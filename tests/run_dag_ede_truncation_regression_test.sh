@@ -166,9 +166,14 @@ run_check "EDE 29 is displayed" "$DAG @127.0.0.1 -p $PORT ede-all.test A" "; EDE
 
 # 2. Test UDP Truncation (TC=1) followed by TCP Retry (Task 2)
 echo "=== 2. Testing UDP Truncated Response Display and TCP Retry (Task 2) ==="
-run_check "UDP TC response is displayed before retry" \
-    "$DAG @127.0.0.1 -p $PORT trunc-test.test A" \
-    "flags: .*tc"
+# Like dig 9.20, the truncated UDP response is not printed; only the TCP answer is (T-12)
+echo -n "Test: UDP TC response is not displayed before the TCP retry ... "
+OUTPUT=$("$DAG" @127.0.0.1 -p $PORT trunc-test.test A 2>&1 || true)
+if echo "$OUTPUT" | grep -qE "flags: .*tc" || [ "$(echo "$OUTPUT" | grep -c "Got answer")" -ne 1 ]; then
+    echo "FAILED"; echo "$OUTPUT" | sed 's/^/    /'; FAILED=$((FAILED + 1))
+else
+    echo "OK"
+fi
 
 run_check "Truncated notification is displayed" \
     "$DAG @127.0.0.1 -p $PORT trunc-test.test A" \

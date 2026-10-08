@@ -9,13 +9,19 @@ if [ ! -f ./karicheck ]; then
     [ -x karicheck ] || make karicheck
 fi
 
-# Test 1: missing_glue.zone should produce a warning about missing glue A/AAAA
+# Test 1: missing_glue.zone: one counted [ERROR] for the NS target without A/AAAA (K-02, K-04: no second,
+# uncounted [WARNING] for the same NS), exit status 1
 echo "[+] Test 1: Testing missing in-bailiwick glue record..."
-OUT1=$(./karicheck zone missing-glue.example. tests/zones/missing_glue.zone 2>&1 || true)
-if echo "$OUT1" | grep -q "delegation will fail to resolve"; then
-    echo "  PASS: Missing in-bailiwick glue warning detected successfully."
+set +e
+OUT1=$(./karicheck zone missing-glue.example. tests/zones/missing_glue.zone 2>&1)
+EXIT1=$?
+set -e
+if [ $EXIT1 -eq 1 ] && echo "$OUT1" | grep -q "^\[ERROR\] In-bailiwick NS target 'ns1.missing-glue.example.' lacks A/AAAA glue record" \
+   && ! echo "$OUT1" | grep -q "^\[WARNING\]" \
+   && echo "$OUT1" | grep -q "1 error(s), 0 warning(s)"; then
+    echo "  PASS: Missing in-bailiwick glue error detected successfully."
 else
-    echo "  FAIL: Expected missing glue warning not found in output:"
+    echo "  FAIL: Expected exactly one missing glue error (exit=$EXIT1):"
     echo "$OUT1"
     exit 1
 fi
@@ -42,8 +48,8 @@ if echo "$OUT3" | grep -q "No NS record found at zone apex"; then
     echo "  FAIL: Unexpected apex NS error on valid zone."
     exit 1
 fi
-if echo "$OUT3" | grep -q "delegation will fail to resolve"; then
-    echo "  FAIL: Unexpected missing glue warning on valid zone."
+if echo "$OUT3" | grep -q "lacks A/AAAA glue"; then
+    echo "  FAIL: Unexpected missing glue error on valid zone."
     exit 1
 fi
 echo "  PASS: Normal zone (valid_glue.zone) passed with zero exit code."
@@ -55,8 +61,15 @@ if echo "$OUT4" | grep -q "No NS record found at zone apex"; then
     echo "  FAIL: Unexpected apex NS error on example.com.zone."
     exit 1
 fi
-if echo "$OUT4" | grep -q "delegation will fail to resolve"; then
-    echo "  FAIL: Unexpected missing glue warning on example.com.zone."
+if echo "$OUT4" | grep -q "lacks A/AAAA glue"; then
+    echo "  FAIL: Unexpected missing glue error on example.com.zone."
+    exit 1
+fi
+# the sample zone is valid as a whole: its ZONEMD matches (RFC 8976 §4) and there are no errors
+if ! echo "$OUT4" | grep -q "^\[OK\] ZONEMD (Scheme 1, Hash 1) for 'example.com.' is VALID.$" ||
+   ! echo "$OUT4" | grep -q "^\[RESULT\] Zone 'example.com.': 0 error(s), "; then
+    echo "  FAIL: example.com.zone is not valid (ZONEMD or other errors):"
+    echo "$OUT4" | grep -E "ERROR|ZONEMD|RESULT"
     exit 1
 fi
 echo "  PASS: example.com.zone passed without false positive delegation/glue warnings."

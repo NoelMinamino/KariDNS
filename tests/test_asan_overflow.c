@@ -932,8 +932,8 @@ int main() {
         memcpy(&pkt[off], "\x07initial", 8);
         off += 8;
 
-        int prc = 0, upc = 0;
-        int res = process_update_sections(pkt, off, "dynupdate.com.", &arena, &prc, &upc);
+        update_result_t ur;
+        int res = process_update_sections(pkt, off, "dynupdate.com.", &arena, &ur);
         if (res != 1) { // Expected FORMERR (1)
             printf("FAIL: process_update_sections returned %d instead of 1 (FORMERR) for invalid Prereq CLASS\n", res);
             return 1;
@@ -941,7 +941,7 @@ int main() {
 
         // 2. Prereq with valid Zone CLASS (IN = 1) matching existing record -> MUST succeed (0)
         pkt[class_offset] = 0x00; pkt[class_offset + 1] = 0x01; // CLASS = 1 (IN)
-        res = process_update_sections(pkt, off, "dynupdate.com.", &arena, &prc, &upc);
+        res = process_update_sections(pkt, off, "dynupdate.com.", &arena, &ur);
         if (res != 0) {
             printf("FAIL: process_update_sections returned %d instead of 0 for valid Prereq CLASS IN\n", res);
             return 1;
@@ -949,7 +949,7 @@ int main() {
 
         // 3. Prereq with valid Zone CLASS (IN = 1) but non-matching RDATA -> MUST return NXRRSET (8)
         memcpy(&pkt[rdata_offset], "\x07wrongval", 8);
-        res = process_update_sections(pkt, off, "dynupdate.com.", &arena, &prc, &upc);
+        res = process_update_sections(pkt, off, "dynupdate.com.", &arena, &ur);
         if (res != 8) {
             printf("FAIL: process_update_sections returned %d instead of 8 (NXRRSET) for non-matching RDATA\n", res);
             return 1;

@@ -31,8 +31,8 @@ int build_synthetic_servfail(const uint8_t *req, size_t req_len,
                              uint8_t *res, size_t max_res_len);
 ssize_t write_all_timeout(int fd, const uint8_t *buf, size_t len, uint32_t timeout_ms);
 ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeout_ms);
-int dispatch_to_program_zone(const char *domain, const uint8_t *req, size_t req_len,
-                             uint8_t *res, size_t max_res_len,
+int dispatch_to_program_zone(const char *view_name, const char *domain, const uint8_t *req, size_t req_len,
+                             uint8_t *res, size_t max_res_len, size_t res_cap,
                              const char *client_ip, bool is_tcp);
 bool question_section_matches(const uint8_t *resp, size_t resp_len,
                               const uint8_t *req, size_t req_len);
@@ -43,8 +43,8 @@ bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iterations,
                         const uint8_t *salt, size_t salt_len,
                         char *out_b32, size_t out_b32_sz);
 bool nsec3_covers_hash(const char *owner_hash, const char *next_hash, const char *target_hash);
-dns_record_t *find_matching_nsec3(zone_arena_t *zone, const char *hash_b32, const char *apex);
-dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *target_hash);
+dns_record_t *find_matching_nsec3(zone_arena_t *zone, const dns_record_t *param, const char *hash_b32, const char *apex);
+dns_record_t *find_covering_nsec3(zone_arena_t *zone, const dns_record_t *param, const char *target_hash);
 bool find_next_closer_name(const char *qname, const char *encloser, char *out, size_t out_sz);
 bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
                          uint8_t *res, size_t max_res_len, uint16_t *offset,
@@ -52,7 +52,7 @@ bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
                          dns_record_t **attached, int *attached_count);
 bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag);
 const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag);
-program_plugin_t *find_program_plugin(const char *domain);
+program_plugin_t *find_program_plugin(const char *view_name, const char *domain);
 ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
                         const uint8_t *query, size_t query_len,
                         uint8_t *resp_out, size_t resp_out_cap,
@@ -486,27 +486,37 @@ static void test_notify_authorization(void) {
         assert(tsig_verify_packet(g_gr.res, r.len, k1, req_mac, req_mac_len, NULL, 0, false, resp_mac, &resp_mac_len) == 0);
     }
 
-    /* the same TSIG-signed NOTIFY from an address that is not a master: NOTAUTH, no refresh */
+    /* R-30: the TSIG is checked first (RFC 8945 5.2); a policy denial after a valid or absent TSIG is REFUSED,
+     * signed with the request's key when the TSIG was valid (5.3); NOTAUTH only for TSIG errors. */
+    tsig_rr_t trr;
+    /* the same TSIG-signed NOTIFY from an address that is not a master: REFUSED, signed with k1, no refresh */
     atomic_store(&g_gr.entry.refresh_now, false);
     build_notify(&q, "example.", k1);
     ask(&q, "example.", 6, STRANGER, false, &r);
-    CHECK(&r, r.rcode == 9 && !atomic_load(&g_gr.entry.refresh_now));
+    CHECK(&r, r.rcode == 5 && !r.aa && !atomic_load(&g_gr.entry.refresh_now));
+    CHECK(&r, tsig_parse_rr(g_gr.res, r.len, &trr) == 1 && strcasecmp(trr.key_name, "k1.") == 0 &&
+              trr.error == 0 && trr.mac_size == 32);
 
-    /* right address but no TSIG although the zone requires one: NOTAUTH */
+    /* right address but no TSIG although the zone requires one: REFUSED, unsigned */
     build_notify(&q, "example.", NULL);
     ask(&q, "example.", 6, MASTER, false, &r);
-    CHECK(&r, r.rcode == 9 && !atomic_load(&g_gr.entry.refresh_now));
+    CHECK(&r, r.rcode == 5 && !atomic_load(&g_gr.entry.refresh_now));
+    CHECK(&r, tsig_parse_rr(g_gr.res, r.len, &trr) == 0);
 
-    /* signed with a key that is known but not the zone's key */
+    /* signed with a key that is known but not the zone's key: REFUSED, signed with k2 (never with k1) */
     build_notify(&q, "example.", k2);
     ask(&q, "example.", 6, MASTER, false, &r);
-    CHECK(&r, r.rcode == 9 && !atomic_load(&g_gr.entry.refresh_now));
+    CHECK(&r, r.rcode == 5 && !atomic_load(&g_gr.entry.refresh_now));
+    CHECK(&r, tsig_parse_rr(g_gr.res, r.len, &trr) == 1 && strcasecmp(trr.key_name, "k2.") == 0 &&
+              trr.error == 0 && trr.mac_size == 32);
 
-    /* corrupted MAC */
+    /* corrupted MAC: NOTAUTH, BADSIG, unsigned, key name echoed */
     build_notify(&q, "example.", k1);
     q.b[q.n - 30] ^= 0x01;                                    /* inside the TSIG RDATA (MAC) */
     ask(&q, "example.", 6, MASTER, false, &r);
     CHECK(&r, r.rcode == 9 && !atomic_load(&g_gr.entry.refresh_now));
+    CHECK(&r, tsig_parse_rr(g_gr.res, r.len, &trr) == 1 && strcasecmp(trr.key_name, "k1.") == 0 &&
+              trr.error == 16 && trr.mac_size == 0);
 
     /* MQTYPE-Query is meaningless in a NOTIFY */
     {
@@ -537,6 +547,9 @@ static void test_notify_authorization(void) {
     build_notify(&q, "example.", bad);
     ask(&q, "example.", 6, MASTER, false, &r);
     CHECK(&r, r.rcode == 9 && !atomic_load(&g_gr.entry.refresh_now));
+    /* unknown key: TSIG error BADKEY, unsigned, the request's key name (RFC 8945 5.2.1, 5.3.2) */
+    CHECK(&r, tsig_parse_rr(g_gr.res, r.len, &trr) == 1 && strcasecmp(trr.key_name, "nokey.") == 0 &&
+              trr.error == 17 && trr.mac_size == 0);
     free(bad->name); free(bad->algorithm); free(bad);
     free_server_config_fields(cfg); free(cfg);
     zone_arena_destroy(&g_gr.arena);
@@ -558,6 +571,62 @@ static void test_notify_authorization(void) {
         zone_arena_destroy(&g_gr.arena);
     }
     printf("  -> NOTIFY authorization matrix passed.\n");
+}
+
+/* RFC 8945 5.2, 5.3: every response to a signed request carries a TSIG, also for a plain QUERY */
+static void test_signed_query(void) {
+    printf("[TEST] Query engine: responses to TSIG-signed queries (RFC 8945 5.2, 5.3)...\n");
+    server_config_t *cfg = notify_cfg("zone \"example.\" { type master; file \"x\"; };");
+    tsig_key_t *k1 = cfg_key(cfg, "k1");
+    assert(k1);
+    gr_setup("example.", ZONE_TXT);
+    g_gr.cfg = *cfg;
+    g_gr.view.name = "__default__";
+    gr_resp_t r;
+    req_t q;
+    tsig_rr_t trr;
+    uint8_t mac[64], rmac[64];
+    size_t mac_len = 0, rmac_len = 0, len;
+
+    /* valid key, with EDNS: answer + OPT, TSIG last, signed with k1 over the request MAC */
+    put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_opt(&q, 0, 0, 0, NULL, 0);
+    len = q.n;
+    assert(tsig_sign_packet(q.b, &len, sizeof(q.b), k1, 0, mac, &mac_len, NULL, 0, false) == 0);
+    q.n = len;
+    ask(&q, "www.example.", 1, "192.0.2.7", false, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, 1) == 1 && gr_count(&r, 3, 41) == 1);
+    CHECK(&r, r.nrr > 0 && r.rr[r.nrr - 1].type == 250 && gr_count(&r, 3, 250) == 1);
+    CHECK(&r, tsig_verify_packet(g_gr.res, r.len, k1, mac, mac_len, NULL, 0, false, rmac, &rmac_len) == 0);
+
+    /* unsigned query: unchanged, no TSIG */
+    put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 0); put_question(&q, "www.example.", 1, 1);
+    ask(&q, "www.example.", 1, "192.0.2.7", false, &r);
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 1) == 1 && gr_count(&r, 3, 250) == 0);
+
+    /* wrong secret: NOTAUTH, no answer, BADSIG unsigned */
+    tsig_key_t bad = *k1;
+    bad.next = NULL;
+    memset(bad.secret_decoded, 0x5A, bad.secret_decoded_len);
+    put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 0); put_question(&q, "www.example.", 1, 1);
+    len = q.n;
+    assert(tsig_sign_packet(q.b, &len, sizeof(q.b), &bad, 0, mac, &mac_len, NULL, 0, false) == 0);
+    q.n = len;
+    ask(&q, "www.example.", 1, "192.0.2.7", false, &r);
+    CHECK(&r, r.rcode == 9 && r.counts[0] == 0 && !r.aa);
+    CHECK(&r, tsig_parse_rr(g_gr.res, r.len, &trr) == 1 && trr.error == 16 && trr.mac_size == 0);
+
+    /* two TSIG RRs: FORMERR without TSIG (RFC 8945 5.2) */
+    put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 0); put_question(&q, "www.example.", 1, 1);
+    len = q.n;
+    assert(tsig_sign_packet(q.b, &len, sizeof(q.b), k1, 0, mac, &mac_len, NULL, 0, false) == 0);
+    assert(tsig_sign_packet(q.b, &len, sizeof(q.b), k1, 0, mac, &mac_len, NULL, 0, false) == 0);
+    q.n = len;
+    ask(&q, "www.example.", 1, "192.0.2.7", false, &r);
+    CHECK(&r, r.rcode == 1 && gr_count(&r, 3, 250) == 0);
+
+    free_server_config_fields(cfg); free(cfg);
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> signed QUERY passed.\n");
 }
 
 static void test_rfc8482_minimal_any_synthesis(void) {
@@ -713,14 +782,308 @@ static void test_eff_ttl_resolution_and_clamp(void) {
     printf("  -> Effective TTL resolution & tinydns clamp passed.\n");
 }
 
+/* ---------------------------------------------------------------- response header / error builder (phase 5) */
+/* Request flags used below: byte 2 = TC|RD, byte 3 = RA|Z|AD|CD. None of RA/Z/AD/TC may be echoed (R-05). */
+#define HDR_FLAGS_ALL 0x03F0
+
+static void put_opt_sz(req_t *q, uint16_t udp_size, const uint8_t *opts, size_t olen) {
+    q->b[q->n++] = 0; put16(q, 41); put16(q, udp_size); q->b[q->n++] = 0; q->b[q->n++] = 0; put16(q, 0);
+    put16(q, (uint16_t)olen); if (olen) { memcpy(q->b + q->n, opts, olen); q->n += olen; }
+}
+
+/* End of the last parsed record (or of the question section): must equal the message length, i.e. no bytes
+ * of the request (prerequisite/update/answer records) are left behind (CLAUDE.md Rule 3, R-12). */
+static size_t gr_end(const gr_resp_t *r) {
+    uint16_t qd = (uint16_t)((r->msg[4] << 8) | r->msg[5]);
+    size_t end = get_question_end_offset(r->msg, r->len, qd);
+    for (int i = 0; i < r->nrr; i++)
+        if (r->rr[i].rdoff + r->rr[i].rdlen > end) end = r->rr[i].rdoff + r->rr[i].rdlen;
+    return end;
+}
+
+/* First EDE (option 15) INFO-CODE in the OPT RR, -1 if none. */
+static int gr_ede(const gr_resp_t *r) {
+    for (int i = 0; i < r->nrr; i++) {
+        if (r->rr[i].sect != 3 || r->rr[i].type != 41) continue;
+        size_t off = r->rr[i].rdoff, end = off + r->rr[i].rdlen;
+        while (off + 4 <= end) {
+            uint16_t code = (uint16_t)((r->msg[off] << 8) | r->msg[off + 1]);
+            uint16_t len = (uint16_t)((r->msg[off + 2] << 8) | r->msg[off + 3]);
+            if (off + 4 + len > end) return -1;
+            if (code == 15 && len >= 2) return (r->msg[off + 4] << 8) | r->msg[off + 5];
+            off += 4 + (size_t)len;
+        }
+    }
+    return -1;
+}
+
+static bool gr_has_option(const gr_resp_t *r, uint16_t want) {
+    for (int i = 0; i < r->nrr; i++) {
+        if (r->rr[i].sect != 3 || r->rr[i].type != 41) continue;
+        size_t off = r->rr[i].rdoff, end = off + r->rr[i].rdlen;
+        while (off + 4 <= end) {
+            uint16_t code = (uint16_t)((r->msg[off] << 8) | r->msg[off + 1]);
+            uint16_t len = (uint16_t)((r->msg[off + 2] << 8) | r->msg[off + 3]);
+            if (code == want) return true;
+            off += 4 + (size_t)len;
+        }
+    }
+    return false;
+}
+
+/* QR=1, same ID/OPCODE, AA as expected, TC/RA/Z/AD=0, CD echoed, RD as expected, RCODE, no trailing bytes. */
+static void check_hdr(const gr_resp_t *r, const req_t *q, uint8_t rcode, bool aa, bool rd) {
+    const uint8_t *m = r->msg;
+    CHECK(r, m[0] == q->b[0] && m[1] == q->b[1]);
+    CHECK(r, (m[2] & 0x80) != 0 && (m[2] & 0x78) == (q->b[2] & 0x78));
+    CHECK(r, ((m[2] & 0x04) != 0) == aa);
+    CHECK(r, (m[2] & 0x02) == 0);
+    CHECK(r, ((m[2] & 0x01) != 0) == rd);
+    CHECK(r, (m[3] & 0xE0) == 0);
+    CHECK(r, (m[3] & 0x10) == (q->b[3] & 0x10));
+    CHECK(r, (m[3] & 0x0F) == rcode);
+    CHECK(r, gr_end(r) == r->len);
+}
+
+static void test_response_header_and_error_builder(void) {
+    printf("[TEST] Query engine: response header bits and error responses (R-05, R-06, R-12, R-13, R-18, R-27)...\n");
+    gr_resp_t r;
+    req_t q;
+    gr_setup("example.", ZONE_TXT);
+    g_gr.cfg.send_extended_errors = true;
+
+    /* R-05: authoritative answer. RA/Z/AD/TC from the query are not copied, CD and RD are echoed, AA=1 */
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_opt(&q, 0, 0, 0, NULL, 0);
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 0, true, true);
+    CHECK(&r, gr_count(&r, 1, 1) == 1);
+    put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 0); put_question(&q, "www.example.", 1, 1);       /* CD=0 stays 0 */
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 0, true, true);
+
+    /* R-06: REFUSED for a name outside every zone: AA=0, EDE 20, OPT kept */
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 1); put_question(&q, "nosuch.invalid.", 1, 1); put_opt(&q, 0, 0, 0, NULL, 0);
+    ask(&q, "nosuch.invalid.", 1, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 5, false, true);
+    CHECK(&r, gr_ede(&r) == 20 && gr_count(&r, 3, 41) == 1);
+
+    /* BADVERS (RFC 6891 §6.1.3): question kept, OPT with version 0, AA=0 */
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_opt(&q, 0, 1, 0, NULL, 0);
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 0, false, true);
+    CHECK(&r, r.counts[2] == 1 && (gr_first(&r, 3, 41)->ttl >> 24) == 1);
+
+    /* R-13: malformed ECS (SCOPE != 0) -> FORMERR *with* OPT, question kept, no ECS echoed */
+    static const uint8_t bad_ecs[] = { 0, 8, 0, 7, 0, 1, 24, 16, 192, 0, 2 };
+    g_gr.cfg.ecs_enable = true;
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_opt(&q, 0, 0, 0, bad_ecs, sizeof(bad_ecs));
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 1, false, true);
+    CHECK(&r, r.counts[2] == 1 && gr_count(&r, 3, 41) == 1 && !gr_has_option(&r, 8));
+    /* R-13 decision: with ecs-enable no the option is ignored and the query is answered */
+    g_gr.cfg.ecs_enable = false;
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 0, true, true);
+    CHECK(&r, gr_count(&r, 1, 1) == 1 && !gr_has_option(&r, 8));
+    /* BADVERS is decided before the malformed option */
+    g_gr.cfg.ecs_enable = true;
+    put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_opt(&q, 0, 1, 0, bad_ecs, sizeof(bad_ecs));
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+    CHECK(&r, r.rcode == 0 && (gr_first(&r, 3, 41)->ttl >> 24) == 1);
+    g_gr.cfg.ecs_enable = false;
+
+    /* COOKIE with an invalid length (RFC 7873 §5.2.2) -> FORMERR with OPT (RFC 6891 §7) */
+    static const uint8_t bad_cookie[] = { 0, 10, 0, 5, 1, 2, 3, 4, 5 };
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_opt(&q, 0, 0, 0, bad_cookie, sizeof(bad_cookie));
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 1, false, true);
+    CHECK(&r, gr_count(&r, 3, 41) == 1 && !gr_has_option(&r, 10));
+
+    /* OPT itself unusable (owner is not the root): FORMERR without OPT, QDCOUNT 0 */
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 1); put_question(&q, "www.example.", 1, 1);
+    put_name(&q, "x."); put16(&q, 41); put16(&q, 4096); put32(&q, 0); put16(&q, 0);
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 1, false, true);
+    CHECK(&r, r.counts[2] == 0 && r.len == DNS_HEADER_SIZE);
+
+    /* Unknown opcode with an answer record in the request: NOTIMP, EDE 21, only question + OPT returned */
+    put_hdr(&q, 0x4592, (uint16_t)((2 << 11) | HDR_FLAGS_ALL), 1, 1, 0, 1); put_question(&q, "www.example.", 1, 1);
+    put_name(&q, "www.example."); put16(&q, 1); put16(&q, 1); put32(&q, 60); put16(&q, 4); put32(&q, 0xC0000201);
+    put_opt(&q, 0, 0, 0, NULL, 0);
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 4, false, true);
+    CHECK(&r, r.counts[0] == 0 && r.counts[2] == 1 && gr_ede(&r) == 21);
+
+    /* QDCOUNT > 1 -> FORMERR, OPT kept */
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 2, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_question(&q, "ns.example.", 1, 1);
+    put_opt(&q, 0, 0, 0, NULL, 0);
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 1, false, true);
+    CHECK(&r, gr_count(&r, 3, 41) == 1);
+
+    /* RFC 9619 §4: a QUERY with QDCOUNT=0 is not malformed -> NOERROR without a question. A cookie-only query
+     * (RFC 7873 §5.4) gets its client cookie back with a server cookie (8 + 16 octets). */
+    static const uint8_t cookie_only[] = { 0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8 };
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 0, 0, 0, 1); put_opt(&q, 0, 0, 0, cookie_only, sizeof(cookie_only));
+    ask(&q, "", 0, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 0, false, true);
+    size_t q0_clen = 0;
+    const uint8_t *q0_ck = gr_find_cookie(&r, &q0_clen, NULL);
+    CHECK(&r, r.msg[4] == 0 && r.msg[5] == 0 && r.counts[0] == 0 && r.counts[1] == 0 && gr_count(&r, 3, 41) == 1);
+    CHECK(&r, q0_ck != NULL && q0_clen == 24 && memcmp(q0_ck, cookie_only + 4, 8) == 0);
+    /* without OPT: the 12-octet header only */
+    put_hdr(&q, 0x4592, 0x0100, 0, 0, 0, 0);
+    ask(&q, "", 0, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 0, false, true);
+    CHECK(&r, r.len == DNS_HEADER_SIZE);
+
+    /* RFC 10029 §3.3: MQTYPE-Query with QDCOUNT=0 -> FORMERR, now with OPT (RFC 6891 §7) */
+    g_gr.cfg.rfc10029_mqtype_enable = true;
+    static const uint8_t mq[] = { 0, 20, 0, 2, 0, 28 };
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 0, 0, 0, 1); put_opt(&q, 0, 0, 0, mq, sizeof(mq));
+    ask(&q, "", 0, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 1, false, true);
+    CHECK(&r, gr_count(&r, 3, 41) == 1 && !gr_has_option(&r, 20) && !gr_has_option(&r, 21));
+    /* MQTYPE-Query that names a meta type: FORMERR with OPT, AA=0, question kept */
+    static const uint8_t mq_meta[] = { 0, 20, 0, 2, 0, 252 };
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_opt(&q, 0, 0, 0, mq_meta, sizeof(mq_meta));
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 1, false, true);
+    CHECK(&r, gr_count(&r, 3, 41) == 1);
+    g_gr.cfg.rfc10029_mqtype_enable = false;
+
+    /* RFC 5936: AXFR over UDP -> FORMERR, OPT kept */
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 1); put_question(&q, "example.", 252, 1); put_opt(&q, 0, 0, 0, NULL, 0);
+    ask(&q, "example.", 252, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 1, false, true);
+    CHECK(&r, gr_count(&r, 3, 41) == 1);
+
+    /* Foreign class -> REFUSED, AA=0 */
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 0); put_question(&q, "www.example.", 1, 4);
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 5, false, true);
+
+    /* R-18: expired secondary -> SERVFAIL + EDE 24 (RFC 8914 §4.25), AA=0; serve-stale answers with EDE 3 */
+    atomic_store(&g_gr.entry.expire, 100);
+    atomic_store(&g_gr.entry.last_successful_transfer, time(NULL) - 1000);
+    g_gr.cfg.serve_stale = false;
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_opt(&q, 0, 0, 0, NULL, 0);
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 2, false, true);
+    CHECK(&r, gr_ede(&r) == 24);
+    g_gr.cfg.serve_stale = true;
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 1) == 1 && gr_ede(&r) == 3);
+    g_gr.cfg.serve_stale = false;
+    atomic_store(&g_gr.entry.last_successful_transfer, 0);
+
+    /* R-27 addendum: zone not loaded yet (empty arena) -> SERVFAIL + EDE 14 with AA=0 */
+    {
+        zone_arena_t empty;
+        memset(&empty, 0, sizeof(empty));
+        zone_arena_init(&empty);
+        atomic_store_explicit(&g_gr.entry.rcu.active, &empty, memory_order_release);
+        ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+        check_hdr(&r, &q, 2, false, true);
+        CHECK(&r, gr_ede(&r) == 14);
+        atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena, memory_order_release);
+        zone_arena_destroy(&empty);
+    }
+    zone_arena_destroy(&g_gr.arena);
+
+    /* NOTIFY (RFC 1996 §4.7): accepted -> QR AA, RD=0; refused -> AA=0 (R-06) */
+    {
+        server_config_t *cfg = notify_cfg("zone \"example.\" { type slave; file \"x\"; masters { 192.0.2.100; }; };");
+        gr_setup("example.", ZONE_TXT);
+        g_gr.cfg = *cfg;
+        g_gr.cfg.send_extended_errors = true;
+        g_gr.view.name = "__default__";
+        put_hdr(&q, 0x4592, (uint16_t)(0x2000 | HDR_FLAGS_ALL), 1, 0, 0, 1); put_question(&q, "example.", 6, 1);
+        put_opt(&q, 0, 0, 0, NULL, 0);
+        ask(&q, "example.", 6, "192.0.2.100", false, &r);
+        check_hdr(&r, &q, 0, true, false);
+        CHECK(&r, gr_count(&r, 3, 41) == 1);
+        ask(&q, "example.", 6, "203.0.113.9", false, &r);
+        check_hdr(&r, &q, 5, false, false);
+        CHECK(&r, gr_ede(&r) == 18);
+        free_server_config_fields(cfg); free(cfg);
+        zone_arena_destroy(&g_gr.arena);
+    }
+
+    /* R-12: UPDATE / NOTIFY to a forward zone -> NOTIMP; the update section is not returned; OPT + EDE 21 */
+    {
+        server_config_t *cfg = notify_cfg("zone \"example.\" { type forward; forwarders { 192.0.2.53; }; };");
+        gr_setup("example.", ZONE_TXT);
+        g_gr.cfg = *cfg;
+        g_gr.cfg.send_extended_errors = true;
+        g_gr.view.name = "__default__";
+        put_hdr(&q, 0x4592, (uint16_t)(0x2800 | HDR_FLAGS_ALL), 1, 0, 1, 1); put_question(&q, "example.", 6, 1);
+        put_name(&q, "a.example."); put16(&q, 1); put16(&q, 1); put32(&q, 300); put16(&q, 4); put32(&q, 0xC0000205);
+        put_opt(&q, 0, 0, 0, NULL, 0);
+        ask(&q, "example.", 6, "192.0.2.100", false, &r);
+        check_hdr(&r, &q, 4, false, false);
+        CHECK(&r, r.counts[1] == 0 && r.counts[2] == 1 && gr_ede(&r) == 21);
+        put_hdr(&q, 0x4592, (uint16_t)(0x2000 | HDR_FLAGS_ALL), 1, 0, 0, 1); put_question(&q, "example.", 6, 1);
+        put_opt(&q, 0, 0, 0, NULL, 0);
+        ask(&q, "example.", 6, "192.0.2.100", false, &r);
+        check_hdr(&r, &q, 4, false, false);
+        CHECK(&r, gr_ede(&r) == 21);
+
+        /* forward zone without a usable forwarder: synthetic SERVFAIL, AA=0, OPT added (RFC 6891 §6.1.1) */
+        zone_config_t *zc = find_zone_config_in_view(&g_gr.cfg, "__default__", "example.");
+        assert(zc);
+        int saved = zc->forwarders_count;
+        zc->forwarders_count = 0;
+        put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_opt(&q, 0, 0, 0, NULL, 0);
+        ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+        check_hdr(&r, &q, 2, false, true);
+        CHECK(&r, gr_count(&r, 3, 41) == 1);
+        zc->forwarders_count = saved;
+        free_server_config_fields(cfg); free(cfg);
+        zone_arena_destroy(&g_gr.arena);
+    }
+    printf("  -> response header and error responses passed.\n");
+}
+
+/* UDP response limit = the client's EDNS size, also when it is exactly 512 and the caller's buffer is larger
+ * (the async path passed 4096 and got up to 4096 bytes back). */
+static void test_udp_limit_follows_edns_size(void) {
+    printf("[TEST] Query engine: UDP response limit follows the EDNS UDP size (512 exactly)...\n");
+    char zone[8192];
+    size_t zl = (size_t)snprintf(zone, sizeof(zone), "$ORIGIN example.\n$TTL 60\n@ SOA ns h 5 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n");
+    for (int i = 0; i < 40; i++)
+        zl += (size_t)snprintf(zone + zl, sizeof(zone) - zl, "big TXT \"record-%02d-padding-padding-padding\"\n", i);
+    gr_setup("example.", zone);
+    static uint8_t res[4096];
+    for (int round = 0; round < 3; round++) {
+        uint16_t udp = round == 0 ? 512 : (round == 1 ? 1232 : 400);   /* < 512 is treated as 512 */
+        req_t q;
+        put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 1); put_question(&q, "big.example.", 16, 1); put_opt_sz(&q, udp, NULL, 0);
+        compress_ctx_t comp; memset(&comp, 0, sizeof(comp)); compress_ctx_init_packet(&comp);
+        rate_limit_config_t *rrl_out = NULL; zone_db_entry_t *matched = NULL;
+        int n = process_dns_query_impl_cap(q.b, q.n, res, sizeof(res), sizeof(res), "big.example.", 16, "192.0.2.100",
+                                           &comp, false, &rrl_out, &g_gr.snap, &g_gr.cfg, &matched);
+        size_t limit = udp < 512 ? 512 : udp;
+        if (n <= 0 || (size_t)n > limit || !(res[2] & 0x02)) {
+            fprintf(stderr, "udp=%u: n=%d tc=%d\n", udp, n, (res[2] & 0x02) != 0);
+            assert(0);
+        }
+    }
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> UDP limit passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Query Engine Protocol Tests ===\n");
     test_protocol_anomalies();
     test_expired_secondary_zone();
     test_notify_authorization();
+    test_signed_query();
     test_rfc8482_minimal_any_synthesis();
     test_sibling_zone_additional_glue_and_limits();
     test_eff_ttl_resolution_and_clamp();
+    test_response_header_and_error_builder();
+    test_udp_limit_follows_edns_size();
     printf("=== All Query Engine Protocol Tests PASSED ===\n");
     return 0;
 }
@@ -730,4 +1093,12 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr
                         const tcp_sockopts_t *tcp_opts) {
     (void)tcp_opts;
     return broker_connect(family, type, addr, addr_len);
+}
+
+/* send_tcp_dns_message(): goes through the send_tcp_robust() mock above (length prefix, then message) */
+ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len) {
+    uint8_t prefix[2] = {(uint8_t)(len >> 8), (uint8_t)(len & 0xFF)};
+    if (send_tcp_robust(fd, prefix, 2) < 0) return -1;
+    if (send_tcp_robust(fd, msg, len) < 0) return -1;
+    return (ssize_t)len;
 }

@@ -60,13 +60,23 @@ run_check() {
     fi
 }
 
+# run_not_check NAME CMD UNEXPECTED [REQUIRED]: UNEXPECTED must not match and REQUIRED (default: a
+# printed DNS header) must match the same output, so a command that printed nothing does not pass.
 run_not_check() {
     NAME="$1"
     CMD="$2"
     UNEXPECT="$3"
+    REQUIRED="${4:-->>HEADER<<-}"
     printf "Test: %s (should NOT match '%s') ... " "$NAME" "$UNEXPECT"
     OUT=$(eval "$CMD" 2>&1 || true)
-    if echo "$OUT" | grep -E -q "$UNEXPECT"; then
+    if ! echo "$OUT" | grep -E -q -e "$REQUIRED"; then
+        echo "FAILED"
+        echo "  Command: $CMD"
+        echo "  Required pattern not found: $REQUIRED"
+        echo "  Output:"
+        echo "$OUT" | sed 's/^/    /'
+        FAILED=$((FAILED + 1))
+    elif echo "$OUT" | grep -E -q "$UNEXPECT"; then
         echo "FAILED"
         echo "  Command: $CMD"
         echo "  Unexpected match: $UNEXPECT"
@@ -138,7 +148,8 @@ run_check "Signer name present in SIG record" \
 # Ensure Type Covered is rendered as "0" and NOT "TYPE0"
 run_not_check "Type Covered is '0' and NOT 'TYPE0'" \
     "$DAG example.com @127.0.0.1 +sig0-pkey=ecdsa.key +sig0-name=update-key.example.com. +qr +timeout=1" \
-    "SIG[[:space:]]+TYPE0"
+    "SIG[[:space:]]+TYPE0" \
+    "ANY[[:space:]]+SIG[[:space:]]+0[[:space:]]+13[[:space:]]"
 
 echo ""
 echo "=== 3. Testing Ed25519 (Alg 15) SIG(0) Transaction Signing ==="

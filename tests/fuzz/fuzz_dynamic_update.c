@@ -83,7 +83,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     };
     char init_zone[] = "dyn.example.com. 3600 IN SOA ns1.dyn.example.com. admin.dyn.example.com. 1 3600 1800 604800 86400\n"
                        "dyn.example.com. 3600 IN NS ns1.dyn.example.com.\n"
-                       "dyn.example.com. 3600 IN A 192.0.2.1\n";
+                       "dyn.example.com. 3600 IN A 192.0.2.1\n"
+                       /* names for the RFC 2136 §3.4.2 rules: RRset equality, CNAME conflicts, delegation */
+                       "www.dyn.example.com. 3600 IN A 192.0.2.10\n"
+                       "www.dyn.example.com. 3600 IN A 192.0.2.11\n"
+                       "alias.dyn.example.com. 3600 IN CNAME www.dyn.example.com.\n"
+                       "sub.dyn.example.com. 3600 IN NS ns.sub.dyn.example.com.\n";
     parse_zone_fast(init_zone, sizeof(init_zone) - 1, &entry.rcu.arena_a, &ctx);
     build_zone_index(&entry.rcu.arena_a, true);
 
@@ -92,6 +97,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
     // Fuzz dynamic update handling
     handle_dynamic_update(data, size, &entry, "127.0.0.1", "key-admin");
+
+    /* X-35: an applied update records its IXFR difference in entry.ixfr_history (compute_ixfr_diff()); the
+     * server keeps it for the life of the zone, this per-input entry must release it or every applied update
+     * leaks one transaction (the RSS grew to the 2 GB limit of the build host in a few minutes) */
+    for (int i = 0; i < MAX_IXFR_HISTORY; i++) {
+        if (entry.ixfr_history.entries[i]) free_ixfr_txn(entry.ixfr_history.entries[i]);
+    }
 
     zone_arena_destroy(&entry.rcu.arena_a);
     zone_arena_destroy(&entry.rcu.arena_b);
@@ -105,4 +117,12 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr
                         const tcp_sockopts_t *tcp_opts) {
     (void)tcp_opts;
     return broker_connect(family, type, addr, addr_len);
+}
+
+/* send_tcp_dns_message(): goes through the send_tcp_robust() mock above (length prefix, then message) */
+ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len) {
+    uint8_t prefix[2] = {(uint8_t)(len >> 8), (uint8_t)(len & 0xFF)};
+    if (send_tcp_robust(fd, prefix, 2) < 0) return -1;
+    if (send_tcp_robust(fd, msg, len) < 0) return -1;
+    return (ssize_t)len;
 }

@@ -125,14 +125,23 @@ bool compare_records(const dns_record_t *a, const dns_record_t *b, bool ignore_t
   if (a->ecs_subnet_tag && b->ecs_subnet_tag && strcasecmp(a->ecs_subnet_tag, b->ecs_subnet_tag) != 0) return false;
   if ((a->bind_location_tag == NULL) != (b->bind_location_tag == NULL)) return false;
   if (a->bind_location_tag && b->bind_location_tag && strcasecmp(a->bind_location_tag, b->bind_location_tag) != 0) return false;
-  if (a->rdata_count != b->rdata_count) return false;
-  for (int i = 0; i < a->rdata_count; i++) {
-    if ((a->rdata[i] == NULL) != (b->rdata[i] == NULL)) return false;
-    if (a->rdata[i] && b->rdata[i] && strcmp(a->rdata[i], b->rdata[i]) != 0) return false;
+  /* 同じ表現で同じ値なら等しい (よくある場合はここで終わる) */
+  bool same_text = (a->rdata_count == b->rdata_count && a->generic_len == b->generic_len);
+  for (int i = 0; same_text && i < a->rdata_count; i++) {
+    if ((a->rdata[i] == NULL) != (b->rdata[i] == NULL)) same_text = false;
+    else if (a->rdata[i] && b->rdata[i] && strcmp(a->rdata[i], b->rdata[i]) != 0) same_text = false;
   }
-  if (a->generic_len != b->generic_len) return false;
-  if (a->generic_len > 0 && memcmp(a->generic_data, b->generic_data, a->generic_len) != 0) return false;
-  return true;
+  if (same_text && a->generic_len > 0 && memcmp(a->generic_data, b->generic_data, a->generic_len) != 0) same_text = false;
+  if (same_text) return true;
+  /* X-16, X-25: RFC 2136 §1.1.1 (RR は RDATA が等しければ等しい)、§1.1.2 (名前は RFC 1035 §2.3.3 のとおり
+   * 大文字小文字を区別しない)。テキスト (ゾーンファイル) とワイヤ (転送、UPDATE) の表現の違い、数値の書き方、
+   * 名前の大文字小文字に依らないよう、RFC 4034 §6.2 の正規形の RDATA で比べる (BIND の dns_rdata_compare()
+   * と同じく、一覧に無い型の名前は区別する)。 */
+  uint8_t wa[65535], wb[65535];
+  long la = dns_record_canonical_rdata(a, wa, sizeof(wa));
+  if (la < 0) return false;
+  long lb = dns_record_canonical_rdata(b, wb, sizeof(wb));
+  return lb == la && memcmp(wa, wb, (size_t)la) == 0;
 }
 
 bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target) {
@@ -146,8 +155,8 @@ bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target) {
   return false;
 }
 
-static char *expand_domain_name(char *name, const char *origin,
-                                zone_arena_t *arena) {
+static char *expand_domain_name_raw(char *name, const char *origin,
+                                    zone_arena_t *arena) {
   if (!name)
     return name;
   size_t n_len = strlen(name);
@@ -208,6 +217,22 @@ static char *expand_domain_name(char *name, const char *origin,
   return fqdn;
 }
 
+/* origin を補った名前を、クエリ名・転送で受けた名前と同じ正規形 (dns_wire.h) にする (R-29)。
+ * RFC 1035 §5.1: \X と \DDD はそのオクテットを表す。"sp\032ace" と "c\(p" はそれぞれ
+ * "sp\032ace"、"c(p" に、"\065bc" は "Abc" になる。正規化できない名前 (不正なエスケープ、
+ * 空ラベル、長すぎる名前) はそのまま返し、validate_domain_name_length() がエラーにする。 */
+static char *expand_domain_name(char *name, const char *origin, zone_arena_t *arena) {
+  char *fqdn = expand_domain_name_raw(name, origin, arena);
+  if (!fqdn || strcmp(fqdn, "@") == 0) return fqdn;
+  char norm[DNS_NAME_TEXT_SIZE];
+  size_t n = dns_name_normalize(fqdn, norm, sizeof(norm));
+  if (n == (size_t)-1 || strcmp(norm, fqdn) == 0) return fqdn;
+  char *copy = (char *)arena_alloc(arena, n + 1);
+  if (!copy) return fqdn;
+  memcpy(copy, norm, n + 1);
+  return copy;
+}
+
 // RFC 1035 §3.1: 各ラベルは63オクテット以下、ドメイン名全体は255オクテット以下を検証
 static bool validate_domain_name_length(const char *fqdn, parse_error_t *err_out,
                                         const char *field_pos_in_buf, const char *buf) {
@@ -266,6 +291,17 @@ static bool validate_domain_name_length(const char *fqdn, parse_error_t *err_out
         }
         return false;
     }
+    /* 長さ以外の理由で正規形にできない名前 (RFC 1035 §5.1 の \DDD が 255 を超える、
+     * 末尾の '\'、空ラベル "a..b") も、ワイヤ形式に書けないのでロード時に弾く。 */
+    char norm[DNS_NAME_TEXT_SIZE];
+    if (strcmp(fqdn, "@") != 0 && dns_name_normalize(fqdn, norm, sizeof(norm)) == (size_t)-1) {
+        if (err_out) {
+            err_out->error_message = "Invalid domain name (bad escape or empty label, RFC 1035 §5.1)";
+            if (buf && field_pos_in_buf) err_out->error_offset = (size_t)(field_pos_in_buf - buf);
+            err_out->token_length = strlen(fqdn);
+        }
+        return false;
+    }
     return true;
 }
 
@@ -311,12 +347,23 @@ static char *resolve_include_path(const char *base_dir, const char *rel_path,
 
 #define MAX_INCLUDE_DEPTH 16
 
+/* 1つのゾーンの読み込み中に、$INCLUDE と $GENERATE をまたいで共有する状態。
+ * origin だけは $INCLUDE ごとに別 (RFC 1035 §5.1: $INCLUDE は親ファイルの origin を変えない)。 */
+typedef struct {
+    char **origin_io;
+    char **ttl_io;       /* $TTL (RFC 2308 §4)。TTL の無い SOA の MINIMUM もここに入る (BIND と同じ) */
+    char **last_ttl_io;  /* 最後に明示された TTL (RFC 1035 §5.1) */
+    char **ecs_tag_io;
+    char **loc_tag_io;
+} zone_parse_state_t;
+
+static int parse_zone_buffer(char *buf, size_t size, zone_arena_t *arena, parse_context_t *ctx,
+                             const zone_parse_state_t *st, bool finalize);
+
 static int process_include(char **fields, int field_idx, zone_arena_t *arena,
-                            parse_context_t *ctx, char **origin_io, char *cur_buf) {
-    if (!ctx || !ctx->shared_ttl_io) {
-        if (ctx && ctx->err_out) {
-            ctx->err_out->error_message = "$INCLUDE requires shared_ttl_io to be configured by the caller";
-        }
+                            parse_context_t *ctx, const zone_parse_state_t *st, char *cur_buf) {
+    if (!ctx || !ctx->load_file_cb || !ctx->base_dir) {
+        if (ctx && ctx->err_out) ctx->err_out->error_message = "$INCLUDE is not available (no file loader configured by the caller)";
         return -1;
     }
     if (field_idx < 2) {
@@ -390,30 +437,32 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
     arena->file_paths[arena->file_buf_count] = resolved;
     arena->file_buf_count++;
 
-    char *saved_origin = *origin_io;
-    char *child_origin = (field_idx > 2) ? fields[2] : *origin_io;
+    /* RFC 1035 §5.1: $INCLUDE の origin 引数も、相対名なら現在の origin を補う (R-22 d) */
+    char *child_origin = *st->origin_io;
+    if (field_idx > 2) {
+        child_origin = expand_domain_name(fields[2], *st->origin_io, arena);
+        if (!validate_domain_name_length(child_origin, ctx->err_out, fields[2], cur_buf))
+            return -1;
+    }
 
     ctx->visited_paths[ctx->visited_count] = resolved;
     if (ctx->visited_devs) ctx->visited_devs[ctx->visited_count] = cur_dev;
     if (ctx->visited_inos) ctx->visited_inos[ctx->visited_count] = cur_ino;
     ctx->visited_count++;
 
-    parse_context_t child_ctx = *ctx; 
+    parse_context_t child_ctx = *ctx;
     child_ctx.default_origin = child_origin;
     child_ctx.current_depth = ctx->current_depth + 1;
-    child_ctx.shared_ttl_io = ctx->shared_ttl_io; 
-    child_ctx.shared_ecs_tag_io = ctx->shared_ecs_tag_io;
-    child_ctx.shared_loc_tag_io = ctx->shared_loc_tag_io;
+    zone_parse_state_t child_st = *st;
+    child_st.origin_io = &child_origin;
 
-    int rc = parse_zone_fast(file_content, strlen(file_content), arena, &child_ctx);
+    int rc = parse_zone_buffer(file_content, strlen(file_content), arena, &child_ctx, &child_st, false);
 
     if (rc < 0 && ctx && ctx->err_out && !ctx->err_out->file_path) {
         ctx->err_out->file_path = resolved;
     }
 
     ctx->visited_count--;
-
-    *origin_io = saved_origin;
 
     return rc;
 }
@@ -445,6 +494,37 @@ dns_record_t *arena_alloc_record(zone_arena_t *arena, parse_context_t *ctx, cons
     dns_record_t *rec = &arena->records[arena->count++];
     memset(rec, 0, sizeof(dns_record_t));
     return rec;
+}
+
+/* クラス欄のニーモニック (RFC 1035 §5.1, RFC 3597 §5)。大文字小文字は区別しない (RFC 1035 §2.3.3)。
+ * NONE/ANY も「クラス欄」としては認識し、ゾーンデータに使えるかは呼び出し側で判定する。 */
+static bool parse_class_token(const char *s, uint16_t *out) {
+    if (strcasecmp(s, "IN") == 0) { *out = 1; return true; }
+    if (strcasecmp(s, "CH") == 0) { *out = 3; return true; }
+    if (strcasecmp(s, "HS") == 0) { *out = 4; return true; }
+    if (strcasecmp(s, "NONE") == 0) { *out = 254; return true; }
+    if (strcasecmp(s, "ANY") == 0) { *out = 255; return true; }
+    if (strncasecmp(s, "CLASS", 5) == 0 && s[5] != '\0') {
+        unsigned long v = 0;
+        for (const char *d = s + 5; *d; d++) {
+            if (*d < '0' || *d > '9') return false;
+            v = v * 10 + (unsigned long)(*d - '0');
+            if (v > 65535) return false;
+        }
+        *out = (uint16_t)v;
+        return true;
+    }
+    return false;
+}
+
+/* ゾーンデータとして置けないクラス: 0 (予約)、NONE/ANY (QCLASS と UPDATE 専用。RFC 6895 §3.2、
+ * RFC 2136 §2.4)、KariDNS が内部で使う私用クラス (ゾーンファイルから注入させない)。 */
+static bool class_allowed_in_zone_data(uint16_t cls) {
+    return cls != 0 && cls != 254 && cls != 255 && cls != DNS_CLASS_KARIDNS_EXT;
+}
+
+static void upcase_in_place(char *s) {
+    for (; *s; s++) *s = (char)toupper((unsigned char)*s);
 }
 
 #define MAX_GENERATE_COUNT 100000
@@ -506,9 +586,41 @@ static int parse_generate_range(const char *range_str, generate_range_t *out, pa
     return 0;
 }
 
+/* BIND の $GENERATE の n/N 修飾子 (lib/dns/master.c nibbles()): 値を下位ニブルから順に 1 桁ずつ
+ * '.' で区切って書く (逆引きの ip6.arpa 名を作るため)。width は '.' も含めた文字数で、足りなければ 0 を補う。 */
+static int generate_nibbles(char *out, size_t out_cap, int width, char mode, uint64_t value) {
+    static const char hex_lc[] = "0123456789abcdef", hex_uc[] = "0123456789ABCDEF";
+    const char *hex = (mode == 'n') ? hex_lc : hex_uc;
+    size_t n = 0;
+    do {
+        if (n + 1 >= out_cap) return -1;
+        out[n++] = hex[value & 0x0f];
+        value >>= 4;
+        if (width > 0) width--;
+        if (width > 0 || value != 0) {
+            if (n + 1 >= out_cap) return -1;
+            out[n++] = '.';
+            if (width > 0) width--;
+        }
+    } while (value != 0 || width > 0);
+    out[n] = '\0';
+    return (int)n;
+}
+
+/* BIND の genname() と同じ規則で $GENERATE の lhs / rhs を展開する。
+ * "$" は値、"$$" は "$"、"${offset[,width[,base]]}" の base は d o x X n N。
+ * '\' はその次の 1 文字と一緒にそのまま写す ("\$" は後で名前・RDATA として読むときに '$' になる)。 */
 static size_t expand_generate_template(const char *tmpl, uint64_t value, char *out, size_t out_cap, parse_error_t *err_out) {
     size_t out_len = 0;
     for (const char *p = tmpl; *p; ) {
+        if (*p == '\\') {
+            size_t n = (p[1] != '\0') ? 2 : 1;
+            if (out_len + n > out_cap) return (size_t)-1;
+            memcpy(out + out_len, p, n);
+            out_len += n;
+            p += n;
+            continue;
+        }
         if (*p == '$') {
             p++;
             if (*p == '$') {
@@ -546,16 +658,25 @@ static size_t expand_generate_template(const char *tmpl, uint64_t value, char *o
                 }
                 p++;
             }
-            if (base != 'd' && base != 'o' && base != 'x' && base != 'X') {
-                if (err_out) err_out->error_message = "$GENERATE base must be one of d,o,x,X";
+            if (base != 'd' && base != 'o' && base != 'x' && base != 'X' && base != 'n' && base != 'N') {
+                if (err_out) err_out->error_message = "$GENERATE base must be one of d,o,x,X,n,N";
                 return (size_t)-1;
             }
 
             int64_t v = (int64_t)value + offset;
-            char numbuf[80];
-            const char *fmt = (base == 'd') ? "%0*lld" : (base == 'o') ? "%0*llo" : (base == 'x') ? "%0*llx" : "%0*llX";
-            int n = (base == 'd') ? snprintf(numbuf, sizeof(numbuf), fmt, width, (long long)v)
+            char numbuf[160];
+            int n;
+            if (base == 'n' || base == 'N') {
+                if (v < 0) {
+                    if (err_out) err_out->error_message = "$GENERATE nibble value must not be negative";
+                    return (size_t)-1;
+                }
+                n = generate_nibbles(numbuf, sizeof(numbuf), width, base, (uint64_t)v);
+            } else {
+                const char *fmt = (base == 'd') ? "%0*lld" : (base == 'o') ? "%0*llo" : (base == 'x') ? "%0*llx" : "%0*llX";
+                n = (base == 'd') ? snprintf(numbuf, sizeof(numbuf), fmt, width, (long long)v)
                                   : snprintf(numbuf, sizeof(numbuf), fmt, width, (unsigned long long)v);
+            }
             if (n < 0 || (size_t)n >= sizeof(numbuf)) return (size_t)-1;
             if (out_len + (size_t)n > out_cap) return (size_t)-1;
             memcpy(out + out_len, numbuf, (size_t)n);
@@ -570,138 +691,150 @@ static size_t expand_generate_template(const char *tmpl, uint64_t value, char *o
     return out_len;
 }
 
+static void generate_error(parse_context_t *ctx, const char *msg, const char *tok, const char *cur_buf) {
+    if (!ctx || !ctx->err_out) return;
+    if (msg) ctx->err_out->error_message = msg;
+    ctx->err_out->error_offset = (size_t)(tok - cur_buf);
+    ctx->err_out->token_length = strlen(tok);
+}
+
+/* 展開した lhs は 1 行の先頭のオーナー名として読み直すので、1 トークンでなければならない */
+static bool generate_lhs_is_single_token(const char *s) {
+    if (s[0] == '\0' || s[0] == '$') return false;
+    for (; *s; s++) {
+        if (*s == '\\') {
+            if (s[1] == '\0') return false;
+            s++;
+            continue;
+        }
+        if (IS_SPACE(*s) || IS_NEWLINE(*s) || *s == '"' || *s == ';' || *s == '(' || *s == ')') return false;
+    }
+    return true;
+}
+
+/* $GENERATE range lhs [ttl] [class] type rhs (BIND の構文。ttl と class は順不同)。
+ * rhs は 1 フィールドで、空白を含む RDATA は引用符で囲む (例: MX "10 mail$")。
+ * 値ごとに "lhs [ttl] [class] type rhs" の 1 行を作り、通常のレコード行と同じ処理に通す
+ * (BIND も展開した rhs を通常の RDATA として読む)。そのため型の制限は無く、検証・エスケープ・
+ * TTL の既定値・$ECS-SUBNET / $LOCATION のタグも通常の行と同じになる (R-22 e, D-18)。 */
 static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
-                             parse_context_t *ctx, const char *origin,
-                             const char *default_ttl, const char *cur_buf,
-                             const char *ecs_tag, const char *loc_tag) {
+                             parse_context_t *ctx, const zone_parse_state_t *st, const char *cur_buf) {
     if (field_idx < 5) {
-        if (ctx && ctx->err_out) ctx->err_out->error_message = "$GENERATE requires range lhs type rhs";
+        generate_error(ctx, "$GENERATE requires range lhs [ttl] [class] type rhs", fields[0], cur_buf);
         return -1;
     }
     parse_error_t local_err = {0};
     generate_range_t range;
     if (parse_generate_range(fields[1], &range, &local_err) != 0) {
-        if (ctx && ctx->err_out) {
-            ctx->err_out->error_message = local_err.error_message;
-            ctx->err_out->error_offset = (size_t)(fields[1] - cur_buf);
-            ctx->err_out->token_length = strlen(fields[1]);
-        }
+        generate_error(ctx, local_err.error_message, fields[1], cur_buf);
         return -1;
     }
 
     const char *lhs_tmpl = fields[2];
-    const char *type_str = NULL;
-    const char *rhs_tmpl = NULL;
-    const char *class_str = "IN";
-    const char *ttl_str = default_ttl;
-
+    const char *ttl_str = NULL, *class_str = NULL, *type_str = NULL, *rhs_tmpl = NULL;
     int i = 3;
-    while (i < field_idx) {
-        char first_char = fields[i][0];
-        if (first_char >= '0' && first_char <= '9') {
+    for (; i < field_idx; i++) {
+        uint16_t cls;
+        if (!ttl_str && fields[i][0] >= '0' && fields[i][0] <= '9') {
             ttl_str = fields[i];
-        } else if (strcasecmp(fields[i], "IN") == 0 || strcasecmp(fields[i], "CH") == 0) {
+        } else if (!class_str && parse_class_token(fields[i], &cls)) {
             class_str = fields[i];
         } else {
             type_str = fields[i];
-            if (i + 1 < field_idx) {
-                rhs_tmpl = fields[i + 1];
-            }
             break;
         }
-        i++;
     }
-
+    if (type_str && i + 1 < field_idx) rhs_tmpl = fields[i + 1];
     if (!type_str || !rhs_tmpl) {
-        if (ctx && ctx->err_out) {
-            ctx->err_out->error_message = "$GENERATE requires range lhs [ttl] [class] type rhs";
-            ctx->err_out->error_offset = (size_t)(fields[0] - cur_buf);
-            ctx->err_out->token_length = strlen(fields[0]);
-        }
+        generate_error(ctx, "$GENERATE requires range lhs [ttl] [class] type rhs", fields[0], cur_buf);
+        return -1;
+    }
+    if (i + 2 < field_idx) {
+        generate_error(ctx, "$GENERATE rhs must be a single field (quote an rhs that contains spaces)",
+                       fields[i + 2], cur_buf);
+        return -1;
+    }
+    if (get_type_code(type_str) == 0) {
+        generate_error(ctx, "Unknown record type", type_str, cur_buf);
         return -1;
     }
 
-    uint16_t type_code = get_type_code(type_str);
-    if (type_code != 1 && type_code != 28 && type_code != 2 &&
-        type_code != 5 && type_code != 12 && type_code != 39 &&
-        type_code != 16) {
-        if (ctx && ctx->err_out) {
-            ctx->err_out->error_message = "$GENERATE does not support this record type";
-            ctx->err_out->error_offset = (size_t)(fields[3] - cur_buf);
-            ctx->err_out->token_length = strlen(fields[3]);
-        }
-        return -1;
-    }
-
-    char name_buf[512], rdata_buf[512];
+    char lhs_buf[DNS_NAME_TEXT_SIZE], rhs_buf[4096];
     for (uint64_t v = range.start; v <= range.stop; v += range.step) {
-        size_t name_len = expand_generate_template(lhs_tmpl, v, name_buf, sizeof(name_buf), &local_err);
-        if (name_len == (size_t)-1) {
-            if (ctx && ctx->err_out) {
-                ctx->err_out->error_message = local_err.error_message ? local_err.error_message : "$GENERATE lhs expansion failed";
-                ctx->err_out->error_offset = (size_t)(fields[2] - cur_buf);
-                ctx->err_out->token_length = strlen(fields[2]);
-            }
+        size_t lhs_len = expand_generate_template(lhs_tmpl, v, lhs_buf, sizeof(lhs_buf), &local_err);
+        if (lhs_len == (size_t)-1) {
+            generate_error(ctx, local_err.error_message ? local_err.error_message : "$GENERATE lhs expansion failed",
+                           fields[2], cur_buf);
             return -1;
         }
-        size_t rdata_len = expand_generate_template(rhs_tmpl, v, rdata_buf, sizeof(rdata_buf), &local_err);
-        if (rdata_len == (size_t)-1) {
-            if (ctx && ctx->err_out) {
-                ctx->err_out->error_message = local_err.error_message ? local_err.error_message : "$GENERATE rhs expansion failed";
-                ctx->err_out->error_offset = (size_t)(fields[4] - cur_buf);
-                ctx->err_out->token_length = strlen(fields[4]);
-            }
+        if (!generate_lhs_is_single_token(lhs_buf)) {
+            generate_error(ctx, "$GENERATE lhs must expand to a single owner name", fields[2], cur_buf);
+            return -1;
+        }
+        size_t rhs_len = expand_generate_template(rhs_tmpl, v, rhs_buf, sizeof(rhs_buf), &local_err);
+        if (rhs_len == (size_t)-1) {
+            generate_error(ctx, local_err.error_message ? local_err.error_message : "$GENERATE rhs expansion failed",
+                           rhs_tmpl, cur_buf);
             return -1;
         }
 
-        dns_record_t *rec = arena_alloc_record(arena, ctx, fields[0], cur_buf);
-        if (!rec) return -1;
-        rec->ecs_subnet_tag = (char *)ecs_tag;
-        rec->bind_location_tag = (char *)loc_tag;
-
-        char *name_copy = arena_alloc(arena, name_len + 1);
-        if (!name_copy) { if (ctx && ctx->err_out) ctx->err_out->error_message = "Out of memory"; return -1; }
-        memcpy(name_copy, name_buf, name_len + 1);
-
-        char *rdata_copy = arena_alloc(arena, rdata_len + 1);
-        if (!rdata_copy) { if (ctx && ctx->err_out) ctx->err_out->error_message = "Out of memory"; return -1; }
-        memcpy(rdata_copy, rdata_buf, rdata_len + 1);
-
-        rec->name = expand_domain_name(name_copy, origin, arena);
-        if (!validate_domain_name_length(rec->name, ctx ? ctx->err_out : NULL, fields[0], cur_buf)) {
+        /* レコードは行バッファ内の文字列を指すので、行はアリーナに置く */
+        size_t line_cap = lhs_len + rhs_len + strlen(type_str) + (ttl_str ? strlen(ttl_str) : 0) +
+                          (class_str ? strlen(class_str) : 0) + 8;
+        char *line = arena_alloc(arena, line_cap);
+        if (!line) {
+            generate_error(ctx, "Out of memory", fields[0], cur_buf);
             return -1;
         }
-        rec->ttl = (char *)ttl_str;
-        rec->ttl_value = rec->ttl ? parse_ttl_value(rec->ttl) : 3600;
-        rec->class_str = (char *)class_str;
-        rec->type = (char *)type_str;
-        rec->type_code = type_code;
-        rec->rdata_count = 1;
-        rec->rdata[0] = rdata_copy;
-
-        if (type_code == 2 || type_code == 5 || type_code == 12 || type_code == 39) {
-            rec->rdata[0] = expand_domain_name(rec->rdata[0], origin, arena);
-            if (!validate_domain_name_length(rec->rdata[0], ctx ? ctx->err_out : NULL, fields[4], cur_buf)) {
-                return -1;
-            }
+        int line_len = snprintf(line, line_cap, "%s %s%s%s%s%s %s\n", lhs_buf,
+                                ttl_str ? ttl_str : "", ttl_str ? " " : "",
+                                class_str ? class_str : "", class_str ? " " : "", type_str, rhs_buf);
+        if (line_len < 0 || (size_t)line_len >= line_cap) {
+            generate_error(ctx, "$GENERATE line too long", fields[0], cur_buf);
+            return -1;
         }
 
-        if (v == UINT64_MAX) break;
+        /* 生成した行で origin が変わることは無いが、親の origin は書き換えさせない */
+        char *gen_origin = *st->origin_io;
+        zone_parse_state_t gen_st = *st;
+        gen_st.origin_io = &gen_origin;
+        if (parse_zone_buffer(line, (size_t)line_len, arena, ctx, &gen_st, false) < 0) {
+            /* エラー位置は生成した行ではなく、$GENERATE の行を指す */
+            generate_error(ctx, NULL, fields[0], cur_buf);
+            return -1;
+        }
+
+        if (range.stop - v < range.step) break;
     }
     return 0;
 }
 
 int parse_zone_fast(char *buf, size_t size, zone_arena_t *arena, parse_context_t *ctx) {
-  char *prev_owner = NULL;
   char *origin = ctx ? (char *)ctx->default_origin : NULL;
   char *local_ttl_storage = NULL;
+  char *last_ttl = NULL;
   char *local_ecs_tag_storage = NULL;
   char *local_loc_tag_storage = NULL;
+  zone_parse_state_t st = {
+    .origin_io = &origin,
+    .ttl_io = (ctx && ctx->shared_ttl_io) ? ctx->shared_ttl_io : &local_ttl_storage,
+    .last_ttl_io = &last_ttl,
+    .ecs_tag_io = (ctx && ctx->shared_ecs_tag_io) ? ctx->shared_ecs_tag_io : &local_ecs_tag_storage,
+    .loc_tag_io = (ctx && ctx->shared_loc_tag_io) ? ctx->shared_loc_tag_io : &local_loc_tag_storage,
+  };
+  return parse_zone_buffer(buf, size, arena, ctx, &st, true);
+}
+
+/* finalize: 最上位のファイルの読み込みの最後に、全レコードの前処理キャッシュを作る。
+ * $INCLUDE と $GENERATE の行は最上位がまとめて処理するので false で呼ぶ。 */
+static int parse_zone_buffer(char *buf, size_t size, zone_arena_t *arena, parse_context_t *ctx,
+                             const zone_parse_state_t *st, bool finalize) {
+  char *prev_owner = NULL;
   char **prev_owner_io = &prev_owner;
-  char **origin_io = &origin;
-  char **default_ttl_str_io = (ctx && ctx->shared_ttl_io) ? ctx->shared_ttl_io : &local_ttl_storage;
-  char **ecs_tag_io = (ctx && ctx->shared_ecs_tag_io) ? ctx->shared_ecs_tag_io : &local_ecs_tag_storage;
-  char **loc_tag_io = (ctx && ctx->shared_loc_tag_io) ? ctx->shared_loc_tag_io : &local_loc_tag_storage;
+  char **origin_io = st->origin_io;
+  char **default_ttl_str_io = st->ttl_io;
+  char **ecs_tag_io = st->ecs_tag_io;
+  char **loc_tag_io = st->loc_tag_io;
   if (!buf || size == 0 || !arena)
     return -1;
   char *p = buf, *end = buf + size;
@@ -923,24 +1056,26 @@ PROCESS_RECORD:
   }
   if (fields[0][0] == '$' && strcasecmp(fields[0], "$ORIGIN") == 0) {
     if (field_idx > 1) {
-      if (!validate_domain_name_length(fields[1], ctx ? ctx->err_out : NULL, fields[1], buf)) {
+      /* RFC 1035 §5.1: 相対名の $ORIGIN は現在の origin を補って絶対名にする (R-22 d) */
+      char *new_origin = expand_domain_name(fields[1], *origin_io, arena);
+      if (!validate_domain_name_length(new_origin, ctx ? ctx->err_out : NULL, fields[1], buf)) {
         return -1;
       }
-      *origin_io = fields[1];
+      *origin_io = new_origin;
     }
     if (p < end)
       goto STATE_START_LINE;
     goto DONE;
   }
     if (fields[0][0] == '$' && strcasecmp(fields[0], "$INCLUDE") == 0) {
-        if (process_include(fields, field_idx, arena, ctx, origin_io, buf) < 0)
+        if (process_include(fields, field_idx, arena, ctx, st, buf) < 0)
             return -1;
         if (p < end)
             goto STATE_START_LINE;
         goto DONE;
     }
     if (fields[0][0] == '$' && strcasecmp(fields[0], "$GENERATE") == 0) {
-        if (process_generate(fields, field_idx, arena, ctx, *origin_io, *default_ttl_str_io, buf, *ecs_tag_io, *loc_tag_io) != 0)
+        if (process_generate(fields, field_idx, arena, ctx, st, buf) != 0)
             return -1;
         if (p < end)
             goto STATE_START_LINE;
@@ -1081,20 +1216,33 @@ PROCESS_RECORD:
       return -1;
   }
   *prev_owner_io = rec->name;
-  rec->ttl = *default_ttl_str_io;
+  rec->ttl = NULL;
   rec->class_str = NULL;
   rec->type = NULL;
   rec->rdata_count = 0;
+  /* RFC 1035 §5.1: <owner> [<TTL>] [<class>] <type> <RDATA>。TTL と class は順不同で各 1 回
+   * (2 つ目は型として読むので、BIND と同じく不正な型になる)。 */
+  char *explicit_ttl = NULL;
+  uint16_t class_val = 1; // クラス省略時は IN (BIND はゾーンのクラスを使う。KariDNS のゾーンは IN)
   int i = 1;
   while (i < field_idx) {
     char first_char = fields[i][0];
-    if (first_char >= '0' && first_char <= '9')
-      rec->ttl = fields[i];
-    else if ((first_char == 'I' && fields[i][1] == 'N' &&
-              fields[i][2] == '\0') ||
-             strcmp(fields[i], "CH") == 0)
+    uint16_t cls;
+    if (!explicit_ttl && first_char >= '0' && first_char <= '9')
+      explicit_ttl = fields[i];
+    else if (!rec->class_str && parse_class_token(fields[i], &cls)) {
+      if (!class_allowed_in_zone_data(cls)) {
+        if (ctx && ctx->err_out) {
+          ctx->err_out->error_message = "Class not allowed in zone data (0, NONE, ANY or a reserved class)";
+          ctx->err_out->error_offset = (size_t)(fields[i] - buf);
+          ctx->err_out->token_length = strlen(fields[i]);
+        }
+        return -1;
+      }
+      upcase_in_place(fields[i]);
       rec->class_str = fields[i];
-    else {
+      class_val = cls;
+    } else {
       rec->type = fields[i];
       i++;
       break;
@@ -1131,6 +1279,7 @@ PROCESS_RECORD:
     }
     return -1;
   }
+  upcase_in_place(rec->type); // 型名は大文字小文字を区別しない (RFC 1035 §2.3.3)。以後は大文字の綴りで扱う
 
   /* Meta-types (OPT/TKEY/TSIG/IXFR/AXFR/MAILB/MAILA/ANY, and NXNAME per
    * RFC 9824) are QTYPE-only / synthesized-on-the-fly pseudo-RRs. They must
@@ -1147,11 +1296,22 @@ PROCESS_RECORD:
     return -1;
   }
   
-  rec->ttl_value = rec->ttl ? parse_ttl_value(rec->ttl) : 3600;
-  rec->class_val = 1; // Default to IN
-  if (rec->class_str && strcasecmp(rec->class_str, "CH") == 0) {
-      rec->class_val = 3;
+  /* TTL を省略したときの値 (R-22 c)。BIND (lib/dns/master.c) と同じ順で決める:
+   * 明示した TTL > $TTL (RFC 2308 §4) > 最後に明示された TTL (RFC 1035 §5.1) >
+   * TTL の手がかりが無い SOA ならその MINIMUM (以後の既定値になる) > 3600。 */
+  if (explicit_ttl) {
+    rec->ttl = explicit_ttl;
+    *st->last_ttl_io = explicit_ttl;
+  } else if (*default_ttl_str_io) {
+    rec->ttl = *default_ttl_str_io;
+  } else if (*st->last_ttl_io) {
+    rec->ttl = *st->last_ttl_io;
+  } else if (rec->type_code == 6 && rec->rdata_count == 7) {
+    rec->ttl = rec->rdata[6];
+    *default_ttl_str_io = rec->rdata[6];
   }
+  rec->ttl_value = rec->ttl ? parse_ttl_value(rec->ttl) : 3600;
+  rec->class_val = class_val;
   
   // A-1: Unescape fields appropriately
   // Owner name, type, class, ttl are handled without unescaping.
@@ -1513,8 +1673,10 @@ PROCESS_RECORD:
   if (p < end)
     goto STATE_START_LINE;
 DONE:
-  for (size_t i = 0; i < arena->count; i++) {
-    dns_record_preparse_cache(arena, &arena->records[i]);
+  if (finalize) {
+    for (size_t i = 0; i < arena->count; i++) {
+      dns_record_preparse_cache(arena, &arena->records[i]);
+    }
   }
   return arena->count;
 }
@@ -1522,7 +1684,6 @@ DONE:
 void zone_arena_init(zone_arena_t *arena) {
   if (!arena) return;
   memset(arena, 0, sizeof(*arena));
-  atomic_init(&arena->reader_count, 0);
 }
 void zone_arena_free_include_buffers(zone_arena_t *arena) {
   for (int i = 0; i < arena->file_buf_count; i++) {
@@ -1582,12 +1743,7 @@ void zone_arena_destroy(zone_arena_t *arena) {
   for (int i = 0; i < arena->data_pool_count; i++)
     free(arena->data_pools[i]);
   free(arena->hash_table);
-  free(arena->nsec_records);
-  arena->nsec_records = NULL;
-  arena->nsec_count = 0;
-  free(arena->sorted_unique_names);
-  arena->sorted_unique_names = NULL;
-  arena->sorted_unique_count = 0;
+  zone_arena_free_sorted_indexes(arena);
   free(arena->locations);
   arena->locations = NULL;
   arena->location_count = 0;
@@ -1652,6 +1808,204 @@ static int cmp_canonical_name_ptr(const void *a, const void *b) {
   const char *s1 = *(const char * const *)a;
   const char *s2 = *(const char * const *)b;
   return compare_canonical_name(s1, s2);
+}
+
+void zone_arena_free_sorted_indexes(zone_arena_t *arena) {
+  free(arena->nsec_records);
+  arena->nsec_records = NULL;
+  arena->nsec_count = 0;
+  free(arena->nsec3_chains);
+  arena->nsec3_chains = NULL;
+  arena->nsec3_chain_count = 0;
+  free(arena->nsec3_entries);
+  arena->nsec3_entries = NULL;
+  memset(&arena->nsec3_active, 0, sizeof(arena->nsec3_active));
+  free(arena->sorted_unique_names);
+  arena->sorted_unique_names = NULL;
+  arena->sorted_unique_count = 0;
+}
+
+bool nsec3_rdata_params(const dns_record_t *rec, uint8_t *algorithm, uint16_t *iterations, const char **salt) {
+  if (!rec || rec->rdata_count < 4 || !rec->rdata[3] ||
+      !parse_u8(rec->rdata[0], algorithm) || !parse_u16(rec->rdata[2], iterations))
+    return false;
+  *salt = rec->rdata[3];
+  return true;
+}
+
+/* RFC 5155 §3.3: the salt field is "-" when the salt is empty; hex digits compare case-insensitively. */
+static int cmp_nsec3_salt(const char *a, const char *b) {
+  if (strcmp(a, "-") == 0) a = "";
+  if (strcmp(b, "-") == 0) b = "";
+  return strcasecmp(a, b);
+}
+
+static int cmp_nsec3_params(uint8_t a_alg, uint16_t a_it, const char *a_salt,
+                            uint8_t b_alg, uint16_t b_it, const char *b_salt) {
+  if (a_alg != b_alg) return a_alg < b_alg ? -1 : 1;
+  if (a_it != b_it) return a_it < b_it ? -1 : 1;
+  return cmp_nsec3_salt(a_salt, b_salt);
+}
+
+static int cmp_nsec3_hash(const char *a, size_t a_len, const char *b, size_t b_len) {
+  int c = strncasecmp(a, b, a_len < b_len ? a_len : b_len);
+  if (c != 0) return c;
+  return a_len < b_len ? -1 : (a_len > b_len ? 1 : 0);
+}
+
+static int cmp_nsec3_entry_params(const nsec3_index_entry_t *x, const nsec3_index_entry_t *y) {
+  return cmp_nsec3_params(x->algorithm, x->iterations, x->salt, y->algorithm, y->iterations, y->salt);
+}
+
+static int cmp_nsec3_entry(const void *a, const void *b) {
+  const nsec3_index_entry_t *x = a, *y = b;
+  int c = cmp_nsec3_entry_params(x, y);
+  return c != 0 ? c : cmp_nsec3_hash(x->hash, x->hash_len, y->hash, y->hash_len);
+}
+
+/* Fills `e` for an NSEC3 RR that can be indexed: all five fixed RDATA fields, and an owner whose first label is
+ * base32hex digits only (RFC 4648 §7, at most 63 octets) followed by the zone name. */
+static bool nsec3_index_entry_init(dns_record_t *rec, nsec3_index_entry_t *e) {
+  if (!rec->name || rec->type_code != 50 || rec->rdata_count < 5 || !rec->rdata[4] ||
+      !nsec3_rdata_params(rec, &e->algorithm, &e->iterations, &e->salt))
+    return false;
+  const char *dot = strchr(rec->name, '.');
+  if (!dot || dot == rec->name || dot[1] == '\0' || dot - rec->name > 63) return false;
+  for (const char *p = rec->name; p < dot; p++) {
+    char c = (char)toupper((unsigned char)*p);
+    if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'V'))) return false;
+  }
+  e->hash = rec->name;
+  e->hash_len = (uint8_t)(dot - rec->name);
+  e->rec = rec;
+  return true;
+}
+
+/* RFC 5155 §7.2: the covering and matching NSEC3 RRs of an answer come from one chain. Group the NSEC3 RRs by
+ * (algorithm, iterations, salt) and sort each group in hash order for binary search (R-34). Returns -1 on OOM. */
+static int build_nsec3_index(zone_arena_t *arena) {
+  size_t n = 0;
+  nsec3_index_entry_t tmp;
+  for (size_t i = 0; i < arena->count; i++)
+    if (nsec3_index_entry_init(&arena->records[i], &tmp)) n++;
+  if (n == 0) return 0;
+
+  nsec3_index_entry_t *entries = malloc(sizeof(*entries) * n);
+  if (!entries) return -1;
+  size_t k = 0;
+  for (size_t i = 0; i < arena->count && k < n; i++)
+    if (nsec3_index_entry_init(&arena->records[i], &entries[k])) k++;
+  qsort(entries, k, sizeof(*entries), cmp_nsec3_entry);
+
+  size_t chains = 0;
+  for (size_t i = 0; i < k; i++)
+    if (i == 0 || cmp_nsec3_entry_params(&entries[i - 1], &entries[i]) != 0) chains++;
+  nsec3_chain_t *chain = calloc(chains, sizeof(*chain));
+  if (!chain) {
+    free(entries);
+    return -1;
+  }
+  size_t c = 0;
+  for (size_t i = 0; i < k; i++) {
+    if (i == 0 || cmp_nsec3_entry_params(&entries[i - 1], &entries[i]) != 0) {
+      nsec3_chain_t *ch = &chain[c++];
+      ch->algorithm = entries[i].algorithm;
+      ch->iterations = entries[i].iterations;
+      ch->salt = entries[i].salt;
+      ch->entries = &entries[i];
+    }
+    chain[c - 1].count++;
+  }
+  arena->nsec3_entries = entries;
+  arena->nsec3_chains = chain;
+  arena->nsec3_chain_count = chains;
+  return 0;
+}
+
+const nsec3_chain_t *zone_find_nsec3_chain(const zone_arena_t *arena, const dns_record_t *param) {
+  uint8_t alg;
+  uint16_t it;
+  const char *salt;
+  if (!arena || !nsec3_rdata_params(param, &alg, &it, &salt)) return NULL;
+  for (size_t i = 0; i < arena->nsec3_chain_count; i++) {
+    const nsec3_chain_t *ch = &arena->nsec3_chains[i];
+    if (cmp_nsec3_params(ch->algorithm, ch->iterations, ch->salt, alg, it, salt) == 0) return ch;
+  }
+  return NULL;
+}
+
+size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out) {
+  if (!hex || strcmp(hex, "-") == 0) return 0;
+  size_t hlen = strlen(hex);
+  if (hlen % 2 != 0 || hlen / 2 > max_out) return (size_t)-1;
+  for (size_t i = 0; i < hlen; i += 2) {
+    int hi = hex_char_to_val(hex[i]), lo = hex_char_to_val(hex[i + 1]);
+    if (hi < 0 || lo < 0) return (size_t)-1;
+    out[i / 2] = (uint8_t)((hi << 4) | lo);
+  }
+  return hlen / 2;
+}
+
+/* RFC 5155 §3.1.7: every Next Hashed Owner Name is the owner hash of the following RR in hash order, and the last RR
+ * points back to the first, so a complete chain covers every possible hash. */
+static bool nsec3_chain_complete(const nsec3_chain_t *ch) {
+  for (size_t i = 0; i < ch->count; i++) {
+    const nsec3_index_entry_t *next = &ch->entries[(i + 1) % ch->count];
+    const char *nh = ch->entries[i].rec->rdata[4];
+    if (strlen(nh) != next->hash_len || strncasecmp(nh, next->hash, next->hash_len) != 0) return false;
+  }
+  return ch->count > 0;
+}
+
+/* R-31: choose the NSEC3 parameters of the zone once, when the index is built (not per query). The apex is the owner
+ * of the SOA. Usable NSEC3PARAM RRs at the apex: Flags 0 (RFC 5155 §4.1.2 "NSEC3PARAM RRs with a Flags field value
+ * other than zero MUST be ignored"), hash algorithm 1 (SHA-1, the only one defined, §11; §7.4 for unknown ones), and
+ * a salt of 0-255 octets in hex (§3.1.5, §3.2). With several of them the server "must choose one" (§7.3): the first
+ * in record order whose chain is complete, else the first whose chain is indexed, else the first usable one. */
+static void select_nsec3_params(zone_arena_t *arena) {
+  const char *apex = NULL;
+  for (size_t i = 0; i < arena->count && !apex; i++)
+    if (arena->records[i].name && arena->records[i].type_code == 6) apex = arena->records[i].name;
+  if (!apex) return;
+
+  size_t seen = 0, usable = 0;
+  int best_rank = 0; // 3 = complete chain, 2 = indexed chain, 1 = usable without NSEC3 RRs
+  for (size_t i = 0; i < arena->count; i++) {
+    const dns_record_t *rec = &arena->records[i];
+    if (rec->type_code != 51 || !rec->name || !domain_names_match_ci(rec->name, apex)) continue;
+    seen++;
+    uint8_t alg, flags;
+    uint16_t it;
+    const char *salt_text;
+    nsec3_params_t p;
+    memset(&p, 0, sizeof(p));
+    if (!nsec3_rdata_params(rec, &alg, &it, &salt_text) || !parse_u8(rec->rdata[1], &flags) || flags != 0 ||
+        alg != 1)
+      continue;
+    size_t salt_len = hex_to_bytes(salt_text, p.salt, sizeof(p.salt));
+    if (salt_len == (size_t)-1) continue;
+    usable++;
+    p.param = rec;
+    p.chain = zone_find_nsec3_chain(arena, rec);
+    p.algorithm = alg;
+    p.iterations = it;
+    p.salt_len = (uint8_t)salt_len;
+    int rank = !p.chain ? 1 : (nsec3_chain_complete(p.chain) ? 3 : 2);
+    if (rank > best_rank) {
+      best_rank = rank;
+      arena->nsec3_active = p;
+    }
+  }
+  if (seen == 0) return;
+  const nsec3_params_t *a = &arena->nsec3_active;
+  if (!a->param) {
+    syslog(LOG_NOTICE, "[Zone] %s: none of the %zu NSEC3PARAM RRs is usable (Flags 0, algorithm 1, salt of at most "
+           "255 octets; RFC 5155 s4.1.2); NSEC3 is not used for denial of existence", apex, seen);
+  } else if (usable > 1 || best_rank < 3) {
+    syslog(LOG_NOTICE, "[Zone] %s: using NSEC3PARAM 1 0 %u %s (%zu usable of %zu; chain %s)", apex, a->iterations,
+           a->param->rdata[3], usable, seen,
+           best_rank == 3 ? "complete" : (best_rank == 2 ? "INCOMPLETE" : "MISSING"));
+  }
 }
 
 /* [T9] RFC 2181 s5.2: same owner+type RRset TTLs normalized to minimum.
@@ -1744,16 +2098,7 @@ int build_zone_index(zone_arena_t *arena, bool harmonize_ttls) {
     free(arena->hash_table);
     arena->hash_table = NULL;
   }
-  if (arena->nsec_records) {
-    free(arena->nsec_records);
-    arena->nsec_records = NULL;
-    arena->nsec_count = 0;
-  }
-  if (arena->sorted_unique_names) {
-    free(arena->sorted_unique_names);
-    arena->sorted_unique_names = NULL;
-    arena->sorted_unique_count = 0;
-  }
+  zone_arena_free_sorted_indexes(arena);
   arena->hash_size = next_pow2(arena->count * 2);
   if (arena->hash_size == 0) arena->hash_size = 1;
   arena->hash_table = malloc(sizeof(int) * arena->hash_size);
@@ -1795,9 +2140,18 @@ int build_zone_index(zone_arena_t *arena, bool harmonize_ttls) {
       arena->nsec_count = idx;
       qsort(arena->nsec_records, arena->nsec_count, sizeof(dns_record_t *), cmp_canonical_nsec_ptr);
     } else {
-      arena->nsec_count = 0;
+      /* X-22: without the index every NSEC lookup would scan the whole zone (the random-subdomain cost of R-34);
+       * fail like the NSEC3 index instead (the callers treat it as a load / transfer / UPDATE failure). */
+      syslog(LOG_ERR, "[Zone] build_zone_index: OOM during NSEC index allocation");
+      return -1;
     }
   }
+
+  if (build_nsec3_index(arena) != 0) {
+    syslog(LOG_ERR, "[Zone] build_zone_index: OOM during NSEC3 index allocation");
+    return -1;
+  }
+  select_nsec3_params(arena);
 
   if (arena->count > 0) {
     char **tmp_names = malloc(sizeof(char *) * arena->count);
@@ -1930,3 +2284,51 @@ int validate_zone_name_lengths(zone_arena_t *arena, parse_error_t *err) {
   return 0;
 }
 
+
+/* ゾーン外のレコード (オーナーが apex でもその下でもない) を取り除く。
+ * RFC 1034 §4.2: ゾーンは apex とその下のデータからなる。RFC 5936 §2.2: AXFR は
+ * そのゾーンを転送する。ゾーン外のデータを読み込むと AXFR で送られ、セカンダリが
+ * 受け取れない (R-27)。BIND と同様に警告して無視する。
+ * build_zone_index() より前 (レコードの添字を指すものが無い間) に呼ぶこと。
+ * report が NULL でなければ、取り除くレコードごとに呼ぶ。戻り値は取り除いた件数。 */
+size_t zone_arena_drop_out_of_zone(zone_arena_t *arena, const char *apex,
+                                   void (*report)(const dns_record_t *rec, void *ud), void *ud) {
+  if (!arena || !apex || !arena->records) return 0;
+  size_t kept = 0, dropped = 0;
+  for (size_t i = 0; i < arena->count; i++) {
+    dns_record_t *r = &arena->records[i];
+    if (r->name && !domain_name_is_at_or_below(r->name, apex)) {
+      if (report) report(r, ud);
+      dropped++;
+      continue;
+    }
+    if (kept != i) arena->records[kept] = *r;
+    kept++;
+  }
+  arena->count = kept;
+  return dropped;
+}
+
+/* X-32: RDATA をワイヤ形式に書けないレコード (パーサは受け付けたが値が型の形式に合わないもの) を取り除く。
+ * 残しておくと応答から黙って落ち、AXFR はそのレコードで転送を打ち切る (後ろのレコードが届かない)。
+ * zone_arena_drop_out_of_zone() と同じく build_zone_index() より前に呼ぶ。戻り値は取り除いた件数。 */
+size_t zone_arena_drop_unencodable(zone_arena_t *arena, void (*report)(const dns_record_t *rec, void *ud), void *ud) {
+  if (!arena || !arena->records) return 0;
+  /* ゾーンの読み込みはクエリの経路ではないので、作業領域はヒープに 1 回だけ取る */
+  uint8_t *buf = malloc(65535);
+  if (!buf) return 0;
+  size_t kept = 0, dropped = 0;
+  for (size_t i = 0; i < arena->count; i++) {
+    dns_record_t *r = &arena->records[i];
+    if (dns_record_canonical_rdata(r, buf, 65535) < 0) {
+      if (report) report(r, ud);
+      dropped++;
+      continue;
+    }
+    if (kept != i) arena->records[kept] = *r;
+    kept++;
+  }
+  arena->count = kept;
+  free(buf);
+  return dropped;
+}

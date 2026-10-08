@@ -96,6 +96,14 @@ static void test_fi_dag_formatters_and_helpers(void) {
     assert(is_qtype_syntax_or_known("A"));
     assert(is_qtype_syntax_or_known("TYPE1"));
     assert(!is_qtype_syntax_or_known("INVALID_TYPE"));
+    /* X-49: like dig, TYPE<n> / CLASS<n> only up to 65535; larger numbers or trailing junk make a domain name */
+    assert(is_qtype_syntax_or_known("TYPE65535"));
+    assert(!is_qtype_syntax_or_known("TYPE65536"));
+    assert(!is_qtype_syntax_or_known("type70000"));
+    assert(is_known_qclass_str("CLASS65535", &qc) && qc == 65535);
+    assert(!is_known_qclass_str("CLASS65536", &qc));
+    assert(!is_known_qclass_str("CLASS70000", &qc));
+    assert(!is_known_qclass_str("CLASS1x", &qc));
 
     assert(parse_opcode_value("QUERY") == 0);
     assert(parse_opcode_value("IQUERY") == 1);
@@ -157,14 +165,14 @@ static void test_fi_dag_formatters_and_helpers(void) {
     uint32_t wh = 0, rh = 0;
     calculate_packet_hashes(dns_pkt, off, &wh, &rh);
 
-    size_t extra_bytes = 0;
-    check_packet_malformed(dns_pkt, off, &extra_bytes);
+    dag_parse_t ps;
+    dag_parse_message(dns_pkt, off, &ps);
 
     query_opts_t qo;
     memset(&qo, 0, sizeof(qo));
     display_opts_t dopt;
     memset(&dopt, 0, sizeof(dopt));
-    print_sent_query(dns_pkt, off, &qo, &dopt);
+    print_sent_query(dns_pkt, off, NULL, 53, false, &qo, &dopt);
 
     (void)count_non_opt_rrs(dns_pkt, off, 12, 0);
 

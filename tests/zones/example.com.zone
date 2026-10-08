@@ -287,7 +287,7 @@ www.example.com. IN NSEC mail.example.com. A AAAA RRSIG NSEC
 @ IN NSEC3PARAM 1 0 10 AABBCCDD
 
 ; ZONEMD: ゾーン全体の内容から計算するダイジェスト
-@       IN ZONEMD 2026071001 1 1 4ba7dc5aab05911764e3a23f4b04ec850bba5d4da9391c2cfa2eca47ad1c1407628c2893906cfe702b9a73d3f3082aa9
+@       IN ZONEMD 2026071001 1 1 e00ecac81c5ec65ca5e45bb7e91b876819801d36c269066db4dd44c2871ca505a711c6deeefdfcfb6e77782d81678474
 
 ; CDS / CDNSKEY: 子ゾーンが親ゾーンにDS/DNSKEY更新を通知
 @       IN CDS     23534 13 2 fcdb742c06b9a17cd02ccd070f9b8f4a9376e1f1a34b960bfab565fbea4e01d8
@@ -334,9 +334,9 @@ eid-node    IN EID \# 4 01020304
 ; NIMLOC (Nimrod Locator, Type 32)
 nimloc-node IN NIMLOC \# 4 01020304
 
-; ATMA (ATM Address, Type 34, RFC 2163)
-; format=0 (E.164) + ASCII digits
-atma-node   IN ATMA 0 16175551234
+; ATMA (ATM Address, Type 34, ATM Forum af-dans-0152.000; BIND atma_34.c presentation)
+; "+" = E.164 (format 1) + ASCII digits
+atma-node   IN ATMA +16175551234
 
 ; A6 (IPv6 with prefix chain, Type 38, RFC 2874)
 ; prefix-length=0 → full IPv6 address, no prefix name required

@@ -254,6 +254,23 @@ int main(void) {
     zone_db_entry_t *fz_root_empty = find_zone_in_view(vs, "");
     assert(fz_root_empty != NULL && strcmp(fz_root_empty->domain, ".") == 0);
 
+    // 5.9 O-08: an escaped dot is part of a label, not a label boundary. "a\.example.com." is the
+    //     label "a.example" under "com." (no such zone here -> root), and "x.a\.test.com." is not
+    //     below "test.com.". Checked on the suffix-hash path and on the linear fallback path.
+    for (int pass = 0; pass < 2; pass++) {
+        size_t saved_size = vs->suffix_hash_size;
+        if (pass == 1) vs->suffix_hash_size = 0;   // force the linear scan
+        zone_db_entry_t *e1 = find_zone_in_view(vs, "a\\.example.com.");
+        assert(e1 != NULL && strcmp(e1->domain, ".") == 0);
+        zone_db_entry_t *e2 = find_zone_in_view(vs, "x.a\\.test.com.");
+        assert(e2 != NULL && strcmp(e2->domain, ".") == 0);
+        zone_db_entry_t *e3 = find_zone_in_view(vs, "a\\.b.example.com.");   // label "a.b" under example.com.
+        assert(e3 != NULL && strcmp(e3->domain, "example.com.") == 0);
+        zone_db_entry_t *e4 = find_zone_in_view(vs, "sp\\032ace.www.sub.example.com.");
+        assert(e4 != NULL && strcmp(e4->domain, "sub.example.com.") == 0);
+        vs->suffix_hash_size = saved_size;
+    }
+
     free_test_snapshot(snap);
     
     // 6. View WITHOUT root zone -> fallback returns NULL
@@ -308,4 +325,12 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr
                         const tcp_sockopts_t *tcp_opts) {
     (void)tcp_opts;
     return broker_connect(family, type, addr, addr_len);
+}
+
+/* send_tcp_dns_message(): goes through the send_tcp_robust() mock above (length prefix, then message) */
+ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len) {
+    uint8_t prefix[2] = {(uint8_t)(len >> 8), (uint8_t)(len & 0xFF)};
+    if (send_tcp_robust(fd, prefix, 2) < 0) return -1;
+    if (send_tcp_robust(fd, msg, len) < 0) return -1;
+    return (ssize_t)len;
 }

@@ -127,6 +127,15 @@ zone "autotc.example." {
     program-max-failures 5;
     disable-auto-tc-flag no;
 };
+
+# X-11: a plugin that exits at once; after program-max-failures the zone is dead
+zone "dead.example." {
+    type program;
+    program "/usr/bin/true";
+    $PROG_USER_OPT
+    program-timeout 1000;
+    program-max-failures 2;
+};
 EOF
 
 # Start karidns
@@ -213,6 +222,29 @@ if (\$rcode == 0 && \$ancount >= 1 && \$res_body =~ /\\xC0\\x00\\x02\\x01/) {
 run_check "Large TCP query (>5000 bytes) to async program zone is not truncated" \
     "$LARGE_TCP_TEST" \
     "SUCCESS: Large TCP query"
+
+# X-11: a plugin that exits must only make its own zone fail. Marking it dead stops the plugin from
+# inside the Capsicum sandbox (kill(pid) used to raise SIGTRAP and stop the whole server).
+echo ""
+echo "=== 3. Testing a program plugin that exits (X-11) ==="
+for n in 1 2 3; do
+    "$DAG" @127.0.0.1 -p $PORT x.dead.example A +timeout=2 +tries=1 >/dev/null 2>&1 || true
+done
+run_check "Plugin that exits is marked dead" \
+    "grep -c \"zone 'dead.example.' exceeded max failures\" $TMP_DIR/karidns.log" \
+    "^1$"
+run_check "Dead program zone answers SERVFAIL" \
+    "$DAG @127.0.0.1 -p $PORT x.dead.example A +timeout=2 +tries=1 +nohexdump" \
+    "status: SERVFAIL"
+run_check "Other program zones still answer after a plugin died" \
+    "$DAG @127.0.0.1 -p $PORT normal.brokentest.example A +timeout=2 +tries=1" \
+    "192\.0\.2\.1"
+run_check "Server process still running after a plugin died" \
+    "kill -0 $SERVER_PID && echo alive" \
+    "^alive$"
+run_check "No child of the server was terminated" \
+    "grep -c 'Terminating all children' $TMP_DIR/karidns.log" \
+    "^0$"
 
 if [ "$FAILED" -gt 0 ] && [ -f "$TMP_DIR/karidns.log" ]; then
     echo "=== Server Log ==="

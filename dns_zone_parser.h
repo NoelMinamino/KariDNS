@@ -7,6 +7,7 @@
 #include <stdatomic.h>
 #include <sys/types.h>
 #include "dns_wire.h"
+#include "dns_utils.h"
 
 typedef struct {
     const char *error_message;
@@ -39,6 +40,13 @@ typedef struct parse_context_s {
     // --- 隍・焚繧ｾ繝ｼ繝ｳ繝ｻ隕ｪ蟄舌だ繝ｼ繝ｳ謖ｯ繧雁・縺醍畑 ---
     const char **all_zone_names;
     int all_zone_count;
+    /* tinydns: all_zone_names のどのゾーンにも属さないため捨てたレコードの数と、
+     * その最初のオーナー名 (arena 内の文字列)。all_zone_names が無ければ数えない。 */
+    size_t out_of_zone_count;
+    const char *first_out_of_zone;
+    /* tinydns: SOA serial に使うデータファイルの mtime (0 = 不明、読み込み時刻を使う)。
+     * パーサ自身はファイルを stat しない (X-13: サンドボックス内の再読み込みではパスを使えない)。 */
+    time_t source_mtime;
 } parse_context_t;
 
 typedef struct {
@@ -73,6 +81,38 @@ typedef struct {
   size_t total_bytes;
 } response_cache_table_t;
 
+/* RFC 5155 §3.1.7: one NSEC3 RR of a chain, keyed by the hashed owner name (the owner's first label, base32hex;
+ * RFC 5155 §2 "hash order" = canonical order of the base32hex labels, compared case-insensitively). */
+typedef struct {
+  const char *hash;  /* first label of rec->name, not NUL-terminated */
+  uint8_t hash_len;
+  uint8_t algorithm;   /* chain parameters of rec (RDATA fields 0, 2, 3) */
+  uint16_t iterations;
+  const char *salt;
+  dns_record_t *rec;
+} nsec3_index_entry_t;
+
+/* RFC 5155 §4 / §7.2: the NSEC3 RRs with the same hash algorithm, iterations and salt, sorted in hash order. */
+typedef struct {
+  uint8_t algorithm;
+  uint16_t iterations;
+  const char *salt;  /* RDATA text: hex digits, "" or "-" (no salt) */
+  nsec3_index_entry_t *entries;
+  size_t count;
+} nsec3_chain_t;
+
+/* R-31: the NSEC3 parameters the zone's denial proofs use, chosen once by build_zone_index() (RFC 5155 §4.1.2:
+ * Flags 0 only; §7.3: one of several NSEC3PARAM RRs; §3.1.5: salt of 0-255 octets). param == NULL: no usable
+ * NSEC3PARAM at the apex, i.e. the zone does not use NSEC3 for answers. */
+typedef struct {
+  const dns_record_t *param;  /* the chosen NSEC3PARAM RR (its owner is the apex) */
+  const nsec3_chain_t *chain; /* its chain in the NSEC3 index, NULL if the zone has no NSEC3 RR for it */
+  uint8_t algorithm;
+  uint16_t iterations;
+  uint8_t salt_len;
+  uint8_t salt[255];
+} nsec3_params_t;
+
 typedef struct zone_arena_s {
   dns_record_t *records;
   size_t count;
@@ -89,9 +129,12 @@ typedef struct zone_arena_s {
   size_t hash_size;
   dns_record_t **nsec_records;
   size_t nsec_count;
+  nsec3_chain_t *nsec3_chains;         /* built by build_zone_index(); entries point into nsec3_entries */
+  size_t nsec3_chain_count;
+  nsec3_index_entry_t *nsec3_entries;
+  nsec3_params_t nsec3_active;         /* built by build_zone_index() */
   char **sorted_unique_names;
   size_t sorted_unique_count;
-  _Atomic int reader_count;
   bool is_tinydns_format; /* parse_tinydns_data()が呼ばれたzone_arenaでのみtrue */
   tinydns_location_entry_t *locations; /* NULL可 */
   int location_count;
@@ -114,11 +157,26 @@ void zone_arena_init(zone_arena_t *arena);
 void zone_arena_destroy(zone_arena_t *arena);
 void zone_arena_free_include_buffers(zone_arena_t *arena);
 void free_zone_response_cache(zone_arena_t *arena);
-void build_zone_response_cache(zone_arena_t *arena, struct server_config_s *cfg, const char *domain);
+void build_zone_response_cache(zone_arena_t *arena, struct server_config_s *cfg, const char *view_name, const char *domain);
 void *arena_alloc(zone_arena_t *arena, size_t size);
 char *arena_strdup(zone_arena_t *arena, const char *str);
 /* RFC 2181 s5.2 / RFC 4035 s2.2: harmonize_ttls=true normalizes RRset TTLs. */
 int build_zone_index(zone_arena_t *arena, bool harmonize_ttls);
+/* Frees the lookup indexes build_zone_index() allocates besides the hash table (NSEC, NSEC3, sorted names). */
+void zone_arena_free_sorted_indexes(zone_arena_t *arena);
+/* RFC 5155 §3.2 / §4.2: algorithm, iterations and salt of an NSEC3 or NSEC3PARAM record (text RDATA fields 0, 2
+ * and 3). false when the record has fewer fields or a number is out of range. */
+bool nsec3_rdata_params(const dns_record_t *rec, uint8_t *algorithm, uint16_t *iterations, const char **salt);
+/* The chain of `arena` with the parameters of the NSEC3PARAM (or NSEC3) record `param`, or NULL. */
+const nsec3_chain_t *zone_find_nsec3_chain(const zone_arena_t *arena, const dns_record_t *param);
+/* Hex text to octets without truncation: 0 for "", "-" or NULL; (size_t)-1 for an odd number of digits, a character
+ * that is not a hex digit, or more than max_out octets. */
+size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out);
+/* RFC 1034 s4.2: drop records whose owner is not at or below apex (call before build_zone_index). */
+size_t zone_arena_drop_out_of_zone(zone_arena_t *arena, const char *apex,
+                                   void (*report)(const dns_record_t *rec, void *ud), void *ud);
+/* X-32: drop records whose RDATA cannot be written in wire format (call before build_zone_index). */
+size_t zone_arena_drop_unencodable(zone_arena_t *arena, void (*report)(const dns_record_t *rec, void *ud), void *ud);
 bool compare_records(const dns_record_t *a, const dns_record_t *b, bool ignore_ttl);
 bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target);
 uint32_t calc_fnv1a_str(const char *str);
@@ -135,6 +193,14 @@ static inline uint32_t calc_fnv1a_continue(uint32_t hash, const char *str) {
         hash *= 16777619u;
     }
     return hash;
+}
+/* name の末尾ドットを付け外しした形のハッシュ (レコード名と参照先の名前で末尾ドットの有無が
+ * 違っても同じバケットを引くため)。末尾の '.' がエスケープされたもの ("a\.") はラベルの一部。
+ * 一時バッファを使わない。 */
+static inline uint32_t calc_fnv1a_other_root_form(const char *name) {
+    size_t len = strlen(name);
+    size_t bare = dns_name_len_no_root(name, len);
+    return (bare != len) ? calc_fnv1a_strn(name, bare) : calc_fnv1a_continue(calc_fnv1a_str(name), ".");
 }
 int validate_zone_dname(zone_arena_t *arena, parse_error_t *err);
 int validate_zone_name_lengths(zone_arena_t *arena, parse_error_t *err);

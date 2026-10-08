@@ -338,7 +338,7 @@ static void test_wire_cache_consistency(void) {
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
 
-    build_zone_response_cache(&arena, &cfg, "example.com.");
+    build_zone_response_cache(&arena, &cfg, NULL, "example.com.");
     assert(arena.response_cache.bucket_count > 0);
     assert(arena.response_cache.entry_count > 0);
     printf("       Pre-rendered %zu response cache entries.\n", arena.response_cache.entry_count);
@@ -925,7 +925,7 @@ static void test_wire_cache_max_records_limit(void) {
 
         // Case A: wire_cache_max_records = 0 (unlimited) -> Cache enabled
         cfg.wire_cache_max_records = 0;
-        build_zone_response_cache(&arena, &cfg, "example.com.");
+        build_zone_response_cache(&arena, &cfg, NULL, "example.com.");
         assert(arena.response_cache.buckets != NULL);
         assert(arena.response_cache.entry_count > 0);
         printf("  [PASS] wire_cache_max_records=0 enables cache (entries=%zu)\n", arena.response_cache.entry_count);
@@ -933,7 +933,7 @@ static void test_wire_cache_max_records_limit(void) {
         // Case B: wire_cache_max_records = total_records + 1 (above) -> Cache enabled
         free_zone_response_cache(&arena);
         cfg.wire_cache_max_records = (uint32_t)(total_records + 1);
-        build_zone_response_cache(&arena, &cfg, "example.com.");
+        build_zone_response_cache(&arena, &cfg, NULL, "example.com.");
         assert(arena.response_cache.buckets != NULL);
         assert(arena.response_cache.entry_count > 0);
         printf("  [PASS] wire_cache_max_records=%zu (total+1) enables cache\n", total_records + 1);
@@ -941,7 +941,7 @@ static void test_wire_cache_max_records_limit(void) {
         // Case C: wire_cache_max_records = total_records (exact boundary) -> Cache enabled (since arena->count > max is false)
         free_zone_response_cache(&arena);
         cfg.wire_cache_max_records = (uint32_t)total_records;
-        build_zone_response_cache(&arena, &cfg, "example.com.");
+        build_zone_response_cache(&arena, &cfg, NULL, "example.com.");
         assert(arena.response_cache.buckets != NULL);
         assert(arena.response_cache.entry_count > 0);
         printf("  [PASS] wire_cache_max_records=%zu (exact total) enables cache\n", total_records);
@@ -949,7 +949,7 @@ static void test_wire_cache_max_records_limit(void) {
         // Case D: wire_cache_max_records = total_records - 1 (below) -> Cache disabled
         free_zone_response_cache(&arena);
         cfg.wire_cache_max_records = (uint32_t)(total_records - 1);
-        build_zone_response_cache(&arena, &cfg, "example.com.");
+        build_zone_response_cache(&arena, &cfg, NULL, "example.com.");
         assert(arena.response_cache.buckets == NULL);
         assert(arena.response_cache.entry_count == 0);
         printf("  [PASS] wire_cache_max_records=%zu (total-1) disables cache\n", total_records - 1);
@@ -1028,7 +1028,7 @@ static void test_wire_cache_observatory_counters(void) {
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
 
-    build_zone_response_cache(&arena, &cfg, "example.com.");
+    build_zone_response_cache(&arena, &cfg, NULL, "example.com.");
     assert(arena.response_cache.buckets != NULL);
     assert(arena.response_cache.entry_count > 0);
     assert(arena.response_cache.total_bytes > 0);
@@ -1095,10 +1095,44 @@ static void test_wire_cache_observatory_counters(void) {
     printf("[SUCCESS] All wire cache observatory counters tests passed!\n");
 }
 
+/* O-07: the same zone name in two views; only one view's zone{} has ecs-tags. The wire cache must follow
+ * the configuration of the entry's own view (previously the first view's settings decided for both). */
+static void test_wire_cache_per_view_config(void) {
+    printf("[TEST] Wire cache: zone configuration is looked up in the entry's own view...\n");
+    const char *conf =
+        "view \"tagged\" { match-clients { 127.0.0.1; }; zone \"example.com\" { type master; file \"x.zone\";\n"
+        "    ecs-tags { tag \"eu\" { 198.51.100.0/24; }; }; }; };\n"
+        "view \"plain\" { match-clients { any; }; zone \"example.com\" { type master; file \"x.zone\"; }; };\n";
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    assert(parse_named_conf(conf, &cfg) == 0);
+
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err };
+    static char zone_text[] =
+        "example.com. 3600 IN SOA ns1.example.com. hostmaster.example.com. 1 7200 3600 1209600 3600\n"
+        "example.com. 3600 IN NS ns1.example.com.\n"
+        "ns1.example.com. 3600 IN A 192.0.2.1\n";
+    assert(parse_zone_fast(zone_text, strlen(zone_text), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    build_zone_response_cache(&arena, &cfg, "tagged", "example.com.");
+    assert(arena.response_cache.buckets == NULL && arena.response_cache.entry_count == 0);
+    build_zone_response_cache(&arena, &cfg, "plain", "example.com.");
+    assert(arena.response_cache.buckets != NULL && arena.response_cache.entry_count > 0);
+
+    zone_arena_destroy(&arena);
+    free_server_config_fields(&cfg);
+    printf("  -> per-view wire cache configuration passed.\n");
+}
+
 int main(void) {
     test_wire_cache_consistency();
     test_wire_cache_max_records_limit();
     test_wire_cache_observatory_counters();
+    test_wire_cache_per_view_config();
     return 0;
 }
 
@@ -1107,4 +1141,12 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr
                         const tcp_sockopts_t *tcp_opts) {
     (void)tcp_opts;
     return broker_connect(family, type, addr, addr_len);
+}
+
+/* send_tcp_dns_message(): goes through the send_tcp_robust() mock above (length prefix, then message) */
+ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len) {
+    uint8_t prefix[2] = {(uint8_t)(len >> 8), (uint8_t)(len & 0xFF)};
+    if (send_tcp_robust(fd, prefix, 2) < 0) return -1;
+    if (send_tcp_robust(fd, msg, len) < 0) return -1;
+    return (ssize_t)len;
 }

@@ -102,6 +102,13 @@ static void test_valid_lines(void) {
     assert(a.records[0].type_code == 1 && a.records[0].ttl_value == 300 && strcasecmp(a.records[0].name, "www.example.com.") == 0);
     assert(a.records[0].rdata_count == 1 && strcmp(a.records[0].rdata[0], "192.0.2.10") == 0);
     zone_arena_destroy(&a);
+    /* O-14: a TTL with the high-order bit set (or above 32 bits) is 2147483647, as in BIND-format files */
+    assert(run_line("+big.example.com:192.0.2.11:4294967296", CTX_FULL, &e, &a, &cnt) == 1);
+    assert(a.records[0].ttl_value == 2147483647u && strcmp(a.records[0].ttl, "2147483647") == 0);
+    zone_arena_destroy(&a);
+    assert(run_line("+big.example.com:192.0.2.11:2147483648", CTX_FULL, &e, &a, &cnt) == 1);
+    assert(a.records[0].ttl_value == 2147483647u);
+    zone_arena_destroy(&a);
     assert(run_line("'txt.example.com:hello world:300", CTX_FULL, &e, &a, &cnt) == 1);
     assert(a.records[0].type_code == 16 && a.records[0].rdata_count >= 1);
     zone_arena_destroy(&a);

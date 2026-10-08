@@ -79,6 +79,19 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
     zone_arena_destroy(&standby);
     zone_arena_destroy(&active);
+
+    /* R-19: the transfer client's checks of each response message (first message, then a later one) */
+    axfr_session_t hs;
+    memset(&hs, 0, sizeof(hs));
+    hs.query_id = size >= 2 ? (uint16_t)((data[0] << 8) | data[1]) : 0;
+    hs.query_type = (size & 1) ? 251 : 252;
+    (void)xfr_check_response_header(data, size, &hs, "fuzz.example.com.");
+    (void)xfr_check_response_header(data, size, &hs, "fuzz.example.com.");
+    /* R-15: the server's reading of the client's SOA in an IXFR request (input taken as the request) */
+    size_t q_end;
+    uint32_t serial;
+    if (size > DNS_HEADER_SIZE && skip_wire_name(data, size, DNS_HEADER_SIZE, &q_end) == 0 && q_end + 4 <= size)
+        (void)ixfr_request_client_serial(data, size, q_end + 4, &serial);
     return 0;
 }
 
@@ -87,4 +100,12 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr
                         const tcp_sockopts_t *tcp_opts) {
     (void)tcp_opts;
     return broker_connect(family, type, addr, addr_len);
+}
+
+/* send_tcp_dns_message(): goes through the send_tcp_robust() mock above (length prefix, then message) */
+ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len) {
+    uint8_t prefix[2] = {(uint8_t)(len >> 8), (uint8_t)(len & 0xFF)};
+    if (send_tcp_robust(fd, prefix, 2) < 0) return -1;
+    if (send_tcp_robust(fd, msg, len) < 0) return -1;
+    return (ssize_t)len;
 }

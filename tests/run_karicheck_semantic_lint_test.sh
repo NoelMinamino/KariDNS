@@ -42,7 +42,8 @@ fi
 # Test 1b: Out-of-bailiwick Glue Detection (WARNING)
 echo "[+] Test 1b: Out-of-bailiwick glue check (orphan_glue.zone)..."
 OUT1B=$(./karicheck zone example.com. tests/zones/orphan_glue.zone 2>&1 || true)
-if echo "$OUT1B" | grep -q "Out-of-bailiwick glue record 'ns1.example.net.' in zone 'example.com.'"; then
+# R-27: out-of-zone glue is reported (and ignored) as out-of-zone data, like the server loader does
+if echo "$OUT1B" | grep -q "\[WARNING\] Zone 'example.com.': out-of-zone record 'ns1.example.net.' A ignored"; then
     echo "  PASS: Out-of-bailiwick glue warning detected."
 else
     echo "  FAIL: Expected out-of-bailiwick glue warning missing:"
@@ -112,6 +113,21 @@ if [ $EXIT4B -ne 0 ] && echo "$OUT4B" | grep -q "NS record 'example.com.' points
 else
     echo "  FAIL: RFC 2181 §10.3 CNAME target errors missing (exit=$EXIT4B):"
     echo "$OUT4B"
+    FAILED=1
+fi
+
+# Test 4c: RFC 2782 SRV target that is a CNAME (WARNING, X-39); "." and a target with an address are not reported
+echo "[+] Test 4c: RFC 2782 SRV CNAME target check..."
+set +e
+OUT4C=$(./karicheck zone srv.test. tests/zones/test_lint_srv_cname.zone 2>&1)
+EXIT4C=$?
+set -e
+if [ $EXIT4C -eq 0 ] && echo "$OUT4C" | grep -q "SRV record '_sip._tcp.srv.test.' points to CNAME target 'alias.srv.test.'" \
+   && echo "$OUT4C" | grep -q "0 error(s), 1 warning(s)" && ! echo "$OUT4C" | grep -q "_ldap._tcp\|_none._tcp"; then
+    echo "  PASS: RFC 2782 SRV CNAME target warning detected (exit=$EXIT4C)."
+else
+    echo "  FAIL: RFC 2782 SRV CNAME target warning missing or wrong (exit=$EXIT4C):"
+    echo "$OUT4C"
     FAILED=1
 fi
 

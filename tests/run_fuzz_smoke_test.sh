@@ -8,7 +8,10 @@
 # Usage:
 #   sh tests/run_fuzz_smoke_test.sh dag      # Test all dag fuzzers
 #   sh tests/run_fuzz_smoke_test.sh karidns  # Test all KariDNS server fuzzers
-#   sh tests/run_fuzz_smoke_test.sh all      # Test all fuzzers
+#   sh tests/run_fuzz_smoke_test.sh all      # Test all fuzzers (default; tests/run_all_suite.sh uses it)
+#
+# A harness that is not built is built with make first (as $SUDO_USER when the script runs under sudo, so the
+# tree does not get root-owned objects); a harness that cannot be built is a failure, not a skip (X-06).
 #
 # Options:
 #   FUZZ_RUNS=1000          # Number of runs per target (default: 1000)
@@ -17,13 +20,42 @@
 set -u
 cd "$(dirname "$0")/.."
 
-MODE="${1:-dag}"
+MODE="${1:-all}"
+case "$MODE" in
+    dag|karidns|all) ;;
+    *) echo "usage: $0 [dag|karidns|all]"; exit 2 ;;
+esac
 FUZZ_RUNS="${FUZZ_RUNS:-1000}"
 FUZZ_SMOKE_SECONDS="${FUZZ_SMOKE_SECONDS:-}"
 
 FAILED=0
+SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/kari_fuzz_smoke.XXXXXX") || exit 1
+trap 'rm -rf "$SCRATCH"' EXIT INT TERM
 log_fail() { echo "  -> FAIL: $1"; FAILED=1; }
 log_ok()   { echo "  -> OK: $1"; }
+
+# make target that builds tests/fuzz/<binary> (see the Makefile)
+make_target_of() {
+    case "$1" in
+        fuzz_dns_wire)         echo fuzz ;;
+        fuzz_dns_server_core)  echo fuzz_core ;;
+        fuzz_zone_parser)      echo fuzz_zone ;;
+        fuzz_conf_parser)      echo fuzz_conf ;;
+        fuzz_tsig_sign)        echo fuzz_tsig ;;
+        fuzz_dag_response)     echo fuzz_dag ;;
+        *)                     echo "$1" ;;
+    esac
+}
+
+build_fuzzer() {
+    t=$(make_target_of "$1")
+    echo "  -> building $1 (make $t)"
+    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+        su -m "$SUDO_USER" -c "make $t" > "fuzz_build_$1.log" 2>&1
+    else
+        make "$t" > "fuzz_build_$1.log" 2>&1
+    fi
+}
 
 run_fuzz_group() {
     title="$1"
@@ -46,8 +78,12 @@ run_fuzz_group() {
         logf="fuzz_${target}.log"
 
         if [ ! -x "$bin" ]; then
-            echo "  -> SKIP: $bin not built"
-            continue
+            if ! build_fuzzer "$target" || [ ! -x "$bin" ]; then
+                log_fail "$target (not built and the build failed, see fuzz_build_$target.log)"
+                tail -n 20 "fuzz_build_$target.log"
+                continue
+            fi
+            rm -f "fuzz_build_$target.log"
         fi
 
         count=$(ls -1 "$corpus" 2>/dev/null | wc -l)
@@ -59,10 +95,13 @@ run_fuzz_group() {
         # -close_fd_mask=3 closes stdout/stderr during LLVMFuzzerTestOneInput
         # to prevent terminal mojibake and noisy parser dumps.
         # Output is directed to logf in background.
+        # New inputs go to the first directory: a scratch one, so the corpus in git is only read.
+        newdir="$SCRATCH/$target"
+        mkdir -p "$newdir"
         if [ -n "${FUZZ_RUNS:-}" ] && [ "$FUZZ_RUNS" -gt 0 ]; then
-            "$bin" -runs="$FUZZ_RUNS" -close_fd_mask=3 "$corpus" > "$logf" 2>&1 &
+            "$bin" -runs="$FUZZ_RUNS" -close_fd_mask=3 "$newdir" "$corpus" > "$logf" 2>&1 &
         else
-            "$bin" -max_total_time="${FUZZ_SMOKE_SECONDS:-5}" -close_fd_mask=3 "$corpus" > "$logf" 2>&1 &
+            "$bin" -max_total_time="${FUZZ_SMOKE_SECONDS:-5}" -close_fd_mask=3 "$newdir" "$corpus" > "$logf" 2>&1 &
         fi
         pids="$pids $target:$!"
     done
@@ -98,7 +137,8 @@ if [ "$MODE" = "karidns" ] || [ "$MODE" = "all" ]; then
     [ "$MODE" = "all" ] && echo ""
     run_fuzz_group "KariDNS Server Fuzzer Smoke Run" \
         fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser \
-        fuzz_conf_parser fuzz_tsig_sign fuzz_tsig_verify
+        fuzz_conf_parser fuzz_tsig_sign fuzz_tsig_verify \
+        fuzz_query_engine fuzz_xfr_packet fuzz_dynamic_update
 fi
 
 echo ""

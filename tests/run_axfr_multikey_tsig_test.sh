@@ -13,10 +13,12 @@ echo "[*] Building karidns and dag..."
 
 CONF_FILE="$DIR/axfr_multikey_test.conf"
 ZONE_FILE="$DIR/axfr_multikey_test.zone"
+MIXED_ZONE="$DIR/axfr_multikey_mixed.zone"
+OTHER_ZONE="$DIR/axfr_multikey_other.zone"
 
 cleanup() {
     kari_kill_tree "${SERVER_PID:-}"
-    rm -f "$CONF_FILE" "$ZONE_FILE" /tmp/karidns_axfr_multikey.log
+    rm -f "$CONF_FILE" "$ZONE_FILE" "$MIXED_ZONE" "$OTHER_ZONE" /tmp/karidns_axfr_multikey.log
 }
 trap cleanup EXIT INT TERM
 
@@ -34,6 +36,12 @@ $TTL 3600
 ns1     IN A    192.0.2.1
 www     IN A    192.0.2.100
 EOF
+
+# X-41: addresses and keys in one allow-transfer list: both are required (docs/karidns.md allow-transfer)
+for z in mixed other; do
+    f="$DIR/axfr_multikey_$z.zone"
+    sed -e "s/multikey\.test\./$z.multikey.test./g" "$ZONE_FILE" > "$f"
+done
 
 KEY_A_SECRET="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 KEY_B_SECRET="BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
@@ -66,6 +74,18 @@ zone "multikey.test" {
     type master;
     file "$ZONE_FILE";
     allow-transfer { key "keyA"; key "keyB"; };
+};
+
+zone "mixed.multikey.test" {
+    type master;
+    file "$MIXED_ZONE";
+    allow-transfer { key "keyA"; 127.0.0.1; };
+};
+
+zone "other.multikey.test" {
+    type master;
+    file "$OTHER_ZONE";
+    allow-transfer { key "keyA"; 192.0.2.99; };
 };
 EOF
 
@@ -119,6 +139,36 @@ if echo "$OUT_UNSIGNED" | grep -q "www.multikey.test."; then
     exit 1
 fi
 echo "[OK] Unsigned AXFR correctly rejected."
+
+# Test 5-7 (X-41): allow-transfer { key "keyA"; <address>; } needs the address AND the key
+# (docs/karidns.md: unlike BIND, the key is not one more first-match entry).
+# dag prints only "; Transfer failed." for a refused transfer (like dig), so the RCODE is read with
+# tests/tsig_query.pl: "rcode=5" is REFUSED, "tsig=ok" a signed answer that verifies.
+xfr_rcode() {
+    perl "$DIR/tsig_query.pl" --server 127.0.0.1 --port $PORT --tcp --name "$1" --type AXFR $2 2>&1 | head -1
+}
+echo "[*] Test 5: signed AXFR from the listed address (should succeed)..."
+OUT=$("$DAG" mixed.multikey.test AXFR "@127.0.0.1" -p $PORT -y "hmac-sha256:keyA:$KEY_A_SECRET" +tcp 2>&1 || true)
+if ! printf '%s\n' "$OUT" | grep -q "^www.mixed.multikey.test."; then
+    echo "[FAIL] signed AXFR from 127.0.0.1 was not answered with the zone"; echo "$OUT"; exit 1
+fi
+echo "[OK] signed AXFR from the listed address succeeded."
+
+echo "[*] Test 6: unsigned AXFR from the listed address (should be REFUSED)..."
+ST=$(xfr_rcode mixed.multikey.test)
+OUT=$("$DAG" mixed.multikey.test AXFR "@127.0.0.1" -p $PORT +tcp +nohexdump 2>&1 || true)
+if ! printf '%s\n' "$ST" | grep -q "^rcode=5 .*tsig=none" || printf '%s\n' "$OUT" | grep -q "^www.mixed.multikey.test."; then
+    echo "[FAIL] unsigned AXFR from 127.0.0.1: expected REFUSED without records, got '$ST'"; echo "$OUT"; exit 1
+fi
+echo "[OK] unsigned AXFR from the listed address was REFUSED."
+
+echo "[*] Test 7: signed AXFR from an address that is not listed (should be REFUSED)..."
+ST=$(xfr_rcode other.multikey.test "--key keyA:$KEY_A_SECRET")
+OUT=$("$DAG" other.multikey.test AXFR "@127.0.0.1" -p $PORT -y "hmac-sha256:keyA:$KEY_A_SECRET" +tcp +nohexdump 2>&1 || true)
+if ! printf '%s\n' "$ST" | grep -q "^rcode=5 .*tsig=ok" || printf '%s\n' "$OUT" | grep -q "^www.other.multikey.test."; then
+    echo "[FAIL] signed AXFR from an unlisted address: expected a signed REFUSED without records, got '$ST'"; echo "$OUT"; exit 1
+fi
+echo "[OK] signed AXFR from an unlisted address was REFUSED (signed)."
 
 echo "[PASS] AXFR multiple TSIG key authorization test passed successfully!"
 exit 0

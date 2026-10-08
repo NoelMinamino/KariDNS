@@ -264,25 +264,33 @@ register_test "unit" "bin" "test_fi_dag" "Fault Injection: dag client query pack
 # 2. Zone Transfer / Redundancy (AXFR / IXFR)
 register_test "xfr" "sh" "tests/run_capsicum_axfr_test.sh" "Capsicum sandbox capability mode AXFR"
 register_test "xfr" "sh" "tests/run_ixfr_roundtrip_test.sh" "RFC 1995 IXFR incremental diff roundtrip"
+register_test "xfr" "sh" "tests/run_xfr_out_of_zone_test.sh" "Out-of-zone records ignored by loader/karicheck; KariDNS primary -> secondary transfer (R-27)"
+register_test "xfr" "sh" "tests/run_xfr_notify_test.sh" "Outbound NOTIFY retransmission/TSIG/reload, transfer client checks and IXFR->AXFR fallback, IXFR serials, OPT in AXFR, retransfer, catalog group change, IXFR between KariDNS servers (R-15, R-16, R-17, D-09, R-19, R-21, R-28, O-06, X-19, X-24)"
+register_test "core" "sh" "tests/run_zone_file_compat_test.sh" "BIND-compatible zone files: case-insensitive mnemonics, CLASSnn/HS, omitted TTL, relative ORIGIN, GENERATE for any type, SINK/ATMA/IPSECKEY gateway 0, tinydns with more than 256 zones (R-22, D-18, D-08, O-11)"
+register_test "xfr" "sh" "tests/run_dnssec_secondary_test.sh" "DNSSEC data on KariDNS secondaries: DO=1 answers equal to the primary after Extended AXFR, AXFR and IXFR (R-33; SKIP without dnssec-signzone)"
 register_test "xfr" "sh" "tests/run_extended_axfr_test.sh" "KariDNS Extended AXFR (Option 65153)"
 register_test "xfr" "sh" "tests/run_axfr_multikey_tsig_test.sh" "Multi-key TSIG authentication in AXFR"
+register_test "xfr" "sh" "tests/run_tsig_error_matrix_test.sh" "RFC 8945 TSIG errors and authorization for UPDATE/AXFR/NOTIFY/QUERY (R-07, R-08, R-10, R-30, D-03)"
 register_test "xfr" "sh" "tests/run_udp_ixfr_test.sh" "RFC 1995 IXFR single-UDP packet transfer"
-register_test "xfr" "sh" "tests/run_zone_type_secondary_test.sh" "Secondary zone SOA refresh polling"
+register_test "xfr" "sh" "tests/run_zone_type_secondary_test.sh" "Secondary zone AXFR, REFRESH, EXPIRE (SERVFAIL + EDE 24, serve-stale EDE 3)"
 register_test "xfr" "sh" "tests/run_edns_expire_test.sh" "RFC 7314 EDNS EXPIRE option (primary, secondary, chained secondaries)"
 
 # 3. DNSSEC & Message Digests
 register_test "dnssec" "sh" "tests/run_zonemd_val_test.sh" "RFC 8976 ZONEMD verification against test vectors"
 register_test "dnssec" "sh" "tests/run_dnssec_negative_soa_rrsig_test.sh" "RFC 4035 Negative response SOA covering RRSIG"
-register_test "dnssec" "sh" "tests/run_ds_delegation_test.sh" "RFC 4034 DS delegation record referral in NS responses"
+register_test "dnssec" "sh" "tests/run_ds_delegation_test.sh" "RFC 4035 3.1.4.1 DS at a delegation point: parent answers, referrals, DS for a hosted child apex from the parent (R-32)"
+register_test "dnssec" "sh" "tests/run_dnssec_answer_sections_test.sh" "DNSSEC answers on signed zones: RRSIGs in Authority/Additional, grouped RRsets, NSEC3PARAM choice and 255-octet salt, DS from the parent, delv validation (R-03, R-04, O-16, O-17, R-31, R-32; SKIP without dnssec-signzone)"
 
 # 4. Dynamic Update (RFC 2136)
 register_test "update" "sh" "tests/run_dynamic_update_test.sh" "RFC 2136 Prerequisites & Update Section handling"
-register_test "update" "sh" "tests/run_update_slave_notauth_test.sh" "RFC 2136 §3.8 Slave rejection with NOTAUTH"
+register_test "update" "sh" "tests/run_update_secondary_refused_test.sh" "RFC 2136 §3.1 UPDATE to a secondary refused, NOTAUTH for unserved zones"
+register_test "update" "sh" "tests/run_rdata_canonical_test.sh" "RFC 2136 §1.1 canonical RDATA comparison, RDATA name case, WKS port names, unencodable records (X-16, X-25, X-32, X-37, X-38)"
 register_test "update" "sh" "tests/run_ttl_harmonization_update_test.sh" "TTL harmonization on dynamic updates"
 
 # 5. EDNS / Cookies / ECS / Multi-QTYPE
 register_test "edns" "sh" "tests/run_bind_ecs_subnet_test.sh" "RFC 7871 \$ECS-SUBNET tag split-horizon routing"
 register_test "edns" "sh" "tests/run_mqtype_qdcount0_test.sh" "RFC 10029 Multi-QTYPE & RFC 9619 QDCOUNT=0"
+register_test "edns" "sh" "tests/run_response_header_test.sh" "RFC 1035 §4.1.1 / RFC 6891 §7 response header bits and error responses (R-05, R-06, R-12, R-13, R-18)"
 
 # 6. Response Rate Limiting (RRL) & Anti-DoS
 register_test "rrl" "sh" "tests/run_rrl_window_test.sh" "RRL sliding window rate limit & SLIP truncated responses"
@@ -291,7 +299,7 @@ register_test "rrl" "sh" "tests/run_glue_truncation_test.sh" "Additional section
 
 # 7. Catalog Zones (RFC 9432)
 register_test "catalog" "sh" "tests/run_catalog_zone_test.sh" "RFC 9432 Catalog Zone member provisioning"
-register_test "catalog" "sh" "tests/run_cve_coo_test.sh" "RFC 9432 Change of Ownership (CoO) migration"
+register_test "catalog" "sh" "tests/run_cve_coo_test.sh" "RFC 9432 CoO tracking under allocation failure"
 
 # 8. DNSTAP Telemetry Logging
 register_test "dnstap" "sh" "tests/run_dnstap_capture_test.sh" "DNSTAP frame streams capture verification"
@@ -309,6 +317,7 @@ register_test "core" "sh" "tests/run_roundtrip_test.sh" "Zone parser to wire ser
 register_test "core" "sh" "tests/run_karicheck_glue_test.sh" "karicheck in-bailiwick glue record verification"
 register_test "core" "sh" "tests/run_karicheck_semantic_lint_test.sh" "karicheck RFC semantic linter checks"
 register_test "core" "sh" "tests/run_karicheck_matrix_test.sh" "karicheck diagnostic matrix: RDATA/DNSSEC/structure/tinydns/catalog/config lint, exit status contract"
+register_test "core" "sh" "tests/run_karicheck_zonemd_ldns_test.sh" "karicheck ZONEMD digests against ldns-signzone (SKIP without ldns)"
 register_test "core" "sh" "tests/run_phase2_core_audit_test.sh" "Phase 2 Core architecture audit test"
 register_test "core" "sh" "tests/run_phase2_audit_part2_test.sh" "Phase 2 Security & boundary validation"
 register_test "core" "sh" "tests/run_response_section_order_test.sh" "RFC 1035 Response section ordering"
@@ -318,6 +327,22 @@ register_test "core" "sh" "tests/run_forward_zone_test.sh" "RFC 5452 Forward zon
 register_test "core" "sh" "tests/run_program_zone_test.sh" "Dynamic backend records via program zone plugin"
 register_test "core" "sh" "tests/run_karictl_observatory_test.sh" "karictl observatory IPC metrics query"
 register_test "core" "sh" "tests/run_karictl_reload_reconfig_test.sh" "karictl reload & dynamic reconfig IPC"
+register_test "core" "sh" "tests/run_karictl_reload_failure_test.sh" "karictl reload/reconfig report failures (exit 3), restart-only settings, status values and time format (D-13, O-05, O-09, D-12, T-11)"
+register_test "core" "sh" "tests/run_config_acl_bool_test.sh" "named.conf booleans, category lists, zone type case, named acl statements (D-01, D-02, D-22, D-23)"
+register_test "core" "sh" "tests/run_zone_path_dotdot_test.sh" "zone and log file paths with ../ inside the sandbox (D-24)"
+register_test "core" "sh" "tests/run_log_rotation_timestamp_test.sh" "suffix timestamp log rotation never overwrites, versions prunes (D-21)"
+register_test "core" "sh" "tests/run_tcp_timeouts_test.sh" "TCP first-message and idle timeouts, partial messages do not extend them (D-06, R-24)"
+register_test "core" "sh" "tests/run_forward_failover_test.sh" "Forward zones share forward-timeout between forwarders, mismatched replies ignored (D-20)"
+register_test "core" "sh" "tests/run_dnstap_lifecycle_test.sh" "dnstap query_zone, reconnect through the broker, STOP/FINISH at shutdown (O-03)"
+register_test "core" "sh" "tests/run_rrl_bind_keys_test.sh" "RRL keyed like BIND: name, zone for NXDOMAIN, wildcard, client prefix length (D-05)"
+register_test "core" "sh" "tests/run_capsicum_enosys_test.sh" "cap_enter ENOSYS logged, failing backend start-up ends cleanly (O-02, O-15)"
+register_test "core" "sh" "tests/run_tinydns_reload_test.sh" "karictl reload of a tinydns zone inside the sandbox, SOA serial from the file mtime (X-13)"
+register_test "core" "sh" "tests/run_cname_child_zone_test.sh" "CNAME/DNAME into a child zone on the same server answered from the child (X-27)"
+register_test "core" "sh" "tests/run_xfr_badvers_test.sh" "AXFR/IXFR with an unsupported EDNS version get BADVERS, signed when the TSIG is valid (X-28)"
+register_test "core" "sh" "tests/run_compressed_qname_test.sh" "Compression pointer in the question name -> FORMERR (X-15)"
+register_test "core" "sh" "tests/run_rrl_slip_tsig_test.sh" "RRL slip answers to TSIG-signed queries are signed (X-20)"
+register_test "core" "sh" "tests/run_view_same_zone_test.sh" "Same zone name in two views: data, glue and program plugin per view (R-26, O-12)"
+register_test "core" "sh" "tests/run_name_escape_test.sh" "Owner names with master-file escapes: BIND/tinydns zones, AXFR, NSEC3 hashes (R-29, R-23, O-08)"
 register_test "core" "sh" "tests/run_config_duplicate_rejection_test.sh" "Duplicate view/zone rejection in config parser"
 register_test "core" "sh" "tests/run_domain_length_rfc1035_test.sh" "RFC 1035 255-byte domain & 63-byte label limits"
 register_test "core" "sh" "tests/run_logging_channel_validation_test.sh" "Syslog & file logging channels configuration"
@@ -327,15 +352,15 @@ register_test "core" "sh" "tests/run_privilege_drop_root_test.sh" "FreeBSD setui
 register_test "core" "sh" "tests/run_nonroot_startup_test.sh" "Non-root startup & fail-closed port/log/pid/control checks"
 register_test "core" "sh" "tests/run_response_cache_test.sh" "Response cache hit/miss functional verification"
 register_test "core" "sh" "tests/run_ttl_harmonization_test.sh" "RRset TTL harmonization on zone load"
-register_test "core" "sh" "tests/run_ttl_rfc2181_clamp_test.sh" "RFC 2181 31-bit signed TTL clamp"
+register_test "core" "sh" "tests/run_ttl_rfc2181_clamp_test.sh" "TTL high bit clamped to 2147483647 (RFC 8767 §4, O-14)"
 register_test "core" "sh" "tests/run_zone_oom_partial_load_test.sh" "OOM fail-closed zone loading rollback"
 register_test "core" "sh" "tests/run_coverage_merge_test.sh" "Coverage report tolerates corrupt raw profiles (SIGKILL during profile write)"
 register_test "core" "sh" "tests/run_malformed_detection_default_test.sh" "Structural malformation detection in default mode (RFC 1035 §4.1.1)"
 register_test "core" "sh" "tests/run_matrix_queries_test.sh" "Table-driven Query Engine Matrix: Wildcard, DNAME, Delegation & NSEC proofs"
 register_test "core" "sh" "tests/run_server_lifecycle_test.sh" "Server lifecycle: port conflict, bad syntax, signals, and crash recovery"
 register_test "core" "sh" "tests/run_tcp_adversary_test.sh" "TCP state machine adversary: slowloris, framing errors, trickle, flood"
-register_test "core" "sh" "tests/run_control_adversary_test.sh" "Control channel IPC adversary: invalid HMAC, buffer limits, timeouts"
-register_test "core" "sh" "tests/run_karicheck_rules_test.sh" "karicheck diagnostic rule checks: SSHFP, RFC 8624, options linting"
+register_test "core" "sh" "tests/run_control_adversary_test.sh" "Control channel adversary: bad AUTH, oversized line, idle client, karictl exit statuses"
+register_test "core" "sh" "tests/run_karicheck_rules_test.sh" "karicheck diagnostic rules: SSHFP, RFC 8624, tcp-idle-timeout, program zones"
 register_test "core" "sh" "tests/run_karicheck_deep_rules_test.sh" "karicheck static lint rules: delegation, glue, CNAME & ZONEMD"
 register_test "core" "sh" "tests/run_zone_parser_error_paths_test.sh" "Zone parser error paths, escape sequences & malformed directives"
 register_test "core" "sh" "tests/run_karictl_adversary_test.sh" "karictl command line argument validation and socket error resilience"
@@ -344,16 +369,17 @@ register_test "core" "sh" "tests/run_karictl_adversary_test.sh" "karictl command
 register_test "regression" "sh" "tests/run_sanitizer_smoke_test.sh" "ASan & UBSan runtime memory error smoke test"
 register_test "regression" "sh" "tests/run_stress_test.sh" "TSan & ASan concurrency stress test (dnsperf + IXFR)"
 register_test "regression" "sh" "tests/run_rcu_tsan_test.sh" "TSan: queries concurrent with reload, UPDATE and AXFR (R-25 RCU publish order)"
+register_test "regression" "sh" "tests/run_nsec3_nxdomain_perf_test.sh" "NSEC3 NXDOMAIN rate vs NSEC with dnsperf, sorted NSEC3 index (R-34; SKIP without dnsperf)"
 register_test "regression" "sh" "tests/run_bind_differential_test.sh" "Differential check against BIND named: wildcard answers (SKIP without named)"
 register_test "regression" "sh" "tests/run_fuzz_smoke_test.sh" "libFuzzer crash-resistance smoke verification"
 register_test "regression" "sh" "tests/run_break_duplicate_kind_override_test.sh" "Duplicate --break kind parameter override validation"
 
 # 12. dag Diagnostic Client & Scenario Matrix Suite (Run with -c dag or --include-dag)
-register_test "dag" "sh" "tests/run_dag_scenario_matrix_test.sh" "dag & karictl Multi-Protocol Scenario Matrix (Trace, Transport, Replay, IPC)"
+register_test "dag" "sh" "tests/run_dag_scenario_matrix_test.sh" "dag scenario matrix: TC fallback, PROXY v2, keepopen, DoH, XFR, replay, TSIG"
 register_test "dag" "sh" "tests/run_dag_ci_test.sh" "dag comprehensive CI test suite (Part 1-19 + Part 20-21 parallel sub-suites)"
 register_test "dag" "sh" "tests/run_dag_cli_anomalous_options_test.sh" "dag CLI anomalous options, YAML escaping & transport errors"
 register_test "dag" "sh" "tests/run_dag_batch_advanced_opts_test.sh" "dag Batch mode (-f) with advanced options"
-register_test "dag" "sh" "tests/run_dag_fuzzer_test.sh" "dag fuzzer smoke execution"
+register_test "dag" "sh" "tests/run_dag_fuzzer_test.sh" "dag fuzzer corpus regression (all harnesses, -runs=0)"
 register_test "dag" "sh" "tests/run_dag_apl_afdlength_overflow_test.sh" "dag APL afdlength buffer overflow regression test"
 register_test "dag" "sh" "tests/run_dag_audit_improvements_test.sh" "dag & dig audit improvements validation"
 register_test "dag" "sh" "tests/run_dag_axfr_tsig_unsigned_intermediate_test.sh" "dag AXFR TSIG intermediate unsigned message digest chaining"
@@ -407,6 +433,10 @@ register_test "dag" "sh" "tests/run_dag_yaml_rdata_test.sh" "dag YAML output RDA
 register_test "dag" "sh" "tests/run_dag_yaml_rrsig_decode_test.sh" "dag YAML RRSIG structured decoding"
 register_test "dag" "sh" "tests/run_dag_yaml_socket_family_force_test.sh" "dag YAML -4/-6 socket_family priority & verification"
 register_test "dag" "sh" "tests/run_dag_yaml_socket_family_test.sh" "dag YAML socket_family accuracy test"
+register_test "dag" "sh" "tests/run_dag_dig_output_compat_test.sh" "dag output compatible with dig 9.20 (EDNS, YAML, TSIG, search, multiline)"
+register_test "dag" "sh" "tests/run_dag_malformed_compat_test.sh" "dag malformed-response diagnostics compatible with dig 9.20"
+register_test "dag" "sh" "tests/run_dag_columns_test.sh" "dag record and question columns identical to dig 9.20 (tabs, +multiline, +nottlid, +noclass; X-40)"
+register_test "dag" "sh" "tests/run_ci_dag_smoke.sh" "dag CI smoke (UDP, TCP, multiple servers, AXFR) against the local mock_dns_server.pl, no real domains (X-09)"
 
 # If -l or --list, print tests and exit
 if [ "${LIST_ONLY}" -eq 1 ]; then

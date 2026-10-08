@@ -97,6 +97,16 @@ while (1) {
         print $lfh "$qname $qtype\n";
         close($lfh);
     }
+    # X-45: DO bit of the query (OPT right after the question: root name, TYPE 41, CLASS, TTL with the flags)
+    my $do = 0;
+    if (unpack("n", substr($query, 10, 2)) >= 1 && length($query) >= $off + 15 &&
+        substr($query, $off + 4, 1) eq "\x00" && unpack("n", substr($query, $off + 5, 2)) == 41) {
+        $do = (unpack("n", substr($query, $off + 11, 2)) & 0x8000) ? 1 : 0;
+    }
+    if ($query_log && open(my $dfh, ">>", "$query_log.do")) {
+        print $dfh "$qname $qtype do=$do\n";
+        close($dfh);
+    }
 
     my $resp = "";
     if ($authonly && ($qname eq "" || $qname eq ".")) {
@@ -163,6 +173,12 @@ while (1) {
                     "\x07example\x03com\x00" . pack("nn", 1, 1) .
                     "\x07example\x03com\x00" . pack("nnNn", 5, 1, 300, 17) . "\x03cdn\x07example\x03net\x00";
         }
+    } elsif ($qname =~ /^nodata\.test\./i) {
+        # X-45: authoritative NODATA with only an SOA in Authority (no NS): not a referral, the trace ends
+        my $nw = enc_name("nodata.test");
+        my $soa = enc_name("ns1.nodata.test") . enc_name("hostmaster.nodata.test") . pack("NNNNN", 1, 3600, 600, 86400, 60);
+        $resp = $qid . pack("nnnnn", 0x8400, 1, 0, 1, 0) . $nw . pack("nn", $qtype, 1) .
+                $nw . pack("nnNn", 6, 1, 60, length($soa)) . $soa;
     } elsif ($qname =~ /^cdn\.example\.net\./i) {
         # Re-traced target: return final A record 192.0.2.100
         $resp = $qid . pack("nnnnn", 0x8400, 1, 1, 0, 0) .
@@ -182,13 +198,39 @@ MOCK_PID=$!
 sleep 0.5
 
 echo "=== 1. Testing +trace with Out-of-Bailiwick Delegation (No Glue Fallback) ==="
-echo -n "Test: Trace succeeds through glue resolution and CNAME re-trace ... "
+echo -n "Test: Trace succeeds through glue resolution and stops at the CNAME like dig ... "
+: > "$QUERY_LOG"
 OUT=$("$DAG" @127.0.0.1 -p $PORT example.com A +trace +timeout=2 2>&1 || true)
-if echo "$OUT" | grep -q "ns1\.external\.org" && echo "$OUT" | grep -q "cdn\.example\.net"; then
+# BIND dig +trace (9.20) ends at the authoritative CNAME answer and does not restart for the target (T-14)
+if echo "$OUT" | grep -q "ns1\.external\.org" && echo "$OUT" | grep -qE "^example\.com\.[[:space:]].*CNAME[[:space:]]+cdn\.example\.net\." \
+   && ! echo "$OUT" | grep -q "192\.0\.2\.100" && ! grep -qi "^cdn\.example\.net\." "$QUERY_LOG"; then
     echo "OK"
 else
     echo "FAILED"
+    echo "  Queries:"
+    sed 's/^/    /' "$QUERY_LOG"
     echo "  Output:"
+    echo "$OUT" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+
+echo -n "Test: Received lines name the server like dig (T-05) ... "
+# first hop: the @server text; later hops: the NS name the address belongs to
+if echo "$OUT" | grep -qE "^;; Received [0-9]+ bytes from 127\.0\.0\.1#$PORT\(127\.0\.0\.1\) in [0-9]+ ms" \
+   && echo "$OUT" | grep -qE "^;; Received [0-9]+ bytes from 127\.0\.0\.1#$PORT\(a\.root-servers\.net\) in [0-9]+ ms" \
+   && echo "$OUT" | grep -qE "^;; Received [0-9]+ bytes from 127\.0\.0\.1#$PORT\(ns1\.external\.org\) in [0-9]+ ms"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "$OUT" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+
+echo -n "Test: no multi-server comparison table after a trace (T-06) ... "
+if ! echo "$OUT" | grep -q "MULTI-SERVER COMPARISON"; then
+    echo "OK"
+else
+    echo "FAILED"
     echo "$OUT" | sed 's/^/    /'
     FAILED=$((FAILED + 1))
 fi
@@ -284,6 +326,45 @@ if [ "$DAG" != "dig" ]; then
         echo "$OUT" | sed 's/^/    /'
         FAILED=$((FAILED + 1))
     fi
+fi
+
+echo "=== 3c. Testing +trace like dig 9.20: banner, implied +dnssec and +authority, NODATA end (X-45) ==="
+# compared with dig 9.20.29 +trace on the Internet (FIX_REPORTS phase 15b); here against the mock
+echo -n "Test: banner and global options line before the first records ... "
+OUT=$("$DAG" @127.0.0.1 -p $PORT example.com A +trace +timeout=2 +nohexdump 2>&1 || true)
+if [ "$(printf '%s\n' "$OUT" | sed -n 2p)" = "; <<>> dag <<>> example.com A @127.0.0.1" ] \
+   && printf '%s\n' "$OUT" | grep -q "^; (1 server found)$" && printf '%s\n' "$OUT" | grep -q "^;; global options: +cmd$"; then
+    echo "OK"
+else
+    echo "FAILED"; echo "$OUT" | sed 's/^/    /'; FAILED=$((FAILED + 1))
+fi
+echo -n "Test: +trace sets DO on every hop, a later +nodnssec clears it ... "
+: > "$QUERY_LOG.do"
+"$DAG" @127.0.0.1 -p $PORT example.com A +trace +timeout=2 > /dev/null 2>&1 || true
+DO_ON=$(grep -c "do=1" "$QUERY_LOG.do" || true); DO_OFF=$(grep -c "do=0" "$QUERY_LOG.do" || true)
+: > "$QUERY_LOG.do"
+"$DAG" @127.0.0.1 -p $PORT example.com A +trace +nodnssec +timeout=2 > /dev/null 2>&1 || true
+NO_DO=$(grep -c "do=1" "$QUERY_LOG.do" || true); NO_DO_TOTAL=$(wc -l < "$QUERY_LOG.do" | tr -d ' ')
+if [ "$DO_ON" -ge 3 ] && [ "$DO_OFF" -eq 0 ] && [ "$NO_DO" -eq 0 ] && [ "$NO_DO_TOTAL" -ge 3 ]; then
+    echo "OK"
+else
+    echo "FAILED (do=1: $DO_ON, do=0: $DO_OFF; with +nodnssec do=1: $NO_DO of $NO_DO_TOTAL)"; FAILED=$((FAILED + 1))
+fi
+echo -n "Test: +noall +answer +trace still shows the referral (dig: +trace sets +authority) ... "
+OUT=$("$DAG" @127.0.0.1 -p $PORT example.com A +noall +answer +trace +timeout=2 +nohexdump 2>&1 || true)
+OUT2=$("$DAG" @127.0.0.1 -p $PORT example.com A +trace +noall +answer +timeout=2 +nohexdump 2>&1 || true)
+if printf '%s\n' "$OUT" | grep -qE "^example\.com\.[[:space:]].*NS[[:space:]]+ns1\.external\.org\." \
+   && ! printf '%s\n' "$OUT2" | grep -qE "^example\.com\.[[:space:]].*NS[[:space:]]"; then
+    echo "OK"
+else
+    echo "FAILED"; echo "$OUT" | sed 's/^/    /'; echo "    ---"; echo "$OUT2" | sed 's/^/    /'; FAILED=$((FAILED + 1))
+fi
+echo -n "Test: NODATA without NS in Authority ends the trace without a message ... "
+OUT=$("$DAG" @127.0.0.1 -p $PORT nodata.test A +trace +timeout=2 +nohexdump 2>&1 || true)
+if printf '%s\n' "$OUT" | grep -qE "^nodata\.test\.[[:space:]].*SOA[[:space:]]" && ! printf '%s\n' "$OUT" | grep -q "stopping trace"; then
+    echo "OK"
+else
+    echo "FAILED"; echo "$OUT" | sed 's/^/    /'; FAILED=$((FAILED + 1))
 fi
 
 echo "=== 4. Testing +trace against authoritative-only @server (RA=0) ==="

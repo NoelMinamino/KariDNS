@@ -9,6 +9,7 @@
 # Usage:
 #   perl tests/mock_dnstap_receiver.pl --socket /path/to/socket [--output <file>]
 #                                      [--max-frames <N>] [--timeout <sec>]
+#                                      [--connections <N>] [--drop-after <N>]
 # ==============================================================================
 
 use strict;
@@ -22,6 +23,8 @@ my $output_file = '';
 my $max_frames  = 0;
 my $timeout_sec = 10;
 my $verbose     = 0;
+my $connections = 1;
+my $drop_after  = 0;
 
 GetOptions(
     'socket=s'     => \$socket_path,
@@ -29,8 +32,11 @@ GetOptions(
     'max-frames=i' => \$max_frames,
     'timeout=i'    => \$timeout_sec,
     'verbose|v'    => \$verbose,
+    'connections=i' => \$connections,
+    'drop-after=i'  => \$drop_after,
     'help|h'       => sub {
-        print "Usage: $0 --socket <path> [--output <file>] [--max-frames <N>] [--timeout <sec>]\n";
+        print "Usage: $0 --socket <path> [--output <file>] [--max-frames <N>] [--timeout <sec>] "
+            . "[--connections <N>] [--drop-after <N>]\n";
         exit 0;
     }
 );
@@ -54,110 +60,129 @@ if ($output_file) {
 }
 
 my $sel = IO::Select->new($server);
-my @ready = $sel->can_read($timeout_sec);
-if (!@ready) {
-    die "[mock_dnstap] Timeout waiting for connection on $socket_path\n";
-}
-
-my $client = $server->accept();
-die "[mock_dnstap] Accept failed: $!\n" unless $client;
-print "[mock_dnstap] Client connected\n";
-
-# Handshake: Receive READY frame
-# Format: escape (4B, 0) + len (4B) + type (4B, 4) + field (4B, 1) + ct_len (4B) + content_type
-my $hdr;
-read_exact($client, \$hdr, 8) or die "[mock_dnstap] Failed to read READY header\n";
-my ($esc, $ready_len) = unpack('NN', $hdr);
-die "[mock_dnstap] Invalid escape in READY frame: $esc\n" if $esc != 0;
-
-my $ready_payload;
-read_exact($client, \$ready_payload, $ready_len) or die "[mock_dnstap] Failed to read READY payload\n";
-my ($ready_type, $ready_field, $ct_len) = unpack('NNN', substr($ready_payload, 0, 12));
-die "[mock_dnstap] Expected READY type 4, got $ready_type\n" if $ready_type != 4;
-my $content_type = substr($ready_payload, 12, $ct_len);
-print "[mock_dnstap] Received READY with content-type: $content_type\n";
-
-# Send ACCEPT frame
-# escape (4B, 0) + len (4B) + type (4B, 1) + field (4B, 1) + ct_len (4B) + content_type
-my $accept_payload = pack('NNN', 1, 1, length($content_type)) . $content_type;
-my $accept_frame = pack('NN', 0, length($accept_payload)) . $accept_payload;
-$client->syswrite($accept_frame) or die "[mock_dnstap] Failed to send ACCEPT frame: $!\n";
-print "[mock_dnstap] Sent ACCEPT frame\n";
-
-# Receive START frame
-# escape (4B, 0) + len (4B) + type (4B, 2) + optional field/content_type
-read_exact($client, \$hdr, 8) or die "[mock_dnstap] Failed to read START header\n";
-my ($start_esc, $start_len) = unpack('NN', $hdr);
-die "[mock_dnstap] Invalid START escape: $start_esc\n" if $start_esc != 0;
-my $start_payload;
-read_exact($client, \$start_payload, $start_len) or die "[mock_dnstap] Failed to read START payload\n";
-my $start_type = unpack('N', substr($start_payload, 0, 4));
-die "[mock_dnstap] Expected START type 2, got $start_type\n" if $start_type != 2;
-print "[mock_dnstap] Handshake completed successfully. Receiving data frames...\n";
-
-# Data loop
 my $frame_count = 0;
-my $client_sel = IO::Select->new($client);
 
-while (1) {
-    last if ($max_frames > 0 && $frame_count >= $max_frames);
-
-    my @readable = $client_sel->can_read($timeout_sec);
-    if (!@readable) {
-        print "[mock_dnstap] Read timeout reached ($timeout_sec s), exiting data loop\n";
-        last;
+# --connections N: serve N connections one after the other (the sender reconnects after a
+# drop). --drop-after K: close the first connection after K data frames, like a collector
+# that is restarted.
+CONNECTION: for my $conn_no (1 .. $connections) {
+    my @ready = $sel->can_read($timeout_sec);
+    if (!@ready) {
+        print "[mock_dnstap] Timeout waiting for connection #$conn_no on $socket_path\n";
+        last CONNECTION;
     }
 
-    my $len_buf;
-    my $r = $client->sysread($len_buf, 4);
-    last if (!defined $r || $r == 0);
-    if ($r != 4) {
-        read_exact($client, \$len_buf, 4, $r) or last;
-    }
+    my $client = $server->accept();
+    die "[mock_dnstap] Accept failed: $!\n" unless $client;
+    print "[mock_dnstap] Client connected\n";
+    print $out_fh "[DNSTAP] connection #$conn_no\n";
+    $out_fh->flush();
 
-    my $data_len = unpack('N', $len_buf);
-    if ($data_len == 0) {
-        # Control frame (e.g. STOP)
-        my $ctrl_len_buf;
-        read_exact($client, \$ctrl_len_buf, 4) or last;
-        my $ctrl_len = unpack('N', $ctrl_len_buf);
-        my $ctrl_buf;
-        read_exact($client, \$ctrl_buf, $ctrl_len) or last;
-        my $ctrl_type = unpack('N', $ctrl_buf);
-        print "[mock_dnstap] Received control frame type $ctrl_type\n";
-        if ($ctrl_type == 3) { # STOP
-            # Send FINISH frame
-            my $finish = pack('NNN', 0, 4, 5);
-            $client->syswrite($finish);
+    # Handshake: Receive READY frame
+    # Format: escape (4B, 0) + len (4B) + type (4B, 4) + field (4B, 1) + ct_len (4B) + content_type
+    my $hdr;
+    read_exact($client, \$hdr, 8) or die "[mock_dnstap] Failed to read READY header\n";
+    my ($esc, $ready_len) = unpack('NN', $hdr);
+    die "[mock_dnstap] Invalid escape in READY frame: $esc\n" if $esc != 0;
+
+    my $ready_payload;
+    read_exact($client, \$ready_payload, $ready_len) or die "[mock_dnstap] Failed to read READY payload\n";
+    my ($ready_type, $ready_field, $ct_len) = unpack('NNN', substr($ready_payload, 0, 12));
+    die "[mock_dnstap] Expected READY type 4, got $ready_type\n" if $ready_type != 4;
+    my $content_type = substr($ready_payload, 12, $ct_len);
+    print "[mock_dnstap] Received READY with content-type: $content_type\n";
+
+    # Send ACCEPT frame
+    # escape (4B, 0) + len (4B) + type (4B, 1) + field (4B, 1) + ct_len (4B) + content_type
+    my $accept_payload = pack('NNN', 1, 1, length($content_type)) . $content_type;
+    my $accept_frame = pack('NN', 0, length($accept_payload)) . $accept_payload;
+    $client->syswrite($accept_frame) or die "[mock_dnstap] Failed to send ACCEPT frame: $!\n";
+    print "[mock_dnstap] Sent ACCEPT frame\n";
+
+    # Receive START frame
+    # escape (4B, 0) + len (4B) + type (4B, 2) + optional field/content_type
+    read_exact($client, \$hdr, 8) or die "[mock_dnstap] Failed to read START header\n";
+    my ($start_esc, $start_len) = unpack('NN', $hdr);
+    die "[mock_dnstap] Invalid START escape: $start_esc\n" if $start_esc != 0;
+    my $start_payload;
+    read_exact($client, \$start_payload, $start_len) or die "[mock_dnstap] Failed to read START payload\n";
+    my $start_type = unpack('N', substr($start_payload, 0, 4));
+    die "[mock_dnstap] Expected START type 2, got $start_type\n" if $start_type != 2;
+    print "[mock_dnstap] Handshake completed successfully. Receiving data frames...\n";
+
+    # Data loop
+    my $conn_frames = 0;
+    my $client_sel = IO::Select->new($client);
+
+    while (1) {
+        last CONNECTION if ($max_frames > 0 && $frame_count >= $max_frames);
+        if ($conn_no == 1 && $drop_after > 0 && $conn_frames >= $drop_after) {
+            print $out_fh "[DNSTAP] dropping connection #1\n";
+            $out_fh->flush();
             last;
         }
-        next;
+
+        my @readable = $client_sel->can_read($timeout_sec);
+        if (!@readable) {
+            print "[mock_dnstap] Read timeout reached ($timeout_sec s), exiting data loop\n";
+            last CONNECTION;
+        }
+
+        my $len_buf;
+        my $r = $client->sysread($len_buf, 4);
+        last if (!defined $r || $r == 0);
+        if ($r != 4) {
+            read_exact($client, \$len_buf, 4, $r) or last;
+        }
+
+        my $data_len = unpack('N', $len_buf);
+        if ($data_len == 0) {
+            # Control frame (e.g. STOP)
+            my $ctrl_len_buf;
+            read_exact($client, \$ctrl_len_buf, 4) or last;
+            my $ctrl_len = unpack('N', $ctrl_len_buf);
+            my $ctrl_buf;
+            read_exact($client, \$ctrl_buf, $ctrl_len) or last;
+            my $ctrl_type = unpack('N', $ctrl_buf);
+            print "[mock_dnstap] Received control frame type $ctrl_type\n";
+            if ($ctrl_type == 3) { # STOP
+                # Send FINISH frame
+                my $finish = pack('NNN', 0, 4, 5);
+                $client->syswrite($finish);
+                print $out_fh "[DNSTAP] STOP received, FINISH sent\n";
+                $out_fh->flush();
+                last CONNECTION;
+            }
+            next;
+        }
+
+        my $payload;
+        read_exact($client, \$payload, $data_len) or last;
+        $frame_count++;
+        $conn_frames++;
+
+        # Basic Protobuf decode
+        my $info = decode_dnstap_pb($payload);
+        my $mtype_str = ($info->{msg_type} == 1) ? 'AUTH_QUERY' :
+                        ($info->{msg_type} == 2) ? 'AUTH_RESPONSE' : "TYPE_$info->{msg_type}";
+
+        if ($output_file) {
+            print "[mock_dnstap] Captured frame #$frame_count: type=$mtype_str (" . ($info->{wire_len} || 0) . " bytes)\n";
+        }
+        print $out_fh sprintf("[DNSTAP] Frame #%d: type=%s (%d), identity=%s, version=%s, wire_len=%d, client=%s, zone=%s\n",
+                              $frame_count,
+                              $mtype_str,
+                              $info->{msg_type} || 0,
+                              $info->{identity} || '',
+                              $info->{version} || '',
+                              $info->{wire_len} || 0,
+                              $info->{client_addr} || '',
+                              $info->{zone} // '');
+        $out_fh->flush();
     }
-
-    my $payload;
-    read_exact($client, \$payload, $data_len) or last;
-    $frame_count++;
-
-    # Basic Protobuf decode
-    my $info = decode_dnstap_pb($payload);
-    my $mtype_str = ($info->{msg_type} == 1) ? 'AUTH_QUERY' :
-                    ($info->{msg_type} == 2) ? 'AUTH_RESPONSE' : "TYPE_$info->{msg_type}";
-
-    if ($output_file) {
-        print "[mock_dnstap] Captured frame #$frame_count: type=$mtype_str (" . ($info->{wire_len} || 0) . " bytes)\n";
-    }
-    print $out_fh sprintf("[DNSTAP] Frame #%d: type=%s (%d), identity=%s, version=%s, wire_len=%d, client=%s\n",
-                          $frame_count,
-                          $mtype_str,
-                          $info->{msg_type} || 0,
-                          $info->{identity} || '',
-                          $info->{version} || '',
-                          $info->{wire_len} || 0,
-                          $info->{client_addr} || '');
-    $out_fh->flush();
+    close($client);
 }
 
-close($client);
 close($server);
 unlink($socket_path) if -e $socket_path;
 close($out_fh) if $output_file;
@@ -264,6 +289,16 @@ sub decode_message_pb {
                 }
             } elsif ($field_num == 10 || $field_num == 14) { # query_message / response_message
                 $info->{wire_len} = $flen;
+            } elsif ($field_num == 11) { # query_zone (wire-format name)
+                my (@labels, $p);
+                $p = 0;
+                while ($p < $flen) {
+                    my $l = ord(substr($fdata, $p, 1));
+                    last if $l == 0;
+                    push @labels, substr($fdata, $p + 1, $l);
+                    $p += 1 + $l;
+                }
+                $info->{zone} = @labels ? join('.', @labels) . '.' : '.';
             }
         } elsif ($wire_type == 5) { # 32-bit
             $off += 4;

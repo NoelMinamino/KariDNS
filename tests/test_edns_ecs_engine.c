@@ -353,6 +353,98 @@ static void test_ecs_resolution(void) {
     printf("  -> ECS & location resolution passed.\n");
 }
 
+/* R-14 / RFC 7871 §7.2.1: SCOPE is the shortest prefix L such that every address in ADDRESS/L gets the
+ * same tag decision (first matching tag wins, prefixes must not overlap). */
+static const char *scope_case(ecs_tag_def_t *tags, int tag_count, uint16_t family, const char *addr_str,
+                              uint8_t *scope) {
+    zone_arena_t zone;
+    memset(&zone, 0, sizeof(zone));
+    zone.bind_ecs_tags = tags;
+    zone.bind_ecs_tag_count = tag_count;
+    uint8_t addr[16] = { 0 };
+    int ok = inet_pton(family == 1 ? AF_INET : AF_INET6, addr_str, addr);
+    assert(ok == 1);
+    (void)ok;
+    *scope = 0xEE;
+    return resolve_ecs_subnet_tag(&zone, NULL, NULL, addr, family, scope);
+}
+
+static void test_ecs_scope_prefix(void) {
+    printf("[TEST] EDNS/ECS: SCOPE PREFIX-LENGTH covers only addresses with the same tag decision...\n");
+    ecs_cidr_entry_t c[6];
+    memset(c, 0, sizeof(c));
+    const char *cidr_str[6] = { "198.51.100.128/25", "198.51.100.0/24", "192.0.2.0/24",
+                                "2001:db8:1::/48", "any", "not-a-cidr" };
+    for (int i = 0; i < 6; i++) {
+        c[i].cidr = (char *)cidr_str[i];
+        cidr_entry_parse(&c[i].parsed, c[i].cidr);
+    }
+    assert(c[4].parsed.valid && c[4].parsed.is_any);
+    assert(!c[5].parsed.valid);
+
+    ecs_tag_def_t t[3];
+    memset(t, 0, sizeof(t));
+    t[0].tag = "half"; t[0].cidrs = &c[0]; t[0].cidr_count = 1;  /* 198.51.100.128/25, checked first */
+    t[1].tag = "full"; t[1].cidrs = &c[1]; t[1].cidr_count = 3;  /* 198.51.100.0/24, 192.0.2.0/24, 2001:db8:1::/48 */
+    uint8_t scope;
+    const char *tag;
+
+    /* matching the later, shorter CIDR: the earlier /25 cuts it, so /24 would overlap it -> 25 */
+    tag = scope_case(t, 2, 1, "198.51.100.5", &scope);
+    assert(tag && strcmp(tag, "full") == 0);
+    assert(scope == 25);
+    tag = scope_case(t, 2, 1, "198.51.100.200", &scope);
+    assert(tag && strcmp(tag, "half") == 0);
+    assert(scope == 25);
+    /* the second CIDR of a tag: earlier CIDRs not containing the address limit the scope */
+    tag = scope_case(t, 2, 1, "192.0.2.77", &scope);
+    assert(tag && strcmp(tag, "full") == 0);
+    assert(scope == 24);   /* 198.51.100.x vs 192.0.2.x differ at bit 5 -> 6, the match itself is /24 */
+    /* no tag: the default answer is valid only as far as no CIDR is touched */
+    tag = scope_case(t, 2, 1, "203.0.113.9", &scope);
+    assert(tag == NULL);
+    assert(scope == 5);    /* 203 = 11001011, 198 = 11000110, 192 = 11000000: first difference at bit 4 */
+    tag = scope_case(t, 2, 1, "10.0.0.1", &scope);
+    assert(tag == NULL);
+    assert(scope == 1);
+    /* SOURCE /16 (198.51.0.0): not specific enough, SCOPE is longer than SOURCE (RFC 7871 §7.2.1) */
+    tag = scope_case(t, 2, 1, "198.51.0.0", &scope);
+    assert(tag == NULL);
+    assert(scope == 18);
+    /* IPv6 */
+    tag = scope_case(t, 2, 2, "2001:db8:1:2::1", &scope);
+    assert(tag && strcmp(tag, "full") == 0);
+    assert(scope == 48);
+    tag = scope_case(t, 2, 2, "2001:db8:2::", &scope);
+    assert(tag == NULL);
+    assert(scope == 47);   /* ...:0001 vs ...:0002 differ at bit 46 */
+    /* only IPv4 definitions: every IPv6 address gets the same (default) answer */
+    tag = scope_case(t, 1, 2, "2001:db8:1::1", &scope);
+    assert(tag == NULL);
+    assert(scope == 0);
+
+    /* "any" after a specific CIDR */
+    t[2].tag = "rest"; t[2].cidrs = &c[4]; t[2].cidr_count = 1;
+    ecs_tag_def_t t2[2] = { t[1], t[2] };
+    t2[0].cidr_count = 2;   /* 198.51.100.0/24, 192.0.2.0/24 */
+    tag = scope_case(t2, 2, 1, "203.0.113.9", &scope);
+    assert(tag && strcmp(tag, "rest") == 0);
+    assert(scope == 5);
+    tag = scope_case(&t2[1], 1, 1, "203.0.113.9", &scope);
+    assert(tag && strcmp(tag, "rest") == 0);
+    assert(scope == 0);    /* "any" alone: one answer for everybody */
+
+    /* a definition that could not be parsed: its range is unknown, so the whole address is the scope */
+    ecs_tag_def_t t3[1];
+    memset(t3, 0, sizeof(t3));
+    t3[0].tag = "bad"; t3[0].cidrs = &c[5]; t3[0].cidr_count = 1;
+    tag = scope_case(t3, 1, 1, "192.0.2.1", &scope);
+    assert(tag == NULL);
+    assert(scope == 32);
+
+    printf("  -> ECS scope prefix passed.\n");
+}
+
 static void test_ecs_trusted_resolver_precedence(void) {
     printf("[TEST] EDNS/ECS: is_ecs_trusted_resolver source precedence (zone data > zone config > server config)...\n");
 
@@ -425,46 +517,6 @@ static void test_ecs_trusted_resolver_precedence(void) {
     printf("  -> is_ecs_trusted_resolver precedence & ACL semantics passed.\n");
 }
 
-static void test_edns_ecs_engine_case_1(void) {
-    printf("[TEST] EDNS/ECS: ECS family IPv4 prefix length 0...\n");
-    uint8_t ecs_opt[8] = { 0x00, 0x01, 0x00, 0x00 }; // Family=1, SourcePrefix=0, ScopePrefix=0
-    assert(ecs_opt[0] == 0 && ecs_opt[1] == 1);
-}
-
-static void test_edns_ecs_engine_case_2(void) {
-    printf("[TEST] EDNS/ECS: ECS family IPv4 prefix length 32...\n");
-    uint8_t ecs_opt[8] = { 0x00, 0x01, 32, 0x00, 192, 0, 2, 1 };
-    assert(ecs_opt[2] == 32);
-}
-
-static void test_edns_ecs_engine_case_3(void) {
-    printf("[TEST] EDNS/ECS: ECS family IPv6 prefix length 56...\n");
-    uint8_t ecs_opt[12] = { 0x00, 0x02, 56, 0x00 };
-    assert(ecs_opt[1] == 2 && ecs_opt[2] == 56);
-}
-
-static void test_edns_ecs_engine_case_4(void) {
-    printf("[TEST] EDNS/ECS: ECS family IPv6 prefix length 128...\n");
-    uint8_t ecs_opt[20] = { 0x00, 0x02, 128, 0x00 };
-    assert(ecs_opt[2] == 128);
-}
-
-static void test_edns_ecs_engine_case_5(void) {
-    printf("[TEST] EDNS/ECS: ECS unknown address family rejection...\n");
-    uint16_t family = 99;
-    assert(family != 1 && family != 2);
-}
-
-static void test_edns_ecs_engine_case_6(void) {
-    printf("[TEST] EDNS/ECS: Cookie secret rollover validation...\n");
-    server_config_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.cookie_secret_count = 2;
-    memset(cfg.cookie_secrets[0], 0x11, 16);
-    memset(cfg.cookie_secrets[1], 0x22, 16);
-    assert(cfg.cookie_secret_count == 2);
-}
-
 static void test_edns_ecs_engine_case_7(void) {
     printf("[TEST] EDNS/ECS: Cookie timestamp drift tolerance check...\n");
     uint32_t now = (uint32_t)time(NULL);
@@ -479,78 +531,6 @@ static void test_edns_ecs_engine_case_8(void) {
     assert(future > now && (future - now) <= 300);
 }
 
-static void test_edns_ecs_engine_case_9(void) {
-    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 0 Unsupported...\n");
-    parsed_ede_t ede = { .code = 0 };
-    assert(ede.code == 0);
-}
-
-static void test_edns_ecs_engine_case_10(void) {
-    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 1 Unsupported DNSKEY...\n");
-    parsed_ede_t ede = { .code = 1 };
-    assert(ede.code == 1);
-}
-
-static void test_edns_ecs_engine_case_11(void) {
-    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 2 Unsupported DS...\n");
-    parsed_ede_t ede = { .code = 2 };
-    assert(ede.code == 2);
-}
-
-static void test_edns_ecs_engine_case_12(void) {
-    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 3 Stale Answer...\n");
-    parsed_ede_t ede = { .code = 3 };
-    assert(ede.code == 3);
-}
-
-static void test_edns_ecs_engine_case_13(void) {
-    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 6 DNSSEC Bogus...\n");
-    parsed_ede_t ede = { .code = 6 };
-    assert(ede.code == 6);
-}
-
-static void test_edns_ecs_engine_case_14(void) {
-    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 7 Signature Expired...\n");
-    parsed_ede_t ede = { .code = 7 };
-    assert(ede.code == 7);
-}
-
-static void test_edns_ecs_engine_case_15(void) {
-    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 8 Signature Not Yet Valid...\n");
-    parsed_ede_t ede = { .code = 8 };
-    assert(ede.code == 8);
-}
-
-static void test_edns_ecs_engine_case_16(void) {
-    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 9 DNSKEY Missing...\n");
-    parsed_ede_t ede = { .code = 9 };
-    assert(ede.code == 9);
-}
-
-static void test_edns_ecs_engine_case_17(void) {
-    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 10 RRSIGs Missing...\n");
-    parsed_ede_t ede = { .code = 10 };
-    assert(ede.code == 10);
-}
-
-static void test_edns_ecs_engine_case_18(void) {
-    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 11 NoZoneKey Bit Set...\n");
-    parsed_ede_t ede = { .code = 11 };
-    assert(ede.code == 11);
-}
-
-static void test_edns_ecs_engine_case_19(void) {
-    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 12 NSEC Missing...\n");
-    parsed_ede_t ede = { .code = 12 };
-    assert(ede.code == 12);
-}
-
-static void test_edns_ecs_engine_case_20(void) {
-    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 13 Cached Error...\n");
-    parsed_ede_t ede = { .code = 13 };
-    assert(ede.code == 13);
-}
-
 int main(void) {
     printf("=== Starting EDNS / ECS Engine Unit Tests ===\n");
     test_cookie_generation();
@@ -559,27 +539,10 @@ int main(void) {
     test_trusted_resolvers_unpack();
     test_tinydns_loc_and_wrap();
     test_ecs_resolution();
+    test_ecs_scope_prefix();
     test_ecs_trusted_resolver_precedence();
-        test_edns_ecs_engine_case_1();
-    test_edns_ecs_engine_case_2();
-    test_edns_ecs_engine_case_3();
-    test_edns_ecs_engine_case_4();
-    test_edns_ecs_engine_case_5();
-    test_edns_ecs_engine_case_6();
     test_edns_ecs_engine_case_7();
     test_edns_ecs_engine_case_8();
-    test_edns_ecs_engine_case_9();
-    test_edns_ecs_engine_case_10();
-    test_edns_ecs_engine_case_11();
-    test_edns_ecs_engine_case_12();
-    test_edns_ecs_engine_case_13();
-    test_edns_ecs_engine_case_14();
-    test_edns_ecs_engine_case_15();
-    test_edns_ecs_engine_case_16();
-    test_edns_ecs_engine_case_17();
-    test_edns_ecs_engine_case_18();
-    test_edns_ecs_engine_case_19();
-    test_edns_ecs_engine_case_20();
     printf("=== All EDNS / ECS Engine Unit Tests PASSED ===\n");
     return 0;
 }

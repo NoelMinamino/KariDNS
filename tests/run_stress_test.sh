@@ -36,7 +36,10 @@ cleanup() {
     sleep 1
     kari_kill_tree "${TSAN_PID:-}" "${ASAN_PID:-}"
     kari_kill_conf "$SERVER_CONF"
-    pkill -9 -f dnsperf 2>/dev/null
+    # X-08: only the dnsperf this test started (another dnsperf on the host must survive)
+    [ -n "${DNSPERF_PID:-}" ] && kill -9 "$DNSPERF_PID" 2>/dev/null
+    [ -n "${IXFR_CLIENT_PID:-}" ] && kill -9 "$IXFR_CLIENT_PID" 2>/dev/null
+    return 0
 }
 trap cleanup EXIT INT TERM
 

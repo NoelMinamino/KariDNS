@@ -31,6 +31,7 @@
 
 #include "../dns_config_parser.h"
 #include "../dns_utils.h"
+#include "../dns_tsig_acl.h"
 
 /* dns_config_parser.c calls this through the privileged-directory cache in the real server. */
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) {
@@ -135,9 +136,13 @@ static void test_boolean_directives(void) {
         { "rfc10029-mqtype",      offsetof(server_config_t, rfc10029_mqtype_enable), false },
         { "tcp-connection-reuse", offsetof(server_config_t, tcp_connection_reuse),   false },
         { "allow-program-zones",  offsetof(server_config_t, allow_program_zones),    false },
+        { "minimal-responses",    offsetof(server_config_t, minimal_responses),      false },
+        { "minimal-any",          offsetof(server_config_t, minimal_any),            false },
     };
+    /* D-02: BIND と同じく yes/true/1 と no/false/0、大文字小文字は区別しない */
     static const struct { const char *word; bool value; } words[] = {
         { "yes", true }, { "true", true }, { "no", false }, { "false", false },
+        { "YES", true }, { "True", true }, { "1", true }, { "No", false }, { "FALSE", false }, { "0", false },
     };
     char txt[256];
     for (size_t d = 0; d < sizeof(dirs) / sizeof(dirs[0]); d++) {
@@ -149,6 +154,11 @@ static void test_boolean_directives(void) {
             CHECK(got == words[w].value);
             free_server_config_fields(&cfg);
         }
+        /* D-02: any other value is a configuration error (it used to be ignored silently) */
+        snprintf(txt, sizeof(txt), "options { %s maybe; };", dirs[d].name);
+        expect_reject("boolean option with value 'maybe'", txt);
+        snprintf(txt, sizeof(txt), "options { %s 2; };", dirs[d].name);
+        expect_reject("boolean option with value '2'", txt);
         /* an unrelated directive must leave the default untouched */
         server_config_t cfg;
         if (parse_ok("options { port 5353; };", &cfg)) {
@@ -169,10 +179,16 @@ static void test_numeric_directives(void) {
     printf("[TEST] numeric options directives: valid values and boundaries...\n");
     server_config_t cfg;
 
+    if (parse_ok("options { tcp-initial-timeout 1500; tcp-idle-timeout 4294967295; };", &cfg)) {
+        CHECK(cfg.tcp_initial_timeout == 1500);
+        CHECK(cfg.tcp_idle_timeout == 4294967295u);
+        free_server_config_fields(&cfg);
+    }
     if (parse_ok("options { port 5353; tcp-idle-timeout 0; query-log-max-qps 250; "
                  "minimal-any-ttl 300; wire-cache-max-records 12345; };", &cfg)) {
         CHECK(cfg.port == 5353);
         CHECK(cfg.tcp_idle_timeout == 0);
+        CHECK(cfg.tcp_initial_timeout == 10000);   /* D-06: default */
         CHECK(cfg.query_log_max_qps == 250);
         CHECK(cfg.minimal_any_ttl == 300);
         CHECK(cfg.wire_cache_max_records == 12345);
@@ -210,6 +226,9 @@ static void test_numeric_directives_invalid(void) {
         "options { tcp-idle-timeout -1; };",
         "options { tcp-idle-timeout abc; };",
         "options { tcp-idle-timeout 10s; };",
+        "options { tcp-initial-timeout -1; };",
+        "options { tcp-initial-timeout 2.5; };",
+        "options { tcp-idle-timeout 4294967296; };",
         "options { query-log-max-qps abc; };",
         "options { minimal-any-ttl -1; };",
         "options { minimal-any-ttl 1.5; };",
@@ -329,8 +348,13 @@ static void test_additional_from_auth(void) {
         { "yes", ADDITIONAL_AUTH_YES },        { "true", ADDITIONAL_AUTH_YES },
         { "in-domain", ADDITIONAL_AUTH_IN_DOMAIN }, { "in-zone", ADDITIONAL_AUTH_IN_DOMAIN },
         { "no", ADDITIONAL_AUTH_NO },          { "false", ADDITIONAL_AUTH_NO },
-        { "bogus", ADDITIONAL_AUTH_YES },      /* unknown value: warning, falls back to yes */
+        { "YES", ADDITIONAL_AUTH_YES },        { "0", ADDITIONAL_AUTH_NO },
+        { "In-Domain", ADDITIONAL_AUTH_IN_DOMAIN },
     };
+    /* D-02: an unknown value is a configuration error (it used to fall back to yes with a warning) */
+    expect_reject("options additional-from-auth bogus", "options { additional-from-auth bogus; };");
+    expect_reject("zone additional-from-auth bogus",
+                  "zone \"example.com\" { type master; file \"z\"; additional-from-auth bogus; };");
     for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
         char txt[256];
         server_config_t cfg;
@@ -720,6 +744,24 @@ static void test_zone_rate_limit(void) {
         CHECK(cfg.rrl.window_seconds == 15);
         CHECK(cfg.rrl.slip == 2);
         CHECK(cfg.rrl.nodata_per_second_set == false);
+        free_server_config_fields(&cfg);
+    }
+    /* D-05: BIND options: prefix lengths, referrals-per-second (defaults to responses-per-second),
+     * all-per-second; qps-scale / min-table-size / max-table-size are accepted but have no effect */
+    if (parse_ok("options { rate-limit { responses-per-second 8; all-per-second 30; ipv4-prefix-length 32; "
+                 "ipv6-prefix-length 64; qps-scale 250; min-table-size 500; max-table-size 20000; }; };", &cfg)) {
+        CHECK(cfg.rrl.referrals_per_second == 8);
+        CHECK(cfg.rrl.referrals_per_second_set == false);
+        CHECK(cfg.rrl.all_per_second == 30);
+        CHECK(cfg.rrl.ipv4_prefix_length == 32 && cfg.rrl.ipv4_prefix_length_set);
+        CHECK(cfg.rrl.ipv6_prefix_length == 64 && cfg.rrl.ipv6_prefix_length_set);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { rate-limit { responses-per-second 8; referrals-per-second 3; ipv4-prefix-length 33; "
+                 "ipv6-prefix-length 129; }; };", &cfg)) {
+        CHECK(cfg.rrl.referrals_per_second == 3 && cfg.rrl.referrals_per_second_set);
+        CHECK(cfg.rrl.ipv4_prefix_length == 24 && !cfg.rrl.ipv4_prefix_length_set);   /* out of range: ignored */
+        CHECK(cfg.rrl.ipv6_prefix_length == 56 && !cfg.rrl.ipv6_prefix_length_set);
         free_server_config_fields(&cfg);
     }
     expect_reject("rate-limit without braces", "options { rate-limit yes; };");
@@ -1173,6 +1215,238 @@ static void test_config_negative_patterns(void) {
     printf("  -> config parser error & warning branches verified.\n");
 }
 
+/* notify-retries / notify-retry-interval / notify-retry-backoff (RFC 1996 §3.6: operator parameters,
+ * defaults 60 s and 5 retransmissions). docs/karidns.md: options and zone, zone overrides options. */
+static void test_notify_retry(void) {
+    printf("[TEST] notify-retries / notify-retry-interval / notify-retry-backoff...\n");
+    server_config_t cfg;
+    if (parse_ok("options { };", &cfg)) {
+        notify_retry_config_t r = notify_retry_effective(&cfg, NULL);
+        CHECK(r.retries == 5 && r.interval == 60 && r.backoff == NOTIFY_BACKOFF_FIXED);
+        free_server_config_fields(&cfg);
+    }
+    /* no configuration at all: the built-in defaults */
+    notify_retry_config_t d = notify_retry_effective(NULL, NULL);
+    CHECK(d.retries == 5 && d.interval == 60 && d.backoff == NOTIFY_BACKOFF_FIXED);
+
+    if (parse_ok("options { notify-retries 3; notify-retry-interval 3; notify-retry-backoff exponential; };"
+                 "zone \"a.example\" { type master; file \"a.zone\"; notify-retry-interval 10; };"
+                 "zone \"b.example\" { type master; file \"b.zone\"; notify-retries 0; notify-retry-backoff FIXED; };"
+                 "zone \"c.example\" { type master; file \"c.zone\"; };", &cfg)) {
+        const zone_config_t *a = first_zone(&cfg);
+        const zone_config_t *b = a ? a->next : NULL;
+        const zone_config_t *c = b ? b->next : NULL;
+        CHECK(cfg.notify_retry.retries == 3 && cfg.notify_retry.interval == 3);
+        CHECK(cfg.notify_retry.backoff == NOTIFY_BACKOFF_EXPONENTIAL);
+        notify_retry_config_t ra = notify_retry_effective(&cfg, a);
+        CHECK(ra.retries == 3 && ra.interval == 10 && ra.backoff == NOTIFY_BACKOFF_EXPONENTIAL);
+        notify_retry_config_t rb = notify_retry_effective(&cfg, b);
+        CHECK(rb.retries == 0 && rb.interval == 3 && rb.backoff == NOTIFY_BACKOFF_FIXED);
+        notify_retry_config_t rc = notify_retry_effective(&cfg, c);
+        CHECK(rc.retries == 3 && rc.interval == 3 && rc.backoff == NOTIFY_BACKOFF_EXPONENTIAL);
+        CHECK(c && !c->notify_retry.retries_set && !c->notify_retry.interval_set && !c->notify_retry.backoff_set);
+        free_server_config_fields(&cfg);
+    }
+    /* range boundaries are inclusive */
+    if (parse_ok("options { notify-retries 10; notify-retry-interval 3600; };", &cfg)) {
+        CHECK(cfg.notify_retry.retries == 10 && cfg.notify_retry.interval == 3600);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { notify-retries 0; notify-retry-interval 1; };", &cfg)) {
+        CHECK(cfg.notify_retry.retries == 0 && cfg.notify_retry.interval == 1);
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("notify-retries above 10", "options { notify-retries 11; };");
+    expect_reject("notify-retries negative", "options { notify-retries -1; };");
+    expect_reject("notify-retry-interval 0", "options { notify-retry-interval 0; };");
+    expect_reject("notify-retry-interval above 3600", "options { notify-retry-interval 3601; };");
+    expect_reject("notify-retry-interval junk", "options { notify-retry-interval 60s; };");
+    expect_reject("notify-retry-backoff unknown", "options { notify-retry-backoff linear; };");
+    expect_reject("notify-retry-backoff missing semicolon", "options { notify-retry-backoff fixed };");
+    expect_reject("zone notify-retries out of range",
+                  "zone \"a.example\" { type master; file \"a.zone\"; notify-retries 99; };");
+    expect_reject("zone notify-retry-backoff unknown",
+                  "zone \"a.example\" { type master; file \"a.zone\"; notify-retry-backoff 2; };");
+}
+
+/* ------------------------------------------------------------------------ */
+/* Phase 12: D-02 (the other boolean statements), D-01 (category lists), D-23 (type case), D-22 (acl) */
+static void test_boolean_statements_everywhere(void) {
+    printf("[TEST] D-02: one boolean rule in zone, rate-limit, dnstap and logging statements...\n");
+    server_config_t cfg;
+    if (parse_ok("zone \"cat.test\" { type master; file \"c\"; catalog-zone TRUE; disable-auto-tc-flag 1; };", &cfg)) {
+        const zone_config_t *z = first_zone(&cfg);
+        CHECK(z && z->is_catalog == true && z->disable_auto_tc_flag == true);
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("catalog-zone maybe", "zone \"cat.test\" { type master; file \"c\"; catalog-zone maybe; };");
+    expect_reject("disable-auto-tc-flag maybe", "zone \"cat.test\" { type master; file \"c\"; disable-auto-tc-flag maybe; };");
+    if (parse_ok("options { rate-limit { responses-per-second 5; log-only Yes; early-drop 0; }; };", &cfg)) {
+        CHECK(cfg.rrl.log_only == true && cfg.rrl.early_drop == false);
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("rate-limit log-only maybe", "options { rate-limit { log-only maybe; }; };");
+    expect_reject("rate-limit early-drop maybe", "options { rate-limit { early-drop maybe; }; };");
+    if (parse_ok("dnstap { socket \"/tmp/x.sock\"; log-queries TRUE; log-responses No; require-connect 1; };", &cfg)) {
+        CHECK(cfg.dnstap.log_auth_query == true && cfg.dnstap.log_auth_response == false);
+        CHECK(cfg.dnstap.require_connect == true);
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("dnstap log-queries maybe", "dnstap { socket \"/tmp/x.sock\"; log-queries maybe; };");
+    expect_reject("dnstap require-connect maybe", "dnstap { socket \"/tmp/x.sock\"; require-connect maybe; };");
+    /* print-time true used to be read as "no" (only the word yes was accepted) */
+    if (parse_ok("logging { channel q { file \"/tmp/q.log\"; print-time true; print-category 1; print-severity YES; }; };", &cfg)) {
+        const log_channel_t *c = cfg.logging.channels;
+        CHECK(c && c->print_time == true && c->print_category == true && c->print_severity == true);
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("print-time maybe", "logging { channel q { file \"/tmp/q.log\"; print-time maybe; }; };");
+}
+
+static void test_logging_category_lists(void) {
+    printf("[TEST] D-01: category with several channels uses the first one...\n");
+    server_config_t cfg;
+    if (parse_ok("logging { channel a { file \"/tmp/a.log\"; }; channel b { file \"/tmp/b.log\"; };"
+                 "  category queries { a; b; }; category responses { b; a; }; };", &cfg)) {
+        CHECK_STR(cfg.logging.queries_channel_name, "a");
+        CHECK(cfg.logging.queries_channel && strcmp(cfg.logging.queries_channel->name, "a") == 0);
+        CHECK_STR(cfg.logging.responses_channel_name, "b");
+        free_server_config_fields(&cfg);
+    }
+    /* an empty list turns the category off; a later definition replaces an earlier one */
+    if (parse_ok("logging { channel a { file \"/tmp/a.log\"; }; category queries { a; }; category queries { }; };", &cfg)) {
+        CHECK(cfg.logging.queries_channel_name == NULL && cfg.logging.queries_channel == NULL);
+        free_server_config_fields(&cfg);
+    }
+    /* only the first channel is used; the others are ignored (with a warning), even undefined ones */
+    if (parse_ok("logging { channel a { file \"/tmp/a.log\"; }; category queries { a; undefined_b; }; };", &cfg)) {
+        CHECK_STR(cfg.logging.queries_channel_name, "a");
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("category list without ';'", "logging { channel a { file \"/tmp/a.log\"; }; category queries { a b; }; };");
+    expect_reject("category without braces", "logging { channel a { file \"/tmp/a.log\"; }; category queries a; };");
+    expect_reject("unterminated channel (no leak of the channel)", "logging { channel a { file \"/tmp/a.log\"; print-time maybe; ");
+}
+
+static void test_zone_type_case(void) {
+    printf("[TEST] D-23: zone type names are stored in lower case...\n");
+    static const struct { const char *word; const char *stored; } t[] = {
+        { "Master", "master" }, { "PRIMARY", "master" }, { "Slave", "slave" }, { "Secondary", "slave" },
+        { "FORWARD", "forward" },
+    };
+    for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+        char txt[256];
+        server_config_t cfg;
+        snprintf(txt, sizeof(txt), "zone \"example.com\" { type %s; file \"z\"; masters { 192.0.2.1; }; "
+                 "forwarders { 192.0.2.1; }; };", t[i].word);
+        if (parse_ok(txt, &cfg)) {
+            const zone_config_t *z = first_zone(&cfg);
+            CHECK(z != NULL);
+            if (z) CHECK_STR(z->type, t[i].stored);
+            free_server_config_fields(&cfg);
+        }
+    }
+    server_config_t cfg;
+    /* a second type statement replaces the first (no leak under ASan) */
+    if (parse_ok("zone \"example.com\" { type master; type Secondary; file \"z\"; masters { 192.0.2.1; }; };", &cfg)) {
+        CHECK_STR(first_zone(&cfg)->type, "slave");
+        free_server_config_fields(&cfg);
+    }
+}
+
+static bool acl_has(char **list, int count, const char *entry) {
+    for (int i = 0; i < count; i++)
+        if (list[i] && strcmp(list[i], entry) == 0) return true;
+    return false;
+}
+
+static void test_named_acls(void) {
+    printf("[TEST] D-22: acl statements, references and invalid entries...\n");
+    server_config_t cfg;
+    /* used before it is defined, nested, negated, with a key */
+    if (parse_ok("key \"k1\" { algorithm hmac-sha256; secret \"" SECRET_OK "\"; };"
+                 "zone \"example.com\" { type master; file \"z\";"
+                 "  allow-transfer { xfr; }; allow-update { !blocked; upd; }; };"
+                 "acl \"inner\" { 192.0.2.0/24; };"
+                 "acl xfr { inner; 2001:db8::/32; key k1; };"
+                 "acl blocked { 192.0.2.66; };"
+                 "acl \"upd\" { 198.51.100.7; key \"k1\"; };", &cfg)) {
+        const zone_config_t *z = first_zone(&cfg);
+        CHECK(z != NULL);
+        if (z) {
+            CHECK(z->allow_transfer_count == 2);
+            CHECK(acl_has(z->allow_transfer, z->allow_transfer_count, "192.0.2.0/24"));
+            CHECK(acl_has(z->allow_transfer, z->allow_transfer_count, "2001:db8::/32"));
+            CHECK(z->tsig_keys_count == 1 && z->tsig_keys && strcmp(z->tsig_keys[0], "k1") == 0);
+            /* allow-update: !192.0.2.66 first, then the address and the key name */
+            CHECK(z->allow_update_count == 3);
+            CHECK(z->allow_update_count == 3 && strcmp(z->allow_update[0], "!192.0.2.66") == 0);
+            CHECK(acl_has(z->allow_update, z->allow_update_count, "198.51.100.7"));
+            CHECK(acl_has(z->allow_update, z->allow_update_count, "k1"));
+            CHECK(check_acl_bin("192.0.2.5", z->allow_transfer_parsed, z->allow_transfer_count));
+            CHECK(!check_acl_bin("203.0.113.5", z->allow_transfer_parsed, z->allow_transfer_count));
+            CHECK(!check_acl_bin("192.0.2.66", z->allow_update_parsed, z->allow_update_count));
+            CHECK(check_acl_bin("198.51.100.7", z->allow_update_parsed, z->allow_update_count));
+        }
+        free_server_config_fields(&cfg);
+    }
+    /* !name negates each entry, as "! { ... };" does; match-clients and ecs-trusted-resolvers expand too */
+    if (parse_ok("acl lan { 192.0.2.0/24; !192.0.2.9; };"
+                 "options { ecs-trusted-resolvers { lan; }; };"
+                 "view \"v\" { match-clients { !lan; any; }; zone \"example.com\" { type master; file \"z\"; }; };", &cfg)) {
+        const view_config_t *v = cfg.views;
+        CHECK(v && v->match_clients_count == 3);
+        if (v && v->match_clients_count == 3) {
+            CHECK_STR(v->match_clients[0], "!192.0.2.0/24");
+            CHECK_STR(v->match_clients[1], "192.0.2.9");
+            CHECK_STR(v->match_clients[2], "any");
+            CHECK(!check_acl_bin("192.0.2.1", v->match_clients_parsed, v->match_clients_count));
+            CHECK(check_acl_bin("203.0.113.1", v->match_clients_parsed, v->match_clients_count));
+        }
+        CHECK(cfg.ecs_trusted_resolvers_count == 2);
+        free_server_config_fields(&cfg);
+    }
+    /* none is accepted and never matches; a bare defined key name stays valid in allow-update */
+    if (parse_ok("key \"k1\" { algorithm hmac-sha256; secret \"" SECRET_OK "\"; };"
+                 "zone \"example.com\" { type master; file \"z\"; allow-transfer { none; }; allow-update { k1; }; };", &cfg)) {
+        const zone_config_t *z = first_zone(&cfg);
+        CHECK(z && z->allow_transfer_count == 1 && !check_acl_bin("192.0.2.1", z->allow_transfer_parsed, 1));
+        CHECK(z && z->allow_update_count == 1 && strcmp(z->allow_update[0], "k1") == 0);
+        free_server_config_fields(&cfg);
+    }
+    /* invalid entries are configuration errors (they used to never match, silently) */
+    expect_reject("allow-transfer with a bad address",
+                  "zone \"example.com\" { type master; file \"z\"; allow-transfer { 192.0.2.300; }; };");
+    expect_reject("allow-transfer with a bad prefix",
+                  "zone \"example.com\" { type master; file \"z\"; allow-transfer { 192.0.2.0/33; }; };");
+    expect_reject("allow-transfer with an undefined acl name",
+                  "zone \"example.com\" { type master; file \"z\"; allow-transfer { secondaries; }; };");
+    expect_reject("allow-update with an undefined name (neither acl nor key)",
+                  "zone \"example.com\" { type master; file \"z\"; allow-update { typo_key; }; };");
+    expect_reject("match-clients with an undefined acl",
+                  "view \"v\" { match-clients { nowhere; }; zone \"example.com\" { type master; file \"z\"; }; };");
+    expect_reject("ecs-trusted-resolvers with a bad entry", "options { ecs-trusted-resolvers { resolver1; }; };");
+    expect_reject("localhost is not supported",
+                  "zone \"example.com\" { type master; file \"z\"; allow-transfer { localhost; }; };");
+    expect_reject("localnets is not supported",
+                  "zone \"example.com\" { type master; file \"z\"; allow-transfer { localnets; }; };");
+    expect_reject("acl with a bad entry",
+                  "acl bad { 999.1.1.1; }; zone \"example.com\" { type master; file \"z\"; allow-transfer { bad; }; };");
+    expect_reject("duplicate acl (case-insensitive)", "acl a { any; }; acl A { none; };");
+    expect_reject("acl named like a built-in", "acl any { 192.0.2.1; };");
+    expect_reject("acl loop", "acl a { b; }; acl b { a; };"
+                  "zone \"example.com\" { type master; file \"z\"; allow-transfer { a; }; };");
+    expect_reject("acl with a key used in match-clients",
+                  "key \"k1\" { algorithm hmac-sha256; secret \"" SECRET_OK "\"; }; acl k { key k1; };"
+                  "view \"v\" { match-clients { k; }; zone \"example.com\" { type master; file \"z\"; }; };");
+    expect_reject("acl with an undefined key",
+                  "acl k { key nokey; }; zone \"example.com\" { type master; file \"z\"; allow-transfer { k; }; };");
+    expect_reject("negated key through an acl",
+                  "key \"k1\" { algorithm hmac-sha256; secret \"" SECRET_OK "\"; }; acl k { key k1; };"
+                  "zone \"example.com\" { type master; file \"z\"; allow-transfer { !k; }; };");
+    expect_reject("acl without a body", "acl a;");
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
     test_defaults();
@@ -1181,6 +1455,7 @@ int main(void) {
     test_numeric_directives_invalid();
     test_buffer_sizes();
     test_transport_params();
+    test_notify_retry();
     test_additional_from_auth();
     test_options_syntax_errors();
     test_ecs_and_location_tags();
@@ -1196,6 +1471,10 @@ int main(void) {
     test_structure_and_validation();
     test_config_cidr_matching();
     test_config_negative_patterns();
+    test_boolean_statements_everywhere();
+    test_logging_category_lists();
+    test_zone_type_case();
+    test_named_acls();
 
     printf("[*] %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) {

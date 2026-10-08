@@ -105,11 +105,11 @@ echo "[+] Step 4: querying 'mixed.harmonize.test.' RRSIG -- RRSIG(A) must show T
 cat out_mixed_rrsig.txt
 check_no_crash
 
-grep "RRSIG" out_mixed_rrsig.txt | grep " A " | awk '{print $2}' | grep -q "^300$" || {
+grep "RRSIG" out_mixed_rrsig.txt | grep -E "RRSIG[[:space:]]+A " | awk '{print $2}' | grep -q "^300$" || {
     echo "FAIL: RRSIG covering type A does not show the harmonized covered-RRset TTL (300)"
     exit 1
 }
-grep "RRSIG" out_mixed_rrsig.txt | grep " MX " | awk '{print $2}' | grep -q "^600$" || {
+grep "RRSIG" out_mixed_rrsig.txt | grep -E "RRSIG[[:space:]]+MX " | awk '{print $2}' | grep -q "^600$" || {
     echo "FAIL: RRSIG covering type MX does not show its own RRset TTL (600); it may have been incorrectly merged with RRSIG(A)"
     exit 1
 }

@@ -153,11 +153,34 @@ static inline uint32_t dag_arc4random(void) {
 const char *dag_strcasestr(const char *haystack, const char *needle);
 
 extern bool g_dag_suppress_stdout;
+extern size_t g_dag_pseudo_opt_off;
+extern bool g_dag_show_stray_opt;
+extern uint16_t g_dag_rdata_class;
+
+/* dag_parse_message(): outcome of parsing a response the way BIND (dig) does */
+typedef struct {
+    const char *fatal;  /* "Got bad packet" reason (the message is not shown), NULL if parsed */
+    bool malformed;     /* recoverable error: "Message parser reports malformed message packet" */
+    size_t end;         /* parsing stopped here; the octets after it are "extra bytes" */
+    uint16_t count[4];  /* records accepted per section (question, answer, authority, additional) */
+    size_t opt_off;     /* offset of the OPT pseudo-RR, SIZE_MAX if none */
+} dag_parse_t;
+void dag_parse_message(const uint8_t *pkt, size_t len, dag_parse_t *out);
+bool print_parse_diagnostics(const uint8_t *pkt, size_t len, const dag_parse_t *ps);
 #define printf(...) do { if (!g_dag_suppress_stdout) { fprintf(stdout, __VA_ARGS__); } } while(0)
 
 extern zone_arena_t g_dag_arena;
+/* +yaml の query_time / response_time (CLOCK_REALTIME)。問い合わせの送信直前と応答の受信後に設定する */
+extern struct timespec g_dag_query_time;
+extern struct timespec g_dag_response_time;
 extern char g_last_server_ip[INET6_ADDRSTRLEN + 1];
 extern int g_last_socket_family;
+/* do_udp_exchange(): further checks of an answer whose header and ID matched (QR, opcode, question; set by dag).
+ * Returns false to ignore the answer and keep waiting. NULL in programs that do not set it. */
+typedef bool (*dag_answer_check_fn)(const uint8_t *query, size_t query_len, const uint8_t *resp, size_t resp_len);
+extern dag_answer_check_fn g_dag_answer_check;
+/* do_udp_exchange() return value for a timeout (dig: ";; communications error to ...: timed out") */
+#define DAG_EXCHANGE_TIMEOUT (-2)
 
 /* Types */
 typedef enum {
@@ -311,6 +334,10 @@ typedef struct {
     bool server_explicit;
 
     bool use_search_list;
+    bool search_more;     /* 検索リストにまだ候補がある (NXDOMAIN なら次へ進む; +showsearch でなければ表示しない) */
+    bool no_cmd_banner;   /* 見出し "; <<>> dag <<>>" を出さない (+qr の検索リストの 2 番目以降) */
+    uint8_t cmd_banner_style; /* dig: 最初のクエリだけ完全な見出し。CMD_BANNER_LINE = -f の 2 行目以降 ("; <<>>" 行だけ)、
+                                 CMD_BANNER_NONE = コマンドラインの 2 番目以降のクエリ (見出しなし) */
     char *search_domain;
     int ndots;
 
@@ -372,6 +399,7 @@ typedef struct {
     bool show_crypto;
     bool show_query_message;
     bool rrcomments;
+    bool rrcomments_set;   /* +[no]rrcomments was given (otherwise +multiline shows key comments, like dig) */
     bool onesoa;
     bool show_badcookie_msg;
     bool show_badvers_msg;
@@ -382,6 +410,11 @@ typedef struct {
     bool has_expected_client_cookie;
     uint8_t expected_client_cookie[8];
     bool check_dns64prefix;
+    /* 表示中のメッセージが dag の送ったクエリ (+qr) か。dig は自分のクエリの COOKIE に状態を付けず、
+     * +padding で付けた PADDING を長さなしで表示する (レンダリング前のメッセージを表示するため)。 */
+    bool msg_is_query;
+    bool query_auto_padding;
+    bool parse_diag_done;   /* run_test() already printed the parse diagnostics before the banner */
 } display_opts_t;
 
 /* +trace2 (フルリゾルバ相当の反復解決) の設定 */
@@ -442,6 +475,17 @@ const char *format_ttl_units(uint32_t ttl, char *buf, size_t buf_size);
 const char *format_class_name(uint16_t klass, char *buf, size_t buf_size);
 const char *opcode_name(uint8_t opcode);
 const char *rcode_name(uint16_t rcode);
+const char *tsig_rcode_name(uint16_t error);
+void print_tsig_verify_error(int err, const uint8_t *resp, size_t n);
+int dag_expand_name(const uint8_t *pkt, size_t pkt_len, size_t off, size_t *next, zone_arena_t *arena, char **out);
+const char *find_sig_pseudo_rr(const uint8_t *pkt, size_t pkt_len, size_t offset, uint16_t arcount, size_t *rr_off);
+const char *format_duration_text(uint32_t secs, char *buf, size_t buf_size);
+/* Type mnemonic as dig 9.20 prints it: format_type_name() (dns_utils.c, shared with the server and karicheck)
+ * except types dig 9.20 has no mnemonic for (128 NXNAME, RFC 9824 -> "TYPE128") */
+const char *dag_type_name(uint16_t type, char *buf, size_t buf_size);
+/* "; <<>> dag <<>> ..." banner, "; (N servers found)", ";; global options: +cmd" (dig: printed when +cmd) */
+void dag_print_cmd_banner(const query_opts_t *qo, const display_opts_t *dopt, const char *qname,
+                          const char *qtype_s, const char *server, int port, bool use_tcp);
 const char *get_ede_error_string(uint16_t code);
 void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                              size_t abs_offset, uint16_t rdlen,
@@ -456,6 +500,14 @@ void free_query_opts(query_opts_t *qo);
 void prescan_always_global_options(int argc, char **argv, query_spec_t *global_spec);
 int parse_arg_slice(int start, int end, int argc, char **argv, query_spec_t *spec);
 int execute_query_spec(query_spec_t *spec);
+void finish_query_tuple(const query_spec_t *spec);
+#define MAX_DAG_QUERIES 64
+typedef struct {
+    int start;
+    int end;
+} arg_slice_t;
+int split_query_tuples(int argc, char **argv, arg_slice_t *queries, int *global_end);
+enum { CMD_BANNER_FULL = 0, CMD_BANNER_LINE = 1, CMD_BANNER_NONE = 2 };
 
 /* Break helpers */
 extern break_opt_t g_breaks[MAX_BREAKS];

@@ -87,7 +87,7 @@ EOF
 # EXPIRE value in the OPT pseudosection ("" when absent)
 expire_of() {
     "$DAG" @127.0.0.1 -p "$1" $2 +expire +nocookie +norec +timeout=2 2>/dev/null |
-        sed -n 's/.*EXPIRE: \([0-9]*\) (seconds).*/\1/p' | head -1
+        sed -n 's/.*EXPIRE: \([0-9]*\) (.*/\1/p' | head -1
 }
 status_of() {
     "$DAG" @127.0.0.1 -p "$1" $2 +norec +timeout=2 2>/dev/null |

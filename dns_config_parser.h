@@ -40,6 +40,13 @@ typedef struct {
   bool nodata_per_second_set;
   uint32_t nxdomains_per_second;
   uint32_t errors_per_second;
+  uint32_t referrals_per_second;  /* D-05: BIND と同じ。未指定なら responses-per-second */
+  bool referrals_per_second_set;
+  uint32_t all_per_second;        /* D-05: クライアント (プレフィックス) ごとの全応答。0 = 制限なし */
+  uint8_t ipv4_prefix_length;     /* D-05: クライアントをまとめる長さ (_set でなければ既定 24) */
+  uint8_t ipv6_prefix_length;     /* D-05: 同 (_set でなければ既定 56) */
+  bool ipv4_prefix_length_set;
+  bool ipv6_prefix_length_set;
   uint32_t window_seconds;
   uint32_t slip;
   ip_port_t *exempt_clients;
@@ -52,6 +59,22 @@ typedef enum {
   ADDITIONAL_AUTH_IN_DOMAIN = 1, /* in-domain: 自ゾーン(管理するドメイン名)配下のレコードのみ返す */
   ADDITIONAL_AUTH_NO = 2         /* no: Additionalセクションへのアドレス付加を行わない */
 } additional_from_auth_t;
+
+/* 送信する NOTIFY の再送 (RFC 1996 §3.6: 間隔と回数は運用者が決める値)。
+ * options の値は常に有効。zone の値は *_set のものだけが options を上書きする。 */
+#define NOTIFY_RETRIES_DEFAULT 5
+#define NOTIFY_RETRIES_MAX 10
+#define NOTIFY_RETRY_INTERVAL_DEFAULT 60
+#define NOTIFY_RETRY_INTERVAL_MAX 3600
+typedef enum { NOTIFY_BACKOFF_FIXED = 0, NOTIFY_BACKOFF_EXPONENTIAL = 1 } notify_backoff_t;
+typedef struct {
+  int retries;        /* notify-retries: 最初の送信の後に再送する回数 */
+  int interval;       /* notify-retry-interval: 最初の再送までの秒数 */
+  notify_backoff_t backoff; /* notify-retry-backoff: fixed は同じ間隔、exponential は再送ごとに倍 */
+  bool retries_set;
+  bool interval_set;
+  bool backoff_set;
+} notify_retry_config_t;
 
 typedef struct zone_config {
   char *domain;
@@ -122,6 +145,8 @@ typedef struct zone_config {
   int zone_tcp_sndbuf;      /* SO_SNDBUF (送信バッファ) */
   uint16_t zone_udp_bufsize; /* EDNS UDP ペイロードサイズ上限 (512..4096) */
 
+  notify_retry_config_t notify_retry; /* ゾーン単位の上書き (*_set のもの) */
+
   struct zone_config *next;
 } zone_config_t;
 
@@ -181,6 +206,16 @@ typedef struct view_config {
   struct view_config *next;
 } view_config_t;
 
+/* D-22: トップレベルの acl "name" { ... }; 。要素は parse 時の文字列のまま持ち、
+ * 設定全体を読んだ後に各 ACL の参照を展開する。key 要素は ACL_KEY_MARK を先頭に付けて区別する */
+#define ACL_KEY_MARK '\001'
+typedef struct acl_def {
+  char *name;
+  char **entries;
+  int count;
+  struct acl_def *next;
+} acl_def_t;
+
 typedef struct server_config_s {
   int port;
   char **bind_addresses;
@@ -192,6 +227,7 @@ typedef struct server_config_s {
   zone_config_t *zones; /* 所有権を持たない参照専用フラットリスト。ビュー内ゾーンへのポインタを共有しており、フィールド書き込みや free_zone_config() は絶対に行わないこと */
   bool zones_are_flat;  /* zones が参照専用フラットリストであるかどうかの追跡フラグ */
   tsig_key_t *keys;
+  acl_def_t *acls;
   logging_config_t logging;
   control_channel_config_t control;
   dnstap_config_t dnstap;
@@ -209,6 +245,7 @@ typedef struct server_config_s {
   bool rfc10029_mqtype_enable;
   bool tcp_connection_reuse;
   uint32_t tcp_idle_timeout;
+  uint32_t tcp_initial_timeout; /* ms。最初のメッセージを受け取るまでの待ち時間 (D-06) */
   char *nsid_string;
   /* RFC 9018 DNS Server Cookies. `cookie-secret "<32 hex>";` may be repeated: the first
    * secret generates new Server Cookies, all secrets are accepted for verification
@@ -219,6 +256,7 @@ typedef struct server_config_s {
   int udp_recvbuf_size;
   int udp_sndbuf_size;
   /* TCP の転送パラメータ (0 = OS 既定) */
+  notify_retry_config_t notify_retry;
   int tcp_mss;              /* TCP_MAXSEG。accept 直後に各接続へ設定 (送信 MSS を下げる方向のみ) */
   int tcp_window;           /* SO_RCVBUF と SO_SNDBUF。listen() 前に設定し accept 済みソケットへ
                              * 継承させる。listen ソケットは reload で作り直さないため再起動が必要 */
@@ -273,10 +311,15 @@ int parse_named_conf_ext(const char *config_str, const char *initial_file_path, 
 void config_lexer_cleanup(token_ctx_t *ctx);
 void free_server_config_fields(server_config_t *cfg);
 void free_zone_config(zone_config_t *z);
+/* zone (NULL 可) の NOTIFY 再送の設定を、options の値で補って返す */
+notify_retry_config_t notify_retry_effective(const server_config_t *cfg, const zone_config_t *zone);
 void free_rate_limit_config(rate_limit_config_t *rrl);
 #include <sys/types.h>
 char *read_entire_file(const char *path, dev_t *out_dev, ino_t *out_ino);
+struct stat;
+char *read_entire_file_stat(const char *path, struct stat *out_st);
 bool match_cidr(const char *client_ip_str, const char *cidr_str);
+bool parse_config_bool(const char *s, bool *out);
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable);
 void *safe_realloc_or_die_test_wrapper(void *ptr, size_t size);
 void *safe_calloc_or_die_test_wrapper(size_t nmemb, size_t size);

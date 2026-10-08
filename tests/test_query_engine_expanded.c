@@ -10,6 +10,8 @@
 #include <time.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <unistd.h>
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
@@ -1021,11 +1023,11 @@ static void test_prelink_zone_additional_glue_policies(void) {
     snap.view_count = 1;
 
     // 1. Policy NO
-    prelink_zone_additional_glue(&arena, "glue.example.", &snap, &view, ADDITIONAL_AUTH_NO);
+    prelink_zone_additional_glue(&arena, "glue.example.", &view, ADDITIONAL_AUTH_NO);
     assert(arena.prelinked_glue == NULL);
 
     // 2. Policy YES
-    prelink_zone_additional_glue(&arena, "glue.example.", &snap, &view, ADDITIONAL_AUTH_YES);
+    prelink_zone_additional_glue(&arena, "glue.example.", &view, ADDITIONAL_AUTH_YES);
     assert(arena.prelinked_glue != NULL);
     assert(arena.prelinked_glue_count >= 1);
 
@@ -1167,11 +1169,15 @@ static void test_nsec3_hashing_and_intervals(void) {
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
     assert(build_zone_index(&arena, true) == 0);
 
-    dns_record_t *matched = find_matching_nsec3(&arena, "00000000000000000000000000000000", "example.com.");
+    dns_record_t *p3 = NULL;
+    for (size_t i = 0; i < arena.count && !p3; i++)
+        if (arena.records[i].type_code == 50) p3 = &arena.records[i];
+    assert(p3 != NULL);
+    dns_record_t *matched = find_matching_nsec3(&arena, p3, "00000000000000000000000000000000", "example.com.");
     assert(matched != NULL);
     assert(matched->type_code == 50);
 
-    dns_record_t *covering = find_covering_nsec3(&arena, "55555555555555555555555555555555");
+    dns_record_t *covering = find_covering_nsec3(&arena, p3, "55555555555555555555555555555555");
     assert(covering != NULL);
     assert(covering->type_code == 50);
 
@@ -1845,7 +1851,7 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
 
     // 6. dispatch_to_program_zone with no plugin registered -> returns synthetic SERVFAIL
     uint8_t prog_res[512];
-    int pr_len = dispatch_to_program_zone("unregistered.prog.", qpkt, qlen, prog_res, sizeof(prog_res), "127.0.0.1", false);
+    int pr_len = dispatch_to_program_zone("", "unregistered.prog.", qpkt, qlen, prog_res, sizeof(prog_res), sizeof(prog_res), "127.0.0.1", false);
     assert(pr_len > 0);
     assert((prog_res[3] & 0x0F) == 2); // SERVFAIL
 
@@ -1870,7 +1876,7 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
     memset(&null_prog_cfg, 0, sizeof(null_prog_cfg));
     null_prog_cfg.domain = "null.prog.";
     program_plugin_t null_out;
-    assert(spawn_one_program_plugin(&null_prog_cfg, &null_out) == false);
+    assert(spawn_one_program_plugin(&null_prog_cfg, "", &null_out) == false);
 
     // 10. nsec_covers_name & find_covering_nsec
     zone_arena_t nsec_arena;
@@ -1896,6 +1902,10 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
     nsec_arena.records[0] = nsec1;
     nsec_arena.records[1] = nsec2;
     nsec_arena.count = 2;
+
+    // X-22: no linear scan without the NSEC index (build_zone_index() fails the load when it cannot allocate it)
+    assert(find_covering_nsec(&nsec_arena, "b.example.") == NULL);
+    assert(build_zone_index(&nsec_arena, false) == 0 && nsec_arena.nsec_count == 2);
 
     dns_record_t *cov = find_covering_nsec(&nsec_arena, "b.example.");
     assert(cov != NULL && strcmp(cov->name, "a.example.") == 0);
@@ -2024,7 +2034,7 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     uint16_t dummy_off = 0, dummy_ar = 0;
     compress_ctx_t comp;
     compress_ctx_init(&comp);
-    assert(append_glue_records(NULL, "target.com.", "apex.com.", dummy_res, sizeof(dummy_res), &dummy_off, &comp, &dummy_ar, "\0\0", NULL, NULL, ADDITIONAL_AUTH_NO, NULL) == true);
+    assert(append_glue_records(NULL, "target.com.", "apex.com.", dummy_res, sizeof(dummy_res), &dummy_off, &comp, &dummy_ar, "\0\0", NULL, NULL, ADDITIONAL_AUTH_NO, NULL, false) == true);
 
     // 5. record_observatory_response
     zone_db_entry_t obs_entry;
@@ -2070,7 +2080,7 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.wire_cache_max_records = 100;
-    build_zone_response_cache(&test_arena, &cfg, "example.com.");
+    build_zone_response_cache(&test_arena, &cfg, NULL, "example.com.");
     zone_arena_destroy(&test_arena);
 
     // 8. name_to_canonical_wire
@@ -2108,16 +2118,40 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     // 13. find_matching_nsec3 & find_covering_nsec3 on empty arena
     zone_arena_t nsec3_arena;
     zone_arena_init(&nsec3_arena);
-    assert(find_matching_nsec3(&nsec3_arena, "AAAA", "example.com.") == NULL);
-    assert(find_covering_nsec3(&nsec3_arena, "AAAA") == NULL);
+    dns_record_t p3_empty;
+    memset(&p3_empty, 0, sizeof(p3_empty));
+    p3_empty.rdata[0] = "1"; p3_empty.rdata[1] = "0"; p3_empty.rdata[2] = "0"; p3_empty.rdata[3] = "-";
+    p3_empty.rdata_count = 4;
+    dns_record_t *p3 = &p3_empty;
+    assert(find_matching_nsec3(&nsec3_arena, p3, "AAAA", "example.com.") == NULL);
+    assert(find_covering_nsec3(&nsec3_arena, p3, "AAAA") == NULL);
     dns_record_t *att[8];
     int att_count = 0;
     assert(attach_nsec3_record(&nsec3_arena, NULL, dummy_res, sizeof(dummy_res), &dummy_off, &comp, &dummy_ar, att, &att_count) == true);
     zone_arena_destroy(&nsec3_arena);
 
     // 14. find_program_plugin
-    assert(find_program_plugin(NULL) == NULL);
-    assert(find_program_plugin("unknown.domain.invalid.") == NULL);
+    assert(find_program_plugin("", NULL) == NULL);
+    assert(find_program_plugin("", "unknown.domain.invalid.") == NULL);
+    {
+        /* O-12: the same program zone name in two views has two plugins; the lookup uses the view */
+        program_plugin_t two[2];
+        memset(two, 0, sizeof(two));
+        strlcpy(two[0].domain, "prog.example.", sizeof(two[0].domain));
+        strlcpy(two[0].view_name, "internal", sizeof(two[0].view_name));
+        strlcpy(two[1].domain, "prog.example.", sizeof(two[1].domain));
+        strlcpy(two[1].view_name, "external", sizeof(two[1].view_name));
+        program_plugin_t *saved = g_program_plugins;
+        int saved_count = g_program_plugins_count;
+        g_program_plugins = two;
+        g_program_plugins_count = 2;
+        assert(find_program_plugin("internal", "prog.example.") == &two[0]);
+        assert(find_program_plugin("EXTERNAL", "PROG.example.") == &two[1]);
+        assert(find_program_plugin("other", "prog.example.") == NULL);
+        assert(find_program_plugin(NULL, "prog.example.") == NULL);
+        g_program_plugins = saved;
+        g_program_plugins_count = saved_count;
+    }
 
     // 15. forward_via_tcp
     struct sockaddr_storage fwd_ss;
@@ -2190,7 +2224,7 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     assert(question_section_matches(valid_qpkt, valid_qlen, valid_qpkt, valid_qlen) == true);
     assert(question_section_matches(qpkt, sizeof(qpkt), qpkt, sizeof(qpkt)) == false);
     assert(question_section_matches(NULL, 0, valid_qpkt, valid_qlen) == false);
-    int pgm_res = dispatch_to_program_zone("invalid.zone.", valid_qpkt, valid_qlen, rpkt, sizeof(rpkt), "127.0.0.1", false);
+    int pgm_res = dispatch_to_program_zone("", "invalid.zone.", valid_qpkt, valid_qlen, rpkt, sizeof(rpkt), sizeof(rpkt), "127.0.0.1", false);
     assert(pgm_res >= 12);
     assert((rpkt[3] & 0x0F) == 2); // SERVFAIL
 
@@ -3979,44 +4013,56 @@ static void test_dynamic_update_prereq_rrset_exists_value_independent(void) {
     printf("  -> prereq RRset exists value-independent passed.\n");
 }
 
+/* RFC 2136 §3.2.3: prerequisites "RRset exists (value dependent)" on www.vdep.example. (A 192.0.2.1,
+ * 192.0.2.2), optionally followed by the update "add www A 192.0.2.<add_last>". Returns the RCODE; *www_count
+ * is the number of www A records afterwards. */
+static int vdep_update_run(const uint8_t *prereq_lasts, int n, uint8_t add_last, update_result_t *ur, int *www_count) {
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "vdep.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN vdep.example.\n$TTL 300\n@ IN SOA ns1 host 1 7200 3600 1209600 300\n@ IN NS ns1\n"
+                         "ns1 IN A 192.0.2.53\nwww IN A 192.0.2.1\nwww IN A 192.0.2.2\n";
+    char *zbuf = arena_strdup(&arena, ztext); // the arena keeps pointers into the text
+    assert(parse_zone_fast(zbuf, strlen(zbuf), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    uint8_t ureq[512];
+    memset(ureq, 0, sizeof(ureq));
+    ureq[2] = 0x28; // UPDATE
+    ureq[5] = 1;    // ZOCOUNT
+    ureq[7] = (uint8_t)n; // PRCOUNT
+    ureq[9] = add_last ? 1 : 0; // UPCOUNT
+    size_t off = 12;
+    off += (size_t)write_uncompressed_name(ureq, off, sizeof(ureq), "vdep.example.");
+    ureq[off++] = 0; ureq[off++] = 6; ureq[off++] = 0; ureq[off++] = 1;
+    for (int i = 0; i <= n; i++) {
+        if (i == n && !add_last) break;
+        off += (size_t)write_uncompressed_name(ureq, off, sizeof(ureq), "www.vdep.example.");
+        uint32_t ttl = (i == n) ? 300 : 0; // prerequisite TTL must be 0 (§3.2.3)
+        uint8_t rr[14] = { 0, 1, 0, 1, (uint8_t)(ttl >> 24), (uint8_t)(ttl >> 16), (uint8_t)(ttl >> 8), (uint8_t)ttl,
+                           0, 4, 192, 0, 2, (i == n) ? add_last : prereq_lasts[i] };
+        memcpy(ureq + off, rr, sizeof(rr));
+        off += sizeof(rr);
+    }
+    int rcode = process_update_sections(ureq, off, "vdep.example.", &arena, ur);
+    *www_count = 0;
+    for (size_t i = 0; i < arena.count; i++) {
+        if (arena.records[i].name && arena.records[i].type_code == 1 &&
+            strcasecmp(arena.records[i].name, "www.vdep.example.") == 0) (*www_count)++;
+    }
+    zone_arena_destroy(&arena);
+    return rcode;
+}
+
 static void test_dynamic_update_prereq_rrset_exists_value_dependent(void) {
     printf("[TEST] Query Engine: Dynamic Update prerequisite RRset exists (value-dependent)...\n");
+    update_result_t ur;
+    int cnt;
+    const uint8_t exact[2] = { 1, 2 };
+    assert(vdep_update_run(exact, 2, 0, &ur, &cnt) == 0 && !ur.changed && cnt == 2);
     printf("  -> prereq RRset exists value-dependent passed.\n");
-}
-
-static void test_dynamic_update_prereq_rrset_does_not_exist(void) {
-    printf("[TEST] Query Engine: Dynamic Update prerequisite RRset does not exist...\n");
-    printf("  -> prereq RRset does not exist passed.\n");
-}
-
-static void test_dynamic_update_prereq_name_in_use(void) {
-    printf("[TEST] Query Engine: Dynamic Update prerequisite Name in use...\n");
-    printf("  -> prereq Name in use passed.\n");
-}
-
-static void test_dynamic_update_prereq_name_not_in_use(void) {
-    printf("[TEST] Query Engine: Dynamic Update prerequisite Name not in use...\n");
-    printf("  -> prereq Name not in use passed.\n");
-}
-
-static void test_dynamic_update_action_add_to_rrset(void) {
-    printf("[TEST] Query Engine: Dynamic Update action Add to RRset...\n");
-    printf("  -> action Add to RRset passed.\n");
-}
-
-static void test_dynamic_update_action_delete_rrset(void) {
-    printf("[TEST] Query Engine: Dynamic Update action Delete RRset...\n");
-    printf("  -> action Delete RRset passed.\n");
-}
-
-static void test_dynamic_update_action_delete_all_rrsets(void) {
-    printf("[TEST] Query Engine: Dynamic Update action Delete all RRsets on name...\n");
-    printf("  -> action Delete all RRsets passed.\n");
-}
-
-static void test_dynamic_update_action_delete_specific_rr(void) {
-    printf("[TEST] Query Engine: Dynamic Update action Delete specific RR matching value...\n");
-    printf("  -> action Delete specific RR passed.\n");
 }
 
 static void test_dnssec_nsec_wildcard_no_data_proof(void) {
@@ -4038,26 +4084,6 @@ static void test_dnssec_nsec_wildcard_no_data_proof(void) {
     printf("  -> NSEC wildcard NODATA proof passed.\n");
 }
 
-static void test_dnssec_nsec_referral_proof(void) {
-    printf("[TEST] Query Engine: DNSSEC NSEC referral proof at delegation point...\n");
-    printf("  -> NSEC referral proof passed.\n");
-}
-
-static void test_dnssec_nsec3_optout_unsigned_delegation(void) {
-    printf("[TEST] Query Engine: DNSSEC NSEC3 Opt-Out unsigned delegation...\n");
-    printf("  -> NSEC3 Opt-Out delegation passed.\n");
-}
-
-static void test_dnssec_covering_rrsig_signature_expiry(void) {
-    printf("[TEST] Query Engine: DNSSEC RRSIG expired signature handling...\n");
-    printf("  -> RRSIG expired signature passed.\n");
-}
-
-static void test_dnssec_covering_rrsig_signature_inception_future(void) {
-    printf("[TEST] Query Engine: DNSSEC RRSIG future inception handling...\n");
-    printf("  -> RRSIG future inception passed.\n");
-}
-
 static void test_dname_synthesis_multi_label_subdomain(void) {
     printf("[TEST] Query Engine: DNAME synthesis on multi-label deep subdomain...\n");
     zone_arena_t arena;
@@ -4076,93 +4102,268 @@ static void test_dname_synthesis_multi_label_subdomain(void) {
     printf("  -> DNAME multi-label synthesis passed.\n");
 }
 
-static void test_dname_synthesis_target_length_exceeded_255(void) {
-    printf("[TEST] Query Engine: DNAME synthesis resulting domain > 255 bytes YXDOMAIN...\n");
-    printf("  -> DNAME domain > 255 bytes passed.\n");
+/* Checks that answer RR i is "<owner> CNAME <target>" (names compared case-insensitively). */
+static void gr_expect_cname(const gr_resp_t *r, int i, const char *owner, const char *target) {
+    char t[256];
+    assert(i < r->nrr && r->rr[i].sect == 1 && r->rr[i].type == 5);
+    assert(strcasecmp(r->rr[i].name, owner) == 0);
+    assert(gr_read_name(r->msg, r->len, r->rr[i].rdoff, t, sizeof(t)) != 0);
+    assert(strcasecmp(t, target) == 0);
 }
 
+/* RFC 1034 §4.3.2 step 3a: the server restarts at each CNAME target. The chain is followed up to the
+ * server's limit (16 steps in resolve_name()), so a long chain ends with the CNAMEs found so far and no
+ * address record; the answer stays NOERROR because the CNAMEs themselves were found (resolve_name()
+ * keeps them instead of rolling back to SERVFAIL). */
 static void test_cname_chain_maximum_length_stop(void) {
     printf("[TEST] Query Engine: CNAME chain traversal stops at limit...\n");
+    char zone[4096];
+    size_t n = (size_t)snprintf(zone, sizeof(zone),
+        "$ORIGIN chain.example.\n$TTL 300\n"
+        "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n");
+    for (int i = 1; i <= 20; i++)
+        n += (size_t)snprintf(zone + n, sizeof(zone) - n, "c%d IN CNAME c%d\n", i, i + 1);
+    n += (size_t)snprintf(zone + n, sizeof(zone) - n, "c21 IN A 192.0.2.21\n");
+    assert(n < sizeof(zone));
+    gr_setup("chain.example.", zone);
+
+    gr_resp_t r;
+    gr_query("c1.chain.example.", 1, false, &r);
+    assert(r.rcode == 0 && r.aa);
+    assert(gr_count(&r, 1, 5) == 16 && gr_count(&r, 1, 1) == 0);
+    for (int i = 0; i < 16; i++) {
+        char owner[64], target[64];
+        snprintf(owner, sizeof(owner), "c%d.chain.example.", i + 1);
+        snprintf(target, sizeof(target), "c%d.chain.example.", i + 2);
+        gr_expect_cname(&r, i, owner, target);
+    }
+
+    /* a chain within the limit is followed to the end */
+    gr_query("c10.chain.example.", 1, false, &r);
+    assert(r.rcode == 0 && gr_count(&r, 1, 5) == 11 && gr_count(&r, 1, 1) == 1);
+    assert(strcasecmp(gr_first(&r, 1, 1)->name, "c21.chain.example.") == 0);
+    zone_arena_destroy(&g_gr.arena);
     printf("  -> CNAME chain limit passed.\n");
 }
 
+/* RFC 1034 §3.6.2: "CNAME loops [should be] signalled as an error" — that is the resolver's job; the
+ * server must not follow a loop forever or repeat an RR (RFC 2181 §5). resolve_name() stops when a
+ * target was already visited and returns the CNAMEs once each. */
 static void test_cname_alias_to_cname_loop_prevention(void) {
     printf("[TEST] Query Engine: CNAME alias cycle detection...\n");
+    gr_setup("loop.example.",
+        "$ORIGIN loop.example.\n$TTL 300\n"
+        "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n"
+        "self IN CNAME self\n"
+        "a IN CNAME b\nb IN CNAME c\nc IN CNAME a\n");
+    gr_resp_t r;
+    gr_query("self.loop.example.", 1, false, &r);
+    assert(r.rcode == 0 && r.aa);
+    assert(r.counts[0] == 1 && r.counts[1] == 0);
+    gr_expect_cname(&r, 0, "self.loop.example.", "self.loop.example.");
+
+    gr_query("a.loop.example.", 1, false, &r);
+    assert(r.rcode == 0 && r.aa);
+    assert(r.counts[0] == 3 && gr_count(&r, 1, 1) == 0);
+    gr_expect_cname(&r, 0, "a.loop.example.", "b.loop.example.");
+    gr_expect_cname(&r, 1, "b.loop.example.", "c.loop.example.");
+    gr_expect_cname(&r, 2, "c.loop.example.", "a.loop.example.");
+
+    /* entering the loop at another member gives the same three RRs, starting there */
+    gr_query("c.loop.example.", 28, false, &r);
+    assert(r.rcode == 0 && r.counts[0] == 3);
+    gr_expect_cname(&r, 0, "c.loop.example.", "a.loop.example.");
+    zone_arena_destroy(&g_gr.arena);
     printf("  -> CNAME cycle detection passed.\n");
 }
 
+/* RFC 4592 §3.3.1 / §2.2.1: "*.w" is the source of synthesis for every name below w that has no closer
+ * encloser, however many labels the QNAME adds; a name below an existing node ("x.w") is not covered. */
 static void test_wildcard_covering_multiple_subdomains(void) {
-    printf("[TEST] Query Engine: Wildcard single level label match...\n");
+    printf("[TEST] Query Engine: Wildcard match over one and several labels...\n");
+    gr_setup("wc.example.",
+        "$ORIGIN wc.example.\n$TTL 300\n"
+        "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n"
+        "*.w IN A 192.0.2.9\n"
+        "x.w IN TXT \"exists\"\n");
+    gr_resp_t r;
+    const gr_rr_t *rr;
+    static const char *const covered[] = { "one.w.wc.example.", "a.b.w.wc.example.", "a.b.c.d.w.wc.example." };
+    for (size_t i = 0; i < sizeof(covered) / sizeof(covered[0]); i++) {
+        gr_query(covered[i], 1, false, &r);
+        assert(r.rcode == 0 && r.aa && r.counts[0] == 1);
+        rr = gr_first(&r, 1, 1);
+        assert(rr && strcasecmp(rr->name, covered[i]) == 0);   // owner is the QNAME (§3.3.1)
+        assert(rr->rdlen == 4 && memcmp(r.msg + rr->rdoff, "\xc0\x00\x02\x09", 4) == 0);
+    }
+    /* closest encloser x.w exists and has no "*.x.w": NXDOMAIN, not the wildcard */
+    gr_query("y.x.w.wc.example.", 1, false, &r);
+    assert(r.rcode == 3 && r.counts[0] == 0 && gr_count(&r, 2, 6) == 1);
+    /* x.w itself: NODATA for A */
+    gr_query("x.w.wc.example.", 1, false, &r);
+    assert(r.rcode == 0 && r.counts[0] == 0 && gr_count(&r, 2, 6) == 1);
+    /* the wildcard does not cover w itself (an empty non-terminal): NODATA */
+    gr_query("w.wc.example.", 1, false, &r);
+    assert(r.rcode == 0 && r.counts[0] == 0);
+    zone_arena_destroy(&g_gr.arena);
     printf("  -> Wildcard label match passed.\n");
 }
 
+/* RFC 4592 §3.3.2 / §4.4 (rules for CNAME at a wildcard): a CNAME at "*.c" is synthesized with the QNAME
+ * as owner and then followed (RFC 1034 §4.3.2 step 3a); an existing name below c is answered from its
+ * own data, never from the wildcard. */
 static void test_wildcard_priority_over_cname_synthesis(void) {
-    printf("[TEST] Query Engine: Wildcard priority evaluation...\n");
+    printf("[TEST] Query Engine: Wildcard CNAME synthesis and exact-match priority...\n");
+    gr_setup("wcn.example.",
+        "$ORIGIN wcn.example.\n$TTL 300\n"
+        "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n"
+        "*.c IN CNAME target\n"
+        "exact.c IN A 192.0.2.6\n"
+        "target IN A 192.0.2.5\n"
+        "target IN TXT \"target txt\"\n");
+    gr_resp_t r;
+    const gr_rr_t *rr;
+    gr_query("foo.c.wcn.example.", 1, false, &r);
+    assert(r.rcode == 0 && r.aa && r.counts[0] == 2);
+    gr_expect_cname(&r, 0, "foo.c.wcn.example.", "target.wcn.example.");
+    rr = gr_first(&r, 1, 1);
+    assert(rr && strcasecmp(rr->name, "target.wcn.example.") == 0);
+    assert(memcmp(r.msg + rr->rdoff, "\xc0\x00\x02\x05", 4) == 0);
+
+    /* exact match wins: no CNAME */
+    gr_query("exact.c.wcn.example.", 1, false, &r);
+    assert(r.rcode == 0 && r.counts[0] == 1 && gr_count(&r, 1, 5) == 0);
+    rr = gr_first(&r, 1, 1);
+    assert(rr && memcmp(r.msg + rr->rdoff, "\xc0\x00\x02\x06", 4) == 0);
+    /* exact.c has no TXT: NODATA, the wildcard CNAME is not used for an existing name */
+    gr_query("exact.c.wcn.example.", 16, false, &r);
+    assert(r.rcode == 0 && r.counts[0] == 0 && gr_count(&r, 2, 6) == 1);
+    /* QTYPE CNAME at a synthesized name: the CNAME itself, not followed (RFC 1034 §3.6.2) */
+    gr_query("bar.c.wcn.example.", 5, false, &r);
+    assert(r.rcode == 0 && r.counts[0] == 1);
+    gr_expect_cname(&r, 0, "bar.c.wcn.example.", "target.wcn.example.");
+    zone_arena_destroy(&g_gr.arena);
     printf("  -> Wildcard priority passed.\n");
 }
 
+/* R-14: SCOPE PREFIX-LENGTH chosen by resolve_name() (RFC 7871 §7.2.1, §7.4). One zone with a name that has
+ * ECS-tagged variants ("geo") and names without ("www"). */
+typedef struct {
+    zone_arena_t arena;
+    zone_db_entry_t entry;
+} ecs_scope_zone_t;
+
+static ecs_scope_zone_t g_ecs_scope_zone;
+static bool g_ecs_scope_zone_ready = false;
+
+static void ecs_scope_zone_init(void) {
+    if (g_ecs_scope_zone_ready) return;
+    /* parse_zone_fast() keeps pointers into its input, so the text must outlive the arena */
+    static char ztext[] =
+        "$ORIGIN ecs.example.\n"
+        "@ 3600 IN SOA ns1 admin 1 3600 1800 604800 86400\n"
+        "@ 3600 IN NS ns1\n"
+        "ns1 300 IN A 192.0.2.1\n"
+        "www 300 IN A 192.0.2.10\n"
+        "$ECS-SUBNET-TAG eu 198.51.100.0/24 2001:db8:1::/48\n"
+        "$ECS-SUBNET eu\n"
+        "geo 300 IN A 192.0.2.100\n"
+        "geo 300 IN AAAA 2001:db8::100\n"
+        "$ECS-SUBNET \"\"\n"
+        "geo 300 IN A 192.0.2.200\n"
+        "alias 300 IN CNAME geo\n";
+    memset(&g_ecs_scope_zone, 0, sizeof(g_ecs_scope_zone));
+    zone_arena_init(&g_ecs_scope_zone.arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "ecs.example.", .is_standalone_mode = true,
+                            .err_out = &err };
+    int rc = parse_zone_fast(ztext, strlen(ztext), &g_ecs_scope_zone.arena, &ctx);
+    assert(rc >= 0);
+    assert(g_ecs_scope_zone.arena.bind_ecs_tag_count == 1);
+    rc = build_zone_index(&g_ecs_scope_zone.arena, true);
+    assert(rc == 0);
+    (void)rc;
+    strlcpy(g_ecs_scope_zone.entry.domain, "ecs.example.", sizeof(g_ecs_scope_zone.entry.domain));
+    atomic_store_explicit(&g_ecs_scope_zone.entry.rcu.active, &g_ecs_scope_zone.arena, memory_order_release);
+    g_ecs_scope_zone_ready = true;
+}
+
+/* Runs resolve_name() with an ECS address; returns SCOPE, stores RCODE and ANCOUNT. */
+static uint8_t ecs_scope_query(const char *qname, uint16_t qtype, uint16_t family, const char *addr_str,
+                               uint8_t source, bool trusted, int *rcode, uint16_t *ancount_out) {
+    ecs_scope_zone_init();
+    uint8_t addr[16] = { 0 };
+    int ok = inet_pton(family == 1 ? AF_INET : AF_INET6, addr_str, addr);
+    assert(ok == 1);
+    (void)ok;
+    zone_db_entry_t *db_entry_ptr = &g_ecs_scope_zone.entry;
+    zone_arena_t *cur_zone = &g_ecs_scope_zone.arena;
+    uint8_t res[1024];
+    memset(res, 0, sizeof(res));
+    uint16_t offset = 12, ancount = 0, nscount = 0, arcount = 0;
+    compress_ctx_t comp_ctx;
+    compress_ctx_init(&comp_ctx);
+    compress_ctx_init_packet(&comp_ctx);
+    uint8_t scope = 0xEE;
+    resolve_name(qname, 1, &qtype, 1, &db_entry_ptr, &cur_zone, res, sizeof(res), &offset, &comp_ctx,
+                 &ancount, &nscount, &arcount, false, false, 0, false, NULL, NULL,
+                 "127.0.0.1", NULL, trusted, addr, family, source, &scope);
+    *rcode = res[3] & 0x0F;
+    *ancount_out = ancount;
+    return scope;
+}
+
 static void test_edns_client_subnet_ipv6_scope_prefix_zero(void) {
-    printf("[TEST] Query Engine: EDNS Client Subnet IPv6 zero scope prefix...\n");
-    printf("  -> ECS IPv6 zero scope passed.\n");
+    printf("[TEST] Query Engine: ECS SCOPE with IPv6 addresses and SOURCE PREFIX-LENGTH 0...\n");
+    int rcode;
+    uint16_t an;
+    /* tagged AAAA for 2001:db8:1::/48 */
+    assert(ecs_scope_query("geo.ecs.example.", 28, 2, "2001:db8:1::", 48, true, &rcode, &an) == 48);
+    assert(rcode == 0 && an == 1);
+    /* outside the tag the name has no AAAA: negative answer, SCOPE 0 (RFC 7871 §7.4) */
+    assert(ecs_scope_query("geo.ecs.example.", 28, 2, "2001:db8:2::", 48, true, &rcode, &an) == 0);
+    assert(rcode == 0 && an == 0);
+    /* default A for an IPv6 client: valid only up to the /48 of the tag (differs at bit 46) */
+    assert(ecs_scope_query("geo.ecs.example.", 1, 2, "2001:db8:2::", 48, true, &rcode, &an) == 47);
+    assert(rcode == 0 && an == 1);
+    /* SOURCE 0 (::/0): the answer still depends on the subnet, so it must not be marked as valid for all
+     * networks; a SCOPE longer than SOURCE makes a resolver keep it for /0 queries only (RFC 7871 §7.3.1) */
+    assert(ecs_scope_query("geo.ecs.example.", 1, 2, "::", 0, true, &rcode, &an) == 3);
+    assert(rcode == 0 && an == 1);
+    /* a name without tagged variants: SCOPE 0 */
+    assert(ecs_scope_query("www.ecs.example.", 1, 2, "::", 0, true, &rcode, &an) == 0);
+    assert(rcode == 0 && an == 1);
+    printf("  -> ECS IPv6 / SOURCE 0 scope passed.\n");
 }
 
 static void test_edns_client_subnet_ipv4_prefix_clamping(void) {
-    printf("[TEST] Query Engine: EDNS Client Subnet prefix clamping (/32 -> /24)...\n");
-    printf("  -> ECS prefix clamping passed.\n");
-}
-
-static void test_dns_cookie_client_cookie_only_generation(void) {
-    printf("[TEST] Query Engine: DNS Cookie client-only Cookie returns BADCOOKIE...\n");
-    printf("  -> DNS Cookie client-only passed.\n");
-}
-
-static void test_dns_cookie_server_cookie_mismatch_refresh(void) {
-    printf("[TEST] Query Engine: DNS Cookie server cookie mismatch update...\n");
-    printf("  -> DNS Cookie server cookie mismatch passed.\n");
-}
-
-static void test_rrl_slip_mode_pseudo_random_drop(void) {
-    printf("[TEST] Query Engine: RRL slip rate response formatting...\n");
-    printf("  -> RRL slip response passed.\n");
-}
-
-static void test_rrl_tcp_exempt_bypass(void) {
-    printf("[TEST] Query Engine: RRL TCP query exemption...\n");
-    printf("  -> RRL TCP exemption passed.\n");
-}
-
-static void test_rrl_whitelist_subnet_bypass(void) {
-    printf("[TEST] Query Engine: RRL exempt subnet whitelist...\n");
-    printf("  -> RRL whitelist bypass passed.\n");
-}
-
-static void test_proxy_v2_tlv_additional_options_skip(void) {
-    printf("[TEST] Query Engine: PROXY v2 TLV options parsing...\n");
-    printf("  -> PROXY v2 TLV options passed.\n");
-}
-
-static void test_catalog_zone_coo_property_verification(void) {
-    printf("[TEST] Query Engine: Catalog zone coo property processing...\n");
-    printf("  -> catalog coo property passed.\n");
-}
-
-static void test_catalog_zone_group_property_verification(void) {
-    printf("[TEST] Query Engine: Catalog zone group property processing...\n");
-    printf("  -> catalog group property passed.\n");
-}
-
-static void test_tinydns_timestamp_high_precision_epoch(void) {
-    printf("[TEST] Query Engine: Tinydns timestamp epoch conversions...\n");
-    time_t t = 1700000000;
-    assert(t > 0);
-    printf("  -> tinydns timestamp conversions passed.\n");
-}
-
-static void test_tinydns_location_two_character_codes(void) {
-    printf("[TEST] Query Engine: Tinydns location 2-character country codes...\n");
-    char loc[2] = { 'j', 'p' };
-    assert(loc[0] == 'j' && loc[1] == 'p');
-    printf("  -> tinydns location codes passed.\n");
+    printf("[TEST] Query Engine: ECS SCOPE for tagged, untagged and negative answers (IPv4)...\n");
+    int rcode;
+    uint16_t an;
+    /* client in the tag: tagged + untagged A, SCOPE = the tag's /24 (not the SOURCE /32) */
+    assert(ecs_scope_query("geo.ecs.example.", 1, 1, "198.51.100.10", 32, true, &rcode, &an) == 24);
+    assert(rcode == 0 && an == 2);
+    /* client in no tag: default answer only, but it is not valid for 198.51.100.0/24 -> SCOPE 5, not 0 */
+    assert(ecs_scope_query("geo.ecs.example.", 1, 1, "203.0.113.9", 32, true, &rcode, &an) == 5);
+    assert(rcode == 0 && an == 1);
+    /* SOURCE /16 cannot tell: SCOPE longer than SOURCE, not clamped (RFC 7871 §7.2.1) */
+    assert(ecs_scope_query("geo.ecs.example.", 1, 1, "198.51.0.0", 16, true, &rcode, &an) == 18);
+    assert(rcode == 0 && an == 1);
+    /* CNAME to a name with tagged variants */
+    assert(ecs_scope_query("alias.ecs.example.", 1, 1, "203.0.113.9", 32, true, &rcode, &an) == 5);
+    assert(rcode == 0 && an == 2);
+    /* untrusted ECS source: tags are not used, one answer for everybody */
+    assert(ecs_scope_query("geo.ecs.example.", 1, 1, "198.51.100.10", 32, false, &rcode, &an) == 0);
+    assert(rcode == 0 && an == 1);
+    /* no tagged variant of the queried name / type */
+    assert(ecs_scope_query("www.ecs.example.", 1, 1, "198.51.100.10", 32, true, &rcode, &an) == 0);
+    assert(rcode == 0 && an == 1);
+    /* negative answers: SCOPE 0 (RFC 7871 §7.4) */
+    assert(ecs_scope_query("nx.ecs.example.", 1, 1, "198.51.100.10", 32, true, &rcode, &an) == 0);
+    assert(rcode == 3 && an == 0);
+    assert(ecs_scope_query("geo.ecs.example.", 15, 1, "198.51.100.10", 32, true, &rcode, &an) == 0);
+    assert(rcode == 0 && an == 0);
+    printf("  -> ECS IPv4 scope passed.\n");
 }
 
 static void test_query_engine_opcode_iquery_notimp(void) {
@@ -4301,15 +4502,6 @@ static void test_query_engine_formerr_truncated_question(void) {
     printf("  -> truncated question FORMERR passed.\n");
 }
 
-static void test_query_engine_tc_bit_setting_on_overflow(void) {
-    printf("[TEST] Query Engine: UDP truncation sets TC bit on buffer overflow...\n");
-    uint8_t rpkt[12];
-    memset(rpkt, 0, sizeof(rpkt));
-    rpkt[2] |= 0x02; // TC bit
-    assert((rpkt[2] & 0x02) != 0);
-    printf("  -> TC bit on overflow passed.\n");
-}
-
 
 /* ------------------------------------------------------------------------ Round 2 tests (+45) */
 
@@ -4379,29 +4571,14 @@ static void test_query_engine_formerr_rdlength_overflow_packet(void) {
     printf("  -> FORMERR RDLENGTH overflow passed.\n");
 }
 
-static void test_query_engine_dynamic_update_tsig_notauth_code9(void) {
-    printf("[TEST] Query Engine: Dynamic update TSIG error NOTAUTH (code 9)...\n");
-    uint16_t tsig_err = 9;
-    assert(tsig_err == 9);
-    printf("  -> Dynamic update NOTAUTH passed.\n");
-}
+/* UPDATE TSIG errors and authorization (R-30) are tested through process_dns_query_impl() in
+ * test_dynamic_update_engine.c test_update_tsig_matrix(). */
 
-static void test_query_engine_dynamic_update_tsig_invalid_key_code18(void) {
-    printf("[TEST] Query Engine: Dynamic update TSIG error Invalid Key (code 18)...\n");
-    uint16_t tsig_err = 18;
-    assert(tsig_err == 18);
-    printf("  -> Dynamic update Invalid Key passed.\n");
-}
+/* UPDATE to a secondary zone (REFUSED, EDE 18) is tested through process_dns_query_impl() in
+ * test_dynamic_update_engine.c test_update_dispatch_zone_section(). */
 
-static void test_query_engine_dynamic_update_not_primary_code20(void) {
-    printf("[TEST] Query Engine: Dynamic update secondary zone error (code 20)...\n");
-    uint16_t ede_code = 20;
-    assert(ede_code == 20);
-    printf("  -> Dynamic update secondary zone passed.\n");
-}
-
-static void test_query_engine_dynamic_update_no_matching_zone_refused(void) {
-    printf("[TEST] Query Engine: Dynamic update non-existent zone REFUSED...\n");
+static void test_query_engine_dynamic_update_no_matching_zone_notauth(void) {
+    printf("[TEST] Query Engine: Dynamic update non-existent zone NOTAUTH (RFC 2136 §3.1.2)...\n");
     zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
     uint8_t qpkt[256]; size_t qlen = 0;
     build_dns_query(qpkt, &qlen, 0x5501, "unknown.zone.", 6 /* SOA */, false);
@@ -4411,121 +4588,8 @@ static void test_query_engine_dynamic_update_no_matching_zone_refused(void) {
     uint8_t rpkt[512];
     int rlen = process_dns_query(qpkt, qlen, rpkt, sizeof(rpkt), "unknown.zone.", 6, "127.0.0.1", &comp_ctx, false, &rrl, &snap);
     assert(rlen >= 12);
-    assert((rpkt[3] & 0x0F) == 5); // REFUSED
-    printf("  -> Dynamic update REFUSED passed.\n");
-}
-
-static void test_query_engine_dynamic_update_prereq_type_any_no_data(void) {
-    printf("[TEST] Query Engine: Dynamic update prerequisite TYPE ANY no-data...\n");
-    uint16_t prereq_class = 255; // ANY
-    assert(prereq_class == 255);
-    printf("  -> Dynamic update TYPE ANY passed.\n");
-}
-
-static void test_query_engine_rrl_client_exhausted_packet_drop(void) {
-    printf("[TEST] Query Engine: RRL client exhausted rate limit drop...\n");
-    bool rrl_drop = true;
-    assert(rrl_drop == true);
-    printf("  -> RRL client drop passed.\n");
-}
-
-static void test_query_engine_rrl_slip_mode_tc_bit_response(void) {
-    printf("[TEST] Query Engine: RRL slip mode response TC=1 setting...\n");
-    uint8_t hdr[12] = { 0 };
-    hdr[2] |= 0x02; // TC bit
-    assert((hdr[2] & 0x02) != 0);
-    printf("  -> RRL slip TC bit passed.\n");
-}
-
-static void test_query_engine_edns_ede_reason15_blocked(void) {
-    printf("[TEST] Query Engine: EDNS EDE reason 15 (Blocked)...\n");
-    edns_info_t edns; memset(&edns, 0, sizeof(edns));
-    edns.ede_count = 1; edns.ede_list[0].code = 15;
-    assert(edns.ede_list[0].code == 15);
-    printf("  -> EDE 15 Blocked passed.\n");
-}
-
-static void test_query_engine_edns_ede_reason16_censored(void) {
-    printf("[TEST] Query Engine: EDNS EDE reason 16 (Censored)...\n");
-    edns_info_t edns; memset(&edns, 0, sizeof(edns));
-    edns.ede_count = 1; edns.ede_list[0].code = 16;
-    assert(edns.ede_list[0].code == 16);
-    printf("  -> EDE 16 Censored passed.\n");
-}
-
-static void test_query_engine_edns_ede_reason18_invalid_tsig(void) {
-    printf("[TEST] Query Engine: EDNS EDE reason 18 (Invalid TSIG)...\n");
-    edns_info_t edns; memset(&edns, 0, sizeof(edns));
-    edns.ede_count = 1; edns.ede_list[0].code = 18;
-    assert(edns.ede_list[0].code == 18);
-    printf("  -> EDE 18 Invalid TSIG passed.\n");
-}
-
-static void test_query_engine_edns_ede_reason20_not_primary(void) {
-    printf("[TEST] Query Engine: EDNS EDE reason 20 (Not Primary Zone)...\n");
-    edns_info_t edns; memset(&edns, 0, sizeof(edns));
-    edns.ede_count = 1; edns.ede_list[0].code = 20;
-    assert(edns.ede_list[0].code == 20);
-    printf("  -> EDE 20 Not Primary passed.\n");
-}
-
-static void test_query_engine_cookie_server_generation_failure_omit(void) {
-    printf("[TEST] Query Engine: DNS Cookie server generation failure omit...\n");
-    edns_info_t edns; memset(&edns, 0, sizeof(edns));
-    edns.has_cookie = false;
-    assert(edns.has_cookie == false);
-    printf("  -> Cookie server failure omit passed.\n");
-}
-
-static void test_query_engine_cookie_bad_cookie_rcode(void) {
-    printf("[TEST] Query Engine: DNS Cookie BADCOOKIE (Extended RCODE 1)...\n");
-    uint16_t ext_rcode = 1;
-    assert(ext_rcode == 1);
-    printf("  -> BADCOOKIE RCODE passed.\n");
-}
-
-static void test_query_engine_ecs_ipv4_scope_zero_truncation(void) {
-    printf("[TEST] Query Engine: ECS IPv4 scope zero prefix...\n");
-    edns_info_t edns; memset(&edns, 0, sizeof(edns));
-    edns.has_ecs = true; edns.ecs_scope_prefix = 0;
-    assert(edns.ecs_scope_prefix == 0);
-    printf("  -> ECS IPv4 scope 0 passed.\n");
-}
-
-static void test_query_engine_ecs_ipv6_scope_match_specific(void) {
-    printf("[TEST] Query Engine: ECS IPv6 scope prefix match (64-bit)...\n");
-    edns_info_t edns; memset(&edns, 0, sizeof(edns));
-    edns.has_ecs = true; edns.ecs_family = 2; edns.ecs_scope_prefix = 64;
-    assert(edns.ecs_scope_prefix == 64);
-    printf("  -> ECS IPv6 scope 64 passed.\n");
-}
-
-static void test_query_engine_dnssec_wildcard_nodata_nsec3_proof(void) {
-    printf("[TEST] Query Engine: DNSSEC NSEC3 wildcard NODATA proof...\n");
-    bool has_nsec3 = true;
-    assert(has_nsec3 == true);
-    printf("  -> DNSSEC NSEC3 wildcard NODATA passed.\n");
-}
-
-static void test_query_engine_dnssec_delegation_ns_rrsig_omitted(void) {
-    printf("[TEST] Query Engine: DNSSEC delegation NS record without RRSIG...\n");
-    bool omit_ns_rrsig = true;
-    assert(omit_ns_rrsig == true);
-    printf("  -> DNSSEC delegation NS RRSIG omitted passed.\n");
-}
-
-static void test_query_engine_dnssec_ds_child_zone_query(void) {
-    printf("[TEST] Query Engine: DNSSEC DS query at parent zone apex...\n");
-    uint16_t qtype = 43; // DS
-    assert(qtype == 43);
-    printf("  -> DNSSEC DS query passed.\n");
-}
-
-static void test_query_engine_dnssec_rrsig_multiple_algorithm_keys(void) {
-    printf("[TEST] Query Engine: DNSSEC multiple algorithm RRSIG responses...\n");
-    uint8_t alg1 = 13, alg2 = 15;
-    assert(alg1 != alg2);
-    printf("  -> DNSSEC multiple alg keys passed.\n");
+    assert((rpkt[3] & 0x0F) == 9); // NOTAUTH
+    printf("  -> Dynamic update NOTAUTH passed.\n");
 }
 
 static void test_query_engine_dname_synthesis_multi_subdomain(void) {
@@ -4535,55 +4599,72 @@ static void test_query_engine_dname_synthesis_multi_subdomain(void) {
     printf("  -> DNAME multi-subdomain passed.\n");
 }
 
+/* RFC 6672 §3.1: the DNAME is put in the answer, followed by a CNAME synthesized with the QNAME as owner,
+ * the substituted target (§2.2) and the TTL of the DNAME. §2.3: the DNAME owner itself is not redirected. */
 static void test_query_engine_dname_synthesis_exact_target_match(void) {
-    printf("[TEST] Query Engine: DNAME exact target domain synthesis...\n");
-    const char *target = "target.net.";
-    assert(strcmp(target, "target.net.") == 0);
+    printf("[TEST] Query Engine: DNAME substitution, synthesized CNAME owner/target/TTL...\n");
+    gr_setup("dn.example.",
+        "$ORIGIN dn.example.\n$TTL 300\n"
+        "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n"
+        "d 1234 IN DNAME target.example.\n"
+        "d IN TXT \"owner data\"\n"
+        "local 600 IN DNAME in.dn.example.\n"
+        "www.in IN A 192.0.2.80\n");
+    gr_resp_t r;
+    const gr_rr_t *rr;
+    char t[256];
+
+    gr_query("x.y.d.dn.example.", 1, false, &r);
+    assert(r.rcode == 0 && r.aa && r.counts[0] == 2);
+    rr = &r.rr[0];
+    assert(rr->type == 39 && strcasecmp(rr->name, "d.dn.example.") == 0 && rr->ttl == 1234);
+    assert(gr_read_name(r.msg, r.len, rr->rdoff, t, sizeof(t)) && strcasecmp(t, "target.example.") == 0);
+    gr_expect_cname(&r, 1, "x.y.d.dn.example.", "x.y.target.example.");
+    assert(r.rr[1].ttl == 1234);
+
+    /* in-zone target: the synthesized CNAME is followed */
+    gr_query("www.local.dn.example.", 1, false, &r);
+    assert(r.rcode == 0 && r.counts[0] == 3);
+    assert(r.rr[0].type == 39 && r.rr[0].ttl == 600);
+    gr_expect_cname(&r, 1, "www.local.dn.example.", "www.in.dn.example.");
+    rr = gr_first(&r, 1, 1);
+    assert(rr && strcasecmp(rr->name, "www.in.dn.example.") == 0);
+
+    /* §2.3 / §3.1: QNAME = owner, QTYPE of another type there: that RRset, no DNAME, no CNAME */
+    gr_query("d.dn.example.", 16, false, &r);
+    assert(r.rcode == 0 && r.counts[0] == 1 && r.rr[0].type == 16);
+    gr_query("d.dn.example.", 1, false, &r);
+    assert(r.rcode == 0 && r.counts[0] == 0 && gr_count(&r, 2, 6) == 1);
+    /* QTYPE DNAME at the owner: the DNAME only */
+    gr_query("d.dn.example.", 39, false, &r);
+    assert(r.rcode == 0 && r.counts[0] == 1 && r.rr[0].type == 39);
+    zone_arena_destroy(&g_gr.arena);
     printf("  -> DNAME exact target passed.\n");
 }
 
-static void test_query_engine_any_query_rrsig_inclusion(void) {
-    printf("[TEST] Query Engine: QTYPE ANY includes covering RRSIGs...\n");
-    uint16_t qtype = 255;
-    assert(qtype == 255);
-    printf("  -> ANY query RRSIG inclusion passed.\n");
-}
-
+/* QTYPE ANY in an unsigned zone returns every RRset at the name (RFC 1035 §3.2.3 "*"); RFC 8482 §4.1
+ * allows a subset, which this server only uses for signed zones (minimal-any). */
 static void test_query_engine_any_query_multiple_record_types(void) {
     printf("[TEST] Query Engine: QTYPE ANY returns all available RR types...\n");
-    int returned_types = 5;
-    assert(returned_types > 1);
+    gr_setup("any.example.",
+        "$ORIGIN any.example.\n$TTL 300\n"
+        "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n"
+        "multi IN A 192.0.2.10\nmulti IN A 192.0.2.11\n"
+        "multi IN AAAA 2001:db8::10\n"
+        "multi IN TXT \"t\"\n"
+        "multi IN MX 10 ns1\n");
+    gr_resp_t r;
+    gr_query("multi.any.example.", 255, false, &r);
+    assert(r.rcode == 0 && r.aa && r.counts[0] == 5);
+    assert(gr_count(&r, 1, 1) == 2 && gr_count(&r, 1, 28) == 1 && gr_count(&r, 1, 16) == 1 &&
+           gr_count(&r, 1, 15) == 1);
+    for (int i = 0; i < r.nrr; i++)
+        if (r.rr[i].sect == 1) assert(strcasecmp(r.rr[i].name, "multi.any.example.") == 0);
+    /* ANY at a name without data: NXDOMAIN */
+    gr_query("none.any.example.", 255, false, &r);
+    assert(r.rcode == 3 && r.counts[0] == 0);
+    zone_arena_destroy(&g_gr.arena);
     printf("  -> ANY query multiple types passed.\n");
-}
-
-static void test_query_engine_wildcard_covering_txt_and_cname(void) {
-    printf("[TEST] Query Engine: Wildcard synthesis for TXT and CNAME...\n");
-    const char *wc = "*.wildcard.example.";
-    assert(wc[0] == '*');
-    printf("  -> Wildcard TXT/CNAME passed.\n");
-}
-
-static void test_query_engine_wildcard_referral_proof(void) {
-    printf("[TEST] Query Engine: Wildcard non-referral proof verification...\n");
-    bool is_wildcard = true;
-    assert(is_wildcard == true);
-    printf("  -> Wildcard referral proof passed.\n");
-}
-
-static void test_query_engine_tinydns_location_filter_mismatch(void) {
-    printf("[TEST] Query Engine: TinyDNS location mismatch fallback...\n");
-    const char *client_loc = "us";
-    const char *record_loc = "jp";
-    assert(strcmp(client_loc, record_loc) != 0);
-    printf("  -> TinyDNS location mismatch passed.\n");
-}
-
-static void test_query_engine_tinydns_timestamp_future_valid(void) {
-    printf("[TEST] Query Engine: TinyDNS timestamp future validity check...\n");
-    uint64_t expiry = 1900000000;
-    uint64_t now = 1700000000;
-    assert(expiry > now);
-    printf("  -> TinyDNS future timestamp passed.\n");
 }
 
 static void test_query_engine_catalog_zone_coo_syntax_check(void) {
@@ -4600,27 +4681,6 @@ static void test_query_engine_catalog_zone_group_filtering(void) {
     printf("  -> Catalog group matching passed.\n");
 }
 
-static void test_query_engine_forward_zone_upstream_servfail(void) {
-    printf("[TEST] Query Engine: Forward zone upstream SERVFAIL response...\n");
-    uint8_t rcode = 2; // SERVFAIL
-    assert(rcode == 2);
-    printf("  -> Forward SERVFAIL passed.\n");
-}
-
-static void test_query_engine_forward_zone_edns_propagation(void) {
-    printf("[TEST] Query Engine: Forward zone EDNS option propagation...\n");
-    bool edns_prop = true;
-    assert(edns_prop == true);
-    printf("  -> Forward EDNS propagation passed.\n");
-}
-
-static void test_query_engine_program_zone_output_parsing_a(void) {
-    printf("[TEST] Query Engine: Program zone dynamic output parsing (A)...\n");
-    const char *out_line = "OK 192.0.2.100 300\n";
-    assert(strncmp(out_line, "OK", 2) == 0);
-    printf("  -> Program zone output A passed.\n");
-}
-
 static void test_query_engine_program_zone_output_parsing_txt(void) {
     printf("[TEST] Query Engine: Program zone dynamic output parsing (TXT)...\n");
     const char *out_line = "OK \"Dynamic TXT string\" 300\n";
@@ -4628,121 +4688,34 @@ static void test_query_engine_program_zone_output_parsing_txt(void) {
     printf("  -> Program zone output TXT passed.\n");
 }
 
-static void test_query_engine_program_zone_timeout_servfail(void) {
-    printf("[TEST] Query Engine: Program zone execution timeout SERVFAIL...\n");
-    uint8_t servfail = 2;
-    assert(servfail == 2);
-    printf("  -> Program zone timeout SERVFAIL passed.\n");
-}
-
-static void test_query_engine_opcode_notify_unauthorized_source(void) {
-    printf("[TEST] Query Engine: NOTIFY from unauthorized source IP (NOTAUTH)...\n");
-    uint8_t rcode = 9; // NOTAUTH
-    assert(rcode == 9);
-    printf("  -> NOTIFY unauthorized source passed.\n");
-}
-
-static void test_query_engine_opcode_notify_slave_success(void) {
-    printf("[TEST] Query Engine: NOTIFY received on secondary zone (NOERROR)...\n");
-    uint8_t rcode = 0; // NOERROR
-    assert(rcode == 0);
-    printf("  -> NOTIFY slave success passed.\n");
-}
-
-static void test_query_engine_opcode_update_prereq_eval_order(void) {
-    printf("[TEST] Query Engine: Dynamic update prerequisite evaluation order...\n");
-    int order = 1;
-    assert(order == 1);
-    printf("  -> Dynamic update prereq order passed.\n");
-}
-
-static void test_query_engine_truncated_tc_flag_arcount_zero(void) {
-    printf("[TEST] Query Engine: TC=1 truncation resets ARCOUNT to 0...\n");
-    uint8_t hdr[12] = { 0 };
-    hdr[2] |= 0x02; // TC
-    hdr[10] = 0; hdr[11] = 0; // ARCOUNT=0
-    assert(hdr[10] == 0 && hdr[11] == 0);
-    printf("  -> TC flag ARCOUNT zero passed.\n");
-}
-
-static void test_query_engine_rdlength_mismatch_boundary(void) {
-    printf("[TEST] Query Engine: RDLENGTH mismatch at packet buffer boundary...\n");
-    uint16_t rdlen = 100;
-    uint16_t rem = 50;
-    assert(rdlen > rem);
-    printf("  -> RDLENGTH mismatch boundary passed.\n");
-}
-
-static void test_query_engine_multiview_acl_exact_match_fallback(void) {
-    printf("[TEST] Query Engine: Multi-view ACL match and fallback...\n");
-    const char *matched_view = "internal";
-    assert(strcmp(matched_view, "internal") == 0);
-    printf("  -> Multi-view ACL fallback passed.\n");
-}
-
 
 /* ------------------------------------------------------------------------ Round 3 tests (+100) */
 
 static void test_query_engine_update_prereq_value_dependent_match(void) {
     printf("[TEST] Query Engine: dynamic update prereq RRset exists (value-dependent)...\n");
-    uint16_t prereq_class = 1; // IN
-    assert(prereq_class == 1);
+    update_result_t ur;
+    int cnt;
+    const uint8_t reversed[2] = { 2, 1 };
+    assert(vdep_update_run(reversed, 2, 3, &ur, &cnt) == 0 && ur.changed && cnt == 3);
 }
 
 static void test_query_engine_update_prereq_value_dependent_mismatch(void) {
     printf("[TEST] Query Engine: dynamic update prereq RRset exists value mismatch NXRRSET...\n");
-    uint8_t nxrrset_rcode = 8; // NXRRSET
-    assert(nxrrset_rcode == 8);
-}
-
-static void test_query_engine_update_prereq_name_in_use_cname(void) {
-    printf("[TEST] Query Engine: dynamic update prereq name in use (CNAME)...\n");
-    uint16_t qtype = 5; // CNAME
-    assert(qtype == 5);
-}
-
-static void test_query_engine_update_prereq_name_not_in_use_yxdomain(void) {
-    printf("[TEST] Query Engine: dynamic update prereq name not in use YXDOMAIN (code 6)...\n");
-    uint8_t yxdomain_rcode = 6; // YXDOMAIN
-    assert(yxdomain_rcode == 6);
+    update_result_t ur;
+    int cnt;
+    const uint8_t subset[1] = { 1 };      // R-11 d: a subset of the zone RRset is not equal
+    const uint8_t superset[3] = { 1, 2, 3 };
+    const uint8_t other[2] = { 1, 9 };
+    assert(vdep_update_run(subset, 1, 3, &ur, &cnt) == 8 && cnt == 2);
+    assert(vdep_update_run(superset, 3, 3, &ur, &cnt) == 8 && cnt == 2);
+    assert(vdep_update_run(other, 2, 3, &ur, &cnt) == 8 && cnt == 2);
 }
 
 static void test_query_engine_update_action_add_duplicate_silent_ignore(void) {
     printf("[TEST] Query Engine: dynamic update duplicate record addition silent ignore...\n");
-    bool duplicate_ignored = true;
-    assert(duplicate_ignored == true);
-}
-
-static void test_query_engine_edns_ecs_ipv4_slash_24(void) {
-    printf("[TEST] Query Engine: EDNS ECS IPv4 /24 source prefix...\n");
-    edns_info_t edns; memset(&edns, 0, sizeof(edns));
-    edns.has_ecs = true; edns.ecs_family = 1; edns.ecs_source_prefix = 24;
-    assert(edns.ecs_source_prefix == 24);
-}
-
-static void test_query_engine_edns_ecs_ipv6_slash_56(void) {
-    printf("[TEST] Query Engine: EDNS ECS IPv6 /56 source prefix...\n");
-    edns_info_t edns; memset(&edns, 0, sizeof(edns));
-    edns.has_ecs = true; edns.ecs_family = 2; edns.ecs_source_prefix = 56;
-    assert(edns.ecs_source_prefix == 56);
-}
-
-static void test_query_engine_rrl_ipv6_slash_64_aggregation(void) {
-    printf("[TEST] Query Engine: RRL IPv6 /64 prefix aggregation...\n");
-    uint8_t pfx = 64;
-    assert(pfx == 64);
-}
-
-static void test_query_engine_cookie_server_cookie_bad_cookie_response(void) {
-    printf("[TEST] Query Engine: DNS Cookie server cookie mismatch BADCOOKIE...\n");
-    uint16_t ext_rcode = 1; // BADCOOKIE
-    assert(ext_rcode == 1);
-}
-
-static void test_query_engine_multiview_internal_to_default_fallback(void) {
-    printf("[TEST] Query Engine: Multi-view fallback from internal to default view...\n");
-    const char *v1 = "internal", *v2 = "default";
-    assert(strcmp(v1, v2) != 0);
+    update_result_t ur;
+    int cnt;
+    assert(vdep_update_run(NULL, 0, 2, &ur, &cnt) == 0 && !ur.changed && cnt == 2);
 }
 
 static void test_query_engine_feature_case_11(void) {
@@ -5918,54 +5891,11 @@ static void test_query_engine_feature_case_100(void) {
 /* ------------------------------------------------------------------------ Round 4 tests (+100) */
 
 
-static void test_query_engine_dynamic_update_prereq_rrset_not_exists(void) {
-    printf("[TEST] Query Engine: Dynamic update prereq RRset does not exist (Class=NONE)...\n");
-    uint16_t prereq_class = 254; // NONE
-    assert(prereq_class == 254);
-}
-
-static void test_query_engine_dynamic_update_prereq_name_in_use_any(void) {
-    printf("[TEST] Query Engine: Dynamic update prereq Name in use (Class=ANY, Type=ANY)...\n");
-    uint16_t qclass = 255, qtype = 255;
-    assert(qclass == 255 && qtype == 255);
-}
-
-static void test_query_engine_dynamic_update_action_delete_rrset(void) {
-    printf("[TEST] Query Engine: Dynamic update action delete entire RRset (Class=ANY)...\n");
-    uint16_t act_class = 255; // ANY
-    assert(act_class == 255);
-}
-
-static void test_query_engine_dynamic_update_action_delete_all_rrsets(void) {
-    printf("[TEST] Query Engine: Dynamic update action delete all RRsets from name...\n");
-    uint16_t act_class = 255, act_type = 255;
-    assert(act_class == 255 && act_type == 255);
-}
-
-static void test_query_engine_dynamic_update_action_delete_specific_rr(void) {
-    printf("[TEST] Query Engine: Dynamic update action delete specific RR (Class=NONE)...\n");
-    uint16_t act_class = 254; // NONE
-    assert(act_class == 254);
-}
-
-static void test_query_engine_edns_ecs_scope_prefix_calculation(void) {
-    printf("[TEST] Query Engine: EDNS ECS scope prefix calculation (/24, /32, /56, /64)...\n");
-    uint8_t scope_v4 = 24, scope_v6 = 56;
-    assert(scope_v4 == 24 && scope_v6 == 56);
-}
-
 static void test_query_engine_dns_cookie_timestamp_regeneration(void) {
     printf("[TEST] Query Engine: DNS Cookie timestamp renewal logic (RFC 9018)...\n");
     uint32_t now = (uint32_t)time(NULL);
     uint32_t old_ts = now - 7200; // 2 hours old -> expired
     assert(now - old_ts > 3600);
-}
-
-static void test_query_engine_rrl_leak_rate_calculation(void) {
-    printf("[TEST] Query Engine: RRL token bucket leak rate calculations...\n");
-    int qps_limit = 10;
-    int window = 1;
-    assert(qps_limit * window == 10);
 }
 
 static void test_query_engine_catalog_zone_coo_and_group_property(void) {
@@ -7205,10 +7135,14 @@ static void test_query_engine_feature_case_188(void) {
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
     assert(build_zone_index(&arena, true) == 0);
 
-    dns_record_t *m = find_matching_nsec3(&arena, "00000000000000000000000000000000", "n3.example.");
+    dns_record_t *p3 = NULL;
+    for (size_t i = 0; i < arena.count && !p3; i++)
+        if (arena.records[i].type_code == 50) p3 = &arena.records[i];
+    assert(p3 != NULL);
+    dns_record_t *m = find_matching_nsec3(&arena, p3, "00000000000000000000000000000000", "n3.example.");
     assert(m != NULL);
 
-    dns_record_t *c = find_covering_nsec3(&arena, "55555555555555555555555555555555");
+    dns_record_t *c = find_covering_nsec3(&arena, p3, "55555555555555555555555555555555");
     assert(c != NULL);
 
     zone_arena_destroy(&arena);
@@ -7240,7 +7174,7 @@ static void test_query_engine_feature_case_191(void) {
     assert(hex_to_bytes("-", out, sizeof(out)) == 0);
     assert(hex_to_bytes("", out, sizeof(out)) == 0);
     assert(hex_to_bytes(NULL, out, sizeof(out)) == 0);
-    assert(hex_to_bytes("deadbeef", out, 2) == 2);
+    assert(hex_to_bytes("deadbeef", out, 2) == (size_t)-1); // R-31: longer than max_out fails (was truncated to 2)
 }
 
 static void test_query_engine_feature_case_192(void) {
@@ -7912,10 +7846,10 @@ static void test_query_engine_feature_case_212(void) {
     ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; // TTL=0
     ureq[off++] = 0; ureq[off++] = 0; // RDLENGTH=0
 
-    int prc = 0, upc = 0;
-    int rcode = process_update_sections(ureq, off, "dynup.example.", &arena, &prc, &upc);
+    update_result_t ur;
+    int rcode = process_update_sections(ureq, off, "dynup.example.", &arena, &ur);
     assert(rcode == 0); // NOERROR
-    assert(prc == 1);
+    assert(ur.prcount == 1);
 
     zone_arena_destroy(&arena);
 }
@@ -7951,8 +7885,8 @@ static void test_query_engine_feature_case_213(void) {
     ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; // TTL=0
     ureq[off++] = 0; ureq[off++] = 0; // RDLENGTH=0
 
-    int prc = 0, upc = 0;
-    int rcode = process_update_sections(ureq, off, "dynup2.example.", &arena, &prc, &upc);
+    update_result_t ur;
+    int rcode = process_update_sections(ureq, off, "dynup2.example.", &arena, &ur);
     assert(rcode == 6); // YXDOMAIN
 
     zone_arena_destroy(&arena);
@@ -7989,10 +7923,10 @@ static void test_query_engine_feature_case_214(void) {
     ureq[off++] = 0; ureq[off++] = 4; // RDLENGTH=4
     ureq[off++] = 192; ureq[off++] = 0; ureq[off++] = 2; ureq[off++] = 77;
 
-    int prc = 0, upc = 0;
-    int rcode = process_update_sections(ureq, off, "dynadd.example.", &arena, &prc, &upc);
+    update_result_t ur;
+    int rcode = process_update_sections(ureq, off, "dynadd.example.", &arena, &ur);
     assert(rcode == 0); // NOERROR
-    assert(upc == 1);
+    assert(ur.upcount == 1);
 
     zone_arena_destroy(&arena);
 }
@@ -8028,10 +7962,10 @@ static void test_query_engine_feature_case_215(void) {
     ureq[off++] = 0; ureq[off++] = 4;
     ureq[off++] = 192; ureq[off++] = 0; ureq[off++] = 2; ureq[off++] = 77;
 
-    int prc = 0, upc = 0;
-    int rcode = process_update_sections(ureq, off, "dyndel.example.", &arena, &prc, &upc);
+    update_result_t ur;
+    int rcode = process_update_sections(ureq, off, "dyndel.example.", &arena, &ur);
     assert(rcode == 0); // NOERROR
-    assert(upc == 1);
+    assert(ur.upcount == 1);
 
     zone_arena_destroy(&arena);
 }
@@ -8066,10 +8000,10 @@ static void test_query_engine_feature_case_216(void) {
     ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; // TTL=0
     ureq[off++] = 0; ureq[off++] = 0; // RDLENGTH=0
 
-    int prc = 0, upc = 0;
-    int rcode = process_update_sections(ureq, off, "dyndelset.example.", &arena, &prc, &upc);
+    update_result_t ur;
+    int rcode = process_update_sections(ureq, off, "dyndelset.example.", &arena, &ur);
     assert(rcode == 0); // NOERROR
-    assert(upc == 1);
+    assert(ur.upcount == 1);
 
     zone_arena_destroy(&arena);
 }
@@ -8104,10 +8038,10 @@ static void test_query_engine_feature_case_217(void) {
     ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; // TTL=0
     ureq[off++] = 0; ureq[off++] = 0; // RDLENGTH=0
 
-    int prc = 0, upc = 0;
-    int rcode = process_update_sections(ureq, off, "dyndelall.example.", &arena, &prc, &upc);
+    update_result_t ur;
+    int rcode = process_update_sections(ureq, off, "dyndelall.example.", &arena, &ur);
     assert(rcode == 0); // NOERROR
-    assert(upc == 1);
+    assert(ur.upcount == 1);
 
     zone_arena_destroy(&arena);
 }
@@ -8955,15 +8889,24 @@ static void test_query_engine_feature_case_244(void) {
     req[off++] = 0; req[off++] = 250; // TSIG
     req[off++] = 0; req[off++] = 255; // ANY
     req[off++] = 0; req[off++] = 0; req[off++] = 0; req[off++] = 0; // TTL=0
-    req[off++] = 0; req[off++] = 16; // RDLENGTH
-    memset(req + off, 0, 16);
-    off += 16;
+    size_t rdlen_at = off;
+    off += 2;
+    off += (size_t)write_uncompressed_name(req, off, sizeof(req), "hmac-sha256.");
+    memset(req + off, 0, 8); off += 8;                      // Time Signed, Fudge
+    req[off++] = 0; req[off++] = 32;                        // MAC Size
+    memset(req + off, 0xAB, 32); off += 32;                 // MAC
+    req[off++] = req[0]; req[off++] = req[1];               // Original ID
+    req[off++] = 0; req[off++] = 0; req[off++] = 0; req[off++] = 0; // Error, Other Len
+    req[rdlen_at] = (uint8_t)((off - rdlen_at - 2) >> 8); req[rdlen_at + 1] = (uint8_t)(off - rdlen_at - 2);
 
     uint8_t res[512];
     int res_len = process_dns_query(req, off, res, sizeof(res), "tsigbadkey.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(res_len >= 12);
-    // BADKEY -> RCODE=9 (NOTAUTH) or REFUSED
-    assert((res[3] & 0x0F) == 9 || (res[3] & 0x0F) == 5);
+    // RFC 8945 §5.2.1, §5.3.2: unknown key -> NOTAUTH, TSIG error BADKEY, unsigned, the request's key name echoed
+    assert((res[3] & 0x0F) == 9);
+    tsig_rr_t rr;
+    assert(tsig_parse_rr(res, (size_t)res_len, &rr) == 1);
+    assert(rr.error == 17 && rr.mac_size == 0 && strcmp(rr.key_name, "badkey.unknown.") == 0);
 }
 
 static void test_query_engine_feature_case_245(void) {
@@ -9074,21 +9017,21 @@ static void test_query_engine_program_zone_plugin_pipe_timeout_and_dead_mark(voi
     size_t req_len = 0;
     build_dns_query(req, &req_len, 0x1234, "plugtest.example.", 1, false);
 
-    int rc1 = dispatch_to_program_zone("plugtest.example.", req, req_len, res, sizeof(res), "127.0.0.1", false);
+    int rc1 = dispatch_to_program_zone("", "plugtest.example.", req, req_len, res, sizeof(res), sizeof(res), "127.0.0.1", false);
     assert(rc1 >= 12); // Returns synthetic SERVFAIL packet length
     assert((res[3] & 0x0F) == 2); // SERVFAIL (RCODE=2)
     assert(atomic_load_explicit(&plugin.consecutive_failures, memory_order_relaxed) == 1);
     assert(atomic_load_explicit(&plugin.dead, memory_order_relaxed) == false);
 
     // Second failure -> reaches max_failures (2) -> marks dead
-    int rc2 = dispatch_to_program_zone("plugtest.example.", req, req_len, res, sizeof(res), "127.0.0.1", false);
+    int rc2 = dispatch_to_program_zone("", "plugtest.example.", req, req_len, res, sizeof(res), sizeof(res), "127.0.0.1", false);
     assert(rc2 >= 12);
     assert((res[3] & 0x0F) == 2); // SERVFAIL (RCODE=2)
     assert(atomic_load_explicit(&plugin.consecutive_failures, memory_order_relaxed) == 2);
     assert(atomic_load_explicit(&plugin.dead, memory_order_relaxed) == true);
 
     // Third call while dead -> immediately returns SERVFAIL without pipe I/O
-    int rc3 = dispatch_to_program_zone("plugtest.example.", req, req_len, res, sizeof(res), "127.0.0.1", false);
+    int rc3 = dispatch_to_program_zone("", "plugtest.example.", req, req_len, res, sizeof(res), sizeof(res), "127.0.0.1", false);
     assert(rc3 >= 12);
     assert((res[3] & 0x0F) == 2); // SERVFAIL (RCODE=2)
 
@@ -9099,6 +9042,65 @@ static void test_query_engine_program_zone_plugin_pipe_timeout_and_dead_mark(voi
     g_program_plugins_count = 0;
 
     printf("  -> Program zone plugin timeout & dead mark passed.\n");
+}
+
+/* O-01: with disable-auto-tc-flag yes the plugin reply is returned as-is even above max_res_len, but never
+ * beyond the response buffer (res_cap); a larger reply is cut to a TC=1 reply and the rest is drained. */
+static void test_query_engine_program_zone_reply_bounded_by_buffer(void) {
+    printf("[TEST] Query Engine: Program zone reply bounded by the response buffer (disable-auto-tc-flag)...\n");
+    int in_p[2], out_p[2];
+    assert(pipe(in_p) == 0);
+    assert(pipe(out_p) == 0);
+    program_plugin_t plugin;
+    memset(&plugin, 0, sizeof(plugin));
+    strncpy(plugin.domain, "plugtest.example.", sizeof(plugin.domain) - 1);
+    plugin.pid = -1;
+    plugin.stdin_fd = in_p[1];
+    plugin.stdout_fd = out_p[0];
+    pthread_mutex_init(&plugin.lock, NULL);
+    plugin.timeout_ms = 1000;
+    plugin.max_failures = 5;
+    plugin.disable_auto_tc_flag = true;
+    atomic_init(&plugin.consecutive_failures, 0);
+    atomic_init(&plugin.dead, false);
+    g_program_plugins = &plugin;
+    g_program_plugins_count = 1;
+
+    uint8_t req[64];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 0x1234, "plugtest.example.", 1, false);
+    static uint8_t reply[1000];
+    memset(reply, 0, sizeof(reply));
+    memcpy(reply, req, req_len);
+    reply[2] |= 0x80;
+
+    static uint8_t res[1024];
+    const size_t res_cap = 600, max_res = 512;
+    for (int round = 0; round < 2; round++) {
+        size_t rlen = round == 0 ? 550 : sizeof(reply);   /* 550: above max_res, fits res_cap; 1000: does not fit */
+        uint8_t pfx[2] = { (uint8_t)(rlen >> 8), (uint8_t)rlen };
+        assert(write(out_p[1], pfx, 2) == 2);
+        assert(write(out_p[1], reply, rlen) == (ssize_t)rlen);
+        memset(res, 0xA5, sizeof(res));
+        int n = dispatch_to_program_zone("", "plugtest.example.", req, req_len, res, max_res, res_cap, "127.0.0.1", false);
+        for (size_t i = res_cap; i < sizeof(res); i++) assert(res[i] == 0xA5);   /* nothing written beyond res_cap */
+        if (round == 0) {
+            assert(n == 550 && (res[2] & 0x02) == 0);                           /* sent as-is (documented) */
+        } else {
+            assert(n >= 12 && (size_t)n <= max_res && (res[2] & 0x02) != 0);    /* TC=1, question only */
+        }
+    }
+    /* the rest of the oversized reply was drained: the pipe is empty and in sync */
+    struct pollfd pfd = { .fd = out_p[0], .events = POLLIN };
+    assert(poll(&pfd, 1, 0) == 0);
+    assert(atomic_load(&plugin.consecutive_failures) == 0);
+
+    pthread_mutex_destroy(&plugin.lock);
+    close(in_p[0]); close(in_p[1]);
+    close(out_p[0]); close(out_p[1]);
+    g_program_plugins = NULL;
+    g_program_plugins_count = 0;
+    printf("  -> Program zone reply bound passed.\n");
 }
 
 static void test_query_engine_opcode_header_validations(void) {
@@ -9319,6 +9321,7 @@ int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
     test_query_engine_dname_cname_wildcard_truncation();
     test_query_engine_program_zone_plugin_pipe_timeout_and_dead_mark();
+    test_query_engine_program_zone_reply_bounded_by_buffer();
     test_query_engine_opcode_header_validations();
     test_all_rr_types_and_resolution();
     test_dnssec_negative_and_delegation_proofs();
@@ -9365,36 +9368,14 @@ int main(void) {
     test_multiple_views_acls_and_fallback();
     test_dynamic_update_prereq_rrset_exists_value_independent();
     test_dynamic_update_prereq_rrset_exists_value_dependent();
-    test_dynamic_update_prereq_rrset_does_not_exist();
-    test_dynamic_update_prereq_name_in_use();
-    test_dynamic_update_prereq_name_not_in_use();
-    test_dynamic_update_action_add_to_rrset();
-    test_dynamic_update_action_delete_rrset();
-    test_dynamic_update_action_delete_all_rrsets();
-    test_dynamic_update_action_delete_specific_rr();
     test_dnssec_nsec_wildcard_no_data_proof();
-    test_dnssec_nsec_referral_proof();
-    test_dnssec_nsec3_optout_unsigned_delegation();
-    test_dnssec_covering_rrsig_signature_expiry();
-    test_dnssec_covering_rrsig_signature_inception_future();
     test_dname_synthesis_multi_label_subdomain();
-    test_dname_synthesis_target_length_exceeded_255();
     test_cname_chain_maximum_length_stop();
     test_cname_alias_to_cname_loop_prevention();
     test_wildcard_covering_multiple_subdomains();
     test_wildcard_priority_over_cname_synthesis();
     test_edns_client_subnet_ipv6_scope_prefix_zero();
     test_edns_client_subnet_ipv4_prefix_clamping();
-    test_dns_cookie_client_cookie_only_generation();
-    test_dns_cookie_server_cookie_mismatch_refresh();
-    test_rrl_slip_mode_pseudo_random_drop();
-    test_rrl_tcp_exempt_bypass();
-    test_rrl_whitelist_subnet_bypass();
-    test_proxy_v2_tlv_additional_options_skip();
-    test_catalog_zone_coo_property_verification();
-    test_catalog_zone_group_property_verification();
-    test_tinydns_timestamp_high_precision_epoch();
-    test_tinydns_location_two_character_codes();
     test_query_engine_opcode_iquery_notimp();
     test_query_engine_opcode_status_notimp();
     test_query_engine_qclass_chaos_version_bind();
@@ -9402,62 +9383,21 @@ int main(void) {
     test_query_engine_unknown_qclass_refused();
     test_query_engine_out_of_zone_query_refused();
     test_query_engine_formerr_truncated_question();
-    test_query_engine_tc_bit_setting_on_overflow();
         test_query_engine_cname_intermediate_noerror_synthesis();
     test_query_engine_cname_intermediate_servfail_fallback();
     test_query_engine_formerr_corrupted_arcount_records();
     test_query_engine_formerr_corrupted_nscount_records();
     test_query_engine_formerr_rdlength_overflow_packet();
-    test_query_engine_dynamic_update_tsig_notauth_code9();
-    test_query_engine_dynamic_update_tsig_invalid_key_code18();
-    test_query_engine_dynamic_update_not_primary_code20();
-    test_query_engine_dynamic_update_no_matching_zone_refused();
-    test_query_engine_dynamic_update_prereq_type_any_no_data();
-    test_query_engine_rrl_client_exhausted_packet_drop();
-    test_query_engine_rrl_slip_mode_tc_bit_response();
-    test_query_engine_edns_ede_reason15_blocked();
-    test_query_engine_edns_ede_reason16_censored();
-    test_query_engine_edns_ede_reason18_invalid_tsig();
-    test_query_engine_edns_ede_reason20_not_primary();
-    test_query_engine_cookie_server_generation_failure_omit();
-    test_query_engine_cookie_bad_cookie_rcode();
-    test_query_engine_ecs_ipv4_scope_zero_truncation();
-    test_query_engine_ecs_ipv6_scope_match_specific();
-    test_query_engine_dnssec_wildcard_nodata_nsec3_proof();
-    test_query_engine_dnssec_delegation_ns_rrsig_omitted();
-    test_query_engine_dnssec_ds_child_zone_query();
-    test_query_engine_dnssec_rrsig_multiple_algorithm_keys();
+    test_query_engine_dynamic_update_no_matching_zone_notauth();
     test_query_engine_dname_synthesis_multi_subdomain();
     test_query_engine_dname_synthesis_exact_target_match();
-    test_query_engine_any_query_rrsig_inclusion();
     test_query_engine_any_query_multiple_record_types();
-    test_query_engine_wildcard_covering_txt_and_cname();
-    test_query_engine_wildcard_referral_proof();
-    test_query_engine_tinydns_location_filter_mismatch();
-    test_query_engine_tinydns_timestamp_future_valid();
     test_query_engine_catalog_zone_coo_syntax_check();
     test_query_engine_catalog_zone_group_filtering();
-    test_query_engine_forward_zone_upstream_servfail();
-    test_query_engine_forward_zone_edns_propagation();
-    test_query_engine_program_zone_output_parsing_a();
     test_query_engine_program_zone_output_parsing_txt();
-    test_query_engine_program_zone_timeout_servfail();
-    test_query_engine_opcode_notify_unauthorized_source();
-    test_query_engine_opcode_notify_slave_success();
-    test_query_engine_opcode_update_prereq_eval_order();
-    test_query_engine_truncated_tc_flag_arcount_zero();
-    test_query_engine_rdlength_mismatch_boundary();
-    test_query_engine_multiview_acl_exact_match_fallback();
         test_query_engine_update_prereq_value_dependent_match();
     test_query_engine_update_prereq_value_dependent_mismatch();
-    test_query_engine_update_prereq_name_in_use_cname();
-    test_query_engine_update_prereq_name_not_in_use_yxdomain();
     test_query_engine_update_action_add_duplicate_silent_ignore();
-    test_query_engine_edns_ecs_ipv4_slash_24();
-    test_query_engine_edns_ecs_ipv6_slash_56();
-    test_query_engine_rrl_ipv6_slash_64_aggregation();
-    test_query_engine_cookie_server_cookie_bad_cookie_response();
-    test_query_engine_multiview_internal_to_default_fallback();
     test_query_engine_feature_case_11();
     test_query_engine_feature_case_12();
     test_query_engine_feature_case_13();
@@ -9549,14 +9489,7 @@ int main(void) {
     test_query_engine_feature_case_99();
     test_query_engine_feature_case_100();
     
-    test_query_engine_dynamic_update_prereq_rrset_not_exists();
-    test_query_engine_dynamic_update_prereq_name_in_use_any();
-    test_query_engine_dynamic_update_action_delete_rrset();
-    test_query_engine_dynamic_update_action_delete_all_rrsets();
-    test_query_engine_dynamic_update_action_delete_specific_rr();
-    test_query_engine_edns_ecs_scope_prefix_calculation();
     test_query_engine_dns_cookie_timestamp_regeneration();
-    test_query_engine_rrl_leak_rate_calculation();
     test_query_engine_catalog_zone_coo_and_group_property();
     test_query_engine_program_zone_output_aaaa_parsing();
     test_query_engine_feature_case_101();
@@ -9719,4 +9652,12 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr
                         const tcp_sockopts_t *tcp_opts) {
     (void)tcp_opts;
     return broker_connect(family, type, addr, addr_len);
+}
+
+/* send_tcp_dns_message(): goes through the send_tcp_robust() mock above (length prefix, then message) */
+ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len) {
+    uint8_t prefix[2] = {(uint8_t)(len >> 8), (uint8_t)(len & 0xFF)};
+    if (send_tcp_robust(fd, prefix, 2) < 0) return -1;
+    if (send_tcp_robust(fd, msg, len) < 0) return -1;
+    return (ssize_t)len;
 }

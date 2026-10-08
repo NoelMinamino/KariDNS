@@ -236,8 +236,8 @@ cat > "$TMP/sweeps" <<'SEOF'
 0 0 setgroups 3 EPERM
 0 0 setgid 3 EPERM
 0 0 setuid 3 EPERM
-0 0 getpwnam 3
-0 0 getgrnam 3
+0 0 getpwnam_r 3
+0 0 getgrnam_r 3
 0 0 cap_enter 3 ENOSYS
 0 0 mkdir 16 EACCES
 0 0 accept 3 ECONNABORTED
@@ -249,8 +249,8 @@ cat > "$TMP/sweeps" <<'SEOF'
 1 0 setgroups 2 EPERM
 1 0 setgid 2 EPERM
 1 0 setuid 2 EPERM
-1 0 getpwnam 3
-1 0 getgrnam 3
+1 0 getpwnam_r 3
+1 0 getgrnam_r 3
 1 0 kqueue 16 EMFILE
 1 0 socket 24
 1 0 bind 16 EADDRINUSE

@@ -44,8 +44,11 @@ fi
 # ゾーン設定にてTSIGが必須(tsig-key "transfer-key";)となっているため、
 # まずはTSIG無しでREFUSEDされることを確認し、次にTSIGありで正常応答を得る。
 echo "Running AXFR transfer without TSIG (expect REFUSED)..."
-noauth_output=$(./dag example.com AXFR @127.0.0.1 -p 10053 +tcp 2>&1 || true)
-if ! echo "$noauth_output" | grep -qE "REFUSED|NOTAUTH"; then
+# +yaml: like dig, dag prints a refused transfer as "; Transfer failed." in text mode; YAML keeps the RCODE
+noauth_output=$(./dag example.com AXFR @127.0.0.1 -p 10053 +tcp +yaml 2>&1 || true)
+# RFC 5936 §5 は拒否の RCODE を決めていない。方針による拒否は REFUSED (RFC 1035 §4.1.1)。
+# NOTAUTH は TSIG のエラー (RFC 8945 §5.2) のときだけで、署名のない要求には TSIG を付けない。
+if ! echo "$noauth_output" | grep -q "status: REFUSED" || echo "$noauth_output" | grep -q "ANY[[:space:]]*TSIG"; then
     echo "[FAIL] AXFR without TSIG was not refused! TSIG-required ACL may be broken."
     echo "$noauth_output"
     exit 1

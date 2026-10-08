@@ -24,17 +24,13 @@ echo "[+] Checking zone syntax with karicheck..."
     exit 1
 }
 
+USER_OPT=""
+[ "$(id -u)" = "0" ] && USER_OPT="user \"nobody\"; group \"nobody\";"
 cat << EOF > karidns.conf
 options {
     port 53532;
     bind-address { 127.0.0.1; };
-    user "nobody";
-    group "nobody";
-};
-
-control-channel {
-    algorithm hmac-sha256;
-    secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
+    ${USER_OPT}
 };
 
 view "default" {
@@ -48,7 +44,10 @@ EOF
 
 "$BIN_DIR/karidns" -f karidns.conf > karidns.log 2>&1 &
 SERVER_PID=$!
-sleep 1
+for _ in $(seq 1 50); do
+    "$BIN_DIR/dag" example.com. SOA @127.0.0.1 -p 53532 +short +timeout=1 +tries=1 2>/dev/null | grep -q admin && break
+    sleep 0.2
+done
 
 cleanup() {
     kari_kill_tree "${SERVER_PID:-}"
@@ -56,25 +55,31 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "[+] Testing query for SOA (default $TTL 1D -> 86400)..."
-"$BIN_DIR/dag" example.com. SOA @127.0.0.1 -p 53532 > out_soa.txt 2>&1
-cat out_soa.txt
-grep "86400" out_soa.txt || { echo "FAIL: Expected TTL 86400 for SOA"; cat karidns.log; exit 1; }
+# check <label> <file> <regex>: the regex must match one answer line (+nohexdump output, anchored)
+check() {
+    grep -E -q "$3" "$2" || { echo "FAIL: $1"; cat "$2"; cat karidns.log; exit 1; }
+    echo "[OK] $1"
+}
+q() { # name type file
+    "$BIN_DIR/dag" "$1" "$2" @127.0.0.1 -p 53532 +nohexdump +norec > "$3" 2>&1
+}
 
-echo "[+] Testing query for NS (TTL 3h -> 10800)..."
-"$BIN_DIR/dag" example.com. NS @127.0.0.1 -p 53532 > out_ns.txt 2>&1
-cat out_ns.txt
-grep "10800" out_ns.txt || { echo "FAIL: Expected TTL 10800 for NS"; cat karidns.log; exit 1; }
+echo "[+] SOA: owner TTL from \$TTL 1D, RDATA timers 1h 15m 1w 1h..."
+q example.com. SOA out_soa.txt
+check "SOA TTL 1D -> 86400, refresh 1h -> 3600, retry 15m -> 900, expire 1w -> 604800, minimum 1h -> 3600" out_soa.txt \
+    "^example\.com\.[[:space:]]+86400[[:space:]]+IN[[:space:]]+SOA[[:space:]]+ns1\.example\.com\.[[:space:]]+admin\.example\.com\.[[:space:]]+1[[:space:]]+3600[[:space:]]+900[[:space:]]+604800[[:space:]]+3600$"
 
-echo "[+] Testing query for www.example.com. A (TTL 90 -> 90)..."
-"$BIN_DIR/dag" www.example.com. A @127.0.0.1 -p 53532 > out_www.txt 2>&1
-cat out_www.txt
-grep "90" out_www.txt || { echo "FAIL: Expected TTL 90 for www A"; cat karidns.log; exit 1; }
+q example.com. NS out_ns.txt
+check "NS TTL 3h -> 10800" out_ns.txt "^example\.com\.[[:space:]]+10800[[:space:]]+IN[[:space:]]+NS[[:space:]]+ns1\.example\.com\.$"
 
-echo "[+] Testing query for mixed.example.com. A (TTL 1h30m -> 5400)..."
-"$BIN_DIR/dag" mixed.example.com. A @127.0.0.1 -p 53532 > out_mixed.txt 2>&1
-cat out_mixed.txt
-grep "5400" out_mixed.txt || { echo "FAIL: Expected TTL 5400 for mixed A"; cat karidns.log; exit 1; }
+q ns1.example.com. A out_ns1.txt
+check "A TTL 1D -> 86400" out_ns1.txt "^ns1\.example\.com\.[[:space:]]+86400[[:space:]]+IN[[:space:]]+A[[:space:]]+192\.0\.2\.53$"
+
+q www.example.com. A out_www.txt
+check "A TTL 90 (no unit) -> 90" out_www.txt "^www\.example\.com\.[[:space:]]+90[[:space:]]+IN[[:space:]]+A[[:space:]]+192\.0\.2\.1$"
+
+q mixed.example.com. A out_mixed.txt
+check "A TTL 1h30m -> 5400" out_mixed.txt "^mixed\.example\.com\.[[:space:]]+5400[[:space:]]+IN[[:space:]]+A[[:space:]]+192\.0\.2\.2$"
 
 echo "[+] All TTL unit suffix parsing tests passed successfully!"
 exit 0

@@ -11,8 +11,6 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <time.h>
-#include <sys/utsname.h>
-#include <sys/sysctl.h>
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -395,29 +393,27 @@ int main(int argc, char **argv) {
         if (total >= expected_len && strncmp(buf, "OK ", 3) == 0) {
             karidns_status_t st;
             memcpy(&st, buf + 3, sizeof(st));
-            
-            struct utsname un;
-            uname(&un);
-            
-            int num_cpus = 1;
-            int mib[2] = { CTL_HW, HW_NCPU };
-            size_t clen = sizeof(num_cpus);
-            sysctl(mib, 2, &num_cpus, &clen, NULL, 0);
-            
+            st.version[sizeof(st.version) - 1] = '\0';
+            st.hostname[sizeof(st.hostname) - 1] = '\0';
+            st.os_name[sizeof(st.os_name) - 1] = '\0';
+            st.os_release[sizeof(st.os_release) - 1] = '\0';
+            st.machine[sizeof(st.machine) - 1] = '\0';
+            st.config_file[sizeof(st.config_file) - 1] = '\0';
+
+            /* T-11: time_t にミリ秒は無く、strftime() は %03d を知らないので秒までにする */
             char boot_str[64], config_str[64];
-            struct tm *tm_info;
-            tm_info = localtime(&st.boot_time);
-            strftime(boot_str, sizeof(boot_str), "%d-%b-%Y %H:%M:%S.%03d", tm_info);
-            
-            tm_info = localtime(&st.last_configured_time);
-            strftime(config_str, sizeof(config_str), "%d-%b-%Y %H:%M:%S.%03d", tm_info);
-            
-            printf("version: KariDNS %s (Authoritative)\n", KARIDNS_VERSION);
-            printf("running on %s: %s %s %s\n", un.nodename, un.sysname, un.machine, un.release);
+            struct tm tm_info;
+            strftime(boot_str, sizeof(boot_str), "%d-%b-%Y %H:%M:%S", localtime_r(&st.boot_time, &tm_info));
+            strftime(config_str, sizeof(config_str), "%d-%b-%Y %H:%M:%S",
+                     localtime_r(&st.last_configured_time, &tm_info));
+
+            /* D-12: バージョン、ホスト名、OS、CPU 数はサーバーが返した値 */
+            printf("version: KariDNS %s (Authoritative)\n", st.version);
+            printf("running on %s: %s %s %s\n", st.hostname, st.os_name, st.machine, st.os_release);
             printf("boot time: %s\n", boot_str);
             printf("last configured: %s\n", config_str);
             printf("configuration file: %s\n", st.config_file[0] ? st.config_file : "(unknown)");
-            printf("CPUs found: %d\n", num_cpus);
+            printf("CPUs found: %d\n", st.ncpus);
             printf("worker threads: %d\n", st.worker_threads);
             printf("number of zones: %d (0 automatic)\n", st.num_zones);
             printf("xfers running: %d\n", st.xfers_running);
@@ -436,9 +432,16 @@ int main(int argc, char **argv) {
             printf("dnstap truncated: %lu\n", (unsigned long)st.dnstap_truncated);
             printf("-----------------------------------\n");
         } else {
+            /* D-13: ERROR 応答や長さの合わない応答は失敗 (終了コード 3) */
             if (total >= sizeof(buf)) total = sizeof(buf) - 1;
             buf[total] = '\0';
-            printf("%s", buf);
+            if (strncmp(buf, "ERROR", 5) == 0)
+                printf("%s", buf);
+            else
+                fprintf(stderr, "Invalid status response (%zu bytes, expected %zu; karictl and karidns versions differ?)\n",
+                        total, expected_len);
+            close(sock);
+            return 3;
         }
     } else if (strcmp(argv[optind], "observatory") == 0) {
         size_t total = 0;

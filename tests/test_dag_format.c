@@ -231,6 +231,37 @@ static const char *type_mnemonic(const char *line) {
     return mn;
 }
 
+/* The RRSIG cache in dns_wire.c passed an uninitialized start offset to decode_concat_b64_rdata(); a stale
+ * stack value of 1..4 put that many garbage octets in front of the signature (seen as a round-trip failure
+ * on FreeBSD 14.4 only). Dirty the stack with each value before parsing: the RDATA must not change. */
+static void __attribute__((noinline)) dirty_stack(size_t v) {
+    volatile size_t s[4096];
+    for (size_t i = 0; i < 4096; i++) s[i] = v;
+}
+
+static void test_rrsig_cache_signature(void) {
+    printf("[TEST] dns_wire: RRSIG signature cache independent of stale stack contents...\n");
+    const char *line = NULL;
+    for (size_t i = 0; i < N(ROUNDTRIP_LINES); i++)
+        if (!strncmp(ROUNDTRIP_LINES[i], "IN RRSIG ", 9)) line = ROUNDTRIP_LINES[i];
+    assert(line);
+    uint8_t ref[4096], rd[4096];
+    size_t reflen = 0, rdlen = 0;
+    uint16_t type = 0;
+    for (size_t v = 0; v <= 8; v++) {
+        dirty_stack(v);
+        zone_arena_t a;
+        assert(parse_line(&a, line));
+        assert(wire_rdata(&a, v ? rd : ref, sizeof(rd), v ? &rdlen : &reflen, &type));
+        zone_arena_destroy(&a);
+        if (v && (rdlen != reflen || memcmp(rd, ref, rdlen) != 0)) {
+            fprintf(stderr, "stale stack value %zu changed the RRSIG RDATA (%zu -> %zu octets)\n", v, reflen, rdlen);
+            assert(0);
+        }
+    }
+    printf("  -> passed.\n");
+}
+
 static void test_round_trip_all_types(void) {
     printf("[TEST] dag: display -> zone parser round trip for %zu RR presentation forms...\n", N(ROUNDTRIP_LINES));
     size_t checked = 0, unreadable = 0;
@@ -367,6 +398,13 @@ static void test_dig_compat_formatting(void) {
     static const uint8_t sink_empty[] = { 5, 6, 7 };
     show(40, sink_empty, sizeof(sink_empty), out, sizeof(out), false);
     assert(strcmp(out, "5 6 7 ") == 0 || strcmp(out, "5 6 7") == 0);
+    /* ATMA (BIND atma_34.c totext): format 0 = AESA in hex, format 1 = E.164 as "+digits" */
+    static const uint8_t atma_aesa[] = { 0, 0x39, 0x24, 0x6f };
+    show(34, atma_aesa, sizeof(atma_aesa), out, sizeof(out), false);
+    assert(strcmp(out, "39246f") == 0);
+    static const uint8_t atma_e164[] = { 1, '3', '5', '8', '4' };
+    show(34, atma_e164, sizeof(atma_e164), out, sizeof(out), false);
+    assert(strcmp(out, "+3584") == 0);
 
     /* EID / NIMLOC: bare hex, no "\# len" prefix */
     static const uint8_t raw4[] = { 0x01, 0x02, 0x03, 0x04 };
@@ -395,11 +433,14 @@ static void test_dag_cli_parsing_helpers_and_error_paths(void) {
     assert(parse_opcode_value(NULL) == -1);
 
     // 2. get_ede_error_string
-    for (uint16_t code = 0; code <= 29; code++) {
-        const char *s = get_ede_error_string(code);
-        assert(s != NULL && strcmp(s, "Unassigned") != 0);
+    /* dig 9.20 names RFC 8914 codes 0-24 and prints later codes by number */
+    for (uint16_t code = 0; code <= 24; code++) {
+        assert(get_ede_error_string(code) != NULL);
     }
-    assert(strcmp(get_ede_error_string(999), "Unassigned") == 0);
+    assert(strcmp(get_ede_error_string(0), "Other") == 0);
+    assert(strcmp(get_ede_error_string(19), "Stale NXDOMAIN Answer") == 0);
+    assert(get_ede_error_string(25) == NULL);
+    assert(get_ede_error_string(999) == NULL);
 
     // 3. rcode_name & opcode_name
     assert(strcmp(rcode_name(0), "NOERROR") == 0);
@@ -588,38 +629,6 @@ static void test_dag_format_case_1(void) {
     spec.dopt.yaml = true;
     assert(spec.dopt.yaml == true);
     free_query_opts(&spec.qo);
-}
-
-static void test_dag_format_case_2(void) {
-    printf("[TEST] DAG Format: YAML format NXDOMAIN response...\n");
-    uint8_t pkt[512];
-    memset(pkt, 0, 12);
-    pkt[2] = 0x81; pkt[3] = 0x83; // NXDOMAIN
-    assert((pkt[3] & 0x0F) == 3);
-}
-
-static void test_dag_format_case_3(void) {
-    printf("[TEST] DAG Format: YAML format SERVFAIL response...\n");
-    uint8_t pkt[512];
-    memset(pkt, 0, 12);
-    pkt[2] = 0x81; pkt[3] = 0x82; // SERVFAIL
-    assert((pkt[3] & 0x0F) == 2);
-}
-
-static void test_dag_format_case_4(void) {
-    printf("[TEST] DAG Format: YAML format REFUSED response...\n");
-    uint8_t pkt[512];
-    memset(pkt, 0, 12);
-    pkt[2] = 0x81; pkt[3] = 0x85; // REFUSED
-    assert((pkt[3] & 0x0F) == 5);
-}
-
-static void test_dag_format_case_5(void) {
-    printf("[TEST] DAG Format: YAML format FORMERR response...\n");
-    uint8_t pkt[512];
-    memset(pkt, 0, 12);
-    pkt[2] = 0x81; pkt[3] = 0x81; // FORMERR
-    assert((pkt[3] & 0x0F) == 1);
 }
 
 static void test_dag_format_case_6(void) {
@@ -879,14 +888,11 @@ int main(void) {
     test_character_string_escaping();
     test_amtrelay_layout();
     test_dig_compat_formatting();
+    test_rrsig_cache_signature();
     test_round_trip_all_types();
     test_truncation_robustness();
     test_dag_cli_parsing_helpers_and_error_paths();
         test_dag_format_case_1();
-    test_dag_format_case_2();
-    test_dag_format_case_3();
-    test_dag_format_case_4();
-    test_dag_format_case_5();
     test_dag_format_case_6();
     test_dag_format_case_7();
     test_dag_format_case_8();

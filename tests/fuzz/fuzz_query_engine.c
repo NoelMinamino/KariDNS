@@ -101,6 +101,17 @@ static const char g_main_zone_text[] =
     "*.wild.example.com. IN A 192.0.2.100\n"
     "*.wild.example.com. IN TXT \"wildcard match\"\n"
     "ent.sub.example.com. IN A 192.0.2.101\n"
+    "$ECS-SUBNET-TAG eu 198.51.100.0/24 192.0.2.128/25 2001:db8:1::/48\n"
+    "$ECS-SUBNET-TAG jp 192.0.2.0/24 203.0.113.0/24 2001:db8::/32\n"
+    "$ECS-SUBNET eu\n"
+    "geo.example.com. IN A 192.0.2.50\n"
+    "*.wild.example.com. IN AAAA 2001:db8::50\n"
+    "$ECS-SUBNET jp\n"
+    "geo.example.com. IN A 192.0.2.60\n"
+    "geo.example.com. IN AAAA 2001:db8::60\n"
+    "$ECS-SUBNET \"\"\n"
+    "geo.example.com. IN A 192.0.2.70\n"
+    "geo-alias.example.com. IN CNAME geo.example.com.\n"
     "subzone.example.com. IN NS ns1.subzone.example.com.\n"
     "ns1.subzone.example.com. IN A 192.0.2.200\n"
     "sibling.example.com. IN NS ns1.other.example.com.\n"
@@ -132,7 +143,8 @@ static void init_rich_fuzz_engine(void) {
     // Main zone
     zone_arena_init(&g_fuzz_arena_main);
     parse_context_t ctx1 = { .base_dir = ".", .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err };
-    char main_buf[sizeof(g_main_zone_text)];
+    /* パース結果のレコードは入力バッファを指し続けるので、関数を抜けても残る static にする */
+    static char main_buf[sizeof(g_main_zone_text)];
     memcpy(main_buf, g_main_zone_text, sizeof(g_main_zone_text));
     parse_zone_fast(main_buf, sizeof(g_main_zone_text) - 1, &g_fuzz_arena_main, &ctx1);
     build_zone_index(&g_fuzz_arena_main, true);
@@ -145,7 +157,7 @@ static void init_rich_fuzz_engine(void) {
     // Sub zone
     zone_arena_init(&g_fuzz_arena_sub);
     parse_context_t ctx2 = { .base_dir = ".", .default_origin = "sub.example.org.", .is_standalone_mode = true, .err_out = &err };
-    char sub_buf[sizeof(g_sub_zone_text)];
+    static char sub_buf[sizeof(g_sub_zone_text)];
     memcpy(sub_buf, g_sub_zone_text, sizeof(g_sub_zone_text));
     parse_zone_fast(sub_buf, sizeof(g_sub_zone_text) - 1, &g_fuzz_arena_sub, &ctx2);
     build_zone_index(&g_fuzz_arena_sub, true);
@@ -158,7 +170,7 @@ static void init_rich_fuzz_engine(void) {
     // NSEC3 zone
     zone_arena_init(&g_fuzz_arena_nsec3);
     parse_context_t ctx3 = { .base_dir = ".", .default_origin = "signed.local.", .is_standalone_mode = true, .err_out = &err };
-    char nsec3_buf[sizeof(g_nsec3_zone_text)];
+    static char nsec3_buf[sizeof(g_nsec3_zone_text)];
     memcpy(nsec3_buf, g_nsec3_zone_text, sizeof(g_nsec3_zone_text));
     parse_zone_fast(nsec3_buf, sizeof(g_nsec3_zone_text) - 1, &g_fuzz_arena_nsec3, &ctx3);
     build_zone_index(&g_fuzz_arena_nsec3, true);
@@ -185,8 +197,20 @@ static void init_rich_fuzz_engine(void) {
     g_fuzz_cfg.rfc10029_mqtype_enable = true;
     g_fuzz_cfg.max_mqtypes = 4;
     g_fuzz_cfg.minimal_responses = true;
+    /* TSIG key "k" (hmac-sha256): requests signed with it reach the MAC check and the error responses (RFC 8945 §5.2) */
+    static tsig_key_t fuzz_key;
+    memset(&fuzz_key, 0, sizeof(fuzz_key));
+    fuzz_key.name = "k";
+    fuzz_key.algorithm = "hmac-sha256";
+    fuzz_key.secret_decoded_len = 32;
+    memset(fuzz_key.secret_decoded, 0x6b, 32);
+    g_fuzz_cfg.keys = &fuzz_key;
     g_fuzz_cfg.minimal_any = true;
     g_fuzz_cfg.minimal_any_ttl = 60;
+    /* ECS from the harness client address (127.0.0.1) is trusted, so the ECS option of the input is used */
+    g_fuzz_cfg.ecs_enable = true;
+    g_fuzz_cfg.ecs_trusted_resolvers = g_fuzz_any_acl;
+    g_fuzz_cfg.ecs_trusted_resolvers_count = 1;
     atomic_store_explicit(&g_config_db.active, &g_fuzz_cfg, memory_order_release);
 
     g_fuzz_qe_initialized = true;
@@ -202,7 +226,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (query_len > sizeof(query_buf)) query_len = sizeof(query_buf);
     memcpy(query_buf, data, query_len);
 
-    char qname[256] = {0};
+    char qname[DNS_NAME_TEXT_SIZE] = {0};
     uint16_t qtype = 0;
     uint16_t qclass = 1;
     size_t qend = 0;
@@ -229,7 +253,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         // Must have QR bit set in response flags
         uint16_t flags = ((uint16_t)resp_buf[2] << 8) | resp_buf[3];
         (void)flags;
-        char rqname[256] = {0};
+        char rqname[DNS_NAME_TEXT_SIZE] = {0};
         uint16_t rqtype = 0;
         uint16_t rqclass = 1;
         size_t rqend = 0;
@@ -244,4 +268,12 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr
                         const tcp_sockopts_t *tcp_opts) {
     (void)tcp_opts;
     return broker_connect(family, type, addr, addr_len);
+}
+
+/* send_tcp_dns_message(): goes through the send_tcp_robust() mock above (length prefix, then message) */
+ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len) {
+    uint8_t prefix[2] = {(uint8_t)(len >> 8), (uint8_t)(len & 0xFF)};
+    if (send_tcp_robust(fd, prefix, 2) < 0) return -1;
+    if (send_tcp_robust(fd, msg, len) < 0) return -1;
+    return (ssize_t)len;
 }

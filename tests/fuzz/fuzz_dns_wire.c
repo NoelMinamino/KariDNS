@@ -2,6 +2,8 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdlib.h>
+#include <strings.h>
 
 // Override syslog to prevent massive disk I/O and CPU usage during fuzzing
 void syslog(int priority, const char *format, ...) {
@@ -11,6 +13,29 @@ void syslog(int priority, const char *format, ...) {
 
 #include "../../dns_wire.h"
 #include "../../dns_zone_parser.h"
+
+/* R-33: the text fields decoded from a DNSSEC RR are a valid zone-parser form: when the text encoder accepts them,
+ * decoding its output gives the same fields again (text -> wire -> text is stable). */
+static void check_dnssec_text_fields(const dns_record_t *rec, zone_arena_t *arena) {
+    uint16_t t = rec->type_code;
+    if (!rec->generic_data || rec->rdata_count == 0 || rec->rdata_count >= MAX_RDATA) return;
+    if (t != 43 && t != 46 && t != 47 && t != 48 && t != 50 && t != 51) abort(); /* only these get text fields */
+    dns_record_t text = *rec;
+    text.generic_data = NULL;
+    text.generic_len = 0;
+    text.is_cached = false;
+    uint8_t wire[65535];
+    uint16_t off = 0;
+    if (serialize_dns_record(wire, sizeof(wire), &off, &text, NULL, "fuzz.test.", 0xFFFFFFFF) != 0) return;
+    dns_record_t again;
+    memset(&again, 0, sizeof(again));
+    size_t pos = 0;
+    uint16_t type;
+    if (parse_resource_record(wire, off, &pos, arena, &again, &type) != 0) abort();
+    if (again.rdata_count != rec->rdata_count) abort();
+    for (int i = 0; i < rec->rdata_count; i++)
+        if (strcasecmp(again.rdata[i], rec->rdata[i]) != 0) abort();
+}
 
 // LLVM libFuzzer entry point
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
@@ -32,7 +57,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     dns_record_t rec;
     memset(&rec, 0, sizeof(rec));
     uint16_t type_out;
-    parse_resource_record(data, size, &offset, &dummy_arena, &rec, &type_out);
+    if (parse_resource_record(data, size, &offset, &dummy_arena, &rec, &type_out) == 0)
+        check_dnssec_text_fields(&rec, &dummy_arena);
 
     // 3. Test parse_edns_opt
     uint16_t qdcount = (data[4] << 8) | data[5];
@@ -84,7 +110,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     // 5. Test process_update_sections
     // Since we just need to test parsing bounds, we can pass dummy standby arena.
     // The arena was already initialized above (dummy_arena).
-    process_update_sections(data, size, "fuzz.test.", &dummy_arena, NULL, NULL);
+    process_update_sections(data, size, "fuzz.test.", &dummy_arena, NULL);
 
     zone_arena_destroy(&dummy_arena);
     return 0; // Fuzzer must return 0

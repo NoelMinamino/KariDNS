@@ -666,8 +666,8 @@ static void sw_setup_all(const char *conf, bool optout) {
 
 static void sw_prelink_and_cache(additional_from_auth_t policy) {
     for (int i = 0; i < g_sw.zone_count; i++) {
-        prelink_zone_additional_glue(&g_sw.arena[i], g_sw.entry[i].domain, &g_sw.snap, &g_sw.view, policy);
-        build_zone_response_cache(&g_sw.arena[i], g_sw.cfg, g_sw.entry[i].domain);
+        prelink_zone_additional_glue(&g_sw.arena[i], g_sw.entry[i].domain, &g_sw.view, policy);
+        build_zone_response_cache(&g_sw.arena[i], g_sw.cfg, NULL, g_sw.entry[i].domain);
     }
 }
 
@@ -917,7 +917,7 @@ static void pg_run(int scn, bool disable_tc, size_t max_res, int rounds, uint32_
     uint8_t req[512], res[8192];
     for (int r = 0; r < rounds; r++) {
         size_t len = sw_build(req, (uint16_t)(0x7100 + r), 0x01, 0, "a.prog.test.", 1, 1, 0);
-        int n = dispatch_to_program_zone("prog.test.", req, len, res, max_res, r & 1 ? NULL : "192.0.2.9", r & 1);
+        int n = dispatch_to_program_zone("", "prog.test.", req, len, res, max_res, max_res, r & 1 ? NULL : "192.0.2.9", r & 1);
         assert(n >= 0);
     }
     close(in_p[1]);
@@ -946,11 +946,12 @@ static void test_program_zone_emulated(void) {
     /* unknown zone / dead plugin / helpers */
     uint8_t req[512], res[512];
     size_t len = sw_build(req, 1, 1, 0, "a.prog.test.", 1, 1, 0);
-    assert(dispatch_to_program_zone("none.test.", req, len, res, sizeof(res), NULL, false) > 0);
-    assert(find_program_plugin(NULL) == NULL);
+    assert(dispatch_to_program_zone("", "none.test.", req, len, res, sizeof(res), sizeof(res), NULL, false) > 0);
+    assert(find_program_plugin("", NULL) == NULL);
     assert(build_synthetic_servfail(req, 5, res, sizeof(res)) == 0);
     assert(build_synthetic_servfail(req, len, res, 5) == 0);
-    assert(build_synthetic_servfail(req, len, res, 16) == 16 && res[5] == 0);
+    /* question does not fit: header only with QDCOUNT=0 (no partial question bytes) */
+    assert(build_synthetic_servfail(req, len, res, 16) == DNS_HEADER_SIZE && res[5] == 0);
     assert(remaining_ms(monotonic_ms() - 10) == 0);
     assert(remaining_ms(monotonic_ms() + 100000) > 0);
     assert(write_all_timeout(-1, req, 4, 10) == -1);
@@ -1004,13 +1005,17 @@ static void test_engine_helper_edges(void) {
 
     /* arena helpers on empty / incomplete zones */
     zone_arena_t z; memset(&z, 0, sizeof(z)); zone_arena_init(&z);
-    assert(find_matching_nsec3(NULL, "x", "a.") == NULL);
-    assert(find_matching_nsec3(&z, NULL, "a.") == NULL);
-    assert(find_matching_nsec3(&z, "x", NULL) == NULL);
-    assert(find_matching_nsec3(&z, "x", "a.") == NULL);
-    assert(find_covering_nsec3(NULL, "x") == NULL);
-    assert(find_covering_nsec3(&z, NULL) == NULL);
-    assert(find_covering_nsec3(&z, "x") == NULL);
+    dns_record_t p3; memset(&p3, 0, sizeof(p3));
+    p3.rdata[0] = "1"; p3.rdata[1] = "0"; p3.rdata[2] = "0"; p3.rdata[3] = "-"; p3.rdata_count = 4;
+    assert(find_matching_nsec3(NULL, &p3, "x", "a.") == NULL);
+    assert(find_matching_nsec3(&z, NULL, "x", "a.") == NULL);
+    assert(find_matching_nsec3(&z, &p3, NULL, "a.") == NULL);
+    assert(find_matching_nsec3(&z, &p3, "x", NULL) == NULL);
+    assert(find_matching_nsec3(&z, &p3, "x", "a.") == NULL);
+    assert(find_covering_nsec3(NULL, &p3, "x") == NULL);
+    assert(find_covering_nsec3(&z, NULL, "x") == NULL);
+    assert(find_covering_nsec3(&z, &p3, NULL) == NULL);
+    assert(find_covering_nsec3(&z, &p3, "x") == NULL);
     assert(name_exists_in_zone(NULL, "a.", "\0\0", NULL, NULL) == false);
     assert(name_exists_in_zone(&z, NULL, "\0\0", NULL, NULL) == false);
     assert(name_exists_in_zone(&z, "a.", "\0\0", NULL, NULL) == false);
@@ -1027,9 +1032,9 @@ static void test_engine_helper_edges(void) {
                            "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false) == false);
     assert(find_delegation(&z, "a.", 0, "a.", res, sizeof(res), &off, &cc, &cnt, &cnt, false,
                            "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false) == false);
-    assert(append_glue_records(NULL, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL));
-    assert(append_glue_records(&z, NULL, "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL));
-    assert(append_glue_records(&z, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_NO, NULL));
+    assert(append_glue_records(NULL, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false));
+    assert(append_glue_records(&z, NULL, "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false));
+    assert(append_glue_records(&z, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_NO, NULL, false));
 
     /* nsec_covers_name with malformed records */
     dns_record_t r; memset(&r, 0, sizeof(r));
@@ -1074,8 +1079,10 @@ static void test_engine_helper_edges(void) {
     assert(hex_to_bytes(NULL, hb, 4) == 0);
     assert(hex_to_bytes("-", hb, 4) == 0);
     assert(hex_to_bytes("", hb, 4) == 0);
-    assert(hex_to_bytes("0102030405", hb, 4) == 4);
-    assert(hex_to_bytes("abc", hb, 4) == 1);
+    assert(hex_to_bytes("01020304", hb, 4) == 4 && hb[3] == 4);
+    assert(hex_to_bytes("0102030405", hb, 4) == (size_t)-1); // R-31: too long for the buffer: fail, no truncation
+    assert(hex_to_bytes("abc", hb, 4) == (size_t)-1);  // R-31: odd number of digits
+    assert(hex_to_bytes("0g", hb, 4) == (size_t)-1);   // R-31: not a hex digit
     zone_db_entry_t e; memset(&e, 0, sizeof(e));
     for (int rc = 0; rc < 6; rc++) { record_observatory_response(&e, (uint8_t)rc, 0); record_observatory_response(&e, (uint8_t)rc, 1); }
     record_observatory_response(NULL, 0, 0);
@@ -2305,6 +2312,9 @@ static void xfr_replay(const uint8_t *stream, size_t len, const char *dom, const
     close(sp[0]);
     tcp_stream_ctx_t sc; memset(&sc, 0, sizeof(sc));
     axfr_session_t s2; memset(&s2, 0, sizeof(s2)); s2.is_ixfr = ixfr; s2.client_serial = cserial;
+    /* R-19: handle_axfr_event() checks the response ID and QTYPE against the request it sent */
+    if (len >= 4) s2.query_id = (uint16_t)((stream[2] << 8) | stream[3]);
+    s2.query_type = ixfr ? 251 : 252;
     int hrc = handle_axfr_event(sp[1], &sec, &sc, &s2, k, mac, maclen);
     if (getenv("SW_SYSLOG")) fprintf(stderr, "XFRDBG len=%zu ixfr=%d hrc=%d parsed_upto=%zu\n", len, ixfr, hrc, o);
     close(sp[1]);
@@ -2618,4 +2628,12 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr
                         const tcp_sockopts_t *tcp_opts) {
     (void)tcp_opts;
     return broker_connect(family, type, addr, addr_len);
+}
+
+/* send_tcp_dns_message(): goes through the send_tcp_robust() mock above (length prefix, then message) */
+ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len) {
+    uint8_t prefix[2] = {(uint8_t)(len >> 8), (uint8_t)(len & 0xFF)};
+    if (send_tcp_robust(fd, prefix, 2) < 0) return -1;
+    if (send_tcp_robust(fd, msg, len) < 0) return -1;
+    return (ssize_t)len;
 }

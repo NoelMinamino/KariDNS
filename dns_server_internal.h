@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -62,6 +63,7 @@ struct mmsghdr {
 extern int g_cwd_fd;
 extern int g_control_kq;
 extern int g_notify_ipc[2];
+extern int g_notify_resp_ipc[2];
 extern char g_startup_cwd[PATH_MAX];
 
 #define DNS_PORT 53
@@ -147,7 +149,6 @@ typedef struct {
 typedef enum { TCP_STATE_READ_LEN, TCP_STATE_READ_BODY } tcp_state_t;
 typedef struct {
   tcp_state_t state;
-  uint8_t buf[65536 + 2];
   size_t accumulated;
   uint16_t msg_len;
   char client_ip[INET6_ADDRSTRLEN];
@@ -164,7 +165,23 @@ typedef struct {
   int applied_sndbuf;
   int orig_rcvbuf;   /* ゾーン値を当てる前の SO_RCVBUF (未指定ゾーンへ戻すため)。-1 = 取得失敗 */
   int orig_sndbuf;
+  /* 次のメッセージを受け取り終えるべき時刻 (CLOCK_MONOTONIC, ms)。accept 時に
+   * tcp-initial-timeout、メッセージを1つ受け取り終えるたびに tcp-idle-timeout で決め、
+   * メッセージの一部を受け取っても延ばさない (RFC 7766 §6.2.3)。 */
+  int64_t idle_deadline_ms;
+  /* buf は最後に置く: プールから払い出すときはこの手前までだけを 0 にする (D-04) */
+  uint8_t buf[65536 + 2];
 } tcp_stream_ctx_t;
+
+/* D-04: 平文 TCP の接続コンテキストは Backend 起動時に MAX_TCP_CLIENTS 個を確保し、
+ * ロックフリーのフリーリストで使い回す (accept のたびに calloc しない)。 */
+bool tcp_pool_init(void);
+tcp_stream_ctx_t *tcp_ctx_alloc(void);
+void tcp_ctx_free(tcp_stream_ctx_t *ctx);
+
+/* DNS メッセージを 2 バイトの長さと一緒に1回の sendmsg() で送る (RFC 7766 §8)。
+ * 送り切れなければ書き込み可能になるのを待って続ける。戻り値は送ったメッセージ長、失敗時 -1。 */
+ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len);
 
 typedef struct {
   bool is_finished;
@@ -181,6 +198,11 @@ typedef struct {
   bool has_current_loc_tag;
   char current_ecs_tag[64];
   bool has_current_ecs_tag;
+  uint32_t out_of_zone_skipped; /* R-27: 読み飛ばしたゾーン外 RR の数 */
+  uint16_t query_id;      /* R-19: 送った要求の ID と QTYPE (xfr_check_response_header() が照合する) */
+  uint16_t query_type;
+  bool got_first_msg;
+  uint8_t rcode;          /* エラーの RCODE で転送が終わったときの値 (0 = エラー応答ではない) */
 } axfr_session_t;
 
 // クエリログ用 固定長イベント構造体 (バイナリ保持)
@@ -226,6 +248,7 @@ struct worker_ctx {
 
   time_t log_current_sec;
   uint32_t log_emitted_this_sec;
+  _Atomic bool startup_failed; /* X-33: このワーカーは起動に失敗して終わった (main() が join する) */
 
   udp_batch_ctx_t batch;
 };
@@ -284,9 +307,28 @@ typedef struct {
   _Atomic time_t   last_notify_time;
 } zone_observatory_t;
 
+/* ゾーンの役割。リロードで既存エントリを再利用してよいかの判定に使う (O-13) */
+typedef enum {
+  ZONE_KIND_OTHER = 0,
+  ZONE_KIND_PRIMARY,
+  ZONE_KIND_SECONDARY,
+  ZONE_KIND_FORWARD,
+  ZONE_KIND_PROGRAM,
+} zone_kind_t;
+
+static inline zone_kind_t zone_kind_from_type(const char *type) {
+  if (!type) return ZONE_KIND_OTHER;
+  if (strcasecmp(type, "master") == 0 || strcasecmp(type, "primary") == 0) return ZONE_KIND_PRIMARY;
+  if (strcasecmp(type, "slave") == 0 || strcasecmp(type, "secondary") == 0) return ZONE_KIND_SECONDARY;
+  if (strcasecmp(type, "forward") == 0) return ZONE_KIND_FORWARD;
+  if (strcasecmp(type, "program") == 0) return ZONE_KIND_PROGRAM;
+  return ZONE_KIND_OTHER;
+}
+
 typedef struct {
   char domain[256];
   char view_name[64];
+  zone_kind_t kind;
   zone_rcu_t rcu;
   pthread_mutex_t writer_lock;
   _Atomic(uint32_t) serial;
@@ -381,7 +423,10 @@ typedef struct {
 
 typedef struct program_plugin {
   char domain[256];      /* zone_db_entry_t->domain と同じ形式(FQDN, 末尾ドット) */
+  char view_name[64];     /* 同じゾーン名が別の view にもあり得るので view と組で引く (O-12) */
   pid_t pid;
+  int proc_fd;            /* FreeBSD: pdfork() のプロセス記述子 (CAP_PDKILL のみ)。-1 = なし。
+                           * capability mode では kill(pid) ができないので pdkill() で止める (X-11) */
   int stdin_fd;           /* karidns -> script への書き込み側 */
   int stdout_fd;          /* script -> karidns への読み込み側 */
   pthread_mutex_t lock;    /* 1子プロセスを複数workerから同時に叩かないための直列化 */
@@ -434,15 +479,17 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(server_config_t *config,
                                              catalog_member_id_t *new_desired_members,
                                              int new_desired_count);
 
-void wait_for_readers(zone_arena_t *arena);
 void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst);
 void zone_arena_clear_data_pools(zone_arena_t *arena);
 void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_arena_t *new_arena);
 void free_ixfr_txn(ixfr_txn_t *txn);
 zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname);
+zone_db_entry_t *find_zone_for_query(view_snapshot_t *view, const char *qname, uint16_t qtype);
+zone_db_entry_t *find_zone_exact_in_view(view_snapshot_t *view, const char *domain);
+view_snapshot_t *snapshot_find_view(zone_db_snapshot_t *snap, const char *view_name);
+zone_db_entry_t *snapshot_get_zone_in_view(zone_db_snapshot_t *snap, const char *view_name, const char *domain);
 void prelink_zone_additional_glue(zone_arena_t *current_zone,
                                   const char *zone_domain,
-                                  zone_db_snapshot_t *snap,
                                   view_snapshot_t *view,
                                   additional_from_auth_t policy);
 
@@ -457,12 +504,16 @@ void submit_response_log(log_action_t action, const char *client_ip, int client_
 /* broker_connect_opts() がブローカー側で TCP ソケットへ設定する値 (0 = 未指定)。
  * rcvbuf / sndbuf は connect() 前に設定するので SYN で通知する初期ウィンドウから効く。
  * mss は FreeBSD では未接続ソケットに mssdflt (既定 536) を超える値を設定できないため、
- * connect() 成功後に設定する (送信 MSS を下げる方向のみ)。 */
+ * connect() 成功後に設定する (送信 MSS を下げる方向のみ)。
+ * connect_timeout_ms は接続完了を待つ上限 (0 = BROKER_CONNECT_TIMEOUT_MS)。待つのは
+ * 要求側で、ブローカーは非ブロッキングの connect() を始めた fd をすぐに返す (O-04)。 */
 typedef struct {
   int mss;
   int rcvbuf;
   int sndbuf;
+  int connect_timeout_ms;
 } tcp_sockopts_t;
+#define BROKER_CONNECT_TIMEOUT_MS 4000
 
 /* ブローカーへの connect 代行要求 (要求側と子プロセスで共有する唯一の定義) */
 typedef struct {
@@ -472,6 +523,8 @@ typedef struct {
   tcp_sockopts_t tcp_opts;
 } broker_req_t;
 
+/* family は AF_INET / AF_INET6、または AF_UNIX (起動時に設定された dnstap ソケットだけ。
+ * dnstap の再接続用)。戻り値は接続済みでブロッキングモードの fd、失敗時 -1。 */
 int broker_connect(int family, int type, struct sockaddr *addr, size_t addr_len);
 int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr_len,
                         const tcp_sockopts_t *tcp_opts);
@@ -482,7 +535,7 @@ void fast_ipv4_to_str(uint32_t ip_be, char *dst);
 uint32_t get_effective_query_log_max_qps(const server_config_t *cfg);
 void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct tm *tm_info);
 void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, zone_observatory_snapshot_t *out);
-bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname);
+bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname, uint16_t qtype);
 bool ensure_priv_dir_safe(const char *dir_buf);
 bool init_logging_channels(server_config_t *cfg);
 bool init_logging_channels_ex(server_config_t *cfg, bool hand_off);
@@ -496,7 +549,7 @@ void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_
 void *control_thread_func(void *arg);
 void *response_logger_thread_func(void *arg);
 void *query_logger_thread_func(void *arg);
-void init_async_io_pool(void);
+bool init_async_io_pool(void);
 int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS]);
 void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
 void apply_tcp_listen_opts(int fd, const server_config_t *cfg, bool verbose);
@@ -522,7 +575,7 @@ typedef struct {
   struct sockaddr_storage server_addr;
   socklen_t server_len;
   bool has_server_addr;
-  char qname[256];
+  char qname[DNS_NAME_TEXT_SIZE];
   uint16_t qtype;
   uint16_t qclass;
   bool has_edns;
@@ -544,6 +597,23 @@ typedef struct {
 
 extern async_io_pool_t g_async_io_pool;
 
+/* D-13 / O-05: 設定の再読み込みの結果。karictl reload / reconfig の応答に使う */
+typedef enum {
+  CONFIG_RELOAD_OK = 0,
+  CONFIG_RELOAD_ZONE_ERRORS, /* 設定は反映した。zones_failed 個のゾーンが読み込めなかった */
+  CONFIG_RELOAD_READ_ERROR,  /* 設定ファイルを読めない。反映していない */
+  CONFIG_RELOAD_PARSE_ERROR, /* 設定の誤り。反映していない */
+  CONFIG_RELOAD_REJECTED,    /* 設定は正しいが適用できない (detail に理由)。反映していない */
+  CONFIG_RELOAD_POSTPONED    /* 前の設定の読み手が残っている。制御スレッドが後で再試行する */
+} config_reload_status_t;
+
+typedef struct {
+  config_reload_status_t status;
+  int zones_failed;
+  char detail[384];         /* 失敗したゾーン名、または拒否の理由 */
+  char restart_needed[192]; /* O-09: 変わったが再起動まで反映されない設定 ("port, bind-address") */
+} config_reload_result_t;
+
 #ifdef KARIDNS_UNIT_TEST
 extern const char *g_config_path;
 extern int g_broker_sock;
@@ -557,13 +627,13 @@ extern int g_pid_fd;
 extern char g_pid_file_path[1024];
 extern volatile sig_atomic_t g_supervisor_should_exit;
 extern volatile sig_atomic_t g_supervisor_got_sighup;
-extern volatile sig_atomic_t g_backend_should_exit;
+extern _Atomic int g_backend_should_exit;
 
 bool enqueue_async_io_task(const async_io_task_t *task);
 void *async_io_worker_func(void *arg);
-void reload_all_zones(void);
-void perform_config_reload(void);
-void perform_config_reload_ext(bool skip_unchanged);
+config_reload_result_t reload_all_zones(void);
+config_reload_result_t perform_config_reload(void);
+config_reload_result_t perform_config_reload_ext(bool skip_unchanged);
 void escape_qname_for_log(const char *src, char *dst, size_t dst_size);
 void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_len,
                      const char *qname, uint16_t qclass, uint16_t qtype,
@@ -571,7 +641,7 @@ void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_
                      uint32_t max_qps);
 void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg,
                                zone_observatory_snapshot_t *out);
-bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname);
+bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname, uint16_t qtype);
 const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size);
 void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
 void backend_sig_handler(int sig);
@@ -594,6 +664,8 @@ extern _Atomic int g_tcp_high_water;
 extern _Atomic int g_bound_workers;
 extern _Atomic bool g_frontend_alive;
 extern _Atomic bool g_privilege_drop_complete;
+/* Backend の通常の終了 (dnstap の STOP/FINISH の後に _exit)。O-03 / O-15 */
+__attribute__((noreturn)) void backend_shutdown(int code);
 extern _Atomic bool g_qlog_circuit_broken;
 extern resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
 extern _Atomic uint64_t g_resp_log_tail;

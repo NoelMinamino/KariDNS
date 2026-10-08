@@ -241,22 +241,26 @@ else
     echo "Step 4: Fuzzer smoke run (${FUZZ_SMOKE_SECONDS:-5}s per target)"
 fi
 echo "=========================================="
-[ -x tests/fuzz/fuzz_dns_wire ] || make fuzz_all >/dev/null 2>&1
+[ -x tests/fuzz/fuzz_dns_wire ] && [ -x tests/fuzz/fuzz_dynamic_update ] || make fuzz_all >/dev/null 2>&1
 
 pids=""
+# new inputs go to a scratch directory (the first one given to libFuzzer); the corpus in git is only read
+FUZZ_NEW_DIR=$(mktemp -d "${TMPDIR:-/tmp}/kari_san_fuzz.XXXXXX")
 for target in fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_conf_parser fuzz_tsig_sign fuzz_tsig_verify \
+              fuzz_query_engine fuzz_xfr_packet fuzz_dynamic_update \
               fuzz_dag_response fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file; do
     bin="tests/fuzz/$target"
     corpus="tests/fuzz/corpus_$target"
+    [ -d "$corpus" ] || corpus="tests/fuzz/corpus"
     if [ ! -x "$bin" ]; then
         echo "  -> SKIP: $bin not built"
         continue
     fi
-    mkdir -p "$corpus"
+    mkdir -p "$FUZZ_NEW_DIR/$target"
     if [ -n "${FUZZ_RUNS:-}" ] && [ "$FUZZ_RUNS" -gt 0 ]; then
-        "$bin" -runs="$FUZZ_RUNS" -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
+        "$bin" -runs="$FUZZ_RUNS" -close_fd_mask=3 "$FUZZ_NEW_DIR/$target" "$corpus" > "fuzz_${target}.log" 2>&1 &
     else
-        "$bin" -max_total_time="${FUZZ_SMOKE_SECONDS:-5}" -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
+        "$bin" -max_total_time="${FUZZ_SMOKE_SECONDS:-5}" -close_fd_mask=3 "$FUZZ_NEW_DIR/$target" "$corpus" > "fuzz_${target}.log" 2>&1 &
     fi
     pids="$pids $target:$!"
 done
@@ -276,6 +280,7 @@ for tp in $pids; do
         fi
     fi
 done
+rm -rf "$FUZZ_NEW_DIR"
 
 echo ""
 echo "=========================================="

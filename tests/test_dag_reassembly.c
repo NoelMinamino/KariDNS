@@ -115,7 +115,24 @@ static void test_extract_l4(void) {
     frame_t r; r.n = 0; ip4(&r, 17, 20 + 8 + sizeof(dns), 0, 5, A4, B4); udp(&r, 11, 12, 8 + sizeof(dns), dns, sizeof(dns));
     assert(pcap_extract_l4(r.b, r.n, 101, &o) && o.src_port == 11);
     assert(pcap_extract_l4(r.b, r.n, 12, &o) && o.src_port == 11);
-    assert(pcap_extract_l4(r.b, r.n, 0, &o) && o.src_port == 11);
+    assert(pcap_extract_l4(r.b, r.n, 998, &o) && o.src_port == 11);
+    /* D-17: LINKTYPE_NULL (0, address family in host byte order) and LINKTYPE_LOOP (108, network byte order) */
+    {
+        static const uint8_t af_le[4][4] = { { 2, 0, 0, 0 }, { 0, 0, 0, 2 }, { 28, 0, 0, 0 }, { 0, 0, 0, 30 } };
+        frame_t nf;
+        for (int k = 0; k < 4; k++) {
+            nf.n = 0; fbytes(&nf, af_le[k], 4);
+            if (k < 2) { ip4(&nf, 17, 20 + 8 + sizeof(dns), 0, 5, A4, B4); udp(&nf, 21, 22, 8 + sizeof(dns), dns, sizeof(dns)); }
+            else { ip6(&nf, 17, 8 + sizeof(dns), A6, B6); udp(&nf, 23, 24, 8 + sizeof(dns), dns, sizeof(dns)); }
+            assert(pcap_extract_l4(nf.b, nf.n, 0, &o) && o.l4_payload_len == sizeof(dns));
+            assert(pcap_extract_l4(nf.b, nf.n, 108, &o) && o.ip_version == (k < 2 ? 4 : 6));
+        }
+        nf.n = 0; f32(&nf, 2); ip6(&nf, 17, 8 + sizeof(dns), A6, B6); udp(&nf, 1, 2, 8 + sizeof(dns), dns, sizeof(dns));
+        assert(!pcap_extract_l4(nf.b, nf.n, 0, &o));                        /* AF_INET header, IPv6 packet */
+        nf.n = 0; f32(&nf, 7); ip4(&nf, 17, 20 + 8 + sizeof(dns), 0, 5, A4, B4); udp(&nf, 1, 2, 8 + sizeof(dns), dns, sizeof(dns));
+        assert(!pcap_extract_l4(nf.b, nf.n, 108, &o));                      /* unknown address family */
+        assert(!pcap_extract_l4(r.b, r.n, 0, &o));                          /* raw IP is not a NULL frame */
+    }
     eth(&f, 0x0800, false); ip4(&f, 17, 20 + 8 + sizeof(dns), 0, 5, A4, B4); udp(&f, 13, 14, 8 + sizeof(dns), dns, sizeof(dns));
     assert(pcap_extract_l4(f.b, f.n, 999, &o) && o.src_port == 13);
     frame_t s; s.n = 0; f16(&s, 0); f16(&s, 1); f16(&s, 6);
@@ -124,6 +141,18 @@ static void test_extract_l4(void) {
     assert(pcap_extract_l4(s.b, s.n, 113, &o) && o.src_port == 15 && o.l4_payload_len == sizeof(dns));
     s.b[14] = 0x08; s.b[15] = 0x06;                                       /* SLL protocol = ARP */
     assert(!pcap_extract_l4(s.b, s.n, 113, &o));
+    /* X-48: LINKTYPE_LINUX_SLL2 (276): protocol type, reserved, ifindex, ARPHRD, packet type, address length,
+     * 8-octet address = 20 octets */
+    {
+        frame_t s2;
+        static const uint8_t mac8[8] = { 2, 0, 0, 0, 0, 1, 0, 0 };
+        s2.n = 0; f16(&s2, 0x86DD); f16(&s2, 0); f32(&s2, 3); f16(&s2, 1); f8(&s2, 0); f8(&s2, 6); fbytes(&s2, mac8, 8);
+        ip6(&s2, 17, 8 + sizeof(dns), A6, B6); udp(&s2, 17, 18, 8 + sizeof(dns), dns, sizeof(dns));
+        assert(pcap_extract_l4(s2.b, s2.n, 276, &o) && o.ip_version == 6 && o.src_port == 17 && o.l4_payload_len == sizeof(dns));
+        s2.b[0] = 0x08; s2.b[1] = 0x06;                                   /* ARP */
+        assert(!pcap_extract_l4(s2.b, s2.n, 276, &o));
+        assert(!pcap_extract_l4(s2.b, 19, 276, &o));                      /* shorter than the header */
+    }
 
     /* frames that are not DNS carriers */
     eth(&f, 0x0806, false); for (int i = 0; i < 28; i++) f8(&f, 0);                  /* ARP */

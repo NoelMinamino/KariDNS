@@ -1,0 +1,7 @@
+$ORIGIN example.
+@ IN SOA ns h 1 2 3 4 555
+$GENERATE 1-4 m$ MX "10 mail${0,2,x}"
+$GENERATE 0-3 ${0,7,n}.r 60 IN PTR h$
+$GENERATE 250-255 ${0,3,N}.u CH TXT "v\$ $$"
+$GENERATE 1-2 a\$b$ A 192.0.2.$
+$GENERATE 1-2 _s$._tcp SRV "0 5 80 t$"

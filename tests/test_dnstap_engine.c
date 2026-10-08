@@ -42,6 +42,20 @@ int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) 
     return open(path, flags);
 }
 
+/* The real broker runs in another process; the test connects directly (used by the
+ * dnstap reconnect path, O-03). */
+int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr_len,
+                        const tcp_sockopts_t *tcp_opts) {
+    (void)tcp_opts;
+    int s = socket(family, type, 0);
+    if (s < 0) return -1;
+    if (connect(s, addr, (socklen_t)addr_len) != 0) {
+        close(s);
+        return -1;
+    }
+    return s;
+}
+
 static void test_protobuf_encoders(void) {
     printf("[TEST] DNSTAP: Protobuf basic field encoding...\n");
     uint8_t buf[128];
@@ -514,6 +528,151 @@ static void test_dnstap_sender_thread(void) {
     printf("  -> dnstap sender thread passed.\n");
 }
 
+/* ---------------------------------------------------------------------------
+ * O-03: STOP/FINISH at shutdown, reconnect after a write failure, query_zone.
+ * A Frame Streams collector that serves two connections in a row: the first one
+ * is dropped after the first data frame (collector restart), the second one is
+ * kept until the sender's STOP, which is answered with FINISH.
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    int srv_fd;
+    _Atomic int connections;    /* handshakes completed */
+    _Atomic int data_frames;    /* data frames received on the second connection */
+    _Atomic bool got_stop;
+    _Atomic bool zone_seen;     /* a data frame carried query_zone = example.test. */
+} fstrm_collector_t;
+
+static const uint8_t k_zone_wire[] = "\x07" "example" "\x04" "test";   /* + the final 0 of the literal */
+
+static bool frame_has_query_zone(const uint8_t *p, size_t n) {
+    /* Message.query_zone: tag (11 << 3 | 2) = 0x5a, length 14, the wire name */
+    for (size_t i = 0; i + 2 + sizeof(k_zone_wire) <= n; i++)
+        if (p[i] == 0x5a && p[i + 1] == sizeof(k_zone_wire) && memcmp(p + i + 2, k_zone_wire, sizeof(k_zone_wire)) == 0)
+            return true;
+    return false;
+}
+
+static bool collector_handshake(int fd) {
+    uint32_t hdr[5];
+    char ct[64];
+    if (recv(fd, hdr, sizeof(hdr), MSG_WAITALL) != (ssize_t)sizeof(hdr)) return false;   /* READY */
+    uint32_t ct_len = ntohl(hdr[4]);
+    if (ct_len >= sizeof(ct) || recv(fd, ct, ct_len, MSG_WAITALL) != (ssize_t)ct_len) return false;
+    const char ct_str[] = "protobuf:dnstap.Dnstap";
+    uint32_t acc[5] = { htonl(FSTRM_CONTROL_ESCAPE), htonl(4 + 4 + 4 + 22), htonl(FSTRM_CONTROL_ACCEPT),
+                        htonl(FSTRM_CONTROL_FIELD_CONTENT_TYPE), htonl(22) };
+    send(fd, acc, sizeof(acc), 0);
+    send(fd, ct_str, 22, 0);
+    if (recv(fd, hdr, sizeof(hdr), MSG_WAITALL) != (ssize_t)sizeof(hdr)) return false;   /* START */
+    ct_len = ntohl(hdr[4]);
+    return ct_len < sizeof(ct) && recv(fd, ct, ct_len, MSG_WAITALL) == (ssize_t)ct_len;
+}
+
+static void *fstrm_collector(void *arg) {
+    fstrm_collector_t *c = arg;
+    static uint8_t frame[70000];
+    for (int conn = 1; conn <= 2; conn++) {
+        int fd = accept(c->srv_fd, NULL, NULL);
+        if (fd < 0) return NULL;
+        if (!collector_handshake(fd)) { close(fd); return NULL; }
+        atomic_fetch_add(&c->connections, 1);
+        for (;;) {
+            uint32_t len_be;
+            if (recv(fd, &len_be, 4, MSG_WAITALL) != 4) break;
+            uint32_t len = ntohl(len_be);
+            if (len == 0) {                                 /* control frame */
+                uint32_t clen_be, ctype_be;
+                if (recv(fd, &clen_be, 4, MSG_WAITALL) != 4 || recv(fd, &ctype_be, 4, MSG_WAITALL) != 4) break;
+                if (ntohl(ctype_be) == FSTRM_CONTROL_STOP) {
+                    atomic_store(&c->got_stop, true);
+                    uint32_t fin[3] = { htonl(FSTRM_CONTROL_ESCAPE), htonl(4), htonl(FSTRM_CONTROL_FINISH) };
+                    send(fd, fin, sizeof(fin), 0);
+                }
+                break;
+            }
+            if (len > sizeof(frame) || recv(fd, frame, len, MSG_WAITALL) != (ssize_t)len) break;
+            if (frame_has_query_zone(frame, len)) atomic_store(&c->zone_seen, true);
+            if (conn == 1) break;                           /* collector "restarts" */
+            atomic_fetch_add(&c->data_frames, 1);
+        }
+        close(fd);
+    }
+    return NULL;
+}
+
+static void test_zone_filler(dnstap_event_meta_t *meta, const uint8_t *wire, size_t wire_len) {
+    (void)wire;
+    (void)wire_len;
+    memcpy(meta->query_zone, k_zone_wire, sizeof(k_zone_wire));
+    meta->query_zone_len = sizeof(k_zone_wire);
+}
+
+static void test_dnstap_stop_finish_reconnect(void) {
+    printf("[TEST] DNSTAP: STOP/FINISH at shutdown, reconnect, query_zone (O-03)...\n");
+    char sock_path[128];
+    snprintf(sock_path, sizeof(sock_path), "/tmp/test_dnstap_rc_%d.sock", (int)getpid());
+    unlink(sock_path);
+    fstrm_collector_t col;
+    memset(&col, 0, sizeof(col));
+    col.srv_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(col.srv_fd >= 0);
+    struct sockaddr_un sun;
+    memset(&sun, 0, sizeof(sun));
+    sun.sun_family = AF_UNIX;
+    strncpy(sun.sun_path, sock_path, sizeof(sun.sun_path) - 1);
+    assert(bind(col.srv_fd, (struct sockaddr *)&sun, sizeof(sun)) == 0);
+    assert(listen(col.srv_fd, 4) == 0);
+    pthread_t cth;
+    assert(pthread_create(&cth, NULL, fstrm_collector, &col) == 0);
+
+    g_dnstap_sock = dnstap_connect_and_handshake(sock_path, "id", "ver");
+    assert(g_dnstap_sock >= 0);
+    atomic_store(&g_dnstap_connected, true);
+    dnstap_enable_reconnect(sock_path);
+    dnstap_set_zone_filler(test_zone_filler);
+
+    worker_ctx_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.dnstap_ring.size = 64;
+    worker.dnstap_ring.mask = 63;
+    worker.dnstap_ring.events = calloc(64, sizeof(dnstap_event_t));
+    assert(worker.dnstap_ring.events);
+    atomic_store(&g_worker_ctxs, &worker);
+    atomic_store(&g_worker_count, 1);
+
+    pthread_t sth;
+    assert(pthread_create(&sth, NULL, dnstap_sender_thread_func, NULL) == 0);
+
+    uint8_t wire[12] = {0x12, 0x34, 0x01, 0x00, 0x00, 0x00};
+    struct sockaddr_in caddr;
+    memset(&caddr, 0, sizeof(caddr));
+    caddr.sin_family = AF_INET;
+    inet_pton(AF_INET, "127.0.0.1", &caddr.sin_addr);
+    /* keep producing until the collector has seen frames on the reconnected stream
+     * (the first write after the drop may still succeed; reconnect backoff is 1 s) */
+    for (int i = 0; i < 100 && atomic_load(&col.data_frames) < 2; i++) {
+        write_dnstap_event(&worker, 1, wire, sizeof(wire), &caddr, sizeof(caddr), NULL, false, IPPROTO_UDP);
+        usleep(50000);
+    }
+    assert(atomic_load(&col.connections) == 2);   /* reconnected through the broker */
+    assert(atomic_load(&col.data_frames) >= 2);
+    assert(atomic_load(&col.zone_seen));          /* Message.query_zone (field 11) */
+
+    assert(dnstap_shutdown(DNSTAP_SHUTDOWN_WAIT_MS));
+    pthread_join(sth, NULL);                      /* the sender thread returns after FINISH */
+    assert(atomic_load(&col.got_stop));
+    assert(!atomic_load(&g_dnstap_connected) && g_dnstap_sock < 0);
+    pthread_join(cth, NULL);
+
+    dnstap_set_zone_filler(NULL);
+    atomic_store(&g_worker_ctxs, NULL);
+    atomic_store(&g_worker_count, 0);
+    free(worker.dnstap_ring.events);
+    close(col.srv_fd);
+    unlink(sock_path);
+    printf("  -> STOP/FINISH, reconnect and query_zone passed.\n");
+}
+
 int main(void) {
     /* The server installs SIG_IGN for SIGPIPE at startup (dns_server_core.c). Do the same here:
      * the write-failure tests below write to a closed socketpair peer and would otherwise
@@ -527,6 +686,7 @@ int main(void) {
     test_dnstap_rings_and_queuing();
     test_dnstap_handshake();
     test_dnstap_sender_thread();
+    test_dnstap_stop_finish_reconnect();   /* last: dnstap_shutdown() ends the sender for good */
     printf("=== All DNSTAP Engine Unit Tests PASSED ===\n");
     return 0;
 }

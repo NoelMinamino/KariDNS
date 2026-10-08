@@ -320,7 +320,16 @@ if wait_up 127.0.0.1 $PA m.test; then
     # enough queries to rotate the 1k query log several times
     j=0
     while [ $j -lt 30 ]; do answer 127.0.0.1 $PA q$j.m.test A >/dev/null; j=$((j + 1)); done
-    ls "$TMP/a/" | grep -q "q.log.0\|q.log.1" && ok "query log rotated" || echo "  note: query log not rotated"
+    # the query log is written from a ring buffer by the logger thread: give it time to flush
+    j=0
+    while [ $j -lt 25 ] && [ ! -f "$TMP/a/q.log.0" ]; do sleep 0.2; j=$((j + 1)); done
+    # "versions 2 size 1k": q.log.0 (and q.log.1) hold the older queries, nothing beyond .1 is kept
+    if [ -f "$TMP/a/q.log.0" ] && grep -q "q[0-9]*\.m\.test" "$TMP/a/q.log.0" "$TMP/a/q.log" 2>/dev/null &&
+       [ ! -f "$TMP/a/q.log.2" ] && [ "$(wc -c < "$TMP/a/q.log.0")" -le 1024 ]; then
+        ok "query log rotated (versions 2, size 1k)"
+    else
+        fail "query log not rotated as configured: $(ls -l "$TMP/a/" | tr '\n' ' ')"
+    fi
     # program zone over UDP/TCP, then enough to trip its rate limit (drop + slip)
     answer 127.0.0.1 $PA normal.prog.test A >/dev/null
     answer 127.0.0.1 $PA normal.prog.test A +tcp >/dev/null

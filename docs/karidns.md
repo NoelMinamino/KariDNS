@@ -30,12 +30,18 @@ karidns [-v | --version | -V] [-f] [-p port | -p pid_file] [-P pid_file] [-c con
    - **Manager (Supervisor) Process**: The process started by the administrator. It parses the configuration, performs the startup checks, forks the other processes and supervises them: if any child exits, all children are stopped. `SIGHUP` is forwarded to the backend.
    - **Frontend Router Processes**: Bind the privileged network sockets (UDP/TCP port 53) and dispatch network traffic to the backend workers. One router is started on hosts with up to 3 CPU cores, two on larger hosts.
    - **Backend Process**: Operates in FreeBSD Capsicum capability mode (`cap_enter(2)`). DNS packet parsing and response generation are performed by the worker threads (one or two on hosts with up to 3 cores, otherwise the number of cores minus two) without direct filesystem access or socket creation permissions. Configuration and zone files are accessed via pre-opened directory descriptors (`openat(2)` / `renameat(2)`).
-   - **Connect Broker**: A small unprivileged helper that opens the outbound TCP connections the sandboxed backend cannot create itself (for example zone transfers of secondary zones from their primary).
+   - **Connect Broker**: A small unprivileged helper that opens the outbound connections the sandboxed backend cannot create itself (zone transfers of secondary zones from their primary, forward-zone queries, and reconnecting to the dnstap collector). It starts a non-blocking `connect(2)` and hands the socket back at once; the backend waits for the connection to complete within its own time limit, so one slow server does not hold up other outbound connections. It only connects to UNIX sockets for the `dnstap` socket configured at startup.
+   - **Startup order**: user and group are looked up once, before any thread is started, and the same identity is used by all processes and for log and control-socket ownership. Control commands (`karictl`), `SIGHUP` and the control thread's timers are processed only after the backend has dropped privileges and entered capability mode.
+   - If the kernel has no `CAPABILITY_MODE` (`cap_enter(2)` fails with `ENOSYS`), the backend logs `Capsicum is not available ... running WITHOUT the capability-mode sandbox` at `LOG_CRIT` and keeps running. Any other `cap_enter(2)` failure aborts startup.
+   - **Shutdown**: on `SIGTERM`/`SIGINT`, `karictl stop`, or when the manager process goes away, the backend sends the dnstap frames that are still queued, ends the Frame Streams session (STOP / FINISH) and exits. A second signal exits at once.
 2. **Read-Copy-Update (RCU) Architecture**:
    - Zone data and configuration pointers are swapped atomically using C11 atomic operations (`memory_order_acquire` / `memory_order_release`), allowing worker threads to serve queries concurrently during zone reloads without locking.
 3. **Memory Arena Allocator (`zone_arena_t`)**:
-   - For ordinary read-only queries (e.g. standard `QUERY` lookups), dynamic memory allocations (`malloc`/`free`) are not used; stack buffers and bump-allocated memory arenas (`zone_arena_t`) are used for request handling.
-   - The exception is Dynamic Update (`RFC 2136`, OPCODE=5): applying an update clones the zone's active arena into the standby arena (`clone_zone_arena`, using `realloc`) and computes an IXFR diff (`compute_ixfr_diff`, using `malloc`) so that secondaries can be notified incrementally. This path is synchronous with the query but is inherently a write path, not the hot read path.
+   - For ordinary read-only queries (e.g. standard `QUERY` lookups) over UDP and TCP, dynamic memory allocations (`malloc`/`free`) are not used; stack buffers and bump-allocated memory arenas (`zone_arena_t`) are used for request handling. TCP connection state comes from a pool of 1000 connection contexts allocated when the backend starts (memory pages are only used once a context has been used), and each worker thread builds its TCP responses in a buffer allocated at startup.
+   - Exceptions:
+     - Dynamic Update (`RFC 2136`, OPCODE=5): applying an update clones the zone's active arena into the standby arena (`clone_zone_arena`, using `realloc`) and computes an IXFR diff (`compute_ixfr_diff`, using `malloc`) so that secondaries can be notified incrementally. This path is synchronous with the query but is inherently a write path, not the hot read path.
+     - `type forward` and `type program` zones: the query is copied to the heap and handed to a separate pool of I/O threads through a queue protected by a mutex, so that waiting for the forwarder or the program does not block a worker thread.
+     - Outgoing zone transfers (AXFR/IXFR): each transfer runs in its own thread, which receives its parameters in a heap block.
 4. **Kqueue Event Loop**:
    - Network I/O events for TCP connections and UDP sockets are managed using FreeBSD `kqueue(2)`.
 
@@ -173,11 +179,12 @@ zone "example.com" {
 - Comments: `# ...`, `// ...` and `/* ... */`.
 - Values may be quoted (`"..."`) or bare words. A single token is limited to 4096 bytes (longer tokens are truncated with a warning). The configuration file (and each included file) may be at most 256 MiB.
 - `include "file";` may appear anywhere and inserts the file in place. Relative paths are resolved against the directory of the file that contains the `include`. Includes can be nested up to 16 levels deep; circular includes are rejected.
-- Boolean values accept `yes` / `true` and `no` / `false`. For the `rate-limit` and `dnstap` flags, `1` is accepted as true as well, and any other value means false.
+- Boolean values accept `yes` / `true` / `1` and `no` / `false` / `0` (case-insensitive), in every statement, as BIND does. Any other value is a configuration error.
 - Zone names are normalized to their fully qualified form (a trailing `.` is added), so `"example.com"` and `"example.com."` are the same zone. A class after the zone name (`zone "example.com" IN { ... };`) is **not** accepted.
-- Relative file paths (zone `file`, log `file`, `pid-file`, ...) are resolved against the working directory `karidns` was started from. Use absolute paths when starting from an rc script.
+- Relative file paths (zone `file`, log `file`, `pid-file`, ...) are resolved against the working directory `karidns` was started from, including paths that contain `../`. Use absolute paths when starting from an rc script. The server opens the directories of zone and log files when it starts, before it enters the Capsicum sandbox; a zone or log file that a reload adds in a directory the server has not used before cannot be opened (the zone answers SERVFAIL and `karictl reload` / `reconfig` report it) until the next restart.
 - Unknown statements and options are skipped silently (up to the next `;` at the same block level), so a misspelled option has no effect. Use [`karicheck conf`](karicheck.md) to validate a configuration.
-- Settings that are fixed when the server starts (`port`, `bind-address`, `user`, `group`, `pid-file`, `udp-recvbuf-size`, `udp-sndbuf-size`, `tcp-window`, the `control-channel` socket path, `dnstap`, the `type program` zone processes) need a restart; a reload (`SIGHUP`, `karictl reload` / `reconfig`) applies everything else.
+- Settings that are fixed when the server starts (`port`, `bind-address`, `user`, `group`, `pid-file`, `udp-recvbuf-size`, `udp-sndbuf-size`, `tcp-window`, the `control-channel` socket path, `dnstap`, the `type program` zone processes) need a restart; a reload (`SIGHUP`, `karictl reload` / `reconfig`) applies everything else. When a reload changes one of them, the server logs a warning that names it, and `karictl` shows it as `OK (restart needed for: ...)`.
+- A reload that cannot be applied (the file cannot be read, a configuration error, a log file that cannot be opened) keeps the running configuration. A reload whose zone files fail to load applies the configuration and serves SERVFAIL for those zones; the failed zones are logged. If readers of the previous configuration are still active after 10 seconds, the reload is postponed and retried every second until it runs. `SIGHUP` signals that arrive while a reload is running are merged into one reload.
 
 ### Top-level statements
 
@@ -190,9 +197,10 @@ zone "example.com" {
 | `control-channel { ... };` | Enables the [`karictl(8)`](karictl.md) control socket. |
 | `logging { ... };` | Log channels and categories. |
 | `dnstap { ... };` | dnstap output (same block as inside `options`). |
+| `acl "<name>" { ... };` | A named address match list (see Address match lists). |
 | `include "<file>";` | Includes another file. |
 
-Duplicate zones (in the same view or at top level), duplicate views and duplicate keys (names compared case-insensitively) are rejected.
+Duplicate zones (in the same view or at top level), duplicate views, duplicate keys and duplicate `acl` names (names compared case-insensitively) are rejected.
 
 ### `options { ... }`
 
@@ -208,14 +216,18 @@ Duplicate zones (in the same view or at top level), duplicate views and duplicat
 | `tcp-mss <n>;` | not set (OS default) | 536–65495. See [TRANSPORT TUNING](#transport-tuning-tcp-mss--window-udp-payload-size). |
 | `tcp-window <size>;` | not set (OS default) | 4K–64M, `K`/`M` suffix allowed. See TRANSPORT TUNING. |
 | `udp-bufsize <n>;` | `1232` | 512–4096. Maximum UDP response size and the payload size advertised in the response OPT. See TRANSPORT TUNING. |
-| `tcp-connection-reuse yes\|no;` | `no` | Keep TCP connections open for further queries (RFC 7766). |
-| `tcp-idle-timeout <ms>;` | `10000` | Idle timeout of TCP connections in **milliseconds** (0 means the default). |
+| `tcp-connection-reuse yes\|no;` | `no` | Keep TCP connections open for further queries (RFC 7766 §6.2.1). With `no`, the connection is closed after the first response. With `yes`, pipelined queries are read and answered in the order they arrive (not concurrently, RFC 7766 §6.2.1.1 is a SHOULD), up to 16 per turn of the event loop. Any TCP connection is closed 60 s after it was opened at the latest. |
+| `tcp-initial-timeout <ms>;` | `10000` | Time in **milliseconds** a new TCP connection may take to deliver its first complete query (0 means the default). |
+| `tcp-idle-timeout <ms>;` | `10000` | Time in **milliseconds** after a complete query in which the next one must have arrived completely (0 means the default). It is not extended while only part of a message has arrived (RFC 7766 §6.2.3), so a client that sends a message a few bytes at a time is disconnected. Also the value advertised in edns-tcp-keepalive (RFC 7828). |
 | `minimal-responses yes\|no;` | `no` | Do not add glue / additional-section records. |
 | `minimal-any yes\|no;` | `no` | RFC 8482: answer `QTYPE=ANY` with a synthesized `HINFO "RFC8482" ""` record instead of all RRsets. When the query has DO=1 and the name has RRSIG records, a single RRset is returned instead (RFC 8482 §4.2). |
 | `minimal-any-ttl <seconds>;` | `86400` | TTL of the synthesized RFC 8482 `HINFO` record. |
-| `additional-from-auth yes\|in-domain\|no;` | `yes` | Whether additional-section data (glue, MX/SRV targets) is taken from the server's authoritative data. `in-domain` (alias `in-zone`) limits it to names inside the zone of the answer. Unknown values are treated as `yes` with a warning. Can be overridden per zone. |
+| `additional-from-auth yes\|in-domain\|no;` | `yes` | Whether additional-section data (glue, MX/SRV targets) is taken from the server's authoritative data. `in-domain` (alias `in-zone`) limits it to names inside the zone of the answer. Any other value is a configuration error. Can be overridden per zone. |
 | `send-extended-errors yes\|no;` | `yes` | Add Extended DNS Errors (EDE, RFC 8914) to responses of EDNS queries. |
-| `serve-stale yes\|no;` | `yes` | When a secondary zone has expired (SOA EXPIRE passed since the last successful transfer, or earlier when the server it transfers from returned a shorter EDNS EXPIRE value, RFC 7314), keep answering from the stale data. With `no` such queries get SERVFAIL with EDE 3. |
+| `notify-retries <n>;` | `5` | 0–10. How many times a NOTIFY that got no answer is sent again (RFC 1996 §3.6). Can be overridden per zone. |
+| `notify-retry-interval <seconds>;` | `60` | 1–3600. Time from sending a NOTIFY to its first retransmission, and the wait for an answer after the last one. Can be overridden per zone. |
+| `notify-retry-backoff fixed\|exponential;` | `fixed` | `fixed` keeps `notify-retry-interval` between all retransmissions; `exponential` doubles it after each one (capped at 3600 s). The defaults follow RFC 1996 §3.6 (60 s, 5 retransmissions); `notify-retry-interval 3; notify-retry-backoff exponential;` retransmits after 3, 6, 12, 24 and 48 s. Can be overridden per zone. |
+| `serve-stale yes\|no;` | `yes` | When a secondary zone has expired (SOA EXPIRE passed since the last successful transfer, or earlier when the server it transfers from returned a shorter EDNS EXPIRE value, RFC 7314), keep answering from the stale data (with EDE 3, Stale Answer). With `no` such queries get SERVFAIL with EDE 24 (Invalid Data, RFC 8914 §4.25). |
 | `nsid "<string>";` | not set | NSID (RFC 5001) value returned to queries that request it. |
 | `cookie-secret "<32 hex digits>";` | random per process | 128-bit SipHash-2-4 server cookie secret (RFC 7873 / RFC 9018). Up to 4 entries: the first creates cookies, all of them are accepted (secret rollover). Use the same secret on all servers of an anycast set. |
 | `cookie-algorithm siphash24;` | `siphash24` | The only supported algorithm (RFC 9018); any other value is an error. |
@@ -234,18 +246,36 @@ Duplicate zones (in the same view or at top level), duplicate views and duplicat
 
 ### `rate-limit { ... }` (in `options` or `zone`)
 
-A `rate-limit` block in a zone replaces the server-wide block for that zone. Rates are per client address and response class; `0` means no limit for that class.
+A `rate-limit` block in a zone replaces the server-wide block for that zone. `0` means no limit for that class. Only UDP responses are limited.
+
+Responses are counted like BIND (`lib/dns/rrl.c`): clients are grouped by address prefix (`ipv4-prefix-length`, `ipv6-prefix-length`), and within a client prefix each kind of response has its own budget per name:
+
+| Response | Counted per |
+|---|---|
+| NOERROR with data | QNAME + QTYPE + QCLASS. Answers made from a wildcard share one budget per zone (`*.<zone>`). |
+| NODATA | QNAME + QCLASS (wildcard: `*.<zone>`) |
+| NXDOMAIN | the zone (random names under one zone share one budget) |
+| Referral (delegation) | the delegation point + QCLASS |
+| Errors (SERVFAIL, REFUSED, FORMERR, ...) | the client prefix only |
+| `all-per-second` | the client prefix only, all responses |
+
+Differences from BIND: the table has a fixed size of 131072 entries (`min-table-size` / `max-table-size` are accepted and ignored); `qps-scale` is accepted and ignored; `nxdomains-per-second` and `errors-per-second` default to `0` (no limit) instead of `responses-per-second`; responses that carry a valid server cookie are limited like any other.
 
 | Option | Default | Description |
 |---|---|---|
 | `responses-per-second <n>;` | `0` | Limit for positive (NOERROR with data) responses. |
 | `nodata-per-second <n>;` | value of `responses-per-second` | Limit for NODATA responses. |
 | `nxdomains-per-second <n>;` | `0` | Limit for NXDOMAIN responses. |
+| `referrals-per-second <n>;` | value of `responses-per-second` | Limit for referrals (delegations to a child zone). |
 | `errors-per-second <n>;` | `0` | Limit for error responses. |
+| `all-per-second <n>;` | `0` | Limit for all responses to one client prefix, whatever the name. When both limits apply, this one decides. |
+| `ipv4-prefix-length <n>;` | `24` | 0–32. IPv4 clients in the same prefix share their budgets. |
+| `ipv6-prefix-length <n>;` | `56` | 0–128. IPv6 clients in the same prefix share their budgets. |
+| `qps-scale`, `min-table-size`, `max-table-size` | — | Accepted for BIND compatibility; no effect (warning). |
 | `window <seconds>;` | `15` | Accounting window (maximum 3600). |
 | `slip <n>;` | `2` | Every *n*-th limited UDP response is sent truncated (TC=1) instead of being dropped; `0` drops all. |
 | `log-only yes\|no;` | `no` | Only log what would be limited. |
-| `early-drop yes\|no;` | `no` | For `type program` zones: drop UDP queries from clients whose budget is already exhausted before the query is passed to the program. |
+| `early-drop yes\|no;` | `no` | For `type program` zones: drop UDP queries before they are passed to the program when the client's budget for a positive answer to this QNAME/QTYPE (or its `all-per-second` budget) is already exhausted. |
 | `exempt-clients { <addr/cidr>; ... };` | none | Clients that are never limited. |
 
 Negative or non-numeric values are ignored with a warning; unknown keys are ignored with a warning.
@@ -254,15 +284,17 @@ Negative or non-numeric values are ignored with a warning; unknown keys are igno
 
 | Option | Default | Description |
 |---|---|---|
-| `socket "<path>";` (alias `socket-path`) | none | UNIX socket of the Frame Streams collector (e.g. `fstrm_capture`). The connection is made once at startup. |
+| `socket "<path>";` (alias `socket-path`) | none | UNIX socket of the Frame Streams collector (e.g. `fstrm_capture`). The first connection is made at startup. When the collector goes away (or was not running at startup), the server reconnects through the connect broker, first after 1 s and then with the interval doubling up to 60 s; events produced while disconnected are dropped. The reconnection runs as the `user` karidns runs as, so that user must be allowed to connect to the socket. |
 | `identity "<string>";` | none | dnstap `identity` field. |
 | `version "<string>";` | none | dnstap `version` field. |
 | `queue-size <n>;` (alias `queue_size`) | `4096` | Entries in each worker's dnstap ring buffer (values below 64 use the default; rounded up to a power of two). |
-| `require-connect yes\|no;` | `no` | Abort startup when the collector cannot be reached (otherwise dnstap is disabled with a warning). |
+| `require-connect yes\|no;` | `no` | Abort startup when the collector cannot be reached (otherwise startup continues and the server keeps trying to connect). |
 | `log-queries yes\|no;` (alias `auth-query`) | see below | Emit `AUTH_QUERY` messages. |
 | `log-responses yes\|no;` (alias `auth-response`) | see below | Emit `AUTH_RESPONSE` messages. |
 
-When neither `log-queries` nor `log-responses` is given, both queries and responses are logged. When one of them is given, only the types set to `yes` are logged (the other one defaults to `no`). The message types are taken over on reload; the collector socket itself is connected only at startup.
+When neither `log-queries` nor `log-responses` is given, both queries and responses are logged. When one of them is given, only the types set to `yes` are logged (the other one defaults to `no`). The message types are taken over on reload; a changed `socket` path needs a restart.
+
+`AUTH_QUERY` and `AUTH_RESPONSE` messages carry `query_zone` (the zone that contains the QNAME in the client's view, looked up when the message is sent). At shutdown the queued messages are sent and the Frame Streams session is ended with STOP / FINISH.
 
 `karictl status` reports the number of truncated dnstap messages.
 
@@ -295,13 +327,13 @@ logging {
 
 | Item | Description |
 |---|---|
-| `file` | Log file. With `size`, the file is rotated when it would exceed the size: with `versions <n>` the old files are kept as `<path>.0` … `<path>.<n-1>`, without `versions` the file is truncated. With `suffix timestamp`, the file is also rotated daily and renamed to `<path>.YYYYMMDD`. |
+| `file` | Log file. With `size`, the file is rotated when it would exceed the size: with `versions <n>` the old files are kept as `<path>.0` … `<path>.<n-1>`, without `versions` the file is truncated. With `suffix timestamp`, the file is also rotated daily, and every rotation (daily or by size) renames it to `<path>.YYYYMMDD`; a second rotation on the same day uses `<path>.YYYYMMDD.1`, then `.2`, … (up to `.9999`), so no rotated file is overwritten. With `suffix timestamp` and `versions <n>`, only the `n` newest `<path>.YYYYMMDD[.N]` files are kept and older ones are deleted after each rotation, as BIND does; without `versions` (or with `versions unlimited`) none are deleted. Other files in the directory are never removed. |
 | `print-time`, `print-category`, `print-severity` | Add the timestamp, category and severity to each line (default `no`). |
 | `max-qps` | Per-channel override of `query-log-max-qps` for the `queries` category. |
 | `category queries` | Query log. |
 | `category responses` | Response log. |
 
-Only the `queries` and `responses` categories exist; other categories are ignored with a warning. Each category uses one channel (the first name in the braces), and a category that names an undefined channel is an error. Other channel options (such as BIND's `severity`) are ignored. Operational messages go to syslog (facility `daemon`).
+Only the `queries` and `responses` categories exist; other categories are ignored with a warning. A category may list several channels (`category queries { a; b; };`), but only the first one is used and the others are ignored with a warning; an empty list (`{ };`) turns the category off. A category that names an undefined channel is an error. Other channel options (such as BIND's `severity`) are ignored. Operational messages go to syslog (facility `daemon`).
 
 ### `key "<name>" { ... }`
 
@@ -310,7 +342,22 @@ Only the `queries` and `responses` categories exist; other categories are ignore
 | `algorithm "<name>";` | `hmac-md5` (also `hmac-md5.sig-alg.reg.int`), `hmac-sha1`, `hmac-sha224`, `hmac-sha256`, `hmac-sha384`, `hmac-sha512`. MD5 and SHA-1 are accepted with a deprecation warning (RFC 8945). When omitted, `hmac-sha256` is used. |
 | `secret "<base64>";` | Shared secret. Invalid base64 is an error. |
 
-Keys are referenced by `allow-transfer { key "<name>"; }`, `allow-update`, and `tsig-key`. A zone that references an undefined key in `tsig-key` or `allow-transfer` is an error. [`karictl tsig-keygen`](karictl.md) prints a new key block.
+Keys are referenced by `allow-transfer { key "<name>"; }`, `allow-update`, and `tsig-key`. Key names are domain names: references match regardless of case and of a trailing dot (`key "K1"` is referenced by `key "k1."`). A zone that references an undefined key in `tsig-key` or `allow-transfer` is an error. [`karictl tsig-keygen`](karictl.md) prints a new key block.
+
+TSIG processing (RFC 8945 §5.2, §5.3) is the same for every opcode (QUERY, NOTIFY, UPDATE) and for AXFR/IXFR. The server first checks the request's TSIG against the key that the request names (key name and algorithm); only then does it apply `allow-transfer`, `allow-update` or `masters`/`tsig-key`:
+
+| Request | Response |
+|---|---|
+| Several TSIG records, a TSIG that is not the last record, or a MAC size outside RFC 8945 §5.2.2.1 | FORMERR, no TSIG |
+| Unknown key name or algorithm | NOTAUTH, TSIG error BADKEY, unsigned (MAC size 0) with the request's key name |
+| MAC does not verify | NOTAUTH, TSIG error BADSIG, unsigned |
+| Time Signed outside the fudge | NOTAUTH, TSIG error BADTIME, signed with the request's key; Time Signed and Fudge are the client's, Other Data is the server time |
+| MAC truncated (shorter than the full hash length) | NOTAUTH, TSIG error BADTRUNC, signed. KariDNS has no setting for truncated MACs, like BIND without `digest-bits` |
+| Valid TSIG, but not allowed by the zone's access control | REFUSED, signed with the request's key |
+| Valid TSIG | The normal response, signed with the request's key |
+| No TSIG | The normal response or REFUSED, unsigned |
+
+A signed response that would not fit the client's UDP size with its TSIG is truncated (TC=1). A NOTIFY is accepted from a `masters` address and, when the zone has `tsig-key`, only when it is signed with that key. `allow-update` accepts a client whose address matches or whose request is signed with a listed key. A truncated RRL `slip` response to a signed request is signed with the request's key as well, as in BIND 9.20 (signed requests are not exempt from rate limiting).
 
 ### `control-channel { ... }`
 
@@ -329,23 +376,28 @@ Keys are referenced by `allow-transfer { key "<name>"; }`, `allow-update`, and `
 
 Views are checked in the order they are defined; the first match is used. A query from a client that matches no view is answered as if no zone matched (REFUSED). Without any `view` block, all top-level zones are placed in an implicit view that matches all clients.
 
+A zone that appears in several views is a separate zone in each view: its own file, data, additional-section glue from the other zones of the same view, wire cache settings and `program` plugin. `karictl reload <zone> <view>` reloads one view's copy. If a reload changes a zone's `type` (for example `master` to `slave`), the zone is recreated with the new type.
+
 ### Address match lists (ACLs)
 
-`allow-transfer`, `allow-update`, `match-clients` and `ecs-trusted-resolvers` take a list of entries evaluated in order; the first matching entry decides. An entry is an IPv4/IPv6 address, a CIDR prefix or `any`; a leading `!` (or a nested `! { ... };` block) negates it. A client that matches no entry is denied. In `allow-transfer` and `allow-update`, `key "<name>";` adds a TSIG key.
+`allow-transfer`, `allow-update`, `match-clients` and `ecs-trusted-resolvers` take a list of entries evaluated in order; the first matching entry decides. An entry is an IPv4/IPv6 address, a CIDR prefix, `any`, `none` (matches nothing) or the name of an `acl`; a leading `!` (or a nested `! { ... };` block) negates it. A client that matches no entry is denied. In `allow-transfer` and `allow-update`, `key "<name>";` adds a TSIG key; in `allow-update` the bare name of a defined key is accepted as well. Keys are not part of the in-order evaluation: in `allow-update` a client is accepted when its address matches **or** its request is signed with a listed key; in `allow-transfer` a list that has both addresses and keys requires a matching address **and** a listed key (unlike BIND, where `allow-transfer { key "k1"; 192.0.2.1; };` also accepts an unsigned request from 192.0.2.1). Write `allow-transfer` with keys only to accept signed requests from any address.
+
+`acl "<name>" { ... };` defines a named list with the same entries (including `key`, other `acl` names and negation). It may be defined before or after it is used. A reference works as if the list were written in place as a nested `{ ... };` block, and `!name` negates each of its entries like `! { ... };`. An `acl` that contains a `key` can be used in `allow-transfer` and `allow-update` only, and a key cannot be negated. The built-in names `any` and `none` are supported; BIND's `localhost` and `localnets` are not (list the addresses instead). Any other entry (a mistyped address, an undefined name) is a configuration error, so `karicheck conf` reports it.
 
 ### `zone "<name>" { ... }`
 
 | Option | Applies to | Description |
 |---|---|---|
-| `type <type>;` | all | `master` (alias `primary`, the default), `slave` (alias `secondary`), `forward`, or `program`. |
-| `file "<path>";` | master, slave | Zone file. For a secondary zone, the transferred zone is written there. Ignored (with a warning) for `forward` and `program` zones. |
+| `type <type>;` | all | `master` (alias `primary`, the default), `slave` (alias `secondary`), `forward`, or `program`. Case-insensitive. |
+| `file "<path>";` | master, slave | Zone file. For a secondary zone the file is optional: if it exists it is loaded at startup as the initial data, and the zone is then refreshed from the primary. Transferred data is kept in memory only and is never written to the file, so after a restart a secondary serves the file's data (or nothing) until its first transfer. Ignored (with a warning) for `forward` and `program` zones. Records whose owner is not at or below the zone name (out-of-zone data, including address records for name servers outside the zone) are not loaded; each is logged as "ignoring out-of-zone data", as BIND does (RFC 1034 §4.2). A secondary likewise skips and logs out-of-zone records received in a transfer instead of rejecting the transfer. A record that the zone file parser accepts but whose RDATA cannot be encoded for its type (for example a WKS port name that is not in the built-in service table) is also left out with a warning ("its RDATA cannot be encoded"); the rest of the zone is served and transferred. `karicheck` reports such a record as an error. |
 | `file-format bind\|tinydns;` | master | `bind` (default) or `tinydns` (djbdns `data` file). See TINYDNS ZONE FORMAT. |
-| `masters { <addr> [port <n>]; ... };` | slave, catalog | Primary servers. NOTIFY is accepted from any listed address; the refresh and transfer use the **first** entry. Port default 53. Transfer requests carry the EDNS EXPIRE option (RFC 7314); the returned value (capped by SOA EXPIRE) sets the zone's expire timer, so a secondary that transfers from another secondary expires no later than its source. |
-| `tsig-key "<name>";` | slave, master | Key used to sign SOA/AXFR/IXFR requests to the primary. On a primary it is also accepted for incoming transfers. |
-| `allow-transfer { <acl>; key "<name>"; ... };` | master, slave | Who may transfer the zone (AXFR/IXFR over TCP). **Without `allow-transfer` and `tsig-key`, transfers are refused.** If both addresses and keys are listed, a request must match an address **and** be signed with one of the keys. At most 4 transfers per zone run at the same time. |
-| `also-notify { <addr> [port <n>]; ... };` | master | Additional servers that receive NOTIFY (RFC 1996) when the zone changes. NOTIFY is also sent to the addresses of the apex NS hosts, except the SOA MNAME host (RFC 1996 §3.2). |
+| `masters { <addr> [port <n>]; ... };` | slave, catalog | Primary servers. NOTIFY is accepted from any listed address; the refresh and transfer use the **first** entry. Port default 53. Transfer requests carry the EDNS EXPIRE option (RFC 7314); the returned value (capped by SOA EXPIRE) sets the zone's expire timer, so a secondary that transfers from another secondary expires no later than its source. The refresh sends IXFR (AXFR when the zone has no data yet, or after `karictl retransfer`). Every message of the answer must carry the request's ID, QR=1 and OPCODE 0, and the first one the request's question (RFC 5936 §2.2.1); otherwise the transfer is rejected and logged. An answer with an error RCODE ends the transfer at once and is logged with the RCODE (and the TSIG error, when the primary rejected the zone's `tsig-key`); a primary that answers IXFR with FORMERR or NOTIMP is asked once more with AXFR (RFC 1995 §4). |
+| `tsig-key "<name>";` | slave, master | Key used to sign SOA/AXFR/IXFR requests to the primary. On a primary it is also accepted for incoming transfers. Outgoing NOTIFY messages of the zone are signed with it. |
+| `allow-transfer { <acl>; key "<name>"; ... };` | master, slave | Who may transfer the zone (AXFR/IXFR over TCP). **Without `allow-transfer` and `tsig-key`, transfers are refused.** If both addresses and keys are listed, a request must match an address **and** be signed with one of the keys. At most 4 transfers per zone run at the same time. The first message of an answer carries an OPT when the request had one (RFC 5936 §2.2.5). An IXFR request needs the client's SOA in the Authority section (RFC 1995 §3), otherwise it gets FORMERR; a client whose serial is the same as or newer than the zone's (RFC 1982 comparison) gets the current SOA only (RFC 1995 §2), also over UDP. A transfer request for a zone that has no data yet (a secondary before its first transfer) gets SERVFAIL with EDE 14 (Not Ready). |
+| `also-notify { <addr> [port <n>]; ... };` | master | Additional servers that receive NOTIFY (RFC 1996) when the zone changes. NOTIFY is also sent to the addresses of the apex NS hosts, except the SOA MNAME host (RFC 1996 §3.2). NOTIFY is sent after an UPDATE, after `karictl notify`, after a reload (`karictl reload`, `reconfig`, SIGHUP) that changed the zone's serial (not at the first load at startup), and by a secondary after each transfer. Each NOTIFY goes over UDP from the listening socket and is retransmitted until the server answers with the same ID and QNAME from the address and port it was sent to (RFC 1996 §3.6); see `notify-retries`. When the zone has `tsig-key`, every NOTIFY is signed with that key and only an answer whose TSIG verifies stops the retransmission (RFC 8945 §5.4); answers that fail verification are logged and ignored. A NOTIFY that gets no answer after the last retransmission is logged ("no answer from ... giving up"). |
+| `notify-retries <n>;`, `notify-retry-interval <seconds>;`, `notify-retry-backoff fixed\|exponential;` | master, slave | Per-zone override of the `options` values below. |
 | `notify-source "<addr>";` | master | Source address of outgoing NOTIFY messages. |
-| `allow-update { <acl>; key "<name>"; ... };` | master | Enables Dynamic Update (RFC 2136) for matching clients or TSIG keys. Updates are kept in memory only. On a secondary zone, updates are rejected with NOTAUTH (a warning is printed at load time). |
+| `allow-update { <acl>; key "<name>"; ... };` | master | Enables Dynamic Update (RFC 2136) for matching clients or TSIG keys. Updates are kept in memory only. An update sent to a secondary zone is answered with REFUSED (EDE 18) whether or not the client matches `allow-update`: KariDNS does not forward updates to the primary (RFC 2136 §6); a warning is printed at load time. Processing follows RFC 2136 §3: an update whose zone section does not name a zone of the client's view gets NOTAUTH; update RRs that §3.4.2 says to ignore (a CNAME next to other data or other data next to a CNAME, an SOA whose serial is not newer, deletion of the apex SOA, of the apex NS RRset or of the last apex NS) are ignored and the rest of the update is applied; an error anywhere leaves the zone unchanged. An update that replaces the SOA with a newer serial keeps that serial; any other change increments the serial by one. An update that changes nothing (only prerequisites, or only ignored or already present records) answers NOERROR without changing the serial or sending NOTIFY. |
 | `catalog-zone yes;` | master, slave | Marks the zone as a catalog zone (RFC 9432, schema version 2: `version.<zone> TXT "2"` is required). Member zones listed under `zones.<zone>` are served as secondary zones that transfer from the catalog zone's first `masters` entry. |
 | `rate-limit { ... };` | all | Per-zone RRL block (replaces the server-wide one). |
 | `ecs-tags { ... };`, `location-tags { ... };` | master, slave | Per-zone tag definitions. |
@@ -354,7 +406,7 @@ Views are checked in the order they are defined; the first match is used. A quer
 | `disable-auto-tc-flag yes\|no;` | program | See PROGRAM ZONE PLUGINS. Any other value is an error. |
 | `zone-tcp-mss`, `zone-tcp-window`, `zone-tcp-sndbuf`, `zone-udp-bufsize` | all | Per-zone transport settings; see TRANSPORT TUNING. |
 | `forwarders { <addr> [port <n>]; ... };` | forward | Upstream servers; see FORWARD ZONES. |
-| `forward-timeout <ms>;` | forward | Total time budget in milliseconds (default 2000). |
+| `forward-timeout <ms>;` | forward | Total time budget in milliseconds (default 2000), shared by the forwarders: each one gets the remaining time divided by the number of forwarders not tried yet. |
 | `program "<path>";`, `program-args { "<arg>"; ... };`, `program-user "<user>";`, `program-timeout <ms>;`, `program-max-failures <n>;` | program | See PROGRAM ZONE PLUGINS. |
 
 ---
@@ -500,11 +552,38 @@ zone "corp.example.com." {
 
 > [!NOTE]
 > **Forward Zone Processing Semantics:**
-> - **Transparent Query Relaying**: KariDNS does not maintain zone resource records locally for forward zones. Incoming queries matching the zone are forwarded to the configured `forwarders` list in order, failing over to the next forwarder within the shared `forward-timeout` budget.
+> - **Transparent Query Relaying**: KariDNS does not maintain zone resource records locally for forward zones. Incoming queries matching the zone are forwarded to the configured `forwarders` list in order, failing over to the next forwarder within the shared `forward-timeout` budget. Each forwarder gets the remaining time divided by the number of forwarders not tried yet (with two forwarders and the default 2000 ms: 1000 ms each, the second one also gets what the first one did not use). A reply whose ID, QR bit or question does not match is discarded and the wait for that forwarder continues (RFC 5452 §9.1). The fallback to TCP after a truncated reply, including its connection setup, uses the time that is still left.
 > - **No Subprocess Overhead**: Unlike `type program` zones, forward zones do not spawn external processes and do not require global opt-in flags like `allow-program-zones`.
 > - **Immediate Reload Support**: Changes to `forwarders` or `forward-timeout` take effect immediately upon configuration reload (`SIGHUP` / `karictl reload`) without requiring a full server restart.
 > - **Unsupported Operations**: Dynamic Update (RFC 2136), Zone Transfer (`AXFR`/`IXFR`), and `NOTIFY` requests are not supported on forward zones and are rejected with `NOTIMP`.
 > - **Security & Transaction ID Randomization**: When relaying to upstream forwarders, KariDNS assigns a fresh cryptographic random transaction ID (`arc4random`) and verifies that the upstream response Question section and ID match before relaying the answer with the client's original transaction ID restored.
+
+---
+
+## ZONE FILE FORMAT
+
+The default `file-format` is the master file format of RFC 1035 §5 as BIND reads it.
+
+- **Records**: `<owner> [<TTL>] [<class>] <type> <RDATA>`; TTL and class may appear in either order, each once.
+  Type and class mnemonics are case-insensitive (`in a`, `IN Mx`). Unknown types and classes use the RFC 3597
+  forms `TYPEnn`, `CLASSnn` and `\# <length> <hex>`.
+- **Classes**: `IN` (the default when the class is omitted), `CH`, `HS` and `CLASSnn` are kept with the record. The
+  server answers queries of class IN and CH; records of other classes are loaded but not answered (queries of
+  those classes are REFUSED). `NONE`, `ANY`, `CLASS0` and class 65302 (used internally by KariDNS) are errors.
+- **Omitted TTL** (same order as BIND): the TTL on the record; else `$TTL` (RFC 2308 §4); else the last TTL
+  written explicitly on a record (RFC 1035 §5.1, also across `$INCLUDE`); else, for an SOA record, its MINIMUM
+  field, which then acts like `$TTL`; else 3600 (BIND rejects such a zone).
+- **TTL values** above 2147483647 are served as 2147483647 (RFC 8767 §4); this also applies to records received
+  by zone transfer.
+- **`$ORIGIN <name>`** and the origin argument of **`$INCLUDE <file> [<origin>]`**: a name without a trailing dot
+  is relative to the current origin (RFC 1035 §5.1). `$INCLUDE` does not change the origin of the including file.
+- **`$GENERATE <range> <lhs> [<TTL>] [<class>] <type> <rhs>`** (BIND syntax): `<range>` is `start-stop[/step]`
+  (at most 100,000 records). For each value, `$` in `<lhs>` and `<rhs>` is replaced by the value,
+  `${offset[,width[,base]]}` with base `d`, `o`, `x`, `X`, `n` or `N` (`n`/`N`: nibbles in reverse order separated
+  by dots, as for `ip6.arpa`; the width counts the dots), `$$` gives `$` and `\$` a literal `$`. Any RR type can be
+  generated; the resulting line is read like any other record line, so `$ECS-SUBNET`/`$LOCATION` tags and the TTL
+  rules apply. `<rhs>` is one field: quote RDATA that contains spaces, e.g.
+  `$GENERATE 1-10 host$ MX "10 mail$"`.
 
 ---
 
@@ -537,6 +616,20 @@ correctly without duplicate records).
 >   127-byte TXT character-string chunking, and the same lenient IPv4
 >   octet parsing (no range validation, trailing garbage tolerated) as
 >   the original `tinydns-data`.
+> - **Extensions** (not in djbdns 1.05). Empty numeric fields are 0; the
+>   default TTL is 86400; `timestamp` and `lo` work as for the other types:
+>   - `3fqdn:ip6:ttl:timestamp:lo`: AAAA. `ip6` is 32 hex digits without
+>     colons (e.g. `20010db8000000000000000000000001`).
+>   - `6fqdn:ip6:ttl:timestamp:lo`: AAAA plus PTR records under `ip6.arpa`
+>     and `ip6.int`.
+>   - `Sfqdn:ip:x:port:weight:priority:ttl:timestamp:lo`: SRV with target
+>     `x` (a full name, no expansion), plus an A record for `x` when `ip`
+>     is given.
+>   - `Nfqdn:order:pref:flags:service:regexp:replacement:ttl:timestamp:lo`:
+>     NAPTR. `flags`, `service` and `regexp` take the octal escapes of `:`
+>     records.
+>   - `_fqdn:algorithm:fptype:fingerprint:ttl:timestamp:lo`: SSHFP with a
+>     hex fingerprint; a line whose fingerprint is not valid hex is skipped.
 > - **`timestamp` field**: Supported with **real-time query evaluation**,
 >   identical to original djbdns behavior. A record whose `timestamp` is in
 >   the future is excluded dynamically on every query (not just at load time).

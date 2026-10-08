@@ -221,9 +221,6 @@ static void test_snapshot_rcu_lifecycle_and_suffix_lookup(void) {
     assert(dst.bind_ecs_tag_count == 1);
     assert(dst.bind_ecs_trusted_resolver_count == 1);
 
-    // Test wait_for_readers on dst (reader_count = 0)
-    wait_for_readers(&dst);
-
     zone_arena_clear_data_pools(&dst);
     zone_arena_destroy(&src);
     zone_arena_destroy(&dst);
@@ -300,4 +297,12 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr
                         const tcp_sockopts_t *tcp_opts) {
     (void)tcp_opts;
     return broker_connect(family, type, addr, addr_len);
+}
+
+/* send_tcp_dns_message(): goes through the send_tcp_robust() mock above (length prefix, then message) */
+ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len) {
+    uint8_t prefix[2] = {(uint8_t)(len >> 8), (uint8_t)(len & 0xFF)};
+    if (send_tcp_robust(fd, prefix, 2) < 0) return -1;
+    if (send_tcp_robust(fd, msg, len) < 0) return -1;
+    return (ssize_t)len;
 }

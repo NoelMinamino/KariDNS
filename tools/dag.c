@@ -27,6 +27,9 @@
 
 
 bool g_dag_suppress_stdout = false;
+size_t g_dag_pseudo_opt_off = SIZE_MAX; /* print_response(): offset of the OPT pseudo-RR */
+uint16_t g_dag_rdata_class = 1;          /* class of the record being formatted (CH A has its own layout) */
+bool g_dag_show_stray_opt = false;     /* print_response(): print other OPT records as records */
 /* ========================================================================
  * 1. Arena (dag only ever bump-allocates scratch strings; never freed)
  * ==================================================================== */
@@ -77,7 +80,7 @@ void reset_dag_arena(void) {
  * ==================================================================== */
 const char *get_ede_error_string(uint16_t code) {
     switch (code) {
-        case 0: return "Other Error";
+        case 0: return "Other";
         case 1: return "Unsupported DNSKEY Algorithm";
         case 2: return "Unsupported DS Digest Type";
         case 3: return "Stale Answer";
@@ -96,18 +99,14 @@ const char *get_ede_error_string(uint16_t code) {
         case 16: return "Censored";
         case 17: return "Filtered";
         case 18: return "Prohibited";
-        case 19: return "Stale NXDomain Answer";
+        case 19: return "Stale NXDOMAIN Answer";
         case 20: return "Not Authoritative";
         case 21: return "Not Supported";
         case 22: return "No Reachable Authority";
         case 23: return "Network Error";
         case 24: return "Invalid Data";
-        case 25: return "Signature Expired before Valid";
-        case 26: return "Too Early";
-        case 27: return "Unsupported NSEC3 Iterations Value";
-        case 28: return "Unable to conform to policy";
-        case 29: return "Synthesized";
-        default: return "Unassigned";
+        /* dig 9.20 names codes 0-24 only; later ones are printed by number ("; EDE: 25: (text)") */
+        default: return NULL;
     }
 }
 
@@ -161,15 +160,10 @@ KARIDNS_TOOL_FN bool is_known_qtype(const char *s) {
     return resolve_qtype(s, NULL);
 }
 
+/* X-49: like dig, "TYPE<n>" is a type only for n <= 65535 (RFC 3597 §5); "TYPE65536" is a domain name */
 KARIDNS_TOOL_FN bool is_qtype_syntax_or_known(const char *s) {
     if (!s) return false;
-    if (is_known_qtype(s)) return true;
-    if (strncasecmp(s, "TYPE", 4) == 0 && isdigit((unsigned char)s[4])) {
-        const char *p = s + 4;
-        while (*p && isdigit((unsigned char)*p)) p++;
-        if (*p == '\0') return true;
-    }
-    return false;
+    return is_known_qtype(s);
 }
 
 int parse_qtype(const char *s) {
@@ -274,25 +268,78 @@ const char *rcode_name(uint16_t rcode) {
         case 0: return "NOERROR"; case 1: return "FORMERR"; case 2: return "SERVFAIL";
         case 3: return "NXDOMAIN"; case 4: return "NOTIMP"; case 5: return "REFUSED";
         case 6: return "YXDOMAIN"; case 7: return "YXRRSET"; case 8: return "NXRRSET";
-        case 9: return "NOTAUTH"; case 10: return "NOTZONE"; case 11: return "DSOTYPENI";
-        case 16: return "BADVERS/BADSIG"; case 17: return "BADKEY";
-        case 18: return "BADTIME"; case 19: return "BADMODE"; case 20: return "BADNAME";
-        case 21: return "BADALG"; case 22: return "BADTRUNC"; case 23: return "BADCOOKIE";
+        case 9: return "NOTAUTH"; case 10: return "NOTZONE";
+        /* dig 9.20 (BIND dns_rcode_totext): 11-15 are RESERVEDn, the extended RCODE 16 is BADVERS,
+         * 23 BADCOOKIE, other values "?N". TSIG error names are for the TSIG RR only (tsig_rcode_name()). */
+        case 11: case 12: case 13: case 14: case 15: {
+            static _Thread_local char rbuf[32];
+            snprintf(rbuf, sizeof(rbuf), "RESERVED%u", (unsigned int)rcode);
+            return rbuf;
+        }
+        case 16: return "BADVERS"; case 23: return "BADCOOKIE";
         default: {
             static _Thread_local char buf[32];
-            snprintf(buf, sizeof(buf), "%u", (unsigned int)rcode);
+            snprintf(buf, sizeof(buf), "?%u", (unsigned int)rcode);
             return buf;
         }
     }
+}
+
+/* TSIG RR の Error フィールド (RFC 8945 §3; 16 は BADSIG, RFC 6895 §2.3) */
+const char *tsig_rcode_name(uint16_t error) {
+    switch (error) {
+        case 16: return "BADSIG"; case 17: return "BADKEY"; case 18: return "BADTIME";
+        case 19: return "BADMODE"; case 20: return "BADNAME"; case 21: return "BADALG";
+        case 22: return "BADTRUNC";
+        default: return rcode_name(error);
+    }
+}
+
+/* tsig_verify_packet() の結果を dig と同じ文で出す (";; Couldn't verify signature: <isc_result_totext>")。
+ * サーバが TSIG の Error を立てて返した応答 (RFC 8945 §5.3.2 の BADSIG/BADKEY、§5.2.3 の BADTIME) は
+ * "tsig indicates error"、こちらで MAC や鍵が合わなければ "tsig verify failure"、時刻のずれは
+ * "clocks are unsynchronized"、TSIG がなければ "expected a TSIG or SIG(0)"。 */
+void print_tsig_verify_error(int err, const uint8_t *resp, size_t n) {
+    if (err == 0) return;
+    const char *why;
+    tsig_rr_t rr;
+    if (err == -1) why = "expected a TSIG or SIG(0)";
+    else if (err == TSIG_VERIFY_FORMERR) why = "FORMERR";
+    else if (resp && tsig_parse_rr(resp, n, &rr) > 0 && rr.error != 0) why = "tsig indicates error";
+    else if (err == 18) why = "clocks are unsynchronized";
+    else why = "tsig verify failure";
+    printf(";; Couldn't verify signature: %s\n", why);
+    fflush(stdout);
+}
+
+/* BIND の dns_ttl_totext(verbose) と同じ表記: "2 weeks", "1 day 1 hour 1 minute 1 second", "0 seconds"。
+ * dig は EDNS EXPIRE (RFC 7314) の値をこの形で括弧内/YAML コメントに出す。 */
+const char *format_duration_text(uint32_t secs, char *buf, size_t buf_size) {
+    static const struct { uint32_t len; const char *unit; } units[] = {
+        { 604800, "week" }, { 86400, "day" }, { 3600, "hour" }, { 60, "minute" }, { 1, "second" }
+    };
+    size_t used = 0;
+    if (buf_size == 0) return buf;
+    buf[0] = '\0';
+    for (size_t i = 0; i < sizeof(units) / sizeof(units[0]); i++) {
+        uint32_t n = secs / units[i].len;
+        secs %= units[i].len;
+        if (n == 0) continue;
+        int w = snprintf(buf + used, buf_size - used, "%s%u %s%s", used ? " " : "", n, units[i].unit, n == 1 ? "" : "s");
+        if (w < 0 || (size_t)w >= buf_size - used) break;
+        used += (size_t)w;
+    }
+    if (used == 0) snprintf(buf, buf_size, "0 seconds");
+    return buf;
 }
 
 const char *opcode_name(uint8_t opcode) {
     switch (opcode) {
         case 0: return "QUERY"; case 1: return "IQUERY"; case 2: return "STATUS";
         case 4: return "NOTIFY"; case 5: return "UPDATE";
-        default: {
+        default: { /* dig: RESERVED3, RESERVED6 ... */
             static _Thread_local char buf[32];
-            snprintf(buf, sizeof(buf), "%u", (unsigned int)opcode);
+            snprintf(buf, sizeof(buf), "RESERVED%u", (unsigned int)opcode);
             return buf;
         }
     }
@@ -384,7 +431,7 @@ KARIDNS_TOOL_FN void decode_type_bitmap(const uint8_t *bitmap, size_t bitmap_len
                 if (b & (0x80 >> bit)) {
                     uint16_t type_code = (window << 8) | (byte_idx * 8 + bit);
                     char tbuf[32];
-                    const char *tname = format_type_name(type_code, tbuf, sizeof(tbuf));
+                    const char *tname = dag_type_name(type_code, tbuf, sizeof(tbuf));
                     if (out_len >= out_cap) return;
                     int n = snprintf(out + out_len, out_cap - out_len, "%s%s",
                                       (out_len > 0) ? " " : "", tname);
@@ -483,13 +530,13 @@ KARIDNS_TOOL_FN void sink_split_hex(rdata_sink_t *sink, const uint8_t *data, siz
 
 KARIDNS_TOOL_FN void sink_multiline_hex(rdata_sink_t *sink, const uint8_t *data, size_t len, int split_width) {
     if (len == 0) {
-        sink_printf(sink, "\t\t\t\t\t )\n");
+        sink_printf(sink, "\t\t\t\t )\n");
         return;
     }
     int sw = (split_width > 0) ? (split_width / 2) : 22;
     if (sw <= 0) sw = 22;
     for (size_t i = 0; i < len; ) {
-        sink_printf(sink, "\t\t\t\t\t");
+        sink_printf(sink, "\t\t\t\t");
         size_t chunk = (len - i) < (size_t)sw ? (len - i) : (size_t)sw;
         for (size_t j = 0; j < chunk; j++) sink_printf(sink, "%02X", data[i + j]);
         i += chunk;
@@ -500,13 +547,13 @@ KARIDNS_TOOL_FN void sink_multiline_hex(rdata_sink_t *sink, const uint8_t *data,
 
 KARIDNS_TOOL_FN void sink_multiline_b64(rdata_sink_t *sink, const char *b64, int len, int split_width) {
     if (len == 0) {
-        sink_printf(sink, "\t\t\t\t\t )\n");
+        sink_printf(sink, "\t\t\t\t )\n");
         return;
     }
     int sw = (split_width > 0) ? split_width : 44;
     if (sw <= 0) sw = 44;
     for (int i = 0; i < len; ) {
-        sink_printf(sink, "\t\t\t\t\t");
+        sink_printf(sink, "\t\t\t\t");
         int chunk = (len - i) < sw ? (len - i) : sw;
         sink_printf(sink, "%.*s", chunk, b64 + i);
         i += chunk;
@@ -515,7 +562,63 @@ KARIDNS_TOOL_FN void sink_multiline_b64(rdata_sink_t *sink, const char *b64, int
     }
 }
 
-KARIDNS_TOOL_FN void sink_dnskey_like(rdata_sink_t *sink, const uint8_t *rdata, size_t rdlen, const display_opts_t *dopt) {
+/* +multiline の不透明データ (dig と同じ): "( " に続けて最初の 22 オクテットを同じ行に置き、残りは字下げした行、
+ * 最後に " )"。RFC 3597 汎用形式、EID、NIMLOC など。 */
+KARIDNS_TOOL_FN void sink_multiline_hex_inline(rdata_sink_t *sink, const uint8_t *data, size_t len, int split_width) {
+    size_t sw = (split_width > 0) ? (size_t)split_width / 2 : 22;
+    if (sw == 0) sw = 22;
+    sink_printf(sink, "( ");
+    for (size_t i = 0; i < len; ) {
+        if (i > 0) sink_printf(sink, "\n\t\t\t\t");
+        size_t chunk = (len - i) < sw ? (len - i) : sw;
+        for (size_t j = 0; j < chunk; j++) sink_printf(sink, "%02X", data[i + j]);
+        i += chunk;
+    }
+    sink_printf(sink, " )");
+}
+
+/* X-40: DHCID/OPENPGPKEY の +multiline (dig と同じ): "( " の直後に最初の base64、続きは RDATA の列まで字下げ、最後に " )" */
+KARIDNS_TOOL_FN void sink_multiline_b64_paren(rdata_sink_t *sink, const char *b64, int len, int split_width) {
+    int sw = (split_width > 0) ? split_width : 44;
+    sink_printf(sink, "( ");
+    for (int i = 0; i < len; ) {
+        if (i > 0) sink_printf(sink, "\n\t\t\t\t");
+        int chunk = (len - i) < sw ? (len - i) : sw;
+        sink_printf(sink, "%.*s", chunk, b64 + i);
+        i += chunk;
+    }
+    sink_printf(sink, " )");
+}
+
+/* RFC 3597 §5 汎用形式 "\# <rdlen> <hex>" (+multiline では dig と同じく括弧で囲む) */
+KARIDNS_TOOL_FN void sink_generic_rdata(rdata_sink_t *sink, const uint8_t *data, uint16_t rdlen, const display_opts_t *dopt) {
+    sink_printf(sink, "\\# %u", rdlen);
+    if (rdlen == 0) return;
+    sink_printf(sink, " ");
+    if (dopt && !dopt->yaml && dopt->multiline) {
+        sink_multiline_hex_inline(sink, data, rdlen, dopt->split_width);
+    } else {
+        sink_split_hex(sink, data, rdlen, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
+    }
+}
+
+/* HHIT/BRID の +multiline (dig と同じ): " (" の直後から base64 を 44 文字ずつ */
+KARIDNS_TOOL_FN void sink_multiline_b64_inline(rdata_sink_t *sink, const char *b64, int len, int split_width) {
+    int sw = (split_width > 0) ? split_width : 44;
+    sink_printf(sink, " (");
+    for (int i = 0; i < len; ) {
+        if (i > 0) sink_printf(sink, "\n\t\t\t\t");
+        int chunk = (len - i) < sw ? (len - i) : sw;
+        sink_printf(sink, "%.*s", chunk, b64 + i);
+        i += chunk;
+    }
+    sink_printf(sink, " )");
+}
+
+/* DNSKEY/CDNSKEY/KEY/RKEY. 鍵の注釈は dig と同じ: DNSKEY/CDNSKEY は "; KSK;"/"; ZSK;" を付け、KEY/RKEY は付けない。
+ * +multiline では +norrcomments を明示しない限り注釈を出す (dig の +multiline は +rrcomments を含む)。 */
+KARIDNS_TOOL_FN void sink_dnskey_like(rdata_sink_t *sink, const uint8_t *rdata, size_t rdlen, const display_opts_t *dopt,
+                                      bool zone_key) {
     if (rdlen < 4) { sink_printf(sink, "(malformed)"); return; }
     uint16_t flags = (rdata[0]<<8)|rdata[1];
     uint8_t protocol = rdata[2];
@@ -534,16 +637,29 @@ KARIDNS_TOOL_FN void sink_dnskey_like(rdata_sink_t *sink, const uint8_t *rdata, 
     if (!b64) { sink_printf(sink, "(oom)"); return; }
 
     if (dopt && !dopt->yaml && dopt->multiline) {
+        bool comments = dopt->rrcomments_set ? dopt->rrcomments : true;
         sink_printf(sink, "%u %u %u (\n", flags, protocol, algorithm);
-        sink_multiline_b64(sink, b64, n, dopt->split_width);
-        if (dopt->rrcomments) {
-            sink_printf(sink, " ; %s; alg = %s ; key id = %u", is_ksk ? "KSK" : "ZSK", alg_name, keytag);
+        if (!comments) {
+            sink_multiline_b64(sink, b64, n, dopt->split_width);
+        } else {
+            int sw = (dopt->split_width > 0) ? dopt->split_width : 44;
+            for (int i = 0; i < n; ) {
+                int chunk = (n - i) < sw ? (n - i) : sw;
+                sink_printf(sink, "\t\t\t\t%.*s\n", chunk, b64 + i);
+                i += chunk;
+            }
+            if (zone_key) {
+                sink_printf(sink, "\t\t\t\t) ; %s; alg = %s ; key id = %u", is_ksk ? "KSK" : "ZSK", alg_name, keytag);
+            } else {
+                sink_printf(sink, "\t\t\t\t); alg = %s ; key id = %u", alg_name, keytag);
+            }
         }
     } else {
         sink_printf(sink, "%u %u %u ", flags, protocol, algorithm);
         sink_split_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
         if (dopt && !dopt->yaml && dopt->rrcomments) {
-            sink_printf(sink, "  ; %s; alg = %s ; key id = %u", is_ksk ? "KSK" : "ZSK", alg_name, keytag);
+            if (zone_key) sink_printf(sink, "  ; %s; alg = %s ; key id = %u", is_ksk ? "KSK" : "ZSK", alg_name, keytag);
+            else sink_printf(sink, " ; alg = %s ; key id = %u", alg_name, keytag);
         }
     }
     free(b64);
@@ -622,7 +738,7 @@ KARIDNS_TOOL_FN void sink_nsec3_params(rdata_sink_t *sink, const uint8_t *rdata,
         char types_buf[512];
         decode_type_bitmap(&rdata[pos], rdlen - pos, types_buf, sizeof(types_buf));
         if (dopt && !dopt->yaml && dopt->multiline) {
-            sink_printf(sink, "%u %u %u %s (\n\t\t\t\t\t%s\n\t\t\t\t\t%s )", hash_alg, flags, iterations, salt_hex, hash_b32, types_buf);
+            sink_printf(sink, "%u %u %u %s (\n\t\t\t\t%s\n\t\t\t\t%s )", hash_alg, flags, iterations, salt_hex, hash_b32, types_buf);
         } else {
             sink_printf(sink, "%u %u %u %s %s %s", hash_alg, flags, iterations, salt_hex, hash_b32, types_buf);
         }
@@ -729,6 +845,35 @@ KARIDNS_TOOL_FN void sink_svcparams(rdata_sink_t *sink, const uint8_t *rdata, si
     }
 }
 
+/* 表示用の名前展開。共有の正規形 (dns_label_to_text: '.' '\' と 0x21-0x7E 外だけをエスケープ) に加えて、
+ * dig (BIND dns_name_totext) と同じく '"' '(' ')' ';' '@' '$' の前にも '\' を置く (X-14)。
+ * 正規形は比較やハッシュに使うので変えず、表示する箇所だけがこれを使う。 */
+int dag_expand_name(const uint8_t *pkt, size_t pkt_len, size_t off, size_t *next, zone_arena_t *arena, char **out) {
+    char canon[DNS_NAME_TEXT_SIZE];
+    if (expand_wire_name_to_buffer(pkt, pkt_len, off, next, canon, sizeof(canon)) < 0) return -1;
+    char disp[DNS_NAME_TEXT_SIZE];
+    size_t w = 0;
+    for (size_t i = 0; canon[i] != '\0'; i++) {
+        if (w + 3 > sizeof(disp)) return -1;
+        if (canon[i] == '\\') {
+            /* 既存のエスケープ (\. \\ \DDD) はそのまま写す */
+            size_t n = (canon[i + 1] >= '0' && canon[i + 1] <= '9') ? 4 : 2;
+            if (w + n + 1 > sizeof(disp)) return -1;
+            for (size_t k = 0; k < n && canon[i + k] != '\0'; k++) disp[w++] = canon[i + k];
+            i += n - 1;
+            continue;
+        }
+        if (strchr("\"();@$", canon[i])) disp[w++] = '\\';
+        disp[w++] = canon[i];
+    }
+    disp[w] = '\0';
+    char *dst = arena_alloc(arena, w + 1);
+    if (!dst) return -1;
+    memcpy(dst, disp, w + 1);
+    if (out) *out = dst;
+    return 0;
+}
+
 KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                                 size_t abs_offset, uint16_t rdlen,
                                 rdata_sink_t *sink, const display_opts_t *dopt) {
@@ -737,17 +882,22 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
         return;
     }
     if (dopt && dopt->force_unknown_format) {
-        sink_printf(sink, "\\# %u", rdlen);
-        if (rdlen > 0) {
-            sink_printf(sink, " ");
-            int sw = (dopt && dopt->split_width > 0) ? dopt->split_width : 0;
-            sink_split_hex(sink, &pkt[abs_offset], rdlen, sw);
-        }
+        sink_generic_rdata(sink, &pkt[abs_offset], rdlen, dopt);
         return;
     }
 
     switch (type) {
         case 1: { // A
+            if (g_dag_rdata_class == 3) {
+                /* Chaosnet A (class CH, as BIND ch/a_1.c prints it): a domain name and a 16-bit address in octal */
+                char *name = NULL; size_t next;
+                if (rdlen >= 3 && dag_expand_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &name) == 0 &&
+                    next + 2 == abs_offset + rdlen) {
+                    sink_printf(sink, "%s %o", name, (unsigned)((pkt[next] << 8) | pkt[next + 1]));
+                    return;
+                }
+                break;
+            }
             if (rdlen == 4) {
                 sink_printf(sink, "%d.%d.%d.%d",
                             pkt[abs_offset], pkt[abs_offset+1], pkt[abs_offset+2], pkt[abs_offset+3]);
@@ -775,7 +925,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
         }
         case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: case 39: { // NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR, DNAME
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &name) == 0 &&
+            if (dag_expand_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &name) == 0 &&
                 next <= abs_offset + rdlen) {
                 sink_printf(sink, "%s", name);
             } else {
@@ -787,7 +937,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
             if (rdlen < 3) { sink_printf(sink, "(malformed MX)"); return; }
             uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0 &&
+            if (dag_expand_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0 &&
                 next <= abs_offset + rdlen) {
                 sink_printf(sink, "%u %s", pref, name);
             } else {
@@ -797,12 +947,12 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
         }
         case 6: { // SOA
             char *mname = NULL, *rname = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &mname) != 0) {
+            if (dag_expand_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &mname) != 0) {
                 sink_printf(sink, "(unparsable SOA)");
                 return;
             }
             size_t after_mname = next;
-            if (expand_wire_name(pkt, pkt_len, after_mname, &next, &g_dag_arena, &rname) != 0 ||
+            if (dag_expand_name(pkt, pkt_len, after_mname, &next, &g_dag_arena, &rname) != 0 ||
                 next > abs_offset + rdlen) {
                 sink_printf(sink, "(unparsable SOA)");
                 return;
@@ -817,19 +967,24 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
             uint32_t retry   = ((uint32_t)pkt[nums_off+8]<<24)|((uint32_t)pkt[nums_off+9]<<16)|((uint32_t)pkt[nums_off+10]<<8)|pkt[nums_off+11];
             uint32_t expire  = ((uint32_t)pkt[nums_off+12]<<24)|((uint32_t)pkt[nums_off+13]<<16)|((uint32_t)pkt[nums_off+14]<<8)|pkt[nums_off+15];
             uint32_t minimum = ((uint32_t)pkt[nums_off+16]<<24)|((uint32_t)pkt[nums_off+17]<<16)|((uint32_t)pkt[nums_off+18]<<8)|pkt[nums_off+19];
-            if (dopt && !dopt->yaml && dopt->multiline) {
+            if (dopt && !dopt->yaml && dopt->multiline && dopt->rrcomments_set && !dopt->rrcomments) {
+                /* dig +multiline +norrcomments: one value per line, ")" right after the last one */
+                sink_printf(sink, "%s %s (\n\t\t\t\t%u\n\t\t\t\t%u\n\t\t\t\t%u\n\t\t\t\t%u\n\t\t\t\t%u)",
+                            mname, rname, serial, refresh, retry, expire, minimum);
+            } else if (dopt && !dopt->yaml && dopt->multiline) {
                 char t_ref[32], t_ret[32], t_exp[32], t_min[32];
                 format_time_comment(refresh, t_ref, sizeof(t_ref));
                 format_time_comment(retry, t_ret, sizeof(t_ret));
                 format_time_comment(expire, t_exp, sizeof(t_exp));
                 format_time_comment(minimum, t_min, sizeof(t_min));
+                /* X-40: BIND soa_6.c の "%-10lu ; " と同じ (値を 10 桁で左詰め) */
                 sink_printf(sink, "%s %s (\n", mname, rname);
-                sink_printf(sink, "\t\t\t\t\t%u\t; serial\n", serial);
-                sink_printf(sink, "\t\t\t\t\t%u\t; refresh%s\n", refresh, t_ref);
-                sink_printf(sink, "\t\t\t\t\t%u\t; retry%s\n", retry, t_ret);
-                sink_printf(sink, "\t\t\t\t\t%u\t; expire%s\n", expire, t_exp);
-                sink_printf(sink, "\t\t\t\t\t%u\t; minimum%s\n", minimum, t_min);
-                sink_printf(sink, "\t\t\t\t\t)");
+                sink_printf(sink, "\t\t\t\t%-10u ; serial\n", serial);
+                sink_printf(sink, "\t\t\t\t%-10u ; refresh%s\n", refresh, t_ref);
+                sink_printf(sink, "\t\t\t\t%-10u ; retry%s\n", retry, t_ret);
+                sink_printf(sink, "\t\t\t\t%-10u ; expire%s\n", expire, t_exp);
+                sink_printf(sink, "\t\t\t\t%-10u ; minimum%s\n", minimum, t_min);
+                sink_printf(sink, "\t\t\t\t)");
             } else {
                 sink_printf(sink, "%s %s %u %u %u %u %u", mname, rname, serial, refresh, retry, expire, minimum);
             }
@@ -882,8 +1037,8 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
         }
         case 14: { // MINFO
             char *rmailbx = NULL, *emailbx = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &rmailbx) == 0 &&
-                expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &emailbx) == 0 &&
+            if (dag_expand_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &rmailbx) == 0 &&
+                dag_expand_name(pkt, pkt_len, next, &next, &g_dag_arena, &emailbx) == 0 &&
                 next <= abs_offset + rdlen) {
                 sink_printf(sink, "%s %s", rmailbx, emailbx);
                 return;
@@ -895,15 +1050,20 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
             uint8_t meaning = pkt[abs_offset], coding = pkt[abs_offset + 1], subcoding = pkt[abs_offset + 2];
             int n = 0;
             char *b64 = base64_encode_alloc(&pkt[abs_offset + 3], rdlen - 3, &n);
-            sink_printf(sink, "%u %u %u %s", meaning, coding, subcoding, (b64 && n > 0) ? b64 : "");
+            if (dopt && !dopt->yaml && dopt->multiline && b64 && n > 0) {
+                sink_printf(sink, "%u %u %u (\n", meaning, coding, subcoding);
+                sink_multiline_b64(sink, b64, n, dopt->split_width);
+            } else {
+                sink_printf(sink, "%u %u %u %s", meaning, coding, subcoding, (b64 && n > 0) ? b64 : "");
+            }
             free(b64);
             return;
         }
         case 17: case 18: case 19: case 20: case 22: case 26: { // RP, AFSDB, X25, ISDN, NSAP, PX
             if (type == 17) { // RP
                 char *mbox = NULL, *txt = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &mbox) == 0 &&
-                    expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &txt) == 0 &&
+                if (dag_expand_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &mbox) == 0 &&
+                    dag_expand_name(pkt, pkt_len, next, &next, &g_dag_arena, &txt) == 0 &&
                     next <= abs_offset + rdlen) {
                     sink_printf(sink, "%s %s", mbox, txt);
                     return;
@@ -912,7 +1072,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                 if (rdlen >= 2) {
                     uint16_t sub = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
                     char *name = NULL; size_t next;
-                    if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0 &&
+                    if (dag_expand_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0 &&
                         next <= abs_offset + rdlen) {
                         sink_printf(sink, "%u %s", sub, name);
                         return;
@@ -954,8 +1114,8 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                 if (rdlen >= 2) {
                     uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
                     char *map822 = NULL, *mapx400 = NULL; size_t next;
-                    if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &map822) == 0 &&
-                        expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &mapx400) == 0 &&
+                    if (dag_expand_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &map822) == 0 &&
+                        dag_expand_name(pkt, pkt_len, next, &next, &g_dag_arena, &mapx400) == 0 &&
                         next <= abs_offset + rdlen) {
                         sink_printf(sink, "%u %s %s", pref, map822, mapx400);
                         return;
@@ -968,7 +1128,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
             if (rdlen >= 2) {
                 uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
                 char *name = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0 &&
+                if (dag_expand_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0 &&
                     next <= abs_offset + rdlen) {
                     sink_printf(sink, "%u %s", pref, name);
                     return;
@@ -1015,7 +1175,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                 uint16_t weight = (pkt[abs_offset+2]<<8)|pkt[abs_offset+3];
                 uint16_t port = (pkt[abs_offset+4]<<8)|pkt[abs_offset+5];
                 char *name = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, abs_offset + 6, &next, &g_dag_arena, &name) == 0 &&
+                if (dag_expand_name(pkt, pkt_len, abs_offset + 6, &next, &g_dag_arena, &name) == 0 &&
                     next <= abs_offset + rdlen) {
                     sink_printf(sink, "%u %u %u %s", prio, weight, port, name);
                     return;
@@ -1035,7 +1195,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                 if (p) p = next_char_string(p, end, &regexp, &regexp_len);
                 if (p) {
                     char *repl = NULL; size_t next;
-                    if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &repl) == 0 &&
+                    if (dag_expand_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &repl) == 0 &&
                         next <= abs_offset + rdlen) {
                         sink_printf(sink, "%u %u ", order, pref);
                         sink_char_string(sink, flags, flags_len); sink_printf(sink, " ");
@@ -1064,10 +1224,10 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                             sink_multiline_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 44);
                             free(b64);
                         } else {
-                            sink_printf(sink, "\t\t\t\t\t)");
+                            sink_printf(sink, "\t\t\t\t)");
                         }
                     } else {
-                        sink_printf(sink, "\t\t\t\t\t)");
+                        sink_printf(sink, "\t\t\t\t)");
                     }
                 } else {
                     sink_printf(sink, "%s %u %u", cname, keytag, alg);
@@ -1155,7 +1315,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                     }
                 } else if (gw_type == 3) {
                     char *gw = NULL; size_t next;
-                    if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &gw) == 0 &&
+                    if (dag_expand_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &gw) == 0 &&
                         next <= abs_offset + rdlen) {
                         snprintf(gw_buf, sizeof(gw_buf), "%s", gw);
                         p = &pkt[next];
@@ -1170,10 +1330,10 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                             sink_multiline_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 44);
                             free(b64);
                         } else {
-                            sink_printf(sink, "\t\t\t\t\t)");
+                            sink_printf(sink, "\t\t\t\t)");
                         }
                     } else {
-                        sink_printf(sink, "\t\t\t\t\t)");
+                        sink_printf(sink, "\t\t\t\t)");
                     }
                 } else {
                     sink_printf(sink, "%u %u %u %s", prec, gw_type, alg, gw_buf);
@@ -1197,8 +1357,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                 char *b64 = base64_encode_alloc(&pkt[abs_offset], rdlen, &n);
                 if (b64) {
                     if (dopt && !dopt->yaml && dopt->multiline) {
-                        sink_printf(sink, "( ");
-                        sink_multiline_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 44);
+                        sink_multiline_b64_paren(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 44);
                         if (rdlen >= 3) {
                             uint16_t id_type = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
                             uint8_t d_type = pkt[abs_offset+2];
@@ -1219,8 +1378,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                 char *b64 = base64_encode_alloc(&pkt[abs_offset], rdlen, &n);
                 if (b64) {
                     if (dopt && !dopt->yaml && dopt->multiline) {
-                        sink_printf(sink, "( ");
-                        sink_multiline_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 44);
+                        sink_multiline_b64_paren(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 44);
                     } else {
                         sink_split_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
                     }
@@ -1270,12 +1428,12 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                     if (b64) {
                         p_off += pk_len;
                         if (dopt && !dopt->yaml && dopt->multiline) {
-                            sink_printf(sink, "( %u %s\n\t\t\t\t\t%.*s", pk_algorithm, hit_hex, n, b64);
+                            sink_printf(sink, "( %u %s\n\t\t\t\t%.*s", pk_algorithm, hit_hex, n, b64);
                             while (p_off < rdlen) {
                                 char *rvs_name = NULL; size_t next;
-                                if (expand_wire_name(pkt, pkt_len, abs_offset + p_off, &next, &g_dag_arena, &rvs_name) != 0 ||
+                                if (dag_expand_name(pkt, pkt_len, abs_offset + p_off, &next, &g_dag_arena, &rvs_name) != 0 ||
                                     next > abs_offset + rdlen) break;
-                                sink_printf(sink, "\n\t\t\t\t\t%s", rvs_name ? rvs_name : ".");
+                                sink_printf(sink, "\n\t\t\t\t%s", rvs_name ? rvs_name : ".");
                                 p_off = next - abs_offset;
                             }
                             sink_printf(sink, " )");
@@ -1283,7 +1441,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                             sink_printf(sink, "%u %s %.*s", pk_algorithm, hit_hex, n, b64);
                             while (p_off < rdlen) {
                                 char *rvs_name = NULL; size_t next;
-                                if (expand_wire_name(pkt, pkt_len, abs_offset + p_off, &next, &g_dag_arena, &rvs_name) != 0 ||
+                                if (dag_expand_name(pkt, pkt_len, abs_offset + p_off, &next, &g_dag_arena, &rvs_name) != 0 ||
                                     next > abs_offset + rdlen) break;
                                 sink_printf(sink, " %s", rvs_name ? rvs_name : ".");
                                 p_off = next - abs_offset;
@@ -1315,10 +1473,10 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                 uint8_t scheme = pkt[abs_offset + 2];
                 uint16_t port = (pkt[abs_offset + 3] << 8) | pkt[abs_offset + 4];
                 char *target = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, abs_offset + 5, &next, &g_dag_arena, &target) == 0 &&
+                if (dag_expand_name(pkt, pkt_len, abs_offset + 5, &next, &g_dag_arena, &target) == 0 &&
                     next <= abs_offset + rdlen) {
                     char tbuf[32];
-                    const char *tname = format_type_name(target_type, tbuf, sizeof(tbuf));
+                    const char *tname = dag_type_name(target_type, tbuf, sizeof(tbuf));
                     if (scheme == 1) {
                         sink_printf(sink, "%s NOTIFY %u %s", tname, port, target);
                     } else {
@@ -1348,10 +1506,10 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                 uint32_t incep = ((uint32_t)pkt[abs_offset+12]<<24)|((uint32_t)pkt[abs_offset+13]<<16)|((uint32_t)pkt[abs_offset+14]<<8)|pkt[abs_offset+15];
                 uint16_t keytag = (pkt[abs_offset+16]<<8)|pkt[abs_offset+17];
                 char *signer = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, abs_offset + 18, &next, &g_dag_arena, &signer) == 0 &&
+                if (dag_expand_name(pkt, pkt_len, abs_offset + 18, &next, &g_dag_arena, &signer) == 0 &&
                     next <= abs_offset + rdlen) {
                     char cov_buf[32];
-                    const char *cov_str = (cov == 0) ? "0" : format_type_name(cov, cov_buf, sizeof(cov_buf));
+                    const char *cov_str = (cov == 0) ? "0" : dag_type_name(cov, cov_buf, sizeof(cov_buf));
                     char exp_buf[32], incep_buf[32];
                     format_rrsig_time(exp, exp_buf, sizeof(exp_buf));
                     format_rrsig_time(incep, incep_buf, sizeof(incep_buf));
@@ -1363,15 +1521,26 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                     }
                     int n = 0;
                     char *b64 = (next < abs_offset + rdlen) ? base64_encode_alloc(&pkt[next], abs_offset + rdlen - next, &n) : NULL;
-                    if (dopt && !dopt->yaml && dopt->multiline) {
-                        sink_printf(sink, "%s %u %u %u (\n\t\t\t\t\t%s %s %u %s\n",
+                    if (dopt && !dopt->yaml && dopt->multiline && type == 24) {
+                        /* dig (BIND sig_24.c) breaks SIG after the expiration, RRSIG after the original TTL */
+                        sink_printf(sink, "%s %u %u %u %s (\n\t\t\t\t%s %u %s\n",
                                     cov_str,
                                     alg, labels, orig_ttl, exp_buf, incep_buf, keytag, signer);
                         if (b64) {
                             sink_multiline_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 44);
                             free(b64);
                         } else {
-                            sink_printf(sink, "\t\t\t\t\t)");
+                            sink_printf(sink, "\t\t\t\t)");
+                        }
+                    } else if (dopt && !dopt->yaml && dopt->multiline) {
+                        sink_printf(sink, "%s %u %u %u (\n\t\t\t\t%s %s %u %s\n",
+                                    cov_str,
+                                    alg, labels, orig_ttl, exp_buf, incep_buf, keytag, signer);
+                        if (b64) {
+                            sink_multiline_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 44);
+                            free(b64);
+                        } else {
+                            sink_printf(sink, "\t\t\t\t)");
                         }
                     } else {
                         sink_printf(sink, "%s %u %u %u %s %s %u %s",
@@ -1390,7 +1559,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
         }
         case 57: // RKEY — display identical to DNSKEY/KEY
         case 25: case 48: case 60: { // KEY, DNSKEY, CDNSKEY
-            sink_dnskey_like(sink, &pkt[abs_offset], rdlen, dopt);
+            sink_dnskey_like(sink, &pkt[abs_offset], rdlen, dopt, type == 48 || type == 60);
             return;
         }
         case 43: case 59: case 32768: case 32769: { // DS, CDS, TA, DLV
@@ -1399,7 +1568,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
         }
         case 47: { // NSEC
             char *next_name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &next_name) == 0 &&
+            if (dag_expand_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &next_name) == 0 &&
                 next <= abs_offset + rdlen) {
                 char types_buf[512];
                 decode_type_bitmap(&pkt[next], abs_offset + rdlen - next, types_buf, sizeof(types_buf));
@@ -1437,7 +1606,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
         }
         case 250: { // TSIG
             char *alg_name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &alg_name) == 0 &&
+            if (dag_expand_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &alg_name) == 0 &&
                 next + 6 <= abs_offset + rdlen) {
                 uint64_t time_signed = ((uint64_t)pkt[next]<<40)|((uint64_t)pkt[next+1]<<32)|((uint64_t)pkt[next+2]<<24)|
                                        ((uint64_t)pkt[next+3]<<16)|((uint64_t)pkt[next+4]<<8)|pkt[next+5];
@@ -1459,21 +1628,23 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                                 int n = 0;
                                 char *b64 = (mac_size > 0) ? base64_encode_alloc(mac_bytes, mac_size, &n) : NULL;
                                 if (dopt && !dopt->yaml && dopt->multiline) {
-                                    sink_printf(sink, "%s %llu %u %u (\n\t\t\t\t\t%.*s ) %u %s %u",
+                                    sink_printf(sink, "%s %llu %u %u (\n\t\t\t\t%.*s ) %u %s %u",
                                                 alg_name, (unsigned long long)time_signed, fudge, mac_size,
                                                 n, b64 ? b64 : "",
-                                                orig_id, rcode_name(err), other_len);
+                                                orig_id, tsig_rcode_name(err), other_len);
+                                    /* dig (BIND) always puts a space after Other Len, then the Other Data in hex */
+                                    sink_printf(sink, " ");
                                     if (other_len > 0) {
-                                        sink_printf(sink, " ");
                                         sink_split_hex(sink, &pkt[next], other_len, 0);
                                     }
                                 } else {
-                                    sink_printf(sink, "%s %llu %u %u %.*s %u %s %u",
+                                    sink_printf(sink, "%s %llu %u %u%s%.*s %u %s %u",
                                                 alg_name, (unsigned long long)time_signed, fudge, mac_size,
-                                                n, b64 ? b64 : "",
-                                                orig_id, rcode_name(err), other_len);
+                                                n > 0 ? " " : "", n, b64 ? b64 : "",
+                                                orig_id, tsig_rcode_name(err), other_len);
+                                    /* dig (BIND) always puts a space after Other Len, then the Other Data in hex */
+                                    sink_printf(sink, " ");
                                     if (other_len > 0) {
-                                        sink_printf(sink, " ");
                                         sink_split_hex(sink, &pkt[next], other_len, 0);
                                     }
                                 }
@@ -1583,7 +1754,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                     }
                 } else if (relay_type == 3) {
                     char *gw = NULL; size_t next;
-                    if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &gw) == 0 &&
+                    if (dag_expand_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &gw) == 0 &&
                         next <= abs_offset + rdlen) {
                         sink_printf(sink, "%s", gw);
                         return;
@@ -1596,7 +1767,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
             // 名前部分 (非圧縮ドメイン名)
             char *nxt_name = NULL;
             size_t name_end;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &name_end, &g_dag_arena, &nxt_name) != 0 ||
+            if (dag_expand_name(pkt, pkt_len, abs_offset, &name_end, &g_dag_arena, &nxt_name) != 0 ||
                 name_end > abs_offset + rdlen) {
                 sink_printf(sink, "(malformed NXT)");
                 return;
@@ -1612,21 +1783,42 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                         uint16_t tc = (uint16_t)((i - boff) * 8 + (7 - bit));
                         if (tc == 0) continue;
                         char tbuf[32];
-                        sink_printf(sink, " %s", format_type_name(tc, tbuf, sizeof(tbuf)));
+                        sink_printf(sink, " %s", dag_type_name(tc, tbuf, sizeof(tbuf)));
                     }
                 }
             }
             return;
         }
-        case 31: case 32: { // EID, NIMLOC (undocumented; presented as a bare hex string, no "\# len" prefix)
-            sink_split_hex(sink, &pkt[abs_offset], rdlen, 0);
+        case 41: { // OPT printed as a record (stray OPT): dig shows no RDATA text when it is empty
+            if (rdlen > 0) sink_generic_rdata(sink, &pkt[abs_offset], rdlen, dopt);
             return;
         }
-        case 34: { // ATMA (RFC 2163 §2): format byte + address
-            // dig と同じ表示: フォーマットバイトを除いた残りのバイト列を hex 表示
-            if (rdlen < 2) { sink_printf(sink, "(malformed ATMA)"); return; }
-            sink_split_hex(sink, &pkt[abs_offset + 1], rdlen - 1, 0);
+        case 31: case 32: { // EID, NIMLOC (undocumented; presented as a bare hex string, no "\# len" prefix)
+            if (dopt && !dopt->yaml && dopt->multiline && rdlen > 0) {
+                sink_multiline_hex_inline(sink, &pkt[abs_offset], rdlen, dopt->split_width);
+            } else {
+                sink_split_hex(sink, &pkt[abs_offset], rdlen, 0);
+            }
             return;
+        }
+        case 34: { // ATMA (ATM Forum af-dans-0152.000): format byte + address
+            // dig と同じ表示 (BIND atma_34.c totext): format 0 (AESA) は残りのバイト列を hex、
+            // format 1 (E.164) は '+' に続けて数字列。それ以外の format は汎用形式
+            if (rdlen < 2) { sink_printf(sink, "(malformed ATMA)"); return; }
+            if (pkt[abs_offset] == 0) {
+                for (uint16_t k = 1; k < rdlen; k++) sink_printf(sink, "%02x", pkt[abs_offset + k]); // BIND は小文字
+                return;
+            }
+            if (pkt[abs_offset] == 1) {
+                bool digits_only = true;
+                for (uint16_t k = 1; k < rdlen; k++)
+                    if (pkt[abs_offset + k] < '0' || pkt[abs_offset + k] > '9') digits_only = false;
+                if (digits_only) {
+                    sink_printf(sink, "+%.*s", (int)(rdlen - 1), (const char *)&pkt[abs_offset + 1]);
+                    return;
+                }
+            }
+            break;
         }
         case 38: { // A6 (RFC 2874 §3): prefix-length + suffix + optional prefix name
             if (rdlen < 1) { sink_printf(sink, "(malformed A6)"); return; }
@@ -1652,7 +1844,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                 if (pfx_off < abs_offset + rdlen) {
                     char *pfx_name = NULL;
                     size_t pfx_end;
-                    if (expand_wire_name(pkt, pkt_len, pfx_off, &pfx_end, &g_dag_arena, &pfx_name) == 0 &&
+                    if (dag_expand_name(pkt, pkt_len, pfx_off, &pfx_end, &g_dag_arena, &pfx_name) == 0 &&
                         pfx_end <= abs_offset + rdlen) {
                         sink_printf(sink, " %s", pfx_name ? pfx_name : ".");
                     }
@@ -1697,11 +1889,11 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
             if (rdlen < 2) { sink_printf(sink, "(malformed TALINK)"); return; }
             char *prev = NULL, *next = NULL;
             size_t n1, n2;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &n1, &g_dag_arena, &prev) != 0 ||
+            if (dag_expand_name(pkt, pkt_len, abs_offset, &n1, &g_dag_arena, &prev) != 0 ||
                 n1 > abs_offset + rdlen) {
                 sink_printf(sink, "(malformed TALINK prev)"); return;
             }
-            if (expand_wire_name(pkt, pkt_len, n1, &n2, &g_dag_arena, &next) != 0 ||
+            if (dag_expand_name(pkt, pkt_len, n1, &n2, &g_dag_arena, &next) != 0 ||
                 n2 > abs_offset + rdlen) {
                 sink_printf(sink, "(malformed TALINK next)"); return;
             }
@@ -1713,8 +1905,12 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
             int b64_n = 0;
             char *b64 = base64_encode_alloc(&pkt[abs_offset], rdlen, &b64_n);
             if (b64) {
-                int sw = (dopt && dopt->split_width > 0) ? dopt->split_width : 0;
-                sink_split_b64(sink, b64, b64_n, sw);
+                if (dopt && !dopt->yaml && dopt->multiline) {
+                    sink_multiline_b64_inline(sink, b64, b64_n, dopt->split_width);
+                } else {
+                    int sw = (dopt && dopt->split_width > 0) ? dopt->split_width : 0;
+                    sink_split_b64(sink, b64, b64_n, sw);
+                }
                 free(b64);
             }
             return;
@@ -1724,12 +1920,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
     }
 
     // Fallback: RFC 3597 Generic Format "\# <rdlen> <hex>"
-    sink_printf(sink, "\\# %u", rdlen);
-    if (rdlen > 0) {
-        sink_printf(sink, " ");
-        int sw = (dopt && dopt->split_width > 0) ? dopt->split_width : 0;
-        sink_split_hex(sink, &pkt[abs_offset], rdlen, sw);
-    }
+    sink_generic_rdata(sink, &pkt[abs_offset], rdlen, dopt);
 }
 
 void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_t type,
@@ -1899,9 +2090,44 @@ KARIDNS_TOOL_FN const char *idn_to_unicode(const char *name, char *buf, size_t b
     return buf;
 }
 
+/* X-40: dig の列揃え。BIND masterdump.c indent() と同じく、タブ幅 8 のタブで列 to まで進め、端数は空白で埋める。
+ * すでに列を越えていれば空白 1 つ。戻り値は新しい列。 */
+static unsigned dag_indent_to(unsigned col, unsigned to) {
+    if (to < col + 1) to = col + 1;
+    if (to / 8 > col / 8) {
+        for (unsigned t = to / 8 - col / 8; t > 0; t--) printf("\t"); /* printf: g_dag_suppress_stdout に従う */
+        col = (to / 8) * 8;
+    }
+    for (; col < to; col++) printf(" ");
+    return to;
+}
+
+/* dig.c (9.20) が dns_master_stylecreate() に渡す列: TTL, CLASS, TYPE, RDATA。
+ * +multiline か +nottlid +noclass は 24/24/24/32、+nottlid か +noclass の片方は 24/24/32/40、それ以外は 24/32/40/48。
+ * 複数行の RDATA の続きの行は RDATA の列まで字下げする (+multiline では 32 = タブ 4 つ)。 */
+static void dag_rr_columns(const display_opts_t *dopt, unsigned col[4]) {
+    bool nottl = dopt && !dopt->ttlid, noclass = dopt && !dopt->show_class;
+    bool ml = dopt && dopt->multiline;
+    static const unsigned c_ml[4] = { 24, 24, 24, 32 }, c_one[4] = { 24, 24, 32, 40 }, c_def[4] = { 24, 32, 40, 48 };
+    const unsigned *c = (ml || (nottl && noclass)) ? c_ml : (nottl || noclass) ? c_one : c_def;
+    memcpy(col, c, sizeof(unsigned) * 4);
+}
+
+/* 質問セクションの行 (dig と同じく CLASS は +noclass でも出し、TTL は無い)。BIND は ";" を書いてから
+ * 列 0 として名前を書く (message.c) ので、列は ";" を数えない。 */
+static void dag_print_question_line(const char *name, const char *qcname, const char *qtname, const display_opts_t *dopt) {
+    unsigned col[4];
+    dag_rr_columns(dopt, col);
+    printf(";%s", name);
+    unsigned c = dag_indent_to((unsigned)strlen(name), col[1]);
+    printf("%s", qcname);
+    dag_indent_to(c + (unsigned)strlen(qcname), col[2]);
+    printf("%s\n", qtname);
+}
+
 KARIDNS_TOOL_FN bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *offset, axfr_state_t *axfr_state, const display_opts_t *dopt) {
     char *name = NULL; size_t next;
-    if (expand_wire_name(pkt, pkt_len, *offset, &next, &g_dag_arena, &name) != 0) return false;
+    if (dag_expand_name(pkt, pkt_len, *offset, &next, &g_dag_arena, &name) != 0) return false;
     size_t hdr = next;
     if (hdr + 10 > pkt_len) return false;
 
@@ -1912,7 +2138,7 @@ KARIDNS_TOOL_FN bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *of
     size_t rdata_start = hdr + 10;
     if (rdata_start + rdlen > pkt_len) return false;
 
-    if (type == 41) {
+    if (type == 41 && (!g_dag_show_stray_opt || *offset == g_dag_pseudo_opt_off)) {
         *offset = rdata_start + rdlen;
         return true;
     }
@@ -1938,7 +2164,7 @@ KARIDNS_TOOL_FN bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *of
         snprintf(cname_buf, sizeof(cname_buf), "CLASS%u", klass);
         cname = cname_buf;
     } else {
-        tname = format_type_name(type, tname_buf, sizeof(tname_buf));
+        tname = dag_type_name(type, tname_buf, sizeof(tname_buf));
         cname = format_class_name(klass, cname_buf, sizeof(cname_buf));
     }
 
@@ -1952,17 +2178,28 @@ KARIDNS_TOOL_FN bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *of
     bool show_c = (dopt == NULL || dopt->show_class);
     bool show_t = (dopt == NULL || dopt->ttlid);
 
-    if (show_t && show_c) {
-        printf("%-24s %-6s %-4s %-8s ", display_name, ttl_str, cname, tname);
-    } else if (show_t && !show_c) {
-        printf("%-24s %-6s %-8s ", display_name, ttl_str, tname);
-    } else if (!show_t && show_c) {
-        printf("%-24s %-4s %-8s ", display_name, cname, tname);
-    } else {
-        printf("%-24s %-8s ", display_name, tname);
+    /* X-40: dig と同じタブ区切りの列 (dag_rr_columns()) */
+    unsigned col[4];
+    dag_rr_columns(dopt, col);
+    printf("%s", display_name);
+    unsigned c = (unsigned)strlen(display_name);
+    if (show_t) {
+        c = dag_indent_to(c, col[0]);
+        printf("%s", ttl_str);
+        c += (unsigned)strlen(ttl_str);
     }
+    if (show_c) {
+        c = dag_indent_to(c, col[1]);
+        printf("%s", cname);
+        c += (unsigned)strlen(cname);
+    }
+    c = dag_indent_to(c, col[2]);
+    printf("%s", tname);
+    dag_indent_to(c + (unsigned)strlen(tname), col[3]);
 
+    g_dag_rdata_class = klass;
     print_rdata(pkt, pkt_len, type, rdata_start, rdlen, dopt);
+    g_dag_rdata_class = 1;
     printf("\n");
 
     *offset = rdata_start + rdlen;
@@ -2012,16 +2249,41 @@ KARIDNS_TOOL_FN void format_edns_flags(bool dnssec_ok, bool compact_answers_ok, 
     if (compact_answers_ok) strncat(buf, " co", buf_size - strlen(buf) - 1);
 }
 
+/* ADDITIONAL の最後の RR が TSIG (RFC 8945 §5.1) か SIG(0) (RFC 2931 §3.1, Type Covered 0) なら、その位置を
+ * *rr_off に入れて "TSIG" / "SIG0" を返す。dig はこれを ADDITIONAL SECTION ではなく
+ * ";; TSIG PSEUDOSECTION:" / ";; SIG0 PSEUDOSECTION:" として出す。 */
+const char *find_sig_pseudo_rr(const uint8_t *pkt, size_t pkt_len, size_t offset, uint16_t arcount, size_t *rr_off) {
+    size_t cur = offset;
+    for (uint16_t i = 0; i < arcount; i++) {
+        size_t next;
+        if (skip_wire_name(pkt, pkt_len, cur, &next) != 0 || next + 10 > pkt_len) return NULL;
+        uint16_t rtype = (pkt[next] << 8) | pkt[next + 1];
+        uint16_t rdlen = (pkt[next + 8] << 8) | pkt[next + 9];
+        if (next + 10 + rdlen > pkt_len) return NULL;
+        if (i == arcount - 1) {
+            if (rr_off) *rr_off = cur;
+            if (rtype == 250) return "TSIG";
+            if (rtype == 24 && rdlen >= 2 && pkt[next + 10] == 0 && pkt[next + 11] == 0) return "SIG0";
+            return NULL;
+        }
+        cur = next + 10 + rdlen;
+    }
+    return NULL;
+}
+
 KARIDNS_TOOL_FN int count_non_opt_rrs(const uint8_t *pkt, size_t pkt_len, size_t offset, uint16_t arcount) {
     int count = 0;
     size_t cur = offset;
+    size_t sig_off = 0;
+    bool has_sig = find_sig_pseudo_rr(pkt, pkt_len, offset, arcount, &sig_off) != NULL;
     for (uint16_t i = 0; i < arcount; i++) {
         size_t next;
         if (skip_wire_name(pkt, pkt_len, cur, &next) != 0) break;
         if (next + 10 > pkt_len) break;
         uint16_t rtype = (pkt[next] << 8) | pkt[next + 1];
         uint16_t rdlen = (pkt[next + 8] << 8) | pkt[next + 9];
-        if (rtype != 41) { // Type 41 is OPT
+        bool pseudo_opt = (rtype == 41) && (!g_dag_show_stray_opt || cur == g_dag_pseudo_opt_off);
+        if (!pseudo_opt && !(has_sig && cur == sig_off)) { // the OPT pseudo-RR and TSIG/SIG(0) are pseudosections
             count++;
         }
         cur = next + 10 + rdlen;
@@ -2030,11 +2292,61 @@ KARIDNS_TOOL_FN int count_non_opt_rrs(const uint8_t *pkt, size_t pkt_len, size_t
     return count;
 }
 
-KARIDNS_TOOL_FN void print_sent_query(const uint8_t *pkt, size_t pkt_len, const query_opts_t *qo, const display_opts_t *dopt) {
+/* ADDITIONAL の RR を出す。最後の TSIG/SIG(0) は後ろに疑似セクションとして出す (dig と同じ)。 */
+/* 戻り値: -1 = RR の解析に失敗、1 = 見出しか疑似セクションを出した、0 = それ以外 */
+static int print_additional_section(const uint8_t *pkt, size_t pkt_len, size_t *offset, uint16_t arcount,
+                                     axfr_state_t *axfr_state, const display_opts_t *dopt, bool gap) {
+    int shown = 0;
+    size_t sig_off = 0;
+    const char *sig_label = find_sig_pseudo_rr(pkt, pkt_len, *offset, arcount, &sig_off);
+    if (dopt->show_comments && dopt->show_additional && count_non_opt_rrs(pkt, pkt_len, *offset, arcount) > 0) {
+        printf("%s;; ADDITIONAL SECTION:\n", gap ? "\n" : "");
+        gap = true;
+        shown = 1;
+    }
+    if (!dopt->show_additional) g_dag_suppress_stdout = true;
+    for (int i = 0; i < arcount; i++) {
+        if (sig_label && *offset == sig_off) {
+            size_t next;
+            if (skip_wire_name(pkt, pkt_len, *offset, &next) != 0 || next + 10 > pkt_len) break;
+            *offset = next + 10 + ((pkt[next + 8] << 8) | pkt[next + 9]);
+            continue;
+        }
+        if (!print_one_rr(pkt, pkt_len, offset, axfr_state, dopt)) {
+            g_dag_suppress_stdout = false;
+            return -1;
+        }
+    }
+    if (sig_label) {
+        if (dopt->show_comments && dopt->show_additional) {
+            printf("%s;; %s PSEUDOSECTION:\n", gap ? "\n" : "", sig_label);
+            shown = 1;
+        }
+        size_t po = sig_off;
+        print_one_rr(pkt, pkt_len, &po, axfr_state, dopt);
+    }
+    g_dag_suppress_stdout = false;
+    return shown;
+}
+
+KARIDNS_TOOL_FN void print_sent_query(const uint8_t *pkt, size_t pkt_len, const char *server, int port,
+                                      bool use_tcp, const query_opts_t *qo, const display_opts_t *dopt_in) {
     if (pkt_len < 12) return;
+    display_opts_t qdopt = *dopt_in;
+    qdopt.msg_is_query = true;
+    qdopt.query_auto_padding = qo && qo->want_padding;
+    const display_opts_t *dopt = &qdopt;
     if (dopt->yaml) {
-        printf(";; Sending query in YAML format\n");
-        print_response_yaml(pkt, pkt_len, "0.0.0.0", 0, qo ? qo->use_tcp : false, dopt);
+        /* dig +qr +yaml: 送信するクエリを宛先アドレス付きの RECURSIVE_QUERY / AUTH_QUERY として出す */
+        if (server) {
+            struct sockaddr_storage ss;
+            socklen_t sl;
+            int fam = AF_UNSPEC;
+            if (resolve_server_addr(server, port, qo ? qo->pref_family : AF_UNSPEC, &ss, &sl, &fam, true)) {
+                g_last_socket_family = fam;
+            }
+        }
+        print_response_yaml(pkt, pkt_len, server, (uint16_t)port, use_tcp, dopt);
         return;
     }
     uint16_t qid = (pkt[0] << 8) | pkt[1];
@@ -2047,42 +2359,55 @@ KARIDNS_TOOL_FN void print_sent_query(const uint8_t *pkt, size_t pkt_len, const 
     uint16_t nscount = (pkt[8] << 8) | pkt[9];
     uint16_t arcount = (pkt[10] << 8) | pkt[11];
 
-    printf(";; Sending:\n");
-    printf(";; ->>HEADER<<- opcode: %s, status: NOERROR, id: %u\n", opcode_name(opcode), qid);
-    printf(";; flags:%s%s%s%s%s%s; QUERY: %u, ANSWER: %u, AUTHORITY: %u, ADDITIONAL: %u\n\n",
-           aa ? " aa" : "", tc ? " tc" : "", rd ? " rd" : "",
-           ra ? " ra" : "", ad ? " ad" : "", cd ? " cd" : "",
-           qdcount, ancount, nscount, arcount);
-
-    if (qo->want_opt) {
-        char flags_buf[32];
-        format_edns_flags(qo->dnssec_ok, qo->compact_answers_ok, flags_buf, sizeof(flags_buf));
-        printf(";; OPT PSEUDOSECTION:\n");
-        printf("; EDNS: version: %d, flags:%s; udp: %u\n", qo->edns_version, flags_buf, qo->udp_payload_size);
-        if (qo->want_cookie) {
-            printf("; COOKIE: ");
-            for (int i = 0; i < 8; i++) printf("%02x", qo->client_cookie[i]);
-            if (qo->server_cookie_len > 0) {
-                for (size_t i = 0; i < qo->server_cookie_len; i++) printf("%02x", qo->server_cookie[i]);
-            }
-            printf("\n");
-        }
-        print_opt_extra_options(pkt, pkt_len, qdcount, ancount, nscount, arcount, dopt);
+    size_t offset = 12;
+    uint16_t first_qtype = 0;
+    for (int i = 0; i < qdcount; i++) {
+        size_t next;
+        if (skip_wire_name(pkt, pkt_len, offset, &next) != 0 || next + 4 > pkt_len) break;
+        if (i == 0) first_qtype = (pkt[next] << 8) | pkt[next + 1];
+        offset = next + 4;
     }
 
-    size_t offset = 12;
+    /* dig はゾーン転送のクエリを転送の応答と同じ形 (RR だけ) で出す */
+    if (first_qtype == 252 || first_qtype == 251) {
+        axfr_state_t qstate = {0};
+        for (int i = 0; i < ancount + nscount + arcount; i++) {
+            if (!print_one_rr(pkt, pkt_len, &offset, &qstate, dopt)) break;
+        }
+        if (dopt->show_stats) printf(";; QUERY SIZE: %zu\n\n", pkt_len);
+        return;
+    }
+
+    /* 表示する部分は +[no]comments / +[no]question / ... に従う (dig +qr と同じ) */
+    if (dopt->show_comments) {
+        printf(";; Sending:\n");
+        printf(";; ->>HEADER<<- opcode: %s, status: NOERROR, id: %u\n", opcode_name(opcode), qid);
+        printf(";; flags:%s%s%s%s%s%s; QUERY: %u, ANSWER: %u, AUTHORITY: %u, ADDITIONAL: %u\n\n",
+               aa ? " aa" : "", tc ? " tc" : "", rd ? " rd" : "",
+               ra ? " ra" : "", ad ? " ad" : "", cd ? " cd" : "",
+               qdcount, ancount, nscount, arcount);
+        if (qo->want_opt) {
+            char flags_buf[32];
+            format_edns_flags(qo->dnssec_ok, qo->compact_answers_ok, flags_buf, sizeof(flags_buf));
+            printf(";; OPT PSEUDOSECTION:\n");
+            printf("; EDNS: version: %d, flags:%s; udp: %u\n", qo->edns_version, flags_buf, qo->udp_payload_size);
+            print_opt_extra_options(pkt, pkt_len, qdcount, ancount, nscount, arcount, dopt);
+        }
+    }
+
+    offset = 12;
     if (qdcount > 0) {
-        if (opcode == 5) {
-            printf(";; ZONE SECTION:\n");
-        } else {
-            printf(";; QUESTION SECTION:\n");
+        if (dopt->show_question) {
+            if (dopt->show_comments) printf(";; %s SECTION:\n", opcode == 5 ? "ZONE" : "QUESTION");
         }
         for (int i = 0; i < qdcount; i++) {
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, offset, &next, &g_dag_arena, &name) != 0) break;
+            if (dag_expand_name(pkt, pkt_len, offset, &next, &g_dag_arena, &name) != 0) break;
             if (next + 4 > pkt_len) break;
             uint16_t qtype = (pkt[next] << 8) | pkt[next+1];
             uint16_t qclass = (pkt[next+2] << 8) | pkt[next+3];
+            offset = next + 4;
+            if (!dopt->show_question) continue;
             char qtname_buf[32];
             const char *qtname;
             char qcname_buf[16];
@@ -2093,108 +2418,293 @@ KARIDNS_TOOL_FN void print_sent_query(const uint8_t *pkt, size_t pkt_len, const 
                 snprintf(qcname_buf, sizeof(qcname_buf), "CLASS%u", qclass);
                 qcname = qcname_buf;
             } else {
-                qtname = format_type_name(qtype, qtname_buf, sizeof(qtname_buf));
+                qtname = dag_type_name(qtype, qtname_buf, sizeof(qtname_buf));
                 qcname = format_class_name(qclass, qcname_buf, sizeof(qcname_buf));
             }
             char idn_buf[512];
             const char *display_name = dopt->idnout ? idn_to_unicode(name, idn_buf, sizeof(idn_buf)) : name;
-            printf(";%-24s\t%-4s\t%s\n", display_name, qcname, qtname);
-            offset = next + 4;
+            dag_print_question_line(display_name, qcname, qtname, dopt); /* X-40 */
         }
-        printf("\n");
+        if (dopt->show_question) printf("\n");
     }
 
-    if (ancount > 0) {
-        if (opcode == 5) {
-            printf(";; PREREQUISITE SECTION:\n");
-        } else {
-            printf(";; ANSWER SECTION:\n");
-        }
-        for (int i = 0; i < ancount; i++) {
+    const char *sec_names[2] = { opcode == 5 ? "PREREQUISITE" : "ANSWER", opcode == 5 ? "UPDATE" : "AUTHORITY" };
+    uint16_t sec_counts[2] = { ancount, nscount };
+    bool sec_show[2] = { dopt->show_answer, dopt->show_authority };
+    for (int s = 0; s < 2; s++) {
+        if (sec_counts[s] == 0) continue;
+        if (sec_show[s] && dopt->show_comments) printf(";; %s SECTION:\n", sec_names[s]);
+        if (!sec_show[s]) g_dag_suppress_stdout = true;
+        for (int i = 0; i < sec_counts[s]; i++) {
             if (!print_one_rr(pkt, pkt_len, &offset, NULL, dopt)) break;
         }
-        printf("\n");
-    }
-
-    if (nscount > 0) {
-        if (opcode == 5) {
-            printf(";; UPDATE SECTION:\n");
-        } else {
-            printf(";; AUTHORITY SECTION:\n");
-        }
-        for (int i = 0; i < nscount; i++) {
-            if (!print_one_rr(pkt, pkt_len, &offset, NULL, dopt)) break;
-        }
-        printf("\n");
+        g_dag_suppress_stdout = false;
+        if (sec_show[s]) printf("\n");
     }
 
     if (arcount > 0) {
-        int non_opt_cnt = count_non_opt_rrs(pkt, pkt_len, offset, arcount);
-        if (non_opt_cnt > 0) {
-            printf(";; ADDITIONAL SECTION:\n");
-            for (int i = 0; i < arcount; i++) {
-                if (!print_one_rr(pkt, pkt_len, &offset, NULL, dopt)) break;
+        size_t sig_off = 0;
+        const char *sig_label = find_sig_pseudo_rr(pkt, pkt_len, offset, arcount, &sig_off);
+        bool has_rrs = count_non_opt_rrs(pkt, pkt_len, offset, arcount) > 0;
+        if (has_rrs && dopt->show_additional && dopt->show_comments) printf(";; ADDITIONAL SECTION:\n");
+        if (!dopt->show_additional) g_dag_suppress_stdout = true;
+        for (int i = 0; i < arcount; i++) {
+            if (sig_label && offset == sig_off) {
+                size_t next;
+                if (skip_wire_name(pkt, pkt_len, offset, &next) != 0 || next + 10 > pkt_len) break;
+                offset = next + 10 + ((pkt[next + 8] << 8) | pkt[next + 9]);
+                continue;
             }
+            if (!print_one_rr(pkt, pkt_len, &offset, NULL, dopt)) break;
+        }
+        if (has_rrs && dopt->show_additional) printf("\n");
+        if (sig_label) {
+            if (dopt->show_comments) printf(";; %s PSEUDOSECTION:\n", sig_label);
+            size_t po = sig_off;
+            print_one_rr(pkt, pkt_len, &po, NULL, dopt);
             printf("\n");
         }
+        g_dag_suppress_stdout = false;
     }
 
-    printf(";; QUERY SIZE: %zu\n\n", pkt_len);
+    if (dopt->show_stats) printf(";; QUERY SIZE: %zu\n\n", pkt_len);
 }
 
-KARIDNS_TOOL_FN bool check_packet_malformed(const uint8_t *pkt, size_t pkt_len, size_t *extra_bytes) {
-    if (pkt_len < 12) return true;
-    uint16_t qdcount = (pkt[4] << 8) | pkt[5];
-    uint16_t ancount = (pkt[6] << 8) | pkt[7];
-    uint16_t nscount = (pkt[8] << 8) | pkt[9];
-    uint16_t arcount = (pkt[10] << 8) | pkt[11];
+/* ------------------------------------------------------------------------
+ * Message parsing with the same outcome as BIND's dns_message_parse() (dig 9.20), so that dag reports malformed
+ * responses like dig (T-12):
+ *   - names: a compression pointer must point backwards (RFC 1035 §4.1.4; loops and forward pointers are
+ *     "bad compression pointer"), label types 01/10 are "bad label type", more than 255 octets is "name too long".
+ *     These errors make the whole message unusable ("Got bad packet"), except running out of data.
+ *   - running out of data, or RDATA that does not fit its type, stops the parse: the records before it are shown
+ *     with "Message parser reports malformed message packet" and the rest counts as extra bytes.
+ *   - a second OPT, an OPT outside ADDITIONAL, or a record whose class differs from the question's is malformed but
+ *     the parse goes on.
+ * ------------------------------------------------------------------------ */
+enum { DAG_NAME_OK = 0, DAG_NAME_BADPTR, DAG_NAME_BADLABEL, DAG_NAME_TOOLONG, DAG_NAME_END };
 
-    size_t offset = 12;
-    for (int i = 0; i < qdcount; i++) {
-        size_t next;
-        if (skip_wire_name(pkt, pkt_len, offset, &next) != 0 || next + 4 > pkt_len) {
-            if (extra_bytes) *extra_bytes = (pkt_len > offset) ? (pkt_len - offset) : 0;
-            return true;
-        }
-        offset = next + 4;
+static const char *dag_name_error_text(int e) {
+    switch (e) {
+        case DAG_NAME_BADPTR: return "bad compression pointer";
+        case DAG_NAME_BADLABEL: return "bad label type";
+        case DAG_NAME_TOOLONG: return "name too long";
+        default: return "unexpected end of input";
     }
+}
 
-    int total_rr = ancount + nscount + arcount;
-    for (int i = 0; i < total_rr; i++) {
-        size_t next;
-        if (skip_wire_name(pkt, pkt_len, offset, &next) != 0 || next + 10 > pkt_len) {
-            if (extra_bytes) *extra_bytes = (pkt_len > offset) ? (pkt_len - offset) : 0;
-            return true;
+/* Name at off; labels before the first pointer must lie below lim. *next is the offset after the name. */
+static int dag_check_name(const uint8_t *pkt, size_t len, size_t off, size_t lim, size_t *next) {
+    size_t pos = off, marker = off, total = 0;
+    bool jumped = false;
+    for (;;) {
+        size_t end = jumped ? len : lim;
+        if (pos >= end) return DAG_NAME_END;
+        uint8_t b = pkt[pos];
+        if ((b & 0xC0) == 0xC0) {
+            if (pos + 1 >= end) return DAG_NAME_END;
+            size_t ptr = ((size_t)(b & 0x3F) << 8) | pkt[pos + 1];
+            if (ptr >= marker) return DAG_NAME_BADPTR;
+            if (!jumped) *next = pos + 2;
+            jumped = true;
+            marker = ptr;
+            pos = ptr;
+            continue;
         }
-        uint16_t rdlen = (pkt[next+8] << 8) | pkt[next+9];
-        if (next + 10 + rdlen > pkt_len) {
-            if (extra_bytes) *extra_bytes = (pkt_len > (next + 10)) ? (pkt_len - (next + 10)) : 0;
-            return true;
+        if (b & 0xC0) return DAG_NAME_BADLABEL;
+        total += (size_t)b + 1;
+        if (total > 255) return DAG_NAME_TOOLONG;
+        if (b == 0) {
+            if (!jumped) *next = pos + 1;
+            return DAG_NAME_OK;
         }
-        offset = next + 10 + rdlen;
+        if (pos + 1 + b > end) return DAG_NAME_END;
+        pos += 1 + (size_t)b;
     }
+}
 
-    if (offset < pkt_len) {
-        if (extra_bytes) *extra_bytes = pkt_len - offset;
+/* RDATA check for the types whose layout dig enforces. Returns DAG_NAME_OK, a fatal name error, or -1 (malformed). */
+static int dag_check_rdata(const uint8_t *pkt, size_t len, uint16_t type, uint16_t klass, size_t r, size_t rend) {
+    size_t p = r, next = 0;
+    int e;
+#define DAG_NAME_AT(pos_) do { e = dag_check_name(pkt, len, (pos_), rend, &next); \
+        if (e == DAG_NAME_END) return -1; if (e != DAG_NAME_OK) return e; p = next; } while (0)
+    switch (type) {
+        case 1:
+            if (klass == 3) { DAG_NAME_AT(p); return (p + 2 == rend) ? DAG_NAME_OK : -1; } /* CH A: name + address */
+            return (klass != 1 || rend - r == 4) ? DAG_NAME_OK : -1;
+        case 28: return (klass != 1 || rend - r == 16) ? DAG_NAME_OK : -1;
+        case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 39:
+            DAG_NAME_AT(p); break;
+        case 15: case 18: case 21: case 36:
+            if (rend - p < 2) return -1;
+            DAG_NAME_AT(p + 2); break;
+        case 14: case 17:
+            DAG_NAME_AT(p); DAG_NAME_AT(p); break;
+        case 6:
+            DAG_NAME_AT(p); DAG_NAME_AT(p);
+            if (rend - p < 20) return -1;
+            p += 20; break;
+        case 33:
+            if (rend - p < 6) return -1;
+            DAG_NAME_AT(p + 6); break;
+        case 16: case 99:
+            if (p == rend) return -1;
+            while (p < rend) {
+                if (p + 1 + pkt[p] > rend) return -1;
+                p += 1 + (size_t)pkt[p];
+            }
+            break;
+        case 64: case 65: {
+            if (rend - p < 2) return -1;
+            DAG_NAME_AT(p + 2);
+            long prev_key = -1;
+            while (p < rend) {
+                if (rend - p < 4) return -1;
+                uint16_t key = (pkt[p] << 8) | pkt[p + 1], vlen = (pkt[p + 2] << 8) | pkt[p + 3];
+                if ((long)key <= prev_key || rend - p - 4 < vlen) return -1;
+                prev_key = key;
+                p += 4 + (size_t)vlen;
+            }
+            break;
+        }
+        case 41:
+            while (p < rend) {
+                if (rend - p < 4) return -1;
+                uint16_t olen = (pkt[p + 2] << 8) | pkt[p + 3];
+                if (rend - p - 4 < olen) return -1;
+                p += 4 + (size_t)olen;
+            }
+            break;
+        default:
+            return DAG_NAME_OK;
+    }
+#undef DAG_NAME_AT
+    return (p == rend) ? DAG_NAME_OK : -1;
+}
+
+void dag_parse_message(const uint8_t *pkt, size_t len, dag_parse_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->opt_off = SIZE_MAX;
+    if (len < 12) { out->fatal = "unexpected end of input"; return; }
+    uint16_t counts[4] = { (uint16_t)((pkt[4] << 8) | pkt[5]), (uint16_t)((pkt[6] << 8) | pkt[7]),
+                           (uint16_t)((pkt[8] << 8) | pkt[9]), (uint16_t)((pkt[10] << 8) | pkt[11]) };
+    size_t pos = 12, next = 0;
+    uint16_t qclass = 0;
+    for (int i = 0; i < counts[0]; i++) {
+        int e = dag_check_name(pkt, len, pos, len, &next);
+        if (e == DAG_NAME_END || (e == DAG_NAME_OK && len - next < 4)) {
+            out->malformed = true;
+            out->end = pos;
+            return;
+        }
+        if (e != DAG_NAME_OK) { out->fatal = dag_name_error_text(e); return; }
+        if (i == 0) qclass = (pkt[next + 2] << 8) | pkt[next + 3];
+        pos = next + 4;
+        out->count[0]++;
+    }
+    if (counts[0] > 1) out->malformed = true; /* BIND accepts a single question only */
+    for (int s = 1; s < 4; s++) {
+        for (int i = 0; i < counts[s]; i++) {
+            size_t start = pos;
+            int e = dag_check_name(pkt, len, pos, len, &next);
+            if (e == DAG_NAME_END) { out->malformed = true; out->end = start; return; }
+            if (e != DAG_NAME_OK) { out->fatal = dag_name_error_text(e); return; }
+            if (len - next < 10) { out->malformed = true; out->end = next; return; }
+            uint16_t type = (pkt[next] << 8) | pkt[next + 1];
+            uint16_t klass = (pkt[next + 2] << 8) | pkt[next + 3];
+            uint16_t rdlen = (pkt[next + 8] << 8) | pkt[next + 9];
+            size_t r = next + 10;
+            if (len - r < rdlen) { out->malformed = true; out->end = r; return; }
+            e = dag_check_rdata(pkt, len, type, klass, r, r + rdlen);
+            if (e < 0) { out->malformed = true; out->end = r; return; }
+            if (e != DAG_NAME_OK) { out->fatal = dag_name_error_text(e); return; }
+            if (type == 41) {
+                /* RFC 6891 §6.1.1: one OPT, in ADDITIONAL, owned by the root */
+                if (s == 3 && out->opt_off == SIZE_MAX && pkt[start] == 0) out->opt_off = start;
+                else out->malformed = true;
+            } else if (type != 250 && type != 24 && qclass != 0 && klass != qclass && klass != 255 && klass != 254) {
+                out->malformed = true;
+            }
+            pos = r + rdlen;
+            out->count[s]++;
+        }
+    }
+    out->end = pos;
+}
+
+/* dig のパケットダンプ: 1 行 16 オクテットを "xx " で並べ、57 桁目から ASCII */
+static void dig_hexdump(const uint8_t *pkt, size_t len) {
+    for (size_t i = 0; i < len; i += 16) {
+        char line[128];
+        int col = 0;
+        for (size_t j = i; j < i + 16 && j < len; j++) col += snprintf(line + col, sizeof(line) - (size_t)col, "%02x ", pkt[j]);
+        col += snprintf(line + col, sizeof(line) - (size_t)col, "%*s", 57 - col, "");
+        for (size_t j = i; j < i + 16 && j < len; j++) line[col++] = (pkt[j] >= 0x20 && pkt[j] < 0x7f) ? (char)pkt[j] : '.';
+        line[col] = '\0';
+        printf("%s\n", line);
+    }
+}
+
+/* 見出しより前に出す診断 (dig と同じ順)。メッセージを表示できないとき (Got bad packet) は true */
+bool print_parse_diagnostics(const uint8_t *pkt, size_t len, const dag_parse_t *ps) {
+    if (ps->fatal) {
+        printf(";; Got bad packet: %s\n%zu bytes\n", ps->fatal, len);
+        dig_hexdump(pkt, len);
         return true;
     }
+    if (ps->malformed) printf(";; Warning: Message parser reports malformed message packet.\n");
+    if (len >= 12 && pkt[4] == 0 && pkt[5] == 0) printf(";; missing question section\n");
     return false;
 }
 
-void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axfr_state, const display_opts_t *dopt) {
-    size_t extra_bytes = 0;
-    bool is_malformed = check_packet_malformed(pkt, pkt_len, &extra_bytes);
-    if (is_malformed && dopt && dopt->show_comments) {
-        printf(";; Warning: Message parser reports malformed message packet.\n\n");
+/* g_dag_answer_check for do_udp_exchange(): like dig 9.20, an answer without the QR bit is reported and used; an
+ * answer with another opcode, or whose question differs from the one sent (name compared case-insensitively,
+ * RFC 4343; RFC 5452 §9.1), is reported and ignored, and dag keeps waiting. Questions that cannot be parsed are
+ * left to the message printer ("Got bad packet"). */
+static bool dag_check_answer(const uint8_t *q, size_t qlen, const uint8_t *r, size_t rlen) {
+    if (qlen < 12 || rlen < 12) return true;
+    if (!(r[2] & 0x80)) printf(";; Warning: query response not set\n");
+    uint8_t want_op = (q[2] >> 3) & 0x0F, got_op = (r[2] >> 3) & 0x0F;
+    if (got_op != want_op) {
+        printf(";; Warning: Opcode mismatch: expected %s, ", opcode_name(want_op));
+        printf("got %s\n", opcode_name(got_op));
+        return false;
     }
+    if (((q[4] << 8) | q[5]) == 0 || any_structural_break(NULL)) return true;
+    char qname[DNS_NAME_TEXT_SIZE], rname[DNS_NAME_TEXT_SIZE];
+    size_t qnext, rnext;
+    if (expand_wire_name_to_buffer(q, qlen, 12, &qnext, qname, sizeof(qname)) < 0 || qnext + 4 > qlen) return true;
+    dag_parse_t ps;
+    dag_parse_message(r, rlen, &ps);
+    uint16_t rqd = (r[4] << 8) | r[5];
+    if (ps.fatal || ps.count[0] < rqd) return true; /* reported by the message printer */
+    size_t off = 12;
+    for (uint16_t i = 0; i < rqd; i++) {
+        size_t name_off = off;
+        if (expand_wire_name_to_buffer(r, rlen, off, &rnext, rname, sizeof(rname)) < 0 || rnext + 4 > rlen) return true;
+        off = rnext + 4;
+        if (strcasecmp(qname, rname) == 0 && memcmp(q + qnext, r + rnext, 4) == 0) continue;
+        if (ps.malformed) printf(";; Warning: Message parser reports malformed message packet.\n");
+        char *disp = NULL;
+        size_t dummy;
+        if (dag_expand_name(r, rlen, name_off, &dummy, &g_dag_arena, &disp) != 0) disp = rname;
+        size_t dl = strlen(disp);
+        if (dl > 1 && disp[dl - 1] == '.') dl--;
+        char tbuf[32], cbuf[32];
+        printf(";; ;; Question section mismatch: got %.*s/%s/%s\n", (int)dl, disp,
+               dag_type_name((r[rnext] << 8) | r[rnext + 1], tbuf, sizeof(tbuf)),
+               format_class_name((r[rnext + 2] << 8) | r[rnext + 3], cbuf, sizeof(cbuf)));
+        return false;
+    }
+    return true;
+}
 
-    if (pkt_len < 12) {
-        if (!dopt || !dopt->besteffort) {
-            printf(";; Got bad packet: unexpected end of input\n%zu bytes\n", pkt_len);
-            hexdump(pkt, pkt_len);
-        }
-        return;
-    }
+void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axfr_state, const display_opts_t *dopt) {
+    dag_parse_t ps;
+    dag_parse_message(pkt, pkt_len, &ps);
+    if (!dopt->parse_diag_done && print_parse_diagnostics(pkt, pkt_len, &ps)) return;
+    if (ps.fatal) return;
+    size_t extra_bytes = pkt_len - ps.end;
     uint16_t qid = (pkt[0] << 8) | pkt[1];
     uint8_t flags1 = pkt[2], flags2 = pkt[3];
     uint8_t opcode = (flags1 >> 3) & 0x0F;
@@ -2211,21 +2721,23 @@ void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axfr_state
 
     uint16_t full_rcode = edns.present ? (((uint16_t)edns.ext_rcode << 4) | rcode) : rcode;
 
-    if (axfr_state && axfr_state->is_axfr && full_rcode == 0) {
+    if (axfr_state && axfr_state->is_axfr) {
+        /* dig と同じく、ゾーン転送の応答は RR だけを並べる。エラー RCODE の応答は、含まれる RR (TSIG など) の後に
+         * "; Transfer failed." を出して転送を終える。 */
         size_t offset = 12;
-        for (int i = 0; i < qdcount; i++) {
+        for (int i = 0; i < ps.count[0]; i++) {
             size_t next;
             if (skip_wire_name(pkt, pkt_len, offset, &next) != 0 || next + 4 > pkt_len) return;
             offset = next + 4;
         }
-        for (int i = 0; i < ancount; i++) {
-            if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) return;
+        for (int i = 0; i < ps.count[1] + ps.count[2] + ps.count[3]; i++) {
+            if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) break;
         }
-        for (int i = 0; i < nscount; i++) {
-            if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) return;
-        }
-        for (int i = 0; i < arcount; i++) {
-            if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) return;
+        if (full_rcode != 0) {
+            printf("; Transfer failed.\n");
+            axfr_state->failed = true;
+            axfr_state->axfr_complete = true;
+            return;
         }
         if (axfr_state->is_ixfr && ancount == 1 && axfr_state->soa_seen_count == 1) {
             axfr_state->axfr_complete = true;
@@ -2233,8 +2745,12 @@ void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axfr_state
         return;
     }
 
+    /* OPT records other than the pseudo-RR (a second one, one outside ADDITIONAL) are printed as records */
+    g_dag_pseudo_opt_off = ps.opt_off;
+    g_dag_show_stray_opt = true;
+    bool has_opt = edns.present && ps.opt_off != SIZE_MAX;
     if (dopt->show_comments) {
-        if (edns.present && edns.has_cookie && dopt->has_expected_client_cookie) {
+        if (has_opt && edns.has_cookie && dopt->has_expected_client_cookie) {
             if (memcmp(dopt->expected_client_cookie, edns.client_cookie, 8) != 0) {
                 printf(";; Warning: Client COOKIE mismatch\n\n");
             }
@@ -2249,58 +2765,33 @@ void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axfr_state
         if (!ra && rd) {
             printf(";; WARNING: recursion requested but not available\n");
         }
-        if (is_malformed && extra_bytes > 0) {
+        if (extra_bytes > 0) {
             printf(";; WARNING: Message has %zu extra bytes at end\n", extra_bytes);
         }
     }
 
-    if (edns.present && dopt->show_comments) {
+    bool gap = true; /* 次のセクション見出しの前に空行を置くか */
+    bool any_section = false; /* コメント付きでセクションを 1 つ以上出した */
+    if (has_opt && dopt->show_comments) {
         printf("\n;; OPT PSEUDOSECTION:\n");
+        gap = false; /* dig: the first section header after the OPT pseudosection has no blank line before it */
         char flags_buf[32];
         format_edns_flags(edns.dnssec_ok, edns.compact_answers_ok, flags_buf, sizeof(flags_buf));
         printf("; EDNS: version: %d, flags:%s; udp: %d\n", edns.version, flags_buf, edns.udp_payload_size);
-        if (edns.ext_rcode != 0) printf("; EXT RCODE: %d\n", edns.ext_rcode);
-        if (edns.has_cookie) {
-            printf("; COOKIE: ");
-            for (int i = 0; i < 8; i++) printf("%02x", edns.client_cookie[i]);
-            if (edns.server_cookie_len > 0) {
-                for (uint16_t i = 0; i < edns.server_cookie_len; i++) printf("%02x", edns.server_cookie[i]);
-            }
-            if (dopt->has_expected_client_cookie) {
-                if (memcmp(dopt->expected_client_cookie, edns.client_cookie, 8) == 0) {
-                    printf(" (good)");
-                } else {
-                    printf(" (bad)");
-                }
-            } else if (edns.server_cookie_len > 0) {
-                printf(" (good)");
-            }
-            printf("\n");
-        }
+        /* dig と同じく、オプションは COOKIE/EDE も含めて受信した順に出す。拡張 RCODE は status に含める */
         print_opt_extra_options(pkt, pkt_len, qdcount, ancount, nscount, arcount, dopt);
-        for (uint16_t i = 0; i < edns.ede_count; i++) {
-            const char *msg = get_ede_error_string(edns.ede_list[i].code);
-            if (edns.ede_list[i].text[0]) printf("; EDE: %d (%s): (%s)\n", edns.ede_list[i].code, msg, edns.ede_list[i].text);
-            else printf("; EDE: %d (%s)\n", edns.ede_list[i].code, msg);
-        }
     }
 
     size_t offset = 12;
-    if (qdcount > 0) {
-        if (dopt->show_comments && dopt->show_question) printf("\n;; QUESTION SECTION:\n");
-        if (!dopt->show_question) g_dag_suppress_stdout = true;
-        for (int i = 0; i < qdcount; i++) {
+    if (ps.count[0] > 0) {
+        if (dopt->show_comments && dopt->show_question) { printf("%s;; QUESTION SECTION:\n", gap ? "\n" : ""); gap = true; any_section = true; }
+        for (int i = 0; i < ps.count[0]; i++) {
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, offset, &next, &g_dag_arena, &name) != 0) {
-                if (dopt->besteffort) { g_dag_suppress_stdout = false; return; }
-                else { printf(";; Got bad packet: unexpected end of input\n%zu bytes\n", pkt_len); hexdump(pkt, pkt_len); return; }
-            }
-            if (next + 4 > pkt_len) {
-                if (dopt->besteffort) { g_dag_suppress_stdout = false; return; }
-                else { printf(";; Got bad packet: unexpected end of input\n%zu bytes\n", pkt_len); hexdump(pkt, pkt_len); return; }
-            }
+            if (dag_expand_name(pkt, pkt_len, offset, &next, &g_dag_arena, &name) != 0 || next + 4 > pkt_len) break;
             uint16_t qtype = (pkt[next] << 8) | pkt[next+1];
             uint16_t qclass = (pkt[next+2] << 8) | pkt[next+3];
+            offset = next + 4;
+            if (!dopt->show_question) continue;
             char qtname_buf[32];
             const char *qtname;
             char qcname_buf[16];
@@ -2311,71 +2802,38 @@ void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axfr_state
                 snprintf(qcname_buf, sizeof(qcname_buf), "CLASS%u", qclass);
                 qcname = qcname_buf;
             } else {
-                qtname = format_type_name(qtype, qtname_buf, sizeof(qtname_buf));
+                qtname = dag_type_name(qtype, qtname_buf, sizeof(qtname_buf));
                 qcname = format_class_name(qclass, qcname_buf, sizeof(qcname_buf));
             }
             char idn_buf[512];
             const char *display_name = dopt->idnout ? idn_to_unicode(name, idn_buf, sizeof(idn_buf)) : name;
-            printf(";%-24s %-4s %s\n", display_name, qcname, qtname);
-            offset = next + 4;
+            dag_print_question_line(display_name, qcname, qtname, dopt); /* X-40 */
         }
-        g_dag_suppress_stdout = false;
     }
 
-    if (ancount > 0) {
-        if (dopt->show_comments && dopt->show_answer) printf("\n;; ANSWER SECTION:\n");
-        if (!dopt->show_answer) g_dag_suppress_stdout = true;
-        for (int i = 0; i < ancount; i++) {
-            if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) {
-                if (dopt->besteffort) {
-                    g_dag_suppress_stdout = false;
-                    return;
-                } else {
-                    printf(";; Got bad packet: unexpected end of input\n%zu bytes\n", pkt_len);
-                    hexdump(pkt, pkt_len);
-                    return;
-                }
-            }
+    const char *sec_names[2] = { "ANSWER", "AUTHORITY" };
+    bool sec_show[2] = { dopt->show_answer, dopt->show_authority };
+    for (int s = 0; s < 2; s++) {
+        if (ps.count[s + 1] == 0) continue;
+        if (dopt->show_comments && sec_show[s]) {
+            printf("%s;; %s SECTION:\n", gap ? "\n" : "", sec_names[s]);
+            gap = true;
+            any_section = true;
+        }
+        if (!sec_show[s]) g_dag_suppress_stdout = true;
+        for (int i = 0; i < ps.count[s + 1]; i++) {
+            if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) break;
         }
         g_dag_suppress_stdout = false;
     }
-    if (nscount > 0) {
-        if (dopt->show_comments && dopt->show_authority) printf("\n;; AUTHORITY SECTION:\n");
-        if (!dopt->show_authority) g_dag_suppress_stdout = true;
-        for (int i = 0; i < nscount; i++) {
-            if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) {
-                if (dopt->besteffort) {
-                    g_dag_suppress_stdout = false;
-                    return;
-                } else {
-                    printf(";; Got bad packet: unexpected end of input\n%zu bytes\n", pkt_len);
-                    hexdump(pkt, pkt_len);
-                    return;
-                }
-            }
-        }
-        g_dag_suppress_stdout = false;
+    if (ps.count[3] > 0) {
+        int shown = print_additional_section(pkt, pkt_len, &offset, ps.count[3], axfr_state, dopt, gap);
+        if (shown > 0) any_section = true;
     }
-    if (arcount > 0) {
-        int non_opt_cnt = count_non_opt_rrs(pkt, pkt_len, offset, arcount);
-        if (non_opt_cnt > 0) {
-            if (dopt->show_comments && dopt->show_additional) printf("\n;; ADDITIONAL SECTION:\n");
-            if (!dopt->show_additional) g_dag_suppress_stdout = true;
-            for (int i = 0; i < arcount; i++) {
-                if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) {
-                    if (dopt->besteffort) {
-                        g_dag_suppress_stdout = false;
-                        return;
-                    } else {
-                        printf(";; Got bad packet: unexpected end of input\n%zu bytes\n", pkt_len);
-                        hexdump(pkt, pkt_len);
-                        return;
-                    }
-                }
-            }
-            g_dag_suppress_stdout = false;
-        }
-    }
+    g_dag_pseudo_opt_off = SIZE_MAX;
+    g_dag_show_stray_opt = false;
+    /* dig: every section shown with comments ends with an empty line, so the last one is followed by one */
+    if (any_section) printf("\n");
 }
 
 /* ========================================================================
@@ -2432,11 +2890,7 @@ KARIDNS_TOOL_FN void run_dns64prefix_check(const char *server, int port, const q
     if (q.want_tsig) {
         uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
         int terr = tsig_verify_packet(resp, (size_t)n, &q.tsig_key, req_mac, req_mac_len, NULL, 0, false, dummy_mac, &dummy_mac_len);
-        if (terr == -1) {
-            printf(";; Couldn't verify signature: expected a TSIG or SIG(0)\n");
-        } else if (terr != 0) {
-            printf(";; Couldn't verify signature: tsig verify failure (%d)\n", terr);
-        }
+        print_tsig_verify_error(terr, resp, (size_t)n);
         fflush(stdout);
     }
 
@@ -2472,6 +2926,168 @@ KARIDNS_TOOL_FN void run_dns64prefix_check(const char *server, int port, const q
                     break;
                 }
             }
+        }
+    }
+}
+
+/* 拡張 RCODE を含めた 12 ビットの RCODE (RFC 6891 §6.1.3)。OPT がなければヘッダの 4 ビット */
+static uint16_t response_full_rcode(const uint8_t *resp, size_t n) {
+    if (n < 12) return 0;
+    edns_info_t e;
+    parse_edns_opt(resp, n, (resp[4] << 8) | resp[5], (resp[6] << 8) | resp[7], (resp[8] << 8) | resp[9],
+                   (resp[10] << 8) | resp[11], &e);
+    return e.present ? (uint16_t)(((uint16_t)e.ext_rcode << 4) | (resp[3] & 0x0F)) : (uint16_t)(resp[3] & 0x0F);
+}
+
+static void print_lookup_preamble(const query_opts_t *qo, const display_opts_t *dopt, const char *qname,
+                                  const char *qtype_s, const char *server, int port, bool use_tcp,
+                                  const uint8_t *pkt, size_t pkt_len, bool no_hexdump_query);
+static void print_lookup_stats(const display_opts_t *dopt, const query_opts_t *qo, long long elapsed_usec,
+                               const char *server, int port, bool use_tcp, bool is_xfr,
+                               int total_records, int msg_count, size_t total_bytes, bool tsig_warning);
+
+/* +showbadvers / +showbadcookie: 再送の前に捨てる応答を、dig と同じく 1 回分の問い合わせとして
+ * (見出し・応答・統計) 出す。dig はこの応答の COOKIE に状態を付けない。 */
+static void show_discarded_answer(const uint8_t *resp, size_t n, axfr_state_t *axfr_state, const query_opts_t *qo,
+                                  const display_opts_t *dopt, const char *qname, const char *qtype_s,
+                                  const char *server, int port, bool use_tcp, const uint8_t *pkt, size_t pkt_len,
+                                  bool no_hexdump_query, bool *preamble_done, const struct timespec *start_ts) {
+    if (dopt->short_mode || dopt->yaml) return;
+    if (!*preamble_done) {
+        print_lookup_preamble(qo, dopt, qname, qtype_s, server, port, use_tcp, pkt, pkt_len, no_hexdump_query);
+        *preamble_done = true;
+    }
+    display_opts_t d = *dopt;
+    d.has_expected_client_cookie = false;
+    d.msg_is_query = true; /* no cookie status */
+    print_response(resp, n, axfr_state, &d);
+    if (dopt->show_stats) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long long usec = (now.tv_sec - start_ts->tv_sec) * 1000000LL + (now.tv_nsec - start_ts->tv_nsec) / 1000LL;
+        print_lookup_stats(dopt, qo, usec, server, port, use_tcp, false, 0, 1, n, false);
+    }
+}
+
+/* ";; Query time" から ";; MSG SIZE" / ";; XFR size" までの統計と、その後の空行 (dig と同じ) */
+static void print_lookup_stats(const display_opts_t *dopt, const query_opts_t *qo, long long elapsed_usec,
+                               const char *server, int port, bool use_tcp, bool is_xfr,
+                               int total_records, int msg_count, size_t total_bytes, bool tsig_warning) {
+    time_t now = time(NULL);
+    char time_buf[64];
+    /* dig: "Tue Oct 06 06:49:22 UTC 2026" (zero-padded day) */
+    strftime(time_buf, sizeof(time_buf), "%a %b %d %H:%M:%S %Z %Y", localtime(&now));
+    const char *proto_name = "UDP";
+    if (qo->use_doh) {
+        proto_name = (qo->doh_method == DOH_GET) ? (qo->doh_tls ? "HTTPS-GET" : "HTTP-GET") : (qo->doh_tls ? "HTTPS" : "HTTP");
+    } else if (qo->use_tls) {
+        proto_name = "TLS";
+    } else if (use_tcp) {
+        proto_name = "TCP";
+    }
+    if (dopt->time_unit_usec) {
+        printf(";; Query time: %lld usec\n", elapsed_usec);
+    } else {
+        printf(";; Query time: %lld msec\n", elapsed_usec / 1000LL);
+    }
+    printf(";; SERVER: %s#%d(%s) (%s)\n", (g_last_server_ip[0] ? g_last_server_ip : server), port, server, proto_name);
+    printf(";; WHEN: %s\n", time_buf);
+    if (is_xfr) {
+        printf(";; XFR size: %d records (messages %d, bytes %zu)\n", total_records, msg_count, total_bytes);
+    } else {
+        printf(";; MSG SIZE  rcvd: %zu\n", total_bytes);
+    }
+    if (tsig_warning) {
+        printf(";; WARNING -- Some TSIG could not be validated\n");
+    }
+    printf("\n");
+}
+
+/* dig 9.20 と同じ型の表記。共有の dag_type_name() (dns_utils.c) はサーバーと karicheck も使うので
+ * RFC 9824 の NXNAME (128) を知っているが、dig 9.20.29 は "TYPE128" と出す (dig 互換を優先する、ユーザー判断)。
+ * 入力の "NXNAME" は従来どおり受け付ける。 */
+const char *dag_type_name(uint16_t type, char *buf, size_t buf_size) {
+    if (type == 128) {
+        snprintf(buf, buf_size, "TYPE%u", type);
+        return buf;
+    }
+    return format_type_name(type, buf, buf_size);
+}
+
+/* "; <<>> dag <<>> ..." の見出し (+cmd)。qo->no_cmd_banner は検索リストの 2 番目以降の候補
+ * (+qr のとき dig は見出しを 1 回だけ出す)。qo->cmd_banner_style は 2 番目以降のクエリ (dig は見出しを
+ * 最初のクエリにだけ出し、-f の 2 行目以降は "; <<>>" 行だけ、コマンドラインの 2 番目以降は出さない)。
+ * 通常の問い合わせと +trace (dag_trace.c) が使う。 */
+void dag_print_cmd_banner(const query_opts_t *qo, const display_opts_t *dopt, const char *qname,
+                          const char *qtype_s, const char *server, int port, bool use_tcp) {
+    if (dopt->short_mode || dopt->yaml) return;
+    if (dopt->show_cmd && !qo->no_cmd_banner && qo->cmd_banner_style != CMD_BANNER_NONE) {
+        bool line_only = (qo->cmd_banner_style == CMD_BANNER_LINE);
+        if (!line_only) printf("\n"); /* dig starts the banner with an empty line */
+        const char *disp_qname = qo->orig_qname ? qo->orig_qname : qname;
+        const char *disp_qtype = qo->orig_qtype_s ? qo->orig_qtype_s : (qtype_s ? qtype_s : "");
+        if (qo->server_explicit) {
+            int found_cnt = get_server_addr_count(server, port, qo->pref_family);
+            if (disp_qtype[0]) {
+                printf("; <<>> dag <<>> %s %s @%s%s\n", disp_qname, disp_qtype, server, use_tcp ? " (tcp)" : "");
+            } else {
+                printf("; <<>> dag <<>> %s @%s%s\n", disp_qname, server, use_tcp ? " (tcp)" : "");
+            }
+            if (!line_only) printf("; (%d server%s found)\n", found_cnt, found_cnt == 1 ? "" : "s");
+        } else {
+            if (disp_qtype[0]) {
+                printf("; <<>> dag <<>> %s %s%s\n", disp_qname, disp_qtype, use_tcp ? " (tcp)" : "");
+            } else {
+                printf("; <<>> dag <<>> %s%s\n", disp_qname, use_tcp ? " (tcp)" : "");
+            }
+        }
+        if (!line_only) printf(";; global options: +cmd\n");
+    }
+}
+
+/* 見出しと、送信したクエリの 16 進ダンプ */
+static void print_lookup_preamble(const query_opts_t *qo, const display_opts_t *dopt, const char *qname,
+                                  const char *qtype_s, const char *server, int port, bool use_tcp,
+                                  const uint8_t *pkt, size_t pkt_len, bool no_hexdump_query) {
+    if (dopt->short_mode || dopt->yaml) return;
+    dag_print_cmd_banner(qo, dopt, qname, qtype_s, server, port, use_tcp);
+    if (!no_hexdump_query) {
+        printf("Query (%zu bytes):\n", pkt_len);
+        hexdump(pkt, pkt_len);
+        printf("\n");
+    }
+}
+
+/* X-43: TCP の応答の検査 (dig 9.20 dighost.c recv_done() と同じ結果。RFC 5452 §9.1)。UDP では合わない応答を
+ * 捨てて待ち続けるが、TCP の dig は次のとおり:
+ *   12 オクテット未満 -> ";; ERROR: short (< header size) message" を出し、この問い合わせをやめる (終了コード 0)
+ *   ID が違う    -> ";; ERROR: ID mismatch: expected ID N, got M" を出し、この問い合わせをやめる (終了コード 0)
+ *   質問が違う   -> dag_check_answer() の表示だけで、この問い合わせをやめる
+ *   opcode が違う -> 警告を出し、同じ接続の次のメッセージを待つ。接続が閉じれば ";; communications error ...:
+ *                   end of file" でこの試行は失敗
+ * 戻り値: 0 = resp (長さ n) は使える応答、1 = 問い合わせをやめる、-1 = この試行は失敗。 */
+static int dag_tcp_check_answer(int sock, const uint8_t *pkt, size_t pkt_len, uint8_t *resp, size_t resp_cap,
+                                ssize_t *n, const char *server, int port, uint16_t expected_id) {
+    if (has_break(BRK_QR_BIT, NULL, NULL) || has_break(BRK_TOO_SHORT, NULL, NULL)) return 0; /* as for UDP */
+    for (;;) {
+        if (*n < 12) {
+            printf(";; ERROR: short (< header size) message\n");
+            return 1;
+        }
+        uint16_t resp_id = (uint16_t)((resp[0] << 8) | resp[1]);
+        if (resp_id != expected_id) {
+            printf(";; ERROR: ID mismatch: expected ID %u, got %u\n", expected_id, resp_id);
+            return 1;
+        }
+        if (dag_check_answer(pkt, pkt_len, resp, (size_t)*n)) return 0;
+        if (((pkt[2] >> 3) & 0x0F) == ((resp[2] >> 3) & 0x0F)) return 1; /* question mismatch */
+        errno = 0;
+        *n = sock >= 0 ? do_tcp_recv_response(sock, resp, resp_cap) : -1;
+        if (*n <= 0) {
+            bool timed_out = (errno == EAGAIN || errno == EWOULDBLOCK);
+            printf(";; communications error to %s#%d: %s\n", g_last_server_ip[0] ? g_last_server_ip : server, port,
+                   timed_out ? "timed out" : "end of file");
+            return -1;
         }
     }
 }
@@ -2520,11 +3136,29 @@ KARIDNS_TOOL_FN int run_test(const char *test_name, const char *qname, const cha
     uint8_t request_mac[64];
     size_t request_mac_len = 0;
 
+    /* ヘッダーのフラグは署名の前に入れる。署名後に書き換えると TSIG の MAC が合わず、
+     * BADVERS/BADCOOKIE の再送で作り直したクエリとも食い違う (X-36)。 */
+    if (norecurse) qo->rd_flag = false;
+    if (qtype == 252 || qtype == 251) qo->rd_flag = false; /* dig は AXFR/IXFR を RD=0 で送る (+rec でも) */
+    if (adflag) qo->ad_flag = true;
+    if (cdflag) qo->cd_flag = true;
+    if (aaflag) qo->aa_flag = true;
+    if (tcflag) qo->tc_flag = true;
+    if (zflag) qo->z_flag = true;
+
     if (hex_payload) {
         pkt_len = parse_hex_string(hex_payload, pkt, sizeof(pkt));
         if (pkt_len == 0 || pkt_len > sizeof(pkt)) {
             fprintf(stderr, "Error: Invalid, empty, or oversized hex payload (max %zu bytes)\n", sizeof(pkt));
             return 1;
+        }
+        if (pkt_len >= 4) {
+            if (norecurse) pkt[2] &= ~0x01; // Clear RD bit
+            if (adflag) pkt[3] |= 0x20;     // Set AD bit
+            if (cdflag) pkt[3] |= 0x10;     // Set CD bit
+            if (aaflag) pkt[2] |= 0x04;     // Set AA bit
+            if (tcflag) pkt[2] |= 0x02;     // Set TC bit
+            if (zflag) pkt[3] |= 0x40;      // Set Z bit
         }
         if (qo->want_tsig) {
             qo->tsig_key.fuzztime = qo->fuzztime;
@@ -2538,25 +3172,6 @@ KARIDNS_TOOL_FN int run_test(const char *test_name, const char *qname, const cha
         if (pkt_len == 0 && !has_break(BRK_TOO_SHORT, NULL, NULL) && !qo->header_only) {
             return 1;
         }
-    }
-
-    if (norecurse) {
-        pkt[2] &= ~0x01; // Clear RD bit
-    }
-    if (adflag) {
-        pkt[3] |= 0x20;  // Set AD bit
-    }
-    if (cdflag) {
-        pkt[3] |= 0x10;  // Set CD bit
-    }
-    if (aaflag) {
-        pkt[2] |= 0x04;  // Set AA bit
-    }
-    if (tcflag) {
-        pkt[2] |= 0x02;  // Set TC bit
-    }
-    if (zflag) {
-        pkt[3] |= 0x40;  // Set Z bit
     }
 
     long short_len = 3;
@@ -2573,42 +3188,21 @@ KARIDNS_TOOL_FN int run_test(const char *test_name, const char *qname, const cha
         retry_tcp = false;
         struct timespec start_ts;
         clock_gettime(CLOCK_MONOTONIC, &start_ts);
+        clock_gettime(CLOCK_REALTIME, &g_dag_query_time);
         
         axfr_state_t axfr_state = {0};
         axfr_state.is_axfr = (qtype == 252 || qtype == 251);
         axfr_state.is_ixfr = (qtype == 251);
 
 
-        if (!dopt->short_mode && !dopt->yaml) {
-            if (dopt->show_cmd) {
-                const char *disp_qname = (qo && qo->orig_qname) ? qo->orig_qname : qname;
-                const char *disp_qtype = (qo && qo->orig_qtype_s) ? qo->orig_qtype_s : (qtype_s ? qtype_s : "");
-                if (qo && qo->server_explicit) {
-                    int found_cnt = get_server_addr_count(server, port, qo ? qo->pref_family : AF_UNSPEC);
-                    if (disp_qtype && disp_qtype[0]) {
-                        printf("; <<>> dag <<>> %s %s @%s%s\n", disp_qname, disp_qtype, server, use_tcp ? " (tcp)" : "");
-                    } else {
-                        printf("; <<>> dag <<>> %s @%s%s\n", disp_qname, server, use_tcp ? " (tcp)" : "");
-                    }
-                    printf("; (%d server%s found)\n", found_cnt, found_cnt == 1 ? "" : "s");
-                } else {
-                    if (disp_qtype && disp_qtype[0]) {
-                        printf("; <<>> dag <<>> %s %s%s\n", disp_qname, disp_qtype, use_tcp ? " (tcp)" : "");
-                    } else {
-                        printf("; <<>> dag <<>> %s%s\n", disp_qname, use_tcp ? " (tcp)" : "");
-                    }
-                }
-                printf(";; global options: +cmd\n");
-            }
-            if (!no_hexdump_query) {
-                printf("Query (%zu bytes):\n", pkt_len);
-                hexdump(pkt, pkt_len);
-                printf("\n");
-            }
-        }
-
+        /* dig と同じく、コマンド行の見出しと (dag 独自の) クエリのダンプは最初に何かを表示する時点で出す:
+         * +qr なら送信時、そうでなければ応答の表示時。BADVERS/BADCOOKIE の再送メッセージはその前に出る。
+         * 検索リストの途中の候補 (NXDOMAIN で次へ進む) は +showsearch でなければ何も表示しない (D-14)。 */
+        bool preamble_done = false;
         if (dopt->show_query_message) {
-            print_sent_query(pkt, pkt_len, qo, dopt);
+            print_lookup_preamble(qo, dopt, qname, qtype_s, server, port, use_tcp, pkt, pkt_len, no_hexdump_query);
+            preamble_done = true;
+            print_sent_query(pkt, pkt_len, server, port, use_tcp, qo, dopt);
         }
 
         query_opts_t eff_qo = *qo;
@@ -2622,8 +3216,13 @@ KARIDNS_TOOL_FN int run_test(const char *test_name, const char *qname, const cha
         int max_tries = (qo->tries < 1) ? 1 : qo->tries;
         
         int tcp_sock = -1;
+        /* X-44: dig +yaml prints none of the ";;" transport diagnostics (ignored answers, timeouts); a lookup that
+         * fails ends with a DIG_ERROR document instead */
+        bool saved_suppress = g_dag_suppress_stdout;
+        if (dopt->yaml) g_dag_suppress_stdout = true;
         while (attempts < max_tries) {
             attempts++;
+            bool tcp_eof_reported = false; /* X-43: dig prints no "retrying" line after a TCP end of file */
             if (eff_qo.use_doh) {
                 n = do_doh_exchange(server, port, &eff_qo, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
                 if (n > 0) break;
@@ -2631,79 +3230,126 @@ KARIDNS_TOOL_FN int run_test(const char *test_name, const char *qname, const cha
                 n = do_tls_exchange(server, port, &eff_qo, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
                 if (n > 0) break;
             } else if (use_tcp) {
+                int check_sock = -1;
                 if (eff_qo.keep_tcp_open) {
                     n = do_tcp_exchange(server, port, &eff_qo, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
-                    if (n > 0) break;
+                    check_sock = g_cached_conn.sock;
                 } else {
                     tcp_sock = do_tcp_send_request(server, port, &eff_qo, pkt, pkt_len, eff_qo.timeout_sec);
-                    if (tcp_sock >= 0) {
-                        n = do_tcp_recv_response(tcp_sock, resp, sizeof(resp));
-                        if (n > 0) {
-                            break; // connected and got first message
-                        }
-                        close(tcp_sock);
-                        tcp_sock = -1;
-                        n = -1;
-                    }
+                    if (tcp_sock >= 0) n = do_tcp_recv_response(tcp_sock, resp, sizeof(resp));
+                    check_sock = tcp_sock;
                 }
+                if (n > 0) {
+                    /* the ID of the message actually sent (a hex payload carries its own ID), as do_udp_exchange() */
+                    uint16_t expected_id = pkt_len >= 2 ? (uint16_t)((pkt[0] << 8) | pkt[1]) : 0;
+                    int verdict = dag_tcp_check_answer(check_sock, pkt, pkt_len, resp, sizeof(resp), &n, server, port,
+                                                       expected_id);
+                    if (verdict == 0) break; // connected and got the first message
+                    if (verdict == 1) {      // dig cancels the lookup without further output (X-43)
+                        if (tcp_sock >= 0) close(tcp_sock);
+                        if (eff_qo.keep_tcp_open) close_cached_tcp();
+                        g_dag_suppress_stdout = saved_suppress;
+                        return 0;
+                    }
+                    tcp_eof_reported = true;  // the attempt failed; the reason is already printed
+                }
+                if (tcp_sock >= 0) close(tcp_sock);
+                tcp_sock = -1;
+                if (eff_qo.keep_tcp_open) close_cached_tcp();
+                n = -1;
             } else {
                 n = do_udp_exchange(server, port, &eff_qo, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
                 if (n >= 0) break;
+                if (n == DAG_EXCHANGE_TIMEOUT) {
+                    /* dig 9.20 reports every attempt that timed out */
+                    printf(";; communications error to %s#%d: timed out\n", g_last_server_ip[0] ? g_last_server_ip : server, port);
+                    continue;
+                }
             }
-            if (attempts < max_tries) {
+            if (attempts < max_tries && !tcp_eof_reported) {
                 if (!dopt->short_mode) printf(";; connection timed out; retrying...\n");
             }
         }
+        g_dag_suppress_stdout = saved_suppress;
 
-        if (n >= 12 && eff_qo.retry_on_badcookie) {
+        /* dig: a truncated UDP answer is not shown; dig says so and asks again over TCP (RFC 7766 §5) */
+        if (n >= 4 && !use_tcp && (resp[2] & 0x02) && !tc_retried && !eff_qo.ignore_tc) {
+            if (!dopt->short_mode && !dopt->yaml) printf(";; Truncated, retrying in TCP mode.\n");
+            use_tcp = true;
+            retry_tcp = true;
+            tc_retried = true;
+            continue;
+        }
+
+        /* RFC 7873 §5.3: a client that sent a cookie retries a BADCOOKIE answer with the new Server Cookie and, if
+         * that is answered with BADCOOKIE again, over TCP (dig: "BADCOOKIE, retrying." / "... retrying in TCP mode.") */
+        for (int bc_round = 0; n >= 12 && eff_qo.retry_on_badcookie && eff_qo.want_cookie && bc_round < 2; bc_round++) {
             edns_info_t bc_edns;
-            uint16_t b_qd = (resp[4] << 8) | resp[5];
-            uint16_t b_an = (resp[6] << 8) | resp[7];
-            uint16_t b_ns = (resp[8] << 8) | resp[9];
-            uint16_t b_ar = (resp[10] << 8) | resp[11];
-            parse_edns_opt(resp, n, b_qd, b_an, b_ns, b_ar, &bc_edns);
-            uint16_t b_rcode = bc_edns.present ? (((uint16_t)bc_edns.ext_rcode << 4) | (resp[3] & 0x0F)) : (resp[3] & 0x0F);
-            if (b_rcode == 23 && bc_edns.has_cookie && bc_edns.server_cookie_len > 0) {
-                if (dopt->show_badcookie_msg) {
-                    if (!dopt->short_mode) {
-                        print_response(resp, (size_t)n, &axfr_state, dopt);
-                        printf("\n");
-                    }
-                }
-                printf(";; BADCOOKIE, retrying.\n");
-                eff_qo.retry_on_badcookie = false; // RFC 7873 §5.4: 再送は 1 回限り
-                eff_qo.want_cookie = true;
-                eff_qo.server_cookie_len = bc_edns.server_cookie_len;
-                memcpy(eff_qo.server_cookie, bc_edns.server_cookie, bc_edns.server_cookie_len);
-                pkt_len = build_and_sign_query(pkt, sizeof(pkt), qname, qtype, &eff_qo, request_mac, &request_mac_len);
-                n = do_dns_exchange_by_transport(server, port, &eff_qo, use_tcp, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
+            parse_edns_opt(resp, n, (resp[4] << 8) | resp[5], (resp[6] << 8) | resp[7], (resp[8] << 8) | resp[9],
+                           (resp[10] << 8) | resp[11], &bc_edns);
+            if (response_full_rcode(resp, (size_t)n) != 23 || !bc_edns.has_cookie || bc_edns.server_cookie_len == 0) break;
+            if (bc_round == 1 && use_tcp) break;
+            if (dopt->show_badcookie_msg) {
+                show_discarded_answer(resp, (size_t)n, &axfr_state, qo, dopt, qname, qtype_s, server, port, use_tcp,
+                                      pkt, pkt_len, no_hexdump_query, &preamble_done, &start_ts);
             }
+            if (bc_round == 0) {
+                printf(";; BADCOOKIE, retrying.\n");
+            } else {
+                printf(";; BADCOOKIE, retrying in TCP mode.\n");
+                use_tcp = true;
+            }
+            eff_qo.server_cookie_len = bc_edns.server_cookie_len;
+            memcpy(eff_qo.server_cookie, bc_edns.server_cookie, bc_edns.server_cookie_len);
+            pkt_len = build_and_sign_query(pkt, sizeof(pkt), qname, qtype, &eff_qo, request_mac, &request_mac_len);
+            /* dig は再送を新しい問い合わせとして送る: +keepopen でなければ前の TCP 接続は使わない */
+            if (!qo->keep_tcp_open) close_cached_tcp();
+            n = do_dns_exchange_by_transport(server, port, &eff_qo, use_tcp, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
         }
 
         if (n >= 12 && eff_qo.edns_negotiation && eff_qo.want_opt) {
-            uint16_t bv_qd = (resp[4] << 8) | resp[5];
-            uint16_t bv_an = (resp[6] << 8) | resp[7];
-            uint16_t bv_ns = (resp[8] << 8) | resp[9];
-            uint16_t bv_ar = (resp[10] << 8) | resp[11];
-            edns_info_t bv_edns;
-            parse_edns_opt(resp, n, bv_qd, bv_an, bv_ns, bv_ar, &bv_edns);
-            uint16_t bv_rcode = bv_edns.present
-                ? (((uint16_t)bv_edns.ext_rcode << 4) | (resp[3] & 0x0F))
-                : (resp[3] & 0x0F);
+            uint16_t bv_rcode = response_full_rcode(resp, (size_t)n);
             if (bv_rcode == 16 && eff_qo.edns_version > 0) {
-                if (dopt->show_badvers_msg && !dopt->short_mode) {
-                    print_response(resp, (size_t)n, &axfr_state, dopt);
-                    printf("\n");
+                /* dig はゾーン転送の BADVERS を表示せずに再送する */
+                if (!axfr_state.is_axfr) {
+                    if (dopt->show_badvers_msg) {
+                        show_discarded_answer(resp, (size_t)n, &axfr_state, qo, dopt, qname, qtype_s, server, port, use_tcp,
+                                              pkt, pkt_len, no_hexdump_query, &preamble_done, &start_ts);
+                    }
+                    printf(";; BADVERS, retrying with EDNS version %d.\n", eff_qo.edns_version - 1);
                 }
-                printf(";; BADVERS, retrying with EDNS version %d.\n", eff_qo.edns_version - 1);
                 eff_qo.edns_version -= 1;
                 pkt_len = build_and_sign_query(pkt, sizeof(pkt), qname, qtype, &eff_qo, request_mac, &request_mac_len);
+                /* dig は再送を新しい問い合わせとして送る: +keepopen でなければ前の TCP 接続は使わない */
+                if (!qo->keep_tcp_open) close_cached_tcp();
                 n = do_dns_exchange_by_transport(server, port, &eff_qo, use_tcp, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
             }
         }
 
+        /* 検索リストの途中の候補: NXDOMAIN なら呼び出し元が次の候補へ進む。dig と同様に +showsearch でなければ
+         * この応答は表示しない。呼び出し元が RCODE を見られるよう結果行だけ残す。 */
+        if (n >= 12 && qo->search_more && !dopt->showsearch && (resp[3] & 0x0F) == 3) {
+            sres = alloc_result_row();
+            if (sres) {
+                sres->rcode = 3;
+                size_t to_copy = (size_t)n < sizeof(sres->resp_buf) ? (size_t)n : sizeof(sres->resp_buf);
+                memcpy(sres->resp_buf, resp, to_copy);
+                sres->resp_len = (ssize_t)to_copy;
+                g_server_count++;
+            }
+            if (tcp_sock >= 0) close(tcp_sock);
+            return 0;
+        }
         if (n <= 0) {
-            printf(";; no servers could be reached\n");
+            if (!preamble_done) {
+                print_lookup_preamble(qo, dopt, qname, qtype_s, server, port, use_tcp, pkt, pkt_len, no_hexdump_query);
+                preamble_done = true;
+            }
+            if (dopt->yaml) {
+                printf("- type: DIG_ERROR\n  message: |\n    no servers could be reached\n"); /* dig 9.20 (X-44) */
+            } else {
+                printf(";; no servers could be reached\n");
+            }
             sres = alloc_result_row();
             if (sres) {
                 sres->rcode = 2; // SERVFAIL
@@ -2722,6 +3368,7 @@ KARIDNS_TOOL_FN int run_test(const char *test_name, const char *qname, const cha
 
         struct timespec end_ts;
         clock_gettime(CLOCK_MONOTONIC, &end_ts);
+        clock_gettime(CLOCK_REALTIME, &g_dag_response_time);
         long long elapsed_usec = (end_ts.tv_sec - start_ts.tv_sec) * 1000000LL + (end_ts.tv_nsec - start_ts.tv_nsec) / 1000LL;
         long elapsed_ms = (long)(elapsed_usec / 1000LL);
 
@@ -2735,6 +3382,7 @@ KARIDNS_TOOL_FN int run_test(const char *test_name, const char *qname, const cha
         size_t unsigned_accum_len = 0;
         
         int start_index = g_server_count;
+        bool bad_packet = false;
         sres = alloc_result_row();
 
         do {
@@ -2805,21 +3453,29 @@ KARIDNS_TOOL_FN int run_test(const char *test_name, const char *qname, const cha
                 } else {
                     had_tsig_fail = true;
                     last_msg_had_tsig = false;
-                    if (err == -1) {
-                        printf(";; Couldn't verify signature: expected a TSIG or SIG(0)\n");
-                    } else if (err == 16) {
-                        printf(";; Couldn't verify signature: tsig verify failure (BADSIG)\n");
-                    } else if (err == 17) {
-                        printf(";; Couldn't verify signature: tsig verify failure (BADKEY)\n");
-                    } else if (err == 18) {
-                        printf(";; Couldn't verify signature: tsig verify failure (BADTIME)\n");
-                    } else if (err == 21) {
-                        printf(";; Couldn't verify signature: tsig verify failure (BADALG)\n");
-                    } else {
-                        printf(";; Couldn't verify signature: tsig verify failure (%d)\n", err);
-                    }
-                    fflush(stdout);
+                    /* RFC 8945 §5.2 (FORMERR: TSIG が複数・最後でない・MAC Size が範囲外, §5.2.2.1) */
+                    print_tsig_verify_error(err, resp, (size_t)n);
                 }
+            }
+
+            /* dig は解析の警告 (malformed / missing question section) を見出しの前に出し、
+             * 解析できないメッセージ (Got bad packet) では見出しも統計も出さない (T-12)。+short でも同じ (X-44)。
+             * +yaml では警告を出さず、解析できないメッセージは何も表示しない (print_response_yaml()) */
+            display_opts_t resp_dopt = *dopt;
+            if (!preamble_done && !dopt->yaml && !axfr_state.is_axfr) {
+                dag_parse_t ps0;
+                dag_parse_message(resp, (size_t)n, &ps0);
+                if (print_parse_diagnostics(resp, (size_t)n, &ps0)) {
+                    bad_packet = true;
+                    break;
+                }
+                resp_dopt.parse_diag_done = true;
+            }
+
+            /* 見出しは署名の検証結果の後、最初の応答の前 (dig と同じ順) */
+            if (!preamble_done) {
+                print_lookup_preamble(qo, dopt, qname, qtype_s, server, port, use_tcp, pkt, pkt_len, no_hexdump_query);
+                preamble_done = true;
             }
 
             if (!dopt->short_mode) {
@@ -2840,15 +3496,35 @@ KARIDNS_TOOL_FN int run_test(const char *test_name, const char *qname, const cha
                     hexdump(resp, (size_t)n);
                     printf("\n");
                 }
-                if (dopt->yaml) {
+                if (dopt->yaml && axfr_state.is_axfr && response_full_rcode(resp, (size_t)n) != 0) {
+                    /* dig +yaml: 失敗した転送はヘッダだけを出して "; Transfer failed." */
+                    display_opts_t fail_dopt = *dopt;
+                    fail_dopt.show_comments = fail_dopt.show_question = fail_dopt.show_answer =
+                        fail_dopt.show_authority = fail_dopt.show_additional = false;
+                    print_response_yaml(resp, (size_t)n, server, port, use_tcp, &fail_dopt);
+                    printf("; Transfer failed.\n");
+                    axfr_state.failed = axfr_state.axfr_complete = true;
+                } else if (dopt->yaml && axfr_state.is_axfr) {
+                    /* dig +yaml は転送の応答を RR だけで出す (OPT 疑似セクションと質問は出さない) */
+                    display_opts_t xfr_dopt = *dopt;
+                    xfr_dopt.show_comments = xfr_dopt.show_question = false;
+                    print_response_yaml(resp, (size_t)n, server, port, use_tcp, &xfr_dopt);
+                } else if (dopt->yaml) {
                     print_response_yaml(resp, (size_t)n, server, port, use_tcp, dopt);
                 } else {
-                    print_response(resp, (size_t)n, &axfr_state, dopt);
+                    print_response(resp, (size_t)n, &axfr_state, &resp_dopt);
                 }
+            } else if (axfr_state.is_axfr && response_full_rcode(resp, (size_t)n) != 0) {
+                printf("; Transfer failed.\n");
+                axfr_state.failed = axfr_state.axfr_complete = true;
             } else {
-                uint16_t ancount = (resp[6] << 8) | resp[7];
+                /* X-44: like dig +short, only the answers that parsed (a malformed RR and what follows it are not
+                 * shown; the warning was printed above) */
+                dag_parse_t short_ps;
+                dag_parse_message(resp, (size_t)n, &short_ps);
+                uint16_t ancount = short_ps.count[1];
                 size_t off = 12;
-                uint16_t qdcount = (resp[4] << 8) | resp[5];
+                uint16_t qdcount = short_ps.count[0];
                 for (int k=0; k<qdcount; k++) {
                     size_t nxt; if(skip_wire_name(resp, n, off, &nxt)==0) off = nxt + 4;
                 }
@@ -2917,7 +3593,7 @@ KARIDNS_TOOL_FN int run_test(const char *test_name, const char *qname, const cha
             close_cached_tcp();
         }
 
-        if (qo->want_tsig && axfr_state.is_axfr && axfr_state.axfr_complete) {
+        if (qo->want_tsig && axfr_state.is_axfr && axfr_state.axfr_complete && !axfr_state.failed) {
             if (!last_msg_had_tsig) {
                 had_tsig_fail = true;
                 fprintf(stderr, ";; WARNING: final AXFR message MUST contain TSIG but none was found (RFC 8945 §5.4 violation)\n");
@@ -2937,56 +3613,15 @@ KARIDNS_TOOL_FN int run_test(const char *test_name, const char *qname, const cha
             }
         }
 
-        time_t now = time(NULL);
-        char time_buf[64];
-#ifdef _WIN32
-        strftime(time_buf, sizeof(time_buf), "%a %b %d %H:%M:%S %Z %Y", localtime(&now));
-#else
-        strftime(time_buf, sizeof(time_buf), "%a %b %e %H:%M:%S %Z %Y", localtime(&now));
-#endif
-
-        const char *proto_name = "UDP";
-        if (qo->use_doh) {
-            proto_name = (qo->doh_method == DOH_GET) ? (qo->doh_tls ? "HTTPS-GET" : "HTTP-GET") : (qo->doh_tls ? "HTTPS" : "HTTP");
-        } else if (qo->use_tls) {
-            proto_name = "TLS";
-        } else if (use_tcp) {
-            proto_name = "TCP";
-        }
-
-        if (!dopt->short_mode && !dopt->yaml && dopt->show_stats) {
-            if (dopt->time_unit_usec) {
-                printf("\n;; Query time: %lld usec\n", elapsed_usec);
-            } else {
-                printf("\n;; Query time: %ld msec\n", elapsed_ms);
-            }
-            printf(";; SERVER: %s#%d(%s) (%s)\n", (g_last_server_ip[0] ? g_last_server_ip : server), port, server, proto_name);
-            printf(";; WHEN: %s\n", time_buf);
-            if (qtype == 252 || qtype == 251) {
-                printf(";; XFR size: %d records (messages %d, bytes %zu)\n", total_records, msg_index, total_bytes);
-            } else {
-                printf(";; MSG SIZE  rcvd: %zu\n", total_bytes);
-            }
-            if (qo->want_tsig && had_tsig_fail) {
-                printf(";; WARNING -- Some TSIG could not be validated\n");
-            }
+        if (!dopt->short_mode && !dopt->yaml && dopt->show_stats && !axfr_state.failed && !bad_packet) {
+            print_lookup_stats(dopt, qo, elapsed_usec, server, port, use_tcp, qtype == 252 || qtype == 251,
+                               total_records, msg_index, total_bytes, qo->want_tsig && had_tsig_fail);
         }
         if (tcp_sock >= 0) close(tcp_sock);
 
         bool is_truncated = (!use_tcp && n >= 4 && (resp[2] & 0x02) != 0);
-        if (is_truncated && !tc_retried) {
-            if (eff_qo.ignore_tc) {
-                if (!dopt->short_mode && !dopt->yaml) {
-                    fprintf(stderr, "\n;; Truncated response received, but +ignore specified; not retrying in TCP mode.\n");
-                }
-            } else {
-                if (!dopt->short_mode && !dopt->yaml) {
-                    printf("\n;; Truncated, retrying in TCP mode.\n");
-                }
-                use_tcp = true;
-                retry_tcp = true;
-                tc_retried = true;
-            }
+        if (is_truncated && !tc_retried && eff_qo.ignore_tc && !dopt->short_mode && !dopt->yaml) {
+            fprintf(stderr, "\n;; Truncated response received, but +ignore specified; not retrying in TCP mode.\n");
         }
     } while (retry_tcp);
 
@@ -2997,10 +3632,24 @@ KARIDNS_TOOL_FN int run_test(const char *test_name, const char *qname, const cha
     return 0;
 }
 
-KARIDNS_TOOL_FN void print_multi_server_summary(bool use_ldnsz, bool is_yaml, bool is_trace) {
+/* 比較してよい行か: 同じ質問 (QNAME は大文字小文字を区別しない、QTYPE、QCLASS) への、同じ番号のメッセージ */
+static bool results_comparable(const server_result_t *a, const server_result_t *b) {
+    if (a->msg_index != b->msg_index) return false;
+    if (a->resp_len < 12 || b->resp_len < 12 || a->qdcount != 1 || b->qdcount != 1) return false;
+    size_t ao = 12, bo = 12;
+    char *an = NULL, *bn = NULL;
+    if (expand_wire_name(a->resp_buf, (size_t)a->resp_len, ao, &ao, &g_dag_arena, &an) != 0) return false;
+    if (expand_wire_name(b->resp_buf, (size_t)b->resp_len, bo, &bo, &g_dag_arena, &bn) != 0) return false;
+    if (ao + 4 > (size_t)a->resp_len || bo + 4 > (size_t)b->resp_len) return false;
+    return strcasecmp(an, bn) == 0 && memcmp(a->resp_buf + ao, b->resp_buf + bo, 4) == 0;
+}
+
+/* show_table: +trace / +trace2 / +nssearch / +search の行はそれぞれ別の質問への応答なので、
+ * 比較表は出さない (dig も出さない)。+ldnsz の URL は全行を使う。 */
+KARIDNS_TOOL_FN void print_multi_server_summary(bool use_ldnsz, bool is_yaml, bool is_trace, bool show_table) {
     if (is_yaml || g_server_count == 0) return;
-    
-    if (g_server_count > 1) {
+
+    if (g_server_count > 1 && show_table) {
 
     int max_server_len = 18;
     for (int i = 0; i < g_server_count; i++) {
@@ -3031,17 +3680,18 @@ KARIDNS_TOOL_FN void print_multi_server_summary(bool use_ldnsz, bool is_yaml, bo
         printf("-+-------+---------+-----+-----+-----+------------+--------+------------------------\n");
     }
 
-    server_result_t *base = &g_results[0];
-    for (int i = 0; i < g_server_count; i++) {
-        if (g_results[i].resp_len > 0 && !g_results[i].tc) {
-            base = &g_results[i];
-            break;
-        }
-    }
-
     for (int i = 0; i < g_server_count; i++) {
         server_result_t *r = &g_results[i];
-        
+        /* 基準は同じ質問への最初の完全な (TC=0) 応答。-f で別々の名前を問い合わせた行どうしは比べない */
+        server_result_t *base = r;
+        for (int j = 0; j < g_server_count; j++) {
+            if (g_results[j].resp_len > 0 && !g_results[j].tc &&
+                (&g_results[j] == r || results_comparable(&g_results[j], r))) {
+                base = &g_results[j];
+                break;
+            }
+        }
+
         const char *status_str = "";
         if (r == base) {
             status_str = "[BASE]";
@@ -3111,6 +3761,17 @@ KARIDNS_TOOL_FN void print_multi_server_summary(bool use_ldnsz, bool is_yaml, bo
     }
 }
 
+/* End of one query of several (command-line tuples, batch-file lines): print its multi-server summary, unless
+ * +nofail failover over a server list already did, and start the next one with an empty result table. */
+void finish_query_tuple(const query_spec_t *s) {
+    bool used_nofail = s->qo.nofail && !s->test_all && !s->do_trace && !s->do_trace2 && !s->do_nssearch &&
+                       s->server_arg && strchr(s->server_arg, ',') != NULL;
+    if (!used_nofail)
+        print_multi_server_summary(s->use_ldnsz, s->dopt.yaml, s->do_trace || s->do_trace2,
+                                   !(s->do_trace || s->do_trace2 || s->do_nssearch));
+    g_server_count = 0;
+}
+
 
 KARIDNS_TOOL_FN void usage(const char *prog) {
     (void)prog;
@@ -3165,7 +3826,7 @@ KARIDNS_TOOL_FN void usage(const char *prog) {
         "  +[no]http-post[=endpoint]    Alias for +http-plain-post\n"
         "  +[no]proxy[=spec]            Inject PROXYv2 transport header ahead of any TLS handshake (e.g. +proxy=192.0.2.1#1234-192.0.2.2#53)\n"
         "  +[no]proxy-plain[=spec]      Alias for +proxy (retained for dig/kdig compatibility); behaves identically\n"
-        "  +[no]keepalive               Send EDNS TCP keepalive option (RFC 7828)\n"
+        "  +[no]keepalive               Send EDNS TCP keepalive option (RFC 7828; also over UDP, like dig)\n"
         "  +[no]keepopen                Keep TCP socket open between consecutive queries (RFC 7766)\n"
         "  +[no]dns64prefix             Query IPv4-only prefix from ipv4only.arpa (RFC 7050)\n"
         "  +timeout=N, +time=N          Query timeout in seconds [5]\n"
@@ -3177,14 +3838,16 @@ KARIDNS_TOOL_FN void usage(const char *prog) {
         "  +[no]tcflag                  Set / clear TC (Truncated) bit in query\n"
         "  +[no]raflag                  Set / clear RA (Recursion Available) bit in query\n"
         "  +[no]zflag                   Set / clear Z (Reserved) bit in query\n"
-        "  +opcode=N                    Override DNS Opcode in query header (0=QUERY, 2=STATUS, 5=UPDATE, etc.)\n"
+        "  +opcode=N, +noopcode         Override DNS Opcode in query header (0=QUERY, 2=STATUS, 5=UPDATE, etc.); +noopcode resets it\n"
         "  +qid=N                       Explicitly specify DNS query ID (0-65535)\n"
         "  +[no]ignore                  Ignore TC flag and do not retry via TCP\n"
         "  +tcp-mss=N                   Force TCP Maximum Segment Size (MSS) to N bytes\n"
         "  +tcp-window=N                Force TCP Receive/Send Window Size to N bytes\n"
         "  +[no]fail                    Do not try next server if SERVFAIL is received\n"
         "  +[no]trace                   Trace delegation hierarchy down from root servers (honors +tcp; falls back to TCP on truncated responses;\n"
-        "                               ignores ADDITIONAL section unless +glue is given; implies +noadditional)\n"
+        "                               ignores ADDITIONAL section unless +glue is given; implies +noadditional,\n"
+        "                               +dnssec and +authority like dig (later options override them);\n"
+        "                               stops at a CNAME answer like dig, +trace2 follows it)\n"
         "  +[no]trace2[=brief|normal|verbose]\n"
         "                               Resolve iteratively like a full resolver (BIND/Unbound) without any local resolver:\n"
         "                               primes from built-in root hints (or @server), resolves glueless NS names itself.\n"
@@ -3211,7 +3874,7 @@ KARIDNS_TOOL_FN void usage(const char *prog) {
         "  +bufsize=N                   Set EDNS0 advertised UDP buffer size [1232]\n"
         "  +[no]dnssec                  Request DNSSEC records by setting DO (DNSSEC OK) bit (+[no]do)\n"
         "  +[no]cookie[=hex]            Send EDNS COOKIE option with optional client/server cookie hex [on; like dig]\n"
-        "  +[no]badcookie               Automatically retry with returned server cookie on BADCOOKIE\n"
+        "  +[no]badcookie               On BADCOOKIE retry with the returned server cookie, then over TCP (RFC 7873)\n"
         "  +[no]showbadcookie           Display diagnostic message when BADCOOKIE retry occurs\n"
         "  +subnet=addr[/prefix]        Send EDNS Client Subnet (ECS) option (e.g. +subnet=192.0.2.0/24)\n"
         "  +[no]nsid                    Request Name Server Identifier (NSID) option (RFC 5001)\n"
@@ -3232,7 +3895,7 @@ KARIDNS_TOOL_FN void usage(const char *prog) {
         "  +[no]ttlid                   Display / suppress TTL field in resource records\n"
         "  +[no]unknownformat           Format record RDATA using RFC 3597 unknown type syntax (\\#)\n"
         "  +[no]crypto                  Display / suppress cryptographic key fields in DNSKEY/DS\n"
-        "  +[no]rrcomments              Display explanatory keytag comments on DNSKEY records\n"
+        "  +[no]rrcomments              Display key comments (on by default with +multiline, like dig)\n"
         "  +[no]comments                Toggle comment banners and section header comments\n"
         "  +[no]cmd                     Toggle command line header banner (; <<>> dag <<>> ...)\n"
         "  +[no]stats                   Toggle query timing and server statistics section\n"
@@ -3240,16 +3903,16 @@ KARIDNS_TOOL_FN void usage(const char *prog) {
         "  +[no]answer                  Toggle ANSWER section display\n"
         "  +[no]authority               Toggle AUTHORITY section display\n"
         "  +[no]additional              Toggle ADDITIONAL section display\n"
-        "  +[no]all                     Set or clear all display section flags at once\n"
+        "  +[no]all                     Set or clear all display flags at once (including the hex dumps)\n"
         "  +[no]qr                      Display outgoing query packet representation before sending\n"
         "  +[no]identify                Display responding server IP in short-mode responses\n"
         "  +[no]idn                     Convert Internationalized Domain Names (IDN) (+[no]idnin / +[no]idnout)\n"
         "  +[no]onesoa                  Display only the first SOA record during AXFR transfers\n"
         "  +[no]expandaaaa              Display IPv6 AAAA addresses in fully expanded 8-field format\n"
         "  +[no]split=N                 Split long hex and base64 fields into N-character chunks [56]\n"
-        "  +[no]besteffort              Attempt to parse and display malformed/illegal DNS packets\n"
-        "  +[no]expire                  Request and highlight zone expiration TTL in SOA output\n"
-        "  +[no]showsearch              Display intermediate results during search list resolution\n"
+        "  +[no]besteffort              Accepted for dig compatibility (malformed answers are shown like dig)\n"
+        "  +[no]expire                  Send the EDNS EXPIRE option (RFC 7314)\n"
+        "  +[no]showsearch              Also print the NXDOMAIN lookups of search list processing\n"
         "\n"
         "Dynamic DNS Update Options (RFC 2136):\n"
         "  --update-add <RR>            Add resource record (e.g. --update-add 'host.example.com 300 IN A 192.0.2.1')\n"
@@ -3575,6 +4238,9 @@ KARIDNS_TOOL_FN int run_single_job(const char *qname, const char *qtype_s, const
     bool has_any_success = false;
     for (int ci = 0; ci < candidate_count; ci++) {
         const char *cur_qname = search_candidates[ci];
+        int cand_row_start = g_server_count;
+        qo.search_more = (ci < candidate_count - 1);
+        qo.no_cmd_banner = (ci > 0 && dopt->show_query_message);
 
         if (qo.nofail && server_count > 1 && !test_all) {
             for (int si = 0; si < server_count; si++) {
@@ -3655,6 +4321,7 @@ KARIDNS_TOOL_FN int run_single_job(const char *qname, const char *qtype_s, const
                         }
                         
                         query_opts_t t_qo = qo;
+                        t_qo.search_more = false;
                         if (all_tests[t].edns_code >= 0) {
                             t_qo.want_opt = true;
                             t_qo.custom_edns_opts[0].code = all_tests[t].edns_code;
@@ -3697,6 +4364,23 @@ KARIDNS_TOOL_FN int run_single_job(const char *qname, const char *qtype_s, const
         if (last_rcode != 3 /* NXDOMAIN */ || ci == candidate_count - 1) {
             break;
         }
+        /* 次の候補へ進む。dig と同様に、同じサーバから受け取ったサーバ Cookie を次の問い合わせに付ける
+         * (RFC 7873 §5.3)。比較表は最後に問い合わせた名前の応答どうしで作る */
+        if (server_count == 1 && qo.want_cookie && g_server_count > cand_row_start) {
+            const server_result_t *last = &g_results[g_server_count - 1];
+            if (last->resp_len >= 12) {
+                edns_info_t ck;
+                parse_edns_opt(last->resp_buf, (size_t)last->resp_len, (last->resp_buf[4] << 8) | last->resp_buf[5],
+                               (last->resp_buf[6] << 8) | last->resp_buf[7], (last->resp_buf[8] << 8) | last->resp_buf[9],
+                               (last->resp_buf[10] << 8) | last->resp_buf[11], &ck);
+                if (ck.present && ck.has_cookie && ck.server_cookie_len >= 8 && ck.server_cookie_len <= sizeof(qo.server_cookie) &&
+                    memcmp(ck.client_cookie, qo.client_cookie, 8) == 0) {
+                    memcpy(qo.server_cookie, ck.server_cookie, ck.server_cookie_len);
+                    qo.server_cookie_len = ck.server_cookie_len;
+                }
+            }
+        }
+        g_server_count = cand_row_start;
     }
     
     if (server_count > 1 && has_any_success) {
@@ -3707,12 +4391,6 @@ KARIDNS_TOOL_FN int run_single_job(const char *qname, const char *qtype_s, const
     return last_overall_rc;
 }
 
-#define MAX_DAG_QUERIES 64
-
-typedef struct {
-    int start;
-    int end;
-} arg_slice_t;
 
 
 
@@ -3785,8 +4463,16 @@ KARIDNS_TOOL_FN bool is_known_qclass_str(const char *s, uint16_t *out_class) {
         if (out_class) *out_class = 4;
         return true;
     }
+    /* X-49: "CLASS<n>" (RFC 3597 §5) only with decimal digits and n <= 65535, as dig parses it; anything else
+     * (CLASS70000, CLASS1x) is a domain name (it was truncated to 16 bits before) */
     if (strncasecmp(s, "CLASS", 5) == 0 && isdigit((unsigned char)s[5])) {
-        if (out_class) *out_class = (uint16_t)atoi(s + 5);
+        unsigned long v = 0;
+        for (const char *p = s + 5; *p; p++) {
+            if (!isdigit((unsigned char)*p)) return false;
+            v = v * 10 + (unsigned long)(*p - '0');
+            if (v > 65535) return false;
+        }
+        if (out_class) *out_class = (uint16_t)v;
         return true;
     }
     return false;
@@ -4206,13 +4892,16 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
         } else if (strcmp(arg, "+allcompare") == 0) {
             g_want_allcompare = true;
         } else if (strcmp(arg, "+noall") == 0) {
+            /* hex dumps are display output too: "+noall +answer" prints only the answer, like dig (T-07) */
             spec->dopt.show_question = spec->dopt.show_answer = spec->dopt.show_authority =
                 spec->dopt.show_additional = spec->dopt.show_comments = spec->dopt.show_stats =
                 spec->dopt.show_cmd = false;
+            spec->no_hexdump_query = spec->no_hexdump_response = true;
         } else if (strcmp(arg, "+all") == 0) {
             spec->dopt.show_question = spec->dopt.show_answer = spec->dopt.show_authority =
                 spec->dopt.show_additional = spec->dopt.show_comments = spec->dopt.show_stats =
                 spec->dopt.show_cmd = true;
+            spec->no_hexdump_query = spec->no_hexdump_response = false;
         } else if (strcmp(arg, "+answer") == 0) {
             spec->dopt.show_answer = true;
         } else if (strcmp(arg, "+noanswer") == 0) {
@@ -4259,6 +4948,11 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
             spec->do_trace = true;
             /* BIND dig 同様、+trace は +noadditional を含意する (後続の +additional で上書き可) */
             spec->dopt.show_additional = false;
+            /* X-45: dig 9.20 の +trace は +dnssec と +authority も含意する (後続の +nodnssec / +noauthority で
+             * 上書き可。"+noall +answer +trace" でも委任の NS/DS が出る。実機で確認) */
+            spec->qo.want_opt = true;
+            spec->qo.dnssec_ok = true;
+            spec->dopt.show_authority = true;
         } else if (strcmp(arg, "+notrace") == 0) {
             spec->do_trace = false;
         } else if (strcmp(arg, "+trace2") == 0 || strncmp(arg, "+trace2=", 8) == 0) {
@@ -4369,9 +5063,9 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
         } else if (strcmp(arg, "+noqr") == 0) {
             spec->dopt.show_query_message = false;
         } else if (strcmp(arg, "+rrcomments") == 0) {
-            spec->dopt.rrcomments = true;
+            spec->dopt.rrcomments = true; spec->dopt.rrcomments_set = true;
         } else if (strcmp(arg, "+norrcomments") == 0) {
-            spec->dopt.rrcomments = false;
+            spec->dopt.rrcomments = false; spec->dopt.rrcomments_set = true;
         } else if (strcmp(arg, "+onesoa") == 0) {
             spec->dopt.onesoa = true;
         } else if (strcmp(arg, "+noonesoa") == 0) {
@@ -4979,6 +5673,115 @@ int execute_query_spec(query_spec_t *spec) {
     return exit_code;
 }
 
+/* Splits argv[1..argc) into the global options (argv[1..*global_end)) and query tuples (name / type / class
+ * with their options), as dig does for several queries on one command line or one batch-file line. Returns the
+ * number of tuples, or -1 (message printed) when there are more than MAX_DAG_QUERIES. */
+int split_query_tuples(int argc, char **argv, arg_slice_t *queries, int *global_end) {
+    int query_count = 0;
+    *global_end = 1;
+
+    bool in_queries = false;
+    bool cur_has_name = false;
+    bool cur_has_type = false;
+    bool cur_has_class = false;
+    int cur_start = 1;
+
+    for (int i = 1; i < argc; ) {
+        int count = get_arg_consume_count(argc, argv, i);
+        const char *arg = argv[i];
+
+        bool is_name_arg = false;
+        bool is_type_arg = false;
+        bool is_class_arg = false;
+        bool is_reverse = false;
+
+        if (arg[0] == '@' || arg[0] == '-' || arg[0] == '+') {
+            if (strcmp(arg, "-x") == 0) {
+                is_reverse = true;
+                is_name_arg = true;
+                is_type_arg = true;
+                is_class_arg = true;
+            } else if (strcmp(arg, "-q") == 0) {
+                is_name_arg = true;
+            } else if (strcmp(arg, "-t") == 0) {
+                is_type_arg = true;
+            } else if (strcmp(arg, "-c") == 0) {
+                is_class_arg = true;
+            } else if (strcmp(arg, "--hex") == 0 || strncmp(arg, "--hex=", 6) == 0) {
+                is_name_arg = true;
+                is_type_arg = true;
+            }
+        } else {
+            // 位置引数
+            if (is_known_qclass_str(arg, NULL)) {
+                is_class_arg = true;
+            } else if (is_qtype_syntax_or_known(arg)) {
+                is_type_arg = true;
+            } else {
+                is_name_arg = true;
+            }
+        }
+
+        if (!in_queries) {
+            if (is_name_arg || is_type_arg || is_class_arg) {
+                in_queries = true;
+                cur_start = i;
+                cur_has_name = is_name_arg;
+                cur_has_type = is_type_arg;
+                cur_has_class = is_class_arg;
+                *global_end = i;
+            }
+        } else {
+            bool start_new_query = false;
+            if (is_reverse) {
+                if (cur_has_name || cur_has_type || cur_has_class) {
+                    start_new_query = true;
+                }
+            } else if (is_name_arg && cur_has_name) {
+                start_new_query = true;
+            } else if (is_type_arg && cur_has_name && cur_has_type) {
+                start_new_query = true;
+            } else if (is_class_arg && cur_has_name && cur_has_class) {
+                start_new_query = true;
+            }
+
+            if (start_new_query) {
+                if (query_count >= MAX_DAG_QUERIES) {
+                    fprintf(stderr, "error: too many queries specified (max %d)\n", MAX_DAG_QUERIES);
+                    return -1;
+                }
+                queries[query_count].start = cur_start;
+                queries[query_count].end = i;
+                query_count++;
+
+                cur_start = i;
+                cur_has_name = is_name_arg;
+                cur_has_type = is_type_arg;
+                cur_has_class = is_class_arg;
+            } else {
+                if (is_name_arg) cur_has_name = true;
+                if (is_type_arg) cur_has_type = true;
+                if (is_class_arg) cur_has_class = true;
+            }
+        }
+
+        i += count;
+    }
+
+    if (in_queries) {
+        if (query_count >= MAX_DAG_QUERIES) {
+            fprintf(stderr, "error: too many queries specified (max %d)\n", MAX_DAG_QUERIES);
+            return -1;
+        }
+        queries[query_count].start = cur_start;
+        queries[query_count].end = argc;
+        query_count++;
+    } else {
+        *global_end = argc;
+    }
+    return query_count;
+}
+
 #if defined(KARIDNS_COVERAGE_LINKAGE) && !defined(main)
 /* Coverage builds: the tests #include this file with "#define main dag_main",
  * so the body below is named dag_main here as well; llvm-cov then merges the
@@ -4992,6 +5795,7 @@ int main(int argc, char **argv) {
     // サーバーからのTCP切断時におけるSIGPIPEによるプロセス強制終了を防止
     signal(SIGPIPE, SIG_IGN);
 #endif
+    g_dag_answer_check = dag_check_answer; /* opcode / question checks of UDP answers (T-12) */
 #ifdef _WIN32
     WSADATA wsa_data;
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
@@ -5066,106 +5870,10 @@ int main(int argc, char **argv) {
     // クエリタプルの境界検出 (Token Slicing)
     int global_end = 1;
     arg_slice_t queries[MAX_DAG_QUERIES];
-    int query_count = 0;
-
-    bool in_queries = false;
-    bool cur_has_name = false;
-    bool cur_has_type = false;
-    bool cur_has_class = false;
-    int cur_start = 1;
-
-    for (int i = 1; i < argc; ) {
-        int count = get_arg_consume_count(argc, argv, i);
-        const char *arg = argv[i];
-
-        bool is_name_arg = false;
-        bool is_type_arg = false;
-        bool is_class_arg = false;
-        bool is_reverse = false;
-
-        if (arg[0] == '@' || arg[0] == '-' || arg[0] == '+') {
-            if (strcmp(arg, "-x") == 0) {
-                is_reverse = true;
-                is_name_arg = true;
-                is_type_arg = true;
-                is_class_arg = true;
-            } else if (strcmp(arg, "-q") == 0) {
-                is_name_arg = true;
-            } else if (strcmp(arg, "-t") == 0) {
-                is_type_arg = true;
-            } else if (strcmp(arg, "-c") == 0) {
-                is_class_arg = true;
-            } else if (strcmp(arg, "--hex") == 0 || strncmp(arg, "--hex=", 6) == 0) {
-                is_name_arg = true;
-                is_type_arg = true;
-            }
-        } else {
-            // 位置引数
-            if (is_known_qclass_str(arg, NULL)) {
-                is_class_arg = true;
-            } else if (is_qtype_syntax_or_known(arg)) {
-                is_type_arg = true;
-            } else {
-                is_name_arg = true;
-            }
-        }
-
-        if (!in_queries) {
-            if (is_name_arg || is_type_arg || is_class_arg) {
-                in_queries = true;
-                cur_start = i;
-                cur_has_name = is_name_arg;
-                cur_has_type = is_type_arg;
-                cur_has_class = is_class_arg;
-                global_end = i;
-            }
-        } else {
-            bool start_new_query = false;
-            if (is_reverse) {
-                if (cur_has_name || cur_has_type || cur_has_class) {
-                    start_new_query = true;
-                }
-            } else if (is_name_arg && cur_has_name) {
-                start_new_query = true;
-            } else if (is_type_arg && cur_has_name && cur_has_type) {
-                start_new_query = true;
-            } else if (is_class_arg && cur_has_name && cur_has_class) {
-                start_new_query = true;
-            }
-
-            if (start_new_query) {
-                if (query_count >= MAX_DAG_QUERIES) {
-                    fprintf(stderr, "error: too many queries specified (max %d)\n", MAX_DAG_QUERIES);
-                    return 1;
-                }
-                queries[query_count].start = cur_start;
-                queries[query_count].end = i;
-                query_count++;
-
-                cur_start = i;
-                cur_has_name = is_name_arg;
-                cur_has_type = is_type_arg;
-                cur_has_class = is_class_arg;
-            } else {
-                if (is_name_arg) cur_has_name = true;
-                if (is_type_arg) cur_has_type = true;
-                if (is_class_arg) cur_has_class = true;
-            }
-        }
-
-        i += count;
-    }
-
-    if (in_queries) {
-        if (query_count >= MAX_DAG_QUERIES) {
-            fprintf(stderr, "error: too many queries specified (max %d)\n", MAX_DAG_QUERIES);
-            return 1;
-        }
-        queries[query_count].start = cur_start;
-        queries[query_count].end = argc;
-        query_count++;
-    } else {
-        global_end = argc;
+    int query_count = split_query_tuples(argc, argv, queries, &global_end);
+    if (query_count < 0) {
+        free_query_opts(&global_spec.qo);
+        return 1;
     }
 
     // グローバル引数区間のパース
@@ -5177,7 +5885,8 @@ int main(int argc, char **argv) {
     // -f バッチファイルモードの処理
     if (global_spec.batch_file) {
         int batch_rc = execute_batch_spec(&global_spec);
-        print_multi_server_summary(global_spec.use_ldnsz, global_spec.dopt.yaml, global_spec.do_trace || global_spec.do_trace2);
+        print_multi_server_summary(global_spec.use_ldnsz, global_spec.dopt.yaml, global_spec.do_trace || global_spec.do_trace2,
+                                   !(global_spec.do_trace || global_spec.do_trace2 || global_spec.do_nssearch));
 #ifndef _WIN32
         if (global_spec.qo.mem_debug) {
             struct rusage ru;
@@ -5201,9 +5910,11 @@ int main(int argc, char **argv) {
 
     int last_exit_code = 0;
     bool any_trace = global_spec.do_trace || global_spec.do_trace2;
+    bool any_nssearch = global_spec.do_nssearch;
     for (int q = 0; q < query_count; q++) {
         query_spec_t local_spec = global_spec;
         deep_copy_query_opts(&local_spec.qo, &global_spec.qo);
+        if (q > 0) local_spec.qo.cmd_banner_style = CMD_BANNER_NONE; /* dig: one banner for the command line */
         if (queries[q].start < queries[q].end) {
             if (parse_arg_slice(queries[q].start, queries[q].end, argc, argv, &local_spec) < 0) {
                 last_exit_code = 1;
@@ -5223,23 +5934,18 @@ int main(int argc, char **argv) {
         if (local_spec.qo.mem_debug) global_spec.qo.mem_debug = true;
         if (local_spec.use_ldnsz) global_spec.use_ldnsz = true;
         if (local_spec.do_trace || local_spec.do_trace2) any_trace = true;
+        if (local_spec.do_nssearch) any_nssearch = true;
         int rc = execute_query_spec(&local_spec);
         if (rc != 0) last_exit_code = rc;
         free_query_opts(&local_spec.qo);
 
-        if (query_count > 1) {
-            bool used_nofail = local_spec.qo.nofail && (!local_spec.test_all) && (!local_spec.do_trace) && (!local_spec.do_trace2) && (!local_spec.do_nssearch) && (!local_spec.batch_file) && (local_spec.server_arg && strchr(local_spec.server_arg, ',') != NULL);
-            if (!used_nofail) {
-                print_multi_server_summary(local_spec.use_ldnsz, local_spec.dopt.yaml, local_spec.do_trace || local_spec.do_trace2);
-            }
-            g_server_count = 0;
-        }
+        if (query_count > 1) finish_query_tuple(&local_spec);
     }
 
     if (query_count <= 1) {
         bool used_nofail_failover = global_spec.qo.nofail && (!global_spec.test_all) && (!global_spec.do_trace) && (!global_spec.do_trace2) && (!global_spec.do_nssearch) && (!global_spec.batch_file) && (global_spec.server_arg && strchr(global_spec.server_arg, ',') != NULL);
         if (!used_nofail_failover) {
-            print_multi_server_summary(global_spec.use_ldnsz, global_spec.dopt.yaml, any_trace);
+            print_multi_server_summary(global_spec.use_ldnsz, global_spec.dopt.yaml, any_trace, !any_trace && !any_nssearch);
         }
     }
 

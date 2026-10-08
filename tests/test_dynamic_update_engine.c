@@ -121,6 +121,15 @@ static void test_bump_soa_serial(void) {
     uint32_t s_none = bump_soa_serial_in_arena(&arena, "otherzone.com.");
     assert(s_none == 0);
 
+    // X-17: the arena cannot allocate the new serial text -> 0 (failure), SOA unchanged
+    size_t saved_pools = arena.data_pool_count, saved_idx = arena.current_pool_idx;
+    arena.data_pool_count = 128;                    // arena_alloc() refuses a 129th pool
+    arena.current_pool_idx = arena.current_pool_cap; // and the current pool is full
+    assert(bump_soa_serial_in_arena(&arena, "example.com.") == 0);
+    assert(strcmp(arena.records[0].rdata[2], "1") == 0);
+    arena.data_pool_count = saved_pools;
+    arena.current_pool_idx = saved_idx;
+
     zone_arena_destroy(&arena);
     printf("  -> bump_soa_serial_in_arena passed.\n");
 }
@@ -185,10 +194,11 @@ static void test_process_update_sections_records(void) {
     pkt[off++] = 0; pkt[off++] = 4; // RDLEN=4
     pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = 99;
 
-    int prcount = 0, upcount = 0;
-    int rcode = process_update_sections(pkt, off, "example.com.", &arena, &prcount, &upcount);
+    update_result_t ur;
+    int rcode = process_update_sections(pkt, off, "example.com.", &arena, &ur);
     assert(rcode == 0); // NOERROR
-    assert(upcount == 1);
+    assert(ur.upcount == 1);
+    assert(ur.changed && !ur.soa_replaced);
     assert(arena.count == 2);
 
     zone_arena_destroy(&arena);
@@ -543,10 +553,13 @@ static void test_process_update_sections_apex_ns_protection(void) {
     pkt[rdlen_pos] = (uint8_t)(rdlen >> 8);
     pkt[rdlen_pos + 1] = (uint8_t)(rdlen & 0xFF);
 
-    int prcount = 0, upcount = 0;
-    int rcode = process_update_sections(pkt, off, "example.com.", &arena, &prcount, &upcount);
-    assert(rcode == 5); // Must return REFUSED (5) because it is the last apex NS record!
-    assert(arena.records[1].name != NULL); // NS record was NOT tombstoned
+    update_result_t ur;
+    int rcode = process_update_sections(pkt, off, "example.com.", &arena, &ur);
+    // RFC 2136 §3.4.2.4: deleting the last apex NS is ignored (NOERROR), not refused
+    assert(rcode == 0);
+    assert(!ur.changed);
+    assert(arena.count == 2);
+    assert(arena.records[1].name != NULL && arena.records[1].type_code == 2); // NS record was NOT tombstoned
 
     // Now add a second apex NS record: ns2.example.com.
     dns_record_t ns2;
@@ -564,8 +577,9 @@ static void test_process_update_sections_apex_ns_protection(void) {
     build_zone_index(&arena, true);
 
     // Now repeating the delete of ns1 must succeed (2 apex NS existed -> 1 remains)
-    rcode = process_update_sections(pkt, off, "example.com.", &arena, &prcount, &upcount);
+    rcode = process_update_sections(pkt, off, "example.com.", &arena, &ur);
     assert(rcode == 0); // NOERROR
+    assert(ur.changed);
     assert(arena.count == 2); // Compacted: SOA + ns2
     assert(arena.records[0].name != NULL && arena.records[0].type_code == 6); // SOA exists
     assert(arena.records[1].name != NULL && arena.records[1].type_code == 2); // ns2 remains
@@ -708,19 +722,19 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
 
     // 1. Short packet (< 12 bytes)
     uint8_t short_pkt[8] = {0};
-    int prc = 0, upc = 0;
-    assert(process_update_sections(short_pkt, sizeof(short_pkt), "example.com.", &arena, &prc, &upc) == 1);
+    update_result_t ur;
+    assert(process_update_sections(short_pkt, sizeof(short_pkt), "example.com.", &arena, &ur) == 1);
 
     // 2. ZOCOUNT != 1
     uint8_t pkt_zocnt[64] = {0};
     pkt_zocnt[2] = 0x28; // UPDATE
     pkt_zocnt[5] = 0;    // ZOCOUNT = 0
-    assert(process_update_sections(pkt_zocnt, 12, "example.com.", &arena, &prc, &upc) == 1);
+    assert(process_update_sections(pkt_zocnt, 12, "example.com.", &arena, &ur) == 1);
 
     // 3. Excessive count (> 1000)
     pkt_zocnt[5] = 1; // ZOCOUNT = 1
     pkt_zocnt[6] = 0x03; pkt_zocnt[7] = 0xF0; // PRCOUNT = 1008
-    assert(process_update_sections(pkt_zocnt, 12, "example.com.", &arena, &prc, &upc) == 5); // REFUSED
+    assert(process_update_sections(pkt_zocnt, 12, "example.com.", &arena, &ur) == 5); // REFUSED
 
     // Helper to build base header + zone section for example.com.
     #define BUILD_HEADER(buf, len_var, pr_cnt, up_cnt) do { \
@@ -742,7 +756,7 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
 
     // 4. Zone name mismatch -> NOTAUTH (9)
     BUILD_HEADER(pkt, off, 0, 0);
-    assert(process_update_sections(pkt, off, "other.com.", &arena, &prc, &upc) == 9);
+    assert(process_update_sections(pkt, off, "other.com.", &arena, &ur) == 9);
 
     // 5. Prereq: name out of zone -> NOTZONE (10)
     BUILD_HEADER(pkt, off, 1, 0);
@@ -753,7 +767,7 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
     pkt[off++] = 0; pkt[off++] = 255; // ANY
     pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; // TTL=0
     pkt[off++] = 0; pkt[off++] = 0; // RDLEN=0
-    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 10);
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &ur) == 10);
 
     // 6. Prereq: CLASS=ANY (255), RDLEN != 0 -> FORMERR (1)
     BUILD_HEADER(pkt, off, 1, 0);
@@ -766,7 +780,7 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
     pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
     pkt[off++] = 0; pkt[off++] = 4; // RDLEN=4 (invalid for ANY)
     pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = 1;
-    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 1);
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &ur) == 1);
 
     // 7. Prereq: CLASS=ANY, TYPE=ANY, name not in zone DB -> NXDOMAIN (3)
     BUILD_HEADER(pkt, off, 1, 0);
@@ -778,7 +792,7 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
     pkt[off++] = 0; pkt[off++] = 255; // CLASS=ANY
     pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
     pkt[off++] = 0; pkt[off++] = 0;
-    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 3); // NXDOMAIN
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &ur) == 3); // NXDOMAIN
 
     // 8. Prereq: CLASS=ANY, TYPE=TXT (not present on www.example.com.) -> NXRRSET (8)
     BUILD_HEADER(pkt, off, 1, 0);
@@ -790,7 +804,7 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
     pkt[off++] = 0; pkt[off++] = 255; // CLASS=ANY
     pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
     pkt[off++] = 0; pkt[off++] = 0;
-    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 8); // NXRRSET
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &ur) == 8); // NXRRSET
 
     // 9. Prereq: CLASS=NONE (254), TYPE=ANY, name exists (www) -> YXDOMAIN (6)
     BUILD_HEADER(pkt, off, 1, 0);
@@ -802,7 +816,7 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
     pkt[off++] = 0; pkt[off++] = 254; // CLASS=NONE
     pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
     pkt[off++] = 0; pkt[off++] = 0;
-    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 6); // YXDOMAIN
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &ur) == 6); // YXDOMAIN
 
     // 10. Prereq: CLASS=NONE (254), TYPE=A, RRset exists (www A) -> YXRRSET (7)
     BUILD_HEADER(pkt, off, 1, 0);
@@ -814,7 +828,7 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
     pkt[off++] = 0; pkt[off++] = 254; // CLASS=NONE
     pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
     pkt[off++] = 0; pkt[off++] = 0;
-    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 7); // YXRRSET
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &ur) == 7); // YXRRSET
 
     // 11. Prereq: CLASS=IN, value-dependent exact match mismatch -> NXRRSET (8)
     BUILD_HEADER(pkt, off, 1, 0);
@@ -827,7 +841,7 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
     pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
     pkt[off++] = 0; pkt[off++] = 4;
     pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = 99; // 192.0.2.99 != 192.0.2.1
-    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 8); // NXRRSET
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &ur) == 8); // NXRRSET
 
     // 12. Prereq: CLASS=IN, value-dependent exact match success -> NOERROR (0)
     BUILD_HEADER(pkt, off, 1, 0);
@@ -840,9 +854,9 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
     pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
     pkt[off++] = 0; pkt[off++] = 4;
     pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = 1; // 192.0.2.1
-    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 0);
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &ur) == 0);
 
-    // 13. Update: Delete SOA via CLASS=ANY -> REFUSED (5)
+    // 13. Update: Delete SOA via CLASS=ANY -> ignored (RFC 2136 §3.4.2.3), NOERROR, SOA untouched
     BUILD_HEADER(pkt, off, 0, 1);
     pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
     pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
@@ -851,7 +865,9 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
     pkt[off++] = 0; pkt[off++] = 255; // ANY
     pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
     pkt[off++] = 0; pkt[off++] = 0;
-    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 5);
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &ur) == 0);
+    assert(!ur.changed);
+    assert(arena.count == 2 && arena.records[0].type_code == 6 && arena.records[0].name != NULL);
 
     // 14. Update: Add meta type (OPT=41) via ADD -> FORMERR (1)
     BUILD_HEADER(pkt, off, 0, 1);
@@ -863,7 +879,7 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
     pkt[off++] = 0; pkt[off++] = 1;  // IN
     pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
     pkt[off++] = 0; pkt[off++] = 0;
-    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 1);
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &ur) == 1);
 
     // 15. Update: Add RR with wrong class (CH=3) -> FORMERR (1)
     BUILD_HEADER(pkt, off, 0, 1);
@@ -876,9 +892,9 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
     pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0x2C;
     pkt[off++] = 0; pkt[off++] = 4;
     pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = 5;
-    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 1);
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &ur) == 1);
 
-    // 16. Update: Add RR with owner out of zone -> REFUSED (5)
+    // 16. Update: Add RR with owner out of zone -> NOTZONE (10, RFC 2136 §3.4.1.3)
     BUILD_HEADER(pkt, off, 0, 1);
     pkt[off++] = 3; memcpy(&pkt[off], "out", 3); off += 3;
     pkt[off++] = 3; memcpy(&pkt[off], "org", 3); off += 3;
@@ -888,9 +904,9 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
     pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0x2C;
     pkt[off++] = 0; pkt[off++] = 4;
     pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = 5;
-    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 5);
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &ur) == 10);
 
-    // 17. Update: Add CNAME where A already exists (www) -> REFUSED (5)
+    // 17. Update: Add CNAME where A already exists (www) -> CNAME ignored (RFC 2136 §3.4.2.2), NOERROR
     BUILD_HEADER(pkt, off, 0, 1);
     pkt[off++] = 3; memcpy(&pkt[off], "www", 3); off += 3;
     pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
@@ -902,11 +918,873 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
     pkt[off++] = 0; pkt[off++] = 8;
     pkt[off++] = 6; memcpy(&pkt[off], "target", 6); off += 6;
     pkt[off++] = 0;
-    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 5);
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &ur) == 0);
+    assert(!ur.changed);
+    assert(arena.count == 2 && arena.records[1].type_code == 1); // www A kept, no CNAME
 
     zone_arena_destroy(&arena);
     #undef BUILD_HEADER
     printf("  -> Dynamic Update prerequisite & error branches passed.\n");
+}
+
+/* ---------------------------------------------------------------------------
+ * RFC 2136 §3.1-§3.4 semantics (R-01, R-11): helpers build UPDATE messages
+ * against the zone below; every case starts from a freshly loaded zone.
+ * ------------------------------------------------------------------------- */
+#define UZ "upd.example."
+static const char UPD_ZONE_TEXT[] =
+    "$ORIGIN upd.example.\n$TTL 300\n"
+    "@ IN SOA ns1 hostmaster 100 3600 600 86400 60\n"
+    "@ IN NS ns1\n@ IN NS ns2\n@ IN TXT \"apex\"\n"
+    "ns1 IN A 192.0.2.1\nns2 IN A 192.0.2.2\n"
+    "www IN A 192.0.2.10\nwww IN A 192.0.2.11\n"
+    "alias IN CNAME www\n"
+    "wks IN WKS 192.0.2.5 TCP 25\n"
+    "sub IN NS ns.sub\nns.sub IN A 192.0.2.53\n";
+
+static void upd_load(zone_arena_t *a) {
+    memset(a, 0, sizeof(*a));
+    zone_arena_init(a);
+    parse_error_t err;
+    memset(&err, 0, sizeof(err));
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.base_dir = ".";
+    ctx.default_origin = UZ;
+    ctx.is_standalone_mode = true;
+    ctx.err_out = &err;
+    char *b = arena_strdup(a, UPD_ZONE_TEXT); // the arena keeps pointers into the text
+    assert(parse_zone_fast(b, strlen(b), a, &ctx) >= 0);
+    assert(build_zone_index(a, true) == 0);
+}
+
+static int upd_count(const zone_arena_t *a, const char *name, uint16_t type) {
+    int n = 0;
+    for (size_t i = 0; i < a->count; i++) {
+        const dns_record_t *r = &a->records[i];
+        if (r->name && r->type_code == type && strcasecmp(r->name, name) == 0) n++;
+    }
+    return n;
+}
+
+static const dns_record_t *upd_get(const zone_arena_t *a, const char *name, uint16_t type) {
+    for (size_t i = 0; i < a->count; i++) {
+        const dns_record_t *r = &a->records[i];
+        if (r->name && r->type_code == type && strcasecmp(r->name, name) == 0) return r;
+    }
+    return NULL;
+}
+
+typedef struct {
+    uint8_t b[2048];
+    size_t len;
+    uint16_t pr, up;
+} upd_msg_t;
+
+static void upd_begin_zone(upd_msg_t *m, const char *zone, uint16_t ztype, uint16_t zclass) {
+    memset(m, 0, sizeof(*m));
+    m->b[0] = 0x4b; m->b[1] = 0x44;
+    m->b[2] = 0x28; // UPDATE
+    m->b[5] = 1;    // ZOCOUNT
+    m->len = 12;
+    long w = write_uncompressed_name(m->b, m->len, sizeof(m->b), zone);
+    assert(w > 0);
+    m->len += (size_t)w;
+    m->b[m->len++] = (uint8_t)(ztype >> 8); m->b[m->len++] = (uint8_t)ztype;
+    m->b[m->len++] = (uint8_t)(zclass >> 8); m->b[m->len++] = (uint8_t)zclass;
+}
+
+static void upd_begin(upd_msg_t *m) { upd_begin_zone(m, UZ, 6, 1); }
+
+static void upd_rr(upd_msg_t *m, bool prereq, const char *name, uint16_t type, uint16_t cls,
+                   uint32_t ttl, const uint8_t *rd, uint16_t rdlen) {
+    long w = write_uncompressed_name(m->b, m->len, sizeof(m->b), name);
+    assert(w > 0);
+    m->len += (size_t)w;
+    uint8_t *p = m->b + m->len;
+    p[0] = (uint8_t)(type >> 8); p[1] = (uint8_t)type;
+    p[2] = (uint8_t)(cls >> 8); p[3] = (uint8_t)cls;
+    p[4] = (uint8_t)(ttl >> 24); p[5] = (uint8_t)(ttl >> 16); p[6] = (uint8_t)(ttl >> 8); p[7] = (uint8_t)ttl;
+    p[8] = (uint8_t)(rdlen >> 8); p[9] = (uint8_t)rdlen;
+    m->len += 10;
+    if (rdlen) memcpy(m->b + m->len, rd, rdlen);
+    m->len += rdlen;
+    if (prereq) {
+        assert(m->up == 0); // prerequisites precede the update section
+        m->pr++;
+    } else {
+        m->up++;
+    }
+    m->b[6] = (uint8_t)(m->pr >> 8); m->b[7] = (uint8_t)m->pr;
+    m->b[8] = (uint8_t)(m->up >> 8); m->b[9] = (uint8_t)m->up;
+}
+
+/* A record 192.0.2.<last> */
+static void upd_a(upd_msg_t *m, bool prereq, const char *name, uint16_t cls, uint32_t ttl, uint8_t last) {
+    uint8_t rd[4] = { 192, 0, 2, last };
+    upd_rr(m, prereq, name, 1, cls, ttl, rd, 4);
+}
+
+/* RR whose RDATA is one domain name (NS, CNAME, DNAME) */
+static void upd_named(upd_msg_t *m, const char *name, uint16_t type, uint16_t cls, const char *target) {
+    uint8_t rd[256];
+    long w = write_uncompressed_name(rd, 0, sizeof(rd), target);
+    assert(w > 0);
+    upd_rr(m, false, name, type, cls, cls == 1 ? 300 : 0, rd, (uint16_t)w);
+}
+
+static void upd_soa(upd_msg_t *m, const char *name, uint16_t cls, uint32_t serial) {
+    uint8_t rd[256];
+    long w = write_uncompressed_name(rd, 0, sizeof(rd), "ns1." UZ);
+    assert(w > 0);
+    size_t n = (size_t)w;
+    w = write_uncompressed_name(rd, n, sizeof(rd), "hostmaster." UZ);
+    assert(w > 0);
+    n += (size_t)w;
+    uint32_t v[5] = { serial, 3600, 600, 86400, 60 };
+    for (int i = 0; i < 5; i++) {
+        rd[n++] = (uint8_t)(v[i] >> 24); rd[n++] = (uint8_t)(v[i] >> 16);
+        rd[n++] = (uint8_t)(v[i] >> 8); rd[n++] = (uint8_t)v[i];
+    }
+    upd_rr(m, false, name, 6, cls, cls == 1 ? 300 : 0, rd, (uint16_t)n);
+}
+
+static int upd_run(zone_arena_t *a, const upd_msg_t *m, update_result_t *ur) {
+    return process_update_sections(m->b, m->len, UZ, a, ur);
+}
+
+static void test_update_soa_rules(void) {
+    printf("[TEST] Dynamic Update: SOA add replaces only with a newer serial (R-01, RFC 2136 §3.4.2.2)...\n");
+    zone_arena_t z;
+    upd_msg_t m;
+    update_result_t ur;
+
+    upd_load(&z);
+    upd_begin(&m);
+    upd_soa(&m, UZ, 1, 105);
+    assert(upd_run(&z, &m, &ur) == 0 && ur.changed && ur.soa_replaced);
+    assert(upd_count(&z, UZ, 6) == 1); // replaced, not appended (R-01)
+    assert(strcmp(upd_get(&z, UZ, 6)->rdata[2], "105") == 0);
+    zone_arena_destroy(&z);
+
+    /* equal, lower, and RFC 1982 undefined (difference 2^31) serials are ignored */
+    const uint32_t ignored[] = { 100, 99, 100u + 2147483648u };
+    for (size_t i = 0; i < sizeof(ignored) / sizeof(ignored[0]); i++) {
+        upd_load(&z);
+        upd_begin(&m);
+        upd_soa(&m, UZ, 1, ignored[i]);
+        assert(upd_run(&z, &m, &ur) == 0 && !ur.changed && !ur.soa_replaced);
+        assert(upd_count(&z, UZ, 6) == 1);
+        assert(strcmp(upd_get(&z, UZ, 6)->rdata[2], "100") == 0);
+        zone_arena_destroy(&z);
+    }
+
+    /* serial arithmetic wraps (RFC 1982 §3.2): 100 + 2^31 - 1 is newer than 100 */
+    upd_load(&z);
+    upd_begin(&m);
+    upd_soa(&m, UZ, 1, 100u + 2147483647u);
+    assert(upd_run(&z, &m, &ur) == 0 && ur.soa_replaced);
+    assert(strcmp(upd_get(&z, UZ, 6)->rdata[2], "2147483747") == 0);
+    zone_arena_destroy(&z);
+
+    /* SOA at a name that has no SOA (not the apex) is ignored */
+    upd_load(&z);
+    upd_begin(&m);
+    upd_soa(&m, "www." UZ, 1, 105);
+    assert(upd_run(&z, &m, &ur) == 0 && !ur.changed);
+    assert(upd_count(&z, "www." UZ, 6) == 0);
+    zone_arena_destroy(&z);
+
+    /* class NONE SOA delete and class ANY SOA delete are ignored (§3.4.2.3, §3.4.2.4) */
+    upd_load(&z);
+    upd_begin(&m);
+    upd_soa(&m, UZ, 254, 100);
+    upd_rr(&m, false, UZ, 6, 255, 0, NULL, 0);
+    assert(upd_run(&z, &m, &ur) == 0 && !ur.changed);
+    assert(upd_count(&z, UZ, 6) == 1);
+    zone_arena_destroy(&z);
+    printf("  -> SOA rules passed.\n");
+}
+
+static void test_update_cname_dname_rules(void) {
+    printf("[TEST] Dynamic Update: CNAME/DNAME conflicts are ignored, singletons replaced (R-11 b)...\n");
+    zone_arena_t z;
+    upd_msg_t m;
+    update_result_t ur;
+
+    /* CNAME next to other data: ignored; the rest of the update is applied */
+    upd_load(&z);
+    upd_begin(&m);
+    upd_named(&m, "www." UZ, 5, 1, "ns1." UZ);
+    upd_a(&m, false, "new." UZ, 1, 300, 20);
+    assert(upd_run(&z, &m, &ur) == 0 && ur.changed);
+    assert(upd_count(&z, "www." UZ, 5) == 0 && upd_count(&z, "www." UZ, 1) == 2);
+    assert(upd_count(&z, "new." UZ, 1) == 1);
+    zone_arena_destroy(&z);
+
+    /* other data next to a CNAME: ignored */
+    upd_load(&z);
+    upd_begin(&m);
+    upd_a(&m, false, "alias." UZ, 1, 300, 30);
+    assert(upd_run(&z, &m, &ur) == 0 && !ur.changed);
+    assert(upd_count(&z, "alias." UZ, 1) == 0 && upd_count(&z, "alias." UZ, 5) == 1);
+    zone_arena_destroy(&z);
+
+    /* CNAME replaces the CNAME */
+    upd_load(&z);
+    upd_begin(&m);
+    upd_named(&m, "alias." UZ, 5, 1, "ns1." UZ);
+    assert(upd_run(&z, &m, &ur) == 0 && ur.changed);
+    assert(upd_count(&z, "alias." UZ, 5) == 1);
+    assert(strcasecmp(upd_get(&z, "alias." UZ, 5)->rdata[0], "ns1." UZ) == 0);
+    zone_arena_destroy(&z);
+
+    /* KEY may coexist with a CNAME (RFC 4035 §2.5) */
+    upd_load(&z);
+    upd_begin(&m);
+    const uint8_t key_rd[] = { 0x02, 0x00, 3, 8, 0xAA, 0xBB, 0xCC, 0xDD };
+    upd_rr(&m, false, "alias." UZ, 25, 1, 300, key_rd, sizeof(key_rd));
+    assert(upd_run(&z, &m, &ur) == 0 && ur.changed);
+    assert(upd_count(&z, "alias." UZ, 25) == 1 && upd_count(&z, "alias." UZ, 5) == 1);
+    zone_arena_destroy(&z);
+
+    /* DNAME coexists with other data, also at the apex (RFC 6672 §2.3); a second DNAME replaces it (§5.2) */
+    upd_load(&z);
+    upd_begin(&m);
+    upd_named(&m, "www." UZ, 39, 1, "t1.example.");
+    upd_named(&m, "www." UZ, 39, 1, "t2.example.");
+    upd_named(&m, UZ, 39, 1, "t3.example.");
+    assert(upd_run(&z, &m, &ur) == 0 && ur.changed);
+    assert(upd_count(&z, "www." UZ, 39) == 1 && upd_count(&z, "www." UZ, 1) == 2);
+    assert(strcasecmp(upd_get(&z, "www." UZ, 39)->rdata[0], "t2.example.") == 0);
+    assert(upd_count(&z, UZ, 39) == 1 && upd_count(&z, UZ, 6) == 1);
+    zone_arena_destroy(&z);
+
+    /* DNAME next to a CNAME, and CNAME next to a DNAME: ignored (RFC 6672 §5.2) */
+    upd_load(&z);
+    upd_begin(&m);
+    upd_named(&m, "alias." UZ, 39, 1, "t1.example.");
+    upd_named(&m, "dn." UZ, 39, 1, "t1.example.");
+    upd_named(&m, "dn." UZ, 5, 1, "www." UZ);
+    assert(upd_run(&z, &m, &ur) == 0 && ur.changed);
+    assert(upd_count(&z, "alias." UZ, 39) == 0);
+    assert(upd_count(&z, "dn." UZ, 39) == 1 && upd_count(&z, "dn." UZ, 5) == 0);
+    zone_arena_destroy(&z);
+    printf("  -> CNAME/DNAME rules passed.\n");
+}
+
+static void test_update_delete_rules(void) {
+    printf("[TEST] Dynamic Update: apex SOA/NS deletes ignored, other deletes applied (R-11 c)...\n");
+    zone_arena_t z;
+    upd_msg_t m;
+    update_result_t ur;
+
+    /* ANY/ANY at the apex keeps SOA and NS, deletes the rest */
+    upd_load(&z);
+    upd_begin(&m);
+    upd_rr(&m, false, UZ, 255, 255, 0, NULL, 0);
+    assert(upd_run(&z, &m, &ur) == 0 && ur.changed);
+    assert(upd_count(&z, UZ, 6) == 1 && upd_count(&z, UZ, 2) == 2 && upd_count(&z, UZ, 16) == 0);
+    zone_arena_destroy(&z);
+
+    /* ANY/NS at the apex is ignored; ANY/NS at a delegation deletes it */
+    upd_load(&z);
+    upd_begin(&m);
+    upd_rr(&m, false, UZ, 2, 255, 0, NULL, 0);
+    assert(upd_run(&z, &m, &ur) == 0 && !ur.changed);
+    assert(upd_count(&z, UZ, 2) == 2);
+    upd_begin(&m);
+    upd_rr(&m, false, "sub." UZ, 2, 255, 0, NULL, 0);
+    assert(upd_run(&z, &m, &ur) == 0 && ur.changed);
+    assert(upd_count(&z, "sub." UZ, 2) == 0);
+    zone_arena_destroy(&z);
+
+    /* NONE/NS: a non-last apex NS is deleted, the last one is kept */
+    upd_load(&z);
+    upd_begin(&m);
+    upd_named(&m, UZ, 2, 254, "ns2." UZ);
+    upd_named(&m, UZ, 2, 254, "ns1." UZ);
+    assert(upd_run(&z, &m, &ur) == 0 && ur.changed);
+    assert(upd_count(&z, UZ, 2) == 1);
+    assert(strcasecmp(upd_get(&z, UZ, 2)->rdata[0], "ns1." UZ) == 0);
+    zone_arena_destroy(&z);
+
+    /* ANY/ANY at a non-apex name deletes every RRset there; NONE deletes one RR */
+    upd_load(&z);
+    upd_begin(&m);
+    upd_rr(&m, false, "alias." UZ, 255, 255, 0, NULL, 0);
+    upd_a(&m, false, "www." UZ, 254, 0, 10);
+    assert(upd_run(&z, &m, &ur) == 0 && ur.changed);
+    assert(upd_count(&z, "alias." UZ, 5) == 0);
+    assert(upd_count(&z, "www." UZ, 1) == 1);
+    assert(strcmp(upd_get(&z, "www." UZ, 1)->rdata[0], "192.0.2.11") == 0);
+    zone_arena_destroy(&z);
+    printf("  -> Delete rules passed.\n");
+}
+
+static void test_update_add_replace_rules(void) {
+    printf("[TEST] Dynamic Update: duplicates replace the zone RR (RFC 2136 §3.4.2.2)...\n");
+    zone_arena_t z;
+    upd_msg_t m;
+    update_result_t ur;
+
+    /* the same RR with the same TTL: no change */
+    upd_load(&z);
+    upd_begin(&m);
+    upd_a(&m, false, "www." UZ, 1, 300, 10);
+    assert(upd_run(&z, &m, &ur) == 0 && !ur.changed);
+    assert(upd_count(&z, "www." UZ, 1) == 2);
+    zone_arena_destroy(&z);
+
+    /* the same RDATA with another TTL replaces the RR (not appended) */
+    upd_load(&z);
+    upd_begin(&m);
+    upd_a(&m, false, "ns1." UZ, 1, 900, 1);
+    assert(upd_run(&z, &m, &ur) == 0 && ur.changed);
+    assert(upd_count(&z, "ns1." UZ, 1) == 1);
+    assert(upd_get(&z, "ns1." UZ, 1)->ttl_value == 900);
+    zone_arena_destroy(&z);
+
+    /* WKS with the same address and protocol replaces the WKS RR */
+    upd_load(&z);
+    assert(upd_count(&z, "wks." UZ, 11) == 1);
+    upd_begin(&m);
+    uint8_t wks_rd[5 + 11] = { 192, 0, 2, 5, 6 };
+    wks_rd[5 + 10] = 0x20; // port 82
+    upd_rr(&m, false, "wks." UZ, 11, 1, 300, wks_rd, sizeof(wks_rd));
+    assert(upd_run(&z, &m, &ur) == 0 && ur.changed);
+    assert(upd_count(&z, "wks." UZ, 11) == 1);
+    /* another protocol is a different RR */
+    upd_begin(&m);
+    wks_rd[4] = 17;
+    upd_rr(&m, false, "wks." UZ, 11, 1, 300, wks_rd, sizeof(wks_rd));
+    assert(upd_run(&z, &m, &ur) == 0 && ur.changed);
+    assert(upd_count(&z, "wks." UZ, 11) == 2);
+    zone_arena_destroy(&z);
+    printf("  -> Add/replace rules passed.\n");
+}
+
+static void test_update_prescan_errors(void) {
+    printf("[TEST] Dynamic Update: prescan NOTZONE/FORMERR before any change (R-11 a, e)...\n");
+    zone_arena_t z;
+    upd_msg_t m;
+    update_result_t ur;
+    upd_load(&z);
+    size_t count = z.count;
+
+    /* NOTZONE for add and delete; a valid RR before it is not applied */
+    upd_begin(&m);
+    upd_a(&m, false, "new." UZ, 1, 300, 20);
+    upd_a(&m, false, "out.test.", 1, 300, 20);
+    assert(upd_run(&z, &m, &ur) == 10);
+    assert(upd_count(&z, "new." UZ, 1) == 0 && z.count == count);
+    upd_begin(&m);
+    upd_rr(&m, false, "out.test.", 255, 255, 0, NULL, 0);
+    assert(upd_run(&z, &m, &ur) == 10);
+    upd_begin(&m);
+    upd_a(&m, false, "out.test.", 254, 0, 20);
+    assert(upd_run(&z, &m, &ur) == 10);
+
+    /* class ANY: TTL, RDLENGTH, meta type other than ANY */
+    upd_begin(&m);
+    upd_rr(&m, false, "www." UZ, 1, 255, 1, NULL, 0);
+    assert(upd_run(&z, &m, &ur) == 1);
+    upd_begin(&m);
+    upd_a(&m, false, "www." UZ, 255, 0, 10);
+    assert(upd_run(&z, &m, &ur) == 1);
+    upd_begin(&m);
+    upd_rr(&m, false, "www." UZ, 252, 255, 0, NULL, 0); // AXFR
+    assert(upd_run(&z, &m, &ur) == 1);
+    /* class NONE: TTL, TYPE ANY */
+    upd_begin(&m);
+    upd_a(&m, false, "www." UZ, 254, 1, 10);
+    assert(upd_run(&z, &m, &ur) == 1);
+    upd_begin(&m);
+    upd_rr(&m, false, "www." UZ, 255, 254, 0, NULL, 0);
+    assert(upd_run(&z, &m, &ur) == 1);
+    /* class ZCLASS: meta types; other classes */
+    upd_begin(&m);
+    upd_rr(&m, false, "www." UZ, 255, 1, 300, NULL, 0);
+    assert(upd_run(&z, &m, &ur) == 1);
+    upd_begin(&m);
+    upd_rr(&m, false, "www." UZ, 251, 1, 300, NULL, 0); // IXFR
+    assert(upd_run(&z, &m, &ur) == 1);
+    upd_begin(&m);
+    upd_a(&m, false, "www." UZ, 3, 300, 10); // CH
+    assert(upd_run(&z, &m, &ur) == 1);
+    assert(z.count == count);
+
+    /* zone section: ZTYPE != SOA -> FORMERR; ZCLASS != IN -> NOTAUTH (§3.1.1) */
+    upd_begin_zone(&m, UZ, 1, 1);
+    assert(upd_run(&z, &m, &ur) == 1);
+    upd_begin_zone(&m, UZ, 6, 3);
+    assert(upd_run(&z, &m, &ur) == 9);
+    upd_begin_zone(&m, UZ, 6, 255);
+    assert(upd_run(&z, &m, &ur) == 9);
+    zone_arena_destroy(&z);
+    printf("  -> Prescan errors passed.\n");
+}
+
+static void test_update_prerequisite_rules(void) {
+    printf("[TEST] Dynamic Update: prerequisite TTL and RRset set equality (R-11 d, e)...\n");
+    zone_arena_t z;
+    upd_msg_t m;
+    update_result_t ur;
+    upd_load(&z);
+
+    /* TTL must be 0 (§3.2.1-§3.2.3) */
+    upd_begin(&m);
+    upd_rr(&m, true, "www." UZ, 255, 255, 1, NULL, 0);
+    assert(upd_run(&z, &m, &ur) == 1);
+    upd_begin(&m);
+    upd_rr(&m, true, "nx." UZ, 255, 254, 1, NULL, 0);
+    assert(upd_run(&z, &m, &ur) == 1);
+    upd_begin(&m);
+    upd_a(&m, true, "www." UZ, 1, 300, 10);
+    assert(upd_run(&z, &m, &ur) == 1);
+
+    /* value-dependent: the zone RRset must equal the prerequisite RRset (§3.2.3) */
+    upd_begin(&m);
+    upd_a(&m, true, "www." UZ, 1, 0, 10); // subset
+    assert(upd_run(&z, &m, &ur) == 8);
+    upd_begin(&m);
+    upd_a(&m, true, "www." UZ, 1, 0, 11);
+    upd_a(&m, true, "www." UZ, 1, 0, 10); // equal, any order
+    assert(upd_run(&z, &m, &ur) == 0 && !ur.changed);
+    upd_begin(&m);
+    upd_a(&m, true, "www." UZ, 1, 0, 10);
+    upd_a(&m, true, "www." UZ, 1, 0, 11);
+    upd_a(&m, true, "www." UZ, 1, 0, 12); // superset
+    assert(upd_run(&z, &m, &ur) == 8);
+    upd_begin(&m);
+    upd_a(&m, true, "www." UZ, 1, 0, 10);
+    upd_a(&m, true, "www." UZ, 1, 0, 10);
+    upd_a(&m, true, "www." UZ, 1, 0, 11); // a set: duplicates do not matter
+    assert(upd_run(&z, &m, &ur) == 0);
+    /* two RRsets, interleaved */
+    upd_begin(&m);
+    upd_a(&m, true, "www." UZ, 1, 0, 10);
+    upd_a(&m, true, "ns1." UZ, 1, 0, 1);
+    upd_a(&m, true, "www." UZ, 1, 0, 11);
+    assert(upd_run(&z, &m, &ur) == 0);
+    upd_begin(&m);
+    upd_a(&m, true, "www." UZ, 1, 0, 10);
+    upd_a(&m, true, "ns1." UZ, 1, 0, 2);
+    upd_a(&m, true, "www." UZ, 1, 0, 11);
+    assert(upd_run(&z, &m, &ur) == 8);
+    /* the prerequisites hold -> the update section is applied */
+    upd_begin(&m);
+    upd_a(&m, true, "www." UZ, 1, 0, 10);
+    upd_a(&m, true, "www." UZ, 1, 0, 11);
+    upd_a(&m, false, "www." UZ, 1, 300, 12);
+    assert(upd_run(&z, &m, &ur) == 0 && ur.changed);
+    assert(upd_count(&z, "www." UZ, 1) == 3);
+    zone_arena_destroy(&z);
+    printf("  -> Prerequisite rules passed.\n");
+}
+
+static void upd_entry_init(zone_db_entry_t *entry) {
+    memset(entry, 0, sizeof(*entry));
+    strlcpy(entry->domain, UZ, sizeof(entry->domain));
+    strlcpy(entry->view_name, "default", sizeof(entry->view_name));
+    pthread_mutex_init(&entry->writer_lock, NULL);
+    pthread_mutex_init(&entry->ixfr_history.lock, NULL);
+    upd_load(&entry->rcu.arena_a);
+    upd_load(&entry->rcu.arena_b);
+    atomic_store_explicit(&entry->rcu.active, &entry->rcu.arena_a, memory_order_release);
+    atomic_store_explicit(&entry->serial, 100, memory_order_release);
+}
+
+static void upd_entry_destroy(zone_db_entry_t *entry) {
+    zone_arena_destroy(&entry->rcu.arena_a);
+    zone_arena_destroy(&entry->rcu.arena_b);
+    pthread_mutex_destroy(&entry->writer_lock);
+    pthread_mutex_destroy(&entry->ixfr_history.lock);
+}
+
+static void test_handle_dynamic_update_serial_rules(void) {
+    printf("[TEST] Dynamic Update: serial after explicit SOA, no-change and failed updates (RFC 2136 §3.6)...\n");
+    zone_db_entry_t entry;
+    upd_entry_init(&entry);
+    upd_msg_t m;
+
+    /* prerequisites only: NOERROR, nothing published, serial unchanged, no NOTIFY */
+    upd_begin(&m);
+    upd_rr(&m, true, "www." UZ, 255, 255, 0, NULL, 0);
+    assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 0);
+    assert(atomic_load(&entry.rcu.active) == &entry.rcu.arena_a);
+    assert(atomic_load(&entry.serial) == 100);
+    assert(!atomic_load(&entry.notify_now));
+
+    /* only ignored RRs (CNAME next to data, older SOA): same */
+    upd_begin(&m);
+    upd_named(&m, "www." UZ, 5, 1, "ns1." UZ);
+    upd_soa(&m, UZ, 1, 50);
+    assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 0);
+    assert(atomic_load(&entry.rcu.active) == &entry.rcu.arena_a);
+    assert(atomic_load(&entry.serial) == 100);
+
+    /* explicit newer SOA together with other data: that serial, no automatic increment (R-01) */
+    upd_begin(&m);
+    upd_soa(&m, UZ, 1, 500);
+    upd_a(&m, false, "new." UZ, 1, 300, 20);
+    assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 0);
+    zone_arena_t *cur = atomic_load(&entry.rcu.active);
+    assert(cur == &entry.rcu.arena_b);
+    assert(atomic_load(&entry.serial) == 500);
+    assert(upd_count(cur, UZ, 6) == 1 && strcmp(upd_get(cur, UZ, 6)->rdata[2], "500") == 0);
+    assert(upd_count(cur, "new." UZ, 1) == 1);
+    assert(atomic_load(&entry.notify_now));
+
+    /* a change without SOA: the server increments the serial */
+    upd_begin(&m);
+    upd_a(&m, false, "new2." UZ, 1, 300, 21);
+    assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 0);
+    cur = atomic_load(&entry.rcu.active);
+    assert(atomic_load(&entry.serial) == 501);
+    assert(strcmp(upd_get(cur, UZ, 6)->rdata[2], "501") == 0);
+
+    /* an error after a valid RR: nothing applied (§3.4.2.1 / atomic update) */
+    upd_begin(&m);
+    upd_a(&m, false, "new3." UZ, 1, 300, 22);
+    upd_rr(&m, false, "www." UZ, 1, 255, 5, NULL, 0); // class ANY with TTL != 0 -> FORMERR
+    assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 1);
+    assert(atomic_load(&entry.rcu.active) == cur);
+    assert(upd_count(cur, "new3." UZ, 1) == 0);
+    assert(atomic_load(&entry.serial) == 501);
+
+    /* X-17: the serial cannot be incremented (here no apex SOA in the copy; an arena allocation failure in
+     * bump_soa_serial_in_arena() takes the same branch): SERVFAIL, nothing published, serial unchanged,
+     * no NOTIFY (RFC 2136 §3.6: a changed zone must get a new serial). */
+    dns_record_t *apex_soa = (dns_record_t *)upd_get(cur, UZ, 6); // the test changes the copy source
+    apex_soa->type_code = 99;
+    atomic_store(&entry.notify_now, false);
+    upd_begin(&m);
+    upd_a(&m, false, "new4." UZ, 1, 300, 23);
+    assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 2);
+    assert(atomic_load(&entry.rcu.active) == cur);
+    assert(upd_count(cur, "new4." UZ, 1) == 0);
+    assert(atomic_load(&entry.serial) == 501);
+    assert(!atomic_load(&entry.notify_now));
+    apex_soa->type_code = 6;
+
+    upd_entry_destroy(&entry);
+    printf("  -> Serial rules passed.\n");
+}
+
+/* process_dns_query_impl(): zone section before permission (RFC 2136 §3.1.2), secondary -> REFUSED */
+static int upd_query(const upd_msg_t *m, const char *zname, uint16_t ztype, const char *client,
+                     zone_db_snapshot_t *snap, server_config_t *cfg, uint8_t *res, size_t res_cap) {
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    zone_db_entry_t *matched = NULL;
+    return process_dns_query_impl(m->b, m->len, res, res_cap, zname, ztype, client, &comp_ctx, false,
+                                  NULL, snap, cfg, &matched);
+}
+
+static bool upd_res_has_ede(const uint8_t *res, int len, uint16_t code) {
+    for (int i = 12; i + 6 <= len; i++) {
+        if (res[i] == 0 && res[i + 1] == 15 && ((res[i + 4] << 8) | res[i + 5]) == code) return true;
+    }
+    return false;
+}
+
+static void test_update_dispatch_zone_section(void) {
+    printf("[TEST] Dynamic Update: zone section dispatch (NOTAUTH, FORMERR) and secondary REFUSED...\n");
+    char *allow[1] = { "192.0.2.1" };
+    zone_config_t sec_cfg;
+    memset(&sec_cfg, 0, sizeof(sec_cfg));
+    sec_cfg.domain = "sec.example.";
+    sec_cfg.type = "slave";
+    sec_cfg.allow_update = allow;
+    sec_cfg.allow_update_count = 1;
+    zone_config_t prim_cfg;
+    memset(&prim_cfg, 0, sizeof(prim_cfg));
+    prim_cfg.domain = UZ;
+    prim_cfg.type = "master";
+    prim_cfg.allow_update = allow;
+    prim_cfg.allow_update_count = 1;
+    prim_cfg.next = &sec_cfg;
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.zones = &prim_cfg;
+    cfg.send_extended_errors = true;
+
+    zone_db_entry_t prim;
+    upd_entry_init(&prim);
+    zone_db_entry_t sec;
+    memset(&sec, 0, sizeof(sec));
+    strlcpy(sec.domain, "sec.example.", sizeof(sec.domain));
+    strlcpy(sec.view_name, "default", sizeof(sec.view_name));
+    zone_arena_init(&sec.rcu.arena_a);
+    atomic_store_explicit(&sec.rcu.active, &sec.rcu.arena_a, memory_order_release);
+
+    zone_db_entry_t *entries[2] = { &prim, &sec };
+    char *any_acl[1] = { "any" };
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 2;
+    view.match_clients = any_acl;
+    view.match_clients_count = 1;
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    uint8_t res[4096];
+    upd_msg_t m;
+
+    /* secondary: REFUSED + EDE 18 for an allowed and for a not allowed client (maintainer decision) */
+    upd_begin_zone(&m, "sec.example.", 6, 1);
+    upd_a(&m, false, "x.sec.example.", 1, 300, 9);
+    const uint8_t opt[11] = { 0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 0 }; // OPT, UDP 1232
+    memcpy(m.b + m.len, opt, sizeof(opt));
+    m.len += sizeof(opt);
+    m.b[11] = 1; // ARCOUNT
+    int len = upd_query(&m, "sec.example.", 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
+    assert(len >= 12 && (res[3] & 0x0F) == 5);
+    assert(upd_res_has_ede(res, len, 18));
+    len = upd_query(&m, "sec.example.", 6, "192.0.2.99", &snap, &cfg, res, sizeof(res));
+    assert(len >= 12 && (res[3] & 0x0F) == 5);
+
+    /* a name below a served zone, and a zone that is not served: NOTAUTH, also for an allowed client */
+    upd_begin_zone(&m, "x." UZ, 6, 1);
+    len = upd_query(&m, "x." UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
+    assert(len >= 12 && (res[3] & 0x0F) == 9);
+    upd_begin_zone(&m, "other.test.", 6, 1);
+    len = upd_query(&m, "other.test.", 6, "192.0.2.99", &snap, &cfg, res, sizeof(res));
+    assert(len >= 12 && (res[3] & 0x0F) == 9);
+    /* ZCLASS CH -> NOTAUTH; ZTYPE A -> FORMERR, before the permission check */
+    upd_begin_zone(&m, UZ, 6, 3);
+    len = upd_query(&m, UZ, 6, "192.0.2.99", &snap, &cfg, res, sizeof(res));
+    assert(len >= 12 && (res[3] & 0x0F) == 9);
+    upd_begin_zone(&m, UZ, 1, 1);
+    len = upd_query(&m, UZ, 1, "192.0.2.99", &snap, &cfg, res, sizeof(res));
+    assert(len >= 12 && (res[3] & 0x0F) == 1);
+
+    /* primary: not allowed -> REFUSED; allowed -> NOERROR and applied */
+    upd_begin(&m);
+    upd_a(&m, false, "new." UZ, 1, 300, 20);
+    len = upd_query(&m, UZ, 6, "192.0.2.99", &snap, &cfg, res, sizeof(res));
+    assert(len >= 12 && (res[3] & 0x0F) == 5);
+    len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
+    assert(len >= 12 && (res[3] & 0x0F) == 0);
+    assert(upd_count(atomic_load(&prim.rcu.active), "new." UZ, 1) == 1);
+    assert(atomic_load(&prim.serial) == 101);
+
+    upd_entry_destroy(&prim);
+    zone_arena_destroy(&sec.rcu.arena_a);
+    printf("  -> Zone section dispatch passed.\n");
+}
+
+/* ---- R-30 / R-07 / R-08 / R-09 / R-20 / D-03 / X-18: TSIG outcome first, then authorization ---- */
+
+static void tk_init(tsig_key_t *k, const char *name, uint8_t fill) {
+    memset(k, 0, sizeof(*k));
+    k->name = (char *)name;
+    k->algorithm = "hmac-sha256";
+    k->secret_decoded_len = 32;
+    memset(k->secret_decoded, fill, 32);
+}
+
+/* sign m with key; returns the request MAC in mac/mac_len */
+static void tk_sign(upd_msg_t *m, tsig_key_t *key, uint8_t *mac, size_t *mac_len) {
+    size_t len = m->len;
+    *mac_len = 0;
+    assert(tsig_sign_packet(m->b, &len, sizeof(m->b), key, 0, mac, mac_len, NULL, 0, false) == 0);
+    m->len = len;
+}
+
+/* the response's TSIG: owner, error, MAC size; and whether it verifies against the request MAC */
+static void tk_expect(const uint8_t *res, int len, uint8_t rcode, const char *owner, uint16_t error,
+                      uint16_t mac_size, tsig_key_t *verify_key, const uint8_t *req_mac, size_t req_mac_len) {
+    assert(len >= 12);
+    assert((res[3] & 0x0F) == rcode);
+    tsig_rr_t rr;
+    int pr = tsig_parse_rr(res, (size_t)len, &rr);
+    if (!owner) {
+        assert(pr == 0);    /* no TSIG RR at all */
+        return;
+    }
+    assert(pr == 1);
+    assert(strcasecmp(rr.key_name, owner) == 0);
+    assert(strcasecmp(rr.alg_name, "hmac-sha256.") == 0);
+    assert(rr.error == error);
+    assert(rr.mac_size == mac_size);
+    if (verify_key) {
+        uint8_t m[64];
+        size_t ml = 0;
+        assert(tsig_verify_packet(res, (size_t)len, verify_key, req_mac, req_mac_len, NULL, 0, false, m, &ml) == 0);
+    }
+}
+
+static void test_update_tsig_matrix(void) {
+    printf("[TEST] Dynamic Update: TSIG errors and authorization (RFC 8945 §5.2-§5.3, RFC 2136 §3.3; R-30)...\n");
+    tsig_key_t k1, k2, k3, k1_bad;
+    tk_init(&k1, "k1", 0x11);
+    tk_init(&k2, "K2", 0x22);            /* configured in upper case (D-03) */
+    tk_init(&k3, "k3", 0x33);            /* not configured */
+    tk_init(&k1_bad, "k1", 0x44);        /* right name, wrong secret */
+    k1.next = &k2;
+
+    char *allow_k1[1] = { "K1." };       /* D-03: key references compare as DNS names */
+    char *allow_ip[1] = { "192.0.2.1" };
+    zone_config_t zc;
+    memset(&zc, 0, sizeof(zc));
+    zc.domain = UZ;
+    zc.type = "master";
+    zc.allow_update = allow_k1;
+    zc.allow_update_count = 1;
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.zones = &zc;
+    cfg.keys = &k1;
+    cfg.send_extended_errors = true;
+
+    zone_db_entry_t prim;
+    upd_entry_init(&prim);
+    zone_db_entry_t *entries[1] = { &prim };
+    char *any_acl[1] = { "any" };
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+    view.match_clients = any_acl;
+    view.match_clients_count = 1;
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    uint8_t res[4096];
+    uint8_t mac[64];
+    size_t mac_len;
+    upd_msg_t m;
+    int len;
+    const char *C = "192.0.2.99";
+
+    /* allowed key: NOERROR, signed with k1 */
+    upd_begin(&m); upd_a(&m, false, "t1." UZ, 1, 300, 31); tk_sign(&m, &k1, mac, &mac_len);
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 0, "k1.", 0, 32, &k1, mac, mac_len);
+    assert(upd_count(atomic_load(&prim.rcu.active), "t1." UZ, 1) == 1);
+
+    /* valid key that allow-update does not list: REFUSED, signed with that key (not k1), error 0 */
+    upd_begin(&m); upd_a(&m, false, "t2." UZ, 1, 300, 32); tk_sign(&m, &k2, mac, &mac_len);
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 5, "k2.", 0, 32, &k2, mac, mac_len);
+    assert(upd_count(atomic_load(&prim.rcu.active), "t2." UZ, 1) == 0);
+
+    /* unknown key: NOTAUTH, BADKEY, unsigned, the request's key name echoed */
+    upd_begin(&m); upd_a(&m, false, "t3." UZ, 1, 300, 33); tk_sign(&m, &k3, mac, &mac_len);
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 9, "k3.", 17, 0, NULL, NULL, 0);
+
+    /* wrong secret: NOTAUTH, BADSIG, unsigned */
+    upd_begin(&m); upd_a(&m, false, "t4." UZ, 1, 300, 34); tk_sign(&m, &k1_bad, mac, &mac_len);
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 9, "k1.", 16, 0, NULL, NULL, 0);
+    assert(upd_count(atomic_load(&prim.rcu.active), "t4." UZ, 1) == 0);
+
+    /* BADTIME (R-08): signed with k1, Time Signed and Fudge are the client's, Other Data = server time */
+    k1.fuzztime = 1000000000;
+    upd_begin(&m); upd_a(&m, false, "t5." UZ, 1, 300, 35); tk_sign(&m, &k1, mac, &mac_len);
+    k1.fuzztime = 0;
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    {
+        tsig_rr_t rr;
+        assert(tsig_parse_rr(res, (size_t)len, &rr) == 1);
+        assert(rr.time_signed == 1000000000 && rr.fudge == 300 && rr.other_len == 6);
+        uint64_t srv = ((uint64_t)rr.other[0] << 40) | ((uint64_t)rr.other[1] << 32) | ((uint64_t)rr.other[2] << 24) |
+                       ((uint64_t)rr.other[3] << 16) | ((uint64_t)rr.other[4] << 8) | rr.other[5];
+        assert(srv + 5 >= (uint64_t)time(NULL) && srv <= (uint64_t)time(NULL));
+        k1.fuzztime = 1000000000;     /* a client with the same clock verifies the response incl. the request MAC */
+        tk_expect(res, len, 9, "k1.", 18, 32, &k1, mac, mac_len);
+        k1.fuzztime = 0;
+    }
+    assert(upd_count(atomic_load(&prim.rcu.active), "t5." UZ, 1) == 0);
+
+    /* BADTRUNC: a MAC truncated to 16 octets (allowed by §5.2.2.1) is below the local policy (full length) */
+    upd_begin(&m); upd_a(&m, false, "t6." UZ, 1, 300, 36); tk_sign(&m, &k1, mac, &mac_len);
+    {
+        tsig_rr_t rr;
+        assert(tsig_parse_rr(m.b, m.len, &rr) == 1 && rr.mac_size == 32);
+        size_t mac_at = (size_t)(rr.mac - m.b);
+        memmove(m.b + mac_at + 16, m.b + mac_at + 32, m.len - (mac_at + 32));
+        m.len -= 16;
+        m.b[mac_at - 2] = 0; m.b[mac_at - 1] = 16;                     /* MAC Size */
+        size_t rdlen_at = rr.rr_offset + 4 /* "k1." */ + 8;
+        uint16_t rdlen = (uint16_t)(((m.b[rdlen_at] << 8) | m.b[rdlen_at + 1]) - 16);
+        m.b[rdlen_at] = (uint8_t)(rdlen >> 8); m.b[rdlen_at + 1] = (uint8_t)rdlen;
+    }
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 9, "k1.", 22, 32, &k1, mac, 16);
+    assert(upd_count(atomic_load(&prim.rcu.active), "t6." UZ, 1) == 0);
+
+    /* R-09: a MAC shorter than max(10, hash/2) is FORMERR, no TSIG in the response */
+    upd_begin(&m); upd_a(&m, false, "t7." UZ, 1, 300, 37); tk_sign(&m, &k1, mac, &mac_len);
+    {
+        tsig_rr_t rr;
+        assert(tsig_parse_rr(m.b, m.len, &rr) == 1);
+        size_t mac_at = (size_t)(rr.mac - m.b);
+        memmove(m.b + mac_at + 8, m.b + mac_at + 32, m.len - (mac_at + 32));
+        m.len -= 24;
+        m.b[mac_at - 1] = 8;
+        size_t rdlen_at = rr.rr_offset + 4 + 8;
+        uint16_t rdlen = (uint16_t)(((m.b[rdlen_at] << 8) | m.b[rdlen_at + 1]) - 24);
+        m.b[rdlen_at] = (uint8_t)(rdlen >> 8); m.b[rdlen_at + 1] = (uint8_t)rdlen;
+    }
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 1, NULL, 0, 0, NULL, NULL, 0);
+
+    /* R-09: two TSIG RRs are FORMERR (they used to make the request count as unsigned) */
+    upd_begin(&m); upd_a(&m, false, "t8." UZ, 1, 300, 38); tk_sign(&m, &k1, mac, &mac_len);
+    tk_sign(&m, &k1, mac, &mac_len);
+    len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 1, NULL, 0, 0, NULL, NULL, 0);
+    assert(upd_count(atomic_load(&prim.rcu.active), "t8." UZ, 1) == 0);
+
+    /* R-20: an Original ID that differs from the message ID is accepted (the digest uses it) */
+    upd_begin(&m); upd_a(&m, false, "t9." UZ, 1, 300, 39); tk_sign(&m, &k1, mac, &mac_len);
+    m.b[0] ^= 0x5A;
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 0, "k1.", 0, 32, &k1, mac, mac_len);
+    assert(res[0] == m.b[0] && res[1] == m.b[1]);
+
+    /* X-18: a zone-section error for a validly signed request is signed */
+    upd_begin_zone(&m, "x." UZ, 6, 1); tk_sign(&m, &k1, mac, &mac_len);
+    len = upd_query(&m, "x." UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 9, "k1.", 0, 32, &k1, mac, mac_len);
+
+    /* zone without allow-update: REFUSED, signed with the request's key */
+    zc.allow_update = NULL;
+    zc.allow_update_count = 0;
+    upd_begin(&m); upd_a(&m, false, "t10." UZ, 1, 300, 40); tk_sign(&m, &k1, mac, &mac_len);
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 5, "k1.", 0, 32, &k1, mac, mac_len);
+
+    /* address ACL: an allowed address with a valid (unlisted) key is accepted and signed, like BIND;
+     * an unsigned request from that address stays accepted and unsigned */
+    zc.allow_update = allow_ip;
+    zc.allow_update_count = 1;
+    upd_begin(&m); upd_a(&m, false, "t11." UZ, 1, 300, 41); tk_sign(&m, &k2, mac, &mac_len);
+    len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 0, "k2.", 0, 32, &k2, mac, mac_len);
+    assert(upd_count(atomic_load(&prim.rcu.active), "t11." UZ, 1) == 1);
+    upd_begin(&m); upd_a(&m, false, "t12." UZ, 1, 300, 42);
+    len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 0, NULL, 0, 0, NULL, NULL, 0);
+    /* ... but a TSIG error is never overridden by the address (RFC 8945 §5.2) */
+    upd_begin(&m); upd_a(&m, false, "t13." UZ, 1, 300, 43); tk_sign(&m, &k1_bad, mac, &mac_len);
+    len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 9, "k1.", 16, 0, NULL, NULL, 0);
+    assert(upd_count(atomic_load(&prim.rcu.active), "t13." UZ, 1) == 0);
+
+    upd_entry_destroy(&prim);
+    printf("  -> TSIG matrix passed.\n");
 }
 
 int main(void) {
@@ -917,6 +1795,15 @@ int main(void) {
     test_dynamic_update_prerequisites_and_error_paths();
     test_handle_dynamic_update_pipeline();
     test_update_multi_tsig_keys();
+    test_update_soa_rules();
+    test_update_cname_dname_rules();
+    test_update_delete_rules();
+    test_update_add_replace_rules();
+    test_update_prescan_errors();
+    test_update_prerequisite_rules();
+    test_handle_dynamic_update_serial_rules();
+    test_update_dispatch_zone_section();
+    test_update_tsig_matrix();
     test_send_notify_to_all_comprehensive();
     printf("=== All Dynamic Update Engine Unit Tests PASSED ===\n");
     return 0;
@@ -928,4 +1815,12 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr
                         const tcp_sockopts_t *tcp_opts) {
     (void)tcp_opts;
     return broker_connect(family, type, addr, addr_len);
+}
+
+/* send_tcp_dns_message(): goes through the send_tcp_robust() mock above (length prefix, then message) */
+ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len) {
+    uint8_t prefix[2] = {(uint8_t)(len >> 8), (uint8_t)(len & 0xFF)};
+    if (send_tcp_robust(fd, prefix, 2) < 0) return -1;
+    if (send_tcp_robust(fd, msg, len) < 0) return -1;
+    return (ssize_t)len;
 }

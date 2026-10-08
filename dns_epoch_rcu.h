@@ -37,10 +37,17 @@ typedef struct {
   _Atomic bool in_use;
 } rcu_aux_slot_t;
 
+/* 専用のスロットを持つワーカー以外の常駐スレッド (ログ、非同期 I/O) のリーダースロット。
+ * X-02: 以前は worker_ctx_t 全体 (バッファ込み、16+2 個で約 33 MB の .data) を使っていたが、
+ * 読むのは世代だけ。偽共有を避けるためキャッシュラインに揃える。 */
+typedef struct {
+  alignas(64) _Atomic uint64_t rcu_observed_epoch;
+} rcu_reader_slot_t;
+
 extern _Atomic uint64_t g_global_epoch;
-extern worker_ctx_t g_resp_logger_rcu_ctx;
-extern worker_ctx_t g_query_logger_rcu_ctx;
-extern worker_ctx_t g_async_io_rcu_ctxs[MAX_ASYNC_IO_RCU_WORKERS];
+extern rcu_reader_slot_t g_resp_logger_rcu_ctx;
+extern rcu_reader_slot_t g_query_logger_rcu_ctx;
+extern rcu_reader_slot_t g_async_io_rcu_ctxs[MAX_ASYNC_IO_RCU_WORKERS];
 extern int g_async_io_rcu_worker_count;
 extern rcu_aux_slot_t g_aux_rcu_slots[MAX_AUX_RCU_READERS];
 
@@ -91,6 +98,16 @@ static inline void rcu_reader_enter(worker_ctx_t *ctx) {
 static inline void rcu_reader_exit(worker_ctx_t *ctx) {
   if (!ctx) return;
   rcu_epoch_exit(&ctx->rcu_observed_epoch);
+}
+
+// rcu_reader_slot_t を持つ常駐スレッドの読み取り区間 (rcu_reader_enter/exit と同じ)
+static inline void rcu_slot_reader_enter(rcu_reader_slot_t *slot) {
+  t_rcu_own_observed = &slot->rcu_observed_epoch;
+  rcu_epoch_enter(&slot->rcu_observed_epoch);
+}
+
+static inline void rcu_slot_reader_exit(rcu_reader_slot_t *slot) {
+  rcu_epoch_exit(&slot->rcu_observed_epoch);
 }
 
 // worker_ctx_t を持たないスレッドの読み取り区間。入れ子にできる (最外側だけが世代を記録する)。
