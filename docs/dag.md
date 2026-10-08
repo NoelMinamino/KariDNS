@@ -56,6 +56,7 @@ dag [global-queryopt...] [query...]
 - The query has the RD and AD bits set, like `dig`.
 - Like `dig`, queries carry an EDNS0 OPT record (version 0, UDP payload size 1232) with a random 8-byte client cookie by default; `+noedns` and `+nocookie` turn them off. Dynamic UPDATE and NOTIFY messages (`--update-*`, `--prereq-*`, `+opcode=UPDATE`, `+opcode=NOTIFY`) get no OPT record unless an EDNS option is given explicitly, like `nsupdate`.
 - In the normal output format, a hex dump of the query (`Query (N bytes):`) and of the response is printed in addition to the dig-style sections. Use `+nohexdump` to turn this off; the dumps are not printed with `+short` or `+yaml` (and the response dump not with `+nocomments`). `+noall` turns them off too, so `+noall +answer` prints only the answer like `dig`; `+hexdump` after `+noall` brings them back.
+- Unlike `dig`, a truncated UDP response (`TC=1`) is printed like any other response before `;; Truncated, retrying in TCP mode.` and the TCP retry to the same server; both responses are recorded for the comparison summary and `+ldnsz` (see [Note on TC (Truncation) Retries](#response-equivalence-comparison-allcompare)). `+ignore` keeps the UDP response and does not retry.
 - Per-user defaults can be configured via `${HOME}/.digrc`. This file is read and its options applied before command-line arguments, unless the `-r` option is supplied.
 - Up to 64 queries can be given on one command line (see [MULTIPLE QUERIES & BATCH PROCESSING](#multiple-queries--batch-processing)).
 
@@ -505,7 +506,7 @@ SERVER             | PROTO | RCODE   | ANS | AUT | ADD | SEM_HASH   | TIME   | M
 ```
 
 > **Note on TC (Truncation) Retries:**
-> As in `dig`, a truncated UDP response (`TC=1`) is not printed: `dag` prints `;; Truncated, retrying in TCP mode.` and shows the TCP answer. Only the TCP answer is recorded for the summary table.
+> When a query triggers automatic TCP retry due to a truncated UDP response (`TC=1`), `dag` intentionally displays both the UDP response and the TCP retry, and records them as separate rows (`UDP`, then `TCP`) in the summary table. This allows users to explicitly observe and diagnose the transport fallback process (`dig` prints only the TCP answer). The truncated response is never the base: the TCP answer is `[BASE]` and the UDP row is compared with it. With `+ldnsz`, the diff URL carries both messages (UDP first), so the truncated and the complete response can be compared side by side.
 
 ### LDNSZ Web Inspection URLs (`+ldnsz`)
 

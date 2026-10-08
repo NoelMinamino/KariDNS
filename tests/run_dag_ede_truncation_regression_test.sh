@@ -166,14 +166,27 @@ run_check "EDE 29 is displayed" "$DAG @127.0.0.1 -p $PORT ede-all.test A" "; EDE
 
 # 2. Test UDP Truncation (TC=1) followed by TCP Retry (Task 2)
 echo "=== 2. Testing UDP Truncated Response Display and TCP Retry (Task 2) ==="
-# Like dig 9.20, the truncated UDP response is not printed; only the TCP answer is (T-12)
-echo -n "Test: UDP TC response is not displayed before the TCP retry ... "
-OUTPUT=$("$DAG" @127.0.0.1 -p $PORT trunc-test.test A 2>&1 || true)
-if echo "$OUTPUT" | grep -qE "flags: .*tc" || [ "$(echo "$OUTPUT" | grep -c "Got answer")" -ne 1 ]; then
-    echo "FAILED"; echo "$OUTPUT" | sed 's/^/    /'; FAILED=$((FAILED + 1))
-else
-    echo "OK"
-fi
+# Intentional difference from dig (docs/dag.md "Note on TC (Truncation) Retries"): the truncated UDP response is
+# printed, then the TCP retry; both are rows of the comparison summary, the complete TCP answer is the base, and
+# +ldnsz puts both messages (UDP first) into the diff URL.
+check_out() { # name awk-program: the awk program prints "ok" when the output is as expected
+    echo -n "Test: $1 ... "
+    if [ "$(echo "$OUTPUT" | awk "$2")" = "ok" ]; then
+        echo "OK"
+    else
+        echo "FAILED"; echo "$OUTPUT" | sed 's/^/    /'; FAILED=$((FAILED + 1))
+    fi
+}
+OUTPUT=$("$DAG" @127.0.0.1 -p $PORT trunc-test.test A +nohexdump 2>&1 || true)
+check_out "UDP TC response is displayed before the TCP retry" \
+    '/^;; flags: .*tc/ && !tc { tc = NR } /[(]UDP[)]$/ && !u { u = NR } /^;; Truncated, retrying in TCP mode[.]$/ { r = NR }
+     /[(]TCP[)]$/ { t = NR } /Got answer/ { g++ } END { if (tc && u > tc && r > u && t > r && g == 2) print "ok" }'
+check_out "comparison summary: UDP row compared with the TCP base" \
+    '/MULTI-SERVER COMPARISON/ { s = 1 } s && /[|] UDP +[|]/ && /[[]DIFF[]]$/ { u = NR } s && /[|] TCP +[|]/ && /[[]BASE[]]$/ { t = NR }
+     END { if (u && t > u) print "ok" }'
+OUTPUT=$("$DAG" @127.0.0.1 -p $PORT trunc-test.test A +nohexdump +ldnsz 2>&1 || true)
+check_out "+ldnsz diff URL carries the UDP and the TCP response" \
+    'index($0, "ldns.jp/diff/#c=") { n = split($0, p, ","); if (n == 2 && p[1] ~ /[|]UDP[|][0-9]+:/ && p[2] ~ /[|]TCP[|][0-9]+:/) print "ok" }'
 
 run_check "Truncated notification is displayed" \
     "$DAG @127.0.0.1 -p $PORT trunc-test.test A" \

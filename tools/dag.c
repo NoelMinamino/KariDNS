@@ -3272,15 +3272,6 @@ KARIDNS_TOOL_FN int run_test(const char *test_name, const char *qname, const cha
         }
         g_dag_suppress_stdout = saved_suppress;
 
-        /* dig: a truncated UDP answer is not shown; dig says so and asks again over TCP (RFC 7766 §5) */
-        if (n >= 4 && !use_tcp && (resp[2] & 0x02) && !tc_retried && !eff_qo.ignore_tc) {
-            if (!dopt->short_mode && !dopt->yaml) printf(";; Truncated, retrying in TCP mode.\n");
-            use_tcp = true;
-            retry_tcp = true;
-            tc_retried = true;
-            continue;
-        }
-
         /* RFC 7873 §5.3: a client that sent a cookie retries a BADCOOKIE answer with the new Server Cookie and, if
          * that is answered with BADCOOKIE again, over TCP (dig: "BADCOOKIE, retrying." / "... retrying in TCP mode.") */
         for (int bc_round = 0; n >= 12 && eff_qo.retry_on_badcookie && eff_qo.want_cookie && bc_round < 2; bc_round++) {
@@ -3619,9 +3610,22 @@ KARIDNS_TOOL_FN int run_test(const char *test_name, const char *qname, const cha
         }
         if (tcp_sock >= 0) close(tcp_sock);
 
+        /* Intentional difference from dig: the truncated UDP answer is printed and recorded (comparison table,
+         * +ldnsz) before the TCP retry (RFC 7766 §5), so the transport fallback can be inspected. */
         bool is_truncated = (!use_tcp && n >= 4 && (resp[2] & 0x02) != 0);
-        if (is_truncated && !tc_retried && eff_qo.ignore_tc && !dopt->short_mode && !dopt->yaml) {
-            fprintf(stderr, "\n;; Truncated response received, but +ignore specified; not retrying in TCP mode.\n");
+        if (is_truncated && !tc_retried) {
+            if (eff_qo.ignore_tc) {
+                if (!dopt->short_mode && !dopt->yaml) {
+                    fprintf(stderr, "\n;; Truncated response received, but +ignore specified; not retrying in TCP mode.\n");
+                }
+            } else {
+                if (!dopt->short_mode && !dopt->yaml) {
+                    printf("\n;; Truncated, retrying in TCP mode.\n");
+                }
+                use_tcp = true;
+                retry_tcp = true;
+                tc_retried = true;
+            }
         }
     } while (retry_tcp);
 
@@ -3682,15 +3686,16 @@ KARIDNS_TOOL_FN void print_multi_server_summary(bool use_ldnsz, bool is_yaml, bo
 
     for (int i = 0; i < g_server_count; i++) {
         server_result_t *r = &g_results[i];
-        /* 基準は同じ質問への最初の完全な (TC=0) 応答。-f で別々の名前を問い合わせた行どうしは比べない */
-        server_result_t *base = r;
-        for (int j = 0; j < g_server_count; j++) {
-            if (g_results[j].resp_len > 0 && !g_results[j].tc &&
-                (&g_results[j] == r || results_comparable(&g_results[j], r))) {
-                base = &g_results[j];
-                break;
+        /* 基準は同じ質問への最初の完全な (TC=0) 応答。TC=0 の応答が無ければ (TCP でも TC=1 など) 同じ質問への
+         * 最初の応答。-f で別々の名前を問い合わせた行どうしは比べない */
+        server_result_t *base = NULL, *first = NULL;
+        for (int j = 0; j < g_server_count && !base; j++) {
+            if (g_results[j].resp_len > 0 && (&g_results[j] == r || results_comparable(&g_results[j], r))) {
+                if (!first) first = &g_results[j];
+                if (!g_results[j].tc) base = &g_results[j];
             }
         }
+        if (!base) base = first ? first : r;
 
         const char *status_str = "";
         if (r == base) {
