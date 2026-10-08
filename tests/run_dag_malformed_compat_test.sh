@@ -59,6 +59,7 @@ fi
 OPTS="+tries=1 +time=2 +nocookie +noedns +noall +answer +comments"
 FAILED=0
 PASSED=0
+TC_NOT_COMPARED=""
 OUT="$TMP_DIR/out.txt"
 
 run() { # scenario [extra options]
@@ -125,10 +126,14 @@ run rcode-dsotypeni;    has "status: RESERVED11" && ok
 run rcode-badkey;       has "status: ?17" && ok
 run rcode-badcookie;    has "status: BADCOOKIE" && hasnt "retrying" && ok
 run ede-all;            has "; EDE: 0 (Other): (EDE code 0 test description)" && has "; EDE: 19 (Stale NXDOMAIN Answer):" && has "; EDE: 25: (EDE code 25 test description)" && ok
-# truncation: the UDP answer is not shown, the TCP answer is
-run flag-tc;            has ";; Truncated, retrying in TCP mode." && hasnt "MULTI-SERVER COMPARISON" && ok
-if [ "$(grep -c "Got answer" "$OUT")" -ne 1 ]; then
-    echo "FAIL [flag-tc]: expected exactly one printed answer (the TCP one)"; FAILED=$((FAILED + 1))
+# truncation (intentional difference from dig, docs/dag.md "Note on TC (Truncation) Retries"): the UDP answer is
+# shown, then the TCP retry, and both are rows of the comparison summary. This mock sets TC=1 over TCP too, so no
+# response is complete: the first one (UDP) is the base and the identical TCP answer matches it exactly.
+run flag-tc;            has ";; Truncated, retrying in TCP mode." && has "MULTI-SERVER COMPARISON" && ok
+if [ "$(grep -c "Got answer" "$OUT")" -ne 2 ] || ! grep -qE '^127\.0\.0\.1#[0-9]+ \| UDP \| NOERROR .*\[BASE\]$' "$OUT" ||
+   ! grep -qE '^127\.0\.0\.1#[0-9]+ \| TCP \| NOERROR .*MATCH_EXACT$' "$OUT"; then
+    echo "FAIL [flag-tc]: expected the UDP and the TCP answer, UDP row [BASE], TCP row MATCH_EXACT"
+    sed 's/^/    | /' "$OUT"; FAILED=$((FAILED + 1))
 fi
 
 # X-43: over TCP dig 9.20 does not wait for another answer: an ID mismatch or a question mismatch ends the lookup
@@ -186,9 +191,29 @@ if command -v dig >/dev/null 2>&1 && dig -v 2>&1 | grep -q "DiG 9\.20\."; then
             drc=$?
             "$DAG" @127.0.0.1 -p "$PORT" "$sc.anomaly.test" A $OPTS $mode +nohexdump > "$TMP_DIR/dag.raw" 2>&1
             grc=$?
+            CUR="$sc $mode (vs dig)"
+            # Unlike dig, dag prints a truncated UDP answer before the TCP retry and adds the comparison summary
+            # (checked with flag-tc above). In the default format the part from ";; Truncated, retrying in TCP mode."
+            # up to the summary must equal dig's; with +yaml everything but the first (UDP) message document;
+            # +short has no such marker and is not compared.
+            if [ "$mode" = "+yaml" ] && grep -q 'socket_protocol: UDP' "$TMP_DIR/dag.raw" &&
+               grep -q 'socket_protocol: TCP' "$TMP_DIR/dag.raw"; then
+                CUR="$sc $mode (vs dig, TCP message)"
+                awk '/^- type: MESSAGE/ { m++ } m != 1' "$TMP_DIR/dag.raw" > "$TMP_DIR/dag.tc"
+                mv "$TMP_DIR/dag.tc" "$TMP_DIR/dag.raw"
+            elif grep -qE '[|] UDP +[|]' "$TMP_DIR/dag.raw" && grep -qE '[|] TCP +[|]' "$TMP_DIR/dag.raw"; then
+                if [ "$mode" = "+short" ]; then
+                    TC_NOT_COMPARED="$TC_NOT_COMPARED $sc"
+                    continue
+                fi
+                CUR="$sc $mode (vs dig, from the TCP retry on)"
+                sed -n '/^;; Truncated, retrying in TCP mode\./,$p' "$TMP_DIR/dig.raw" > "$TMP_DIR/dig.tc"
+                sed -n '/^;; Truncated, retrying in TCP mode\./,$p' "$TMP_DIR/dag.raw" |
+                    sed '/MULTI-SERVER COMPARISON/,$d' > "$TMP_DIR/dag.tc"
+                mv "$TMP_DIR/dig.tc" "$TMP_DIR/dig.raw"; mv "$TMP_DIR/dag.tc" "$TMP_DIR/dag.raw"
+            fi
             norm < "$TMP_DIR/dig.raw" > "$TMP_DIR/dig.txt"
             norm < "$TMP_DIR/dag.raw" > "$TMP_DIR/dag.txt"
-            CUR="$sc $mode (vs dig)"
             if cmp -s "$TMP_DIR/dig.txt" "$TMP_DIR/dag.txt" && [ "$drc" = "$grc" ]; then
                 PASSED=$((PASSED + 1))
             else
@@ -198,6 +223,7 @@ if command -v dig >/dev/null 2>&1 && dig -v 2>&1 | grep -q "DiG 9\.20\."; then
             fi
         done
     done
+    [ -n "$TC_NOT_COMPARED" ] && echo "NOTE: +short not compared with dig after a TC retry (intentional difference):$TC_NOT_COMPARED"
 else
     echo "SKIP: dig 9.20 not installed; direct comparison not run"
 fi
