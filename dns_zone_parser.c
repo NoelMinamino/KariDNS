@@ -825,6 +825,38 @@ int parse_zone_fast(char *buf, size_t size, zone_arena_t *arena, parse_context_t
   return parse_zone_buffer(buf, size, arena, ctx, &st, true);
 }
 
+/* RDATA の最後のフィールドが空白で分割できる base64 / 16 進の値である型について、その前にあるフィールド数を返す
+ * (それ以外の型は -1)。 */
+static int trailing_blob_lead_fields(uint16_t type_code) {
+  switch (type_code) {
+  case 24: case 46:                 // SIG, RRSIG: 署名 (base64)
+    return 8;
+  case 25: case 48: case 60:        // KEY, DNSKEY, CDNSKEY: 公開鍵 (base64)
+  case 43: case 59:                 // DS, CDS: ダイジェスト (16 進)
+  case 32768: case 32769:           // TA, DLV: ダイジェスト (16 進)
+  case 37:                          // CERT: 証明書 (base64)
+  case 52: case 53:                 // TLSA, SMIMEA: 関連データ (16 進)
+    return 3;
+  case 49: case 61:                 // DHCID, OPENPGPKEY: RDATA 全体が base64
+    return 0;
+  default:
+    return -1;
+  }
+}
+
+/* fields[from] .. fields[count - 1] を fields[from] に詰めて連結し、新しいフィールド数 (from + 1) を返す。
+ * 各フィールドはバッファ内で後ろほど大きなアドレスにある NUL 終端の文字列なので、その場で前へ詰められる。 */
+static int join_trailing_fields(char **fields, int from, int count) {
+  char *dst = fields[from] + strlen(fields[from]);
+  for (int j = from + 1; j < count; j++) {
+    size_t len = strlen(fields[j]);
+    memmove(dst, fields[j], len);
+    dst += len;
+  }
+  *dst = '\0';
+  return from + 1;
+}
+
 /* finalize: 最上位のファイルの読み込みの最後に、全レコードの前処理キャッシュを作る。
  * $INCLUDE と $GENERATE の行は最上位がまとめて処理するので false で呼ぶ。 */
 static int parse_zone_buffer(char *buf, size_t size, zone_arena_t *arena, parse_context_t *ctx,
@@ -1248,6 +1280,15 @@ PROCESS_RECORD:
       break;
     }
     i++;
+  }
+  /* 末尾が base64 / 16 進の 1 フィールド (鍵・署名・ダイジェスト) の型は、その値を空白で区切って何行にも分けて
+   * 書ける (RFC 4034 §2.2/§3.2 等)。ML-DSA-44 (algorithm 18) の RRSIG 署名は base64 で 3228 文字あり、
+   * dnssec-signzone などの出力では MAX_RDATA を超える数の断片に分かれるので、超えるときは末尾の断片を
+   * 1 フィールドに連結する (エンコーダは断片を連結して復号するので、結果のワイヤ形式は変わらない)。 */
+  if (field_idx - i > MAX_RDATA && rec->type) {
+    int lead = trailing_blob_lead_fields(get_type_code(rec->type));
+    if (lead >= 0 && i + lead < field_idx)
+      field_idx = join_trailing_fields(fields, i + lead, field_idx);
   }
   while (i < field_idx && rec->rdata_count < MAX_RDATA)
     rec->rdata[rec->rdata_count++] = fields[i++];

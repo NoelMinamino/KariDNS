@@ -256,7 +256,7 @@ typedef struct tsig_key {
 // SIG(0) 鍵構造体 (RFC 2931 / RFC 3007)
 typedef struct sig0_key {
     char *signer_name;    // Signer's Name (鍵の所有者名, e.g. "update.example.com.")
-    uint8_t algorithm;     // DNSSEC Algorithm Number (8=RSASHA256, 13=ECDSAP256SHA256, 15=ED25519 等)
+    uint8_t algorithm;     // DNSSEC Algorithm Number (8=RSASHA256, 13=ECDSAP256SHA256, 15=ED25519, 18=MLDSA44 等)
     uint16_t key_tag;      // KEY RRのキータグ(compute_sig0_keytagで計算 or 手動指定)
     EVP_PKEY *pkey;        // OpenSSL 秘密鍵オブジェクト
     int64_t fuzztime;      // テスト用時刻固定機構 (--break / 決定論テスト用)
@@ -412,6 +412,15 @@ bool packet_has_tsig(const uint8_t *packet, size_t packet_len);
 
 // SIG(0) & DNSKEY Tag
 uint16_t compute_dnskey_tag(const uint8_t *rdata, size_t rdlen);
+/* ML-DSA-44 (FIPS 204) as DNSSEC algorithm 18 "MLDSA44" (draft-westerbaan-dnssec-mldsa): the DNSKEY/KEY public key
+ * field is the bare 1312-octet FIPS 204 public key encoding, the RRSIG/SIG signature field the bare 2420-octet
+ * signature (pure ML-DSA with an empty context string). Needs OpenSSL 3.5 or later at run time. */
+#define DNSSEC_ALG_MLDSA44 18
+#define MLDSA44_PUBKEY_LEN 1312
+#define MLDSA44_SIG_LEN 2420
+#define MLDSA44_SEED_LEN 32
+#define MLDSA44_PRIVKEY_LEN 2560
+
 uint16_t compute_sig0_keytag(const sig0_key_t *key);
 int sig0_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, sig0_key_t *key);
 

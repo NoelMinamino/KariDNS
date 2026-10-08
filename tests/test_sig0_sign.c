@@ -3,7 +3,9 @@
  *
  * RFC 2931 section 3.1:   data = RDATA(sig fields, signature omitted) | (request - SIG(0))
  * where the request is taken BEFORE its ARCOUNT is adjusted for the SIG(0). The signature is verified here
- * with EVP_DigestVerify over exactly that byte string, for RSASHA256 (8), ECDSAP256SHA256 (13) and Ed25519 (15).
+ * with EVP_DigestVerify over exactly that byte string, for RSASHA256 (8), ECDSAP256SHA256 (13), Ed25519 (15) and,
+ * when the OpenSSL in use has ML-DSA (3.5 or later), MLDSA44 (18, draft-westerbaan-dnssec-mldsa: bare 1312-octet
+ * public key, bare 2420-octet pure ML-DSA signature with an empty context string).
  * Key tags are recomputed with an independent RFC 4034 Appendix B implementation from the public key.
  */
 #include <assert.h>
@@ -58,6 +60,10 @@ static size_t ref_key_rdata(EVP_PKEY *pkey, uint8_t alg, uint8_t *out) {
         size_t l = 0;
         assert(EVP_PKEY_get_octet_string_param(pkey, OSSL_PKEY_PARAM_PUB_KEY, pt, sizeof(pt), &l) == 1 && l == 65 && pt[0] == 4);
         memcpy(out + p, pt + 1, 64); p += 64;
+    } else if (alg == 18) {
+        size_t l = 1312;
+        assert(EVP_PKEY_get_raw_public_key(pkey, out + p, &l) == 1 && l == 1312);
+        p += 1312;
     } else {
         size_t l = 32;
         assert(EVP_PKEY_get_raw_public_key(pkey, out + p, &l) == 1 && l == 32);
@@ -70,6 +76,7 @@ static EVP_PKEY *gen_key(uint8_t alg) {
     EVP_PKEY *k = NULL;
     if (alg == 8) k = EVP_PKEY_Q_keygen(NULL, NULL, "RSA", (size_t)2048);
     else if (alg == 13) k = EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
+    else if (alg == 18) return EVP_PKEY_Q_keygen(NULL, NULL, "ML-DSA-44");   /* NULL before OpenSSL 3.5 */
     else k = EVP_PKEY_Q_keygen(NULL, NULL, "ED25519");
     assert(k);
     return k;
@@ -106,7 +113,7 @@ static void check_and_verify(const uint8_t *pkt, size_t total, size_t orig_len, 
     size_t prefix_len = 18 + signer_wire_len;
     const uint8_t *sig = pkt + rd_start + prefix_len;
     size_t sig_len = rdlen - prefix_len;
-    assert(sig_len == (alg == 8 ? 256u : 64u));
+    assert(sig_len == (alg == 8 ? 256u : alg == 18 ? 2420u : 64u));
 
     /* RFC 2931 3.1: data = RDATA(without signature) | request with the ORIGINAL ARCOUNT */
     uint8_t data[8192];
@@ -129,7 +136,7 @@ static void check_and_verify(const uint8_t *pkt, size_t total, size_t orig_len, 
         sigp = der; siglen = (size_t)dl;
     }
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    const EVP_MD *md = (alg == 15) ? NULL : EVP_sha256();
+    const EVP_MD *md = (alg == 15 || alg == 18) ? NULL : EVP_sha256();   /* pure EdDSA / pure ML-DSA */
     assert(EVP_DigestVerifyInit(ctx, NULL, md, NULL, pkey) == 1);
     int ok = EVP_DigestVerify(ctx, sigp, siglen, data, orig_len + prefix_len);
     EVP_MD_CTX_free(ctx);
@@ -151,12 +158,17 @@ static void check_and_verify(const uint8_t *pkt, size_t total, size_t orig_len, 
 }
 
 static void test_sign_and_verify(void) {
-    printf("[TEST] SIG(0): RSASHA256 / ECDSAP256SHA256 / Ed25519 signatures verify over the RFC 2931 data...\n");
-    static const uint8_t algs[] = { 13, 15, 8 };
+    printf("[TEST] SIG(0): RSASHA256 / ECDSAP256SHA256 / Ed25519 / MLDSA44 signatures verify over the RFC 2931 data...\n");
+    static const uint8_t algs[] = { 13, 15, 8, 18 };
+    int verified = 0;
     for (size_t a = 0; a < sizeof(algs); a++) {
         uint8_t alg = algs[a];
         EVP_PKEY *pkey = gen_key(alg);
-        uint8_t rd[600];
+        if (!pkey && alg == 18) {
+            printf("  (skipping MLDSA44: this OpenSSL has no ML-DSA-44; it needs OpenSSL 3.5 or later)\n");
+            continue;
+        }
+        uint8_t rd[2048];
         size_t rdl = ref_key_rdata(pkey, alg, rd);
         uint16_t tag = ref_keytag(rd, rdl);
 
@@ -189,8 +201,9 @@ static void test_sign_and_verify(void) {
         free(big);
         (void)big_orig;
         EVP_PKEY_free(pkey);
+        verified++;
     }
-    printf("  -> SIG(0) signatures verified independently for 3 algorithms.\n");
+    printf("  -> SIG(0) signatures verified independently for %d algorithms.\n", verified);
 }
 
 static void test_error_paths(void) {
@@ -238,6 +251,25 @@ static void test_error_paths(void) {
     assert(compute_sig0_keytag(NULL) == 0);
     assert(compute_sig0_keytag(&nokey) == 0);
     assert(compute_sig0_keytag(&badalg) == 0);
+
+    /* MLDSA44 (18) with a key that is not ML-DSA-44: no key tag, no signature, ARCOUNT restored */
+    sig0_key_t notmldsa = key; notmldsa.algorithm = 18;
+    assert(compute_sig0_keytag(&notmldsa) == 0);
+    len = orig;
+    assert(sig0_sign_packet(pkt, &len, sizeof(pkt), &notmldsa) == -1 && len == orig && pkt[10] == 0 && pkt[11] == 0);
+
+    /* MLDSA44: a buffer that holds the query but not the 2.4 KB SIG(0) RR */
+    EVP_PKEY *ml = gen_key(18);
+    if (ml) {
+        sig0_key_t mlkey = { .signer_name = signer, .algorithm = 18, .key_tag = 0, .pkey = ml, .fuzztime = FUZZ };
+        len = orig;
+        assert(sig0_sign_packet(pkt, &len, orig + 1000, &mlkey) == -1 && len == orig && pkt[10] == 0 && pkt[11] == 0);
+        /* the same ML-DSA-44 key labelled Ed25519 does not produce a 64-octet signature */
+        mlkey.algorithm = 15;
+        len = orig;
+        assert(sig0_sign_packet(pkt, &len, sizeof(pkt), &mlkey) == -1 && pkt[10] == 0 && pkt[11] == 0);
+        EVP_PKEY_free(ml);
+    }
 
     /* An EC key mislabelled as RSA is NOT rejected today (an ECDSA DER blob is stored under algorithm 8).
      * Caller misuse; exercised for robustness only. */

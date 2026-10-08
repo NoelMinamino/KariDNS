@@ -93,6 +93,7 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
 4. **DNSSEC Algorithm & Digest Verification (RFC 8624 / RFC 8078)**:
    - Evaluates DNSSEC algorithms in DNSKEY and RRSIG records against RFC 8624 status recommendations (e.g., flagging deprecated SHA-1 or MD5 algorithms)
    - Validates DS digest types (warning on deprecated digests)
+   - ML-DSA-44 (algorithm 18, draft-westerbaan-dnssec-mldsa): warns when a DNSKEY/CDNSKEY public key is not 1312 octets or an RRSIG signature is not 2420 octets
    - Recognizes RFC 8078 CDS and CDNSKEY delete signals (Algorithm=0 / DigestType=0) without false-positive warnings
 5. **RFC 8976 ZONEMD Message Digest Verification**:
    - The ZONEMD serial must match the SOA serial, and ZONEMD should be at the zone apex.

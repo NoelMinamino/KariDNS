@@ -1,4 +1,9 @@
 #include "dag_tsig_client.h"
+#include <openssl/core_names.h>
+#include <openssl/params.h>
+
+/* OSSL_PKEY_PARAM_ML_DSA_SEED of OpenSSL 3.5; spelled out so that the file still builds against older OpenSSL. */
+#define MLDSA_PARAM_SEED "seed"
 
 void parse_tsig_str(char *tsig_str, query_opts_t *qo) {
     qo->want_tsig = true;
@@ -289,6 +294,38 @@ static EVP_PKEY *ec_key_from_raw_priv(int alg, const uint8_t *priv_bytes, size_t
     return pkey;
 }
 
+/* ML-DSA-44 private key from a BIND-style .private file. "PrivateKey:" holds either the 32-octet FIPS 204 seed
+ * (xi, from which ML-DSA.KeyGen_internal derives the key pair) or the 2560-octet expanded private key encoding.
+ * ML-DSA needs OpenSSL 3.5 or later; older libraries fail here with NULL. */
+static EVP_PKEY *mldsa44_key_from_bind_fields(const char *file_buf) {
+    char b64_priv[4096] = {0};
+    if (!extract_bind_field(file_buf, "PrivateKey", b64_priv, sizeof(b64_priv))) return NULL;
+    uint8_t raw[MLDSA44_PRIVKEY_LEN + 1];
+    size_t raw_len = b64_decode_clean(b64_priv, raw, sizeof(raw));
+    const char *param;
+    if (raw_len == MLDSA44_SEED_LEN) param = MLDSA_PARAM_SEED;
+    else if (raw_len == MLDSA44_PRIVKEY_LEN) param = OSSL_PKEY_PARAM_PRIV_KEY;
+    else return NULL;
+
+    EVP_PKEY *pkey = NULL;
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_from_name(NULL, "ML-DSA-44", NULL);
+    if (ctx) {
+        OSSL_PARAM params[] = {
+            OSSL_PARAM_construct_octet_string(param, raw, raw_len),
+            OSSL_PARAM_construct_end(),
+        };
+        if (EVP_PKEY_fromdata_init(ctx) != 1 || EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_KEYPAIR, params) != 1) {
+            pkey = NULL;
+        }
+        EVP_PKEY_CTX_free(ctx);
+    } else {
+        fprintf(stderr, "error: this OpenSSL has no ML-DSA-44 (OpenSSL 3.5 or later is required for algorithm 18)\n");
+    }
+    OPENSSL_cleanse(raw, sizeof(raw));
+    OPENSSL_cleanse(b64_priv, sizeof(b64_priv));
+    return pkey;
+}
+
 static EVP_PKEY *rsa_key_from_bind_fields(const char *file_buf) {
     char b64[4096];
     uint8_t n_buf[512], e_buf[32], d_buf[512];
@@ -458,6 +495,8 @@ bool load_bind_sig0_private_key(const char *path, sig0_key_t *key) {
         }
     } else if (alg == 8) { // RSASHA256
         pkey = rsa_key_from_bind_fields(file_buf);
+    } else if (alg == DNSSEC_ALG_MLDSA44) { // ML-DSA-44 (draft-westerbaan-dnssec-mldsa)
+        pkey = mldsa44_key_from_bind_fields(file_buf);
     } else {
         fprintf(stderr, "error: unsupported BIND DNSSEC algorithm %d for SIG(0)\n", alg);
         return false;
@@ -521,6 +560,8 @@ bool load_sig0_pkey(const char *path, sig0_key_t *key) {
             }
         } else if (base_id == EVP_PKEY_ED25519) {
             key->algorithm = 15; // ED25519
+        } else if (EVP_PKEY_is_a(pkey, "ML-DSA-44")) {
+            key->algorithm = DNSSEC_ALG_MLDSA44; // MLDSA44 (OpenSSL 3.5+)
         } else {
             fprintf(stderr, "error: unsupported private key type (base_id %d) for SIG(0)\n", base_id);
             EVP_PKEY_free(pkey);

@@ -1260,6 +1260,85 @@ static void expect_rdata(const char *line, const uint8_t *want, size_t want_len)
     zt_free(&z);
 }
 
+/* ML-DSA-44 (DNSSEC algorithm 18, draft-westerbaan-dnssec-mldsa): a 1312-octet DNSKEY public key and a 2420-octet
+ * RRSIG signature. Signed zones split such base64 values over many whitespace-separated pieces (dnssec-signzone
+ * writes the 3228-character signature on dozens of lines), more than MAX_RDATA fields: the parser joins the
+ * trailing pieces, and the wire RDATA must be exactly the decoded bytes. */
+static size_t ref_b64(const uint8_t *in, size_t n, char *out) {
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)in[i] << 16 | (i + 1 < n ? (uint32_t)in[i + 1] << 8 : 0) | (i + 2 < n ? in[i + 2] : 0);
+        out[o++] = tbl[(v >> 18) & 63];
+        out[o++] = tbl[(v >> 12) & 63];
+        out[o++] = i + 1 < n ? tbl[(v >> 6) & 63] : '=';
+        out[o++] = i + 2 < n ? tbl[v & 63] : '=';
+    }
+    out[o] = '\0';
+    return o;
+}
+/* Appends `b64` to `dst` in pieces of `chunk` characters, one per line inside parentheses. */
+static void append_split(char *dst, size_t cap, const char *b64, size_t chunk) {
+    size_t len = strlen(b64), o = strlen(dst);
+    for (size_t i = 0; i < len; i += chunk) {
+        int w = snprintf(dst + o, cap - o, "\n\t\t%.*s", (int)(len - i < chunk ? len - i : chunk), b64 + i);
+        assert(w > 0 && (size_t)w < cap - o);
+        o += (size_t)w;
+    }
+}
+
+static void test_mldsa44_large_blobs(void) {
+    printf("[TEST] ML-DSA-44 (alg 18) DNSKEY/RRSIG: base64 split over more than MAX_RDATA pieces...\n");
+    static uint8_t pub[1312], sig[2420];
+    for (size_t i = 0; i < sizeof(pub); i++) pub[i] = (uint8_t)(i * 7 + 1);
+    for (size_t i = 0; i < sizeof(sig); i++) sig[i] = (uint8_t)(i * 13 + 5);
+    static char pub64[2000], sig64[3300];
+    ref_b64(pub, sizeof(pub), pub64);
+    assert(ref_b64(sig, sizeof(sig), sig64) == 3228);
+
+    static const size_t chunks[] = { 3228, 64, 44, 16, 8 };   /* one piece .. 404 pieces (MAX_FIELDS is 512) */
+    for (size_t c = 0; c < sizeof(chunks) / sizeof(chunks[0]); c++) {
+        static char text[16384];
+        snprintf(text, sizeof(text), "%sk1 DNSKEY 256 3 18 (", SOA_HEAD);
+        append_split(text, sizeof(text), pub64, chunks[c] < 16 ? 16 : chunks[c]);
+        strcat(text, " )\nk1 RRSIG DNSKEY 18 2 300 20261231000000 20261001000000 4242 example. (");
+        append_split(text, sizeof(text), sig64, chunks[c]);
+        strcat(text, " )\n");
+        zt_t z;
+        zt_load(&z, text);
+        ASSERT_PARSED(&z);
+
+        static uint8_t wire[8192];
+        const uint8_t *rd;
+        size_t rdlen;
+        dns_record_t *k = zt_find(&z, "k1.example.", 48);
+        assert(k && ser_rdata(k, wire, sizeof(wire), &rd, &rdlen) == 0);
+        assert(rdlen == 4 + sizeof(pub) && rd[0] == 1 && rd[1] == 0 && rd[2] == 3 && rd[3] == 18);
+        assert(memcmp(rd + 4, pub, sizeof(pub)) == 0);
+
+        dns_record_t *r = zt_find(&z, "k1.example.", 46);
+        assert(r && r->rdata_count <= MAX_RDATA && ser_rdata(r, wire, sizeof(wire), &rd, &rdlen) == 0);
+        static const uint8_t signer[] = { 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+        assert(rdlen == 18 + sizeof(signer) + sizeof(sig));
+        assert(rd[0] == 0 && rd[1] == 48 && rd[2] == 18 && rd[3] == 2);              /* DNSKEY, alg 18, 2 labels */
+        assert(rd[16] == (4242 >> 8) && rd[17] == (4242 & 0xFF));
+        assert(memcmp(rd + 18, signer, sizeof(signer)) == 0);
+        assert(memcmp(rd + 18 + sizeof(signer), sig, sizeof(sig)) == 0);
+        zt_free(&z);
+    }
+
+    /* Only a trailing base64/hex value is joined: a TXT with more strings than MAX_RDATA is still rejected. */
+    static char txt[4096];
+    snprintf(txt, sizeof(txt), "%st1 TXT", SOA_HEAD);
+    for (int i = 0; i < MAX_RDATA + 1; i++) strcat(txt, " x");
+    strcat(txt, "\n");
+    zt_t z;
+    zt_load(&z, txt);
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "MAX_RDATA"));
+    zt_free(&z);
+    printf("  -> ML-DSA-44 DNSKEY/RRSIG serialize to the exact 1312/2420-octet values.\n");
+}
+
 static void test_d08_readme_types(void) {
     printf("[TEST] D-08: SINK, ATMA and IPSECKEY gateway 0 wire format...\n");
     static const uint8_t sink[] = { 1, 2, 3, 1, 2, 3, 4, 5, 6 };
@@ -1440,6 +1519,7 @@ int main(void) {
     test_x32_drop_unencodable();
     test_x16_x25_compare_records();
     test_d08_readme_types();
+    test_mldsa44_large_blobs();
     test_r22_mnemonics_and_classes();
     test_r22_omitted_ttl();
     test_r22_relative_origin();

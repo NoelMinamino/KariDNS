@@ -3800,7 +3800,7 @@ KARIDNS_TOOL_FN void usage(const char *prog) {
         "  -k <keyfile>                 Load TSIG key or BIND SIG(0) (.private) keyfile\n"
         "  +sig0-pkey=<file>            Specify SIG(0) private key file (PEM or BIND .private format)\n"
         "  +sig0-name=<name>            Specify Signer's Name for SIG(0) record\n"
-        "  +sig0-alg=<N>                Override DNSSEC algorithm number for SIG(0) (default: auto)\n"
+        "  +sig0-alg=<N>                Override DNSSEC algorithm number for SIG(0) (8, 13, 15, 18; default: auto)\n"
         "  +sig0-keytag=<N>             Override Key Tag for SIG(0) record (default: auto)\n"
         "  +[no]sig0                    Enable/disable SIG(0) transaction signing\n"
         "  -4 / -6                      Force IPv4 or IPv6 query transport\n"

@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <errno.h>
+#include <ctype.h>
 #include "../dns_config_parser.h"
 #include "../dns_zone_parser.h"
 #include "../dns_utils.h"
@@ -73,6 +74,7 @@ static const dnssec_alg_info_t KNOWN_DNSSEC_ALGS[] = {
     {14, "ECDSAP384SHA384",     "MAY"},
     {15, "ED25519",             "RECOMMENDED"},
     {16, "ED448",               "MAY"},
+    {18, "MLDSA44",             "MAY"},  // draft-westerbaan-dnssec-mldsa (IANA: MAY for signing and validation)
 };
 
 KARIDNS_TOOL_FN void check_dnssec_algorithm(kc_tally_t *t, int alg_num, const char *rec_name, const char *rec_type, int flags, int protocol) {
@@ -91,6 +93,39 @@ KARIDNS_TOOL_FN void check_dnssec_algorithm(kc_tally_t *t, int alg_num, const ch
         }
     }
     kc_warning(t, "%s '%s': unknown DNSSEC algorithm number %d\n", rec_type, rec_name, alg_num);
+}
+
+/* Decoded length of base64 text split over several fields (whitespace inside the value is allowed), or -1 when the
+ * text is not a whole number of base64 quanta. */
+static long b64_fields_decoded_len(char *const *fields, int count) {
+    size_t chars = 0, pad = 0;
+    for (int i = 0; i < count; i++) {
+        for (const char *c = fields[i]; *c; c++) {
+            if (*c == '=') pad++;
+            else if (isalnum((unsigned char)*c) || *c == '+' || *c == '/') { if (pad) return -1; }
+            else return -1;
+            chars++;
+        }
+    }
+    if (chars == 0 || chars % 4 != 0 || pad > 2) return -1;
+    return (long)(chars / 4 * 3 - pad);
+}
+
+/* Algorithms whose public key / signature has a fixed size: a DNSKEY or RRSIG of another size cannot validate.
+ * ML-DSA-44 (algorithm 18, draft-westerbaan-dnssec-mldsa): 1312-octet public key, 2420-octet signature. */
+KARIDNS_TOOL_FN void check_dnssec_blob_length(kc_tally_t *t, int alg_num, const char *rec_name, const char *rec_type,
+                                              bool is_signature, char *const *fields, int count) {
+    long want;
+    if (alg_num == 18) want = is_signature ? 2420 : 1312;
+    else return;
+    long got = b64_fields_decoded_len(fields, count);
+    if (got < 0) {
+        kc_warning(t, "%s '%s': %s is not valid base64\n", rec_type, rec_name, is_signature ? "signature" : "public key");
+    } else if (got != want) {
+        kc_warning(t, "%s '%s': algorithm %d (MLDSA44) %s must be %ld octets, found %ld "
+                      "(draft-westerbaan-dnssec-mldsa)\n",
+                   rec_type, rec_name, alg_num, is_signature ? "signature" : "public key", want, got);
+    }
 }
 
 typedef struct { int digest_type; const char *name; const char *status; } ds_digest_info_t;
@@ -1314,6 +1349,9 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
                 int protocol = (int)strtol(rdata[1], NULL, 10);
                 int alg = (int)strtol(rdata[2], NULL, 10);
                 check_dnssec_algorithm(&tally, alg, arena.records[i].name, tcode == 48 ? "DNSKEY" : "CDNSKEY", flags, protocol);
+                if (rcount >= 4)
+                    check_dnssec_blob_length(&tally, alg, arena.records[i].name, tcode == 48 ? "DNSKEY" : "CDNSKEY",
+                                             false, &rdata[3], rcount - 3);
             }
         }
         if (tcode == 43 || tcode == 59) { // DS / CDS
@@ -1328,6 +1366,9 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         if (tcode == 46) { // RRSIG
             if (rcount >= 2) {
                 check_dnssec_algorithm(&tally, (int)strtol(rdata[1], NULL, 10), arena.records[i].name, "RRSIG", -1, -1);
+                if (rcount >= 9)
+                    check_dnssec_blob_length(&tally, (int)strtol(rdata[1], NULL, 10), arena.records[i].name, "RRSIG",
+                                             true, &rdata[8], rcount - 8);
             }
         }
         if (tcode == 55) { // HIP

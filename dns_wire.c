@@ -1639,13 +1639,21 @@ static size_t build_key_rdata_from_pkey(EVP_PKEY *pkey, uint8_t algorithm, uint8
         }
         pos += raw_len;
         return pos;
+    } else if (algorithm == DNSSEC_ALG_MLDSA44) { // ML-DSA-44 (draft-westerbaan-dnssec-mldsa): bare FIPS 204 public key
+        size_t raw_len = MLDSA44_PUBKEY_LEN;
+        if (pos + raw_len > max_out || !EVP_PKEY_is_a(pkey, "ML-DSA-44")) return 0;
+        if (EVP_PKEY_get_raw_public_key(pkey, &out[pos], &raw_len) != 1 || raw_len != MLDSA44_PUBKEY_LEN) {
+            return 0;
+        }
+        pos += raw_len;
+        return pos;
     }
     return 0;
 }
 
 uint16_t compute_sig0_keytag(const sig0_key_t *key) {
     if (!key || !key->pkey) return 0;
-    uint8_t rdata[4 + 1024];
+    uint8_t rdata[4 + 2048]; // ML-DSA-44 の公開鍵 (1312 オクテット) も入る大きさ
     size_t rdlen = build_key_rdata_from_pkey(key->pkey, key->algorithm, rdata, sizeof(rdata));
     if (rdlen == 0) return 0;
     return compute_dnskey_tag(rdata, rdlen);
@@ -1720,6 +1728,8 @@ int sig0_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, sig0_k
         md = EVP_sha256();
     } else if (key->algorithm == 15) {
         md = NULL; // Ed25519 requires md = NULL
+    } else if (key->algorithm == DNSSEC_ALG_MLDSA44 && EVP_PKEY_is_a(key->pkey, "ML-DSA-44")) {
+        md = NULL; // pure ML-DSA (FIPS 204 ML-DSA.Sign) over the data with the default empty context string
     } else {
         if (to_sign != stack_to_sign) free(to_sign);
         packet[10] = (uint8_t)(orig_arcount >> 8);
@@ -1735,7 +1745,7 @@ int sig0_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, sig0_k
         return -1;
     }
 
-    unsigned char raw_sig[1024];
+    unsigned char raw_sig[4096]; // ML-DSA-44 の署名は 2420 オクテット
     size_t raw_sig_len = sizeof(raw_sig);
     bool ok = false;
     if (EVP_DigestSignInit(mdctx, NULL, md, NULL, key->pkey) == 1 &&
@@ -1750,7 +1760,7 @@ int sig0_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, sig0_k
         return -1;
     }
 
-    unsigned char sig[1024];
+    unsigned char sig[4096];
     size_t sig_len = 0;
     if (key->algorithm == 13) {
         const unsigned char *der_ptr = raw_sig;
@@ -1785,6 +1795,14 @@ int sig0_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, sig0_k
         }
         memcpy(sig, raw_sig, 64);
         sig_len = 64;
+    } else if (key->algorithm == DNSSEC_ALG_MLDSA44) {
+        if (raw_sig_len != MLDSA44_SIG_LEN) {
+            packet[10] = (uint8_t)(orig_arcount >> 8);
+            packet[11] = (uint8_t)(orig_arcount & 0xFF);
+            return -1;
+        }
+        memcpy(sig, raw_sig, MLDSA44_SIG_LEN);
+        sig_len = MLDSA44_SIG_LEN;
     } else if (key->algorithm == 8) {
         if (raw_sig_len > sizeof(sig)) {
             packet[10] = (uint8_t)(orig_arcount >> 8);
@@ -2010,18 +2028,35 @@ static uint8_t loc_encode_precsize(double meters) {
 }
 
 
+static int decode_b64_buffer(const char *b64, size_t b64_len, uint8_t *res, size_t max_res_len, size_t *offset);
+
 static int decode_concat_b64_rdata(char *const *fields, int count, uint8_t *res,
                                     size_t max_res_len, size_t *offset) {
     if (!fields || !res || !offset || *offset > max_res_len) return -1;
-    char b64[2048] = "";
+    /* ML-DSA-44 の RRSIG 署名 (2420 オクテット = base64 3228 文字) のように 2 KiB を超える値もあるので、
+     * スタックに収まらない長さはヒープで連結する (上限は RDATA 最大長 65535 オクテットの base64 長)。 */
+    char stack_b64[2048];
+    size_t total = 0;
+    for (int i = 0; i < count; i++) {
+        total += strlen(fields[i]);
+        if (total > 87384) return -1;
+    }
+    char *b64 = (total < sizeof(stack_b64)) ? stack_b64 : malloc(total + 1);
+    if (!b64) return -1;
     size_t b64_len = 0;
+    b64[0] = '\0';
     for (int i = 0; i < count; i++) {
         size_t flen = strlen(fields[i]);
-        if (b64_len + flen >= sizeof(b64)) return -1;
         memcpy(b64 + b64_len, fields[i], flen);
         b64_len += flen;
         b64[b64_len] = '\0';
     }
+    int rc = decode_b64_buffer(b64, b64_len, res, max_res_len, offset);
+    if (b64 != stack_b64) free(b64);
+    return rc;
+}
+
+static int decode_b64_buffer(const char *b64, size_t b64_len, uint8_t *res, size_t max_res_len, size_t *offset) {
     /* b64_len must be a non-zero multiple of 4 (a well-formed base64 quantum
      * count). Otherwise EVP_DecodeBlock's returned length can legitimately be
      * smaller than the trailing '=' padding count below (e.g. b64_len==2 with

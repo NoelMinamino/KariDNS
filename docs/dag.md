@@ -362,16 +362,18 @@ Queries carry an EDNS0 OPT record and a client cookie by default (like `dig`). U
 
 ## SIG(0) TRANSACTION SECURITY (RFC 2931 / RFC 3007)
 
-`dag` supports client-side SIG(0) asymmetric key transaction signatures (RFC 2931 / RFC 3007) for authenticating Dynamic DNS UPDATE and query requests using public-key cryptography (RSA, ECDSA P-256/P-384, Ed25519). Server-side verification in KariDNS is out of scope.
+`dag` supports client-side SIG(0) asymmetric key transaction signatures (RFC 2931 / RFC 3007) for authenticating Dynamic DNS UPDATE and query requests using public-key cryptography (RSA, ECDSA P-256/P-384, Ed25519, ML-DSA-44). Server-side verification in KariDNS is out of scope.
 
 `+sig0-pkey=file`
-: Specify the private key file in PKCS#8 / traditional PEM format (`.key` or `.pem`) or BIND DNSSEC private key format (`.private`). The key algorithm is auto-detected (supporting RSA, ECDSA P-256, and Ed25519). Setting this option automatically enables SIG(0) signing.
+: Specify the private key file in PKCS#8 / traditional PEM format (`.key` or `.pem`) or BIND DNSSEC private key format (`.private`). The key algorithm is auto-detected (supporting RSA, ECDSA P-256, Ed25519, and ML-DSA-44). Setting this option automatically enables SIG(0) signing.
 
 `+sig0-name=name`
 : Specify the signer's domain name (identity of the KEY RR), e.g., `update-key.example.com.`. Required when using PEM keys; automatically extracted when using BIND `-k` / `.private` keys.
 
 `+sig0-alg=N`
-: Override the algorithm number (e.g., 8 for RSASHA256, 13 for ECDSAP256SHA256, 15 for ED25519). If omitted, `dag` automatically determines the algorithm from the loaded private key.
+: Override the algorithm number (e.g., 8 for RSASHA256, 13 for ECDSAP256SHA256, 15 for ED25519, 18 for MLDSA44). If omitted, `dag` automatically determines the algorithm from the loaded private key.
+
+> **ML-DSA-44 (algorithm 18, `MLDSA44`)** follows [draft-westerbaan-dnssec-mldsa](https://datatracker.ietf.org/doc/draft-westerbaan-dnssec-mldsa/): the KEY/DNSKEY public key is the bare 1312-octet FIPS 204 encoding and the signature the bare 2420-octet pure ML-DSA signature with an empty context string. It needs `dag` built against OpenSSL 3.5 or later. A BIND `.private` file carries the key in `PrivateKey:` as either the 32-octet seed or the 2560-octet expanded private key; a PEM file is read as is (e.g. `openssl genpkey -algorithm ML-DSA-44`). A message with a 2.4 KB signature exceeds the usual UDP payload sizes, so use `+tcp` for signed UPDATEs.
 
 `+sig0-keytag=N`
 : Override the 16-bit key tag (0–65535). If omitted, `dag` automatically computes the key tag from the public key using RFC 4034 Appendix B and standard KEY RR wire formatting.

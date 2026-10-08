@@ -162,6 +162,7 @@ const char *dnssec_algo_name(uint8_t alg) {
         case 14: return "ECDSAP384SHA384";
         case 15: return "ED25519";
         case 16: return "ED448";
+        case 18: return "MLDSA44"; // ML-DSA-44 (draft-westerbaan-dnssec-mldsa)
         default: return "UNKNOWN";
     }
 }
