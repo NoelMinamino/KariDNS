@@ -201,7 +201,8 @@ static void test_all_rr_types_and_resolution(void) {
         { "dkey.example.com.", 48 /* DNSKEY */, 1, 0 },
         { "rrsigrec.example.com.", 46 /* RRSIG */, 1, 0 },
         { "nsec1.example.com.", 47 /* NSEC */, 1, 0 },
-        { "nsec3rec.example.com.", 50 /* NSEC3 */, 1, 0 },
+        // RFC 5155 §7.2.8: a name that owns only an NSEC3 RR does not exist for queries (Name Error)
+        { "nsec3rec.example.com.", 50 /* NSEC3 */, 0, 3 },
         { "svc.example.com.", 64 /* SVCB */, 1, 0 },
         { "https.example.com.", 65 /* HTTPS */, 1, 0 },
         { "apl.example.com.", 42 /* APL */, 1, 0 },
