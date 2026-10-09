@@ -60,8 +60,33 @@ static bool is_record_owned_by_zone(const char *record_name, const char *target_
 /* is_record_owned_by_zone() に加えて、同じ view のどのゾーンにも属さない
  * レコードを数える (R-27: ゾーン外データは警告して捨てる)。'=' / '6' 行から
  * 自動生成する逆引き PTR は、逆引きゾーンを置かないのが普通なので数えない。 */
+/* 次の上位の名前 ("a.example.test." -> "example.test.")。最上位のラベルなら NULL */
+static const char *parent_name(const char *name) {
+    const char *dot = strchr_unescaped(name, '.');
+    return (dot && dot[1]) ? dot + 1 : NULL;
+}
+
 static bool tinydns_owned(parse_context_t *ctx, const char *record_name, bool count_orphan) {
     const char *target_zone = ctx ? ctx->default_origin : NULL;
+    if (ctx && ctx->zone_exists && record_name && target_zone && *target_zone) {
+        /* 索引で引く版。record_name から上位へたどり、target_zone より長いゾーンが
+         * あればそちら (子ゾーン) のレコード。ゾーン数ではなくラベル数に比例する。 */
+        if (domain_name_is_at_or_below(record_name, target_zone)) {
+            size_t tlen = dns_name_len_no_root(target_zone, strlen(target_zone));
+            for (const char *p = record_name; p; p = parent_name(p)) {
+                if (dns_name_len_no_root(p, strlen(p)) <= tlen) break;
+                if (ctx->zone_exists(ctx->zone_exists_ud, p)) return false;
+            }
+            return true;
+        }
+        if (!count_orphan) return false;
+        for (const char *p = record_name; p; p = parent_name(p)) {
+            if (ctx->zone_exists(ctx->zone_exists_ud, p)) return false;
+        }
+        if (ctx->zone_exists(ctx->zone_exists_ud, ".")) return false; /* ルートゾーン */
+        if (ctx->out_of_zone_count++ == 0) ctx->first_out_of_zone = record_name;
+        return false;
+    }
     const char **all_zones = ctx ? ctx->all_zone_names : NULL;
     int all_zone_count = ctx ? ctx->all_zone_count : 0;
     if (is_record_owned_by_zone(record_name, target_zone, all_zones, all_zone_count)) return true;

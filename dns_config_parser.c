@@ -441,8 +441,66 @@ void free_zone_config(zone_config_t *zone) {
   free(zone);
 }
 
+void zone_cfg_index_free(zone_cfg_index_t *ix) {
+  if (!ix) return;
+  free(ix->slots);
+  memset(ix, 0, sizeof(*ix));
+}
+
+static zone_config_t *zone_cfg_index_find(const zone_cfg_index_t *ix, const char *domain) {
+  for (uint32_t i = dns_name_hash_ci(domain) & ix->mask; ix->slots[i]; i = (i + 1) & ix->mask) {
+    if (domain_names_match_ci(ix->slots[i]->domain, domain)) return ix->slots[i];
+  }
+  return NULL;
+}
+
+int zone_cfg_index_insert(zone_cfg_index_t *ix, zone_config_t *z, zone_config_t **dup) {
+  if (dup) *dup = NULL;
+  if (!z || !z->domain) return 0;
+  if (ix->slots) {
+    zone_config_t *found = zone_cfg_index_find(ix, z->domain);
+    if (found) {
+      if (dup) *dup = found;
+      return 1;
+    }
+  }
+  /* 使用率を 1/2 以下に保つ (線形探索の探索長を短くする) */
+  if (!ix->slots || (size_t)(ix->count + 1) * 2 > (size_t)ix->mask + 1) {
+    size_t cap = ix->slots ? ((size_t)ix->mask + 1) * 2 : 16;
+    if (cap > UINT32_MAX) return -1;
+    zone_config_t **slots = calloc(cap, sizeof(*slots));
+    if (!slots) return -1;
+    uint32_t mask = (uint32_t)(cap - 1);
+    for (uint32_t k = 0; ix->slots && k <= ix->mask; k++) {
+      zone_config_t *old = ix->slots[k];
+      if (!old) continue;
+      uint32_t i = dns_name_hash_ci(old->domain) & mask;
+      while (slots[i]) i = (i + 1) & mask;
+      slots[i] = old;
+    }
+    free(ix->slots);
+    ix->slots = slots;
+    ix->mask = mask;
+  }
+  uint32_t i = dns_name_hash_ci(z->domain) & ix->mask;
+  while (ix->slots[i]) i = (i + 1) & ix->mask;
+  ix->slots[i] = z;
+  ix->count++;
+  return 0;
+}
+
+zone_config_t *view_find_zone_config(const view_config_t *v, const char *domain) {
+  if (!v || !domain) return NULL;
+  if (v->zone_index.slots) return zone_cfg_index_find(&v->zone_index, domain);
+  for (zone_config_t *z = v->zones; z; z = z->next) {
+    if (domain_names_match_ci(z->domain, domain)) return z;
+  }
+  return NULL;
+}
+
 static void free_partial_view(view_config_t *view) {
   if (!view) return;
+  zone_cfg_index_free(&view->zone_index);
   if (view->name) free(view->name);
   for (int i = 0; i < view->match_clients_count; i++) free(view->match_clients[i]);
   if (view->match_clients) free(view->match_clients);
@@ -582,6 +640,7 @@ void free_server_config_fields(server_config_t *cfg) {
   if (cfg->nsid_string) { free(cfg->nsid_string); cfg->nsid_string = NULL; }
   OPENSSL_cleanse(cfg->cookie_secrets, sizeof(cfg->cookie_secrets));
   cfg->cookie_secret_count = 0;
+  zone_cfg_index_free(&cfg->top_zone_index);
 
   if (cfg->zones_are_flat) {
     zone_config_t *curr_flat = cfg->zones;
@@ -605,6 +664,7 @@ void free_server_config_fields(server_config_t *cfg) {
   view_config_t *v = cfg->views;
   while (v) {
     view_config_t *next_v = v->next;
+    zone_cfg_index_free(&v->zone_index);
     if (v->name) free(v->name);
     for (int i = 0; i < v->match_clients_count; i++) free(v->match_clients[i]);
     if (v->match_clients) free(v->match_clients);
@@ -2528,14 +2588,18 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free_partial_view(view);
             return -1;
           }
-          for (zone_config_t *existing = view->zones; existing; existing = existing->next) {
-            if (strcasecmp(existing->domain, z->domain) == 0) {
+          /* 重複は検索と同じ規則で判定する ("example.test" と "example.test." は同じゾーン) */
+          int ins = zone_cfg_index_insert(&view->zone_index, z, NULL);
+          if (ins != 0) {
+            if (ins > 0) {
               syslog(LOG_ERR, "[Config] Duplicate zone '%s' defined in view '%s'; rejecting configuration", z->domain, view->name);
               fprintf(stderr, "[ERROR] Duplicate zone '%s' defined in view '%s'\n", z->domain, view->name);
-              free_zone_config(z);
-              free_partial_view(view);
-              return -1;
+            } else {
+              syslog(LOG_ERR, "[Config] Out of memory indexing zone '%s'", z->domain);
             }
+            free_zone_config(z);
+            free_partial_view(view);
+            return -1;
           }
           if (!view->zones) view->zones = z; else last_view_zone->next = z;
           last_view_zone = z;
@@ -2562,13 +2626,16 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       free_token(&tok);
       zone_config_t *zone = NULL;
       if (parse_zone_block(ctx, &zone) != 0) return -1;
-      for (zone_config_t *existing = config->zones; existing; existing = existing->next) {
-        if (strcasecmp(existing->domain, zone->domain) == 0) {
+      int ins = zone_cfg_index_insert(&config->top_zone_index, zone, NULL);
+      if (ins != 0) {
+        if (ins > 0) {
           syslog(LOG_ERR, "[Config] Duplicate zone '%s' defined (top-level); rejecting configuration", zone->domain);
           fprintf(stderr, "[ERROR] Duplicate zone '%s' defined\n", zone->domain);
-          free_zone_config(zone);
-          return -1;
+        } else {
+          syslog(LOG_ERR, "[Config] Out of memory indexing zone '%s'", zone->domain);
         }
+        free_zone_config(zone);
+        return -1;
       }
       saw_top_level_zone = true;
       if (!config->zones)
@@ -3212,6 +3279,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
     default_view->match_clients_count = 1;
     default_view->match_clients_parsed = acl_list_parse(default_view->match_clients, default_view->match_clients_count);
     default_view->zones = config->zones;
+    default_view->zone_index = config->top_zone_index;
+    memset(&config->top_zone_index, 0, sizeof(config->top_zone_index));
     config->zones = NULL;
     config->views = default_view;
   }

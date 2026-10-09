@@ -74,9 +74,8 @@ zone_config_t *find_zone_config_in_view(server_config_t *cfg,
   if (cfg->views) {
     for (view_config_t *v = cfg->views; v; v = v->next) {
       if (view_name && view_name[0] != '\0' && strcasecmp(v->name, view_name) != 0) continue;
-      for (zone_config_t *z = v->zones; z; z = z->next) {
-        if (domain_names_match_ci(z->domain, domain)) return z;
-      }
+      zone_config_t *z = view_find_zone_config(v, domain);
+      if (z) return z;
       if (view_name && view_name[0] != '\0') return NULL;
     }
   } else {
@@ -144,10 +143,7 @@ int lookup_zone_across_views(zone_db_snapshot_t *snap, server_config_t *cfg,
   int matches = 0;
   for (view_config_t *v = cfg->views; v; v = v->next) {
     if (view_name && v->name && strcasecmp(v->name, view_name) != 0) continue;
-    zone_config_t *zcfg = NULL;
-    for (zone_config_t *z = v->zones; z; z = z->next) {
-      if (z->domain && domain_names_match_ci(z->domain, domain)) { zcfg = z; break; }
-    }
+    zone_config_t *zcfg = view_find_zone_config(v, domain);
     if (!zcfg) continue;
 
     zone_db_entry_t *entry = v->name ? snapshot_get_zone_in_view(snap, v->name, domain) : NULL;
@@ -636,6 +632,11 @@ static void log_unencodable_record(const dns_record_t *rec, void *ud) {
          "(karicheck shows the reason)", l->zone, rec->name ? rec->name : "", rec->type ? rec->type : "");
 }
 
+/* parse_context_t.zone_exists: name が view (ud) のゾーンの頂点か */
+static bool view_has_zone(const void *ud, const char *name) {
+  return view_find_zone_config((const view_config_t *)ud, name) != NULL;
+}
+
 reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) {
   if (!entry || !zcfg || !zcfg->file) return RELOAD_ERR_FILE_READ;
   const char *file = zcfg->file;
@@ -740,8 +741,6 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   ctx.source_mtime = root_st.st_mtime; // X-13: tinydns の SOA serial。パーサはパスを stat しない
 
   server_config_t *active_cfg = acquire_config_snapshot();
-  const char **all_zone_ptrs = NULL;
-  int all_zone_cnt = 0;
   // 親子ゾーンの振り分けに使うのは、このゾーンと同じ view のゾーンだけ (R-26)。
   // 別の view にしか無い子ゾーンの名前で、この view のレコードを落とさない。
   view_config_t *own_view = NULL;
@@ -750,26 +749,12 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
           if (v->name && strcasecmp(v->name, entry->view_name) == 0) { own_view = v; break; }
       }
   }
+  /* view の全ゾーン名の配列をゾーンごとに作ると、読み込み全体がゾーン数の 2 乗になる。
+   * tinydns パーサには view の索引を引かせる (O-11 と同じく、view の全ゾーンが対象)。 */
   if (own_view) {
-      /* view のゾーン数だけ確保する (O-11: 以前は 256 件で打ち切り、それを超えると共有 data の
-       * レコードが親ゾーンに入ることがあった)。ゾーンの読み込みはクエリの経路ではない。 */
-      size_t n = 0;
-      for (zone_config_t *zc = own_view->zones; zc; zc = zc->next) n++;
-      all_zone_ptrs = n > 0 ? calloc(n, sizeof(*all_zone_ptrs)) : NULL;
-      if (n > 0 && !all_zone_ptrs) {
-          release_config_snapshot(active_cfg);
-          free((void*)ctx.base_dir);
-          free(root_path);
-          syslog(LOG_ERR, "[ZoneLoader] Out of memory building the zone list for '%s'", entry->domain);
-          pthread_mutex_unlock(&entry->writer_lock);
-          return RELOAD_ERR_PARSE;
-      }
-      for (zone_config_t *zc = own_view->zones; zc; zc = zc->next) {
-          if (zc->domain) all_zone_ptrs[all_zone_cnt++] = zc->domain;
-      }
+      ctx.zone_exists = view_has_zone;
+      ctx.zone_exists_ud = own_view;
   }
-  ctx.all_zone_names = (all_zone_cnt > 0) ? all_zone_ptrs : NULL;
-  ctx.all_zone_count = all_zone_cnt;
 
   int count;
   if (zcfg->file_format && strcasecmp(zcfg->file_format, "tinydns") == 0) {
@@ -778,7 +763,6 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
       count = parse_zone_fast(buf, strlen(buf), z_standby, &ctx);
   }
   release_config_snapshot(active_cfg);
-  free(all_zone_ptrs);
   free((void*)ctx.base_dir);
   free(root_path);
 
@@ -944,6 +928,34 @@ static int catalog_member_index(const catalog_member_id_t *list, int count, cons
     return -1;
 }
 
+/* catalog_member_index() 用のハッシュ表を作る。作れなければ *ht / *chain は NULL のまま
+ * (catalog_member_index() は線形探索になる)。呼び出し側が free() する。 */
+static void catalog_member_hash_build(const catalog_member_id_t *list, int count,
+                                      int **ht, int **chain, size_t *hsize) {
+    *ht = NULL;
+    *chain = NULL;
+    *hsize = 0;
+    if (!list || count <= 0) return;
+    size_t p = 256;
+    while (p < (size_t)count * 2) p <<= 1;
+    int *t = malloc(p * sizeof(int));
+    int *c = malloc((size_t)count * sizeof(int));
+    if (!t || !c) {
+        free(t);
+        free(c);
+        return;
+    }
+    for (size_t k = 0; k < p; k++) t[k] = -1;
+    for (int j = 0; j < count; j++) {
+        size_t idx = calc_catalog_member_hash(list[j].domain, list[j].unique_id) & (p - 1);
+        c[j] = t[idx];
+        t[idx] = j;
+    }
+    *ht = t;
+    *chain = c;
+    *hsize = p;
+}
+
 static bool catalog_groups_equal(const catalog_member_id_t *a, const catalog_member_id_t *b) {
     if (a->group_count != b->group_count) return false;
     for (int k = 0; k < a->group_count; k++) {
@@ -1043,6 +1055,11 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             }
         }
 
+        /* 旧メンバーが有効かは (名前, unique-id) のハッシュで引く (メンバー数の 2 乗にしない) */
+        int *vm_ht = NULL, *vm_chain = NULL;
+        size_t vm_hsize = 0;
+        catalog_member_hash_build(valid_members, valid_member_count, &vm_ht, &vm_chain, &vm_hsize);
+
         int view_count = 0;
         for (view_config_t *v = active_config->views; v; v = v->next) view_count++;
         
@@ -1050,7 +1067,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         if (view_count > 0) {
             new_snap->views = calloc(view_count, sizeof(view_snapshot_t));
             if (!new_snap->views) {
-                if (valid_members) free(valid_members);
+                { free(valid_members); free(vm_ht); free(vm_chain); }
                 abort_rebuild_snapshot(new_snap, "new_snap->views");
                 return NULL;
             }
@@ -1062,7 +1079,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             view_snapshot_t *vs = &new_snap->views[vidx];
             vs->name = v->name ? strdup(v->name) : strdup("");
             if (!vs->name) {
-                if (valid_members) free(valid_members);
+                { free(valid_members); free(vm_ht); free(vm_chain); }
                 abort_rebuild_snapshot(new_snap, "vs->name");
                 return NULL;
             }
@@ -1070,7 +1087,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             if (v->match_clients_count > 0) {
                 vs->match_clients = calloc(v->match_clients_count, sizeof(char *));
                 if (!vs->match_clients) {
-                    if (valid_members) free(valid_members);
+                    { free(valid_members); free(vm_ht); free(vm_chain); }
                     abort_rebuild_snapshot(new_snap, "vs->match_clients");
                     return NULL;
                 }
@@ -1078,7 +1095,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     if (v->match_clients[i]) {
                         vs->match_clients[i] = strdup(v->match_clients[i]);
                         if (!vs->match_clients[i]) {
-                            if (valid_members) free(valid_members);
+                            { free(valid_members); free(vm_ht); free(vm_chain); }
                             abort_rebuild_snapshot(new_snap, "vs->match_clients[i]");
                             return NULL;
                         }
@@ -1093,35 +1110,19 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             int static_count = 0;
             for (zone_config_t *z = v->zones; z; z = z->next) static_count++;
             
+            /* 同じ名前の旧 view。ゾーンごとの照合はその view のハッシュと設定の索引で行う
+             * (旧エントリを線形に探すと reload がゾーン数の 2 乗になる) */
+            view_snapshot_t *old_view = (old_snap && v->name) ? snapshot_find_view(old_snap, v->name) : NULL;
+
             int dynamic_count = 0;
-            if (old_snap && old_snap->views) {
-                for (size_t ov = 0; ov < old_snap->view_count; ov++) {
-                    if (old_snap->views[ov].name && v->name && strcasecmp(old_snap->views[ov].name, v->name) == 0) {
-                        if (old_snap->views[ov].entries) {
-                            for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
-                                zone_db_entry_t *entry = old_snap->views[ov].entries[oi];
-                                if (!entry) continue;
-                                if (entry->is_catalog_member) {
-                                    bool is_valid = false;
-                                    for (int k = 0; k < valid_member_count; k++) {
-                                        if (domain_names_match_ci(valid_members[k].domain, entry->domain) &&
-                                            strcmp(valid_members[k].unique_id, entry->catalog_member_unique_id) == 0) {
-                                            is_valid = true; break;
-                                        }
-                                    }
-                                    if (is_valid) {
-                                        bool overridden = false;
-                                        for (zone_config_t *z = v->zones; z; z = z->next) {
-                                            if (z->domain && domain_names_match_ci(z->domain, entry->domain)) {
-                                                 overridden = true; break;
-                                            }
-                                        }
-                                        if (!overridden) dynamic_count++;
-                                    }
-                                }
-                            }
-                        }
-                        break;
+            if (old_view && old_view->entries) {
+                for (size_t oi = 0; oi < old_view->zone_count; oi++) {
+                    zone_db_entry_t *entry = old_view->entries[oi];
+                    if (entry && entry->is_catalog_member &&
+                        catalog_member_index(valid_members, valid_member_count, vm_ht, vm_chain, vm_hsize,
+                                             entry->domain, entry->catalog_member_unique_id) >= 0 &&
+                        !view_find_zone_config(v, entry->domain)) {
+                        dynamic_count++;
                     }
                 }
             }
@@ -1130,7 +1131,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             if (vs->zone_count > 0) {
                 vs->entries = calloc(vs->zone_count, sizeof(zone_db_entry_t *));
                 if (!vs->entries) {
-                    if (valid_members) free(valid_members);
+                    { free(valid_members); free(vm_ht); free(vm_chain); }
                     abort_rebuild_snapshot(new_snap, "vs->entries");
                     return NULL;
                 }
@@ -1139,31 +1140,18 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             int zidx = 0;
             for (zone_config_t *z = v->zones; z; z = z->next) {
                 zone_db_entry_t *entry = NULL;
-                if (old_snap && old_snap->views) {
-                    for (size_t ov = 0; ov < old_snap->view_count; ov++) {
-                        if (old_snap->views[ov].name && v->name && strcasecmp(old_snap->views[ov].name, v->name) == 0) {
-                            if (old_snap->views[ov].entries) {
-                                for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
-                                    if (!old_snap->views[ov].entries[oi]) continue;
-                                    zone_db_entry_t *old = old_snap->views[ov].entries[oi];
-                                    if (z->domain && domain_names_match_ci(old->domain, z->domain)) {
-                                        /* O-13: type が変わったゾーンと、静的ゾーンで上書きされたカタログ
-                                         * メンバーは再利用しない。is_secondary や EXPIRE、転送の状態は
-                                         * エントリ作成時に決まるので、新しいエントリを作る (旧エントリは
-                                         * 削除されたゾーンと同じく旧スナップショットとともに解放される)。*/
-                                        if (old->kind == zone_kind_from_type(z->type) && !old->is_catalog_member) {
-                                            entry = old;
-                                            atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
-                                        } else {
-                                            syslog(LOG_NOTICE, "[Core] zone '%s' in view '%s' changed type or replaces a catalog member; recreating the zone entry",
-                                                   z->domain, v->name ? v->name : "");
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                            break;
-                        }
+                zone_db_entry_t *old = (old_view && z->domain) ? find_zone_exact_in_view(old_view, z->domain) : NULL;
+                if (old) {
+                    /* O-13: type が変わったゾーンと、静的ゾーンで上書きされたカタログ
+                     * メンバーは再利用しない。is_secondary や EXPIRE、転送の状態は
+                     * エントリ作成時に決まるので、新しいエントリを作る (旧エントリは
+                     * 削除されたゾーンと同じく旧スナップショットとともに解放される)。*/
+                    if (old->kind == zone_kind_from_type(z->type) && !old->is_catalog_member) {
+                        entry = old;
+                        atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
+                    } else {
+                        syslog(LOG_NOTICE, "[Core] zone '%s' in view '%s' changed type or replaces a catalog member; recreating the zone entry",
+                               z->domain, v->name ? v->name : "");
                     }
                 }
                 if (!entry) {
@@ -1184,43 +1172,23 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 vs->entries[zidx++] = entry;
             }
 
-            if (old_snap && old_snap->views) {
-                for (size_t ov = 0; ov < old_snap->view_count; ov++) {
-                    if (old_snap->views[ov].name && v->name && strcasecmp(old_snap->views[ov].name, v->name) == 0) {
-                        if (old_snap->views[ov].entries) {
-                            for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
-                                zone_db_entry_t *entry = old_snap->views[ov].entries[oi];
-                                if (!entry) continue;
-                                if (entry->is_catalog_member) {
-                                    bool is_valid = false;
-                                    for (int k = 0; k < valid_member_count; k++) {
-                                        if (domain_names_match_ci(valid_members[k].domain, entry->domain) &&
-                                            strcmp(valid_members[k].unique_id, entry->catalog_member_unique_id) == 0) {
-                                            is_valid = true; break;
-                                        }
-                                    }
-                                    if (is_valid) {
-                                        bool overridden = false;
-                                        for (zone_config_t *z = v->zones; z; z = z->next) {
-                                            if (z->domain && domain_names_match_ci(z->domain, entry->domain)) {
-                                                overridden = true; break;
-                                            }
-                                        }
-                                        if (!overridden) {
-                                            atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
-                                            vs->entries[zidx++] = entry;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        break;
+            /* 有効なカタログメンバーのうち、静的な zone{} で上書きされていないものを引き継ぐ
+             * (dynamic_count と同じ判定) */
+            if (old_view && old_view->entries) {
+                for (size_t oi = 0; oi < old_view->zone_count; oi++) {
+                    zone_db_entry_t *entry = old_view->entries[oi];
+                    if (entry && entry->is_catalog_member &&
+                        catalog_member_index(valid_members, valid_member_count, vm_ht, vm_chain, vm_hsize,
+                                             entry->domain, entry->catalog_member_unique_id) >= 0 &&
+                        !view_find_zone_config(v, entry->domain)) {
+                        atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
+                        vs->entries[zidx++] = entry;
                     }
                 }
             }
             vs->zone_count = zidx;
         }
-        if (valid_members) free(valid_members);
+        { free(valid_members); free(vm_ht); free(vm_chain); }
 
     } else {
         // MODE: Catalog Delta Update
@@ -1298,27 +1266,8 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         int *cur_chain_next = NULL;
         size_t cur_hash_size = 0;
         int cur_count = catalog_entry_to_update->catalog_member_count;
-        if (cur_count > 0 && catalog_entry_to_update->catalog_members) {
-            size_t p = 256;
-            while (p < (size_t)cur_count * 2) p <<= 1;
-            cur_hash_size = p;
-            cur_hash_table = malloc(cur_hash_size * sizeof(int));
-            cur_chain_next = malloc(cur_count * sizeof(int));
-            if (cur_hash_table && cur_chain_next) {
-                for (size_t k = 0; k < cur_hash_size; k++) cur_hash_table[k] = -1;
-                for (int j = 0; j < cur_count; j++) {
-                    uint32_t h = calc_catalog_member_hash(catalog_entry_to_update->catalog_members[j].domain,
-                                                          catalog_entry_to_update->catalog_members[j].unique_id);
-                    size_t idx = h & (cur_hash_size - 1);
-                    cur_chain_next[j] = cur_hash_table[idx];
-                    cur_hash_table[idx] = j;
-                }
-            } else {
-                if (cur_hash_table) { free(cur_hash_table); cur_hash_table = NULL; }
-                if (cur_chain_next) { free(cur_chain_next); cur_chain_next = NULL; }
-                cur_hash_size = 0;
-            }
-        }
+        catalog_member_hash_build(catalog_entry_to_update->catalog_members, cur_count,
+                                  &cur_hash_table, &cur_chain_next, &cur_hash_size);
 
         for (int i = 0; i < new_desired_count; i++) {
             int cur_idx = catalog_member_index(catalog_entry_to_update->catalog_members, cur_count,
@@ -1411,26 +1360,8 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         int *des_hash_table = NULL;
         int *des_chain_next = NULL;
         size_t des_hash_size = 0;
-        if (new_desired_count > 0) {
-            size_t p = 256;
-            while (p < (size_t)new_desired_count * 2) p <<= 1;
-            des_hash_size = p;
-            des_hash_table = malloc(des_hash_size * sizeof(int));
-            des_chain_next = malloc(new_desired_count * sizeof(int));
-            if (des_hash_table && des_chain_next) {
-                for (size_t k = 0; k < des_hash_size; k++) des_hash_table[k] = -1;
-                for (int j = 0; j < new_desired_count; j++) {
-                    uint32_t h = calc_catalog_member_hash(new_desired_members[j].domain, new_desired_members[j].unique_id);
-                    size_t idx = h & (des_hash_size - 1);
-                    des_chain_next[j] = des_hash_table[idx];
-                    des_hash_table[idx] = j;
-                }
-            } else {
-                if (des_hash_table) { free(des_hash_table); des_hash_table = NULL; }
-                if (des_chain_next) { free(des_chain_next); des_chain_next = NULL; }
-                des_hash_size = 0;
-            }
-        }
+        catalog_member_hash_build(new_desired_members, new_desired_count,
+                                  &des_hash_table, &des_chain_next, &des_hash_size);
 
         for (int i = 0; i < catalog_entry_to_update->catalog_member_count; i++) {
             bool found = catalog_member_index(new_desired_members, new_desired_count,

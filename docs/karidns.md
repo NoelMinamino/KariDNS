@@ -200,7 +200,7 @@ zone "example.com" {
 | `acl "<name>" { ... };` | A named address match list (see Address match lists). |
 | `include "<file>";` | Includes another file. |
 
-Duplicate zones (in the same view or at top level), duplicate views, duplicate keys and duplicate `acl` names (names compared case-insensitively) are rejected.
+Duplicate zones (in the same view or at top level), duplicate views, duplicate keys and duplicate `acl` names (names compared case-insensitively) are rejected. Zone names are compared as DNS names, so `example.com` and `example.com.` are the same zone.
 
 ### `options { ... }`
 

@@ -884,6 +884,11 @@ static void karicheck_report_out_of_zone(const dns_record_t *rec, void *ud) {
                u->zone, rec->name ? rec->name : "", rec->type ? rec->type : "");
 }
 
+/* parse_context_t.zone_exists: name が view (ud) のゾーンの頂点か */
+static bool kc_view_has_zone(const void *ud, const char *name) {
+    return view_find_zone_config((const view_config_t *)ud, name) != NULL;
+}
+
 KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bool is_standalone, bool is_catalog, const char *file_format, const zone_config_t *zcfg, const server_config_t *cfg, const view_config_t *view) {
     // Normalize domain to FQDN: append trailing dot if missing.
     // Without this, "example.com" wouldn't match records expanded to "example.com."
@@ -970,27 +975,11 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     ctx.source_mtime = root_st.st_mtime; /* tinydns の SOA serial (サーバーと同じくファイルの mtime) */
 
     /* サーバー (reload_master_zone) と同じく、tinydns の親子ゾーンの振り分けには
-     * このゾーンと同じ view のゾーン名を使う */
-    const char **view_zone_ptrs = NULL;
-    int view_zone_cnt = 0;
+     * このゾーンと同じ view のゾーン (O-11: view の全ゾーン) を、view の索引で引く */
     if (view) {
-        /* 件数の上限は置かない (O-11: サーバーと同じく view の全ゾーン) */
-        size_t n = 0;
-        for (const zone_config_t *vz = view->zones; vz; vz = vz->next) n++;
-        view_zone_ptrs = n > 0 ? calloc(n, sizeof(*view_zone_ptrs)) : NULL;
-        if (n > 0 && !view_zone_ptrs) {
-            kc_error(&tally, "Out of memory\n");
-            free((void*)ctx.base_dir);
-            zone_arena_destroy(&arena);
-            free(root_path);
-            return 1;
-        }
-        for (const zone_config_t *vz = view->zones; vz; vz = vz->next) {
-            if (vz->domain) view_zone_ptrs[view_zone_cnt++] = vz->domain;
-        }
+        ctx.zone_exists = kc_view_has_zone;
+        ctx.zone_exists_ud = view;
     }
-    ctx.all_zone_names = view_zone_cnt > 0 ? view_zone_ptrs : NULL;
-    ctx.all_zone_count = view_zone_cnt;
 
     int res;
     if (file_format && strcasecmp(file_format, "tinydns") == 0) {
@@ -998,8 +987,7 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     } else {
         res = parse_zone_fast(mutable_buf, strlen(mutable_buf), &arena, &ctx);
     }
-    free(view_zone_ptrs);
-    ctx.all_zone_names = NULL;
+    ctx.zone_exists = NULL;
     if (res < 0) {
         print_error_context(file_path, buf, &err, &arena);
         free((void*)ctx.base_dir);

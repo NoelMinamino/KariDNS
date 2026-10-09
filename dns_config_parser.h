@@ -197,12 +197,22 @@ typedef struct {
   uint32_t queue_size;   // queue-size 4096; (既定 4096)
 } dnstap_config_t;
 
+/* view 内のゾーン設定のハッシュ索引 (オープンアドレス法)。キーは domain_names_match_ci()
+ * と同じ規則 (dns_name_hash_ci)。パース中にゾーンを足すたびに作り、重複の検出にも使う。
+ * 設定は公開後に書き換わらないので、読み手はロックなしで引ける。 */
+typedef struct {
+  zone_config_t **slots; /* NULL = 空き */
+  uint32_t mask;         /* 容量 - 1 (容量は 2 のべき) */
+  uint32_t count;
+} zone_cfg_index_t;
+
 typedef struct view_config {
   char *name;
   char **match_clients;
   int match_clients_count;
   acl_entry_t *match_clients_parsed;
   zone_config_t *zones;
+  zone_cfg_index_t zone_index; /* zones の索引。手で組んだ設定 (テスト) では空で、線形探索になる */
   struct view_config *next;
 } view_config_t;
 
@@ -226,6 +236,7 @@ typedef struct server_config_s {
   view_config_t *views;
   zone_config_t *zones; /* 所有権を持たない参照専用フラットリスト。ビュー内ゾーンへのポインタを共有しており、フィールド書き込みや free_zone_config() は絶対に行わないこと */
   bool zones_are_flat;  /* zones が参照専用フラットリストであるかどうかの追跡フラグ */
+  zone_cfg_index_t top_zone_index; /* パース中のトップレベル zone の索引。既定の view に移す */
   tsig_key_t *keys;
   acl_def_t *acls;
   logging_config_t logging;
@@ -311,6 +322,11 @@ int parse_named_conf_ext(const char *config_str, const char *initial_file_path, 
 void config_lexer_cleanup(token_ctx_t *ctx);
 void free_server_config_fields(server_config_t *cfg);
 void free_zone_config(zone_config_t *z);
+/* 0: 追加した、1: 同じ名前のゾーンが既にある (*dup に返す)、-1: メモリ不足 */
+int zone_cfg_index_insert(zone_cfg_index_t *ix, zone_config_t *z, zone_config_t **dup);
+void zone_cfg_index_free(zone_cfg_index_t *ix);
+/* view 内で domain (末尾ドットの有無、大文字小文字は問わない) のゾーン設定。索引が無ければ線形探索 */
+zone_config_t *view_find_zone_config(const view_config_t *v, const char *domain);
 /* zone (NULL 可) の NOTIFY 再送の設定を、options の値で補って返す */
 notify_retry_config_t notify_retry_effective(const server_config_t *cfg, const zone_config_t *zone);
 void free_rate_limit_config(rate_limit_config_t *rrl);

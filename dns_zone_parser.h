@@ -40,6 +40,10 @@ typedef struct parse_context_s {
     // --- 隍・焚繧ｾ繝ｼ繝ｳ繝ｻ隕ｪ蟄舌だ繝ｼ繝ｳ謖ｯ繧雁・縺醍畑 ---
     const char **all_zone_names;
     int all_zone_count;
+    /* tinydns: 省略可。name (正規形) が同じ view のゾーンの頂点かを答える。あれば all_zone_names の
+     * 代わりに使い、レコードごとの判定をゾーン数ではなくラベル数に比例させる。 */
+    bool (*zone_exists)(const void *ud, const char *name);
+    const void *zone_exists_ud;
     /* tinydns: all_zone_names のどのゾーンにも属さないため捨てたレコードの数と、
      * その最初のオーナー名 (arena 内の文字列)。all_zone_names が無ければ数えない。 */
     size_t out_of_zone_count;

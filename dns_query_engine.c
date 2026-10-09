@@ -2499,6 +2499,10 @@ void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const 
     if (domain) {
       strncpy(dummy_entry.domain, domain, sizeof(dummy_entry.domain) - 1);
     }
+    /* resolve_name() はこの view のゾーン設定を引く (空だと全 view から最初に一致したもの) */
+    if (view_name) {
+      strncpy(dummy_entry.view_name, view_name, sizeof(dummy_entry.view_name) - 1);
+    }
     zone_db_entry_t *db_entry_ptr = &dummy_entry;
     zone_arena_t *current_zone_ptr = arena;
 

@@ -70,6 +70,21 @@ static inline bool domain_names_match_ci(const char *a, const char *b) {
     return la == lb && strncasecmp(a, b, la) == 0;
 }
 
+/* domain_names_match_ci() で一致する名前が必ず同じ値になるハッシュ (FNV-1a)。
+ * 末尾のエスケープされない '.' を 1 つ除き、ASCII 英字の大文字小文字を区別しない。
+ * 一致の判定は domain_names_match_ci() で行い、これは候補を絞るだけ。 */
+static inline uint32_t dns_name_hash_ci(const char *name) {
+    size_t len = dns_name_len_no_root(name, strlen(name));
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t c = (uint8_t)name[i];
+        if (c >= 'A' && c <= 'Z') c |= 0x20;
+        h ^= c;
+        h *= 16777619u;
+    }
+    return h;
+}
+
 /* name (表示形式) が apex と同じか、その下にあるか。末尾ドットの有無は問わない。
  * ラベル境界は、エスケープされていない '.' だけとする ("a\.example.test" は
  * "example.test" の下ではない)。apex が "." または "" ならルートなので常に true。

@@ -1447,6 +1447,81 @@ static void test_named_acls(void) {
     expect_reject("acl without a body", "acl a;");
 }
 
+/* ------------------------------------------------------------------------ */
+/* Zone config index (view_find_zone_config): same names as domain_names_match_ci(), built while
+ * parsing, also used for the duplicate check. */
+static void test_zone_config_index(void) {
+    printf("[TEST] zone config index...\n");
+    server_config_t cfg;
+    if (parse_ok("view \"a\" { match-clients { 192.0.2.0/24; };"
+                 "  zone \"one.test\" { type master; file \"a1\"; };"
+                 "  zone \"Sub.Example.TEST.\" { type master; file \"a2\"; }; };"
+                 "view \"b\" { match-clients { any; };"
+                 "  zone \"one.test\" { type master; file \"b1\"; }; };", &cfg)) {
+        const view_config_t *va = cfg.views, *vb = va ? va->next : NULL;
+        CHECK(va && vb && va->zone_index.slots && vb->zone_index.slots);
+        if (va && vb) {
+            const zone_config_t *z = view_find_zone_config(va, "ONE.test.");
+            CHECK(z && strcmp(z->file, "a1") == 0);
+            z = view_find_zone_config(vb, "one.test");
+            CHECK(z && strcmp(z->file, "b1") == 0);
+            z = view_find_zone_config(va, "sub.example.test");
+            CHECK(z && strcmp(z->file, "a2") == 0);
+            CHECK(view_find_zone_config(va, "example.test") == NULL);
+            CHECK(view_find_zone_config(va, "one.test..") == NULL);
+            CHECK(view_find_zone_config(vb, "sub.example.test.") == NULL);
+        }
+        free_server_config_fields(&cfg);
+    }
+
+    /* top-level zones: the index moves to the default view */
+    if (parse_ok("zone \"x.test\" { type master; file \"x\"; }; zone \"y.test\" { type master; file \"y\"; };", &cfg)) {
+        CHECK(cfg.views && cfg.views->zone_index.slots && cfg.views->zone_index.count == 2);
+        CHECK(cfg.top_zone_index.slots == NULL);
+        const zone_config_t *z = cfg.views ? view_find_zone_config(cfg.views, "Y.TEST.") : NULL;
+        CHECK(z && strcmp(z->file, "y") == 0);
+        free_server_config_fields(&cfg);
+    }
+
+    /* duplicates use the lookup rule: trailing dot and case do not make a different zone */
+    expect_reject("dup in view (trailing dot)",
+                  "view \"a\" { zone \"dup.test\" { type master; file \"1\"; };"
+                  " zone \"dup.test.\" { type master; file \"2\"; }; };");
+    expect_reject("dup top-level (case)",
+                  "zone \"dup.test\" { type master; file \"1\"; }; zone \"DUP.test\" { type master; file \"2\"; };");
+
+    /* many zones: growth and probing */
+    enum { N = 3000 };
+    size_t cap = (size_t)N * 64 + 64;
+    char *txt = malloc(cap);
+    if (txt) {
+        size_t off = 0;
+        for (int i = 0; i < N; i++)
+            off += (size_t)snprintf(txt + off, cap - off, "zone \"z%05d.test\" { type master; file \"f\"; };", i);
+        if (parse_ok(txt, &cfg)) {
+            CHECK(cfg.views && cfg.views->zone_index.count == N);
+            int found = 0;
+            char name[32];
+            for (int i = 0; i < N; i++) {
+                snprintf(name, sizeof(name), "Z%05d.TEST.", i);
+                if (cfg.views && view_find_zone_config(cfg.views, name)) found++;
+            }
+            CHECK(found == N);
+            CHECK(view_find_zone_config(cfg.views, "z99999.test") == NULL);
+            free_server_config_fields(&cfg);
+        }
+        free(txt);
+    }
+
+    /* a view built by hand (no index) falls back to the linear search */
+    zone_config_t hz = {0};
+    hz.domain = "hand.test";
+    view_config_t hv = {0};
+    hv.zones = &hz;
+    CHECK(view_find_zone_config(&hv, "HAND.test.") == &hz);
+    CHECK(view_find_zone_config(&hv, "other.test") == NULL);
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
     test_defaults();
@@ -1475,6 +1550,7 @@ int main(void) {
     test_logging_category_lists();
     test_zone_type_case();
     test_named_acls();
+    test_zone_config_index();
 
     printf("[*] %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) {
