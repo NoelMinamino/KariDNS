@@ -280,6 +280,7 @@ register_test "dnssec" "sh" "tests/run_zonemd_val_test.sh" "RFC 8976 ZONEMD veri
 register_test "dnssec" "sh" "tests/run_dnssec_negative_soa_rrsig_test.sh" "RFC 4035 Negative response SOA covering RRSIG"
 register_test "dnssec" "sh" "tests/run_ds_delegation_test.sh" "RFC 4035 3.1.4.1 DS at a delegation point: parent answers, referrals, DS for a hosted child apex from the parent (R-32)"
 register_test "dnssec" "sh" "tests/run_dnssec_answer_sections_test.sh" "DNSSEC answers on signed zones: RRSIGs in Authority/Additional, grouped RRsets, NSEC3PARAM choice and 255-octet salt, DS from the parent, delv validation (R-03, R-04, O-16, O-17, R-31, R-32; SKIP without dnssec-signzone)"
+register_test "dnssec" "sh" "tests/run_nsec3_owner_query_test.sh" "RFC 5155 7.2.8 queries for NSEC3 owner names: NXDOMAIN with the NSEC3 proof for every QTYPE (UDP/TCP, MQTYPE, minimal-any), apex wildcard answers them as BIND does, RCODE/Answer equal to named, AXFR keeps the NSEC3 RRs (SKIP without dnssec-signzone)"
 
 # 4. Dynamic Update (RFC 2136)
 register_test "update" "sh" "tests/run_dynamic_update_test.sh" "RFC 2136 Prerequisites & Update Section handling"

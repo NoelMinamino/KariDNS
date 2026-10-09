@@ -74,6 +74,14 @@ static bool is_non_data_rrtype(uint16_t t) {
     }
 }
 
+/* RFC 5155 §7.2.8: NSEC3 RR とそれを覆う RRSIG はハッシュ化した名前の NSEC3 チェーンのデータで、通常の
+ * 名前空間の RR ではない。これしか持たない名前は (その下にも RR が無ければ) 存在しないものとして答える
+ * (§7.2.2 の Name Error)。AXFR/IXFR はゾーンの全レコードを送るので、この判定を使わない。 */
+static bool is_nsec3_chain_record(const dns_record_t *rec) {
+  if (rec->type_code == 50) return true;
+  return rec->type_code == 46 && rec->rdata_count >= 1 && rec->rdata[0] && get_type_code(rec->rdata[0]) == 50;
+}
+
 static resolve_checkpoint_t save_checkpoint(uint16_t *offset, uint16_t *ancount,
 
                                              uint16_t *nscount, uint16_t *arcount) {
@@ -210,6 +218,7 @@ static int emit_rrset(zone_arena_t *zone, const size_t *idxs, int n_idx, const c
     for (int i = zone->hash_table[idxs[h]]; i != -1; i = zone->records[i].next_record) {
       dns_record_t *rec = &zone->records[i];
       if (rec->type_code != type || !domain_names_match_ci(rec->name, owner)) continue;
+      if (is_nsec3_chain_record(rec)) continue; // RFC 5155 §7.2.8: 否定の証明でだけ書く (attach_nsec3_record)
       uint16_t r_class = rec->class_val ? rec->class_val : 1;
       if (qclass != 255 && qclass != r_class) continue;
       if (f->answer_scope) note_ecs_variant(rec, type, f->zone_scope, f->answer_scope);
@@ -421,7 +430,7 @@ STATIC_TEST bool name_exists_in_zone(zone_arena_t *zone, const char *name, const
   size_t idx = h & (zone->hash_size - 1);
   for (int i = zone->hash_table[idx]; i != -1; i = zone->records[i].next_record) {
     dns_record_t *rec = &zone->records[i];
-    if (strcasecmp(rec->name, name) == 0) {
+    if (strcasecmp(rec->name, name) == 0 && !is_nsec3_chain_record(rec)) {
       uint32_t eff_ttl;
       if (tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) return true;
     }
@@ -875,7 +884,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
       for (int i = current_zone->hash_table[idx]; i != -1;
            i = current_zone->records[i].next_record) {
         dns_record_t *rec = &current_zone->records[i];
-        if (strcasecmp(rec->name, current_qname) == 0) {
+        if (strcasecmp(rec->name, current_qname) == 0 && !is_nsec3_chain_record(rec)) {
           uint32_t eff_ttl;
           note_ecs_variant(rec, 255, zone_scope, answer_scope);
           if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
@@ -916,6 +925,8 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
         uint16_t r_class = rec->class_val ? rec->class_val : 1;
         bool class_matches = (qclass == 255 || qclass == r_class);
         if (!class_matches) continue;
+        // RFC 5155 §7.2.8: NSEC3 チェーンのレコードは QTYPE NSEC3/RRSIG/ANY でも答えず、名前の存在にも数えない
+        if (is_nsec3_chain_record(rec)) continue;
         uint32_t eff_ttl;
         note_ecs_variant(rec, qtypes[0], zone_scope, answer_scope);
         if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
