@@ -1036,6 +1036,85 @@ static void test_wire_cache_max_records_limit(void) {
     printf("[SUCCESS] All wire-cache-max-records tests passed!\n");
 }
 
+/* An answer whose CNAME chain leaves the zone is not cached: the cache key has only the first zone's
+ * generation, so after an update of the other zone the old answer would keep being returned. */
+static void test_rcache_cross_zone_cname_not_cached(void) {
+    printf("[TEST] Shared response cache: answers that follow a CNAME into another zone are not stored...\n");
+    static char text_a[] =
+        "a.example. 3600 IN SOA ns.a.example. h.a.example. 1 7200 3600 1209600 3600\n"
+        "a.example. 3600 IN NS ns.a.example.\n"
+        "ns.a.example. 3600 IN A 192.0.2.1\n"
+        "www.a.example. 3600 IN CNAME x.b.example.\n"
+        "back.a.example. 3600 IN CNAME y.b.example.\n"
+        "end.a.example. 3600 IN A 192.0.2.9\n";
+    static char text_b[] =
+        "b.example. 3600 IN SOA ns.b.example. h.b.example. 1 7200 3600 1209600 3600\n"
+        "b.example. 3600 IN NS ns.b.example.\n"
+        "ns.b.example. 3600 IN A 192.0.2.2\n"
+        "x.b.example. 3600 IN A 192.0.2.77\n"
+        "y.b.example. 3600 IN CNAME end.a.example.\n";
+    zone_arena_t arena_a, arena_b;
+    zone_arena_init(&arena_a);
+    zone_arena_init(&arena_b);
+    parse_error_t err = {0};
+    parse_context_t ca = { .base_dir = ".", .default_origin = "a.example.", .is_standalone_mode = true, .err_out = &err };
+    parse_context_t cb = { .base_dir = ".", .default_origin = "b.example.", .is_standalone_mode = true, .err_out = &err };
+    assert(parse_zone_fast(text_a, strlen(text_a), &arena_a, &ca) >= 0);
+    assert(parse_zone_fast(text_b, strlen(text_b), &arena_b, &cb) >= 0);
+    assert(test_build_index(&arena_a, true) == 0 && test_build_index(&arena_b, true) == 0);
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    build_zone_response_cache(&arena_a, &cfg, NULL, "a.example.");
+    build_zone_response_cache(&arena_b, &cfg, NULL, "b.example.");
+    assert(arena_a.rcache_ok && arena_b.rcache_ok);
+
+    zone_db_entry_t ea, eb;
+    memset(&ea, 0, sizeof(ea));
+    memset(&eb, 0, sizeof(eb));
+    strncpy(ea.domain, "a.example.", sizeof(ea.domain) - 1);
+    strncpy(eb.domain, "b.example.", sizeof(eb.domain) - 1);
+    atomic_store_explicit(&ea.rcu.active, &arena_a, memory_order_release);
+    atomic_store_explicit(&eb.rcu.active, &arena_b, memory_order_release);
+    zone_db_entry_t *entries[2] = { &ea, &eb };
+    char *any_acl[1] = { (char *)"any" };
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 2;
+    view.match_clients = any_acl;
+    view.match_clients_count = 1;
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    struct { const char *qname; bool crosses; } cases[] = {
+        { "www.a.example.", true },   /* a -> b */
+        { "back.a.example.", true },  /* a -> b -> a: ends in the first zone but used b's data */
+        { "end.a.example.", false },  /* stays in a: cached as before */
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint64_t hits0 = atomic_load(&ea.observatory.wirecache_hits);
+        for (int round = 0; round < 2; round++) {
+            uint8_t req[512], res[4096];
+            size_t req_len = 0;
+            build_simple_query(req, &req_len, (uint16_t)(0x4100 + i * 2 + round), cases[i].qname, 1);
+            compress_ctx_t cc = {0};
+            compress_ctx_init_packet(&cc);
+            zone_db_entry_t *matched = NULL;
+            int len = process_dns_query_impl(req, req_len, res, sizeof(res), cases[i].qname, 1,
+                                             "127.0.0.1", &cc, false, NULL, &snap, &cfg, &matched);
+            assert(len > 12 && (res[3] & 0x0F) == 0 && ((res[6] << 8) | res[7]) >= 1);
+        }
+        uint64_t hits = atomic_load(&ea.observatory.wirecache_hits) - hits0;
+        assert(cases[i].crosses ? hits == 0 : hits == 1);
+    }
+    zone_arena_destroy(&arena_a);
+    zone_arena_destroy(&arena_b);
+    printf("  [PASS] cross-zone CNAME answers are not cached; in-zone answers still are\n");
+}
+
 static void test_wire_cache_observatory_counters(void) {
     printf("[TEST] Running wire cache observatory statistics & counters test...\n");
 
@@ -1262,6 +1341,7 @@ int main(void) {
     test_wire_cache_consistency();
     test_wire_cache_max_records_limit();
     test_wire_cache_observatory_counters();
+    test_rcache_cross_zone_cname_not_cached();
     test_wire_cache_per_view_config();
     return 0;
 }
