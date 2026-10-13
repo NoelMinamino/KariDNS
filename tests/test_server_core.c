@@ -1609,6 +1609,7 @@ static void test_async_io_pool_and_tasks(void) {
 
     dns_record_t a_rec;
     memset(&a_rec, 0, sizeof(a_rec));
+    DNS_RECORD_BIND_RDATA(a_rec);
     a_rec.name = arena_strdup(&arena, "async.example.com.");
     a_rec.type = arena_strdup(&arena, "A");
     a_rec.type_code = 1;

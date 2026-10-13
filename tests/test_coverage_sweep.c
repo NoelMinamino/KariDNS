@@ -1006,6 +1006,7 @@ static void test_engine_helper_edges(void) {
     /* arena helpers on empty / incomplete zones */
     zone_arena_t z; memset(&z, 0, sizeof(z)); zone_arena_init(&z);
     dns_record_t p3; memset(&p3, 0, sizeof(p3));
+    DNS_RECORD_BIND_RDATA(p3);
     p3.rdata[0] = "1"; p3.rdata[1] = "0"; p3.rdata[2] = "0"; p3.rdata[3] = "-"; p3.rdata_count = 4;
     assert(find_matching_nsec3(NULL, &p3, "x", "a.") == NULL);
     assert(find_matching_nsec3(&z, NULL, "x", "a.") == NULL);
@@ -1038,6 +1039,7 @@ static void test_engine_helper_edges(void) {
 
     /* nsec_covers_name with malformed records */
     dns_record_t r; memset(&r, 0, sizeof(r));
+    DNS_RECORD_BIND_RDATA(r);
     assert(nsec_covers_name(NULL, "a.") == false);
     assert(nsec_covers_name(&r, "a.") == false);
     r.type_code = 47;
@@ -1056,7 +1058,7 @@ static void test_engine_helper_edges(void) {
     collect_additional_rr_glue(&r, NULL, &gc, false);
     collect_additional_rr_glue(&r, gt, NULL, false);
     collect_additional_rr_glue(&r, gt, &gc, true);
-    dns_record_t m; memset(&m, 0, sizeof(m)); m.type_code = 15; m.rdata[0] = "10"; m.rdata[1] = ""; m.rdata_count = 2;
+    dns_record_t m; memset(&m, 0, sizeof(m)); DNS_RECORD_BIND_RDATA(m); m.type_code = 15; m.rdata[0] = "10"; m.rdata[1] = ""; m.rdata_count = 2;
     char **mx = m.rdata;
     collect_additional_rr_glue(&m, gt, &gc, false);            /* empty target */
     mx[1] = "mail.example.";
@@ -1149,6 +1151,7 @@ static const char *RR_LINES[] = {
 static void rr_parse_sweep(const uint8_t *pkt, size_t len) {
     zone_arena_t a; memset(&a, 0, sizeof(a)); zone_arena_init(&a);
     dns_record_t r; uint16_t t;
+    DNS_RECORD_BIND_RDATA(r);
     for (size_t cut = 12; cut <= len; cut++) {
         size_t off = 12; memset(&r, 0, sizeof(r));
         (void)parse_resource_record(pkt, cut, &off, &a, &r, &t);
@@ -1202,6 +1205,9 @@ static void test_wire_rr_sweep(void) {
         for (int f = 0; f < rec->rdata_count && f < 12; f++) {
             for (size_t g = 0; g < NELEM(garbage); g++) {
                 dns_record_t copy = *rec;
+                char *copy_rd[MAX_RDATA];   /* S5: copy は rec の rdata[] を共有するので、書き換える前に自前の配列に写す */
+                memcpy(copy_rd, rec->rdata, (size_t)rec->rdata_count * sizeof(char *));
+                copy.rdata = copy_rd;
                 copy.rdata[f] = (char *)garbage[g];
                 copy.is_cached = false;
                 uint16_t off = 12; compress_ctx_init(&cc);
@@ -1935,6 +1941,7 @@ static void test_ecs_cookie_rrl_dnstap_edges(void) {
     {
         zone_arena_t w; memset(&w, 0, sizeof(w)); zone_arena_init(&w);
         dns_record_t r; memset(&r, 0, sizeof(r));
+        DNS_RECORD_BIND_RDATA(r);
         r.name = "x.example."; r.type_code = 1; r.type = "A"; r.rdata[0] = "192.0.2.1"; r.rdata_count = 1; r.ttl_value = 60;
         r.tinydns_ttd = time(NULL) + 1000; r.tinydns_loc[0] = 'j'; r.tinydns_loc[1] = 'p';
         dns_record_t out; uint8_t wb[512];

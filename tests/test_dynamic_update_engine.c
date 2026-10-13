@@ -81,6 +81,7 @@ static void test_bump_soa_serial(void) {
 
     dns_record_t rec;
     memset(&rec, 0, sizeof(rec));
+    DNS_RECORD_BIND_RDATA(rec);
     rec.name = arena_strdup(&arena, "example.com.");
     rec.type = arena_strdup(&arena, "SOA");
     rec.type_code = 6;
@@ -146,6 +147,7 @@ static void test_process_update_sections_records(void) {
     // Initial SOA record
     dns_record_t soa_rec;
     memset(&soa_rec, 0, sizeof(soa_rec));
+    DNS_RECORD_BIND_RDATA(soa_rec);
     soa_rec.name = arena_strdup(&arena, "example.com.");
     soa_rec.type = arena_strdup(&arena, "SOA");
     soa_rec.type_code = 6;
@@ -214,6 +216,7 @@ static void init_sample_zone_arena(zone_arena_t *arena, const char *domain, cons
 
     dns_record_t rec;
     memset(&rec, 0, sizeof(rec));
+    arena_record_alloc_rdata(arena, &rec, 7);   /* rec は関数を出ると消えるので、rdata[] は arena に持たせる */
     rec.name = arena_strdup(arena, domain);
     rec.type = arena_strdup(arena, "SOA");
     rec.type_code = 6;
@@ -388,18 +391,21 @@ static void test_send_notify_to_all_comprehensive(void) {
 
     // NS records
     dns_record_t r_ns1; memset(&r_ns1, 0, sizeof(r_ns1));
+    DNS_RECORD_BIND_RDATA(r_ns1);
     r_ns1.name = arena_strdup(a1, "example.com.");
     r_ns1.type_code = 2; r_ns1.rdata_count = 1;
     r_ns1.rdata[0] = arena_strdup(a1, "ns1.example.com.");
     a1->records[a1->count++] = r_ns1;
 
     dns_record_t r_ns2; memset(&r_ns2, 0, sizeof(r_ns2));
+    DNS_RECORD_BIND_RDATA(r_ns2);
     r_ns2.name = arena_strdup(a1, "example.com.");
     r_ns2.type_code = 2; r_ns2.rdata_count = 1;
     r_ns2.rdata[0] = arena_strdup(a1, "ns2.example.com.");
     a1->records[a1->count++] = r_ns2;
 
     dns_record_t r_ns3; memset(&r_ns3, 0, sizeof(r_ns3));
+    DNS_RECORD_BIND_RDATA(r_ns3);
     r_ns3.name = arena_strdup(a1, "example.com.");
     r_ns3.type_code = 2; r_ns3.rdata_count = 1;
     r_ns3.rdata[0] = arena_strdup(a1, "ns1.sibling.com.");
@@ -407,12 +413,14 @@ static void test_send_notify_to_all_comprehensive(void) {
 
     // In-zone A & AAAA glue for ns2.example.com
     dns_record_t r_g4; memset(&r_g4, 0, sizeof(r_g4));
+    DNS_RECORD_BIND_RDATA(r_g4);
     r_g4.name = arena_strdup(a1, "ns2.example.com.");
     r_g4.type_code = 1; r_g4.rdata_count = 1;
     r_g4.rdata[0] = arena_strdup(a1, "192.0.2.20");
     a1->records[a1->count++] = r_g4;
 
     dns_record_t r_g6; memset(&r_g6, 0, sizeof(r_g6));
+    DNS_RECORD_BIND_RDATA(r_g6);
     r_g6.name = arena_strdup(a1, "ns2.example.com.");
     r_g6.type_code = 28; r_g6.rdata_count = 1;
     r_g6.rdata[0] = arena_strdup(a1, "2001:db8::20");
@@ -430,12 +438,14 @@ static void test_send_notify_to_all_comprehensive(void) {
     a2->records_cap = 16;
 
     dns_record_t r_sib4; memset(&r_sib4, 0, sizeof(r_sib4));
+    DNS_RECORD_BIND_RDATA(r_sib4);
     r_sib4.name = arena_strdup(a2, "ns1.sibling.com.");
     r_sib4.type_code = 1; r_sib4.rdata_count = 1;
     r_sib4.rdata[0] = arena_strdup(a2, "198.51.100.30");
     a2->records[a2->count++] = r_sib4;
 
     dns_record_t r_sib6; memset(&r_sib6, 0, sizeof(r_sib6));
+    DNS_RECORD_BIND_RDATA(r_sib6);
     r_sib6.name = arena_strdup(a2, "ns1.sibling.com.");
     r_sib6.type_code = 28; r_sib6.rdata_count = 1;
     r_sib6.rdata[0] = arena_strdup(a2, "2001:db8:ffff::30");
@@ -487,6 +497,7 @@ static void test_process_update_sections_apex_ns_protection(void) {
     // SOA record
     dns_record_t soa;
     memset(&soa, 0, sizeof(soa));
+    DNS_RECORD_BIND_RDATA(soa);
     soa.name = arena_strdup(&arena, "example.com.");
     soa.type = arena_strdup(&arena, "SOA");
     soa.type_code = 6;
@@ -507,6 +518,7 @@ static void test_process_update_sections_apex_ns_protection(void) {
     // Only 1 apex NS record
     dns_record_t ns1;
     memset(&ns1, 0, sizeof(ns1));
+    DNS_RECORD_BIND_RDATA(ns1);
     ns1.name = arena_strdup(&arena, "example.com.");
     ns1.type = arena_strdup(&arena, "NS");
     ns1.type_code = 2;
@@ -564,6 +576,7 @@ static void test_process_update_sections_apex_ns_protection(void) {
     // Now add a second apex NS record: ns2.example.com.
     dns_record_t ns2;
     memset(&ns2, 0, sizeof(ns2));
+    DNS_RECORD_BIND_RDATA(ns2);
     ns2.name = arena_strdup(&arena, "example.com.");
     ns2.type = arena_strdup(&arena, "NS");
     ns2.type_code = 2;
@@ -708,6 +721,7 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
     // Add an A record for www.example.com.
     dns_record_t a_rec;
     memset(&a_rec, 0, sizeof(a_rec));
+    DNS_RECORD_BIND_RDATA(a_rec);
     a_rec.name = arena_strdup(&arena, "www.example.com.");
     a_rec.type = arena_strdup(&arena, "A");
     a_rec.type_code = 1;

@@ -233,6 +233,7 @@ static void test_tinydns_loc_and_wrap(void) {
     // 2. wrap_tinydns_record
     dns_record_t rec;
     memset(&rec, 0, sizeof(rec));
+    DNS_RECORD_BIND_RDATA(rec);
     rec.name = "www.example.com";
     rec.type = "A";
     rec.type_code = 1;

@@ -186,6 +186,7 @@ static void test_compute_ixfr_diff(void) {
 
     dns_record_t soa_old;
     memset(&soa_old, 0, sizeof(soa_old));
+    DNS_RECORD_BIND_RDATA(soa_old);
     soa_old.name = arena_strdup(&old_arena, "example.com.");
     soa_old.type = arena_strdup(&old_arena, "SOA");
     soa_old.type_code = 6;
@@ -205,6 +206,7 @@ static void test_compute_ixfr_diff(void) {
 
     dns_record_t a_old;
     memset(&a_old, 0, sizeof(a_old));
+    DNS_RECORD_BIND_RDATA(a_old);
     a_old.name = arena_strdup(&old_arena, "host.example.com.");
     a_old.type = arena_strdup(&old_arena, "A");
     a_old.type_code = 1;
@@ -226,6 +228,7 @@ static void test_compute_ixfr_diff(void) {
     new_arena.records_cap = 4;
 
     dns_record_t soa_new = soa_old;
+    dns_record_dup_rdata(&new_arena, &soa_new);
     soa_new.name = arena_strdup(&new_arena, "example.com.");
     soa_new.type = arena_strdup(&new_arena, "SOA");
     soa_new.ttl = arena_strdup(&new_arena, "3600");
@@ -240,6 +243,7 @@ static void test_compute_ixfr_diff(void) {
     new_arena.records[0] = soa_new;
 
     dns_record_t a_new = a_old;
+    dns_record_dup_rdata(&new_arena, &a_new);
     a_new.name = arena_strdup(&new_arena, "host.example.com.");
     a_new.type = arena_strdup(&new_arena, "A");
     a_new.ttl = arena_strdup(&new_arena, "300");
@@ -288,6 +292,7 @@ static void test_compute_ixfr_diff_generic_and_edge_cases(void) {
 
     dns_record_t soa1;
     memset(&soa1, 0, sizeof(soa1));
+    DNS_RECORD_BIND_RDATA(soa1);
     soa1.name = arena_strdup(&arena_v1, "example.org.");
     soa1.type = arena_strdup(&arena_v1, "SOA");
     soa1.type_code = 6;
@@ -304,6 +309,7 @@ static void test_compute_ixfr_diff_generic_and_edge_cases(void) {
     build_zone_index(&arena_v1, true);
 
     dns_record_t soa2 = soa1;
+    dns_record_dup_rdata(&arena_v2, &soa2);
     soa2.name = arena_strdup(&arena_v2, "example.org.");
     soa2.type = arena_strdup(&arena_v2, "SOA");
     soa2.ttl = arena_strdup(&arena_v2, "3600");
@@ -328,6 +334,7 @@ static void test_compute_ixfr_diff_generic_and_edge_cases(void) {
     arena_wrap_new.records_cap = 4;
 
     dns_record_t soa_wrap1 = soa1;
+    dns_record_dup_rdata(&arena_wrap_old, &soa_wrap1);
     soa_wrap1.name = arena_strdup(&arena_wrap_old, "example.org.");
     soa_wrap1.rdata[2] = arena_strdup(&arena_wrap_old, "4294967295");
     arena_wrap_old.records[0] = soa_wrap1;
@@ -335,6 +342,7 @@ static void test_compute_ixfr_diff_generic_and_edge_cases(void) {
     build_zone_index(&arena_wrap_old, true);
 
     dns_record_t soa_wrap2 = soa1;
+    dns_record_dup_rdata(&arena_wrap_new, &soa_wrap2);
     soa_wrap2.name = arena_strdup(&arena_wrap_new, "example.org.");
     soa_wrap2.rdata[2] = arena_strdup(&arena_wrap_new, "1");
     arena_wrap_new.records[0] = soa_wrap2;
@@ -356,9 +364,13 @@ static void test_compute_ixfr_diff_generic_and_edge_cases(void) {
         char s1[16], s2[16];
         snprintf(s1, sizeof(s1), "%u", 1000 + k);
         snprintf(s2, sizeof(s2), "%u", 1001 + k);
-        dns_record_t r1 = soa1; r1.name = arena_strdup(&o_ar, "example.org."); r1.rdata[2] = arena_strdup(&o_ar, s1);
+        dns_record_t r1 = soa1; r1.name = arena_strdup(&o_ar, "example.org.");
+        dns_record_dup_rdata(&o_ar, &r1);
+        r1.rdata[2] = arena_strdup(&o_ar, s1);
         o_ar.records[0] = r1; o_ar.count = 1; build_zone_index(&o_ar, true);
-        dns_record_t r2 = soa1; r2.name = arena_strdup(&n_ar, "example.org."); r2.rdata[2] = arena_strdup(&n_ar, s2);
+        dns_record_t r2 = soa1; r2.name = arena_strdup(&n_ar, "example.org.");
+        dns_record_dup_rdata(&n_ar, &r2);
+        r2.rdata[2] = arena_strdup(&n_ar, s2);
         n_ar.records[0] = r2; n_ar.count = 1; build_zone_index(&n_ar, true);
         compute_ixfr_diff(&entry, &o_ar, &n_ar);
         zone_arena_destroy(&o_ar);
@@ -511,6 +523,7 @@ static void test_parse_xfr_packet_ixfr_sequence_and_tinydns(void) {
     init_axfr_zone(&active, "example.com.", "100");
     dns_record_t a_rec;
     memset(&a_rec, 0, sizeof(a_rec));
+    DNS_RECORD_BIND_RDATA(a_rec);
     a_rec.name = arena_strdup(&active, "host.example.com.");
     a_rec.type = arena_strdup(&active, "A");
     a_rec.type_code = 1;
@@ -668,6 +681,7 @@ static void test_parse_xfr_packet_ixfr_sequence_and_tinydns(void) {
     // 3. TINYDNS_WRAP record
     dns_record_t plain_a;
     memset(&plain_a, 0, sizeof(plain_a));
+    DNS_RECORD_BIND_RDATA(plain_a);
     plain_a.name = "tinydns.example.com.";
     plain_a.type = "A";
     plain_a.type_code = 1;
@@ -768,6 +782,7 @@ static void test_send_axfr_response_ixfr_and_extended(void) {
 
     dns_record_t tagged_rec;
     memset(&tagged_rec, 0, sizeof(tagged_rec));
+    DNS_RECORD_BIND_RDATA(tagged_rec);
     tagged_rec.name = arena_strdup(cur, "geo.example.com.");
     tagged_rec.type = arena_strdup(cur, "A");
     tagged_rec.type_code = 1;
@@ -1296,6 +1311,7 @@ static void test_send_axfr_response_error_and_edge_branches(void) {
     zone_arena_init(&nosoa_arena);
     dns_record_t a_rec;
     memset(&a_rec, 0, sizeof(a_rec));
+    DNS_RECORD_BIND_RDATA(a_rec);
     a_rec.name = arena_strdup(&nosoa_arena, "edge.example.");
     a_rec.type = arena_strdup(&nosoa_arena, "A");
     a_rec.type_code = 1;
@@ -1340,6 +1356,7 @@ static void test_compute_ixfr_diff_exhaustive(void) {
     // 3. Add custom generic_data records, ecs_subnet_tag, bind_location_tag
     dns_record_t rec_old;
     memset(&rec_old, 0, sizeof(rec_old));
+    DNS_RECORD_BIND_RDATA(rec_old);
     rec_old.name = arena_strdup(&old_a, "loc.diff.example.");
     rec_old.type = arena_strdup(&old_a, "TXT");
     rec_old.type_code = 16;
@@ -1357,6 +1374,7 @@ static void test_compute_ixfr_diff_exhaustive(void) {
 
     dns_record_t rec_new;
     memset(&rec_new, 0, sizeof(rec_new));
+    DNS_RECORD_BIND_RDATA(rec_new);
     rec_new.name = arena_strdup(&new_a, "loc.diff.example.");
     rec_new.type = arena_strdup(&new_a, "TXT");
     rec_new.type_code = 16;
@@ -1546,6 +1564,7 @@ static void test_send_axfr_response_full_matrix(void) {
     // Records with tags & tinydns
     dns_record_t r_loc;
     memset(&r_loc, 0, sizeof(r_loc));
+    DNS_RECORD_BIND_RDATA(r_loc);
     r_loc.name = arena_strdup(cur, "geo.matrix.example.");
     r_loc.type = arena_strdup(cur, "A");
     r_loc.type_code = 1;
@@ -2138,6 +2157,7 @@ static void test_compute_ixfr_diff_rdata_order_insensitive(void) {
     // Add TXT records in reverse order
     dns_record_t r1, r2;
     memset(&r1, 0, sizeof(r1));
+    DNS_RECORD_BIND_RDATA(r1);
     r1.name = arena_strdup(&old_a, "txt.order.example.");
     r1.type = arena_strdup(&old_a, "TXT");
     r1.type_code = 16;
@@ -2150,6 +2170,8 @@ static void test_compute_ixfr_diff_rdata_order_insensitive(void) {
     old_a.records[old_a.count++] = r1;
 
     memset(&r2, 0, sizeof(r2));
+
+    DNS_RECORD_BIND_RDATA(r2);
     r2.name = arena_strdup(&new_a, "txt.order.example.");
     r2.type = arena_strdup(&new_a, "TXT");
     r2.type_code = 16;
@@ -2195,6 +2217,7 @@ static void test_compute_ixfr_diff_ttl_changes_only(void) {
 
     dns_record_t r_old, r_new;
     memset(&r_old, 0, sizeof(r_old));
+    DNS_RECORD_BIND_RDATA(r_old);
     r_old.name = arena_strdup(&old_a, "host.ttlchange.example.");
     r_old.type = arena_strdup(&old_a, "A");
     r_old.type_code = 1;
@@ -2207,6 +2230,8 @@ static void test_compute_ixfr_diff_ttl_changes_only(void) {
     old_a.records[old_a.count++] = r_old;
 
     memset(&r_new, 0, sizeof(r_new));
+
+    DNS_RECORD_BIND_RDATA(r_new);
     r_new.name = arena_strdup(&new_a, "host.ttlchange.example.");
     r_new.type = arena_strdup(&new_a, "A");
     r_new.type_code = 1;
@@ -2819,6 +2844,7 @@ static void test_axfr_ixfr_delta_cname_addition(void) {
     init_axfr_zone(&entry.rcu.arena_b, "cname.example.", "200");
     // Add CNAME to new arena
     dns_record_t cname_rec; memset(&cname_rec, 0, sizeof(cname_rec));
+    DNS_RECORD_BIND_RDATA(cname_rec);
     cname_rec.name = arena_strdup(&entry.rcu.arena_b, "alias.cname.example.");
     cname_rec.type = arena_strdup(&entry.rcu.arena_b, "CNAME");
     cname_rec.type_code = 5; cname_rec.class_val = 1; cname_rec.ttl_value = 300;
@@ -3771,6 +3797,7 @@ static void test_axfr_ixfr_send_axfr_response_location_and_ecs_transitions(void)
     init_axfr_zone(&entry.rcu.arena_a, "tagtrans.example.", "100");
     
     dns_record_t r1; memset(&r1, 0, sizeof(r1));
+    DNS_RECORD_BIND_RDATA(r1);
     r1.name = arena_strdup(&entry.rcu.arena_a, "node1.tagtrans.example.");
     r1.type = arena_strdup(&entry.rcu.arena_a, "A");
     r1.type_code = 1; r1.class_val = 1; r1.ttl_value = 300;
@@ -3779,6 +3806,7 @@ static void test_axfr_ixfr_send_axfr_response_location_and_ecs_transitions(void)
     r1.ecs_subnet_tag = arena_strdup(&entry.rcu.arena_a, "10.0.0.0/8");
     
     dns_record_t r2; memset(&r2, 0, sizeof(r2));
+    DNS_RECORD_BIND_RDATA(r2);
     r2.name = arena_strdup(&entry.rcu.arena_a, "node2.tagtrans.example.");
     r2.type = arena_strdup(&entry.rcu.arena_a, "A");
     r2.type_code = 1; r2.class_val = 1; r2.ttl_value = 300;
@@ -5555,6 +5583,7 @@ static void test_axfr_ixfr_feature_case_155(void) {
         snprintf(ip_buf, sizeof(ip_buf), "192.0.2.%d", (k % 250) + 1);
         dns_record_t r;
         memset(&r, 0, sizeof(r));
+        arena_record_alloc_rdata(cur, &r, 1);   /* r は繰り返しごとに消えるので、rdata[] は arena に持たせる */
         r.name = arena_strdup(cur, name_buf);
         r.type = arena_strdup(cur, "A");
         r.type_code = 1;
@@ -6186,6 +6215,138 @@ static void test_p10_xfr_check_response_header(void) {
     printf("  -> xfr_check_response_header passed.\n");
 }
 
+/* S5: rdata[] は rdata_count 個ぶんだけ arena に持つ。NSEC の型 44 個、TXT の文字列 30 個、RRSIG が、
+ * ゾーンの読み込み → 索引 → 複製 (clone_zone_arena) → ワイヤへの符号化 (AXFR/IXFR の応答と同じ
+ * serialize_dns_record) のどこでも同じになり、構造体のコピーの rdata[] を書き換えても元が変わらないこと。 */
+#define S5_MAXREC 16
+typedef struct { uint8_t wire[S5_MAXREC][2048]; uint16_t len[S5_MAXREC]; } s5_wire_t;
+
+static void s5_encode_all(zone_arena_t *z, s5_wire_t *out) {
+    assert(z->count <= S5_MAXREC);
+    for (size_t i = 0; i < z->count; i++) {
+        uint16_t off = 0;
+        assert(serialize_dns_record(out->wire[i], sizeof(out->wire[i]), &off, &z->records[i], NULL, NULL, 0xFFFFFFFF) == 0);
+        out->len[i] = off;
+    }
+}
+
+static void test_axfr_ixfr_feature_case_158(void) {
+    printf("[TEST] AXFR/IXFR: Case 158 - variable-length rdata[] survives parse, clone and wire encoding (S5)...\n");
+    static const char *types[] = {
+        "A", "NS", "CNAME", "SOA", "PTR", "HINFO", "MX", "TXT", "RP", "AFSDB", "X25", "ISDN", "KEY", "AAAA", "LOC",
+        "SRV", "NAPTR", "KX", "CERT", "DNAME", "DS", "SSHFP", "IPSECKEY", "RRSIG", "NSEC", "DNSKEY", "DHCID", "NSEC3",
+        "NSEC3PARAM", "TLSA", "SMIMEA", "HIP", "CDS", "CDNSKEY", "OPENPGPKEY", "CSYNC", "ZONEMD", "SVCB", "HTTPS",
+        "SPF", "URI", "CAA", "EUI48", "EUI64" };
+    const int ntypes = (int)(sizeof(types) / sizeof(types[0]));
+    assert(ntypes == 44);
+    char text[8192];
+    size_t tl = (size_t)snprintf(text, sizeof(text),
+        "$ORIGIN s5.example.\n$TTL 300\n"
+        "@ IN SOA ns1 admin 1 7200 3600 1209600 300\n"
+        "@ IN NS ns1\n"
+        "ns1 IN A 192.0.2.1\n"
+        "@ IN NSEC next.s5.example.");
+    for (int i = 0; i < ntypes; i++) tl += (size_t)snprintf(text + tl, sizeof(text) - tl, " %s", types[i]);
+    tl += (size_t)snprintf(text + tl, sizeof(text) - tl, "\nt IN TXT");
+    for (int i = 0; i < 30; i++) tl += (size_t)snprintf(text + tl, sizeof(text) - tl, " \"str%02d-abcdefghij\"", i);
+    snprintf(text + tl, sizeof(text) - tl,
+        "\n@ IN RRSIG A 13 2 300 20301231235959 20200101000000 12345 s5.example. "
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==\n");
+
+    zone_arena_t a, b;
+    memset(&a, 0, sizeof(a));
+    zone_arena_init(&a);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "s5.example.", .is_standalone_mode = true, .err_out = &err };
+    char *zbuf = arena_strdup(&a, text);
+    assert(zbuf && parse_zone_fast(zbuf, strlen(zbuf), &a, &ctx) >= 0);
+    assert(build_zone_index(&a, true) == 0);
+    assert(a.count == 6);
+
+    const dns_record_t *nsec = NULL, *txt = NULL, *sig = NULL;
+    for (size_t i = 0; i < a.count; i++) {
+        if (a.records[i].type_code == 47) nsec = &a.records[i];
+        if (a.records[i].type_code == 16) txt = &a.records[i];
+        if (a.records[i].type_code == 46) sig = &a.records[i];
+    }
+    assert(nsec && nsec->rdata_count == 1 + ntypes && txt && txt->rdata_count == 30 && sig && sig->rdata_count == 9);
+    assert(strcmp(nsec->rdata[ntypes], "EUI64") == 0 && strcmp(txt->rdata[29], "str29-abcdefghij") == 0);
+    for (size_t i = 0; i < a.count; i++)   /* 各レコードの rdata[] は別々の配列 */
+        for (size_t j = i + 1; j < a.count; j++)
+            assert(a.records[i].rdata != a.records[j].rdata);
+
+    s5_wire_t *wa = malloc(sizeof(*wa)), *wb = malloc(sizeof(*wb));
+    assert(wa && wb);
+    s5_encode_all(&a, wa);
+
+    /* 複製して複製元を解放しても、複製先は同じ内容 */
+    memset(&b, 0, sizeof(b));
+    zone_arena_init(&b);
+    clone_zone_arena(&a, &b);
+    assert(b.count == a.count);
+    for (size_t i = 0; i < a.count; i++) {
+        assert(b.records[i].rdata_count == a.records[i].rdata_count);
+        assert(b.records[i].rdata != a.records[i].rdata);
+    }
+    zone_arena_destroy(&a);
+    s5_encode_all(&b, wb);
+    for (size_t i = 0; i < b.count; i++)
+        assert(wa->len[i] == wb->len[i] && memcmp(wa->wire[i], wb->wire[i], wa->len[i]) == 0);
+
+    /* 符号化した NSEC / TXT / RRSIG をワイヤから読み戻す (転送の受け側): 文字列が元と同じ */
+    zone_arena_t rd;
+    memset(&rd, 0, sizeof(rd));
+    zone_arena_init(&rd);
+    int checked = 0;
+    for (size_t i = 0; i < b.count; i++) {
+        uint16_t t = b.records[i].type_code;
+        if (t != 47 && t != 16 && t != 46) continue;
+        dns_record_t got;
+        size_t pos = 0;
+        uint16_t gt;
+        assert(parse_resource_record(wb->wire[i], wb->len[i], &pos, &rd, &got, &gt) == 0);
+        assert(gt == t && got.rdata_count == b.records[i].rdata_count);
+        for (int k = 0; k < got.rdata_count; k++) {
+            if (t == 46 && k == 8) continue;   /* 署名 (base64) は綴りが同じとは限らない */
+            if (t == 47 && k >= 1) {           /* 型の一覧はワイヤでは型番号順になる: 元の一覧のどれかと一致する */
+                bool found = false;
+                for (int m = 1; m < b.records[i].rdata_count && !found; m++)
+                    found = strcasecmp(got.rdata[k], b.records[i].rdata[m]) == 0;
+                assert(found);
+                continue;
+            }
+            assert(strcasecmp(got.rdata[k], b.records[i].rdata[k]) == 0);
+        }
+        checked++;
+    }
+    assert(checked == 3);
+    zone_arena_destroy(&rd);
+
+    /* 構造体のコピーは rdata[] を共有する。dns_record_dup_rdata() で取り直してから書き換えれば元は変わらない */
+    size_t ti = 0;
+    for (size_t i = 0; i < b.count; i++) if (b.records[i].type_code == 16) ti = i;
+    dns_record_t cp = b.records[ti];
+    assert(cp.rdata == b.records[ti].rdata);
+    assert(dns_record_dup_rdata(&b, &cp) == 0);
+    assert(cp.rdata != b.records[ti].rdata && cp.rdata_count == 30);
+    char *orig0 = b.records[ti].rdata[0];
+    cp.rdata[0] = "changed";
+    cp.is_cached = false;
+    assert(b.records[ti].rdata[0] == orig0 && strcmp(orig0, "str00-abcdefghij") == 0);
+    uint8_t cw[2048];
+    uint16_t coff = 0;
+    assert(serialize_dns_record(cw, sizeof(cw), &coff, &b.records[ti], NULL, NULL, 0xFFFFFFFF) == 0);
+    assert(coff == wb->len[ti] && memcmp(cw, wb->wire[ti], coff) == 0);   /* 元のレコードの符号化は変わらない */
+    uint16_t coff2 = 0;
+    assert(serialize_dns_record(cw, sizeof(cw), &coff2, &cp, NULL, NULL, 0xFFFFFFFF) == 0);
+    assert(coff2 != coff || memcmp(cw, wb->wire[ti], coff) != 0);         /* コピーの書き換えは符号化に出る */
+
+    free(wa);
+    free(wb);
+    zone_arena_destroy(&b);
+    printf("  -> Case 158 passed.\n");
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     test_edns_expire_rfc7314();
@@ -6413,6 +6574,7 @@ int main(void) {
     test_axfr_ixfr_feature_case_155();
     test_axfr_ixfr_feature_case_156();
     test_axfr_ixfr_feature_case_157();
+    test_axfr_ixfr_feature_case_158();
     printf("=== All AXFR/IXFR Engine Unit Tests PASSED ===\n");
     return 0;
 }

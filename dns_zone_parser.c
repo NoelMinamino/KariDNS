@@ -511,6 +511,12 @@ dns_record_t *arena_alloc_record(zone_arena_t *arena, parse_context_t *ctx, cons
     return rec;
 }
 
+bool arena_record_alloc_rdata(zone_arena_t *arena, dns_record_t *rec, int n) {
+  rec->rdata = n > 0 ? arena_alloc(arena, (size_t)n * sizeof(char *)) : NULL;
+  if (rec->rdata) memset(rec->rdata, 0, (size_t)n * sizeof(char *));   /* 書かなかった要素は NULL (従来の配列と同じ) */
+  return n <= 0 || rec->rdata != NULL;
+}
+
 /* クラス欄のニーモニック (RFC 1035 §5.1, RFC 3597 §5)。大文字小文字は区別しない (RFC 1035 §2.3.3)。
  * NONE/ANY も「クラス欄」としては認識し、ゾーンデータに使えるかは呼び出し側で判定する。 */
 static bool parse_class_token(const char *s, uint16_t *out) {
@@ -1305,6 +1311,20 @@ PROCESS_RECORD:
     if (lead >= 0 && i + lead < field_idx)
       field_idx = join_trailing_fields(fields, i + lead, field_idx);
   }
+  /* S5: rdata[] は個数ぶんだけ arena に持つ (EID/NIMLOC の書き換えだけは下で 3 個の配列に取り直す) */
+  {
+    int nrd = field_idx - i < MAX_RDATA ? field_idx - i : MAX_RDATA;
+    if (nrd > 0) {
+      if (!arena_record_alloc_rdata(arena, rec, nrd)) {
+        if (ctx && ctx->err_out) {
+          ctx->err_out->error_message = "Out of memory";
+          ctx->err_out->error_offset = (size_t)(fields[i] - buf);
+          ctx->err_out->token_length = strlen(fields[i]);
+        }
+        return -1;
+      }
+    }
+  }
   while (i < field_idx && rec->rdata_count < MAX_RDATA)
     rec->rdata[rec->rdata_count++] = fields[i++];
 
@@ -1431,6 +1451,7 @@ PROCESS_RECORD:
         strspn(hex_copy, "0123456789abcdefABCDEF") == hexlen && MAX_RDATA >= 3) {
       char lenbuf[16];
       snprintf(lenbuf, sizeof(lenbuf), "%zu", hexlen / 2);
+      if (!arena_record_alloc_rdata(arena, rec, 3)) return -1;
       rec->rdata[0] = arena_strdup(arena, "\\#");
       rec->rdata[1] = arena_strdup(arena, lenbuf);
       rec->rdata[2] = arena_strdup(arena, hex_copy);

@@ -378,6 +378,7 @@ static void test_tinydns_timestamp_countdown(void) {
 
     // SOA
     dns_record_t soa; memset(&soa, 0, sizeof(soa));
+    DNS_RECORD_BIND_RDATA(soa);
     soa.name = arena_strdup(&arena, "tiny.example.");
     soa.type_code = 6; soa.ttl_value = 3600; soa.class_val = 1;
     soa.rdata_count = 7;
@@ -394,6 +395,7 @@ static void test_tinydns_timestamp_countdown(void) {
 
     // Record 1: Past activation timestamp (active)
     dns_record_t r_past; memset(&r_past, 0, sizeof(r_past));
+    DNS_RECORD_BIND_RDATA(r_past);
     r_past.name = arena_strdup(&arena, "past.tiny.example.");
     r_past.type_code = 1; r_past.class_val = 1;
     r_past.ttl_value = 300; r_past.rdata_count = 1;
@@ -404,6 +406,7 @@ static void test_tinydns_timestamp_countdown(void) {
 
     // Record 2: Future activation timestamp (inactive)
     dns_record_t r_fut; memset(&r_fut, 0, sizeof(r_fut));
+    DNS_RECORD_BIND_RDATA(r_fut);
     r_fut.name = arena_strdup(&arena, "future.tiny.example.");
     r_fut.type_code = 1; r_fut.class_val = 1;
     r_fut.ttl_value = 300; r_fut.rdata_count = 1;
@@ -414,6 +417,7 @@ static void test_tinydns_timestamp_countdown(void) {
 
     // Record 3: Countdown TTL (expires in 60 seconds)
     dns_record_t r_cnt; memset(&r_cnt, 0, sizeof(r_cnt));
+    DNS_RECORD_BIND_RDATA(r_cnt);
     r_cnt.name = arena_strdup(&arena, "countdown.tiny.example.");
     r_cnt.type_code = 1; r_cnt.class_val = 1;
     r_cnt.ttl_value = 300; r_cnt.rdata_count = 1;
@@ -837,6 +841,7 @@ static void test_cname_loop_and_max_depth(void) {
     // CNAME a.loop. -> b.loop.
     dns_record_t c1;
     memset(&c1, 0, sizeof(c1));
+    DNS_RECORD_BIND_RDATA(c1);
     c1.name = arena_strdup(&arena, "a.loop.example.");
     c1.type = arena_strdup(&arena, "CNAME");
     c1.type_code = 5;
@@ -851,6 +856,7 @@ static void test_cname_loop_and_max_depth(void) {
     // CNAME b.loop. -> a.loop. (Circular loop)
     dns_record_t c2;
     memset(&c2, 0, sizeof(c2));
+    DNS_RECORD_BIND_RDATA(c2);
     c2.name = arena_strdup(&arena, "b.loop.example.");
     c2.type = arena_strdup(&arena, "CNAME");
     c2.type_code = 5;
@@ -926,6 +932,7 @@ static void test_prelink_zone_additional_glue_policies(void) {
     // SOA
     dns_record_t soa;
     memset(&soa, 0, sizeof(soa));
+    DNS_RECORD_BIND_RDATA(soa);
     soa.name = arena_strdup(&arena, "glue.example.");
     soa.type = arena_strdup(&arena, "SOA");
     soa.type_code = 6;
@@ -942,6 +949,7 @@ static void test_prelink_zone_additional_glue_policies(void) {
     // NS record pointing to in-bailiwick ns1.glue.example.
     dns_record_t ns;
     memset(&ns, 0, sizeof(ns));
+    DNS_RECORD_BIND_RDATA(ns);
     ns.name = arena_strdup(&arena, "glue.example.");
     ns.type = arena_strdup(&arena, "NS");
     ns.type_code = 2;
@@ -956,6 +964,7 @@ static void test_prelink_zone_additional_glue_policies(void) {
     // MX record pointing to mail.glue.example.
     dns_record_t mx;
     memset(&mx, 0, sizeof(mx));
+    DNS_RECORD_BIND_RDATA(mx);
     mx.name = arena_strdup(&arena, "glue.example.");
     mx.type = arena_strdup(&arena, "MX");
     mx.type_code = 15;
@@ -971,6 +980,7 @@ static void test_prelink_zone_additional_glue_policies(void) {
     // A records for ns1 and mail
     dns_record_t a1;
     memset(&a1, 0, sizeof(a1));
+    DNS_RECORD_BIND_RDATA(a1);
     a1.name = arena_strdup(&arena, "ns1.glue.example.");
     a1.type = arena_strdup(&arena, "A");
     a1.type_code = 1;
@@ -984,6 +994,7 @@ static void test_prelink_zone_additional_glue_policies(void) {
 
     dns_record_t a2;
     memset(&a2, 0, sizeof(a2));
+    DNS_RECORD_BIND_RDATA(a2);
     a2.name = arena_strdup(&arena, "mail.glue.example.");
     a2.type = arena_strdup(&arena, "A");
     a2.type_code = 1;
@@ -1680,6 +1691,7 @@ static void test_delegation_referral_and_ds_handling(void) {
     // Apex SOA
     dns_record_t soa;
     memset(&soa, 0, sizeof(soa));
+    DNS_RECORD_BIND_RDATA(soa);
     soa.name = arena_strdup(&arena, "example.com.");
     soa.type = arena_strdup(&arena, "SOA");
     soa.type_code = 6;
@@ -1696,6 +1708,7 @@ static void test_delegation_referral_and_ds_handling(void) {
     // Subdelegation NS: child.example.com. NS ns1.child.example.com.
     dns_record_t ns_del;
     memset(&ns_del, 0, sizeof(ns_del));
+    DNS_RECORD_BIND_RDATA(ns_del);
     ns_del.name = arena_strdup(&arena, "child.example.com.");
     ns_del.type = arena_strdup(&arena, "NS");
     ns_del.type_code = 2;
@@ -1710,6 +1723,7 @@ static void test_delegation_referral_and_ds_handling(void) {
     // Glue A: ns1.child.example.com. A 192.0.2.123
     dns_record_t glue;
     memset(&glue, 0, sizeof(glue));
+    DNS_RECORD_BIND_RDATA(glue);
     glue.name = arena_strdup(&arena, "ns1.child.example.com.");
     glue.type = arena_strdup(&arena, "A");
     glue.type_code = 1;
@@ -1882,12 +1896,14 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
     zone_arena_t nsec_arena;
     zone_arena_init(&nsec_arena);
     dns_record_t nsec1; memset(&nsec1, 0, sizeof(nsec1));
+    DNS_RECORD_BIND_RDATA(nsec1);
     nsec1.name = arena_strdup(&nsec_arena, "a.example.");
     nsec1.type_code = 47;
     nsec1.rdata_count = 1;
     nsec1.rdata[0] = arena_strdup(&nsec_arena, "m.example.");
 
     dns_record_t nsec2; memset(&nsec2, 0, sizeof(nsec2));
+    DNS_RECORD_BIND_RDATA(nsec2);
     nsec2.name = arena_strdup(&nsec_arena, "m.example.");
     nsec2.type_code = 47;
     nsec2.rdata_count = 1;
@@ -1995,6 +2011,7 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     // MX record
     dns_record_t mx_rec;
     memset(&mx_rec, 0, sizeof(mx_rec));
+    DNS_RECORD_BIND_RDATA(mx_rec);
     mx_rec.type_code = 15;
     mx_rec.rdata[0] = "10";
     mx_rec.rdata[1] = "mail.example.com.";
@@ -2010,6 +2027,7 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     // SRV record
     dns_record_t srv_rec;
     memset(&srv_rec, 0, sizeof(srv_rec));
+    DNS_RECORD_BIND_RDATA(srv_rec);
     srv_rec.type_code = 33;
     srv_rec.rdata[0] = "0";
     srv_rec.rdata[1] = "5";
@@ -2023,6 +2041,7 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     // NS record
     dns_record_t ns_rec;
     memset(&ns_rec, 0, sizeof(ns_rec));
+    DNS_RECORD_BIND_RDATA(ns_rec);
     ns_rec.type_code = 2;
     ns_rec.rdata[0] = "ns1.example.com.";
     ns_rec.rdata_count = 1;
@@ -2120,6 +2139,7 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     zone_arena_init(&nsec3_arena);
     dns_record_t p3_empty;
     memset(&p3_empty, 0, sizeof(p3_empty));
+    DNS_RECORD_BIND_RDATA(p3_empty);
     p3_empty.rdata[0] = "1"; p3_empty.rdata[1] = "0"; p3_empty.rdata[2] = "0"; p3_empty.rdata[3] = "-";
     p3_empty.rdata_count = 4;
     dns_record_t *p3 = &p3_empty;
@@ -2170,6 +2190,7 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     // 17. nsec_covers_name & find_covering_nsec
     dns_record_t nsec_rec;
     memset(&nsec_rec, 0, sizeof(nsec_rec));
+    DNS_RECORD_BIND_RDATA(nsec_rec);
     nsec_rec.type_code = 47;
     nsec_rec.name = "a.example.com.";
     nsec_rec.rdata[0] = "c.example.com.";
@@ -2863,6 +2884,7 @@ static void test_edns_client_subnet_cache_matching(void) {
 
     dns_record_t ecs_rec;
     memset(&ecs_rec, 0, sizeof(ecs_rec));
+    DNS_RECORD_BIND_RDATA(ecs_rec);
     ecs_rec.name = arena_strdup(&arena, "geo.ecs.example.");
     ecs_rec.type = arena_strdup(&arena, "A");
     ecs_rec.type_code = 1;
@@ -3639,6 +3661,7 @@ static void test_tinydns_timestamp_decay_and_expiry(void) {
 
     dns_record_t soa_rec, active_rec, expired_rec;
     memset(&soa_rec, 0, sizeof(soa_rec));
+    DNS_RECORD_BIND_RDATA(soa_rec);
     soa_rec.name = arena_strdup(&arena, "ttd.example.");
     soa_rec.type = arena_strdup(&arena, "SOA");
     soa_rec.type_code = 6;
@@ -3656,6 +3679,8 @@ static void test_tinydns_timestamp_decay_and_expiry(void) {
     soa_rec.rdata[6] = arena_strdup(&arena, "86400");
 
     memset(&active_rec, 0, sizeof(active_rec));
+
+    DNS_RECORD_BIND_RDATA(active_rec);
     active_rec.name = arena_strdup(&arena, "live.ttd.example.");
     active_rec.type = arena_strdup(&arena, "A");
     active_rec.type_code = 1;
@@ -3669,6 +3694,8 @@ static void test_tinydns_timestamp_decay_and_expiry(void) {
     active_rec.tinydns_ttd = (uint64_t)now + 100000; // Future countdown TTL
 
     memset(&expired_rec, 0, sizeof(expired_rec));
+
+    DNS_RECORD_BIND_RDATA(expired_rec);
     expired_rec.name = arena_strdup(&arena, "dead.ttd.example.");
     expired_rec.type = arena_strdup(&arena, "A");
     expired_rec.type_code = 1;

@@ -152,7 +152,10 @@ typedef struct {
     char *type;
     uint16_t type_code;
     uint32_t ttl_value;
-    char *rdata[MAX_RDATA];
+    char **rdata;               /* rdata_count 個 (S5: 保存済みレコードは arena に必要な分だけ持つ。
+                                   rdata_count == 0 のとき NULL 可。rdata_count 以降は読まない)。
+                                   パース中や構造体のコピーに書き込むときは呼び出し側が配列を用意する
+                                   (arena_record_alloc_rdata / DNS_RECORD_BIND_RDATA / dns_record_dup_rdata) */
     int rdata_count;
     uint16_t generic_len;
     uint8_t *generic_data;
@@ -225,6 +228,18 @@ typedef struct {
         } name; // NS, PTR, CNAME, DNAME, MD, MF, MB, MG, MR, NSAP-PTR
     } cache;
 } dns_record_t;
+
+/* S5: rdata は rdata_count 個ぶんの配列を指すだけなので、スタックなどに作るレコード (dns_record_t r; ...)
+ * に r.rdata[i] = ... と書く前には配列を結び付ける。r は memset 等で 0 にした「後」に使う
+ * (memset すると rdata が NULL に戻る)。MAX_RDATA 個まで書ける。 */
+#define DNS_RECORD_BIND_RDATA(r) \
+    char *r##_rdbuf_[MAX_RDATA]; \
+    memset(r##_rdbuf_, 0, sizeof(r##_rdbuf_)); \
+    (r).rdata = r##_rdbuf_
+
+/* 構造体のコピー (*d = *s) は rdata の配列を共有する。コピーの rdata[i] を書き換える前に呼んで、
+ * 元の配列を arena に複製して持たせる (読むだけなら不要)。0 = 成功、-1 = arena の確保に失敗 (rdata = NULL, rdata_count = 0 にする) */
+int dns_record_dup_rdata(struct zone_arena_s *arena, dns_record_t *rec);
 
 // Cache preparse function
 void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec);

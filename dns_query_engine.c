@@ -894,8 +894,8 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
         char ttl_str[32];
         snprintf(ttl_str, sizeof(ttl_str), "%u", minimal_any_ttl);
         hinfo_rec.ttl = ttl_str;
-        hinfo_rec.rdata[0] = "RFC8482";
-        hinfo_rec.rdata[1] = "";
+        char *hinfo_rd[2] = { "RFC8482", "" };
+        hinfo_rec.rdata = hinfo_rd;
         hinfo_rec.rdata_count = 2;
         if (serialize_dns_record(res, max_res_len, offset, &hinfo_rec, comp_ctx,
                                  NULL, 0xFFFFFFFF) < 0) {
@@ -1048,8 +1048,9 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
             synth_cname.type_code = 5;
             synth_cname.ttl = rec->ttl;
             synth_cname.ttl_value = eff_ttl;
+            char *synth_rd[1] = { synth_name };
+            synth_cname.rdata = synth_rd;
             synth_cname.rdata_count = 1;
-            synth_cname.rdata[0] = synth_name;
             if (serialize_dns_record(res, max_res_len, offset, &synth_cname, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
               res[2] |= 0x02;
               return;

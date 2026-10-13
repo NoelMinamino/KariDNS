@@ -127,7 +127,9 @@ void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_are
       txn->deleted[d_idx].type = arena_strdup(&txn->arena, old_arena->records[i].type);
       txn->deleted[d_idx].ecs_subnet_tag = old_arena->records[i].ecs_subnet_tag ? arena_strdup(&txn->arena, old_arena->records[i].ecs_subnet_tag) : NULL;
       txn->deleted[d_idx].bind_location_tag = old_arena->records[i].bind_location_tag ? arena_strdup(&txn->arena, old_arena->records[i].bind_location_tag) : NULL;
-      for (int j = 0; j < old_arena->records[i].rdata_count; j++) {
+      /* 構造体のコピーは old_arena の rdata[] を共有するので、書き換える前に txn の arena に取り直す */
+      dns_record_dup_rdata(&txn->arena, &txn->deleted[d_idx]);
+      for (int j = 0; j < txn->deleted[d_idx].rdata_count; j++) {
          txn->deleted[d_idx].rdata[j] = arena_strdup(&txn->arena, old_arena->records[i].rdata[j]);
       }
       if (old_arena->records[i].generic_len > 0 && old_arena->records[i].generic_data) {
@@ -155,7 +157,8 @@ void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_are
       txn->added[a_idx].type = arena_strdup(&txn->arena, new_arena->records[i].type);
       txn->added[a_idx].ecs_subnet_tag = new_arena->records[i].ecs_subnet_tag ? arena_strdup(&txn->arena, new_arena->records[i].ecs_subnet_tag) : NULL;
       txn->added[a_idx].bind_location_tag = new_arena->records[i].bind_location_tag ? arena_strdup(&txn->arena, new_arena->records[i].bind_location_tag) : NULL;
-      for (int j = 0; j < new_arena->records[i].rdata_count; j++) {
+      dns_record_dup_rdata(&txn->arena, &txn->added[a_idx]);
+      for (int j = 0; j < txn->added[a_idx].rdata_count; j++) {
          txn->added[a_idx].rdata[j] = arena_strdup(&txn->arena, new_arena->records[i].rdata[j]);
       }
       if (new_arena->records[i].generic_len > 0 && new_arena->records[i].generic_data) {
@@ -1273,7 +1276,8 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   bool send_ixfr = false;
   ixfr_txn_t *txn_list[MAX_IXFR_HISTORY];
   int txn_count = 0;
-  uint32_t current_serial = strtoul(current_zone->records[soa_idx].rdata[2], NULL, 10);
+  uint32_t current_serial = current_zone->records[soa_idx].rdata_count >= 3
+      ? (uint32_t)strtoul(current_zone->records[soa_idx].rdata[2], NULL, 10) : 0;
 
   /* R-15, RFC 1995 §2: 同じか新しい版 (RFC 1982 の比較) を持つクライアントには現在の SOA 1件で答える。 */
   bool client_up_to_date = is_ixfr && (client_serial == current_serial ||

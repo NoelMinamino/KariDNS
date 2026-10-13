@@ -24,6 +24,7 @@ void syslog(int priority, const char *format, ...) {
 
 static void test_fi_serialize_records(void) {
     dns_record_t rec_a = {0};
+    DNS_RECORD_BIND_RDATA(rec_a);
     rec_a.name = (char *)"example.com.";
     rec_a.type_code = 1; // A
     rec_a.class_val = 1;
@@ -32,6 +33,7 @@ static void test_fi_serialize_records(void) {
     rec_a.rdata[0] = (char *)"192.0.2.1";
 
     dns_record_t rec_txt = {0};
+    DNS_RECORD_BIND_RDATA(rec_txt);
     rec_txt.name = (char *)"example.com.";
     rec_txt.type_code = 16; // TXT
     rec_txt.class_val = 1;

@@ -618,7 +618,7 @@ static int decode_dnssec_rdata(const uint8_t *rd, size_t rdlen, zone_arena_t *ar
     }
 }
 
-int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offset, zone_arena_t *arena, dns_record_t *rec, uint16_t *type_out) {
+static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_len, size_t *offset, zone_arena_t *arena, dns_record_t *rec, uint16_t *type_out) {
     char *name; if (expand_wire_name(packet, packet_len, *offset, offset, arena, &name) != 0) { syslog(LOG_ERR, "[AXFR] parse_resource_record: expand_wire_name failed for owner name"); return -1; }
     rec->name = name; if (*offset + 10 > packet_len) { syslog(LOG_ERR, "[AXFR] parse_resource_record: packet too short for header"); return -1; }
     uint16_t type = (packet[*offset] << 8) | packet[*offset + 1];
@@ -796,6 +796,34 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
     }
     dns_record_preparse_cache(arena, rec);
     *offset += rdlen; return 0;
+}
+
+/* S5: rdata[] は MAX_RDATA 個のスタック上の配列に組み立て、成功したら rdata_count 個ぶんだけ arena に写す
+ * (呼び出し側は rec をスタックなどに置いてよい。失敗時は rdata = NULL, rdata_count = 0)。 */
+int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offset, zone_arena_t *arena, dns_record_t *rec, uint16_t *type_out) {
+    char *scratch[MAX_RDATA];
+    rec->rdata = scratch;
+    rec->rdata_count = 0;
+    int rc = parse_resource_record_scratch(packet, packet_len, offset, arena, rec, type_out);
+    char **keep = NULL;
+    if (rc == 0 && rec->rdata_count > 0) {
+        keep = arena_alloc(arena, (size_t)rec->rdata_count * sizeof(char *));
+        if (keep) memcpy(keep, scratch, (size_t)rec->rdata_count * sizeof(char *));
+        else rc = -1;
+    }
+    rec->rdata = keep;
+    if (rc != 0) rec->rdata_count = 0;
+    return rc;
+}
+
+int dns_record_dup_rdata(zone_arena_t *arena, dns_record_t *rec) {
+    if (rec->rdata_count <= 0) { rec->rdata = NULL; return 0; }
+    size_t bytes = (size_t)rec->rdata_count * sizeof(char *);
+    char **dup = arena_alloc(arena, bytes);
+    if (!dup) { rec->rdata = NULL; rec->rdata_count = 0; return -1; }
+    memcpy(dup, rec->rdata, bytes);
+    rec->rdata = dup;
+    return 0;
 }
 
 // ============================================================================

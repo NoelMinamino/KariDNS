@@ -848,6 +848,7 @@ static void test_nsec3_index_two_chains(void) {
     /* parameters without a chain, and unusable NSEC3PARAM RDATA */
     dns_record_t p;
     memset(&p, 0, sizeof(p));
+    DNS_RECORD_BIND_RDATA(p);
     p.rdata[0] = "1"; p.rdata[1] = "0"; p.rdata[2] = "0"; p.rdata[3] = "cc33"; p.rdata_count = 4;
     assert(find_covering_nsec3(&z.arena, &p, ha[0]) == NULL && find_matching_nsec3(&z.arena, &p, ha[0], "n3.test.") == NULL);
     p.rdata[3] = "aa11"; p.rdata[2] = "1";

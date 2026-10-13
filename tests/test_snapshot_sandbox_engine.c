@@ -168,6 +168,7 @@ static void test_snapshot_rcu_lifecycle_and_suffix_lookup(void) {
     src.records = malloc(sizeof(dns_record_t) * 4);
     src.records_cap = 4;
     dns_record_t r1; memset(&r1, 0, sizeof(r1));
+    DNS_RECORD_BIND_RDATA(r1);
     r1.name = arena_strdup(&src, "host.example.com.");
     r1.type = arena_strdup(&src, "A");
     r1.type_code = 1;

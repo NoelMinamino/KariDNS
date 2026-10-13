@@ -51,6 +51,7 @@ static uint64_t get_time_ns() {
 compress_ctx_t dummy_comp_ctx;
 zone_arena_t bench_arena;
 static char name_pool[NUM_RECORDS][64];
+static char *rdata_pool[NUM_RECORDS][MAX_RDATA];
 
 // Prepare records with realistic distribution
 void prepare_records() {
@@ -59,6 +60,7 @@ void prepare_records() {
         dns_record_t *rec = &records[i];
         snprintf(name_pool[i], sizeof(name_pool[i]), "host%d.example.com.", i);
         rec->name = name_pool[i];
+        rec->rdata = rdata_pool[i];
         rec->class_val = 1;
         rec->ttl_value = 3600;
         

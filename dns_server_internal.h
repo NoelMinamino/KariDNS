@@ -347,13 +347,13 @@ typedef struct {
   int catalog_member_count;
   bool is_catalog_member;
   bool is_secondary;
-  char catalog_member_unique_id[256];
+  char *catalog_member_unique_id; /* S5: malloc。カタログのメンバーでなければ NULL (読むときは zone_entry_catalog_uid) */
   char **groups;
   int group_count;
   char cached_master_ip[64];
   int cached_master_port;
   char cached_tsig_key_name[64];
-  char owning_catalog_domain[256];
+  char *owning_catalog_domain;    /* S5: malloc。同上 (読むときは zone_entry_catalog_owner) */
   _Atomic(time_t) last_successful_transfer;
   /* RFC 7314 §4: セカンダリの expire タイマーが切れる時刻。0 なら
    * last_successful_transfer + expire (従来どおり SOA EXPIRE で数える)。 */
@@ -370,6 +370,14 @@ typedef struct {
   /* 最後に公開したときの全体の公開カウンタ */
   _Atomic uint64_t publish_order;
 } zone_db_entry_t;
+
+/* S5: カタログ関連の文字列は非カタログのゾーンでは NULL。比較や表示には空文字列として読む */
+static inline const char *zone_entry_catalog_uid(const zone_db_entry_t *e) {
+  return e->catalog_member_unique_id ? e->catalog_member_unique_id : "";
+}
+static inline const char *zone_entry_catalog_owner(const zone_db_entry_t *e) {
+  return e->owning_catalog_domain ? e->owning_catalog_domain : "";
+}
 
 /* セカンダリゾーンが期限切れになる時刻。期限が無い (プライマリ、未転送) なら 0。 */
 static inline time_t zone_expire_deadline(zone_db_entry_t *e) {

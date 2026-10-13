@@ -303,6 +303,8 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
   }
   zone_arena_destroy(&entry->rcu.arena_a);
   zone_arena_destroy(&entry->rcu.arena_b);
+  free(entry->catalog_member_unique_id);
+  free(entry->owning_catalog_domain);
   free(entry);
 }
 
@@ -1237,7 +1239,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     zone_db_entry_t *entry = old_view->entries[oi];
                     if (entry && entry->is_catalog_member &&
                         catalog_member_index(valid_members, valid_member_count, vm_ht, vm_chain, vm_hsize,
-                                             entry->domain, entry->catalog_member_unique_id) >= 0 &&
+                                             entry->domain, zone_entry_catalog_uid(entry)) >= 0 &&
                         !view_find_zone_config(v, entry->domain)) {
                         dynamic_count++;
                     }
@@ -1296,7 +1298,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     zone_db_entry_t *entry = old_view->entries[oi];
                     if (entry && entry->is_catalog_member &&
                         catalog_member_index(valid_members, valid_member_count, vm_ht, vm_chain, vm_hsize,
-                                             entry->domain, entry->catalog_member_unique_id) >= 0 &&
+                                             entry->domain, zone_entry_catalog_uid(entry)) >= 0 &&
                         !view_find_zone_config(v, entry->domain)) {
                         atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
                         vs->entries[zidx++] = entry;
@@ -1396,7 +1398,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 /* R-28: group だけの変更はメンバーの削除と追加にしない (RFC 9432 §4.3.2, §5.4) */
                 zone_db_entry_t *existing = find_catalog_parent_in_snapshot(target_view, new_desired_members[i].domain);
                 if (existing && existing->is_catalog_member &&
-                    strcasecmp(existing->owning_catalog_domain, catalog_entry_to_update->domain) == 0) {
+                    strcasecmp(zone_entry_catalog_owner(existing), catalog_entry_to_update->domain) == 0) {
                     catalog_entry_set_groups(existing, &new_desired_members[i]);
                     syslog(LOG_INFO, "[Catalog] Updated group property of member '%s' (unique-id: %s)",
                            existing->domain, new_desired_members[i].unique_id);
@@ -1410,39 +1412,43 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 if (target_view) {
                     zone_db_entry_t *existing = find_catalog_parent_in_snapshot(target_view, new_desired_members[i].domain);
                     if (existing && existing->is_catalog_member) {
-                        if (strcasecmp(existing->owning_catalog_domain, catalog_entry_to_update->domain) != 0) {
+                        if (strcasecmp(zone_entry_catalog_owner(existing), catalog_entry_to_update->domain) != 0) {
                             bool valid_coo = false;
                             for (int p = 0; p < g_pending_coo_count; p++) {
                                 if (strcasecmp(g_pending_coo[p].domain, new_desired_members[i].domain) == 0 &&
-                                    strcasecmp(g_pending_coo[p].old_catalog, existing->owning_catalog_domain) == 0 &&
+                                    strcasecmp(g_pending_coo[p].old_catalog, zone_entry_catalog_owner(existing)) == 0 &&
                                     strcasecmp(g_pending_coo[p].new_catalog, catalog_entry_to_update->domain) == 0) {
                                     valid_coo = true; break;
                                 }
                             }
                             if (valid_coo) {
-                                zone_db_entry_t *old_catalog_entry = find_catalog_parent_in_snapshot(target_view, existing->owning_catalog_domain);
+                                zone_db_entry_t *old_catalog_entry = find_catalog_parent_in_snapshot(target_view, zone_entry_catalog_owner(existing));
                                 if (old_catalog_entry) {
-                                    remove_member_from_catalog_bookkeeping(old_catalog_entry, existing->catalog_member_unique_id, new_desired_members[i].domain);
+                                    remove_member_from_catalog_bookkeeping(old_catalog_entry, zone_entry_catalog_uid(existing), new_desired_members[i].domain);
                                 }
-                                if (strcmp(existing->catalog_member_unique_id, new_desired_members[i].unique_id) == 0) {
+                                if (strcmp(zone_entry_catalog_uid(existing), new_desired_members[i].unique_id) == 0) {
                                     // Retain state
                                     syslog(LOG_INFO, "[Catalog] CoO transfer: retained state for '%s' (unique-id: %s), owner %s -> %s",
-                                           existing->domain, existing->catalog_member_unique_id, existing->owning_catalog_domain, catalog_entry_to_update->domain);
-                                    strncpy(existing->owning_catalog_domain, catalog_entry_to_update->domain, sizeof(existing->owning_catalog_domain) - 1);
+                                           existing->domain, zone_entry_catalog_uid(existing), zone_entry_catalog_owner(existing), catalog_entry_to_update->domain);
+                                    char *new_owner = strdup(catalog_entry_to_update->domain);
+                                    if (new_owner) {
+                                        free(existing->owning_catalog_domain);
+                                        existing->owning_catalog_domain = new_owner;
+                                    }
                                     
                                     catalog_entry_set_groups(existing, &new_desired_members[i]);
                                     needs_creation = false;
                                 } else {
                                     // State reset
                                     syslog(LOG_INFO, "[Catalog] CoO transfer: evicted old state for '%s' (old unique-id: %s, new unique-id: %s)",
-                                           existing->domain, existing->catalog_member_unique_id, new_desired_members[i].unique_id);
-                                    strncpy(coo_evicted_members[coo_evicted_count].unique_id, existing->catalog_member_unique_id, sizeof(coo_evicted_members[coo_evicted_count].unique_id) - 1);
+                                           existing->domain, zone_entry_catalog_uid(existing), new_desired_members[i].unique_id);
+                                    strncpy(coo_evicted_members[coo_evicted_count].unique_id, zone_entry_catalog_uid(existing), sizeof(coo_evicted_members[coo_evicted_count].unique_id) - 1);
                                     strncpy(coo_evicted_members[coo_evicted_count].domain, existing->domain, sizeof(coo_evicted_members[coo_evicted_count].domain) - 1);
                                     coo_evicted_count++;
                                 }
                             } else {
                                 syslog(LOG_WARNING, "[Catalog] Name collision for '%s' between '%s' and '%s'. Ignoring.", 
-                                       new_desired_members[i].domain, existing->owning_catalog_domain, catalog_entry_to_update->domain);
+                                       new_desired_members[i].domain, zone_entry_catalog_owner(existing), catalog_entry_to_update->domain);
                                 member_accepted = false;
                             }
                         }
@@ -1511,14 +1517,18 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                        added_members[i].domain, catalog_entry_to_update->domain);
                 continue;
             }
-            strncpy(entry->owning_catalog_domain, catalog_entry_to_update->domain, sizeof(entry->owning_catalog_domain) - 1);
-            entry->owning_catalog_domain[sizeof(entry->owning_catalog_domain) - 1] = '\0';
+            entry->owning_catalog_domain = strdup(catalog_entry_to_update->domain);
+            entry->catalog_member_unique_id = strdup(added_members[i].unique_id);
+            if (!entry->owning_catalog_domain || !entry->catalog_member_unique_id) {
+                syslog(LOG_ERR, "[Catalog] Failed to allocate memory for member '%s' owned by %s, skipping",
+                       added_members[i].domain, catalog_entry_to_update->domain);
+                free_zone_db_entry(entry);
+                continue;
+            }
             syslog(LOG_INFO, "[Catalog] Added new member '%s' (unique-id: %s) owned by %s", added_members[i].domain, added_members[i].unique_id, catalog_entry_to_update->domain);
             entry->is_catalog_member = true;
             entry->kind = ZONE_KIND_SECONDARY;
             entry->is_secondary = true;
-            strncpy(entry->catalog_member_unique_id, added_members[i].unique_id, sizeof(entry->catalog_member_unique_id) - 1);
-            entry->catalog_member_unique_id[sizeof(entry->catalog_member_unique_id) - 1] = '\0';
             if (added_members[i].group_count > 0) {
                 entry->groups = calloc(added_members[i].group_count, sizeof(char*));
                 if (entry->groups) {
@@ -1649,13 +1659,13 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                         if (!entry) continue;
                         bool is_removed = false;
                         if (entry->is_catalog_member && del_hash_table && del_chain_next) {
-                            uint32_t h = calc_catalog_member_hash(entry->domain, entry->catalog_member_unique_id);
+                            uint32_t h = calc_catalog_member_hash(entry->domain, zone_entry_catalog_uid(entry));
                             size_t idx = h & (del_hash_size - 1);
                             for (int j = del_hash_table[idx]; j != -1; j = del_chain_next[j]) {
                                 const catalog_member_id_t *del = (j < removed_count) ? 
                                     &removed_members[j] : &coo_evicted_members[j - removed_count];
                                 if (strcasecmp(entry->domain, del->domain) == 0 &&
-                                    strcmp(entry->catalog_member_unique_id, del->unique_id) == 0) {
+                                    strcmp(zone_entry_catalog_uid(entry), del->unique_id) == 0) {
                                     is_removed = true;
                                     break;
                                 }
@@ -1663,14 +1673,14 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                         } else if (entry->is_catalog_member && total_deleted > 0) {
                             for (int j = 0; j < removed_count; j++) {
                                 if (strcasecmp(entry->domain, removed_members[j].domain) == 0 &&
-                                    strcmp(entry->catalog_member_unique_id, removed_members[j].unique_id) == 0) {
+                                    strcmp(zone_entry_catalog_uid(entry), removed_members[j].unique_id) == 0) {
                                     is_removed = true; break;
                                 }
                             }
                             if (!is_removed) {
                                 for (int j = 0; j < coo_evicted_count; j++) {
                                     if (strcasecmp(entry->domain, coo_evicted_members[j].domain) == 0 &&
-                                        strcmp(entry->catalog_member_unique_id, coo_evicted_members[j].unique_id) == 0) {
+                                        strcmp(zone_entry_catalog_uid(entry), coo_evicted_members[j].unique_id) == 0) {
                                         is_removed = true; break;
                                     }
                                 }
@@ -2004,7 +2014,11 @@ void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
     d_rec->ecs_subnet_tag = s_rec->ecs_subnet_tag ? arena_strdup(dst, s_rec->ecs_subnet_tag) : NULL;
     d_rec->bind_location_tag = s_rec->bind_location_tag ? arena_strdup(dst, s_rec->bind_location_tag) : NULL;
     d_rec->rdata_count = s_rec->rdata_count;
-    for (int j = 0; j < s_rec->rdata_count; j++)
+    if (d_rec->rdata_count > 0) {
+      d_rec->rdata = arena_alloc(dst, (size_t)d_rec->rdata_count * sizeof(char *));
+      if (!d_rec->rdata) d_rec->rdata_count = 0;
+    }
+    for (int j = 0; j < d_rec->rdata_count; j++)
       d_rec->rdata[j] = s_rec->rdata[j] ? arena_strdup(dst, s_rec->rdata[j]) : NULL;
     d_rec->generic_len = s_rec->generic_len;
     if (s_rec->generic_len > 0 && s_rec->generic_data) {

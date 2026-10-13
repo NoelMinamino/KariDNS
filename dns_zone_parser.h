@@ -164,6 +164,8 @@ static inline uint64_t zone_arena_data_generation(const zone_arena_t *arena) {
 int parse_zone_fast(char *buf, size_t len, zone_arena_t *arena, parse_context_t *ctx);
 int parse_tinydns_data(char *buf, size_t len, zone_arena_t *arena, parse_context_t *ctx);
 dns_record_t *arena_alloc_record(zone_arena_t *arena, parse_context_t *ctx, const char *err_pos, const char *buf);
+/* S5: rec->rdata[] を n 個ぶん arena に取る (rdata[i] への代入より前に呼ぶ)。失敗は false。rdata[] は 0 で埋める。rdata_count は呼び出し側が設定する */
+bool arena_record_alloc_rdata(zone_arena_t *arena, dns_record_t *rec, int n);
 void zone_arena_init(zone_arena_t *arena);
 void zone_arena_destroy(zone_arena_t *arena);
 void zone_arena_free_include_buffers(zone_arena_t *arena);
