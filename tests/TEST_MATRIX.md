@@ -16,7 +16,7 @@ The KariDNS automated test suite is managed via the unified runner script [`test
 
 | Category Code | Category Name | Target Domain | Registered Tests | Primary Execution Method |
 |:---|:---|:---|:---:|:---|
-| `unit` | **Unit Tests & Fault Injection** | C unit tests (also built with ASan/UBSan by `make unit-tests-asan`), fail-Nth FI sweeps and coverage sweeps | 39 | Native binary execution |
+| `unit` | **Unit Tests & Fault Injection** | C unit tests (also built with ASan/UBSan by `make unit-tests-asan`), fail-Nth FI sweeps and coverage sweeps | 40 | Native binary execution |
 | `xfr` | **Zone Transfer** | RFC 5936 AXFR, RFC 1995 IXFR, Extended AXFR, Capsicum, RFC 7314 EXPIRE, DNSSEC data on secondaries, outbound NOTIFY | 11 | Shell script + multi-instance KariDNS |
 | `dnssec` | **DNSSEC & Digest** | RFC 4034/4035 DNSSEC serving (answer sections, DS from the parent, NSEC3 parameters), RFC 8976 ZONEMD, SIG(0) | 4 | Shell script + `karicheck` / `dag` |
 | `update` | **Dynamic Update** | RFC 2136 DNS UPDATE prerequisites & updates | 3 | Shell script + `dag` UPDATE |
@@ -28,7 +28,7 @@ The KariDNS automated test suite is managed via the unified runner script [`test
 | `core` | **Server Core Engine** | RFC 1034/1035 resolution, forward & program zones, glue, RCU reload, lifecycle, adversarial inputs, `karicheck` / `karictl` | 40 | Shell script + `karidns` / `karictl` / `karicheck` |
 | `dag` | **Diagnostic Tool** | `run_dag_ci_test.sh` (Part 1-19 + Part 20-21 parallel sub-suites) and the individual dag test scripts | 60 | Shell scripts (included by default; skip with `--no-dag`) |
 | `regression` | **Regression & Fuzz** | ASan/UBSan smoke, concurrency stress, libFuzzer harnesses, coverage tooling, BIND differential | 6 | Shell script + libFuzzer / ASan binaries |
-| **Total** | | | **169** | *(111 without the `dag` category)* |
+| **Total** | | | **170** | *(111 without the `dag` category)* |
 
 ---
 
@@ -83,7 +83,7 @@ This table maps RFC standards recognized in [`KariDNS_RFC_GUIDELINE.md`](../Kari
 
 ---
 
-## 3. Exhaustive Test Inventory (175 Registered Tests)
+## 3. Exhaustive Test Inventory (176 Registered Tests)
 
 The complete inventory of all test targets registered in `tests/run_all_suite.sh` (`sh tests/run_all_suite.sh --list`), grouped by their registered category in registration order. `bin` targets are C unit test binaries built by the Makefile; the others are shell scripts.
 
@@ -130,6 +130,7 @@ The complete inventory of all test targets registered in `tests/run_all_suite.sh
 | 37 | [`test_fi_misc`](test_fi_misc.c) | `dns_dynamic_update.c`, `dns_catalog_zone.c`, `dns_dnstap.c`, `dns_edns_ecs.c` | RFC 2136, RFC 9432, DNSTAP | **Fault Injection / Extensions** | Fail-Nth fault injection sweeps across dynamic updates, catalog zone bookkeeping, and DNSTAP Protobuf message construction. |
 | 38 | [`test_fi_dag`](test_fi_dag.c) | `tools/dag.c`, `tools/dag_output_yaml.c` | RFC 1035, YAML | **Fault Injection / Tools** | Fail-Nth fault injection sweeps across dag client query packet generation and YAML formatting helpers. |
 | 162 | [`test_epoch_rcu`](test_epoch_rcu.c) | `dns_epoch_rcu.c` | Epoch RCU (R-25) | **Positive / Concurrency** | `rcu_writer_publish()` makes the new pointer visible before the epoch advances and returns the pre-publish epoch; a reader that entered before the publish blocks `rcu_writer_wait_until_safe(retire)`, one that entered after does not; auxiliary reader slots (nesting keeps the outer epoch, pin/unpin, release); 3-thread double-buffer stress where the writer poisons the retired buffer after the grace period and readers must never see it. Also built as `test_epoch_rcu-tsan` and run by `run_rcu_tsan_test.sh`. |
+| 195 | [`test_zone_image`](test_zone_image.c) | `dns_zone_image.c`, `dns_wire.c` (`dns_rdata_name_layout`) | RFC 1035 §4.1.4, RFC 3597 §4, RFC 4034 §6.1, RFC 5155 §7.2.8 | **Differential / Positive / Boundary** | S5 Phase B-0, zone image (nothing in the server reads it yet). For every zone file in `tests/zones/`, one synthetic zone per RR type the parser accepts (91 lines, incl. mixed-case owners and NSEC / NSEC3 chains), their union, tinydns data (time stamps, countdown TTLs, `%location`) and `$LOCATION` / `$ECS-SUBNET` zones: `image_serialize_rr()` is byte-equal to `serialize_dns_record()` for the same RR sequence in one message with one `compress_ctx_t` (status, offset, bytes and the compression table after every RR; with and without a context, with an owner override and with TTL overrides; 512 / 1232 / 4096 / 65535 octet messages), and at every message size from header-only to one octet more than needed, also behind a primed context (the fits / does-not-fit decision, e.g. the base64 decoder's room check, is the same at every boundary). Accessors (target names, SOA fields, MX/SRV fields, RRSIG type covered, NSEC next name and type bitmap, NSEC3 fields) agree with the builder's text fields; name lookup (case, root dot), RRset iteration, canonical order and floor, NSEC order and floor, NSEC3 chains, hash order and lower bound, the NSEC3PARAM choice, glue targets and the extras table equal what `build_zone_index()` made; `thaw(freeze(x))` holds records equal to x (`compare_records`, tinydns / tag fields, zone level tables, same answer bytes) and freezing the thawed builder gives the same image content. Mutation checks done by hand: a wrong compress flag in the layout table, a missing room check and a lowercased MINFO each fail the test. |
 
 ---
 

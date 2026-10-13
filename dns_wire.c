@@ -1000,6 +1000,30 @@ void dns_canonical_downcase_rdata(uint16_t type, uint8_t *rd, size_t len) {
     }
 }
 
+/* S5 Phase B: see dns_wire.h. The `compress` column mirrors the comp_ctx calls in serialize_dns_record(): NS MD MF
+ * CNAME MB MG MR PTR (case 2..12 there), MX, SOA and MINFO. Unit test tests/test_zone_image.c checks the table
+ * against serialize_dns_record() for every RR of tests/zones/ and the fuzz harness does it for arbitrary input. */
+static const dns_rdata_name_layout_t g_rdata_name_layout[] = {
+    { 2, 0, 1, 1 },   { 3, 0, 1, 1 },   { 4, 0, 1, 1 },   { 5, 0, 1, 1 },   /* NS MD MF CNAME */
+    { 7, 0, 1, 1 },   { 8, 0, 1, 1 },   { 9, 0, 1, 1 },   { 12, 0, 1, 1 },  /* MB MG MR PTR */
+    { 6, 0, 2, 1 },                                                         /* SOA: MNAME RNAME, then 20 octets */
+    { 14, 0, 2, 1 },                                                        /* MINFO */
+    { 15, 2, 1, 1 },                                                        /* MX: PREFERENCE, EXCHANGE */
+    { 17, 0, 2, 0 },                                                        /* RP */
+    { 18, 2, 1, 0 },  { 21, 2, 1, 0 },  { 36, 2, 1, 0 },  { 107, 2, 1, 0 }, /* AFSDB RT KX LP */
+    { 23, 0, 1, 0 },  { 39, 0, 1, 0 },                                      /* NSAP-PTR, DNAME */
+    { 24, 18, 1, 0 }, { 46, 18, 1, 0 },                                     /* SIG, RRSIG: Signer's Name */
+    { 26, 2, 2, 0 },                                                        /* PX */
+    { 30, 0, 1, 0 },  { 47, 0, 1, 0 },                                      /* NXT, NSEC: next domain name */
+    { 33, 6, 1, 0 },                                                        /* SRV: target */
+};
+
+const dns_rdata_name_layout_t *dns_rdata_name_layout(uint16_t type) {
+    for (size_t i = 0; i < sizeof(g_rdata_name_layout) / sizeof(g_rdata_name_layout[0]); i++)
+        if (g_rdata_name_layout[i].type == type) return &g_rdata_name_layout[i];
+    return NULL;
+}
+
 long dns_record_canonical_rdata(const dns_record_t *rec, uint8_t *buf, size_t cap) {
     /* 所有者名をルートにして RR 全体を書き、固定部 (名前 1 + TYPE/CLASS/TTL/RDLENGTH 10) の後ろを使う */
     uint16_t len = 0;

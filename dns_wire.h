@@ -492,6 +492,21 @@ void dns_canonical_downcase_rdata(uint16_t type, uint8_t *rd, size_t len);
 long dns_record_canonical_rdata(const dns_record_t *rec, uint8_t *buf, size_t cap);
 uint32_t parse_ttl_value(const char *ttl_str);
 
+/* S5 Phase B: where domain names sit in the RDATA of the types the server reads names from, and which of them
+ * serialize_dns_record() compresses. This is the single table the zone image (dns_zone_image.c) uses to write
+ * RDATA stored uncompressed: `skip` octets of fixed fields, then `nnames` consecutive domain names. The names are
+ * compressed (RFC 1035 §4.1.4) only when `compress` is set: NS MD MF CNAME MB MG MR PTR (§3.3), MX (§3.3.9),
+ * SOA (§3.3.13) and MINFO (§3.3.7), exactly the types serialize_dns_record() passes a compress_ctx_t for. Every
+ * other type is written uncompressed (RFC 3597 §4, RFC 2782 for SRV, RFC 4034 §4.1.1 / §3.1.7 for NSEC / RRSIG,
+ * RFC 6672 §2.1 for DNAME). NULL: the type has no leading domain name. */
+typedef struct {
+    uint16_t type;
+    uint8_t skip;     /* octets before the first name */
+    uint8_t nnames;   /* consecutive names (1 or 2) */
+    uint8_t compress; /* serialize_dns_record() compresses these names */
+} dns_rdata_name_layout_t;
+const dns_rdata_name_layout_t *dns_rdata_name_layout(uint16_t type);
+
 // EDNS
 int parse_edns_opt(const uint8_t *req, size_t req_len,
                    uint16_t qdcount, uint16_t ancount, uint16_t nscount, uint16_t arcount,
