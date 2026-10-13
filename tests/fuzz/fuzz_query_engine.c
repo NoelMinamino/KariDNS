@@ -213,6 +213,12 @@ static void init_rich_fuzz_engine(void) {
     g_fuzz_cfg.ecs_trusted_resolvers_count = 1;
     atomic_store_explicit(&g_config_db.active, &g_fuzz_cfg, memory_order_release);
 
+    /* The shared response cache (filled on a miss, read on later inputs) and its eligibility per zone */
+    response_cache_init(256 * 1024);
+    build_zone_response_cache(&g_fuzz_arena_main, &g_fuzz_cfg, "default", "example.com.");
+    build_zone_response_cache(&g_fuzz_arena_sub, &g_fuzz_cfg, "default", "sub.example.org.");
+    build_zone_response_cache(&g_fuzz_arena_nsec3, &g_fuzz_cfg, "default", "signed.local.");
+
     g_fuzz_qe_initialized = true;
 }
 

@@ -1186,16 +1186,11 @@ void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, z
     out->wirecache_hits = atomic_load_explicit(&e->observatory.wirecache_hits, memory_order_relaxed);
     out->wirecache_misses = atomic_load_explicit(&e->observatory.wirecache_misses, memory_order_relaxed);
 
+    /* 応答キャッシュは全ゾーン共有 (response_cache_init) なので、ゾーンごとの件数は持たない */
     zone_arena_t *active_arena = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
-    if (active_arena && active_arena->response_cache.buckets) {
-        out->wirecache_enabled = true;
-        out->wirecache_entries = active_arena->response_cache.entry_count;
-        out->wirecache_bytes = active_arena->response_cache.total_bytes;
-    } else {
-        out->wirecache_enabled = false;
-        out->wirecache_entries = 0;
-        out->wirecache_bytes = 0;
-    }
+    out->wirecache_enabled = active_arena && active_arena->rcache_ok;
+    out->wirecache_entries = 0;
+    out->wirecache_bytes = 0;
 }
 
 // ============================================================================
@@ -2671,6 +2666,7 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
   if (o->udp_recvbuf_size != n->udp_recvbuf_size) append_list_item(buf, sz, "udp-recvbuf-size");
   if (o->udp_sndbuf_size != n->udp_sndbuf_size) append_list_item(buf, sz, "udp-sndbuf-size");
   if (o->tcp_window != n->tcp_window) append_list_item(buf, sz, "tcp-window");
+  if (o->response_cache_size != n->response_cache_size) append_list_item(buf, sz, "response-cache-size");
   if (o->control.enabled != n->control.enabled || str_differs(o->control.socket_path, n->control.socket_path))
     append_list_item(buf, sz, "control-channel socket");
   if (o->dnstap.enabled != n->dnstap.enabled || str_differs(o->dnstap.socket_path, n->dnstap.socket_path))
@@ -2739,6 +2735,8 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
     return res;
   }
   if (active) collect_restart_only_changes(active, standby, res.restart_needed, sizeof(res.restart_needed));
+  /* 応答キャッシュの鍵に入る: 設定が変われば以前の応答 (minimal-responses 等に依存) は引かれない */
+  standby->generation = (active ? active->generation : 0) + 1;
   g_config_db.retire_epoch = rcu_writer_publish(&g_config_db.active, standby);
   g_last_configured_time = time(NULL);
   // dnstap の接続先は起動時のみだが、出力するメッセージ種別はリロードで反映できる
@@ -3344,6 +3342,10 @@ void *control_thread_func(void *arg) {
       } else if (ev_list[i].filter == EVFILT_TIMER ||
                  ev_list[i].filter == EVFILT_USER) {
         time_t now = time(NULL);
+        /* S2: 兄弟ゾーンの公開 (転送、UPDATE、個別の reload) を、そのアドレスをグルーに使うゾーンの応答の版に反映し、
+         * 公開で不要になった古い版を猶予期間の後で解放する */
+        zone_glue_refresh_dependents(false);
+        zone_retire_process(false);
         if (g_reload_pending) {
           /* O-10: 読み手が残っていて延期したリロードを捨てずにやり直す */
           syslog(LOG_NOTICE, "[Config] Retrying the postponed reload");
@@ -4789,6 +4791,12 @@ int main(int argc, char **argv) {
     return 1;
   }
   free(config_str);
+  g_config_db.config_a.generation = 1;
+  /* 共有の応答キャッシュ: 起動時に 1 回だけ確保する (大きさの変更は再起動で反映) */
+  if (g_config_db.config_a.response_cache_size > 0 &&
+      response_cache_init(g_config_db.config_a.response_cache_size) == 0)
+    syslog(LOG_WARNING, "[Startup] response-cache-size %zu is too small or could not be allocated; response cache disabled",
+           g_config_db.config_a.response_cache_size);
 
   if (g_cli_port_override > 0) {
     g_config_db.config_a.port = g_cli_port_override;

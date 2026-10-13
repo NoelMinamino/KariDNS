@@ -65,25 +65,6 @@ typedef struct {
   int record_count;
 } prelinked_glue_entry_t;
 
-typedef struct response_cache_entry_s {
-  char *name;
-  uint32_t name_hash;
-  uint16_t qtype;
-  uint16_t qclass;
-  uint16_t ancount;
-  uint16_t nscount;
-  uint16_t arcount;
-  uint16_t body_len;
-  uint8_t *body;
-  struct response_cache_entry_s *next;
-} response_cache_entry_t;
-
-typedef struct {
-  response_cache_entry_t **buckets;
-  size_t bucket_count;
-  size_t entry_count;
-  size_t total_bytes;
-} response_cache_table_t;
 
 /* RFC 5155 §3.1.7: one NSEC3 RR of a chain, keyed by the hashed owner name (the owner's first label, base32hex;
  * RFC 5155 §2 "hash order" = canonical order of the base32hex labels, compared case-insensitively). */
@@ -121,14 +102,18 @@ typedef struct zone_arena_s {
   dns_record_t *records;
   size_t count;
   size_t records_cap;
-  char *data_pools[128];
+  char **data_pools;      /* data_pool_cap 個 (必要に応じて倍に伸ばす、最大 ZONE_ARENA_MAX_POOLS) */
   int data_pool_count;
+  int data_pool_cap;
+  size_t first_pool_cap;  /* 0 = 64 KiB。小さいゾーンは読み込み前にファイルの大きさから決める */
   size_t current_pool_cap;
   size_t current_pool_idx;
-  char *file_bufs[32];
-  char *display_bufs[32];
-  char *file_paths[32];   // file_bufs[i] に対応する解決済み絶対パス
+  /* 読み込んだファイルの本文 (レコードの文字列はこの中を指す)。file_buf_cap 個まで (最大 32) */
+  char **file_bufs;
+  char **display_bufs;
+  char **file_paths;      // file_bufs[i] に対応する解決済み絶対パス
   int file_buf_count;
+  int file_buf_cap;
   int *hash_table;
   size_t hash_size;
   dns_record_t **nsec_records;
@@ -149,10 +134,32 @@ typedef struct zone_arena_s {
   char **bind_ecs_trusted_resolvers;      /* AXFR(拡張モード)で受信した値、NULL可 */
   int bind_ecs_trusted_resolver_count;
   acl_entry_t *bind_ecs_trusted_resolvers_parsed;
-  prelinked_glue_entry_t *prelinked_glue; /* 事前リンクされたAdditionalグルー */
+  /* 事前リンクされた Additional グルー。このゾーン自身のアドレスだけを値で持つ。兄弟ゾーンの
+   * アドレスは応答のたびにその兄弟ゾーンから引く (S2: 兄弟が変わっても複製を作り直さない) */
+  prelinked_glue_entry_t *prelinked_glue;
   int prelinked_glue_count;
-  response_cache_table_t response_cache;  /* 事前レンダリング済みワイヤ形式応答キャッシュ */
+  bool glue_external;      /* glue_targets がある */
+  /* S2: グルーの対象名のうち、view で引くと自分以外のゾーン (または無し) になるもの。
+   * 名前は records の rdata を指す。glue_target_ids はそのとき引けたゾーンの id (無ければ 0)、
+   * glue_built_at はそれを調べた時点の公開カウンタ。兄弟ゾーンの id か公開順が変わったら、
+   * このゾーンの応答 (兄弟のアドレスを含みうる) の版を上げる。公開後は制御スレッドだけが書く。 */
+  const char **glue_targets;
+  uint64_t *glue_target_ids;
+  int glue_target_count;
+  uint64_t glue_built_at;
+  bool rcache_ok;          /* このゾーンの応答を共有の応答キャッシュに入れてよい */
+  /* 公開した版、および兄弟ゾーンが変わるたびに新しい値 (応答キャッシュの鍵)。0 = 未公開/テスト用 */
+  _Atomic uint64_t generation;
 } zone_arena_t;
+
+#define ZONE_ARENA_MAX_POOLS 128
+#define ZONE_ARENA_MAX_FILES 32
+/* file を arena に登録する ($INCLUDE を含め最大 ZONE_ARENA_MAX_FILES)。失敗は -1 (呼び出し側が buf 等を解放) */
+int zone_arena_add_file(zone_arena_t *arena, char *buf, char *display, char *path);
+/* グルーを含めたゾーンのデータの版 (応答キャッシュの鍵) */
+static inline uint64_t zone_arena_data_generation(const zone_arena_t *arena) {
+  return atomic_load_explicit((_Atomic uint64_t *)&arena->generation, memory_order_acquire);
+}
 
 int parse_zone_fast(char *buf, size_t len, zone_arena_t *arena, parse_context_t *ctx);
 int parse_tinydns_data(char *buf, size_t len, zone_arena_t *arena, parse_context_t *ctx);
@@ -160,11 +167,12 @@ dns_record_t *arena_alloc_record(zone_arena_t *arena, parse_context_t *ctx, cons
 void zone_arena_init(zone_arena_t *arena);
 void zone_arena_destroy(zone_arena_t *arena);
 void zone_arena_free_include_buffers(zone_arena_t *arena);
-void free_zone_response_cache(zone_arena_t *arena);
+/* 公開直前に呼ぶ: 応答キャッシュに入れてよいか (rcache_ok) を決める */
 void build_zone_response_cache(zone_arena_t *arena, struct server_config_s *cfg, const char *view_name, const char *domain);
 void *arena_alloc(zone_arena_t *arena, size_t size);
 char *arena_strdup(zone_arena_t *arena, const char *str);
 /* RFC 2181 s5.2 / RFC 4035 s2.2: harmonize_ttls=true normalizes RRset TTLs. */
+void zone_arena_shrink_records(zone_arena_t *arena);
 int build_zone_index(zone_arena_t *arena, bool harmonize_ttls);
 /* Frees the lookup indexes build_zone_index() allocates besides the hash table (NSEC, NSEC3, sorted names). */
 void zone_arena_free_sorted_indexes(zone_arena_t *arena);

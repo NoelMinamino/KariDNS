@@ -75,10 +75,22 @@ void *arena_alloc(zone_arena_t *arena, size_t size) {
 
   if (aligned_idx + aligned_size > arena->current_pool_cap ||
       arena->data_pool_count == 0) {
-    if (arena->data_pool_count >= 128)
+    if (arena->data_pool_count >= ZONE_ARENA_MAX_POOLS)
       return NULL;
+    if (arena->data_pool_count >= arena->data_pool_cap) {
+      int cap = arena->data_pool_cap ? arena->data_pool_cap * 2 : 4;
+      if (cap > ZONE_ARENA_MAX_POOLS) cap = ZONE_ARENA_MAX_POOLS;
+      char **pools = realloc(arena->data_pools, (size_t)cap * sizeof(*pools));
+      if (!pools) return NULL;
+      arena->data_pools = pools;
+      arena->data_pool_cap = cap;
+    }
     if (arena->data_pool_count == 0)
-      arena->current_pool_cap = 64 * 1024;
+      arena->current_pool_cap = arena->first_pool_cap ? arena->first_pool_cap : 64 * 1024;
+    else if (arena->first_pool_cap && arena->data_pool_count < 4)
+      /* S4: 最初のプールを見積もったときは、少し足りなかった分を半分の大きさで足す (倍にすると
+       * 小さいゾーンの多くで半分が空く)。見積もりが大きく外れたら倍に戻る */
+      arena->current_pool_cap = arena->first_pool_cap / 2 > 1024 ? arena->first_pool_cap / 2 : 1024;
     else {
       arena->current_pool_cap *= 2;
       if (arena->current_pool_cap > 64 * 1024 * 1024)
@@ -374,7 +386,7 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
         if (ctx->err_out) ctx->err_out->error_message = "$INCLUDE nesting too deep";
         return -1;
     }
-    if (arena->file_buf_count >= 32) {
+    if (arena->file_buf_count >= ZONE_ARENA_MAX_FILES) {
         if (ctx->err_out) ctx->err_out->error_message = "Too many $INCLUDE files (max 32)";
         return -1;
     }
@@ -432,10 +444,13 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
         return -1;
     }
 
-    arena->file_bufs[arena->file_buf_count] = file_content;
-    arena->display_bufs[arena->file_buf_count] = display_copy;
-    arena->file_paths[arena->file_buf_count] = resolved;
-    arena->file_buf_count++;
+    if (zone_arena_add_file(arena, file_content, display_copy, resolved) != 0) {
+        free(file_content);
+        free(display_copy);
+        free(resolved);
+        if (ctx->err_out) ctx->err_out->error_message = "Out of memory";
+        return -1;
+    }
 
     /* RFC 1035 §5.1: $INCLUDE の origin 引数も、相対名なら現在の origin を補う (R-22 d) */
     char *child_origin = *st->origin_io;
@@ -1726,13 +1741,44 @@ void zone_arena_init(zone_arena_t *arena) {
   if (!arena) return;
   memset(arena, 0, sizeof(*arena));
 }
+int zone_arena_add_file(zone_arena_t *arena, char *buf, char *display, char *path) {
+  if (arena->file_buf_count >= ZONE_ARENA_MAX_FILES) return -1;
+  if (arena->file_buf_count >= arena->file_buf_cap) {
+    /* 1 ファイルのゾーンが大半なので 1 から倍に伸ばす (固定 32 個分を全ゾーンに持たない) */
+    int cap = arena->file_buf_cap ? arena->file_buf_cap * 2 : 1;
+    if (cap > ZONE_ARENA_MAX_FILES) cap = ZONE_ARENA_MAX_FILES;
+    char **b = realloc(arena->file_bufs, (size_t)cap * sizeof(*b));
+    if (!b) return -1;
+    arena->file_bufs = b;
+    char **d = realloc(arena->display_bufs, (size_t)cap * sizeof(*d));
+    if (!d) return -1;
+    arena->display_bufs = d;
+    char **p = realloc(arena->file_paths, (size_t)cap * sizeof(*p));
+    if (!p) return -1;
+    arena->file_paths = p;
+    arena->file_buf_cap = cap;
+  }
+  arena->file_bufs[arena->file_buf_count] = buf;
+  arena->display_bufs[arena->file_buf_count] = display;
+  arena->file_paths[arena->file_buf_count] = path;
+  arena->file_buf_count++;
+  return 0;
+}
+
 void zone_arena_free_include_buffers(zone_arena_t *arena) {
   for (int i = 0; i < arena->file_buf_count; i++) {
     free(arena->file_bufs[i]);
     free(arena->display_bufs[i]);
     free(arena->file_paths[i]);
   }
+  free(arena->file_bufs);
+  free(arena->display_bufs);
+  free(arena->file_paths);
+  arena->file_bufs = NULL;
+  arena->display_bufs = NULL;
+  arena->file_paths = NULL;
   arena->file_buf_count = 0;
+  arena->file_buf_cap = 0;
 }
 
 void free_ecs_tags_array(ecs_tag_def_t *tags, int count) {
@@ -1769,21 +1815,22 @@ ecs_tag_def_t *clone_ecs_tags_array(const ecs_tag_def_t *src, int count) {
   return dst;
 }
 
-void free_zone_response_cache(zone_arena_t *arena) {
-  if (!arena) return;
-  if (arena->response_cache.buckets) {
-    free(arena->response_cache.buckets);
-    arena->response_cache.buckets = NULL;
-    arena->response_cache.bucket_count = 0;
-    arena->response_cache.entry_count = 0;
-  }
-}
-
 void zone_arena_destroy(zone_arena_t *arena) {
   free(arena->records);
+  arena->records = NULL;
+  arena->count = 0;
+  arena->records_cap = 0;
   for (int i = 0; i < arena->data_pool_count; i++)
     free(arena->data_pools[i]);
+  free(arena->data_pools);
+  arena->data_pools = NULL;
+  arena->data_pool_count = 0;
+  arena->data_pool_cap = 0;
+  arena->current_pool_cap = 0;
+  arena->current_pool_idx = 0;
   free(arena->hash_table);
+  arena->hash_table = NULL;
+  arena->hash_size = 0;
   zone_arena_free_sorted_indexes(arena);
   free(arena->locations);
   arena->locations = NULL;
@@ -1808,7 +1855,13 @@ void zone_arena_destroy(zone_arena_t *arena) {
   }
   arena->prelinked_glue = NULL;
   arena->prelinked_glue_count = 0;
-  free_zone_response_cache(arena);
+  arena->glue_external = false;
+  arena->glue_targets = NULL;
+  arena->glue_target_count = 0;
+  arena->glue_target_ids = NULL;
+  arena->glue_built_at = 0;
+  arena->rcache_ok = false;
+  atomic_store_explicit(&arena->generation, 0, memory_order_relaxed);
   zone_arena_free_include_buffers(arena);
 }
 uint32_t calc_fnv1a_str(const char *str) {
@@ -1834,7 +1887,7 @@ uint32_t calc_fnv1a_strn(const char *str, size_t len) {
   return hash;
 }
 static size_t next_pow2(size_t n) {
-  size_t p = 256;
+  size_t p = 8; /* S4: 小さいゾーンに 1 KiB の表を持たせない (以前は最小 256) */
   while (p < n)
     p <<= 1;
   return p;
@@ -2130,6 +2183,18 @@ static void harmonize_rrset_ttls(zone_arena_t *arena) {
     snprintf(buf, sizeof(buf), "%u", rec->ttl_value);
     char *new_ttl = arena_strdup(arena, buf);
     if (new_ttl) rec->ttl = new_ttl;
+  }
+}
+
+/* S4: 読み込み中に倍に伸ばした records を件数に合わせて縮める (1 件 sizeof(dns_record_t))。
+ * 公開前の arena に、索引を作る前に呼ぶ (レコードへのポインタを持つものがまだ無い) */
+void zone_arena_shrink_records(zone_arena_t *arena) {
+  if (arena->count > 0 && arena->count < arena->records_cap) {
+    dns_record_t *shrunk = realloc(arena->records, arena->count * sizeof(dns_record_t));
+    if (shrunk) {
+      arena->records = shrunk;
+      arena->records_cap = arena->count;
+    }
   }
 }
 

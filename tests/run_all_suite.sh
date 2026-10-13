@@ -249,7 +249,7 @@ register_test "unit" "bin" "test_snapshot_rebuild" "Zone snapshot rebuild across
 register_test "unit" "bin" "test_dag_reassembly" "dag pcap L4 extraction (all link types, padding, fragments) & randomized TCP reassembly (reorder, retransmit, seq wraparound)"
 register_test "unit" "bin" "test_dag_format" "dag RDATA display: RFC 1035 decimal escaping, RFC 8777 AMTRELAY, display->parse round trip of every RR type"
 register_test "unit" "bin" "test_query_engine_protocol" "Query engine protocol: BADVERS, FORMERR/NOTIMP, foreign classes, IXFR/UDP, SOA EXPIRE, NOTIFY+TSIG authorization"
-register_test "unit" "bin" "test_response_cache" "Response cache: hot-path LRU, TTL countdown, negative caching & invalidation"
+register_test "unit" "bin" "test_response_cache" "Shared response cache: fill on miss, byte-identical answers, invalidation by generation"
 register_test "unit" "bin" "test_dnssec_proofs" "DNSSEC negative proofs: RFC 5155 App A/B (NSEC3) & RFC 4035 App A/B (NSEC) example zones"
 register_test "unit" "bin" "test_hash_table" "Fixed-size FNV1a hash table collisions"
 register_test "unit" "bin" "test_epoch_rcu" "Epoch RCU publish order, grace period, auxiliary reader slots (R-25)"

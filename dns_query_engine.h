@@ -80,9 +80,17 @@ typedef struct resolve_checkpoint {
 } resolve_checkpoint_t;
 
 void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const char *view_name, const char *domain);
+/* 共有の応答キャッシュを bytes 以内で確保する (以前の表は捨てる)。0 なら使わない。確保した大きさを返す */
+size_t response_cache_init(size_t bytes);
+/* ゾーンのデータを公開するたび (と兄弟ゾーンが変わるたび) に使う、一意の版の番号 */
+uint64_t zone_data_generation_next(void);
 program_plugin_t *find_program_plugin(const char *view_name, const char *domain);
 
 #ifdef KARIDNS_UNIT_TEST
+int rcache_lookup(uint64_t tag, uint64_t gen, uint16_t qtype, uint8_t *dst, size_t room,
+                  uint16_t *an, uint16_t *ns, uint16_t *ar);
+void rcache_store(uint64_t tag, uint64_t gen, uint16_t qtype, const uint8_t *body, size_t len,
+                  uint16_t an, uint16_t ns, uint16_t ar);
 void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
                         uint16_t *ancount, uint16_t *nscount, uint16_t *arcount);
 bool tinydns_record_currently_valid(const dns_record_t *rec, time_t now,

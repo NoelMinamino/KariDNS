@@ -8,6 +8,7 @@
 #include "dns_tsig_acl.h"
 #include "dns_priv_sandbox.h"
 #include "dns_dynamic_update.h"
+#include "dns_siphash.h"
 
 #ifdef __FreeBSD__
 #include <sys/capsicum.h>
@@ -2381,21 +2382,179 @@ view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip) {
   return NULL;
 }
 
-void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const char *view_name, const char *domain) {
-  if (!arena || arena->count == 0) return;
+/* ============================================================================
+ * 共有の応答キャッシュ (全ワーカーで 1 つ、問い合わせで作った応答を入れる)
+ *
+ * 以前はゾーンを読み込むたびに全レコードの応答を resolve_name() で作り、ゾーンの arena に
+ * 持っていた (読み込み時間の大半、メモリはゾーン数とレコード数に比例)。ここでは応答本体
+ * (answer/authority/additional、OPT の前まで) を、実際に問い合わせが来た名前だけ、大きさが
+ * 決まった表に入れる。
+ * - 起動時に 1 回確保する (response-cache-size)。クエリの経路では malloc しない。
+ * - 表はセットの並び。セットは 8 件分の索引と 1 KiB のデータ領域を持ち、本体は 8 オクテット
+ *   単位の可変長でデータ領域にリングバッファとして詰める (典型的な本体は 60-100 オクテット)。
+ *   上書きした範囲を指す索引は消す (セットの中では古いものから追い出される)。
+ * - セットごとの seqlock で守り、ロックは使わない (書き手が競合したら入れるのをやめるだけ、
+ *   読み手は読む間に書き換わったら外れにする)。データは atomic の語単位で読み書きする。
+ * - 鍵は (qname 小文字, qtype, qclass, ゾーンのデータの版, 設定の版) の SipHash-2-4。版は
+ *   公開のたびに新しい値になるので、古い応答は引かれない (表全体を消す必要はない)。
+ * ========================================================================== */
+#define RCACHE_SET_ENTRIES 8
+#define RCACHE_SET_WORDS 128 /* データ領域 1 KiB */
+#define RCACHE_BODY_MAX 496  /* UDP 512 オクテットの応答から、ヘッダと最短の質問を除いた大きさ */
 
-  // If per-client location/ECS features or tinydns format are active, skip static wire cache
+typedef struct {
+  _Atomic uint64_t tag;    /* 鍵の SipHash。0 = 空き */
+  _Atomic uint64_t gen;    /* ゾーンのデータの版 */
+  _Atomic uint64_t counts; /* ancount | nscount << 16 | arcount << 32 */
+  _Atomic uint32_t meta;   /* qtype << 16 | 本体の長さ */
+  _Atomic uint32_t off;    /* データ領域の語の位置 */
+} rcache_ent_t;
+
+typedef struct {
+  _Atomic uint32_t seq;  /* 偶数 = 安定、奇数 = 書き込み中 */
+  _Atomic uint32_t head; /* 次に書く語の位置 (書き手だけが使う) */
+  _Atomic uint32_t next; /* 空きが無いときに使う索引 (順に回す) */
+  uint32_t pad;
+  rcache_ent_t ent[RCACHE_SET_ENTRIES];
+  _Atomic uint64_t data[RCACHE_SET_WORDS];
+} rcache_set_t;
+
+static rcache_set_t *g_rcache;
+static size_t g_rcache_sets;
+static uint64_t g_rcache_key[2];
+static _Atomic uint64_t g_zone_data_generation = 1;
+
+uint64_t zone_data_generation_next(void) {
+  return atomic_fetch_add_explicit(&g_zone_data_generation, 1, memory_order_relaxed);
+}
+
+size_t response_cache_init(size_t bytes) {
+  free(g_rcache);
+  g_rcache = NULL;
+  g_rcache_sets = 0;
+  size_t sets = bytes / sizeof(rcache_set_t);
+  if (sets == 0 || sets > UINT32_MAX) return 0;
+  rcache_set_t *t = calloc(sets, sizeof(rcache_set_t));
+  if (!t) return 0;
+  arc4random_buf(g_rcache_key, sizeof(g_rcache_key));
+  g_rcache_sets = sets;
+  g_rcache = t;
+  return sets * sizeof(rcache_set_t);
+}
+
+static uint64_t rcache_tag(const char *qname_lc, uint16_t qtype, uint16_t qclass, uint64_t gen, uint64_t cfg_gen) {
+  uint8_t buf[DNS_NAME_TEXT_SIZE + 24];
+  size_t n = strnlen(qname_lc, DNS_NAME_TEXT_SIZE);
+  memcpy(buf, qname_lc, n);
+  buf[n++] = (uint8_t)(qtype >> 8);
+  buf[n++] = (uint8_t)qtype;
+  buf[n++] = (uint8_t)(qclass >> 8);
+  buf[n++] = (uint8_t)qclass;
+  memcpy(buf + n, &gen, sizeof(gen));
+  n += sizeof(gen);
+  memcpy(buf + n, &cfg_gen, sizeof(cfg_gen));
+  n += sizeof(cfg_gen);
+  uint64_t t = dns_siphash24(buf, n, g_rcache_key);
+  return t ? t : 1; /* 0 は空きの印 */
+}
+
+/* セット数は 2 の冪に限らない (設定した大きさを切り捨てない)。上位 32 ビットを掛けて割り当てる */
+static rcache_set_t *rcache_set_of(uint64_t tag) {
+  return &g_rcache[(size_t)(((tag >> 32) * (uint64_t)g_rcache_sets) >> 32)];
+}
+
+/* 見つかれば本体を dst に写して長さを返す。無い/入りきらない/書き込み中なら -1 */
+STATIC_TEST int rcache_lookup(uint64_t tag, uint64_t gen, uint16_t qtype, uint8_t *dst, size_t room,
+                         uint16_t *an, uint16_t *ns, uint16_t *ar) {
+  rcache_set_t *set = rcache_set_of(tag);
+  uint32_t s1 = atomic_load_explicit(&set->seq, memory_order_acquire);
+  if (s1 & 1) return -1;
+  for (int i = 0; i < RCACHE_SET_ENTRIES; i++) {
+    rcache_ent_t *e = &set->ent[i];
+    if (atomic_load_explicit(&e->tag, memory_order_relaxed) != tag ||
+        atomic_load_explicit(&e->gen, memory_order_relaxed) != gen) continue;
+    uint32_t meta = atomic_load_explicit(&e->meta, memory_order_relaxed);
+    if ((meta >> 16) != qtype) continue;
+    size_t len = meta & 0xFFFF;
+    size_t off = atomic_load_explicit(&e->off, memory_order_relaxed);
+    /* 書き換え中の値でもデータ領域の外は読まない (seq の確認は読んだ後) */
+    if (len == 0 || len > RCACHE_BODY_MAX || len > room || off + (len + 7) / 8 > RCACHE_SET_WORDS) return -1;
+    uint64_t counts = atomic_load_explicit(&e->counts, memory_order_relaxed);
+    for (size_t w = 0; w * 8 < len; w++) {
+      uint64_t word = atomic_load_explicit(&set->data[off + w], memory_order_relaxed);
+      size_t chunk = len - w * 8 < 8 ? len - w * 8 : 8;
+      memcpy(dst + w * 8, &word, chunk);
+    }
+    atomic_thread_fence(memory_order_acquire);
+    if (atomic_load_explicit(&set->seq, memory_order_relaxed) != s1) return -1; /* 読む間に書き換わった */
+    *an = (uint16_t)counts;
+    *ns = (uint16_t)(counts >> 16);
+    *ar = (uint16_t)(counts >> 32);
+    return (int)len;
+  }
+  return -1;
+}
+
+STATIC_TEST void rcache_store(uint64_t tag, uint64_t gen, uint16_t qtype, const uint8_t *body, size_t len,
+                         uint16_t an, uint16_t ns, uint16_t ar) {
+  if (len == 0 || len > RCACHE_BODY_MAX) return;
+  rcache_set_t *set = rcache_set_of(tag);
+  uint32_t s0 = atomic_load_explicit(&set->seq, memory_order_relaxed);
+  if ((s0 & 1) || !atomic_compare_exchange_strong_explicit(&set->seq, &s0, s0 + 1, memory_order_relaxed,
+                                                          memory_order_relaxed))
+    return; /* 他のワーカーが書いている: 入れない */
+  atomic_thread_fence(memory_order_release);
+  uint32_t words = (uint32_t)((len + 7) / 8);
+  uint32_t off = atomic_load_explicit(&set->head, memory_order_relaxed);
+  if (off + words > RCACHE_SET_WORDS) off = 0; /* 末尾に入らなければ先頭から */
+  /* 上書きする範囲を指す索引と、同じ鍵の古い索引を消す。空いた索引を使う */
+  int slot = -1;
+  for (int i = 0; i < RCACHE_SET_ENTRIES; i++) {
+    rcache_ent_t *e = &set->ent[i];
+    uint64_t t = atomic_load_explicit(&e->tag, memory_order_relaxed);
+    if (t != 0) {
+      uint32_t eo = atomic_load_explicit(&e->off, memory_order_relaxed);
+      uint32_t ew = ((atomic_load_explicit(&e->meta, memory_order_relaxed) & 0xFFFF) + 7) / 8;
+      if (t == tag || (eo < off + words && off < eo + ew)) {
+        atomic_store_explicit(&e->tag, 0, memory_order_relaxed);
+        t = 0;
+      }
+    }
+    if (t == 0 && slot < 0) slot = i;
+  }
+  if (slot < 0) {
+    uint32_t n = atomic_load_explicit(&set->next, memory_order_relaxed);
+    slot = (int)(n % RCACHE_SET_ENTRIES);
+    atomic_store_explicit(&set->next, n + 1, memory_order_relaxed);
+  }
+  for (uint32_t w = 0; w < words; w++) {
+    uint64_t word = 0;
+    size_t chunk = len - w * 8 < 8 ? len - w * 8 : 8;
+    memcpy(&word, body + w * 8, chunk);
+    atomic_store_explicit(&set->data[off + w], word, memory_order_relaxed);
+  }
+  rcache_ent_t *e = &set->ent[slot];
+  atomic_store_explicit(&e->tag, tag, memory_order_relaxed);
+  atomic_store_explicit(&e->gen, gen, memory_order_relaxed);
+  atomic_store_explicit(&e->meta, ((uint32_t)qtype << 16) | (uint32_t)len, memory_order_relaxed);
+  atomic_store_explicit(&e->off, off, memory_order_relaxed);
+  atomic_store_explicit(&e->counts, (uint64_t)an | ((uint64_t)ns << 16) | ((uint64_t)ar << 32), memory_order_relaxed);
+  atomic_store_explicit(&set->head, off + words, memory_order_relaxed);
+  atomic_store_explicit(&set->seq, s0 + 2, memory_order_release);
+}
+
+/* 公開する直前に呼ぶ。このゾーンの応答を共有キャッシュに入れてよいかを決める (応答がクライアントの
+ * アドレス、ECS、時刻で変わるゾーンは入れない)。 */
+void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const char *view_name, const char *domain) {
+  if (!arena) return;
+  arena->rcache_ok = false;
+  atomic_store_explicit(&arena->generation, zone_data_generation_next(), memory_order_release); /* 公開する版ごとに 1 回 */
+  if (arena->count == 0) return;
   if (arena->is_tinydns_format) return;
   if (arena->locations != NULL && arena->location_count > 0) return;
   if (arena->bind_location_tags != NULL && arena->bind_location_tag_count > 0) return;
   if (arena->bind_ecs_tags != NULL && arena->bind_ecs_tag_count > 0) return;
-
-  if (cfg && cfg->wire_cache_max_records > 0 && arena->count > cfg->wire_cache_max_records) {
-    syslog(LOG_NOTICE,
-           "[WireCache] zone '%s' has %zu records, exceeding wire-cache-max-records=%u; caching disabled for this zone",
-           domain ? domain : "(unknown)", arena->count, cfg->wire_cache_max_records);
-    return;
-  }
+  if (cfg && cfg->wire_cache_max_records > 0 && arena->count > cfg->wire_cache_max_records) return;
 
   // O-07: 同じゾーン名が別の view にもあるので、このエントリの view の設定を見る
   zone_config_t *zcfg = cfg ? find_zone_config_in_view(cfg, view_name, domain) : NULL;
@@ -2409,157 +2568,13 @@ void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const 
     if (cfg->location_tags != NULL && cfg->location_tag_count > 0) return;
     if (cfg->ecs_tags != NULL && cfg->ecs_tag_count > 0) return;
   }
-
-  free_zone_response_cache(arena);
-
-  size_t bucket_count = 16;
-  while (bucket_count < arena->count * 2) {
-    bucket_count <<= 1;
-    if (bucket_count >= 65536) break;
-  }
-
-  arena->response_cache.buckets = calloc(bucket_count, sizeof(response_cache_entry_t *));
-  if (!arena->response_cache.buckets) return;
-  arena->response_cache.bucket_count = bucket_count;
-  arena->response_cache.entry_count = 0;
-
-  bool minimal_responses = cfg ? cfg->minimal_responses : false;
-  bool minimal_any = cfg ? cfg->minimal_any : false;
-  uint32_t minimal_any_ttl = cfg ? cfg->minimal_any_ttl : 86400;
-
-  size_t cached_entries = 0;
-  size_t cached_bytes = 0;
-
   for (size_t i = 0; i < arena->count; i++) {
-    dns_record_t *rec = &arena->records[i];
-    if (!rec->name || rec->name[0] == '\0') continue;
-    if (rec->name[0] == '*' && (rec->name[1] == '.' || rec->name[1] == '\0')) continue;
-
-    uint16_t qtype = rec->type_code;
-    if (is_non_data_rrtype(qtype)) continue;
-    if (qtype == 46 || qtype == 47 || qtype == 50) continue; // RRSIG, NSEC, NSEC3
-
-    uint16_t qclass = rec->class_val ? rec->class_val : 1;
-    if (qclass != 1) continue;
-
-    const char *qname = rec->name;
-    uint32_t name_hash = calc_fnv1a_str(qname);
-
-    // Skip caching if any record for this qname is location-tagged, ECS-tagged, or time-sensitive
-    bool has_dynamic_record = false;
-    if (arena->hash_size > 0 && arena->hash_table) {
-      size_t name_idx = name_hash & (arena->hash_size - 1);
-      for (int r_idx = arena->hash_table[name_idx]; r_idx != -1; r_idx = arena->records[r_idx].next_record) {
-        dns_record_t *r = &arena->records[r_idx];
-        if (strcasecmp(r->name, qname) == 0) {
-          if (r->bind_location_tag != NULL || r->ecs_subnet_tag != NULL ||
-              r->tinydns_loc[0] != 0 || r->tinydns_ttd != 0 || r->tinydns_ttl_countdown) {
-            has_dynamic_record = true;
-            break;
-          }
-        }
-      }
-    }
-    if (has_dynamic_record) continue;
-    size_t hash_idx = (name_hash ^ (uint32_t)qtype) & (bucket_count - 1);
-
-    bool already_cached = false;
-    for (response_cache_entry_t *e = arena->response_cache.buckets[hash_idx]; e != NULL; e = e->next) {
-      if (e->qtype == qtype && e->qclass == qclass && e->name_hash == name_hash &&
-          strcasecmp(e->name, qname) == 0) {
-        already_cached = true;
-        break;
-      }
-    }
-    if (already_cached) continue;
-
-    uint8_t dummy_res[4096];
-    memset(dummy_res, 0, DNS_HEADER_SIZE);
-
-    long wlen = write_uncompressed_name(dummy_res, DNS_HEADER_SIZE, sizeof(dummy_res), qname);
-    if (wlen <= 0) continue;
-    uint16_t q_offset = (uint16_t)(DNS_HEADER_SIZE + wlen);
-    if (q_offset + 4 > sizeof(dummy_res)) continue;
-    dummy_res[q_offset] = (uint8_t)(qtype >> 8);
-    dummy_res[q_offset + 1] = (uint8_t)(qtype & 0xFF);
-    dummy_res[q_offset + 2] = (uint8_t)(qclass >> 8);
-    dummy_res[q_offset + 3] = (uint8_t)(qclass & 0xFF);
-    q_offset += 4;
-
-    uint16_t offset = q_offset;
-    uint16_t ancount = 0, nscount = 0, arcount = 0;
-
-    compress_ctx_t comp_ctx;
-    memset(&comp_ctx, 0, sizeof(comp_ctx));
-    compress_ctx_init_packet(&comp_ctx);
-    register_wire_name_for_compression(dummy_res, DNS_HEADER_SIZE, &comp_ctx);
-
-    zone_db_entry_t dummy_entry;
-    memset(&dummy_entry, 0, sizeof(dummy_entry));
-    if (domain) {
-      strncpy(dummy_entry.domain, domain, sizeof(dummy_entry.domain) - 1);
-    }
-    /* resolve_name() はこの view のゾーン設定を引く (空だと全 view から最初に一致したもの) */
-    if (view_name) {
-      strncpy(dummy_entry.view_name, view_name, sizeof(dummy_entry.view_name) - 1);
-    }
-    zone_db_entry_t *db_entry_ptr = &dummy_entry;
-    zone_arena_t *current_zone_ptr = arena;
-
-    uint16_t qtypes_arr[1] = { qtype };
-    dummy_res[2] = 0x84; // QR=1, AA=1
-    dummy_res[3] = 0x00; // NOERROR
-
-    resolve_name(qname, qclass, qtypes_arr, 1,
-                 &db_entry_ptr, &current_zone_ptr,
-                 dummy_res, sizeof(dummy_res),
-                 &offset, &comp_ctx, &ancount, &nscount, &arcount,
-                 minimal_responses, minimal_any, minimal_any_ttl,
-                 false /* dnssec_ok */, NULL /* view */, NULL /* qtx_included */,
-                 NULL /* client_ip */, cfg, false /* ecs_trusted */,
-                 NULL, 0, 0, NULL);
-
-    uint8_t rcode = dummy_res[3] & 0x0F;
-    bool tc = (dummy_res[2] & 0x02) != 0;
-
-    if (rcode == 0 && !tc && ancount > 0 && offset <= UDP_DEFAULT_MAX_RES_LEN && offset > q_offset) {
-      uint16_t body_len = offset - q_offset;
-      uint8_t *body = (uint8_t *)arena_alloc(arena, body_len);
-      if (!body) continue;
-      memcpy(body, dummy_res + q_offset, body_len);
-
-      char *cached_name = arena_strdup(arena, qname);
-      if (!cached_name) continue;
-
-      response_cache_entry_t *entry = (response_cache_entry_t *)arena_alloc(arena, sizeof(response_cache_entry_t));
-      if (!entry) continue;
-
-      entry->name = cached_name;
-      entry->name_hash = name_hash;
-      entry->qtype = qtype;
-      entry->qclass = qclass;
-      entry->ancount = ancount;
-      entry->nscount = nscount;
-      entry->arcount = arcount;
-      entry->body_len = body_len;
-      entry->body = body;
-      entry->next = arena->response_cache.buckets[hash_idx];
-      arena->response_cache.buckets[hash_idx] = entry;
-      arena->response_cache.entry_count++;
-
-      cached_entries++;
-      cached_bytes += body_len + strlen(cached_name) + 1 + sizeof(response_cache_entry_t);
-    }
+    const dns_record_t *r = &arena->records[i];
+    if (r->bind_location_tag || r->ecs_subnet_tag || r->tinydns_loc[0] || r->tinydns_ttd || r->tinydns_ttl_countdown)
+      return;
   }
-
-  if (cached_entries > 0) {
-    arena->response_cache.total_bytes = cached_bytes;
-    syslog(LOG_NOTICE,
-           "[WireCache] zone '%s': cached %zu entries (~%zu bytes) out of %zu total records",
-           domain ? domain : "(unknown)", cached_entries, cached_bytes, arena->count);
-  }
+  arena->rcache_ok = true;
 }
-
 
 /* program / forward ゾーンの応答のうち、質問セクションだけのもの (上限超過で切り詰めた TC=1 応答、
  * KariDNS が合成した SERVFAIL、上流が OPT なしで返したエラー) には OPT が無い。問い合わせに OPT が
@@ -3247,36 +3262,32 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
        edns.ede_count == 0 &&
        !edns.has_malformed_cookie);
 
-  if (edns_safe_for_cache && !is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 &&
-      current_zone && current_zone->response_cache.buckets && max_res_len >= 512) {
-    uint32_t qname_hash = calc_fnv1a_str(current_qname_lc);
-    size_t hash_idx = (qname_hash ^ (uint32_t)qtype) & (current_zone->response_cache.bucket_count - 1);
-    bool wc_hit = false;
-    for (response_cache_entry_t *e = current_zone->response_cache.buckets[hash_idx]; e != NULL; e = e->next) {
-      if (e->qtype == qtype && e->qclass == qclass && e->name_hash == qname_hash &&
-          strcmp(e->name, current_qname_lc) == 0) {
-        if ((size_t)q_offset + e->body_len <= body_max_len) {
-          memcpy(res + q_offset, e->body, e->body_len);
-          uint16_t body_offset = (uint16_t)(q_offset + e->body_len);
-          uint16_t arcount = e->arcount;
-          if (edns.present) {
-            assemble_edns_opt(res, max_res_len, &body_offset, &arcount, &edns, 0, is_tcp, cfg);
-          }
-          res[6] = (uint8_t)(e->ancount >> 8);
-          res[7] = (uint8_t)(e->ancount & 0xFF);
-          res[8] = (uint8_t)(e->nscount >> 8);
-          res[9] = (uint8_t)(e->nscount & 0xFF);
-          res[10] = (uint8_t)(arcount >> 8);
-          res[11] = (uint8_t)(arcount & 0xFF);
-          if (db_entry) atomic_fetch_add_explicit(&db_entry->observatory.wirecache_hits, 1, memory_order_relaxed);
-          return body_offset;
-        }
-        break;
+  /* 共有の応答キャッシュ (response_cache_init)。鍵の版 (rc_gen) は名前解決の前に読む:
+   * 解決中に版が上がっても、古い版の鍵で入れた応答は二度と引かれない。 */
+  uint64_t rc_tag = 0, rc_gen = 0;
+  if (g_rcache && edns_safe_for_cache && !is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 &&
+      current_zone && current_zone->rcache_ok && max_res_len >= 512 && q_offset < body_max_len) {
+    rc_gen = zone_arena_data_generation(current_zone);
+    rc_tag = rcache_tag(current_qname_lc, qtype, qclass, rc_gen, cfg ? cfg->generation : 0);
+    uint16_t c_an, c_ns, c_ar;
+    int blen = rcache_lookup(rc_tag, rc_gen, qtype, res + q_offset, body_max_len - q_offset, &c_an, &c_ns, &c_ar);
+    if (blen > 0) {
+      uint16_t body_offset = (uint16_t)(q_offset + blen);
+      uint16_t arcount = c_ar;
+      res[2] |= 0x04; /* 入れるのは AA の応答だけ */
+      if (edns.present) {
+        assemble_edns_opt(res, max_res_len, &body_offset, &arcount, &edns, 0, is_tcp, cfg);
       }
+      res[6] = (uint8_t)(c_an >> 8);
+      res[7] = (uint8_t)(c_an & 0xFF);
+      res[8] = (uint8_t)(c_ns >> 8);
+      res[9] = (uint8_t)(c_ns & 0xFF);
+      res[10] = (uint8_t)(arcount >> 8);
+      res[11] = (uint8_t)(arcount & 0xFF);
+      if (db_entry) atomic_fetch_add_explicit(&db_entry->observatory.wirecache_hits, 1, memory_order_relaxed);
+      return body_offset;
     }
-    if (!wc_hit && db_entry) {
-      atomic_fetch_add_explicit(&db_entry->observatory.wirecache_misses, 1, memory_order_relaxed);
-    }
+    if (db_entry) atomic_fetch_add_explicit(&db_entry->observatory.wirecache_misses, 1, memory_order_relaxed);
   }
 
   uint16_t qtypes[17];
@@ -3333,6 +3344,13 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       }
       edns.mqtype_count = new_count;
     }
+  }
+
+  /* 応答キャッシュに入れる: NOERROR、AA、TC なしで answer があり、EDE の付かない応答
+   * (ヒットした応答は UDP の 512 オクテットに入る大きさに限る) */
+  if (rc_tag && (res[3] & 0x0F) == 0 && (res[2] & 0x04) && !(res[2] & 0x02) && ancount > 0 &&
+      edns.ede_count == 0 && offset > q_offset && offset <= UDP_DEFAULT_MAX_RES_LEN) {
+    rcache_store(rc_tag, rc_gen, qtype, res + q_offset, (size_t)(offset - q_offset), ancount, nscount, arcount);
   }
 
   if (edns.present) {

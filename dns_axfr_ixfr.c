@@ -740,6 +740,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
 
         clone_zone_arena(&tmp_arena, standby);
 
+        zone_arena_shrink_records(standby);
         if (build_zone_index(standby, true) != 0) {
           zone_arena_clear_data_pools(standby);
           pthread_mutex_unlock(&entry->writer_lock);
@@ -763,7 +764,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         rcu_aux_read_unlock();
 
         compute_ixfr_diff(entry, cur_active, standby);
-        entry->rcu.retire_epoch = rcu_writer_publish(&entry->rcu.active, standby);
+        zone_publish(entry, standby);
         pthread_mutex_unlock(&entry->writer_lock);
 
         if (session->is_ixfr) {

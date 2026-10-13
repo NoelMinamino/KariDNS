@@ -297,6 +297,23 @@ static void build_edns_mqtype_do_query(uint8_t *buf, size_t *out_len, uint16_t t
     *out_len = off;
 }
 
+/* The shared cache is filled on a miss. Send the query once to fill it, then answer it again so the
+ * returned response comes from the cache (if the query is cacheable). */
+static int cached_query(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len,
+                        const char *qname, uint16_t qtype, const char *client_ip, compress_ctx_t *comp_ctx,
+                        bool is_tcp, rate_limit_config_t **out_rrl_cfg, zone_db_snapshot_t *snap,
+                        server_config_t *cfg, zone_db_entry_t **matched) {
+    uint8_t warm[4096];
+    compress_ctx_t warm_ctx = {0};
+    compress_ctx_init_packet(&warm_ctx);
+    zone_db_entry_t *warm_matched = NULL;
+    (void)process_dns_query_impl(req, req_len, warm, sizeof(warm), qname, qtype, client_ip, &warm_ctx,
+                                 is_tcp, NULL, snap, cfg, &warm_matched);
+    compress_ctx_init_packet(comp_ctx);
+    return process_dns_query_impl(req, req_len, res, max_res_len, qname, qtype, client_ip, comp_ctx,
+                                  is_tcp, out_rrl_cfg, snap, cfg, matched);
+}
+
 static void test_wire_cache_consistency(void) {
     printf("[TEST] Running wire cache byte-for-byte consistency test...\n");
 
@@ -339,9 +356,7 @@ static void test_wire_cache_consistency(void) {
     memset(&cfg, 0, sizeof(cfg));
 
     build_zone_response_cache(&arena, &cfg, NULL, "example.com.");
-    assert(arena.response_cache.bucket_count > 0);
-    assert(arena.response_cache.entry_count > 0);
-    printf("       Pre-rendered %zu response cache entries.\n", arena.response_cache.entry_count);
+    assert(arena.rcache_ok);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
@@ -394,13 +409,13 @@ static void test_wire_cache_consistency(void) {
         compress_ctx_init_packet(&comp_ctx);
 
         zone_db_entry_t *matched1 = NULL;
-        int len_cached = process_dns_query_impl(req, req_len, res_cached, sizeof(res_cached),
+        int len_cached = cached_query(req, req_len, res_cached, sizeof(res_cached),
                                                test_cases[i].qname, test_cases[i].qtype,
                                                "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched1);
         assert(len_cached > 0);
 
-        response_cache_entry_t **saved_buckets = arena.response_cache.buckets;
-        arena.response_cache.buckets = NULL;
+        bool saved_ok = arena.rcache_ok;
+        arena.rcache_ok = false;
 
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched2 = NULL;
@@ -408,7 +423,7 @@ static void test_wire_cache_consistency(void) {
                                                  test_cases[i].qname, test_cases[i].qtype,
                                                  "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched2);
         assert(len_uncached > 0);
-        arena.response_cache.buckets = saved_buckets;
+        arena.rcache_ok = saved_ok;
 
         assert(len_cached == len_uncached);
         assert(memcmp(res_cached, res_uncached, len_cached) == 0);
@@ -432,15 +447,15 @@ static void test_wire_cache_consistency(void) {
         compress_ctx_init_packet(&comp_ctx);
 
         zone_db_entry_t *matched1 = NULL;
-        int len_cached = process_dns_query_impl(req, req_len, res_cached, sizeof(res_cached),
+        int len_cached = cached_query(req, req_len, res_cached, sizeof(res_cached),
                                                test_cases[i].qname, test_cases[i].qtype,
                                                "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched1);
         assert(len_cached > 0);
         uint16_t arcount_cached = ((uint16_t)res_cached[10] << 8) | res_cached[11];
         assert(arcount_cached >= 1); // OPT record present
 
-        response_cache_entry_t **saved_buckets = arena.response_cache.buckets;
-        arena.response_cache.buckets = NULL;
+        bool saved_ok = arena.rcache_ok;
+        arena.rcache_ok = false;
 
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched2 = NULL;
@@ -448,7 +463,7 @@ static void test_wire_cache_consistency(void) {
                                                  test_cases[i].qname, test_cases[i].qtype,
                                                  "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched2);
         assert(len_uncached > 0);
-        arena.response_cache.buckets = saved_buckets;
+        arena.rcache_ok = saved_ok;
 
         assert(len_cached == len_uncached);
         assert(memcmp(res_cached, res_uncached, len_cached) == 0);
@@ -474,7 +489,7 @@ static void test_wire_cache_consistency(void) {
 
         // Client 1 query (cached)
         zone_db_entry_t *matched1 = NULL;
-        int len1_cached = process_dns_query_impl(req1, req_len1, res1_cached, sizeof(res1_cached),
+        int len1_cached = cached_query(req1, req_len1, res1_cached, sizeof(res1_cached),
                                                 "mail.example.com.", 1,
                                                 "192.0.2.1", &comp_ctx, false, NULL, &snap, &cfg, &matched1);
         assert(len1_cached > 0);
@@ -482,15 +497,15 @@ static void test_wire_cache_consistency(void) {
         uint64_t hits_before = atomic_load(&matched1->observatory.wirecache_hits);
 
         // Client 1 query (uncached)
-        response_cache_entry_t **saved_buckets = arena.response_cache.buckets;
-        arena.response_cache.buckets = NULL;
+        bool saved_ok = arena.rcache_ok;
+        arena.rcache_ok = false;
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched2 = NULL;
         int len1_uncached = process_dns_query_impl(req1, req_len1, res1_uncached, sizeof(res1_uncached),
                                                   "mail.example.com.", 1,
                                                   "192.0.2.1", &comp_ctx, false, NULL, &snap, &cfg, &matched2);
         assert(len1_uncached > 0);
-        arena.response_cache.buckets = saved_buckets;
+        arena.rcache_ok = saved_ok;
 
         assert(len1_cached == len1_uncached);
         assert(memcmp(res1_cached, res1_uncached, len1_cached) == 0);
@@ -499,13 +514,13 @@ static void test_wire_cache_consistency(void) {
         // Client 2 query from different IP (cached)
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched3 = NULL;
-        int len2_cached = process_dns_query_impl(req2, req_len2, res2_cached, sizeof(res2_cached),
+        int len2_cached = cached_query(req2, req_len2, res2_cached, sizeof(res2_cached),
                                                 "mail.example.com.", 1,
                                                 "192.0.2.2", &comp_ctx, false, NULL, &snap, &cfg, &matched3);
         assert(len2_cached > 0);
         // A cookie query is served from the wire cache (the cookie itself is appended per query)
         assert(matched3 == matched1);
-        assert(atomic_load(&matched3->observatory.wirecache_hits) == hits_before + 1);
+        assert(atomic_load(&matched3->observatory.wirecache_hits) == hits_before + 2); // warm-up + query, both hits
 
         // Verify body portion (ANSWER section) is identical between Client 1 and Client 2
         // while the OPT / Cookie portion is independently generated
@@ -537,18 +552,18 @@ static void test_wire_cache_consistency(void) {
             compress_ctx_t comp_ctx = {0};
             compress_ctx_init_packet(&comp_ctx);
             zone_db_entry_t *matched = NULL;
-            int len_cached = process_dns_query_impl(req, req_len, res_cached, sizeof(res_cached),
+            int len_cached = cached_query(req, req_len, res_cached, sizeof(res_cached),
                                                    mixed_qname, 1,
                                                    "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
             assert(len_cached > 0);
 
-            response_cache_entry_t **saved_buckets = arena.response_cache.buckets;
-            arena.response_cache.buckets = NULL;
+            bool saved_ok = arena.rcache_ok;
+            arena.rcache_ok = false;
             compress_ctx_init_packet(&comp_ctx);
             int len_uncached = process_dns_query_impl(req, req_len, res_uncached, sizeof(res_uncached),
                                                      mixed_qname, 1,
                                                      "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
-            arena.response_cache.buckets = saved_buckets;
+            arena.rcache_ok = saved_ok;
 
             assert(len_cached == len_uncached);
             assert(memcmp(res_cached, res_uncached, len_cached) == 0);
@@ -890,6 +905,33 @@ static void test_wire_cache_max_records_limit(void) {
         assert(res != 0);
 
         printf("  [PASS] Config parser handles wire-cache-max-records properly\n");
+
+        /* response-cache-size: default 32M, K/M suffix, 0 disables, junk and out-of-range values are errors */
+        struct { const char *conf; int ok; size_t want; } rcs[] = {
+            { "options { };", 1, 32u * 1024 * 1024 },
+            { "options { response-cache-size 64M; };", 1, 64u * 1024 * 1024 },
+            { "options { response-cache-size 512K; };", 1, 512u * 1024 },
+            { "options { response-cache-size 0; };", 1, 0 },
+            { "options { response-cache-size 16X; };", 0, 0 },
+            { "options { response-cache-size -1; };", 0, 0 },
+            { "options { response-cache-size 2048M; };", 0, 0 },
+            { "options { response-cache-size abc; };", 0, 0 },
+        };
+        for (size_t i = 0; i < sizeof(rcs) / sizeof(rcs[0]); i++) {
+            char text[128];
+            snprintf(text, sizeof(text), "%s", rcs[i].conf);
+            server_config_t c;
+            memset(&c, 0, sizeof(c));
+            int r = parse_named_conf(text, &c);
+            if (rcs[i].ok) {
+                assert(r == 0);
+                assert(c.response_cache_size == rcs[i].want);
+                free_server_config_fields(&c);
+            } else {
+                assert(r != 0);
+            }
+        }
+        printf("  [PASS] Config parser handles response-cache-size properly\n");
     }
 
     // 2. Threshold check & boundary tests
@@ -926,32 +968,25 @@ static void test_wire_cache_max_records_limit(void) {
         // Case A: wire_cache_max_records = 0 (unlimited) -> Cache enabled
         cfg.wire_cache_max_records = 0;
         build_zone_response_cache(&arena, &cfg, NULL, "example.com.");
-        assert(arena.response_cache.buckets != NULL);
-        assert(arena.response_cache.entry_count > 0);
-        printf("  [PASS] wire_cache_max_records=0 enables cache (entries=%zu)\n", arena.response_cache.entry_count);
+        assert(arena.rcache_ok);
+        printf("  [PASS] wire_cache_max_records=0 enables cache\n");
 
         // Case B: wire_cache_max_records = total_records + 1 (above) -> Cache enabled
-        free_zone_response_cache(&arena);
         cfg.wire_cache_max_records = (uint32_t)(total_records + 1);
         build_zone_response_cache(&arena, &cfg, NULL, "example.com.");
-        assert(arena.response_cache.buckets != NULL);
-        assert(arena.response_cache.entry_count > 0);
+        assert(arena.rcache_ok);
         printf("  [PASS] wire_cache_max_records=%zu (total+1) enables cache\n", total_records + 1);
 
         // Case C: wire_cache_max_records = total_records (exact boundary) -> Cache enabled (since arena->count > max is false)
-        free_zone_response_cache(&arena);
         cfg.wire_cache_max_records = (uint32_t)total_records;
         build_zone_response_cache(&arena, &cfg, NULL, "example.com.");
-        assert(arena.response_cache.buckets != NULL);
-        assert(arena.response_cache.entry_count > 0);
+        assert(arena.rcache_ok);
         printf("  [PASS] wire_cache_max_records=%zu (exact total) enables cache\n", total_records);
 
         // Case D: wire_cache_max_records = total_records - 1 (below) -> Cache disabled
-        free_zone_response_cache(&arena);
         cfg.wire_cache_max_records = (uint32_t)(total_records - 1);
         build_zone_response_cache(&arena, &cfg, NULL, "example.com.");
-        assert(arena.response_cache.buckets == NULL);
-        assert(arena.response_cache.entry_count == 0);
+        assert(!arena.rcache_ok);
         printf("  [PASS] wire_cache_max_records=%zu (total-1) disables cache\n", total_records - 1);
 
         // Case E: Query resolution still works when cache is disabled (fallback to full path)
@@ -1029,9 +1064,7 @@ static void test_wire_cache_observatory_counters(void) {
     memset(&cfg, 0, sizeof(cfg));
 
     build_zone_response_cache(&arena, &cfg, NULL, "example.com.");
-    assert(arena.response_cache.buckets != NULL);
-    assert(arena.response_cache.entry_count > 0);
-    assert(arena.response_cache.total_bytes > 0);
+    assert(arena.rcache_ok);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
@@ -1054,7 +1087,7 @@ static void test_wire_cache_observatory_counters(void) {
     snap.views = &view;
     snap.view_count = 1;
 
-    // 1. Cache hit query: www.example.com A
+    // 1. First query fills the shared cache (miss), the second one is a hit: www.example.com A
     uint8_t req[512], res[4096];
     size_t req_len = 0;
     build_simple_query(req, &req_len, 0x1001, "www.example.com.", 1);
@@ -1066,8 +1099,18 @@ static void test_wire_cache_observatory_counters(void) {
                                     "www.example.com.", 1,
                                     "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
     assert(len > 0);
+    assert(atomic_load_explicit(&db_entry.observatory.wirecache_hits, memory_order_relaxed) == 0);
+    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 1);
+    uint8_t res_first[4096];
+    memcpy(res_first, res, (size_t)len);
+    int len_first = len;
+    compress_ctx_init_packet(&comp_ctx);
+    len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                 "www.example.com.", 1,
+                                 "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+    assert(len == len_first && memcmp(res, res_first, (size_t)len) == 0);
     assert(atomic_load_explicit(&db_entry.observatory.wirecache_hits, memory_order_relaxed) == 1);
-    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 0);
+    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 1);
 
     // 2. Cache miss query (NXDOMAIN): nonexistent.example.com A
     build_simple_query(req, &req_len, 0x1002, "nonexistent.example.com.", 1);
@@ -1078,7 +1121,15 @@ static void test_wire_cache_observatory_counters(void) {
                                  "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
     assert(len > 0);
     assert(atomic_load_explicit(&db_entry.observatory.wirecache_hits, memory_order_relaxed) == 1);
-    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 2);
+    // NXDOMAIN is not stored: the same query misses again
+    compress_ctx_init_packet(&comp_ctx);
+    len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                 "nonexistent.example.com.", 1,
+                                 "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+    assert(len > 0 && (res[3] & 0x0F) == 3);
+    assert(atomic_load_explicit(&db_entry.observatory.wirecache_hits, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 3);
 
     // 3. Cache-ineligible query (DO=1): should not increment hits or misses
     build_edns_query(req, &req_len, 0x1003, "www.example.com.", 1, true /* DO=1 */);
@@ -1089,7 +1140,38 @@ static void test_wire_cache_observatory_counters(void) {
                                  "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
     assert(len > 0);
     assert(atomic_load_explicit(&db_entry.observatory.wirecache_hits, memory_order_relaxed) == 1);
-    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 3);
+
+    // 4. A new published version (new data generation) never sees the old entries
+    build_simple_query(req, &req_len, 0x1004, "www.example.com.", 1);
+    build_zone_response_cache(&arena, &cfg, NULL, "example.com.");
+    compress_ctx_init_packet(&comp_ctx);
+    len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                 "www.example.com.", 1,
+                                 "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+    assert(len > 0);
+    assert(atomic_load_explicit(&db_entry.observatory.wirecache_hits, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 4);
+
+    // 5. A sibling zone that holds glue addresses changed (S2): the zone gets a new generation in place
+    uint64_t sibling_gen = zone_data_generation_next();
+    atomic_store_explicit(&arena.generation, sibling_gen, memory_order_release);
+    assert(zone_arena_data_generation(&arena) == sibling_gen);
+    compress_ctx_init_packet(&comp_ctx);
+    len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                 "www.example.com.", 1,
+                                 "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+    assert(len > 0);
+    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 5);
+
+    // 6. A configuration generation change also misses
+    cfg.generation++;
+    compress_ctx_init_packet(&comp_ctx);
+    len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                 "www.example.com.", 1,
+                                 "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+    assert(len > 0);
+    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 6);
 
     zone_arena_destroy(&arena);
     printf("[SUCCESS] All wire cache observatory counters tests passed!\n");
@@ -1119,16 +1201,62 @@ static void test_wire_cache_per_view_config(void) {
     assert(build_zone_index(&arena, true) == 0);
 
     build_zone_response_cache(&arena, &cfg, "tagged", "example.com.");
-    assert(arena.response_cache.buckets == NULL && arena.response_cache.entry_count == 0);
+    assert(!arena.rcache_ok);
     build_zone_response_cache(&arena, &cfg, "plain", "example.com.");
-    assert(arena.response_cache.buckets != NULL && arena.response_cache.entry_count > 0);
+    assert(arena.rcache_ok);
 
     zone_arena_destroy(&arena);
     free_server_config_fields(&cfg);
     printf("  -> per-view wire cache configuration passed.\n");
 }
 
+/* Store layout: one set (8 index entries, 1 KiB ring). Bodies of varying sizes wrap around the ring; a lookup
+ * returns the stored body exactly or misses, never bytes of another entry, and a stored key replaces its old body. */
+static void test_rcache_store_layout(void) {
+    printf("[TEST] Shared response cache: variable-length bodies, ring wrap-around and eviction...\n");
+    assert(response_cache_init(1) == 0);              /* too small for one set: disabled */
+    size_t got = response_cache_init(1400);           /* exactly one set */
+    assert(got > 0 && got <= 1400);
+    uint8_t body[512], out[512];
+    uint16_t an, ns, ar;
+    int hits_total = 0;
+    for (uint64_t k = 1; k <= 400; k++) {
+        size_t len = 1 + (k * 37) % 300;
+        for (size_t i = 0; i < len; i++) body[i] = (uint8_t)(k * 13 + i);
+        rcache_store(k, 7, 1, body, len, (uint16_t)k, 2, 3);
+        /* the entry just stored is always there */
+        int l = rcache_lookup(k, 7, 1, out, sizeof(out), &an, &ns, &ar);
+        assert(l == (int)len && an == (uint16_t)k && ns == 2 && ar == 3 && memcmp(out, body, len) == 0);
+        /* older entries either hit with their own bytes or miss */
+        for (uint64_t j = (k > 12 ? k - 12 : 1); j < k; j++) {
+            size_t jl = 1 + (j * 37) % 300;
+            l = rcache_lookup(j, 7, 1, out, sizeof(out), &an, &ns, &ar);
+            if (l < 0) continue;
+            assert(l == (int)jl && an == (uint16_t)j);
+            for (size_t i = 0; i < jl; i++) assert(out[i] == (uint8_t)(j * 13 + i));
+            hits_total++;
+        }
+        /* wrong generation, wrong qtype, too little room: miss */
+        assert(rcache_lookup(k, 8, 1, out, sizeof(out), &an, &ns, &ar) < 0);
+        assert(rcache_lookup(k, 7, 28, out, sizeof(out), &an, &ns, &ar) < 0);
+        assert(rcache_lookup(k, 7, 1, out, len - 1, &an, &ns, &ar) < 0 || len == 0);
+    }
+    assert(hits_total > 0);
+    /* the same key stored again replaces the old body */
+    memset(body, 0xAB, 40);
+    rcache_store(9999, 7, 1, body, 40, 1, 0, 0);
+    memset(body, 0xCD, 24);
+    rcache_store(9999, 7, 1, body, 24, 1, 0, 0);
+    assert(rcache_lookup(9999, 7, 1, out, sizeof(out), &an, &ns, &ar) == 24 && out[0] == 0xCD && out[23] == 0xCD);
+    /* bodies over the limit are not stored */
+    rcache_store(4242, 7, 1, body, 497, 1, 0, 0);
+    assert(rcache_lookup(4242, 7, 1, out, sizeof(out), &an, &ns, &ar) < 0);
+    printf("  [PASS] variable-length store, wrap-around and eviction\n");
+}
+
 int main(void) {
+    test_rcache_store_layout();
+    assert(response_cache_init(1u << 20) > 0);
     test_wire_cache_consistency();
     test_wire_cache_max_records_limit();
     test_wire_cache_observatory_counters();

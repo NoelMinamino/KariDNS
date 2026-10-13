@@ -249,6 +249,8 @@ typedef struct server_config_s {
   bool minimal_any;
   uint32_t minimal_any_ttl;
   uint32_t wire_cache_max_records;
+  size_t response_cache_size;  /* 共有の応答キャッシュの大きさ (オクテット)。0 = 使わない */
+  uint64_t generation;         /* 公開した設定ごとに増える (応答キャッシュの鍵) */
   additional_from_auth_t additional_from_auth;
   uint32_t query_log_max_qps;
   uint32_t query_log_buffer_size;

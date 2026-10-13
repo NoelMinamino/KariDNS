@@ -96,7 +96,9 @@ fi
 
 # 5. Send Queries via dag
 echo "[+] Sending DNS queries to generate observatory metrics..."
-# UDP query -> NOERROR (with a client cookie, as dag sends by default: still a wire cache hit)
+# UDP query -> NOERROR. The response cache is filled on a miss, so the second identical query is a hit
+# (with a client cookie, as dag sends by default: still a cache hit)
+"$DAG" @127.0.0.1 -p $PORT www.obs.example.com A > /dev/null 2>&1 || true
 "$DAG" @127.0.0.1 -p $PORT www.obs.example.com A > /dev/null 2>&1 || true
 
 # TCP query -> NOERROR

@@ -206,6 +206,129 @@ static void test_rebuild_two_views(void) {
     printf("  -> rebuild/lookup/reload verdicts passed.\n");
 }
 
+/* S2: true when the additional section of "<zone> NS" (DO=0) carries addr */
+static bool ns_answer_has_glue(const char *zone, const char *addr) {
+    uint8_t req[512], res[4096];
+    size_t n = 0;
+    memset(req, 0, sizeof(req));
+    req[0] = 0x12; req[1] = 0x34; req[5] = 1; /* QDCOUNT=1, RD=0 */
+    n = 12;
+    const char *p = zone;
+    while (*p) {
+        const char *dot = strchr(p, '.');
+        size_t len = dot ? (size_t)(dot - p) : strlen(p);
+        if (len == 0) break;
+        req[n++] = (uint8_t)len;
+        memcpy(req + n, p, len);
+        n += len;
+        p += len + (dot ? 1 : 0);
+    }
+    req[n++] = 0;
+    req[n++] = 0; req[n++] = 2;  /* NS */
+    req[n++] = 0; req[n++] = 1;  /* IN */
+    compress_ctx_t comp = {0};
+    compress_ctx_init_packet(&comp);
+    zone_db_entry_t *matched = NULL;
+    zone_db_snapshot_t *snap = acquire_zone_snapshot();
+    int len = process_dns_query_impl(req, n, res, sizeof(res), zone, 2, "127.0.0.1", &comp, false, NULL,
+                                     snap, atomic_load_explicit(&g_config_db.active, memory_order_acquire), &matched);
+    assert(len > 12 && (res[3] & 0x0F) == 0);
+    unsigned a, b, c, d;
+    assert(sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) == 4);
+    const uint8_t want[4] = { (uint8_t)a, (uint8_t)b, (uint8_t)c, (uint8_t)d };
+    /* an A record's RDATA is RDLENGTH=4 followed by the address */
+    for (int i = 12; i + 6 <= len; i++) {
+        if (res[i] == 0 && res[i + 1] == 4 && memcmp(res + i + 2, want, 4) == 0) return true;
+    }
+    return false;
+}
+
+static bool standby_empty(zone_db_entry_t *e) {
+    zone_arena_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
+    zone_arena_t *s = (a == &e->rcu.arena_a) ? &e->rcu.arena_b : &e->rcu.arena_a;
+    return s->records == NULL && s->data_pool_count == 0 && s->hash_table == NULL && s->file_buf_count == 0;
+}
+
+/* S2: glue from a sibling zone follows the sibling (load order, reload, removal) without copying or
+ * republishing the dependent zone; only its response cache generation changes. Published versions keep
+ * one copy of each zone. */
+static void test_snapshot_rebuild_sibling_glue(void) {
+    printf("[TEST] Snapshot rebuild: sibling glue tracking and release of old versions (S2)...\n");
+    wfile("dep.zone", "$ORIGIN dep.example.\n$TTL 60\n@ IN SOA ns1.prov.example. h.dep.example. 1 7200 3600 1209600 60\n"
+                      "@ IN NS ns1.prov.example.\n@ IN NS ns.dep.example.\nns IN A 192.0.2.31\nwww IN A 192.0.2.30\n");
+    wfile("prov.zone", "$ORIGIN prov.example.\n$TTL 60\n@ IN SOA ns1 h 1 7200 3600 1209600 60\n"
+                       "@ IN NS ns1\nns1 IN A 192.0.2.7\n");
+    /* dep.example is loaded before the zone that holds its name server address */
+    server_config_t *cfg = load_conf(
+        "options { additional-from-auth yes; };\n"
+        "zone \"dep.example\" { type master; file \"%s/dep.zone\"; };\n"
+        "zone \"prov.example\" { type master; file \"%s/prov.zone\"; };\n", g_dir, g_dir);
+    zone_db_snapshot_t *snap = build(cfg, false);
+    zone_db_entry_t *dep = snapshot_get_zone(snap, "dep.example.");
+    zone_db_entry_t *prov = snapshot_get_zone(snap, "prov.example.");
+    assert(dep && prov);
+    assert(atomic_load_explicit(&prov->glue_provider, memory_order_relaxed));
+    /* a new zone is loaded once (not again by the second loop), so nothing is left in standby */
+    assert(dep->publish_seq == 1 && prov->publish_seq == 1);
+    assert(standby_empty(dep) && standby_empty(prov));
+    /* only the zone's own address is copied; the sibling's is looked up when answering */
+    zone_arena_t *dep_arena = atomic_load_explicit(&dep->rcu.active, memory_order_acquire);
+    assert(dep_arena->prelinked_glue_count == 1);
+    assert(!strcasecmp(dep_arena->prelinked_glue[0].target_name, "ns.dep.example."));
+    /* both targets are tracked (an in-zone name may later be covered by a new child zone) */
+    assert(dep_arena->glue_external && dep_arena->glue_target_count == 2);
+    int prov_k = !strcasecmp(dep_arena->glue_targets[0], "ns1.prov.example.") ? 0 : 1;
+    assert(!strcasecmp(dep_arena->glue_targets[prov_k], "ns1.prov.example."));
+    assert(dep_arena->glue_target_ids[prov_k] == prov->id); /* the startup pass found the later sibling */
+    assert(dep_arena->glue_target_ids[1 - prov_k] == 0);    /* the zone itself */
+    assert(ns_answer_has_glue("dep.example.", "192.0.2.7") && ns_answer_has_glue("dep.example.", "192.0.2.31"));
+
+    /* nothing changed: the generation stays */
+    uint64_t gen_before = zone_arena_data_generation(dep_arena);
+    zone_glue_refresh_dependents(true);
+    assert(zone_arena_data_generation(dep_arena) == gen_before);
+
+    /* the sibling changes: the dependent is not republished, its answers get a new cache key */
+    wfile("prov.zone", "$ORIGIN prov.example.\n$TTL 60\n@ IN SOA ns1 h 2 7200 3600 1209600 60\n"
+                       "@ IN NS ns1\nns1 IN A 192.0.2.8\n");
+    zone_config_t *pcfg = find_zone_config_in_view(cfg, NULL, "prov.example.");
+    assert(pcfg && reload_master_zone(prov, pcfg) == RELOAD_OK);
+    assert(!standby_empty(prov));         /* the old version waits for the grace period */
+    zone_glue_refresh_dependents(false);
+    assert(atomic_load_explicit(&dep->rcu.active, memory_order_acquire) == dep_arena);
+    assert(zone_arena_data_generation(dep_arena) != gen_before);
+    assert(ns_answer_has_glue("dep.example.", "192.0.2.8") && !ns_answer_has_glue("dep.example.", "192.0.2.7"));
+    gen_before = zone_arena_data_generation(dep_arena);
+    zone_glue_refresh_dependents(false);  /* no further publish: nothing to do */
+    assert(zone_arena_data_generation(dep_arena) == gen_before);
+    zone_retire_process(true);
+    assert(standby_empty(prov));          /* released after the grace period */
+    release_zone_snapshot(snap);
+
+    /* a reload of the dependent itself */
+    zone_config_t *dcfg = find_zone_config_in_view(cfg, NULL, "dep.example.");
+    assert(dcfg && reload_master_zone(dep, dcfg) == RELOAD_OK);
+    assert(ns_answer_has_glue("dep.example.", "192.0.2.8"));
+    zone_retire_process(true);
+    assert(standby_empty(dep));
+
+    /* the sibling zone is removed from the configuration: its address is no longer served as glue,
+     * and the dependent's generation changes although the dependent itself was not reloaded */
+    dep_arena = atomic_load_explicit(&dep->rcu.active, memory_order_acquire);
+    gen_before = zone_arena_data_generation(dep_arena);
+    server_config_t *cfg2 = load_conf(
+        "options { additional-from-auth yes; };\n"
+        "zone \"dep.example\" { type master; file \"%s/dep.zone\"; };\n", g_dir);
+    snap = build(cfg2, true);
+    dep = snapshot_get_zone(snap, "dep.example.");
+    assert(dep && atomic_load_explicit(&dep->rcu.active, memory_order_acquire) == dep_arena);
+    assert(zone_arena_data_generation(dep_arena) != gen_before);
+    for (int k = 0; k < dep_arena->glue_target_count; k++) assert(dep_arena->glue_target_ids[k] == 0);
+    assert(!ns_answer_has_glue("dep.example.", "192.0.2.8") && ns_answer_has_glue("dep.example.", "192.0.2.31"));
+    release_zone_snapshot(snap);
+    printf("  -> sibling glue tracking and release of old versions passed.\n");
+}
+
 static void test_snapshot_retain_release_and_gc(void) {
     printf("[TEST] Snapshot retain, release, GC, and abort rebuild...\n");
     // Retain / release NULL safety
@@ -871,6 +994,7 @@ int main(void) {
     snprintf(g_dir, sizeof(g_dir), "/tmp/karidns_snap_XXXXXX");
     assert(mkdtemp(g_dir));
     test_rebuild_two_views();
+    test_snapshot_rebuild_sibling_glue();
     test_snapshot_retain_release_and_gc();
     test_lookup_across_views_multi();
     test_snapshot_catalog_member_sync_and_deltas();

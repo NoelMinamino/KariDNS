@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-echo "=== Running Pre-rendered Wire-format Response Cache Tests ==="
+echo "=== Running Shared Response Cache Tests ==="
 
 CC="${CC:-clang}"
 CFLAGS="${CFLAGS:--O1 -g -fsanitize=address,undefined -I.}"
@@ -18,4 +18,4 @@ else
     ./test_response_cache_bin
 fi
 
-echo "=== Pre-rendered Wire-format Response Cache Tests: ALL PASSED ==="
+echo "=== Shared Response Cache Tests: ALL PASSED ==="

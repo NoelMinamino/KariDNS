@@ -60,6 +60,53 @@ bool rcu_writer_wait_until_safe_in_reader(uint64_t retire_epoch, int timeout_ms)
   return wait_until_safe_impl(retire_epoch, timeout_ms, t_rcu_own_observed);
 }
 
+static bool readers_safe(uint64_t retire_epoch, _Atomic uint64_t *skip) {
+  // 公開したスレッドと待つスレッドが異なる場合 (GC スレッド) にも、
+  // 公開と走査の間に seq_cst フェンスを置く。
+  atomic_thread_fence(memory_order_seq_cst);
+  bool all_safe = true;
+  int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
+  worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
+
+  if (workers && num_workers > 0) {
+    for (int i = 0; i < num_workers; i++) {
+      if (epoch_blocks(&workers[i].rcu_observed_epoch, retire_epoch, skip)) {
+        all_safe = false;
+        break;
+      }
+    }
+  }
+
+  if (all_safe && epoch_blocks(&g_resp_logger_rcu_ctx.rcu_observed_epoch, retire_epoch, skip)) {
+    all_safe = false;
+  }
+  if (all_safe && epoch_blocks(&g_query_logger_rcu_ctx.rcu_observed_epoch, retire_epoch, skip)) {
+    all_safe = false;
+  }
+  if (all_safe && g_async_io_rcu_worker_count > 0) {
+    for (int i = 0; i < g_async_io_rcu_worker_count; i++) {
+      if (epoch_blocks(&g_async_io_rcu_ctxs[i].rcu_observed_epoch, retire_epoch, skip)) {
+        all_safe = false;
+        break;
+      }
+    }
+  }
+  if (all_safe) {
+    for (int i = 0; i < MAX_AUX_RCU_READERS; i++) {
+      if (epoch_blocks(&g_aux_rcu_slots[i].observed_epoch, retire_epoch, skip)) {
+        all_safe = false;
+        break;
+      }
+    }
+  }
+  return all_safe;
+}
+
+/* 待たずに 1 回だけ調べる (S2: 制御スレッドの周期処理が解放待ちを処理するときに使う) */
+bool rcu_writer_is_safe(uint64_t retire_epoch) {
+  return readers_safe(retire_epoch, NULL);
+}
+
 static bool wait_until_safe_impl(uint64_t retire_epoch, int timeout_ms, _Atomic uint64_t *skip) {
   int retries = 0;
   useconds_t sleep_time = 1;
@@ -67,44 +114,7 @@ static bool wait_until_safe_impl(uint64_t retire_epoch, int timeout_ms, _Atomic 
   clock_gettime(CLOCK_MONOTONIC, &start);
 
   for (;;) {
-    // 公開したスレッドと待つスレッドが異なる場合 (GC スレッド) にも、
-    // 公開と走査の間に seq_cst フェンスを置く。
-    atomic_thread_fence(memory_order_seq_cst);
-    bool all_safe = true;
-    int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
-    worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
-
-    if (workers && num_workers > 0) {
-      for (int i = 0; i < num_workers; i++) {
-        if (epoch_blocks(&workers[i].rcu_observed_epoch, retire_epoch, skip)) {
-          all_safe = false;
-          break;
-        }
-      }
-    }
-
-    if (all_safe && epoch_blocks(&g_resp_logger_rcu_ctx.rcu_observed_epoch, retire_epoch, skip)) {
-      all_safe = false;
-    }
-    if (all_safe && epoch_blocks(&g_query_logger_rcu_ctx.rcu_observed_epoch, retire_epoch, skip)) {
-      all_safe = false;
-    }
-    if (all_safe && g_async_io_rcu_worker_count > 0) {
-      for (int i = 0; i < g_async_io_rcu_worker_count; i++) {
-        if (epoch_blocks(&g_async_io_rcu_ctxs[i].rcu_observed_epoch, retire_epoch, skip)) {
-          all_safe = false;
-          break;
-        }
-      }
-    }
-    if (all_safe) {
-      for (int i = 0; i < MAX_AUX_RCU_READERS; i++) {
-        if (epoch_blocks(&g_aux_rcu_slots[i].observed_epoch, retire_epoch, skip)) {
-          all_safe = false;
-          break;
-        }
-      }
-    }
+    bool all_safe = readers_safe(retire_epoch, skip);
 
     if (all_safe) {
       return true;

@@ -360,6 +360,15 @@ typedef struct {
   _Atomic(time_t) expire_at;
   _Atomic(time_t) last_stale_log_time;
   time_t last_loaded_mtime;
+  /* S2: 公開の回数 (writer_lock の下で増やす)。解放待ちの arena がまだ standby のままかの判定に使う */
+  uint64_t publish_seq;
+  /* 他のゾーンがこのゾーンの名前をグルーに使っている (prelink が印を付ける)。公開時に
+   * 制御スレッドへ依存するゾーンのグルーの作り直しを頼む */
+  _Atomic bool glue_provider;
+  /* エントリごとに一意 (アドレスの再利用と区別する)。グルーの作り直しの判定に使う */
+  uint64_t id;
+  /* 最後に公開したときの全体の公開カウンタ */
+  _Atomic uint64_t publish_order;
 } zone_db_entry_t;
 
 /* セカンダリゾーンが期限切れになる時刻。期限が無い (プライマリ、未転送) なら 0。 */
@@ -492,6 +501,11 @@ void prelink_zone_additional_glue(zone_arena_t *current_zone,
                                   const char *zone_domain,
                                   view_snapshot_t *view,
                                   additional_from_auth_t policy);
+/* S2: 公開、解放待ちの処理、兄弟ゾーンの変更に伴うグルーの作り直し (dns_snapshot_rcu.c) */
+void zone_publish(zone_db_entry_t *entry, zone_arena_t *standby);
+void zone_retire_process(bool wait);
+void zone_glue_refresh_dependents(bool force);
+uint64_t zone_entry_next_id(void);
 
 int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out, uint16_t *msg_len_out);
 ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len);

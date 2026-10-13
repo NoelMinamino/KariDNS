@@ -119,6 +119,7 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
     return 2; // SERVFAIL
   }
 
+  zone_arena_shrink_records(z_standby);
   if (build_zone_index(z_standby, true) != 0) {
     zone_arena_clear_data_pools(z_standby);
     pthread_mutex_unlock(&entry->writer_lock);
@@ -141,7 +142,7 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   /* 公開する直前に記録する (索引の構築に失敗して公開しなかった UPDATE のシリアルを残さない) */
   atomic_store_explicit(&entry->serial, new_serial, memory_order_release);
 
-  entry->rcu.retire_epoch = rcu_writer_publish(&entry->rcu.active, z_standby);
+  zone_publish(entry, z_standby);
   pthread_mutex_unlock(&entry->writer_lock);
 
   notify_request_send(entry);

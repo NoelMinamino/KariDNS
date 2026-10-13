@@ -2093,6 +2093,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->minimal_any = false;
   config->minimal_any_ttl = 86400;
   config->wire_cache_max_records = 0;
+  config->response_cache_size = 32 * 1024 * 1024;
   config->additional_from_auth = ADDITIONAL_AUTH_YES;
   config->notify_retry.retries = NOTIFY_RETRIES_DEFAULT;
   config->notify_retry.interval = NOTIFY_RETRY_INTERVAL_DEFAULT;
@@ -2525,6 +2526,14 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           free_token(&tok);
+        } else if (strcmp(key, "response-cache-size") == 0) {
+          /* 0 = 使わない。それ以外は 4K/16M のような大きさ (上限 1024M)。書き損じは誤りにする */
+          int sz = 0;
+          if (parse_transport_param(ctx, NULL, key, true, 0, 1024LL * 1024 * 1024, &sz) != 0) {
+            free(key);
+            return -1;
+          }
+          config->response_cache_size = (size_t)sz;
         } else if (strcmp(key, "udp-sndbuf-size") == 0) {
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {

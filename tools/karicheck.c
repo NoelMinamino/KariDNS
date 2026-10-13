@@ -914,14 +914,14 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     zone_arena_t arena;
     zone_arena_init(&arena);
 
-    arena.file_bufs[0] = mutable_buf;
-    arena.display_bufs[0] = (char*)buf;
-    arena.file_paths[0] = strdup(file_path);
-    if (!arena.file_paths[0]) {
+    char *root_path_copy = strdup(file_path);
+    if (!root_path_copy || zone_arena_add_file(&arena, mutable_buf, (char*)buf, root_path_copy) != 0) {
+        free(root_path_copy);
         free(mutable_buf);
+        free(buf);
+        kc_error(&tally, "Out of memory\n");
         return 1;
     }
-    arena.file_buf_count = 1;
 
     parse_error_t err = {0};
     char *root_ttl = NULL;
