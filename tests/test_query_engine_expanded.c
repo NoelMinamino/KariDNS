@@ -924,7 +924,7 @@ static void test_cname_loop_and_max_depth(void) {
 }
 
 static void test_prelink_zone_additional_glue_policies(void) {
-    printf("[TEST] Snapshot RCU: prelink_zone_additional_glue policies...\n");
+    printf("[TEST] Snapshot RCU: zone_glue_track_build policies...\n");
 
     zone_arena_t arena;
     zone_arena_init(&arena);
@@ -1040,16 +1040,18 @@ static void test_prelink_zone_additional_glue_policies(void) {
     snap.view_count = 1;
 
     // 1. Policy NO
-    prelink_zone_additional_glue(&arena, "glue.example.", &view, ADDITIONAL_AUTH_NO);
-    assert(arena.prelinked_glue == NULL);
+    zone_glue_track_build(&arena, "glue.example.", &view, ADDITIONAL_AUTH_NO);
+    assert(arena.glue == NULL);
+    zone_glue_track_build(&arena, "glue.example.", &view, ADDITIONAL_AUTH_IN_DOMAIN);
+    assert(arena.glue == NULL); /* only additional-from-auth yes follows sibling zones */
 
-    // 2. Policy YES
-    prelink_zone_additional_glue(&arena, "glue.example.", &view, ADDITIONAL_AUTH_YES);
-    assert(arena.prelinked_glue != NULL);
-    assert(arena.prelinked_glue_count >= 1);
+    // 2. Policy YES: the NS / MX / SRV targets are tracked
+    zone_glue_track_build(&arena, "glue.example.", &view, ADDITIONAL_AUTH_YES);
+    assert(arena.glue != NULL);
+    assert(arena.glue->count >= 1);
 
     zone_arena_destroy(&arena);
-    printf("  -> prelink_zone_additional_glue policies passed.\n");
+    printf("  -> zone_glue_track_build policies passed.\n");
 }
 
 // ----------------------------------------------------------------------------
@@ -7848,7 +7850,7 @@ static void test_query_engine_feature_case_208(void) {
 
     uint8_t addr[4] = { 192, 0, 2, 10 };
     uint8_t scope = 0;
-    const char *tag = resolve_ecs_subnet_tag(&arena, NULL, NULL, addr, AF_INET, &scope);
+    const char *tag = resolve_ecs_subnet_tag(test_zimg(&arena), NULL, NULL, addr, AF_INET, &scope);
     (void)tag;
     assert(scope <= 32);
 
@@ -8956,7 +8958,7 @@ static void test_query_engine_feature_case_241(void) {
     zone_arena_init(&arena);
 
     char loc[2] = {0};
-    tinydns_resolve_client_location(&arena, "192.0.2.1", loc);
+    tinydns_resolve_client_location(test_zimg(&arena), "192.0.2.1", loc);
     (void)loc;
 
     zone_arena_destroy(&arena);

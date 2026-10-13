@@ -668,7 +668,7 @@ static void sw_setup_all(const char *conf, bool optout) {
 
 static void sw_prelink_and_cache(additional_from_auth_t policy) {
     for (int i = 0; i < g_sw.zone_count; i++) {
-        prelink_zone_additional_glue(&g_sw.arena[i], g_sw.entry[i].domain, &g_sw.view, policy);
+        zone_glue_track_build(&g_sw.arena[i], g_sw.entry[i].domain, &g_sw.view, policy);
         build_zone_response_cache(&g_sw.arena[i], g_sw.cfg, NULL, g_sw.entry[i].domain);
     }
 }
@@ -1938,13 +1938,13 @@ static void test_ecs_cookie_rrl_dnstap_edges(void) {
                 uint8_t sc = 0;
                 const uint8_t *ad = f == 1 ? a6 : (f == 2 ? a4b : a4);
                 uint16_t fam = f == 1 ? 2 : (f == 3 ? 7 : 1);
-                (void)resolve_ecs_subnet_tag(&za, &cfg, &zc, ad, fam, &sc);
-                (void)resolve_ecs_subnet_tag(&za, &cfg, &zc, ad, fam, NULL);
+                (void)resolve_ecs_subnet_tag(test_zimg(&za), &cfg, &zc, ad, fam, &sc);
+                (void)resolve_ecs_subnet_tag(test_zimg(&za), &cfg, &zc, ad, fam, NULL);
                 (void)resolve_ecs_subnet_tag(NULL, &cfg, NULL, ad, fam, &sc);
-                (void)resolve_ecs_subnet_tag(&za, NULL, &zc, NULL, fam, &sc);
+                (void)resolve_ecs_subnet_tag(test_zimg(&za), NULL, &zc, NULL, fam, &sc);
             }
             for (size_t i = 0; i < NELEM(ips); i++) {
-                (void)resolve_bind_location_tag(&za, &cfg, &zc, ips[i]);
+                (void)resolve_bind_location_tag(test_zimg(&za), &cfg, &zc, ips[i]);
                 (void)resolve_bind_location_tag(NULL, NULL, &zc, ips[i]);
             }
         }
@@ -1964,7 +1964,7 @@ static void test_ecs_cookie_rrl_dnstap_edges(void) {
         if (mode == 4) { cfg.ecs_trusted_resolvers = tr; cfg.ecs_trusted_resolvers_count = 3; cfg.ecs_trusted_resolvers_parsed = trp; }
         if (mode == 5) { cfg.ecs_trusted_resolvers = tr; cfg.ecs_trusted_resolvers_count = 3; }
         for (size_t i = 0; i < NELEM(ips); i++) {
-            (void)is_ecs_trusted_resolver(&za, &cfg, &zc, ips[i]);
+            (void)is_ecs_trusted_resolver(test_zimg(&za), &cfg, &zc, ips[i]);
             (void)is_ecs_trusted_resolver(NULL, &cfg, NULL, ips[i]);
         }
     }
@@ -1973,8 +1973,8 @@ static void test_ecs_cookie_rrl_dnstap_edges(void) {
     /* tinydns client location */
     tinydns_location_entry_t locs[3] = { { {'j','p'}, {192,0,2,0}, 24 }, { {'u','s'}, {10,0,0,0}, 8 }, { {'a','l'}, {0}, 0 } };
     za.locations = locs; za.location_count = 3;
-    for (size_t i = 0; i < NELEM(ips); i++) { char lo[2]; tinydns_resolve_client_location(&za, ips[i], lo); }
-    char lo2[2]; tinydns_resolve_client_location(&za, "192.0.2.77", lo2); tinydns_resolve_client_location(NULL, "1.2.3.4", lo2);
+    for (size_t i = 0; i < NELEM(ips); i++) { char lo[2]; tinydns_resolve_client_location(test_zimg(&za), ips[i], lo); }
+    char lo2[2]; tinydns_resolve_client_location(test_zimg(&za), "192.0.2.77", lo2); tinydns_resolve_client_location(NULL, "1.2.3.4", lo2);
     za.locations = NULL; za.location_count = 0;
     zone_arena_destroy(&za);
     /* wrap_tinydns_record */

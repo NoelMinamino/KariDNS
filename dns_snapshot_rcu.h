@@ -37,10 +37,7 @@ zone_db_entry_t *find_zone_for_query(view_snapshot_t *view, const char *qname, u
 void free_zone_db_entry(zone_db_entry_t *entry);
 void *gc_snapshot_thread(void *arg);
 zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name);
-void prelink_zone_additional_glue(zone_arena_t *current_zone,
-                                  const char *zone_domain,
-                                  view_snapshot_t *view,
-                                  additional_from_auth_t policy);
+
 reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg);
 zone_db_snapshot_t *rebuild_zone_db_snapshot(
     server_config_t *active_config, 
@@ -51,7 +48,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
 int rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged);
 int rebuild_zone_db_from_config_ext(server_config_t *config, bool skip_unchanged, char *failed, size_t failed_sz);
 void zone_arena_clear_data_pools(zone_arena_t *arena);
-void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst);
+
 
 void free_zone_db_snapshot(zone_db_snapshot_t *snap);
 

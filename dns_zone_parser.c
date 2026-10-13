@@ -1836,9 +1836,7 @@ ecs_tag_def_t *clone_ecs_tags_array(const ecs_tag_def_t *src, int count) {
   return dst;
 }
 
-void zone_arena_destroy(zone_arena_t *arena) {
-  free(arena->image);
-  arena->image = NULL;
+void zone_arena_free_builder(zone_arena_t *arena) {
   free(arena->records);
   arena->records = NULL;
   arena->count = 0;
@@ -1876,16 +1874,17 @@ void zone_arena_destroy(zone_arena_t *arena) {
     free(arena->bind_ecs_trusted_resolvers_parsed);
     arena->bind_ecs_trusted_resolvers_parsed = NULL;
   }
-  arena->prelinked_glue = NULL;
-  arena->prelinked_glue_count = 0;
-  arena->glue_external = false;
-  arena->glue_targets = NULL;
-  arena->glue_target_count = 0;
-  arena->glue_target_ids = NULL;
-  arena->glue_built_at = 0;
+  zone_arena_free_include_buffers(arena);
+}
+
+void zone_arena_destroy(zone_arena_t *arena) {
+  free(arena->image);
+  arena->image = NULL;
+  zone_arena_free_builder(arena);
+  free(arena->glue);
+  arena->glue = NULL;
   arena->rcache_ok = false;
   atomic_store_explicit(&arena->generation, 0, memory_order_relaxed);
-  zone_arena_free_include_buffers(arena);
 }
 uint32_t calc_fnv1a_str(const char *str) {
   uint32_t hash = 2166136261u;

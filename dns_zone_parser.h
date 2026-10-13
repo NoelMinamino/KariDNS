@@ -59,12 +59,16 @@ typedef struct {
     uint8_t prefix_bits; /* 0..32: CIDR prefix length in bits (prefix[] holds the masked network) */
 } tinydns_location_entry_t;
 
-typedef struct {
-  char *target_name;
-  dns_record_t **records;
-  int record_count;
-} prelinked_glue_entry_t;
-
+/* S2 / S5 B-2: the sibling zones whose addresses a zone's Additional sections may use (additional-from-auth yes).
+ * One malloc block (ids, targets and the target strings follow the struct). The zone data itself is read from the image;
+ * this is the only mutable state kept next to it: zone_glue_refresh_dependents() (control thread, writer_lock) rewrites
+ * ids[] and built_at after the zone was published. */
+typedef struct zone_glue_s {
+  uint64_t built_at;     /* the global publish counter when the siblings were looked up */
+  int count;
+  uint64_t *ids;         /* per target: id of the zone it resolved to in the view (0 = none / the zone itself) */
+  const char **targets;  /* per target: name of an NS / MX / SRV target (first MAX_PRELINK_TARGETS distinct, in file order) */
+} zone_glue_t;
 
 /* RFC 5155 §3.1.7: one NSEC3 RR of a chain, keyed by the hashed owner name (the owner's first label, base32hex;
  * RFC 5155 §2 "hash order" = canonical order of the base32hex labels, compared case-insensitively). */
@@ -134,19 +138,11 @@ typedef struct zone_arena_s {
   char **bind_ecs_trusted_resolvers;      /* AXFR(拡張モード)で受信した値、NULL可 */
   int bind_ecs_trusted_resolver_count;
   acl_entry_t *bind_ecs_trusted_resolvers_parsed;
-  /* 事前リンクされた Additional グルー。このゾーン自身のアドレスだけを値で持つ。兄弟ゾーンの
-   * アドレスは応答のたびにその兄弟ゾーンから引く (S2: 兄弟が変わっても複製を作り直さない) */
-  prelinked_glue_entry_t *prelinked_glue;
-  int prelinked_glue_count;
-  bool glue_external;      /* glue_targets がある */
-  /* S2: グルーの対象名のうち、view で引くと自分以外のゾーン (または無し) になるもの。
-   * 名前は records の rdata を指す。glue_target_ids はそのとき引けたゾーンの id (無ければ 0)、
-   * glue_built_at はそれを調べた時点の公開カウンタ。兄弟ゾーンの id か公開順が変わったら、
-   * このゾーンの応答 (兄弟のアドレスを含みうる) の版を上げる。公開後は制御スレッドだけが書く。 */
-  const char **glue_targets;
-  uint64_t *glue_target_ids;
-  int glue_target_count;
-  uint64_t glue_built_at;
+  /* S2: グルーの対象名のうち、view で引くと自分以外のゾーン (または無し) になるもの。兄弟ゾーンの id か
+   * 公開順が変わったら、このゾーンの応答 (兄弟のアドレスを含みうる) の版を上げる。NULL = 兄弟のアドレスを使わない。
+   * 公開後は制御スレッドだけが書く (イメージには入れない)。S5 B-2 以降、公開した版の arena が持つのは
+   * image / generation / rcache_ok / glue だけで、レコード・プール・索引・ゾーンファイルの本文は公開の前に解放する */
+  zone_glue_t *glue;
   bool rcache_ok;          /* このゾーンの応答を共有の応答キャッシュに入れてよい */
   /* S5 phase B: 公開する版のコンパクトなイメージ (dns_zone_image.h)。応答を作る側はこれだけを読む。
    * zone_image_freeze() が公開の直前に作り、zone_arena_destroy() が解放する (1 回の malloc なので free()) */
@@ -171,6 +167,9 @@ dns_record_t *arena_alloc_record(zone_arena_t *arena, parse_context_t *ctx, cons
 bool arena_record_alloc_rdata(zone_arena_t *arena, dns_record_t *rec, int n);
 void zone_arena_init(zone_arena_t *arena);
 void zone_arena_destroy(zone_arena_t *arena);
+/* S5 B-2: free the builder side of an arena once its image is made: records, data pools, indexes, zone level tables and
+ * the kept zone file text. image, glue, rcache_ok and generation are kept. */
+void zone_arena_free_builder(zone_arena_t *arena);
 void zone_arena_free_include_buffers(zone_arena_t *arena);
 /* 公開直前に呼ぶ: 応答キャッシュに入れてよいか (rcache_ok) を決める */
 void build_zone_response_cache(zone_arena_t *arena, struct server_config_s *cfg, const char *view_name, const char *domain);

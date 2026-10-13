@@ -307,7 +307,7 @@ STATIC_TEST bool append_glue_records(const zone_image_t *img, const char *target
   if (!img || !target || policy == ADDITIONAL_AUTH_NO) return true;
   uint32_t id = zone_image_find_name(img, target);
 
-  // 1. Fast path: the prelinked glue (prelink_zone_additional_glue(): this zone's own A/AAAA of a NS/MX/SRV target,
+  // 1. Fast path: the prelinked glue (zone_glue_track_build(): this zone's own A/AAAA of a NS/MX/SRV target,
   //    the RRs in zone order). It carries no RRSIGs, so DO=1 takes the lookup below (R-03).
   if (!dnssec_ok && id != ZONE_IMAGE_NONE && (zone_image_name_flags(img, id) & ZONE_IMAGE_NAME_GLUE) &&
       (policy != ADDITIONAL_AUTH_IN_DOMAIN || domain_name_is_at_or_below(target, zone_apex))) {
@@ -319,7 +319,7 @@ STATIC_TEST bool append_glue_records(const zone_image_t *img, const char *target
     int linked = 0;
     for (; k < end; k++) {
       if (rrs[k].type != 1 && rrs[k].type != 28) continue;
-      if (++linked > 32) break; // MAX_MATCH_RECS of prelink_zone_additional_glue()
+      if (++linked > 32) break; // MAX_MATCH_RECS of zone_glue_track_build()
       uint32_t eff_ttl;
       if (!rr_valid(img, k, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
       if (image_serialize_rr(img, k, res, max_res_len, offset, comp_ctx, NULL, eff_ttl) < 0) {
@@ -786,14 +786,14 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
       tinydns_now = time(NULL);
     }
     char client_loc[2] = {0, 0};
-    tinydns_resolve_client_location(current_zone, client_ip, client_loc);
+    tinydns_resolve_client_location(img, client_ip, client_loc);
 
     zone_config_t *zcfg = (cfg && db_entry) ? find_zone_config_in_view(cfg, db_entry->view_name, db_entry->domain) : NULL;
-    const char *client_loc_tag = resolve_bind_location_tag(current_zone, cfg, zcfg, client_ip);
+    const char *client_loc_tag = resolve_bind_location_tag(img, cfg, zcfg, client_ip);
     const char *client_ecs_tag = NULL;
     uint8_t zone_scope = 0;
     if (ecs_trusted && ecs_addr) {
-      client_ecs_tag = resolve_ecs_subnet_tag(current_zone, cfg, zcfg, ecs_addr, ecs_family, &zone_scope);
+      client_ecs_tag = resolve_ecs_subnet_tag(img, cfg, zcfg, ecs_addr, ecs_family, &zone_scope);
     }
 
     // ==== フェーズ1: 委任判定 ====
@@ -2427,9 +2427,14 @@ void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const 
   const zone_image_t *img = arena->image; /* zone_image_freeze() の後で呼ぶ */
   if (!img || img->n_rrs == 0) return;
   if (img->flags & ZONE_IMAGE_F_TINYDNS) return;
-  if (arena->locations != NULL && arena->location_count > 0) return;
-  if (arena->bind_location_tags != NULL && arena->bind_location_tag_count > 0) return;
-  if (arena->bind_ecs_tags != NULL && arena->bind_ecs_tag_count > 0) return;
+  if (zone_image_has_zattr(img)) { /* tinydns locations, $LOCATION / $ECS-SUBNET tag definitions: the answer depends on the client (trusted resolvers alone do not) */
+    int nloc = 0;
+    zone_image_tags_t lt, et;
+    (void)zone_image_locations(img, &nloc);
+    zone_image_tags_open(img, ZONE_IMAGE_TAGS_LOCATION, &lt);
+    zone_image_tags_open(img, ZONE_IMAGE_TAGS_ECS, &et);
+    if (nloc > 0 || lt.left > 0 || et.left > 0) return;
+  }
   if (cfg && cfg->wire_cache_max_records > 0 && img->n_rrs > cfg->wire_cache_max_records) return;
 
   // O-07: 同じゾーン名が別の view にもあるので、このエントリの view の設定を見る
@@ -3184,7 +3189,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   uint32_t qtx_included = 0;
   zone_config_t *zcfg = (db_entry && view) ? find_zone_config_in_view(cfg, view->name, db_entry->domain) : NULL;
   bool ecs_trusted = (cfg && cfg->ecs_enable && edns.has_ecs && client_ip &&
-                      is_ecs_trusted_resolver(current_zone, cfg, zcfg, client_ip));
+                      is_ecs_trusted_resolver(current_zone ? current_zone->image : NULL, cfg, zcfg, client_ip));
   t_resolve_crossed_zone = false;
   resolve_name(current_qname, qclass, qtypes, num_qtypes, &db_entry, &current_zone, res, body_max_len,
                &offset, comp_ctx, &ancount, &nscount, &arcount,

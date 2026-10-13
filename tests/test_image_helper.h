@@ -95,4 +95,21 @@ static inline zone_image_t *test_image_of_record(const dns_record_t *rec) {
     return img;
 }
 
+/* S5 B-2: the zone level tables (locations, tag definitions, trusted resolvers) are read from the image. A test that
+ * sets them by hand on a zone_arena_t gets an image of them here (a single static slot, replaced by the next call;
+ * the arena keeps its own table pointers and is not modified apart from a transient index). */
+static inline const zone_image_t *test_zimg(zone_arena_t *a) {
+    static zone_image_t *slot;
+    free(slot);
+    slot = NULL;
+    if (!a) return NULL;
+    int rc = build_zone_index(a, false);
+    if (rc == 0) slot = zone_image_freeze(a, NULL);
+    free(a->hash_table);
+    a->hash_table = NULL;
+    a->hash_size = 0;
+    zone_arena_free_sorted_indexes(a);
+    return slot;
+}
+
 #endif

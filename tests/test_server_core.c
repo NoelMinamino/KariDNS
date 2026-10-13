@@ -2908,7 +2908,7 @@ static long rl_zone_serial(const char *domain) {
     retain_zone_snapshot(snap);
     zone_db_entry_t *e = snap ? snapshot_get_zone_in_view(snap, "default", domain) : NULL;
     zone_arena_t *a = e ? atomic_load_explicit(&e->rcu.active, memory_order_acquire) : NULL;
-    long serial = (a && a->count > 0) ? (long)e->serial : -1;
+    long serial = (a && a->image && a->image->n_rrs > 0) ? (long)e->serial : -1;
     release_zone_snapshot(snap);
     return serial;
 }

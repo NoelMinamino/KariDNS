@@ -19,6 +19,10 @@
 #include "dns_config_parser.h"
 #include "dns_zone_parser.h"
 #include "dns_zone_image.h"
+#include "test_image_helper.h"
+/* S5 B-2: the transfer code reads the published image, so every hand-built zone of these tests is frozen once it is
+ * indexed (what the loaders do before they publish) */
+#define build_zone_index test_build_index
 #include "dns_snapshot_rcu.h"
 #include "dns_epoch_rcu.h"
 #include "dns_axfr_ixfr.h"
@@ -141,6 +145,8 @@ static void init_axfr_zone(zone_arena_t *arena, const char *domain, const char *
     assert(parsed >= 0);
     int b_rc = build_zone_index(arena, true);
     assert(b_rc == 0);
+    arena->image = zone_image_freeze(arena, domain); /* S5 B-2: AXFR out reads the image */
+    assert(arena->image != NULL);
 }
 
 // ----------------------------------------------------------------------------
@@ -171,6 +177,18 @@ static void test_wait_for_active_axfr_branches(void) {
 // ----------------------------------------------------------------------------
 // 2. compute_ixfr_diff Tests
 // ----------------------------------------------------------------------------
+/* S5 B-2: compute_ixfr_diff() compares the images of the two versions. These tests hand-build the two builders, so
+ * index and freeze them (with the zone's name as apex) before the call. */
+static void test_ixfr_diff_of_builders(zone_db_entry_t *e, zone_arena_t *o, zone_arena_t *n) {
+    zone_arena_t *v[2] = { o, n };
+    for (int i = 0; i < 2; i++) {
+        if (!v[i]->hash_table) build_zone_index(v[i], false);
+        free(v[i]->image);
+        v[i]->image = v[i]->hash_table ? zone_image_freeze(v[i], e->domain) : NULL;
+    }
+    compute_ixfr_diff(e, o, n);
+}
+#define compute_ixfr_diff test_ixfr_diff_of_builders
 static void test_compute_ixfr_diff(void) {
     printf("[TEST] AXFR/IXFR: compute_ixfr_diff & history ring buffer...\n");
     zone_db_entry_t entry;
@@ -301,10 +319,14 @@ static void test_compute_ixfr_diff_generic_and_edge_cases(void) {
     soa1.ttl_value = 3600;
     soa1.class_str = arena_strdup(&arena_v1, "IN");
     soa1.class_val = 1;
-    soa1.rdata_count = 3;
+    soa1.rdata_count = 7; /* S5 B-2: the diff compares images, so the SOA must be one serialize_dns_record() can write */
     soa1.rdata[0] = arena_strdup(&arena_v1, "ns1.example.org.");
     soa1.rdata[1] = arena_strdup(&arena_v1, "hostmaster.example.org.");
     soa1.rdata[2] = arena_strdup(&arena_v1, "500");
+    soa1.rdata[3] = arena_strdup(&arena_v1, "7200");
+    soa1.rdata[4] = arena_strdup(&arena_v1, "3600");
+    soa1.rdata[5] = arena_strdup(&arena_v1, "1209600");
+    soa1.rdata[6] = arena_strdup(&arena_v1, "300");
     arena_v1.records[0] = soa1;
     arena_v1.count = 1;
     build_zone_index(&arena_v1, true);
@@ -1016,7 +1038,7 @@ static void test_handle_axfr_event_multi_message_and_tsig(void) {
     assert(entry.serial == 200);
     {   /* S5 B-1: the transferred version is published with the image the engine reads */
         zone_arena_t *cur = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
-        assert(cur == &entry.rcu.arena_b && cur->image != NULL && cur->image->n_rrs == cur->count);
+        assert(cur == &entry.rcu.arena_b && cur->image != NULL && cur->image->n_rrs == 1 && cur->count == 0 /* the builder is freed after publishing */);
         uint32_t soa_id = zone_image_find_name(cur->image, "multi.example.");
         assert(soa_id != ZONE_IMAGE_NONE);
         uint32_t soa_rr = zone_image_rrset_next(cur->image, soa_id, 6, zone_image_name_first_rr(cur->image, soa_id));
@@ -1045,6 +1067,73 @@ static void test_handle_axfr_event_multi_message_and_tsig(void) {
     pthread_mutex_destroy(&entry.ixfr_history.lock);
 
     printf("  -> handle_axfr_event_multi_message_and_tsig passed.\n");
+}
+
+/* append one RR (owner, type, class IN, TTL 60, RDATA) to a message being built; returns the new offset */
+static size_t xfr_put_rr(uint8_t *p, size_t cap, size_t off, const char *owner, uint16_t type, const uint8_t *rd, uint16_t rdlen) {
+    off += write_uncompressed_name(p, off, cap, owner);
+    p[off++] = type >> 8; p[off++] = type & 0xFF; p[off++] = 0; p[off++] = 1;
+    p[off++] = 0; p[off++] = 0; p[off++] = 0; p[off++] = 60;
+    p[off++] = rdlen >> 8; p[off++] = rdlen & 0xFF;
+    if (rdlen) memcpy(p + off, rd, rdlen);
+    return off + rdlen;
+}
+
+/* S5 B-2: an RR of a transfer that cannot be written in wire format (a TXT with no RDATA) is dropped with a warning,
+ * the rest of the zone is published. */
+static void test_handle_axfr_event_drops_unencodable(void) {
+    printf("[TEST] AXFR/IXFR: AXFR-in drops an RR that cannot be encoded and applies the rest...\n");
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "drop.example.", sizeof(entry.domain));
+    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+    init_axfr_zone(&entry.rcu.arena_a, "drop.example.", "100");
+    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+    atomic_store_explicit(&entry.serial, 100, memory_order_release);
+
+    uint8_t soa_rd[128];
+    size_t sl = 0;
+    sl += write_uncompressed_name(soa_rd, sl, sizeof(soa_rd), "ns1.drop.example.");
+    sl += write_uncompressed_name(soa_rd, sl, sizeof(soa_rd), "admin.drop.example.");
+    soa_rd[sl++] = 0; soa_rd[sl++] = 0; soa_rd[sl++] = 0; soa_rd[sl++] = 200;
+    for (int k = 0; k < 4; k++) { soa_rd[sl++] = 0; soa_rd[sl++] = 0; soa_rd[sl++] = 0; soa_rd[sl++] = 10; }
+    static const uint8_t a_rd[4] = { 192, 0, 2, 1 };
+
+    uint8_t p1[1024] = {0};
+    p1[0] = 0x11; p1[1] = 0x23; p1[2] = 0x84;
+    p1[5] = 1; p1[7] = 4; // QDCOUNT=1, ANCOUNT=4: SOA, A, bad TXT, SOA
+    size_t off = 12;
+    off += write_uncompressed_name(p1, off, sizeof(p1), "drop.example.");
+    p1[off++] = 0; p1[off++] = 252; p1[off++] = 0; p1[off++] = 1;
+    off = xfr_put_rr(p1, sizeof(p1), off, "drop.example.", 6, soa_rd, (uint16_t)sl);
+    off = xfr_put_rr(p1, sizeof(p1), off, "www.drop.example.", 1, a_rd, 4);
+    off = xfr_put_rr(p1, sizeof(p1), off, "bad.drop.example.", 16, NULL, 0);
+    off = xfr_put_rr(p1, sizeof(p1), off, "drop.example.", 6, soa_rd, (uint16_t)sl);
+
+    tcp_stream_ctx_t stream_ctx;
+    memset(&stream_ctx, 0, sizeof(stream_ctx));
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+    reset_mock_tcp_stream();
+    push_mock_tcp_msg(p1, (uint16_t)off);
+    session.query_id = 0x1123; session.query_type = 252;
+    assert(handle_axfr_event(-1, &entry, &stream_ctx, &session, NULL, NULL, 0) == 1);
+    assert(entry.serial == 200);
+    zone_arena_t *cur = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
+    assert(cur == &entry.rcu.arena_b && cur->image != NULL);
+    assert(cur->image->n_rrs == 2);   /* SOA + www A; the TXT is gone */
+    assert(zone_image_find_name(cur->image, "www.drop.example.") != ZONE_IMAGE_NONE);
+    assert(zone_image_find_name(cur->image, "bad.drop.example.") == ZONE_IMAGE_NONE);
+    assert(cur->records == NULL && cur->hash_table == NULL && cur->data_pool_count == 0 && cur->file_buf_count == 0);
+
+    zone_arena_destroy(&entry.rcu.arena_a);
+    zone_arena_destroy(&entry.rcu.arena_b);
+    pthread_mutex_destroy(&entry.writer_lock);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    printf("  -> AXFR-in unencodable RR dropped passed.\n");
 }
 
 // ----------------------------------------------------------------------------
@@ -3783,6 +3872,7 @@ static void test_axfr_ixfr_send_axfr_response_extended_trusted_resolvers(void) {
     char *trusted[2] = { "192.0.2.1/32", "198.51.100.0/24" };
     entry.rcu.arena_a.bind_ecs_trusted_resolvers = trusted;
     entry.rcu.arena_a.bind_ecs_trusted_resolver_count = 2;
+    assert(test_freeze(&entry.rcu.arena_a) == 0); /* the tables are read from the image */
     atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
     
     uint8_t req[512] = {0};
@@ -5916,6 +6006,8 @@ static void p10_init_zone(zone_arena_t *arena, const char *domain, const char *s
     char *buf = arena_strdup(arena, text);
     assert(parse_zone_fast(buf, strlen(buf), arena, &ctx) >= 0);
     assert(build_zone_index(arena, true) == 0);
+    arena->image = zone_image_freeze(arena, domain); /* S5 B-2: AXFR out reads the image */
+    assert(arena->image != NULL);
 }
 
 /* AXFR/IXFR query. serial < 0: no SOA in Authority. edns: OPT, ext: with Option 65153. */
@@ -6094,11 +6186,16 @@ static void test_p10_extended_ixfr(void) {
     assert(m.an == 1 && m.soa[0] == 101);
     /* with tag definitions the zone needs the extension: full Extended AXFR (SOA first, no old SOA) */
     zone_arena_t *cur = &e.rcu.arena_a;
-    cur->bind_ecs_trusted_resolver_count = 1; /* trusted ECS resolvers travel only in Extended AXFR */
+    char *trusted_list[1] = { "192.0.2.53" };
+    cur->bind_ecs_trusted_resolvers = trusted_list; /* trusted ECS resolvers travel only in Extended AXFR */
+    cur->bind_ecs_trusted_resolver_count = 1;
+    assert(test_freeze(cur) == 0);
     ql = p10_query(q, sizeof(q), "x24.example.", 251, 100, true, true);
     p10_send(&e, q, ql); m = p10_first_msg();
     assert(m.rcode == 0 && m.soa[0] == 101 && (m.soa_count < 2 || m.soa[1] == 101));
+    cur->bind_ecs_trusted_resolvers = NULL;
     cur->bind_ecs_trusted_resolver_count = 0;
+    assert(test_freeze(cur) == 0);
     /* plain IXFR (no Option 65153) is unchanged: differences */
     ql = p10_query(q, sizeof(q), "x24.example.", 251, 100, true, false);
     p10_send(&e, q, ql); m = p10_first_msg();
@@ -6292,7 +6389,8 @@ static void test_axfr_ixfr_feature_case_158(void) {
     /* 複製して複製元を解放しても、複製先は同じ内容 */
     memset(&b, 0, sizeof(b));
     zone_arena_init(&b);
-    clone_zone_arena(&a, &b);
+    assert(test_freeze(&a) == 0);
+    assert(thaw_zone_arena(&a, &b) == 0);
     assert(b.count == a.count);
     for (size_t i = 0; i < a.count; i++) {
         assert(b.records[i].rdata_count == a.records[i].rdata_count);
@@ -6378,6 +6476,7 @@ int main(void) {
     test_send_axfr_response_large_multi_chunk_tsig();
     test_send_axfr_response_error_and_edge_branches();
     test_handle_axfr_event_multi_message_and_tsig();
+    test_handle_axfr_event_drops_unencodable();
     test_handle_axfr_event_intermediate_unsigned_flow();
     test_handle_axfr_event_and_worker_thread();
     test_axfr_bg_thread_and_free_ixfr_txn();

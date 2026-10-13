@@ -101,9 +101,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     // Fuzz dynamic update handling
     handle_dynamic_update(data, size, &entry, "127.0.0.1", "key-admin");
 
-    /* S5 B-1: every published version carries the image the engine reads, and it holds exactly the builder's RRs */
+    /* S5 B-1: every published version carries the image the engine reads. B-2: the version an UPDATE published has
+     * no builder any more; the hand-built initial one (arena_a, an UPDATE that changed nothing) still holds its RRs */
     zone_arena_t *published = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
-    assert(published->image != NULL && published->image->n_rrs == published->count);
+    assert(published->image != NULL);
+    assert(published == &entry.rcu.arena_a ? published->image->n_rrs == published->count
+                                           : (published->count == 0 && published->records == NULL));
 
     /* X-35: an applied update records its IXFR difference in entry.ixfr_history (compute_ixfr_diff()); the
      * server keeps it for the life of the zone, this per-input entry must release it or every applied update

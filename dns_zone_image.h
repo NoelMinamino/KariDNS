@@ -37,6 +37,7 @@
 #define ZONE_IMAGE_F_EXT     0x2u /* at least one RR has an ext[] entry */
 #define ZONE_IMAGE_F_WILDCARD 0x4u /* some owner is a wildcard (first label "*"): lets the engine skip the wildcard search of a zone without one */
 #define ZONE_IMAGE_F_DNAME    0x8u /* some owner has a DNAME RRset: lets the engine skip the DNAME search of a zone without one */
+#define ZONE_IMAGE_F_PERM     0x10u /* the file (builder) order of the RRs differs from the image order: perm[] lists the RR indexes in that order (AXFR out and thaw use it) */
 
 /* zone_image_name_t.rr_count_flags: low 24 bits RR count, high 8 bits flags */
 #define ZONE_IMAGE_NAME_COUNT_MASK 0x00FFFFFFu
@@ -45,7 +46,7 @@
 #define ZONE_IMAGE_NAME_DNAME      (1u << 26) /* DNAME RRset */
 #define ZONE_IMAGE_NAME_APEX       (1u << 27)
 #define ZONE_IMAGE_NAME_NSEC       (1u << 28) /* has an NSEC RR */
-#define ZONE_IMAGE_NAME_GLUE       (1u << 29) /* prelinked glue target: among the first MAX_PRELINK_TARGETS (256) distinct NS/MX/SRV targets in record order and has A/AAAA RRs here (what prelink_zone_additional_glue() links); the engine answers it with the RRs in RR order (see append_glue_records) */
+#define ZONE_IMAGE_NAME_GLUE       (1u << 29) /* prelinked glue target: among the first MAX_PRELINK_TARGETS (256) distinct NS/MX/SRV targets in record order and has A/AAAA RRs here (what zone_glue_track_build() links); the engine answers it with the RRs in RR order (see append_glue_records) */
 
 /* zone_image_rr_t.flags */
 #define ZONE_IMAGE_RR_RAW        0x1u /* RDATA written as is (generic_data / KARIDNS_EXT class): never compressed */
@@ -108,6 +109,7 @@ typedef struct zone_image_s {
     uint32_t n_names, n_rrs, n_ext, n_canon, n_nsec, n_n3chains, n_n3entries, n_glue, hash_size;
     uint32_t off_names, off_rrs, off_ext, off_hash, off_canon, off_nsec, off_n3chains, off_n3entries, off_glue,
              off_zattr, off_strings;
+    uint32_t off_perm;      /* RR indexes in builder (file) order, 0 = same as the image order (ZONE_IMAGE_F_PERM) */
     uint32_t zattr_len;
     uint32_t apex_name;     /* name id of the apex, ZONE_IMAGE_NONE when the zone has no data at the apex */
     uint32_t n3_param_rr;   /* the NSEC3PARAM RR the denial proofs use (nsec3_params_t.param), ZONE_IMAGE_NONE */
@@ -116,6 +118,7 @@ typedef struct zone_image_s {
     uint16_t n3_iterations;
     uint8_t n3_algorithm;
     uint8_t n3_salt_len;
+    uint32_t reserved_;
 } zone_image_t;
 
 /* ---- build and release (load path, not the query path: these allocate) ---- */
@@ -126,7 +129,7 @@ typedef struct zone_image_s {
  * with syslog); the builder is not modified. */
 zone_image_t *zone_image_freeze(const zone_arena_t *builder, const char *apex);
 void zone_image_free(zone_image_t *img);
-/* Rebuild a builder from an image: records in image order (RRs of one owner together, file order within it),
+/* Rebuild a builder from an image: records in file order (zone_image_seq_rr(); the order the zone was frozen in),
  * text RDATA made from the wire form the way AXFR / UPDATE records are (parse_resource_record()), tinydns / tag
  * extras and the zone level tables restored, indexes built (build_zone_index(builder, false)). `builder` must be
  * a zone_arena_init()ed, empty arena. 0 = success. */
@@ -273,5 +276,40 @@ uint32_t zone_image_n3chain_lower_bound(const zone_image_t *img, uint32_t c, con
  *      first appearance. The addresses are the A / AAAA RRs of the name (type 1 / 28 in its RR range). ---- */
 static inline uint32_t zone_image_glue_count(const zone_image_t *img) { return img->n_glue; }
 static inline uint32_t zone_image_glue_name(const zone_image_t *img, uint32_t i) { return zone_image_u32s(img, img->off_glue)[i]; }
+
+/* ---- file order of the RRs ----
+ * The RRs of one owner are contiguous in the image (rrs[]); the file (builder) order may interleave owners.
+ * Phase A wrote an AXFR in builder order, and thaw gives an UPDATE the builder it had before, so both walk the RRs in
+ * this order: seq 0 .. n_rrs - 1 (zone_image_seq_rr()). It is the identity unless ZONE_IMAGE_F_PERM is set. */
+static inline uint32_t zone_image_seq_rr(const zone_image_t *img, uint32_t seq) {
+    return img->off_perm ? zone_image_u32s(img, img->off_perm)[seq] : seq;
+}
+/* The apex SOA RR (first in file order), ZONE_IMAGE_NONE when there is none. */
+uint32_t zone_image_apex_soa(const zone_image_t *img);
+
+/* ---- zone level tables: tinydns locations, $LOCATION-TAG / $ECS-SUBNET-TAG definitions, ECS trusted resolvers
+ *      (stored in the image's zattr area; nothing is allocated when they are read) ---- */
+const tinydns_location_entry_t *zone_image_locations(const zone_image_t *img, int *count);
+#define ZONE_IMAGE_TAGS_LOCATION 0
+#define ZONE_IMAGE_TAGS_ECS      1
+/* cursor over the tag definitions of one table, and over the CIDRs of one tag */
+typedef struct { const uint8_t *p, *end; uint32_t left; } zone_image_tags_t;
+typedef struct { const char *tag; uint32_t cidr_count; const uint8_t *p, *end; uint32_t left; } zone_image_tag_t;
+/* it->left is the number of definitions */
+void zone_image_tags_open(const zone_image_t *img, int kind, zone_image_tags_t *it);
+/* next definition (false at the end); the CIDRs of `tag` are read with zone_image_tag_next_cidr() */
+bool zone_image_tags_next(zone_image_tags_t *it, zone_image_tag_t *tag);
+/* next CIDR of the tag: its text (NULL when the definition has none) and the parsed form */
+bool zone_image_tag_next_cidr(zone_image_tag_t *tag, const char **cidr, cidr_entry_t *parsed);
+/* ECS trusted resolvers of the zone (Extended AXFR): parsed ACL (count entries, 8-aligned in the image), NULL/0 when none */
+const acl_entry_t *zone_image_ecs_trusted(const zone_image_t *img, int *count);
+/* True when the image has any zone level table */
+bool zone_image_has_zattr(const zone_image_t *img);
+/* Copy the zone level tables into the builder `a` (heap copies, freed by zone_arena_destroy()); used by Extended AXFR out. 0 = ok */
+int zone_image_zattr_load(const zone_image_t *img, zone_arena_t *a);
+
+/* One RR as a builder record, the way thaw makes it, in `arena` (strings and RDATA are allocated there). The record is
+ * not linked into the arena's record array. 0 = ok, -1 = cannot be decoded. Load path only (allocates). */
+int zone_image_rr_to_record(const zone_image_t *img, uint32_t rr, zone_arena_t *arena, dns_record_t *rec);
 
 #endif

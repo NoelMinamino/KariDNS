@@ -296,7 +296,7 @@ static void test_handle_dynamic_update_pipeline(void) {
 
     // Verify record in active arena (arena_b)
     zone_arena_t *z_cur = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
-    assert(z_cur->count == 2);
+    assert(z_cur->count == 0); /* S5 B-2: the builder is freed after publishing */
     /* S5 B-1: the published version carries the image the engine reads, with the added RR in it */
     assert(z_cur->image != NULL && z_cur->image->n_rrs == 2);
     uint32_t www_id = zone_image_find_name(z_cur->image, "www.example.com.");
@@ -335,6 +335,61 @@ static void test_handle_dynamic_update_pipeline(void) {
     pthread_mutex_destroy(&entry.ixfr_history.lock);
 
     printf("  -> handle_dynamic_update pipeline passed.\n");
+}
+
+/* S5 B-2: an RR of an UPDATE that cannot be written in wire format (a TXT with no RDATA, RFC 1035 §3.3.14 wants at
+ * least one character-string) is dropped with a warning and the rest of the UPDATE is applied. */
+static void test_handle_dynamic_update_drops_unencodable(void) {
+    printf("[TEST] Dynamic Update: an RR that cannot be encoded is dropped, the rest is applied...\n");
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strncpy(entry.domain, "example.com.", sizeof(entry.domain) - 1);
+    strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+    init_sample_zone_arena(&entry.rcu.arena_a, "example.com.", "1000");
+    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+    atomic_store_explicit(&entry.serial, 1000, memory_order_release);
+
+    uint8_t pkt[512] = {0};
+    pkt[0] = 0x12; pkt[1] = 0x35;
+    pkt[2] = 0x28; // UPDATE
+    pkt[5] = 1;    // ZOCOUNT=1
+    pkt[9] = 2;    // UPCOUNT=2
+    size_t off = 12;
+    static const uint8_t zname[] = { 7, 'e','x','a','m','p','l','e', 3, 'c','o','m', 0 };
+    memcpy(&pkt[off], zname, sizeof(zname)); off += sizeof(zname);
+    pkt[off++] = 0; pkt[off++] = 6; pkt[off++] = 0; pkt[off++] = 1; // SOA IN
+    // 1. add www.example.com. A 192.0.2.7
+    pkt[off++] = 3; memcpy(&pkt[off], "www", 3); off += 3;
+    memcpy(&pkt[off], zname, sizeof(zname)); off += sizeof(zname);
+    pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0; pkt[off++] = 1;
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0x2C;
+    pkt[off++] = 0; pkt[off++] = 4;
+    pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = 7;
+    // 2. add bad.example.com. TXT with RDLENGTH 0
+    pkt[off++] = 3; memcpy(&pkt[off], "bad", 3); off += 3;
+    memcpy(&pkt[off], zname, sizeof(zname)); off += sizeof(zname);
+    pkt[off++] = 0; pkt[off++] = 16; pkt[off++] = 0; pkt[off++] = 1;
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0x2C;
+    pkt[off++] = 0; pkt[off++] = 0;
+
+    assert(handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "key") == 0);
+    assert(atomic_load_explicit(&entry.serial, memory_order_acquire) == 1001);
+    zone_arena_t *cur = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
+    assert(cur != &entry.rcu.arena_a && cur->image != NULL);
+    assert(cur->image->n_rrs == 2);   /* SOA + www A: the TXT was dropped, the A applied */
+    uint32_t id = zone_image_find_name(cur->image, "www.example.com.");
+    assert(id != ZONE_IMAGE_NONE && zone_image_rrset_next(cur->image, id, 1, zone_image_name_first_rr(cur->image, id)) != ZONE_IMAGE_NONE);
+    assert(zone_image_find_name(cur->image, "bad.example.com.") == ZONE_IMAGE_NONE);
+    assert(cur->records == NULL && cur->hash_table == NULL && cur->data_pool_count == 0); /* builder freed */
+
+    zone_arena_destroy(&entry.rcu.arena_a);
+    zone_arena_destroy(&entry.rcu.arena_b);
+    pthread_mutex_destroy(&entry.writer_lock);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    printf("  -> unencodable UPDATE RR dropped passed.\n");
 }
 
 static void test_send_notify_to_all_comprehensive(void) {
@@ -995,6 +1050,24 @@ static const dns_record_t *upd_get(const zone_arena_t *a, const char *name, uint
     return NULL;
 }
 
+/* S5 B-2: a published version has no builder, only its image */
+static int upd_img_count(const zone_arena_t *a, const char *name, uint16_t type) {
+    uint32_t id = zone_image_find_name(a->image, name);
+    int n = 0;
+    if (id == ZONE_IMAGE_NONE) return 0;
+    for (uint32_t k = zone_image_rrset_next(a->image, id, type, zone_image_name_first_rr(a->image, id)); k != ZONE_IMAGE_NONE;
+         k = zone_image_rrset_next(a->image, id, type, k + 1))
+        n++;
+    return n;
+}
+
+static uint32_t upd_img_serial(const zone_arena_t *a) {
+    zone_image_soa_t nums;
+    uint32_t rr = zone_image_apex_soa(a->image);
+    assert(rr != ZONE_IMAGE_NONE && zone_image_soa(a->image, rr, NULL, 0, NULL, 0, &nums) == 0);
+    return nums.serial;
+}
+
 typedef struct {
     uint8_t b[2048];
     size_t len;
@@ -1452,8 +1525,8 @@ static void test_handle_dynamic_update_serial_rules(void) {
     zone_arena_t *cur = atomic_load(&entry.rcu.active);
     assert(cur == &entry.rcu.arena_b);
     assert(atomic_load(&entry.serial) == 500);
-    assert(upd_count(cur, UZ, 6) == 1 && strcmp(upd_get(cur, UZ, 6)->rdata[2], "500") == 0);
-    assert(upd_count(cur, "new." UZ, 1) == 1);
+    assert(upd_img_count(cur, UZ, 6) == 1 && upd_img_serial(cur) == 500);
+    assert(upd_img_count(cur, "new." UZ, 1) == 1);
     assert(atomic_load(&entry.notify_now));
 
     /* a change without SOA: the server increments the serial */
@@ -1462,7 +1535,7 @@ static void test_handle_dynamic_update_serial_rules(void) {
     assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 0);
     cur = atomic_load(&entry.rcu.active);
     assert(atomic_load(&entry.serial) == 501);
-    assert(strcmp(upd_get(cur, UZ, 6)->rdata[2], "501") == 0);
+    assert(upd_img_serial(cur) == 501);
 
     /* an error after a valid RR: nothing applied (§3.4.2.1 / atomic update) */
     upd_begin(&m);
@@ -1470,23 +1543,25 @@ static void test_handle_dynamic_update_serial_rules(void) {
     upd_rr(&m, false, "www." UZ, 1, 255, 5, NULL, 0); // class ANY with TTL != 0 -> FORMERR
     assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 1);
     assert(atomic_load(&entry.rcu.active) == cur);
-    assert(upd_count(cur, "new3." UZ, 1) == 0);
+    assert(upd_img_count(cur, "new3." UZ, 1) == 0);
     assert(atomic_load(&entry.serial) == 501);
 
-    /* X-17: the serial cannot be incremented (here no apex SOA in the copy; an arena allocation failure in
-     * bump_soa_serial_in_arena() takes the same branch): SERVFAIL, nothing published, serial unchanged,
-     * no NOTIFY (RFC 2136 §3.6: a changed zone must get a new serial). */
-    dns_record_t *apex_soa = (dns_record_t *)upd_get(cur, UZ, 6); // the test changes the copy source
-    apex_soa->type_code = 99;
+    /* X-17: the serial cannot be incremented (here no apex SOA in the copy: the spelling of the apex in the image
+     * the copy is thawed from is changed; an arena allocation failure in bump_soa_serial_in_arena() takes the same
+     * branch): SERVFAIL, nothing published, serial unchanged, no NOTIFY (RFC 2136 §3.6: a changed zone must get a
+     * new serial). */
+    char *apex_text = (char *)zone_image_name_text(cur->image, cur->image->apex_name); // the test changes the copy source
+    char apex_first = apex_text[0];
+    apex_text[0] = 'X';
     atomic_store(&entry.notify_now, false);
     upd_begin(&m);
     upd_a(&m, false, "new4." UZ, 1, 300, 23);
     assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 2);
     assert(atomic_load(&entry.rcu.active) == cur);
-    assert(upd_count(cur, "new4." UZ, 1) == 0);
+    assert(upd_img_count(cur, "new4." UZ, 1) == 0);
     assert(atomic_load(&entry.serial) == 501);
     assert(!atomic_load(&entry.notify_now));
-    apex_soa->type_code = 6;
+    apex_text[0] = apex_first;
 
     upd_entry_destroy(&entry);
     printf("  -> Serial rules passed.\n");
@@ -1591,7 +1666,7 @@ static void test_update_dispatch_zone_section(void) {
     assert(len >= 12 && (res[3] & 0x0F) == 5);
     len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
     assert(len >= 12 && (res[3] & 0x0F) == 0);
-    assert(upd_count(atomic_load(&prim.rcu.active), "new." UZ, 1) == 1);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "new." UZ, 1) == 1);
     assert(atomic_load(&prim.serial) == 101);
 
     upd_entry_destroy(&prim);
@@ -1690,13 +1765,13 @@ static void test_update_tsig_matrix(void) {
     upd_begin(&m); upd_a(&m, false, "t1." UZ, 1, 300, 31); tk_sign(&m, &k1, mac, &mac_len);
     len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 0, "k1.", 0, 32, &k1, mac, mac_len);
-    assert(upd_count(atomic_load(&prim.rcu.active), "t1." UZ, 1) == 1);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "t1." UZ, 1) == 1);
 
     /* valid key that allow-update does not list: REFUSED, signed with that key (not k1), error 0 */
     upd_begin(&m); upd_a(&m, false, "t2." UZ, 1, 300, 32); tk_sign(&m, &k2, mac, &mac_len);
     len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 5, "k2.", 0, 32, &k2, mac, mac_len);
-    assert(upd_count(atomic_load(&prim.rcu.active), "t2." UZ, 1) == 0);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "t2." UZ, 1) == 0);
 
     /* unknown key: NOTAUTH, BADKEY, unsigned, the request's key name echoed */
     upd_begin(&m); upd_a(&m, false, "t3." UZ, 1, 300, 33); tk_sign(&m, &k3, mac, &mac_len);
@@ -1707,7 +1782,7 @@ static void test_update_tsig_matrix(void) {
     upd_begin(&m); upd_a(&m, false, "t4." UZ, 1, 300, 34); tk_sign(&m, &k1_bad, mac, &mac_len);
     len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 9, "k1.", 16, 0, NULL, NULL, 0);
-    assert(upd_count(atomic_load(&prim.rcu.active), "t4." UZ, 1) == 0);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "t4." UZ, 1) == 0);
 
     /* BADTIME (R-08): signed with k1, Time Signed and Fudge are the client's, Other Data = server time */
     k1.fuzztime = 1000000000;
@@ -1725,7 +1800,7 @@ static void test_update_tsig_matrix(void) {
         tk_expect(res, len, 9, "k1.", 18, 32, &k1, mac, mac_len);
         k1.fuzztime = 0;
     }
-    assert(upd_count(atomic_load(&prim.rcu.active), "t5." UZ, 1) == 0);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "t5." UZ, 1) == 0);
 
     /* BADTRUNC: a MAC truncated to 16 octets (allowed by §5.2.2.1) is below the local policy (full length) */
     upd_begin(&m); upd_a(&m, false, "t6." UZ, 1, 300, 36); tk_sign(&m, &k1, mac, &mac_len);
@@ -1742,7 +1817,7 @@ static void test_update_tsig_matrix(void) {
     }
     len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 9, "k1.", 22, 32, &k1, mac, 16);
-    assert(upd_count(atomic_load(&prim.rcu.active), "t6." UZ, 1) == 0);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "t6." UZ, 1) == 0);
 
     /* R-09: a MAC shorter than max(10, hash/2) is FORMERR, no TSIG in the response */
     upd_begin(&m); upd_a(&m, false, "t7." UZ, 1, 300, 37); tk_sign(&m, &k1, mac, &mac_len);
@@ -1765,7 +1840,7 @@ static void test_update_tsig_matrix(void) {
     tk_sign(&m, &k1, mac, &mac_len);
     len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 1, NULL, 0, 0, NULL, NULL, 0);
-    assert(upd_count(atomic_load(&prim.rcu.active), "t8." UZ, 1) == 0);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "t8." UZ, 1) == 0);
 
     /* R-20: an Original ID that differs from the message ID is accepted (the digest uses it) */
     upd_begin(&m); upd_a(&m, false, "t9." UZ, 1, 300, 39); tk_sign(&m, &k1, mac, &mac_len);
@@ -1793,7 +1868,7 @@ static void test_update_tsig_matrix(void) {
     upd_begin(&m); upd_a(&m, false, "t11." UZ, 1, 300, 41); tk_sign(&m, &k2, mac, &mac_len);
     len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 0, "k2.", 0, 32, &k2, mac, mac_len);
-    assert(upd_count(atomic_load(&prim.rcu.active), "t11." UZ, 1) == 1);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "t11." UZ, 1) == 1);
     upd_begin(&m); upd_a(&m, false, "t12." UZ, 1, 300, 42);
     len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 0, NULL, 0, 0, NULL, NULL, 0);
@@ -1801,7 +1876,7 @@ static void test_update_tsig_matrix(void) {
     upd_begin(&m); upd_a(&m, false, "t13." UZ, 1, 300, 43); tk_sign(&m, &k1_bad, mac, &mac_len);
     len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 9, "k1.", 16, 0, NULL, NULL, 0);
-    assert(upd_count(atomic_load(&prim.rcu.active), "t13." UZ, 1) == 0);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "t13." UZ, 1) == 0);
 
     upd_entry_destroy(&prim);
     printf("  -> TSIG matrix passed.\n");
@@ -1814,6 +1889,7 @@ int main(void) {
     test_process_update_sections_apex_ns_protection();
     test_dynamic_update_prerequisites_and_error_paths();
     test_handle_dynamic_update_pipeline();
+    test_handle_dynamic_update_drops_unencodable();
     test_update_multi_tsig_keys();
     test_update_soa_rules();
     test_update_cname_dname_rules();

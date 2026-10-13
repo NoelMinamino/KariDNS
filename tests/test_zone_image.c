@@ -680,10 +680,12 @@ static void check_thaw(const zone_arena_t *a, const zone_image_t *img, const uin
     CHECK(rc == 0);
     if (rc != 0) { zone_arena_destroy(&b); return; }
     CHECK(b.count == img->n_rrs);
+    size_t seq = 0; /* S5 B-2: thaw gives the records back in file order (tombstones leave no gap) */
     for (size_t i = 0; i < a->count; i++) {
         const dns_record_t *x = &a->records[i];
         if (map[i] == ZONE_IMAGE_NONE) continue;
-        const dns_record_t *y = &b.records[map[i]];
+        if (seq >= b.count) { CHECK(false); break; }
+        const dns_record_t *y = &b.records[seq++];
         CHECK(compare_records(x, y, true));
         CHECK(str_eq(x->name, y->name));
         CHECK(y->type_code == x->type_code && y->class_val == ref_class(x) && y->ttl_value == ref_ttl(x));
@@ -766,6 +768,58 @@ static void check_thaw(const zone_arena_t *a, const zone_image_t *img, const uin
     zone_arena_destroy(&b);
 }
 
+/* S5 B-2: the zone level tables read in place from the image (accessors) equal the builder's */
+static void check_zattr(const zone_arena_t *a, const zone_image_t *img) {
+    int n = 0;
+    const tinydns_location_entry_t *l = zone_image_locations(img, &n);
+    CHECK(n == (a->locations ? a->location_count : 0));
+    if (n > 0 && n == a->location_count) CHECK(memcmp(l, a->locations, (size_t)n * sizeof(*l)) == 0);
+    CHECK(zone_image_has_zattr(img) == (a->location_count > 0 || a->bind_location_tag_count > 0 || a->bind_ecs_tag_count > 0 ||
+                                        a->bind_ecs_trusted_resolver_count > 0));
+    for (int kind = 0; kind < 2; kind++) {
+        const ecs_tag_def_t *tags = kind == 0 ? a->bind_location_tags : a->bind_ecs_tags;
+        int nt = tags ? (kind == 0 ? a->bind_location_tag_count : a->bind_ecs_tag_count) : 0;
+        zone_image_tags_t it;
+        zone_image_tags_open(img, kind == 0 ? ZONE_IMAGE_TAGS_LOCATION : ZONE_IMAGE_TAGS_ECS, &it);
+        CHECK((int)it.left == nt);
+        zone_image_tag_t t;
+        int i = 0;
+        while (zone_image_tags_next(&it, &t)) {
+            CHECK(i < nt);
+            if (i >= nt) break;
+            CHECK(str_eq(t.tag, tags[i].tag) && (int)t.cidr_count == tags[i].cidr_count);
+            const char *c;
+            cidr_entry_t p;
+            int j = 0;
+            while (zone_image_tag_next_cidr(&t, &c, &p)) {
+                CHECK(j < tags[i].cidr_count);
+                if (j >= tags[i].cidr_count) break;
+                CHECK(str_eq(c, tags[i].cidrs[j].cidr) && memcmp(&p, &tags[i].cidrs[j].parsed, sizeof(p)) == 0);
+                j++;
+            }
+            CHECK(j == tags[i].cidr_count);
+            i++;
+        }
+        CHECK(i == nt);
+    }
+    int ntr = 0;
+    const acl_entry_t *acl = zone_image_ecs_trusted(img, &ntr);
+    CHECK(ntr == (a->bind_ecs_trusted_resolvers ? a->bind_ecs_trusted_resolver_count : 0));
+    CHECK((acl != NULL) == (ntr > 0) && ((uintptr_t)acl % 8) == 0);
+}
+
+/* S5 B-2: file order (zone_image_seq_rr) = the builder's record order, tombstones left out */
+static void check_seq(const zone_arena_t *a, const zone_image_t *img, const uint32_t *map) {
+    uint32_t seq = 0;
+    for (size_t i = 0; i < a->count; i++) {
+        if (map[i] == ZONE_IMAGE_NONE) continue;
+        CHECK(seq < img->n_rrs && zone_image_seq_rr(img, seq) == map[i]);
+        seq++;
+    }
+    CHECK(seq == img->n_rrs);
+    CHECK(((img->flags & ZONE_IMAGE_F_PERM) != 0) == (img->off_perm != 0));
+}
+
 /* ------------------------------------------------------------------------------------------------ driver per zone */
 static int g_zones_checked = 0;
 static unsigned long g_rrs_checked = 0;
@@ -793,6 +847,8 @@ static void check_zone(const char *label, zone_t *z, const char *apex) {
     check_glue(a, img);
     check_flags(a, img);
     check_ext(a, img, map);
+    check_zattr(a, img);
+    check_seq(a, img, map);
 
     pass_sequence(a, img, map, 65535, MODE_PLAIN);
     if (!big) {
@@ -1062,6 +1118,48 @@ static void run_tags(void) {
     free_zone(&z);
 }
 
+/* S5 B-2: owners interleaved in the file keep their file order in AXFR out and thaw (perm[]), a contiguous zone has none */
+static void run_perm(void) {
+    g_label = "perm";
+    static const char *INTER =
+        "$ORIGIN perm.test.\n$TTL 300\n"
+        "@ IN SOA ns1 host 1 7200 3600 1209600 300\n"
+        "www IN A 192.0.2.1\n@ IN NS ns1\nwww IN AAAA 2001:db8::1\nns1 IN A 192.0.2.53\n@ IN MX 10 www\nwww IN TXT \"x\"\n";
+    static const char *CONTIG =
+        "$ORIGIN perm.test.\n$TTL 300\n"
+        "@ IN SOA ns1 host 1 7200 3600 1209600 300\n@ IN NS ns1\n@ IN MX 10 www\nns1 IN A 192.0.2.53\nwww IN A 192.0.2.1\nwww IN AAAA 2001:db8::1\n";
+    zone_t z;
+    CHECK(load_zone(&z, INTER, "perm.test.", NULL, false));
+    zone_image_t *img = zone_image_freeze(&z.a, "perm.test.");
+    CHECK(img != NULL);
+    if (img) {
+        CHECK((img->flags & ZONE_IMAGE_F_PERM) && img->off_perm != 0);
+        uint32_t *map = map_records(&z.a, img);
+        CHECK(map != NULL);
+        if (map) { check_seq(&z.a, img, map); free(map); }
+        /* thaw restores the file order */
+        zone_arena_t b;
+        zone_arena_init(&b);
+        CHECK(zone_image_thaw(img, &b) == 0 && b.count == z.a.count);
+        for (size_t i = 0; i < b.count && i < z.a.count; i++)
+            CHECK(strcasecmp(b.records[i].name, z.a.records[i].name) == 0 && b.records[i].type_code == z.a.records[i].type_code);
+        zone_arena_destroy(&b);
+        /* apex SOA is the first SOA in file order */
+        uint32_t soa = zone_image_apex_soa(img);
+        CHECK(soa != ZONE_IMAGE_NONE && zone_image_rr_type(img, soa) == 6);
+        zone_image_free(img);
+    }
+    free_zone(&z);
+    CHECK(load_zone(&z, CONTIG, "perm.test.", NULL, false));
+    img = zone_image_freeze(&z.a, "perm.test.");
+    CHECK(img != NULL);
+    if (img) {
+        CHECK(!(img->flags & ZONE_IMAGE_F_PERM) && img->off_perm == 0);
+        zone_image_free(img);
+    }
+    free_zone(&z);
+}
+
 /* B-1: more than 256 distinct targets (some without addresses, some used twice) and wildcard / DNAME owners */
 static void run_glue_flags(void) {
     g_label = "glue flags";
@@ -1144,6 +1242,8 @@ int main(void) {
     run_tags();
     printf("[TEST] engine hints: wildcard / DNAME flags, prelinked glue targets (B-1)\n");
     run_glue_flags();
+    printf("[TEST] file order of interleaved owners (B-2)\n");
+    run_perm();
     printf("[TEST] empty zone\n");
     run_edges();
     printf("[TEST] tests/zones/*.zone\n");

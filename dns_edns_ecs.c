@@ -4,6 +4,7 @@
 #include "dns_utils.h"
 #include "dns_tsig_acl.h"
 #include "dns_siphash.h"
+#include "dns_zone_image.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -262,16 +263,11 @@ bool unpack_tinydns_loc_rdata(const uint8_t *data, size_t len, tinydns_location_
   return true;
 }
 
-bool wrap_tinydns_record(const dns_record_t *rec, dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap) {
-  if (!rec || !out_wrap || !wrap_buf) return false;
-  uint8_t tmp_wire[4096];
-  uint16_t tmp_off = 0;
-  compress_ctx_t dummy_comp;
-  memset(&dummy_comp, 0, sizeof(dummy_comp));
-  compress_ctx_init_packet(&dummy_comp);
-  if (serialize_dns_record(tmp_wire, sizeof(tmp_wire), &tmp_off, (dns_record_t *)rec, &dummy_comp, NULL, 0xFFFFFFFF) < 0) {
-    return false;
-  }
+/* The wrapper record around the RR written at tmp_wire[0, tmp_off) (owner, fixed fields, RDATA compressed against
+ * tmp_wire itself): the original TYPE / CLASS / TTL / RDATA, the tinydns location and time stamp. */
+static bool wrap_tinydns_wire(const uint8_t *tmp_wire, uint16_t tmp_off, const char loc[2], int64_t tinydns_ttd,
+                              bool countdown, const char *name, uint32_t ttl_value,
+                              dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap) {
   size_t p = 0;
   if (skip_wire_name(tmp_wire, tmp_off, 0, &p) != 0) return false;
   if (p + 10 > tmp_off) return false;
@@ -293,13 +289,13 @@ bool wrap_tinydns_record(const dns_record_t *rec, dns_record_t *out_wrap, uint8_
   wrap_buf[5] = (orig_ttl >> 16) & 0xFF;
   wrap_buf[6] = (orig_ttl >> 8) & 0xFF;
   wrap_buf[7] = orig_ttl & 0xFF;
-  wrap_buf[8] = (uint8_t)rec->tinydns_loc[0];
-  wrap_buf[9] = (uint8_t)rec->tinydns_loc[1];
-  uint64_t ttd = (uint64_t)rec->tinydns_ttd;
+  wrap_buf[8] = (uint8_t)loc[0];
+  wrap_buf[9] = (uint8_t)loc[1];
+  uint64_t ttd = (uint64_t)tinydns_ttd;
   for (int b = 0; b < 8; b++) {
     wrap_buf[10 + b] = (ttd >> ((7 - b) * 8)) & 0xFF;
   }
-  wrap_buf[18] = rec->tinydns_ttl_countdown ? 1 : 0;
+  wrap_buf[18] = countdown ? 1 : 0;
   wrap_buf[19] = (orig_rdlen >> 8) & 0xFF;
   wrap_buf[20] = orig_rdlen & 0xFF;
   if (orig_rdlen > 0) {
@@ -307,14 +303,48 @@ bool wrap_tinydns_record(const dns_record_t *rec, dns_record_t *out_wrap, uint8_
   }
 
   memset(out_wrap, 0, sizeof(*out_wrap));
-  out_wrap->name = rec->name;
+  out_wrap->name = (char *)name;
   out_wrap->type_code = DNS_TYPE_KARIDNS_TINYDNS_WRAP;
   out_wrap->class_val = DNS_CLASS_KARIDNS_EXT;
   out_wrap->class_str = "KARIDNS";
-  out_wrap->ttl_value = rec->ttl_value;
+  out_wrap->ttl_value = ttl_value;
   out_wrap->generic_data = wrap_buf;
   out_wrap->generic_len = total_wrap_len;
   return true;
+}
+
+bool wrap_tinydns_record(const dns_record_t *rec, dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap) {
+  if (!rec || !out_wrap || !wrap_buf) return false;
+  uint8_t tmp_wire[4096];
+  uint16_t tmp_off = 0;
+  compress_ctx_t dummy_comp;
+  memset(&dummy_comp, 0, sizeof(dummy_comp));
+  compress_ctx_init_packet(&dummy_comp);
+  if (serialize_dns_record(tmp_wire, sizeof(tmp_wire), &tmp_off, (dns_record_t *)rec, &dummy_comp, NULL, 0xFFFFFFFF) < 0) {
+    return false;
+  }
+  return wrap_tinydns_wire(tmp_wire, tmp_off, rec->tinydns_loc, (int64_t)rec->tinydns_ttd, rec->tinydns_ttl_countdown,
+                           rec->name, rec->ttl_value, out_wrap, wrap_buf, wrap_buf_cap);
+}
+
+/* The same for an RR of an image (Extended AXFR out of a tinydns zone). image_serialize_rr() writes what
+ * serialize_dns_record() does, so the wrapper carries the same bytes as wrap_tinydns_record() on the builder record. */
+bool wrap_tinydns_image_rr(const zone_image_t *img, uint32_t rr, dns_record_t *out_wrap, uint8_t *wrap_buf,
+                           size_t wrap_buf_cap) {
+  if (!img || !out_wrap || !wrap_buf || rr >= img->n_rrs) return false;
+  uint8_t tmp_wire[4096];
+  uint16_t tmp_off = 0;
+  compress_ctx_t dummy_comp;
+  memset(&dummy_comp, 0, sizeof(dummy_comp));
+  compress_ctx_init_packet(&dummy_comp);
+  uint32_t ttl = zone_image_rr_ttl(img, rr);
+  if (image_serialize_rr(img, rr, tmp_wire, sizeof(tmp_wire), &tmp_off, &dummy_comp, NULL, ttl) < 0) return false;
+  const zone_image_ext_t *ext = zone_image_rr_ext(img, rr);
+  static const char no_loc[2] = { 0, 0 };
+  const char *name = zone_image_str(img, ext && ext->alt_text_off ? ext->alt_text_off
+                                                                  : zone_image_names(img)[zone_image_rr_name(img, rr)].text_off);
+  return wrap_tinydns_wire(tmp_wire, tmp_off, ext ? ext->loc : no_loc, ext ? ext->ttd : 0,
+                           ext && (ext->flags & ZONE_IMAGE_EXT_COUNTDOWN), name, ttl, out_wrap, wrap_buf, wrap_buf_cap);
 }
 
 /* 先頭から数えて a と b が一致しているビット数 (最大 max_bits)。 */
@@ -341,17 +371,45 @@ static uint8_t ecs_common_prefix_bits(const uint8_t *a, const uint8_t *b, uint8_
  *   - 一致した CIDR の内側なら、それより後の CIDR は判定に影響しない。
  *   - どれにも一致しない場合は、同じ FAMILY の全 CIDR が対象。
  * L は SOURCE PREFIX-LENGTH より長くなることがある (§7.2.1 で許される。呼び出し側で切り詰めない)。 */
-const char *resolve_ecs_subnet_tag(const zone_arena_t *zone, const server_config_t *cfg, const zone_config_t *zcfg,
+/* resolve_ecs_subnet_tag() の 1 つの CIDR の判定。一致したら true。*scope は SCOPE PREFIX-LENGTH (上の説明) */
+static bool ecs_cidr_step(const char *cidr_text, const cidr_entry_t *parsed, int af, const uint8_t *addr,
+                          uint8_t family_bits, uint8_t *scope) {
+    if (parsed->valid) {
+        if (cidr_entry_match(parsed, af, addr)) {
+            if (!parsed->is_any && parsed->prefix > *scope) *scope = parsed->prefix;
+            return true;
+        }
+        if (parsed->family == af) {
+            uint8_t cp = ecs_common_prefix_bits(addr, parsed->addr, parsed->prefix);
+            if ((uint8_t)(cp + 1) > *scope) *scope = (uint8_t)(cp + 1);
+        }
+    } else if (cidr_text) {
+        /* 解析できなかった定義は文字列で照合する。範囲が分からないので、
+         * この定義が判定に関わる場合は FAMILY の全ビットを SCOPE にする。 */
+        char ip_buf[INET6_ADDRSTRLEN];
+        if (inet_ntop(af, addr, ip_buf, sizeof(ip_buf)) && match_cidr(ip_buf, cidr_text)) {
+            *scope = family_bits;
+            return true;
+        }
+        *scope = family_bits;
+    }
+    return false;
+}
+
+const char *resolve_ecs_subnet_tag(const zone_image_t *zone, const server_config_t *cfg, const zone_config_t *zcfg,
                                    const uint8_t *addr, uint16_t family, uint8_t *out_scope_prefix) {
     if (out_scope_prefix) *out_scope_prefix = 0;
-    const ecs_tag_def_t *tags = (zone && zone->bind_ecs_tags && zone->bind_ecs_tag_count > 0)
-                                 ? zone->bind_ecs_tags : NULL;
-    int tag_count = tags ? zone->bind_ecs_tag_count : 0;
-    if (!tags) {
+    /* 定義の出どころの優先順位: ゾーンのデータ (イメージ) > ゾーンの設定 > サーバーの設定 */
+    zone_image_tags_t zit;
+    zone_image_tags_open(zone, ZONE_IMAGE_TAGS_ECS, &zit);
+    const ecs_tag_def_t *tags = NULL;
+    int tag_count = 0;
+    if (zit.left == 0) {
         tags = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tags : (cfg ? cfg->ecs_tags : NULL);
         tag_count = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0);
+        if (!tags || tag_count == 0) return NULL;
     }
-    if (!tags || tag_count == 0 || !addr) return NULL;
+    if (!addr) return NULL;
 
     int af = (family == 1) ? AF_INET : ((family == 2) ? AF_INET6 : -1);
     if (af == -1) return NULL;
@@ -359,29 +417,26 @@ const char *resolve_ecs_subnet_tag(const zone_arena_t *zone, const server_config
 
     uint8_t scope = 0;
     const char *found = NULL;
-    for (int i = 0; i < tag_count && !found; i++) {
-        for (int j = 0; j < tags[i].cidr_count; j++) {
-            const ecs_cidr_entry_t *ce = &tags[i].cidrs[j];
-            if (ce->parsed.valid) {
-                if (cidr_entry_match(&ce->parsed, af, addr)) {
-                    if (!ce->parsed.is_any && ce->parsed.prefix > scope) scope = ce->parsed.prefix;
+    if (zit.left > 0) {
+        zone_image_tag_t zt;
+        const char *ctext;
+        cidr_entry_t parsed;
+        while (!found && zone_image_tags_next(&zit, &zt)) {
+            while (zone_image_tag_next_cidr(&zt, &ctext, &parsed)) {
+                if (ecs_cidr_step(ctext, &parsed, af, addr, family_bits, &scope)) {
+                    found = zt.tag;
+                    break;
+                }
+            }
+        }
+    } else {
+        for (int i = 0; i < tag_count && !found; i++) {
+            for (int j = 0; j < tags[i].cidr_count; j++) {
+                const ecs_cidr_entry_t *ce = &tags[i].cidrs[j];
+                if (ecs_cidr_step(ce->cidr, &ce->parsed, af, addr, family_bits, &scope)) {
                     found = tags[i].tag;
                     break;
                 }
-                if (ce->parsed.family == af) {
-                    uint8_t cp = ecs_common_prefix_bits(addr, ce->parsed.addr, ce->parsed.prefix);
-                    if ((uint8_t)(cp + 1) > scope) scope = (uint8_t)(cp + 1);
-                }
-            } else if (ce->cidr) {
-                /* 解析できなかった定義は文字列で照合する。範囲が分からないので、
-                 * この定義が判定に関わる場合は FAMILY の全ビットを SCOPE にする。 */
-                char ip_buf[INET6_ADDRSTRLEN];
-                if (inet_ntop(af, addr, ip_buf, sizeof(ip_buf)) && match_cidr(ip_buf, ce->cidr)) {
-                    scope = family_bits;
-                    found = tags[i].tag;
-                    break;
-                }
-                scope = family_bits;
             }
         }
     }
@@ -390,18 +445,19 @@ const char *resolve_ecs_subnet_tag(const zone_arena_t *zone, const server_config
     return found;
 }
 
-const char *resolve_bind_location_tag(const zone_arena_t *zone, const server_config_t *cfg, const zone_config_t *zcfg,
+const char *resolve_bind_location_tag(const zone_image_t *zone, const server_config_t *cfg, const zone_config_t *zcfg,
                                       const char *client_ip) {
     if (!client_ip) return NULL;
 
-    const ecs_tag_def_t *tags = (zone && zone->bind_location_tags && zone->bind_location_tag_count > 0)
-                                 ? zone->bind_location_tags : NULL;
-    int tag_count = tags ? zone->bind_location_tag_count : 0;
-    if (!tags) {
+    zone_image_tags_t zit;
+    zone_image_tags_open(zone, ZONE_IMAGE_TAGS_LOCATION, &zit);
+    const ecs_tag_def_t *tags = NULL;
+    int tag_count = 0;
+    if (zit.left == 0) {
         tags = (zcfg && zcfg->location_tags) ? zcfg->location_tags : (cfg ? cfg->location_tags : NULL);
         tag_count = (zcfg && zcfg->location_tags) ? zcfg->location_tag_count : (cfg ? cfg->location_tag_count : 0);
+        if (!tags || tag_count == 0) return NULL;
     }
-    if (!tags || tag_count == 0) return NULL;
 
     struct in_addr addr4;
     struct in6_addr addr6;
@@ -417,6 +473,18 @@ const char *resolve_bind_location_tag(const zone_arena_t *zone, const server_con
         return NULL;
     }
 
+    if (zit.left > 0) {
+        zone_image_tag_t zt;
+        const char *ctext;
+        cidr_entry_t parsed;
+        while (zone_image_tags_next(&zit, &zt)) {
+            while (zone_image_tag_next_cidr(&zt, &ctext, &parsed)) {
+                if (parsed.valid ? cidr_entry_match(&parsed, af, addr_bytes) : (ctext && match_cidr(client_ip, ctext)))
+                    return zt.tag;
+            }
+        }
+        return NULL;
+    }
     for (int i = 0; i < tag_count; i++) {
         for (int j = 0; j < tags[i].cidr_count; j++) {
             const ecs_cidr_entry_t *ce = &tags[i].cidrs[j];
@@ -432,41 +500,38 @@ const char *resolve_bind_location_tag(const zone_arena_t *zone, const server_con
     return NULL;
 }
 
-bool is_ecs_trusted_resolver(const zone_arena_t *zone, const server_config_t *cfg,
+bool is_ecs_trusted_resolver(const zone_image_t *zone, const server_config_t *cfg,
                              const zone_config_t *zcfg, const char *client_ip) {
     if (!client_ip) return false;
 
-    const acl_entry_t *parsed = (zone && zone->bind_ecs_trusted_resolvers_parsed && zone->bind_ecs_trusted_resolver_count > 0)
-                                 ? zone->bind_ecs_trusted_resolvers_parsed : NULL;
-    int count = parsed ? zone->bind_ecs_trusted_resolver_count : 0;
-    if (!parsed) {
-        parsed = (zcfg && zcfg->ecs_trusted_resolvers_parsed) ? zcfg->ecs_trusted_resolvers_parsed
-                                                              : (cfg ? cfg->ecs_trusted_resolvers_parsed : NULL);
-        count = (zcfg && zcfg->ecs_trusted_resolvers_parsed) ? zcfg->ecs_trusted_resolvers_count
-                                                             : (cfg ? cfg->ecs_trusted_resolvers_count : 0);
-    }
+    /* ゾーンのデータ (イメージ) に定義があればそれだけを使う */
+    int count = 0;
+    const acl_entry_t *parsed = zone_image_ecs_trusted(zone, &count);
+    if (parsed && count > 0) return check_acl_bin(client_ip, parsed, count);
+
+    parsed = (zcfg && zcfg->ecs_trusted_resolvers_parsed) ? zcfg->ecs_trusted_resolvers_parsed
+                                                          : (cfg ? cfg->ecs_trusted_resolvers_parsed : NULL);
+    count = (zcfg && zcfg->ecs_trusted_resolvers_parsed) ? zcfg->ecs_trusted_resolvers_count
+                                                         : (cfg ? cfg->ecs_trusted_resolvers_count : 0);
     if (parsed && count > 0) {
         return check_acl_bin(client_ip, parsed, count);
     }
 
-    char **resolvers = (zone && zone->bind_ecs_trusted_resolvers && zone->bind_ecs_trusted_resolver_count > 0)
-                        ? zone->bind_ecs_trusted_resolvers : NULL;
-    count = resolvers ? zone->bind_ecs_trusted_resolver_count : 0;
-    if (!resolvers) {
-        resolvers = (zcfg && zcfg->ecs_trusted_resolvers) ? zcfg->ecs_trusted_resolvers
-                                                           : (cfg ? cfg->ecs_trusted_resolvers : NULL);
-        count = (zcfg && zcfg->ecs_trusted_resolvers) ? zcfg->ecs_trusted_resolvers_count
-                                                       : (cfg ? cfg->ecs_trusted_resolvers_count : 0);
-    }
+    char **resolvers = (zcfg && zcfg->ecs_trusted_resolvers) ? zcfg->ecs_trusted_resolvers
+                                                             : (cfg ? cfg->ecs_trusted_resolvers : NULL);
+    count = (zcfg && zcfg->ecs_trusted_resolvers) ? zcfg->ecs_trusted_resolvers_count
+                                                   : (cfg ? cfg->ecs_trusted_resolvers_count : 0);
     if (!resolvers || count == 0) return false;
     return check_acl(client_ip, resolvers, count);
 }
 
-void tinydns_resolve_client_location(const zone_arena_t *zone, const char *client_ip,
+void tinydns_resolve_client_location(const zone_image_t *zone, const char *client_ip,
                                      char out_loc[2]) {
     out_loc[0] = 0;
     out_loc[1] = 0;
-    if (!zone || zone->location_count == 0 || !client_ip) return;
+    int location_count = 0;
+    const tinydns_location_entry_t *locations = zone_image_locations(zone, &location_count);
+    if (location_count == 0 || !client_ip) return;
 
     struct in_addr addr;
     if (inet_pton(AF_INET, client_ip, &addr) != 1) return; /* IPv6は非対応(仕様通り) */
@@ -475,8 +540,8 @@ void tinydns_resolve_client_location(const zone_arena_t *zone, const char *clien
     /* 最長一致 (同じ長さなら先に定義された方)。prefix[] は読込時にマスク済み。 */
     int best = -1;
     int best_bits = -1;
-    for (int li = 0; li < zone->location_count; li++) {
-        const tinydns_location_entry_t *loc = &zone->locations[li];
+    for (int li = 0; li < location_count; li++) {
+        const tinydns_location_entry_t *loc = &locations[li];
         int bits = loc->prefix_bits > 32 ? 32 : loc->prefix_bits;
         if (bits <= best_bits) continue;
         uint32_t mask = bits == 0 ? 0 : (0xFFFFFFFFu << (32 - bits));
@@ -488,7 +553,7 @@ void tinydns_resolve_client_location(const zone_arena_t *zone, const char *clien
         }
     }
     if (best >= 0) {
-        out_loc[0] = zone->locations[best].code[0];
-        out_loc[1] = zone->locations[best].code[1];
+        out_loc[0] = locations[best].code[0];
+        out_loc[1] = locations[best].code[1];
     }
 }

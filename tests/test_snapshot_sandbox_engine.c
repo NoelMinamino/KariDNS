@@ -23,6 +23,8 @@
 #include "dns_cidr.h"
 #include "dns_tsig_acl.h"
 #include "dns_utils.h"
+#include "dns_zone_image.h"
+#include "test_image_helper.h"
 
 // Mock globals
 int g_control_kq = -1;
@@ -213,7 +215,8 @@ static void test_snapshot_rcu_lifecycle_and_suffix_lookup(void) {
     src.bind_ecs_trusted_resolvers[0] = strdup("127.0.0.1/32");
     src.bind_ecs_trusted_resolver_count = 1;
 
-    clone_zone_arena(&src, &dst);
+    assert(test_build_index(&src, false) == 0);   /* S5 B-2: the published image is what UPDATE / IXFR rebuild a builder from */
+    assert(thaw_zone_arena(&src, &dst) == 0);
     assert(dst.count == 1);
     assert(strcmp(dst.records[0].name, "host.example.com.") == 0);
     assert(strcmp(dst.records[0].rdata[0], "192.0.2.55") == 0);

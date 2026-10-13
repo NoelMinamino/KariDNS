@@ -21,6 +21,7 @@
 #include "dns_zone_parser.h"
 #include "dns_zone_image.h"
 #include "test_image_helper.h"
+#include <arpa/inet.h>
 #include "dns_snapshot_rcu.h"
 #include "dns_priv_sandbox.h"
 #include "dns_query_engine.h"
@@ -174,7 +175,7 @@ static void test_rebuild_two_views(void) {
 
     /* the zone content really is what the file said */
     zone_arena_t *arena = atomic_load_explicit(&za->rcu.active, memory_order_acquire);
-    assert(arena && arena->count >= 8);
+    assert(arena && arena->image && arena->image->n_rrs >= 8);
     release_zone_snapshot(snap);
 
     /* --- reload_master_zone verdicts --- */
@@ -187,11 +188,8 @@ static void test_rebuild_two_views(void) {
                     "@ IN NS ns.a.example.\nns IN A 192.0.2.1\nwww IN A 192.0.2.10\nnew IN A 192.0.2.99\n");
     assert(reload_master_zone(ea, zcfg) == RELOAD_OK);
     zone_arena_t *na = atomic_load_explicit(&ea->rcu.active, memory_order_acquire);
-    bool found_new = false;
-    for (size_t i = 0; i < na->count; i++) if (!strcasecmp(na->records[i].name, "new.a.example.")) found_new = true;
-    assert(found_new);
-    /* S5 B-1: the reloaded version carries the image the engine reads, with the new owner in it */
-    assert(na->image != NULL && na->image->n_rrs == na->count);
+    /* S5 B-1: the reloaded version carries the image the engine reads, with the new owner in it (B-2: and no builder) */
+    assert(na->image != NULL && na->count == 0 && na->records == NULL);
     assert(zone_image_find_name(na->image, "new.a.example.") != ZONE_IMAGE_NONE);
 
     char zpath[300];
@@ -251,7 +249,8 @@ static bool ns_answer_has_glue(const char *zone, const char *addr) {
 static bool standby_empty(zone_db_entry_t *e) {
     zone_arena_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
     zone_arena_t *s = (a == &e->rcu.arena_a) ? &e->rcu.arena_b : &e->rcu.arena_a;
-    return s->records == NULL && s->data_pool_count == 0 && s->hash_table == NULL && s->file_buf_count == 0;
+    return s->image == NULL && s->glue == NULL && s->records == NULL && s->data_pool_count == 0 && s->hash_table == NULL &&
+           s->file_buf_count == 0;
 }
 
 /* S2: glue from a sibling zone follows the sibling (load order, reload, removal) without copying or
@@ -278,14 +277,20 @@ static void test_snapshot_rebuild_sibling_glue(void) {
     assert(standby_empty(dep) && standby_empty(prov));
     /* only the zone's own address is copied; the sibling's is looked up when answering */
     zone_arena_t *dep_arena = atomic_load_explicit(&dep->rcu.active, memory_order_acquire);
-    assert(dep_arena->prelinked_glue_count == 1);
-    assert(!strcasecmp(dep_arena->prelinked_glue[0].target_name, "ns.dep.example."));
+    {
+        const zone_image_t *di = dep_arena->image;
+        uint32_t nid = zone_image_find_name(di, "ns.dep.example.");
+        assert(nid != ZONE_IMAGE_NONE && (zone_image_name_flags(di, nid) & ZONE_IMAGE_NAME_GLUE));
+        /* the builder is gone once the version is published (S5 B-2) */
+        assert(dep_arena->records == NULL && dep_arena->hash_table == NULL && dep_arena->data_pool_count == 0 &&
+               dep_arena->file_buf_count == 0);
+    }
     /* both targets are tracked (an in-zone name may later be covered by a new child zone) */
-    assert(dep_arena->glue_external && dep_arena->glue_target_count == 2);
-    int prov_k = !strcasecmp(dep_arena->glue_targets[0], "ns1.prov.example.") ? 0 : 1;
-    assert(!strcasecmp(dep_arena->glue_targets[prov_k], "ns1.prov.example."));
-    assert(dep_arena->glue_target_ids[prov_k] == prov->id); /* the startup pass found the later sibling */
-    assert(dep_arena->glue_target_ids[1 - prov_k] == 0);    /* the zone itself */
+    assert(dep_arena->glue && dep_arena->glue->count == 2);
+    int prov_k = !strcasecmp(dep_arena->glue->targets[0], "ns1.prov.example.") ? 0 : 1;
+    assert(!strcasecmp(dep_arena->glue->targets[prov_k], "ns1.prov.example."));
+    assert(dep_arena->glue->ids[prov_k] == prov->id); /* the startup pass found the later sibling */
+    assert(dep_arena->glue->ids[1 - prov_k] == 0);    /* the zone itself */
     assert(ns_answer_has_glue("dep.example.", "192.0.2.7") && ns_answer_has_glue("dep.example.", "192.0.2.31"));
 
     /* nothing changed: the generation stays */
@@ -328,7 +333,7 @@ static void test_snapshot_rebuild_sibling_glue(void) {
     dep = snapshot_get_zone(snap, "dep.example.");
     assert(dep && atomic_load_explicit(&dep->rcu.active, memory_order_acquire) == dep_arena);
     assert(zone_arena_data_generation(dep_arena) != gen_before);
-    for (int k = 0; k < dep_arena->glue_target_count; k++) assert(dep_arena->glue_target_ids[k] == 0);
+    for (int k = 0; k < dep_arena->glue->count; k++) assert(dep_arena->glue->ids[k] == 0);
     assert(!ns_answer_has_glue("dep.example.", "192.0.2.8") && ns_answer_has_glue("dep.example.", "192.0.2.31"));
     release_zone_snapshot(snap);
     printf("  -> sibling glue tracking and release of old versions passed.\n");
@@ -772,13 +777,14 @@ static void test_snapshot_rebuild_case_29(void) {
 }
 
 /* www.shared.example. の A レコードの値を返す (無ければ NULL) */
-static const char *shared_www_addr(zone_db_entry_t *e) {
+static const char *shared_www_addr(zone_db_entry_t *e, char buf[INET_ADDRSTRLEN]) {
     zone_arena_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
-    for (size_t i = 0; a && i < a->count; i++) {
-        if (a->records[i].type_code == 1 && strcasecmp(a->records[i].name, "www.shared.example.") == 0)
-            return a->records[i].rdata[0];
-    }
-    return NULL;
+    const zone_image_t *img = a ? a->image : NULL;
+    uint32_t id = img ? zone_image_find_name(img, "www.shared.example.") : ZONE_IMAGE_NONE;
+    if (id == ZONE_IMAGE_NONE) return NULL;
+    uint32_t rr = zone_image_rrset_next(img, id, 1, zone_image_name_first_rr(img, id));
+    if (rr == ZONE_IMAGE_NONE || zone_image_rr_rdlen(img, rr) != 4) return NULL;
+    return inet_ntop(AF_INET, zone_image_rr_rdata(img, rr), buf, INET_ADDRSTRLEN);
 }
 
 /* R-26: the same zone name in two views keeps each view's own data, at start-up and after every
@@ -806,7 +812,8 @@ static void test_snapshot_rebuild_case_30(void) {
         assert(find_zone_exact_in_view(snapshot_find_view(snap, "VIEW1"), "SHARED.example.") == z1);
         assert(snapshot_get_zone_in_view(snap, "view3", "shared.example.") == NULL);
         assert(snapshot_get_zone_in_view(snap, "view1", "www.shared.example.") == NULL); /* exact apex only */
-        const char *a1 = shared_www_addr(z1), *a2 = shared_www_addr(z2);
+        char b1[INET_ADDRSTRLEN], b2[INET_ADDRSTRLEN];
+        const char *a1 = shared_www_addr(z1, b1), *a2 = shared_www_addr(z2, b2);
         assert(a1 && strcmp(a1, "192.0.2.11") == 0);
         assert(a2 && strcmp(a2, "198.51.100.22") == 0);
         /* query path: the client address selects the view, the view selects the entry */
@@ -857,7 +864,7 @@ static void test_snapshot_rebuild_type_change(void) {
     zone_db_entry_t *tc3 = snapshot_get_zone_in_view(s3, "__default__", "tc.example.");
     assert(tc3 && tc3 != tc2 && tc3->kind == ZONE_KIND_PRIMARY && !tc3->is_secondary);
     zone_arena_t *a3 = atomic_load_explicit(&tc3->rcu.active, memory_order_acquire);
-    assert(a3 && a3->count >= 3); /* the recreated primary loaded its file */
+    assert(a3 && a3->image && a3->image->n_rrs >= 3); /* the recreated primary loaded its file */
     assert(zone_kind_from_type("Secondary") == ZONE_KIND_SECONDARY);
     assert(zone_kind_from_type("forward") == ZONE_KIND_FORWARD);
     assert(zone_kind_from_type("program") == ZONE_KIND_PROGRAM);

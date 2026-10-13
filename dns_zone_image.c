@@ -155,11 +155,12 @@ static uint32_t rec_ttl(const dns_record_t *rec) {
 static size_t round8(size_t v) { return (v + 7) & ~(size_t)7; }
 
 /* zone level tables (tinydns locations, $LOCATION-TAG / $ECS-SUBNET-TAG definitions, ECS trusted resolvers) */
+/* a string: length (0xFFFFFFFF = NULL), the octets and a NUL (so the reader can hand out a C string) */
 static void put_str(sbuf_t *sb, const char *s) {
     if (!s) { sb_u32(sb, 0xFFFFFFFFu); return; }
     size_t n = strlen(s);
     sb_u32(sb, (uint32_t)n);
-    sb_add(sb, s, n);
+    sb_add(sb, s, n + 1);
 }
 
 static void put_tags(sbuf_t *sb, const ecs_tag_def_t *tags, int count) {
@@ -177,7 +178,18 @@ static void put_tags(sbuf_t *sb, const ecs_tag_def_t *tags, int count) {
     }
 }
 
+/* Layout: u32 nloc, nloc x tinydns_location_entry_t, location tags, ECS tags (put_tags), u32 ntr, ntr strings,
+ * u32 nparsed, padding to 8, nparsed x acl_entry_t (the parsed form of the trusted resolvers, what
+ * is_ecs_trusted_resolver() matches). The area is empty (zattr_len 0) when the zone has none of them, so a zone
+ * without tables pays nothing at freeze or at query time. */
+static bool zattr_any(const zone_arena_t *a) {
+    return (a->locations && a->location_count > 0) || (a->bind_location_tags && a->bind_location_tag_count > 0) ||
+           (a->bind_ecs_tags && a->bind_ecs_tag_count > 0) ||
+           (a->bind_ecs_trusted_resolvers && a->bind_ecs_trusted_resolver_count > 0);
+}
+
 static void build_zattr(sbuf_t *sb, const zone_arena_t *a) {
+    if (!zattr_any(a)) return;
     int nloc = (a->locations && a->location_count > 0) ? a->location_count : 0;
     sb_u32(sb, (uint32_t)nloc);
     for (int i = 0; i < nloc; i++) {
@@ -189,6 +201,22 @@ static void build_zattr(sbuf_t *sb, const zone_arena_t *a) {
     int ntr = (a->bind_ecs_trusted_resolvers && a->bind_ecs_trusted_resolver_count > 0) ? a->bind_ecs_trusted_resolver_count : 0;
     sb_u32(sb, (uint32_t)ntr);
     for (int i = 0; i < ntr; i++) put_str(sb, a->bind_ecs_trusted_resolvers[i]);
+    /* the builder's parsed list when it has one (the same count), else parse the strings */
+    acl_entry_t *own = NULL;
+    const acl_entry_t *parsed = NULL;
+    if (ntr > 0) {
+        parsed = a->bind_ecs_trusted_resolvers_parsed;
+        if (!parsed) parsed = own = acl_list_parse(a->bind_ecs_trusted_resolvers, ntr);
+        if (!parsed) sb->oom = true; /* freeze fails: a zone must not lose its own trusted resolvers (it would fall back to the server's) */
+    }
+    sb_u32(sb, parsed ? (uint32_t)ntr : 0);
+    if (parsed) {
+        static const uint8_t zeros[8] = { 0 };
+        size_t pad = (8 - (sb->len & 7)) & 7;
+        if (pad) sb_add(sb, zeros, pad);
+        sb_add(sb, parsed, (size_t)ntr * sizeof(acl_entry_t));
+    }
+    free(own);
 }
 
 static bool rec_in_arena(const zone_arena_t *a, const dns_record_t *r, size_t *idx) {
@@ -213,7 +241,7 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
     zone_image_rr_t *rrs = NULL;
     zone_image_ext_t *exts = NULL;
     size_t n_ext = 0, cap_ext = 0;
-    uint32_t *canon = NULL, *nsec = NULL, *n3entries = NULL, *glue = NULL, *hashtab = NULL;
+    uint32_t *canon = NULL, *nsec = NULL, *n3entries = NULL, *glue = NULL, *hashtab = NULL, *perm = NULL;
     zone_image_n3chain_t *n3chains = NULL;
     uint8_t *cap = NULL;
     uint8_t *seen = NULL;
@@ -291,6 +319,24 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
         uint32_t idx = ix.names[rec_name[i]].cursor++;
         rec_rr[i] = idx;
         rr_rec[idx] = (uint32_t)i;
+    }
+    /* file (builder) order of the RRs: perm[seq] = RR index. Kept only when it differs from the image order (an
+     * owner whose RRs are not contiguous in the file); AXFR out and thaw walk it so they keep Phase A's order */
+    {
+        bool identity = true;
+        uint32_t seq = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (rec_rr[i] == ZONE_IMAGE_NONE) continue;
+            if (rec_rr[i] != seq) identity = false;
+            seq++;
+        }
+        if (!identity) {
+            perm = malloc((n_rrs ? n_rrs : 1) * sizeof(uint32_t));
+            if (!perm) IMG_FAIL();
+            seq = 0;
+            for (size_t i = 0; i < n; i++)
+                if (rec_rr[i] != ZONE_IMAGE_NONE) perm[seq++] = rec_rr[i];
+        }
     }
 
     /* 3. owner strings (first record of each name) */
@@ -493,7 +539,7 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
     seen = calloc(n_names ? n_names : 1, 1);
     glue = malloc((n_names ? n_names : 1) * sizeof(uint32_t));
     if (!seen || !glue) IMG_FAIL();
-    /* ZONE_IMAGE_NAME_GLUE mirrors prelink_zone_additional_glue(): its target list holds the first
+    /* ZONE_IMAGE_NAME_GLUE mirrors zone_glue_track_build(): its target list holds the first
      * IMG_MAX_PRELINK_TARGETS distinct targets in record order, whether or not they have addresses here */
     const char *prelink_targets[IMG_MAX_PRELINK_TARGETS];
     int n_prelink = 0;
@@ -551,6 +597,7 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
         size_t o_nsec = off;   off = round8(off + a->nsec_count * sizeof(uint32_t));
         size_t o_n3e = off;    off = round8(off + (size_t)n_n3e * sizeof(uint32_t));
         size_t o_glue = off;   off = round8(off + (size_t)n_glue * sizeof(uint32_t));
+        size_t o_perm = off;   off = round8(off + (perm ? (size_t)n_rrs * sizeof(uint32_t) : 0));
         size_t o_zattr = off;  off = round8(off + za.len);
         size_t o_str = off;    off = round8(off + sb.len);
         if (off > 0xFFFFF000u) {
@@ -563,7 +610,8 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
         img->magic = ZONE_IMAGE_MAGIC;
         img->version = ZONE_IMAGE_VERSION;
         img->total_size = (uint32_t)off;
-        img->flags = (a->is_tinydns_format ? ZONE_IMAGE_F_TINYDNS : 0) | (n_ext ? ZONE_IMAGE_F_EXT : 0) | (has_wild ? ZONE_IMAGE_F_WILDCARD : 0) | (has_dname ? ZONE_IMAGE_F_DNAME : 0);
+        img->flags = (a->is_tinydns_format ? ZONE_IMAGE_F_TINYDNS : 0) | (n_ext ? ZONE_IMAGE_F_EXT : 0) | (has_wild ? ZONE_IMAGE_F_WILDCARD : 0) | (has_dname ? ZONE_IMAGE_F_DNAME : 0) | (perm ? ZONE_IMAGE_F_PERM : 0);
+        img->off_perm = perm ? (uint32_t)o_perm : 0;
         img->n_names = n_names; img->n_rrs = n_rrs; img->n_ext = (uint32_t)n_ext;
         img->n_canon = (uint32_t)n_canon; img->n_nsec = (uint32_t)a->nsec_count;
         img->n_n3chains = n_n3ch; img->n_n3entries = n_n3e; img->n_glue = n_glue; img->hash_size = (uint32_t)hash_size;
@@ -586,6 +634,7 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
         if (a->nsec_count) memcpy(b + o_nsec, nsec, a->nsec_count * sizeof(uint32_t));
         if (n_n3e) memcpy(b + o_n3e, n3entries, (size_t)n_n3e * sizeof(uint32_t));
         if (n_glue) memcpy(b + o_glue, glue, (size_t)n_glue * sizeof(uint32_t));
+        if (perm) memcpy(b + o_perm, perm, (size_t)n_rrs * sizeof(uint32_t));
         if (za.len) memcpy(b + o_zattr, za.p, za.len);
         memcpy(b + o_str, sb.p, sb.len);
     }
@@ -598,6 +647,7 @@ out:
     }
     free(ix.tab); free(ix.names); free(rec_name); free(rec_rr); free(rr_rec); free(names); free(rrs); free(exts);
     free(canon); free(nsec); free(n3chains); free(n3entries); free(glue); free(hashtab); free(cap); free(chk); free(seen);
+    free(perm);
     free(sb.p); free(za.p);
     return img;
 }
@@ -919,12 +969,12 @@ static uint32_t get_u32(cursor_t *c) {
 static char *get_str(cursor_t *c) {
     uint32_t n = get_u32(c);
     if (c->bad || n == 0xFFFFFFFFu) return NULL;
-    if (c->len - c->pos < n) { c->bad = true; return NULL; }
+    if (n >= c->len || c->len - c->pos < (size_t)n + 1) { c->bad = true; return NULL; }
     char *s = malloc((size_t)n + 1);
     if (!s) { c->bad = true; return NULL; }
     memcpy(s, c->p + c->pos, n);
     s[n] = '\0';
-    c->pos += n;
+    c->pos += (size_t)n + 1;
     return s;
 }
 
@@ -957,6 +1007,7 @@ static ecs_tag_def_t *get_tags(cursor_t *c, int *count_out) {
 }
 
 static int thaw_zattr(const zone_image_t *img, zone_arena_t *a) {
+    if (img->zattr_len == 0) return 0;
     cursor_t c = { (const uint8_t *)img + img->off_zattr, img->zattr_len, 0, false };
     uint32_t nloc = get_u32(&c);
     if (!c.bad && nloc) {
@@ -983,11 +1034,263 @@ static int thaw_zattr(const zone_image_t *img, zone_arena_t *a) {
     return c.bad ? -1 : 0;
 }
 
+/* ---- zone level tables, read in place (no allocation) ---- */
+static const char *zc_str(cursor_t *c) {
+    uint32_t n = get_u32(c);
+    if (c->bad || n == 0xFFFFFFFFu) return NULL;
+    if (n >= c->len || c->len - c->pos < (size_t)n + 1) { c->bad = true; return NULL; }
+    const char *s = (const char *)c->p + c->pos;
+    c->pos += (size_t)n + 1;
+    return s;
+}
+
+static void zc_skip_tags(cursor_t *c) {
+    uint32_t n = get_u32(c);
+    if (c->bad) return;
+    if (n > c->len) { c->bad = true; return; }
+    for (uint32_t i = 0; i < n && !c->bad; i++) {
+        (void)zc_str(c);
+        uint32_t nc = get_u32(c);
+        if (c->bad) return;
+        if (nc > c->len) { c->bad = true; return; }
+        for (uint32_t j = 0; j < nc && !c->bad; j++) {
+            (void)zc_str(c);
+            if (c->len - c->pos < sizeof(cidr_entry_t)) { c->bad = true; return; }
+            c->pos += sizeof(cidr_entry_t);
+        }
+    }
+}
+
+static cursor_t zattr_cursor(const zone_image_t *img) {
+    cursor_t c = { zone_image_base(img) + img->off_zattr, img->zattr_len, 0, false };
+    if (img->zattr_len == 0) c.bad = true;
+    return c;
+}
+
+bool zone_image_has_zattr(const zone_image_t *img) { return img && img->zattr_len > 0; }
+
+const tinydns_location_entry_t *zone_image_locations(const zone_image_t *img, int *count) {
+    *count = 0;
+    if (!img) return NULL;
+    cursor_t c = zattr_cursor(img);
+    uint32_t n = get_u32(&c);
+    if (c.bad || n == 0 || (size_t)n > (c.len - c.pos) / sizeof(tinydns_location_entry_t)) return NULL;
+    *count = (int)n;
+    return (const tinydns_location_entry_t *)(const void *)(c.p + c.pos);
+}
+
+void zone_image_tags_open(const zone_image_t *img, int kind, zone_image_tags_t *it) {
+    memset(it, 0, sizeof(*it));
+    if (!img) return;
+    cursor_t c = zattr_cursor(img);
+    uint32_t nloc = get_u32(&c);
+    if (c.bad || (size_t)nloc > (c.len - c.pos) / sizeof(tinydns_location_entry_t)) return;
+    c.pos += (size_t)nloc * sizeof(tinydns_location_entry_t);
+    if (kind == ZONE_IMAGE_TAGS_ECS) zc_skip_tags(&c);
+    uint32_t n = get_u32(&c);
+    if (c.bad) return;
+    it->p = c.p + c.pos;
+    it->end = c.p + c.len;
+    it->left = n;
+}
+
+bool zone_image_tags_next(zone_image_tags_t *it, zone_image_tag_t *tag) {
+    if (it->left == 0) return false;
+    cursor_t c = { it->p, (size_t)(it->end - it->p), 0, false };
+    memset(tag, 0, sizeof(*tag));
+    tag->tag = zc_str(&c);
+    uint32_t nc = get_u32(&c);
+    if (c.bad || nc > c.len) { it->left = 0; return false; }
+    tag->cidr_count = nc;
+    tag->left = nc;
+    tag->p = c.p + c.pos;
+    tag->end = it->end;
+    for (uint32_t j = 0; j < nc && !c.bad; j++) {
+        (void)zc_str(&c);
+        if (c.len - c.pos < sizeof(cidr_entry_t)) c.bad = true;
+        else c.pos += sizeof(cidr_entry_t);
+    }
+    if (c.bad) { it->left = 0; return false; }
+    it->p += c.pos;
+    it->left--;
+    return true;
+}
+
+bool zone_image_tag_next_cidr(zone_image_tag_t *tag, const char **cidr, cidr_entry_t *parsed) {
+    if (tag->left == 0) return false;
+    cursor_t c = { tag->p, (size_t)(tag->end - tag->p), 0, false };
+    *cidr = zc_str(&c);
+    if (c.bad || c.len - c.pos < sizeof(cidr_entry_t)) { tag->left = 0; return false; }
+    memcpy(parsed, c.p + c.pos, sizeof(cidr_entry_t));
+    c.pos += sizeof(cidr_entry_t);
+    tag->p += c.pos;
+    tag->left--;
+    return true;
+}
+
+const acl_entry_t *zone_image_ecs_trusted(const zone_image_t *img, int *count) {
+    *count = 0;
+    if (!img) return NULL;
+    cursor_t c = zattr_cursor(img);
+    uint32_t nloc = get_u32(&c);
+    if (c.bad || (size_t)nloc > (c.len - c.pos) / sizeof(tinydns_location_entry_t)) return NULL;
+    c.pos += (size_t)nloc * sizeof(tinydns_location_entry_t);
+    zc_skip_tags(&c);
+    zc_skip_tags(&c);
+    uint32_t ntr = get_u32(&c);
+    if (c.bad || ntr > c.len) return NULL;
+    for (uint32_t i = 0; i < ntr && !c.bad; i++) (void)zc_str(&c);
+    uint32_t np = get_u32(&c);
+    if (c.bad || np == 0) return NULL;
+    size_t at = (c.pos + 7) & ~(size_t)7;
+    if (at > c.len || (size_t)np > (c.len - at) / sizeof(acl_entry_t)) return NULL;
+    *count = (int)np;
+    return (const acl_entry_t *)(const void *)(c.p + at);
+}
+
+int zone_image_zattr_load(const zone_image_t *img, zone_arena_t *a) { return thaw_zattr(img, a); }
+
+uint32_t zone_image_apex_soa(const zone_image_t *img) {
+    if (!img || img->apex_name == ZONE_IMAGE_NONE) return ZONE_IMAGE_NONE;
+    uint32_t first = ZONE_IMAGE_NONE, nsoa = 0;
+    uint32_t end = zone_image_name_first_rr(img, img->apex_name) + zone_image_name_rr_count(img, img->apex_name);
+    for (uint32_t k = zone_image_name_first_rr(img, img->apex_name); k < end; k++) {
+        if (zone_image_rr_type(img, k) != 6) continue;
+        if (nsoa++ == 0) first = k;
+    }
+    if (nsoa <= 1 || !img->off_perm) return first;
+    /* several SOAs at the apex: the one that comes first in file order */
+    for (uint32_t seq = 0; seq < img->n_rrs; seq++) {
+        uint32_t k = zone_image_seq_rr(img, seq);
+        if (zone_image_rr_name(img, k) == img->apex_name && zone_image_rr_type(img, k) == 6) return k;
+    }
+    return first;
+}
+
+/* One RR as a builder record (the way AXFR / UPDATE records look: text RDATA for the types parse_resource_record()
+ * knows, generic_data for the rest). pkt (>= 255 + 10 + 65535 octets) and chk (65535) are scratch. */
+static int thaw_one(const zone_image_t *img, uint32_t k, zone_arena_t *a, uint8_t *pkt, uint8_t *chk, dns_record_t *out) {
+    const zone_image_rr_t *rr = &zone_image_rrs(img)[k];
+    const zone_image_name_t *nm = &zone_image_names(img)[rr->name_id];
+    const zone_image_ext_t *ext = zone_image_rr_ext(img, k);
+    const char *text = zone_image_str(img, ext && ext->alt_text_off ? ext->alt_text_off : nm->text_off);
+    uint32_t woff = ext && ext->alt_text_off ? ext->alt_wire_off : nm->wire_off;
+    /* a synthetic RR in message form: owner, TYPE, CLASS, TTL, RDLENGTH, RDATA */
+    size_t p = 0;
+    if (woff) {
+        const uint8_t *w = zone_image_bytes(img, woff);
+        int wl = wire_name_len(w, 256);
+        if (wl < 0) return -1;
+        memcpy(pkt, w, (size_t)wl);
+        p = (size_t)wl;
+    } else {
+        pkt[p++] = 0;
+    }
+    pkt[p++] = rr->type >> 8; pkt[p++] = rr->type & 0xFF;
+    pkt[p++] = rr->class_val >> 8; pkt[p++] = rr->class_val & 0xFF;
+    pkt[p++] = rr->ttl >> 24; pkt[p++] = (rr->ttl >> 16) & 0xFF; pkt[p++] = (rr->ttl >> 8) & 0xFF; pkt[p++] = rr->ttl & 0xFF;
+    pkt[p++] = rr->rdata_len >> 8; pkt[p++] = rr->rdata_len & 0xFF;
+    if (rr->rdata_len) memcpy(pkt + p, zone_image_rr_rdata(img, k), rr->rdata_len);
+    p += rr->rdata_len;
+
+    dns_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    size_t off = 0;
+    uint16_t t = 0;
+    bool raw = (rr->flags & ZONE_IMAGE_RR_RAW) != 0;
+    const dns_rdata_name_layout_t *rlay = dns_rdata_name_layout(rr->type);
+    /* A raw RR keeps its RDATA as it is (never compressed, RDATA of any shape): even for a type whose text form
+     * exists, decoding it would make the record compressible (tinydns ":fqdn:4:...:" generic data). */
+    bool decoded = !(raw && rlay && rlay->compress) && parse_resource_record(pkt, p, &off, a, &rec, &t) == 0;
+    if (!decoded) {
+        if (!raw) {
+            syslog(LOG_ERR, "[Image] thaw: RR %u (type %u) cannot be decoded", k, rr->type);
+            return -1;
+        }
+        memset(&rec, 0, sizeof(rec));
+        rec.name = arena_strdup(a, text);
+        char ttlbuf[16];
+        snprintf(ttlbuf, sizeof(ttlbuf), "%u", rr->ttl);
+        rec.ttl = arena_strdup(a, ttlbuf);
+        rec.ttl_value = rr->ttl;
+        rec.class_val = rr->class_val;
+        rec.class_str = rr->class_val == 1 ? "IN" : (rr->class_val == DNS_CLASS_KARIDNS_EXT ? "KARIDNS" : "CH");
+        rec.type = (char *)get_type_str(rr->type, a);
+        rec.type_code = rr->type;
+        rec.next_record = -1;
+        uint8_t *keep = rr->rdata_len ? arena_alloc(a, rr->rdata_len) : (uint8_t *)"";
+        if (!rec.name || !rec.ttl || !rec.type || !keep) return -1;
+        if (rr->rdata_len) memcpy(keep, zone_image_rr_rdata(img, k), rr->rdata_len);
+        rec.generic_data = keep;
+        rec.generic_len = rr->rdata_len;
+    }
+    if (!rec.name || strcmp(rec.name, text) != 0) {
+        rec.name = arena_strdup(a, text);
+        if (!rec.name) return -1;
+        dns_record_preparse_cache(a, &rec);
+    }
+    /* a record that is raw in the image stays raw even when its RDATA is empty */
+    if ((rr->flags & ZONE_IMAGE_RR_RAW) && !rec.generic_data) {
+        rec.generic_data = (uint8_t *)"";
+        rec.generic_len = 0;
+    }
+    if (ext) {
+        rec.tinydns_ttd = (time_t)ext->ttd;
+        rec.tinydns_ttl_countdown = (ext->flags & ZONE_IMAGE_EXT_COUNTDOWN) != 0;
+        rec.tinydns_loc[0] = ext->loc[0];
+        rec.tinydns_loc[1] = ext->loc[1];
+        if (ext->ecs_tag_off) {
+            rec.ecs_subnet_tag = arena_strdup(a, zone_image_str(img, ext->ecs_tag_off));
+            if (!rec.ecs_subnet_tag) return -1;
+        }
+        if (ext->loc_tag_off) {
+            rec.bind_location_tag = arena_strdup(a, zone_image_str(img, ext->loc_tag_off));
+            if (!rec.bind_location_tag) return -1;
+        }
+    }
+    /* the text form must write the same RDATA: types whose text form cannot hold some RDATA (a NUL octet in a
+     * character-string, more strings than MAX_RDATA) fall back to the wire form kept as it is */
+    uint16_t clen = 0;
+    bool same = serialize_dns_record(chk, 65535, &clen, &rec, NULL, ".", 0xFFFFFFFFu) == 0 && clen == 11 + rr->rdata_len &&
+                (rr->rdata_len == 0 || memcmp(chk + 11, zone_image_rr_rdata(img, k), rr->rdata_len) == 0);
+    if (!same && rec.type_code == 14 && rec.rdata_count >= 2) same = true; /* MINFO: lowercased without a context */
+    if (!same) {
+        const dns_rdata_name_layout_t *lay = dns_rdata_name_layout(rr->type);
+        if (lay && lay->compress) {
+            syslog(LOG_ERR, "[Image] thaw: RR %u (type %u) does not round-trip", k, rr->type);
+            return -1;
+        }
+        uint8_t *keep = rr->rdata_len ? arena_alloc(a, rr->rdata_len) : (uint8_t *)"";
+        if (rr->rdata_len && !keep) return -1;
+        if (rr->rdata_len) memcpy(keep, zone_image_rr_rdata(img, k), rr->rdata_len);
+        rec.generic_data = keep;
+        rec.generic_len = rr->rdata_len;
+    }
+    *out = rec;
+    return 0;
+}
+
+int zone_image_rr_to_record(const zone_image_t *img, uint32_t rr, zone_arena_t *arena, dns_record_t *rec) {
+    if (!img || !arena || !rec || rr >= img->n_rrs) return -1;
+    uint8_t *pkt = malloc(255 + 10 + 65535);
+    uint8_t *chk = malloc(65535);
+    int rc = -1;
+    if (pkt && chk) {
+        rc = thaw_one(img, rr, arena, pkt, chk, rec);
+        if (rc == 0) rec->next_record = -1;
+    }
+    free(pkt);
+    free(chk);
+    return rc;
+}
+
 int zone_image_thaw(const zone_image_t *img, zone_arena_t *a) {
-    if (!img || !a || img->magic != ZONE_IMAGE_MAGIC || a->count != 0 || a->records) return -1;
+    if (!img || !a || img->magic != ZONE_IMAGE_MAGIC || a->count != 0) return -1;
     const uint32_t n = img->n_rrs;
     size_t hint = (size_t)img->total_size * 2 + 4096;
     a->first_pool_cap = hint > (16u << 20) ? (16u << 20) : hint;
+    /* an arena that was used and emptied (count 0) may still own a record array: replace it */
+    free(a->records);
     a->records = calloc(n ? n : 1, sizeof(dns_record_t));
     a->records_cap = n ? n : 1;
     if (!a->records) return -1;
@@ -995,104 +1298,10 @@ int zone_image_thaw(const zone_image_t *img, zone_arena_t *a) {
     uint8_t *chk = malloc(65535);
     if (!pkt || !chk) { free(pkt); free(chk); return -1; }
     int rc = -1;
-    for (uint32_t k = 0; k < n; k++) {
-        const zone_image_rr_t *rr = &zone_image_rrs(img)[k];
-        const zone_image_name_t *nm = &zone_image_names(img)[rr->name_id];
-        const zone_image_ext_t *ext = zone_image_rr_ext(img, k);
-        const char *text = zone_image_str(img, ext && ext->alt_text_off ? ext->alt_text_off : nm->text_off);
-        uint32_t woff = ext && ext->alt_text_off ? ext->alt_wire_off : nm->wire_off;
-        /* a synthetic RR in message form: owner, TYPE, CLASS, TTL, RDLENGTH, RDATA */
-        size_t p = 0;
-        if (woff) {
-            const uint8_t *w = zone_image_bytes(img, woff);
-            int wl = wire_name_len(w, 256);
-            if (wl < 0) goto out;
-            memcpy(pkt, w, (size_t)wl);
-            p = (size_t)wl;
-        } else {
-            pkt[p++] = 0;
-        }
-        pkt[p++] = rr->type >> 8; pkt[p++] = rr->type & 0xFF;
-        pkt[p++] = rr->class_val >> 8; pkt[p++] = rr->class_val & 0xFF;
-        pkt[p++] = rr->ttl >> 24; pkt[p++] = (rr->ttl >> 16) & 0xFF; pkt[p++] = (rr->ttl >> 8) & 0xFF; pkt[p++] = rr->ttl & 0xFF;
-        pkt[p++] = rr->rdata_len >> 8; pkt[p++] = rr->rdata_len & 0xFF;
-        if (rr->rdata_len) memcpy(pkt + p, zone_image_rr_rdata(img, k), rr->rdata_len);
-        p += rr->rdata_len;
-
-        dns_record_t rec;
-        memset(&rec, 0, sizeof(rec));
-        size_t off = 0;
-        uint16_t t = 0;
-        bool raw = (rr->flags & ZONE_IMAGE_RR_RAW) != 0;
-        const dns_rdata_name_layout_t *rlay = dns_rdata_name_layout(rr->type);
-        /* A raw RR keeps its RDATA as it is (never compressed, RDATA of any shape): even for a type whose text form
-         * exists, decoding it would make the record compressible (tinydns ":fqdn:4:...:" generic data). */
-        bool decoded = !(raw && rlay && rlay->compress) && parse_resource_record(pkt, p, &off, a, &rec, &t) == 0;
-        if (!decoded) {
-            if (!raw) {
-                syslog(LOG_ERR, "[Image] thaw: RR %u (type %u) cannot be decoded", k, rr->type);
-                goto out;
-            }
-            memset(&rec, 0, sizeof(rec));
-            rec.name = arena_strdup(a, text);
-            char ttlbuf[16];
-            snprintf(ttlbuf, sizeof(ttlbuf), "%u", rr->ttl);
-            rec.ttl = arena_strdup(a, ttlbuf);
-            rec.ttl_value = rr->ttl;
-            rec.class_val = rr->class_val;
-            rec.class_str = rr->class_val == 1 ? "IN" : (rr->class_val == DNS_CLASS_KARIDNS_EXT ? "KARIDNS" : "CH");
-            rec.type = (char *)get_type_str(rr->type, a);
-            rec.type_code = rr->type;
-            rec.next_record = -1;
-            uint8_t *keep = rr->rdata_len ? arena_alloc(a, rr->rdata_len) : (uint8_t *)"";
-            if (!rec.name || !rec.ttl || !rec.type || !keep) goto out;
-            if (rr->rdata_len) memcpy(keep, zone_image_rr_rdata(img, k), rr->rdata_len);
-            rec.generic_data = keep;
-            rec.generic_len = rr->rdata_len;
-        }
-        if (!rec.name || strcmp(rec.name, text) != 0) {
-            rec.name = arena_strdup(a, text);
-            if (!rec.name) goto out;
-            dns_record_preparse_cache(a, &rec);
-        }
-        /* a record that is raw in the image stays raw even when its RDATA is empty */
-        if ((rr->flags & ZONE_IMAGE_RR_RAW) && !rec.generic_data) {
-            rec.generic_data = (uint8_t *)"";
-            rec.generic_len = 0;
-        }
-        if (ext) {
-            rec.tinydns_ttd = (time_t)ext->ttd;
-            rec.tinydns_ttl_countdown = (ext->flags & ZONE_IMAGE_EXT_COUNTDOWN) != 0;
-            rec.tinydns_loc[0] = ext->loc[0];
-            rec.tinydns_loc[1] = ext->loc[1];
-            if (ext->ecs_tag_off) {
-                rec.ecs_subnet_tag = arena_strdup(a, zone_image_str(img, ext->ecs_tag_off));
-                if (!rec.ecs_subnet_tag) goto out;
-            }
-            if (ext->loc_tag_off) {
-                rec.bind_location_tag = arena_strdup(a, zone_image_str(img, ext->loc_tag_off));
-                if (!rec.bind_location_tag) goto out;
-            }
-        }
-        /* the text form must write the same RDATA: types whose text form cannot hold some RDATA (a NUL octet in a
-         * character-string, more strings than MAX_RDATA) fall back to the wire form kept as it is */
-        uint16_t clen = 0;
-        bool same = serialize_dns_record(chk, 65535, &clen, &rec, NULL, ".", 0xFFFFFFFFu) == 0 && clen == 11 + rr->rdata_len &&
-                    (rr->rdata_len == 0 || memcmp(chk + 11, zone_image_rr_rdata(img, k), rr->rdata_len) == 0);
-        if (!same && rec.type_code == 14 && rec.rdata_count >= 2) same = true; /* MINFO: lowercased without a context */
-        if (!same) {
-            const dns_rdata_name_layout_t *lay = dns_rdata_name_layout(rr->type);
-            if (lay && lay->compress) {
-                syslog(LOG_ERR, "[Image] thaw: RR %u (type %u) does not round-trip", k, rr->type);
-                goto out;
-            }
-            uint8_t *keep = rr->rdata_len ? arena_alloc(a, rr->rdata_len) : (uint8_t *)"";
-            if (rr->rdata_len && !keep) goto out;
-            if (rr->rdata_len) memcpy(keep, zone_image_rr_rdata(img, k), rr->rdata_len);
-            rec.generic_data = keep;
-            rec.generic_len = rr->rdata_len;
-        }
-        a->records[a->count++] = rec;
+    /* file (builder) order: the order the zone had when it was frozen */
+    for (uint32_t seq = 0; seq < n; seq++) {
+        if (thaw_one(img, zone_image_seq_rr(img, seq), a, pkt, chk, &a->records[a->count]) != 0) goto out;
+        a->count++;
     }
     a->is_tinydns_format = (img->flags & ZONE_IMAGE_F_TINYDNS) != 0;
     if (thaw_zattr(img, a) != 0) goto out;

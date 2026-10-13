@@ -496,7 +496,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(server_config_t *config,
                                              catalog_member_id_t *new_desired_members,
                                              int new_desired_count);
 
-void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst);
+int thaw_zone_arena(const zone_arena_t *src, zone_arena_t *dst);
 void zone_arena_clear_data_pools(zone_arena_t *arena);
 void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_arena_t *new_arena);
 void free_ixfr_txn(ixfr_txn_t *txn);
@@ -505,10 +505,9 @@ zone_db_entry_t *find_zone_for_query(view_snapshot_t *view, const char *qname, u
 zone_db_entry_t *find_zone_exact_in_view(view_snapshot_t *view, const char *domain);
 view_snapshot_t *snapshot_find_view(zone_db_snapshot_t *snap, const char *view_name);
 zone_db_entry_t *snapshot_get_zone_in_view(zone_db_snapshot_t *snap, const char *view_name, const char *domain);
-void prelink_zone_additional_glue(zone_arena_t *current_zone,
-                                  const char *zone_domain,
-                                  view_snapshot_t *view,
-                                  additional_from_auth_t policy);
+void zone_glue_track_build(zone_arena_t *arena, const char *zone_domain, view_snapshot_t *view,
+                           additional_from_auth_t policy);
+size_t zone_drop_unencodable_logged(zone_arena_t *a, const char *zone, const char *from);
 /* S2: 公開、解放待ちの処理、兄弟ゾーンの変更に伴うグルーの作り直し (dns_snapshot_rcu.c) */
 void zone_publish(zone_db_entry_t *entry, zone_arena_t *standby);
 void zone_retire_process(bool wait);
