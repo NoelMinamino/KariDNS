@@ -83,7 +83,7 @@ static void test_fi_xfr_parsing(void) {
         axfr_session_t session;
         memset(&session, 0, sizeof(session));
 
-        parse_xfr_packet(pkt, 29, &standby, &active, &session, "example.com.");
+        parse_xfr_packet(pkt, 29, &standby, &active.ver, &session, "example.com.");
         zone_arena_destroy(&standby);
         zone_arena_destroy(&active);
     });
@@ -123,7 +123,7 @@ static void test_fi_axfr_send_and_recv(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "fixfr.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 

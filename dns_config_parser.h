@@ -76,6 +76,10 @@ typedef struct {
   bool backoff_set;
 } notify_retry_config_t;
 
+/* ixfr-history <n>: how many past versions of a zone are kept as IXFR diffs (RFC 1995 §4). options and zone; a zone overrides options. */
+#define IXFR_HISTORY_DEFAULT 4
+#define IXFR_HISTORY_MAX 32
+
 typedef struct zone_config {
   char *domain;
   char *file;
@@ -146,6 +150,9 @@ typedef struct zone_config {
   uint16_t zone_udp_bufsize; /* EDNS UDP ペイロードサイズ上限 (512..4096) */
 
   notify_retry_config_t notify_retry; /* ゾーン単位の上書き (*_set のもの) */
+
+  bool ixfr_history_set;     /* ixfr-history をこのゾーンで指定した */
+  uint8_t ixfr_history;      /* その値 (0..IXFR_HISTORY_MAX) */
 
   struct zone_config *next;
 } zone_config_t;
@@ -270,6 +277,7 @@ typedef struct server_config_s {
   int udp_sndbuf_size;
   /* TCP の転送パラメータ (0 = OS 既定) */
   notify_retry_config_t notify_retry;
+  int ixfr_history;         /* options の ixfr-history (既定 IXFR_HISTORY_DEFAULT) */
   int tcp_mss;              /* TCP_MAXSEG。accept 直後に各接続へ設定 (送信 MSS を下げる方向のみ) */
   int tcp_window;           /* SO_RCVBUF と SO_SNDBUF。listen() 前に設定し accept 済みソケットへ
                              * 継承させる。listen ソケットは reload で作り直さないため再起動が必要 */
@@ -331,6 +339,8 @@ void zone_cfg_index_free(zone_cfg_index_t *ix);
 zone_config_t *view_find_zone_config(const view_config_t *v, const char *domain);
 /* zone (NULL 可) の NOTIFY 再送の設定を、options の値で補って返す */
 notify_retry_config_t notify_retry_effective(const server_config_t *cfg, const zone_config_t *zone);
+/* The IXFR history depth of a zone: its own ixfr-history, else the options value, else IXFR_HISTORY_DEFAULT (zone/cfg may be NULL). */
+int ixfr_history_effective(const server_config_t *cfg, const zone_config_t *zone);
 void free_rate_limit_config(rate_limit_config_t *rrl);
 #include <sys/types.h>
 char *read_entire_file(const char *path, dev_t *out_dev, ino_t *out_ino);

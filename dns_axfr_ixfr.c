@@ -155,12 +155,60 @@ static int ixfr_fill(const zone_image_t *img, const uint32_t *rrs, size_t n, dns
   return 0;
 }
 
-/* Compare the published image of old_arena with the new one and keep the difference in the IXFR history of `entry`
- * (RFC 1995 §4: deletions and additions per version). Does nothing when a serial is missing or not newer, or
- * when the difference is larger than IXFR_MAX_DELTA RRs. */
-void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_arena_t *new_arena) {
-  const zone_image_t *oi = old_arena ? old_arena->image : NULL, *ni = new_arena ? new_arena->image : NULL;
+static void ixfr_txn_release(ixfr_txn_t *txn) {
+  if (txn && atomic_fetch_sub_explicit(&txn->ref_count, 1, memory_order_acq_rel) == 1) free_ixfr_txn(txn);
+}
+
+/* Change the ring to `newcap` slots (h->lock held), keeping the newest diffs in order (oldest first, from slot 0). */
+static int ixfr_ring_resize(ixfr_history_t *h, int newcap) {
+  ixfr_txn_t **ring = NULL;
+  if (newcap > 0) {
+    ring = calloc((size_t)newcap, sizeof(*ring));
+    if (!ring) return -1;
+  }
+  int keep = h->count < newcap ? h->count : newcap;
+  for (int i = 0; i < h->count; i++) {
+    ixfr_txn_t *t = h->entries[(h->head + h->cap - h->count + i) % h->cap];
+    if (i >= h->count - keep) ring[i - (h->count - keep)] = t;
+    else ixfr_txn_release(t); /* the oldest ones go */
+  }
+  free(h->entries);
+  h->entries = ring;
+  h->cap = (uint8_t)newcap;
+  h->count = (uint8_t)keep;
+  h->head = (uint8_t)(newcap > 0 ? keep % newcap : 0);
+  return 0;
+}
+
+void ixfr_history_set_depth(zone_db_entry_t *entry, int depth) {
+  if (depth < 0) depth = 0;
+  if (depth > MAX_IXFR_HISTORY) depth = MAX_IXFR_HISTORY;
+  ixfr_history_t *h = &entry->ixfr_history;
+  pthread_mutex_lock(&h->lock);
+  h->depth_p1 = (uint8_t)(depth + 1);
+  /* a lower depth drops the oldest diffs now; a higher one grows the ring at the next stored diff */
+  if (h->entries && depth < h->cap) (void)ixfr_ring_resize(h, depth);
+  pthread_mutex_unlock(&h->lock);
+}
+
+void ixfr_history_clear(ixfr_history_t *h) {
+  for (int i = 0; i < h->cap && h->entries; i++)
+    if (h->entries[i]) free_ixfr_txn(h->entries[i]);
+  free(h->entries);
+  h->entries = NULL;
+  h->cap = h->head = h->count = 0;
+}
+
+/* Compare the published image of old_ver with the new one and keep the difference in the IXFR history of `entry`
+ * (RFC 1995 §4: deletions and additions per version). Does nothing when the zone keeps no history (ixfr-history 0), a
+ * serial is missing or not newer, or when the difference is larger than IXFR_MAX_DELTA RRs. */
+void compute_ixfr_diff(zone_db_entry_t *entry, const zone_version_t *old_ver, const zone_version_t *new_ver) {
+  const zone_image_t *oi = old_ver ? old_ver->image : NULL, *ni = new_ver ? new_ver->image : NULL;
   if (!oi || !ni) return;
+  pthread_mutex_lock(&entry->ixfr_history.lock);
+  int depth = ixfr_history_depth(&entry->ixfr_history);
+  pthread_mutex_unlock(&entry->ixfr_history.lock);
+  if (depth == 0) return;
   uint32_t old_serial = 0, new_serial = 0;
   (void)ixfr_apex_serial(oi, &old_serial);
   (void)ixfr_apex_serial(ni, &new_serial);
@@ -199,21 +247,24 @@ void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_are
   txn->added_count = (int)add_count;
   atomic_init(&txn->ref_count, 1);
 
-  pthread_mutex_lock(&entry->ixfr_history.lock);
-  int new_head = entry->ixfr_history.head;
-  if (entry->ixfr_history.count == MAX_IXFR_HISTORY) {
-    ixfr_txn_t *old_txn = entry->ixfr_history.entries[new_head];
-    if (old_txn) {
-      if (atomic_fetch_sub_explicit(&old_txn->ref_count, 1, memory_order_acq_rel) == 1) {
-        free_ixfr_txn(old_txn);
-      }
-    }
-  } else {
-    entry->ixfr_history.count++;
+  ixfr_history_t *h = &entry->ixfr_history;
+  pthread_mutex_lock(&h->lock);
+  depth = ixfr_history_depth(h); /* may have changed while the diff was computed */
+  /* the ring is made on the first diff, with the configured size; a raised depth grows it here */
+  if (depth > 0 && (!h->entries || h->cap < depth) && ixfr_ring_resize(h, depth) != 0) depth = 0;
+  if (depth == 0) {
+    pthread_mutex_unlock(&h->lock);
+    free_ixfr_txn(txn);
+    goto out;
   }
-  entry->ixfr_history.entries[new_head] = txn;
-  entry->ixfr_history.head = (new_head + 1) % MAX_IXFR_HISTORY;
-  pthread_mutex_unlock(&entry->ixfr_history.lock);
+  if (h->count == h->cap) {
+    ixfr_txn_release(h->entries[h->head]);
+  } else {
+    h->count++;
+  }
+  h->entries[h->head] = txn;
+  h->head = (uint8_t)((h->head + 1) % h->cap);
+  pthread_mutex_unlock(&h->lock);
 out:
   free(del_rr);
   free(add_rr);
@@ -282,7 +333,7 @@ int xfr_check_response_header(const uint8_t *msg, size_t msg_len, axfr_session_t
 }
 
 int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
-                     zone_arena_t *standby, zone_arena_t *active,
+                     zone_arena_t *standby, const zone_version_t *active,
                      axfr_session_t *session, const char *domain) {
   /* 拒否する経路では、運用者が原因を探せるよう必ずゾーン名と理由をログに出す (R-27) */
   if (packet_len < DNS_HEADER_SIZE) {
@@ -618,7 +669,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
   /* 転送の間ずっと読み取り区間の外で使う。このゾーンの arena を入れ替えるのは
    * この転送 (is_transferring で1本に限る) と制御スレッドの Pass 2 prelink だけで、
    * Pass 2 は転送中のゾーンを飛ばすので、この arena は転送の完了まで再利用されない。*/
-  zone_arena_t *active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  zone_version_t *active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   int ret_code = -1;
 
   uint8_t prior_mac[64];
@@ -748,16 +799,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
           syslog(LOG_WARNING, "[XFR] Inbound transfer swap for zone '%s' postponed: active AXFR in progress.", entry->domain);
           return -1;
         }
-        zone_arena_t *cur_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-        zone_arena_t *standby = (cur_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b
-                                                                    : &entry->rcu.arena_a;
-        if (!rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000)) {
-          pthread_mutex_unlock(&entry->writer_lock);
-          if (unsigned_msgs) free(unsigned_msgs);
-          zone_arena_destroy(&tmp_arena);
-          syslog(LOG_ERR, "[XFR] Inbound transfer swap for zone '%s' aborted: RCU grace period wait timed out", entry->domain);
-          return -1;
-        }
+        zone_version_t *cur_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
 
         if (has_soa) {
           time_t now = time(NULL);
@@ -772,9 +814,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
           atomic_store_explicit(&entry->last_successful_transfer, now, memory_order_release);
         }
 
-        /* S5 B-2: the received zone (tmp_arena) is the builder; only its image goes into the RCU slot.
-         * The slot may still hold the previous version's remains (a retire that could not be queued). */
-        zone_arena_destroy(standby);
+        /* S5 B-2: the received zone (tmp_arena) is the builder; only its image is published (S5 B-3: as a new version) */
         zone_arena_shrink_records(&tmp_arena);
         if (build_zone_index(&tmp_arena, true) != 0) {
           pthread_mutex_unlock(&entry->writer_lock);
@@ -785,8 +825,8 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         }
 
         /* S5 B-1: 応答を作る側が読むイメージ。公開の直前に 1 回だけ作る。作れなければ索引を作れなかったときと同じく転送を捨てる */
-        standby->image = zone_image_freeze(&tmp_arena, entry->domain);
-        if (!standby->image) {
+        tmp_arena.image = zone_image_freeze(&tmp_arena, entry->domain);
+        if (!tmp_arena.image) {
           pthread_mutex_unlock(&entry->writer_lock);
           if (unsigned_msgs) free(unsigned_msgs);
           zone_arena_destroy(&tmp_arena);
@@ -794,6 +834,14 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
           return -1;
         }
         zone_arena_free_builder(&tmp_arena);
+        zone_version_t *standby = zone_version_new(&tmp_arena);
+        if (!standby) {
+          pthread_mutex_unlock(&entry->writer_lock);
+          if (unsigned_msgs) free(unsigned_msgs);
+          zone_arena_destroy(&tmp_arena);
+          syslog(LOG_ERR, "[Zone] Out of memory publishing the zone after XFR for '%s'", entry->domain);
+          return -1;
+        }
 
         // 設定は制御スレッドが並行して入れ替えるので、読み取り区間の中で読む
         rcu_aux_read_lock();
@@ -1254,7 +1302,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   /* arena は呼び出し側 (axfr_worker_thread) の読み取り区間 (rcu_aux_read_lock) と entry->active_axfr
    * (writer は wait_for_active_axfr() で待つ) で守られる。X-03: arena の reader_count は待つ側が
    * 無かったので削除した。 */
-  zone_arena_t *current_arena = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  zone_version_t *current_arena = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   const zone_image_t *current_zone = current_arena->image;
   if (!current_zone || current_zone->n_rrs == 0) {
     /* X-19: まだデータの無いゾーン (未転送のセカンダリなど)。何も送らないとクライアントは
@@ -1351,12 +1399,14 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   if (client_up_to_date) {
     send_ixfr = true;
   } else if (is_ixfr) {
+    /* RFC 1995 §4: when no incremental answer is available (no history at all with ixfr-history 0, or the client's
+     * serial is older than the oldest kept diff) the whole zone is sent, AXFR style */
     pthread_mutex_lock(&entry->ixfr_history.lock);
     if (entry->ixfr_history.count > 0) {
-    int start_idx = (entry->ixfr_history.head + MAX_IXFR_HISTORY - entry->ixfr_history.count) % MAX_IXFR_HISTORY;
+    int start_idx = (entry->ixfr_history.head + entry->ixfr_history.cap - entry->ixfr_history.count) % entry->ixfr_history.cap;
     int found_idx = -1;
     for (int i = 0; i < entry->ixfr_history.count; i++) {
-      int idx = (start_idx + i) % MAX_IXFR_HISTORY;
+      int idx = (start_idx + i) % entry->ixfr_history.cap;
       ixfr_txn_t *txn = entry->ixfr_history.entries[idx];
       if (txn && txn->old_serial == client_serial) {
         found_idx = i;
@@ -1367,7 +1417,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       bool continuous = true;
       uint32_t expected_serial = client_serial;
       for (int i = found_idx; i < entry->ixfr_history.count; i++) {
-        int idx = (start_idx + i) % MAX_IXFR_HISTORY;
+        int idx = (start_idx + i) % entry->ixfr_history.cap;
         ixfr_txn_t *txn = entry->ixfr_history.entries[idx];
         if (!txn || txn->old_serial != expected_serial) {
           continuous = false;
@@ -1378,7 +1428,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       if (continuous && expected_serial == current_serial) {
         send_ixfr = true;
         for (int i = found_idx; i < entry->ixfr_history.count; i++) {
-          int idx = (start_idx + i) % MAX_IXFR_HISTORY;
+          int idx = (start_idx + i) % entry->ixfr_history.cap;
           ixfr_txn_t *txn = entry->ixfr_history.entries[idx];
           if (txn) {
             atomic_fetch_add_explicit(&txn->ref_count, 1, memory_order_acquire);

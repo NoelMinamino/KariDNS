@@ -1588,6 +1588,11 @@ notify_retry_config_t notify_retry_effective(const server_config_t *cfg, const z
   return r;
 }
 
+int ixfr_history_effective(const server_config_t *cfg, const zone_config_t *zone) {
+  if (zone && zone->ixfr_history_set) return zone->ixfr_history;
+  return cfg ? cfg->ixfr_history : IXFR_HISTORY_DEFAULT;
+}
+
 static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
   conf_token_t tok = get_next_token(ctx);
   int nr_rc = 0;
@@ -1910,6 +1915,15 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         return -1;
       }
       free_token(&tok);
+    } else if (strcmp(key, "ixfr-history") == 0) {
+      int v = 0;
+      if (parse_transport_param(ctx, zone->domain, key, false, 0, IXFR_HISTORY_MAX, &v) != 0) {
+        free(key);
+        free_zone_config(zone);
+        return -1;
+      }
+      zone->ixfr_history = (uint8_t)v;
+      zone->ixfr_history_set = true;
     } else if (strncmp(key, "notify-retr", 11) == 0 &&
                (nr_rc = parse_notify_retry_option(ctx, zone->domain, key, &zone->notify_retry)) != 0) {
       if (nr_rc < 0) {
@@ -2098,6 +2112,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->notify_retry.retries = NOTIFY_RETRIES_DEFAULT;
   config->notify_retry.interval = NOTIFY_RETRY_INTERVAL_DEFAULT;
   config->notify_retry.backoff = NOTIFY_BACKOFF_FIXED;
+  config->ixfr_history = IXFR_HISTORY_DEFAULT;
   config->query_log_max_qps = 5000;
   config->query_log_buffer_size = 32768;
   config->max_mqtypes = 4;
@@ -2484,6 +2499,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           free_token(&tok);
+        } else if (strcmp(key, "ixfr-history") == 0) {
+          if (parse_transport_param(ctx, NULL, key, false, 0, IXFR_HISTORY_MAX, &config->ixfr_history) != 0) {
+            free(key);
+            return -1;
+          }
         } else if (strncmp(key, "notify-retr", 11) == 0 &&
                    (nr_rc = parse_notify_retry_option(ctx, NULL, key, &config->notify_retry)) != 0) {
           if (nr_rc < 0) {

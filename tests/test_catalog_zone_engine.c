@@ -134,7 +134,7 @@ static void test_catalog_process_membership_rfc9432(void) {
     zone_arena_t a_no_ver;
     memset(&a_no_ver, 0, sizeof(a_no_ver));
     zone_arena_init(&a_no_ver);
-    atomic_store_explicit(&cat_entry.rcu.active, &a_no_ver, memory_order_release);
+    atomic_store_explicit(&cat_entry.rcu.active, &a_no_ver.ver, memory_order_release);
 
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
     assert(cat_entry.catalog_member_count == 0);
@@ -170,7 +170,7 @@ static void test_catalog_process_membership_rfc9432(void) {
     r_p2.rdata[0] = arena_strdup(&a_dup_ptr, "m2.example.");
     a_dup_ptr.records[a_dup_ptr.count++] = r_p2;
 
-    atomic_store_explicit(&cat_entry.rcu.active, &a_dup_ptr, memory_order_release);
+    atomic_store_explicit(&cat_entry.rcu.active, &a_dup_ptr.ver, memory_order_release);
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
     assert(cat_entry.catalog_member_count == 0); // Broken catalog rejected!
 
@@ -196,7 +196,7 @@ static void test_catalog_process_membership_rfc9432(void) {
     r_u2.rdata[0] = arena_strdup(&a_dup_target, "same.example.");
     a_dup_target.records[a_dup_target.count++] = r_u2;
 
-    atomic_store_explicit(&cat_entry.rcu.active, &a_dup_target, memory_order_release);
+    atomic_store_explicit(&cat_entry.rcu.active, &a_dup_target.ver, memory_order_release);
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
     assert(cat_entry.catalog_member_count == 0); // Duplicate target domain rejected!
 
@@ -223,7 +223,7 @@ static void test_catalog_process_membership_rfc9432(void) {
     r_col.rdata[0] = arena_strdup(&a_static_col, "static.example.");
     a_static_col.records[a_static_col.count++] = r_col;
 
-    atomic_store_explicit(&cat_entry.rcu.active, &a_static_col, memory_order_release);
+    atomic_store_explicit(&cat_entry.rcu.active, &a_static_col.ver, memory_order_release);
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
     assert(cat_entry.catalog_member_count == 0); // Colliding member skipped!
 
@@ -256,7 +256,7 @@ static void test_catalog_process_membership_rfc9432(void) {
     r_coo2.rdata[0] = arena_strdup(&a_mult_coo, "target2.catalog.");
     a_mult_coo.records[a_mult_coo.count++] = r_coo2;
 
-    atomic_store_explicit(&cat_entry.rcu.active, &a_mult_coo, memory_order_release);
+    atomic_store_explicit(&cat_entry.rcu.active, &a_mult_coo.ver, memory_order_release);
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
     assert(cat_entry.catalog_member_count == 0); // Multiple coo records rejected!
 
@@ -370,7 +370,7 @@ static void test_find_catalog_parent_and_valid_properties(void) {
     r_coo.rdata[0] = arena_strdup(&a_valid, "newcatalog.example.");
     a_valid.records[a_valid.count++] = r_coo;
 
-    atomic_store_explicit(&cat_parent.rcu.active, &a_valid, memory_order_release);
+    atomic_store_explicit(&cat_parent.rcu.active, &a_valid.ver, memory_order_release);
     catalog_process_membership(&cat_parent, &cat_cfg, "default");
 
     // Clean up

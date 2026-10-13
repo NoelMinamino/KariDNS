@@ -54,7 +54,7 @@ static void init_fuzz_environment(void) {
 
     memset(&g_fuzz_entry, 0, sizeof(g_fuzz_entry));
     strncpy(g_fuzz_entry.domain, "fuzz.local.", sizeof(g_fuzz_entry.domain) - 1);
-    atomic_store_explicit(&g_fuzz_entry.rcu.active, &g_fuzz_arena, memory_order_release);
+    atomic_store_explicit(&g_fuzz_entry.rcu.active, &g_fuzz_arena.ver, memory_order_release);
 
     g_fuzz_entries[0] = &g_fuzz_entry;
 
@@ -118,7 +118,7 @@ static void check_nsec3_active(zone_arena_t *arena) {
 /* Phase 9: DO=1 queries against the fuzzed zone (answer sections, RRSIG attachment, NSEC/NSEC3 proofs, glue),
  * with a 512-octet and a 4096-octet EDNS buffer, for the apex, a missing name and the first owners of the zone. */
 static void query_fuzzed_zone(zone_arena_t *arena) {
-    atomic_store_explicit(&g_fuzz_entry.rcu.active, arena, memory_order_release);
+    atomic_store_explicit(&g_fuzz_entry.rcu.active, &arena->ver, memory_order_release);
     static const uint16_t types[] = { 255, 1, 43, 48, 15, 2 };
     const char *names[6] = { "fuzz.local.", "nx.fuzz.local.", "a.b.fuzz.local.", NULL, NULL, NULL };
     uint16_t own_type[6] = { 6, 1, 1, 0, 0, 0 };
@@ -151,7 +151,7 @@ static void query_fuzzed_zone(zone_arena_t *arena) {
                               &g_fuzz_snap);
         }
     }
-    atomic_store_explicit(&g_fuzz_entry.rcu.active, &g_fuzz_arena, memory_order_release);
+    atomic_store_explicit(&g_fuzz_entry.rcu.active, &g_fuzz_arena.ver, memory_order_release);
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
@@ -214,7 +214,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         memset(&session, 0, sizeof(session));
 
         /* R-33: transferred NSEC3 RRs get text fields and enter the index like file-loaded ones */
-        if (parse_xfr_packet(fuzz_data, fuzz_size, &standby, &active, &session, "fuzz.local.") == 0 &&
+        if (parse_xfr_packet(fuzz_data, fuzz_size, &standby, &active.ver, &session, "fuzz.local.") == 0 &&
             build_zone_index(&standby, true) == 0)
             check_nsec3_index(&standby);
 

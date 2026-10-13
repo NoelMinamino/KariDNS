@@ -20,6 +20,7 @@
 #include "../dns_query_engine.h"
 #include "../dns_snapshot_rcu.h"
 #include "../dns_axfr_ixfr.h"
+#include "test_zone_slots.h"
 
 // Mock globals
 int g_control_kq = -1;
@@ -76,17 +77,17 @@ static void test_fi_dynamic_update(void) {
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
-    zone_arena_init(&entry.rcu.arena_a);
-    zone_arena_init(&entry.rcu.arena_b);
+    zone_arena_init(test_zone_slot(&entry, 0));
+    zone_arena_init(test_zone_slot(&entry, 1));
 
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err };
     char zone_text[] = "example.com. 3600 IN SOA ns1.example.com. admin.example.com. 100 3600 1800 604800 86400\n"
                        "example.com. 3600 IN NS ns1.example.com.\n";
-    parse_zone_fast(zone_text, sizeof(zone_text) - 1, &entry.rcu.arena_a, &ctx);
-    build_zone_index(&entry.rcu.arena_a, true);
+    parse_zone_fast(zone_text, sizeof(zone_text) - 1, test_zone_slot(&entry, 0), &ctx);
+    build_zone_index(test_zone_slot(&entry, 0), true);
 
-    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
     atomic_store_explicit(&entry.serial, 100, memory_order_release);
 
     uint8_t update_pkt[512];
@@ -100,8 +101,8 @@ static void test_fi_dynamic_update(void) {
         handle_dynamic_update(update_pkt, 29, &entry, "127.0.0.1", "key-admin");
     });
 
-    zone_arena_destroy(&entry.rcu.arena_a);
-    zone_arena_destroy(&entry.rcu.arena_b);
+    zone_arena_destroy(test_zone_slot(&entry, 0));
+    zone_arena_destroy(test_zone_slot(&entry, 1));
     pthread_mutex_destroy(&entry.writer_lock);
     pthread_mutex_destroy(&entry.ixfr_history.lock);
 }

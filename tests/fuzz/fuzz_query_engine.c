@@ -153,7 +153,7 @@ static void init_rich_fuzz_engine(void) {
     
     memset(&g_fuzz_entries[0], 0, sizeof(g_fuzz_entries[0]));
     strncpy(g_fuzz_entries[0].domain, "example.com.", sizeof(g_fuzz_entries[0].domain) - 1);
-    atomic_store_explicit(&g_fuzz_entries[0].rcu.active, &g_fuzz_arena_main, memory_order_release);
+    atomic_store_explicit(&g_fuzz_entries[0].rcu.active, &g_fuzz_arena_main.ver, memory_order_release);
     g_fuzz_entry_ptrs[0] = &g_fuzz_entries[0];
 
     // Sub zone
@@ -166,7 +166,7 @@ static void init_rich_fuzz_engine(void) {
     
     memset(&g_fuzz_entries[1], 0, sizeof(g_fuzz_entries[1]));
     strncpy(g_fuzz_entries[1].domain, "sub.example.org.", sizeof(g_fuzz_entries[1].domain) - 1);
-    atomic_store_explicit(&g_fuzz_entries[1].rcu.active, &g_fuzz_arena_sub, memory_order_release);
+    atomic_store_explicit(&g_fuzz_entries[1].rcu.active, &g_fuzz_arena_sub.ver, memory_order_release);
     g_fuzz_entry_ptrs[1] = &g_fuzz_entries[1];
 
     // NSEC3 zone
@@ -179,7 +179,7 @@ static void init_rich_fuzz_engine(void) {
     
     memset(&g_fuzz_entries[2], 0, sizeof(g_fuzz_entries[2]));
     strncpy(g_fuzz_entries[2].domain, "signed.local.", sizeof(g_fuzz_entries[2].domain) - 1);
-    atomic_store_explicit(&g_fuzz_entries[2].rcu.active, &g_fuzz_arena_nsec3, memory_order_release);
+    atomic_store_explicit(&g_fuzz_entries[2].rcu.active, &g_fuzz_arena_nsec3.ver, memory_order_release);
     g_fuzz_entry_ptrs[2] = &g_fuzz_entries[2];
 
     // Snapshot View
@@ -217,9 +217,9 @@ static void init_rich_fuzz_engine(void) {
 
     /* The shared response cache (filled on a miss, read on later inputs) and its eligibility per zone */
     response_cache_init(256 * 1024);
-    build_zone_response_cache(&g_fuzz_arena_main, &g_fuzz_cfg, "default", "example.com.");
-    build_zone_response_cache(&g_fuzz_arena_sub, &g_fuzz_cfg, "default", "sub.example.org.");
-    build_zone_response_cache(&g_fuzz_arena_nsec3, &g_fuzz_cfg, "default", "signed.local.");
+    build_zone_response_cache(&g_fuzz_arena_main.ver, &g_fuzz_cfg, "default", "example.com.");
+    build_zone_response_cache(&g_fuzz_arena_sub.ver, &g_fuzz_cfg, "default", "sub.example.org.");
+    build_zone_response_cache(&g_fuzz_arena_nsec3.ver, &g_fuzz_cfg, "default", "signed.local.");
 
     g_fuzz_qe_initialized = true;
 }

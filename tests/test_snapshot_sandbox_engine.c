@@ -216,7 +216,7 @@ static void test_snapshot_rcu_lifecycle_and_suffix_lookup(void) {
     src.bind_ecs_trusted_resolver_count = 1;
 
     assert(test_build_index(&src, false) == 0);   /* S5 B-2: the published image is what UPDATE / IXFR rebuild a builder from */
-    assert(thaw_zone_arena(&src, &dst) == 0);
+    assert(thaw_zone_arena(&src.ver, &dst) == 0);
     assert(dst.count == 1);
     assert(strcmp(dst.records[0].name, "host.example.com.") == 0);
     assert(strcmp(dst.records[0].rdata[0], "192.0.2.55") == 0);

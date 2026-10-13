@@ -1886,6 +1886,25 @@ void zone_arena_destroy(zone_arena_t *arena) {
   arena->rcache_ok = false;
   atomic_store_explicit(&arena->generation, 0, memory_order_relaxed);
 }
+
+zone_version_t zone_version_empty;
+
+zone_version_t *zone_version_new(zone_arena_t *builder) {
+  zone_version_t *v = calloc(1, sizeof(*v));
+  if (!v) return NULL;
+  v->image = builder->image;
+  v->heap = true;
+  builder->image = NULL;
+  return v;
+}
+
+void zone_version_free(zone_version_t *v) {
+  if (!v || !v->heap) return;
+  free(v->image);
+  free(v->glue);
+  free(v);
+}
+
 uint32_t calc_fnv1a_str(const char *str) {
   uint32_t hash = 2166136261u;
   for (const char *p = str; *p; p++) {

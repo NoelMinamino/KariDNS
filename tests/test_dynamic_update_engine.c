@@ -23,6 +23,7 @@
 #include "dns_query_engine.h"
 #include "dns_axfr_ixfr.h"
 #include "dns_utils.h"
+#include "test_zone_slots.h"
 
 // Mock globals needed by server internal dependencies
 int g_control_kq = -1;
@@ -252,9 +253,9 @@ static void test_handle_dynamic_update_pipeline(void) {
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
-    init_sample_zone_arena(&entry.rcu.arena_a, "example.com.", "1000");
-    init_sample_zone_arena(&entry.rcu.arena_b, "example.com.", "1000");
-    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+    init_sample_zone_arena(test_zone_slot(&entry, 0), "example.com.", "1000");
+    init_sample_zone_arena(test_zone_slot(&entry, 1), "example.com.", "1000");
+    atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
     atomic_store_explicit(&entry.serial, 1000, memory_order_release);
 
     // 1. AXFR in progress -> Rejected with SERVFAIL (rcode 2)
@@ -292,11 +293,11 @@ static void test_handle_dynamic_update_pipeline(void) {
     assert(r_success == 0); // NOERROR
     assert(atomic_load_explicit(&entry.serial, memory_order_acquire) == 1001);
     assert(atomic_load_explicit(&entry.notify_now, memory_order_acquire) == true);
-    assert(atomic_load_explicit(&entry.rcu.active, memory_order_acquire) == &entry.rcu.arena_b);
+    assert(atomic_load_explicit(&entry.rcu.active, memory_order_acquire)->heap); /* a new heap version was published */
 
     // Verify record in active arena (arena_b)
-    zone_arena_t *z_cur = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
-    assert(z_cur->count == 0); /* S5 B-2: the builder is freed after publishing */
+    zone_version_t *z_cur = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
+    assert(z_cur->image != NULL); /* S5 B-2: only the image is published (a zone_version_t has no builder) */
     /* S5 B-1: the published version carries the image the engine reads, with the added RR in it */
     assert(z_cur->image != NULL && z_cur->image->n_rrs == 2);
     uint32_t www_id = zone_image_find_name(z_cur->image, "www.example.com.");
@@ -329,8 +330,8 @@ static void test_handle_dynamic_update_pipeline(void) {
     assert(r_prereq == 3); // NXDOMAIN (RFC 2136 rcode 3)
 
     // Clean up
-    zone_arena_destroy(&entry.rcu.arena_a);
-    zone_arena_destroy(&entry.rcu.arena_b);
+    zone_arena_destroy(test_zone_slot(&entry, 0));
+    zone_arena_destroy(test_zone_slot(&entry, 1));
     pthread_mutex_destroy(&entry.writer_lock);
     pthread_mutex_destroy(&entry.ixfr_history.lock);
 
@@ -348,8 +349,8 @@ static void test_handle_dynamic_update_drops_unencodable(void) {
     strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
-    init_sample_zone_arena(&entry.rcu.arena_a, "example.com.", "1000");
-    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+    init_sample_zone_arena(test_zone_slot(&entry, 0), "example.com.", "1000");
+    atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
     atomic_store_explicit(&entry.serial, 1000, memory_order_release);
 
     uint8_t pkt[512] = {0};
@@ -377,13 +378,12 @@ static void test_handle_dynamic_update_drops_unencodable(void) {
 
     assert(handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "key") == 0);
     assert(atomic_load_explicit(&entry.serial, memory_order_acquire) == 1001);
-    zone_arena_t *cur = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
-    assert(cur != &entry.rcu.arena_a && cur->image != NULL);
+    zone_version_t *cur = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
+    assert(cur != &test_zone_slot(&entry, 0)->ver && cur->heap && cur->image != NULL);
     assert(cur->image->n_rrs == 2);   /* SOA + www A: the TXT was dropped, the A applied */
     uint32_t id = zone_image_find_name(cur->image, "www.example.com.");
     assert(id != ZONE_IMAGE_NONE && zone_image_rrset_next(cur->image, id, 1, zone_image_name_first_rr(cur->image, id)) != ZONE_IMAGE_NONE);
     assert(zone_image_find_name(cur->image, "bad.example.com.") == ZONE_IMAGE_NONE);
-    assert(cur->records == NULL && cur->hash_table == NULL && cur->data_pool_count == 0); /* builder freed */
 
     /* 3. an UPDATE whose only addition cannot be encoded changes nothing: no serial bump, nothing published
      * (RFC 2136 §3.6) */
@@ -400,8 +400,8 @@ static void test_handle_dynamic_update_drops_unencodable(void) {
     assert(atomic_load_explicit(&entry.serial, memory_order_acquire) == serial_before);
     assert(atomic_load_explicit(&entry.rcu.active, memory_order_acquire) == cur);
 
-    zone_arena_destroy(&entry.rcu.arena_a);
-    zone_arena_destroy(&entry.rcu.arena_b);
+    zone_arena_destroy(test_zone_slot(&entry, 0));
+    zone_arena_destroy(test_zone_slot(&entry, 1));
     pthread_mutex_destroy(&entry.writer_lock);
     pthread_mutex_destroy(&entry.ixfr_history.lock);
     printf("  -> unencodable UPDATE RR dropped passed.\n");
@@ -453,13 +453,13 @@ static void test_send_notify_to_all_comprehensive(void) {
     zone_db_entry_t *z2 = snapshot_get_zone(snap, "sibling.com.");
     assert(z1 && z2);
 
-    init_sample_zone_arena(&z1->rcu.arena_a, "example.com.", "100");
+    init_sample_zone_arena(test_zone_slot(z1, 0), "example.com.", "100");
 
     // Add NS records and glue in z1
     // NS 1: ns1.example.com (matches SOA MNAME -> excluded)
     // NS 2: ns2.example.com -> in-zone A and AAAA glue
     // NS 3: ns1.sibling.com -> sibling zone glue
-    zone_arena_t *a1 = &z1->rcu.arena_a;
+    zone_arena_t *a1 = test_zone_slot(z1, 0);
     dns_record_t *new_recs = realloc(a1->records, sizeof(dns_record_t) * 16);
     assert(new_recs);
     a1->records = new_recs;
@@ -503,11 +503,11 @@ static void test_send_notify_to_all_comprehensive(void) {
     a1->records[a1->count++] = r_g6;
 
     assert(test_build_index(a1, true) == 0);
-    atomic_store_explicit(&z1->rcu.active, a1, memory_order_release);
+    atomic_store_explicit(&z1->rcu.active, &a1->ver, memory_order_release);
 
     // Sibling zone z2: sibling.com
-    init_sample_zone_arena(&z2->rcu.arena_a, "sibling.com.", "100");
-    zone_arena_t *a2 = &z2->rcu.arena_a;
+    init_sample_zone_arena(test_zone_slot(z2, 0), "sibling.com.", "100");
+    zone_arena_t *a2 = test_zone_slot(z2, 0);
     dns_record_t *new_recs2 = realloc(a2->records, sizeof(dns_record_t) * 16);
     assert(new_recs2);
     a2->records = new_recs2;
@@ -528,7 +528,7 @@ static void test_send_notify_to_all_comprehensive(void) {
     a2->records[a2->count++] = r_sib6;
 
     assert(test_build_index(a2, true) == 0);
-    atomic_store_explicit(&z2->rcu.active, a2, memory_order_release);
+    atomic_store_explicit(&z2->rcu.active, &a2->ver, memory_order_release);
 
     send_notify_to_all("example.com.", "default");
 
@@ -717,9 +717,9 @@ static void test_update_multi_tsig_keys(void) {
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
-    init_sample_zone_arena(&entry.rcu.arena_a, "example.com.", "100");
-    init_sample_zone_arena(&entry.rcu.arena_b, "example.com.", "100");
-    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+    init_sample_zone_arena(test_zone_slot(&entry, 0), "example.com.", "100");
+    init_sample_zone_arena(test_zone_slot(&entry, 1), "example.com.", "100");
+    atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
     atomic_store_explicit(&entry.serial, 100, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &entry };
@@ -781,8 +781,8 @@ static void test_update_multi_tsig_keys(void) {
     uint8_t rcode = res[3] & 0x0F;
     assert(rcode == 0); // MUST NOT be 9 (NOTAUTH)! Must succeed with NOERROR (0)
 
-    zone_arena_destroy(&entry.rcu.arena_a);
-    zone_arena_destroy(&entry.rcu.arena_b);
+    zone_arena_destroy(test_zone_slot(&entry, 0));
+    zone_arena_destroy(test_zone_slot(&entry, 1));
     pthread_mutex_destroy(&entry.writer_lock);
     pthread_mutex_destroy(&entry.ixfr_history.lock);
 
@@ -1066,7 +1066,7 @@ static const dns_record_t *upd_get(const zone_arena_t *a, const char *name, uint
 }
 
 /* S5 B-2: a published version has no builder, only its image */
-static int upd_img_count(const zone_arena_t *a, const char *name, uint16_t type) {
+static int upd_img_count(const zone_version_t *a, const char *name, uint16_t type) {
     uint32_t id = zone_image_find_name(a->image, name);
     int n = 0;
     if (id == ZONE_IMAGE_NONE) return 0;
@@ -1076,7 +1076,7 @@ static int upd_img_count(const zone_arena_t *a, const char *name, uint16_t type)
     return n;
 }
 
-static uint32_t upd_img_serial(const zone_arena_t *a) {
+static uint32_t upd_img_serial(const zone_version_t *a) {
     zone_image_soa_t nums;
     uint32_t rr = zone_image_apex_soa(a->image);
     assert(rr != ZONE_IMAGE_NONE && zone_image_soa(a->image, rr, NULL, 0, NULL, 0, &nums) == 0);
@@ -1497,15 +1497,15 @@ static void upd_entry_init(zone_db_entry_t *entry) {
     strlcpy(entry->view_name, "default", sizeof(entry->view_name));
     pthread_mutex_init(&entry->writer_lock, NULL);
     pthread_mutex_init(&entry->ixfr_history.lock, NULL);
-    upd_load(&entry->rcu.arena_a);
-    upd_load(&entry->rcu.arena_b);
-    atomic_store_explicit(&entry->rcu.active, &entry->rcu.arena_a, memory_order_release);
+    upd_load(test_zone_slot(entry, 0));
+    upd_load(test_zone_slot(entry, 1));
+    atomic_store_explicit(&entry->rcu.active, &test_zone_slot(entry, 0)->ver, memory_order_release);
     atomic_store_explicit(&entry->serial, 100, memory_order_release);
 }
 
 static void upd_entry_destroy(zone_db_entry_t *entry) {
-    zone_arena_destroy(&entry->rcu.arena_a);
-    zone_arena_destroy(&entry->rcu.arena_b);
+    zone_arena_destroy(test_zone_slot(entry, 0));
+    zone_arena_destroy(test_zone_slot(entry, 1));
     pthread_mutex_destroy(&entry->writer_lock);
     pthread_mutex_destroy(&entry->ixfr_history.lock);
 }
@@ -1520,7 +1520,7 @@ static void test_handle_dynamic_update_serial_rules(void) {
     upd_begin(&m);
     upd_rr(&m, true, "www." UZ, 255, 255, 0, NULL, 0);
     assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 0);
-    assert(atomic_load(&entry.rcu.active) == &entry.rcu.arena_a);
+    assert(atomic_load(&entry.rcu.active) == &test_zone_slot(&entry, 0)->ver);
     assert(atomic_load(&entry.serial) == 100);
     assert(!atomic_load(&entry.notify_now));
 
@@ -1529,7 +1529,7 @@ static void test_handle_dynamic_update_serial_rules(void) {
     upd_named(&m, "www." UZ, 5, 1, "ns1." UZ);
     upd_soa(&m, UZ, 1, 50);
     assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 0);
-    assert(atomic_load(&entry.rcu.active) == &entry.rcu.arena_a);
+    assert(atomic_load(&entry.rcu.active) == &test_zone_slot(&entry, 0)->ver);
     assert(atomic_load(&entry.serial) == 100);
 
     /* explicit newer SOA together with other data: that serial, no automatic increment (R-01) */
@@ -1537,8 +1537,8 @@ static void test_handle_dynamic_update_serial_rules(void) {
     upd_soa(&m, UZ, 1, 500);
     upd_a(&m, false, "new." UZ, 1, 300, 20);
     assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 0);
-    zone_arena_t *cur = atomic_load(&entry.rcu.active);
-    assert(cur == &entry.rcu.arena_b);
+    zone_version_t *cur = atomic_load(&entry.rcu.active);
+    assert(cur->heap);
     assert(atomic_load(&entry.serial) == 500);
     assert(upd_img_count(cur, UZ, 6) == 1 && upd_img_serial(cur) == 500);
     assert(upd_img_count(cur, "new." UZ, 1) == 1);
@@ -1626,8 +1626,8 @@ static void test_update_dispatch_zone_section(void) {
     memset(&sec, 0, sizeof(sec));
     strlcpy(sec.domain, "sec.example.", sizeof(sec.domain));
     strlcpy(sec.view_name, "default", sizeof(sec.view_name));
-    zone_arena_init(&sec.rcu.arena_a);
-    atomic_store_explicit(&sec.rcu.active, &sec.rcu.arena_a, memory_order_release);
+    zone_arena_init(test_zone_slot(&sec, 0));
+    atomic_store_explicit(&sec.rcu.active, &test_zone_slot(&sec, 0)->ver, memory_order_release);
 
     zone_db_entry_t *entries[2] = { &prim, &sec };
     char *any_acl[1] = { "any" };
@@ -1685,7 +1685,7 @@ static void test_update_dispatch_zone_section(void) {
     assert(atomic_load(&prim.serial) == 101);
 
     upd_entry_destroy(&prim);
-    zone_arena_destroy(&sec.rcu.arena_a);
+    zone_arena_destroy(test_zone_slot(&sec, 0));
     printf("  -> Zone section dispatch passed.\n");
 }
 

@@ -279,6 +279,10 @@ check "conf:sample-placeholder" 0 "secret is still the sample placeholder" "$out
 conf_case tcp_opts      conf 0 "is valid" 'options { tcp-mss 1220; tcp-window 256K; udp-bufsize 1232; };
 zone "t.example" { type master; file "t.zone"; zone-tcp-mss 1200; zone-tcp-window 128K; zone-tcp-sndbuf 2M; zone-udp-bufsize 1400; };'
 conf_case tcp_opts_bad  conf 1 "invalid zone-tcp-sndbuf value" 'zone "t.example" { type master; file "t.zone"; zone-tcp-sndbuf 2MB; };'
+conf_case ixfr_hist     conf 0 "is valid" 'options { ixfr-history 2; };
+zone "h.example" { type master; file "h.zone"; ixfr-history 0; };'
+conf_case ixfr_hist_bad conf 1 "Invalid ixfr-history value '33'" 'options { ixfr-history 33; };'
+conf_case ixfr_hist_zbad conf 1 "invalid ixfr-history value '-1'" 'zone "h.example" { type master; file "h.zone"; ixfr-history -1; };'
 conf_case bad_b64       conf 1 "secret is not valid base64" 'key "k" { algorithm "hmac-sha256"; secret "NOT_BASE64="; };'
 conf_case bad_b64_ctl   conf 1 "control-channel: secret is not valid base64" 'control-channel { algorithm "hmac-sha256"; secret "NOT_BASE64="; };'
 printf '$ORIGIN m.example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n' > "$TMP/m.zone"

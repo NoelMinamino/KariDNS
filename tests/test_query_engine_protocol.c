@@ -231,7 +231,7 @@ static void gr_setup(const char *origin, const char *zone_text) {
     assert(parse_zone_fast(buf, strlen(buf), &g_gr.arena, &ctx) >= 0);
     assert(test_build_index(&g_gr.arena, true) == 0);
     strncpy(g_gr.entry.domain, origin, sizeof(g_gr.entry.domain) - 1);
-    atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena, memory_order_release);
+    atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena.ver, memory_order_release);
     g_gr.entries[0] = &g_gr.entry;
     g_gr.acl[0] = (char *)"any";
     g_gr.view.name = "default";
@@ -712,8 +712,8 @@ static void test_sibling_zone_additional_glue_and_limits(void) {
     memset(&entry_sib, 0, sizeof(entry_sib));
     strlcpy(entry_prim.domain, "prim.example.", sizeof(entry_prim.domain));
     strlcpy(entry_sib.domain, "sib.example.", sizeof(entry_sib.domain));
-    atomic_store_explicit(&entry_prim.rcu.active, &arena_prim, memory_order_release);
-    atomic_store_explicit(&entry_sib.rcu.active, &arena_sib, memory_order_release);
+    atomic_store_explicit(&entry_prim.rcu.active, &arena_prim.ver, memory_order_release);
+    atomic_store_explicit(&entry_sib.rcu.active, &arena_sib.ver, memory_order_release);
 
     zone_db_entry_t *entries[2] = { &entry_prim, &entry_sib };
     char *acl_any[1] = { (char *)"any" };
@@ -993,11 +993,11 @@ static void test_response_header_and_error_builder(void) {
         zone_arena_t empty;
         memset(&empty, 0, sizeof(empty));
         zone_arena_init(&empty);
-        atomic_store_explicit(&g_gr.entry.rcu.active, &empty, memory_order_release);
+        atomic_store_explicit(&g_gr.entry.rcu.active, &empty.ver, memory_order_release);
         ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
         check_hdr(&r, &q, 2, false, true);
         CHECK(&r, gr_ede(&r) == 14);
-        atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena, memory_order_release);
+        atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena.ver, memory_order_release);
         zone_arena_destroy(&empty);
     }
     zone_arena_destroy(&g_gr.arena);

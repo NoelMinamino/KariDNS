@@ -1627,7 +1627,7 @@ static void test_async_io_pool_and_tasks(void) {
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "async.example.com.", sizeof(entry.domain));
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2907,7 +2907,7 @@ static long rl_zone_serial(const char *domain) {
     zone_db_snapshot_t *snap = acquire_zone_snapshot();
     retain_zone_snapshot(snap);
     zone_db_entry_t *e = snap ? snapshot_get_zone_in_view(snap, "default", domain) : NULL;
-    zone_arena_t *a = e ? atomic_load_explicit(&e->rcu.active, memory_order_acquire) : NULL;
+    zone_version_t *a = e ? atomic_load_explicit(&e->rcu.active, memory_order_acquire) : NULL;
     long serial = (a && a->image && a->image->n_rrs > 0) ? (long)e->serial : -1;
     release_zone_snapshot(snap);
     return serial;

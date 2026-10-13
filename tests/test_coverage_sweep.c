@@ -40,6 +40,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
+#include "test_zone_slots.h"
 
 // Mock globals
 int g_control_kq = -1;
@@ -185,7 +186,7 @@ static void sw_add_zone(const char *origin, const char *text) {
     strncpy(e->domain, origin, sizeof(e->domain) - 1);
     strncpy(e->view_name, "default", sizeof(e->view_name) - 1);
     pthread_mutex_init(&e->writer_lock, NULL);
-    atomic_store_explicit(&e->rcu.active, a, memory_order_release);
+    atomic_store_explicit(&e->rcu.active, &a->ver, memory_order_release);
     g_sw.entries[i] = e;
 }
 
@@ -668,8 +669,8 @@ static void sw_setup_all(const char *conf, bool optout) {
 
 static void sw_prelink_and_cache(additional_from_auth_t policy) {
     for (int i = 0; i < g_sw.zone_count; i++) {
-        zone_glue_track_build(&g_sw.arena[i], g_sw.entry[i].domain, &g_sw.view, policy);
-        build_zone_response_cache(&g_sw.arena[i], g_sw.cfg, NULL, g_sw.entry[i].domain);
+        zone_glue_track_build(&g_sw.arena[i].ver, g_sw.entry[i].domain, &g_sw.view, policy);
+        build_zone_response_cache(&g_sw.arena[i].ver, g_sw.cfg, NULL, g_sw.entry[i].domain);
     }
 }
 
@@ -2190,7 +2191,7 @@ static void upd_entry_init(zone_db_entry_t *e) {
     pthread_mutex_init(&e->writer_lock, NULL);
     pthread_mutex_init(&e->ixfr_history.lock, NULL);
     for (int k = 0; k < 2; k++) {
-        zone_arena_t *a = k ? &e->rcu.arena_b : &e->rcu.arena_a;
+        zone_arena_t *a = k ? test_zone_slot(e, 1) : test_zone_slot(e, 0);
         zone_arena_init(a);
         parse_error_t err = {0};
         parse_context_t ctx = { .base_dir = ".", .default_origin = "upd.example.", .is_standalone_mode = true, .err_out = &err };
@@ -2198,12 +2199,12 @@ static void upd_entry_init(zone_db_entry_t *e) {
         assert(parse_zone_fast(b, strlen(b), a, &ctx) >= 0);
         assert(test_build_index(a, true) == 0);
     }
-    atomic_store_explicit(&e->rcu.active, &e->rcu.arena_a, memory_order_release);
+    atomic_store_explicit(&e->rcu.active, &test_zone_slot(e, 0)->ver, memory_order_release);
     atomic_store_explicit(&e->serial, 100, memory_order_release);
 }
 
 static void upd_entry_free(zone_db_entry_t *e) {
-    zone_arena_destroy(&e->rcu.arena_a); zone_arena_destroy(&e->rcu.arena_b);
+    zone_arena_destroy(test_zone_slot(e, 0)); zone_arena_destroy(test_zone_slot(e, 1));
     for (int i = 0; i < e->ixfr_history.count; i++) {
         (void)i;
     }
@@ -2282,8 +2283,8 @@ static void test_update_matrix(void) {
     pkt[5] = 2; (void)handle_dynamic_update(pkt, len, &e, "192.0.2.1", NULL);   /* ZOCOUNT != 1 */
     len = upd_build(pkt, "upd.example.", NULL, 0, ups, 1); pkt[len - 16] = 0; /* zone type not SOA */
     (void)handle_dynamic_update(pkt, len, &e, "192.0.2.1", NULL);
-    (void)bump_soa_serial_in_arena(&e.rcu.arena_a, "upd.example.");
-    (void)bump_soa_serial_in_arena(&e.rcu.arena_a, "nomatch.example.");
+    (void)bump_soa_serial_in_arena(test_zone_slot(&e, 0), "upd.example.");
+    (void)bump_soa_serial_in_arena(test_zone_slot(&e, 0), "nomatch.example.");
     upd_entry_free(&e);
     printf("  -> UPDATE matrix passed (NOERROR=%d FORMERR=%d NXDOMAIN=%d YXDOMAIN=%d YXRRSET=%d NXRRSET=%d NOTZONE=%d).\n",
            results[0], results[1], results[3], results[6], results[7], results[8], results[10]);
@@ -2299,7 +2300,7 @@ static void xfr_entry_init(zone_db_entry_t *e, const char *text, const char *ori
     pthread_mutex_init(&e->writer_lock, NULL);
     pthread_mutex_init(&e->ixfr_history.lock, NULL);
     for (int k = 0; k < 2; k++) {
-        zone_arena_t *a = k ? &e->rcu.arena_b : &e->rcu.arena_a;
+        zone_arena_t *a = k ? test_zone_slot(e, 1) : test_zone_slot(e, 0);
         zone_arena_init(a);
         if (!text) continue;
         parse_error_t err = {0};
@@ -2308,7 +2309,7 @@ static void xfr_entry_init(zone_db_entry_t *e, const char *text, const char *ori
         assert(parse_zone_fast(b, strlen(b), a, &ctx) >= 0);
         assert(test_build_index(a, true) == 0);
     }
-    atomic_store_explicit(&e->rcu.active, &e->rcu.arena_a, memory_order_release);
+    atomic_store_explicit(&e->rcu.active, &test_zone_slot(e, 0)->ver, memory_order_release);
 }
 
 static size_t xfr_req(uint8_t *p, uint16_t qtype, int serial, bool ext, const char *dom, tsig_key_t *k, uint8_t *mac, size_t *maclen) {
@@ -2345,7 +2346,7 @@ static void xfr_replay(const uint8_t *stream, size_t len, const char *dom, const
     while (o + 2 <= len) {
         size_t ml = ((size_t)stream[o] << 8) | stream[o + 1];
         if (o + 2 + ml > len) break;
-        if (parse_xfr_packet(stream + o + 2, ml, &standby, &active, &ss, dom) < 0) break;
+        if (parse_xfr_packet(stream + o + 2, ml, &standby, &active.ver, &ss, dom) < 0) break;
         o += 2 + ml;
     }
     zone_arena_destroy(&standby); zone_arena_destroy(&active);
@@ -2366,8 +2367,8 @@ static void xfr_replay(const uint8_t *stream, size_t len, const char *dom, const
     if (getenv("SW_SYSLOG")) fprintf(stderr, "XFRDBG len=%zu ixfr=%d hrc=%d parsed_upto=%zu\n", len, ixfr, hrc, o);
     close(sp[1]);
     waitpid(pid, NULL, 0);
-    zone_arena_destroy(&sec.rcu.arena_a); zone_arena_destroy(&sec.rcu.arena_b);
-    for (int i = 0; i < MAX_IXFR_HISTORY; i++) if (sec.ixfr_history.entries[i]) { free_ixfr_txn(sec.ixfr_history.entries[i]); sec.ixfr_history.entries[i] = NULL; }
+    zone_arena_destroy(test_zone_slot(&sec, 0)); zone_arena_destroy(test_zone_slot(&sec, 1));
+    ixfr_history_clear(&sec.ixfr_history);
 }
 
 static void test_xfr_roundtrips(void) {
@@ -2383,7 +2384,7 @@ static void test_xfr_roundtrips(void) {
     zone_db_entry_t srv; xfr_entry_init(&srv, zt, dom);
     atomic_store_explicit(&srv.serial, 100, memory_order_release);
     /* tinydns-style metadata on a couple of records so the wrap path is used */
-    zone_arena_t *act = atomic_load_explicit(&srv.rcu.active, memory_order_acquire);
+    zone_arena_t *act = test_zone_slot(&srv, 0);
     for (size_t i = 0; i < act->count && i < 40; i++) if (act->records[i].type_code == 16 && (i & 1)) { act->records[i].tinydns_loc[0] = 'j'; act->records[i].tinydns_loc[1] = 'p'; }
     /* build IXFR history with a few updates (serial 100 -> 104) */
     for (int u = 0; u < 4; u++) {
@@ -2442,10 +2443,10 @@ static void test_xfr_roundtrips(void) {
     atomic_store_explicit(&srv.active_axfr, 1, memory_order_release);
     assert(!wait_for_active_axfr(&srv, 20));
     atomic_store_explicit(&srv.active_axfr, 0, memory_order_release);
-    zone_arena_destroy(&empty.rcu.arena_a); zone_arena_destroy(&empty.rcu.arena_b);
-    zone_arena_destroy(&nosoa.rcu.arena_a); zone_arena_destroy(&nosoa.rcu.arena_b);
-    zone_arena_destroy(&srv.rcu.arena_a); zone_arena_destroy(&srv.rcu.arena_b);
-    for (int i = 0; i < MAX_IXFR_HISTORY; i++) if (srv.ixfr_history.entries[i]) free_ixfr_txn(srv.ixfr_history.entries[i]);
+    zone_arena_destroy(test_zone_slot(&empty, 0)); zone_arena_destroy(test_zone_slot(&empty, 1));
+    zone_arena_destroy(test_zone_slot(&nosoa, 0)); zone_arena_destroy(test_zone_slot(&nosoa, 1));
+    zone_arena_destroy(test_zone_slot(&srv, 0)); zone_arena_destroy(test_zone_slot(&srv, 1));
+    ixfr_history_clear(&srv.ixfr_history);
     free(zt); free(g_cap); g_cap = NULL; g_cap_cap = 0;
     printf("  -> AXFR/IXFR round trips passed.\n");
 }

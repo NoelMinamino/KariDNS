@@ -102,7 +102,26 @@ typedef struct {
   uint8_t salt[255];
 } nsec3_params_t;
 
+/* S5 B-3: what a published version of a zone is. The fields every reader needs: the image, the glue-tracking side block,
+ * the response-cache flag and the generation. A published version is a zone_version_t of its own (one small malloc,
+ * zone_version_new()); zone_arena_t, the builder, starts with the same fields (as `ver`), so a hand-made arena can stand
+ * in for a published version in tests: heap == false means "not owned by the zone entry" and is never freed with it. */
+#define ZONE_VERSION_FIELDS                                                              \
+  struct zone_image_s *image; /* the compact image (dns_zone_image.h); zone_version_free() frees it */ \
+  zone_glue_t *glue;          /* NULL = no sibling addresses are used */                \
+  bool rcache_ok;             /* the zone's answers may go into the shared response cache */ \
+  bool heap;                  /* allocated by zone_version_new(): the zone entry frees it */ \
+  /* the published version / any change of a sibling zone: a new value (response cache key). 0 = unpublished/test */ \
+  _Atomic uint64_t generation;
+typedef struct zone_version_s {
+  ZONE_VERSION_FIELDS
+} zone_version_t;
+
 typedef struct zone_arena_s {
+  union {
+    zone_version_t ver;
+    struct { ZONE_VERSION_FIELDS };
+  };
   dns_record_t *records;
   size_t count;
   size_t records_cap;
@@ -138,17 +157,9 @@ typedef struct zone_arena_s {
   char **bind_ecs_trusted_resolvers;      /* AXFR(拡張モード)で受信した値、NULL可 */
   int bind_ecs_trusted_resolver_count;
   acl_entry_t *bind_ecs_trusted_resolvers_parsed;
-  /* S2: グルーの対象名のうち、view で引くと自分以外のゾーン (または無し) になるもの。兄弟ゾーンの id か
-   * 公開順が変わったら、このゾーンの応答 (兄弟のアドレスを含みうる) の版を上げる。NULL = 兄弟のアドレスを使わない。
-   * 公開後は制御スレッドだけが書く (イメージには入れない)。S5 B-2 以降、公開した版の arena が持つのは
-   * image / generation / rcache_ok / glue だけで、レコード・プール・索引・ゾーンファイルの本文は公開の前に解放する */
-  zone_glue_t *glue;
-  bool rcache_ok;          /* このゾーンの応答を共有の応答キャッシュに入れてよい */
-  /* S5 phase B: 公開する版のコンパクトなイメージ (dns_zone_image.h)。応答を作る側はこれだけを読む。
-   * zone_image_freeze() が公開の直前に作り、zone_arena_destroy() が解放する (1 回の malloc なので free()) */
-  struct zone_image_s *image;
-  /* 公開した版、および兄弟ゾーンが変わるたびに新しい値 (応答キャッシュの鍵)。0 = 未公開/テスト用 */
-  _Atomic uint64_t generation;
+  /* S5 B-3: image / glue / rcache_ok / generation (what a published version keeps) are the members of `ver` above.
+   * S2: glue lists the targets whose sibling zones' addresses an answer may use (NULL = none); after the version is
+   * published only the control thread writes it. zone_image_freeze() makes image just before publishing. */
 } zone_arena_t;
 
 #define ZONE_ARENA_MAX_POOLS 128
@@ -156,7 +167,7 @@ typedef struct zone_arena_s {
 /* file を arena に登録する ($INCLUDE を含め最大 ZONE_ARENA_MAX_FILES)。失敗は -1 (呼び出し側が buf 等を解放) */
 int zone_arena_add_file(zone_arena_t *arena, char *buf, char *display, char *path);
 /* グルーを含めたゾーンのデータの版 (応答キャッシュの鍵) */
-static inline uint64_t zone_arena_data_generation(const zone_arena_t *arena) {
+static inline uint64_t zone_arena_data_generation(const zone_version_t *arena) {
   return atomic_load_explicit((_Atomic uint64_t *)&arena->generation, memory_order_acquire);
 }
 
@@ -172,7 +183,14 @@ void zone_arena_destroy(zone_arena_t *arena);
 void zone_arena_free_builder(zone_arena_t *arena);
 void zone_arena_free_include_buffers(zone_arena_t *arena);
 /* 公開直前に呼ぶ: 応答キャッシュに入れてよいか (rcache_ok) を決める */
-void build_zone_response_cache(zone_arena_t *arena, struct server_config_s *cfg, const char *view_name, const char *domain);
+void build_zone_response_cache(zone_version_t *ver, struct server_config_s *cfg, const char *view_name, const char *domain);
+/* S5 B-3: make the published version out of a frozen builder: a new heap zone_version_t takes over builder->image (the builder
+ * keeps nothing of it and can be destroyed). NULL on out of memory; the builder still owns the image then. */
+zone_version_t *zone_version_new(zone_arena_t *builder);
+/* Frees the image, the glue block and the version itself (a version that is not heap, e.g. a test's arena, is left alone). */
+void zone_version_free(zone_version_t *ver);
+/* What a zone entry points to before its first publish: no image, never freed. */
+extern zone_version_t zone_version_empty;
 void *arena_alloc(zone_arena_t *arena, size_t size);
 char *arena_strdup(zone_arena_t *arena, const char *str);
 /* RFC 2181 s5.2 / RFC 4035 s2.2: harmonize_ttls=true normalizes RRset TTLs. */

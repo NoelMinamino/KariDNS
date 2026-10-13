@@ -128,7 +128,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
      * writer がこの arena を standby として再利用しないよう、読み取り区間に入れる。
      * 区間は rebuild_zone_db_snapshot() の前で抜ける (ロック待ちを区間に含めない)。*/
     rcu_aux_read_lock();
-    zone_arena_t *arena = atomic_load_explicit(&catalog_entry->rcu.active, memory_order_acquire);
+    zone_version_t *arena = atomic_load_explicit(&catalog_entry->rcu.active, memory_order_acquire);
     const zone_image_t *img = arena ? arena->image : NULL;
     if (!img) {
         rcu_aux_read_unlock();

@@ -26,9 +26,8 @@ static _Thread_local bool t_resolve_crossed_zone;
 program_plugin_t *g_program_plugins = NULL;
 int g_program_plugins_count = 0;
 
-/* S5 phase B-1: the engine reads the zone image (dns_zone_image.h), not zone_arena_t.records[]. The arena stays
- * the handle of a published version: it carries the image and the zone level tables (tinydns locations, tags),
- * the response cache state and the generation. RRs are named by their index in the image. */
+/* S5 phase B-1: the engine reads the zone image (dns_zone_image.h), not zone_arena_t.records[]. A published version (zone_version_t) carries the image (with the zone level tables:
+ * tinydns locations, tags), the response cache state and the generation. RRs are named by their index in the image. */
 
 /* Final TTL serialize_dns_record() writes with an override: the smaller of the two (0xFFFFFFFF = no override). */
 static inline uint32_t ttl_with_override(uint32_t ttl, uint32_t override_ttl) {
@@ -349,7 +348,7 @@ STATIC_TEST bool append_glue_records(const zone_image_t *img, const char *target
   if (policy == ADDITIONAL_AUTH_YES && view) {
     zone_db_entry_t *sib_entry = find_zone_in_view(view, target);
     if (sib_entry) {
-      zone_arena_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
+      zone_version_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
       const zone_image_t *sib = sib_arena ? sib_arena->image : NULL;
       if (sib && sib != img &&
           append_additional_from_zone(sib, sib_entry->domain, target, zone_image_find_name(sib, target), dnssec_ok,
@@ -731,7 +730,7 @@ static bool rrset_type_seen(uint16_t types[64], int *count, uint16_t t) {
 
 static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
                          zone_db_entry_t **db_entry_ptr,
-                         zone_arena_t **current_zone_ptr, uint8_t *res,
+                         zone_version_t **current_zone_ptr, uint8_t *res,
                          size_t max_res_len, uint16_t *offset,
                          compress_ctx_t *comp_ctx, uint16_t *ancount,
                          uint16_t *nscount, uint16_t *arcount,
@@ -764,11 +763,11 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
   bool chain_exhausted = true;
   bool any_cname_wc_expanded = false;
   char first_wc_qname[DNS_NAME_TEXT_SIZE] = {0};
-  zone_arena_t *first_wc_zone = NULL;
+  zone_version_t *first_wc_zone = NULL;
   char first_wc_apex[DNS_NAME_TEXT_SIZE] = {0};
   for (int depth = 0; depth < 16; depth++) {
     zone_db_entry_t *db_entry = *db_entry_ptr;
-    zone_arena_t *current_zone = *current_zone_ptr;
+    zone_version_t *current_zone = *current_zone_ptr;
     if (!current_zone || !current_zone->image) {
       res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
       *offset = initial_offset;
@@ -1424,7 +1423,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     }
 
     if (dnssec_ok && any_cname_wc_expanded && !nsec_failed) {
-      zone_arena_t *wc_zone = first_wc_zone ? first_wc_zone : current_zone;
+      zone_version_t *wc_zone = first_wc_zone ? first_wc_zone : current_zone;
       const zone_image_t *wc_img = wc_zone->image;
       const char *wc_apex = first_wc_apex[0] ? first_wc_apex : db_entry->domain;
       zone_n3_t wc_n3;
@@ -1521,7 +1520,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
 
 void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
                          zone_db_entry_t **db_entry_ptr,
-                         zone_arena_t **current_zone_ptr, uint8_t *res,
+                         zone_version_t **current_zone_ptr, uint8_t *res,
                          size_t max_res_len, uint16_t *offset,
                          compress_ctx_t *comp_ctx, uint16_t *ancount,
                          uint16_t *nscount, uint16_t *arcount,
@@ -2420,7 +2419,7 @@ STATIC_TEST void rcache_store(uint64_t tag, uint64_t gen, uint16_t qtype, const 
 
 /* 公開する直前に呼ぶ。このゾーンの応答を共有キャッシュに入れてよいかを決める (応答がクライアントの
  * アドレス、ECS、時刻で変わるゾーンは入れない)。 */
-void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const char *view_name, const char *domain) {
+void build_zone_response_cache(zone_version_t *arena, server_config_t *cfg, const char *view_name, const char *domain) {
   if (!arena) return;
   arena->rcache_ok = false;
   atomic_store_explicit(&arena->generation, zone_data_generation_next(), memory_order_release); /* 公開する版ごとに 1 回 */
@@ -2551,7 +2550,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     current_qname_lc[current_qname_lc_len] = (c >= 'A' && c <= 'Z') ? (c | 0x20) : c;
   }
   current_qname_lc[current_qname_lc_len] = '\0';
-  zone_arena_t *current_zone = NULL;
+  zone_version_t *current_zone = NULL;
   zone_db_entry_t *db_entry = NULL;
   view_snapshot_t *view = NULL;
 

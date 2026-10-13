@@ -77,21 +77,12 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
     return 2; // SERVFAIL
   }
 
-  zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-  zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
-  /* ワーカーの読み取り区間の中から呼ばれる。区間に入った後で別の writer がこのゾーンを
-   * 公開していると、通常の待機は自分自身を待ってタイムアウトする (60 秒間 writer_lock を
-   * 持ったまま他の writer も止める)。自分の区間だけを除いて待つ。UPDATE の応答は
-   * 設定だけから作り、待機前に読んだ arena を使わない (process_dns_query_impl)。*/
-  if (!rcu_writer_wait_until_safe_in_reader(entry->rcu.retire_epoch, 60000)) {
-    pthread_mutex_unlock(&entry->writer_lock);
-    syslog(LOG_ERR, "[Update] Dynamic update on zone '%s' aborted: RCU grace period wait timed out", entry->domain);
-    return 2; // SERVFAIL
-  }
-
-  /* S5 B-2: the update is applied to a builder thawed from the published image; the standby slot holds the leftovers
-   * of an older version at most (zone_arena_clear_data_pools in thaw_zone_arena) */
-  zone_arena_destroy(z_standby);
+  zone_version_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  /* S5 B-2: the update is applied to a builder thawed from the published image (S5 B-3: a stack builder freed on every
+   * way out; the result is published as a new version, the old one goes on the retire stack) */
+  zone_arena_t z_builder;
+  zone_arena_t *z_standby = &z_builder;
+  zone_arena_init(z_standby);
   if (thaw_zone_arena(z_active, z_standby) != 0) {
     zone_arena_destroy(z_standby);
     pthread_mutex_unlock(&entry->writer_lock);
@@ -149,6 +140,13 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
     return 2; // SERVFAIL
   }
   zone_arena_free_builder(z_standby);
+  zone_version_t *z_next = zone_version_new(z_standby);
+  zone_arena_destroy(z_standby);
+  if (!z_next) {
+    pthread_mutex_unlock(&entry->writer_lock);
+    syslog(LOG_ERR, "[Update] Dynamic update on zone '%s' aborted: out of memory", entry->domain);
+    return 2; // SERVFAIL
+  }
 
   zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
   if (cur_snap) retain_zone_snapshot(cur_snap);
@@ -157,15 +155,15 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
                                       ? zcfg->additional_from_auth
                                       : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
-  zone_glue_track_build(z_standby, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
-  build_zone_response_cache(z_standby, active_cfg_prelink, entry->view_name, entry->domain);
+  zone_glue_track_build(z_next, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
+  build_zone_response_cache(z_next, active_cfg_prelink, entry->view_name, entry->domain);
   if (cur_snap) release_zone_snapshot(cur_snap);
 
-  compute_ixfr_diff(entry, z_active, z_standby);
+  compute_ixfr_diff(entry, z_active, z_next);
   /* 公開する直前に記録する (索引の構築に失敗して公開しなかった UPDATE のシリアルを残さない) */
   atomic_store_explicit(&entry->serial, new_serial, memory_order_release);
 
-  zone_publish(entry, z_standby);
+  zone_publish(entry, z_next);
   pthread_mutex_unlock(&entry->writer_lock);
 
   notify_request_send(entry);
@@ -534,7 +532,7 @@ void send_notify_to_all(const char *domain, const char *view_name) {
   view_snapshot_t *view = snap ? snapshot_find_view(snap, view_name) : NULL;
   // 同じゾーン名が別の view にもあり得るので、呼び出し元のエントリの view で引く (R-26)
   if (view) entry = find_zone_exact_in_view(view, domain);
-  zone_arena_t *arena = entry ? atomic_load_explicit(&entry->rcu.active, memory_order_acquire) : NULL;
+  zone_version_t *arena = entry ? atomic_load_explicit(&entry->rcu.active, memory_order_acquire) : NULL;
   const zone_image_t *img = arena ? arena->image : NULL;
   uint32_t apex_id = img ? zone_image_find_name(img, entry->domain) : ZONE_IMAGE_NONE;
   if (apex_id != ZONE_IMAGE_NONE) {
@@ -553,7 +551,7 @@ void send_notify_to_all(const char *domain, const char *view_name) {
       if (notify_add_glue(img, ns_target, targets, &ntargets, 64)) continue;
       zone_db_entry_t *sib_entry = find_zone_in_view(view, ns_target);
       if (!sib_entry || sib_entry == entry) continue;
-      zone_arena_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
+      zone_version_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
       if (sib_arena && sib_arena->image)
         notify_add_glue(sib_arena->image, ns_target, targets, &ntargets, 64);
     }

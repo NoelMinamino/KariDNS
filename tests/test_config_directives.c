@@ -1269,6 +1269,54 @@ static void test_notify_retry(void) {
                   "zone \"a.example\" { type master; file \"a.zone\"; notify-retry-backoff 2; };");
 }
 
+/* ixfr-history <n>: how many past versions are kept as IXFR diffs (RFC 1995 §4), 0..32, default 4; options and
+ * zone, a zone overrides options (S5 B-3). */
+static void test_ixfr_history_option(void) {
+    printf("[TEST] ixfr-history option (options and zone, range 0..32, default 4)...\n");
+    server_config_t cfg;
+    if (parse_ok("options { };", &cfg)) {
+        CHECK(cfg.ixfr_history == IXFR_HISTORY_DEFAULT && IXFR_HISTORY_DEFAULT == 4);
+        CHECK(ixfr_history_effective(&cfg, NULL) == 4);
+        free_server_config_fields(&cfg);
+    }
+    CHECK(ixfr_history_effective(NULL, NULL) == 4);   /* no configuration at all: the built-in default */
+
+    if (parse_ok("options { ixfr-history 2; };"
+                 "zone \"a.example\" { type master; file \"a.zone\"; ixfr-history 0; };"
+                 "zone \"b.example\" { type master; file \"b.zone\"; ixfr-history 32; };"
+                 "zone \"c.example\" { type master; file \"c.zone\"; };", &cfg)) {
+        const zone_config_t *a = first_zone(&cfg);
+        const zone_config_t *b = a ? a->next : NULL;
+        const zone_config_t *c = b ? b->next : NULL;
+        CHECK(cfg.ixfr_history == 2);
+        CHECK(a && a->ixfr_history_set && a->ixfr_history == 0 && ixfr_history_effective(&cfg, a) == 0);
+        CHECK(b && b->ixfr_history_set && b->ixfr_history == 32 && ixfr_history_effective(&cfg, b) == 32);
+        CHECK(c && !c->ixfr_history_set && ixfr_history_effective(&cfg, c) == 2);   /* the zone inherits options */
+        free_server_config_fields(&cfg);
+    }
+    /* a zone without the option, no options value: the default */
+    if (parse_ok("zone \"a.example\" { type master; file \"a.zone\"; };", &cfg)) {
+        CHECK(ixfr_history_effective(&cfg, first_zone(&cfg)) == IXFR_HISTORY_DEFAULT);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { ixfr-history 0; };", &cfg)) {
+        CHECK(cfg.ixfr_history == 0);
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("ixfr-history above 32", "options { ixfr-history 33; };");
+    expect_reject("ixfr-history negative", "options { ixfr-history -1; };");
+    expect_reject("ixfr-history junk", "options { ixfr-history 4x; };");
+    expect_reject("ixfr-history word", "options { ixfr-history many; };");
+    expect_reject("ixfr-history missing value", "options { ixfr-history; };");
+    expect_reject("ixfr-history missing semicolon", "options { ixfr-history 4 };");
+    expect_reject("zone ixfr-history above 32",
+                  "zone \"a.example\" { type master; file \"a.zone\"; ixfr-history 99; };");
+    expect_reject("zone ixfr-history negative",
+                  "zone \"a.example\" { type master; file \"a.zone\"; ixfr-history -2; };");
+    expect_reject("zone ixfr-history empty",
+                  "zone \"a.example\" { type master; file \"a.zone\"; ixfr-history ; };");
+}
+
 /* ------------------------------------------------------------------------ */
 /* Phase 12: D-02 (the other boolean statements), D-01 (category lists), D-23 (type case), D-22 (acl) */
 static void test_boolean_statements_everywhere(void) {
@@ -1531,6 +1579,7 @@ int main(void) {
     test_buffer_sizes();
     test_transport_params();
     test_notify_retry();
+    test_ixfr_history_option();
     test_additional_from_auth();
     test_options_syntax_errors();
     test_ecs_and_location_tags();

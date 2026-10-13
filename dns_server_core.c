@@ -1187,7 +1187,7 @@ void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, z
     out->wirecache_misses = atomic_load_explicit(&e->observatory.wirecache_misses, memory_order_relaxed);
 
     /* 応答キャッシュは全ゾーン共有 (response_cache_init) なので、ゾーンごとの件数は持たない */
-    zone_arena_t *active_arena = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
+    zone_version_t *active_arena = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
     out->wirecache_enabled = active_arena && active_arena->rcache_ok;
     out->wirecache_entries = 0;
     out->wirecache_bytes = 0;
@@ -3394,9 +3394,11 @@ void *control_thread_func(void *arg) {
                     
                     if (entry->is_catalog_member) {
                         is_slave = true;
-                        strncpy(master_ip, entry->cached_master_ip, sizeof(master_ip) - 1);
-                        master_port = entry->cached_master_port;
-                        strncpy(tsig_key_name, entry->cached_tsig_key_name, sizeof(tsig_key_name) - 1);
+                        if (entry->catalog_master) {
+                            strncpy(master_ip, entry->catalog_master->ip, sizeof(master_ip) - 1);
+                            master_port = entry->catalog_master->port;
+                            strncpy(tsig_key_name, entry->catalog_master->tsig_key, sizeof(tsig_key_name) - 1);
+                        }
                     } else {
                         zone_config_t *zcfg = find_zone_config_in_view(active, entry->view_name, entry->domain);
                         slave_zcfg = zcfg;

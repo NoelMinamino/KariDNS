@@ -272,7 +272,7 @@ static void gr_setup(const char *origin, const char *zone_text) {
     (void)zone_arena_drop_unencodable(&g_gr.arena, NULL, NULL);
     assert(test_build_index(&g_gr.arena, true) == 0);
     strncpy(g_gr.entry.domain, origin, sizeof(g_gr.entry.domain) - 1);
-    atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena, memory_order_release);
+    atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena.ver, memory_order_release);
     g_gr.entries[0] = &g_gr.entry;
     g_gr.acl[0] = (char *)"any";
     g_gr.view.name = "default";
@@ -1602,7 +1602,7 @@ static void mz_add(const char *origin, const char *text) {
     assert(test_build_index(&g_mz.arena[i], true) == 0);
     strncpy(g_mz.entry[i].domain, origin, sizeof(g_mz.entry[i].domain) - 1);
     g_mz.entry[i].kind = ZONE_KIND_PRIMARY;
-    atomic_store_explicit(&g_mz.entry[i].rcu.active, &g_mz.arena[i], memory_order_release);
+    atomic_store_explicit(&g_mz.entry[i].rcu.active, &g_mz.arena[i].ver, memory_order_release);
     g_mz.entries[i] = &g_mz.entry[i];
 }
 

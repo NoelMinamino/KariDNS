@@ -155,7 +155,7 @@ static void test_all_rr_types_and_resolution(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     char *any_acl[1] = { (char *)"any" };
@@ -293,7 +293,7 @@ static void test_dnssec_negative_and_delegation_proofs(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strncpy(db_entry.domain, "sec.example.com.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     char *any_acl[1] = { (char *)"any" };
@@ -433,7 +433,7 @@ static void test_tinydns_timestamp_countdown(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strncpy(db_entry.domain, "tiny.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     char *any_acl[1] = { (char *)"any" };
@@ -520,7 +520,7 @@ static void test_mqtype_truncation(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain) - 1);
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     char *any_acl[1] = { (char *)"any" };
@@ -635,9 +635,9 @@ static void test_resolve_name_servfail_rcode_clearing(void) {
     memset(&db_entry, 0, sizeof(db_entry));
     strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain) - 1);
 
-    zone_arena_t *empty_zone = NULL;
+    zone_version_t *empty_zone = NULL;
     zone_db_entry_t *db_entry_ptr = &db_entry;
-    zone_arena_t **zone_ptr = &empty_zone;
+    zone_version_t **zone_ptr = &empty_zone;
 
     uint8_t res[512] = {0};
     res[3] = 0x83; // Pre-set RCODE=3 (NXDOMAIN)
@@ -675,7 +675,7 @@ static void test_resolve_name_servfail_rcode_clearing(void) {
     int b_res = test_build_index(&loop_arena, true);
     assert(b_res == 0);
 
-    zone_arena_t *current_zone = &loop_arena;
+    zone_version_t *current_zone = &loop_arena.ver;
     zone_ptr = &current_zone;
 
     memset(res, 0, sizeof(res));
@@ -725,11 +725,11 @@ static void test_response_section_order(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain) - 1);
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *db_entry_ptr = &db_entry;
-    zone_arena_t *cur_zone = &arena;
-    zone_arena_t **zone_ptr = &cur_zone;
+    zone_version_t *cur_zone = &arena.ver;
+    zone_version_t **zone_ptr = &cur_zone;
 
     uint8_t res[1024];
     memset(res, 0, sizeof(res));
@@ -876,7 +876,7 @@ static void test_cname_loop_and_max_depth(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "loop.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -1019,7 +1019,7 @@ static void test_prelink_zone_additional_glue_policies(void) {
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "glue.example.", sizeof(entry.domain));
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -1040,13 +1040,13 @@ static void test_prelink_zone_additional_glue_policies(void) {
     snap.view_count = 1;
 
     // 1. Policy NO
-    zone_glue_track_build(&arena, "glue.example.", &view, ADDITIONAL_AUTH_NO);
+    zone_glue_track_build(&arena.ver, "glue.example.", &view, ADDITIONAL_AUTH_NO);
     assert(arena.glue == NULL);
-    zone_glue_track_build(&arena, "glue.example.", &view, ADDITIONAL_AUTH_IN_DOMAIN);
+    zone_glue_track_build(&arena.ver, "glue.example.", &view, ADDITIONAL_AUTH_IN_DOMAIN);
     assert(arena.glue == NULL); /* only additional-from-auth yes follows sibling zones */
 
     // 2. Policy YES: the NS / MX / SRV targets are tracked
-    zone_glue_track_build(&arena, "glue.example.", &view, ADDITIONAL_AUTH_YES);
+    zone_glue_track_build(&arena.ver, "glue.example.", &view, ADDITIONAL_AUTH_YES);
     assert(arena.glue != NULL);
     assert(arena.glue->count >= 1);
 
@@ -1346,7 +1346,7 @@ static void gr_setup(const char *origin, const char *zone_text) {
     assert(parse_zone_fast(buf, strlen(buf), &g_gr.arena, &ctx) >= 0);
     assert(test_build_index(&g_gr.arena, true) == 0);
     strncpy(g_gr.entry.domain, origin, sizeof(g_gr.entry.domain) - 1);
-    atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena, memory_order_release);
+    atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena.ver, memory_order_release);
     g_gr.entries[0] = &g_gr.entry;
     g_gr.acl[0] = (char *)"any";
     g_gr.view.name = "default";
@@ -1814,7 +1814,7 @@ static void test_delegation_referral_and_ds_handling(void) {
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "example.com.", sizeof(entry.domain));
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2208,7 +2208,7 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.wire_cache_max_records = 100;
-    build_zone_response_cache(&test_arena, &cfg, NULL, "example.com.");
+    build_zone_response_cache(&test_arena.ver, &cfg, NULL, "example.com.");
     zone_arena_destroy(&test_arena);
 
     // 8. name_to_canonical_wire
@@ -2406,7 +2406,7 @@ static void test_dname_synthesis_and_wildcard_proofs(void) {
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "dname.example.", sizeof(entry.domain));
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2487,7 +2487,7 @@ static void test_query_engine_protocol_qclass_and_edns_branches(void) {
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "qproto.example.", sizeof(entry.domain));
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2589,7 +2589,7 @@ static void test_cname_target_overflow_and_tsig_query_paths(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "cname.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2653,7 +2653,7 @@ static void test_non_data_rrtypes_and_special_qtypes(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "special.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2734,7 +2734,7 @@ static void test_covering_rrsig_and_buffer_exhaustion_branches(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "rrsig.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2799,7 +2799,7 @@ static void test_dname_loop_and_depth_limit(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "dname.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2844,7 +2844,7 @@ static void test_wildcard_cname_and_dname_synthesis(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "wildsyn.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2896,7 +2896,7 @@ static void test_nsec3_wildcard_nodata_and_optout(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "nsec3opt.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2942,7 +2942,7 @@ static void test_nsec_apex_and_delegation_proofs(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "nsecproof.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3020,7 +3020,7 @@ static void test_edns_client_subnet_cache_matching(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "ecs.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3085,7 +3085,7 @@ static void test_dns_cookie_badcookie_and_timestamp_drift(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "cookie.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3190,7 +3190,7 @@ static void test_udp_bufsize_global_and_zone(void) {
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "ubuf.example.", sizeof(entry.domain));
     strlcpy(entry.view_name, "__default__", sizeof(entry.view_name));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
     zone_db_entry_t *entries[1] = {&entry};
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
@@ -3292,7 +3292,7 @@ static void test_truncated_response_keeps_opt(void) {
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "tcopt.example.", sizeof(entry.domain));
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
     zone_db_entry_t *entries[1] = {&entry};
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
@@ -3368,7 +3368,7 @@ static void test_rrl_slip_and_tc_response(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "rrltest.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3432,7 +3432,7 @@ static void test_proxy_v2_header_parsing(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "proxy.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3477,7 +3477,7 @@ static void test_catalog_zone_queries_and_member_zones(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "catalog.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3522,7 +3522,7 @@ static void test_any_query_with_dnssec_rrsigs(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "anydnssec.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3566,7 +3566,7 @@ static void test_cname_pointing_to_delegation_referral(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "cnameref.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3658,7 +3658,7 @@ static void test_program_zone_dynamic_scripts(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "prog.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3701,7 +3701,7 @@ static void test_prelinked_glue_records_ordering(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "glueord.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3744,7 +3744,7 @@ static void test_nsec3_salt_and_iteration_limits(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "nsec3lim.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3834,7 +3834,7 @@ static void test_tinydns_timestamp_decay_and_expiry(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "ttd.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&db_entry};
     char *any_acl[1] = { (char *)"any" };
@@ -3902,7 +3902,7 @@ static void test_tsig_badkey_badsig_badtime_responses(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "tsigerr.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3961,7 +3961,7 @@ static void test_dynamic_update_prerequisites_and_actions(void) {
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "dynup.example.", sizeof(entry.domain));
     pthread_mutex_init(&entry.writer_lock, NULL);
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -4014,7 +4014,7 @@ static void test_udp_truncation_with_edns_buffer_size(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "trunc.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -4072,8 +4072,8 @@ static void test_multiple_views_acls_and_fallback(void) {
     memset(&entry_ext, 0, sizeof(entry_ext));
     strlcpy(entry_int.domain, "split.example.", sizeof(entry_int.domain));
     strlcpy(entry_ext.domain, "split.example.", sizeof(entry_ext.domain));
-    atomic_store_explicit(&entry_int.rcu.active, &arena_int, memory_order_release);
-    atomic_store_explicit(&entry_ext.rcu.active, &arena_ext, memory_order_release);
+    atomic_store_explicit(&entry_int.rcu.active, &arena_int.ver, memory_order_release);
+    atomic_store_explicit(&entry_ext.rcu.active, &arena_ext.ver, memory_order_release);
 
     zone_db_entry_t *entries_int[1] = {&entry_int};
     zone_db_entry_t *entries_ext[1] = {&entry_ext};
@@ -4149,7 +4149,7 @@ static void test_dynamic_update_prereq_rrset_exists_value_independent(void) {
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "dyn1.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     assert(record_exists_in_arena(&arena, &arena.records[2]) == true);
     zone_arena_destroy(&arena);
@@ -4427,7 +4427,7 @@ static void ecs_scope_zone_init(void) {
     assert(rc == 0);
     (void)rc;
     strlcpy(g_ecs_scope_zone.entry.domain, "ecs.example.", sizeof(g_ecs_scope_zone.entry.domain));
-    atomic_store_explicit(&g_ecs_scope_zone.entry.rcu.active, &g_ecs_scope_zone.arena, memory_order_release);
+    atomic_store_explicit(&g_ecs_scope_zone.entry.rcu.active, &g_ecs_scope_zone.arena.ver, memory_order_release);
     g_ecs_scope_zone_ready = true;
 }
 
@@ -4440,7 +4440,7 @@ static uint8_t ecs_scope_query(const char *qname, uint16_t qtype, uint16_t famil
     assert(ok == 1);
     (void)ok;
     zone_db_entry_t *db_entry_ptr = &g_ecs_scope_zone.entry;
-    zone_arena_t *cur_zone = &g_ecs_scope_zone.arena;
+    zone_version_t *cur_zone = &g_ecs_scope_zone.arena.ver;
     uint8_t res[1024];
     memset(res, 0, sizeof(res));
     uint16_t offset = 12, ancount = 0, nscount = 0, arcount = 0;
@@ -7519,7 +7519,7 @@ static void test_query_engine_feature_case_201(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "soa.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -7572,7 +7572,7 @@ static void test_query_engine_feature_case_202(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "any.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -7623,7 +7623,7 @@ static void test_query_engine_feature_case_203(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "cname2.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -7672,7 +7672,7 @@ static void test_query_engine_feature_case_204(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "dnamesyn.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -7721,7 +7721,7 @@ static void test_query_engine_feature_case_205(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "wildsyn.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -7771,7 +7771,7 @@ static void test_query_engine_feature_case_206(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "wildexp.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -7820,7 +7820,7 @@ static void test_query_engine_feature_case_207(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "edns.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -7927,8 +7927,8 @@ static void test_query_engine_feature_case_211(void) {
     memset(&e_ext, 0, sizeof(e_ext));
     strlcpy(e_int.domain, "view.example.", sizeof(e_int.domain));
     strlcpy(e_ext.domain, "view.example.", sizeof(e_ext.domain));
-    atomic_store_explicit(&e_int.rcu.active, &arena_int, memory_order_release);
-    atomic_store_explicit(&e_ext.rcu.active, &arena_ext, memory_order_release);
+    atomic_store_explicit(&e_int.rcu.active, &arena_int.ver, memory_order_release);
+    atomic_store_explicit(&e_ext.rcu.active, &arena_ext.ver, memory_order_release);
 
     zone_db_entry_t *int_entries[1] = { &e_int };
     zone_db_entry_t *ext_entries[1] = { &e_ext };
@@ -8365,7 +8365,7 @@ static void test_query_engine_feature_case_225(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "version.bind.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8408,7 +8408,7 @@ static void test_query_engine_feature_case_226(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "local.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8444,7 +8444,7 @@ static void test_query_engine_feature_case_227(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "trunc.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8480,7 +8480,7 @@ static void test_query_engine_feature_case_228(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "glue.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8518,7 +8518,7 @@ static void test_query_engine_feature_case_229(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "mxglue.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8556,7 +8556,7 @@ static void test_query_engine_feature_case_230(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "srvglue.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8594,7 +8594,7 @@ static void test_query_engine_feature_case_231(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "nodata.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8632,7 +8632,7 @@ static void test_query_engine_feature_case_232(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "nx.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8670,7 +8670,7 @@ static void test_query_engine_feature_case_233(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "2.0.192.in-addr.arpa.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8707,7 +8707,7 @@ static void test_query_engine_feature_case_234(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "8.b.d.0.1.0.0.2.ip6.arpa.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8744,7 +8744,7 @@ static void test_query_engine_feature_case_235(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "caa.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8781,7 +8781,7 @@ static void test_query_engine_feature_case_236(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "tlsa.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8818,7 +8818,7 @@ static void test_query_engine_feature_case_237(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "sshfp.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8855,7 +8855,7 @@ static void test_query_engine_feature_case_238(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "naptr.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8892,7 +8892,7 @@ static void test_query_engine_feature_case_239(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "loc.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8929,7 +8929,7 @@ static void test_query_engine_feature_case_240(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "hinfo.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8994,7 +8994,7 @@ static void test_query_engine_feature_case_243(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "catalog.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -9268,7 +9268,7 @@ static void test_query_engine_opcode_header_validations(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "op.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view;
@@ -9355,7 +9355,7 @@ static void test_query_engine_dname_cname_wildcard_truncation(void) {
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "matrix.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view;
