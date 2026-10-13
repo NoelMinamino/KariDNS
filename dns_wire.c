@@ -4175,6 +4175,18 @@ static bool update_replaces(const dns_record_t *zrr, const dns_record_t *rr) {
     return compare_records(zrr, rr, true);
 }
 
+/* 追加する RR をワイヤー形式に書けるか。書けない RR はゾーンファイルと同じく落として警告し、変更として
+ * 数えない (そうしないと、それだけの UPDATE でシリアルが上がり公開される: RFC 2136 §3.6)。UPDATE は
+ * クエリの経路ではないので作業領域はヒープに取る。確保できなければ書けるものとして扱う (公開前の
+ * zone_drop_unencodable_logged() が落とす) */
+static bool update_rr_encodable(const dns_record_t *rr) {
+    uint8_t *buf = malloc(65535);
+    if (!buf) return true;
+    bool ok = dns_record_canonical_rdata(rr, buf, 65535) >= 0;
+    free(buf);
+    return ok;
+}
+
 static int update_append_record(zone_arena_t *standby, const dns_record_t *rec) {
     if (standby->count >= standby->records_cap) {
         size_t new_cap = standby->records_cap == 0 ? 256 : standby->records_cap * 2;
@@ -4399,6 +4411,12 @@ int process_update_sections(const uint8_t *req, size_t req_len,
                 if (update_rec_is_at(&standby->records[k], name) && standby->records[k].type_code == 6) soa_idx = k;
             }
             if (soa_idx < 0 || !serial_is_newer(update_soa_serial(&rr), update_soa_serial(&standby->records[soa_idx]))) continue;
+        }
+
+        if (!update_rr_encodable(&rr)) {
+            syslog(LOG_WARNING, "[Update] zone '%s': ignored an RR for '%s' type %u that cannot be encoded",
+                   zone_name, name, (unsigned)type);
+            continue;
         }
 
         bool replaced = false;

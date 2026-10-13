@@ -385,6 +385,21 @@ static void test_handle_dynamic_update_drops_unencodable(void) {
     assert(zone_image_find_name(cur->image, "bad.example.com.") == ZONE_IMAGE_NONE);
     assert(cur->records == NULL && cur->hash_table == NULL && cur->data_pool_count == 0); /* builder freed */
 
+    /* 3. an UPDATE whose only addition cannot be encoded changes nothing: no serial bump, nothing published
+     * (RFC 2136 §3.6) */
+    pkt[1] = 0x36;
+    pkt[9] = 1; // UPCOUNT=1
+    size_t off2 = 12 + sizeof(zname) + 4;
+    pkt[off2++] = 3; memcpy(&pkt[off2], "bad", 3); off2 += 3;
+    memcpy(&pkt[off2], zname, sizeof(zname)); off2 += sizeof(zname);
+    pkt[off2++] = 0; pkt[off2++] = 16; pkt[off2++] = 0; pkt[off2++] = 1;
+    pkt[off2++] = 0; pkt[off2++] = 0; pkt[off2++] = 1; pkt[off2++] = 0x2C;
+    pkt[off2++] = 0; pkt[off2++] = 0;
+    uint32_t serial_before = atomic_load_explicit(&entry.serial, memory_order_acquire);
+    assert(handle_dynamic_update(pkt, off2, &entry, "127.0.0.1", "key") == 0);
+    assert(atomic_load_explicit(&entry.serial, memory_order_acquire) == serial_before);
+    assert(atomic_load_explicit(&entry.rcu.active, memory_order_acquire) == cur);
+
     zone_arena_destroy(&entry.rcu.arena_a);
     zone_arena_destroy(&entry.rcu.arena_b);
     pthread_mutex_destroy(&entry.writer_lock);
