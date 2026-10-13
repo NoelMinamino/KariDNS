@@ -3,6 +3,7 @@
 #include "dns_server_internal.h"
 #include "dns_wire.h"
 #include "dns_utils.h"
+#include "dns_zone_image.h"
 #include "dns_axfr_ixfr.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_tsig_acl.h"
@@ -124,6 +125,15 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
     zone_arena_clear_data_pools(z_standby);
     pthread_mutex_unlock(&entry->writer_lock);
     syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after Update for '%s'", entry->domain);
+    return 2; // SERVFAIL
+  }
+
+  /* S5 B-1: 応答を作る側が読むイメージ。公開の直前に 1 回だけ作る。作れなければ索引を作れなかったときと同じく UPDATE を捨てる */
+  z_standby->image = zone_image_freeze(z_standby, entry->domain);
+  if (!z_standby->image) {
+    zone_arena_clear_data_pools(z_standby);
+    pthread_mutex_unlock(&entry->writer_lock);
+    syslog(LOG_ERR, "[Zone] Failed to build the zone image after Update for '%s'", entry->domain);
     return 2; // SERVFAIL
   }
 

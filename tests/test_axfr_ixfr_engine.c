@@ -18,6 +18,7 @@
 #include "dns_wire.h"
 #include "dns_config_parser.h"
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_epoch_rcu.h"
 #include "dns_axfr_ixfr.h"
@@ -1013,6 +1014,15 @@ static void test_handle_axfr_event_multi_message_and_tsig(void) {
     int r_res = handle_axfr_event(-1, &entry, &stream_ctx, &session, NULL, NULL, 0);
     assert(r_res == 1); // Success, zone swapped
     assert(entry.serial == 200);
+    {   /* S5 B-1: the transferred version is published with the image the engine reads */
+        zone_arena_t *cur = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
+        assert(cur == &entry.rcu.arena_b && cur->image != NULL && cur->image->n_rrs == cur->count);
+        uint32_t soa_id = zone_image_find_name(cur->image, "multi.example.");
+        assert(soa_id != ZONE_IMAGE_NONE);
+        uint32_t soa_rr = zone_image_rrset_next(cur->image, soa_id, 6, zone_image_name_first_rr(cur->image, soa_id));
+        zone_image_soa_t soa;
+        assert(soa_rr != ZONE_IMAGE_NONE && zone_image_soa(cur->image, soa_rr, NULL, 0, NULL, 0, &soa) == 0 && soa.serial == 200);
+    }
 
     // 2. TSIG missing on first message error branch
     reset_mock_tcp_stream();

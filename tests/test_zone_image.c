@@ -595,6 +595,47 @@ static void check_glue(const zone_arena_t *a, const zone_image_t *img) {
     free(want);
 }
 
+/* B-1 engine hints: ZONE_IMAGE_F_WILDCARD / F_DNAME and the per-name ZONE_IMAGE_NAME_GLUE (the owners of the first 256
+ * distinct NS / MX / SRV targets, as prelink_zone_additional_glue() collects them, that have A or AAAA RRs here). */
+static void check_flags(const zone_arena_t *a, const zone_image_t *img) {
+    bool wild = false, dname = false;
+    for (size_t i = 0; i < a->count; i++) {
+        const dns_record_t *r = &a->records[i];
+        if (!r->name) continue;
+        if (r->name[0] == '*' && r->name[1] == '.') wild = true;
+        if (r->type_code == 39) dname = true;
+    }
+    CHECK(((img->flags & ZONE_IMAGE_F_WILDCARD) != 0) == wild);
+    CHECK(((img->flags & ZONE_IMAGE_F_DNAME) != 0) == dname);
+    for (uint32_t id = 0; id < img->n_names; id++)
+        CHECK(((zone_image_name_flags(img, id) & ZONE_IMAGE_NAME_WILDCARD) != 0) ==
+              (zone_image_name_text(img, id)[0] == '*' && zone_image_name_text(img, id)[1] == '.'));
+    if (a->count > 20000) return; /* quadratic */
+    uint8_t *want = calloc(img->n_names + 1, 1);
+    const char *prelink[256];
+    int np = 0;
+    for (size_t i = 0; i < a->count; i++) {
+        const dns_record_t *r = &a->records[i];
+        const char *tgt = NULL;
+        if (!r->name) continue;
+        if (r->type_code == 2 && r->rdata_count >= 1) tgt = r->rdata[0];
+        else if (r->type_code == 15 && r->rdata_count >= 2) tgt = r->rdata[1];
+        else if (r->type_code == 33 && r->rdata_count >= 4) tgt = r->rdata[3];
+        if (!tgt || !*tgt) continue;
+        bool dup = false;
+        for (int k = 0; k < np; k++) if (domain_names_match_ci(prelink[k], tgt)) dup = true;
+        if (dup || np >= 256) continue;
+        prelink[np++] = tgt;
+        uint32_t id = zone_image_find_name(img, tgt);
+        if (id == ZONE_IMAGE_NONE) continue;
+        for (uint32_t k = zone_image_name_first_rr(img, id), e = k + zone_image_name_rr_count(img, id); k < e; k++)
+            if (zone_image_rr_type(img, k) == 1 || zone_image_rr_type(img, k) == 28) want[id] = 1;
+    }
+    for (uint32_t id = 0; id < img->n_names; id++)
+        CHECK(((zone_image_name_flags(img, id) & ZONE_IMAGE_NAME_GLUE) != 0) == (want[id] != 0));
+    free(want);
+}
+
 static void check_ext(const zone_arena_t *a, const zone_image_t *img, const uint32_t *map) {
     for (size_t i = 0; i < a->count; i++) {
         const dns_record_t *r = &a->records[i];
@@ -750,6 +791,7 @@ static void check_zone(const char *label, zone_t *z, const char *apex) {
     check_nsec(a, img, map);
     check_nsec3(a, img);
     check_glue(a, img);
+    check_flags(a, img);
     check_ext(a, img, map);
 
     pass_sequence(a, img, map, 65535, MODE_PLAIN);
@@ -1020,6 +1062,57 @@ static void run_tags(void) {
     free_zone(&z);
 }
 
+/* B-1: more than 256 distinct targets (some without addresses, some used twice) and wildcard / DNAME owners */
+static void run_glue_flags(void) {
+    g_label = "glue flags";
+    static char text[64 * 1024];
+    size_t o = (size_t)snprintf(text, sizeof(text), "%s", ZONE_HEAD);
+    for (int i = 0; i < 300; i++) {
+        o += (size_t)snprintf(text + o, sizeof(text) - o, "m%03d MX 10 t%03d.img.example.\n", i, i);
+        if (i % 7 != 3) o += (size_t)snprintf(text + o, sizeof(text) - o, "t%03d AAAA 2001:db8::%x\nt%03d A 192.0.2.%d\n", i, i + 1, i, i % 250 + 1);
+        if (i % 11 == 0) o += (size_t)snprintf(text + o, sizeof(text) - o, "n%03d NS t%03d.img.example.\n", i, i);   /* a target used twice */
+    }
+    o += (size_t)snprintf(text + o, sizeof(text) - o, "*.w A 192.0.2.250\ndn DNAME img.example.\nx.out MX 10 mail.elsewhere.example.\n");
+    zone_t z;
+    CHECK(load_zone(&z, text, "img.example.", NULL, false));
+    if (!z.ok) return;
+    check_zone("glue flags", &z, "img.example.");
+    zone_image_t *img = zone_image_freeze(&z.a, "img.example.");
+    CHECK(img != NULL);
+    if (img) {
+        CHECK((img->flags & ZONE_IMAGE_F_WILDCARD) && (img->flags & ZONE_IMAGE_F_DNAME));
+        int flagged = 0, below = 0;
+        for (int i = 0; i < 300; i++) {
+            char nm[64];
+            snprintf(nm, sizeof(nm), "t%03d.img.example.", i);
+            uint32_t id = zone_image_find_name(img, nm);
+            bool has_addr = i % 7 != 3;
+            CHECK((id != ZONE_IMAGE_NONE) == has_addr);
+            if (id == ZONE_IMAGE_NONE) continue;
+            bool f = (zone_image_name_flags(img, id) & ZONE_IMAGE_NAME_GLUE) != 0;
+            if (f) flagged++;
+            /* the 256 slots are taken in record order by targets with or without addresses: the two NS targets of
+             * ZONE_HEAD first, then t000.. */
+            CHECK(f == (i < 254));
+            if (i >= 254 && !f) below++;
+        }
+        CHECK(flagged > 200 && flagged < 256 && below > 30);
+        zone_image_free(img);
+    }
+    /* no wildcard and no DNAME: neither flag */
+    zone_t z2;
+    char small[2048];
+    snprintf(small, sizeof(small), "%swww A 192.0.2.1\n", ZONE_HEAD);
+    CHECK(load_zone(&z2, small, "img.example.", NULL, false));
+    if (z2.ok) {
+        zone_image_t *i2 = zone_image_freeze(&z2.a, "img.example.");
+        CHECK(i2 && !(i2->flags & (ZONE_IMAGE_F_WILDCARD | ZONE_IMAGE_F_DNAME)));
+        zone_image_free(i2);
+        free_zone(&z2);
+    }
+    free_zone(&z);
+}
+
 /* an empty zone, a zone of one RR, and the builder contract */
 static void run_edges(void) {
     g_label = "edges";
@@ -1049,6 +1142,8 @@ int main(void) {
     run_tinydns();
     printf("[TEST] BIND $LOCATION / $ECS-SUBNET tags\n");
     run_tags();
+    printf("[TEST] engine hints: wildcard / DNAME flags, prelinked glue targets (B-1)\n");
+    run_glue_flags();
     printf("[TEST] empty zone\n");
     run_edges();
     printf("[TEST] tests/zones/*.zone\n");

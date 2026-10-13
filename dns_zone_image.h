@@ -35,6 +35,8 @@
 /* zone_image_t.flags */
 #define ZONE_IMAGE_F_TINYDNS 0x1u /* the zone was loaded from tinydns data (is_tinydns_format) */
 #define ZONE_IMAGE_F_EXT     0x2u /* at least one RR has an ext[] entry */
+#define ZONE_IMAGE_F_WILDCARD 0x4u /* some owner is a wildcard (first label "*"): lets the engine skip the wildcard search of a zone without one */
+#define ZONE_IMAGE_F_DNAME    0x8u /* some owner has a DNAME RRset: lets the engine skip the DNAME search of a zone without one */
 
 /* zone_image_name_t.rr_count_flags: low 24 bits RR count, high 8 bits flags */
 #define ZONE_IMAGE_NAME_COUNT_MASK 0x00FFFFFFu
@@ -43,6 +45,7 @@
 #define ZONE_IMAGE_NAME_DNAME      (1u << 26) /* DNAME RRset */
 #define ZONE_IMAGE_NAME_APEX       (1u << 27)
 #define ZONE_IMAGE_NAME_NSEC       (1u << 28) /* has an NSEC RR */
+#define ZONE_IMAGE_NAME_GLUE       (1u << 29) /* prelinked glue target: among the first MAX_PRELINK_TARGETS (256) distinct NS/MX/SRV targets in record order and has A/AAAA RRs here (what prelink_zone_additional_glue() links); the engine answers it with the RRs in RR order (see append_glue_records) */
 
 /* zone_image_rr_t.flags */
 #define ZONE_IMAGE_RR_RAW        0x1u /* RDATA written as is (generic_data / KARIDNS_EXT class): never compressed */
@@ -211,6 +214,13 @@ int zone_image_soa(const zone_image_t *img, uint32_t rr, char *mname, size_t mca
 int zone_image_mx_pref(const zone_image_t *img, uint32_t rr, uint16_t *pref);
 /* SRV priority / weight / port (RFC 2782) */
 int zone_image_srv(const zone_image_t *img, uint32_t rr, uint16_t *priority, uint16_t *weight, uint16_t *port);
+/* SOA MINIMUM (RFC 2308 §4: the negative caching TTL), the last 32 bits of the RDATA (RFC 1035 §3.3.13); decodes no names */
+static inline int zone_image_soa_minimum(const zone_image_t *img, uint32_t rr, uint32_t *minimum) {
+    if (zone_image_rr_type(img, rr) != 6 || zone_image_rr_rdlen(img, rr) < 22) return -1;
+    const uint8_t *e = zone_image_rr_rdata(img, rr) + zone_image_rr_rdlen(img, rr) - 4;
+    *minimum = ((uint32_t)e[0] << 24) | ((uint32_t)e[1] << 16) | ((uint32_t)e[2] << 8) | e[3];
+    return 0;
+}
 /* RRSIG / SIG (RFC 4034 §3.1) type covered */
 int zone_image_rrsig_covered(const zone_image_t *img, uint32_t rr, uint16_t *type_covered);
 /* NSEC (RFC 4034 §4.1.2) / NSEC3 (RFC 5155 §3.2.1) type bitmap: is `type` listed? false for a malformed bitmap */

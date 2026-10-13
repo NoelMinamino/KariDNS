@@ -7,6 +7,7 @@
 #include "dns_edns_ecs.h"
 #include "dns_axfr_ixfr.h"
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
 #include "dns_wire.h"
 #include "dns_utils.h"
 #include "dns_tsig_acl.h"
@@ -993,6 +994,15 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
       return RELOAD_ERR_MISSING_SOA;
   }
 
+  /* S5 B-1: 応答を作る側が読むイメージ。公開の直前に 1 回だけ作る (クエリの経路では作らない) */
+  z_standby->image = zone_image_freeze(z_standby, entry->domain);
+  if (!z_standby->image) {
+      zone_arena_destroy(z_standby);
+      pthread_mutex_unlock(&entry->writer_lock);
+      syslog(LOG_ERR, "[Zone] Failed to build the zone image after reload for '%s'", entry->domain);
+      return RELOAD_ERR_PARSE;
+  }
+
   // prelink は他ゾーンの active arena を読むので、読み取り区間で他の writer の再利用から守る
   rcu_aux_read_lock();
   zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
@@ -1890,6 +1900,8 @@ int rebuild_zone_db_from_config_ext(server_config_t *config, bool skip_unchanged
 
 void zone_arena_clear_data_pools(zone_arena_t *arena) {
   if (!arena) return;
+  free(arena->image);
+  arena->image = NULL;
   for (int i = 0; i < arena->data_pool_count; i++) {
     if (arena->data_pools[i]) {
       free(arena->data_pools[i]);

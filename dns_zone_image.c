@@ -31,6 +31,7 @@ _Static_assert(sizeof(zone_image_n3chain_t) == 16, "zone_image_n3chain_t");
 _Static_assert(sizeof(zone_image_t) % 8 == 0, "zone_image_t alignment");
 
 #define IMG_MAX_RDLEN 65524u /* 65535 - 11: a root owner and the fixed fields precede the RDATA when captured */
+#define IMG_MAX_PRELINK_TARGETS 256 /* MAX_PRELINK_TARGETS in dns_snapshot_rcu.c */
 #define IMG_FAIL() do { syslog(LOG_ERR, "[Image] freeze failed at dns_zone_image.c:%d", __LINE__); goto out; } while (0)
 
 /* ------------------------------------------------------------------------------------------------------------
@@ -220,6 +221,8 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
     uint32_t n_names = 0, n_rrs = 0;
     uint32_t n_glue = 0, n_n3ch = 0, n_n3e = 0;
     bool ok = false;
+    bool has_wild = false;
+    bool has_dname = false;
 
     /* strings area: offset 0 is "none", so the first 8 octets are padding */
     { uint8_t pad[8] = { 0 }; sb_add(&sb, pad, sizeof(pad)); }
@@ -394,12 +397,18 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
     for (uint32_t k = 0; k < n_rrs; k++) {
         uint32_t id = rrs[k].name_id;
         if (rrs[k].type == 2 && id != apex_id) names[id].rr_count_flags |= ZONE_IMAGE_NAME_CUT;
-        else if (rrs[k].type == 39) names[id].rr_count_flags |= ZONE_IMAGE_NAME_DNAME;
+        else if (rrs[k].type == 39) {
+            names[id].rr_count_flags |= ZONE_IMAGE_NAME_DNAME;
+            has_dname = true;
+        }
         else if (rrs[k].type == 47) names[id].rr_count_flags |= ZONE_IMAGE_NAME_NSEC;
     }
     for (uint32_t id = 0; id < n_names; id++) {
         const char *t = ix.names[id].text;
-        if (t[0] == '*' && t[1] == '.') names[id].rr_count_flags |= ZONE_IMAGE_NAME_WILDCARD;
+        if (t[0] == '*' && t[1] == '.') {
+            names[id].rr_count_flags |= ZONE_IMAGE_NAME_WILDCARD;
+            has_wild = true;
+        }
         if (id == apex_id) {
             names[id].rr_count_flags |= ZONE_IMAGE_NAME_APEX;
             names[id].rr_count_flags &= ~ZONE_IMAGE_NAME_CUT;
@@ -484,6 +493,10 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
     seen = calloc(n_names ? n_names : 1, 1);
     glue = malloc((n_names ? n_names : 1) * sizeof(uint32_t));
     if (!seen || !glue) IMG_FAIL();
+    /* ZONE_IMAGE_NAME_GLUE mirrors prelink_zone_additional_glue(): its target list holds the first
+     * IMG_MAX_PRELINK_TARGETS distinct targets in record order, whether or not they have addresses here */
+    const char *prelink_targets[IMG_MAX_PRELINK_TARGETS];
+    int n_prelink = 0;
     for (size_t i = 0; i < n; i++) {
         const dns_record_t *r = &a->records[i];
         const char *tgt = NULL;
@@ -492,12 +505,21 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
         else if (r->type_code == 15 && r->rdata_count >= 2) tgt = r->rdata[1];
         else if (r->type_code == 33 && r->rdata_count >= 4) tgt = r->rdata[3];
         if (!tgt || *tgt == '\0') continue;
+        bool in_prelink = false, dup = false;
+        for (int k = 0; k < n_prelink; k++)
+            if (domain_names_match_ci(prelink_targets[k], tgt)) { dup = true; break; }
+        if (!dup && n_prelink < IMG_MAX_PRELINK_TARGETS) {
+            prelink_targets[n_prelink++] = tgt;
+            in_prelink = true;
+        }
         uint32_t id = tmp_find(&ix, tgt, dns_name_hash_ci(tgt));
-        if (id == ZONE_IMAGE_NONE || seen[id]) continue;
-        seen[id] = 1;
+        if (id == ZONE_IMAGE_NONE) continue;
         bool has_addr = false;
         for (uint32_t k = names[id].first_rr, e = k + (names[id].rr_count_flags & ZONE_IMAGE_NAME_COUNT_MASK); k < e; k++)
             if (rrs[k].type == 1 || rrs[k].type == 28) { has_addr = true; break; }
+        if (has_addr && in_prelink) names[id].rr_count_flags |= ZONE_IMAGE_NAME_GLUE;
+        if (seen[id]) continue;
+        seen[id] = 1;
         if (has_addr) glue[n_glue++] = id;
     }
 
@@ -541,7 +563,7 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
         img->magic = ZONE_IMAGE_MAGIC;
         img->version = ZONE_IMAGE_VERSION;
         img->total_size = (uint32_t)off;
-        img->flags = (a->is_tinydns_format ? ZONE_IMAGE_F_TINYDNS : 0) | (n_ext ? ZONE_IMAGE_F_EXT : 0);
+        img->flags = (a->is_tinydns_format ? ZONE_IMAGE_F_TINYDNS : 0) | (n_ext ? ZONE_IMAGE_F_EXT : 0) | (has_wild ? ZONE_IMAGE_F_WILDCARD : 0) | (has_dname ? ZONE_IMAGE_F_DNAME : 0);
         img->n_names = n_names; img->n_rrs = n_rrs; img->n_ext = (uint32_t)n_ext;
         img->n_canon = (uint32_t)n_canon; img->n_nsec = (uint32_t)a->nsec_count;
         img->n_n3chains = n_n3ch; img->n_n3entries = n_n3e; img->n_glue = n_glue; img->hash_size = (uint32_t)hash_size;

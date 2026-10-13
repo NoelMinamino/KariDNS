@@ -16,6 +16,8 @@
 #include "dns_wire.h"
 #include "dns_config_parser.h"
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
+#include "test_image_helper.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_dynamic_update.h"
 #include "dns_query_engine.h"
@@ -168,7 +170,7 @@ static void test_process_update_sections_records(void) {
     arena.records_cap = 16;
     arena.records[0] = soa_rec;
     arena.count = 1;
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     // Build UPDATE packet: ZOCOUNT=1 (example.com), PRCOUNT=0, UPCOUNT=1 (Add test.example.com A 192.0.2.99)
     uint8_t pkt[512] = {0};
@@ -237,7 +239,7 @@ static void init_sample_zone_arena(zone_arena_t *arena, const char *domain, cons
     arena->records_cap = 16;
     arena->records[0] = rec;
     arena->count = 1;
-    build_zone_index(arena, true);
+    assert(test_build_index(arena, true) == 0);
 }
 
 static void test_handle_dynamic_update_pipeline(void) {
@@ -295,6 +297,10 @@ static void test_handle_dynamic_update_pipeline(void) {
     // Verify record in active arena (arena_b)
     zone_arena_t *z_cur = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
     assert(z_cur->count == 2);
+    /* S5 B-1: the published version carries the image the engine reads, with the added RR in it */
+    assert(z_cur->image != NULL && z_cur->image->n_rrs == 2);
+    uint32_t www_id = zone_image_find_name(z_cur->image, "www.example.com.");
+    assert(www_id != ZONE_IMAGE_NONE && zone_image_rrset_next(z_cur->image, www_id, 1, zone_image_name_first_rr(z_cur->image, www_id)) != ZONE_IMAGE_NONE);
 
     // 3. Update with PREREQ failure (e.g. NXDOMAIN on non-existent domain under RFC 2136 §3.2.1)
     uint8_t bad_pkt[512] = {0};
@@ -426,7 +432,7 @@ static void test_send_notify_to_all_comprehensive(void) {
     r_g6.rdata[0] = arena_strdup(a1, "2001:db8::20");
     a1->records[a1->count++] = r_g6;
 
-    build_zone_index(a1, true);
+    assert(test_build_index(a1, true) == 0);
     atomic_store_explicit(&z1->rcu.active, a1, memory_order_release);
 
     // Sibling zone z2: sibling.com
@@ -451,7 +457,7 @@ static void test_send_notify_to_all_comprehensive(void) {
     r_sib6.rdata[0] = arena_strdup(a2, "2001:db8:ffff::30");
     a2->records[a2->count++] = r_sib6;
 
-    build_zone_index(a2, true);
+    assert(test_build_index(a2, true) == 0);
     atomic_store_explicit(&z2->rcu.active, a2, memory_order_release);
 
     send_notify_to_all("example.com.", "default");
@@ -530,7 +536,7 @@ static void test_process_update_sections_apex_ns_protection(void) {
     ns1.rdata[0] = arena_strdup(&arena, "ns1.example.com.");
     arena.records[arena.count++] = ns1;
 
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     // Build UPDATE packet to delete ns1 via CLASS NONE (254)
     uint8_t pkt[512] = {0};
@@ -587,7 +593,7 @@ static void test_process_update_sections_apex_ns_protection(void) {
     ns2.rdata_count = 1;
     ns2.rdata[0] = arena_strdup(&arena, "ns2.example.com.");
     arena.records[arena.count++] = ns2;
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     // Now repeating the delete of ns1 must succeed (2 apex NS existed -> 1 remains)
     rcode = process_update_sections(pkt, off, "example.com.", &arena, &ur);
@@ -732,7 +738,7 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
     a_rec.rdata_count = 1;
     a_rec.rdata[0] = arena_strdup(&arena, "192.0.2.1");
     arena.records[arena.count++] = a_rec;
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     // 1. Short packet (< 12 bytes)
     uint8_t short_pkt[8] = {0};
@@ -969,7 +975,7 @@ static void upd_load(zone_arena_t *a) {
     ctx.err_out = &err;
     char *b = arena_strdup(a, UPD_ZONE_TEXT); // the arena keeps pointers into the text
     assert(parse_zone_fast(b, strlen(b), a, &ctx) >= 0);
-    assert(build_zone_index(a, true) == 0);
+    assert(test_build_index(a, true) == 0);
 }
 
 static int upd_count(const zone_arena_t *a, const char *name, uint16_t type) {

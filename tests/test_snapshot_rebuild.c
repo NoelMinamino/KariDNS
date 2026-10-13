@@ -19,6 +19,8 @@
 #include "dns_wire.h"
 #include "dns_config_parser.h"
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
+#include "test_image_helper.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_priv_sandbox.h"
 #include "dns_query_engine.h"
@@ -188,6 +190,9 @@ static void test_rebuild_two_views(void) {
     bool found_new = false;
     for (size_t i = 0; i < na->count; i++) if (!strcasecmp(na->records[i].name, "new.a.example.")) found_new = true;
     assert(found_new);
+    /* S5 B-1: the reloaded version carries the image the engine reads, with the new owner in it */
+    assert(na->image != NULL && na->image->n_rrs == na->count);
+    assert(zone_image_find_name(na->image, "new.a.example.") != ZONE_IMAGE_NONE);
 
     char zpath[300];
     zone_config_t bad = *zcfg;
@@ -700,7 +705,7 @@ static void test_snapshot_rebuild_case_23(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "idx.example.", .is_standalone_mode = true, .err_out = &err };
     char ztext[] = "$ORIGIN idx.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\n";
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
     assert(arena.hash_size > 0);
     zone_arena_destroy(&arena);
 }
@@ -714,7 +719,7 @@ static void test_snapshot_rebuild_case_24(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "coll.example.", .is_standalone_mode = true, .err_out = &err };
     char ztext[] = "$ORIGIN coll.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nrec1 IN A 1.1.1.1\nrec2 IN A 2.2.2.2\n";
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
     zone_arena_destroy(&arena);
 }
 
@@ -727,7 +732,7 @@ static void test_snapshot_rebuild_case_25(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "ent.example.", .is_standalone_mode = true, .err_out = &err };
     char ztext[] = "$ORIGIN ent.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\na.b.c IN A 192.0.2.1\n";
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
     zone_arena_destroy(&arena);
 }
 

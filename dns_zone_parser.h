@@ -148,6 +148,9 @@ typedef struct zone_arena_s {
   int glue_target_count;
   uint64_t glue_built_at;
   bool rcache_ok;          /* このゾーンの応答を共有の応答キャッシュに入れてよい */
+  /* S5 phase B: 公開する版のコンパクトなイメージ (dns_zone_image.h)。応答を作る側はこれだけを読む。
+   * zone_image_freeze() が公開の直前に作り、zone_arena_destroy() が解放する (1 回の malloc なので free()) */
+  struct zone_image_s *image;
   /* 公開した版、および兄弟ゾーンが変わるたびに新しい値 (応答キャッシュの鍵)。0 = 未公開/テスト用 */
   _Atomic uint64_t generation;
 } zone_arena_t;

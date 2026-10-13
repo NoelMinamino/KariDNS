@@ -9,6 +9,8 @@
 #include "dns_wire.h"
 #include "dns_config_parser.h"
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
+#include "test_image_helper.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_query_engine.h"
 #include "dns_server_internal.h"
@@ -349,7 +351,7 @@ static void test_wire_cache_consistency(void) {
 
     int parsed = parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx);
     assert(parsed >= 0);
-    int b_rc = build_zone_index(&arena, true);
+    int b_rc = test_build_index(&arena, true);
     assert(b_rc == 0);
 
     server_config_t cfg;
@@ -957,7 +959,7 @@ static void test_wire_cache_max_records_limit(void) {
 
         int parsed = parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx);
         assert(parsed >= 0);
-        int b_rc = build_zone_index(&arena, true);
+        int b_rc = test_build_index(&arena, true);
         assert(b_rc == 0);
         size_t total_records = arena.count;
         assert(total_records == 5);
@@ -1057,7 +1059,7 @@ static void test_wire_cache_observatory_counters(void) {
 
     int parsed = parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx);
     assert(parsed >= 0);
-    int b_rc = build_zone_index(&arena, true);
+    int b_rc = test_build_index(&arena, true);
     assert(b_rc == 0);
 
     server_config_t cfg;
@@ -1198,7 +1200,7 @@ static void test_wire_cache_per_view_config(void) {
         "example.com. 3600 IN NS ns1.example.com.\n"
         "ns1.example.com. 3600 IN A 192.0.2.1\n";
     assert(parse_zone_fast(zone_text, strlen(zone_text), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     build_zone_response_cache(&arena, &cfg, "tagged", "example.com.");
     assert(!arena.rcache_ok);

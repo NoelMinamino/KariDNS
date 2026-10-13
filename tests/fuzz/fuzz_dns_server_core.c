@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include "../../dns_config_parser.h"
 #include "../../dns_zone_parser.h"
+#include "../../dns_zone_image.h"
+#include "../test_image_helper.h"
 
 // Override syslog to prevent massive disk I/O and CPU usage during fuzzing
 void syslog(int priority, const char *format, ...) {
@@ -48,7 +50,7 @@ static void init_fuzz_environment(void) {
                        "cname.fuzz.local. 3600 IN CNAME fuzz.local.\n"
                        "sub.fuzz.local. 3600 IN A 192.0.2.2\n";
     parse_zone_fast(zone_text, strlen(zone_text), &g_fuzz_arena, &ctx);
-    build_zone_index(&g_fuzz_arena, true);
+    assert(test_build_index(&g_fuzz_arena, true) == 0);
 
     memset(&g_fuzz_entry, 0, sizeof(g_fuzz_entry));
     strncpy(g_fuzz_entry.domain, "fuzz.local.", sizeof(g_fuzz_entry.domain) - 1);
@@ -189,7 +191,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         memset(&ctx, 0, sizeof(ctx));
         ctx.default_origin = "fuzz.local.";
 
-        if (parse_zone_fast(text_buf, fuzz_size, &arena, &ctx) >= 0 && build_zone_index(&arena, true) == 0) {
+        /* like the loader (X-32): what cannot be written in wire format never reaches the index and the image */
+        if (parse_zone_fast(text_buf, fuzz_size, &arena, &ctx) >= 0 &&
+            (zone_arena_drop_unencodable(&arena, NULL, NULL), test_build_index(&arena, true)) == 0) {
             check_nsec3_index(&arena);
             check_nsec3_active(&arena);
             query_fuzzed_zone(&arena);

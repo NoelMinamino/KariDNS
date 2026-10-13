@@ -14,6 +14,8 @@
 #include "dns_wire.h"
 #include "dns_config_parser.h"
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
+#include "test_image_helper.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_query_engine.h"
 #include "dns_server_internal.h"
@@ -22,8 +24,8 @@
 // Prototypes for internal query engine functions under test
 void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
                         uint16_t *ancount, uint16_t *nscount, uint16_t *arcount);
-bool nsec_covers_name(const dns_record_t *rec, const char *name);
-dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name);
+bool nsec_covers_name(const zone_image_t *img, uint32_t rr, const char *name);
+uint32_t find_covering_nsec(const zone_image_t *img, const char *name);
 size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out);
 int64_t monotonic_ms(void);
 uint32_t remaining_ms(int64_t deadline);
@@ -43,15 +45,15 @@ bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iterations,
                         const uint8_t *salt, size_t salt_len,
                         char *out_b32, size_t out_b32_sz);
 bool nsec3_covers_hash(const char *owner_hash, const char *next_hash, const char *target_hash);
-dns_record_t *find_matching_nsec3(zone_arena_t *zone, const dns_record_t *param, const char *hash_b32, const char *apex);
-dns_record_t *find_covering_nsec3(zone_arena_t *zone, const dns_record_t *param, const char *target_hash);
+uint32_t find_matching_nsec3(const zone_image_t *img, uint32_t chain, const char *hash_b32, const char *apex);
+uint32_t find_covering_nsec3(const zone_image_t *img, uint32_t chain, const char *target_hash);
 bool find_next_closer_name(const char *qname, const char *encloser, char *out, size_t out_sz);
-bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
+bool attach_nsec3_record(const zone_image_t *img, uint32_t rr,
                          uint8_t *res, size_t max_res_len, uint16_t *offset,
                          compress_ctx_t *comp_ctx, uint16_t *nscount,
-                         dns_record_t **attached, int *attached_count);
-bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag);
-const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag);
+                         const zone_image_rr_t **attached, int *attached_count);
+bool name_exists_in_zone(const zone_image_t *img, const char *name, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag);
+const char *find_closest_encloser(const zone_image_t *img, const char *qname, const char *zone_apex, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag);
 program_plugin_t *find_program_plugin(const char *view_name, const char *domain);
 ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
                         const uint8_t *query, size_t query_len,
@@ -227,7 +229,7 @@ static void gr_setup(const char *origin, const char *zone_text) {
     char *buf = arena_strdup(&g_gr.arena, zone_text);
     assert(buf != NULL);
     assert(parse_zone_fast(buf, strlen(buf), &g_gr.arena, &ctx) >= 0);
-    assert(build_zone_index(&g_gr.arena, true) == 0);
+    assert(test_build_index(&g_gr.arena, true) == 0);
     strncpy(g_gr.entry.domain, origin, sizeof(g_gr.entry.domain) - 1);
     atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena, memory_order_release);
     g_gr.entries[0] = &g_gr.entry;
@@ -691,7 +693,7 @@ static void test_sibling_zone_additional_glue_and_limits(void) {
         "sub IN NS ns1.sib.example.\n";
     char *p_buf = arena_strdup(&arena_prim, prim_text);
     parse_zone_fast(p_buf, strlen(p_buf), &arena_prim, &ctx1);
-    build_zone_index(&arena_prim, true);
+    assert(test_build_index(&arena_prim, true) == 0);
 
     parse_context_t ctx2 = { .base_dir = ".", .default_origin = "sib.example.", .is_standalone_mode = true, .err_out = &err };
     const char *sib_text =
@@ -703,7 +705,7 @@ static void test_sibling_zone_additional_glue_and_limits(void) {
         "ns1 IN AAAA 2001:db8::1\n";
     char *s_buf = arena_strdup(&arena_sib, sib_text);
     parse_zone_fast(s_buf, strlen(s_buf), &arena_sib, &ctx2);
-    build_zone_index(&arena_sib, true);
+    assert(test_build_index(&arena_sib, true) == 0);
 
     zone_db_entry_t entry_prim, entry_sib;
     memset(&entry_prim, 0, sizeof(entry_prim));
@@ -756,6 +758,15 @@ static void test_sibling_zone_additional_glue_and_limits(void) {
     printf("  -> Sibling zone additional glue passed.\n");
 }
 
+/* image_rr_currently_valid() on the one RR of a one-RR image of a copy of `rec` (no location, no tags) */
+static bool rec_currently_valid(const dns_record_t *rec, time_t now, uint32_t *eff_ttl) {
+    zone_image_t *img = test_image_of_record(rec);
+    assert(img != NULL);
+    bool ok = image_rr_currently_valid(img, 0, now, NULL, NULL, NULL, eff_ttl);
+    free(img);
+    return ok;
+}
+
 static void test_eff_ttl_resolution_and_clamp(void) {
     printf("[TEST] Query Engine: Effective TTL resolution & tinydns clamp...\n");
     dns_record_t rec;
@@ -764,19 +775,19 @@ static void test_eff_ttl_resolution_and_clamp(void) {
     rec.tinydns_ttd = 0;
 
     uint32_t eff_ttl = 0;
-    bool valid = tinydns_record_currently_valid(&rec, 0, NULL, NULL, NULL, &eff_ttl);
+    bool valid = rec_currently_valid(&rec, 0, &eff_ttl);
     assert(valid == true);
     assert(eff_ttl == 86400);
 
     // Countdown TTL
     rec.tinydns_ttd = 1000000;
     rec.tinydns_ttl_countdown = true;
-    valid = tinydns_record_currently_valid(&rec, 999900, NULL, NULL, NULL, &eff_ttl);
+    valid = rec_currently_valid(&rec, 999900, &eff_ttl);
     assert(valid == true);
     assert(eff_ttl == 100);
 
     // Expired TTL
-    valid = tinydns_record_currently_valid(&rec, 1000001, NULL, NULL, NULL, &eff_ttl);
+    valid = rec_currently_valid(&rec, 1000001, &eff_ttl);
     assert(valid == false);
 
     printf("  -> Effective TTL resolution & tinydns clamp passed.\n");

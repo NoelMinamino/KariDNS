@@ -2,6 +2,7 @@
 #include "dns_axfr_ixfr.h"
 #include "dns_wire.h"
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
 #include "dns_config_parser.h"
 #include "dns_utils.h"
 #include "dns_catalog_zone.h"
@@ -750,6 +751,17 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
           if (unsigned_msgs) free(unsigned_msgs);
           zone_arena_destroy(&tmp_arena);
           syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after XFR for '%s'", entry->domain);
+          return -1;
+        }
+
+        /* S5 B-1: 応答を作る側が読むイメージ。公開の直前に 1 回だけ作る。作れなければ索引を作れなかったときと同じく転送を捨てる */
+        standby->image = zone_image_freeze(standby, entry->domain);
+        if (!standby->image) {
+          zone_arena_clear_data_pools(standby);
+          pthread_mutex_unlock(&entry->writer_lock);
+          if (unsigned_msgs) free(unsigned_msgs);
+          zone_arena_destroy(&tmp_arena);
+          syslog(LOG_ERR, "[Zone] Failed to build the zone image after XFR for '%s'", entry->domain);
           return -1;
         }
 

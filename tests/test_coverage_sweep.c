@@ -15,6 +15,8 @@
 #include "dns_wire.h"
 #include "dns_config_parser.h"
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
+#include "test_image_helper.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_query_engine.h"
 #include "dns_server_internal.h"
@@ -178,7 +180,7 @@ static void sw_add_zone(const char *origin, const char *text) {
     assert(buf);
     int prc = parse_zone_fast(buf, strlen(buf), a, &ctx);
     if (prc < 0) { fprintf(stderr, "zone %s parse failed at %zu: %s\n", origin, err.error_offset, err.error_message ? err.error_message : "?"); assert(0); }
-    assert(build_zone_index(a, true) == 0);
+    assert(test_build_index(a, true) == 0);
     zone_db_entry_t *e = &g_sw.entry[i];
     strncpy(e->domain, origin, sizeof(e->domain) - 1);
     strncpy(e->view_name, "default", sizeof(e->view_name) - 1);
@@ -1003,77 +1005,115 @@ static void test_engine_helper_edges(void) {
     assert(find_next_closer_name("longlabel.b.", "b.", out, 4) == false);
     assert(find_next_closer_name("q.r.b", "b", out, sizeof(out)) == true && strcmp(out, "r.b") == 0);
 
-    /* arena helpers on empty / incomplete zones */
+    /* image helpers on a missing and on an empty zone image */
     zone_arena_t z; memset(&z, 0, sizeof(z)); zone_arena_init(&z);
+    assert(test_build_index(&z, true) == 0);   /* an empty zone: an image with no RRs */
+    assert(z.image != NULL && z.image->n_rrs == 0);
+    const zone_image_t *zi = z.image;
     dns_record_t p3; memset(&p3, 0, sizeof(p3));
     DNS_RECORD_BIND_RDATA(p3);
     p3.rdata[0] = "1"; p3.rdata[1] = "0"; p3.rdata[2] = "0"; p3.rdata[3] = "-"; p3.rdata_count = 4;
-    assert(find_matching_nsec3(NULL, &p3, "x", "a.") == NULL);
-    assert(find_matching_nsec3(&z, NULL, "x", "a.") == NULL);
-    assert(find_matching_nsec3(&z, &p3, NULL, "a.") == NULL);
-    assert(find_matching_nsec3(&z, &p3, "x", NULL) == NULL);
-    assert(find_matching_nsec3(&z, &p3, "x", "a.") == NULL);
-    assert(find_covering_nsec3(NULL, &p3, "x") == NULL);
-    assert(find_covering_nsec3(&z, NULL, "x") == NULL);
-    assert(find_covering_nsec3(&z, &p3, NULL) == NULL);
-    assert(find_covering_nsec3(&z, &p3, "x") == NULL);
+    uint32_t no_chain = test_chain_of(&z, &p3);   /* the empty zone has no chain for any parameters */
+    assert(no_chain == ZONE_IMAGE_NONE);
+    assert(find_matching_nsec3(NULL, no_chain, "x", "a.") == ZONE_IMAGE_NONE);
+    assert(find_matching_nsec3(zi, no_chain, "x", "a.") == ZONE_IMAGE_NONE);
+    assert(find_matching_nsec3(zi, no_chain, NULL, "a.") == ZONE_IMAGE_NONE);
+    assert(find_matching_nsec3(zi, no_chain, "x", NULL) == ZONE_IMAGE_NONE);
+    assert(find_covering_nsec3(NULL, no_chain, "x") == ZONE_IMAGE_NONE);
+    assert(find_covering_nsec3(zi, no_chain, NULL) == ZONE_IMAGE_NONE);
+    assert(find_covering_nsec3(zi, no_chain, "x") == ZONE_IMAGE_NONE);
     assert(name_exists_in_zone(NULL, "a.", "\0\0", NULL, NULL) == false);
-    assert(name_exists_in_zone(&z, NULL, "\0\0", NULL, NULL) == false);
-    assert(name_exists_in_zone(&z, "a.", "\0\0", NULL, NULL) == false);
+    assert(name_exists_in_zone(zi, NULL, "\0\0", NULL, NULL) == false);
+    assert(name_exists_in_zone(zi, "a.", "\0\0", NULL, NULL) == false);
     const char *apx = "a.";
     assert(find_closest_encloser(NULL, "a.", apx, "\0\0", NULL, NULL) == apx);
-    assert(find_closest_encloser(&z, NULL, apx, "\0\0", NULL, NULL) == apx);
-    assert(find_closest_encloser(&z, "a.", NULL, "\0\0", NULL, NULL) == NULL);
-    assert(find_closest_encloser(&z, "a.", apx, "\0\0", NULL, NULL) == apx);
-    assert(find_covering_nsec(&z, "a.") == NULL);
+    assert(find_closest_encloser(zi, NULL, apx, "\0\0", NULL, NULL) == apx);
+    assert(find_closest_encloser(zi, "a.", NULL, "\0\0", NULL, NULL) == NULL);
+    assert(find_closest_encloser(zi, "a.", apx, "\0\0", NULL, NULL) == apx);
+    assert(find_covering_nsec(zi, "a.") == ZONE_IMAGE_NONE);
+    assert(find_covering_nsec(NULL, "a.") == ZONE_IMAGE_NONE);
     uint16_t off = 12, cnt = 0;
     compress_ctx_t cc; compress_ctx_init(&cc);
     uint8_t res[512];
-    assert(find_delegation(NULL, "a.", 0, "a.", res, sizeof(res), &off, &cc, &cnt, &cnt, false,
+    assert(find_delegation(NULL, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, &cnt, false,
                            "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false) == false);
-    assert(find_delegation(&z, "a.", 0, "a.", res, sizeof(res), &off, &cc, &cnt, &cnt, false,
+    assert(find_delegation(zi, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, &cnt, false,
                            "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false) == false);
     assert(append_glue_records(NULL, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false));
-    assert(append_glue_records(&z, NULL, "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false));
-    assert(append_glue_records(&z, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_NO, NULL, false));
+    assert(append_glue_records(zi, NULL, "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false));
+    assert(append_glue_records(zi, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_NO, NULL, false));
 
-    /* nsec_covers_name with malformed records */
+    /* nsec_covers_name: a missing image, an RR that is not an NSEC, the owner/next orders. (A record without an
+     * owner, or an NSEC without a type bitmap, cannot be written in wire format, so no image holds one.) */
     dns_record_t r; memset(&r, 0, sizeof(r));
     DNS_RECORD_BIND_RDATA(r);
-    assert(nsec_covers_name(NULL, "a.") == false);
-    assert(nsec_covers_name(&r, "a.") == false);
+    assert(nsec_covers_name(NULL, 0, "a.") == false);
+    zone_image_t *ri = test_image_of_record(&r);    /* defaults to an A record */
+    assert(ri != NULL && nsec_covers_name(ri, 0, "a.") == false);
+    free(ri);
     r.type_code = 47;
-    assert(nsec_covers_name(&r, "a.") == false);
     r.rdata[0] = "c.example."; r.rdata[1] = "A"; r.rdata_count = 2;
-    assert(nsec_covers_name(&r, "a.") == false);
     r.name = "a.example.";
-    assert(nsec_covers_name(&r, NULL) == false);
-    assert(nsec_covers_name(&r, "b.example.") == true);
+    ri = test_image_of_record(&r);
+    assert(ri != NULL);
+    assert(nsec_covers_name(ri, 0, NULL) == false);
+    assert(nsec_covers_name(ri, 0, "b.example.") == true);
+    assert(nsec_covers_name(ri, 0, "d.example.") == false);
+    free(ri);
     r.rdata[0] = "example.";   /* last NSEC in the chain (wrap-around) */
-    assert(nsec_covers_name(&r, "z.example.") == true);
+    ri = test_image_of_record(&r);
+    assert(ri != NULL && nsec_covers_name(ri, 0, "z.example.") == true);
+    free(ri);
 
     /* collect_additional_rr_glue variants */
-    const char *gt[16]; int gc = 0;
-    collect_additional_rr_glue(NULL, gt, &gc, false);
-    collect_additional_rr_glue(&r, NULL, &gc, false);
-    collect_additional_rr_glue(&r, gt, NULL, false);
-    collect_additional_rr_glue(&r, gt, &gc, true);
-    dns_record_t m; memset(&m, 0, sizeof(m)); DNS_RECORD_BIND_RDATA(m); m.type_code = 15; m.rdata[0] = "10"; m.rdata[1] = ""; m.rdata_count = 2;
+    glue_list_t gl; memset(&gl, 0, sizeof(gl));
+    collect_additional_rr_glue(NULL, 0, &gl);
+    assert(gl.count == 0);
+    dns_record_t m; memset(&m, 0, sizeof(m)); DNS_RECORD_BIND_RDATA(m); m.type_code = 15; m.rdata[0] = "10"; m.rdata[1] = "mail.example."; m.rdata_count = 2;
     char **mx = m.rdata;
-    collect_additional_rr_glue(&m, gt, &gc, false);            /* empty target */
-    mx[1] = "mail.example.";
-    for (int i = 0; i < 20; i++) collect_additional_rr_glue(&m, gt, &gc, false);  /* dedupe */
+    zone_image_t *mi = test_image_of_record(&m);
+    assert(mi != NULL);
+    collect_additional_rr_glue(mi, 0, NULL);
+    gl.minimal = true;
+    collect_additional_rr_glue(mi, 0, &gl);
+    assert(gl.count == 0);
+    gl.minimal = false;
+    for (int i = 0; i < 20; i++) collect_additional_rr_glue(mi, 0, &gl);  /* dedupe */
+    assert(gl.count == 1 && strcmp(gl.targets[0], "mail.example.") == 0);
+    free(mi);
+    mx[1] = ".";                                  /* null MX (RFC 7505): the root is a target like any other */
+    mi = test_image_of_record(&m);
+    assert(mi != NULL);
+    collect_additional_rr_glue(mi, 0, &gl);
+    assert(gl.count == 2 && strcmp(gl.targets[1], ".") == 0);
+    free(mi);
     char names[20][32];
-    for (int i = 0; i < 20; i++) { snprintf(names[i], sizeof(names[i]), "h%d.example.", i); mx[1] = names[i]; collect_additional_rr_glue(&m, gt, &gc, false); }
-    assert(gc == 16);
-    m.rdata_count = 1; gc = 0; collect_additional_rr_glue(&m, gt, &gc, false); assert(gc == 0);
-    m.type_code = 33; collect_additional_rr_glue(&m, gt, &gc, false);
-    m.type_code = 2; m.rdata_count = 0; collect_additional_rr_glue(&m, gt, &gc, false);
-    m.type_code = 1; collect_additional_rr_glue(&m, gt, &gc, false);
+    for (int i = 0; i < 20; i++) {
+        snprintf(names[i], sizeof(names[i]), "h%d.example.", i);
+        mx[1] = names[i];
+        mi = test_image_of_record(&m);
+        assert(mi != NULL);
+        collect_additional_rr_glue(mi, 0, &gl);
+        free(mi);
+    }
+    assert(gl.count == 16);
+    gl.count = 0;
+    m.type_code = 33; m.rdata[0] = "0"; m.rdata[1] = "5"; m.rdata[2] = "5060"; m.rdata[3] = "sip.example."; m.rdata_count = 4;
+    mi = test_image_of_record(&m);
+    assert(mi != NULL);
+    collect_additional_rr_glue(mi, 0, &gl);
+    assert(gl.count == 1 && strcmp(gl.targets[0], "sip.example.") == 0);
+    free(mi);
+    m.type_code = 1; m.rdata[0] = "192.0.2.1"; m.rdata_count = 1;    /* an address is not a glue source */
+    mi = test_image_of_record(&m);
+    assert(mi != NULL);
+    collect_additional_rr_glue(mi, 0, &gl);
+    assert(gl.count == 1);
+    free(mi);
 
-    /* attach_nsec3_record dedupe + overflow */
-    dns_record_t *att[8] = {0}; int ac = 0;
-    assert(attach_nsec3_record(&z, NULL, res, sizeof(res), &off, &cc, &cnt, att, &ac));
+    /* attach_nsec3_record with no RR */
+    const zone_image_rr_t *att[8] = {0}; int ac = 0;
+    assert(attach_nsec3_record(zi, ZONE_IMAGE_NONE, res, sizeof(res), &off, &cc, &cnt, att, &ac));
     zone_arena_destroy(&z);
 
     /* hex_to_bytes / record observatory */
@@ -2156,7 +2196,7 @@ static void upd_entry_init(zone_db_entry_t *e) {
         parse_context_t ctx = { .base_dir = ".", .default_origin = "upd.example.", .is_standalone_mode = true, .err_out = &err };
         char *b = arena_strdup(a, zt);
         assert(parse_zone_fast(b, strlen(b), a, &ctx) >= 0);
-        assert(build_zone_index(a, true) == 0);
+        assert(test_build_index(a, true) == 0);
     }
     atomic_store_explicit(&e->rcu.active, &e->rcu.arena_a, memory_order_release);
     atomic_store_explicit(&e->serial, 100, memory_order_release);
@@ -2266,7 +2306,7 @@ static void xfr_entry_init(zone_db_entry_t *e, const char *text, const char *ori
         parse_context_t ctx = { .base_dir = ".", .default_origin = origin, .is_standalone_mode = true, .err_out = &err };
         char *b = arena_strdup(a, text);
         assert(parse_zone_fast(b, strlen(b), a, &ctx) >= 0);
-        assert(build_zone_index(a, true) == 0);
+        assert(test_build_index(a, true) == 0);
     }
     atomic_store_explicit(&e->rcu.active, &e->rcu.arena_a, memory_order_release);
 }

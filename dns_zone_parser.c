@@ -1837,6 +1837,8 @@ ecs_tag_def_t *clone_ecs_tags_array(const ecs_tag_def_t *src, int count) {
 }
 
 void zone_arena_destroy(zone_arena_t *arena) {
+  free(arena->image);
+  arena->image = NULL;
   free(arena->records);
   arena->records = NULL;
   arena->count = 0;

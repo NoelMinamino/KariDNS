@@ -3,12 +3,15 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
+#include <assert.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <limits.h>
 
 #include "../../dns_wire.h"
 #include "../../dns_zone_parser.h"
+#include "../../dns_zone_image.h"
+#include "../test_image_helper.h"
 #include "../../dns_dynamic_update.h"
 #include "../../dns_snapshot_rcu.h"
 #include "../../dns_epoch_rcu.h"
@@ -90,13 +93,17 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                        "alias.dyn.example.com. 3600 IN CNAME www.dyn.example.com.\n"
                        "sub.dyn.example.com. 3600 IN NS ns.sub.dyn.example.com.\n";
     parse_zone_fast(init_zone, sizeof(init_zone) - 1, &entry.rcu.arena_a, &ctx);
-    build_zone_index(&entry.rcu.arena_a, true);
+    assert(test_build_index(&entry.rcu.arena_a, true) == 0);
 
     atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
     atomic_store_explicit(&entry.serial, 1, memory_order_release);
 
     // Fuzz dynamic update handling
     handle_dynamic_update(data, size, &entry, "127.0.0.1", "key-admin");
+
+    /* S5 B-1: every published version carries the image the engine reads, and it holds exactly the builder's RRs */
+    zone_arena_t *published = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
+    assert(published->image != NULL && published->image->n_rrs == published->count);
 
     /* X-35: an applied update records its IXFR difference in entry.ixfr_history (compute_ixfr_diff()); the
      * server keeps it for the life of the zone, this per-input entry must release it or every applied update
