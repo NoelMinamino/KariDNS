@@ -4781,6 +4781,14 @@ int main(int argc, char **argv) {
     g_startup_cwd[0] = '\0';
   }
   signal(SIGPIPE, SIG_IGN);
+  /* SIGHUP/SIGUSR1/SIGUSR2 の既定動作はプロセス終了。fork する全子プロセス (ブローカー・
+   * フロントエンドルーター・バックエンド) のために fork 前に無視にしておく。pkill -HUP karidns の
+   * ように全プロセスへ届いても、マネージャーが「子が signal 1 で死んだ」として全体を止めない。
+   * リロードを行うマネージャーは後で SIGHUP のハンドラを設定し、バックエンドは kqueue の
+   * EVFILT_SIGNAL (無視・ブロックされていても通知される) で受ける。 */
+  signal(SIGHUP, SIG_IGN);
+  signal(SIGUSR1, SIG_IGN);
+  signal(SIGUSR2, SIG_IGN);
   g_cwd_fd = open(".", O_DIRECTORY | O_CLOEXEC | O_RDONLY);
   if (g_cwd_fd >= 0) {
     cap_rights_t cwd_rights;

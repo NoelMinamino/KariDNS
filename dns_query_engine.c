@@ -2165,6 +2165,16 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, progra
       argv[ai++] = x->program_args[i];
     argv[ai] = NULL;
 
+    /* バックエンドが無視/ブロックしているシグナルをプラグインへ引き継がない
+     * (無視の設定とシグナルマスクは exec 後も残る) */
+    signal(SIGPIPE, SIG_DFL);
+    signal(SIGHUP, SIG_DFL);
+    signal(SIGUSR1, SIG_DFL);
+    signal(SIGUSR2, SIG_DFL);
+    sigset_t plugin_mask;
+    sigemptyset(&plugin_mask);
+    sigprocmask(SIG_SETMASK, &plugin_mask, NULL);
+
     execv(x->program_path, argv);
     _exit(127);
   }

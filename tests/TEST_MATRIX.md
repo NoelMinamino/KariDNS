@@ -281,6 +281,7 @@ The complete inventory of all test targets registered in `tests/run_all_suite.sh
 | 97 | [`run_karicheck_deep_rules_test.sh`](run_karicheck_deep_rules_test.sh) | `tools/karicheck.c` | RFC 8624, RFC 9276, RFC 8976, RFC 9432 | **Positive / Lint** | Deep static lint rules of karicheck (DNSSEC parameters, ZONEMD, catalog zones and RDATA field checks). |
 | 98 | [`run_zone_parser_error_paths_test.sh`](run_zone_parser_error_paths_test.sh) | `dns_zone_parser.c`, `tools/karicheck.c` | RFC 1035 §5, BIND `$GENERATE` | **Negative / Robustness** | Zone parser negative paths: anomalous directives, `$GENERATE` ranges and modifiers, and malformed RDATA handling. |
 | 99 | [`run_karictl_adversary_test.sh`](run_karictl_adversary_test.sh) | `tools/karictl.c` | KariDNS control protocol | **Negative** | karictl command-line and error-handling matrix: bad options, missing or unreadable configuration, wrong secrets, unreachable sockets and server error replies. |
+| 177 | [`run_signal_all_processes_test.sh`](run_signal_all_processes_test.sh) | `dns_server_core.c` (signal setup), `dns_query_engine.c` | POSIX signals | **Negative / Robustness** | SIGHUP/SIGUSR1/SIGUSR2/SIGPIPE sent to every karidns process (broker, routers, backend, manager): no process dies, the server keeps answering and SIGHUP reloads; the same signals to the manager only. |
 
 ---
 

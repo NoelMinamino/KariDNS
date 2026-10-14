@@ -329,6 +329,7 @@ register_test "core" "sh" "tests/run_program_zone_test.sh" "Dynamic backend reco
 register_test "core" "sh" "tests/run_karictl_observatory_test.sh" "karictl observatory IPC metrics query"
 register_test "core" "sh" "tests/run_karictl_reload_reconfig_test.sh" "karictl reload & dynamic reconfig IPC"
 register_test "core" "sh" "tests/run_karictl_reload_failure_test.sh" "karictl reload/reconfig report failures (exit 3), restart-only settings, status values and time format (D-13, O-05, O-09, D-12, T-11)"
+register_test "core" "sh" "tests/run_signal_all_processes_test.sh" "SIGHUP/SIGUSR1/SIGUSR2/SIGPIPE to every karidns process: nothing dies, the server reloads and keeps answering"
 register_test "core" "sh" "tests/run_config_acl_bool_test.sh" "named.conf booleans, category lists, zone type case, named acl statements (D-01, D-02, D-22, D-23)"
 register_test "core" "sh" "tests/run_zone_path_dotdot_test.sh" "zone and log file paths with ../ inside the sandbox (D-24)"
 register_test "core" "sh" "tests/run_log_rotation_timestamp_test.sh" "suffix timestamp log rotation never overwrites, versions prunes (D-21)"
