@@ -15,6 +15,7 @@
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
+#include "test_zext.h"
 #include "dns_zone_parser.h"
 #include "dns_zone_image.h"
 #include "test_image_helper.h"
@@ -299,7 +300,7 @@ static void gr_query_raw(const uint8_t *req, size_t req_len, const char *qname, 
     compress_ctx_t comp;
     memset(&comp, 0, sizeof(comp));
     compress_ctx_init_packet(&comp);
-    rate_limit_config_t *rrl_out = NULL;
+    const rate_limit_config_t *rrl_out = NULL;
     zone_db_entry_t *matched = NULL;
     int n = process_dns_query_impl(req, req_len, g_gr.res, sizeof(g_gr.res), qname, qtype,
                                    client_ip, &comp, is_tcp, &rrl_out,
@@ -1617,7 +1618,7 @@ static void mz_query(const char *qname, uint16_t qtype, bool dnssec_ok, gr_resp_
     compress_ctx_t comp;
     memset(&comp, 0, sizeof(comp));
     compress_ctx_init_packet(&comp);
-    rate_limit_config_t *rrl_out = NULL;
+    const rate_limit_config_t *rrl_out = NULL;
     zone_db_entry_t *matched = NULL;
     int n = process_dns_query_impl(req, req_len, g_mz.res, sizeof(g_mz.res), qname, qtype, "192.0.2.100", &comp,
                                    false, &rrl_out, &g_mz.snap, &g_mz.cfg, &matched);

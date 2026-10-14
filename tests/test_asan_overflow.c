@@ -11,6 +11,9 @@
 #endif
 #include "../dns_wire.h"
 #include "../dns_config_parser.h"
+#include "test_zext.h"
+/* S6a: パース済みの設定のゾーンは views の中にある (cfg.zones は手で組む設定用) */
+#define CFG_ZONES(c) ((c).views ? (c).views->zones : NULL)
 #include "../dns_zone_parser.h"
 #include "../dns_utils.h"
 #include <fcntl.h>
@@ -94,12 +97,12 @@ int main() {
     char* copy_acl = strdup(conf_acl);
     int res_acl = parse_named_conf(copy_acl, &cfg);
     free(copy_acl);
-    if (res_acl == 0 && cfg.zones && cfg.zones->tsig_keys_count == 1 && cfg.zones->tsig_keys && strcmp(cfg.zones->tsig_keys[0], "mykey") == 0 && cfg.zones->allow_transfer_count == 0) {
+    if (res_acl == 0 && cfg.views->zones && zext(cfg.views->zones)->tsig_keys_count == 1 && zext(cfg.views->zones)->tsig_keys && strcmp(zext(cfg.views->zones)->tsig_keys[0], "mykey") == 0 && zext(cfg.views->zones)->allow_transfer_count == 0) {
         printf("Test 4 Passed: allow-transfer key correctly parsed as tsig_keys\n");
     } else {
         printf("Test 4 Failed: allow-transfer key parsing failed! res_acl=%d, tsig_keys_count=%d, count=%d\n",
-               res_acl, cfg.zones ? cfg.zones->tsig_keys_count : -1,
-               cfg.zones ? cfg.zones->allow_transfer_count : -1);
+               res_acl, cfg.views->zones ? zext(cfg.views->zones)->tsig_keys_count : -1,
+               cfg.views->zones ? zext(cfg.views->zones)->allow_transfer_count : -1);
         return 1;
     }
     free_server_config_fields(&cfg);
@@ -2662,15 +2665,15 @@ int main() {
             return 1;
         }
 
-        if (!cfg.zones || !cfg.zones->notify_source ||
-            strcmp(cfg.zones->notify_source, "192.168.1.1") != 0) {
+        if (!cfg.views->zones || !zext(cfg.views->zones)->notify_source ||
+            strcmp(zext(cfg.views->zones)->notify_source, "192.168.1.1") != 0) {
             printf("FAIL: notify_source not parsed properly\n");
             free_server_config_fields(&cfg);
             return 1;
         }
 
         struct in_addr src_ip;
-        if (inet_pton(AF_INET, cfg.zones->notify_source, &src_ip) != 1) {
+        if (inet_pton(AF_INET, zext(cfg.views->zones)->notify_source, &src_ip) != 1) {
             printf("FAIL: inet_pton failed on parsed notify_source\n");
             free_server_config_fields(&cfg);
             return 1;
@@ -2931,7 +2934,7 @@ int main() {
             printf("FAIL: Valid multiple top-level zones failed to parse\n");
             return 1;
         }
-        if (!cfg_vz.zones || !cfg_vz.zones->next) {
+        if (!cfg_vz.views || !cfg_vz.views->zones || !cfg_vz.views->zones->next) {
             printf("FAIL: Valid multiple top-level zones count mismatch\n");
             free_server_config_fields(&cfg_vz);
             return 1;
@@ -3061,9 +3064,9 @@ int main() {
             printf("FAIL: type primary should be accepted\n");
             return 1;
         }
-        if (!cfg1.zones || strcmp(cfg1.zones->type, "master") != 0) {
+        if (!CFG_ZONES(cfg1) || strcmp(CFG_ZONES(cfg1)->type, "master") != 0) {
             printf("FAIL: type primary should be normalized to master (got %s)\n",
-                   cfg1.zones ? cfg1.zones->type : "NULL");
+                   CFG_ZONES(cfg1) ? CFG_ZONES(cfg1)->type : "NULL");
             free_server_config_fields(&cfg1);
             return 1;
         }
@@ -3079,9 +3082,9 @@ int main() {
             printf("FAIL: type secondary should be accepted\n");
             return 1;
         }
-        if (!cfg2.zones || strcmp(cfg2.zones->type, "slave") != 0) {
+        if (!CFG_ZONES(cfg2) || strcmp(CFG_ZONES(cfg2)->type, "slave") != 0) {
             printf("FAIL: type secondary should be normalized to slave (got %s)\n",
-                   cfg2.zones ? cfg2.zones->type : "NULL");
+                   CFG_ZONES(cfg2) ? CFG_ZONES(cfg2)->type : "NULL");
             free_server_config_fields(&cfg2);
             return 1;
         }
@@ -3097,9 +3100,9 @@ int main() {
             printf("FAIL: type master should be accepted\n");
             return 1;
         }
-        if (!cfg_m.zones || strcmp(cfg_m.zones->type, "master") != 0) {
+        if (!CFG_ZONES(cfg_m) || strcmp(CFG_ZONES(cfg_m)->type, "master") != 0) {
             printf("FAIL: type master should be master (got %s)\n",
-                   cfg_m.zones ? cfg_m.zones->type : "NULL");
+                   CFG_ZONES(cfg_m) ? CFG_ZONES(cfg_m)->type : "NULL");
             free_server_config_fields(&cfg_m);
             return 1;
         }
@@ -3115,9 +3118,9 @@ int main() {
             printf("FAIL: type slave should be accepted\n");
             return 1;
         }
-        if (!cfg_s.zones || strcmp(cfg_s.zones->type, "slave") != 0) {
+        if (!CFG_ZONES(cfg_s) || strcmp(CFG_ZONES(cfg_s)->type, "slave") != 0) {
             printf("FAIL: type slave should be slave (got %s)\n",
-                   cfg_s.zones ? cfg_s.zones->type : "NULL");
+                   CFG_ZONES(cfg_s) ? CFG_ZONES(cfg_s)->type : "NULL");
             free_server_config_fields(&cfg_s);
             return 1;
         }
@@ -3155,8 +3158,8 @@ int main() {
             printf("FAIL: master zone with allow-update failed to parse\n");
             return 1;
         }
-        if (!cfg1.zones || cfg1.zones->allow_update_count != 1 ||
-            strcmp(cfg1.zones->allow_update[0], "upd-key") != 0) {
+        if (!CFG_ZONES(cfg1) || zext(CFG_ZONES(cfg1))->allow_update_count != 1 ||
+            strcmp(zext(CFG_ZONES(cfg1))->allow_update[0], "upd-key") != 0) {
             printf("FAIL: allow-update ACL mismatch on master zone\n");
             free_server_config_fields(&cfg1);
             return 1;
@@ -3173,9 +3176,9 @@ int main() {
             printf("FAIL: zone without explicit type failed to parse\n");
             return 1;
         }
-        if (!cfg2.zones || !cfg2.zones->type || strcmp(cfg2.zones->type, "master") != 0) {
+        if (!CFG_ZONES(cfg2) || !CFG_ZONES(cfg2)->type || strcmp(CFG_ZONES(cfg2)->type, "master") != 0) {
             printf("FAIL: zone without explicit type should default to master (got %s)\n",
-                   (cfg2.zones && cfg2.zones->type) ? cfg2.zones->type : "NULL");
+                   (CFG_ZONES(cfg2) && CFG_ZONES(cfg2)->type) ? CFG_ZONES(cfg2)->type : "NULL");
             free_server_config_fields(&cfg2);
             return 1;
         }
@@ -3301,12 +3304,12 @@ int main() {
             printf("FAIL: allow-transfer with multiple keys should parse safely\n");
             return 1;
         }
-        if (!cfg2.zones || cfg2.zones->tsig_keys_count != 2 ||
-            !cfg2.zones->tsig_keys ||
-            strcmp(cfg2.zones->tsig_keys[0], "key1") != 0 ||
-            strcmp(cfg2.zones->tsig_keys[1], "key2") != 0) {
+        if (!CFG_ZONES(cfg2) || zext(CFG_ZONES(cfg2))->tsig_keys_count != 2 ||
+            !zext(CFG_ZONES(cfg2))->tsig_keys ||
+            strcmp(zext(CFG_ZONES(cfg2))->tsig_keys[0], "key1") != 0 ||
+            strcmp(zext(CFG_ZONES(cfg2))->tsig_keys[1], "key2") != 0) {
             printf("FAIL: allow-transfer with multiple keys should retain both keys 'key1' and 'key2' (count=%d)\n",
-                   cfg2.zones ? cfg2.zones->tsig_keys_count : -1);
+                   CFG_ZONES(cfg2) ? zext(CFG_ZONES(cfg2))->tsig_keys_count : -1);
             free_server_config_fields(&cfg2);
             return 1;
         }
@@ -3509,10 +3512,10 @@ int main() {
             return 1;
         }
 
-        zone_config_t *zcfg = cfg_mk.zones;
-        if (!zcfg || zcfg->tsig_keys_count != 2 || !zcfg->tsig_keys ||
-            strcmp(zcfg->tsig_keys[0], "keyA") != 0 || strcmp(zcfg->tsig_keys[1], "keyB") != 0) {
-            printf("FAIL: zcfg tsig_keys not populated correctly (count=%d)\n", zcfg ? zcfg->tsig_keys_count : -1);
+        zone_config_t *zcfg = CFG_ZONES(cfg_mk);
+        if (!zcfg || zext(zcfg)->tsig_keys_count != 2 || !zext(zcfg)->tsig_keys ||
+            strcmp(zext(zcfg)->tsig_keys[0], "keyA") != 0 || strcmp(zext(zcfg)->tsig_keys[1], "keyB") != 0) {
+            printf("FAIL: zcfg tsig_keys not populated correctly (count=%d)\n", zcfg ? zext(zcfg)->tsig_keys_count : -1);
             free_server_config_fields(&cfg_mk);
             return 1;
         }

@@ -30,6 +30,7 @@
 #include <sys/types.h>
 
 #include "../dns_config_parser.h"
+#include "test_zext.h"
 #include "../dns_utils.h"
 #include "../dns_tsig_acl.h"
 
@@ -299,12 +300,12 @@ static void test_transport_params(void) {
                  "zone \"b.example\" { type master; file \"b.zone\"; };", &cfg)) {
         const zone_config_t *a = first_zone(&cfg);
         const zone_config_t *b = a ? a->next : NULL;
-        CHECK(a && a->zone_tcp_mss == 1200);
-        CHECK(a && a->zone_tcp_window == 128 * 1024);
-        CHECK(a && a->zone_tcp_sndbuf == 2 * 1024 * 1024);
-        CHECK(a && a->zone_udp_bufsize == 1400);
-        CHECK(b && b->zone_tcp_mss == 0 && b->zone_tcp_window == 0 && b->zone_tcp_sndbuf == 0);
-        CHECK(b && b->zone_udp_bufsize == 0);
+        CHECK(a && zext(a)->zone_tcp_mss == 1200);
+        CHECK(a && zext(a)->zone_tcp_window == 128 * 1024);
+        CHECK(a && zext(a)->zone_tcp_sndbuf == 2 * 1024 * 1024);
+        CHECK(a && zext(a)->zone_udp_bufsize == 1400);
+        CHECK(b && zext(b)->zone_tcp_mss == 0 && zext(b)->zone_tcp_window == 0 && zext(b)->zone_tcp_sndbuf == 0);
+        CHECK(b && zext(b)->zone_udp_bufsize == 0);
         CHECK(cfg.any_zone_tcp_opts == true);
         free_server_config_fields(&cfg);
     }
@@ -367,8 +368,8 @@ static void test_additional_from_auth(void) {
             const zone_config_t *z = first_zone(&cfg);
             CHECK(z != NULL);
             if (z) {
-                CHECK(z->additional_from_auth_specified == true);
-                CHECK(z->additional_from_auth == t[i].expect);
+                CHECK(zext(z)->additional_from_auth_specified == true);
+                CHECK(zext(z)->additional_from_auth == t[i].expect);
             }
             free_server_config_fields(&cfg);
         }
@@ -376,7 +377,7 @@ static void test_additional_from_auth(void) {
     server_config_t cfg;
     if (parse_ok("zone \"example.com\" { type master; file \"z\"; };", &cfg)) {
         const zone_config_t *z = first_zone(&cfg);
-        CHECK(z && z->additional_from_auth_specified == false);
+        CHECK(z && zext(z)->additional_from_auth_specified == false);
         free_server_config_fields(&cfg);
     }
 }
@@ -436,10 +437,10 @@ static void test_ecs_and_location_tags(void) {
         const zone_config_t *z = first_zone(&cfg);
         CHECK(z != NULL);
         if (z) {
-            CHECK(z->ecs_tag_count == 3);
-            CHECK(z->location_tag_count == 3);
-            if (z->ecs_tag_count == 3) CHECK_STR(z->ecs_tags[0].tag, "eu-tier");
-            if (z->location_tag_count == 3) CHECK(z->location_tags[0].cidr_count == 2);
+            CHECK(zext(z)->ecs_tag_count == 3);
+            CHECK(zext(z)->location_tag_count == 3);
+            if (zext(z)->ecs_tag_count == 3) CHECK_STR(zext(z)->ecs_tags[0].tag, "eu-tier");
+            if (zext(z)->location_tag_count == 3) CHECK(zext(z)->location_tags[0].cidr_count == 2);
         }
         free_server_config_fields(&cfg);
     }
@@ -479,8 +480,8 @@ static void test_ecs_trusted_resolvers(void) {
     }
     if (parse_ok("zone \"example.com\" { type master; file \"z\"; ecs-trusted-resolvers { 10.0.0.0/8; }; };", &cfg)) {
         const zone_config_t *z = first_zone(&cfg);
-        CHECK(z && z->ecs_trusted_resolvers_count == 1);
-        CHECK(z && z->ecs_trusted_resolvers_parsed != NULL);
+        CHECK(z && zext(z)->ecs_trusted_resolvers_count == 1);
+        CHECK(z && zext(z)->ecs_trusted_resolvers_parsed != NULL);
         free_server_config_fields(&cfg);
     }
     expect_reject("options: '{' missing", "options { ecs-trusted-resolvers 192.0.2.1; };");
@@ -601,10 +602,10 @@ static void test_zone_types_and_files(void) {
 
     /* file-format */
     if (parse_ok("zone \"a.test\" { type master; file \"z\"; file-format bind; };", &cfg)) {
-        CHECK_STR(first_zone(&cfg)->file_format, "bind"); free_server_config_fields(&cfg);
+        CHECK_STR(zext(first_zone(&cfg))->file_format, "bind"); free_server_config_fields(&cfg);
     }
     if (parse_ok("zone \"a.test\" { type master; file \"z\"; file-format TinyDNS; };", &cfg)) {
-        CHECK_STR(first_zone(&cfg)->file_format, "TinyDNS"); free_server_config_fields(&cfg);
+        CHECK_STR(zext(first_zone(&cfg))->file_format, "TinyDNS"); free_server_config_fields(&cfg);
     }
     expect_reject("file-format yaml", "zone \"a.test\" { type master; file \"z\"; file-format yaml; };");
 
@@ -612,7 +613,7 @@ static void test_zone_types_and_files(void) {
     if (parse_ok("zone \"cat.test\" { type master; file \"cat.zone\"; catalog-zone yes; notify-source 192.0.2.10; };", &cfg)) {
         const zone_config_t *z = first_zone(&cfg);
         CHECK(z && z->is_catalog == true);
-        if (z) { CHECK_STR(z->notify_source, "192.0.2.10"); CHECK_STR(z->file, "cat.zone"); }
+        if (z) { CHECK_STR(zext(z)->notify_source, "192.0.2.10"); CHECK_STR(z->file, "cat.zone"); }
         free_server_config_fields(&cfg);
     }
     if (parse_ok("zone \"cat.test\" { type master; file \"cat.zone\"; catalog-zone no; };", &cfg)) {
@@ -623,12 +624,12 @@ static void test_zone_types_and_files(void) {
     if (parse_ok("zone \"s.test\" { type slave; file \"s.zone\"; masters { 192.0.2.1 port 5353; 198.51.100.1; }; "
                  "also-notify { 192.0.2.99 port 5354; }; };", &cfg)) {
         const zone_config_t *z = first_zone(&cfg);
-        CHECK(z && z->masters_count == 2 && z->masters_parsed != NULL);
-        if (z && z->masters_count == 2) {
-            CHECK_STR(z->masters[0].ip, "192.0.2.1"); CHECK(z->masters[0].port == 5353);
-            CHECK_STR(z->masters[1].ip, "198.51.100.1"); CHECK(z->masters[1].port == 53);
+        CHECK(z && zext(z)->masters_count == 2 && zext(z)->masters_parsed != NULL);
+        if (z && zext(z)->masters_count == 2) {
+            CHECK_STR(zext(z)->masters[0].ip, "192.0.2.1"); CHECK(zext(z)->masters[0].port == 5353);
+            CHECK_STR(zext(z)->masters[1].ip, "198.51.100.1"); CHECK(zext(z)->masters[1].port == 53);
         }
-        CHECK(z && z->also_notify_count == 1 && z->also_notify[0].port == 5354);
+        CHECK(z && zext(z)->also_notify_count == 1 && zext(z)->also_notify[0].port == 5354);
         free_server_config_fields(&cfg);
     }
     expect_reject("port 0", "zone \"s.test\" { type slave; masters { 192.0.2.1 port 0; }; };");
@@ -644,7 +645,7 @@ static void test_zone_types_and_files(void) {
     char txt[512];
     snprintf(txt, sizeof(txt), "key \"k1\" { algorithm hmac-sha256; secret \"%s\"; };"
              "zone \"x.test\" { type slave; file \"z\"; masters { 192.0.2.1; }; tsig-key k1; };", SECRET_OK);
-    if (parse_ok(txt, &cfg)) { CHECK_STR(first_zone(&cfg)->tsig_key, "k1"); free_server_config_fields(&cfg); }
+    if (parse_ok(txt, &cfg)) { CHECK_STR(zext(first_zone(&cfg))->tsig_key, "k1"); free_server_config_fields(&cfg); }
     expect_reject("undefined tsig-key", "zone \"x.test\" { type slave; file \"z\"; tsig-key nokey; };");
 }
 
@@ -661,20 +662,20 @@ static void test_zone_program_and_forward(void) {
         const zone_config_t *z1 = first_zone(&cfg);
         CHECK(z1 != NULL);
         if (z1) {
-            CHECK_STR(z1->program_path, "/usr/local/bin/backend");
-            CHECK(z1->program_args_count == 2);
-            if (z1->program_args_count == 2) {
-                CHECK_STR(z1->program_args[0], "--verbose");
-                CHECK_STR(z1->program_args[1], "zone=dyn");
+            CHECK_STR(zext(z1)->program_path, "/usr/local/bin/backend");
+            CHECK(zext(z1)->program_args_count == 2);
+            if (zext(z1)->program_args_count == 2) {
+                CHECK_STR(zext(z1)->program_args[0], "--verbose");
+                CHECK_STR(zext(z1)->program_args[1], "zone=dyn");
             }
-            CHECK_STR(z1->program_user, "svc");
-            CHECK(z1->program_timeout_ms == 750);
-            CHECK(z1->program_max_failures == 3);
+            CHECK_STR(zext(z1)->program_user, "svc");
+            CHECK(zext(z1)->program_timeout_ms == 750);
+            CHECK(zext(z1)->program_max_failures == 3);
             const zone_config_t *z2 = z1->next;
             CHECK(z2 != NULL);
             if (z2) {
-                CHECK_STR(z2->program_path, "/bin/true");
-                CHECK_STR(z2->program_user, "nobody");   /* inherited from options { user } */
+                CHECK_STR(zext(z2)->program_path, "/bin/true");
+                CHECK_STR(zext(z2)->program_user, "nobody");   /* inherited from options { user } */
             }
         }
         free_server_config_fields(&cfg);
@@ -692,12 +693,12 @@ static void test_zone_program_and_forward(void) {
     if (parse_ok("zone \"f.example\" { type forward; forwarders { 192.0.2.53; 198.51.100.53 port 5353; }; "
                  "forward-timeout 1500; };", &cfg)) {
         const zone_config_t *z = first_zone(&cfg);
-        CHECK(z && z->forwarders_count == 2);
-        if (z && z->forwarders_count == 2) {
-            CHECK_STR(z->forwarders[0].ip, "192.0.2.53"); CHECK(z->forwarders[0].port == 53);
-            CHECK(z->forwarders[1].port == 5353);
+        CHECK(z && zext(z)->forwarders_count == 2);
+        if (z && zext(z)->forwarders_count == 2) {
+            CHECK_STR(zext(z)->forwarders[0].ip, "192.0.2.53"); CHECK(zext(z)->forwarders[0].port == 53);
+            CHECK(zext(z)->forwarders[1].port == 5353);
         }
-        CHECK(z && z->forward_timeout_ms == 1500);
+        CHECK(z && zext(z)->forward_timeout_ms == 1500);
         free_server_config_fields(&cfg);
     }
     expect_reject("forwarders without braces", "zone \"f.test\" { type forward; forwarders 192.0.2.53; };");
@@ -714,7 +715,7 @@ static void test_zone_rate_limit(void) {
         const zone_config_t *z = first_zone(&cfg);
         CHECK(z != NULL);
         if (z) {
-            const rate_limit_config_t *r = &z->rrl;
+            const rate_limit_config_t *r = &zext(z)->rrl;
             CHECK(r->configured == true);
             CHECK(r->responses_per_second == 20);
             CHECK(r->nodata_per_second == 20);            /* not set explicitly: follows responses-per-second */
@@ -786,14 +787,14 @@ static void test_acl_lists(void) {
              "allow-transfer { 192.0.2.1; key k1; 198.51.100.0/24; }; };", keydef);
     if (parse_ok(txt, &cfg)) {
         const zone_config_t *z = first_zone(&cfg);
-        CHECK(z && z->allow_transfer_count == 2);
-        if (z && z->allow_transfer_count == 2) {
-            CHECK_STR(z->allow_transfer[0], "192.0.2.1");
-            CHECK_STR(z->allow_transfer[1], "198.51.100.0/24");
+        CHECK(z && zext(z)->allow_transfer_count == 2);
+        if (z && zext(z)->allow_transfer_count == 2) {
+            CHECK_STR(zext(z)->allow_transfer[0], "192.0.2.1");
+            CHECK_STR(zext(z)->allow_transfer[1], "198.51.100.0/24");
         }
-        CHECK(z && z->tsig_keys_count == 1);
-        if (z && z->tsig_keys_count == 1) CHECK_STR(z->tsig_keys[0], "k1");
-        CHECK(z && z->allow_transfer_parsed != NULL);
+        CHECK(z && zext(z)->tsig_keys_count == 1);
+        if (z && zext(z)->tsig_keys_count == 1) CHECK_STR(zext(z)->tsig_keys[0], "k1");
+        CHECK(z && zext(z)->allow_transfer_parsed != NULL);
         free_server_config_fields(&cfg);
     }
     /* allow-update: a key is kept in the list itself */
@@ -801,35 +802,35 @@ static void test_acl_lists(void) {
              "allow-update { 192.0.2.0/24; key k1; }; };", keydef);
     if (parse_ok(txt, &cfg)) {
         const zone_config_t *z = first_zone(&cfg);
-        CHECK(z && z->allow_update_count == 2);
-        if (z && z->allow_update_count == 2) { CHECK_STR(z->allow_update[0], "192.0.2.0/24"); CHECK_STR(z->allow_update[1], "k1"); }
+        CHECK(z && zext(z)->allow_update_count == 2);
+        if (z && zext(z)->allow_update_count == 2) { CHECK_STR(zext(z)->allow_update[0], "192.0.2.0/24"); CHECK_STR(zext(z)->allow_update[1], "k1"); }
         free_server_config_fields(&cfg);
     }
     /* single negated entry */
     if (parse_ok("zone \"a.test\" { type master; file \"z\"; allow-transfer { ! 192.0.2.9; 192.0.2.0/24; }; };", &cfg)) {
         const zone_config_t *z = first_zone(&cfg);
-        CHECK(z && z->allow_transfer_count == 2);
-        if (z && z->allow_transfer_count == 2) { CHECK_STR(z->allow_transfer[0], "!192.0.2.9"); CHECK_STR(z->allow_transfer[1], "192.0.2.0/24"); }
+        CHECK(z && zext(z)->allow_transfer_count == 2);
+        if (z && zext(z)->allow_transfer_count == 2) { CHECK_STR(zext(z)->allow_transfer[0], "!192.0.2.9"); CHECK_STR(zext(z)->allow_transfer[1], "192.0.2.0/24"); }
         free_server_config_fields(&cfg);
     }
     /* negated block: every member is negated, `any` disappears (BIND: !{ x; any; } == !x) */
     if (parse_ok("zone \"a.test\" { type master; file \"z\"; allow-transfer { ! { 10.0.0.0/8; any; }; }; };", &cfg)) {
         const zone_config_t *z = first_zone(&cfg);
-        CHECK(z && z->allow_transfer_count == 1);
-        if (z && z->allow_transfer_count == 1) CHECK_STR(z->allow_transfer[0], "!10.0.0.0/8");
+        CHECK(z && zext(z)->allow_transfer_count == 1);
+        if (z && zext(z)->allow_transfer_count == 1) CHECK_STR(zext(z)->allow_transfer[0], "!10.0.0.0/8");
         free_server_config_fields(&cfg);
     }
     /* double negation inside a negated block cancels: !{ !x; } == x */
     if (parse_ok("zone \"a.test\" { type master; file \"z\"; allow-transfer { ! { !192.0.2.1; }; }; };", &cfg)) {
         const zone_config_t *z = first_zone(&cfg);
-        CHECK(z && z->allow_transfer_count == 1);
-        if (z && z->allow_transfer_count == 1) CHECK_STR(z->allow_transfer[0], "192.0.2.1");
+        CHECK(z && zext(z)->allow_transfer_count == 1);
+        if (z && zext(z)->allow_transfer_count == 1) CHECK_STR(zext(z)->allow_transfer[0], "192.0.2.1");
         free_server_config_fields(&cfg);
     }
     /* `any` at top level is an ordinary entry */
     if (parse_ok("zone \"a.test\" { type master; file \"z\"; allow-update { any; }; };", &cfg)) {
         const zone_config_t *z = first_zone(&cfg);
-        CHECK(z && z->allow_update_count == 1 && strcmp(z->allow_update[0], "any") == 0);
+        CHECK(z && zext(z)->allow_update_count == 1 && strcmp(zext(z)->allow_update[0], "any") == 0);
         free_server_config_fields(&cfg);
     }
 
@@ -1048,7 +1049,7 @@ static void test_structure_and_validation(void) {
         CHECK(cfg.port == 5300);
         CHECK(first_zone(&cfg) != NULL);
         CHECK(cfg.views && strcmp(cfg.views->name, "__default__") == 0);
-        CHECK(cfg.zones != NULL && cfg.zones_are_flat == true);
+        CHECK(cfg.zones == NULL && cfg.views->zones != NULL); /* S6a: ゾーン構造体の複製のフラットリストは無い */
         free_server_config_fields(&cfg);
     }
     if (parse_ok("view \"internal\" { match-clients { 10.0.0.0/8; }; " ZONE_MIN " };"
@@ -1244,7 +1245,7 @@ static void test_notify_retry(void) {
         CHECK(rb.retries == 0 && rb.interval == 3 && rb.backoff == NOTIFY_BACKOFF_FIXED);
         notify_retry_config_t rc = notify_retry_effective(&cfg, c);
         CHECK(rc.retries == 3 && rc.interval == 3 && rc.backoff == NOTIFY_BACKOFF_EXPONENTIAL);
-        CHECK(c && !c->notify_retry.retries_set && !c->notify_retry.interval_set && !c->notify_retry.backoff_set);
+        CHECK(c && !zext(c)->notify_retry.retries_set && !zext(c)->notify_retry.interval_set && !zext(c)->notify_retry.backoff_set);
         free_server_config_fields(&cfg);
     }
     /* range boundaries are inclusive */
@@ -1289,9 +1290,9 @@ static void test_ixfr_history_option(void) {
         const zone_config_t *b = a ? a->next : NULL;
         const zone_config_t *c = b ? b->next : NULL;
         CHECK(cfg.ixfr_history == 2);
-        CHECK(a && a->ixfr_history_set && a->ixfr_history == 0 && ixfr_history_effective(&cfg, a) == 0);
-        CHECK(b && b->ixfr_history_set && b->ixfr_history == 32 && ixfr_history_effective(&cfg, b) == 32);
-        CHECK(c && !c->ixfr_history_set && ixfr_history_effective(&cfg, c) == 2);   /* the zone inherits options */
+        CHECK(a && zext(a)->ixfr_history_set && zext(a)->ixfr_history == 0 && ixfr_history_effective(&cfg, a) == 0);
+        CHECK(b && zext(b)->ixfr_history_set && zext(b)->ixfr_history == 32 && ixfr_history_effective(&cfg, b) == 32);
+        CHECK(c && !zext(c)->ixfr_history_set && ixfr_history_effective(&cfg, c) == 2);   /* the zone inherits options */
         free_server_config_fields(&cfg);
     }
     /* a zone without the option, no options value: the default */
@@ -1324,7 +1325,7 @@ static void test_boolean_statements_everywhere(void) {
     server_config_t cfg;
     if (parse_ok("zone \"cat.test\" { type master; file \"c\"; catalog-zone TRUE; disable-auto-tc-flag 1; };", &cfg)) {
         const zone_config_t *z = first_zone(&cfg);
-        CHECK(z && z->is_catalog == true && z->disable_auto_tc_flag == true);
+        CHECK(z && z->is_catalog == true && zext(z)->disable_auto_tc_flag == true);
         free_server_config_fields(&cfg);
     }
     expect_reject("catalog-zone maybe", "zone \"cat.test\" { type master; file \"c\"; catalog-zone maybe; };");
@@ -1422,19 +1423,19 @@ static void test_named_acls(void) {
         const zone_config_t *z = first_zone(&cfg);
         CHECK(z != NULL);
         if (z) {
-            CHECK(z->allow_transfer_count == 2);
-            CHECK(acl_has(z->allow_transfer, z->allow_transfer_count, "192.0.2.0/24"));
-            CHECK(acl_has(z->allow_transfer, z->allow_transfer_count, "2001:db8::/32"));
-            CHECK(z->tsig_keys_count == 1 && z->tsig_keys && strcmp(z->tsig_keys[0], "k1") == 0);
+            CHECK(zext(z)->allow_transfer_count == 2);
+            CHECK(acl_has(zext(z)->allow_transfer, zext(z)->allow_transfer_count, "192.0.2.0/24"));
+            CHECK(acl_has(zext(z)->allow_transfer, zext(z)->allow_transfer_count, "2001:db8::/32"));
+            CHECK(zext(z)->tsig_keys_count == 1 && zext(z)->tsig_keys && strcmp(zext(z)->tsig_keys[0], "k1") == 0);
             /* allow-update: !192.0.2.66 first, then the address and the key name */
-            CHECK(z->allow_update_count == 3);
-            CHECK(z->allow_update_count == 3 && strcmp(z->allow_update[0], "!192.0.2.66") == 0);
-            CHECK(acl_has(z->allow_update, z->allow_update_count, "198.51.100.7"));
-            CHECK(acl_has(z->allow_update, z->allow_update_count, "k1"));
-            CHECK(check_acl_bin("192.0.2.5", z->allow_transfer_parsed, z->allow_transfer_count));
-            CHECK(!check_acl_bin("203.0.113.5", z->allow_transfer_parsed, z->allow_transfer_count));
-            CHECK(!check_acl_bin("192.0.2.66", z->allow_update_parsed, z->allow_update_count));
-            CHECK(check_acl_bin("198.51.100.7", z->allow_update_parsed, z->allow_update_count));
+            CHECK(zext(z)->allow_update_count == 3);
+            CHECK(zext(z)->allow_update_count == 3 && strcmp(zext(z)->allow_update[0], "!192.0.2.66") == 0);
+            CHECK(acl_has(zext(z)->allow_update, zext(z)->allow_update_count, "198.51.100.7"));
+            CHECK(acl_has(zext(z)->allow_update, zext(z)->allow_update_count, "k1"));
+            CHECK(check_acl_bin("192.0.2.5", zext(z)->allow_transfer_parsed, zext(z)->allow_transfer_count));
+            CHECK(!check_acl_bin("203.0.113.5", zext(z)->allow_transfer_parsed, zext(z)->allow_transfer_count));
+            CHECK(!check_acl_bin("192.0.2.66", zext(z)->allow_update_parsed, zext(z)->allow_update_count));
+            CHECK(check_acl_bin("198.51.100.7", zext(z)->allow_update_parsed, zext(z)->allow_update_count));
         }
         free_server_config_fields(&cfg);
     }
@@ -1458,8 +1459,8 @@ static void test_named_acls(void) {
     if (parse_ok("key \"k1\" { algorithm hmac-sha256; secret \"" SECRET_OK "\"; };"
                  "zone \"example.com\" { type master; file \"z\"; allow-transfer { none; }; allow-update { k1; }; };", &cfg)) {
         const zone_config_t *z = first_zone(&cfg);
-        CHECK(z && z->allow_transfer_count == 1 && !check_acl_bin("192.0.2.1", z->allow_transfer_parsed, 1));
-        CHECK(z && z->allow_update_count == 1 && strcmp(z->allow_update[0], "k1") == 0);
+        CHECK(z && zext(z)->allow_transfer_count == 1 && !check_acl_bin("192.0.2.1", zext(z)->allow_transfer_parsed, 1));
+        CHECK(z && zext(z)->allow_update_count == 1 && strcmp(zext(z)->allow_update[0], "k1") == 0);
         free_server_config_fields(&cfg);
     }
     /* invalid entries are configuration errors (they used to never match, silently) */
@@ -1570,6 +1571,91 @@ static void test_zone_config_index(void) {
     CHECK(view_find_zone_config(&hv, "other.test") == NULL);
 }
 
+/* S6a: zone_config_t keeps only domain/file/type/is_catalog/ext/next; the rarely set options live in zone_ext_t, which
+ * a zone gets only when it sets at least one of them (ext == NULL means every option is at its default). */
+static void test_zone_ext_layout(void) {
+    printf("[TEST] zone_config_t core / zone_ext_t override block (S6a)...\n");
+    CHECK(sizeof(zone_config_t) <= 48);
+    server_config_t cfg;
+    if (parse_ok("options { notify-retries 3; notify-retry-interval 7; ixfr-history 9; additional-from-auth in-domain; };"
+                 "zone \"plain.example\" { type master; file \"plain.zone\"; };"
+                 "zone \"empty-type.example\" { file \"x.zone\"; };"
+                 "zone \"one.example\" { type master; file \"one.zone\"; notify-retries 1; };"
+                 "zone \"acl.example\" { type master; file \"acl.zone\"; allow-transfer { 192.0.2.1; }; };"
+                 "zone \"cat.example\" { type master; file \"cat.zone\"; catalog-zone yes; };", &cfg)) {
+        const zone_config_t *plain = first_zone(&cfg);
+        const zone_config_t *def = plain ? plain->next : NULL;
+        const zone_config_t *one = def ? def->next : NULL;
+        const zone_config_t *acl = one ? one->next : NULL;
+        const zone_config_t *cat = acl ? acl->next : NULL;
+        CHECK(plain && def && one && acl && cat && cat->next == NULL);
+        /* nothing set: no override block, every accessor value is the default */
+        CHECK(plain && plain->ext == NULL && zext(plain) == &zone_ext_default);
+        CHECK(def && def->ext == NULL && def->type && strcmp(def->type, "master") == 0);
+        CHECK(plain && zext(plain)->masters_count == 0 && zext(plain)->allow_transfer == NULL &&
+              !zext(plain)->additional_from_auth_specified && zext(plain)->zone_udp_bufsize == 0);
+        /* catalog-zone is a core flag, not an option */
+        CHECK(cat && cat->is_catalog && cat->ext == NULL);
+        /* one option set: a block, and the other options still come from options{} */
+        CHECK(one && one->ext != NULL && zext(one)->notify_retry.retries_set && zext(one)->notify_retry.retries == 1);
+        notify_retry_config_t r = notify_retry_effective(&cfg, one);
+        CHECK(r.retries == 1 && r.interval == 7 && r.backoff == NOTIFY_BACKOFF_FIXED);
+        CHECK(!zext(one)->notify_retry.interval_set && !zext(one)->ixfr_history_set);
+        CHECK(ixfr_history_effective(&cfg, one) == 9);
+        CHECK(ixfr_history_effective(&cfg, plain) == 9);
+        CHECK(acl && acl->ext != NULL && zext(acl)->allow_transfer_count == 1 && zext(acl)->allow_transfer_parsed != NULL);
+        CHECK(cfg.additional_from_auth == ADDITIONAL_AUTH_IN_DOMAIN && !zext(acl)->additional_from_auth_specified);
+        free_server_config_fields(&cfg);
+    }
+    /* an option block holding only zero values is dropped too; explicit zeros that carry meaning are kept */
+    if (parse_ok("zone \"z.example\" { type master; file \"z.zone\"; notify-retries 0; ixfr-history 0; };"
+                 "zone \"y.example\" { type master; file \"y.zone\"; masters { }; };", &cfg)) {
+        const zone_config_t *z = first_zone(&cfg);
+        CHECK(z && z->ext && zext(z)->notify_retry.retries_set && zext(z)->notify_retry.retries == 0);
+        CHECK(z && zext(z)->ixfr_history_set && zext(z)->ixfr_history == 0);
+        free_server_config_fields(&cfg);
+    }
+}
+
+/* S6a: no complete copy of the zone list is made: the parsed configuration has no top-level list, every view's
+ * list is the one list, and the "all zones" helpers see the zones in view order. */
+static void test_zone_flat_list_removed(void) {
+    printf("[TEST] no flat zone copy; config_find_zone_any_view / CONFIG_FOR_EACH_ZONE order (S6a)...\n");
+    server_config_t cfg;
+    if (parse_ok("view \"v1\" { match-clients { 192.0.2.0/24; };"
+                 "  zone \"a.example\" { type master; file \"a.zone\"; masters { 192.0.2.9; }; };"
+                 "  zone \"b.example\" { type master; file \"b.zone\"; }; };"
+                 "view \"v2\" { match-clients { any; };"
+                 "  zone \"c.example\" { type master; file \"c.zone\"; };"
+                 "  zone \"a.example\" { type master; file \"a2.zone\"; }; };", &cfg)) {
+        CHECK(cfg.zones == NULL);
+        const char *want[] = {"a.example.", "b.example.", "c.example.", "a.example."};
+        const char *want_file[] = {"a.zone", "b.zone", "c.zone", "a2.zone"};
+        int n = 0;
+        const view_config_t *v;
+        zone_config_t *z;
+        CONFIG_FOR_EACH_ZONE(&cfg, v, z) {
+            CHECK(n < 4 && strcmp(z->domain, want[n]) == 0 && strcmp(z->file, want_file[n]) == 0);
+            /* the very zone object of the view (no copy): the view's index finds this same pointer */
+            CHECK(view_find_zone_config(v, z->domain) == z);
+            n++;
+        }
+        CHECK(n == 4);
+        /* first match in view order; the options of the view-1 zone are the ones the shared object carries */
+        zone_config_t *any = config_find_zone_any_view(&cfg, "A.EXAMPLE");
+        CHECK(any && strcmp(any->file, "a.zone") == 0 && zext(any)->masters_count == 1);
+        CHECK(any == view_find_zone_config(cfg.views, "a.example"));
+        CHECK(config_find_zone_any_view(&cfg, "c.example") == cfg.views->next->zones);
+        CHECK(config_find_zone_any_view(&cfg, "nope.example") == NULL);
+        free_server_config_fields(&cfg);
+    }
+    /* top-level zones move into the default view; the config keeps no list of its own */
+    if (parse_ok(ZONE_MIN, &cfg)) {
+        CHECK(cfg.zones == NULL && cfg.views && cfg.views->zones && config_find_zone_any_view(&cfg, "example.com") == cfg.views->zones);
+        free_server_config_fields(&cfg);
+    }
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
     test_defaults();
@@ -1600,6 +1686,8 @@ int main(void) {
     test_zone_type_case();
     test_named_acls();
     test_zone_config_index();
+    test_zone_ext_layout();
+    test_zone_flat_list_removed();
 
     printf("[*] %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) {

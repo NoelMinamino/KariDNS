@@ -15,6 +15,7 @@
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
+#include "test_zext.h"
 #include "dns_zone_parser.h"
 #include "dns_zone_image.h"
 #include "test_image_helper.h"
@@ -425,8 +426,8 @@ static void test_send_notify_to_all_comprehensive(void) {
     zone_config_t zcfg1, zcfg2;
     memset(&zcfg1, 0, sizeof(zcfg1));
     zcfg1.domain = "example.com.";
-    zcfg1.notify_source = "192.0.2.1";
-    zcfg1.also_notify_count = 3;
+    tzx(&zcfg1)->notify_source = "192.0.2.1";
+    tzx(&zcfg1)->also_notify_count = 3;
     ip_port_t notifys[3];
     notifys[0].ip = "192.0.2.10";
     notifys[0].port = 53;
@@ -434,7 +435,7 @@ static void test_send_notify_to_all_comprehensive(void) {
     notifys[1].port = 5353;
     notifys[2].ip = "invalid.ip"; // Invalid IP to test parse failure
     notifys[2].port = 53;
-    zcfg1.also_notify = notifys;
+    tzx(&zcfg1)->also_notify = notifys;
     zcfg1.next = &zcfg2;
 
     memset(&zcfg2, 0, sizeof(zcfg2));
@@ -706,8 +707,8 @@ static void test_update_multi_tsig_keys(void) {
     memset(&zcfg, 0, sizeof(zcfg));
     zcfg.domain = "example.com.";
     zcfg.type = "master";
-    zcfg.allow_update = allow_keys;
-    zcfg.allow_update_count = 2;
+    tzx(&zcfg)->allow_update = allow_keys;
+    tzx(&zcfg)->allow_update_count = 2;
     cfg.zones = &zcfg;
 
     zone_db_entry_t entry;
@@ -1606,14 +1607,14 @@ static void test_update_dispatch_zone_section(void) {
     memset(&sec_cfg, 0, sizeof(sec_cfg));
     sec_cfg.domain = "sec.example.";
     sec_cfg.type = "slave";
-    sec_cfg.allow_update = allow;
-    sec_cfg.allow_update_count = 1;
+    tzx(&sec_cfg)->allow_update = allow;
+    tzx(&sec_cfg)->allow_update_count = 1;
     zone_config_t prim_cfg;
     memset(&prim_cfg, 0, sizeof(prim_cfg));
     prim_cfg.domain = UZ;
     prim_cfg.type = "master";
-    prim_cfg.allow_update = allow;
-    prim_cfg.allow_update_count = 1;
+    tzx(&prim_cfg)->allow_update = allow;
+    tzx(&prim_cfg)->allow_update_count = 1;
     prim_cfg.next = &sec_cfg;
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -1745,8 +1746,8 @@ static void test_update_tsig_matrix(void) {
     memset(&zc, 0, sizeof(zc));
     zc.domain = UZ;
     zc.type = "master";
-    zc.allow_update = allow_k1;
-    zc.allow_update_count = 1;
+    tzx(&zc)->allow_update = allow_k1;
+    tzx(&zc)->allow_update_count = 1;
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.zones = &zc;
@@ -1870,16 +1871,16 @@ static void test_update_tsig_matrix(void) {
     tk_expect(res, len, 9, "k1.", 0, 32, &k1, mac, mac_len);
 
     /* zone without allow-update: REFUSED, signed with the request's key */
-    zc.allow_update = NULL;
-    zc.allow_update_count = 0;
+    tzx(&zc)->allow_update = NULL;
+    tzx(&zc)->allow_update_count = 0;
     upd_begin(&m); upd_a(&m, false, "t10." UZ, 1, 300, 40); tk_sign(&m, &k1, mac, &mac_len);
     len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 5, "k1.", 0, 32, &k1, mac, mac_len);
 
     /* address ACL: an allowed address with a valid (unlisted) key is accepted and signed, like BIND;
      * an unsigned request from that address stays accepted and unsigned */
-    zc.allow_update = allow_ip;
-    zc.allow_update_count = 1;
+    tzx(&zc)->allow_update = allow_ip;
+    tzx(&zc)->allow_update_count = 1;
     upd_begin(&m); upd_a(&m, false, "t11." UZ, 1, 300, 41); tk_sign(&m, &k2, mac, &mac_len);
     len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 0, "k2.", 0, 32, &k2, mac, mac_len);

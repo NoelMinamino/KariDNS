@@ -15,6 +15,7 @@
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
+#include "test_zext.h"
 #include "dns_zone_parser.h"
 #include "dns_zone_image.h"
 #include "test_image_helper.h"
@@ -232,7 +233,7 @@ static void test_all_rr_types_and_resolution(void) {
         build_dns_query(req, &req_len, (uint16_t)(i + 1), tests[i].qname, tests[i].qtype, false);
         compress_ctx_init_packet(&comp_ctx);
 
-        rate_limit_config_t *rrl_out = NULL;
+        const rate_limit_config_t *rrl_out = NULL;
         zone_db_entry_t *matched_entry = NULL;
         int res_len = process_dns_query_impl(req, req_len, res, sizeof(res),
                                              tests[i].qname, tests[i].qtype,
@@ -323,7 +324,7 @@ static void test_dnssec_negative_and_delegation_proofs(void) {
     // 1. NXDOMAIN with DO=1 -> Authority section contains NSEC + RRSIG
     build_dns_query(req, &req_len, 0x8801, "nonexistent.sec.example.com.", 1 /* A */, true);
     compress_ctx_init_packet(&comp_ctx);
-    rate_limit_config_t *rrl_out = NULL;
+    const rate_limit_config_t *rrl_out = NULL;
     zone_db_entry_t *matched_entry = NULL;
     int res_len = process_dns_query_impl(req, req_len, res, sizeof(res),
                                          "nonexistent.sec.example.com.", 1,
@@ -456,7 +457,7 @@ static void test_tinydns_timestamp_countdown(void) {
 
     uint8_t req[512], res[4096];
     size_t req_len = 0;
-    rate_limit_config_t *rrl_out = NULL;
+    const rate_limit_config_t *rrl_out = NULL;
     zone_db_entry_t *matched_entry = NULL;
 
     // Query 1: Past activation record -> found (ancount=1)
@@ -573,7 +574,7 @@ static void test_mqtype_truncation(void) {
 
     uint8_t res[512] = {0};
     size_t small_res_len = 100;
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_entry_t *matched_entry = NULL;
     int res_len = process_dns_query_impl(req, off, res, small_res_len, "example.com.", 1,
                                          "127.0.0.1", &comp_ctx, false, &rrl, &snap, &cfg, &matched_entry);
@@ -618,7 +619,7 @@ static void test_mqtype_qdcount0_formerr(void) {
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
     compress_ctx_init_packet(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_entry_t *matched = NULL;
 
     int res_len = process_dns_query_impl(req, off, res, sizeof(res), "", 0,
@@ -908,7 +909,7 @@ static void test_cname_loop_and_max_depth(void) {
     memset(&comp_ctx, 0, sizeof(comp_ctx));
     compress_ctx_init_packet(&comp_ctx);
 
-    rate_limit_config_t *rrl_out = NULL;
+    const rate_limit_config_t *rrl_out = NULL;
     zone_db_entry_t *matched_entry = NULL;
 
     int res_len = process_dns_query_impl(qbuf, qlen, rbuf, sizeof(rbuf),
@@ -1373,7 +1374,7 @@ static void gr_query_raw(const uint8_t *req, size_t req_len, const char *qname, 
     compress_ctx_t comp;
     memset(&comp, 0, sizeof(comp));
     compress_ctx_init_packet(&comp);
-    rate_limit_config_t *rrl_out = NULL;
+    const rate_limit_config_t *rrl_out = NULL;
     zone_db_entry_t *matched = NULL;
     int n = process_dns_query_impl(req, req_len, g_gr.res, sizeof(g_gr.res), qname, qtype,
                                    client_ip, &comp, is_tcp, &rrl_out,
@@ -1871,13 +1872,13 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
     memset(&zcfg, 0, sizeof(zcfg));
     zcfg.domain = "dynamic.prog.";
     zcfg.type = "program";
-    zcfg.program_path = "/usr/local/bin/test_plugin";
-    zcfg.program_user = "bind";
-    zcfg.program_timeout_ms = 1500;
-    zcfg.program_max_failures = 3;
+    tzx(&zcfg)->program_path = "/usr/local/bin/test_plugin";
+    tzx(&zcfg)->program_user = "bind";
+    tzx(&zcfg)->program_timeout_ms = 1500;
+    tzx(&zcfg)->program_max_failures = 3;
     const char *args[2] = {"--zone=dynamic.prog", "--debug"};
-    zcfg.program_args = (char **)args;
-    zcfg.program_args_count = 2;
+    tzx(&zcfg)->program_args = (char **)args;
+    tzx(&zcfg)->program_args_count = 2;
 
     char fp[256];
     compute_program_zone_fingerprint(&zcfg, fp, sizeof(fp));
@@ -1946,7 +1947,7 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
     memset(&fwd_cfg, 0, sizeof(fwd_cfg));
     fwd_cfg.domain = "forward.example.";
     fwd_cfg.type = "forward";
-    fwd_cfg.forwarders_count = 0;
+    tzx(&fwd_cfg)->forwarders_count = 0;
 
     int fwd_len = dispatch_forward_zone(&fwd_cfg, qpkt, qlen, prog_res, sizeof(prog_res));
     assert(fwd_len > 0);
@@ -2429,7 +2430,7 @@ static void test_dname_synthesis_and_wildcard_proofs(void) {
 
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     // 1. Query for host.sub.dname.example. -> synthesizes DNAME + CNAME target.example.net.
     uint8_t qbuf[512];
@@ -2510,7 +2511,7 @@ static void test_query_engine_protocol_qclass_and_edns_branches(void) {
 
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     // 1. UDP AXFR (QTYPE=252 on UDP -> FORMERR)
     uint8_t qbuf[512];
@@ -2614,7 +2615,7 @@ static void test_cname_target_overflow_and_tsig_query_paths(void) {
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0x4444, "alias.cname.example.", 1 /*A*/, false);
 
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "alias.cname.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     // Should successfully answer with the CNAME record
@@ -2673,7 +2674,7 @@ static void test_non_data_rrtypes_and_special_qtypes(void) {
 
     compress_ctx_t comp_ctx;
     uint8_t qbuf[512], rbuf[1024];
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     // Test each non-data type: 41, 249, 250, 251, 252, 253, 254, 255
     uint16_t non_data_types[] = {41, 249, 250, 251, 252, 253, 254, 255};
@@ -2754,7 +2755,7 @@ static void test_covering_rrsig_and_buffer_exhaustion_branches(void) {
 
     compress_ctx_t comp_ctx;
     uint8_t qbuf[512], rbuf[1024];
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     // Query with DO=1
     size_t qlen = 0;
@@ -2812,7 +2813,7 @@ static void test_dname_loop_and_depth_limit(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0x1111, "sub.a.dname.example.", 1, false);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "sub.a.dname.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
@@ -2857,7 +2858,7 @@ static void test_wildcard_cname_and_dname_synthesis(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0x1234, "foo.bar.wildsyn.example.", 1, false);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "foo.bar.wildsyn.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
@@ -2909,7 +2910,7 @@ static void test_nsec3_wildcard_nodata_and_optout(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0x3333, "host.unsecure.nsec3opt.example.", 1, true);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "host.unsecure.nsec3opt.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     // Delegation referral should be returned
@@ -2956,7 +2957,7 @@ static void test_nsec_apex_and_delegation_proofs(void) {
     size_t qlen = 0;
     // Query TXT at apex (NODATA proof with NSEC)
     build_dns_query(qbuf, &qlen, 0x4444, "nsecproof.example.", 16 /* TXT */, true);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "nsecproof.example.", 16, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     assert((rbuf[3] & 0x0F) == 0); // NOERROR
@@ -3054,7 +3055,7 @@ static void test_edns_client_subnet_cache_matching(void) {
     qbuf[qoff++] = 0;  // Scope prefix 0
     qbuf[qoff++] = 203; qbuf[qoff++] = 0; qbuf[qoff++] = 113; // 203.0.113
 
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qoff, rbuf, sizeof(rbuf), "geo.ecs.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
@@ -3116,7 +3117,7 @@ static void test_dns_cookie_badcookie_and_timestamp_drift(void) {
     qbuf[qoff++] = 0; qbuf[qoff++] = 16; // 8 bytes client + 8 bytes bad server cookie
     memcpy(qbuf + qoff, "12345678BADCOOKI", 16); qoff += 16;
 
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qoff, rbuf, sizeof(rbuf), "cookie.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     // BADCOOKIE error response or NOERROR with new server cookie
@@ -3140,7 +3141,7 @@ static int ubuf_query_name(zone_db_snapshot_t *snap, const char *qname, uint16_t
     qbuf[qlen - 7] = (uint8_t)(client_payload & 0xFF);
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     /* production UDP callers pass the 512-byte default; the engine widens it up to the cap */
     size_t max_res = is_tcp ? rcap : UDP_DEFAULT_MAX_RES_LEN;
     return process_dns_query(qbuf, qlen, rbuf, max_res, qname, qtype, "127.0.0.1",
@@ -3322,7 +3323,7 @@ static void test_truncated_response_keeps_opt(void) {
         }
         compress_ctx_t comp_ctx;
         compress_ctx_init(&comp_ctx);
-        rate_limit_config_t *rrl_cfg = NULL;
+        const rate_limit_config_t *rrl_cfg = NULL;
         uint8_t rbuf[65535];
         int rlen = process_dns_query(qbuf, qlen, rbuf, UDP_DEFAULT_MAX_RES_LEN, "big.tcopt.example.", 16,
                                      "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
@@ -3376,7 +3377,7 @@ static void test_rrl_slip_and_tc_response(void) {
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     compress_ctx_t comp_ctx;
     uint8_t qbuf[512], rbuf[1024];
@@ -3448,7 +3449,7 @@ static void test_proxy_v2_header_parsing(void) {
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0x9999, "proxy.example.", 1, false);
 
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "proxy.example.", 1, "203.0.113.199", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     assert((rbuf[3] & 0x0F) == 0); // NOERROR
@@ -3490,7 +3491,7 @@ static void test_catalog_zone_queries_and_member_zones(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0xAAAA, "version.catalog.example.", 16 /* TXT */, false);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "version.catalog.example.", 16, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
@@ -3535,7 +3536,7 @@ static void test_any_query_with_dnssec_rrsigs(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0xBBBB, "anydnssec.example.", 255 /* ANY */, true);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "anydnssec.example.", 255, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
@@ -3579,7 +3580,7 @@ static void test_cname_pointing_to_delegation_referral(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0xCCCC, "alias.cnameref.example.", 1, false);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "alias.cnameref.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
@@ -3595,7 +3596,7 @@ static void test_query_engine_formerr_branches(void) {
     printf("[TEST] Query Engine: FORMERR on invalid packets and compressed name loops...\n");
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     zone_db_snapshot_t empty_snap = { .views = NULL, .view_count = 0 };
 
     uint8_t rbuf[1024];
@@ -3671,7 +3672,7 @@ static void test_program_zone_dynamic_scripts(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0xDDDD, "prog.example.", 1, false);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "prog.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     assert((rbuf[3] & 0x0F) == 0);
@@ -3714,7 +3715,7 @@ static void test_prelinked_glue_records_ordering(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0xEEEE, "host.sub.glueord.example.", 1, false);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "host.sub.glueord.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     uint16_t arcount = (rbuf[10] << 8) | rbuf[11];
@@ -3757,7 +3758,7 @@ static void test_nsec3_salt_and_iteration_limits(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0xFFFF, "missing.nsec3lim.example.", 1, true);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "missing.nsec3lim.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     assert((rbuf[3] & 0x0F) == 3); // NXDOMAIN
@@ -3853,7 +3854,7 @@ static void test_tinydns_timestamp_decay_and_expiry(void) {
     memset(&comp_ctx, 0, sizeof(comp_ctx));
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     zone_db_entry_t *matched_entry = NULL;
 
     // Query active record
@@ -3933,7 +3934,7 @@ static void test_tsig_badkey_badsig_badtime_responses(void) {
 
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "tsigerr.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
 
@@ -3982,7 +3983,7 @@ static void test_dynamic_update_prerequisites_and_actions(void) {
 
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qoff, rbuf, sizeof(rbuf), "dynup.example.", 6, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
 
@@ -4029,7 +4030,7 @@ static void test_udp_truncation_with_edns_buffer_size(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0x4001, "many.trunc.example.", 16 /* TXT */, false);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, 512, "many.trunc.example.", 16, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     // Should set TC bit if overflowed 512
@@ -4115,7 +4116,7 @@ static void test_multiple_views_acls_and_fallback(void) {
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0x5001, "srv.split.example.", 1, false);
 
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     // Internal client (10.1.2.3)
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "srv.split.example.", 1, "10.1.2.3", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
@@ -4517,7 +4518,7 @@ static void test_query_engine_opcode_iquery_notimp(void) {
     qpkt[2] |= (1 << 3); // Opcode 1 (IQUERY)
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t empty_snap;
     memset(&empty_snap, 0, sizeof(empty_snap));
     atomic_init(&empty_snap.reader_count, 10);
@@ -4536,7 +4537,7 @@ static void test_query_engine_opcode_status_notimp(void) {
     qpkt[2] |= (2 << 3); // Opcode 2 (STATUS)
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t empty_snap;
     memset(&empty_snap, 0, sizeof(empty_snap));
     atomic_init(&empty_snap.reader_count, 10);
@@ -4556,7 +4557,7 @@ static void test_query_engine_qclass_chaos_version_bind(void) {
     qpkt[qlen - 2] = 0; qpkt[qlen - 1] = 3;
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t empty_snap;
     memset(&empty_snap, 0, sizeof(empty_snap));
     atomic_init(&empty_snap.reader_count, 10);
@@ -4575,7 +4576,7 @@ static void test_query_engine_qclass_hesiod_refused(void) {
     qpkt[qlen - 2] = 0; qpkt[qlen - 1] = 4;
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t empty_snap;
     memset(&empty_snap, 0, sizeof(empty_snap));
     atomic_init(&empty_snap.reader_count, 10);
@@ -4594,7 +4595,7 @@ static void test_query_engine_unknown_qclass_refused(void) {
     qpkt[qlen - 2] = 0xFD; qpkt[qlen - 1] = 0xE8; // 65000
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t empty_snap;
     memset(&empty_snap, 0, sizeof(empty_snap));
     atomic_init(&empty_snap.reader_count, 10);
@@ -4612,7 +4613,7 @@ static void test_query_engine_out_of_zone_query_refused(void) {
     build_dns_query(qpkt, &qlen, 0x4444, "notmyzone.org.", 1, false);
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t empty_snap;
     memset(&empty_snap, 0, sizeof(empty_snap));
     atomic_init(&empty_snap.reader_count, 10);
@@ -4629,7 +4630,7 @@ static void test_query_engine_formerr_truncated_question(void) {
     uint8_t bad_q1[18] = { 0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 3, 'a', 'b', 'c', 0, 0 };
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t empty_snap;
     memset(&empty_snap, 0, sizeof(empty_snap));
     atomic_init(&empty_snap.reader_count, 10);
@@ -4656,7 +4657,7 @@ static void test_query_engine_cname_intermediate_noerror_synthesis(void) {
     uint8_t qpkt[256]; size_t qlen = 0;
     build_dns_query(qpkt, &qlen, 0x1234, "alias.example.com.", 1, false);
     compress_ctx_t comp_ctx; compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     uint8_t rpkt[512];
     int rlen = process_dns_query(qpkt, qlen, rpkt, sizeof(rpkt), "alias.example.com.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &snap);
     assert(rlen >= 12);
@@ -4671,7 +4672,7 @@ static void test_query_engine_cname_intermediate_servfail_fallback(void) {
     uint8_t qpkt[256]; size_t qlen = 0;
     build_dns_query(qpkt, &qlen, 0x1235, "loop.example.com.", 1, false);
     compress_ctx_t comp_ctx; compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     uint8_t rpkt[512];
     int rlen = process_dns_query(qpkt, qlen, rpkt, sizeof(rpkt), "loop.example.com.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &snap);
     assert(rlen >= 12);
@@ -4682,7 +4683,7 @@ static void test_query_engine_formerr_corrupted_arcount_records(void) {
     printf("[TEST] Query Engine: FORMERR corrupted ARCOUNT records...\n");
     uint8_t qpkt[64] = { 0x12, 0x36, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 5, 3, 'f', 'o', 'o', 0, 0, 1, 0, 1 };
     compress_ctx_t comp_ctx; compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
     uint8_t rpkt[512];
     int rlen = process_dns_query(qpkt, 21, rpkt, sizeof(rpkt), "foo.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &snap);
@@ -4694,7 +4695,7 @@ static void test_query_engine_formerr_corrupted_nscount_records(void) {
     printf("[TEST] Query Engine: FORMERR corrupted NSCOUNT records...\n");
     uint8_t qpkt[64] = { 0x12, 0x37, 0x01, 0x00, 0, 1, 0, 0, 0, 3, 0, 0, 3, 'b', 'a', 'r', 0, 0, 1, 0, 1 };
     compress_ctx_t comp_ctx; compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
     uint8_t rpkt[512];
     int rlen = process_dns_query(qpkt, 21, rpkt, sizeof(rpkt), "bar.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &snap);
@@ -4706,7 +4707,7 @@ static void test_query_engine_formerr_rdlength_overflow_packet(void) {
     printf("[TEST] Query Engine: FORMERR RDLENGTH overflow packet...\n");
     uint8_t qpkt[64] = { 0x12, 0x38, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1, 3, 'b', 'a', 'z', 0, 0, 1, 0, 1, 0, 0, 41, 16, 0, 0, 0, 0, 0, 0xFF, 0xFF };
     compress_ctx_t comp_ctx; compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
     uint8_t rpkt[512];
     int rlen = process_dns_query(qpkt, 32, rpkt, sizeof(rpkt), "baz.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &snap);
@@ -4727,7 +4728,7 @@ static void test_query_engine_dynamic_update_no_matching_zone_notauth(void) {
     build_dns_query(qpkt, &qlen, 0x5501, "unknown.zone.", 6 /* SOA */, false);
     qpkt[2] = (5 << 3); // Opcode 5 (UPDATE)
     compress_ctx_t comp_ctx; compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     uint8_t rpkt[512];
     int rlen = process_dns_query(qpkt, qlen, rpkt, sizeof(rpkt), "unknown.zone.", 6, "127.0.0.1", &comp_ctx, false, &rrl, &snap);
     assert(rlen >= 12);
@@ -7527,7 +7528,7 @@ static void test_query_engine_feature_case_201(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[512];
     size_t req_len = 0;
@@ -7580,7 +7581,7 @@ static void test_query_engine_feature_case_202(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[2048];
     size_t req_len = 0;
@@ -7631,7 +7632,7 @@ static void test_query_engine_feature_case_203(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -7680,7 +7681,7 @@ static void test_query_engine_feature_case_204(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -7729,7 +7730,7 @@ static void test_query_engine_feature_case_205(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[512];
     size_t req_len = 0;
@@ -7779,7 +7780,7 @@ static void test_query_engine_feature_case_206(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[512];
     size_t req_len = 0;
@@ -7828,7 +7829,7 @@ static void test_query_engine_feature_case_207(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[512];
     size_t req_len = 0;
@@ -7946,7 +7947,7 @@ static void test_query_engine_feature_case_211(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[512];
     size_t req_len = 0;
@@ -8196,7 +8197,7 @@ static void test_query_engine_feature_case_218(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
     uint8_t res[512];
@@ -8210,7 +8211,7 @@ static void test_query_engine_feature_case_219(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[16];
     memset(req, 0, sizeof(req));
@@ -8230,7 +8231,7 @@ static void test_query_engine_feature_case_220(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     // 1. RFC 9619: Opcode QUERY (0), QDCOUNT=0 -> NOERROR (0)
     uint8_t req[12];
@@ -8264,7 +8265,7 @@ static void test_query_engine_feature_case_221(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[64];
     memset(req, 0, sizeof(req));
@@ -8286,7 +8287,7 @@ static void test_query_engine_feature_case_222(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[64];
     memset(req, 0, sizeof(req));
@@ -8308,7 +8309,7 @@ static void test_query_engine_feature_case_223(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[64];
     memset(req, 0, sizeof(req));
@@ -8330,7 +8331,7 @@ static void test_query_engine_feature_case_224(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[64];
     memset(req, 0, sizeof(req));
@@ -8373,7 +8374,7 @@ static void test_query_engine_feature_case_225(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[64];
     memset(req, 0, sizeof(req));
@@ -8416,7 +8417,7 @@ static void test_query_engine_feature_case_226(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[512];
     size_t req_len = 0;
@@ -8452,7 +8453,7 @@ static void test_query_engine_feature_case_227(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[35]; // Tiny buffer
     size_t req_len = 0;
@@ -8488,7 +8489,7 @@ static void test_query_engine_feature_case_228(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8526,7 +8527,7 @@ static void test_query_engine_feature_case_229(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8564,7 +8565,7 @@ static void test_query_engine_feature_case_230(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8602,7 +8603,7 @@ static void test_query_engine_feature_case_231(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8640,7 +8641,7 @@ static void test_query_engine_feature_case_232(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8678,7 +8679,7 @@ static void test_query_engine_feature_case_233(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8715,7 +8716,7 @@ static void test_query_engine_feature_case_234(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8752,7 +8753,7 @@ static void test_query_engine_feature_case_235(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8789,7 +8790,7 @@ static void test_query_engine_feature_case_236(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8826,7 +8827,7 @@ static void test_query_engine_feature_case_237(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8863,7 +8864,7 @@ static void test_query_engine_feature_case_238(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8900,7 +8901,7 @@ static void test_query_engine_feature_case_239(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8937,7 +8938,7 @@ static void test_query_engine_feature_case_240(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -9002,7 +9003,7 @@ static void test_query_engine_feature_case_243(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -9021,7 +9022,7 @@ static void test_query_engine_feature_case_244(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512];
     size_t req_len = 0;
@@ -9059,7 +9060,7 @@ static void test_query_engine_feature_case_245(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512];
     size_t req_len = 0;
@@ -9075,7 +9076,7 @@ static void test_query_engine_feature_case_246(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512];
     size_t req_len = 0;
@@ -9287,7 +9288,7 @@ static void test_query_engine_opcode_header_validations(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     // 1. NOTIFY packet with QDCOUNT = 0 -> FORMERR (RCODE=1)
     uint8_t notify_bad_qd[64], res[512];
@@ -9374,7 +9375,7 @@ static void test_query_engine_dname_cname_wildcard_truncation(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[4096];
     size_t req_len = 0;

@@ -1228,14 +1228,14 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     }
 
     ecs_tag_def_t *active_ecs_tags = (arena.bind_ecs_tags && arena.bind_ecs_tag_count > 0) ? arena.bind_ecs_tags :
-                                     ((zcfg && zcfg->ecs_tags) ? zcfg->ecs_tags : (cfg ? cfg->ecs_tags : NULL));
+                                     ((zcfg && zext(zcfg)->ecs_tags) ? zext(zcfg)->ecs_tags : (cfg ? cfg->ecs_tags : NULL));
     int active_ecs_tag_count = (arena.bind_ecs_tags && arena.bind_ecs_tag_count > 0) ? arena.bind_ecs_tag_count :
-                               ((zcfg && zcfg->ecs_tags) ? zcfg->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0));
+                               ((zcfg && zext(zcfg)->ecs_tags) ? zext(zcfg)->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0));
 
     ecs_tag_def_t *active_loc_tags = (arena.bind_location_tags && arena.bind_location_tag_count > 0) ? arena.bind_location_tags :
-                                     ((zcfg && zcfg->location_tags) ? zcfg->location_tags : (cfg ? cfg->location_tags : NULL));
+                                     ((zcfg && zext(zcfg)->location_tags) ? zext(zcfg)->location_tags : (cfg ? cfg->location_tags : NULL));
     int active_loc_tag_count = (arena.bind_location_tags && arena.bind_location_tag_count > 0) ? arena.bind_location_tag_count :
-                               ((zcfg && zcfg->location_tags) ? zcfg->location_tag_count : (cfg ? cfg->location_tag_count : 0));
+                               ((zcfg && zext(zcfg)->location_tags) ? zext(zcfg)->location_tag_count : (cfg ? cfg->location_tag_count : 0));
 
     for (size_t i = 0; i < arena.count; i++) {
         if (arena.records[i].ecs_subnet_tag != NULL) {
@@ -1737,42 +1737,45 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
     }
 
     int program_zone_count = 0;
-    zone_config_t *z = cfg->zones;
-    while (z) {
+    const view_config_t *zv;
+    zone_config_t *z;
+    CONFIG_FOR_EACH_ZONE(cfg, zv, z) {
+        const zone_ext_t *zx = zext(z);
         if (z->type && strcasecmp(z->type, "program") == 0) {
             program_zone_count++;
-            if (z->program_path) {
-                if (cfg->user && !z->program_user) {
-                    z->program_user = strdup(cfg->user);
+            if (zx->program_path) {
+                if (cfg->user && !zx->program_user) {
+                    zone_ext_mut(z)->program_user = strdup(cfg->user);
+                    zx = zext(z);
                 }
-                if (z->program_path[0] != '/') {
+                if (zx->program_path[0] != '/') {
                     fprintf(stderr,
                         "[ERROR] Zone '%s': 'program' must be an absolute path (got '%s'). "
                         "A relative name would be resolved via $PATH at runtime, which is "
                         "not deterministic for a network-facing daemon.\n",
-                        z->domain, z->program_path);
+                        z->domain, zx->program_path);
                     free(buf);
                     return 1;
                 }
-                if (access(z->program_path, X_OK) != 0) {
+                if (access(zx->program_path, X_OK) != 0) {
                     fprintf(stderr, "[WARNING] Zone '%s' program '%s' is not executable (access X_OK failed: %s)\n",
-                            z->domain, z->program_path, strerror(errno));
+                            z->domain, zx->program_path, strerror(errno));
                 }
-                if (z->program_user && cfg->user &&
-                    strcasecmp(z->program_user, cfg->user) != 0) {
+                if (zx->program_user && cfg->user &&
+                    strcasecmp(zx->program_user, cfg->user) != 0) {
                     fprintf(stderr,
                         "[WARNING] Zone '%s': program-user '%s' differs from options.user '%s'. "
                         "This only works if karidns itself starts as root (no prior privilege drop); "
                         "if karidns is started as a non-root user, it refuses to start "
                         "(setuid to a different non-root user is not permitted by the OS).\n",
-                        z->domain, z->program_user, cfg->user);
+                        z->domain, zx->program_user, cfg->user);
                 }
-                if (z->program_args_count > 62) {
+                if (zx->program_args_count > 62) {
                     fprintf(stderr,
                         "[ERROR] Zone '%s': program-args has %d entries, but only 62 are "
                         "supported (argv[] is fixed-size in spawn_one_program_plugin()). "
                         "Reduce the argument count.\n",
-                        z->domain, z->program_args_count);
+                        z->domain, zx->program_args_count);
                     free(buf);
                     return 1;
                 }
@@ -1782,7 +1785,7 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
                 return 1;
             }
         } else if (z->type && strcasecmp(z->type, "forward") == 0) {
-            if (z->forwarders_count == 0) {
+            if (zx->forwarders_count == 0) {
                 fprintf(stderr, "[ERROR] Zone '%s' has type 'forward' but no 'forwarders' specified\n",
                         z->domain);
                 free(buf);
@@ -1790,21 +1793,20 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
             }
             // 自己ループ検知: forwarders のいずれかが自分自身の
             // bind-address:port と一致していないか確認する
-            for (int fi = 0; fi < z->forwarders_count; fi++) {
+            for (int fi = 0; fi < zx->forwarders_count; fi++) {
                 if (cfg->bind_addresses) {
                     for (int bi = 0; bi < cfg->bind_address_count; bi++) {
-                        if (strcmp(z->forwarders[fi].ip, cfg->bind_addresses[bi]) == 0 &&
-                            (z->forwarders[fi].port == cfg->port || z->forwarders[fi].port == 0)) {
+                        if (strcmp(zx->forwarders[fi].ip, cfg->bind_addresses[bi]) == 0 &&
+                            (zx->forwarders[fi].port == cfg->port || zx->forwarders[fi].port == 0)) {
                             fprintf(stderr,
                                 "[WARNING] Zone '%s': forwarder '%s:%d' appears to point back "
                                 "at this server itself (self-loop risk).\n",
-                                z->domain, z->forwarders[fi].ip, z->forwarders[fi].port);
+                                z->domain, zx->forwarders[fi].ip, zx->forwarders[fi].port);
                         }
                     }
                 }
             }
         }
-        z = z->next;
     }
 
     if (program_zone_count > 0 && !cfg->allow_program_zones) {
@@ -1834,26 +1836,31 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
             }
         }
     }
-    for (zone_config_t *zc = cfg->zones; zc; zc = zc->next) {
-        if (zc->ecs_tag_count > 0) has_ecs_tags = true;
-        for (int ti = 0; ti < zc->ecs_tag_count; ti++) {
-            for (int ci = 0; ci < zc->ecs_tags[ti].cidr_count; ci++) {
-                if (!validate_cidr_syntax(zc->ecs_tags[ti].cidrs[ci].cidr)) {
+    {
+    const view_config_t *zcv;
+    zone_config_t *zc;
+    CONFIG_FOR_EACH_ZONE(cfg, zcv, zc) {
+        const zone_ext_t *zx = zext(zc);
+        if (zx->ecs_tag_count > 0) has_ecs_tags = true;
+        for (int ti = 0; ti < zx->ecs_tag_count; ti++) {
+            for (int ci = 0; ci < zx->ecs_tags[ti].cidr_count; ci++) {
+                if (!validate_cidr_syntax(zx->ecs_tags[ti].cidrs[ci].cidr)) {
                     fprintf(stderr, "[ERROR] Zone '%s': Invalid CIDR '%s' in ecs-tags tag '%s'\n",
-                            zc->domain, zc->ecs_tags[ti].cidrs[ci].cidr, zc->ecs_tags[ti].tag);
+                            zc->domain, zx->ecs_tags[ti].cidrs[ci].cidr, zx->ecs_tags[ti].tag);
                     ecs_error = true;
                 }
             }
         }
-        for (int ti = 0; ti < zc->location_tag_count; ti++) {
-            for (int ci = 0; ci < zc->location_tags[ti].cidr_count; ci++) {
-                if (!validate_cidr_syntax(zc->location_tags[ti].cidrs[ci].cidr)) {
+        for (int ti = 0; ti < zx->location_tag_count; ti++) {
+            for (int ci = 0; ci < zx->location_tags[ti].cidr_count; ci++) {
+                if (!validate_cidr_syntax(zx->location_tags[ti].cidrs[ci].cidr)) {
                     fprintf(stderr, "[ERROR] Zone '%s': Invalid CIDR '%s' in location-tags tag '%s'\n",
-                            zc->domain, zc->location_tags[ti].cidrs[ci].cidr, zc->location_tags[ti].tag);
+                            zc->domain, zx->location_tags[ti].cidrs[ci].cidr, zx->location_tags[ti].tag);
                     ecs_error = true;
                 }
             }
         }
+    }
     }
     if (has_ecs_tags && !cfg->ecs_enable) {
         fprintf(stderr, "[WARNING] ecs-tags defined, but ecs-enable is not set to 'yes' in options{}\n");
@@ -1920,7 +1927,7 @@ int main(int argc, char **argv) {
             for (zone_config_t *z = v->zones; z; z = z->next) {
                 /* 型名はパーサが小文字の master/slave/forward/program に正規化している (D-23) */
                 if (!z->type || strcmp(z->type, "master") == 0) {
-                    if (check_zone(z->domain, z->file, false, z->is_catalog, z->file_format, z, &cfg, v) != 0) {
+                    if (check_zone(z->domain, z->file, false, z->is_catalog, zext(z)->file_format, z, &cfg, v) != 0) {
                         error_count++;
                     }
                     checked++;
@@ -1961,7 +1968,7 @@ int main(int argc, char **argv) {
                     found++;
                     if (z->type && strcasecmp(z->type, "program") == 0) {
                         printf("[INFO] Zone '%s' is type 'program'; skipping file validation.\n", z->domain);
-                    } else if (check_zone(z->domain, z->file, false, z->is_catalog, z->file_format, z, &cfg, v) != 0) {
+                    } else if (check_zone(z->domain, z->file, false, z->is_catalog, zext(z)->file_format, z, &cfg, v) != 0) {
                         failed++;
                     }
                     break;

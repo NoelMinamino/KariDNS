@@ -12,6 +12,7 @@
 #include "dns_wire.h"
 #include "dns_edns_ecs.h"
 #include "dns_config_parser.h"
+#include "test_zext.h"
 #include "dns_zone_parser.h"
 #include "dns_server_internal.h"
 #include "dns_cidr.h"
@@ -477,10 +478,10 @@ static void test_ecs_trusted_resolver_precedence(void) {
     assert(!is_ecs_trusted_resolver(test_zimg(&zone), &cfg, NULL, "203.0.113.9"));
 
     // A zone-level list replaces (does not extend) the server-level list.
-    zcfg.ecs_trusted_resolvers = zcfg_list;
-    zcfg.ecs_trusted_resolvers_count = 1;
-    zcfg.ecs_trusted_resolvers_parsed = acl_list_parse(zcfg_list, 1);
-    assert(zcfg.ecs_trusted_resolvers_parsed != NULL);
+    tzx(&zcfg)->ecs_trusted_resolvers = zcfg_list;
+    tzx(&zcfg)->ecs_trusted_resolvers_count = 1;
+    tzx(&zcfg)->ecs_trusted_resolvers_parsed = acl_list_parse(zcfg_list, 1);
+    assert(zext(&zcfg)->ecs_trusted_resolvers_parsed != NULL);
     assert(is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "198.51.100.1"));
     assert(!is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "192.0.2.7"));
 
@@ -495,14 +496,14 @@ static void test_ecs_trusted_resolver_precedence(void) {
 
     // Without the pre-parsed form the textual lists are used, with the same precedence.
     free(zone.bind_ecs_trusted_resolvers_parsed); zone.bind_ecs_trusted_resolvers_parsed = NULL;
-    free(zcfg.ecs_trusted_resolvers_parsed);      zcfg.ecs_trusted_resolvers_parsed = NULL;
+    free(zext(&zcfg)->ecs_trusted_resolvers_parsed);      tzx(&zcfg)->ecs_trusted_resolvers_parsed = NULL;
     free(cfg.ecs_trusted_resolvers_parsed);       cfg.ecs_trusted_resolvers_parsed = NULL;
     assert(is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "203.0.113.9"));
     assert(!is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "198.51.100.1"));
     zone.bind_ecs_trusted_resolvers = NULL; zone.bind_ecs_trusted_resolver_count = 0;
     assert(is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "198.51.100.1"));
     assert(!is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "192.0.2.7"));
-    zcfg.ecs_trusted_resolvers = NULL; zcfg.ecs_trusted_resolvers_count = 0;
+    tzx(&zcfg)->ecs_trusted_resolvers = NULL; tzx(&zcfg)->ecs_trusted_resolvers_count = 0;
     assert(is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "192.0.2.7"));
     assert(!is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "198.51.100.1"));
 

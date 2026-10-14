@@ -848,8 +848,8 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
         server_config_t *active_cfg_prelink = acquire_config_snapshot();
         zone_config_t *zcfg = find_zone_config_in_view(active_cfg_prelink, entry->view_name, entry->domain);
-        additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
-                                            ? zcfg->additional_from_auth
+        additional_from_auth_t policy = (zcfg && zext(zcfg)->additional_from_auth_specified)
+                                            ? zext(zcfg)->additional_from_auth
                                             : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
         zone_glue_track_build(standby, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
         build_zone_response_cache(standby, active_cfg_prelink, entry->view_name, entry->domain);
@@ -1282,7 +1282,7 @@ static bool zone_needs_extended_axfr(const zone_image_t *zone, const zone_db_ent
   server_config_t *cfg = acquire_config_snapshot();
   if (cfg) {
     zone_config_t *zcfg = find_zone_config_in_view(cfg, entry->view_name, entry->domain);
-    cfg_trusted = (zcfg && zcfg->ecs_trusted_resolvers_count > 0) || cfg->ecs_trusted_resolvers_count > 0;
+    cfg_trusted = (zcfg && zext(zcfg)->ecs_trusted_resolvers_count > 0) || cfg->ecs_trusted_resolvers_count > 0;
     release_config_snapshot(cfg);
   }
   return cfg_trusted;
@@ -1550,9 +1550,9 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
                             ? zattr.bind_ecs_trusted_resolvers : NULL;
       int trusted_count = trusted_res ? zattr.bind_ecs_trusted_resolver_count : 0;
       if (!trusted_res) {
-        trusted_res = (axfr_zcfg && axfr_zcfg->ecs_trusted_resolvers) ? axfr_zcfg->ecs_trusted_resolvers
+        trusted_res = (axfr_zcfg && zext(axfr_zcfg)->ecs_trusted_resolvers) ? zext(axfr_zcfg)->ecs_trusted_resolvers
                                                                        : (axfr_cfg ? axfr_cfg->ecs_trusted_resolvers : NULL);
-        trusted_count = (axfr_zcfg && axfr_zcfg->ecs_trusted_resolvers) ? axfr_zcfg->ecs_trusted_resolvers_count
+        trusted_count = (axfr_zcfg && zext(axfr_zcfg)->ecs_trusted_resolvers) ? zext(axfr_zcfg)->ecs_trusted_resolvers_count
                                                                    : (axfr_cfg ? axfr_cfg->ecs_trusted_resolvers_count : 0);
       }
       if (trusted_count > 0 && trusted_res) {

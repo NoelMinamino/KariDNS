@@ -152,8 +152,8 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   if (cur_snap) retain_zone_snapshot(cur_snap);
   server_config_t *active_cfg_prelink = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
   zone_config_t *zcfg = find_zone_config_in_view(active_cfg_prelink, entry->view_name, entry->domain);
-  additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
-                                      ? zcfg->additional_from_auth
+  additional_from_auth_t policy = (zcfg && zext(zcfg)->additional_from_auth_specified)
+                                      ? zext(zcfg)->additional_from_auth
                                       : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
   zone_glue_track_build(z_next, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
   build_zone_response_cache(z_next, active_cfg_prelink, entry->view_name, entry->domain);
@@ -508,14 +508,14 @@ void send_notify_to_all(const char *domain, const char *view_name) {
   }
 
   zone_config_t *zone = active ? find_zone_config_in_view(active, view_name, domain) : NULL;
-  const char *notify_source = zone ? zone->notify_source : NULL;
+  const char *notify_source = zone ? zext(zone)->notify_source : NULL;
   notify_retry_config_t nr = notify_retry_effective(active, zone);
   /* D-09: ゾーンに tsig-key があれば NOTIFY に署名する */
   const tsig_key_t *key = NULL;
-  if (zone && zone->tsig_key && zone->tsig_key[0]) {
-    key = find_tsig_key_by_name(active, zone->tsig_key);
+  if (zone && zext(zone)->tsig_key && zext(zone)->tsig_key[0]) {
+    key = find_tsig_key_by_name(active, zext(zone)->tsig_key);
     if (!key) syslog(LOG_ERR, "[Notify] zone '%s': tsig-key '%s' is not defined; NOTIFY sent unsigned", domain,
-                     zone->tsig_key);
+                     zext(zone)->tsig_key);
   }
 
   struct sockaddr_storage targets[64];
@@ -523,8 +523,8 @@ void send_notify_to_all(const char *domain, const char *view_name) {
 
   // 1. also-notify servers
   if (zone) {
-    for (int i = 0; i < zone->also_notify_count; i++)
-      notify_add_target(targets, &ntargets, 64, AF_UNSPEC, zone->also_notify[i].ip, zone->also_notify[i].port);
+    for (int i = 0; i < zext(zone)->also_notify_count; i++)
+      notify_add_target(targets, &ntargets, 64, AF_UNSPEC, zext(zone)->also_notify[i].ip, zext(zone)->also_notify[i].port);
   }
 
   // 2. Addresses of the apex NS hosts except the SOA MNAME host (RFC 1996 §3.2)

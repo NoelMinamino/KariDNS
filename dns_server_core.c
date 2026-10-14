@@ -86,6 +86,23 @@ server_config_t *acquire_config_snapshot(void) {
 void release_config_snapshot(server_config_t *snap) {
   (void)snap;
 }
+
+/* S6a: 退いた設定の解放。公開した設定の入れ替え (制御スレッドだけが行う) で退いた設定は、retire_epoch 以下の
+ * 世代で読み取り区間に入ったスレッドがいなくなれば誰からも見えない (ワーカー、ロガー、ゾーン転送スレッドなど
+ * 制御スレッド以外は設定を読み取り区間の中でだけ読み、ポインタを区間の外へ持ち出さない)。
+ * 以前は次のリロードまで退いた設定を持ち続けて 2 世代ぶん確保していた。 */
+bool config_standby_reap(bool wait) {
+  if (!g_config_db.standby_pending) return true;
+  if (wait ? !rcu_writer_wait_until_safe(g_config_db.retire_epoch, 10000)
+           : !rcu_writer_is_safe(g_config_db.retire_epoch))
+    return false;
+  server_config_t *active = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+  server_config_t *standby = (active == &g_config_db.config_a) ? &g_config_db.config_b : &g_config_db.config_a;
+  free_server_config_fields(standby);
+  g_config_db.standby_pending = false;
+  g_config_db.standby_freed++;
+  return true;
+}
 int g_control_kq = -1;
 int g_cwd_fd = -1;
 STATIC_TEST const char *g_config_path = NULL;
@@ -1158,7 +1175,7 @@ void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, z
     out->soa_serial = (uint32_t)atomic_load_explicit(&e->serial, memory_order_relaxed);
 
     zone_config_t *zc = find_zone_config_in_view(cfg, e->view_name, e->domain);
-    out->slaves_configured = zc ? zc->also_notify_count : 0;
+    out->slaves_configured = zc ? zext(zc)->also_notify_count : 0;
 
     out->last_notify_time = atomic_load_explicit(&e->observatory.last_notify_time, memory_order_relaxed);
     out->last_transfer_time = atomic_load_explicit(&e->observatory.last_transfer_time, memory_order_relaxed);
@@ -1438,7 +1455,7 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
       // UDP async resolution
       alignas(udp_ipc_t) uint8_t res_buf_full[UDP_IPC_BUFFER_SIZE];
       uint8_t *res_buf = res_buf_full + sizeof(udp_ipc_t);
-      rate_limit_config_t *rrl_cfg = NULL;
+      const rate_limit_config_t *rrl_cfg = NULL;
       size_t max_res = task.has_edns ? BUFFER_SIZE : UDP_DEFAULT_MAX_RES_LEN;
       int res_len = process_dns_query_cap(task.req_buf, task.req_len, res_buf, max_res,
                                           UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t),
@@ -1592,9 +1609,9 @@ STATIC_TEST tcp_sockopts_t xfr_tcp_sockopts(const server_config_t *cfg, const zo
     o.sndbuf = cfg->tcp_window;
   }
   if (zcfg) {
-    if (zcfg->zone_tcp_mss > 0) o.mss = zcfg->zone_tcp_mss;
-    if (zcfg->zone_tcp_window > 0) o.rcvbuf = zcfg->zone_tcp_window;
-    if (zcfg->zone_tcp_sndbuf > 0) o.sndbuf = zcfg->zone_tcp_sndbuf;
+    if (zext(zcfg)->zone_tcp_mss > 0) o.mss = zext(zcfg)->zone_tcp_mss;
+    if (zext(zcfg)->zone_tcp_window > 0) o.rcvbuf = zext(zcfg)->zone_tcp_window;
+    if (zext(zcfg)->zone_tcp_sndbuf > 0) o.sndbuf = zext(zcfg)->zone_tcp_sndbuf;
   }
   return o;
 }
@@ -1662,9 +1679,9 @@ static void apply_zone_sockbuf(int fd, int opt, int want, int *applied, int *ori
  * クエリごとに切り替わる (値が変わるときだけ setsockopt する)。MSS だけは
  * apply_tcp_mss() の通り下げる方向のみで、戻さない。 */
 STATIC_TEST void apply_zone_tcp_opts(int fd, tcp_stream_ctx_t *c, const zone_config_t *zcfg) {
-  if (zcfg) apply_tcp_mss(fd, c, zcfg->zone_tcp_mss);
-  apply_zone_sockbuf(fd, SO_RCVBUF, zcfg ? zcfg->zone_tcp_window : 0, &c->applied_rcvbuf, &c->orig_rcvbuf);
-  apply_zone_sockbuf(fd, SO_SNDBUF, zcfg ? zcfg->zone_tcp_sndbuf : 0, &c->applied_sndbuf, &c->orig_sndbuf);
+  if (zcfg) apply_tcp_mss(fd, c, zext(zcfg)->zone_tcp_mss);
+  apply_zone_sockbuf(fd, SO_RCVBUF, zcfg ? zext(zcfg)->zone_tcp_window : 0, &c->applied_rcvbuf, &c->orig_rcvbuf);
+  apply_zone_sockbuf(fd, SO_SNDBUF, zcfg ? zext(zcfg)->zone_tcp_sndbuf : 0, &c->applied_sndbuf, &c->orig_sndbuf);
 }
 
 void *worker_thread_func(void *arg) {
@@ -2021,7 +2038,7 @@ worker_startup_success:;
             }
 
             uint8_t *res_buf = batch->tx_buffers[n_tx] + sizeof(udp_ipc_t);
-            rate_limit_config_t *rrl_cfg = NULL;
+            const rate_limit_config_t *rrl_cfg = NULL;
             int res_len =
                 process_dns_query_cap(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
                                       UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
@@ -2326,22 +2343,22 @@ process_tcp_client: ;
                            edns_version_unsupported(&edns);
             bool allowed = false;
             if (zcfg && !badvers && tsig.status != TSIG_REQ_ERROR && tsig.status != TSIG_REQ_FORMERR) {
-              bool has_acl = (zcfg->allow_transfer_count > 0);
-              bool has_keys = (zcfg->tsig_keys_count > 0) || (zcfg->tsig_key != NULL);
+              bool has_acl = (zext(zcfg)->allow_transfer_count > 0);
+              bool has_keys = (zext(zcfg)->tsig_keys_count > 0) || (zext(zcfg)->tsig_key != NULL);
               bool acl_ok = false;
               if (has_acl) {
-                if (zcfg->allow_transfer_parsed) {
-                  acl_ok = check_acl_bin(ctx_tcp->client_ip, zcfg->allow_transfer_parsed, zcfg->allow_transfer_count);
+                if (zext(zcfg)->allow_transfer_parsed) {
+                  acl_ok = check_acl_bin(ctx_tcp->client_ip, zext(zcfg)->allow_transfer_parsed, zext(zcfg)->allow_transfer_count);
                 } else {
-                  acl_ok = check_acl(ctx_tcp->client_ip, zcfg->allow_transfer, zcfg->allow_transfer_count);
+                  acl_ok = check_acl(ctx_tcp->client_ip, zext(zcfg)->allow_transfer, zext(zcfg)->allow_transfer_count);
                 }
               }
               /* allow-transfer { key "A"; ... } の鍵か、ゾーンの tsig-key で署名されていること (D-03: 名前は DNS 名として比較) */
               bool key_ok = false;
-              for (int ki = 0; matched_key && ki < zcfg->tsig_keys_count && !key_ok; ki++)
-                key_ok = tsig_key_names_equal(matched_key->name, zcfg->tsig_keys[ki]);
-              if (matched_key && !key_ok && zcfg->tsig_key)
-                key_ok = tsig_key_names_equal(matched_key->name, zcfg->tsig_key);
+              for (int ki = 0; matched_key && ki < zext(zcfg)->tsig_keys_count && !key_ok; ki++)
+                key_ok = tsig_key_names_equal(matched_key->name, zext(zcfg)->tsig_keys[ki]);
+              if (matched_key && !key_ok && zext(zcfg)->tsig_key)
+                key_ok = tsig_key_names_equal(matched_key->name, zext(zcfg)->tsig_key);
               /* アドレスと鍵の両方があれば両方を満たすこと (docs/karidns.md allow-transfer) */
               if (has_acl && has_keys) {
                   allowed = (acl_ok && key_ok);
@@ -2701,6 +2718,7 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
     free(config_str);
     return res;
   }
+  config_standby_reap(false); /* 周期処理がまだ解放していなければここで (待ったので必ず解放できる) */
 
   free_server_config_fields(standby);
   if (parse_named_conf_ext(config_str, g_config_path, standby) != 0) {
@@ -2738,6 +2756,7 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
   /* 応答キャッシュの鍵に入る: 設定が変われば以前の応答 (minimal-responses 等に依存) は引かれない */
   standby->generation = (active ? active->generation : 0) + 1;
   g_config_db.retire_epoch = rcu_writer_publish(&g_config_db.active, standby);
+  g_config_db.standby_pending = true; /* 退いた設定 (旧 active) は猶予期間の後で config_standby_reap() が解放する */
   g_last_configured_time = time(NULL);
   // dnstap の接続先は起動時のみだが、出力するメッセージ種別はリロードで反映できる
   if (standby->dnstap.enabled) {
@@ -2843,14 +2862,8 @@ const char *find_configured_domain(const char *arg, char *out_buf, size_t out_si
   snprintf(out_buf, out_size, "%s", arg);
   server_config_t *active = acquire_config_snapshot();
   if (!active) return out_buf;
-  zone_config_t *zcfg = active->zones;
-  while (zcfg) {
-    if (domain_names_match_ci(zcfg->domain, arg)) {
-      snprintf(out_buf, out_size, "%s", zcfg->domain);
-      break;
-    }
-    zcfg = zcfg->next;
-  }
+  const zone_config_t *zcfg = config_find_zone_any_view(active, arg);
+  if (zcfg) snprintf(out_buf, out_size, "%s", zcfg->domain);
   release_config_snapshot(active);
   return out_buf;
 }
@@ -3346,6 +3359,7 @@ void *control_thread_func(void *arg) {
          * 公開で不要になった古い版を猶予期間の後で解放する */
         zone_glue_refresh_dependents(false);
         zone_retire_process(false);
+        config_standby_reap(false);
         if (g_reload_pending) {
           /* O-10: 読み手が残っていて延期したリロードを捨てずにやり直す */
           syslog(LOG_NOTICE, "[Config] Retrying the postponed reload");
@@ -3403,12 +3417,12 @@ void *control_thread_func(void *arg) {
                         zone_config_t *zcfg = find_zone_config_in_view(active, entry->view_name, entry->domain);
                         slave_zcfg = zcfg;
                         if (zcfg && zcfg->type && (strcasecmp(zcfg->type, "slave") == 0 || strcasecmp(zcfg->type, "secondary") == 0) &&
-                            zcfg->masters_count > 0 && zcfg->masters[0].ip != NULL) {
+                            zext(zcfg)->masters_count > 0 && zext(zcfg)->masters[0].ip != NULL) {
                             is_slave = true;
-                            strncpy(master_ip, zcfg->masters[0].ip, sizeof(master_ip) - 1);
-                            master_port = zcfg->masters[0].port;
-                            if (zcfg->tsig_key) {
-                                strncpy(tsig_key_name, zcfg->tsig_key, sizeof(tsig_key_name) - 1);
+                            strncpy(master_ip, zext(zcfg)->masters[0].ip, sizeof(master_ip) - 1);
+                            master_port = zext(zcfg)->masters[0].port;
+                            if (zext(zcfg)->tsig_key) {
+                                strncpy(tsig_key_name, zext(zcfg)->tsig_key, sizeof(tsig_key_name) - 1);
                             }
                         }
                     }
@@ -3661,7 +3675,7 @@ int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], b
   if (cfg) {
     for (view_config_t *v = cfg->views; v; v = v->next) {
       for (zone_config_t *z = v->zones; z; z = z->next) {
-        if (!z->notify_source || !*z->notify_source) continue;
+        if (!zext(z)->notify_source || !*zext(z)->notify_source) continue;
         if (num_fds >= MAX_BIND_ADDRS) break;
 
         struct sockaddr_in addr4;
@@ -3671,11 +3685,11 @@ int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], b
         memset(&addr4, 0, sizeof(addr4));
         memset(&addr6, 0, sizeof(addr6));
 
-        if (inet_pton(AF_INET, z->notify_source, &addr4.sin_addr) == 1) {
+        if (inet_pton(AF_INET, zext(z)->notify_source, &addr4.sin_addr) == 1) {
           addr4.sin_family = AF_INET;
           addr4.sin_port = htons(port);
           is_v4 = true;
-        } else if (inet_pton(AF_INET6, z->notify_source, &addr6.sin6_addr) == 1) {
+        } else if (inet_pton(AF_INET6, zext(z)->notify_source, &addr6.sin6_addr) == 1) {
           addr6.sin6_family = AF_INET6;
           addr6.sin6_port = htons(port);
           is_v6 = true;
@@ -4537,22 +4551,22 @@ STATIC_TEST bool validate_program_zone_users(server_config_t *cfg) {
     return true;
   for (view_config_t *v = cfg->views; v; v = v->next) {
     for (zone_config_t *z = v->zones; z; z = z->next) {
-      if (!z->type || strcasecmp(z->type, "program") != 0 || !z->program_user)
+      if (!z->type || strcasecmp(z->type, "program") != 0 || !zext(z)->program_user)
         continue;
       uid_t puid;
       gid_t pgid;
-      bool found = lookup_user_ids(z->program_user, &puid, &pgid);
+      bool found = lookup_user_ids(zext(z)->program_user, &puid, &pgid);
       if (found && puid == geteuid() && puid == getuid())
         continue;
       syslog(LOG_ERR, "[Config] Refusing to start: zone '%s': program-user '%s' %s; a non-root "
                       "process (uid %u) cannot switch to another user. Start karidns as root, or "
                       "set program-user to the user karidns runs as.",
-             z->domain, z->program_user, found ? "differs from the running user" : "not found",
+             z->domain, zext(z)->program_user, found ? "differs from the running user" : "not found",
              (unsigned)geteuid());
       fprintf(stderr, "[ERROR] Refusing to start: zone '%s': program-user '%s' %s; a non-root "
                       "process (uid %u) cannot switch to another user. Start karidns as root, or "
                       "set program-user to the user karidns runs as.\n",
-              z->domain, z->program_user, found ? "differs from the running user" : "not found",
+              z->domain, zext(z)->program_user, found ? "differs from the running user" : "not found",
               (unsigned)geteuid());
       return false;
     }

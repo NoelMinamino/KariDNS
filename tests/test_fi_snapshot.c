@@ -8,6 +8,7 @@
 #include <stdatomic.h>
 #include "fi/kari_fi.h"
 #include "../dns_config_parser.h"
+#include "test_zext.h"
 #include "../dns_zone_parser.h"
 #include "../dns_snapshot_rcu.h"
 #include "../dns_epoch_rcu.h"

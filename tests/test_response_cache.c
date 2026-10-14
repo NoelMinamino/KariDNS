@@ -303,7 +303,7 @@ static void build_edns_mqtype_do_query(uint8_t *buf, size_t *out_len, uint16_t t
  * returned response comes from the cache (if the query is cacheable). */
 static int cached_query(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len,
                         const char *qname, uint16_t qtype, const char *client_ip, compress_ctx_t *comp_ctx,
-                        bool is_tcp, rate_limit_config_t **out_rrl_cfg, zone_db_snapshot_t *snap,
+                        bool is_tcp, const rate_limit_config_t **out_rrl_cfg, zone_db_snapshot_t *snap,
                         server_config_t *cfg, zone_db_entry_t **matched) {
     uint8_t warm[4096];
     compress_ctx_t warm_ctx = {0};

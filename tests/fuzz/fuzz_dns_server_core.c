@@ -146,7 +146,7 @@ static void query_fuzzed_zone(zone_arena_t *arena) {
             compress_ctx_t comp_ctx;
             memset(&comp_ctx, 0, sizeof(comp_ctx));
             compress_ctx_init_packet(&comp_ctx);
-            rate_limit_config_t *rrl = NULL;
+            const rate_limit_config_t *rrl = NULL;
             process_dns_query(req, off, res, sizeof(res), qname, qtype, "127.0.0.1", &comp_ctx, false, &rrl,
                               &g_fuzz_snap);
         }
@@ -234,7 +234,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         size_t qend = 0;
         parse_query_question_fast(fuzz_data, fuzz_size, qname, sizeof(qname), &qtype, &qclass, &qend);
 
-        rate_limit_config_t *rrl = NULL;
+        const rate_limit_config_t *rrl = NULL;
         bool is_tcp = (selector & 0x80) != 0;
         process_dns_query(fuzz_data, fuzz_size, res, sizeof(res), qname, qtype,
                           "127.0.0.1", &comp_ctx, is_tcp, &rrl, &g_fuzz_snap);

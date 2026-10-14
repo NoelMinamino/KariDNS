@@ -405,8 +405,8 @@ const char *resolve_ecs_subnet_tag(const zone_image_t *zone, const server_config
     const ecs_tag_def_t *tags = NULL;
     int tag_count = 0;
     if (zit.left == 0) {
-        tags = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tags : (cfg ? cfg->ecs_tags : NULL);
-        tag_count = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0);
+        tags = (zcfg && zext(zcfg)->ecs_tags) ? zext(zcfg)->ecs_tags : (cfg ? cfg->ecs_tags : NULL);
+        tag_count = (zcfg && zext(zcfg)->ecs_tags) ? zext(zcfg)->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0);
         if (!tags || tag_count == 0) return NULL;
     }
     if (!addr) return NULL;
@@ -454,8 +454,8 @@ const char *resolve_bind_location_tag(const zone_image_t *zone, const server_con
     const ecs_tag_def_t *tags = NULL;
     int tag_count = 0;
     if (zit.left == 0) {
-        tags = (zcfg && zcfg->location_tags) ? zcfg->location_tags : (cfg ? cfg->location_tags : NULL);
-        tag_count = (zcfg && zcfg->location_tags) ? zcfg->location_tag_count : (cfg ? cfg->location_tag_count : 0);
+        tags = (zcfg && zext(zcfg)->location_tags) ? zext(zcfg)->location_tags : (cfg ? cfg->location_tags : NULL);
+        tag_count = (zcfg && zext(zcfg)->location_tags) ? zext(zcfg)->location_tag_count : (cfg ? cfg->location_tag_count : 0);
         if (!tags || tag_count == 0) return NULL;
     }
 
@@ -509,17 +509,17 @@ bool is_ecs_trusted_resolver(const zone_image_t *zone, const server_config_t *cf
     const acl_entry_t *parsed = zone_image_ecs_trusted(zone, &count);
     if (parsed && count > 0) return check_acl_bin(client_ip, parsed, count);
 
-    parsed = (zcfg && zcfg->ecs_trusted_resolvers_parsed) ? zcfg->ecs_trusted_resolvers_parsed
+    parsed = (zcfg && zext(zcfg)->ecs_trusted_resolvers_parsed) ? zext(zcfg)->ecs_trusted_resolvers_parsed
                                                           : (cfg ? cfg->ecs_trusted_resolvers_parsed : NULL);
-    count = (zcfg && zcfg->ecs_trusted_resolvers_parsed) ? zcfg->ecs_trusted_resolvers_count
+    count = (zcfg && zext(zcfg)->ecs_trusted_resolvers_parsed) ? zext(zcfg)->ecs_trusted_resolvers_count
                                                          : (cfg ? cfg->ecs_trusted_resolvers_count : 0);
     if (parsed && count > 0) {
         return check_acl_bin(client_ip, parsed, count);
     }
 
-    char **resolvers = (zcfg && zcfg->ecs_trusted_resolvers) ? zcfg->ecs_trusted_resolvers
+    char **resolvers = (zcfg && zext(zcfg)->ecs_trusted_resolvers) ? zext(zcfg)->ecs_trusted_resolvers
                                                              : (cfg ? cfg->ecs_trusted_resolvers : NULL);
-    count = (zcfg && zcfg->ecs_trusted_resolvers) ? zcfg->ecs_trusted_resolvers_count
+    count = (zcfg && zext(zcfg)->ecs_trusted_resolvers) ? zext(zcfg)->ecs_trusted_resolvers_count
                                                    : (cfg ? cfg->ecs_trusted_resolvers_count : 0);
     if (!resolvers || count == 0) return false;
     return check_acl(client_ip, resolvers, count);

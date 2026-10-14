@@ -13,6 +13,7 @@
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
+#include "test_zext.h"
 #include "dns_zone_parser.h"
 #include "dns_zone_image.h"
 #include "test_image_helper.h"
@@ -251,7 +252,7 @@ static void gr_query_raw(const uint8_t *req, size_t req_len, const char *qname, 
     compress_ctx_t comp;
     memset(&comp, 0, sizeof(comp));
     compress_ctx_init_packet(&comp);
-    rate_limit_config_t *rrl_out = NULL;
+    const rate_limit_config_t *rrl_out = NULL;
     zone_db_entry_t *matched = NULL;
     int n = process_dns_query_impl(req, req_len, g_gr.res, sizeof(g_gr.res), qname, qtype,
                                    client_ip, &comp, is_tcp, &rrl_out,
@@ -738,7 +739,7 @@ static void test_sibling_zone_additional_glue_and_limits(void) {
     compress_ctx_t comp;
     memset(&comp, 0, sizeof(comp));
     compress_ctx_init_packet(&comp);
-    rate_limit_config_t *rrl_out = NULL;
+    const rate_limit_config_t *rrl_out = NULL;
     zone_db_entry_t *matched = NULL;
 
     req_t q;
@@ -1043,13 +1044,13 @@ static void test_response_header_and_error_builder(void) {
         /* forward zone without a usable forwarder: synthetic SERVFAIL, AA=0, OPT added (RFC 6891 §6.1.1) */
         zone_config_t *zc = find_zone_config_in_view(&g_gr.cfg, "__default__", "example.");
         assert(zc);
-        int saved = zc->forwarders_count;
-        zc->forwarders_count = 0;
+        int saved = zext(zc)->forwarders_count;
+        tzx(zc)->forwarders_count = 0;
         put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_opt(&q, 0, 0, 0, NULL, 0);
         ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
         check_hdr(&r, &q, 2, false, true);
         CHECK(&r, gr_count(&r, 3, 41) == 1);
-        zc->forwarders_count = saved;
+        tzx(zc)->forwarders_count = saved;
         free_server_config_fields(cfg); free(cfg);
         zone_arena_destroy(&g_gr.arena);
     }
@@ -1071,7 +1072,7 @@ static void test_udp_limit_follows_edns_size(void) {
         req_t q;
         put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 1); put_question(&q, "big.example.", 16, 1); put_opt_sz(&q, udp, NULL, 0);
         compress_ctx_t comp; memset(&comp, 0, sizeof(comp)); compress_ctx_init_packet(&comp);
-        rate_limit_config_t *rrl_out = NULL; zone_db_entry_t *matched = NULL;
+        const rate_limit_config_t *rrl_out = NULL; zone_db_entry_t *matched = NULL;
         int n = process_dns_query_impl_cap(q.b, q.n, res, sizeof(res), sizeof(res), "big.example.", 16, "192.0.2.100",
                                            &comp, false, &rrl_out, &g_gr.snap, &g_gr.cfg, &matched);
         size_t limit = udp < 512 ? 512 : udp;

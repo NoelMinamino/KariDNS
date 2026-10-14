@@ -29,13 +29,13 @@ size_t dns_rrl_slip_response(uint8_t *res, size_t res_len, size_t buf_cap);
 int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       size_t max_res_len, const char *qname, uint16_t qtype,
                       const char *client_ip, compress_ctx_t *comp_ctx,
-                      bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                      bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                       zone_db_snapshot_t *snap);
 
 int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                           size_t max_res_len, const char *qname, uint16_t qtype,
                           const char *client_ip, compress_ctx_t *comp_ctx,
-                          bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                          bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                           zone_db_snapshot_t *snap, server_config_t *cfg,
                           zone_db_entry_t **out_matched_entry);
 
@@ -44,12 +44,12 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
 int process_dns_query_cap(const uint8_t *req, size_t req_len, uint8_t *res,
                           size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
                           const char *client_ip, compress_ctx_t *comp_ctx,
-                          bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                          bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                           zone_db_snapshot_t *snap);
 int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
                                size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
                                const char *client_ip, compress_ctx_t *comp_ctx,
-                               bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                               bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                                zone_db_snapshot_t *snap, server_config_t *cfg,
                                zone_db_entry_t **out_matched_entry);
 

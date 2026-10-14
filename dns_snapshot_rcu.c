@@ -795,7 +795,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   }
 
   int count;
-  if (zcfg->file_format && strcasecmp(zcfg->file_format, "tinydns") == 0) {
+  if (zext(zcfg)->file_format && strcasecmp(zext(zcfg)->file_format, "tinydns") == 0) {
       count = parse_tinydns_data(buf, strlen(buf), z_standby, &ctx);
   } else {
       count = parse_zone_fast(buf, strlen(buf), z_standby, &ctx);
@@ -941,8 +941,8 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   rcu_aux_read_lock();
   zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
   server_config_t *active_cfg_prelink = acquire_config_snapshot();
-  additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
-                                      ? zcfg->additional_from_auth
+  additional_from_auth_t policy = (zcfg && zext(zcfg)->additional_from_auth_specified)
+                                      ? zext(zcfg)->additional_from_auth
                                       : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
   zone_glue_track_build(z_next, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
   build_zone_response_cache(z_next, active_cfg_prelink, entry->view_name, entry->domain);
@@ -1487,15 +1487,15 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     }
                 }
             }
-            bool has_master = catalog_cfg && catalog_cfg->masters_count > 0 && catalog_cfg->masters[0].ip != NULL;
-            if (has_master || (catalog_cfg && catalog_cfg->tsig_key)) {
+            bool has_master = catalog_cfg && zext(catalog_cfg)->masters_count > 0 && zext(catalog_cfg)->masters[0].ip != NULL;
+            if (has_master || (catalog_cfg && zext(catalog_cfg)->tsig_key)) {
                 entry->catalog_master = calloc(1, sizeof(*entry->catalog_master));
                 if (entry->catalog_master && has_master) {
-                    strncpy(entry->catalog_master->ip, catalog_cfg->masters[0].ip, sizeof(entry->catalog_master->ip) - 1);
-                    entry->catalog_master->port = catalog_cfg->masters[0].port;
+                    strncpy(entry->catalog_master->ip, zext(catalog_cfg)->masters[0].ip, sizeof(entry->catalog_master->ip) - 1);
+                    entry->catalog_master->port = zext(catalog_cfg)->masters[0].port;
                 }
-                if (entry->catalog_master && catalog_cfg->tsig_key)
-                    strncpy(entry->catalog_master->tsig_key, catalog_cfg->tsig_key, sizeof(entry->catalog_master->tsig_key) - 1);
+                if (entry->catalog_master && zext(catalog_cfg)->tsig_key)
+                    strncpy(entry->catalog_master->tsig_key, zext(catalog_cfg)->tsig_key, sizeof(entry->catalog_master->tsig_key) - 1);
             }
             atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
             new_entries[actual_added_count++] = entry;

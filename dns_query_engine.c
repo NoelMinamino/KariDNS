@@ -799,8 +799,8 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     }
 
     // ==== フェーズ1: 委任判定 ====
-    additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
-                                        ? zcfg->additional_from_auth
+    additional_from_auth_t policy = (zcfg && zext(zcfg)->additional_from_auth_specified)
+                                        ? zext(zcfg)->additional_from_auth
                                         : (cfg ? cfg->additional_from_auth : ADDITIONAL_AUTH_YES);
     bool is_ds_query = (num_qtypes > 0 && qtypes[0] == 43);
     if (find_delegation(img, current_qname, db_entry->domain, res,
@@ -1598,14 +1598,15 @@ STATIC_TEST uint32_t remaining_ms(int64_t deadline) {
 }
 
 void compute_program_zone_fingerprint(const zone_config_t *z, char *out, size_t out_cap) {
+  const zone_ext_t *x = zext(z);
   size_t pos = 0;
   pos += (size_t)snprintf(out + pos, out_cap - pos, "path=%s|user=%s|timeout=%u|maxfail=%u|disable_tc=%d|args=",
-                          z->program_path ? z->program_path : "",
-                          z->program_user ? z->program_user : "",
-                          z->program_timeout_ms, z->program_max_failures,
-                          z->disable_auto_tc_flag ? 1 : 0);
-  for (int i = 0; i < z->program_args_count && pos < out_cap; i++) {
-    pos += (size_t)snprintf(out + pos, out_cap - pos, "%s;", z->program_args[i]);
+                          x->program_path ? x->program_path : "",
+                          x->program_user ? x->program_user : "",
+                          x->program_timeout_ms, x->program_max_failures,
+                          x->disable_auto_tc_flag ? 1 : 0);
+  for (int i = 0; i < x->program_args_count && pos < out_cap; i++) {
+    pos += (size_t)snprintf(out + pos, out_cap - pos, "%s;", x->program_args[i]);
   }
 }
 
@@ -1951,7 +1952,8 @@ _Thread_local static uint8_t s_forward_res_buf[65535];
 
 STATIC_TEST int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t req_len,
                                  uint8_t *res, size_t max_res_len) {
-  if (req_len < DNS_HEADER_SIZE || zcfg->forwarders_count == 0) {
+  const zone_ext_t *x = zext(zcfg);
+  if (req_len < DNS_HEADER_SIZE || x->forwarders_count == 0) {
     return build_synthetic_servfail(req, req_len, res, max_res_len);
   }
   if (req_len > sizeof(s_forward_req_buf)) {
@@ -1960,7 +1962,7 @@ STATIC_TEST int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, s
 
   // H-3: 1クエリ全体で共有する絶対締切。以降の全I/O呼び出しは
   // 各フォワーダーにフル分与せず、この締切までの残り時間を使う。
-  uint32_t total_budget = zcfg->forward_timeout_ms > 0 ? zcfg->forward_timeout_ms : 2000;
+  uint32_t total_budget = x->forward_timeout_ms > 0 ? x->forward_timeout_ms : 2000;
   int64_t deadline = monotonic_ms() + total_budget;
 
   memcpy(s_forward_req_buf, req, req_len);
@@ -1968,7 +1970,7 @@ STATIC_TEST int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, s
   s_forward_req_buf[0] = fresh_id >> 8;
   s_forward_req_buf[1] = fresh_id & 0xFF;
 
-  for (int i = 0; i < zcfg->forwarders_count; i++) {
+  for (int i = 0; i < x->forwarders_count; i++) {
     uint32_t rem = remaining_ms(deadline);
     if (rem == 0) {
       syslog(LOG_WARNING, "[Forward] zone '%s': total timeout budget (%ums) expired; stopping forwarder loop",
@@ -1976,7 +1978,7 @@ STATIC_TEST int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, s
       break;
     }
 
-    ip_port_t *fwd = &zcfg->forwarders[i];
+    ip_port_t *fwd = &x->forwarders[i];
     struct sockaddr_storage ss;
     size_t ss_len = resolve_ip_port_to_sockaddr(fwd->ip, fwd->port, &ss);
     if (ss_len == 0) {
@@ -1994,7 +1996,7 @@ STATIC_TEST int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, s
 
     /* D-20: 残り時間を、まだ試していないフォワーダー (このフォワーダーを含む) で等分する。
      * 最初のフォワーダーが応答しなくても、後ろのフォワーダーに時間が残る。 */
-    uint32_t share = rem / (uint32_t)(zcfg->forwarders_count - i);
+    uint32_t share = rem / (uint32_t)(x->forwarders_count - i);
     if (share == 0) share = 1;
     int64_t fwd_deadline = monotonic_ms() + share;
 
@@ -2079,12 +2081,13 @@ STATIC_TEST int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, s
     return (int)copy_len;
   }
 
-  syslog(LOG_ERR, "[Forward] zone '%s': all %d forwarder(s) failed or timed out", zcfg->domain, zcfg->forwarders_count);
+  syslog(LOG_ERR, "[Forward] zone '%s': all %d forwarder(s) failed or timed out", zcfg->domain, x->forwarders_count);
   return build_synthetic_servfail(req, req_len, res, max_res_len);
 }
 
 bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, program_plugin_t *out) {
-  if (!zcfg->program_path) {
+  const zone_ext_t *x = zext(zcfg);
+  if (!x->program_path) {
     syslog(LOG_ERR, "[Plugin] zone '%s' program_path is NULL; refusing to spawn", zcfg->domain);
     return false;
   }
@@ -2092,7 +2095,7 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, progra
   /* program-user は fork 前に解決する (O-18: fork した子で getpwnam() を呼ばない) */
   uid_t prog_uid = (uid_t)-1;
   gid_t prog_gid = (gid_t)-1;
-  bool prog_user_found = zcfg->program_user && lookup_user_ids(zcfg->program_user, &prog_uid, &prog_gid);
+  bool prog_user_found = x->program_user && lookup_user_ids(x->program_user, &prog_uid, &prog_gid);
 
   int in_pipe[2];  // parent(karidns) write -> child(script) stdin
   int out_pipe[2]; // child(script) stdout -> parent(karidns) read
@@ -2133,14 +2136,14 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, progra
     // H-1適用に伴う必須フェイルセーフ:
     // program-user未設定のままrootでexecされることを、main()の
     // 「root起動でuser/group未設定なら拒否する」既存ポリシーと同様に禁止する。
-    if (!zcfg->program_user && geteuid() == 0) {
+    if (!x->program_user && geteuid() == 0) {
       // 標準エラーはまだ生きている(closefromはSTDERR_FILENO+1から)ので出力可能
       fprintf(stderr, "[FATAL] Zone '%s': 'program-user' is not set and karidns is running "
               "as root; refusing to exec plugin as root.\n", zcfg->domain);
       _exit(125);
     }
 
-    if (zcfg->program_user) {
+    if (x->program_user) {
       if (!prog_user_found) { _exit(126); }
       if (geteuid() == 0) {
         if (setgroups(0, NULL) != 0) _exit(126);
@@ -2150,19 +2153,19 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, progra
         // 非root起動では別ユーザーへ切り替えられない。main()の起動前検証
         // (validate_program_zone_users) で弾かれるはずだが念のため fail-closed。
         fprintf(stderr, "[FATAL] Zone '%s': program-user '%s' differs from the non-root user "
-                "karidns runs as; refusing to exec plugin.\n", zcfg->domain, zcfg->program_user);
+                "karidns runs as; refusing to exec plugin.\n", zcfg->domain, x->program_user);
         _exit(126);
       }
     }
 
     char *argv[64];
     int ai = 0;
-    argv[ai++] = (char *)zcfg->program_path;
-    for (int i = 0; i < zcfg->program_args_count && ai < 63; i++)
-      argv[ai++] = zcfg->program_args[i];
+    argv[ai++] = (char *)x->program_path;
+    for (int i = 0; i < x->program_args_count && ai < 63; i++)
+      argv[ai++] = x->program_args[i];
     argv[ai] = NULL;
 
-    execv(zcfg->program_path, argv);
+    execv(x->program_path, argv);
     _exit(127);
   }
 
@@ -2191,15 +2194,15 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, progra
   out->stdin_fd = in_pipe[1];
   out->stdout_fd = out_pipe[0];
   pthread_mutex_init(&out->lock, NULL);
-  out->timeout_ms = zcfg->program_timeout_ms > 0 ? zcfg->program_timeout_ms : 2000;
-  out->max_failures = zcfg->program_max_failures > 0 ? zcfg->program_max_failures : 5;
-  out->disable_auto_tc_flag = zcfg->disable_auto_tc_flag;
+  out->timeout_ms = x->program_timeout_ms > 0 ? x->program_timeout_ms : 2000;
+  out->max_failures = x->program_max_failures > 0 ? x->program_max_failures : 5;
+  out->disable_auto_tc_flag = x->disable_auto_tc_flag;
   compute_program_zone_fingerprint(zcfg, out->config_fingerprint, sizeof(out->config_fingerprint));
   atomic_init(&out->consecutive_failures, 0);
   atomic_init(&out->dead, false);
 
   syslog(LOG_INFO, "[Plugin] Spawned program zone '%s' -> pid=%d exec='%s'",
-         zcfg->domain, pid, zcfg->program_path);
+         zcfg->domain, pid, x->program_path);
   return true;
 }
 
@@ -2229,12 +2232,13 @@ void spawn_program_zone_plugins(server_config_t *cfg) {
   for (view_config_t *v = cfg->views; v; v = v->next) {
     for (zone_config_t *z = v->zones; z; z = z->next) {
       if (!z->type || strcasecmp(z->type, "program") != 0) continue;
-      if (!z->program_path) {
+      if (!zext(z)->program_path) {
         syslog(LOG_ERR, "[Plugin] zone '%s' has type program but no 'program' path set; skipping (will SERVFAIL)", z->domain);
         continue;
       }
-      if (!z->program_user && cfg->user) {
-        z->program_user = strdup(cfg->user);
+      if (!zext(z)->program_user && cfg->user) {
+        zone_ext_t *zx = zone_ext_mut(z);
+        if (zx) zx->program_user = strdup(cfg->user);
       }
       if (spawn_one_program_plugin(z, v->name, &g_program_plugins[idx])) idx++;
     }
@@ -2443,8 +2447,8 @@ void build_zone_response_cache(zone_version_t *arena, server_config_t *cfg, cons
   // O-07: 同じゾーン名が別の view にもあるので、このエントリの view の設定を見る
   zone_config_t *zcfg = cfg ? find_zone_config_in_view(cfg, view_name, domain) : NULL;
   if (zcfg) {
-    if (zcfg->location_tags != NULL && zcfg->location_tag_count > 0) return;
-    if (zcfg->ecs_tags != NULL && zcfg->ecs_tag_count > 0) return;
+    if (zext(zcfg)->location_tags != NULL && zext(zcfg)->location_tag_count > 0) return;
+    if (zext(zcfg)->ecs_tags != NULL && zext(zcfg)->ecs_tag_count > 0) return;
     if (zcfg->type && strcasecmp(zcfg->type, "master") != 0 && strcasecmp(zcfg->type, "primary") != 0 &&
         strcasecmp(zcfg->type, "slave") != 0 && strcasecmp(zcfg->type, "secondary") != 0) return;
   }
@@ -2480,7 +2484,7 @@ static int add_opt_to_bare_passthrough(uint8_t *res, size_t max_res_len, int len
 int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                             size_t max_res_len, const char *qname, uint16_t qtype,
                             const char *client_ip, compress_ctx_t *comp_ctx,
-                            bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                            bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                             zone_db_snapshot_t *snap, server_config_t *cfg,
                             zone_db_entry_t **out_matched_entry) {
   return process_dns_query_impl_cap(req, req_len, res, max_res_len, 0, qname, qtype, client_ip, comp_ctx,
@@ -2490,7 +2494,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
 static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
                               size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
                               const char *client_ip, compress_ctx_t *comp_ctx,
-                              bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                              bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                               zone_db_snapshot_t *snap, server_config_t *cfg,
                               zone_db_entry_t **out_matched_entry, tsig_request_t *tsig);
 
@@ -2502,7 +2506,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
                                size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
                                const char *client_ip, compress_ctx_t *comp_ctx,
-                               bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                               bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                                zone_db_snapshot_t *snap, server_config_t *cfg,
                                zone_db_entry_t **out_matched_entry) {
   t_query_rrl_info.zone = NULL; /* D-05: 早い段階で返す応答 (エラー) のために先に消す */
@@ -2542,7 +2546,7 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
 static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
                               size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
                               const char *client_ip, compress_ctx_t *comp_ctx,
-                              bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                              bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                               zone_db_snapshot_t *snap, server_config_t *cfg,
                               zone_db_entry_t **out_matched_entry, tsig_request_t *tsig) {
   char current_qname[DNS_NAME_TEXT_SIZE];
@@ -2574,8 +2578,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   t_query_rrl_info.wildcard = false;
   if (out_rrl_cfg) {
     *out_rrl_cfg = cfg ? &cfg->rrl : NULL;
-    if (matched_zcfg && matched_zcfg->rrl.configured) {
-      *out_rrl_cfg = &matched_zcfg->rrl;
+    if (matched_zcfg && zext(matched_zcfg)->rrl.configured) {
+      *out_rrl_cfg = &zext(matched_zcfg)->rrl;
     }
   }
   
@@ -2600,8 +2604,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   /* udp-bufsize / zone-udp-bufsize: UDP 応答サイズの上限であり、OPT で通知する値。
    * 範囲はパーサで 512..4096 に制限済み (呼び出し側の UDP 応答バッファは >= 4096)。 */
-  if (matched_zcfg && matched_zcfg->zone_udp_bufsize > 0)
-    edns.server_udp_size = matched_zcfg->zone_udp_bufsize;
+  if (matched_zcfg && zext(matched_zcfg)->zone_udp_bufsize > 0)
+    edns.server_udp_size = zext(matched_zcfg)->zone_udp_bufsize;
   else if (cfg && cfg->udp_bufsize > 0)
     edns.server_udp_size = cfg->udp_bufsize;
 
@@ -2740,17 +2744,18 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     bool auth = false;
     if (db_entry && view) {
       zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
-      if (zcfg && zcfg->masters_count > 0) {
+      const zone_ext_t *zx = zext(zcfg);
+      if (zcfg && zx->masters_count > 0) {
         bool from_master = false;
-        for (int k = 0; k < zcfg->masters_count; k++) {
-          if (zcfg->masters_parsed ? cidr_entry_match_str(&zcfg->masters_parsed[k], client_ip)
-                                   : match_cidr(client_ip, zcfg->masters[k].ip)) {
+        for (int k = 0; k < zx->masters_count; k++) {
+          if (zx->masters_parsed ? cidr_entry_match_str(&zx->masters_parsed[k], client_ip)
+                                   : match_cidr(client_ip, zx->masters[k].ip)) {
             from_master = true;
             break;
           }
         }
-        bool key_ok = !(zcfg->tsig_key && zcfg->tsig_key[0] != '\0') ||
-                      (tkey && tsig_key_names_equal(tkey->name, zcfg->tsig_key));
+        bool key_ok = !(zx->tsig_key && zx->tsig_key[0] != '\0') ||
+                      (tkey && tsig_key_names_equal(tkey->name, zx->tsig_key));
         auth = from_master && key_ok;
       }
     }
@@ -2822,16 +2827,17 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
           zone_is_master = true;
         }
       }
-      if (zcfg && zcfg->allow_update_count > 0) {
-        if (zcfg->allow_update_parsed) {
-          if (check_acl_bin(client_ip, zcfg->allow_update_parsed, zcfg->allow_update_count)) {
+      const zone_ext_t *zu = zext(zcfg);
+      if (zcfg && zu->allow_update_count > 0) {
+        if (zu->allow_update_parsed) {
+          if (check_acl_bin(client_ip, zu->allow_update_parsed, zu->allow_update_count)) {
             auth = true;
           }
-        } else if (check_acl(client_ip, zcfg->allow_update, zcfg->allow_update_count)) {
+        } else if (check_acl(client_ip, zu->allow_update, zu->allow_update_count)) {
           auth = true;
         }
-        for (int i = 0; !auth && tkey && i < zcfg->allow_update_count; i++) {
-          if (tsig_key_names_equal(tkey->name, zcfg->allow_update[i])) auth = true;
+        for (int i = 0; !auth && tkey && i < zu->allow_update_count; i++) {
+          if (tsig_key_names_equal(tkey->name, zu->allow_update[i])) auth = true;
         }
       }
     }
@@ -2981,7 +2987,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     server_config_t *cfg_lookup = cfg;
     zone_config_t *zcfg = find_zone_config_in_view(cfg_lookup, view->name, db_entry->domain);
     if (zcfg && zcfg->type && strcasecmp(zcfg->type, "program") == 0) {
-      rate_limit_config_t *rrl = zcfg->rrl.configured ? &zcfg->rrl : (cfg ? &cfg->rrl : NULL);
+      const rate_limit_config_t *rrl = zext(zcfg)->rrl.configured ? &zext(zcfg)->rrl : (cfg ? &cfg->rrl : NULL);
       if (!is_tcp && rrl && rrl->configured && rrl->early_drop) {
         struct sockaddr_storage ss;
         if (resolve_ip_port_to_sockaddr(client_ip, 0, &ss) > 0) {
@@ -3259,7 +3265,7 @@ STATIC_TEST void record_observatory_response(zone_db_entry_t *entry, uint8_t rco
 int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       size_t max_res_len, const char *qname, uint16_t qtype,
                       const char *client_ip, compress_ctx_t *comp_ctx,
-                      bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                      bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                       zone_db_snapshot_t *snap) {
   return process_dns_query_cap(req, req_len, res, max_res_len, 0, qname, qtype, client_ip, comp_ctx,
                                is_tcp, out_rrl_cfg, snap);
@@ -3268,7 +3274,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 int process_dns_query_cap(const uint8_t *req, size_t req_len, uint8_t *res,
                           size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
                           const char *client_ip, compress_ctx_t *comp_ctx,
-                          bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                          bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                           zone_db_snapshot_t *snap) {
   server_config_t *cfg = acquire_config_snapshot();
   zone_db_entry_t *matched_entry = NULL;

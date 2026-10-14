@@ -7,6 +7,7 @@
 
 #include "../dns_wire.h"
 #include "../dns_config_parser.h"
+#include "test_zext.h"
 #include "../dns_zone_parser.h"
 #include "../dns_utils.h"
 
@@ -459,13 +460,13 @@ static void test_config_file_format(void) {
     TEST_ASSERT(z1 != NULL, "Zone 1 exists");
     if (z1) {
         TEST_ASSERT(strcmp(z1->domain, "example.com.") == 0, "Zone 1 domain");
-        TEST_ASSERT(z1->file_format != NULL && strcmp(z1->file_format, "tinydns") == 0, "Zone 1 file-format is tinydns");
+        TEST_ASSERT(zext(z1)->file_format != NULL && strcmp(zext(z1)->file_format, "tinydns") == 0, "Zone 1 file-format is tinydns");
         
         zone_config_t *z2 = z1->next;
         TEST_ASSERT(z2 != NULL, "Zone 2 exists");
         if (z2) {
             TEST_ASSERT(strcmp(z2->domain, "bind.example.") == 0, "Zone 2 domain");
-            TEST_ASSERT(z2->file_format != NULL && strcmp(z2->file_format, "bind") == 0, "Zone 2 file-format is bind");
+            TEST_ASSERT(zext(z2)->file_format != NULL && strcmp(zext(z2)->file_format, "bind") == 0, "Zone 2 file-format is bind");
         }
     }
 

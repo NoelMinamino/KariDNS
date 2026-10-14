@@ -80,11 +80,12 @@ typedef struct {
 #define IXFR_HISTORY_DEFAULT 4
 #define IXFR_HISTORY_MAX 32
 
-typedef struct zone_config {
-  char *domain;
-  char *file;
-  char *type;
-  bool is_catalog;
+/* S6a: ゾーンごとの「まれに指定する」オプション。ほとんどのゾーン (domain/file/type だけの
+ * 主ゾーン) では 1 つも指定しないので、zone_config_t は核だけを持ち、ここに挙げた値は
+ * 1 つでも指定したゾーンに限って別のブロックに確保する (zone_config_t.ext)。
+ * ext == NULL は「全部既定 (ゼロ)」。読み手は必ず zext(z) 経由で読むこと。
+ * 書き手 (パーサ、テスト) は zone_ext_mut(z) で確保してから書く。 */
+typedef struct zone_ext {
   ip_port_t *masters;
   int masters_count;
   cidr_entry_t *masters_parsed;
@@ -153,9 +154,30 @@ typedef struct zone_config {
 
   bool ixfr_history_set;     /* ixfr-history をこのゾーンで指定した */
   uint8_t ixfr_history;      /* その値 (0..IXFR_HISTORY_MAX) */
+} zone_ext_t;
 
+typedef struct zone_config {
+  char *domain;
+  char *file;
+  char *type;
+  bool is_catalog;
+  zone_ext_t *ext; /* NULL = 全オプション既定。直接読まず zext() を使う */
   struct zone_config *next;
 } zone_config_t;
+
+/* 全オプション既定 (全ゼロ) の共有ブロック。読み取り専用 */
+extern const zone_ext_t zone_ext_default;
+
+/* ゾーンのオプションブロック。ext == NULL (または zone_config_t をゼロ初期化しただけ) でも
+ * 既定値を返すので NULL チェックは要らない。共有の既定ブロックを返す設計にしなかったのは、
+ * calloc しただけのゾーン (テスト、ファザー) でも正しく読め、書き込みが共有ブロックに
+ * 届く事故が型 (const) で防げるため。 */
+static inline const zone_ext_t *zext(const zone_config_t *z) {
+  return z && z->ext ? z->ext : &zone_ext_default;
+}
+
+/* 書き込み用。無ければ確保する (メモリ不足は NULL)。パースとテストだけが呼ぶ */
+zone_ext_t *zone_ext_mut(zone_config_t *z);
 
 
 typedef struct log_channel {
@@ -241,8 +263,9 @@ typedef struct server_config_s {
   char *group;
   char *pid_file;
   view_config_t *views;
-  zone_config_t *zones; /* 所有権を持たない参照専用フラットリスト。ビュー内ゾーンへのポインタを共有しており、フィールド書き込みや free_zone_config() は絶対に行わないこと */
-  bool zones_are_flat;  /* zones が参照専用フラットリストであるかどうかの追跡フラグ */
+  zone_config_t *zones; /* パース中のトップレベル zone のリスト。パースが終わると既定の view に移るので、パース済みの設定では NULL。
+                         * 手で組んだ設定 (テスト) では views を持たずにここへ並べる。全ビューのゾーンを引くには config_find_zone_any_view()、
+                         * 順に見るには views の zones を辿る (S6a: ゾーン構造体を複製したフラットリストは廃止) */
   zone_cfg_index_t top_zone_index; /* パース中のトップレベル zone の索引。既定の view に移す */
   tsig_key_t *keys;
   acl_def_t *acls;
@@ -337,6 +360,12 @@ int zone_cfg_index_insert(zone_cfg_index_t *ix, zone_config_t *z, zone_config_t 
 void zone_cfg_index_free(zone_cfg_index_t *ix);
 /* view 内で domain (末尾ドットの有無、大文字小文字は問わない) のゾーン設定。索引が無ければ線形探索 */
 zone_config_t *view_find_zone_config(const view_config_t *v, const char *domain);
+/* 全ビューのゾーンを、ビューの並び順・ビュー内の並び順で辿る。内側のループだけを抜ける break は使えない */
+#define CONFIG_FOR_EACH_ZONE(cfg, v, z) \
+  for ((v) = (cfg)->views; (v); (v) = (v)->next) \
+    for ((z) = (v)->zones; (z); (z) = (z)->next)
+/* 全ビューを順に見て、最初に domain と一致したゾーン設定 (ビューが無い手組みの設定では cfg->zones から) */
+zone_config_t *config_find_zone_any_view(const server_config_t *cfg, const char *domain);
 /* zone (NULL 可) の NOTIFY 再送の設定を、options の値で補って返す */
 notify_retry_config_t notify_retry_effective(const server_config_t *cfg, const zone_config_t *zone);
 /* The IXFR history depth of a zone: its own ixfr-history, else the options value, else IXFR_HISTORY_DEFAULT (zone/cfg may be NULL). */

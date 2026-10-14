@@ -14,6 +14,7 @@
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
+#include "test_zext.h"
 #include "dns_zone_parser.h"
 #include "dns_zone_image.h"
 #include "test_image_helper.h"
@@ -301,7 +302,7 @@ static int sw_run(const uint8_t *req, size_t req_len, size_t max_res, const char
     static compress_ctx_t comp;
     static bool comp_init;
     if (!comp_init) { compress_ctx_init(&comp); comp_init = true; }
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_entry_t *matched = NULL;
     g_calls++;
     int n = process_dns_query_impl(req, req_len, g_res, max_res, qname, qtype, client_ip,
@@ -828,10 +829,10 @@ static void test_forward_zone_scenarios(void) {
     }
     /* invalid inputs */
     assert(dispatch_forward_zone(z1, req, 5, res, sizeof(res)) == 0);
-    int saved = z1->forwarders_count; z1->forwarders_count = 0;
+    int saved = zext(z1)->forwarders_count; tzx(z1)->forwarders_count = 0;
     size_t len = sw_build(req, 1, 1, 0, "www.fwd.test.", 1, 1, 0);
     assert(dispatch_forward_zone(z1, req, len, res, sizeof(res)) > 0);
-    z1->forwarders_count = saved;
+    tzx(z1)->forwarders_count = saved;
     g_broker_fail = 1;
     assert(dispatch_forward_zone(z1, req, len, res, sizeof(res)) > 0);
     struct sockaddr_storage ss; size_t sl = resolve_ip_port_to_sockaddr("127.0.0.1", g_fw_port, &ss);
@@ -971,7 +972,7 @@ static void test_program_zone_emulated(void) {
     close(p[1]);
     zone_config_t z; memset(&z, 0, sizeof(z));
     char *args[] = { "a", "b" };
-    z.program_path = "/bin/true"; z.program_args = args; z.program_args_count = 2;
+    tzx(&z)->program_path = "/bin/true"; tzx(&z)->program_args = args; tzx(&z)->program_args_count = 2;
     char fp[64];
     compute_program_zone_fingerprint(&z, fp, sizeof(fp));
     compute_program_zone_fingerprint(&z, fp, 20);
@@ -1933,8 +1934,8 @@ static void test_ecs_cookie_rrl_dnstap_edges(void) {
             za.bind_location_tags = where == 0 ? zt : NULL; za.bind_location_tag_count = where == 0 ? n1 : 0;
             cfg.ecs_tags = where == 1 ? ct : NULL; cfg.ecs_tag_count = where == 1 ? n2 : 0;
             cfg.location_tags = where == 1 ? ct : NULL; cfg.location_tag_count = where == 1 ? n2 : 0;
-            zc.ecs_tags = where == 2 ? ft : NULL; zc.ecs_tag_count = where == 2 ? n3 : 0;
-            zc.location_tags = where == 2 ? ft : NULL; zc.location_tag_count = where == 2 ? n3 : 0;
+            tzx(&zc)->ecs_tags = where == 2 ? ft : NULL; tzx(&zc)->ecs_tag_count = where == 2 ? n3 : 0;
+            tzx(&zc)->location_tags = where == 2 ? ft : NULL; tzx(&zc)->location_tag_count = where == 2 ? n3 : 0;
             for (int f = 0; f < 4; f++) {
                 uint8_t sc = 0;
                 const uint8_t *ad = f == 1 ? a6 : (f == 2 ? a4b : a4);
@@ -1960,8 +1961,8 @@ static void test_ecs_cookie_rrl_dnstap_edges(void) {
         za.bind_ecs_trusted_resolvers = NULL; za.bind_ecs_trusted_resolver_count = 0; za.bind_ecs_trusted_resolvers_parsed = NULL;
         if (mode == 0) { za.bind_ecs_trusted_resolvers = tr; za.bind_ecs_trusted_resolver_count = 3; za.bind_ecs_trusted_resolvers_parsed = trp; }
         if (mode == 1) { za.bind_ecs_trusted_resolvers = tr; za.bind_ecs_trusted_resolver_count = 3; }
-        if (mode == 2) { zc.ecs_trusted_resolvers = tr; zc.ecs_trusted_resolvers_count = 3; zc.ecs_trusted_resolvers_parsed = trp; }
-        if (mode == 3) { zc.ecs_trusted_resolvers = tr; zc.ecs_trusted_resolvers_count = 4; }
+        if (mode == 2) { tzx(&zc)->ecs_trusted_resolvers = tr; tzx(&zc)->ecs_trusted_resolvers_count = 3; tzx(&zc)->ecs_trusted_resolvers_parsed = trp; }
+        if (mode == 3) { tzx(&zc)->ecs_trusted_resolvers = tr; tzx(&zc)->ecs_trusted_resolvers_count = 4; }
         if (mode == 4) { cfg.ecs_trusted_resolvers = tr; cfg.ecs_trusted_resolvers_count = 3; cfg.ecs_trusted_resolvers_parsed = trp; }
         if (mode == 5) { cfg.ecs_trusted_resolvers = tr; cfg.ecs_trusted_resolvers_count = 3; }
         for (size_t i = 0; i < NELEM(ips); i++) {

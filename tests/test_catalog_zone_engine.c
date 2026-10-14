@@ -11,6 +11,7 @@
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
+#include "test_zext.h"
 #include "dns_zone_parser.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_catalog_zone.h"

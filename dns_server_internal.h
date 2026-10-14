@@ -443,6 +443,8 @@ typedef struct {
   server_config_t config_a;
   server_config_t config_b;
   uint64_t retire_epoch;
+  bool standby_pending; /* 退いた設定 (standby) がまだ確保されている。制御スレッドだけが読み書きする */
+  uint64_t standby_freed;  /* 解放した退いた設定の数 (テスト用の計数) */
 } config_rcu_t;
 
 extern config_rcu_t g_config_db;
@@ -498,6 +500,9 @@ typedef struct {
 extern _Atomic int g_xfers_running;
 
 server_config_t *acquire_config_snapshot(void);
+/* 退いた設定 (standby) を、読み手が全員抜けていれば解放する。wait なら最大 10 秒待つ。
+ * 解放した (または解放するものが無い) とき true。制御スレッド専用 */
+bool config_standby_reap(bool wait);
 void release_config_snapshot(server_config_t *snap);
 zone_db_snapshot_t *acquire_zone_snapshot(void);
 void retain_zone_snapshot(zone_db_snapshot_t *snap);

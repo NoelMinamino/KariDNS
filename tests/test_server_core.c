@@ -32,6 +32,7 @@
 #include "dns_wire.h"
 #include "dns_zone_parser.h"
 #include "dns_config_parser.h"
+#include "test_zext.h"
 #include "dns_utils.h"
 #include "dns_query_engine.h"
 #include "dns_edns_ecs.h"
@@ -1531,9 +1532,9 @@ static void test_tcp_listen_and_zone_socket_opts(void) {
     /* zone A sets everything; the MSS only goes further down */
     zone_config_t za;
     memset(&za, 0, sizeof(za));
-    za.zone_tcp_mss = 1000;
-    za.zone_tcp_window = 512 * 1024;
-    za.zone_tcp_sndbuf = 1024 * 1024;
+    tzx(&za)->zone_tcp_mss = 1000;
+    tzx(&za)->zone_tcp_window = 512 * 1024;
+    tzx(&za)->zone_tcp_sndbuf = 1024 * 1024;
     int orig_snd = sockopt_int(sfd, SOL_SOCKET, SO_SNDBUF);
     int orig_rcv = sockopt_int(sfd, SOL_SOCKET, SO_RCVBUF);
     apply_zone_tcp_opts(sfd, c, &za);
@@ -1550,7 +1551,7 @@ static void test_tcp_listen_and_zone_socket_opts(void) {
     /* zone B has no zone-tcp-*: buffers go back to the pre-zone values, MSS stays lowered */
     zone_config_t zb;
     memset(&zb, 0, sizeof(zb));
-    zb.zone_tcp_mss = 1300;
+    tzx(&zb)->zone_tcp_mss = 1300;
     apply_zone_tcp_opts(sfd, c, &zb);
     assert(c->applied_mss == 1000);
     assert(c->applied_rcvbuf == 0 && c->applied_sndbuf == 0);
@@ -1560,7 +1561,7 @@ static void test_tcp_listen_and_zone_socket_opts(void) {
     /* only zone-tcp-sndbuf on zone C; a query outside any configured zone (NULL) resets it */
     zone_config_t zc;
     memset(&zc, 0, sizeof(zc));
-    zc.zone_tcp_sndbuf = 2 * 1024 * 1024;
+    tzx(&zc)->zone_tcp_sndbuf = 2 * 1024 * 1024;
     apply_zone_tcp_opts(sfd, c, &zc);
     assert(c->applied_sndbuf == 2 * 1024 * 1024 && c->applied_rcvbuf == 0);
     apply_zone_tcp_opts(sfd, c, NULL);
@@ -2015,13 +2016,13 @@ static void nonroot_startup_checks(void) {
     char zuser_other[] = "root";
     zone.domain = zdomain;
     zone.type = ztype;
-    zone.program_user = zuser_other;
+    tzx(&zone)->program_user = zuser_other;
     view.zones = &zone;
     cfg.views = &view;
     assert(!validate_program_zone_users(&cfg));
-    zone.program_user = myname;
+    tzx(&zone)->program_user = myname;
     assert(validate_program_zone_users(&cfg));
-    zone.program_user = NULL;
+    tzx(&zone)->program_user = NULL;
     assert(validate_program_zone_users(&cfg));
 
     /* 1024未満のポートは非rootでは bind できず、起動前検証で拒否される */
@@ -2326,11 +2327,11 @@ static void test_broker_connect_opts_and_xfr_tcp_sockopts(void) {
     assert(o.mss == 1400 && o.rcvbuf == 256 * 1024 && o.sndbuf == 256 * 1024);
     zone_config_t z;
     memset(&z, 0, sizeof(z));
-    z.zone_tcp_window = 1024 * 1024;
+    tzx(&z)->zone_tcp_window = 1024 * 1024;
     o = xfr_tcp_sockopts(&cfg, &z);
     assert(o.mss == 1400 && o.rcvbuf == 1024 * 1024 && o.sndbuf == 256 * 1024);
-    z.zone_tcp_mss = 1200;
-    z.zone_tcp_sndbuf = 128 * 1024;
+    tzx(&z)->zone_tcp_mss = 1200;
+    tzx(&z)->zone_tcp_sndbuf = 128 * 1024;
     o = xfr_tcp_sockopts(&cfg, &z);
     assert(o.mss == 1200 && o.rcvbuf == 1024 * 1024 && o.sndbuf == 128 * 1024);
 
@@ -2985,6 +2986,42 @@ static void test_perform_config_reload_added_zone(void) {
     assert(rl_zone_serial("a.reload.test.") == 2);
     rl_cleanup();
     printf("  -> config reload added zone passed.\n");
+}
+
+/* S6a: the configuration retired by a reload is freed once its readers are gone (no standby kept until the next reload) */
+static void test_perform_config_reload_frees_retired_config(void) {
+    printf("[TEST] Server Core: perform_config_reload frees the retired configuration (S6a)...\n");
+    rl_setup();
+    assert(rl_reload(true, false, false) == CONFIG_RELOAD_OK);
+    /* a reader that entered after the first publish still sees the second one's predecessor: its grace period
+     * is not over, so the retired configuration must stay intact until the reader leaves */
+    rcu_aux_read_lock();
+    server_config_t *held = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+    assert(held != NULL && held->views != NULL);
+    assert(rl_reload(true, true, false) == CONFIG_RELOAD_OK);
+    assert(held != atomic_load_explicit(&g_config_db.active, memory_order_acquire));
+    assert(g_config_db.standby_pending);
+    assert(!config_standby_reap(false));
+    assert(held->views != NULL && held->views->zones != NULL); /* still valid for the reader */
+    rcu_aux_read_unlock();
+    uint64_t freed0 = g_config_db.standby_freed;
+    assert(config_standby_reap(false));
+    assert(!g_config_db.standby_pending && g_config_db.standby_freed == freed0 + 1);
+    assert(held->views == NULL && held->keys == NULL && held->logging.channels == NULL);
+
+    /* repeated reloads: one retired configuration per reload, each freed by the next reload or by the reaper */
+    for (int i = 0; i < 100; i++) {
+        assert(rl_reload(true, (i & 1) != 0, false) == CONFIG_RELOAD_OK);
+        server_config_t *act = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+        server_config_t *sb = (act == &g_config_db.config_a) ? &g_config_db.config_b : &g_config_db.config_a;
+        assert(g_config_db.standby_pending);
+        assert(config_standby_reap(false));
+        assert(sb->views == NULL && sb->zones == NULL);
+        assert(act->views != NULL);
+    }
+    assert(g_config_db.standby_freed >= freed0 + 101);
+    rl_cleanup();
+    printf("  -> config reload frees the retired configuration passed.\n");
 }
 
 static void test_server_core_sighup_reload_flag(void) {
@@ -4807,8 +4844,8 @@ static void test_server_core_feature_case_155(void) {
     memset(&z, 0, sizeof(z));
     z.domain = "dynplugin.example.";
     z.type = "program";
-    z.program_path = "/usr/libexec/my_plugin";
-    z.program_timeout_ms = 5000;
+    tzx(&z)->program_path = "/usr/libexec/my_plugin";
+    tzx(&z)->program_timeout_ms = 5000;
 
     char new_fp[512];
     compute_program_zone_fingerprint(&z, new_fp, sizeof(new_fp));
@@ -4977,7 +5014,7 @@ static void test_server_core_feature_case_191(void) {
     zone_config_t z;
     memset(&z, 0, sizeof(z));
     z.domain = "stable.example.";
-    z.program_path = "/bin/ls";
+    tzx(&z)->program_path = "/bin/ls";
     char fp1[128], fp2[128];
     compute_program_zone_fingerprint(&z, fp1, sizeof(fp1));
     compute_program_zone_fingerprint(&z, fp2, sizeof(fp2));
@@ -4988,8 +5025,8 @@ static void test_server_core_feature_case_192(void) {
     printf("[TEST] Server Core: Program zone fingerprint difference on arg change...\n");
     zone_config_t z1, z2;
     memset(&z1, 0, sizeof(z1)); memset(&z2, 0, sizeof(z2));
-    z1.domain = "diff.example."; z1.program_path = "/bin/sh";
-    z2.domain = "diff.example."; z2.program_path = "/bin/bash";
+    z1.domain = "diff.example."; tzx(&z1)->program_path = "/bin/sh";
+    z2.domain = "diff.example."; tzx(&z2)->program_path = "/bin/bash";
     char fp1[128], fp2[128];
     compute_program_zone_fingerprint(&z1, fp1, sizeof(fp1));
     compute_program_zone_fingerprint(&z2, fp2, sizeof(fp2));
@@ -5000,8 +5037,8 @@ static void test_server_core_feature_case_193(void) {
     printf("[TEST] Server Core: Program zone fingerprint difference on user change...\n");
     zone_config_t z1, z2;
     memset(&z1, 0, sizeof(z1)); memset(&z2, 0, sizeof(z2));
-    z1.domain = "user.example."; z1.program_user = "user1";
-    z2.domain = "user.example."; z2.program_user = "user2";
+    z1.domain = "user.example."; tzx(&z1)->program_user = "user1";
+    z2.domain = "user.example."; tzx(&z2)->program_user = "user2";
     char fp1[128], fp2[128];
     compute_program_zone_fingerprint(&z1, fp1, sizeof(fp1));
     compute_program_zone_fingerprint(&z2, fp2, sizeof(fp2));
@@ -5098,14 +5135,14 @@ static void test_server_core_program_zone_reload_fingerprint_and_added(void) {
     memset(&z_modified, 0, sizeof(z_modified));
     z_modified.domain = "plugin.example.";
     z_modified.type = "program";
-    z_modified.program_path = "/usr/local/bin/test_plugin";
-    z_modified.program_timeout_ms = 2000;
+    tzx(&z_modified)->program_path = "/usr/local/bin/test_plugin";
+    tzx(&z_modified)->program_timeout_ms = 2000;
 
     zone_config_t z_new;
     memset(&z_new, 0, sizeof(z_new));
     z_new.domain = "newplugin.example.";
     z_new.type = "program";
-    z_new.program_path = "/usr/local/bin/new_plugin";
+    tzx(&z_new)->program_path = "/usr/local/bin/new_plugin";
 
     z_modified.next = &z_new;
     view.zones = &z_modified;
@@ -5163,7 +5200,7 @@ static void test_server_core_notify_tsig_key_matching_and_transfer_bg_ctx(void) 
     zone_config_t zcfg;
     memset(&zcfg, 0, sizeof(zcfg));
     zcfg.domain = "notify.example.";
-    zcfg.tsig_key = "notify-key.";
+    tzx(&zcfg)->tsig_key = "notify-key.";
     cfg.zones = &zcfg;
 
     atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
@@ -5186,7 +5223,7 @@ static void test_server_core_notify_tsig_key_matching_and_transfer_bg_ctx(void) 
     tsig_key_t *matched_key = NULL;
     tsig_key_t *k = cfg.keys;
     while (k) {
-        if (strcmp(k->name, zcfg.tsig_key) == 0) {
+        if (strcmp(k->name, zext(&zcfg)->tsig_key) == 0) {
             matched_key = k;
             break;
         }
@@ -5333,6 +5370,7 @@ int main(void) {
     test_perform_config_reload_identical_config();
     test_perform_config_reload_removed_zone();
     test_perform_config_reload_added_zone();
+    test_perform_config_reload_frees_retired_config();
     test_server_core_sighup_reload_flag();
     test_server_core_sigterm_shutdown_flag();
     test_broker_connect_nonblocking_stream();
