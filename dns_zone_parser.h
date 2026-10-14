@@ -34,10 +34,10 @@ typedef struct parse_context_s {
     char **visited_paths;   // 逾門・繧ｹ繧ｿ繝・け(迴ｾ蝨ｨ縺ｮ蜻ｼ縺ｳ蜃ｺ縺励メ繧ｧ繝ｼ繝ｳ縺ｮ縺ｿ縲∬ｨｪ蝠乗ｸ医∩髮・粋縺ｧ縺ｯ縺ｪ縺・
     dev_t *visited_devs;
     ino_t *visited_inos;
-    int visited_count;      // 繧ｹ繧ｿ繝・け縺ｮ迴ｾ蝨ｨ縺ｮ豺ｱ縺・
-    int visited_cap;        // visited_paths驟榊・縺ｮ螳ｹ驥・
+    int visited_count;      // スタックの現在の深さ
+    int visited_cap;        // visited_paths 配列の容量
 
-    // --- 隍・焚繧ｾ繝ｼ繝ｳ繝ｻ隕ｪ蟄舌だ繝ｼ繝ｳ謖ｯ繧雁・縺醍畑 ---
+    // --- 複数ゾーン・親子ゾーン振り分け用 ---
     const char **all_zone_names;
     int all_zone_count;
     /* tinydns: 省略可。name (正規形) が同じ view のゾーンの頂点かを答える。あれば all_zone_names の

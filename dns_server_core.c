@@ -111,6 +111,8 @@ _Atomic int g_bound_workers = 0;
 STATIC_TEST _Atomic bool g_privilege_drop_complete = false;
 // 制御スレッドが SIGTERM / SIGINT を EVFILT_SIGNAL で受けられるようになった (backend_sig_handler)
 STATIC_TEST _Atomic bool g_control_signals_ready = false;
+// P5: バックエンドを fork したマネージャーの PID。SIGHUP はマネージャーから転送されたものだけでリロードする
+static pid_t g_manager_pid = 0;
 #define MAX_ZONE_AXFR 4
 
 #define NUM_FRONTEND_ROUTERS 2
@@ -2868,6 +2870,36 @@ const char *find_configured_domain(const char *arg, char *out_buf, size_t out_si
   return out_buf;
 }
 
+/* P5: SIGHUP はバックエンドの全スレッドでブロックされ、保留のまま EVFILT_SIGNAL で通知される。
+ * 保留分を sigtimedwait() で取り出して送信元を見る。pkill -HUP karidns のように全プロセスへ
+ * 送られると、直接届いたものとマネージャーが転送したものの2つになり、両方でリロードすると
+ * 2回になる。マネージャーからのもの (転送) だけをリロードの合図にし、それ以外は無視する。
+ * 何も取り出せなかった (どこかのスレッドがブロックしておらずハンドラで消費された) 場合は
+ * 送信元が分からないので従来どおりリロードする。 */
+static bool sighup_from_manager(void) {
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGHUP);
+  const struct timespec zero = {0, 0};
+  siginfo_t si;
+  int drained = 0;
+  bool from_manager = false;
+  pid_t other = 0;
+  while (sigtimedwait(&set, &si, &zero) == SIGHUP) {
+    drained++;
+    if (g_manager_pid > 0 && si.si_pid == g_manager_pid)
+      from_manager = true;
+    else
+      other = si.si_pid;
+  }
+  if (drained == 0 || from_manager)
+    return true;
+  syslog(LOG_NOTICE, "[Config] SIGHUP from pid %d sent to the backend directly is ignored; "
+                     "the manager forwards SIGHUP (send it to the manager or use karictl reload)",
+         (int)other);
+  return false;
+}
+
 void *control_thread_func(void *arg) {
   (void)arg;
   /* 制御スレッドは設定・ゾーン DB・arena の writer で、ロックを持ったまま
@@ -3346,7 +3378,8 @@ void *control_thread_func(void *arg) {
          * data に回数を入れる。リロード中に届いた SIGHUP は次の1回のリロードにまとめる */
         if (ev_list[i].data > 1)
           syslog(LOG_NOTICE, "[Config] %ld SIGHUP signals arrived while busy; reloading once", (long)ev_list[i].data);
-        run_config_reload(true);
+        if (sighup_from_manager())
+          run_config_reload(true);
       } else if (ev_list[i].filter == EVFILT_SIGNAL &&
                  (ev_list[i].ident == SIGTERM || ev_list[i].ident == SIGINT)) {
         /* O-03: 起動後の SIGTERM / SIGINT はここで受け、dnstap を閉じてから終了する */
@@ -4698,6 +4731,11 @@ bool ensure_priv_dir_safe(const char *dir_buf) {
 }
 
 #ifndef KARIDNS_UNIT_TEST
+/* P5: バックエンドの SIGHUP。保留させるためだけのハンドラ (sighup_from_manager()) */
+static void backend_sighup_noop(int sig) {
+  (void)sig;
+}
+
 int main(int argc, char **argv) {
   assert(calc_fnv1a_str("*.") == FNV1A_WILDCARD_PREFIX_HASH);
   init_server_cookie_secret();
@@ -5236,6 +5274,15 @@ int main(int argc, char **argv) {
   b_sa.sa_flags = 0;
   sigaction(SIGTERM, &b_sa, NULL);
   sigaction(SIGINT, &b_sa, NULL);
+  /* P5: SIGHUP は fork 前からブロックされている。SIG_IGN のままだと届いた時点で捨てられて
+   * sigtimedwait() で送信元を取り出せないので、何もしないハンドラにして保留させる
+   * (sighup_from_manager())。ブロックしていないスレッドに配られてもハンドラで消えるだけ */
+  struct sigaction hup_sa;
+  memset(&hup_sa, 0, sizeof(hup_sa));
+  hup_sa.sa_handler = backend_sighup_noop;
+  sigemptyset(&hup_sa.sa_mask);
+  sigaction(SIGHUP, &hup_sa, NULL);
+  g_manager_pid = getppid();
 
   g_pid_file_path[0] = '\0';
   if (g_pid_fd >= 0) {

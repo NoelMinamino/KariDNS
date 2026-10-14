@@ -665,7 +665,7 @@ For complete configuration syntax, query evaluation flows, and Extended AXFR det
 ## SIGNALS
 
 `SIGHUP`
-: Same as `karictl reconfig`: re-reads the configuration file and swaps it in atomically (RCU). Zone files whose modification time has not changed since they were loaded are not re-read; use `karictl reload` to re-read all zone files.
+: Same as `karictl reconfig`: re-reads the configuration file and swaps it in atomically (RCU). Zone files whose modification time has not changed since they were loaded are not re-read; use `karictl reload` to re-read all zone files. Send it to the manager process (the PID in the PID file); the manager forwards it to the backend. When it reaches every process (`pkill -HUP karidns`), the server still reloads once: the backend acts only on the manager's forward, and a `SIGHUP` sent to the backend process alone is logged and ignored.
 
 `SIGTERM`, `SIGINT`
 : Sent to the manager process, stops all child processes (backend, frontend routers, connect broker), removes the PID file and exits.
