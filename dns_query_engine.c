@@ -22,6 +22,9 @@
 /* 名前解決が CNAME/DNAME で別のゾーンに移ったか (共有の応答キャッシュの鍵は最初のゾーンの版だけ
  * なので、移った応答は入れない: 移り先のゾーンが更新されても古い応答を返し続けてしまう) */
 static _Thread_local bool t_resolve_crossed_zone;
+/* 応答の大きさの上限で Additional を途中で打ち切ったか (TC は立てない、RFC 2181 §9)。キャッシュの鍵は
+ * 問い合わせの受信バッファの大きさを含まないので、打ち切った応答は入れない */
+static _Thread_local bool t_resolve_additional_cut;
 
 program_plugin_t *g_program_plugins = NULL;
 int g_program_plugins_count = 0;
@@ -1495,6 +1498,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
         if (!append_glue_records(img, glue.targets[k], db_entry->domain,
                                  res, max_res_len, offset, comp_ctx, arcount,
                                  client_loc, client_ecs_tag, client_loc_tag, policy, view, dnssec_ok)) {
+          t_resolve_additional_cut = true; // 応答キャッシュに入れない (大きいバッファの問い合わせにも返ってしまう)
           break; // バッファ上限に達した場合は以後のグルー追加を中断 (RFC 2181 §9)
         }
       }
@@ -3190,6 +3194,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   bool ecs_trusted = (cfg && cfg->ecs_enable && edns.has_ecs && client_ip &&
                       is_ecs_trusted_resolver(current_zone ? current_zone->image : NULL, cfg, zcfg, client_ip));
   t_resolve_crossed_zone = false;
+  t_resolve_additional_cut = false;
   resolve_name(current_qname, qclass, qtypes, num_qtypes, &db_entry, &current_zone, res, body_max_len,
                &offset, comp_ctx, &ancount, &nscount, &arcount,
                cfg_for_ede ? cfg_for_ede->minimal_responses : false,
@@ -3215,8 +3220,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   /* 応答キャッシュに入れる: NOERROR、AA、TC なしで answer があり、EDE の付かない応答
-   * (ヒットした応答は UDP の 512 オクテットに入る大きさに限る)。別のゾーンへ移った応答は入れない */
-  if (rc_tag && !t_resolve_crossed_zone && (res[3] & 0x0F) == 0 && (res[2] & 0x04) && !(res[2] & 0x02) && ancount > 0 &&
+   * (ヒットした応答は UDP の 512 オクテットに入る大きさに限る)。別のゾーンへ移った応答と、Additional を打ち切った応答は入れない */
+  if (rc_tag && !t_resolve_crossed_zone && !t_resolve_additional_cut && (res[3] & 0x0F) == 0 && (res[2] & 0x04) && !(res[2] & 0x02) && ancount > 0 &&
       edns.ede_count == 0 && offset > q_offset && offset <= UDP_DEFAULT_MAX_RES_LEN) {
     rcache_store(rc_tag, rc_gen, qtype, res + q_offset, (size_t)(offset - q_offset), ancount, nscount, arcount);
   }

@@ -1115,6 +1115,74 @@ static void test_rcache_cross_zone_cname_not_cached(void) {
     printf("  [PASS] cross-zone CNAME answers are not cached; in-zone answers still are\n");
 }
 
+/* An answer whose Additional section was cut to fit a small buffer (no TC, RFC 2181 §9) is not cached:
+ * the key does not include the requester's buffer size, so a later EDNS query would get the cut answer. */
+static void test_rcache_cut_additional_not_cached(void) {
+    printf("[TEST] Shared response cache: answers with a cut Additional section are not stored...\n");
+    static char text[8192];
+    size_t n = (size_t)snprintf(text, sizeof(text),
+        "mx.example. 3600 IN SOA ns.mx.example. h.mx.example. 1 7200 3600 1209600 3600\n"
+        "mx.example. 3600 IN NS ns.mx.example.\n"
+        "ns.mx.example. 3600 IN A 192.0.2.1\n");
+    for (int m = 1; m <= 6; m++) {
+        n += (size_t)snprintf(text + n, sizeof(text) - n, "mx.example. 3600 IN MX %d m%d.mx.example.\n", m, m);
+        for (int a = 1; a <= 6; a++)
+            n += (size_t)snprintf(text + n, sizeof(text) - n, "m%d.mx.example. 3600 IN A 192.0.2.%d\n", m, m * 10 + a);
+    }
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "mx.example.", .is_standalone_mode = true, .err_out = &err };
+    assert(parse_zone_fast(text, strlen(text), &arena, &ctx) >= 0);
+    assert(test_build_index(&arena, true) == 0);
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    build_zone_response_cache(&arena.ver, &cfg, NULL, "mx.example.");
+    assert(arena.rcache_ok);
+
+    zone_db_entry_t e;
+    memset(&e, 0, sizeof(e));
+    strncpy(e.domain, "mx.example.", sizeof(e.domain) - 1);
+    atomic_store_explicit(&e.rcu.active, &arena.ver, memory_order_release);
+    zone_db_entry_t *entries[1] = { &e };
+    char *any_acl[1] = { (char *)"any" };
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+    view.match_clients = any_acl;
+    view.match_clients_count = 1;
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    uint8_t req[512], res_small[4096], res_big[4096];
+    size_t req_len = 0;
+    compress_ctx_t cc = {0};
+    zone_db_entry_t *matched = NULL;
+    /* 1. no EDNS: 512 octets, the Additional section is cut, no TC */
+    build_simple_query(req, &req_len, 0x5101, "mx.example.", 15);
+    compress_ctx_init_packet(&cc);
+    int len_small = process_dns_query_impl(req, req_len, res_small, 512, "mx.example.", 15,
+                                           "127.0.0.1", &cc, false, NULL, &snap, &cfg, &matched);
+    assert(len_small > 12 && len_small <= 512 && !(res_small[2] & 0x02));
+    uint16_t ar_small = (uint16_t)((res_small[10] << 8) | res_small[11]);
+    /* 2. EDNS 4096: must get the whole Additional section, not the cut answer from the cache */
+    uint64_t hits0 = atomic_load(&e.observatory.wirecache_hits);
+    build_edns_query(req, &req_len, 0x5102, "mx.example.", 15, false);
+    compress_ctx_init_packet(&cc);
+    int len_big = process_dns_query_impl(req, req_len, res_big, sizeof(res_big), "mx.example.", 15,
+                                         "127.0.0.1", &cc, false, NULL, &snap, &cfg, &matched);
+    assert(len_big > len_small);
+    uint16_t ar_big = (uint16_t)((res_big[10] << 8) | res_big[11]);
+    assert(ar_big > ar_small + 1); /* more than the OPT RR alone */
+    assert(atomic_load(&e.observatory.wirecache_hits) == hits0);
+    zone_arena_destroy(&arena);
+    printf("  [PASS] cut Additional section not cached (plain AR=%u, EDNS AR=%u)\n", ar_small, ar_big);
+}
+
 static void test_wire_cache_observatory_counters(void) {
     printf("[TEST] Running wire cache observatory statistics & counters test...\n");
 
@@ -1342,6 +1410,7 @@ int main(void) {
     test_wire_cache_max_records_limit();
     test_wire_cache_observatory_counters();
     test_rcache_cross_zone_cname_not_cached();
+    test_rcache_cut_additional_not_cached();
     test_wire_cache_per_view_config();
     return 0;
 }
