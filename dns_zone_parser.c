@@ -34,6 +34,7 @@ static void unescape_string_in_place(char *str) {
 #include <string.h>
 #include <ctype.h>
 #include <assert.h>
+#include <errno.h>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -650,20 +651,30 @@ static size_t expand_generate_template(const char *tmpl, uint64_t value, char *o
                 p++;
                 continue;
             }
-            long offset = 0;
+            int64_t offset = 0;
             int width = 0;
             char base = 'd';
             if (*p == '{') {
                 char *end;
-                offset = strtol(p + 1, &end, 10);
+                errno = 0;
+                long long ov = strtoll(p + 1, &end, 10);
                 p = end;
+                /* BIND は offset を int で持つ。範囲外は黙って丸めず拒否する (value + offset の符号付き
+                 * オーバーフロー = UB も、これで起きない: value は 32 bit に収まる) */
+                if (errno == ERANGE || ov < INT32_MIN || ov > INT32_MAX) {
+                    if (err_out) err_out->error_message = "$GENERATE offset out of range (32-bit signed)";
+                    return (size_t)-1;
+                }
+                offset = ov;
                 if (*p == ',') {
-                    width = (int)strtol(p + 1, &end, 10);
+                    errno = 0;
+                    long wv = strtol(p + 1, &end, 10);
                     p = end;
-                    if (width < 0 || width > 64) {
+                    if (errno == ERANGE || wv < 0 || wv > 64) {
                         if (err_out) err_out->error_message = "$GENERATE width out of range (0-64)";
                         return (size_t)-1;
                     }
+                    width = (int)wv;
                     if (*p == ',') {
                         p++;
                         if (*p == '\0') {
