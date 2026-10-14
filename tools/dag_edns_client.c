@@ -508,7 +508,7 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                 rec.type = (char *)qo->prereqs[pi].type_str;
                 rec.class_str = (char *)(qo->qclass == 3 ? "CH" : (qo->qclass == 4 ? "HS" : "IN"));
                 rec.rdata_count = token_count;
-                for (int t = 0; t < token_count; t++) rec.rdata[t] = tokens[t];
+                rec.rdata = tokens; // S5: rdata は tokens を指す (rdata_count 個)
 
                 uint16_t out_offset = offset;
                 if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0) == 0) {
@@ -628,7 +628,7 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                         rec.type = tokens[type_idx];
                         rec.class_str = class_str;
                         rec.rdata_count = token_count - (type_idx + 1);
-                        for (int i = 0; i < rec.rdata_count; i++) rec.rdata[i] = tokens[type_idx + 1 + i];
+                        rec.rdata = tokens + (type_idx + 1);
 
                         uint16_t out_offset = offset;
                         if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0xFFFFFFFF) == 0) {
@@ -746,7 +746,7 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                         rec.type = tokens[type_idx];
                         rec.class_str = (char *)"NONE"; // Class NONE for exact match delete
                         rec.rdata_count = token_count - (type_idx + 1);
-                        for (int i = 0; i < rec.rdata_count; i++) rec.rdata[i] = tokens[type_idx + 1 + i];
+                        rec.rdata = tokens + (type_idx + 1);
 
                         uint16_t out_offset = offset;
                         if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0) == 0) {

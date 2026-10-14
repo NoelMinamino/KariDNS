@@ -14,7 +14,10 @@
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
+#include "test_zext.h"
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
+#include "test_image_helper.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_query_engine.h"
 #include "dns_server_internal.h"
@@ -38,6 +41,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
+#include "test_zone_slots.h"
 
 // Mock globals
 int g_control_kq = -1;
@@ -178,12 +182,12 @@ static void sw_add_zone(const char *origin, const char *text) {
     assert(buf);
     int prc = parse_zone_fast(buf, strlen(buf), a, &ctx);
     if (prc < 0) { fprintf(stderr, "zone %s parse failed at %zu: %s\n", origin, err.error_offset, err.error_message ? err.error_message : "?"); assert(0); }
-    assert(build_zone_index(a, true) == 0);
+    assert(test_build_index(a, true) == 0);
     zone_db_entry_t *e = &g_sw.entry[i];
     strncpy(e->domain, origin, sizeof(e->domain) - 1);
     strncpy(e->view_name, "default", sizeof(e->view_name) - 1);
     pthread_mutex_init(&e->writer_lock, NULL);
-    atomic_store_explicit(&e->rcu.active, a, memory_order_release);
+    atomic_store_explicit(&e->rcu.active, &a->ver, memory_order_release);
     g_sw.entries[i] = e;
 }
 
@@ -298,7 +302,7 @@ static int sw_run(const uint8_t *req, size_t req_len, size_t max_res, const char
     static compress_ctx_t comp;
     static bool comp_init;
     if (!comp_init) { compress_ctx_init(&comp); comp_init = true; }
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_entry_t *matched = NULL;
     g_calls++;
     int n = process_dns_query_impl(req, req_len, g_res, max_res, qname, qtype, client_ip,
@@ -666,8 +670,8 @@ static void sw_setup_all(const char *conf, bool optout) {
 
 static void sw_prelink_and_cache(additional_from_auth_t policy) {
     for (int i = 0; i < g_sw.zone_count; i++) {
-        prelink_zone_additional_glue(&g_sw.arena[i], g_sw.entry[i].domain, &g_sw.view, policy);
-        build_zone_response_cache(&g_sw.arena[i], g_sw.cfg, NULL, g_sw.entry[i].domain);
+        zone_glue_track_build(&g_sw.arena[i].ver, g_sw.entry[i].domain, &g_sw.view, policy);
+        build_zone_response_cache(&g_sw.arena[i].ver, g_sw.cfg, NULL, g_sw.entry[i].domain);
     }
 }
 
@@ -825,10 +829,10 @@ static void test_forward_zone_scenarios(void) {
     }
     /* invalid inputs */
     assert(dispatch_forward_zone(z1, req, 5, res, sizeof(res)) == 0);
-    int saved = z1->forwarders_count; z1->forwarders_count = 0;
+    int saved = zext(z1)->forwarders_count; tzx(z1)->forwarders_count = 0;
     size_t len = sw_build(req, 1, 1, 0, "www.fwd.test.", 1, 1, 0);
     assert(dispatch_forward_zone(z1, req, len, res, sizeof(res)) > 0);
-    z1->forwarders_count = saved;
+    tzx(z1)->forwarders_count = saved;
     g_broker_fail = 1;
     assert(dispatch_forward_zone(z1, req, len, res, sizeof(res)) > 0);
     struct sockaddr_storage ss; size_t sl = resolve_ip_port_to_sockaddr("127.0.0.1", g_fw_port, &ss);
@@ -968,7 +972,7 @@ static void test_program_zone_emulated(void) {
     close(p[1]);
     zone_config_t z; memset(&z, 0, sizeof(z));
     char *args[] = { "a", "b" };
-    z.program_path = "/bin/true"; z.program_args = args; z.program_args_count = 2;
+    tzx(&z)->program_path = "/bin/true"; tzx(&z)->program_args = args; tzx(&z)->program_args_count = 2;
     char fp[64];
     compute_program_zone_fingerprint(&z, fp, sizeof(fp));
     compute_program_zone_fingerprint(&z, fp, 20);
@@ -1003,75 +1007,115 @@ static void test_engine_helper_edges(void) {
     assert(find_next_closer_name("longlabel.b.", "b.", out, 4) == false);
     assert(find_next_closer_name("q.r.b", "b", out, sizeof(out)) == true && strcmp(out, "r.b") == 0);
 
-    /* arena helpers on empty / incomplete zones */
+    /* image helpers on a missing and on an empty zone image */
     zone_arena_t z; memset(&z, 0, sizeof(z)); zone_arena_init(&z);
+    assert(test_build_index(&z, true) == 0);   /* an empty zone: an image with no RRs */
+    assert(z.image != NULL && z.image->n_rrs == 0);
+    const zone_image_t *zi = z.image;
     dns_record_t p3; memset(&p3, 0, sizeof(p3));
+    DNS_RECORD_BIND_RDATA(p3);
     p3.rdata[0] = "1"; p3.rdata[1] = "0"; p3.rdata[2] = "0"; p3.rdata[3] = "-"; p3.rdata_count = 4;
-    assert(find_matching_nsec3(NULL, &p3, "x", "a.") == NULL);
-    assert(find_matching_nsec3(&z, NULL, "x", "a.") == NULL);
-    assert(find_matching_nsec3(&z, &p3, NULL, "a.") == NULL);
-    assert(find_matching_nsec3(&z, &p3, "x", NULL) == NULL);
-    assert(find_matching_nsec3(&z, &p3, "x", "a.") == NULL);
-    assert(find_covering_nsec3(NULL, &p3, "x") == NULL);
-    assert(find_covering_nsec3(&z, NULL, "x") == NULL);
-    assert(find_covering_nsec3(&z, &p3, NULL) == NULL);
-    assert(find_covering_nsec3(&z, &p3, "x") == NULL);
+    uint32_t no_chain = test_chain_of(&z, &p3);   /* the empty zone has no chain for any parameters */
+    assert(no_chain == ZONE_IMAGE_NONE);
+    assert(find_matching_nsec3(NULL, no_chain, "x", "a.") == ZONE_IMAGE_NONE);
+    assert(find_matching_nsec3(zi, no_chain, "x", "a.") == ZONE_IMAGE_NONE);
+    assert(find_matching_nsec3(zi, no_chain, NULL, "a.") == ZONE_IMAGE_NONE);
+    assert(find_matching_nsec3(zi, no_chain, "x", NULL) == ZONE_IMAGE_NONE);
+    assert(find_covering_nsec3(NULL, no_chain, "x") == ZONE_IMAGE_NONE);
+    assert(find_covering_nsec3(zi, no_chain, NULL) == ZONE_IMAGE_NONE);
+    assert(find_covering_nsec3(zi, no_chain, "x") == ZONE_IMAGE_NONE);
     assert(name_exists_in_zone(NULL, "a.", "\0\0", NULL, NULL) == false);
-    assert(name_exists_in_zone(&z, NULL, "\0\0", NULL, NULL) == false);
-    assert(name_exists_in_zone(&z, "a.", "\0\0", NULL, NULL) == false);
+    assert(name_exists_in_zone(zi, NULL, "\0\0", NULL, NULL) == false);
+    assert(name_exists_in_zone(zi, "a.", "\0\0", NULL, NULL) == false);
     const char *apx = "a.";
     assert(find_closest_encloser(NULL, "a.", apx, "\0\0", NULL, NULL) == apx);
-    assert(find_closest_encloser(&z, NULL, apx, "\0\0", NULL, NULL) == apx);
-    assert(find_closest_encloser(&z, "a.", NULL, "\0\0", NULL, NULL) == NULL);
-    assert(find_closest_encloser(&z, "a.", apx, "\0\0", NULL, NULL) == apx);
-    assert(find_covering_nsec(&z, "a.") == NULL);
+    assert(find_closest_encloser(zi, NULL, apx, "\0\0", NULL, NULL) == apx);
+    assert(find_closest_encloser(zi, "a.", NULL, "\0\0", NULL, NULL) == NULL);
+    assert(find_closest_encloser(zi, "a.", apx, "\0\0", NULL, NULL) == apx);
+    assert(find_covering_nsec(zi, "a.") == ZONE_IMAGE_NONE);
+    assert(find_covering_nsec(NULL, "a.") == ZONE_IMAGE_NONE);
     uint16_t off = 12, cnt = 0;
     compress_ctx_t cc; compress_ctx_init(&cc);
     uint8_t res[512];
-    assert(find_delegation(NULL, "a.", 0, "a.", res, sizeof(res), &off, &cc, &cnt, &cnt, false,
+    assert(find_delegation(NULL, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, &cnt, false,
                            "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false) == false);
-    assert(find_delegation(&z, "a.", 0, "a.", res, sizeof(res), &off, &cc, &cnt, &cnt, false,
+    assert(find_delegation(zi, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, &cnt, false,
                            "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false) == false);
     assert(append_glue_records(NULL, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false));
-    assert(append_glue_records(&z, NULL, "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false));
-    assert(append_glue_records(&z, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_NO, NULL, false));
+    assert(append_glue_records(zi, NULL, "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false));
+    assert(append_glue_records(zi, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_NO, NULL, false));
 
-    /* nsec_covers_name with malformed records */
+    /* nsec_covers_name: a missing image, an RR that is not an NSEC, the owner/next orders. (A record without an
+     * owner, or an NSEC without a type bitmap, cannot be written in wire format, so no image holds one.) */
     dns_record_t r; memset(&r, 0, sizeof(r));
-    assert(nsec_covers_name(NULL, "a.") == false);
-    assert(nsec_covers_name(&r, "a.") == false);
+    DNS_RECORD_BIND_RDATA(r);
+    assert(nsec_covers_name(NULL, 0, "a.") == false);
+    zone_image_t *ri = test_image_of_record(&r);    /* defaults to an A record */
+    assert(ri != NULL && nsec_covers_name(ri, 0, "a.") == false);
+    free(ri);
     r.type_code = 47;
-    assert(nsec_covers_name(&r, "a.") == false);
     r.rdata[0] = "c.example."; r.rdata[1] = "A"; r.rdata_count = 2;
-    assert(nsec_covers_name(&r, "a.") == false);
     r.name = "a.example.";
-    assert(nsec_covers_name(&r, NULL) == false);
-    assert(nsec_covers_name(&r, "b.example.") == true);
+    ri = test_image_of_record(&r);
+    assert(ri != NULL);
+    assert(nsec_covers_name(ri, 0, NULL) == false);
+    assert(nsec_covers_name(ri, 0, "b.example.") == true);
+    assert(nsec_covers_name(ri, 0, "d.example.") == false);
+    free(ri);
     r.rdata[0] = "example.";   /* last NSEC in the chain (wrap-around) */
-    assert(nsec_covers_name(&r, "z.example.") == true);
+    ri = test_image_of_record(&r);
+    assert(ri != NULL && nsec_covers_name(ri, 0, "z.example.") == true);
+    free(ri);
 
     /* collect_additional_rr_glue variants */
-    const char *gt[16]; int gc = 0;
-    collect_additional_rr_glue(NULL, gt, &gc, false);
-    collect_additional_rr_glue(&r, NULL, &gc, false);
-    collect_additional_rr_glue(&r, gt, NULL, false);
-    collect_additional_rr_glue(&r, gt, &gc, true);
-    dns_record_t m; memset(&m, 0, sizeof(m)); m.type_code = 15; m.rdata[0] = "10"; m.rdata[1] = ""; m.rdata_count = 2;
+    glue_list_t gl; memset(&gl, 0, sizeof(gl));
+    collect_additional_rr_glue(NULL, 0, &gl);
+    assert(gl.count == 0);
+    dns_record_t m; memset(&m, 0, sizeof(m)); DNS_RECORD_BIND_RDATA(m); m.type_code = 15; m.rdata[0] = "10"; m.rdata[1] = "mail.example."; m.rdata_count = 2;
     char **mx = m.rdata;
-    collect_additional_rr_glue(&m, gt, &gc, false);            /* empty target */
-    mx[1] = "mail.example.";
-    for (int i = 0; i < 20; i++) collect_additional_rr_glue(&m, gt, &gc, false);  /* dedupe */
+    zone_image_t *mi = test_image_of_record(&m);
+    assert(mi != NULL);
+    collect_additional_rr_glue(mi, 0, NULL);
+    gl.minimal = true;
+    collect_additional_rr_glue(mi, 0, &gl);
+    assert(gl.count == 0);
+    gl.minimal = false;
+    for (int i = 0; i < 20; i++) collect_additional_rr_glue(mi, 0, &gl);  /* dedupe */
+    assert(gl.count == 1 && strcmp(gl.targets[0], "mail.example.") == 0);
+    free(mi);
+    mx[1] = ".";                                  /* null MX (RFC 7505): the root is a target like any other */
+    mi = test_image_of_record(&m);
+    assert(mi != NULL);
+    collect_additional_rr_glue(mi, 0, &gl);
+    assert(gl.count == 2 && strcmp(gl.targets[1], ".") == 0);
+    free(mi);
     char names[20][32];
-    for (int i = 0; i < 20; i++) { snprintf(names[i], sizeof(names[i]), "h%d.example.", i); mx[1] = names[i]; collect_additional_rr_glue(&m, gt, &gc, false); }
-    assert(gc == 16);
-    m.rdata_count = 1; gc = 0; collect_additional_rr_glue(&m, gt, &gc, false); assert(gc == 0);
-    m.type_code = 33; collect_additional_rr_glue(&m, gt, &gc, false);
-    m.type_code = 2; m.rdata_count = 0; collect_additional_rr_glue(&m, gt, &gc, false);
-    m.type_code = 1; collect_additional_rr_glue(&m, gt, &gc, false);
+    for (int i = 0; i < 20; i++) {
+        snprintf(names[i], sizeof(names[i]), "h%d.example.", i);
+        mx[1] = names[i];
+        mi = test_image_of_record(&m);
+        assert(mi != NULL);
+        collect_additional_rr_glue(mi, 0, &gl);
+        free(mi);
+    }
+    assert(gl.count == 16);
+    gl.count = 0;
+    m.type_code = 33; m.rdata[0] = "0"; m.rdata[1] = "5"; m.rdata[2] = "5060"; m.rdata[3] = "sip.example."; m.rdata_count = 4;
+    mi = test_image_of_record(&m);
+    assert(mi != NULL);
+    collect_additional_rr_glue(mi, 0, &gl);
+    assert(gl.count == 1 && strcmp(gl.targets[0], "sip.example.") == 0);
+    free(mi);
+    m.type_code = 1; m.rdata[0] = "192.0.2.1"; m.rdata_count = 1;    /* an address is not a glue source */
+    mi = test_image_of_record(&m);
+    assert(mi != NULL);
+    collect_additional_rr_glue(mi, 0, &gl);
+    assert(gl.count == 1);
+    free(mi);
 
-    /* attach_nsec3_record dedupe + overflow */
-    dns_record_t *att[8] = {0}; int ac = 0;
-    assert(attach_nsec3_record(&z, NULL, res, sizeof(res), &off, &cc, &cnt, att, &ac));
+    /* attach_nsec3_record with no RR */
+    const zone_image_rr_t *att[8] = {0}; int ac = 0;
+    assert(attach_nsec3_record(zi, ZONE_IMAGE_NONE, res, sizeof(res), &off, &cc, &cnt, att, &ac));
     zone_arena_destroy(&z);
 
     /* hex_to_bytes / record observatory */
@@ -1149,6 +1193,7 @@ static const char *RR_LINES[] = {
 static void rr_parse_sweep(const uint8_t *pkt, size_t len) {
     zone_arena_t a; memset(&a, 0, sizeof(a)); zone_arena_init(&a);
     dns_record_t r; uint16_t t;
+    DNS_RECORD_BIND_RDATA(r);
     for (size_t cut = 12; cut <= len; cut++) {
         size_t off = 12; memset(&r, 0, sizeof(r));
         (void)parse_resource_record(pkt, cut, &off, &a, &r, &t);
@@ -1202,6 +1247,9 @@ static void test_wire_rr_sweep(void) {
         for (int f = 0; f < rec->rdata_count && f < 12; f++) {
             for (size_t g = 0; g < NELEM(garbage); g++) {
                 dns_record_t copy = *rec;
+                char *copy_rd[MAX_RDATA];   /* S5: copy は rec の rdata[] を共有するので、書き換える前に自前の配列に写す */
+                memcpy(copy_rd, rec->rdata, (size_t)rec->rdata_count * sizeof(char *));
+                copy.rdata = copy_rd;
                 copy.rdata[f] = (char *)garbage[g];
                 copy.is_cached = false;
                 uint16_t off = 12; compress_ctx_init(&cc);
@@ -1886,19 +1934,19 @@ static void test_ecs_cookie_rrl_dnstap_edges(void) {
             za.bind_location_tags = where == 0 ? zt : NULL; za.bind_location_tag_count = where == 0 ? n1 : 0;
             cfg.ecs_tags = where == 1 ? ct : NULL; cfg.ecs_tag_count = where == 1 ? n2 : 0;
             cfg.location_tags = where == 1 ? ct : NULL; cfg.location_tag_count = where == 1 ? n2 : 0;
-            zc.ecs_tags = where == 2 ? ft : NULL; zc.ecs_tag_count = where == 2 ? n3 : 0;
-            zc.location_tags = where == 2 ? ft : NULL; zc.location_tag_count = where == 2 ? n3 : 0;
+            tzx(&zc)->ecs_tags = where == 2 ? ft : NULL; tzx(&zc)->ecs_tag_count = where == 2 ? n3 : 0;
+            tzx(&zc)->location_tags = where == 2 ? ft : NULL; tzx(&zc)->location_tag_count = where == 2 ? n3 : 0;
             for (int f = 0; f < 4; f++) {
                 uint8_t sc = 0;
                 const uint8_t *ad = f == 1 ? a6 : (f == 2 ? a4b : a4);
                 uint16_t fam = f == 1 ? 2 : (f == 3 ? 7 : 1);
-                (void)resolve_ecs_subnet_tag(&za, &cfg, &zc, ad, fam, &sc);
-                (void)resolve_ecs_subnet_tag(&za, &cfg, &zc, ad, fam, NULL);
+                (void)resolve_ecs_subnet_tag(test_zimg(&za), &cfg, &zc, ad, fam, &sc);
+                (void)resolve_ecs_subnet_tag(test_zimg(&za), &cfg, &zc, ad, fam, NULL);
                 (void)resolve_ecs_subnet_tag(NULL, &cfg, NULL, ad, fam, &sc);
-                (void)resolve_ecs_subnet_tag(&za, NULL, &zc, NULL, fam, &sc);
+                (void)resolve_ecs_subnet_tag(test_zimg(&za), NULL, &zc, NULL, fam, &sc);
             }
             for (size_t i = 0; i < NELEM(ips); i++) {
-                (void)resolve_bind_location_tag(&za, &cfg, &zc, ips[i]);
+                (void)resolve_bind_location_tag(test_zimg(&za), &cfg, &zc, ips[i]);
                 (void)resolve_bind_location_tag(NULL, NULL, &zc, ips[i]);
             }
         }
@@ -1913,12 +1961,12 @@ static void test_ecs_cookie_rrl_dnstap_edges(void) {
         za.bind_ecs_trusted_resolvers = NULL; za.bind_ecs_trusted_resolver_count = 0; za.bind_ecs_trusted_resolvers_parsed = NULL;
         if (mode == 0) { za.bind_ecs_trusted_resolvers = tr; za.bind_ecs_trusted_resolver_count = 3; za.bind_ecs_trusted_resolvers_parsed = trp; }
         if (mode == 1) { za.bind_ecs_trusted_resolvers = tr; za.bind_ecs_trusted_resolver_count = 3; }
-        if (mode == 2) { zc.ecs_trusted_resolvers = tr; zc.ecs_trusted_resolvers_count = 3; zc.ecs_trusted_resolvers_parsed = trp; }
-        if (mode == 3) { zc.ecs_trusted_resolvers = tr; zc.ecs_trusted_resolvers_count = 4; }
+        if (mode == 2) { tzx(&zc)->ecs_trusted_resolvers = tr; tzx(&zc)->ecs_trusted_resolvers_count = 3; tzx(&zc)->ecs_trusted_resolvers_parsed = trp; }
+        if (mode == 3) { tzx(&zc)->ecs_trusted_resolvers = tr; tzx(&zc)->ecs_trusted_resolvers_count = 4; }
         if (mode == 4) { cfg.ecs_trusted_resolvers = tr; cfg.ecs_trusted_resolvers_count = 3; cfg.ecs_trusted_resolvers_parsed = trp; }
         if (mode == 5) { cfg.ecs_trusted_resolvers = tr; cfg.ecs_trusted_resolvers_count = 3; }
         for (size_t i = 0; i < NELEM(ips); i++) {
-            (void)is_ecs_trusted_resolver(&za, &cfg, &zc, ips[i]);
+            (void)is_ecs_trusted_resolver(test_zimg(&za), &cfg, &zc, ips[i]);
             (void)is_ecs_trusted_resolver(NULL, &cfg, NULL, ips[i]);
         }
     }
@@ -1927,14 +1975,15 @@ static void test_ecs_cookie_rrl_dnstap_edges(void) {
     /* tinydns client location */
     tinydns_location_entry_t locs[3] = { { {'j','p'}, {192,0,2,0}, 24 }, { {'u','s'}, {10,0,0,0}, 8 }, { {'a','l'}, {0}, 0 } };
     za.locations = locs; za.location_count = 3;
-    for (size_t i = 0; i < NELEM(ips); i++) { char lo[2]; tinydns_resolve_client_location(&za, ips[i], lo); }
-    char lo2[2]; tinydns_resolve_client_location(&za, "192.0.2.77", lo2); tinydns_resolve_client_location(NULL, "1.2.3.4", lo2);
+    for (size_t i = 0; i < NELEM(ips); i++) { char lo[2]; tinydns_resolve_client_location(test_zimg(&za), ips[i], lo); }
+    char lo2[2]; tinydns_resolve_client_location(test_zimg(&za), "192.0.2.77", lo2); tinydns_resolve_client_location(NULL, "1.2.3.4", lo2);
     za.locations = NULL; za.location_count = 0;
     zone_arena_destroy(&za);
     /* wrap_tinydns_record */
     {
         zone_arena_t w; memset(&w, 0, sizeof(w)); zone_arena_init(&w);
         dns_record_t r; memset(&r, 0, sizeof(r));
+        DNS_RECORD_BIND_RDATA(r);
         r.name = "x.example."; r.type_code = 1; r.type = "A"; r.rdata[0] = "192.0.2.1"; r.rdata_count = 1; r.ttl_value = 60;
         r.tinydns_ttd = time(NULL) + 1000; r.tinydns_loc[0] = 'j'; r.tinydns_loc[1] = 'p';
         dns_record_t out; uint8_t wb[512];
@@ -2143,20 +2192,20 @@ static void upd_entry_init(zone_db_entry_t *e) {
     pthread_mutex_init(&e->writer_lock, NULL);
     pthread_mutex_init(&e->ixfr_history.lock, NULL);
     for (int k = 0; k < 2; k++) {
-        zone_arena_t *a = k ? &e->rcu.arena_b : &e->rcu.arena_a;
+        zone_arena_t *a = k ? test_zone_slot(e, 1) : test_zone_slot(e, 0);
         zone_arena_init(a);
         parse_error_t err = {0};
         parse_context_t ctx = { .base_dir = ".", .default_origin = "upd.example.", .is_standalone_mode = true, .err_out = &err };
         char *b = arena_strdup(a, zt);
         assert(parse_zone_fast(b, strlen(b), a, &ctx) >= 0);
-        assert(build_zone_index(a, true) == 0);
+        assert(test_build_index(a, true) == 0);
     }
-    atomic_store_explicit(&e->rcu.active, &e->rcu.arena_a, memory_order_release);
+    atomic_store_explicit(&e->rcu.active, &test_zone_slot(e, 0)->ver, memory_order_release);
     atomic_store_explicit(&e->serial, 100, memory_order_release);
 }
 
 static void upd_entry_free(zone_db_entry_t *e) {
-    zone_arena_destroy(&e->rcu.arena_a); zone_arena_destroy(&e->rcu.arena_b);
+    zone_arena_destroy(test_zone_slot(e, 0)); zone_arena_destroy(test_zone_slot(e, 1));
     for (int i = 0; i < e->ixfr_history.count; i++) {
         (void)i;
     }
@@ -2235,8 +2284,8 @@ static void test_update_matrix(void) {
     pkt[5] = 2; (void)handle_dynamic_update(pkt, len, &e, "192.0.2.1", NULL);   /* ZOCOUNT != 1 */
     len = upd_build(pkt, "upd.example.", NULL, 0, ups, 1); pkt[len - 16] = 0; /* zone type not SOA */
     (void)handle_dynamic_update(pkt, len, &e, "192.0.2.1", NULL);
-    (void)bump_soa_serial_in_arena(&e.rcu.arena_a, "upd.example.");
-    (void)bump_soa_serial_in_arena(&e.rcu.arena_a, "nomatch.example.");
+    (void)bump_soa_serial_in_arena(test_zone_slot(&e, 0), "upd.example.");
+    (void)bump_soa_serial_in_arena(test_zone_slot(&e, 0), "nomatch.example.");
     upd_entry_free(&e);
     printf("  -> UPDATE matrix passed (NOERROR=%d FORMERR=%d NXDOMAIN=%d YXDOMAIN=%d YXRRSET=%d NXRRSET=%d NOTZONE=%d).\n",
            results[0], results[1], results[3], results[6], results[7], results[8], results[10]);
@@ -2252,16 +2301,16 @@ static void xfr_entry_init(zone_db_entry_t *e, const char *text, const char *ori
     pthread_mutex_init(&e->writer_lock, NULL);
     pthread_mutex_init(&e->ixfr_history.lock, NULL);
     for (int k = 0; k < 2; k++) {
-        zone_arena_t *a = k ? &e->rcu.arena_b : &e->rcu.arena_a;
+        zone_arena_t *a = k ? test_zone_slot(e, 1) : test_zone_slot(e, 0);
         zone_arena_init(a);
         if (!text) continue;
         parse_error_t err = {0};
         parse_context_t ctx = { .base_dir = ".", .default_origin = origin, .is_standalone_mode = true, .err_out = &err };
         char *b = arena_strdup(a, text);
         assert(parse_zone_fast(b, strlen(b), a, &ctx) >= 0);
-        assert(build_zone_index(a, true) == 0);
+        assert(test_build_index(a, true) == 0);
     }
-    atomic_store_explicit(&e->rcu.active, &e->rcu.arena_a, memory_order_release);
+    atomic_store_explicit(&e->rcu.active, &test_zone_slot(e, 0)->ver, memory_order_release);
 }
 
 static size_t xfr_req(uint8_t *p, uint16_t qtype, int serial, bool ext, const char *dom, tsig_key_t *k, uint8_t *mac, size_t *maclen) {
@@ -2298,7 +2347,7 @@ static void xfr_replay(const uint8_t *stream, size_t len, const char *dom, const
     while (o + 2 <= len) {
         size_t ml = ((size_t)stream[o] << 8) | stream[o + 1];
         if (o + 2 + ml > len) break;
-        if (parse_xfr_packet(stream + o + 2, ml, &standby, &active, &ss, dom) < 0) break;
+        if (parse_xfr_packet(stream + o + 2, ml, &standby, &active.ver, &ss, dom) < 0) break;
         o += 2 + ml;
     }
     zone_arena_destroy(&standby); zone_arena_destroy(&active);
@@ -2319,8 +2368,8 @@ static void xfr_replay(const uint8_t *stream, size_t len, const char *dom, const
     if (getenv("SW_SYSLOG")) fprintf(stderr, "XFRDBG len=%zu ixfr=%d hrc=%d parsed_upto=%zu\n", len, ixfr, hrc, o);
     close(sp[1]);
     waitpid(pid, NULL, 0);
-    zone_arena_destroy(&sec.rcu.arena_a); zone_arena_destroy(&sec.rcu.arena_b);
-    for (int i = 0; i < MAX_IXFR_HISTORY; i++) if (sec.ixfr_history.entries[i]) { free_ixfr_txn(sec.ixfr_history.entries[i]); sec.ixfr_history.entries[i] = NULL; }
+    zone_arena_destroy(test_zone_slot(&sec, 0)); zone_arena_destroy(test_zone_slot(&sec, 1));
+    ixfr_history_clear(&sec.ixfr_history);
 }
 
 static void test_xfr_roundtrips(void) {
@@ -2336,7 +2385,7 @@ static void test_xfr_roundtrips(void) {
     zone_db_entry_t srv; xfr_entry_init(&srv, zt, dom);
     atomic_store_explicit(&srv.serial, 100, memory_order_release);
     /* tinydns-style metadata on a couple of records so the wrap path is used */
-    zone_arena_t *act = atomic_load_explicit(&srv.rcu.active, memory_order_acquire);
+    zone_arena_t *act = test_zone_slot(&srv, 0);
     for (size_t i = 0; i < act->count && i < 40; i++) if (act->records[i].type_code == 16 && (i & 1)) { act->records[i].tinydns_loc[0] = 'j'; act->records[i].tinydns_loc[1] = 'p'; }
     /* build IXFR history with a few updates (serial 100 -> 104) */
     for (int u = 0; u < 4; u++) {
@@ -2395,10 +2444,10 @@ static void test_xfr_roundtrips(void) {
     atomic_store_explicit(&srv.active_axfr, 1, memory_order_release);
     assert(!wait_for_active_axfr(&srv, 20));
     atomic_store_explicit(&srv.active_axfr, 0, memory_order_release);
-    zone_arena_destroy(&empty.rcu.arena_a); zone_arena_destroy(&empty.rcu.arena_b);
-    zone_arena_destroy(&nosoa.rcu.arena_a); zone_arena_destroy(&nosoa.rcu.arena_b);
-    zone_arena_destroy(&srv.rcu.arena_a); zone_arena_destroy(&srv.rcu.arena_b);
-    for (int i = 0; i < MAX_IXFR_HISTORY; i++) if (srv.ixfr_history.entries[i]) free_ixfr_txn(srv.ixfr_history.entries[i]);
+    zone_arena_destroy(test_zone_slot(&empty, 0)); zone_arena_destroy(test_zone_slot(&empty, 1));
+    zone_arena_destroy(test_zone_slot(&nosoa, 0)); zone_arena_destroy(test_zone_slot(&nosoa, 1));
+    zone_arena_destroy(test_zone_slot(&srv, 0)); zone_arena_destroy(test_zone_slot(&srv, 1));
+    ixfr_history_clear(&srv.ixfr_history);
     free(zt); free(g_cap); g_cap = NULL; g_cap_cap = 0;
     printf("  -> AXFR/IXFR round trips passed.\n");
 }

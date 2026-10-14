@@ -521,9 +521,8 @@ int main(int argc, char **argv) {
                                                       - (long long)snap.responses_nodata;
                     if (other_noerror_misses < 0) other_noerror_misses = 0; // 概算のズレで負値になった場合の保険
 
-                    printf("  WireCache:             Hits=%lu Misses=%lu [Entries: %lu, ~%lu bytes]\n",
-                           (unsigned long)snap.wirecache_hits, (unsigned long)snap.wirecache_misses,
-                           (unsigned long)snap.wirecache_entries, (unsigned long)snap.wirecache_bytes);
+                    printf("  WireCache:             Hits=%lu Misses=%lu (shared response cache)\n",
+                           (unsigned long)snap.wirecache_hits, (unsigned long)snap.wirecache_misses);
                     printf("                         HitRate: overall=%.1f%% / of-NOERROR=%.1f%% / cache-attempt-rate=%.1f%%\n",
                            hit_rate_overall, hit_rate_noerror, attempt_rate);
                     printf("                         Miss breakdown (approx): NXDOMAIN=%lu NODATA=%lu other-NOERROR=%lld\n",

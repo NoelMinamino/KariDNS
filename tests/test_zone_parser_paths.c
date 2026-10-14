@@ -623,6 +623,43 @@ static void test_generate(void) {
     printf("  -> $GENERATE passed.\n");
 }
 
+/* ${offset,width,base} の offset は 32 bit 符号付きに収まるものだけを受け付ける。範囲外 (strtol の飽和値を
+ * 含む) は拒否し、value + offset が符号付きオーバーフロー (UB) にならないこと。width も範囲外を拒否する。 */
+static void test_generate_offset_range(void) {
+    printf("[TEST] Zone parser: $GENERATE offset/width range checks (no signed overflow)...\n");
+    static const char head[] = "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ NS ns\n";
+    static const char *const bad[] = {
+        "$GENERATE 250-255 ${9223372036854775807,0,d}.u TXT \"v\"\n",   /* LONG_MAX: value + offset overflowed int64 */
+        "$GENERATE 1-2 h${9223372036854775807} A 192.0.2.1\n",
+        "$GENERATE 1-2 h${-9223372036854775808} A 192.0.2.1\n",
+        "$GENERATE 1-2 h${8888888888888888888888888888888888888888880,3,N} TXT \"v\"\n", /* strtol saturates */
+        "$GENERATE 1-2 h${2147483648} A 192.0.2.1\n",                   /* INT32_MAX + 1 */
+        "$GENERATE 1-2 h${-2147483649} A 192.0.2.1\n",                  /* INT32_MIN - 1 */
+        "$GENERATE 1-2 h${0,4294967301,d} A 192.0.2.1\n",               /* (int) cast made this width 5 */
+        "$GENERATE 1-2 h${0,99999999999999999999,d} A 192.0.2.1\n",
+    };
+    for (size_t i = 0; i < N(bad); i++) {
+        zt_t z;
+        char text[512];
+        snprintf(text, sizeof(text), "%s%s", head, bad[i]);
+        zt_load(&z, text);
+        if (z.rc >= 0) fprintf(stderr, "accepted out-of-range $GENERATE: %s", bad[i]);
+        assert(z.rc < 0);
+        assert(z.err.error_message && strstr(z.err.error_message, "$GENERATE"));
+        zt_free(&z);
+    }
+    /* the limits themselves work: value (up to 2^32-1) + INT32_MAX still fits in int64 */
+    zt_t z;
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ NS ns\n"
+                "$GENERATE 4294967295-4294967295 max${2147483647} TXT \"v\"\n"
+                "$GENERATE 1-1 min${-2147483648} TXT \"v\"\n");
+    ASSERT_PARSED(&z);
+    assert(zt_find(&z, "max6442450942.example.", 16));
+    assert(zt_find(&z, "min-2147483647.example.", 16));
+    zt_free(&z);
+    printf("  -> $GENERATE offset/width range passed.\n");
+}
+
 static void write_file(const char *path, const char *text) {
     FILE *f = fopen(path, "w");
     assert(f);
@@ -1534,6 +1571,7 @@ int main(void) {
     test_origin_ttl_owner_syntax();
     test_syntax_errors();
     test_generate();
+    test_generate_offset_range();
     test_include();
     test_tags_and_semantics();
     test_extended_negative_paths();

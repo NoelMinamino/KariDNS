@@ -15,12 +15,16 @@
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
+#include "test_zext.h"
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
+#include "test_image_helper.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_dynamic_update.h"
 #include "dns_query_engine.h"
 #include "dns_axfr_ixfr.h"
 #include "dns_utils.h"
+#include "test_zone_slots.h"
 
 // Mock globals needed by server internal dependencies
 int g_control_kq = -1;
@@ -81,6 +85,7 @@ static void test_bump_soa_serial(void) {
 
     dns_record_t rec;
     memset(&rec, 0, sizeof(rec));
+    DNS_RECORD_BIND_RDATA(rec);
     rec.name = arena_strdup(&arena, "example.com.");
     rec.type = arena_strdup(&arena, "SOA");
     rec.type_code = 6;
@@ -146,6 +151,7 @@ static void test_process_update_sections_records(void) {
     // Initial SOA record
     dns_record_t soa_rec;
     memset(&soa_rec, 0, sizeof(soa_rec));
+    DNS_RECORD_BIND_RDATA(soa_rec);
     soa_rec.name = arena_strdup(&arena, "example.com.");
     soa_rec.type = arena_strdup(&arena, "SOA");
     soa_rec.type_code = 6;
@@ -166,7 +172,7 @@ static void test_process_update_sections_records(void) {
     arena.records_cap = 16;
     arena.records[0] = soa_rec;
     arena.count = 1;
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     // Build UPDATE packet: ZOCOUNT=1 (example.com), PRCOUNT=0, UPCOUNT=1 (Add test.example.com A 192.0.2.99)
     uint8_t pkt[512] = {0};
@@ -214,6 +220,7 @@ static void init_sample_zone_arena(zone_arena_t *arena, const char *domain, cons
 
     dns_record_t rec;
     memset(&rec, 0, sizeof(rec));
+    arena_record_alloc_rdata(arena, &rec, 7);   /* rec は関数を出ると消えるので、rdata[] は arena に持たせる */
     rec.name = arena_strdup(arena, domain);
     rec.type = arena_strdup(arena, "SOA");
     rec.type_code = 6;
@@ -234,7 +241,7 @@ static void init_sample_zone_arena(zone_arena_t *arena, const char *domain, cons
     arena->records_cap = 16;
     arena->records[0] = rec;
     arena->count = 1;
-    build_zone_index(arena, true);
+    assert(test_build_index(arena, true) == 0);
 }
 
 static void test_handle_dynamic_update_pipeline(void) {
@@ -247,9 +254,9 @@ static void test_handle_dynamic_update_pipeline(void) {
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
-    init_sample_zone_arena(&entry.rcu.arena_a, "example.com.", "1000");
-    init_sample_zone_arena(&entry.rcu.arena_b, "example.com.", "1000");
-    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+    init_sample_zone_arena(test_zone_slot(&entry, 0), "example.com.", "1000");
+    init_sample_zone_arena(test_zone_slot(&entry, 1), "example.com.", "1000");
+    atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
     atomic_store_explicit(&entry.serial, 1000, memory_order_release);
 
     // 1. AXFR in progress -> Rejected with SERVFAIL (rcode 2)
@@ -287,11 +294,15 @@ static void test_handle_dynamic_update_pipeline(void) {
     assert(r_success == 0); // NOERROR
     assert(atomic_load_explicit(&entry.serial, memory_order_acquire) == 1001);
     assert(atomic_load_explicit(&entry.notify_now, memory_order_acquire) == true);
-    assert(atomic_load_explicit(&entry.rcu.active, memory_order_acquire) == &entry.rcu.arena_b);
+    assert(atomic_load_explicit(&entry.rcu.active, memory_order_acquire)->heap); /* a new heap version was published */
 
     // Verify record in active arena (arena_b)
-    zone_arena_t *z_cur = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
-    assert(z_cur->count == 2);
+    zone_version_t *z_cur = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
+    assert(z_cur->image != NULL); /* S5 B-2: only the image is published (a zone_version_t has no builder) */
+    /* S5 B-1: the published version carries the image the engine reads, with the added RR in it */
+    assert(z_cur->image != NULL && z_cur->image->n_rrs == 2);
+    uint32_t www_id = zone_image_find_name(z_cur->image, "www.example.com.");
+    assert(www_id != ZONE_IMAGE_NONE && zone_image_rrset_next(z_cur->image, www_id, 1, zone_image_name_first_rr(z_cur->image, www_id)) != ZONE_IMAGE_NONE);
 
     // 3. Update with PREREQ failure (e.g. NXDOMAIN on non-existent domain under RFC 2136 §3.2.1)
     uint8_t bad_pkt[512] = {0};
@@ -320,12 +331,81 @@ static void test_handle_dynamic_update_pipeline(void) {
     assert(r_prereq == 3); // NXDOMAIN (RFC 2136 rcode 3)
 
     // Clean up
-    zone_arena_destroy(&entry.rcu.arena_a);
-    zone_arena_destroy(&entry.rcu.arena_b);
+    zone_arena_destroy(test_zone_slot(&entry, 0));
+    zone_arena_destroy(test_zone_slot(&entry, 1));
     pthread_mutex_destroy(&entry.writer_lock);
     pthread_mutex_destroy(&entry.ixfr_history.lock);
 
     printf("  -> handle_dynamic_update pipeline passed.\n");
+}
+
+/* S5 B-2: an RR of an UPDATE that cannot be written in wire format (a TXT with no RDATA, RFC 1035 §3.3.14 wants at
+ * least one character-string) is dropped with a warning and the rest of the UPDATE is applied. */
+static void test_handle_dynamic_update_drops_unencodable(void) {
+    printf("[TEST] Dynamic Update: an RR that cannot be encoded is dropped, the rest is applied...\n");
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strncpy(entry.domain, "example.com.", sizeof(entry.domain) - 1);
+    strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+    init_sample_zone_arena(test_zone_slot(&entry, 0), "example.com.", "1000");
+    atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
+    atomic_store_explicit(&entry.serial, 1000, memory_order_release);
+
+    uint8_t pkt[512] = {0};
+    pkt[0] = 0x12; pkt[1] = 0x35;
+    pkt[2] = 0x28; // UPDATE
+    pkt[5] = 1;    // ZOCOUNT=1
+    pkt[9] = 2;    // UPCOUNT=2
+    size_t off = 12;
+    static const uint8_t zname[] = { 7, 'e','x','a','m','p','l','e', 3, 'c','o','m', 0 };
+    memcpy(&pkt[off], zname, sizeof(zname)); off += sizeof(zname);
+    pkt[off++] = 0; pkt[off++] = 6; pkt[off++] = 0; pkt[off++] = 1; // SOA IN
+    // 1. add www.example.com. A 192.0.2.7
+    pkt[off++] = 3; memcpy(&pkt[off], "www", 3); off += 3;
+    memcpy(&pkt[off], zname, sizeof(zname)); off += sizeof(zname);
+    pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0; pkt[off++] = 1;
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0x2C;
+    pkt[off++] = 0; pkt[off++] = 4;
+    pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = 7;
+    // 2. add bad.example.com. TXT with RDLENGTH 0
+    pkt[off++] = 3; memcpy(&pkt[off], "bad", 3); off += 3;
+    memcpy(&pkt[off], zname, sizeof(zname)); off += sizeof(zname);
+    pkt[off++] = 0; pkt[off++] = 16; pkt[off++] = 0; pkt[off++] = 1;
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0x2C;
+    pkt[off++] = 0; pkt[off++] = 0;
+
+    assert(handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "key") == 0);
+    assert(atomic_load_explicit(&entry.serial, memory_order_acquire) == 1001);
+    zone_version_t *cur = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
+    assert(cur != &test_zone_slot(&entry, 0)->ver && cur->heap && cur->image != NULL);
+    assert(cur->image->n_rrs == 2);   /* SOA + www A: the TXT was dropped, the A applied */
+    uint32_t id = zone_image_find_name(cur->image, "www.example.com.");
+    assert(id != ZONE_IMAGE_NONE && zone_image_rrset_next(cur->image, id, 1, zone_image_name_first_rr(cur->image, id)) != ZONE_IMAGE_NONE);
+    assert(zone_image_find_name(cur->image, "bad.example.com.") == ZONE_IMAGE_NONE);
+
+    /* 3. an UPDATE whose only addition cannot be encoded changes nothing: no serial bump, nothing published
+     * (RFC 2136 §3.6) */
+    pkt[1] = 0x36;
+    pkt[9] = 1; // UPCOUNT=1
+    size_t off2 = 12 + sizeof(zname) + 4;
+    pkt[off2++] = 3; memcpy(&pkt[off2], "bad", 3); off2 += 3;
+    memcpy(&pkt[off2], zname, sizeof(zname)); off2 += sizeof(zname);
+    pkt[off2++] = 0; pkt[off2++] = 16; pkt[off2++] = 0; pkt[off2++] = 1;
+    pkt[off2++] = 0; pkt[off2++] = 0; pkt[off2++] = 1; pkt[off2++] = 0x2C;
+    pkt[off2++] = 0; pkt[off2++] = 0;
+    uint32_t serial_before = atomic_load_explicit(&entry.serial, memory_order_acquire);
+    assert(handle_dynamic_update(pkt, off2, &entry, "127.0.0.1", "key") == 0);
+    assert(atomic_load_explicit(&entry.serial, memory_order_acquire) == serial_before);
+    assert(atomic_load_explicit(&entry.rcu.active, memory_order_acquire) == cur);
+
+    zone_arena_destroy(test_zone_slot(&entry, 0));
+    zone_arena_destroy(test_zone_slot(&entry, 1));
+    pthread_mutex_destroy(&entry.writer_lock);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    printf("  -> unencodable UPDATE RR dropped passed.\n");
 }
 
 static void test_send_notify_to_all_comprehensive(void) {
@@ -346,8 +426,8 @@ static void test_send_notify_to_all_comprehensive(void) {
     zone_config_t zcfg1, zcfg2;
     memset(&zcfg1, 0, sizeof(zcfg1));
     zcfg1.domain = "example.com.";
-    zcfg1.notify_source = "192.0.2.1";
-    zcfg1.also_notify_count = 3;
+    tzx(&zcfg1)->notify_source = "192.0.2.1";
+    tzx(&zcfg1)->also_notify_count = 3;
     ip_port_t notifys[3];
     notifys[0].ip = "192.0.2.10";
     notifys[0].port = 53;
@@ -355,7 +435,7 @@ static void test_send_notify_to_all_comprehensive(void) {
     notifys[1].port = 5353;
     notifys[2].ip = "invalid.ip"; // Invalid IP to test parse failure
     notifys[2].port = 53;
-    zcfg1.also_notify = notifys;
+    tzx(&zcfg1)->also_notify = notifys;
     zcfg1.next = &zcfg2;
 
     memset(&zcfg2, 0, sizeof(zcfg2));
@@ -374,13 +454,13 @@ static void test_send_notify_to_all_comprehensive(void) {
     zone_db_entry_t *z2 = snapshot_get_zone(snap, "sibling.com.");
     assert(z1 && z2);
 
-    init_sample_zone_arena(&z1->rcu.arena_a, "example.com.", "100");
+    init_sample_zone_arena(test_zone_slot(z1, 0), "example.com.", "100");
 
     // Add NS records and glue in z1
     // NS 1: ns1.example.com (matches SOA MNAME -> excluded)
     // NS 2: ns2.example.com -> in-zone A and AAAA glue
     // NS 3: ns1.sibling.com -> sibling zone glue
-    zone_arena_t *a1 = &z1->rcu.arena_a;
+    zone_arena_t *a1 = test_zone_slot(z1, 0);
     dns_record_t *new_recs = realloc(a1->records, sizeof(dns_record_t) * 16);
     assert(new_recs);
     a1->records = new_recs;
@@ -388,18 +468,21 @@ static void test_send_notify_to_all_comprehensive(void) {
 
     // NS records
     dns_record_t r_ns1; memset(&r_ns1, 0, sizeof(r_ns1));
+    DNS_RECORD_BIND_RDATA(r_ns1);
     r_ns1.name = arena_strdup(a1, "example.com.");
     r_ns1.type_code = 2; r_ns1.rdata_count = 1;
     r_ns1.rdata[0] = arena_strdup(a1, "ns1.example.com.");
     a1->records[a1->count++] = r_ns1;
 
     dns_record_t r_ns2; memset(&r_ns2, 0, sizeof(r_ns2));
+    DNS_RECORD_BIND_RDATA(r_ns2);
     r_ns2.name = arena_strdup(a1, "example.com.");
     r_ns2.type_code = 2; r_ns2.rdata_count = 1;
     r_ns2.rdata[0] = arena_strdup(a1, "ns2.example.com.");
     a1->records[a1->count++] = r_ns2;
 
     dns_record_t r_ns3; memset(&r_ns3, 0, sizeof(r_ns3));
+    DNS_RECORD_BIND_RDATA(r_ns3);
     r_ns3.name = arena_strdup(a1, "example.com.");
     r_ns3.type_code = 2; r_ns3.rdata_count = 1;
     r_ns3.rdata[0] = arena_strdup(a1, "ns1.sibling.com.");
@@ -407,42 +490,46 @@ static void test_send_notify_to_all_comprehensive(void) {
 
     // In-zone A & AAAA glue for ns2.example.com
     dns_record_t r_g4; memset(&r_g4, 0, sizeof(r_g4));
+    DNS_RECORD_BIND_RDATA(r_g4);
     r_g4.name = arena_strdup(a1, "ns2.example.com.");
     r_g4.type_code = 1; r_g4.rdata_count = 1;
     r_g4.rdata[0] = arena_strdup(a1, "192.0.2.20");
     a1->records[a1->count++] = r_g4;
 
     dns_record_t r_g6; memset(&r_g6, 0, sizeof(r_g6));
+    DNS_RECORD_BIND_RDATA(r_g6);
     r_g6.name = arena_strdup(a1, "ns2.example.com.");
     r_g6.type_code = 28; r_g6.rdata_count = 1;
     r_g6.rdata[0] = arena_strdup(a1, "2001:db8::20");
     a1->records[a1->count++] = r_g6;
 
-    build_zone_index(a1, true);
-    atomic_store_explicit(&z1->rcu.active, a1, memory_order_release);
+    assert(test_build_index(a1, true) == 0);
+    atomic_store_explicit(&z1->rcu.active, &a1->ver, memory_order_release);
 
     // Sibling zone z2: sibling.com
-    init_sample_zone_arena(&z2->rcu.arena_a, "sibling.com.", "100");
-    zone_arena_t *a2 = &z2->rcu.arena_a;
+    init_sample_zone_arena(test_zone_slot(z2, 0), "sibling.com.", "100");
+    zone_arena_t *a2 = test_zone_slot(z2, 0);
     dns_record_t *new_recs2 = realloc(a2->records, sizeof(dns_record_t) * 16);
     assert(new_recs2);
     a2->records = new_recs2;
     a2->records_cap = 16;
 
     dns_record_t r_sib4; memset(&r_sib4, 0, sizeof(r_sib4));
+    DNS_RECORD_BIND_RDATA(r_sib4);
     r_sib4.name = arena_strdup(a2, "ns1.sibling.com.");
     r_sib4.type_code = 1; r_sib4.rdata_count = 1;
     r_sib4.rdata[0] = arena_strdup(a2, "198.51.100.30");
     a2->records[a2->count++] = r_sib4;
 
     dns_record_t r_sib6; memset(&r_sib6, 0, sizeof(r_sib6));
+    DNS_RECORD_BIND_RDATA(r_sib6);
     r_sib6.name = arena_strdup(a2, "ns1.sibling.com.");
     r_sib6.type_code = 28; r_sib6.rdata_count = 1;
     r_sib6.rdata[0] = arena_strdup(a2, "2001:db8:ffff::30");
     a2->records[a2->count++] = r_sib6;
 
-    build_zone_index(a2, true);
-    atomic_store_explicit(&z2->rcu.active, a2, memory_order_release);
+    assert(test_build_index(a2, true) == 0);
+    atomic_store_explicit(&z2->rcu.active, &a2->ver, memory_order_release);
 
     send_notify_to_all("example.com.", "default");
 
@@ -487,6 +574,7 @@ static void test_process_update_sections_apex_ns_protection(void) {
     // SOA record
     dns_record_t soa;
     memset(&soa, 0, sizeof(soa));
+    DNS_RECORD_BIND_RDATA(soa);
     soa.name = arena_strdup(&arena, "example.com.");
     soa.type = arena_strdup(&arena, "SOA");
     soa.type_code = 6;
@@ -507,6 +595,7 @@ static void test_process_update_sections_apex_ns_protection(void) {
     // Only 1 apex NS record
     dns_record_t ns1;
     memset(&ns1, 0, sizeof(ns1));
+    DNS_RECORD_BIND_RDATA(ns1);
     ns1.name = arena_strdup(&arena, "example.com.");
     ns1.type = arena_strdup(&arena, "NS");
     ns1.type_code = 2;
@@ -518,7 +607,7 @@ static void test_process_update_sections_apex_ns_protection(void) {
     ns1.rdata[0] = arena_strdup(&arena, "ns1.example.com.");
     arena.records[arena.count++] = ns1;
 
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     // Build UPDATE packet to delete ns1 via CLASS NONE (254)
     uint8_t pkt[512] = {0};
@@ -564,6 +653,7 @@ static void test_process_update_sections_apex_ns_protection(void) {
     // Now add a second apex NS record: ns2.example.com.
     dns_record_t ns2;
     memset(&ns2, 0, sizeof(ns2));
+    DNS_RECORD_BIND_RDATA(ns2);
     ns2.name = arena_strdup(&arena, "example.com.");
     ns2.type = arena_strdup(&arena, "NS");
     ns2.type_code = 2;
@@ -574,7 +664,7 @@ static void test_process_update_sections_apex_ns_protection(void) {
     ns2.rdata_count = 1;
     ns2.rdata[0] = arena_strdup(&arena, "ns2.example.com.");
     arena.records[arena.count++] = ns2;
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     // Now repeating the delete of ns1 must succeed (2 apex NS existed -> 1 remains)
     rcode = process_update_sections(pkt, off, "example.com.", &arena, &ur);
@@ -617,8 +707,8 @@ static void test_update_multi_tsig_keys(void) {
     memset(&zcfg, 0, sizeof(zcfg));
     zcfg.domain = "example.com.";
     zcfg.type = "master";
-    zcfg.allow_update = allow_keys;
-    zcfg.allow_update_count = 2;
+    tzx(&zcfg)->allow_update = allow_keys;
+    tzx(&zcfg)->allow_update_count = 2;
     cfg.zones = &zcfg;
 
     zone_db_entry_t entry;
@@ -628,9 +718,9 @@ static void test_update_multi_tsig_keys(void) {
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
-    init_sample_zone_arena(&entry.rcu.arena_a, "example.com.", "100");
-    init_sample_zone_arena(&entry.rcu.arena_b, "example.com.", "100");
-    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+    init_sample_zone_arena(test_zone_slot(&entry, 0), "example.com.", "100");
+    init_sample_zone_arena(test_zone_slot(&entry, 1), "example.com.", "100");
+    atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
     atomic_store_explicit(&entry.serial, 100, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &entry };
@@ -692,8 +782,8 @@ static void test_update_multi_tsig_keys(void) {
     uint8_t rcode = res[3] & 0x0F;
     assert(rcode == 0); // MUST NOT be 9 (NOTAUTH)! Must succeed with NOERROR (0)
 
-    zone_arena_destroy(&entry.rcu.arena_a);
-    zone_arena_destroy(&entry.rcu.arena_b);
+    zone_arena_destroy(test_zone_slot(&entry, 0));
+    zone_arena_destroy(test_zone_slot(&entry, 1));
     pthread_mutex_destroy(&entry.writer_lock);
     pthread_mutex_destroy(&entry.ixfr_history.lock);
 
@@ -708,6 +798,7 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
     // Add an A record for www.example.com.
     dns_record_t a_rec;
     memset(&a_rec, 0, sizeof(a_rec));
+    DNS_RECORD_BIND_RDATA(a_rec);
     a_rec.name = arena_strdup(&arena, "www.example.com.");
     a_rec.type = arena_strdup(&arena, "A");
     a_rec.type_code = 1;
@@ -718,7 +809,7 @@ static void test_dynamic_update_prerequisites_and_error_paths(void) {
     a_rec.rdata_count = 1;
     a_rec.rdata[0] = arena_strdup(&arena, "192.0.2.1");
     arena.records[arena.count++] = a_rec;
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     // 1. Short packet (< 12 bytes)
     uint8_t short_pkt[8] = {0};
@@ -955,7 +1046,7 @@ static void upd_load(zone_arena_t *a) {
     ctx.err_out = &err;
     char *b = arena_strdup(a, UPD_ZONE_TEXT); // the arena keeps pointers into the text
     assert(parse_zone_fast(b, strlen(b), a, &ctx) >= 0);
-    assert(build_zone_index(a, true) == 0);
+    assert(test_build_index(a, true) == 0);
 }
 
 static int upd_count(const zone_arena_t *a, const char *name, uint16_t type) {
@@ -973,6 +1064,24 @@ static const dns_record_t *upd_get(const zone_arena_t *a, const char *name, uint
         if (r->name && r->type_code == type && strcasecmp(r->name, name) == 0) return r;
     }
     return NULL;
+}
+
+/* S5 B-2: a published version has no builder, only its image */
+static int upd_img_count(const zone_version_t *a, const char *name, uint16_t type) {
+    uint32_t id = zone_image_find_name(a->image, name);
+    int n = 0;
+    if (id == ZONE_IMAGE_NONE) return 0;
+    for (uint32_t k = zone_image_rrset_next(a->image, id, type, zone_image_name_first_rr(a->image, id)); k != ZONE_IMAGE_NONE;
+         k = zone_image_rrset_next(a->image, id, type, k + 1))
+        n++;
+    return n;
+}
+
+static uint32_t upd_img_serial(const zone_version_t *a) {
+    zone_image_soa_t nums;
+    uint32_t rr = zone_image_apex_soa(a->image);
+    assert(rr != ZONE_IMAGE_NONE && zone_image_soa(a->image, rr, NULL, 0, NULL, 0, &nums) == 0);
+    return nums.serial;
 }
 
 typedef struct {
@@ -1389,15 +1498,15 @@ static void upd_entry_init(zone_db_entry_t *entry) {
     strlcpy(entry->view_name, "default", sizeof(entry->view_name));
     pthread_mutex_init(&entry->writer_lock, NULL);
     pthread_mutex_init(&entry->ixfr_history.lock, NULL);
-    upd_load(&entry->rcu.arena_a);
-    upd_load(&entry->rcu.arena_b);
-    atomic_store_explicit(&entry->rcu.active, &entry->rcu.arena_a, memory_order_release);
+    upd_load(test_zone_slot(entry, 0));
+    upd_load(test_zone_slot(entry, 1));
+    atomic_store_explicit(&entry->rcu.active, &test_zone_slot(entry, 0)->ver, memory_order_release);
     atomic_store_explicit(&entry->serial, 100, memory_order_release);
 }
 
 static void upd_entry_destroy(zone_db_entry_t *entry) {
-    zone_arena_destroy(&entry->rcu.arena_a);
-    zone_arena_destroy(&entry->rcu.arena_b);
+    zone_arena_destroy(test_zone_slot(entry, 0));
+    zone_arena_destroy(test_zone_slot(entry, 1));
     pthread_mutex_destroy(&entry->writer_lock);
     pthread_mutex_destroy(&entry->ixfr_history.lock);
 }
@@ -1412,7 +1521,7 @@ static void test_handle_dynamic_update_serial_rules(void) {
     upd_begin(&m);
     upd_rr(&m, true, "www." UZ, 255, 255, 0, NULL, 0);
     assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 0);
-    assert(atomic_load(&entry.rcu.active) == &entry.rcu.arena_a);
+    assert(atomic_load(&entry.rcu.active) == &test_zone_slot(&entry, 0)->ver);
     assert(atomic_load(&entry.serial) == 100);
     assert(!atomic_load(&entry.notify_now));
 
@@ -1421,7 +1530,7 @@ static void test_handle_dynamic_update_serial_rules(void) {
     upd_named(&m, "www." UZ, 5, 1, "ns1." UZ);
     upd_soa(&m, UZ, 1, 50);
     assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 0);
-    assert(atomic_load(&entry.rcu.active) == &entry.rcu.arena_a);
+    assert(atomic_load(&entry.rcu.active) == &test_zone_slot(&entry, 0)->ver);
     assert(atomic_load(&entry.serial) == 100);
 
     /* explicit newer SOA together with other data: that serial, no automatic increment (R-01) */
@@ -1429,11 +1538,11 @@ static void test_handle_dynamic_update_serial_rules(void) {
     upd_soa(&m, UZ, 1, 500);
     upd_a(&m, false, "new." UZ, 1, 300, 20);
     assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 0);
-    zone_arena_t *cur = atomic_load(&entry.rcu.active);
-    assert(cur == &entry.rcu.arena_b);
+    zone_version_t *cur = atomic_load(&entry.rcu.active);
+    assert(cur->heap);
     assert(atomic_load(&entry.serial) == 500);
-    assert(upd_count(cur, UZ, 6) == 1 && strcmp(upd_get(cur, UZ, 6)->rdata[2], "500") == 0);
-    assert(upd_count(cur, "new." UZ, 1) == 1);
+    assert(upd_img_count(cur, UZ, 6) == 1 && upd_img_serial(cur) == 500);
+    assert(upd_img_count(cur, "new." UZ, 1) == 1);
     assert(atomic_load(&entry.notify_now));
 
     /* a change without SOA: the server increments the serial */
@@ -1442,7 +1551,7 @@ static void test_handle_dynamic_update_serial_rules(void) {
     assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 0);
     cur = atomic_load(&entry.rcu.active);
     assert(atomic_load(&entry.serial) == 501);
-    assert(strcmp(upd_get(cur, UZ, 6)->rdata[2], "501") == 0);
+    assert(upd_img_serial(cur) == 501);
 
     /* an error after a valid RR: nothing applied (§3.4.2.1 / atomic update) */
     upd_begin(&m);
@@ -1450,23 +1559,25 @@ static void test_handle_dynamic_update_serial_rules(void) {
     upd_rr(&m, false, "www." UZ, 1, 255, 5, NULL, 0); // class ANY with TTL != 0 -> FORMERR
     assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 1);
     assert(atomic_load(&entry.rcu.active) == cur);
-    assert(upd_count(cur, "new3." UZ, 1) == 0);
+    assert(upd_img_count(cur, "new3." UZ, 1) == 0);
     assert(atomic_load(&entry.serial) == 501);
 
-    /* X-17: the serial cannot be incremented (here no apex SOA in the copy; an arena allocation failure in
-     * bump_soa_serial_in_arena() takes the same branch): SERVFAIL, nothing published, serial unchanged,
-     * no NOTIFY (RFC 2136 §3.6: a changed zone must get a new serial). */
-    dns_record_t *apex_soa = (dns_record_t *)upd_get(cur, UZ, 6); // the test changes the copy source
-    apex_soa->type_code = 99;
+    /* X-17: the serial cannot be incremented (here no apex SOA in the copy: the spelling of the apex in the image
+     * the copy is thawed from is changed; an arena allocation failure in bump_soa_serial_in_arena() takes the same
+     * branch): SERVFAIL, nothing published, serial unchanged, no NOTIFY (RFC 2136 §3.6: a changed zone must get a
+     * new serial). */
+    char *apex_text = (char *)zone_image_name_text(cur->image, cur->image->apex_name); // the test changes the copy source
+    char apex_first = apex_text[0];
+    apex_text[0] = 'X';
     atomic_store(&entry.notify_now, false);
     upd_begin(&m);
     upd_a(&m, false, "new4." UZ, 1, 300, 23);
     assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 2);
     assert(atomic_load(&entry.rcu.active) == cur);
-    assert(upd_count(cur, "new4." UZ, 1) == 0);
+    assert(upd_img_count(cur, "new4." UZ, 1) == 0);
     assert(atomic_load(&entry.serial) == 501);
     assert(!atomic_load(&entry.notify_now));
-    apex_soa->type_code = 6;
+    apex_text[0] = apex_first;
 
     upd_entry_destroy(&entry);
     printf("  -> Serial rules passed.\n");
@@ -1496,14 +1607,14 @@ static void test_update_dispatch_zone_section(void) {
     memset(&sec_cfg, 0, sizeof(sec_cfg));
     sec_cfg.domain = "sec.example.";
     sec_cfg.type = "slave";
-    sec_cfg.allow_update = allow;
-    sec_cfg.allow_update_count = 1;
+    tzx(&sec_cfg)->allow_update = allow;
+    tzx(&sec_cfg)->allow_update_count = 1;
     zone_config_t prim_cfg;
     memset(&prim_cfg, 0, sizeof(prim_cfg));
     prim_cfg.domain = UZ;
     prim_cfg.type = "master";
-    prim_cfg.allow_update = allow;
-    prim_cfg.allow_update_count = 1;
+    tzx(&prim_cfg)->allow_update = allow;
+    tzx(&prim_cfg)->allow_update_count = 1;
     prim_cfg.next = &sec_cfg;
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -1516,8 +1627,8 @@ static void test_update_dispatch_zone_section(void) {
     memset(&sec, 0, sizeof(sec));
     strlcpy(sec.domain, "sec.example.", sizeof(sec.domain));
     strlcpy(sec.view_name, "default", sizeof(sec.view_name));
-    zone_arena_init(&sec.rcu.arena_a);
-    atomic_store_explicit(&sec.rcu.active, &sec.rcu.arena_a, memory_order_release);
+    zone_arena_init(test_zone_slot(&sec, 0));
+    atomic_store_explicit(&sec.rcu.active, &test_zone_slot(&sec, 0)->ver, memory_order_release);
 
     zone_db_entry_t *entries[2] = { &prim, &sec };
     char *any_acl[1] = { "any" };
@@ -1571,11 +1682,11 @@ static void test_update_dispatch_zone_section(void) {
     assert(len >= 12 && (res[3] & 0x0F) == 5);
     len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
     assert(len >= 12 && (res[3] & 0x0F) == 0);
-    assert(upd_count(atomic_load(&prim.rcu.active), "new." UZ, 1) == 1);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "new." UZ, 1) == 1);
     assert(atomic_load(&prim.serial) == 101);
 
     upd_entry_destroy(&prim);
-    zone_arena_destroy(&sec.rcu.arena_a);
+    zone_arena_destroy(test_zone_slot(&sec, 0));
     printf("  -> Zone section dispatch passed.\n");
 }
 
@@ -1635,8 +1746,8 @@ static void test_update_tsig_matrix(void) {
     memset(&zc, 0, sizeof(zc));
     zc.domain = UZ;
     zc.type = "master";
-    zc.allow_update = allow_k1;
-    zc.allow_update_count = 1;
+    tzx(&zc)->allow_update = allow_k1;
+    tzx(&zc)->allow_update_count = 1;
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.zones = &zc;
@@ -1670,13 +1781,13 @@ static void test_update_tsig_matrix(void) {
     upd_begin(&m); upd_a(&m, false, "t1." UZ, 1, 300, 31); tk_sign(&m, &k1, mac, &mac_len);
     len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 0, "k1.", 0, 32, &k1, mac, mac_len);
-    assert(upd_count(atomic_load(&prim.rcu.active), "t1." UZ, 1) == 1);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "t1." UZ, 1) == 1);
 
     /* valid key that allow-update does not list: REFUSED, signed with that key (not k1), error 0 */
     upd_begin(&m); upd_a(&m, false, "t2." UZ, 1, 300, 32); tk_sign(&m, &k2, mac, &mac_len);
     len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 5, "k2.", 0, 32, &k2, mac, mac_len);
-    assert(upd_count(atomic_load(&prim.rcu.active), "t2." UZ, 1) == 0);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "t2." UZ, 1) == 0);
 
     /* unknown key: NOTAUTH, BADKEY, unsigned, the request's key name echoed */
     upd_begin(&m); upd_a(&m, false, "t3." UZ, 1, 300, 33); tk_sign(&m, &k3, mac, &mac_len);
@@ -1687,7 +1798,7 @@ static void test_update_tsig_matrix(void) {
     upd_begin(&m); upd_a(&m, false, "t4." UZ, 1, 300, 34); tk_sign(&m, &k1_bad, mac, &mac_len);
     len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 9, "k1.", 16, 0, NULL, NULL, 0);
-    assert(upd_count(atomic_load(&prim.rcu.active), "t4." UZ, 1) == 0);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "t4." UZ, 1) == 0);
 
     /* BADTIME (R-08): signed with k1, Time Signed and Fudge are the client's, Other Data = server time */
     k1.fuzztime = 1000000000;
@@ -1705,7 +1816,7 @@ static void test_update_tsig_matrix(void) {
         tk_expect(res, len, 9, "k1.", 18, 32, &k1, mac, mac_len);
         k1.fuzztime = 0;
     }
-    assert(upd_count(atomic_load(&prim.rcu.active), "t5." UZ, 1) == 0);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "t5." UZ, 1) == 0);
 
     /* BADTRUNC: a MAC truncated to 16 octets (allowed by §5.2.2.1) is below the local policy (full length) */
     upd_begin(&m); upd_a(&m, false, "t6." UZ, 1, 300, 36); tk_sign(&m, &k1, mac, &mac_len);
@@ -1722,7 +1833,7 @@ static void test_update_tsig_matrix(void) {
     }
     len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 9, "k1.", 22, 32, &k1, mac, 16);
-    assert(upd_count(atomic_load(&prim.rcu.active), "t6." UZ, 1) == 0);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "t6." UZ, 1) == 0);
 
     /* R-09: a MAC shorter than max(10, hash/2) is FORMERR, no TSIG in the response */
     upd_begin(&m); upd_a(&m, false, "t7." UZ, 1, 300, 37); tk_sign(&m, &k1, mac, &mac_len);
@@ -1745,7 +1856,7 @@ static void test_update_tsig_matrix(void) {
     tk_sign(&m, &k1, mac, &mac_len);
     len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 1, NULL, 0, 0, NULL, NULL, 0);
-    assert(upd_count(atomic_load(&prim.rcu.active), "t8." UZ, 1) == 0);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "t8." UZ, 1) == 0);
 
     /* R-20: an Original ID that differs from the message ID is accepted (the digest uses it) */
     upd_begin(&m); upd_a(&m, false, "t9." UZ, 1, 300, 39); tk_sign(&m, &k1, mac, &mac_len);
@@ -1760,20 +1871,20 @@ static void test_update_tsig_matrix(void) {
     tk_expect(res, len, 9, "k1.", 0, 32, &k1, mac, mac_len);
 
     /* zone without allow-update: REFUSED, signed with the request's key */
-    zc.allow_update = NULL;
-    zc.allow_update_count = 0;
+    tzx(&zc)->allow_update = NULL;
+    tzx(&zc)->allow_update_count = 0;
     upd_begin(&m); upd_a(&m, false, "t10." UZ, 1, 300, 40); tk_sign(&m, &k1, mac, &mac_len);
     len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 5, "k1.", 0, 32, &k1, mac, mac_len);
 
     /* address ACL: an allowed address with a valid (unlisted) key is accepted and signed, like BIND;
      * an unsigned request from that address stays accepted and unsigned */
-    zc.allow_update = allow_ip;
-    zc.allow_update_count = 1;
+    tzx(&zc)->allow_update = allow_ip;
+    tzx(&zc)->allow_update_count = 1;
     upd_begin(&m); upd_a(&m, false, "t11." UZ, 1, 300, 41); tk_sign(&m, &k2, mac, &mac_len);
     len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 0, "k2.", 0, 32, &k2, mac, mac_len);
-    assert(upd_count(atomic_load(&prim.rcu.active), "t11." UZ, 1) == 1);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "t11." UZ, 1) == 1);
     upd_begin(&m); upd_a(&m, false, "t12." UZ, 1, 300, 42);
     len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 0, NULL, 0, 0, NULL, NULL, 0);
@@ -1781,7 +1892,7 @@ static void test_update_tsig_matrix(void) {
     upd_begin(&m); upd_a(&m, false, "t13." UZ, 1, 300, 43); tk_sign(&m, &k1_bad, mac, &mac_len);
     len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
     tk_expect(res, len, 9, "k1.", 16, 0, NULL, NULL, 0);
-    assert(upd_count(atomic_load(&prim.rcu.active), "t13." UZ, 1) == 0);
+    assert(upd_img_count(atomic_load(&prim.rcu.active), "t13." UZ, 1) == 0);
 
     upd_entry_destroy(&prim);
     printf("  -> TSIG matrix passed.\n");
@@ -1794,6 +1905,7 @@ int main(void) {
     test_process_update_sections_apex_ns_protection();
     test_dynamic_update_prerequisites_and_error_paths();
     test_handle_dynamic_update_pipeline();
+    test_handle_dynamic_update_drops_unencodable();
     test_update_multi_tsig_keys();
     test_update_soa_rules();
     test_update_cname_dname_rules();

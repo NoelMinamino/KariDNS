@@ -73,6 +73,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size >= 16) {
         dns_record_t srec;
         memset(&srec, 0, sizeof(srec));
+        DNS_RECORD_BIND_RDATA(srec);
         srec.name = "fuzz.test.";
         
         int type_choices[] = {1, 28, 15, 33, 257, 6, 64, 65, 35, 37, 44, 52, 53, 51,

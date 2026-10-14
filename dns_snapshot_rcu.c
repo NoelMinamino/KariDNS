@@ -7,9 +7,11 @@
 #include "dns_edns_ecs.h"
 #include "dns_axfr_ixfr.h"
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
 #include "dns_wire.h"
 #include "dns_utils.h"
 #include "dns_tsig_acl.h"
+#include "dns_query_engine.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,9 +76,8 @@ zone_config_t *find_zone_config_in_view(server_config_t *cfg,
   if (cfg->views) {
     for (view_config_t *v = cfg->views; v; v = v->next) {
       if (view_name && view_name[0] != '\0' && strcasecmp(v->name, view_name) != 0) continue;
-      for (zone_config_t *z = v->zones; z; z = z->next) {
-        if (domain_names_match_ci(z->domain, domain)) return z;
-      }
+      zone_config_t *z = view_find_zone_config(v, domain);
+      if (z) return z;
       if (view_name && view_name[0] != '\0') return NULL;
     }
   } else {
@@ -144,10 +145,7 @@ int lookup_zone_across_views(zone_db_snapshot_t *snap, server_config_t *cfg,
   int matches = 0;
   for (view_config_t *v = cfg->views; v; v = v->next) {
     if (view_name && v->name && strcasecmp(v->name, view_name) != 0) continue;
-    zone_config_t *zcfg = NULL;
-    for (zone_config_t *z = v->zones; z; z = z->next) {
-      if (z->domain && domain_names_match_ci(z->domain, domain)) { zcfg = z; break; }
-    }
+    zone_config_t *zcfg = view_find_zone_config(v, domain);
     if (!zcfg) continue;
 
     zone_db_entry_t *entry = v->name ? snapshot_get_zone_in_view(snap, v->name, domain) : NULL;
@@ -264,6 +262,7 @@ zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name
   if (!z) return NULL;
   atomic_init(&z->active_axfr, 0);
   atomic_init(&z->snapshot_refs, 1);
+  z->id = zone_entry_next_id();
 
   size_t dlen = domain ? strlen(domain) : 0;
   if (dlen > 0 && dns_name_len_no_root(domain, dlen) == dlen && dlen + 1 < sizeof(z->domain)) {
@@ -278,11 +277,7 @@ zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name
   z->view_name[sizeof(z->view_name) - 1] = '\0';
   pthread_mutex_init(&z->writer_lock, NULL);
   pthread_mutex_init(&z->ixfr_history.lock, NULL);
-  z->ixfr_history.count = 0;
-  z->ixfr_history.head = 0;
-  zone_arena_init(&z->rcu.arena_a);
-  zone_arena_init(&z->rcu.arena_b);
-  atomic_init(&z->rcu.active, &z->rcu.arena_a);
+  atomic_init(&z->rcu.active, &zone_version_empty);
   return z;
 }
 
@@ -297,14 +292,11 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
   wait_for_active_axfr(entry, 0);
   pthread_mutex_destroy(&entry->writer_lock);
   pthread_mutex_destroy(&entry->ixfr_history.lock);
-  for (int idx = 0; idx < MAX_IXFR_HISTORY; idx++) {
-    ixfr_txn_t *txn = entry->ixfr_history.entries[idx];
-    if (txn) {
-      free_ixfr_txn(txn);
-    }
-  }
-  zone_arena_destroy(&entry->rcu.arena_a);
-  zone_arena_destroy(&entry->rcu.arena_b);
+  ixfr_history_clear(&entry->ixfr_history);
+  zone_version_free(atomic_load_explicit(&entry->rcu.active, memory_order_relaxed));
+  free(entry->catalog_master);
+  free(entry->catalog_member_unique_id);
+  free(entry->owning_catalog_domain);
   free(entry);
 }
 
@@ -422,195 +414,243 @@ static char *server_load_file_cb(parse_context_t *ctx, const char *rel_path, dev
     return buf;
 }
 
-#define MAX_PRELINK_TARGETS 256
-#define MAX_MATCH_RECS 32
+#define MAX_PRELINK_TARGETS 256 /* the image's NAME_GLUE flag uses the same number (IMG_MAX_PRELINK_TARGETS) */
 
-void prelink_zone_additional_glue(zone_arena_t *current_zone,
-                                  const char *zone_domain,
-                                  view_snapshot_t *view,
-                                  additional_from_auth_t policy) {
-  if (!current_zone || current_zone->count == 0 || !zone_domain || policy == ADDITIONAL_AUTH_NO) {
-    if (current_zone) {
-      current_zone->prelinked_glue = NULL;
-      current_zone->prelinked_glue_count = 0;
-    }
-    return;
+/* 公開の通し番号 (zone_publish が増やす)。兄弟ゾーンを調べた時点と、兄弟ゾーンの公開の前後を比べる */
+static _Atomic uint64_t g_publish_counter;
+
+/* グルーの対象名 (src の NS/MX/SRV の対象) について、view で引けるゾーンを調べる。自分以外の
+ * ゾーン (または無し) になる名前を、そのゾーンの id (無ければ 0) とともに targets / ids に入れ、
+ * 見つかった兄弟ゾーンに glue_provider の印を付ける。読み取り区間の中で呼ぶ。 */
+static void glue_lookup_siblings(const char *zone_domain, view_snapshot_t *view, const char **targets,
+                                 uint64_t *ids, int count) {
+  for (int k = 0; k < count; k++) {
+    zone_db_entry_t *s = view ? find_zone_in_view(view, targets[k]) : NULL;
+    if (s && domain_names_match_ci(s->domain, zone_domain)) s = NULL;
+    if (s) atomic_store_explicit(&s->glue_provider, true, memory_order_relaxed);
+    ids[k] = s ? s->id : 0;
   }
+}
 
-  const char *raw_targets[MAX_PRELINK_TARGETS];
-  int raw_target_count = 0;
+/* 公開前の版 (zone_image_freeze() の後) に、兄弟ゾーンのグルーの追跡情報を作る。Additional のグルーの
+ * 実体はイメージにある (自分のアドレスは NAME_GLUE の印、兄弟のアドレスは応答のたびに兄弟から引く:
+ * append_glue_records の 3.)。ここで作るのは、NS/MX/SRV の対象名のうち兄弟ゾーンにありうるものと、そのとき引けた
+ * 兄弟の id だけ (S2: 兄弟が変わったらこのゾーンの応答の版を上げる)。兄弟ゾーンを引くので、呼び出し側は
+ * 読み取り区間に入れる。対象名は先頭の MAX_PRELINK_TARGETS 個 (ファイルの順、重複を除く) で、additional-from-auth yes
+ * のときだけ追跡する。 */
+void zone_glue_track_build(zone_version_t *ver, const char *zone_domain, view_snapshot_t *view,
+                           additional_from_auth_t policy) {
+  if (!ver) return;
+  free(ver->glue);
+  ver->glue = NULL;
+  const zone_image_t *img = ver->image;
+  if (!img || img->n_rrs == 0 || !zone_domain || policy != ADDITIONAL_AUTH_YES) return;
 
-  for (size_t i = 0; i < current_zone->count; i++) {
-    dns_record_t *rec = &current_zone->records[i];
-    const char *tgt = NULL;
-    if (rec->type_code == 2 && rec->rdata_count >= 1) {
-      tgt = rec->rdata[0];
-    } else if (rec->type_code == 15 && rec->rdata_count >= 2) {
-      tgt = rec->rdata[1];
-    } else if (rec->type_code == 33 && rec->rdata_count >= 4) {
-      tgt = rec->rdata[3];
-    }
-    if (!tgt || *tgt == '\0') continue;
-
+  char tmp[DNS_NAME_TEXT_SIZE];
+  char *pool = NULL;
+  size_t pool_len = 0, pool_cap = 0;
+  uint32_t offs[MAX_PRELINK_TARGETS];
+  int n = 0;
+  for (uint32_t seq = 0; seq < img->n_rrs && n < MAX_PRELINK_TARGETS; seq++) {
+    uint32_t k = zone_image_seq_rr(img, seq);
+    uint16_t t = zone_image_rr_type(img, k);
+    if (t != 2 && t != 15 && t != 33) continue;
+    if (zone_image_rrs(img)[k].flags & ZONE_IMAGE_RR_RAW) continue; /* 生の RDATA に対象名の文字列は無い */
+    if (zone_image_rr_target(img, k, tmp, sizeof(tmp)) != 0 || tmp[0] == '\0') continue;
     bool dup = false;
-    for (int k = 0; k < raw_target_count; k++) {
-      if (domain_names_match_ci(raw_targets[k], tgt)) {
-        dup = true;
-        break;
-      }
+    for (int j = 0; j < n && !dup; j++) dup = domain_names_match_ci(pool + offs[j], tmp);
+    if (dup) continue;
+    size_t l = strlen(tmp) + 1;
+    if (pool_len + l > pool_cap) {
+      size_t nc = pool_cap ? pool_cap * 2 : 256;
+      while (nc < pool_len + l) nc *= 2;
+      char *np = realloc(pool, nc);
+      if (!np) { free(pool); return; }
+      pool = np;
+      pool_cap = nc;
     }
-    if (!dup && raw_target_count < MAX_PRELINK_TARGETS) {
-      raw_targets[raw_target_count++] = tgt;
+    memcpy(pool + pool_len, tmp, l);
+    offs[n++] = (uint32_t)pool_len;
+    pool_len += l;
+  }
+  if (n > 0) {
+    size_t head = (sizeof(zone_glue_t) + 7) & ~(size_t)7;
+    zone_glue_t *g = malloc(head + (size_t)n * sizeof(uint64_t) + (size_t)n * sizeof(char *) + pool_len);
+    if (g) {
+      g->built_at = atomic_load_explicit(&g_publish_counter, memory_order_seq_cst);
+      g->count = n;
+      g->ids = (uint64_t *)(void *)((char *)g + head);
+      g->targets = (const char **)(void *)(g->ids + n);
+      char *strs = (char *)(g->targets + n);
+      memcpy(strs, pool, pool_len);
+      for (int k = 0; k < n; k++) g->targets[k] = strs + offs[k];
+      glue_lookup_siblings(zone_domain, view, g->targets, g->ids, n);
+      ver->glue = g;
     }
   }
+  free(pool);
+}
 
-  if (raw_target_count == 0) {
-    current_zone->prelinked_glue = NULL;
-    current_zone->prelinked_glue_count = 0;
-    return;
+/* ---- S2: 解放待ちの版、公開、兄弟ゾーンの変更の反映 ----
+ * S5 B-3: 公開した版は 1 つずつ malloc した zone_version_t で、書き込みは新しい版を作って公開する (standby の再利用は無い)。
+ * 公開で退いた版は解放待ちに積み、猶予期間の後で制御スレッド (またはまとめて読み込む再構築) が解放する。
+ * 積むのは複数のスレッド (制御、転送、UPDATE のワーカー) なので lock-free のスタックにし、
+ * 取り出しはスタック全体を交換して行う。 */
+typedef struct zone_retire_s {
+  struct zone_retire_s *next;
+  zone_db_entry_t *entry; /* 参照を 1 つ持つ */
+  zone_version_t *ver;    /* 公開で退いた版 */
+  uint64_t epoch;
+} zone_retire_t;
+
+static _Atomic(zone_retire_t *) g_zone_retire_head;
+static _Atomic uint64_t g_zone_entry_id;
+static _Atomic bool g_glue_dirty;
+
+uint64_t zone_entry_next_id(void) {
+  return atomic_fetch_add_explicit(&g_zone_entry_id, 1, memory_order_relaxed) + 1;
+}
+
+static void zone_retire_push(zone_retire_t *r) {
+  zone_retire_t *h = atomic_load_explicit(&g_zone_retire_head, memory_order_relaxed);
+  do {
+    r->next = h;
+  } while (!atomic_compare_exchange_weak_explicit(&g_zone_retire_head, &h, r, memory_order_release,
+                                                  memory_order_relaxed));
+}
+
+static void zone_entry_unref(zone_db_entry_t *e) {
+  if (atomic_fetch_sub_explicit(&e->snapshot_refs, 1, memory_order_acq_rel) == 1) free_zone_db_entry(e);
+}
+
+/* 解放待ちを処理する。wait なら最も新しい世代まで猶予期間を待つ (再構築の途中でまとめて解放する)。
+ * 読み取り区間の外から呼ぶこと。まだ解放できないもの (読み手、転送中、writer が使用中) は積み直す。 */
+void zone_retire_process(bool wait) {
+  zone_retire_t *list = atomic_exchange_explicit(&g_zone_retire_head, NULL, memory_order_acquire);
+  if (!list) return;
+  uint64_t max_epoch = 0;
+  for (zone_retire_t *r = list; r; r = r->next) {
+    if (r->epoch > max_epoch) max_epoch = r->epoch;
   }
-
-  prelinked_glue_entry_t entries[MAX_PRELINK_TARGETS];
-  int entry_count = 0;
-
-  for (int t = 0; t < raw_target_count; t++) {
-    const char *tgt = raw_targets[t];
-    bool in_domain = domain_name_is_at_or_below(tgt, zone_domain);
-
-    if (policy == ADDITIONAL_AUTH_IN_DOMAIN && !in_domain) {
+  bool all_safe = wait ? rcu_writer_wait_until_safe(max_epoch, 60000) : rcu_writer_is_safe(max_epoch);
+  while (list) {
+    zone_retire_t *r = list;
+    list = r->next;
+    zone_db_entry_t *e = r->entry;
+    if (!all_safe && !rcu_writer_is_safe(r->epoch)) {
+      zone_retire_push(r);
       continue;
     }
-
-    dns_record_t *found_recs[MAX_MATCH_RECS];
-    int found_count = 0;
-
-    // 1. Search current_zone first
-    if (current_zone->hash_size > 0 && current_zone->hash_table) {
-      uint32_t hashes[2];
-      int h_count = 1;
-      hashes[0] = calc_fnv1a_str(tgt);
-      if (tgt[0] != '\0') {
-        hashes[1] = calc_fnv1a_other_root_form(tgt);
-        h_count = 2;
-      }
-
-      for (int h = 0; h < h_count; h++) {
-        size_t idx = hashes[h] & (current_zone->hash_size - 1);
-        for (int j = current_zone->hash_table[idx]; j != -1;
-             j = current_zone->records[j].next_record) {
-          dns_record_t *r = &current_zone->records[j];
-          if ((r->type_code == 1 || r->type_code == 28) &&
-              domain_names_match_ci(r->name, tgt)) {
-            bool rdup = false;
-            for (int f = 0; f < found_count; f++) {
-              if (found_recs[f] == r) { rdup = true; break; }
-            }
-            if (!rdup && found_count < MAX_MATCH_RECS) {
-              found_recs[found_count++] = r;
-            }
-          }
-        }
-      }
+    /* 送信中の AXFR と受信中の転送は、開始時の版を読み取り区間の外で使い続ける */
+    if (atomic_load_explicit(&e->active_axfr, memory_order_acquire) > 0 ||
+        atomic_load_explicit(&e->is_transferring, memory_order_acquire)) {
+      zone_retire_push(r);
+      continue;
     }
-
-    // 2. Search sibling authoritative zones in view if policy == ADDITIONAL_AUTH_YES
-    if (policy == ADDITIONAL_AUTH_YES && view) {
-      zone_db_entry_t *sib_entry = find_zone_in_view(view, tgt);
-      if (sib_entry) {
-        zone_arena_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
-        if (sib_arena && sib_arena != current_zone && sib_arena->hash_size > 0 && sib_arena->hash_table) {
-          uint32_t hashes[2];
-          int h_count = 1;
-          hashes[0] = calc_fnv1a_str(tgt);
-          if (tgt[0] != '\0') {
-            hashes[1] = calc_fnv1a_other_root_form(tgt);
-            h_count = 2;
-          }
-          for (int h = 0; h < h_count; h++) {
-            size_t idx = hashes[h] & (sib_arena->hash_size - 1);
-            for (int j = sib_arena->hash_table[idx]; j != -1;
-                 j = sib_arena->records[j].next_record) {
-              dns_record_t *r = &sib_arena->records[j];
-              if ((r->type_code == 1 || r->type_code == 28) &&
-                  domain_names_match_ci(r->name, tgt)) {
-                bool rdup = false;
-                for (int f = 0; f < found_count; f++) {
-                  if (found_recs[f]->type_code == r->type_code &&
-                      found_recs[f]->rdata_count == r->rdata_count) {
-                    bool match_all = true;
-                    for (int rc = 0; rc < r->rdata_count; rc++) {
-                      if (strcasecmp(found_recs[f]->rdata[rc], r->rdata[rc]) != 0) {
-                        match_all = false; break;
-                      }
-                    }
-                    if (match_all) { rdup = true; break; }
-                  }
-                }
-                if (!rdup && found_count < MAX_MATCH_RECS) {
-                  found_recs[found_count++] = r;
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    if (found_count > 0) {
-      dns_record_t **copied_recs = (dns_record_t **)arena_alloc(current_zone, found_count * sizeof(dns_record_t *));
-      if (!copied_recs) continue;
-
-      int copied_count = 0;
-      for (int f = 0; f < found_count; f++) {
-        dns_record_t *src_rec = found_recs[f];
-        dns_record_t *d_rec = (dns_record_t *)arena_alloc(current_zone, sizeof(dns_record_t));
-        if (!d_rec) break;
-        *d_rec = *src_rec;
-        d_rec->name = arena_strdup(current_zone, src_rec->name);
-        d_rec->ttl = src_rec->ttl ? arena_strdup(current_zone, src_rec->ttl) : NULL;
-        d_rec->class_str = src_rec->class_str ? arena_strdup(current_zone, src_rec->class_str) : NULL;
-        d_rec->type = src_rec->type ? arena_strdup(current_zone, src_rec->type) : NULL;
-        d_rec->ecs_subnet_tag = src_rec->ecs_subnet_tag ? arena_strdup(current_zone, src_rec->ecs_subnet_tag) : NULL;
-        d_rec->bind_location_tag = src_rec->bind_location_tag ? arena_strdup(current_zone, src_rec->bind_location_tag) : NULL;
-        for (int r = 0; r < src_rec->rdata_count && r < MAX_RDATA; r++) {
-          d_rec->rdata[r] = src_rec->rdata[r] ? arena_strdup(current_zone, src_rec->rdata[r]) : NULL;
-        }
-        if (src_rec->generic_len > 0 && src_rec->generic_data) {
-          d_rec->generic_data = (uint8_t *)arena_alloc(current_zone, src_rec->generic_len);
-          if (d_rec->generic_data)
-            memcpy(d_rec->generic_data, src_rec->generic_data, src_rec->generic_len);
-        } else if (src_rec->generic_data) {
-          d_rec->generic_data = (uint8_t *)"";
-        } else {
-          d_rec->generic_data = NULL;
-        }
-        d_rec->next_record = -1;
-        d_rec->is_cached = false;
-        dns_record_preparse_cache(current_zone, d_rec);
-        copied_recs[copied_count++] = d_rec;
-      }
-
-      if (copied_count > 0) {
-        entries[entry_count].target_name = arena_strdup(current_zone, tgt);
-        entries[entry_count].records = copied_recs;
-        entries[entry_count].record_count = copied_count;
-        entry_count++;
-      }
-    }
+    zone_version_free(r->ver);
+    zone_entry_unref(e);
+    free(r);
   }
+}
 
-  if (entry_count > 0) {
-    current_zone->prelinked_glue = (prelinked_glue_entry_t *)arena_alloc(current_zone, entry_count * sizeof(prelinked_glue_entry_t));
-    if (current_zone->prelinked_glue) {
-      memcpy(current_zone->prelinked_glue, entries, entry_count * sizeof(prelinked_glue_entry_t));
-      current_zone->prelinked_glue_count = entry_count;
+/* next を公開する。entry->writer_lock を持って呼ぶ (S2)。退いた版は解放待ちに積む (S5 B-3: 版は heap のものだけ。
+ * 空の版とテストが自分で持つ版は積まない)。他のゾーンのグルーに使われているゾーン、または初めて公開するゾーン
+ * なら、制御スレッドに依存するゾーンの応答の版の更新を頼む。 */
+void zone_publish(zone_db_entry_t *entry, zone_version_t *next) {
+  zone_version_t *old = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  bool first = atomic_load_explicit(&entry->publish_order, memory_order_relaxed) == 0;
+  uint64_t epoch = rcu_writer_publish(&entry->rcu.active, next);
+  atomic_store_explicit(&entry->publish_order,
+                        atomic_fetch_add_explicit(&g_publish_counter, 1, memory_order_seq_cst) + 1,
+                        memory_order_seq_cst);
+  if (old != next && old->heap) {
+    zone_retire_t *r = calloc(1, sizeof(*r));
+    if (r) {
+      atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_relaxed);
+      r->entry = entry;
+      r->ver = old;
+      r->epoch = epoch;
+      zone_retire_push(r);
+    } else if (!atomic_load_explicit(&entry->active_axfr, memory_order_acquire) &&
+               !atomic_load_explicit(&entry->is_transferring, memory_order_acquire) &&
+               rcu_writer_wait_until_safe_in_reader(epoch, 60000)) {
+      zone_version_free(old); /* 積めないときは、ここで猶予期間を待って解放する */
     } else {
-      current_zone->prelinked_glue_count = 0;
+      syslog(LOG_ERR, "[Zone] zone '%s': out of memory retiring the previous version; it is leaked", entry->domain);
     }
-  } else {
-    current_zone->prelinked_glue = NULL;
-    current_zone->prelinked_glue_count = 0;
   }
+  if (first || atomic_load_explicit(&entry->glue_provider, memory_order_relaxed))
+    atomic_store_explicit(&g_glue_dirty, true, memory_order_release);
+}
+
+typedef struct {
+  zone_db_entry_t *entry;
+  view_snapshot_t *view;
+} glue_todo_t;
+
+/* 兄弟ゾーンが変わった (公開された、追加・削除された) ゾーンの応答の版を上げる。兄弟のアドレスは
+ * 応答のたびに兄弟から引くので、データは作り直さない。共有の応答キャッシュに残る古い応答を引かせない
+ * ためだけに版を上げ、兄弟の id と調べた時点を記録し直す (メモリは確保しない)。
+ * 制御スレッドから (起動時はメインスレッドから)、読み取り区間の外で呼ぶ。glue->ids と
+ * glue->built_at を公開後に書くのはこの関数だけ。force でなければ、グルーに関わる公開があったときだけ調べる。 */
+void zone_glue_refresh_dependents(bool force) {
+  if (!atomic_exchange_explicit(&g_glue_dirty, false, memory_order_acq_rel) && !force) return;
+  zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
+  if (!snap) return;
+  glue_todo_t *todo = NULL;
+  size_t n = 0, cap = 0;
+  bool oom = false;
+  for (size_t v = 0; v < snap->view_count && !oom; v++) {
+    view_snapshot_t *view = &snap->views[v];
+    rcu_aux_read_lock();
+    for (size_t i = 0; i < view->zone_count; i++) {
+      zone_db_entry_t *e = view->entries[i];
+      if (!e) continue;
+      zone_version_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
+      zone_glue_t *g = a ? a->glue : NULL;
+      if (!g) continue;
+      bool need = false;
+      for (int k = 0; k < g->count && !need; k++) {
+        zone_db_entry_t *s = find_zone_in_view(view, g->targets[k]);
+        if (s && domain_names_match_ci(s->domain, e->domain)) s = NULL;
+        need = (s ? s->id : 0) != g->ids[k] ||
+               (s && atomic_load_explicit(&s->publish_order, memory_order_seq_cst) > g->built_at);
+      }
+      if (!need) continue;
+      if (n == cap) {
+        size_t ncap = cap ? cap * 2 : 64;
+        glue_todo_t *t = realloc(todo, ncap * sizeof(*t));
+        if (!t) {
+          oom = true;
+          break;
+        }
+        todo = t;
+        cap = ncap;
+      }
+      todo[n].entry = e;
+      todo[n].view = view;
+      n++;
+    }
+    rcu_aux_read_unlock();
+  }
+  if (oom) atomic_store_explicit(&g_glue_dirty, true, memory_order_release); /* 次の周期でやり直す */
+  for (size_t i = 0; i < n; i++) {
+    zone_db_entry_t *e = todo[i].entry;
+    /* writer は公開の前に glue を作る。その途中の arena は active ではないが、公開と
+     * 入れ違わないように writer_lock の下で active を読み直す */
+    pthread_mutex_lock(&e->writer_lock);
+    zone_version_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
+    if (a && a->glue) {
+      a->glue->built_at = atomic_load_explicit(&g_publish_counter, memory_order_seq_cst);
+      rcu_aux_read_lock();
+      glue_lookup_siblings(e->domain, todo[i].view, a->glue->targets, a->glue->ids, a->glue->count);
+      rcu_aux_read_unlock();
+      atomic_store_explicit(&a->generation, zone_data_generation_next(), memory_order_release);
+    }
+    pthread_mutex_unlock(&e->writer_lock);
+  }
+  free(todo);
+  release_zone_snapshot(snap);
 }
 
 /* ゾーン外レコードのログ。1回の読み込みで出す行数を制限し、残りは件数だけにする。 */
@@ -636,6 +676,22 @@ static void log_unencodable_record(const dns_record_t *rec, void *ud) {
          "(karicheck shows the reason)", l->zone, rec->name ? rec->name : "", rec->type ? rec->type : "");
 }
 
+/* X-32, S5 B-2: 書けないレコードを 1 件ずつ除き (警告は 1 回に OUT_OF_ZONE_LOG_MAX 行まで、残りは件数)、残りで続ける。
+ * ゾーンファイルの読み込みも、AXFR/IXFR で受けたゾーンも、UPDATE を当てたゾーンも同じ扱い (公開するイメージには
+ * serialize_dns_record() で書けないレコードを入れられない)。build_zone_index() の前に呼ぶ。除いた件数を返す。 */
+size_t zone_drop_unencodable_logged(zone_arena_t *a, const char *zone, const char *from) {
+  out_of_zone_log_t bad = { zone, 0 };
+  size_t bad_count = zone_arena_drop_unencodable(a, log_unencodable_record, &bad);
+  if (bad_count > 0)
+    syslog(LOG_WARNING, "[Zone] zone '%s': ignored %zu record(s) that cannot be encoded from %s", zone, bad_count, from);
+  return bad_count;
+}
+
+/* parse_context_t.zone_exists: name が view (ud) のゾーンの頂点か */
+static bool view_has_zone(const void *ud, const char *name) {
+  return view_find_zone_config((const view_config_t *)ud, name) != NULL;
+}
+
 reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) {
   if (!entry || !zcfg || !zcfg->file) return RELOAD_ERR_FILE_READ;
   const char *file = zcfg->file;
@@ -654,48 +710,30 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
     pthread_mutex_unlock(&entry->writer_lock);
     return RELOAD_ERR_BUSY;
   }
-  zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-  zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
+  zone_version_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  /* S5 B-3: the zone is built in a builder of its own (freed on every way out) and published as a new version */
+  zone_arena_t z_builder;
+  zone_arena_t *z_standby = &z_builder;
+  zone_arena_init(z_standby);
   /* R-21: 読み込み済みのゾーンの版が変わったら NOTIFY を送る (起動時の最初の読み込みでは送らない) */
-  bool was_loaded = z_active->count > 0;
+  bool was_loaded = z_active->image && z_active->image->n_rrs > 0;
   uint32_t old_serial = entry->serial;
-  if (!rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000)) {
-    syslog(LOG_WARNING, "[Zone] Reload of zone '%s' postponed: RCU grace period wait timed out (60s).", entry->domain);
-    free(buf);
-    pthread_mutex_unlock(&entry->writer_lock);
-    return RELOAD_ERR_BUSY;
-  }
 
-  zone_arena_free_include_buffers(z_standby);
-  free(z_standby->locations);
-  z_standby->locations = NULL;
-  z_standby->location_count = 0;
-  free_ecs_tags_array(z_standby->bind_location_tags, z_standby->bind_location_tag_count);
-  z_standby->bind_location_tags = NULL;
-  z_standby->bind_location_tag_count = 0;
-  free_ecs_tags_array(z_standby->bind_ecs_tags, z_standby->bind_ecs_tag_count);
-  z_standby->bind_ecs_tags = NULL;
-  z_standby->bind_ecs_tag_count = 0;
-  if (z_standby->bind_ecs_trusted_resolvers) {
-    for (int i = 0; i < z_standby->bind_ecs_trusted_resolver_count; i++) {
-      free(z_standby->bind_ecs_trusted_resolvers[i]);
-    }
-    free(z_standby->bind_ecs_trusted_resolvers);
-    z_standby->bind_ecs_trusted_resolvers = NULL;
-    z_standby->bind_ecs_trusted_resolver_count = 0;
+  /* S4: 小さいゾーンに 64 KiB の最初のプールを持たせない。プールの使用量 (レコードのワイヤー形式の
+   * 前処理など) はゾーンファイルの 0.6-1.2 倍ほど。足りなければ半分の大きさで足す (arena_alloc) */
+  size_t pool_cap = (size_t)root_st.st_size + 256;
+  if (pool_cap < 1024) pool_cap = 1024;
+  if (pool_cap > 64 * 1024) pool_cap = 64 * 1024;
+  z_standby->first_pool_cap = pool_cap;
+  char *root_file_path = strdup(file);
+  if (!root_file_path || zone_arena_add_file(z_standby, buf, NULL, root_file_path) != 0) {
+    free(root_file_path);
+    free(buf);
+    zone_arena_destroy(z_standby);
+    pthread_mutex_unlock(&entry->writer_lock);
+    syslog(LOG_ERR, "[Zone] Out of memory reloading zone '%s'", entry->domain);
+    return RELOAD_ERR_PARSE;
   }
-  if (z_standby->bind_ecs_trusted_resolvers_parsed) {
-    free(z_standby->bind_ecs_trusted_resolvers_parsed);
-    z_standby->bind_ecs_trusted_resolvers_parsed = NULL;
-  }
-  z_standby->count = 0;
-  z_standby->data_pool_count = 0;
-  z_standby->current_pool_cap = 0;
-  z_standby->current_pool_idx = 0;
-  z_standby->file_buf_count = 0;
-  z_standby->file_bufs[z_standby->file_buf_count] = buf;
-  z_standby->file_paths[z_standby->file_buf_count] = strdup(file);
-  z_standby->file_buf_count++;
 
   char *root_ttl = NULL;
   char *root_ecs_tag = NULL;
@@ -720,6 +758,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   if (!ctx.base_dir) {
       syslog(LOG_ERR, "[ZoneLoader] Out of memory allocating base_dir for zone '%s'", entry->domain);
       free(root_path);
+      zone_arena_destroy(z_standby);
       pthread_mutex_unlock(&entry->writer_lock);
       return RELOAD_ERR_PARSE;
   }
@@ -740,8 +779,6 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   ctx.source_mtime = root_st.st_mtime; // X-13: tinydns の SOA serial。パーサはパスを stat しない
 
   server_config_t *active_cfg = acquire_config_snapshot();
-  const char **all_zone_ptrs = NULL;
-  int all_zone_cnt = 0;
   // 親子ゾーンの振り分けに使うのは、このゾーンと同じ view のゾーンだけ (R-26)。
   // 別の view にしか無い子ゾーンの名前で、この view のレコードを落とさない。
   view_config_t *own_view = NULL;
@@ -750,39 +787,25 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
           if (v->name && strcasecmp(v->name, entry->view_name) == 0) { own_view = v; break; }
       }
   }
+  /* view の全ゾーン名の配列をゾーンごとに作ると、読み込み全体がゾーン数の 2 乗になる。
+   * tinydns パーサには view の索引を引かせる (O-11 と同じく、view の全ゾーンが対象)。 */
   if (own_view) {
-      /* view のゾーン数だけ確保する (O-11: 以前は 256 件で打ち切り、それを超えると共有 data の
-       * レコードが親ゾーンに入ることがあった)。ゾーンの読み込みはクエリの経路ではない。 */
-      size_t n = 0;
-      for (zone_config_t *zc = own_view->zones; zc; zc = zc->next) n++;
-      all_zone_ptrs = n > 0 ? calloc(n, sizeof(*all_zone_ptrs)) : NULL;
-      if (n > 0 && !all_zone_ptrs) {
-          release_config_snapshot(active_cfg);
-          free((void*)ctx.base_dir);
-          free(root_path);
-          syslog(LOG_ERR, "[ZoneLoader] Out of memory building the zone list for '%s'", entry->domain);
-          pthread_mutex_unlock(&entry->writer_lock);
-          return RELOAD_ERR_PARSE;
-      }
-      for (zone_config_t *zc = own_view->zones; zc; zc = zc->next) {
-          if (zc->domain) all_zone_ptrs[all_zone_cnt++] = zc->domain;
-      }
+      ctx.zone_exists = view_has_zone;
+      ctx.zone_exists_ud = own_view;
   }
-  ctx.all_zone_names = (all_zone_cnt > 0) ? all_zone_ptrs : NULL;
-  ctx.all_zone_count = all_zone_cnt;
 
   int count;
-  if (zcfg->file_format && strcasecmp(zcfg->file_format, "tinydns") == 0) {
+  if (zext(zcfg)->file_format && strcasecmp(zext(zcfg)->file_format, "tinydns") == 0) {
       count = parse_tinydns_data(buf, strlen(buf), z_standby, &ctx);
   } else {
       count = parse_zone_fast(buf, strlen(buf), z_standby, &ctx);
   }
   release_config_snapshot(active_cfg);
-  free(all_zone_ptrs);
   free((void*)ctx.base_dir);
   free(root_path);
 
   if (count < 0) {
+      zone_arena_destroy(z_standby);
       pthread_mutex_unlock(&entry->writer_lock);
       if (parse_err.error_message) {
           syslog(LOG_ERR, "[Zone] Parse error reloading zone '%s' from '%s': %s (offset=%zu, file=%s)",
@@ -808,25 +831,28 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
              ctx.first_out_of_zone ? ctx.first_out_of_zone : "", file);
   }
   /* X-32: 書けないレコードはその 1 件だけ警告して除く (応答や AXFR で他のレコードを巻き込まない) */
-  out_of_zone_log_t bad = { entry->domain, 0 };
-  size_t bad_count = zone_arena_drop_unencodable(z_standby, log_unencodable_record, &bad);
-  if (bad_count > 0) {
-      syslog(LOG_WARNING, "[Zone] zone '%s': ignored %zu record(s) that cannot be encoded from '%s'",
-             entry->domain, bad_count, file);
+  {
+      char from[PATH_MAX + 8];
+      snprintf(from, sizeof(from), "'%s'", file);
+      zone_drop_unencodable_logged(z_standby, entry->domain, from);
   }
 
+  zone_arena_shrink_records(z_standby);
   if (build_zone_index(z_standby, true) != 0) {
+      zone_arena_destroy(z_standby);
       pthread_mutex_unlock(&entry->writer_lock);
       syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after reload for '%s'", entry->domain);
       return RELOAD_ERR_PARSE;
   }
   if (validate_zone_dname(z_standby, &parse_err) < 0) {
+      zone_arena_destroy(z_standby);
       pthread_mutex_unlock(&entry->writer_lock);
       syslog(LOG_ERR, "[Zone] DNAME validation error reloading zone '%s' from '%s': %s",
              entry->domain, file, parse_err.error_message);
       return RELOAD_ERR_PARSE;
   }
   if (validate_zone_name_lengths(z_standby, &parse_err) < 0) {
+      zone_arena_destroy(z_standby);
       pthread_mutex_unlock(&entry->writer_lock);
       syslog(LOG_ERR, "[Zone] Name length validation error reloading zone '%s' from '%s': %s",
              entry->domain, file, parse_err.error_message);
@@ -885,25 +911,46 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
       }
   }
   if (!has_soa) {
+      zone_arena_destroy(z_standby);
       pthread_mutex_unlock(&entry->writer_lock);
       syslog(LOG_ERR, "[Zone] Missing SOA reloading zone '%s' from '%s'", entry->domain, file);
       return RELOAD_ERR_MISSING_SOA;
   }
 
-  // prelink は他ゾーンの active arena を読むので、読み取り区間で他の writer の再利用から守る
+  /* S5 B-1: 応答を作る側が読むイメージ。公開の直前に 1 回だけ作る (クエリの経路では作らない) */
+  z_standby->image = zone_image_freeze(z_standby, entry->domain);
+  if (!z_standby->image) {
+      zone_arena_destroy(z_standby);
+      pthread_mutex_unlock(&entry->writer_lock);
+      syslog(LOG_ERR, "[Zone] Failed to build the zone image after reload for '%s'", entry->domain);
+      return RELOAD_ERR_PARSE;
+  }
+
+  /* S5 B-2: 公開するのはイメージだけ。レコード・プール・索引・ゾーンファイルの本文はここで解放する。
+   * S5 B-3: イメージは新しい版 (zone_version_t) に移る */
+  zone_arena_free_builder(z_standby);
+  zone_version_t *z_next = zone_version_new(z_standby);
+  zone_arena_destroy(z_standby);
+  if (!z_next) {
+      pthread_mutex_unlock(&entry->writer_lock);
+      syslog(LOG_ERR, "[Zone] Out of memory publishing the reloaded zone '%s'", entry->domain);
+      return RELOAD_ERR_PARSE;
+  }
+
+  // グルーの追跡は他ゾーンの active arena を読むので、読み取り区間で他の writer の再利用から守る
   rcu_aux_read_lock();
   zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
   server_config_t *active_cfg_prelink = acquire_config_snapshot();
-  additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
-                                      ? zcfg->additional_from_auth
+  additional_from_auth_t policy = (zcfg && zext(zcfg)->additional_from_auth_specified)
+                                      ? zext(zcfg)->additional_from_auth
                                       : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
-  prelink_zone_additional_glue(z_standby, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
-  build_zone_response_cache(z_standby, active_cfg_prelink, entry->view_name, entry->domain);
+  zone_glue_track_build(z_next, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
+  build_zone_response_cache(z_next, active_cfg_prelink, entry->view_name, entry->domain);
   release_config_snapshot(active_cfg_prelink);
   rcu_aux_read_unlock();
 
-  compute_ixfr_diff(entry, z_active, z_standby);
-  entry->rcu.retire_epoch = rcu_writer_publish(&entry->rcu.active, z_standby);
+  compute_ixfr_diff(entry, z_active, z_next);
+  zone_publish(entry, z_next);
   struct stat st_loaded;
   if (stat_via_dir_cache(file, &st_loaded) == 0) {
     entry->last_loaded_mtime = st_loaded.st_mtime;
@@ -942,6 +989,34 @@ static int catalog_member_index(const catalog_member_id_t *list, int count, cons
         if (strcasecmp(domain, list[j].domain) == 0 && strcmp(unique_id, list[j].unique_id) == 0) return j;
     }
     return -1;
+}
+
+/* catalog_member_index() 用のハッシュ表を作る。作れなければ *ht / *chain は NULL のまま
+ * (catalog_member_index() は線形探索になる)。呼び出し側が free() する。 */
+static void catalog_member_hash_build(const catalog_member_id_t *list, int count,
+                                      int **ht, int **chain, size_t *hsize) {
+    *ht = NULL;
+    *chain = NULL;
+    *hsize = 0;
+    if (!list || count <= 0) return;
+    size_t p = 256;
+    while (p < (size_t)count * 2) p <<= 1;
+    int *t = malloc(p * sizeof(int));
+    int *c = malloc((size_t)count * sizeof(int));
+    if (!t || !c) {
+        free(t);
+        free(c);
+        return;
+    }
+    for (size_t k = 0; k < p; k++) t[k] = -1;
+    for (int j = 0; j < count; j++) {
+        size_t idx = calc_catalog_member_hash(list[j].domain, list[j].unique_id) & (p - 1);
+        c[j] = t[idx];
+        t[idx] = j;
+    }
+    *ht = t;
+    *chain = c;
+    *hsize = p;
 }
 
 static bool catalog_groups_equal(const catalog_member_id_t *a, const catalog_member_id_t *b) {
@@ -1043,6 +1118,11 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             }
         }
 
+        /* 旧メンバーが有効かは (名前, unique-id) のハッシュで引く (メンバー数の 2 乗にしない) */
+        int *vm_ht = NULL, *vm_chain = NULL;
+        size_t vm_hsize = 0;
+        catalog_member_hash_build(valid_members, valid_member_count, &vm_ht, &vm_chain, &vm_hsize);
+
         int view_count = 0;
         for (view_config_t *v = active_config->views; v; v = v->next) view_count++;
         
@@ -1050,7 +1130,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         if (view_count > 0) {
             new_snap->views = calloc(view_count, sizeof(view_snapshot_t));
             if (!new_snap->views) {
-                if (valid_members) free(valid_members);
+                { free(valid_members); free(vm_ht); free(vm_chain); }
                 abort_rebuild_snapshot(new_snap, "new_snap->views");
                 return NULL;
             }
@@ -1062,7 +1142,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             view_snapshot_t *vs = &new_snap->views[vidx];
             vs->name = v->name ? strdup(v->name) : strdup("");
             if (!vs->name) {
-                if (valid_members) free(valid_members);
+                { free(valid_members); free(vm_ht); free(vm_chain); }
                 abort_rebuild_snapshot(new_snap, "vs->name");
                 return NULL;
             }
@@ -1070,7 +1150,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             if (v->match_clients_count > 0) {
                 vs->match_clients = calloc(v->match_clients_count, sizeof(char *));
                 if (!vs->match_clients) {
-                    if (valid_members) free(valid_members);
+                    { free(valid_members); free(vm_ht); free(vm_chain); }
                     abort_rebuild_snapshot(new_snap, "vs->match_clients");
                     return NULL;
                 }
@@ -1078,7 +1158,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     if (v->match_clients[i]) {
                         vs->match_clients[i] = strdup(v->match_clients[i]);
                         if (!vs->match_clients[i]) {
-                            if (valid_members) free(valid_members);
+                            { free(valid_members); free(vm_ht); free(vm_chain); }
                             abort_rebuild_snapshot(new_snap, "vs->match_clients[i]");
                             return NULL;
                         }
@@ -1093,35 +1173,19 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             int static_count = 0;
             for (zone_config_t *z = v->zones; z; z = z->next) static_count++;
             
+            /* 同じ名前の旧 view。ゾーンごとの照合はその view のハッシュと設定の索引で行う
+             * (旧エントリを線形に探すと reload がゾーン数の 2 乗になる) */
+            view_snapshot_t *old_view = (old_snap && v->name) ? snapshot_find_view(old_snap, v->name) : NULL;
+
             int dynamic_count = 0;
-            if (old_snap && old_snap->views) {
-                for (size_t ov = 0; ov < old_snap->view_count; ov++) {
-                    if (old_snap->views[ov].name && v->name && strcasecmp(old_snap->views[ov].name, v->name) == 0) {
-                        if (old_snap->views[ov].entries) {
-                            for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
-                                zone_db_entry_t *entry = old_snap->views[ov].entries[oi];
-                                if (!entry) continue;
-                                if (entry->is_catalog_member) {
-                                    bool is_valid = false;
-                                    for (int k = 0; k < valid_member_count; k++) {
-                                        if (domain_names_match_ci(valid_members[k].domain, entry->domain) &&
-                                            strcmp(valid_members[k].unique_id, entry->catalog_member_unique_id) == 0) {
-                                            is_valid = true; break;
-                                        }
-                                    }
-                                    if (is_valid) {
-                                        bool overridden = false;
-                                        for (zone_config_t *z = v->zones; z; z = z->next) {
-                                            if (z->domain && domain_names_match_ci(z->domain, entry->domain)) {
-                                                 overridden = true; break;
-                                            }
-                                        }
-                                        if (!overridden) dynamic_count++;
-                                    }
-                                }
-                            }
-                        }
-                        break;
+            if (old_view && old_view->entries) {
+                for (size_t oi = 0; oi < old_view->zone_count; oi++) {
+                    zone_db_entry_t *entry = old_view->entries[oi];
+                    if (entry && entry->is_catalog_member &&
+                        catalog_member_index(valid_members, valid_member_count, vm_ht, vm_chain, vm_hsize,
+                                             entry->domain, zone_entry_catalog_uid(entry)) >= 0 &&
+                        !view_find_zone_config(v, entry->domain)) {
+                        dynamic_count++;
                     }
                 }
             }
@@ -1130,7 +1194,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             if (vs->zone_count > 0) {
                 vs->entries = calloc(vs->zone_count, sizeof(zone_db_entry_t *));
                 if (!vs->entries) {
-                    if (valid_members) free(valid_members);
+                    { free(valid_members); free(vm_ht); free(vm_chain); }
                     abort_rebuild_snapshot(new_snap, "vs->entries");
                     return NULL;
                 }
@@ -1139,36 +1203,26 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             int zidx = 0;
             for (zone_config_t *z = v->zones; z; z = z->next) {
                 zone_db_entry_t *entry = NULL;
-                if (old_snap && old_snap->views) {
-                    for (size_t ov = 0; ov < old_snap->view_count; ov++) {
-                        if (old_snap->views[ov].name && v->name && strcasecmp(old_snap->views[ov].name, v->name) == 0) {
-                            if (old_snap->views[ov].entries) {
-                                for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
-                                    if (!old_snap->views[ov].entries[oi]) continue;
-                                    zone_db_entry_t *old = old_snap->views[ov].entries[oi];
-                                    if (z->domain && domain_names_match_ci(old->domain, z->domain)) {
-                                        /* O-13: type が変わったゾーンと、静的ゾーンで上書きされたカタログ
-                                         * メンバーは再利用しない。is_secondary や EXPIRE、転送の状態は
-                                         * エントリ作成時に決まるので、新しいエントリを作る (旧エントリは
-                                         * 削除されたゾーンと同じく旧スナップショットとともに解放される)。*/
-                                        if (old->kind == zone_kind_from_type(z->type) && !old->is_catalog_member) {
-                                            entry = old;
-                                            atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
-                                        } else {
-                                            syslog(LOG_NOTICE, "[Core] zone '%s' in view '%s' changed type or replaces a catalog member; recreating the zone entry",
-                                                   z->domain, v->name ? v->name : "");
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                            break;
-                        }
+                zone_db_entry_t *old = (old_view && z->domain) ? find_zone_exact_in_view(old_view, z->domain) : NULL;
+                if (old) {
+                    /* O-13: type が変わったゾーンと、静的ゾーンで上書きされたカタログ
+                     * メンバーは再利用しない。is_secondary や EXPIRE、転送の状態は
+                     * エントリ作成時に決まるので、新しいエントリを作る (旧エントリは
+                     * 削除されたゾーンと同じく旧スナップショットとともに解放される)。*/
+                    if (old->kind == zone_kind_from_type(z->type) && !old->is_catalog_member) {
+                        entry = old;
+                        atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
+                        /* B-3: ixfr-history may have changed; a lower depth drops the oldest diffs now */
+                        ixfr_history_set_depth(entry, ixfr_history_effective(active_config, z));
+                    } else {
+                        syslog(LOG_NOTICE, "[Core] zone '%s' in view '%s' changed type or replaces a catalog member; recreating the zone entry",
+                               z->domain, v->name ? v->name : "");
                     }
                 }
                 if (!entry) {
                     entry = create_new_zone_entry(z->domain, v->name);
                     if (entry) {
+                        ixfr_history_set_depth(entry, ixfr_history_effective(active_config, z));
                         entry->kind = zone_kind_from_type(z->type);
                         entry->is_secondary = (entry->kind == ZONE_KIND_SECONDARY);
                     }
@@ -1184,43 +1238,24 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 vs->entries[zidx++] = entry;
             }
 
-            if (old_snap && old_snap->views) {
-                for (size_t ov = 0; ov < old_snap->view_count; ov++) {
-                    if (old_snap->views[ov].name && v->name && strcasecmp(old_snap->views[ov].name, v->name) == 0) {
-                        if (old_snap->views[ov].entries) {
-                            for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
-                                zone_db_entry_t *entry = old_snap->views[ov].entries[oi];
-                                if (!entry) continue;
-                                if (entry->is_catalog_member) {
-                                    bool is_valid = false;
-                                    for (int k = 0; k < valid_member_count; k++) {
-                                        if (domain_names_match_ci(valid_members[k].domain, entry->domain) &&
-                                            strcmp(valid_members[k].unique_id, entry->catalog_member_unique_id) == 0) {
-                                            is_valid = true; break;
-                                        }
-                                    }
-                                    if (is_valid) {
-                                        bool overridden = false;
-                                        for (zone_config_t *z = v->zones; z; z = z->next) {
-                                            if (z->domain && domain_names_match_ci(z->domain, entry->domain)) {
-                                                overridden = true; break;
-                                            }
-                                        }
-                                        if (!overridden) {
-                                            atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
-                                            vs->entries[zidx++] = entry;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        break;
+            /* 有効なカタログメンバーのうち、静的な zone{} で上書きされていないものを引き継ぐ
+             * (dynamic_count と同じ判定) */
+            if (old_view && old_view->entries) {
+                for (size_t oi = 0; oi < old_view->zone_count; oi++) {
+                    zone_db_entry_t *entry = old_view->entries[oi];
+                    if (entry && entry->is_catalog_member &&
+                        catalog_member_index(valid_members, valid_member_count, vm_ht, vm_chain, vm_hsize,
+                                             entry->domain, zone_entry_catalog_uid(entry)) >= 0 &&
+                        !view_find_zone_config(v, entry->domain)) {
+                        atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
+                        ixfr_history_set_depth(entry, ixfr_history_effective(active_config, NULL));
+                        vs->entries[zidx++] = entry;
                     }
                 }
             }
             vs->zone_count = zidx;
         }
-        if (valid_members) free(valid_members);
+        { free(valid_members); free(vm_ht); free(vm_chain); }
 
     } else {
         // MODE: Catalog Delta Update
@@ -1298,27 +1333,8 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         int *cur_chain_next = NULL;
         size_t cur_hash_size = 0;
         int cur_count = catalog_entry_to_update->catalog_member_count;
-        if (cur_count > 0 && catalog_entry_to_update->catalog_members) {
-            size_t p = 256;
-            while (p < (size_t)cur_count * 2) p <<= 1;
-            cur_hash_size = p;
-            cur_hash_table = malloc(cur_hash_size * sizeof(int));
-            cur_chain_next = malloc(cur_count * sizeof(int));
-            if (cur_hash_table && cur_chain_next) {
-                for (size_t k = 0; k < cur_hash_size; k++) cur_hash_table[k] = -1;
-                for (int j = 0; j < cur_count; j++) {
-                    uint32_t h = calc_catalog_member_hash(catalog_entry_to_update->catalog_members[j].domain,
-                                                          catalog_entry_to_update->catalog_members[j].unique_id);
-                    size_t idx = h & (cur_hash_size - 1);
-                    cur_chain_next[j] = cur_hash_table[idx];
-                    cur_hash_table[idx] = j;
-                }
-            } else {
-                if (cur_hash_table) { free(cur_hash_table); cur_hash_table = NULL; }
-                if (cur_chain_next) { free(cur_chain_next); cur_chain_next = NULL; }
-                cur_hash_size = 0;
-            }
-        }
+        catalog_member_hash_build(catalog_entry_to_update->catalog_members, cur_count,
+                                  &cur_hash_table, &cur_chain_next, &cur_hash_size);
 
         for (int i = 0; i < new_desired_count; i++) {
             int cur_idx = catalog_member_index(catalog_entry_to_update->catalog_members, cur_count,
@@ -1330,7 +1346,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 /* R-28: group だけの変更はメンバーの削除と追加にしない (RFC 9432 §4.3.2, §5.4) */
                 zone_db_entry_t *existing = find_catalog_parent_in_snapshot(target_view, new_desired_members[i].domain);
                 if (existing && existing->is_catalog_member &&
-                    strcasecmp(existing->owning_catalog_domain, catalog_entry_to_update->domain) == 0) {
+                    strcasecmp(zone_entry_catalog_owner(existing), catalog_entry_to_update->domain) == 0) {
                     catalog_entry_set_groups(existing, &new_desired_members[i]);
                     syslog(LOG_INFO, "[Catalog] Updated group property of member '%s' (unique-id: %s)",
                            existing->domain, new_desired_members[i].unique_id);
@@ -1344,39 +1360,43 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 if (target_view) {
                     zone_db_entry_t *existing = find_catalog_parent_in_snapshot(target_view, new_desired_members[i].domain);
                     if (existing && existing->is_catalog_member) {
-                        if (strcasecmp(existing->owning_catalog_domain, catalog_entry_to_update->domain) != 0) {
+                        if (strcasecmp(zone_entry_catalog_owner(existing), catalog_entry_to_update->domain) != 0) {
                             bool valid_coo = false;
                             for (int p = 0; p < g_pending_coo_count; p++) {
                                 if (strcasecmp(g_pending_coo[p].domain, new_desired_members[i].domain) == 0 &&
-                                    strcasecmp(g_pending_coo[p].old_catalog, existing->owning_catalog_domain) == 0 &&
+                                    strcasecmp(g_pending_coo[p].old_catalog, zone_entry_catalog_owner(existing)) == 0 &&
                                     strcasecmp(g_pending_coo[p].new_catalog, catalog_entry_to_update->domain) == 0) {
                                     valid_coo = true; break;
                                 }
                             }
                             if (valid_coo) {
-                                zone_db_entry_t *old_catalog_entry = find_catalog_parent_in_snapshot(target_view, existing->owning_catalog_domain);
+                                zone_db_entry_t *old_catalog_entry = find_catalog_parent_in_snapshot(target_view, zone_entry_catalog_owner(existing));
                                 if (old_catalog_entry) {
-                                    remove_member_from_catalog_bookkeeping(old_catalog_entry, existing->catalog_member_unique_id, new_desired_members[i].domain);
+                                    remove_member_from_catalog_bookkeeping(old_catalog_entry, zone_entry_catalog_uid(existing), new_desired_members[i].domain);
                                 }
-                                if (strcmp(existing->catalog_member_unique_id, new_desired_members[i].unique_id) == 0) {
+                                if (strcmp(zone_entry_catalog_uid(existing), new_desired_members[i].unique_id) == 0) {
                                     // Retain state
                                     syslog(LOG_INFO, "[Catalog] CoO transfer: retained state for '%s' (unique-id: %s), owner %s -> %s",
-                                           existing->domain, existing->catalog_member_unique_id, existing->owning_catalog_domain, catalog_entry_to_update->domain);
-                                    strncpy(existing->owning_catalog_domain, catalog_entry_to_update->domain, sizeof(existing->owning_catalog_domain) - 1);
+                                           existing->domain, zone_entry_catalog_uid(existing), zone_entry_catalog_owner(existing), catalog_entry_to_update->domain);
+                                    char *new_owner = strdup(catalog_entry_to_update->domain);
+                                    if (new_owner) {
+                                        free(existing->owning_catalog_domain);
+                                        existing->owning_catalog_domain = new_owner;
+                                    }
                                     
                                     catalog_entry_set_groups(existing, &new_desired_members[i]);
                                     needs_creation = false;
                                 } else {
                                     // State reset
                                     syslog(LOG_INFO, "[Catalog] CoO transfer: evicted old state for '%s' (old unique-id: %s, new unique-id: %s)",
-                                           existing->domain, existing->catalog_member_unique_id, new_desired_members[i].unique_id);
-                                    strncpy(coo_evicted_members[coo_evicted_count].unique_id, existing->catalog_member_unique_id, sizeof(coo_evicted_members[coo_evicted_count].unique_id) - 1);
+                                           existing->domain, zone_entry_catalog_uid(existing), new_desired_members[i].unique_id);
+                                    strncpy(coo_evicted_members[coo_evicted_count].unique_id, zone_entry_catalog_uid(existing), sizeof(coo_evicted_members[coo_evicted_count].unique_id) - 1);
                                     strncpy(coo_evicted_members[coo_evicted_count].domain, existing->domain, sizeof(coo_evicted_members[coo_evicted_count].domain) - 1);
                                     coo_evicted_count++;
                                 }
                             } else {
                                 syslog(LOG_WARNING, "[Catalog] Name collision for '%s' between '%s' and '%s'. Ignoring.", 
-                                       new_desired_members[i].domain, existing->owning_catalog_domain, catalog_entry_to_update->domain);
+                                       new_desired_members[i].domain, zone_entry_catalog_owner(existing), catalog_entry_to_update->domain);
                                 member_accepted = false;
                             }
                         }
@@ -1411,26 +1431,8 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         int *des_hash_table = NULL;
         int *des_chain_next = NULL;
         size_t des_hash_size = 0;
-        if (new_desired_count > 0) {
-            size_t p = 256;
-            while (p < (size_t)new_desired_count * 2) p <<= 1;
-            des_hash_size = p;
-            des_hash_table = malloc(des_hash_size * sizeof(int));
-            des_chain_next = malloc(new_desired_count * sizeof(int));
-            if (des_hash_table && des_chain_next) {
-                for (size_t k = 0; k < des_hash_size; k++) des_hash_table[k] = -1;
-                for (int j = 0; j < new_desired_count; j++) {
-                    uint32_t h = calc_catalog_member_hash(new_desired_members[j].domain, new_desired_members[j].unique_id);
-                    size_t idx = h & (des_hash_size - 1);
-                    des_chain_next[j] = des_hash_table[idx];
-                    des_hash_table[idx] = j;
-                }
-            } else {
-                if (des_hash_table) { free(des_hash_table); des_hash_table = NULL; }
-                if (des_chain_next) { free(des_chain_next); des_chain_next = NULL; }
-                des_hash_size = 0;
-            }
-        }
+        catalog_member_hash_build(new_desired_members, new_desired_count,
+                                  &des_hash_table, &des_chain_next, &des_hash_size);
 
         for (int i = 0; i < catalog_entry_to_update->catalog_member_count; i++) {
             bool found = catalog_member_index(new_desired_members, new_desired_count,
@@ -1463,14 +1465,19 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                        added_members[i].domain, catalog_entry_to_update->domain);
                 continue;
             }
-            strncpy(entry->owning_catalog_domain, catalog_entry_to_update->domain, sizeof(entry->owning_catalog_domain) - 1);
-            entry->owning_catalog_domain[sizeof(entry->owning_catalog_domain) - 1] = '\0';
+            ixfr_history_set_depth(entry, ixfr_history_effective(active_config, NULL));
+            entry->owning_catalog_domain = strdup(catalog_entry_to_update->domain);
+            entry->catalog_member_unique_id = strdup(added_members[i].unique_id);
+            if (!entry->owning_catalog_domain || !entry->catalog_member_unique_id) {
+                syslog(LOG_ERR, "[Catalog] Failed to allocate memory for member '%s' owned by %s, skipping",
+                       added_members[i].domain, catalog_entry_to_update->domain);
+                free_zone_db_entry(entry);
+                continue;
+            }
             syslog(LOG_INFO, "[Catalog] Added new member '%s' (unique-id: %s) owned by %s", added_members[i].domain, added_members[i].unique_id, catalog_entry_to_update->domain);
             entry->is_catalog_member = true;
             entry->kind = ZONE_KIND_SECONDARY;
             entry->is_secondary = true;
-            strncpy(entry->catalog_member_unique_id, added_members[i].unique_id, sizeof(entry->catalog_member_unique_id) - 1);
-            entry->catalog_member_unique_id[sizeof(entry->catalog_member_unique_id) - 1] = '\0';
             if (added_members[i].group_count > 0) {
                 entry->groups = calloc(added_members[i].group_count, sizeof(char*));
                 if (entry->groups) {
@@ -1480,13 +1487,15 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     }
                 }
             }
-            if (catalog_cfg && catalog_cfg->masters_count > 0 && catalog_cfg->masters[0].ip != NULL) {
-                strncpy(entry->cached_master_ip, catalog_cfg->masters[0].ip, sizeof(entry->cached_master_ip) - 1);
-                entry->cached_master_ip[sizeof(entry->cached_master_ip) - 1] = '\0';
-                entry->cached_master_port = catalog_cfg->masters[0].port;
-            }
-            if (catalog_cfg && catalog_cfg->tsig_key) {
-                strncpy(entry->cached_tsig_key_name, catalog_cfg->tsig_key, sizeof(entry->cached_tsig_key_name) - 1);
+            bool has_master = catalog_cfg && zext(catalog_cfg)->masters_count > 0 && zext(catalog_cfg)->masters[0].ip != NULL;
+            if (has_master || (catalog_cfg && zext(catalog_cfg)->tsig_key)) {
+                entry->catalog_master = calloc(1, sizeof(*entry->catalog_master));
+                if (entry->catalog_master && has_master) {
+                    strncpy(entry->catalog_master->ip, zext(catalog_cfg)->masters[0].ip, sizeof(entry->catalog_master->ip) - 1);
+                    entry->catalog_master->port = zext(catalog_cfg)->masters[0].port;
+                }
+                if (entry->catalog_master && zext(catalog_cfg)->tsig_key)
+                    strncpy(entry->catalog_master->tsig_key, zext(catalog_cfg)->tsig_key, sizeof(entry->catalog_master->tsig_key) - 1);
             }
             atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
             new_entries[actual_added_count++] = entry;
@@ -1601,13 +1610,13 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                         if (!entry) continue;
                         bool is_removed = false;
                         if (entry->is_catalog_member && del_hash_table && del_chain_next) {
-                            uint32_t h = calc_catalog_member_hash(entry->domain, entry->catalog_member_unique_id);
+                            uint32_t h = calc_catalog_member_hash(entry->domain, zone_entry_catalog_uid(entry));
                             size_t idx = h & (del_hash_size - 1);
                             for (int j = del_hash_table[idx]; j != -1; j = del_chain_next[j]) {
                                 const catalog_member_id_t *del = (j < removed_count) ? 
                                     &removed_members[j] : &coo_evicted_members[j - removed_count];
                                 if (strcasecmp(entry->domain, del->domain) == 0 &&
-                                    strcmp(entry->catalog_member_unique_id, del->unique_id) == 0) {
+                                    strcmp(zone_entry_catalog_uid(entry), del->unique_id) == 0) {
                                     is_removed = true;
                                     break;
                                 }
@@ -1615,14 +1624,14 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                         } else if (entry->is_catalog_member && total_deleted > 0) {
                             for (int j = 0; j < removed_count; j++) {
                                 if (strcasecmp(entry->domain, removed_members[j].domain) == 0 &&
-                                    strcmp(entry->catalog_member_unique_id, removed_members[j].unique_id) == 0) {
+                                    strcmp(zone_entry_catalog_uid(entry), removed_members[j].unique_id) == 0) {
                                     is_removed = true; break;
                                 }
                             }
                             if (!is_removed) {
                                 for (int j = 0; j < coo_evicted_count; j++) {
                                     if (strcasecmp(entry->domain, coo_evicted_members[j].domain) == 0 &&
-                                        strcmp(entry->catalog_member_unique_id, coo_evicted_members[j].unique_id) == 0) {
+                                        strcmp(zone_entry_catalog_uid(entry), coo_evicted_members[j].unique_id) == 0) {
                                         is_removed = true; break;
                                     }
                                 }
@@ -1766,12 +1775,15 @@ int rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
 int rebuild_zone_db_from_config_ext(server_config_t *config, bool skip_unchanged, char *failed, size_t failed_sz) {
     int nfailed = 0;
     if (failed && failed_sz > 0) failed[0] = '\0';
+    /* 新しいエントリはスナップショットを作るときに読み込む。読み込めたものを下で 2 度読まない */
+    uint64_t first_new_id = atomic_load_explicit(&g_zone_entry_id, memory_order_relaxed);
     zone_db_snapshot_t *new_snap = rebuild_zone_db_snapshot(config, NULL, NULL, NULL, NULL, 0);
     if (!new_snap) {
         syslog(LOG_ERR, "[Core] Failed to rebuild zone DB snapshot from config due to allocation failure. Reload aborted.");
         return -1;
     }
 
+    size_t since_retire = 0;
     for (view_config_t *v = config->views; v; v = v->next) {
         for (zone_config_t *z = v->zones; z; z = z->next) {
             zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
@@ -1779,7 +1791,9 @@ int rebuild_zone_db_from_config_ext(server_config_t *config, bool skip_unchanged
                 zone_db_entry_t *entry = snapshot_get_zone_in_view(snap, v->name, z->domain);
                 if (entry && z->type && (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) && z->file) {
                     struct stat st;
-                    if (skip_unchanged && stat_via_dir_cache(z->file, &st) == 0 && entry->last_loaded_mtime != 0 && st.st_mtime == entry->last_loaded_mtime) {
+                    if (entry->id > first_new_id && atomic_load_explicit(&entry->publish_order, memory_order_seq_cst) != 0) {
+                        /* この再構築で作って読み込み済み */
+                    } else if (skip_unchanged && stat_via_dir_cache(z->file, &st) == 0 && entry->last_loaded_mtime != 0 && st.st_mtime == entry->last_loaded_mtime) {
                         syslog(LOG_DEBUG, "[Config] zone '%s' file unchanged (mtime match), skipping reload", z->domain);
                     } else if (reload_master_zone(entry, z) != RELOAD_OK) {
                         nfailed++;
@@ -1791,6 +1805,10 @@ int rebuild_zone_db_from_config_ext(server_config_t *config, bool skip_unchanged
                                 if (failed_sz >= 4) memcpy(failed + failed_sz - 4, "...", 4);
                             }
                         }
+                    } else if (++since_retire >= 1024) {
+                        /* S2: 古い版をまとめて解放する (全ゾーンの 2 版分を同時に持たない) */
+                        zone_retire_process(true);
+                        since_retire = 0;
                     }
                 }
                 release_zone_snapshot(snap);
@@ -1813,53 +1831,20 @@ int rebuild_zone_db_from_config_ext(server_config_t *config, bool skip_unchanged
         }
     }
 
-    // Pass 2: Pre-link additional glue across authoritative zones in each view
-    zone_db_snapshot_t *relink_snap = acquire_retained_zone_snapshot();
-    if (relink_snap) {
-        for (size_t v = 0; v < relink_snap->view_count; v++) {
-            view_snapshot_t *view = &relink_snap->views[v];
-            for (size_t i = 0; i < view->zone_count; i++) {
-                zone_db_entry_t *entry = view->entries[i];
-                if (!entry) continue;
-                /* 受信転送中のゾーンは飛ばす。転送スレッドは開始時の active arena を
-                 * 読み取り区間の外で最後まで使い続け、完了時に自分で prelink する。
-                 * 転送の開始もこの処理も制御スレッドで行うので、判定と開始は競合しない。*/
-                if (atomic_load_explicit(&entry->is_transferring, memory_order_acquire)) continue;
-                pthread_mutex_lock(&entry->writer_lock);
-                if (!wait_for_active_axfr(entry, 5000)) {
-                    pthread_mutex_unlock(&entry->writer_lock);
-                    continue;
-                }
-                zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-                if (z_active && z_active->count > 0) {
-                    zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
-                    if (rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000)) {
-                        clone_zone_arena(z_active, z_standby);
-                        build_zone_index(z_standby, true);
-                        zone_config_t *zcfg = find_zone_config_in_view(config, view->name, entry->domain);
-                        additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
-                                                            ? zcfg->additional_from_auth
-                                                            : (config ? config->additional_from_auth : ADDITIONAL_AUTH_YES);
-                        // 兄弟ゾーンの active arena を読むので読み取り区間に入れる
-                        rcu_aux_read_lock();
-                        prelink_zone_additional_glue(z_standby, entry->domain, view, policy);
-                        rcu_aux_read_unlock();
-                        build_zone_response_cache(z_standby, config, view->name, entry->domain);
-                        entry->rcu.retire_epoch = rcu_writer_publish(&entry->rcu.active, z_standby);
-                    } else {
-                        syslog(LOG_WARNING, "[Zone] Pass 2 glue prelink for '%s' skipped: RCU wait timeout", entry->domain);
-                    }
-                }
-                pthread_mutex_unlock(&entry->writer_lock);
-            }
-        }
-        release_zone_snapshot(relink_snap);
-    }
+    /* S2: 兄弟ゾーンのアドレスを使うグルーを作り直す。以前は全ゾーンの arena を複製して prelink し
+     * 直していた (Pass 2)。今は兄弟ゾーンが後から読み込まれた・変わった・増減したゾーンだけ、
+     * グルーだけを差し替える。ゾーンの増減は公開を伴わないので必ず調べる。 */
+    zone_glue_refresh_dependents(true);
+    zone_retire_process(true);
     return nfailed;
 }
 
 void zone_arena_clear_data_pools(zone_arena_t *arena) {
   if (!arena) return;
+  free(arena->image);
+  arena->image = NULL;
+  free(arena->glue);
+  arena->glue = NULL;
   for (int i = 0; i < arena->data_pool_count; i++) {
     if (arena->data_pools[i]) {
       free(arena->data_pools[i]);
@@ -1894,99 +1879,23 @@ void zone_arena_clear_data_pools(zone_arena_t *arena) {
     free(arena->bind_ecs_trusted_resolvers_parsed);
     arena->bind_ecs_trusted_resolvers_parsed = NULL;
   }
-  arena->prelinked_glue = NULL;
-  arena->prelinked_glue_count = 0;
-  free_zone_response_cache(arena);
+  arena->rcache_ok = false;
+  atomic_store_explicit(&arena->generation, 0, memory_order_relaxed);
   arena->count = 0;
   arena->data_pool_count = 0;
   arena->current_pool_cap = 0;
   arena->current_pool_idx = 0;
 }
 
-void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
+/* S5 B-2: 公開済みのイメージ src->image から dst に builder を作る (UPDATE と IXFR で、公開済みのゾーンに差分を当てる前の
+ * 複製の代わり)。dst は空にしてからイメージを zone_image_thaw() する: レコードはファイルの順、索引も作ってある。
+ * 0 = 成功。失敗したら dst は空にする。 */
+int thaw_zone_arena(const zone_version_t *src, zone_arena_t *dst) {
   zone_arena_clear_data_pools(dst);
-  dst->is_tinydns_format = src->is_tinydns_format;
-  if (src->location_count > 0 && src->locations) {
-    dst->locations = malloc(src->location_count * sizeof(tinydns_location_entry_t));
-    if (dst->locations) {
-      memcpy(dst->locations, src->locations, src->location_count * sizeof(tinydns_location_entry_t));
-      dst->location_count = src->location_count;
-    }
+  if (!src || !src->image) return -1;
+  if (zone_image_thaw(src->image, dst) != 0) {
+    zone_arena_clear_data_pools(dst);
+    return -1;
   }
-  if (src->bind_location_tag_count > 0 && src->bind_location_tags) {
-    dst->bind_location_tags = clone_ecs_tags_array(src->bind_location_tags, src->bind_location_tag_count);
-    if (dst->bind_location_tags) {
-      dst->bind_location_tag_count = src->bind_location_tag_count;
-    }
-  }
-  if (src->bind_ecs_tag_count > 0 && src->bind_ecs_tags) {
-    dst->bind_ecs_tags = clone_ecs_tags_array(src->bind_ecs_tags, src->bind_ecs_tag_count);
-    if (dst->bind_ecs_tags) {
-      dst->bind_ecs_tag_count = src->bind_ecs_tag_count;
-    }
-  }
-  if (src->bind_ecs_trusted_resolver_count > 0 && src->bind_ecs_trusted_resolvers) {
-    dst->bind_ecs_trusted_resolvers = malloc(src->bind_ecs_trusted_resolver_count * sizeof(char *));
-    if (dst->bind_ecs_trusted_resolvers) {
-      dst->bind_ecs_trusted_resolver_count = 0;
-      for (int i = 0; i < src->bind_ecs_trusted_resolver_count; i++) {
-        if (src->bind_ecs_trusted_resolvers[i]) {
-          dst->bind_ecs_trusted_resolvers[dst->bind_ecs_trusted_resolver_count] = strdup(src->bind_ecs_trusted_resolvers[i]);
-          if (dst->bind_ecs_trusted_resolvers[dst->bind_ecs_trusted_resolver_count]) {
-            dst->bind_ecs_trusted_resolver_count++;
-          }
-        }
-      }
-      if (dst->bind_ecs_trusted_resolver_count > 0) {
-        dst->bind_ecs_trusted_resolvers_parsed = acl_list_parse(dst->bind_ecs_trusted_resolvers, dst->bind_ecs_trusted_resolver_count);
-      }
-    }
-  }
-  for (size_t i = 0; i < src->count; i++) {
-    if (dst->count >= dst->records_cap) {
-      size_t new_cap = dst->records_cap == 0 ? 16 : dst->records_cap * 2;
-      if (new_cap > SIZE_MAX / sizeof(dns_record_t)) break;
-      dns_record_t *new_records =
-          realloc(dst->records, new_cap * sizeof(dns_record_t));
-      if (!new_records)
-        break;
-      memset(new_records + dst->records_cap, 0,
-             (new_cap - dst->records_cap) * sizeof(dns_record_t));
-      dst->records = new_records;
-      dst->records_cap = new_cap;
-    }
-    dns_record_t *s_rec = &src->records[i];
-    dns_record_t *d_rec = &dst->records[dst->count++];
-    memset(d_rec, 0, sizeof(*d_rec));
-    d_rec->name = arena_strdup(dst, s_rec->name);
-    d_rec->ttl = s_rec->ttl ? arena_strdup(dst, s_rec->ttl) : NULL;
-    d_rec->ttl_value = s_rec->ttl_value;
-    d_rec->class_str =
-        s_rec->class_str ? arena_strdup(dst, s_rec->class_str) : NULL;
-    d_rec->class_val = s_rec->class_val;
-    d_rec->type = s_rec->type ? arena_strdup(dst, s_rec->type) : NULL;
-    d_rec->type_code = s_rec->type_code;
-    d_rec->tinydns_ttd = s_rec->tinydns_ttd;
-    d_rec->tinydns_ttl_countdown = s_rec->tinydns_ttl_countdown;
-    d_rec->tinydns_loc[0] = s_rec->tinydns_loc[0];
-    d_rec->tinydns_loc[1] = s_rec->tinydns_loc[1];
-    d_rec->ecs_subnet_tag = s_rec->ecs_subnet_tag ? arena_strdup(dst, s_rec->ecs_subnet_tag) : NULL;
-    d_rec->bind_location_tag = s_rec->bind_location_tag ? arena_strdup(dst, s_rec->bind_location_tag) : NULL;
-    d_rec->rdata_count = s_rec->rdata_count;
-    for (int j = 0; j < s_rec->rdata_count; j++)
-      d_rec->rdata[j] = s_rec->rdata[j] ? arena_strdup(dst, s_rec->rdata[j]) : NULL;
-    d_rec->generic_len = s_rec->generic_len;
-    if (s_rec->generic_len > 0 && s_rec->generic_data) {
-      d_rec->generic_data = (uint8_t *)arena_alloc(dst, s_rec->generic_len);
-      if (d_rec->generic_data)
-        memcpy(d_rec->generic_data, s_rec->generic_data, s_rec->generic_len);
-    } else if (s_rec->generic_data) {
-      d_rec->generic_data = (uint8_t *)"";
-    } else {
-      d_rec->generic_data = NULL;
-    }
-    d_rec->next_record = -1;
-    d_rec->is_cached = false;
-    dns_record_preparse_cache(dst, d_rec);
-  }
+  return 0;
 }

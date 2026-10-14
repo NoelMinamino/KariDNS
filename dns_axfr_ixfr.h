@@ -57,7 +57,7 @@ typedef struct {
 } axfr_worker_args_t;
 
 int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
-                     zone_arena_t *standby, zone_arena_t *active,
+                     zone_arena_t *standby, const zone_version_t *active,
                      axfr_session_t *session, const char *domain);
 /* R-19: 転送応答の1通のヘッダーと質問を session->query_id / query_type / domain と照合する
  * (RFC 5936 §2.2.1、§2.2.2)。0 = 問題なし、-1 = 応答として受け付けない (ログ済み)、

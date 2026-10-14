@@ -58,6 +58,7 @@
 "notify-retries"
 "notify-retry-interval"
 "notify-retry-backoff"
+"ixfr-history"
 "exponential"
 "fixed"
 "masters"

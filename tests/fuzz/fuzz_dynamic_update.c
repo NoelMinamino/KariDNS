@@ -3,16 +3,20 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
+#include <assert.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <limits.h>
 
 #include "../../dns_wire.h"
 #include "../../dns_zone_parser.h"
+#include "../../dns_zone_image.h"
+#include "../test_image_helper.h"
 #include "../../dns_dynamic_update.h"
 #include "../../dns_snapshot_rcu.h"
 #include "../../dns_epoch_rcu.h"
 #include "../../dns_server_internal.h"
+#include "../test_zone_slots.h"
 
 // Mock globals
 int g_control_kq = -1;
@@ -71,8 +75,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
-    zone_arena_init(&entry.rcu.arena_a);
-    zone_arena_init(&entry.rcu.arena_b);
+    zone_arena_init(test_zone_slot(&entry, 0));
+    zone_arena_init(test_zone_slot(&entry, 1));
 
     parse_error_t err = {0};
     parse_context_t ctx = {
@@ -89,24 +93,27 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                        "www.dyn.example.com. 3600 IN A 192.0.2.11\n"
                        "alias.dyn.example.com. 3600 IN CNAME www.dyn.example.com.\n"
                        "sub.dyn.example.com. 3600 IN NS ns.sub.dyn.example.com.\n";
-    parse_zone_fast(init_zone, sizeof(init_zone) - 1, &entry.rcu.arena_a, &ctx);
-    build_zone_index(&entry.rcu.arena_a, true);
+    parse_zone_fast(init_zone, sizeof(init_zone) - 1, test_zone_slot(&entry, 0), &ctx);
+    assert(test_build_index(test_zone_slot(&entry, 0), true) == 0);
 
-    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
     atomic_store_explicit(&entry.serial, 1, memory_order_release);
 
     // Fuzz dynamic update handling
     handle_dynamic_update(data, size, &entry, "127.0.0.1", "key-admin");
 
+    /* S5 B-1: every published version carries the image the engine reads. B-2: the version an UPDATE published has
+     * no builder any more; the hand-built initial one (arena_a, an UPDATE that changed nothing) still holds its RRs */
+    zone_version_t *published = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
+    assert(published->image != NULL);
+    assert(published == &test_zone_slot(&entry, 0)->ver || published->heap); /* unchanged, or a new heap version without a builder */
+
     /* X-35: an applied update records its IXFR difference in entry.ixfr_history (compute_ixfr_diff()); the
      * server keeps it for the life of the zone, this per-input entry must release it or every applied update
      * leaks one transaction (the RSS grew to the 2 GB limit of the build host in a few minutes) */
-    for (int i = 0; i < MAX_IXFR_HISTORY; i++) {
-        if (entry.ixfr_history.entries[i]) free_ixfr_txn(entry.ixfr_history.entries[i]);
-    }
+    ixfr_history_clear(&entry.ixfr_history);
 
-    zone_arena_destroy(&entry.rcu.arena_a);
-    zone_arena_destroy(&entry.rcu.arena_b);
+    test_entry_release(&entry);
     pthread_mutex_destroy(&entry.writer_lock);
     pthread_mutex_destroy(&entry.ixfr_history.lock);
     return 0;

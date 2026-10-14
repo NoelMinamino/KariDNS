@@ -10,6 +10,7 @@
 #include "dns_wire.h"
 #include "dns_config_parser.h"
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
 #include "dns_server_internal.h"
 
 /* D-05: 直前の process_dns_query*() が応答を作ったゾーンと、答えがワイルドカードから作られたか
@@ -28,13 +29,13 @@ size_t dns_rrl_slip_response(uint8_t *res, size_t res_len, size_t buf_cap);
 int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       size_t max_res_len, const char *qname, uint16_t qtype,
                       const char *client_ip, compress_ctx_t *comp_ctx,
-                      bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                      bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                       zone_db_snapshot_t *snap);
 
 int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                           size_t max_res_len, const char *qname, uint16_t qtype,
                           const char *client_ip, compress_ctx_t *comp_ctx,
-                          bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                          bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                           zone_db_snapshot_t *snap, server_config_t *cfg,
                           zone_db_entry_t **out_matched_entry);
 
@@ -43,12 +44,12 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
 int process_dns_query_cap(const uint8_t *req, size_t req_len, uint8_t *res,
                           size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
                           const char *client_ip, compress_ctx_t *comp_ctx,
-                          bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                          bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                           zone_db_snapshot_t *snap);
 int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
                                size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
                                const char *client_ip, compress_ctx_t *comp_ctx,
-                               bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                               bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                                zone_db_snapshot_t *snap, server_config_t *cfg,
                                zone_db_entry_t **out_matched_entry);
 
@@ -60,7 +61,7 @@ size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t qdcount)
 
 void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
                   zone_db_entry_t **db_entry_ptr,
-                  zone_arena_t **current_zone_ptr, uint8_t *res,
+                  zone_version_t **current_zone_ptr, uint8_t *res,
                   size_t max_res_len, uint16_t *offset,
                   compress_ctx_t *comp_ctx, uint16_t *ancount,
                   uint16_t *nscount, uint16_t *arcount,
@@ -72,6 +73,13 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                   uint8_t ecs_source_prefix,
                   uint8_t *out_ecs_scope_prefix);
 
+/* Additional セクションに載せる名前 (MX/SRV/NS のターゲット)。16 個まで、同じ名前は 1 回 */
+typedef struct {
+  char targets[16][DNS_NAME_TEXT_SIZE];
+  int count;
+  bool minimal;
+} glue_list_t;
+
 typedef struct resolve_checkpoint {
     uint16_t offset;
     uint16_t ancount;
@@ -79,18 +87,26 @@ typedef struct resolve_checkpoint {
     uint16_t arcount;
 } resolve_checkpoint_t;
 
-void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const char *view_name, const char *domain);
+void build_zone_response_cache(zone_version_t *arena, server_config_t *cfg, const char *view_name, const char *domain);
+/* 共有の応答キャッシュを bytes 以内で確保する (以前の表は捨てる)。0 なら使わない。確保した大きさを返す */
+size_t response_cache_init(size_t bytes);
+/* ゾーンのデータを公開するたび (と兄弟ゾーンが変わるたび) に使う、一意の版の番号 */
+uint64_t zone_data_generation_next(void);
 program_plugin_t *find_program_plugin(const char *view_name, const char *domain);
 
 #ifdef KARIDNS_UNIT_TEST
+int rcache_lookup(uint64_t tag, uint64_t gen, uint16_t qtype, uint8_t *dst, size_t room,
+                  uint16_t *an, uint16_t *ns, uint16_t *ar);
+void rcache_store(uint64_t tag, uint64_t gen, uint16_t qtype, const uint8_t *body, size_t len,
+                  uint16_t an, uint16_t ns, uint16_t ar);
 void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
                         uint16_t *ancount, uint16_t *nscount, uint16_t *arcount);
-bool tinydns_record_currently_valid(const dns_record_t *rec, time_t now,
-                                    const char client_loc[2],
-                                    const char *client_ecs_tag,
-                                    const char *client_loc_tag,
-                                    uint32_t *effective_ttl_out);
-bool append_glue_records(zone_arena_t *current_zone, const char *target,
+bool image_rr_currently_valid(const zone_image_t *img, uint32_t rr, time_t now,
+                              const char client_loc[2],
+                              const char *client_ecs_tag,
+                              const char *client_loc_tag,
+                              uint32_t *effective_ttl_out);
+bool append_glue_records(const zone_image_t *img, const char *target,
                          const char *zone_apex, uint8_t *res,
                          size_t max_res_len, uint16_t *offset,
                          compress_ctx_t *comp_ctx, uint16_t *arcount,
@@ -99,14 +115,11 @@ bool append_glue_records(zone_arena_t *current_zone, const char *target,
                          const char *client_loc_tag,
                          additional_from_auth_t policy,
                          view_snapshot_t *view, bool dnssec_ok);
-void collect_additional_rr_glue(dns_record_t *rec,
-                                const char *glue_targets[16],
-                                int *glue_target_count,
-                                bool minimal_responses);
-bool name_exists_in_zone(zone_arena_t *zone, const char *name,
+void collect_additional_rr_glue(const zone_image_t *img, uint32_t rr, glue_list_t *glue);
+bool name_exists_in_zone(const zone_image_t *img, const char *name,
                          const char client_loc[2], const char *client_ecs_tag,
                          const char *client_loc_tag);
-const char *find_closest_encloser(zone_arena_t *zone, const char *qname,
+const char *find_closest_encloser(const zone_image_t *img, const char *qname,
                                   const char *zone_apex, const char client_loc[2],
                                   const char *client_ecs_tag,
                                   const char *client_loc_tag);
@@ -115,16 +128,15 @@ bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iterations,
                         const uint8_t *salt, size_t salt_len,
                         char *out_b32, size_t out_b32_sz);
 bool nsec3_covers_hash(const char *owner_hash, const char *next_hash, const char *target_hash);
-dns_record_t *find_matching_nsec3(zone_arena_t *zone, const dns_record_t *param, const char *hash_b32,
-                                  const char *apex);
-dns_record_t *find_covering_nsec3(zone_arena_t *zone, const dns_record_t *param, const char *target_hash);
+/* NSEC3 の RR (イメージの添字) を返す。chain はイメージの NSEC3 チェーン番号、無ければ ZONE_IMAGE_NONE */
+uint32_t find_matching_nsec3(const zone_image_t *img, uint32_t chain, const char *hash_b32, const char *apex);
+uint32_t find_covering_nsec3(const zone_image_t *img, uint32_t chain, const char *target_hash);
 bool find_next_closer_name(const char *qname, const char *encloser, char *out, size_t out_sz);
-bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
+bool attach_nsec3_record(const zone_image_t *img, uint32_t rr,
                          uint8_t *res, size_t max_res_len, uint16_t *offset,
                          compress_ctx_t *comp_ctx, uint16_t *nscount,
-                         dns_record_t **attached, int *attached_count);
-bool find_delegation(zone_arena_t *current_zone, const char *qname,
-                     uint32_t qname_hash,
+                         const zone_image_rr_t **attached, int *attached_count);
+bool find_delegation(const zone_image_t *img, const char *qname,
                      const char *zone_apex, uint8_t *res,
                      size_t max_res_len, uint16_t *offset,
                      compress_ctx_t *comp_ctx, uint16_t *nscount,
@@ -152,8 +164,8 @@ ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
                         uint32_t timeout_ms);
 int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t req_len,
                           uint8_t *res, size_t max_res_len);
-bool nsec_covers_name(const dns_record_t *rec, const char *name);
-dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name);
+bool nsec_covers_name(const zone_image_t *img, uint32_t rr, const char *name);
+uint32_t find_covering_nsec(const zone_image_t *img, const char *name);
 bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, program_plugin_t *out);
 void record_observatory_response(zone_db_entry_t *entry, uint8_t rcode, uint16_t ancount);
 #endif

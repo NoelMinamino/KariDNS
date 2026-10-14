@@ -242,6 +242,7 @@ register_test "unit" "bin" "test_cidr" "CIDR prefix matching & binary ACL evalua
 register_test "unit" "bin" "test_conf_include" "Config file tokenizer & \$INCLUDE nesting"
 register_test "unit" "bin" "test_config_directives" "named.conf directives: options/zone/key/logging/dnstap/ecs-tags, ACL negation & validation"
 register_test "unit" "bin" "test_wire_helpers" "Wire helpers: question parser, TSIG position, name pointers/compression, path split"
+register_test "unit" "bin" "test_zone_image" "S5-B0 zone image: byte parity with serialize_dns_record(), accessors, canonical/NSEC3 order, thaw round trip"
 register_test "unit" "bin" "test_zone_parser_paths" "Zone parser: 91 RR forms, 44 RFC golden RDATA vectors, rejection tables, \$INCLUDE/\$GENERATE/tags"
 register_test "unit" "bin" "test_tinydns_paths" "tinydns parser: 23 valid line forms, over-long FQDN rejection in every position, generic/unknown records, mutations"
 register_test "unit" "bin" "test_sig0_sign" "RFC 2931 SIG(0) signing verified independently with OpenSSL (RSA/ECDSA/Ed25519)"
@@ -249,7 +250,7 @@ register_test "unit" "bin" "test_snapshot_rebuild" "Zone snapshot rebuild across
 register_test "unit" "bin" "test_dag_reassembly" "dag pcap L4 extraction (all link types, padding, fragments) & randomized TCP reassembly (reorder, retransmit, seq wraparound)"
 register_test "unit" "bin" "test_dag_format" "dag RDATA display: RFC 1035 decimal escaping, RFC 8777 AMTRELAY, display->parse round trip of every RR type"
 register_test "unit" "bin" "test_query_engine_protocol" "Query engine protocol: BADVERS, FORMERR/NOTIMP, foreign classes, IXFR/UDP, SOA EXPIRE, NOTIFY+TSIG authorization"
-register_test "unit" "bin" "test_response_cache" "Response cache: hot-path LRU, TTL countdown, negative caching & invalidation"
+register_test "unit" "bin" "test_response_cache" "Shared response cache: fill on miss, byte-identical answers, invalidation by generation"
 register_test "unit" "bin" "test_dnssec_proofs" "DNSSEC negative proofs: RFC 5155 App A/B (NSEC3) & RFC 4035 App A/B (NSEC) example zones"
 register_test "unit" "bin" "test_hash_table" "Fixed-size FNV1a hash table collisions"
 register_test "unit" "bin" "test_epoch_rcu" "Epoch RCU publish order, grace period, auxiliary reader slots (R-25)"
@@ -329,6 +330,7 @@ register_test "core" "sh" "tests/run_program_zone_test.sh" "Dynamic backend reco
 register_test "core" "sh" "tests/run_karictl_observatory_test.sh" "karictl observatory IPC metrics query"
 register_test "core" "sh" "tests/run_karictl_reload_reconfig_test.sh" "karictl reload & dynamic reconfig IPC"
 register_test "core" "sh" "tests/run_karictl_reload_failure_test.sh" "karictl reload/reconfig report failures (exit 3), restart-only settings, status values and time format (D-13, O-05, O-09, D-12, T-11)"
+register_test "core" "sh" "tests/run_signal_all_processes_test.sh" "SIGHUP/SIGUSR1/SIGUSR2/SIGPIPE to every karidns process: nothing dies, the server reloads and keeps answering"
 register_test "core" "sh" "tests/run_config_acl_bool_test.sh" "named.conf booleans, category lists, zone type case, named acl statements (D-01, D-02, D-22, D-23)"
 register_test "core" "sh" "tests/run_zone_path_dotdot_test.sh" "zone and log file paths with ../ inside the sandbox (D-24)"
 register_test "core" "sh" "tests/run_log_rotation_timestamp_test.sh" "suffix timestamp log rotation never overwrites, versions prunes (D-21)"
@@ -533,7 +535,7 @@ FAILED_TEST_NAMES=""
 # Ensure unit test binaries are built if category 'unit' is active
 if is_category_selected "unit"; then
     echo "${C_CYAN}==> Ensuring unit test binaries are built...${C_RESET}"
-    for _b in test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_epoch_rcu test_cidr test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core; do
+    for _b in test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_config_directives test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_epoch_rcu test_cidr test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core; do
         if [ ! -x "./${_b}" ]; then
             make "${_b}" >/dev/null 2>&1 || true
         fi

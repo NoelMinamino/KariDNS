@@ -7,6 +7,7 @@
 
 #include "../dns_wire.h"
 #include "../dns_config_parser.h"
+#include "test_zext.h"
 #include "../dns_zone_parser.h"
 #include "../dns_utils.h"
 
@@ -279,8 +280,19 @@ static void test_generic_record_prohibited_types(void) {
 /* ============================================================================
  * Test 5: 正引き・逆引き混在および親子ゾーンの振り分け検証
  * ============================================================================ */
-static void test_zone_filtering_and_parent_child(void) {
-    printf("--- Test 5: Zone Filtering and Parent-Child Delegation ---\n");
+/* zone_exists コールバック (サーバーと karicheck は view の索引を引く) の代わりの線形版 */
+typedef struct { const char **names; int count; } zone_list_t;
+static bool list_has_zone(const void *ud, const char *name) {
+    const zone_list_t *l = ud;
+    for (int i = 0; i < l->count; i++)
+        if (domain_names_match_ci(l->names[i], name)) return true;
+    return false;
+}
+
+/* lookup = true: all_zone_names の代わりに zone_exists で同じ結果になること */
+static void run_zone_filtering(bool lookup) {
+    printf("--- Test 5: Zone Filtering and Parent-Child Delegation (%s) ---\n",
+           lookup ? "zone_exists callback" : "all_zone_names");
 
     const char *shared_data =
         ".example.com:192.168.1.1:a:259200\n"
@@ -294,6 +306,7 @@ static void test_zone_filtering_and_parent_child(void) {
         "1.168.192.in-addr.arpa."
     };
     int all_zones_count = 3;
+    zone_list_t list1 = { all_zones, all_zones_count };
 
     // 1. 親ゾーン example.com. のパース
     {
@@ -302,8 +315,10 @@ static void test_zone_filtering_and_parent_child(void) {
         parse_error_t err = {0};
         parse_context_t ctx = {
             .default_origin = "example.com.",
-            .all_zone_names = all_zones,
-            .all_zone_count = all_zones_count,
+            .all_zone_names = lookup ? NULL : all_zones,
+            .all_zone_count = lookup ? 0 : all_zones_count,
+            .zone_exists = lookup ? list_has_zone : NULL,
+            .zone_exists_ud = &list1,
             .err_out = &err
         };
         int count = parse_tinydns_data(buf, strlen(buf), &arena, &ctx);
@@ -332,8 +347,10 @@ static void test_zone_filtering_and_parent_child(void) {
         parse_error_t err = {0};
         parse_context_t ctx = {
             .default_origin = "sub.example.com.",
-            .all_zone_names = all_zones,
-            .all_zone_count = all_zones_count,
+            .all_zone_names = lookup ? NULL : all_zones,
+            .all_zone_count = lookup ? 0 : all_zones_count,
+            .zone_exists = lookup ? list_has_zone : NULL,
+            .zone_exists_ud = &list1,
             .err_out = &err
         };
         int count = parse_tinydns_data(buf, strlen(buf), &arena, &ctx);
@@ -352,8 +369,10 @@ static void test_zone_filtering_and_parent_child(void) {
         parse_error_t err = {0};
         parse_context_t ctx = {
             .default_origin = "1.168.192.in-addr.arpa.",
-            .all_zone_names = all_zones,
-            .all_zone_count = all_zones_count,
+            .all_zone_names = lookup ? NULL : all_zones,
+            .all_zone_count = lookup ? 0 : all_zones_count,
+            .zone_exists = lookup ? list_has_zone : NULL,
+            .zone_exists_ud = &list1,
             .err_out = &err
         };
         int count = parse_tinydns_data(buf, strlen(buf), &arena, &ctx);
@@ -375,12 +394,15 @@ static void test_zone_filtering_and_parent_child(void) {
                     "+stray2.other.test:192.0.2.8:3600\n"
                     "=rev2.example.com:198.51.100.7:3600\n");
         const char *zones2[] = { "example.com." };
+        zone_list_t list2 = { zones2, 1 };
         zone_arena_t arena; zone_arena_init(&arena);
         parse_error_t err = {0};
         parse_context_t ctx = {
             .default_origin = "example.com.",
-            .all_zone_names = zones2,
-            .all_zone_count = 1,
+            .all_zone_names = lookup ? NULL : zones2,
+            .all_zone_count = lookup ? 0 : 1,
+            .zone_exists = lookup ? list_has_zone : NULL,
+            .zone_exists_ud = &list2,
             .err_out = &err
         };
         int count = parse_tinydns_data(buf, strlen(buf), &arena, &ctx);
@@ -402,6 +424,11 @@ static void test_zone_filtering_and_parent_child(void) {
         TEST_ASSERT(ctx2.out_of_zone_count == 0, "No zone list: out-of-zone records not counted");
         zone_arena_destroy(&arena);
     }
+}
+
+static void test_zone_filtering_and_parent_child(void) {
+    run_zone_filtering(false);
+    run_zone_filtering(true);
 }
 
 /* ============================================================================
@@ -433,13 +460,13 @@ static void test_config_file_format(void) {
     TEST_ASSERT(z1 != NULL, "Zone 1 exists");
     if (z1) {
         TEST_ASSERT(strcmp(z1->domain, "example.com.") == 0, "Zone 1 domain");
-        TEST_ASSERT(z1->file_format != NULL && strcmp(z1->file_format, "tinydns") == 0, "Zone 1 file-format is tinydns");
+        TEST_ASSERT(zext(z1)->file_format != NULL && strcmp(zext(z1)->file_format, "tinydns") == 0, "Zone 1 file-format is tinydns");
         
         zone_config_t *z2 = z1->next;
         TEST_ASSERT(z2 != NULL, "Zone 2 exists");
         if (z2) {
             TEST_ASSERT(strcmp(z2->domain, "bind.example.") == 0, "Zone 2 domain");
-            TEST_ASSERT(z2->file_format != NULL && strcmp(z2->file_format, "bind") == 0, "Zone 2 file-format is bind");
+            TEST_ASSERT(zext(z2)->file_format != NULL && strcmp(zext(z2)->file_format, "bind") == 0, "Zone 2 file-format is bind");
         }
     }
 

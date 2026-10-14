@@ -83,7 +83,7 @@ Commands that take a zone name accept an optional view name as the next argument
 : Display the SOA serial and refresh interval of `<zone>` (`OK serial=<n> refresh=<n>`).
 
 `observatory [zone [view]]`
-: Display per-zone statistics for all zones, or only for the given zone (and view): role (primary/secondary), SOA serial, query counts (total and TCP), response codes (NOERROR, NXDOMAIN, NODATA, SERVFAIL, REFUSED), EDNS/DO/ECS query counts, RRL dropped/slipped counts, successful inbound AXFR/IXFR transfers (secondary) or NOTIFY messages sent (primary) with the time of the last one, and wire-cache hits, misses and size.
+: Display per-zone statistics for all zones, or only for the given zone (and view): role (primary/secondary), SOA serial, query counts (total and TCP), response codes (NOERROR, NXDOMAIN, NODATA, SERVFAIL, REFUSED), EDNS/DO/ECS query counts, RRL dropped/slipped counts, successful inbound AXFR/IXFR transfers (secondary) or NOTIFY messages sent (primary) with the time of the last one, and response cache hits and misses (the cache is shared by all zones, so it has no per-zone size).
 
 `tsig-keygen [keyname]`
 : Generate a 256-bit random TSIG secret with OpenSSL `RAND_bytes(3)` and print a `key` block (`algorithm hmac-sha256`) ready for `karidns.conf`. The default key name is `transfer-key`. This command does not contact the server and does not read the configuration file.

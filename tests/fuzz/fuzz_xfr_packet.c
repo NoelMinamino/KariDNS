@@ -75,7 +75,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     axfr_session_t session;
     memset(&session, 0, sizeof(session));
 
-    parse_xfr_packet(data, size, &standby, &active, &session, "fuzz.example.com.");
+    parse_xfr_packet(data, size, &standby, &active.ver, &session, "fuzz.example.com.");
 
     zone_arena_destroy(&standby);
     zone_arena_destroy(&active);

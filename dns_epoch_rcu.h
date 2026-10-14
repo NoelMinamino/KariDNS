@@ -63,6 +63,8 @@ uint64_t rcu_writer_advance_epoch(void);
 // 指定epoch以前を参照しているワーカーがいなくなるまで待つ(writer専用、低頻度呼び出し)
 // timeout_ms <= 0 の場合は無制限に待つ。全リーダーの退出を確認できたら true、タイムアウト時は false を返す。
 bool rcu_writer_wait_until_safe(uint64_t retire_epoch, int timeout_ms);
+// 待たずに 1 回だけ調べる (retire_epoch 以前を読んでいるスレッドがいなければ true)
+bool rcu_writer_is_safe(uint64_t retire_epoch);
 
 // ワーカーが自分の読み取り区間の中で writer になるとき (UPDATE) に使う。自分の区間は待たない
 // (待つと自分自身を待ってタイムアウトまで止まる)。呼び出し側は、待つ前に読んだ arena の

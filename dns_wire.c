@@ -618,7 +618,7 @@ static int decode_dnssec_rdata(const uint8_t *rd, size_t rdlen, zone_arena_t *ar
     }
 }
 
-int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offset, zone_arena_t *arena, dns_record_t *rec, uint16_t *type_out) {
+static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_len, size_t *offset, zone_arena_t *arena, dns_record_t *rec, uint16_t *type_out) {
     char *name; if (expand_wire_name(packet, packet_len, *offset, offset, arena, &name) != 0) { syslog(LOG_ERR, "[AXFR] parse_resource_record: expand_wire_name failed for owner name"); return -1; }
     rec->name = name; if (*offset + 10 > packet_len) { syslog(LOG_ERR, "[AXFR] parse_resource_record: packet too short for header"); return -1; }
     uint16_t type = (packet[*offset] << 8) | packet[*offset + 1];
@@ -798,6 +798,34 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
     *offset += rdlen; return 0;
 }
 
+/* S5: rdata[] は MAX_RDATA 個のスタック上の配列に組み立て、成功したら rdata_count 個ぶんだけ arena に写す
+ * (呼び出し側は rec をスタックなどに置いてよい。失敗時は rdata = NULL, rdata_count = 0)。 */
+int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offset, zone_arena_t *arena, dns_record_t *rec, uint16_t *type_out) {
+    char *scratch[MAX_RDATA];
+    rec->rdata = scratch;
+    rec->rdata_count = 0;
+    int rc = parse_resource_record_scratch(packet, packet_len, offset, arena, rec, type_out);
+    char **keep = NULL;
+    if (rc == 0 && rec->rdata_count > 0) {
+        keep = arena_alloc(arena, (size_t)rec->rdata_count * sizeof(char *));
+        if (keep) memcpy(keep, scratch, (size_t)rec->rdata_count * sizeof(char *));
+        else rc = -1;
+    }
+    rec->rdata = keep;
+    if (rc != 0) rec->rdata_count = 0;
+    return rc;
+}
+
+int dns_record_dup_rdata(zone_arena_t *arena, dns_record_t *rec) {
+    if (rec->rdata_count <= 0) { rec->rdata = NULL; return 0; }
+    size_t bytes = (size_t)rec->rdata_count * sizeof(char *);
+    char **dup = arena_alloc(arena, bytes);
+    if (!dup) { rec->rdata = NULL; rec->rdata_count = 0; return -1; }
+    memcpy(dup, rec->rdata, bytes);
+    rec->rdata = dup;
+    return 0;
+}
+
 // ============================================================================
 // TSIG ヘルパー
 // ============================================================================
@@ -970,6 +998,30 @@ void dns_canonical_downcase_rdata(uint16_t type, uint8_t *rd, size_t len) {
         default:
             break;
     }
+}
+
+/* S5 Phase B: see dns_wire.h. The `compress` column mirrors the comp_ctx calls in serialize_dns_record(): NS MD MF
+ * CNAME MB MG MR PTR (case 2..12 there), MX, SOA and MINFO. Unit test tests/test_zone_image.c checks the table
+ * against serialize_dns_record() for every RR of tests/zones/ and the fuzz harness does it for arbitrary input. */
+static const dns_rdata_name_layout_t g_rdata_name_layout[] = {
+    { 2, 0, 1, 1 },   { 3, 0, 1, 1 },   { 4, 0, 1, 1 },   { 5, 0, 1, 1 },   /* NS MD MF CNAME */
+    { 7, 0, 1, 1 },   { 8, 0, 1, 1 },   { 9, 0, 1, 1 },   { 12, 0, 1, 1 },  /* MB MG MR PTR */
+    { 6, 0, 2, 1 },                                                         /* SOA: MNAME RNAME, then 20 octets */
+    { 14, 0, 2, 1 },                                                        /* MINFO */
+    { 15, 2, 1, 1 },                                                        /* MX: PREFERENCE, EXCHANGE */
+    { 17, 0, 2, 0 },                                                        /* RP */
+    { 18, 2, 1, 0 },  { 21, 2, 1, 0 },  { 36, 2, 1, 0 },  { 107, 2, 1, 0 }, /* AFSDB RT KX LP */
+    { 23, 0, 1, 0 },  { 39, 0, 1, 0 },                                      /* NSAP-PTR, DNAME */
+    { 24, 18, 1, 0 }, { 46, 18, 1, 0 },                                     /* SIG, RRSIG: Signer's Name */
+    { 26, 2, 2, 0 },                                                        /* PX */
+    { 30, 0, 1, 0 },  { 47, 0, 1, 0 },                                      /* NXT, NSEC: next domain name */
+    { 33, 6, 1, 0 },                                                        /* SRV: target */
+};
+
+const dns_rdata_name_layout_t *dns_rdata_name_layout(uint16_t type) {
+    for (size_t i = 0; i < sizeof(g_rdata_name_layout) / sizeof(g_rdata_name_layout[0]); i++)
+        if (g_rdata_name_layout[i].type == type) return &g_rdata_name_layout[i];
+    return NULL;
 }
 
 long dns_record_canonical_rdata(const dns_record_t *rec, uint8_t *buf, size_t cap) {
@@ -2064,13 +2116,24 @@ static int decode_b64_buffer(const char *b64, size_t b64_len, uint8_t *res, size
      * (declen - padding) to a negative int that then wraps to a huge size_t
      * when added to *offset, corrupting all bound checks that follow. */
     if (b64_len == 0 || (b64_len % 4) != 0) return -1;
-    size_t decoded_upper_bound = ((b64_len + 3) / 4) * 3;
-    if (*offset + decoded_upper_bound > max_res_len) return -1;
-    int declen = EVP_DecodeBlock(&res[*offset], (const unsigned char *)b64, b64_len);
-    if (declen < 0) return -1;
-    int padding = (b64_len > 0 && b64[b64_len-1]=='=') + (b64_len > 1 && b64[b64_len-2]=='=');
-    if (declen < padding) return -1; // guard against underflow
-    *offset += (size_t)(declen - padding);
+    /* EVP_DecodeBlock() writes 3 octets per quantum including the zero octets standing for '=' padding. Those
+     * octets are not part of the RDATA, so the room check must use the exact length (up to 2 less), or an RR
+     * that fits exactly is rejected. The last quantum goes through a 3-octet scratch buffer so nothing is
+     * written beyond *offset + exact length. */
+    int padding = (b64[b64_len - 1] == '=') + (b64[b64_len - 2] == '=');
+    size_t exact = (b64_len / 4) * 3 - (size_t)padding;
+    if (*offset + exact > max_res_len) return -1;
+    size_t head = b64_len - 4, written = 0;
+    if (head > 0) {
+        int hlen = EVP_DecodeBlock(&res[*offset], (const unsigned char *)b64, head);
+        if (hlen < 0 || (size_t)hlen != head / 4 * 3) return -1;
+        written = (size_t)hlen;
+    }
+    unsigned char tail[3];
+    int tlen = EVP_DecodeBlock(tail, (const unsigned char *)b64 + head, 4);
+    if (tlen != 3) return -1;
+    memcpy(&res[*offset + written], tail, (size_t)(3 - padding));
+    *offset += exact;
     return 0;
 }
 
@@ -2896,8 +2959,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 // count below, underflowing pk_len (uint16_t) into a huge value.
                 if (pk_b64_len == 0 || (pk_b64_len % 4) != 0) return -1;
 
-                size_t decoded_upper_bound = ((pk_b64_len + 3) / 4) * 3;
-                if ((size_t)offset + 4 + hit_len + decoded_upper_bound > max_res_len) return -1;
+                if ((size_t)offset + 4 + hit_len > max_res_len) return -1;
                 
                 res[offset++] = (uint8_t)hit_len;
                 res[offset++] = pk_alg;
@@ -2908,15 +2970,10 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 memcpy(&res[offset], hit, hit_len);
                 offset += hit_len;
                 
-                int pk_declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)pk_b64, pk_b64_len);
-                if (pk_declen < 0) return -1;
-                
-                int padding = 0;
-                if (pk_b64_len > 0 && pk_b64[pk_b64_len - 1] == '=') padding++;
-                if (pk_b64_len > 1 && pk_b64[pk_b64_len - 2] == '=') padding++;
-                
-                if (pk_declen < padding) return -1; // guard against uint16_t underflow below
-                uint16_t pk_len = (uint16_t)(pk_declen - padding);
+                size_t pk_end = offset;
+                if (decode_b64_buffer(pk_b64, pk_b64_len, res, max_res_len, &pk_end) != 0) return -1;
+                if (pk_end - offset > 0xFFFF) return -1; // the public key length is 16 bits
+                uint16_t pk_len = (uint16_t)(pk_end - offset);
                 res[pk_len_offset] = pk_len >> 8;
                 res[pk_len_offset + 1] = pk_len & 0xFF;
                 offset += pk_len;
@@ -4123,6 +4180,18 @@ static bool update_replaces(const dns_record_t *zrr, const dns_record_t *rr) {
     return compare_records(zrr, rr, true);
 }
 
+/* 追加する RR をワイヤー形式に書けるか。書けない RR はゾーンファイルと同じく落として警告し、変更として
+ * 数えない (そうしないと、それだけの UPDATE でシリアルが上がり公開される: RFC 2136 §3.6)。UPDATE は
+ * クエリの経路ではないので作業領域はヒープに取る。確保できなければ書けるものとして扱う (公開前の
+ * zone_drop_unencodable_logged() が落とす) */
+static bool update_rr_encodable(const dns_record_t *rr) {
+    uint8_t *buf = malloc(65535);
+    if (!buf) return true;
+    bool ok = dns_record_canonical_rdata(rr, buf, 65535) >= 0;
+    free(buf);
+    return ok;
+}
+
 static int update_append_record(zone_arena_t *standby, const dns_record_t *rec) {
     if (standby->count >= standby->records_cap) {
         size_t new_cap = standby->records_cap == 0 ? 256 : standby->records_cap * 2;
@@ -4347,6 +4416,12 @@ int process_update_sections(const uint8_t *req, size_t req_len,
                 if (update_rec_is_at(&standby->records[k], name) && standby->records[k].type_code == 6) soa_idx = k;
             }
             if (soa_idx < 0 || !serial_is_newer(update_soa_serial(&rr), update_soa_serial(&standby->records[soa_idx]))) continue;
+        }
+
+        if (!update_rr_encodable(&rr)) {
+            syslog(LOG_WARNING, "[Update] zone '%s': ignored an RR for '%s' type %u that cannot be encoded",
+                   zone_name, name, (unsigned)type);
+            continue;
         }
 
         bool replaced = false;

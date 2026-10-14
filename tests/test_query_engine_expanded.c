@@ -15,7 +15,10 @@
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
+#include "test_zext.h"
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
+#include "test_image_helper.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_query_engine.h"
 #include "dns_server_internal.h"
@@ -147,13 +150,13 @@ static void test_all_rr_types_and_resolution(void) {
 
     int parsed = parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx);
     assert(parsed >= 0);
-    int b_res = build_zone_index(&arena, true);
+    int b_res = test_build_index(&arena, true);
     assert(b_res == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     char *any_acl[1] = { (char *)"any" };
@@ -231,7 +234,7 @@ static void test_all_rr_types_and_resolution(void) {
         build_dns_query(req, &req_len, (uint16_t)(i + 1), tests[i].qname, tests[i].qtype, false);
         compress_ctx_init_packet(&comp_ctx);
 
-        rate_limit_config_t *rrl_out = NULL;
+        const rate_limit_config_t *rrl_out = NULL;
         zone_db_entry_t *matched_entry = NULL;
         int res_len = process_dns_query_impl(req, req_len, res, sizeof(res),
                                              tests[i].qname, tests[i].qtype,
@@ -286,13 +289,13 @@ static void test_dnssec_negative_and_delegation_proofs(void) {
 
     int parsed = parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx);
     assert(parsed >= 0);
-    int b_res = build_zone_index(&arena, true);
+    int b_res = test_build_index(&arena, true);
     assert(b_res == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strncpy(db_entry.domain, "sec.example.com.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     char *any_acl[1] = { (char *)"any" };
@@ -322,7 +325,7 @@ static void test_dnssec_negative_and_delegation_proofs(void) {
     // 1. NXDOMAIN with DO=1 -> Authority section contains NSEC + RRSIG
     build_dns_query(req, &req_len, 0x8801, "nonexistent.sec.example.com.", 1 /* A */, true);
     compress_ctx_init_packet(&comp_ctx);
-    rate_limit_config_t *rrl_out = NULL;
+    const rate_limit_config_t *rrl_out = NULL;
     zone_db_entry_t *matched_entry = NULL;
     int res_len = process_dns_query_impl(req, req_len, res, sizeof(res),
                                          "nonexistent.sec.example.com.", 1,
@@ -379,6 +382,7 @@ static void test_tinydns_timestamp_countdown(void) {
 
     // SOA
     dns_record_t soa; memset(&soa, 0, sizeof(soa));
+    DNS_RECORD_BIND_RDATA(soa);
     soa.name = arena_strdup(&arena, "tiny.example.");
     soa.type_code = 6; soa.ttl_value = 3600; soa.class_val = 1;
     soa.rdata_count = 7;
@@ -395,6 +399,7 @@ static void test_tinydns_timestamp_countdown(void) {
 
     // Record 1: Past activation timestamp (active)
     dns_record_t r_past; memset(&r_past, 0, sizeof(r_past));
+    DNS_RECORD_BIND_RDATA(r_past);
     r_past.name = arena_strdup(&arena, "past.tiny.example.");
     r_past.type_code = 1; r_past.class_val = 1;
     r_past.ttl_value = 300; r_past.rdata_count = 1;
@@ -405,6 +410,7 @@ static void test_tinydns_timestamp_countdown(void) {
 
     // Record 2: Future activation timestamp (inactive)
     dns_record_t r_fut; memset(&r_fut, 0, sizeof(r_fut));
+    DNS_RECORD_BIND_RDATA(r_fut);
     r_fut.name = arena_strdup(&arena, "future.tiny.example.");
     r_fut.type_code = 1; r_fut.class_val = 1;
     r_fut.ttl_value = 300; r_fut.rdata_count = 1;
@@ -415,6 +421,7 @@ static void test_tinydns_timestamp_countdown(void) {
 
     // Record 3: Countdown TTL (expires in 60 seconds)
     dns_record_t r_cnt; memset(&r_cnt, 0, sizeof(r_cnt));
+    DNS_RECORD_BIND_RDATA(r_cnt);
     r_cnt.name = arena_strdup(&arena, "countdown.tiny.example.");
     r_cnt.type_code = 1; r_cnt.class_val = 1;
     r_cnt.ttl_value = 300; r_cnt.rdata_count = 1;
@@ -423,12 +430,12 @@ static void test_tinydns_timestamp_countdown(void) {
     r_cnt.tinydns_ttl_countdown = true;
     arena.records[arena.count++] = r_cnt;
 
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strncpy(db_entry.domain, "tiny.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     char *any_acl[1] = { (char *)"any" };
@@ -451,7 +458,7 @@ static void test_tinydns_timestamp_countdown(void) {
 
     uint8_t req[512], res[4096];
     size_t req_len = 0;
-    rate_limit_config_t *rrl_out = NULL;
+    const rate_limit_config_t *rrl_out = NULL;
     zone_db_entry_t *matched_entry = NULL;
 
     // Query 1: Past activation record -> found (ancount=1)
@@ -509,13 +516,13 @@ static void test_mqtype_truncation(void) {
                        "example.com. 3600 IN TXT \"another very long txt record for overflow testing 1234567890 1234567890 1234567890 1234567890\"\n";
     int p_res = parse_zone_fast(zone_text, strlen(zone_text), &arena, &ctx);
     assert(p_res >= 0);
-    int b_res = build_zone_index(&arena, true);
+    int b_res = test_build_index(&arena, true);
     assert(b_res == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain) - 1);
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     char *any_acl[1] = { (char *)"any" };
@@ -568,7 +575,7 @@ static void test_mqtype_truncation(void) {
 
     uint8_t res[512] = {0};
     size_t small_res_len = 100;
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_entry_t *matched_entry = NULL;
     int res_len = process_dns_query_impl(req, off, res, small_res_len, "example.com.", 1,
                                          "127.0.0.1", &comp_ctx, false, &rrl, &snap, &cfg, &matched_entry);
@@ -613,7 +620,7 @@ static void test_mqtype_qdcount0_formerr(void) {
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
     compress_ctx_init_packet(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_entry_t *matched = NULL;
 
     int res_len = process_dns_query_impl(req, off, res, sizeof(res), "", 0,
@@ -630,9 +637,9 @@ static void test_resolve_name_servfail_rcode_clearing(void) {
     memset(&db_entry, 0, sizeof(db_entry));
     strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain) - 1);
 
-    zone_arena_t *empty_zone = NULL;
+    zone_version_t *empty_zone = NULL;
     zone_db_entry_t *db_entry_ptr = &db_entry;
-    zone_arena_t **zone_ptr = &empty_zone;
+    zone_version_t **zone_ptr = &empty_zone;
 
     uint8_t res[512] = {0};
     res[3] = 0x83; // Pre-set RCODE=3 (NXDOMAIN)
@@ -667,10 +674,10 @@ static void test_resolve_name_servfail_rcode_clearing(void) {
                        "loop.example.com. 3600 IN CNAME loop.example.com.\n";
     int p_res = parse_zone_fast(loop_zone, strlen(loop_zone), &loop_arena, &ctx);
     assert(p_res >= 0);
-    int b_res = build_zone_index(&loop_arena, true);
+    int b_res = test_build_index(&loop_arena, true);
     assert(b_res == 0);
 
-    zone_arena_t *current_zone = &loop_arena;
+    zone_version_t *current_zone = &loop_arena.ver;
     zone_ptr = &current_zone;
 
     memset(res, 0, sizeof(res));
@@ -714,17 +721,17 @@ static void test_response_section_order(void) {
                        "ns3.v6.example.com. 1800 IN A 192.0.2.3\n";
     int p_res = parse_zone_fast(zone_text, strlen(zone_text), &arena, &ctx);
     assert(p_res >= 0);
-    int b_res = build_zone_index(&arena, true);
+    int b_res = test_build_index(&arena, true);
     assert(b_res == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain) - 1);
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *db_entry_ptr = &db_entry;
-    zone_arena_t *cur_zone = &arena;
-    zone_arena_t **zone_ptr = &cur_zone;
+    zone_version_t *cur_zone = &arena.ver;
+    zone_version_t **zone_ptr = &cur_zone;
 
     uint8_t res[1024];
     memset(res, 0, sizeof(res));
@@ -838,6 +845,7 @@ static void test_cname_loop_and_max_depth(void) {
     // CNAME a.loop. -> b.loop.
     dns_record_t c1;
     memset(&c1, 0, sizeof(c1));
+    DNS_RECORD_BIND_RDATA(c1);
     c1.name = arena_strdup(&arena, "a.loop.example.");
     c1.type = arena_strdup(&arena, "CNAME");
     c1.type_code = 5;
@@ -852,6 +860,7 @@ static void test_cname_loop_and_max_depth(void) {
     // CNAME b.loop. -> a.loop. (Circular loop)
     dns_record_t c2;
     memset(&c2, 0, sizeof(c2));
+    DNS_RECORD_BIND_RDATA(c2);
     c2.name = arena_strdup(&arena, "b.loop.example.");
     c2.type = arena_strdup(&arena, "CNAME");
     c2.type_code = 5;
@@ -864,12 +873,12 @@ static void test_cname_loop_and_max_depth(void) {
     arena.records[1] = c2;
 
     arena.count = 2;
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "loop.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -901,7 +910,7 @@ static void test_cname_loop_and_max_depth(void) {
     memset(&comp_ctx, 0, sizeof(comp_ctx));
     compress_ctx_init_packet(&comp_ctx);
 
-    rate_limit_config_t *rrl_out = NULL;
+    const rate_limit_config_t *rrl_out = NULL;
     zone_db_entry_t *matched_entry = NULL;
 
     int res_len = process_dns_query_impl(qbuf, qlen, rbuf, sizeof(rbuf),
@@ -917,7 +926,7 @@ static void test_cname_loop_and_max_depth(void) {
 }
 
 static void test_prelink_zone_additional_glue_policies(void) {
-    printf("[TEST] Snapshot RCU: prelink_zone_additional_glue policies...\n");
+    printf("[TEST] Snapshot RCU: zone_glue_track_build policies...\n");
 
     zone_arena_t arena;
     zone_arena_init(&arena);
@@ -927,6 +936,7 @@ static void test_prelink_zone_additional_glue_policies(void) {
     // SOA
     dns_record_t soa;
     memset(&soa, 0, sizeof(soa));
+    DNS_RECORD_BIND_RDATA(soa);
     soa.name = arena_strdup(&arena, "glue.example.");
     soa.type = arena_strdup(&arena, "SOA");
     soa.type_code = 6;
@@ -934,15 +944,20 @@ static void test_prelink_zone_additional_glue_policies(void) {
     soa.ttl_value = 3600;
     soa.class_str = arena_strdup(&arena, "IN");
     soa.class_val = 1;
-    soa.rdata_count = 3;
+    soa.rdata_count = 7; /* a complete SOA: the zone image holds only records that can be written in wire format */
     soa.rdata[0] = arena_strdup(&arena, "ns1.glue.example.");
     soa.rdata[1] = arena_strdup(&arena, "hostmaster.glue.example.");
     soa.rdata[2] = arena_strdup(&arena, "1");
+    soa.rdata[3] = arena_strdup(&arena, "7200");
+    soa.rdata[4] = arena_strdup(&arena, "3600");
+    soa.rdata[5] = arena_strdup(&arena, "1209600");
+    soa.rdata[6] = arena_strdup(&arena, "3600");
     arena.records[0] = soa;
 
     // NS record pointing to in-bailiwick ns1.glue.example.
     dns_record_t ns;
     memset(&ns, 0, sizeof(ns));
+    DNS_RECORD_BIND_RDATA(ns);
     ns.name = arena_strdup(&arena, "glue.example.");
     ns.type = arena_strdup(&arena, "NS");
     ns.type_code = 2;
@@ -957,6 +972,7 @@ static void test_prelink_zone_additional_glue_policies(void) {
     // MX record pointing to mail.glue.example.
     dns_record_t mx;
     memset(&mx, 0, sizeof(mx));
+    DNS_RECORD_BIND_RDATA(mx);
     mx.name = arena_strdup(&arena, "glue.example.");
     mx.type = arena_strdup(&arena, "MX");
     mx.type_code = 15;
@@ -972,6 +988,7 @@ static void test_prelink_zone_additional_glue_policies(void) {
     // A records for ns1 and mail
     dns_record_t a1;
     memset(&a1, 0, sizeof(a1));
+    DNS_RECORD_BIND_RDATA(a1);
     a1.name = arena_strdup(&arena, "ns1.glue.example.");
     a1.type = arena_strdup(&arena, "A");
     a1.type_code = 1;
@@ -985,6 +1002,7 @@ static void test_prelink_zone_additional_glue_policies(void) {
 
     dns_record_t a2;
     memset(&a2, 0, sizeof(a2));
+    DNS_RECORD_BIND_RDATA(a2);
     a2.name = arena_strdup(&arena, "mail.glue.example.");
     a2.type = arena_strdup(&arena, "A");
     a2.type_code = 1;
@@ -997,13 +1015,13 @@ static void test_prelink_zone_additional_glue_policies(void) {
     arena.records[4] = a2;
 
     arena.count = 5;
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "glue.example.", sizeof(entry.domain));
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -1024,16 +1042,18 @@ static void test_prelink_zone_additional_glue_policies(void) {
     snap.view_count = 1;
 
     // 1. Policy NO
-    prelink_zone_additional_glue(&arena, "glue.example.", &view, ADDITIONAL_AUTH_NO);
-    assert(arena.prelinked_glue == NULL);
+    zone_glue_track_build(&arena.ver, "glue.example.", &view, ADDITIONAL_AUTH_NO);
+    assert(arena.glue == NULL);
+    zone_glue_track_build(&arena.ver, "glue.example.", &view, ADDITIONAL_AUTH_IN_DOMAIN);
+    assert(arena.glue == NULL); /* only additional-from-auth yes follows sibling zones */
 
-    // 2. Policy YES
-    prelink_zone_additional_glue(&arena, "glue.example.", &view, ADDITIONAL_AUTH_YES);
-    assert(arena.prelinked_glue != NULL);
-    assert(arena.prelinked_glue_count >= 1);
+    // 2. Policy YES: the NS / MX / SRV targets are tracked
+    zone_glue_track_build(&arena.ver, "glue.example.", &view, ADDITIONAL_AUTH_YES);
+    assert(arena.glue != NULL);
+    assert(arena.glue->count >= 1);
 
     zone_arena_destroy(&arena);
-    printf("  -> prelink_zone_additional_glue policies passed.\n");
+    printf("  -> zone_glue_track_build policies passed.\n");
 }
 
 // ----------------------------------------------------------------------------
@@ -1168,19 +1188,20 @@ static void test_nsec3_hashing_and_intervals(void) {
         "00000000000000000000000000000000 IN NSEC3 1 0 1 - AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA A\n"
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA IN NSEC3 1 0 1 - 00000000000000000000000000000000 A\n";
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     dns_record_t *p3 = NULL;
     for (size_t i = 0; i < arena.count && !p3; i++)
         if (arena.records[i].type_code == 50) p3 = &arena.records[i];
     assert(p3 != NULL);
-    dns_record_t *matched = find_matching_nsec3(&arena, p3, "00000000000000000000000000000000", "example.com.");
-    assert(matched != NULL);
-    assert(matched->type_code == 50);
+    uint32_t n3_chain = test_chain_of(&arena, p3);
+    uint32_t matched = find_matching_nsec3(arena.image, n3_chain, "00000000000000000000000000000000", "example.com.");
+    assert(matched != ZONE_IMAGE_NONE);
+    assert(zone_image_rr_type(arena.image, matched) == 50);
 
-    dns_record_t *covering = find_covering_nsec3(&arena, p3, "55555555555555555555555555555555");
-    assert(covering != NULL);
-    assert(covering->type_code == 50);
+    uint32_t covering = find_covering_nsec3(arena.image, n3_chain, "55555555555555555555555555555555");
+    assert(covering != ZONE_IMAGE_NONE);
+    assert(zone_image_rr_type(arena.image, covering) == 50);
 
     // 6. attach_nsec3_record
     uint8_t res_buf[512];
@@ -1188,10 +1209,10 @@ static void test_nsec3_hashing_and_intervals(void) {
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);   /* full init: init_packet() on an uninitialized stack ctx is UB (reads current_generation) */
     uint16_t nscount = 0;
-    dns_record_t *attached[8] = {0};
+    const zone_image_rr_t *attached[8] = {0};
     int attached_count = 0;
 
-    bool attached_ok = attach_nsec3_record(&arena, matched, res_buf, sizeof(res_buf),
+    bool attached_ok = attach_nsec3_record(arena.image, matched, res_buf, sizeof(res_buf),
                                            &offset, &comp_ctx, &nscount,
                                            attached, &attached_count);
     assert(attached_ok == true);
@@ -1325,9 +1346,9 @@ static void gr_setup(const char *origin, const char *zone_text) {
     char *buf = arena_strdup(&g_gr.arena, zone_text);
     assert(buf != NULL);
     assert(parse_zone_fast(buf, strlen(buf), &g_gr.arena, &ctx) >= 0);
-    assert(build_zone_index(&g_gr.arena, true) == 0);
+    assert(test_build_index(&g_gr.arena, true) == 0);
     strncpy(g_gr.entry.domain, origin, sizeof(g_gr.entry.domain) - 1);
-    atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena, memory_order_release);
+    atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena.ver, memory_order_release);
     g_gr.entries[0] = &g_gr.entry;
     g_gr.acl[0] = (char *)"any";
     g_gr.view.name = "default";
@@ -1354,7 +1375,7 @@ static void gr_query_raw(const uint8_t *req, size_t req_len, const char *qname, 
     compress_ctx_t comp;
     memset(&comp, 0, sizeof(comp));
     compress_ctx_init_packet(&comp);
-    rate_limit_config_t *rrl_out = NULL;
+    const rate_limit_config_t *rrl_out = NULL;
     zone_db_entry_t *matched = NULL;
     int n = process_dns_query_impl(req, req_len, g_gr.res, sizeof(g_gr.res), qname, qtype,
                                    client_ip, &comp, is_tcp, &rrl_out,
@@ -1368,6 +1389,65 @@ static void gr_expect_txt(const gr_resp_t *r, const gr_rr_t *rr, const char *tex
     assert(rr->rdlen == 1u + strlen(text));
     assert(r->msg[rr->rdoff] == strlen(text));
     assert(memcmp(r->msg + rr->rdoff + 1, text, strlen(text)) == 0);
+}
+
+/* The Additional section types of a response, in order (section 3 of gr_parse()). */
+static int gr_additional_types(const gr_resp_t *r, uint16_t *types, int cap) {
+    int n = 0;
+    for (int i = 0; i < r->nrr && n < cap; i++)
+        if (r->rr[i].sect == 3 && r->rr[i].type != 41) types[n++] = r->rr[i].type;
+    return n;
+}
+
+/* B-1: the Additional glue of a NS target comes from the "prelinked" path (the RRs in zone order, no RRSIG) for the
+ * first 256 distinct NS/MX/SRV targets of a zone and for DO=0, from the lookup (A before AAAA) otherwise; the
+ * prelinked path stops at 32 addresses (prelink_zone_additional_glue(): MAX_PRELINK_TARGETS, MAX_MATCH_RECS).
+ * The server answered this way before the zone image; the answers must not change. */
+static void test_image_glue_order_and_caps(void) {
+    printf("[TEST] Query Engine: Additional glue order (prelinked vs lookup), 256-target and 32-address caps...\n");
+    static char zone[64 * 1024];
+    size_t o = (size_t)snprintf(zone, sizeof(zone),
+        "$ORIGIN glue.test.\n$TTL 300\n"
+        "@ SOA ns1 hostmaster 1 7200 3600 1209600 3600\n"
+        "@ NS nsa\n"          /* target 0: AAAA is written before A */
+        "@ NS nsf\n"          /* target 1: 34 addresses */
+        "www A 192.0.2.80\n"
+        "nsa AAAA 2001:db8::a\n"
+        "nsa A 192.0.2.10\n");
+    for (int i = 0; i < 34; i++)
+        o += (size_t)snprintf(zone + o, sizeof(zone) - o, "nsf A 192.0.2.%d\n", 100 + i);
+    for (int i = 0; i < 256; i++) {   /* targets 2..257: only the first 254 of them are within the first 256 */
+        o += (size_t)snprintf(zone + o, sizeof(zone) - o, "m%03d MX 10 t%03d\n", i, i);
+        o += (size_t)snprintf(zone + o, sizeof(zone) - o, "t%03d AAAA 2001:db8::%x\nt%03d A 198.51.100.%d\n", i, i + 16, i, i % 250 + 1);
+    }
+    o += (size_t)snprintf(zone + o, sizeof(zone) - o, "@ NS late\nlate AAAA 2001:db8::ff\nlate A 192.0.2.255\n");
+    gr_setup("glue.test.", zone);
+    gr_resp_t r;
+    uint16_t t[80];
+
+    /* apex NS: nsa and nsf are within the first 256 targets: zone order for DO=0, A before AAAA for DO=1 */
+    gr_query("www.glue.test.", 1, false, &r);
+    assert(r.rcode == 0 && gr_count(&r, 2, 2) == 3);
+    int n = gr_additional_types(&r, t, 80);
+    assert(n == 2 + 32 + 2);                     /* nsa AAAA, A; nsf: 32 of its 34 addresses; late */
+    assert(t[0] == 28 && t[1] == 1);
+    for (int i = 2; i < 34; i++) assert(t[i] == 1);
+    /* the apex NS "late" is target 258, past the first 256: no prelinked entry, A before AAAA even with DO=0 */
+    assert(t[34] == 1 && t[35] == 28);
+    gr_query("www.glue.test.", 1, true, &r);
+    n = gr_additional_types(&r, t, 80);
+    assert(n == 2 + 34 + 2);                     /* the lookup writes every address, A before AAAA */
+    assert(t[0] == 1 && t[1] == 28);
+    assert(t[36] == 1 && t[37] == 28);
+    /* an MX target within the first 256 (t000 is target 2) and one past it (t255 is target 257) */
+    gr_query("m000.glue.test.", 15, false, &r);
+    n = gr_additional_types(&r, t, 80);
+    assert(n >= 2 && t[0] == 28 && t[1] == 1);
+    gr_query("m255.glue.test.", 15, false, &r);
+    n = gr_additional_types(&r, t, 80);
+    assert(n >= 2 && t[0] == 1 && t[1] == 28);
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> glue order and caps unchanged.\n");
 }
 
 static void test_rfc4592_wildcard_golden(void) {
@@ -1681,6 +1761,7 @@ static void test_delegation_referral_and_ds_handling(void) {
     // Apex SOA
     dns_record_t soa;
     memset(&soa, 0, sizeof(soa));
+    DNS_RECORD_BIND_RDATA(soa);
     soa.name = arena_strdup(&arena, "example.com.");
     soa.type = arena_strdup(&arena, "SOA");
     soa.type_code = 6;
@@ -1688,15 +1769,20 @@ static void test_delegation_referral_and_ds_handling(void) {
     soa.ttl_value = 3600;
     soa.class_str = arena_strdup(&arena, "IN");
     soa.class_val = 1;
-    soa.rdata_count = 3;
+    soa.rdata_count = 7; // a complete SOA: the zone image holds only records that can be written in wire format
     soa.rdata[0] = arena_strdup(&arena, "ns1.example.com.");
     soa.rdata[1] = arena_strdup(&arena, "hostmaster.example.com.");
     soa.rdata[2] = arena_strdup(&arena, "1");
+    soa.rdata[3] = arena_strdup(&arena, "7200");
+    soa.rdata[4] = arena_strdup(&arena, "3600");
+    soa.rdata[5] = arena_strdup(&arena, "1209600");
+    soa.rdata[6] = arena_strdup(&arena, "3600");
     arena.records[0] = soa;
 
     // Subdelegation NS: child.example.com. NS ns1.child.example.com.
     dns_record_t ns_del;
     memset(&ns_del, 0, sizeof(ns_del));
+    DNS_RECORD_BIND_RDATA(ns_del);
     ns_del.name = arena_strdup(&arena, "child.example.com.");
     ns_del.type = arena_strdup(&arena, "NS");
     ns_del.type_code = 2;
@@ -1711,6 +1797,7 @@ static void test_delegation_referral_and_ds_handling(void) {
     // Glue A: ns1.child.example.com. A 192.0.2.123
     dns_record_t glue;
     memset(&glue, 0, sizeof(glue));
+    DNS_RECORD_BIND_RDATA(glue);
     glue.name = arena_strdup(&arena, "ns1.child.example.com.");
     glue.type = arena_strdup(&arena, "A");
     glue.type_code = 1;
@@ -1723,13 +1810,13 @@ static void test_delegation_referral_and_ds_handling(void) {
     arena.records[2] = glue;
 
     arena.count = 3;
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "example.com.", sizeof(entry.domain));
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -1752,7 +1839,7 @@ static void test_delegation_referral_and_ds_handling(void) {
     uint16_t nscount = 0;
     uint16_t arcount = 0;
 
-    bool del_res = find_delegation(&arena, "www.child.example.com.", calc_fnv1a_str("www.child.example.com."),
+    bool del_res = find_delegation(arena.image, "www.child.example.com.",
                                    "example.com.", res, sizeof(res), &offset,
                                    &comp_ctx, &nscount, &arcount, false /* not DS */,
                                    NULL, NULL, NULL, ADDITIONAL_AUTH_YES, &view, false);
@@ -1765,7 +1852,7 @@ static void test_delegation_referral_and_ds_handling(void) {
     compress_ctx_init_packet(&comp_ctx);
     nscount = 0;
     arcount = 0;
-    del_res = find_delegation(&arena, "child.example.com.", calc_fnv1a_str("child.example.com."),
+    del_res = find_delegation(arena.image, "child.example.com.",
                               "example.com.", res, sizeof(res), &offset,
                               &comp_ctx, &nscount, &arcount, true /* is DS query */,
                               NULL, NULL, NULL, ADDITIONAL_AUTH_YES, &view, false);
@@ -1786,13 +1873,13 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
     memset(&zcfg, 0, sizeof(zcfg));
     zcfg.domain = "dynamic.prog.";
     zcfg.type = "program";
-    zcfg.program_path = "/usr/local/bin/test_plugin";
-    zcfg.program_user = "bind";
-    zcfg.program_timeout_ms = 1500;
-    zcfg.program_max_failures = 3;
+    tzx(&zcfg)->program_path = "/usr/local/bin/test_plugin";
+    tzx(&zcfg)->program_user = "bind";
+    tzx(&zcfg)->program_timeout_ms = 1500;
+    tzx(&zcfg)->program_max_failures = 3;
     const char *args[2] = {"--zone=dynamic.prog", "--debug"};
-    zcfg.program_args = (char **)args;
-    zcfg.program_args_count = 2;
+    tzx(&zcfg)->program_args = (char **)args;
+    tzx(&zcfg)->program_args_count = 2;
 
     char fp[256];
     compute_program_zone_fingerprint(&zcfg, fp, sizeof(fp));
@@ -1861,7 +1948,7 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
     memset(&fwd_cfg, 0, sizeof(fwd_cfg));
     fwd_cfg.domain = "forward.example.";
     fwd_cfg.type = "forward";
-    fwd_cfg.forwarders_count = 0;
+    tzx(&fwd_cfg)->forwarders_count = 0;
 
     int fwd_len = dispatch_forward_zone(&fwd_cfg, qpkt, qlen, prog_res, sizeof(prog_res));
     assert(fwd_len > 0);
@@ -1883,45 +1970,76 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
     zone_arena_t nsec_arena;
     zone_arena_init(&nsec_arena);
     dns_record_t nsec1; memset(&nsec1, 0, sizeof(nsec1));
+    DNS_RECORD_BIND_RDATA(nsec1);
     nsec1.name = arena_strdup(&nsec_arena, "a.example.");
     nsec1.type_code = 47;
-    nsec1.rdata_count = 1;
+    nsec1.rdata_count = 2; // next name and a type bitmap (an NSEC without one cannot be written in wire format)
     nsec1.rdata[0] = arena_strdup(&nsec_arena, "m.example.");
+    nsec1.rdata[1] = "A";
 
     dns_record_t nsec2; memset(&nsec2, 0, sizeof(nsec2));
+    DNS_RECORD_BIND_RDATA(nsec2);
     nsec2.name = arena_strdup(&nsec_arena, "m.example.");
     nsec2.type_code = 47;
-    nsec2.rdata_count = 1;
+    nsec2.rdata_count = 2;
     nsec2.rdata[0] = arena_strdup(&nsec_arena, "a.example."); // wrap-around
+    nsec2.rdata[1] = "A";
 
-    assert(nsec_covers_name(&nsec1, "b.example.") == true);
-    assert(nsec_covers_name(&nsec1, "z.example.") == false);
-    assert(nsec_covers_name(&nsec2, "z.example.") == true); // wrap-around covers z
-    assert(nsec_covers_name(NULL, "b.example.") == false);
+    zone_image_t *nsec1_img = test_image_of_record(&nsec1), *nsec2_img = test_image_of_record(&nsec2);
+    assert(nsec1_img != NULL && nsec2_img != NULL);
+    assert(nsec_covers_name(nsec1_img, 0, "b.example.") == true);
+    assert(nsec_covers_name(nsec1_img, 0, "z.example.") == false);
+    assert(nsec_covers_name(nsec2_img, 0, "z.example.") == true); // wrap-around covers z
+    assert(nsec_covers_name(NULL, 0, "b.example.") == false);
+    free(nsec1_img);
+    free(nsec2_img);
 
     nsec_arena.records = calloc(2, sizeof(dns_record_t));
     nsec_arena.records[0] = nsec1;
     nsec_arena.records[1] = nsec2;
     nsec_arena.count = 2;
 
-    // X-22: no linear scan without the NSEC index (build_zone_index() fails the load when it cannot allocate it)
-    assert(find_covering_nsec(&nsec_arena, "b.example.") == NULL);
-    assert(build_zone_index(&nsec_arena, false) == 0 && nsec_arena.nsec_count == 2);
+    // X-22: no linear scan without the NSEC index (the loaders fail when build_zone_index() cannot allocate it,
+    // and the engine reads only the image frozen from that index)
+    assert(nsec_arena.image == NULL);
+    assert(find_covering_nsec(nsec_arena.image, "b.example.") == ZONE_IMAGE_NONE);
+    assert(test_build_index(&nsec_arena, false) == 0 && nsec_arena.nsec_count == 2);
+    assert(zone_image_nsec_count(nsec_arena.image) == 2);
 
-    dns_record_t *cov = find_covering_nsec(&nsec_arena, "b.example.");
-    assert(cov != NULL && strcmp(cov->name, "a.example.") == 0);
+    uint32_t cov = find_covering_nsec(nsec_arena.image, "b.example.");
+    assert(cov != ZONE_IMAGE_NONE &&
+           strcmp(zone_image_name_text(nsec_arena.image, zone_image_rr_name(nsec_arena.image, cov)), "a.example.") == 0);
 
-    dns_record_t *cov_wrap = find_covering_nsec(&nsec_arena, "z.example.");
-    assert(cov_wrap != NULL && strcmp(cov_wrap->name, "m.example.") == 0);
+    uint32_t cov_wrap = find_covering_nsec(nsec_arena.image, "z.example.");
+    assert(cov_wrap != ZONE_IMAGE_NONE &&
+           strcmp(zone_image_name_text(nsec_arena.image, zone_image_rr_name(nsec_arena.image, cov_wrap)), "m.example.") == 0);
 
-    assert(find_covering_nsec(NULL, "b.example.") == NULL);
-    assert(find_covering_nsec(&nsec_arena, NULL) == NULL);
+    assert(find_covering_nsec(NULL, "b.example.") == ZONE_IMAGE_NONE);
+    assert(find_covering_nsec(nsec_arena.image, NULL) == ZONE_IMAGE_NONE);
 
     free(nsec_arena.records);
     nsec_arena.records = NULL;
     zone_arena_destroy(&nsec_arena);
 
     printf("  -> Program plugin & forward zone helpers passed.\n");
+}
+
+/* image_rr_currently_valid() on the one RR of a one-RR image of a copy of `rec` */
+static bool rec_currently_valid(const dns_record_t *rec, time_t now, const char client_loc[2],
+                                const char *client_ecs_tag, const char *client_loc_tag, uint32_t *eff_ttl) {
+    zone_image_t *img = test_image_of_record(rec);
+    assert(img != NULL);
+    bool ok = image_rr_currently_valid(img, 0, now, client_loc, client_ecs_tag, client_loc_tag, eff_ttl);
+    free(img);
+    return ok;
+}
+
+/* collect_additional_rr_glue() on the one RR of a one-RR image of a copy of `rec` */
+static void rec_collect_glue(const dns_record_t *rec, glue_list_t *g) {
+    zone_image_t *img = test_image_of_record(rec);
+    assert(img != NULL);
+    collect_additional_rr_glue(img, 0, g);
+    free(img);
 }
 
 static void test_query_engine_helpers_and_edge_cases(void) {
@@ -1942,93 +2060,104 @@ static void test_query_engine_helpers_and_edge_cases(void) {
 
     // Location mismatch / match
     rec.tinydns_loc[0] = 'u'; rec.tinydns_loc[1] = 's';
-    assert(tinydns_record_currently_valid(&rec, now, "jp", NULL, NULL, &eff_ttl) == false);
-    assert(tinydns_record_currently_valid(&rec, now, "us", NULL, NULL, &eff_ttl) == true);
+    assert(rec_currently_valid(&rec, now, "jp", NULL, NULL, &eff_ttl) == false);
+    assert(rec_currently_valid(&rec, now, "us", NULL, NULL, &eff_ttl) == true);
     rec.tinydns_loc[0] = 0; rec.tinydns_loc[1] = 0;
 
     // ECS tag mismatch / match
     rec.ecs_subnet_tag = "tagA";
-    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == false);
-    assert(tinydns_record_currently_valid(&rec, now, "\0\0", "tagB", NULL, &eff_ttl) == false);
-    assert(tinydns_record_currently_valid(&rec, now, "\0\0", "tagA", NULL, &eff_ttl) == true);
+    assert(rec_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == false);
+    assert(rec_currently_valid(&rec, now, "\0\0", "tagB", NULL, &eff_ttl) == false);
+    assert(rec_currently_valid(&rec, now, "\0\0", "tagA", NULL, &eff_ttl) == true);
     rec.ecs_subnet_tag = NULL;
 
     // BIND location tag mismatch / match
     rec.bind_location_tag = "locX";
-    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == false);
-    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, "locY", &eff_ttl) == false);
-    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, "locX", &eff_ttl) == true);
+    assert(rec_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == false);
+    assert(rec_currently_valid(&rec, now, "\0\0", NULL, "locY", &eff_ttl) == false);
+    assert(rec_currently_valid(&rec, now, "\0\0", NULL, "locX", &eff_ttl) == true);
     rec.bind_location_tag = NULL;
 
     // Timestamp countdown: future activation (ttd >= now)
     rec.tinydns_ttd = now + 100;
     rec.tinydns_ttl_countdown = false;
-    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == false);
+    assert(rec_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == false);
 
     // Timestamp countdown: past activation (ttd < now)
     rec.tinydns_ttd = now - 100;
-    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == true);
+    assert(rec_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == true);
     assert(eff_ttl == 300);
 
     // Countdown TTL: expired
     rec.tinydns_ttl_countdown = true;
     rec.tinydns_ttd = now - 10;
-    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == false);
+    assert(rec_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == false);
 
     // Countdown TTL: remaining < 2s clamped to 2s
     rec.tinydns_ttd = now + 1;
-    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == true);
+    assert(rec_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == true);
     assert(eff_ttl == 2);
 
     // Countdown TTL: remaining > 3600s clamped to 3600s
     rec.tinydns_ttd = now + 5000;
-    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == true);
+    assert(rec_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == true);
     assert(eff_ttl == 3600);
 
     // 3. collect_additional_rr_glue
-    const char *glue_targets[16] = {0};
-    int glue_count = 0;
-
-    // Minimal responses flag disables collection
-    collect_additional_rr_glue(&rec, glue_targets, &glue_count, true);
-    assert(glue_count == 0);
+    glue_list_t gl;
+    memset(&gl, 0, sizeof(gl));
 
     // MX record
     dns_record_t mx_rec;
     memset(&mx_rec, 0, sizeof(mx_rec));
+    DNS_RECORD_BIND_RDATA(mx_rec);
     mx_rec.type_code = 15;
     mx_rec.rdata[0] = "10";
     mx_rec.rdata[1] = "mail.example.com.";
     mx_rec.rdata_count = 2;
-    collect_additional_rr_glue(&mx_rec, glue_targets, &glue_count, false);
-    assert(glue_count == 1);
-    assert(strcmp(glue_targets[0], "mail.example.com.") == 0);
+
+    // Minimal responses flag disables collection
+    gl.minimal = true;
+    rec_collect_glue(&mx_rec, &gl);
+    assert(gl.count == 0);
+    gl.minimal = false;
+
+    // A record is not a glue source
+    rec_collect_glue(&rec, &gl);
+    assert(gl.count == 0);
+
+    rec_collect_glue(&mx_rec, &gl);
+    assert(gl.count == 1);
+    assert(strcmp(gl.targets[0], "mail.example.com.") == 0);
 
     // Duplicate MX target ignored
-    collect_additional_rr_glue(&mx_rec, glue_targets, &glue_count, false);
-    assert(glue_count == 1);
+    rec_collect_glue(&mx_rec, &gl);
+    assert(gl.count == 1);
 
     // SRV record
     dns_record_t srv_rec;
     memset(&srv_rec, 0, sizeof(srv_rec));
+    DNS_RECORD_BIND_RDATA(srv_rec);
     srv_rec.type_code = 33;
     srv_rec.rdata[0] = "0";
     srv_rec.rdata[1] = "5";
     srv_rec.rdata[2] = "5060";
     srv_rec.rdata[3] = "sip.example.com.";
     srv_rec.rdata_count = 4;
-    collect_additional_rr_glue(&srv_rec, glue_targets, &glue_count, false);
-    assert(glue_count == 2);
-    assert(strcmp(glue_targets[1], "sip.example.com.") == 0);
+    rec_collect_glue(&srv_rec, &gl);
+    assert(gl.count == 2);
+    assert(strcmp(gl.targets[1], "sip.example.com.") == 0);
 
     // NS record
     dns_record_t ns_rec;
     memset(&ns_rec, 0, sizeof(ns_rec));
+    DNS_RECORD_BIND_RDATA(ns_rec);
     ns_rec.type_code = 2;
     ns_rec.rdata[0] = "ns1.example.com.";
     ns_rec.rdata_count = 1;
-    collect_additional_rr_glue(&ns_rec, glue_targets, &glue_count, false);
-    assert(glue_count == 3);
+    rec_collect_glue(&ns_rec, &gl);
+    assert(gl.count == 3);
+    assert(strcmp(gl.targets[2], "ns1.example.com.") == 0);
 
     // 4. append_glue_records NO-OP paths
     uint8_t dummy_res[512];
@@ -2081,7 +2210,7 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.wire_cache_max_records = 100;
-    build_zone_response_cache(&test_arena, &cfg, NULL, "example.com.");
+    build_zone_response_cache(&test_arena.ver, &cfg, NULL, "example.com.");
     zone_arena_destroy(&test_arena);
 
     // 8. name_to_canonical_wire
@@ -2121,14 +2250,16 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     zone_arena_init(&nsec3_arena);
     dns_record_t p3_empty;
     memset(&p3_empty, 0, sizeof(p3_empty));
+    DNS_RECORD_BIND_RDATA(p3_empty);
     p3_empty.rdata[0] = "1"; p3_empty.rdata[1] = "0"; p3_empty.rdata[2] = "0"; p3_empty.rdata[3] = "-";
     p3_empty.rdata_count = 4;
     dns_record_t *p3 = &p3_empty;
-    assert(find_matching_nsec3(&nsec3_arena, p3, "AAAA", "example.com.") == NULL);
-    assert(find_covering_nsec3(&nsec3_arena, p3, "AAAA") == NULL);
-    dns_record_t *att[8];
+    assert(nsec3_arena.image == NULL);
+    assert(find_matching_nsec3(nsec3_arena.image, test_chain_of(&nsec3_arena, p3), "AAAA", "example.com.") == ZONE_IMAGE_NONE);
+    assert(find_covering_nsec3(nsec3_arena.image, test_chain_of(&nsec3_arena, p3), "AAAA") == ZONE_IMAGE_NONE);
+    const zone_image_rr_t *att[8];
     int att_count = 0;
-    assert(attach_nsec3_record(&nsec3_arena, NULL, dummy_res, sizeof(dummy_res), &dummy_off, &comp, &dummy_ar, att, &att_count) == true);
+    assert(attach_nsec3_record(nsec3_arena.image, ZONE_IMAGE_NONE, dummy_res, sizeof(dummy_res), &dummy_off, &comp, &dummy_ar, att, &att_count) == true);
     zone_arena_destroy(&nsec3_arena);
 
     // 14. find_program_plugin
@@ -2171,17 +2302,22 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     // 17. nsec_covers_name & find_covering_nsec
     dns_record_t nsec_rec;
     memset(&nsec_rec, 0, sizeof(nsec_rec));
+    DNS_RECORD_BIND_RDATA(nsec_rec);
     nsec_rec.type_code = 47;
     nsec_rec.name = "a.example.com.";
     nsec_rec.rdata[0] = "c.example.com.";
-    nsec_rec.rdata_count = 1;
-    assert(nsec_covers_name(&nsec_rec, "b.example.com.") == true);
-    assert(nsec_covers_name(&nsec_rec, "d.example.com.") == false);
-    assert(nsec_covers_name(NULL, "b.example.com.") == false);
+    nsec_rec.rdata[1] = "A";
+    nsec_rec.rdata_count = 2;
+    zone_image_t *nsec_rec_img = test_image_of_record(&nsec_rec);
+    assert(nsec_rec_img != NULL);
+    assert(nsec_covers_name(nsec_rec_img, 0, "b.example.com.") == true);
+    assert(nsec_covers_name(nsec_rec_img, 0, "d.example.com.") == false);
+    assert(nsec_covers_name(NULL, 0, "b.example.com.") == false);
+    free(nsec_rec_img);
 
     zone_arena_t cov_arena;
     zone_arena_init(&cov_arena);
-    assert(find_covering_nsec(&cov_arena, "b.example.com.") == NULL);
+    assert(find_covering_nsec(cov_arena.image, "b.example.com.") == ZONE_IMAGE_NONE);
     zone_arena_destroy(&cov_arena);
 
     // 18. hex_to_bytes
@@ -2266,13 +2402,13 @@ static void test_dname_synthesis_and_wildcard_proofs(void) {
     char *zbuf = arena_strdup(&arena, zstr);
     int parsed = parse_zone_fast(zbuf, strlen(zbuf), &arena, &ctx);
     assert(parsed >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "dname.example.", sizeof(entry.domain));
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2295,7 +2431,7 @@ static void test_dname_synthesis_and_wildcard_proofs(void) {
 
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     // 1. Query for host.sub.dname.example. -> synthesizes DNAME + CNAME target.example.net.
     uint8_t qbuf[512];
@@ -2347,13 +2483,13 @@ static void test_query_engine_protocol_qclass_and_edns_branches(void) {
         "ns1 IN A 192.0.2.1\n";
     char *zbuf = arena_strdup(&arena, zstr);
     assert(parse_zone_fast(zbuf, strlen(zbuf), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "qproto.example.", sizeof(entry.domain));
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2376,7 +2512,7 @@ static void test_query_engine_protocol_qclass_and_edns_branches(void) {
 
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     // 1. UDP AXFR (QTYPE=252 on UDP -> FORMERR)
     uint8_t qbuf[512];
@@ -2450,12 +2586,12 @@ static void test_cname_target_overflow_and_tsig_query_paths(void) {
     };
     int p_res = parse_zone_fast(ztext, strlen(ztext), &arena, &ctx);
     assert(p_res >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "cname.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2480,7 +2616,7 @@ static void test_cname_target_overflow_and_tsig_query_paths(void) {
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0x4444, "alias.cname.example.", 1 /*A*/, false);
 
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "alias.cname.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     // Should successfully answer with the CNAME record
@@ -2514,12 +2650,12 @@ static void test_non_data_rrtypes_and_special_qtypes(void) {
     };
     int p_res = parse_zone_fast(ztext, strlen(ztext), &arena, &ctx);
     assert(p_res >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "special.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2539,7 +2675,7 @@ static void test_non_data_rrtypes_and_special_qtypes(void) {
 
     compress_ctx_t comp_ctx;
     uint8_t qbuf[512], rbuf[1024];
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     // Test each non-data type: 41, 249, 250, 251, 252, 253, 254, 255
     uint16_t non_data_types[] = {41, 249, 250, 251, 252, 253, 254, 255};
@@ -2586,19 +2722,21 @@ static void test_covering_rrsig_and_buffer_exhaustion_branches(void) {
     int p_res = parse_zone_fast(ztext, strlen(ztext), &arena, &ctx);
     assert(p_res >= 0);
 
-    // Corrupt one record to have rdata_count < 9 to exercise the line 35-36 check
+    // Corrupt one record to have rdata_count < 9. A record that cannot be written in wire format never reaches the
+    // zone image: the loaders drop it (X-32, zone_arena_drop_unencodable) and the answer carries the intact RRSIG.
     for (size_t i = 0; i < arena.count; i++) {
         if (arena.records[i].type_code == 46 /* RRSIG */) {
             arena.records[i].rdata_count = 5; // malformed!
             break;
         }
     }
-    build_zone_index(&arena, true);
+    assert(zone_arena_drop_unencodable(&arena, NULL, NULL) == 1);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "rrsig.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2618,7 +2756,7 @@ static void test_covering_rrsig_and_buffer_exhaustion_branches(void) {
 
     compress_ctx_t comp_ctx;
     uint8_t qbuf[512], rbuf[1024];
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     // Query with DO=1
     size_t qlen = 0;
@@ -2628,7 +2766,7 @@ static void test_covering_rrsig_and_buffer_exhaustion_branches(void) {
     assert(rlen >= 12);
     // Should answer with A and the uncorrupted RRSIG
     uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
-    assert(ancount >= 2);
+    assert(ancount == 2);
 
     // Now test response buffer truncation / exhaustion
     uint8_t small_rbuf[40];
@@ -2658,12 +2796,12 @@ static void test_dname_loop_and_depth_limit(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "dname.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "dname.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2676,7 +2814,7 @@ static void test_dname_loop_and_depth_limit(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0x1111, "sub.a.dname.example.", 1, false);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "sub.a.dname.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
@@ -2703,12 +2841,12 @@ static void test_wildcard_cname_and_dname_synthesis(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "wildsyn.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "wildsyn.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2721,7 +2859,7 @@ static void test_wildcard_cname_and_dname_synthesis(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0x1234, "foo.bar.wildsyn.example.", 1, false);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "foo.bar.wildsyn.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
@@ -2755,12 +2893,12 @@ static void test_nsec3_wildcard_nodata_and_optout(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "nsec3opt.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "nsec3opt.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2773,7 +2911,7 @@ static void test_nsec3_wildcard_nodata_and_optout(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0x3333, "host.unsecure.nsec3opt.example.", 1, true);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "host.unsecure.nsec3opt.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     // Delegation referral should be returned
@@ -2801,12 +2939,12 @@ static void test_nsec_apex_and_delegation_proofs(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "nsecproof.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "nsecproof.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2820,7 +2958,7 @@ static void test_nsec_apex_and_delegation_proofs(void) {
     size_t qlen = 0;
     // Query TXT at apex (NODATA proof with NSEC)
     build_dns_query(qbuf, &qlen, 0x4444, "nsecproof.example.", 16 /* TXT */, true);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "nsecproof.example.", 16, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     assert((rbuf[3] & 0x0F) == 0); // NOERROR
@@ -2864,6 +3002,7 @@ static void test_edns_client_subnet_cache_matching(void) {
 
     dns_record_t ecs_rec;
     memset(&ecs_rec, 0, sizeof(ecs_rec));
+    DNS_RECORD_BIND_RDATA(ecs_rec);
     ecs_rec.name = arena_strdup(&arena, "geo.ecs.example.");
     ecs_rec.type = arena_strdup(&arena, "A");
     ecs_rec.type_code = 1;
@@ -2878,12 +3017,12 @@ static void test_edns_client_subnet_cache_matching(void) {
     arena.records_cap = arena.count + 4;
     arena.records = realloc(arena.records, sizeof(dns_record_t) * arena.records_cap);
     arena.records[arena.count++] = ecs_rec;
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "ecs.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2917,7 +3056,7 @@ static void test_edns_client_subnet_cache_matching(void) {
     qbuf[qoff++] = 0;  // Scope prefix 0
     qbuf[qoff++] = 203; qbuf[qoff++] = 0; qbuf[qoff++] = 113; // 203.0.113
 
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qoff, rbuf, sizeof(rbuf), "geo.ecs.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
@@ -2943,12 +3082,12 @@ static void test_dns_cookie_badcookie_and_timestamp_drift(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "cookie.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "cookie.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -2979,7 +3118,7 @@ static void test_dns_cookie_badcookie_and_timestamp_drift(void) {
     qbuf[qoff++] = 0; qbuf[qoff++] = 16; // 8 bytes client + 8 bytes bad server cookie
     memcpy(qbuf + qoff, "12345678BADCOOKI", 16); qoff += 16;
 
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qoff, rbuf, sizeof(rbuf), "cookie.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     // BADCOOKIE error response or NOERROR with new server cookie
@@ -3003,7 +3142,7 @@ static int ubuf_query_name(zone_db_snapshot_t *snap, const char *qname, uint16_t
     qbuf[qlen - 7] = (uint8_t)(client_payload & 0xFF);
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     /* production UDP callers pass the 512-byte default; the engine widens it up to the cap */
     size_t max_res = is_tcp ? rcap : UDP_DEFAULT_MAX_RES_LEN;
     return process_dns_query(qbuf, qlen, rbuf, max_res, qname, qtype, "127.0.0.1",
@@ -3047,13 +3186,13 @@ static void test_udp_bufsize_global_and_zone(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "ubuf.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "ubuf.example.", sizeof(entry.domain));
     strlcpy(entry.view_name, "__default__", sizeof(entry.view_name));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
     zone_db_entry_t *entries[1] = {&entry};
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
@@ -3149,13 +3288,13 @@ static void test_truncated_response_keeps_opt(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "tcopt.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "tcopt.example.", sizeof(entry.domain));
     strlcpy(entry.view_name, "default", sizeof(entry.view_name));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
     zone_db_entry_t *entries[1] = {&entry};
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
@@ -3185,7 +3324,7 @@ static void test_truncated_response_keeps_opt(void) {
         }
         compress_ctx_t comp_ctx;
         compress_ctx_init(&comp_ctx);
-        rate_limit_config_t *rrl_cfg = NULL;
+        const rate_limit_config_t *rrl_cfg = NULL;
         uint8_t rbuf[65535];
         int rlen = process_dns_query(qbuf, qlen, rbuf, UDP_DEFAULT_MAX_RES_LEN, "big.tcopt.example.", 16,
                                      "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
@@ -3226,12 +3365,12 @@ static void test_rrl_slip_and_tc_response(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "rrltest.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "rrltest.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3239,7 +3378,7 @@ static void test_rrl_slip_and_tc_response(void) {
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     compress_ctx_t comp_ctx;
     uint8_t qbuf[512], rbuf[1024];
@@ -3290,12 +3429,12 @@ static void test_proxy_v2_header_parsing(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "proxy.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "proxy.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3311,7 +3450,7 @@ static void test_proxy_v2_header_parsing(void) {
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0x9999, "proxy.example.", 1, false);
 
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "proxy.example.", 1, "203.0.113.199", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     assert((rbuf[3] & 0x0F) == 0); // NOERROR
@@ -3335,12 +3474,12 @@ static void test_catalog_zone_queries_and_member_zones(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "catalog.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "catalog.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3353,7 +3492,7 @@ static void test_catalog_zone_queries_and_member_zones(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0xAAAA, "version.catalog.example.", 16 /* TXT */, false);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "version.catalog.example.", 16, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
@@ -3380,12 +3519,12 @@ static void test_any_query_with_dnssec_rrsigs(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "anydnssec.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "anydnssec.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3398,7 +3537,7 @@ static void test_any_query_with_dnssec_rrsigs(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0xBBBB, "anydnssec.example.", 255 /* ANY */, true);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "anydnssec.example.", 255, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
@@ -3424,12 +3563,12 @@ static void test_cname_pointing_to_delegation_referral(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "cnameref.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "cnameref.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3442,7 +3581,7 @@ static void test_cname_pointing_to_delegation_referral(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0xCCCC, "alias.cnameref.example.", 1, false);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "alias.cnameref.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
@@ -3458,7 +3597,7 @@ static void test_query_engine_formerr_branches(void) {
     printf("[TEST] Query Engine: FORMERR on invalid packets and compressed name loops...\n");
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     zone_db_snapshot_t empty_snap = { .views = NULL, .view_count = 0 };
 
     uint8_t rbuf[1024];
@@ -3516,12 +3655,12 @@ static void test_program_zone_dynamic_scripts(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "prog.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "prog.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3534,7 +3673,7 @@ static void test_program_zone_dynamic_scripts(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0xDDDD, "prog.example.", 1, false);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "prog.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     assert((rbuf[3] & 0x0F) == 0);
@@ -3559,12 +3698,12 @@ static void test_prelinked_glue_records_ordering(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "glueord.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "glueord.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3577,7 +3716,7 @@ static void test_prelinked_glue_records_ordering(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0xEEEE, "host.sub.glueord.example.", 1, false);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "host.sub.glueord.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     uint16_t arcount = (rbuf[10] << 8) | rbuf[11];
@@ -3602,12 +3741,12 @@ static void test_nsec3_salt_and_iteration_limits(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "nsec3lim.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "nsec3lim.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3620,7 +3759,7 @@ static void test_nsec3_salt_and_iteration_limits(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0xFFFF, "missing.nsec3lim.example.", 1, true);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "missing.nsec3lim.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     assert((rbuf[3] & 0x0F) == 3); // NXDOMAIN
@@ -3640,6 +3779,7 @@ static void test_tinydns_timestamp_decay_and_expiry(void) {
 
     dns_record_t soa_rec, active_rec, expired_rec;
     memset(&soa_rec, 0, sizeof(soa_rec));
+    DNS_RECORD_BIND_RDATA(soa_rec);
     soa_rec.name = arena_strdup(&arena, "ttd.example.");
     soa_rec.type = arena_strdup(&arena, "SOA");
     soa_rec.type_code = 6;
@@ -3657,6 +3797,8 @@ static void test_tinydns_timestamp_decay_and_expiry(void) {
     soa_rec.rdata[6] = arena_strdup(&arena, "86400");
 
     memset(&active_rec, 0, sizeof(active_rec));
+
+    DNS_RECORD_BIND_RDATA(active_rec);
     active_rec.name = arena_strdup(&arena, "live.ttd.example.");
     active_rec.type = arena_strdup(&arena, "A");
     active_rec.type_code = 1;
@@ -3670,6 +3812,8 @@ static void test_tinydns_timestamp_decay_and_expiry(void) {
     active_rec.tinydns_ttd = (uint64_t)now + 100000; // Future countdown TTL
 
     memset(&expired_rec, 0, sizeof(expired_rec));
+
+    DNS_RECORD_BIND_RDATA(expired_rec);
     expired_rec.name = arena_strdup(&arena, "dead.ttd.example.");
     expired_rec.type = arena_strdup(&arena, "A");
     expired_rec.type_code = 1;
@@ -3687,12 +3831,12 @@ static void test_tinydns_timestamp_decay_and_expiry(void) {
     arena.records[arena.count++] = soa_rec;
     arena.records[arena.count++] = active_rec;
     arena.records[arena.count++] = expired_rec;
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "ttd.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&db_entry};
     char *any_acl[1] = { (char *)"any" };
@@ -3711,7 +3855,7 @@ static void test_tinydns_timestamp_decay_and_expiry(void) {
     memset(&comp_ctx, 0, sizeof(comp_ctx));
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     zone_db_entry_t *matched_entry = NULL;
 
     // Query active record
@@ -3733,9 +3877,9 @@ static void test_tinydns_timestamp_decay_and_expiry(void) {
 
     // Direct helper validation
     uint32_t eff_ttl = 0;
-    assert(tinydns_record_currently_valid(&active_rec, now, "", NULL, NULL, &eff_ttl) == true);
+    assert(rec_currently_valid(&active_rec, now, "", NULL, NULL, &eff_ttl) == true);
     assert(eff_ttl >= 2 && eff_ttl <= 3600);
-    assert(tinydns_record_currently_valid(&expired_rec, now, "", NULL, NULL, &eff_ttl) == false);
+    assert(rec_currently_valid(&expired_rec, now, "", NULL, NULL, &eff_ttl) == false);
 
     zone_arena_destroy(&arena);
     printf("  -> Tinydns timestamp decay passed.\n");
@@ -3755,12 +3899,12 @@ static void test_tsig_badkey_badsig_badtime_responses(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "tsigerr.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "tsigerr.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3791,7 +3935,7 @@ static void test_tsig_badkey_badsig_badtime_responses(void) {
 
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "tsigerr.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
 
@@ -3813,13 +3957,13 @@ static void test_dynamic_update_prerequisites_and_actions(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "dynup.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "dynup.example.", sizeof(entry.domain));
     pthread_mutex_init(&entry.writer_lock, NULL);
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3840,7 +3984,7 @@ static void test_dynamic_update_prerequisites_and_actions(void) {
 
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qoff, rbuf, sizeof(rbuf), "dynup.example.", 6, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
 
@@ -3867,12 +4011,12 @@ static void test_udp_truncation_with_edns_buffer_size(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "trunc.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "trunc.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
     int hash_tbl[2] = {0, -1};
@@ -3887,7 +4031,7 @@ static void test_udp_truncation_with_edns_buffer_size(void) {
     uint8_t qbuf[512], rbuf[1024];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0x4001, "many.trunc.example.", 16 /* TXT */, false);
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     int rlen = process_dns_query(qbuf, qlen, rbuf, 512, "many.trunc.example.", 16, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
     // Should set TC bit if overflowed 512
@@ -3922,16 +4066,16 @@ static void test_multiple_views_acls_and_fallback(void) {
     parse_context_t ctx_ext = { .base_dir = ".", .default_origin = "split.example.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(zint, strlen(zint), &arena_int, &ctx_int) >= 0);
     assert(parse_zone_fast(zext, strlen(zext), &arena_ext, &ctx_ext) >= 0);
-    build_zone_index(&arena_int, true);
-    build_zone_index(&arena_ext, true);
+    assert(test_build_index(&arena_int, true) == 0);
+    assert(test_build_index(&arena_ext, true) == 0);
 
     zone_db_entry_t entry_int, entry_ext;
     memset(&entry_int, 0, sizeof(entry_int));
     memset(&entry_ext, 0, sizeof(entry_ext));
     strlcpy(entry_int.domain, "split.example.", sizeof(entry_int.domain));
     strlcpy(entry_ext.domain, "split.example.", sizeof(entry_ext.domain));
-    atomic_store_explicit(&entry_int.rcu.active, &arena_int, memory_order_release);
-    atomic_store_explicit(&entry_ext.rcu.active, &arena_ext, memory_order_release);
+    atomic_store_explicit(&entry_int.rcu.active, &arena_int.ver, memory_order_release);
+    atomic_store_explicit(&entry_ext.rcu.active, &arena_ext.ver, memory_order_release);
 
     zone_db_entry_t *entries_int[1] = {&entry_int};
     zone_db_entry_t *entries_ext[1] = {&entry_ext};
@@ -3973,7 +4117,7 @@ static void test_multiple_views_acls_and_fallback(void) {
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0x5001, "srv.split.example.", 1, false);
 
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
     // Internal client (10.1.2.3)
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "srv.split.example.", 1, "10.1.2.3", &comp_ctx, false, &rrl_cfg, &snap);
     assert(rlen >= 12);
@@ -4002,12 +4146,12 @@ static void test_dynamic_update_prereq_rrset_exists_value_independent(void) {
     const char *zstr = "@ IN SOA ns1.dyn1.example. hostmaster.dyn1.example. 1 7200 3600 1209600 300\n@ IN NS ns1.dyn1.example.\nhost IN A 192.0.2.1\n";
     char *b = arena_strdup(&arena, zstr);
     parse_zone_fast(b, strlen(b), &arena, &ctx);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
     strlcpy(entry.domain, "dyn1.example.", sizeof(entry.domain));
-    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     assert(record_exists_in_arena(&arena, &arena.records[2]) == true);
     zone_arena_destroy(&arena);
@@ -4027,7 +4171,7 @@ static int vdep_update_run(const uint8_t *prereq_lasts, int n, uint8_t add_last,
                          "ns1 IN A 192.0.2.53\nwww IN A 192.0.2.1\nwww IN A 192.0.2.2\n";
     char *zbuf = arena_strdup(&arena, ztext); // the arena keeps pointers into the text
     assert(parse_zone_fast(zbuf, strlen(zbuf), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     uint8_t ureq[512];
     memset(ureq, 0, sizeof(ureq));
@@ -4080,7 +4224,7 @@ static void test_dnssec_nsec_wildcard_no_data_proof(void) {
         "*.wild IN NSEC host.nsec.example. A RRSIG NSEC\n";
     char *b = arena_strdup(&arena, zstr);
     parse_zone_fast(b, strlen(b), &arena, &ctx);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
     zone_arena_destroy(&arena);
     printf("  -> NSEC wildcard NODATA proof passed.\n");
 }
@@ -4098,7 +4242,7 @@ static void test_dname_synthesis_multi_label_subdomain(void) {
         "sub IN DNAME target.net.\n";
     char *b = arena_strdup(&arena, zstr);
     parse_zone_fast(b, strlen(b), &arena, &ctx);
-    build_zone_index(&arena, true);
+    assert(test_build_index(&arena, true) == 0);
     zone_arena_destroy(&arena);
     printf("  -> DNAME multi-label synthesis passed.\n");
 }
@@ -4281,11 +4425,11 @@ static void ecs_scope_zone_init(void) {
     int rc = parse_zone_fast(ztext, strlen(ztext), &g_ecs_scope_zone.arena, &ctx);
     assert(rc >= 0);
     assert(g_ecs_scope_zone.arena.bind_ecs_tag_count == 1);
-    rc = build_zone_index(&g_ecs_scope_zone.arena, true);
+    rc = test_build_index(&g_ecs_scope_zone.arena, true);
     assert(rc == 0);
     (void)rc;
     strlcpy(g_ecs_scope_zone.entry.domain, "ecs.example.", sizeof(g_ecs_scope_zone.entry.domain));
-    atomic_store_explicit(&g_ecs_scope_zone.entry.rcu.active, &g_ecs_scope_zone.arena, memory_order_release);
+    atomic_store_explicit(&g_ecs_scope_zone.entry.rcu.active, &g_ecs_scope_zone.arena.ver, memory_order_release);
     g_ecs_scope_zone_ready = true;
 }
 
@@ -4298,7 +4442,7 @@ static uint8_t ecs_scope_query(const char *qname, uint16_t qtype, uint16_t famil
     assert(ok == 1);
     (void)ok;
     zone_db_entry_t *db_entry_ptr = &g_ecs_scope_zone.entry;
-    zone_arena_t *cur_zone = &g_ecs_scope_zone.arena;
+    zone_version_t *cur_zone = &g_ecs_scope_zone.arena.ver;
     uint8_t res[1024];
     memset(res, 0, sizeof(res));
     uint16_t offset = 12, ancount = 0, nscount = 0, arcount = 0;
@@ -4375,7 +4519,7 @@ static void test_query_engine_opcode_iquery_notimp(void) {
     qpkt[2] |= (1 << 3); // Opcode 1 (IQUERY)
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t empty_snap;
     memset(&empty_snap, 0, sizeof(empty_snap));
     atomic_init(&empty_snap.reader_count, 10);
@@ -4394,7 +4538,7 @@ static void test_query_engine_opcode_status_notimp(void) {
     qpkt[2] |= (2 << 3); // Opcode 2 (STATUS)
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t empty_snap;
     memset(&empty_snap, 0, sizeof(empty_snap));
     atomic_init(&empty_snap.reader_count, 10);
@@ -4414,7 +4558,7 @@ static void test_query_engine_qclass_chaos_version_bind(void) {
     qpkt[qlen - 2] = 0; qpkt[qlen - 1] = 3;
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t empty_snap;
     memset(&empty_snap, 0, sizeof(empty_snap));
     atomic_init(&empty_snap.reader_count, 10);
@@ -4433,7 +4577,7 @@ static void test_query_engine_qclass_hesiod_refused(void) {
     qpkt[qlen - 2] = 0; qpkt[qlen - 1] = 4;
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t empty_snap;
     memset(&empty_snap, 0, sizeof(empty_snap));
     atomic_init(&empty_snap.reader_count, 10);
@@ -4452,7 +4596,7 @@ static void test_query_engine_unknown_qclass_refused(void) {
     qpkt[qlen - 2] = 0xFD; qpkt[qlen - 1] = 0xE8; // 65000
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t empty_snap;
     memset(&empty_snap, 0, sizeof(empty_snap));
     atomic_init(&empty_snap.reader_count, 10);
@@ -4470,7 +4614,7 @@ static void test_query_engine_out_of_zone_query_refused(void) {
     build_dns_query(qpkt, &qlen, 0x4444, "notmyzone.org.", 1, false);
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t empty_snap;
     memset(&empty_snap, 0, sizeof(empty_snap));
     atomic_init(&empty_snap.reader_count, 10);
@@ -4487,7 +4631,7 @@ static void test_query_engine_formerr_truncated_question(void) {
     uint8_t bad_q1[18] = { 0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 3, 'a', 'b', 'c', 0, 0 };
     compress_ctx_t comp_ctx;
     compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t empty_snap;
     memset(&empty_snap, 0, sizeof(empty_snap));
     atomic_init(&empty_snap.reader_count, 10);
@@ -4514,7 +4658,7 @@ static void test_query_engine_cname_intermediate_noerror_synthesis(void) {
     uint8_t qpkt[256]; size_t qlen = 0;
     build_dns_query(qpkt, &qlen, 0x1234, "alias.example.com.", 1, false);
     compress_ctx_t comp_ctx; compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     uint8_t rpkt[512];
     int rlen = process_dns_query(qpkt, qlen, rpkt, sizeof(rpkt), "alias.example.com.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &snap);
     assert(rlen >= 12);
@@ -4529,7 +4673,7 @@ static void test_query_engine_cname_intermediate_servfail_fallback(void) {
     uint8_t qpkt[256]; size_t qlen = 0;
     build_dns_query(qpkt, &qlen, 0x1235, "loop.example.com.", 1, false);
     compress_ctx_t comp_ctx; compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     uint8_t rpkt[512];
     int rlen = process_dns_query(qpkt, qlen, rpkt, sizeof(rpkt), "loop.example.com.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &snap);
     assert(rlen >= 12);
@@ -4540,7 +4684,7 @@ static void test_query_engine_formerr_corrupted_arcount_records(void) {
     printf("[TEST] Query Engine: FORMERR corrupted ARCOUNT records...\n");
     uint8_t qpkt[64] = { 0x12, 0x36, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 5, 3, 'f', 'o', 'o', 0, 0, 1, 0, 1 };
     compress_ctx_t comp_ctx; compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
     uint8_t rpkt[512];
     int rlen = process_dns_query(qpkt, 21, rpkt, sizeof(rpkt), "foo.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &snap);
@@ -4552,7 +4696,7 @@ static void test_query_engine_formerr_corrupted_nscount_records(void) {
     printf("[TEST] Query Engine: FORMERR corrupted NSCOUNT records...\n");
     uint8_t qpkt[64] = { 0x12, 0x37, 0x01, 0x00, 0, 1, 0, 0, 0, 3, 0, 0, 3, 'b', 'a', 'r', 0, 0, 1, 0, 1 };
     compress_ctx_t comp_ctx; compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
     uint8_t rpkt[512];
     int rlen = process_dns_query(qpkt, 21, rpkt, sizeof(rpkt), "bar.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &snap);
@@ -4564,7 +4708,7 @@ static void test_query_engine_formerr_rdlength_overflow_packet(void) {
     printf("[TEST] Query Engine: FORMERR RDLENGTH overflow packet...\n");
     uint8_t qpkt[64] = { 0x12, 0x38, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1, 3, 'b', 'a', 'z', 0, 0, 1, 0, 1, 0, 0, 41, 16, 0, 0, 0, 0, 0, 0xFF, 0xFF };
     compress_ctx_t comp_ctx; compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
     uint8_t rpkt[512];
     int rlen = process_dns_query(qpkt, 32, rpkt, sizeof(rpkt), "baz.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &snap);
@@ -4585,7 +4729,7 @@ static void test_query_engine_dynamic_update_no_matching_zone_notauth(void) {
     build_dns_query(qpkt, &qlen, 0x5501, "unknown.zone.", 6 /* SOA */, false);
     qpkt[2] = (5 << 3); // Opcode 5 (UPDATE)
     compress_ctx_t comp_ctx; compress_ctx_init(&comp_ctx);
-    rate_limit_config_t *rrl = NULL;
+    const rate_limit_config_t *rrl = NULL;
     uint8_t rpkt[512];
     int rlen = process_dns_query(qpkt, qlen, rpkt, sizeof(rpkt), "unknown.zone.", 6, "127.0.0.1", &comp_ctx, false, &rrl, &snap);
     assert(rlen >= 12);
@@ -7030,16 +7174,16 @@ static void test_query_engine_feature_case_185(void) {
         "ns1 IN A 192.0.2.1\n"
         "sub.child IN A 192.0.2.10\n";
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     char loc[2] = {0};
-    assert(name_exists_in_zone(&arena, "example.com.", loc, NULL, NULL) == true);
-    assert(name_exists_in_zone(&arena, "ns1.example.com.", loc, NULL, NULL) == true);
-    assert(name_exists_in_zone(&arena, "sub.child.example.com.", loc, NULL, NULL) == true);
-    assert(name_exists_in_zone(&arena, "child.example.com.", loc, NULL, NULL) == true); // ENT
-    assert(name_exists_in_zone(&arena, "nonexistent.example.com.", loc, NULL, NULL) == false);
+    assert(name_exists_in_zone(arena.image, "example.com.", loc, NULL, NULL) == true);
+    assert(name_exists_in_zone(arena.image, "ns1.example.com.", loc, NULL, NULL) == true);
+    assert(name_exists_in_zone(arena.image, "sub.child.example.com.", loc, NULL, NULL) == true);
+    assert(name_exists_in_zone(arena.image, "child.example.com.", loc, NULL, NULL) == true); // ENT
+    assert(name_exists_in_zone(arena.image, "nonexistent.example.com.", loc, NULL, NULL) == false);
 
-    const char *enc = find_closest_encloser(&arena, "foo.sub.child.example.com.", "example.com.", loc, NULL, NULL);
+    const char *enc = find_closest_encloser(arena.image, "foo.sub.child.example.com.", "example.com.", loc, NULL, NULL);
     assert(enc != NULL);
     assert(strcasecmp(enc, "sub.child.example.com.") == 0);
 
@@ -7072,7 +7216,7 @@ static void test_query_engine_feature_case_186(void) {
         "d IN NSEC h.nsec.example. A RRSIG NSEC\n"
         "h IN NSEC nsec.example. A RRSIG NSEC\n";
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     dns_record_t *rec_d = NULL;
     for (size_t i = 0; i < arena.count; i++) {
@@ -7082,16 +7226,18 @@ static void test_query_engine_feature_case_186(void) {
         }
     }
     assert(rec_d != NULL);
-    assert(nsec_covers_name(rec_d, "b.nsec.example.") == true);
-    assert(nsec_covers_name(rec_d, "f.nsec.example.") == false);
+    uint32_t rr_d = test_rr_of(&arena, rec_d);
+    assert(rr_d != ZONE_IMAGE_NONE);
+    assert(nsec_covers_name(arena.image, rr_d, "b.nsec.example.") == true);
+    assert(nsec_covers_name(arena.image, rr_d, "f.nsec.example.") == false);
 
-    dns_record_t *cover = find_covering_nsec(&arena, "b.nsec.example.");
-    assert(cover != NULL);
-    assert(strcasecmp(cover->name, "nsec.example.") == 0);
+    uint32_t cover = find_covering_nsec(arena.image, "b.nsec.example.");
+    assert(cover != ZONE_IMAGE_NONE);
+    assert(strcasecmp(zone_image_name_text(arena.image, zone_image_rr_name(arena.image, cover)), "nsec.example.") == 0);
 
-    dns_record_t *cover_z = find_covering_nsec(&arena, "z.nsec.example.");
-    assert(cover_z != NULL);
-    assert(strcasecmp(cover_z->name, "h.nsec.example.") == 0);
+    uint32_t cover_z = find_covering_nsec(arena.image, "z.nsec.example.");
+    assert(cover_z != ZONE_IMAGE_NONE);
+    assert(strcasecmp(zone_image_name_text(arena.image, zone_image_rr_name(arena.image, cover_z)), "h.nsec.example.") == 0);
 
     zone_arena_destroy(&arena);
 }
@@ -7134,17 +7280,17 @@ static void test_query_engine_feature_case_188(void) {
         "00000000000000000000000000000000 IN NSEC3 1 0 0 - AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA A RRSIG\n"
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA IN NSEC3 1 0 0 - 00000000000000000000000000000000 A RRSIG\n";
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     dns_record_t *p3 = NULL;
     for (size_t i = 0; i < arena.count && !p3; i++)
         if (arena.records[i].type_code == 50) p3 = &arena.records[i];
     assert(p3 != NULL);
-    dns_record_t *m = find_matching_nsec3(&arena, p3, "00000000000000000000000000000000", "n3.example.");
-    assert(m != NULL);
+    uint32_t m = find_matching_nsec3(arena.image, test_chain_of(&arena, p3), "00000000000000000000000000000000", "n3.example.");
+    assert(m != ZONE_IMAGE_NONE);
 
-    dns_record_t *c = find_covering_nsec3(&arena, p3, "55555555555555555555555555555555");
-    assert(c != NULL);
+    uint32_t c = find_covering_nsec3(arena.image, test_chain_of(&arena, p3), "55555555555555555555555555555555");
+    assert(c != ZONE_IMAGE_NONE);
 
     zone_arena_destroy(&arena);
 }
@@ -7344,7 +7490,7 @@ static void test_query_engine_feature_case_200(void) {
         "rec2 IN TXT \"quoted \\\"internal\\\" text\"\n";
 
     assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_arena_destroy(&arena);
 }
@@ -7370,12 +7516,12 @@ static void test_query_engine_feature_case_201(void) {
         "ns1 IN A 192.0.2.1\n";
 
     assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "soa.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -7383,7 +7529,7 @@ static void test_query_engine_feature_case_201(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[512];
     size_t req_len = 0;
@@ -7423,12 +7569,12 @@ static void test_query_engine_feature_case_202(void) {
         "mail IN A 192.0.2.3\n";
 
     assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "any.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -7436,7 +7582,7 @@ static void test_query_engine_feature_case_202(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[2048];
     size_t req_len = 0;
@@ -7474,12 +7620,12 @@ static void test_query_engine_feature_case_203(void) {
         "cname1 IN CNAME cname2.cname2.example.\n";
 
     assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "cname2.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -7487,7 +7633,7 @@ static void test_query_engine_feature_case_203(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -7523,12 +7669,12 @@ static void test_query_engine_feature_case_204(void) {
         "sub IN DNAME target.org.\n";
 
     assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "dnamesyn.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -7536,7 +7682,7 @@ static void test_query_engine_feature_case_204(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -7572,12 +7718,12 @@ static void test_query_engine_feature_case_205(void) {
         "*.wildsyn.example. IN A 192.0.2.99\n";
 
     assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "wildsyn.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -7585,7 +7731,7 @@ static void test_query_engine_feature_case_205(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[512];
     size_t req_len = 0;
@@ -7622,12 +7768,12 @@ static void test_query_engine_feature_case_206(void) {
         "explicit.wildexp.example. IN A 192.0.2.200\n";
 
     assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "wildexp.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -7635,7 +7781,7 @@ static void test_query_engine_feature_case_206(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[512];
     size_t req_len = 0;
@@ -7671,12 +7817,12 @@ static void test_query_engine_feature_case_207(void) {
         "ns1 IN A 192.0.2.1\n";
 
     assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "edns.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -7684,7 +7830,7 @@ static void test_query_engine_feature_case_207(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[512];
     size_t req_len = 0;
@@ -7706,7 +7852,7 @@ static void test_query_engine_feature_case_208(void) {
 
     uint8_t addr[4] = { 192, 0, 2, 10 };
     uint8_t scope = 0;
-    const char *tag = resolve_ecs_subnet_tag(&arena, NULL, NULL, addr, AF_INET, &scope);
+    const char *tag = resolve_ecs_subnet_tag(test_zimg(&arena), NULL, NULL, addr, AF_INET, &scope);
     (void)tag;
     assert(scope <= 32);
 
@@ -7774,17 +7920,17 @@ static void test_query_engine_feature_case_211(void) {
     const char z_ext[] = "$ORIGIN view.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nhost IN A 198.51.100.1\n";
 
     assert(parse_zone_fast((char *)z_int, strlen(z_int), &arena_int, &ctx_int) >= 0);
-    assert(build_zone_index(&arena_int, true) == 0);
+    assert(test_build_index(&arena_int, true) == 0);
     assert(parse_zone_fast((char *)z_ext, strlen(z_ext), &arena_ext, &ctx_ext) >= 0);
-    assert(build_zone_index(&arena_ext, true) == 0);
+    assert(test_build_index(&arena_ext, true) == 0);
 
     zone_db_entry_t e_int, e_ext;
     memset(&e_int, 0, sizeof(e_int));
     memset(&e_ext, 0, sizeof(e_ext));
     strlcpy(e_int.domain, "view.example.", sizeof(e_int.domain));
     strlcpy(e_ext.domain, "view.example.", sizeof(e_ext.domain));
-    atomic_store_explicit(&e_int.rcu.active, &arena_int, memory_order_release);
-    atomic_store_explicit(&e_ext.rcu.active, &arena_ext, memory_order_release);
+    atomic_store_explicit(&e_int.rcu.active, &arena_int.ver, memory_order_release);
+    atomic_store_explicit(&e_ext.rcu.active, &arena_ext.ver, memory_order_release);
 
     zone_db_entry_t *int_entries[1] = { &e_int };
     zone_db_entry_t *ext_entries[1] = { &e_ext };
@@ -7802,7 +7948,7 @@ static void test_query_engine_feature_case_211(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[512];
     size_t req_len = 0;
@@ -7826,7 +7972,7 @@ static void test_query_engine_feature_case_212(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "dynup.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN dynup.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nexisting IN A 192.0.2.1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     uint8_t ureq[512];
     memset(ureq, 0, sizeof(ureq));
@@ -7865,7 +8011,7 @@ static void test_query_engine_feature_case_213(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "dynup2.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN dynup2.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nexisting IN A 192.0.2.1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     uint8_t ureq[512];
     memset(ureq, 0, sizeof(ureq));
@@ -7903,7 +8049,7 @@ static void test_query_engine_feature_case_214(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "dynadd.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN dynadd.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     uint8_t ureq[512];
     memset(ureq, 0, sizeof(ureq));
@@ -7942,7 +8088,7 @@ static void test_query_engine_feature_case_215(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "dyndel.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN dyndel.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nhost IN A 192.0.2.77\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     uint8_t ureq[512];
     memset(ureq, 0, sizeof(ureq));
@@ -7981,7 +8127,7 @@ static void test_query_engine_feature_case_216(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "dyndelset.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN dyndelset.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nhost IN A 192.0.2.1\nhost IN A 192.0.2.2\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     uint8_t ureq[512];
     memset(ureq, 0, sizeof(ureq));
@@ -8019,7 +8165,7 @@ static void test_query_engine_feature_case_217(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "dyndelall.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN dyndelall.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nhost IN A 192.0.2.1\nhost IN TXT \"test\"\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     uint8_t ureq[512];
     memset(ureq, 0, sizeof(ureq));
@@ -8052,7 +8198,7 @@ static void test_query_engine_feature_case_218(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
     uint8_t res[512];
@@ -8066,7 +8212,7 @@ static void test_query_engine_feature_case_219(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[16];
     memset(req, 0, sizeof(req));
@@ -8086,7 +8232,7 @@ static void test_query_engine_feature_case_220(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     // 1. RFC 9619: Opcode QUERY (0), QDCOUNT=0 -> NOERROR (0)
     uint8_t req[12];
@@ -8120,7 +8266,7 @@ static void test_query_engine_feature_case_221(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[64];
     memset(req, 0, sizeof(req));
@@ -8142,7 +8288,7 @@ static void test_query_engine_feature_case_222(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[64];
     memset(req, 0, sizeof(req));
@@ -8164,7 +8310,7 @@ static void test_query_engine_feature_case_223(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[64];
     memset(req, 0, sizeof(req));
@@ -8186,7 +8332,7 @@ static void test_query_engine_feature_case_224(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[64];
     memset(req, 0, sizeof(req));
@@ -8216,12 +8362,12 @@ static void test_query_engine_feature_case_225(void) {
     for (size_t i = 0; i < arena.count; i++) {
         arena.records[i].class_val = 3;
     }
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "version.bind.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8229,7 +8375,7 @@ static void test_query_engine_feature_case_225(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[64];
     memset(req, 0, sizeof(req));
@@ -8259,12 +8405,12 @@ static void test_query_engine_feature_case_226(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "local.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN local.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "local.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8272,7 +8418,7 @@ static void test_query_engine_feature_case_226(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[512];
     size_t req_len = 0;
@@ -8295,12 +8441,12 @@ static void test_query_engine_feature_case_227(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "trunc.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN trunc.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n@ IN TXT \"long payload 1\"\n@ IN TXT \"long payload 2\"\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "trunc.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8308,7 +8454,7 @@ static void test_query_engine_feature_case_227(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[35]; // Tiny buffer
     size_t req_len = 0;
@@ -8331,12 +8477,12 @@ static void test_query_engine_feature_case_228(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "glue.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN glue.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nns1 IN A 192.0.2.10\nns1 IN AAAA 2001:db8::10\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "glue.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8344,7 +8490,7 @@ static void test_query_engine_feature_case_228(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8369,12 +8515,12 @@ static void test_query_engine_feature_case_229(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "mxglue.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN mxglue.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n@ IN MX 10 mail.mxglue.example.\nmail IN A 192.0.2.20\nns1 IN A 192.0.2.1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "mxglue.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8382,7 +8528,7 @@ static void test_query_engine_feature_case_229(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8407,12 +8553,12 @@ static void test_query_engine_feature_case_230(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "srvglue.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN srvglue.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n_sip._tcp IN SRV 10 60 5060 srv1.srvglue.example.\nsrv1 IN A 192.0.2.30\nns1 IN A 192.0.2.1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "srvglue.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8420,7 +8566,7 @@ static void test_query_engine_feature_case_230(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8445,12 +8591,12 @@ static void test_query_engine_feature_case_231(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "nodata.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN nodata.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nns1 IN A 192.0.2.1\nnode IN A 192.0.2.50\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "nodata.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8458,7 +8604,7 @@ static void test_query_engine_feature_case_231(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8483,12 +8629,12 @@ static void test_query_engine_feature_case_232(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "nx.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN nx.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nns1 IN A 192.0.2.1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "nx.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8496,7 +8642,7 @@ static void test_query_engine_feature_case_232(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8521,12 +8667,12 @@ static void test_query_engine_feature_case_233(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "2.0.192.in-addr.arpa.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN 2.0.192.in-addr.arpa.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n1 IN PTR host1.example.com.\nns1 IN A 192.0.2.1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "2.0.192.in-addr.arpa.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8534,7 +8680,7 @@ static void test_query_engine_feature_case_233(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8558,12 +8704,12 @@ static void test_query_engine_feature_case_234(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "8.b.d.0.1.0.0.2.ip6.arpa.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN 8.b.d.0.1.0.0.2.ip6.arpa.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0 IN PTR host6.example.com.\nns1 IN A 192.0.2.1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "8.b.d.0.1.0.0.2.ip6.arpa.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8571,7 +8717,7 @@ static void test_query_engine_feature_case_234(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8595,12 +8741,12 @@ static void test_query_engine_feature_case_235(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "caa.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN caa.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n@ IN CAA 0 issue \"letsencrypt.org\"\n@ IN CAA 0 iodef \"mailto:security@example.com\"\nns1 IN A 192.0.2.1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "caa.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8608,7 +8754,7 @@ static void test_query_engine_feature_case_235(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8632,12 +8778,12 @@ static void test_query_engine_feature_case_236(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "tlsa.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN tlsa.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n_443._tcp IN TLSA 3 1 1 d2abde240d7cd3ee6b4b28c54df034b97983a132e9620a4036024c63f2ef95ab\nns1 IN A 192.0.2.1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "tlsa.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8645,7 +8791,7 @@ static void test_query_engine_feature_case_236(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8669,12 +8815,12 @@ static void test_query_engine_feature_case_237(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "sshfp.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN sshfp.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nssh IN SSHFP 1 1 123456789abcdef67890123456789abcdef67890\nns1 IN A 192.0.2.1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "sshfp.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8682,7 +8828,7 @@ static void test_query_engine_feature_case_237(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8706,12 +8852,12 @@ static void test_query_engine_feature_case_238(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "naptr.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN naptr.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n@ IN NAPTR 100 10 \"u\" \"sip+E2U\" \"!^.*$!sip:info@example.com!\" .\nns1 IN A 192.0.2.1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "naptr.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8719,7 +8865,7 @@ static void test_query_engine_feature_case_238(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8743,12 +8889,12 @@ static void test_query_engine_feature_case_239(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "loc.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN loc.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n@ IN LOC 52 22 23.000 N 4 53 32.000 E -18.00m 10m 100m 10m\nns1 IN A 192.0.2.1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "loc.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8756,7 +8902,7 @@ static void test_query_engine_feature_case_239(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8780,12 +8926,12 @@ static void test_query_engine_feature_case_240(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "hinfo.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN hinfo.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n@ IN HINFO \"x86_64\" \"FreeBSD\"\nns1 IN A 192.0.2.1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "hinfo.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8793,7 +8939,7 @@ static void test_query_engine_feature_case_240(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8814,7 +8960,7 @@ static void test_query_engine_feature_case_241(void) {
     zone_arena_init(&arena);
 
     char loc[2] = {0};
-    tinydns_resolve_client_location(&arena, "192.0.2.1", loc);
+    tinydns_resolve_client_location(test_zimg(&arena), "192.0.2.1", loc);
     (void)loc;
 
     zone_arena_destroy(&arena);
@@ -8830,7 +8976,7 @@ static void test_query_engine_feature_case_242(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "tinytim.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN tinytim.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nns1 IN A 192.0.2.1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_arena_destroy(&arena);
 }
@@ -8845,12 +8991,12 @@ static void test_query_engine_feature_case_243(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "catalog.example.", .is_standalone_mode = true, .err_out = &err };
     const char ztext[] = "$ORIGIN catalog.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nversion IN TXT \"2\"\nns1 IN A 192.0.2.1\n";
     assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "catalog.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
@@ -8858,7 +9004,7 @@ static void test_query_engine_feature_case_243(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[1024];
     size_t req_len = 0;
@@ -8877,7 +9023,7 @@ static void test_query_engine_feature_case_244(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512];
     size_t req_len = 0;
@@ -8915,7 +9061,7 @@ static void test_query_engine_feature_case_245(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512];
     size_t req_len = 0;
@@ -8931,7 +9077,7 @@ static void test_query_engine_feature_case_246(void) {
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512];
     size_t req_len = 0;
@@ -9119,12 +9265,12 @@ static void test_query_engine_opcode_header_validations(void) {
     };
     char ztext[] = "$ORIGIN op.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n";
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "op.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view;
@@ -9143,7 +9289,7 @@ static void test_query_engine_opcode_header_validations(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     // 1. NOTIFY packet with QDCOUNT = 0 -> FORMERR (RCODE=1)
     uint8_t notify_bad_qd[64], res[512];
@@ -9206,12 +9352,12 @@ static void test_query_engine_dname_cname_wildcard_truncation(void) {
         "direct-a IN A 192.0.2.10\n";
 
     assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
     strlcpy(db_entry.domain, "matrix.example.", sizeof(db_entry.domain));
-    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+    atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
     view_snapshot_t view;
@@ -9230,7 +9376,7 @@ static void test_query_engine_dname_cname_wildcard_truncation(void) {
 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
-    rate_limit_config_t *rrl_cfg = NULL;
+    const rate_limit_config_t *rrl_cfg = NULL;
 
     uint8_t req[512], res[4096];
     size_t req_len = 0;
@@ -9335,6 +9481,7 @@ int main(void) {
     test_cname_loop_and_max_depth();
     test_prelink_zone_additional_glue_policies();
     test_nsec3_hashing_and_intervals();
+    test_image_glue_order_and_caps();
     test_rfc4592_wildcard_golden();
     test_dns_cookie_engine_rfc9018();
     test_delegation_referral_and_ds_handling();

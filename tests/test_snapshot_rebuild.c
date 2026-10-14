@@ -18,7 +18,11 @@
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
+#include "test_zext.h"
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
+#include "test_image_helper.h"
+#include <arpa/inet.h>
 #include "dns_snapshot_rcu.h"
 #include "dns_priv_sandbox.h"
 #include "dns_query_engine.h"
@@ -28,6 +32,7 @@
 #include "dns_utils.h"
 #include "dns_catalog_zone.h"
 #include "sweep_watchdog.h"
+#include "test_zone_slots.h"
 
 // Mock globals
 int g_control_kq = -1;
@@ -171,8 +176,8 @@ static void test_rebuild_two_views(void) {
     (void)lookup_zone_across_views(snap, cfg, "a.example.", NULL, &res);
 
     /* the zone content really is what the file said */
-    zone_arena_t *arena = atomic_load_explicit(&za->rcu.active, memory_order_acquire);
-    assert(arena && arena->count >= 8);
+    zone_version_t *arena = atomic_load_explicit(&za->rcu.active, memory_order_acquire);
+    assert(arena && arena->image && arena->image->n_rrs >= 8);
     release_zone_snapshot(snap);
 
     /* --- reload_master_zone verdicts --- */
@@ -184,10 +189,10 @@ static void test_rebuild_two_views(void) {
     wfile("a.zone", "$ORIGIN a.example.\n$TTL 300\n@ IN SOA ns.a.example. h.a.example. 2 7200 3600 1209600 300\n"
                     "@ IN NS ns.a.example.\nns IN A 192.0.2.1\nwww IN A 192.0.2.10\nnew IN A 192.0.2.99\n");
     assert(reload_master_zone(ea, zcfg) == RELOAD_OK);
-    zone_arena_t *na = atomic_load_explicit(&ea->rcu.active, memory_order_acquire);
-    bool found_new = false;
-    for (size_t i = 0; i < na->count; i++) if (!strcasecmp(na->records[i].name, "new.a.example.")) found_new = true;
-    assert(found_new);
+    zone_version_t *na = atomic_load_explicit(&ea->rcu.active, memory_order_acquire);
+    /* S5 B-1: the reloaded version carries the image the engine reads, with the new owner in it (B-2: and no builder) */
+    assert(na->image != NULL && na->heap);
+    assert(zone_image_find_name(na->image, "new.a.example.") != ZONE_IMAGE_NONE);
 
     char zpath[300];
     zone_config_t bad = *zcfg;
@@ -204,6 +209,124 @@ static void test_rebuild_two_views(void) {
     assert(atomic_load_explicit(&ea->rcu.active, memory_order_acquire) == na);
     release_zone_snapshot(s2);
     printf("  -> rebuild/lookup/reload verdicts passed.\n");
+}
+
+/* S2: true when the additional section of "<zone> NS" (DO=0) carries addr */
+static bool ns_answer_has_glue(const char *zone, const char *addr) {
+    uint8_t req[512], res[4096];
+    size_t n = 0;
+    memset(req, 0, sizeof(req));
+    req[0] = 0x12; req[1] = 0x34; req[5] = 1; /* QDCOUNT=1, RD=0 */
+    n = 12;
+    const char *p = zone;
+    while (*p) {
+        const char *dot = strchr(p, '.');
+        size_t len = dot ? (size_t)(dot - p) : strlen(p);
+        if (len == 0) break;
+        req[n++] = (uint8_t)len;
+        memcpy(req + n, p, len);
+        n += len;
+        p += len + (dot ? 1 : 0);
+    }
+    req[n++] = 0;
+    req[n++] = 0; req[n++] = 2;  /* NS */
+    req[n++] = 0; req[n++] = 1;  /* IN */
+    compress_ctx_t comp = {0};
+    compress_ctx_init_packet(&comp);
+    zone_db_entry_t *matched = NULL;
+    zone_db_snapshot_t *snap = acquire_zone_snapshot();
+    int len = process_dns_query_impl(req, n, res, sizeof(res), zone, 2, "127.0.0.1", &comp, false, NULL,
+                                     snap, atomic_load_explicit(&g_config_db.active, memory_order_acquire), &matched);
+    assert(len > 12 && (res[3] & 0x0F) == 0);
+    unsigned a, b, c, d;
+    assert(sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) == 4);
+    const uint8_t want[4] = { (uint8_t)a, (uint8_t)b, (uint8_t)c, (uint8_t)d };
+    /* an A record's RDATA is RDLENGTH=4 followed by the address */
+    for (int i = 12; i + 6 <= len; i++) {
+        if (res[i] == 0 && res[i + 1] == 4 && memcmp(res + i + 2, want, 4) == 0) return true;
+    }
+    return false;
+}
+
+
+/* S2: glue from a sibling zone follows the sibling (load order, reload, removal) without copying or
+ * republishing the dependent zone; only its response cache generation changes. Published versions keep
+ * one copy of each zone. */
+static void test_snapshot_rebuild_sibling_glue(void) {
+    printf("[TEST] Snapshot rebuild: sibling glue tracking and release of old versions (S2)...\n");
+    wfile("dep.zone", "$ORIGIN dep.example.\n$TTL 60\n@ IN SOA ns1.prov.example. h.dep.example. 1 7200 3600 1209600 60\n"
+                      "@ IN NS ns1.prov.example.\n@ IN NS ns.dep.example.\nns IN A 192.0.2.31\nwww IN A 192.0.2.30\n");
+    wfile("prov.zone", "$ORIGIN prov.example.\n$TTL 60\n@ IN SOA ns1 h 1 7200 3600 1209600 60\n"
+                       "@ IN NS ns1\nns1 IN A 192.0.2.7\n");
+    /* dep.example is loaded before the zone that holds its name server address */
+    server_config_t *cfg = load_conf(
+        "options { additional-from-auth yes; };\n"
+        "zone \"dep.example\" { type master; file \"%s/dep.zone\"; };\n"
+        "zone \"prov.example\" { type master; file \"%s/prov.zone\"; };\n", g_dir, g_dir);
+    zone_db_snapshot_t *snap = build(cfg, false);
+    zone_db_entry_t *dep = snapshot_get_zone(snap, "dep.example.");
+    zone_db_entry_t *prov = snapshot_get_zone(snap, "prov.example.");
+    assert(dep && prov);
+    assert(atomic_load_explicit(&prov->glue_provider, memory_order_relaxed));
+    /* a new zone is loaded and published (B-3: there is no standby slot left behind) */
+    assert(dep->publish_order != 0 && prov->publish_order != 0);
+    /* only the zone's own address is copied; the sibling's is looked up when answering */
+    zone_version_t *dep_arena = atomic_load_explicit(&dep->rcu.active, memory_order_acquire);
+    {
+        const zone_image_t *di = dep_arena->image;
+        uint32_t nid = zone_image_find_name(di, "ns.dep.example.");
+        assert(nid != ZONE_IMAGE_NONE && (zone_image_name_flags(di, nid) & ZONE_IMAGE_NAME_GLUE));
+        assert(dep_arena->heap); /* a published version is a zone_version_t of its own (no builder, S5 B-2/B-3) */
+    }
+    /* both targets are tracked (an in-zone name may later be covered by a new child zone) */
+    assert(dep_arena->glue && dep_arena->glue->count == 2);
+    int prov_k = !strcasecmp(dep_arena->glue->targets[0], "ns1.prov.example.") ? 0 : 1;
+    assert(!strcasecmp(dep_arena->glue->targets[prov_k], "ns1.prov.example."));
+    assert(dep_arena->glue->ids[prov_k] == prov->id); /* the startup pass found the later sibling */
+    assert(dep_arena->glue->ids[1 - prov_k] == 0);    /* the zone itself */
+    assert(ns_answer_has_glue("dep.example.", "192.0.2.7") && ns_answer_has_glue("dep.example.", "192.0.2.31"));
+
+    /* nothing changed: the generation stays */
+    uint64_t gen_before = zone_arena_data_generation(dep_arena);
+    zone_glue_refresh_dependents(true);
+    assert(zone_arena_data_generation(dep_arena) == gen_before);
+
+    /* the sibling changes: the dependent is not republished, its answers get a new cache key */
+    wfile("prov.zone", "$ORIGIN prov.example.\n$TTL 60\n@ IN SOA ns1 h 2 7200 3600 1209600 60\n"
+                       "@ IN NS ns1\nns1 IN A 192.0.2.8\n");
+    zone_config_t *pcfg = find_zone_config_in_view(cfg, NULL, "prov.example.");
+    assert(pcfg && reload_master_zone(prov, pcfg) == RELOAD_OK);
+    zone_glue_refresh_dependents(false);
+    assert(atomic_load_explicit(&dep->rcu.active, memory_order_acquire) == dep_arena);
+    assert(zone_arena_data_generation(dep_arena) != gen_before);
+    assert(ns_answer_has_glue("dep.example.", "192.0.2.8") && !ns_answer_has_glue("dep.example.", "192.0.2.7"));
+    gen_before = zone_arena_data_generation(dep_arena);
+    zone_glue_refresh_dependents(false);  /* no further publish: nothing to do */
+    assert(zone_arena_data_generation(dep_arena) == gen_before);
+    zone_retire_process(true);            /* the old version is freed after the grace period (LeakSanitizer checks) */
+    release_zone_snapshot(snap);
+
+    /* a reload of the dependent itself */
+    zone_config_t *dcfg = find_zone_config_in_view(cfg, NULL, "dep.example.");
+    assert(dcfg && reload_master_zone(dep, dcfg) == RELOAD_OK);
+    assert(ns_answer_has_glue("dep.example.", "192.0.2.8"));
+    zone_retire_process(true);
+
+    /* the sibling zone is removed from the configuration: its address is no longer served as glue,
+     * and the dependent's generation changes although the dependent itself was not reloaded */
+    dep_arena = atomic_load_explicit(&dep->rcu.active, memory_order_acquire);
+    gen_before = zone_arena_data_generation(dep_arena);
+    server_config_t *cfg2 = load_conf(
+        "options { additional-from-auth yes; };\n"
+        "zone \"dep.example\" { type master; file \"%s/dep.zone\"; };\n", g_dir);
+    snap = build(cfg2, true);
+    dep = snapshot_get_zone(snap, "dep.example.");
+    assert(dep && atomic_load_explicit(&dep->rcu.active, memory_order_acquire) == dep_arena);
+    assert(zone_arena_data_generation(dep_arena) != gen_before);
+    for (int k = 0; k < dep_arena->glue->count; k++) assert(dep_arena->glue->ids[k] == 0);
+    assert(!ns_answer_has_glue("dep.example.", "192.0.2.8") && ns_answer_has_glue("dep.example.", "192.0.2.31"));
+    release_zone_snapshot(snap);
+    printf("  -> sibling glue tracking and release of old versions passed.\n");
 }
 
 static void test_snapshot_retain_release_and_gc(void) {
@@ -376,10 +499,10 @@ static void test_snapshot_rebuild_case_3(void) {
     memset(&entry, 0, sizeof(entry));
     zone_arena_t a1, a2;
     memset(&a1, 0, sizeof(a1)); memset(&a2, 0, sizeof(a2));
-    atomic_init(&entry.rcu.active, &a1);
-    assert(atomic_load_explicit(&entry.rcu.active, memory_order_relaxed) == &a1);
-    atomic_store_explicit(&entry.rcu.active, &a2, memory_order_release);
-    assert(atomic_load_explicit(&entry.rcu.active, memory_order_acquire) == &a2);
+    atomic_init(&entry.rcu.active, &a1.ver);
+    assert(atomic_load_explicit(&entry.rcu.active, memory_order_relaxed) == &a1.ver);
+    atomic_store_explicit(&entry.rcu.active, &a2.ver, memory_order_release);
+    assert(atomic_load_explicit(&entry.rcu.active, memory_order_acquire) == &a2.ver);
 }
 
 static void test_snapshot_rebuild_case_4(void) {
@@ -577,7 +700,7 @@ static void test_snapshot_rebuild_case_23(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "idx.example.", .is_standalone_mode = true, .err_out = &err };
     char ztext[] = "$ORIGIN idx.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\n";
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
     assert(arena.hash_size > 0);
     zone_arena_destroy(&arena);
 }
@@ -591,7 +714,7 @@ static void test_snapshot_rebuild_case_24(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "coll.example.", .is_standalone_mode = true, .err_out = &err };
     char ztext[] = "$ORIGIN coll.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nrec1 IN A 1.1.1.1\nrec2 IN A 2.2.2.2\n";
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
     zone_arena_destroy(&arena);
 }
 
@@ -604,7 +727,7 @@ static void test_snapshot_rebuild_case_25(void) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = "ent.example.", .is_standalone_mode = true, .err_out = &err };
     char ztext[] = "$ORIGIN ent.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\na.b.c IN A 192.0.2.1\n";
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    assert(test_build_index(&arena, true) == 0);
     zone_arena_destroy(&arena);
 }
 
@@ -644,13 +767,14 @@ static void test_snapshot_rebuild_case_29(void) {
 }
 
 /* www.shared.example. の A レコードの値を返す (無ければ NULL) */
-static const char *shared_www_addr(zone_db_entry_t *e) {
-    zone_arena_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
-    for (size_t i = 0; a && i < a->count; i++) {
-        if (a->records[i].type_code == 1 && strcasecmp(a->records[i].name, "www.shared.example.") == 0)
-            return a->records[i].rdata[0];
-    }
-    return NULL;
+static const char *shared_www_addr(zone_db_entry_t *e, char buf[INET_ADDRSTRLEN]) {
+    zone_version_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
+    const zone_image_t *img = a ? a->image : NULL;
+    uint32_t id = img ? zone_image_find_name(img, "www.shared.example.") : ZONE_IMAGE_NONE;
+    if (id == ZONE_IMAGE_NONE) return NULL;
+    uint32_t rr = zone_image_rrset_next(img, id, 1, zone_image_name_first_rr(img, id));
+    if (rr == ZONE_IMAGE_NONE || zone_image_rr_rdlen(img, rr) != 4) return NULL;
+    return inet_ntop(AF_INET, zone_image_rr_rdata(img, rr), buf, INET_ADDRSTRLEN);
 }
 
 /* R-26: the same zone name in two views keeps each view's own data, at start-up and after every
@@ -678,7 +802,8 @@ static void test_snapshot_rebuild_case_30(void) {
         assert(find_zone_exact_in_view(snapshot_find_view(snap, "VIEW1"), "SHARED.example.") == z1);
         assert(snapshot_get_zone_in_view(snap, "view3", "shared.example.") == NULL);
         assert(snapshot_get_zone_in_view(snap, "view1", "www.shared.example.") == NULL); /* exact apex only */
-        const char *a1 = shared_www_addr(z1), *a2 = shared_www_addr(z2);
+        char b1[INET_ADDRSTRLEN], b2[INET_ADDRSTRLEN];
+        const char *a1 = shared_www_addr(z1, b1), *a2 = shared_www_addr(z2, b2);
         assert(a1 && strcmp(a1, "192.0.2.11") == 0);
         assert(a2 && strcmp(a2, "198.51.100.22") == 0);
         /* query path: the client address selects the view, the view selects the entry */
@@ -728,8 +853,8 @@ static void test_snapshot_rebuild_type_change(void) {
     zone_db_snapshot_t *s3 = build(c3, false);
     zone_db_entry_t *tc3 = snapshot_get_zone_in_view(s3, "__default__", "tc.example.");
     assert(tc3 && tc3 != tc2 && tc3->kind == ZONE_KIND_PRIMARY && !tc3->is_secondary);
-    zone_arena_t *a3 = atomic_load_explicit(&tc3->rcu.active, memory_order_acquire);
-    assert(a3 && a3->count >= 3); /* the recreated primary loaded its file */
+    zone_version_t *a3 = atomic_load_explicit(&tc3->rcu.active, memory_order_acquire);
+    assert(a3 && a3->image && a3->image->n_rrs >= 3); /* the recreated primary loaded its file */
     assert(zone_kind_from_type("Secondary") == ZONE_KIND_SECONDARY);
     assert(zone_kind_from_type("forward") == ZONE_KIND_FORWARD);
     assert(zone_kind_from_type("program") == ZONE_KIND_PROGRAM);
@@ -863,6 +988,74 @@ static int rm_entry(const char *path, const struct stat *sb, int type, struct FT
     return remove(path);
 }
 
+/* S5 B-3: ixfr-history reaches the zone entries (options value, zone override), a reload with a lower value trims the
+ * kept differences at once and a higher value lets the ring grow with the next stored difference. */
+static void zone_with_serial(const char *file, const char *dom, unsigned serial) {
+    char t[512];
+    snprintf(t, sizeof(t), "$ORIGIN %s\n$TTL 60\n@ IN SOA ns.%s h.%s %u 7200 3600 1209600 60\n@ IN NS ns.%s\nns IN A 192.0.2.%u\n",
+             dom, dom, dom, serial, dom, serial % 200 + 1);
+    wfile(file, t);
+}
+
+static void test_ixfr_history_reload(void) {
+    printf("[TEST] Snapshot rebuild: ixfr-history from options/zone, trimming and growing on reload...\n");
+    zone_with_serial("h1.zone", "h1.example.", 1);
+    zone_with_serial("h2.zone", "h2.example.", 1);
+    zone_with_serial("h3.zone", "h3.example.", 1);
+    #define HCONF(opt) \
+        "options { " opt " };\n" \
+        "zone \"h1.example\" { type master; file \"%s/h1.zone\"; };\n" \
+        "zone \"h2.example\" { type master; file \"%s/h2.zone\"; ixfr-history 1; };\n" \
+        "zone \"h3.example\" { type master; file \"%s/h3.zone\"; ixfr-history 0; };\n"
+    server_config_t *cfg = load_conf(HCONF("ixfr-history 3;"), g_dir, g_dir, g_dir);
+    zone_db_snapshot_t *snap = build(cfg, false);
+    zone_db_entry_t *e1 = snapshot_get_zone(snap, "h1.example.");
+    zone_db_entry_t *e2 = snapshot_get_zone(snap, "h2.example.");
+    zone_db_entry_t *e3 = snapshot_get_zone(snap, "h3.example.");
+    assert(e1 && e2 && e3);
+    assert(ixfr_history_depth(&e1->ixfr_history) == 3);   /* options */
+    assert(ixfr_history_depth(&e2->ixfr_history) == 1);   /* the zone overrides options */
+    assert(ixfr_history_depth(&e3->ixfr_history) == 0);
+    assert(e1->ixfr_history.entries == NULL && e1->ixfr_history.count == 0);   /* nothing before the first diff */
+    zone_config_t *c1 = find_zone_config_in_view(cfg, NULL, "h1.example.");
+    zone_config_t *c2 = find_zone_config_in_view(cfg, NULL, "h2.example.");
+    zone_config_t *c3 = find_zone_config_in_view(cfg, NULL, "h3.example.");
+    for (unsigned s = 2; s <= 6; s++) {   /* five reloads, each with a new serial: five diffs */
+        zone_with_serial("h1.zone", "h1.example.", s);
+        zone_with_serial("h2.zone", "h2.example.", s);
+        zone_with_serial("h3.zone", "h3.example.", s);
+        assert(reload_master_zone(e1, c1) == RELOAD_OK);
+        assert(reload_master_zone(e2, c2) == RELOAD_OK);
+        assert(reload_master_zone(e3, c3) == RELOAD_OK);
+    }
+    assert(e1->ixfr_history.cap == 3 && e1->ixfr_history.count == 3);
+    assert(e1->ixfr_history.entries[(e1->ixfr_history.head + 3 - 3) % 3]->old_serial == 3);   /* 3->4, 4->5, 5->6 kept */
+    assert(e2->ixfr_history.cap == 1 && e2->ixfr_history.count == 1 && e2->ixfr_history.entries[0]->old_serial == 5);
+    assert(e3->ixfr_history.entries == NULL && e3->ixfr_history.count == 0);   /* depth 0: no ring, no diff */
+
+    /* a reload of the configuration with a lower options value trims the zone that follows options (not the others) */
+    server_config_t *cfg2 = load_conf(HCONF("ixfr-history 1;"), g_dir, g_dir, g_dir);
+    zone_db_snapshot_t *snap2 = build(cfg2, true);
+    assert(snapshot_get_zone(snap2, "h1.example.") == e1);   /* the entry is reused */
+    assert(ixfr_history_depth(&e1->ixfr_history) == 1);
+    assert(e1->ixfr_history.cap == 1 && e1->ixfr_history.count == 1 && e1->ixfr_history.entries[0]->old_serial == 5);
+    /* a higher value: the ring grows with the next stored diff and keeps what it had */
+    server_config_t *cfg3 = load_conf(HCONF("ixfr-history 5;"), g_dir, g_dir, g_dir);
+    zone_db_snapshot_t *snap3 = build(cfg3, true);
+    assert(ixfr_history_depth(&e1->ixfr_history) == 5 && e1->ixfr_history.cap == 1);
+    zone_with_serial("h1.zone", "h1.example.", 7);
+    c1 = find_zone_config_in_view(cfg3, NULL, "h1.example.");
+    assert(reload_master_zone(e1, c1) == RELOAD_OK);
+    assert(e1->ixfr_history.cap == 5 && e1->ixfr_history.count == 2);
+    assert(e1->ixfr_history.entries[0]->old_serial == 5 && e1->ixfr_history.entries[1]->old_serial == 6);
+    assert(ixfr_history_depth(&e2->ixfr_history) == 1);      /* still the zone's own value */
+    release_zone_snapshot(snap3);
+    release_zone_snapshot(snap2);
+    release_zone_snapshot(snap);
+    #undef HCONF
+    printf("  -> ixfr-history on reload passed.\n");
+}
+
 int main(void) {
     /* Line-buffered progress + a hang watchdog (exit 124 with the phase) so a
      * stalled run fails fast in CI instead of blocking the job. */
@@ -871,6 +1064,8 @@ int main(void) {
     snprintf(g_dir, sizeof(g_dir), "/tmp/karidns_snap_XXXXXX");
     assert(mkdtemp(g_dir));
     test_rebuild_two_views();
+    test_ixfr_history_reload();
+    test_snapshot_rebuild_sibling_glue();
     test_snapshot_retain_release_and_gc();
     test_lookup_across_views_multi();
     test_snapshot_catalog_member_sync_and_deltas();

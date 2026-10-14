@@ -11,6 +11,9 @@
 #endif
 #include "../dns_wire.h"
 #include "../dns_config_parser.h"
+#include "test_zext.h"
+/* S6a: パース済みの設定のゾーンは views の中にある (cfg.zones は手で組む設定用) */
+#define CFG_ZONES(c) ((c).views ? (c).views->zones : NULL)
 #include "../dns_zone_parser.h"
 #include "../dns_utils.h"
 #include <fcntl.h>
@@ -94,12 +97,12 @@ int main() {
     char* copy_acl = strdup(conf_acl);
     int res_acl = parse_named_conf(copy_acl, &cfg);
     free(copy_acl);
-    if (res_acl == 0 && cfg.zones && cfg.zones->tsig_keys_count == 1 && cfg.zones->tsig_keys && strcmp(cfg.zones->tsig_keys[0], "mykey") == 0 && cfg.zones->allow_transfer_count == 0) {
+    if (res_acl == 0 && cfg.views->zones && zext(cfg.views->zones)->tsig_keys_count == 1 && zext(cfg.views->zones)->tsig_keys && strcmp(zext(cfg.views->zones)->tsig_keys[0], "mykey") == 0 && zext(cfg.views->zones)->allow_transfer_count == 0) {
         printf("Test 4 Passed: allow-transfer key correctly parsed as tsig_keys\n");
     } else {
         printf("Test 4 Failed: allow-transfer key parsing failed! res_acl=%d, tsig_keys_count=%d, count=%d\n",
-               res_acl, cfg.zones ? cfg.zones->tsig_keys_count : -1,
-               cfg.zones ? cfg.zones->allow_transfer_count : -1);
+               res_acl, cfg.views->zones ? zext(cfg.views->zones)->tsig_keys_count : -1,
+               cfg.views->zones ? zext(cfg.views->zones)->allow_transfer_count : -1);
         return 1;
     }
     free_server_config_fields(&cfg);
@@ -108,18 +111,21 @@ int main() {
     {
         // SSHFP
         dns_record_t rec_sshfp = {0};
+        DNS_RECORD_BIND_RDATA(rec_sshfp);
         rec_sshfp.name = (char*)"example.com"; rec_sshfp.type_code = 44; rec_sshfp.rdata_count = 3;
         rec_sshfp.rdata[0] = (char*)"2"; rec_sshfp.rdata[1] = (char*)"1"; rec_sshfp.rdata[2] = (char*)"1234567890abcdef";
         if (assert_bound_checked(&rec_sshfp)) return 1;
         
         // TLSA
         dns_record_t rec_tlsa = {0};
+        DNS_RECORD_BIND_RDATA(rec_tlsa);
         rec_tlsa.name = (char*)"_443._tcp.example.com"; rec_tlsa.type_code = 52; rec_tlsa.rdata_count = 4;
         rec_tlsa.rdata[0] = (char*)"3"; rec_tlsa.rdata[1] = (char*)"1"; rec_tlsa.rdata[2] = (char*)"1"; rec_tlsa.rdata[3] = (char*)"abcdef";
         if (assert_bound_checked(&rec_tlsa)) return 1;
 
         // CERT
         dns_record_t rec_cert = {0};
+        DNS_RECORD_BIND_RDATA(rec_cert);
         rec_cert.name = (char*)"example.com"; rec_cert.type_code = 37; rec_cert.rdata_count = 4;
         rec_cert.rdata[0] = (char*)"PKIX"; rec_cert.rdata[1] = (char*)"12345"; rec_cert.rdata[2] = (char*)"8"; 
         rec_cert.rdata[3] = (char*)"QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB";
@@ -127,6 +133,7 @@ int main() {
 
         // NAPTR
         dns_record_t rec_naptr = {0};
+        DNS_RECORD_BIND_RDATA(rec_naptr);
         rec_naptr.name = (char*)"example.com"; rec_naptr.type_code = 35; rec_naptr.rdata_count = 6;
         rec_naptr.rdata[0] = (char*)"100"; rec_naptr.rdata[1] = (char*)"10"; rec_naptr.rdata[2] = (char*)"S";
         rec_naptr.rdata[3] = (char*)"SIP+D2U"; rec_naptr.rdata[4] = (char*)""; rec_naptr.rdata[5] = (char*)"_sip._udp.example.com.";
@@ -134,6 +141,7 @@ int main() {
 
         // NSEC3PARAM
         dns_record_t rec_nsec3param = {0};
+        DNS_RECORD_BIND_RDATA(rec_nsec3param);
         rec_nsec3param.name = (char*)"example.com"; rec_nsec3param.type_code = 51; rec_nsec3param.rdata_count = 4;
         rec_nsec3param.rdata[0] = (char*)"1"; rec_nsec3param.rdata[1] = (char*)"0"; rec_nsec3param.rdata[2] = (char*)"10";
         rec_nsec3param.rdata[3] = (char*)"12345678";
@@ -142,42 +150,49 @@ int main() {
   
         // HINFO
         dns_record_t rec_hinfo = {0};
+        DNS_RECORD_BIND_RDATA(rec_hinfo);
         rec_hinfo.name = (char*)"example.com"; rec_hinfo.type_code = 13; rec_hinfo.rdata_count = 2;
         rec_hinfo.rdata[0] = (char*)"INTEL-386"; rec_hinfo.rdata[1] = (char*)"UNIX";
         if (assert_bound_checked(&rec_hinfo)) return 1;
 
         // URI
         dns_record_t rec_uri = {0};
+        DNS_RECORD_BIND_RDATA(rec_uri);
         rec_uri.name = (char*)"example.com"; rec_uri.type_code = 256; rec_uri.rdata_count = 3;
         rec_uri.rdata[0] = (char*)"10"; rec_uri.rdata[1] = (char*)"1"; rec_uri.rdata[2] = (char*)"ftp://ftp.example.com/public";
         if (assert_bound_checked(&rec_uri)) return 1;
 
         // OPENPGPKEY
         dns_record_t rec_openpgpkey = {0};
+        DNS_RECORD_BIND_RDATA(rec_openpgpkey);
         rec_openpgpkey.name = (char*)"example.com"; rec_openpgpkey.type_code = 61; rec_openpgpkey.rdata_count = 1;
         rec_openpgpkey.rdata[0] = (char*)"mQENBFxJ0V4BCADA"; // Dummy base64 string
         if (assert_bound_checked(&rec_openpgpkey)) return 1;
 
         // DHCID
         dns_record_t rec_dhcid = {0};
+        DNS_RECORD_BIND_RDATA(rec_dhcid);
         rec_dhcid.name = (char*)"example.com"; rec_dhcid.type_code = 49; rec_dhcid.rdata_count = 1;
         rec_dhcid.rdata[0] = (char*)"AAIBY2/AuCccgoJbsaxcQc9TUapptP69lOjxfNuVAA2kjEA=";
         if (assert_bound_checked(&rec_dhcid)) return 1;
 
         // EUI48
         dns_record_t rec_eui48 = {0};
+        DNS_RECORD_BIND_RDATA(rec_eui48);
         rec_eui48.name = (char*)"example.com"; rec_eui48.type_code = 108; rec_eui48.rdata_count = 1;
         rec_eui48.rdata[0] = (char*)"00-11-22-33-44-55";
         if (assert_bound_checked(&rec_eui48)) return 1;
 
         // EUI64
         dns_record_t rec_eui64 = {0};
+        DNS_RECORD_BIND_RDATA(rec_eui64);
         rec_eui64.name = (char*)"example.com"; rec_eui64.type_code = 109; rec_eui64.rdata_count = 1;
         rec_eui64.rdata[0] = (char*)"00-11-22-33-44-55-66-77";
         if (assert_bound_checked(&rec_eui64)) return 1;
 
         // ZONEMD
         dns_record_t rec_zonemd = {0};
+        DNS_RECORD_BIND_RDATA(rec_zonemd);
         rec_zonemd.name = (char*)"example.com"; rec_zonemd.type_code = 63; rec_zonemd.rdata_count = 4;
         rec_zonemd.rdata[0] = (char*)"2018031500"; rec_zonemd.rdata[1] = (char*)"1"; rec_zonemd.rdata[2] = (char*)"1";
         rec_zonemd.rdata[3] = (char*)"FEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFE";
@@ -185,72 +200,84 @@ int main() {
 
         // MINFO
         dns_record_t rec_minfo = {0};
+        DNS_RECORD_BIND_RDATA(rec_minfo);
         rec_minfo.name = (char*)"example.com"; rec_minfo.type_code = 14; rec_minfo.rdata_count = 2;
         rec_minfo.rdata[0] = (char*)"rm.example.com"; rec_minfo.rdata[1] = (char*)"err.example.com";
         if (assert_bound_checked(&rec_minfo)) return 1;
 
         // RP
         dns_record_t rec_rp = {0};
+        DNS_RECORD_BIND_RDATA(rec_rp);
         rec_rp.name = (char*)"example.com"; rec_rp.type_code = 17; rec_rp.rdata_count = 2;
         rec_rp.rdata[0] = (char*)"admin.example.com"; rec_rp.rdata[1] = (char*)"txt.example.com";
         if (assert_bound_checked(&rec_rp)) return 1;
 
         // AFSDB
         dns_record_t rec_afsdb = {0};
+        DNS_RECORD_BIND_RDATA(rec_afsdb);
         rec_afsdb.name = (char*)"example.com"; rec_afsdb.type_code = 18; rec_afsdb.rdata_count = 2;
         rec_afsdb.rdata[0] = (char*)"1"; rec_afsdb.rdata[1] = (char*)"afs.example.com";
         if (assert_bound_checked(&rec_afsdb)) return 1;
 
         // KX
         dns_record_t rec_kx = {0};
+        DNS_RECORD_BIND_RDATA(rec_kx);
         rec_kx.name = (char*)"example.com"; rec_kx.type_code = 36; rec_kx.rdata_count = 2;
         rec_kx.rdata[0] = (char*)"10"; rec_kx.rdata[1] = (char*)"kx.example.com";
         if (assert_bound_checked(&rec_kx)) return 1;
 
         // PX
         dns_record_t rec_px = {0};
+        DNS_RECORD_BIND_RDATA(rec_px);
         rec_px.name = (char*)"example.com"; rec_px.type_code = 26; rec_px.rdata_count = 3;
         rec_px.rdata[0] = (char*)"10"; rec_px.rdata[1] = (char*)"px1.example.com"; rec_px.rdata[2] = (char*)"px2.example.com";
         if (assert_bound_checked(&rec_px)) return 1;
 
         // RT
         dns_record_t rec_rt = {0};
+        DNS_RECORD_BIND_RDATA(rec_rt);
         rec_rt.name = (char*)"example.com"; rec_rt.type_code = 21; rec_rt.rdata_count = 2;
         rec_rt.rdata[0] = (char*)"10"; rec_rt.rdata[1] = (char*)"rt.example.com";
         if (assert_bound_checked(&rec_rt)) return 1;
 
         // LP
         dns_record_t rec_lp = {0};
+        DNS_RECORD_BIND_RDATA(rec_lp);
         rec_lp.name = (char*)"example.com"; rec_lp.type_code = 107; rec_lp.rdata_count = 2;
         rec_lp.rdata[0] = (char*)"10"; rec_lp.rdata[1] = (char*)"lp.example.com";
         if (assert_bound_checked(&rec_lp)) return 1;
 
         // CSYNC
         dns_record_t rec_csync = {0};
+        DNS_RECORD_BIND_RDATA(rec_csync);
         rec_csync.name = (char*)"example.com"; rec_csync.type_code = 62; rec_csync.rdata_count = 4;
         rec_csync.rdata[0] = (char*)"123456"; rec_csync.rdata[1] = (char*)"1"; rec_csync.rdata[2] = (char*)"A"; rec_csync.rdata[3] = (char*)"AAAA";
         if (assert_bound_checked(&rec_csync)) return 1;
         // X25 (Type 19)
         dns_record_t rec_x25 = {0};
+        DNS_RECORD_BIND_RDATA(rec_x25);
         rec_x25.name = (char*)"example.com"; rec_x25.type_code = 19; rec_x25.rdata_count = 1;
         rec_x25.rdata[0] = (char*)"311061700956";
         if (assert_bound_checked(&rec_x25)) return 1;
 
         // ISDN (Type 20)
         dns_record_t rec_isdn = {0};
+        DNS_RECORD_BIND_RDATA(rec_isdn);
         rec_isdn.name = (char*)"example.com"; rec_isdn.type_code = 20; rec_isdn.rdata_count = 2;
         rec_isdn.rdata[0] = (char*)"150862028003217"; rec_isdn.rdata[1] = (char*)"004";
         if (assert_bound_checked(&rec_isdn)) return 1;
 
         // NSAP (Type 22)
-        // 繧ｾ繝ｼ繝ｳ繝代・繧ｵ繝ｼ縺ｧ0x縺ｨ繝峨ャ繝医′髯､蜴ｻ縺輔ｌ縺溷ｾ後・豁｣隕丞喧縺輔ｌ縺櫞ex譁・ｭ怜・繧呈Φ螳・
+        // ゾーンパーサーで0xとドットが除去された後の、正規化されたHex文字列を想定
         dns_record_t rec_nsap = {0};
+        DNS_RECORD_BIND_RDATA(rec_nsap);
         rec_nsap.name = (char*)"example.com"; rec_nsap.type_code = 22; rec_nsap.rdata_count = 1;
         rec_nsap.rdata[0] = (char*)"47000580005a0000000001e133ffffff00016100";
         if (assert_bound_checked(&rec_nsap)) return 1;
 
         // GPOS (Type 27)
         dns_record_t rec_gpos = {0};
+        DNS_RECORD_BIND_RDATA(rec_gpos);
         rec_gpos.name = (char*)"example.com"; rec_gpos.type_code = 27; rec_gpos.rdata_count = 3;
         rec_gpos.rdata[0] = (char*)"-32.6866"; rec_gpos.rdata[1] = (char*)"-70.1509"; rec_gpos.rdata[2] = (char*)"12.0";
         if (assert_bound_checked(&rec_gpos)) return 1;
@@ -273,6 +300,7 @@ int main() {
 
         // TLSA (Type 52) - exact hex string for bound checking
         dns_record_t rec_tlsa = {0};
+        DNS_RECORD_BIND_RDATA(rec_tlsa);
         rec_tlsa.name = (char*)"_443._tcp.example.com"; rec_tlsa.type_code = 52; rec_tlsa.rdata_count = 4;
         rec_tlsa.rdata[0] = (char*)"3"; rec_tlsa.rdata[1] = (char*)"1"; rec_tlsa.rdata[2] = (char*)"1"; 
         rec_tlsa.rdata[3] = exact_hex_512;
@@ -284,6 +312,7 @@ int main() {
             uint16_t offset = 0;
             compress_ctx_t ctx = {0}; compress_ctx_init_packet(&ctx);
             dns_record_t rec_tlsa_multi = {0};
+            DNS_RECORD_BIND_RDATA(rec_tlsa_multi);
             rec_tlsa_multi.name = (char*)"_443._tcp.example.com";
             rec_tlsa_multi.type_code = 52; rec_tlsa_multi.rdata_count = 7;
             rec_tlsa_multi.rdata[0] = (char*)"3"; rec_tlsa_multi.rdata[1] = (char*)"1";
@@ -305,6 +334,7 @@ int main() {
         // Note: The following test with huge_b64 actually tests EVP_DecodeBlock rejecting
         // invalid base64 lengths rather than the bound check itself.
         dns_record_t rec_cert = {0};
+        DNS_RECORD_BIND_RDATA(rec_cert);
         rec_cert.name = (char*)"example.com"; rec_cert.type_code = 37; rec_cert.rdata_count = 4;
         rec_cert.rdata[0] = (char*)"PKIX"; rec_cert.rdata[1] = (char*)"12345"; rec_cert.rdata[2] = (char*)"8"; 
         rec_cert.rdata[3] = huge_b64;
@@ -324,6 +354,7 @@ int main() {
 
         // CERT: Valid Base64 that exceeds max_res_len (boundary check test)
         dns_record_t rec_cert2 = {0};
+        DNS_RECORD_BIND_RDATA(rec_cert2);
         rec_cert2.name = (char*)"example.com"; rec_cert2.type_code = 37; rec_cert2.rdata_count = 4;
         rec_cert2.rdata[0] = (char*)"PKIX"; rec_cert2.rdata[1] = (char*)"12345"; rec_cert2.rdata[2] = (char*)"8";
         
@@ -337,6 +368,7 @@ int main() {
 
         // ZONEMD (Type 63) - exact hex string for bound checking
         dns_record_t rec_zonemd = {0};
+        DNS_RECORD_BIND_RDATA(rec_zonemd);
         rec_zonemd.name = (char*)"example.com"; rec_zonemd.type_code = 63; rec_zonemd.rdata_count = 4;
         rec_zonemd.rdata[0] = (char*)"2018031500"; rec_zonemd.rdata[1] = (char*)"1"; rec_zonemd.rdata[2] = (char*)"1";
         rec_zonemd.rdata[3] = exact_hex_512;
@@ -348,6 +380,7 @@ int main() {
             uint16_t offset = 0;
             compress_ctx_t ctx = {0}; compress_ctx_init_packet(&ctx);
             dns_record_t rec_zonemd_multi = {0};
+            DNS_RECORD_BIND_RDATA(rec_zonemd_multi);
             rec_zonemd_multi.name = (char*)"example.com";
             rec_zonemd_multi.type_code = 63; rec_zonemd_multi.rdata_count = 9;
             rec_zonemd_multi.rdata[0] = (char*)"2018031500"; rec_zonemd_multi.rdata[1] = (char*)"1";
@@ -369,24 +402,28 @@ int main() {
 
         // NID (Type 104)
         dns_record_t rec_nid = {0};
+        DNS_RECORD_BIND_RDATA(rec_nid);
         rec_nid.name = (char*)"example.com"; rec_nid.type_code = 104; rec_nid.rdata_count = 2;
         rec_nid.rdata[0] = (char*)"10"; rec_nid.rdata[1] = (char*)"0000:0000:0000:0000";
         if (assert_bound_checked(&rec_nid)) return 1;
 
         // L32 (Type 105)
         dns_record_t rec_l32 = {0};
+        DNS_RECORD_BIND_RDATA(rec_l32);
         rec_l32.name = (char*)"example.com"; rec_l32.type_code = 105; rec_l32.rdata_count = 2;
         rec_l32.rdata[0] = (char*)"10"; rec_l32.rdata[1] = (char*)"192.0.2.1";
         if (assert_bound_checked(&rec_l32)) return 1;
 
         // L64 (Type 106)
         dns_record_t rec_l64 = {0};
+        DNS_RECORD_BIND_RDATA(rec_l64);
         rec_l64.name = (char*)"example.com"; rec_l64.type_code = 106; rec_l64.rdata_count = 2;
         rec_l64.rdata[0] = (char*)"10"; rec_l64.rdata[1] = (char*)"0000:0000:0000:0000";
         if (assert_bound_checked(&rec_l64)) return 1;
 
         // IPSECKEY (Type 45) - GW Type 1 (IPv4)
         dns_record_t rec_ipseckey1 = {0};
+        DNS_RECORD_BIND_RDATA(rec_ipseckey1);
         rec_ipseckey1.name = (char*)"example.com"; rec_ipseckey1.type_code = 45; rec_ipseckey1.rdata_count = 5;
         rec_ipseckey1.rdata[0] = (char*)"10"; rec_ipseckey1.rdata[1] = (char*)"1"; rec_ipseckey1.rdata[2] = (char*)"2";
         rec_ipseckey1.rdata[3] = (char*)"192.0.2.1"; rec_ipseckey1.rdata[4] = valid_long_b64;
@@ -394,6 +431,7 @@ int main() {
 
         // IPSECKEY (Type 45) - GW Type 2 (IPv6)
         dns_record_t rec_ipseckey2 = {0};
+        DNS_RECORD_BIND_RDATA(rec_ipseckey2);
         rec_ipseckey2.name = (char*)"example.com"; rec_ipseckey2.type_code = 45; rec_ipseckey2.rdata_count = 5;
         rec_ipseckey2.rdata[0] = (char*)"10"; rec_ipseckey2.rdata[1] = (char*)"2"; rec_ipseckey2.rdata[2] = (char*)"2";
         rec_ipseckey2.rdata[3] = (char*)"2001:db8::1"; rec_ipseckey2.rdata[4] = valid_long_b64;
@@ -401,6 +439,7 @@ int main() {
 
         // IPSECKEY (Type 45) - GW Type 3 (Domain Name)
         dns_record_t rec_ipseckey3 = {0};
+        DNS_RECORD_BIND_RDATA(rec_ipseckey3);
         rec_ipseckey3.name = (char*)"example.com"; rec_ipseckey3.type_code = 45; rec_ipseckey3.rdata_count = 5;
         rec_ipseckey3.rdata[0] = (char*)"10"; rec_ipseckey3.rdata[1] = (char*)"3"; rec_ipseckey3.rdata[2] = (char*)"2";
         rec_ipseckey3.rdata[3] = (char*)"gw.example.com"; rec_ipseckey3.rdata[4] = valid_long_b64;
@@ -408,6 +447,7 @@ int main() {
 
         // AMTRELAY (Type 260) - Type 1 (IPv4)
         dns_record_t rec_amtrelay1 = {0};
+        DNS_RECORD_BIND_RDATA(rec_amtrelay1);
         rec_amtrelay1.name = (char*)"example.com"; rec_amtrelay1.type_code = 260; rec_amtrelay1.rdata_count = 4;
         rec_amtrelay1.rdata[0] = (char*)"10"; rec_amtrelay1.rdata[1] = (char*)"0"; rec_amtrelay1.rdata[2] = (char*)"1";
         rec_amtrelay1.rdata[3] = (char*)"192.0.2.1";
@@ -415,6 +455,7 @@ int main() {
 
         // LOC (Type 29)
         dns_record_t rec_loc = {0};
+        DNS_RECORD_BIND_RDATA(rec_loc);
         rec_loc.name = (char*)"example.com"; rec_loc.type_code = 29; rec_loc.rdata_count = 10;
         rec_loc.rdata[0] = (char*)"37"; rec_loc.rdata[1] = (char*)"26"; rec_loc.rdata[2] = (char*)"0.000"; rec_loc.rdata[3] = (char*)"N";
         rec_loc.rdata[4] = (char*)"122"; rec_loc.rdata[5] = (char*)"8"; rec_loc.rdata[6] = (char*)"0.000"; rec_loc.rdata[7] = (char*)"W";
@@ -423,6 +464,7 @@ int main() {
 
         // APL (Type 42)
         dns_record_t rec_apl = {0};
+        DNS_RECORD_BIND_RDATA(rec_apl);
         rec_apl.name = (char*)"example.com"; rec_apl.type_code = 42; rec_apl.rdata_count = 2;
         rec_apl.rdata[0] = (char*)"1:192.168.0.0/24";
         rec_apl.rdata[1] = (char*)"!2:2001:db8::/32";
@@ -453,27 +495,27 @@ int main() {
             free(buf); \
         } while(0)
 
-        // 豁｣蟶ｸ邉ｻ: 1-5 
+        // 正常系: 1-5
         RUN_GEN_TEST("$GENERATE 1-5 host-$ A 10.0.0.$", false);
-        // 逡ｰ蟶ｸ邉ｻ: stop < start
+        // 異常系: stop < start
         RUN_GEN_TEST("$GENERATE 10-1 host-$ A 10.0.0.$", true);
-        // 逡ｰ蟶ｸ邉ｻ: step 0
+        // 異常系: step 0
         RUN_GEN_TEST("$GENERATE 1-10/0 host-$ A 10.0.0.$", true);
-        // 逡ｰ蟶ｸ邉ｻ: MAX_GENERATE_COUNT 雜・∴
+        // 異常系: MAX_GENERATE_COUNT 超え
         RUN_GEN_TEST("$GENERATE 1-999999 host-$ A 10.0.0.$", true);
-        // 逡ｰ蟶ｸ邉ｻ: width逡ｰ蟶ｸ
+        // 異常系: width 異常
         RUN_GEN_TEST("$GENERATE 1-10 host-${0,999,d} A 10.0.0.$", true);
-        // 逡ｰ蟶ｸ邉ｻ: base逡ｰ蟶ｸ
+        // 異常系: base 異常
         RUN_GEN_TEST("$GENERATE 1-10 host-${0,3,q} A 10.0.0.$", true);
-        // 豁｣蟶ｸ邉ｻ: $$
+        // 正常系: $$
         RUN_GEN_TEST("$GENERATE 1-5 host-$$ A 10.0.0.$", false);
-        // 豁｣蟶ｸ邉ｻ: 雋�縺ｮoffset
+        // 正常系: 負の offset
         RUN_GEN_TEST("$GENERATE 1-5 host-${-5,3,d} A 10.0.0.$", false);
-        // 豁｣蟶ｸ邉ｻ: width 32-64
+        // 正常系: width 32-64
         RUN_GEN_TEST("$GENERATE 1-2 host-${0,40,d} A 10.0.0.$", false);
         RUN_GEN_TEST("$GENERATE 1-2 host-$ TXT ${0,64,d}", false);
         RUN_GEN_TEST("$GENERATE 1-2 host-${0,30,d}.${0,34,d} A 10.0.0.$", false);
-        // 逡ｰ蟶ｸ邉ｻ / 繧ｨ繝・ず繧ｱ繝ｼ繧ｹ: 繝・Φ繝励Ξ繝ｼ繝域忰蟆ｾ繧ｫ繝ｳ繝槭・谺�關ｽ繝ｻ譛ｪ繧ｯ繝ｭ繝ｼ繧ｺ (Fuzzer Crash regression)
+        // 異常系 / エッジケース: テンプレート末尾のカンマ欠落・未クローズ (Fuzzer Crash regression)
         RUN_GEN_TEST("$GENERATE 1-2 host-${,60, A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-${,, A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-${ A 10.0.0.$", true);
@@ -481,7 +523,7 @@ int main() {
         RUN_GEN_TEST("$GENERATE 1-2 host-${1,2,d A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-$ A 10.0.0.${,60,", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-$ A 10.0.0.${,,", true);
-        // 逡ｰ蟶ｸ邉ｻ: range 讒区枚縺ｮ荳肴ｭ｣ (start/stop/step 縺ｮ逵∫払繧・ざ繝・
+        // 異常系: range 構文の不正 (start/stop/step の省略など)
         RUN_GEN_TEST("$GENERATE - host-$ A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1- host-$ A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE -5 host-$ A 10.0.0.$", true);
@@ -498,6 +540,7 @@ int main() {
 
         // LOC: Invalid latitude (> 90 degrees = 324000 sec)
         dns_record_t rec_loc_badlat = {0};
+        DNS_RECORD_BIND_RDATA(rec_loc_badlat);
         rec_loc_badlat.name = (char*)"example.com"; rec_loc_badlat.type_code = 29; rec_loc_badlat.rdata_count = 10;
         rec_loc_badlat.rdata[0] = (char*)"91"; rec_loc_badlat.rdata[1] = (char*)"0"; rec_loc_badlat.rdata[2] = (char*)"0"; rec_loc_badlat.rdata[3] = (char*)"N";
         rec_loc_badlat.rdata[4] = (char*)"0"; rec_loc_badlat.rdata[5] = (char*)"0"; rec_loc_badlat.rdata[6] = (char*)"0"; rec_loc_badlat.rdata[7] = (char*)"E";
@@ -509,6 +552,7 @@ int main() {
 
         // LOC: Invalid direction ('X')
         dns_record_t rec_loc_baddir = {0};
+        DNS_RECORD_BIND_RDATA(rec_loc_baddir);
         rec_loc_baddir.name = (char*)"example.com"; rec_loc_baddir.type_code = 29; rec_loc_baddir.rdata_count = 10;
         rec_loc_baddir.rdata[0] = (char*)"10"; rec_loc_baddir.rdata[1] = (char*)"0"; rec_loc_baddir.rdata[2] = (char*)"0"; rec_loc_baddir.rdata[3] = (char*)"X";
         rec_loc_baddir.rdata[4] = (char*)"0"; rec_loc_baddir.rdata[5] = (char*)"0"; rec_loc_baddir.rdata[6] = (char*)"0"; rec_loc_baddir.rdata[7] = (char*)"E";
@@ -520,6 +564,7 @@ int main() {
         
         // LOC: Valid short form
         dns_record_t rec_loc_short = {0};
+        DNS_RECORD_BIND_RDATA(rec_loc_short);
         rec_loc_short.name = (char*)"example.com"; rec_loc_short.type_code = 29; rec_loc_short.rdata_count = 5;
         rec_loc_short.rdata[0] = (char*)"37"; rec_loc_short.rdata[1] = (char*)"N";
         rec_loc_short.rdata[2] = (char*)"122"; rec_loc_short.rdata[3] = (char*)"W";
@@ -531,6 +576,7 @@ int main() {
 
         // APL: Invalid AFI (3)
         dns_record_t rec_apl_badafi = {0};
+        DNS_RECORD_BIND_RDATA(rec_apl_badafi);
         rec_apl_badafi.name = (char*)"example.com"; rec_apl_badafi.type_code = 42; rec_apl_badafi.rdata_count = 1;
         rec_apl_badafi.rdata[0] = (char*)"3:192.168.0.0/24";
         offset = 0;
@@ -540,6 +586,7 @@ int main() {
         
         // APL: Invalid IPv4 Prefix (33)
         dns_record_t rec_apl_badpfx = {0};
+        DNS_RECORD_BIND_RDATA(rec_apl_badpfx);
         rec_apl_badpfx.name = (char*)"example.com"; rec_apl_badpfx.type_code = 42; rec_apl_badpfx.rdata_count = 1;
         rec_apl_badpfx.rdata[0] = (char*)"1:192.168.0.0/33";
         offset = 0;
@@ -620,7 +667,7 @@ int main() {
         }
 
         // 5. Properly closed quote at EOF (no trailing newline, but valid closing quote)
-        char buf5[] = "example.com. 3600 IN TXT \"hello\"";  // 譛ｫ蟆ｾ縺ｫ謾ｹ陦後↑縺励√◆縺�縺玲ｭ｣縺励￥髢峨§縺ｦ縺・ｋ
+        char buf5[] = "example.com. 3600 IN TXT \"hello\"";  // 末尾に改行なし、ただし正しく閉じている
         int r5 = parse_zone_fast(buf5, strlen(buf5), &arena, &ctx);
         if (r5 < 0) {
             printf("FAIL: Test 5 (properly closed quote at EOF) failed. err=%s\n", err.error_message ? err.error_message : "NULL");
@@ -822,8 +869,8 @@ int main() {
         zone_arena_t arena = {0};
         zone_arena_init(&arena);
         // 1. Single allocation limit (64MB)
-        // size閾ｪ菴薙′荳企剞(64MB)繧定ｶ・∴繧九こ繝ｼ繧ｹ縲・縺､逶ｮ縺ｮ繧ｬ繝ｼ繝・
-        // `size > (64 * 1024 * 1024)` 縺ｧ蠑ｾ縺九ｌ繧九％縺ｨ繧堤｢ｺ隱阪☆繧九・
+        // size 自体が上限 (64MB) を超えるケース。1つ目のガード
+        // `size > (64 * 1024 * 1024)` で弾かれることを確認する。
         void *p1 = arena_alloc(&arena, (64 * 1024 * 1024) + 1);
         if (p1 != NULL) {
             printf("FAIL: arena_alloc accepted allocation > 64MB\n");
@@ -837,10 +884,10 @@ int main() {
     // Test 10b: arena_alloc Addition Overflow Prevention (strict)
     {
         printf("\n--- Test 10b: arena_alloc Addition Overflow Prevention (strict) ---\n");
-        // current_pool_idx 繧・SIZE_MAX 霑大ｍ縺ｾ縺ｧ諢丞峙逧・↓騾ｲ繧√◆迥ｶ諷九ｒ蛛ｽ陬・＠縲・
-        // size閾ｪ菴薙・64MB譛ｪ貅縺�縺・current_pool_idx + size 縺・size_t 縺ｮ遽・峇縺ｧ
-        // 繧ｪ繝ｼ繝舌・繝輔Ο繝ｼ縺吶ｋ繧ｱ繝ｼ繧ｹ繧剃ｽ懊ｋ縲ゅ％繧後↓繧医ｊ1縺､逶ｮ縺ｮ繧ｬ繝ｼ繝峨ｒ縺吶ｊ謚懊￠縺ｦ
-        // 2縺､逶ｮ縺ｮ繧ｬ繝ｼ繝・(current_pool_idx > SIZE_MAX - size) 繧堤｢ｺ螳溘↓雕上∪縺帙ｋ縲・
+        // current_pool_idx を SIZE_MAX 近傍まで意図的に進めた状態を偽装し、
+        // size 自体は 64MB 未満だが current_pool_idx + size が size_t の範囲で
+        // オーバーフローするケースを作る。これにより1つ目のガードをすり抜けて
+        // 2つ目のガード (current_pool_idx > SIZE_MAX - size) を確実に踏ませる。
         zone_arena_t arena2 = {0};
         zone_arena_init(&arena2);
         arena2.current_pool_idx = SIZE_MAX - 100;
@@ -1035,6 +1082,7 @@ int main() {
         // Case 1: Out-of-order SvcParamKeys (port=443 before alpn=h2) must be sorted in wire format
         dns_record_t svcb_rec;
         memset(&svcb_rec, 0, sizeof(svcb_rec));
+        DNS_RECORD_BIND_RDATA(svcb_rec);
         svcb_rec.name = "example.com.";
         svcb_rec.type = "HTTPS";
         svcb_rec.type_code = 65;
@@ -1077,6 +1125,7 @@ int main() {
         // Case 2: Duplicate SvcParamKeys (alpn=h2 and alpn=h3) must be rejected with error
         dns_record_t dup_rec;
         memset(&dup_rec, 0, sizeof(dup_rec));
+        DNS_RECORD_BIND_RDATA(dup_rec);
         dup_rec.name = "example.com.";
         dup_rec.type = "HTTPS";
         dup_rec.type_code = 65;
@@ -1101,6 +1150,7 @@ int main() {
         // Case 3: mandatory SvcParam (key=0) with unordered keys (port,alpn) must encode sorted list (00 01 00 03)
         dns_record_t mand_rec;
         memset(&mand_rec, 0, sizeof(mand_rec));
+        DNS_RECORD_BIND_RDATA(mand_rec);
         mand_rec.name = "example.com.";
         mand_rec.type = "HTTPS";
         mand_rec.type_code = 65;
@@ -1142,6 +1192,7 @@ int main() {
         // Case 4: Generic keyNNN (key667=hello and key667=hello\xd2qoo) character-string encoding (RFC 9460 Appendix D.2)
         dns_record_t gen_rec;
         memset(&gen_rec, 0, sizeof(gen_rec));
+        DNS_RECORD_BIND_RDATA(gen_rec);
         gen_rec.name = "example.com.";
         gen_rec.type = "HTTPS";
         gen_rec.type_code = 65;
@@ -1179,6 +1230,7 @@ int main() {
         // Case 4b: Generic key667 with unescaped byte (hello\xd2qoo)
         dns_record_t gen_rec2;
         memset(&gen_rec2, 0, sizeof(gen_rec2));
+        DNS_RECORD_BIND_RDATA(gen_rec2);
         gen_rec2.name = "example.com.";
         gen_rec2.type = "HTTPS";
         gen_rec2.type_code = 65;
@@ -1214,9 +1266,10 @@ int main() {
             return 1;
         }
 
-        // Case 5: mandatory referencing absent SvcParam must be rejected (RFC 9460 ﾂｧ8)
+        // Case 5: mandatory referencing absent SvcParam must be rejected (RFC 9460 §8)
         dns_record_t incomplete_mand_rec;
         memset(&incomplete_mand_rec, 0, sizeof(incomplete_mand_rec));
+        DNS_RECORD_BIND_RDATA(incomplete_mand_rec);
         incomplete_mand_rec.name = "example.com.";
         incomplete_mand_rec.type = "HTTPS";
         incomplete_mand_rec.type_code = 65;
@@ -1239,6 +1292,7 @@ int main() {
         // Case 5b: mandatory referencing present SvcParams must succeed
         dns_record_t valid_mand_rec;
         memset(&valid_mand_rec, 0, sizeof(valid_mand_rec));
+        DNS_RECORD_BIND_RDATA(valid_mand_rec);
         valid_mand_rec.name = "example.com.";
         valid_mand_rec.type = "HTTPS";
         valid_mand_rec.type_code = 65;
@@ -1260,9 +1314,10 @@ int main() {
             return 1;
         }
 
-        // Case 6: key65535 (Invalid key) must be rejected (RFC 9460 ﾂｧ14.3.2)
+        // Case 6: key65535 (Invalid key) must be rejected (RFC 9460 §14.3.2)
         dns_record_t invalid_key_rec;
         memset(&invalid_key_rec, 0, sizeof(invalid_key_rec));
+        DNS_RECORD_BIND_RDATA(invalid_key_rec);
         invalid_key_rec.name = "example.com.";
         invalid_key_rec.type = "HTTPS";
         invalid_key_rec.type_code = 65;
@@ -1285,6 +1340,7 @@ int main() {
         // Case 7: Malformed "keyABC" must be rejected
         dns_record_t malformed_key_rec;
         memset(&malformed_key_rec, 0, sizeof(malformed_key_rec));
+        DNS_RECORD_BIND_RDATA(malformed_key_rec);
         malformed_key_rec.name = "example.com.";
         malformed_key_rec.type = "HTTPS";
         malformed_key_rec.type_code = 65;
@@ -1389,7 +1445,7 @@ int main() {
         printf("PASS: karictl control secret base64 overflow protection\n");
     }
 
-    // --- Test 17: RFC 10029 ﾂｧ3.3: MQTYPE-Query option with QDCOUNT=0 FORMERR ---
+    // --- Test 17: RFC 10029 §3.3: MQTYPE-Query option with QDCOUNT=0 FORMERR ---
     {
         uint8_t req[512] = {0};
         req[0] = 0x56; req[1] = 0x78;
@@ -1429,7 +1485,7 @@ int main() {
             printf("FAIL: Expected FORMERR (1) response for MQTYPE-Query with QDCOUNT=0\n");
             return 1;
         }
-        printf("PASS: RFC 10029 ﾂｧ3.3 MQTYPE-Query with QDCOUNT=0 FORMERR response\n");
+        printf("PASS: RFC 10029 §3.3 MQTYPE-Query with QDCOUNT=0 FORMERR response\n");
     }
 
     // --- Test 18: BIND-compatible TTL unit suffix parsing (w/d/h/m/s) ---
@@ -1470,7 +1526,7 @@ int main() {
             printf("FAIL: parse_ttl_value('invalid') != 3600\n");
             return 1;
         }
-        // RFC 2181 ﾂｧ8: Maximum TTL clamp (2147483647) for both numeric and unit suffixes
+        // RFC 2181 §8: Maximum TTL clamp (2147483647) for both numeric and unit suffixes
         if (parse_ttl_value("4000000000") != 2147483647) {
             printf("FAIL: parse_ttl_value('4000000000') != 2147483647 (got %u)\n", parse_ttl_value("4000000000"));
             return 1;
@@ -1564,7 +1620,7 @@ int main() {
             .type_code = 257,
             .ttl_value = 3600,
             .rdata_count = 3,
-            .rdata = { "0", long_tag, "letsencrypt.org" }
+            .rdata = (char *[]){ "0", long_tag, "letsencrypt.org" }
         };
         if (serialize_dns_record(buf, sizeof(buf), &off, &caa_rec, &c, NULL, 0) != -1) {
             printf("FAIL: CAA tag_len > 255 was not rejected\n");
@@ -1599,7 +1655,7 @@ int main() {
             .type_code = 51,
             .ttl_value = 0,
             .rdata_count = 4,
-            .rdata = { "1", "0", "70000", "-" }
+            .rdata = (char *[]){ "1", "0", "70000", "-" }
         };
         if (serialize_dns_record(buf, sizeof(buf), &off, &nsec3param_rec, &c, NULL, 0) != -1) {
             printf("FAIL: NSEC3PARAM iterations > 65535 was not rejected\n");
@@ -1722,7 +1778,7 @@ int main() {
             .type_code = 15,
             .ttl_value = 3600,
             .rdata_count = 2,
-            .rdata = { "70000", "mail.example.com." }
+            .rdata = (char *[]){ "70000", "mail.example.com." }
         };
         if (serialize_dns_record(buf, sizeof(buf), &off, &mx_rec, &c, NULL, 0) != -1) {
             printf("FAIL: MX preference > 65535 was not rejected\n");
@@ -1737,7 +1793,7 @@ int main() {
             .type_code = 44,
             .ttl_value = 3600,
             .rdata_count = 3,
-            .rdata = { "300", "1", "123456789abcdef67890123456789abcdef67890" }
+            .rdata = (char *[]){ "300", "1", "123456789abcdef67890123456789abcdef67890" }
         };
         if (serialize_dns_record(buf, sizeof(buf), &off, &sshfp_rec, &c, NULL, 0) != -1) {
             printf("FAIL: SSHFP algorithm > 255 was not rejected\n");
@@ -1752,7 +1808,7 @@ int main() {
             .type_code = 33,
             .ttl_value = 3600,
             .rdata_count = 4,
-            .rdata = { "10", "60", "-1", "sip.example.com." }
+            .rdata = (char *[]){ "10", "60", "-1", "sip.example.com." }
         };
         if (serialize_dns_record(buf, sizeof(buf), &off, &srv_rec, &c, NULL, 0) != -1) {
             printf("FAIL: SRV port < 0 was not rejected\n");
@@ -1775,7 +1831,7 @@ int main() {
             .type_code = 37,
             .ttl_value = 3600,
             .rdata_count = 4,
-            .rdata = { "99999", "12345", "8", "QUFB" }
+            .rdata = (char *[]){ "99999", "12345", "8", "QUFB" }
         };
         if (serialize_dns_record(buf, sizeof(buf), &off, &cert_rec, &c, NULL, 0) != -1) {
             printf("FAIL: CERT type > 65535 was not rejected\n");
@@ -1947,7 +2003,7 @@ int main() {
         printf("PASS: RRL token refill 32-bit overflow & normal refill test\n");
     }
 
-    // --- Test 27: RFC 4034 ﾂｧ6.1 Canonical ordering & NSEC non-existence proof tests ---
+    // --- Test 27: RFC 4034 §6.1 Canonical ordering & NSEC non-existence proof tests ---
     {
         // 1. Canonical DNS name comparison tests
         if (compare_canonical_name("example.com.", "example.com.") != 0) {
@@ -2048,10 +2104,10 @@ int main() {
 
         free(zone_copy);
         zone_arena_destroy(&arena);
-        printf("PASS: RFC 4034 ﾂｧ6.1 Canonical ordering & NSEC index tests\n");
+        printf("PASS: RFC 4034 §6.1 Canonical ordering & NSEC index tests\n");
     }
 
-    // --- Test 28: RFC 4592 ﾂｧ3.3.1 Closest encloser & empty non-terminal wildcard tests ---
+    // --- Test 28: RFC 4592 §3.3.1 Closest encloser & empty non-terminal wildcard tests ---
     {
         zone_arena_t arena;
         zone_arena_init(&arena);
@@ -2191,7 +2247,7 @@ int main() {
 
         free(zone_copy);
         zone_arena_destroy(&arena);
-        printf("PASS: RFC 4592 ﾂｧ3.3.1 Closest encloser & empty non-terminal wildcard tests\n");
+        printf("PASS: RFC 4592 §3.3.1 Closest encloser & empty non-terminal wildcard tests\n");
     }
 
     // --- Test 29: RFC 1982 Serial arithmetic & wraparound tests ---
@@ -2419,7 +2475,7 @@ int main() {
         printf("PASS: DNS record type parsing & non-fatal type resolution test\n");
     }
 
-    // --- Test 33: Multiple EDNS OPT RR rejection (RFC 6891 ﾂｧ6.1.1) and RCODE bitmask test ---
+    // --- Test 33: Multiple EDNS OPT RR rejection (RFC 6891 §6.1.1) and RCODE bitmask test ---
     {
         uint8_t pkt[512];
         memset(pkt, 0, sizeof(pkt));
@@ -2461,7 +2517,7 @@ int main() {
 
         int ret2 = parse_edns_opt(pkt, off, 1, 0, 0, 2, &edns);
         if (ret2 != -1) {
-            printf("FAIL: parse_edns_opt should return -1 on multiple OPT RRs per RFC 6891 ﾂｧ6.1.1\n");
+            printf("FAIL: parse_edns_opt should return -1 on multiple OPT RRs per RFC 6891 §6.1.1\n");
             return 1;
         }
 
@@ -2609,15 +2665,15 @@ int main() {
             return 1;
         }
 
-        if (!cfg.zones || !cfg.zones->notify_source ||
-            strcmp(cfg.zones->notify_source, "192.168.1.1") != 0) {
+        if (!cfg.views->zones || !zext(cfg.views->zones)->notify_source ||
+            strcmp(zext(cfg.views->zones)->notify_source, "192.168.1.1") != 0) {
             printf("FAIL: notify_source not parsed properly\n");
             free_server_config_fields(&cfg);
             return 1;
         }
 
         struct in_addr src_ip;
-        if (inet_pton(AF_INET, cfg.zones->notify_source, &src_ip) != 1) {
+        if (inet_pton(AF_INET, zext(cfg.views->zones)->notify_source, &src_ip) != 1) {
             printf("FAIL: inet_pton failed on parsed notify_source\n");
             free_server_config_fields(&cfg);
             return 1;
@@ -2710,7 +2766,7 @@ int main() {
         printf("PASS: SOA RRSIG covering record parsing and serialization for DNSSEC negative responses\n");
     }
 
-    // --- Test 37: Delegation point DS record (RFC 4035 ﾂｧ3.1.4.1) in parent zone ---
+    // --- Test 37: Delegation point DS record (RFC 4035 §3.1.4.1) in parent zone ---
     {
         const char *zone_text =
             "$ORIGIN example.com.\n"
@@ -2788,10 +2844,10 @@ int main() {
 
         free(zone_copy);
         zone_arena_destroy(&arena);
-        printf("PASS: Delegation point DS record & RRSIG parsing and lookup (RFC 4035 ﾂｧ3.1.4.1)\n");
+        printf("PASS: Delegation point DS record & RRSIG parsing and lookup (RFC 4035 §3.1.4.1)\n");
     }
 
-    // --- Test 38: RFC 1035 ﾂｧ3.1 Domain Name Length Validation (label <= 63, wire total <= 255) ---
+    // --- Test 38: RFC 1035 §3.1 Domain Name Length Validation (label <= 63, wire total <= 255) ---
     {
         // 1. Label exceeds 63 octets (64 'a's)
         const char *long_label_zone =
@@ -2862,7 +2918,7 @@ int main() {
             return 1;
         }
 
-        printf("PASS: RFC 1035 ﾂｧ3.1 Domain Name Length Validation (label <= 63, wire total <= 255)\n");
+        printf("PASS: RFC 1035 §3.1 Domain Name Length Validation (label <= 63, wire total <= 255)\n");
     }
 
     // --- Test 39: Duplicate zone/view/key block rejection & FIFO key order ---
@@ -2878,7 +2934,7 @@ int main() {
             printf("FAIL: Valid multiple top-level zones failed to parse\n");
             return 1;
         }
-        if (!cfg_vz.zones || !cfg_vz.zones->next) {
+        if (!cfg_vz.views || !cfg_vz.views->zones || !cfg_vz.views->zones->next) {
             printf("FAIL: Valid multiple top-level zones count mismatch\n");
             free_server_config_fields(&cfg_vz);
             return 1;
@@ -3008,9 +3064,9 @@ int main() {
             printf("FAIL: type primary should be accepted\n");
             return 1;
         }
-        if (!cfg1.zones || strcmp(cfg1.zones->type, "master") != 0) {
+        if (!CFG_ZONES(cfg1) || strcmp(CFG_ZONES(cfg1)->type, "master") != 0) {
             printf("FAIL: type primary should be normalized to master (got %s)\n",
-                   cfg1.zones ? cfg1.zones->type : "NULL");
+                   CFG_ZONES(cfg1) ? CFG_ZONES(cfg1)->type : "NULL");
             free_server_config_fields(&cfg1);
             return 1;
         }
@@ -3026,9 +3082,9 @@ int main() {
             printf("FAIL: type secondary should be accepted\n");
             return 1;
         }
-        if (!cfg2.zones || strcmp(cfg2.zones->type, "slave") != 0) {
+        if (!CFG_ZONES(cfg2) || strcmp(CFG_ZONES(cfg2)->type, "slave") != 0) {
             printf("FAIL: type secondary should be normalized to slave (got %s)\n",
-                   cfg2.zones ? cfg2.zones->type : "NULL");
+                   CFG_ZONES(cfg2) ? CFG_ZONES(cfg2)->type : "NULL");
             free_server_config_fields(&cfg2);
             return 1;
         }
@@ -3044,9 +3100,9 @@ int main() {
             printf("FAIL: type master should be accepted\n");
             return 1;
         }
-        if (!cfg_m.zones || strcmp(cfg_m.zones->type, "master") != 0) {
+        if (!CFG_ZONES(cfg_m) || strcmp(CFG_ZONES(cfg_m)->type, "master") != 0) {
             printf("FAIL: type master should be master (got %s)\n",
-                   cfg_m.zones ? cfg_m.zones->type : "NULL");
+                   CFG_ZONES(cfg_m) ? CFG_ZONES(cfg_m)->type : "NULL");
             free_server_config_fields(&cfg_m);
             return 1;
         }
@@ -3062,9 +3118,9 @@ int main() {
             printf("FAIL: type slave should be accepted\n");
             return 1;
         }
-        if (!cfg_s.zones || strcmp(cfg_s.zones->type, "slave") != 0) {
+        if (!CFG_ZONES(cfg_s) || strcmp(CFG_ZONES(cfg_s)->type, "slave") != 0) {
             printf("FAIL: type slave should be slave (got %s)\n",
-                   cfg_s.zones ? cfg_s.zones->type : "NULL");
+                   CFG_ZONES(cfg_s) ? CFG_ZONES(cfg_s)->type : "NULL");
             free_server_config_fields(&cfg_s);
             return 1;
         }
@@ -3102,8 +3158,8 @@ int main() {
             printf("FAIL: master zone with allow-update failed to parse\n");
             return 1;
         }
-        if (!cfg1.zones || cfg1.zones->allow_update_count != 1 ||
-            strcmp(cfg1.zones->allow_update[0], "upd-key") != 0) {
+        if (!CFG_ZONES(cfg1) || zext(CFG_ZONES(cfg1))->allow_update_count != 1 ||
+            strcmp(zext(CFG_ZONES(cfg1))->allow_update[0], "upd-key") != 0) {
             printf("FAIL: allow-update ACL mismatch on master zone\n");
             free_server_config_fields(&cfg1);
             return 1;
@@ -3120,9 +3176,9 @@ int main() {
             printf("FAIL: zone without explicit type failed to parse\n");
             return 1;
         }
-        if (!cfg2.zones || !cfg2.zones->type || strcmp(cfg2.zones->type, "master") != 0) {
+        if (!CFG_ZONES(cfg2) || !CFG_ZONES(cfg2)->type || strcmp(CFG_ZONES(cfg2)->type, "master") != 0) {
             printf("FAIL: zone without explicit type should default to master (got %s)\n",
-                   (cfg2.zones && cfg2.zones->type) ? cfg2.zones->type : "NULL");
+                   (CFG_ZONES(cfg2) && CFG_ZONES(cfg2)->type) ? CFG_ZONES(cfg2)->type : "NULL");
             free_server_config_fields(&cfg2);
             return 1;
         }
@@ -3248,12 +3304,12 @@ int main() {
             printf("FAIL: allow-transfer with multiple keys should parse safely\n");
             return 1;
         }
-        if (!cfg2.zones || cfg2.zones->tsig_keys_count != 2 ||
-            !cfg2.zones->tsig_keys ||
-            strcmp(cfg2.zones->tsig_keys[0], "key1") != 0 ||
-            strcmp(cfg2.zones->tsig_keys[1], "key2") != 0) {
+        if (!CFG_ZONES(cfg2) || zext(CFG_ZONES(cfg2))->tsig_keys_count != 2 ||
+            !zext(CFG_ZONES(cfg2))->tsig_keys ||
+            strcmp(zext(CFG_ZONES(cfg2))->tsig_keys[0], "key1") != 0 ||
+            strcmp(zext(CFG_ZONES(cfg2))->tsig_keys[1], "key2") != 0) {
             printf("FAIL: allow-transfer with multiple keys should retain both keys 'key1' and 'key2' (count=%d)\n",
-                   cfg2.zones ? cfg2.zones->tsig_keys_count : -1);
+                   CFG_ZONES(cfg2) ? zext(CFG_ZONES(cfg2))->tsig_keys_count : -1);
             free_server_config_fields(&cfg2);
             return 1;
         }
@@ -3456,10 +3512,10 @@ int main() {
             return 1;
         }
 
-        zone_config_t *zcfg = cfg_mk.zones;
-        if (!zcfg || zcfg->tsig_keys_count != 2 || !zcfg->tsig_keys ||
-            strcmp(zcfg->tsig_keys[0], "keyA") != 0 || strcmp(zcfg->tsig_keys[1], "keyB") != 0) {
-            printf("FAIL: zcfg tsig_keys not populated correctly (count=%d)\n", zcfg ? zcfg->tsig_keys_count : -1);
+        zone_config_t *zcfg = CFG_ZONES(cfg_mk);
+        if (!zcfg || zext(zcfg)->tsig_keys_count != 2 || !zext(zcfg)->tsig_keys ||
+            strcmp(zext(zcfg)->tsig_keys[0], "keyA") != 0 || strcmp(zext(zcfg)->tsig_keys[1], "keyB") != 0) {
+            printf("FAIL: zcfg tsig_keys not populated correctly (count=%d)\n", zcfg ? zext(zcfg)->tsig_keys_count : -1);
             free_server_config_fields(&cfg_mk);
             return 1;
         }

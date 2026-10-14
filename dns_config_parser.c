@@ -357,92 +357,179 @@ void free_rate_limit_config(rate_limit_config_t *rrl) {
   rrl->exempt_clients_count = 0;
 }
 
+const zone_ext_t zone_ext_default = {0}; /* 全ゼロ = すべて既定 */
+
+zone_ext_t *zone_ext_mut(zone_config_t *z) {
+  if (!z->ext) z->ext = calloc(1, sizeof(*z->ext));
+  return z->ext;
+}
+
+static void free_zone_ext(zone_ext_t *x) {
+  if (!x)
+    return;
+  for (int i = 0; i < x->masters_count; i++)
+    free(x->masters[i].ip);
+  free(x->masters);
+  if (x->masters_parsed) {
+    free(x->masters_parsed);
+    x->masters_parsed = NULL;
+  }
+  free(x->tsig_key);
+  for (int i = 0; i < x->tsig_keys_count; i++)
+    free(x->tsig_keys[i]);
+  free(x->tsig_keys);
+  for (int i = 0; i < x->also_notify_count; i++)
+    free(x->also_notify[i].ip);
+  free(x->also_notify);
+  free(x->notify_source);
+  for (int i = 0; i < x->allow_transfer_count; i++)
+    free(x->allow_transfer[i]);
+  free(x->allow_transfer);
+  if (x->allow_transfer_parsed) {
+    free(x->allow_transfer_parsed);
+    x->allow_transfer_parsed = NULL;
+  }
+  for (int i = 0; i < x->allow_update_count; i++)
+    free(x->allow_update[i]);
+  free(x->allow_update);
+  if (x->allow_update_parsed) {
+    free(x->allow_update_parsed);
+    x->allow_update_parsed = NULL;
+  }
+  free(x->program_path);
+  for (int i = 0; i < x->program_args_count; i++)
+    free(x->program_args[i]);
+  free(x->program_args);
+  free(x->program_user);
+  for (int i = 0; i < x->forwarders_count; i++)
+    free(x->forwarders[i].ip);
+  free(x->forwarders);
+  free(x->file_format);
+  free_rate_limit_config(&x->rrl);
+  if (x->ecs_tags) {
+    for (int i = 0; i < x->ecs_tag_count; i++) {
+      free(x->ecs_tags[i].tag);
+      for (int j = 0; j < x->ecs_tags[i].cidr_count; j++) {
+        free(x->ecs_tags[i].cidrs[j].cidr);
+      }
+      free(x->ecs_tags[i].cidrs);
+    }
+    free(x->ecs_tags);
+    x->ecs_tags = NULL;
+    x->ecs_tag_count = 0;
+  }
+  if (x->location_tags) {
+    for (int i = 0; i < x->location_tag_count; i++) {
+      free(x->location_tags[i].tag);
+      for (int j = 0; j < x->location_tags[i].cidr_count; j++) {
+        free(x->location_tags[i].cidrs[j].cidr);
+      }
+      free(x->location_tags[i].cidrs);
+    }
+    free(x->location_tags);
+    x->location_tags = NULL;
+    x->location_tag_count = 0;
+  }
+  if (x->ecs_trusted_resolvers) {
+    for (int i = 0; i < x->ecs_trusted_resolvers_count; i++) {
+      free(x->ecs_trusted_resolvers[i]);
+    }
+    free(x->ecs_trusted_resolvers);
+    x->ecs_trusted_resolvers = NULL;
+    x->ecs_trusted_resolvers_count = 0;
+  }
+  if (x->ecs_trusted_resolvers_parsed) {
+    free(x->ecs_trusted_resolvers_parsed);
+    x->ecs_trusted_resolvers_parsed = NULL;
+  }
+  free(x);
+}
+
 void free_zone_config(zone_config_t *zone) {
   if (!zone)
     return;
   free(zone->domain);
   free(zone->type);
   free(zone->file);
-  for (int i = 0; i < zone->masters_count; i++)
-    free(zone->masters[i].ip);
-  free(zone->masters);
-  if (zone->masters_parsed) {
-    free(zone->masters_parsed);
-    zone->masters_parsed = NULL;
-  }
-  free(zone->tsig_key);
-  for (int i = 0; i < zone->tsig_keys_count; i++)
-    free(zone->tsig_keys[i]);
-  free(zone->tsig_keys);
-  for (int i = 0; i < zone->also_notify_count; i++)
-    free(zone->also_notify[i].ip);
-  free(zone->also_notify);
-  free(zone->notify_source);
-  for (int i = 0; i < zone->allow_transfer_count; i++)
-    free(zone->allow_transfer[i]);
-  free(zone->allow_transfer);
-  if (zone->allow_transfer_parsed) {
-    free(zone->allow_transfer_parsed);
-    zone->allow_transfer_parsed = NULL;
-  }
-  for (int i = 0; i < zone->allow_update_count; i++)
-    free(zone->allow_update[i]);
-  free(zone->allow_update);
-  if (zone->allow_update_parsed) {
-    free(zone->allow_update_parsed);
-    zone->allow_update_parsed = NULL;
-  }
-  free(zone->program_path);
-  for (int i = 0; i < zone->program_args_count; i++)
-    free(zone->program_args[i]);
-  free(zone->program_args);
-  free(zone->program_user);
-  for (int i = 0; i < zone->forwarders_count; i++)
-    free(zone->forwarders[i].ip);
-  free(zone->forwarders);
-  free(zone->file_format);
-  free_rate_limit_config(&zone->rrl);
-  if (zone->ecs_tags) {
-    for (int i = 0; i < zone->ecs_tag_count; i++) {
-      free(zone->ecs_tags[i].tag);
-      for (int j = 0; j < zone->ecs_tags[i].cidr_count; j++) {
-        free(zone->ecs_tags[i].cidrs[j].cidr);
-      }
-      free(zone->ecs_tags[i].cidrs);
-    }
-    free(zone->ecs_tags);
-    zone->ecs_tags = NULL;
-    zone->ecs_tag_count = 0;
-  }
-  if (zone->location_tags) {
-    for (int i = 0; i < zone->location_tag_count; i++) {
-      free(zone->location_tags[i].tag);
-      for (int j = 0; j < zone->location_tags[i].cidr_count; j++) {
-        free(zone->location_tags[i].cidrs[j].cidr);
-      }
-      free(zone->location_tags[i].cidrs);
-    }
-    free(zone->location_tags);
-    zone->location_tags = NULL;
-    zone->location_tag_count = 0;
-  }
-  if (zone->ecs_trusted_resolvers) {
-    for (int i = 0; i < zone->ecs_trusted_resolvers_count; i++) {
-      free(zone->ecs_trusted_resolvers[i]);
-    }
-    free(zone->ecs_trusted_resolvers);
-    zone->ecs_trusted_resolvers = NULL;
-    zone->ecs_trusted_resolvers_count = 0;
-  }
-  if (zone->ecs_trusted_resolvers_parsed) {
-    free(zone->ecs_trusted_resolvers_parsed);
-    zone->ecs_trusted_resolvers_parsed = NULL;
-  }
+  free_zone_ext(zone->ext);
   free(zone);
+}
+
+void zone_cfg_index_free(zone_cfg_index_t *ix) {
+  if (!ix) return;
+  free(ix->slots);
+  memset(ix, 0, sizeof(*ix));
+}
+
+static zone_config_t *zone_cfg_index_find(const zone_cfg_index_t *ix, const char *domain) {
+  for (uint32_t i = dns_name_hash_ci(domain) & ix->mask; ix->slots[i]; i = (i + 1) & ix->mask) {
+    if (domain_names_match_ci(ix->slots[i]->domain, domain)) return ix->slots[i];
+  }
+  return NULL;
+}
+
+int zone_cfg_index_insert(zone_cfg_index_t *ix, zone_config_t *z, zone_config_t **dup) {
+  if (dup) *dup = NULL;
+  if (!z || !z->domain) return 0;
+  if (ix->slots) {
+    zone_config_t *found = zone_cfg_index_find(ix, z->domain);
+    if (found) {
+      if (dup) *dup = found;
+      return 1;
+    }
+  }
+  /* 使用率を 1/2 以下に保つ (線形探索の探索長を短くする) */
+  if (!ix->slots || (size_t)(ix->count + 1) * 2 > (size_t)ix->mask + 1) {
+    size_t cap = ix->slots ? ((size_t)ix->mask + 1) * 2 : 16;
+    if (cap > UINT32_MAX) return -1;
+    zone_config_t **slots = calloc(cap, sizeof(*slots));
+    if (!slots) return -1;
+    uint32_t mask = (uint32_t)(cap - 1);
+    for (uint32_t k = 0; ix->slots && k <= ix->mask; k++) {
+      zone_config_t *old = ix->slots[k];
+      if (!old) continue;
+      uint32_t i = dns_name_hash_ci(old->domain) & mask;
+      while (slots[i]) i = (i + 1) & mask;
+      slots[i] = old;
+    }
+    free(ix->slots);
+    ix->slots = slots;
+    ix->mask = mask;
+  }
+  uint32_t i = dns_name_hash_ci(z->domain) & ix->mask;
+  while (ix->slots[i]) i = (i + 1) & ix->mask;
+  ix->slots[i] = z;
+  ix->count++;
+  return 0;
+}
+
+zone_config_t *view_find_zone_config(const view_config_t *v, const char *domain) {
+  if (!v || !domain) return NULL;
+  if (v->zone_index.slots) return zone_cfg_index_find(&v->zone_index, domain);
+  for (zone_config_t *z = v->zones; z; z = z->next) {
+    if (domain_names_match_ci(z->domain, domain)) return z;
+  }
+  return NULL;
+}
+
+zone_config_t *config_find_zone_any_view(const server_config_t *cfg, const char *domain) {
+  if (!cfg || !domain) return NULL;
+  if (cfg->views) {
+    for (const view_config_t *v = cfg->views; v; v = v->next) {
+      zone_config_t *z = view_find_zone_config(v, domain);
+      if (z) return z;
+    }
+    return NULL;
+  }
+  for (zone_config_t *z = cfg->zones; z; z = z->next) {
+    if (domain_names_match_ci(z->domain, domain)) return z;
+  }
+  return NULL;
 }
 
 static void free_partial_view(view_config_t *view) {
   if (!view) return;
+  zone_cfg_index_free(&view->zone_index);
   if (view->name) free(view->name);
   for (int i = 0; i < view->match_clients_count; i++) free(view->match_clients[i]);
   if (view->match_clients) free(view->match_clients);
@@ -582,17 +669,10 @@ void free_server_config_fields(server_config_t *cfg) {
   if (cfg->nsid_string) { free(cfg->nsid_string); cfg->nsid_string = NULL; }
   OPENSSL_cleanse(cfg->cookie_secrets, sizeof(cfg->cookie_secrets));
   cfg->cookie_secret_count = 0;
+  zone_cfg_index_free(&cfg->top_zone_index);
 
-  if (cfg->zones_are_flat) {
-    zone_config_t *curr_flat = cfg->zones;
-    while (curr_flat) {
-      zone_config_t *next = curr_flat->next;
-      free(curr_flat);
-      curr_flat = next;
-    }
-    cfg->zones = NULL;
-    cfg->zones_are_flat = false;
-  } else {
+  /* パース中のトップレベル zone (パース済みの設定では既定の view に移っていて NULL) */
+  {
     zone_config_t *curr = cfg->zones;
     while (curr) {
       zone_config_t *next = curr->next;
@@ -605,6 +685,7 @@ void free_server_config_fields(server_config_t *cfg) {
   view_config_t *v = cfg->views;
   while (v) {
     view_config_t *next_v = v->next;
+    zone_cfg_index_free(&v->zone_index);
     if (v->name) free(v->name);
     for (int i = 0; i < v->match_clients_count; i++) free(v->match_clients[i]);
     if (v->match_clients) free(v->match_clients);
@@ -1521,11 +1602,17 @@ notify_retry_config_t notify_retry_effective(const server_config_t *cfg, const z
     r.backoff = cfg->notify_retry.backoff;
   }
   if (zone) {
-    if (zone->notify_retry.retries_set) r.retries = zone->notify_retry.retries;
-    if (zone->notify_retry.interval_set) r.interval = zone->notify_retry.interval;
-    if (zone->notify_retry.backoff_set) r.backoff = zone->notify_retry.backoff;
+    const zone_ext_t *x = zext(zone);
+    if (x->notify_retry.retries_set) r.retries = x->notify_retry.retries;
+    if (x->notify_retry.interval_set) r.interval = x->notify_retry.interval;
+    if (x->notify_retry.backoff_set) r.backoff = x->notify_retry.backoff;
   }
   return r;
+}
+
+int ixfr_history_effective(const server_config_t *cfg, const zone_config_t *zone) {
+  if (zone && zext(zone)->ixfr_history_set) return zext(zone)->ixfr_history;
+  return cfg ? cfg->ixfr_history : IXFR_HISTORY_DEFAULT;
 }
 
 static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
@@ -1541,7 +1628,15 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
     if (ctx) ctx->error_occurred = true;
     return -1;
   }
-  zone->disable_auto_tc_flag = false; // default no
+  /* 指定されたオプションはまず x に溜め、1 つも指定が無ければ最後に捨てる (zone->ext == NULL = 全既定) */
+  zone_ext_t *x = safe_calloc_or_die(1, sizeof(zone_ext_t));
+  if (!x) {
+    free(zone);
+    free_token(&tok);
+    if (ctx) ctx->error_occurred = true;
+    return -1;
+  }
+  zone->ext = x;
   zone->domain = tok.value;
   tok.value = NULL;
   free_token(&tok);
@@ -1594,40 +1689,40 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
     tok.value = NULL;
     free_token(&tok);
     if (strcmp(key, "masters") == 0) {
-      if (parse_ip_port_list(ctx, &zone->masters, &zone->masters_count) !=
+      if (parse_ip_port_list(ctx, &x->masters, &x->masters_count) !=
           0) {
         free(key);
         free_zone_config(zone);
         return -1;
       }
-      if (zone->masters_count > 0 && zone->masters) {
-        free(zone->masters_parsed);
-        zone->masters_parsed = calloc(zone->masters_count, sizeof(cidr_entry_t));
-        if (zone->masters_parsed) {
-          for (int i = 0; i < zone->masters_count; i++) {
-            cidr_entry_parse(&zone->masters_parsed[i], zone->masters[i].ip);
+      if (x->masters_count > 0 && x->masters) {
+        free(x->masters_parsed);
+        x->masters_parsed = calloc(x->masters_count, sizeof(cidr_entry_t));
+        if (x->masters_parsed) {
+          for (int i = 0; i < x->masters_count; i++) {
+            cidr_entry_parse(&x->masters_parsed[i], x->masters[i].ip);
           }
         }
       }
     } else if (strcmp(key, "also-notify") == 0) {
-      if (parse_ip_port_list(ctx, &zone->also_notify,
-                             &zone->also_notify_count) != 0) {
+      if (parse_ip_port_list(ctx, &x->also_notify,
+                             &x->also_notify_count) != 0) {
         free(key);
         free_zone_config(zone);
         return -1;
       }
     } else if (strcmp(key, "allow-transfer") == 0) {
-      if (parse_acl_list(ctx, &zone->allow_transfer, &zone->allow_transfer_count, ACL_KEY_AS_TSIG_FIELD, &zone->tsig_keys, &zone->tsig_keys_count) != 0) {
+      if (parse_acl_list(ctx, &x->allow_transfer, &x->allow_transfer_count, ACL_KEY_AS_TSIG_FIELD, &x->tsig_keys, &x->tsig_keys_count) != 0) {
         free(key); free_zone_config(zone); return -1;
       }
-      free(zone->allow_transfer_parsed);
-      zone->allow_transfer_parsed = acl_list_parse(zone->allow_transfer, zone->allow_transfer_count);
+      free(x->allow_transfer_parsed);
+      x->allow_transfer_parsed = acl_list_parse(x->allow_transfer, x->allow_transfer_count);
     } else if (strcmp(key, "allow-update") == 0) {
-      if (parse_acl_list(ctx, &zone->allow_update, &zone->allow_update_count, ACL_KEY_AS_LIST_ENTRY, NULL, NULL) != 0) {
+      if (parse_acl_list(ctx, &x->allow_update, &x->allow_update_count, ACL_KEY_AS_LIST_ENTRY, NULL, NULL) != 0) {
         free(key); free_zone_config(zone); return -1;
       }
-      free(zone->allow_update_parsed);
-      zone->allow_update_parsed = acl_list_parse(zone->allow_update, zone->allow_update_count);
+      free(x->allow_update_parsed);
+      x->allow_update_parsed = acl_list_parse(x->allow_update, x->allow_update_count);
     } else if (strcmp(key, "type") == 0 || strcmp(key, "file") == 0 ||
                strcmp(key, "file-format") == 0 ||
                strcmp(key, "tsig-key") == 0 ||
@@ -1693,12 +1788,12 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
           free_zone_config(zone);
           return -1;
         }
-        zone->file_format = val;
+        x->file_format = val;
       }
       else if (strcmp(key, "tsig-key") == 0)
-        zone->tsig_key = val;
+        x->tsig_key = val;
       else if (strcmp(key, "notify-source") == 0)
-        zone->notify_source = val;
+        x->notify_source = val;
       else if (strcmp(key, "catalog-zone") == 0) {
         if (!parse_config_bool(val, &zone->is_catalog)) {
           report_bad_bool(ctx, zone->domain, key, val);
@@ -1712,25 +1807,25 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
     } else if (strcmp(key, "program") == 0) {
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_STRING) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
-      if (zone->program_path) free(zone->program_path);
-      zone->program_path = tok.value;
+      if (x->program_path) free(x->program_path);
+      x->program_path = tok.value;
       tok.value = NULL;
       free_token(&tok);
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
       free_token(&tok);
     } else if (strcmp(key, "program-args") == 0) {
-      if (parse_string_list(ctx, &zone->program_args, &zone->program_args_count) != 0) {
+      if (parse_string_list(ctx, &x->program_args, &x->program_args_count) != 0) {
         free(key); free_zone_config(zone); return -1;
       }
     } else if (strcmp(key, "program-user") == 0) {
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_STRING) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
-      if (zone->program_user) free(zone->program_user);
-      zone->program_user = tok.value;
+      if (x->program_user) free(x->program_user);
+      x->program_user = tok.value;
       tok.value = NULL;
       free_token(&tok);
-      if (!zone->program_user) { free(key); free_zone_config(zone); if (ctx) ctx->error_occurred = true; return -1; }
+      if (!x->program_user) { free(key); free_zone_config(zone); if (ctx) ctx->error_occurred = true; return -1; }
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
       free_token(&tok);
@@ -1740,7 +1835,7 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       char *endptr = NULL;
       unsigned long val_num = strtoul(tok.value, &endptr, 10);
       if (*endptr == '\0') {
-        zone->program_timeout_ms = (uint32_t)val_num;
+        x->program_timeout_ms = (uint32_t)val_num;
       }
       free_token(&tok);
       tok = get_next_token(ctx);
@@ -1752,14 +1847,14 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       char *endptr = NULL;
       unsigned long val_num = strtoul(tok.value, &endptr, 10);
       if (*endptr == '\0') {
-        zone->program_max_failures = (uint32_t)val_num;
+        x->program_max_failures = (uint32_t)val_num;
       }
       free_token(&tok);
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
       free_token(&tok);
     } else if (strcmp(key, "forwarders") == 0) {
-      if (parse_ip_port_list(ctx, &zone->forwarders, &zone->forwarders_count) != 0) {
+      if (parse_ip_port_list(ctx, &x->forwarders, &x->forwarders_count) != 0) {
         free(key); free_zone_config(zone); return -1;
       }
     } else if (strcmp(key, "forward-timeout") == 0) {
@@ -1768,39 +1863,39 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       char *endptr = NULL;
       unsigned long val_num = strtoul(tok.value, &endptr, 10);
       if (*endptr == '\0') {
-        zone->forward_timeout_ms = (uint32_t)val_num;
+        x->forward_timeout_ms = (uint32_t)val_num;
       }
       free_token(&tok);
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
       free_token(&tok);
     } else if (strcmp(key, "rate-limit") == 0) {
-      if (parse_rate_limit_config(ctx, &zone->rrl) != 0) {
+      if (parse_rate_limit_config(ctx, &x->rrl) != 0) {
         free(key);
         free_zone_config(zone);
         return -1;
       }
     } else if (strcmp(key, "ecs-tags") == 0) {
-      if (parse_ecs_tags_block(ctx, &zone->ecs_tags, &zone->ecs_tag_count) != 0) {
+      if (parse_ecs_tags_block(ctx, &x->ecs_tags, &x->ecs_tag_count) != 0) {
         free(key);
         free_zone_config(zone);
         return -1;
       }
     } else if (strcmp(key, "location-tags") == 0) {
-      if (parse_ecs_tags_block(ctx, &zone->location_tags, &zone->location_tag_count) != 0) {
+      if (parse_ecs_tags_block(ctx, &x->location_tags, &x->location_tag_count) != 0) {
         free(key);
         free_zone_config(zone);
         return -1;
       }
     } else if (strcmp(key, "ecs-trusted-resolvers") == 0) {
-      if (parse_string_list(ctx, &zone->ecs_trusted_resolvers,
-                            &zone->ecs_trusted_resolvers_count) != 0) {
+      if (parse_string_list(ctx, &x->ecs_trusted_resolvers,
+                            &x->ecs_trusted_resolvers_count) != 0) {
         free(key);
         free_zone_config(zone);
         return -1;
       }
-      free(zone->ecs_trusted_resolvers_parsed);
-      zone->ecs_trusted_resolvers_parsed = acl_list_parse(zone->ecs_trusted_resolvers, zone->ecs_trusted_resolvers_count);
+      free(x->ecs_trusted_resolvers_parsed);
+      x->ecs_trusted_resolvers_parsed = acl_list_parse(x->ecs_trusted_resolvers, x->ecs_trusted_resolvers_count);
     } else if (strcmp(key, "additional-from-auth") == 0) {
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_STRING) {
@@ -1809,8 +1904,8 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         free_token(&tok);
         return -1;
       }
-      zone->additional_from_auth_specified = true;
-      if (!parse_additional_from_auth(tok.value, &zone->additional_from_auth)) {
+      x->additional_from_auth_specified = true;
+      if (!parse_additional_from_auth(tok.value, &x->additional_from_auth)) {
         report_bad_value(ctx, zone->domain, key, tok.value, "yes, no or in-domain");
         free(key);
         free_zone_config(zone);
@@ -1834,7 +1929,7 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         free_token(&tok);
         return -1;
       }
-      if (!parse_config_bool(tok.value, &zone->disable_auto_tc_flag)) {
+      if (!parse_config_bool(tok.value, &x->disable_auto_tc_flag)) {
         report_bad_bool(ctx, zone->domain, key, tok.value);
         free(key);
         free_zone_config(zone);
@@ -1850,8 +1945,17 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         return -1;
       }
       free_token(&tok);
+    } else if (strcmp(key, "ixfr-history") == 0) {
+      int v = 0;
+      if (parse_transport_param(ctx, zone->domain, key, false, 0, IXFR_HISTORY_MAX, &v) != 0) {
+        free(key);
+        free_zone_config(zone);
+        return -1;
+      }
+      x->ixfr_history = (uint8_t)v;
+      x->ixfr_history_set = true;
     } else if (strncmp(key, "notify-retr", 11) == 0 &&
-               (nr_rc = parse_notify_retry_option(ctx, zone->domain, key, &zone->notify_retry)) != 0) {
+               (nr_rc = parse_notify_retry_option(ctx, zone->domain, key, &x->notify_retry)) != 0) {
       if (nr_rc < 0) {
         free(key);
         free_zone_config(zone);
@@ -1872,10 +1976,10 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         free_zone_config(zone);
         return -1;
       }
-      if (strcmp(key, "zone-tcp-mss") == 0) zone->zone_tcp_mss = v;
-      else if (strcmp(key, "zone-tcp-window") == 0) zone->zone_tcp_window = v;
-      else if (strcmp(key, "zone-tcp-sndbuf") == 0) zone->zone_tcp_sndbuf = v;
-      else zone->zone_udp_bufsize = (uint16_t)v;
+      if (strcmp(key, "zone-tcp-mss") == 0) x->zone_tcp_mss = v;
+      else if (strcmp(key, "zone-tcp-window") == 0) x->zone_tcp_window = v;
+      else if (strcmp(key, "zone-tcp-sndbuf") == 0) x->zone_tcp_sndbuf = v;
+      else x->zone_udp_bufsize = (uint16_t)v;
     } else
       skip_unknown_block(ctx);
     free(key);
@@ -1895,7 +1999,7 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
     if (zone->file) {
       syslog(LOG_WARNING, "[Config] Zone '%s' is type 'program' but has 'file' configured; ignoring file", zone->domain);
     }
-    if (zone->masters_count > 0) {
+    if (x->masters_count > 0) {
       syslog(LOG_WARNING, "[Config] Zone '%s' is type 'program' but has 'masters' configured; ignoring masters", zone->domain);
     }
   }
@@ -1903,11 +2007,11 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
     if (zone->file) {
       syslog(LOG_WARNING, "[Config] Zone '%s' is type 'forward' but has 'file' configured; ignoring file", zone->domain);
     }
-    if (zone->masters_count > 0) {
+    if (x->masters_count > 0) {
       syslog(LOG_WARNING, "[Config] Zone '%s' is type 'forward' but has 'masters' configured; ignoring masters", zone->domain);
     }
   }
-  if (zone->allow_update_count > 0 && zone->type &&
+  if (x->allow_update_count > 0 && zone->type &&
       (strcasecmp(zone->type, "slave") == 0 || strcasecmp(zone->type, "secondary") == 0)) {
     syslog(LOG_WARNING,
            "[Config] Zone '%s' is type 'slave'/'secondary' but has 'allow-update' configured; "
@@ -1917,6 +2021,11 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
            "[WARNING] Zone '%s' is type 'slave'/'secondary' but has 'allow-update' configured; "
            "Dynamic Update requests to secondary zones are refused at runtime (REFUSED; updates are not forwarded to the primary)\n",
            zone->domain);
+  }
+  /* 何も指定されなかった (全ゼロ) なら ext を持たない。x は calloc なのでパディングもゼロ */
+  if (memcmp(x, &zone_ext_default, sizeof(*x)) == 0) {
+    free(x);
+    zone->ext = NULL;
   }
   *zone_out = zone;
   return 0;
@@ -2016,7 +2125,6 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->bind_addresses = NULL;
   config->bind_address_count = 0;
   config->zones = NULL;
-  config->zones_are_flat = false;
   config->views = NULL;
   config->keys = NULL;
   config->user = NULL;
@@ -2033,10 +2141,12 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->minimal_any = false;
   config->minimal_any_ttl = 86400;
   config->wire_cache_max_records = 0;
+  config->response_cache_size = 32 * 1024 * 1024;
   config->additional_from_auth = ADDITIONAL_AUTH_YES;
   config->notify_retry.retries = NOTIFY_RETRIES_DEFAULT;
   config->notify_retry.interval = NOTIFY_RETRY_INTERVAL_DEFAULT;
   config->notify_retry.backoff = NOTIFY_BACKOFF_FIXED;
+  config->ixfr_history = IXFR_HISTORY_DEFAULT;
   config->query_log_max_qps = 5000;
   config->query_log_buffer_size = 32768;
   config->max_mqtypes = 4;
@@ -2423,6 +2533,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           free_token(&tok);
+        } else if (strcmp(key, "ixfr-history") == 0) {
+          if (parse_transport_param(ctx, NULL, key, false, 0, IXFR_HISTORY_MAX, &config->ixfr_history) != 0) {
+            free(key);
+            return -1;
+          }
         } else if (strncmp(key, "notify-retr", 11) == 0 &&
                    (nr_rc = parse_notify_retry_option(ctx, NULL, key, &config->notify_retry)) != 0) {
           if (nr_rc < 0) {
@@ -2465,6 +2580,14 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           free_token(&tok);
+        } else if (strcmp(key, "response-cache-size") == 0) {
+          /* 0 = 使わない。それ以外は 4K/16M のような大きさ (上限 1024M)。書き損じは誤りにする */
+          int sz = 0;
+          if (parse_transport_param(ctx, NULL, key, true, 0, 1024LL * 1024 * 1024, &sz) != 0) {
+            free(key);
+            return -1;
+          }
+          config->response_cache_size = (size_t)sz;
         } else if (strcmp(key, "udp-sndbuf-size") == 0) {
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
@@ -2528,14 +2651,18 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free_partial_view(view);
             return -1;
           }
-          for (zone_config_t *existing = view->zones; existing; existing = existing->next) {
-            if (strcasecmp(existing->domain, z->domain) == 0) {
+          /* 重複は検索と同じ規則で判定する ("example.test" と "example.test." は同じゾーン) */
+          int ins = zone_cfg_index_insert(&view->zone_index, z, NULL);
+          if (ins != 0) {
+            if (ins > 0) {
               syslog(LOG_ERR, "[Config] Duplicate zone '%s' defined in view '%s'; rejecting configuration", z->domain, view->name);
               fprintf(stderr, "[ERROR] Duplicate zone '%s' defined in view '%s'\n", z->domain, view->name);
-              free_zone_config(z);
-              free_partial_view(view);
-              return -1;
+            } else {
+              syslog(LOG_ERR, "[Config] Out of memory indexing zone '%s'", z->domain);
             }
+            free_zone_config(z);
+            free_partial_view(view);
+            return -1;
           }
           if (!view->zones) view->zones = z; else last_view_zone->next = z;
           last_view_zone = z;
@@ -2562,13 +2689,16 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       free_token(&tok);
       zone_config_t *zone = NULL;
       if (parse_zone_block(ctx, &zone) != 0) return -1;
-      for (zone_config_t *existing = config->zones; existing; existing = existing->next) {
-        if (strcasecmp(existing->domain, zone->domain) == 0) {
+      int ins = zone_cfg_index_insert(&config->top_zone_index, zone, NULL);
+      if (ins != 0) {
+        if (ins > 0) {
           syslog(LOG_ERR, "[Config] Duplicate zone '%s' defined (top-level); rejecting configuration", zone->domain);
           fprintf(stderr, "[ERROR] Duplicate zone '%s' defined\n", zone->domain);
-          free_zone_config(zone);
-          return -1;
+        } else {
+          syslog(LOG_ERR, "[Config] Out of memory indexing zone '%s'", zone->domain);
         }
+        free_zone_config(zone);
+        return -1;
       }
       saw_top_level_zone = true;
       if (!config->zones)
@@ -3212,6 +3342,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
     default_view->match_clients_count = 1;
     default_view->match_clients_parsed = acl_list_parse(default_view->match_clients, default_view->match_clients_count);
     default_view->zones = config->zones;
+    default_view->zone_index = config->top_zone_index;
+    memset(&config->top_zone_index, 0, sizeof(config->top_zone_index));
     config->zones = NULL;
     config->views = default_view;
   }
@@ -3220,16 +3352,18 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   for (view_config_t *v = config->views; v; v = v->next) {
     for (zone_config_t *z = v->zones; z; z = z->next) {
       if (z->type && strcasecmp(z->type, "program") == 0) {
-        if (!z->program_user && config->user) {
-          z->program_user = strdup(config->user);
-          if (!z->program_user) return -1;
+        if (!zext(z)->program_user && config->user) {
+          zone_ext_t *zx = zone_ext_mut(z);
+          if (!zx) return -1;
+          zx->program_user = strdup(config->user);
+          if (!zx->program_user) return -1;
         }
       }
     }
   }
 
   /* D-22: 名前付き ACL の参照を展開し、アドレスでも ACL 名でもない要素を設定エラーにする。
-   * フラットなゾーンリストは構造体のコピーなので、それを作る前に行う */
+   */
   {
     char where[DNS_NAME_TEXT_SIZE + 128];
     if (config->ecs_trusted_resolvers_count > 0 &&
@@ -3243,17 +3377,19 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                            &v->match_clients_parsed, NULL, NULL) != 0)
         return -1;
       for (zone_config_t *z = v->zones; z; z = z->next) {
+        zone_ext_t *zx = z->ext; /* ext が無いゾーンは ACL を 1 つも持たない */
+        if (!zx) continue;
         snprintf(where, sizeof(where), "zone '%s' allow-transfer", z->domain);
-        if (acl_expand_field(ctx, config, where, ACL_USE_TRANSFER, &z->allow_transfer, &z->allow_transfer_count,
-                             &z->allow_transfer_parsed, &z->tsig_keys, &z->tsig_keys_count) != 0)
+        if (acl_expand_field(ctx, config, where, ACL_USE_TRANSFER, &zx->allow_transfer, &zx->allow_transfer_count,
+                             &zx->allow_transfer_parsed, &zx->tsig_keys, &zx->tsig_keys_count) != 0)
           return -1;
         snprintf(where, sizeof(where), "zone '%s' allow-update", z->domain);
-        if (acl_expand_field(ctx, config, where, ACL_USE_UPDATE, &z->allow_update, &z->allow_update_count,
-                             &z->allow_update_parsed, NULL, NULL) != 0)
+        if (acl_expand_field(ctx, config, where, ACL_USE_UPDATE, &zx->allow_update, &zx->allow_update_count,
+                             &zx->allow_update_parsed, NULL, NULL) != 0)
           return -1;
         snprintf(where, sizeof(where), "zone '%s' ecs-trusted-resolvers", z->domain);
-        if (acl_expand_field(ctx, config, where, ACL_USE_ADDRESS, &z->ecs_trusted_resolvers,
-                             &z->ecs_trusted_resolvers_count, &z->ecs_trusted_resolvers_parsed, NULL, NULL) != 0)
+        if (acl_expand_field(ctx, config, where, ACL_USE_ADDRESS, &zx->ecs_trusted_resolvers,
+                             &zx->ecs_trusted_resolvers_count, &zx->ecs_trusted_resolvers_parsed, NULL, NULL) != 0)
           return -1;
       }
     }
@@ -3262,66 +3398,37 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   /* [T7] TSIGキー参照の未定義検出 (checkconf相当の健全性チェック) */
   for (view_config_t *v = config->views; v; v = v->next) {
     for (zone_config_t *z = v->zones; z; z = z->next) {
+      const zone_ext_t *zx = z->ext;
+      if (!zx) continue; /* tsig-key も allow-transfer key も持たない */
       /* tsig-key ディレクティブ: 存在しないキー名は起動失敗 */
-      if (z->tsig_key && !key_name_is_defined(config->keys, z->tsig_key)) {
+      if (zx->tsig_key && !key_name_is_defined(config->keys, zx->tsig_key)) {
         syslog(LOG_ERR, "[Config] Zone '%s': tsig-key '%s' is not defined in any key {} block",
-               z->domain, z->tsig_key);
+               z->domain, zx->tsig_key);
         fprintf(stderr, "[ERROR] Zone '%s': tsig-key '%s' is not defined in any key {} block\n",
-                z->domain, z->tsig_key);
+                z->domain, zx->tsig_key);
         return -1;
       }
       /* allow-transfer key: 存在しないキー名は起動失敗 */
-      for (int i = 0; i < z->tsig_keys_count; i++) {
-        if (!key_name_is_defined(config->keys, z->tsig_keys[i])) {
+      for (int i = 0; i < zx->tsig_keys_count; i++) {
+        if (!key_name_is_defined(config->keys, zx->tsig_keys[i])) {
           syslog(LOG_ERR, "[Config] Zone '%s': allow-transfer key '%s' is not defined in any key {} block",
-                 z->domain, z->tsig_keys[i]);
+                 z->domain, zx->tsig_keys[i]);
           fprintf(stderr, "[ERROR] Zone '%s': allow-transfer key '%s' is not defined in any key {} block\n",
-                  z->domain, z->tsig_keys[i]);
+                  z->domain, zx->tsig_keys[i]);
           return -1;
         }
       }
     }
   }
 
-  // Create a flattened list of zones in config->zones for backward compatibility
-  // (AXFR, RRL, control-channel etc).
-  // ※ このリストは所有権を持たない走査・参照専用リストです。
-  //   各ノードはビュー内ゾーン(v->zones)の内部ポインタを共有しているため、
-  //   フィールドの書き込みや free_zone_config() の呼び出しは絶対に行わないこと。
-  //   解放時は free_server_config_fields() 内でノード構造体自体のみを free() すること。
-  zone_config_t *flat_zones = NULL;
-  zone_config_t *flat_tail = NULL;
-  for (view_config_t *v = config->views; v; v = v->next) {
-    for (zone_config_t *z = v->zones; z; z = z->next) {
-      zone_config_t *dup_z = safe_calloc_or_die(1, sizeof(zone_config_t));
-      if (!dup_z) {
-        zone_config_t *curr = flat_zones;
-        while (curr) {
-          zone_config_t *next = curr->next;
-          free(curr);
-          curr = next;
-        }
-        return -1;
-      }
-      *dup_z = *z;
-      dup_z->next = NULL;
-      if (!flat_zones) {
-        flat_zones = dup_z;
-        flat_tail = dup_z;
-      } else {
-        flat_tail->next = dup_z;
-        flat_tail = dup_z;
-      }
-    }
-  }
-  config->zones = flat_zones;
-  config->zones_are_flat = true;
-
   config->any_zone_tcp_opts = false;
-  for (zone_config_t *z = config->zones; z; z = z->next) {
-    if (z->zone_tcp_mss > 0 || z->zone_tcp_window > 0 || z->zone_tcp_sndbuf > 0) {
-      config->any_zone_tcp_opts = true;
-      break;
+  for (view_config_t *v = config->views; v && !config->any_zone_tcp_opts; v = v->next) {
+    for (zone_config_t *z = v->zones; z; z = z->next) {
+      const zone_ext_t *zx = z->ext;
+      if (zx && (zx->zone_tcp_mss > 0 || zx->zone_tcp_window > 0 || zx->zone_tcp_sndbuf > 0)) {
+        config->any_zone_tcp_opts = true;
+        break;
+      }
     }
   }
 

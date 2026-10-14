@@ -11,6 +11,7 @@
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
+#include "test_zext.h"
 #include "dns_zone_parser.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_catalog_zone.h"
@@ -134,7 +135,7 @@ static void test_catalog_process_membership_rfc9432(void) {
     zone_arena_t a_no_ver;
     memset(&a_no_ver, 0, sizeof(a_no_ver));
     zone_arena_init(&a_no_ver);
-    atomic_store_explicit(&cat_entry.rcu.active, &a_no_ver, memory_order_release);
+    atomic_store_explicit(&cat_entry.rcu.active, &a_no_ver.ver, memory_order_release);
 
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
     assert(cat_entry.catalog_member_count == 0);
@@ -148,6 +149,7 @@ static void test_catalog_process_membership_rfc9432(void) {
 
     // version.catalog.example. TXT "2"
     dns_record_t r_ver; memset(&r_ver, 0, sizeof(r_ver));
+    DNS_RECORD_BIND_RDATA(r_ver);
     r_ver.name = arena_strdup(&a_dup_ptr, "version.catalog.example.");
     r_ver.type_code = 16; r_ver.rdata_count = 1;
     r_ver.rdata[0] = arena_strdup(&a_dup_ptr, "2");
@@ -155,6 +157,7 @@ static void test_catalog_process_membership_rfc9432(void) {
 
     // node1.zones.catalog.example. PTR m1.example.
     dns_record_t r_p1; memset(&r_p1, 0, sizeof(r_p1));
+    DNS_RECORD_BIND_RDATA(r_p1);
     r_p1.name = arena_strdup(&a_dup_ptr, "node1.zones.catalog.example.");
     r_p1.type_code = 12; r_p1.rdata_count = 1;
     r_p1.rdata[0] = arena_strdup(&a_dup_ptr, "m1.example.");
@@ -162,12 +165,13 @@ static void test_catalog_process_membership_rfc9432(void) {
 
     // node1.zones.catalog.example. PTR m2.example. (Duplicate PTR on same node!)
     dns_record_t r_p2; memset(&r_p2, 0, sizeof(r_p2));
+    DNS_RECORD_BIND_RDATA(r_p2);
     r_p2.name = arena_strdup(&a_dup_ptr, "node1.zones.catalog.example.");
     r_p2.type_code = 12; r_p2.rdata_count = 1;
     r_p2.rdata[0] = arena_strdup(&a_dup_ptr, "m2.example.");
     a_dup_ptr.records[a_dup_ptr.count++] = r_p2;
 
-    atomic_store_explicit(&cat_entry.rcu.active, &a_dup_ptr, memory_order_release);
+    atomic_store_explicit(&cat_entry.rcu.active, &a_dup_ptr.ver, memory_order_release);
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
     assert(cat_entry.catalog_member_count == 0); // Broken catalog rejected!
 
@@ -180,18 +184,20 @@ static void test_catalog_process_membership_rfc9432(void) {
     a_dup_target.records[a_dup_target.count++] = r_ver;
 
     dns_record_t r_u1; memset(&r_u1, 0, sizeof(r_u1));
+    DNS_RECORD_BIND_RDATA(r_u1);
     r_u1.name = arena_strdup(&a_dup_target, "node1.zones.catalog.example.");
     r_u1.type_code = 12; r_u1.rdata_count = 1;
     r_u1.rdata[0] = arena_strdup(&a_dup_target, "same.example.");
     a_dup_target.records[a_dup_target.count++] = r_u1;
 
     dns_record_t r_u2; memset(&r_u2, 0, sizeof(r_u2));
+    DNS_RECORD_BIND_RDATA(r_u2);
     r_u2.name = arena_strdup(&a_dup_target, "node2.zones.catalog.example.");
     r_u2.type_code = 12; r_u2.rdata_count = 1;
     r_u2.rdata[0] = arena_strdup(&a_dup_target, "same.example.");
     a_dup_target.records[a_dup_target.count++] = r_u2;
 
-    atomic_store_explicit(&cat_entry.rcu.active, &a_dup_target, memory_order_release);
+    atomic_store_explicit(&cat_entry.rcu.active, &a_dup_target.ver, memory_order_release);
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
     assert(cat_entry.catalog_member_count == 0); // Duplicate target domain rejected!
 
@@ -212,12 +218,13 @@ static void test_catalog_process_membership_rfc9432(void) {
     a_static_col.records[a_static_col.count++] = r_ver;
 
     dns_record_t r_col; memset(&r_col, 0, sizeof(r_col));
+    DNS_RECORD_BIND_RDATA(r_col);
     r_col.name = arena_strdup(&a_static_col, "node1.zones.catalog.example.");
     r_col.type_code = 12; r_col.rdata_count = 1;
     r_col.rdata[0] = arena_strdup(&a_static_col, "static.example.");
     a_static_col.records[a_static_col.count++] = r_col;
 
-    atomic_store_explicit(&cat_entry.rcu.active, &a_static_col, memory_order_release);
+    atomic_store_explicit(&cat_entry.rcu.active, &a_static_col.ver, memory_order_release);
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
     assert(cat_entry.catalog_member_count == 0); // Colliding member skipped!
 
@@ -230,24 +237,27 @@ static void test_catalog_process_membership_rfc9432(void) {
     a_mult_coo.records[a_mult_coo.count++] = r_ver;
 
     dns_record_t r_m1; memset(&r_m1, 0, sizeof(r_m1));
+    DNS_RECORD_BIND_RDATA(r_m1);
     r_m1.name = arena_strdup(&a_mult_coo, "node1.zones.catalog.example.");
     r_m1.type_code = 12; r_m1.rdata_count = 1;
     r_m1.rdata[0] = arena_strdup(&a_mult_coo, "member1.example.");
     a_mult_coo.records[a_mult_coo.count++] = r_m1;
 
     dns_record_t r_coo1; memset(&r_coo1, 0, sizeof(r_coo1));
+    DNS_RECORD_BIND_RDATA(r_coo1);
     r_coo1.name = arena_strdup(&a_mult_coo, "coo.node1.zones.catalog.example.");
     r_coo1.type_code = 12; r_coo1.rdata_count = 1;
     r_coo1.rdata[0] = arena_strdup(&a_mult_coo, "target1.catalog.");
     a_mult_coo.records[a_mult_coo.count++] = r_coo1;
 
     dns_record_t r_coo2; memset(&r_coo2, 0, sizeof(r_coo2));
+    DNS_RECORD_BIND_RDATA(r_coo2);
     r_coo2.name = arena_strdup(&a_mult_coo, "coo.node1.zones.catalog.example.");
     r_coo2.type_code = 12; r_coo2.rdata_count = 1;
     r_coo2.rdata[0] = arena_strdup(&a_mult_coo, "target2.catalog.");
     a_mult_coo.records[a_mult_coo.count++] = r_coo2;
 
-    atomic_store_explicit(&cat_entry.rcu.active, &a_mult_coo, memory_order_release);
+    atomic_store_explicit(&cat_entry.rcu.active, &a_mult_coo.ver, memory_order_release);
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
     assert(cat_entry.catalog_member_count == 0); // Multiple coo records rejected!
 
@@ -327,6 +337,7 @@ static void test_find_catalog_parent_and_valid_properties(void) {
 
     dns_record_t r_ver;
     memset(&r_ver, 0, sizeof(r_ver));
+    DNS_RECORD_BIND_RDATA(r_ver);
     r_ver.name = arena_strdup(&a_valid, "version.catalog.example.");
     r_ver.type_code = 16;
     r_ver.rdata_count = 1;
@@ -335,6 +346,7 @@ static void test_find_catalog_parent_and_valid_properties(void) {
 
     dns_record_t r_ptr;
     memset(&r_ptr, 0, sizeof(r_ptr));
+    DNS_RECORD_BIND_RDATA(r_ptr);
     r_ptr.name = arena_strdup(&a_valid, "unique1.zones.catalog.example.");
     r_ptr.type_code = 12;
     r_ptr.rdata_count = 1;
@@ -343,6 +355,7 @@ static void test_find_catalog_parent_and_valid_properties(void) {
 
     dns_record_t r_grp;
     memset(&r_grp, 0, sizeof(r_grp));
+    DNS_RECORD_BIND_RDATA(r_grp);
     r_grp.name = arena_strdup(&a_valid, "group.unique1.zones.catalog.example.");
     r_grp.type_code = 16;
     r_grp.rdata_count = 1;
@@ -351,13 +364,14 @@ static void test_find_catalog_parent_and_valid_properties(void) {
 
     dns_record_t r_coo;
     memset(&r_coo, 0, sizeof(r_coo));
+    DNS_RECORD_BIND_RDATA(r_coo);
     r_coo.name = arena_strdup(&a_valid, "coo.unique1.zones.catalog.example.");
     r_coo.type_code = 12;
     r_coo.rdata_count = 1;
     r_coo.rdata[0] = arena_strdup(&a_valid, "newcatalog.example.");
     a_valid.records[a_valid.count++] = r_coo;
 
-    atomic_store_explicit(&cat_parent.rcu.active, &a_valid, memory_order_release);
+    atomic_store_explicit(&cat_parent.rcu.active, &a_valid.ver, memory_order_release);
     catalog_process_membership(&cat_parent, &cat_cfg, "default");
 
     // Clean up

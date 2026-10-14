@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include "../dns_config_parser.h"
+#include "test_zext.h"
 #include "../dns_utils.h"
 
 // Stub for open_via_dir_cache when running unit tests outside full server
@@ -52,8 +53,8 @@ int main(void) {
         assert(cfg.keys != NULL);
         assert(strcmp(cfg.keys->name, "test-key") == 0);
         assert(strcmp(cfg.keys->algorithm, "hmac-sha256") == 0);
-        assert(cfg.zones != NULL);
-        assert(strcmp(cfg.zones->domain, "example.com.") == 0);
+        assert(cfg.views->zones != NULL);
+        assert(strcmp(cfg.views->zones->domain, "example.com.") == 0);
         free_server_config_fields(&cfg);
         printf("  -> PASS\n");
     }
@@ -82,12 +83,12 @@ int main(void) {
         free(buf);
 
         assert(res == 0);
-        assert(cfg.zones != NULL);
-        assert(cfg.zones->allow_transfer_count == 4);
-        assert(strcmp(cfg.zones->allow_transfer[0], "10.0.0.1") == 0);
-        assert(strcmp(cfg.zones->allow_transfer[1], "192.168.1.1") == 0);
-        assert(strcmp(cfg.zones->allow_transfer[2], "192.168.1.2") == 0);
-        assert(strcmp(cfg.zones->allow_transfer[3], "10.0.0.2") == 0);
+        assert(cfg.views->zones != NULL);
+        assert(zext(cfg.views->zones)->allow_transfer_count == 4);
+        assert(strcmp(zext(cfg.views->zones)->allow_transfer[0], "10.0.0.1") == 0);
+        assert(strcmp(zext(cfg.views->zones)->allow_transfer[1], "192.168.1.1") == 0);
+        assert(strcmp(zext(cfg.views->zones)->allow_transfer[2], "192.168.1.2") == 0);
+        assert(strcmp(zext(cfg.views->zones)->allow_transfer[3], "10.0.0.2") == 0);
         free_server_config_fields(&cfg);
         printf("  -> PASS\n");
     }
@@ -144,10 +145,10 @@ int main(void) {
         free(buf);
 
         assert(res == 0);
-        assert(cfg.zones != NULL);
-        assert(strcmp(cfg.zones->domain, "empty-test.org.") == 0);
-        assert(cfg.zones->allow_transfer_count == 1);
-        assert(strcmp(cfg.zones->allow_transfer[0], "127.0.0.1") == 0);
+        assert(cfg.views->zones != NULL);
+        assert(strcmp(cfg.views->zones->domain, "empty-test.org.") == 0);
+        assert(zext(cfg.views->zones)->allow_transfer_count == 1);
+        assert(strcmp(zext(cfg.views->zones)->allow_transfer[0], "127.0.0.1") == 0);
         free_server_config_fields(&cfg);
         printf("  -> PASS\n");
     }
@@ -283,8 +284,8 @@ int main(void) {
         server_config_t cfg;
         int res = parse_named_conf(conf, &cfg);
         assert(res == 0);
-        assert(cfg.zones != NULL);
-        assert(strcmp(cfg.zones->domain, "include.") == 0);
+        assert(cfg.views->zones != NULL);
+        assert(strcmp(cfg.views->zones->domain, "include.") == 0);
         free_server_config_fields(&cfg);
         printf("  -> PASS (quoted \"include\" preserved as string literal)\n");
     }
@@ -342,24 +343,24 @@ int main(void) {
         assert(res == 0);
         assert(cfg.additional_from_auth == ADDITIONAL_AUTH_YES);
 
-        zone_config_t *z1 = cfg.zones;
+        zone_config_t *z1 = cfg.views->zones;
         assert(z1 != NULL && strcmp(z1->domain, "z1.example.com.") == 0);
-        assert(z1->additional_from_auth_specified == true);
-        assert(z1->additional_from_auth == ADDITIONAL_AUTH_NO);
+        assert(zext(z1)->additional_from_auth_specified == true);
+        assert(zext(z1)->additional_from_auth == ADDITIONAL_AUTH_NO);
 
         zone_config_t *z2 = z1->next;
         assert(z2 != NULL && strcmp(z2->domain, "z2.example.com.") == 0);
-        assert(z2->additional_from_auth_specified == true);
-        assert(z2->additional_from_auth == ADDITIONAL_AUTH_IN_DOMAIN);
+        assert(zext(z2)->additional_from_auth_specified == true);
+        assert(zext(z2)->additional_from_auth == ADDITIONAL_AUTH_IN_DOMAIN);
 
         zone_config_t *z3 = z2->next;
         assert(z3 != NULL && strcmp(z3->domain, "z3.example.com.") == 0);
-        assert(z3->additional_from_auth_specified == true);
-        assert(z3->additional_from_auth == ADDITIONAL_AUTH_YES);
+        assert(zext(z3)->additional_from_auth_specified == true);
+        assert(zext(z3)->additional_from_auth == ADDITIONAL_AUTH_YES);
 
         zone_config_t *z4 = z3->next;
         assert(z4 != NULL && strcmp(z4->domain, "z4.example.com.") == 0);
-        assert(z4->additional_from_auth_specified == false);
+        assert(zext(z4)->additional_from_auth_specified == false);
 
         free_server_config_fields(&cfg);
         printf("  -> PASS (zone-level additional-from-auth correctly parsed)\n");
@@ -381,7 +382,7 @@ int main(void) {
 
         assert(res == 0);
         assert(cfg.keys != NULL && strcmp(cfg.keys->name, "test-key") == 0);
-        assert(cfg.zones != NULL && strcmp(cfg.zones->domain, "example.com.") == 0);
+        assert(cfg.views->zones != NULL && strcmp(cfg.views->zones->domain, "example.com.") == 0);
         free_server_config_fields(&cfg);
         printf("  -> PASS\n");
     }

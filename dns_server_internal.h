@@ -71,7 +71,10 @@ extern char g_startup_cwd[PATH_MAX];
 #define BUFFER_SIZE 4096
 #define MAX_BIND_ADDRS 64
 
-#define MAX_IXFR_HISTORY 32
+/* IXFR history (RFC 1995 §4): the most diffs one zone keeps. The configured depth (ixfr-history, 0..MAX_IXFR_HISTORY, default
+ * IXFR_HISTORY_DEFAULT; dns_config_parser.h) is the number of versions a secondary may lag behind and still get an
+ * incremental transfer. */
+#define MAX_IXFR_HISTORY IXFR_HISTORY_MAX
 #define MAX_ZONE_AXFR 4
 #define MAX_TCP_CLIENTS 1000
 
@@ -230,11 +233,11 @@ typedef struct {
     alignas(64) _Atomic uint64_t dropped_count;
 } qlog_ring_t;
 
+/* S5 B-3: the published version of a zone is a heap zone_version_t (image + glue + flags); a writer builds a new one and
+ * publishes it with zone_publish(), the old one goes on the retire stack. Before the first publish `active` is
+ * &zone_version_empty. */
 typedef struct {
-  _Atomic(zone_arena_t *) active;
-  zone_arena_t arena_a;
-  zone_arena_t arena_b;
-  uint64_t retire_epoch;
+  _Atomic(zone_version_t *) active;
 } zone_rcu_t;
 
 struct worker_ctx {
@@ -269,12 +272,21 @@ typedef struct {
   zone_arena_t arena;
 } ixfr_txn_t;
 
+/* S5 B-3: the ring is allocated on the first stored diff (a zone that never changes after loading pays nothing) with `cap` =
+ * the configured depth at that time. A depth change trims the oldest diffs at once (ixfr_history_set_depth) and grows the
+ * ring at the next diff. depth_p1 is the configured depth + 1; 0 (a zeroed entry) means IXFR_HISTORY_DEFAULT. */
 typedef struct {
-  ixfr_txn_t *entries[MAX_IXFR_HISTORY];
-  int head;
-  int count;
+  ixfr_txn_t **entries;   /* NULL or `cap` slots: a ring, `count` diffs ending before `head` */
   pthread_mutex_t lock;
+  uint8_t cap;
+  uint8_t head;
+  uint8_t count;
+  uint8_t depth_p1;
 } ixfr_history_t;
+
+static inline int ixfr_history_depth(const ixfr_history_t *h) {
+  return h->depth_p1 ? (int)h->depth_p1 - 1 : IXFR_HISTORY_DEFAULT;
+}
 
 typedef struct {
   char unique_id[256];
@@ -325,6 +337,13 @@ static inline zone_kind_t zone_kind_from_type(const char *type) {
   return ZONE_KIND_OTHER;
 }
 
+/* B-3: the primary a catalog member zone is transferred from (copied from the catalog zone's config when the member is added) */
+typedef struct {
+  char ip[64];
+  int port;
+  char tsig_key[64];
+} catalog_master_t;
+
 typedef struct {
   char domain[256];
   char view_name[64];
@@ -347,20 +366,33 @@ typedef struct {
   int catalog_member_count;
   bool is_catalog_member;
   bool is_secondary;
-  char catalog_member_unique_id[256];
+  char *catalog_member_unique_id; /* S5: malloc。カタログのメンバーでなければ NULL (読むときは zone_entry_catalog_uid) */
   char **groups;
   int group_count;
-  char cached_master_ip[64];
-  int cached_master_port;
-  char cached_tsig_key_name[64];
-  char owning_catalog_domain[256];
+  catalog_master_t *catalog_master; /* B-3: malloc, catalog members only (primary and TSIG key of the catalog zone) */
+  char *owning_catalog_domain;    /* S5: malloc。同上 (読むときは zone_entry_catalog_owner) */
   _Atomic(time_t) last_successful_transfer;
   /* RFC 7314 §4: セカンダリの expire タイマーが切れる時刻。0 なら
    * last_successful_transfer + expire (従来どおり SOA EXPIRE で数える)。 */
   _Atomic(time_t) expire_at;
   _Atomic(time_t) last_stale_log_time;
   time_t last_loaded_mtime;
+  /* 他のゾーンがこのゾーンの名前をグルーに使っている (prelink が印を付ける)。公開時に
+   * 制御スレッドへ依存するゾーンのグルーの作り直しを頼む */
+  _Atomic bool glue_provider;
+  /* エントリごとに一意 (アドレスの再利用と区別する)。グルーの作り直しの判定に使う */
+  uint64_t id;
+  /* 最後に公開したときの全体の公開カウンタ */
+  _Atomic uint64_t publish_order;
 } zone_db_entry_t;
+
+/* S5: カタログ関連の文字列は非カタログのゾーンでは NULL。比較や表示には空文字列として読む */
+static inline const char *zone_entry_catalog_uid(const zone_db_entry_t *e) {
+  return e->catalog_member_unique_id ? e->catalog_member_unique_id : "";
+}
+static inline const char *zone_entry_catalog_owner(const zone_db_entry_t *e) {
+  return e->owning_catalog_domain ? e->owning_catalog_domain : "";
+}
 
 /* セカンダリゾーンが期限切れになる時刻。期限が無い (プライマリ、未転送) なら 0。 */
 static inline time_t zone_expire_deadline(zone_db_entry_t *e) {
@@ -411,6 +443,8 @@ typedef struct {
   server_config_t config_a;
   server_config_t config_b;
   uint64_t retire_epoch;
+  bool standby_pending; /* 退いた設定 (standby) がまだ確保されている。制御スレッドだけが読み書きする */
+  uint64_t standby_freed;  /* 解放した退いた設定の数 (テスト用の計数) */
 } config_rcu_t;
 
 extern config_rcu_t g_config_db;
@@ -466,6 +500,9 @@ typedef struct {
 extern _Atomic int g_xfers_running;
 
 server_config_t *acquire_config_snapshot(void);
+/* 退いた設定 (standby) を、読み手が全員抜けていれば解放する。wait なら最大 10 秒待つ。
+ * 解放した (または解放するものが無い) とき true。制御スレッド専用 */
+bool config_standby_reap(bool wait);
 void release_config_snapshot(server_config_t *snap);
 zone_db_snapshot_t *acquire_zone_snapshot(void);
 void retain_zone_snapshot(zone_db_snapshot_t *snap);
@@ -479,19 +516,27 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(server_config_t *config,
                                              catalog_member_id_t *new_desired_members,
                                              int new_desired_count);
 
-void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst);
+int thaw_zone_arena(const zone_version_t *src, zone_arena_t *dst);
 void zone_arena_clear_data_pools(zone_arena_t *arena);
-void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_arena_t *new_arena);
+void compute_ixfr_diff(zone_db_entry_t *entry, const zone_version_t *old_ver, const zone_version_t *new_ver);
 void free_ixfr_txn(ixfr_txn_t *txn);
+/* B-3: set the IXFR history depth of a zone (0..MAX_IXFR_HISTORY); a lower depth drops the oldest diffs now */
+void ixfr_history_set_depth(zone_db_entry_t *entry, int depth);
+/* frees the diffs and the ring */
+void ixfr_history_clear(ixfr_history_t *h);
 zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname);
 zone_db_entry_t *find_zone_for_query(view_snapshot_t *view, const char *qname, uint16_t qtype);
 zone_db_entry_t *find_zone_exact_in_view(view_snapshot_t *view, const char *domain);
 view_snapshot_t *snapshot_find_view(zone_db_snapshot_t *snap, const char *view_name);
 zone_db_entry_t *snapshot_get_zone_in_view(zone_db_snapshot_t *snap, const char *view_name, const char *domain);
-void prelink_zone_additional_glue(zone_arena_t *current_zone,
-                                  const char *zone_domain,
-                                  view_snapshot_t *view,
-                                  additional_from_auth_t policy);
+void zone_glue_track_build(zone_version_t *ver, const char *zone_domain, view_snapshot_t *view,
+                           additional_from_auth_t policy);
+size_t zone_drop_unencodable_logged(zone_arena_t *a, const char *zone, const char *from);
+/* S2: 公開、解放待ちの処理、兄弟ゾーンの変更に伴うグルーの作り直し (dns_snapshot_rcu.c) */
+void zone_publish(zone_db_entry_t *entry, zone_version_t *next);
+void zone_retire_process(bool wait);
+void zone_glue_refresh_dependents(bool force);
+uint64_t zone_entry_next_id(void);
 
 int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out, uint16_t *msg_len_out);
 ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len);

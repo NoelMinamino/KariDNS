@@ -2,6 +2,7 @@
 #include "dns_axfr_ixfr.h"
 #include "dns_wire.h"
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
 #include "dns_config_parser.h"
 #include "dns_utils.h"
 #include "dns_catalog_zone.h"
@@ -61,135 +62,212 @@ bool wait_for_active_axfr(zone_db_entry_t *entry, int timeout_ms) {
   return true;
 }
 
-void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_arena_t *new_arena) {
-  if (!old_arena->hash_table || !new_arena->hash_table) return;
+/* ---- IXFR difference (S5 B-2): two images are compared; the old builder no longer exists ----
+ * An RR of one version is "in" the other when the other has an RR with the same owner (case-insensitive), type, class,
+ * TTL, tinydns time stamp / location, tags and RDATA (RFC 2136 §1.1.1: equal RDATA is the same RR; names compare as
+ * RFC 4034 §6.2 canonical form, the way compare_records() did on builder records). */
+static bool ixfr_ext_equal(const zone_image_ext_t *a, const zone_image_ext_t *b, const zone_image_t *ia,
+                           const zone_image_t *ib) {
+  if (!a && !b) return true;
+  zone_image_ext_t none;
+  memset(&none, 0, sizeof(none));
+  if (!a) a = &none;
+  if (!b) b = &none;
+  if (a->ttd != b->ttd || ((a->flags ^ b->flags) & ZONE_IMAGE_EXT_COUNTDOWN) || a->loc[0] != b->loc[0] ||
+      a->loc[1] != b->loc[1])
+    return false;
+  const char *ea = zone_image_str(ia, a->ecs_tag_off), *eb = zone_image_str(ib, b->ecs_tag_off);
+  const char *la = zone_image_str(ia, a->loc_tag_off), *lb = zone_image_str(ib, b->loc_tag_off);
+  if ((ea == NULL) != (eb == NULL) || (ea && strcasecmp(ea, eb) != 0)) return false;
+  if ((la == NULL) != (lb == NULL) || (la && strcasecmp(la, lb) != 0)) return false;
+  return true;
+}
+
+static bool ixfr_rdata_equal(const zone_image_t *ia, uint32_t a, const zone_image_t *ib, uint32_t b) {
+  uint16_t la = zone_image_rr_rdlen(ia, a), lb = zone_image_rr_rdlen(ib, b);
+  if (la != lb) return false;
+  if (la == 0) return true;
+  const uint8_t *pa = zone_image_rr_rdata(ia, a), *pb = zone_image_rr_rdata(ib, b);
+  if (memcmp(pa, pb, la) == 0) return true;
+  /* the stored RDATA is uncompressed, so a difference can only be the case of a domain name; only the types with
+   * names in their RDATA can be equal in canonical form, and then only if the octets agree when case is folded */
+  uint16_t type = zone_image_rr_type(ia, a);
+  if (!dns_rdata_name_layout(type) && !(zone_image_rrs(ia)[a].flags & ZONE_IMAGE_RR_RAW)) return false;
+  for (uint16_t i = 0; i < la; i++) {
+    uint8_t x = pa[i], y = pb[i];
+    if (x >= 'A' && x <= 'Z') x |= 0x20;
+    if (y >= 'A' && y <= 'Z') y |= 0x20;
+    if (x != y) return false;
+  }
+  /* exact answer through the same comparison the builder records used */
+  zone_arena_t scratch;
+  zone_arena_init(&scratch);
+  dns_record_t ra, rb;
+  bool same = zone_image_rr_to_record(ia, a, &scratch, &ra) == 0 && zone_image_rr_to_record(ib, b, &scratch, &rb) == 0 &&
+              compare_records(&ra, &rb, true);
+  zone_arena_destroy(&scratch);
+  return same;
+}
+
+/* Is RR `rr` of image `img` also in `other`? */
+static bool ixfr_rr_in(const zone_image_t *img, uint32_t rr, const zone_image_t *other) {
+  uint32_t id = zone_image_find_name(other, zone_image_name_text(img, zone_image_rr_name(img, rr)));
+  if (id == ZONE_IMAGE_NONE) return false;
+  uint16_t type = zone_image_rr_type(img, rr);
+  const zone_image_ext_t *ext = zone_image_rr_ext(img, rr);
+  for (uint32_t k = zone_image_rrset_next(other, id, type, zone_image_name_first_rr(other, id)); k != ZONE_IMAGE_NONE;
+       k = zone_image_rrset_next(other, id, type, k + 1)) {
+    if (zone_image_rr_class(other, k) != zone_image_rr_class(img, rr) ||
+        zone_image_rr_ttl(other, k) != zone_image_rr_ttl(img, rr))
+      continue;
+    if (!ixfr_ext_equal(ext, zone_image_rr_ext(other, k), img, other)) continue;
+    if (ixfr_rdata_equal(img, rr, other, k)) return true;
+  }
+  return false;
+}
+
+static bool ixfr_apex_serial(const zone_image_t *img, uint32_t *serial) {
+  uint32_t rr = zone_image_apex_soa(img);
+  zone_image_soa_t nums;
+  if (rr == ZONE_IMAGE_NONE || zone_image_soa(img, rr, NULL, 0, NULL, 0, &nums) != 0) return false;
+  *serial = nums.serial;
+  return true;
+}
+
+#define IXFR_MAX_DELTA 10000
+
+/* The RRs of `img` (in file order) that are not in `other`, up to IXFR_MAX_DELTA + 1 - *budget_used... returns the
+ * count, or (size_t)-1 when it does not fit in `cap`. */
+static size_t ixfr_collect(const zone_image_t *img, const zone_image_t *other, uint32_t *out, size_t cap) {
+  size_t n = 0;
+  for (uint32_t seq = 0; seq < img->n_rrs; seq++) {
+    uint32_t rr = zone_image_seq_rr(img, seq);
+    if (ixfr_rr_in(img, rr, other)) continue;
+    if (n >= cap) return (size_t)-1;
+    out[n++] = rr;
+  }
+  return n;
+}
+
+static int ixfr_fill(const zone_image_t *img, const uint32_t *rrs, size_t n, dns_record_t *out, zone_arena_t *arena) {
+  for (size_t i = 0; i < n; i++)
+    if (zone_image_rr_to_record(img, rrs[i], arena, &out[i]) != 0) return -1;
+  return 0;
+}
+
+static void ixfr_txn_release(ixfr_txn_t *txn) {
+  if (txn && atomic_fetch_sub_explicit(&txn->ref_count, 1, memory_order_acq_rel) == 1) free_ixfr_txn(txn);
+}
+
+/* Change the ring to `newcap` slots (h->lock held), keeping the newest diffs in order (oldest first, from slot 0). */
+static int ixfr_ring_resize(ixfr_history_t *h, int newcap) {
+  ixfr_txn_t **ring = NULL;
+  if (newcap > 0) {
+    ring = calloc((size_t)newcap, sizeof(*ring));
+    if (!ring) return -1;
+  }
+  int keep = h->count < newcap ? h->count : newcap;
+  for (int i = 0; i < h->count; i++) {
+    ixfr_txn_t *t = h->entries[(h->head + h->cap - h->count + i) % h->cap];
+    if (i >= h->count - keep) ring[i - (h->count - keep)] = t;
+    else ixfr_txn_release(t); /* the oldest ones go */
+  }
+  free(h->entries);
+  h->entries = ring;
+  h->cap = (uint8_t)newcap;
+  h->count = (uint8_t)keep;
+  h->head = (uint8_t)(newcap > 0 ? keep % newcap : 0);
+  return 0;
+}
+
+void ixfr_history_set_depth(zone_db_entry_t *entry, int depth) {
+  if (depth < 0) depth = 0;
+  if (depth > MAX_IXFR_HISTORY) depth = MAX_IXFR_HISTORY;
+  ixfr_history_t *h = &entry->ixfr_history;
+  pthread_mutex_lock(&h->lock);
+  h->depth_p1 = (uint8_t)(depth + 1);
+  /* a lower depth drops the oldest diffs now; a higher one grows the ring at the next stored diff */
+  if (h->entries && depth < h->cap) (void)ixfr_ring_resize(h, depth);
+  pthread_mutex_unlock(&h->lock);
+}
+
+void ixfr_history_clear(ixfr_history_t *h) {
+  for (int i = 0; i < h->cap && h->entries; i++)
+    if (h->entries[i]) free_ixfr_txn(h->entries[i]);
+  free(h->entries);
+  h->entries = NULL;
+  h->cap = h->head = h->count = 0;
+}
+
+/* Compare the published image of old_ver with the new one and keep the difference in the IXFR history of `entry`
+ * (RFC 1995 §4: deletions and additions per version). Does nothing when the zone keeps no history (ixfr-history 0), a
+ * serial is missing or not newer, or when the difference is larger than IXFR_MAX_DELTA RRs. */
+void compute_ixfr_diff(zone_db_entry_t *entry, const zone_version_t *old_ver, const zone_version_t *new_ver) {
+  const zone_image_t *oi = old_ver ? old_ver->image : NULL, *ni = new_ver ? new_ver->image : NULL;
+  if (!oi || !ni) return;
+  pthread_mutex_lock(&entry->ixfr_history.lock);
+  int depth = ixfr_history_depth(&entry->ixfr_history);
+  pthread_mutex_unlock(&entry->ixfr_history.lock);
+  if (depth == 0) return;
   uint32_t old_serial = 0, new_serial = 0;
-  for (size_t i = 0; i < old_arena->count; i++) {
-    if (old_arena->records[i].type_code == 6 &&
-        domain_names_match_ci(old_arena->records[i].name, entry->domain) &&
-        old_arena->records[i].rdata_count >= 3 && old_arena->records[i].rdata[2]) {
-      old_serial = strtoul(old_arena->records[i].rdata[2], NULL, 10);
-      break;
-    }
-  }
-  for (size_t i = 0; i < new_arena->count; i++) {
-    if (new_arena->records[i].type_code == 6 &&
-        domain_names_match_ci(new_arena->records[i].name, entry->domain) &&
-        new_arena->records[i].rdata_count >= 3 && new_arena->records[i].rdata[2]) {
-      new_serial = strtoul(new_arena->records[i].rdata[2], NULL, 10);
-      break;
-    }
-  }
+  (void)ixfr_apex_serial(oi, &old_serial);
+  (void)ixfr_apex_serial(ni, &new_serial);
   if (old_serial == 0 || new_serial == 0) return;
   if ((int32_t)(new_serial - old_serial) <= 0) return;
 
-  size_t del_count = 0, add_count = 0;
-  for (size_t i = 0; i < old_arena->count; i++) {
-    if (!record_exists_in_arena(new_arena, &old_arena->records[i])) del_count++;
-  }
-  for (size_t i = 0; i < new_arena->count; i++) {
-    if (!record_exists_in_arena(old_arena, &new_arena->records[i])) add_count++;
-  }
-  
-  if (del_count + add_count > 10000) return;
-  
-  ixfr_txn_t *txn = malloc(sizeof(ixfr_txn_t));
-  if (!txn) return;
-  memset(txn, 0, sizeof(ixfr_txn_t));
+  uint32_t *del_rr = malloc((IXFR_MAX_DELTA + 1) * sizeof(uint32_t));
+  uint32_t *add_rr = malloc((IXFR_MAX_DELTA + 1) * sizeof(uint32_t));
+  ixfr_txn_t *txn = NULL;
+  if (!del_rr || !add_rr) goto out;
+  size_t del_count = ixfr_collect(oi, ni, del_rr, IXFR_MAX_DELTA);
+  if (del_count == (size_t)-1) goto out;
+  size_t add_count = ixfr_collect(ni, oi, add_rr, IXFR_MAX_DELTA - del_count);
+  if (add_count == (size_t)-1) goto out;
 
-  if (del_count > SIZE_MAX / sizeof(dns_record_t) || add_count > SIZE_MAX / sizeof(dns_record_t)) {
-      free(txn);
-      return;
+  txn = calloc(1, sizeof(ixfr_txn_t));
+  if (!txn) goto out;
+  zone_arena_init(&txn->arena);
+  /* S4: a small difference does not get a 64 KiB first pool */
+  txn->arena.first_pool_cap = ((del_count + add_count) * 512 + 1024) < 64 * 1024 ? (del_count + add_count) * 512 + 1024 : 64 * 1024;
+  /* the records live in the transaction's own arena: the images are freed with their versions */
+  if (del_count > 0) txn->deleted = calloc(del_count, sizeof(dns_record_t));
+  if (add_count > 0) txn->added = calloc(add_count, sizeof(dns_record_t));
+  if ((del_count > 0 && !txn->deleted) || (add_count > 0 && !txn->added) ||
+      ixfr_fill(oi, del_rr, del_count, txn->deleted, &txn->arena) != 0 ||
+      ixfr_fill(ni, add_rr, add_count, txn->added, &txn->arena) != 0) {
+    syslog(LOG_WARNING, "[IXFR] zone '%s': could not record the difference between serial %u and %u", entry->domain,
+           old_serial, new_serial);
+    free_ixfr_txn(txn);
+    txn = NULL;
+    goto out;
   }
-  if (del_count > 0) {
-    txn->deleted = malloc(sizeof(dns_record_t) * del_count);
-    if (!txn->deleted) { free(txn); return; }
-  }
-  if (add_count > 0) {
-    txn->added = malloc(sizeof(dns_record_t) * add_count);
-    if (!txn->added) { if (txn->deleted) free(txn->deleted); free(txn); return; }
-  }
-
   txn->old_serial = old_serial;
   txn->new_serial = new_serial;
-  txn->deleted_count = del_count;
-  txn->added_count = add_count;
+  txn->deleted_count = (int)del_count;
+  txn->added_count = (int)add_count;
   atomic_init(&txn->ref_count, 1);
-  zone_arena_init(&txn->arena);
 
-  int d_idx = 0;
-  for (size_t i = 0; i < old_arena->count; i++) {
-    if (!record_exists_in_arena(new_arena, &old_arena->records[i])) {
-      txn->deleted[d_idx] = old_arena->records[i];
-      txn->deleted[d_idx].name = arena_strdup(&txn->arena, old_arena->records[i].name);
-      txn->deleted[d_idx].ttl = arena_strdup(&txn->arena, old_arena->records[i].ttl);
-      txn->deleted[d_idx].class_str = arena_strdup(&txn->arena, old_arena->records[i].class_str);
-      txn->deleted[d_idx].type = arena_strdup(&txn->arena, old_arena->records[i].type);
-      txn->deleted[d_idx].ecs_subnet_tag = old_arena->records[i].ecs_subnet_tag ? arena_strdup(&txn->arena, old_arena->records[i].ecs_subnet_tag) : NULL;
-      txn->deleted[d_idx].bind_location_tag = old_arena->records[i].bind_location_tag ? arena_strdup(&txn->arena, old_arena->records[i].bind_location_tag) : NULL;
-      for (int j = 0; j < old_arena->records[i].rdata_count; j++) {
-         txn->deleted[d_idx].rdata[j] = arena_strdup(&txn->arena, old_arena->records[i].rdata[j]);
-      }
-      if (old_arena->records[i].generic_len > 0 && old_arena->records[i].generic_data) {
-         txn->deleted[d_idx].generic_data = arena_alloc(&txn->arena, old_arena->records[i].generic_len);
-         if (txn->deleted[d_idx].generic_data)
-           memcpy(txn->deleted[d_idx].generic_data, old_arena->records[i].generic_data, old_arena->records[i].generic_len);
-      } else if (old_arena->records[i].generic_data) {
-         txn->deleted[d_idx].generic_data = (uint8_t *)"";
-      } else {
-         txn->deleted[d_idx].generic_data = NULL;
-      }
-      txn->deleted[d_idx].is_cached = false;
-      dns_record_preparse_cache(&txn->arena, &txn->deleted[d_idx]);
-      d_idx++;
-    }
+  ixfr_history_t *h = &entry->ixfr_history;
+  pthread_mutex_lock(&h->lock);
+  depth = ixfr_history_depth(h); /* may have changed while the diff was computed */
+  /* the ring is made on the first diff, with the configured size; a raised depth grows it here */
+  if (depth > 0 && (!h->entries || h->cap < depth) && ixfr_ring_resize(h, depth) != 0) depth = 0;
+  if (depth == 0) {
+    pthread_mutex_unlock(&h->lock);
+    free_ixfr_txn(txn);
+    goto out;
   }
-
-  int a_idx = 0;
-  for (size_t i = 0; i < new_arena->count; i++) {
-    if (!record_exists_in_arena(old_arena, &new_arena->records[i])) {
-      txn->added[a_idx] = new_arena->records[i];
-      txn->added[a_idx].name = arena_strdup(&txn->arena, new_arena->records[i].name);
-      txn->added[a_idx].ttl = arena_strdup(&txn->arena, new_arena->records[i].ttl);
-      txn->added[a_idx].class_str = arena_strdup(&txn->arena, new_arena->records[i].class_str);
-      txn->added[a_idx].type = arena_strdup(&txn->arena, new_arena->records[i].type);
-      txn->added[a_idx].ecs_subnet_tag = new_arena->records[i].ecs_subnet_tag ? arena_strdup(&txn->arena, new_arena->records[i].ecs_subnet_tag) : NULL;
-      txn->added[a_idx].bind_location_tag = new_arena->records[i].bind_location_tag ? arena_strdup(&txn->arena, new_arena->records[i].bind_location_tag) : NULL;
-      for (int j = 0; j < new_arena->records[i].rdata_count; j++) {
-         txn->added[a_idx].rdata[j] = arena_strdup(&txn->arena, new_arena->records[i].rdata[j]);
-      }
-      if (new_arena->records[i].generic_len > 0 && new_arena->records[i].generic_data) {
-         txn->added[a_idx].generic_data = arena_alloc(&txn->arena, new_arena->records[i].generic_len);
-         if (txn->added[a_idx].generic_data)
-           memcpy(txn->added[a_idx].generic_data, new_arena->records[i].generic_data, new_arena->records[i].generic_len);
-      } else if (new_arena->records[i].generic_data) {
-         txn->added[a_idx].generic_data = (uint8_t *)"";
-      } else {
-         txn->added[a_idx].generic_data = NULL;
-      }
-      txn->added[a_idx].is_cached = false;
-      dns_record_preparse_cache(&txn->arena, &txn->added[a_idx]);
-      a_idx++;
-    }
-  }
-
-  pthread_mutex_lock(&entry->ixfr_history.lock);
-  
-  int new_head = entry->ixfr_history.head;
-  if (entry->ixfr_history.count == MAX_IXFR_HISTORY) {
-    ixfr_txn_t *old_txn = entry->ixfr_history.entries[new_head];
-    if (old_txn) {
-      if (atomic_fetch_sub_explicit(&old_txn->ref_count, 1, memory_order_acq_rel) == 1) {
-        free_ixfr_txn(old_txn);
-      }
-    }
+  if (h->count == h->cap) {
+    ixfr_txn_release(h->entries[h->head]);
   } else {
-    entry->ixfr_history.count++;
+    h->count++;
   }
-
-  entry->ixfr_history.entries[new_head] = txn;
-  entry->ixfr_history.head = (new_head + 1) % MAX_IXFR_HISTORY;
-  pthread_mutex_unlock(&entry->ixfr_history.lock);
+  h->entries[h->head] = txn;
+  h->head = (uint8_t)((h->head + 1) % h->cap);
+  pthread_mutex_unlock(&h->lock);
+out:
+  free(del_rr);
+  free(add_rr);
 }
 
 static const char *xfr_rcode_name(unsigned rcode) {
@@ -255,7 +333,7 @@ int xfr_check_response_header(const uint8_t *msg, size_t msg_len, axfr_session_t
 }
 
 int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
-                     zone_arena_t *standby, zone_arena_t *active,
+                     zone_arena_t *standby, const zone_version_t *active,
                      axfr_session_t *session, const char *domain) {
   /* 拒否する経路では、運用者が原因を探せるよう必ずゾーン名と理由をログに出す (R-27) */
   if (packet_len < DNS_HEADER_SIZE) {
@@ -514,7 +592,11 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           }
         }
       } else if (session->soa_count == 2 && session->is_ixfr) {
-        clone_zone_arena(active, standby);
+        /* the IXFR is applied to the version we serve now: rebuild its builder from the published image (S5 B-2) */
+        if (thaw_zone_arena(active, standby) != 0) {
+          syslog(LOG_ERR, "[AXFR] zone '%s': cannot rebuild the current version of the zone to apply the IXFR", domain);
+          return -1;
+        }
         session->is_deleting = true;
       } else if (session->is_ixfr && session->is_deleting) {
         session->is_deleting = false;
@@ -587,7 +669,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
   /* 転送の間ずっと読み取り区間の外で使う。このゾーンの arena を入れ替えるのは
    * この転送 (is_transferring で1本に限る) と制御スレッドの Pass 2 prelink だけで、
    * Pass 2 は転送中のゾーンを飛ばすので、この arena は転送の完了まで再利用されない。*/
-  zone_arena_t *active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  zone_version_t *active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   int ret_code = -1;
 
   uint8_t prior_mac[64];
@@ -693,6 +775,9 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
       if (tmp_arena.count > 0) {
         uint32_t serial = 0, refresh = 0, retry = 0, expire = 0;
         bool has_soa = false;
+        /* S5 B-2: an RR that cannot be written in wire format is dropped with a warning and the rest is applied
+         * (the same as a zone file; the published image holds only RRs that can be served) */
+        zone_drop_unencodable_logged(&tmp_arena, entry->domain, "the zone transfer");
         for (size_t k = 0; k < tmp_arena.count; k++) {
           if (tmp_arena.records[k].type_code == 6 &&
               domain_names_match_ci(tmp_arena.records[k].name, entry->domain) &&
@@ -714,16 +799,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
           syslog(LOG_WARNING, "[XFR] Inbound transfer swap for zone '%s' postponed: active AXFR in progress.", entry->domain);
           return -1;
         }
-        zone_arena_t *cur_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-        zone_arena_t *standby = (cur_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b
-                                                                    : &entry->rcu.arena_a;
-        if (!rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000)) {
-          pthread_mutex_unlock(&entry->writer_lock);
-          if (unsigned_msgs) free(unsigned_msgs);
-          zone_arena_destroy(&tmp_arena);
-          syslog(LOG_ERR, "[XFR] Inbound transfer swap for zone '%s' aborted: RCU grace period wait timed out", entry->domain);
-          return -1;
-        }
+        zone_version_t *cur_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
 
         if (has_soa) {
           time_t now = time(NULL);
@@ -738,14 +814,32 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
           atomic_store_explicit(&entry->last_successful_transfer, now, memory_order_release);
         }
 
-        clone_zone_arena(&tmp_arena, standby);
-
-        if (build_zone_index(standby, true) != 0) {
-          zone_arena_clear_data_pools(standby);
+        /* S5 B-2: the received zone (tmp_arena) is the builder; only its image is published (S5 B-3: as a new version) */
+        zone_arena_shrink_records(&tmp_arena);
+        if (build_zone_index(&tmp_arena, true) != 0) {
           pthread_mutex_unlock(&entry->writer_lock);
           if (unsigned_msgs) free(unsigned_msgs);
           zone_arena_destroy(&tmp_arena);
           syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after XFR for '%s'", entry->domain);
+          return -1;
+        }
+
+        /* S5 B-1: 応答を作る側が読むイメージ。公開の直前に 1 回だけ作る。作れなければ索引を作れなかったときと同じく転送を捨てる */
+        tmp_arena.image = zone_image_freeze(&tmp_arena, entry->domain);
+        if (!tmp_arena.image) {
+          pthread_mutex_unlock(&entry->writer_lock);
+          if (unsigned_msgs) free(unsigned_msgs);
+          zone_arena_destroy(&tmp_arena);
+          syslog(LOG_ERR, "[Zone] Failed to build the zone image after XFR for '%s'", entry->domain);
+          return -1;
+        }
+        zone_arena_free_builder(&tmp_arena);
+        zone_version_t *standby = zone_version_new(&tmp_arena);
+        if (!standby) {
+          pthread_mutex_unlock(&entry->writer_lock);
+          if (unsigned_msgs) free(unsigned_msgs);
+          zone_arena_destroy(&tmp_arena);
+          syslog(LOG_ERR, "[Zone] Out of memory publishing the zone after XFR for '%s'", entry->domain);
           return -1;
         }
 
@@ -754,16 +848,16 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
         server_config_t *active_cfg_prelink = acquire_config_snapshot();
         zone_config_t *zcfg = find_zone_config_in_view(active_cfg_prelink, entry->view_name, entry->domain);
-        additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
-                                            ? zcfg->additional_from_auth
+        additional_from_auth_t policy = (zcfg && zext(zcfg)->additional_from_auth_specified)
+                                            ? zext(zcfg)->additional_from_auth
                                             : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
-        prelink_zone_additional_glue(standby, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
+        zone_glue_track_build(standby, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
         build_zone_response_cache(standby, active_cfg_prelink, entry->view_name, entry->domain);
         release_config_snapshot(active_cfg_prelink);
         rcu_aux_read_unlock();
 
         compute_ixfr_diff(entry, cur_active, standby);
-        entry->rcu.retire_epoch = rcu_writer_publish(&entry->rcu.active, standby);
+        zone_publish(entry, standby);
         pthread_mutex_unlock(&entry->writer_lock);
 
         if (session->is_ixfr) {
@@ -1021,9 +1115,16 @@ typedef struct {
   const char *domain;
 } axfr_emit_ctx_t;
 
-static int axfr_emit_record(axfr_emit_ctx_t *ec, const dns_record_t *rec) {
+/* One RR to send: a builder record (IXFR history, KariDNS markers) or RR `rr` of a zone image (S5 B-2: the zone itself) */
+static int axfr_write_item(axfr_emit_ctx_t *ec, const dns_record_t *rec, const zone_image_t *img, uint32_t rr) {
+  if (img) return image_serialize_rr(img, rr, ec->res, KARIDNS_AXFR_MSG_LIMIT, &ec->offset, &ec->comp_ctx, NULL,
+                                     zone_image_rr_ttl(img, rr));
+  return serialize_dns_record(ec->res, KARIDNS_AXFR_MSG_LIMIT, &ec->offset, rec, &ec->comp_ctx, NULL, 0xFFFFFFFF);
+}
+
+static int axfr_emit_item(axfr_emit_ctx_t *ec, const dns_record_t *rec, const zone_image_t *img, uint32_t rr) {
   uint16_t prev_offset = ec->offset;
-  if (serialize_dns_record(ec->res, KARIDNS_AXFR_MSG_LIMIT, &ec->offset, rec, &ec->comp_ctx, NULL, 0xFFFFFFFF) < 0) {
+  if (axfr_write_item(ec, rec, img, rr) < 0) {
     ec->res[6] = (uint8_t)(ec->answers >> 8);
     ec->res[7] = (uint8_t)(ec->answers & 0xFF);
     if (ec->send_opt && !ec->opt_sent) {
@@ -1061,9 +1162,10 @@ static int axfr_emit_record(axfr_emit_ctx_t *ec, const dns_record_t *rec) {
     /* パケットバッファを破壊せず質問セクションの名前を圧縮テーブルに登録 */
     register_wire_name_for_compression(ec->res, DNS_HEADER_SIZE, &ec->comp_ctx);
 
-    if (serialize_dns_record(ec->res, KARIDNS_AXFR_MSG_LIMIT, &ec->offset, rec, &ec->comp_ctx, NULL, 0xFFFFFFFF) < 0) {
+    if (axfr_write_item(ec, rec, img, rr) < 0) {
       syslog(LOG_ERR, "[AXFR] Record too large to fit in any TCP message (name=%s type=%u), aborting transfer",
-             rec->name ? rec->name : "(null)", rec->type_code);
+             img ? zone_image_name_text(img, zone_image_rr_name(img, rr)) : (rec->name ? rec->name : "(null)"),
+             img ? zone_image_rr_type(img, rr) : rec->type_code);
       return -1;
     }
   }
@@ -1071,20 +1173,25 @@ static int axfr_emit_record(axfr_emit_ctx_t *ec, const dns_record_t *rec) {
   return 0;
 }
 
-static int axfr_emit_zone_record(axfr_emit_ctx_t *ec, const dns_record_t *rec_item,
-                                 const char **cur_loc_io, const char **cur_ecs_io) {
+static int axfr_emit_record(axfr_emit_ctx_t *ec, const dns_record_t *rec) { return axfr_emit_item(ec, rec, NULL, 0); }
+
+/* A zone RR (builder record of the IXFR history, or image RR) with the Extended AXFR state markers around it */
+static int axfr_emit_zone_item(axfr_emit_ctx_t *ec, const dns_record_t *rec_item, const zone_image_t *img, uint32_t rr,
+                               const char **cur_loc_io, const char **cur_ecs_io) {
+  const zone_image_ext_t *ext = img ? zone_image_rr_ext(img, rr) : NULL;
+  const char *item_loc_tag = img ? (ext ? zone_image_str(img, ext->loc_tag_off) : NULL) : rec_item->bind_location_tag;
+  const char *item_ecs_tag = img ? (ext ? zone_image_str(img, ext->ecs_tag_off) : NULL) : rec_item->ecs_subnet_tag;
+  const char *item_tloc = img ? (ext ? ext->loc : "\0") : rec_item->tinydns_loc;
+  int64_t item_ttd = img ? (ext ? ext->ttd : 0) : (int64_t)rec_item->tinydns_ttd;
   if (!ec->is_extended_axfr) {
-    if (rec_item->bind_location_tag != NULL ||
-        rec_item->ecs_subnet_tag != NULL ||
-        rec_item->tinydns_loc[0] != 0 || rec_item->tinydns_loc[1] != 0 ||
-        rec_item->tinydns_ttd != 0) {
+    if (item_loc_tag != NULL || item_ecs_tag != NULL || item_tloc[0] != 0 || item_tloc[1] != 0 || item_ttd != 0) {
       /* Skip tagged records in fallback mode */
       return 0;
     }
-    return axfr_emit_record(ec, rec_item);
+    return axfr_emit_item(ec, rec_item, img, rr);
   }
 
-  const char *r_loc = rec_item->bind_location_tag ? rec_item->bind_location_tag : "";
+  const char *r_loc = item_loc_tag ? item_loc_tag : "";
   if (strcasecmp(r_loc, *(cur_loc_io) ? *(cur_loc_io) : "") != 0) {
     dns_record_t set_rec;
     memset(&set_rec, 0, sizeof(set_rec));
@@ -1095,9 +1202,9 @@ static int axfr_emit_zone_record(axfr_emit_ctx_t *ec, const dns_record_t *rec_it
     set_rec.generic_data = (uint8_t *)r_loc;
     set_rec.generic_len = strlen(r_loc);
     if (axfr_emit_record(ec, &set_rec) < 0) return -1;
-    *(cur_loc_io) = rec_item->bind_location_tag;
+    *(cur_loc_io) = item_loc_tag;
   }
-  const char *r_ecs = rec_item->ecs_subnet_tag ? rec_item->ecs_subnet_tag : "";
+  const char *r_ecs = item_ecs_tag ? item_ecs_tag : "";
   if (strcasecmp(r_ecs, *(cur_ecs_io) ? *(cur_ecs_io) : "") != 0) {
     dns_record_t set_rec;
     memset(&set_rec, 0, sizeof(set_rec));
@@ -1108,18 +1215,24 @@ static int axfr_emit_zone_record(axfr_emit_ctx_t *ec, const dns_record_t *rec_it
     set_rec.generic_data = (uint8_t *)r_ecs;
     set_rec.generic_len = strlen(r_ecs);
     if (axfr_emit_record(ec, &set_rec) < 0) return -1;
-    *(cur_ecs_io) = rec_item->ecs_subnet_tag;
+    *(cur_ecs_io) = item_ecs_tag;
   }
-  if (rec_item->tinydns_loc[0] != 0 || rec_item->tinydns_loc[1] != 0 || rec_item->tinydns_ttd != 0) {
+  if (item_tloc[0] != 0 || item_tloc[1] != 0 || item_ttd != 0) {
     dns_record_t wrap_rec;
     uint8_t wrap_buf[4096];
-    if (wrap_tinydns_record(rec_item, &wrap_rec, wrap_buf, sizeof(wrap_buf))) {
+    if (img ? wrap_tinydns_image_rr(img, rr, &wrap_rec, wrap_buf, sizeof(wrap_buf))
+            : wrap_tinydns_record(rec_item, &wrap_rec, wrap_buf, sizeof(wrap_buf))) {
       return axfr_emit_record(ec, &wrap_rec);
     } else {
-      return axfr_emit_record(ec, rec_item);
+      return axfr_emit_item(ec, rec_item, img, rr);
     }
   }
-  return axfr_emit_record(ec, rec_item);
+  return axfr_emit_item(ec, rec_item, img, rr);
+}
+
+static int axfr_emit_zone_record(axfr_emit_ctx_t *ec, const dns_record_t *rec_item,
+                                 const char **cur_loc_io, const char **cur_ecs_io) {
+  return axfr_emit_zone_item(ec, rec_item, NULL, 0, cur_loc_io, cur_ecs_io);
 }
 
 /* 転送要求への1通だけのエラー応答 (RFC 5936 §2.2: 質問セクションを写し、それで転送を終える)。
@@ -1162,15 +1275,14 @@ static void axfr_send_error(int client_fd, const uint8_t *req, uint16_t req_len,
 /* Extended AXFR (KariDNS 拡張) でしか運べないデータがゾーンにあるか。無ければ拡張を求める
  * KariDNS セカンダリの IXFR にも差分で答えられる (X-24)。セカンダリは IXFR を受けると
  * 自分の active を複製して差分を当てるので、拡張データの更新はこの判定で AXFR に回す。 */
-static bool zone_needs_extended_axfr(const zone_arena_t *zone, const zone_db_entry_t *entry) {
-  if (zone->bind_location_tag_count > 0 || zone->bind_ecs_tag_count > 0 || zone->location_count > 0 ||
-      zone->is_tinydns_format || zone->bind_ecs_trusted_resolver_count > 0)
+static bool zone_needs_extended_axfr(const zone_image_t *zone, const zone_db_entry_t *entry) {
+  if (zone_image_has_zattr(zone) || (zone->flags & ZONE_IMAGE_F_TINYDNS))
     return true;
   bool cfg_trusted = false;
   server_config_t *cfg = acquire_config_snapshot();
   if (cfg) {
     zone_config_t *zcfg = find_zone_config_in_view(cfg, entry->view_name, entry->domain);
-    cfg_trusted = (zcfg && zcfg->ecs_trusted_resolvers_count > 0) || cfg->ecs_trusted_resolvers_count > 0;
+    cfg_trusted = (zcfg && zext(zcfg)->ecs_trusted_resolvers_count > 0) || cfg->ecs_trusted_resolvers_count > 0;
     release_config_snapshot(cfg);
   }
   return cfg_trusted;
@@ -1190,8 +1302,9 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   /* arena は呼び出し側 (axfr_worker_thread) の読み取り区間 (rcu_aux_read_lock) と entry->active_axfr
    * (writer は wait_for_active_axfr() で待つ) で守られる。X-03: arena の reader_count は待つ側が
    * 無かったので削除した。 */
-  zone_arena_t *current_zone = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-  if (current_zone->count == 0) {
+  zone_version_t *current_arena = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  const zone_image_t *current_zone = current_arena->image;
+  if (!current_zone || current_zone->n_rrs == 0) {
     /* X-19: まだデータの無いゾーン (未転送のセカンダリなど)。何も送らないとクライアントは
      * タイムアウトまで待つので、SERVFAIL と EDE 14 Not Ready (RFC 8914 §4.15) で終える。 */
     axfr_send_error(client_fd, req, req_len, 2, false, 14, "Zone not loaded", tsig_key, req_mac, req_mac_len,
@@ -1256,15 +1369,8 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     resp_edns.send_expire_value = zone_expire_option_value(entry, time(NULL));
   }
 
-  int soa_idx = -1;
-  for (size_t i = 0; i < current_zone->count; i++) {
-    if (current_zone->records[i].type_code == 6 &&
-        domain_names_match_ci(current_zone->records[i].name, entry->domain)) {
-      soa_idx = i;
-      break;
-    }
-  }
-  if (soa_idx < 0) {
+  uint32_t soa_rr = zone_image_apex_soa(current_zone);
+  if (soa_rr == ZONE_IMAGE_NONE) {
     free(res);
     return;
   }
@@ -1272,7 +1378,14 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   bool send_ixfr = false;
   ixfr_txn_t *txn_list[MAX_IXFR_HISTORY];
   int txn_count = 0;
-  uint32_t current_serial = strtoul(current_zone->records[soa_idx].rdata[2], NULL, 10);
+  uint32_t current_serial = 0;
+  {
+    zone_image_soa_t soa_nums;
+    if (zone_image_soa(current_zone, soa_rr, NULL, 0, NULL, 0, &soa_nums) == 0) current_serial = soa_nums.serial;
+  }
+  /* Extended AXFR: the zone level tables, decoded from the image (freed at the end) */
+  zone_arena_t zattr;
+  zone_arena_init(&zattr);
 
   /* R-15, RFC 1995 §2: 同じか新しい版 (RFC 1982 の比較) を持つクライアントには現在の SOA 1件で答える。 */
   bool client_up_to_date = is_ixfr && (client_serial == current_serial ||
@@ -1286,12 +1399,14 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   if (client_up_to_date) {
     send_ixfr = true;
   } else if (is_ixfr) {
+    /* RFC 1995 §4: when no incremental answer is available (no history at all with ixfr-history 0, or the client's
+     * serial is older than the oldest kept diff) the whole zone is sent, AXFR style */
     pthread_mutex_lock(&entry->ixfr_history.lock);
     if (entry->ixfr_history.count > 0) {
-    int start_idx = (entry->ixfr_history.head + MAX_IXFR_HISTORY - entry->ixfr_history.count) % MAX_IXFR_HISTORY;
+    int start_idx = (entry->ixfr_history.head + entry->ixfr_history.cap - entry->ixfr_history.count) % entry->ixfr_history.cap;
     int found_idx = -1;
     for (int i = 0; i < entry->ixfr_history.count; i++) {
-      int idx = (start_idx + i) % MAX_IXFR_HISTORY;
+      int idx = (start_idx + i) % entry->ixfr_history.cap;
       ixfr_txn_t *txn = entry->ixfr_history.entries[idx];
       if (txn && txn->old_serial == client_serial) {
         found_idx = i;
@@ -1302,7 +1417,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       bool continuous = true;
       uint32_t expected_serial = client_serial;
       for (int i = found_idx; i < entry->ixfr_history.count; i++) {
-        int idx = (start_idx + i) % MAX_IXFR_HISTORY;
+        int idx = (start_idx + i) % entry->ixfr_history.cap;
         ixfr_txn_t *txn = entry->ixfr_history.entries[idx];
         if (!txn || txn->old_serial != expected_serial) {
           continuous = false;
@@ -1313,7 +1428,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       if (continuous && expected_serial == current_serial) {
         send_ixfr = true;
         for (int i = found_idx; i < entry->ixfr_history.count; i++) {
-          int idx = (start_idx + i) % MAX_IXFR_HISTORY;
+          int idx = (start_idx + i) % entry->ixfr_history.cap;
           ixfr_txn_t *txn = entry->ixfr_history.entries[idx];
           if (txn) {
             atomic_fetch_add_explicit(&txn->ref_count, 1, memory_order_acquire);
@@ -1360,8 +1475,9 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   compress_ctx_init_packet(&ec.comp_ctx);
   register_wire_name_for_compression(res, DNS_HEADER_SIZE, &ec.comp_ctx);
 
+  if (!send_ixfr && is_extended_axfr && zone_image_zattr_load(current_zone, &zattr) != 0) goto axfr_error;
   if (send_ixfr) {
-    if (axfr_emit_record(&ec, &current_zone->records[soa_idx]) < 0) goto axfr_error;
+    if (axfr_emit_item(&ec, NULL, current_zone, soa_rr) < 0) goto axfr_error;
     const char *ixfr_loc = NULL;
     const char *ixfr_ecs = NULL;
     for (int t = 0; t < txn_count; t++) {
@@ -1390,17 +1506,17 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       }
     }
     if (txn_count > 0) {
-      if (axfr_emit_record(&ec, &current_zone->records[soa_idx]) < 0) goto axfr_error;
+      if (axfr_emit_item(&ec, NULL, current_zone, soa_rr) < 0) goto axfr_error;
     }
   } else {
     // 1. Initial SOA
-    if (axfr_emit_record(&ec, &current_zone->records[soa_idx]) < 0) goto axfr_error;
+    if (axfr_emit_item(&ec, NULL, current_zone, soa_rr) < 0) goto axfr_error;
 
     // Definitions emitted after first SOA in extended mode
     if (is_extended_axfr) {
-      for (int i = 0; i < current_zone->bind_location_tag_count; i++) {
+      for (int i = 0; i < zattr.bind_location_tag_count; i++) {
         uint8_t tag_buf[2048];
-        size_t dlen = pack_tag_def_rdata(tag_buf, sizeof(tag_buf), &current_zone->bind_location_tags[i]);
+        size_t dlen = pack_tag_def_rdata(tag_buf, sizeof(tag_buf), &zattr.bind_location_tags[i]);
         if (dlen > 0) {
           dns_record_t tag_rec;
           memset(&tag_rec, 0, sizeof(tag_rec));
@@ -1413,9 +1529,9 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
           if (axfr_emit_record(&ec, &tag_rec) < 0) goto axfr_error;
         }
       }
-      for (int i = 0; i < current_zone->bind_ecs_tag_count; i++) {
+      for (int i = 0; i < zattr.bind_ecs_tag_count; i++) {
         uint8_t tag_buf[2048];
-        size_t dlen = pack_tag_def_rdata(tag_buf, sizeof(tag_buf), &current_zone->bind_ecs_tags[i]);
+        size_t dlen = pack_tag_def_rdata(tag_buf, sizeof(tag_buf), &zattr.bind_ecs_tags[i]);
         if (dlen > 0) {
           dns_record_t tag_rec;
           memset(&tag_rec, 0, sizeof(tag_rec));
@@ -1430,13 +1546,13 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       }
       server_config_t *axfr_cfg = acquire_config_snapshot();
       zone_config_t *axfr_zcfg = axfr_cfg ? find_zone_config_in_view(axfr_cfg, entry->view_name, entry->domain) : NULL;
-      char **trusted_res = (current_zone->bind_ecs_trusted_resolver_count > 0 && current_zone->bind_ecs_trusted_resolvers)
-                            ? current_zone->bind_ecs_trusted_resolvers : NULL;
-      int trusted_count = trusted_res ? current_zone->bind_ecs_trusted_resolver_count : 0;
+      char **trusted_res = (zattr.bind_ecs_trusted_resolver_count > 0 && zattr.bind_ecs_trusted_resolvers)
+                            ? zattr.bind_ecs_trusted_resolvers : NULL;
+      int trusted_count = trusted_res ? zattr.bind_ecs_trusted_resolver_count : 0;
       if (!trusted_res) {
-        trusted_res = (axfr_zcfg && axfr_zcfg->ecs_trusted_resolvers) ? axfr_zcfg->ecs_trusted_resolvers
+        trusted_res = (axfr_zcfg && zext(axfr_zcfg)->ecs_trusted_resolvers) ? zext(axfr_zcfg)->ecs_trusted_resolvers
                                                                        : (axfr_cfg ? axfr_cfg->ecs_trusted_resolvers : NULL);
-        trusted_count = (axfr_zcfg && axfr_zcfg->ecs_trusted_resolvers) ? axfr_zcfg->ecs_trusted_resolvers_count
+        trusted_count = (axfr_zcfg && zext(axfr_zcfg)->ecs_trusted_resolvers) ? zext(axfr_zcfg)->ecs_trusted_resolvers_count
                                                                    : (axfr_cfg ? axfr_cfg->ecs_trusted_resolvers_count : 0);
       }
       if (trusted_count > 0 && trusted_res) {
@@ -1466,8 +1582,8 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
         }
       }
       if (axfr_cfg) release_config_snapshot(axfr_cfg);
-      for (int i = 0; i < current_zone->location_count; i++) {
-        const tinydns_location_entry_t *loc = &current_zone->locations[i];
+      for (int i = 0; i < zattr.location_count; i++) {
+        const tinydns_location_entry_t *loc = &zattr.locations[i];
         /* Extended AXFR v2: code(2) + prefix length in bits(1) + network(4) */
         uint8_t loc_buf[7];
         loc_buf[0] = loc->code[0];
@@ -1488,10 +1604,12 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
 
     const char *current_stream_loc = NULL;
     const char *current_stream_ecs = NULL;
-    for (size_t i = 0; i < current_zone->count; i++) {
-      if ((int)i == soa_idx)
+    /* file order (zone_image_seq_rr), as the builder was walked before */
+    for (uint32_t seq = 0; seq < current_zone->n_rrs; seq++) {
+      uint32_t rr = zone_image_seq_rr(current_zone, seq);
+      if (rr == soa_rr)
         continue;
-      if (axfr_emit_zone_record(&ec, &current_zone->records[i], &current_stream_loc, &current_stream_ecs) < 0) goto axfr_error;
+      if (axfr_emit_zone_item(&ec, NULL, current_zone, rr, &current_stream_loc, &current_stream_ecs) < 0) goto axfr_error;
     }
 
     if (is_extended_axfr) {
@@ -1520,7 +1638,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     }
 
     // 3. Trailing SOA
-    if (axfr_emit_record(&ec, &current_zone->records[soa_idx]) < 0) goto axfr_error;
+    if (axfr_emit_item(&ec, NULL, current_zone, soa_rr) < 0) goto axfr_error;
   }
   if (ec.answers > 0) {
     ec.res[6] = (uint8_t)(ec.answers >> 8);
@@ -1554,9 +1672,11 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     }
   }
   if (res) free(res);
+  zone_arena_destroy(&zattr);
   return;
 
 axfr_error:
+  zone_arena_destroy(&zattr);
   for (int t = 0; t < txn_count; t++) {
     if (atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_acq_rel) == 1) {
        free_ixfr_txn(txn_list[t]);

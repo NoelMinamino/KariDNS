@@ -40,6 +40,10 @@ typedef struct parse_context_s {
     // --- 隍・焚繧ｾ繝ｼ繝ｳ繝ｻ隕ｪ蟄舌だ繝ｼ繝ｳ謖ｯ繧雁・縺醍畑 ---
     const char **all_zone_names;
     int all_zone_count;
+    /* tinydns: 省略可。name (正規形) が同じ view のゾーンの頂点かを答える。あれば all_zone_names の
+     * 代わりに使い、レコードごとの判定をゾーン数ではなくラベル数に比例させる。 */
+    bool (*zone_exists)(const void *ud, const char *name);
+    const void *zone_exists_ud;
     /* tinydns: all_zone_names のどのゾーンにも属さないため捨てたレコードの数と、
      * その最初のオーナー名 (arena 内の文字列)。all_zone_names が無ければ数えない。 */
     size_t out_of_zone_count;
@@ -55,31 +59,16 @@ typedef struct {
     uint8_t prefix_bits; /* 0..32: CIDR prefix length in bits (prefix[] holds the masked network) */
 } tinydns_location_entry_t;
 
-typedef struct {
-  char *target_name;
-  dns_record_t **records;
-  int record_count;
-} prelinked_glue_entry_t;
-
-typedef struct response_cache_entry_s {
-  char *name;
-  uint32_t name_hash;
-  uint16_t qtype;
-  uint16_t qclass;
-  uint16_t ancount;
-  uint16_t nscount;
-  uint16_t arcount;
-  uint16_t body_len;
-  uint8_t *body;
-  struct response_cache_entry_s *next;
-} response_cache_entry_t;
-
-typedef struct {
-  response_cache_entry_t **buckets;
-  size_t bucket_count;
-  size_t entry_count;
-  size_t total_bytes;
-} response_cache_table_t;
+/* S2 / S5 B-2: the sibling zones whose addresses a zone's Additional sections may use (additional-from-auth yes).
+ * One malloc block (ids, targets and the target strings follow the struct). The zone data itself is read from the image;
+ * this is the only mutable state kept next to it: zone_glue_refresh_dependents() (control thread, writer_lock) rewrites
+ * ids[] and built_at after the zone was published. */
+typedef struct zone_glue_s {
+  uint64_t built_at;     /* the global publish counter when the siblings were looked up */
+  int count;
+  uint64_t *ids;         /* per target: id of the zone it resolved to in the view (0 = none / the zone itself) */
+  const char **targets;  /* per target: name of an NS / MX / SRV target (first MAX_PRELINK_TARGETS distinct, in file order) */
+} zone_glue_t;
 
 /* RFC 5155 §3.1.7: one NSEC3 RR of a chain, keyed by the hashed owner name (the owner's first label, base32hex;
  * RFC 5155 §2 "hash order" = canonical order of the base32hex labels, compared case-insensitively). */
@@ -113,18 +102,41 @@ typedef struct {
   uint8_t salt[255];
 } nsec3_params_t;
 
+/* S5 B-3: what a published version of a zone is. The fields every reader needs: the image, the glue-tracking side block,
+ * the response-cache flag and the generation. A published version is a zone_version_t of its own (one small malloc,
+ * zone_version_new()); zone_arena_t, the builder, starts with the same fields (as `ver`), so a hand-made arena can stand
+ * in for a published version in tests: heap == false means "not owned by the zone entry" and is never freed with it. */
+#define ZONE_VERSION_FIELDS                                                              \
+  struct zone_image_s *image; /* the compact image (dns_zone_image.h); zone_version_free() frees it */ \
+  zone_glue_t *glue;          /* NULL = no sibling addresses are used */                \
+  bool rcache_ok;             /* the zone's answers may go into the shared response cache */ \
+  bool heap;                  /* allocated by zone_version_new(): the zone entry frees it */ \
+  /* the published version / any change of a sibling zone: a new value (response cache key). 0 = unpublished/test */ \
+  _Atomic uint64_t generation;
+typedef struct zone_version_s {
+  ZONE_VERSION_FIELDS
+} zone_version_t;
+
 typedef struct zone_arena_s {
+  union {
+    zone_version_t ver;
+    struct { ZONE_VERSION_FIELDS };
+  };
   dns_record_t *records;
   size_t count;
   size_t records_cap;
-  char *data_pools[128];
+  char **data_pools;      /* data_pool_cap 個 (必要に応じて倍に伸ばす、最大 ZONE_ARENA_MAX_POOLS) */
   int data_pool_count;
+  int data_pool_cap;
+  size_t first_pool_cap;  /* 0 = 64 KiB。小さいゾーンは読み込み前にファイルの大きさから決める */
   size_t current_pool_cap;
   size_t current_pool_idx;
-  char *file_bufs[32];
-  char *display_bufs[32];
-  char *file_paths[32];   // file_bufs[i] に対応する解決済み絶対パス
+  /* 読み込んだファイルの本文 (レコードの文字列はこの中を指す)。file_buf_cap 個まで (最大 32) */
+  char **file_bufs;
+  char **display_bufs;
+  char **file_paths;      // file_bufs[i] に対応する解決済み絶対パス
   int file_buf_count;
+  int file_buf_cap;
   int *hash_table;
   size_t hash_size;
   dns_record_t **nsec_records;
@@ -145,22 +157,44 @@ typedef struct zone_arena_s {
   char **bind_ecs_trusted_resolvers;      /* AXFR(拡張モード)で受信した値、NULL可 */
   int bind_ecs_trusted_resolver_count;
   acl_entry_t *bind_ecs_trusted_resolvers_parsed;
-  prelinked_glue_entry_t *prelinked_glue; /* 事前リンクされたAdditionalグルー */
-  int prelinked_glue_count;
-  response_cache_table_t response_cache;  /* 事前レンダリング済みワイヤ形式応答キャッシュ */
+  /* S5 B-3: image / glue / rcache_ok / generation (what a published version keeps) are the members of `ver` above.
+   * S2: glue lists the targets whose sibling zones' addresses an answer may use (NULL = none); after the version is
+   * published only the control thread writes it. zone_image_freeze() makes image just before publishing. */
 } zone_arena_t;
+
+#define ZONE_ARENA_MAX_POOLS 128
+#define ZONE_ARENA_MAX_FILES 32
+/* file を arena に登録する ($INCLUDE を含め最大 ZONE_ARENA_MAX_FILES)。失敗は -1 (呼び出し側が buf 等を解放) */
+int zone_arena_add_file(zone_arena_t *arena, char *buf, char *display, char *path);
+/* グルーを含めたゾーンのデータの版 (応答キャッシュの鍵) */
+static inline uint64_t zone_arena_data_generation(const zone_version_t *arena) {
+  return atomic_load_explicit((_Atomic uint64_t *)&arena->generation, memory_order_acquire);
+}
 
 int parse_zone_fast(char *buf, size_t len, zone_arena_t *arena, parse_context_t *ctx);
 int parse_tinydns_data(char *buf, size_t len, zone_arena_t *arena, parse_context_t *ctx);
 dns_record_t *arena_alloc_record(zone_arena_t *arena, parse_context_t *ctx, const char *err_pos, const char *buf);
+/* S5: rec->rdata[] を n 個ぶん arena に取る (rdata[i] への代入より前に呼ぶ)。失敗は false。rdata[] は 0 で埋める。rdata_count は呼び出し側が設定する */
+bool arena_record_alloc_rdata(zone_arena_t *arena, dns_record_t *rec, int n);
 void zone_arena_init(zone_arena_t *arena);
 void zone_arena_destroy(zone_arena_t *arena);
+/* S5 B-2: free the builder side of an arena once its image is made: records, data pools, indexes, zone level tables and
+ * the kept zone file text. image, glue, rcache_ok and generation are kept. */
+void zone_arena_free_builder(zone_arena_t *arena);
 void zone_arena_free_include_buffers(zone_arena_t *arena);
-void free_zone_response_cache(zone_arena_t *arena);
-void build_zone_response_cache(zone_arena_t *arena, struct server_config_s *cfg, const char *view_name, const char *domain);
+/* 公開直前に呼ぶ: 応答キャッシュに入れてよいか (rcache_ok) を決める */
+void build_zone_response_cache(zone_version_t *ver, struct server_config_s *cfg, const char *view_name, const char *domain);
+/* S5 B-3: make the published version out of a frozen builder: a new heap zone_version_t takes over builder->image (the builder
+ * keeps nothing of it and can be destroyed). NULL on out of memory; the builder still owns the image then. */
+zone_version_t *zone_version_new(zone_arena_t *builder);
+/* Frees the image, the glue block and the version itself (a version that is not heap, e.g. a test's arena, is left alone). */
+void zone_version_free(zone_version_t *ver);
+/* What a zone entry points to before its first publish: no image, never freed. */
+extern zone_version_t zone_version_empty;
 void *arena_alloc(zone_arena_t *arena, size_t size);
 char *arena_strdup(zone_arena_t *arena, const char *str);
 /* RFC 2181 s5.2 / RFC 4035 s2.2: harmonize_ttls=true normalizes RRset TTLs. */
+void zone_arena_shrink_records(zone_arena_t *arena);
 int build_zone_index(zone_arena_t *arena, bool harmonize_ttls);
 /* Frees the lookup indexes build_zone_index() allocates besides the hash table (NSEC, NSEC3, sorted names). */
 void zone_arena_free_sorted_indexes(zone_arena_t *arena);

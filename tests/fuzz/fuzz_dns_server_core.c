@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include "../../dns_config_parser.h"
 #include "../../dns_zone_parser.h"
+#include "../../dns_zone_image.h"
+#include "../test_image_helper.h"
 
 // Override syslog to prevent massive disk I/O and CPU usage during fuzzing
 void syslog(int priority, const char *format, ...) {
@@ -48,11 +50,11 @@ static void init_fuzz_environment(void) {
                        "cname.fuzz.local. 3600 IN CNAME fuzz.local.\n"
                        "sub.fuzz.local. 3600 IN A 192.0.2.2\n";
     parse_zone_fast(zone_text, strlen(zone_text), &g_fuzz_arena, &ctx);
-    build_zone_index(&g_fuzz_arena, true);
+    assert(test_build_index(&g_fuzz_arena, true) == 0);
 
     memset(&g_fuzz_entry, 0, sizeof(g_fuzz_entry));
     strncpy(g_fuzz_entry.domain, "fuzz.local.", sizeof(g_fuzz_entry.domain) - 1);
-    atomic_store_explicit(&g_fuzz_entry.rcu.active, &g_fuzz_arena, memory_order_release);
+    atomic_store_explicit(&g_fuzz_entry.rcu.active, &g_fuzz_arena.ver, memory_order_release);
 
     g_fuzz_entries[0] = &g_fuzz_entry;
 
@@ -116,7 +118,7 @@ static void check_nsec3_active(zone_arena_t *arena) {
 /* Phase 9: DO=1 queries against the fuzzed zone (answer sections, RRSIG attachment, NSEC/NSEC3 proofs, glue),
  * with a 512-octet and a 4096-octet EDNS buffer, for the apex, a missing name and the first owners of the zone. */
 static void query_fuzzed_zone(zone_arena_t *arena) {
-    atomic_store_explicit(&g_fuzz_entry.rcu.active, arena, memory_order_release);
+    atomic_store_explicit(&g_fuzz_entry.rcu.active, &arena->ver, memory_order_release);
     static const uint16_t types[] = { 255, 1, 43, 48, 15, 2 };
     const char *names[6] = { "fuzz.local.", "nx.fuzz.local.", "a.b.fuzz.local.", NULL, NULL, NULL };
     uint16_t own_type[6] = { 6, 1, 1, 0, 0, 0 };
@@ -144,12 +146,12 @@ static void query_fuzzed_zone(zone_arena_t *arena) {
             compress_ctx_t comp_ctx;
             memset(&comp_ctx, 0, sizeof(comp_ctx));
             compress_ctx_init_packet(&comp_ctx);
-            rate_limit_config_t *rrl = NULL;
+            const rate_limit_config_t *rrl = NULL;
             process_dns_query(req, off, res, sizeof(res), qname, qtype, "127.0.0.1", &comp_ctx, false, &rrl,
                               &g_fuzz_snap);
         }
     }
-    atomic_store_explicit(&g_fuzz_entry.rcu.active, &g_fuzz_arena, memory_order_release);
+    atomic_store_explicit(&g_fuzz_entry.rcu.active, &g_fuzz_arena.ver, memory_order_release);
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
@@ -189,7 +191,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         memset(&ctx, 0, sizeof(ctx));
         ctx.default_origin = "fuzz.local.";
 
-        if (parse_zone_fast(text_buf, fuzz_size, &arena, &ctx) >= 0 && build_zone_index(&arena, true) == 0) {
+        /* like the loader (X-32): what cannot be written in wire format never reaches the index and the image */
+        if (parse_zone_fast(text_buf, fuzz_size, &arena, &ctx) >= 0 &&
+            (zone_arena_drop_unencodable(&arena, NULL, NULL), test_build_index(&arena, true)) == 0) {
             check_nsec3_index(&arena);
             check_nsec3_active(&arena);
             query_fuzzed_zone(&arena);
@@ -210,7 +214,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         memset(&session, 0, sizeof(session));
 
         /* R-33: transferred NSEC3 RRs get text fields and enter the index like file-loaded ones */
-        if (parse_xfr_packet(fuzz_data, fuzz_size, &standby, &active, &session, "fuzz.local.") == 0 &&
+        if (parse_xfr_packet(fuzz_data, fuzz_size, &standby, &active.ver, &session, "fuzz.local.") == 0 &&
             build_zone_index(&standby, true) == 0)
             check_nsec3_index(&standby);
 
@@ -230,7 +234,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         size_t qend = 0;
         parse_query_question_fast(fuzz_data, fuzz_size, qname, sizeof(qname), &qtype, &qclass, &qend);
 
-        rate_limit_config_t *rrl = NULL;
+        const rate_limit_config_t *rrl = NULL;
         bool is_tcp = (selector & 0x80) != 0;
         process_dns_query(fuzz_data, fuzz_size, res, sizeof(res), qname, qtype,
                           "127.0.0.1", &comp_ctx, is_tcp, &rrl, &g_fuzz_snap);

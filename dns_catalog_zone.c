@@ -1,6 +1,7 @@
 #define OPENSSL_SUPPRESS_DEPRECATED 1
 #define STATIC_TEST
 #include "dns_catalog_zone.h"
+#include "dns_zone_image.h"
 
 uint32_t calc_catalog_member_hash(const char *domain, const char *unique_id) {
   uint32_t hash = calc_fnv1a_str(domain);
@@ -97,6 +98,29 @@ static bool catalog_prefix_is_single_label(const char *name, size_t prefix_len) 
     return true;
 }
 
+/* The first character-string of a TXT RR of the image (what the zone file text calls rdata[0]); false if the RDATA has none. */
+static bool catalog_txt_first(const zone_image_t *img, uint32_t rr, char *buf, size_t cap) {
+    const uint8_t *rd = zone_image_rr_rdata(img, rr);
+    uint16_t len = zone_image_rr_rdlen(img, rr);
+    if (len < 1 || (size_t)rd[0] + 1 > len || (size_t)rd[0] + 1 > cap) return false;
+    memcpy(buf, rd + 1, rd[0]);
+    buf[rd[0]] = '\0';
+    return true;
+}
+
+/* number of RRs of `type` at `name` (any spelling); *first_rr = the first of them */
+static int catalog_count(const zone_image_t *img, const char *name, uint16_t type, uint32_t *first_rr) {
+    int n = 0;
+    uint32_t id = zone_image_find_name(img, name);
+    if (first_rr) *first_rr = ZONE_IMAGE_NONE;
+    if (id == ZONE_IMAGE_NONE) return 0;
+    for (uint32_t k = zone_image_rrset_next(img, id, type, zone_image_name_first_rr(img, id)); k != ZONE_IMAGE_NONE;
+         k = zone_image_rrset_next(img, id, type, k + 1)) {
+        if (n++ == 0 && first_rr) *first_rr = k;
+    }
+    return n;
+}
+
 void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name) {
     if (!catalog_entry || !catalog_cfg) return;
 
@@ -104,8 +128,9 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
      * writer がこの arena を standby として再利用しないよう、読み取り区間に入れる。
      * 区間は rebuild_zone_db_snapshot() の前で抜ける (ロック待ちを区間に含めない)。*/
     rcu_aux_read_lock();
-    zone_arena_t *arena = atomic_load_explicit(&catalog_entry->rcu.active, memory_order_acquire);
-    if (!arena) {
+    zone_version_t *arena = atomic_load_explicit(&catalog_entry->rcu.active, memory_order_acquire);
+    const zone_image_t *img = arena ? arena->image : NULL;
+    if (!img) {
         rcu_aux_read_unlock();
         return;
     }
@@ -114,9 +139,12 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     char version_txt[256];
     snprintf(version_txt, sizeof(version_txt), "version.%s", catalog_entry->domain);
     bool found_version = false;
-    for (size_t i = 0; i < arena->count; i++) {
-        if (arena->records[i].type_code == 16 && strcasecmp(arena->records[i].name, version_txt) == 0) {
-            if (arena->records[i].rdata_count > 0 && strcmp(arena->records[i].rdata[0], "2") == 0) {
+    {
+        uint32_t vid = zone_image_find_name(img, version_txt);
+        for (uint32_t k = vid == ZONE_IMAGE_NONE ? ZONE_IMAGE_NONE : zone_image_rrset_next(img, vid, 16, zone_image_name_first_rr(img, vid));
+             k != ZONE_IMAGE_NONE; k = zone_image_rrset_next(img, vid, 16, k + 1)) {
+            char v[8];
+            if (catalog_txt_first(img, k, v, sizeof(v)) && strcmp(v, "2") == 0) {
                 found_version = true;
                 break;
             }
@@ -130,7 +158,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     }
 
     // Build desired members list
-    int max_possible = arena->count;
+    int max_possible = (int)img->n_rrs;
     catalog_member_id_t *new_desired = calloc(max_possible, sizeof(catalog_member_id_t));
     if (!new_desired) {
         syslog(LOG_ERR, "[Catalog] Zone '%s': out of memory building member list", catalog_entry->domain);
@@ -144,13 +172,15 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     size_t suffix_len = strlen(suffix);
 
     server_config_t *cfg = acquire_config_snapshot();
-    for (size_t i = 0; i < arena->count; i++) {
-        if (arena->records[i].type_code == 12) { // PTR
-            size_t name_len = strlen(arena->records[i].name);
-            if (name_len > suffix_len && strcasecmp(arena->records[i].name + name_len - suffix_len, suffix) == 0 &&
-                catalog_prefix_is_single_label(arena->records[i].name, name_len - suffix_len)) {
-                if (arena->records[i].rdata_count > 0) {
-                    char *target = arena->records[i].rdata[0];
+    for (uint32_t seq = 0; seq < img->n_rrs; seq++) {
+        uint32_t rr = zone_image_seq_rr(img, seq);
+        if (zone_image_rr_type(img, rr) == 12) { // PTR
+            const char *rr_name = zone_image_name_text(img, zone_image_rr_name(img, rr));
+            size_t name_len = strlen(rr_name);
+            if (name_len > suffix_len && strcasecmp(rr_name + name_len - suffix_len, suffix) == 0 &&
+                catalog_prefix_is_single_label(rr_name, name_len - suffix_len)) {
+                char target[DNS_NAME_TEXT_SIZE];
+                if (zone_image_rr_target(img, rr, target, sizeof(target)) == 0) {
                     char norm_target[256];
                     if (!normalize_domain_fqdn_local(target, norm_target, sizeof(norm_target))) {
                         syslog(LOG_WARNING, "[Catalog] Zone '%s': member name too long. Skipping.", catalog_entry->domain);
@@ -167,7 +197,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
                     // Extract unique_id
                     size_t prefix_len = name_len - suffix_len;
                     if (prefix_len < sizeof(new_desired[new_desired_count].unique_id)) {
-                        strncpy(new_desired[new_desired_count].unique_id, arena->records[i].name, prefix_len);
+                        strncpy(new_desired[new_desired_count].unique_id, rr_name, prefix_len);
                         new_desired[new_desired_count].unique_id[prefix_len] = '\0';
                         strncpy(new_desired[new_desired_count].domain, norm_target, sizeof(new_desired[new_desired_count].domain) - 1);
                         new_desired[new_desired_count].domain[sizeof(new_desired[new_desired_count].domain) - 1] = '\0';
@@ -182,23 +212,19 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     // RFC 9432 §5.1: 壊れたカタログゾーンの検出
     // (1) 同一 <unique-N> に複数のPTRレコードが存在しないか
     bool catalog_broken = false;
-    for (size_t i = 0; i < arena->count && !catalog_broken; i++) {
-        if (arena->records[i].type_code != 12) continue;
-        size_t name_len = strlen(arena->records[i].name);
+    for (uint32_t seq = 0; seq < img->n_rrs && !catalog_broken; seq++) {
+        uint32_t rr = zone_image_seq_rr(img, seq);
+        if (zone_image_rr_type(img, rr) != 12) continue;
+        const char *rr_name = zone_image_name_text(img, zone_image_rr_name(img, rr));
+        size_t name_len = strlen(rr_name);
         if (name_len <= suffix_len ||
-            strcasecmp(arena->records[i].name + name_len - suffix_len, suffix) != 0 ||
-            !catalog_prefix_is_single_label(arena->records[i].name, name_len - suffix_len))
+            strcasecmp(rr_name + name_len - suffix_len, suffix) != 0 ||
+            !catalog_prefix_is_single_label(rr_name, name_len - suffix_len))
             continue;
-        int count_for_this_name = 0;
-        for (size_t j = 0; j < arena->count; j++) {
-            if (arena->records[j].type_code == 12 &&
-                strcasecmp(arena->records[j].name, arena->records[i].name) == 0) {
-                count_for_this_name++;
-            }
-        }
+        int count_for_this_name = catalog_count(img, rr_name, 12, NULL);
         if (count_for_this_name > 1) {
             syslog(LOG_ERR, "[Catalog] Zone '%s': member node '%s' has %d PTR records (RFC 9432 requires exactly 1); catalog zone is broken and will NOT be processed",
-                   catalog_entry->domain, arena->records[i].name, count_for_this_name);
+                   catalog_entry->domain, rr_name, count_for_this_name);
             catalog_broken = true;
         }
     }
@@ -225,12 +251,8 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
         char group_name[512];
         snprintf(group_name, sizeof(group_name), "group.%s.zones.%s", new_desired[d].unique_id, catalog_entry->domain);
         
-        int grp_count = 0;
-        for (size_t i = 0; i < arena->count; i++) {
-            if (arena->records[i].type_code == 16 && strcasecmp(arena->records[i].name, group_name) == 0) {
-                grp_count++;
-            }
-        }
+        uint32_t grp_first = ZONE_IMAGE_NONE;
+        int grp_count = catalog_count(img, group_name, 16, &grp_first);
         
         if (grp_count > 0) {
             new_desired[d].groups = calloc(grp_count, sizeof(char *));
@@ -241,10 +263,12 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
                 return;
             }
             new_desired[d].group_count = 0;
-            for (size_t i = 0; i < arena->count; i++) {
-                if (arena->records[i].type_code == 16 && strcasecmp(arena->records[i].name, group_name) == 0) {
-                    if (arena->records[i].rdata_count > 0) {
-                        char *g = strdup(arena->records[i].rdata[0]);
+            uint32_t gid = zone_image_rr_name(img, grp_first);
+            for (uint32_t i = grp_first; i != ZONE_IMAGE_NONE; i = zone_image_rrset_next(img, gid, 16, i + 1)) {
+                {
+                    char gtxt[256];
+                    if (catalog_txt_first(img, i, gtxt, sizeof(gtxt))) {
+                        char *g = strdup(gtxt);
                         if (!g) {
                             syslog(LOG_ERR, "[Catalog] Zone '%s': out of memory duplicating group string", catalog_entry->domain);
                             free_catalog_desired_list(new_desired, new_desired_count);
@@ -268,14 +292,14 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
         char coo_name[512];
         snprintf(coo_name, sizeof(coo_name), "coo.%s.zones.%s", new_desired[d].unique_id, catalog_entry->domain);
         
-        int coo_count = 0;
         char coo_rdata[256] = {0};
-        for (size_t i = 0; i < arena->count; i++) {
-            if (arena->records[i].type_code == 12 && strcasecmp(arena->records[i].name, coo_name) == 0) {
-                if (arena->records[i].rdata_count > 0) {
-                    strncpy(coo_rdata, arena->records[i].rdata[0], sizeof(coo_rdata) - 1);
-                }
-                coo_count++;
+        uint32_t coo_first = ZONE_IMAGE_NONE;
+        int coo_count = catalog_count(img, coo_name, 12, &coo_first);
+        if (coo_count > 0) {
+            uint32_t cid = zone_image_rr_name(img, coo_first);
+            for (uint32_t i = coo_first; i != ZONE_IMAGE_NONE; i = zone_image_rrset_next(img, cid, 12, i + 1)) {
+                char tgt[DNS_NAME_TEXT_SIZE];
+                if (zone_image_rr_target(img, i, tgt, sizeof(tgt)) == 0) strlcpy(coo_rdata, tgt, sizeof(coo_rdata));
             }
         }
         

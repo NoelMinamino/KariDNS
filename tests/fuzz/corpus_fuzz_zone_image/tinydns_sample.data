@@ -1,0 +1,13 @@
+%in:127.0.0.1
+%ex:10.0.0.0/8
+.fuzz.local:127.0.0.1:ns1.fuzz.local:2560
++act.fuzz.local:192.168.1.10:300:40000000b2d05e00
++cnt.fuzz.local:192.168.1.30:0:4000000099999999
++www.fuzz.local:192.168.1.10:300::in
++www.fuzz.local:10.0.0.10:300::ex
+@fuzz.local:192.168.1.30:mx1.fuzz.local:10:1800
+'txt.fuzz.local:Hello World:300
+Calias.fuzz.local:www.fuzz.local:1200
+Zc.fuzz.local:ns1.fuzz.local:admin.fuzz.local:2026090201:7200:3600:1209600:300:600
+:ssh.fuzz.local:44:
+%:3600

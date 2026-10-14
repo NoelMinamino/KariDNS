@@ -12,10 +12,13 @@
 #include "dns_wire.h"
 #include "dns_edns_ecs.h"
 #include "dns_config_parser.h"
+#include "test_zext.h"
 #include "dns_zone_parser.h"
 #include "dns_server_internal.h"
 #include "dns_cidr.h"
 #include "dns_tsig_acl.h"
+#include "dns_zone_image.h"
+#include "test_image_helper.h"
 
 // Mock globals
 int g_control_kq = -1;
@@ -233,6 +236,7 @@ static void test_tinydns_loc_and_wrap(void) {
     // 2. wrap_tinydns_record
     dns_record_t rec;
     memset(&rec, 0, sizeof(rec));
+    DNS_RECORD_BIND_RDATA(rec);
     rec.name = "www.example.com";
     rec.type = "A";
     rec.type_code = 1;
@@ -288,23 +292,23 @@ static void test_ecs_resolution(void) {
 
     uint8_t addr_match[4] = { 192, 0, 2, 45 };
     uint8_t out_scope = 0;
-    const char *tag = resolve_ecs_subnet_tag(&zone, NULL, NULL, addr_match, 1 /* IPv4 */, &out_scope);
+    const char *tag = resolve_ecs_subnet_tag(test_zimg(&zone), NULL, NULL, addr_match, 1 /* IPv4 */, &out_scope);
     assert(tag != NULL);
     assert(strcmp(tag, "tokyo") == 0);
     assert(out_scope == 24);
 
     uint8_t addr_nomatch[4] = { 10, 0, 0, 1 };
-    tag = resolve_ecs_subnet_tag(&zone, NULL, NULL, addr_nomatch, 1, &out_scope);
+    tag = resolve_ecs_subnet_tag(test_zimg(&zone), NULL, NULL, addr_nomatch, 1, &out_scope);
     assert(tag == NULL);
 
     // Test resolve_bind_location_tag
     zone.bind_location_tags = tags;
     zone.bind_location_tag_count = 2;
-    const char *loc_tag = resolve_bind_location_tag(&zone, NULL, NULL, "198.51.100.99");
+    const char *loc_tag = resolve_bind_location_tag(test_zimg(&zone), NULL, NULL, "198.51.100.99");
     assert(loc_tag != NULL);
     assert(strcmp(loc_tag, "osaka") == 0);
 
-    loc_tag = resolve_bind_location_tag(&zone, NULL, NULL, "10.0.0.1");
+    loc_tag = resolve_bind_location_tag(test_zimg(&zone), NULL, NULL, "10.0.0.1");
     assert(loc_tag == NULL);
 
     // Test tinydns_resolve_client_location
@@ -321,10 +325,10 @@ static void test_ecs_resolution(void) {
     zone.location_count = 2;
 
     char resolved_loc[2] = {0, 0};
-    tinydns_resolve_client_location(&zone, "192.0.2.123", resolved_loc);
+    tinydns_resolve_client_location(test_zimg(&zone), "192.0.2.123", resolved_loc);
     assert(resolved_loc[0] == 'j' && resolved_loc[1] == 'p');
 
-    tinydns_resolve_client_location(&zone, "1.2.3.4", resolved_loc);
+    tinydns_resolve_client_location(test_zimg(&zone), "1.2.3.4", resolved_loc);
     assert(resolved_loc[0] == 'u' && resolved_loc[1] == 's');
 
     /* bit-granular CIDR prefixes: longest match wins, ties go to the first definition */
@@ -339,15 +343,15 @@ static void test_ecs_resolution(void) {
     cidr_entries[3].prefix[1] = 31; cidr_entries[3].prefix[2] = 0; cidr_entries[3].prefix[3] = 1;          /* host */
     zone.locations = cidr_entries;
     zone.location_count = 4;
-    tinydns_resolve_client_location(&zone, "10.20.1.1", resolved_loc);   /* in 10.16.0.0-10.31.255.255 */
+    tinydns_resolve_client_location(test_zimg(&zone), "10.20.1.1", resolved_loc);   /* in 10.16.0.0-10.31.255.255 */
     assert(resolved_loc[0] == 'b');
-    tinydns_resolve_client_location(&zone, "10.31.0.1", resolved_loc);
+    tinydns_resolve_client_location(test_zimg(&zone), "10.31.0.1", resolved_loc);
     assert(resolved_loc[0] == 'd');
-    tinydns_resolve_client_location(&zone, "10.32.0.1", resolved_loc);   /* outside /12 */
+    tinydns_resolve_client_location(test_zimg(&zone), "10.32.0.1", resolved_loc);   /* outside /12 */
     assert(resolved_loc[0] == 'a');
-    tinydns_resolve_client_location(&zone, "192.0.2.1", resolved_loc);   /* no match */
+    tinydns_resolve_client_location(test_zimg(&zone), "192.0.2.1", resolved_loc);   /* no match */
     assert(resolved_loc[0] == 0 && resolved_loc[1] == 0);
-    tinydns_resolve_client_location(&zone, "2001:db8::1", resolved_loc); /* IPv6 never matches */
+    tinydns_resolve_client_location(test_zimg(&zone), "2001:db8::1", resolved_loc); /* IPv6 never matches */
     assert(resolved_loc[0] == 0);
 
     printf("  -> ECS & location resolution passed.\n");
@@ -366,7 +370,7 @@ static const char *scope_case(ecs_tag_def_t *tags, int tag_count, uint16_t famil
     assert(ok == 1);
     (void)ok;
     *scope = 0xEE;
-    return resolve_ecs_subnet_tag(&zone, NULL, NULL, addr, family, scope);
+    return resolve_ecs_subnet_tag(test_zimg(&zone), NULL, NULL, addr, family, scope);
 }
 
 static void test_ecs_scope_prefix(void) {
@@ -461,47 +465,47 @@ static void test_ecs_trusted_resolver_precedence(void) {
 
     // No source configured anywhere, or no client address: never trusted (fail closed).
     assert(!is_ecs_trusted_resolver(NULL, NULL, NULL, "192.0.2.7"));
-    assert(!is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "192.0.2.7"));
-    assert(!is_ecs_trusted_resolver(&zone, &cfg, &zcfg, NULL));
+    assert(!is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "192.0.2.7"));
+    assert(!is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, NULL));
 
     // Server-level list, pre-parsed binary ACL.
     cfg.ecs_trusted_resolvers = srv_list;
     cfg.ecs_trusted_resolvers_count = 1;
     cfg.ecs_trusted_resolvers_parsed = acl_list_parse(srv_list, 1);
     assert(cfg.ecs_trusted_resolvers_parsed != NULL);
-    assert(is_ecs_trusted_resolver(&zone, &cfg, NULL, "192.0.2.7"));
-    assert(!is_ecs_trusted_resolver(&zone, &cfg, NULL, "198.51.100.1"));
-    assert(!is_ecs_trusted_resolver(&zone, &cfg, NULL, "203.0.113.9"));
+    assert(is_ecs_trusted_resolver(test_zimg(&zone), &cfg, NULL, "192.0.2.7"));
+    assert(!is_ecs_trusted_resolver(test_zimg(&zone), &cfg, NULL, "198.51.100.1"));
+    assert(!is_ecs_trusted_resolver(test_zimg(&zone), &cfg, NULL, "203.0.113.9"));
 
     // A zone-level list replaces (does not extend) the server-level list.
-    zcfg.ecs_trusted_resolvers = zcfg_list;
-    zcfg.ecs_trusted_resolvers_count = 1;
-    zcfg.ecs_trusted_resolvers_parsed = acl_list_parse(zcfg_list, 1);
-    assert(zcfg.ecs_trusted_resolvers_parsed != NULL);
-    assert(is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "198.51.100.1"));
-    assert(!is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "192.0.2.7"));
+    tzx(&zcfg)->ecs_trusted_resolvers = zcfg_list;
+    tzx(&zcfg)->ecs_trusted_resolvers_count = 1;
+    tzx(&zcfg)->ecs_trusted_resolvers_parsed = acl_list_parse(zcfg_list, 1);
+    assert(zext(&zcfg)->ecs_trusted_resolvers_parsed != NULL);
+    assert(is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "198.51.100.1"));
+    assert(!is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "192.0.2.7"));
 
     // The list received via extended AXFR (stored in the zone data) wins over both.
     zone.bind_ecs_trusted_resolvers = zone_list;
     zone.bind_ecs_trusted_resolver_count = 1;
     zone.bind_ecs_trusted_resolvers_parsed = acl_list_parse(zone_list, 1);
     assert(zone.bind_ecs_trusted_resolvers_parsed != NULL);
-    assert(is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "203.0.113.9"));
-    assert(!is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "198.51.100.1"));
-    assert(!is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "192.0.2.7"));
+    assert(is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "203.0.113.9"));
+    assert(!is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "198.51.100.1"));
+    assert(!is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "192.0.2.7"));
 
     // Without the pre-parsed form the textual lists are used, with the same precedence.
     free(zone.bind_ecs_trusted_resolvers_parsed); zone.bind_ecs_trusted_resolvers_parsed = NULL;
-    free(zcfg.ecs_trusted_resolvers_parsed);      zcfg.ecs_trusted_resolvers_parsed = NULL;
+    free(zext(&zcfg)->ecs_trusted_resolvers_parsed);      tzx(&zcfg)->ecs_trusted_resolvers_parsed = NULL;
     free(cfg.ecs_trusted_resolvers_parsed);       cfg.ecs_trusted_resolvers_parsed = NULL;
-    assert(is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "203.0.113.9"));
-    assert(!is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "198.51.100.1"));
+    assert(is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "203.0.113.9"));
+    assert(!is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "198.51.100.1"));
     zone.bind_ecs_trusted_resolvers = NULL; zone.bind_ecs_trusted_resolver_count = 0;
-    assert(is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "198.51.100.1"));
-    assert(!is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "192.0.2.7"));
-    zcfg.ecs_trusted_resolvers = NULL; zcfg.ecs_trusted_resolvers_count = 0;
-    assert(is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "192.0.2.7"));
-    assert(!is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "198.51.100.1"));
+    assert(is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "198.51.100.1"));
+    assert(!is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "192.0.2.7"));
+    tzx(&zcfg)->ecs_trusted_resolvers = NULL; tzx(&zcfg)->ecs_trusted_resolvers_count = 0;
+    assert(is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "192.0.2.7"));
+    assert(!is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "198.51.100.1"));
 
     // ACL semantics: first match wins, `!` negates (BIND 9 address_match_list), IPv6 prefixes.
     char *neg[] = { (char *)"!192.0.2.7", (char *)"192.0.2.0/24", (char *)"2001:db8::/32" };

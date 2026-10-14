@@ -8,6 +8,7 @@
 #include "dns_wire.h"
 #include "dns_config_parser.h"
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
 
 // EDE stats counters
 extern _Atomic uint64_t g_ede_prohibited_total;
@@ -56,16 +57,17 @@ server_cookie_status_t verify_server_cookie(const server_config_t *cfg, const ch
                                             uint32_t now);
 void add_ede(edns_info_t *edns, bool enabled, uint16_t code, const char *text);
 
-const char *resolve_ecs_subnet_tag(const zone_arena_t *zone, const server_config_t *cfg, const zone_config_t *zcfg,
+/* S5 B-2: the zone level tables (tinydns locations, tag definitions, trusted resolvers) are read from the zone image */
+const char *resolve_ecs_subnet_tag(const zone_image_t *zone, const server_config_t *cfg, const zone_config_t *zcfg,
                                    const uint8_t *addr, uint16_t family, uint8_t *out_scope_prefix);
 
-const char *resolve_bind_location_tag(const zone_arena_t *zone, const server_config_t *cfg, const zone_config_t *zcfg,
+const char *resolve_bind_location_tag(const zone_image_t *zone, const server_config_t *cfg, const zone_config_t *zcfg,
                                       const char *client_ip);
 
-bool is_ecs_trusted_resolver(const zone_arena_t *zone, const server_config_t *cfg,
+bool is_ecs_trusted_resolver(const zone_image_t *zone, const server_config_t *cfg,
                              const zone_config_t *zcfg, const char *client_ip);
 
-void tinydns_resolve_client_location(const zone_arena_t *zone, const char *client_ip,
+void tinydns_resolve_client_location(const zone_image_t *zone, const char *client_ip,
                                      char out_loc[2]);
 
 size_t pack_tag_def_rdata(uint8_t *buf, size_t buf_cap, const ecs_tag_def_t *def);
@@ -73,5 +75,8 @@ bool unpack_tag_def_rdata(const uint8_t *data, size_t len, ecs_tag_def_t **defs_
 bool unpack_trusted_resolvers_rdata(const uint8_t *data, size_t len, char ***resolvers_out, int *count_out);
 bool unpack_tinydns_loc_rdata(const uint8_t *data, size_t len, tinydns_location_entry_t **locs_out, int *count_out);
 bool wrap_tinydns_record(const dns_record_t *rec, dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap);
+/* the same for RR `rr` of a zone image */
+bool wrap_tinydns_image_rr(const zone_image_t *img, uint32_t rr, dns_record_t *out_wrap, uint8_t *wrap_buf,
+                           size_t wrap_buf_cap);
 
 #endif /* DNS_EDNS_ECS_H */

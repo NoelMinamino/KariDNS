@@ -76,13 +76,21 @@ EOF
 named -c "${TMP_DIR}/named.conf" -g > "${TMP_DIR}/named.log" 2>&1 &
 BIND_PID=$!
 
-# Wait for both servers to be ready
+# Wait for both servers to be ready: the zone is loaded when the SOA is answered. dag +short prints its
+# ";; communications error" / ";; no servers could be reached" lines on stdout (as dig does), so only a line that
+# is not a ";" comment counts as an answer; "any output" would call a server that is still starting up ready.
+# Bounded to 30 s per server; stop waiting early when the server process is gone.
+answers_soa() {
+    ./dag @127.0.0.1 -p "$1" wildcard.test SOA +short +timeout=1 +tries=1 2>/dev/null | grep -q '^[^;]'
+}
 KARI_UP=0
 BIND_UP=0
-for i in $(seq 1 50); do
-    [ "$KARI_UP" = 1 ] || { ./dag @127.0.0.1 -p "${KARI_PORT}" wildcard.test SOA +short +timeout=1 +tries=1 2>/dev/null | grep -q . && KARI_UP=1; } || true
-    [ "$BIND_UP" = 1 ] || { ./dag @127.0.0.1 -p "${BIND_PORT}" wildcard.test SOA +short +timeout=1 +tries=1 2>/dev/null | grep -q . && BIND_UP=1; } || true
+for i in $(seq 1 150); do
+    [ "$KARI_UP" = 1 ] || { answers_soa "${KARI_PORT}" && KARI_UP=1; } || true
+    [ "$BIND_UP" = 1 ] || { answers_soa "${BIND_PORT}" && BIND_UP=1; } || true
     [ "$KARI_UP" = 1 ] && [ "$BIND_UP" = 1 ] && break
+    kill -0 "${KARI_PID}" 2>/dev/null || break
+    kill -0 "${BIND_PID}" 2>/dev/null || break
     sleep 0.2
 done
 if [ "$KARI_UP" != 1 ]; then
@@ -112,6 +120,9 @@ for q in "foo.wildcard.test A" "foo.sub.wildcard.test AAAA" "exact.wildcard.test
     set -- $q
     KARI_OUT=$(summarize "${KARI_PORT}" "$1" "$2")
     BIND_OUT=$(summarize "${BIND_PORT}" "$1" "$2")
+    case "${KARI_OUT}" in
+        "|"*) echo "FAIL: no status line from KariDNS for $1 $2"; exit 1 ;;
+    esac
     case "${BIND_OUT}" in
         "|"*) echo "FAIL: no status line from named for $1 $2"; exit 1 ;;
     esac

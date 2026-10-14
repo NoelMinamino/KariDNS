@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
@@ -14,7 +15,10 @@
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
+#include "test_zext.h"
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
+#include "test_image_helper.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_query_engine.h"
 #include "dns_server_internal.h"
@@ -23,8 +27,8 @@
 // Prototypes for internal query engine functions under test
 void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
                         uint16_t *ancount, uint16_t *nscount, uint16_t *arcount);
-bool nsec_covers_name(const dns_record_t *rec, const char *name);
-dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name);
+bool nsec_covers_name(const zone_image_t *img, uint32_t rr, const char *name);
+uint32_t find_covering_nsec(const zone_image_t *img, const char *name);
 size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out);
 int64_t monotonic_ms(void);
 uint32_t remaining_ms(int64_t deadline);
@@ -44,15 +48,15 @@ bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iterations,
                         const uint8_t *salt, size_t salt_len,
                         char *out_b32, size_t out_b32_sz);
 bool nsec3_covers_hash(const char *owner_hash, const char *next_hash, const char *target_hash);
-dns_record_t *find_matching_nsec3(zone_arena_t *zone, const dns_record_t *param, const char *hash_b32, const char *apex);
-dns_record_t *find_covering_nsec3(zone_arena_t *zone, const dns_record_t *param, const char *target_hash);
+uint32_t find_matching_nsec3(const zone_image_t *img, uint32_t chain, const char *hash_b32, const char *apex);
+uint32_t find_covering_nsec3(const zone_image_t *img, uint32_t chain, const char *target_hash);
 bool find_next_closer_name(const char *qname, const char *encloser, char *out, size_t out_sz);
-bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
+bool attach_nsec3_record(const zone_image_t *img, uint32_t rr,
                          uint8_t *res, size_t max_res_len, uint16_t *offset,
                          compress_ctx_t *comp_ctx, uint16_t *nscount,
-                         dns_record_t **attached, int *attached_count);
-bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag);
-const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag);
+                         const zone_image_rr_t **attached, int *attached_count);
+bool name_exists_in_zone(const zone_image_t *img, const char *name, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag);
+const char *find_closest_encloser(const zone_image_t *img, const char *qname, const char *zone_apex, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag);
 program_plugin_t *find_program_plugin(const char *view_name, const char *domain);
 ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
                         const uint8_t *query, size_t query_len,
@@ -72,7 +76,13 @@ char g_startup_cwd[PATH_MAX] = "";
 
 void syslog(int priority, const char *format, ...) {
     (void)priority;
-    (void)format;
+    if (format && strncmp(format, "[Image]", 7) == 0) { /* a record that cannot be frozen: show why */
+        va_list ap;
+        va_start(ap, format);
+        vfprintf(stderr, format, ap);
+        fputc('\n', stderr);
+        va_end(ap);
+    }
 }
 
 server_config_t *acquire_config_snapshot(void) {
@@ -258,9 +268,12 @@ static void gr_setup(const char *origin, const char *zone_text) {
     char *buf = arena_strdup(&g_gr.arena, zone_text);
     assert(buf != NULL);
     assert(parse_zone_fast(buf, strlen(buf), &g_gr.arena, &ctx) >= 0);
-    assert(build_zone_index(&g_gr.arena, true) == 0);
+    /* like the loader (X-32): a record that cannot be written in wire format (an NSEC3PARAM with a 256-octet salt)
+     * is dropped before the index and the image are built, and so is never selected as the NSEC3 parameter */
+    (void)zone_arena_drop_unencodable(&g_gr.arena, NULL, NULL);
+    assert(test_build_index(&g_gr.arena, true) == 0);
     strncpy(g_gr.entry.domain, origin, sizeof(g_gr.entry.domain) - 1);
-    atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena, memory_order_release);
+    atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena.ver, memory_order_release);
     g_gr.entries[0] = &g_gr.entry;
     g_gr.acl[0] = (char *)"any";
     g_gr.view.name = "default";
@@ -287,7 +300,7 @@ static void gr_query_raw(const uint8_t *req, size_t req_len, const char *qname, 
     compress_ctx_t comp;
     memset(&comp, 0, sizeof(comp));
     compress_ctx_init_packet(&comp);
-    rate_limit_config_t *rrl_out = NULL;
+    const rate_limit_config_t *rrl_out = NULL;
     zone_db_entry_t *matched = NULL;
     int n = process_dns_query_impl(req, req_len, g_gr.res, sizeof(g_gr.res), qname, qtype,
                                    client_ip, &comp, is_tcp, &rrl_out,
@@ -730,7 +743,7 @@ static void n3_zone_load(n3_zone_t *z, char *text) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "n3.test.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(text, strlen(text), &z->arena, &ctx) >= 0);
-    assert(build_zone_index(&z->arena, true) == 0);
+    assert(test_build_index(&z->arena, true) == 0);
 }
 
 static void n3_zone_free(n3_zone_t *z) {
@@ -760,6 +773,18 @@ static dns_record_t *n3_linear_cover(zone_arena_t *zone, const dns_record_t *par
     return NULL;
 }
 
+/* The engine functions return image RRs; the tests below compare builder records, so map them back
+ * (test_rec_of() is linear: the performance test uses the image API directly). */
+static dns_record_t *t_match(zone_arena_t *z, const dns_record_t *param, const char *hash, const char *apex) {
+    return (dns_record_t *)test_rec_of(z, find_matching_nsec3(z->image, test_chain_of(z, param), hash, apex));
+}
+static dns_record_t *t_cover(zone_arena_t *z, const dns_record_t *param, const char *hash) {
+    return (dns_record_t *)test_rec_of(z, find_covering_nsec3(z->image, test_chain_of(z, param), hash));
+}
+static dns_record_t *t_nsec_cover(zone_arena_t *z, const char *name) {
+    return (dns_record_t *)test_rec_of(z, find_covering_nsec(z->image, name));
+}
+
 static const char *n3_salt_of(const dns_record_t *rec) { return rec ? rec->rdata[3] : "(none)"; }
 
 #define N3_HDR "$ORIGIN n3.test.\n$TTL 300\n@ IN SOA ns1 hostmaster 1 3600 600 86400 60\n@ IN NS ns1\n"
@@ -779,13 +804,13 @@ static void test_nsec3_index_matches_linear_scan(void) {
 
     /* every owner: matched, never covered (RFC 5155 §3.1.7: an owner hash is not strictly between owner/next) */
     for (size_t i = 0; i < n; i++) {
-        dns_record_t *m = find_matching_nsec3(&z.arena, param, h[i], "n3.test.");
+        dns_record_t *m = t_match(&z.arena, param, h[i], "n3.test.");
         assert(m && strncasecmp(m->name, h[i], 32) == 0);
         char lower[33];
         for (int k = 0; k < 33; k++) lower[k] = (char)tolower((unsigned char)h[i][k]);
-        assert(find_matching_nsec3(&z.arena, param, lower, "n3.test.") == m);
-        assert(find_matching_nsec3(&z.arena, param, h[i], "other.test.") == NULL);
-        assert(find_covering_nsec3(&z.arena, param, h[i]) == NULL);
+        assert(t_match(&z.arena, param, lower, "n3.test.") == m);
+        assert(t_match(&z.arena, param, h[i], "other.test.") == NULL);
+        assert(t_cover(&z.arena, param, h[i]) == NULL);
         assert(n3_linear_cover(&z.arena, param, h[i]) == NULL);
     }
     /* random targets and both ends of the hash space (wrap-around at the last RR) */
@@ -794,15 +819,15 @@ static void test_nsec3_index_matches_linear_scan(void) {
     for (size_t i = 0; i < 5000 + 3; i++) {
         char t[33];
         if (i < 3) memcpy(t, ends[i], sizeof(t)); else n3_random_hash(t, i % 2 == 0);
-        dns_record_t *got = find_covering_nsec3(&z.arena, param, t), *want = n3_linear_cover(&z.arena, param, t);
-        bool owner = find_matching_nsec3(&z.arena, param, t, "n3.test.") != NULL;
+        dns_record_t *got = t_cover(&z.arena, param, t), *want = n3_linear_cover(&z.arena, param, t);
+        bool owner = t_match(&z.arena, param, t, "n3.test.") != NULL;
         if (got != want || (!owner && !got)) {
             fprintf(stderr, "cover %s: index %s, linear %s\n", t, got ? got->name : "NULL", want ? want->name : "NULL");
             assert(0);
         }
     }
     /* rebuilding the index (as after IXFR/UPDATE) replaces it without leaking */
-    assert(build_zone_index(&z.arena, true) == 0);
+    assert(test_build_index(&z.arena, true) == 0);
     assert(z.arena.nsec3_chain_count == 1 && z.arena.nsec3_chains[0].count == n);
     n3_zone_free(&z);
     free(h);
@@ -831,7 +856,7 @@ static void test_nsec3_index_two_chains(void) {
     for (size_t i = 0; i < 2000; i++) {
         char t[33];
         n3_random_hash(t, false);
-        dns_record_t *ca = find_covering_nsec3(&z.arena, pa, t), *cb = find_covering_nsec3(&z.arena, pb, t);
+        dns_record_t *ca = t_cover(&z.arena, pa, t), *cb = t_cover(&z.arena, pb, t);
         if (!ca || strcasecmp(n3_salt_of(ca), "aa11") != 0 || !cb || strcasecmp(n3_salt_of(cb), "bb22") != 0) {
             fprintf(stderr, "cover %s: chain A -> %s, chain B -> %s\n", t, n3_salt_of(ca), n3_salt_of(cb));
             assert(0);
@@ -840,24 +865,25 @@ static void test_nsec3_index_two_chains(void) {
     }
     for (size_t i = 0; i < n; i++) {
         /* an owner of chain A is matched through chain A only */
-        dns_record_t *m = find_matching_nsec3(&z.arena, pa, ha[i], "n3.test.");
+        dns_record_t *m = t_match(&z.arena, pa, ha[i], "n3.test.");
         assert(m && strcasecmp(n3_salt_of(m), "aa11") == 0);
-        dns_record_t *mb = find_matching_nsec3(&z.arena, pb, ha[i], "n3.test.");
+        dns_record_t *mb = t_match(&z.arena, pb, ha[i], "n3.test.");
         assert(mb == NULL || strcasecmp(n3_salt_of(mb), "bb22") == 0);
     }
     /* parameters without a chain, and unusable NSEC3PARAM RDATA */
     dns_record_t p;
     memset(&p, 0, sizeof(p));
+    DNS_RECORD_BIND_RDATA(p);
     p.rdata[0] = "1"; p.rdata[1] = "0"; p.rdata[2] = "0"; p.rdata[3] = "cc33"; p.rdata_count = 4;
-    assert(find_covering_nsec3(&z.arena, &p, ha[0]) == NULL && find_matching_nsec3(&z.arena, &p, ha[0], "n3.test.") == NULL);
+    assert(t_cover(&z.arena, &p, ha[0]) == NULL && t_match(&z.arena, &p, ha[0], "n3.test.") == NULL);
     p.rdata[3] = "aa11"; p.rdata[2] = "1";
-    assert(find_covering_nsec3(&z.arena, &p, ha[0]) == NULL);
+    assert(t_cover(&z.arena, &p, ha[0]) == NULL);
     p.rdata[2] = "x";
-    assert(find_covering_nsec3(&z.arena, &p, ha[0]) == NULL);
+    assert(t_cover(&z.arena, &p, ha[0]) == NULL);
     p.rdata[2] = "65536";
-    assert(find_covering_nsec3(&z.arena, &p, ha[0]) == NULL);
+    assert(t_cover(&z.arena, &p, ha[0]) == NULL);
     p.rdata[2] = "0"; p.rdata_count = 3;
-    assert(find_covering_nsec3(&z.arena, &p, ha[0]) == NULL);
+    assert(t_cover(&z.arena, &p, ha[0]) == NULL);
     n3_zone_free(&z);
     free(ha);
     free(hb);
@@ -882,13 +908,13 @@ static void test_nsec3_index_broken_chain(void) {
     /* h[10] is missing: a target between h[9] and h[10] has no covering RR (h[9]'s next is h[10]) */
     char t[33];
     memcpy(t, h[10], sizeof(t));
-    assert(find_matching_nsec3(&z.arena, param, t, "n3.test.") == NULL);
-    assert(find_covering_nsec3(&z.arena, param, t) == NULL);
+    assert(t_match(&z.arena, param, t, "n3.test.") == NULL);
+    assert(t_cover(&z.arena, param, t) == NULL);
     /* other targets: NULL (inside the gap) or a chain RR that really covers the target, never the ignored RR */
     size_t gaps = 0;
     for (size_t i = 0; i < 1000; i++) {
         n3_random_hash(t, false);
-        dns_record_t *c = find_covering_nsec3(&z.arena, param, t);
+        dns_record_t *c = t_cover(&z.arena, param, t);
         if (!c) { gaps++; continue; }
         char owner[33];
         memcpy(owner, c->name, 32);
@@ -925,7 +951,8 @@ static void test_nsec3_index_performance(void) {
     for (size_t i = 0; i < lookups; i++) n3_random_hash(t[i], false);
     size_t found = 0;
     double t0 = n3_now();
-    for (size_t i = 0; i < lookups; i++) found += find_covering_nsec3(&z.arena, param, t[i]) != NULL;
+    uint32_t chain = test_chain_of(&z.arena, param);
+    for (size_t i = 0; i < lookups; i++) found += find_covering_nsec3(z.arena.image, chain, t[i]) != ZONE_IMAGE_NONE;
     double elapsed = n3_now() - t0;
     printf("  -> %zu lookups on %zu NSEC3 RRs: %.3f s (%zu covered)\n", lookups, n, elapsed, found);
     assert(found == lookups);  /* random 160-bit targets never equal an owner */
@@ -1046,7 +1073,7 @@ static void dw_copy_zone(const zone_arena_t *src, zone_arena_t *dst) {
     uint8_t wire[4096];
     for (size_t i = 0; i < src->count; i++)
         (void)dw_roundtrip(&src->records[i], dst, &dst->records[dst->count++], wire, sizeof(wire));
-    assert(build_zone_index(dst, true) == 0);
+    assert(test_build_index(dst, true) == 0);
 }
 
 static void test_dnssec_wire_decode_usable(void) {
@@ -1068,11 +1095,11 @@ static void test_dnssec_wire_decode_usable(void) {
     for (size_t i = 0; i < 2000; i++) {
         char t[33];
         n3_random_hash(t, i % 2 == 0);
-        dns_record_t *a = find_covering_nsec3(&z.arena, pz, t), *b = find_covering_nsec3(&w, pw, t);
+        dns_record_t *a = t_cover(&z.arena, pz, t), *b = t_cover(&w, pw, t);
         assert(a && b && strcasecmp(a->name, b->name) == 0);
     }
     for (size_t i = 0; i < n; i++) {
-        dns_record_t *m = find_matching_nsec3(&w, pw, h[i], "n3.test.");
+        dns_record_t *m = t_match(&w, pw, h[i], "n3.test.");
         assert(m && strncasecmp(m->name, h[i], 32) == 0);
     }
     zone_arena_destroy(&w);
@@ -1091,11 +1118,11 @@ static void test_dnssec_wire_decode_usable(void) {
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = "nw.test.", .is_standalone_mode = true, .err_out = &err };
     assert(parse_zone_fast(nt, strlen(nt), &nz.arena, &ctx) >= 0);
-    assert(build_zone_index(&nz.arena, true) == 0);
+    assert(test_build_index(&nz.arena, true) == 0);
     dw_copy_zone(&nz.arena, &w);
     const char *names[] = { "a.nw.test.", "c.nw.test.", "c.b.nw.test.", "e.nw.test.", "z.nw.test.", "0.nw.test." };
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-        dns_record_t *a = find_covering_nsec(&nz.arena, names[i]), *b = find_covering_nsec(&w, names[i]);
+        dns_record_t *a = t_nsec_cover(&nz.arena, names[i]), *b = t_nsec_cover(&w, names[i]);
         assert(a && b && strcasecmp(a->name, b->name) == 0);
     }
     zone_arena_destroy(&w);
@@ -1573,10 +1600,10 @@ static void mz_add(const char *origin, const char *text) {
     parse_context_t ctx = { .base_dir = ".", .default_origin = origin, .is_standalone_mode = true, .err_out = &err };
     char *buf = arena_strdup(&g_mz.arena[i], text);
     assert(buf && parse_zone_fast(buf, strlen(buf), &g_mz.arena[i], &ctx) >= 0);
-    assert(build_zone_index(&g_mz.arena[i], true) == 0);
+    assert(test_build_index(&g_mz.arena[i], true) == 0);
     strncpy(g_mz.entry[i].domain, origin, sizeof(g_mz.entry[i].domain) - 1);
     g_mz.entry[i].kind = ZONE_KIND_PRIMARY;
-    atomic_store_explicit(&g_mz.entry[i].rcu.active, &g_mz.arena[i], memory_order_release);
+    atomic_store_explicit(&g_mz.entry[i].rcu.active, &g_mz.arena[i].ver, memory_order_release);
     g_mz.entries[i] = &g_mz.entry[i];
 }
 
@@ -1591,7 +1618,7 @@ static void mz_query(const char *qname, uint16_t qtype, bool dnssec_ok, gr_resp_
     compress_ctx_t comp;
     memset(&comp, 0, sizeof(comp));
     compress_ctx_init_packet(&comp);
-    rate_limit_config_t *rrl_out = NULL;
+    const rate_limit_config_t *rrl_out = NULL;
     zone_db_entry_t *matched = NULL;
     int n = process_dns_query_impl(req, req_len, g_mz.res, sizeof(g_mz.res), qname, qtype, "192.0.2.100", &comp,
                                    false, &rrl_out, &g_mz.snap, &g_mz.cfg, &matched);

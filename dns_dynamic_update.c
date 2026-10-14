@@ -3,6 +3,7 @@
 #include "dns_server_internal.h"
 #include "dns_wire.h"
 #include "dns_utils.h"
+#include "dns_zone_image.h"
 #include "dns_axfr_ixfr.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_tsig_acl.h"
@@ -76,26 +77,25 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
     return 2; // SERVFAIL
   }
 
-  zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-  zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
-  /* ワーカーの読み取り区間の中から呼ばれる。区間に入った後で別の writer がこのゾーンを
-   * 公開していると、通常の待機は自分自身を待ってタイムアウトする (60 秒間 writer_lock を
-   * 持ったまま他の writer も止める)。自分の区間だけを除いて待つ。UPDATE の応答は
-   * 設定だけから作り、待機前に読んだ arena を使わない (process_dns_query_impl)。*/
-  if (!rcu_writer_wait_until_safe_in_reader(entry->rcu.retire_epoch, 60000)) {
+  zone_version_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  /* S5 B-2: the update is applied to a builder thawed from the published image (S5 B-3: a stack builder freed on every
+   * way out; the result is published as a new version, the old one goes on the retire stack) */
+  zone_arena_t z_builder;
+  zone_arena_t *z_standby = &z_builder;
+  zone_arena_init(z_standby);
+  if (thaw_zone_arena(z_active, z_standby) != 0) {
+    zone_arena_destroy(z_standby);
     pthread_mutex_unlock(&entry->writer_lock);
-    syslog(LOG_ERR, "[Update] Dynamic update on zone '%s' aborted: RCU grace period wait timed out", entry->domain);
+    syslog(LOG_ERR, "[Update] Dynamic update on zone '%s' aborted: cannot rebuild the zone from its image", entry->domain);
     return 2; // SERVFAIL
   }
-
-  clone_zone_arena(z_active, z_standby);
 
   update_result_t result;
   int rcode = process_update_sections(req, req_len, entry->domain, z_standby, &result);
   if (rcode != 0 || !result.changed) {
     /* エラーなら何も適用しない (RFC 2136 §3.4.2.1)。何も変わらなかった UPDATE (前提条件だけ、
      * 無視された RR や既存と同じ RR だけ) はシリアルを上げず、公開も NOTIFY もしない (§3.6)。*/
-    zone_arena_clear_data_pools(z_standby);
+    zone_arena_destroy(z_standby);
     pthread_mutex_unlock(&entry->writer_lock);
     if (rcode == 0) {
       syslog(LOG_INFO, "[Update] client=%s key=%s zone='%s' prcount=%d upcount=%d: no change",
@@ -112,17 +112,39 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
     /* X-17: シリアルを上げられなかった (arena の確保失敗、または頂点の SOA が無い)。変更したゾーンを
      * 同じシリアルで公開するとセカンダリが転送しない (RFC 2136 §3.6) ので、UPDATE 全体を捨てて
      * SERVFAIL にする (§3.4.2.1 と同じく何も適用しない)。 */
-    zone_arena_clear_data_pools(z_standby);
+    zone_arena_destroy(z_standby);
     pthread_mutex_unlock(&entry->writer_lock);
     syslog(LOG_ERR, "[Update] client=%s zone='%s': SOA serial could not be incremented; update aborted",
            client_ip, entry->domain);
     return 2; // SERVFAIL
   }
 
+  /* S5 B-2: an RR that cannot be written in wire format is dropped with a warning, the rest of the UPDATE is applied
+   * (as for a zone file); the published image holds only RRs that can be served */
+  zone_drop_unencodable_logged(z_standby, entry->domain, "the dynamic update");
+
+  zone_arena_shrink_records(z_standby);
   if (build_zone_index(z_standby, true) != 0) {
-    zone_arena_clear_data_pools(z_standby);
+    zone_arena_destroy(z_standby);
     pthread_mutex_unlock(&entry->writer_lock);
     syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after Update for '%s'", entry->domain);
+    return 2; // SERVFAIL
+  }
+
+  /* S5 B-1: 応答を作る側が読むイメージ。公開の直前に 1 回だけ作る。作れなければ索引を作れなかったときと同じく UPDATE を捨てる */
+  z_standby->image = zone_image_freeze(z_standby, entry->domain);
+  if (!z_standby->image) {
+    zone_arena_destroy(z_standby);
+    pthread_mutex_unlock(&entry->writer_lock);
+    syslog(LOG_ERR, "[Zone] Failed to build the zone image after Update for '%s'", entry->domain);
+    return 2; // SERVFAIL
+  }
+  zone_arena_free_builder(z_standby);
+  zone_version_t *z_next = zone_version_new(z_standby);
+  zone_arena_destroy(z_standby);
+  if (!z_next) {
+    pthread_mutex_unlock(&entry->writer_lock);
+    syslog(LOG_ERR, "[Update] Dynamic update on zone '%s' aborted: out of memory", entry->domain);
     return 2; // SERVFAIL
   }
 
@@ -130,18 +152,18 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   if (cur_snap) retain_zone_snapshot(cur_snap);
   server_config_t *active_cfg_prelink = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
   zone_config_t *zcfg = find_zone_config_in_view(active_cfg_prelink, entry->view_name, entry->domain);
-  additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
-                                      ? zcfg->additional_from_auth
+  additional_from_auth_t policy = (zcfg && zext(zcfg)->additional_from_auth_specified)
+                                      ? zext(zcfg)->additional_from_auth
                                       : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
-  prelink_zone_additional_glue(z_standby, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
-  build_zone_response_cache(z_standby, active_cfg_prelink, entry->view_name, entry->domain);
+  zone_glue_track_build(z_next, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
+  build_zone_response_cache(z_next, active_cfg_prelink, entry->view_name, entry->domain);
   if (cur_snap) release_zone_snapshot(cur_snap);
 
-  compute_ixfr_diff(entry, z_active, z_standby);
+  compute_ixfr_diff(entry, z_active, z_next);
   /* 公開する直前に記録する (索引の構築に失敗して公開しなかった UPDATE のシリアルを残さない) */
   atomic_store_explicit(&entry->serial, new_serial, memory_order_release);
 
-  entry->rcu.retire_epoch = rcu_writer_publish(&entry->rcu.active, z_standby);
+  zone_publish(entry, z_next);
   pthread_mutex_unlock(&entry->writer_lock);
 
   notify_request_send(entry);
@@ -455,16 +477,19 @@ static void notify_add_target(struct sockaddr_storage *targets, int *count, int 
 }
 
 /* arena の中の name のアドレス (A/AAAA) を宛先に加える。見つかれば true */
-static bool notify_add_glue(zone_arena_t *arena, const char *name, struct sockaddr_storage *targets, int *count,
+static bool notify_add_glue(const zone_image_t *img, const char *name, struct sockaddr_storage *targets, int *count,
                             int max) {
   bool found = false;
-  size_t idx = calc_fnv1a_str(name) & (arena->hash_size - 1);
-  for (int j = arena->hash_table[idx]; j != -1; j = arena->records[j].next_record) {
-    dns_record_t *g = &arena->records[j];
-    if ((g->type_code != 1 && g->type_code != 28) || g->rdata_count < 1 || !g->rdata[0] ||
-        !domain_names_match_ci(g->name, name))
-      continue;
-    notify_add_target(targets, count, max, g->type_code == 1 ? AF_INET : AF_INET6, g->rdata[0], 53);
+  uint32_t id = zone_image_find_name(img, name);
+  if (id == ZONE_IMAGE_NONE) return false;
+  uint32_t end = zone_image_name_first_rr(img, id) + zone_image_name_rr_count(img, id);
+  for (uint32_t k = zone_image_name_first_rr(img, id); k < end; k++) {
+    uint16_t t = zone_image_rr_type(img, k);
+    uint16_t len = zone_image_rr_rdlen(img, k);
+    char ip[INET6_ADDRSTRLEN];
+    if ((t != 1 || len != 4) && (t != 28 || len != 16)) continue;
+    if (!inet_ntop(t == 1 ? AF_INET : AF_INET6, zone_image_rr_rdata(img, k), ip, sizeof(ip))) continue;
+    notify_add_target(targets, count, max, t == 1 ? AF_INET : AF_INET6, ip, 53);
     found = true;
   }
   return found;
@@ -483,14 +508,14 @@ void send_notify_to_all(const char *domain, const char *view_name) {
   }
 
   zone_config_t *zone = active ? find_zone_config_in_view(active, view_name, domain) : NULL;
-  const char *notify_source = zone ? zone->notify_source : NULL;
+  const char *notify_source = zone ? zext(zone)->notify_source : NULL;
   notify_retry_config_t nr = notify_retry_effective(active, zone);
   /* D-09: ゾーンに tsig-key があれば NOTIFY に署名する */
   const tsig_key_t *key = NULL;
-  if (zone && zone->tsig_key && zone->tsig_key[0]) {
-    key = find_tsig_key_by_name(active, zone->tsig_key);
+  if (zone && zext(zone)->tsig_key && zext(zone)->tsig_key[0]) {
+    key = find_tsig_key_by_name(active, zext(zone)->tsig_key);
     if (!key) syslog(LOG_ERR, "[Notify] zone '%s': tsig-key '%s' is not defined; NOTIFY sent unsigned", domain,
-                     zone->tsig_key);
+                     zext(zone)->tsig_key);
   }
 
   struct sockaddr_storage targets[64];
@@ -498,8 +523,8 @@ void send_notify_to_all(const char *domain, const char *view_name) {
 
   // 1. also-notify servers
   if (zone) {
-    for (int i = 0; i < zone->also_notify_count; i++)
-      notify_add_target(targets, &ntargets, 64, AF_UNSPEC, zone->also_notify[i].ip, zone->also_notify[i].port);
+    for (int i = 0; i < zext(zone)->also_notify_count; i++)
+      notify_add_target(targets, &ntargets, 64, AF_UNSPEC, zext(zone)->also_notify[i].ip, zext(zone)->also_notify[i].port);
   }
 
   // 2. Addresses of the apex NS hosts except the SOA MNAME host (RFC 1996 §3.2)
@@ -507,29 +532,28 @@ void send_notify_to_all(const char *domain, const char *view_name) {
   view_snapshot_t *view = snap ? snapshot_find_view(snap, view_name) : NULL;
   // 同じゾーン名が別の view にもあり得るので、呼び出し元のエントリの view で引く (R-26)
   if (view) entry = find_zone_exact_in_view(view, domain);
-  zone_arena_t *arena = entry ? atomic_load_explicit(&entry->rcu.active, memory_order_acquire) : NULL;
-  if (arena && arena->hash_size > 0 && arena->hash_table) {
+  zone_version_t *arena = entry ? atomic_load_explicit(&entry->rcu.active, memory_order_acquire) : NULL;
+  const zone_image_t *img = arena ? arena->image : NULL;
+  uint32_t apex_id = img ? zone_image_find_name(img, entry->domain) : ZONE_IMAGE_NONE;
+  if (apex_id != ZONE_IMAGE_NONE) {
+    char mname_buf[DNS_NAME_TEXT_SIZE];
     const char *mname = NULL;
-    size_t apex_idx = calc_fnv1a_str(entry->domain) & (arena->hash_size - 1);
-    for (int i = arena->hash_table[apex_idx]; i != -1; i = arena->records[i].next_record) {
-      if (arena->records[i].type_code == 6 && domain_names_match_ci(arena->records[i].name, entry->domain)) {
-        if (arena->records[i].rdata_count >= 1 && arena->records[i].rdata[0]) mname = arena->records[i].rdata[0];
-        break;
-      }
-    }
-    for (int i = arena->hash_table[apex_idx]; i != -1; i = arena->records[i].next_record) {
-      dns_record_t *rec = &arena->records[i];
-      if (rec->type_code != 2 || !domain_names_match_ci(rec->name, entry->domain)) continue;
-      if (rec->rdata_count < 1 || !rec->rdata[0]) continue;
-      const char *ns_target = rec->rdata[0];
+    uint32_t apex_end = zone_image_name_first_rr(img, apex_id) + zone_image_name_rr_count(img, apex_id);
+    uint32_t soa = zone_image_rrset_next(img, apex_id, 6, zone_image_name_first_rr(img, apex_id));
+    if (soa != ZONE_IMAGE_NONE && zone_image_soa(img, soa, mname_buf, sizeof(mname_buf), NULL, 0, NULL) == 0)
+      mname = mname_buf;
+    for (uint32_t i = zone_image_name_first_rr(img, apex_id); i < apex_end; i++) {
+      if (zone_image_rr_type(img, i) != 2) continue;
+      char ns_target[DNS_NAME_TEXT_SIZE];
+      if (zone_image_rr_target(img, i, ns_target, sizeof(ns_target)) != 0) continue;
       if (mname && domain_names_match_ci(ns_target, mname)) continue;
       // A. in-zone glue, B. otherwise the address in a sibling zone of the same view
-      if (notify_add_glue(arena, ns_target, targets, &ntargets, 64)) continue;
+      if (notify_add_glue(img, ns_target, targets, &ntargets, 64)) continue;
       zone_db_entry_t *sib_entry = find_zone_in_view(view, ns_target);
       if (!sib_entry || sib_entry == entry) continue;
-      zone_arena_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
-      if (sib_arena && sib_arena->hash_size > 0 && sib_arena->hash_table)
-        notify_add_glue(sib_arena, ns_target, targets, &ntargets, 64);
+      zone_version_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
+      if (sib_arena && sib_arena->image)
+        notify_add_glue(sib_arena->image, ns_target, targets, &ntargets, 64);
     }
   }
 

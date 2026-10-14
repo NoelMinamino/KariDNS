@@ -8,6 +8,8 @@
 
 #include "../../dns_wire.h"
 #include "../../dns_zone_parser.h"
+#include "../../dns_zone_image.h"
+#include "../test_image_helper.h"
 #include "../../dns_config_parser.h"
 #include "../../dns_query_engine.h"
 #include "../../dns_snapshot_rcu.h"
@@ -147,11 +149,11 @@ static void init_rich_fuzz_engine(void) {
     static char main_buf[sizeof(g_main_zone_text)];
     memcpy(main_buf, g_main_zone_text, sizeof(g_main_zone_text));
     parse_zone_fast(main_buf, sizeof(g_main_zone_text) - 1, &g_fuzz_arena_main, &ctx1);
-    build_zone_index(&g_fuzz_arena_main, true);
+    assert(test_build_index(&g_fuzz_arena_main, true) == 0);
     
     memset(&g_fuzz_entries[0], 0, sizeof(g_fuzz_entries[0]));
     strncpy(g_fuzz_entries[0].domain, "example.com.", sizeof(g_fuzz_entries[0].domain) - 1);
-    atomic_store_explicit(&g_fuzz_entries[0].rcu.active, &g_fuzz_arena_main, memory_order_release);
+    atomic_store_explicit(&g_fuzz_entries[0].rcu.active, &g_fuzz_arena_main.ver, memory_order_release);
     g_fuzz_entry_ptrs[0] = &g_fuzz_entries[0];
 
     // Sub zone
@@ -160,11 +162,11 @@ static void init_rich_fuzz_engine(void) {
     static char sub_buf[sizeof(g_sub_zone_text)];
     memcpy(sub_buf, g_sub_zone_text, sizeof(g_sub_zone_text));
     parse_zone_fast(sub_buf, sizeof(g_sub_zone_text) - 1, &g_fuzz_arena_sub, &ctx2);
-    build_zone_index(&g_fuzz_arena_sub, true);
+    assert(test_build_index(&g_fuzz_arena_sub, true) == 0);
     
     memset(&g_fuzz_entries[1], 0, sizeof(g_fuzz_entries[1]));
     strncpy(g_fuzz_entries[1].domain, "sub.example.org.", sizeof(g_fuzz_entries[1].domain) - 1);
-    atomic_store_explicit(&g_fuzz_entries[1].rcu.active, &g_fuzz_arena_sub, memory_order_release);
+    atomic_store_explicit(&g_fuzz_entries[1].rcu.active, &g_fuzz_arena_sub.ver, memory_order_release);
     g_fuzz_entry_ptrs[1] = &g_fuzz_entries[1];
 
     // NSEC3 zone
@@ -173,11 +175,11 @@ static void init_rich_fuzz_engine(void) {
     static char nsec3_buf[sizeof(g_nsec3_zone_text)];
     memcpy(nsec3_buf, g_nsec3_zone_text, sizeof(g_nsec3_zone_text));
     parse_zone_fast(nsec3_buf, sizeof(g_nsec3_zone_text) - 1, &g_fuzz_arena_nsec3, &ctx3);
-    build_zone_index(&g_fuzz_arena_nsec3, true);
+    assert(test_build_index(&g_fuzz_arena_nsec3, true) == 0);
     
     memset(&g_fuzz_entries[2], 0, sizeof(g_fuzz_entries[2]));
     strncpy(g_fuzz_entries[2].domain, "signed.local.", sizeof(g_fuzz_entries[2].domain) - 1);
-    atomic_store_explicit(&g_fuzz_entries[2].rcu.active, &g_fuzz_arena_nsec3, memory_order_release);
+    atomic_store_explicit(&g_fuzz_entries[2].rcu.active, &g_fuzz_arena_nsec3.ver, memory_order_release);
     g_fuzz_entry_ptrs[2] = &g_fuzz_entries[2];
 
     // Snapshot View
@@ -212,6 +214,12 @@ static void init_rich_fuzz_engine(void) {
     g_fuzz_cfg.ecs_trusted_resolvers = g_fuzz_any_acl;
     g_fuzz_cfg.ecs_trusted_resolvers_count = 1;
     atomic_store_explicit(&g_config_db.active, &g_fuzz_cfg, memory_order_release);
+
+    /* The shared response cache (filled on a miss, read on later inputs) and its eligibility per zone */
+    response_cache_init(256 * 1024);
+    build_zone_response_cache(&g_fuzz_arena_main.ver, &g_fuzz_cfg, "default", "example.com.");
+    build_zone_response_cache(&g_fuzz_arena_sub.ver, &g_fuzz_cfg, "default", "sub.example.org.");
+    build_zone_response_cache(&g_fuzz_arena_nsec3.ver, &g_fuzz_cfg, "default", "signed.local.");
 
     g_fuzz_qe_initialized = true;
 }
