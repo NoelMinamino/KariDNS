@@ -268,7 +268,7 @@ int main() {
         if (assert_bound_checked(&rec_isdn)) return 1;
 
         // NSAP (Type 22)
-        // 繧ｾ繝ｼ繝ｳ繝代・繧ｵ繝ｼ縺ｧ0x縺ｨ繝峨ャ繝医′髯､蜴ｻ縺輔ｌ縺溷ｾ後・豁｣隕丞喧縺輔ｌ縺櫞ex譁・ｭ怜・繧呈Φ螳・
+        // ゾーンパーサーで0xとドットが除去された後の、正規化されたHex文字列を想定
         dns_record_t rec_nsap = {0};
         DNS_RECORD_BIND_RDATA(rec_nsap);
         rec_nsap.name = (char*)"example.com"; rec_nsap.type_code = 22; rec_nsap.rdata_count = 1;
@@ -495,27 +495,27 @@ int main() {
             free(buf); \
         } while(0)
 
-        // 豁｣蟶ｸ邉ｻ: 1-5 
+        // 正常系: 1-5
         RUN_GEN_TEST("$GENERATE 1-5 host-$ A 10.0.0.$", false);
-        // 逡ｰ蟶ｸ邉ｻ: stop < start
+        // 異常系: stop < start
         RUN_GEN_TEST("$GENERATE 10-1 host-$ A 10.0.0.$", true);
-        // 逡ｰ蟶ｸ邉ｻ: step 0
+        // 異常系: step 0
         RUN_GEN_TEST("$GENERATE 1-10/0 host-$ A 10.0.0.$", true);
-        // 逡ｰ蟶ｸ邉ｻ: MAX_GENERATE_COUNT 雜・∴
+        // 異常系: MAX_GENERATE_COUNT 超え
         RUN_GEN_TEST("$GENERATE 1-999999 host-$ A 10.0.0.$", true);
-        // 逡ｰ蟶ｸ邉ｻ: width逡ｰ蟶ｸ
+        // 異常系: width 異常
         RUN_GEN_TEST("$GENERATE 1-10 host-${0,999,d} A 10.0.0.$", true);
-        // 逡ｰ蟶ｸ邉ｻ: base逡ｰ蟶ｸ
+        // 異常系: base 異常
         RUN_GEN_TEST("$GENERATE 1-10 host-${0,3,q} A 10.0.0.$", true);
-        // 豁｣蟶ｸ邉ｻ: $$
+        // 正常系: $$
         RUN_GEN_TEST("$GENERATE 1-5 host-$$ A 10.0.0.$", false);
-        // 豁｣蟶ｸ邉ｻ: 雋�縺ｮoffset
+        // 正常系: 負の offset
         RUN_GEN_TEST("$GENERATE 1-5 host-${-5,3,d} A 10.0.0.$", false);
-        // 豁｣蟶ｸ邉ｻ: width 32-64
+        // 正常系: width 32-64
         RUN_GEN_TEST("$GENERATE 1-2 host-${0,40,d} A 10.0.0.$", false);
         RUN_GEN_TEST("$GENERATE 1-2 host-$ TXT ${0,64,d}", false);
         RUN_GEN_TEST("$GENERATE 1-2 host-${0,30,d}.${0,34,d} A 10.0.0.$", false);
-        // 逡ｰ蟶ｸ邉ｻ / 繧ｨ繝・ず繧ｱ繝ｼ繧ｹ: 繝・Φ繝励Ξ繝ｼ繝域忰蟆ｾ繧ｫ繝ｳ繝槭・谺�關ｽ繝ｻ譛ｪ繧ｯ繝ｭ繝ｼ繧ｺ (Fuzzer Crash regression)
+        // 異常系 / エッジケース: テンプレート末尾のカンマ欠落・未クローズ (Fuzzer Crash regression)
         RUN_GEN_TEST("$GENERATE 1-2 host-${,60, A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-${,, A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-${ A 10.0.0.$", true);
@@ -523,7 +523,7 @@ int main() {
         RUN_GEN_TEST("$GENERATE 1-2 host-${1,2,d A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-$ A 10.0.0.${,60,", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-$ A 10.0.0.${,,", true);
-        // 逡ｰ蟶ｸ邉ｻ: range 讒区枚縺ｮ荳肴ｭ｣ (start/stop/step 縺ｮ逵∫払繧・ざ繝・
+        // 異常系: range 構文の不正 (start/stop/step の省略など)
         RUN_GEN_TEST("$GENERATE - host-$ A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1- host-$ A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE -5 host-$ A 10.0.0.$", true);
@@ -667,7 +667,7 @@ int main() {
         }
 
         // 5. Properly closed quote at EOF (no trailing newline, but valid closing quote)
-        char buf5[] = "example.com. 3600 IN TXT \"hello\"";  // 譛ｫ蟆ｾ縺ｫ謾ｹ陦後↑縺励√◆縺�縺玲ｭ｣縺励￥髢峨§縺ｦ縺・ｋ
+        char buf5[] = "example.com. 3600 IN TXT \"hello\"";  // 末尾に改行なし、ただし正しく閉じている
         int r5 = parse_zone_fast(buf5, strlen(buf5), &arena, &ctx);
         if (r5 < 0) {
             printf("FAIL: Test 5 (properly closed quote at EOF) failed. err=%s\n", err.error_message ? err.error_message : "NULL");
@@ -869,8 +869,8 @@ int main() {
         zone_arena_t arena = {0};
         zone_arena_init(&arena);
         // 1. Single allocation limit (64MB)
-        // size閾ｪ菴薙′荳企剞(64MB)繧定ｶ・∴繧九こ繝ｼ繧ｹ縲・縺､逶ｮ縺ｮ繧ｬ繝ｼ繝・
-        // `size > (64 * 1024 * 1024)` 縺ｧ蠑ｾ縺九ｌ繧九％縺ｨ繧堤｢ｺ隱阪☆繧九・
+        // size 自体が上限 (64MB) を超えるケース。1つ目のガード
+        // `size > (64 * 1024 * 1024)` で弾かれることを確認する。
         void *p1 = arena_alloc(&arena, (64 * 1024 * 1024) + 1);
         if (p1 != NULL) {
             printf("FAIL: arena_alloc accepted allocation > 64MB\n");
@@ -884,10 +884,10 @@ int main() {
     // Test 10b: arena_alloc Addition Overflow Prevention (strict)
     {
         printf("\n--- Test 10b: arena_alloc Addition Overflow Prevention (strict) ---\n");
-        // current_pool_idx 繧・SIZE_MAX 霑大ｍ縺ｾ縺ｧ諢丞峙逧・↓騾ｲ繧√◆迥ｶ諷九ｒ蛛ｽ陬・＠縲・
-        // size閾ｪ菴薙・64MB譛ｪ貅縺�縺・current_pool_idx + size 縺・size_t 縺ｮ遽・峇縺ｧ
-        // 繧ｪ繝ｼ繝舌・繝輔Ο繝ｼ縺吶ｋ繧ｱ繝ｼ繧ｹ繧剃ｽ懊ｋ縲ゅ％繧後↓繧医ｊ1縺､逶ｮ縺ｮ繧ｬ繝ｼ繝峨ｒ縺吶ｊ謚懊￠縺ｦ
-        // 2縺､逶ｮ縺ｮ繧ｬ繝ｼ繝・(current_pool_idx > SIZE_MAX - size) 繧堤｢ｺ螳溘↓雕上∪縺帙ｋ縲・
+        // current_pool_idx を SIZE_MAX 近傍まで意図的に進めた状態を偽装し、
+        // size 自体は 64MB 未満だが current_pool_idx + size が size_t の範囲で
+        // オーバーフローするケースを作る。これにより1つ目のガードをすり抜けて
+        // 2つ目のガード (current_pool_idx > SIZE_MAX - size) を確実に踏ませる。
         zone_arena_t arena2 = {0};
         zone_arena_init(&arena2);
         arena2.current_pool_idx = SIZE_MAX - 100;
@@ -1266,7 +1266,7 @@ int main() {
             return 1;
         }
 
-        // Case 5: mandatory referencing absent SvcParam must be rejected (RFC 9460 ﾂｧ8)
+        // Case 5: mandatory referencing absent SvcParam must be rejected (RFC 9460 §8)
         dns_record_t incomplete_mand_rec;
         memset(&incomplete_mand_rec, 0, sizeof(incomplete_mand_rec));
         DNS_RECORD_BIND_RDATA(incomplete_mand_rec);
@@ -1314,7 +1314,7 @@ int main() {
             return 1;
         }
 
-        // Case 6: key65535 (Invalid key) must be rejected (RFC 9460 ﾂｧ14.3.2)
+        // Case 6: key65535 (Invalid key) must be rejected (RFC 9460 §14.3.2)
         dns_record_t invalid_key_rec;
         memset(&invalid_key_rec, 0, sizeof(invalid_key_rec));
         DNS_RECORD_BIND_RDATA(invalid_key_rec);
@@ -1445,7 +1445,7 @@ int main() {
         printf("PASS: karictl control secret base64 overflow protection\n");
     }
 
-    // --- Test 17: RFC 10029 ﾂｧ3.3: MQTYPE-Query option with QDCOUNT=0 FORMERR ---
+    // --- Test 17: RFC 10029 §3.3: MQTYPE-Query option with QDCOUNT=0 FORMERR ---
     {
         uint8_t req[512] = {0};
         req[0] = 0x56; req[1] = 0x78;
@@ -1485,7 +1485,7 @@ int main() {
             printf("FAIL: Expected FORMERR (1) response for MQTYPE-Query with QDCOUNT=0\n");
             return 1;
         }
-        printf("PASS: RFC 10029 ﾂｧ3.3 MQTYPE-Query with QDCOUNT=0 FORMERR response\n");
+        printf("PASS: RFC 10029 §3.3 MQTYPE-Query with QDCOUNT=0 FORMERR response\n");
     }
 
     // --- Test 18: BIND-compatible TTL unit suffix parsing (w/d/h/m/s) ---
@@ -1526,7 +1526,7 @@ int main() {
             printf("FAIL: parse_ttl_value('invalid') != 3600\n");
             return 1;
         }
-        // RFC 2181 ﾂｧ8: Maximum TTL clamp (2147483647) for both numeric and unit suffixes
+        // RFC 2181 §8: Maximum TTL clamp (2147483647) for both numeric and unit suffixes
         if (parse_ttl_value("4000000000") != 2147483647) {
             printf("FAIL: parse_ttl_value('4000000000') != 2147483647 (got %u)\n", parse_ttl_value("4000000000"));
             return 1;
@@ -2003,7 +2003,7 @@ int main() {
         printf("PASS: RRL token refill 32-bit overflow & normal refill test\n");
     }
 
-    // --- Test 27: RFC 4034 ﾂｧ6.1 Canonical ordering & NSEC non-existence proof tests ---
+    // --- Test 27: RFC 4034 §6.1 Canonical ordering & NSEC non-existence proof tests ---
     {
         // 1. Canonical DNS name comparison tests
         if (compare_canonical_name("example.com.", "example.com.") != 0) {
@@ -2104,10 +2104,10 @@ int main() {
 
         free(zone_copy);
         zone_arena_destroy(&arena);
-        printf("PASS: RFC 4034 ﾂｧ6.1 Canonical ordering & NSEC index tests\n");
+        printf("PASS: RFC 4034 §6.1 Canonical ordering & NSEC index tests\n");
     }
 
-    // --- Test 28: RFC 4592 ﾂｧ3.3.1 Closest encloser & empty non-terminal wildcard tests ---
+    // --- Test 28: RFC 4592 §3.3.1 Closest encloser & empty non-terminal wildcard tests ---
     {
         zone_arena_t arena;
         zone_arena_init(&arena);
@@ -2247,7 +2247,7 @@ int main() {
 
         free(zone_copy);
         zone_arena_destroy(&arena);
-        printf("PASS: RFC 4592 ﾂｧ3.3.1 Closest encloser & empty non-terminal wildcard tests\n");
+        printf("PASS: RFC 4592 §3.3.1 Closest encloser & empty non-terminal wildcard tests\n");
     }
 
     // --- Test 29: RFC 1982 Serial arithmetic & wraparound tests ---
@@ -2475,7 +2475,7 @@ int main() {
         printf("PASS: DNS record type parsing & non-fatal type resolution test\n");
     }
 
-    // --- Test 33: Multiple EDNS OPT RR rejection (RFC 6891 ﾂｧ6.1.1) and RCODE bitmask test ---
+    // --- Test 33: Multiple EDNS OPT RR rejection (RFC 6891 §6.1.1) and RCODE bitmask test ---
     {
         uint8_t pkt[512];
         memset(pkt, 0, sizeof(pkt));
@@ -2517,7 +2517,7 @@ int main() {
 
         int ret2 = parse_edns_opt(pkt, off, 1, 0, 0, 2, &edns);
         if (ret2 != -1) {
-            printf("FAIL: parse_edns_opt should return -1 on multiple OPT RRs per RFC 6891 ﾂｧ6.1.1\n");
+            printf("FAIL: parse_edns_opt should return -1 on multiple OPT RRs per RFC 6891 §6.1.1\n");
             return 1;
         }
 
@@ -2766,7 +2766,7 @@ int main() {
         printf("PASS: SOA RRSIG covering record parsing and serialization for DNSSEC negative responses\n");
     }
 
-    // --- Test 37: Delegation point DS record (RFC 4035 ﾂｧ3.1.4.1) in parent zone ---
+    // --- Test 37: Delegation point DS record (RFC 4035 §3.1.4.1) in parent zone ---
     {
         const char *zone_text =
             "$ORIGIN example.com.\n"
@@ -2844,10 +2844,10 @@ int main() {
 
         free(zone_copy);
         zone_arena_destroy(&arena);
-        printf("PASS: Delegation point DS record & RRSIG parsing and lookup (RFC 4035 ﾂｧ3.1.4.1)\n");
+        printf("PASS: Delegation point DS record & RRSIG parsing and lookup (RFC 4035 §3.1.4.1)\n");
     }
 
-    // --- Test 38: RFC 1035 ﾂｧ3.1 Domain Name Length Validation (label <= 63, wire total <= 255) ---
+    // --- Test 38: RFC 1035 §3.1 Domain Name Length Validation (label <= 63, wire total <= 255) ---
     {
         // 1. Label exceeds 63 octets (64 'a's)
         const char *long_label_zone =
@@ -2918,7 +2918,7 @@ int main() {
             return 1;
         }
 
-        printf("PASS: RFC 1035 ﾂｧ3.1 Domain Name Length Validation (label <= 63, wire total <= 255)\n");
+        printf("PASS: RFC 1035 §3.1 Domain Name Length Validation (label <= 63, wire total <= 255)\n");
     }
 
     // --- Test 39: Duplicate zone/view/key block rejection & FIFO key order ---
