@@ -320,12 +320,23 @@ if wait_up 127.0.0.1 $PA m.test; then
     # enough queries to rotate the 1k query log several times
     j=0
     while [ $j -lt 30 ]; do answer 127.0.0.1 $PA q$j.m.test A >/dev/null; j=$((j + 1)); done
-    # the query log is written from a ring buffer by the logger thread: give it time to flush
-    j=0
-    while [ $j -lt 25 ] && [ ! -f "$TMP/a/q.log.0" ]; do sleep 0.2; j=$((j + 1)); done
+    # The query log is written from a ring buffer by the logger thread, which writes everything that is pending as
+    # one batch and rotates before a batch when the file would exceed the size: the burst above can leave a batch
+    # larger than 1k in q.log.0, and the thread may still be behind. Wait (bounded, 15 s) for the state that is
+    # checked instead of a fixed time, and feed it one more query per round so that a later, small rotation
+    # replaces an oversized q.log.0.
     # "versions 2 size 1k": q.log.0 (and q.log.1) hold the older queries, nothing beyond .1 is kept
-    if [ -f "$TMP/a/q.log.0" ] && grep -q "q[0-9]*\.m\.test" "$TMP/a/q.log.0" "$TMP/a/q.log" 2>/dev/null &&
-       [ ! -f "$TMP/a/q.log.2" ] && [ "$(wc -c < "$TMP/a/q.log.0")" -le 1024 ]; then
+    qlog_rotated() {
+        [ -f "$TMP/a/q.log.0" ] && grep -q "q[0-9]*\.m\.test" "$TMP/a/q.log.0" "$TMP/a/q.log" 2>/dev/null &&
+        [ ! -f "$TMP/a/q.log.2" ] && [ "$(wc -c < "$TMP/a/q.log.0")" -le 1024 ]
+    }
+    j=0
+    while [ $j -lt 75 ] && ! qlog_rotated; do
+        sleep 0.2
+        answer 127.0.0.1 $PA q$((30 + j)).m.test A >/dev/null
+        j=$((j + 1))
+    done
+    if qlog_rotated; then
         ok "query log rotated (versions 2, size 1k)"
     else
         fail "query log not rotated as configured: $(ls -l "$TMP/a/" | tr '\n' ' ')"
