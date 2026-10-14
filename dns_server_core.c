@@ -1174,7 +1174,7 @@ void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, z
     out->is_secondary = e->is_secondary;
     out->soa_serial = (uint32_t)atomic_load_explicit(&e->serial, memory_order_relaxed);
 
-    zone_config_t *zc = find_zone_config_in_view(cfg, e->view_name, e->domain);
+    const zone_config_t *zc = zone_entry_config(cfg, e);
     out->slaves_configured = zc ? zext(zc)->also_notify_count : 0;
 
     out->last_notify_time = atomic_load_explicit(&e->observatory.last_notify_time, memory_order_relaxed);
@@ -1569,7 +1569,7 @@ bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, con
   bool is_synth = false;
   zone_db_entry_t *entry = find_zone_for_query(view, qname, qtype); // R-32: DS at a child apex goes to the parent
   if (entry) {
-    zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, entry->domain);
+    const zone_config_t *zcfg = zone_entry_config(cfg, entry);
     if (zcfg && zcfg->type && (strcasecmp(zcfg->type, "program") == 0 || strcasecmp(zcfg->type, "forward") == 0)) {
       is_synth = true;
     }
@@ -2321,11 +2321,11 @@ process_tcp_client: ;
            * どのゾーンにも指定がなければ検索自体を省く。AXFR ワーカーへ渡す前に
            * 適用しておくことで、転送スレッドもこの値で送信する。 */
           if (cfg && cfg->any_zone_tcp_opts) {
-            zone_config_t *tcp_zcfg = zcfg;
+            const zone_config_t *tcp_zcfg = zcfg;
             if (!tcp_zcfg && xfr_view) {
               zone_db_entry_t *tcp_entry = find_zone_in_view(xfr_view, qname);
               if (tcp_entry)
-                tcp_zcfg = find_zone_config_in_view(cfg, xfr_view->name, tcp_entry->domain);
+                tcp_zcfg = zone_entry_config(cfg, tcp_entry);
             }
             apply_zone_tcp_opts(client_fd, ctx_tcp, tcp_zcfg);
           }
@@ -3106,7 +3106,7 @@ void *control_thread_func(void *arg) {
                         case RELOAD_OK:
                             syslog(LOG_NOTICE, "[Control] Targeted reload successful for %s", lr.zcfg->domain);
                             if (lr.zcfg->is_catalog) {
-                                void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
+                                void catalog_process_membership(zone_db_entry_t *catalog_entry, const zone_config_t *catalog_cfg, const char *view_name);
                                 catalog_process_membership(lr.entry, lr.zcfg, lr.view_name);
                             }
                             send(cfd, "OK reloaded\n", 12, 0);
@@ -3404,7 +3404,7 @@ void *control_thread_func(void *arg) {
                     char master_ip[64] = {0};
                     int master_port = 53;
                     char tsig_key_name[64] = {0};
-                    zone_config_t *slave_zcfg = NULL; /* カタログのメンバーゾーンは zone{} を持たない */
+                    const zone_config_t *slave_zcfg = NULL; /* カタログのメンバーゾーンは zone{} を持たない */
                     
                     if (entry->is_catalog_member) {
                         is_slave = true;
@@ -3414,7 +3414,7 @@ void *control_thread_func(void *arg) {
                             strncpy(tsig_key_name, entry->catalog_master->tsig_key, sizeof(tsig_key_name) - 1);
                         }
                     } else {
-                        zone_config_t *zcfg = find_zone_config_in_view(active, entry->view_name, entry->domain);
+                        const zone_config_t *zcfg = zone_entry_config(active, entry);
                         slave_zcfg = zcfg;
                         if (zcfg && zcfg->type && (strcasecmp(zcfg->type, "slave") == 0 || strcasecmp(zcfg->type, "secondary") == 0) &&
                             zext(zcfg)->masters_count > 0 && zext(zcfg)->masters[0].ip != NULL) {

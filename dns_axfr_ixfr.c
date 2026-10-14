@@ -655,6 +655,58 @@ time_t xfr_expire_deadline(bool transferred, bool has_expire, uint32_t expire_op
   return deadline;
 }
 
+/* 組み上がったゾーン (builder) を新しい版として公開する。AXFR/IXFR の受信 (handle_axfr_event) と、
+ * 取り込み側が同じ手順を使う (ずれないようにここに 1 つだけ置く)。
+ * 手順: 配列の縮小 -> build_zone_index(RRset の TTL をそろえる) -> zone_image_freeze -> 作り手の解放 -> 新しい版 ->
+ *       グルーの追跡と応答キャッシュ (設定とスナップショットは読み取り区間の中で読む) -> compute_ixfr_diff -> zone_publish。
+ * 呼ぶ側の約束:
+ *   - entry->writer_lock を持って呼ぶ (呼んだ後も持ったまま。解放は呼ぶ側)。wait_for_active_axfr() も呼ぶ側が済ませる。
+ *   - 書けない RR は zone_drop_unencodable_logged() で呼ぶ前に除いておく (SOA の取り出しがその後に要るため呼ぶ側に置く)。
+ *   - serial / refresh / retry / expire / next_check / expire_at / last_successful_transfer と、統計 (observatory)、
+ *     notify_request_send() は呼ぶ側が行う。
+ * 戻り値 0: builder の image は公開した版に移り (builder に残るのはレコード等の解放済みの殻)、entry の公開が済んでいる。
+ * 戻り値 -1: 何も公開していない (ログ済み。what は "after %s" に入る)。image はここで解放しないので builder に残る。
+ * どちらの場合も builder は呼ぶ側が zone_arena_destroy() する (二重に呼んでも安全)。*/
+int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const char *what) {
+  zone_version_t *cur_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+
+  zone_arena_shrink_records(builder);
+  if (build_zone_index(builder, true) != 0) {
+    syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after %s for '%s'", what, entry->domain);
+    return -1;
+  }
+
+  /* S5 B-1: 応答を作る側が読むイメージ。公開の直前に 1 回だけ作る。作れなければ索引を作れなかったときと同じく捨てる */
+  builder->image = zone_image_freeze(builder, entry->domain);
+  if (!builder->image) {
+    syslog(LOG_ERR, "[Zone] Failed to build the zone image after %s for '%s'", what, entry->domain);
+    return -1;
+  }
+  zone_arena_free_builder(builder);
+  zone_version_t *standby = zone_version_new(builder);
+  if (!standby) {
+    syslog(LOG_ERR, "[Zone] Out of memory publishing the zone after %s for '%s'", what, entry->domain);
+    return -1;
+  }
+
+  // 設定は制御スレッドが並行して入れ替えるので、読み取り区間の中で読む
+  rcu_aux_read_lock();
+  zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
+  server_config_t *active_cfg_prelink = acquire_config_snapshot();
+  const zone_config_t *zcfg = zone_entry_config(active_cfg_prelink, entry);
+  additional_from_auth_t policy = (zcfg && zext(zcfg)->additional_from_auth_specified)
+                                      ? zext(zcfg)->additional_from_auth
+                                      : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
+  zone_glue_track_build(standby, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
+  build_zone_response_cache(standby, active_cfg_prelink, entry->view_name, entry->domain);
+  release_config_snapshot(active_cfg_prelink);
+  rcu_aux_read_unlock();
+
+  compute_ixfr_diff(entry, cur_active, standby);
+  zone_publish(entry, standby);
+  return 0;
+}
+
 int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
                       tcp_stream_ctx_t *stream_ctx, axfr_session_t *session,
                       tsig_key_t *tsig_key,
@@ -799,8 +851,6 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
           syslog(LOG_WARNING, "[XFR] Inbound transfer swap for zone '%s' postponed: active AXFR in progress.", entry->domain);
           return -1;
         }
-        zone_version_t *cur_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-
         if (has_soa) {
           time_t now = time(NULL);
           entry->serial = serial;
@@ -815,49 +865,12 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         }
 
         /* S5 B-2: the received zone (tmp_arena) is the builder; only its image is published (S5 B-3: as a new version) */
-        zone_arena_shrink_records(&tmp_arena);
-        if (build_zone_index(&tmp_arena, true) != 0) {
+        if (zone_install_builder(entry, &tmp_arena, "XFR") != 0) {
           pthread_mutex_unlock(&entry->writer_lock);
           if (unsigned_msgs) free(unsigned_msgs);
           zone_arena_destroy(&tmp_arena);
-          syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after XFR for '%s'", entry->domain);
           return -1;
         }
-
-        /* S5 B-1: 応答を作る側が読むイメージ。公開の直前に 1 回だけ作る。作れなければ索引を作れなかったときと同じく転送を捨てる */
-        tmp_arena.image = zone_image_freeze(&tmp_arena, entry->domain);
-        if (!tmp_arena.image) {
-          pthread_mutex_unlock(&entry->writer_lock);
-          if (unsigned_msgs) free(unsigned_msgs);
-          zone_arena_destroy(&tmp_arena);
-          syslog(LOG_ERR, "[Zone] Failed to build the zone image after XFR for '%s'", entry->domain);
-          return -1;
-        }
-        zone_arena_free_builder(&tmp_arena);
-        zone_version_t *standby = zone_version_new(&tmp_arena);
-        if (!standby) {
-          pthread_mutex_unlock(&entry->writer_lock);
-          if (unsigned_msgs) free(unsigned_msgs);
-          zone_arena_destroy(&tmp_arena);
-          syslog(LOG_ERR, "[Zone] Out of memory publishing the zone after XFR for '%s'", entry->domain);
-          return -1;
-        }
-
-        // 設定は制御スレッドが並行して入れ替えるので、読み取り区間の中で読む
-        rcu_aux_read_lock();
-        zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
-        server_config_t *active_cfg_prelink = acquire_config_snapshot();
-        zone_config_t *zcfg = find_zone_config_in_view(active_cfg_prelink, entry->view_name, entry->domain);
-        additional_from_auth_t policy = (zcfg && zext(zcfg)->additional_from_auth_specified)
-                                            ? zext(zcfg)->additional_from_auth
-                                            : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
-        zone_glue_track_build(standby, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
-        build_zone_response_cache(standby, active_cfg_prelink, entry->view_name, entry->domain);
-        release_config_snapshot(active_cfg_prelink);
-        rcu_aux_read_unlock();
-
-        compute_ixfr_diff(entry, cur_active, standby);
-        zone_publish(entry, standby);
         pthread_mutex_unlock(&entry->writer_lock);
 
         if (session->is_ixfr) {
@@ -895,7 +908,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
   // rebuild_zone_db_snapshot() の構築と公開だけで、解放は GC スレッドが待つ)。
   rcu_aux_read_lock();
   server_config_t *cfg = acquire_config_snapshot();
-  zone_config_t *zcfg = find_zone_config_in_view(cfg, entry->view_name, entry->domain);
+  const zone_config_t *zcfg = zone_entry_config(cfg, entry);
   if (zcfg && zcfg->is_catalog) {
       catalog_process_membership(entry, zcfg, entry->view_name);
   }
@@ -1281,7 +1294,7 @@ static bool zone_needs_extended_axfr(const zone_image_t *zone, const zone_db_ent
   bool cfg_trusted = false;
   server_config_t *cfg = acquire_config_snapshot();
   if (cfg) {
-    zone_config_t *zcfg = find_zone_config_in_view(cfg, entry->view_name, entry->domain);
+    const zone_config_t *zcfg = zone_entry_config(cfg, entry);
     cfg_trusted = (zcfg && zext(zcfg)->ecs_trusted_resolvers_count > 0) || cfg->ecs_trusted_resolvers_count > 0;
     release_config_snapshot(cfg);
   }
@@ -1545,7 +1558,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
         }
       }
       server_config_t *axfr_cfg = acquire_config_snapshot();
-      zone_config_t *axfr_zcfg = axfr_cfg ? find_zone_config_in_view(axfr_cfg, entry->view_name, entry->domain) : NULL;
+      const zone_config_t *axfr_zcfg = axfr_cfg ? zone_entry_config(axfr_cfg, entry) : NULL;
       char **trusted_res = (zattr.bind_ecs_trusted_resolver_count > 0 && zattr.bind_ecs_trusted_resolvers)
                             ? zattr.bind_ecs_trusted_resolvers : NULL;
       int trusted_count = trusted_res ? zattr.bind_ecs_trusted_resolver_count : 0;

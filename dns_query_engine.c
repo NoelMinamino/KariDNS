@@ -802,7 +802,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     char client_loc[2] = {0, 0};
     tinydns_resolve_client_location(img, client_ip, client_loc);
 
-    zone_config_t *zcfg = (cfg && db_entry) ? find_zone_config_in_view(cfg, db_entry->view_name, db_entry->domain) : NULL;
+    const zone_config_t *zcfg = (cfg && db_entry) ? zone_entry_config(cfg, db_entry) : NULL;
     const char *client_loc_tag = resolve_bind_location_tag(img, cfg, zcfg, client_ip);
     const char *client_ecs_tag = NULL;
     uint8_t zone_scope = 0;
@@ -1965,7 +1965,7 @@ size_t dns_rrl_slip_response(uint8_t *res, size_t res_len, size_t buf_cap) {
 _Thread_local static uint8_t s_forward_req_buf[65535];
 _Thread_local static uint8_t s_forward_res_buf[65535];
 
-STATIC_TEST int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t req_len,
+STATIC_TEST int dispatch_forward_zone(const zone_config_t *zcfg, const uint8_t *req, size_t req_len,
                                  uint8_t *res, size_t max_res_len) {
   const zone_ext_t *x = zext(zcfg);
   if (req_len < DNS_HEADER_SIZE || x->forwarders_count == 0) {
@@ -2595,8 +2595,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     }
   }
 
-  zone_config_t *matched_zcfg = (db_entry && view && cfg)
-      ? find_zone_config_in_view(cfg, view->name, db_entry->domain)
+  const zone_config_t *matched_zcfg = (db_entry && view && cfg)
+      ? zone_entry_config(cfg, db_entry)
       : NULL;
   /* D-05: RRL のキー (NXDOMAIN はゾーン名、ワイルドカードの答えは "*.<ゾーン>") */
   t_query_rrl_info.zone = db_entry ? db_entry->domain : NULL;
@@ -2745,7 +2745,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   if (opcode == 4) { // NOTIFY
     if (db_entry && view) {
       server_config_t *cfg_chk = cfg;
-      zone_config_t *zc = find_zone_config_in_view(cfg_chk, view->name, db_entry->domain);
+      const zone_config_t *zc = zone_entry_config(cfg_chk, db_entry);
       if (zc && zc->type && (strcasecmp(zc->type, "program") == 0 ||
                               strcasecmp(zc->type, "forward") == 0)) {
         /* R-12: 要求の本体は返さず質問セクションで切り、OPT と EDE 21 (RFC 8914 §4.22) を付ける。
@@ -2768,7 +2768,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     tsig_key_t *tkey = (tsig && tsig->status == TSIG_REQ_VALID) ? tsig->key : NULL;
     bool auth = false;
     if (db_entry && view) {
-      zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
+      const zone_config_t *zcfg = zone_entry_config(cfg, db_entry);
       const zone_ext_t *zx = zext(zcfg);
       if (zcfg && zx->masters_count > 0) {
         bool from_master = false;
@@ -2809,7 +2809,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   if (opcode == 5) { // UPDATE
     if (db_entry && view) {
       server_config_t *cfg_chk = cfg;
-      zone_config_t *zc = find_zone_config_in_view(cfg_chk, view->name, db_entry->domain);
+      const zone_config_t *zc = zone_entry_config(cfg_chk, db_entry);
       if (zc && zc->type && (strcasecmp(zc->type, "program") == 0 ||
                               strcasecmp(zc->type, "forward") == 0)) {
         /* R-12: 要求の本体は返さず質問セクションで切り、OPT と EDE 21 (RFC 8914 §4.22) を付ける。
@@ -2846,7 +2846,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     bool auth = false;
     bool zone_is_master = false;
     if (zone_rcode == 0) {
-      zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
+      const zone_config_t *zcfg = zone_entry_config(cfg, db_entry);
       if (zcfg) {
         if (zcfg->type && (strcasecmp(zcfg->type, "master") == 0 || strcasecmp(zcfg->type, "primary") == 0)) {
           zone_is_master = true;
@@ -3010,7 +3010,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   dns_init_response_header(res, req, 0, true);
   if (db_entry && view) {
     server_config_t *cfg_lookup = cfg;
-    zone_config_t *zcfg = find_zone_config_in_view(cfg_lookup, view->name, db_entry->domain);
+    const zone_config_t *zcfg = zone_entry_config(cfg_lookup, db_entry);
     if (zcfg && zcfg->type && strcasecmp(zcfg->type, "program") == 0) {
       const rate_limit_config_t *rrl = zext(zcfg)->rrl.configured ? &zext(zcfg)->rrl : (cfg ? &cfg->rrl : NULL);
       if (!is_tcp && rrl && rrl->configured && rrl->early_drop) {
@@ -3221,7 +3221,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   uint32_t qtx_included = 0;
-  zone_config_t *zcfg = (db_entry && view) ? find_zone_config_in_view(cfg, view->name, db_entry->domain) : NULL;
+  const zone_config_t *zcfg = (db_entry && view) ? zone_entry_config(cfg, db_entry) : NULL;
   bool ecs_trusted = (cfg && cfg->ecs_enable && edns.has_ecs && client_ip &&
                       is_ecs_trusted_resolver(current_zone ? current_zone->image : NULL, cfg, zcfg, client_ip));
   t_resolve_crossed_zone = false;

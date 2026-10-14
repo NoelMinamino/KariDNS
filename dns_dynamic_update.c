@@ -151,7 +151,7 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
   if (cur_snap) retain_zone_snapshot(cur_snap);
   server_config_t *active_cfg_prelink = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  zone_config_t *zcfg = find_zone_config_in_view(active_cfg_prelink, entry->view_name, entry->domain);
+  const zone_config_t *zcfg = zone_entry_config(active_cfg_prelink, entry);
   additional_from_auth_t policy = (zcfg && zext(zcfg)->additional_from_auth_specified)
                                       ? zext(zcfg)->additional_from_auth
                                       : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);

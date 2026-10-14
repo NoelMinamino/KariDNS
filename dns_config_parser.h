@@ -3,6 +3,9 @@
 
 #define KARIDNS_MAX_CONFIG_FILE_SIZE (256 * 1024 * 1024)
 
+/* view 名の上限 (NUL 込みのバイト数)。zone_db_entry_t などが view 名をこの長さの配列で持つ */
+#define KARIDNS_VIEW_NAME_MAX 64
+
 /* tcp-mss / tcp-window / udp-bufsize と zone-tcp-* / zone-udp-bufsize の許容範囲 */
 #define KARIDNS_TCP_MSS_MIN      536                 /* RFC 1122 §3.3.3 の既定 MSS */
 #define KARIDNS_TCP_MSS_MAX      65495               /* 65535 - IPv4/TCP ヘッダ 40 */

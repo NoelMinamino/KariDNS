@@ -499,7 +499,9 @@ void zone_glue_track_build(zone_version_t *ver, const char *zone_domain, view_sn
 typedef struct zone_retire_s {
   struct zone_retire_s *next;
   zone_db_entry_t *entry; /* 参照を 1 つ持つ */
-  zone_version_t *ver;    /* 公開で退いた版 */
+  zone_version_t *ver;    /* 公開で退いた版。NULL なら obj / free_fn の項目 (zone_retire_object()) */
+  void *obj;              /* ver が NULL のときに free_fn で解放する物 (ゾーン単位の設定など) */
+  void (*free_fn)(void *);
   uint64_t epoch;
 } zone_retire_t;
 
@@ -547,10 +549,31 @@ void zone_retire_process(bool wait) {
       zone_retire_push(r);
       continue;
     }
-    zone_version_free(r->ver);
+    if (r->ver)
+      zone_version_free(r->ver);
+    else
+      r->free_fn(r->obj);
     zone_entry_unref(e);
     free(r);
   }
+}
+
+/* entry に属する物 obj を、世代 epoch の猶予期間が過ぎ、かつ entry が AXFR の送信中でも転送の受信中でもなくなってから
+ * free_fn(obj) で解放する (退いた版と同じ解放待ちの積み方、同じ条件)。epoch は obj を読み手から外した公開 (rcu_writer_publish()) が
+ * 返した世代。積むのは複数のスレッドから呼べる。成功すると entry の参照を 1 つ持ち、解放のときに手放す。
+ * 戻り値 true なら以後の解放は zone_retire_process() が行う。false は積めなかった (メモリ不足) ことを示し、
+ * obj は呼び出し側に残る (解放も参照も行っていない)。 */
+bool zone_retire_object(zone_db_entry_t *entry, void *obj, void (*free_fn)(void *), uint64_t epoch) {
+  if (!entry || !obj || !free_fn) return false;
+  zone_retire_t *r = calloc(1, sizeof(*r));
+  if (!r) return false;
+  atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_relaxed);
+  r->entry = entry;
+  r->obj = obj;
+  r->free_fn = free_fn;
+  r->epoch = epoch;
+  zone_retire_push(r);
+  return true;
 }
 
 /* next を公開する。entry->writer_lock を持って呼ぶ (S2)。退いた版は解放待ちに積む (S5 B-3: 版は heap のものだけ。
@@ -1050,7 +1073,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
     server_config_t *active_config, 
     const char *catalog_view_name,
     zone_db_entry_t *catalog_entry_to_update,
-    zone_config_t *catalog_cfg,
+    const zone_config_t *catalog_cfg,
     catalog_member_id_t *new_desired_members, int new_desired_count) 
 {
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
@@ -1091,7 +1114,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     zone_db_entry_t *entry = old_snap->views[v].entries[i];
                     if (!entry) continue;
                     if (entry->catalog_member_count > 0) {
-                        zone_config_t *zcfg = find_zone_config_in_view(active_config, entry->view_name, entry->domain);
+                        const zone_config_t *zcfg = zone_entry_config(active_config, entry);
                         if (zcfg && zcfg->is_catalog) {
                             for (int k = 0; k < entry->catalog_member_count; k++) {
                                 valid_members[valid_member_count++] = entry->catalog_members[k];
@@ -1476,6 +1499,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             }
             syslog(LOG_INFO, "[Catalog] Added new member '%s' (unique-id: %s) owned by %s", added_members[i].domain, added_members[i].unique_id, catalog_entry_to_update->domain);
             entry->is_catalog_member = true;
+            entry->source = ZONE_SRC_CATALOG;
             entry->kind = ZONE_KIND_SECONDARY;
             entry->is_secondary = true;
             if (added_members[i].group_count > 0) {

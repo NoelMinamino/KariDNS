@@ -1069,6 +1069,23 @@ static void test_structure_and_validation(void) {
     expect_reject("options without braces", "options 53;");
     expect_reject("unterminated options", "options { port 53; ");
     expect_reject("view name missing", "view { };");
+
+    /* zone_db_entry_t keeps the view name in KARIDNS_VIEW_NAME_MAX bytes: a longer name would be cut and the view's
+     * zones would lose their settings, so it is rejected; the longest name that fits is accepted */
+    {
+        char name[KARIDNS_VIEW_NAME_MAX + 1], txt[512];
+        memset(name, 'v', KARIDNS_VIEW_NAME_MAX - 1);
+        name[KARIDNS_VIEW_NAME_MAX - 1] = '\0';
+        snprintf(txt, sizeof(txt), "view \"%s\" { match-clients { any; }; " ZONE_MIN " };", name);
+        if (parse_ok(txt, &cfg)) {
+            CHECK(cfg.views && strlen(cfg.views->name) == KARIDNS_VIEW_NAME_MAX - 1);
+            free_server_config_fields(&cfg);
+        }
+        name[KARIDNS_VIEW_NAME_MAX - 1] = 'v';
+        name[KARIDNS_VIEW_NAME_MAX] = '\0';
+        snprintf(txt, sizeof(txt), "view \"%s\" { match-clients { any; }; " ZONE_MIN " };", name);
+        expect_reject("view name longer than KARIDNS_VIEW_NAME_MAX - 1", txt);
+    }
 }
 
 /* ------------------------------------------------------------------------ */

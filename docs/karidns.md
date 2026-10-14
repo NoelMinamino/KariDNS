@@ -376,7 +376,7 @@ A signed response that would not fit the client's UDP size with its TSIG is trun
 | `match-clients { <acl>; ... };` | Clients that use this view, by source address only; a `key` entry is a configuration error. A view without `match-clients` matches every client. |
 | `zone "<name>" { ... };` | Zones of this view. The same zone name may appear in several views. |
 
-Views are checked in the order they are defined; the first match is used. A query from a client that matches no view is answered as if no zone matched (REFUSED). Without any `view` block, all top-level zones are placed in an implicit view that matches all clients.
+The view name is at most 63 characters; a longer name is a configuration error. Views are checked in the order they are defined; the first match is used. A query from a client that matches no view is answered as if no zone matched (REFUSED). Without any `view` block, all top-level zones are placed in an implicit view that matches all clients.
 
 A zone that appears in several views is a separate zone in each view: its own file, data, additional-section glue from the other zones of the same view, wire cache settings and `program` plugin. `karictl reload <zone> <view>` reloads one view's copy. If a reload changes a zone's `type` (for example `master` to `slave`), the zone is recreated with the new type.
 

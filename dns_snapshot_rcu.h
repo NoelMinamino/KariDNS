@@ -43,7 +43,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
     server_config_t *active_config, 
     const char *catalog_view_name,
     zone_db_entry_t *catalog_entry_to_update,
-    zone_config_t *catalog_cfg,
+    const zone_config_t *catalog_cfg,
     catalog_member_id_t *new_desired_members, int new_desired_count);
 int rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged);
 int rebuild_zone_db_from_config_ext(server_config_t *config, bool skip_unchanged, char *failed, size_t failed_sz);

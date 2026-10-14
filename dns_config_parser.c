@@ -2622,6 +2622,17 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       free_token(&tok);
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
+      /* ゾーンのエントリなどは view 名を固定長 (KARIDNS_VIEW_NAME_MAX、NUL 込み) で持つ。それより長い名前は
+       * 切り詰められ、その view のゾーンの設定を引けなくなる (転送、リロード、UPDATE、応答) ので受け付けない */
+      if (strlen(tok.value) >= KARIDNS_VIEW_NAME_MAX) {
+        syslog(LOG_ERR, "[Config] View name '%.40s...' is longer than %d characters; rejecting configuration",
+               tok.value, KARIDNS_VIEW_NAME_MAX - 1);
+        fprintf(stderr, "[ERROR] View name '%.40s...' is longer than %d characters\n", tok.value,
+                KARIDNS_VIEW_NAME_MAX - 1);
+        free_token(&tok);
+        if (ctx) ctx->error_occurred = true;
+        return -1;
+      }
       view_config_t *view = safe_calloc_or_die(1, sizeof(view_config_t));
       if (!view) { free_token(&tok); if (ctx) ctx->error_occurred = true; return -1; }
       view->name = tok.value;

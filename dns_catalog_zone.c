@@ -121,7 +121,7 @@ static int catalog_count(const zone_image_t *img, const char *name, uint16_t typ
     return n;
 }
 
-void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name) {
+void catalog_process_membership(zone_db_entry_t *catalog_entry, const zone_config_t *catalog_cfg, const char *view_name) {
     if (!catalog_entry || !catalog_cfg) return;
 
     /* 制御スレッドと受信転送スレッドから呼ばれる。arena の走査中に UPDATE などの

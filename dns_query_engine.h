@@ -162,7 +162,7 @@ ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
                         const uint8_t *query, size_t query_len,
                         uint8_t *resp_out, size_t resp_out_cap,
                         uint32_t timeout_ms);
-int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t req_len,
+int dispatch_forward_zone(const zone_config_t *zcfg, const uint8_t *req, size_t req_len,
                           uint8_t *res, size_t max_res_len);
 bool nsec_covers_name(const zone_image_t *img, uint32_t rr, const char *name);
 uint32_t find_covering_nsec(const zone_image_t *img, const char *name);

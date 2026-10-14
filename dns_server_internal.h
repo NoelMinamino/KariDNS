@@ -344,9 +344,16 @@ typedef struct {
   char tsig_key[64];
 } catalog_master_t;
 
+/* ゾーンエントリの出どころ (zone_db_entry_t.source)。ZONE_SRC_DB はまだ使われない */
+typedef enum {
+  ZONE_SRC_CONFIG = 0, /* karidns.conf の zone {} */
+  ZONE_SRC_CATALOG,    /* カタログゾーンのメンバー */
+  ZONE_SRC_DB,         /* データベースから取り込んだゾーン */
+} zone_source_t;
+
 typedef struct {
   char domain[256];
-  char view_name[64];
+  char view_name[KARIDNS_VIEW_NAME_MAX];
   zone_kind_t kind;
   zone_rcu_t rcu;
   pthread_mutex_t writer_lock;
@@ -366,11 +373,15 @@ typedef struct {
   int catalog_member_count;
   bool is_catalog_member;
   bool is_secondary;
+  uint8_t source; /* zone_source_t: どこから来たゾーンか。作成時に決まり、変わらない */
   char *catalog_member_unique_id; /* S5: malloc。カタログのメンバーでなければ NULL (読むときは zone_entry_catalog_uid) */
   char **groups;
   int group_count;
   catalog_master_t *catalog_master; /* B-3: malloc, catalog members only (primary and TSIG key of the catalog zone) */
   char *owning_catalog_domain;    /* S5: malloc。同上 (読むときは zone_entry_catalog_owner) */
+  /* source == ZONE_SRC_DB のゾーンの設定 (それ以外は NULL)。読むのは zone_entry_config() だけ。
+   * 差し替えは新しい物を公開してから、古い物を zone_retire_object() で積む */
+  _Atomic(const zone_config_t *) dbcfg;
   _Atomic(time_t) last_successful_transfer;
   /* RFC 7314 §4: セカンダリの expire タイマーが切れる時刻。0 なら
    * last_successful_transfer + expire (従来どおり SOA EXPIRE で数える)。 */
@@ -385,6 +396,9 @@ typedef struct {
   /* 最後に公開したときの全体の公開カウンタ */
   _Atomic uint64_t publish_order;
 } zone_db_entry_t;
+/* 制御チャネルで送る統計 (dns_wire.h、karictl も読む) も同じ長さで view 名を持つ */
+_Static_assert(sizeof(((zone_observatory_snapshot_t *)0)->view_name) == KARIDNS_VIEW_NAME_MAX,
+               "view name buffers must match KARIDNS_VIEW_NAME_MAX");
 
 /* S5: カタログ関連の文字列は非カタログのゾーンでは NULL。比較や表示には空文字列として読む */
 static inline const char *zone_entry_catalog_uid(const zone_db_entry_t *e) {
@@ -457,7 +471,7 @@ typedef struct {
 
 typedef struct program_plugin {
   char domain[256];      /* zone_db_entry_t->domain と同じ形式(FQDN, 末尾ドット) */
-  char view_name[64];     /* 同じゾーン名が別の view にもあり得るので view と組で引く (O-12) */
+  char view_name[KARIDNS_VIEW_NAME_MAX]; /* 同じゾーン名が別の view にもあり得るので view と組で引く (O-12) */
   pid_t pid;
   int proc_fd;            /* FreeBSD: pdfork() のプロセス記述子 (CAP_PDKILL のみ)。-1 = なし。
                            * capability mode では kill(pid) ができないので pdkill() で止める (X-11) */
@@ -509,10 +523,16 @@ void retain_zone_snapshot(zone_db_snapshot_t *snap);
 zone_db_snapshot_t *acquire_retained_zone_snapshot(void);
 void release_zone_snapshot(zone_db_snapshot_t *snap);
 zone_config_t *find_zone_config_in_view(server_config_t *cfg, const char *view_name, const char *domain);
+/* ゾーンエントリの設定。DB のゾーンは entry->dbcfg、それ以外は cfg の索引 (find_zone_config_in_view)。
+ * 無ければ NULL。返した物は cfg を保持している間 (DB のゾーンは読み取り区間の中) だけ有効 */
+static inline const zone_config_t *zone_entry_config(server_config_t *cfg, const zone_db_entry_t *entry) {
+  if (entry->source == ZONE_SRC_DB) return atomic_load_explicit(&entry->dbcfg, memory_order_acquire);
+  return find_zone_config_in_view(cfg, entry->view_name, entry->domain);
+}
 zone_db_snapshot_t *rebuild_zone_db_snapshot(server_config_t *config,
                                              const char *target_view_name,
                                              zone_db_entry_t *catalog_entry_to_update,
-                                             zone_config_t *catalog_cfg,
+                                             const zone_config_t *catalog_cfg,
                                              catalog_member_id_t *new_desired_members,
                                              int new_desired_count);
 
@@ -535,6 +555,9 @@ size_t zone_drop_unencodable_logged(zone_arena_t *a, const char *zone, const cha
 /* S2: 公開、解放待ちの処理、兄弟ゾーンの変更に伴うグルーの作り直し (dns_snapshot_rcu.c) */
 void zone_publish(zone_db_entry_t *entry, zone_version_t *next);
 void zone_retire_process(bool wait);
+bool zone_retire_object(zone_db_entry_t *entry, void *obj, void (*free_fn)(void *), uint64_t epoch);
+/* builder を新しい版として公開する (dns_axfr_ixfr.c)。entry->writer_lock を持って呼ぶ。約束は定義の前の注釈に */
+int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const char *what);
 void zone_glue_refresh_dependents(bool force);
 uint64_t zone_entry_next_id(void);
 
