@@ -97,6 +97,16 @@ static bool is_non_data_rrtype(uint16_t t) {
     }
 }
 
+/* RFC 5155 §7.2.8: NSEC3 RR とそれを覆う RRSIG はハッシュ化した名前の NSEC3 チェーンのデータで、通常の
+ * 名前空間の RR ではない。これしか持たない名前は (その下にも RR が無ければ) 存在しないものとして答える
+ * (§7.2.2 の Name Error)。AXFR/IXFR はゾーンの全レコードを送るので、この判定を使わない。 */
+static bool is_nsec3_chain_rr(const zone_image_t *img, uint32_t rr) {
+  uint16_t type = zone_image_rrs(img)[rr].type;
+  if (type == 50) return true;
+  uint16_t covered = 0;
+  return type == 46 && zone_image_rrsig_covered(img, rr, &covered) == 0 && covered == 50;
+}
+
 static resolve_checkpoint_t save_checkpoint(uint16_t *offset, uint16_t *ancount,
 
                                              uint16_t *nscount, uint16_t *arcount) {
@@ -239,6 +249,7 @@ static int emit_rrset(const zone_image_t *img, uint32_t name_id, const char *own
   uint32_t end = k + zone_image_name_rr_count(img, name_id);
   for (; k < end; k++) {
     if (rrs[k].type != type) continue;
+    if (is_nsec3_chain_rr(img, k)) continue; // RFC 5155 §7.2.8: 否定の証明でだけ書く (attach_nsec3_record)
     if (qclass != 255 && qclass != rrs[k].class_val) continue;
     if (f->answer_scope) note_ecs_variant(img, k, type, f->zone_scope, f->answer_scope);
     uint32_t eff_ttl;
@@ -400,6 +411,7 @@ STATIC_TEST bool name_exists_in_zone(const zone_image_t *img, const char *name, 
     uint32_t k = zone_image_name_first_rr(img, id);
     uint32_t end = k + zone_image_name_rr_count(img, id);
     for (; k < end; k++) {
+      if (is_nsec3_chain_rr(img, k)) continue; // RFC 5155 §7.2.8
       uint32_t eff_ttl;
       if (rr_valid(img, k, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) return true;
     }
@@ -824,6 +836,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     if (has_any && minimal_any) {
       bool name_exists = false, has_cname = false, has_rrsig = false;
       for (uint32_t k = q_first; k < q_end; k++) {
+        if (is_nsec3_chain_rr(img, k)) continue; // RFC 5155 §7.2.8: 名前の存在に数えない
         uint32_t eff_ttl;
         note_ecs_variant(img, k, 255, zone_scope, answer_scope);
         if (!rr_valid(img, k, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
@@ -860,6 +873,8 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
       uint16_t r_class = img_rrs[k].class_val;
       bool class_matches = (qclass == 255 || qclass == r_class);
       if (!class_matches) continue;
+      // RFC 5155 §7.2.8: NSEC3 チェーンのレコードは QTYPE NSEC3/RRSIG/ANY でも答えず、名前の存在にも数えない
+      if (is_nsec3_chain_rr(img, k)) continue;
       uint32_t eff_ttl;
       note_ecs_variant(img, k, qtypes[0], zone_scope, answer_scope);
       if (!rr_valid(img, k, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
