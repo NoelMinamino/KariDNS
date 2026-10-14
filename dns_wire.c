@@ -2116,13 +2116,24 @@ static int decode_b64_buffer(const char *b64, size_t b64_len, uint8_t *res, size
      * (declen - padding) to a negative int that then wraps to a huge size_t
      * when added to *offset, corrupting all bound checks that follow. */
     if (b64_len == 0 || (b64_len % 4) != 0) return -1;
-    size_t decoded_upper_bound = ((b64_len + 3) / 4) * 3;
-    if (*offset + decoded_upper_bound > max_res_len) return -1;
-    int declen = EVP_DecodeBlock(&res[*offset], (const unsigned char *)b64, b64_len);
-    if (declen < 0) return -1;
-    int padding = (b64_len > 0 && b64[b64_len-1]=='=') + (b64_len > 1 && b64[b64_len-2]=='=');
-    if (declen < padding) return -1; // guard against underflow
-    *offset += (size_t)(declen - padding);
+    /* EVP_DecodeBlock() writes 3 octets per quantum including the zero octets standing for '=' padding. Those
+     * octets are not part of the RDATA, so the room check must use the exact length (up to 2 less), or an RR
+     * that fits exactly is rejected. The last quantum goes through a 3-octet scratch buffer so nothing is
+     * written beyond *offset + exact length. */
+    int padding = (b64[b64_len - 1] == '=') + (b64[b64_len - 2] == '=');
+    size_t exact = (b64_len / 4) * 3 - (size_t)padding;
+    if (*offset + exact > max_res_len) return -1;
+    size_t head = b64_len - 4, written = 0;
+    if (head > 0) {
+        int hlen = EVP_DecodeBlock(&res[*offset], (const unsigned char *)b64, head);
+        if (hlen < 0 || (size_t)hlen != head / 4 * 3) return -1;
+        written = (size_t)hlen;
+    }
+    unsigned char tail[3];
+    int tlen = EVP_DecodeBlock(tail, (const unsigned char *)b64 + head, 4);
+    if (tlen != 3) return -1;
+    memcpy(&res[*offset + written], tail, (size_t)(3 - padding));
+    *offset += exact;
     return 0;
 }
 
@@ -2948,8 +2959,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 // count below, underflowing pk_len (uint16_t) into a huge value.
                 if (pk_b64_len == 0 || (pk_b64_len % 4) != 0) return -1;
 
-                size_t decoded_upper_bound = ((pk_b64_len + 3) / 4) * 3;
-                if ((size_t)offset + 4 + hit_len + decoded_upper_bound > max_res_len) return -1;
+                if ((size_t)offset + 4 + hit_len > max_res_len) return -1;
                 
                 res[offset++] = (uint8_t)hit_len;
                 res[offset++] = pk_alg;
@@ -2960,15 +2970,10 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 memcpy(&res[offset], hit, hit_len);
                 offset += hit_len;
                 
-                int pk_declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)pk_b64, pk_b64_len);
-                if (pk_declen < 0) return -1;
-                
-                int padding = 0;
-                if (pk_b64_len > 0 && pk_b64[pk_b64_len - 1] == '=') padding++;
-                if (pk_b64_len > 1 && pk_b64[pk_b64_len - 2] == '=') padding++;
-                
-                if (pk_declen < padding) return -1; // guard against uint16_t underflow below
-                uint16_t pk_len = (uint16_t)(pk_declen - padding);
+                size_t pk_end = offset;
+                if (decode_b64_buffer(pk_b64, pk_b64_len, res, max_res_len, &pk_end) != 0) return -1;
+                if (pk_end - offset > 0xFFFF) return -1; // the public key length is 16 bits
+                uint16_t pk_len = (uint16_t)(pk_end - offset);
                 res[pk_len_offset] = pk_len >> 8;
                 res[pk_len_offset + 1] = pk_len & 0xFF;
                 offset += pk_len;

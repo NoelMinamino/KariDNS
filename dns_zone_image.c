@@ -263,8 +263,7 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
     uint32_t *rec_name = malloc((n ? n : 1) * sizeof(uint32_t));
     rec_rr = malloc((n ? n : 1) * sizeof(uint32_t));
     cap = malloc(65535);
-    uint8_t *chk = malloc(65540);
-    if (!ix.tab || !ix.names || !rec_name || !rec_rr || !cap || !chk) IMG_FAIL();
+    if (!ix.tab || !ix.names || !rec_name || !rec_rr || !cap) IMG_FAIL();
 
     /* 1. owners: one name id per owner (case-insensitive, with or without the root dot), first appearance order */
     for (size_t i = 0; i < n; i++) {
@@ -385,16 +384,6 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
             if (w2 < 0) IMG_FAIL();
             rd = minfo;
             rdlen = (size_t)(w1 + w2);
-        }
-        /* room serialize_dns_record() wants beyond the RDATA (base64 fields: it checks the padded size first) */
-        if (!raw && rdlen > 0 && r->type_code != 14 && len <= 65533) {
-            unsigned slack = 0;
-            for (; slack <= 2; slack++) {
-                uint16_t l2 = 0;
-                if (serialize_dns_record(chk, (size_t)len + slack, &l2, r, NULL, ".", 0xFFFFFFFFu) == 0) break;
-            }
-            if (slack > 2) IMG_FAIL();
-            rr->flags = (uint16_t)(rr->flags | (slack << ZONE_IMAGE_RR_SLACK_SHIFT));
         }
         rr->rdata_len = (uint16_t)rdlen;
         rr->rdata_off = rdlen ? sb_add(&sb, rd, rdlen) : 0;
@@ -646,7 +635,7 @@ out:
         img = NULL;
     }
     free(ix.tab); free(ix.names); free(rec_name); free(rec_rr); free(rr_rec); free(names); free(rrs); free(exts);
-    free(canon); free(nsec); free(n3chains); free(n3entries); free(glue); free(hashtab); free(cap); free(chk); free(seen);
+    free(canon); free(nsec); free(n3chains); free(n3entries); free(glue); free(hashtab); free(cap); free(seen);
     free(perm);
     free(sb.p); free(za.p);
     return img;
@@ -828,8 +817,6 @@ int image_serialize_rr(const zone_image_t *img, uint32_t rr_idx, uint8_t *res, s
         }
     }
 
-    unsigned slack = (rr->flags & ZONE_IMAGE_RR_SLACK_MASK) >> ZONE_IMAGE_RR_SLACK_SHIFT;
-    if (slack && (size_t)offset + slack > max_res_len) return -1;
     uint16_t rdlength = (uint16_t)(offset - rdlength_idx - 2);
     res[rdlength_idx] = rdlength >> 8; res[rdlength_idx + 1] = rdlength & 0xFF;
     *offset_ptr = offset;

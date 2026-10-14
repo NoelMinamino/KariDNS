@@ -274,7 +274,10 @@ static void pass_boundary(const zone_arena_t *a, const zone_image_t *img, const 
                 int x = serialize_dns_record(ra_buf, m, &oa, rec, &ca, NULL, 0xFFFFFFFFu);
                 int y = image_serialize_rr(img, k, rb_buf, m, &ob, &cb, NULL, zone_image_rr_ttl(img, k));
                 CHECK(x == y);
-                if (x != y) {
+                /* exact fit: the RR is written in a message of exactly its size and in none one octet smaller
+                 * (no padding allowance in either implementation) */
+                CHECK((x == 0) == (m >= (size_t)full));
+                if (x != y || (x == 0) != (m >= (size_t)full)) {
                     printf("    boundary: rr %u type %u size %zu (%zu..%zu): serialize=%d image=%d\n", k, rec->type_code, m,
                            (size_t)base, (size_t)full, x, y);
                     return;

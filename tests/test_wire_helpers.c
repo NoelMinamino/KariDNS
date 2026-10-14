@@ -54,6 +54,89 @@ static const dns_record_t *find_rec(const zone_arena_t *a, const char *name, uin
     return NULL;
 }
 
+/* base64 (RFC 4648 §4) for the exact-fit test; written here so the expected text does not come from the code under test */
+static void test_b64_encode(const uint8_t *in, size_t n, char *out) {
+    static const char tab[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        if (i + 1 < n) v |= (uint32_t)in[i + 1] << 8;
+        if (i + 2 < n) v |= in[i + 2];
+        out[o++] = tab[(v >> 18) & 63];
+        out[o++] = tab[(v >> 12) & 63];
+        out[o++] = (i + 1 < n) ? tab[(v >> 6) & 63] : '=';
+        out[o++] = (i + 2 < n) ? tab[v & 63] : '=';
+    }
+    out[o] = '\0';
+}
+
+/* serialize_dns_record() must accept a message that is exactly as long as the RR needs and reject one octet less,
+ * also for base64 RDATA whose padding ('=') makes the decoded length shorter than the 3 octets per quantum that
+ * the decoder writes (RFC 4648 §4 padding, RFC 4034 §2.1.4 / RFC 4398 / RFC 7929 / RFC 4701 / RFC 5205 RDATA layouts). */
+static void test_serialize_exact_fit_base64(void) {
+    printf("[TEST] serialize_dns_record: base64 RDATA that fits exactly is not dropped...\n");
+    static const struct { uint16_t type; const char *name; } types[] = {
+        { 48, "DNSKEY" }, { 60, "CDNSKEY" }, { 61, "OPENPGPKEY" }, { 49, "DHCID" }, { 55, "HIP" }, { 45, "IPSECKEY" },
+        { 46, "RRSIG" },
+    };
+    const char *owner = "a.example.";     /* 1 + 1 + 7 + 1 + 1 = 11 octets uncompressed */
+    for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+        for (size_t n = 1; n <= 12; n++) {  /* n % 3 = 0, 1, 2: no padding, "==", "=" */
+            uint8_t key[12];
+            for (size_t i = 0; i < n; i++) key[i] = (uint8_t)(0x40 + i * 7);
+            char b64[32];
+            test_b64_encode(key, n, b64);
+            dns_record_t rec;
+            memset(&rec, 0, sizeof(rec));
+            DNS_RECORD_BIND_RDATA(rec);
+            rec.name = (char *)owner;
+            rec.type_code = types[t].type;
+            rec.class_val = 1;
+            rec.ttl_value = 60;
+            size_t fixed;       /* RDATA octets before the key */
+            switch (types[t].type) {
+            case 48: case 60:   /* flags protocol algorithm key (RFC 4034 §2.1) */
+                rec.rdata[0] = "257"; rec.rdata[1] = "3"; rec.rdata[2] = "13"; rec.rdata[3] = b64; rec.rdata_count = 4;
+                fixed = 4; break;
+            case 61: case 49:   /* the whole RDATA is the base64 value (RFC 7929 §2.1, RFC 4701 §3) */
+                rec.rdata[0] = b64; rec.rdata_count = 1;
+                fixed = 0; break;
+            case 55:            /* HIT length, PK algorithm, PK length, HIT, PK (RFC 5205 §5): 4 octet HIT "00112233" */
+                rec.rdata[0] = "2"; rec.rdata[1] = "00112233"; rec.rdata[2] = b64; rec.rdata_count = 3;
+                fixed = 4 + 4; break;
+            case 45:            /* precedence, gateway type 0 (none), algorithm 2, gateway ".", key (RFC 4025 §2.1) */
+                rec.rdata[0] = "10"; rec.rdata[1] = "0"; rec.rdata[2] = "2"; rec.rdata[3] = "."; rec.rdata[4] = b64;
+                rec.rdata_count = 5; fixed = 3; break;
+            default:            /* RRSIG: type, alg, labels, ttl, expiration, inception, tag, signer, signature (RFC 4034 §3.1) */
+                rec.rdata[0] = "A"; rec.rdata[1] = "13"; rec.rdata[2] = "2"; rec.rdata[3] = "300";
+                rec.rdata[4] = "20300101000000"; rec.rdata[5] = "20200101000000"; rec.rdata[6] = "12345";
+                rec.rdata[7] = "example."; rec.rdata[8] = b64; rec.rdata_count = 9;
+                fixed = 18 + 9; break;      /* signer "example." = 9 octets uncompressed */
+            }
+            size_t total = 11 + 10 + fixed + n;
+            uint8_t buf[256];
+            memset(buf, 0xEE, sizeof(buf));
+            uint16_t off = 0;
+            int rc = serialize_dns_record(buf, total, &off, &rec, NULL, NULL, 0xFFFFFFFFu);
+            if (rc != 0 || off != total)
+                printf("  %s n=%zu: rc=%d off=%u want %zu\n", types[t].name, n, rc, off, total);
+            CHECK(rc == 0 && off == total);
+            if (rc == 0) {
+                CHECK(memcmp(buf + total - n, key, n) == 0);                       /* the key, nothing after it */
+                CHECK(((size_t)buf[19] << 8 | buf[20]) == fixed + n);              /* RDLENGTH */
+            }
+            CHECK(buf[total] == 0xEE);                                              /* nothing written past the end */
+            off = 0;
+            CHECK(serialize_dns_record(buf, total - 1, &off, &rec, NULL, NULL, 0xFFFFFFFFu) != 0);
+            /* fits with room to spare: same bytes */
+            uint8_t buf2[256];
+            uint16_t off2 = 0;
+            CHECK(serialize_dns_record(buf2, sizeof(buf2), &off2, &rec, NULL, NULL, 0xFFFFFFFFu) == 0 && off2 == total);
+            CHECK(rc == 0 && memcmp(buf, buf2, total) == 0);
+        }
+    }
+}
+
 static void test_name_label_to_text(void) {
     printf("[TEST] dns_label_to_text: RFC 4343 §2.1 escaping of one label...\n");
     const uint8_t label[] = { 'a', '.', 'b', '\\', ' ', 0x00, 0xFF, '~', '!', '(', 'Z' };
@@ -2980,6 +3063,7 @@ int main(void) {
     test_name_register_stops_at_pointer();
     test_name_zone_parser_normalizes();
     test_name_tinydns_normalizes();
+    test_serialize_exact_fit_base64();
     printf("[*] Final checks: %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) {
         printf("=== Wire / Utility Helper Tests FAILED ===\n");

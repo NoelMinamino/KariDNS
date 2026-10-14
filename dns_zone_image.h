@@ -51,10 +51,6 @@
 /* zone_image_rr_t.flags */
 #define ZONE_IMAGE_RR_RAW        0x1u /* RDATA written as is (generic_data / KARIDNS_EXT class): never compressed */
 #define ZONE_IMAGE_RR_NO_NAMEWIRE 0x2u /* record had no preparsed owner wire (rdata_count == 0): see image_serialize_rr */
-/* bits 2-3: octets of room serialize_dns_record() wants beyond the RDATA (its base64 decoder checks the room for the
- * padded output before it knows the padding; (flags & ZONE_IMAGE_RR_SLACK_MASK) >> ZONE_IMAGE_RR_SLACK_SHIFT is 0..2) */
-#define ZONE_IMAGE_RR_SLACK_SHIFT 2
-#define ZONE_IMAGE_RR_SLACK_MASK  (0x3u << ZONE_IMAGE_RR_SLACK_SHIFT)
 
 /* 24 bytes */
 typedef struct {
