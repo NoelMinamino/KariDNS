@@ -363,6 +363,8 @@ A signed response that would not fit the client's UDP size with its TSIG is trun
 
 ### `control-channel { ... }`
 
+`control-channel` is a statement of its own, at the top level of the configuration, next to `options` and `zone`. Written inside `options { ... }` it is a configuration error (the server refuses to start and `karicheck conf` reports it) instead of being ignored, which used to leave the server without a control socket.
+
 | Option | Default | Description |
 |---|---|---|
 | `socket "<path>";` (alias `socket-path`) | `/var/run/karidns/control.sock` | UNIX socket for `karictl`. |
@@ -617,6 +619,12 @@ The default `file-format` is the master file format of RFC 1035 §5 as BIND read
   that is valid for that type (RFC 3597 §5): `PTR \# 0`, `NS \# 3 010203` or a compressed name in the hex are
   zone file errors, reported by `karicheck zone` at the record's line. Zero-length RDATA is legal for a type
   without a defined format (`TYPE65534 \# 0`) and is transferred (AXFR/IXFR) and served like any other record.
+- **Case of names**: owner names and the domain names inside RDATA are answered and transferred with the letters as
+  written (RFC 4343 §4.1), for every type, from a zone file and from a database alike. The only exception is name
+  compression (types NS, CNAME, PTR, MX, SOA, MINFO and the owner): a name that is compressed against an earlier name of the
+  same message that differs only in case shows the case of the earlier one, as RFC 4343 §4.1 allows. The lower-case form
+  of RFC 4034 §6.2 is used only where DNSSEC needs the canonical form (ZONEMD digests, UPDATE and IXFR comparisons,
+  `karicheck`).
 - **Classes**: `IN` (the default when the class is omitted), `CH`, `HS` and `CLASSnn` are kept with the record. The
   server answers queries of class IN and CH; records of other classes are loaded but not answered (queries of
   those classes are REFUSED). `NONE`, `ANY`, `CLASS0` and class 65302 (used internally by KariDNS) are errors.

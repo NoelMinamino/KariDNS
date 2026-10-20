@@ -138,12 +138,13 @@ if cmp -s "$T/ref.kdb" "$T/k1.kdb"; then bad "the dump did not change"; else ok 
 "$Z2K" --extract "$T/k1.kdb" "$ZK" > "$T/zb.k1"
 [ ! -s "$T/zb.k1" ] && ok "no ZONE_BEGIN for $ZK" || bad "$ZK is still in the stream"
 sqlite3 "$T/z.db" "INSERT INTO domainmetadata (domain_id, kind, content) VALUES ((SELECT id FROM domains WHERE name = '$ZK'), 'PRESIGNED', '1')"
+PM_ID=$(sqlite3 "$T/z.db" "SELECT max(id) FROM domainmetadata")     # the row just added; zone2sql's own PRESIGNED / NSEC3PARAM rows of signed zones stay
 "$LOADER" --dump "$T/k2.kdb" --driver sqlite3 --database-file "$T/z.db" 2> "$T/k2.err"
 RC=$?
 [ $RC -eq 0 ] && ok "with PRESIGNED=1 the zone loads (exit 0)" || { bad "exit $RC with PRESIGNED=1"; cat "$T/k2.err"; }
 "$Z2K" --extract "$T/k2.kdb" "$ZK" > "$T/zb.k2"
 [ -s "$T/zb.k2" ] && ok "$ZK is in the stream again" || bad "$ZK is missing"
-sqlite3 "$T/z.db" "DELETE FROM cryptokeys; DELETE FROM domainmetadata"
+sqlite3 "$T/z.db" "DELETE FROM cryptokeys; DELETE FROM domainmetadata WHERE id = $PM_ID"
 "$LOADER" --dump "$T/v1.kdb" --driver sqlite3 --database-file "$T/z.db" --view-index 3 --default-ttl 120 2> /dev/null
 RC=$?
 [ $RC -eq 0 ] && ok "--view-index 3 --default-ttl 120" || bad "exit $RC with --view-index"

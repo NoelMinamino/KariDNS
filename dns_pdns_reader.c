@@ -258,6 +258,9 @@ void pdns_zone_free(pdns_zone_t *z) {
     free(z->text);
     free(z->line_off);
     free(z->line_id);
+    free(z->ord_off);
+    free(z->ord_pool);
+    free(z->text2);
     for (size_t i = 0; i < z->n_meta; i++) free(z->meta[i].content);
     free(z->meta);
     for (size_t i = 0; i < z->n_ents; i++) {
@@ -299,6 +302,9 @@ static bool rows_reserve(pdns_zone_t *z) {
     int64_t *li = realloc(z->line_id, nc * sizeof(int64_t));
     if (!li) return false;
     z->line_id = li;
+    size_t *oo = realloc(z->ord_off, nc * sizeof(size_t));
+    if (!oo) return false;
+    z->ord_off = oo;
     z->rows_cap = nc;
     return true;
 }
@@ -310,6 +316,35 @@ static bool type_token_ok(const char *t) {
     for (size_t i = 0; i < n; i++)
         if (!isalnum((unsigned char)t[i]) && t[i] != '-') return false;
     return true;
+}
+
+/* The ordername of the row about to become row z->n_rows (presigned checks, dns_presigned.h).  The rows of one owner
+ * carry the same value, so a value equal to the previous row's is stored once.  A value longer than the column
+ * (255) is replaced by a marker that matches no hash and no name. */
+static int store_ordername(pdns_zone_t *z, const char *on) {
+    size_t i = z->n_rows;
+    if (!on) {
+        z->ord_off[i] = 0;
+        return 0;
+    }
+    if (strlen(on) > 255) on = "\x01too-long";
+    if (i > 0 && z->ord_off[i - 1] && strcmp(z->ord_pool + z->ord_off[i - 1] - 1, on) == 0) {
+        z->ord_off[i] = z->ord_off[i - 1];
+        return 0;
+    }
+    size_t n = strlen(on) + 1;
+    if (z->ord_len + n > z->ord_cap) {
+        size_t nc = z->ord_cap ? z->ord_cap : 1024;
+        while (nc < z->ord_len + n) nc *= 2;
+        char *np = realloc(z->ord_pool, nc);
+        if (!np) return -1;
+        z->ord_pool = np;
+        z->ord_cap = nc;
+    }
+    memcpy(z->ord_pool + z->ord_len, on, n);
+    z->ord_off[i] = z->ord_len + 1;
+    z->ord_len += n;
+    return 0;
 }
 
 int pdns_zone_add_record(pdns_zone_t *z, const db_record_row_t *row) {
@@ -473,6 +508,10 @@ int pdns_zone_add_record(pdns_zone_t *z, const db_record_row_t *row) {
     if (tr == 0 && !rows_reserve(z)) tr = -1;
     if (tr != 0) {
         zfail(z, true, id, "%s", tr > 0 ? "zone text exceeds the size limit (max-text-bytes)" : "out of memory");
+        return -1;
+    }
+    if (store_ordername(z, row->ordername) != 0) {
+        zfail(z, true, id, "out of memory");
         return -1;
     }
     z->line_off[z->n_rows] = z->text_len;
@@ -976,6 +1015,113 @@ static size_t row_at_offset(const pdns_zone_t *z, size_t off) {
     return lo;
 }
 
+/* Presigned zones (design 3.6, dns_presigned.h): the NSEC3 / NSEC RRs PowerDNS does not store are rebuilt from the rows,
+ * written as zone-file lines and parsed into the same arena after the rows (so the stream order is: rows in records.id
+ * order; each synthesized RR right before the stored RRSIG row that covers it, the order of a signer's output). */
+typedef struct { size_t anchor, line; } synth_pos_t;
+
+static int synth_pos_cmp(const void *a, const void *b) {
+    const synth_pos_t *x = a, *y = b;
+    if (x->anchor != y->anchor) return x->anchor < y->anchor ? -1 : 1;
+    return x->line < y->line ? -1 : x->line > y->line;
+}
+
+static int apply_presigned(pdns_zone_t *z) {
+    const char **ord = NULL;
+    presigned_ent_t *pe = NULL;
+    presigned_out_t out;
+    memset(&out, 0, sizeof(out));
+    int rc = -1;
+    if (z->n_rows) {
+        ord = malloc(z->n_rows * sizeof(*ord));
+        if (!ord) goto oom;
+        for (size_t i = 0; i < z->n_rows; i++) ord[i] = z->ord_off[i] ? z->ord_pool + z->ord_off[i] - 1 : NULL;
+    }
+    if (z->n_ents) {
+        pe = malloc(z->n_ents * sizeof(*pe));
+        if (!pe) goto oom;
+        for (size_t i = 0; i < z->n_ents; i++) {
+            pe[i].name = z->ents[i].name;
+            pe[i].ordername = z->ents[i].ordername;
+        }
+    }
+    char err[PDNS_ERR_LEN / 2];
+    if (presigned_rebuild(&z->arena, z->name, z->nsec3param, ord, pe, z->n_ents, &out, err, sizeof(err)) != 0) {
+        zfail(z, false, 0, "presigned zone: %s", err);
+        goto done;
+    }
+    z->presigned_mode = out.mode;
+    if (out.mode == PS_NONE) {
+        rc = 0;
+        goto done;
+    }
+    z->text2 = out.text;                                     /* the arena keeps pointers into it */
+    size_t before = z->arena.count;
+    parse_error_t perr = {0};
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.default_origin = ".";
+    ctx.err_out = &perr;
+    if (parse_zone_fast(z->text2, out.text_len, &z->arena, &ctx) < 0 || z->arena.count != before + out.n_records) {
+        zfail(z, false, 0, "internal error: the rebuilt NSEC/NSEC3 records were not accepted by the parser (%s)",
+              perr.error_message ? perr.error_message : "record count");
+        goto done;
+    }
+    int64_t *li = realloc(z->line_id, z->arena.count * sizeof(int64_t));
+    if (!li) goto oom;
+    z->line_id = li;
+    for (size_t i = before; i < z->arena.count; i++) z->line_id[i] = 0;
+    z->n_synth = out.n_records;
+    /* every synthesized RR goes right before the stored RRSIG row that covers it (the signer's order of RRsets) */
+    {
+        size_t total = z->arena.count, ns = out.n_records;
+        dns_record_t *tmp = malloc(total * sizeof(*tmp));
+        int64_t *tid = malloc(total * sizeof(int64_t));
+        synth_pos_t *srt = malloc(ns * sizeof(*srt));
+        if (!tmp || !tid || !srt) {
+            free(tmp);
+            free(tid);
+            free(srt);
+            goto oom;
+        }
+        for (size_t i = 0; i < ns; i++) {                       /* lines ordered by (anchor, line) */
+            srt[i].anchor = out.anchor[i];
+            srt[i].line = i;
+        }
+        qsort(srt, ns, sizeof(*srt), synth_pos_cmp);
+        size_t w = 0, s = 0;
+        for (size_t i = 0; i < before; i++) {
+            while (s < ns && srt[s].anchor == i) {
+                tmp[w] = z->arena.records[before + srt[s].line];
+                tid[w++] = 0;
+                s++;
+            }
+            tmp[w] = z->arena.records[i];
+            tid[w++] = z->line_id[i];
+        }
+        for (; s < ns; s++) {
+            tmp[w] = z->arena.records[before + srt[s].line];
+            tid[w++] = 0;
+        }
+        memcpy(z->arena.records, tmp, total * sizeof(*tmp));
+        memcpy(z->line_id, tid, total * sizeof(int64_t));
+        free(tmp);
+        free(tid);
+        free(srt);
+        for (size_t i = 0; i < total; i++)
+            if (z->arena.records[i].type_code == 6) z->soa_index = i;        /* the apex SOA moved if a line went before it */
+    }
+    rc = 0;
+    goto done;
+oom:
+    zfail(z, false, 0, "out of memory");
+done:
+    free(ord);
+    free(pe);
+    free(out.anchor);
+    return rc;
+}
+
 int pdns_zone_finish(pdns_zone_t *z) {
     if (z->failed) return -1;
     if (z->finished) {
@@ -1071,6 +1217,7 @@ int pdns_zone_finish(pdns_zone_t *z) {
             return -1;
         }
     }
+    if ((z->flags & PDNS_F_PRESIGNED) && apply_presigned(z) != 0) return -1;
     if (build_zone_index(&z->arena, false) != 0) {
         zfail(z, false, 0, "out of memory building the zone index");
         return -1;
@@ -1122,15 +1269,6 @@ static int gen_bodies(const pdns_zone_t *z, body_sink_t sink, void *ud, char *er
         for (int attempt = 0;; attempt++) {
             uint16_t o2 = off;
             if (serialize_dns_record(buf, KDB_MAX_ZONE_DATA, &o2, &z->arena.records[idx], NULL, NULL, 0xFFFFFFFFu) == 0) {
-                /* keep the case of MINFO names as the zone image does (serialize_dns_record() without a compression
-                 * context lowercases them): owner, TYPE CLASS TTL RDLENGTH (10 octets), RDATA */
-                size_t at;
-                if (skip_wire_name(buf, o2, off, &at) != 0 || at + 10 > o2 ||
-                    dns_rdata_keep_name_case(&z->arena.records[idx], buf + at + 10, (size_t)o2 - at - 10) != 0) {
-                    snprintf(err, errlen, "zone '%s' records.id %lld: cannot write the RR", z->name,
-                             (long long)z->line_id[idx]);
-                    goto out;
-                }
                 off = o2;
                 an++;
                 break;
@@ -1193,10 +1331,6 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
     }
     if (z->flags & PDNS_F_TINYDNS) {
         snprintf(err, errlen, "zone '%s': tinydns zones are encoded in milestone B8", z->name);
-        return -1;
-    }
-    if ((z->flags & PDNS_F_PRESIGNED) && z->nsec3param) {
-        snprintf(err, errlen, "zone '%s': presigned NSEC3 zones are rebuilt in milestone B5", z->name);
         return -1;
     }
     uint64_t rr_count = (uint64_t)z->arena.count + 1;

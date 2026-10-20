@@ -2933,6 +2933,16 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key);
             return -1;
           }
+        } else if (strcmp(key, "control-channel") == 0) {
+          /* D17-3: it used to be skipped like any unknown option, so the control socket silently did not exist.  It is a
+           * top-level statement (like in the sample configuration); say so instead of ignoring it. */
+          syslog(LOG_ERR, "[Config] control-channel is written inside options { }: it is a top-level statement, "
+                          "write it outside options { }");
+          fprintf(stderr, "[ERROR] control-channel is written inside options { }: it is a top-level statement, "
+                          "write it outside options { }\n");
+          if (ctx) ctx->error_occurred = true;
+          free(key);
+          return -1;
         } else
           skip_unknown_block(ctx);
         free(key);

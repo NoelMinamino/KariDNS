@@ -3,9 +3,9 @@
  *
  * Byte parity with serialize_dns_record() (CLAUDE.md Rule 3/4):
  *  - freeze asks serialize_dns_record() itself for the RDATA (no compress_ctx_t, so every name is expanded and
- *    nothing depends on what was written before) and stores those bytes. The only type whose uncompressed output
- *    differs in case from the compressed one is MINFO (write_dns_name_str() lowercases without a context), so it
- *    is rebuilt from the text with the case kept.
+ *    nothing depends on what was written before) and stores those bytes.  Every RDATA name keeps the case as
+ *    written, with or without a context (D17-4, RFC 4343 s2-s4); the lower-case form exists only in
+ *    dns_record_canonical_rdata().
  *  - image_serialize_rr() copies the stored bytes and sends the domain names at the places listed in
  *    dns_rdata_name_layout() through compress_name(), the function serialize_dns_record() uses, in the same order,
  *    so the bytes, the status and the compress_ctx_t table are those of serialize_dns_record().
@@ -374,7 +374,6 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
         size_t rdlen = ((size_t)cap[9] << 8) | cap[10];
         if (11 + rdlen != len || rdlen > IMG_MAX_RDLEN) IMG_FAIL();
         uint8_t *rd = cap + 11;
-        if (!raw && dns_rdata_keep_name_case(r, rd, rdlen) != 0) IMG_FAIL();   /* MINFO: the case as written */
         rr->rdata_len = (uint16_t)rdlen;
         rr->rdata_off = rdlen ? sb_add(&sb, rd, rdlen) : 0;
 
@@ -795,7 +794,6 @@ int image_serialize_rr(const zone_image_t *img, uint32_t rr_idx, uint8_t *res, s
             } else {
                 if ((size_t)offset + (size_t)wl > max_res_len) return -1;
                 memcpy(&res[offset], rd + pos, (size_t)wl);
-                if (rec_type == 14) dns_canonical_downcase_rdata(2 /* one name */, &res[offset], (size_t)wl);
                 offset = (uint16_t)(offset + wl);
             }
             pos += (size_t)wl;
@@ -1230,7 +1228,6 @@ static int thaw_one(const zone_image_t *img, uint32_t k, zone_arena_t *a, uint8_
     uint16_t clen = 0;
     bool same = serialize_dns_record(chk, 65535, &clen, &rec, NULL, ".", 0xFFFFFFFFu) == 0 && clen == 11 + rr->rdata_len &&
                 (rr->rdata_len == 0 || memcmp(chk + 11, zone_image_rr_rdata(img, k), rr->rdata_len) == 0);
-    if (!same && rec.type_code == 14 && rec.rdata_count >= 2) same = true; /* MINFO: lowercased without a context */
     if (!same) {
         const dns_rdata_name_layout_t *lay = dns_rdata_name_layout(rr->type);
         if (lay && lay->compress) {

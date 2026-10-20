@@ -490,11 +490,6 @@ int extract_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t
 long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const char *name);
 // downcase=true なら RFC 4034 §6.2 の正規ワイヤ形式 (英字を小文字化)
 long write_uncompressed_name_ext(uint8_t *buf, size_t offset, size_t max_len, const char *name, bool downcase);
-/* serialize_dns_record() without a compression context writes the two names of a MINFO (RFC 1035 3.3.7) in lower
- * case; with a context it keeps their case. Code that keeps or sends uncompressed RDATA (the zone image, the DB
- * loader) rewrites them in place with the case as written (same length). rd / rdlen: the RDATA that
- * serialize_dns_record(.., NULL, ..) wrote for rec. 0 = done or nothing to do, -1 = cannot. */
-int dns_rdata_keep_name_case(const dns_record_t *rec, uint8_t *rd, size_t rdlen);
 int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, compress_ctx_t *ctx, size_t max_len);
 int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, const dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl);
 /* RFC 4034 §6.2 item 3 (RFC 6840 §5.1) の型について、非圧縮の RDATA 内のドメイン名を小文字にする */

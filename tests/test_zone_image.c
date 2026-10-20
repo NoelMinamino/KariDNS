@@ -700,9 +700,7 @@ static void check_thaw(const zone_arena_t *a, const zone_image_t *img, const uin
         uint16_t oa = 0, ob = 0;
         int ra = serialize_dns_record(ba, sizeof(ba), &oa, x, NULL, NULL, 0xFFFFFFFFu);
         int rb = serialize_dns_record(bb, sizeof(bb), &ob, y, NULL, NULL, 0xFFFFFFFFu);
-        if (x->type_code != 14) { /* MINFO is lowercased without a context in both; compare with a context below */
-            CHECK(ra == rb && oa == ob && memcmp(ba, bb, oa) == 0);
-        }
+        CHECK(ra == rb && oa == ob && memcmp(ba, bb, oa) == 0);      /* D17-4: every type keeps the case as written, MINFO too */
         compress_ctx_t c1, c2;
         compress_ctx_init(&c1);
         compress_ctx_init(&c2);

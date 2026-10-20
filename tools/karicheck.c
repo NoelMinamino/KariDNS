@@ -320,13 +320,14 @@ typedef struct {
 KARIDNS_TOOL_FN bool kc_canonical_rr(const dns_record_t *rec, kc_canon_rr_t *out) {
     uint8_t buf[65535];
     uint16_t len = 0;
-    /* owner_name を渡すと所有者名は write_uncompressed_name() で小文字の非圧縮形になる
-     * (rec->name_wire は元の大文字小文字のまま) */
+    /* owner_name を渡すと所有者名は非圧縮形で書かれる (rec->name_wire は元の大文字小文字のまま)。D17-4 以降
+     * serialize_dns_record() は名前の大文字小文字を変えないので、正規形 (RFC 4034 §6.2) の小文字化はここで行う */
     if (serialize_dns_record(buf, sizeof(buf), &len, rec, NULL, rec->name, 0xFFFFFFFF) != 0) return false;
     size_t owner = 0;
     while (owner < len && buf[owner] != 0) owner += 1 + (size_t)buf[owner];
     owner++;
     if (owner + 10 > len) return false;
+    dns_canonical_downcase_rdata(2 /* one name */, buf, owner);
     size_t rdlen = ((size_t)buf[owner + 8] << 8) | buf[owner + 9];
     if (owner + 10 + rdlen != len) return false;
     /* RFC 4034 §6.2 item 3 の型の RDATA 内の名前を小文字に (K-01。共通関数は dns_wire.c) */

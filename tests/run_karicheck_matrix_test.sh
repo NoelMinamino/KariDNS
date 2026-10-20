@@ -285,6 +285,9 @@ conf_case ixfr_hist_bad conf 1 "Invalid ixfr-history value '33'" 'options { ixfr
 conf_case ixfr_hist_zbad conf 1 "invalid ixfr-history value '-1'" 'zone "h.example" { type master; file "h.zone"; ixfr-history -1; };'
 conf_case bad_b64       conf 1 "secret is not valid base64" 'key "k" { algorithm "hmac-sha256"; secret "NOT_BASE64="; };'
 conf_case bad_b64_ctl   conf 1 "control-channel: secret is not valid base64" 'control-channel { algorithm "hmac-sha256"; secret "NOT_BASE64="; };'
+conf_case ctl_in_options conf 1 "control-channel is written inside options" 'options { port 5300; control-channel { algorithm "hmac-sha256"; secret "dGVzdC1zZWNyZXQ="; }; };'
+conf_case ctl_top_level conf 0 "is valid" 'options { port 5300; };
+control-channel { algorithm "hmac-sha256"; secret "dGVzdC1zZWNyZXQ="; };'
 printf '$ORIGIN m.example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n' > "$TMP/m.zone"
 printf 'zone "m.example" { type master; file "%s/m.zone"; };\nzone "p.example" { type program; program "/bin/true"; };\noptions { allow-program-zones yes; };\n' "$TMP" > "$TMP/zm.conf"
 out=$("$KC" zone m.example. "$TMP/zm.conf" 2>&1); rc=$?

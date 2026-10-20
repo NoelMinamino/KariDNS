@@ -1434,7 +1434,7 @@ static void test_d08_readme_types(void) {
 
 /* ---------------------------------------------------------------- phase 15b: X-16, X-25, X-32, X-37, X-38 */
 static void test_x37_rdata_name_case(void) {
-    printf("[TEST] X-37: RDATA names of types outside RFC 4034 6.2 keep their case...\n");
+    printf("[TEST] X-37 / D17-4: RDATA names keep their case (RFC 4343); the canonical form is separate...\n");
     static const uint8_t ipsec[] = { 10, 3, 2, 2, 'G', 'w', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0, 0x01, 0x03, 0x51 };
     expect_rdata("IN IPSECKEY 10 3 2 Gw.Example. AQNR", ipsec, sizeof(ipsec));
     static const uint8_t talink[] = { 1, 'P', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0, 1, 'n', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
@@ -1447,9 +1447,18 @@ static void test_x37_rdata_name_case(void) {
     expect_rdata("IN NSAP-PTR F.Example.", nsap_ptr, sizeof(nsap_ptr));
     static const uint8_t dsync[] = { 0, 59, 1, 0x14, 0xb4, 1, 'S', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
     expect_rdata("IN DSYNC CDS NOTIFY 5300 S.Example.", dsync, sizeof(dsync));
-    /* types in the RFC 4034 6.2 list are still written in lower case in the uncompressed text path */
-    static const uint8_t afsdb[] = { 0, 1, 1, 'a', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    /* D17-4: the types of the RFC 4034 6.2 list keep their case as well (RFC 4343 s2-s4); only the canonical form below
+     * (dns_canonical_downcase_rdata) lower-cases them */
+    static const uint8_t afsdb[] = { 0, 1, 1, 'A', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
     expect_rdata("IN AFSDB 1 A.Example.", afsdb, sizeof(afsdb));
+    static const uint8_t rp[] = { 1, 'M', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0, 1, 'T', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    expect_rdata("IN RP M.Example. T.Example.", rp, sizeof(rp));
+    static const uint8_t rt[] = { 0, 10, 1, 'R', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    expect_rdata("IN RT 10 R.Example.", rt, sizeof(rt));
+    static const uint8_t kx[] = { 0, 10, 1, 'K', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    expect_rdata("IN KX 10 K.Example.", kx, sizeof(kx));
+    static const uint8_t minfo[] = { 1, 'R', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0, 1, 'E', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    expect_rdata("IN MINFO R.Example. E.Example.", minfo, sizeof(minfo));
     /* the canonical form lower-cases only the listed types */
     uint8_t rd[] = { 0, 1, 1, 'A', 0 };
     dns_canonical_downcase_rdata(18, rd, sizeof(rd));

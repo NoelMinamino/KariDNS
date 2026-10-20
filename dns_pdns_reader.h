@@ -29,7 +29,8 @@
  *                                        must be 0..65535); MX with 2 / SRV with 4 fields and prio != 0: error
  *                                        (ambiguous); any other type with prio != 0: warning, ignored
  *   7. content                           must not be empty; line-safety rules below
- *   8. after parsing                     every record is written as ZONE_DATA writes it and read back with the decoder the
+ *   8. after parsing                     a PRESIGNED zone gets the NSEC3PARAM / NSEC3 / NSEC RRs PowerDNS does not store
+ *                                        (dns_presigned.h, design 3.6); every record is written as ZONE_DATA writes it and read back with the decoder the
  *                                        Backend uses (parse_resource_record); one it refuses (the zone parser itself refuses
  *                                        such generic RDATA since D15-2; this is defence in depth) fails the zone with its records.id, as
  *                                        does a record that cannot fit a ZONE_DATA message on its own
@@ -62,6 +63,7 @@
 #include "dns_wire.h"
 #include "dns_zone_parser.h"
 #include "dns_db_stream.h"
+#include "dns_presigned.h"
 
 /* ------------------------------------------------------------------ row structs (design 2.1) */
 typedef struct {                                /* one row of `domains` with its apex SOA */
@@ -121,7 +123,11 @@ typedef struct pdns_zone_s {
     char *text;                     /* the generated zone text, "$ORIGIN .\n" first */
     size_t text_len, text_cap;
     size_t *line_off;               /* [i] = offset of the line of enabled record row i */
-    int64_t *line_id;               /* [i] = records.id of that row */
+    int64_t *line_id;               /* [i] = records.id of that row (0 for a record added by presigned_rebuild()) */
+    size_t *ord_off;                /* [i] = 1 + offset of the row's ordername in ord_pool, 0 = NULL (kept for the presigned checks) */
+    char *ord_pool;
+    size_t ord_len, ord_cap;
+    char *text2;                    /* NSEC3 / NSEC lines synthesized by presigned_rebuild(); the arena points into them */
     size_t n_rows, rows_cap;        /* rows that became a line */
     uint64_t n_seen;                /* enabled rows incl. ENT rows (against max_records) */
     pdns_meta_t *meta;
@@ -143,7 +149,9 @@ typedef struct pdns_zone_s {
     size_t n_ents, ents_cap;
     char *settings;                 /* settings text (design 3.5), "" when the metadata give none */
     char profile[256];              /* X-KARIDNS-PROFILE, "" if none */
-    char *nsec3param;               /* NSEC3PARAM metadata (first row), NULL if none; used by B5 */
+    char *nsec3param;               /* NSEC3PARAM metadata (first row), NULL if none */
+    presigned_mode_t presigned_mode;   /* PS_NSEC3 / PS_NSEC: the chain was rebuilt; PS_NONE: served as stored */
+    size_t n_synth;                 /* records presigned_rebuild() added at the end of arena.records */
 
     /* ---- diagnostics */
     char **warnings;
@@ -202,8 +210,7 @@ typedef int (*pdns_emit_fn)(void *ud, const uint8_t *msg, size_t len);
  *   digest      SHA-256 over the ZONE_DATA bodies in stream order (the 12-byte DNS header and the RRs of each
  *               message, no framing, no ZONE_DATA headers); two loaders on the same rows send the same digest
  *   flags       bit0 presigned.  Extended AXFR attributes (tags, tinydns) are B8.
- * Fails (-1, *err filled) for a tinydns zone, for a presigned zone with NSEC3PARAM metadata (the NSEC3 chain is
- * rebuilt in B5), for an RR that does not fit a message, and above max_zone_bytes. */
+ * Fails (-1, *err filled) for a tinydns zone, for an RR that does not fit a message, and above max_zone_bytes. */
 int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_emit_fn emit, void *ud,
                          char *err, size_t errlen);
 

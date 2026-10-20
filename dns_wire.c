@@ -2058,7 +2058,9 @@ int sig0_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, sig0_k
 
 int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, compress_ctx_t *ctx, size_t max_len) {
     if (!ctx) {
-        long w = write_uncompressed_name(packet_buf, *offset, max_len, name);
+        /* D17-4: the case as written, like the compressed form (RFC 4343 s2-s4: a response keeps the case of the zone data;
+         * the lower-case canonical form is only for DNSSEC, dns_record_canonical_rdata()) */
+        long w = write_uncompressed_name_ext(packet_buf, *offset, max_len, name, false);
         if (w < 0) return -1;
         *offset += w;
         return 0;
@@ -2502,8 +2504,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     break;
                 }
                 if (rec->rdata_count == 0) return -1;
-                /* X-37: RFC 4034 §6.2 item 3 に無い NSAP-PTR の名前は大文字小文字を保つ (DNAME は一覧にある) */
-                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[0], rec_type == 39);
+                /* D17-4: the case as written for every RDATA name (RFC 4343 s2-s4).  RFC 4034 s6.2 item 3 (DNAME is in the
+                 * list, NSAP-PTR is not) only matters for the canonical form, dns_canonical_downcase_rdata() */
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[0], false);
                 if (w < 0) return -1;
                 offset += w;
                 break;
@@ -2564,7 +2567,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 res[offset++] = prio >> 8; res[offset++] = prio & 0xFF;
                 res[offset++] = weight >> 8; res[offset++] = weight & 0xFF;
                 res[offset++] = port >> 8; res[offset++] = port & 0xFF;
-                long w = write_uncompressed_name(res, offset, max_res_len, target);
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, target, false);   /* D17-4 */
                 if (w < 0) return -1;
                 offset += w;
                 break;
@@ -2960,7 +2963,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 res[offset++] = (sig_inc >> 8) & 0xFF; res[offset++] = sig_inc & 0xFF;
                 res[offset++] = key_tag >> 8; res[offset++] = key_tag & 0xFF;
 
-                long w = write_uncompressed_name_ext(res, offset, max_res_len, signer, true);
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, signer, false);   /* D17-4 */
                 if (w < 0) return -1;
                 offset += w;
 
@@ -3057,7 +3060,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 for (int k = 0; k < 3; k++) {
                     if (write_char_string(res, max_res_len, &offset, cstrs[k]) != 0) return -1;
                 }
-                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[5], true);
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[5], false);   /* D17-4 */
                 if (w < 0) return -1;
                 offset += (size_t)w;
                 break;
@@ -3542,10 +3545,10 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 17: { // RP
                 if (rec->rdata_count < 2) return -1;
-                long w1 = write_uncompressed_name(res, offset, max_res_len, rec->rdata[0]);
+                long w1 = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[0], false);   /* D17-4 */
                 if (w1 < 0) return -1;
                 offset += w1;
-                long w2 = write_uncompressed_name(res, offset, max_res_len, rec->rdata[1]);
+                long w2 = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[1], false);
                 if (w2 < 0) return -1;
                 offset += w2;
                 break;
@@ -3556,8 +3559,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 uint16_t pref;
                 if (!parse_u16(rec->rdata[0], &pref)) return -1;
                 res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
-                /* X-37: LP (RFC 6742) は RFC 4034 §6.2 item 3 の一覧に無い: 大文字小文字を保つ */
-                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[1], rec_type != 107);
+                /* D17-4: the case as written for all four (RFC 4343 s2-s4); AFSDB, RT and KX are lower-cased only in the
+                 * canonical form (RFC 4034 s6.2 item 3, dns_canonical_downcase_rdata()); LP (RFC 6742) never */
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[1], false);
                 if (w < 0) return -1;
                 offset += w;
                 break;
@@ -3568,10 +3572,10 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 uint16_t pref;
                 if (!parse_u16(rec->rdata[0], &pref)) return -1;
                 res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
-                long w1 = write_uncompressed_name(res, offset, max_res_len, rec->rdata[1]);
+                long w1 = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[1], false);   /* D17-4 */
                 if (w1 < 0) return -1;
                 offset += w1;
-                long w2 = write_uncompressed_name(res, offset, max_res_len, rec->rdata[2]);
+                long w2 = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[2], false);
                 if (w2 < 0) return -1;
                 offset += w2;
                 break;
@@ -3648,7 +3652,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             case 30: { // NXT (RFC 2535 §5.1): 非圧縮ドメイン名 + シンプルタイプビットマップ
                 // rdata[0] = Next Domain Name (非圧縮、RFC 2535 §5.1 — 圧縮禁止)
                 if (rec->rdata_count < 1) return -1;
-                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[0]);
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[0], false);   /* D17-4 */
                 if (w < 0) return -1;
                 offset += (size_t)w;
                 // Type Bit Map: ビット n がタイプ n に対応 (RFC 2535 §5.2)
@@ -3730,7 +3734,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 // プレフィックス名 (prefix_len > 0 のとき必須, 非圧縮)
                 if (prefix_len > 0) {
                     const char *pfx_name = (rec->rdata_count >= 3) ? rec->rdata[2] : ".";
-                    long w = write_uncompressed_name(res, offset, max_res_len, pfx_name);
+                    long w = write_uncompressed_name_ext(res, offset, max_res_len, pfx_name, false);   /* D17-4 */
                     if (w < 0) return -1;
                     offset += (size_t)w;
                 }
@@ -4990,14 +4994,3 @@ bool parse_query_question_fast(const uint8_t *buf, size_t len, char *qname, size
     return false;
 }
 
-int dns_rdata_keep_name_case(const dns_record_t *rec, uint8_t *rd, size_t rdlen) {
-    if (rec->type_code != 14 || rec->generic_data != NULL || rec->class_val == DNS_CLASS_KARIDNS_EXT) return 0;
-    if (rec->rdata_count < 2) return -1;
-    uint8_t tmp[2 * 255];
-    long w1 = write_uncompressed_name_ext(tmp, 0, sizeof(tmp), rec->rdata[0], false);
-    if (w1 < 0) return -1;
-    long w2 = write_uncompressed_name_ext(tmp, (size_t)w1, sizeof(tmp), rec->rdata[1], false);
-    if (w2 < 0 || (size_t)(w1 + w2) != rdlen) return -1;
-    memcpy(rd, tmp, rdlen);
-    return 0;
-}

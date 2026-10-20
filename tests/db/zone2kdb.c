@@ -132,7 +132,12 @@ static int cmd_ref(const char *out_path, const char *list_path, uint32_t default
             continue;
         }
         pdns_zone_t *z = pdns_zone_new(rows.zone, &opts);
-        int rc = z ? pdns_zone_convert(z, rows.rows, rows.n, NULL, 0) : -1;
+        /* the metadata zone2sql writes for a presigned zone (PRESIGNED, NSEC3PARAM), so the reader rebuilds the chain */
+        db_meta_row_t meta[2];
+        size_t nmeta = 0;
+        if (rows.presigned) meta[nmeta++] = (db_meta_row_t){ 1, "PRESIGNED", "1" };
+        if (rows.nsec3param) meta[nmeta++] = (db_meta_row_t){ 1, "NSEC3PARAM", rows.nsec3param };
+        int rc = z ? pdns_zone_convert(z, rows.rows, rows.n, meta, nmeta) : -1;
         buf_t zb = {0};
         char why[400] = "";
         if (rc == 0) {

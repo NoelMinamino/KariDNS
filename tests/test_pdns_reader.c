@@ -174,20 +174,30 @@ static void test_zone_files(void) {
         tested++;
         pdns_zone_t *z = pdns_zone_new(rows.zone, NULL);
         CHECK(z != NULL);
-        int rc = z ? pdns_zone_convert(z, rows.rows, rows.n, NULL, 0) : -1;
+        db_meta_row_t meta[2];
+        size_t nmeta = 0;
+        if (rows.presigned) meta[nmeta++] = M("PRESIGNED", "1");
+        if (rows.nsec3param) meta[nmeta++] = M("NSEC3PARAM", rows.nsec3param);
+        int rc = z ? pdns_zone_convert(z, rows.rows, rows.n, meta, nmeta) : -1;
         CHECK_MSG(rc == 0, "%s: reader: %s", names[k], z ? z->error : "(null)");
         if (rc == 0) {
             CHECK_MSG(z->arena.count == fa.count, "%s: %zu RRs from rows, %zu in the file", names[k], z->arena.count, fa.count);
-            size_t bad = 0;
-            for (size_t i = 0; i < fa.count && i < z->arena.count; i++) {
-                char *a = rt_canon(&fa.records[i]), *b = rt_canon(&z->arena.records[i]);
-                if (!a || !b || strcmp(a, b) != 0) {
-                    if (bad++ < 3) printf("    %s RR %zu differs:\n      file   %.200s\n      reader %.200s\n", names[k], i + 1, a, b);
-                }
-                free(a);
-                free(b);
-            }
+            /* The RRs must be the file's.  A presigned zone (NSEC3 / NSEC chain rebuilt, B5) has its synthesized RRs
+             * at the end, so the two sides are compared as sorted sets of canonical lines. */
+            size_t bad = 0, nw = 0, ng = 0;
+            char **want = rt_sorted_lines(&fa, &nw), **got = rt_sorted_lines(&z->arena, &ng);
+            CHECK(want && got && nw == ng);
+            for (size_t i = 0; want && got && i < nw && i < ng; i++)
+                if (strcmp(want[i], got[i]) != 0 && bad++ < 3)
+                    printf("    %s RR differs:\n      file   %.200s\n      reader %.200s\n", names[k], want[i], got[i]);
+            if (want) rt_free_lines(want, nw);
+            if (got) rt_free_lines(got, ng);
             CHECK_MSG(bad == 0, "%s: %zu RRs differ", names[k], bad);
+            if (rows.presigned) {
+                CHECK_MSG(z->presigned_mode == (rows.nsec3param ? PS_NSEC3 : PS_NSEC), "%s: presigned mode %d", names[k], (int)z->presigned_mode);
+                CHECK(z->n_synth > 0);
+                printf("  [info] %s: presigned layout, %zu NSEC3/NSEC RRs rebuilt\n", names[k], z->n_synth);
+            }
             CHECK(z->n_warnings == 0);
             rt_info_t info;
             char why[400];
@@ -1031,9 +1041,10 @@ static void test_kdb(void) {
         CHECK(b.len == 0);
         pdns_zone_free(z);
         db_meta_row_t m2[] = { M("PRESIGNED", "1"), M("NSEC3PARAM", "1 0 5 AABB") };
-        z = build(NULL, 0, m2, 2, NULL);
+        z = build(NULL, 0, m2, 2, NULL);                              /* B5: NSEC3PARAM without any RRSIG(NSEC3) cannot be rebuilt */
+        CHECK(z->failed);
+        CHECK_HAS(z->error, "no RRSIG(NSEC3) rows");
         CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL}, rt_emit, &b, err, sizeof(err)) != 0);
-        CHECK_HAS(err, "B5");
         pdns_zone_free(z);
         db_meta_row_t m3[] = { M("PRESIGNED", "1") };               /* presigned without NSEC3PARAM: encoded, flag set */
         z = build(NULL, 0, m3, 1, NULL);
@@ -1082,22 +1093,102 @@ static void test_kdb(void) {
 }
 
 /* ------------------------------------------------------------------ zone2sql */
-/* serialize_dns_record() without a compression context lowercases MINFO names; the KDB1 stream must keep the case as
- * written, as the zone image does for a file zone (found by the B4b file vs DB comparison of the lab zones) */
+/* D17-4 (found by the B4b file vs DB comparison of the lab zones, MINFO; RP / AFSDB / RT / KX and others answered in lower
+ * case too): the RDATA names keep the case as written (RFC 4343 s2-s4) in the KDB1 stream and in the file zone alike;
+ * only dns_record_canonical_rdata() (RFC 4034 s6.2 item 3) lower-cases them */
+static const struct { const char *type, *content, *file_text; int64_t prio; } k_case[] = {
+    { "MINFO", "RM.Z.TEST. EM.z.Test.", "RM.Z.TEST. EM.z.Test.", 0 },
+    { "RP", "Mbox.Z.TEST. Txt.z.Test.", "Mbox.Z.TEST. Txt.z.Test.", 0 },
+    { "AFSDB", "1 AFS.Z.test.", "1 AFS.Z.test.", 0 },
+    { "RT", "10 Rt.Z.TEST.", "10 Rt.Z.TEST.", 0 },
+    { "KX", "10 Kx.Z.TEST.", "10 Kx.Z.TEST.", 0 },
+    { "LP", "10 L.Z.TEST.", "10 L.Z.TEST.", 0 },
+    { "PX", "10 Map822.Z.test. MapX400.z.TEST.", "10 Map822.Z.test. MapX400.z.TEST.", 0 },
+    { "MX", "MAIL.Z.Test.", "10 MAIL.Z.Test.", 10 },
+    { "NS", "NS9.Z.Test.", "NS9.Z.Test.", 0 },
+    { "SRV", "1 2 5060 SIP.Z.Test.", "1 2 5060 SIP.Z.Test.", 0 },
+    { "NAPTR", "100 10 \"S\" \"SIP+D2U\" \"\" _SIP._udp.Z.Test.", "100 10 \"S\" \"SIP+D2U\" \"\" _SIP._udp.Z.Test.", 0 },
+    { "DNAME", "Target.Z.Test.", "Target.Z.Test.", 0 },
+};
+
+static size_t upper_count(const uint8_t *p, size_t n) {
+    size_t c = 0;
+    for (size_t k = 0; k < n; k++) c += (p[k] >= 'A' && p[k] <= 'Z');
+    return c;
+}
+
 static void test_kdb_name_case(void) {
-    printf("KDB1 encoding keeps the case of RDATA names\n");
-    db_record_row_t rows[] = { R(2, "minfo.z.test", "MINFO", "RM.Z.TEST. EM.z.Test.", 300, 0),
-                               R(3, "mx.z.test", "MX", "MAIL.Z.Test", 300, 10) };
-    pdns_zone_t *z = build(rows, 2, NULL, 0, NULL);
+    printf("RDATA names keep their case (D17-4): file zone, DB zone, KDB1 stream; canonical form lower case\n");
+    enum { N = sizeof(k_case) / sizeof(k_case[0]) };
+    static db_record_row_t rows[N];
+    char *text = malloc(8192);
+    size_t tl = (size_t)snprintf(text, 8192, "$ORIGIN .\n");
+    for (size_t i = 0; i < N; i++) {
+        char owner[40];
+        snprintf(owner, sizeof(owner), "t%zu.z.test", i);
+        rows[i] = R((int64_t)i + 2, strdup(owner), k_case[i].type, k_case[i].content, 300, k_case[i].prio);
+        tl += (size_t)snprintf(text + tl, 8192 - tl, "%s. 300 IN %s %s\n", owner, k_case[i].type, k_case[i].file_text);
+    }
+    pdns_zone_t *z = build(rows, N, NULL, 0, NULL);
     CHECK_MSG(!z->failed, "%s", z->error);
+    zone_arena_t fa;
+    zone_arena_init(&fa);
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.default_origin = ".";
+    parse_error_t perr = {0};
+    ctx.err_out = &perr;
+    int prc = parse_zone_fast(text, tl, &fa, &ctx);
+    CHECK_MSG(prc == (int)N, "rc %d: %s (offset %zu)", prc, perr.error_message ? perr.error_message : "-", perr.error_offset);
+    CHECK(fa.count == N);
     rt_buf_t b = {0};
     char err[200];
-    CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL}, rt_emit, &b, err, sizeof(err)) == 0);
+    if (!z->failed) CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL}, rt_emit, &b, err, sizeof(err)) == 0);
+    for (size_t i = 0; i < N && !z->failed && i < fa.count; i++) {
+        const dns_record_t *dbrec = NULL;
+        for (size_t k = 0; k < z->arena.count; k++)
+            if (z->arena.records[k].type_code == fa.records[i].type_code && strcmp(z->arena.records[k].name, fa.records[i].name) == 0)
+                dbrec = &z->arena.records[k];
+        CHECK_MSG(dbrec != NULL, "%s: not in the DB zone", k_case[i].type);
+        if (!dbrec) continue;
+        uint8_t wa[1024], wb[1024], wc[1024];
+        uint16_t oa = 0, ob = 0, oc = 12;
+        CHECK(serialize_dns_record(wa, sizeof(wa), &oa, &fa.records[i], NULL, NULL, 0xFFFFFFFFu) == 0);
+        CHECK(serialize_dns_record(wb, sizeof(wb), &ob, dbrec, NULL, NULL, 0xFFFFFFFFu) == 0);
+        CHECK_MSG(oa == ob && memcmp(wa, wb, oa) == 0, "%s: file zone and DB zone serialize differently", k_case[i].type);
+        compress_ctx_t cc;
+        compress_ctx_init(&cc);
+        CHECK(serialize_dns_record(wc, sizeof(wc), &oc, &fa.records[i], &cc, NULL, 0xFFFFFFFFu) == 0);
+        /* upper-case letters of the names survive, with and without a compression context (NAPTR also has the
+         * character-strings "S" and "SIP+D2U", which are never case-folded) */
+        CHECK_MSG(upper_count(wa, oa) > 0, "%s: RDATA names were lower-cased without a context", k_case[i].type);
+        CHECK_MSG(upper_count(wc + 12, (size_t)oc - 12) > 0, "%s: RDATA names were lower-cased with a context", k_case[i].type);
+        /* the canonical form is lower case where RFC 4034 s6.2 item 3 lists the type (not LP, RFC 6742) */
+        uint8_t cn[1024];
+        long cl = dns_record_canonical_rdata(&fa.records[i], cn, sizeof(cn));
+        CHECK(cl > 0);
+        size_t uc = upper_count(cn, cl > 0 ? (size_t)cl : 0);
+        if (fa.records[i].type_code == 35) CHECK(uc == 6);               /* NAPTR: only the letters of "S" and "SIP+D2U" */
+        else if (fa.records[i].type_code == 107) CHECK(uc > 0);           /* LP */
+        else CHECK_MSG(uc == 0, "%s: canonical RDATA has upper-case octets", k_case[i].type);
+    }
+    /* the stream carries the names as written */
     static const uint8_t minfo[] = { 2, 'R', 'M', 1, 'Z', 4, 'T', 'E', 'S', 'T', 0, 2, 'E', 'M', 1, 'z', 4, 'T', 'e', 's', 't', 0 };
+    static const uint8_t rp[] = { 4, 'M', 'b', 'o', 'x', 1, 'Z', 4, 'T', 'E', 'S', 'T', 0, 3, 'T', 'x', 't' };
+    static const uint8_t afsdb[] = { 0, 1, 3, 'A', 'F', 'S', 1, 'Z', 4, 't', 'e', 's', 't', 0 };
+    static const uint8_t rt[] = { 0, 10, 2, 'R', 't', 1, 'Z', 4, 'T', 'E', 'S', 'T', 0 };
+    static const uint8_t kx[] = { 0, 10, 2, 'K', 'x', 1, 'Z', 4, 'T', 'E', 'S', 'T', 0 };
     static const uint8_t mx[] = { 0, 10, 4, 'M', 'A', 'I', 'L', 1, 'Z', 4, 'T', 'e', 's', 't', 0 };
     CHECK(b.buf && memmem(b.buf, b.len, minfo, sizeof(minfo)) != NULL);
+    CHECK(b.buf && memmem(b.buf, b.len, rp, sizeof(rp)) != NULL);
+    CHECK(b.buf && memmem(b.buf, b.len, afsdb, sizeof(afsdb)) != NULL);
+    CHECK(b.buf && memmem(b.buf, b.len, rt, sizeof(rt)) != NULL);
+    CHECK(b.buf && memmem(b.buf, b.len, kx, sizeof(kx)) != NULL);
     CHECK(b.buf && memmem(b.buf, b.len, mx, sizeof(mx)) != NULL);
     free(b.buf);
+    zone_arena_destroy(&fa);
+    free(text);
+    for (size_t i = 0; i < N; i++) free((void *)rows[i].name);
     pdns_zone_free(z);
 }
 
@@ -1118,6 +1209,7 @@ static void test_zone2sql(void) {
     for (size_t i = 0; i < rows.n; i++) {
         const db_record_row_t *r = &rows.rows[i];
         CHECK(r->id == (int64_t)i + 1);
+        if (!r->type) continue;                                        /* ENT row of a presigned zone */
         CHECK(r->name[strlen(r->name) - 1] != '.');
         for (const char *p = r->name; *p; p++) CHECK(!(*p >= 'A' && *p <= 'Z'));
         if (strcmp(r->type, "MX") == 0 && !saw_mx) {
@@ -1147,8 +1239,8 @@ static void test_zone2sql(void) {
         fclose(fp);
         CHECK(strstr(buf, "INSERT INTO domains (name, type) VALUES ('example.com', 'NATIVE');") != NULL);
         CHECK((strstr(buf, "SET standard_conforming_strings") != NULL) == (d == 1));
-        CHECK((strstr(buf, ", 0, false, true);") != NULL) == (d == 1));
-        CHECK((strstr(buf, ", 0, 0, 1);") != NULL) == (d == 0));
+        CHECK((strstr(buf, ", 0, false, true, NULL);") != NULL) == (d == 1));
+        CHECK((strstr(buf, ", 0, 0, 1, NULL);") != NULL) == (d == 0));
         size_t ins = 0;
         for (const char *p = buf; (p = strstr(p, "INSERT INTO records")) != NULL; p++) ins++;
         CHECK(ins == rows.n);

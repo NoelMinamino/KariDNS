@@ -1041,6 +1041,11 @@ static void test_control_channel(void) {
     if (parse_ok("control-channel { future-option { a; }; };", &cfg)) { CHECK(cfg.control.enabled == true); free_server_config_fields(&cfg); }
 
     expect_reject("unsupported algorithm", "control-channel { algorithm hmac-sha3; };");
+    /* D17-3: control-channel is a top-level statement; inside options { } it used to be skipped silently */
+    snprintf(txt, sizeof(txt), "options { port 5353; control-channel { algorithm hmac-sha256; secret \"%s\"; }; };", SECRET_OK);
+    expect_reject("control-channel inside options", txt);
+    snprintf(txt, sizeof(txt), "options { port 5353; }; control-channel { algorithm hmac-sha256; secret \"%s\"; };", SECRET_OK);
+    if (parse_ok(txt, &cfg)) { CHECK(cfg.control.enabled == true); CHECK(cfg.port == 5353); free_server_config_fields(&cfg); }
     expect_reject("empty secret", "control-channel { secret \"\"; };");
     {
         char longsecret[512];
