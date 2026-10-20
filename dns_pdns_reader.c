@@ -1,0 +1,1244 @@
+/*
+ * dns_pdns_reader.c - PowerDNS 5.1 reader core (beta design 3.1-3.5).  See dns_pdns_reader.h for the rules.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <strings.h>
+#include <ctype.h>
+#include <errno.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <openssl/evp.h>
+
+#include "dns_pdns_reader.h"
+#include "dns_config_parser.h"   /* option ranges (NOTIFY_RETRIES_MAX, IXFR_HISTORY_MAX, KARIDNS_*_MIN/MAX) */
+#include "dns_cidr.h"
+#include "dns_utils.h"
+
+#define PDNS_DEFAULT_MAX_TEXT (4ull << 30)
+#define PDNS_MAX_LIST 1024
+#define PDNS_MAX_NAME_TEXT 1024
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* diagnostics                                                                                                    */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* Messages are logged and sent to the operator: text that came from the DB (a domainmetadata kind or value, an owner)
+ * must not carry control characters or line breaks into a log (log injection).  Done once, here, for every message. */
+static void sanitize_msg(char *s) {
+    for (; *s; s++)
+        if ((unsigned char)*s < 0x20 || (unsigned char)*s > 0x7E) *s = '?';
+}
+
+static void zfail(pdns_zone_t *z, bool has_row, int64_t id, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+static void zfail(pdns_zone_t *z, bool has_row, int64_t id, const char *fmt, ...) {
+    if (z->failed) return;
+    char why[PDNS_ERR_LEN / 2];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(why, sizeof(why), fmt, ap);
+    va_end(ap);
+    sanitize_msg(why);
+    z->failed = true;
+    z->error_has_row = has_row;
+    z->error_row_id = id;
+    if (has_row)
+        snprintf(z->error, sizeof(z->error), "zone '%s' records.id %lld: %s", z->name, (long long)id, why);
+    else
+        snprintf(z->error, sizeof(z->error), "zone '%s': %s", z->name, why);
+}
+
+static void zwarn(pdns_zone_t *z, bool has_row, int64_t id, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+static void zwarn(pdns_zone_t *z, bool has_row, int64_t id, const char *fmt, ...) {
+    if (z->n_warnings >= PDNS_MAX_WARNINGS) {
+        z->warnings_dropped++;
+        return;
+    }
+    char why[PDNS_ERR_LEN / 2], line[PDNS_ERR_LEN];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(why, sizeof(why), fmt, ap);
+    va_end(ap);
+    sanitize_msg(why);
+    if (has_row)
+        snprintf(line, sizeof(line), "zone '%s' records.id %lld: %s", z->name, (long long)id, why);
+    else
+        snprintf(line, sizeof(line), "zone '%s': %s", z->name, why);
+    char **nw = realloc(z->warnings, (z->n_warnings + 1) * sizeof(char *));
+    if (!nw) return;
+    z->warnings = nw;
+    char *dup = strdup(line);
+    if (!dup) return;
+    z->warnings[z->n_warnings++] = dup;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* line safety (RFC 1035 5.1 and the tokenizer of dns_zone_parser.c)                                              */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+const char *pdns_text_check(const char *s, size_t len, bool is_owner) {
+    /* pass 1: characters that can end or hide a line, whatever the quoting */
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == 0) return "contains a NUL byte";
+        if (c == '\n' || c == '\r') return "contains a line break";
+        if (c == '\t' || c == ' ') {
+            if (is_owner) return "contains whitespace";
+            continue;
+        }
+        if (c < 0x20 || c == 0x7F) return "contains a control character";
+    }
+    /* first non-blank character: '$' makes the line a directive */
+    size_t first = 0;
+    while (first < len && (s[first] == ' ' || s[first] == '\t')) first++;
+    if (first < len && s[first] == '$') return "starts with '$' (zone file directive)";
+
+    /* pass 2: follow the tokenizer.  '\' takes the next character literally, '"' toggles quoting, outside quotes
+     * ';' starts a comment and '(' ')' open / close a group. */
+    bool inq = false;
+    int depth = 0;
+    size_t tok_start = 0, tok_n = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (c == '\\') {
+            if (i + 1 >= len) return "ends with a lone backslash";
+            if (tok_n == 0) tok_start = i;
+            tok_n += 2;
+            i++;
+            continue;
+        }
+        if (c == '"') {
+            if (is_owner) return "contains a double quote";
+            inq = !inq;
+            if (tok_n == 0) tok_start = i;
+            tok_n++;
+            continue;
+        }
+        if (!inq) {
+            bool boundary = false;
+            if (c == ';') return "contains ';' outside quotes (comment)";
+            if (c == '(') {
+                if (is_owner) return "contains '('";
+                if (depth) return "contains nested parentheses";
+                depth = 1;
+                boundary = true;
+            } else if (c == ')') {
+                if (is_owner) return "contains ')'";
+                if (!depth) return "contains ')' without '('";
+                depth = 0;
+                boundary = true;
+            } else if (c == ' ' || c == '\t') {
+                boundary = true;
+            }
+            if (boundary) {
+                if (tok_n == 1 && s[tok_start] == '@') return "contains a bare '@' token";
+                tok_n = 0;
+                continue;
+            }
+        }
+        if (tok_n == 0) tok_start = i;
+        tok_n++;
+    }
+    if (inq) return "has an unbalanced double quote";
+    if (depth) return "has an unbalanced parenthesis";
+    if (tok_n == 1 && s[tok_start] == '@') return "contains a bare '@' token";
+    return NULL;
+}
+
+/* number of blank-separated fields (quotes and escapes as the tokenizer sees them); the text passed pdns_text_check() */
+static int count_fields(const char *s, size_t len) {
+    int n = 0;
+    bool inq = false, in_tok = false;
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (!inq && c != '\\' && c != '"' && (c == ' ' || c == '\t' || c == '(' || c == ')')) {
+            in_tok = false;
+            continue;
+        }
+        if (!in_tok) {
+            in_tok = true;
+            n++;
+        }
+        if (c == '\\')
+            i++;
+        else if (c == '"')
+            inq = !inq;
+    }
+    return n;
+}
+
+bool pdns_soa_serial(const char *content, uint32_t *serial) {
+    if (!content) return false;
+    const char *p = content;
+    for (int field = 0; field < 3; field++) {
+        while (*p == ' ' || *p == '\t') p++;
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (p == start) return false;
+        if (field < 2) continue;
+        uint64_t v = 0;
+        for (const char *d = start; d < p; d++) {
+            if (*d < '0' || *d > '9') return false;
+            v = v * 10 + (uint64_t)(*d - '0');
+            if (v > 0xFFFFFFFFull) return false;
+        }
+        if (serial) *serial = (uint32_t)v;
+        return true;
+    }
+    return false;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* names                                                                                                          */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* raw (as stored, usually without the trailing dot) -> canonical absolute name.  false: not a name. */
+static bool name_to_absolute(const char *raw, size_t len, char *out, size_t cap) {
+    if (len == 0 || len > PDNS_MAX_NAME_TEXT) return false;
+    char tmp[PDNS_MAX_NAME_TEXT + 2];
+    memcpy(tmp, raw, len);
+    tmp[len] = '\0';
+    if (dns_name_len_no_root(tmp, len) == len) {   /* no unescaped trailing dot */
+        tmp[len] = '.';
+        tmp[len + 1] = '\0';
+    }
+    if (strcmp(tmp, ".") == 0) return false;       /* the root is not a record owner here */
+    size_t n = dns_name_normalize(tmp, out, cap);
+    return n != (size_t)-1 && n > 0 && out[n - 1] == '.';
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* zone object                                                                                                    */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+pdns_zone_t *pdns_zone_new(const char *zone_name, const pdns_opts_t *opts) {
+    pdns_zone_t *z = calloc(1, sizeof(*z));
+    if (!z) return NULL;
+    if (opts) z->opts = *opts;
+    if (z->opts.default_ttl == 0) z->opts.default_ttl = PDNS_DEFAULT_TTL;
+    if (z->opts.default_ttl > PDNS_MAX_TTL) z->opts.default_ttl = PDNS_MAX_TTL;
+    if (z->opts.max_records == 0) z->opts.max_records = KDB_DEFAULT_MAX_ZONE_RECORDS;
+    if (z->opts.max_text_bytes == 0) z->opts.max_text_bytes = PDNS_DEFAULT_MAX_TEXT;
+    if (z->opts.max_zone_bytes == 0) z->opts.max_zone_bytes = KDB_DEFAULT_MAX_ZONE_BYTES;
+
+    const char *zn = zone_name ? zone_name : "";
+    const char *why = NULL;
+    size_t zl = strlen(zn);
+    if (zl == 0 || strcmp(zn, ".") == 0)
+        why = "the root zone is not supported";
+    else if ((why = pdns_text_check(zn, zl, true)) == NULL && !name_to_absolute(zn, zl, z->name, sizeof(z->name)))
+        why = "not a valid zone name (bad escape, empty label, or name too long)";
+    if (why) {
+        /* keep a printable name for the message: printable ASCII only, at most 200 characters */
+        size_t k = 0;
+        for (; k < zl && k < 200; k++)
+            z->name[k] = (zn[k] >= 0x20 && zn[k] < 0x7F) ? zn[k] : '?';
+        z->name[k] = '\0';
+        zfail(z, false, 0, "%s", why);
+        return z;
+    }
+    const char *hdr = "$ORIGIN .\n";
+    z->text_cap = 4096;
+    z->text = malloc(z->text_cap);
+    if (!z->text) {
+        free(z);
+        return NULL;
+    }
+    z->text_len = strlen(hdr);
+    memcpy(z->text, hdr, z->text_len);
+    return z;
+}
+
+void pdns_zone_free(pdns_zone_t *z) {
+    if (!z) return;
+    if (z->arena_ready) zone_arena_destroy(&z->arena);
+    free(z->text);
+    free(z->line_off);
+    free(z->line_id);
+    for (size_t i = 0; i < z->n_meta; i++) free(z->meta[i].content);
+    free(z->meta);
+    for (size_t i = 0; i < z->n_ents; i++) {
+        free(z->ents[i].name);
+        free(z->ents[i].ordername);
+    }
+    free(z->ents);
+    free(z->settings);
+    free(z->nsec3param);
+    for (size_t i = 0; i < z->n_warnings; i++) free(z->warnings[i]);
+    free(z->warnings);
+    free(z);
+}
+
+/* 0 = room made; 1 = over the size limit; -1 = out of memory */
+static int text_reserve(pdns_zone_t *z, size_t extra) {
+    if (extra > z->opts.max_text_bytes || z->text_len > z->opts.max_text_bytes - extra) return 1;
+    size_t need = z->text_len + extra + 1;
+    if (need <= z->text_cap) return 0;
+    size_t nc = z->text_cap;
+    while (nc < need) {
+        if (nc > SIZE_MAX / 2) return -1;
+        nc *= 2;
+    }
+    char *nt = realloc(z->text, nc);
+    if (!nt) return -1;
+    z->text = nt;
+    z->text_cap = nc;
+    return 0;
+}
+
+static bool rows_reserve(pdns_zone_t *z) {
+    if (z->n_rows < z->rows_cap) return true;
+    if (z->rows_cap > SIZE_MAX / 2 / sizeof(int64_t)) return false;
+    size_t nc = z->rows_cap ? z->rows_cap * 2 : 64;
+    size_t *lo = realloc(z->line_off, nc * sizeof(size_t));
+    if (!lo) return false;
+    z->line_off = lo;
+    int64_t *li = realloc(z->line_id, nc * sizeof(int64_t));
+    if (!li) return false;
+    z->line_id = li;
+    z->rows_cap = nc;
+    return true;
+}
+
+static bool type_token_ok(const char *t) {
+    size_t n = t ? strlen(t) : 0;
+    if (n == 0 || n > PDNS_MAX_TYPE_LEN) return false;
+    if (!isalpha((unsigned char)t[0])) return false;
+    for (size_t i = 0; i < n; i++)
+        if (!isalnum((unsigned char)t[i]) && t[i] != '-') return false;
+    return true;
+}
+
+int pdns_zone_add_record(pdns_zone_t *z, const db_record_row_t *row) {
+    if (z->failed) return -1;
+    if (z->finished) {
+        zfail(z, false, 0, "internal error: record added after pdns_zone_finish()");
+        return -1;
+    }
+    if (row->disabled) return 0;                                   /* rule 1 */
+    int64_t id = row->id;
+    if (++z->n_seen > z->opts.max_records) {
+        zfail(z, true, id, "more than %llu rows (max-zone-records)", (unsigned long long)z->opts.max_records);
+        return -1;
+    }
+
+    /* owner: needed by ENT rows and normal rows alike */
+    size_t nlen = row->name ? strlen(row->name) : 0;
+    char owner[DNS_NAME_TEXT_SIZE];
+    if (nlen == 0) {
+        zfail(z, true, id, "empty owner name");
+        return -1;
+    }
+    const char *why = pdns_text_check(row->name, nlen, true);
+    if (why) {
+        zfail(z, true, id, "owner name %s", why);
+        return -1;
+    }
+    if (!name_to_absolute(row->name, nlen, owner, sizeof(owner))) {
+        zfail(z, true, id, "owner name is not a valid domain name (bad escape, empty label, or too long)");
+        return -1;
+    }
+    if (!domain_name_is_at_or_below(owner, z->name)) {
+        zfail(z, true, id, "owner name '%.200s' is outside the zone", owner);
+        return -1;
+    }
+
+    if (!row->type) {                                              /* rule 2: empty non-terminal */
+        if (z->n_ents >= z->ents_cap) {
+            size_t nc = z->ents_cap ? z->ents_cap * 2 : 16;
+            pdns_ent_t *ne = z->ents_cap > SIZE_MAX / 2 / sizeof(*ne) ? NULL : realloc(z->ents, nc * sizeof(*ne));
+            if (!ne) {
+                zfail(z, true, id, "out of memory");
+                return -1;
+            }
+            z->ents = ne;
+            z->ents_cap = nc;
+        }
+        pdns_ent_t *e = &z->ents[z->n_ents];
+        e->row_id = id;
+        e->name = strdup(owner);
+        e->ordername = row->ordername ? strdup(row->ordername) : NULL;
+        if (!e->name || (row->ordername && !e->ordername)) {
+            free(e->name);
+            free(e->ordername);
+            zfail(z, true, id, "out of memory");
+            return -1;
+        }
+        z->n_ents++;
+        return 0;
+    }
+
+    /* rule 3: type token */
+    if (!type_token_ok(row->type)) {
+        zfail(z, true, id, "bad record type token (letters, digits and '-' only, starting with a letter)");
+        return -1;
+    }
+    char type[PDNS_MAX_TYPE_LEN + 1];
+    size_t tl = strlen(row->type);
+    for (size_t i = 0; i <= tl; i++) type[i] = (char)toupper((unsigned char)row->type[i]);
+    if (strcmp(type, "ALIAS") == 0) {                              /* B9a replaces this */
+        zfail(z, true, id, "ALIAS records are not supported yet (milestone B9a)");
+        return -1;
+    }
+    if (strcmp(type, "LUA") == 0) {                                /* B9a replaces this */
+        zfail(z, true, id, "LUA records are not supported yet (milestone B9a)");
+        return -1;
+    }
+
+    /* rule 5: ttl */
+    uint32_t ttl;
+    if (row->ttl_null) {
+        ttl = z->opts.default_ttl;
+        if (z->n_null_ttl++ == 0) z->first_null_ttl_id = id;
+    } else if (row->ttl < 0 || row->ttl > (int64_t)PDNS_MAX_TTL) {
+        zfail(z, true, id, "ttl %lld is outside 0..%u", (long long)row->ttl, PDNS_MAX_TTL);
+        return -1;
+    } else {
+        ttl = (uint32_t)row->ttl;
+    }
+
+    /* rule 7: content */
+    size_t clen = row->content ? strlen(row->content) : 0;
+    if (clen > PDNS_MAX_CONTENT) {
+        zfail(z, true, id, "content is longer than %u bytes", PDNS_MAX_CONTENT);
+        return -1;
+    }
+    size_t cstart = 0;
+    while (cstart < clen && (row->content[cstart] == ' ' || row->content[cstart] == '\t')) cstart++;
+    if (cstart == clen) {
+        zfail(z, true, id, "empty content");
+        return -1;
+    }
+    why = pdns_text_check(row->content, clen, false);
+    if (why) {
+        zfail(z, true, id, "content %s", why);
+        return -1;
+    }
+
+    /* rule 6: prio */
+    bool is_mx = strcmp(type, "MX") == 0, is_srv = strcmp(type, "SRV") == 0;
+    bool prepend = false;
+    unsigned prio_val = 0;
+    bool prio_nz = !row->prio_null && row->prio != 0;
+    if (is_mx || is_srv) {
+        int nf = count_fields(row->content, clen);
+        int have_prio_fields = is_mx ? 2 : 4;
+        if (nf == have_prio_fields - 1) {
+            if (!row->prio_null && (row->prio < 0 || row->prio > 65535)) {
+                zfail(z, true, id, "prio %lld is outside 0..65535", (long long)row->prio);
+                return -1;
+            }
+            prepend = true;
+            prio_val = row->prio_null ? 0 : (unsigned)row->prio;
+        } else if (nf == have_prio_fields && prio_nz) {
+            zfail(z, true, id, "%s content already has a %s and prio is %lld: ambiguous", type,
+                  is_mx ? "preference" : "priority", (long long)row->prio);
+            return -1;
+        }
+    } else if (prio_nz) {
+        if (z->n_prio_ignored++ == 0) z->first_prio_ignored_id = id;
+    }
+
+    /* SOA: exactly one, at the apex, with a serial */
+    if (strcmp(type, "SOA") == 0) {
+        if (!domain_names_match_ci(owner, z->name)) {
+            zfail(z, true, id, "SOA record at '%.200s', not at the zone apex", owner);
+            return -1;
+        }
+        if (z->n_soa++ > 0) {
+            zfail(z, true, id, "more than one enabled SOA record (first: records.id %lld)", (long long)z->soa_row_id);
+            return -1;
+        }
+        z->soa_row_id = id;
+        z->soa_row_index = z->n_rows;     /* the row about to be added */
+        if (!pdns_soa_serial(row->content, NULL)) {
+            zfail(z, true, id, "SOA serial is not a decimal number up to 4294967295");
+            return -1;
+        }
+    }
+
+    /* ZONE_BEGIN rr_count counts both SOAs (RFC 5936 2.2) and the Backend refuses a count above max-zone-records: the
+     * RRs of this zone plus the closing SOA must stay within it, or the loader would send a zone that kills the stream */
+    if ((uint64_t)z->n_rows + 2 > z->opts.max_records) {
+        zfail(z, true, id, "more than %llu records (max-zone-records; the SOA counts twice)", (unsigned long long)z->opts.max_records);
+        return -1;
+    }
+
+    /* the line */
+    size_t olen = strlen(owner);
+    int tr = text_reserve(z, olen + clen + tl + 64);
+    if (tr == 0 && !rows_reserve(z)) tr = -1;
+    if (tr != 0) {
+        zfail(z, true, id, "%s", tr > 0 ? "zone text exceeds the size limit (max-text-bytes)" : "out of memory");
+        return -1;
+    }
+    z->line_off[z->n_rows] = z->text_len;
+    z->line_id[z->n_rows] = id;
+    z->n_rows++;
+    char *w = z->text + z->text_len;
+    memcpy(w, owner, olen);
+    w += olen;
+    w += sprintf(w, " %u IN %s ", ttl, type);
+    if (prepend) w += sprintf(w, "%u ", prio_val);
+    memcpy(w, row->content, clen);
+    w += clen;
+    *w++ = '\n';
+    *w = '\0';
+    z->text_len = (size_t)(w - z->text);
+    return 0;
+}
+
+int pdns_zone_add_meta(pdns_zone_t *z, const db_meta_row_t *row) {
+    if (z->failed) return -1;
+    if (z->finished) {
+        zfail(z, false, 0, "internal error: metadata added after pdns_zone_finish()");
+        return -1;
+    }
+    if (!row->kind || !*row->kind) return 0;
+    size_t kl = strlen(row->kind);
+    size_t cl = row->content ? strlen(row->content) : 0;
+    if (kl > 64) {
+        zwarn(z, false, 0, "domainmetadata kind longer than 64 bytes ignored");
+        return 0;
+    }
+    if (cl > PDNS_MAX_META_CONTENT) {
+        zwarn(z, false, 0, "domainmetadata %.64s content longer than %u bytes ignored", row->kind, PDNS_MAX_META_CONTENT);
+        return 0;
+    }
+    if (z->n_meta >= PDNS_MAX_META_ROWS) {
+        zfail(z, false, 0, "more than %u domainmetadata rows", PDNS_MAX_META_ROWS);
+        return -1;
+    }
+    if (z->n_meta >= z->meta_cap) {
+        size_t nc = z->meta_cap ? z->meta_cap * 2 : 16;
+        pdns_meta_t *nm = realloc(z->meta, nc * sizeof(*nm));
+        if (!nm) {
+            zfail(z, false, 0, "out of memory");
+            return -1;
+        }
+        z->meta = nm;
+        z->meta_cap = nc;
+    }
+    pdns_meta_t *m = &z->meta[z->n_meta];
+    memcpy(m->kind, row->kind, kl + 1);
+    m->content = malloc(cl + 1);
+    if (!m->content) {
+        zfail(z, false, 0, "out of memory");
+        return -1;
+    }
+    if (cl) memcpy(m->content, row->content, cl);
+    m->content[cl] = '\0';
+    z->n_meta++;
+    return 0;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* metadata -> flags, profile, settings text (design 3.5)                                                         */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+typedef struct { char **v; size_t n, cap; } strlist_t;
+
+static void strlist_free(strlist_t *l) {
+    for (size_t i = 0; i < l->n; i++) free(l->v[i]);
+    free(l->v);
+    memset(l, 0, sizeof(*l));
+}
+
+/* adds s (copied) unless already present; false on out of memory */
+static bool strlist_add(strlist_t *l, const char *s, bool *dup) {
+    *dup = false;
+    for (size_t i = 0; i < l->n; i++)
+        if (strcmp(l->v[i], s) == 0) {
+            *dup = true;
+            return true;
+        }
+    if (l->n >= l->cap) {
+        size_t nc = l->cap ? l->cap * 2 : 8;
+        char **nv = realloc(l->v, nc * sizeof(char *));
+        if (!nv) return false;
+        l->v = nv;
+        l->cap = nc;
+    }
+    char *d = strdup(s);
+    if (!d) return false;
+    l->v[l->n++] = d;
+    return true;
+}
+
+typedef struct { char *buf; size_t len, cap; bool oom; } sbuf_t;
+
+static void sb_add(sbuf_t *b, const char *s) {
+    size_t n = strlen(s);
+    if (b->oom) return;
+    if (b->len + n + 1 > b->cap) {
+        size_t nc = b->cap ? b->cap : 128;
+        while (nc < b->len + n + 1) nc *= 2;
+        char *nb = realloc(b->buf, nc);
+        if (!nb) {
+            b->oom = true;
+            return;
+        }
+        b->buf = nb;
+        b->cap = nc;
+    }
+    memcpy(b->buf + b->len, s, n + 1);
+    b->len += n;
+}
+
+static void trim_blanks(char *s) {
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t')) s[--n] = '\0';
+    size_t lead = 0;
+    while (s[lead] == ' ' || s[lead] == '\t') lead++;
+    if (lead) memmove(s, s + lead, strlen(s + lead) + 1);
+}
+
+static bool charset_ok(const char *s, size_t maxlen, const char *extra) {
+    size_t n = strlen(s);
+    if (n == 0 || n > maxlen) return false;
+    for (size_t i = 0; i < n; i++)
+        if (!isalnum((unsigned char)s[i]) && !strchr(extra, s[i])) return false;
+    return true;
+}
+
+/* address or CIDR prefix for an ACL: only characters that cannot change the syntax of the statement are let through,
+ * then the real parser of the server decides */
+static bool acl_addr_ok(const char *s) {
+    if (!charset_ok(s, 64, ":./")) return false;
+    for (const char *p = s; *p; p++)
+        if (isalpha((unsigned char)*p) && !isxdigit((unsigned char)*p)) return false;
+    cidr_entry_t e;
+    return cidr_entry_parse(&e, s) && !e.is_any;
+}
+
+/* A TSIG key name.  In allow-update a key is kept in the ACL list as a bare name, and the config parser reads such an
+ * entry as the built-in ACL names (any / none / localhost / localnets, any case) or as an address before it tries a
+ * key: a key called "any" or "192.0.2.1" would be refused or, worse, turn into an address entry.  Such names are not
+ * accepted here, so a key reference can never mean something else. */
+static bool key_name_ok(const char *s) {
+    if (!charset_ok(s, 255, "._-")) return false;
+    size_t n = strlen(s);
+    if (s[n - 1] == '.') n--;
+    static const char *const builtin[] = { "any", "none", "localhost", "localnets" };
+    for (size_t i = 0; i < sizeof(builtin) / sizeof(builtin[0]); i++)
+        if (n == strlen(builtin[i]) && strncasecmp(s, builtin[i], n) == 0) return false;
+    cidr_entry_t e;
+    return !cidr_entry_parse(&e, s);
+}
+
+/* also-notify: ip, ip:port, [ip]:port or a bare IPv6 address -> "ip" / "ip port N" */
+static bool notify_entry(const char *s, char *out, size_t cap) {
+    char ip[64];
+    long port = 0;
+    size_t n = strlen(s);
+    if (n == 0 || n > 80) return false;
+    if (s[0] == '[') {
+        const char *rb = strchr(s, ']');
+        if (!rb || rb - s - 1 <= 0 || rb - s - 1 >= (long)sizeof(ip)) return false;
+        memcpy(ip, s + 1, (size_t)(rb - s - 1));
+        ip[rb - s - 1] = '\0';
+        if (rb[1] == ':') {
+            char *end;
+            port = strtol(rb + 2, &end, 10);
+            if (end == rb + 2 || *end || port < 1 || port > 65535) return false;
+        } else if (rb[1] != '\0') {
+            return false;
+        }
+        struct in6_addr a6;
+        if (inet_pton(AF_INET6, ip, &a6) != 1) return false;
+    } else {
+        size_t colons = 0;
+        for (const char *p = s; *p; p++) colons += (*p == ':');
+        if (colons == 1) {
+            const char *c = strchr(s, ':');
+            if ((size_t)(c - s) >= sizeof(ip)) return false;
+            memcpy(ip, s, (size_t)(c - s));
+            ip[c - s] = '\0';
+            char *end;
+            port = strtol(c + 1, &end, 10);
+            if (end == c + 1 || *end || port < 1 || port > 65535) return false;
+            struct in_addr a4;
+            if (inet_pton(AF_INET, ip, &a4) != 1) return false;
+        } else {
+            if (n >= sizeof(ip)) return false;
+            memcpy(ip, s, n + 1);
+            struct in_addr a4;
+            struct in6_addr a6;
+            if (inet_pton(AF_INET, ip, &a4) != 1 && inet_pton(AF_INET6, ip, &a6) != 1) return false;
+        }
+    }
+    if (port) snprintf(out, cap, "%s port %ld", ip, port);
+    else snprintf(out, cap, "%s", ip);
+    return true;
+}
+
+/* value of an X-KARIDNS-<option>; on success *out is the text to emit */
+typedef enum { OPT_INT, OPT_INT_SUFFIX, OPT_BACKOFF, OPT_AFA, OPT_BOOL } opt_kind_t;
+static const struct { const char *name; opt_kind_t kind; long long lo, hi; } k_options[] = {
+    { "notify-retries", OPT_INT, 0, NOTIFY_RETRIES_MAX },
+    { "notify-retry-interval", OPT_INT, 1, NOTIFY_RETRY_INTERVAL_MAX },
+    { "notify-retry-backoff", OPT_BACKOFF, 0, 0 },
+    { "ixfr-history", OPT_INT, 0, IXFR_HISTORY_MAX },
+    { "additional-from-auth", OPT_AFA, 0, 0 },
+    { "disable-auto-tc-flag", OPT_BOOL, 0, 0 },
+    { "zone-udp-bufsize", OPT_INT, KARIDNS_UDP_BUFSIZE_MIN, KARIDNS_UDP_BUFSIZE_MAX },
+    { "zone-tcp-mss", OPT_INT, KARIDNS_TCP_MSS_MIN, KARIDNS_TCP_MSS_MAX },
+    { "zone-tcp-window", OPT_INT_SUFFIX, KARIDNS_TCP_BUF_MIN, KARIDNS_TCP_BUF_MAX },
+    { "zone-tcp-sndbuf", OPT_INT_SUFFIX, KARIDNS_TCP_BUF_MIN, KARIDNS_TCP_BUF_MAX },
+};
+#define N_OPTIONS (sizeof(k_options) / sizeof(k_options[0]))
+
+/* same acceptance rules as parse_transport_param() / parse_additional_from_auth() / parse_config_bool() in
+ * dns_config_parser.c: the generated text must always be accepted by it */
+static bool option_value_ok(size_t oi, const char *v) {
+    switch (k_options[oi].kind) {
+    case OPT_INT:
+    case OPT_INT_SUFFIX: {
+        size_t n = strlen(v);
+        size_t dn = n;
+        long long mult = 1;
+        if (k_options[oi].kind == OPT_INT_SUFFIX && n > 1) {
+            char s = v[n - 1];
+            if (s == 'k' || s == 'K') { mult = 1024; dn = n - 1; }
+            else if (s == 'm' || s == 'M') { mult = 1024 * 1024; dn = n - 1; }
+        }
+        if (dn == 0 || dn > 10) return false;
+        long long x = 0;
+        for (size_t i = 0; i < dn; i++) {
+            if (v[i] < '0' || v[i] > '9') return false;
+            x = x * 10 + (v[i] - '0');
+        }
+        if (x > k_options[oi].hi / mult) return false;
+        x *= mult;
+        return x >= k_options[oi].lo && x <= k_options[oi].hi;
+    }
+    case OPT_BACKOFF:
+        return strcasecmp(v, "fixed") == 0 || strcasecmp(v, "exponential") == 0;
+    case OPT_AFA:
+        if (strcasecmp(v, "in-domain") == 0 || strcasecmp(v, "in-zone") == 0) return true;
+        /* fallthrough */
+    case OPT_BOOL:
+        return strcasecmp(v, "yes") == 0 || strcasecmp(v, "true") == 0 || strcmp(v, "1") == 0 ||
+               strcasecmp(v, "no") == 0 || strcasecmp(v, "false") == 0 || strcmp(v, "0") == 0;
+    }
+    return false;
+}
+
+static bool kind_answer_changing(const char *k) {
+    static const char *const exact[] = { "ENABLE-LUA-RECORDS", "LUA-AXFR-SCRIPT", "NSEC3NARROW", "PUBLISH-CDS",
+                                         "PUBLISH-CDNSKEY" };
+    /* SOA-EDIT changes the SOA in answers and transfers; SOA-EDIT-API and SOA-EDIT-DNSUPDATE only act when the API or an UPDATE edits the zone (pdnsutil adds SOA-EDIT-API to every new zone: no warning) */
+    if (strcasecmp(k, "SOA-EDIT") == 0) return true;
+    for (size_t i = 0; i < sizeof(exact) / sizeof(exact[0]); i++)
+        if (strcasecmp(k, exact[i]) == 0) return true;
+    return false;
+}
+
+static bool build_settings(pdns_zone_t *z) {
+    strlist_t axfr_from = {0}, axfr_keys = {0}, notify = {0}, upd_from = {0}, upd_keys = {0};
+    bool have_axfr = false, have_upd = false, have_notify = false, have_nsec3param = false, have_presigned = false,
+         have_format = false, have_profile = false, have_tsig = false;
+    char tsig_key[256] = "";
+    char opt_val[N_OPTIONS][34];
+    bool opt_set[N_OPTIONS];
+    memset(opt_val, 0, sizeof(opt_val));
+    memset(opt_set, 0, sizeof(opt_set));
+    char *warned[32];
+    size_t n_warned = 0;
+    bool ok = true;
+
+    for (size_t i = 0; i < z->n_meta && ok; i++) {
+        const char *kind = z->meta[i].kind;
+        char *content = z->meta[i].content;
+        trim_blanks(content);
+        bool dup;
+        if (strcasecmp(kind, "PRESIGNED") == 0) {
+            if (have_presigned) continue;
+            have_presigned = true;
+            if (strcmp(content, "1") == 0) z->flags |= PDNS_F_PRESIGNED;
+            else if (strcmp(content, "0") != 0 && *content)
+                zwarn(z, false, 0, "PRESIGNED metadata value '%.32s' is not 1: zone treated as not presigned", content);
+        } else if (strcasecmp(kind, "X-KARIDNS-FORMAT") == 0) {
+            if (have_format) continue;
+            have_format = true;
+            if (strcasecmp(content, "tinydns") == 0) z->flags |= PDNS_F_TINYDNS;
+            else if (strcasecmp(content, "bind") != 0 && strcasecmp(content, "zone") != 0)
+                zwarn(z, false, 0, "X-KARIDNS-FORMAT value '%.32s' unknown, ignored", content);
+        } else if (strcasecmp(kind, "NSEC3PARAM") == 0) {
+            if (have_nsec3param) continue;
+            have_nsec3param = true;
+            z->nsec3param = strdup(content);
+            if (!z->nsec3param) ok = false;
+        } else if (strcasecmp(kind, "X-KARIDNS-PROFILE") == 0) {
+            if (have_profile) continue;
+            have_profile = true;
+            if (charset_ok(content, 64, "._-")) snprintf(z->profile, sizeof(z->profile), "%s", content);
+            else zwarn(z, false, 0, "X-KARIDNS-PROFILE value is not a valid profile name, ignored");
+        } else if (strcasecmp(kind, "ALLOW-AXFR-FROM") == 0 || strcasecmp(kind, "ALLOW-DNSUPDATE-FROM") == 0) {
+            bool upd = strcasecmp(kind, "ALLOW-DNSUPDATE-FROM") == 0;
+            if (upd) have_upd = true;
+            else have_axfr = true;
+            strlist_t *l = upd ? &upd_from : &axfr_from;
+            if (!acl_addr_ok(content)) {
+                zwarn(z, false, 0, "%.40s entry '%.64s' is not an address or prefix (AUTO-NS and the like are not supported), ignored",
+                      kind, content);
+            } else if (l->n >= PDNS_MAX_LIST) {
+                zwarn(z, false, 0, "%.40s has more than %d entries, rest ignored", kind, PDNS_MAX_LIST);
+            } else if (!strlist_add(l, content, &dup)) {
+                ok = false;
+            }
+        } else if (strcasecmp(kind, "TSIG-ALLOW-AXFR") == 0 || strcasecmp(kind, "TSIG-ALLOW-DNSUPDATE") == 0) {
+            bool upd = strcasecmp(kind, "TSIG-ALLOW-DNSUPDATE") == 0;
+            if (upd) have_upd = true;
+            else have_axfr = true;
+            strlist_t *l = upd ? &upd_keys : &axfr_keys;
+            if (!key_name_ok(content)) {
+                zwarn(z, false, 0, "%.40s key name is not valid (letters, digits, '.', '_', '-'), ignored", kind);
+            } else if (l->n >= PDNS_MAX_LIST) {
+                zwarn(z, false, 0, "%.40s has more than %d entries, rest ignored", kind, PDNS_MAX_LIST);
+            } else if (!strlist_add(l, content, &dup)) {
+                ok = false;
+            }
+        } else if (strcasecmp(kind, "ALSO-NOTIFY") == 0) {
+            have_notify = true;
+            char ent[160];
+            if (!notify_entry(content, ent, sizeof(ent))) {
+                zwarn(z, false, 0, "ALSO-NOTIFY entry '%.64s' is not an address[:port], ignored", content);
+            } else if (notify.n >= PDNS_MAX_LIST) {
+                zwarn(z, false, 0, "ALSO-NOTIFY has more than %d entries, rest ignored", PDNS_MAX_LIST);
+            } else if (!strlist_add(&notify, ent, &dup)) {
+                ok = false;
+            }
+        } else if (strcasecmp(kind, "AXFR-MASTER-TSIG") == 0) {
+            if (have_tsig) {
+                zwarn(z, false, 0, "AXFR-MASTER-TSIG has more than one row, the first is used");
+                continue;
+            }
+            have_tsig = true;
+            if (key_name_ok(content)) snprintf(tsig_key, sizeof(tsig_key), "%s", content);
+            else zwarn(z, false, 0, "AXFR-MASTER-TSIG key name is not valid, ignored");
+        } else if (strncasecmp(kind, "X-KARIDNS-", 10) == 0) {
+            size_t oi;
+            for (oi = 0; oi < N_OPTIONS; oi++)
+                if (strcasecmp(kind + 10, k_options[oi].name) == 0) break;
+            if (oi == N_OPTIONS) {
+                zwarn(z, false, 0, "unknown zone option %.60s, ignored", kind);
+            } else if (opt_set[oi]) {
+                zwarn(z, false, 0, "%.60s given more than once, the first is used", kind);
+            } else if (strlen(content) > 32 || !option_value_ok(oi, content)) {
+                zwarn(z, false, 0, "%.60s has an invalid value '%.32s', ignored", kind, content);
+                opt_set[oi] = true;     /* a later row must not override the invalid first one */
+            } else {
+                opt_set[oi] = true;
+                snprintf(opt_val[oi], sizeof(opt_val[oi]), "%s", content);
+                opt_val[oi][33] = '\0';
+            }
+        } else if (kind_answer_changing(kind)) {
+            bool seen = false;
+            for (size_t w = 0; w < n_warned; w++)
+                if (strcasecmp(warned[w], kind) == 0) seen = true;
+            if (!seen) {
+                zwarn(z, false, 0, "PowerDNS metadata %.60s changes answers in PowerDNS and has no effect here", kind);
+                if (n_warned < sizeof(warned) / sizeof(warned[0])) warned[n_warned++] = z->meta[i].kind;
+            }
+        }
+        /* any other kind: ignored */
+    }
+
+    sbuf_t sb = {0};
+    if (ok) {
+        char tmp[512];
+        if (tsig_key[0]) {
+            snprintf(tmp, sizeof(tmp), "tsig-key \"%s\"; ", tsig_key);
+            sb_add(&sb, tmp);
+        }
+        if (have_axfr) {
+            if (axfr_from.n && axfr_keys.n)
+                zwarn(z, false, 0, "ALLOW-AXFR-FROM and TSIG-ALLOW-AXFR are both set: PowerDNS accepts either, "
+                                   "allow-transfer requires both an address and a key");
+            sb_add(&sb, "allow-transfer {");
+            if (!axfr_from.n && !axfr_keys.n) sb_add(&sb, " none;");
+            for (size_t i = 0; i < axfr_from.n; i++) { sb_add(&sb, " "); sb_add(&sb, axfr_from.v[i]); sb_add(&sb, ";"); }
+            for (size_t i = 0; i < axfr_keys.n; i++) { sb_add(&sb, " key \""); sb_add(&sb, axfr_keys.v[i]); sb_add(&sb, "\";"); }
+            sb_add(&sb, " }; ");
+        }
+        if (have_notify && notify.n) {
+            sb_add(&sb, "also-notify {");
+            for (size_t i = 0; i < notify.n; i++) { sb_add(&sb, " "); sb_add(&sb, notify.v[i]); sb_add(&sb, ";"); }
+            sb_add(&sb, " }; ");
+        }
+        if (have_upd) {
+            sb_add(&sb, "allow-update {");
+            if (upd_from.n && upd_keys.n) {
+                /* PowerDNS needs the address AND the key; allow-update accepts either.  Not expressible: closed. */
+                zwarn(z, false, 0, "ALLOW-DNSUPDATE-FROM and TSIG-ALLOW-DNSUPDATE are both set: PowerDNS requires both, "
+                                   "allow-update accepts either; dynamic update is disabled for this zone");
+                sb_add(&sb, " none;");
+            } else if (!upd_from.n && !upd_keys.n) {
+                sb_add(&sb, " none;");
+            } else {
+                for (size_t i = 0; i < upd_from.n; i++) { sb_add(&sb, " "); sb_add(&sb, upd_from.v[i]); sb_add(&sb, ";"); }
+                for (size_t i = 0; i < upd_keys.n; i++) { sb_add(&sb, " key \""); sb_add(&sb, upd_keys.v[i]); sb_add(&sb, "\";"); }
+            }
+            sb_add(&sb, " }; ");
+        }
+        for (size_t oi = 0; oi < N_OPTIONS; oi++) {
+            if (!opt_val[oi][0]) continue;
+            snprintf(tmp, sizeof(tmp), "%s %s; ", k_options[oi].name, opt_val[oi]);
+            sb_add(&sb, tmp);
+        }
+        if (sb.len > 0 && sb.buf[sb.len - 1] == ' ') sb.buf[--sb.len] = '\0';   /* no trailing blank */
+    }
+    strlist_free(&axfr_from);
+    strlist_free(&axfr_keys);
+    strlist_free(&notify);
+    strlist_free(&upd_from);
+    strlist_free(&upd_keys);
+    if (!ok || sb.oom) {
+        free(sb.buf);
+        zfail(z, false, 0, "out of memory");
+        return false;
+    }
+    if (sb.len > PDNS_MAX_SETTINGS) {
+        free(sb.buf);
+        zfail(z, false, 0, "settings text from the metadata is longer than %u bytes", PDNS_MAX_SETTINGS);
+        return false;
+    }
+    z->settings = sb.buf ? sb.buf : strdup("");
+    if (!z->settings) {
+        zfail(z, false, 0, "out of memory");
+        return false;
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* finish: parse, check, index                                                                                    */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+typedef struct { const pdns_zone_t *z; size_t first_idx; bool any; } unenc_ud_t;
+
+static void unenc_report(const dns_record_t *rec, void *ud) {
+    unenc_ud_t *u = ud;
+    size_t idx = (size_t)(rec - u->z->arena.records);
+    if (!u->any) u->first_idx = idx;
+    u->any = true;
+}
+
+/* The Backend reads the stream with parse_xfr_packet() (parse_resource_record()): a record it refuses rejects the
+ * whole zone message.  The zone file parser accepts some RDATA the wire decoder refuses (the RFC 3597 generic form
+ * "\# 0" of a PTR, "\# 3 010203" of an NS, ...).  Every record is therefore written the way ZONE_DATA writes it and read
+ * back by the decoder here, so such a row fails the zone with its records.id instead of the whole zone failing later at
+ * the Backend.  0 = all records accepted; 1 = *bad is the first refused one (*why says how); -1 = out of memory. */
+static int wire_check_all(const pdns_zone_t *z, size_t *bad, const char **why) {
+    uint8_t *buf = malloc(KDB_MAX_ZONE_DATA);
+    if (!buf) return -1;
+    zone_arena_t tmp;
+    zone_arena_init(&tmp);
+    int rc = 0;
+    for (size_t i = 0; i < z->arena.count && rc == 0; i++) {
+        uint16_t off = DNS_HEADER_SIZE;
+        memset(buf, 0, DNS_HEADER_SIZE);
+        if (serialize_dns_record(buf, KDB_MAX_ZONE_DATA, &off, &z->arena.records[i], NULL, NULL, 0xFFFFFFFFu) != 0) {
+            *bad = i;
+            *why = "RR does not fit a ZONE_DATA message";
+            rc = 1;
+            break;
+        }
+        dns_record_t back;
+        memset(&back, 0, sizeof(back));
+        size_t pos = DNS_HEADER_SIZE;
+        uint16_t type = 0;
+        if (parse_resource_record(buf, off, &pos, &tmp, &back, &type) != 0 || pos != off) {
+            *bad = i;
+            *why = "RDATA is not valid wire data for the record type (the Backend would refuse the zone)";
+            rc = 1;
+        }
+        if ((i & 511) == 511) zone_arena_free_builder(&tmp);     /* the decoded copies are not needed */
+    }
+    zone_arena_destroy(&tmp);
+    free(buf);
+    return rc;
+}
+
+/* index of the row whose line holds byte offset off; (size_t)-1 if off is in the header line */
+static size_t row_at_offset(const pdns_zone_t *z, size_t off) {
+    if (z->n_rows == 0 || off < z->line_off[0]) return (size_t)-1;
+    size_t lo = 0, hi = z->n_rows;     /* last i with line_off[i] <= off */
+    while (hi - lo > 1) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (z->line_off[mid] <= off) lo = mid;
+        else hi = mid;
+    }
+    return lo;
+}
+
+int pdns_zone_finish(pdns_zone_t *z) {
+    if (z->failed) return -1;
+    if (z->finished) {
+        zfail(z, false, 0, "internal error: pdns_zone_finish() called twice");
+        return -1;
+    }
+    z->finished = true;
+
+    if (!build_settings(z)) return -1;
+    if (z->n_null_ttl)
+        zwarn(z, true, z->first_null_ttl_id, "%llu record(s) have a NULL ttl; default-ttl %u used (first shown)",
+              (unsigned long long)z->n_null_ttl, z->opts.default_ttl);
+    if (z->n_prio_ignored)
+        zwarn(z, true, z->first_prio_ignored_id, "%llu record(s) of a type other than MX/SRV have prio != 0; ignored (first shown)",
+              (unsigned long long)z->n_prio_ignored);
+    if (z->n_soa == 0) {
+        zfail(z, false, 0, "no enabled SOA record at the apex");
+        return -1;
+    }
+
+    zone_arena_init(&z->arena);
+    z->arena_ready = true;
+    z->text[z->text_len] = '\0';
+    parse_error_t err = {0};
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.default_origin = ".";
+    ctx.err_out = &err;
+    int rc = parse_zone_fast(z->text, z->text_len, &z->arena, &ctx);
+    if (rc < 0) {
+        size_t r = (size_t)-1;
+        if (err.error_message && err.error_offset > 0) r = row_at_offset(z, err.error_offset);
+        if (r == (size_t)-1 && z->arena.count > 0) r = z->arena.count - 1;    /* the record being filled in */
+        if (r != (size_t)-1 && r >= z->n_rows) r = z->n_rows ? z->n_rows - 1 : (size_t)-1;
+        const char *msg = err.error_message ? err.error_message : "record rejected by the zone file parser";
+        if (r != (size_t)-1) zfail(z, true, z->line_id[r], "%s", msg);
+        else zfail(z, false, 0, "%s", msg);
+        return -1;
+    }
+    if (z->arena.count != z->n_rows) {
+        zfail(z, false, 0, "internal error: %zu rows gave %zu records", z->n_rows, z->arena.count);
+        return -1;
+    }
+    /* a record the wire format cannot carry (X-32) fails the row, like any other parser rejection (design D7) */
+    unenc_ud_t ud = { z, 0, false };
+    zone_arena_drop_unencodable(&z->arena, unenc_report, &ud);
+    if (ud.any) {
+        zfail(z, true, z->line_id[ud.first_idx < z->n_rows ? ud.first_idx : 0],
+              "RDATA does not fit the record type (cannot be encoded in wire format)");
+        return -1;
+    }
+    {
+        size_t bad = 0;
+        const char *why = "";
+        int wr = wire_check_all(z, &bad, &why);
+        if (wr < 0) {
+            zfail(z, false, 0, "out of memory");
+            return -1;
+        }
+        if (wr > 0) {
+            zfail(z, true, z->line_id[bad < z->n_rows ? bad : 0], "%s", why);
+            return -1;
+        }
+    }
+    /* every record must be the row it was written from: owner inside the zone, SOA where the SOA row is */
+    for (size_t i = 0; i < z->arena.count; i++) {
+        const dns_record_t *r = &z->arena.records[i];
+        if (!r->name || !domain_name_is_at_or_below(r->name, z->name)) {
+            zfail(z, true, z->line_id[i], "internal error: parsed owner '%.200s' is outside the zone", r->name ? r->name : "");
+            return -1;
+        }
+        if (r->type_code == 6) {
+            if (!domain_names_match_ci(r->name, z->name) || i != z->soa_row_index) {
+                zfail(z, true, z->line_id[i], "SOA record is not the apex SOA row");
+                return -1;
+            }
+            z->soa_index = i;
+        } else if (i == z->soa_row_index) {
+            zfail(z, true, z->line_id[i], "the SOA row did not produce an SOA record");
+            return -1;
+        }
+    }
+    {
+        const dns_record_t *soa = &z->arena.records[z->soa_index];
+        if (soa->type_code != 6 || soa->rdata_count < 3) {
+            zfail(z, true, z->soa_row_id, "SOA record has too few fields");
+            return -1;
+        }
+        char sb[64];
+        snprintf(sb, sizeof(sb), "0 0 %.40s", soa->rdata[2] ? soa->rdata[2] : "");
+        if (!pdns_soa_serial(sb, &z->serial)) {
+            zfail(z, true, z->soa_row_id, "SOA serial is not a decimal number up to 4294967295");
+            return -1;
+        }
+    }
+    if (build_zone_index(&z->arena, false) != 0) {
+        zfail(z, false, 0, "out of memory building the zone index");
+        return -1;
+    }
+    parse_error_t verr = {0};
+    if (validate_zone_dname(&z->arena, &verr) < 0 || validate_zone_name_lengths(&z->arena, &verr) < 0) {
+        zfail(z, false, 0, "%s", verr.error_message ? verr.error_message : "zone check failed");
+        return -1;
+    }
+    return 0;
+}
+
+int pdns_zone_convert(pdns_zone_t *z, const db_record_row_t *rows, size_t n_rows,
+                      const db_meta_row_t *meta, size_t n_meta) {
+    for (size_t i = 0; i < n_rows; i++)
+        if (pdns_zone_add_record(z, &rows[i]) != 0) return -1;
+    for (size_t i = 0; i < n_meta; i++)
+        if (pdns_zone_add_meta(z, &meta[i]) != 0) return -1;
+    return pdns_zone_finish(z);
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* KDB1 encoding                                                                                                  */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+typedef int (*body_sink_t)(void *ud, const uint8_t *body, size_t len);
+
+/* The ZONE_DATA bodies of the zone, in stream order, each handed to sink.  *rr_total = RRs written. */
+static int gen_bodies(const pdns_zone_t *z, body_sink_t sink, void *ud, char *err, size_t errlen) {
+    uint8_t *buf = malloc(KDB_MAX_ZONE_DATA);
+    if (!buf) {
+        snprintf(err, errlen, "zone '%s': out of memory", z->name);
+        return -1;
+    }
+    const size_t total = z->arena.count + 1;      /* SOA first and last (RFC 5936 2.2) */
+    size_t next = 0;
+    uint16_t off = DNS_HEADER_SIZE, an = 0;
+    int rc = -1;
+    memset(buf, 0, DNS_HEADER_SIZE);
+    buf[2] = 0x84;                                /* QR=1 AA=1, opcode QUERY, RCODE 0 */
+
+    for (size_t step = 0; step < total; step++) {
+        size_t idx;
+        if (step == 0 || step == total - 1) idx = z->soa_index;
+        else {
+            if (next == z->soa_index) next++;
+            idx = next++;
+        }
+        for (int attempt = 0;; attempt++) {
+            uint16_t o2 = off;
+            if (serialize_dns_record(buf, KDB_MAX_ZONE_DATA, &o2, &z->arena.records[idx], NULL, NULL, 0xFFFFFFFFu) == 0) {
+                off = o2;
+                an++;
+                break;
+            }
+            if (an == 0 || attempt > 0) {
+                snprintf(err, errlen, "zone '%s' records.id %lld: RR does not fit a ZONE_DATA message", z->name,
+                         (long long)z->line_id[idx]);
+                goto out;
+            }
+            buf[6] = (uint8_t)(an >> 8);
+            buf[7] = (uint8_t)an;
+            if (sink(ud, buf, off) != 0) goto out_sink;
+            off = DNS_HEADER_SIZE;
+            an = 0;
+        }
+    }
+    buf[6] = (uint8_t)(an >> 8);
+    buf[7] = (uint8_t)an;
+    if (an && sink(ud, buf, off) != 0) goto out_sink;
+    rc = 0;
+    goto out;
+out_sink:
+    snprintf(err, errlen, "zone '%s': output stopped or size limit exceeded", z->name);
+out:
+    free(buf);
+    return rc;
+}
+
+typedef struct { EVP_MD_CTX *md; uint64_t bytes, limit; } digest_ud_t;
+
+static int digest_sink(void *ud, const uint8_t *body, size_t len) {
+    digest_ud_t *d = ud;
+    d->bytes += len;
+    if (d->bytes > d->limit) return -1;
+    return EVP_DigestUpdate(d->md, body, len) == 1 ? 0 : -1;
+}
+
+typedef struct { kdb_enc_t *enc; pdns_emit_fn emit; void *emit_ud; } emit_ud_t;
+
+static int emit_msg(emit_ud_t *e) {
+    if (e->enc->err) return -1;
+    int rc = e->emit(e->emit_ud, e->enc->buf, e->enc->len);
+    kdb_enc_reset(e->enc);
+    return rc;
+}
+
+static int data_sink(void *ud, const uint8_t *body, size_t len) {
+    emit_ud_t *e = ud;
+    if (kdb_enc_raw_msg(e->enc, KDB_T_ZONE_DATA, body, len) != 0) return -1;
+    return emit_msg(e);
+}
+
+int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_emit_fn emit, void *ud,
+                         char *err, size_t errlen) {
+    char dummy[8];
+    if (!err || errlen == 0) { err = dummy; errlen = sizeof(dummy); }
+    if (z->failed || !z->finished || !z->arena_ready) {
+        snprintf(err, errlen, "zone '%s': not converted", z->name);
+        return -1;
+    }
+    if (z->flags & PDNS_F_TINYDNS) {
+        snprintf(err, errlen, "zone '%s': tinydns zones are encoded in milestone B8", z->name);
+        return -1;
+    }
+    if ((z->flags & PDNS_F_PRESIGNED) && z->nsec3param) {
+        snprintf(err, errlen, "zone '%s': presigned NSEC3 zones are rebuilt in milestone B5", z->name);
+        return -1;
+    }
+    uint64_t rr_count = (uint64_t)z->arena.count + 1;
+    if (rr_count > z->opts.max_records) {
+        snprintf(err, errlen, "zone '%s': %llu records exceed max-zone-records", z->name, (unsigned long long)rr_count);
+        return -1;
+    }
+
+    /* pass 1: digest over the bodies */
+    uint8_t digest[KDB_DIGEST_LEN];
+    unsigned dlen = 0;
+    digest_ud_t dd = { EVP_MD_CTX_new(), 0, z->opts.max_zone_bytes };
+    if (!dd.md || EVP_DigestInit_ex(dd.md, EVP_sha256(), NULL) != 1) {
+        EVP_MD_CTX_free(dd.md);
+        snprintf(err, errlen, "zone '%s': out of memory", z->name);
+        return -1;
+    }
+    int rc = gen_bodies(z, digest_sink, &dd, err, errlen);
+    if (rc == 0 && (EVP_DigestFinal_ex(dd.md, digest, &dlen) != 1 || dlen != KDB_DIGEST_LEN)) {
+        snprintf(err, errlen, "zone '%s': digest failed", z->name);
+        rc = -1;
+    }
+    EVP_MD_CTX_free(dd.md);
+    if (rc != 0) return -1;
+
+    /* pass 2: the messages */
+    kdb_enc_t enc;
+    kdb_enc_init(&enc);
+    emit_ud_t eu = { &enc, emit, ud };
+    const char *profile = p->profile ? p->profile : z->profile;
+    rc = -1;
+    if (kdb_enc_begin(&enc, KDB_T_ZONE_BEGIN) != 0 ||
+        kdb_enc_u16(&enc, 1, p->view) != 0 || kdb_enc_name(&enc, 2, z->name) != 0 ||
+        kdb_enc_i64(&enc, 3, p->source_id) != 0 || kdb_enc_u8(&enc, 4, p->zone_kind) != 0 ||
+        kdb_enc_u32(&enc, 5, z->serial) != 0 ||
+        kdb_enc_u32(&enc, 6, (z->flags & PDNS_F_PRESIGNED) ? KDB_ZF_PRESIGNED : 0) != 0 ||
+        kdb_enc_u64(&enc, 7, rr_count) != 0 || kdb_enc_bytes(&enc, 8, digest, KDB_DIGEST_LEN) != 0 ||
+        (z->settings && *z->settings && kdb_enc_str(&enc, 9, z->settings) != 0) ||
+        (profile && *profile && kdb_enc_str(&enc, 10, profile) != 0) || kdb_enc_end(&enc) != 0 ||
+        emit_msg(&eu) != 0) {
+        snprintf(err, errlen, "zone '%s': ZONE_BEGIN could not be encoded or sent", z->name);
+        goto out;
+    }
+    if (gen_bodies(z, data_sink, &eu, err, errlen) != 0) goto out;
+    if (kdb_enc_begin(&enc, KDB_T_ZONE_END) != 0 || kdb_enc_u64(&enc, 1, rr_count) != 0 || kdb_enc_end(&enc) != 0 ||
+        emit_msg(&eu) != 0) {
+        snprintf(err, errlen, "zone '%s': ZONE_END could not be encoded or sent", z->name);
+        goto out;
+    }
+    rc = 0;
+out:
+    kdb_enc_free(&enc);
+    return rc;
+}
