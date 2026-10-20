@@ -775,6 +775,22 @@ static void test_rfc3597_generic_form(void) {
         { "IN L32 \\# 6 000ac0000201", "000ac0000201" },
         { "IN NID \\# 10 000a00144fffff20ee64", "000a00144fffff20ee64" },
         { "IN L64 \\# 10 000a20010db811401000", "000a20010db811401000" },
+        /* D15-2: a known type may use the generic form when the RDATA is valid for it (RFC 3597 5) */
+        { "IN PTR \\# 5 036e733100", "036e733100" },
+        { "IN NS \\# 5 036E733100", "036e733100" },
+        { "IN CNAME \\# 5 036e733100", "036e733100" },
+        { "IN DNAME \\# 1 00", "00" },
+        { "IN MX \\# 7 000a036e733100", "000a036e733100" },
+        { "IN MX \\# 3 000a00", "000a00" },                                     /* null MX "10 ." */
+        { "IN SRV \\# 11 0001000213c4036e733100", "0001000213c4036e733100" },
+        { "IN SOA \\# 31 036e733100 04686f737400 00000001 00000e10 00000258 00015180 0000003c",
+          "036e73310004686f73740000000001" "00000e10" "00000258" "00015180" "0000003c" },
+        { "IN TXT \\# 4 03616263", "03616263" },
+        { "IN HINFO \\# 4 0161 0162", "01610162" },
+        { "IN NULL \\# 0", "" },
+        { "IN TYPE65534 \\# 0", "" },
+        { "IN X25 \\# 0", "" },
+        { "IN RP \\# 2 0000", "0000" },
     };
     for (size_t i = 0; i < N(ok); i++) {
         zt_t z;
@@ -810,6 +826,23 @@ static void test_rfc3597_generic_form(void) {
         { "IN L32 \\# 4 c0000201",          "wrong length for this fixed-size" },
         { "IN NID \\# 8 00144fffff20ee64",  "wrong length for this fixed-size" },
         { "IN L64 \\# 8 20010db811401000",  "wrong length for this fixed-size" },
+        /* D15-2: RDATA that is not valid for a known type is refused (RFC 3597 5), not served as raw octets */
+        { "IN PTR \\# 0",                    "not terminated" },
+        { "IN CNAME \\# 0",                  "not terminated" },
+        { "IN DNAME \\# 0",                  "not terminated" },
+        { "IN NS \\# 3 010203",              "runs past the end" },
+        { "IN NS \\# 2 C00C",                "compressed" },                           /* a pointer has no message to point into */
+        { "IN NS \\# 6 036E733100FF",        "trailing octets" },
+        { "IN MX \\# 1 00",                  "shorter than the fixed part" },
+        { "IN MX \\# 2 000A",                "not terminated" },
+        { "IN SRV \\# 6 000100020003",       "not terminated" },
+        { "IN SOA \\# 5 036E733100",         "not terminated" },
+        { "IN SOA \\# 11 036E73310004686F737400", "not valid for this record type" },   /* names, no timers */
+        { "IN RP \\# 1 00",                  "not terminated" },
+        { "IN TXT \\# 2 0361",               "not valid for this record type" },       /* string longer than the RDATA */
+        { "IN NAPTR \\# 9 00010001000000C000", "compressed" },                         /* replacement is a pointer */
+        { "IN RRSIG \\# 3 000000",           "shorter than the fixed part" },
+        { "IN NSEC \\# 0",                   "not terminated" },
     };
     for (size_t i = 0; i < N(bad); i++) {
         zt_t z;
@@ -817,6 +850,11 @@ static void test_rfc3597_generic_form(void) {
         if (z.rc >= 0) { fprintf(stderr, "must be rejected: %s\n", bad[i].line); assert(0); }
         if (!z.err.error_message || !strstr(z.err.error_message, bad[i].msg)) {
             fprintf(stderr, "%s: wrong message '%s' (want '%s')\n", bad[i].line, z.err.error_message ? z.err.error_message : "-", bad[i].msg);
+            assert(0);
+        }
+        /* the error is reported at the record's own line (after the SOA line), not at the top of the file */
+        if (z.err.error_offset < strlen(SOA_HEAD)) {
+            fprintf(stderr, "%s: error offset %zu is not in the record\n", bad[i].line, z.err.error_offset);
             assert(0);
         }
         zt_free(&z);

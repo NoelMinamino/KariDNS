@@ -782,7 +782,9 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
             if (!blob) return -1;
             memcpy(blob, &packet[*offset], rdlen);
         }
-        rec->generic_data = blob;
+        /* RFC 3597 §5: zero-length RDATA is legal.  It is an empty blob, not "no blob": generic_data == NULL means
+         * "written from the text fields", and an RR with neither could not be written (it was dropped as unencodable) */
+        rec->generic_data = blob ? blob : (uint8_t *)"";
         rec->generic_len = rdlen;
         rec->rdata_count = 0;
         // R-33: DNSSEC の型はテキストのフィールドも持たせる (RDATA は blob のまま応答に使う)
@@ -814,6 +816,68 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
     rec->rdata = keep;
     if (rc != 0) rec->rdata_count = 0;
     return rc;
+}
+
+/* D15-2.  RFC 3597 §5: "\# <length> <hex>" is only another way to write the RDATA, and a known type written that way is processed as the known type afterwards (RFC 3597 5; the RFC does not say
+ * "invalid RDATA is an error" outright, but type-specific processing needs valid RDATA), so the RDATA of a type the server
+ * knows must be valid for that type.  The test is the decoder a secondary applies to the same bytes
+ * (parse_resource_record), plus two things that decoder is lenient about:
+ *   - a compressed name: RFC 3597 §4 (and RFC 1035 §4.1.4: a pointer needs the message it points into);
+ *   - bytes the text form cannot hold (trailing octets after the names, a pointer that expands to a name of another
+ *     length): the decoded record, written back without compression, must be the same octets (names compared
+ *     case-insensitively, RFC 4034 §6.2). */
+const char *dns_generic_rdata_check(uint16_t type, const uint8_t *rd, size_t len) {
+    if (len > 65535) return "RDATA is longer than 65535 octets";
+    const dns_rdata_name_layout_t *lay = dns_rdata_name_layout(type);
+    if (lay) {
+        size_t p = lay->skip;
+        if (p > len) return "RDATA is shorter than the fixed part of this type";
+        for (unsigned n = 0; n < lay->nnames; n++) {
+            for (;;) {
+                if (p >= len) return "domain name in RDATA is not terminated";
+                uint8_t l = rd[p++];
+                if (l == 0) break;
+                if (l > 63) return "domain name in RDATA is compressed or has an extended label (RFC 3597 4)";
+                if (len - p < l) return "domain name in RDATA runs past the end of the RDATA";
+                p += l;
+            }
+        }
+    }
+    uint8_t *pkt = malloc(11 + len);
+    uint8_t *back = malloc(65535);
+    uint8_t *want = malloc(len ? len : 1);
+    const char *why = NULL;
+    zone_arena_t a;
+    zone_arena_init(&a);
+    if (!pkt || !back || !want) {
+        why = "out of memory";
+        goto done;
+    }
+    pkt[0] = 0;                                   /* owner: the root */
+    pkt[1] = (uint8_t)(type >> 8); pkt[2] = (uint8_t)type;
+    pkt[3] = 0; pkt[4] = 1;                       /* CLASS IN */
+    pkt[5] = pkt[6] = pkt[7] = pkt[8] = 0;        /* TTL */
+    pkt[9] = (uint8_t)(len >> 8); pkt[10] = (uint8_t)len;
+    if (len) memcpy(pkt + 11, rd, len);
+    dns_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    size_t off = 0;
+    uint16_t t;
+    if (parse_resource_record(pkt, 11 + len, &off, &a, &rec, &t) != 0 || off != 11 + len) {
+        why = "RDATA is not valid for this record type (RFC 3597 5)";
+    } else if (rec.generic_data == NULL) {      /* decoded into text fields: write it back */
+        long n = dns_record_canonical_rdata(&rec, back, 65535);
+        if (len) memcpy(want, rd, len);
+        dns_canonical_downcase_rdata(type, want, len);
+        if (n < 0 || (size_t)n != len || (len && memcmp(back, want, len) != 0))
+            why = "RDATA is not valid for this record type: it has trailing octets or a compressed name (RFC 3597 5)";
+    }
+done:
+    zone_arena_destroy(&a);
+    free(pkt);
+    free(back);
+    free(want);
+    return why;
 }
 
 int dns_record_dup_rdata(zone_arena_t *arena, dns_record_t *rec) {

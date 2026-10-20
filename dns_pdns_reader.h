@@ -30,8 +30,8 @@
  *                                        (ambiguous); any other type with prio != 0: warning, ignored
  *   7. content                           must not be empty; line-safety rules below
  *   8. after parsing                     every record is written as ZONE_DATA writes it and read back with the decoder the
- *                                        Backend uses (parse_resource_record); one it refuses (the zone parser takes the
- *                                        RFC 3597 generic form "\# 0" for a PTR) fails the zone with its records.id, as
+ *                                        Backend uses (parse_resource_record); one it refuses (the zone parser itself refuses
+ *                                        such generic RDATA since D15-2; this is defence in depth) fails the zone with its records.id, as
  *                                        does a record that cannot fit a ZONE_DATA message on its own
  *
  * Line-safety rules (pdns_text_check(); RFC 1035 5.1 master file format, and the tokenizer of dns_zone_parser.c

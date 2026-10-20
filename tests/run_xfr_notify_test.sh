@@ -74,6 +74,8 @@ zone() { # zone FILE ORIGIN SERIAL [extra lines]
 for z in n1 n2 n3 s; do zone "$W/$z.test.zone" "$z.test" 1; done
 zone "$W/k.test.zone" k.test 1
 zone "$W/m1.test.zone" m1.test 1
+zone "$W/d.test.zone" d.test 1 'empty IN TYPE65534 \# 0
+'   # D15-1: an RR of an unknown type with zero-length RDATA (RFC 3597 5)
 printf '$TTL 300\n@ IN SOA ns1.cat.test. hostmaster.cat.test. 1 3600 600 86400 60\n@ IN NS invalid.\nversion IN TXT "2"\nabc.zones IN PTR m1.test.\n' > "$W/cat.test.zone"
 zone "$W/x2.test.zone" x2.test 5   # the secondary's initial copy, so its first refresh asks IXFR
 
@@ -95,6 +97,8 @@ zone "k.test" { type master; file "$W/k.test.zone"; allow-transfer { 127.0.0.1; 
                 also-notify { 127.0.0.1 port $PK; }; notify-retry-interval 1; };
 zone "cat.test" { type master; file "$W/cat.test.zone"; allow-transfer { 127.0.0.1; }; };
 zone "m1.test" { type master; file "$W/m1.test.zone"; allow-transfer { 127.0.0.1; }; };
+zone "d.test" { type master; file "$W/d.test.zone"; allow-transfer { 127.0.0.1; }; also-notify { 127.0.0.1 port $PK; };
+                notify-retry-interval 1; };
 EOF
 cat > "$W/s.conf" <<EOF
 options { port $PS; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT };
@@ -116,6 +120,7 @@ options { port $PK; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT };
 control-channel { socket "$W/k.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 zone "k.test" { type slave; masters { 127.0.0.1 port $PP; }; };
 zone "cat.test" { type slave; masters { 127.0.0.1 port $PP; }; catalog-zone yes; };
+zone "d.test" { type slave; masters { 127.0.0.1 port $PP; }; };
 EOF
 echo "key \"karictl\" { algorithm hmac-sha256; secret \"$SECRET\"; };" > "$W/ctl.conf"
 chmod 600 "$W/ctl.conf"
@@ -251,6 +256,43 @@ after=$(transfers)
 if [ "$before" = "AXFR=1 IXFR=0" ] && [ "$after" = "AXFR=1 IXFR=1" ]; then
     pass "X-24: the KariDNS secondary received the UPDATE as IXFR ($before -> $after)"
 else fail "X-24: transfers $before -> $after (expected AXFR=1 IXFR=0 -> AXFR=1 IXFR=1)"; fi
+
+# ---------------------------------------------------------------- D15-1: zero-length RDATA of an unknown type (RFC 3597 5)
+# "empty.d.test TYPE65534 \# 0" is in the primary's zone file.  parse_resource_record() used to leave generic_data NULL for
+# it, so the secondary dropped it as unencodable and answered NXDOMAIN; the same for a record that arrives by IXFR.
+dtype() { "$DAG" @127.0.0.1 -p "$1" "$2" TYPE65534 +short +nohexdump 2>&1; }
+d_transfers() { $CK observatory d.test 2>/dev/null | sed -n 's/.*Transfers (In): *\(AXFR=[0-9]* IXFR=[0-9]*\).*/\1/p'; }
+i=0; while [ $i -lt 10 ] && [ -z "$(dtype $PK empty.d.test)" ]; do sleep 1; i=$((i + 1)); done
+p_empty=$(dtype $PP empty.d.test)
+s_empty=$(dtype $PK empty.d.test)
+if [ -n "$p_empty" ] && [ "$p_empty" = "$s_empty" ]; then
+    pass "D15-1: AXFR carries a zero-length RDATA record to the secondary (both answer '$s_empty')"
+else fail "D15-1: empty.d.test TYPE65534: primary '$p_empty', secondary '$s_empty'"; fi
+case $("$DAG" @127.0.0.1 -p $PK empty.d.test TYPE65534 +nohexdump 2>&1) in
+    *"status: NOERROR"*) pass "D15-1: the secondary answers NOERROR, not NXDOMAIN";;
+    *) fail "D15-1: the secondary does not answer NOERROR for the empty record";; esac
+# a new empty record by reload (serial 2): NOTIFY -> IXFR
+zone "$W/d.test.zone" d.test 2 'empty IN TYPE65534 \# 0
+new0 IN TYPE65534 \# 0
+new1 IN A 192.0.2.99
+'
+$CP reload d.test >/dev/null
+i=0; while [ $i -lt 10 ]; do
+    "$DAG" @127.0.0.1 -p $PK new1.d.test A +short +nohexdump | grep -qx 192.0.2.99 && break; sleep 1; i=$((i + 1)); done
+p_new0=$(dtype $PP new0.d.test)
+s_new0=$(dtype $PK new0.d.test)
+if [ -n "$p_new0" ] && [ "$p_new0" = "$s_new0" ] && [ "$(d_transfers)" = "AXFR=1 IXFR=1" ]; then
+    pass "D15-1: IXFR adds a zero-length RDATA record on the secondary ($(d_transfers))"
+else fail "D15-1: new0.d.test after IXFR: primary '$p_new0', secondary '$s_new0' ($(d_transfers))"; fi
+# serial 3 removes it again: the deleted RR in the IXFR is an empty blob
+zone "$W/d.test.zone" d.test 3 'empty IN TYPE65534 \# 0
+new1 IN A 192.0.2.99
+'
+$CP reload d.test >/dev/null
+i=0; while [ $i -lt 10 ] && [ -n "$(dtype $PK new0.d.test)" ]; do sleep 1; i=$((i + 1)); done
+if [ -z "$(dtype $PK new0.d.test)" ] && [ -n "$(dtype $PK empty.d.test)" ] && [ "$(d_transfers)" = "AXFR=1 IXFR=2" ]; then
+    pass "D15-1: IXFR deletes a zero-length RDATA record; the one that stays is kept ($(d_transfers))"
+else fail "D15-1: after the IXFR that deletes new0.d.test: secondary '$(dtype $PK new0.d.test)' / '$(dtype $PK empty.d.test)' ($(d_transfers))"; fi
 
 for f in p s w k; do
     if grep -qE "AddressSanitizer|UndefinedBehaviorSanitizer|runtime error" "$W/$f.log"; then fail "sanitizer report in $f.log"; fi

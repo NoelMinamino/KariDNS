@@ -929,7 +929,7 @@ static void unenc_report(const dns_record_t *rec, void *ud) {
 }
 
 /* The Backend reads the stream with parse_xfr_packet() (parse_resource_record()): a record it refuses rejects the
- * whole zone message.  The zone file parser accepts some RDATA the wire decoder refuses (the RFC 3597 generic form
+ * whole zone message.  The zone file parser used to accept some RDATA the wire decoder refuses (D15-2; the RFC 3597 generic form
  * "\# 0" of a PTR, "\# 3 010203" of an NS, ...).  Every record is therefore written the way ZONE_DATA writes it and read
  * back by the decoder here, so such a row fails the zone with its records.id instead of the whole zone failing later at
  * the Backend.  0 = all records accepted; 1 = *bad is the first refused one (*why says how); -1 = out of memory. */

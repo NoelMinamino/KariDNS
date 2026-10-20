@@ -1,6 +1,6 @@
 # KariDNS Test Suite Matrix & RFC Traceability Document
 
-This document provides a comprehensive traceability matrix mapping every test in the KariDNS test suite (164 test targets registered in `tests/run_all_suite.sh` — C unit test binaries, integration shell scripts, sanitizer tests and fuzzing harnesses — plus the targets listed in §3.13) to its corresponding **IETF RFC / Technical Specification**, target **KariDNS Component**, and **Test Classification** (Positive, Negative, Boundary, Concurrency/RCU, Memory/ASan, Fuzzing).
+This document provides a comprehensive traceability matrix mapping every test in the KariDNS test suite (165 test targets registered in `tests/run_all_suite.sh` — C unit test binaries, integration shell scripts, sanitizer tests and fuzzing harnesses — plus the targets listed in §3.13) to its corresponding **IETF RFC / Technical Specification**, target **KariDNS Component**, and **Test Classification** (Positive, Negative, Boundary, Concurrency/RCU, Memory/ASan, Fuzzing).
 
 It directly cross-references the implementation status documented in [`KariDNS_RFC_GUIDELINE.md`](../KariDNS_RFC_GUIDELINE.md).
 
@@ -25,7 +25,7 @@ The KariDNS automated test suite is managed via the unified runner script [`test
 | `catalog` | **Catalog Zones** | RFC 9432 DNS Catalog Zones, Change of Ownership (CoO) | 2 | Shell script + multi-zone provisioning |
 | `dnstap` | **dnstap Logging** | Frame Streams / Protobuf logging | 1 | Shell script + receiver |
 | `tinydns` | **tinydns Format** | djbdns data format, %location split-horizon, TAI64 timestamps | 2 | Shell script + `karidns` |
-| `core` | **Server Core Engine** | RFC 1034/1035 resolution, forward & program zones, glue, RCU reload, lifecycle, adversarial inputs, `karicheck` / `karictl` | 40 | Shell script + `karidns` / `karictl` / `karicheck` |
+| `core` | **Server Core Engine** | RFC 1034/1035 resolution, forward & program zones, glue, RCU reload, lifecycle, adversarial inputs, `karicheck` / `karictl` | 41 | Shell script + `karidns` / `karictl` / `karicheck` |
 | `dag` | **Diagnostic Tool** | `run_dag_ci_test.sh` (Part 1-19 + Part 20-21 parallel sub-suites) and the individual dag test scripts | 60 | Shell scripts (included by default; skip with `--no-dag`) |
 | `regression` | **Regression & Fuzz** | ASan/UBSan smoke, concurrency stress, libFuzzer harnesses, coverage tooling, BIND differential | 6 | Shell script + libFuzzer / ASan binaries |
 | **Total** | | | **170** | *(111 without the `dag` category)* |
@@ -83,7 +83,7 @@ This table maps RFC standards recognized in [`KariDNS_RFC_GUIDELINE.md`](../Kari
 
 ---
 
-## 3. Exhaustive Test Inventory (176 Registered Tests)
+## 3. Exhaustive Test Inventory (177 Registered Tests)
 
 The complete inventory of all test targets registered in `tests/run_all_suite.sh` (`sh tests/run_all_suite.sh --list`), grouped by their registered category in registration order. `bin` targets are C unit test binaries built by the Makefile; the others are shell scripts.
 
@@ -283,6 +283,7 @@ The complete inventory of all test targets registered in `tests/run_all_suite.sh
 | 98 | [`run_zone_parser_error_paths_test.sh`](run_zone_parser_error_paths_test.sh) | `dns_zone_parser.c`, `tools/karicheck.c` | RFC 1035 §5, BIND `$GENERATE` | **Negative / Robustness** | Zone parser negative paths: anomalous directives, `$GENERATE` ranges and modifiers, and malformed RDATA handling. |
 | 99 | [`run_karictl_adversary_test.sh`](run_karictl_adversary_test.sh) | `tools/karictl.c` | KariDNS control protocol | **Negative** | karictl command-line and error-handling matrix: bad options, missing or unreadable configuration, wrong secrets, unreachable sockets and server error replies. |
 | 177 | [`run_signal_all_processes_test.sh`](run_signal_all_processes_test.sh) | `dns_server_core.c` (signal setup), `dns_query_engine.c` | POSIX signals | **Negative / Robustness** | SIGHUP/SIGUSR1/SIGUSR2/SIGPIPE sent to every karidns process (broker, routers, backend, manager): no process dies, the server keeps answering and SIGHUP reloads; the same signals to the manager only. |
+| 196 | [`run_db_dump_test.sh`](run_db_dump_test.sh) | `karidns_dbloader.c`, `dns_db_sqlite3.c`, `dns_db_driver.h`, `dns_pdns_reader.c`, `tests/db/zone2sql.c`, `tests/db/zone2kdb.c` | beta design 1.6, 2.2, 3.1, 3.5, 5.1; RFC 5936 2.2 | **Positive / Differential** | Every zone file of `tests/zones/` that the reader takes is imported with `zone2sql --dialect sqlite3` and the `sqlite3` CLI into a WAL database; `karidns-dbloader --dump` must write byte for byte the KDB1 stream that `tests/db/zone2kdb --ref` builds from the files (zone2sql rows -> reader -> `pdns_zone_encode_kdb`): 19 zones, HELLO, BATCH_BEGIN, BATCH_END. Two dumps are identical, `--loader-threads 4` and `--dump -` give the same bytes, `--zone` (per-zone path) gives each zone the bulk path's bytes. cryptokeys without PRESIGNED fail the zone (exit 1, ZONE_FAILED), PRESIGNED=1 lets it through, `--view-index`. Exit statuses 2 / 3 for usage, missing file, `file:` name, non-WAL database, schema errors, unknown zone, unwritable output; `%65` and UTF-8 file names are literal; every example of `--help` is run. SKIP without the `sqlite3` CLI or when the loader was built without the SQLite3 driver. |
 
 ---
 
@@ -370,7 +371,7 @@ The complete inventory of all test targets registered in `tests/run_all_suite.sh
 
 ### 3.13 Built and Run Outside `run_all_suite.sh`
 
-These targets are not registered in `tests/run_all_suite.sh`: `test_dag_iter` runs with `make unit-tests` (`make dag_iter_test`), `test_db_stream` with `make unit-tests` (`make db_stream_test`), `test_pdns_reader` with `make unit-tests` (`make pdns_reader_test`), and the libFuzzer harnesses run with `make fuzz_dag_all` / `sh tests/run_fuzz_smoke_test.sh dag`.
+These targets are not registered in `tests/run_all_suite.sh`: `test_dag_iter` runs with `make unit-tests` (`make dag_iter_test`), `test_db_stream` with `make unit-tests` (`make db_stream_test`), `test_pdns_reader` with `make unit-tests` (`make pdns_reader_test`), `test_db_sqlite3` with `make unit-tests` (`make db_sqlite3_test`), and the libFuzzer harnesses run with `make fuzz_dag_all` / `sh tests/run_fuzz_smoke_test.sh dag`.
 
 | ID | Test Target | Subsystems / Files | RFC / Spec | Test Classification | Verification Objective |
 |:---:|:---|:---|:---|:---|:---|
@@ -382,6 +383,8 @@ These targets are not registered in `tests/run_all_suite.sh`: `test_dag_iter` ru
 | E6 | [`fuzz_pdns_content`](fuzz/fuzz_pdns_content.c) | `dns_pdns_reader.c`, `dns_db_stream.c`, `dns_axfr_ixfr.c` | beta design 3.3, 3.4, 8.5 | **Fuzz / Robustness** | libFuzzer harness: hostile rows (owner, type, content, prio, ttl) -> reader; an accepted zone has exactly one record per row, and survives KDB1 encoding, decoding and `parse_xfr_packet()` with the same RRs; a row that changes another row's line (reader "internal error") traps. Seed corpus `fuzz/corpus_fuzz_pdns_content/` (from `test_pdns_reader --gen-corpus`). |
 | E7 | [`fuzz_pdns_metadata`](fuzz/fuzz_pdns_metadata.c) | `dns_pdns_reader.c`, `dns_config_parser.c` | beta design 3.5, 8.5 | **Fuzz / Robustness** | libFuzzer harness: hostile `domainmetadata` rows -> settings text -> `parse_named_conf` of `zone "z.test" { type master; file "x"; <text> };`; generated text that the configuration parser rejects, or that contains a statement the metadata did not ask for, traps. Seed corpus `fuzz/corpus_fuzz_pdns_metadata/`. |
 | E8 | [`zone2sql`](db/zone2sql.c) | `tests/db/zone2sql.c` | beta design 8.2 | **Test tool** | Zone file -> SQL for the PowerDNS 5.1 schema (`--dialect sqlite3\|pgsql`), the way PowerDNS stores a zone; built by `make zone2sql`, not installed. Host-checked against `pdnsutil load-zone` of PowerDNS 5.1.4 (milestone B2). |
+| E9 | [`test_db_sqlite3`](test_db_sqlite3.c) | `dns_db_sqlite3.c`, `dns_db_driver.h`, `karidns_dbloader.c` (included, `main` renamed), `dns_pdns_reader.c`, `dns_db_stream.c` | beta design 2.1, 2.2, 3.1, 3.5; RFC 3597 5 | **Positive / Negative / Boundary** | The SQLite3 driver against temporary databases made with the PowerDNS 5.1 column list (`tests/db/pdns_schema.sqlite3.sql`): WAL required, a `file:` name / empty / `:memory:` refused, an absent file is not created, `%65` in the file name literal, UTF-8 name, a name containing `file:` later; missing column and missing table named in the error, extra columns ignored; NULL ttl / prio / ordername / type (ENT row) / disabled (NULL disabled = disabled), empty strings; an embedded NUL in a record, domain or metadata value is an error naming the table and `id`; zone list with the apex SOA (one row per domain, disabled or second SOA), bulk scan == per-zone scans, `ORDER BY domain_id, id`, orphans, prepared statements reused 50 times, a callback that stops the scan; metadata and cryptokeys lists; snapshot isolation against a writer that commits (new zone, new row, changed row); busy handling (`DB_ERR_RETRY` from a connection in exclusive locking mode); `changes_since` unavailable / rows / gap; the dump: ZONE_FAILED for cryptokeys without PRESIGNED, SLAVE, unknown type, no SOA, an invalid name only on stderr, the whole stream accepted by the KDB1 state machine, two dumps identical, per-zone bytes equal bulk bytes, unknown zone and non-WAL database are errors. Built by `make db_sqlite3_test` / `make test_db_sqlite3-asan` (part of `make unit-tests` / `unit-tests-asan`; SKIP output when DB_DRIVERS lacks sqlite3). |
+| E10 | [`zone2kdb`](db/zone2kdb.c) | `tests/db/zone2kdb.c` | beta design 8.2 | **Test tool** | Zone files -> the reference KDB1 stream for `run_db_dump_test.sh` (`--ref`), stream comparison naming the zone and message of the first difference (`--compare`), extraction of one zone's messages (`--extract`); built by `make zone2kdb`, not installed. |
 
 ---
 

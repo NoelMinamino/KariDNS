@@ -363,6 +363,10 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
 // レコード型変換・解析
 const char *get_type_str(uint16_t type, zone_arena_t *arena);
 int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offset, zone_arena_t *arena, dns_record_t *rec, uint16_t *type_out);
+/* RFC 3597 5: NULL if rd[0..len) is valid RDATA for `type` (the decoder a secondary applies to it accepts it and the
+ * record writes back as the same octets, no compression), else a static reason.  Types without a decoder accept
+ * any octets.  Not for the query path (allocates). */
+const char *dns_generic_rdata_check(uint16_t type, const uint8_t *rd, size_t len);
 
 // TSIG
 bool tsig_algorithm_is_supported(const char *alg);

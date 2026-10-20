@@ -55,10 +55,6 @@ typedef struct {
 static char *rt_canon(const dns_record_t *r) {
     static uint8_t rd[65535];
     long n = dns_record_canonical_rdata(r, rd, sizeof(rd));
-    /* Known gap (reported, not fixed here): parse_resource_record() keeps a zero-length RDATA of a type it has no decoder
-     * for as generic_data == NULL, so the record has no readable RDATA (the zone parser uses an empty string). Compare
-     * it as the empty RDATA it is. */
-    if (n < 0 && r->generic_data == NULL && r->generic_len == 0 && r->rdata_count == 0) n = 0;
     size_t ol = r->name ? strlen(r->name) : 0;
     char *s = malloc(ol + 64 + (n > 0 ? (size_t)n * 2 : 8));
     if (!s) return NULL;

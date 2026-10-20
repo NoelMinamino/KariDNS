@@ -513,10 +513,11 @@ static void test_rejections(void) {
     reject("bad A", R(0, "x.z.test", "A", "999.1.1.1", 300, 0), "IPv4");
     reject("bad AAAA", R(0, "x.z.test", "AAAA", "nonsense", 300, 0), "IPv6");
     reject("generic length mismatch", R(0, "x.z.test", "TYPE65534", "\\# 5 0102", 300, 0), "length");
-    /* the zone parser takes the RFC 3597 generic form of any type; the wire decoder the Backend uses does not */
-    reject("generic empty PTR", R(0, "x.z.test", "PTR", "\\# 0", 300, 0), "not valid wire data");
-    reject("generic NS with garbage", R(0, "x.z.test", "NS", "\\# 3 010203", 300, 0), "not valid wire data");
-    reject("generic empty MX", R(0, "x.z.test", "MX", "\\# 1 00", 300, 0), "not valid wire data");
+    /* RFC 3597 5 (D15-2): the zone parser itself refuses generic RDATA that is not valid for a known type; the
+     * reader's own wire check (wire_check_all) stays behind it as defence in depth */
+    reject("generic empty PTR", R(0, "x.z.test", "PTR", "\\# 0", 300, 0), "RDATA");
+    reject("generic NS with garbage", R(0, "x.z.test", "NS", "\\# 3 010203", 300, 0), "RDATA");
+    reject("generic empty MX", R(0, "x.z.test", "MX", "\\# 1 00", 300, 0), "RDATA");
     accept_row("generic A is fine", R(0, "x.z.test", "A", "\\# 4 c0000201", 300, 0));
     accept_row("generic NS with a name", R(0, "x.z.test", "NS", "\\# 4 026e7300", 300, 0));
     reject("generic odd digits", R(0, "x.z.test", "TYPE65534", "\\# 1 012", 300, 0), "odd");

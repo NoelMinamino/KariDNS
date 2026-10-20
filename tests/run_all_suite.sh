@@ -367,6 +367,7 @@ register_test "core" "sh" "tests/run_karicheck_rules_test.sh" "karicheck diagnos
 register_test "core" "sh" "tests/run_karicheck_deep_rules_test.sh" "karicheck static lint rules: delegation, glue, CNAME & ZONEMD"
 register_test "core" "sh" "tests/run_zone_parser_error_paths_test.sh" "Zone parser error paths, escape sequences & malformed directives"
 register_test "core" "sh" "tests/run_karictl_adversary_test.sh" "karictl command line argument validation and socket error resilience"
+register_test "core" "sh" "tests/run_db_dump_test.sh" "karidns-dbloader --dump of a SQLite3 database made by zone2sql equals the KDB1 encoding of the zone files, byte for byte (beta B3; SKIP without sqlite3 or the SQLite3 driver)"
 
 # 11. Regression, Sanitizer & Concurrency Stress
 register_test "regression" "sh" "tests/run_sanitizer_smoke_test.sh" "ASan & UBSan runtime memory error smoke test"

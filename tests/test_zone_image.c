@@ -1214,6 +1214,87 @@ static void run_glue_flags(void) {
     free_zone(&z);
 }
 
+/* D15-1 (RFC 3597 5: zero-length RDATA is legal).  A secondary reads every RR with parse_resource_record(); an RR of a type
+ * that has no dedicated decoder and RDLENGTH 0 used to come out with generic_data == NULL: nothing to write, so it was
+ * dropped as unencodable (a primary serving "x TYPE65534 \# 0" answered it, its secondary said NXDOMAIN).  It must be an
+ * empty blob that survives dropping, indexing, freeze, thaw, comparison (IXFR diff) and serialization. */
+static void run_empty_rdata_wire(void) {
+    g_label = "empty RDATA";
+    static const char *text =
+        "$ORIGIN e.test.\n$TTL 300\n@ IN SOA ns1 hm 1 3600 600 86400 60\n@ IN NS ns1\nns1 IN A 192.0.2.1\n"
+        "empty IN TYPE65534 \\# 0\nempty IN TYPE65534 \\# 2 0102\nnul IN NULL \\# 0\nx25 IN X25 \\# 0\nlast IN TXT \"z\"\n";
+    zone_t a;
+    CHECK(load_zone(&a, text, "e.test.", ".", false));
+    if (!a.ok) return;
+    size_t n_empty = 0;
+    for (size_t i = 0; i < a.a.count; i++)
+        if (a.a.records[i].generic_data && a.a.records[i].generic_len == 0) n_empty++;
+    CHECK(n_empty == 3);
+
+    /* the secondary: every RR written to the wire and read back the way AXFR-in does it */
+    zone_arena_t b;
+    zone_arena_init(&b);
+    b.records = calloc(a.a.count, sizeof(dns_record_t));
+    b.records_cap = a.a.count;
+    CHECK(b.records != NULL);
+    static uint8_t wire[65535];
+    size_t n_empty_b = 0;
+    for (size_t i = 0; b.records && i < a.a.count; i++) {
+        uint16_t off = 0;
+        CHECK(serialize_dns_record(wire, sizeof(wire), &off, &a.a.records[i], NULL, NULL, 0xFFFFFFFFu) == 0);
+        dns_record_t rec;
+        memset(&rec, 0, sizeof(rec));
+        size_t pos = 0;
+        uint16_t t = 0;
+        CHECK(parse_resource_record(wire, off, &pos, &b, &rec, &t) == 0 && pos == off);
+        b.records[b.count++] = rec;
+        if (a.a.records[i].generic_data && a.a.records[i].generic_len == 0) {
+            CHECK(rec.generic_data != NULL && rec.generic_len == 0 && rec.rdata_count == 0);   /* an empty blob, not "no blob" */
+            n_empty_b++;
+        }
+        CHECK(compare_records(&a.a.records[i], &rec, false));
+        uint8_t canon[64];
+        CHECK(dns_record_canonical_rdata(&rec, canon, sizeof(canon)) >= 0);
+        /* and it is written back byte for byte */
+        uint8_t wire2[65535];
+        uint16_t off2 = 0;
+        CHECK(serialize_dns_record(wire2, sizeof(wire2), &off2, &rec, NULL, NULL, 0xFFFFFFFFu) == 0 && off2 == off &&
+              memcmp(wire, wire2, off) == 0);
+    }
+    CHECK(n_empty_b == 3);
+    CHECK(zone_arena_drop_unencodable(&b, silent_report, NULL) == 0);       /* nothing is dropped any more */
+    CHECK(b.count == a.a.count);
+    /* an IXFR diff sees empty == empty and empty != a one-record-different RDATA */
+    dns_record_t *e0 = NULL, *e2 = NULL;
+    for (size_t i = 0; i < b.count; i++) {
+        if (b.records[i].type_code == 65534 && b.records[i].generic_len == 0) e0 = &b.records[i];
+        if (b.records[i].type_code == 65534 && b.records[i].generic_len == 2) e2 = &b.records[i];
+    }
+    CHECK(e0 && e2 && !compare_records(e0, e2, false) && compare_records(e0, e0, false));
+    CHECK(build_zone_index(&b, true) == 0);
+    zone_image_t *img = zone_image_freeze(&b, "e.test.");
+    CHECK(img != NULL);
+    if (img) {
+        size_t raw_empty = 0;
+        for (uint32_t k = 0; k < img->n_rrs; k++) {
+            uint16_t ty = zone_image_rr_type(img, k);
+            if ((ty == 65534 || ty == 10 || ty == 19) && zone_image_rr_rdlen(img, k) == 0) raw_empty++;
+        }
+        CHECK(raw_empty == 3);
+        zone_arena_t c;
+        zone_arena_init(&c);
+        CHECK(zone_image_thaw(img, &c) == 0 && c.count == b.count);
+        size_t found = 0;
+        for (size_t i = 0; i < b.count; i++)
+            if (record_exists_in_arena(&c, &b.records[i])) found++;
+        CHECK(found == b.count);
+        zone_arena_destroy(&c);
+        zone_image_free(img);
+    }
+    zone_arena_destroy(&b);
+    free_zone(&a);
+}
+
 /* an empty zone, a zone of one RR, and the builder contract */
 static void run_edges(void) {
     g_label = "edges";
@@ -1247,6 +1328,8 @@ int main(void) {
     run_glue_flags();
     printf("[TEST] file order of interleaved owners (B-2)\n");
     run_perm();
+    printf("[TEST] zero-length RDATA read from the wire (D15-1)\n");
+    run_empty_rdata_wire();
     printf("[TEST] empty zone\n");
     run_edges();
     printf("[TEST] tests/zones/*.zone\n");

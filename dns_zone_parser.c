@@ -370,6 +370,17 @@ typedef struct {
     char **loc_tag_io;
 } zone_parse_state_t;
 
+/* An error in the RFC 3597 generic RDATA of the record whose type token is `type`: the message, and the position of the
+ * record in `buf` so that the error is reported at its own line (the other record errors point at the type token). */
+static void zone_generic_rdata_error(parse_context_t *ctx, const char *type, const char *buf, const char *msg) {
+  if (!ctx || !ctx->err_out) return;
+  ctx->err_out->error_message = msg;
+  if (type && buf && type >= buf) {
+    ctx->err_out->error_offset = (size_t)(type - buf);
+    ctx->err_out->token_length = strlen(type);
+  }
+}
+
 static int parse_zone_buffer(char *buf, size_t size, zone_arena_t *arena, parse_context_t *ctx,
                              const zone_parse_state_t *st, bool finalize);
 
@@ -1477,30 +1488,30 @@ PROCESS_RECORD:
     const char *len_tok = rec->rdata[1];
     size_t len_tok_len = strlen(len_tok);
     if (len_tok_len == 0 || len_tok_len > 5 || strspn(len_tok, "0123456789") != len_tok_len) {
-      if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA length (\\#) is not a decimal number";
+      zone_generic_rdata_error(ctx, rec->type, buf, "Generic RDATA length (\\#) is not a decimal number");
       return -1;
     }
     long declared_len = atol(len_tok);
     if (declared_len < 0 || declared_len > 65535) {
-      if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA length (\\#) out of range (0-65535)";
+      zone_generic_rdata_error(ctx, rec->type, buf, "Generic RDATA length (\\#) out of range (0-65535)");
       return -1;
     }
     size_t nibbles = 0;
     for (int j = 2; j < rec->rdata_count; j++) {
       for (const char *h = rec->rdata[j]; *h; h++) {
         if (hex_char_to_val(*h) < 0) {
-          if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA (\\#) contains a non-hexadecimal character";
+          zone_generic_rdata_error(ctx, rec->type, buf, "Generic RDATA (\\#) contains a non-hexadecimal character");
           return -1;
         }
         nibbles++;
       }
     }
     if ((nibbles & 1) != 0) {
-      if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA (\\#) has an odd number of hex digits";
+      zone_generic_rdata_error(ctx, rec->type, buf, "Generic RDATA (\\#) has an odd number of hex digits");
       return -1;
     }
     if (nibbles / 2 != (size_t)declared_len) {
-      if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA (\\#) length does not match the declared length";
+      zone_generic_rdata_error(ctx, rec->type, buf, "Generic RDATA (\\#) length does not match the declared length");
       return -1;
     }
     /* Types whose RDATA has a fixed size must not be given in a different size, even in generic form. */
@@ -1517,7 +1528,7 @@ PROCESS_RECORD:
         default: break;
       }
       if (fixed >= 0 && declared_len != fixed) {
-        if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA (\\#) has the wrong length for this fixed-size record type";
+        zone_generic_rdata_error(ctx, rec->type, buf, "Generic RDATA (\\#) has the wrong length for this fixed-size record type");
         return -1;
       }
     }
@@ -1542,6 +1553,15 @@ PROCESS_RECORD:
       }
     } else {
       rec->generic_data = (uint8_t *)"";
+    }
+    /* D15-2, RFC 3597 section 5: the RDATA must be valid for the type.  "PTR \# 0" and "NS \# 3 010203" used to be
+     * kept as they were and served as raw octets, which the wire decoder of a secondary refuses. */
+    if (rec->generic_data) {
+      const char *why = dns_generic_rdata_check(rec->type_code, rec->generic_data, rec->generic_len);
+      if (why) {
+        zone_generic_rdata_error(ctx, rec->type, buf, why);
+        return -1;
+      }
     }
   } else if (rec->type) {
     if (rec->type_code == 5 || rec->type_code == 12 || rec->type_code == 2 ||
