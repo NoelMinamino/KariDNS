@@ -178,10 +178,11 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
 
 void notify_request_send(zone_db_entry_t *entry) {
   atomic_store_explicit(&entry->notify_now, true, memory_order_release);
-  if (g_control_kq != -1) {
+  int kq = atomic_load_explicit(&g_control_kq, memory_order_acquire);
+  if (kq != -1) {
     struct kevent ev;
     EV_SET(&ev, 2, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
-    kevent(g_control_kq, &ev, 1, NULL, 0, NULL);
+    kevent(kq, &ev, 1, NULL, 0, NULL);
   }
 }
 

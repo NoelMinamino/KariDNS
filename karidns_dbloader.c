@@ -26,6 +26,14 @@
 #include <errno.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <stdarg.h>
+#include <signal.h>
+#include <poll.h>
+#include <fcntl.h>
+#include <syslog.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 
 #include "dns_db_driver.h"
 #include "dns_db_stream.h"
@@ -36,6 +44,20 @@
 #endif
 
 enum { EXIT_OK = 0, EXIT_ZONES_FAILED = 1, EXIT_USAGE = 2, EXIT_ERROR = 3, EXIT_RETRY = 4 };
+
+/* Messages.  Dump mode: stderr with the program prefix (the lines the dump tests expect).  Stream mode: syslog
+ * (openlog() has LOG_PERROR, so a foreground server still shows them on stderr). */
+static bool g_stream_mode;
+static void lg(int prio, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void lg(int prio, const char *fmt, ...) {
+    char msg[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    if (g_stream_mode) syslog(prio, "%s", msg);
+    else fprintf(stderr, "karidns-dbloader: %s\n", msg);
+}
 
 /* ------------------------------------------------------------------------------------------------------------- */
 /* drivers compiled in                                                                                            */
@@ -97,11 +119,26 @@ typedef struct {
     uint32_t n_unwritten;             /* failed zones whose name cannot be written to the stream */
     bool oom;
     kdb_enc_t enc;
+    /* stream mode (-s FD, B4a); all zero in dump mode, so a ctx_t made by memset() is a dump context */
+    struct lio *io;                   /* non-NULL: write to the socket (io->fd) instead of x->out */
+    uint64_t batch_id;
+    uint8_t batch_kind;
+    uint64_t change_seq;
+    bool batch_open;                  /* BATCH_BEGIN sent, BATCH_END not yet */
 } ctx_t;
+
+static int stream_write(ctx_t *x, const uint8_t *msg, size_t len);
 
 static int emit_file(void *ud, const uint8_t *msg, size_t len) {
     ctx_t *x = ud;
     if (x->io_error) return -1;
+    if (x->io) {
+        if (stream_write(x, msg, len) != 0) {
+            x->io_error = true;
+            return -1;
+        }
+        return 0;
+    }
     if (fwrite(msg, 1, len, x->out) != len) {
         x->io_error = true;
         return -1;
@@ -212,9 +249,9 @@ static bool canonical_name(const char *dbname, char out[DNS_NAME_TEXT_SIZE]) {
 static int send_failed(ctx_t *x, const zinfo_t *zi, const char *reason) {
     char name[DNS_NAME_TEXT_SIZE], why[260], shown[210];
     clean_reason(zi->name ? zi->name : "(NULL)", shown, sizeof(shown));
-    fprintf(stderr, "karidns-dbloader: zone '%s' (domains.id %lld): %s\n", shown, (long long)zi->id, reason);
+    lg(LOG_ERR, "zone '%s' (domains.id %lld): %s", shown, (long long)zi->id, reason);
     if (!canonical_name(zi->name, name)) {
-        fprintf(stderr, "karidns-dbloader: the zone name is not a valid domain name; not written to the stream\n");
+        lg(LOG_ERR, "the zone name is not a valid domain name; not written to the stream");
         x->n_unwritten++;
         return 0;
     }
@@ -282,7 +319,7 @@ static int finish_current(ctx_t *x) {
             why = "the zone has cryptokeys but no PRESIGNED=1 metadata (online signing is not supported)";
         }
         for (size_t i = 0; i < z->n_warnings; i++)
-            fprintf(stderr, "karidns-dbloader: warning: %s\n", z->warnings[i]);
+            lg(LOG_WARNING, "warning: %s", z->warnings[i]);
         if (why) {
             ret = send_failed(x, zi, why);
         } else {
@@ -325,20 +362,36 @@ static int rec_cb(void *ud, int64_t did, const db_record_row_t *row) {
     return 0;
 }
 
-static int send_simple_header(ctx_t *x) {
+static int send_hello(ctx_t *x, const char *driver_list, uint32_t pid) {
     if (kdb_enc_begin(&x->enc, KDB_T_HELLO) != 0 || kdb_enc_u16(&x->enc, 1, KDB_VERSION) != 0 ||
-        kdb_enc_str(&x->enc, 2, KARIDNS_VERSION) != 0 || kdb_enc_str(&x->enc, 3, x->drv->name) != 0 ||
-        kdb_enc_u32(&x->enc, 4, 0) != 0 || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
+        kdb_enc_str(&x->enc, 2, KARIDNS_VERSION) != 0 || kdb_enc_str(&x->enc, 3, driver_list) != 0 ||
+        kdb_enc_u32(&x->enc, 4, pid) != 0 || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
         return -1;
-    if (kdb_enc_begin(&x->enc, KDB_T_BATCH_BEGIN) != 0 || kdb_enc_u64(&x->enc, 1, 1) != 0 ||
-        kdb_enc_u8(&x->enc, 2, KDB_BATCH_STARTUP) != 0 || kdb_enc_u64(&x->enc, 3, 0) != 0 || kdb_enc_end(&x->enc) != 0 ||
+    return 0;
+}
+
+static int send_batch_begin(ctx_t *x, uint64_t id, uint8_t kind, uint64_t change_seq) {
+    if (kdb_enc_begin(&x->enc, KDB_T_BATCH_BEGIN) != 0 || kdb_enc_u64(&x->enc, 1, id) != 0 ||
+        kdb_enc_u8(&x->enc, 2, kind) != 0 || kdb_enc_u64(&x->enc, 3, change_seq) != 0 || kdb_enc_end(&x->enc) != 0 ||
         send_enc(x) != 0)
         return -1;
     return 0;
 }
 
+/* dump mode: HELLO and the one startup batch.  Stream mode: HELLO went out at the handshake; BATCH_BEGIN goes out
+ * once, just before the first zone of the batch (an error before that leaves nothing half sent). */
+static int send_simple_header(ctx_t *x) {
+    if (x->io) {
+        if (x->batch_open) return 0;
+        x->batch_open = true;
+        return send_batch_begin(x, x->batch_id, x->batch_kind, x->change_seq);
+    }
+    if (send_hello(x, x->drv->name, 0) != 0) return -1;
+    return send_batch_begin(x, 1, KDB_BATCH_STARTUP, 0);
+}
+
 static int send_batch_end(ctx_t *x) {
-    if (kdb_enc_begin(&x->enc, KDB_T_BATCH_END) != 0 || kdb_enc_u64(&x->enc, 1, 1) != 0 ||
+    if (kdb_enc_begin(&x->enc, KDB_T_BATCH_END) != 0 || kdb_enc_u64(&x->enc, 1, x->io ? x->batch_id : 1) != 0 ||
         kdb_enc_u32(&x->enc, 2, x->n_zones) != 0 || kdb_enc_u32(&x->enc, 3, x->n_failed) != 0 ||
         kdb_enc_u32(&x->enc, 4, 0) != 0 || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
         return -1;
@@ -353,16 +406,45 @@ static int names_equal(const char *a, const char *b) {
 }
 
 static int db_err(ctx_t *x, int rc, const char *what) {
-    fprintf(stderr, "karidns-dbloader: %s: %s\n", what, x->conn ? x->drv->errmsg(x->conn) : "?");
+    lg(LOG_ERR, "%s: %s", what, x->conn ? x->drv->errmsg(x->conn) : "?");
     return rc == DB_ERR_RETRY ? EXIT_RETRY : EXIT_ERROR;
 }
 
-/* The whole dump.  Returns an exit status. */
-static int run_dump(ctx_t *x, const db_source_t *src, const char *only_zone) {
+/* Forget the lists of the previous view (zones, metadata, keys).  The context keeps them after a run so that the owner
+ * (main(), a test) can look at them; the next run starts empty. */
+static void ctx_view_reset(ctx_t *x) {
+    if (x->cur_open && x->cur) pdns_zone_free(x->cur);
+    x->cur = NULL;
+    x->cur_open = false;
+    for (size_t i = 0; i < x->nz; i++) {
+        free(x->zones[i].name);
+        free(x->zones[i].type);
+    }
+    free(x->zones);
+    x->zones = NULL;
+    x->nz = x->zcap = 0;
+    for (size_t i = 0; i < x->nm; i++) {
+        free(x->meta[i].kind);
+        free(x->meta[i].content);
+    }
+    free(x->meta);
+    x->meta = NULL;
+    x->nm = x->mcap = x->mi = 0;
+    free(x->keys);
+    x->keys = NULL;
+    x->nk = x->kcap = 0;
+    x->zi = 0;
+}
+
+/* One source (one view): open, read the lists, then the records, writing the zones.  whole: the dump of a file,
+ * with HELLO / BATCH_BEGIN before the first zone and BATCH_END after the last; otherwise (stream mode) the caller
+ * owns the batch and calls this once per view.  Returns an exit status. */
+static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, bool whole) {
     char err[DB_ERRLEN];
+    ctx_view_reset(x);
     int rc = x->drv->open(&x->conn, src, err, sizeof(err));
     if (rc != 0) {
-        fprintf(stderr, "karidns-dbloader: %s\n", err);
+        lg(LOG_ERR, "%s", err);
         return rc == DB_ERR_RETRY ? EXIT_RETRY : EXIT_ERROR;
     }
     int status = EXIT_OK;
@@ -377,7 +459,7 @@ static int run_dump(ctx_t *x, const db_source_t *src, const char *only_zone) {
     }
     if ((rc = x->drv->list_zones(x->conn, zone_cb, x)) != 0) {
         status = x->oom ? EXIT_ERROR : db_err(x, rc, "reading the zone list");
-        if (x->oom) fprintf(stderr, "karidns-dbloader: out of memory\n");
+        if (x->oom) lg(LOG_ERR, "out of memory");
         goto out_snap;
     }
     if (only_zone) {        /* keep only that zone */
@@ -393,7 +475,7 @@ static int run_dump(ctx_t *x, const db_source_t *src, const char *only_zone) {
         }
         x->nz = keep;
         if (!keep) {
-            fprintf(stderr, "karidns-dbloader: zone '%.200s' is not in the database\n", only_zone);
+            lg(LOG_ERR, "zone '%.200s' is not in the database", only_zone);
             status = EXIT_ERROR;
             goto out_snap;
         }
@@ -404,13 +486,13 @@ static int run_dump(ctx_t *x, const db_source_t *src, const char *only_zone) {
         if ((rc = x->drv->scan_metadata(x->conn, sel ? &id0 : NULL, meta_cb, x)) != 0 ||
             (rc = x->drv->zones_with_keys(x->conn, key_cb, x)) != 0) {
             status = x->oom ? EXIT_ERROR : db_err(x, rc, "reading metadata");
-            if (x->oom) fprintf(stderr, "karidns-dbloader: out of memory\n");
+            if (x->oom) lg(LOG_ERR, "out of memory");
             goto out_snap;
         }
         qsort(x->keys, x->nk, sizeof(int64_t), cmp_i64);
 
         if (send_simple_header(x) != 0) {
-            fprintf(stderr, "karidns-dbloader: cannot write the output: %s\n", strerror(errno));
+            lg(LOG_ERR, "cannot write the output: %s", strerror(errno));
             status = EXIT_ERROR;
             goto out_snap;
         }
@@ -420,7 +502,7 @@ static int run_dump(ctx_t *x, const db_source_t *src, const char *only_zone) {
             goto out_snap;
         }
         if (rc == DB_STOPPED && !x->io_error && !x->oom) {
-            fprintf(stderr, "karidns-dbloader: internal error: the scan was stopped\n");
+            lg(LOG_ERR, "internal error: the scan was stopped");
             status = EXIT_ERROR;
             goto out_snap;
         }
@@ -430,13 +512,13 @@ static int run_dump(ctx_t *x, const db_source_t *src, const char *only_zone) {
             x->zi++;
         }
         if (fatal || x->io_error || x->oom) {
-            if (x->oom) fprintf(stderr, "karidns-dbloader: out of memory\n");
-            else fprintf(stderr, "karidns-dbloader: cannot write the output: %s\n", strerror(errno));
+            if (x->oom) lg(LOG_ERR, "out of memory");
+            else lg(LOG_ERR, "cannot write the output: %s", strerror(errno));
             status = EXIT_ERROR;
             goto out_snap;
         }
-        if (send_batch_end(x) != 0) {
-            fprintf(stderr, "karidns-dbloader: cannot write the output: %s\n", strerror(errno));
+        if (whole && send_batch_end(x) != 0) {
+            lg(LOG_ERR, "cannot write the output: %s", strerror(errno));
             status = EXIT_ERROR;
             goto out_snap;
         }
@@ -448,6 +530,492 @@ out:
     x->drv->close(x->conn);
     x->conn = NULL;
     return status;
+}
+
+/* The whole dump.  Returns an exit status. */
+static int run_dump(ctx_t *x, const db_source_t *src, const char *only_zone) {
+    return run_view(x, src, only_zone, true);
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* stream mode: -s FD, the long-running loader that karidns starts (beta design 1.2, 1.4, 1.5)                    */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+typedef struct {
+    uint16_t index;
+    char *name, *source, *conninfo;          /* source: the file (sqlite3) or schema (postgresql); NULL = driver default */
+    uint8_t auto_reload;
+    uint32_t poll_interval, coalesce_ms;
+    uint64_t max_records, max_bytes;
+} lview_t;
+
+typedef struct {
+    uint64_t generation;
+    char driver[40], server_id[72];
+    uint32_t default_ttl, loader_threads;
+    int bulk_threshold;
+    lview_t *views;
+    size_t nviews;
+} lcfg_t;
+
+typedef struct { uint64_t id; uint16_t view; char zone[DNS_NAME_TEXT_SIZE]; } lreq_t;
+
+#define LREQ_MAX 64
+
+struct lio {
+    int fd;
+    kdb_framer_t fr;
+    uint8_t *body;                           /* KDB_MAX_BODY */
+    uint8_t rbuf[65536];
+    bool eof, failed;
+    lcfg_t cfg;                              /* in use by a load */
+    bool have_cfg;
+    lcfg_t newcfg;                           /* the latest CONFIG, adopted between two loads (a load walks cfg.views) */
+    bool have_newcfg;
+    bool inv_end;
+    uint64_t inv_entries;
+    lreq_t req[LREQ_MAX];
+    size_t nreq;
+    bool reload_all;
+    uint64_t batch_seq;
+    uint64_t n_results, n_rejected;          /* ZONE_RESULTs of the current batch */
+    char first_reject[130];
+};
+
+static volatile sig_atomic_t g_stop;
+static void on_term(int sig) { (void)sig; g_stop = 1; }
+
+static void cfg_free(lcfg_t *c) {
+    for (size_t i = 0; i < c->nviews; i++) {
+        free(c->views[i].name);
+        free(c->views[i].source);
+        free(c->views[i].conninfo);
+    }
+    free(c->views);
+    memset(c, 0, sizeof(*c));
+}
+
+static char *dup_kstr(kdb_str_t s) {
+    if (!s.p) return NULL;
+    char *r = malloc((size_t)s.len + 1);
+    if (!r) return NULL;
+    memcpy(r, s.p, s.len);
+    r[s.len] = '\0';
+    return r;
+}
+
+static int cfg_from_msg(const kdb_msg_t *m, lcfg_t *c) {
+    memset(c, 0, sizeof(*c));
+    c->generation = m->u.config.generation;
+    snprintf(c->driver, sizeof(c->driver), "%.*s", (int)m->u.config.driver.len, m->u.config.driver.p);
+    if (m->u.config.server_id.p)
+        snprintf(c->server_id, sizeof(c->server_id), "%.*s", (int)m->u.config.server_id.len, m->u.config.server_id.p);
+    c->default_ttl = m->u.config.default_ttl;
+    c->loader_threads = m->u.config.loader_threads;
+    c->bulk_threshold = m->u.config.bulk_threshold;
+    c->views = calloc(m->u.config.n_views ? m->u.config.n_views : 1, sizeof(lview_t));
+    if (!c->views) return -1;
+    kdb_iter_t it;
+    kdb_config_view_t v;
+    kdb_config_views(m, &it);
+    while (kdb_config_views_next(&it, &v) && c->nviews < m->u.config.n_views) {
+        lview_t *d = &c->views[c->nviews++];
+        d->index = v.index;
+        d->name = dup_kstr(v.name);
+        d->source = dup_kstr(v.source);
+        d->conninfo = dup_kstr(v.conninfo_file);
+        d->auto_reload = v.auto_reload;
+        d->poll_interval = v.poll_interval;
+        d->coalesce_ms = v.coalesce_ms;
+        d->max_records = v.max_zone_records;
+        d->max_bytes = v.max_zone_bytes;
+        if (!d->name || (v.source.p && !d->source) || (v.conninfo_file.p && !d->conninfo)) return -1;
+    }
+    return 0;
+}
+
+static bool streq_n(const char *a, const char *b) { return (a == NULL) == (b == NULL) && (!a || strcmp(a, b) == 0); }
+
+/* Same sources and same conversion parameters: nothing to read again.  (Generation, auto-reload and the poll
+ * settings change without a new read.) */
+static bool cfg_load_equal(const lcfg_t *a, const lcfg_t *b) {
+    if (strcmp(a->driver, b->driver) != 0 || a->default_ttl != b->default_ttl || a->nviews != b->nviews) return false;
+    for (size_t i = 0; i < a->nviews; i++) {
+        const lview_t *x = &a->views[i], *y = &b->views[i];
+        if (x->index != y->index || strcmp(x->name, y->name) != 0 || !streq_n(x->source, y->source) ||
+            !streq_n(x->conninfo, y->conninfo) || x->max_records != y->max_records || x->max_bytes != y->max_bytes)
+            return false;
+    }
+    return true;
+}
+
+static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
+    kdb_msg_t m;
+    char why[KDB_REASON_LEN];
+    kdb_rc_t rc = kdb_decode(fr, KDB_VIEWS_ANY, &m, why, sizeof(why));
+    if (rc != KDB_OK) {
+        lg(LOG_ERR, "protocol error from the Backend: %s", why);
+        io->failed = true;
+        return;
+    }
+    switch (m.type) {
+    case KDB_T_CONFIG: {
+        lcfg_t nc;
+        if (cfg_from_msg(&m, &nc) != 0) {
+            cfg_free(&nc);
+            lg(LOG_ERR, "out of memory");
+            io->failed = true;
+            return;
+        }
+        cfg_free(&io->newcfg);
+        io->newcfg = nc;
+        io->have_newcfg = true;
+        lg(LOG_INFO, "CONFIG generation %llu: driver %s, %zu view(s)", (unsigned long long)nc.generation, nc.driver,
+           nc.nviews);
+        break;
+    }
+    case KDB_T_INVENTORY: {
+        kdb_iter_t it;
+        kdb_inventory_entry_t e;
+        kdb_inventory_entries(&m, &it);
+        while (kdb_inventory_entries_next(&it, &e)) io->inv_entries++;
+        break;
+    }
+    case KDB_T_INVENTORY_END:
+        io->inv_end = true;
+        break;
+    case KDB_T_ZONE_RESULT:
+        io->n_results++;
+        if (m.u.zone_result.status == KDB_ST_REJECTED) {
+            io->n_rejected++;
+            if (!io->first_reject[0] && m.u.zone_result.reason.p)
+                snprintf(io->first_reject, sizeof(io->first_reject), "%.*s", (int)m.u.zone_result.reason.len,
+                         m.u.zone_result.reason.p);
+        }
+        break;
+    case KDB_T_BATCH_RESULT:
+        lg(LOG_INFO, "Backend result for batch %llu: %u applied, %u unchanged, %u rejected, %u deleted%s%s",
+           (unsigned long long)m.u.batch_result.batch_id, m.u.batch_result.n_applied, m.u.batch_result.n_unchanged,
+           m.u.batch_result.n_rejected, m.u.batch_result.n_deleted, io->first_reject[0] ? "; first reason: " : "",
+           io->first_reject);
+        break;
+    case KDB_T_RELOAD_REQ:
+        /* scope all: send everything again (the diff against the Backend's inventory comes with B6) */
+        if (m.u.reload_req.scope == 0 || io->nreq >= LREQ_MAX) {
+            io->reload_all = true;
+        } else {
+            lreq_t *r = &io->req[io->nreq++];
+            r->id = m.u.reload_req.request_id;
+            r->view = m.u.reload_req.view;
+            snprintf(r->zone, sizeof(r->zone), "%s", m.u.reload_req.zone);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+/* Read what is there and act on it.  Sets io->eof / io->failed. */
+static void io_pump(struct lio *io) {
+    for (;;) {
+        ssize_t n = read(io->fd, io->rbuf, sizeof(io->rbuf));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            lg(LOG_ERR, "cannot read the stream: %s", strerror(errno));
+            io->failed = true;
+            return;
+        }
+        if (n == 0) {
+            io->eof = true;
+            return;
+        }
+        if (kdb_framer_feed(&io->fr, io->rbuf, (size_t)n) != KDB_OK) {
+            lg(LOG_ERR, "protocol error from the Backend: %s", io->fr.reason);
+            io->failed = true;
+            return;
+        }
+        kdb_frame_t fr;
+        for (;;) {
+            kdb_rc_t rc = kdb_framer_next(&io->fr, &fr);
+            if (rc == KDB_MORE) break;
+            if (rc != KDB_OK) {
+                lg(LOG_ERR, "protocol error from the Backend: %s", io->fr.reason);
+                io->failed = true;
+                return;
+            }
+            io_dispatch(io, &fr);
+            if (io->failed) return;
+        }
+    }
+}
+
+/* Write the whole buffer to the socket (short writes, EINTR).  While the socket is full, read what the Backend
+ * sent: it answers every zone, and a Backend that cannot get rid of its answers must not be waited for. */
+static int stream_write(ctx_t *x, const uint8_t *msg, size_t len) {
+    struct lio *io = x->io;
+    while (len > 0) {
+        if (g_stop) {
+            errno = EINTR;
+            return -1;
+        }
+        ssize_t n = write(io->fd, msg, len);
+        if (n > 0) {
+            msg += n;
+            len -= (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd p = { io->fd, POLLIN | POLLOUT, 0 };
+            int r = poll(&p, 1, 1000);
+            if (r < 0 && errno != EINTR) return -1;
+            if (r > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR))) {
+                io_pump(io);
+                if (io->eof || io->failed) {
+                    errno = EPIPE;
+                    return -1;
+                }
+            }
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+/* Wait until *flag is set.  0, or -1 when the loader is told to stop or the stream is gone. */
+static int io_wait_for(struct lio *io, const bool *flag) {
+    while (!*flag) {
+        if (g_stop) return -1;
+        if (io->eof || io->failed) return -1;
+        struct pollfd p = { io->fd, POLLIN, 0 };
+        int r = poll(&p, 1, 1000);
+        if (r < 0 && errno != EINTR) return -1;
+        if (r > 0) io_pump(io);
+    }
+    return 0;
+}
+
+static void drivers_csv(char *out, size_t cap) {
+    out[0] = '\0';
+    for (size_t i = 0; k_drivers[i]; i++) {
+        size_t l = strlen(out);
+        snprintf(out + l, cap - l, "%s%s", i ? "," : "", k_drivers[i]->name);
+    }
+}
+
+/* One batch: the zones of every view (only_view >= 0: of that view; only_zone: of that zone).  0 = done, 1 = some
+ * view could not be read (logged; the caller retries), -1 = fatal (stream, memory, stop). */
+static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const char *only_zone) {
+    const lcfg_t *c = &io->cfg;
+    const db_driver_t *drv = driver_find(c->driver);
+    if (!drv) return -1;
+    x->drv = drv;
+    x->batch_id = ++io->batch_seq;
+    x->batch_kind = kind;
+    x->change_seq = 0;
+    x->batch_open = false;
+    x->n_zones = x->n_failed = x->n_unwritten = 0;
+    io->n_results = io->n_rejected = 0;
+    io->first_reject[0] = '\0';
+    int errs = 0;
+    bool sqlite = strcmp(drv->name, "sqlite3") == 0;
+    for (size_t i = 0; i < c->nviews; i++) {
+        const lview_t *v = &c->views[i];
+        if (only_view >= 0 && v->index != only_view) continue;
+        x->view = v->index;
+        memset(&x->opts, 0, sizeof(x->opts));
+        x->opts.default_ttl = c->default_ttl;
+        x->opts.max_records = v->max_records;
+        x->opts.max_zone_bytes = v->max_bytes;
+        db_source_t src = { drv->name, sqlite ? v->source : NULL, v->conninfo, sqlite ? NULL : v->source, 0 };
+        int st = run_view(x, &src, only_zone, false);
+        if (x->io_error || x->oom || g_stop) {
+            ctx_view_reset(x);
+            return -1;
+        }
+        if (st == EXIT_ERROR || st == EXIT_RETRY) {
+            lg(LOG_ERR, "view '%s' could not be read", v->name);
+            errs++;
+        }
+    }
+    ctx_view_reset(x);
+    if (x->batch_open) {
+        x->batch_open = false;
+        if (send_batch_end(x) != 0) {
+            lg(LOG_ERR, "cannot write the output: %s", strerror(errno));
+            return -1;
+        }
+        lg(LOG_INFO, "batch %llu sent: %u zone(s), %u failed in the loader", (unsigned long long)x->batch_id,
+           x->n_zones, x->n_failed);
+    }
+    return errs ? 1 : 0;
+}
+
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int run_stream(int fd) {
+    struct lio *io = calloc(1, sizeof(*io));
+    uint8_t *body = malloc(KDB_MAX_BODY);
+    if (!io || !body) {
+        lg(LOG_ERR, "out of memory");
+        return EXIT_ERROR;
+    }
+    io->fd = fd;
+    io->body = body;
+    kdb_framer_init(&io->fr, KDB_FROM_BACKEND, body, KDB_MAX_BODY);
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    x.io = io;
+    kdb_enc_init(&x.enc);
+    int status = EXIT_OK;
+    char drvs[128];
+    drivers_csv(drvs, sizeof(drvs));
+
+    /* HELLO -> CONFIG -> INVENTORY_REQ -> INVENTORY ... INVENTORY_END (design 1.4) */
+    if (send_hello(&x, drvs, (uint32_t)getpid()) != 0) {
+        status = g_stop ? EXIT_OK : EXIT_ERROR;
+        goto done;
+    }
+    lg(LOG_INFO, "karidns-dbloader %s: HELLO sent (drivers: %s)", KARIDNS_VERSION, drvs);
+    if (io_wait_for(io, &io->have_newcfg) != 0) goto stopped;
+    cfg_free(&io->cfg);
+    io->cfg = io->newcfg;
+    memset(&io->newcfg, 0, sizeof(io->newcfg));
+    io->have_cfg = true;
+    io->have_newcfg = false;
+    if (!driver_find(io->cfg.driver)) {
+        lg(LOG_ERR, "driver %s is not compiled into this loader (compiled in: %s)", io->cfg.driver, drvs);
+        status = EXIT_ERROR;
+        goto done;
+    }
+    if (kdb_enc_begin(&x.enc, KDB_T_INVENTORY_REQ) != 0 || kdb_enc_end(&x.enc) != 0 || send_enc(&x) != 0) goto stopped;
+    if (io_wait_for(io, &io->inv_end) != 0) goto stopped;
+    lg(LOG_INFO, "inventory received: %llu zone(s) at the Backend", (unsigned long long)io->inv_entries);
+
+    bool startup_done = false, retry_pending = false;
+    int64_t retry_at = 0;
+    unsigned backoff = 1;
+    bool need_load = true;                     /* the startup batch */
+    while (!g_stop) {
+        if (io->failed) {
+            status = EXIT_ERROR;
+            goto done;
+        }
+        if (io->eof) goto stopped;
+        if (io->have_newcfg) {                 /* a reload of karidns.conf: read again only if the sources changed */
+            bool diff = !cfg_load_equal(&io->cfg, &io->newcfg);
+            cfg_free(&io->cfg);
+            io->cfg = io->newcfg;
+            memset(&io->newcfg, 0, sizeof(io->newcfg));
+            io->have_newcfg = false;
+            if (diff) {
+                lg(LOG_NOTICE, "the database sources changed; reading everything again");
+                need_load = true;
+            }
+        }
+        if (io->reload_all) {
+            io->reload_all = false;
+            io->nreq = 0;
+            need_load = true;
+        }
+        if (retry_pending && now_ms() >= retry_at) {
+            retry_pending = false;
+            need_load = true;
+        }
+        if (need_load) {
+            need_load = false;
+            int rc = do_load(&x, io, startup_done ? KDB_BATCH_FULL : KDB_BATCH_STARTUP, -1, NULL);
+            if (rc < 0) {
+                if (g_stop) goto stopped;
+                status = EXIT_ERROR;
+                goto done;
+            }
+            if (rc == 0) {
+                startup_done = true;
+                backoff = 1;
+            } else {                           /* a database error: retry with backoff, do not crash (design 1.2) */
+                retry_pending = true;
+                retry_at = now_ms() + (int64_t)backoff * 1000;
+                lg(LOG_WARNING, "retrying in %u s", backoff);
+                if (backoff < 30) backoff *= 2;
+            }
+        }
+        for (size_t i = 0; i < io->nreq && !g_stop; i++) {
+            lreq_t r = io->req[i];
+            if (do_load(&x, io, KDB_BATCH_ZONE, r.view, r.zone) < 0) {
+                if (g_stop) goto stopped;
+                status = EXIT_ERROR;
+                goto done;
+            }
+        }
+        io->nreq = 0;
+        int timeout = 1000;
+        if (retry_pending) {
+            int64_t left = retry_at - now_ms();
+            if (left < 0) left = 0;
+            if (left < timeout) timeout = (int)left;
+        }
+        struct pollfd p = { io->fd, POLLIN, 0 };
+        int r = poll(&p, 1, timeout);
+        if (r < 0 && errno != EINTR) {
+            lg(LOG_ERR, "poll: %s", strerror(errno));
+            status = EXIT_ERROR;
+            goto done;
+        }
+        if (r > 0) io_pump(io);
+    }
+stopped:
+    if (g_stop) lg(LOG_NOTICE, "stopping on a signal");
+    else if (io->eof) lg(LOG_NOTICE, "the Backend closed the stream; exiting");
+    else if (io->failed) status = EXIT_ERROR;
+done:
+    ctx_view_reset(&x);
+    kdb_enc_free(&x.enc);
+    cfg_free(&io->cfg);
+    cfg_free(&io->newcfg);
+    free(body);
+    free(io);
+    return status;
+}
+
+static int stream_main(int fd) {
+    /* Check the stream before anything opens a descriptor of its own: openlog(LOG_NDELAY) takes the lowest free
+     * number, so with an unused fd the log socket itself would pass a later "is it a socket" test. The supervisor's
+     * stream is a SOCK_STREAM socketpair (design 1.2); the log socket is a datagram socket. */
+    struct stat st;
+    int stype = 0;
+    socklen_t slen = sizeof(stype);
+    if (fstat(fd, &st) != 0 || !S_ISSOCK(st.st_mode) ||
+        getsockopt(fd, SOL_SOCKET, SO_TYPE, &stype, &slen) != 0 || stype != SOCK_STREAM) {
+        fprintf(stderr, "karidns-dbloader: file descriptor %d is not a stream socket\n", fd);
+        return EXIT_USAGE;
+    }
+    g_stream_mode = true;
+    openlog("karidns-dbloader", LOG_PID | LOG_NDELAY | LOG_PERROR, LOG_DAEMON);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_term;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, NULL);          /* no SA_RESTART: a signal interrupts poll() / write() */
+    sigaction(SIGINT, &sa, NULL);
+    /* The supervisor starts us with these ignored, so that a "pkill -HUP karidns" cannot kill a loader that has not
+     * got here yet.  Reload requests come from the Backend as RELOAD_REQ, never as a signal. */
+    signal(SIGHUP, SIG_IGN);
+    signal(SIGUSR1, SIG_IGN);
+    signal(SIGUSR2, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) != 0) {
+        lg(LOG_ERR, "cannot set the stream non-blocking: %s", strerror(errno));
+        return EXIT_ERROR;
+    }
+    return run_stream(fd);
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -463,10 +1031,15 @@ static void usage(FILE *fp) {
         "usage:\n"
         "  karidns-dbloader --dump OUT --driver DRIVER --database-file PATH [options]\n"
         "  karidns-dbloader -s FD                    (stream mode; started by karidns, not by hand)\n"
+        "  karidns-dbloader --drivers                (print the compiled-in drivers, one per line)\n"
         "\n"
         "Dump mode writes the stream exactly as the loader sends it to the Backend: HELLO, BATCH_BEGIN (startup), per\n"
         "zone ZONE_BEGIN / ZONE_DATA... / ZONE_END (or ZONE_FAILED with the reason), BATCH_END.  Zones come in\n"
         "domains.id order, so two runs on the same database write the same bytes (the HELLO carries pid 0).\n"
+        "Stream mode (-s FD) is what karidns runs: FD is a socket to the Backend.  The loader sends HELLO, waits for the\n"
+        "CONFIG of the Backend (databases, limits), asks for the inventory, then sends one startup batch with every zone\n"
+        "of every view, and again on RELOAD_REQ or when the configuration names other sources.  It logs to syslog and\n"
+        "ends when the Backend closes the stream or on SIGTERM / SIGINT; SIGHUP is ignored.\n"
         "\n"
         "options:\n"
         "  --dump OUT          write the stream to the file OUT (\"-\" = standard output)\n"
@@ -511,6 +1084,7 @@ int main(int argc, char **argv) {
         { "schema", required_argument, NULL, 'S' },        { "view-index", required_argument, NULL, 'v' },
         { "zone", required_argument, NULL, 'z' },          { "default-ttl", required_argument, NULL, 't' },
         { "loader-threads", required_argument, NULL, 'j' }, { "version", no_argument, NULL, 'V' },
+        { "drivers", no_argument, NULL, 'L' },
         { "help", no_argument, NULL, 'h' },                { NULL, 0, NULL, 0 }
     };
     const char *dump = NULL, *driver = NULL, *dbfile = NULL, *conninfo = NULL, *schema = NULL, *zone = NULL;
@@ -544,6 +1118,9 @@ int main(int argc, char **argv) {
                 return EXIT_USAGE;
             }
             break;
+        case 'L':
+            for (size_t i = 0; k_drivers[i]; i++) printf("%s\n", k_drivers[i]->name);
+            return EXIT_OK;
         case 'V': printf("karidns-dbloader %s\n", KARIDNS_VERSION); return EXIT_OK;
         case 'h': usage(stdout); return EXIT_OK;
         default: usage(stderr); return EXIT_USAGE;
@@ -560,9 +1137,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "karidns-dbloader: -s needs a file descriptor number\n");
             return EXIT_USAGE;
         }
-        fprintf(stderr, "karidns-dbloader: stream mode (-s FD) is not implemented in this build (milestone B4a); "
-                        "use --dump OUT\n");
-        return EXIT_USAGE;
+        if (dump || driver || dbfile || conninfo || schema || zone) {
+            fprintf(stderr, "karidns-dbloader: -s cannot be combined with the dump options\n");
+            return EXIT_USAGE;
+        }
+        return stream_main((int)v);
     }
     if (!dump || !driver) {
         fprintf(stderr, "karidns-dbloader: --dump and --driver are required\n");

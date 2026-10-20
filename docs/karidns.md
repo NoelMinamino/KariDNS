@@ -380,6 +380,50 @@ The view name is at most 63 characters; a longer name is a configuration error. 
 
 A zone that appears in several views is a separate zone in each view: its own file, data, additional-section glue from the other zones of the same view, wire cache settings and `program` plugin. `karictl reload <zone> <view>` reloads one view's copy. If a reload changes a zone's `type` (for example `master` to `slave`), the zone is recreated with the new type.
 
+### `database { ... }` (in `options`) and the view database options
+
+Zones can come from a PowerDNS 5.1 database. The server never links a database library: it starts `karidns-dbloader` (the loader), which reads the database and sends the zones to the Backend over a socket (stream `KDB1`). The loader runs as `loader-user`, without access to this configuration file. In B4a the loader and the Backend run the protocol up to the zones; the zones are validated but not installed yet (every zone is answered "zone install not implemented yet (B4b)"), so the DB zones are not served.
+
+```
+options {
+    database {
+        driver sqlite3;
+        database-file "/var/db/karidns/zones.sqlite3";
+        loader-user "karidns-db";
+        loader-path "/usr/local/libexec/karidns-dbloader";
+    };
+};
+view "internal" { match-clients { 10.0.0.0/8; }; database-file "/var/db/karidns/internal.sqlite3"; };
+view "other"    { database none; };
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `driver <name>;` | required | `sqlite3` or `postgresql`. The loader must have been built with it (`karidns-dbloader --drivers`). Restart only. |
+| `database-file "<path>";` | | sqlite3: the database of the views without their own file. The file must be in WAL mode. An error with `postgresql`. |
+| `conninfo-file "<path>";` | | postgresql (required): the libpq conninfo. Mode 0600 or 0400, owned by `loader-user`. An error with `sqlite3`. |
+| `schema "<name>";` | | postgresql: the schema of the views without their own. An error with `sqlite3`. |
+| `loader-user "<user>";` `loader-group "<group>";` | none | Identity of the loader. `loader-user` is required when karidns starts as root (the loader never runs as root); started as another user, it must be that user. Restart only. |
+| `loader-path "<path>";` | `/usr/local/libexec/karidns-dbloader` | The loader binary: a regular executable owned by root (or by the running user when not root) and not writable by group or others; checked at the start and before every restart. Restart only. |
+| `acl-ceiling { ... };` | none | Upper bound for ACLs that come from the database (addresses and `key "name"`). Parsed and stored; enforced with milestone B7. |
+| `auto-reload yes;` | `no` | Reload when the database changes (milestone B9). |
+| `poll-interval <n>;` | `2` | Seconds, 1..60. |
+| `coalesce <ms>;` | `1000` | Milliseconds, 0..10000. |
+| `default-ttl <n>;` | `3600` | TTL for a `records.ttl` that is NULL, 1..2147483647. |
+| `bulk-threshold <percent>;` | `25` | 0..100. |
+| `max-zone-records <n>;` | `10000000` | Records of one zone, 2..4294967295. |
+| `max-zone-bytes <size>;` | `1G` | Bytes of one zone on the stream, 65535..64G (K, M, G suffixes). |
+| `db-reload-timeout <s>;` | `30` | 1..3600. |
+| `ingest-threads <n>;` `loader-threads <n>;` | `1` | 1..16 each. |
+| `server-id "<id>";` | none | postgresql multi-server status (milestone B11); a warning in `karicheck conf` with sqlite3. |
+| `alias-resolver { <ip>; ... };` | none | Parsed and stored (milestone B9a). |
+
+In a `view`: `database-file "<path>";` (sqlite3) or `database-schema "<name>";` (postgresql) gives the view its own source; `database none;` makes it take no DB zones. A view without these uses the global source. File paths and schema names may contain any valid UTF-8 and are used byte for byte (`%XX` is not decoded); invalid UTF-8 and control characters are configuration errors.
+
+Everything except `driver`, `loader-user`, `loader-group`, `loader-path` and the presence of the block reloads (`SIGHUP` / `karictl reload`): the Backend then sends the loader a CONFIG with the new generation. These four are logged as "take effect only after a restart".
+
+The supervisor starts the loader after the other processes. A loader exit is not fatal: it is restarted after 1, 2, 4 ... 60 s (back to 1 s after 10 minutes of uptime), with a new socket handed to the Backend. File zones keep answering meanwhile. `SIGHUP` to all processes (`pkill -HUP karidns`) does not affect the loader; it ends on `SIGTERM` with the other processes. The Backend treats everything from the loader as untrusted: a protocol violation is logged once, the stream is closed and the loader is restarted. `karicheck conf` checks the block without opening a database (driver in the loader, users, loader file, SQLite WAL and mode, conninfo-file).
+
 ### Address match lists (ACLs)
 
 `allow-transfer`, `allow-update`, `match-clients` and `ecs-trusted-resolvers` take a list of entries evaluated in order; the first matching entry decides. An entry is an IPv4/IPv6 address, a CIDR prefix, `any`, `none` (matches nothing) or the name of an `acl`; a leading `!` (or a nested `! { ... };` block) negates it. A client that matches no entry is denied. In `allow-transfer` and `allow-update`, `key "<name>";` adds a TSIG key; in `allow-update` the bare name of a defined key is accepted as well. Keys are not part of the in-order evaluation: in `allow-update` a client is accepted when its address matches **or** its request is signed with a listed key; in `allow-transfer` a list that has both addresses and keys requires a matching address **and** a listed key (unlike BIND, where `allow-transfer { key "k1"; 192.0.2.1; };` also accepts an unsigned request from 192.0.2.1). Write `allow-transfer` with keys only to accept signed requests from any address.

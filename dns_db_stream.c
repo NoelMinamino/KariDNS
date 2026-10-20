@@ -68,7 +68,8 @@ static const kdb_tspec_t sp_cfg_view[] = {
 TDEF(td_cfg_view, "CONFIG.VIEW", sp_cfg_view);
 static const kdb_tspec_t sp_config[] = {
     S(KT_U64, KS_REQ, 0), S(KT_STR, KS_REQ | KS_NE, 32), S(KT_STR, 0, 64),
-    { KT_NEST, 0, KDB_MAX_CONFIG_VIEWS, &td_cfg_view } };
+    { KT_NEST, 0, KDB_MAX_CONFIG_VIEWS, &td_cfg_view },
+    S(KT_U32, KS_MAXV, 2147483647u), S(KT_U8, KS_MAXV, 100), S(KT_U32, KS_MAXV, 16) };
 TDEF(td_config, "CONFIG", sp_config);
 static const kdb_tspec_t sp_reload_req[] = {
     S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 1), S(KT_U16, KS_VIEW, 0), S(KT_NAME, 0, 0), S(KT_U8, KS_REQ | KS_MAXV, 1) };
@@ -180,33 +181,7 @@ static bool name_ok(const uint8_t *p, size_t n) {
  * U+D800..U+DFFF, nothing above U+10FFFF) without control characters (C0, DEL, C1 U+0080..U+009F). The bytes are
  * used as they are: no decoding of '%XX', '\' or anything else, so "a%65.sqlite3" names that file literally (the
  * loader opens SQLite files without SQLITE_OPEN_URI). */
-static bool path_ok(const uint8_t *p, size_t n) {
-    size_t i = 0;
-    while (i < n) {
-        uint8_t c = p[i];
-        if (c < 0x80) {
-            if (c < 0x20 || c == 0x7F) return false;
-            i++;
-            continue;
-        }
-        uint32_t cp;
-        size_t k;
-        if (c >= 0xC2 && c <= 0xDF) { cp = c & 0x1Fu; k = 1; }
-        else if (c >= 0xE0 && c <= 0xEF) { cp = c & 0x0Fu; k = 2; }
-        else if (c >= 0xF0 && c <= 0xF4) { cp = c & 0x07u; k = 3; }
-        else return false;              /* continuation byte, 0xC0/0xC1 (overlong) or 0xF5.. */
-        if (k > n - i - 1) return false;   /* truncated sequence */
-        for (size_t j = 1; j <= k; j++) {
-            if ((p[i + j] & 0xC0) != 0x80) return false;
-            cp = (cp << 6) | (p[i + j] & 0x3Fu);
-        }
-        static const uint32_t min_cp[] = { 0, 0x80, 0x800, 0x10000 };
-        if (cp < min_cp[k] || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) || (cp >= 0x80 && cp <= 0x9F))
-            return false;
-        i += k + 1;
-    }
-    return true;
-}
+static bool path_ok(const uint8_t *p, size_t n) { return dns_path_is_valid_utf8(p, n); }
 
 static bool str_ok(const uint8_t *p, size_t n, bool text) {
     for (size_t i = 0; i < n; i++) {
@@ -386,6 +361,9 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         m->u.config.generation = V(1).u;
         m->u.config.driver = gstr(&V(2));
         m->u.config.server_id = gstr(&V(3));
+        m->u.config.default_ttl = V(5).present ? (uint32_t)V(5).u : 0;
+        m->u.config.bulk_threshold = V(6).present ? (int)V(6).u : -1;
+        m->u.config.loader_threads = V(7).present ? (uint32_t)V(7).u : 0;
         m->u.config.n_views = nrep;
         m->u.config.body = fr->body;
         m->u.config.body_len = fr->len;

@@ -103,6 +103,8 @@ jobs:
             sh ./tests/run_dnstap_capture_test.sh
             sh ./tests/run_karicheck_semantic_lint_test.sh
             sh ./tests/run_db_dump_test.sh
+            sh ./tests/run_karicheck_database_conf_test.sh
+            sh ./tests/run_dag_update_generic_rdata_test.sh
             sh ./tests/run_karictl_observatory_test.sh
             sh ./tests/run_axfr_multikey_tsig_test.sh
             sh ./tests/run_config_duplicate_rejection_test.sh

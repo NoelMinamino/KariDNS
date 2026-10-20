@@ -491,6 +491,108 @@ static void test_ecs_trusted_resolvers(void) {
 }
 
 /* ------------------------------------------------------------------------ */
+/* options { database { } } and the view database options (beta design 7.1, B4a) */
+static void test_database_block(void) {
+    printf("[TEST] database block and view database options...\n");
+    server_config_t cfg;
+    if (parse_ok("options { };" ZONE_MIN, &cfg)) {
+        CHECK(cfg.database.enabled == false);
+        free_server_config_fields(&cfg);
+    }
+
+    /* every option with a non-default value */
+    static const char *full =
+        "options { database { driver sqlite3; database-file \"/var/db/z.sqlite3\"; loader-user \"karidns-db\"; "
+        "loader-group \"karidns-db\"; loader-path \"/usr/local/libexec/karidns-dbloader\"; "
+        "acl-ceiling { 192.0.2.0/24; }; auto-reload yes; poll-interval 5; coalesce 250; default-ttl 600; "
+        "bulk-threshold 40; max-zone-records 5000; max-zone-bytes 64M; db-reload-timeout 45; ingest-threads 4; "
+        "loader-threads 8; server-id \"ns1\"; alias-resolver { 192.0.2.53; 2001:db8::53; }; }; };";
+    if (parse_ok(full, &cfg)) {
+        const database_config_t *d = &cfg.database;
+        CHECK(d->enabled);
+        CHECK_STR(d->driver, "sqlite3");
+        CHECK_STR(d->database_file, "/var/db/z.sqlite3");
+        CHECK_STR(d->loader_user, "karidns-db");
+        CHECK_STR(d->loader_group, "karidns-db");
+        CHECK_STR(db_loader_path(&cfg), "/usr/local/libexec/karidns-dbloader");
+        CHECK(d->acl_ceiling_count == 1 && d->acl_ceiling_parsed != NULL);
+        CHECK(d->auto_reload && d->poll_interval == 5 && d->coalesce_ms == 250 && d->default_ttl == 600);
+        CHECK(d->bulk_threshold == 40 && d->max_zone_records == 5000 && d->max_zone_bytes == 64ull << 20);
+        CHECK(d->db_reload_timeout == 45 && d->ingest_threads == 4 && d->loader_threads == 8);
+        CHECK_STR(d->server_id, "ns1");
+        CHECK(d->alias_resolver_count == 2);
+        free_server_config_fields(&cfg);
+    }
+    /* defaults */
+    if (parse_ok("options { database { driver sqlite3; database-file \"/x.db\"; }; };", &cfg)) {
+        const database_config_t *d = &cfg.database;
+        CHECK(!d->auto_reload && d->poll_interval == 2 && d->coalesce_ms == 1000 && d->default_ttl == 3600);
+        CHECK(d->bulk_threshold == 25 && d->max_zone_records == 10000000ull && d->max_zone_bytes == 1ull << 30);
+        CHECK(d->db_reload_timeout == 30 && d->ingest_threads == 1 && d->loader_threads == 1);
+        CHECK_STR(db_loader_path(&cfg), KARIDNS_DB_DEFAULT_LOADER_PATH);
+        free_server_config_fields(&cfg);
+    }
+#define DBP "options { database { driver sqlite3; database-file \"/x\"; "
+    /* ranges */
+    expect_reject("poll-interval 0", DBP "poll-interval 0; }; };");
+    expect_reject("poll-interval 61", DBP "poll-interval 61; }; };");
+    expect_reject("coalesce 10001", DBP "coalesce 10001; }; };");
+    expect_reject("default-ttl 0", DBP "default-ttl 0; }; };");
+    expect_reject("bulk-threshold 101", DBP "bulk-threshold 101; }; };");
+    expect_reject("ingest-threads 17", DBP "ingest-threads 17; }; };");
+    expect_reject("loader-threads 0", DBP "loader-threads 0; }; };");
+    expect_reject("max-zone-records 1", DBP "max-zone-records 1; }; };");
+    expect_reject("max-zone-bytes 100", DBP "max-zone-bytes 100; }; };");
+    expect_reject("max-zone-bytes junk", DBP "max-zone-bytes 1X; }; };");
+    expect_reject("db-reload-timeout 0", DBP "db-reload-timeout 0; }; };");
+    expect_reject("unknown option", DBP "bogus 1; }; };");
+    expect_reject("unknown driver", "options { database { driver mysql; }; };");
+    expect_reject("no driver", "options { database { database-file \"/x\"; }; };");
+    expect_reject("sqlite3 without database-file", "options { database { driver sqlite3; }; };");
+    expect_reject("alias-resolver not an address", DBP "alias-resolver { example.test; }; }; };");
+    expect_reject("acl-ceiling undefined key", DBP "acl-ceiling { key \"nokey\"; }; }; };");
+    expect_reject("block twice", DBP "}; database { driver sqlite3; database-file \"/x\"; }; };");
+
+    /* driver / option consistency (7.1) */
+    expect_reject("postgresql with database-file",
+                  "options { database { driver postgresql; conninfo-file \"/c\"; database-file \"/x\"; }; };");
+    expect_reject("postgresql without conninfo-file", "options { database { driver postgresql; }; };");
+    expect_reject("sqlite3 with schema", DBP "schema \"s\"; }; };");
+    expect_reject("sqlite3 with conninfo-file", DBP "conninfo-file \"/c\"; }; };");
+    expect_reject("view database-schema with sqlite3",
+                  DBP "}; }; view \"v\" { database-schema \"s\"; " ZONE_MIN " };");
+    expect_reject("view database-file with postgresql",
+                  "options { database { driver postgresql; conninfo-file \"/c\"; }; }; view \"v\" { database-file \"/y\"; " ZONE_MIN " };");
+    expect_reject("view database option without a block", "view \"v\" { database-file \"/y\"; " ZONE_MIN " };");
+    expect_reject("view database none and file",
+                  DBP "}; }; view \"v\" { database none; database-file \"/y\"; " ZONE_MIN " };");
+    expect_reject("view database junk", DBP "}; }; view \"v\" { database maybe; " ZONE_MIN " };");
+    if (parse_ok("options { database { driver sqlite3; }; }; view \"a\" { database-file \"/a.db\"; " ZONE_MIN
+                 " }; view \"b\" { database none; };", &cfg)) {
+        CHECK_STR(cfg.views->database_file, "/a.db");
+        CHECK(cfg.views->next && cfg.views->next->database_none);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { database { driver postgresql; conninfo-file \"/c\"; }; }; view \"a\" { "
+                 "database-schema \"pdns_a\"; " ZONE_MIN " };", &cfg)) {
+        CHECK_STR(cfg.views->database_schema, "pdns_a");
+        free_server_config_fields(&cfg);
+    }
+
+    /* paths: UTF-8 passes the lexer byte for byte (no %XX decoding), bad UTF-8 and control characters are errors */
+    if (parse_ok("options { database { driver sqlite3; database-file \"/var/db/\xe3\x82\xbe\xe3\x83\xbc\xe3\x83\xb3%41.db\"; }; };", &cfg)) {
+        CHECK_STR(cfg.database.database_file, "/var/db/\xe3\x82\xbe\xe3\x83\xbc\xe3\x83\xb3%41.db");
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("invalid UTF-8 (lone continuation byte)", "options { database { driver sqlite3; database-file \"/x\x80.db\"; }; };");
+    expect_reject("overlong UTF-8", "options { database { driver sqlite3; database-file \"/x\xc0\xaf.db\"; }; };");
+    expect_reject("UTF-8 surrogate", "options { database { driver sqlite3; database-file \"/x\xed\xa0\x80.db\"; }; };");
+    expect_reject("control character", "options { database { driver sqlite3; database-file \"/x\ty.db\"; }; };");
+    expect_reject("C1 control character", "options { database { driver sqlite3; database-file \"/x\xc2\x85y.db\"; }; };");
+    expect_reject("empty path", "options { database { driver sqlite3; database-file \"\"; }; };");
+#undef DBP
+}
+
 static void test_dnstap_block(void) {
     printf("[TEST] dnstap block (options-level and top-level)...\n");
     server_config_t cfg;
@@ -1688,6 +1790,7 @@ int main(void) {
     test_ecs_and_location_tags();
     test_ecs_trusted_resolvers();
     test_dnstap_block();
+    test_database_block();
     test_zone_types_and_files();
     test_zone_program_and_forward();
     test_zone_rate_limit();

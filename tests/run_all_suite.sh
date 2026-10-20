@@ -368,6 +368,8 @@ register_test "core" "sh" "tests/run_karicheck_deep_rules_test.sh" "karicheck st
 register_test "core" "sh" "tests/run_zone_parser_error_paths_test.sh" "Zone parser error paths, escape sequences & malformed directives"
 register_test "core" "sh" "tests/run_karictl_adversary_test.sh" "karictl command line argument validation and socket error resilience"
 register_test "core" "sh" "tests/run_db_dump_test.sh" "karidns-dbloader --dump of a SQLite3 database made by zone2sql equals the KDB1 encoding of the zone files, byte for byte (beta B3; SKIP without sqlite3 or the SQLite3 driver)"
+register_test "core" "sh" "tests/run_db_loader_lifecycle_test.sh" "karidns-dbloader under the supervisor: runs as loader-user on fd 3, HELLO/CONFIG/INVENTORY, restart with backoff after kill -9, SIGHUP/reload, fake loaders breaking the protocol, SIGTERM (beta B4a; root only, SKIP otherwise)"
+register_test "core" "sh" "tests/run_karicheck_database_conf_test.sh" "karicheck conf checks of the database block without a connection: loader/driver/users, SQLite WAL and mode, conninfo-file, UTF-8 paths (beta B4a)"
 
 # 11. Regression, Sanitizer & Concurrency Stress
 register_test "regression" "sh" "tests/run_sanitizer_smoke_test.sh" "ASan & UBSan runtime memory error smoke test"
@@ -426,6 +428,7 @@ register_test "dag" "sh" "tests/run_dag_udp_id_mismatch_discard_test.sh" "dag UD
 register_test "dag" "sh" "tests/run_dag_udp_spoofing_source_test.sh" "dag UDP spoofing source rejection per RFC 5452"
 register_test "dag" "sh" "tests/run_dag_update_del_exact_ttl_notype_crash_test.sh" "dag --update-del-exact TTL support regression test"
 register_test "dag" "sh" "tests/run_dag_update_del_no_type_test.sh" "dag --update-del type omission regression test"
+register_test "dag" "sh" "tests/run_dag_update_generic_rdata_test.sh" "dag --update-add / --update-del-exact / --prereq-yxrrset accept the RFC 3597 generic form (D16-2)"
 register_test "dag" "sh" "tests/run_dag_yaml_apostrophe_escaping_test.sh" "dag YAML single-quote / apostrophe escaping"
 register_test "dag" "sh" "tests/run_dag_yaml_cookie_status_test.sh" "dag YAML DNS cookie status verification"
 register_test "dag" "sh" "tests/run_dag_yaml_ede_escaping_test.sh" "dag YAML EDE double-quote escaping"

@@ -27,7 +27,7 @@
 #include "test_zone_slots.h"
 
 // Mock globals needed by server internal dependencies
-int g_control_kq = -1;
+_Atomic int g_control_kq = -1;
 int g_notify_ipc[2] = {-1, -1};
 int g_broker_sock = -1;
 config_rcu_t g_config_db;

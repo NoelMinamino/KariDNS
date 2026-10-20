@@ -46,6 +46,11 @@ int compare_canonical_name(const char *name1, const char *name2);
 bool serial_is_newer(uint32_t s1, uint32_t s2);
 const char *strchr_unescaped(const char *s, char c);
 
+/* File paths and schema names of the database configuration and of the KDB1 stream (beta design 7.1, 1.4): valid
+ * UTF-8 (RFC 3629 3/4: shortest form only, no surrogates U+D800..U+DFFF, nothing above U+10FFFF) without control
+ * characters (C0, DEL, C1 U+0080..U+009F).  The bytes are used as they are ('%XX' is not decoded). */
+bool dns_path_is_valid_utf8(const unsigned char *p, size_t n);
+
 static inline bool dns_char_is_escaped(const char *s, size_t pos) {
     size_t bs = 0;
     while (pos > bs && s[pos - bs - 1] == '\\') bs++;

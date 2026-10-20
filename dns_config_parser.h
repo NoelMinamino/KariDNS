@@ -245,8 +245,55 @@ typedef struct view_config {
   acl_entry_t *match_clients_parsed;
   zone_config_t *zones;
   zone_cfg_index_t zone_index; /* zones の索引。手で組んだ設定 (テスト) では空で、線形探索になる */
+  /* beta design 7.1: DB zone source of this view. NULL/false = the global source of options { database { } } */
+  char *database_file;         /* "database-file": sqlite3, this view's own file */
+  char *database_schema;       /* "database-schema": postgresql, this view's own schema */
+  bool database_none;          /* "database none;": this view takes no DB zones */
   struct view_config *next;
 } view_config_t;
+
+/* options { database { ... }; }  (beta design 7.1). enabled == false: the block is absent and the rest is zero.
+ * Paths and schema names are UTF-8 strings kept byte for byte (dns_path_is_valid_utf8()). */
+#define KARIDNS_DB_PATH_MAX 1023            /* same limit as the CONFIG path TLV (dns_db_stream.h) */
+#define KARIDNS_DB_DEFAULT_LOADER_PATH "/usr/local/libexec/karidns-dbloader"
+typedef struct {
+  bool enabled;
+  char *driver;                /* "sqlite3" | "postgresql" */
+  char *database_file;         /* sqlite3: source of the views without their own file */
+  char *conninfo_file;         /* postgresql */
+  char *schema;                /* postgresql: schema of the views without their own */
+  char *loader_user;           /* restart-only */
+  char *loader_group;          /* restart-only */
+  char *loader_path;           /* restart-only; NULL = KARIDNS_DB_DEFAULT_LOADER_PATH */
+  char **acl_ceiling;          /* stored only (enforced from B7): addresses, "!" negation like allow-transfer */
+  int acl_ceiling_count;
+  acl_entry_t *acl_ceiling_parsed;
+  char **acl_ceiling_keys;
+  int acl_ceiling_keys_count;
+  bool auto_reload;
+  uint32_t poll_interval;      /* seconds, 1..60 */
+  uint32_t coalesce_ms;        /* 0..10000 */
+  uint32_t default_ttl;        /* 1..2147483647 */
+  uint32_t bulk_threshold;     /* percent, 0..100 */
+  uint64_t max_zone_records;   /* 2..4294967295 */
+  uint64_t max_zone_bytes;     /* 65535..64G */
+  uint32_t db_reload_timeout;  /* seconds, 1..3600 */
+  uint32_t ingest_threads;     /* 1..16 */
+  uint32_t loader_threads;     /* 1..16 */
+  char *server_id;             /* postgresql only (B11) */
+  char **alias_resolver;       /* stored only (B9a): IP address literals */
+  int alias_resolver_count;
+} database_config_t;
+
+#define KARIDNS_DB_POLL_MIN 1
+#define KARIDNS_DB_POLL_MAX 60
+#define KARIDNS_DB_COALESCE_MAX 10000
+#define KARIDNS_DB_TTL_MAX 2147483647u
+#define KARIDNS_DB_RELOAD_TIMEOUT_MAX 3600
+#define KARIDNS_DB_THREADS_MAX 16
+#define KARIDNS_DB_MAX_ZONE_RECORDS_MAX 4294967295ull
+#define KARIDNS_DB_MAX_ZONE_BYTES_MIN 65535ull
+#define KARIDNS_DB_MAX_ZONE_BYTES_MAX (64ull << 30)
 
 /* D-22: トップレベルの acl "name" { ... }; 。要素は parse 時の文字列のまま持ち、
  * 設定全体を読んだ後に各 ACL の参照を展開する。key 要素は ACL_KEY_MARK を先頭に付けて区別する */
@@ -275,6 +322,7 @@ typedef struct server_config_s {
   logging_config_t logging;
   control_channel_config_t control;
   dnstap_config_t dnstap;
+  database_config_t database;  /* options { database { } }; .enabled == false when absent */
   rate_limit_config_t rrl;
   bool serve_stale;
   bool send_extended_errors;
@@ -320,6 +368,11 @@ typedef struct server_config_s {
   int location_tag_count;
   _Atomic int reader_count;
 } server_config_t;
+
+/* loader-path with its default */
+static inline const char *db_loader_path(const server_config_t *c) {
+  return c->database.loader_path ? c->database.loader_path : KARIDNS_DB_DEFAULT_LOADER_PATH;
+}
 
 #define MAX_INCLUDE_DEPTH 16
 

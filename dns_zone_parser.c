@@ -1485,84 +1485,29 @@ PROCESS_RECORD:
      * even number of hex digits (possibly split into several tokens) and its size MUST equal <length>. Anything
      * else used to be "repaired" silently (non-hex skipped, short data padded, long data cut off), which let a
      * malformed record be served as if it were valid (e.g. a 3-byte A record). */
-    const char *len_tok = rec->rdata[1];
-    size_t len_tok_len = strlen(len_tok);
-    if (len_tok_len == 0 || len_tok_len > 5 || strspn(len_tok, "0123456789") != len_tok_len) {
-      zone_generic_rdata_error(ctx, rec->type, buf, "Generic RDATA length (\\#) is not a decimal number");
+    /* One implementation with dag's UPDATE operands: dns_generic_rdata_parse() (length, hex, fixed sizes, and the
+     * D15-2 rule that the RDATA must be valid for the type). */
+    uint8_t *tmp = (uint8_t *)malloc(65535);
+    if (!tmp) {
+      zone_generic_rdata_error(ctx, rec->type, buf, "Out of memory");
       return -1;
     }
-    long declared_len = atol(len_tok);
-    if (declared_len < 0 || declared_len > 65535) {
-      zone_generic_rdata_error(ctx, rec->type, buf, "Generic RDATA length (\\#) out of range (0-65535)");
+    size_t glen = 0;
+    const char *gwhy = dns_generic_rdata_parse(rec->type_code, rec->rdata, rec->rdata_count, tmp, &glen);
+    if (gwhy) {
+      free(tmp);
+      zone_generic_rdata_error(ctx, rec->type, buf, gwhy);
       return -1;
     }
-    size_t nibbles = 0;
-    for (int j = 2; j < rec->rdata_count; j++) {
-      for (const char *h = rec->rdata[j]; *h; h++) {
-        if (hex_char_to_val(*h) < 0) {
-          zone_generic_rdata_error(ctx, rec->type, buf, "Generic RDATA (\\#) contains a non-hexadecimal character");
-          return -1;
-        }
-        nibbles++;
-      }
-    }
-    if ((nibbles & 1) != 0) {
-      zone_generic_rdata_error(ctx, rec->type, buf, "Generic RDATA (\\#) has an odd number of hex digits");
-      return -1;
-    }
-    if (nibbles / 2 != (size_t)declared_len) {
-      zone_generic_rdata_error(ctx, rec->type, buf, "Generic RDATA (\\#) length does not match the declared length");
-      return -1;
-    }
-    /* Types whose RDATA has a fixed size must not be given in a different size, even in generic form. */
-    {
-      int fixed = -1;
-      switch (rec->type_code) {
-        case 1:   fixed = 4;  break;   /* A */
-        case 28:  fixed = 16; break;   /* AAAA */
-        case 108: fixed = 6;  break;   /* EUI48 */
-        case 109: fixed = 8;  break;   /* EUI64 */
-        case 105: fixed = 6;  break;   /* L32 */
-        case 104: fixed = 10; break;   /* NID */
-        case 106: fixed = 10; break;   /* L64 */
-        default: break;
-      }
-      if (fixed >= 0 && declared_len != fixed) {
-        zone_generic_rdata_error(ctx, rec->type, buf, "Generic RDATA (\\#) has the wrong length for this fixed-size record type");
-        return -1;
-      }
-    }
-    rec->generic_len = (uint16_t)declared_len;
-    if (rec->generic_len > 0) {
-      uint8_t *blob = (uint8_t *)arena_alloc(arena, rec->generic_len);
-      if (blob) {
-        size_t b_idx = 0;
-        int high_nibble = -1;
-        for (int j = 2; j < rec->rdata_count; j++) {
-          for (char *h = rec->rdata[j]; *h; h++) {
-            int val = hex_char_to_val(*h);
-            if (high_nibble < 0)
-              high_nibble = val;
-            else {
-              blob[b_idx++] = (uint8_t)((high_nibble << 4) | val);
-              high_nibble = -1;
-            }
-          }
-        }
-        rec->generic_data = blob;
-      }
+    rec->generic_len = (uint16_t)glen;
+    if (glen > 0) {
+      uint8_t *blob = (uint8_t *)arena_alloc(arena, glen);
+      if (blob) memcpy(blob, tmp, glen);
+      rec->generic_data = blob;
     } else {
       rec->generic_data = (uint8_t *)"";
     }
-    /* D15-2, RFC 3597 section 5: the RDATA must be valid for the type.  "PTR \# 0" and "NS \# 3 010203" used to be
-     * kept as they were and served as raw octets, which the wire decoder of a secondary refuses. */
-    if (rec->generic_data) {
-      const char *why = dns_generic_rdata_check(rec->type_code, rec->generic_data, rec->generic_len);
-      if (why) {
-        zone_generic_rdata_error(ctx, rec->type, buf, why);
-        return -1;
-      }
-    }
+    free(tmp);
   } else if (rec->type) {
     if (rec->type_code == 5 || rec->type_code == 12 || rec->type_code == 2 ||
         rec->type_code == 39 || rec->type_code == 23 || 

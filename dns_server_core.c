@@ -59,6 +59,8 @@
 #include "dns_axfr_ixfr.h"
 #include "dns_query_engine.h"
 #include "dns_snapshot_rcu.h"
+#include "dns_db_supervisor.h"
+#include "dns_db_ingest.h"
 
 // karidns
 // Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)
@@ -103,7 +105,8 @@ bool config_standby_reap(bool wait) {
   g_config_db.standby_freed++;
   return true;
 }
-int g_control_kq = -1;
+/* written once by the control thread (release); the workers and transfer threads read it (acquire) */
+_Atomic int g_control_kq = -1;
 int g_cwd_fd = -1;
 STATIC_TEST const char *g_config_path = NULL;
 static int g_cli_port_override = 0;
@@ -2688,6 +2691,16 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
     append_list_item(buf, sz, "control-channel socket");
   if (o->dnstap.enabled != n->dnstap.enabled || str_differs(o->dnstap.socket_path, n->dnstap.socket_path))
     append_list_item(buf, sz, "dnstap socket");
+  /* beta design 7.1: the loader is started once by the supervisor, so adding or removing the database block and
+   * these four options take effect only after a restart (everything else in the block reloads) */
+  if (o->database.enabled != n->database.enabled) {
+    append_list_item(buf, sz, "database block");
+  } else if (o->database.enabled) {
+    if (str_differs(o->database.driver, n->database.driver)) append_list_item(buf, sz, "database driver");
+    if (str_differs(o->database.loader_user, n->database.loader_user)) append_list_item(buf, sz, "database loader-user");
+    if (str_differs(o->database.loader_group, n->database.loader_group)) append_list_item(buf, sz, "database loader-group");
+    if (str_differs(db_loader_path(o), db_loader_path(n))) append_list_item(buf, sz, "database loader-path");
+  }
 }
 
 STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged) {
@@ -2758,6 +2771,7 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
   g_config_db.retire_epoch = rcu_writer_publish(&g_config_db.active, standby);
   g_config_db.standby_pending = true; /* 退いた設定 (旧 active) は猶予期間の後で config_standby_reap() が解放する */
   g_last_configured_time = time(NULL);
+  db_ingest_config_changed(); /* beta design 4.5: the loader gets a CONFIG with the new generation */
   // dnstap の接続先は起動時のみだが、出力するメッセージ種別はリロードで反映できる
   if (standby->dnstap.enabled) {
     dnstap_set_message_types(standby->dnstap.log_auth_query, standby->dnstap.log_auth_response);
@@ -2877,7 +2891,7 @@ void *control_thread_func(void *arg) {
   int kq = kqueue();
   if (kq < 0)
     pthread_exit(NULL);
-  g_control_kq = kq;
+  atomic_store_explicit(&g_control_kq, kq, memory_order_release);
   struct kevent ev_set[5];
   EV_SET(&ev_set[0], SIGHUP, EVFILT_SIGNAL, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev_set[1], 1, EVFILT_TIMER, EV_ADD | EV_CLEAR, 0, 1000, NULL);
@@ -2985,7 +2999,7 @@ void *control_thread_func(void *arg) {
           
           struct kevent ev_c;
           EV_SET(&ev_c, cfd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void*)1);
-          kevent(g_control_kq, &ev_c, 1, NULL, 0, NULL);
+          kevent(kq, &ev_c, 1, NULL, 0, NULL);
           
           uint8_t rand_bytes[32];
           arc4random_buf(rand_bytes, 32);
@@ -4400,6 +4414,11 @@ STATIC_TEST void supervisor_sig_handler(int sig) {
   }
 }
 
+/* SIGCHLD only has to interrupt the supervisor's ppoll(); the children are collected with waitpid() */
+STATIC_TEST void supervisor_sigchld_handler(int sig) {
+  (void)sig;
+}
+
 STATIC_TEST void cleanup_pid_file(void) {
   if (g_supervisor_pid != 0 && getpid() == g_supervisor_pid) {
     if (g_pid_fd >= 0) {
@@ -4882,6 +4901,19 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // beta design 1.2: loader-user / loader-group and loader-path are checked once, here, where stderr still
+  // reaches the terminal.  Without a database block dbsup.enabled is false and nothing below touches it.
+  db_sup_t dbsup;
+  {
+    char db_err[512];
+    if (!db_sup_init(&dbsup, &g_config_db.config_a, db_err, sizeof(db_err))) {
+      syslog(LOG_ERR, "[Config] Refusing to start: %s", db_err);
+      fprintf(stderr, "[ERROR] Refusing to start: %s\n", db_err);
+      free_server_config_fields(&g_config_db.config_a);
+      return 1;
+    }
+  }
+
   // ログファイルを開く (開けなければ起動しない)。fd は daemonize() 後も引き継がれる。
   // 実行ユーザーへの所有者の引き渡しは pid file / 制御ソケットのディレクトリ検証の
   // 後 (hand_off_logging_channels) に行う。
@@ -5089,6 +5121,17 @@ int main(int argc, char **argv) {
   // ログと同じディレクトリに置いた pid file 等の検証が「root所有でない」として失敗する。
   hand_off_logging_channels(&g_config_db.config_a);
 
+  // beta design 1.2 step 2: the loader sockets exist before the Backend is forked
+  {
+    char db_err[512];
+    if (!db_sup_open_pairs(&dbsup, db_err, sizeof(db_err))) {
+      syslog(LOG_CRIT, "[Startup] %s", db_err);
+      if (g_broker_pid > 0) kill(g_broker_pid, SIGTERM);
+      cleanup_pid_file();
+      exit(1);
+    }
+  }
+
   pid_t backend_pid = fork();
   if (backend_pid < 0) {
     syslog(LOG_CRIT, "fork for backend process failed: %m");
@@ -5099,6 +5142,7 @@ int main(int argc, char **argv) {
 
   if (backend_pid > 0) {
     // === Parent Process (Process Manager / Supervisor) ===
+    db_sup_after_fork_supervisor(&dbsup); // the Backend's ends of the loader sockets belong to the Backend
     sigset_t unblock_set;
     sigemptyset(&unblock_set);
     sigaddset(&unblock_set, SIGHUP);
@@ -5135,6 +5179,7 @@ int main(int argc, char **argv) {
           close(g_broker_sock);
           g_broker_sock = -1;
         }
+        db_sup_close_supervisor_ends(&dbsup);
         run_frontend_router(backend_pid, r);
         exit(0);
       }
@@ -5161,7 +5206,29 @@ int main(int argc, char **argv) {
       g_broker_sock = -1;
     }
 
-    // 子プロセスの死活監視ループ (いずれかの子プロセスが終了した場合は全子プロセスを停止)
+    // beta design 1.2 step 4: the loader is started last, when the Backend and the routers exist
+    if (dbsup.enabled) db_sup_spawn(&dbsup);
+    // The wait below is a ppoll() with the signals unblocked only while it sleeps, so that a signal cannot slip in
+    // between the flag checks and the sleep.  SIGCHLD's default action is to ignore it, which would not interrupt
+    // the sleep: give it a handler that does nothing.
+    {
+      struct sigaction ca;
+      memset(&ca, 0, sizeof(ca));
+      ca.sa_handler = supervisor_sigchld_handler;
+      sigemptyset(&ca.sa_mask);
+      ca.sa_flags = SA_NOCLDSTOP;
+      sigaction(SIGCHLD, &ca, NULL);
+    }
+    sigset_t loop_block, loop_orig;
+    sigemptyset(&loop_block);
+    sigaddset(&loop_block, SIGCHLD);
+    sigaddset(&loop_block, SIGTERM);
+    sigaddset(&loop_block, SIGINT);
+    sigaddset(&loop_block, SIGHUP);
+    sigprocmask(SIG_BLOCK, &loop_block, &loop_orig);
+
+    // 子プロセスの死活監視ループ (いずれかの子プロセスが終了した場合は全子プロセスを停止。
+    // ただし karidns-dbloader の終了は致命的ではなく、待ち時間を置いて起動し直す)
     pid_t dead = 0;
     int child_exit_code = 0;
     while (!g_supervisor_should_exit) {
@@ -5171,8 +5238,11 @@ int main(int argc, char **argv) {
         kill(backend_pid, SIGHUP);
       }
       int status;
-      dead = wait(&status);
-      if (dead > 0) {
+      pid_t w;
+      bool child_died = false;
+      while ((w = waitpid(-1, &status, WNOHANG)) > 0) {
+        if (db_sup_child_exited(&dbsup, w, status)) continue;
+        dead = w;
         if (WIFEXITED(status)) {
           int code = WEXITSTATUS(status);
           if (code != 0) child_exit_code = code;
@@ -5184,15 +5254,21 @@ int main(int argc, char **argv) {
         } else {
           child_exit_code = 1;
         }
+        child_died = true;
         break;
       }
-      if (dead < 0 && errno == ECHILD) {
+      if (child_died) break;
+      if (w < 0 && errno == ECHILD) {
         break;
       }
-      if (dead < 0 && errno == EINTR) {
-        continue;
-      }
+      db_sup_tick(&dbsup);
+      struct timespec nap;
+      int nap_ms = db_sup_timeout_ms(&dbsup);
+      nap.tv_sec = nap_ms / 1000;
+      nap.tv_nsec = (long)(nap_ms % 1000) * 1000000L;
+      ppoll(NULL, 0, nap_ms >= 0 ? &nap : NULL, &loop_orig);
     }
+    sigprocmask(SIG_SETMASK, &loop_orig, NULL);
     if (g_supervisor_should_exit && dead <= 0) {
       syslog(LOG_INFO, "[Manager] Received termination signal. Shutting down children.");
     }
@@ -5203,9 +5279,33 @@ int main(int argc, char **argv) {
     if (g_broker_pid > 0) {
       kill(g_broker_pid, SIGTERM);
     }
+    db_sup_signal(&dbsup, SIGTERM);
+    int64_t loader_kill_ms = 0; // a loader that does not end on SIGTERM (stuck in a database call) is killed after 10 s
     while (1) {
       int status;
-      pid_t w = wait(&status);
+      pid_t w;
+      if (dbsup.enabled && dbsup.pid > 0) {
+        w = waitpid(-1, &status, WNOHANG);
+        if (w == 0) {
+          struct timespec now_ts;
+          clock_gettime(CLOCK_MONOTONIC, &now_ts);
+          int64_t now_ms = (int64_t)now_ts.tv_sec * 1000 + now_ts.tv_nsec / 1000000;
+          if (loader_kill_ms == 0) loader_kill_ms = now_ms + 10000;
+          else if (now_ms >= loader_kill_ms) {
+            syslog(LOG_WARNING, "[Manager] Database loader (pid %d) did not stop; killing it", (int)dbsup.pid);
+            db_sup_signal(&dbsup, SIGKILL);
+            loader_kill_ms = now_ms + 3600 * 1000;
+          }
+          usleep(20000);
+          continue;
+        }
+      } else {
+        w = wait(&status);
+      }
+      if (w > 0 && dbsup.enabled && w == dbsup.pid) {
+        dbsup.pid = 0; // the loader's own status does not decide the exit code of the server
+        continue;
+      }
       if (w > 0) {
         if (WIFEXITED(status)) {
           int code = WEXITSTATUS(status);
@@ -5242,6 +5342,7 @@ int main(int argc, char **argv) {
     close(g_pid_fd);
     g_pid_fd = -1;
   }
+  db_sup_close_supervisor_ends(&dbsup); // the loader sockets: the Backend keeps only its own ends
 
   // 指示2: Backendプロセス側もFrontend用端点を直ちにclose
   for (int f = 0; f < g_num_frontend_routers; f++) {
@@ -5405,7 +5506,15 @@ int main(int argc, char **argv) {
   }
   /* 送信スレッドは終了時 (dnstap_shutdown) に自分で戻る。誰も join しない */
   pthread_detach(dnstap_sender_thread);
-  
+
+  // beta design 1.3 / 1.5: the db ingest thread.  It limits the rights of the two descriptors the supervisor made
+  // (stream, control) and uses only them (read / write / recvmsg / kevent) once the sandbox is on.
+  if (cfg->database.enabled && !db_ingest_start(g_db_stream_fd, g_db_ctrl_fd)) {
+    syslog(LOG_ERR, "[Backend] Cannot start the database ingest thread; aborting startup");
+    fprintf(stderr, "[ERROR] [Backend] Cannot start the database ingest thread; aborting startup\n");
+    backend_exit(EXIT_FAILURE);
+  }
+
   enter_capsicum_sandbox(); // サンドボックス突入
 
   // 特権分離(setuid+Capsicum)が完了したため、各Workerスレッドにクエリ処理の開始を許可する

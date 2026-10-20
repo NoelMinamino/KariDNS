@@ -2882,6 +2882,52 @@ static void test_wire_unpack_rr_all_types_underflow_matrix(void) {
            sizeof(underflows)/sizeof(underflows[0]));
 }
 
+/* D16-1 (RFC 1035 3.3.14): a character-string may hold a NUL octet.  AXFR/IXFR-in kept TXT as C strings, which stop
+ * at the NUL; such an RR is now kept as its RDATA octets.  Also D16-2: dns_generic_rdata_parse(). */
+static void test_char_string_nul(void) {
+    printf("[TEST] character-strings with a NUL octet (D16-1) and the generic form parser (D16-2)...\n");
+    zone_arena_t a;
+    zone_arena_init(&a);
+    /* ". TXT IN ttl 60, RDLENGTH 4: 03 'a' 00 'b' */
+    static const uint8_t txt[] = { 0, 0, 16, 0, 1, 0, 0, 0, 60, 0, 4, 3, 'a', 0, 'b' };
+    dns_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    size_t off = 0;
+    uint16_t t = 0;
+    CHECK(parse_resource_record(txt, sizeof(txt), &off, &a, &rec, &t) == 0 && off == sizeof(txt));
+    CHECK(rec.generic_data != NULL && rec.generic_len == 4 && memcmp(rec.generic_data, "\x03" "a\0b", 4) == 0);
+    uint8_t out[128];
+    uint16_t olen = 0;
+    CHECK(serialize_dns_record(out, sizeof(out), &olen, &rec, NULL, ".", 0xFFFFFFFF) == 0);
+    CHECK(olen == sizeof(txt) && memcmp(out, txt, sizeof(txt)) == 0);   /* the same octets back */
+    /* a TXT without NUL keeps its text form */
+    static const uint8_t plain[] = { 0, 0, 16, 0, 1, 0, 0, 0, 60, 0, 4, 3, 'a', 'b', 'c' };
+    memset(&rec, 0, sizeof(rec));
+    off = 0;
+    CHECK(parse_resource_record(plain, sizeof(plain), &off, &a, &rec, &t) == 0);
+    CHECK(rec.generic_data == NULL && rec.rdata_count == 1 && strcmp(rec.rdata[0], "abc") == 0);
+    /* NAPTR: flags "a\0", services "", regexp "", replacement "." */
+    static const uint8_t naptr[] = { 0, 0, 35, 0, 1, 0, 0, 0, 60, 0, 10, 0, 1, 0, 2, 2, 'a', 0, 0, 0, 0 };
+    memset(&rec, 0, sizeof(rec));
+    off = 0;
+    CHECK(parse_resource_record(naptr, sizeof(naptr), &off, &a, &rec, &t) == 0);
+    CHECK(rec.generic_data != NULL && rec.generic_len == 10);
+    /* the generic-form check accepts it, and TXT "\# 4 03610062" */
+    static const uint8_t g[] = { 3, 'a', 0, 'b' };
+    CHECK(dns_generic_rdata_check(16, g, sizeof(g)) == NULL);
+    /* generic form parser */
+    char *tok[] = { (char *)"\\#", (char *)"4", (char *)"0361", (char *)"0062" };
+    uint8_t blob[65535];
+    size_t blen = 0;
+    CHECK(dns_generic_rdata_parse(16, tok, 4, blob, &blen) == NULL && blen == 4 && memcmp(blob, g, 4) == 0);
+    char *t0[] = { (char *)"\\#", (char *)"0" };
+    CHECK(dns_generic_rdata_parse(65534, t0, 2, blob, &blen) == NULL && blen == 0);
+    CHECK(dns_generic_rdata_parse(12, t0, 2, blob, &blen) != NULL);      /* PTR \# 0 is not valid RDATA */
+    char *tb[] = { (char *)"\\#", (char *)"3", (char *)"0102" };
+    CHECK(dns_generic_rdata_parse(65534, tb, 3, blob, &blen) != NULL);   /* length mismatch */
+    zone_arena_destroy(&a);
+}
+
 int main(void) {
     printf("=== Starting Wire / Utility Helper Tests ===\n");
     test_wire_compression_and_rdata_boundaries();
@@ -3064,6 +3110,7 @@ int main(void) {
     test_name_zone_parser_normalizes();
     test_name_tinydns_normalizes();
     test_serialize_exact_fit_base64();
+    test_char_string_nul();
     printf("[*] Final checks: %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) {
         printf("=== Wire / Utility Helper Tests FAILED ===\n");

@@ -75,6 +75,7 @@ for z in n1 n2 n3 s; do zone "$W/$z.test.zone" "$z.test" 1; done
 zone "$W/k.test.zone" k.test 1
 zone "$W/m1.test.zone" m1.test 1
 zone "$W/d.test.zone" d.test 1 'empty IN TYPE65534 \# 0
+nulltxt IN TXT \# 4 03610062
 '   # D15-1: an RR of an unknown type with zero-length RDATA (RFC 3597 5)
 printf '$TTL 300\n@ IN SOA ns1.cat.test. hostmaster.cat.test. 1 3600 600 86400 60\n@ IN NS invalid.\nversion IN TXT "2"\nabc.zones IN PTR m1.test.\n' > "$W/cat.test.zone"
 zone "$W/x2.test.zone" x2.test 5   # the secondary's initial copy, so its first refresh asks IXFR
@@ -268,11 +269,18 @@ s_empty=$(dtype $PK empty.d.test)
 if [ -n "$p_empty" ] && [ "$p_empty" = "$s_empty" ]; then
     pass "D15-1: AXFR carries a zero-length RDATA record to the secondary (both answer '$s_empty')"
 else fail "D15-1: empty.d.test TYPE65534: primary '$p_empty', secondary '$s_empty'"; fi
+# D16-1: a TXT string with a NUL octet (RFC 1035 3.3.14) crosses AXFR/IXFR unchanged
+p_nul=$("$DAG" @127.0.0.1 -p $PP nulltxt.d.test TXT +short +nohexdump 2>&1)
+s_nul=$("$DAG" @127.0.0.1 -p $PK nulltxt.d.test TXT +short +nohexdump 2>&1)
+if [ -n "$p_nul" ] && [ "$p_nul" = "$s_nul" ] && [ "$s_nul" = '"a\000b"' ]; then
+    pass "D16-1: AXFR carries TXT with a NUL octet (both answer $s_nul)"
+else fail "D16-1: nulltxt.d.test TXT: primary '$p_nul', secondary '$s_nul'"; fi
 case $("$DAG" @127.0.0.1 -p $PK empty.d.test TYPE65534 +nohexdump 2>&1) in
     *"status: NOERROR"*) pass "D15-1: the secondary answers NOERROR, not NXDOMAIN";;
     *) fail "D15-1: the secondary does not answer NOERROR for the empty record";; esac
 # a new empty record by reload (serial 2): NOTIFY -> IXFR
 zone "$W/d.test.zone" d.test 2 'empty IN TYPE65534 \# 0
+nulltxt IN TXT \# 4 03610062
 new0 IN TYPE65534 \# 0
 new1 IN A 192.0.2.99
 '
@@ -286,6 +294,7 @@ if [ -n "$p_new0" ] && [ "$p_new0" = "$s_new0" ] && [ "$(d_transfers)" = "AXFR=1
 else fail "D15-1: new0.d.test after IXFR: primary '$p_new0', secondary '$s_new0' ($(d_transfers))"; fi
 # serial 3 removes it again: the deleted RR in the IXFR is an empty blob
 zone "$W/d.test.zone" d.test 3 'empty IN TYPE65534 \# 0
+nulltxt IN TXT \# 4 03610062
 new1 IN A 192.0.2.99
 '
 $CP reload d.test >/dev/null

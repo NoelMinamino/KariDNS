@@ -164,7 +164,9 @@ expect 2 "--dump without --driver" "$LOADER" --dump "$T/x.kdb"
 expect 2 "unknown driver" "$LOADER" --dump "$T/x.kdb" --driver mysql --database-file "$T/z.db"
 expect 2 "postgresql is not built yet" "$LOADER" --dump "$T/x.kdb" --driver postgresql --database-file "$T/z.db"
 expect 2 "sqlite3 without --database-file" "$LOADER" --dump "$T/x.kdb" --driver sqlite3
-expect 2 "stream mode is not implemented" "$LOADER" -s 3
+expect 2 "-s with a descriptor that is not open" "$LOADER" -s 9 9>&-
+expect 2 "-s with a file instead of a stream socket" "$LOADER" -s 9 9<"$T/z.db"
+expect 2 "-s with a number that is not a descriptor number" "$LOADER" -s x
 expect 2 "bad --view-index" "$LOADER" --dump "$T/x.kdb" --driver sqlite3 --database-file "$T/z.db" --view-index 70000
 expect 2 "bad --default-ttl" "$LOADER" --dump "$T/x.kdb" --driver sqlite3 --database-file "$T/z.db" --default-ttl 0
 expect 2 "bad --loader-threads" "$LOADER" --dump "$T/x.kdb" --driver sqlite3 --database-file "$T/z.db" --loader-threads 17

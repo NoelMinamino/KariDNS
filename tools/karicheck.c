@@ -13,6 +13,10 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <limits.h>
+#include <pwd.h>
+#include <grp.h>
+#include <sys/wait.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -1724,6 +1728,193 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     return 0;
 }
 
+/* The drivers the loader at `path` was built with (`karidns-dbloader --drivers`, one name per line), run without a
+ * shell.  false: it could not be run or did not succeed. */
+KARIDNS_TOOL_FN bool kc_loader_drivers(const char *path, char *out, size_t cap) {
+    int fds[2];
+    out[0] = '\0';
+    if (pipe(fds) != 0) return false;
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return false;
+    }
+    if (pid == 0) {
+        int dn = open("/dev/null", O_RDWR);
+        if (dn >= 0) {
+            dup2(dn, 0);
+            dup2(dn, 2);
+        }
+        dup2(fds[1], 1);
+        close(fds[0]);
+        close(fds[1]);
+        execl(path, "karidns-dbloader", "--drivers", (char *)NULL);
+        _exit(127);
+    }
+    close(fds[1]);
+    size_t n = 0;
+    ssize_t r;
+    while ((r = read(fds[0], out + n, cap - 1 - n)) > 0 && (n += (size_t)r) < cap - 1) {}
+    out[n] = '\0';
+    close(fds[0]);
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+/* is `name` one of the lines of `list`? */
+KARIDNS_TOOL_FN bool kc_line_listed(const char *list, const char *name) {
+    size_t nl = strlen(name);
+    for (const char *p = list; *p;) {
+        const char *e = strchr(p, '\n');
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        if (l == nl && strncmp(p, name, nl) == 0) return true;
+        p += l + (e ? 1 : 0);
+    }
+    return false;
+}
+
+/* An SQLite3 database file: it must exist, be in WAL mode (bytes 18 and 19 of the header are 2: file format
+ * write / read version, https://www.sqlite.org/fileformat2.html), not be readable by others, and not sit in a
+ * directory others can write to. */
+KARIDNS_TOOL_FN void kc_check_sqlite_file(kc_tally_t *t, const char *what, const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        kc_error(t, "%s: database file '%s': %s\n", what, path, strerror(errno));
+        return;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        kc_error(t, "%s: database file '%s' is not a regular file\n", what, path);
+        return;
+    }
+    if (st.st_mode & S_IROTH)
+        kc_warning(t, "%s: database file '%s' is readable by everyone (mode %04o); the zone data should be private\n",
+                   what, path, (unsigned)(st.st_mode & 07777));
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) *(slash == dir ? slash + 1 : slash) = '\0';
+    else snprintf(dir, sizeof(dir), ".");
+    struct stat ds;
+    if (stat(dir, &ds) == 0 && (ds.st_mode & S_IWOTH) && !(ds.st_mode & S_ISVTX))
+        kc_warning(t, "%s: the directory '%s' of the database file is writable by everyone\n", what, dir);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        kc_warning(t, "%s: cannot read '%s' to check its journal mode: %s (run karicheck as the loader user to check it)\n",
+                   what, path, strerror(errno));
+        return;
+    }
+    unsigned char h[100];
+    ssize_t n = read(fd, h, sizeof(h));
+    close(fd);
+    if (n < 20 || memcmp(h, "SQLite format 3\0", 16) != 0) {
+        if (n == 0)
+            kc_error(t, "%s: database file '%s' is empty; create the PowerDNS schema first\n", what, path);
+        else
+            kc_error(t, "%s: '%s' is not an SQLite3 database\n", what, path);
+        return;
+    }
+    if (h[18] != 2 || h[19] != 2)
+        kc_error(t, "%s: database file '%s' is not in WAL mode (run: sqlite3 '%s' 'PRAGMA journal_mode=WAL;')\n", what,
+                 path, path);
+}
+
+/* beta design 7.2: the checks of options { database { } } that need no connection.  `karicheck db` (B12) reads the
+ * data.  Returns the number of errors. */
+KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
+    const database_config_t *db = &cfg->database;
+    if (!db->enabled) return 0;
+    kc_tally_t t = {0, 0};
+    bool sqlite = db->driver && strcmp(db->driver, "sqlite3") == 0;
+
+    /* loader-user / loader-group */
+    uid_t loader_uid = (uid_t)-1;
+    bool have_uid = false;
+    if (db->loader_user) {
+        struct passwd *pw = getpwnam(db->loader_user);
+        if (!pw) kc_error(&t, "database loader-user '%s' does not exist\n", db->loader_user);
+        else { loader_uid = pw->pw_uid; have_uid = true; }
+    } else {
+        kc_warning(&t, "database: no loader-user; karidns refuses to start as root without one\n");
+    }
+    if (db->loader_group && !getgrnam(db->loader_group))
+        kc_error(&t, "database loader-group '%s' does not exist\n", db->loader_group);
+
+    /* loader-path: exists, root-owned, not group / world writable; and it has the driver */
+    const char *lp = db_loader_path(cfg);
+    struct stat st;
+    bool loader_ok = false;
+    if (stat(lp, &st) != 0) {
+        kc_error(&t, "database loader '%s': %s\n", lp, strerror(errno));
+    } else if (!S_ISREG(st.st_mode)) {
+        kc_error(&t, "database loader '%s' is not a regular file\n", lp);
+    } else {
+        loader_ok = true;
+        if (st.st_uid != 0)
+            kc_error(&t, "database loader '%s' is not owned by root (uid %u); karidns refuses to run it\n", lp,
+                     (unsigned)st.st_uid);
+        if (st.st_mode & (S_IWGRP | S_IWOTH))
+            kc_error(&t, "database loader '%s' is writable by group or others (mode %04o); karidns refuses to run it\n",
+                     lp, (unsigned)(st.st_mode & 07777));
+        if (access(lp, X_OK) != 0) {
+            kc_error(&t, "database loader '%s' is not executable by this user\n", lp);
+            loader_ok = false;
+        }
+    }
+    if (loader_ok && db->driver) {
+        char drivers[256];
+        if (!kc_loader_drivers(lp, drivers, sizeof(drivers)))
+            kc_error(&t, "database loader '%s' did not answer --drivers; is it karidns-dbloader?\n", lp);
+        else if (!kc_line_listed(drivers, db->driver)) {
+            for (char *c = drivers; *c; c++)
+                if (*c == '\n') *c = (c[1] ? ',' : '\0');
+            kc_error(&t, "driver %s is not available in this installation (the loader '%s' has: %s)\n", db->driver, lp,
+                     drivers[0] ? drivers : "no driver");
+        }
+    }
+
+    /* sources */
+    if (sqlite) {
+        if (db->database_file) kc_check_sqlite_file(&t, "database", db->database_file);
+        for (const view_config_t *v = cfg->views; v; v = v->next)
+            if (v->database_file) {
+                char what[KARIDNS_VIEW_NAME_MAX + 16];
+                snprintf(what, sizeof(what), "view '%s'", v->name);
+                kc_check_sqlite_file(&t, what, v->database_file);
+            }
+        if (db->server_id)
+            kc_warning(&t, "database: server-id is for driver postgresql (ignored with sqlite3)\n");
+    } else if (db->conninfo_file) {
+        struct stat cs;
+        if (stat(db->conninfo_file, &cs) != 0) {
+            kc_error(&t, "database conninfo-file '%s': %s\n", db->conninfo_file, strerror(errno));
+        } else {
+            mode_t m = cs.st_mode & 0777;
+            if (m != 0600 && m != 0400)
+                kc_error(&t, "database conninfo-file '%s' has mode %04o; it must be 0600 or 0400\n", db->conninfo_file,
+                         (unsigned)m);
+            if (have_uid && cs.st_uid != loader_uid)
+                kc_error(&t, "database conninfo-file '%s' is owned by uid %u; it must belong to the loader user '%s'\n",
+                         db->conninfo_file, (unsigned)cs.st_uid, db->loader_user);
+            FILE *cf = fopen(db->conninfo_file, "r");
+            if (cf) {
+                char line[2048];
+                bool unix_sock = false, verify = false;
+                while (fgets(line, sizeof(line), cf)) {
+                    if (strstr(line, "host=/") || strstr(line, "host='/") || strstr(line, "host=\"/")) unix_sock = true;
+                    if (strstr(line, "sslmode=verify-full")) verify = true;
+                }
+                fclose(cf);
+                if (!unix_sock && !verify)
+                    kc_warning(&t, "database conninfo-file '%s' has neither a UNIX socket host nor sslmode=verify-full\n",
+                               db->conninfo_file);
+            }
+        }
+    }
+    return t.errors;
+}
+
 KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) {
     printf("[INFO] Loading config %s...\n", config_path);
     bool failed = false;
@@ -1866,6 +2057,11 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
         fprintf(stderr, "[WARNING] ecs-tags defined, but ecs-enable is not set to 'yes' in options{}\n");
     }
     if (ecs_error) {
+        free(buf);
+        return 1;
+    }
+
+    if (kc_check_database(cfg) > 0) {
         free(buf);
         return 1;
     }

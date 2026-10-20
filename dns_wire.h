@@ -367,6 +367,9 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
  * record writes back as the same octets, no compression), else a static reason.  Types without a decoder accept
  * any octets.  Not for the query path (allocates). */
 const char *dns_generic_rdata_check(uint16_t type, const uint8_t *rd, size_t len);
+/* RFC 3597 5: decode "\# <length> <hex>..." (tok[0] = "\#" or "#") into out (>= 65535 octets); *outlen = the octets.
+ * NULL on success, else a static message.  Used by the zone parser and by dag's UPDATE operands. */
+const char *dns_generic_rdata_parse(uint16_t type, char *const *tok, int ntok, uint8_t *out, size_t *outlen);
 
 // TSIG
 bool tsig_algorithm_is_supported(const char *alg);

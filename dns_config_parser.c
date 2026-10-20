@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include <errno.h>
+#include <stdarg.h>
 #include "dns_wire.h"
 #include "dns_tsig_acl.h"
 
@@ -527,9 +528,38 @@ zone_config_t *config_find_zone_any_view(const server_config_t *cfg, const char 
   return NULL;
 }
 
+static void free_str_list(char **list, int count) {
+  for (int i = 0; i < count; i++) free(list[i]);
+  free(list);
+}
+
+static void free_database_config(database_config_t *db) {
+  free(db->driver);
+  free(db->database_file);
+  free(db->conninfo_file);
+  free(db->schema);
+  free(db->loader_user);
+  free(db->loader_group);
+  free(db->loader_path);
+  free_str_list(db->acl_ceiling, db->acl_ceiling_count);
+  free(db->acl_ceiling_parsed);
+  free_str_list(db->acl_ceiling_keys, db->acl_ceiling_keys_count);
+  free(db->server_id);
+  free_str_list(db->alias_resolver, db->alias_resolver_count);
+  memset(db, 0, sizeof(*db));
+}
+
+static void free_view_db_fields(view_config_t *view) {
+  free(view->database_file);
+  free(view->database_schema);
+  view->database_file = view->database_schema = NULL;
+  view->database_none = false;
+}
+
 static void free_partial_view(view_config_t *view) {
   if (!view) return;
   zone_cfg_index_free(&view->zone_index);
+  free_view_db_fields(view);
   if (view->name) free(view->name);
   for (int i = 0; i < view->match_clients_count; i++) free(view->match_clients[i]);
   if (view->match_clients) free(view->match_clients);
@@ -686,6 +716,7 @@ void free_server_config_fields(server_config_t *cfg) {
   while (v) {
     view_config_t *next_v = v->next;
     zone_cfg_index_free(&v->zone_index);
+    free_view_db_fields(v);
     if (v->name) free(v->name);
     for (int i = 0; i < v->match_clients_count; i++) free(v->match_clients[i]);
     if (v->match_clients) free(v->match_clients);
@@ -731,6 +762,7 @@ void free_server_config_fields(server_config_t *cfg) {
   if (cfg->dnstap.identity) { free(cfg->dnstap.identity); cfg->dnstap.identity = NULL; }
   if (cfg->dnstap.version) { free(cfg->dnstap.version); cfg->dnstap.version = NULL; }
   memset(&cfg->dnstap, 0, sizeof(dnstap_config_t));
+  free_database_config(&cfg->database);
   free_rate_limit_config(&cfg->rrl);
   memset(&cfg->rrl, 0, sizeof(rate_limit_config_t));
 
@@ -2118,6 +2150,285 @@ static int parse_dnstap_block(token_ctx_t *ctx, server_config_t *config) {
   return 0;
 }
 
+/* ---- options { database { ... }; } and the per-view database options (beta design 7.1) ---------------------------- */
+
+static void db_cfg_error(token_ctx_t *ctx, const char *fmt, ...) {
+  char msg[512];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  syslog(LOG_ERR, "[Config] %s", msg);
+  fprintf(stderr, "[ERROR] %s\n", msg);
+  if (ctx) ctx->error_occurred = true;
+}
+
+/* The value of "<key> <string>;" is a UTF-8 string without control characters of 1..maxlen bytes (paths and schema
+ * names are used byte for byte, so nothing is decoded here).  *dst takes the string (a previous value is freed). */
+static int db_take_string(token_ctx_t *ctx, const char *scope, const char *key, size_t maxlen, char **dst) {
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+  char *val = tok.value;
+  tok.value = NULL;
+  free_token(&tok);
+  size_t n = strlen(val);
+  if (n == 0 || n > maxlen || !dns_path_is_valid_utf8((const unsigned char *)val, n)) {
+    db_cfg_error(ctx, "%s: invalid %s value (expected 1..%zu bytes of UTF-8 without control characters)", scope,
+                 key, maxlen);
+    free(val);
+    return -1;
+  }
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free(val); free_token(&tok); return -1; }
+  free_token(&tok);
+  free(*dst);
+  *dst = val;
+  return 0;
+}
+
+/* "<key> <number>;" with an optional K/M/G suffix (1024 based) when allow_suffix.  Digits only, lo..hi. */
+static int db_take_uint(token_ctx_t *ctx, const char *key, bool allow_suffix, uint64_t lo, uint64_t hi,
+                        uint64_t *out) {
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+  const char *s = tok.value;
+  bool ok = false;
+  uint64_t v = 0;
+  if (isdigit((unsigned char)s[0])) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long long x = strtoull(s, &end, 10);
+    if (errno == 0) {
+      uint64_t mult = 1;
+      if (allow_suffix && (*end == 'k' || *end == 'K')) { mult = 1ull << 10; end++; }
+      else if (allow_suffix && (*end == 'm' || *end == 'M')) { mult = 1ull << 20; end++; }
+      else if (allow_suffix && (*end == 'g' || *end == 'G')) { mult = 1ull << 30; end++; }
+      if (*end == '\0' && x <= UINT64_MAX / mult) {
+        v = (uint64_t)x * mult;
+        ok = v >= lo && v <= hi;
+      }
+    }
+  }
+  if (!ok) {
+    char expected[96];
+    snprintf(expected, sizeof(expected), "%llu..%llu%s", (unsigned long long)lo, (unsigned long long)hi,
+             allow_suffix ? ", K/M/G suffix allowed" : "");
+    report_bad_value(ctx, NULL, key, s, expected);
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  free_token(&tok);
+  *out = v;
+  return 0;
+}
+
+static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const char *key) {
+  uint64_t u = 0;
+  if (strcmp(key, "driver") == 0) {
+    char *v = NULL;
+    if (db_take_string(ctx, "database", key, 32, &v) != 0) { free(v); return -1; }
+    if (strcmp(v, "sqlite3") != 0 && strcmp(v, "postgresql") != 0) {
+      db_cfg_error(ctx, "database: unknown driver '%.32s' (expected sqlite3 or postgresql)", v);
+      free(v);
+      return -1;
+    }
+    free(db->driver);
+    db->driver = v;
+    return 0;
+  }
+  if (strcmp(key, "database-file") == 0) return db_take_string(ctx, "database", key, KARIDNS_DB_PATH_MAX, &db->database_file);
+  if (strcmp(key, "conninfo-file") == 0) return db_take_string(ctx, "database", key, KARIDNS_DB_PATH_MAX, &db->conninfo_file);
+  if (strcmp(key, "schema") == 0) return db_take_string(ctx, "database", key, KARIDNS_DB_PATH_MAX, &db->schema);
+  if (strcmp(key, "loader-user") == 0) return db_take_string(ctx, "database", key, 255, &db->loader_user);
+  if (strcmp(key, "loader-group") == 0) return db_take_string(ctx, "database", key, 255, &db->loader_group);
+  if (strcmp(key, "loader-path") == 0) return db_take_string(ctx, "database", key, KARIDNS_DB_PATH_MAX, &db->loader_path);
+  if (strcmp(key, "server-id") == 0) return db_take_string(ctx, "database", key, 64, &db->server_id);
+  if (strcmp(key, "auto-reload") == 0) return parse_bool_statement(ctx, NULL, key, &db->auto_reload);
+  if (strcmp(key, "poll-interval") == 0) {
+    if (db_take_uint(ctx, key, false, KARIDNS_DB_POLL_MIN, KARIDNS_DB_POLL_MAX, &u) != 0) return -1;
+    db->poll_interval = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "coalesce") == 0) {
+    if (db_take_uint(ctx, key, false, 0, KARIDNS_DB_COALESCE_MAX, &u) != 0) return -1;
+    db->coalesce_ms = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "default-ttl") == 0) {
+    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_TTL_MAX, &u) != 0) return -1;
+    db->default_ttl = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "bulk-threshold") == 0) {
+    if (db_take_uint(ctx, key, false, 0, 100, &u) != 0) return -1;
+    db->bulk_threshold = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "max-zone-records") == 0)
+    return db_take_uint(ctx, key, false, 2, KARIDNS_DB_MAX_ZONE_RECORDS_MAX, &db->max_zone_records);
+  if (strcmp(key, "max-zone-bytes") == 0)
+    return db_take_uint(ctx, key, true, KARIDNS_DB_MAX_ZONE_BYTES_MIN, KARIDNS_DB_MAX_ZONE_BYTES_MAX,
+                        &db->max_zone_bytes);
+  if (strcmp(key, "db-reload-timeout") == 0) {
+    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_RELOAD_TIMEOUT_MAX, &u) != 0) return -1;
+    db->db_reload_timeout = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "ingest-threads") == 0) {
+    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_THREADS_MAX, &u) != 0) return -1;
+    db->ingest_threads = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "loader-threads") == 0) {
+    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_THREADS_MAX, &u) != 0) return -1;
+    db->loader_threads = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "acl-ceiling") == 0) {
+    /* addresses and "key" entries like allow-transfer; enforcement comes with milestone B7 */
+    free_str_list(db->acl_ceiling, db->acl_ceiling_count);
+    free(db->acl_ceiling_parsed);
+    free_str_list(db->acl_ceiling_keys, db->acl_ceiling_keys_count);
+    db->acl_ceiling = NULL;
+    db->acl_ceiling_parsed = NULL;
+    db->acl_ceiling_keys = NULL;
+    db->acl_ceiling_count = db->acl_ceiling_keys_count = 0;
+    return parse_acl_list(ctx, &db->acl_ceiling, &db->acl_ceiling_count, ACL_KEY_AS_TSIG_FIELD,
+                          &db->acl_ceiling_keys, &db->acl_ceiling_keys_count);
+  }
+  if (strcmp(key, "alias-resolver") == 0) {
+    free_str_list(db->alias_resolver, db->alias_resolver_count);
+    db->alias_resolver = NULL;
+    db->alias_resolver_count = 0;
+    if (parse_string_list(ctx, &db->alias_resolver, &db->alias_resolver_count) != 0) return -1;
+    for (int i = 0; i < db->alias_resolver_count; i++) {
+      struct in_addr a4;
+      struct in6_addr a6;
+      if (inet_pton(AF_INET, db->alias_resolver[i], &a4) != 1 && inet_pton(AF_INET6, db->alias_resolver[i], &a6) != 1) {
+        db_cfg_error(ctx, "database: alias-resolver entry '%.64s' is not an IP address", db->alias_resolver[i]);
+        return -1;
+      }
+    }
+    return 0;
+  }
+  db_cfg_error(ctx, "database: unknown option '%.64s'", key);
+  return -1;
+}
+
+static int parse_database_block(token_ctx_t *ctx, server_config_t *config) {
+  database_config_t *db = &config->database;
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_LBRACE) { free_token(&tok); return -1; }
+  free_token(&tok);
+  if (db->enabled) {
+    db_cfg_error(ctx, "database: the block is given twice");
+    return -1;
+  }
+  db->enabled = true;
+  db->poll_interval = 2;
+  db->coalesce_ms = 1000;
+  db->default_ttl = 3600;
+  db->bulk_threshold = 25;
+  db->max_zone_records = 10000000ull;
+  db->max_zone_bytes = 1ull << 30;
+  db->db_reload_timeout = 30;
+  db->ingest_threads = 1;
+  db->loader_threads = 1;
+  while (1) {
+    tok = get_next_token(ctx);
+    if (tok.type == TOKEN_RBRACE) { free_token(&tok); break; }
+    if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
+    char *key = tok.value;
+    tok.value = NULL;
+    free_token(&tok);
+    int rc = parse_database_option(ctx, db, key);
+    free(key);
+    if (rc != 0) return -1;
+  }
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  free_token(&tok);
+  return 0;
+}
+
+/* view { database-file "..."; database-schema "..."; database none; } */
+static int parse_view_database_option(token_ctx_t *ctx, view_config_t *view, const char *key) {
+  if (strcmp(key, "database-file") == 0) return db_take_string(ctx, view->name, key, KARIDNS_DB_PATH_MAX, &view->database_file);
+  if (strcmp(key, "database-schema") == 0) return db_take_string(ctx, view->name, key, KARIDNS_DB_PATH_MAX, &view->database_schema);
+  /* "database none;" */
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+  if (strcmp(tok.value, "none") != 0) {
+    db_cfg_error(ctx, "view '%s': invalid database value '%.32s' (expected none)", view->name, tok.value);
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  free_token(&tok);
+  view->database_none = true;
+  return 0;
+}
+
+/* The rules that need the whole configuration (design 7.1): required fields per driver, driver / view option
+ * consistency, view options without a database block. */
+static int validate_database_config(token_ctx_t *ctx, server_config_t *config) {
+  const database_config_t *db = &config->database;
+  bool sqlite = db->enabled && db->driver && strcmp(db->driver, "sqlite3") == 0;
+  bool pg = db->enabled && db->driver && strcmp(db->driver, "postgresql") == 0;
+  bool need_global = false;
+  for (const view_config_t *v = config->views; v; v = v->next) {
+    if ((v->database_file || v->database_schema || v->database_none) && !db->enabled) {
+      db_cfg_error(ctx, "view '%s': database options need an options { database { ... }; } block", v->name);
+      return -1;
+    }
+    if (v->database_none && (v->database_file || v->database_schema)) {
+      db_cfg_error(ctx, "view '%s': \"database none;\" cannot be combined with database-file or database-schema", v->name);
+      return -1;
+    }
+    if (pg && v->database_file) {
+      db_cfg_error(ctx, "view '%s': database-file is for driver sqlite3 (this configuration uses postgresql)", v->name);
+      return -1;
+    }
+    if (sqlite && v->database_schema) {
+      db_cfg_error(ctx, "view '%s': database-schema is for driver postgresql (this configuration uses sqlite3)", v->name);
+      return -1;
+    }
+    if (!v->database_none && !v->database_file && !v->database_schema) need_global = true;
+  }
+  if (!db->enabled) return 0;
+  if (!db->driver) {
+    db_cfg_error(ctx, "database: 'driver' is required (sqlite3 or postgresql)");
+    return -1;
+  }
+  if (sqlite) {
+    if (db->conninfo_file || db->schema) {
+      db_cfg_error(ctx, "database: %s is for driver postgresql (this configuration uses sqlite3)",
+                   db->conninfo_file ? "conninfo-file" : "schema");
+      return -1;
+    }
+    if (!db->database_file && need_global) {
+      db_cfg_error(ctx, "database: driver sqlite3 needs 'database-file' (a view without its own database-file or "
+                        "\"database none;\" uses it)");
+      return -1;
+    }
+  } else if (pg) {
+    if (db->database_file) {
+      db_cfg_error(ctx, "database: database-file is for driver sqlite3 (this configuration uses postgresql)");
+      return -1;
+    }
+    if (!db->conninfo_file) {
+      db_cfg_error(ctx, "database: driver postgresql needs 'conninfo-file'");
+      return -1;
+    }
+  }
+  return 0;
+}
+
 static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) {
   int nr_rc = 0;
   memset(config, 0, sizeof(server_config_t));
@@ -2608,6 +2919,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key);
             return -1;
           }
+        } else if (strcmp(key, "database") == 0) {
+          if (parse_database_block(ctx, config) != 0) {
+            free(key);
+            return -1;
+          }
         } else
           skip_unknown_block(ctx);
         free(key);
@@ -2677,6 +2993,14 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
           if (!view->zones) view->zones = z; else last_view_zone->next = z;
           last_view_zone = z;
+        } else if (strcmp(tok.value, "database-file") == 0 || strcmp(tok.value, "database-schema") == 0 ||
+                   strcmp(tok.value, "database") == 0) {
+          char *vkey = tok.value;
+          tok.value = NULL;
+          free_token(&tok);
+          int vrc = parse_view_database_option(ctx, view, vkey);
+          free(vkey);
+          if (vrc != 0) { free_partial_view(view); return -1; }
         } else {
           free_token(&tok);
           skip_unknown_block(ctx);
@@ -3359,6 +3683,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
     config->views = default_view;
   }
 
+  if (validate_database_config(ctx, config) != 0) return -1;
+
   // Inherit options.user as default program-user if unspecified
   for (view_config_t *v = config->views; v; v = v->next) {
     for (zone_config_t *z = v->zones; z; z = z->next) {
@@ -3382,6 +3708,20 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                          &config->ecs_trusted_resolvers, &config->ecs_trusted_resolvers_count,
                          &config->ecs_trusted_resolvers_parsed, NULL, NULL) != 0)
       return -1;
+    /* database acl-ceiling: like allow-transfer (addresses, named ACLs, key "name"); the keys must exist */
+    if (config->database.enabled && config->database.acl_ceiling_count > 0 &&
+        acl_expand_field(ctx, config, "options database acl-ceiling", ACL_USE_TRANSFER,
+                         &config->database.acl_ceiling, &config->database.acl_ceiling_count,
+                         &config->database.acl_ceiling_parsed, &config->database.acl_ceiling_keys,
+                         &config->database.acl_ceiling_keys_count) != 0)
+      return -1;
+    for (int i = 0; i < config->database.acl_ceiling_keys_count; i++) {
+      if (!key_name_is_defined(config->keys, config->database.acl_ceiling_keys[i])) {
+        db_cfg_error(ctx, "database acl-ceiling: key '%.64s' is not defined in any key {} block",
+                     config->database.acl_ceiling_keys[i]);
+        return -1;
+      }
+    }
     for (view_config_t *v = config->views; v; v = v->next) {
       snprintf(where, sizeof(where), "view '%s' match-clients", v->name);
       if (acl_expand_field(ctx, config, where, ACL_USE_ADDRESS, &v->match_clients, &v->match_clients_count,

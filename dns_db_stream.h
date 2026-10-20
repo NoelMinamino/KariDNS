@@ -58,9 +58,10 @@
  * Backend -> loader (type | 0x8000)
  *   CONFIG (0x8001)   1 generation u64 R | 2 driver str ne <=32 R | 3 server_id str<=64 O |
  *                     4 VIEW nested, repeatable (<= 1024):
- *                         1 index u16 R | 2 name str ne <=255 R | 3 source path ne<=1023 O (absent = shared source) |
+ *                         1 index u16 R | 2 name str ne <=255 R | 3 source path ne<=1023 O (absent = driver default; B4a: the Backend repeats the global source for views that use it) |
  *                         4 conninfo_file path ne<=1023 O | 5 auto_reload u8 R (0/1) | 6 poll_interval u32 R (s) |
  *                         7 coalesce_ms u32 R | 8 max_zone_records u64 R | 9 max_zone_bytes u64 R
+ *                     5 default_ttl u32 O (<= 2147483647; B4a) | 6 bulk_threshold u8 O (<= 100) | 7 loader_threads u32 O (<= 16)
  *   RELOAD_REQ (0x8002) 1 request_id u64 R | 2 scope u8 R (0 all, 1 one zone) | 3 view view O | 4 zone name O |
  *                     5 force u8 R (0/1); scope 1 needs tags 3 and 4, scope 0 forbids them
  *   INVENTORY (0x8003) 1 ENTRY nested, repeatable: 1 view view R | 2 zone name R | 3 source_id i64 R |
@@ -197,6 +198,9 @@ typedef struct { uint64_t batch_id; uint32_t n_zones, n_failed, n_deleted; } kdb
 
 typedef struct {
     uint64_t generation; kdb_str_t driver, server_id;
+    uint32_t default_ttl;       /* 0 = tag absent */
+    int bulk_threshold;         /* percent; -1 = tag absent */
+    uint32_t loader_threads;    /* 0 = tag absent */
     uint32_t n_views;
     const uint8_t *body; uint32_t body_len;       /* for kdb_config_views() */
 } kdb_config_t;

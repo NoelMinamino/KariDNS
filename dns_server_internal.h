@@ -61,7 +61,7 @@ struct mmsghdr {
 #include "dns_priv_sandbox.h"
 
 extern int g_cwd_fd;
-extern int g_control_kq;
+extern _Atomic int g_control_kq;
 extern int g_notify_ipc[2];
 extern int g_notify_resp_ipc[2];
 extern char g_startup_cwd[PATH_MAX];
@@ -724,7 +724,7 @@ void *worker_thread_func(void *arg);
 
 extern config_rcu_t g_config_db;
 extern int g_control_sock;
-extern int g_control_kq;
+extern _Atomic int g_control_kq;
 extern time_t g_boot_time;
 extern time_t g_last_configured_time;
 extern _Atomic int g_tcp_clients;

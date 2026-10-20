@@ -728,15 +728,18 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
         uint16_t pref = (packet[rdata_p+2] << 8) | packet[rdata_p+3];
         rdata_p += 4;
         char *cstrs[3];
+        bool has_nul = false;
         for (int k = 0; k < 3; k++) {
             if (rdata_p >= *offset + rdlen) return -1;
             uint8_t slen = packet[rdata_p++];
             if (rdata_p + slen > *offset + rdlen) return -1;
+            if (slen && memchr(&packet[rdata_p], 0, slen)) has_nul = true;
             char *s = arena_alloc(arena, slen + 1); if (!s) return -1;
             memcpy(s, &packet[rdata_p], slen); s[slen] = '\0';
             cstrs[k] = s;
             rdata_p += slen;
         }
+        size_t repl_start = rdata_p;
         char *replacement;
         if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &replacement) != 0) return -1;
         if (rdata_p > *offset + rdlen) return -1;
@@ -749,6 +752,26 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
         rec->rdata[2] = cstrs[0]; rec->rdata[3] = cstrs[1]; rec->rdata[4] = cstrs[2];
         rec->rdata[5] = replacement;
         rec->rdata_count = 6;
+        if (has_nul) {
+            /* D16-1: a NUL in flags / services / regexp (RFC 3403 4.1, character-strings) cannot live in the text
+             * fields; keep the RDATA octets.  They are copied as they are, so the replacement name must be written
+             * out in full (RFC 3597 4: no compression in the RDATA of this type) and end the RDATA. */
+            size_t q = repl_start, end = *offset + rdlen;
+            for (;;) {
+                if (q >= end) return -1;
+                uint8_t l = packet[q++];
+                if (l == 0) break;
+                if (l > 63 || end - q < l) return -1;
+                q += l;
+            }
+            if (q != end) return -1;
+            uint8_t *blob = (uint8_t *)arena_alloc(arena, rdlen);
+            if (!blob) return -1;
+            memcpy(blob, &packet[*offset], rdlen);
+            rec->generic_data = blob;
+            rec->generic_len = rdlen;
+            rec->rdata_count = 0;
+        }
     } else if (type == 15) {
         if (rdlen < 3) return -1;
         size_t rdata_p = *offset; char *target;
@@ -761,14 +784,27 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
         rec->rdata[0] = pref_buf; rec->rdata[1] = target; rec->rdata_count = 2;
     } else if (type == 16) {
         size_t rdata_p = *offset;
+        bool has_nul = false;
         while (rdata_p < *offset + rdlen) {
             if (rec->rdata_count >= MAX_RDATA) return -1;
             uint8_t len = packet[rdata_p++];
             if (rdata_p + len > *offset + rdlen) return -1;
+            if (len && memchr(&packet[rdata_p], 0, len)) has_nul = true;
             char *txt = arena_alloc(arena, len + 1); if (!txt) return -1;
             memcpy(txt, &packet[rdata_p], len); txt[len] = '\0';
             rec->rdata[rec->rdata_count++] = txt;
             rdata_p += len;
+        }
+        /* D16-1, RFC 1035 3.3.14: a character-string may hold any octet, NUL included, but the text fields are C
+         * strings.  Such an RR is kept as the RDATA octets (the form of an unknown type, RFC 3597 5) instead of
+         * fields that would stop at the NUL. */
+        if (has_nul && rdlen > 0) {
+            uint8_t *blob = (uint8_t *)arena_alloc(arena, rdlen);
+            if (!blob) return -1;
+            memcpy(blob, &packet[*offset], rdlen);
+            rec->generic_data = blob;
+            rec->generic_len = rdlen;
+            rec->rdata_count = 0;
         }
     } else if (type == 28) {
         if (rdlen != 16) return -1;
@@ -878,6 +914,63 @@ done:
     free(back);
     free(want);
     return why;
+}
+
+static int generic_hex_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* RFC 3597 5.  tok[0] is "\#" (or "#": the zone parser's unescaping leaves that), tok[1] the decimal length, tok[2..]
+ * the hex digits, split into any number of tokens.  One implementation for the zone parser and for dag's UPDATE
+ * operands.  The length must equal the number of octets; a fixed-size type must have its size; RDATA the type
+ * does not accept is refused (dns_generic_rdata_check()). */
+const char *dns_generic_rdata_parse(uint16_t type, char *const *tok, int ntok, uint8_t *out, size_t *outlen) {
+    if (ntok < 2 || !tok[0] || !tok[1] || (strcmp(tok[0], "\\#") != 0 && strcmp(tok[0], "#") != 0))
+        return "Generic RDATA (\\#) is malformed";
+    size_t len_tok_len = strlen(tok[1]);
+    if (len_tok_len == 0 || len_tok_len > 5 || strspn(tok[1], "0123456789") != len_tok_len)
+        return "Generic RDATA length (\\#) is not a decimal number";
+    long declared = atol(tok[1]);
+    if (declared < 0 || declared > 65535) return "Generic RDATA length (\\#) out of range (0-65535)";
+    size_t nibbles = 0;
+    for (int j = 2; j < ntok; j++) {
+        for (const char *h = tok[j]; *h; h++) {
+            if (generic_hex_val(*h) < 0) return "Generic RDATA (\\#) contains a non-hexadecimal character";
+            nibbles++;
+        }
+    }
+    if ((nibbles & 1) != 0) return "Generic RDATA (\\#) has an odd number of hex digits";
+    if (nibbles / 2 != (size_t)declared) return "Generic RDATA (\\#) length does not match the declared length";
+    /* Types whose RDATA has a fixed size must not be given in a different size, even in generic form. */
+    int fixed = -1;
+    switch (type) {
+        case 1:   fixed = 4;  break;   /* A */
+        case 28:  fixed = 16; break;   /* AAAA */
+        case 108: fixed = 6;  break;   /* EUI48 */
+        case 109: fixed = 8;  break;   /* EUI64 */
+        case 105: fixed = 6;  break;   /* L32 */
+        case 104: fixed = 10; break;   /* NID */
+        case 106: fixed = 10; break;   /* L64 */
+        default: break;
+    }
+    if (fixed >= 0 && declared != fixed) return "Generic RDATA (\\#) has the wrong length for this fixed-size record type";
+    size_t b = 0;
+    int high = -1;
+    for (int j = 2; j < ntok; j++) {
+        for (const char *h = tok[j]; *h; h++) {
+            int v = generic_hex_val(*h);
+            if (high < 0) high = v;
+            else { out[b++] = (uint8_t)((high << 4) | v); high = -1; }
+        }
+    }
+    /* D15-2, RFC 3597 5: the RDATA must be valid for the type ("PTR \# 0", "NS \# 3 010203" are not). */
+    const char *why = dns_generic_rdata_check(type, out, b);
+    if (why) return why;
+    *outlen = b;
+    return NULL;
 }
 
 int dns_record_dup_rdata(zone_arena_t *arena, dns_record_t *rec) {
