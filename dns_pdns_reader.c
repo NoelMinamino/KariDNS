@@ -1122,6 +1122,15 @@ static int gen_bodies(const pdns_zone_t *z, body_sink_t sink, void *ud, char *er
         for (int attempt = 0;; attempt++) {
             uint16_t o2 = off;
             if (serialize_dns_record(buf, KDB_MAX_ZONE_DATA, &o2, &z->arena.records[idx], NULL, NULL, 0xFFFFFFFFu) == 0) {
+                /* keep the case of MINFO names as the zone image does (serialize_dns_record() without a compression
+                 * context lowercases them): owner, TYPE CLASS TTL RDLENGTH (10 octets), RDATA */
+                size_t at;
+                if (skip_wire_name(buf, o2, off, &at) != 0 || at + 10 > o2 ||
+                    dns_rdata_keep_name_case(&z->arena.records[idx], buf + at + 10, (size_t)o2 - at - 10) != 0) {
+                    snprintf(err, errlen, "zone '%s' records.id %lld: cannot write the RR", z->name,
+                             (long long)z->line_id[idx]);
+                    goto out;
+                }
                 off = o2;
                 an++;
                 break;

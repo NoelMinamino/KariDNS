@@ -202,6 +202,7 @@ typedef struct {
   char current_ecs_tag[64];
   bool has_current_ecs_tag;
   uint32_t out_of_zone_skipped; /* R-27: 読み飛ばしたゾーン外 RR の数 */
+  bool trailing_rrs;      /* AXFR: 終わりの SOA の後ろに同じメッセージの RR が続いていた (取り込み側は拒否する) */
   uint16_t query_id;      /* R-19: 送った要求の ID と QTYPE (xfr_check_response_header() が照合する) */
   uint16_t query_type;
   bool got_first_msg;
@@ -558,8 +559,72 @@ void zone_retire_process(bool wait);
 bool zone_retire_object(zone_db_entry_t *entry, void *obj, void (*free_fn)(void *), uint64_t epoch);
 /* builder を新しい版として公開する (dns_axfr_ixfr.c)。entry->writer_lock を持って呼ぶ。約束は定義の前の注釈に */
 int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const char *what);
+/* 公開直前に呼ぶ: 応答キャッシュに入れてよいか (rcache_ok) を決める。ゾーンの設定は zone_entry_config(cfg, entry)
+ * (DB のゾーンは dbcfg)。entry は view_name、domain、source (と DB のゾーンなら dbcfg) だけを読む */
+void build_zone_response_cache(zone_version_t *ver, server_config_t *cfg, const zone_db_entry_t *entry);
 void zone_glue_refresh_dependents(bool force);
 uint64_t zone_entry_next_id(void);
+
+/* ---- DB zone registry and view delta (beta design 4.2, 4.4; implemented in dns_snapshot_rcu.c) ----
+ * The registry is the source of truth for which DB zones exist.  Per view (by name) it maps a zone name to
+ * {entry, source id, serial, digest, last result, shadowed}.  Everything below takes g_zone_db_rebuild_lock itself
+ * (the "_locked" ones expect it to be held); the ingest threads and the full-configuration rebuild are the only
+ * writers, queries never touch it.  The registry holds one snapshot_refs reference of each entry it knows; every
+ * snapshot that lists the entry holds another.  Callers on aux threads must rcu_aux_thread_pin() first (the
+ * commit reads the configuration inside the lock). */
+extern pthread_mutex_t g_zone_db_rebuild_lock;
+
+typedef struct dbreg_zone {
+  struct dbreg_zone *next;     /* hash chain */
+  zone_db_entry_t *entry;      /* NULL: the zone has never been applied (only a rejection is recorded) */
+  char *error;                 /* last rejection / loader error, malloc; NULL = none */
+  int64_t source_id;
+  uint32_t serial;
+  uint32_t hash;
+  uint8_t digest[32];
+  uint8_t last_result;         /* DBREG_APPLIED or DBREG_REJECTED (the last version offered) */
+  bool shadowed;               /* a zone of karidns.conf with this name hides it (D-PRIO) */
+  char name[];                 /* canonical absolute name, lower case, with the trailing dot */
+} dbreg_zone_t;
+enum { DBREG_APPLIED = 0, DBREG_REJECTED = 1 };
+
+/* Commit an installed zone.  entry is either a new entry (created = true, the registry takes over its initial
+ * reference and the entry is queued to enter the view snapshot, unless a configured zone shadows it) or the entry
+ * already registered under name.  *shadowed tells whether a zone of karidns.conf hides it.  0, or -1 (out of
+ * memory: the caller keeps ownership of a new entry). */
+int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, bool created, int64_t source_id,
+                 uint32_t serial, const uint8_t digest[32], bool *shadowed);
+/* The entry registered for (view, name) or NULL.  Valid while the caller is the only ingest thread working on that
+ * name (the ingest thread serializes zones of the same name). */
+zone_db_entry_t *dbreg_lookup_entry(const char *view, const char *name);
+/* Record that the version offered for (view, name) was rejected (an existing entry keeps serving its last good
+ * version; without one only the error is recorded).  false: out of memory. */
+bool dbreg_reject(const char *view, const char *name, int64_t source_id, const char *reason);
+/* ZONE_DELETE: forget the zone; its entry leaves the view snapshot with the next snapshot_apply_db_delta().  1:
+ * removed, 0: not registered or registered with another source id (nothing done). */
+int dbreg_delete(const char *view, const char *name, int64_t source_id);
+/* Publish the queued additions and removals as one new snapshot (beta design 4.4): per view the entry array is
+ * copied without the removed and with the added entries and its hash tables are rebuilt.  The other views are copied
+ * too (view_snapshot_t has no reference count to share them by).  Returns the number of entries added plus removed,
+ * or -1 (out of memory, the queue is kept). */
+int snapshot_apply_db_delta(void);
+/* Number of queued changes (cheap, no lock) */
+size_t dbreg_pending_count(void);
+
+typedef struct { size_t view, bucket, skip; } dbreg_cursor_t;
+/* Walk the registry from *cur; cb returns false to stop (the cursor then points at the zone that was refused).
+ * Returns true when the end was reached. */
+typedef bool (*dbreg_walk_cb)(void *ud, const char *view, const dbreg_zone_t *z);
+bool dbreg_walk(dbreg_cursor_t *cur, dbreg_walk_cb cb, void *ud);
+/* counts: zones with an entry (applied+shadowed), rejected-only records and shadowed ones */
+void dbreg_counts(size_t *total, size_t *rejected, size_t *shadowed);
+/* Publish new settings for a DB zone; the old ones are freed after a grace period (zone_retire_object()).  cfg is
+ * owned by the entry afterwards (freed with it). */
+void db_entry_set_config(zone_db_entry_t *entry, const zone_config_t *cfg);
+/* A zone_config_t for a DB zone: type "master", the zone name, no options */
+zone_config_t *db_zone_config_new(const char *domain);
+/* Free every registry record and queued change (unit tests, fuzzers).  Entries lose the registry's reference. */
+void dbreg_reset(void);
 
 int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out, uint16_t *msg_len_out);
 ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len);

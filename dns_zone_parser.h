@@ -182,8 +182,7 @@ void zone_arena_destroy(zone_arena_t *arena);
  * the kept zone file text. image, glue, rcache_ok and generation are kept. */
 void zone_arena_free_builder(zone_arena_t *arena);
 void zone_arena_free_include_buffers(zone_arena_t *arena);
-/* 公開直前に呼ぶ: 応答キャッシュに入れてよいか (rcache_ok) を決める */
-void build_zone_response_cache(zone_version_t *ver, struct server_config_s *cfg, const char *view_name, const char *domain);
+/* build_zone_response_cache() is declared in dns_server_internal.h (it takes the zone entry) */
 /* S5 B-3: make the published version out of a frozen builder: a new heap zone_version_t takes over builder->image (the builder
  * keeps nothing of it and can be destroyed). NULL on out of memory; the builder still owns the image then. */
 zone_version_t *zone_version_new(zone_arena_t *builder);

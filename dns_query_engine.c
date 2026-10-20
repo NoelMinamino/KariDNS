@@ -2452,7 +2452,7 @@ STATIC_TEST void rcache_store(uint64_t tag, uint64_t gen, uint16_t qtype, const 
 
 /* 公開する直前に呼ぶ。このゾーンの応答を共有キャッシュに入れてよいかを決める (応答がクライアントの
  * アドレス、ECS、時刻で変わるゾーンは入れない)。 */
-void build_zone_response_cache(zone_version_t *arena, server_config_t *cfg, const char *view_name, const char *domain) {
+void build_zone_response_cache(zone_version_t *arena, server_config_t *cfg, const zone_db_entry_t *entry) {
   if (!arena) return;
   arena->rcache_ok = false;
   atomic_store_explicit(&arena->generation, zone_data_generation_next(), memory_order_release); /* 公開する版ごとに 1 回 */
@@ -2470,7 +2470,7 @@ void build_zone_response_cache(zone_version_t *arena, server_config_t *cfg, cons
   if (cfg && cfg->wire_cache_max_records > 0 && img->n_rrs > cfg->wire_cache_max_records) return;
 
   // O-07: 同じゾーン名が別の view にもあるので、このエントリの view の設定を見る
-  zone_config_t *zcfg = cfg ? find_zone_config_in_view(cfg, view_name, domain) : NULL;
+  const zone_config_t *zcfg = zone_entry_config(cfg, entry);
   if (zcfg) {
     if (zext(zcfg)->location_tags != NULL && zext(zcfg)->location_tag_count > 0) return;
     if (zext(zcfg)->ecs_tags != NULL && zext(zcfg)->ecs_tag_count > 0) return;

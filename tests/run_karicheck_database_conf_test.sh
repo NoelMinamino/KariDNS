@@ -105,6 +105,20 @@ expect "poll-interval out of range" "$T/c.conf" "Syntax error"
 conf "$T/c.conf" "driver sqlite3; database-file \"$T/w$(printf '\200')al.db\";"
 expect "invalid UTF-8 in a path" "$T/c.conf" "Syntax error"
 
+echo "== the views that take DB zones (the CONFIG message of the loader link lists at most 1024)"
+views_conf() {   # views_conf FILE NVIEWS NONE_FROM: views from NONE_FROM on are "database none;"
+    printf 'options {\n  user "%s";\n  database { driver sqlite3; database-file "%s"; loader-user "%s"; loader-path "%s"; };\n};\n' "$USER_OK" "$T/wal.db" "$USER_OK" "$T/dbl" > "$1"
+    awk -v n="$2" -v none="$3" 'BEGIN { for (i = 1; i <= n; i++) { printf "view \"v%d\" { match-clients { 192.0.2.%d; }; ", i, i % 250 + 1; if (i >= none) printf "database none; "; printf "};\n" } }' >> "$1"
+}
+views_conf "$T/v1025.conf" 1025 100000
+expect "1025 views with a database block" "$T/v1025.conf" "1025 views take DB zones, at most 1024"
+views_conf "$T/v1024.conf" 1024 100000
+out=$(run "$T/v1024.conf")
+if printf '%s\n' "$out" | grep -q "views take DB zones"; then bad "1024 views that take DB zones were refused" "$out"; else ok "1024 views that take DB zones pass the view limit"; fi
+views_conf "$T/vnone.conf" 1100 1025
+out=$(run "$T/vnone.conf")
+if printf '%s\n' "$out" | grep -q "views take DB zones"; then bad "1100 views of which 76 are \"database none;\" were refused" "$out"; else ok "views marked \"database none;\" are not counted"; fi
+
 if [ "$FAILS" -eq 0 ]; then echo "=== run_karicheck_database_conf_test: all checks passed ==="; exit 0; fi
 echo "=== run_karicheck_database_conf_test: $FAILS check(s) FAILED ==="
 exit 1

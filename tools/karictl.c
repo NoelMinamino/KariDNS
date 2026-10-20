@@ -191,7 +191,7 @@ int main(int argc, char **argv) {
     }
     if (optind >= argc) {
         fprintf(stderr, "Usage: %s [-f config_path] [-s socket_path] [-v] <command> [args...]\n", argv[0]);
-        fprintf(stderr, "Commands: status, reload [zone], reconfig, stop, notify <zone>, retransfer <zone>, zonestatus <zone>, observatory [zone], tsig-keygen [keyname]\n");
+        fprintf(stderr, "Commands: status, reload [zone], reconfig, stop, notify <zone>, retransfer <zone>, zonestatus <zone>, observatory [zone], dbstatus [zone [view]], tsig-keygen [keyname]\n");
         return 1;
     }
 
@@ -440,6 +440,21 @@ int main(int argc, char **argv) {
             else
                 fprintf(stderr, "Invalid status response (%zu bytes, expected %zu; karictl and karidns versions differ?)\n",
                         total, expected_len);
+            close(sock);
+            return 3;
+        }
+    } else if (strcmp(argv[optind], "dbstatus") == 0) {
+        /* the reply is text of any length; the server closes the connection after it */
+        char dbuf[16384];
+        size_t total = 0;
+        while (total < sizeof(dbuf) - 1) {
+            r = recv(sock, dbuf + total, sizeof(dbuf) - 1 - total, 0);
+            if (r <= 0) break;
+            total += (size_t)r;
+        }
+        dbuf[total] = '\0';
+        printf("%s", dbuf);
+        if (total == 0 || strncmp(dbuf, "ERROR", 5) == 0) {
             close(sock);
             return 3;
         }

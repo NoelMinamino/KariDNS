@@ -578,7 +578,7 @@ struct lio {
     size_t nreq;
     bool reload_all;
     uint64_t batch_seq;
-    uint64_t n_results, n_rejected;          /* ZONE_RESULTs of the current batch */
+    uint64_t n_results, n_rejected, n_shadowed;   /* ZONE_RESULTs of the current batch */
     char first_reject[130];
 };
 
@@ -691,13 +691,23 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
             if (!io->first_reject[0] && m.u.zone_result.reason.p)
                 snprintf(io->first_reject, sizeof(io->first_reject), "%.*s", (int)m.u.zone_result.reason.len,
                          m.u.zone_result.reason.p);
+            if (io->n_rejected <= 8)   /* the Backend logs every rejection too; a few here keep the story in one place */
+                lg(LOG_WARNING, "the Backend rejected zone '%s' (view %u): %.*s", m.u.zone_result.name,
+                   (unsigned)m.u.zone_result.view, (int)m.u.zone_result.reason.len,
+                   m.u.zone_result.reason.p ? m.u.zone_result.reason.p : "");
+        } else if (m.u.zone_result.status == KDB_ST_SHADOWED) {
+            io->n_shadowed++;
+            if (io->n_shadowed <= 8)
+                lg(LOG_NOTICE, "zone '%s' (view %u) is hidden by a zone in karidns.conf", m.u.zone_result.name,
+                   (unsigned)m.u.zone_result.view);
         }
         break;
     case KDB_T_BATCH_RESULT:
-        lg(LOG_INFO, "Backend result for batch %llu: %u applied, %u unchanged, %u rejected, %u deleted%s%s",
+        lg(LOG_INFO, "Backend result for batch %llu: %u applied, %u unchanged, %u rejected, %u deleted%s%s "
+                     "(%llu zone result(s), %llu hidden by karidns.conf)",
            (unsigned long long)m.u.batch_result.batch_id, m.u.batch_result.n_applied, m.u.batch_result.n_unchanged,
            m.u.batch_result.n_rejected, m.u.batch_result.n_deleted, io->first_reject[0] ? "; first reason: " : "",
-           io->first_reject);
+           io->first_reject, (unsigned long long)io->n_results, (unsigned long long)io->n_shadowed);
         break;
     case KDB_T_RELOAD_REQ:
         /* scope all: send everything again (the diff against the Backend's inventory comes with B6) */
@@ -817,7 +827,7 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
     x->change_seq = 0;
     x->batch_open = false;
     x->n_zones = x->n_failed = x->n_unwritten = 0;
-    io->n_results = io->n_rejected = 0;
+    io->n_results = io->n_rejected = io->n_shadowed = 0;
     io->first_reject[0] = '\0';
     int errs = 0;
     bool sqlite = strcmp(drv->name, "sqlite3") == 0;

@@ -382,7 +382,7 @@ A zone that appears in several views is a separate zone in each view: its own fi
 
 ### `database { ... }` (in `options`) and the view database options
 
-Zones can come from a PowerDNS 5.1 database. The server never links a database library: it starts `karidns-dbloader` (the loader), which reads the database and sends the zones to the Backend over a socket (stream `KDB1`). The loader runs as `loader-user`, without access to this configuration file. In B4a the loader and the Backend run the protocol up to the zones; the zones are validated but not installed yet (every zone is answered "zone install not implemented yet (B4b)"), so the DB zones are not served.
+Zones can come from a PowerDNS 5.1 database. The server never links a database library: it starts `karidns-dbloader` (the loader), which reads the database and sends the zones to the Backend over a socket (stream `KDB1`). The loader runs as `loader-user`, without access to this configuration file. The Backend builds every zone it receives into a zone of its own (the same engine as for zone files, so a zone answers byte for byte the same from a file and from the database) and serves it as a primary. File zones answer at once; DB zones appear as the batches of the loader are published (new zones become visible when a batch ends and at least once a second during a long batch), and a line `initial load complete` is logged when the first batch is done. A zone that fails the Backend's checks (the data does not match its declared count, a record outside the zone, no closing SOA, a malformed record, ...) is rejected alone: it keeps its last good version, or is absent when there is none, and `karictl dbstatus` shows the reason. A zone from the database whose name is also defined by a `zone { }` of `karidns.conf` (a `file`, `program`, `forward` or secondary zone, or a catalog member) is hidden by it: the configured zone answers, a warning is logged, `karictl dbstatus` says `shadowed`, and the DB zone is served again at the next reload after the configured zone is removed. The settings text the loader may send with a zone, `allow-transfer` and the other per-zone options are not applied yet (milestone B7): DB zones run with the default settings, so transfers are refused. Zones removed from the database are not removed from the server before milestone B6.
 
 ```
 options {
@@ -414,7 +414,7 @@ view "other"    { database none; };
 | `max-zone-records <n>;` | `10000000` | Records of one zone, 2..4294967295. |
 | `max-zone-bytes <size>;` | `1G` | Bytes of one zone on the stream, 65535..64G (K, M, G suffixes). |
 | `db-reload-timeout <s>;` | `30` | 1..3600. |
-| `ingest-threads <n>;` `loader-threads <n>;` | `1` | 1..16 each. |
+| `ingest-threads <n>;` `loader-threads <n>;` | `1` | 1..16 each. `ingest-threads` is the number of builder threads of the Backend: with 1 the thread that reads the stream also builds the zones; with more, complete zones are handed to that many builders (at most that many zones in flight; read when the server starts). `loader-threads` is used by the loader. |
 | `server-id "<id>";` | none | postgresql multi-server status (milestone B11); a warning in `karicheck conf` with sqlite3. |
 | `alias-resolver { <ip>; ... };` | none | Parsed and stored (milestone B9a). |
 
@@ -422,7 +422,7 @@ In a `view`: `database-file "<path>";` (sqlite3) or `database-schema "<name>";` 
 
 Everything except `driver`, `loader-user`, `loader-group`, `loader-path` and the presence of the block reloads (`SIGHUP` / `karictl reload`): the Backend then sends the loader a CONFIG with the new generation. These four are logged as "take effect only after a restart".
 
-The supervisor starts the loader after the other processes. A loader exit is not fatal: it is restarted after 1, 2, 4 ... 60 s (back to 1 s after 10 minutes of uptime), with a new socket handed to the Backend. File zones keep answering meanwhile. `SIGHUP` to all processes (`pkill -HUP karidns`) does not affect the loader; it ends on `SIGTERM` with the other processes. The Backend treats everything from the loader as untrusted: a protocol violation is logged once, the stream is closed and the loader is restarted. `karicheck conf` checks the block without opening a database (driver in the loader, users, loader file, SQLite WAL and mode, conninfo-file).
+The supervisor starts the loader after the other processes. A loader exit is not fatal: it is restarted after 1, 2, 4 ... 60 s (back to 1 s after 10 minutes of uptime), with a new socket handed to the Backend. File zones keep answering meanwhile. `SIGHUP` to all processes (`pkill -HUP karidns`) does not affect the loader; it ends on `SIGTERM` with the other processes. The Backend treats everything from the loader as untrusted: a protocol violation is logged once, the stream is closed and the loader is restarted. `karicheck conf` checks the block without opening a database (driver in the loader, users, loader file, SQLite WAL and mode, conninfo-file). More than 1024 views that take DB zones (not marked `database none;`) are a configuration error for `karidns` and `karicheck conf`: the CONFIG message that tells the loader its views lists at most 1024.
 
 ### Address match lists (ACLs)
 

@@ -370,6 +370,9 @@ register_test "core" "sh" "tests/run_karictl_adversary_test.sh" "karictl command
 register_test "core" "sh" "tests/run_db_dump_test.sh" "karidns-dbloader --dump of a SQLite3 database made by zone2sql equals the KDB1 encoding of the zone files, byte for byte (beta B3; SKIP without sqlite3 or the SQLite3 driver)"
 register_test "core" "sh" "tests/run_db_loader_lifecycle_test.sh" "karidns-dbloader under the supervisor: runs as loader-user on fd 3, HELLO/CONFIG/INVENTORY, restart with backoff after kill -9, SIGHUP/reload, fake loaders breaking the protocol, SIGTERM (beta B4a; root only, SKIP otherwise)"
 register_test "core" "sh" "tests/run_karicheck_database_conf_test.sh" "karicheck conf checks of the database block without a connection: loader/driver/users, SQLite WAL and mode, conninfo-file, UTF-8 paths (beta B4a)"
+register_test "core" "sh" "tests/run_db_sqlite_basic_test.sh" "Zones from a SQLite3 database: answers, karictl dbstatus, loader kill -9 and reconciliation, D-PRIO shadowing, a bad row keeps the last good version, ingest-threads, the 1024 view limit (beta B4b; root only, SKIP otherwise)"
+register_test "core" "sh" "tests/run_db_file_diff_test.sh" "GATE file vs DB = 0: every unsigned zone of tests/zones/ answers byte for byte the same from the zone file and from SQLite3 (plain, EDNS, DO; owners x types, NXDOMAIN, NODATA, ANY) (beta B4b; root only, SKIP otherwise)"
+register_test "core" "sh" "tests/run_db_hostile_loader_test.sh" "A fake loader sends bad zone data (wrong counts, owner outside the zone, garbage RRs, oversize frames, ...): the zone is rejected or the stream closed, the Backend survives and keeps serving (beta B4b; root only, SKIP otherwise)"
 
 # 11. Regression, Sanitizer & Concurrency Stress
 register_test "regression" "sh" "tests/run_sanitizer_smoke_test.sh" "ASan & UBSan runtime memory error smoke test"

@@ -14,6 +14,7 @@
 #include "dns_snapshot_rcu.h"
 #include "dns_query_engine.h"
 #include "dns_server_internal.h"
+#include "tst_entry.h"
 
 _Atomic int g_control_kq = -1;
 int g_notify_ipc[2] = {-1, -1};
@@ -357,7 +358,7 @@ static void test_wire_cache_consistency(void) {
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
 
-    build_zone_response_cache(&arena.ver, &cfg, NULL, "example.com.");
+    build_zone_response_cache(&arena.ver, &cfg, tst_entry(NULL, "example.com."));
     assert(arena.rcache_ok);
 
     zone_db_entry_t db_entry;
@@ -969,25 +970,25 @@ static void test_wire_cache_max_records_limit(void) {
 
         // Case A: wire_cache_max_records = 0 (unlimited) -> Cache enabled
         cfg.wire_cache_max_records = 0;
-        build_zone_response_cache(&arena.ver, &cfg, NULL, "example.com.");
+        build_zone_response_cache(&arena.ver, &cfg, tst_entry(NULL, "example.com."));
         assert(arena.rcache_ok);
         printf("  [PASS] wire_cache_max_records=0 enables cache\n");
 
         // Case B: wire_cache_max_records = total_records + 1 (above) -> Cache enabled
         cfg.wire_cache_max_records = (uint32_t)(total_records + 1);
-        build_zone_response_cache(&arena.ver, &cfg, NULL, "example.com.");
+        build_zone_response_cache(&arena.ver, &cfg, tst_entry(NULL, "example.com."));
         assert(arena.rcache_ok);
         printf("  [PASS] wire_cache_max_records=%zu (total+1) enables cache\n", total_records + 1);
 
         // Case C: wire_cache_max_records = total_records (exact boundary) -> Cache enabled (since arena->count > max is false)
         cfg.wire_cache_max_records = (uint32_t)total_records;
-        build_zone_response_cache(&arena.ver, &cfg, NULL, "example.com.");
+        build_zone_response_cache(&arena.ver, &cfg, tst_entry(NULL, "example.com."));
         assert(arena.rcache_ok);
         printf("  [PASS] wire_cache_max_records=%zu (exact total) enables cache\n", total_records);
 
         // Case D: wire_cache_max_records = total_records - 1 (below) -> Cache disabled
         cfg.wire_cache_max_records = (uint32_t)(total_records - 1);
-        build_zone_response_cache(&arena.ver, &cfg, NULL, "example.com.");
+        build_zone_response_cache(&arena.ver, &cfg, tst_entry(NULL, "example.com."));
         assert(!arena.rcache_ok);
         printf("  [PASS] wire_cache_max_records=%zu (total-1) disables cache\n", total_records - 1);
 
@@ -1064,8 +1065,8 @@ static void test_rcache_cross_zone_cname_not_cached(void) {
     assert(test_build_index(&arena_a, true) == 0 && test_build_index(&arena_b, true) == 0);
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
-    build_zone_response_cache(&arena_a.ver, &cfg, NULL, "a.example.");
-    build_zone_response_cache(&arena_b.ver, &cfg, NULL, "b.example.");
+    build_zone_response_cache(&arena_a.ver, &cfg, tst_entry(NULL, "a.example."));
+    build_zone_response_cache(&arena_b.ver, &cfg, tst_entry(NULL, "b.example."));
     assert(arena_a.rcache_ok && arena_b.rcache_ok);
 
     zone_db_entry_t ea, eb;
@@ -1137,7 +1138,7 @@ static void test_rcache_cut_additional_not_cached(void) {
     assert(test_build_index(&arena, true) == 0);
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
-    build_zone_response_cache(&arena.ver, &cfg, NULL, "mx.example.");
+    build_zone_response_cache(&arena.ver, &cfg, tst_entry(NULL, "mx.example."));
     assert(arena.rcache_ok);
 
     zone_db_entry_t e;
@@ -1212,7 +1213,7 @@ static void test_wire_cache_observatory_counters(void) {
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
 
-    build_zone_response_cache(&arena.ver, &cfg, NULL, "example.com.");
+    build_zone_response_cache(&arena.ver, &cfg, tst_entry(NULL, "example.com."));
     assert(arena.rcache_ok);
 
     zone_db_entry_t db_entry;
@@ -1293,7 +1294,7 @@ static void test_wire_cache_observatory_counters(void) {
 
     // 4. A new published version (new data generation) never sees the old entries
     build_simple_query(req, &req_len, 0x1004, "www.example.com.", 1);
-    build_zone_response_cache(&arena.ver, &cfg, NULL, "example.com.");
+    build_zone_response_cache(&arena.ver, &cfg, tst_entry(NULL, "example.com."));
     compress_ctx_init_packet(&comp_ctx);
     len = process_dns_query_impl(req, req_len, res, sizeof(res),
                                  "www.example.com.", 1,
@@ -1349,9 +1350,9 @@ static void test_wire_cache_per_view_config(void) {
     assert(parse_zone_fast(zone_text, strlen(zone_text), &arena, &ctx) >= 0);
     assert(test_build_index(&arena, true) == 0);
 
-    build_zone_response_cache(&arena.ver, &cfg, "tagged", "example.com.");
+    build_zone_response_cache(&arena.ver, &cfg, tst_entry("tagged", "example.com."));
     assert(!arena.rcache_ok);
-    build_zone_response_cache(&arena.ver, &cfg, "plain", "example.com.");
+    build_zone_response_cache(&arena.ver, &cfg, tst_entry("plain", "example.com."));
     assert(arena.rcache_ok);
 
     zone_arena_destroy(&arena);

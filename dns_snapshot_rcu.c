@@ -294,6 +294,8 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
   pthread_mutex_destroy(&entry->ixfr_history.lock);
   ixfr_history_clear(&entry->ixfr_history);
   zone_version_free(atomic_load_explicit(&entry->rcu.active, memory_order_relaxed));
+  /* a DB zone's settings (the entry owns the current block; replaced ones go through zone_retire_object()) */
+  free_zone_config((zone_config_t *)atomic_load_explicit(&entry->dbcfg, memory_order_relaxed));
   free(entry->catalog_master);
   free(entry->catalog_member_unique_id);
   free(entry->owning_catalog_domain);
@@ -968,7 +970,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
                                       ? zext(zcfg)->additional_from_auth
                                       : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
   zone_glue_track_build(z_next, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
-  build_zone_response_cache(z_next, active_cfg_prelink, entry->view_name, entry->domain);
+  build_zone_response_cache(z_next, active_cfg_prelink, entry);
   release_config_snapshot(active_cfg_prelink);
   rcu_aux_read_unlock();
 
@@ -1067,6 +1069,562 @@ static void catalog_entry_set_groups(zone_db_entry_t *entry, const catalog_membe
         if (!entry->groups[g]) break;
         entry->group_count = g + 1;
     }
+}
+
+/* Both hash tables of a view (zone name, and the suffix table find_zone_in_view() walks) from vs->entries /
+ * vs->zone_count.  false: out of memory (the view keeps what was allocated; free_zone_db_snapshot() frees it). */
+static bool view_build_hashes(view_snapshot_t *vs) {
+    size_t p = 256;
+    while (p < vs->zone_count * 2) p <<= 1;
+    vs->hash_size = p;
+    if (vs->hash_size > 0) {
+        vs->hash_table = malloc(vs->hash_size * sizeof(int));
+        if (vs->hash_table) {
+            for (size_t i = 0; i < vs->hash_size; i++) vs->hash_table[i] = -1;
+        }
+    }
+    if (vs->zone_count > 0) {
+        vs->chain_next = malloc(vs->zone_count * sizeof(int));
+        if (vs->chain_next) {
+            for (size_t i = 0; i < vs->zone_count; i++) vs->chain_next[i] = -1;
+        }
+    }
+
+    vs->suffix_hash_size = p;
+    if (vs->suffix_hash_size > 0) {
+        vs->suffix_hash_table = malloc(vs->suffix_hash_size * sizeof(int));
+        if (vs->suffix_hash_table) {
+            for (size_t i = 0; i < vs->suffix_hash_size; i++) vs->suffix_hash_table[i] = -1;
+        }
+    }
+    if (vs->zone_count > 0) {
+        vs->suffix_chain_next = malloc(vs->zone_count * sizeof(int));
+        if (vs->suffix_chain_next) {
+            for (size_t i = 0; i < vs->zone_count; i++) vs->suffix_chain_next[i] = -1;
+        }
+    }
+
+    if ((vs->hash_size > 0 && !vs->hash_table) || (vs->zone_count > 0 && !vs->chain_next) ||
+        (vs->suffix_hash_size > 0 && !vs->suffix_hash_table) || (vs->zone_count > 0 && !vs->suffix_chain_next)) {
+        return false;
+    }
+
+    if (vs->hash_table && vs->chain_next) {
+        for (size_t i = 0; i < vs->zone_count; i++) {
+            if (!vs->entries[i]) continue;
+            uint32_t hash = calc_fnv1a_str(vs->entries[i]->domain);
+            size_t idx = hash & (vs->hash_size - 1);
+            vs->chain_next[i] = vs->hash_table[idx];
+            vs->hash_table[idx] = i;
+        }
+    }
+
+    if (vs->suffix_hash_table && vs->suffix_chain_next) {
+        for (size_t i = 0; i < vs->zone_count; i++) {
+            if (!vs->entries[i]) continue;
+            size_t z_len = zone_key_len(vs->entries[i]->domain);
+            uint32_t hash = calc_fnv1a_strn(vs->entries[i]->domain, z_len);
+            size_t idx = hash & (vs->suffix_hash_size - 1);
+            vs->suffix_chain_next[i] = vs->suffix_hash_table[idx];
+            vs->suffix_hash_table[idx] = i;
+        }
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* DB zone registry and view delta (beta design 4.2, 4.4, 4.5)                                                    */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+typedef struct {
+    char name[KARIDNS_VIEW_NAME_MAX];
+    dbreg_zone_t **tab;                 /* hash chains by dns_name_hash_ci(), nb is a power of two */
+    size_t nb, count;
+    zone_db_entry_t **adds;             /* entries that should enter the view snapshot (a reference each) */
+    size_t n_adds, cap_adds;
+    zone_db_entry_t **removes;          /* entries that should leave it (a reference each) */
+    size_t n_removes, cap_removes;
+} dbreg_view_t;
+
+/* all of it is protected by g_zone_db_rebuild_lock */
+static dbreg_view_t *g_dbreg_views;
+static size_t g_dbreg_nviews, g_dbreg_capviews, g_dbreg_hint;
+static _Atomic size_t g_dbreg_pending;
+
+static void dbreg_entry_ref(zone_db_entry_t *e) {
+    atomic_fetch_add_explicit(&e->snapshot_refs, 1, memory_order_release);
+}
+
+static dbreg_view_t *dbreg_view_get(const char *name, bool create) {
+    size_t n = g_dbreg_nviews;
+    if (n && g_dbreg_hint < n && strcasecmp(g_dbreg_views[g_dbreg_hint].name, name) == 0)
+        return &g_dbreg_views[g_dbreg_hint];
+    for (size_t i = 0; i < n; i++) {
+        if (strcasecmp(g_dbreg_views[i].name, name) == 0) {
+            g_dbreg_hint = i;
+            return &g_dbreg_views[i];
+        }
+    }
+    if (!create) return NULL;
+    if (n == g_dbreg_capviews) {
+        size_t nc = n ? n * 2 : 4;
+        dbreg_view_t *nv = realloc(g_dbreg_views, nc * sizeof(*nv));
+        if (!nv) return NULL;
+        g_dbreg_views = nv;
+        g_dbreg_capviews = nc;
+    }
+    dbreg_view_t *v = &g_dbreg_views[n];
+    memset(v, 0, sizeof(*v));
+    snprintf(v->name, sizeof(v->name), "%s", name);
+    g_dbreg_nviews = n + 1;
+    g_dbreg_hint = n;
+    return v;
+}
+
+static dbreg_zone_t *dbreg_find(const dbreg_view_t *rv, const char *name, uint32_t h) {
+    if (!rv->nb) return NULL;
+    for (dbreg_zone_t *z = rv->tab[h & (rv->nb - 1)]; z; z = z->next) {
+        if (z->hash == h && domain_names_match_ci(z->name, name)) return z;
+    }
+    return NULL;
+}
+
+static dbreg_zone_t *dbreg_add(dbreg_view_t *rv, const char *name, uint32_t h) {
+    if (rv->count >= rv->nb) {
+        size_t nnb = rv->nb ? rv->nb * 2 : 64;
+        dbreg_zone_t **nt = calloc(nnb, sizeof(*nt));
+        if (!nt) return NULL;
+        for (size_t i = 0; i < rv->nb; i++) {
+            dbreg_zone_t *z = rv->tab[i];
+            while (z) {
+                dbreg_zone_t *nx = z->next;
+                size_t b = z->hash & (nnb - 1);
+                z->next = nt[b];
+                nt[b] = z;
+                z = nx;
+            }
+        }
+        free(rv->tab);
+        rv->tab = nt;
+        rv->nb = nnb;
+    }
+    size_t l = strlen(name);
+    dbreg_zone_t *z = calloc(1, sizeof(*z) + l + 1);
+    if (!z) return NULL;
+    memcpy(z->name, name, l + 1);
+    z->hash = h;
+    size_t b = h & (rv->nb - 1);
+    z->next = rv->tab[b];
+    rv->tab[b] = z;
+    rv->count++;
+    return z;
+}
+
+static void dbreg_unlink(dbreg_view_t *rv, dbreg_zone_t *z) {
+    dbreg_zone_t **pp = &rv->tab[z->hash & (rv->nb - 1)];
+    while (*pp && *pp != z) pp = &(*pp)->next;
+    if (*pp) *pp = z->next;
+    rv->count--;
+}
+
+static bool dbreg_queue_reserve(zone_db_entry_t ***arr, size_t n, size_t *cap) {
+    if (n < *cap) return true;
+    size_t nc = *cap ? *cap * 2 : 16;
+    zone_db_entry_t **na = realloc(*arr, nc * sizeof(**arr));
+    if (!na) return false;
+    *arr = na;
+    *cap = nc;
+    return true;
+}
+
+/* does a zone of the configuration hide a DB zone of this name in this view? (D-PRIO: file, program, forward and
+ * secondary zones all come from zone {} statements) */
+static bool dbreg_config_shadows(const char *view, const char *name) {
+    rcu_aux_read_lock();
+    server_config_t *cfg = acquire_config_snapshot();
+    bool sh = cfg && find_zone_config_in_view(cfg, view, name) != NULL;
+    release_config_snapshot(cfg);
+    rcu_aux_read_unlock();
+    return sh;
+}
+
+static void dbreg_set_error(dbreg_zone_t *z, const char *reason) {
+    free(z->error);
+    z->error = reason ? strdup(reason) : NULL;
+}
+
+int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, bool created, int64_t source_id,
+                 uint32_t serial, const uint8_t digest[32], bool *shadowed) {
+    bool sh = dbreg_config_shadows(view, name);
+    int rc = -1;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, true);
+    if (!rv) goto out;
+    uint32_t h = dns_name_hash_ci(name);
+    dbreg_zone_t *z = dbreg_find(rv, name, h);
+    bool fresh = false;
+    if (!z) {
+        if (!(z = dbreg_add(rv, name, h))) goto out;
+        fresh = true;
+    }
+    bool queue_add = created && !sh;
+    bool queue_remove = created && z->entry && z->entry != entry;
+    if ((queue_add && !dbreg_queue_reserve(&rv->adds, rv->n_adds, &rv->cap_adds)) ||
+        (queue_remove && !dbreg_queue_reserve(&rv->removes, rv->n_removes, &rv->cap_removes))) {
+        if (fresh) {
+            dbreg_unlink(rv, z);
+            free(z);
+        }
+        goto out;
+    }
+    if (created) {
+        if (queue_remove) {                            /* a new entry replaces one registered earlier: that one leaves */
+            rv->removes[rv->n_removes++] = z->entry;   /* (the registry's reference moves to the queue) */
+            atomic_fetch_add_explicit(&g_dbreg_pending, 1, memory_order_relaxed);
+        }
+        z->entry = entry;                              /* the initial reference of the entry is the registry's */
+        if (queue_add) {
+            dbreg_entry_ref(entry);
+            rv->adds[rv->n_adds++] = entry;
+            atomic_fetch_add_explicit(&g_dbreg_pending, 1, memory_order_relaxed);
+        }
+    }
+    z->source_id = source_id;
+    z->serial = serial;
+    memcpy(z->digest, digest, 32);
+    z->last_result = DBREG_APPLIED;
+    z->shadowed = sh;
+    dbreg_set_error(z, NULL);
+    rc = 0;
+out:
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    if (shadowed) *shadowed = sh;
+    return rc;
+}
+
+zone_db_entry_t *dbreg_lookup_entry(const char *view, const char *name) {
+    zone_db_entry_t *e = NULL;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    if (rv) {
+        dbreg_zone_t *z = dbreg_find(rv, name, dns_name_hash_ci(name));
+        if (z) e = z->entry;
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return e;
+}
+
+bool dbreg_reject(const char *view, const char *name, int64_t source_id, const char *reason) {
+    bool ok = false;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, true);
+    if (rv) {
+        uint32_t h = dns_name_hash_ci(name);
+        dbreg_zone_t *z = dbreg_find(rv, name, h);
+        if (!z) z = dbreg_add(rv, name, h);
+        if (z) {
+            if (!z->entry) z->source_id = source_id;
+            z->last_result = DBREG_REJECTED;
+            dbreg_set_error(z, reason);
+            ok = true;
+        }
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return ok;
+}
+
+int dbreg_delete(const char *view, const char *name, int64_t source_id) {
+    int rc = 0;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, name, dns_name_hash_ci(name)) : NULL;
+    if (z && z->source_id == source_id) {
+        zone_db_entry_t *e = z->entry;
+        bool in_snap = false;
+        if (e) {
+            /* the active snapshot cannot change or be freed while we hold the lock (only lock holders replace it) */
+            zone_db_snapshot_t *snap = atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
+            in_snap = find_zone_exact_in_view(snapshot_find_view(snap, view), e->domain) == e;
+        }
+        if (in_snap && !dbreg_queue_reserve(&rv->removes, rv->n_removes, &rv->cap_removes)) {
+            rc = -1;
+        } else {
+            dbreg_unlink(rv, z);
+            if (in_snap) {
+                rv->removes[rv->n_removes++] = e;      /* the registry's reference moves to the queue */
+                atomic_fetch_add_explicit(&g_dbreg_pending, 1, memory_order_relaxed);
+            } else if (e) {
+                zone_entry_unref(e);
+            }
+            free(z->error);
+            free(z);
+            rc = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return rc;
+}
+
+size_t dbreg_pending_count(void) {
+    return atomic_load_explicit(&g_dbreg_pending, memory_order_relaxed);
+}
+
+/* drop the queued additions and removals (with their references); the lock is held */
+static void dbreg_pending_drop_locked(void) {
+    for (size_t v = 0; v < g_dbreg_nviews; v++) {
+        dbreg_view_t *rv = &g_dbreg_views[v];
+        for (size_t i = 0; i < rv->n_adds; i++) zone_entry_unref(rv->adds[i]);
+        for (size_t i = 0; i < rv->n_removes; i++) zone_entry_unref(rv->removes[i]);
+        rv->n_adds = rv->n_removes = 0;
+    }
+    atomic_store_explicit(&g_dbreg_pending, 0, memory_order_relaxed);
+}
+
+/* The registry's entries of one view that the new configuration does not hide (beta design 4.5); the lock is held.
+ * vc: the view of the new configuration, old_view: the same view of the snapshot being replaced (a catalog member of
+ * the same name hides a DB zone too).  *out: a malloc'ed array of the entries (no references taken).  Updates the
+ * shadowed flags and logs the changes.  (size_t)-1: out of memory. */
+static size_t dbreg_collect_view_locked(const view_config_t *vc, view_snapshot_t *old_view, zone_db_entry_t ***out) {
+    *out = NULL;
+    dbreg_view_t *rv = vc->name ? dbreg_view_get(vc->name, false) : NULL;
+    if (!rv || rv->count == 0) return 0;
+    zone_db_entry_t **list = malloc(rv->count * sizeof(*list));
+    if (!list) return (size_t)-1;
+    size_t n = 0;
+    for (size_t b = 0; b < rv->nb; b++) {
+        for (dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
+            if (!z->entry) continue;
+            bool sh = view_find_zone_config(vc, z->name) != NULL;
+            if (!sh && old_view) {
+                zone_db_entry_t *o = find_zone_exact_in_view(old_view, z->name);
+                sh = o && o != z->entry && o->is_catalog_member;
+            }
+            if (sh && !z->shadowed)
+                syslog(LOG_WARNING, "[DB] zone %s from the DB is shadowed by the zone in karidns.conf (view '%s')",
+                       z->name, vc->name);
+            else if (!sh && z->shadowed)
+                syslog(LOG_NOTICE, "[DB] zone %s (view '%s') is served from the DB again: the zone in karidns.conf "
+                       "is gone", z->name, vc->name);
+            z->shadowed = sh;
+            if (!sh) list[n++] = z->entry;
+        }
+    }
+    *out = list;
+    return n;
+}
+
+static int cmp_ptr(const void *a, const void *b) {
+    const void *x = *(const void *const *)a, *y = *(const void *const *)b;
+    return x < y ? -1 : x > y;
+}
+
+static bool ptr_in_sorted(zone_db_entry_t *const *arr, size_t n, const zone_db_entry_t *p) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (arr[mid] == p) return true;
+        if (arr[mid] < p) lo = mid + 1;
+        else hi = mid;
+    }
+    return false;
+}
+
+int snapshot_apply_db_delta(void) {
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    if (atomic_load_explicit(&g_dbreg_pending, memory_order_relaxed) == 0) {
+        pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+        return 0;
+    }
+    zone_db_snapshot_t *old_snap = atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
+    if (!old_snap) {                              /* no snapshot yet: the first full rebuild reads the registry */
+        pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+        return 0;
+    }
+    zone_db_snapshot_t *ns = calloc(1, sizeof(*ns));
+    if (ns && old_snap->view_count) ns->views = calloc(old_snap->view_count, sizeof(view_snapshot_t));
+    if (!ns || (old_snap->view_count && !ns->views)) {
+        free(ns);
+        pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+        syslog(LOG_ERR, "[DB] out of memory publishing the zone changes; they are kept for the next try");
+        return -1;
+    }
+    ns->view_count = old_snap->view_count;
+    atomic_init(&ns->reader_count, 0);
+    int changes = 0;
+    for (size_t v = 0; v < old_snap->view_count; v++) {
+        view_snapshot_t *ov = &old_snap->views[v];
+        view_snapshot_t *vs = &ns->views[v];
+        vs->name = strdup(ov->name ? ov->name : "");
+        bool ok = vs->name != NULL;
+        vs->match_clients_count = ov->match_clients_count;
+        if (ok && ov->match_clients_count > 0) {
+            vs->match_clients = calloc(ov->match_clients_count, sizeof(char *));
+            ok = vs->match_clients != NULL;
+            for (int i = 0; ok && i < ov->match_clients_count; i++) {
+                if (ov->match_clients[i]) ok = (vs->match_clients[i] = strdup(ov->match_clients[i])) != NULL;
+            }
+            if (ok) vs->match_clients_parsed = acl_list_parse(vs->match_clients, vs->match_clients_count);
+        }
+        dbreg_view_t *rv = ok ? dbreg_view_get(vs->name, false) : NULL;
+        /* removals that are in this view, and additions that are still wanted and not in it yet */
+        size_t nrem = 0, nadd = 0;
+        zone_db_entry_t **rem = NULL, **add = NULL;
+        if (rv && (rv->n_removes || rv->n_adds)) {
+            rem = malloc((rv->n_removes + 1) * sizeof(*rem));
+            add = malloc((rv->n_adds + 1) * sizeof(*add));
+            ok = ok && rem && add;
+            for (size_t i = 0; ok && i < rv->n_removes; i++) {
+                zone_db_entry_t *r = rv->removes[i];
+                if (find_zone_exact_in_view(ov, r->domain) == r) rem[nrem++] = r;
+            }
+            for (size_t i = 0; ok && i < rv->n_adds; i++) {
+                zone_db_entry_t *a = rv->adds[i];
+                dbreg_zone_t *z = dbreg_find(rv, a->domain, dns_name_hash_ci(a->domain));
+                if (z && z->entry == a && !z->shadowed && find_zone_exact_in_view(ov, a->domain) != a)
+                    add[nadd++] = a;
+            }
+            if (nrem > 1) qsort(rem, nrem, sizeof(*rem), cmp_ptr);
+        }
+        if (ok) {
+            vs->entries = calloc(ov->zone_count + nadd ? ov->zone_count + nadd : 1, sizeof(zone_db_entry_t *));
+            ok = vs->entries != NULL;
+        }
+        if (ok) {
+            size_t k = 0;
+            for (size_t i = 0; i < ov->zone_count; i++) {
+                zone_db_entry_t *e = ov->entries[i];
+                if (!e || (nrem && ptr_in_sorted(rem, nrem, e))) continue;
+                dbreg_entry_ref(e);
+                vs->entries[k++] = e;
+            }
+            for (size_t i = 0; i < nadd; i++) {
+                dbreg_entry_ref(add[i]);
+                vs->entries[k++] = add[i];
+            }
+            vs->zone_count = k;
+            changes += (int)(nrem + nadd);
+            ok = view_build_hashes(vs);
+        }
+        free(rem);
+        free(add);
+        if (!ok) {
+            free_zone_db_snapshot(ns);
+            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+            syslog(LOG_ERR, "[DB] out of memory publishing the zone changes; they are kept for the next try");
+            return -1;
+        }
+    }
+    uint64_t retire_epoch = rcu_writer_publish(&g_zone_db_active, ns);
+    old_snap->retire_epoch = retire_epoch;
+    dbreg_pending_drop_locked();
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+
+    pthread_t gc_tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&gc_tid, &attr, gc_snapshot_thread, old_snap) != 0)
+        syslog(LOG_ERR, "[DB] cannot start the snapshot cleanup thread; the old snapshot is kept");
+    pthread_attr_destroy(&attr);
+    return changes;
+}
+
+bool dbreg_walk(dbreg_cursor_t *cur, dbreg_walk_cb cb, void *ud) {
+    bool done = true;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    while (done && cur->view < g_dbreg_nviews) {
+        const dbreg_view_t *rv = &g_dbreg_views[cur->view];
+        while (done && cur->bucket < rv->nb) {
+            size_t i = 0;
+            for (const dbreg_zone_t *z = rv->tab[cur->bucket]; z; z = z->next, i++) {
+                if (i < cur->skip) continue;
+                if (!cb(ud, rv->name, z)) {
+                    cur->skip = i;
+                    done = false;
+                    break;
+                }
+            }
+            if (done) {
+                cur->bucket++;
+                cur->skip = 0;
+            }
+        }
+        if (done) {
+            cur->view++;
+            cur->bucket = 0;
+            cur->skip = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return done;
+}
+
+void dbreg_counts(size_t *total, size_t *rejected, size_t *shadowed) {
+    size_t t = 0, r = 0, s = 0;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    for (size_t v = 0; v < g_dbreg_nviews; v++) {
+        const dbreg_view_t *rv = &g_dbreg_views[v];
+        for (size_t b = 0; b < rv->nb; b++) {
+            for (const dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
+                if (z->entry) t++;
+                if (z->last_result == DBREG_REJECTED) r++;
+                if (z->entry && z->shadowed) s++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    if (total) *total = t;
+    if (rejected) *rejected = r;
+    if (shadowed) *shadowed = s;
+}
+
+void dbreg_reset(void) {
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_pending_drop_locked();
+    for (size_t v = 0; v < g_dbreg_nviews; v++) {
+        dbreg_view_t *rv = &g_dbreg_views[v];
+        for (size_t b = 0; b < rv->nb; b++) {
+            dbreg_zone_t *z = rv->tab[b];
+            while (z) {
+                dbreg_zone_t *nx = z->next;
+                if (z->entry) zone_entry_unref(z->entry);
+                free(z->error);
+                free(z);
+                z = nx;
+            }
+        }
+        free(rv->tab);
+        free(rv->adds);
+        free(rv->removes);
+    }
+    free(g_dbreg_views);
+    g_dbreg_views = NULL;
+    g_dbreg_nviews = g_dbreg_capviews = g_dbreg_hint = 0;
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+}
+
+zone_config_t *db_zone_config_new(const char *domain) {
+    zone_config_t *c = calloc(1, sizeof(*c));
+    if (!c) return NULL;
+    c->domain = strdup(domain);
+    c->type = strdup("master");
+    if (!c->domain || !c->type) {
+        free_zone_config(c);
+        return NULL;
+    }
+    return c;
+}
+
+static void free_zone_config_cb(void *p) {
+    free_zone_config(p);
+}
+
+void db_entry_set_config(zone_db_entry_t *entry, const zone_config_t *cfg) {
+    /* one writer per entry (the ingest thread working on the zone) */
+    const zone_config_t *old = atomic_load_explicit(&entry->dbcfg, memory_order_relaxed);
+    uint64_t epoch = rcu_writer_publish(&entry->dbcfg, cfg);
+    if (old && !zone_retire_object(entry, (void *)old, free_zone_config_cb, epoch))
+        syslog(LOG_ERR, "[DB] zone '%s': out of memory retiring the previous settings; they are leaked", entry->domain);
 }
 
 zone_db_snapshot_t *rebuild_zone_db_snapshot(
@@ -1213,10 +1771,20 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 }
             }
 
-            vs->zone_count = static_count + dynamic_count;
+            /* DB zones (beta design 4.5): the registry's entries of this view that no configured zone hides */
+            zone_db_entry_t **db_list = NULL;
+            size_t db_n = dbreg_collect_view_locked(v, old_view, &db_list);
+            if (db_n == (size_t)-1) {
+                { free(valid_members); free(vm_ht); free(vm_chain); }
+                abort_rebuild_snapshot(new_snap, "db_list");
+                return NULL;
+            }
+
+            vs->zone_count = static_count + dynamic_count + db_n;
             if (vs->zone_count > 0) {
                 vs->entries = calloc(vs->zone_count, sizeof(zone_db_entry_t *));
                 if (!vs->entries) {
+                    free(db_list);
                     { free(valid_members); free(vm_ht); free(vm_chain); }
                     abort_rebuild_snapshot(new_snap, "vs->entries");
                     return NULL;
@@ -1232,7 +1800,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                      * メンバーは再利用しない。is_secondary や EXPIRE、転送の状態は
                      * エントリ作成時に決まるので、新しいエントリを作る (旧エントリは
                      * 削除されたゾーンと同じく旧スナップショットとともに解放される)。*/
-                    if (old->kind == zone_kind_from_type(z->type) && !old->is_catalog_member) {
+                    if (old->kind == zone_kind_from_type(z->type) && !old->is_catalog_member && old->source != ZONE_SRC_DB) {
                         entry = old;
                         atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
                         /* B-3: ixfr-history may have changed; a lower depth drops the oldest diffs now */
@@ -1276,6 +1844,12 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     }
                 }
             }
+            for (size_t k = 0; k < db_n; k++) {
+                atomic_fetch_add_explicit(&db_list[k]->snapshot_refs, 1, memory_order_release);
+                ixfr_history_set_depth(db_list[k], ixfr_history_effective(active_config, zone_entry_config(active_config, db_list[k])));
+                vs->entries[zidx++] = db_list[k];
+            }
+            free(db_list);
             vs->zone_count = zidx;
         }
         { free(valid_members); free(vm_ht); free(vm_chain); }
@@ -1382,7 +1956,13 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             if (!found) {
                 if (target_view) {
                     zone_db_entry_t *existing = find_catalog_parent_in_snapshot(target_view, new_desired_members[i].domain);
-                    if (existing && existing->is_catalog_member) {
+                    if (existing && existing->source == ZONE_SRC_DB) {
+                        /* the DB zone keeps its place: two entries of one name in a view would answer unpredictably.
+                         * (A full reconfiguration lets the catalog member win, beta design 4.5.) */
+                        syslog(LOG_WARNING, "[Catalog] Zone '%s' generated member '%s' which collides with a zone from the database. Skipping.",
+                               catalog_entry_to_update->domain, new_desired_members[i].domain);
+                        member_accepted = false;
+                    } else if (existing && existing->is_catalog_member) {
                         if (strcasecmp(zone_entry_catalog_owner(existing), catalog_entry_to_update->domain) != 0) {
                             bool valid_coo = false;
                             for (int p = 0; p < g_pending_coo_count; p++) {
@@ -1713,65 +2293,16 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
 
     for (size_t v = 0; v < new_snap->view_count; v++) {
         view_snapshot_t *vs = &new_snap->views[v];
-        size_t p = 256;
-        while (p < vs->zone_count * 2) p <<= 1;
-        vs->hash_size = p;
-        if (vs->hash_size > 0) {
-            vs->hash_table = malloc(vs->hash_size * sizeof(int));
-            if (vs->hash_table) {
-                for (size_t i = 0; i < vs->hash_size; i++) vs->hash_table[i] = -1;
-            }
-        }
-        if (vs->zone_count > 0) {
-            vs->chain_next = malloc(vs->zone_count * sizeof(int));
-            if (vs->chain_next) {
-                for (size_t i = 0; i < vs->zone_count; i++) vs->chain_next[i] = -1;
-            }
-        }
-
-        vs->suffix_hash_size = p;
-        if (vs->suffix_hash_size > 0) {
-            vs->suffix_hash_table = malloc(vs->suffix_hash_size * sizeof(int));
-            if (vs->suffix_hash_table) {
-                for (size_t i = 0; i < vs->suffix_hash_size; i++) vs->suffix_hash_table[i] = -1;
-            }
-        }
-        if (vs->zone_count > 0) {
-            vs->suffix_chain_next = malloc(vs->zone_count * sizeof(int));
-            if (vs->suffix_chain_next) {
-                for (size_t i = 0; i < vs->zone_count; i++) vs->suffix_chain_next[i] = -1;
-            }
-        }
-        
-        if ((vs->hash_size > 0 && !vs->hash_table) || (vs->zone_count > 0 && !vs->chain_next) ||
-            (vs->suffix_hash_size > 0 && !vs->suffix_hash_table) || (vs->zone_count > 0 && !vs->suffix_chain_next)) {
+        if (!view_build_hashes(vs)) {
             syslog(LOG_ERR, "[Core] Hash table allocation failed for view '%s', aborting snapshot rebuild", vs->name ? vs->name : "unknown");
             abort_rebuild_snapshot(new_snap, "hash_tables");
             return NULL;
         }
-
-        if (vs->hash_table && vs->chain_next) {
-            for (size_t i = 0; i < vs->zone_count; i++) {
-                if (!vs->entries[i]) continue;
-                uint32_t hash = calc_fnv1a_str(vs->entries[i]->domain);
-                size_t idx = hash & (vs->hash_size - 1);
-                vs->chain_next[i] = vs->hash_table[idx];
-                vs->hash_table[idx] = i;
-            }
-        }
-
-        if (vs->suffix_hash_table && vs->suffix_chain_next) {
-            for (size_t i = 0; i < vs->zone_count; i++) {
-                if (!vs->entries[i]) continue;
-                size_t z_len = zone_key_len(vs->entries[i]->domain);
-                uint32_t hash = calc_fnv1a_strn(vs->entries[i]->domain, z_len);
-                size_t idx = hash & (vs->suffix_hash_size - 1);
-                vs->suffix_chain_next[i] = vs->suffix_hash_table[idx];
-                vs->suffix_hash_table[idx] = i;
-            }
-        }
     }
 
+    /* the registry is the source of truth: what the ingest threads queued for the old snapshot is in (or out of) this
+     * one already (full configuration mode); the catalog delta copies the old entries, so its queue stays valid */
+    if (active_config) dbreg_pending_drop_locked();
     uint64_t retire_epoch = rcu_writer_publish(&g_zone_db_active, new_snap);
     if (old_snap) {
         old_snap->retire_epoch = retire_epoch;

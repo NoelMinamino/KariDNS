@@ -1,0 +1,590 @@
+/*
+ * test_db_registry.c - the DB zone registry, the view delta and the zone install of the database loader link
+ * (beta design 4.1-4.5, milestone B4b): dns_snapshot_rcu.c (dbreg_*, snapshot_apply_db_delta, the shadowing rules of
+ * the full-configuration rebuild, dbcfg) and dns_db_install.c (db_zone_build_*).
+ *
+ *  1. install: a zone built from AXFR-format messages is published into an entry (serial, SOA timers, image, NOTIFY
+ *     only when a loaded zone changes its serial); every rejection rule leaves the entry as it was.
+ *  2. registry and delta: commit / apply / delete, idempotence, source id check, rejected-only records, walk.
+ *  3. D-PRIO: a configured zone hides a DB zone, the DB zone comes back when the configured zone is removed.
+ *  4. dbcfg: zone_entry_config() returns it for DB zones, a replaced block is retired and freed.
+ *  5. concurrent readers while zones are added and removed: a reader never sees a DB zone without its image.
+ */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <unistd.h>
+#include <syslog.h>
+#include <sys/stat.h>
+
+#include "../dns_config_parser.h"
+#include "../dns_db_install.h"
+#include "../dns_utils.h"
+#include "db/xfr_mocks.h"
+
+void syslog(int priority, const char *format, ...) {
+    (void)priority;
+    (void)format;
+}
+
+static int g_checks = 0, g_failed = 0;
+#define CHECK(cond) do { g_checks++; if (!(cond)) { g_failed++; \
+    printf("  [FAIL] %s:%d: %s\n", __FILE__, __LINE__, #cond); } } while (0)
+
+/* ---------------------------------------------------------------- wire helpers */
+typedef struct {
+    uint8_t b[8192];
+    size_t n;
+    uint16_t an;
+} msg_t;
+
+static size_t put_name(uint8_t *p, const char *name) {
+    size_t n = 0;
+    const char *s = name;
+    while (*s && !(s[0] == '.' && s[1] == '\0')) {
+        const char *dot = strchr(s, '.');
+        size_t l = dot ? (size_t)(dot - s) : strlen(s);
+        p[n++] = (uint8_t)l;
+        memcpy(p + n, s, l);
+        n += l;
+        if (!dot) break;
+        s = dot + 1;
+    }
+    p[n++] = 0;
+    return n;
+}
+
+static void msg_init(msg_t *m) {
+    memset(m, 0, sizeof(*m));
+    m->b[2] = 0x84;                       /* QR, AA */
+    m->n = 12;
+}
+
+static void msg_rr(msg_t *m, const char *owner, uint16_t type, uint16_t cls, const uint8_t *rd, size_t rdlen) {
+    m->n += put_name(m->b + m->n, owner);
+    m->b[m->n++] = (uint8_t)(type >> 8); m->b[m->n++] = (uint8_t)type;
+    m->b[m->n++] = (uint8_t)(cls >> 8); m->b[m->n++] = (uint8_t)cls;
+    m->b[m->n++] = 0; m->b[m->n++] = 0; m->b[m->n++] = 0x0e; m->b[m->n++] = 0x10;       /* TTL 3600 */
+    m->b[m->n++] = (uint8_t)(rdlen >> 8); m->b[m->n++] = (uint8_t)rdlen;
+    memcpy(m->b + m->n, rd, rdlen);
+    m->n += rdlen;
+    m->an++;
+    m->b[6] = (uint8_t)(m->an >> 8); m->b[7] = (uint8_t)m->an;
+}
+
+static size_t soa_rd(uint8_t *p, const char *zone, uint32_t serial) {
+    char mn[300], rn[300];
+    snprintf(mn, sizeof(mn), "ns.%s", zone);
+    snprintf(rn, sizeof(rn), "host.%s", zone);
+    size_t n = put_name(p, mn);
+    n += put_name(p + n, rn);
+    uint32_t v[5] = { serial, 7200, 3600, 1209600, 300 };
+    for (int i = 0; i < 5; i++) {
+        p[n++] = (uint8_t)(v[i] >> 24); p[n++] = (uint8_t)(v[i] >> 16); p[n++] = (uint8_t)(v[i] >> 8); p[n++] = (uint8_t)v[i];
+    }
+    return n;
+}
+
+static void msg_soa(msg_t *m, const char *zone, uint32_t serial) {
+    uint8_t rd[600];
+    msg_rr(m, zone, 6, 1, rd, soa_rd(rd, zone, serial));
+}
+
+static void msg_a(msg_t *m, const char *owner, uint8_t last) {
+    uint8_t rd[4] = { 192, 0, 2, last };
+    msg_rr(m, owner, 1, 1, rd, 4);
+}
+
+static void msg_ns(msg_t *m, const char *owner, const char *target) {
+    uint8_t rd[300];
+    msg_rr(m, owner, 2, 1, rd, put_name(rd, target));
+}
+
+/* SOA, NS, nrr A records, SOA: one message */
+static void zone_msg(msg_t *m, const char *zone, uint32_t serial, int nrr) {
+    msg_init(m);
+    msg_soa(m, zone, serial);
+    char ns[300];
+    snprintf(ns, sizeof(ns), "ns.%s", zone);
+    msg_ns(m, zone, ns);
+    for (int i = 0; i < nrr; i++) {
+        char o[320];
+        snprintf(o, sizeof(o), "h%d.%s", i, zone);
+        msg_a(m, o, (uint8_t)(i + 1));
+    }
+    msg_soa(m, zone, serial);
+}
+
+/* ---------------------------------------------------------------- fixtures */
+static char g_dir[128];
+
+static server_config_t *load_conf(const char *fmt, ...) {
+    char text[8192];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(text, sizeof(text), fmt, ap);
+    va_end(ap);
+    server_config_t *cfg = calloc(1, sizeof(*cfg));
+    CHECK(cfg != NULL);
+    int rc = parse_named_conf(text, cfg);
+    if (rc != 0) { fprintf(stderr, "config failed:\n%s\n", text); exit(1); }
+    return cfg;
+}
+
+static void rebuild(server_config_t *cfg) {
+    atomic_store_explicit(&g_config_db.active, cfg, memory_order_release);
+    rebuild_zone_db_from_config(cfg, false);
+}
+
+static zone_db_entry_t *new_entry(const char *view, const char *zone) {
+    zone_db_entry_t *e = create_new_zone_entry(zone, view);
+    CHECK(e != NULL);
+    zone_config_t *dc = db_zone_config_new(zone);
+    CHECK(dc != NULL);
+    e->source = ZONE_SRC_DB;
+    e->kind = ZONE_KIND_PRIMARY;
+    atomic_store_explicit(&e->dbcfg, dc, memory_order_release);
+    return e;
+}
+
+static int install_msgs(zone_db_entry_t *e, const char *zone, uint64_t declared, const msg_t *ms, int nm,
+                        char *why, size_t whylen, bool *notified) {
+    db_zone_build_t *b = db_zone_build_new(zone, declared);
+    CHECK(b != NULL);
+    int rc = 0;
+    for (int i = 0; i < nm && rc == 0; i++) rc = db_zone_build_feed(b, ms[i].b, ms[i].n, why, whylen);
+    if (rc == 0) rc = db_zone_build_install(b, e, notified, why, whylen);
+    db_zone_build_free(b);
+    return rc;
+}
+
+/* a complete zone through the same steps as the ingest thread: build, install, register */
+static zone_db_entry_t *add_zone(const char *view, const char *zone, uint32_t serial, int nrr, int64_t id) {
+    msg_t m;
+    zone_msg(&m, zone, serial, nrr);
+    zone_db_entry_t *e = dbreg_lookup_entry(view, zone);
+    bool created = false;
+    if (!e) { e = new_entry(view, zone); created = true; }
+    char why[128];
+    int rc = install_msgs(e, zone, (uint64_t)nrr + 3, &m, 1, why, sizeof(why), NULL);
+    if (rc != 0) { printf("  install of %s failed: %s\n", zone, why); CHECK(rc == 0); return NULL; }
+    uint8_t dg[32] = { 1 };
+    bool sh = false;
+    CHECK(dbreg_commit(view, zone, e, created, id, serial, dg, &sh) == 0);
+    return e;
+}
+
+static bool in_snapshot(const char *view, zone_db_entry_t *e) {
+    zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+    view_snapshot_t *v = snapshot_find_view(s, view);
+    bool r = v && find_zone_exact_in_view(v, e->domain) == e;
+    release_zone_snapshot(s);
+    return r;
+}
+
+static bool name_in_snapshot(const char *view, const char *name) {
+    zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+    view_snapshot_t *v = snapshot_find_view(s, view);
+    bool r = v && find_zone_exact_in_view(v, name) != NULL;
+    release_zone_snapshot(s);
+    return r;
+}
+
+/* ---------------------------------------------------------------- 1. install */
+static void test_install(void) {
+    printf("[TEST] DB install: a zone from AXFR-format messages, every rejection rule...\n");
+    zone_db_entry_t *e = new_entry("default", "a.test.");
+    msg_t m;
+    char why[128] = "";
+    bool notified = true;
+
+    zone_msg(&m, "a.test.", 10, 3);
+    CHECK(install_msgs(e, "a.test.", 3 + 3, &m, 1, why, sizeof(why), &notified) == 0);
+    CHECK(!notified);                                           /* the first load sends no NOTIFY (R-21) */
+    CHECK(e->serial == 10 && e->refresh == 7200 && e->retry == 3600 && e->expire == 1209600);
+    zone_version_t *v = atomic_load(&e->rcu.active);
+    CHECK(v->image && v->image->n_rrs == 5);                    /* SOA, NS, 3 A (the closing SOA is not a record) */
+    CHECK(!atomic_load(&e->notify_now));
+
+    /* a new serial of a loaded zone: published, NOTIFY requested */
+    zone_msg(&m, "a.test.", 11, 4);
+    CHECK(install_msgs(e, "a.test.", 4 + 3, &m, 1, why, sizeof(why), &notified) == 0);
+    CHECK(notified && atomic_load(&e->notify_now));
+    CHECK(e->serial == 11);
+    v = atomic_load(&e->rcu.active);
+    CHECK(v->image && v->image->n_rrs == 6);
+    atomic_store(&e->notify_now, false);
+    /* the same serial again: published again, no NOTIFY; a lower serial is accepted (an operator restoring old data) */
+    zone_msg(&m, "a.test.", 11, 4);
+    CHECK(install_msgs(e, "a.test.", 7, &m, 1, why, sizeof(why), &notified) == 0 && !notified);
+    zone_msg(&m, "a.test.", 5, 2);
+    CHECK(install_msgs(e, "a.test.", 5, &m, 1, why, sizeof(why), &notified) == 0);
+    CHECK(e->serial == 5);
+
+    uint32_t keep_serial = e->serial;
+    size_t keep_rrs = atomic_load(&e->rcu.active)->image->n_rrs;
+
+    /* the zone in several messages */
+    {
+        msg_t a, b, c;
+        msg_init(&a); msg_soa(&a, "a.test.", 20); msg_ns(&a, "a.test.", "ns.a.test.");
+        msg_init(&b); msg_a(&b, "x.a.test.", 1); msg_a(&b, "y.a.test.", 2);
+        msg_init(&c); msg_soa(&c, "a.test.", 20);
+        msg_t ms[3] = { a, b, c };
+        CHECK(install_msgs(e, "a.test.", 5, ms, 3, why, sizeof(why), &notified) == 0);
+        CHECK(e->serial == 20 && atomic_load(&e->rcu.active)->image->n_rrs == 4);
+        keep_serial = 20;
+        keep_rrs = 4;
+    }
+
+    /* rejections: the entry keeps its last good version */
+    zone_msg(&m, "a.test.", 30, 2);
+    CHECK(install_msgs(e, "a.test.", 6, &m, 1, why, sizeof(why), NULL) != 0 && strstr(why, "count mismatch"));
+    CHECK(install_msgs(e, "a.test.", 4, &m, 1, why, sizeof(why), NULL) != 0 && strstr(why, "count mismatch"));
+    {   /* an owner outside the zone: AXFR-in would skip it, the DB path refuses the zone */
+        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_a(&m, "host.other.test.", 1); msg_soa(&m, "a.test.", 31);
+        db_zone_build_t *b = db_zone_build_new("a.test.", 3);
+        CHECK(db_zone_build_feed(b, m.b, m.n, why, sizeof(why)) != 0 && strstr(why, "outside the zone"));
+        db_zone_build_free(b);
+    }
+    {   /* the apex SOA of another zone */
+        msg_init(&m); msg_soa(&m, "b.test.", 31); msg_soa(&m, "b.test.", 31);
+        db_zone_build_t *b = db_zone_build_new("a.test.", 2);
+        CHECK(db_zone_build_feed(b, m.b, m.n, why, sizeof(why)) != 0);
+        db_zone_build_free(b);
+    }
+    {   /* a subdomain's SOA first: it is inside the zone but not the apex */
+        msg_init(&m); msg_soa(&m, "sub.a.test.", 31); msg_a(&m, "a.test.", 1); msg_soa(&m, "sub.a.test.", 31);
+        CHECK(install_msgs(e, "a.test.", 3, &m, 1, why, sizeof(why), NULL) != 0 && strstr(why, "SOA of its apex"));
+    }
+    {   /* no closing SOA */
+        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_a(&m, "x.a.test.", 1);
+        CHECK(install_msgs(e, "a.test.", 3, &m, 1, why, sizeof(why), NULL) != 0 && strstr(why, "final SOA"));
+    }
+    {   /* a record after the closing SOA, in the same message and in a later one */
+        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_soa(&m, "a.test.", 31); msg_a(&m, "x.a.test.", 1);
+        db_zone_build_t *b = db_zone_build_new("a.test.", 3);
+        CHECK(db_zone_build_feed(b, m.b, m.n, why, sizeof(why)) != 0 && strstr(why, "after the final SOA"));
+        db_zone_build_free(b);
+        msg_t a, c;
+        msg_init(&a); msg_soa(&a, "a.test.", 31); msg_soa(&a, "a.test.", 31);
+        msg_init(&c); msg_a(&c, "x.a.test.", 1);
+        b = db_zone_build_new("a.test.", 3);
+        CHECK(db_zone_build_feed(b, a.b, a.n, why, sizeof(why)) == 0);
+        CHECK(db_zone_build_feed(b, c.b, c.n, why, sizeof(why)) != 0 && strstr(why, "after the final SOA"));
+        db_zone_build_free(b);
+    }
+    {   /* two SOAs (a different serial in the middle) */
+        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_soa(&m, "a.test.", 32); msg_soa(&m, "a.test.", 31);
+        int rc2 = install_msgs(e, "a.test.", 3, &m, 1, why, sizeof(why), NULL);
+        CHECK(rc2 != 0 && strstr(why, "more than one SOA"));
+    }
+    {   /* a class other than IN */
+        uint8_t rd[4] = { 1, 2, 3, 4 };
+        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_rr(&m, "x.a.test.", 1, 3, rd, 4); msg_soa(&m, "a.test.", 31);
+        CHECK(install_msgs(e, "a.test.", 3, &m, 1, why, sizeof(why), NULL) != 0 && (strstr(why, "class") || strstr(why, "malformed")));
+    }
+    {   /* garbage inside a valid frame: a truncated RR */
+        zone_msg(&m, "a.test.", 31, 2);
+        m.n -= 7;
+        db_zone_build_t *b = db_zone_build_new("a.test.", 6);
+        CHECK(db_zone_build_feed(b, m.b, m.n, why, sizeof(why)) != 0 && strstr(why, "malformed"));
+        db_zone_build_free(b);
+    }
+    CHECK(e->serial == keep_serial && atomic_load(&e->rcu.active)->image->n_rrs == keep_rrs);
+    zone_retire_process(true);          /* the retired versions hold a reference of the entry */
+    free_zone_db_entry(e);
+}
+
+/* ---------------------------------------------------------------- 2. registry and delta */
+typedef struct { int n, limit; } walk_ctx_t;
+static bool cb_count(void *ud, const char *view, const dbreg_zone_t *z) {
+    (void)view; (void)z;
+    walk_ctx_t *p = ud;
+    if (p->n >= p->limit) return false;
+    p->n++;
+    return true;
+}
+
+static void test_registry_delta(void) {
+    printf("[TEST] DB registry: commit, view delta, delete, rejected-only records...\n");
+    char path[300];
+    snprintf(path, sizeof(path), "%s/file.zone", g_dir);
+    FILE *f = fopen(path, "w");
+    fputs("$ORIGIN file.test.\n$TTL 300\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.1\n", f);
+    fclose(f);
+    server_config_t *cfg = load_conf("view \"default\" { match-clients { any; };\n"
+                                     "  zone \"file.test\" { type master; file \"%s\"; }; };\n"
+                                     "view \"other\" { match-clients { 10.0.0.0/8; };\n"
+                                     "  zone \"file.test\" { type master; file \"%s\"; }; };\n", path, path);
+    rebuild(cfg);
+    CHECK(name_in_snapshot("default", "file.test.") && name_in_snapshot("other", "file.test."));
+
+    zone_db_entry_t *a = add_zone("default", "a.test.", 1, 2, 11);
+    zone_db_entry_t *b = add_zone("default", "b.test.", 1, 2, 12);
+    zone_db_entry_t *c = add_zone("other", "c.test.", 1, 2, 13);
+    CHECK(dbreg_pending_count() == 3);
+    CHECK(!in_snapshot("default", a));                         /* installed but not visible until the delta */
+    CHECK(snapshot_apply_db_delta() == 3);
+    CHECK(in_snapshot("default", a) && in_snapshot("default", b) && in_snapshot("other", c));
+    CHECK(!in_snapshot("default", c));                         /* views are separate */
+    CHECK(name_in_snapshot("default", "file.test."));
+    CHECK(dbreg_pending_count() == 0 && snapshot_apply_db_delta() == 0);
+
+    /* the same name in the other view is another entry */
+    zone_db_entry_t *a2 = add_zone("other", "a.test.", 7, 1, 21);
+    CHECK(a2 && a2 != a);
+    CHECK(snapshot_apply_db_delta() == 1);
+    CHECK(in_snapshot("other", a2) && in_snapshot("default", a));
+
+    /* a new version of a registered zone: same entry, no delta */
+    zone_db_entry_t *a_again = add_zone("default", "a.test.", 2, 3, 11);
+    CHECK(a_again == a && dbreg_pending_count() == 0);
+    CHECK(a->serial == 2);
+
+    /* delete: wrong id does nothing, right id queues the removal */
+    CHECK(dbreg_delete("default", "a.test.", 999) == 0);
+    CHECK(dbreg_delete("default", "nothere.test.", 1) == 0);
+    CHECK(dbreg_delete("default", "A.TEST.", 11) == 1);        /* names compare case-insensitively */
+    CHECK(dbreg_lookup_entry("default", "a.test.") == NULL);
+    CHECK(dbreg_pending_count() == 1);
+    CHECK(in_snapshot("default", a));                          /* still served until the delta */
+    CHECK(snapshot_apply_db_delta() == 1);
+    CHECK(!name_in_snapshot("default", "a.test.") && in_snapshot("default", b));
+    CHECK(in_snapshot("other", a2));
+
+    /* a rejection keeps the last good version; a record without a version is only an error */
+    CHECK(dbreg_reject("default", "b.test.", 12, "bad row 7"));
+    CHECK(dbreg_lookup_entry("default", "b.test.") == b);
+    CHECK(dbreg_reject("default", "never.test.", 99, "no SOA"));
+    CHECK(dbreg_lookup_entry("default", "never.test.") == NULL);
+    size_t total, rej, shd;
+    dbreg_counts(&total, &rej, &shd);
+    CHECK(total == 3 && rej == 2 && shd == 0);                 /* b, c, a2 hold a version; b and never are rejected */
+    CHECK(dbreg_delete("default", "never.test.", 99) == 1);    /* an error-only record can be deleted too */
+    CHECK(dbreg_pending_count() == 0);
+
+    /* walk: in two chunks the whole registry is seen once */
+    {
+        walk_ctx_t w = { 0, 2 };
+        dbreg_cursor_t cur;
+        memset(&cur, 0, sizeof(cur));
+        int seen = 0;
+        bool done = false;
+        for (int round = 0; round < 10 && !done; round++) {
+            w.n = 0;
+            done = dbreg_walk(&cur, cb_count, &w);
+            seen += w.n;
+        }
+        CHECK(done && seen == 3);
+    }
+
+    /* a new entry for a name that is registered replaces it: the old one leaves */
+    zone_db_entry_t *b_new = new_entry("default", "b.test.");
+    {
+        msg_t m;
+        zone_msg(&m, "b.test.", 50, 1);
+        char why[128];
+        CHECK(install_msgs(b_new, "b.test.", 4, &m, 1, why, sizeof(why), NULL) == 0);
+        uint8_t dg[32] = { 0 };
+        bool sh;
+        CHECK(dbreg_commit("default", "b.test.", b_new, true, 12, 50, dg, &sh) == 0 && !sh);
+        CHECK(dbreg_pending_count() == 2);
+        CHECK(snapshot_apply_db_delta() == 2);
+        CHECK(in_snapshot("default", b_new) && !in_snapshot("default", b));
+    }
+
+    dbreg_reset();
+    CHECK(dbreg_pending_count() == 0);
+}
+
+/* ---------------------------------------------------------------- 3. D-PRIO */
+static void test_shadowing(void) {
+    printf("[TEST] DB registry: a configured zone hides a DB zone, and the DB zone comes back...\n");
+    char path[300];
+    snprintf(path, sizeof(path), "%s/file.zone", g_dir);
+    char path2[300];
+    snprintf(path2, sizeof(path2), "%s/dup.zone", g_dir);
+    FILE *f = fopen(path2, "w");
+    fputs("$ORIGIN dup.test.\n$TTL 300\n@ IN SOA ns h 9 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.9\n", f);
+    fclose(f);
+    server_config_t *cfg1 = load_conf("view \"default\" { match-clients { any; };\n"
+                                      "  zone \"file.test\" { type master; file \"%s\"; }; };\n", path);
+    rebuild(cfg1);
+    zone_db_entry_t *d = add_zone("default", "dup.test.", 3, 2, 31);
+    zone_db_entry_t *keep = add_zone("default", "keep.test.", 3, 2, 32);
+    CHECK(snapshot_apply_db_delta() == 2);
+    CHECK(in_snapshot("default", d) && in_snapshot("default", keep));
+
+    /* full reload with a file zone of the same name: that one answers */
+    server_config_t *cfg2 = load_conf("view \"default\" { match-clients { any; };\n"
+                                      "  zone \"file.test\" { type master; file \"%s\"; };\n"
+                                      "  zone \"dup.test\" { type master; file \"%s\"; }; };\n", path, path2);
+    rebuild(cfg2);
+    CHECK(name_in_snapshot("default", "dup.test.") && !in_snapshot("default", d));   /* the file zone's entry */
+    CHECK(in_snapshot("default", keep));
+    zone_db_entry_t *served = NULL;
+    {
+        zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+        served = find_zone_exact_in_view(snapshot_find_view(s, "default"), "dup.test.");
+        CHECK(served && served->source == ZONE_SRC_CONFIG);
+        release_zone_snapshot(s);
+    }
+    CHECK(dbreg_lookup_entry("default", "dup.test.") == d);          /* still in the registry */
+    size_t total, rej, shd;
+    dbreg_counts(&total, &rej, &shd);
+    CHECK(total == 2 && shd == 1);
+
+    /* a DB zone arriving while the configured zone exists: loaded, hidden, never queued */
+    {
+        msg_t m;
+        zone_msg(&m, "dup.test.", 4, 1);
+        char why[128];
+        CHECK(install_msgs(d, "dup.test.", 4, &m, 1, why, sizeof(why), NULL) == 0);
+        uint8_t dg[32] = { 0 };
+        bool sh = false;
+        CHECK(dbreg_commit("default", "dup.test.", d, false, 31, 4, dg, &sh) == 0 && sh);
+        zone_db_entry_t *late = new_entry("default", "file.test.");
+        CHECK(install_msgs(late, "file.test.", 4, &m, 1, why, sizeof(why), NULL) != 0);   /* wrong zone name in the data */
+        zone_msg(&m, "file.test.", 4, 1);
+        CHECK(install_msgs(late, "file.test.", 4, &m, 1, why, sizeof(why), NULL) == 0);
+        CHECK(dbreg_commit("default", "file.test.", late, true, 33, 4, dg, &sh) == 0 && sh);
+        CHECK(dbreg_pending_count() == 0);
+    }
+
+    /* the configured zone goes away: the DB version is served again at the next rebuild */
+    rebuild(cfg1);
+    CHECK(in_snapshot("default", d));
+    CHECK(in_snapshot("default", keep));
+    {
+        zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+        zone_db_entry_t *f1 = find_zone_exact_in_view(snapshot_find_view(s, "default"), "file.test.");
+        CHECK(f1 && f1->source == ZONE_SRC_CONFIG);                  /* file.test is still the configured zone's */
+        release_zone_snapshot(s);
+    }
+    dbreg_reset();
+}
+
+/* ---------------------------------------------------------------- 4. dbcfg */
+static void test_dbcfg(void) {
+    printf("[TEST] DB settings: zone_entry_config() and the retirement of a replaced block...\n");
+    zone_db_entry_t *e = new_entry("default", "cfg.test.");
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    const zone_config_t *c1 = zone_entry_config(&cfg, e);
+    CHECK(c1 && strcmp(c1->type, "master") == 0 && strcmp(c1->domain, "cfg.test.") == 0 && c1->ext == NULL);
+    CHECK(zone_entry_config(NULL, e) == c1);                         /* no configuration needed for a DB zone */
+    zone_config_t *c2 = db_zone_config_new("cfg.test.");
+    CHECK(c2 != NULL);
+    db_entry_set_config(e, c2);
+    CHECK(zone_entry_config(&cfg, e) == c2);
+    zone_retire_process(true);                                        /* the old block is freed after the grace period */
+    CHECK(zone_entry_config(&cfg, e) == c2);
+    atomic_store(&e->is_transferring, false);
+    free_zone_db_entry(e);                                            /* frees the current block */
+    /* build_zone_response_cache() reads the entry's settings, not the configuration's */
+    zone_db_entry_t *e2 = new_entry("default", "cfg2.test.");
+    msg_t m;
+    char why[128];
+    zone_msg(&m, "cfg2.test.", 1, 2);
+    CHECK(install_msgs(e2, "cfg2.test.", 5, &m, 1, why, sizeof(why), NULL) == 0);
+    CHECK(atomic_load(&e2->rcu.active)->rcache_ok);
+    free_zone_db_entry(e2);
+}
+
+/* ---------------------------------------------------------------- 5. readers while zones come and go */
+static _Atomic bool g_stop;
+static _Atomic long g_reads, g_empty;
+
+static void *reader_thread(void *arg) {
+    int id = (int)(intptr_t)arg;
+    while (!atomic_load(&g_stop)) {
+        zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+        view_snapshot_t *v = snapshot_find_view(s, "default");
+        for (int i = 0; v && i < 40; i++) {
+            char q[64];
+            snprintf(q, sizeof(q), "www.z%d.test.", (i + id) % 40);
+            zone_db_entry_t *e = find_zone_in_view(v, q);
+            if (e && e->source == ZONE_SRC_DB) {
+                rcu_aux_read_lock();
+                zone_version_t *ver = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
+                atomic_fetch_add(&g_reads, 1);
+                if (!ver->image || ver->image->n_rrs == 0) atomic_fetch_add(&g_empty, 1);   /* must never happen */
+                rcu_aux_read_unlock();
+            }
+        }
+        release_zone_snapshot(s);
+    }
+    return NULL;
+}
+
+static void test_concurrent(void) {
+    printf("[TEST] DB view delta under concurrent readers...\n");
+    char path[300];
+    snprintf(path, sizeof(path), "%s/file.zone", g_dir);
+    server_config_t *cfg = load_conf("view \"default\" { match-clients { any; };\n"
+                                     "  zone \"file.test\" { type master; file \"%s\"; }; };\n", path);
+    rebuild(cfg);
+    pthread_t th[3];
+    for (intptr_t i = 0; i < 3; i++) pthread_create(&th[i], NULL, reader_thread, (void *)i);
+    for (int round = 0; round < 150; round++) {
+        char z[64];
+        int k = round % 40;
+        snprintf(z, sizeof(z), "z%d.test.", k);
+        zone_db_entry_t *old = dbreg_lookup_entry("default", z);
+        if (old && round % 3 == 0) {
+            CHECK(dbreg_delete("default", z, 1000 + k) == 1);
+        } else {
+            zone_db_entry_t *e = add_zone("default", z, (uint32_t)round + 1, 1, 1000 + k);
+            CHECK(e != NULL);
+        }
+        if (round % 5 == 4) CHECK(snapshot_apply_db_delta() >= 0);
+        if (round % 20 == 19) zone_retire_process(true);
+    }
+    CHECK(snapshot_apply_db_delta() >= 0);
+    atomic_store(&g_stop, true);
+    for (int i = 0; i < 3; i++) pthread_join(th[i], NULL);
+    CHECK(atomic_load(&g_empty) == 0);
+    printf("  readers saw %ld DB zone lookups\n", atomic_load(&g_reads));
+    /* every registered zone is in the snapshot exactly once */
+    zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+    view_snapshot_t *v = snapshot_find_view(s, "default");
+    size_t total, rej, shd;
+    dbreg_counts(&total, &rej, &shd);
+    size_t db_in_view = 0;
+    for (size_t i = 0; i < v->zone_count; i++) {
+        if (v->entries[i] && v->entries[i]->source == ZONE_SRC_DB) {
+            db_in_view++;
+            CHECK(dbreg_lookup_entry("default", v->entries[i]->domain) == v->entries[i]);
+        }
+    }
+    CHECK(db_in_view == total);
+    release_zone_snapshot(s);
+    zone_retire_process(true);
+    dbreg_reset();
+}
+
+int main(void) {
+    snprintf(g_dir, sizeof(g_dir), "/tmp/karidns_dbreg.XXXXXX");
+    if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
+    test_install();
+    test_registry_delta();
+    test_shadowing();
+    test_dbcfg();
+    test_concurrent();
+    char cmd[300];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", g_dir);
+    if (system(cmd) != 0) { /* leave the directory */ }
+    printf("\n%d checks, %d failed\n", g_checks, g_failed);
+    if (g_failed) return 1;
+    printf("=== test_db_registry: all checks passed ===\n");
+    return 0;
+}

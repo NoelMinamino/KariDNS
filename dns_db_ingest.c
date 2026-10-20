@@ -1,23 +1,29 @@
 /*
  * dns_db_ingest.c - the db ingest thread of the Backend (see dns_db_ingest.h).
  *
- * Single thread, no mutex: the stream state is owned by the thread; the only things other threads touch are the
- * "configuration changed" flag and the kqueue EVFILT_USER trigger.  The configuration is read inside an RCU read
- * section (rcu_aux_read_lock) and copied.  Everything from the stream is untrusted: dns_db_stream.c validates it,
- * a violation closes the stream (the loader then ends and the supervisor restarts it).
+ * The stream state is owned by one thread; the threads that touch it are the configuration trigger (an EVFILT_USER
+ * event) and, with `ingest-threads` N > 1, N builder threads that parse and publish complete zones.  There is no
+ * mutex of its own: builders get their job through an atomic slot and a per-builder kqueue, hand the result back on a
+ * lock-free stack and an EVFILT_USER event, and share the DB zone registry under the existing
+ * g_zone_db_rebuild_lock (dns_snapshot_rcu.c).  The configuration is read inside an RCU read section
+ * (rcu_aux_read_lock) and copied.  Everything from the stream is untrusted: dns_db_stream.c validates it, a protocol
+ * violation closes the stream (the loader then ends and the supervisor restarts it), a zone that fails its checks is
+ * rejected alone and keeps its last good version.
  *
- * The thread allocates outside the query path only (start, stream buffers, the output queue).
+ * Allocation happens on the load path only (start, stream buffers, zones), never on the query path.
  */
 #include "dns_db_ingest.h"
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/capsicum.h>
 #include <sys/event.h>
@@ -26,25 +32,66 @@
 #include <sys/uio.h>
 
 #include "dns_config_parser.h"
+#include "dns_db_install.h"
 #include "dns_db_stream.h"
 #include "dns_epoch_rcu.h"
 #include "dns_server_internal.h"
+#include "dns_snapshot_rcu.h"
 
-#define ING_MAX_OUT (32u << 20)   /* queued answers the loader has not read: above this the loader is dropped */
+_Static_assert(KARIDNS_DB_MAX_VIEWS == KDB_MAX_CONFIG_VIEWS, "the configuration check and the CONFIG message must agree");
+
+#define ING_MAX_OUT (32u << 20)  /* queued answers the loader has not read: above this the loader is dropped */
 #define ING_ZONES_LOGGED 16       /* zones logged one by one per connection */
+#define ING_REJECTS_LOGGED 100    /* rejected zones logged one by one per batch */
 #define ING_READ_ROUNDS 16
-#define ING_EVT_CONFIG 1          /* EVFILT_USER ident */
+#define ING_EVT_CONFIG 1          /* EVFILT_USER idents of the main kqueue */
+#define ING_EVT_RESULT 2
+#define ING_RETIRE_EVERY 1024     /* design 4.3: a blocking grace period every this many published zones */
+#define ING_DELTA_MS 1000         /* design 4.4: new zones become visible at least this often */
+#define ING_INV_CHUNK 400         /* INVENTORY entries per message */
+#define ING_INV_QUEUE_LOW (256u << 10)
+#define ING_MAX_BUILDERS 16
+#define ING_RBUF 65536
+#define ING_FLUSH_AT 16384        /* queued bytes that are written at once; the rest goes out after the event round */
 
 typedef struct {
   uint64_t generation;
   char driver[40];
   uint32_t nviews;
   uint64_t max_zone_records, max_zone_bytes;
+  uint32_t ingest_threads;
   bool enabled;
 } ing_cfg_t;
 
+/* one zone on its way from ZONE_BEGIN to ZONE_RESULT */
+typedef struct ing_job {
+  struct ing_job *next;                  /* result stack */
+  uint16_t view;
+  char view_name[KARIDNS_VIEW_NAME_MAX];
+  char zone[DNS_NAME_TEXT_SIZE];
+  int64_t source_id;
+  uint32_t serial;
+  uint64_t rr_count;
+  uint8_t digest[KDB_DIGEST_LEN];
+  db_zone_build_t *build;
+  bool skip;                             /* decided at ZONE_BEGIN: the data is discarded, the zone is rejected */
+  bool failed;                           /* a ZONE_DATA message was refused */
+  bool has_settings;
+  uint8_t *buf;                          /* ingest-threads > 1: the ZONE_DATA messages, [u32 length][bytes] each */
+  size_t buf_len, buf_cap;
+  uint8_t status;                        /* KDB_ST_* */
+  int builder;                           /* index of the builder it was handed to */
+  char reason[KDB_REASON_LEN];
+} ing_job_t;
+
 typedef struct {
-  int kq, ctrl_fd, stream_fd;
+  pthread_t tid;
+  int kq;
+  _Atomic(ing_job_t *) slot;
+} ing_builder_t;
+
+typedef struct {
+  int kq, wait_kq, ctrl_fd, stream_fd;
   bool write_armed;
   uint8_t *body;               /* KDB_MAX_BODY */
   uint8_t *rbuf;               /* ING_RBUF */
@@ -53,20 +100,102 @@ typedef struct {
   kdb_enc_t enc;
   uint8_t *out;                /* answers queued for the loader */
   size_t out_len, out_off, out_cap;
-  bool hello_done;
+  bool hello_done, need_cleanup;
+  /* view index -> name, as of the CONFIG last sent */
+  char (*view_names)[KARIDNS_VIEW_NAME_MAX];
+  uint32_t nview_names;
   /* the zone being received */
-  uint16_t zone_view;
-  char zone_name[DNS_NAME_TEXT_SIZE];
-  uint64_t zone_rr;
+  ing_job_t *cur;
   uint32_t zones_logged;
-  uint32_t batch_rejected;
+  uint32_t rejects_logged;
+  uint32_t settings_ignored;
+  /* batch */
+  bool in_batch;
+  uint64_t batch_id;
+  uint8_t batch_kind;
+  uint32_t b_applied, b_rejected, b_shadowed, b_deleted, b_failed;
+  /* builders and work in flight */
+  uint32_t nbuilders;          /* 0 = the stream thread builds */
+  ing_builder_t builders[ING_MAX_BUILDERS];
+  ing_job_t *flight[ING_MAX_BUILDERS];  /* the job each builder works on, until its result was taken (stream thread only) */
+  _Atomic(ing_job_t *) res_head;
+  uint32_t inflight;
+  uint32_t since_retire;
+  int64_t last_delta_ms;
+  /* INVENTORY in progress */
+  bool inv_active;
+  dbreg_cursor_t inv_cur;
+  uint64_t inv_sent;
 } ing_t;
-
-#define ING_RBUF 65536
 
 static ing_t g_ing;
 static _Atomic bool g_cfg_dirty;
 static _Atomic int g_ing_kq = -1;
+static _Atomic uint64_t g_last_change_seq;   /* what the last BATCH_BEGIN said (design 1.4, INVENTORY_END) */
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* status for `karictl dbstatus`: written by the stream thread, read by the control thread                        */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+#define ST_STR 200
+static struct {
+  _Atomic bool connected, ever_connected, batch_done;
+  _Atomic uint32_t pid, b_applied, b_rejected, b_shadowed, b_deleted;
+  _Atomic int64_t since;                                    /* connected since / disconnected since */
+  _Atomic uint64_t tot_applied, tot_rejected, tot_shadowed, tot_deleted, tot_failed;
+  _Atomic uint64_t batch_id;
+  _Atomic int batch_kind;
+  _Atomic int64_t batch_time;
+  _Atomic uint32_t seq;                                     /* seqlock of the strings (one writer) */
+  _Atomic char err[ST_STR], ver[ST_STR];
+  _Atomic int64_t err_time;
+} g_st;
+
+static void st_str_set(_Atomic char *dst, const char *src, size_t n) {
+  size_t i = 0;
+  for (; src && i + 1 < n && src[i]; i++) atomic_store_explicit(&dst[i], src[i], memory_order_relaxed);
+  atomic_store_explicit(&dst[i], '\0', memory_order_relaxed);
+}
+
+static void st_str_get(const _Atomic char *src, char *dst, size_t n) {
+  size_t i = 0;
+  for (; i + 1 < n; i++) {
+    char c = atomic_load_explicit(&src[i], memory_order_relaxed);
+    dst[i] = c;
+    if (!c) return;
+  }
+  dst[i] = '\0';
+}
+
+static void st_set_strings(const char *err, const char *ver) {
+  uint32_t s = atomic_load_explicit(&g_st.seq, memory_order_relaxed);
+  atomic_store_explicit(&g_st.seq, s + 1, memory_order_release);
+  atomic_thread_fence(memory_order_seq_cst);
+  if (err) {
+    st_str_set(g_st.err, err, ST_STR);
+    atomic_store_explicit(&g_st.err_time, (int64_t)time(NULL), memory_order_relaxed);
+  }
+  if (ver) st_str_set(g_st.ver, ver, ST_STR);
+  atomic_store_explicit(&g_st.seq, s + 2, memory_order_release);
+}
+
+static void st_get_strings(char *err, size_t en, char *ver, size_t vn, int64_t *err_time) {
+  for (int tries = 0; tries < 1000; tries++) {
+    uint32_t s1 = atomic_load_explicit(&g_st.seq, memory_order_acquire);
+    if (s1 & 1) continue;
+    st_str_get(g_st.err, err, en);
+    st_str_get(g_st.ver, ver, vn);
+    *err_time = atomic_load_explicit(&g_st.err_time, memory_order_relaxed);
+    atomic_thread_fence(memory_order_seq_cst);
+    if (atomic_load_explicit(&g_st.seq, memory_order_acquire) == s1) return;
+  }
+}
+
+static int64_t now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 /* ------------------------------------------------------------------------------------------------------------- */
 /* rights                                                                                                         */
@@ -100,6 +229,7 @@ static void fill_snap(const server_config_t *cfg, ing_cfg_t *c) {
     for (const view_config_t *v = cfg->views; v; v = v->next) c->nviews++;
     c->max_zone_records = cfg->database.max_zone_records;
     c->max_zone_bytes = cfg->database.max_zone_bytes;
+    c->ingest_threads = cfg->database.ingest_threads;
   }
 }
 
@@ -118,10 +248,17 @@ static void enc_sane_str(kdb_enc_t *e, uint16_t tag, const char *s) {
   kdb_enc_str(e, tag, buf);
 }
 
+static void sane_copy(char *dst, size_t cap, const char *s, size_t n) {
+  size_t i = 0;
+  for (; i + 1 < cap && i < n && s[i]; i++) dst[i] = (s[i] >= 0x20 && s[i] <= 0x7E) ? s[i] : '?';
+  dst[i] = '\0';
+}
+
 /* CONFIG from the active configuration (design 1.4).  A view that takes no DB zones ("database none;") is left
  * out; the others carry their own source or, if they have none, the global one (the loader needs a path for every
  * view it reads; "absent = shared source" of the design is expressed by repeating the global path).  Views are
- * numbered by their position in the configuration.  false: no database block, or too many views. */
+ * numbered by their position in the configuration; the names are remembered so that ZONE_BEGIN's index can be
+ * turned into a view name.  false: no database block, or too many views. */
 static bool build_config(ing_t *g, ing_cfg_t *snap) {
   bool ok = false;
   rcu_aux_read_lock();
@@ -130,6 +267,9 @@ static bool build_config(ing_t *g, ing_cfg_t *snap) {
     const database_config_t *db = &cfg->database;
     bool sqlite = db->driver && strcmp(db->driver, "sqlite3") == 0;
     fill_snap(cfg, snap);
+    free(g->view_names);
+    g->view_names = snap->nviews ? calloc(snap->nviews, sizeof(*g->view_names)) : NULL;
+    g->nview_names = g->view_names ? snap->nviews : 0;
     kdb_enc_reset(&g->enc);
     kdb_enc_begin(&g->enc, KDB_T_CONFIG);
     kdb_enc_u64(&g->enc, 1, cfg->generation);
@@ -137,6 +277,7 @@ static bool build_config(ing_t *g, ing_cfg_t *snap) {
     if (db->server_id) enc_sane_str(&g->enc, 3, db->server_id);
     uint32_t idx = 0, listed = 0;
     for (const view_config_t *v = cfg->views; v; v = v->next, idx++) {
+      if (g->view_names && idx < g->nview_names) snprintf(g->view_names[idx], sizeof(g->view_names[idx]), "%s", v->name ? v->name : "");
       if (v->database_none) continue;
       const char *src = sqlite ? (v->database_file ? v->database_file : db->database_file)
                                : (v->database_schema ? v->database_schema : db->schema);
@@ -157,7 +298,7 @@ static bool build_config(ing_t *g, ing_cfg_t *snap) {
     kdb_enc_u32(&g->enc, 5, db->default_ttl);
     kdb_enc_u8(&g->enc, 6, (uint8_t)db->bulk_threshold);
     kdb_enc_u32(&g->enc, 7, db->loader_threads);
-    ok = kdb_enc_end(&g->enc) == 0 && idx <= 0xFFFF;
+    ok = kdb_enc_end(&g->enc) == 0 && idx <= 0xFFFF && (snap->nviews == 0 || g->view_names);
   }
   rcu_aux_read_unlock();
   return ok;
@@ -228,7 +369,265 @@ static void send_enc(ing_t *g) {
   memcpy(g->out + g->out_len, g->enc.buf, g->enc.len);
   g->out_len += g->enc.len;
   kdb_enc_reset(&g->enc);
-  out_flush(g);
+  /* many small answers (one ZONE_RESULT per zone) go out in one write: here when a chunk has gathered, otherwise at
+   * the end of the event round in ingest_thread() */
+  if (g->out_len - g->out_off >= ING_FLUSH_AT) out_flush(g);
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* jobs                                                                                                           */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+static void job_free(ing_job_t *j) {
+  if (!j) return;
+  db_zone_build_free(j->build);
+  free(j->buf);
+  free(j);
+}
+
+static void job_reject(ing_job_t *j, const char *why) {
+  j->status = KDB_ST_REJECTED;
+  snprintf(j->reason, sizeof(j->reason), "%s", why);
+}
+
+/* A new entry for a DB zone (design 4.2): source DB, a primary, its own settings block (B4b: the defaults) */
+static zone_db_entry_t *new_db_entry(const char *view, const char *zone) {
+  zone_db_entry_t *e = create_new_zone_entry(zone, view);
+  if (!e) return NULL;
+  zone_config_t *dc = db_zone_config_new(zone);
+  if (!dc) {
+    free_zone_db_entry(e);
+    return NULL;
+  }
+  e->source = ZONE_SRC_DB;
+  e->kind = ZONE_KIND_PRIMARY;
+  e->is_secondary = false;
+  atomic_store_explicit(&e->dbcfg, dc, memory_order_release);
+  rcu_aux_read_lock();
+  ixfr_history_set_depth(e, ixfr_history_effective(acquire_config_snapshot(), dc));
+  rcu_aux_read_unlock();
+  return e;
+}
+
+/* ZONE_END work, on the stream thread (ingest-threads 1) or a builder: feed what was buffered, check, publish the
+ * image into the entry, enter the zone in the registry.  Sets j->status / j->reason; the reply is the caller's. */
+static void job_execute(ing_job_t *j) {
+  if (j->skip) {                                         /* status and reason were set at ZONE_BEGIN */
+    if (j->view_name[0]) (void)dbreg_reject(j->view_name, j->zone, j->source_id, j->reason);
+    return;
+  }
+  /* ingest-threads > 1: the messages were buffered by the stream thread */
+  for (size_t off = 0; j->buf && !j->failed && off + 4 <= j->buf_len;) {
+    uint32_t n;
+    memcpy(&n, j->buf + off, 4);
+    off += 4;
+    if (db_zone_build_feed(j->build, j->buf + off, n, j->reason, sizeof(j->reason)) != 0) j->failed = true;
+    off += n;
+  }
+  free(j->buf);
+  j->buf = NULL;
+  if (j->failed) {                                       /* j->reason says why */
+    j->status = KDB_ST_REJECTED;
+    goto rejected;
+  }
+  zone_db_entry_t *entry = dbreg_lookup_entry(j->view_name, j->zone);
+  bool created = false;
+  if (!entry) {
+    entry = new_db_entry(j->view_name, j->zone);
+    if (!entry) {
+      job_reject(j, "out of memory");
+      goto rejected;
+    }
+    created = true;
+  }
+  if (db_zone_build_install(j->build, entry, NULL, j->reason, sizeof(j->reason)) != 0) {
+    if (created) free_zone_db_entry(entry);              /* never registered or published into a snapshot */
+    j->status = KDB_ST_REJECTED;
+    goto rejected;
+  }
+  bool shadowed = false;
+  if (dbreg_commit(j->view_name, j->zone, entry, created, j->source_id, atomic_load(&entry->serial), j->digest,
+                   &shadowed) != 0) {
+    if (created) free_zone_db_entry(entry);
+    job_reject(j, "out of memory registering the zone");
+    goto rejected;
+  }
+  j->serial = atomic_load(&entry->serial);
+  j->status = shadowed ? KDB_ST_SHADOWED : KDB_ST_APPLIED;
+  db_zone_build_free(j->build);
+  j->build = NULL;
+  return;
+rejected:
+  (void)dbreg_reject(j->view_name, j->zone, j->source_id, j->reason);
+  db_zone_build_free(j->build);
+  j->build = NULL;
+}
+
+static void *builder_thread(void *arg) {
+  ing_builder_t *b = arg;
+  ing_t *g = &g_ing;
+  rcu_aux_thread_pin();
+  struct kevent ev;
+  for (;;) {
+    if (kevent(b->kq, NULL, 0, &ev, 1, NULL) < 0) {
+      if (errno == EINTR) continue;
+      syslog(LOG_ERR, "[DB] a builder thread stops: kevent: %s", strerror(errno));
+      return NULL;
+    }
+    ing_job_t *j = atomic_exchange_explicit(&b->slot, NULL, memory_order_acquire);
+    if (!j) continue;
+    job_execute(j);
+    ing_job_t *h = atomic_load_explicit(&g->res_head, memory_order_relaxed);
+    do {
+      j->next = h;
+    } while (!atomic_compare_exchange_weak_explicit(&g->res_head, &h, j, memory_order_release, memory_order_relaxed));
+    struct kevent t;
+    EV_SET(&t, ING_EVT_RESULT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+    (void)kevent(g->kq, &t, 1, NULL, 0, NULL);
+    EV_SET(&t, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+    (void)kevent(g->wait_kq, &t, 1, NULL, 0, NULL);
+  }
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* replies and bookkeeping (stream thread)                                                                        */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+static void send_zone_result(ing_t *g, uint16_t view, const char *zone, uint8_t status, const char *reason) {
+  kdb_enc_reset(&g->enc);
+  if (kdb_enc_begin(&g->enc, KDB_T_ZONE_RESULT) != 0 || kdb_enc_u16(&g->enc, 1, view) != 0 ||
+      kdb_enc_name(&g->enc, 2, zone) != 0 || kdb_enc_u8(&g->enc, 3, status) != 0 ||
+      (reason && reason[0] && (enc_sane_str(&g->enc, 4, reason), g->enc.err)) || kdb_enc_end(&g->enc) != 0) {
+    g->enc.err = true;
+  }
+  send_enc(g);
+}
+
+/* the answer of a finished job; the job is freed */
+static void job_finish(ing_t *g, ing_job_t *j) {
+  switch (j->status) {
+  case KDB_ST_APPLIED:
+    g->b_applied++;
+    atomic_fetch_add_explicit(&g_st.tot_applied, 1, memory_order_relaxed);
+    g->since_retire++;
+    if (g->zones_logged < ING_ZONES_LOGGED) {
+      g->zones_logged++;
+      syslog(LOG_INFO, "[DB] zone '%s' (view '%s'): installed, serial %u", j->zone, j->view_name, j->serial);
+    }
+    break;
+  case KDB_ST_SHADOWED:
+    g->b_shadowed++;
+    atomic_fetch_add_explicit(&g_st.tot_shadowed, 1, memory_order_relaxed);
+    g->since_retire++;
+    syslog(LOG_WARNING, "[DB] zone '%s' (view '%s'): loaded, but hidden by the zone in karidns.conf", j->zone,
+           j->view_name);
+    break;
+  default:
+    g->b_rejected++;
+    atomic_fetch_add_explicit(&g_st.tot_rejected, 1, memory_order_relaxed);
+    if (g->rejects_logged < ING_REJECTS_LOGGED) {
+      g->rejects_logged++;
+      syslog(LOG_WARNING, "[DB] zone '%s' (view '%s') rejected: %s; the last good version, if any, keeps serving",
+             j->zone, j->view_name, j->reason);
+    }
+    break;
+  }
+  if (j->has_settings) g->settings_ignored++;
+  send_zone_result(g, j->view, j->zone, j->status, j->status == KDB_ST_REJECTED ? j->reason : NULL);
+  job_free(j);
+}
+
+static void retire_if_due(ing_t *g, bool force) {
+  if (g->since_retire >= ING_RETIRE_EVERY || force) {
+    zone_retire_process(true);                           /* outside any read section; a grace period for the batch */
+    g->since_retire = 0;
+  }
+}
+
+static void apply_delta(ing_t *g) {
+  if (dbreg_pending_count() == 0) return;
+  (void)snapshot_apply_db_delta();
+  g->last_delta_ms = now_ms();
+}
+
+/* publish new zones when a second has passed since the last time (design 4.4: the first DB zones appear early) */
+static void maybe_apply_delta(ing_t *g) {
+  if (dbreg_pending_count() > 0 && now_ms() - g->last_delta_ms >= ING_DELTA_MS) apply_delta(g);
+}
+
+static void drain_results(ing_t *g) {
+  ing_job_t *list = atomic_exchange_explicit(&g->res_head, NULL, memory_order_acquire);
+  while (list) {
+    ing_job_t *j = list;
+    list = j->next;
+    g->inflight--;
+    g->flight[j->builder] = NULL;
+    job_finish(g, j);
+  }
+  retire_if_due(g, false);
+  maybe_apply_delta(g);
+}
+
+/* block until a builder reports a result (or a second has passed) */
+static void wait_for_result(ing_t *g) {
+  struct kevent ev;
+  struct timespec ts = { 1, 0 };
+  (void)kevent(g->wait_kq, NULL, 0, &ev, 1, &ts);
+  drain_results(g);
+}
+
+static void drain_all(ing_t *g) {
+  drain_results(g);
+  while (g->inflight > 0) wait_for_result(g);
+}
+
+/* Everything in flight is done and published, the new zones are visible and the old versions are being reclaimed */
+static void sync_all(ing_t *g) {
+  drain_all(g);
+  apply_delta(g);
+  retire_if_due(g, true);
+}
+
+static bool name_in_flight(ing_t *g, const ing_job_t *me) {
+  /* in-flight zones of the same name must finish first: two builders would race on one registry record */
+  for (uint32_t i = 0; i < g->nbuilders; i++) {
+    const ing_job_t *j = g->flight[i];
+    if (j && j->view == me->view && domain_names_match_ci(j->zone, me->zone)) return true;
+  }
+  return false;
+}
+
+/* hand a complete zone over (or build it here) */
+static void job_submit(ing_t *g, ing_job_t *j) {
+  if (g->nbuilders == 0 || j->skip) {
+    job_execute(j);
+    job_finish(g, j);
+    retire_if_due(g, false);
+    maybe_apply_delta(g);
+    return;
+  }
+  for (;;) {
+    int free_b = -1;
+    for (uint32_t i = 0; i < g->nbuilders; i++) {
+      if (!g->flight[i]) {
+        free_b = (int)i;
+        break;
+      }
+    }
+    /* a finished job stays "same name in flight" until its result was taken */
+    if (free_b >= 0 && !name_in_flight(g, j)) {
+      ing_builder_t *b = &g->builders[free_b];
+      j->builder = free_b;
+      g->flight[free_b] = j;
+      atomic_store_explicit(&b->slot, j, memory_order_release);
+      g->inflight++;
+      struct kevent t;
+      EV_SET(&t, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+      (void)kevent(b->kq, &t, 1, NULL, 0, NULL);
+      return;
+    }
+    wait_for_result(g);
+  }
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -241,7 +640,22 @@ static void drop_stream(ing_t *g) {
   g->write_armed = false;
   g->out_len = g->out_off = 0;
   g->hello_done = false;
+  g->inv_active = false;
+  g->need_cleanup = true;                     /* zones in flight are finished by the main loop, not from here */
   kdb_enc_reset(&g->enc);
+  if (atomic_exchange_explicit(&g_st.connected, false, memory_order_relaxed))
+    atomic_store_explicit(&g_st.since, (int64_t)time(NULL), memory_order_relaxed);
+}
+
+/* the stream is gone (or replaced): throw away the partial zone, let the zones in flight finish, publish them */
+static void cleanup_stream_state(ing_t *g) {
+  g->need_cleanup = false;
+  job_free(g->cur);
+  g->cur = NULL;
+  g->in_batch = false;
+  drain_all(g);
+  apply_delta(g);
+  retire_if_due(g, true);
 }
 
 static void send_config(ing_t *g, const char *why) {
@@ -286,54 +700,242 @@ static void on_hello(ing_t *g, const kdb_msg_t *m) {
     drop_stream(g);
     return;
   }
+  char ver[ST_STR], drv[48];
+  sane_copy(ver, sizeof(ver), h->loader_version.p, h->loader_version.len);
+  sane_copy(drv, sizeof(drv), h->driver.p, h->driver.len);
+  char line[ST_STR];
+  snprintf(line, sizeof(line), "%s, drivers %s", ver, drv);
+  st_set_strings(NULL, line);
+  atomic_store_explicit(&g_st.pid, h->pid, memory_order_relaxed);
+  atomic_store_explicit(&g_st.since, (int64_t)time(NULL), memory_order_relaxed);
+  atomic_store_explicit(&g_st.ever_connected, true, memory_order_relaxed);
+  atomic_store_explicit(&g_st.connected, true, memory_order_relaxed);
   g->hello_done = true;
   send_config(g, "handshake");
 }
 
+/* ---- INVENTORY: the registry, a few hundred entries at a time so the output queue never holds all of it ---- */
+
+typedef struct {
+  ing_t *g;
+  uint32_t n;
+  bool bad;
+} inv_ctx_t;
+
+static bool inv_cb(void *ud, const char *view, const dbreg_zone_t *z) {
+  inv_ctx_t *c = ud;
+  ing_t *g = c->g;
+  if (!z->entry) return true;                            /* never applied: nothing the loader could skip */
+  uint16_t idx = 0;
+  bool found = false;
+  for (uint32_t i = 0; i < g->nview_names; i++) {
+    if (strcasecmp(g->view_names[i], view) == 0) {
+      idx = (uint16_t)i;
+      found = true;
+      break;
+    }
+  }
+  if (!found) return true;                               /* a view that left the configuration */
+  if (c->n >= ING_INV_CHUNK) return false;
+  if (kdb_enc_nest_begin(&g->enc, 1) != 0 || kdb_enc_u16(&g->enc, 1, idx) != 0 || kdb_enc_name(&g->enc, 2, z->name) != 0 ||
+      kdb_enc_i64(&g->enc, 3, z->source_id) != 0 || kdb_enc_u32(&g->enc, 4, z->serial) != 0 ||
+      kdb_enc_bytes(&g->enc, 5, z->digest, KDB_DIGEST_LEN) != 0 || kdb_enc_nest_end(&g->enc) != 0) {
+    c->bad = true;
+    return false;
+  }
+  c->n++;
+  return true;
+}
+
+static void pump_inventory(ing_t *g) {
+  while (g->inv_active && g->stream_fd >= 0 && g->out_len - g->out_off < ING_INV_QUEUE_LOW) {
+    inv_ctx_t c = { g, 0, false };
+    kdb_enc_reset(&g->enc);
+    if (kdb_enc_begin(&g->enc, KDB_T_INVENTORY) != 0) {
+      send_enc(g);
+      return;
+    }
+    bool done = dbreg_walk(&g->inv_cur, inv_cb, &c);
+    if (c.bad || kdb_enc_end(&g->enc) != 0) {
+      g->enc.err = true;
+      send_enc(g);
+      return;
+    }
+    if (c.n > 0) {
+      g->inv_sent += c.n;
+      send_enc(g);
+    } else {
+      kdb_enc_reset(&g->enc);
+    }
+    if (done) {
+      g->inv_active = false;
+      if (g->stream_fd < 0) return;
+      kdb_enc_reset(&g->enc);
+      if (kdb_enc_begin(&g->enc, KDB_T_INVENTORY_END) != 0 ||
+          kdb_enc_u64(&g->enc, 1, atomic_load_explicit(&g_last_change_seq, memory_order_relaxed)) != 0 ||
+          kdb_enc_u64(&g->enc, 2, g->inv_sent) != 0 || kdb_enc_end(&g->enc) != 0)
+        g->enc.err = true;
+      send_enc(g);
+      syslog(LOG_INFO, "[DB] loader asked for the inventory: sent %llu zone(s)", (unsigned long long)g->inv_sent);
+    }
+  }
+}
+
 static void on_inventory_req(ing_t *g) {
-  /* the registry of DB zones comes with B4b: nothing is installed yet, so the inventory is empty */
-  kdb_enc_reset(&g->enc);
-  if (kdb_enc_begin(&g->enc, KDB_T_INVENTORY) != 0 || kdb_enc_end(&g->enc) != 0) {
-    send_enc(g);
+  g->inv_active = true;
+  memset(&g->inv_cur, 0, sizeof(g->inv_cur));
+  g->inv_sent = 0;
+  pump_inventory(g);
+}
+
+static const char *kind_name(int k) {
+  static const char *const n[] = { "startup", "full", "diff", "zone", "auto" };
+  return k >= 0 && k < 5 ? n[k] : "?";
+}
+
+static void on_batch_begin(ing_t *g, const kdb_msg_t *m) {
+  drain_all(g);
+  g->in_batch = true;
+  g->batch_id = m->u.batch_begin.batch_id;
+  g->batch_kind = m->u.batch_begin.kind;
+  g->b_applied = g->b_rejected = g->b_shadowed = g->b_deleted = g->b_failed = 0;
+  g->settings_ignored = 0;
+  g->rejects_logged = 0;
+  atomic_store_explicit(&g_last_change_seq, m->u.batch_begin.change_seq, memory_order_relaxed);
+  atomic_store_explicit(&g_st.batch_id, g->batch_id, memory_order_relaxed);
+  atomic_store_explicit(&g_st.batch_kind, g->batch_kind, memory_order_relaxed);
+  atomic_store_explicit(&g_st.batch_done, false, memory_order_relaxed);
+  atomic_store_explicit(&g_st.batch_time, (int64_t)time(NULL), memory_order_relaxed);
+  g->last_delta_ms = now_ms();
+}
+
+static void on_zone_begin(ing_t *g, const kdb_msg_t *m) {
+  const kdb_zone_begin_t *zb = &m->u.zone_begin;
+  ing_job_t *j = calloc(1, sizeof(*j));
+  if (!j) {
+    syslog(LOG_ERR, "[DB] out of memory; closing the stream");
+    drop_stream(g);
     return;
   }
-  send_enc(g);
-  if (g->stream_fd < 0) return;
-  if (kdb_enc_begin(&g->enc, KDB_T_INVENTORY_END) != 0 || kdb_enc_u64(&g->enc, 1, 0) != 0 ||
-      kdb_enc_u64(&g->enc, 2, 0) != 0 || kdb_enc_end(&g->enc) != 0) {
-    send_enc(g);
+  j->view = zb->view;
+  snprintf(j->zone, sizeof(j->zone), "%s", zb->name);
+  j->source_id = zb->source_id;
+  j->serial = zb->serial;
+  j->rr_count = zb->rr_count;
+  memcpy(j->digest, zb->digest, KDB_DIGEST_LEN);
+  j->has_settings = zb->settings.p != NULL && zb->settings.len > 0;
+  if (j->has_settings && g->settings_ignored == 0)
+    syslog(LOG_INFO, "[DB] zone '%s': the settings text is ignored (zone settings from the database come with B7); "
+                     "the zone runs with the default settings", zb->name);
+  if (zb->view < g->nview_names) snprintf(j->view_name, sizeof(j->view_name), "%s", g->view_names[zb->view]);
+  if (j->view_name[0] == '\0') {
+    j->skip = true;
+    job_reject(j, "the view is not in the configuration");
+  } else if (zb->zone_kind != KDB_ZK_PRIMARY) {
+    j->skip = true;
+    job_reject(j, "secondary and catalog zones from the database are not supported yet");
+  } else if (zb->flags & KDB_ZF_EXTENDED) {
+    j->skip = true;
+    job_reject(j, "extended attributes (tags, tinydns) from the database are not supported yet");
+  } else {
+    j->build = db_zone_build_new(j->zone, j->rr_count);
+    if (!j->build) {
+      j->skip = true;
+      job_reject(j, "out of memory");
+    }
+  }
+  g->cur = j;
+}
+
+static void on_zone_data(ing_t *g, const kdb_msg_t *m) {
+  ing_job_t *j = g->cur;
+  if (!j || j->skip || j->failed) return;
+  const kdb_zone_data_t *zd = &m->u.zone_data;
+  if (g->nbuilders == 0) {
+    if (db_zone_build_feed(j->build, zd->body, zd->len, j->reason, sizeof(j->reason)) != 0) j->failed = true;
     return;
   }
-  send_enc(g);
-  syslog(LOG_INFO, "[DB] loader asked for the inventory: sent 0 zones (the registry of DB zones comes with B4b)");
+  size_t need = j->buf_len + 4 + zd->len;
+  if (need > j->buf_cap) {
+    size_t nc = j->buf_cap ? j->buf_cap : 65536;
+    while (nc < need) nc *= 2;
+    uint8_t *nb = realloc(j->buf, nc);
+    if (!nb) {
+      j->failed = true;
+      snprintf(j->reason, sizeof(j->reason), "out of memory");
+      return;
+    }
+    j->buf = nb;
+    j->buf_cap = nc;
+  }
+  uint32_t n = zd->len;
+  memcpy(j->buf + j->buf_len, &n, 4);
+  memcpy(j->buf + j->buf_len + 4, zd->body, zd->len);
+  j->buf_len = need;
 }
 
 static void on_zone_end(ing_t *g) {
-  static const char reason[] = "zone install not implemented yet (B4b)";
-  if (g->zones_logged < ING_ZONES_LOGGED) {
-    g->zones_logged++;
-    syslog(LOG_INFO, "[DB] zone '%s' (view %u): %llu RRs received; %s, rejected", g->zone_name,
-           (unsigned)g->zone_view, (unsigned long long)g->zone_rr, reason);
+  ing_job_t *j = g->cur;
+  g->cur = NULL;
+  if (j) job_submit(g, j);
+}
+
+static void on_zone_failed(ing_t *g, const kdb_msg_t *m) {
+  const kdb_zone_failed_t *zf = &m->u.zone_failed;
+  char reason[KDB_REASON_LEN];
+  sane_copy(reason, sizeof(reason), zf->reason.p, zf->reason.len);
+  g->b_failed++;
+  atomic_fetch_add_explicit(&g_st.tot_failed, 1, memory_order_relaxed);
+  syslog(LOG_WARNING, "[DB] the loader could not read zone '%s' (view %u, id %lld): %s", zf->name,
+         (unsigned)zf->view, (long long)zf->source_id, reason);
+  if (zf->view < g->nview_names && g->view_names[zf->view][0]) {
+    /* a zone of the same name in flight must be finished first (it would race on the record) */
+    drain_all(g);
+    (void)dbreg_reject(g->view_names[zf->view], zf->name, zf->source_id, reason);
   }
-  g->batch_rejected++;
-  kdb_enc_reset(&g->enc);
-  if (kdb_enc_begin(&g->enc, KDB_T_ZONE_RESULT) != 0 || kdb_enc_u16(&g->enc, 1, g->zone_view) != 0 ||
-      kdb_enc_name(&g->enc, 2, g->zone_name) != 0 || kdb_enc_u8(&g->enc, 3, KDB_ST_REJECTED) != 0 ||
-      kdb_enc_str(&g->enc, 4, reason) != 0 || kdb_enc_end(&g->enc) != 0) {
-    g->enc.err = true;
+}
+
+static void on_zone_delete(ing_t *g, const kdb_msg_t *m) {
+  const kdb_zone_delete_t *zd = &m->u.zone_delete;
+  uint8_t st = KDB_ST_UNCHANGED;
+  if (zd->view < g->nview_names && g->view_names[zd->view][0]) {
+    drain_all(g);                                        /* a zone of the same name may be in flight */
+    int r = dbreg_delete(g->view_names[zd->view], zd->name, zd->source_id);
+    if (r > 0) {
+      st = KDB_ST_DELETED;
+      g->b_deleted++;
+      atomic_fetch_add_explicit(&g_st.tot_deleted, 1, memory_order_relaxed);
+      syslog(LOG_INFO, "[DB] zone '%s' (view '%s') deleted", zd->name, g->view_names[zd->view]);
+    } else if (r == 0) {
+      syslog(LOG_NOTICE, "[DB] delete of zone '%s' (view %u, id %lld) ignored: not registered with that id",
+             zd->name, (unsigned)zd->view, (long long)zd->source_id);
+    }
   }
-  send_enc(g);
+  send_zone_result(g, zd->view, zd->name, st, NULL);
 }
 
 static void on_batch_end(ing_t *g, const kdb_msg_t *m) {
   const kdb_batch_end_t *b = &m->u.batch_end;
-  syslog(LOG_INFO, "[DB] batch %llu complete: %u zone(s) received and rejected (install not implemented yet, B4b), "
+  sync_all(g);
+  atomic_store_explicit(&g_st.b_applied, g->b_applied, memory_order_relaxed);
+  atomic_store_explicit(&g_st.b_rejected, g->b_rejected, memory_order_relaxed);
+  atomic_store_explicit(&g_st.b_shadowed, g->b_shadowed, memory_order_relaxed);
+  atomic_store_explicit(&g_st.b_deleted, g->b_deleted, memory_order_relaxed);
+  atomic_store_explicit(&g_st.batch_time, (int64_t)time(NULL), memory_order_relaxed);
+  atomic_store_explicit(&g_st.batch_done, true, memory_order_relaxed);
+  if (g->settings_ignored > 0)
+    syslog(LOG_INFO, "[DB] %u zone(s) of the batch carried a settings text; it is ignored until B7", g->settings_ignored);
+  syslog(LOG_INFO, "[DB] batch %llu complete: %u zone(s) received (%u installed, %u hidden by karidns.conf, %u rejected), "
                    "%u failed in the loader, %u deleted",
-         (unsigned long long)b->batch_id, b->n_zones, b->n_failed, b->n_deleted);
+         (unsigned long long)b->batch_id, b->n_zones, g->b_applied, g->b_shadowed, g->b_rejected, b->n_failed,
+         g->b_deleted);
+  if (g->batch_kind == KDB_BATCH_STARTUP)
+    syslog(LOG_INFO, "[DB] initial load complete: %u zone(s) served from the database", g->b_applied + g->b_shadowed);
+  g->in_batch = false;
   kdb_enc_reset(&g->enc);
   if (kdb_enc_begin(&g->enc, KDB_T_BATCH_RESULT) != 0 || kdb_enc_u64(&g->enc, 1, b->batch_id) != 0 ||
-      kdb_enc_u32(&g->enc, 3, 0) != 0 || kdb_enc_u32(&g->enc, 4, 0) != 0 ||
-      kdb_enc_u32(&g->enc, 5, g->batch_rejected) != 0 || kdb_enc_u32(&g->enc, 6, 0) != 0 ||
+      kdb_enc_u32(&g->enc, 3, g->b_applied + g->b_shadowed) != 0 || kdb_enc_u32(&g->enc, 4, 0) != 0 ||
+      kdb_enc_u32(&g->enc, 5, g->b_rejected) != 0 || kdb_enc_u32(&g->enc, 6, g->b_deleted) != 0 ||
       kdb_enc_end(&g->enc) != 0) {
     g->enc.err = true;
   }
@@ -349,27 +951,41 @@ static void handle_msg(ing_t *g, const kdb_msg_t *m) {
     on_inventory_req(g);
     break;
   case KDB_T_BATCH_BEGIN:
-    g->batch_rejected = 0;
+    on_batch_begin(g, m);
     break;
   case KDB_T_ZONE_BEGIN:
-    g->zone_view = m->u.zone_begin.view;
-    snprintf(g->zone_name, sizeof(g->zone_name), "%s", m->u.zone_begin.name);
-    g->zone_rr = m->u.zone_begin.rr_count;
+    on_zone_begin(g, m);
+    break;
+  case KDB_T_ZONE_DATA:
+    on_zone_data(g, m);
     break;
   case KDB_T_ZONE_END:
     on_zone_end(g);
     break;
+  case KDB_T_ZONE_ABORT:
+    job_free(g->cur);                                    /* the loader gave the zone up: no result */
+    g->cur = NULL;
+    break;
   case KDB_T_ZONE_FAILED:
-    syslog(LOG_WARNING, "[DB] the loader could not read zone '%s' (view %u, id %lld): %.*s", m->u.zone_failed.name,
-           (unsigned)m->u.zone_failed.view, (long long)m->u.zone_failed.source_id, (int)m->u.zone_failed.reason.len,
-           m->u.zone_failed.reason.p);
+    on_zone_failed(g, m);
+    break;
+  case KDB_T_ZONE_DELETE:
+    on_zone_delete(g, m);
     break;
   case KDB_T_BATCH_END:
     on_batch_end(g, m);
     break;
-  default: /* ZONE_DATA: counted and bounded by the state machine, nothing to do without an install */
+  default: /* PROFILE: counted by the state machine, used with B7 */
     break;
   }
+}
+
+static void protocol_error(ing_t *g, const char *reason) {
+  syslog(LOG_ERR, "[DB] protocol error from the loader: %s; closing the stream", reason);
+  char line[ST_STR];
+  snprintf(line, sizeof(line), "%s", reason);
+  st_set_strings(line, NULL);
+  drop_stream(g);
 }
 
 static void on_stream_readable(ing_t *g) {
@@ -388,8 +1004,7 @@ static void on_stream_readable(ing_t *g) {
       return;
     }
     if (kdb_framer_feed(&g->fr, g->rbuf, (size_t)n) != KDB_OK) {
-      syslog(LOG_ERR, "[DB] protocol error from the loader: %s; closing the stream", g->fr.reason);
-      drop_stream(g);
+      protocol_error(g, g->fr.reason);
       return;
     }
     kdb_frame_t fr;
@@ -397,16 +1012,14 @@ static void on_stream_readable(ing_t *g) {
       kdb_rc_t rc = kdb_framer_next(&g->fr, &fr);
       if (rc == KDB_MORE) break;
       if (rc != KDB_OK) {
-        syslog(LOG_ERR, "[DB] protocol error from the loader: %s; closing the stream", g->fr.reason);
-        drop_stream(g);
+        protocol_error(g, g->fr.reason);
         return;
       }
       kdb_msg_t msg;
       rc = kdb_sm_accept(&g->sm, &fr, &msg);
       if (rc != KDB_OK) {
         /* the reason names the rule, never bytes of the stream */
-        syslog(LOG_ERR, "[DB] protocol error from the loader: %s; closing the stream", g->sm.reason);
-        drop_stream(g);
+        protocol_error(g, g->sm.reason);
         return;
       }
       handle_msg(g, &msg);
@@ -425,6 +1038,7 @@ static void adopt_stream(ing_t *g, int fd) {
     syslog(LOG_NOTICE, "[DB] a new loader stream replaces the old one");
     drop_stream(g);
   }
+  if (g->need_cleanup) cleanup_stream_state(g);
   g->stream_fd = fd;
   struct kevent ev[2];
   EV_SET(&ev[0], fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
@@ -438,7 +1052,8 @@ static void adopt_stream(ing_t *g, int fd) {
   g->out_len = g->out_off = 0;
   g->hello_done = false;
   g->zones_logged = 0;
-  g->batch_rejected = 0;
+  g->rejects_logged = 0;
+  g->inv_active = false;
   ing_cfg_t snap;
   snapshot_cfg(&snap);
   kdb_limits_t lim = { snap.max_zone_records ? snap.max_zone_records : KDB_DEFAULT_MAX_ZONE_RECORDS,
@@ -501,9 +1116,18 @@ static void on_config_event(ing_t *g) {
 
 static void *ingest_thread(void *arg) {
   ing_t *g = arg;
+  rcu_aux_thread_pin();
   struct kevent evs[8];
   for (;;) {
-    int n = kevent(g->kq, NULL, 0, evs, 8, NULL);
+    struct timespec ts, *tp = NULL;
+    if (dbreg_pending_count() > 0) {                     /* new zones are waiting to become visible */
+      int64_t left = g->last_delta_ms + ING_DELTA_MS - now_ms();
+      if (left < 0) left = 0;
+      ts.tv_sec = left / 1000;
+      ts.tv_nsec = (left % 1000) * 1000000;
+      tp = &ts;
+    }
+    int n = kevent(g->kq, NULL, 0, evs, 8, tp);
     if (n < 0) {
       if (errno == EINTR) continue;
       syslog(LOG_ERR, "[DB] the ingest thread stops: kevent: %s", strerror(errno));
@@ -511,7 +1135,9 @@ static void *ingest_thread(void *arg) {
     }
     for (int i = 0; i < n; i++) {
       const struct kevent *e = &evs[i];
-      if (e->filter == EVFILT_USER) {
+      if (e->filter == EVFILT_USER && e->ident == ING_EVT_RESULT) {
+        drain_results(g);
+      } else if (e->filter == EVFILT_USER) {
         on_config_event(g);
       } else if (g->ctrl_fd >= 0 && e->ident == (uintptr_t)g->ctrl_fd) {
         on_ctrl_readable(g);
@@ -519,7 +1145,12 @@ static void *ingest_thread(void *arg) {
         if (e->filter == EVFILT_WRITE) out_flush(g);
         else on_stream_readable(g);
       }
+      if (g->need_cleanup) cleanup_stream_state(g);
     }
+    if (g->inv_active) pump_inventory(g);
+    if (g->need_cleanup) cleanup_stream_state(g);
+    maybe_apply_delta(g);
+    if (g->stream_fd >= 0 && g->out_off < g->out_len) out_flush(g);
   }
 }
 
@@ -532,17 +1163,47 @@ bool db_ingest_start(int stream_fd, int ctrl_fd) {
   g->rbuf = malloc(ING_RBUF);
   kdb_enc_init(&g->enc);
   g->kq = kqueue();
-  if (!g->body || !g->rbuf || g->kq < 0 || ctrl_fd < 0) {
+  g->wait_kq = kqueue();
+  if (!g->body || !g->rbuf || g->kq < 0 || g->wait_kq < 0 || ctrl_fd < 0) {
     syslog(LOG_ERR, "[DB] cannot start the ingest thread: %s", g->kq < 0 ? strerror(errno) : "no control socket or memory");
     return false;
   }
   limit_ctrl_rights(ctrl_fd);
-  struct kevent ev[2];
+  struct kevent ev[3];
   EV_SET(&ev[0], ctrl_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
   EV_SET(&ev[1], ING_EVT_CONFIG, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
-  if (kevent(g->kq, ev, 2, NULL, 0, NULL) != 0) {
+  EV_SET(&ev[2], ING_EVT_RESULT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+  if (kevent(g->kq, ev, 3, NULL, 0, NULL) != 0) {
     syslog(LOG_ERR, "[DB] cannot watch the loader control socket: %s", strerror(errno));
     return false;
+  }
+  EV_SET(&ev[0], 1, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+  if (kevent(g->wait_kq, ev, 1, NULL, 0, NULL) != 0) return false;
+  /* builder threads (design 1.5, D10): ingest-threads 1 = the stream thread builds */
+  ing_cfg_t snap;
+  snapshot_cfg(&snap);
+  uint32_t nthr = snap.ingest_threads;
+  if (nthr > ING_MAX_BUILDERS) nthr = ING_MAX_BUILDERS;
+  if (nthr > 1) {
+    for (uint32_t i = 0; i < nthr; i++) {
+      ing_builder_t *b = &g->builders[i];
+      atomic_init(&b->slot, NULL);
+      b->kq = kqueue();
+      EV_SET(&ev[0], 1, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+      if (b->kq < 0 || kevent(b->kq, ev, 1, NULL, 0, NULL) != 0) {
+        syslog(LOG_ERR, "[DB] cannot create a builder thread kqueue: %s", strerror(errno));
+        return false;
+      }
+    }
+    for (uint32_t i = 0; i < nthr; i++) {
+      if (pthread_create(&g->builders[i].tid, NULL, builder_thread, &g->builders[i]) != 0) {
+        syslog(LOG_ERR, "[DB] cannot create a builder thread");
+        return false;
+      }
+      pthread_detach(g->builders[i].tid);
+      g->nbuilders = i + 1;
+    }
+    syslog(LOG_INFO, "[DB] %u builder thread(s) for the zones of the database", g->nbuilders);
   }
   if (stream_fd >= 0) adopt_stream(g, stream_fd);
   pthread_t t;
@@ -562,4 +1223,109 @@ void db_ingest_config_changed(void) {
   struct kevent ev;
   EV_SET(&ev, ING_EVT_CONFIG, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
   (void)kevent(kq, &ev, 1, NULL, 0, NULL);
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* karictl dbstatus                                                                                               */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* "YYYY-MM-DD HH:MM:SS UTC" without the C library's time functions: gmtime_r() and localtime_r() load a time zone file
+ * on first use, which the Backend must not do in capability mode (CLAUDE.md Rule 2; it is a SIGTRAP).  The days are
+ * converted with the civil-from-days algorithm (proleptic Gregorian calendar). */
+static void fmt_time(int64_t t, char *buf, size_t n) {
+  if (t <= 0) {
+    snprintf(buf, n, "never");
+    return;
+  }
+  int64_t days = t / 86400, rem = t % 86400;
+  int64_t z = days + 719468;
+  int64_t era = z / 146097;
+  int64_t doe = z - era * 146097;
+  int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int64_t y = yoe + era * 400;
+  int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  int64_t mp = (5 * doy + 2) / 153;
+  int64_t d = doy - (153 * mp + 2) / 5 + 1;
+  int64_t m = mp < 10 ? mp + 3 : mp - 9;
+  if (m <= 2) y++;
+  snprintf(buf, n, "%04lld-%02lld-%02lld %02lld:%02lld:%02lld UTC", (long long)y, (long long)m, (long long)d,
+           (long long)(rem / 3600), (long long)(rem % 3600 / 60), (long long)(rem % 60));
+}
+
+typedef struct {
+  const char *zone, *view;
+  char *out;
+  size_t cap, len;
+  int matches;
+} status_ctx_t;
+
+static void st_append(status_ctx_t *c, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void st_append(status_ctx_t *c, const char *fmt, ...) {
+  if (c->len + 1 >= c->cap) return;
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(c->out + c->len, c->cap - c->len, fmt, ap);
+  va_end(ap);
+  if (n > 0) c->len = (size_t)n < c->cap - c->len ? c->len + (size_t)n : c->cap - 1;
+}
+
+static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
+  status_ctx_t *c = ud;
+  if (c->view && strcasecmp(c->view, view) != 0) return true;
+  if (!domain_names_match_ci(z->name, c->zone)) return true;
+  c->matches++;
+  const char *st = z->shadowed ? "shadowed" : (z->last_result == DBREG_REJECTED ? "rejected" : "applied");
+  st_append(c, "zone %s view %s: source id %lld, serial %u, status %s", z->name, view, (long long)z->source_id,
+            z->entry ? z->serial : 0u, st);
+  if (z->last_result == DBREG_REJECTED && z->entry) st_append(c, " (serving the last good version, serial %u)", z->serial);
+  if (!z->entry) st_append(c, " (no version loaded)");
+  if (z->error) st_append(c, ", last error: %s", z->error);
+  st_append(c, "\n");
+  return true;
+}
+
+size_t db_ingest_status(const char *zone, const char *view, char *out, size_t cap) {
+  if (cap == 0) return 0;
+  out[0] = '\0';
+  ing_cfg_t snap;
+  snapshot_cfg(&snap);
+  if (!snap.enabled) return 0;
+  status_ctx_t c = { zone, view, out, cap, 0, 0 };
+  if (zone) {
+    dbreg_cursor_t cur;
+    memset(&cur, 0, sizeof(cur));
+    (void)dbreg_walk(&cur, status_cb, &c);
+    if (c.matches == 0) st_append(&c, "zone %s: not in the database registry\n", zone);
+    return c.len;
+  }
+  char err[ST_STR], ver[ST_STR], t1[40], t2[40], t3[40];
+  int64_t err_time = 0;
+  st_get_strings(err, sizeof(err), ver, sizeof(ver), &err_time);
+  fmt_time(atomic_load(&g_st.since), t1, sizeof(t1));
+  if (atomic_load(&g_st.connected))
+    st_append(&c, "loader: connected since %s (pid %u, %s)\n", t1, atomic_load(&g_st.pid), ver);
+  else if (atomic_load(&g_st.ever_connected))
+    st_append(&c, "loader: not connected since %s (last pid %u)\n", t1, atomic_load(&g_st.pid));
+  else
+    st_append(&c, "loader: not connected yet\n");
+  size_t total, rejected, shadowed;
+  dbreg_counts(&total, &rejected, &shadowed);
+  st_append(&c, "zones: %zu in the registry (%zu served, %zu shadowed by karidns.conf), %zu with a rejected version\n",
+            total, total - shadowed, shadowed, rejected);
+  fmt_time(atomic_load(&g_st.batch_time), t2, sizeof(t2));
+  if (atomic_load(&g_st.batch_id) == 0)
+    st_append(&c, "last batch: none yet\n");
+  else
+    st_append(&c, "last batch: id %llu, kind %s, %s %s: %u applied, %u rejected, %u shadowed, %u deleted\n",
+              (unsigned long long)atomic_load(&g_st.batch_id), kind_name(atomic_load(&g_st.batch_kind)),
+              atomic_load(&g_st.batch_done) ? "finished" : "started", t2, atomic_load(&g_st.b_applied),
+              atomic_load(&g_st.b_rejected), atomic_load(&g_st.b_shadowed), atomic_load(&g_st.b_deleted));
+  st_append(&c, "since start: %llu applied, %llu rejected, %llu shadowed, %llu deleted, %llu failed in the loader\n",
+            (unsigned long long)atomic_load(&g_st.tot_applied), (unsigned long long)atomic_load(&g_st.tot_rejected),
+            (unsigned long long)atomic_load(&g_st.tot_shadowed), (unsigned long long)atomic_load(&g_st.tot_deleted),
+            (unsigned long long)atomic_load(&g_st.tot_failed));
+  fmt_time(err_time, t3, sizeof(t3));
+  if (err[0]) st_append(&c, "last protocol error: %s (%s)\n", err, t3);
+  else st_append(&c, "last protocol error: none\n");
+  return c.len;
 }

@@ -2381,7 +2381,9 @@ static int validate_database_config(token_ctx_t *ctx, server_config_t *config) {
   bool sqlite = db->enabled && db->driver && strcmp(db->driver, "sqlite3") == 0;
   bool pg = db->enabled && db->driver && strcmp(db->driver, "postgresql") == 0;
   bool need_global = false;
+  unsigned db_views = 0;
   for (const view_config_t *v = config->views; v; v = v->next) {
+    if (!v->database_none) db_views++;
     if ((v->database_file || v->database_schema || v->database_none) && !db->enabled) {
       db_cfg_error(ctx, "view '%s': database options need an options { database { ... }; } block", v->name);
       return -1;
@@ -2401,6 +2403,13 @@ static int validate_database_config(token_ctx_t *ctx, server_config_t *config) {
     if (!v->database_none && !v->database_file && !v->database_schema) need_global = true;
   }
   if (!db->enabled) return 0;
+  if (db_views > KARIDNS_DB_MAX_VIEWS) {
+    /* the CONFIG message of the loader link lists every view that takes DB zones (dns_db_stream.h, KDB_MAX_CONFIG_VIEWS):
+     * with more it cannot be sent and the loader would be restarted forever */
+    db_cfg_error(ctx, "database: %u views take DB zones, at most %d are supported (mark the others with "
+                      "\"database none;\")", db_views, KARIDNS_DB_MAX_VIEWS);
+    return -1;
+  }
   if (!db->driver) {
     db_cfg_error(ctx, "database: 'driver' is required (sqlite3 or postgresql)");
     return -1;

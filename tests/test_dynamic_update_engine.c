@@ -531,7 +531,7 @@ static void test_send_notify_to_all_comprehensive(void) {
     assert(test_build_index(a2, true) == 0);
     atomic_store_explicit(&z2->rcu.active, &a2->ver, memory_order_release);
 
-    send_notify_to_all("example.com.", "default");
+    send_notify_to_all(z1);
 
     // Count received NOTIFY packets from IPC
     int pkt_count = 0;

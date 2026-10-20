@@ -23,6 +23,7 @@
 #include "dns_query_engine.h"
 #include "dns_server_internal.h"
 #include "dns_dynamic_update.h"
+#include "tst_entry.h"
 
 // Mock globals
 _Atomic int g_control_kq = -1;
@@ -2210,7 +2211,7 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.wire_cache_max_records = 100;
-    build_zone_response_cache(&test_arena.ver, &cfg, NULL, "example.com.");
+    build_zone_response_cache(&test_arena.ver, &cfg, tst_entry(NULL, "example.com."));
     zone_arena_destroy(&test_arena);
 
     // 8. name_to_canonical_wire

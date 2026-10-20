@@ -2312,9 +2312,14 @@ process_tcp_client: ;
           zone_db_snapshot_t *snap = acquire_zone_snapshot();
           view_snapshot_t *xfr_view = select_view(snap, ctx_tcp->client_ip);
           server_config_t *cfg = acquire_config_snapshot();
-          zone_config_t *zcfg = xfr_view
+          const zone_config_t *zcfg = xfr_view
               ? find_zone_config_in_view(cfg, xfr_view->name, qname)
               : NULL;
+          if (!zcfg && xfr_view && (qtype == 252 || qtype == 251)) {
+            /* a DB zone has settings of its own (dbcfg): the transfer checks below read them like a configured zone's */
+            zone_db_entry_t *xfr_entry = find_zone_exact_in_view(xfr_view, qname);
+            if (xfr_entry && xfr_entry->source == ZONE_SRC_DB) zcfg = zone_entry_config(cfg, xfr_entry);
+          }
           bool is_synthetic_zone = (zcfg && zcfg->type &&
                                     (strcasecmp(zcfg->type, "program") == 0 ||
                                      strcasecmp(zcfg->type, "forward") == 0));
@@ -3339,6 +3344,12 @@ void *control_thread_func(void *arg) {
               }
               release_config_snapshot(active_cfg);
               release_zone_snapshot(snap);
+            } else if (strcmp(cmd, "dbstatus") == 0) {
+              /* beta design 5.2: the loader, the batches and the DB zones of the registry */
+              char dbbuf[4096];
+              size_t dblen = db_ingest_status(arg, view_arg, dbbuf, sizeof(dbbuf));
+              if (dblen == 0) send(cfd, "ERROR no database block is configured\n", 38, 0);
+              else send(cfd, dbbuf, dblen, 0);
             } else {
               syslog(LOG_ERR, "[Control] Received unknown command: %s", cmd);
               send(cfd, "ERROR unknown command\n", 22, 0);
@@ -3411,7 +3422,7 @@ void *control_thread_func(void *arg) {
 
                     if (atomic_exchange_explicit(&entry->notify_now, false, memory_order_acquire)) {
                         syslog(LOG_INFO, "[Control] Executing manual NOTIFY for %s", entry->domain);
-                        send_notify_to_all(entry->domain, entry->view_name);
+                        send_notify_to_all(entry);
                     }
 
                     bool is_slave = false;
@@ -4414,7 +4425,7 @@ STATIC_TEST void supervisor_sig_handler(int sig) {
   }
 }
 
-/* SIGCHLD only has to interrupt the supervisor's ppoll(); the children are collected with waitpid() */
+/* SIGCHLD only has to stay pending for the supervisor's sigtimedwait(); the children are collected with waitpid() */
 STATIC_TEST void supervisor_sigchld_handler(int sig) {
   (void)sig;
 }
@@ -5208,9 +5219,11 @@ int main(int argc, char **argv) {
 
     // beta design 1.2 step 4: the loader is started last, when the Backend and the routers exist
     if (dbsup.enabled) db_sup_spawn(&dbsup);
-    // The wait below is a ppoll() with the signals unblocked only while it sleeps, so that a signal cannot slip in
-    // between the flag checks and the sleep.  SIGCHLD's default action is to ignore it, which would not interrupt
-    // the sleep: give it a handler that does nothing.
+    // The loop keeps SIGCHLD / SIGTERM / SIGINT / SIGHUP blocked and takes them synchronously with sigtimedwait(),
+    // so a signal cannot slip in between the checks and the sleep, and no handler runs inside the loop (handlers
+    // that run late, as under ThreadSanitizer, left the supervisor deaf to SIGTERM with the earlier ppoll() wait).
+    // SIGCHLD gets a handler that does nothing: with its default action (ignore) a blocked SIGCHLD may be discarded
+    // instead of staying pending (POSIX leaves it unspecified).
     {
       struct sigaction ca;
       memset(&ca, 0, sizeof(ca));
@@ -5266,7 +5279,13 @@ int main(int argc, char **argv) {
       int nap_ms = db_sup_timeout_ms(&dbsup);
       nap.tv_sec = nap_ms / 1000;
       nap.tv_nsec = (long)(nap_ms % 1000) * 1000000L;
-      ppoll(NULL, 0, nap_ms >= 0 ? &nap : NULL, &loop_orig);
+      siginfo_t si;
+      int sig = nap_ms >= 0 ? sigtimedwait(&loop_block, &si, &nap) : sigwaitinfo(&loop_block, &si);
+      if (sig == SIGHUP)
+        g_supervisor_got_sighup = 1;
+      else if (sig == SIGTERM || sig == SIGINT)
+        g_supervisor_should_exit = 1;
+      /* SIGCHLD, a timeout (the loader restart time) or EINTR: the top of the loop collects children and restarts */
     }
     sigprocmask(SIG_SETMASK, &loop_orig, NULL);
     if (g_supervisor_should_exit && dead <= 0) {

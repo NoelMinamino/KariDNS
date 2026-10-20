@@ -373,18 +373,8 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
         }
         size_t rdlen = ((size_t)cap[9] << 8) | cap[10];
         if (11 + rdlen != len || rdlen > IMG_MAX_RDLEN) IMG_FAIL();
-        const uint8_t *rd = cap + 11;
-        uint8_t minfo[512];
-        if (!raw && r->type_code == 14) {
-            /* serialize_dns_record() lowercases a MINFO name without a context but keeps its case with one */
-            if (r->rdata_count < 2) IMG_FAIL();
-            long w1 = write_uncompressed_name_ext(minfo, 0, sizeof(minfo), r->rdata[0], false);
-            if (w1 < 0) IMG_FAIL();
-            long w2 = write_uncompressed_name_ext(minfo, (size_t)w1, sizeof(minfo), r->rdata[1], false);
-            if (w2 < 0) IMG_FAIL();
-            rd = minfo;
-            rdlen = (size_t)(w1 + w2);
-        }
+        uint8_t *rd = cap + 11;
+        if (!raw && dns_rdata_keep_name_case(r, rd, rdlen) != 0) IMG_FAIL();   /* MINFO: the case as written */
         rr->rdata_len = (uint16_t)rdlen;
         rr->rdata_off = rdlen ? sb_add(&sb, rd, rdlen) : 0;
 

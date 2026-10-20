@@ -5,7 +5,7 @@
 # as "nobody":
 #   - the loader runs as nobody, started as "karidns-dbloader -s 3", fd 3 is its stream socket; the Backend has the
 #     stream with the limited rights (read, write, event);
-#   - the log shows HELLO / CONFIG / INVENTORY and the zones received and answered "not implemented yet" (B4a);
+#   - the log shows HELLO / CONFIG / INVENTORY and the zones received and installed (B4b: they answer);
 #   - kill -9 of the loader: restarted with a new pid after about 1 s, then about 2 s; file zones answer throughout;
 #   - pkill -HUP karidns does not kill the loader; a configuration reload sends a new CONFIG (new generation);
 #   - a loader that breaks the protocol (fake loader): the Backend logs the protocol error once, closes the stream,
@@ -99,9 +99,8 @@ fi
 grep -q "\[DB\] loader connected: pid $LP" "$T/srv.log" && pass "log: HELLO" || fail "log: no HELLO line"
 grep -q "\[DB\] sent CONFIG generation 1" "$T/srv.log" && pass "log: CONFIG sent" || fail "log: no CONFIG line"
 grep -q "\[DB\] loader asked for the inventory" "$T/srv.log" && pass "log: INVENTORY" || fail "log: no inventory line"
-NREJ=$(grep -c "install not implemented yet (B4b), rejected" "$T/srv.log")
-[ "$NREJ" -eq "$NZ" ] && pass "$NZ zones received and answered 'install not implemented yet'" || fail "$NREJ zones answered, $NZ expected"
-wait_log "$T/srv.log" "Backend result for batch 1: 0 applied, 0 unchanged, $NZ rejected" 5 && pass "the loader got the BATCH_RESULT" || fail "no BATCH_RESULT at the loader"
+grep -q "batch 1 complete: $NZ zone(s) received ($NZ installed, 0 hidden by karidns.conf, 0 rejected)" "$T/srv.log" && pass "$NZ zones received and installed" || fail "the batch line does not say $NZ installed"
+wait_log "$T/srv.log" "Backend result for batch 1: $NZ applied, 0 unchanged, 0 rejected" 5 && pass "the loader got the BATCH_RESULT" || fail "no BATCH_RESULT at the loader"
 file_answers && pass "the file zone answers" || fail "the file zone does not answer"
 
 # design 1.3: the Backend limited the rights of the control socket (pair C, a SEQPACKET socket "UDQ") to recvmsg +

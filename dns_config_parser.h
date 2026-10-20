@@ -291,6 +291,7 @@ typedef struct {
 #define KARIDNS_DB_TTL_MAX 2147483647u
 #define KARIDNS_DB_RELOAD_TIMEOUT_MAX 3600
 #define KARIDNS_DB_THREADS_MAX 16
+#define KARIDNS_DB_MAX_VIEWS 1024   /* views that take DB zones: the CONFIG message of the loader link lists at most this many (KDB_MAX_CONFIG_VIEWS) */
 #define KARIDNS_DB_MAX_ZONE_RECORDS_MAX 4294967295ull
 #define KARIDNS_DB_MAX_ZONE_BYTES_MIN 65535ull
 #define KARIDNS_DB_MAX_ZONE_BYTES_MAX (64ull << 30)

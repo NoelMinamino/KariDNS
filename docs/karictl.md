@@ -85,6 +85,13 @@ Commands that take a zone name accept an optional view name as the next argument
 `observatory [zone [view]]`
 : Display per-zone statistics for all zones, or only for the given zone (and view): role (primary/secondary), SOA serial, query counts (total and TCP), response codes (NOERROR, NXDOMAIN, NODATA, SERVFAIL, REFUSED), EDNS/DO/ECS query counts, RRL dropped/slipped counts, successful inbound AXFR/IXFR transfers (secondary) or NOTIFY messages sent (primary) with the time of the last one, and response cache hits and misses (the cache is shared by all zones, so it has no per-zone size).
 
+`dbstatus [zone [view]]`
+: Show the state of the zones served from a database (`options { database { ... }; }`, SQLite3 or PostgreSQL through `karidns-dbloader`). Without arguments: whether the loader is connected (with its process ID, version and drivers, and since when), how many DB zones the server holds (served, hidden by a zone of the same name in `karidns.conf`, and zones with a rejected version), the last batch the loader delivered (id, kind `startup` / `full` / `diff` / `zone` / `auto`, time, and its applied / rejected / shadowed / deleted counts), the totals since the server started, and the last protocol error of the loader link. With a zone name (and optionally a view): that zone's view, database id, SOA serial, status (`applied`, `rejected` or `shadowed`) and the last error. A zone that was rejected keeps serving its last good version (its serial is shown). Without a `database` block the server answers `ERROR no database block is configured`.
+  ```sh
+  karictl dbstatus
+  karictl dbstatus example.test
+  ```
+
 `tsig-keygen [keyname]`
 : Generate a 256-bit random TSIG secret with OpenSSL `RAND_bytes(3)` and print a `key` block (`algorithm hmac-sha256`) ready for `karidns.conf`. The default key name is `transfer-key`. This command does not contact the server and does not read the configuration file.
   ```sh
@@ -126,7 +133,7 @@ The file is not parsed as a full configuration file: `karictl` takes the quoted 
 : The secret could not be read or decoded from the configuration file, the challenge was invalid, or authentication failed.
 
 `3`
-: The server returned an error (`ERROR ...`, including a failed `reload` or `reconfig`) or an invalid `status` or `observatory` response.
+: The server returned an error (`ERROR ...`, including a failed `reload` or `reconfig`) or an invalid `status` or `observatory` response (also `dbstatus` without a database block).
 
 ---
 

@@ -1082,6 +1082,25 @@ static void test_kdb(void) {
 }
 
 /* ------------------------------------------------------------------ zone2sql */
+/* serialize_dns_record() without a compression context lowercases MINFO names; the KDB1 stream must keep the case as
+ * written, as the zone image does for a file zone (found by the B4b file vs DB comparison of the lab zones) */
+static void test_kdb_name_case(void) {
+    printf("KDB1 encoding keeps the case of RDATA names\n");
+    db_record_row_t rows[] = { R(2, "minfo.z.test", "MINFO", "RM.Z.TEST. EM.z.Test.", 300, 0),
+                               R(3, "mx.z.test", "MX", "MAIL.Z.Test", 300, 10) };
+    pdns_zone_t *z = build(rows, 2, NULL, 0, NULL);
+    CHECK_MSG(!z->failed, "%s", z->error);
+    rt_buf_t b = {0};
+    char err[200];
+    CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL}, rt_emit, &b, err, sizeof(err)) == 0);
+    static const uint8_t minfo[] = { 2, 'R', 'M', 1, 'Z', 4, 'T', 'E', 'S', 'T', 0, 2, 'E', 'M', 1, 'z', 4, 'T', 'e', 's', 't', 0 };
+    static const uint8_t mx[] = { 0, 10, 4, 'M', 'A', 'I', 'L', 1, 'Z', 4, 'T', 'e', 's', 't', 0 };
+    CHECK(b.buf && memmem(b.buf, b.len, minfo, sizeof(minfo)) != NULL);
+    CHECK(b.buf && memmem(b.buf, b.len, mx, sizeof(mx)) != NULL);
+    free(b.buf);
+    pdns_zone_free(z);
+}
+
 static void test_zone2sql(void) {
     printf("zone2sql\n");
     char path[600];
@@ -1229,6 +1248,7 @@ int main(int argc, char **argv) {
     test_isolation();
     test_metadata();
     test_kdb();
+    test_kdb_name_case();
     test_zone2sql();
     test_zone_files();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);

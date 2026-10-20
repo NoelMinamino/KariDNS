@@ -4990,3 +4990,14 @@ bool parse_query_question_fast(const uint8_t *buf, size_t len, char *qname, size
     return false;
 }
 
+int dns_rdata_keep_name_case(const dns_record_t *rec, uint8_t *rd, size_t rdlen) {
+    if (rec->type_code != 14 || rec->generic_data != NULL || rec->class_val == DNS_CLASS_KARIDNS_EXT) return 0;
+    if (rec->rdata_count < 2) return -1;
+    uint8_t tmp[2 * 255];
+    long w1 = write_uncompressed_name_ext(tmp, 0, sizeof(tmp), rec->rdata[0], false);
+    if (w1 < 0) return -1;
+    long w2 = write_uncompressed_name_ext(tmp, (size_t)w1, sizeof(tmp), rec->rdata[1], false);
+    if (w2 < 0 || (size_t)(w1 + w2) != rdlen) return -1;
+    memcpy(rd, tmp, rdlen);
+    return 0;
+}

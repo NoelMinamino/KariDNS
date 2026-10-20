@@ -621,6 +621,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
             session->initial_soa_serial == current_serial) {
           session->is_finished = true;
           standby->count--;
+          if (i != ancount - 1) session->trailing_rrs = true; /* RFC 5936 §2.2: the final SOA is the last RR (the database loader checks it) */
         }
       }
     } else {
@@ -698,7 +699,7 @@ int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const ch
                                       ? zext(zcfg)->additional_from_auth
                                       : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
   zone_glue_track_build(standby, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
-  build_zone_response_cache(standby, active_cfg_prelink, entry->view_name, entry->domain);
+  build_zone_response_cache(standby, active_cfg_prelink, entry);
   release_config_snapshot(active_cfg_prelink);
   rcu_aux_read_unlock();
 
