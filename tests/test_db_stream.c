@@ -1196,6 +1196,18 @@ static int gen_corpus(const char *dir) {
     m_zone_begin(&e, 2, "b.test.", 3); m_zone_data(&e, 3, 0, 30); m_zone_end(&e, 3); m_batch_end(&e, 3, 1, 0, 0);
     rc |= write_seed(dir, "seed_loader_abort.bin", 0xC0, &e);   /* bit 6: start in READY */
     kdb_enc_reset(&e);
+    kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);       /* B6a: a batch that answers a RELOAD_REQ (tag 4), empty */
+    kdb_enc_u64(&e, 1, 9); kdb_enc_u8(&e, 2, KDB_BATCH_ZONE); kdb_enc_u64(&e, 3, 0); kdb_enc_u64(&e, 4, 4242);
+    kdb_enc_end(&e);
+    m_batch_end(&e, 9, 0, 0, 0);
+    rc |= write_seed(dir, "seed_loader_request_batch.bin", 0xC0, &e);
+    kdb_enc_reset(&e);
+    kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);       /* ... with the one deleted zone it was asked for */
+    kdb_enc_u64(&e, 1, 10); kdb_enc_u8(&e, 2, KDB_BATCH_ZONE); kdb_enc_u64(&e, 3, 0); kdb_enc_u64(&e, 4, 4243);
+    kdb_enc_end(&e);
+    m_zone_delete(&e); m_batch_end(&e, 10, 0, 0, 1);
+    rc |= write_seed(dir, "seed_loader_request_delete.bin", 0xC0, &e);
+    kdb_enc_reset(&e);
     m_config(&e); m_reload_req(&e, false); m_reload_req(&e, true); m_inventory(&e); m_inventory_end(&e);
     m_zone_result(&e); m_batch_result(&e);
     rc |= write_seed(dir, "seed_backend.bin", 0x80, &e);
@@ -1204,6 +1216,45 @@ static int gen_corpus(const char *dir) {
     rc |= write_seed(dir, "seed_hello_batch_chunked.bin", 0x05, &e);
     kdb_enc_free(&e);
     return rc;
+}
+
+/* B6a: BATCH_BEGIN tag 4 request_id (optional u64): the batch answers that RELOAD_REQ */
+static void test_batch_request_id(void) {
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_msg_t m;
+    char why[KDB_REASON_LEN];
+    kdb_frame_t fr;
+    kdb_framer_t f;
+    /* with the tag */
+    kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+    kdb_enc_u64(&e, 1, 5); kdb_enc_u8(&e, 2, KDB_BATCH_ZONE); kdb_enc_u64(&e, 3, 0); kdb_enc_u64(&e, 4, 0x0102030405060708ull);
+    kdb_enc_end(&e);
+    kdb_framer_init(&f, KDB_FROM_LOADER, g_rbuf, sizeof(g_rbuf));
+    CHECK_RC("feed", kdb_framer_feed(&f, e.buf, e.len), KDB_OK);
+    CHECK_RC("next", kdb_framer_next(&f, &fr), KDB_OK);
+    CHECK_RC("decode with request_id", kdb_decode(&fr, NVIEWS, &m, why, sizeof(why)), KDB_OK);
+    CHECK(m.u.batch_begin.request_id == 0x0102030405060708ull && m.u.batch_begin.kind == KDB_BATCH_ZONE);
+    /* the state machine accepts it and the id of BATCH_END still has to match batch_id */
+    CHECK_RC("state machine", send_enc(KDB_S_READY, &e), KDB_OK);
+    /* without the tag: request_id 0 */
+    kdb_enc_reset(&e); m_batch_begin(&e, 5);
+    kdb_framer_init(&f, KDB_FROM_LOADER, g_rbuf, sizeof(g_rbuf));
+    CHECK_RC("feed2", kdb_framer_feed(&f, e.buf, e.len), KDB_OK);
+    CHECK_RC("next2", kdb_framer_next(&f, &fr), KDB_OK);
+    CHECK_RC("decode without request_id", kdb_decode(&fr, NVIEWS, &m, why, sizeof(why)), KDB_OK);
+    CHECK(m.u.batch_begin.request_id == 0);
+    /* a duplicate tag 4, a short tag 4 and an unknown tag 5 are protocol errors */
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+    kdb_enc_u64(&e, 1, 5); kdb_enc_u8(&e, 2, 3); kdb_enc_u64(&e, 3, 0); kdb_enc_u64(&e, 4, 1); kdb_enc_u64(&e, 4, 2); kdb_enc_end(&e);
+    CHECK_RC("duplicate request_id", send_enc(KDB_S_READY, &e), KDB_E_TLV_DUP);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+    kdb_enc_u64(&e, 1, 5); kdb_enc_u8(&e, 2, 3); kdb_enc_u64(&e, 3, 0); kdb_enc_u32(&e, 4, 1); kdb_enc_end(&e);
+    CHECK_RC("request_id of 4 bytes", send_enc(KDB_S_READY, &e), KDB_E_TLV_LEN);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+    kdb_enc_u64(&e, 1, 5); kdb_enc_u8(&e, 2, 3); kdb_enc_u64(&e, 3, 0); kdb_enc_u64(&e, 4, 1); kdb_enc_u64(&e, 5, 1); kdb_enc_end(&e);
+    CHECK_RC("tag 5 is unknown", send_enc(KDB_S_READY, &e), KDB_E_TLV_UNKNOWN);
+    kdb_enc_free(&e);
 }
 
 int main(int argc, char **argv) {
@@ -1219,6 +1270,7 @@ int main(int argc, char **argv) {
     test_counts_and_limits();
     test_chunking();
     test_encoder();
+    test_batch_request_id();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

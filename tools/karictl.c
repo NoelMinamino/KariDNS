@@ -154,6 +154,34 @@ const EVP_MD *karictl_hmac_md(const char *alg) {
     return NULL;
 }
 
+static void karictl_usage(FILE *fp, const char *argv0) {
+    fprintf(fp, "Usage: %s [-c config_path] [-f config_path] [-s socket_path] [-v] <command> [args...]\n", argv0);
+    fprintf(fp,
+        "Commands:\n"
+        "  status                      server status\n"
+        "  reload                      reload the configuration and the zone files, then ask the database loader to compare\n"
+        "                              its databases with the zones served (the reply returns at once: karictl dbstatus)\n"
+        "  reload <zone> [view] [force]\n"
+        "                              read one zone again: a zone file, or a zone of the database.  For a database zone the\n"
+        "                              reply is the loader's answer (applied, unchanged, hidden, deleted, rejected, failed);\n"
+        "                              force sends it even when its content is the one the server already has.  A zone that was\n"
+        "                              just added to the database is found by its name (name the view when several take\n"
+        "                              database zones)\n"
+        "  reconfig                    reload the configuration only\n"
+        "  stop                        stop the server\n"
+        "  notify <zone> [view]        send NOTIFY for the zone now (zone files and database zones)\n"
+        "  retransfer <zone> [view]    transfer a secondary zone again (a database zone is a primary: use reload)\n"
+        "  zonestatus <zone> [view]    serial of the zone; a database zone also shows its source id and last result\n"
+        "  observatory [zone] [view]   per-zone statistics\n"
+        "  dbstatus [zone [view]]      the database loader, the last batch, the zones of the database\n"
+        "  tsig-keygen [keyname]       print a TSIG key\n"
+        "Examples:\n"
+        "  karictl reload example.test\n"
+        "  karictl reload example.test force\n"
+        "  karictl zonestatus example.test\n"
+        "A zone name that exists in several views needs the view name after it: reload <zone> <view> [force]\n");
+}
+
 #if defined(KARIDNS_COVERAGE_LINKAGE) && !defined(main)
 /* Coverage builds: the tests #include this file with "#define main karictl_main",
  * so the body below is named karictl_main here as well; llvm-cov then merges the
@@ -165,6 +193,10 @@ int main(int argc, char **argv) { return karictl_main(argc, argv); }
 int main(int argc, char **argv) {
     if (argc >= 2 && (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0)) {
         printf("karictl %s\n", KARIDNS_VERSION);
+        return 0;
+    }
+    if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
+        karictl_usage(stdout, argv[0]);
         return 0;
     }
     const char *conf_path = "/usr/local/etc/karidns/karictl.conf";
@@ -185,13 +217,12 @@ int main(int argc, char **argv) {
                 printf("karictl %s\n", KARIDNS_VERSION);
                 return 0;
             default:
-                fprintf(stderr, "Usage: %s [-c config_path] [-f config_path] [-s socket_path] [-v] <command> [args...]\n", argv[0]);
+                karictl_usage(stderr, argv[0]);
                 return 1;
         }
     }
     if (optind >= argc) {
-        fprintf(stderr, "Usage: %s [-f config_path] [-s socket_path] [-v] <command> [args...]\n", argv[0]);
-        fprintf(stderr, "Commands: status, reload [zone], reconfig, stop, notify <zone>, retransfer <zone>, zonestatus <zone>, observatory [zone], dbstatus [zone [view]], tsig-keygen [keyname]\n");
+        karictl_usage(stderr, argv[0]);
         return 1;
     }
 
@@ -372,7 +403,9 @@ int main(int argc, char **argv) {
     }
 
     char cmd_msg[512];
-    if (optind + 2 < argc) {
+    if (optind + 3 < argc) {                       /* reload <zone> <view> force */
+        snprintf(cmd_msg, sizeof(cmd_msg), "%s %s %s %s\n", argv[optind], argv[optind + 1], argv[optind + 2], argv[optind + 3]);
+    } else if (optind + 2 < argc) {
         snprintf(cmd_msg, sizeof(cmd_msg), "%s %s %s\n", argv[optind], argv[optind + 1], argv[optind + 2]);
     } else if (optind + 1 < argc) {
         snprintf(cmd_msg, sizeof(cmd_msg), "%s %s\n", argv[optind], argv[optind + 1]);

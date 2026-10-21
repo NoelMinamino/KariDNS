@@ -168,6 +168,9 @@ typedef struct pdns_zone_s {
  * (z->failed, z->error), so callers have one error path. */
 pdns_zone_t *pdns_zone_new(const char *zone_name, const pdns_opts_t *opts);
 void pdns_zone_free(pdns_zone_t *z);
+/* The canonical absolute name pdns_zone_new() gives a zone called dbname (domains.name); false if that would be a failed zone
+ * (empty, root, bad escape, label or name too long).  out: DNS_NAME_TEXT_SIZE bytes. */
+bool pdns_canonical_zone_name(const char *dbname, char out[DNS_NAME_TEXT_SIZE]);
 
 /* One row of `records` (the driver passes them in records.id order).  0 = accepted or skipped; -1 = the zone has
  * failed (z->error says why; later calls return -1 at once, so a driver callback can stop its scan). */
@@ -196,6 +199,10 @@ typedef struct {
     int64_t source_id;          /* domains.id */
     uint8_t zone_kind;          /* KDB_ZK_* */
     const char *profile;        /* NULL: z->profile when set */
+    /* B6a: called once, after the digest is known and before anything is emitted.  Returns non-zero to skip the zone (the
+     * loader already knows this exact version): pdns_zone_encode_kdb() then returns 1 and has emitted nothing. */
+    int (*gate)(void *ud, uint32_t serial, const uint8_t digest[KDB_DIGEST_LEN]);
+    void *gate_ud;
 } pdns_kdb_params_t;
 
 /* Called once per complete KDB1 message (12-byte header + body); the memory is valid during the call only.
@@ -210,6 +217,8 @@ typedef int (*pdns_emit_fn)(void *ud, const uint8_t *msg, size_t len);
  *   digest      SHA-256 over the ZONE_DATA bodies in stream order (the 12-byte DNS header and the RRs of each
  *               message, no framing, no ZONE_DATA headers); two loaders on the same rows send the same digest
  *   flags       bit0 presigned.  Extended AXFR attributes (tags, tinydns) are B8.
+ * Returns 1 (nothing emitted) when p->gate asked to skip the zone.
+ *
  * Fails (-1, *err filled) for a tinydns zone, for an RR that does not fit a message, and above max_zone_bytes. */
 int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_emit_fn emit, void *ud,
                          char *err, size_t errlen);

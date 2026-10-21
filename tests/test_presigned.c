@@ -247,6 +247,31 @@ static size_t expect_same_as_file(const char *what, const fx_t *f, pdns_zone_t *
     return n;
 }
 
+/* open item 1 (decided 2026-10-21): the hashed first label of every NSEC3 owner and of every RRSIG(NSEC3) owner is spelled in
+ * upper case (RFC 4648 s7 alphabet, as BIND's signer writes it); returns how many owners were looked at */
+static size_t check_upper_hash_owners(const char *what, const zone_arena_t *a) {
+    size_t n = 0, lower = 0, other_changed = 0;
+    for (size_t i = 0; i < a->count; i++) {
+        const dns_record_t *r = &a->records[i];
+        bool hashed = r->type_code == 50 || (r->type_code == 46 && r->rdata_count > 0 && r->rdata[0] && strcasecmp(r->rdata[0], "NSEC3") == 0);
+        if (!hashed) {
+            for (const char *p = r->name; p && *p; p++)           /* the other owners keep the lower case the rows have */
+                if (*p >= 'A' && *p <= 'Z') other_changed++;
+            continue;
+        }
+        n++;
+        for (size_t k = 0; k < 32 && r->name[k]; k++)
+            if (r->name[k] >= 'a' && r->name[k] <= 'z') lower++;
+        if (r->name_wire && r->name_wire_len > 32)
+            for (size_t k = 1; k <= 32; k++)
+                if (r->name_wire[k] >= 'a' && r->name_wire[k] <= 'z') lower++;
+    }
+    CHECK_MSG(n > 0, "%s: no NSEC3 owners", what);
+    CHECK_MSG(lower == 0, "%s: %zu lower-case letters in the hashed owner labels", what, lower);
+    CHECK_MSG(other_changed == 0, "%s: %zu upper-case letters in other owner names", what, other_changed);
+    return n;
+}
+
 static int count_type(const rs_t *s, const char *type) {
     int c = 0;
     for (size_t i = 0; i < s->n; i++)
@@ -286,6 +311,15 @@ static void test_nsec3(const char *z, const char *label, bool optout) {
     pdns_zone_t *pz = rs_build_default(&f, &s);
     size_t synth = expect_same_as_file("rebuild", &f, pz, PS_NSEC3);
     CHECK_MSG((int)synth == nrs + 1, "%zu rebuilt RRs, %d chain owners + NSEC3PARAM", synth, nrs);
+    (void)check_upper_hash_owners(label, &pz->arena);
+    {   /* open item 3: the loader warns about NSEC3PARAM metadata with iterations > 0 (RFC 9276 s3.1); the cap stays 2500 */
+        unsigned alg = 0, fl = 0, iters = 0;
+        CHECK(sscanf(f.z.nsec3param, "%u %u %u", &alg, &fl, &iters) == 3);
+        bool warned = false;
+        for (size_t i = 0; i < pz->n_warnings; i++)
+            if (strstr(pz->warnings[i], "RFC 9276")) warned = true;
+        CHECK_MSG(warned == (iters > 0), "%s: iterations %u, RFC 9276 warning %s", label, iters, warned ? "given" : "absent");
+    }
     verify_with_bind(label, f.apex, pz);
     pdns_zone_free(pz);
 
@@ -293,7 +327,7 @@ static void test_nsec3(const char *z, const char *label, bool optout) {
     pdns_zone_t *a = rs_build_default(&f, &s), *b = rs_build_default(&f, &s);
     rt_buf_t ba = {0}, bb = {0};
     char err[300];
-    pdns_kdb_params_t kp = { 0, 1, KDB_ZK_PRIMARY, NULL };
+    pdns_kdb_params_t kp = { 0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL };
     CHECK(pdns_zone_encode_kdb(a, &kp, rt_emit, &ba, err, sizeof(err)) == 0);
     CHECK(pdns_zone_encode_kdb(b, &kp, rt_emit, &bb, err, sizeof(err)) == 0);
     CHECK(ba.len == bb.len && ba.len > 0 && memcmp(ba.buf, bb.buf, ba.len) == 0);

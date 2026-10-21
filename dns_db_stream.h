@@ -43,7 +43,8 @@
  * loader -> Backend
  *   HELLO (1)         1 proto_version u16 R (=1) | 2 loader_version str<=64 R | 3 driver str<=32 R | 4 pid u32 R
  *   INVENTORY_REQ (2) no tags (empty body)
- *   BATCH_BEGIN (3)   1 batch_id u64 R | 2 kind u8 R (0 startup,1 full,2 diff,3 zone,4 auto) | 3 change_seq u64 R
+ *   BATCH_BEGIN (3)   1 batch_id u64 R | 2 kind u8 R (0 startup,1 full,2 diff,3 zone,4 auto) | 3 change_seq u64 R |
+ *                     4 request_id u64 O (B6a: the batch answers that RELOAD_REQ; absent or 0 = not an answer)
  *   ZONE_BEGIN (4)    1 view view R | 2 zone name R | 3 source_id i64 R | 4 zone_kind u8 R (0 primary,1 secondary,
  *                     2 catalog) | 5 serial u32 R | 6 flags u32 R (bit0 presigned, bit1 extended; others 0) |
  *                     7 rr_count u64 R (both SOAs counted; >= 2) | 8 digest bytes R (exactly 32) |
@@ -180,7 +181,7 @@ kdb_rc_t kdb_framer_next(kdb_framer_t *f, kdb_frame_t *out);
 typedef struct { const char *p; uint32_t len; } kdb_str_t;     /* p == NULL: absent */
 
 typedef struct { uint16_t proto; kdb_str_t loader_version, driver; uint32_t pid; } kdb_hello_t;
-typedef struct { uint64_t batch_id; uint8_t kind; uint64_t change_seq; } kdb_batch_begin_t;
+typedef struct { uint64_t batch_id; uint8_t kind; uint64_t change_seq; uint64_t request_id; /* 0 = none */ } kdb_batch_begin_t;
 typedef struct {
     uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; uint8_t zone_kind; uint32_t serial;
     uint32_t flags; uint64_t rr_count; uint8_t digest[KDB_DIGEST_LEN]; kdb_str_t settings, profile;

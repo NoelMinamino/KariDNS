@@ -47,6 +47,14 @@ static void sb_put(ps_sb_t *b, const char *s, size_t n) {
 
 static void sb_puts(ps_sb_t *b, const char *s) { sb_put(b, s, strlen(s)); }
 
+/* a canonical name as one zone-file token: ';' '"' '(' ')' '$' '@' escaped again (RFC 1035 5.1, dns_name_zone_token) */
+static void sb_put_name(ps_sb_t *b, const char *name) {
+    char tok[2 * DNS_NAME_TEXT_SIZE];
+    size_t n = dns_name_zone_token(name, tok, sizeof(tok));
+    if (n == (size_t)-1) b->oom = true;
+    else sb_put(b, tok, n);
+}
+
 static void sb_printf(ps_sb_t *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void sb_printf(ps_sb_t *b, const char *fmt, ...) {
     char tmp[64];
@@ -659,7 +667,7 @@ static int rebuild_nsec3(ps_ctx_t *c, const presigned_n3param_t *np, const char 
         if (!out->anchor) goto oom;
         out->anchor[0] = first_sig_idx(c, ap, T_NSEC3PARAM);
         sb_puts(&sb, "$ORIGIN .\n");
-        sb_puts(&sb, c->apex);
+        sb_put_name(&sb, c->apex);
         sb_printf(&sb, " %u IN NSEC3PARAM %u 0 %u ", (unsigned)ttl_param, (unsigned)np->alg, (unsigned)np->iterations);
         sb_puts(&sb, salt);
         sb_puts(&sb, "\n");
@@ -669,7 +677,7 @@ static int rebuild_nsec3(ps_ctx_t *c, const presigned_n3param_t *np, const char 
             const ps_node_t *nxt = chain[(j + 1) % n_chain];
             const ps_he_t *h = &he[chain_ref[j]];
             out->anchor[out->n_records] = first_sig_idx(c, own, T_NSEC3);
-            sb_puts(&sb, own->name);
+            sb_put_name(&sb, own->name);
             sb_printf(&sb, " %u IN NSEC3 %u %u %u ", (unsigned)own->sig_ttl, (unsigned)np->alg, (unsigned)np->flags,
                       (unsigned)np->iterations);
             sb_puts(&sb, salt);
@@ -773,9 +781,9 @@ static int rebuild_nsec(ps_ctx_t *c, const char *const *ordernames, const presig
         out->anchor[j] = first_sig_idx(c, n, T_NSEC);
         const ps_node_t *nx = &c->nodes[chain[(j + 1) % n_chain]];
         bool deleg = !n->is_apex && n->has_ns;
-        sb_puts(&sb, n->name);
+        sb_put_name(&sb, n->name);
         sb_printf(&sb, " %u IN NSEC ", (unsigned)n->sig_ttl);
-        sb_puts(&sb, nx->name);
+        sb_put_name(&sb, nx->name);
         put_types(&sb, c, n, deleg, T_NSEC, 0, true, true);
         sb_puts(&sb, "\n");
     }
@@ -871,4 +879,39 @@ void presigned_out_free(presigned_out_t *out) {
     free(out->text);
     free(out->anchor);
     memset(out, 0, sizeof(*out));
+}
+
+/* RFC 4648 s7 spells the base32hex alphabet in upper case, and so do BIND's signer and every file zone; PowerDNS stores
+ * the hash label in lower case.  The two spellings are one name (RFC 4343 s2), but a DB zone should answer the same bytes
+ * as the same zone read from a file, so the hashed first label of every NSEC3 owner and of every RRSIG(NSEC3) owner is
+ * put in upper case (design open item 1, decided 2026-10-21).  Only a 32-character label of [0-9A-Va-v] counts. */
+static bool upper_hash_label(char *name) {
+    for (size_t i = 0; i < 32; i++) {
+        char ch = name[i];
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'v') || (ch >= 'A' && ch <= 'V'))) return false;
+    }
+    if (name[32] != '.') return false;
+    for (size_t i = 0; i < 32; i++) name[i] = (char)toupper((unsigned char)name[i]);
+    return true;
+}
+
+size_t presigned_upper_hash_owners(zone_arena_t *a) {
+    size_t n = 0;
+    for (size_t i = 0; i < a->count; i++) {
+        dns_record_t *r = &a->records[i];
+        if (!r->name) continue;
+        if (r->type_code == T_RRSIG) {
+            uint16_t cv;
+            uint32_t og;
+            rrsig_fields(r, &cv, &og);
+            if (cv != T_NSEC3) continue;
+        } else if (r->type_code != T_NSEC3) {
+            continue;
+        }
+        if (!upper_hash_label(r->name)) continue;
+        if (r->name_wire && r->name_wire_len > 32 && r->name_wire[0] == 32)
+            for (size_t k = 1; k <= 32; k++) r->name_wire[k] = (uint8_t)toupper(r->name_wire[k]);
+        n++;
+    }
+    return n;
 }

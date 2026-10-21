@@ -46,6 +46,9 @@ _Static_assert(KARIDNS_DB_MAX_VIEWS == KDB_MAX_CONFIG_VIEWS, "the configuration 
 #define ING_READ_ROUNDS 16
 #define ING_EVT_CONFIG 1          /* EVFILT_USER idents of the main kqueue */
 #define ING_EVT_RESULT 2
+#define ING_EVT_REQ 3             /* karictl reload requests from the control thread (SPSC ring g_rq) */
+#define ING_REQ_MAX 32            /* reload requests waiting for the loader's answer (the control thread parks as many clients) */
+#define RQ_RING 64                /* both rings: more than ING_REQ_MAX, so a ring never fills while the bound holds */
 #define ING_RETIRE_EVERY 1024     /* design 4.3: a blocking grace period every this many published zones */
 #define ING_DELTA_MS 1000         /* design 4.4: new zones become visible at least this often */
 #define ING_INV_CHUNK 400         /* INVENTORY entries per message */
@@ -126,12 +129,72 @@ typedef struct {
   bool inv_active;
   dbreg_cursor_t inv_cur;
   uint64_t inv_sent;
+  /* reload requests sent to the loader whose answer the control thread is waiting for (B6a, design 5.2) */
+  struct {
+    bool active;
+    uint64_t id;
+    uint16_t view;
+    char view_name[KARIDNS_VIEW_NAME_MAX];
+    char zone[DNS_NAME_TEXT_SIZE];
+  } reqs[ING_REQ_MAX];
+  int cur_req;                 /* the request the current batch answers (BATCH_BEGIN request_id), -1 = none */
+  int req_outcome;             /* what the batch did to the requested zone: ROUT_* */
+  uint32_t req_serial;
+  char req_reason[KDB_REASON_LEN];
 } ing_t;
+
+enum { ROUT_NONE = 0, ROUT_APPLIED, ROUT_SHADOWED, ROUT_REJECTED, ROUT_FAILED, ROUT_DELETED };
+static void answer_request(ing_t *g);
 
 static ing_t g_ing;
 static _Atomic bool g_cfg_dirty;
 static _Atomic int g_ing_kq = -1;
 static _Atomic uint64_t g_last_change_seq;   /* what the last BATCH_BEGIN said (design 1.4, INVENTORY_END) */
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* karictl reload: control thread <-> ingest thread, two single-producer single-consumer rings (no mutex)         */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+enum { RQ_ALL = 1, RQ_ZONE, RQ_CANCEL };
+typedef struct {
+  uint8_t type;
+  bool force;
+  uint64_t id;
+  char view[KARIDNS_VIEW_NAME_MAX];
+  char zone[DNS_NAME_TEXT_SIZE];
+} rq_item_t;
+
+static rq_item_t g_rq[RQ_RING];              /* producer: the control thread; consumer: the ingest thread */
+static _Atomic uint32_t g_rq_head, g_rq_tail;
+static db_reload_result_t g_rs[RQ_RING];     /* producer: the ingest thread; consumer: the control thread */
+static _Atomic uint32_t g_rs_head, g_rs_tail;
+static uint64_t g_next_req_id;               /* control thread only */
+
+/* ingest thread: queue an answer for the control thread and wake it */
+static void post_result(uint64_t id, bool ok, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void post_result(uint64_t id, bool ok, const char *fmt, ...) {
+  uint32_t t = atomic_load_explicit(&g_rs_tail, memory_order_relaxed);
+  uint32_t h = atomic_load_explicit(&g_rs_head, memory_order_acquire);
+  if (t - h >= RQ_RING) {
+    syslog(LOG_ERR, "[DB] the answer queue for the control thread is full; the answer to request %llu is dropped",
+           (unsigned long long)id);
+    return;
+  }
+  db_reload_result_t *r = &g_rs[t % RQ_RING];
+  r->id = id;
+  r->ok = ok;
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(r->text, sizeof(r->text), fmt, ap);
+  va_end(ap);
+  atomic_store_explicit(&g_rs_tail, t + 1, memory_order_release);
+  int ckq = atomic_load_explicit(&g_control_kq, memory_order_acquire);
+  if (ckq >= 0) {
+    struct kevent ev;
+    EV_SET(&ev, DB_INGEST_CTL_EVENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+    (void)kevent(ckq, &ev, 1, NULL, 0, NULL);
+  }
+}
 
 /* ------------------------------------------------------------------------------------------------------------- */
 /* status for `karictl dbstatus`: written by the stream thread, read by the control thread                        */
@@ -519,8 +582,12 @@ static void job_finish(ing_t *g, ing_job_t *j) {
     g->b_shadowed++;
     atomic_fetch_add_explicit(&g_st.tot_shadowed, 1, memory_order_relaxed);
     g->since_retire++;
-    syslog(LOG_WARNING, "[DB] zone '%s' (view '%s'): loaded, but hidden by the zone in karidns.conf", j->zone,
-           j->view_name);
+    {
+      dbreg_info_t si;
+      bool cat = dbreg_find_info(j->view_name, j->zone, &si, 1) > 0 && si.shadow_by == DBREG_SH_CATALOG;
+      syslog(LOG_WARNING, "[DB] zone '%s' (view '%s'): loaded, but hidden by %s", j->zone, j->view_name,
+             cat ? "a catalog member of the same name" : "the zone in karidns.conf");
+    }
     break;
   default:
     g->b_rejected++;
@@ -533,6 +600,11 @@ static void job_finish(ing_t *g, ing_job_t *j) {
     break;
   }
   if (j->has_settings) g->settings_ignored++;
+  if (g->cur_req >= 0 && g->reqs[g->cur_req].view == j->view && domain_names_match_ci(g->reqs[g->cur_req].zone, j->zone)) {
+    g->req_outcome = j->status == KDB_ST_APPLIED ? ROUT_APPLIED : j->status == KDB_ST_SHADOWED ? ROUT_SHADOWED : ROUT_REJECTED;
+    g->req_serial = j->serial;
+    snprintf(g->req_reason, sizeof(g->req_reason), "%s", j->status == KDB_ST_REJECTED ? j->reason : "");
+  }
   send_zone_result(g, j->view, j->zone, j->status, j->status == KDB_ST_REJECTED ? j->reason : NULL);
   job_free(j);
 }
@@ -634,7 +706,17 @@ static void job_submit(ing_t *g, ing_job_t *j) {
 /* messages                                                                                                       */
 /* ------------------------------------------------------------------------------------------------------------- */
 
+static void fail_requests(ing_t *g, const char *why) {
+  for (int i = 0; i < ING_REQ_MAX; i++) {
+    if (!g->reqs[i].active) continue;
+    post_result(g->reqs[i].id, false, "zone %s (view %s): %s", g->reqs[i].zone, g->reqs[i].view_name, why);
+    g->reqs[i].active = false;
+  }
+  g->cur_req = -1;
+}
+
 static void drop_stream(ing_t *g) {
+  fail_requests(g, "the connection to the database loader was lost; the reload may or may not have been applied");
   if (g->stream_fd >= 0) close(g->stream_fd); /* the kqueue forgets the descriptor */
   g->stream_fd = -1;
   g->write_armed = false;
@@ -726,6 +808,9 @@ static bool inv_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   inv_ctx_t *c = ud;
   ing_t *g = c->g;
   if (!z->entry) return true;                            /* never applied: nothing the loader could skip */
+  /* B6a: a zone whose last version was refused (or could not be read) is offered again by a loader that starts now: it
+   * must not find the old version "up to date" and leave the error standing when the data are fixed */
+  if (z->last_result == DBREG_REJECTED) return true;
   uint16_t idx = 0;
   bool found = false;
   for (uint32_t i = 0; i < g->nview_names; i++) {
@@ -801,7 +886,15 @@ static void on_batch_begin(ing_t *g, const kdb_msg_t *m) {
   g->b_applied = g->b_rejected = g->b_shadowed = g->b_deleted = g->b_failed = 0;
   g->settings_ignored = 0;
   g->rejects_logged = 0;
-  atomic_store_explicit(&g_last_change_seq, m->u.batch_begin.change_seq, memory_order_relaxed);
+  if (m->u.batch_begin.change_seq != 0)                  /* a one-zone batch does not read the log */
+    atomic_store_explicit(&g_last_change_seq, m->u.batch_begin.change_seq, memory_order_relaxed);
+  g->cur_req = -1;
+  g->req_outcome = ROUT_NONE;
+  g->req_reason[0] = '\0';
+  if (m->u.batch_begin.request_id != 0) {
+    for (int i = 0; i < ING_REQ_MAX; i++)
+      if (g->reqs[i].active && g->reqs[i].id == m->u.batch_begin.request_id) g->cur_req = i;
+  }
   atomic_store_explicit(&g_st.batch_id, g->batch_id, memory_order_relaxed);
   atomic_store_explicit(&g_st.batch_kind, g->batch_kind, memory_order_relaxed);
   atomic_store_explicit(&g_st.batch_done, false, memory_order_relaxed);
@@ -893,6 +986,10 @@ static void on_zone_failed(ing_t *g, const kdb_msg_t *m) {
     drain_all(g);
     (void)dbreg_reject(g->view_names[zf->view], zf->name, zf->source_id, reason);
   }
+  if (g->cur_req >= 0 && g->reqs[g->cur_req].view == zf->view && domain_names_match_ci(g->reqs[g->cur_req].zone, zf->name)) {
+    g->req_outcome = ROUT_FAILED;
+    snprintf(g->req_reason, sizeof(g->req_reason), "%s", reason);
+  }
 }
 
 static void on_zone_delete(ing_t *g, const kdb_msg_t *m) {
@@ -903,6 +1000,8 @@ static void on_zone_delete(ing_t *g, const kdb_msg_t *m) {
     int r = dbreg_delete(g->view_names[zd->view], zd->name, zd->source_id);
     if (r > 0) {
       st = KDB_ST_DELETED;
+      if (g->cur_req >= 0 && g->reqs[g->cur_req].view == zd->view && domain_names_match_ci(g->reqs[g->cur_req].zone, zd->name))
+        g->req_outcome = ROUT_DELETED;
       g->b_deleted++;
       atomic_fetch_add_explicit(&g_st.tot_deleted, 1, memory_order_relaxed);
       syslog(LOG_INFO, "[DB] zone '%s' (view '%s') deleted", zd->name, g->view_names[zd->view]);
@@ -929,8 +1028,13 @@ static void on_batch_end(ing_t *g, const kdb_msg_t *m) {
                    "%u failed in the loader, %u deleted",
          (unsigned long long)b->batch_id, b->n_zones, g->b_applied, g->b_shadowed, g->b_rejected, b->n_failed,
          g->b_deleted);
-  if (g->batch_kind == KDB_BATCH_STARTUP)
-    syslog(LOG_INFO, "[DB] initial load complete: %u zone(s) served from the database", g->b_applied + g->b_shadowed);
+  if (g->batch_kind == KDB_BATCH_STARTUP) {
+    /* the loader may have sent nothing (a restarted loader finds the Backend up to date): count the registry */
+    size_t total, rej, shc, shk;
+    dbreg_counts2(&total, &rej, &shc, &shk);
+    syslog(LOG_INFO, "[DB] initial load complete: %zu zone(s) served from the database", total);
+  }
+  answer_request(g);
   g->in_batch = false;
   kdb_enc_reset(&g->enc);
   if (kdb_enc_begin(&g->enc, KDB_T_BATCH_RESULT) != 0 || kdb_enc_u64(&g->enc, 1, b->batch_id) != 0 ||
@@ -1114,6 +1218,140 @@ static void on_config_event(ing_t *g) {
   /* otherwise the CONFIG of the handshake reads the new configuration */
 }
 
+/* ---- karictl reload requests (control thread -> loader) and their answers ---- */
+
+/* the zone name as the stream wants it: canonical, absolute */
+static bool canon_zone(const char *in, char out[DNS_NAME_TEXT_SIZE]) {
+  char norm[DNS_NAME_TEXT_SIZE];
+  size_t nl = dns_name_normalize(in, norm, sizeof(norm) - 1);
+  if (nl == (size_t)-1 || nl == 0) return false;
+  if (dns_name_len_no_root(norm, nl) == nl) {
+    norm[nl++] = '.';
+    norm[nl] = '\0';
+  }
+  if (nl > 255) return false;
+  snprintf(out, DNS_NAME_TEXT_SIZE, "%s", norm);
+  return true;
+}
+
+static void send_reload_req(ing_t *g, uint64_t id, bool all, uint16_t view, const char *zone, bool force) {
+  kdb_enc_reset(&g->enc);
+  if (kdb_enc_begin(&g->enc, KDB_T_RELOAD_REQ) != 0 || kdb_enc_u64(&g->enc, 1, id) != 0 ||
+      kdb_enc_u8(&g->enc, 2, all ? 0 : 1) != 0 ||
+      (!all && (kdb_enc_u16(&g->enc, 3, view) != 0 || kdb_enc_name(&g->enc, 4, zone) != 0)) ||
+      kdb_enc_u8(&g->enc, 5, force ? 1 : 0) != 0 || kdb_enc_end(&g->enc) != 0)
+    g->enc.err = true;
+  send_enc(g);
+}
+
+static void on_config_event(ing_t *g);
+
+static void process_requests(ing_t *g) {
+  on_config_event(g);          /* a reload that changed the configuration sends CONFIG before the request */
+  for (;;) {
+    uint32_t h = atomic_load_explicit(&g_rq_head, memory_order_relaxed);
+    uint32_t t = atomic_load_explicit(&g_rq_tail, memory_order_acquire);
+    if (h == t) break;
+    rq_item_t it = g_rq[h % RQ_RING];
+    atomic_store_explicit(&g_rq_head, h + 1, memory_order_release);
+    bool ready = g->stream_fd >= 0 && g->hello_done;
+    switch (it.type) {
+    case RQ_ALL:
+      if (ready) {
+        send_reload_req(g, it.id, true, 0, NULL, false);
+        syslog(LOG_NOTICE, "[DB] reload requested (request %llu): the loader compares every source with the zones served",
+               (unsigned long long)it.id);
+      } else {
+        syslog(LOG_WARNING, "[DB] reload requested (request %llu), but the database loader is not connected",
+               (unsigned long long)it.id);
+      }
+      break;
+    case RQ_ZONE: {
+      char canon[DNS_NAME_TEXT_SIZE];
+      if (!canon_zone(it.zone, canon)) {
+        post_result(it.id, false, "'%.100s' is not a valid zone name", it.zone);
+        break;
+      }
+      int vi = -1;
+      for (uint32_t i = 0; i < g->nview_names; i++)
+        if (strcasecmp(g->view_names[i], it.view) == 0) vi = (int)i;
+      if (vi < 0) {
+        post_result(it.id, false, "view '%.60s' is not in the configuration", it.view);
+        break;
+      }
+      if (!ready) {
+        post_result(it.id, false, "the database loader is not connected (see 'karictl dbstatus')");
+        break;
+      }
+      int slot = -1;
+      for (int i = 0; i < ING_REQ_MAX && slot < 0; i++)
+        if (!g->reqs[i].active) slot = i;
+      if (slot < 0) {
+        post_result(it.id, false, "too many reload requests are waiting for the database loader");
+        break;
+      }
+      g->reqs[slot].active = true;
+      g->reqs[slot].id = it.id;
+      g->reqs[slot].view = (uint16_t)vi;
+      snprintf(g->reqs[slot].view_name, sizeof(g->reqs[slot].view_name), "%s", g->view_names[vi]);
+      snprintf(g->reqs[slot].zone, sizeof(g->reqs[slot].zone), "%s", canon);
+      syslog(LOG_NOTICE, "[DB] reload of zone '%s' (view '%s') requested (request %llu)%s", canon, g->view_names[vi],
+             (unsigned long long)it.id, it.force ? ", force" : "");
+      send_reload_req(g, it.id, false, (uint16_t)vi, canon, it.force);
+      break;
+    }
+    case RQ_CANCEL:
+      for (int i = 0; i < ING_REQ_MAX; i++)
+        if (g->reqs[i].active && g->reqs[i].id == it.id) {
+          g->reqs[i].active = false;
+          if (g->cur_req == i) g->cur_req = -1;
+        }
+      break;
+    default:
+      break;
+    }
+  }
+}
+
+/* BATCH_END of a batch that answers a request: tell the control thread what became of the zone (design 5.2) */
+static void answer_request(ing_t *g) {
+  if (g->cur_req < 0) return;
+  int i = g->cur_req;
+  g->cur_req = -1;
+  if (!g->reqs[i].active) return;
+  uint64_t id = g->reqs[i].id;
+  const char *zone = g->reqs[i].zone, *view = g->reqs[i].view_name;
+  g->reqs[i].active = false;
+  dbreg_info_t info;
+  int n = dbreg_find_info(view, zone, &info, 1);
+  switch (g->req_outcome) {
+  case ROUT_APPLIED:
+    post_result(id, true, "zone %s (view %s): applied, serial %u", zone, view, g->req_serial);
+    break;
+  case ROUT_SHADOWED:
+    post_result(id, true, "zone %s (view %s): loaded, serial %u, but hidden by %s", zone, view, g->req_serial,
+                n > 0 && info.shadow_by == DBREG_SH_CATALOG ? "a catalog member of the same name" : "the zone in karidns.conf");
+    break;
+  case ROUT_REJECTED:
+    post_result(id, false, "zone %s (view %s): rejected: %.100s; the last good version, if any, keeps serving", zone, view,
+                g->req_reason);
+    break;
+  case ROUT_FAILED:
+    post_result(id, false, "zone %s (view %s): failed: %.100s", zone, view, g->req_reason);
+    break;
+  case ROUT_DELETED:
+    post_result(id, true, "zone %s (view %s): deleted (it is no longer in the database)", zone, view);
+    break;
+  default:        /* nothing was sent for the zone: the loader found it unchanged, or the database does not have it */
+    if (n > 0 && info.has_entry)
+      post_result(id, true, "zone %s (view %s): unchanged, serial %u%s", zone, view, info.serial,
+                  info.shadowed ? " (hidden by another zone of the same name)" : "");
+    else
+      post_result(id, false, "zone not found (it is not in the database of view %s)", view);
+    break;
+  }
+}
+
 static void *ingest_thread(void *arg) {
   ing_t *g = arg;
   rcu_aux_thread_pin();
@@ -1137,6 +1375,8 @@ static void *ingest_thread(void *arg) {
       const struct kevent *e = &evs[i];
       if (e->filter == EVFILT_USER && e->ident == ING_EVT_RESULT) {
         drain_results(g);
+      } else if (e->filter == EVFILT_USER && e->ident == ING_EVT_REQ) {
+        process_requests(g);
       } else if (e->filter == EVFILT_USER) {
         on_config_event(g);
       } else if (g->ctrl_fd >= 0 && e->ident == (uintptr_t)g->ctrl_fd) {
@@ -1158,6 +1398,7 @@ bool db_ingest_start(int stream_fd, int ctrl_fd) {
   ing_t *g = &g_ing;
   memset(g, 0, sizeof(*g));
   g->stream_fd = -1;
+  g->cur_req = -1;
   g->ctrl_fd = ctrl_fd;
   g->body = malloc(KDB_MAX_BODY);
   g->rbuf = malloc(ING_RBUF);
@@ -1169,11 +1410,12 @@ bool db_ingest_start(int stream_fd, int ctrl_fd) {
     return false;
   }
   limit_ctrl_rights(ctrl_fd);
-  struct kevent ev[3];
+  struct kevent ev[4];
   EV_SET(&ev[0], ctrl_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
   EV_SET(&ev[1], ING_EVT_CONFIG, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev[2], ING_EVT_RESULT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
-  if (kevent(g->kq, ev, 3, NULL, 0, NULL) != 0) {
+  EV_SET(&ev[3], ING_EVT_REQ, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+  if (kevent(g->kq, ev, 4, NULL, 0, NULL) != 0) {
     syslog(LOG_ERR, "[DB] cannot watch the loader control socket: %s", strerror(errno));
     return false;
   }
@@ -1214,6 +1456,88 @@ bool db_ingest_start(int stream_fd, int ctrl_fd) {
   pthread_detach(t);
   atomic_store_explicit(&g_ing_kq, g->kq, memory_order_release);
   return true;
+}
+
+bool db_ingest_enabled(void) {
+  return atomic_load_explicit(&g_ing_kq, memory_order_acquire) >= 0;
+}
+
+uint64_t db_ingest_reload(bool all, const char *view, const char *zone, bool force) {
+  int kq = atomic_load_explicit(&g_ing_kq, memory_order_acquire);
+  if (kq < 0) return 0;
+  uint32_t t = atomic_load_explicit(&g_rq_tail, memory_order_relaxed);
+  uint32_t h = atomic_load_explicit(&g_rq_head, memory_order_acquire);
+  if (t - h >= RQ_RING) return 0;
+  rq_item_t *it = &g_rq[t % RQ_RING];
+  memset(it, 0, sizeof(*it));
+  it->type = all ? RQ_ALL : RQ_ZONE;
+  it->force = force;
+  it->id = ++g_next_req_id;
+  if (view) snprintf(it->view, sizeof(it->view), "%s", view);
+  if (zone) snprintf(it->zone, sizeof(it->zone), "%s", zone);
+  uint64_t id = it->id;
+  atomic_store_explicit(&g_rq_tail, t + 1, memory_order_release);
+  struct kevent ev;
+  EV_SET(&ev, ING_EVT_REQ, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+  (void)kevent(kq, &ev, 1, NULL, 0, NULL);
+  return id;
+}
+
+void db_ingest_reload_cancel(uint64_t id) {
+  int kq = atomic_load_explicit(&g_ing_kq, memory_order_acquire);
+  if (kq < 0) return;
+  uint32_t t = atomic_load_explicit(&g_rq_tail, memory_order_relaxed);
+  uint32_t h = atomic_load_explicit(&g_rq_head, memory_order_acquire);
+  if (t - h >= RQ_RING) return;                          /* the table entry then lives until its batch ends */
+  rq_item_t *it = &g_rq[t % RQ_RING];
+  memset(it, 0, sizeof(*it));
+  it->type = RQ_CANCEL;
+  it->id = id;
+  atomic_store_explicit(&g_rq_tail, t + 1, memory_order_release);
+  struct kevent ev;
+  EV_SET(&ev, ING_EVT_REQ, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+  (void)kevent(kq, &ev, 1, NULL, 0, NULL);
+}
+
+bool db_ingest_reload_result(db_reload_result_t *out) {
+  uint32_t h = atomic_load_explicit(&g_rs_head, memory_order_relaxed);
+  uint32_t t = atomic_load_explicit(&g_rs_tail, memory_order_acquire);
+  if (h == t) return false;
+  *out = g_rs[h % RQ_RING];
+  atomic_store_explicit(&g_rs_head, h + 1, memory_order_release);
+  return true;
+}
+
+bool db_ingest_pick_view(const char *view_arg, char *out, size_t cap, char *err, size_t errlen) {
+  bool ok = false;
+  rcu_aux_read_lock();
+  const server_config_t *cfg = acquire_config_snapshot();
+  if (!cfg || !cfg->database.enabled) {
+    snprintf(err, errlen, "no database block is configured");
+  } else {
+    int n = 0;
+    const view_config_t *only = NULL, *named = NULL;
+    for (const view_config_t *v = cfg->views; v; v = v->next) {
+      if (view_arg && v->name && strcasecmp(v->name, view_arg) == 0) named = v;
+      if (v->database_none) continue;
+      n++;
+      only = v;
+    }
+    if (view_arg) {
+      if (!named) snprintf(err, errlen, "view '%.60s' does not exist", view_arg);
+      else if (named->database_none) snprintf(err, errlen, "view '%.60s' takes no zones from the database", view_arg);
+      else ok = true, snprintf(out, cap, "%s", named->name);
+    } else if (n == 1) {
+      ok = true;
+      snprintf(out, cap, "%s", only->name ? only->name : "");
+    } else if (n == 0) {
+      snprintf(err, errlen, "no view takes zones from the database");
+    } else {
+      snprintf(err, errlen, "the database serves %d views; name the view (e.g. 'reload <zone> <view>')", n);
+    }
+  }
+  rcu_aux_read_unlock();
+  return ok;
 }
 
 void db_ingest_config_changed(void) {
@@ -1277,6 +1601,7 @@ static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   const char *st = z->shadowed ? "shadowed" : (z->last_result == DBREG_REJECTED ? "rejected" : "applied");
   st_append(c, "zone %s view %s: source id %lld, serial %u, status %s", z->name, view, (long long)z->source_id,
             z->entry ? z->serial : 0u, st);
+  if (z->shadowed) st_append(c, z->shadow_by == DBREG_SH_CATALOG ? " (hidden by a catalog member)" : " (hidden by a zone in karidns.conf)");
   if (z->last_result == DBREG_REJECTED && z->entry) st_append(c, " (serving the last good version, serial %u)", z->serial);
   if (!z->entry) st_append(c, " (no version loaded)");
   if (z->error) st_append(c, ", last error: %s", z->error);
@@ -1308,10 +1633,14 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     st_append(&c, "loader: not connected since %s (last pid %u)\n", t1, atomic_load(&g_st.pid));
   else
     st_append(&c, "loader: not connected yet\n");
-  size_t total, rejected, shadowed;
-  dbreg_counts(&total, &rejected, &shadowed);
-  st_append(&c, "zones: %zu in the registry (%zu served, %zu shadowed by karidns.conf), %zu with a rejected version\n",
-            total, total - shadowed, shadowed, rejected);
+  size_t total, rejected, sh_cfg, sh_cat;
+  dbreg_counts2(&total, &rejected, &sh_cfg, &sh_cat);
+  if (sh_cat == 0)
+    st_append(&c, "zones: %zu in the registry (%zu served, %zu shadowed by karidns.conf), %zu with a rejected version\n",
+              total, total - sh_cfg, sh_cfg, rejected);
+  else
+    st_append(&c, "zones: %zu in the registry (%zu served, %zu shadowed by karidns.conf, %zu hidden by catalog members), "
+                  "%zu with a rejected version\n", total, total - sh_cfg - sh_cat, sh_cfg, sh_cat, rejected);
   fmt_time(atomic_load(&g_st.batch_time), t2, sizeof(t2));
   if (atomic_load(&g_st.batch_id) == 0)
     st_append(&c, "last batch: none yet\n");

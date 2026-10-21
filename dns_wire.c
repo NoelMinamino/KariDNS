@@ -1251,7 +1251,28 @@ size_t dns_name_normalize(const char *in, char *out, size_t cap) {
     return w;
 }
 
-
+size_t dns_name_zone_token(const char *name, char *out, size_t cap) {
+    if (!name || !out || cap == 0) return (size_t)-1;
+    size_t w = 0;
+    for (const char *p = name; *p; p++) {
+        size_t n = 1;
+        bool esc = false;
+        if (*p == '\\') { // 正規形のエスケープ (\. \\ \DDD) はそのまま写す
+            n = (p[1] >= '0' && p[1] <= '9') ? 4 : 2;
+            for (size_t k = 1; k < n; k++)
+                if (p[k] == '\0') return (size_t)-1;
+        } else if (strchr(";\"()$@", *p)) {
+            esc = true;
+        }
+        if (w + n + (esc ? 1 : 0) >= cap) return (size_t)-1;
+        if (esc) out[w++] = '\\';
+        memcpy(out + w, p, n);
+        w += n;
+        p += n - 1;
+    }
+    out[w] = '\0';
+    return w;
+}
 
 static size_t base32hex_decode(const char *in, uint8_t *out, size_t out_cap) {
     static const int8_t map[256] = {

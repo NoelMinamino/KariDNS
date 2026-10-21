@@ -252,6 +252,15 @@ pdns_zone_t *pdns_zone_new(const char *zone_name, const pdns_opts_t *opts) {
     return z;
 }
 
+/* The canonical absolute name pdns_zone_new() would give a zone called dbname; false when it would be a failed zone. */
+bool pdns_canonical_zone_name(const char *dbname, char out[DNS_NAME_TEXT_SIZE]) {
+    if (!dbname) return false;
+    size_t zl = strlen(dbname);
+    if (zl == 0 || strcmp(dbname, ".") == 0) return false;
+    if (pdns_text_check(dbname, zl, true) != NULL) return false;
+    return name_to_absolute(dbname, zl, out, DNS_NAME_TEXT_SIZE);
+}
+
 void pdns_zone_free(pdns_zone_t *z) {
     if (!z) return;
     if (z->arena_ready) zone_arena_destroy(&z->arena);
@@ -502,8 +511,14 @@ int pdns_zone_add_record(pdns_zone_t *z, const db_record_row_t *row) {
         return -1;
     }
 
-    /* the line */
-    size_t olen = strlen(owner);
+    /* the line.  The canonical owner unescapes ';' '"' '(' ')' '$' '@' that the row escaped (pdns_text_check() saw them
+     * escaped); written as they are they would start a comment or a directive in the line (RFC 1035 5.1) */
+    char otok[2 * DNS_NAME_TEXT_SIZE];
+    size_t olen = dns_name_zone_token(owner, otok, sizeof(otok));
+    if (olen == (size_t)-1) {
+        zfail(z, true, id, "owner name is too long");
+        return -1;
+    }
     int tr = text_reserve(z, olen + clen + tl + 64);
     if (tr == 0 && !rows_reserve(z)) tr = -1;
     if (tr != 0) {
@@ -518,7 +533,7 @@ int pdns_zone_add_record(pdns_zone_t *z, const db_record_row_t *row) {
     z->line_id[z->n_rows] = id;
     z->n_rows++;
     char *w = z->text + z->text_len;
-    memcpy(w, owner, olen);
+    memcpy(w, otok, olen);
     w += olen;
     w += sprintf(w, " %u IN %s ", ttl, type);
     if (prepend) w += sprintf(w, "%u ", prio_val);
@@ -1051,6 +1066,13 @@ static int apply_presigned(pdns_zone_t *z) {
         goto done;
     }
     z->presigned_mode = out.mode;
+    if (out.mode == PS_NSEC3 && z->nsec3param) {      /* open item 3: the cap stays 2500 (RFC 5155 s10.3); RFC 9276 s3.1 says 0 */
+        presigned_n3param_t np;
+        const char *why = NULL;
+        if (presigned_parse_n3param(z->nsec3param, &np, &why) && np.iterations > 0)
+            zwarn(z, false, 0, "NSEC3PARAM metadata: iterations %u; the iteration count MUST be 0 (RFC 9276 section 3.1)",
+                  (unsigned)np.iterations);
+    }
     if (out.mode == PS_NONE) {
         rc = 0;
         goto done;
@@ -1218,6 +1240,7 @@ int pdns_zone_finish(pdns_zone_t *z) {
         }
     }
     if ((z->flags & PDNS_F_PRESIGNED) && apply_presigned(z) != 0) return -1;
+    if (z->flags & PDNS_F_PRESIGNED) (void)presigned_upper_hash_owners(&z->arena);   /* open item 1: BIND's spelling */
     if (build_zone_index(&z->arena, false) != 0) {
         zfail(z, false, 0, "out of memory building the zone index");
         return -1;
@@ -1355,6 +1378,7 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
     }
     EVP_MD_CTX_free(dd.md);
     if (rc != 0) return -1;
+    if (p->gate && p->gate(p->gate_ud, z->serial, digest) != 0) return 1;        /* the loader has this version already */
 
     /* pass 2: the messages */
     kdb_enc_t enc;

@@ -362,6 +362,27 @@ static void test_owners(void) {
     CHECK_STR(z->arena.records[2].name, "WWW.Z.TEST.");            /* case is kept: the comparison is case-insensitive */
     CHECK_STR(z->arena.records[4].name, "a\\032b.z.test.");
     pdns_zone_free(z);
+
+    /* escaped characters that the zone-file tokenizer gives a meaning (RFC 1035 5.1): the canonical owner holds them
+     * unescaped, the line must escape them again (fuzz_pdns_content: "\;" made the line a comment, the row vanished) */
+    db_record_row_t sp[] = {
+        R(2, "a\\;b.z.test", "A", "192.0.2.5", 300, 0),
+        R(3, "\\;x.z.test", "A", "192.0.2.6", 300, 0),
+        R(4, "\\$x.z.test", "A", "192.0.2.7", 300, 0),
+        R(5, "\\@.z.test", "A", "192.0.2.8", 300, 0),
+        R(6, "p\\(q\\).z.test", "A", "192.0.2.9", 300, 0),
+    };
+    z = build(sp, 5, NULL, 0, NULL);
+    CHECK_MSG(!z->failed, "%s", z->error);
+    CHECK(z->arena.count == 6);
+    if (z->arena.count == 6) {
+        CHECK_STR(z->arena.records[1].name, "a;b.z.test.");
+        CHECK_STR(z->arena.records[2].name, ";x.z.test.");
+        CHECK_STR(z->arena.records[3].name, "$x.z.test.");
+        CHECK_STR(z->arena.records[4].name, "@.z.test.");
+        CHECK_STR(z->arena.records[5].name, "p(q).z.test.");
+    }
+    pdns_zone_free(z);
 }
 
 /* ------------------------------------------------------------------ 3. rejections */
@@ -951,6 +972,15 @@ static void test_metadata(void) {
 /* ------------------------------------------------------------------ 5. KDB1 encoding */
 static int stop_emit(void *ud, const uint8_t *m, size_t n) { (void)ud; (void)m; (void)n; return -1; }
 
+typedef struct { int calls; uint32_t serial; uint8_t digest[KDB_DIGEST_LEN]; int answer; } gate_seen_t;
+static int test_gate(void *ud, uint32_t serial, const uint8_t digest[KDB_DIGEST_LEN]) {
+    gate_seen_t *g = ud;
+    g->calls++;
+    g->serial = serial;
+    memcpy(g->digest, digest, KDB_DIGEST_LEN);
+    return g->answer;
+}
+
 static void test_kdb(void) {
     printf("KDB1 encoding\n");
     /* many records: several ZONE_DATA messages, SOA first and last, every message <= 65535 */
@@ -978,7 +1008,7 @@ static void test_kdb(void) {
 
         /* determinism: the same rows give the same bytes */
         rt_buf_t b1 = {0}, b2 = {0};
-        pdns_kdb_params_t kp = { 1, 9, KDB_ZK_PRIMARY, "prof" };
+        pdns_kdb_params_t kp = { 1, 9, KDB_ZK_PRIMARY, "prof", NULL, NULL };
         char err[200];
         CHECK(pdns_zone_encode_kdb(z, &kp, rt_emit, &b1, err, sizeof(err)) == 0);
         pdns_zone_t *z2 = build(rows, n, NULL, 0, NULL);
@@ -995,6 +1025,20 @@ static void test_kdb(void) {
         CHECK(memcmp(i3.digest, info.digest, KDB_DIGEST_LEN) != 0);
         /* the sink can stop the encoding */
         CHECK(pdns_zone_encode_kdb(z, &kp, stop_emit, NULL, err, sizeof(err)) != 0);
+        /* B6a: the gate sees the serial and the digest ZONE_BEGIN carries, and can keep the zone back (returns 1, emits nothing) */
+        {
+            gate_seen_t gs = { 0, 0, { 0 }, 0 };
+            pdns_kdb_params_t gp = { 1, 9, KDB_ZK_PRIMARY, "prof", test_gate, &gs };
+            rt_buf_t b4 = {0};
+            gs.answer = 1;
+            CHECK(pdns_zone_encode_kdb(z, &gp, rt_emit, &b4, err, sizeof(err)) == 1);
+            CHECK(b4.len == 0 && gs.calls == 1 && gs.serial == 2024010101u);
+            CHECK(memcmp(gs.digest, info.digest, KDB_DIGEST_LEN) == 0);
+            gs.answer = 0;
+            CHECK(pdns_zone_encode_kdb(z, &gp, rt_emit, &b4, err, sizeof(err)) == 0);
+            CHECK(b4.len == b1.len && memcmp(b4.buf, b1.buf, b1.len) == 0 && gs.calls == 2);
+            free(b4.buf);
+        }
         free(b1.buf); free(b2.buf);
         pdns_zone_free(z); pdns_zone_free(z2); pdns_zone_free(z3);
         free(rows); free(names); free(txt);
@@ -1036,7 +1080,7 @@ static void test_kdb(void) {
         rt_buf_t b = {0};
         db_meta_row_t m[] = { M("X-KARIDNS-FORMAT", "tinydns") };
         pdns_zone_t *z = build(NULL, 0, m, 1, NULL);
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL}, rt_emit, &b, err, sizeof(err)) != 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL}, rt_emit, &b, err, sizeof(err)) != 0);
         CHECK_HAS(err, "B8");
         CHECK(b.len == 0);
         pdns_zone_free(z);
@@ -1044,7 +1088,7 @@ static void test_kdb(void) {
         z = build(NULL, 0, m2, 2, NULL);                              /* B5: NSEC3PARAM without any RRSIG(NSEC3) cannot be rebuilt */
         CHECK(z->failed);
         CHECK_HAS(z->error, "no RRSIG(NSEC3) rows");
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL}, rt_emit, &b, err, sizeof(err)) != 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL}, rt_emit, &b, err, sizeof(err)) != 0);
         pdns_zone_free(z);
         db_meta_row_t m3[] = { M("PRESIGNED", "1") };               /* presigned without NSEC3PARAM: encoded, flag set */
         z = build(NULL, 0, m3, 1, NULL);
@@ -1056,13 +1100,13 @@ static void test_kdb(void) {
         /* a failed zone is not encoded */
         db_record_row_t bad[1] = { R(2, "x.z.test", "A", "nope", 300, 0) };
         z = build(bad, 1, NULL, 0, NULL);
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL}, rt_emit, &b, err, sizeof(err)) != 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL}, rt_emit, &b, err, sizeof(err)) != 0);
         pdns_zone_free(z);
         /* size limit */
         pdns_opts_t o = { 0, 0, 0, 100 };
         z = build(NULL, 0, NULL, 0, &o);
         CHECK(!z->failed);
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL}, rt_emit, &b, err, sizeof(err)) != 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL}, rt_emit, &b, err, sizeof(err)) != 0);
         CHECK_HAS(err, "limit");
         pdns_zone_free(z);
         free(b.buf);
@@ -1073,7 +1117,7 @@ static void test_kdb(void) {
         pdns_zone_t *z = build(NULL, 0, m, 2, NULL);
         rt_buf_t b = {0};
         char err[200];
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){5, 42, KDB_ZK_SECONDARY, NULL}, rt_emit, &b, err, sizeof(err)) == 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){5, 42, KDB_ZK_SECONDARY, NULL, NULL, NULL}, rt_emit, &b, err, sizeof(err)) == 0);
         static uint8_t fb[KDB_MAX_BODY];
         kdb_framer_t f;
         kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
@@ -1143,7 +1187,7 @@ static void test_kdb_name_case(void) {
     CHECK(fa.count == N);
     rt_buf_t b = {0};
     char err[200];
-    if (!z->failed) CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL}, rt_emit, &b, err, sizeof(err)) == 0);
+    if (!z->failed) CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL}, rt_emit, &b, err, sizeof(err)) == 0);
     for (size_t i = 0; i < N && !z->failed && i < fa.count; i++) {
         const dns_record_t *dbrec = NULL;
         for (size_t k = 0; k < z->arena.count; k++)

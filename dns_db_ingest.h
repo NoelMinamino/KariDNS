@@ -19,6 +19,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* Limit the rights of the two descriptors and start the thread (and the builder threads).  Call before
  * enter_capsicum_sandbox().  stream_fd may be -1 (the loader is not connected yet); ctrl_fd is the Backend end of
@@ -32,5 +33,28 @@ void db_ingest_config_changed(void);
 /* `karictl dbstatus [zone [view]]`: text for the control channel (design 5.2).  Returns the length written to out
  * (always NUL terminated), or 0 when the configuration has no database block.  Control thread. */
 size_t db_ingest_status(const char *zone, const char *view, char *out, size_t cap);
+
+/* ---- karictl reload (B6a, design 5.2, D5) ------------------------------------------------------------------------
+ * The control thread never waits for the loader.  It hands a request to the ingest thread through a lock-free ring
+ * (db_ingest_reload), parks the client, and gets the answer back through a second ring plus an EVFILT_USER event on
+ * g_control_kq (ident DB_INGEST_CTL_EVENT); it times the parked client out itself (db-reload-timeout).  Both rings are
+ * single producer, single consumer; there is no mutex. */
+#define DB_INGEST_CTL_EVENT 3
+
+typedef struct { uint64_t id; bool ok; char text[200]; } db_reload_result_t;
+
+/* Is the ingest thread running (a database block is configured)? */
+bool db_ingest_enabled(void);
+/* all: RELOAD_REQ scope all (the caller has reloaded the configuration already).  Otherwise one zone of the view
+ * `view` (a view name).  Returns the request id (> 0), or 0 when the thread is not running or the ring is full.
+ * Control thread only. */
+uint64_t db_ingest_reload(bool all, const char *view, const char *zone, bool force);
+/* The client of that request is gone or timed out: forget the request.  Control thread only. */
+void db_ingest_reload_cancel(uint64_t id);
+/* One answer, if there is one (call until false after a DB_INGEST_CTL_EVENT).  Control thread only. */
+bool db_ingest_reload_result(db_reload_result_t *out);
+/* Which view a command about the zone means: view_arg if given, else the only view that takes zones from the database.
+ * false with a reason in err otherwise. */
+bool db_ingest_pick_view(const char *view_arg, char *out, size_t cap, char *err, size_t errlen);
 
 #endif /* DNS_DB_INGEST_H */

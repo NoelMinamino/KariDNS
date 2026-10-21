@@ -1332,7 +1332,7 @@ static void test_config_negative_patterns(void) {
         free_server_config_fields(&cfg);
     }
     /* Program & forward zone with superfluous file and masters */
-    if (parse_ok("zone \"p.com\" { type program; program-command \"/bin/echo\"; file \"z\"; masters { 1.2.3.4; }; }; "
+    if (parse_ok("zone \"p.com\" { type program; program \"/bin/echo\"; file \"z\"; masters { 1.2.3.4; }; }; "
                  "zone \"f.com\" { type forward; forwarders { 1.2.3.4; }; file \"z\"; masters { 1.2.3.4; }; };", &cfg)) {
         free_server_config_fields(&cfg);
     }

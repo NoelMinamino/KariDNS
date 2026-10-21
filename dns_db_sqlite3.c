@@ -464,6 +464,25 @@ static int sq_changes_since(db_conn_t *c, uint64_t after, db_change_cb cb, void 
     return ret;
 }
 
+static int sq_changes_max(db_conn_t *c, uint64_t *seq) {
+    if (!c->has_changes) {
+        set_err(c, "karidns_changes does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(c->db, "SELECT max(seq) FROM karidns_changes", -1, &st, NULL);
+    if (rc != SQLITE_OK) return sql_fail(c, rc, "prepare");
+    int ret = 0;
+    rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) {
+        *seq = sqlite3_column_type(st, 0) == SQLITE_NULL ? 0 : (uint64_t)sqlite3_column_int64(st, 0);
+    } else {
+        ret = sql_fail(c, rc, "changes_max");
+    }
+    sqlite3_finalize(st);
+    return ret;
+}
+
 static int sq_wait_fd(db_conn_t *c) {
     (void)c;
     return -1;      /* SQLite3 has no notifications: the loader polls PRAGMA data_version by timer (B9) */
@@ -485,6 +504,7 @@ const db_driver_t db_driver_sqlite3 = {
     "sqlite3",       sq_open,         sq_close,           sq_errmsg,           sq_check_schema,
     sq_begin_snapshot, sq_end_snapshot, sq_list_zones,    sq_scan_records,     sq_scan_metadata,
     sq_zones_with_keys, sq_changes_since, sq_wait_fd,     sq_drain_notifications, sq_report_status,
+    sq_changes_max,
 };
 
 #endif /* KARIDNS_DB_SQLITE3 */

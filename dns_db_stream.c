@@ -41,7 +41,7 @@ struct kdb_tdef { const char *name; uint8_t n; const kdb_tspec_t *spec; };
 #define TDEF(var, nm, arr) static const kdb_tdef_t var = { nm, (uint8_t)(sizeof(arr) / sizeof((arr)[0])), arr }
 
 static const kdb_tspec_t sp_hello[] = { S(KT_U16, KS_REQ, 0), S(KT_STR, KS_REQ, 64), S(KT_STR, KS_REQ, 32), S(KT_U32, KS_REQ, 0) };
-static const kdb_tspec_t sp_batch_begin[] = { S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 4), S(KT_U64, KS_REQ, 0) };
+static const kdb_tspec_t sp_batch_begin[] = { S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 4), S(KT_U64, KS_REQ, 0), S(KT_U64, 0, 0) };
 static const kdb_tspec_t sp_zone_begin[] = {
     S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 2),
     S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ | KS_MAXV, KDB_ZF_PRESIGNED | KDB_ZF_EXTENDED), S(KT_U64, KS_REQ, 0),
@@ -315,6 +315,7 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         m->u.batch_begin.batch_id = V(1).u;
         m->u.batch_begin.kind = (uint8_t)V(2).u;
         m->u.batch_begin.change_seq = V(3).u;
+        m->u.batch_begin.request_id = V(4).present ? V(4).u : 0;
         break;
     case KDB_T_ZONE_BEGIN: {
         kdb_zone_begin_t *z = &m->u.zone_begin;

@@ -1647,6 +1647,81 @@ int ixfr_history_effective(const server_config_t *cfg, const zone_config_t *zone
   return cfg ? cfg->ixfr_history : IXFR_HISTORY_DEFAULT;
 }
 
+/* B6a (open item 2, decided 2026-10-21): an unknown statement inside zone { } or view { } used to be skipped without a
+ * word, so a typo ("alow-transfer") silently left a zone open or closed.  Now:
+ *   - an option BIND 9 documents for a zone / view statement but KariDNS does not implement is skipped with a warning;
+ *   - anything else is a configuration error, shown by karidns and by `karicheck conf`.
+ * The lists are the zone and view options of the BIND 9.18 / 9.20 ARM ("zone Statement Grammar", "view Statement
+ * Grammar") minus what KariDNS reads; options of options { } that a view may also carry are on the view list.  Only
+ * zone { } and view { } are strict; key { }, control-channel { }, logging { } and options { } keep skipping unknowns. */
+static const char *const k_bind_zone_options[] = {
+  "allow-notify", "allow-query", "allow-query-on", "allow-update-forwarding", "auto-dnssec", "check-dup-records",
+  "check-integrity", "check-mx", "check-mx-cname", "check-names", "check-sibling", "check-spf", "check-srv-cname",
+  "check-wildcard", "database", "delegation-only", "dialup", "dlz", "dnssec-dnskey-kskonly", "dnssec-loadkeys-interval",
+  "dnssec-policy", "dnssec-secure-to-insecure", "dnssec-update-mode", "forward", "in-view", "inline-signing",
+  "ixfr-from-differences", "journal", "key-directory", "masterfile-format", "masterfile-style", "max-ixfr-ratio",
+  "max-journal-size", "max-records", "max-refresh-time", "max-retry-time", "max-transfer-idle-in", "max-transfer-idle-out",
+  "max-transfer-time-in", "max-transfer-time-out", "max-zone-ttl", "min-refresh-time", "min-retry-time", "multi-master",
+  "notify", "notify-delay", "notify-source-v6", "notify-to-soa", "nta-lifetime", "nta-recheck", "parental-agents",
+  "parental-source", "parental-source-v6", "primaries", "request-expire", "request-ixfr", "request-nsid",
+  "require-server-cookie", "send-report-channel", "serial-update-method", "server-addresses", "server-names",
+  "sig-signing-nodes", "sig-signing-signatures", "sig-signing-type", "sig-validity-interval", "transfer-source",
+  "transfer-source-v6", "try-tcp-refresh", "update-check-ksk", "update-policy", "use-alt-transfer-source",
+  "zero-no-soa-ttl", "zone-statistics", NULL
+};
+
+static const char *const k_bind_view_options[] = {
+  "allow-notify", "allow-query", "allow-query-cache", "allow-query-cache-on", "allow-query-on", "allow-recursion",
+  "allow-recursion-on", "allow-transfer", "allow-update", "allow-update-forwarding", "also-notify", "attach-cache",
+  "auto-dnssec", "cache-file", "check-dup-records", "check-integrity", "check-mx", "check-mx-cname", "check-names",
+  "check-sibling", "check-spf", "check-srv-cname", "check-wildcard", "clients-per-query", "deny-answer-addresses",
+  "deny-answer-aliases", "disable-algorithms", "disable-ds-digests", "disable-empty-zone", "dns64", "dns64-contact",
+  "dns64-server", "dnssec-accept-expired", "dnssec-enable", "dnssec-lookaside", "dnssec-must-be-secure",
+  "dnssec-policy", "dnssec-validation", "dnstap", "dual-stack-servers", "edns-udp-size", "empty-contact", "empty-server",
+  "empty-zones-enable", "fetch-quota-params", "fetches-per-server", "fetches-per-zone", "forward", "forwarders",
+  "glue-cache", "inline-signing", "ixfr-from-differences", "key", "key-directory", "lame-ttl", "lmdb-mapsize",
+  "managed-keys", "match-destinations", "match-recursive-only", "max-cache-size", "max-cache-ttl", "max-clients-per-query",
+  "max-ixfr-ratio", "max-journal-size", "max-ncache-ttl", "max-records", "max-recursion-depth", "max-recursion-queries",
+  "max-refresh-time", "max-retry-time", "max-stale-ttl", "max-udp-size", "max-zone-ttl", "message-compression",
+  "min-cache-ttl", "min-ncache-ttl", "min-refresh-time", "min-retry-time", "minimal-any", "minimal-responses", "notify",
+  "notify-delay", "notify-source", "notify-source-v6", "notify-to-soa", "nocookie-udp-size", "nosit-udp-size",
+  "nta-lifetime", "nta-recheck", "nxdomain-redirect", "parental-source", "parental-source-v6", "preferred-glue",
+  "prefetch", "provide-ixfr", "qname-minimization", "query-source", "query-source-v6", "rate-limit", "recursion",
+  "request-expire", "request-ixfr", "request-nsid", "require-server-cookie", "resolver-nonbackoff-tries",
+  "resolver-query-timeout", "resolver-retry-interval", "response-padding", "response-policy", "root-delegation-only",
+  "rrset-order", "send-cookie", "serial-update-method", "servfail-ttl", "sig-signing-nodes", "sig-signing-signatures",
+  "sig-signing-type", "sig-validity-interval", "sortlist", "stale-answer-client-timeout", "stale-answer-enable",
+  "stale-answer-ttl", "stale-cache-enable", "stale-refresh-time", "synth-from-dnssec", "transfer-format",
+  "transfer-source", "transfer-source-v6", "trust-anchor-telemetry", "trust-anchors", "trusted-keys", "try-tcp-refresh",
+  "update-check-ksk", "v6-bias", "validate-except", "zero-no-soa-ttl", "zone-statistics", NULL
+};
+
+static bool name_in_list(const char *const *list, const char *key) {
+  for (size_t i = 0; list[i]; i++)
+    if (strcmp(list[i], key) == 0) return true;
+  return false;
+}
+
+/* The statement `key` (already read) inside zone / view `what` is not one KariDNS implements.  Skips the statement and
+ * returns 0 when BIND documents it (warning), or reports a configuration error and returns -1 (the caller frees its
+ * partial result and returns -1). */
+static int unknown_statement(token_ctx_t *ctx, const char *kind, const char *name, const char *key, bool in_view) {
+  if (name_in_list(in_view ? k_bind_view_options : k_bind_zone_options, key)) {
+    syslog(LOG_WARNING, "[Config] %s '%s': option '%s' is a BIND option that KariDNS does not implement; it is ignored", kind,
+           name, key);
+    fprintf(stderr, "[WARNING] %s '%s': option '%s' is a BIND option that KariDNS does not implement; it is ignored\n", kind,
+            name, key);
+    skip_unknown_block(ctx);
+    return 0;
+  }
+  syslog(LOG_ERR, "[Config] %s '%s': unknown option '%.64s' (neither a KariDNS option nor a BIND option for this statement; check the spelling)", kind, name,
+         key);
+  fprintf(stderr, "[ERROR] %s '%s': unknown option '%.64s' (neither a KariDNS option nor a BIND option for this statement; check the spelling)\n", kind,
+          name, key);
+  if (ctx) ctx->error_occurred = true;
+  return -1;
+}
+
 static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
   conf_token_t tok = get_next_token(ctx);
   int nr_rc = 0;
@@ -2012,8 +2087,11 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       else if (strcmp(key, "zone-tcp-window") == 0) x->zone_tcp_window = v;
       else if (strcmp(key, "zone-tcp-sndbuf") == 0) x->zone_tcp_sndbuf = v;
       else x->zone_udp_bufsize = (uint16_t)v;
-    } else
-      skip_unknown_block(ctx);
+    } else if (unknown_statement(ctx, "zone", zone->domain, key, false) != 0) {
+      free(key);
+      free_zone_config(zone);
+      return -1;
+    }
     free(key);
   }
   tok = get_next_token(ctx);
@@ -3021,8 +3099,12 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           free(vkey);
           if (vrc != 0) { free_partial_view(view); return -1; }
         } else {
+          char *ukey = tok.value;
+          tok.value = NULL;
           free_token(&tok);
-          skip_unknown_block(ctx);
+          int urc = unknown_statement(ctx, "view", view->name, ukey, true);
+          free(ukey);
+          if (urc != 0) { free_partial_view(view); return -1; }
         }
       }
       tok = get_next_token(ctx);

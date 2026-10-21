@@ -188,6 +188,23 @@ static void test_name_normalize(void) {
     }
     CHECK(dns_name_normalize(big, out, sizeof(out)) == strlen(big));
     CHECK(dns_name_normalize("a.b.", out, 4) == (size_t)-1);   /* buffer too small */
+
+    printf("[TEST] dns_name_zone_token: zone-file specials escaped again, canonical escapes copied...\n");
+    static const struct { const char *in, *out; } tk[] = {
+        { "a;b.test.", "a\\;b.test." },
+        { "$x.@.test.", "\\$x.\\@.test." },
+        { "p(q)\"r.test.", "p\\(q\\)\\\"r.test." },
+        { "a\\.b\\\\c\\032d.test.", "a\\.b\\\\c\\032d.test." },
+        { "plain.test.", "plain.test." },
+        { ".", "." },
+    };
+    for (size_t i = 0; i < sizeof(tk) / sizeof(tk[0]); i++) {
+        size_t n = dns_name_zone_token(tk[i].in, out, sizeof(out));
+        CHECK(n != (size_t)-1);
+        if (n != (size_t)-1) { CHECK_STR(out, tk[i].out); CHECK(n == strlen(tk[i].out)); }
+    }
+    CHECK(dns_name_zone_token(";.", out, 3) == (size_t)-1);    /* "\;." needs 4 bytes */
+    CHECK(dns_name_zone_token(";.", out, 4) == 3);
 }
 
 static void test_name_wire_decoders(void) {

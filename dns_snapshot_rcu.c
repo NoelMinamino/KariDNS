@@ -1253,11 +1253,21 @@ static void dbreg_set_error(dbreg_zone_t *z, const char *reason) {
     z->error = reason ? strdup(reason) : NULL;
 }
 
+/* D17-1: a catalog member with the name of a DB zone wins over it on every path (the active snapshot is stable while the
+ * lock is held: only lock holders replace it) */
+static bool dbreg_catalog_member_locked(const char *view, const char *name) {
+    zone_db_snapshot_t *snap = atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
+    zone_db_entry_t *e = find_zone_exact_in_view(snapshot_find_view(snap, view), name);
+    return e && e->is_catalog_member;
+}
+
 int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, bool created, int64_t source_id,
                  uint32_t serial, const uint8_t digest[32], bool *shadowed) {
-    bool sh = dbreg_config_shadows(view, name);
+    bool sh_cfg = dbreg_config_shadows(view, name);
     int rc = -1;
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    bool sh_cat = !sh_cfg && dbreg_catalog_member_locked(view, name);
+    bool sh = sh_cfg || sh_cat;
     dbreg_view_t *rv = dbreg_view_get(view, true);
     if (!rv) goto out;
     uint32_t h = dns_name_hash_ci(name);
@@ -1294,12 +1304,37 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
     memcpy(z->digest, digest, 32);
     z->last_result = DBREG_APPLIED;
     z->shadowed = sh;
+    z->shadow_by = sh_cfg ? DBREG_SH_CONFIG : sh_cat ? DBREG_SH_CATALOG : DBREG_SH_NONE;
     dbreg_set_error(z, NULL);
     rc = 0;
 out:
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     if (shadowed) *shadowed = sh;
     return rc;
+}
+
+/* D17-1 helpers for the catalog delta (the lock is held): the DB zone of this name is now hidden by a catalog member / is
+ * hidden by one and is a candidate to come back */
+static void dbreg_hide_by_catalog_locked(const char *view, const char *name) {
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, name, dns_name_hash_ci(name)) : NULL;
+    if (z && z->entry && !z->shadowed) {
+        z->shadowed = true;
+        z->shadow_by = DBREG_SH_CATALOG;
+        syslog(LOG_WARNING, "[DB] zone %s from the DB is hidden by a catalog member of the same name (view '%s')", z->name, view);
+    }
+}
+
+static bool dbreg_hidden_by_catalog_locked(const char *view, const zone_db_entry_t *e) {
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, e->domain, dns_name_hash_ci(e->domain)) : NULL;
+    return z && z->entry == e && z->shadowed && z->shadow_by == DBREG_SH_CATALOG;
+}
+
+static dbreg_zone_t *dbreg_catalog_hidden_zone_locked(const char *view, const char *name) {
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, name, dns_name_hash_ci(name)) : NULL;
+    return z && z->entry && z->shadowed && z->shadow_by == DBREG_SH_CATALOG ? z : NULL;
 }
 
 zone_db_entry_t *dbreg_lookup_entry(const char *view, const char *name) {
@@ -1384,7 +1419,9 @@ static void dbreg_pending_drop_locked(void) {
  * vc: the view of the new configuration, old_view: the same view of the snapshot being replaced (a catalog member of
  * the same name hides a DB zone too).  *out: a malloc'ed array of the entries (no references taken).  Updates the
  * shadowed flags and logs the changes.  (size_t)-1: out of memory. */
-static size_t dbreg_collect_view_locked(const view_config_t *vc, view_snapshot_t *old_view, zone_db_entry_t ***out) {
+static size_t dbreg_collect_view_locked(const view_config_t *vc, view_snapshot_t *old_view, const catalog_member_id_t *vm,
+                                        int vm_count, const int *vm_ht, const int *vm_chain, size_t vm_hsize,
+                                        zone_db_entry_t ***out) {
     *out = NULL;
     dbreg_view_t *rv = vc->name ? dbreg_view_get(vc->name, false) : NULL;
     if (!rv || rv->count == 0) return 0;
@@ -1394,18 +1431,23 @@ static size_t dbreg_collect_view_locked(const view_config_t *vc, view_snapshot_t
     for (size_t b = 0; b < rv->nb; b++) {
         for (dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
             if (!z->entry) continue;
-            bool sh = view_find_zone_config(vc, z->name) != NULL;
-            if (!sh && old_view) {
+            bool by_cfg = view_find_zone_config(vc, z->name) != NULL;
+            bool by_cat = false;
+            if (!by_cfg && old_view) {
                 zone_db_entry_t *o = find_zone_exact_in_view(old_view, z->name);
-                sh = o && o != z->entry && o->is_catalog_member;
+                /* a catalog member hides it only if the rebuild keeps that member (it is still valid) */
+                by_cat = o && o != z->entry && o->is_catalog_member &&
+                         catalog_member_index(vm, vm_count, vm_ht, vm_chain, vm_hsize, o->domain, zone_entry_catalog_uid(o)) >= 0;
             }
+            bool sh = by_cfg || by_cat;
             if (sh && !z->shadowed)
-                syslog(LOG_WARNING, "[DB] zone %s from the DB is shadowed by the zone in karidns.conf (view '%s')",
-                       z->name, vc->name);
+                syslog(LOG_WARNING, "[DB] zone %s from the DB is shadowed by the %s (view '%s')", z->name,
+                       by_cfg ? "zone in karidns.conf" : "catalog member of the same name", vc->name);
             else if (!sh && z->shadowed)
-                syslog(LOG_NOTICE, "[DB] zone %s (view '%s') is served from the DB again: the zone in karidns.conf "
-                       "is gone", z->name, vc->name);
+                syslog(LOG_NOTICE, "[DB] zone %s (view '%s') is served from the DB again: the %s is gone", z->name, vc->name,
+                       z->shadow_by == DBREG_SH_CATALOG ? "catalog member" : "zone in karidns.conf");
             z->shadowed = sh;
+            z->shadow_by = by_cfg ? DBREG_SH_CONFIG : by_cat ? DBREG_SH_CATALOG : DBREG_SH_NONE;
             if (!sh) list[n++] = z->entry;
         }
     }
@@ -1480,8 +1522,16 @@ int snapshot_apply_db_delta(void) {
             for (size_t i = 0; ok && i < rv->n_adds; i++) {
                 zone_db_entry_t *a = rv->adds[i];
                 dbreg_zone_t *z = dbreg_find(rv, a->domain, dns_name_hash_ci(a->domain));
-                if (z && z->entry == a && !z->shadowed && find_zone_exact_in_view(ov, a->domain) != a)
-                    add[nadd++] = a;
+                if (!z || z->entry != a || z->shadowed) continue;
+                zone_db_entry_t *ex = find_zone_exact_in_view(ov, a->domain);
+                if (ex && ex != a && ex->is_catalog_member) {      /* D17-1: the catalog member that is there wins */
+                    z->shadowed = true;
+                    z->shadow_by = DBREG_SH_CATALOG;
+                    syslog(LOG_WARNING, "[DB] zone %s from the DB is hidden by a catalog member of the same name (view '%s')",
+                           z->name, vs->name);
+                    continue;
+                }
+                if (ex != a) add[nadd++] = a;
             }
             if (nrem > 1) qsort(rem, nrem, sizeof(*rem), cmp_ptr);
         }
@@ -1576,6 +1626,70 @@ void dbreg_counts(size_t *total, size_t *rejected, size_t *shadowed) {
     if (total) *total = t;
     if (rejected) *rejected = r;
     if (shadowed) *shadowed = s;
+}
+
+void dbreg_counts2(size_t *total, size_t *rejected, size_t *shadowed_config, size_t *shadowed_catalog) {
+    size_t t = 0, r = 0, sc = 0, sk = 0;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    for (size_t v = 0; v < g_dbreg_nviews; v++) {
+        const dbreg_view_t *rv = &g_dbreg_views[v];
+        for (size_t b = 0; b < rv->nb; b++) {
+            for (const dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
+                if (z->entry) t++;
+                if (z->last_result == DBREG_REJECTED) r++;
+                if (z->entry && z->shadowed) {
+                    if (z->shadow_by == DBREG_SH_CATALOG) sk++;
+                    else sc++;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    if (total) *total = t;
+    if (rejected) *rejected = r;
+    if (shadowed_config) *shadowed_config = sc;
+    if (shadowed_catalog) *shadowed_catalog = sk;
+}
+
+int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int max) {
+    int n = 0;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    for (size_t v = 0; v < g_dbreg_nviews; v++) {
+        const dbreg_view_t *rv = &g_dbreg_views[v];
+        if (view && strcasecmp(rv->name, view) != 0) continue;
+        const dbreg_zone_t *z = dbreg_find(rv, name, dns_name_hash_ci(name));
+        if (!z) continue;
+        if (n < max) {
+            dbreg_info_t *o = &out[n];
+            memset(o, 0, sizeof(*o));
+            snprintf(o->view, sizeof(o->view), "%s", rv->name);
+            o->source_id = z->source_id;
+            o->has_entry = z->entry != NULL;
+            if (z->entry) {
+                o->serial = atomic_load_explicit(&z->entry->serial, memory_order_relaxed);
+                o->refresh = atomic_load_explicit(&z->entry->refresh, memory_order_relaxed);
+            }
+            o->shadowed = z->shadowed;
+            o->shadow_by = z->shadow_by;
+            o->last_result = z->last_result;
+            if (z->error) snprintf(o->error, sizeof(o->error), "%s", z->error);
+        }
+        n++;
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return n;
+}
+
+zone_db_entry_t *dbreg_snapshot_entry(zone_db_snapshot_t *snap, const char *view, const char *name) {
+    zone_db_entry_t *want = NULL;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, name, dns_name_hash_ci(name)) : NULL;
+    if (z && z->entry && !z->shadowed) want = z->entry;
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    if (!want) return NULL;
+    zone_db_entry_t *e = snapshot_get_zone_in_view(snap, view, name);
+    return e == want ? e : NULL;
 }
 
 void dbreg_reset(void) {
@@ -1773,7 +1887,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
 
             /* DB zones (beta design 4.5): the registry's entries of this view that no configured zone hides */
             zone_db_entry_t **db_list = NULL;
-            size_t db_n = dbreg_collect_view_locked(v, old_view, &db_list);
+            size_t db_n = dbreg_collect_view_locked(v, old_view, valid_members, valid_member_count, vm_ht, vm_chain, vm_hsize, &db_list);
             if (db_n == (size_t)-1) {
                 { free(valid_members); free(vm_ht); free(vm_chain); }
                 abort_rebuild_snapshot(new_snap, "db_list");
@@ -1957,11 +2071,12 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 if (target_view) {
                     zone_db_entry_t *existing = find_catalog_parent_in_snapshot(target_view, new_desired_members[i].domain);
                     if (existing && existing->source == ZONE_SRC_DB) {
-                        /* the DB zone keeps its place: two entries of one name in a view would answer unpredictably.
-                         * (A full reconfiguration lets the catalog member win, beta design 4.5.) */
-                        syslog(LOG_WARNING, "[Catalog] Zone '%s' generated member '%s' which collides with a zone from the database. Skipping.",
+                        /* D17-1: the catalog member wins on every path (a full reconfiguration does too, beta design 4.5).
+                         * The DB zone stays in the registry, hidden, and comes back when the member goes away. */
+                        syslog(LOG_WARNING, "[Catalog] Zone '%s' generated member '%s' which has the name of a zone from the database; "
+                               "the catalog member wins and the database zone is hidden",
                                catalog_entry_to_update->domain, new_desired_members[i].domain);
-                        member_accepted = false;
+                        dbreg_hide_by_catalog_locked(catalog_view_name, new_desired_members[i].domain);
                     } else if (existing && existing->is_catalog_member) {
                         if (strcasecmp(zone_entry_catalog_owner(existing), catalog_entry_to_update->domain) != 0) {
                             bool valid_coo = false;
@@ -2195,7 +2310,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 }
 
                 if (catalog_view_name && strcasecmp(vs->name, catalog_view_name) == 0) {
-                    size_t max_zones = old_snap->views[v].zone_count + added_count;
+                    size_t max_zones = old_snap->views[v].zone_count + added_count + (size_t)total_deleted;
                     vs->entries = calloc(max_zones > 0 ? max_zones : 1, sizeof(zone_db_entry_t *));
                     if (!vs->entries) {
                         if (del_hash_table) free(del_hash_table);
@@ -2241,6 +2356,8 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                                 }
                             }
                         }
+                        if (!is_removed && entry->source == ZONE_SRC_DB && dbreg_hidden_by_catalog_locked(vs->name, entry))
+                            is_removed = true;                      /* D17-1: a new catalog member of this name hides it */
                         if (!is_removed) {
                             atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
                             vs->entries[zidx++] = entry;
@@ -2249,6 +2366,21 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     
                     for (int i = 0; i < added_count; i++) {
                         vs->entries[zidx++] = new_entries[i];
+                    }
+                    /* D17-1: a catalog member that left uncovers the DB zone of its name, unless another entry has the name */
+                    for (int j = 0; j < removed_count; j++) {
+                        dbreg_zone_t *hz = dbreg_catalog_hidden_zone_locked(vs->name, removed_members[j].domain);
+                        if (!hz) continue;
+                        bool taken = false;
+                        for (int k = 0; k < zidx && !taken; k++)
+                            taken = domain_names_match_ci(vs->entries[k]->domain, hz->entry->domain);
+                        if (taken) continue;
+                        atomic_fetch_add_explicit(&hz->entry->snapshot_refs, 1, memory_order_release);
+                        vs->entries[zidx++] = hz->entry;
+                        hz->shadowed = false;
+                        hz->shadow_by = DBREG_SH_NONE;
+                        syslog(LOG_NOTICE, "[DB] zone %s (view '%s') is served from the DB again: the catalog member is gone",
+                               hz->name, vs->name);
                     }
                     new_entries_published = true;
                     vs->zone_count = zidx;

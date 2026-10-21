@@ -2619,7 +2619,8 @@ process_tcp_client: ;
 typedef enum {
   CTRL_STATE_NEW,
   CTRL_STATE_AUTH_WAIT,
-  CTRL_STATE_CMD_WAIT
+  CTRL_STATE_CMD_WAIT,
+  CTRL_STATE_PARKED  /* B6a: `reload <zone>` of a database zone, waiting for the loader's answer (see db_ingest_reload) */
 } ctrl_state_t;
 
 typedef struct ctrl_client {
@@ -2630,10 +2631,14 @@ typedef struct ctrl_client {
   char challenge[65];
   char buf[1024];
   size_t buf_len;
+  uint64_t req_id;       /* PARKED: the reload request this client waits for */
+  time_t park_deadline;  /* PARKED: answer "timeout" at this time (db-reload-timeout) */
   struct ctrl_client *next;
 } ctrl_client_t;
 
 static ctrl_client_t *g_ctrl_clients = NULL;
+#define CTRL_PARK_MAX 32 /* parked clients: bounded, so the request rings never fill (dns_db_ingest.c) */
+static int g_ctrl_parked = 0;
 
 static void free_ctrl_client(int fd) {
   ctrl_client_t **p = &g_ctrl_clients;
@@ -2641,6 +2646,10 @@ static void free_ctrl_client(int fd) {
     if ((*p)->fd == fd) {
       ctrl_client_t *c = *p;
       *p = c->next;
+      if (c->state == CTRL_STATE_PARKED) {
+        g_ctrl_parked--;
+        db_ingest_reload_cancel(c->req_id);
+      }
       close(c->fd);
       free(c);
       return;
@@ -2889,6 +2898,124 @@ const char *find_configured_domain(const char *arg, char *out_buf, size_t out_si
   return out_buf;
 }
 
+/* B6a: an answer of the database loader for a parked `reload <zone>` client (control thread) */
+static void control_db_results(void) {
+  db_reload_result_t r;
+  while (db_ingest_reload_result(&r)) {
+    ctrl_client_t *c = g_ctrl_clients;
+    while (c && !(c->state == CTRL_STATE_PARKED && c->req_id == r.id)) c = c->next;
+    if (!c) continue; /* the client left or timed out: nothing to do */
+    char reply[sizeof(r.text) + 16];
+    int n = snprintf(reply, sizeof(reply), "%s %s\n", r.ok ? "OK" : "ERROR", r.text);
+    if (n > 0) (void)send(c->fd, reply, (size_t)n, 0);
+    syslog(LOG_NOTICE, "[Control] reload of a database zone answered: %s", r.text);
+    c->state = CTRL_STATE_CMD_WAIT; /* it is no longer waiting: free_ctrl_client() must not cancel the finished request */
+    g_ctrl_parked--;
+    free_ctrl_client(c->fd);
+  }
+}
+
+/* B6a: parked clients whose db-reload-timeout has passed get an error; the request is forgotten */
+static void control_park_timeouts(time_t now) {
+  ctrl_client_t *c = g_ctrl_clients;
+  while (c) {
+    ctrl_client_t *next = c->next;
+    if (c->state == CTRL_STATE_PARKED && now >= c->park_deadline) {
+      static const char msg[] = "ERROR timeout: the database loader did not answer within db-reload-timeout; "
+                                "the reload may still be applied (see 'karictl dbstatus')\n";
+      (void)send(c->fd, msg, sizeof(msg) - 1, 0);
+      syslog(LOG_WARNING, "[Control] reload of a database zone timed out (request %llu)", (unsigned long long)c->req_id);
+      free_ctrl_client(c->fd); /* cancels the request */
+    }
+    c = next;
+  }
+}
+
+/* D17-2 / B6a: a command about a zone that is not in karidns.conf, which may be a zone of the database.  Returns true
+ * when it was answered (or the client was parked), false when there is no such DB zone ("zone not found").  The registry
+ * is looked at without any wait for the loader; `reload` hands the request to the ingest thread and parks the client. */
+static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone, const char *view_arg, bool force) {
+  int cfd = c->fd;
+  server_config_t *cfg = acquire_config_snapshot();
+  bool enabled = cfg && cfg->database.enabled;
+  uint32_t tmo = cfg && cfg->database.db_reload_timeout ? cfg->database.db_reload_timeout : 30;
+  release_config_snapshot(cfg);
+  if (!enabled || !db_ingest_enabled()) return false;
+  bool is_reload = strcmp(cmd, "reload") == 0;
+  dbreg_info_t info[2];
+  int n = dbreg_find_info(view_arg, zone, info, 2);
+  if (n >= 2) {
+    char m[160];
+    int l = snprintf(m, sizeof(m), "ERROR zone exists in multiple views; specify view (e.g. '%s <zone> <view>')\n", cmd);
+    send(cfd, m, (size_t)l, 0);
+    return true;
+  }
+  if (n == 0 && !is_reload) return false;
+  char view[KARIDNS_VIEW_NAME_MAX];
+  if (n == 1) {
+    snprintf(view, sizeof(view), "%s", info[0].view);
+  } else { /* not in the registry yet: a zone added to the database; ask the loader for it */
+    char why[200];
+    if (!db_ingest_pick_view(view_arg, view, sizeof(view), why, sizeof(why))) {
+      char m[300];
+      int l = snprintf(m, sizeof(m), "ERROR zone not found (%s)\n", why);
+      send(cfd, m, (size_t)l, 0);
+      return true;
+    }
+  }
+  if (is_reload) {
+    if (g_ctrl_parked >= CTRL_PARK_MAX) {
+      static const char msg[] = "ERROR too many reloads are waiting for the database loader; try again later\n";
+      send(cfd, msg, sizeof(msg) - 1, 0);
+      return true;
+    }
+    uint64_t id = db_ingest_reload(false, view, zone, force);
+    if (id == 0) {
+      static const char msg[] = "ERROR cannot queue the reload request for the database loader\n";
+      send(cfd, msg, sizeof(msg) - 1, 0);
+      return true;
+    }
+    syslog(LOG_NOTICE, "[Control] Received reload command for database zone: %s (view %s)%s", zone, view,
+           force ? ", force" : "");
+    c->state = CTRL_STATE_PARKED;
+    c->req_id = id;
+    c->park_deadline = time(NULL) + (time_t)tmo;
+    g_ctrl_parked++;
+    return true;
+  }
+  const dbreg_info_t *zi = &info[0];
+  if (strcmp(cmd, "zonestatus") == 0) {
+    char m[600];
+    const char *res = zi->shadowed ? (zi->shadow_by == DBREG_SH_CATALOG ? "shadowed (hidden by a catalog member)"
+                                                                         : "shadowed (hidden by a zone in karidns.conf)")
+                                   : (zi->last_result == DBREG_REJECTED ? "rejected" : "applied");
+    int l = snprintf(m, sizeof(m), "OK serial=%u refresh=%u source=database view=%s id=%lld result=%s%s%s%s\n", zi->serial,
+                     zi->refresh, zi->view, (long long)zi->source_id, res, zi->has_entry ? "" : " (no version loaded)",
+                     zi->error[0] ? " last-error: " : "", zi->error);
+    if (l >= (int)sizeof(m)) l = (int)sizeof(m) - 1, m[l - 1] = '\n';
+    send(cfd, m, (size_t)l, 0);
+    return true;
+  }
+  if (strcmp(cmd, "notify") == 0) {
+    zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
+    zone_db_entry_t *e = snap ? dbreg_snapshot_entry(snap, zi->view, zone) : NULL;
+    if (e) {
+      syslog(LOG_NOTICE, "[Control] Received notify command for zone: %s (database zone, view %s)", zone, zi->view);
+      atomic_store_explicit(&e->notify_now, true, memory_order_release);
+      send(cfd, "OK\n", 3, 0);
+    } else {
+      static const char msg[] = "ERROR zone is not served from the database (hidden by another zone of the same name)\n";
+      send(cfd, msg, sizeof(msg) - 1, 0);
+    }
+    if (snap) release_zone_snapshot(snap);
+    return true;
+  }
+  /* retransfer: a database zone is a primary zone; its data comes from the loader, not from a primary server */
+  static const char msg[] = "ERROR zone is a primary zone from the database; read it again with 'karictl reload <zone>'\n";
+  send(cfd, msg, sizeof(msg) - 1, 0);
+  return true;
+}
+
 /* P5: SIGHUP はバックエンドの全スレッドでブロックされ、保留のまま EVFILT_SIGNAL で通知される。
  * 保留分を sigtimedwait() で取り出して送信元を見る。pkill -HUP karidns のように全プロセスへ
  * 送られると、直接届いたものとマネージャーが転送したものの2つになり、両方でリロードすると
@@ -2929,7 +3056,7 @@ void *control_thread_func(void *arg) {
   if (kq < 0)
     pthread_exit(NULL);
   atomic_store_explicit(&g_control_kq, kq, memory_order_release);
-  struct kevent ev_set[5];
+  struct kevent ev_set[6];
   EV_SET(&ev_set[0], SIGHUP, EVFILT_SIGNAL, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev_set[1], 1, EVFILT_TIMER, EV_ADD | EV_CLEAR, 0, 1000, NULL);
   EV_SET(&ev_set[2], 2, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
@@ -2937,7 +3064,8 @@ void *control_thread_func(void *arg) {
    * backend_shutdown() する (EVFILT_SIGNAL はハンドラがあっても配送を記録する) */
   EV_SET(&ev_set[3], SIGTERM, EVFILT_SIGNAL, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev_set[4], SIGINT, EVFILT_SIGNAL, EV_ADD | EV_CLEAR, 0, 0, NULL);
-  if (kevent(kq, ev_set, 5, NULL, 0, NULL) == -1) {
+  EV_SET(&ev_set[5], DB_INGEST_CTL_EVENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL); /* B6a: an answer of the DB loader */
+  if (kevent(kq, ev_set, 6, NULL, 0, NULL) == -1) {
     close(kq);
     pthread_exit(NULL);
   }
@@ -2971,6 +3099,10 @@ void *control_thread_func(void *arg) {
       break;
     }
     for (int i = 0; i < n; i++) {
+      if (ev_list[i].filter == EVFILT_USER && ev_list[i].ident == DB_INGEST_CTL_EVENT) {
+        control_db_results();
+        continue;
+      }
       if (ev_list[i].filter == EVFILT_READ && g_notify_resp_ipc[0] >= 0 &&
           ev_list[i].ident == (uintptr_t)g_notify_resp_ipc[0]) {
         /* UDP ワーカーが回してきた NOTIFY の応答 (udp_ipc_t + DNS メッセージ) */
@@ -3056,6 +3188,12 @@ void *control_thread_func(void *arg) {
           free_ctrl_client(cfd);
           continue;
         }
+        if (c->state == CTRL_STATE_PARKED) { /* waiting for the loader: nothing more is expected; a closed socket frees it */
+          char junk[128];
+          ssize_t pr = recv(cfd, junk, sizeof(junk), 0);
+          if (pr == 0 || (pr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) free_ctrl_client(cfd);
+          continue;
+        }
         /* 行の処理後は buf_len < sizeof(c->buf) - 1 (改行の無いまま満杯になったクライアントは下で切断する) */
         size_t space_left = sizeof(c->buf) - c->buf_len - 1;
         ssize_t r = recv(cfd, c->buf + c->buf_len, space_left, 0);
@@ -3136,6 +3274,19 @@ void *control_thread_func(void *arg) {
               }
             }
             
+            bool want_force = false; /* `reload <zone> [<view>] [force]` (B6a): force is the last word */
+            if (strcmp(cmd, "reload") == 0 && view_arg) {
+              char *fw = strrchr(view_arg, ' ');
+              if (strcmp(view_arg, "force") == 0) {
+                want_force = true;
+                view_arg = NULL;
+              } else if (fw && strcmp(fw + 1, "force") == 0) {
+                want_force = true;
+                while (fw > view_arg && fw[-1] == ' ') fw--;
+                *fw = '\0';
+              }
+            }
+
             if (strcmp(cmd, "reload") == 0) {
               if (arg && strlen(arg) > 0) {
                 char canon_buf[256];
@@ -3145,8 +3296,12 @@ void *control_thread_func(void *arg) {
                 zone_lookup_result_t lr = {0};
                 int nmatches = lookup_zone_across_views(snap, active, canon_arg, view_arg, &lr);
                 if (nmatches == 0) {
-                  syslog(LOG_ERR, "[Control] Command 'reload' failed: zone '%s' not found", canon_arg);
-                  send(cfd, "ERROR zone not found\n", 21, 0);
+                  if (db_zone_command(c, cmd, canon_arg, view_arg, want_force)) {
+                    /* answered or parked (D17-2) */
+                  } else {
+                    syslog(LOG_ERR, "[Control] Command 'reload' failed: zone '%s' not found", canon_arg);
+                    send(cfd, "ERROR zone not found\n", 21, 0);
+                  }
                 } else if (nmatches > 1) {
                   send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'reload <zone> <view>')\n", 82, 0);
                 } else if (lr.entry && lr.zcfg) {
@@ -3193,6 +3348,16 @@ void *control_thread_func(void *arg) {
                 config_reload_result_t rr = run_config_reload(false);
                 char reply[CTRL_RELOAD_REPLY_SIZE];
                 int rlen = format_reload_reply(&rr, "OK reloaded", reply, sizeof(reply));
+                /* B6a (design 5.2): after the configuration, ask the loader to compare its sources with the zones served;
+                 * the answer is not waited for (karictl dbstatus shows the batch) */
+                if ((rr.status == CONFIG_RELOAD_OK || rr.status == CONFIG_RELOAD_ZONE_ERRORS) && db_ingest_enabled()) {
+                  uint64_t rid = db_ingest_reload(true, NULL, NULL, false);
+                  if (rid && rlen > 0 && reply[rlen - 1] == '\n' && (size_t)rlen + 64 < sizeof(reply)) {
+                    rlen--;
+                    rlen += snprintf(reply + rlen, sizeof(reply) - (size_t)rlen, "; DB reload requested (request %llu)\n",
+                                     (unsigned long long)rid);
+                  }
+                }
                 send(cfd, reply, (size_t)rlen, 0);
               }
             } else if (strcmp(cmd, "reconfig") == 0) {
@@ -3273,8 +3438,10 @@ void *control_thread_func(void *arg) {
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
               if (nmatches == 0) {
-                syslog(LOG_ERR, "[Control] Command 'zonestatus' failed: zone '%s' not found", canon_arg);
-                send(cfd, "ERROR zone not found\n", 21, 0);
+                if (!db_zone_command(c, cmd, canon_arg, view_arg, false)) {
+                  syslog(LOG_ERR, "[Control] Command 'zonestatus' failed: zone '%s' not found", canon_arg);
+                  send(cfd, "ERROR zone not found\n", 21, 0);
+                }
               } else if (nmatches > 1) {
                 send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'zonestatus <zone> <view>')\n", 86, 0);
               } else if (lr.entry) {
@@ -3336,8 +3503,10 @@ void *control_thread_func(void *arg) {
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
               if (nmatches == 0) {
-                syslog(LOG_ERR, "[Control] Command 'notify' failed: zone '%s' not found", canon_arg);
-                send(cfd, "ERROR zone not found\n", 21, 0);
+                if (!db_zone_command(c, cmd, canon_arg, view_arg, false)) {
+                  syslog(LOG_ERR, "[Control] Command 'notify' failed: zone '%s' not found", canon_arg);
+                  send(cfd, "ERROR zone not found\n", 21, 0);
+                }
               } else if (nmatches > 1) {
                 send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'notify <zone> <view>')\n", 82, 0);
               } else if (lr.entry) {
@@ -3357,8 +3526,10 @@ void *control_thread_func(void *arg) {
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
               if (nmatches == 0) {
-                syslog(LOG_ERR, "[Control] Command 'retransfer' failed: zone '%s' not found", canon_arg);
-                send(cfd, "ERROR zone not found\n", 21, 0);
+                if (!db_zone_command(c, cmd, canon_arg, view_arg, false)) {
+                  syslog(LOG_ERR, "[Control] Command 'retransfer' failed: zone '%s' not found", canon_arg);
+                  send(cfd, "ERROR zone not found\n", 21, 0);
+                }
               } else if (nmatches > 1) {
                 send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'retransfer <zone> <view>')\n", 86, 0);
               } else if (lr.entry && !lr.entry->is_secondary) {
@@ -3386,7 +3557,7 @@ void *control_thread_func(void *arg) {
               syslog(LOG_ERR, "[Control] Received unknown command: %s", cmd);
               send(cfd, "ERROR unknown command\n", 22, 0);
             }
-            free_ctrl_client(cfd);
+            if (c->state != CTRL_STATE_PARKED) free_ctrl_client(cfd); /* a parked client waits for the loader's answer */
             continue;
           }
           size_t rem = c->buf_len - (nl + 1 - c->buf);
@@ -3428,6 +3599,10 @@ void *control_thread_func(void *arg) {
         while (curr_c) {
           ctrl_client_t *next_c = curr_c->next;
           bool timed_out = false;
+          if (curr_c->state == CTRL_STATE_PARKED) {
+            curr_c = next_c;                             /* control_park_timeouts() below */
+            continue;
+          }
           if (curr_c->state != CTRL_STATE_CMD_WAIT) {
             if (now - curr_c->connect_time >= 5) {
               timed_out = true;
@@ -3444,6 +3619,8 @@ void *control_thread_func(void *arg) {
           curr_c = next_c;
         }
 
+        control_db_results(); /* an answer whose wake-up was missed */
+        control_park_timeouts(now);
         notify_retransmit_due(now); /* RFC 1996 §3.6: 応答の無い NOTIFY の再送 */
 
         server_config_t *active = acquire_config_snapshot();

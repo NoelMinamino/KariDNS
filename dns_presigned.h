@@ -90,4 +90,9 @@ int presigned_rebuild(const zone_arena_t *arena, const char *apex, const char *n
                       presigned_out_t *out, char *err, size_t errlen);
 void presigned_out_free(presigned_out_t *out);
 
+/* Open item 1 (decided 2026-10-21): put the hashed first label of every NSEC3 owner and of every RRSIG(NSEC3) owner in
+ * upper case (RFC 4648 s7 alphabet, as BIND and file zones spell it; the same name per RFC 4343 s2).  Rewrites the owners
+ * in place (and the precomputed wire owner when there is one); returns the number of records changed. */
+size_t presigned_upper_hash_owners(zone_arena_t *a);
+
 #endif

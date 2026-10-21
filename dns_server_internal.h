@@ -583,10 +583,12 @@ typedef struct dbreg_zone {
   uint32_t hash;
   uint8_t digest[32];
   uint8_t last_result;         /* DBREG_APPLIED or DBREG_REJECTED (the last version offered) */
-  bool shadowed;               /* a zone of karidns.conf with this name hides it (D-PRIO) */
+  bool shadowed;               /* a zone of karidns.conf (D-PRIO) or a catalog member (D17-1) with this name hides it */
+  uint8_t shadow_by;           /* DBREG_SH_*, meaningful while shadowed */
   char name[];                 /* canonical absolute name, lower case, with the trailing dot */
 } dbreg_zone_t;
 enum { DBREG_APPLIED = 0, DBREG_REJECTED = 1 };
+enum { DBREG_SH_NONE = 0, DBREG_SH_CONFIG = 1, DBREG_SH_CATALOG = 2 };
 
 /* Commit an installed zone.  entry is either a new entry (created = true, the registry takes over its initial
  * reference and the entry is queued to enter the view snapshot, unless a configured zone shadows it) or the entry
@@ -618,6 +620,26 @@ typedef bool (*dbreg_walk_cb)(void *ud, const char *view, const dbreg_zone_t *z)
 bool dbreg_walk(dbreg_cursor_t *cur, dbreg_walk_cb cb, void *ud);
 /* counts: zones with an entry (applied+shadowed), rejected-only records and shadowed ones */
 void dbreg_counts(size_t *total, size_t *rejected, size_t *shadowed);
+/* the same, with the shadowed zones told apart: by a zone of karidns.conf, by a catalog member (D17-1) */
+void dbreg_counts2(size_t *total, size_t *rejected, size_t *shadowed_config, size_t *shadowed_catalog);
+/* What the registry knows about a zone, copied under the lock (control commands, D17-2). */
+typedef struct {
+  char view[KARIDNS_VIEW_NAME_MAX];
+  int64_t source_id;
+  uint32_t serial;             /* the serial of the version served (0 without an entry) */
+  uint32_t refresh;            /* SOA refresh of that version */
+  bool has_entry;              /* a version was installed */
+  bool shadowed;
+  uint8_t shadow_by;           /* DBREG_SH_* */
+  uint8_t last_result;         /* DBREG_APPLIED / DBREG_REJECTED: the last version offered */
+  char error[160];             /* last rejection / loader error, "" = none */
+} dbreg_info_t;
+/* The registry records of the zone `name` (any case, with or without the trailing dot) in the view `view` (NULL: every
+ * view), at most max of them copied to out.  Returns how many there are. */
+int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int max);
+/* The entry of the DB zone (view, name) when it is in the active snapshot, i.e. served (not shadowed), else NULL.  Valid
+ * while the caller holds the snapshot (acquire_retained_zone_snapshot()). */
+zone_db_entry_t *dbreg_snapshot_entry(zone_db_snapshot_t *snap, const char *view, const char *name);
 /* Publish new settings for a DB zone; the old ones are freed after a grace period (zone_retire_object()).  cfg is
  * owned by the entry afterwards (freed with it). */
 void db_entry_set_config(zone_db_entry_t *entry, const zone_config_t *cfg);

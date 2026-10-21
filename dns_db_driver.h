@@ -88,11 +88,14 @@ typedef struct db_driver {
     /* DISTINCT cryptokeys.domain_id (existence only: the loader never reads key material) */
     int (*zones_with_keys)(db_conn_t *c, db_key_cb cb, void *ud);
     /* rows of karidns_changes after `after`, ORDER BY seq.  *last_seq = highest seq seen (or after); *gap = rows
-     * after `after` were pruned.  DB_ERR_UNAVAILABLE when the table does not exist.  Provisional until B6. */
+     * after `after` were pruned (the first row is not after + 1).  DB_ERR_UNAVAILABLE when the table does not exist. */
     int (*changes_since)(db_conn_t *c, uint64_t after, db_change_cb cb, void *ud, uint64_t *last_seq, bool *gap);
     int (*wait_fd)(db_conn_t *c);                                /* fd to poll for change notifications; -1 = poll by timer */
     int (*drain_notifications)(db_conn_t *c, bool *changed);
     int (*report_status)(db_conn_t *c, const db_status_t *st);   /* PostgreSQL only; SQLite3: no-op */
+    /* B6a: the highest seq in karidns_changes inside the open snapshot (0 = the table is empty); DB_ERR_UNAVAILABLE when
+     * the table does not exist.  Used for the first reading of the change log (no need to list a million rows). */
+    int (*changes_max)(db_conn_t *c, uint64_t *seq);
 } db_driver_t;
 
 /* compiled in when the driver is listed in DB_DRIVERS (Makefile) */

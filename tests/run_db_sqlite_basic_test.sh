@@ -6,8 +6,8 @@
 # as "nobody":
 #   - DB zones answer (SOA, A, MX, TXT, NXDOMAIN, AA) once the startup batch is done; the log says so and
 #     `karictl dbstatus` shows the loader, the batch and the zones (summary and one zone);
-#   - kill -9 of the loader: the zones keep answering, the restarted loader reconciles (the Backend sends the
-#     inventory; B4b has no diff yet, so the zones are sent and installed again): no errors, the answers stay;
+#   - kill -9 of the loader: the zones keep answering, the restarted loader reconciles against the Backend's inventory
+#     (B6a: it reads every zone, finds the digests equal and sends none): no errors, the answers stay, the totals do not move;
 #   - D-PRIO: a zone {} with a file of the same name hides the DB zone (warning, dbstatus "shadowed", the file's data
 #     answers); removing it from karidns.conf and `karictl reconfig` brings the DB zone back without a loader run;
 #   - a bad row: the loader cannot read the zone, the Backend keeps the last good version (still answers, dbstatus says
@@ -172,10 +172,11 @@ if wait_log "$T/srv.log" "\[DB\] batch 1 complete" 20 2; then pass "the restarte
 grep -q "loader asked for the inventory: sent $NZ zone(s)" "$T/srv.log" && pass "the Backend's inventory listed the $NZ zones" || { fail "inventory line"; grep "inventory" "$T/srv.log" | sed 's/^/         /'; }
 P2=$(loader_pid)
 [ -n "$P2" ] && [ "$P2" != "$P1" ] && pass "new loader pid $P2" || fail "no new loader process"
-[ "$(grep -c 'rejected:' "$T/srv.log")" -eq 0 ] && pass "no zone was rejected when the zones were sent again" || fail "a zone was rejected on the second batch"
+[ "$(grep -c 'rejected:' "$T/srv.log")" -eq 0 ] && pass "no zone was rejected at the restart" || fail "a zone was rejected on the second batch"
+grep -q "batch 1 (startup) sent: $NZ zone(s) read, 0 sent, 0 failed in the loader, 0 deleted, $NZ unchanged" "$T/srv.log" && pass "the restarted loader read $NZ zones and sent none (same digests)" || { fail "the restarted loader sent zones again"; grep "batch 1 (startup)" "$T/srv.log" | sed 's/^/         /'; }
 check_ans "www.db1.test A after the restart" "192.0.2.10" www.db1.test A
 dbst | grep -q "^zones: $NZ in the registry ($NZ served" && pass "dbstatus: still $NZ zones" || fail "dbstatus zones line after the restart"
-dbst | grep -q "^since start: $((NZ * 2)) applied, 0 rejected" && pass "dbstatus: $((NZ * 2)) applied in total (sent again)" || fail "dbstatus totals after the restart"
+dbst | grep -q "^since start: $NZ applied, 0 rejected" && pass "dbstatus: still $NZ applied in total (nothing was sent again)" || fail "dbstatus totals after the restart"
 
 # ================================================================ D-PRIO
 echo "== a configured zone hides a DB zone"

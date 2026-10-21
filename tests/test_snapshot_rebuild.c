@@ -446,8 +446,8 @@ static void test_snapshot_catalog_member_sync_and_deltas(void) {
         "options { directory \"%s\"; };\n"
         "view \"default\" {\n"
         "  zone \"cat.example\" { type master; file \"%s/cat_v1.zone\"; };\n"
-        "  zone \"member1.example\" { type master; file \"%s/m1.zone\"; in-catalog-zone \"cat.example\"; };\n"
-        "  zone \"member2.example\" { type master; file \"%s/m2.zone\"; in-catalog-zone \"cat.example\"; };\n"
+        "  zone \"member1.example\" { type master; file \"%s/m1.zone\"; };\n"
+        "  zone \"member2.example\" { type master; file \"%s/m2.zone\"; };\n"
         "};\n",
         g_dir, g_dir, g_dir, g_dir);
 
@@ -462,8 +462,8 @@ static void test_snapshot_catalog_member_sync_and_deltas(void) {
         "options { directory \"%s\"; };\n"
         "view \"default\" {\n"
         "  zone \"cat.example\" { type master; file \"%s/cat_v2.zone\"; };\n"
-        "  zone \"member1.example\" { type master; file \"%s/m1.zone\"; in-catalog-zone \"cat.example\"; };\n"
-        "  zone \"member3.example\" { type master; file \"%s/m3.zone\"; in-catalog-zone \"cat.example\"; };\n"
+        "  zone \"member1.example\" { type master; file \"%s/m1.zone\"; };\n"
+        "  zone \"member3.example\" { type master; file \"%s/m3.zone\"; };\n"
         "};\n",
         g_dir, g_dir, g_dir, g_dir);
 
@@ -558,7 +558,7 @@ static void test_snapshot_rebuild_case_8(void) {
     printf("[TEST] Snapshot Rebuild: Program zone configuration snapshot...\n");
     server_config_t *cfg = load_conf(
         "options { directory \"%s\"; allow-program-zones yes; };\n"
-        "view \"default\" { zone \"prog.example\" { type program; program-path \"/bin/echo\"; }; };\n",
+        "view \"default\" { zone \"prog.example\" { type program; program \"/bin/echo\"; }; };\n",
         g_dir);
     zone_db_snapshot_t *snap = build(cfg, false);
     assert(snap != NULL);
@@ -1033,7 +1033,6 @@ static void test_snapshot_standby_ecs_and_soa_serial(void) {
         "  zone \"standby.example\" {\n"
         "    type master;\n"
         "    file \"%s/standby.zone\";\n"
-        "    bind-ecs-trusted-resolvers { 192.0.2.0/24; 2001:db8::/32; };\n"
         "  };\n"
         "};\n",
         g_dir, g_dir);

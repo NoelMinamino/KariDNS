@@ -195,20 +195,20 @@ gen_queries() {   # gen_queries APEX: the query list on stdout
         }' | head -40000
 }
 
-# compare A.out B.out: prints "total identical folded mismatches".  folded = identical after the ASCII letters of the
-# question name and of the owner names are folded to lower case: the hashed owner names of an NSEC3 chain are written
-# in upper case by BIND's dnssec-signzone and come out in lower case from the database (PowerDNS stores every owner in
-# lower case; the owner of a rebuilt NSEC3 RR is the stored RRSIG(NSEC3) owner).  RFC 4343 s2: the same name.
+# compare A.out B.out: prints "total identical folded mismatches" (folded is always 0 now).  Since B6a the answers are
+# compared byte for byte, the case of the owner names included: PowerDNS stores the hashed owner names of an NSEC3 chain
+# in lower case, the loader writes the hashed first label of every NSEC3 owner and of every RRSIG(NSEC3) owner in upper
+# case (RFC 4648 s7 alphabet, as BIND's dnssec-signzone writes it; open item 1, decided 2026-10-21), so the file zone and
+# its database copy answer the same bytes.
 compare() {
     awk -F'\t' '
-        NR == FNR { k[FNR] = $1; s[FNR] = $2; f[FNR] = $3; next }
+        NR == FNR { k[FNR] = $1; s[FNR] = $2; next }
         { total++
           if ($1 != k[FNR]) { bad++; if (bad <= 5) print "         query list mismatch at " FNR > "/dev/stderr"; next }
           if ($2 == "TIMEOUT" || s[FNR] == "TIMEOUT") { bad++; if (bad <= 5) print "         timeout: " $1 > "/dev/stderr"; next }
           if ($2 == s[FNR]) ident++
-          else if ($3 == f[FNR]) fold++
           else { bad++; if (bad <= 5) print "         DIFFERENT: " $1 > "/dev/stderr" } }
-        END { printf "%d %d %d %d\n", total, ident, fold, bad }' "$1" "$2"
+        END { printf "%d %d 0 %d\n", total, ident, bad }' "$1" "$2"
 }
 
 TOTAL=0; IDENT=0; FOLD=0
@@ -227,9 +227,7 @@ for z in $ZONES; do
     set -- $(compare "$T/q.a" "$T/q.b" 2> "$T/cmp.err"); tot=$1; idn=$2; fol=$3; bad=$4
     TOTAL=$((TOTAL + tot)); IDENT=$((IDENT + idn)); FOLD=$((FOLD + fol))
     if [ "$bad" = "0" ] && [ "$tot" = "$NQ" ] && [ "$tot" -gt 0 ]; then
-        if [ "$fol" = "0" ]; then pass "$z: $tot queries (DO=1 included), all identical"
-        elif [ "$z" = "sg-nsec.test" ]; then fail "$z: $fol queries differ in the case of owner names, an NSEC zone has no hashed owners"
-        else pass "$z: $tot queries (DO=1 included): $idn identical, $fol differ only in the case of the NSEC3 owner names"; fi
+        pass "$z: $tot queries (DO=1 included), all byte-identical (the case of the owner names included)"
     else fail "$z: $bad of $tot queries differ (list had $NQ)"; cat "$T/cmp.err"; fi
     # the NSEC3 hashed owners of the zone as query names (NSEC3 owner names answer NOERROR, RFC 5155 s7.2)
     id=$(sqlite3 "$T/db/z.db" "SELECT id FROM domains WHERE name = '$z'")
@@ -240,7 +238,7 @@ for z in $ZONES; do
         "$T/dbquery" -p "$PB" -t 3 "$T/h.list" "$T/h.b" > /dev/null 2>&1
         set -- $(compare "$T/h.a" "$T/h.b" 2> "$T/cmp.err")
         TOTAL=$((TOTAL + $1)); IDENT=$((IDENT + $2)); FOLD=$((FOLD + $3))
-        if [ "$4" = "0" ] && [ "$1" -gt 0 ]; then pass "$z: $1 queries for the NSEC3 owner names: $2 identical, $3 differ only in the case of the owner"
+        if [ "$4" = "0" ] && [ "$1" -gt 0 ]; then pass "$z: $1 queries for the NSEC3 owner names, all byte-identical"
         else fail "$z: $4 of $1 NSEC3 owner name queries differ"; cat "$T/cmp.err"; fi
     fi
     # AXFR as a set of RRs.  DB zones run with the default settings until B7 (the allow-transfer of the metadata is not
@@ -254,8 +252,6 @@ for z in $ZONES; do
     elif [ "$(wc -l < "$T/axfr.b" | tr -d ' ')" -lt 10 ]; then echo "  [SKIP] $z: AXFR of a database zone is refused until B7 (default settings); file AXFR $(wc -l < "$T/axfr.a" | tr -d ' ') lines"
     else
         if cmp -s "$T/axfr.a" "$T/axfr.b"; then pass "$z: AXFR is the same set of $(wc -l < "$T/axfr.a" | tr -d ' ') lines"
-        elif tr 'A-Z' 'a-z' < "$T/axfr.a" | sort > "$T/axfr.a.l" && tr 'A-Z' 'a-z' < "$T/axfr.b" | sort > "$T/axfr.b.l" && cmp -s "$T/axfr.a.l" "$T/axfr.b.l"; then
-            pass "$z: AXFR is the same set of lines (the case of the NSEC3 owner names apart)"
         else fail "$z: AXFR differs ($(wc -l < "$T/axfr.a" | tr -d ' ') vs $(wc -l < "$T/axfr.b" | tr -d ' ') lines)"; diff "$T/axfr.a" "$T/axfr.b" | head -6; fi
         if command -v dnssec-verify >/dev/null 2>&1; then
             sed '$d' "$T/axfr.b.raw" > "$T/verify.zone"
@@ -265,7 +261,7 @@ for z in $ZONES; do
     fi
 done
 echo
-echo "$TOTAL queries: $IDENT byte-identical, $FOLD identical after folding the case of the owner names (NSEC3 hashed owners)"
+echo "$TOTAL queries: $IDENT byte-identical"
 stop_servers
 if grep -q "AddressSanitizer\|runtime error:" "$T/a.log" "$T/b.log" 2>/dev/null; then fail "sanitizer report in a server log"; fi
 if [ "$FAILS" -eq 0 ]; then echo "=== run_db_signed_diff_test: all $PASS checks passed (file vs DB = 0 differences, signed zones) ==="; exit 0; fi

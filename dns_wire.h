@@ -463,6 +463,10 @@ size_t dns_label_to_text(const uint8_t *label, size_t len, char *out, size_t cap
 // 戻り値は strlen(out)。不正なエスケープ、空ラベル、63 オクテット超のラベル、
 // 255 オクテット超の名前 (RFC 1035 §2.3.4)、バッファ不足なら (size_t)-1。
 size_t dns_name_normalize(const char *in, char *out, size_t cap);
+// 正規形の名前をゾーンファイルの 1 トークンとして書く。正規形がエスケープしない文字のうち
+// ゾーンファイルの字句解析で意味を持つもの (RFC 1035 §5.1: ';' '"' '(' ')'、行頭の '$'、'@') にも
+// '\' を付ける。戻り値は strlen(out)、入りきらなければ (size_t)-1。out の大きさは 2 * strlen(name) + 1 あれば足りる。
+size_t dns_name_zone_token(const char *name, char *out, size_t cap);
 
 /* メッセージ中の TSIG RR (RFC 8945 §4.2) */
 typedef struct {

@@ -9,6 +9,9 @@
  *  3. D-PRIO: a configured zone hides a DB zone, the DB zone comes back when the configured zone is removed.
  *  4. dbcfg: zone_entry_config() returns it for DB zones, a replaced block is retired and freed.
  *  5. concurrent readers while zones are added and removed: a reader never sees a DB zone without its image.
+ *  6. (B6a) D17-1: a catalog member with the name of a DB zone hides it (catalog delta), the DB zone returns when the
+ *     member leaves, a DB zone committed behind an existing member is hidden; dbreg_find_info(), dbreg_counts2(),
+ *     dbreg_snapshot_entry().
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -473,6 +476,111 @@ static void test_shadowing(void) {
     dbreg_reset();
 }
 
+/* ---------------------------------------------------------------- 6. D17-1 */
+static void test_catalog_member_wins(void) {
+    printf("[TEST] DB registry: a catalog member hides a DB zone of the same name and gives it back...\n");
+    char path[300];
+    snprintf(path, sizeof(path), "%s/cat.zone", g_dir);
+    FILE *f = fopen(path, "w");
+    fputs("$ORIGIN cat.test.\n$TTL 300\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.9\nversion IN TXT \"2\"\n"
+          "uid1.zones IN PTR m1.test.\n", f);
+    fclose(f);
+    server_config_t *cfg = load_conf("view \"default\" { match-clients { any; };\n"
+                                     "  zone \"cat.test\" { type master; file \"%s\"; catalog-zone yes; }; };\n", path);
+    rebuild(cfg);                                                   /* the catalog zone lists m1.test as a member */
+    zone_db_entry_t *cat = NULL, *member = NULL;
+    {
+        zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+        view_snapshot_t *v = snapshot_find_view(s, "default");
+        cat = find_zone_exact_in_view(v, "cat.test.");
+        member = find_zone_exact_in_view(v, "m1.test.");
+        release_zone_snapshot(s);
+    }
+    CHECK(cat != NULL);
+    CHECK(member && member->is_catalog_member && member->source == ZONE_SRC_CATALOG);
+
+    /* a DB zone that arrives behind the member: committed, hidden, never queued; another one is served */
+    dbreg_info_t info[2];
+    zone_db_entry_t *d = new_entry("default", "m1.test.");
+    {
+        msg_t m;
+        char why[128];
+        zone_msg(&m, "m1.test.", 3, 2);
+        CHECK(install_msgs(d, "m1.test.", 5, &m, 1, why, sizeof(why), NULL) == 0);
+        uint8_t dg[32] = { 1 };
+        bool sh = false;
+        CHECK(dbreg_commit("default", "m1.test.", d, true, 41, 3, dg, &sh) == 0 && sh);
+        CHECK(dbreg_pending_count() == 0);
+    }
+    zone_db_entry_t *other = add_zone("default", "other.test.", 3, 2, 42);
+    CHECK(snapshot_apply_db_delta() == 1);
+    CHECK(!in_snapshot("default", d) && in_snapshot("default", other) && in_snapshot("default", member));
+    CHECK(dbreg_find_info(NULL, "M1.test", info, 2) == 1);          /* any case, no trailing dot, every view */
+    CHECK(strcmp(info[0].view, "default") == 0 && info[0].source_id == 41 && info[0].serial == 3 && info[0].has_entry);
+    CHECK(info[0].shadowed && info[0].shadow_by == DBREG_SH_CATALOG && info[0].last_result == DBREG_APPLIED);
+    CHECK(dbreg_find_info("nosuchview", "m1.test.", info, 2) == 0 && dbreg_find_info(NULL, "nothere.test.", info, 2) == 0);
+    size_t total, rej, shc, shk;
+    dbreg_counts2(&total, &rej, &shc, &shk);
+    CHECK(total == 2 && rej == 0 && shc == 0 && shk == 1);
+    {
+        zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+        CHECK(dbreg_snapshot_entry(s, "default", "m1.test.") == NULL);      /* hidden: not served */
+        CHECK(dbreg_snapshot_entry(s, "default", "other.test.") == other);
+        release_zone_snapshot(s);
+    }
+
+    /* the member leaves (a catalog update, delta mode): the DB zone is served in the same snapshot */
+    catalog_member_id_t *none = calloc(1, sizeof(*none));
+    CHECK(none != NULL);
+    CHECK(rebuild_zone_db_snapshot(NULL, "default", cat, NULL, none, 0) != NULL);
+    CHECK(in_snapshot("default", d) && in_snapshot("default", other));
+    CHECK(dbreg_find_info(NULL, "m1.test.", info, 2) == 1 && !info[0].shadowed && info[0].shadow_by == DBREG_SH_NONE);
+    dbreg_counts2(&total, &rej, &shc, &shk);
+    CHECK(total == 2 && shc == 0 && shk == 0);
+    {
+        zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+        CHECK(dbreg_snapshot_entry(s, "default", "m1.test.") == d);
+        release_zone_snapshot(s);
+    }
+
+    /* the member comes back (a catalog update that adds it): the served DB zone leaves the view */
+    catalog_member_id_t *one = calloc(1, sizeof(*one));
+    CHECK(one != NULL);
+    snprintf(one[0].unique_id, sizeof(one[0].unique_id), "uid1");
+    snprintf(one[0].domain, sizeof(one[0].domain), "m1.test.");
+    CHECK(rebuild_zone_db_snapshot(NULL, "default", cat, NULL, one, 1) != NULL);
+    CHECK(!in_snapshot("default", d) && in_snapshot("default", other));
+    {
+        zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+        zone_db_entry_t *m = find_zone_exact_in_view(snapshot_find_view(s, "default"), "m1.test.");
+        CHECK(m && m != d && m->source == ZONE_SRC_CATALOG && m->is_catalog_member);
+        release_zone_snapshot(s);
+    }
+    CHECK(dbreg_find_info(NULL, "m1.test.", info, 1) == 1 && info[0].shadowed && info[0].shadow_by == DBREG_SH_CATALOG);
+    CHECK(dbreg_lookup_entry("default", "m1.test.") == d);          /* still registered */
+
+    /* a new version of the hidden zone stays hidden */
+    {
+        msg_t m;
+        char why[128];
+        zone_msg(&m, "m1.test.", 4, 1);
+        CHECK(install_msgs(d, "m1.test.", 4, &m, 1, why, sizeof(why), NULL) == 0);
+        uint8_t dg[32] = { 2 };
+        bool sh = false;
+        CHECK(dbreg_commit("default", "m1.test.", d, false, 41, 4, dg, &sh) == 0 && sh);
+        CHECK(dbreg_find_info("default", "m1.test.", info, 1) == 1 && info[0].shadowed && info[0].serial == 4);
+        CHECK(!in_snapshot("default", d));
+    }
+
+    /* the full rebuild (the catalog file still lists the member) lets the member win too */
+    rebuild(cfg);
+    CHECK(!in_snapshot("default", d));
+    CHECK(name_in_snapshot("default", "m1.test."));
+    CHECK(in_snapshot("default", other));
+    zone_retire_process(true);
+    dbreg_reset();
+}
+
 /* ---------------------------------------------------------------- 4. dbcfg */
 static void test_dbcfg(void) {
     printf("[TEST] DB settings: zone_entry_config() and the retirement of a replaced block...\n");
@@ -578,6 +686,7 @@ int main(void) {
     test_install();
     test_registry_delta();
     test_shadowing();
+    test_catalog_member_wins();
     test_dbcfg();
     test_concurrent();
     char cmd[300];
