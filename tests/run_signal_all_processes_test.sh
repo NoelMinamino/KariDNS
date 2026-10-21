@@ -9,8 +9,10 @@ set -e
 # manager stopped the whole server ("Child process N killed by signal 1").
 # Verifies that after SIGHUP/SIGUSR1/SIGUSR2/SIGPIPE are sent to all processes:
 #   1. every process is still alive (same PIDs) and the server still answers,
-#   2. SIGHUP made the server reload (and not stop), and
-#   3. the same signals sent to the manager only also reload and do not kill.
+#   2. SIGHUP made the server reload exactly once (and not stop): the backend
+#      reloads only on the manager's forward, not on its own copy (P5),
+#   3. the same signals sent to the manager only also reload once and do not kill, and
+#   4. SIGHUP sent to the backend alone is logged and ignored.
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -99,6 +101,12 @@ for sig in HUP USR1 USR2 PIPE; do
 done
 if wait_reloads $((R0 + 1)); then check "SIGHUP to all processes reloads" ok; else check "SIGHUP to all processes reloads" ng; fi
 sleep 1
+# P5: the backend gets SIGHUP directly and forwarded by the manager; it must reload once, not twice
+if [ "$(reloads)" -eq $((R0 + 1)) ]; then
+    check "SIGHUP to all processes reloads exactly once" ok
+else
+    check "SIGHUP to all processes reloads exactly once ($(($(reloads) - R0)) reloads)" ng
+fi
 AFTER=$(kari_conf_pids "$TMP_DIR/karidns.conf" | sort -n | tr '\n' ' ')
 if [ "$BEFORE" = "$AFTER" ]; then check "no process died (same PIDs)" ok; else check "no process died (before: $BEFORE after: $AFTER)" ng; fi
 if grep -q "killed by signal" "$TMP_DIR/karidns.log"; then check "no 'killed by signal' in the log" ng; else check "no 'killed by signal' in the log" ok; fi
@@ -114,6 +122,25 @@ if kill -0 $SERVER_PID 2>/dev/null && answers; then
     check "manager alive and answering after HUP/USR1/USR2" ok
 else
     check "manager alive and answering after HUP/USR1/USR2" ng
+fi
+sleep 1
+if [ "$(reloads)" -eq $((R1 + 1)) ]; then check "SIGHUP to the manager reloads exactly once" ok; else check "SIGHUP to the manager reloads exactly once" ng; fi
+
+# 3. SIGHUP to the backend only is not a reload request (only the manager's forward is)
+BACKEND_PID=$(sed -n 's/.*Forwarding to backend process \([0-9][0-9]*\).*/\1/p' "$TMP_DIR/karidns.log" | tail -1)
+if [ -n "$BACKEND_PID" ]; then
+    R2=$(reloads)
+    kill -HUP "$BACKEND_PID"
+    _i=0
+    while ! grep -q "sent to the backend directly is ignored" "$TMP_DIR/karidns.log" && [ $_i -lt 50 ]; do sleep 0.1; _i=$((_i + 1)); done
+    if grep -q "sent to the backend directly is ignored" "$TMP_DIR/karidns.log" && [ "$(reloads)" -eq "$R2" ]; then
+        check "SIGHUP to the backend only is logged and ignored" ok
+    else
+        check "SIGHUP to the backend only is logged and ignored" ng
+    fi
+    if kill -0 "$BACKEND_PID" 2>/dev/null && answers; then check "backend alive after direct SIGHUP" ok; else check "backend alive after direct SIGHUP" ng; fi
+else
+    check "backend PID found in the manager's forwarding log line" ng
 fi
 
 if [ $FAILED -ne 0 ]; then
