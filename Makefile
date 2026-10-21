@@ -384,7 +384,7 @@ dbloader-check-drivers:
 	esac; done
 
 karidns-dbloader: dbloader-check-drivers $(DBLOADER_SRCS)
-	$(CC) $(CFLAGS) $(DBLOADER_DRV_CFLAGS) -I. $(DBLOADER_SRCS) -o $(DBLOADER_TARGET) $(LDFLAGS) -lcrypto $(DBLOADER_DRV_LIBS)
+	$(CC) $(CFLAGS) $(DBLOADER_DRV_CFLAGS) -I. $(DBLOADER_SRCS) -o $(DBLOADER_TARGET) $(LDFLAGS) -pthread -lcrypto $(DBLOADER_DRV_LIBS)
 
 TEST_DB_SQLITE3_SRCS = tests/test_db_sqlite3.c dns_db_sqlite3.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c
 

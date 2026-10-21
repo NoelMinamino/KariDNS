@@ -53,6 +53,7 @@ typedef struct {
 /* What check_schema() found.  Missing PowerDNS tables or columns are an error, not a flag. */
 typedef struct {
     bool has_changes;               /* karidns_changes exists (created by the B6 DDL) */
+    bool has_domain_views;          /* karidns_domain_views exists (B6b, design 3.7, 7.1) */
 } db_schema_info_t;
 
 /* PostgreSQL only: written to karidns_server_status (B11).  SQLite3 ignores it. */
@@ -69,6 +70,7 @@ typedef int (*db_record_cb)(void *ud, int64_t domain_id, const db_record_row_t *
 typedef int (*db_meta_cb)(void *ud, const db_meta_row_t *row);
 typedef int (*db_key_cb)(void *ud, int64_t domain_id);
 typedef int (*db_change_cb)(void *ud, const db_change_row_t *row);
+typedef int (*db_domain_view_cb)(void *ud, int64_t domain_id, const char *view_name);
 
 typedef struct db_driver {
     const char *name;               /* "sqlite3", "postgresql" */
@@ -96,6 +98,12 @@ typedef struct db_driver {
     /* B6a: the highest seq in karidns_changes inside the open snapshot (0 = the table is empty); DB_ERR_UNAVAILABLE when
      * the table does not exist.  Used for the first reading of the change log (no need to list a million rows). */
     int (*changes_max)(db_conn_t *c, uint64_t *seq);
+    /* B6b: records of domain_id lo..hi (both included), ORDER BY domain_id, id: the bulk scan of one range, so that
+     * loader workers with their own connections read disjoint sets of zones. */
+    int (*scan_records_range)(db_conn_t *c, int64_t lo, int64_t hi, db_record_cb cb, void *ud);
+    /* B6b: rows of karidns_domain_views (domain_id, view_name), ORDER BY domain_id; of one domain when domain_id is not NULL.
+     * DB_ERR_UNAVAILABLE when the table does not exist.  The view names are compared by the caller, in C. */
+    int (*scan_domain_views)(db_conn_t *c, const int64_t *domain_id, db_domain_view_cb cb, void *ud);
 } db_driver_t;
 
 /* compiled in when the driver is listed in DB_DRIVERS (Makefile) */

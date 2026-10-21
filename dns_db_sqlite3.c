@@ -34,7 +34,9 @@ struct db_conn {
     char err[DB_ERRLEN];
     bool in_snapshot;
     bool has_changes;
-    sqlite3_stmt *st_zones, *st_rec_all, *st_rec_one, *st_meta_all, *st_meta_one, *st_keys, *st_changes;
+    sqlite3_stmt *st_zones, *st_rec_all, *st_rec_one, *st_rec_rng, *st_meta_all, *st_meta_one, *st_keys, *st_changes;
+    sqlite3_stmt *st_dv_all, *st_dv_one;
+    bool has_domain_views;
 };
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -172,6 +174,9 @@ static void sq_close(db_conn_t *c) {
     sqlite3_finalize(c->st_zones);
     sqlite3_finalize(c->st_rec_all);
     sqlite3_finalize(c->st_rec_one);
+    sqlite3_finalize(c->st_rec_rng);
+    sqlite3_finalize(c->st_dv_all);
+    sqlite3_finalize(c->st_dv_one);
     sqlite3_finalize(c->st_meta_all);
     sqlite3_finalize(c->st_meta_one);
     sqlite3_finalize(c->st_keys);
@@ -240,6 +245,11 @@ static int sq_check_schema(db_conn_t *c, db_schema_info_t *out) {
     if (rc != 0) return rc;
     c->has_changes = rows > 0 && found == 3u;
     if (out) out->has_changes = c->has_changes;
+    static const char *const dv_cols[] = { "domain_id", "view_name", NULL };
+    rc = table_columns(c, "karidns_domain_views", dv_cols, &found, &rows);
+    if (rc != 0) return rc;
+    c->has_domain_views = rows > 0 && found == 3u;
+    if (out) out->has_domain_views = c->has_domain_views;
     return 0;
 }
 
@@ -274,8 +284,8 @@ static int sq_begin_snapshot(db_conn_t *c) {
 
 static int sq_end_snapshot(db_conn_t *c) {
     if (!c->in_snapshot) return 0;
-    sqlite3_stmt *all[] = { c->st_zones, c->st_rec_all, c->st_rec_one, c->st_meta_all, c->st_meta_one, c->st_keys,
-                            c->st_changes };
+    sqlite3_stmt *all[] = { c->st_zones, c->st_rec_all, c->st_rec_one, c->st_rec_rng, c->st_meta_all, c->st_meta_one,
+                            c->st_keys, c->st_changes, c->st_dv_all, c->st_dv_one };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
         if (all[i]) rearm(all[i]);
     c->in_snapshot = false;
@@ -328,16 +338,9 @@ static int sq_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
     return ret;
 }
 
-static int sq_scan_records(db_conn_t *c, const int64_t *domain_id, db_record_cb cb, void *ud) {
-    sqlite3_stmt **slot = domain_id ? &c->st_rec_one : &c->st_rec_all;
-    int ret = prep(c, slot, domain_id ? "SELECT domain_id, id, name, type, content, ttl, prio, disabled, ordername "
-                                        "FROM records WHERE domain_id = ?1 ORDER BY id"
-                                      : "SELECT domain_id, id, name, type, content, ttl, prio, disabled, ordername "
-                                        "FROM records ORDER BY domain_id, id");
-    if (ret != 0) return ret;
-    sqlite3_stmt *st = *slot;
-    rearm(st);
-    if (domain_id) sqlite3_bind_int64(st, 1, *domain_id);
+/* the rows of a prepared records statement (already bound) to the callback */
+static int rec_loop(db_conn_t *c, sqlite3_stmt *st, db_record_cb cb, void *ud) {
+    int ret = 0;
     for (;;) {
         int rc = sqlite3_step(st);
         if (rc == SQLITE_DONE) break;
@@ -364,6 +367,66 @@ static int sq_scan_records(db_conn_t *c, const int64_t *domain_id, db_record_cb 
             break;
         }
         if (cb(ud, did, &r) != 0) {
+            ret = DB_STOPPED;
+            break;
+        }
+    }
+    rearm(st);
+    return ret;
+}
+
+static int sq_scan_records(db_conn_t *c, const int64_t *domain_id, db_record_cb cb, void *ud) {
+    sqlite3_stmt **slot = domain_id ? &c->st_rec_one : &c->st_rec_all;
+    int ret = prep(c, slot, domain_id ? "SELECT domain_id, id, name, type, content, ttl, prio, disabled, ordername "
+                                        "FROM records WHERE domain_id = ?1 ORDER BY id"
+                                      : "SELECT domain_id, id, name, type, content, ttl, prio, disabled, ordername "
+                                        "FROM records ORDER BY domain_id, id");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = *slot;
+    rearm(st);
+    if (domain_id) sqlite3_bind_int64(st, 1, *domain_id);
+    return rec_loop(c, st, cb, ud);
+}
+
+static int sq_scan_records_range(db_conn_t *c, int64_t lo, int64_t hi, db_record_cb cb, void *ud) {
+    int ret = prep(c, &c->st_rec_rng, "SELECT domain_id, id, name, type, content, ttl, prio, disabled, ordername "
+                                      "FROM records WHERE domain_id >= ?1 AND domain_id <= ?2 ORDER BY domain_id, id");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = c->st_rec_rng;
+    rearm(st);
+    sqlite3_bind_int64(st, 1, lo);
+    sqlite3_bind_int64(st, 2, hi);
+    return rec_loop(c, st, cb, ud);
+}
+
+static int sq_scan_domain_views(db_conn_t *c, const int64_t *domain_id, db_domain_view_cb cb, void *ud) {
+    if (!c->has_domain_views) {
+        set_err(c, "karidns_domain_views does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    sqlite3_stmt **slot = domain_id ? &c->st_dv_one : &c->st_dv_all;
+    int ret = prep(c, slot, domain_id ? "SELECT domain_id, view_name FROM karidns_domain_views WHERE domain_id = ?1"
+                                      : "SELECT domain_id, view_name FROM karidns_domain_views ORDER BY domain_id");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = *slot;
+    rearm(st);
+    if (domain_id) sqlite3_bind_int64(st, 1, *domain_id);
+    for (;;) {
+        int rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE) break;
+        if (rc != SQLITE_ROW) {
+            ret = sql_fail(c, rc, "scan_domain_views");
+            break;
+        }
+        bool bad = false;
+        int64_t did = sqlite3_column_int64(st, 0);
+        const char *vn = col_text(c, st, 1, "karidns_domain_views", did, "view_name", &bad);
+        if (bad) {
+            ret = -1;
+            break;
+        }
+        if (!vn) continue;                  /* the column is NOT NULL; a NULL name maps to no view */
+        if (cb(ud, did, vn) != 0) {
             ret = DB_STOPPED;
             break;
         }
@@ -504,7 +567,7 @@ const db_driver_t db_driver_sqlite3 = {
     "sqlite3",       sq_open,         sq_close,           sq_errmsg,           sq_check_schema,
     sq_begin_snapshot, sq_end_snapshot, sq_list_zones,    sq_scan_records,     sq_scan_metadata,
     sq_zones_with_keys, sq_changes_since, sq_wait_fd,     sq_drain_notifications, sq_report_status,
-    sq_changes_max,
+    sq_changes_max,   sq_scan_records_range, sq_scan_domain_views,
 };
 
 #endif /* KARIDNS_DB_SQLITE3 */

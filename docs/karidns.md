@@ -417,11 +417,20 @@ view "other"    { database none; };
 | `max-zone-records <n>;` | `10000000` | Records of one zone, 2..4294967295. |
 | `max-zone-bytes <size>;` | `1G` | Bytes of one zone on the stream, 65535..64G (K, M, G suffixes). |
 | `db-reload-timeout <s>;` | `30` | 1..3600. How long a `karictl reload <zone>` of a database zone waits for the loader's answer; then it gets `ERROR timeout` (the reload may still be applied). The control thread never waits itself: the client is parked (at most 32 at once). |
-| `ingest-threads <n>;` `loader-threads <n>;` | `1` | 1..16 each. `ingest-threads` is the number of builder threads of the Backend: with 1 the thread that reads the stream also builds the zones; with more, complete zones are handed to that many builders (at most that many zones in flight; read when the server starts). `loader-threads` is used by the loader. |
+| `ingest-threads <n>;` `loader-threads <n>;` | `1` | 1..16 each. `ingest-threads` is the number of builder threads of the Backend: with 1 the thread that reads the stream also builds the zones; with more, complete zones are handed to that many builders (at most that many zones in flight; read when the server starts). `loader-threads` is the number of workers of the loader: each has its own database connection and snapshot and reads and converts a disjoint set of zones (consecutive zones in `domains.id` order); the loader writes the results to the stream in `domains.id` order whatever the number is, so the stream (and `karidns-dbloader --dump`) is byte for byte the same with 1 and with 16 workers. More workers help when converting is the cost (many zones, a cold start); one zone or a handful is always read by the loader's main thread. Zones that wait for their turn are held in memory (at most 256 MB). |
 | `server-id "<id>";` | none | postgresql multi-server status (milestone B11); a warning in `karicheck conf` with sqlite3. |
 | `alias-resolver { <ip>; ... };` | none | Parsed and stored (milestone B9a). |
 
-In a `view`: `database-file "<path>";` (sqlite3) or `database-schema "<name>";` (postgresql) gives the view its own source; `database none;` makes it take no DB zones. A view without these uses the global source. File paths and schema names may contain any valid UTF-8 and are used byte for byte (`%XX` is not decoded); invalid UTF-8 and control characters are configuration errors.
+In a `view`: `database-file "<path>";` (sqlite3) or `database-schema "<name>";` (postgresql) gives the view its own source; `database none;` makes it take no DB zones. A view without these uses the global source.
+
+**Which zones a view gets (`karidns_domain_views`, milestone B6b).** A view that uses the global source takes the zones the table `karidns_domain_views (domain_id, view_name)` of that database assigns to it (`db/karidns_ext.*.sql`; edits are in the change log, so `karictl reload` moves a zone between views, with a `ZONE_DELETE` in the old one):
+
+- a domain with **no row** is served by every view that uses the global source (D6); a database without the table behaves the same;
+- a domain with rows is served by the views they name and by no other; view names are compared case-insensitively;
+- a row that names a view that does not use this database as its source (no such view, a view with `database none;`, a view with its own file) is logged once per batch and ignored; a zone that only such rows map is served by no view (so a database shared with another server, whose views are not here, is never served by mistake), and a syslog warning names such zones (the first three and their count, once per batch);
+- a view with its **own** `database-file` / `database-schema` takes all zones of that file; a `karidns_domain_views` inside it is ignored; a view with `database none;` takes none.
+
+`karidns-dbloader --dump ... --map-view <view>` applies the same rule to a dump. File paths and schema names may contain any valid UTF-8 and are used byte for byte (`%XX` is not decoded); invalid UTF-8 and control characters are configuration errors.
 
 Everything except `driver`, `loader-user`, `loader-group`, `loader-path` and the presence of the block reloads (`SIGHUP` / `karictl reload`): the Backend then sends the loader a CONFIG with the new generation. These four are logged as "take effect only after a restart".
 

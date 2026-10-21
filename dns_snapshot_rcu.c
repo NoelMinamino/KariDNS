@@ -357,6 +357,53 @@ void free_zone_db_snapshot(zone_db_snapshot_t *snap) {
   free(snap);
 }
 
+/* GC threads that were started and have not finished.  The process manager forks the Backend, the routers and the
+ * database loader; a fork while one of these threads still runs leaves a multi-threaded parent behind, and the child
+ * (which only copies the forking thread) must not start threads of its own then (ThreadSanitizer refuses: "starting new
+ * threads after multi-threaded fork").  gc_snapshot_wait_idle() lets the manager fork from a single thread. */
+static _Atomic unsigned g_gc_live;
+/* A thread that has counted itself out is still on its way out of the C library (and of ThreadSanitizer's bookkeeping),
+ * and a fork in that window is a fork from a multi-threaded process.  So in the manager, before the Backend exists, the
+ * cleanup threads are joinable and gc_snapshot_wait_idle() joins them.  The Backend turns this off (gc_snapshot_detach_only):
+ * it creates a thread per retired snapshot for the life of the process and never joins. */
+#define GC_TRACK_MAX 64
+static bool g_gc_track = true;
+static pthread_t g_gc_tids[GC_TRACK_MAX];
+static unsigned g_gc_ntids;
+
+void gc_snapshot_detach_only(void) {
+  g_gc_track = false;
+  g_gc_ntids = 0;                 /* the ids belong to the manager's threads, which the Backend does not have */
+}
+
+void gc_snapshot_wait_idle(void) {
+  for (unsigned i = 0; i < g_gc_ntids; i++) pthread_join(g_gc_tids[i], NULL);
+  g_gc_ntids = 0;
+  for (int i = 0; atomic_load_explicit(&g_gc_live, memory_order_acquire) != 0; i++) {
+    if (i == 30000) {    /* 30 s: a reader that never leaves; the fork goes on, the threads stay */
+      syslog(LOG_WARNING, "[Manager] snapshot cleanup threads are still running; forking anyway");
+      return;
+    }
+    struct timespec ts = { 0, 1000000 };
+    nanosleep(&ts, NULL);
+  }
+}
+
+/* start the cleanup of a retired snapshot; false when no thread could be started (the snapshot is then kept) */
+static bool gc_snapshot_start(zone_db_snapshot_t *snap) {
+  pthread_t gc_tid;
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  bool track = g_gc_track && g_gc_ntids < GC_TRACK_MAX;      /* the manager: one thread creates and joins */
+  if (!track) pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  atomic_fetch_add_explicit(&g_gc_live, 1, memory_order_relaxed);
+  bool ok = pthread_create(&gc_tid, &attr, gc_snapshot_thread, snap) == 0;
+  if (!ok) atomic_fetch_sub_explicit(&g_gc_live, 1, memory_order_release);
+  else if (track) g_gc_tids[g_gc_ntids++] = gc_tid;
+  pthread_attr_destroy(&attr);
+  return ok;
+}
+
 void *gc_snapshot_thread(void *arg) {
   zone_db_snapshot_t *snap = (zone_db_snapshot_t *)arg;
   if (!snap) return NULL;
@@ -369,6 +416,7 @@ void *gc_snapshot_thread(void *arg) {
     rcu_exponential_backoff(&retries, &sleep_time);
   }
   free_zone_db_snapshot(snap);
+  atomic_fetch_sub_explicit(&g_gc_live, 1, memory_order_release);
   return NULL;
 }
 
@@ -1569,13 +1617,8 @@ int snapshot_apply_db_delta(void) {
     dbreg_pending_drop_locked();
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 
-    pthread_t gc_tid;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    if (pthread_create(&gc_tid, &attr, gc_snapshot_thread, old_snap) != 0)
+    if (!gc_snapshot_start(old_snap))
         syslog(LOG_ERR, "[DB] cannot start the snapshot cleanup thread; the old snapshot is kept");
-    pthread_attr_destroy(&attr);
     return changes;
 }
 
@@ -2442,12 +2485,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 
     if (old_snap) {
-        pthread_t gc_tid;
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-        pthread_create(&gc_tid, &attr, gc_snapshot_thread, old_snap);
-        pthread_attr_destroy(&attr);
+        (void)gc_snapshot_start(old_snap);
     }
 
     return new_snap;

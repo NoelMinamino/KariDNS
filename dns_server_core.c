@@ -243,6 +243,7 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
   /* 降格先は main() が起動時に解決した g_run_identity (O-18: ここで名前を引き直さない) */
   bool need_drop = (geteuid() == 0);
 
+  gc_snapshot_wait_idle();
   pid_t pid = fork();
   if (pid < 0) {
     close(sv[0]);
@@ -2944,15 +2945,24 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
   bool is_reload = strcmp(cmd, "reload") == 0;
   dbreg_info_t info[2];
   int n = dbreg_find_info(view_arg, zone, info, 2);
-  if (n >= 2) {
+  /* B6b: `reload <zone>` with several views that take database zones and none named asks every one of them: a mapping
+   * (karidns_domain_views) may have moved the zone to another view, which only the loader can tell */
+  bool all_views = false;
+  char view[KARIDNS_VIEW_NAME_MAX];
+  if (is_reload && !view_arg) {
+    char why0[200];
+    all_views = db_ingest_pick_view(NULL, view, sizeof(view), why0, sizeof(why0)) && !view[0];
+  }
+  if (n >= 2 && !all_views) {
     char m[160];
     int l = snprintf(m, sizeof(m), "ERROR zone exists in multiple views; specify view (e.g. '%s <zone> <view>')\n", cmd);
     send(cfd, m, (size_t)l, 0);
     return true;
   }
   if (n == 0 && !is_reload) return false;
-  char view[KARIDNS_VIEW_NAME_MAX];
-  if (n == 1) {
+  if (all_views) {
+    /* view stays empty: dns_db_ingest.c asks every view that takes database zones */
+  } else if (n == 1) {
     snprintf(view, sizeof(view), "%s", info[0].view);
   } else { /* not in the registry yet: a zone added to the database; ask the loader for it */
     char why[200];
@@ -2975,8 +2985,8 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
       send(cfd, msg, sizeof(msg) - 1, 0);
       return true;
     }
-    syslog(LOG_NOTICE, "[Control] Received reload command for database zone: %s (view %s)%s", zone, view,
-           force ? ", force" : "");
+    syslog(LOG_NOTICE, "[Control] Received reload command for database zone: %s (%s%s)%s", zone,
+           all_views ? "every view" : "view ", view, force ? ", force" : "");
     c->state = CTRL_STATE_PARKED;
     c->req_id = id;
     c->park_deadline = time(NULL) + (time_t)tmo;
@@ -5358,6 +5368,7 @@ int main(int argc, char **argv) {
     }
   }
 
+  gc_snapshot_wait_idle(); // GC threads of the startup configuration must be gone: the Backend is forked from one thread
   pid_t backend_pid = fork();
   if (backend_pid < 0) {
     syslog(LOG_CRIT, "fork for backend process failed: %m");
@@ -5385,6 +5396,7 @@ int main(int argc, char **argv) {
 
     pid_t router_pids[MAX_FRONTEND_ROUTERS];
     for (int r = 0; r < g_num_frontend_routers; r++) {
+      gc_snapshot_wait_idle();
       pid_t rpid = fork();
       if (rpid < 0) {
         syslog(LOG_CRIT, "fork for frontend router %d failed: %m", r);
@@ -5563,6 +5575,7 @@ int main(int argc, char **argv) {
   }
 
   // === Backend Process (backend_pid == 0) ===
+  gc_snapshot_detach_only();
   struct sigaction b_sa;
   memset(&b_sa, 0, sizeof(b_sa));
   b_sa.sa_handler = backend_sig_handler;

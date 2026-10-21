@@ -61,7 +61,8 @@
  *                     4 VIEW nested, repeatable (<= 1024):
  *                         1 index u16 R | 2 name str ne <=255 R | 3 source path ne<=1023 O (absent = driver default; B4a: the Backend repeats the global source for views that use it) |
  *                         4 conninfo_file path ne<=1023 O | 5 auto_reload u8 R (0/1) | 6 poll_interval u32 R (s) |
- *                         7 coalesce_ms u32 R | 8 max_zone_records u64 R | 9 max_zone_bytes u64 R
+ *                         7 coalesce_ms u32 R | 8 max_zone_records u64 R | 9 max_zone_bytes u64 R |
+ *                         10 shared_source u8 O (0/1; B6b: the source is the global one, so karidns_domain_views maps zones to this view)
  *                     5 default_ttl u32 O (<= 2147483647; B4a) | 6 bulk_threshold u8 O (<= 100) | 7 loader_threads u32 O (<= 16)
  *   RELOAD_REQ (0x8002) 1 request_id u64 R | 2 scope u8 R (0 all, 1 one zone) | 3 view view O | 4 zone name O |
  *                     5 force u8 R (0/1); scope 1 needs tags 3 and 4, scope 0 forbids them
@@ -238,6 +239,7 @@ typedef struct { const uint8_t *p; size_t left; uint32_t view_count; } kdb_iter_
 typedef struct {
     uint16_t index; kdb_str_t name, source, conninfo_file; uint8_t auto_reload; uint32_t poll_interval, coalesce_ms;
     uint64_t max_zone_records, max_zone_bytes;
+    uint8_t shared_source;      /* tag 10; 0 = absent */
 } kdb_config_view_t;
 typedef struct {
     uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; uint32_t serial; uint8_t digest[KDB_DIGEST_LEN];

@@ -36,6 +36,9 @@
 #include <stdarg.h>
 #include <signal.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <fcntl.h>
 #include <ctype.h>
 #include <time.h>
@@ -57,6 +60,7 @@ enum { EXIT_OK = 0, EXIT_ZONES_FAILED = 1, EXIT_USAGE = 2, EXIT_ERROR = 3, EXIT_
 /* Messages.  Dump mode: stderr with the program prefix (the lines the dump tests expect).  Stream mode: syslog
  * (openlog() has LOG_PERROR, so a foreground server still shows them on stderr). */
 static bool g_stream_mode;
+static volatile sig_atomic_t g_stop;      /* SIGTERM / SIGINT in stream mode */
 static void lg(int prio, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void lg(int prio, const char *fmt, ...) {
     char msg[1024];
@@ -109,8 +113,13 @@ typedef struct {
     uint32_t serial;                  /* serial of the enabled apex SOA */
     bool has_serial;
     bool want;                        /* stream mode: read and convert this zone in this load */
+    bool g_ok;                        /* stream mode: the Backend has a version of the zone it did not reject (digest gate) ... */
+    int64_t g_source;                 /* ... with this source id, serial and digest (copied from the inventory by plan_diff(), */
+    uint32_t g_serial;                /* so that the conversion threads never read the inventory) */
+    uint8_t g_digest[KDB_DIGEST_LEN];
 } zinfo_t;
 typedef struct { int64_t domain_id; char *kind; char *content; } meta_t;
+typedef struct { meta_t *v; size_t n, cap; bool oom; } mset_t;
 
 /* What the Backend has (stream mode): one entry per (view, zone name), filled from the Backend's INVENTORY and kept up
  * to date from its ZONE_RESULTs.  A version that was sent but not answered yet is "pending". */
@@ -144,15 +153,16 @@ typedef struct {
     zinfo_t *zones;
     size_t nz, zcap;
     const char *only_name;            /* list only this zone (--zone, or a one-zone reload request) */
-    /* metadata (sorted by domain_id) and zones with cryptokeys */
-    meta_t *meta;
-    size_t nm, mcap, mi;
+    /* bulk scan: the metadata of every zone (sorted by domain_id); the zones with cryptokeys */
+    mset_t meta;
     int64_t *keys;
     size_t nk, kcap;
-    /* the zone being collected */
-    size_t zi;
-    pdns_zone_t *cur;
-    bool cur_open;
+    /* B6b: the zones to read (positions in zones[], ascending), the conversion threads, the view mapping */
+    size_t *wl;
+    size_t nwl;
+    uint32_t nthreads;                /* loader-threads: 1..16 */
+    const char *map_view;             /* non-NULL: keep only the zones karidns_domain_views maps to this view (D6) */
+    bool map_logged;                  /* the mapping rows naming unknown views were logged in this batch */
     /* results */
     uint32_t n_zones, n_failed;       /* ZONE_END / ZONE_FAILED messages written */
     uint32_t n_unwritten;             /* failed zones whose name cannot be written to the stream */
@@ -186,6 +196,7 @@ static int stream_write(ctx_t *x, const uint8_t *msg, size_t len);
 
 typedef struct {
     uint16_t index;
+    bool shared;                             /* the source is the global one: karidns_domain_views maps zones to this view (B6b) */
     char *name, *source, *conninfo;          /* source: the file (sqlite3) or schema (postgresql); NULL = driver default */
     uint8_t auto_reload;
     uint32_t poll_interval, coalesce_ms;
@@ -431,25 +442,41 @@ static bool chg_has(const ctx_t *x, int64_t id) {
 }
 
 static int meta_cb(void *ud, const db_meta_row_t *r) {
-    ctx_t *x = ud;
-    if (x->nm >= x->mcap) {
-        size_t nc = x->mcap ? x->mcap * 2 : 256;
-        meta_t *nms = realloc(x->meta, nc * sizeof(*nms));
-        if (!nms) return x->oom = true;
-        x->meta = nms;
-        x->mcap = nc;
+    mset_t *m = ud;
+    if (m->n >= m->cap) {
+        size_t nc = m->cap ? m->cap * 2 : 256;
+        meta_t *nms = realloc(m->v, nc * sizeof(*nms));
+        if (!nms) return m->oom = true;
+        m->v = nms;
+        m->cap = nc;
     }
-    meta_t *m = &x->meta[x->nm];
-    m->domain_id = r->domain_id;
-    m->kind = r->kind ? strdup(r->kind) : NULL;
-    m->content = r->content ? strdup(r->content) : NULL;
-    if ((r->kind && !m->kind) || (r->content && !m->content)) {
-        free(m->kind);
-        free(m->content);
-        return x->oom = true;
+    meta_t *e = &m->v[m->n];
+    e->domain_id = r->domain_id;
+    e->kind = r->kind ? strdup(r->kind) : NULL;
+    e->content = r->content ? strdup(r->content) : NULL;
+    if ((r->kind && !e->kind) || (r->content && !e->content)) {
+        free(e->kind);
+        free(e->content);
+        return m->oom = true;
     }
-    x->nm++;
+    m->n++;
     return 0;
+}
+
+/* forget the rows, keep the array */
+static void mset_reset(mset_t *m) {
+    for (size_t i = 0; i < m->n; i++) {
+        free(m->v[i].kind);
+        free(m->v[i].content);
+    }
+    m->n = 0;
+    m->oom = false;
+}
+
+static void mset_free(mset_t *m) {
+    mset_reset(m);
+    free(m->v);
+    memset(m, 0, sizeof(*m));
 }
 
 static int key_cb(void *ud, int64_t id) {
@@ -502,14 +529,6 @@ static int send_failed(ctx_t *x, const zinfo_t *zi, const char *reason) {
     return send_enc(x);
 }
 
-typedef struct { ctx_t *x; bool started; } zemit_t;
-
-static int zone_emit(void *ud, const uint8_t *msg, size_t len) {
-    zemit_t *e = ud;
-    e->started = true;
-    return emit_file(e->x, msg, len);
-}
-
 static const char *zone_type_reason(const char *type) {
     if (!type) return "domains.type is NULL";
     if (strcasecmp(type, "NATIVE") == 0 || strcasecmp(type, "MASTER") == 0) return NULL;
@@ -519,60 +538,138 @@ static const char *zone_type_reason(const char *type) {
     return "unsupported domains.type";
 }
 
-static void open_current(ctx_t *x) {
-    if (x->cur_open) return;
-    x->cur_open = true;
-    x->cur = NULL;
-    const zinfo_t *zi = &x->zones[x->zi];
-    if (zi->name && !zone_type_reason(zi->type)) x->cur = pdns_zone_new(zi->name, &x->opts);
-    if (zi->name && !zone_type_reason(zi->type) && !x->cur) x->oom = true;
+/* B6b: a zone is converted by a worker (the main thread when loader-threads is 1) into a zres_t, and committed to the
+ * stream by the main thread, in zones[] order.  The worker never touches the inventory, the socket or the counters: it
+ * reads the zone's own entry of zones[] (the Backend's version of it, copied by plan_diff()) and builds the ZONE_BEGIN /
+ * ZONE_DATA / ZONE_END messages in memory, so a conversion that fails half way leaves nothing on the stream. */
+static void io_pump(struct lio *io);
+
+enum { ZR_UNCHANGED = 1, ZR_SENT, ZR_FAILED, ZR_FATAL };
+typedef struct {
+    uint8_t kind;
+    uint8_t *buf;                     /* ZR_SENT: the messages */
+    size_t len, cap;
+    bool oom;
+    uint32_t serial;                  /* ZR_SENT */
+    uint8_t digest[KDB_DIGEST_LEN];
+    char *reason;                     /* ZR_FAILED */
+} zres_t;
+
+static void zres_reset(zres_t *r) {
+    r->kind = 0;
+    r->len = 0;
+    r->oom = false;
+    free(r->reason);
+    r->reason = NULL;
+}
+
+static void zres_free(zres_t *r) {
+    free(r->buf);
+    free(r->reason);
+    memset(r, 0, sizeof(*r));
+}
+
+static int zres_emit(void *ud, const uint8_t *msg, size_t len) {
+    zres_t *r = ud;
+    if (len > r->cap - r->len) {
+        size_t nc = r->cap ? r->cap : 4096;
+        while (nc - r->len < len) nc *= 2;
+        uint8_t *nb = realloc(r->buf, nc);
+        if (!nb) {
+            r->oom = true;
+            return -1;
+        }
+        r->buf = nb;
+        r->cap = nc;
+    }
+    memcpy(r->buf + r->len, msg, len);
+    r->len += len;
+    return 0;
+}
+
+static void zres_fail(zres_t *r, const char *reason) {
+    r->len = 0;
+    r->reason = strdup(reason);
+    r->kind = r->reason ? ZR_FAILED : ZR_FATAL;
+}
+
+typedef struct wk {
+    ctx_t *x;                         /* shared; read only while workers run */
+    const db_driver_t *drv;
+    db_conn_t *conn;
+    const mset_t *bulk_meta;          /* bulk scan: the metadata of every zone; NULL = read them zone by zone into zmeta */
+    mset_t zmeta;
+    size_t wi, wend;                  /* the next position of x->wl to finish, and the end of the task */
+    pdns_zone_t *cur;
+    bool cur_open;
+    zres_t res;                       /* scratch for the zone being converted */
+    bool oom, stop;
+    int (*deliver)(struct wk *w, size_t pos, zres_t *r);   /* nonzero: stop */
+    void *dud;
+    char errtext[240];
+} wk_t;
+
+#define WZ(w, pos) (&(w)->x->zones[(w)->x->wl[pos]])
+
+static void wk_free(wk_t *w) {
+    if (w->cur_open && w->cur) pdns_zone_free(w->cur);
+    w->cur = NULL;
+    w->cur_open = false;
+    mset_free(&w->zmeta);
+    zres_free(&w->res);
+}
+
+static void open_current(wk_t *w, const zinfo_t *zi) {
+    if (w->cur_open) return;
+    w->cur_open = true;
+    w->cur = NULL;
+    if (zi->name && !zone_type_reason(zi->type)) w->cur = pdns_zone_new(zi->name, &w->x->opts);
+    if (zi->name && !zone_type_reason(zi->type) && !w->cur) w->oom = true;
 }
 
 /* the digest gate of pdns_zone_encode_kdb(): a zone whose converted stream has the digest the Backend already holds
- * (same source id, no pending rejection) is not sent unless the request says force */
-typedef struct { ctx_t *x; const zinfo_t *zi; uint8_t digest[KDB_DIGEST_LEN]; } gate_t;
+ * (same source id, no pending rejection; copied into the zinfo by plan_diff) is not sent unless the request says force */
+typedef struct { const ctx_t *x; const zinfo_t *zi; uint8_t digest[KDB_DIGEST_LEN]; } gate_t;
 
 static int gate_cb(void *ud, uint32_t serial, const uint8_t digest[KDB_DIGEST_LEN]) {
     gate_t *g = ud;
-    ctx_t *x = g->x;
+    const zinfo_t *zi = g->zi;
     memcpy(g->digest, digest, KDB_DIGEST_LEN);          /* what ZONE_BEGIN will carry: the pending version of the entry */
-    if (!x->io || x->force || !g->zi->canon) return 0;
-    const inv_ent_t *e = inv_find(&x->io->inv, x->vslot, g->zi->canon);
-    return e && e->known && !e->dirty && e->source_id == g->zi->id && e->serial == serial &&
-           memcmp(e->digest, digest, KDB_DIGEST_LEN) == 0;
+    if (!g->x->io || g->x->force || !zi->canon) return 0;
+    return zi->g_ok && zi->g_source == zi->id && zi->g_serial == serial && memcmp(zi->g_digest, digest, KDB_DIGEST_LEN) == 0;
 }
 
-static int send_simple_header(ctx_t *x);
-
-/* convert and write the zone x->zi; 0, or -1 on a fatal error (output, memory) */
-static int finish_current(ctx_t *x) {
-    const zinfo_t *zi = &x->zones[x->zi];
-    if (x->io && !zi->want) {              /* the diff says nothing happened to this zone */
-        x->n_unchanged++;
-        return 0;
+/* index of the first metadata row with domain_id >= id (rows are sorted by domain_id) */
+static size_t meta_lower(const mset_t *m, int64_t id) {
+    size_t lo = 0, hi = m->n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (m->v[mid].domain_id < id) lo = mid + 1;
+        else hi = mid;
     }
-    open_current(x);
-    pdns_zone_t *z = x->cur;
-    int ret = 0;
+    return lo;
+}
+
+/* Convert the zone zi (its rows were added to w->cur) into w->res.  Never fails: a bad zone is a ZR_FAILED result. */
+static void convert_zone(wk_t *w, const zinfo_t *zi) {
+    ctx_t *x = w->x;
+    zres_t *r = &w->res;
+    zres_reset(r);
+    open_current(w, zi);
+    pdns_zone_t *z = w->cur;
     const char *tr = zone_type_reason(zi->type);
-    char msg[PDNS_ERR_LEN + 100];
-
-    if (x->oom) return -1;
-    if (send_simple_header(x) != 0) {
-        x->io_error = true;
-        return -1;
-    }
-    x->n_read++;
-    if (!zi->name) {
-        ret = send_failed(x, zi, "domains.name is NULL");
+    if (w->oom) {
+        r->kind = ZR_FATAL;
+    } else if (!zi->name) {
+        zres_fail(r, "domains.name is NULL");
     } else if (tr) {
-        ret = send_failed(x, zi, tr);
+        zres_fail(r, tr);
     } else {
         /* metadata of this zone (sorted by domain_id) */
-        while (x->mi < x->nm && x->meta[x->mi].domain_id < zi->id) x->mi++;
-        for (; !z->failed && x->mi < x->nm && x->meta[x->mi].domain_id == zi->id; x->mi++) {
-            db_meta_row_t m = { zi->id, x->meta[x->mi].kind, x->meta[x->mi].content };
-            pdns_zone_add_meta(z, &m);
+        const mset_t *m = w->bulk_meta ? w->bulk_meta : &w->zmeta;
+        for (size_t mi = w->bulk_meta ? meta_lower(m, zi->id) : 0; !z->failed && mi < m->n && m->v[mi].domain_id == zi->id; mi++) {
+            db_meta_row_t row = { zi->id, m->v[mi].kind, m->v[mi].content };
+            pdns_zone_add_meta(z, &row);
         }
         const char *why = NULL;
         if (pdns_zone_finish(z) != 0) {
@@ -584,65 +681,373 @@ static int finish_current(ctx_t *x) {
         for (size_t i = 0; i < z->n_warnings; i++)
             lg(LOG_WARNING, "warning: %s", z->warnings[i]);
         if (why) {
-            ret = send_failed(x, zi, why);
+            zres_fail(r, why);
         } else {
             gate_t g;
             memset(&g, 0, sizeof(g));
             g.x = x;
             g.zi = zi;
-            pdns_kdb_params_t p = { x->view, zi->id, KDB_ZK_PRIMARY, NULL, x->io ? gate_cb : NULL, &g };
-            zemit_t e = { x, false };
-            int er = pdns_zone_encode_kdb(z, &p, zone_emit, &e, msg, sizeof(msg));
+            pdns_kdb_params_t p = { x->view, zi->id, KDB_ZK_PRIMARY, NULL, gate_cb, &g };
+            char msg[PDNS_ERR_LEN + 100];
+            int er = pdns_zone_encode_kdb(z, &p, zres_emit, r, msg, sizeof(msg));
             if (er == 0) {
-                x->n_zones++;
-                if (x->io) {              /* sent: what the Backend will have once it says "applied" */
-                    inv_ent_t *ie = inv_get(&x->io->inv, x->vslot, z->name);
-                    if (!ie) {
-                        x->oom = true;
-                        ret = -1;
-                    } else {
-                        ie->has_pend = true;
-                        ie->p_source_id = zi->id;
-                        ie->p_serial = z->serial;
-                        memcpy(ie->p_digest, g.digest, KDB_DIGEST_LEN);
-                    }
-                }
+                r->kind = ZR_SENT;
+                r->serial = z->serial;
+                memcpy(r->digest, g.digest, KDB_DIGEST_LEN);
             } else if (er == 1) {
-                x->n_unchanged++;         /* converted, but the Backend has exactly this version */
-            } else if (x->io_error) {
-                ret = -1;
+                r->kind = ZR_UNCHANGED;     /* converted, but the Backend has exactly this version */
+            } else if (r->oom) {
+                r->kind = ZR_FATAL;
             } else {
-                if (e.started) {        /* cannot happen today (the refusals come before ZONE_BEGIN); be safe */
-                    if (kdb_enc_begin(&x->enc, KDB_T_ZONE_ABORT) != 0 || kdb_enc_str(&x->enc, 1, "encoding failed") != 0 ||
-                        kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
-                        ret = -1;
-                }
-                if (ret == 0) ret = send_failed(x, zi, msg);
+                zres_fail(r, msg);
             }
         }
     }
     pdns_zone_free(z);
-    x->cur = NULL;
-    x->cur_open = false;
-    return ret;
+    w->cur = NULL;
+    w->cur_open = false;
+}
+
+static int send_simple_header(ctx_t *x);
+
+/* Write the result of one zone to the stream (the main thread only; this is where the counters and the inventory are
+ * touched).  0, or -1 on a fatal error (output, memory). */
+static int commit_zone(ctx_t *x, const zinfo_t *zi, zres_t *r) {
+    if (r->kind == ZR_FATAL) {
+        x->oom = true;
+        return -1;
+    }
+    if (send_simple_header(x) != 0) {
+        x->io_error = true;
+        return -1;
+    }
+    x->n_read++;
+    switch (r->kind) {
+    case ZR_UNCHANGED:
+        x->n_unchanged++;
+        return 0;
+    case ZR_FAILED:
+        return send_failed(x, zi, r->reason);
+    default:                                   /* ZR_SENT */
+        if (emit_file(x, r->buf, r->len) != 0) return -1;
+        x->n_zones++;
+        if (x->io) {                           /* sent: what the Backend will have once it says "applied" */
+            inv_ent_t *ie = inv_get(&x->io->inv, x->vslot, zi->canon);
+            if (!ie) {
+                x->oom = true;
+                return -1;
+            }
+            ie->has_pend = true;
+            ie->p_source_id = zi->id;
+            ie->p_serial = r->serial;
+            memcpy(ie->p_digest, r->digest, KDB_DIGEST_LEN);
+        }
+        return 0;
+    }
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
 /* the scan                                                                                                       */
 /* ------------------------------------------------------------------------------------------------------------- */
 
-static int rec_cb(void *ud, int64_t did, const db_record_row_t *row) {
-    ctx_t *x = ud;
-    while (x->zi < x->nz && x->zones[x->zi].id < did) {
-        if (finish_current(x) != 0) return 1;
-        x->zi++;
+/* convert and hand over the zone at w->wi; nonzero when the load must stop */
+static int finish_pos(wk_t *w) {
+    size_t pos = w->wi++;
+    convert_zone(w, WZ(w, pos));
+    if (w->deliver(w, pos, &w->res) != 0) {
+        w->stop = true;
+        return 1;
     }
-    if (x->zi >= x->nz || x->zones[x->zi].id != did) return 0;      /* a row of a domain that is not listed: ignored */
-    if (x->io && !x->zones[x->zi].want) return 0;                   /* not read in this load */
-    open_current(x);
-    if (x->oom) return 1;
-    if (x->cur && !x->cur->failed) pdns_zone_add_record(x->cur, row);
     return 0;
+}
+
+static int rec_cb(void *ud, int64_t did, const db_record_row_t *row) {
+    wk_t *w = ud;
+    while (w->wi < w->wend && WZ(w, w->wi)->id < did) {
+        if (finish_pos(w) != 0) return 1;
+    }
+    if (w->wi >= w->wend || WZ(w, w->wi)->id != did) return 0;      /* a row of a domain that is not wanted: ignored */
+    open_current(w, WZ(w, w->wi));
+    if (w->oom) {
+        w->stop = true;
+        return 1;
+    }
+    if (w->cur && !w->cur->failed) pdns_zone_add_record(w->cur, row);
+    return 0;
+}
+
+static int send_hello(ctx_t *x, const char *driver_list, uint32_t pid);
+static int db_err_c(const db_driver_t *drv, db_conn_t *conn, char *errtext, size_t cap, int rc, const char *what);
+
+enum { TK_FATAL = -1 };      /* a task returns 0, an EXIT_* status of a database error, or this */
+
+/* Read and convert the wanted zones at positions a..b-1 of x->wl.  bulk: one scan of the records (all = the whole table,
+ * otherwise the domain_id range of the zones), else one query per zone. */
+static int run_task(wk_t *w, size_t a, size_t b, bool bulk, bool all) {
+    const db_driver_t *drv = w->drv;
+    int rc;
+    w->wi = a;
+    w->wend = b;
+    if (bulk) {
+        if (all) rc = drv->scan_records(w->conn, NULL, rec_cb, w);
+        else rc = drv->scan_records_range(w->conn, WZ(w, a)->id, WZ(w, b - 1)->id, rec_cb, w);
+        if (rc != 0 && rc != DB_STOPPED) return db_err_c(drv, w->conn, w->errtext, sizeof(w->errtext), rc, "reading records");
+        if (rc == DB_STOPPED) {
+            if (!w->stop) {
+                lg(LOG_ERR, "internal error: the scan was stopped");
+                snprintf(w->errtext, sizeof(w->errtext), "internal error: the scan was stopped");
+                return EXIT_ERROR;
+            }
+            return TK_FATAL;
+        }
+        while (w->wi < w->wend)
+            if (finish_pos(w) != 0) return TK_FATAL;
+        return 0;
+    }
+    for (size_t pos = a; pos < b; pos++) {
+        int64_t id = WZ(w, pos)->id;
+        w->wi = pos;
+        mset_reset(&w->zmeta);
+        if ((rc = drv->scan_metadata(w->conn, &id, meta_cb, &w->zmeta)) != 0 || (rc = drv->scan_records(w->conn, &id, rec_cb, w)) != 0) {
+            if (rc == DB_STOPPED) {
+                if (w->zmeta.oom) w->oom = true;
+                return TK_FATAL;
+            }
+            return db_err_c(drv, w->conn, w->errtext, sizeof(w->errtext), rc, "reading the zone");
+        }
+        if (finish_pos(w) != 0) return TK_FATAL;
+    }
+    return 0;
+}
+
+/* loader-threads 1 (or a single zone): the main thread converts and commits, zone by zone, on the connection of the view */
+static int deliver_inline(wk_t *w, size_t pos, zres_t *r) {
+    return commit_zone(w->x, WZ(w, pos), r);
+}
+
+/* ---- loader-threads N > 1 (design 1.5, D10) ----
+ * N workers, each with its own connection and snapshot (later than the main thread's, so the change seq in BATCH_BEGIN
+ * never runs ahead of what they read), take tasks of consecutive wanted zones from an atomic counter and convert them.
+ * The results go through a window of slots indexed by the zone's position in x->wl; the main thread commits the slots in
+ * position order, so the stream is the same as with one thread.  No mutex: the hand-over is the slot state (release /
+ * acquire), the window base `emitted`, and a byte budget for results that wait out of order.  Waiting is by sched_yield
+ * and short sleeps (the main thread also polls the socket, so the Backend's answers are read while it waits). */
+#define POOL_BUDGET (256u << 20)         /* bytes of finished zones waiting for their turn (the next one in line is always taken) */
+#define POOL_MAX 16
+
+typedef struct { _Atomic int state; zres_t r; } zslot_t;       /* 0 empty, 1 full */
+
+typedef struct pool {
+    ctx_t *x;
+    const db_source_t *src;
+    bool bulk;
+    size_t n_want, chunk, win;
+    zslot_t *slots;
+    _Atomic size_t next_task, emitted, buffered;
+    _Atomic bool stop;
+    _Atomic int failed;                  /* the first EXIT_* status of a worker, 0 = none */
+    _Atomic bool oom;
+    wk_t wk[POOL_MAX];
+    char errtext[240];                   /* of the first failing worker (written once, under the CAS on `failed`) */
+    pthread_t tid[POOL_MAX];
+} pool_t;
+
+static void nap(unsigned *spins) {
+    if (++*spins < 32) {
+        sched_yield();
+    } else {
+        struct timespec ts = { 0, 200000 };
+        nanosleep(&ts, NULL);
+    }
+}
+
+static void pool_fail(pool_t *p, wk_t *w, int status) {
+    int none = 0;
+    if (atomic_compare_exchange_strong(&p->failed, &none, status)) snprintf(p->errtext, sizeof(p->errtext), "%s", w->errtext);
+    atomic_store(&p->stop, true);
+}
+
+static int deliver_slot(wk_t *w, size_t pos, zres_t *r) {
+    pool_t *p = w->dud;
+    unsigned spins = 0;
+    for (;;) {                                                         /* the slot of pos is free once pos - win is committed */
+        if (atomic_load_explicit(&p->stop, memory_order_acquire)) return -1;
+        if (pos < atomic_load_explicit(&p->emitted, memory_order_acquire) + p->win) break;
+        nap(&spins);
+    }
+    spins = 0;
+    while (pos != atomic_load_explicit(&p->emitted, memory_order_acquire) &&
+           atomic_load_explicit(&p->buffered, memory_order_relaxed) + r->len > POOL_BUDGET) {
+        if (atomic_load_explicit(&p->stop, memory_order_acquire)) return -1;
+        nap(&spins);
+    }
+    zslot_t *s = &p->slots[pos % p->win];
+    zres_t t = s->r;                                                   /* swap, so both sides keep their buffers */
+    s->r = *r;
+    *r = t;
+    atomic_fetch_add_explicit(&p->buffered, s->r.len, memory_order_relaxed);
+    atomic_store_explicit(&s->state, 1, memory_order_release);
+    return 0;
+}
+
+static void *worker_main(void *arg) {
+    wk_t *w = arg;
+    pool_t *p = w->dud;
+    char err[DB_ERRLEN];
+    int rc = w->drv->open(&w->conn, p->src, err, sizeof(err));
+    if (rc != 0) {
+        lg(LOG_ERR, "%s", err);
+        clean_reason(err, w->errtext, sizeof(w->errtext));
+        pool_fail(p, w, rc == DB_ERR_RETRY ? EXIT_RETRY : EXIT_ERROR);
+        return NULL;
+    }
+    if ((rc = w->drv->begin_snapshot(w->conn)) != 0) {
+        pool_fail(p, w, db_err_c(w->drv, w->conn, w->errtext, sizeof(w->errtext), rc, "snapshot"));
+        w->drv->close(w->conn);
+        w->conn = NULL;
+        return NULL;
+    }
+    while (!atomic_load_explicit(&p->stop, memory_order_acquire)) {
+        size_t t = atomic_fetch_add_explicit(&p->next_task, 1, memory_order_relaxed);
+        size_t a = t * p->chunk;
+        if (a >= p->n_want) break;
+        size_t b = a + p->chunk < p->n_want ? a + p->chunk : p->n_want;
+        int st = run_task(w, a, b, p->bulk, false);
+        if (st == 0) continue;
+        if (st == TK_FATAL) {
+            if (w->oom) {
+                atomic_store(&p->oom, true);
+                snprintf(w->errtext, sizeof(w->errtext), "out of memory");
+                pool_fail(p, w, EXIT_ERROR);
+            }
+            atomic_store(&p->stop, true);                              /* otherwise the main thread asked us to stop */
+        } else {
+            pool_fail(p, w, st);
+        }
+        break;
+    }
+    w->drv->end_snapshot(w->conn);
+    w->drv->close(w->conn);
+    w->conn = NULL;
+    return NULL;
+}
+
+/* Wait for the next result while reading what the Backend sent.  0, or -1 when the load must stop. */
+static int pool_wait(ctx_t *x, unsigned *spins) {
+    if (g_stop) return -1;
+    if (x->io) {
+        struct pollfd pf = { x->io->fd, POLLIN, 0 };
+        if (*spins > 32) {
+            int r = poll(&pf, 1, 1);
+            if (r > 0) io_pump(x->io);
+        } else {
+            nap(spins);
+        }
+        if (x->io->eof || x->io->failed) {
+            errno = EPIPE;
+            x->io_error = true;
+            return -1;
+        }
+        ++*spins;
+        return 0;
+    }
+    nap(spins);
+    return 0;
+}
+
+static int run_pool(ctx_t *x, const db_source_t *src, bool bulk, size_t n_want, size_t nthr) {
+    pool_t *p = calloc(1, sizeof(*p));
+    if (!p) {
+        x->oom = true;
+        return TK_FATAL;
+    }
+    p->x = x;
+    p->src = src;
+    p->bulk = bulk;
+    p->n_want = n_want;
+    size_t cmax = bulk ? 128 : 32;
+    p->chunk = n_want / (nthr * 4);
+    if (p->chunk < 1) p->chunk = 1;
+    if (p->chunk > cmax) p->chunk = cmax;
+    p->win = nthr * p->chunk * 3 + 8;
+    p->slots = calloc(p->win, sizeof(*p->slots));
+    if (!p->slots) {
+        free(p);
+        x->oom = true;
+        return TK_FATAL;
+    }
+    sigset_t all, old;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, &old);                            /* workers take no signals: SIGTERM is for the main thread */
+    size_t started = 0;
+    for (size_t i = 0; i < nthr; i++) {
+        wk_t *w = &p->wk[i];
+        w->x = x;
+        w->drv = x->drv;
+        w->bulk_meta = bulk ? &x->meta : NULL;
+        w->deliver = deliver_slot;
+        w->dud = p;
+        if (pthread_create(&p->tid[i], NULL, worker_main, w) != 0) break;
+        started++;
+    }
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    int result = 0;
+    if (started == 0) {
+        lg(LOG_ERR, "cannot start the loader threads: %s", strerror(errno));
+        snprintf(x->errtext, sizeof(x->errtext), "cannot start the loader threads");
+        result = EXIT_ERROR;
+        atomic_store(&p->stop, true);
+    }
+    for (size_t pos = 0; started && pos < n_want; pos++) {
+        zslot_t *s = &p->slots[pos % p->win];
+        unsigned spins = 0;
+        while (atomic_load_explicit(&s->state, memory_order_acquire) != 1) {
+            if (atomic_load_explicit(&p->failed, memory_order_acquire) || pool_wait(x, &spins) != 0) goto drain;
+        }
+        int rc = commit_zone(x, &x->zones[x->wl[pos]], &s->r);
+        atomic_fetch_sub_explicit(&p->buffered, s->r.len, memory_order_relaxed);
+        s->r.len = 0;
+        atomic_store_explicit(&s->state, 0, memory_order_relaxed);
+        atomic_store_explicit(&p->emitted, pos + 1, memory_order_release);
+        if (rc != 0) goto drain;
+    }
+drain:
+    atomic_store(&p->stop, true);
+    for (size_t i = 0; i < started; i++) pthread_join(p->tid[i], NULL);
+    if (x->io_error || x->oom) {
+        result = TK_FATAL;
+    } else if (g_stop) {
+        result = TK_FATAL;
+    } else if (atomic_load(&p->failed)) {
+        if (atomic_load(&p->oom)) x->oom = true;
+        result = atomic_load(&p->failed);
+        snprintf(x->errtext, sizeof(x->errtext), "%s", p->errtext);
+        if (x->oom) result = TK_FATAL;
+    }
+    for (size_t i = 0; i < nthr; i++) wk_free(&p->wk[i]);
+    for (size_t i = 0; i < p->win; i++) zres_free(&p->slots[i].r);
+    free(p->slots);
+    free(p);
+    return result;
+}
+
+/* Convert the n_want wanted zones.  Returns 0, an EXIT_* status of a database error (x->errtext says what), or TK_FATAL. */
+static int run_zones(ctx_t *x, const db_source_t *src, bool bulk, size_t n_want) {
+    size_t nthr = x->nthreads < n_want ? x->nthreads : n_want;
+    if (nthr > POOL_MAX) nthr = POOL_MAX;
+    if (nthr > 1) return run_pool(x, src, bulk, n_want, nthr);
+    wk_t w;
+    memset(&w, 0, sizeof(w));
+    w.x = x;
+    w.drv = x->drv;
+    w.conn = x->conn;
+    w.bulk_meta = bulk ? &x->meta : NULL;
+    w.deliver = deliver_inline;
+    int st = run_task(&w, 0, n_want, bulk, true);
+    if (w.oom) x->oom = true;
+    if (st > 0) snprintf(x->errtext, sizeof(x->errtext), "%s", w.errtext);
+    wk_free(&w);
+    return st;
 }
 
 static int send_hello(ctx_t *x, const char *driver_list, uint32_t pid) {
@@ -690,29 +1095,22 @@ static bool names_equal(const char *a, const char *b) {
     return la == lb && strncasecmp(a, b, la) == 0;
 }
 
-static int db_err(ctx_t *x, int rc, const char *what) {
-    const char *m = x->conn ? x->drv->errmsg(x->conn) : "?";
+static int db_err_c(const db_driver_t *drv, db_conn_t *conn, char *errtext, size_t cap, int rc, const char *what) {
+    const char *m = conn ? drv->errmsg(conn) : "?";
     lg(LOG_ERR, "%s: %s", what, m);
     char shown[200];
     clean_reason(m, shown, sizeof(shown));
-    snprintf(x->errtext, sizeof(x->errtext), "%s: %s", what, shown);
+    snprintf(errtext, cap, "%s: %s", what, shown);
     return rc == DB_ERR_RETRY ? EXIT_RETRY : EXIT_ERROR;
+}
+
+static int db_err(ctx_t *x, int rc, const char *what) {
+    return db_err_c(x->drv, x->conn, x->errtext, sizeof(x->errtext), rc, what);
 }
 
 /* Forget the lists of the previous view (zones, metadata, keys).  The context keeps them after a run so that the owner
  * (main(), a test) can look at them; the next run starts empty. */
-static void meta_reset(ctx_t *x) {
-    for (size_t i = 0; i < x->nm; i++) {
-        free(x->meta[i].kind);
-        free(x->meta[i].content);
-    }
-    x->nm = x->mi = 0;
-}
-
 static void ctx_view_reset(ctx_t *x) {
-    if (x->cur_open && x->cur) pdns_zone_free(x->cur);
-    x->cur = NULL;
-    x->cur_open = false;
     for (size_t i = 0; i < x->nz; i++) {
         free(x->zones[i].name);
         free(x->zones[i].type);
@@ -721,17 +1119,16 @@ static void ctx_view_reset(ctx_t *x) {
     free(x->zones);
     x->zones = NULL;
     x->nz = x->zcap = 0;
-    meta_reset(x);
-    free(x->meta);
-    x->meta = NULL;
-    x->mcap = 0;
+    mset_free(&x->meta);
     free(x->keys);
     x->keys = NULL;
     x->nk = x->kcap = 0;
     free(x->chg);
     x->chg = NULL;
     x->nchg = x->cchg = 0;
-    x->zi = 0;
+    free(x->wl);
+    x->wl = NULL;
+    x->nwl = 0;
 }
 
 /* a zone the Backend has and the database no longer lists */
@@ -805,6 +1202,12 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
         }
         inv_ent_t *e = inv_find(&io->inv, x->vslot, z->canon);
         if (e) e->mark = gen;
+        z->g_ok = e && e->known && !e->dirty;
+        if (z->g_ok) {
+            z->g_source = e->source_id;
+            z->g_serial = e->serial;
+            memcpy(z->g_digest, e->digest, KDB_DIGEST_LEN);
+        }
         bool changed = chg_has(x, z->id);
         if (zone_type_reason(z->type)) {
             z->want = compare_all || changed;      /* not loadable: reported again only when something happened to it */
@@ -842,6 +1245,117 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
     return 0;
 }
 
+/* ---- karidns_domain_views (design 3.7, 7.1, D6) ----
+ * A view that uses the global source takes the zones the mapping gives it.  A domain without any row goes to every such
+ * view; a domain with rows goes to the views they name and to no other (a row that names a view this server does not have
+ * for this source is logged and ignored, so a zone meant for another server's view is not served here by mistake).  The
+ * names are compared in C, case-insensitively like view names everywhere else, never with an SQL collation. */
+typedef struct {
+    const ctx_t *x;
+    int64_t *any, *mine, *known;          /* domain ids that have a row / a row for this view / a row for any view of this
+                                             source (stream mode), ascending */
+    size_t nany, cany, nmine, cmine, nknown, cknown;
+    bool oom;
+    char unk[3][64];                      /* names of views that are not views of this source (the first few) */
+    size_t nunk;
+    unsigned long unk_rows;
+} mapctx_t;
+
+static int push_id(int64_t **v, size_t *n, size_t *cap, int64_t id) {
+    if (*n && (*v)[*n - 1] == id) return 0;                 /* the rows come in domain_id order */
+    if (*n >= *cap) {
+        size_t nc = *cap ? *cap * 2 : 256;
+        int64_t *nv = realloc(*v, nc * sizeof(*nv));
+        if (!nv) return -1;
+        *v = nv;
+        *cap = nc;
+    }
+    (*v)[(*n)++] = id;
+    return 0;
+}
+
+static bool view_uses_shared_source(const struct lio *io, const char *name) {
+    for (size_t i = 0; i < io->cfg.nviews; i++)
+        if (io->cfg.views[i].shared && strcasecmp(io->cfg.views[i].name, name) == 0) return true;
+    return false;
+}
+
+static int map_cb(void *ud, int64_t did, const char *vn) {
+    mapctx_t *m = ud;
+    if (push_id(&m->any, &m->nany, &m->cany, did) != 0) return m->oom = true;
+    if (strcasecmp(vn, m->x->map_view) == 0) {
+        if (push_id(&m->mine, &m->nmine, &m->cmine, did) != 0) return m->oom = true;
+        if (push_id(&m->known, &m->nknown, &m->cknown, did) != 0) return m->oom = true;
+    } else if (m->x->io && view_uses_shared_source(m->x->io, vn)) {
+        if (push_id(&m->known, &m->nknown, &m->cknown, did) != 0) return m->oom = true;
+    } else if (m->x->io) {
+        m->unk_rows++;
+        bool seen = false;
+        for (size_t i = 0; i < m->nunk; i++)
+            if (strcasecmp(m->unk[i], vn) == 0) seen = true;
+        if (!seen && m->nunk < 3) clean_reason(vn, m->unk[m->nunk++], sizeof(m->unk[0]));
+    }
+    return 0;
+}
+
+/* Drop the zones of x->zones[] the mapping does not give to x->map_view.  0, or an EXIT_* status. */
+static int apply_mapping(ctx_t *x, const db_schema_info_t *si) {
+    if (!x->map_view || !si->has_domain_views || x->nz == 0) return 0;
+    mapctx_t m;
+    memset(&m, 0, sizeof(m));
+    m.x = x;
+    const int64_t *one = x->only_name ? &x->zones[0].id : NULL;      /* a one-zone list has the zone alone */
+    int rc = x->drv->scan_domain_views(x->conn, one, map_cb, &m);
+    int ret = 0;
+    if (rc != 0) {
+        ret = m.oom ? EXIT_ERROR : db_err(x, rc, "reading karidns_domain_views");
+        if (m.oom) lg(LOG_ERR, "out of memory");
+    } else {
+        /* zones whose rows only name views that do not use this source are served by no view: say which (once per
+         * batch, like the rows below; stream mode only, a dump does not know the other views) */
+        size_t norphan = 0;
+        char orphan[3][DNS_NAME_TEXT_SIZE];
+        for (size_t i = 0; x->io && !x->map_logged && i < x->nz; i++) {
+            int64_t id = x->zones[i].id;
+            if (!(m.nany && bsearch(&id, m.any, m.nany, sizeof(int64_t), cmp_i64)) ||
+                (m.nknown && bsearch(&id, m.known, m.nknown, sizeof(int64_t), cmp_i64)))
+                continue;
+            if (norphan < 3) clean_reason(x->zones[i].name ? x->zones[i].name : "?", orphan[norphan], sizeof(orphan[0]));
+            norphan++;
+        }
+        size_t keep = 0;
+        for (size_t i = 0; i < x->nz; i++) {
+            int64_t id = x->zones[i].id;
+            bool has_row = m.nany && bsearch(&id, m.any, m.nany, sizeof(int64_t), cmp_i64) != NULL;
+            bool mine = m.nmine && bsearch(&id, m.mine, m.nmine, sizeof(int64_t), cmp_i64) != NULL;
+            if (!has_row || mine) {
+                if (keep != i) x->zones[keep] = x->zones[i];
+                keep++;
+            } else {
+                free(x->zones[i].name);
+                free(x->zones[i].type);
+                free(x->zones[i].canon);
+            }
+        }
+        x->nz = keep;
+        if (m.nunk && !x->map_logged) {
+            x->map_logged = true;
+            lg(LOG_WARNING, "karidns_domain_views: %lu row(s) name view(s) that do not use this database as their source (%s%s); "
+                            "those rows are ignored, and a zone that only they map is served by no view",
+               m.unk_rows, m.unk[0], m.nunk > 1 ? ", ..." : "");
+            if (norphan)
+                lg(LOG_WARNING, "karidns_domain_views: %zu zone(s) are mapped only to views that do not use this database as "
+                                "their source and are served by no view: %s%s%s%s%s%s",
+                   norphan, orphan[0], norphan > 1 ? ", " : "", norphan > 1 ? orphan[1] : "", norphan > 2 ? ", " : "",
+                   norphan > 2 ? orphan[2] : "", norphan > 3 ? ", ..." : "");
+        }
+    }
+    free(m.any);
+    free(m.mine);
+    free(m.known);
+    return ret;
+}
+
 /* One source (one view): open, read the lists, then the records, writing the zones.  whole: the dump of a file,
  * with HELLO / BATCH_BEGIN before the first zone and BATCH_END after the last; otherwise (stream mode) the caller
  * owns the batch and calls this once per view.  Returns an exit status. */
@@ -877,26 +1391,35 @@ static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, boo
         if (x->oom) lg(LOG_ERR, "out of memory");
         goto out_snap;
     }
+    if ((rc = apply_mapping(x, &si)) != 0) {
+        status = rc;
+        goto out_snap;
+    }
     if (!x->io && only_zone && x->nz == 0) {
-        lg(LOG_ERR, "zone '%.200s' is not in the database", only_zone);
+        lg(LOG_ERR, "zone '%.200s' is not in the database%s", only_zone, x->map_view ? " (or not mapped to this view)" : "");
         status = EXIT_ERROR;
         goto out_snap;
     }
-    size_t n_want = x->nz;
     if (x->io) {
         if (plan_diff(x, &si, only_zone, &gone, &ngone, &have_seq, &new_seq) != 0) {
             lg(LOG_ERR, "out of memory");
             status = EXIT_ERROR;
             goto out_snap;
         }
-        n_want = 0;
-        for (size_t i = 0; i < x->nz; i++)
-            if (x->zones[i].want) n_want++;
         if (have_seq && new_seq > x->change_seq) x->change_seq = new_seq;   /* BATCH_BEGIN says how far the log was read */
     }
-    if (x->io && n_want == 0 && ngone == 0) {            /* nothing to read, nothing to delete */
-        x->n_unchanged += (uint32_t)x->nz;
-    } else {
+    /* the zones to read, in zones[] order; the others (the diff says nothing happened to them) are only counted */
+    x->wl = malloc((x->nz ? x->nz : 1) * sizeof(*x->wl));
+    if (!x->wl) {
+        lg(LOG_ERR, "out of memory");
+        status = EXIT_ERROR;
+        goto out_snap;
+    }
+    for (size_t i = 0; i < x->nz; i++)
+        if (!x->io || x->zones[i].want) x->wl[x->nwl++] = i;
+    size_t n_want = x->nwl;
+    if (x->io) x->n_unchanged += (uint32_t)(x->nz - n_want);
+    if (!(x->io && n_want == 0 && ngone == 0)) {         /* otherwise: nothing to read, nothing to delete */
         /* bulk scan (every record of the source in domain_id order, the unwanted zones skipped) or one query per zone */
         bool bulk = !only_zone;
         if (x->io && only_zone == NULL)
@@ -908,9 +1431,9 @@ static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, boo
         }
         qsort(x->keys, x->nk, sizeof(int64_t), cmp_i64);
         if (bulk && n_want > 0) {
-            if ((rc = x->drv->scan_metadata(x->conn, NULL, meta_cb, x)) != 0) {
-                status = x->oom ? EXIT_ERROR : db_err(x, rc, "reading metadata");
-                if (x->oom) lg(LOG_ERR, "out of memory");
+            if ((rc = x->drv->scan_metadata(x->conn, NULL, meta_cb, &x->meta)) != 0) {
+                status = x->meta.oom ? EXIT_ERROR : db_err(x, rc, "reading metadata");
+                if (x->meta.oom) lg(LOG_ERR, "out of memory");
                 goto out_snap;
             }
         }
@@ -922,45 +1445,13 @@ static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, boo
             }
         }
         int fatal = 0;
-        if (bulk) {
-            if (n_want > 0 || !x->io) {
-                rc = x->drv->scan_records(x->conn, NULL, rec_cb, x);
-                if (rc != 0 && rc != DB_STOPPED) {
-                    status = db_err(x, rc, "reading records");
-                    goto out_snap;
-                }
-                if (rc == DB_STOPPED && !x->io_error && !x->oom) {
-                    lg(LOG_ERR, "internal error: the scan was stopped");
-                    status = EXIT_ERROR;
-                    goto out_snap;
-                }
-                fatal = rc == DB_STOPPED;
-            }
-            while (!fatal && x->zi < x->nz) {
-                if (finish_current(x) != 0) fatal = 1;
-                x->zi++;
-            }
-        } else {
-            for (size_t i = 0; i < x->nz && !fatal; i++) {
-                if (!x->zones[i].want && x->io) {
-                    x->n_unchanged++;
-                    continue;
-                }
-                int64_t id = x->zones[i].id;
-                x->zi = i;
-                meta_reset(x);
-                if ((rc = x->drv->scan_metadata(x->conn, &id, meta_cb, x)) != 0 ||
-                    (rc = x->drv->scan_records(x->conn, &id, rec_cb, x)) != 0) {
-                    if (rc == DB_STOPPED && (x->io_error || x->oom)) {
-                        fatal = 1;
-                        break;
-                    }
-                    status = x->oom ? EXIT_ERROR : db_err(x, rc, "reading the zone");
-                    if (x->oom) lg(LOG_ERR, "out of memory");
-                    goto out_snap;
-                }
-                x->zi = i;
-                if (finish_current(x) != 0) fatal = 1;
+        if (n_want > 0) {
+            int st = run_zones(x, src, bulk, n_want);
+            if (st == TK_FATAL) {
+                fatal = 1;
+            } else if (st != 0) {
+                status = st;
+                goto out_snap;
             }
         }
         for (size_t i = 0; i < ngone && !fatal; i++)
@@ -1001,7 +1492,6 @@ static int run_dump(ctx_t *x, const db_source_t *src, const char *only_zone) {
 /* stream mode: -s FD, the long-running loader that karidns starts (beta design 1.2, 1.4, 1.5)                    */
 /* ------------------------------------------------------------------------------------------------------------- */
 
-static volatile sig_atomic_t g_stop;
 static void on_term(int sig) { (void)sig; g_stop = 1; }
 
 static void cfg_free(lcfg_t *c) {
@@ -1040,6 +1530,7 @@ static int cfg_from_msg(const kdb_msg_t *m, lcfg_t *c) {
     while (kdb_config_views_next(&it, &v) && c->nviews < m->u.config.n_views) {
         lview_t *d = &c->views[c->nviews++];
         d->index = v.index;
+        d->shared = v.shared_source != 0;
         d->name = dup_kstr(v.name);
         d->source = dup_kstr(v.source);
         d->conninfo = dup_kstr(v.conninfo_file);
@@ -1061,7 +1552,7 @@ static bool cfg_load_equal(const lcfg_t *a, const lcfg_t *b) {
     if (strcmp(a->driver, b->driver) != 0 || a->default_ttl != b->default_ttl || a->nviews != b->nviews) return false;
     for (size_t i = 0; i < a->nviews; i++) {
         const lview_t *x = &a->views[i], *y = &b->views[i];
-        if (x->index != y->index || strcmp(x->name, y->name) != 0 || !streq_n(x->source, y->source) ||
+        if (x->index != y->index || x->shared != y->shared || strcmp(x->name, y->name) != 0 || !streq_n(x->source, y->source) ||
             !streq_n(x->conninfo, y->conninfo) || x->max_records != y->max_records || x->max_bytes != y->max_bytes)
             return false;
     }
@@ -1348,6 +1839,8 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
     x->force = force;
     x->reconcile = reconcile;
     x->bulk_threshold = c->bulk_threshold;
+    x->nthreads = c->loader_threads >= 1 && c->loader_threads <= 16 ? c->loader_threads : 1;
+    x->map_logged = false;
     x->n_zones = x->n_failed = x->n_unwritten = 0;
     x->n_unchanged = x->n_deleted = x->n_read = 0;
     io->n_results = io->n_rejected = io->n_shadowed = 0;
@@ -1371,6 +1864,7 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
         x->opts.max_records = v->max_records;
         x->opts.max_zone_bytes = v->max_bytes;
         x->errtext[0] = '\0';
+        x->map_view = v->shared ? v->name : NULL;      /* karidns_domain_views decides which zones of the shared source are this view's */
         db_source_t src = { drv->name, sqlite ? v->source : NULL, v->conninfo, sqlite ? NULL : v->source, 0 };
         int st = run_view(x, &src, only_zone, false);
         if (x->io_error || x->oom || g_stop) {
@@ -1385,6 +1879,7 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
         }
     }
     ctx_view_reset(x);
+    x->map_view = NULL;
     if (x->io_error) return -1;
     if (only_zone && !seen_view && send_request_failure(x, (uint16_t)only_view, only_zone, "the view takes no zones from the database") != 0)
         return -1;
@@ -1624,7 +2119,10 @@ static void usage(FILE *fp) {
         "  --view-index N      view index in ZONE_BEGIN / ZONE_FAILED (0..65535, default 0)\n"
         "  --zone NAME         dump only this zone (read with one query per zone instead of the bulk scan)\n"
         "  --default-ttl N     TTL for a records.ttl that is NULL (1..2147483647, default 3600)\n"
-        "  --loader-threads N  1..16, default 1.  Accepted; the dump runs on one thread (parallel workers: milestone B6b)\n"
+        "  --loader-threads N  1..16, default 1.  N workers, each with its own connection, read and convert disjoint sets of\n"
+        "                      zones; the output is written in domains.id order whatever N is, so the bytes are the same\n"
+        "  --map-view NAME     keep only the zones karidns_domain_views maps to the view NAME (a domain without a row is kept):\n"
+        "                      what a view that uses the shared source of a server gets (docs/karidns.md)\n"
         "  --version           print the version\n"
         "  -h, --help          this text\n"
         "\n"
@@ -1659,10 +2157,10 @@ int main(int argc, char **argv) {
         { "schema", required_argument, NULL, 'S' },        { "view-index", required_argument, NULL, 'v' },
         { "zone", required_argument, NULL, 'z' },          { "default-ttl", required_argument, NULL, 't' },
         { "loader-threads", required_argument, NULL, 'j' }, { "version", no_argument, NULL, 'V' },
-        { "drivers", no_argument, NULL, 'L' },
+        { "drivers", no_argument, NULL, 'L' },             { "map-view", required_argument, NULL, 'm' },
         { "help", no_argument, NULL, 'h' },                { NULL, 0, NULL, 0 }
     };
-    const char *dump = NULL, *driver = NULL, *dbfile = NULL, *conninfo = NULL, *schema = NULL, *zone = NULL;
+    const char *dump = NULL, *driver = NULL, *dbfile = NULL, *conninfo = NULL, *schema = NULL, *zone = NULL, *map_view = NULL;
     const char *stream_fd = NULL;
     unsigned long view = 0, ttl = 0, threads = 1, v;
     int ch;
@@ -1675,6 +2173,7 @@ int main(int argc, char **argv) {
         case 'S': schema = optarg; break;
         case 's': stream_fd = optarg; break;
         case 'z': zone = optarg; break;
+        case 'm': map_view = optarg; break;
         case 'v':
             if (!parse_uint(optarg, 0, 65535, &view)) {
                 fprintf(stderr, "karidns-dbloader: --view-index must be 0..65535\n");
@@ -1701,7 +2200,6 @@ int main(int argc, char **argv) {
         default: usage(stderr); return EXIT_USAGE;
         }
     }
-    (void)threads;
     if (optind != argc) {
         fprintf(stderr, "karidns-dbloader: unexpected argument '%s'\n", argv[optind]);
         usage(stderr);
@@ -1712,7 +2210,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "karidns-dbloader: -s needs a file descriptor number\n");
             return EXIT_USAGE;
         }
-        if (dump || driver || dbfile || conninfo || schema || zone) {
+        if (dump || driver || dbfile || conninfo || schema || zone || map_view) {
             fprintf(stderr, "karidns-dbloader: -s cannot be combined with the dump options\n");
             return EXIT_USAGE;
         }
@@ -1749,6 +2247,8 @@ int main(int argc, char **argv) {
     x.drv = drv;
     x.view = (uint16_t)view;
     x.opts.default_ttl = (uint32_t)ttl;
+    x.nthreads = (uint32_t)threads;
+    x.map_view = map_view;
     kdb_enc_init(&x.enc);
     bool to_stdout = strcmp(dump, "-") == 0;
     x.out = to_stdout ? stdout : fopen(dump, "wb");
@@ -1767,17 +2267,7 @@ int main(int argc, char **argv) {
         status = EXIT_ERROR;
     }
     if (status >= EXIT_ERROR && !to_stdout) unlink(dump);
-    for (size_t i = 0; i < x.nz; i++) {
-        free(x.zones[i].name);
-        free(x.zones[i].type);
-    }
-    free(x.zones);
-    for (size_t i = 0; i < x.nm; i++) {
-        free(x.meta[i].kind);
-        free(x.meta[i].content);
-    }
-    free(x.meta);
-    free(x.keys);
+    ctx_view_reset(&x);
     kdb_enc_free(&x.enc);
     return status;
 }

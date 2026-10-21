@@ -54,7 +54,8 @@ void db_ingest_reload_cancel(uint64_t id);
 /* One answer, if there is one (call until false after a DB_INGEST_CTL_EVENT).  Control thread only. */
 bool db_ingest_reload_result(db_reload_result_t *out);
 /* Which view a command about the zone means: view_arg if given, else the only view that takes zones from the database.
- * false with a reason in err otherwise. */
+ * Several views and none named: true with an empty out (B6b: `reload <zone>` then asks every view that takes database
+ * zones, and the answer names each).  false with a reason in err otherwise. */
 bool db_ingest_pick_view(const char *view_arg, char *out, size_t cap, char *err, size_t errlen);
 
 #endif /* DNS_DB_INGEST_H */

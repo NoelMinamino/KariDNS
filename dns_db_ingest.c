@@ -106,6 +106,7 @@ typedef struct {
   bool hello_done, need_cleanup;
   /* view index -> name, as of the CONFIG last sent */
   char (*view_names)[KARIDNS_VIEW_NAME_MAX];
+  uint8_t *view_db;            /* [index]: the view takes zones from the database (not "database none;") */
   uint32_t nview_names;
   /* the zone being received */
   ing_job_t *cur;
@@ -136,7 +137,19 @@ typedef struct {
     uint16_t view;
     char view_name[KARIDNS_VIEW_NAME_MAX];
     char zone[DNS_NAME_TEXT_SIZE];
+    int grp;                   /* >= 0: one view of a request that asks every view (grps[grp]) */
   } reqs[ING_REQ_MAX];
+  /* B6b: `reload <zone>` without a view while several views take database zones: one RELOAD_REQ per view (ids with the
+   * top bit set, so they cannot clash with the control thread's), one combined answer for the control thread */
+  struct {
+    bool active;
+    uint64_t ctl_id;
+    int pending;
+    bool any_ok, any_bad;
+    char zone[DNS_NAME_TEXT_SIZE];
+    char text[200];
+  } grps[ING_REQ_MAX];
+  uint64_t sub_seq;
   int cur_req;                 /* the request the current batch answers (BATCH_BEGIN request_id), -1 = none */
   int req_outcome;             /* what the batch did to the requested zone: ROUT_* */
   uint32_t req_serial;
@@ -331,8 +344,10 @@ static bool build_config(ing_t *g, ing_cfg_t *snap) {
     bool sqlite = db->driver && strcmp(db->driver, "sqlite3") == 0;
     fill_snap(cfg, snap);
     free(g->view_names);
+    free(g->view_db);
     g->view_names = snap->nviews ? calloc(snap->nviews, sizeof(*g->view_names)) : NULL;
-    g->nview_names = g->view_names ? snap->nviews : 0;
+    g->view_db = snap->nviews ? calloc(snap->nviews, 1) : NULL;
+    g->nview_names = g->view_names && g->view_db ? snap->nviews : 0;
     kdb_enc_reset(&g->enc);
     kdb_enc_begin(&g->enc, KDB_T_CONFIG);
     kdb_enc_u64(&g->enc, 1, cfg->generation);
@@ -342,6 +357,7 @@ static bool build_config(ing_t *g, ing_cfg_t *snap) {
     for (const view_config_t *v = cfg->views; v; v = v->next, idx++) {
       if (g->view_names && idx < g->nview_names) snprintf(g->view_names[idx], sizeof(g->view_names[idx]), "%s", v->name ? v->name : "");
       if (v->database_none) continue;
+      if (g->view_db && idx < g->nview_names) g->view_db[idx] = 1;
       const char *src = sqlite ? (v->database_file ? v->database_file : db->database_file)
                                : (v->database_schema ? v->database_schema : db->schema);
       if (listed >= KDB_MAX_CONFIG_VIEWS) break;
@@ -356,12 +372,14 @@ static bool build_config(ing_t *g, ing_cfg_t *snap) {
       kdb_enc_u32(&g->enc, 7, db->coalesce_ms);
       kdb_enc_u64(&g->enc, 8, db->max_zone_records);
       kdb_enc_u64(&g->enc, 9, db->max_zone_bytes);
+      /* B6b (design 7.1): a view on the global source gets the zones karidns_domain_views maps to it */
+      if (sqlite ? !v->database_file : !v->database_schema) kdb_enc_u8(&g->enc, 10, 1);
       kdb_enc_nest_end(&g->enc);
     }
     kdb_enc_u32(&g->enc, 5, db->default_ttl);
     kdb_enc_u8(&g->enc, 6, (uint8_t)db->bulk_threshold);
     kdb_enc_u32(&g->enc, 7, db->loader_threads);
-    ok = kdb_enc_end(&g->enc) == 0 && idx <= 0xFFFF && (snap->nviews == 0 || g->view_names);
+    ok = kdb_enc_end(&g->enc) == 0 && idx <= 0xFFFF && (snap->nviews == 0 || (g->view_names && g->view_db));
   }
   rcu_aux_read_unlock();
   return ok;
@@ -709,7 +727,13 @@ static void job_submit(ing_t *g, ing_job_t *j) {
 static void fail_requests(ing_t *g, const char *why) {
   for (int i = 0; i < ING_REQ_MAX; i++) {
     if (!g->reqs[i].active) continue;
-    post_result(g->reqs[i].id, false, "zone %s (view %s): %s", g->reqs[i].zone, g->reqs[i].view_name, why);
+    int grp = g->reqs[i].grp;
+    if (grp < 0) {
+      post_result(g->reqs[i].id, false, "zone %s (view %s): %s", g->reqs[i].zone, g->reqs[i].view_name, why);
+    } else if (g->grps[grp].active) {          /* one answer for the group, under the id the control thread knows */
+      post_result(g->grps[grp].ctl_id, false, "zone %s: %s", g->grps[grp].zone, why);
+      g->grps[grp].active = false;
+    }
     g->reqs[i].active = false;
   }
   g->cur_req = -1;
@@ -1246,6 +1270,45 @@ static void send_reload_req(ing_t *g, uint64_t id, bool all, uint16_t view, cons
 
 static void on_config_event(ing_t *g);
 
+/* B6b: one RELOAD_REQ per view that takes database zones; answer_request() combines the answers */
+static void request_all_views(ing_t *g, const rq_item_t *it, const char *canon) {
+  int need = 0, gi = -1, slots[ING_REQ_MAX], ns = 0;
+  for (uint32_t v = 0; v < g->nview_names; v++)
+    if (g->view_db && g->view_db[v]) need++;
+  for (int i = 0; i < ING_REQ_MAX; i++) {
+    if (gi < 0 && !g->grps[i].active) gi = i;
+    if (!g->reqs[i].active && ns < need) slots[ns++] = i;
+  }
+  if (need == 0) {
+    post_result(it->id, false, "no view takes zones from the database");
+    return;
+  }
+  if (gi < 0 || ns < need) {
+    post_result(it->id, false, "too many reload requests are waiting for the database loader");
+    return;
+  }
+  g->grps[gi].active = true;
+  g->grps[gi].ctl_id = it->id;
+  g->grps[gi].pending = need;
+  g->grps[gi].any_ok = g->grps[gi].any_bad = false;
+  g->grps[gi].text[0] = '\0';
+  snprintf(g->grps[gi].zone, sizeof(g->grps[gi].zone), "%s", canon);
+  syslog(LOG_NOTICE, "[DB] reload of zone '%s' (all %d views that take database zones) requested (request %llu)%s", canon, need,
+         (unsigned long long)it->id, it->force ? ", force" : "");
+  int k = 0;
+  for (uint32_t v = 0; v < g->nview_names; v++) {
+    if (!g->view_db || !g->view_db[v]) continue;
+    int slot = slots[k++];
+    g->reqs[slot].active = true;
+    g->reqs[slot].id = (1ULL << 63) | ++g->sub_seq;
+    g->reqs[slot].grp = gi;
+    g->reqs[slot].view = (uint16_t)v;
+    snprintf(g->reqs[slot].view_name, sizeof(g->reqs[slot].view_name), "%s", g->view_names[v]);
+    snprintf(g->reqs[slot].zone, sizeof(g->reqs[slot].zone), "%s", canon);
+    send_reload_req(g, g->reqs[slot].id, false, (uint16_t)v, canon, it->force);
+  }
+}
+
 static void process_requests(ing_t *g) {
   on_config_event(g);          /* a reload that changed the configuration sends CONFIG before the request */
   for (;;) {
@@ -1272,6 +1335,14 @@ static void process_requests(ing_t *g) {
         post_result(it.id, false, "'%.100s' is not a valid zone name", it.zone);
         break;
       }
+      if (!it.view[0]) { /* no view named, several take database zones: ask every one of them */
+        if (!ready) {
+          post_result(it.id, false, "the database loader is not connected (see 'karictl dbstatus')");
+          break;
+        }
+        request_all_views(g, &it, canon);
+        break;
+      }
       int vi = -1;
       for (uint32_t i = 0; i < g->nview_names; i++)
         if (strcasecmp(g->view_names[i], it.view) == 0) vi = (int)i;
@@ -1292,6 +1363,7 @@ static void process_requests(ing_t *g) {
       }
       g->reqs[slot].active = true;
       g->reqs[slot].id = it.id;
+      g->reqs[slot].grp = -1;
       g->reqs[slot].view = (uint16_t)vi;
       snprintf(g->reqs[slot].view_name, sizeof(g->reqs[slot].view_name), "%s", g->view_names[vi]);
       snprintf(g->reqs[slot].zone, sizeof(g->reqs[slot].zone), "%s", canon);
@@ -1302,7 +1374,9 @@ static void process_requests(ing_t *g) {
     }
     case RQ_CANCEL:
       for (int i = 0; i < ING_REQ_MAX; i++)
-        if (g->reqs[i].active && g->reqs[i].id == it.id) {
+        if (g->grps[i].active && g->grps[i].ctl_id == it.id) g->grps[i].active = false;
+      for (int i = 0; i < ING_REQ_MAX; i++)
+        if (g->reqs[i].active && (g->reqs[i].id == it.id || (g->reqs[i].grp >= 0 && !g->grps[g->reqs[i].grp].active))) {
           g->reqs[i].active = false;
           if (g->cur_req == i) g->cur_req = -1;
         }
@@ -1313,7 +1387,47 @@ static void process_requests(ing_t *g) {
   }
 }
 
-/* BATCH_END of a batch that answers a request: tell the control thread what became of the zone (design 5.2) */
+/* What a finished request says about its zone in one view: the text after "zone Z (view V): " and whether it is good news.
+ * *notfound: the loader sent nothing and the zone is not served (the zone is not in the database of this view). */
+static void request_clause(ing_t *g, int i, char *out, size_t cap, bool *ok, bool *notfound) {
+  const char *zone = g->reqs[i].zone, *view = g->reqs[i].view_name;
+  dbreg_info_t info;
+  int n = dbreg_find_info(view, zone, &info, 1);
+  *ok = true;
+  *notfound = false;
+  switch (g->req_outcome) {
+  case ROUT_APPLIED:
+    snprintf(out, cap, "applied, serial %u", g->req_serial);
+    break;
+  case ROUT_SHADOWED:
+    snprintf(out, cap, "loaded, serial %u, but hidden by %s", g->req_serial,
+             n > 0 && info.shadow_by == DBREG_SH_CATALOG ? "a catalog member of the same name" : "the zone in karidns.conf");
+    break;
+  case ROUT_REJECTED:
+    *ok = false;
+    snprintf(out, cap, "rejected: %.100s; the last good version, if any, keeps serving", g->req_reason);
+    break;
+  case ROUT_FAILED:
+    *ok = false;
+    snprintf(out, cap, "failed: %.100s", g->req_reason);
+    break;
+  case ROUT_DELETED:
+    snprintf(out, cap, "deleted (it is no longer in the database)");
+    break;
+  default: /* nothing was sent for the zone: the loader found it unchanged, or the database does not have it */
+    if (n > 0 && info.has_entry) {
+      snprintf(out, cap, "unchanged, serial %u%s", info.serial, info.shadowed ? " (hidden by another zone of the same name)" : "");
+    } else {
+      *ok = false;
+      *notfound = true;
+      snprintf(out, cap, "not in the database");
+    }
+    break;
+  }
+}
+
+/* BATCH_END of a batch that answers a request: tell the control thread what became of the zone (design 5.2).  A request
+ * that is one view of a group (B6b) only adds its part; the last part posts the combined answer. */
 static void answer_request(ing_t *g) {
   if (g->cur_req < 0) return;
   int i = g->cur_req;
@@ -1321,35 +1435,28 @@ static void answer_request(ing_t *g) {
   if (!g->reqs[i].active) return;
   uint64_t id = g->reqs[i].id;
   const char *zone = g->reqs[i].zone, *view = g->reqs[i].view_name;
+  int grp = g->reqs[i].grp;
   g->reqs[i].active = false;
-  dbreg_info_t info;
-  int n = dbreg_find_info(view, zone, &info, 1);
-  switch (g->req_outcome) {
-  case ROUT_APPLIED:
-    post_result(id, true, "zone %s (view %s): applied, serial %u", zone, view, g->req_serial);
-    break;
-  case ROUT_SHADOWED:
-    post_result(id, true, "zone %s (view %s): loaded, serial %u, but hidden by %s", zone, view, g->req_serial,
-                n > 0 && info.shadow_by == DBREG_SH_CATALOG ? "a catalog member of the same name" : "the zone in karidns.conf");
-    break;
-  case ROUT_REJECTED:
-    post_result(id, false, "zone %s (view %s): rejected: %.100s; the last good version, if any, keeps serving", zone, view,
-                g->req_reason);
-    break;
-  case ROUT_FAILED:
-    post_result(id, false, "zone %s (view %s): failed: %.100s", zone, view, g->req_reason);
-    break;
-  case ROUT_DELETED:
-    post_result(id, true, "zone %s (view %s): deleted (it is no longer in the database)", zone, view);
-    break;
-  default:        /* nothing was sent for the zone: the loader found it unchanged, or the database does not have it */
-    if (n > 0 && info.has_entry)
-      post_result(id, true, "zone %s (view %s): unchanged, serial %u%s", zone, view, info.serial,
-                  info.shadowed ? " (hidden by another zone of the same name)" : "");
-    else
+  char clause[160];
+  bool ok, notfound;
+  request_clause(g, i, clause, sizeof(clause), &ok, &notfound);
+  if (grp < 0) {
+    if (notfound)
       post_result(id, false, "zone not found (it is not in the database of view %s)", view);
-    break;
+    else
+      post_result(id, ok, "zone %s (view %s): %s", zone, view, clause);
+    return;
   }
+  size_t l = strlen(g->grps[grp].text);
+  snprintf(g->grps[grp].text + l, sizeof(g->grps[grp].text) - l, "%sview %s: %s", l ? "; " : "", view, clause);
+  if (ok) g->grps[grp].any_ok = true;
+  if (!ok && !notfound) g->grps[grp].any_bad = true;
+  if (--g->grps[grp].pending > 0) return;
+  g->grps[grp].active = false;
+  if (!g->grps[grp].any_ok && !g->grps[grp].any_bad)
+    post_result(g->grps[grp].ctl_id, false, "zone not found (it is not in the database of any view that takes database zones)");
+  else
+    post_result(g->grps[grp].ctl_id, g->grps[grp].any_ok, "zone %s: %s", g->grps[grp].zone, g->grps[grp].text);
 }
 
 static void *ingest_thread(void *arg) {
@@ -1510,6 +1617,7 @@ bool db_ingest_reload_result(db_reload_result_t *out) {
 
 bool db_ingest_pick_view(const char *view_arg, char *out, size_t cap, char *err, size_t errlen) {
   bool ok = false;
+  if (cap) out[0] = '\0';
   rcu_aux_read_lock();
   const server_config_t *cfg = acquire_config_snapshot();
   if (!cfg || !cfg->database.enabled) {
@@ -1533,7 +1641,8 @@ bool db_ingest_pick_view(const char *view_arg, char *out, size_t cap, char *err,
     } else if (n == 0) {
       snprintf(err, errlen, "no view takes zones from the database");
     } else {
-      snprintf(err, errlen, "the database serves %d views; name the view (e.g. 'reload <zone> <view>')", n);
+      ok = true;                 /* several views and none named: the caller asks every one of them (B6b) */
+      out[0] = '\0';
     }
   }
   rcu_aux_read_unlock();

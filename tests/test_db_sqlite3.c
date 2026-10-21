@@ -750,6 +750,8 @@ static void analyze_stream(dump_t *d) {
     }
 }
 
+static uint32_t g_threads = 1;      /* loader-threads of run_dump_mem() */
+
 /* run the dump of `path` into memory (only_zone may be NULL) */
 static void run_dump_mem(const char *path, const char *only_zone, dump_t *d) {
     memset(d, 0, sizeof(*d));
@@ -758,6 +760,7 @@ static void run_dump_mem(const char *path, const char *only_zone, dump_t *d) {
     ctx_t x;
     memset(&x, 0, sizeof(x));
     x.drv = &db_driver_sqlite3;
+    x.nthreads = g_threads;
     kdb_enc_init(&x.enc);
     x.out = fopen(outp, "wb");
     db_source_t src = { "sqlite3", path, NULL, NULL, 0 };
@@ -768,13 +771,78 @@ static void run_dump_mem(const char *path, const char *only_zone, dump_t *d) {
     if (f) { fseek(f, 0, SEEK_END); d->len = (size_t)ftell(f); fclose(f); }
     analyze_stream(d);
     if (d->bytes) find_first_zone(d);
-    for (size_t i = 0; i < x.nz; i++) { free(x.zones[i].name); free(x.zones[i].type); }
-    free(x.zones);
-    for (size_t i = 0; i < x.nm; i++) { free(x.meta[i].kind); free(x.meta[i].content); }
-    free(x.meta);
-    free(x.keys);
+    ctx_view_reset(&x);
     kdb_enc_free(&x.enc);
     unlink(outp);
+}
+
+typedef struct { int64_t did[32]; char vn[32][24]; size_t n; } dv_t;
+static int collect_dv(void *ud, int64_t did, const char *vn) {
+    dv_t *d = ud;
+    if (d->n < 32) { d->did[d->n] = did; snprintf(d->vn[d->n], sizeof(d->vn[0]), "%s", vn); d->n++; }
+    return 0;
+}
+typedef struct { int64_t lo, hi; size_t n; bool ordered; int64_t prev_d, prev_id; } rng_t;
+static int collect_rng(void *ud, int64_t did, const db_record_row_t *r) {
+    rng_t *g = ud;
+    if (did < g->lo || did > g->hi) g->ordered = false;
+    if (did < g->prev_d || (did == g->prev_d && r->id <= g->prev_id)) g->ordered = false;
+    g->prev_d = did;
+    g->prev_id = r->id;
+    g->n++;
+    return 0;
+}
+
+/* B6b: scan_records_range (the rows of a domain_id range, in order) and scan_domain_views (karidns_domain_views) */
+static void test_range_views(void) {
+    printf("scan_records_range, scan_domain_views\n");
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("rng.db", path, sizeof(path));
+    for (int i = 1; i <= 6; i++) {
+        char nm[40];
+        snprintf(nm, sizeof(nm), "r%d.test", i);
+        add_simple_zone(db, i, i * 10, nm);                      /* 3 records each */
+    }
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (!c) { sqlite3_close(db); return; }
+    db_schema_info_t si;
+    CHECK(db_driver_sqlite3.check_schema(c, &si) == 0 && !si.has_domain_views);
+    dv_t dv = {0};
+    CHECK(db_driver_sqlite3.scan_domain_views(c, NULL, collect_dv, &dv) == DB_ERR_UNAVAILABLE && dv.n == 0);
+    db_driver_sqlite3.close(c);
+
+    raw_exec(db, "CREATE TABLE karidns_domain_views (domain_id INTEGER NOT NULL, view_name VARCHAR(64) NOT NULL,"
+                 " PRIMARY KEY (domain_id, view_name))");
+    raw_exec(db, "INSERT INTO karidns_domain_views VALUES (4, 'b'), (2, 'a'), (2, 'B'), (5, 'a')");
+    c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (!c) { sqlite3_close(db); return; }
+    CHECK(db_driver_sqlite3.check_schema(c, &si) == 0 && si.has_domain_views);
+    CHECK(db_driver_sqlite3.begin_snapshot(c) == 0);
+    CHECK(db_driver_sqlite3.scan_domain_views(c, NULL, collect_dv, &dv) == 0);
+    CHECK(dv.n == 4 && dv.did[0] == 2 && dv.did[1] == 2 && dv.did[2] == 4 && dv.did[3] == 5);
+    CHECK(strcmp(dv.vn[2], "b") == 0 && strcmp(dv.vn[3], "a") == 0);        /* names are returned as stored */
+    dv_t one = {0};
+    int64_t id2 = 2, id3 = 3;
+    CHECK(db_driver_sqlite3.scan_domain_views(c, &id2, collect_dv, &one) == 0 && one.n == 2);
+    dv_t none = {0};
+    CHECK(db_driver_sqlite3.scan_domain_views(c, &id3, collect_dv, &none) == 0 && none.n == 0);
+
+    rng_t g = { 2, 4, 0, true, 0, 0 };
+    CHECK(db_driver_sqlite3.scan_records_range(c, 2, 4, collect_rng, &g) == 0);
+    CHECK(g.n == 9 && g.ordered);
+    rng_t g2 = { 5, 5, 0, true, 0, 0 };
+    CHECK(db_driver_sqlite3.scan_records_range(c, 5, 5, collect_rng, &g2) == 0 && g2.n == 3 && g2.ordered);
+    rng_t g3 = { 7, 9, 0, true, 0, 0 };
+    CHECK(db_driver_sqlite3.scan_records_range(c, 7, 9, collect_rng, &g3) == 0 && g3.n == 0);
+    rng_t g4 = { 1, 6, 0, true, 0, 0 };
+    size_t stopped = 0;
+    CHECK(db_driver_sqlite3.scan_records_range(c, 1, 6, stop_rec, &stopped) == DB_STOPPED && stopped == 1);
+    CHECK(db_driver_sqlite3.scan_records_range(c, 1, 6, collect_rng, &g4) == 0 && g4.n == 18);     /* the statement is usable again */
+    CHECK(db_driver_sqlite3.end_snapshot(c) == 0);
+    db_driver_sqlite3.close(c);
+    sqlite3_close(db);
 }
 
 static void test_dump(void) {
@@ -803,6 +871,15 @@ static void test_dump(void) {
     CHECK_MSG(d.status == 1, "exit status %d: some zones failed", d.status);
     CHECK_MSG(d.stream_ok, "the whole stream passes the Backend state machine: %s", d.sm_reason);
     CHECK(d.saw_hello && d.saw_batch_begin && d.saw_batch_end);
+    {   /* B6b: the stream does not depend on loader-threads (valid and failed zones, in domains.id order) */
+        dump_t d4;
+        g_threads = 4;
+        run_dump_mem(path, NULL, &d4);
+        g_threads = 1;
+        CHECK_MSG(d4.status == d.status && d4.len == d.len && d.len > 0 && memcmp(d4.bytes, d.bytes, d.len) == 0,
+                  "4 threads: exit %d, %zu bytes (1 thread: exit %d, %zu bytes)", d4.status, d4.len, d.status, d.len);
+        dump_free(&d4);
+    }
     CHECK_MSG(d.n_begin == 3 && d.n_end == 3, "zones written: %zu begin, %zu end", d.n_begin, d.n_end);
     if (d.n_begin == 3) {
         CHECK(strcmp(d.begin_name[0], "ok.test.") == 0);
@@ -882,6 +959,7 @@ int main(int argc, char **argv) {
     test_snapshot();
     test_busy();
     test_changes();
+    test_range_views();
     test_dump();
     free(g_schema_sql);
     rm_tree(g_dir);

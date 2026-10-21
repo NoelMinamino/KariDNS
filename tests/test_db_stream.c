@@ -138,6 +138,7 @@ static void m_config(kdb_enc_t *e) {
         kdb_enc_u32(e, 7, 1000);
         kdb_enc_u64(e, 8, KDB_DEFAULT_MAX_ZONE_RECORDS);
         kdb_enc_u64(e, 9, KDB_DEFAULT_MAX_ZONE_BYTES);
+        if (!i) kdb_enc_u8(e, 10, 1);                 /* B6b: the first view uses the shared source */
         kdb_enc_nest_end(e);
     }
     kdb_enc_end(e);
@@ -365,9 +366,9 @@ static void test_roundtrip_backend(void) {
             kdb_iter_t it;
             kdb_config_view_t v;
             kdb_config_views(&m, &it);
-            CHECK(kdb_config_views_next(&it, &v) && v.index == 0 && v.name.len == 8 && v.source.p == NULL && v.auto_reload == 0);
+            CHECK(kdb_config_views_next(&it, &v) && v.index == 0 && v.name.len == 8 && v.source.p == NULL && v.auto_reload == 0 && v.shared_source == 1);
             CHECK(v.poll_interval == 2 && v.coalesce_ms == 1000 && v.max_zone_records == KDB_DEFAULT_MAX_ZONE_RECORDS);
-            CHECK(kdb_config_views_next(&it, &v) && v.index == 1 && v.source.len == 32 && v.auto_reload == 1);
+            CHECK(kdb_config_views_next(&it, &v) && v.index == 1 && v.source.len == 32 && v.auto_reload == 1 && v.shared_source == 0);
             CHECK(v.max_zone_bytes == KDB_DEFAULT_MAX_ZONE_BYTES);
             CHECK(!kdb_config_views_next(&it, &v));
             break;
@@ -679,6 +680,15 @@ static void test_backend_direction_rejects(void) {
     kdb_enc_init(&e);
     m_config(&e);
     CHECK_RC("config ok", decode_backend(&e, 2), KDB_OK);
+    /* B6b: shared_source is 0 or 1 */
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_CONFIG);
+    kdb_enc_u64(&e, 1, 1); kdb_enc_str(&e, 2, "sqlite3");
+    kdb_enc_nest_begin(&e, 4);
+    kdb_enc_u16(&e, 1, 0); kdb_enc_str(&e, 2, "v"); kdb_enc_u8(&e, 5, 0); kdb_enc_u32(&e, 6, 2); kdb_enc_u32(&e, 7, 1000);
+    kdb_enc_u64(&e, 8, 1); kdb_enc_u64(&e, 9, 1); kdb_enc_u8(&e, 10, 2);
+    kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("shared_source 2 is refused", decode_backend(&e, 2), KDB_E_RANGE);
     /* unknown tag inside a nested VIEW entry */
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_CONFIG);
     kdb_enc_u64(&e, 1, 1); kdb_enc_str(&e, 2, "sqlite3");

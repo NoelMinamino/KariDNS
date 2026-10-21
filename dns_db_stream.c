@@ -64,7 +64,8 @@ TDEF(td_batch_end, "BATCH_END", sp_batch_end);
 
 static const kdb_tspec_t sp_cfg_view[] = {
     S(KT_U16, KS_REQ, 0), S(KT_STR, KS_REQ | KS_NE, 255), S(KT_PATH, KS_NE, 1023), S(KT_PATH, KS_NE, 1023),
-    S(KT_U8, KS_REQ | KS_MAXV, 1), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_U64, KS_REQ, 0), S(KT_U64, KS_REQ, 0) };
+    S(KT_U8, KS_REQ | KS_MAXV, 1), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_U64, KS_REQ, 0), S(KT_U64, KS_REQ, 0),
+    S(KT_U8, KS_MAXV, 1) };
 TDEF(td_cfg_view, "CONFIG.VIEW", sp_cfg_view);
 static const kdb_tspec_t sp_config[] = {
     S(KT_U64, KS_REQ, 0), S(KT_STR, KS_REQ | KS_NE, 32), S(KT_STR, 0, 64),
@@ -449,6 +450,7 @@ bool kdb_config_views_next(kdb_iter_t *it, kdb_config_view_t *o) {
     o->coalesce_ms = (uint32_t)V(7).u;
     o->max_zone_records = V(8).u;
     o->max_zone_bytes = V(9).u;
+    o->shared_source = V(10).present ? (uint8_t)V(10).u : 0;
     return true;
 }
 

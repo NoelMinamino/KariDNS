@@ -24,7 +24,7 @@
 # Needs root (the server starts as root and drops to nobody, the loader must be root-owned).  SKIP otherwise, and when
 # karidns, dag, karictl, karidns-dbloader (SQLite3 driver), zone2sql or the sqlite3 CLI is missing.
 # BULK=n sets bulk-threshold (default 25; 0 = every diff reads all records in one scan, 100 = one query per zone); the answers
-# must not depend on it.
+# must not depend on it.  LOADER_THREADS=n sets loader-threads (default 1; B6b); the answers and the batch counts are the same.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
@@ -121,7 +121,7 @@ conf() {   # conf FILE
     cat > "$1" <<EOF
 options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT;
-    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; db-reload-timeout 4; bulk-threshold ${BULK:-25}; };
+    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; db-reload-timeout 4; bulk-threshold ${BULK:-25}; loader-threads ${LOADER_THREADS:-1}; };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
 zone "file.test" { type primary; file "$T/file.zone"; };

@@ -4,6 +4,7 @@
  * Runs in the supervisor, a single-threaded process, so fork() followed by ordinary libc calls in the child is fine.
  */
 #include "dns_db_supervisor.h"
+#include "dns_snapshot_rcu.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -249,6 +250,7 @@ bool db_sup_spawn(db_sup_t *s) {
     loader_fd = sv[0];
     backend_fd = sv[1];
   }
+  gc_snapshot_wait_idle();   /* fork from a single thread (see dns_snapshot_rcu.c) */
   pid_t pid = fork();
   if (pid < 0) {
     syslog(LOG_ERR, "[Manager] fork for the database loader failed: %m");
