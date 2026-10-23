@@ -203,6 +203,10 @@ typedef struct {
      * loader already knows this exact version): pdns_zone_encode_kdb() then returns 1 and has emitted nothing. */
     int (*gate)(void *ud, uint32_t serial, const uint8_t digest[KDB_DIGEST_LEN]);
     void *gate_ud;
+    /* B7a: the text of the profile the zone names (karidns_profiles.settings), "" or NULL = none.  It goes into the digest
+     * (with the settings text and the profile name), so that editing the profile makes every zone that uses it new to a
+     * loader that has the old version; the loader sends it itself as a PROFILE message. */
+    const char *profile_text;
 } pdns_kdb_params_t;
 
 /* Called once per complete KDB1 message (12-byte header + body); the memory is valid during the call only.
@@ -215,7 +219,9 @@ typedef int (*pdns_emit_fn)(void *ud, const uint8_t *msg, size_t len);
  *               <= 65,535 bytes with the header QR=1, AA=1, ID 0, QDCOUNT/NSCOUNT/ARCOUNT 0 (B1 rules).
  *   rr_count    number of RRs including both SOAs
  *   digest      SHA-256 over the ZONE_DATA bodies in stream order (the 12-byte DNS header and the RRs of each
- *               message, no framing, no ZONE_DATA headers); two loaders on the same rows send the same digest
+ *               message, no framing, no ZONE_DATA headers), then, when the zone has a settings text or names a profile,
+ *               a marker and the length-prefixed settings text, profile name and profile text (B7a: a metadata-only
+ *               edit changes the digest); two loaders on the same rows send the same digest
  *   flags       bit0 presigned.  Extended AXFR attributes (tags, tinydns) are B8.
  * Returns 1 (nothing emitted) when p->gate asked to skip the zone.
  *

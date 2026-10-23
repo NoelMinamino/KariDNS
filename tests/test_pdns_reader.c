@@ -829,7 +829,8 @@ static void test_metadata(void) {
     }
     {
         db_meta_row_t m[] = { M("TSIG-ALLOW-AXFR", "xfr"), M("ALLOW-AXFR-FROM", "192.0.2.0/24") };
-        expect_settings("allow-transfer both", m, 2, "allow-transfer { 192.0.2.0/24; key \"xfr\"; };", 1);
+        /* D14 (B7a): PowerDNS accepts an address or a key; the text says so (karidns.conf alone would need both) */
+        expect_settings("allow-transfer both", m, 2, "allow-transfer { 192.0.2.0/24; key \"xfr\"; }; transfer-acl-match any;", 0);
     }
     {   /* AUTO-NS and garbage cannot be expressed; the list must not become wider than the metadata: none */
         db_meta_row_t m[] = { M("ALLOW-AXFR-FROM", "AUTO-NS"), M("ALLOW-AXFR-FROM", "1.2.3.4; any") };
@@ -846,9 +847,9 @@ static void test_metadata(void) {
         expect_settings("allow-update addresses", m, 1, "allow-update { 192.0.2.0/24; };", 0);
         db_meta_row_t m2[] = { M("TSIG-ALLOW-DNSUPDATE", "upd") };
         expect_settings("allow-update keys", m2, 1, "allow-update { key \"upd\"; };", 0);
-        /* PowerDNS requires address AND key; allow-update accepts either: closed, with a warning */
+        /* PowerDNS requires address AND key (D14, B7a): update-acl-match all, no warning, not closed */
         db_meta_row_t m3[] = { M("TSIG-ALLOW-DNSUPDATE", "upd"), M("ALLOW-DNSUPDATE-FROM", "192.0.2.0/24") };
-        expect_settings("allow-update both", m3, 2, "allow-update { none; };", 1);
+        expect_settings("allow-update both", m3, 2, "allow-update { 192.0.2.0/24; key \"upd\"; }; update-acl-match all;", 0);
     }
     {
         db_meta_row_t m[] = { M("AXFR-MASTER-TSIG", "master-key"), M("AXFR-MASTER-TSIG", "other") };
@@ -1008,7 +1009,7 @@ static void test_kdb(void) {
 
         /* determinism: the same rows give the same bytes */
         rt_buf_t b1 = {0}, b2 = {0};
-        pdns_kdb_params_t kp = { 1, 9, KDB_ZK_PRIMARY, "prof", NULL, NULL };
+        pdns_kdb_params_t kp = { 1, 9, KDB_ZK_PRIMARY, "prof", NULL, NULL, NULL };
         char err[200];
         CHECK(pdns_zone_encode_kdb(z, &kp, rt_emit, &b1, err, sizeof(err)) == 0);
         pdns_zone_t *z2 = build(rows, n, NULL, 0, NULL);
@@ -1028,20 +1029,54 @@ static void test_kdb(void) {
         /* B6a: the gate sees the serial and the digest ZONE_BEGIN carries, and can keep the zone back (returns 1, emits nothing) */
         {
             gate_seen_t gs = { 0, 0, { 0 }, 0 };
-            pdns_kdb_params_t gp = { 1, 9, KDB_ZK_PRIMARY, "prof", test_gate, &gs };
+            pdns_kdb_params_t gp = { 1, 9, KDB_ZK_PRIMARY, "prof", test_gate, &gs, NULL };
             rt_buf_t b4 = {0};
             gs.answer = 1;
             CHECK(pdns_zone_encode_kdb(z, &gp, rt_emit, &b4, err, sizeof(err)) == 1);
             CHECK(b4.len == 0 && gs.calls == 1 && gs.serial == 2024010101u);
+            /* B7a: the profile name is part of the digest; without a profile it is the digest of the data alone */
+            CHECK(memcmp(gs.digest, info.digest, KDB_DIGEST_LEN) != 0);
+            uint8_t with_prof[KDB_DIGEST_LEN];
+            memcpy(with_prof, gs.digest, KDB_DIGEST_LEN);
+            pdns_kdb_params_t gn = { 1, 9, KDB_ZK_PRIMARY, "", test_gate, &gs, NULL };
+            CHECK(pdns_zone_encode_kdb(z, &gn, rt_emit, &b4, err, sizeof(err)) == 1);
             CHECK(memcmp(gs.digest, info.digest, KDB_DIGEST_LEN) == 0);
+            /* ... and so is the text of the profile: editing a profile makes every zone that names it new */
+            pdns_kdb_params_t gt = { 1, 9, KDB_ZK_PRIMARY, "prof", test_gate, &gs, "allow-transfer { 192.0.2.1; };" };
+            CHECK(pdns_zone_encode_kdb(z, &gt, rt_emit, &b4, err, sizeof(err)) == 1);
+            CHECK(memcmp(gs.digest, with_prof, KDB_DIGEST_LEN) != 0 && memcmp(gs.digest, info.digest, KDB_DIGEST_LEN) != 0);
+            uint8_t with_text[KDB_DIGEST_LEN];
+            memcpy(with_text, gs.digest, KDB_DIGEST_LEN);
+            gt.profile_text = "allow-transfer { 192.0.2.2; };";
+            CHECK(pdns_zone_encode_kdb(z, &gt, rt_emit, &b4, err, sizeof(err)) == 1);
+            CHECK(memcmp(gs.digest, with_text, KDB_DIGEST_LEN) != 0);
+            CHECK(b4.len == 0);
             gs.answer = 0;
             CHECK(pdns_zone_encode_kdb(z, &gp, rt_emit, &b4, err, sizeof(err)) == 0);
-            CHECK(b4.len == b1.len && memcmp(b4.buf, b1.buf, b1.len) == 0 && gs.calls == 2);
+            CHECK(b4.len == b1.len && memcmp(b4.buf, b1.buf, b1.len) == 0 && gs.calls == 5);
             free(b4.buf);
         }
         free(b1.buf); free(b2.buf);
         pdns_zone_free(z); pdns_zone_free(z2); pdns_zone_free(z3);
         free(rows); free(names); free(txt);
+    }
+    {   /* B7a: a metadata-only edit changes the digest (the settings text is part of it), the same metadata does not */
+        db_meta_row_t m1[] = { M("ALLOW-AXFR-FROM", "192.0.2.1") }, m2[] = { M("ALLOW-AXFR-FROM", "192.0.2.2") };
+        pdns_zone_t *za = build(NULL, 0, NULL, 0, NULL), *zb = build(NULL, 0, m1, 1, NULL), *zc = build(NULL, 0, m2, 1, NULL),
+                    *zd = build(NULL, 0, m1, 1, NULL);
+        gate_seen_t ga = { 0, 0, { 0 }, 1 }, gb = ga, gc = ga, gd = ga;
+        pdns_kdb_params_t pa = { 0, 1, KDB_ZK_PRIMARY, NULL, test_gate, &ga, NULL }, pb = pa, pc = pa, pd = pa;
+        pb.gate_ud = &gb; pc.gate_ud = &gc; pd.gate_ud = &gd;
+        char err[200];
+        rt_buf_t nb = {0};
+        CHECK(pdns_zone_encode_kdb(za, &pa, rt_emit, &nb, err, sizeof(err)) == 1);
+        CHECK(pdns_zone_encode_kdb(zb, &pb, rt_emit, &nb, err, sizeof(err)) == 1);
+        CHECK(pdns_zone_encode_kdb(zc, &pc, rt_emit, &nb, err, sizeof(err)) == 1);
+        CHECK(pdns_zone_encode_kdb(zd, &pd, rt_emit, &nb, err, sizeof(err)) == 1);
+        CHECK(memcmp(ga.digest, gb.digest, KDB_DIGEST_LEN) != 0);
+        CHECK(memcmp(gb.digest, gc.digest, KDB_DIGEST_LEN) != 0);
+        CHECK(memcmp(gb.digest, gd.digest, KDB_DIGEST_LEN) == 0);
+        pdns_zone_free(za); pdns_zone_free(zb); pdns_zone_free(zc); pdns_zone_free(zd);
     }
     /* big RDATA through the generic form (one token, up to 65535 octets): messages are filled to the limit, an RR is
      * never split, and one that cannot fit a message of its own is refused with its row id */
@@ -1080,7 +1115,7 @@ static void test_kdb(void) {
         rt_buf_t b = {0};
         db_meta_row_t m[] = { M("X-KARIDNS-FORMAT", "tinydns") };
         pdns_zone_t *z = build(NULL, 0, m, 1, NULL);
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL}, rt_emit, &b, err, sizeof(err)) != 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL }, rt_emit, &b, err, sizeof(err)) != 0);
         CHECK_HAS(err, "B8");
         CHECK(b.len == 0);
         pdns_zone_free(z);
@@ -1088,7 +1123,7 @@ static void test_kdb(void) {
         z = build(NULL, 0, m2, 2, NULL);                              /* B5: NSEC3PARAM without any RRSIG(NSEC3) cannot be rebuilt */
         CHECK(z->failed);
         CHECK_HAS(z->error, "no RRSIG(NSEC3) rows");
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL}, rt_emit, &b, err, sizeof(err)) != 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL }, rt_emit, &b, err, sizeof(err)) != 0);
         pdns_zone_free(z);
         db_meta_row_t m3[] = { M("PRESIGNED", "1") };               /* presigned without NSEC3PARAM: encoded, flag set */
         z = build(NULL, 0, m3, 1, NULL);
@@ -1100,13 +1135,13 @@ static void test_kdb(void) {
         /* a failed zone is not encoded */
         db_record_row_t bad[1] = { R(2, "x.z.test", "A", "nope", 300, 0) };
         z = build(bad, 1, NULL, 0, NULL);
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL}, rt_emit, &b, err, sizeof(err)) != 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL }, rt_emit, &b, err, sizeof(err)) != 0);
         pdns_zone_free(z);
         /* size limit */
         pdns_opts_t o = { 0, 0, 0, 100 };
         z = build(NULL, 0, NULL, 0, &o);
         CHECK(!z->failed);
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL}, rt_emit, &b, err, sizeof(err)) != 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL }, rt_emit, &b, err, sizeof(err)) != 0);
         CHECK_HAS(err, "limit");
         pdns_zone_free(z);
         free(b.buf);
@@ -1117,7 +1152,7 @@ static void test_kdb(void) {
         pdns_zone_t *z = build(NULL, 0, m, 2, NULL);
         rt_buf_t b = {0};
         char err[200];
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){5, 42, KDB_ZK_SECONDARY, NULL, NULL, NULL}, rt_emit, &b, err, sizeof(err)) == 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){5, 42, KDB_ZK_SECONDARY, NULL, NULL, NULL, NULL }, rt_emit, &b, err, sizeof(err)) == 0);
         static uint8_t fb[KDB_MAX_BODY];
         kdb_framer_t f;
         kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
@@ -1187,7 +1222,7 @@ static void test_kdb_name_case(void) {
     CHECK(fa.count == N);
     rt_buf_t b = {0};
     char err[200];
-    if (!z->failed) CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL}, rt_emit, &b, err, sizeof(err)) == 0);
+    if (!z->failed) CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL }, rt_emit, &b, err, sizeof(err)) == 0);
     for (size_t i = 0; i < N && !z->failed && i < fa.count; i++) {
         const dns_record_t *dbrec = NULL;
         for (size_t k = 0; k < z->arena.count; k++)

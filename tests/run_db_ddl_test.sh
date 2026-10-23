@@ -14,6 +14,10 @@
 # reaches a LISTENing session, and the prune keeps the newest rows.  KARIDNS_TEST_PG is the conninfo of a maintenance
 # database the role may create databases from (default: the local socket, database "postgres").  If the real PowerDNS
 # schema file is found (PDNS_SCHEMA_PGSQL or /usr/local/share/doc/pdns/schema.pgsql.sql) the ext DDL is also applied to it.
+# When the test runs as root (the suite does) psql runs as an unprivileged user through su -m, because FreeBSD has no sudo
+# in base and PostgreSQL has no role "root": KARIDNS_TEST_PG_USER, else SUDO_USER, else the owner of the source tree (the
+# first of them that can connect); the test never needs sudo.
+# B7a: the triggers on karidns_profiles log every domain whose X-KARIDNS-PROFILE names the profile (both dialects).
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
@@ -30,6 +34,39 @@ cleanup() {
     rm -rf "$T"
 }
 trap cleanup EXIT INT TERM
+
+# psql, as an unprivileged user when this test runs as root (PG_AS is chosen in the PostgreSQL section; empty = as
+# ourselves).  The arguments travel in the environment (PSQLA1, PSQLA2, ...) so that nothing has to be quoted for su.
+PG_AS=""
+psql() {
+    if [ -z "$PG_AS" ]; then command psql "$@"; return $?; fi
+    cmd="exec psql"
+    i=0
+    for a in "$@"; do
+        i=$((i + 1))
+        export "PSQLA$i=$a"
+        cmd="$cmd \"\$PSQLA$i\""
+    done
+    su -m "$PG_AS" -c "$cmd"
+}
+# who may run psql: the first candidate that can connect (as root; anybody else runs psql as themselves)
+pick_pg_user() {
+    [ "$(id -u)" = "0" ] || return 0
+    owner=$(stat -f %Su "$ROOT" 2>/dev/null || stat -c %U "$ROOT" 2>/dev/null)
+    for u in "${KARIDNS_TEST_PG_USER:-}" "${SUDO_USER:-}" "$owner" postgres pgsql; do
+        [ -n "$u" ] && [ "$u" != root ] && id "$u" >/dev/null 2>&1 || continue
+        PG_AS=$u
+        if psql -X -q -At -d "${KARIDNS_TEST_PG:-postgres}" -c "SELECT 1" >/dev/null 2>&1; then
+            PG_TRIED="$PG_TRIED $u"
+            chmod 755 "$T"                     # psql -f reads files of the temporary directory
+            return 0
+        fi
+        PG_TRIED="$PG_TRIED $u"
+    done
+    PG_AS=""
+    return 0
+}
+PG_TRIED=""
 
 # ================================================================ SQLite3
 echo "== SQLite3"
@@ -56,9 +93,9 @@ else
     for t in karidns_schema_version karidns_changes karidns_domain_views karidns_profiles karidns_record_tags karidns_record_tinydns karidns_zone_tagdefs; do
         [ "$(sq "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '$t'")" = "1" ] && pass "table $t" || fail "table $t is missing"
     done
-    # 8 tables with INSERT / UPDATE / DELETE triggers + the prune trigger
-    [ "$(sq "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'")" = "25" ] && pass "25 triggers (8 tables x 3 + prune)" ||
-        fail "trigger count $(sq "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'"), wanted 25"
+    # 9 tables with INSERT / UPDATE / DELETE triggers (B7a: karidns_profiles) + the prune trigger
+    [ "$(sq "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'")" = "28" ] && pass "28 triggers (9 tables x 3 + prune)" ||
+        fail "trigger count $(sq "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'"), wanted 28"
     sq "PRAGMA foreign_keys = ON" > /dev/null
 
     # sq with foreign keys on for the statements below (the pragma is per connection)
@@ -114,6 +151,26 @@ else
     expect "UPDATE domains (new id: OLD and NEW)" "1,3"
     sqf "DELETE FROM domains WHERE id = 3"
     expect "DELETE FROM domains (the log keeps the deleted id)" "3"
+    # B7a: a profile edit logs every domain whose X-KARIDNS-PROFILE names the old or the new name (kind in any case, blanks
+    # around the name ignored, other profiles and other kinds not)
+    sqf "INSERT INTO domains (id, name, type) VALUES (31, 'pa.test', 'NATIVE'), (32, 'pb.test', 'NATIVE'), (33, 'pc.test', 'NATIVE'), (34, 'pd.test', 'NATIVE'), (35, 'pe.test', 'NATIVE')"
+    sqf "INSERT INTO domainmetadata (domain_id, kind, content) VALUES (31, 'X-KARIDNS-PROFILE', 'gold'), (32, 'X-KARIDNS-PROFILE', '  gold ' || char(9)),
+         (33, 'X-KARIDNS-PROFILE', 'silver'), (34, 'x-karidns-profile', 'gold'), (35, 'ALSO-NOTIFY', 'gold')"
+    reset
+    sets() { sq "SELECT coalesce(group_concat(domain_id, ','), '') FROM (SELECT domain_id FROM karidns_changes ORDER BY domain_id)"; }
+    expect_set() { got=$(sets); [ "$got" = "$2" ] && pass "$1: $got" || fail "$1: logged '$got', wanted '$2'"; reset; }
+    sqf "INSERT INTO karidns_profiles (name, settings) VALUES ('gold', 'allow-transfer { 192.0.2.1; };')"
+    expect_set "INSERT INTO karidns_profiles logs the domains that name it" "31,32,34"
+    sqf "UPDATE karidns_profiles SET settings = 'allow-transfer { 192.0.2.2; };' WHERE name = 'gold'"
+    expect_set "UPDATE karidns_profiles (settings)" "31,32,34"
+    sqf "UPDATE karidns_profiles SET name = 'silver' WHERE name = 'gold'"
+    expect_set "UPDATE karidns_profiles (rename: the old and the new name)" "31,32,33,34"
+    sqf "DELETE FROM karidns_profiles WHERE name = 'silver'"
+    expect_set "DELETE FROM karidns_profiles" "33"
+    sqf "INSERT INTO karidns_profiles (name, settings) VALUES ('unused', '')"
+    expect_set "a profile no domain names logs nothing" ""
+    sqf "DELETE FROM domains WHERE id >= 31 AND id <= 35"
+    reset
     # sequence numbers only grow, and the time is a unix time
     sqf "INSERT INTO domains (id, name, type) VALUES (20, 'seq1.test', 'NATIVE'); INSERT INTO domains (id, name, type) VALUES (21, 'seq2.test', 'NATIVE')"
     [ "$(sq "SELECT count(*) FROM karidns_changes c1 JOIN karidns_changes c2 ON c2.seq > c1.seq WHERE c2.domain_id = 21 AND c1.domain_id = 20")" = "1" ] &&
@@ -142,9 +199,14 @@ if ! command -v psql >/dev/null 2>&1; then
     skip "psql is not installed"
 elif ! pg_isready -q 2>/dev/null && [ -z "${KARIDNS_TEST_PG:-}" ]; then
     skip "no PostgreSQL server is reachable on the default socket (set KARIDNS_TEST_PG to a conninfo to test one)"
-elif ! psql -X -q -At -d "$PGMAINT" -c "SELECT 1" >/dev/null 2>&1; then
-    skip "cannot connect to PostgreSQL (database '$PGMAINT')"
+elif pick_pg_user; ! psql -X -q -At -d "$PGMAINT" -c "SELECT 1" >/dev/null 2>&1; then
+    if [ "$(id -u)" = "0" ] && [ -z "$PG_AS" ]; then
+        skip "running as root and no unprivileged user could connect to PostgreSQL (tried:${PG_TRIED:- none}; set KARIDNS_TEST_PG_USER)"
+    else
+        skip "cannot connect to PostgreSQL (database '$PGMAINT')"
+    fi
 else
+    [ -n "$PG_AS" ] && echo "  (psql runs as user $PG_AS)"
     PGDB="karidns_ddl_test_$$"
     if ! psql -X -q -d "$PGMAINT" -c "CREATE DATABASE $PGDB" >/dev/null 2>&1; then
         skip "the role may not create databases"
@@ -169,8 +231,8 @@ else
         for t in karidns_schema_version karidns_changes karidns_domain_views karidns_profiles karidns_record_tags karidns_record_tinydns karidns_zone_tagdefs; do
             [ "$(pq "SELECT count(*) FROM pg_tables WHERE tablename = '$t' AND schemaname = current_schema()")" = "1" ] && pass "table $t" || fail "table $t is missing"
         done
-        [ "$(pq "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND c.relname LIKE '%'")" = "25" ] &&
-            pass "25 triggers (8 tables x 3 + prune)" || fail "trigger count $(pq "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal")"
+        [ "$(pq "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND c.relname LIKE '%'")" = "28" ] &&
+            pass "28 triggers (9 tables x 3 + prune)" || fail "trigger count $(pq "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal")"
 
         pq "INSERT INTO domains (name, type) SELECT 'd' || g || '.test', 'NATIVE' FROM generate_series(1, 3) g" >/dev/null
         expect "INSERT of 3 domains in one statement: one row per domain" "1,2,3"
@@ -202,6 +264,22 @@ else
         expect "DELETE FROM karidns_domain_views" "1,2"
         pq "INSERT INTO karidns_zone_tagdefs (domain_id, kind, tag, cidr) VALUES (3, 'location', 'tokyo', '192.0.2.0/24')" >/dev/null
         expect "INSERT INTO karidns_zone_tagdefs" "3"
+        # B7a: a profile edit logs every domain whose X-KARIDNS-PROFILE names the old or the new name (kind in any case,
+        # blanks around the name ignored, other profiles and other kinds not), one row per domain and statement
+        pq "INSERT INTO domains (id, name, type) VALUES (41, 'pa.test', 'NATIVE'), (42, 'pb.test', 'NATIVE'), (43, 'pc.test', 'NATIVE'), (44, 'pd.test', 'NATIVE'), (45, 'pe.test', 'NATIVE')" >/dev/null
+        pq "INSERT INTO domainmetadata (domain_id, kind, content) VALUES (41, 'X-KARIDNS-PROFILE', 'gold'), (42, 'X-KARIDNS-PROFILE', E'  gold \t'),
+            (43, 'X-KARIDNS-PROFILE', 'silver'), (44, 'x-karidns-profile', 'gold'), (45, 'ALSO-NOTIFY', 'gold')" >/dev/null
+        reset
+        pq "INSERT INTO karidns_profiles (name, settings) VALUES ('gold', 'allow-transfer { 192.0.2.1; };')" >/dev/null
+        expect "INSERT INTO karidns_profiles logs the domains that name it" "41,42,44"
+        pq "INSERT INTO karidns_profiles (name, settings) VALUES ('silver', ''), ('gold2', ''), ('nobody', '')" >/dev/null
+        expect "INSERT of three profiles in one statement: one row per domain" "43"
+        pq "UPDATE karidns_profiles SET settings = 'allow-transfer { 192.0.2.2; };' WHERE name = 'gold'" >/dev/null
+        expect "UPDATE karidns_profiles (settings)" "41,42,44"
+        pq "UPDATE karidns_profiles SET name = 'bronze' WHERE name = 'gold'" >/dev/null
+        expect "UPDATE karidns_profiles (rename: the old name)" "41,42,44"
+        pq "DELETE FROM karidns_profiles" >/dev/null
+        expect "DELETE FROM karidns_profiles (silver is the only name a domain still uses)" "43"
         RID=$(pq "SELECT id FROM records WHERE domain_id = 2 LIMIT 1")
         pq "INSERT INTO karidns_record_tags (record_id, location_tag) VALUES ($RID, 'tokyo')" >/dev/null
         expect "INSERT INTO karidns_record_tags (the domain comes through the record)" "2"

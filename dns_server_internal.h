@@ -643,8 +643,26 @@ zone_db_entry_t *dbreg_snapshot_entry(zone_db_snapshot_t *snap, const char *view
 /* Publish new settings for a DB zone; the old ones are freed after a grace period (zone_retire_object()).  cfg is
  * owned by the entry afterwards (freed with it). */
 void db_entry_set_config(zone_db_entry_t *entry, const zone_config_t *cfg);
-/* A zone_config_t for a DB zone: type "master", the zone name, no options */
-zone_config_t *db_zone_config_new(const char *domain);
+/* The same in two steps, so that settings can be taken back when the data that came with them is refused: swap publishes
+ * cfg and returns the previous block without retiring it; retire hands a block (the previous one, or the one that was
+ * taken back) to the S2 retire stack with the epoch swap returned. */
+const zone_config_t *db_entry_swap_config(zone_db_entry_t *entry, const zone_config_t *cfg, uint64_t *epoch);
+void db_entry_retire_config(zone_db_entry_t *entry, const zone_config_t *old, uint64_t epoch);
+/* A zone_config_t for a DB zone: type "master", the zone name, and (B7a) the interned settings `shared` (may be NULL:
+ * no options); the zone takes its own reference of shared. */
+zone_config_t *db_zone_config_new(const char *domain, zone_ext_shared_t *shared);
+/* Interned settings of DB zones (B7a, design 4.2).  The key is what makes two settings the same (profile name, profile text,
+ * zone text).  find: a new reference of the object with this key, or NULL.  intern: enters `fresh` (refs 1, hash and key
+ * set) into the table, or, when an equal object is there already, drops fresh and returns that one; the result carries a
+ * reference for the caller.  Unused objects are dropped by a later intern. */
+uint64_t db_settings_hash(const char *key, size_t len);
+zone_ext_shared_t *db_settings_find(const char *key, size_t len);
+zone_ext_shared_t *db_settings_intern(zone_ext_shared_t *fresh);
+size_t db_settings_count(void);
+void db_settings_reset(void);
+/* true once any DB zone's settings carry zone-tcp-mss / zone-tcp-window / zone-tcp-sndbuf (cfg->any_zone_tcp_opts only
+ * knows the zones of karidns.conf) */
+extern _Atomic bool g_db_zone_tcp_opts;
 /* Free every registry record and queued change (unit tests, fuzzers).  Entries lose the registry's reference. */
 void dbreg_reset(void);
 

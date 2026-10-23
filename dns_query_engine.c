@@ -2853,19 +2853,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
           zone_is_master = true;
         }
       }
-      const zone_ext_t *zu = zext(zcfg);
-      if (zcfg && zu->allow_update_count > 0) {
-        if (zu->allow_update_parsed) {
-          if (check_acl_bin(client_ip, zu->allow_update_parsed, zu->allow_update_count)) {
-            auth = true;
-          }
-        } else if (check_acl(client_ip, zu->allow_update, zu->allow_update_count)) {
-          auth = true;
-        }
-        for (int i = 0; !auth && tkey && i < zu->allow_update_count; i++) {
-          if (tsig_key_names_equal(tkey->name, zu->allow_update[i])) auth = true;
-        }
-      }
+      /* the address list, the named keys, update-acl-match and (DB zones) acl-ceiling: dns_tsig_acl.c */
+      if (zcfg) auth = zone_update_acl_allows(cfg, zcfg, client_ip, tkey ? tkey->name : NULL);
     }
 
     int rcode = 5; // REFUSED

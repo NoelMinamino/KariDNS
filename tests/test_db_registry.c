@@ -150,7 +150,7 @@ static void rebuild(server_config_t *cfg) {
 static zone_db_entry_t *new_entry(const char *view, const char *zone) {
     zone_db_entry_t *e = create_new_zone_entry(zone, view);
     CHECK(e != NULL);
-    zone_config_t *dc = db_zone_config_new(zone);
+    zone_config_t *dc = db_zone_config_new(zone, NULL);
     CHECK(dc != NULL);
     e->source = ZONE_SRC_DB;
     e->kind = ZONE_KIND_PRIMARY;
@@ -590,7 +590,7 @@ static void test_dbcfg(void) {
     const zone_config_t *c1 = zone_entry_config(&cfg, e);
     CHECK(c1 && strcmp(c1->type, "master") == 0 && strcmp(c1->domain, "cfg.test.") == 0 && c1->ext == NULL);
     CHECK(zone_entry_config(NULL, e) == c1);                         /* no configuration needed for a DB zone */
-    zone_config_t *c2 = db_zone_config_new("cfg.test.");
+    zone_config_t *c2 = db_zone_config_new("cfg.test.", NULL);
     CHECK(c2 != NULL);
     db_entry_set_config(e, c2);
     CHECK(zone_entry_config(&cfg, e) == c2);
@@ -680,6 +680,87 @@ static void test_concurrent(void) {
     dbreg_reset();
 }
 
+/* ---------------------------------------------------------------- 4b. interned settings (B7a) */
+static zone_ext_shared_t *mk_shared(const char *profile, const char *text) {
+    char err[200];
+    zone_ext_shared_t *s = db_settings_parse(text, strlen(text), err, sizeof(err));
+    CHECK(s != NULL);
+    if (!s) return NULL;
+    size_t pl = strlen(profile), tl = strlen(text);
+    char *key = malloc(pl + 1 + tl + 1);
+    memcpy(key, profile, pl);
+    key[pl] = '\0';
+    memcpy(key + pl + 1, text, tl + 1);
+    s->key = key;
+    s->key_len = pl + 1 + tl;
+    s->hash = db_settings_hash(key, s->key_len);
+    snprintf(s->profile, sizeof(s->profile), "%s", profile);
+    return db_settings_intern(s);                 /* a new reference for the caller */
+}
+
+static void test_settings_interning(void) {
+    printf("[TEST] DB settings: interning, reference counts, replacement and take-back of an entry's block...\n");
+    db_settings_reset();
+    const char *t1 = "allow-transfer { 192.0.2.1; };";
+    zone_ext_shared_t *a = mk_shared("p", t1), *b = mk_shared("p", t1), *c = mk_shared("q", t1);
+    CHECK(a && b && c && a == b && c != a);                          /* same profile name, profile text and zone text: one object */
+    CHECK(atomic_load(&a->refs) == 3 && atomic_load(&c->refs) == 2);  /* the table + the two callers / the table + one */
+    CHECK(db_settings_count() == 2);
+    char key[64];
+    memcpy(key, "p", 2);
+    memcpy(key + 2, t1, strlen(t1) + 1);
+    zone_ext_shared_t *f = db_settings_find(key, 2 + strlen(t1));
+    CHECK(f == a && atomic_load(&a->refs) == 4);
+    zone_ext_shared_unref(f);
+    CHECK(db_settings_find("nope", 4) == NULL);
+    CHECK(strcmp(a->profile, "p") == 0 && a->ext.db_acl_ceiling && a->ext.allow_transfer_count == 1);
+
+    /* an entry holds a reference through its zone_config_t; the old block of a replaced entry is freed after the grace period
+     * and gives its reference back */
+    zone_db_entry_t *e = new_entry("default", "set.test.");
+    zone_config_t *dc = db_zone_config_new("set.test.", a);
+    CHECK(dc && dc->ext_shared && dc->ext == &a->ext && atomic_load(&a->refs) == 4);
+    const zone_config_t *plain = zone_entry_config(NULL, e);
+    uint64_t ep;
+    const zone_config_t *prev = db_entry_swap_config(e, dc, &ep);      /* publish ... */
+    CHECK(prev == plain && zone_entry_config(NULL, e) == dc);
+    uint64_t ep2;
+    CHECK(db_entry_swap_config(e, prev, &ep2) == dc);                   /* ... and take it back (the data was refused) */
+    db_entry_retire_config(e, dc, ep2);                                 /* the refused block goes to the retire stack */
+    zone_retire_process(true);
+    CHECK(zone_entry_config(NULL, e) == plain && atomic_load(&a->refs) == 3);   /* its reference is back */
+    zone_config_t *dc2 = db_zone_config_new("set.test.", b);
+    db_entry_set_config(e, dc2);                                        /* replacement retires the plain block */
+    zone_retire_process(true);
+    CHECK(zone_entry_config(NULL, e) == dc2 && atomic_load(&a->refs) == 4);
+    atomic_store(&e->is_transferring, false);
+    free_zone_db_entry(e);                                              /* frees dc2 and drops its reference */
+    CHECK(atomic_load(&a->refs) == 3);
+    zone_ext_shared_unref(a);
+    zone_ext_shared_unref(b);
+    zone_ext_shared_unref(c);
+
+    /* nobody uses a, c: a later intern, once the table has grown, drops them (and keeps the objects in use) */
+    zone_ext_shared_t *keep = mk_shared("keep", t1);
+    for (int i = 0; i < 400; i++) {
+        char txt[80];
+        snprintf(txt, sizeof(txt), "ixfr-history %d;", i % 33);
+        zone_ext_shared_t *s = mk_shared("many", txt);
+        zone_ext_shared_unref(s);
+    }
+    for (int i = 0; i < 400; i++) {                                     /* distinct keys: different profile names */
+        char pn[16], txt[40] = "ixfr-history 1;";
+        snprintf(pn, sizeof(pn), "n%d", i);
+        zone_ext_shared_t *s = mk_shared(pn, txt);
+        zone_ext_shared_unref(s);
+    }
+    CHECK(db_settings_count() < 300);                                   /* swept; 433 distinct keys were interned */
+    CHECK(atomic_load(&keep->refs) == 2 && keep->ext.allow_transfer_count == 1);
+    zone_ext_shared_unref(keep);
+    db_settings_reset();                                                /* the table's references go too */
+    CHECK(db_settings_count() == 0);
+}
+
 int main(void) {
     snprintf(g_dir, sizeof(g_dir), "/tmp/karidns_dbreg.XXXXXX");
     if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
@@ -688,6 +769,7 @@ int main(void) {
     test_shadowing();
     test_catalog_member_wins();
     test_dbcfg();
+    test_settings_interning();
     test_concurrent();
     char cmd[300];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", g_dir);

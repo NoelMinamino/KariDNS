@@ -13,7 +13,7 @@
 --                     There is no foreign key on domain_id: a deleted domain must stay in the log.
 --   a prune trigger   keeps the newest 1,000,000 rows (the loader is read-only and cannot prune).  A loader that finds the
 --                     rows after its seq are gone (the first remaining seq is not seq + 1) compares everything again.
---   the tables of design 3.7 that later milestones read: karidns_domain_views (B6b), karidns_profiles (B7),
+--   the tables of design 3.7 that later milestones read: karidns_domain_views (B6b), karidns_profiles (B7a, with triggers that log the domains naming the profile),
 --                     karidns_record_tags / karidns_record_tinydns / karidns_zone_tagdefs (B8).
 --
 -- SQLite triggers are row level, so a bulk import writes one log row per changed row; that is harmless (the log is pruned)
@@ -192,4 +192,27 @@ END;
 CREATE TRIGGER IF NOT EXISTS karidns_trg_record_tinydns_del AFTER DELETE ON karidns_record_tinydns
 BEGIN
   INSERT INTO karidns_changes (domain_id, changed_at) SELECT domain_id, strftime('%s', 'now') FROM records WHERE id = OLD.record_id;
+END;
+
+-- karidns_profiles (B7a): the settings of a profile are part of every zone that names it (domainmetadata X-KARIDNS-PROFILE),
+-- so editing, adding or deleting a profile logs every domain that uses the old or the new name.  The kind is compared
+-- case-insensitively and the content without leading / trailing blanks, like the loader does.
+CREATE TRIGGER IF NOT EXISTS karidns_trg_profiles_ins AFTER INSERT ON karidns_profiles
+BEGIN
+  INSERT INTO karidns_changes (domain_id, changed_at)
+    SELECT domain_id, strftime('%s', 'now') FROM domainmetadata
+     WHERE domain_id IS NOT NULL AND upper(kind) = 'X-KARIDNS-PROFILE' AND trim(content, ' ' || char(9)) = NEW.name;
+END;
+CREATE TRIGGER IF NOT EXISTS karidns_trg_profiles_upd AFTER UPDATE ON karidns_profiles
+BEGIN
+  INSERT INTO karidns_changes (domain_id, changed_at)
+    SELECT domain_id, strftime('%s', 'now') FROM domainmetadata
+     WHERE domain_id IS NOT NULL AND upper(kind) = 'X-KARIDNS-PROFILE'
+       AND trim(content, ' ' || char(9)) IN (OLD.name, NEW.name);
+END;
+CREATE TRIGGER IF NOT EXISTS karidns_trg_profiles_del AFTER DELETE ON karidns_profiles
+BEGIN
+  INSERT INTO karidns_changes (domain_id, changed_at)
+    SELECT domain_id, strftime('%s', 'now') FROM domainmetadata
+     WHERE domain_id IS NOT NULL AND upper(kind) = 'X-KARIDNS-PROFILE' AND trim(content, ' ' || char(9)) = OLD.name;
 END;

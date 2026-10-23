@@ -37,6 +37,8 @@ struct db_conn {
     sqlite3_stmt *st_zones, *st_rec_all, *st_rec_one, *st_rec_rng, *st_meta_all, *st_meta_one, *st_keys, *st_changes;
     sqlite3_stmt *st_dv_all, *st_dv_one;
     bool has_domain_views;
+    sqlite3_stmt *st_prof;
+    bool has_profiles;
 };
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -177,6 +179,7 @@ static void sq_close(db_conn_t *c) {
     sqlite3_finalize(c->st_rec_rng);
     sqlite3_finalize(c->st_dv_all);
     sqlite3_finalize(c->st_dv_one);
+    sqlite3_finalize(c->st_prof);
     sqlite3_finalize(c->st_meta_all);
     sqlite3_finalize(c->st_meta_one);
     sqlite3_finalize(c->st_keys);
@@ -250,6 +253,11 @@ static int sq_check_schema(db_conn_t *c, db_schema_info_t *out) {
     if (rc != 0) return rc;
     c->has_domain_views = rows > 0 && found == 3u;
     if (out) out->has_domain_views = c->has_domain_views;
+    static const char *const pr_cols[] = { "name", "settings", NULL };
+    rc = table_columns(c, "karidns_profiles", pr_cols, &found, &rows);
+    if (rc != 0) return rc;
+    c->has_profiles = rows > 0 && found == 3u;
+    if (out) out->has_profiles = c->has_profiles;
     return 0;
 }
 
@@ -285,7 +293,7 @@ static int sq_begin_snapshot(db_conn_t *c) {
 static int sq_end_snapshot(db_conn_t *c) {
     if (!c->in_snapshot) return 0;
     sqlite3_stmt *all[] = { c->st_zones, c->st_rec_all, c->st_rec_one, c->st_rec_rng, c->st_meta_all, c->st_meta_one,
-                            c->st_keys, c->st_changes, c->st_dv_all, c->st_dv_one };
+                            c->st_keys, c->st_changes, c->st_dv_all, c->st_dv_one, c->st_prof };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
         if (all[i]) rearm(all[i]);
     c->in_snapshot = false;
@@ -435,6 +443,40 @@ static int sq_scan_domain_views(db_conn_t *c, const int64_t *domain_id, db_domai
     return ret;
 }
 
+static int sq_scan_profiles(db_conn_t *c, db_profile_cb cb, void *ud) {
+    if (!c->has_profiles) {
+        set_err(c, "karidns_profiles does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    int ret = prep(c, &c->st_prof, "SELECT name, settings FROM karidns_profiles ORDER BY name");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = c->st_prof;
+    rearm(st);
+    for (;;) {
+        int rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE) break;
+        if (rc != SQLITE_ROW) {
+            ret = sql_fail(c, rc, "scan_profiles");
+            break;
+        }
+        bool bad = false;
+        db_profile_row_t p;
+        p.name = col_text(c, st, 0, "karidns_profiles", 0, "name", &bad);
+        p.settings = col_text(c, st, 1, "karidns_profiles", 0, "settings", &bad);
+        if (bad) {
+            ret = -1;
+            break;
+        }
+        if (!p.name) continue;                  /* the primary key is NOT NULL in practice; a NULL name names no profile */
+        if (cb(ud, &p) != 0) {
+            ret = DB_STOPPED;
+            break;
+        }
+    }
+    rearm(st);
+    return ret;
+}
+
 static int sq_scan_metadata(db_conn_t *c, const int64_t *domain_id, db_meta_cb cb, void *ud) {
     sqlite3_stmt **slot = domain_id ? &c->st_meta_one : &c->st_meta_all;
     int ret = prep(c, slot, domain_id ? "SELECT domain_id, kind, content, id FROM domainmetadata WHERE domain_id = ?1 ORDER BY id"
@@ -567,7 +609,7 @@ const db_driver_t db_driver_sqlite3 = {
     "sqlite3",       sq_open,         sq_close,           sq_errmsg,           sq_check_schema,
     sq_begin_snapshot, sq_end_snapshot, sq_list_zones,    sq_scan_records,     sq_scan_metadata,
     sq_zones_with_keys, sq_changes_since, sq_wait_fd,     sq_drain_notifications, sq_report_status,
-    sq_changes_max,   sq_scan_records_range, sq_scan_domain_views,
+    sq_changes_max,   sq_scan_records_range, sq_scan_domain_views, sq_scan_profiles,
 };
 
 #endif /* KARIDNS_DB_SQLITE3 */

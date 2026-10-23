@@ -910,14 +910,14 @@ static bool build_settings(pdns_zone_t *z) {
             sb_add(&sb, tmp);
         }
         if (have_axfr) {
-            if (axfr_from.n && axfr_keys.n)
-                zwarn(z, false, 0, "ALLOW-AXFR-FROM and TSIG-ALLOW-AXFR are both set: PowerDNS accepts either, "
-                                   "allow-transfer requires both an address and a key");
             sb_add(&sb, "allow-transfer {");
             if (!axfr_from.n && !axfr_keys.n) sb_add(&sb, " none;");
             for (size_t i = 0; i < axfr_from.n; i++) { sb_add(&sb, " "); sb_add(&sb, axfr_from.v[i]); sb_add(&sb, ";"); }
             for (size_t i = 0; i < axfr_keys.n; i++) { sb_add(&sb, " key \""); sb_add(&sb, axfr_keys.v[i]); sb_add(&sb, "\";"); }
             sb_add(&sb, " }; ");
+            /* D14 (B7a): PowerDNS allows an AXFR when ALLOW-AXFR-FROM matches or the request is signed with a
+             * TSIG-ALLOW-AXFR key; karidns.conf's allow-transfer would need both.  transfer-acl-match says "either". */
+            if (axfr_from.n && axfr_keys.n) sb_add(&sb, "transfer-acl-match any; ");
         }
         if (have_notify && notify.n) {
             sb_add(&sb, "also-notify {");
@@ -926,18 +926,15 @@ static bool build_settings(pdns_zone_t *z) {
         }
         if (have_upd) {
             sb_add(&sb, "allow-update {");
-            if (upd_from.n && upd_keys.n) {
-                /* PowerDNS needs the address AND the key; allow-update accepts either.  Not expressible: closed. */
-                zwarn(z, false, 0, "ALLOW-DNSUPDATE-FROM and TSIG-ALLOW-DNSUPDATE are both set: PowerDNS requires both, "
-                                   "allow-update accepts either; dynamic update is disabled for this zone");
-                sb_add(&sb, " none;");
-            } else if (!upd_from.n && !upd_keys.n) {
+            if (!upd_from.n && !upd_keys.n) {
                 sb_add(&sb, " none;");
             } else {
                 for (size_t i = 0; i < upd_from.n; i++) { sb_add(&sb, " "); sb_add(&sb, upd_from.v[i]); sb_add(&sb, ";"); }
                 for (size_t i = 0; i < upd_keys.n; i++) { sb_add(&sb, " key \""); sb_add(&sb, upd_keys.v[i]); sb_add(&sb, "\";"); }
             }
             sb_add(&sb, " }; ");
+            /* D14 (B7a): PowerDNS needs the address AND the TSIG key for an update; allow-update alone would take either */
+            if (upd_from.n && upd_keys.n) sb_add(&sb, "update-acl-match all; ");
         }
         for (size_t oi = 0; oi < N_OPTIONS; oi++) {
             if (!opt_val[oi][0]) continue;
@@ -1371,7 +1368,23 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
         snprintf(err, errlen, "zone '%s': out of memory", z->name);
         return -1;
     }
+    const char *profile = p->profile ? p->profile : z->profile;
     int rc = gen_bodies(z, digest_sink, &dd, err, errlen);
+    /* B7a: a metadata-only edit (the settings text, the profile that is named, the text of that profile) must change the
+     * digest, or the diff would find the zone up to date.  Zones without settings and profile keep the digest of the data
+     * alone.  Every field is length-prefixed, so two different splits cannot give the same input. */
+    if (rc == 0 && ((z->settings && *z->settings) || (profile && *profile))) {
+        const char *parts[3] = { z->settings ? z->settings : "", profile ? profile : "", p->profile_text ? p->profile_text : "" };
+        static const uint8_t tag[] = "KDB1-SETTINGS";
+        if (EVP_DigestUpdate(dd.md, tag, sizeof(tag)) != 1) rc = -1;
+        for (int k = 0; rc == 0 && k < 3; k++) {
+            uint64_t n = strlen(parts[k]);
+            uint8_t lb[8];
+            for (int b = 0; b < 8; b++) lb[b] = (uint8_t)(n >> (56 - 8 * b));
+            if (EVP_DigestUpdate(dd.md, lb, 8) != 1 || EVP_DigestUpdate(dd.md, parts[k], (size_t)n) != 1) rc = -1;
+        }
+        if (rc != 0) snprintf(err, errlen, "zone '%s': digest failed", z->name);
+    }
     if (rc == 0 && (EVP_DigestFinal_ex(dd.md, digest, &dlen) != 1 || dlen != KDB_DIGEST_LEN)) {
         snprintf(err, errlen, "zone '%s': digest failed", z->name);
         rc = -1;
@@ -1384,7 +1397,6 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
     kdb_enc_t enc;
     kdb_enc_init(&enc);
     emit_ud_t eu = { &enc, emit, ud };
-    const char *profile = p->profile ? p->profile : z->profile;
     rc = -1;
     if (kdb_enc_begin(&enc, KDB_T_ZONE_BEGIN) != 0 ||
         kdb_enc_u16(&enc, 1, p->view) != 0 || kdb_enc_name(&enc, 2, z->name) != 0 ||

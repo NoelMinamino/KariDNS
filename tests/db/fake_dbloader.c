@@ -33,6 +33,15 @@
  *   zero-ancount     a ZONE_DATA message with ANCOUNT 0                                 -> protocol error
  *   opt-twice        ARCOUNT 1 in the second ZONE_DATA of a zone                        -> protocol error
  *   unknown-tag      ZONE_BEGIN with an unknown TLV tag                                 -> protocol error
+ * Modes of the settings part (B7a):
+ *   settings-key     settings text naming a TSIG key karidns.conf does not define          -> zone rejected
+ *   settings-include settings text with an include statement                               -> zone rejected
+ *   settings-file    settings text with a file statement                                   -> zone rejected
+ *   settings-slave   settings text with type / masters statements                          -> zone rejected
+ *   settings-brace   settings text with a stray closing brace                              -> zone rejected
+ *   profile-missing  ZONE_BEGIN names a profile that was not sent                          -> zone rejected
+ *   profile-flood    270 PROFILE messages of 64000 bytes (more than the Backend keeps)    -> protocol error
+ *   settings-ok      settings text and a profile the Backend accepts                       -> both applied
  * Then it waits until the Backend closes the stream and exits 0.  Hand-made bytes, no library: the encoder of
  * dns_db_stream.c would only make correct messages.
  */
@@ -158,8 +167,9 @@ static void batch_end(int fd, uint32_t deleted) {
     send_msg(fd, "KDB1", 11, b, n);
 }
 
-static void zone_begin(int fd, const char *zone, uint8_t kind, uint32_t flags, uint64_t declared, uint16_t extra_tag) {
-    uint8_t b[512], view[2] = { 0, 0 }, serial[4], fl[4], rrs[8], digest[32] = { 0 }, src[8] = { 0 };
+static void zone_begin_ex(int fd, const char *zone, uint8_t kind, uint32_t flags, uint64_t declared, uint16_t extra_tag,
+                          const char *settings, const char *profile) {
+    uint8_t b[1024], view[2] = { 0, 0 }, serial[4], fl[4], rrs[8], digest[32] = { 0 }, src[8] = { 0 };
     char canon[300];
     snprintf(canon, sizeof(canon), "%s.", zone);
     put32(serial, 1);
@@ -175,8 +185,14 @@ static void zone_begin(int fd, const char *zone, uint8_t kind, uint32_t flags, u
     n += tlv(b + n, 6, fl, 4);
     n += tlv(b + n, 7, rrs, 8);
     n += tlv(b + n, 8, digest, 32);
+    if (settings) n += tlv(b + n, 9, settings, (uint16_t)strlen(settings));
+    if (profile) n += tlv(b + n, 10, profile, (uint16_t)strlen(profile));
     if (extra_tag) n += tlv(b + n, extra_tag, "x", 1);
     send_msg(fd, "KDB1", 4, b, n);
+}
+
+static void zone_begin(int fd, const char *zone, uint8_t kind, uint32_t flags, uint64_t declared, uint16_t extra_tag) {
+    zone_begin_ex(fd, zone, kind, flags, declared, extra_tag, NULL, NULL);
 }
 
 static void zone_data(int fd, const dm_t *m) { send_msg(fd, "KDB1", 5, m->b, m->n); }
@@ -276,6 +292,39 @@ static void bad_zone(int fd, const char *mode) {
     } else if (strcmp(mode, "unknown-tag") == 0) {
         dm_soa(&m, z, 5); dm_soa(&m, z, 5);
         zone_begin(fd, z, 0, 0, 2, 99);
+    } else if (strcmp(mode, "settings-key") == 0 || strcmp(mode, "settings-include") == 0 || strcmp(mode, "settings-file") == 0 ||
+               strcmp(mode, "settings-slave") == 0 || strcmp(mode, "settings-brace") == 0 || strcmp(mode, "profile-missing") == 0 ||
+               strcmp(mode, "settings-ok") == 0) {
+        const char *st = NULL, *pr = NULL;
+        if (strcmp(mode, "settings-key") == 0) st = "allow-transfer { 127.0.0.1; key \"ghost\"; };";
+        else if (strcmp(mode, "settings-include") == 0) st = "include \"/etc/passwd\"; allow-transfer { any; };";
+        else if (strcmp(mode, "settings-file") == 0) st = "ixfr-history 2; file \"/etc/passwd\";";
+        else if (strcmp(mode, "settings-slave") == 0) st = "type slave; masters { 192.0.2.1; };";
+        else if (strcmp(mode, "settings-brace") == 0) st = "allow-transfer { 127.0.0.1; }; };";
+        else if (strcmp(mode, "profile-missing") == 0) pr = "p1";
+        else st = "allow-transfer { 127.0.0.1; }; ixfr-history 3;";
+        dm_soa(&m, z, 5); dm_a(&m, "www.bad.test", 1); dm_soa(&m, z, 5);
+        if (strcmp(mode, "settings-ok") == 0) {                   /* a profile first, then a zone that uses it and has own text */
+            uint8_t pb[256];
+            size_t pn = 0;
+            pn += tlv(pb + pn, 1, "p1", 2);
+            pn += tlv(pb + pn, 2, "notify-retries 2;", 17);
+            send_msg(fd, "KDB1", 10, pb, pn);
+            pr = "p1";
+        }
+        zone_begin_ex(fd, z, 0, 0, 3, 0, st, pr); zone_data(fd, &m); zone_end(fd, 3);
+    } else if (strcmp(mode, "profile-flood") == 0) {
+        static uint8_t pb[64100];
+        static char text[64001];
+        memset(text, '#', 64000);
+        for (int i = 0; i < 270; i++) {
+            char name[16];
+            size_t pn = 0;
+            snprintf(name, sizeof(name), "p%d", i);
+            pn += tlv(pb + pn, 1, name, (uint16_t)strlen(name));
+            pn += tlv(pb + pn, 2, text, 64000);
+            send_msg(fd, "KDB1", 10, pb, pn);
+        }
     } else if (strcmp(mode, "delete-unknown") == 0) {
         uint8_t b[128], view[2] = { 0, 0 }, src[8] = { 0 };
         size_t n = 0;

@@ -69,6 +69,8 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
 - `type program` zones: `program` must be set and be an absolute path, and `program-args` may have at most 62 entries (errors); a `program` that is not executable and a `program-user` that differs from `options { user }` give warnings. `allow-program-zones yes;` is required when any program zone exists.
 - `type forward` zones must have `forwarders`; a forwarder equal to one of the server's own `bind-address` / `port` pairs gives a self-loop warning.
 - Every CIDR in `ecs-tags` and `location-tags` (in `options` and in zones) must be valid; `ecs-tags` without `ecs-enable yes;` gives a warning.
+- `transfer-acl-match` and `update-acl-match` take `any` or `all` (anything else is an error). A warning says when an option has nothing to choose between: without `allow-transfer` / `allow-update`, or with an ACL that lists only addresses or only keys (see karidns(8) "Settings of database zones").
+- `options { database { ... }; }` (no database connection is opened): the driver is built into `karidns-dbloader` (`--drivers`); `loader-user` / `loader-group` exist; `loader-path` is a regular executable owned by root and not writable by group or others; a SQLite3 file exists, is a database in WAL mode and is not readable by everyone; a PostgreSQL `conninfo-file` has mode 0600 or 0400, belongs to the loader user and names a UNIX socket or `sslmode=verify-full` (warning otherwise); `acl-ceiling` entries are valid and its keys are defined. A database block **without `acl-ceiling`** gives a warning: the ACLs a database zone carries (transfers, dynamic updates) refuse every client until a ceiling is set.
 
 ### Zone checks
 

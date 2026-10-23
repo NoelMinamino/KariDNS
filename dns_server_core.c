@@ -2331,7 +2331,7 @@ process_tcp_client: ;
            * (AXFR/IXFR 用)、それ以外は QNAME を含む最も近いゾーンを引き直す。
            * どのゾーンにも指定がなければ検索自体を省く。AXFR ワーカーへ渡す前に
            * 適用しておくことで、転送スレッドもこの値で送信する。 */
-          if (cfg && cfg->any_zone_tcp_opts) {
+          if (cfg && (cfg->any_zone_tcp_opts || atomic_load_explicit(&g_db_zone_tcp_opts, memory_order_relaxed))) {
             const zone_config_t *tcp_zcfg = zcfg;
             if (!tcp_zcfg && xfr_view) {
               zone_db_entry_t *tcp_entry = find_zone_in_view(xfr_view, qname);
@@ -2354,30 +2354,9 @@ process_tcp_client: ;
                            edns_version_unsupported(&edns);
             bool allowed = false;
             if (zcfg && !badvers && tsig.status != TSIG_REQ_ERROR && tsig.status != TSIG_REQ_FORMERR) {
-              bool has_acl = (zext(zcfg)->allow_transfer_count > 0);
-              bool has_keys = (zext(zcfg)->tsig_keys_count > 0) || (zext(zcfg)->tsig_key != NULL);
-              bool acl_ok = false;
-              if (has_acl) {
-                if (zext(zcfg)->allow_transfer_parsed) {
-                  acl_ok = check_acl_bin(ctx_tcp->client_ip, zext(zcfg)->allow_transfer_parsed, zext(zcfg)->allow_transfer_count);
-                } else {
-                  acl_ok = check_acl(ctx_tcp->client_ip, zext(zcfg)->allow_transfer, zext(zcfg)->allow_transfer_count);
-                }
-              }
-              /* allow-transfer { key "A"; ... } の鍵か、ゾーンの tsig-key で署名されていること (D-03: 名前は DNS 名として比較) */
-              bool key_ok = false;
-              for (int ki = 0; matched_key && ki < zext(zcfg)->tsig_keys_count && !key_ok; ki++)
-                key_ok = tsig_key_names_equal(matched_key->name, zext(zcfg)->tsig_keys[ki]);
-              if (matched_key && !key_ok && zext(zcfg)->tsig_key)
-                key_ok = tsig_key_names_equal(matched_key->name, zext(zcfg)->tsig_key);
-              /* アドレスと鍵の両方があれば両方を満たすこと (docs/karidns.md allow-transfer) */
-              if (has_acl && has_keys) {
-                  allowed = (acl_ok && key_ok);
-              } else if (has_acl) {
-                  allowed = acl_ok;
-              } else if (has_keys) {
-                  allowed = key_ok;
-              }
+              /* allow-transfer のアドレスと鍵 (鍵名は DNS 名として比較 D-03)、zone の tsig-key、transfer-acl-match、
+               * DB ゾーンの acl-ceiling は zone_transfer_acl_allows() が見る (dns_tsig_acl.c) */
+              allowed = zone_transfer_acl_allows(cfg, zcfg, ctx_tcp->client_ip, matched_key ? matched_key->name : NULL);
             }
             uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
             static_assert(sizeof(tsig_mac) >= sizeof(tsig.mac), "tsig_mac must hold the request MAC");
@@ -3636,6 +3615,10 @@ void *control_thread_func(void *arg) {
         server_config_t *active = acquire_config_snapshot();
         zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
         if (snap) {
+            /* B7a: the settings block of a DB zone (entry->dbcfg) is replaced when the zone's metadata change and freed after a
+             * grace period, so zone_entry_config() below must be read inside a read section (the blocks of file zones belong
+             * to the configuration snapshot held in `active`) */
+            rcu_aux_read_lock();
             for (size_t v = 0; v < snap->view_count; v++) {
                 for (size_t i = 0; i < snap->views[v].zone_count; i++) {
                     zone_db_entry_t *entry = snap->views[v].entries[i];
@@ -3749,6 +3732,7 @@ void *control_thread_func(void *arg) {
                     }
                 }
             }
+            rcu_aux_read_unlock();
             release_zone_snapshot(snap);
         }
         release_config_snapshot(active);

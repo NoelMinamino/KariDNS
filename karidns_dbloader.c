@@ -186,6 +186,13 @@ typedef struct {
     uint32_t n_deleted;               /* ZONE_DELETE messages */
     uint32_t n_read;                  /* zones read and converted */
     char errtext[240];                /* the last database error (printable), for the ZONE_FAILED of a one-zone request */
+    /* B7a: karidns_profiles of the source being read (loaded before the conversion threads start, read only while they
+     * run) and the profiles already sent in the open batch (a PROFILE goes out once per batch and text) */
+    struct lprof { char *name; char *text; const char *bad; } *profs;
+    size_t nprofs, cprofs;
+    bool prof_oom;
+    struct psent { char name[256]; uint64_t hash; size_t len; } *psent;
+    size_t npsent, cpsent;
 } ctx_t;
 
 static int stream_write(ctx_t *x, const uint8_t *msg, size_t len);
@@ -552,11 +559,13 @@ typedef struct {
     bool oom;
     uint32_t serial;                  /* ZR_SENT */
     uint8_t digest[KDB_DIGEST_LEN];
+    char profile[256];                /* ZR_SENT: the profile the zone names ("" = none): commit_zone() sends its PROFILE first */
     char *reason;                     /* ZR_FAILED */
 } zres_t;
 
 static void zres_reset(zres_t *r) {
     r->kind = 0;
+    r->profile[0] = '\0';
     r->len = 0;
     r->oom = false;
     free(r->reason);
@@ -627,6 +636,95 @@ static void open_current(wk_t *w, const zinfo_t *zi) {
     if (zi->name && !zone_type_reason(zi->type) && !w->cur) w->oom = true;
 }
 
+/* ---- karidns_profiles (B7a, design 3.7, 1.4) ----
+ * The loader does not interpret a profile: it checks that the text can travel (a PROFILE settings value is printable ASCII,
+ * TAB and LF, at most 65,535 bytes) and sends it before the first zone of the batch that names it.  The Backend merges it
+ * with the zone's own settings (the zone's statements replace the profile's) and parses the result in restricted mode. */
+static int prof_cb(void *ud, const db_profile_row_t *r) {
+    ctx_t *x = ud;
+    if (x->nprofs >= x->cprofs) {
+        size_t nc = x->cprofs ? x->cprofs * 2 : 16;
+        struct lprof *np = realloc(x->profs, nc * sizeof(*np));
+        if (!np) return x->prof_oom = true;
+        x->profs = np;
+        x->cprofs = nc;
+    }
+    struct lprof *p = &x->profs[x->nprofs];
+    p->name = strdup(r->name);
+    p->text = strdup(r->settings ? r->settings : "");
+    p->bad = NULL;
+    if (!p->name || !p->text) {
+        free(p->name);
+        free(p->text);
+        return x->prof_oom = true;
+    }
+    size_t n = strlen(p->text);
+    if (n > PDNS_MAX_SETTINGS) {
+        p->bad = "its settings text is longer than 65535 bytes";
+    } else {
+        for (size_t i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)p->text[i];
+            if ((c < 0x20 || c > 0x7E) && c != '\t' && c != '\n') {
+                p->bad = "its settings text has a character other than printable ASCII, TAB and LF";
+                break;
+            }
+        }
+    }
+    x->nprofs++;
+    return 0;
+}
+
+static const struct lprof *lprof_find(const ctx_t *x, const char *name) {
+    for (size_t i = 0; i < x->nprofs; i++)
+        if (strcmp(x->profs[i].name, name) == 0) return &x->profs[i];
+    return NULL;
+}
+
+static uint64_t text_hash(const char *s, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; i++) {
+        h ^= (uint8_t)s[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/* the PROFILE message of a zone about to be sent, unless the batch carried this name with this text already.  The Backend
+ * keeps the latest text of a name, so two views that read different databases and use the same profile name each get
+ * their own text in front of their zones.  0, or -1 (output error, memory). */
+static int send_profile_for(ctx_t *x, const char *name) {
+    const struct lprof *pf = lprof_find(x, name);
+    if (!pf) return 0;
+    size_t len = strlen(pf->text);
+    uint64_t h = text_hash(pf->text, len);
+    for (size_t i = 0; i < x->npsent; i++)
+        if (strcmp(x->psent[i].name, name) == 0) {
+            if (x->psent[i].hash == h && x->psent[i].len == len) return 0;
+            x->psent[i].hash = h;
+            x->psent[i].len = len;
+            goto send;
+        }
+    if (x->npsent >= x->cpsent) {
+        size_t nc = x->cpsent ? x->cpsent * 2 : 16;
+        struct psent *np = realloc(x->psent, nc * sizeof(*np));
+        if (!np) {
+            x->oom = true;
+            return -1;
+        }
+        x->psent = np;
+        x->cpsent = nc;
+    }
+    snprintf(x->psent[x->npsent].name, sizeof(x->psent[0].name), "%s", name);
+    x->psent[x->npsent].hash = h;
+    x->psent[x->npsent].len = len;
+    x->npsent++;
+send:
+    if (kdb_enc_begin(&x->enc, KDB_T_PROFILE) != 0 || kdb_enc_str(&x->enc, 1, name) != 0 ||
+        kdb_enc_str(&x->enc, 2, pf->text) != 0 || kdb_enc_end(&x->enc) != 0)
+        return -1;
+    return send_enc(x);
+}
+
 /* the digest gate of pdns_zone_encode_kdb(): a zone whose converted stream has the digest the Backend already holds
  * (same source id, no pending rejection; copied into the zinfo by plan_diff) is not sent unless the request says force */
 typedef struct { const ctx_t *x; const zinfo_t *zi; uint8_t digest[KDB_DIGEST_LEN]; } gate_t;
@@ -680,6 +778,19 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
         }
         for (size_t i = 0; i < z->n_warnings; i++)
             lg(LOG_WARNING, "warning: %s", z->warnings[i]);
+        /* B7a: the profile a zone names must be in karidns_profiles and fit the stream (design 3.7, 1.4) */
+        const struct lprof *pf = NULL;
+        char pwhy[200];
+        if (!why && z->profile[0]) {
+            pf = lprof_find(x, z->profile);
+            if (!pf) {
+                snprintf(pwhy, sizeof(pwhy), "the profile '%.64s' (X-KARIDNS-PROFILE) is not defined in karidns_profiles", z->profile);
+                why = pwhy;
+            } else if (pf->bad) {
+                snprintf(pwhy, sizeof(pwhy), "the profile '%.64s' cannot be used: %s", z->profile, pf->bad);
+                why = pwhy;
+            }
+        }
         if (why) {
             zres_fail(r, why);
         } else {
@@ -687,12 +798,13 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
             memset(&g, 0, sizeof(g));
             g.x = x;
             g.zi = zi;
-            pdns_kdb_params_t p = { x->view, zi->id, KDB_ZK_PRIMARY, NULL, gate_cb, &g };
+            pdns_kdb_params_t p = { x->view, zi->id, KDB_ZK_PRIMARY, NULL, gate_cb, &g, pf ? pf->text : NULL };
             char msg[PDNS_ERR_LEN + 100];
             int er = pdns_zone_encode_kdb(z, &p, zres_emit, r, msg, sizeof(msg));
             if (er == 0) {
                 r->kind = ZR_SENT;
                 r->serial = z->serial;
+                snprintf(r->profile, sizeof(r->profile), "%s", z->profile);
                 memcpy(r->digest, g.digest, KDB_DIGEST_LEN);
             } else if (er == 1) {
                 r->kind = ZR_UNCHANGED;     /* converted, but the Backend has exactly this version */
@@ -729,6 +841,7 @@ static int commit_zone(ctx_t *x, const zinfo_t *zi, zres_t *r) {
     case ZR_FAILED:
         return send_failed(x, zi, r->reason);
     default:                                   /* ZR_SENT */
+        if (r->profile[0] && send_profile_for(x, r->profile) != 0) return -1;   /* B7a: the profile text comes first */
         if (emit_file(x, r->buf, r->len) != 0) return -1;
         x->n_zones++;
         if (x->io) {                           /* sent: what the Backend will have once it says "applied" */
@@ -1072,10 +1185,12 @@ static int send_simple_header(ctx_t *x) {
     if (x->io) {
         if (x->batch_open) return 0;
         x->batch_open = true;
+        x->npsent = 0;                         /* the Backend forgets the profiles at BATCH_BEGIN */
         return send_batch_begin(x, x->batch_id, x->batch_kind, x->change_seq);
     }
     if (x->batch_open) return 0;
     x->batch_open = true;
+    x->npsent = 0;
     if (send_hello(x, x->drv->name, 0) != 0) return -1;
     return send_batch_begin(x, 1, KDB_BATCH_STARTUP, 0);
 }
@@ -1129,6 +1244,14 @@ static void ctx_view_reset(ctx_t *x) {
     free(x->wl);
     x->wl = NULL;
     x->nwl = 0;
+    for (size_t i = 0; i < x->nprofs; i++) {
+        free(x->profs[i].name);
+        free(x->profs[i].text);
+    }
+    free(x->profs);
+    x->profs = NULL;
+    x->nprofs = x->cprofs = 0;
+    x->prof_oom = false;
 }
 
 /* a zone the Backend has and the database no longer lists */
@@ -1430,6 +1553,14 @@ static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, boo
             goto out_snap;
         }
         qsort(x->keys, x->nk, sizeof(int64_t), cmp_i64);
+        if (n_want > 0 && si.has_profiles && x->drv->scan_profiles) {                  /* B7a: the profiles, in this snapshot, before any zone is converted */
+            rc = x->drv->scan_profiles(x->conn, prof_cb, x);
+            if (rc != 0) {
+                status = x->prof_oom ? EXIT_ERROR : db_err(x, rc, "reading karidns_profiles");
+                if (x->prof_oom) lg(LOG_ERR, "out of memory");
+                goto out_snap;
+            }
+        }
         if (bulk && n_want > 0) {
             if ((rc = x->drv->scan_metadata(x->conn, NULL, meta_cb, &x->meta)) != 0) {
                 status = x->meta.oom ? EXIT_ERROR : db_err(x, rc, "reading metadata");

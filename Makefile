@@ -124,7 +124,7 @@ FUZZ_DAG_REPLAY_DIFF_SRCS = tests/fuzz/fuzz_dag_replay_diff.c tools/dag_replay.c
 FUZZ_DAG_TCP_REASSEMBLY_TARGET = tests/fuzz/fuzz_dag_tcp_reassembly
 FUZZ_DAG_TCP_REASSEMBLY_SRCS = tests/fuzz/fuzz_dag_tcp_reassembly.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_replay.c tools/dag_http.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
-.PHONY: all clean run fuzz zone2kdb karidns-dbloader dbloader-check-drivers db_sqlite3_test fuzz_core fuzz_query_engine fuzz_zone_image fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_pdns_content fuzz_pdns_metadata fuzz_nsec3_rebuild clean-fuzz asan tsan fuzz_tsig fuzz_dag fuzz_tsig_verify dag tools response_cache_test \
+.PHONY: all clean run fuzz zone2kdb karidns-dbloader karidns-dbloader-tsan dbloader-check-drivers db_sqlite3_test fuzz_core fuzz_query_engine fuzz_zone_image fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_pdns_content fuzz_pdns_metadata fuzz_nsec3_rebuild clean-fuzz asan tsan fuzz_tsig fuzz_dag fuzz_tsig_verify dag tools response_cache_test \
 	fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file \
 	fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly \
 	fuzz_dag_all fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_all fuzz_test \
@@ -362,6 +362,8 @@ zone2kdb: $(ZONE2KDB_SRCS)
 # DB_DRIVERS: any subset of "sqlite3 postgresql" (the packages of design 1.6 differ only in this binary).  Each driver
 # is compiled only when listed (-DKARIDNS_DB_SQLITE3 / -DKARIDNS_DB_POSTGRESQL) and links its library:
 #   make karidns-dbloader DB_DRIVERS="sqlite3"
+#   make karidns-dbloader-tsan                      the same loader under ThreadSanitizer (loader-threads > 1; the TSan runs of the DB
+#                                                   tests use it with `loader-path` and KARIDNS=./karidns-tsan)
 # The default for development builds is sqlite3.  FreeBSD: databases/sqlite3 (/usr/local/include, /usr/local/lib, already
 # in CFLAGS / LDFLAGS); Debian / Ubuntu: libsqlite3-dev.  postgresql is not implemented yet (milestone B10).
 # The server and the tools never link a database library.
@@ -385,6 +387,10 @@ dbloader-check-drivers:
 
 karidns-dbloader: dbloader-check-drivers $(DBLOADER_SRCS)
 	$(CC) $(CFLAGS) $(DBLOADER_DRV_CFLAGS) -I. $(DBLOADER_SRCS) -o $(DBLOADER_TARGET) $(LDFLAGS) -pthread -lcrypto $(DBLOADER_DRV_LIBS)
+
+# B7a (carried over from B6b): the loader under ThreadSanitizer, same flags as karidns-tsan
+karidns-dbloader-tsan: dbloader-check-drivers $(DBLOADER_SRCS)
+	$(CC) $(TSAN_CFLAGS) $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(DBLOADER_DRV_CFLAGS) -I. $(DBLOADER_SRCS) -o karidns-dbloader-tsan $(LDFLAGS) $(TSAN_LDFLAGS) -pthread -lcrypto $(DBLOADER_DRV_LIBS)
 
 TEST_DB_SQLITE3_SRCS = tests/test_db_sqlite3.c dns_db_sqlite3.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c
 
@@ -1073,7 +1079,7 @@ bench_rrl: tests/bench_rrl.c dns_rrl.o dns_config_parser.o dns_zone_parser.o dns
 
 clean: clean-fuzz coverage-clean
 	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck bench_serialize bench_rrl $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
-	rm -f karidns-asan karidns-tsan test_epoch_rcu-tsan *.asan.o *.tsan.o test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_stream test_pdns_reader test_presigned test_db_sqlite3 test_db_registry karidns-dbloader tests/db/zone2sql tests/db/zone2kdb
+	rm -f karidns-asan karidns-tsan test_epoch_rcu-tsan *.asan.o *.tsan.o test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_stream test_pdns_reader test_presigned test_db_sqlite3 test_db_registry karidns-dbloader karidns-dbloader-tsan tests/db/zone2sql tests/db/zone2kdb
 	rm -f $(UT_ASAN_BINS)
 	rm -f *.uta.o *.utn.o tests/*.uta.o tests/*.utn.o tools/*.uta.o tools/*.utn.o
 	rm -f tests/fi/kari_fi_preload.so

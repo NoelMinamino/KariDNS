@@ -14,6 +14,7 @@
 #include <sys/types.h>
 
 #include "../../dns_pdns_reader.h"
+#include "../../dns_tsig_acl.h"
 #include "../db/pdns_confcheck.h"
 
 void syslog(int priority, const char *format, ...) {
@@ -29,6 +30,61 @@ int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) 
 
 #define MAX_ROWS 128
 
+/* B7a: the Backend side.  The text goes through the restricted parse (db_settings_parse); what it accepts is evaluated
+ * against a configuration with an acl-ceiling of 192.0.2.0/24 and the key "k", and no client outside that ceiling may be
+ * allowed whatever the text says (design 1.3: a hostile loader cannot widen ACLs beyond acl-ceiling). */
+static bool in_ceiling(const char *ip, const char *key) {
+    return strncmp(ip, "192.0.2.", 8) == 0 || (key && (strcmp(key, "k") == 0 || strcmp(key, "K.") == 0));
+}
+
+static void check_restricted(const char *s, size_t len, bool must_accept) {
+    static char kname[] = "k";
+    static char *ceil_list[1] = { (char *)"192.0.2.0/24" };
+    static char *ceil_keys[1] = { kname };
+    static tsig_key_t key = { kname, (char *)"hmac-sha256", NULL, { 0 }, 0, 0, NULL };
+    static server_config_t cfg;
+    if (!cfg.database.enabled) {
+        cfg.database.enabled = true;
+        cfg.database.acl_ceiling = ceil_list;
+        cfg.database.acl_ceiling_count = 1;
+        cfg.database.acl_ceiling_parsed = acl_list_parse(ceil_list, 1);
+        cfg.database.acl_ceiling_keys = ceil_keys;
+        cfg.database.acl_ceiling_keys_count = 1;
+        cfg.keys = &key;
+    }
+    char err[200];
+    zone_ext_shared_t *sh = db_settings_parse(s, len, err, sizeof(err));
+    if (!sh) {
+        if (must_accept) __builtin_trap();        /* the reader wrote it: the Backend must accept it */
+        if (!err[0]) __builtin_trap();            /* a refusal says why */
+        return;
+    }
+    zone_config_t zc;
+    memset(&zc, 0, sizeof(zc));
+    zc.domain = (char *)"z.test.";
+    zc.type = (char *)"master";
+    zc.ext = &sh->ext;
+    zc.ext_shared = true;                         /* (not freed through free_zone_config: the object is unref'd below) */
+    if (!sh->ext.db_acl_ceiling) __builtin_trap();
+    static const char *const ips[] = { "192.0.2.5", "198.51.100.9", "2001:db8::1", "10.0.0.1", "192.0.2.255" };
+    static const char *const keys[] = { NULL, "k", "x", "K." };
+    for (size_t i = 0; i < sizeof(ips) / sizeof(ips[0]); i++)
+        for (size_t j = 0; j < sizeof(keys) / sizeof(keys[0]); j++)
+            if (!in_ceiling(ips[i], keys[j]) &&
+                (zone_transfer_acl_allows(&cfg, &zc, ips[i], keys[j]) || zone_update_acl_allows(&cfg, &zc, ips[i], keys[j])))
+                __builtin_trap();
+    cfg.database.acl_ceiling_count = 0;           /* no ceiling: nobody */
+    cfg.database.acl_ceiling_keys_count = 0;
+    for (size_t i = 0; i < sizeof(ips) / sizeof(ips[0]); i++)
+        for (size_t j = 0; j < sizeof(keys) / sizeof(keys[0]); j++)
+            if (zone_transfer_acl_allows(&cfg, &zc, ips[i], keys[j]) || zone_update_acl_allows(&cfg, &zc, ips[i], keys[j]))
+                __builtin_trap();
+    cfg.database.acl_ceiling_count = 1;
+    cfg.database.acl_ceiling_keys_count = 1;
+    (void)db_settings_missing_key(&sh->ext, &cfg);
+    zone_ext_shared_unref(sh);
+}
+
 static bool has_word(const char *text, const char *w) {
     size_t wl = strlen(w);
     for (const char *p = text; (p = strstr(p, w)) != NULL; p += wl) {
@@ -42,9 +98,18 @@ static bool has_word(const char *text, const char *w) {
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size < 1 || size > (1u << 16)) return 0;
     char *buf = malloc(size + 1);
-    if (!buf) return 0;
+    char *raw = malloc(size + 1);
+    if (!buf || !raw) {
+        free(buf);
+        free(raw);
+        return 0;
+    }
     memcpy(buf, data, size);
     buf[size] = '\0';
+    memcpy(raw, data, size);
+    raw[size] = '\0';
+    check_restricted(raw, size, false);           /* the raw input as hostile settings text */
+    free(raw);
 
     pdns_zone_t *z = pdns_zone_new("z.test", NULL);
     if (!z) {
@@ -95,6 +160,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             if (has_word(s, forbidden[i])) __builtin_trap();
         if (strcmp(zc->type, "master") != 0 || strcmp(zc->file, "x") != 0) __builtin_trap();
         free_server_config_fields(&cfg);
+        check_restricted(s, strlen(s), true);     /* B7a: and the Backend's restricted parse must take it too */
     }
     pdns_zone_free(z);
     free(buf);

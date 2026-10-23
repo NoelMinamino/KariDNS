@@ -79,8 +79,8 @@ typedef struct ing_job {
   db_zone_build_t *build;
   bool skip;                             /* decided at ZONE_BEGIN: the data is discarded, the zone is rejected */
   bool failed;                           /* a ZONE_DATA message was refused */
-  bool has_settings;
-  uint8_t *buf;                          /* ingest-threads > 1: the ZONE_DATA messages, [u32 length][bytes] each */
+  zone_ext_shared_t *shared;             /* B7a: the interned settings of the zone (this job holds a reference), NULL = none */
+  uint8_t *buf;                        /* ingest-threads > 1: the ZONE_DATA messages, [u32 length][bytes] each */
   size_t buf_len, buf_cap;
   uint8_t status;                        /* KDB_ST_* */
   int builder;                           /* index of the builder it was handed to */
@@ -92,6 +92,17 @@ typedef struct {
   int kq;
   _Atomic(ing_job_t *) slot;
 } ing_builder_t;
+
+/* B7a: the PROFILE messages of the batch (design 1.4): a zone names its profile in ZONE_BEGIN, the profile's text comes
+ * before it.  A later PROFILE of the same name replaces the earlier one (two views may read different databases).  The
+ * table is the stream thread's; a zone resolves its settings at ZONE_BEGIN, so builders never see it. */
+#define ING_MAX_PROFILES 4096
+#define ING_PROFILE_BYTES (16u << 20)  /* a hostile loader cannot make the Backend hold more than this */
+typedef struct {
+  char name[256];
+  char *text;
+  size_t len;
+} ing_profile_t;
 
 typedef struct {
   int kq, wait_kq, ctrl_fd, stream_fd;
@@ -112,7 +123,8 @@ typedef struct {
   ing_job_t *cur;
   uint32_t zones_logged;
   uint32_t rejects_logged;
-  uint32_t settings_ignored;
+  ing_profile_t *profiles;     /* of the current batch */
+  size_t nprof, cprof, prof_bytes;
   /* batch */
   bool in_batch;
   uint64_t batch_id;
@@ -462,6 +474,7 @@ static void send_enc(ing_t *g) {
 static void job_free(ing_job_t *j) {
   if (!j) return;
   db_zone_build_free(j->build);
+  zone_ext_shared_unref(j->shared);
   free(j->buf);
   free(j);
 }
@@ -471,11 +484,207 @@ static void job_reject(ing_job_t *j, const char *why) {
   snprintf(j->reason, sizeof(j->reason), "%s", why);
 }
 
-/* A new entry for a DB zone (design 4.2): source DB, a primary, its own settings block (B4b: the defaults) */
-static zone_db_entry_t *new_db_entry(const char *view, const char *zone) {
+/* ------------------------------------------------------------------------------------------------------------- */
+/* settings of DB zones (B7a, design 1.3, 3.5, 4.2)                                                               */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* do the ACL entries a..b overlap?  Two prefixes overlap when the shorter one contains the other's network. */
+static bool cidr_overlap(const cidr_entry_t *a, const cidr_entry_t *b, bool *b_contains_a) {
+  if (a->is_any || b->is_any) {
+    *b_contains_a = b->is_any;
+    return true;
+  }
+  if (!a->valid || !b->valid || a->family != b->family) return false;
+  unsigned p = a->prefix < b->prefix ? a->prefix : b->prefix;
+  for (unsigned i = 0; i < 16 && i * 8 < p; i++) {
+    unsigned bits = p - i * 8;
+    uint8_t m = bits >= 8 ? 0xFF : (uint8_t)(0xFF << (8 - bits));
+    if ((a->addr[i] & m) != (b->addr[i] & m)) return false;
+  }
+  *b_contains_a = b->prefix <= a->prefix;
+  return true;
+}
+
+/* How acl-ceiling cuts the ACLs of x: "<statement> <entry> <outside|narrowed by> the ceiling; ...".  Returns the length;
+ * an empty text means nothing is cut.  Only address entries are judged here: whether a request is inside the ceiling also
+ * depends on its key (dns_tsig_acl.c), but an address entry outside every ceiling address can only be used together with a
+ * key the ceiling names. */
+static size_t ceiling_notes(const server_config_t *cfg, const zone_ext_t *x, char *out, size_t cap) {
+  size_t n = 0;
+  if (cap) out[0] = '\0';
+  bool have_acl = x->allow_transfer_count > 0 || x->tsig_keys_count > 0 || x->allow_update_count > 0;
+  if (!have_acl) return 0;
+#define NOTE(...) do { if (n + 1 < cap) { int w_ = snprintf(out + n, cap - n, __VA_ARGS__); if (w_ > 0) n = (size_t)w_ < cap - n ? n + (size_t)w_ : cap - 1; } } while (0)
+  if (!db_acl_ceiling_configured(cfg)) {
+    NOTE("no acl-ceiling is configured: these ACLs refuse everybody");
+    return n;
+  }
+  const database_config_t *d = &cfg->database;
+  for (int pass = 0; pass < 2; pass++) {
+    const char *what = pass == 0 ? "allow-transfer" : "allow-update";
+    char *const *list = pass == 0 ? x->allow_transfer : x->allow_update;
+    const acl_entry_t *parsed = pass == 0 ? x->allow_transfer_parsed : x->allow_update_parsed;
+    int count = pass == 0 ? x->allow_transfer_count : x->allow_update_count;
+    for (int i = 0; parsed && i < count; i++) {
+      if (!parsed[i].cidr.valid || parsed[i].is_deny) continue;      /* a key name, none, or an exclusion */
+      bool inside = false, overlaps = false;
+      for (int k = 0; k < d->acl_ceiling_count && d->acl_ceiling_parsed; k++) {
+        if (!d->acl_ceiling_parsed[k].cidr.valid || d->acl_ceiling_parsed[k].is_deny) continue;
+        bool contains = false;
+        if (cidr_overlap(&parsed[i].cidr, &d->acl_ceiling_parsed[k].cidr, &contains)) {
+          overlaps = true;
+          if (contains) inside = true;
+        }
+      }
+      if (!inside)
+        NOTE("%s %.64s %s; ", what, list[i], overlaps ? "is narrowed by acl-ceiling" : "lies outside acl-ceiling");
+    }
+  }
+#undef NOTE
+  return n;
+}
+
+/* Resolve the settings of a zone: the text of its profile followed by its own text, parsed in the restricted mode of the
+ * configuration parser (statement by statement the zone overrides the profile: the loader sends both texts and the
+ * Backend merges them, so a hostile loader cannot get a statement past the whitelist by the way it splits them).  The
+ * result is interned: zones with the same texts share one parsed object.  Every TSIG key the settings name must exist in
+ * karidns.conf now.  *out: a new reference (NULL = no settings at all).  false: the zone is rejected, why says why. */
+static const ing_profile_t *find_profile(const ing_t *g, const char *name, size_t len) {
+  for (size_t i = 0; i < g->nprof; i++)
+    if (strlen(g->profiles[i].name) == len && memcmp(g->profiles[i].name, name, len) == 0) return &g->profiles[i];
+  return NULL;
+}
+
+static _Atomic bool g_ceiling_warned;
+
+static bool check_settings_against_config(const zone_ext_shared_t *sh, const char *zone, char *why, size_t whylen) {
+  bool ok = true;
+  rcu_aux_read_lock();
+  const server_config_t *cfg = acquire_config_snapshot();
+  const char *missing = db_settings_missing_key(&sh->ext, cfg);
+  if (missing) {
+    char shown[72];
+    sane_copy(shown, sizeof(shown), missing, strlen(missing));
+    snprintf(why, whylen, "the settings name the TSIG key '%s', which is not defined in karidns.conf", shown);
+    ok = false;
+  } else if ((sh->ext.allow_transfer_count > 0 || sh->ext.tsig_keys_count > 0 || sh->ext.allow_update_count > 0) &&
+             !db_acl_ceiling_configured(cfg) && !atomic_exchange_explicit(&g_ceiling_warned, true, memory_order_relaxed)) {
+    syslog(LOG_WARNING, "[DB] zone '%s' has ACLs in its database settings, but options { database { acl-ceiling } } is not "
+                        "configured: database ACLs refuse every client until it is (this is logged once)", zone);
+  }
+  rcu_aux_read_unlock();
+  return ok;
+}
+
+static bool resolve_zone_settings(ing_t *g, ing_job_t *j, const kdb_zone_begin_t *zb) {
+  const char *ztext = zb->settings.p ? zb->settings.p : "";
+  size_t zlen = zb->settings.p ? zb->settings.len : 0;
+  size_t pnlen = zb->profile.p ? zb->profile.len : 0;
+  if (pnlen == 0 && zlen == 0) return true;               /* no metadata: the defaults, no ACLs */
+  const ing_profile_t *prof = NULL;
+  if (pnlen) {
+    prof = find_profile(g, zb->profile.p, pnlen);
+    if (!prof) {
+      char shown[72];
+      sane_copy(shown, sizeof(shown), zb->profile.p, pnlen);
+      char msg[KDB_REASON_LEN];
+      snprintf(msg, sizeof(msg), "the profile '%s' is not defined (karidns_profiles) or was not sent", shown);
+      job_reject(j, msg);
+      return false;
+    }
+  }
+  const char *ptext = prof ? prof->text : "";
+  size_t ptlen = prof ? prof->len : 0;
+  /* what makes two settings the same: profile name, profile text, zone text */
+  size_t klen = pnlen + 1 + ptlen + 1 + zlen;
+  char *key = malloc(klen + 1);
+  if (!key) {
+    job_reject(j, "out of memory");
+    return false;
+  }
+  memcpy(key, zb->profile.p ? zb->profile.p : "", pnlen);
+  key[pnlen] = '\0';
+  memcpy(key + pnlen + 1, ptext, ptlen);
+  key[pnlen + 1 + ptlen] = '\0';
+  memcpy(key + pnlen + 2 + ptlen, ztext, zlen);
+  key[klen] = '\0';
+  zone_ext_shared_t *sh = db_settings_find(key, klen);
+  char err[200];
+  if (!sh) {
+    char *merged = malloc(ptlen + 1 + zlen + 1);
+    if (!merged) {
+      free(key);
+      job_reject(j, "out of memory");
+      return false;
+    }
+    memcpy(merged, ptext, ptlen);
+    merged[ptlen] = '\n';
+    memcpy(merged + ptlen + 1, ztext, zlen);
+    /* each text must be complete on its own (a profile that opens a block it never closes would swallow the zone's
+     * statements); then the two together, the zone's statements after the profile's */
+    zone_ext_shared_t *t;
+    char msg[KDB_REASON_LEN];
+    bool bad = false;
+    if (ptlen > 0 && zlen > 0) {
+      if (!(t = db_settings_parse(ptext, ptlen, err, sizeof(err)))) {
+        snprintf(msg, sizeof(msg), "profile text: %.150s", err);
+        bad = true;
+      } else {
+        zone_ext_shared_unref(t);
+        if (!(t = db_settings_parse(ztext, zlen, err, sizeof(err)))) {
+          snprintf(msg, sizeof(msg), "zone settings: %.150s", err);
+          bad = true;
+        } else {
+          zone_ext_shared_unref(t);
+        }
+      }
+    }
+    if (!bad && !(sh = db_settings_parse(merged, ptlen + 1 + zlen, err, sizeof(err)))) {
+      snprintf(msg, sizeof(msg), "%s: %.150s", ptlen > 0 && zlen == 0 ? "profile text" : "settings", err);
+      bad = true;
+    }
+    free(merged);
+    if (bad) {
+      free(key);
+      job_reject(j, msg);
+      return false;
+    }
+    sh->key = key;
+    sh->key_len = klen;
+    sh->hash = db_settings_hash(key, klen);
+    if (pnlen) sane_copy(sh->profile, sizeof(sh->profile), zb->profile.p, pnlen);
+    sh = db_settings_intern(sh);
+    rcu_aux_read_lock();
+    const server_config_t *ccfg = acquire_config_snapshot();
+    char notes[400];
+    if (db_acl_ceiling_configured(ccfg) && ceiling_notes(ccfg, &sh->ext, notes, sizeof(notes)) > 0)
+      syslog(LOG_WARNING, "[DB] zone '%s' (first zone with these settings): %s", j->zone, notes);
+    rcu_aux_read_unlock();
+  } else {
+    free(key);
+  }
+  char why[KDB_REASON_LEN];
+  if (!check_settings_against_config(sh, j->zone, why, sizeof(why))) {
+    zone_ext_shared_unref(sh);
+    job_reject(j, why);
+    return false;
+  }
+  j->shared = sh;
+  return true;
+}
+
+/* the ixfr-history depth of the entry follows its settings (and options { ixfr-history }) */
+static void apply_ixfr_depth(zone_db_entry_t *e, const zone_config_t *dc) {
+  rcu_aux_read_lock();
+  ixfr_history_set_depth(e, ixfr_history_effective(acquire_config_snapshot(), dc));
+  rcu_aux_read_unlock();
+}
+
+/* A new entry for a DB zone (design 4.2): source DB, a primary, its settings block (interned settings or none) */
+static zone_db_entry_t *new_db_entry(const char *view, const char *zone, zone_ext_shared_t *shared) {
   zone_db_entry_t *e = create_new_zone_entry(zone, view);
   if (!e) return NULL;
-  zone_config_t *dc = db_zone_config_new(zone);
+  zone_config_t *dc = db_zone_config_new(zone, shared);
   if (!dc) {
     free_zone_db_entry(e);
     return NULL;
@@ -484,10 +693,15 @@ static zone_db_entry_t *new_db_entry(const char *view, const char *zone) {
   e->kind = ZONE_KIND_PRIMARY;
   e->is_secondary = false;
   atomic_store_explicit(&e->dbcfg, dc, memory_order_release);
-  rcu_aux_read_lock();
-  ixfr_history_set_depth(e, ixfr_history_effective(acquire_config_snapshot(), dc));
-  rcu_aux_read_unlock();
+  apply_ixfr_depth(e, dc);
   return e;
+}
+
+/* does the settings block of the entry already hold exactly these settings? */
+static bool entry_has_settings(const zone_db_entry_t *e, const zone_ext_shared_t *sh) {
+  const zone_config_t *c = atomic_load_explicit(&e->dbcfg, memory_order_acquire);
+  if (!c) return false;
+  return sh ? (c->ext_shared && c->ext == &sh->ext) : (c->ext == NULL);
 }
 
 /* ZONE_END work, on the stream thread (ingest-threads 1) or a builder: feed what was buffered, check, publish the
@@ -514,18 +728,41 @@ static void job_execute(ing_job_t *j) {
   zone_db_entry_t *entry = dbreg_lookup_entry(j->view_name, j->zone);
   bool created = false;
   if (!entry) {
-    entry = new_db_entry(j->view_name, j->zone);
+    entry = new_db_entry(j->view_name, j->zone, j->shared);
     if (!entry) {
       job_reject(j, "out of memory");
       goto rejected;
     }
     created = true;
   }
+  /* B7a: the settings that came with the data are in force while the data is installed (also-notify, the response cache
+   * and the NOTIFY after the install read them); when the data is refused the previous settings are put back, so a zone
+   * that keeps serving its last good version also keeps its last good settings */
+  const zone_config_t *old_cfg = NULL, *new_cfg = NULL;
+  uint64_t cfg_epoch = 0;
+  if (!created && !entry_has_settings(entry, j->shared)) {
+    zone_config_t *nc = db_zone_config_new(j->zone, j->shared);
+    if (!nc) {
+      job_reject(j, "out of memory");
+      goto rejected;
+    }
+    new_cfg = nc;
+    old_cfg = db_entry_swap_config(entry, nc, &cfg_epoch);
+    apply_ixfr_depth(entry, nc);
+  }
   if (db_zone_build_install(j->build, entry, NULL, j->reason, sizeof(j->reason)) != 0) {
-    if (created) free_zone_db_entry(entry);              /* never registered or published into a snapshot */
+    if (created) {
+      free_zone_db_entry(entry);                         /* never registered or published into a snapshot */
+    } else if (new_cfg) {
+      uint64_t e2;
+      (void)db_entry_swap_config(entry, old_cfg, &e2);   /* take the previous settings back ... */
+      db_entry_retire_config(entry, new_cfg, e2);        /* ... and retire the ones that were refused */
+      if (old_cfg) apply_ixfr_depth(entry, old_cfg);
+    }
     j->status = KDB_ST_REJECTED;
     goto rejected;
   }
+  if (new_cfg) db_entry_retire_config(entry, old_cfg, cfg_epoch);
   bool shadowed = false;
   if (dbreg_commit(j->view_name, j->zone, entry, created, j->source_id, atomic_load(&entry->serial), j->digest,
                    &shadowed) != 0) {
@@ -617,7 +854,6 @@ static void job_finish(ing_t *g, ing_job_t *j) {
     }
     break;
   }
-  if (j->has_settings) g->settings_ignored++;
   if (g->cur_req >= 0 && g->reqs[g->cur_req].view == j->view && domain_names_match_ci(g->reqs[g->cur_req].zone, j->zone)) {
     g->req_outcome = j->status == KDB_ST_APPLIED ? ROUT_APPLIED : j->status == KDB_ST_SHADOWED ? ROUT_SHADOWED : ROUT_REJECTED;
     g->req_serial = j->serial;
@@ -724,6 +960,59 @@ static void job_submit(ing_t *g, ing_job_t *j) {
 /* messages                                                                                                       */
 /* ------------------------------------------------------------------------------------------------------------- */
 
+static void protocol_error(ing_t *g, const char *reason);
+
+static void clear_profiles(ing_t *g) {
+  for (size_t i = 0; i < g->nprof; i++) free(g->profiles[i].text);
+  g->nprof = 0;
+  g->prof_bytes = 0;
+}
+
+/* PROFILE (design 1.4): name and settings text, valid for the zones that follow in this batch.  The state machine has
+ * checked the characters and the lengths; the Backend bounds what it holds (a hostile loader cannot make it keep more). */
+static void on_profile(ing_t *g, const kdb_msg_t *m) {
+  const kdb_profile_t *p = &m->u.profile;
+  size_t i;
+  for (i = 0; i < g->nprof; i++)
+    if (strlen(g->profiles[i].name) == p->name.len && memcmp(g->profiles[i].name, p->name.p, p->name.len) == 0) break;
+  size_t old = i < g->nprof ? g->profiles[i].len : 0;
+  if (g->prof_bytes - old + p->settings.len > ING_PROFILE_BYTES || (i == g->nprof && g->nprof >= ING_MAX_PROFILES)) {
+    protocol_error(g, "PROFILE: more profile data in a batch than the Backend accepts");
+    return;
+  }
+  char *copy = malloc(p->settings.len + 1);
+  if (!copy) {
+    syslog(LOG_ERR, "[DB] out of memory; closing the stream");
+    drop_stream(g);
+    return;
+  }
+  memcpy(copy, p->settings.p, p->settings.len);
+  copy[p->settings.len] = '\0';
+  if (i == g->nprof) {
+    if (g->nprof == g->cprof) {
+      size_t nc = g->cprof ? g->cprof * 2 : 16;
+      ing_profile_t *np = realloc(g->profiles, nc * sizeof(*np));
+      if (!np) {
+        free(copy);
+        syslog(LOG_ERR, "[DB] out of memory; closing the stream");
+        drop_stream(g);
+        return;
+      }
+      g->profiles = np;
+      g->cprof = nc;
+    }
+    memcpy(g->profiles[i].name, p->name.p, p->name.len);
+    g->profiles[i].name[p->name.len] = '\0';
+    g->nprof++;
+  } else {
+    free(g->profiles[i].text);
+    g->prof_bytes -= old;
+  }
+  g->profiles[i].text = copy;
+  g->profiles[i].len = p->settings.len;
+  g->prof_bytes += p->settings.len;
+}
+
 static void fail_requests(ing_t *g, const char *why) {
   for (int i = 0; i < ING_REQ_MAX; i++) {
     if (!g->reqs[i].active) continue;
@@ -759,6 +1048,7 @@ static void cleanup_stream_state(ing_t *g) {
   job_free(g->cur);
   g->cur = NULL;
   g->in_batch = false;
+  clear_profiles(g);
   drain_all(g);
   apply_delta(g);
   retire_if_due(g, true);
@@ -908,7 +1198,7 @@ static void on_batch_begin(ing_t *g, const kdb_msg_t *m) {
   g->batch_id = m->u.batch_begin.batch_id;
   g->batch_kind = m->u.batch_begin.kind;
   g->b_applied = g->b_rejected = g->b_shadowed = g->b_deleted = g->b_failed = 0;
-  g->settings_ignored = 0;
+  clear_profiles(g);                                     /* B7a: the profiles of the previous batch */
   g->rejects_logged = 0;
   if (m->u.batch_begin.change_seq != 0)                  /* a one-zone batch does not read the log */
     atomic_store_explicit(&g_last_change_seq, m->u.batch_begin.change_seq, memory_order_relaxed);
@@ -940,10 +1230,6 @@ static void on_zone_begin(ing_t *g, const kdb_msg_t *m) {
   j->serial = zb->serial;
   j->rr_count = zb->rr_count;
   memcpy(j->digest, zb->digest, KDB_DIGEST_LEN);
-  j->has_settings = zb->settings.p != NULL && zb->settings.len > 0;
-  if (j->has_settings && g->settings_ignored == 0)
-    syslog(LOG_INFO, "[DB] zone '%s': the settings text is ignored (zone settings from the database come with B7); "
-                     "the zone runs with the default settings", zb->name);
   if (zb->view < g->nview_names) snprintf(j->view_name, sizeof(j->view_name), "%s", g->view_names[zb->view]);
   if (j->view_name[0] == '\0') {
     j->skip = true;
@@ -954,6 +1240,8 @@ static void on_zone_begin(ing_t *g, const kdb_msg_t *m) {
   } else if (zb->flags & KDB_ZF_EXTENDED) {
     j->skip = true;
     job_reject(j, "extended attributes (tags, tinydns) from the database are not supported yet");
+  } else if (!resolve_zone_settings(g, j, zb)) {
+    j->skip = true;                                      /* job_reject() was called: the zone is rejected, its data skipped */
   } else {
     j->build = db_zone_build_new(j->zone, j->rr_count);
     if (!j->build) {
@@ -1046,8 +1334,6 @@ static void on_batch_end(ing_t *g, const kdb_msg_t *m) {
   atomic_store_explicit(&g_st.b_deleted, g->b_deleted, memory_order_relaxed);
   atomic_store_explicit(&g_st.batch_time, (int64_t)time(NULL), memory_order_relaxed);
   atomic_store_explicit(&g_st.batch_done, true, memory_order_relaxed);
-  if (g->settings_ignored > 0)
-    syslog(LOG_INFO, "[DB] %u zone(s) of the batch carried a settings text; it is ignored until B7", g->settings_ignored);
   syslog(LOG_INFO, "[DB] batch %llu complete: %u zone(s) received (%u installed, %u hidden by karidns.conf, %u rejected), "
                    "%u failed in the loader, %u deleted",
          (unsigned long long)b->batch_id, b->n_zones, g->b_applied, g->b_shadowed, g->b_rejected, b->n_failed,
@@ -1103,7 +1389,10 @@ static void handle_msg(ing_t *g, const kdb_msg_t *m) {
   case KDB_T_BATCH_END:
     on_batch_end(g, m);
     break;
-  default: /* PROFILE: counted by the state machine, used with B7 */
+  case KDB_T_PROFILE:
+    on_profile(g, m);
+    break;
+  default:
     break;
   }
 }
@@ -1236,8 +1525,60 @@ static void on_ctrl_readable(ing_t *g) {
   }
 }
 
+/* B7a: karidns.conf was reloaded.  The ceiling is evaluated for every request against the active configuration, and so is
+ * the existence of a TSIG key (dns_tsig_acl.c: a database ACL that names a key the configuration no longer defines refuses
+ * everybody), so nothing has to be republished and no data has to be read again; what is left to do is to say it: a line
+ * per zone (the first few) and the counts in `karictl dbstatus`. */
+typedef struct {
+  const server_config_t *cfg;
+  uint32_t zones, with_acl, missing, logged;
+} reeval_ctx_t;
+
+static _Atomic uint32_t g_settings_missing_keys;     /* zones with a missing key, as of the last reload (dbstatus) */
+
+static bool reeval_cb(void *ud, const char *view, const dbreg_zone_t *z) {
+  reeval_ctx_t *c = ud;
+  if (!z->entry) return true;
+  const zone_config_t *dc = atomic_load_explicit(&z->entry->dbcfg, memory_order_acquire);
+  if (!dc || !dc->ext_shared) return true;
+  c->zones++;
+  const zone_ext_t *x = dc->ext;
+  if (x->allow_transfer_count > 0 || x->tsig_keys_count > 0 || x->allow_update_count > 0) c->with_acl++;
+  const char *missing = db_settings_missing_key(x, c->cfg);
+  if (missing) {
+    c->missing++;
+    if (c->logged < 20) {
+      c->logged++;
+      char shown[72];
+      sane_copy(shown, sizeof(shown), missing, strlen(missing));
+      syslog(LOG_WARNING, "[DB] zone '%s' (view '%s'): its settings name the TSIG key '%s', which karidns.conf no longer defines; "
+                          "the ACL that names it refuses everybody until the key is back", z->name, view, shown);
+    }
+  }
+  return true;
+}
+
+static void reeval_settings(ing_t *g) {
+  (void)g;
+  reeval_ctx_t c = { NULL, 0, 0, 0, 0 };
+  rcu_aux_read_lock();
+  c.cfg = acquire_config_snapshot();
+  dbreg_cursor_t cur;
+  memset(&cur, 0, sizeof(cur));
+  (void)dbreg_walk(&cur, reeval_cb, &c);
+  if (c.with_acl > 0 && !db_acl_ceiling_configured(c.cfg))
+    syslog(LOG_WARNING, "[DB] %u zone(s) have ACLs in their database settings, but options { database { acl-ceiling } } is not "
+                        "configured: they refuse every client", c.with_acl);
+  rcu_aux_read_unlock();
+  atomic_store_explicit(&g_settings_missing_keys, c.missing, memory_order_relaxed);
+  if (c.zones > 0)
+    syslog(LOG_INFO, "[DB] configuration reloaded: settings of %u database zone(s) checked against it (%u with ACLs, %u naming a "
+                     "TSIG key that is not defined)", c.zones, c.with_acl, c.missing);
+}
+
 static void on_config_event(ing_t *g) {
   if (!atomic_exchange_explicit(&g_cfg_dirty, false, memory_order_acq_rel)) return;
+  reeval_settings(g);
   if (g->stream_fd >= 0 && g->hello_done) send_config(g, "configuration reloaded");
   /* otherwise the CONFIG of the handshake reads the new configuration */
 }
@@ -1690,6 +2031,7 @@ typedef struct {
   char *out;
   size_t cap, len;
   int matches;
+  const server_config_t *cfg;   /* B7a: for the ceiling lines of one zone; valid inside the read section of db_ingest_status() */
 } status_ctx_t;
 
 static void st_append(status_ctx_t *c, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -1700,6 +2042,47 @@ static void st_append(status_ctx_t *c, const char *fmt, ...) {
   int n = vsnprintf(c->out + c->len, c->cap - c->len, fmt, ap);
   va_end(ap);
   if (n > 0) c->len = (size_t)n < c->cap - c->len ? c->len + (size_t)n : c->cap - 1;
+}
+
+static void st_list(status_ctx_t *c, const char *label, char *const *list, int n) {
+  if (n <= 0) return;
+  st_append(c, " %s", label);
+  for (int i = 0; i < n && i < 8; i++) st_append(c, "%s%.64s", i ? ", " : " ", list[i] ? list[i] : "?");
+  if (n > 8) st_append(c, ", ... (%d entries)", n);
+}
+
+/* B7a: where the settings of a DB zone come from and what acl-ceiling makes of its ACLs */
+static void settings_status(status_ctx_t *c, const zone_db_entry_t *e) {
+  const zone_config_t *dc = atomic_load_explicit(&e->dbcfg, memory_order_acquire);
+  if (!dc || !dc->ext_shared) {
+    st_append(c, "  settings: none (the defaults; no ACLs, so transfers and updates are refused)\n");
+    return;
+  }
+  const zone_ext_shared_t *sh = (const zone_ext_shared_t *)dc->ext;
+  const zone_ext_t *x = dc->ext;
+  if (sh->profile[0])
+    st_append(c, "  settings: profile '%.64s' (statements in the zone's own metadata override the profile's)\n", sh->profile);
+  else
+    st_append(c, "  settings: the zone's own metadata\n");
+  if (x->allow_transfer_count > 0 || x->tsig_keys_count > 0) {
+    st_append(c, "  allow-transfer:");
+    st_list(c, "addresses", x->allow_transfer, x->allow_transfer_count);
+    st_list(c, "keys", x->tsig_keys, x->tsig_keys_count);
+    st_append(c, " (match %s)\n", x->transfer_acl_match == ACL_MATCH_ANY ? "any" : "all");
+  }
+  if (x->allow_update_count > 0) {
+    st_append(c, "  allow-update:");
+    st_list(c, "entries", x->allow_update, x->allow_update_count);
+    st_append(c, " (match %s)\n", x->update_acl_match == ACL_MATCH_ALL ? "all" : "any");
+  }
+  if (c->cfg) {
+    char notes[400];
+    if (ceiling_notes(c->cfg, x, notes, sizeof(notes)) > 0) st_append(c, "  acl-ceiling: %s\n", notes);
+    const char *missing = db_settings_missing_key(x, c->cfg);
+    if (missing)
+      st_append(c, "  settings error: the TSIG key '%.64s' is not defined in karidns.conf; the ACL that names it refuses everybody\n",
+                missing);
+  }
 }
 
 static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
@@ -1715,6 +2098,7 @@ static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   if (!z->entry) st_append(c, " (no version loaded)");
   if (z->error) st_append(c, ", last error: %s", z->error);
   st_append(c, "\n");
+  if (z->entry) settings_status(c, z->entry);
   return true;
 }
 
@@ -1724,11 +2108,14 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
   ing_cfg_t snap;
   snapshot_cfg(&snap);
   if (!snap.enabled) return 0;
-  status_ctx_t c = { zone, view, out, cap, 0, 0 };
+  status_ctx_t c = { zone, view, out, cap, 0, 0, NULL };
   if (zone) {
     dbreg_cursor_t cur;
     memset(&cur, 0, sizeof(cur));
+    rcu_aux_read_lock();                                 /* the entries' settings blocks are read */
+    c.cfg = acquire_config_snapshot();
     (void)dbreg_walk(&cur, status_cb, &c);
+    rcu_aux_read_unlock();
     if (c.matches == 0) st_append(&c, "zone %s: not in the database registry\n", zone);
     return c.len;
   }
@@ -1762,6 +2149,8 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
             (unsigned long long)atomic_load(&g_st.tot_applied), (unsigned long long)atomic_load(&g_st.tot_rejected),
             (unsigned long long)atomic_load(&g_st.tot_shadowed), (unsigned long long)atomic_load(&g_st.tot_deleted),
             (unsigned long long)atomic_load(&g_st.tot_failed));
+  st_append(&c, "settings: %zu distinct (shared between zones), %u zone(s) name a TSIG key that karidns.conf does not define\n",
+            db_settings_count(), atomic_load_explicit(&g_settings_missing_keys, memory_order_relaxed));
   fmt_time(err_time, t3, sizeof(t3));
   if (err[0]) st_append(&c, "last protocol error: %s (%s)\n", err, t3);
   else st_append(&c, "last protocol error: none\n");

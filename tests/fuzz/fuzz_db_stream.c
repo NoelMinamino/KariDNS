@@ -109,10 +109,38 @@ static void run_backend(const uint8_t *p, size_t n) {
 
 /* The install path: what handle_msg() of dns_db_ingest.c does with a zone, without the thread.  A zone that installs
  * is registered; the registry and the entries are dropped at the end of the input. */
-static zone_db_entry_t *scratch_entry(const char *view, const char *zone) {
+/* B7a: the settings of a zone, resolved as resolve_zone_settings() of the ingest thread does: the text of the last PROFILE of
+ * the stream followed by the zone's own text, restricted parse, interned.  NULL = none (or refused: the zone then has no
+ * settings, which is all the harness needs from it). */
+static char g_prof[4096];
+static size_t g_prof_len;
+
+static zone_ext_shared_t *fuzz_settings(const kdb_zone_begin_t *zb) {
+    size_t zl = zb->settings.p ? zb->settings.len : 0;
+    size_t pl = (zb->profile.p && zb->profile.len) ? g_prof_len : 0;
+    if (zl + pl == 0 || zl + pl + 2 > sizeof(g_prof) * 2) return NULL;
+    char *merged = malloc(pl + 1 + zl + 1);
+    if (!merged) return NULL;
+    memcpy(merged, g_prof, pl);
+    merged[pl] = '\n';
+    if (zl) memcpy(merged + pl + 1, zb->settings.p, zl);
+    char err[200];
+    zone_ext_shared_t *sh = db_settings_parse(merged, pl + 1 + zl, err, sizeof(err));
+    if (sh) {
+        sh->key = merged;                          /* (owned by the object from here on) */
+        sh->key_len = pl + 1 + zl;
+        sh->hash = db_settings_hash(merged, sh->key_len);
+        sh = db_settings_intern(sh);
+    } else {
+        free(merged);
+    }
+    return sh;
+}
+
+static zone_db_entry_t *scratch_entry(const char *view, const char *zone, zone_ext_shared_t *sh) {
     zone_db_entry_t *e = create_new_zone_entry(zone, view);
     if (!e) return NULL;
-    zone_config_t *dc = db_zone_config_new(zone);
+    zone_config_t *dc = db_zone_config_new(zone, sh);
     if (!dc) {
         free_zone_db_entry(e);
         return NULL;
@@ -139,6 +167,8 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
     int64_t source_id = 0;
     bool failed = false;
     char why[KDB_REASON_LEN];
+    zone_ext_shared_t *zsh = NULL;
+    g_prof_len = 0;
     for (;;) {
         kdb_frame_t fr;
         if (kdb_framer_next(&f, &fr) != KDB_OK) break;
@@ -150,8 +180,14 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
             snprintf(view, sizeof(view), "v%u", (unsigned)(m.u.zone_begin.view % 3));
             source_id = m.u.zone_begin.source_id;
             failed = false;
+            zone_ext_shared_unref(zsh);
+            zsh = fuzz_settings(&m.u.zone_begin);
             b = (m.u.zone_begin.zone_kind == KDB_ZK_PRIMARY) ? db_zone_build_new(zone, m.u.zone_begin.rr_count) : NULL;
             if (!b) failed = true;
+            break;
+        case KDB_T_PROFILE:
+            g_prof_len = m.u.profile.settings.len < sizeof(g_prof) ? m.u.profile.settings.len : sizeof(g_prof);
+            memcpy(g_prof, m.u.profile.settings.p, g_prof_len);
             break;
         case KDB_T_ZONE_DATA:
             if (b && !failed && db_zone_build_feed(b, m.u.zone_data.body, m.u.zone_data.len, why, sizeof(why)) != 0)
@@ -166,7 +202,7 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
                 zone_db_entry_t *e = dbreg_lookup_entry(view, zone);
                 bool created = false;
                 if (!e) {
-                    e = scratch_entry(view, zone);
+                    e = scratch_entry(view, zone, zsh);
                     created = e != NULL;
                 }
                 if (e && db_zone_build_install(b, e, NULL, why, sizeof(why)) == 0) {
@@ -195,9 +231,11 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
         }
     }
     db_zone_build_free(b);
+    zone_ext_shared_unref(zsh);
     zone_retire_process(true);
     dbreg_reset();
     zone_retire_process(true);
+    db_settings_reset();
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {

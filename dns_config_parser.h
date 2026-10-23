@@ -157,16 +157,57 @@ typedef struct zone_ext {
 
   bool ixfr_history_set;     /* ixfr-history をこのゾーンで指定した */
   uint8_t ixfr_history;      /* その値 (0..IXFR_HISTORY_MAX) */
+
+  /* --- transfer-acl-match / update-acl-match (B7a, beta design D14): which kinds of entry of an ACL must match.
+   * ACL_MATCH_DEFAULT = the meaning karidns.conf always had: allow-transfer with addresses and keys = address AND key,
+   * allow-update = address OR key.  The DB loader writes ACL_MATCH_ANY for transfers and ACL_MATCH_ALL for updates, which
+   * is what PowerDNS does. --- */
+  uint8_t transfer_acl_match;
+  uint8_t update_acl_match;
+  /* --- set by the code that installs the settings of a DB zone, never by text: the ACLs of this zone also have to pass
+   * options { database { acl-ceiling } } (dns_tsig_acl.c) --- */
+  bool db_acl_ceiling;
 } zone_ext_t;
+
+/* transfer-acl-match / update-acl-match values (zone_ext_t) */
+enum { ACL_MATCH_DEFAULT = 0, ACL_MATCH_ANY = 1, ACL_MATCH_ALL = 2 };
 
 typedef struct zone_config {
   char *domain;
   char *file;
   char *type;
   bool is_catalog;
+  bool ext_shared; /* ext points to the zone_ext_t at the start of a zone_ext_shared_t (reference counted, DB zones) */
   zone_ext_t *ext; /* NULL = 全オプション既定。直接読まず zext() を使う */
   struct zone_config *next;
 } zone_config_t;
+
+/* B7a: the settings of DB zones are interned: zones whose settings text is the same share one parsed zone_ext_t.  The
+ * object is reference counted; the intern table (dns_snapshot_rcu.c) holds one reference, every zone_config_t with
+ * ext_shared one more.  free_zone_config() drops that reference. */
+typedef struct zone_ext_shared {
+  zone_ext_t ext;               /* must stay first */
+  _Atomic uint32_t refs;
+  struct zone_ext_shared *next; /* intern table chain */
+  uint64_t hash;
+  char *key;                    /* profile name, NUL, profile text, NUL, zone text: what makes two settings the same */
+  size_t key_len;
+  char profile[256];            /* "" = none */
+} zone_ext_shared_t;
+
+zone_ext_shared_t *zone_ext_shared_ref(zone_ext_shared_t *s);
+void zone_ext_shared_unref(zone_ext_shared_t *s);
+
+/* Restricted parse of the settings text of a DB zone (beta design 1.3, 3.5).  The text is hostile: only the statements the
+ * loader can write are accepted (allow-transfer, allow-update, also-notify, tsig-key, notify-retries, notify-retry-interval,
+ * notify-retry-backoff, ixfr-history, additional-from-auth, disable-auto-tc-flag, zone-udp-bufsize, zone-tcp-mss,
+ * zone-tcp-window, zone-tcp-sndbuf, transfer-acl-match, update-acl-match); everything else (file, type, masters, program*,
+ * include, unknown) is an error.  A statement that is written twice replaces the first (so the text of a profile followed by
+ * the text of a zone is "the zone overrides the profile, statement by statement").  The ACL entries must be addresses,
+ * prefixes, any or none ("!" allowed); in allow-update a name that is not an address is a TSIG key name.  Named ACLs of
+ * karidns.conf are not available.  On success returns a new zone_ext_shared_t (refs 1, profile/key empty) whose ext has
+ * db_acl_ceiling set; NULL with a one-line reason in err.  key_text/profile/key are the caller's to fill. */
+zone_ext_shared_t *db_settings_parse(const char *text, size_t len, char *err, size_t errlen);
 
 /* 全オプション既定 (全ゼロ) の共有ブロック。読み取り専用 */
 extern const zone_ext_t zone_ext_default;
@@ -370,6 +411,12 @@ typedef struct server_config_s {
   _Atomic int reader_count;
 } server_config_t;
 
+/* B7a: the first TSIG key name that the settings x of a DB zone name (allow-transfer key, allow-update name, tsig-key) and
+ * cfg does not define in a key {} block, or NULL when all exist */
+const char *db_settings_missing_key(const zone_ext_t *x, const server_config_t *cfg);
+/* B7a: is options { database { acl-ceiling } } configured (any address or key entry)?  No ceiling = DB ACLs refuse everyone */
+bool db_acl_ceiling_configured(const server_config_t *cfg);
+
 /* loader-path with its default */
 static inline const char *db_loader_path(const server_config_t *c) {
   return c->database.loader_path ? c->database.loader_path : KARIDNS_DB_DEFAULT_LOADER_PATH;
@@ -405,6 +452,9 @@ typedef struct {
   config_file_frame_t stack[MAX_INCLUDE_DEPTH];
   int depth;            // 現在のスタック深さ (0 = トップレベル)
   bool error_occurred;  // 循環/不存在等のエラーフラグ
+  bool no_include;      // B7a: 'include' is an error (settings text of a DB zone is hostile and must not open files)
+  bool restricted;      // B7a: zone statements are limited to what a DB zone may set (db_settings_parse)
+  char restricted_err[160]; // restricted: why a statement was refused (printable, no input bytes beyond the statement name)
 } token_ctx_t;
 
 int parse_named_conf(const char *config_str, server_config_t *config);

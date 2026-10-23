@@ -33,6 +33,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     parse_named_conf(text_buf, &config);
 
     free_server_config_fields(&config);
+
+    /* B7a: the same bytes as the settings text of a database zone (restricted parse, no include, a whitelist of statements) */
+    char err[200];
+    zone_ext_shared_t *sh = db_settings_parse(text_buf, size, err, sizeof(err));
+    if (!sh && err[0] == '\0') __builtin_trap();     /* a refusal says why */
+    zone_ext_shared_unref(sh);
     free(text_buf);
     return 0;
 }

@@ -257,6 +257,11 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
 
     if (tok.type == TOKEN_STRING && tok.value && !tok.is_quoted && strcmp(tok.value, "include") == 0) {
       free_token(&tok);
+      if (ctx->no_include) { /* B7a: settings text of a DB zone: no file is ever opened for it */
+        snprintf(ctx->restricted_err, sizeof(ctx->restricted_err), "'include' is not allowed in the settings of a database zone");
+        ctx->error_occurred = true;
+        return (conf_token_t){TOKEN_EOF, NULL, false};
+      }
 
       conf_token_t tok_file = get_raw_token_from_frame(frame);
       if (tok_file.type != TOKEN_STRING) {
@@ -365,7 +370,8 @@ zone_ext_t *zone_ext_mut(zone_config_t *z) {
   return z->ext;
 }
 
-static void free_zone_ext(zone_ext_t *x) {
+/* everything x points to (not x itself: a zone_ext_shared_t embeds it) */
+static void free_zone_ext_fields(zone_ext_t *x) {
   if (!x)
     return;
   for (int i = 0; i < x->masters_count; i++)
@@ -443,7 +449,28 @@ static void free_zone_ext(zone_ext_t *x) {
     free(x->ecs_trusted_resolvers_parsed);
     x->ecs_trusted_resolvers_parsed = NULL;
   }
+}
+
+static void free_zone_ext(zone_ext_t *x) {
+  if (!x)
+    return;
+  free_zone_ext_fields(x);
   free(x);
+}
+
+zone_ext_shared_t *zone_ext_shared_ref(zone_ext_shared_t *s) {
+  if (s) atomic_fetch_add_explicit(&s->refs, 1, memory_order_relaxed);
+  return s;
+}
+
+void zone_ext_shared_unref(zone_ext_shared_t *s) {
+  if (!s)
+    return;
+  if (atomic_fetch_sub_explicit(&s->refs, 1, memory_order_acq_rel) == 1) {
+    free_zone_ext_fields(&s->ext);
+    free(s->key);
+    free(s);
+  }
 }
 
 void free_zone_config(zone_config_t *zone) {
@@ -452,7 +479,10 @@ void free_zone_config(zone_config_t *zone) {
   free(zone->domain);
   free(zone->type);
   free(zone->file);
-  free_zone_ext(zone->ext);
+  if (zone->ext_shared)
+    zone_ext_shared_unref((zone_ext_shared_t *)zone->ext); /* ext is the first member of the shared object */
+  else
+    free_zone_ext(zone->ext);
   free(zone);
 }
 
@@ -1722,9 +1752,60 @@ static int unknown_statement(token_ctx_t *ctx, const char *kind, const char *nam
   return -1;
 }
 
+/* B7a: what a DB zone's settings text may contain (db_settings_parse).  The statements karidns-dbloader writes (the output
+ * of build_settings() in dns_pdns_reader.c) and the profile texts of karidns_profiles are made of these. */
+static const char *const k_db_zone_statements[] = {
+  "allow-transfer", "allow-update", "also-notify", "tsig-key", "notify-retries", "notify-retry-interval",
+  "notify-retry-backoff", "ixfr-history", "additional-from-auth", "disable-auto-tc-flag", "zone-udp-bufsize",
+  "zone-tcp-mss", "zone-tcp-window", "zone-tcp-sndbuf", "transfer-acl-match", "update-acl-match", NULL
+};
+
+/* The statement `key` is about to be read in restricted mode: refuse it unless it is on the list, and forget what an
+ * earlier statement of the same name set (the later statement replaces it: profile text first, zone text after it). */
+static bool restricted_statement(token_ctx_t *ctx, zone_ext_t *x, const char *key) {
+  if (!name_in_list(k_db_zone_statements, key)) {
+    bool plain = key[0] != '\0' && strlen(key) <= 40;
+    for (const char *p = key; plain && *p; p++)
+      if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_') plain = false;
+    snprintf(ctx->restricted_err, sizeof(ctx->restricted_err),
+             "statement '%s' is not allowed in the settings of a database zone", plain ? key : "?");
+    ctx->error_occurred = true;
+    return false;
+  }
+  if (strcmp(key, "also-notify") == 0) {
+    for (int i = 0; i < x->also_notify_count; i++) free(x->also_notify[i].ip);
+    free(x->also_notify);
+    x->also_notify = NULL;
+    x->also_notify_count = 0;
+  } else if (strcmp(key, "allow-transfer") == 0) {
+    for (int i = 0; i < x->allow_transfer_count; i++) free(x->allow_transfer[i]);
+    free(x->allow_transfer);
+    free(x->allow_transfer_parsed);
+    x->allow_transfer = NULL;
+    x->allow_transfer_parsed = NULL;
+    x->allow_transfer_count = 0;
+    for (int i = 0; i < x->tsig_keys_count; i++) free(x->tsig_keys[i]);
+    free(x->tsig_keys);
+    x->tsig_keys = NULL;
+    x->tsig_keys_count = 0;
+  } else if (strcmp(key, "allow-update") == 0) {
+    for (int i = 0; i < x->allow_update_count; i++) free(x->allow_update[i]);
+    free(x->allow_update);
+    free(x->allow_update_parsed);
+    x->allow_update = NULL;
+    x->allow_update_parsed = NULL;
+    x->allow_update_count = 0;
+  } else if (strcmp(key, "tsig-key") == 0) {
+    free(x->tsig_key);
+    x->tsig_key = NULL;
+  }
+  return true;
+}
+
+static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t **zone_out);
+
 static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
   conf_token_t tok = get_next_token(ctx);
-  int nr_rc = 0;
   if (tok.type != TOKEN_STRING) {
     free_token(&tok);
     return -1;
@@ -1774,7 +1855,14 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       zone->domain = copy;
     }
   }
-  tok = get_next_token(ctx);
+  return parse_zone_body(ctx, zone, zone_out);
+}
+
+/* "{ statements };" of a zone whose name and (empty) ext are in place.  Owns zone: freed on every failure. */
+static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t **zone_out) {
+  zone_ext_t *x = zone->ext;
+  int nr_rc = 0;
+  conf_token_t tok = get_next_token(ctx);
   if (tok.type != TOKEN_LBRACE) {
     free_zone_config(zone);
     free_token(&tok);
@@ -1795,6 +1883,11 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
     char *key = tok.value;
     tok.value = NULL;
     free_token(&tok);
+    if (ctx->restricted && !restricted_statement(ctx, x, key)) {
+      free(key);
+      free_zone_config(zone);
+      return -1;
+    }
     if (strcmp(key, "masters") == 0) {
       if (parse_ip_port_list(ctx, &x->masters, &x->masters_count) !=
           0) {
@@ -1884,8 +1977,10 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
           return -1;
         }
       }
-      else if (strcmp(key, "file") == 0)
+      else if (strcmp(key, "file") == 0) {
+        free(zone->file); /* 同じ文が 2 回あれば後の値 (前の値を解放する) */
         zone->file = val;
+      }
       else if (strcmp(key, "file-format") == 0) {
         if (strcasecmp(val, "bind") != 0 && strcasecmp(val, "tinydns") != 0) {
           syslog(LOG_ERR, "[Config] zone '%s': file-format must be 'bind' or 'tinydns' (got '%s')", zone->domain, val);
@@ -1895,12 +1990,17 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
           free_zone_config(zone);
           return -1;
         }
+        free(x->file_format);
         x->file_format = val;
       }
-      else if (strcmp(key, "tsig-key") == 0)
+      else if (strcmp(key, "tsig-key") == 0) {
+        free(x->tsig_key);
         x->tsig_key = val;
-      else if (strcmp(key, "notify-source") == 0)
+      }
+      else if (strcmp(key, "notify-source") == 0) {
+        free(x->notify_source);
         x->notify_source = val;
+      }
       else if (strcmp(key, "catalog-zone") == 0) {
         if (!parse_config_bool(val, &zone->is_catalog)) {
           report_bad_bool(ctx, zone->domain, key, val);
@@ -2087,6 +2187,32 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       else if (strcmp(key, "zone-tcp-window") == 0) x->zone_tcp_window = v;
       else if (strcmp(key, "zone-tcp-sndbuf") == 0) x->zone_tcp_sndbuf = v;
       else x->zone_udp_bufsize = (uint16_t)v;
+    } else if (strcmp(key, "transfer-acl-match") == 0 || strcmp(key, "update-acl-match") == 0) {
+      /* D14: which kinds of entry of allow-transfer / allow-update have to match (docs/karidns.md) */
+      tok = get_next_token(ctx);
+      uint8_t m = ACL_MATCH_DEFAULT;
+      if (tok.type == TOKEN_STRING && tok.value) {
+        if (strcasecmp(tok.value, "any") == 0) m = ACL_MATCH_ANY;
+        else if (strcasecmp(tok.value, "all") == 0) m = ACL_MATCH_ALL;
+      }
+      if (m == ACL_MATCH_DEFAULT) {
+        report_bad_value(ctx, zone->domain, key, tok.type == TOKEN_STRING ? tok.value : "", "any or all");
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) {
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+      if (key[0] == 't') x->transfer_acl_match = m;
+      else x->update_acl_match = m;
     } else if (unknown_statement(ctx, "zone", zone->domain, key, false) != 0) {
       free(key);
       free_zone_config(zone);
@@ -2139,6 +2265,151 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
   }
   *zone_out = zone;
   return 0;
+}
+
+/* ---- settings text of DB zones (B7a, beta design 1.3, 3.5) ---- */
+
+static void db_set_err(char *err, size_t errlen, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void db_set_err(char *err, size_t errlen, const char *fmt, ...) {
+  if (!err || errlen == 0) return;
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(err, errlen, fmt, ap);
+  va_end(ap);
+}
+
+/* The entries of an ACL must be something this module can evaluate without karidns.conf: an address, a prefix, any, none
+ * (each with an optional leading "!").  Names of ACLs of karidns.conf, localhost and localnets are refused: they would be
+ * read as something else (a key name in allow-update) or never match. */
+static bool db_acl_entries_ok(char *const *list, int count, bool keys_allowed, char *err, size_t errlen, const char *what) {
+  for (int i = 0; i < count; i++) {
+    const char *e = list[i] ? list[i] : "";
+    const char *t = e[0] == '!' ? e + 1 : e;
+    if (acl_entry_is_address(t)) continue;
+    /* allow-update keeps a key as a bare name; a negated or odd name is not a key */
+    bool name_ok = keys_allowed && e[0] != '!' && e[0] != '\0' && strlen(e) <= 255 && !acl_name_is_builtin(e);
+    for (const char *p = e; name_ok && *p; p++)
+      if ((unsigned char)*p < 0x21 || (unsigned char)*p > 0x7E) name_ok = false;
+    if (!name_ok) {
+      db_set_err(err, errlen, "%s has an entry that is not an address, prefix, any, none%s", what,
+                 keys_allowed ? " or key name" : "");
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool db_ip_literal_ok(const char *s) {
+  struct in_addr a4;
+  struct in6_addr a6;
+  return s && (inet_pton(AF_INET, s, &a4) == 1 || inet_pton(AF_INET6, s, &a6) == 1);
+}
+
+zone_ext_shared_t *db_settings_parse(const char *text, size_t len, char *err, size_t errlen) {
+  if (err && errlen) err[0] = '\0';
+  if (!text) return NULL;
+  if (len > (size_t)262144) {
+    db_set_err(err, errlen, "settings text is too long");
+    return NULL;
+  }
+  char *buf = malloc(len + 16);
+  zone_config_t *zone = calloc(1, sizeof(*zone));
+  zone_ext_t *x = calloc(1, sizeof(*x));
+  if (!buf || !zone || !x) {
+    free(buf);
+    free(zone);
+    free(x);
+    db_set_err(err, errlen, "out of memory");
+    return NULL;
+  }
+  buf[0] = '{';
+  memcpy(buf + 1, text, len);
+  memcpy(buf + 1 + len, "\n};", 4);        /* a text that ends inside a comment still gets its closing brace */
+  zone->domain = strdup("settings.");
+  zone->type = strdup("master");
+  zone->ext = x;
+  if (!zone->domain || !zone->type) {
+    free_zone_config(zone);
+    free(buf);
+    db_set_err(err, errlen, "out of memory");
+    return NULL;
+  }
+  token_ctx_t ctx;
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.stack[0].src = buf;
+  ctx.stack[0].len = len + 4;
+  ctx.restricted = true;
+  ctx.no_include = true;
+  zone_config_t *out = NULL;
+  int rc = parse_zone_body(&ctx, zone, &out);      /* frees zone on failure */
+  zone_ext_shared_t *sh = NULL;
+  if (rc == 0 && !ctx.error_occurred) {
+    conf_token_t tail = get_next_token(&ctx);       /* a stray '}' in the text would end the block early */
+    bool trailing = tail.type != TOKEN_EOF;
+    free_token(&tail);
+    if (trailing) db_set_err(err, errlen, "unbalanced braces in the settings text");
+    else if (!out->ext) out->ext = calloc(1, sizeof(zone_ext_t));
+    zone_ext_t *ox = out->ext;
+    if (!trailing && !ox) {
+      db_set_err(err, errlen, "out of memory");
+    } else if (!trailing) {
+      const char *bad = NULL;
+      if (!db_acl_entries_ok(ox->allow_transfer, ox->allow_transfer_count, false, err, errlen, "allow-transfer") ||
+          !db_acl_entries_ok(ox->allow_update, ox->allow_update_count, true, err, errlen, "allow-update"))
+        bad = err;
+      for (int i = 0; !bad && i < ox->also_notify_count; i++)
+        if (!db_ip_literal_ok(ox->also_notify[i].ip)) {
+          db_set_err(err, errlen, "also-notify has an entry that is not an IP address");
+          bad = err;
+        }
+      for (int i = 0; !bad && i < ox->tsig_keys_count; i++)
+        if (!ox->tsig_keys[i] || !ox->tsig_keys[i][0]) {
+          db_set_err(err, errlen, "allow-transfer has an empty key name");
+          bad = err;
+        }
+      if (!bad && ox->tsig_key && !ox->tsig_key[0]) {
+        db_set_err(err, errlen, "tsig-key is empty");
+        bad = err;
+      }
+      if (!bad) {
+        sh = calloc(1, sizeof(*sh));
+        if (!sh) {
+          db_set_err(err, errlen, "out of memory");
+        } else {
+          sh->ext = *ox;                            /* the pointers move to the shared object */
+          free(ox);
+          out->ext = NULL;
+          sh->ext.db_acl_ceiling = true;
+          atomic_init(&sh->refs, 1);
+        }
+      }
+    }
+    free_zone_config(out);
+  } else {
+    if (rc == 0) free_zone_config(out);
+    if (err && errlen && !err[0])
+      db_set_err(err, errlen, "%s", ctx.restricted_err[0] ? ctx.restricted_err : "syntax error or invalid value in the settings text");
+  }
+  config_lexer_cleanup(&ctx);
+  free(buf);
+  return sh;
+}
+
+const char *db_settings_missing_key(const zone_ext_t *x, const server_config_t *cfg) {
+  if (!x) return NULL;
+  for (int i = 0; i < x->tsig_keys_count; i++)
+    if (!cfg || !key_name_is_defined(cfg->keys, x->tsig_keys[i])) return x->tsig_keys[i];
+  if (x->tsig_key && (!cfg || !key_name_is_defined(cfg->keys, x->tsig_key))) return x->tsig_key;
+  for (int i = 0; i < x->allow_update_count; i++) {
+    const char *e = x->allow_update[i];
+    if (!e || acl_entry_is_address(e[0] == '!' ? e + 1 : e)) continue;
+    if (!cfg || !key_name_is_defined(cfg->keys, e)) return e;
+  }
+  return NULL;
+}
+
+bool db_acl_ceiling_configured(const server_config_t *cfg) {
+  return cfg && cfg->database.enabled && (cfg->database.acl_ceiling_count > 0 || cfg->database.acl_ceiling_keys_count > 0);
 }
 
 static int parse_buffer_size_value(const char *str) {

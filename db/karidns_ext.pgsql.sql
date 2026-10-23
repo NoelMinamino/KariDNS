@@ -15,7 +15,7 @@
 --   a prune trigger   keeps the newest 1,000,000 rows (the loader is read-only and cannot prune).  BIGSERIAL values are not
 --                     given back by a rolled-back transaction, so the log can have holes; a loader that sees the rows after
 --                     its seq start later than seq + 1 compares everything again (never wrong, only slower).
---   the tables of design 3.7 that later milestones read: karidns_domain_views (B6b), karidns_profiles (B7),
+--   the tables of design 3.7 that later milestones read: karidns_domain_views (B6b), karidns_profiles (B7a, with triggers that log the domains naming the profile),
 --                     karidns_record_tags / karidns_record_tinydns / karidns_zone_tagdefs (B8).
 --
 -- TRUNCATE is not logged (a trigger on TRUNCATE has no transition tables); use DELETE, or `karictl reload` afterwards.
@@ -221,3 +221,27 @@ CREATE TRIGGER karidns_trg_record_tinydns_upd AFTER UPDATE ON karidns_record_tin
   FOR EACH STATEMENT EXECUTE FUNCTION karidns_trg_record_tinydns_upd_fn();
 CREATE TRIGGER karidns_trg_record_tinydns_del AFTER DELETE ON karidns_record_tinydns REFERENCING OLD TABLE AS old_rows
   FOR EACH STATEMENT EXECUTE FUNCTION karidns_trg_record_tinydns_del_fn();
+
+-- karidns_profiles (B7a): the settings of a profile are part of every zone that names it (domainmetadata X-KARIDNS-PROFILE),
+-- so editing, adding or deleting a profile logs every domain that uses the old or the new name (one statement = one
+-- log row per domain).  The kind is compared case-insensitively and the content without leading / trailing blanks, like
+-- the loader does.
+CREATE OR REPLACE FUNCTION karidns_trg_profiles_ins_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN PERFORM karidns_log_domains(ARRAY(SELECT m.domain_id FROM domainmetadata m JOIN new_rows n ON btrim(m.content, E' \t') = n.name
+                                         WHERE upper(m.kind) = 'X-KARIDNS-PROFILE')); RETURN NULL; END $$;
+CREATE OR REPLACE FUNCTION karidns_trg_profiles_upd_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN PERFORM karidns_log_domains(ARRAY(SELECT m.domain_id FROM domainmetadata m
+                                         WHERE upper(m.kind) = 'X-KARIDNS-PROFILE'
+                                           AND btrim(m.content, E' \t') IN (SELECT name FROM old_rows UNION SELECT name FROM new_rows))); RETURN NULL; END $$;
+CREATE OR REPLACE FUNCTION karidns_trg_profiles_del_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN PERFORM karidns_log_domains(ARRAY(SELECT m.domain_id FROM domainmetadata m JOIN old_rows o ON btrim(m.content, E' \t') = o.name
+                                         WHERE upper(m.kind) = 'X-KARIDNS-PROFILE')); RETURN NULL; END $$;
+DROP TRIGGER IF EXISTS karidns_trg_profiles_ins ON karidns_profiles;
+DROP TRIGGER IF EXISTS karidns_trg_profiles_upd ON karidns_profiles;
+DROP TRIGGER IF EXISTS karidns_trg_profiles_del ON karidns_profiles;
+CREATE TRIGGER karidns_trg_profiles_ins AFTER INSERT ON karidns_profiles REFERENCING NEW TABLE AS new_rows
+  FOR EACH STATEMENT EXECUTE FUNCTION karidns_trg_profiles_ins_fn();
+CREATE TRIGGER karidns_trg_profiles_upd AFTER UPDATE ON karidns_profiles REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows
+  FOR EACH STATEMENT EXECUTE FUNCTION karidns_trg_profiles_upd_fn();
+CREATE TRIGGER karidns_trg_profiles_del AFTER DELETE ON karidns_profiles REFERENCING OLD TABLE AS old_rows
+  FOR EACH STATEMENT EXECUTE FUNCTION karidns_trg_profiles_del_fn();

@@ -1875,6 +1875,12 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
         }
     }
 
+    /* B7a: without acl-ceiling the ACLs a database zone carries (allow-transfer, allow-update from the metadata or a profile)
+     * refuse every client; the zones still answer queries */
+    if (db->acl_ceiling_count == 0 && db->acl_ceiling_keys_count == 0)
+        kc_warning(&t, "database: no acl-ceiling; the ACLs of database zones (zone transfers, dynamic updates) refuse every "
+                       "client until one is set (acl-ceiling { 192.0.2.0/24; key \"name\"; };)\n");
+
     /* sources */
     if (sqlite) {
         if (db->database_file) kc_check_sqlite_file(&t, "database", db->database_file);
@@ -1933,6 +1939,29 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
     zone_config_t *z;
     CONFIG_FOR_EACH_ZONE(cfg, zv, z) {
         const zone_ext_t *zx = zext(z);
+        /* D14 (B7a): transfer-acl-match / update-acl-match only choose between the entries of an ACL */
+        if (zx->transfer_acl_match != ACL_MATCH_DEFAULT) {
+            if (zx->allow_transfer_count == 0 && zx->tsig_keys_count == 0)
+                fprintf(stderr, "[WARNING] Zone '%s': transfer-acl-match has no effect without allow-transfer\n", z->domain);
+            else if (zx->allow_transfer_count == 0 || zx->tsig_keys_count == 0)
+                fprintf(stderr, "[WARNING] Zone '%s': transfer-acl-match has no effect: allow-transfer lists only %s "
+                                "(the option chooses between addresses and keys)\n",
+                        z->domain, zx->allow_transfer_count ? "addresses" : "keys");
+        }
+        if (zx->update_acl_match != ACL_MATCH_DEFAULT) {
+            bool addr = false, key = false;
+            for (int i = 0; i < zx->allow_update_count; i++) {
+                const char *e = zx->allow_update[i];
+                cidr_entry_t ce;
+                if (!e || e[0] == '!' || strcmp(e, "none") == 0 || cidr_entry_parse(&ce, e)) addr = true;
+                else key = true;
+            }
+            if (zx->allow_update_count == 0)
+                fprintf(stderr, "[WARNING] Zone '%s': update-acl-match has no effect without allow-update\n", z->domain);
+            else if (!addr || !key)
+                fprintf(stderr, "[WARNING] Zone '%s': update-acl-match has no effect: allow-update lists only %s "
+                                "(the option chooses between addresses and keys)\n", z->domain, addr ? "addresses" : "keys");
+        }
         if (z->type && strcasecmp(z->type, "program") == 0) {
             program_zone_count++;
             if (zx->program_path) {

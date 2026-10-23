@@ -1,0 +1,5 @@
+allow-transfer { 192.0.2.1; };
+ixfr-history 3;
+allow-transfer { 198.51.100.0/24; key "k"; }; transfer-acl-match any;
+# profile then zone: the later statement wins
+allow-update { key "k"; };

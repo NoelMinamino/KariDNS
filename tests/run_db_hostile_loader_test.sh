@@ -123,6 +123,14 @@ run_mode() {
         $KCTL dbstatus 2>&1 | grep -Eq "^last protocol error: .*($pat)" && pass "$mode: dbstatus shows the protocol error" || { fail "$mode: dbstatus protocol error"; $KCTL dbstatus 2>&1 | sed 's/^/         /'; }
         ;;
     esac
+    if [ "$mode" = settings-ok ]; then   # the zone took the profile and its own statements
+        OUT=$($KCTL dbstatus bad.test 2>&1)
+        if printf '%s\n' "$OUT" | grep -q "settings: profile 'p1'" && printf '%s\n' "$OUT" | grep -q "allow-transfer: addresses 127.0.0.1 (match all)"; then
+            pass "$mode: dbstatus shows the profile and the zone's ACL"
+        else
+            fail "$mode: dbstatus bad.test"; printf '%s\n' "$OUT" | sed 's/^/         /'
+        fi
+    fi
     file_answers && pass "$mode: the Backend survived and answers the file zone" || fail "$mode: the file zone does not answer"
     kill -TERM "$SRV"
     i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
@@ -172,6 +180,16 @@ run_mode begin-count error "ANCOUNT sum differs"
 run_mode zero-ancount error "no answer RR"
 run_mode opt-twice error "ARCOUNT in a message after the first"
 run_mode unknown-tag error "unknown tag 99"
+
+# B7a: the settings text and the PROFILE messages are as hostile as the zone data
+run_mode settings-ok ok "" "batch 1 complete: 3 zone(s) received (3 installed"
+run_mode settings-key reject "TSIG key 'ghost'" "batch 1 complete: 3 zone(s) received (2 installed, 0 hidden by karidns.conf, 1 rejected)"
+run_mode settings-include reject "'include' is not allowed"
+run_mode settings-file reject "statement 'file' is not allowed"
+run_mode settings-slave reject "statement 'type' is not allowed"
+run_mode settings-brace reject "unbalanced braces"
+run_mode profile-missing reject "profile 'p1' is not defined"
+run_mode profile-flood error "more profile data in a batch"
 
 # the unknown delete is answered "unchanged" and logged
 if grep -q "delete of zone 'nothere.test.' (view 0, id 4242) ignored" "$T/delete-unknown.log"; then pass "delete-unknown: the delete of an unregistered zone is ignored and logged"; else fail "delete-unknown: no 'ignored' line"; fi

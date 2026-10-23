@@ -122,3 +122,6 @@
 "update-policy"
 "allow-query"
 "recursion"
+"transfer-acl-match"
+"update-acl-match"
+"acl-ceiling"

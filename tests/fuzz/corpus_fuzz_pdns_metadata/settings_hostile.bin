@@ -1,0 +1,1 @@
+include "/etc/passwd"; file "/x"; type slave; masters { 192.0.2.1; }; allow-transfer { any; }; } ; allow-update { !{ key "k"; }; 

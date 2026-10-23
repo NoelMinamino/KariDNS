@@ -69,6 +69,92 @@ bool check_acl_bin(const char *client_ip, const acl_entry_t *parsed, int count) 
     return false;
 }
 
+/* ---- zone ACLs: allow-transfer, allow-update, transfer-acl-match / update-acl-match, acl-ceiling (B7a, D14) ---- */
+
+/* RFC 8945 §5.2: key_name is the key the request was verified with (NULL: no TSIG, or one that did not verify) */
+static bool addr_list_match(const char *client_ip, char **list, const acl_entry_t *parsed, int count) {
+    if (count <= 0) return false;
+    return parsed ? check_acl_bin(client_ip, parsed, count) : check_acl(client_ip, list, count);
+}
+
+/* Is the client inside options { database { acl-ceiling } }?  The ceiling is a list of addresses and key names: a client is
+ * inside when its address matches an address entry (a "!" entry excludes, first match decides, like every address list) or
+ * the request is signed with a listed key.  No ceiling configured (or no database block) = nobody is inside. */
+static bool ceiling_allows(const server_config_t *cfg, const char *client_ip, const char *key_name) {
+    if (!db_acl_ceiling_configured(cfg)) return false;
+    const database_config_t *d = &cfg->database;
+    if (client_ip && addr_list_match(client_ip, d->acl_ceiling, d->acl_ceiling_parsed, d->acl_ceiling_count)) return true;
+    for (int i = 0; key_name && i < d->acl_ceiling_keys_count; i++)
+        if (tsig_key_names_equal(key_name, d->acl_ceiling_keys[i])) return true;
+    return false;
+}
+
+bool zone_transfer_acl_allows(const server_config_t *cfg, const zone_config_t *zcfg, const char *client_ip,
+                              const char *key_name) {
+    if (!zcfg || !client_ip) return false;
+    const zone_ext_t *x = zext(zcfg);
+    /* the zone's tsig-key is the key of the primary of a secondary zone; for a file zone it has always also been a key that
+     * may transfer, for a DB zone (PowerDNS: AXFR-MASTER-TSIG) it is not */
+    bool zone_key_counts = x->tsig_key != NULL && !x->db_acl_ceiling;
+    /* a database ACL that names a key karidns.conf does not (or no longer) define refuses everybody (design 1.3) */
+    for (int i = 0; x->db_acl_ceiling && i < x->tsig_keys_count; i++)
+        if (!find_tsig_key_by_name(cfg, x->tsig_keys[i])) return false;
+    bool has_acl = x->allow_transfer_count > 0;
+    bool has_keys = x->tsig_keys_count > 0 || zone_key_counts;
+    bool acl_ok = has_acl && addr_list_match(client_ip, x->allow_transfer, x->allow_transfer_parsed, x->allow_transfer_count);
+    bool key_ok = false;
+    for (int i = 0; key_name && i < x->tsig_keys_count && !key_ok; i++)
+        key_ok = tsig_key_names_equal(key_name, x->tsig_keys[i]);
+    if (key_name && !key_ok && zone_key_counts) key_ok = tsig_key_names_equal(key_name, x->tsig_key);
+    bool allowed = false;
+    if (has_acl && has_keys)         /* both kinds of entry: AND unless the zone says "any" (D14) */
+        allowed = x->transfer_acl_match == ACL_MATCH_ANY ? (acl_ok || key_ok) : (acl_ok && key_ok);
+    else if (has_acl)
+        allowed = acl_ok;
+    else if (has_keys)
+        allowed = key_ok;
+    if (allowed && x->db_acl_ceiling) allowed = ceiling_allows(cfg, client_ip, key_name);
+    return allowed;
+}
+
+/* an allow-update entry is a key name when it is no address, prefix, any or none (the list keeps both kinds) */
+static bool update_entry_is_key(const char *e, const acl_entry_t *parsed, int i) {
+    if (!e || e[0] == '!' || e[0] == '\0' || strcmp(e, "none") == 0) return false;
+    if (parsed) return !parsed[i].cidr.valid;
+    cidr_entry_t tmp;
+    return !cidr_entry_parse(&tmp, e);
+}
+
+bool zone_update_acl_allows(const server_config_t *cfg, const zone_config_t *zcfg, const char *client_ip,
+                            const char *key_name) {
+    if (!zcfg || !client_ip) return false;
+    const zone_ext_t *x = zext(zcfg);
+    if (x->allow_update_count <= 0) return false;
+    for (int i = 0; x->db_acl_ceiling && i < x->allow_update_count; i++)       /* as for transfers: a key that is not defined */
+        if (update_entry_is_key(x->allow_update[i], x->allow_update_parsed, i) && !find_tsig_key_by_name(cfg, x->allow_update[i]))
+            return false;
+    bool addr_ok = addr_list_match(client_ip, x->allow_update, x->allow_update_parsed, x->allow_update_count);
+    bool any_key_ok = false;                 /* the signing key is named by an entry (any entry: the file zone rule since R-30) */
+    bool addr_present = false, key_present = false, key_ok = false;
+    for (int i = 0; i < x->allow_update_count; i++) {
+        const char *e = x->allow_update[i];
+        bool is_key = update_entry_is_key(e, x->allow_update_parsed, i);
+        if (is_key) key_present = true;
+        else addr_present = true;
+        if (key_name && e && tsig_key_names_equal(key_name, e)) {
+            any_key_ok = true;
+            if (is_key) key_ok = true;
+        }
+    }
+    bool allowed;
+    if (x->update_acl_match == ACL_MATCH_ALL)    /* every kind of entry that is there must match (PowerDNS: address and key) */
+        allowed = addr_present && key_present ? (addr_ok && key_ok) : (addr_present ? addr_ok : key_ok);
+    else                                         /* the default: the address matches, or the signing key is named */
+        allowed = addr_ok || any_key_ok;
+    if (allowed && x->db_acl_ceiling) allowed = ceiling_allows(cfg, client_ip, key_name);
+    return allowed;
+}
+
 tsig_key_t *find_tsig_key_by_name(const server_config_t *cfg, const char *key_name) {
     if (!cfg || !key_name || !*key_name) return NULL;
     for (tsig_key_t *k = cfg->keys; k; k = k->next) {

@@ -1760,7 +1760,7 @@ void dbreg_reset(void) {
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 }
 
-zone_config_t *db_zone_config_new(const char *domain) {
+zone_config_t *db_zone_config_new(const char *domain, zone_ext_shared_t *shared) {
     zone_config_t *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
     c->domain = strdup(domain);
@@ -1769,6 +1769,12 @@ zone_config_t *db_zone_config_new(const char *domain) {
         free_zone_config(c);
         return NULL;
     }
+    if (shared) {                                   /* interned settings: this zone holds one reference */
+        c->ext = &zone_ext_shared_ref(shared)->ext;
+        c->ext_shared = true;
+        if (shared->ext.zone_tcp_mss > 0 || shared->ext.zone_tcp_window > 0 || shared->ext.zone_tcp_sndbuf > 0)
+            atomic_store_explicit(&g_db_zone_tcp_opts, true, memory_order_relaxed);
+    }
     return c;
 }
 
@@ -1776,12 +1782,139 @@ static void free_zone_config_cb(void *p) {
     free_zone_config(p);
 }
 
-void db_entry_set_config(zone_db_entry_t *entry, const zone_config_t *cfg) {
+const zone_config_t *db_entry_swap_config(zone_db_entry_t *entry, const zone_config_t *cfg, uint64_t *epoch) {
     /* one writer per entry (the ingest thread working on the zone) */
     const zone_config_t *old = atomic_load_explicit(&entry->dbcfg, memory_order_relaxed);
-    uint64_t epoch = rcu_writer_publish(&entry->dbcfg, cfg);
+    *epoch = rcu_writer_publish(&entry->dbcfg, cfg);
+    return old;
+}
+
+void db_entry_retire_config(zone_db_entry_t *entry, const zone_config_t *old, uint64_t epoch) {
     if (old && !zone_retire_object(entry, (void *)old, free_zone_config_cb, epoch))
         syslog(LOG_ERR, "[DB] zone '%s': out of memory retiring the previous settings; they are leaked", entry->domain);
+}
+
+void db_entry_set_config(zone_db_entry_t *entry, const zone_config_t *cfg) {
+    uint64_t epoch;
+    const zone_config_t *old = db_entry_swap_config(entry, cfg, &epoch);
+    db_entry_retire_config(entry, old, epoch);
+}
+
+/* ---- interned settings of DB zones (B7a, beta design 4.2) ----
+ * Zones whose settings text (profile name + profile text + zone text) is the same share one parsed zone_ext_t.  The table
+ * is a writer-side structure under g_zone_db_rebuild_lock (the ingest thread and its builders; queries never touch it).
+ * It holds one reference of every object; an object nobody else holds (refs == 1) is dropped when the table has grown by
+ * half since the last sweep.  A zone's reference is released when its zone_config_t is freed (the S2 retire stack for a
+ * replaced block, the entry's free for the last one), so an object lives until the last reader has left. */
+_Atomic bool g_db_zone_tcp_opts;
+
+static zone_ext_shared_t **g_dbset_tab;
+static size_t g_dbset_nb, g_dbset_count, g_dbset_sweep_at = 256;
+
+uint64_t db_settings_hash(const char *key, size_t len) {
+    uint64_t h = 1469598103934665603ULL;           /* FNV-1a, 64 bit */
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint8_t)key[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static zone_ext_shared_t *dbset_find_locked(uint64_t hash, const char *key, size_t len) {
+    if (!g_dbset_nb) return NULL;
+    for (zone_ext_shared_t *s = g_dbset_tab[hash & (g_dbset_nb - 1)]; s; s = s->next)
+        if (s->hash == hash && s->key_len == len && memcmp(s->key, key, len) == 0) return s;
+    return NULL;
+}
+
+zone_ext_shared_t *db_settings_find(const char *key, size_t len) {
+    uint64_t h = db_settings_hash(key, len);
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    zone_ext_shared_t *s = dbset_find_locked(h, key, len);
+    if (s) zone_ext_shared_ref(s);
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return s;
+}
+
+static void dbset_sweep_locked(void) {
+    size_t kept = 0;
+    for (size_t b = 0; b < g_dbset_nb; b++) {
+        zone_ext_shared_t **pp = &g_dbset_tab[b];
+        while (*pp) {
+            zone_ext_shared_t *s = *pp;
+            if (atomic_load_explicit(&s->refs, memory_order_acquire) == 1) {       /* only the table holds it */
+                *pp = s->next;
+                zone_ext_shared_unref(s);
+            } else {
+                kept++;
+                pp = &s->next;
+            }
+        }
+    }
+    g_dbset_count = kept;
+    g_dbset_sweep_at = kept * 2 > 256 ? kept * 2 : 256;
+}
+
+zone_ext_shared_t *db_settings_intern(zone_ext_shared_t *fresh) {
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    zone_ext_shared_t *s = dbset_find_locked(fresh->hash, fresh->key, fresh->key_len);
+    if (s) {                                        /* another thread was first: use its object */
+        zone_ext_shared_ref(s);
+        pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+        zone_ext_shared_unref(fresh);
+        return s;
+    }
+    if (g_dbset_count >= g_dbset_sweep_at) dbset_sweep_locked();
+    if (g_dbset_count >= g_dbset_nb) {
+        size_t nnb = g_dbset_nb ? g_dbset_nb * 2 : 256;
+        zone_ext_shared_t **nt = calloc(nnb, sizeof(*nt));
+        if (nt) {
+            for (size_t b = 0; b < g_dbset_nb; b++) {
+                zone_ext_shared_t *p = g_dbset_tab[b];
+                while (p) {
+                    zone_ext_shared_t *nx = p->next;
+                    p->next = nt[p->hash & (nnb - 1)];
+                    nt[p->hash & (nnb - 1)] = p;
+                    p = nx;
+                }
+            }
+            free(g_dbset_tab);
+            g_dbset_tab = nt;
+            g_dbset_nb = nnb;
+        }
+    }
+    if (g_dbset_nb) {                               /* (out of memory growing: the object is simply not shared) */
+        zone_ext_shared_ref(fresh);                 /* the table's reference */
+        fresh->next = g_dbset_tab[fresh->hash & (g_dbset_nb - 1)];
+        g_dbset_tab[fresh->hash & (g_dbset_nb - 1)] = fresh;
+        g_dbset_count++;
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return fresh;
+}
+
+size_t db_settings_count(void) {
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    size_t n = g_dbset_count;
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return n;
+}
+
+void db_settings_reset(void) {                      /* unit tests: drop the table's references */
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    for (size_t b = 0; b < g_dbset_nb; b++) {
+        zone_ext_shared_t *s = g_dbset_tab[b];
+        while (s) {
+            zone_ext_shared_t *nx = s->next;
+            zone_ext_shared_unref(s);
+            s = nx;
+        }
+    }
+    free(g_dbset_tab);
+    g_dbset_tab = NULL;
+    g_dbset_nb = g_dbset_count = 0;
+    g_dbset_sweep_at = 256;
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 }
 
 zone_db_snapshot_t *rebuild_zone_db_snapshot(
@@ -2001,11 +2134,13 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     }
                 }
             }
+            rcu_aux_read_lock();       /* B7a: a DB zone's settings block can be replaced (and freed after a grace period) meanwhile */
             for (size_t k = 0; k < db_n; k++) {
                 atomic_fetch_add_explicit(&db_list[k]->snapshot_refs, 1, memory_order_release);
                 ixfr_history_set_depth(db_list[k], ixfr_history_effective(active_config, zone_entry_config(active_config, db_list[k])));
                 vs->entries[zidx++] = db_list[k];
             }
+            rcu_aux_read_unlock();
             free(db_list);
             vs->zone_count = zidx;
         }

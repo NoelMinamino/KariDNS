@@ -10,6 +10,17 @@ bool check_acl(const char *client_ip, char **acl_list, int acl_count);
 acl_entry_t *acl_list_parse(char **acl_list, int count);
 bool check_acl_bin(const char *client_ip, const acl_entry_t *parsed, int count);
 tsig_key_t *find_tsig_key_by_name(const server_config_t *cfg, const char *key_name);
+
+/* Is a transfer (AXFR/IXFR) / a dynamic update from client_ip allowed by the ACLs of the zone?  key_name is the TSIG key the
+ * request was verified with, NULL when it was not signed (RFC 8945 §5.2).  transfer: allow-transfer addresses and keys, as
+ * transfer-acl-match says (default all: address AND key when both are written; any: address OR key).  update: allow-update,
+ * as update-acl-match says (default any: the address matches or the key is named; all: every kind of entry that is written
+ * must match).  A zone whose settings come from a database (zone_ext_t.db_acl_ceiling) is also bounded by
+ * options { database { acl-ceiling } }: the client must be inside it too, and with no ceiling configured nobody is. */
+bool zone_transfer_acl_allows(const server_config_t *cfg, const zone_config_t *zcfg, const char *client_ip,
+                              const char *key_name);
+bool zone_update_acl_allows(const server_config_t *cfg, const zone_config_t *zcfg, const char *client_ip,
+                            const char *key_name);
 /* 鍵名 (DNS 名) が同じか。大文字小文字と末尾のドットは区別しない (RFC 4343 §2、D-03) */
 bool tsig_key_names_equal(const char *a, const char *b);
 
