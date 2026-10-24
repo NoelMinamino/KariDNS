@@ -167,6 +167,8 @@ typedef struct zone_ext {
   /* --- set by the code that installs the settings of a DB zone, never by text: the ACLs of this zone also have to pass
    * options { database { acl-ceiling } } (dns_tsig_acl.c) --- */
   bool db_acl_ceiling;
+  /* --- B8t-2: primary-settings no; ignores the settings the primary sends with the zone (Extended AXFR v3).  Default: they are used. --- */
+  bool primary_settings_off;
 } zone_ext_t;
 
 /* transfer-acl-match / update-acl-match values (zone_ext_t) */
@@ -416,6 +418,21 @@ typedef struct server_config_s {
 /* B7a: the first TSIG key name that the settings x of a DB zone name (allow-transfer key, allow-update name, tsig-key) and
  * cfg does not define in a key {} block, or NULL when all exist */
 const char *db_settings_missing_key(const zone_ext_t *x, const server_config_t *cfg);
+
+/* B8t-2: the settings of a zone as its primary sends them to the secondaries (Extended AXFR v3, TYPE 65408), in the syntax of
+ * db_settings_parse(): allow-transfer (addresses and keys; the zone's tsig-key of a master zone), transfer-acl-match,
+ * ecs-trusted-resolvers (the zone's list, else options'; not when omit_trusted: the zone data carries its own), additional-from-auth
+ * and zone-udp-bufsize, each with the value the primary applies (the zone's, else options').  The ACLs of a database zone are cut at
+ * acl-ceiling (only what lies inside it is written; no ceiling configured = none).  Never acl-ceiling itself, TSIG secrets or any other
+ * server-level policy.  Returns the length (0 = nothing to send), (size_t)-1 when it does not fit cap. */
+size_t zone_settings_render(const server_config_t *cfg, const zone_config_t *zcfg, bool omit_trusted, char *out, size_t cap);
+/* B8t-2: the zone configuration a secondary uses for a zone that received settings rx (a db_settings_parse() result) from its primary:
+ * a copy of base (the zone {} of karidns.conf, or the settings block of a database zone; NULL for a catalog member) in which a
+ * statement the secondary did not write itself is taken from rx; the rest falls back to options as always.  A TSIG key the received
+ * allow-transfer names and this server does not define makes the received allow-transfer "none" (note says why).  NULL when out of
+ * memory.  The result owns everything it points to. */
+zone_config_t *zone_config_with_received(const char *domain, const zone_config_t *base, const zone_ext_t *rx,
+                                         const server_config_t *cfg, char *note, size_t notelen);
 /* B7a: is options { database { acl-ceiling } } configured (any address or key entry)?  No ceiling = DB ACLs refuse everyone */
 bool db_acl_ceiling_configured(const server_config_t *cfg);
 

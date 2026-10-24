@@ -73,6 +73,19 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
 time_t xfr_expire_deadline(bool transferred, bool has_expire, uint32_t expire_opt,
                            uint32_t soa_expire, time_t cur_deadline, time_t now);
 
+/* B8t-2: which Extended AXFR version a primary speaks, as a secondary learns it (kept per zone, in memory).  The secondary asks for
+ * version 3; a standard transfer in answer may come from a primary that speaks version 2 only (it ignores a version it does not know), so
+ * the transfer is asked again with version 2 (no SOA_SET, no settings, as before) and the result is remembered: XFR_EXT_V2 = version 2,
+ * XFR_EXT_STANDARD = no extension at all (asked with version 3, accepted as it comes, no second request).  Both are forgotten after
+ * XFR_EXT_REPROBE_SECS, so an upgraded primary is found; XFR_EXT_V3 and XFR_EXT_UNKNOWN ask for version 3 and fall back when the answer
+ * is a standard transfer. */
+enum { XFR_EXT_UNKNOWN = 0, XFR_EXT_STANDARD = 1, XFR_EXT_V2 = 2, XFR_EXT_V3 = 3 };
+#define XFR_EXT_REPROBE_SECS (6 * 3600)
+uint8_t xfr_ext_effective(uint8_t state, time_t set_at, time_t now);   /* the state to act on: STANDARD and V2 expire to UNKNOWN */
+uint8_t xfr_ext_request_version(uint8_t state);                        /* 2 for V2, else 3 */
+bool xfr_ext_probe(uint8_t state);                                      /* may a standard answer to version 3 mean "ask with version 2"? */
+uint8_t xfr_ext_learn(bool answered_extended, uint8_t answered_version); /* the state after a transfer that finished */
+
 void *axfr_bg_thread_func(void *arg);
 
 void send_axfr_response(int client_fd, const char *qname __attribute__((unused)), uint8_t *req,

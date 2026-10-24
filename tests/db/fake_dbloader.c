@@ -46,6 +46,13 @@
  *   zero-ancount     a ZONE_DATA message with ANCOUNT 0                                 -> protocol error
  *   opt-twice        ARCOUNT 1 in the second ZONE_DATA of a zone                        -> protocol error
  *   unknown-tag      ZONE_BEGIN with an unknown TLV tag                                 -> protocol error
+ * Modes of the version 3 SOA set (B8t-2: SOA_SET, the apex SOA RRs as wrapped body RRs):
+ *   soaset-ok        two SOAs (one with the location in), the frame is the reference SOA     -> applied
+ *   soaset-serial    a body SOA with another serial than the frame                          -> zone rejected
+ *   soaset-count     SOA_SET announces 3, the body has 2                                    -> zone rejected
+ *   soaset-late      SOA_SET after a data record                                            -> zone rejected
+ *   soaset-dup       two body SOAs for the same clients (both location in)                  -> zone rejected
+ *   soaset-frame     the opening SOA is not the reference SOA (another refresh)             -> zone rejected
  * Modes of the settings part (B7a):
  *   settings-key     settings text naming a TSIG key karidns.conf does not define          -> zone rejected
  *   settings-include settings text with an include statement                               -> zone rejected
@@ -132,16 +139,37 @@ static void dm_rr(dm_t *m, const char *owner, uint16_t type, uint16_t cls, const
     put16(m->b + 6, m->an);
 }
 
-static void dm_soa(dm_t *m, const char *zone, uint32_t serial) {
+static void dm_soa_ex(dm_t *m, const char *zone, uint32_t serial, uint32_t refresh) {
     uint8_t rd[600];
     char mn[300], rn[300];
     snprintf(mn, sizeof(mn), "ns.%s", zone);
     snprintf(rn, sizeof(rn), "host.%s", zone);
     size_t n = wname(rd, mn);
     n += wname(rd + n, rn);
-    put32(rd + n, serial); put32(rd + n + 4, 3600); put32(rd + n + 8, 600); put32(rd + n + 12, 86400);
+    put32(rd + n, serial); put32(rd + n + 4, refresh); put32(rd + n + 8, 600); put32(rd + n + 12, 86400);
     put32(rd + n + 16, 300);
     dm_rr(m, zone, 6, 1, rd, n + 20);
+}
+
+static void dm_soa(dm_t *m, const char *zone, uint32_t serial) { dm_soa_ex(m, zone, serial, 3600); }
+
+/* B8t-2: a SOA of a SOA set: TYPE 65406 around the SOA, with the tinydns location loc ("" = none) */
+static void dm_soa_set_member(dm_t *m, const char *zone, uint32_t serial, uint32_t refresh, const char *loc) {
+    uint8_t rd[600], w[700];
+    char mn[300], rn[300];
+    snprintf(mn, sizeof(mn), "ns.%s", zone);
+    snprintf(rn, sizeof(rn), "host.%s", zone);
+    size_t n = wname(rd, mn);
+    n += wname(rd + n, rn);
+    put32(rd + n, serial); put32(rd + n + 4, refresh); put32(rd + n + 8, 600); put32(rd + n + 12, 86400);
+    put32(rd + n + 16, 300);
+    n += 20;
+    memset(w, 0, sizeof(w));
+    put16(w, 6); put16(w + 2, 1); put32(w + 4, 300);                 /* the original TYPE, CLASS, TTL */
+    w[8] = (uint8_t)loc[0]; w[9] = loc[0] ? (uint8_t)loc[1] : 0;     /* the location, no time stamp */
+    put16(w + 19, (uint16_t)n);
+    memcpy(w + 21, rd, n);
+    dm_rr(m, zone, 65406, 65302, w, 21 + n);
 }
 
 static void dm_a(dm_t *m, const char *owner, uint8_t last) {
@@ -180,12 +208,14 @@ static void batch_end(int fd, uint32_t deleted) {
     send_msg(fd, "KDB1", 11, b, n);
 }
 
+static uint32_t g_zb_serial = 1;              /* the serial ZONE_BEGIN declares (the SOA serial of the zone) */
+
 static void zone_begin_ex(int fd, const char *zone, uint8_t kind, uint32_t flags, uint64_t declared, uint16_t extra_tag,
                           const char *settings, const char *profile) {
     uint8_t b[1024], view[2] = { 0, 0 }, serial[4], fl[4], rrs[8], digest[32] = { 0 }, src[8] = { 0 };
     char canon[300];
     snprintf(canon, sizeof(canon), "%s.", zone);
-    put32(serial, 1);
+    put32(serial, g_zb_serial);
     put32(fl, flags);
     put64(rrs, declared);
     put64(src, 100 + g_nzones);
@@ -227,6 +257,7 @@ static void good_zone(int fd, const char *zone, uint32_t serial) {
     snprintf(h1, sizeof(h1), "www.%s", zone);
     snprintf(h2, sizeof(h2), "mail.%s", zone);
     dm_init(&m);
+    g_zb_serial = serial;
     dm_soa(&m, zone, serial);
     dm_ns(&m, zone, ns);
     dm_a(&m, ns, 1);
@@ -243,6 +274,7 @@ static void bad_zone(int fd, const char *mode) {
     dm_t m;
     const char *z = "bad.test";
     dm_init(&m);
+    g_zb_serial = 5;
     if (strcmp(mode, "owner-outside") == 0) {
         dm_soa(&m, z, 5); dm_a(&m, "host.other.test", 1); dm_soa(&m, z, 5);
         zone_begin(fd, z, 0, 0, 3, 0); zone_data(fd, &m); zone_end(fd, 3);
@@ -315,6 +347,25 @@ static void bad_zone(int fd, const char *mode) {
         }
         dm_soa(&m, z, 5);
         zone_begin(fd, z, 0, flags, declared, 0); zone_data(fd, &m); zone_end(fd, declared);
+    } else if (strncmp(mode, "soaset-", 7) == 0) {                 /* B8t-2: the version 3 SOA set */
+        const char *m2 = mode + 7;
+        uint8_t locdef[7] = { 'i', 'n', 32, 127, 0, 0, 1 };
+        uint8_t set_n[3] = { 1, 0, (uint8_t)(strcmp(m2, "count") == 0 ? 3 : 2) };
+        uint64_t declared = 8;                                    /* frame, SOA_SET, locdef, 2 wrapped SOAs, NS, A, closing SOA */
+        uint32_t fr = strcmp(m2, "frame") == 0 ? 1234 : 3600;     /* "frame": the opening SOA is not the reference SOA */
+        dm_soa_ex(&m, z, 5, fr);
+        if (strcmp(m2, "late") == 0) {                             /* SOA_SET after a data record */
+            dm_a(&m, "www.bad.test", 1);
+            declared++;
+        }
+        dm_rr(&m, z, 65409, 65302, set_n, 3);
+        dm_rr(&m, z, 65405, 65302, locdef, 7);
+        dm_soa_set_member(&m, z, 5, 3600, "in");
+        dm_soa_set_member(&m, z, strcmp(m2, "serial") == 0 ? 6 : 5, 3600, strcmp(m2, "dup") == 0 ? "in" : "");
+        dm_ns(&m, z, "ns.bad.test");
+        dm_a(&m, "www.bad.test", 1);
+        dm_soa_ex(&m, z, 5, fr);
+        zone_begin(fd, z, 0, 6, declared, 0); zone_data(fd, &m); zone_end(fd, declared);
     } else if (strcmp(mode, "non-in-class") == 0) {
         uint8_t rd[4] = { 192, 0, 2, 1 };
         dm_soa(&m, z, 5); dm_rr(&m, "www.bad.test", 1, 3, rd, 4); dm_soa(&m, z, 5);

@@ -1304,6 +1304,7 @@ static void on_zone_begin(ing_t *g, const kdb_msg_t *m) {
     j->zkind = zb->zone_kind;                            /* no ZONE_DATA follows (the stream rules, dns_db_stream.c): ZONE_END runs it */
   } else {
     j->build = db_zone_build_new(j->zone, j->rr_count, zb->flags);
+    if (j->build) db_zone_build_set_serial(j->build, zb->serial);
     if (!j->build) {
       j->skip = true;
       job_reject(j, "out of memory");
@@ -2128,6 +2129,9 @@ static void secondary_status(status_ctx_t *c, const zone_db_entry_t *e, const zo
               (unsigned)atomic_load_explicit(&e->serial, memory_order_relaxed));
   else
     st_append(c, "  transfer: no transfer has succeeded yet (kept in memory only)\n");
+  /* B8t-2: the settings the primary sent with the zone (Extended AXFR version 3); the statements of the zone's own metadata win */
+  if (atomic_load_explicit(&e->rxcfg, memory_order_acquire))
+    st_append(c, "  settings from the primary: in force (what the zone's own metadata sets wins over them)\n");
 }
 
 /* B7a: where the settings of a DB zone come from and what acl-ceiling makes of its ACLs */

@@ -1026,21 +1026,44 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         if (sorted) {
             for (size_t k = 0; k < arena.count; k++) sorted[k] = &arena.records[k];
             qsort(sorted, arena.count, sizeof(dns_record_t *), cmp_rec_by_name_type);
-            for (size_t k = 0; k + 1 < arena.count; k++) {
-                if (!sorted[k]->name || !sorted[k + 1]->name) continue;
-                /* RRSIG(46)同士の比較は被覆タイプが異なる場合に誤検知する可能性があるため除外 */
-                if (sorted[k]->type_code == 46 && sorted[k + 1]->type_code == 46) continue;
-                if (sorted[k]->type_code == sorted[k + 1]->type_code &&
-                    strcasecmp(sorted[k]->name, sorted[k + 1]->name) == 0 &&
-                    sorted[k]->ttl_value != sorted[k + 1]->ttl_value) {
-                    kc_warning(&tally,
-                        "RRset '%s' type %d has inconsistent TTLs (%u vs %u) in the source "
-                        "zone file; RFC 2181 §5.2 requires all RRs in an RRset to share the same TTL. "
-                        "KariDNS will normalize this to the minimum value at load time, "
-                        "but the zone file should be corrected.\n",
-                        sorted[k]->name, sorted[k]->type_code,
-                        sorted[k]->ttl_value, sorted[k + 1]->ttl_value);
+            /* B8t-2: the TTLs of an RRset are harmonized (lowest wins) among the RRs that have the same visibility only (location, time
+             * stamp, tag); an RR that only some clients see keeps its TTL, so an unrestricted RR and a restricted RR of one name and type
+             * with different TTLs make a client that sees both get an RRset with differing TTLs (tinydns serves them that way). */
+            for (size_t k = 0; k < arena.count;) {
+                size_t e = k + 1;
+                while (e < arena.count && sorted[e]->name && sorted[k]->name && sorted[e]->type_code == sorted[k]->type_code &&
+                       strcasecmp(sorted[e]->name, sorted[k]->name) == 0)
+                    e++;
+                if (!sorted[k]->name || sorted[k]->type_code == 46 || e - k < 2) {
+                    k = e;
+                    continue;
                 }
+                size_t lim = e - k > 64 ? k + 64 : e;     /* a very large RRset: compare the first 64 */
+                bool warned_norm = false, warned_covis = false;
+                for (size_t a = k; a < lim; a++) {
+                    for (size_t b = a + 1; b < lim; b++) {
+                        if (sorted[a]->ttl_value == sorted[b]->ttl_value) continue;
+                        if (dns_record_same_visibility(sorted[a], sorted[b])) {
+                            if (warned_norm) continue;
+                            warned_norm = true;
+                            kc_warning(&tally,
+                                "RRset '%s' type %d has inconsistent TTLs (%u vs %u) in the source "
+                                "zone file; RFC 2181 §5.2 requires all RRs in an RRset to share the same TTL. "
+                                "KariDNS will normalize this to the minimum value at load time, "
+                                "but the zone file should be corrected.\n",
+                                sorted[a]->name, sorted[a]->type_code, sorted[a]->ttl_value, sorted[b]->ttl_value);
+                        } else if (dns_record_is_restricted(sorted[a]) != dns_record_is_restricted(sorted[b])) {
+                            if (warned_covis) continue;
+                            warned_covis = true;
+                            kc_warning(&tally,
+                                "RRset '%s' type %d: an RR that every client sees and an RR with a location, time stamp or tag have "
+                                "different TTLs (%u vs %u). A client that sees both gets an RRset with differing TTLs (RFC 2181 §5.2); "
+                                "KariDNS keeps the TTL written on each RR, as tinydns does.\n",
+                                sorted[a]->name, sorted[a]->type_code, sorted[a]->ttl_value, sorted[b]->ttl_value);
+                        }
+                    }
+                }
+                k = e;
             }
             free(sorted);
         }

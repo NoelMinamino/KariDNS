@@ -502,7 +502,7 @@ A zone file with `$LOCATION` / `$ECS-SUBNET` tags or a tinydns data file is not 
 
 **`acl-ceiling` and the trusted resolvers.** The list of `X-KARIDNS-ECS-TRUSTED-RESOLVERS` is bounded by the ceiling **when a query is answered**: a resolver is trusted only if the zone's list and the **address entries** of `acl-ceiling` both accept its address (keys of the ceiling do not matter: ECS trust has no key; with no ceiling configured nobody is trusted; a zone without the metadata uses the `ecs-trusted-resolvers` of `options`, which is not bounded). `karidns-dbloader` / the Backend log the entries that lie outside the ceiling once per distinct settings text. A server that is a secondary of a database zone gets the list in the Extended AXFR (it is the primary's data) and applies its own configuration to it.
 
-**What does not carry over.** (1) The SOA serial that a tinydns `.` line takes from the data file's modification time: the database stores the number the importer saw; whoever edits the zone bumps it (a `Z` line carries an explicit serial). (2) The data file as text: comments, line grouping, one line that writes into two zones (`=` makes an A and a PTR: two independent rows in two zones), a data file with many zones (the importer writes one zone per SOA). (3) Several SOA rows for the apex, and tags or tinydns attributes (time stamp, location) on a SOA row (milestone B8t-1): `karidns-dbloader` reads them like any other row (the SOA rows must have one serial; the SOA without attributes, else the first row, is the reference SOA and gives the zone serial; a presigned zone cannot have them) and the rules of "Several SOA records" below apply to a zone file. The stream between the loader and the Backend is still the Extended AXFR v2 format, whose frame SOA has no attributes and whose receiver ends at the second SOA, so such a zone fails in the loader for now (`zone '...': several SOA records or attributes ... need the extended transfer format of B8t-2`; the last good version keeps serving). The next format (milestone B8t-2) carries them. (4) `karidns_*` rows of a record that is disabled or does not exist are ignored with a warning.
+**What does not carry over.** (1) The SOA serial that a tinydns `.` line takes from the data file's modification time: the database stores the number the importer saw; whoever edits the zone bumps it (a `Z` line carries an explicit serial). (2) The data file as text: comments, line grouping, one line that writes into two zones (`=` makes an A and a PTR: two independent rows in two zones), a data file with many zones (the importer writes one zone per SOA). (3) Several SOA rows for the apex, and tags or tinydns attributes (time stamp, location) on a SOA row (milestone B8t-1): `karidns-dbloader` reads them like any other row (the SOA rows must have one serial; the SOA without attributes, else the first row, is the reference SOA and gives the zone serial; a presigned zone cannot have them) and the rules of "Several SOA records" below apply to a zone file. Milestone B8t-2: the stream between the loader and the Backend is the Extended AXFR version 3 format, which carries them (the frame is the reference SOA, `SOA_SET` announces the number of SOA rows and each SOA row is a body RR in a wrapper record, with its tinydns attributes and tags). The Backend checks what the loader sent: every SOA at the apex, one serial (the one `ZONE_BEGIN` declares), no two SOA rows for the same clients, the opening SOA is the reference SOA, the number announced; a zone that fails a check is rejected and the last good version keeps serving. At most 4096 SOA rows. (4) `karidns_*` rows of a record that is disabled or does not exist are ignored with a warning.
 
 **Importer.** `tests/db/zone2sql` (the seed of the later ZoneImporter) writes all of this: `zone2sql --dialect sqlite3|pgsql zone` for a zone file with tags, `zone2sql --format tinydns data` for a tinydns data file; apply `db/karidns_ext.*.sql` first.
 
@@ -532,6 +532,7 @@ A zone file with `$LOCATION` / `$ECS-SUBNET` tags or a tinydns data file is not 
 | `rate-limit { ... };` | all | Per-zone RRL block (replaces the server-wide one). |
 | `ecs-tags { ... };`, `location-tags { ... };` | master, slave | Per-zone tag definitions. |
 | `ecs-trusted-resolvers { ... };` | master, slave | Per-zone trusted ECS resolvers. |
+| `primary-settings yes\|no;` | slave | `yes` (default): use the settings the primary sends with the zone (Extended AXFR version 3: `allow-transfer`, `transfer-acl-match`, `ecs-trusted-resolvers`, `additional-from-auth`, `zone-udp-bufsize`); a statement written in this `zone {}` still wins. `no`: ignore them. See "Secondary zones: Extended AXFR version 3 and the settings of the primary". |
 | `additional-from-auth yes\|in-domain\|no;` | all | Per-zone override of the `options` value. |
 | `disable-auto-tc-flag yes\|no;` | program | See PROGRAM ZONE PLUGINS. Any other value is an error. |
 | `zone-tcp-mss`, `zone-tcp-window`, `zone-tcp-sndbuf`, `zone-udp-bufsize` | all | Per-zone transport settings; see TRANSPORT TUNING. |
@@ -614,6 +615,69 @@ there, taken from the zone and falling back to the server-wide values (catalog m
 | `SO_RCVBUF` | `zone-tcp-window`, else `tcp-window` | before `connect()`, so it covers the window advertised in the SYN; this is the one that speeds up receiving a large AXFR/IXFR |
 | `SO_SNDBUF` | `zone-tcp-sndbuf`, else `tcp-window` | before `connect()` |
 | `TCP_MAXSEG` | `zone-tcp-mss`, else `tcp-mss` | after `connect()`: lowers the send MSS only, for the same FreeBSD reason as above |
+
+### Secondary zones: Extended AXFR version 3 and the settings of the primary (milestone B8t-2)
+
+Between two KariDNS servers the transfer carries more than the RRs (EDNS option 65153, see "Extended AXFR" in
+`KariDNS_How_to_use_ECS_and_location.md`). Version 3 adds two things, both in private-use records of CLASS 65302 (RFC 6895 §3).
+
+**Versions.** The secondary asks for version 3. A primary answers version 2 and 3 with a stream of the version asked; a version 2
+secondary of a version 3 primary therefore keeps working (it is refused only for a zone with several or restricted SOA records,
+see "Several SOA records"), and a version 3 secondary of a version 2 primary keeps its tags and tinydns attributes: a version 2 primary does not know
+version 3 and answers a standard transfer, so the secondary stops that transfer at its first message (nothing is installed), asks again
+with version 2 and uses the version 2 stream (no `SOA_SET`, no settings). It remembers per zone, in memory, that the primary speaks
+version 2 and asks for version 2 directly from then on; after 6 hours (`XFR_EXT_REPROBE_SECS`) it asks for version 3 again, so an
+upgraded primary is found. A primary that answers a standard transfer to version 2 as well (not KariDNS) costs one extra request and
+is then remembered the same way (version 3 asked, a standard answer accepted at once, re-probed after 6 hours). Upgrading the secondaries
+first therefore does not degrade service. Any other version, or a request without the option, is a standard transfer. A version 3 stream of a plain zone (one unrestricted SOA) differs from the
+version 2 stream by the version in the OPT, the settings record, and by sending the trusted resolvers of the *configuration* in the
+settings instead of as `ECS_TRUSTED` (65407); the zone data is the same.
+
+**The SOA set.** For a zone with several or restricted apex SOA records (see "Several SOA records") the stream is: the reference
+SOA (frame), `SOA_SET` (65409: flags, number of apex SOA records), `SETTINGS`, the definitions, then every record in file order
+with each apex SOA as a TINYDNS_WRAP (65406) record that carries its attributes (and the `LOC_STATE` / `ECS_STATE` records of its
+tags), the resetting state records, the frame. The secondary does not store the frame as data, takes its serial and timers from it,
+and ends up with exactly the SOA set of the primary; a stream that announces another number of SOA records, has a SOA of another
+serial or not at the apex, or puts `SOA_SET` anywhere but right after the opening SOA is refused. A change of the SOA set or of a
+SOA attribute reaches a secondary with a full transfer (an IXFR request is answered with an AXFR for such a zone, and also when an
+earlier version of it had a SOA set).
+
+**The settings of the primary.** The primary sends one `SETTINGS` record (65408): the zone's effective settings as text in the
+syntax of a `zone {}` block, the statements of the restricted parser of "Settings of database zones". The statements sent, each
+with the value the primary applies (the zone's own, else `options`'):
+
+| Statement | Sent when |
+|---|---|
+| `allow-transfer { <addresses> key "<name>"; ... };` and `transfer-acl-match` | the zone has an `allow-transfer` (or a `tsig-key`, which on a primary may also transfer): the addresses (with their `!`), the key *names* |
+| `ecs-trusted-resolvers { ... };` | the zone or `options` has the list and the zone's own data has none |
+| `additional-from-auth`, `zone-udp-bufsize` | the zone or `options` sets them |
+
+Never sent: `acl-ceiling`, TSIG secrets (only key names), `masters`, `also-notify`, `allow-update` or any other server-level policy.
+The ACLs of a *database* zone are cut at the primary's `acl-ceiling` before they are sent: an address or prefix that is not
+entirely inside the ceiling and a key that the ceiling does not name are left out, and a database zone's ACL without a configured
+ceiling is sent as `none` (the secondary must never get a wider list than the primary applies). A text longer than 32,768 octets is
+not sent (logged). The same record is sent in an IXFR (right after the opening SOA) and in an AXFR, and a secondary that serves
+the zone to others sends the settings in force on it. The tag definitions of the configuration (`location-tags` / `ecs-tags` of the
+zone, else `options`) that the records of the zone use are sent as tag definitions (65403 / 65404) when the zone data defines no
+tags of its own; the secondary then resolves tags as the primary does and needs no `location-tags` of its own for the zone.
+
+**On the secondary.** The text is parsed with the restricted parser (`file`, `type`, `include`, unknown statements are errors; a
+text that does not parse is dropped with a warning), and merged with the zone as the secondary has it:
+**a statement written in the secondary's own `zone {}` > the received statement > the secondary's `options`**. Statements the
+secondary does not take from the primary (`masters`, `tsig-key`, `also-notify`, ...) are parsed and ignored. A TSIG key name in
+the received `allow-transfer` is valid only if the secondary defines that key; otherwise that ACL fails closed (`none`, logged and
+shown by `zonestatus`) while the rest of the settings apply. `primary-settings no;` in the zone ignores the received settings
+altogether. The received settings are replaced by every successful transfer (a transfer without a `SETTINGS` record clears them), are
+kept when a refresh fails or the primary is down, follow a changed `karidns.conf` (the secondary's own statements are re-read), and
+live in memory only, like the data; a catalog member zone and a database secondary use them in the same way (for a database zone
+the settings of its database row take the place of the `zone {}` block). `karictl zonestatus` shows `settings=primary` while
+received settings are in force. A change of the settings alone (no new serial) reaches the secondary with its next transfer.
+
+> [!WARNING]
+> Over an unsigned transfer a path attacker (or anybody who can answer instead of the primary) can change the ACLs of the
+> secondary: widen `allow-transfer`, add a trusted ECS resolver. Sign the transfer with a TSIG key (`tsig-key` in the secondary's
+> zone, `allow-transfer { key ...; }` on the primary) whenever the settings are accepted, or write the statements that matter in the
+> secondary's own `zone {}` (they win) or set `primary-settings no;`.
 
 ### Forward and program zones: not applied upstream
 
@@ -792,7 +856,8 @@ A zone can have one SOA record per client group: a `Z` line per location in a ti
 - **Answers.** The SOA a client gets is the first SOA it can see, with the rules that decide the other records (its tinydns location, its `$LOCATION` / `$ECS-SUBNET` tag, the tinydns time stamp and countdown, as `tdlookup.c` does). A query for the SOA (or ANY) at the apex gets that one SOA only. NXDOMAIN and NODATA carry it in the authority section (RFC 2308 §3) and its MINIMUM is the negative TTL (RFC 2308 §5).
 - **A client that sees no SOA** of the zone, whether or not it sees an NS record, gets **REFUSED with AA=0 and Extended DNS Error 18 (Prohibited, RFC 8914 §4.19)**, for every name and type of the zone and for a zone transfer. This is the answer of BIND 9.20 to a client a zone is not served to (no matching view, `allow-query` denial); `tdlookup.c` differs: with a visible NS it answers a referral without AA, and with nothing visible it sends no response. The zone is treated as not served to that client: the closest zone decides, there is no fall back to the answer of a parent zone (a parent's referral to the child is not shown), and a CNAME chain that leads into such a zone ends at the CNAME.
 - **Standard AXFR and IXFR** (a request without the KariDNS extension, e.g. from BIND, NSD or `dig`) of a zone with per-client records is the zone **as the requester sees it now**, as `axfrdns.c` builds it: the RRs the requester's address does not match (tinydns location, `$LOCATION` tag) or that are not active (time stamp) are not sent, a record with a countdown TTL is sent with TTL 2, no location, tag or time stamp is sent, an `$ECS-SUBNET`-tagged RR is not sent (a transfer has no client subnet), the opening and closing SOA is the first SOA the requester sees, and a requester that sees none is refused (REFUSED, AA=0, EDE 18). Every other SOA record is left out of the body. A zone without such RRs is transferred as before. (Before this release a standard transfer left out every restricted RR, and it kept all SOA records.) An IXFR of such a zone is answered with the whole zone, as RFC 1995 §4 allows, unless the requester is up to date (then one SOA).
-- **Extended AXFR (v2) of a zone with several or restricted SOA records is refused** (REFUSED with a text) until the next format (milestone B8t-2): its frame SOA has no attributes and its receiver ends a transfer at the second SOA. A KariDNS secondary of such a zone therefore cannot be set up yet, and a database zone with such SOA rows fails in the loader with that reason (see "Location / ECS tags and tinydns zones in the database").
+- **Extended AXFR of such a zone (milestone B8t-2)** is the whole zone, for a KariDNS secondary that speaks version 3 (see "Secondary zones: Extended AXFR version 3 and the settings of the primary"): the frame is the reference SOA, every SOA record travels in the body with its attributes, and the secondary ends up with exactly the SOA set of the primary and answers each client as the primary does. A secondary of version 2 is refused (REFUSED with a text): sending it the reference SOA alone would show a hidden SOA to everybody. A KariDNS secondary outside every SOA's location can still refresh: the extension makes the primary answer with the reference SOA whatever the requester's address is (a SOA or IXFR question that carries the extension option for the zone gets it too).
+- **TTLs of an RRset (milestone B8t-2).** The TTLs of the RRs of one name and type are brought to the lowest one (RFC 2181 §5.2) only among RRs that are seen by the same clients: no location / tag / time stamp, or the same. An RR that only some clients see keeps the TTL it was written with, also when an RR that everybody sees has the same name and type: a client that sees both gets an RRset whose RRs have different TTLs, as it does from tinydns (`+www:192.0.2.1:300` and `+www:192.0.2.2:60::in`). `karicheck` warns for that case (an unrestricted and a restricted RR of one name and type with different TTLs). A zone without such RRs is unchanged. The rule is the same for zone files, database zones and zones received from a primary.
 - **Cache.** A zone with restricted RRs is never served from the response cache, so the answer cannot be shared between clients.
 
 The reference run against djbdns 1.05 (`tests/run_tinydns_soa_location_test.sh` with `DJBDNS_DIR`) shows the same SOA for each location, the same NXDOMAIN and the same transfer records; the difference is the client that sees no SOA (above).
@@ -807,7 +872,8 @@ KariDNS provides high-performance, record-level split-horizon response steering 
 - **BIND Zone `$ECS-SUBNET` & `$ECS-SUBNET-TAG`**: Steers responses based on EDNS0 Client Subnet (ECS, RFC 7871) options supplied by trusted recursive resolvers (`ecs-enable yes;` and `ecs-trusted-resolvers`). Tags can be defined in zone files (`$ECS-SUBNET-TAG`) or in `karidns.conf` (`ecs-tags`).
 - **tinydns `location` (`%`)**: Steers responses based on client IPv4 longest-prefix matching declared with `%<loc>:<prefix>` lines and trailing `:loc` record tags.
 - **Several SOA records per zone (B8t-1)**: a SOA can carry a tinydns location or time stamp, or a `$LOCATION` / `$ECS-SUBNET` tag; a client gets the first SOA it sees, and a client that sees none is refused. See "Several SOA records, and a client that sees none" in the tinydns section.
-- **KariDNS Extended AXFR (Option 65153)**: Replicates zone directives and tags across KariDNS primary and secondary servers, while providing a standard AXFR fallback (Plan B) for non-KariDNS clients: the zone as the requester sees it.
+- **TTLs of records that only some clients see (B8t-2)**: the lowest-TTL rule for an RRset (RFC 2181 §5.2) applies only among records with the same location, tag and time stamp; a record with a location, tag or time stamp keeps the TTL it was written with, also beside a record for everybody. `karicheck` warns when the two have different TTLs. See "Several SOA records, and a client that sees none".
+- **KariDNS Extended AXFR (Option 65153)**: Replicates zone directives, tags, the SOA set and (version 3) the primary's zone settings across KariDNS primary and secondary servers, while providing a standard AXFR fallback (Plan B) for non-KariDNS clients: the zone as the requester sees it. See "Secondary zones: Extended AXFR version 3 and the settings of the primary".
 
 For complete configuration syntax, query evaluation flows, and Extended AXFR details, see **[KariDNS: Client Geolocation & Subnet Steering Guide](KariDNS_How_to_use_ECS_and_location.md)**.
 

@@ -2318,10 +2318,14 @@ process_tcp_client: ;
           const zone_config_t *zcfg = xfr_view
               ? find_zone_config_in_view(cfg, xfr_view->name, qname)
               : NULL;
-          if (!zcfg && xfr_view && (qtype == 252 || qtype == 251)) {
-            /* a DB zone has settings of its own (dbcfg): the transfer checks below read them like a configured zone's */
+          if (xfr_view && (qtype == 252 || qtype == 251)) {
+            /* a DB zone has settings of its own (dbcfg), and a secondary may have settings received from its primary (B8t-2: rxcfg,
+             * the zone's own statements first): the transfer checks below read them like a configured zone's */
             zone_db_entry_t *xfr_entry = find_zone_exact_in_view(xfr_view, qname);
-            if (xfr_entry && xfr_entry->source == ZONE_SRC_DB) zcfg = zone_entry_config(cfg, xfr_entry);
+            if (xfr_entry && (!zcfg || xfr_entry->source == ZONE_SRC_DB || atomic_load_explicit(&xfr_entry->rxcfg, memory_order_acquire))) {
+              const zone_config_t *ec = zone_entry_config(cfg, xfr_entry);
+              if (ec) zcfg = ec;
+            }
           }
           bool is_synthetic_zone = (zcfg && zcfg->type &&
                                     (strcasecmp(zcfg->type, "program") == 0 ||
@@ -2978,9 +2982,17 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
     const char *res = zi->shadowed ? (zi->shadow_by == DBREG_SH_CATALOG ? "shadowed (hidden by a catalog member)"
                                                                          : "shadowed (hidden by a zone in karidns.conf)")
                                    : (zi->last_result == DBREG_REJECTED ? "rejected" : "applied");
-    int l = snprintf(m, sizeof(m), "OK serial=%u refresh=%u source=database view=%s id=%lld result=%s%s%s%s\n", zi->serial,
+    /* B8t-2: a database secondary with settings received from its primary */
+    bool rx_on = false;
+    {
+      zone_db_snapshot_t *zsnap = acquire_retained_zone_snapshot();
+      zone_db_entry_t *ze = zsnap ? dbreg_snapshot_entry(zsnap, zi->view, zone) : NULL;
+      if (ze) rx_on = zone_rx_settings_status(ze, NULL, 0);
+      if (zsnap) release_zone_snapshot(zsnap);
+    }
+    int l = snprintf(m, sizeof(m), "OK serial=%u refresh=%u source=database view=%s id=%lld result=%s%s%s%s%s\n", zi->serial,
                      zi->refresh, zi->view, (long long)zi->source_id, res, zi->has_entry ? "" : " (no version loaded)",
-                     zi->error[0] ? " last-error: " : "", zi->error);
+                     zi->error[0] ? " last-error: " : "", zi->error, rx_on ? " settings=primary" : "");
     if (l >= (int)sizeof(m)) l = (int)sizeof(m) - 1, m[l - 1] = '\n';
     send(cfd, m, (size_t)l, 0);
     return true;
@@ -3445,8 +3457,14 @@ void *control_thread_func(void *arg) {
               } else if (nmatches > 1) {
                 send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'zonestatus <zone> <view>')\n", 86, 0);
               } else if (lr.entry) {
-                char smsg[256];
-                int slen = snprintf(smsg, sizeof(smsg), "OK serial=%u refresh=%u\n", (uint32_t)lr.entry->serial, (uint32_t)lr.entry->refresh);
+                char smsg[384];
+                char rx_note[160];
+                /* B8t-2: a secondary says that settings received from its primary are in force (and which part is not) */
+                bool rx_on = zone_rx_settings_status(lr.entry, rx_note, sizeof(rx_note));
+                int slen = snprintf(smsg, sizeof(smsg), "OK serial=%u refresh=%u%s%s%s\n", (uint32_t)lr.entry->serial,
+                                    (uint32_t)lr.entry->refresh, rx_on ? " settings=primary" : "", rx_note[0] ? " note: " : "",
+                                    rx_note);
+                if (slen >= (int)sizeof(smsg)) slen = (int)sizeof(smsg) - 1, smsg[slen - 1] = '\n';
                 send(cfd, smsg, slen, 0);
               } else {
                 send(cfd, "ERROR zone not found\n", 21, 0);
@@ -3633,6 +3651,9 @@ void *control_thread_func(void *arg) {
             for (size_t v = 0; v < snap->view_count; v++) {
                 for (size_t i = 0; i < snap->views[v].zone_count; i++) {
                     zone_db_entry_t *entry = snap->views[v].entries[i];
+
+                    /* B8t-2: settings received from the primary follow a changed karidns.conf (a secondary's own statements win) */
+                    if (atomic_load_explicit(&entry->rx_present, memory_order_relaxed)) zone_rx_settings_refresh(entry, active);
 
                     if (atomic_exchange_explicit(&entry->notify_now, false, memory_order_acquire)) {
                         syslog(LOG_INFO, "[Control] Executing manual NOTIFY for %s", entry->domain);

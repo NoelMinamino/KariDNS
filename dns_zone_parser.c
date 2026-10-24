@@ -2120,6 +2120,9 @@ static void select_nsec3_params(zone_arena_t *arena) {
 }
 
 /* [T9] RFC 2181 s5.2: same owner+type RRset TTLs normalized to minimum.
+ * B8t-2: only among RRs of the same visibility (dns_record_same_visibility()): an RR that only some clients see (tinydns location or
+ * time stamp, $LOCATION / $ECS-SUBNET tag) keeps the TTL it was written with, also when an unrestricted RR of the same name and
+ * type exists (tinydns serves each record with its own TTL).  A zone without such RRs is unchanged.
  * RFC 4035 s2.2: RRSIG TTL aligned to the covered RRset (post phase-1) TTL. */
 static void harmonize_rrset_ttls(zone_arena_t *arena) {
   if (!arena->hash_table || arena->hash_size == 0 || arena->count == 0) return;
@@ -2142,6 +2145,7 @@ static void harmonize_rrset_ttls(zone_arena_t *arena) {
       dns_record_t *rj = &arena->records[j];
       if (rj->type_code != ri->type_code || !rj->name) continue;
       if (strcasecmp(rj->name, ri->name) != 0) continue;
+      if (!dns_record_same_visibility(rj, ri)) continue;
       if (rj->ttl_value < min_ttl) min_ttl = rj->ttl_value;
     }
 
@@ -2157,6 +2161,7 @@ static void harmonize_rrset_ttls(zone_arena_t *arena) {
       dns_record_t *rj = &arena->records[j];
       if (rj->type_code != ri->type_code || !rj->name) continue;
       if (strcasecmp(rj->name, ri->name) != 0) continue;
+      if (!dns_record_same_visibility(rj, ri)) continue;
       rj->ttl_value = min_ttl;
       processed[j] = true;
     }
@@ -2460,6 +2465,17 @@ size_t zone_arena_drop_unencodable(zone_arena_t *arena, void (*report)(const dns
 bool dns_record_is_restricted(const dns_record_t *r) {
   return r->tinydns_loc[0] != 0 || r->tinydns_loc[1] != 0 || r->tinydns_ttd != 0 || r->ecs_subnet_tag != NULL ||
          r->bind_location_tag != NULL;
+}
+
+static bool tags_equal_ci(const char *a, const char *b) {
+  if (!a || !b) return a == b;
+  return strcasecmp(a, b) == 0;
+}
+
+bool dns_record_same_visibility(const dns_record_t *a, const dns_record_t *b) {
+  return a->tinydns_loc[0] == b->tinydns_loc[0] && a->tinydns_loc[1] == b->tinydns_loc[1] && a->tinydns_ttd == b->tinydns_ttd &&
+         a->tinydns_ttl_countdown == b->tinydns_ttl_countdown && tags_equal_ci(a->bind_location_tag, b->bind_location_tag) &&
+         tags_equal_ci(a->ecs_subnet_tag, b->ecs_subnet_tag);
 }
 
 const dns_record_t *zone_arena_reference_soa(const zone_arena_t *arena, const char *zone) {

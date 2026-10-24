@@ -205,7 +205,8 @@ static bool pdns_roundtrip(const pdns_zone_t *z, rt_info_t *info, char *why, siz
             RT_FAIL("digest in ZONE_BEGIN does not match the ZONE_DATA bodies");
     }
     if (!session.is_finished) RT_FAIL("transfer not finished (closing SOA missing)");
-    if (standby.count + 1 + session.ext_records != inf.rr_count)
+    /* B8t-2: the opening SOA of a SOA set (SOA_SET) is the frame and is not stored */
+    if (standby.count + 1 + session.ext_records + (session.soa_set ? 1 : 0) != inf.rr_count)
         RT_FAIL("rr_count %llu but %zu RRs and %llu extension RRs parsed", (unsigned long long)inf.rr_count, standby.count + 1,
                 (unsigned long long)session.ext_records);
     if (((inf.flags & KDB_ZF_EXTENDED) != 0) != z->has_ext || (z->has_ext != (session.ext_records > 0 || session.ext_wrapped > 0)))
@@ -220,10 +221,14 @@ static bool pdns_roundtrip(const pdns_zone_t *z, rt_info_t *info, char *why, siz
         if (!same) RT_FAIL("the tag and location definitions that came out are not the ones that went in");
     }
     /* the flag alone is applied by db_zone_build_new() (dns_db_install.c), not by the transfer parser */
-    if ((z->arena.location_count > 0 || session.ext_wrapped > 0) != standby.is_tinydns_format)
-        RT_FAIL("is_tinydns_format %d after the transfer", (int)standby.is_tinydns_format);
+    {   /* a wrapper without a tinydns attribute (a SOA of a SOA set that has a tag only) does not make a tinydns zone */
+        bool tattr = z->arena.location_count > 0;
+        for (size_t k = 0; k < z->arena.count; k++)
+            if (z->arena.records[k].tinydns_loc[0] || z->arena.records[k].tinydns_loc[1] || z->arena.records[k].tinydns_ttd) tattr = true;
+        if (tattr != standby.is_tinydns_format) RT_FAIL("is_tinydns_format %d after the transfer", (int)standby.is_tinydns_format);
+    }
     if (standby.count != z->arena.count) RT_FAIL("%zu RRs came back, %zu went in", standby.count, z->arena.count);
-    if (standby.count == 0 || standby.records[0].type_code != 6) RT_FAIL("first RR is not the SOA");
+    if (standby.count == 0 || (!session.soa_set && standby.records[0].type_code != 6)) RT_FAIL("first RR is not the SOA");
 
     want = rt_sorted_lines(&z->arena, &nwant);
     got = rt_sorted_lines(&standby, &ngot);

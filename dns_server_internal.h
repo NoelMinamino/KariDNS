@@ -209,6 +209,16 @@ typedef struct {
   uint8_t rcode;          /* エラーの RCODE で転送が終わったときの値 (0 = エラー応答ではない) */
   uint64_t ext_records;   /* B8: number of Extended AXFR marker / definition RRs (65401-65405, 65407) read: they count as RRs but are not kept, so the database loader's declared count is checked against them */
   uint64_t ext_wrapped;   /* B8: TINYDNS_WRAP (65406) records read; each is a normal RR in the zone (already in the RR count) */
+  uint8_t ext_version;    /* B8t-2: the Extended AXFR version of the stream (2 or 3) the primary answered with; 0 = not extended */
+  bool soa_set;           /* B8t-2 (v3): SOA_SET (TYPE 65409) was read: the opening and closing SOA is not zone data, and the apex SOA RRs follow as wrappers */
+  uint32_t soa_set_expected, soa_set_seen; /* the number of body SOA RRs SOA_SET announced, and read */
+  bool frame_valid;       /* soa_set: the numbers of the frame SOA (the reference SOA) that was not stored */
+  uint32_t frame_refresh, frame_retry, frame_expire;
+  bool has_settings;      /* B8t-2 (v3): a SETTINGS record (TYPE 65408) was read; its text is in settings_text */
+  char settings_text[KARIDNS_SETTINGS_MAX + 1]; /* NUL terminated; not in the transfer's arena: an IXFR rebuilds the arena after the SETTINGS record */
+  size_t settings_len;
+  bool ext_probe;         /* B8t-2: version 3 was asked for and a standard answer means "try version 2" (xfr_ext_probe()) */
+  bool no_ext_answer;     /* set when handle_axfr_event() stopped for that reason */
   bool db_stream;         /* B8: the messages come from the database loader (ZONE_DATA): the Extended AXFR records are checked strictly (a malformed definition, state or wrapper record rejects the zone) and ECS_TRUSTED (65407) is refused: the trusted resolvers come from the settings text only, inside acl-ceiling */
 } axfr_session_t;
 
@@ -386,6 +396,18 @@ typedef struct {
   /* source == ZONE_SRC_DB のゾーンの設定 (それ以外は NULL)。読むのは zone_entry_config() だけ。
    * 差し替えは新しい物を公開してから、古い物を zone_retire_object() で積む */
   _Atomic(const zone_config_t *) dbcfg;
+  /* B8t-2: the settings the primary sent with the zone (Extended AXFR v3).  rxcfg is the zone configuration in force: a copy of the
+   * zone's own block (karidns.conf zone {}, or dbcfg) in which the statements the secondary did not write itself come from the
+   * received settings (zone_config_with_received()); NULL = no received settings in force.  Read by zone_entry_config(); replaced
+   * through the S2 retire stack.  rx_sh (the parsed text), rx_base, rx_gen and rx_note belong to the writers (entry->writer_lock) */
+  uint8_t xfr_ext_state;          /* B8t-2: what the primary speaks (XFR_EXT_*, dns_axfr_ixfr.h); written by the transfer thread only */
+  time_t xfr_ext_set;             /* when it was learned */
+  _Atomic(const zone_config_t *) rxcfg;
+  zone_ext_shared_t *rx_sh;
+  _Atomic bool rx_present;        /* rx_sh != NULL (read without the lock by the control thread's tick) */
+  const zone_config_t *rx_base;   /* the block rxcfg was made from (compared, never dereferenced) */
+  uint64_t rx_gen;                /* server_config_t.generation of that merge */
+  char rx_note[160];              /* why part of the received settings is not in force ("" = all of it is) */
   _Atomic(time_t) last_successful_transfer;
   /* RFC 7314 §4: セカンダリの expire タイマーが切れる時刻。0 なら
    * last_successful_transfer + expire (従来どおり SOA EXPIRE で数える)。 */
@@ -530,9 +552,24 @@ zone_config_t *find_zone_config_in_view(server_config_t *cfg, const char *view_n
 /* ゾーンエントリの設定。DB のゾーンは entry->dbcfg、それ以外は cfg の索引 (find_zone_config_in_view)。
  * 無ければ NULL。返した物は cfg を保持している間 (DB のゾーンは読み取り区間の中) だけ有効 */
 static inline const zone_config_t *zone_entry_config(server_config_t *cfg, const zone_db_entry_t *entry) {
+  const zone_config_t *rx = atomic_load_explicit(&entry->rxcfg, memory_order_acquire); /* B8t-2 */
+  if (rx) return rx;
   if (entry->source == ZONE_SRC_DB) return atomic_load_explicit(&entry->dbcfg, memory_order_acquire);
   return find_zone_config_in_view(cfg, entry->view_name, entry->domain);
 }
+/* B8t-2: the settings a primary sent with the zone.  zone_rx_settings_parse() reads the text with the restricted parser (NULL when
+ * there is none, or it is not accepted: logged; the text is never trusted).  zone_rx_settings_apply_locked() makes sh (ownership
+ * moves to the entry; NULL = none) the settings in force: it merges them with the zone's own configuration and publishes the result,
+ * and returns the settings that were in force (the caller unrefs them, or puts them back when the data cannot be installed).  The
+ * caller holds entry->writer_lock; the data is installed after the settings, so that the glue and the response cache of the new
+ * version are built with them.  zone_rx_settings_refresh() redoes the merge when karidns.conf (or the settings block of a database
+ * zone) changed under it (control thread, once per tick; skips the zone when a writer holds the entry). */
+zone_ext_shared_t *zone_rx_settings_parse(const char *zone, const char *text, size_t len);
+zone_ext_shared_t *zone_rx_settings_apply_locked(zone_db_entry_t *entry, zone_ext_shared_t *sh);
+void zone_rx_settings_refresh(zone_db_entry_t *entry, server_config_t *cfg);
+/* are received settings in force for the zone?  note (cap octets, may be NULL) gets why not all of them are ("" if all are, or when a writer
+ * holds the entry at the moment) */
+bool zone_rx_settings_status(zone_db_entry_t *entry, char *note, size_t cap);
 zone_db_snapshot_t *rebuild_zone_db_snapshot(server_config_t *config,
                                              const char *target_view_name,
                                              zone_db_entry_t *catalog_entry_to_update,

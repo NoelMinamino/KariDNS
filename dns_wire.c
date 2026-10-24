@@ -5131,6 +5131,19 @@ int xext_emit_locdef(xext_t *x, const char code[2], uint8_t prefix_bits, const u
     return xext_emit_blob(x, DNS_TYPE_KARIDNS_TINYDNS_LOCDEF, b, sizeof(b));
 }
 
+int xext_emit_soa_set(xext_t *x, uint16_t n) {
+    uint8_t b[3];
+    b[0] = 0x01;                        /* bit 0: the opening and closing SOA is not zone data */
+    b[1] = (uint8_t)(n >> 8);
+    b[2] = (uint8_t)n;
+    return xext_emit_blob(x, DNS_TYPE_KARIDNS_SOA_SET, b, sizeof(b));
+}
+
+int xext_emit_settings(xext_t *x, const char *text, size_t len) {
+    if (!text || len == 0 || len > KARIDNS_SETTINGS_MAX) return -1;
+    return xext_emit_blob(x, DNS_TYPE_KARIDNS_SETTINGS, (const uint8_t *)text, len);
+}
+
 /* The wrapper record around the RR written at tmp_wire[0, tmp_off) (owner, fixed fields, RDATA compressed against
  * tmp_wire itself): the original TYPE / CLASS / TTL / RDATA, the tinydns location and time stamp. */
 bool wrap_tinydns_wire(const uint8_t *tmp_wire, uint16_t tmp_off, const char loc[2], int64_t tinydns_ttd,

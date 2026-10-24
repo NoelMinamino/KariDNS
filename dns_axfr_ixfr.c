@@ -373,10 +373,11 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           session->has_expire = true;
           session->expire = edns.expire_value;
         }
-        if (edns.has_karidns_ext && edns.karidns_ext_version == KARIDNS_EXT_VERSION) {
+        if (edns.has_karidns_ext && KARIDNS_EXT_VERSION_OK(edns.karidns_ext_version)) {
           uint32_t exp_hash = calc_fnv1a_str(domain);
           if (edns.karidns_ext_hash == exp_hash) {
             session->is_extended_mode = true;
+            session->ext_version = edns.karidns_ext_version;
           }
         }
       }
@@ -411,6 +412,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
     standby->count++;
 
     // KariDNS Extended AXFR record interception:
+    bool wrapped_soa = false; /* a 65406 wrapper around an apex SOA RR: a body RR of a version 3 stream, never the frame */
     if (rec->class_val == DNS_CLASS_KARIDNS_EXT) {
       if (type == DNS_TYPE_KARIDNS_LOC_STATE) {
         standby->count--;
@@ -468,6 +470,48 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           standby->bind_ecs_trusted_resolvers_parsed = acl_list_parse(standby->bind_ecs_trusted_resolvers, standby->bind_ecs_trusted_resolver_count);
         }
         continue;
+      } else if (type == DNS_TYPE_KARIDNS_SOA_SET) {
+        /* B8t-2 (v3): the opening SOA is the frame, not zone data; n apex SOA RRs follow in the body, each in a 65406 wrapper.  It
+         * must come right after the opening SOA of a full transfer. */
+        standby->count--;
+        session->ext_records++;
+        if (rec->generic_len != 3 || !rec->generic_data || (rec->generic_data[0] & 1) == 0 || session->soa_set ||
+            session->soa_count != 1 || standby->count != 1 || standby->records[0].type_code != 6 ||
+            standby->records[0].rdata_count < 7) {
+          return xfr_ext_reject(domain, "a SOA_SET that is malformed, repeated or not right after the opening SOA");
+        }
+        uint32_t nbody = ((uint32_t)rec->generic_data[1] << 8) | rec->generic_data[2];
+        if (nbody == 0 || nbody > KARIDNS_SOA_SET_MAX) return xfr_ext_reject(domain, "a SOA_SET that announces no apex SOA RR, or more than 4096");
+        session->soa_set = true;
+        session->soa_set_expected = nbody;
+        session->frame_valid = true;
+        session->frame_refresh = parse_ttl_value(standby->records[0].rdata[3]);
+        session->frame_retry = parse_ttl_value(standby->records[0].rdata[4]);
+        session->frame_expire = parse_ttl_value(standby->records[0].rdata[5]);
+        standby->count = 0; /* the frame SOA is not stored */
+        continue;
+      } else if (type == DNS_TYPE_KARIDNS_SETTINGS) {
+        /* B8t-2 (v3): the settings of the primary for this zone.  Kept as text in the session (not in the transfer's arena, which an IXFR rebuilds); the caller parses them with the
+         * restricted parser once the transfer is complete.  Only for a stream that was negotiated as version 3, and never from the
+         * database loader (its settings come with ZONE_BEGIN). */
+        standby->count--;
+        session->ext_records++;
+        if (session->db_stream)
+          return xfr_ext_reject(domain, "a SETTINGS record in a stream where it is not allowed (the settings of a database zone come with ZONE_BEGIN)");
+        if (session->ext_version >= 3 && !session->has_settings && rec->generic_data && rec->generic_len > 0 &&
+            rec->generic_len <= KARIDNS_SETTINGS_MAX) {
+          memcpy(session->settings_text, rec->generic_data, rec->generic_len);
+          session->settings_text[rec->generic_len] = '\0';
+          session->settings_len = rec->generic_len;
+          session->has_settings = true;
+        } else if (session->has_settings || session->ext_version < 3) {
+          syslog(LOG_WARNING, "[AXFR] zone '%s': ignoring a SETTINGS record (%s)", domain,
+                 session->has_settings ? "a second one" : "the stream was not negotiated as version 3");
+        } else {
+          syslog(LOG_WARNING, "[AXFR] zone '%s': ignoring a SETTINGS record of %zu octets (empty or longer than %u)", domain,
+                 (size_t)rec->generic_len, KARIDNS_SETTINGS_MAX);
+        }
+        continue;
       } else if (type == DNS_TYPE_KARIDNS_TINYDNS_LOCDEF) {
         standby->count--;
         session->ext_records++;
@@ -479,7 +523,6 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
         continue;
       } else if (type == DNS_TYPE_KARIDNS_TINYDNS_WRAP) {
         session->ext_wrapped++;
-        standby->is_tinydns_format = true;
         if (session->db_stream && (!rec->generic_data || rec->generic_len < 21))
           return xfr_ext_reject(domain, "a TINYDNS_WRAP shorter than its fixed part");
         if (rec->generic_data && rec->generic_len >= 21) {
@@ -537,6 +580,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
               *rec = unwrapped;
               type = parsed_t;
               reconstructed = true;
+              if (parsed_t == 6) wrapped_soa = true;
             }
             if (!reconstructed) {
               if (session->db_stream) return xfr_ext_reject(domain, "a TINYDNS_WRAP whose RR cannot be decoded");
@@ -559,6 +603,8 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           rec->tinydns_loc[1] = loc[1];
           rec->tinydns_ttd = ttd;
           rec->tinydns_ttl_countdown = (flags & 1) ? true : false;
+          /* B8t-2: a version 3 stream wraps an apex SOA RR also when it has no tinydns attribute (tags only, or none) */
+          if (loc[0] != 0 || loc[1] != 0 || ttd != 0 || (flags & 1)) standby->is_tinydns_format = true;
         }
       }
     }
@@ -586,6 +632,18 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
     if (session->has_current_ecs_tag && session->current_ecs_tag[0] != '\0') {
       rec->ecs_subnet_tag = arena_strdup(standby, session->current_ecs_tag);
     }
+    if (type == 6 && wrapped_soa && session->soa_set) {
+      /* B8t-2 (v3): an apex SOA RR of the zone (with its attributes), not the frame */
+      uint32_t body_serial = rec->rdata_count >= 7 && rec->rdata[2] ? (uint32_t)strtoul(rec->rdata[2], NULL, 10) : 0;
+      if (!domain_names_match_ci(rec->name, domain) || rec->rdata_count < 7 || body_serial != session->initial_soa_serial ||
+          ++session->soa_set_seen > session->soa_set_expected) {
+        return xfr_ext_reject(domain, "an apex SOA RR of the body that is not at the apex, has another serial than the frame, or is more than SOA_SET announced");
+      }
+      continue;
+    }
+    /* a SOA is read through its RDATA fields: a TINYDNS_WRAP around a SOA that cannot be decoded leaves none (found by fuzz_xfr_packet) */
+    if (type == 6 && (!rec->rdata || rec->rdata_count < 3 || !rec->rdata[2]))
+      return xfr_ext_reject(domain, "a SOA whose RDATA cannot be decoded");
     if (type == 6) {
       session->soa_count++;
       uint32_t current_serial = strtoul(rec->rdata[2], NULL, 10);
@@ -642,6 +700,8 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
       } else {
         if (domain_names_match_ci(session->initial_soa_name, rec->name) &&
             session->initial_soa_serial == current_serial) {
+          if (session->soa_set && session->soa_set_seen != session->soa_set_expected)
+            return xfr_ext_reject(domain, "the transfer ends before all the apex SOA RRs SOA_SET announced");
           session->is_finished = true;
           standby->count--;
           if (i != ancount - 1) session->trailing_rrs = true; /* RFC 5936 §2.2: the final SOA is the last RR (the database loader checks it) */
@@ -755,6 +815,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
     prior_mac_len = req_mac_len;
   }
   bool is_subsequent = false;
+  bool first_msg = true;
   uint8_t *unsigned_msgs = NULL;
   size_t unsigned_msgs_len = 0;
   size_t unsigned_msgs_cap = 0;
@@ -840,6 +901,16 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
       zone_arena_destroy(&tmp_arena);
       return -1;
     }
+    /* B8t-2: version 3 was asked for and a standard transfer came back: the primary may speak version 2 only (or no extension at
+     * all).  Stop before anything is installed; the caller asks again with version 2 (xfr_ext_*), so that a secondary upgraded before
+     * its primary keeps the tags and tinydns attributes. */
+    if (first_msg && session->ext_probe && !session->is_extended_mode) {
+      session->no_ext_answer = true;
+      if (unsigned_msgs) free(unsigned_msgs);
+      zone_arena_destroy(&tmp_arena);
+      return -1;
+    }
+    first_msg = false;
     if (session->is_finished) {
       if (tsig_key && unsigned_msgs_len > 0) {
         syslog(LOG_ERR, "[AXFR] Final message unsigned or intermediate TSIG missing");
@@ -854,10 +925,19 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         /* S5 B-2: an RR that cannot be written in wire format is dropped with a warning and the rest is applied
          * (the same as a zone file; the published image holds only RRs that can be served) */
         zone_drop_unencodable_logged(&tmp_arena, entry->domain, "the zone transfer");
-        for (size_t k = 0; k < tmp_arena.count; k++) {
+        if (session->frame_valid) {
+          /* B8t-2 (v3, several or restricted apex SOA RRs): the zone-wide values are the frame's (the reference SOA) */
+          serial = session->initial_soa_serial;
+          refresh = session->frame_refresh;
+          retry = session->frame_retry;
+          expire = session->frame_expire;
+          has_soa = true;
+        }
+        for (size_t k = 0; !has_soa && k < tmp_arena.count; k++) {
           if (tmp_arena.records[k].type_code == 6 &&
               domain_names_match_ci(tmp_arena.records[k].name, entry->domain) &&
               tmp_arena.records[k].rdata_count >= 7) {
+
             serial = strtoul(tmp_arena.records[k].rdata[2], NULL, 10);
             refresh = parse_ttl_value(tmp_arena.records[k].rdata[3]);
             retry = parse_ttl_value(tmp_arena.records[k].rdata[4]);
@@ -867,11 +947,24 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
           }
         }
 
+        /* B8t-2: the settings of the primary (v3), kept past the install; a v3 transfer without them clears the earlier ones */
+        char *rx_text = NULL;
+        size_t rx_len = 0;
+        bool rx_apply = session->is_extended_mode && session->ext_version >= 3;
+        if (rx_apply && session->has_settings) {
+          rx_text = malloc(session->settings_len + 1);
+          if (rx_text) {
+            memcpy(rx_text, session->settings_text, session->settings_len);
+            rx_text[session->settings_len] = '\0';
+            rx_len = session->settings_len;
+          }
+        }
         pthread_mutex_lock(&entry->writer_lock);
         if (!wait_for_active_axfr(entry, 5000)) {
           pthread_mutex_unlock(&entry->writer_lock);
           if (unsigned_msgs) free(unsigned_msgs);
           zone_arena_destroy(&tmp_arena);
+          free(rx_text);
           syslog(LOG_WARNING, "[XFR] Inbound transfer swap for zone '%s' postponed: active AXFR in progress.", entry->domain);
           return -1;
         }
@@ -889,13 +982,21 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         }
 
         /* S5 B-2: the received zone (tmp_arena) is the builder; only its image is published (S5 B-3: as a new version) */
+        /* the settings are in force while the data is installed (the glue and the response cache of the new version read them); when the
+         * data is refused the previous settings are put back */
+        zone_ext_shared_t *rx_prev = NULL;
+        if (rx_apply) rx_prev = zone_rx_settings_apply_locked(entry, zone_rx_settings_parse(entry->domain, rx_text, rx_len));
         if (zone_install_builder(entry, &tmp_arena, "XFR") != 0) {
+          if (rx_apply) zone_ext_shared_unref(zone_rx_settings_apply_locked(entry, rx_prev));
           pthread_mutex_unlock(&entry->writer_lock);
           if (unsigned_msgs) free(unsigned_msgs);
           zone_arena_destroy(&tmp_arena);
+          free(rx_text);
           return -1;
         }
         pthread_mutex_unlock(&entry->writer_lock);
+        zone_ext_shared_unref(rx_prev);
+        free(rx_text);
 
         if (session->is_ixfr) {
           atomic_fetch_add_explicit(&entry->observatory.ixfr_success, 1, memory_order_relaxed);
@@ -944,7 +1045,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
 /* 転送要求 (AXFR、serial が 0 でなければ IXFR) を TCP の長さ前置き付きで buf に組み立てる。
  * IXFR の Authority にはクライアントの版の SOA (RFC 1995 §3)、OPT には長さ 0 の EXPIRE (RFC 7314 §4) と
  * Extended AXFR を付け、鍵があれば署名する (req_mac に要求の MAC)。戻り値は全体の長さ、失敗は 0。 */
-static size_t build_xfr_request(uint8_t *buf, size_t cap, const char *domain, uint32_t serial, uint16_t id,
+static size_t build_xfr_request(uint8_t *buf, size_t cap, const char *domain, uint32_t serial, uint16_t id, uint8_t ext_ver,
                                 tsig_key_t *tsig_key, uint8_t *req_mac, size_t *req_mac_len) {
   uint8_t *hdr = &buf[2];
   size_t len = 2;
@@ -980,7 +1081,7 @@ static size_t build_xfr_request(uint8_t *buf, size_t cap, const char *domain, ui
       0x00, 0x0D, /* RDLEN: 4 (EXPIRE) + 9 (Extended AXFR) */
       0x00, EDNS_OPTION_EXPIRE, 0x00, 0x00,
       (EDNS_OPTION_KARIDNS_EXT >> 8) & 0xFF, EDNS_OPTION_KARIDNS_EXT & 0xFF, 0x00, 0x05,
-      KARIDNS_EXT_VERSION, (domain_hash >> 24) & 0xFF, (domain_hash >> 16) & 0xFF, (domain_hash >> 8) & 0xFF,
+      ext_ver, (domain_hash >> 24) & 0xFF, (domain_hash >> 16) & 0xFF, (domain_hash >> 8) & 0xFF,
       domain_hash & 0xFF};
   memcpy(&buf[len], opt, sizeof(opt));
   len += sizeof(opt);
@@ -999,7 +1100,7 @@ static size_t build_xfr_request(uint8_t *buf, size_t cap, const char *domain, ui
 
 /* 1回の転送: 接続し、要求を送り、応答を処理する。戻り値は handle_axfr_event() と同じ
  * (1 = 転送した、2 = 最新、-1 = 失敗。エラー応答なら session->rcode にその RCODE)。 */
-static int xfr_attempt(axfr_bg_ctx_t *ctx, struct sockaddr_storage *master_addr, int family,
+static int xfr_attempt(axfr_bg_ctx_t *ctx, struct sockaddr_storage *master_addr, int family, uint8_t ext_ver, bool ext_probe,
                        tsig_key_t *tsig_key, uint32_t ixfr_serial, axfr_session_t *session) {
   uint32_t active_serial = ctx->entry ? ctx->entry->serial : 0;
   memset(session, 0, sizeof(*session));
@@ -1032,7 +1133,8 @@ static int xfr_attempt(axfr_bg_ctx_t *ctx, struct sockaddr_storage *master_addr,
   uint8_t req_mac[64];
   size_t req_mac_len = 0;
   int axfr_res = -1;
-  size_t req_len = build_xfr_request(axfr_req, sizeof(axfr_req), ctx->domain, ixfr_serial, session->query_id,
+  session->ext_probe = ext_probe;
+  size_t req_len = build_xfr_request(axfr_req, sizeof(axfr_req), ctx->domain, ixfr_serial, session->query_id, ext_ver,
                                      tsig_key, req_mac, &req_mac_len);
   if (req_len == 0) {
     syslog(LOG_ERR, "[AXFR] Failed to build%s request for zone %s", tsig_key ? " TSIG-signed" : "", ctx->domain);
@@ -1048,6 +1150,20 @@ static int xfr_attempt(axfr_bg_ctx_t *ctx, struct sockaddr_storage *master_addr,
   free(stream_ctx);
   close(tcp_fd);
   return axfr_res;
+}
+
+uint8_t xfr_ext_effective(uint8_t state, time_t set_at, time_t now) {
+  if ((state == XFR_EXT_STANDARD || state == XFR_EXT_V2) && now - set_at > XFR_EXT_REPROBE_SECS) return XFR_EXT_UNKNOWN;
+  return state;
+}
+
+uint8_t xfr_ext_request_version(uint8_t state) { return state == XFR_EXT_V2 ? 2 : KARIDNS_EXT_VERSION; }
+
+bool xfr_ext_probe(uint8_t state) { return state == XFR_EXT_UNKNOWN || state == XFR_EXT_V3; }
+
+uint8_t xfr_ext_learn(bool answered_extended, uint8_t answered_version) {
+  if (!answered_extended) return XFR_EXT_STANDARD;
+  return answered_version >= 3 ? XFR_EXT_V3 : XFR_EXT_V2;
 }
 
 void *axfr_bg_thread_func(void *arg) {
@@ -1098,11 +1214,32 @@ void *axfr_bg_thread_func(void *arg) {
 
   axfr_session_t session;
   uint32_t active_serial = ctx->entry ? ctx->entry->serial : 0;
-  int axfr_res = xfr_attempt(ctx, &master_addr, domain_family, tsig_key_ptr, active_serial, &session);
+  /* B8t-2: the Extended AXFR version this primary speaks (kept per zone, in memory): ask for version 3 first; when a standard transfer
+   * comes back, ask once more with version 2 and remember what the primary did (xfr_ext_*) */
+  time_t ext_now = time(NULL);
+  uint8_t ext_state = ctx->entry ? xfr_ext_effective(ctx->entry->xfr_ext_state, ctx->entry->xfr_ext_set, ext_now) : XFR_EXT_UNKNOWN;
+  uint8_t ext_ver = xfr_ext_request_version(ext_state);
+  int axfr_res = xfr_attempt(ctx, &master_addr, domain_family, ext_ver, xfr_ext_probe(ext_state), tsig_key_ptr, active_serial, &session);
+  if (axfr_res < 0 && session.no_ext_answer) {
+    syslog(LOG_NOTICE, "[AXFR] zone %s: %s answered a version 3 request with a standard transfer; asking with version 2", ctx->domain,
+           ctx->master_ip);
+    ext_ver = 2;
+    axfr_res = xfr_attempt(ctx, &master_addr, domain_family, ext_ver, false, tsig_key_ptr, active_serial, &session);
+  }
   /* R-19, RFC 1995 §4: IXFR を扱えないプライマリ (FORMERR / NOTIMP) からは AXFR で1回だけ取り直す */
   if (axfr_res < 0 && active_serial != 0 && (session.rcode == 1 || session.rcode == 4)) {
     syslog(LOG_NOTICE, "[AXFR] zone %s: %s does not support IXFR, retrying with AXFR", ctx->domain, ctx->master_ip);
-    axfr_res = xfr_attempt(ctx, &master_addr, domain_family, tsig_key_ptr, 0, &session);
+    axfr_res = xfr_attempt(ctx, &master_addr, domain_family, ext_ver, false, tsig_key_ptr, 0, &session);
+  }
+  if (axfr_res > 0 && ctx->entry) {
+    uint8_t learned = xfr_ext_learn(session.is_extended_mode, session.ext_version);
+    if (learned != ctx->entry->xfr_ext_state || ext_state != ctx->entry->xfr_ext_state) {
+      if (learned == XFR_EXT_V2)
+        syslog(LOG_NOTICE, "[AXFR] zone %s: the primary %s speaks Extended AXFR version 2 only; version 3 is tried again after %d hours",
+               ctx->domain, ctx->master_ip, XFR_EXT_REPROBE_SECS / 3600);
+      ctx->entry->xfr_ext_state = learned;
+      ctx->entry->xfr_ext_set = ext_now;       /* the re-probe time counts from the change */
+    }
   }
   if (session.out_of_zone_skipped > 0) {
     syslog(LOG_WARNING, "[AXFR] zone %s: ignored %u out-of-zone record(s) sent by %s",
@@ -1152,6 +1289,7 @@ typedef struct {
   const char *domain;
   const zone_image_view_t *view; /* B8t-1: a standard AXFR carries the requester's view: the RRs it does not see are left out (NULL = no filtering) */
   xext_t xe;            /* Extended AXFR: the one encoder of the extension records (dns_wire.h), state markers included */
+  bool wrap_apex_soa;   /* B8t-2 (v3, several or restricted SOA RRs): every apex SOA RR of the body is a 65406 wrapper */
 } axfr_emit_ctx_t;
 
 /* One RR to send: a builder record (IXFR history, KariDNS markers) or RR `rr` of a zone image (S5 B-2: the zone itself) */
@@ -1245,7 +1383,8 @@ static int axfr_emit_zone_item(axfr_emit_ctx_t *ec, const dns_record_t *rec_item
   }
 
   if (xext_select(&ec->xe, item_loc_tag, item_ecs_tag) < 0) return -1;
-  if (xext_rr_is_tinydns(item_tloc, item_ttd)) {
+  if (xext_rr_is_tinydns(item_tloc, item_ttd) ||
+      (ec->wrap_apex_soa && img && zone_image_rr_type(img, rr) == 6 && zone_image_rr_name(img, rr) == img->apex_name)) {
     dns_record_t wrap_rec;
     uint8_t wrap_buf[4096];
     if (img ? wrap_tinydns_image_rr(img, rr, &wrap_rec, wrap_buf, sizeof(wrap_buf))
@@ -1302,9 +1441,14 @@ static void axfr_send_error(int client_fd, const uint8_t *req, uint16_t req_len,
 /* Extended AXFR (KariDNS 拡張) でしか運べないデータがゾーンにあるか。無ければ拡張を求める
  * KariDNS セカンダリの IXFR にも差分で答えられる (X-24)。セカンダリは IXFR を受けると
  * 自分の active を複製して差分を当てるので、拡張データの更新はこの判定で AXFR に回す。 */
-static bool zone_needs_extended_axfr(const zone_image_t *zone, const zone_db_entry_t *entry) {
-  if (zone_image_has_zattr(zone) || (zone->flags & (ZONE_IMAGE_F_TINYDNS | ZONE_IMAGE_F_SOA_ATTR)))
+static bool zone_has_multiple_or_restricted_soa(const zone_image_t *img);
+
+static bool zone_needs_extended_axfr(const zone_image_t *zone, const zone_db_entry_t *entry, uint8_t ext_ver) {
+  if (zone_image_has_zattr(zone) || (zone->flags & (ZONE_IMAGE_F_TINYDNS | ZONE_IMAGE_F_SOA_ATTR)) ||
+      zone_has_multiple_or_restricted_soa(zone))
     return true;
+  /* version 3 sends the settings (and so the trusted resolvers of the configuration) with an IXFR as well */
+  if (ext_ver >= 3) return false;
   bool cfg_trusted = false;
   server_config_t *cfg = acquire_config_snapshot();
   if (cfg) {
@@ -1321,6 +1465,78 @@ static bool zone_has_multiple_or_restricted_soa(const zone_image_t *img) {
   if (img->apex_name == ZONE_IMAGE_NONE) return false;
   uint32_t k = zone_image_rrset_next(img, img->apex_name, 6, zone_image_name_first_rr(img, img->apex_name));
   return k != ZONE_IMAGE_NONE && zone_image_rrset_next(img, img->apex_name, 6, k + 1) != ZONE_IMAGE_NONE;
+}
+
+/* B8t-2 (v3): the settings of the zone as this server applies them, as a TYPE 65408 record; nothing when there are none.  A zone
+ * whose data carries its own trusted resolvers does not repeat them.  A text that does not fit the record is not sent (logged). */
+static int axfr_emit_settings(axfr_emit_ctx_t *ec, const zone_db_entry_t *entry, bool omit_trusted) {
+  char *text = malloc(KARIDNS_SETTINGS_MAX + 1);
+  if (!text) return -1;
+  rcu_aux_read_lock();
+  server_config_t *cfg = acquire_config_snapshot();
+  size_t len = 0;
+  if (cfg) len = zone_settings_render(cfg, zone_entry_config(cfg, entry), omit_trusted, text, KARIDNS_SETTINGS_MAX + 1);
+  if (cfg) release_config_snapshot(cfg);
+  rcu_aux_read_unlock();
+  int rc = 0;
+  if (len == (size_t)-1)
+    syslog(LOG_WARNING, "[AXFR] zone '%s': the settings of the zone are longer than %u octets and are not sent", entry->domain, KARIDNS_SETTINGS_MAX);
+  else if (len > 0)
+    rc = xext_emit_settings(&ec->xe, text, len);
+  free(text);
+  return rc;
+}
+
+/* B8t-2 (v3): the tag definitions of the configuration (the zone's location-tags / ecs-tags, else options') that the RRs of a zone
+ * use, when the zone data defines no tags of that kind itself (the data's own definitions are the only ones used then, as when the
+ * zone is served): sent as tag definitions, so that the secondary resolves the tags as the primary does */
+static int axfr_emit_config_tags(axfr_emit_ctx_t *ec, const zone_image_t *img, const zone_db_entry_t *entry, const zone_arena_t *zattr) {
+  bool want_loc = zattr->bind_location_tag_count == 0, want_ecs = zattr->bind_ecs_tag_count == 0;
+  if (!want_loc && !want_ecs) return 0;
+  uint32_t used_loc[256], used_ecs[256];
+  int nloc = 0, necs = 0;
+  for (uint32_t rr = 0; rr < img->n_rrs; rr++) {
+    const zone_image_ext_t *e = zone_image_rr_ext(img, rr);
+    if (!e) continue;
+    if (want_loc && e->loc_tag_off != 0) {
+      int i = 0;
+      while (i < nloc && used_loc[i] != e->loc_tag_off) i++;
+      if (i == nloc && nloc < 256) used_loc[nloc++] = e->loc_tag_off;
+    }
+    if (want_ecs && e->ecs_tag_off != 0) {
+      int i = 0;
+      while (i < necs && used_ecs[i] != e->ecs_tag_off) i++;
+      if (i == necs && necs < 256) used_ecs[necs++] = e->ecs_tag_off;
+    }
+  }
+  if (nloc == 0 && necs == 0) return 0;
+  int rc = 0;
+  rcu_aux_read_lock();
+  server_config_t *cfg = acquire_config_snapshot();
+  const zone_config_t *zcfg = cfg ? zone_entry_config(cfg, entry) : NULL;
+  for (int kind = 0; kind < 2 && rc == 0 && cfg; kind++) {
+    const ecs_tag_def_t *defs;
+    int ndef;
+    if (kind == 0) {
+      if (nloc == 0) continue;
+      defs = (zcfg && zext(zcfg)->location_tags) ? zext(zcfg)->location_tags : cfg->location_tags;
+      ndef = (zcfg && zext(zcfg)->location_tags) ? zext(zcfg)->location_tag_count : cfg->location_tag_count;
+    } else {
+      if (necs == 0) continue;
+      defs = (zcfg && zext(zcfg)->ecs_tags) ? zext(zcfg)->ecs_tags : cfg->ecs_tags;
+      ndef = (zcfg && zext(zcfg)->ecs_tags) ? zext(zcfg)->ecs_tag_count : cfg->ecs_tag_count;
+    }
+    for (int d = 0; d < ndef && rc == 0; d++) {
+      const uint32_t *used = kind == 0 ? used_loc : used_ecs;
+      int nused = kind == 0 ? nloc : necs;
+      bool uses = false;
+      for (int u = 0; u < nused && !uses; u++) uses = defs[d].tag && strcasecmp(defs[d].tag, zone_image_str(img, used[u])) == 0;
+      if (uses && xext_emit_tagdef(&ec->xe, kind == 1, &defs[d]) < 0) rc = -1;
+    }
+  }
+  if (cfg) release_config_snapshot(cfg);
+  rcu_aux_read_unlock();
+  return rc;
 }
 
 void send_axfr_response(int client_fd, const char *qname __attribute__((unused)), uint8_t *req,
@@ -1379,21 +1595,24 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   uint16_t req_ar = (req[10] << 8) | req[11];
   edns_info_t req_edns = {0};
   bool is_extended_axfr = false;
+  uint8_t ext_ver = 0; /* B8t-2: the version of the stream: what the requester speaks, if it is 2 or 3 */
   if (parse_edns_opt(req, req_len, req_qd, req_an, req_ns, req_ar, &req_edns) == 0) {
-    if (req_edns.has_karidns_ext && req_edns.karidns_ext_version == KARIDNS_EXT_VERSION) {
+    if (req_edns.has_karidns_ext && KARIDNS_EXT_VERSION_OK(req_edns.karidns_ext_version)) {
       uint32_t exp_hash = calc_fnv1a_str(entry->domain);
       if (req_edns.karidns_ext_hash == exp_hash) {
         is_extended_axfr = true;
+        ext_ver = req_edns.karidns_ext_version;
       }
     }
   }
+  const bool v3 = is_extended_axfr && ext_ver >= 3;
   edns_info_t resp_edns = {0};
   /* R-16, RFC 5936 §2.2.5: 要求に OPT があれば最初のメッセージに OPT を1つ付ける */
   if (req_edns.present) resp_edns.present = true;
   if (is_extended_axfr) {
     resp_edns.present = true;
     resp_edns.has_karidns_ext = true;
-    resp_edns.karidns_ext_version = KARIDNS_EXT_VERSION;
+    resp_edns.karidns_ext_version = ext_ver;
     resp_edns.karidns_ext_hash = calc_fnv1a_str(entry->domain);
   }
   /* RFC 7314 §3: EXPIRE 付きの AXFR/IXFR には SOA EXPIRE (プライマリ) または
@@ -1410,14 +1629,17 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     return;
   }
 
-  /* B8t-1: an Extended AXFR (v2) cannot carry several or restricted SOA RRs (the frame SOA has no attributes, and the receiver
-   * ends the transfer at a second SOA); that comes with the next format (B8t-2). Until then it is refused rather than sent
-   * wrong; a standard AXFR is unaffected. */
-  if (is_extended_axfr && zone_has_multiple_or_restricted_soa(current_zone)) {
+  /* An Extended AXFR of version 2 cannot carry several or restricted SOA RRs (the frame SOA has no attributes, and the receiver
+   * ends the transfer at a second SOA).  Sending such a secondary the reference SOA alone would change what it serves (a hidden
+   * SOA would become visible to everybody), so it is refused, as it was by B8t-1; version 3 carries the SOA set (SOA_SET).  A
+   * standard AXFR is unaffected. */
+  const bool soa_multi = zone_has_multiple_or_restricted_soa(current_zone);
+  if (is_extended_axfr && !v3 && soa_multi) {
     syslog(LOG_WARNING, "[AXFR] zone '%s': Extended AXFR refused: the zone has several or restricted SOA records "
-           "(location, time stamp, tag); the extended format of this version cannot carry them", entry->domain);
+           "(location, time stamp, tag) and the requester speaks version 2 of the extended format, which cannot carry them "
+           "(upgrade the secondary)", entry->domain);
     free(res);
-    axfr_send_error(client_fd, req, req_len, 5, false, 0, "Extended transfer of a zone with several or restricted SOA records is not supported",
+    axfr_send_error(client_fd, req, req_len, 5, false, 0, "Extended transfer (version 2) of a zone with several or restricted SOA records is not supported; use version 3",
                     tsig_key, req_mac, req_mac_len, client_addr, client_len, server_addr, has_server_addr);
     return;
   }
@@ -1465,7 +1687,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
                                        serial_is_newer(client_serial, current_serial));
   /* X-24: 拡張を求める KariDNS セカンダリの IXFR は、拡張でしか運べないデータがあるときだけ
    * Extended AXFR にする。それ以外は通常の IXFR (差分が無ければ下で AXFR) で答える。 */
-  if (is_extended_axfr && is_ixfr && !client_up_to_date && zone_needs_extended_axfr(current_zone, entry)) {
+  if (is_extended_axfr && is_ixfr && !client_up_to_date && zone_needs_extended_axfr(current_zone, entry, ext_ver)) {
     is_ixfr = false;
   }
   /* B8t-1: the history of differences is not per client; a standard IXFR of a zone with per-client RRs gets the whole zone as the
@@ -1517,6 +1739,23 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       }
     }
     pthread_mutex_unlock(&entry->ixfr_history.lock);
+    /* B8t-2: the differences of a version that had several or restricted SOA RRs cannot say what happened to the SOA set (RFC 1995 §4
+     * allows the whole zone instead) */
+    bool soa_in_history = false;
+    for (int t = 0; t < txn_count && !soa_in_history; t++) {
+      int nsoa = 0;
+      for (int i = 0; i < txn_list[t]->deleted_count; i++)
+        if (txn_list[t]->deleted[i].type_code == 6 && (++nsoa > 1 || dns_record_is_restricted(&txn_list[t]->deleted[i]))) soa_in_history = true;
+      nsoa = 0;
+      for (int i = 0; i < txn_list[t]->added_count; i++)
+        if (txn_list[t]->added[i].type_code == 6 && (++nsoa > 1 || dns_record_is_restricted(&txn_list[t]->added[i]))) soa_in_history = true;
+    }
+    if (soa_in_history) {
+      for (int t = 0; t < txn_count; t++)
+        if (atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_acq_rel) == 1) free_ixfr_txn(txn_list[t]);
+      txn_count = 0;
+      send_ixfr = false;
+    }
   }
 
   axfr_emit_ctx_t ec;
@@ -1544,6 +1783,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   ec.domain = entry->domain;
   ec.view = (!is_extended_axfr && (current_zone->flags & ZONE_IMAGE_F_VIEW)) ? &xview : NULL;
   xext_init(&ec.xe, entry->domain, axfr_xext_emit, &ec);
+  ec.wrap_apex_soa = v3 && soa_multi && !send_ixfr;
 
   memset(res, 0, 65535);
   memcpy(res, req, q_offset);
@@ -1558,6 +1798,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   if (!send_ixfr && is_extended_axfr && zone_image_zattr_load(current_zone, &zattr) != 0) goto axfr_error;
   if (send_ixfr) {
     if (axfr_emit_item(&ec, NULL, current_zone, frame_rr) < 0) goto axfr_error;
+    if (v3 && txn_count > 0 && axfr_emit_settings(&ec, entry, zattr.bind_ecs_trusted_resolver_count > 0) < 0) goto axfr_error;
     for (int t = 0; t < txn_count; t++) {
       ixfr_txn_t *txn = txn_list[t];
       int soa_del_idx = -1;
@@ -1592,16 +1833,25 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
 
     // Definitions emitted after first SOA in extended mode
     if (is_extended_axfr) {
+      if (v3 && soa_multi) {
+        /* the apex SOA RRs are body RRs; the frame (the reference SOA) is not zone data */
+        uint16_t nsoa = 0;
+        uint32_t k = zone_image_rrset_next(current_zone, current_zone->apex_name, 6, zone_image_name_first_rr(current_zone, current_zone->apex_name));
+        for (; k != ZONE_IMAGE_NONE && nsoa < 0xFFFF; k = zone_image_rrset_next(current_zone, current_zone->apex_name, 6, k + 1)) nsoa++;
+        if (xext_emit_soa_set(&ec.xe, nsoa) < 0) goto axfr_error;
+      }
+      if (v3 && axfr_emit_settings(&ec, entry, zattr.bind_ecs_trusted_resolver_count > 0) < 0) goto axfr_error;
       for (int i = 0; i < zattr.bind_location_tag_count; i++)
         if (xext_emit_tagdef(&ec.xe, false, &zattr.bind_location_tags[i]) < 0) goto axfr_error;
       for (int i = 0; i < zattr.bind_ecs_tag_count; i++)
         if (xext_emit_tagdef(&ec.xe, true, &zattr.bind_ecs_tags[i]) < 0) goto axfr_error;
+      if (v3 && axfr_emit_config_tags(&ec, current_zone, entry, &zattr) < 0) goto axfr_error;
       server_config_t *axfr_cfg = acquire_config_snapshot();
       const zone_config_t *axfr_zcfg = axfr_cfg ? zone_entry_config(axfr_cfg, entry) : NULL;
       char **trusted_res = (zattr.bind_ecs_trusted_resolver_count > 0 && zattr.bind_ecs_trusted_resolvers)
                             ? zattr.bind_ecs_trusted_resolvers : NULL;
       int trusted_count = trusted_res ? zattr.bind_ecs_trusted_resolver_count : 0;
-      if (!trusted_res) {
+      if (!trusted_res && !v3) {
         trusted_res = (axfr_zcfg && zext(axfr_zcfg)->ecs_trusted_resolvers) ? zext(axfr_zcfg)->ecs_trusted_resolvers
                                                                        : (axfr_cfg ? axfr_cfg->ecs_trusted_resolvers : NULL);
         trusted_count = (axfr_zcfg && zext(axfr_zcfg)->ecs_trusted_resolvers) ? zext(axfr_zcfg)->ecs_trusted_resolvers_count
@@ -1619,7 +1869,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     /* file order (zone_image_seq_rr), as the builder was walked before */
     for (uint32_t seq = 0; seq < current_zone->n_rrs; seq++) {
       uint32_t rr = zone_image_seq_rr(current_zone, seq);
-      if (zone_image_rr_type(current_zone, rr) == 6 && zone_image_rr_name(current_zone, rr) == current_zone->apex_name) /* every apex SOA: the frame is the opening and closing SOA (B8t-1: axfrdns.c leaves SOA RRs out of the body) */
+      if (!ec.wrap_apex_soa && zone_image_rr_type(current_zone, rr) == 6 && zone_image_rr_name(current_zone, rr) == current_zone->apex_name) /* every apex SOA: the frame is the opening and closing SOA (B8t-1: axfrdns.c leaves SOA RRs out of the body); a version 3 SOA set is in the body instead */
         continue;
       if (axfr_emit_zone_item(&ec, NULL, current_zone, rr) < 0) goto axfr_error;
     }

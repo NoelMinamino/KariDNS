@@ -226,6 +226,16 @@ printf '%s\n' "$OUT" | grep -q "transfer: last successful .*serial 10 (kept in m
 $DAG1 slv.test AXFR +nohexdump +noall +answer -y "hmac-sha256:xfr:$S_XFR" 2>/dev/null | grep -v "TSIG" | sort > "$T/axfr.p"
 [ -s "$T/axfr.s" ] && cmp -s "$T/axfr.s" "$T/axfr.p" && pass "AXFR out of the database secondary = AXFR of the primary ($(wc -l < "$T/axfr.p" | tr -d ' ') RRs)" || { fail "AXFR out of S differs from P1's"; diff "$T/axfr.s" "$T/axfr.p" | head -5; }
 
+# B8t-2: the settings P1 sends with the zone (Extended AXFR version 3) reach a database secondary; the statements of its own row win
+OUT=$($KCTL zonestatus recon.test 2>&1)
+printf '%s\n' "$OUT" | grep -q 'settings=primary' && pass "recon.test: zonestatus says that the settings of the primary are in force" || { fail "recon.test: no settings=primary"; printf '%s\n' "$OUT" | sed 's/^/         /'; }
+OUT=$(dbst recon.test)
+printf '%s\n' "$OUT" | grep -q 'settings from the primary: in force' && pass "recon.test: dbstatus says that settings of the primary are in force" || { fail "recon.test: dbstatus has no 'settings from the primary' line"; printf '%s\n' "$OUT" | sed 's/^/         /'; }
+if command -v perl >/dev/null 2>&1; then
+    perl tests/lib_axfr_probe.pl 127.0.0.1 "$PS" 127.0.0.1 recon.test AXFR 2>&1 | grep -q 'rcode=0 aa=1' \
+        && pass "recon.test: the allow-transfer P1 sent applies (inside acl-ceiling), the row of S has none" || fail "recon.test: the received allow-transfer is not applied"
+fi
+
 # ================================================================ rejected zones
 echo "== rejected zones"
 for case in "nokey.test:TSIG key 'ghost'" "nomaster.test:domains.master is NULL" "hostm.test:host names are not supported" "prod.test:PRODUCER"; do

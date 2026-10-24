@@ -213,6 +213,10 @@ size_t zone_arena_drop_unencodable(zone_arena_t *arena, void (*report)(const dns
 /* B8t-1: SOA RRs at the apex of a zone (builder form). A SOA is restricted when it has a tinydns location or time stamp, or a
  * $LOCATION / $ECS-SUBNET tag: some clients do not see it. */
 bool dns_record_is_restricted(const dns_record_t *r);
+/* B8t-2: do two RRs have the same visibility (the same tinydns location, time stamp and countdown flag, the same $LOCATION and
+ * $ECS-SUBNET tags)?  Two unrestricted RRs do.  RRset TTL harmonization (RFC 2181 §5.2) applies among RRs of the same visibility
+ * only: the TTL a zone author wrote for an RR that only some clients see is kept. */
+bool dns_record_same_visibility(const dns_record_t *a, const dns_record_t *b);
 /* The reference SOA of the zone `zone`: the apex SOA (with a complete RDATA) that is not restricted if there is one, else the
  * first in record order; NULL when there is none. Zone-wide values (serial, refresh / retry / expire, EDNS EXPIRE) come from it. */
 const dns_record_t *zone_arena_reference_soa(const zone_arena_t *arena, const char *zone);

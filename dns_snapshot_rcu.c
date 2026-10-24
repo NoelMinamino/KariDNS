@@ -296,6 +296,8 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
   zone_version_free(atomic_load_explicit(&entry->rcu.active, memory_order_relaxed));
   /* a DB zone's settings (the entry owns the current block; replaced ones go through zone_retire_object()) */
   free_zone_config((zone_config_t *)atomic_load_explicit(&entry->dbcfg, memory_order_relaxed));
+  free_zone_config((zone_config_t *)atomic_load_explicit(&entry->rxcfg, memory_order_relaxed));      /* B8t-2 */
+  zone_ext_shared_unref(entry->rx_sh);
   /* the member ids of a catalog zone belong to its entry (a rebuild only copies the pointers while it runs) */
   if (entry->catalog_members) free_catalog_member_ids(entry->catalog_members, entry->catalog_member_count);
   free(entry->catalog_master);
@@ -1811,6 +1813,83 @@ void db_entry_set_config(zone_db_entry_t *entry, const zone_config_t *cfg) {
     uint64_t epoch;
     const zone_config_t *old = db_entry_swap_config(entry, cfg, &epoch);
     db_entry_retire_config(entry, old, epoch);
+}
+
+/* ---- settings received from the primary (B8t-2, Extended AXFR v3) ----
+ * The writers are the transfer thread that applied a transfer, and the control thread (zone_rx_settings_refresh()); both hold
+ * entry->writer_lock while they change rx_sh / rx_base / rx_gen / rx_note and publish rxcfg. */
+static void rx_merge_locked(zone_db_entry_t *entry, server_config_t *cfg) {
+    const zone_config_t *base = entry->source == ZONE_SRC_DB ? atomic_load_explicit(&entry->dbcfg, memory_order_acquire)
+                                                              : find_zone_config_in_view(cfg, entry->view_name, entry->domain);
+    zone_config_t *nc = NULL;
+    entry->rx_note[0] = '\0';
+    if (entry->rx_sh && !(base && zext(base)->primary_settings_off)) {
+        nc = zone_config_with_received(entry->domain, base, &entry->rx_sh->ext, cfg, entry->rx_note, sizeof(entry->rx_note));
+        if (!nc) syslog(LOG_ERR, "[AXFR] zone '%s': out of memory applying the settings received from the primary; they are not in force", entry->domain);
+    }
+    entry->rx_base = base;
+    entry->rx_gen = cfg->generation;
+    const zone_config_t *old = atomic_load_explicit(&entry->rxcfg, memory_order_relaxed);
+    if (!old && !nc) return;
+    uint64_t epoch = rcu_writer_publish(&entry->rxcfg, nc);
+    if (old && !zone_retire_object(entry, (void *)old, free_zone_config_cb, epoch))
+        syslog(LOG_ERR, "[AXFR] zone '%s': out of memory retiring the previous received settings; they are leaked", entry->domain);
+}
+
+zone_ext_shared_t *zone_rx_settings_parse(const char *zone, const char *text, size_t len) {
+    if (!text || len == 0) return NULL;
+    char err[200];
+    zone_ext_shared_t *sh = db_settings_parse(text, len, err, sizeof(err));
+    if (!sh) {
+        syslog(LOG_WARNING, "[AXFR] zone '%s': the settings received from the primary are not accepted (%s); the zone keeps its own settings",
+               zone, err);
+        return NULL;
+    }
+    sh->ext.db_acl_ceiling = false;      /* the ceiling is a rule for the settings of the secondary's own database zones */
+    return sh;
+}
+
+zone_ext_shared_t *zone_rx_settings_apply_locked(zone_db_entry_t *entry, zone_ext_shared_t *sh) {
+    zone_ext_shared_t *old = entry->rx_sh;
+    entry->rx_sh = sh;
+    atomic_store_explicit(&entry->rx_present, sh != NULL, memory_order_relaxed);
+    rcu_aux_read_lock();
+    server_config_t *cfg = acquire_config_snapshot();
+    if (cfg) {
+        rx_merge_locked(entry, cfg);
+        release_config_snapshot(cfg);
+    }
+    rcu_aux_read_unlock();
+    if (sh && entry->rx_note[0])
+        syslog(LOG_WARNING, "[AXFR] zone '%s': settings received from the primary: %s", entry->domain, entry->rx_note);
+    return old;
+}
+
+void zone_rx_settings_refresh(zone_db_entry_t *entry, server_config_t *cfg) {
+    if (!cfg || !atomic_load_explicit(&entry->rx_present, memory_order_relaxed)) return;
+    if (pthread_mutex_trylock(&entry->writer_lock) != 0) return;      /* a transfer is installing: next tick */
+    if (!entry->rx_sh) {
+        pthread_mutex_unlock(&entry->writer_lock);
+        return;
+    }
+    rcu_aux_read_lock();
+    const zone_config_t *base = entry->source == ZONE_SRC_DB ? atomic_load_explicit(&entry->dbcfg, memory_order_acquire)
+                                                              : find_zone_config_in_view(cfg, entry->view_name, entry->domain);
+    if (entry->rx_gen != cfg->generation || entry->rx_base != base) rx_merge_locked(entry, cfg);
+    rcu_aux_read_unlock();
+    pthread_mutex_unlock(&entry->writer_lock);
+}
+
+bool zone_rx_settings_status(zone_db_entry_t *entry, char *note, size_t cap) {
+    bool on = atomic_load_explicit(&entry->rxcfg, memory_order_acquire) != NULL;
+    if (note && cap) {
+        note[0] = '\0';
+        if (on && pthread_mutex_trylock(&entry->writer_lock) == 0) {
+            snprintf(note, cap, "%s", entry->rx_note);
+            pthread_mutex_unlock(&entry->writer_lock);
+        }
+    }
+    return on;
 }
 
 /* ---- interned settings of DB zones (B7a, beta design 4.2) ----

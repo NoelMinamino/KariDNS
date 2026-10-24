@@ -2202,6 +2202,27 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       else if (strcmp(key, "zone-tcp-window") == 0) x->zone_tcp_window = v;
       else if (strcmp(key, "zone-tcp-sndbuf") == 0) x->zone_tcp_sndbuf = v;
       else x->zone_udp_bufsize = (uint16_t)v;
+    } else if (strcmp(key, "primary-settings") == 0) {
+      /* B8t-2: use (default) or ignore the settings the primary sends with the zone */
+      tok = get_next_token(ctx);
+      bool v = true;
+      if (tok.type != TOKEN_STRING || !parse_config_bool(tok.value, &v)) {
+        report_bad_bool(ctx, zone->domain, key, tok.type == TOKEN_STRING ? tok.value : "");
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) {
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+      x->primary_settings_off = !v;
     } else if (strcmp(key, "transfer-acl-match") == 0 || strcmp(key, "update-acl-match") == 0) {
       /* D14: which kinds of entry of allow-transfer / allow-update have to match (docs/karidns.md) */
       tok = get_next_token(ctx);
@@ -4241,4 +4262,354 @@ int parse_named_conf_ext(const char *config_str, const char *initial_file_path, 
 
 int parse_named_conf(const char *config_str, server_config_t *config) {
   return parse_named_conf_ext(config_str, NULL, config);
+}
+
+/* ---- B8t-2: the settings of a zone travel from its primary to the secondaries (Extended AXFR v3, TYPE 65408) ---- */
+
+typedef struct {
+  char *buf;
+  size_t cap, len;
+  bool ovf;
+} rs_t;
+
+static void rs_add(rs_t *r, const char *s) {
+  size_t n = strlen(s);
+  if (r->ovf || r->len + n + 1 > r->cap) {
+    r->ovf = true;
+    return;
+  }
+  memcpy(r->buf + r->len, s, n);
+  r->len += n;
+  r->buf[r->len] = '\0';
+}
+
+static bool settings_key_name_ok(const char *k) {
+  size_t n = k ? strlen(k) : 0;
+  if (n == 0 || n > 255) return false;
+  for (const char *p = k; *p; p++)
+    if (!isalnum((unsigned char)*p) && *p != '.' && *p != '_' && *p != '-') return false;
+  return true;
+}
+
+/* Is every address of the prefix inside options { database { acl-ceiling } }?  The first and the last address decide (and the
+ * ends of the whole address space for "any"): a prefix the ceiling only partly covers is not sent. */
+static bool cidr_inside_ceiling(const server_config_t *cfg, const cidr_entry_t *e) {
+  char ip[INET6_ADDRSTRLEN];
+  for (int fam = 0; fam < 2; fam++) {
+    int af = fam == 0 ? AF_INET : AF_INET6;
+    if (!e->is_any && e->family != af) continue;
+    size_t n = fam == 0 ? 4 : 16;
+    uint8_t lo[16] = {0}, hi[16] = {0};
+    for (size_t i = 0; i < n; i++) {
+      uint8_t a = e->is_any ? 0 : e->addr[i], m = e->is_any ? 0 : e->mask[i];
+      lo[i] = a & m;
+      hi[i] = (uint8_t)(a | (uint8_t)~m);
+    }
+    if (!inet_ntop(af, lo, ip, sizeof(ip)) || !db_ceiling_allows_address(cfg, ip)) return false;
+    if (!inet_ntop(af, hi, ip, sizeof(ip)) || !db_ceiling_allows_address(cfg, ip)) return false;
+  }
+  return true;
+}
+
+static bool ceiling_has_key(const server_config_t *cfg, const char *name) {
+  const database_config_t *d = &cfg->database;
+  for (int i = 0; i < d->acl_ceiling_keys_count; i++)
+    if (d->acl_ceiling_keys[i] && domain_names_match_ci(d->acl_ceiling_keys[i], name)) return true;
+  return false;
+}
+
+/* "stmt { entries; key "k"; };": the ACL as the primary applies it.  For the ACL of a database zone (ceiling) only what lies inside
+ * the ceiling is written; an entry this module cannot write (not an address, a key name with odd octets) makes the whole ACL
+ * "none": the secondary must never get a wider list than the primary has. */
+static void rs_acl(rs_t *r, const char *stmt, char *const *list, int n, char *const *keys, int nkeys, const char *zone_key,
+                   bool ceiling, const server_config_t *cfg) {
+  bool bad = false;
+  for (int i = 0; i < n; i++) {
+    const char *e = list[i] ? list[i] : "";
+    if (!acl_entry_is_address(e[0] == '!' ? e + 1 : e)) bad = true;
+  }
+  for (int i = 0; i < nkeys; i++)
+    if (!settings_key_name_ok(keys[i])) bad = true;
+  if (zone_key && !settings_key_name_ok(zone_key)) bad = true;
+  rs_add(r, stmt);
+  rs_add(r, " {");
+  int written = 0;
+  for (int i = 0; !bad && i < n; i++) {
+    const char *e = list[i];
+    bool neg = e[0] == '!';
+    const char *t = neg ? e + 1 : e;
+    if (ceiling && !neg && strcmp(t, "none") != 0) {
+      cidr_entry_t c;
+      if (strcmp(t, "any") == 0) {
+        memset(&c, 0, sizeof(c));
+        c.is_any = true;
+      } else if (!cidr_entry_parse(&c, t)) {
+        continue;
+      }
+      if (!cidr_inside_ceiling(cfg, &c)) continue;
+    }
+    rs_add(r, " ");
+    rs_add(r, e);
+    rs_add(r, ";");
+    if (!neg) written++;
+  }
+  for (int i = 0; !bad && i <= nkeys; i++) {
+    const char *k = i < nkeys ? keys[i] : zone_key;
+    if (!k) continue;
+    if (ceiling && !ceiling_has_key(cfg, k)) continue;
+    rs_add(r, " key \"");
+    rs_add(r, k);
+    rs_add(r, "\";");
+    written++;
+  }
+  if (bad || written == 0) rs_add(r, " none;");
+  rs_add(r, " };\n");
+}
+
+size_t zone_settings_render(const server_config_t *cfg, const zone_config_t *zcfg, bool omit_trusted, char *out, size_t cap) {
+  if (!cfg || !out || cap < 16) return 0;
+  out[0] = '\0';
+  const zone_ext_t *x = zext(zcfg);
+  rs_t r = { out, cap, 0, false };
+  /* a database zone's ACLs also have to pass the ceiling (dns_tsig_acl.c); without a ceiling they refuse everybody */
+  bool ceil = x->db_acl_ceiling;
+  bool no_ceiling = ceil && !db_acl_ceiling_configured(cfg);
+  bool is_master = zcfg && zcfg->type && strcasecmp(zcfg->type, "master") == 0;
+
+  /* allow-transfer: the addresses, the keys, and (file zone of type master) the zone's tsig-key, which also may transfer */
+  const char *zone_key = (is_master && !ceil && x->tsig_key) ? x->tsig_key : NULL;
+  if (x->allow_transfer_count > 0 || x->tsig_keys_count > 0 || zone_key) {
+    if (no_ceiling) {
+      rs_add(&r, "allow-transfer { none; };\n");
+    } else {
+      rs_acl(&r, "allow-transfer", x->allow_transfer, x->allow_transfer_count, x->tsig_keys, x->tsig_keys_count, zone_key, ceil, cfg);
+    }
+    if (x->transfer_acl_match == ACL_MATCH_ANY) rs_add(&r, "transfer-acl-match any;\n");
+    else if (x->transfer_acl_match == ACL_MATCH_ALL) rs_add(&r, "transfer-acl-match all;\n");
+  }
+
+  /* ecs-trusted-resolvers: the list the zone has, else options' (the zone's data may carry its own list: omit_trusted) */
+  if (!omit_trusted) {
+    char *const *tl = x->ecs_trusted_resolvers_count > 0 ? x->ecs_trusted_resolvers : cfg->ecs_trusted_resolvers;
+    int tn = x->ecs_trusted_resolvers_count > 0 ? x->ecs_trusted_resolvers_count : cfg->ecs_trusted_resolvers_count;
+    if (tn > 0 && tl) {
+      if (no_ceiling) rs_add(&r, "ecs-trusted-resolvers { none; };\n");
+      else rs_acl(&r, "ecs-trusted-resolvers", tl, tn, NULL, 0, NULL, ceil && x->ecs_trusted_resolvers_count > 0, cfg);
+    }
+  }
+
+  additional_from_auth_t afa = x->additional_from_auth_specified ? x->additional_from_auth : cfg->additional_from_auth;
+  if (x->additional_from_auth_specified || afa != ADDITIONAL_AUTH_YES)
+    rs_add(&r, afa == ADDITIONAL_AUTH_NO ? "additional-from-auth no;\n"
+               : afa == ADDITIONAL_AUTH_IN_DOMAIN ? "additional-from-auth in-domain;\n" : "additional-from-auth yes;\n");
+
+  unsigned bs = x->zone_udp_bufsize > 0 ? x->zone_udp_bufsize : cfg->udp_bufsize;
+  if (bs >= KARIDNS_UDP_BUFSIZE_MIN && bs <= KARIDNS_UDP_BUFSIZE_MAX) {
+    char tmp[48];
+    snprintf(tmp, sizeof(tmp), "zone-udp-bufsize %u;\n", bs);
+    rs_add(&r, tmp);
+  }
+  if (r.ovf) {
+    out[0] = '\0';
+    return (size_t)-1;
+  }
+  return r.len;
+}
+
+/* ---- a deep copy of a zone's option block, and the zone configuration of a secondary with the settings it received ---- */
+
+static char *zx_strdup(const char *s) { return s ? strdup(s) : NULL; }
+
+static void *zx_memdup(const void *p, size_t n) {
+  if (!p || n == 0) return NULL;
+  void *q = malloc(n);
+  if (q) memcpy(q, p, n);
+  return q;
+}
+
+static bool zx_strs(char ***dst, int *dn, char *const *src, int sn) {
+  *dst = NULL;
+  *dn = 0;
+  if (sn <= 0 || !src) return true;
+  char **a = calloc((size_t)sn, sizeof(char *));
+  if (!a) return false;
+  *dst = a;
+  *dn = sn;
+  for (int i = 0; i < sn; i++) {
+    a[i] = zx_strdup(src[i]);
+    if (src[i] && !a[i]) return false;
+  }
+  return true;
+}
+
+static bool zx_ipports(ip_port_t **dst, int *dn, const ip_port_t *src, int sn) {
+  *dst = NULL;
+  *dn = 0;
+  if (sn <= 0 || !src) return true;
+  ip_port_t *a = calloc((size_t)sn, sizeof(ip_port_t));
+  if (!a) return false;
+  *dst = a;
+  *dn = sn;
+  for (int i = 0; i < sn; i++) {
+    a[i].port = src[i].port;
+    a[i].ip = zx_strdup(src[i].ip);
+    if (src[i].ip && !a[i].ip) return false;
+  }
+  return true;
+}
+
+static bool zx_tags(struct ecs_tag_def_s **dst, int *dn, const struct ecs_tag_def_s *src, int sn) {
+  *dst = NULL;
+  *dn = 0;
+  if (sn <= 0 || !src) return true;
+  struct ecs_tag_def_s *a = calloc((size_t)sn, sizeof(*a));
+  if (!a) return false;
+  *dst = a;
+  *dn = sn;
+  for (int i = 0; i < sn; i++) {
+    a[i].tag = zx_strdup(src[i].tag);
+    if (src[i].tag && !a[i].tag) return false;
+    if (src[i].cidr_count > 0 && src[i].cidrs) {
+      a[i].cidrs = calloc((size_t)src[i].cidr_count, sizeof(ecs_cidr_entry_t));
+      if (!a[i].cidrs) return false;
+      a[i].cidr_count = src[i].cidr_count;
+      for (int j = 0; j < src[i].cidr_count; j++) {
+        a[i].cidrs[j].parsed = src[i].cidrs[j].parsed;
+        a[i].cidrs[j].cidr = zx_strdup(src[i].cidrs[j].cidr);
+        if (src[i].cidrs[j].cidr && !a[i].cidrs[j].cidr) return false;
+      }
+    }
+  }
+  return true;
+}
+
+/* A deep copy: the copy owns everything it points to (free_zone_ext()).  NULL when out of memory. */
+static zone_ext_t *zone_ext_clone(const zone_ext_t *s) {
+  zone_ext_t *d = calloc(1, sizeof(*d));
+  if (!d) return NULL;
+  *d = *s;
+  /* every pointer of the copy is rebuilt below; until then it must not alias the source */
+  d->masters = NULL; d->masters_count = 0; d->masters_parsed = NULL;
+  d->tsig_key = NULL;
+  d->tsig_keys = NULL; d->tsig_keys_count = 0;
+  d->also_notify = NULL; d->also_notify_count = 0;
+  d->notify_source = NULL;
+  d->allow_transfer = NULL; d->allow_transfer_count = 0; d->allow_transfer_parsed = NULL;
+  d->allow_update = NULL; d->allow_update_count = 0; d->allow_update_parsed = NULL;
+  d->rrl.exempt_clients = NULL; d->rrl.exempt_clients_count = 0; d->rrl.exempt_clients_parsed = NULL;
+  d->program_path = NULL; d->program_args = NULL; d->program_args_count = 0; d->program_user = NULL;
+  d->forwarders = NULL; d->forwarders_count = 0;
+  d->file_format = NULL;
+  d->ecs_tags = NULL; d->ecs_tag_count = 0;
+  d->location_tags = NULL; d->location_tag_count = 0;
+  d->ecs_trusted_resolvers = NULL; d->ecs_trusted_resolvers_count = 0; d->ecs_trusted_resolvers_parsed = NULL;
+  bool ok = zx_ipports(&d->masters, &d->masters_count, s->masters, s->masters_count) &&
+            zx_strs(&d->tsig_keys, &d->tsig_keys_count, s->tsig_keys, s->tsig_keys_count) &&
+            zx_ipports(&d->also_notify, &d->also_notify_count, s->also_notify, s->also_notify_count) &&
+            zx_strs(&d->allow_transfer, &d->allow_transfer_count, s->allow_transfer, s->allow_transfer_count) &&
+            zx_strs(&d->allow_update, &d->allow_update_count, s->allow_update, s->allow_update_count) &&
+            zx_ipports(&d->rrl.exempt_clients, &d->rrl.exempt_clients_count, s->rrl.exempt_clients, s->rrl.exempt_clients_count) &&
+            zx_strs(&d->program_args, &d->program_args_count, s->program_args, s->program_args_count) &&
+            zx_ipports(&d->forwarders, &d->forwarders_count, s->forwarders, s->forwarders_count) &&
+            zx_tags(&d->ecs_tags, &d->ecs_tag_count, s->ecs_tags, s->ecs_tag_count) &&
+            zx_tags(&d->location_tags, &d->location_tag_count, s->location_tags, s->location_tag_count) &&
+            zx_strs(&d->ecs_trusted_resolvers, &d->ecs_trusted_resolvers_count, s->ecs_trusted_resolvers, s->ecs_trusted_resolvers_count);
+  if (ok && s->tsig_key && !(d->tsig_key = strdup(s->tsig_key))) ok = false;
+  if (ok && s->notify_source && !(d->notify_source = strdup(s->notify_source))) ok = false;
+  if (ok && s->program_path && !(d->program_path = strdup(s->program_path))) ok = false;
+  if (ok && s->program_user && !(d->program_user = strdup(s->program_user))) ok = false;
+  if (ok && s->file_format && !(d->file_format = strdup(s->file_format))) ok = false;
+  /* the parsed forms are plain arrays of structs without pointers */
+  if (ok && s->masters_parsed && s->masters_count > 0 &&
+      !(d->masters_parsed = zx_memdup(s->masters_parsed, (size_t)s->masters_count * sizeof(cidr_entry_t))))
+    ok = false;
+  if (ok && s->allow_transfer_parsed && s->allow_transfer_count > 0 &&
+      !(d->allow_transfer_parsed = zx_memdup(s->allow_transfer_parsed, (size_t)s->allow_transfer_count * sizeof(acl_entry_t))))
+    ok = false;
+  if (ok && s->allow_update_parsed && s->allow_update_count > 0 &&
+      !(d->allow_update_parsed = zx_memdup(s->allow_update_parsed, (size_t)s->allow_update_count * sizeof(acl_entry_t))))
+    ok = false;
+  if (ok && s->rrl.exempt_clients_parsed && s->rrl.exempt_clients_count > 0 &&
+      !(d->rrl.exempt_clients_parsed = zx_memdup(s->rrl.exempt_clients_parsed, (size_t)s->rrl.exempt_clients_count * sizeof(cidr_entry_t))))
+    ok = false;
+  if (ok && s->ecs_trusted_resolvers_parsed && s->ecs_trusted_resolvers_count > 0 &&
+      !(d->ecs_trusted_resolvers_parsed = zx_memdup(s->ecs_trusted_resolvers_parsed, (size_t)s->ecs_trusted_resolvers_count * sizeof(acl_entry_t))))
+    ok = false;
+  if (!ok) {
+    free_zone_ext(d);
+    return NULL;
+  }
+  return d;
+}
+
+/* Move the received statement lists into d (replacing d's), as parsed lists of their own. */
+static bool zx_take_acl(zone_ext_t *d, const zone_ext_t *rx, char *note, size_t notelen, const server_config_t *cfg) {
+  for (int i = 0; i < d->allow_transfer_count; i++) free(d->allow_transfer[i]);
+  free(d->allow_transfer);
+  free(d->allow_transfer_parsed);
+  for (int i = 0; i < d->tsig_keys_count; i++) free(d->tsig_keys[i]);
+  free(d->tsig_keys);
+  d->allow_transfer = NULL; d->allow_transfer_parsed = NULL; d->allow_transfer_count = 0;
+  d->tsig_keys = NULL; d->tsig_keys_count = 0;
+  /* a key the secondary does not have: the ACL fails closed (as for a database zone), whatever else it lists */
+  const char *missing = NULL;
+  for (int i = 0; i < rx->tsig_keys_count && !missing; i++)
+    if (!cfg || !key_name_is_defined(cfg->keys, rx->tsig_keys[i])) missing = rx->tsig_keys[i];
+  if (missing) {
+    char *none[1] = { "none" };
+    if (!zx_strs(&d->allow_transfer, &d->allow_transfer_count, none, 1)) return false;
+    d->allow_transfer_parsed = acl_list_parse(d->allow_transfer, d->allow_transfer_count);
+    if (note && notelen) snprintf(note, notelen, "the received allow-transfer names the TSIG key '%.64s', which is not defined here: transfers are refused", missing);
+    return true;
+  }
+  if (!zx_strs(&d->allow_transfer, &d->allow_transfer_count, rx->allow_transfer, rx->allow_transfer_count) ||
+      !zx_strs(&d->tsig_keys, &d->tsig_keys_count, rx->tsig_keys, rx->tsig_keys_count))
+    return false;
+  if (d->allow_transfer_count > 0) d->allow_transfer_parsed = acl_list_parse(d->allow_transfer, d->allow_transfer_count);
+  return true;
+}
+
+zone_config_t *zone_config_with_received(const char *domain, const zone_config_t *base, const zone_ext_t *rx,
+                                         const server_config_t *cfg, char *note, size_t notelen) {
+  if (note && notelen) note[0] = '\0';
+  zone_config_t *c = calloc(1, sizeof(*c));
+  if (!c) return NULL;
+  c->domain = strdup(domain);
+  c->type = strdup(base && base->type ? base->type : "slave");
+  c->file = base && base->file ? strdup(base->file) : NULL;
+  c->is_catalog = base ? base->is_catalog : false;
+  zone_ext_t *x = zone_ext_clone(zext(base));
+  if (!c->domain || !c->type || (base && base->file && !c->file) || !x) {
+    if (x) free_zone_ext(x);
+    free_zone_config(c);
+    return NULL;
+  }
+  c->ext = x;
+  const zone_ext_t *b = zext(base);
+  /* precedence: a statement written in the secondary's own zone {} > the received one > options (the lookups fall back to options
+   * where the zone has no value) */
+  if (rx && b->allow_transfer_count == 0 && b->tsig_keys_count == 0 && rx->allow_transfer_count + rx->tsig_keys_count > 0) {
+    if (!zx_take_acl(x, rx, note, notelen, cfg)) {
+      free_zone_config(c);
+      return NULL;
+    }
+    if (b->transfer_acl_match == ACL_MATCH_DEFAULT) x->transfer_acl_match = rx->transfer_acl_match;
+  }
+  if (rx && b->ecs_trusted_resolvers_count == 0 && rx->ecs_trusted_resolvers_count > 0) {
+    for (int i = 0; i < x->ecs_trusted_resolvers_count; i++) free(x->ecs_trusted_resolvers[i]);
+    free(x->ecs_trusted_resolvers);
+    free(x->ecs_trusted_resolvers_parsed);
+    x->ecs_trusted_resolvers = NULL; x->ecs_trusted_resolvers_parsed = NULL; x->ecs_trusted_resolvers_count = 0;
+    if (!zx_strs(&x->ecs_trusted_resolvers, &x->ecs_trusted_resolvers_count, rx->ecs_trusted_resolvers, rx->ecs_trusted_resolvers_count)) {
+      free_zone_config(c);
+      return NULL;
+    }
+    x->ecs_trusted_resolvers_parsed = acl_list_parse(x->ecs_trusted_resolvers, x->ecs_trusted_resolvers_count);
+  }
+  if (rx && !b->additional_from_auth_specified && rx->additional_from_auth_specified) {
+    x->additional_from_auth = rx->additional_from_auth;
+    x->additional_from_auth_specified = true;
+  }
+  if (rx && b->zone_udp_bufsize == 0 && rx->zone_udp_bufsize > 0) x->zone_udp_bufsize = rx->zone_udp_bufsize;
+  return c;
 }

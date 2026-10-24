@@ -83,7 +83,7 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
    - CNAME exclusivity (CNAME must not co-exist with other record types at the same owner name, except DNSSEC RRs), CNAME loops, CNAME chains (warning), NS/MX targets that point to a CNAME (error, RFC 2181 §10.3) and SRV targets that point to a CNAME (warning, RFC 2782 "the name MUST NOT be an alias"; BIND's `check-srv-cname` default is also a warning)
    - Out-of-zone records (owner not at or below the zone name, e.g. address records for name servers outside the zone) give a warning and are left out of all further checks, because the server does not load them (RFC 1034 §4.2); the exit status is not affected
    - In-bailiwick NS targets (apex and delegations) must have an A/AAAA record in the zone (error); in-bailiwick MX and SRV targets without A/AAAA give a warning only, because no RFC requires an address for them. Records occluded by a delegation give warnings
-   - Inconsistent TTLs within one RRset (warning)
+   - Inconsistent TTLs within one RRset (warning); RRs with a location, time stamp or tag are not harmonized with RRs that every client sees, and an unrestricted and a restricted RR of one name and type with different TTLs are reported as such (a client that sees both gets an RRset with differing TTLs; the TTLs are kept)
    - SOA MNAME pointing to a CNAME (warning)
    - Meta-types (e.g. `OPT`, `TSIG`, `AXFR`) must not appear in zone data
    - Every record must be serializable to wire format

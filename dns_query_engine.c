@@ -3038,7 +3038,16 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
    * (RFC 1035 §4.1.1, RFC 8914 §4.19), as BIND 9.20 answers a client the zone is not served to (no matching view, allow-query
    * denial). The closest zone decides: there is no fall back to a parent zone's answer. tinydns differs (tdlookup.c: a
    * referral without AA, or no answer at all); documented in docs/karidns.md. */
-  if ((current_zone->image->flags & ZONE_IMAGE_F_SOA_ATTR) && db_entry) {
+  /* B8t-2: a SOA (or IXFR) question that carries the KariDNS extension option for this zone (a KariDNS secondary checking the serial)
+   * is answered with the reference SOA, whatever location, tag or time the requester has: a secondary outside every SOA's location
+   * must still be able to refresh.  The SOA of a zone is public data; the option adds nothing a plain query could not learn from a
+   * client the zone is served to. */
+  const bool ref_soa_ask = db_entry && (qtype == 6 || qtype == 251) && qclass == 1 && edns.has_karidns_ext &&
+                           KARIDNS_EXT_VERSION_OK(edns.karidns_ext_version) &&
+                           edns.karidns_ext_hash == calc_fnv1a_str(db_entry->domain) &&
+                           domain_names_match_ci(current_qname_lc, db_entry->domain);
+
+  if ((current_zone->image->flags & ZONE_IMAGE_F_SOA_ATTR) && db_entry && !ref_soa_ask) {
     zone_image_view_t cv;
     uint8_t cv_scope;
     zone_client_view(current_zone->image, cfg, zcfg, client_ip, ecs_trusted, edns.ecs_addr, edns.ecs_family, &cv, &cv_scope);
@@ -3098,6 +3107,10 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       uint8_t iv_scope;
       zone_client_view(zimg, cfg, zcfg, client_ip, ecs_trusted, edns.ecs_addr, edns.ecs_family, &iv, &iv_scope);
       soa_rr = zone_image_visible_soa(zimg, &iv, &soa_ttl);
+      if (ref_soa_ask) {
+        soa_rr = zone_image_apex_soa(zimg);
+        if (soa_rr != ZONE_IMAGE_NONE) soa_ttl = zone_image_rr_ttl(zimg, soa_rr);
+      }
     }
 
     uint32_t current_serial = 0;
@@ -3119,6 +3132,23 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         ancount = 1;
       }
     }
+    res[6] = (uint8_t)(ancount >> 8);
+    res[7] = (uint8_t)(ancount & 0xFF);
+    res[8] = 0; res[9] = 0;
+    if (edns.present) {
+      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
+    }
+    res[10] = (uint8_t)(arcount >> 8);
+    res[11] = (uint8_t)(arcount & 0xFF);
+    return offset;
+  }
+
+  if (ref_soa_ask && qtype == 6 && (current_zone->image->flags & ZONE_IMAGE_F_SOA_ATTR)) {
+    const zone_image_t *zimg = current_zone->image;
+    uint32_t soa_rr = zone_image_apex_soa(zimg);
+    if (soa_rr != ZONE_IMAGE_NONE &&
+        image_serialize_rr(zimg, soa_rr, res, body_max_len, &offset, comp_ctx, NULL, zone_image_rr_ttl(zimg, soa_rr)) >= 0)
+      ancount = 1;
     res[6] = (uint8_t)(ancount >> 8);
     res[7] = (uint8_t)(ancount & 0xFF);
     res[8] = 0; res[9] = 0;

@@ -917,6 +917,7 @@ static int ext_apply(pdns_zone_t *z) {
         const dns_record_t *r = &a->records[i];
         if (r->bind_location_tag || r->ecs_subnet_tag || r->tinydns_ttd || r->tinydns_loc[0] || r->tinydns_loc[1]) z->has_ext = true;
     }
+    if (z->n_soa > 1) z->has_ext = true;       /* B8t-2: several SOA rows travel in the version 3 encoding (SOA_SET) */
     return 0;
 }
 
@@ -1698,7 +1699,11 @@ typedef int (*body_sink_t)(void *ud, const uint8_t *body, size_t len);
  * the way Extended AXFR out writes a zone (dns_axfr_ixfr.c send_axfr_response(), one shared encoder: xext_* in dns_wire.c): the SOA,
  * the tag definitions (location, ECS) and the tinydns location definitions, then the rows with the state records in front
  * of the row that changes the tag in force (a tinydns row with a time stamp or a location as a TINYDNS_WRAP record), the
- * resetting state records, the SOA.  The marker and definition records are RRs of the stream: they count in rr_count. */
+ * resetting state records, the SOA.  The marker and definition records are RRs of the stream: they count in rr_count.
+ *
+ * B8t-2: a zone with several SOA rows, or a SOA row with a location, time stamp or tag, is written in the version 3 encoding: the
+ * frame is the reference SOA, SOA_SET (the number of SOA rows) follows it, and every SOA row is a body RR in a TINYDNS_WRAP
+ * record (also with no tinydns attribute), with the state records of its tags in front. */
 typedef struct {
     const pdns_zone_t *z;
     uint8_t *buf;
@@ -1745,12 +1750,9 @@ static int gen_put(void *ud, const dns_record_t *rec) {
 }
 
 static int gen_bodies(const pdns_zone_t *z, body_sink_t sink, void *ud, uint64_t *rr_total, char *err, size_t errlen) {
-    /* B8t-1: the stream is the Extended AXFR v2 format, whose frame SOA has no attributes and whose receiver ends a transfer at
-     * the second SOA.  Several SOA records and attributes (location, time stamp, tag) on the SOA record travel with the next
-     * format (B8t-2); until then such a zone is refused here, with this reason. */
-    if (z->n_soa > 1 || dns_record_is_restricted(&z->arena.records[z->soa_index])) {
-        snprintf(err, errlen, "zone '%s': several SOA records or attributes (location, time stamp, tag) on the SOA record need the "
-                 "extended transfer format of B8t-2, which this version does not have", z->name);
+    const bool soa_set = z->n_soa > 1 || dns_record_is_restricted(&z->arena.records[z->soa_index]);
+    if (soa_set && z->n_soa > KARIDNS_SOA_SET_MAX) {
+        snprintf(err, errlen, "zone '%s': more than %u SOA records", z->name, (unsigned)KARIDNS_SOA_SET_MAX);
         return -1;
     }
     gen_t g = { z, malloc(KDB_MAX_ZONE_DATA), DNS_HEADER_SIZE, 0, sink, ud, err, errlen, z->soa_index, 0, false };
@@ -1766,6 +1768,10 @@ static int gen_bodies(const pdns_zone_t *z, body_sink_t sink, void *ud, uint64_t
     g.buf[2] = 0x84;                              /* QR=1 AA=1, opcode QUERY, RCODE 0 */
 
     if (gen_put(&g, &recs[z->soa_index]) != 0) goto out;                 /* SOA first (RFC 5936 2.2) */
+    if (soa_set && xext_emit_soa_set(&x, (uint16_t)z->n_soa) != 0) {
+        snprintf(err, errlen, "zone '%s': the SOA set marker could not be written", z->name);
+        goto out;
+    }
     if (z->has_ext) {
         const zone_arena_t *a = &z->arena;
         for (int i = 0; i < a->bind_location_tag_count; i++)
@@ -1776,7 +1782,7 @@ static int gen_bodies(const pdns_zone_t *z, body_sink_t sink, void *ud, uint64_t
             if (xext_emit_locdef(&x, a->locations[i].code, a->locations[i].prefix_bits, a->locations[i].prefix) != 0) goto defs_failed;
     }
     for (size_t idx = 0; idx < z->arena.count; idx++) {
-        if (idx == z->soa_index) continue;
+        if (idx == z->soa_index && !soa_set) continue;
         const dns_record_t *r = &recs[idx];
         g.cur = idx;
         if (!z->has_ext) {
@@ -1784,7 +1790,7 @@ static int gen_bodies(const pdns_zone_t *z, body_sink_t sink, void *ud, uint64_t
             continue;
         }
         if (xext_select(&x, r->bind_location_tag, r->ecs_subnet_tag) != 0) goto out;
-        if (xext_rr_is_tinydns(r->tinydns_loc, (int64_t)r->tinydns_ttd)) {
+        if (xext_rr_is_tinydns(r->tinydns_loc, (int64_t)r->tinydns_ttd) || (soa_set && r->type_code == 6)) {
             dns_record_t wrap;
             uint8_t wbuf[4096];
             if (!wrap_tinydns_record(r, &wrap, wbuf, sizeof(wbuf))) {
