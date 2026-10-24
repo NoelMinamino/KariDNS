@@ -2455,3 +2455,48 @@ size_t zone_arena_drop_unencodable(zone_arena_t *arena, void (*report)(const dns
   free(buf);
   return dropped;
 }
+
+/* B8t-1: SOA RRs at the apex */
+bool dns_record_is_restricted(const dns_record_t *r) {
+  return r->tinydns_loc[0] != 0 || r->tinydns_loc[1] != 0 || r->tinydns_ttd != 0 || r->ecs_subnet_tag != NULL ||
+         r->bind_location_tag != NULL;
+}
+
+const dns_record_t *zone_arena_reference_soa(const zone_arena_t *arena, const char *zone) {
+  const dns_record_t *first = NULL;
+  if (!arena || !arena->records || !zone) return NULL;
+  for (size_t i = 0; i < arena->count; i++) {
+    const dns_record_t *r = &arena->records[i];
+    if (r->type_code != 6 || r->rdata_count < 7 || !r->name || !domain_names_match_ci(r->name, zone)) continue;
+    if (!dns_record_is_restricted(r)) return r;
+    if (!first) first = r;
+  }
+  return first;
+}
+
+int zone_arena_check_soa_set(const zone_arena_t *arena, const char *zone, char *err, size_t errlen) {
+  if (!arena || !arena->records || !zone) return 0;
+  size_t nsoa = 0;
+  bool restricted = false, signed_zone = false;
+  uint32_t serial = 0;
+  for (size_t i = 0; i < arena->count; i++) {
+    const dns_record_t *r = &arena->records[i];
+    if (r->type_code == 46 || r->type_code == 48 || r->type_code == 47 || r->type_code == 50) signed_zone = true;
+    if (r->type_code != 6 || !r->name || !domain_names_match_ci(r->name, zone) || r->rdata_count < 3 || !r->rdata[2]) continue;
+    uint32_t s = (uint32_t)strtoul(r->rdata[2], NULL, 10);
+    if (nsoa++ == 0) {
+      serial = s;
+    } else if (s != serial) {
+      snprintf(err, errlen, "the SOA records of zone '%s' have different serials (%u and %u); a zone has one serial (RFC 2181 §6.1)",
+               zone, serial, s);
+      return -1;
+    }
+    if (dns_record_is_restricted(r)) restricted = true;
+  }
+  if ((restricted || nsoa > 1) && signed_zone) {
+    snprintf(err, errlen, "zone '%s' holds DNSSEC records and several or restricted SOA records (location, time stamp, tag); "
+             "the signature of the SOA RRset would not hold for every client", zone);
+    return -1;
+  }
+  return 0;
+}

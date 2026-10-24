@@ -134,47 +134,7 @@ STATIC_TEST bool image_rr_currently_valid(const zone_image_t *img, uint32_t rr, 
                                           const char *client_ecs_tag,
                                           const char *client_loc_tag,
                                           uint32_t *effective_ttl_out) {
-    const zone_image_ext_t *e = zone_image_rr_ext(img, rr);
-    uint32_t ttl = zone_image_rr_ttl(img, rr);
-    if (!e) {
-        *effective_ttl_out = ttl;
-        return true;
-    }
-    if (e->loc[0] != 0 || e->loc[1] != 0) {
-        if (e->loc[0] != client_loc[0] || e->loc[1] != client_loc[1]) {
-            return false;
-        }
-    }
-    if (e->ecs_tag_off != 0) {
-        if (client_ecs_tag == NULL || strcasecmp(zone_image_str(img, e->ecs_tag_off), client_ecs_tag) != 0) {
-            return false;
-        }
-    }
-    if (e->loc_tag_off != 0) {
-        if (client_loc_tag == NULL || strcasecmp(zone_image_str(img, e->loc_tag_off), client_loc_tag) != 0) {
-            return false;
-        }
-    }
-    time_t ttd = (time_t)e->ttd;
-    if (ttd == 0) {
-        *effective_ttl_out = ttl;
-        return true;
-    }
-
-    if (!(e->flags & ZONE_IMAGE_EXT_COUNTDOWN)) {
-        /* アクティベーション時刻としてのtimestamp */
-        if (ttd >= now) return false; /* まだ未来 */
-        *effective_ttl_out = ttl;
-        return true;
-    }
-
-    /* カウントダウンTTL(有効期限としてのtimestamp)。 */
-    if (ttd < now) return false; /* 既に期限切れ */
-    double remaining = difftime(ttd, now);
-    if (remaining < 2.0) remaining = 2.0;
-    if (remaining > 3600.0) remaining = 3600.0;
-    *effective_ttl_out = (uint32_t)remaining;
-    return true;
+    return zone_image_rr_valid(img, rr, now, client_loc, client_ecs_tag, client_loc_tag, effective_ttl_out);
 }
 
 /* The common case (an RR with no ext[] entry) without the call */
@@ -263,6 +223,9 @@ static int emit_rrset(const zone_image_t *img, uint32_t name_id, const char *own
     (*count)++;
     written++;
     if (glue) collect_additional_rr_glue(img, k, glue);
+    /* B8t-1: a zone with restricted SOA RRs answers with the first SOA the client sees, never with several (as tinydns does, djbdns 1.05;
+     * RFC 2181 §6.1: one SOA per zone) */
+    if (type == 6 && (img->flags & ZONE_IMAGE_F_SOA_ATTR)) break;
   }
   if (written == 0 || rrsig_mode == RRSIG_NONE || type == 46) return written;
   uint16_t rrset_offset = *offset, rrset_count = *count;
@@ -795,20 +758,18 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     const zone_image_name_t *img_names = zone_image_names(img);
     const zone_image_rr_t *img_rrs = zone_image_rrs(img);
 
-    time_t tinydns_now = 0;
-    if (img->flags & ZONE_IMAGE_F_TINYDNS) {
-      tinydns_now = time(NULL);
-    }
-    char client_loc[2] = {0, 0};
-    tinydns_resolve_client_location(img, client_ip, client_loc);
-
     const zone_config_t *zcfg = (cfg && db_entry) ? zone_entry_config(cfg, db_entry) : NULL;
-    const char *client_loc_tag = resolve_bind_location_tag(img, cfg, zcfg, client_ip);
-    const char *client_ecs_tag = NULL;
+    zone_image_view_t cview;
     uint8_t zone_scope = 0;
-    if (ecs_trusted && ecs_addr) {
-      client_ecs_tag = resolve_ecs_subnet_tag(img, cfg, zcfg, ecs_addr, ecs_family, &zone_scope);
-    }
+    zone_client_view(img, cfg, zcfg, client_ip, ecs_trusted, ecs_addr, ecs_family, &cview, &zone_scope);
+    time_t tinydns_now = cview.now;
+    const char *client_loc = cview.loc;
+    const char *client_loc_tag = cview.loc_tag;
+    const char *client_ecs_tag = cview.ecs_tag;
+    /* B8t-1: a zone cut over to by a CNAME whose SOA this client does not see is not served to it: the chain stops here
+     * (the query's own zone was checked before, REFUSED) */
+    if (depth > 0 && (img->flags & ZONE_IMAGE_F_SOA_ATTR) && zone_image_visible_soa(img, &cview, NULL) == ZONE_IMAGE_NONE)
+      return;
 
     // ==== フェーズ1: 委任判定 ====
     additional_from_auth_t policy = (zcfg && zext(zcfg)->additional_from_auth_specified)
@@ -3068,6 +3029,34 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     return offset;
   }
 
+  const zone_config_t *zcfg = (db_entry && view) ? zone_entry_config(cfg, db_entry) : NULL;
+  bool ecs_trusted = (cfg && cfg->ecs_enable && edns.has_ecs && client_ip &&
+                      is_ecs_trusted_resolver(current_zone->image, cfg, zcfg, client_ip));
+
+  /* B8t-1: a zone whose SOA RRs are restricted (tinydns location / time stamp, $LOCATION / $ECS-SUBNET tag) is served only to the
+   * clients that see one of them. For the others it is a zone that is not served to them: REFUSED, AA=0, EDE 18 Prohibited
+   * (RFC 1035 §4.1.1, RFC 8914 §4.19), as BIND 9.20 answers a client the zone is not served to (no matching view, allow-query
+   * denial). The closest zone decides: there is no fall back to a parent zone's answer. tinydns differs (tdlookup.c: a
+   * referral without AA, or no answer at all); documented in docs/karidns.md. */
+  if ((current_zone->image->flags & ZONE_IMAGE_F_SOA_ATTR) && db_entry) {
+    zone_image_view_t cv;
+    uint8_t cv_scope;
+    zone_client_view(current_zone->image, cfg, zcfg, client_ip, ecs_trusted, edns.ecs_addr, edns.ecs_family, &cv, &cv_scope);
+    if (zone_image_visible_soa(current_zone->image, &cv, NULL) == ZONE_IMAGE_NONE) {
+      res[2] &= ~0x04;
+      res[3] = (res[3] & 0xF0) | 5;
+      add_ede(&edns, send_ede, 18, "Query refused: the zone is not served to this client");
+      uint16_t roff = q_offset;
+      uint16_t rar = 0;
+      if (edns.present) {
+        assemble_edns_opt(res, max_res_len, &roff, &rar, &edns, ext_rcode_out, is_tcp, cfg);
+        res[10] = (uint8_t)(rar >> 8);
+        res[11] = (uint8_t)(rar & 0xFF);
+      }
+      return roff;
+    }
+  }
+
   /* RFC 7314 §3: 権威を持つゾーンへの EXPIRE 付き問い合わせには、SOA EXPIRE (プライマリ)
    * または expire タイマーの残り (セカンダリ) を返す。権威が無い応答 (上の REFUSED) には
    * 付けない (§3.3)。値は本体に依存しないので wire キャッシュのヒット時も同じく付く。 */
@@ -3101,10 +3090,15 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
 
     const zone_image_t *zimg = current_zone->image;
+    /* B8t-1: the SOA this client sees (the zone has one, checked above); the serial is the zone's, the same in all of them */
     uint32_t soa_rr = ZONE_IMAGE_NONE;
-    uint32_t apex_id = zone_image_find_name(zimg, db_entry->domain);
-    if (apex_id != ZONE_IMAGE_NONE)
-      soa_rr = zone_image_rrset_next(zimg, apex_id, 6, zone_image_name_first_rr(zimg, apex_id));
+    uint32_t soa_ttl = 0;
+    {
+      zone_image_view_t iv;
+      uint8_t iv_scope;
+      zone_client_view(zimg, cfg, zcfg, client_ip, ecs_trusted, edns.ecs_addr, edns.ecs_family, &iv, &iv_scope);
+      soa_rr = zone_image_visible_soa(zimg, &iv, &soa_ttl);
+    }
 
     uint32_t current_serial = 0;
     zone_image_soa_t soa_nums;
@@ -3121,7 +3115,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     }
 
     if (soa_rr != ZONE_IMAGE_NONE) {
-      if (image_serialize_rr(zimg, soa_rr, res, body_max_len, &offset, comp_ctx, NULL, zone_image_rr_ttl(zimg, soa_rr)) >= 0) {
+      if (image_serialize_rr(zimg, soa_rr, res, body_max_len, &offset, comp_ctx, NULL, soa_ttl) >= 0) {
         ancount = 1;
       }
     }
@@ -3211,9 +3205,6 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   uint32_t qtx_included = 0;
-  const zone_config_t *zcfg = (db_entry && view) ? zone_entry_config(cfg, db_entry) : NULL;
-  bool ecs_trusted = (cfg && cfg->ecs_enable && edns.has_ecs && client_ip &&
-                      is_ecs_trusted_resolver(current_zone ? current_zone->image : NULL, cfg, zcfg, client_ip));
   t_resolve_crossed_zone = false;
   t_resolve_additional_cut = false;
   resolve_name(current_qname, qclass, qtypes, num_qtypes, &db_entry, &current_zone, res, body_max_len,

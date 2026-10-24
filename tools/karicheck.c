@@ -1071,6 +1071,7 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     fprintf(stdout, "[OK] Zone '%s' parsed successfully (%zu records)\n", domain, arena.count);
     bool has_soa = false;
     int soa_count = 0; /* [T3] SOA重複検出用 */
+    int soa_plain_count = 0; /* B8t-1: apex SOA RRs that every client sees (no location, time stamp or tag) */
     bool has_apex_ns = false;
 
     if (arena.is_tinydns_format) {
@@ -1300,6 +1301,7 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
             has_soa = true;
             /* [T3] SOA重複検出: apexに2度以上の SOAは破損ゾーンファイル */
             soa_count++;
+            if (!dns_record_is_restricted(&arena.records[i])) soa_plain_count++;
         }
         if (tcode == 2 && strcasecmp(arena.records[i].name, domain) == 0) {
             has_apex_ns = true;
@@ -1645,10 +1647,36 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         return 1;
     }
     /* [T3] SOA重複検出: apexに 2以上の SOAは失敗 */
-    if (soa_count > 1) {
-        kc_error(&tally, "Zone '%s' (%s) has %d SOA records at the apex; "
-                "exactly one SOA record is required\n",
-                domain, file_path, soa_count);
+    /* B8t-1: a tinydns zone (one Z line per location) and a zone with $LOCATION / $ECS-SUBNET tags may hold several SOA RRs when the
+     * others are restricted; at most one is for everybody, and all have one serial */
+    if (soa_plain_count > 1) {
+        kc_error(&tally, "Zone '%s' (%s) has %d SOA records at the apex that every client sees; "
+                "exactly one SOA record is required (more only with a location, time stamp or tag on the others)\n",
+                domain, file_path, soa_plain_count);
+    }
+    (void)soa_count;
+    {
+        char soa_err[320];
+        if (zone_arena_check_soa_set(&arena, domain, soa_err, sizeof(soa_err)) < 0)
+            kc_error(&tally, "%s (%s)\n", soa_err, file_path);
+        /* a SOA that no client can see: a location the zone does not define, or a countdown time stamp that is over (tdlookup.c) */
+        time_t soa_now = time(NULL);
+        for (size_t i = 0; i < arena.count; i++) {
+            const dns_record_t *sr = &arena.records[i];
+            if (sr->type_code != 6 || !sr->name || strcasecmp(sr->name, domain) != 0 || !dns_record_is_restricted(sr)) continue;
+            bool defined = true;
+            if (sr->tinydns_loc[0] || sr->tinydns_loc[1]) {
+                defined = false;
+                for (int li = 0; li < arena.location_count; li++)
+                    if (arena.locations[li].code[0] == sr->tinydns_loc[0] && arena.locations[li].code[1] == sr->tinydns_loc[1]) defined = true;
+            }
+            if (!defined)
+                kc_warning(&tally, "The SOA record of zone '%s' (%s) is restricted to location '%.2s', which the zone does not define: no client sees it\n",
+                        domain, file_path, sr->tinydns_loc);
+            else if (sr->tinydns_ttd != 0 && sr->tinydns_ttl_countdown && sr->tinydns_ttd < soa_now)
+                kc_warning(&tally, "The SOA record of zone '%s' (%s) has expired (countdown time stamp in the past): no client sees it\n",
+                        domain, file_path);
+        }
     }
 
     if (!has_apex_ns) {

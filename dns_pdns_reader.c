@@ -501,18 +501,17 @@ int pdns_zone_add_record(pdns_zone_t *z, const db_record_row_t *row) {
         if (z->n_prio_ignored++ == 0) z->first_prio_ignored_id = id;
     }
 
-    /* SOA: exactly one, at the apex, with a serial */
+    /* SOA: at the apex, with a serial.  B8t-1: several rows are allowed (a tinydns zone has one SOA per location, a tagged zone one per
+     * tag); they must have one serial (checked with the records in pdns_zone_finish()) */
     if (strcmp(type, "SOA") == 0) {
         if (!domain_names_match_ci(owner, z->name)) {
             zfail(z, true, id, "SOA record at '%.200s', not at the zone apex", owner);
             return -1;
         }
-        if (z->n_soa++ > 0) {
-            zfail(z, true, id, "more than one enabled SOA record (first: records.id %lld)", (long long)z->soa_row_id);
-            return -1;
+        if (z->n_soa++ == 0) {
+            z->soa_row_id = id;
+            z->soa_row_index = z->n_rows;     /* the row about to be added */
         }
-        z->soa_row_id = id;
-        z->soa_row_index = z->n_rows;     /* the row about to be added */
         if (!pdns_soa_serial(row->content, NULL)) {
             zfail(z, true, id, "SOA serial is not a decimal number up to 4294967295");
             return -1;
@@ -871,12 +870,6 @@ static int ext_apply(pdns_zone_t *z) {
                 continue;
             }
             dns_record_t *r = &a->records[i];
-            if (i == z->soa_row_index) {
-                /* until B8t: the apex SOA frames every transfer without attributes (RFC 5936 s2.2), so a tagged SOA
-                 * would answer differently on a secondary; tinydns semantics for it (tdlookup.c) come with B8t */
-                zfail(z, true, z->tags[t].id, "tags on the apex SOA record are not supported yet");
-                break;
-            }
             if (r->bind_location_tag || r->ecs_subnet_tag) {
                 zfail(z, true, z->tags[t].id, "two rows in karidns_record_tags for this record");
                 break;
@@ -894,10 +887,6 @@ static int ext_apply(pdns_zone_t *z) {
                 continue;
             }
             dns_record_t *r = &a->records[i];
-            if (i == z->soa_row_index) {        /* until B8t, as for the tags above */
-                zfail(z, true, z->tdns[t].id, "tinydns attributes (time stamp, location) on the apex SOA record are not supported yet");
-                break;
-            }
             if (r->tinydns_ttd || r->tinydns_loc[0] || r->tinydns_loc[1]) {
                 zfail(z, true, z->tdns[t].id, "two rows in karidns_record_tinydns for this record");
                 break;
@@ -1627,7 +1616,8 @@ int pdns_zone_finish(pdns_zone_t *z) {
             return -1;
         }
     }
-    /* every record must be the row it was written from: owner inside the zone, SOA where the SOA row is */
+    /* every record must be the row it was written from: owner inside the zone, SOA records exactly where the SOA rows are */
+    size_t nsoa_rec = 0;
     for (size_t i = 0; i < z->arena.count; i++) {
         const dns_record_t *r = &z->arena.records[i];
         if (!r->name || !domain_name_is_at_or_below(r->name, z->name)) {
@@ -1635,30 +1625,44 @@ int pdns_zone_finish(pdns_zone_t *z) {
             return -1;
         }
         if (r->type_code == 6) {
-            if (!domain_names_match_ci(r->name, z->name) || i != z->soa_row_index) {
-                zfail(z, true, z->line_id[i], "SOA record is not the apex SOA row");
+            if (!domain_names_match_ci(r->name, z->name)) {
+                zfail(z, true, z->line_id[i], "SOA record is not an apex SOA row");
                 return -1;
             }
-            z->soa_index = i;
-        } else if (i == z->soa_row_index) {
-            zfail(z, true, z->line_id[i], "the SOA row did not produce an SOA record");
-            return -1;
+            nsoa_rec++;
         }
     }
+    if (nsoa_rec != z->n_soa) {
+        zfail(z, true, z->soa_row_id, "an SOA row did not produce an SOA record");
+        return -1;
+    }
+    if (ext_apply(z) != 0) return -1;
+    /* B8t-1: the reference SOA (the SOA without location, time stamp or tag if there is one, else the first row) gives the zone
+     * serial; every SOA must carry it (RFC 2181 s6.1), and a presigned zone cannot have several or restricted SOA RRs: the
+     * signature of the SOA RRset would not hold for every client */
     {
-        const dns_record_t *soa = &z->arena.records[z->soa_index];
-        if (soa->type_code != 6 || soa->rdata_count < 3) {
+        char serr[320];
+        if (zone_arena_check_soa_set(&z->arena, z->name, serr, sizeof(serr)) < 0) {
+            zfail(z, true, z->soa_row_id, "%s", serr);
+            return -1;
+        }
+        const dns_record_t *ref = zone_arena_reference_soa(&z->arena, z->name);
+        if (!ref) {
             zfail(z, true, z->soa_row_id, "SOA record has too few fields");
             return -1;
         }
+        z->soa_index = (size_t)(ref - z->arena.records);
+        if ((z->flags & PDNS_F_PRESIGNED) && (z->n_soa > 1 || dns_record_is_restricted(ref))) {
+            zfail(z, true, z->soa_row_id, "a presigned zone cannot have several or restricted (location, time stamp, tag) SOA records");
+            return -1;
+        }
         char sb[64];
-        snprintf(sb, sizeof(sb), "0 0 %.40s", soa->rdata[2] ? soa->rdata[2] : "");
+        snprintf(sb, sizeof(sb), "0 0 %.40s", ref->rdata[2] ? ref->rdata[2] : "");
         if (!pdns_soa_serial(sb, &z->serial)) {
             zfail(z, true, z->soa_row_id, "SOA serial is not a decimal number up to 4294967295");
             return -1;
         }
     }
-    if (ext_apply(z) != 0) return -1;
     if ((z->flags & PDNS_F_PRESIGNED) && apply_presigned(z) != 0) return -1;
     if (z->flags & PDNS_F_PRESIGNED) (void)presigned_upper_hash_owners(&z->arena);   /* open item 1: BIND's spelling */
     if (build_zone_index(&z->arena, false) != 0) {
@@ -1741,6 +1745,14 @@ static int gen_put(void *ud, const dns_record_t *rec) {
 }
 
 static int gen_bodies(const pdns_zone_t *z, body_sink_t sink, void *ud, uint64_t *rr_total, char *err, size_t errlen) {
+    /* B8t-1: the stream is the Extended AXFR v2 format, whose frame SOA has no attributes and whose receiver ends a transfer at
+     * the second SOA.  Several SOA records and attributes (location, time stamp, tag) on the SOA record travel with the next
+     * format (B8t-2); until then such a zone is refused here, with this reason. */
+    if (z->n_soa > 1 || dns_record_is_restricted(&z->arena.records[z->soa_index])) {
+        snprintf(err, errlen, "zone '%s': several SOA records or attributes (location, time stamp, tag) on the SOA record need the "
+                 "extended transfer format of B8t-2, which this version does not have", z->name);
+        return -1;
+    }
     gen_t g = { z, malloc(KDB_MAX_ZONE_DATA), DNS_HEADER_SIZE, 0, sink, ud, err, errlen, z->soa_index, 0, false };
     if (!g.buf) {
         snprintf(err, errlen, "zone '%s': out of memory", z->name);

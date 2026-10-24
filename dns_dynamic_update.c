@@ -30,15 +30,19 @@
 uint32_t bump_soa_serial_in_arena(zone_arena_t *arena, const char *zone_name) {
   if (!arena || !zone_name) return 0;
   uint32_t new_serial = 0;
+  /* B8t-1: a zone can hold several apex SOA RRs (tinydns locations, tags), all with the one zone serial (RFC 2181 §6.1):
+   * every one gets the new serial, computed once from the first. */
   for (size_t i = 0; i < arena->count; i++) {
     if (arena->records[i].type_code == 6 && domain_names_match_ci(arena->records[i].name, zone_name) && arena->records[i].rdata_count >= 3) {
       if (arena->records[i].rdata[2]) {
-        uint32_t serial = strtoul(arena->records[i].rdata[2], NULL, 10);
-        serial++;
-        if (serial == 0) serial = 1;
-        new_serial = serial;
+        if (new_serial == 0) {
+          uint32_t serial = strtoul(arena->records[i].rdata[2], NULL, 10);
+          serial++;
+          if (serial == 0) serial = 1;
+          new_serial = serial;
+        }
         char buf[32];
-        snprintf(buf, sizeof(buf), "%u", serial);
+        snprintf(buf, sizeof(buf), "%u", new_serial);
         /* [C-2] arena_strdup 失敗時は NULL が代入されることを防ぐ */
         char *new_rdata = arena_strdup(arena, buf);
         if (!new_rdata) {
@@ -49,7 +53,6 @@ uint32_t bump_soa_serial_in_arena(zone_arena_t *arena, const char *zone_name) {
         arena->records[i].is_cached = false;
         dns_record_preparse_cache(arena, &arena->records[i]);
       }
-      break;
     }
   }
   return new_serial;
@@ -541,7 +544,7 @@ void send_notify_to_all(zone_db_entry_t *entry) {
     char mname_buf[DNS_NAME_TEXT_SIZE];
     const char *mname = NULL;
     uint32_t apex_end = zone_image_name_first_rr(img, apex_id) + zone_image_name_rr_count(img, apex_id);
-    uint32_t soa = zone_image_rrset_next(img, apex_id, 6, zone_image_name_first_rr(img, apex_id));
+    uint32_t soa = zone_image_apex_soa(img); /* B8t-1: the reference SOA (the SOA RRs of a zone can differ in MNAME) */
     if (soa != ZONE_IMAGE_NONE && zone_image_soa(img, soa, mname_buf, sizeof(mname_buf), NULL, 0, NULL) == 0)
       mname = mname_buf;
     for (uint32_t i = zone_image_name_first_rr(img, apex_id); i < apex_end; i++) {

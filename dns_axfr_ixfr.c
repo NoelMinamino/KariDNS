@@ -1150,13 +1150,19 @@ typedef struct {
   const struct sockaddr_storage *server_addr;
   bool has_server_addr;
   const char *domain;
-  xext_t xe;             /* Extended AXFR: the one encoder of the extension records (dns_wire.h), state markers included */
+  const zone_image_view_t *view; /* B8t-1: a standard AXFR carries the requester's view: the RRs it does not see are left out (NULL = no filtering) */
+  xext_t xe;            /* Extended AXFR: the one encoder of the extension records (dns_wire.h), state markers included */
 } axfr_emit_ctx_t;
 
 /* One RR to send: a builder record (IXFR history, KariDNS markers) or RR `rr` of a zone image (S5 B-2: the zone itself) */
 static int axfr_write_item(axfr_emit_ctx_t *ec, const dns_record_t *rec, const zone_image_t *img, uint32_t rr) {
-  if (img) return image_serialize_rr(img, rr, ec->res, KARIDNS_AXFR_MSG_LIMIT, &ec->offset, &ec->comp_ctx, NULL,
-                                     zone_image_rr_ttl(img, rr));
+  if (img) {
+    uint32_t ttl = zone_image_rr_ttl(img, rr);
+    /* as axfrdns does (behavioural reference, djbdns 1.05): a tinydns countdown RR (TTL 0 with a time stamp) is sent with TTL 2 */
+    const zone_image_ext_t *ext = ec->view ? zone_image_rr_ext(img, rr) : NULL;
+    if (ext && ext->ttd != 0 && (ext->flags & ZONE_IMAGE_EXT_COUNTDOWN)) ttl = 2;
+    return image_serialize_rr(img, rr, ec->res, KARIDNS_AXFR_MSG_LIMIT, &ec->offset, &ec->comp_ctx, NULL, ttl);
+  }
   return serialize_dns_record(ec->res, KARIDNS_AXFR_MSG_LIMIT, &ec->offset, rec, &ec->comp_ctx, NULL, 0xFFFFFFFF);
 }
 
@@ -1224,6 +1230,13 @@ static int axfr_emit_zone_item(axfr_emit_ctx_t *ec, const dns_record_t *rec_item
   const char *item_tloc = img ? (ext ? ext->loc : "\0") : rec_item->tinydns_loc;
   int64_t item_ttd = img ? (ext ? ext->ttd : 0) : (int64_t)rec_item->tinydns_ttd;
   if (!ec->is_extended_axfr) {
+    /* B8t-1: a standard AXFR is the zone as the requester sees it now (axfrdns.c: the location of the client, the time stamps of
+     * now); a record it does not see is not sent. Locations and tags are not sent: the requester has no use for them. */
+    if (ec->view && img) {
+      uint32_t ttl;
+      if (!zone_image_rr_visible(img, rr, ec->view, &ttl)) return 0;
+      return axfr_emit_item(ec, rec_item, img, rr);
+    }
     if (item_loc_tag != NULL || item_ecs_tag != NULL || item_tloc[0] != 0 || item_tloc[1] != 0 || item_ttd != 0) {
       /* Skip tagged records in fallback mode */
       return 0;
@@ -1290,7 +1303,7 @@ static void axfr_send_error(int client_fd, const uint8_t *req, uint16_t req_len,
  * KariDNS セカンダリの IXFR にも差分で答えられる (X-24)。セカンダリは IXFR を受けると
  * 自分の active を複製して差分を当てるので、拡張データの更新はこの判定で AXFR に回す。 */
 static bool zone_needs_extended_axfr(const zone_image_t *zone, const zone_db_entry_t *entry) {
-  if (zone_image_has_zattr(zone) || (zone->flags & ZONE_IMAGE_F_TINYDNS))
+  if (zone_image_has_zattr(zone) || (zone->flags & (ZONE_IMAGE_F_TINYDNS | ZONE_IMAGE_F_SOA_ATTR)))
     return true;
   bool cfg_trusted = false;
   server_config_t *cfg = acquire_config_snapshot();
@@ -1300,6 +1313,14 @@ static bool zone_needs_extended_axfr(const zone_image_t *zone, const zone_db_ent
     release_config_snapshot(cfg);
   }
   return cfg_trusted;
+}
+
+/* B8t-1: the apex has more than one SOA RR, or one that some client does not see */
+static bool zone_has_multiple_or_restricted_soa(const zone_image_t *img) {
+  if (img->flags & ZONE_IMAGE_F_SOA_ATTR) return true;
+  if (img->apex_name == ZONE_IMAGE_NONE) return false;
+  uint32_t k = zone_image_rrset_next(img, img->apex_name, 6, zone_image_name_first_rr(img, img->apex_name));
+  return k != ZONE_IMAGE_NONE && zone_image_rrset_next(img, img->apex_name, 6, k + 1) != ZONE_IMAGE_NONE;
 }
 
 void send_axfr_response(int client_fd, const char *qname __attribute__((unused)), uint8_t *req,
@@ -1383,10 +1404,48 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     resp_edns.send_expire_value = zone_expire_option_value(entry, time(NULL));
   }
 
-  uint32_t soa_rr = zone_image_apex_soa(current_zone);
+  uint32_t soa_rr = zone_image_apex_soa(current_zone); /* the reference SOA: serial, the frame of an Extended AXFR */
   if (soa_rr == ZONE_IMAGE_NONE) {
     free(res);
     return;
+  }
+
+  /* B8t-1: an Extended AXFR (v2) cannot carry several or restricted SOA RRs (the frame SOA has no attributes, and the receiver
+   * ends the transfer at a second SOA); that comes with the next format (B8t-2). Until then it is refused rather than sent
+   * wrong; a standard AXFR is unaffected. */
+  if (is_extended_axfr && zone_has_multiple_or_restricted_soa(current_zone)) {
+    syslog(LOG_WARNING, "[AXFR] zone '%s': Extended AXFR refused: the zone has several or restricted SOA records "
+           "(location, time stamp, tag); the extended format of this version cannot carry them", entry->domain);
+    free(res);
+    axfr_send_error(client_fd, req, req_len, 5, false, 0, "Extended transfer of a zone with several or restricted SOA records is not supported",
+                    tsig_key, req_mac, req_mac_len, client_addr, client_len, server_addr, has_server_addr);
+    return;
+  }
+
+  /* B8t-1: a standard AXFR of a zone with per-client RRs (tinydns locations and time stamps, $LOCATION / $ECS-SUBNET tags) is the zone
+   * as the requester sees it now (axfrdns.c): the RRs it does not see are not sent, the opening and closing SOA is the first
+   * SOA it sees, and a requester that sees no SOA is refused (REFUSED, EDE 18 Prohibited; RFC 8914 §4.19, as BIND answers a
+   * client the zone is not served to). An ECS tag is never matched (a transfer has no client subnet). A zone without such
+   * RRs is sent as before. */
+  zone_image_view_t xview = { {0, 0}, NULL, NULL, 0 };
+  uint32_t frame_rr = soa_rr;
+  if (!is_extended_axfr && (current_zone->flags & ZONE_IMAGE_F_VIEW)) {
+    char cip[INET6_ADDRSTRLEN] = "";
+    if (client_addr && client_addr->ss_family == AF_INET)
+      inet_ntop(AF_INET, &((const struct sockaddr_in *)client_addr)->sin_addr, cip, sizeof(cip));
+    else if (client_addr && client_addr->ss_family == AF_INET6)
+      inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, cip, sizeof(cip));
+    server_config_t *vcfg = acquire_config_snapshot();
+    const zone_config_t *vzcfg = vcfg ? zone_entry_config(vcfg, entry) : NULL;
+    zone_client_view(current_zone, vcfg, vzcfg, cip, false, NULL, 0, &xview, NULL);
+    if (vcfg) release_config_snapshot(vcfg);
+    frame_rr = zone_image_visible_soa(current_zone, &xview, NULL);
+    if (frame_rr == ZONE_IMAGE_NONE) {
+      free(res);
+      axfr_send_error(client_fd, req, req_len, 5, false, 18, "Transfer refused: the zone is not served to this client", tsig_key,
+                      req_mac, req_mac_len, client_addr, client_len, server_addr, has_server_addr);
+      return;
+    }
   }
 
   bool send_ixfr = false;
@@ -1407,6 +1466,11 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   /* X-24: 拡張を求める KariDNS セカンダリの IXFR は、拡張でしか運べないデータがあるときだけ
    * Extended AXFR にする。それ以外は通常の IXFR (差分が無ければ下で AXFR) で答える。 */
   if (is_extended_axfr && is_ixfr && !client_up_to_date && zone_needs_extended_axfr(current_zone, entry)) {
+    is_ixfr = false;
+  }
+  /* B8t-1: the history of differences is not per client; a standard IXFR of a zone with per-client RRs gets the whole zone as the
+   * requester sees it (RFC 1995 §4: the server may answer an IXFR with an AXFR). The up to date answer is the one SOA. */
+  if (!is_extended_axfr && is_ixfr && !client_up_to_date && (current_zone->flags & ZONE_IMAGE_F_VIEW)) {
     is_ixfr = false;
   }
 
@@ -1478,6 +1542,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   ec.server_addr = server_addr;
   ec.has_server_addr = has_server_addr;
   ec.domain = entry->domain;
+  ec.view = (!is_extended_axfr && (current_zone->flags & ZONE_IMAGE_F_VIEW)) ? &xview : NULL;
   xext_init(&ec.xe, entry->domain, axfr_xext_emit, &ec);
 
   memset(res, 0, 65535);
@@ -1492,7 +1557,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
 
   if (!send_ixfr && is_extended_axfr && zone_image_zattr_load(current_zone, &zattr) != 0) goto axfr_error;
   if (send_ixfr) {
-    if (axfr_emit_item(&ec, NULL, current_zone, soa_rr) < 0) goto axfr_error;
+    if (axfr_emit_item(&ec, NULL, current_zone, frame_rr) < 0) goto axfr_error;
     for (int t = 0; t < txn_count; t++) {
       ixfr_txn_t *txn = txn_list[t];
       int soa_del_idx = -1;
@@ -1519,11 +1584,11 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       }
     }
     if (txn_count > 0) {
-      if (axfr_emit_item(&ec, NULL, current_zone, soa_rr) < 0) goto axfr_error;
+      if (axfr_emit_item(&ec, NULL, current_zone, frame_rr) < 0) goto axfr_error;
     }
   } else {
     // 1. Initial SOA
-    if (axfr_emit_item(&ec, NULL, current_zone, soa_rr) < 0) goto axfr_error;
+    if (axfr_emit_item(&ec, NULL, current_zone, frame_rr) < 0) goto axfr_error;
 
     // Definitions emitted after first SOA in extended mode
     if (is_extended_axfr) {
@@ -1554,7 +1619,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     /* file order (zone_image_seq_rr), as the builder was walked before */
     for (uint32_t seq = 0; seq < current_zone->n_rrs; seq++) {
       uint32_t rr = zone_image_seq_rr(current_zone, seq);
-      if (rr == soa_rr)
+      if (zone_image_rr_type(current_zone, rr) == 6 && zone_image_rr_name(current_zone, rr) == current_zone->apex_name) /* every apex SOA: the frame is the opening and closing SOA (B8t-1: axfrdns.c leaves SOA RRs out of the body) */
         continue;
       if (axfr_emit_zone_item(&ec, NULL, current_zone, rr) < 0) goto axfr_error;
     }
@@ -1562,7 +1627,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     if (is_extended_axfr && xext_finish(&ec.xe) < 0) goto axfr_error;
 
     // 3. Trailing SOA
-    if (axfr_emit_item(&ec, NULL, current_zone, soa_rr) < 0) goto axfr_error;
+    if (axfr_emit_item(&ec, NULL, current_zone, frame_rr) < 0) goto axfr_error;
   }
   if (ec.answers > 0) {
     ec.res[6] = (uint8_t)(ec.answers >> 8);

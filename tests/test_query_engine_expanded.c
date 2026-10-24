@@ -497,6 +497,139 @@ static void test_tinydns_timestamp_countdown(void) {
     printf("  -> tinydns timestamp countdown passed.\n");
 }
 
+/* B8t-1: a tinydns zone with one SOA per location: the SOA a client gets is the first one it can see (tdlookup.c), negative
+ * answers carry it (RFC 2308 s3), a client that sees none gets REFUSED / AA=0 / EDE 18 (RFC 8914 s4.19) */
+static bool soa_set_has(const uint8_t *res, int len, const char *needle) {
+    return memmem(res, (size_t)len, needle, strlen(needle)) != NULL;
+}
+static bool soa_set_has_ede18(const uint8_t *res, int len) {
+    for (int i = 12; i + 6 <= len; i++)
+        if (res[i] == 0x00 && res[i + 1] == 0x0F && res[i + 4] == 0x00 && res[i + 5] == 0x12) return true;
+    return false;
+}
+static int soa_set_query(zone_db_snapshot_t *snap, server_config_t *cfg, const char *qname, uint16_t qtype, const char *client,
+                         uint8_t *res, size_t res_cap) {
+    uint8_t req[512];
+    size_t req_len = 0;
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    build_dns_query(req, &req_len, 0x7001, qname, qtype, true);
+    compress_ctx_init_packet(&comp_ctx);
+    const rate_limit_config_t *rrl_out = NULL;
+    zone_db_entry_t *matched = NULL;
+    return process_dns_query_impl(req, req_len, res, res_cap, qname, qtype, client, &comp_ctx, false, &rrl_out, snap, cfg, &matched);
+}
+
+static void test_soa_set_per_client(void) {
+    printf("[TEST] Query Engine: several restricted SOA records (B8t-1)...\n");
+    char data[] =
+        "%in:192.0.2\n"
+        "%ex:198.51.100\n"
+        "Zsoa.example:ns1.in.soa.example.:hostmaster.soa.example.:7:3600:900:604800:300:300::in\n"
+        "Zsoa.example:ns1.ex.soa.example.:hostmaster.soa.example.:7:3600:900:604800:300:300::ex\n"
+        "&soa.example::ns1.soa.example:300\n"
+        "+ns1.soa.example:203.0.113.1:300\n"
+        "+www.soa.example:203.0.113.10:300\n";
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .default_origin = "soa.example.", .err_out = &err, .source_mtime = 1 };
+    assert(parse_tinydns_data(data, strlen(data), &arena, &ctx) >= 0);
+    char serr[256];
+    assert(zone_arena_check_soa_set(&arena, "soa.example.", serr, sizeof(serr)) == 0);
+    assert(test_build_index(&arena, true) == 0);
+    assert(arena.image->flags & ZONE_IMAGE_F_SOA_ATTR);
+    /* the reference SOA: both are restricted, so the first in file order */
+    uint32_t ref_rr = zone_image_apex_soa(arena.image);
+    assert(ref_rr != ZONE_IMAGE_NONE);
+    const dns_record_t *ref = zone_arena_reference_soa(&arena, "soa.example.");
+    assert(ref && strcmp(ref->rdata[0], "ns1.in.soa.example.") == 0);
+    assert(zone_image_rr_ttl(arena.image, ref_rr) == 300);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "soa.example.", sizeof(entry.domain));
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
+    zone_db_entry_t *entries[1] = { &entry };
+    char *any_acl[1] = { (char *)"any" };
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+    view.match_clients = any_acl;
+    view.match_clients_count = 1;
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.send_extended_errors = true;
+
+    uint8_t res[4096];
+    int n = soa_set_query(&snap, &cfg, "soa.example.", 6, "192.0.2.5", res, sizeof(res));
+    assert(n >= DNS_HEADER_SIZE && (res[3] & 0x0F) == 0 && (res[2] & 0x04));
+    assert(((res[6] << 8) | res[7]) == 1);                       /* the one SOA the client sees */
+    assert(soa_set_has(res, n, "\3ns1\2in") && !soa_set_has(res, n, "\3ns1\2ex"));
+    n = soa_set_query(&snap, &cfg, "soa.example.", 6, "198.51.100.5", res, sizeof(res));
+    assert(((res[6] << 8) | res[7]) == 1);
+    assert(soa_set_has(res, n, "\3ns1\2ex") && !soa_set_has(res, n, "\3ns1\2in"));
+    /* ANY at the apex: one SOA */
+    n = soa_set_query(&snap, &cfg, "soa.example.", 255, "192.0.2.5", res, sizeof(res));
+    assert(!soa_set_has(res, n, "\3ns1\2ex"));
+    /* NXDOMAIN and NODATA carry the SOA of the client (RFC 2308 s3) */
+    n = soa_set_query(&snap, &cfg, "nx.soa.example.", 1, "198.51.100.5", res, sizeof(res));
+    assert((res[3] & 0x0F) == 3 && ((res[8] << 8) | res[9]) == 1 && soa_set_has(res, n, "\3ns1\2ex"));
+    n = soa_set_query(&snap, &cfg, "www.soa.example.", 28, "192.0.2.5", res, sizeof(res));
+    assert((res[3] & 0x0F) == 0 && ((res[6] << 8) | res[7]) == 0 && ((res[8] << 8) | res[9]) == 1 &&
+           soa_set_has(res, n, "\3ns1\2in"));
+    /* a client that sees no SOA: REFUSED, AA=0, EDE 18, nothing else (RFC 1035 s4.1.1, RFC 8914 s4.19) */
+    n = soa_set_query(&snap, &cfg, "www.soa.example.", 1, "203.0.113.200", res, sizeof(res));
+    assert(n >= DNS_HEADER_SIZE && (res[3] & 0x0F) == 5 && !(res[2] & 0x04));
+    assert(res[6] == 0 && res[7] == 0 && res[8] == 0 && res[9] == 0);
+    assert(soa_set_has_ede18(res, n));
+    n = soa_set_query(&snap, &cfg, "soa.example.", 2, "203.0.113.200", res, sizeof(res));
+    assert((res[3] & 0x0F) == 5 && !(res[2] & 0x04) && soa_set_has_ede18(res, n));
+    /* without extended errors the status is the same and no EDE is sent */
+    cfg.send_extended_errors = false;
+    n = soa_set_query(&snap, &cfg, "soa.example.", 6, "203.0.113.200", res, sizeof(res));
+    assert((res[3] & 0x0F) == 5 && !soa_set_has_ede18(res, n));
+    /* UDP IXFR (RFC 1995 s4.2): the SOA of the client; none visible = REFUSED */
+    {
+        uint8_t req[512];
+        size_t off = 12;
+        memset(req, 0, 12);
+        req[5] = 1; req[9] = 1;
+        off += (size_t)write_uncompressed_name(req, off, sizeof(req), "soa.example.");
+        req[off++] = 0; req[off++] = 251; req[off++] = 0; req[off++] = 1;
+        off += (size_t)write_uncompressed_name(req, off, sizeof(req), "soa.example.");
+        req[off++] = 0; req[off++] = 6; req[off++] = 0; req[off++] = 1; req[off++] = 0; req[off++] = 0; req[off++] = 0; req[off++] = 0;
+        size_t rdl_pos = off;
+        off += 2;
+        size_t rd_start = off;
+        off += (size_t)write_uncompressed_name(req, off, sizeof(req), "a.");
+        off += (size_t)write_uncompressed_name(req, off, sizeof(req), "b.");
+        uint32_t v[5] = {7, 0, 0, 0, 0};
+        for (int i = 0; i < 5; i++) { req[off++] = v[i] >> 24; req[off++] = v[i] >> 16; req[off++] = v[i] >> 8; req[off++] = v[i]; }
+        req[rdl_pos] = (uint8_t)((off - rd_start) >> 8);
+        req[rdl_pos + 1] = (uint8_t)((off - rd_start) & 0xFF);
+        compress_ctx_t cc;
+        memset(&cc, 0, sizeof(cc));
+        compress_ctx_init_packet(&cc);
+        const rate_limit_config_t *rrl = NULL;
+        zone_db_entry_t *m = NULL;
+        n = process_dns_query_impl(req, off, res, sizeof(res), "soa.example.", 251, "198.51.100.5", &cc, false, &rrl, &snap, &cfg, &m);
+        assert(n >= DNS_HEADER_SIZE && (res[3] & 0x0F) == 0 && ((res[6] << 8) | res[7]) == 1 && soa_set_has(res, n, "\3ns1\2ex"));
+        compress_ctx_init_packet(&cc);
+        n = process_dns_query_impl(req, off, res, sizeof(res), "soa.example.", 251, "203.0.113.200", &cc, false, &rrl, &snap, &cfg, &m);
+        assert(n >= DNS_HEADER_SIZE && (res[3] & 0x0F) == 5);
+    }
+    zone_arena_destroy(&arena);
+    printf("  -> several restricted SOA records passed.\n");
+}
+
 static void test_mqtype_truncation(void) {
     printf("[TEST] Query Engine: MQTYPE EDNS option truncation handling...\n");
     zone_arena_t arena;
@@ -9474,6 +9607,7 @@ int main(void) {
     test_all_rr_types_and_resolution();
     test_dnssec_negative_and_delegation_proofs();
     test_tinydns_timestamp_countdown();
+    test_soa_set_per_client();
     test_mqtype_truncation();
     test_mqtype_qdcount0_formerr();
     test_resolve_name_servfail_rcode_clearing();

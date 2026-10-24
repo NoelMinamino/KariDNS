@@ -663,12 +663,26 @@ static void test_zone_level(void) {
     pdns_zone_add_record(z, &soa);
     CHECK(pdns_zone_finish(z) != 0);
     pdns_zone_free(z);
-    /* two SOAs */
+    /* B8t-1: several SOAs (a tinydns zone has one per location) must have one serial (RFC 2181 s6.1) */
     db_record_row_t two[] = { R(9, "z.test", "SOA", "ns1.z.test hostmaster.z.test 2 7200 3600 1209600 300", 3600, 0) };
     z = build(two, 1, NULL, 0, NULL);
     CHECK(z->failed);
-    CHECK_HAS(z->error, "records.id 9");
-    CHECK_HAS(z->error, "more than one");
+    CHECK_HAS(z->error, "records.id 1");
+    CHECK_HAS(z->error, "different serials");
+    pdns_zone_free(z);
+    /* ... with one serial the reader accepts them: the reference SOA (not restricted, else the first row) gives the serial.
+     * The KDB1 stream is still Extended AXFR v2, which cannot carry them (B8t-2): the zone is refused when it is encoded */
+    db_record_row_t two_ok[] = { R(9, "z.test", "SOA", "ns2.z.test hostmaster.z.test 2024010101 7200 3600 1209600 300", 3600, 0) };
+    z = build(two_ok, 1, NULL, 0, NULL);
+    CHECK_MSG(!z->failed, "%s", z->error);
+    CHECK(z->n_soa == 2 && z->serial == 2024010101u && z->arena.records[z->soa_index].type_code == 6);
+    {
+        rt_info_t info;
+        char why[300];
+        CHECK(!pdns_roundtrip(z, &info, why, sizeof(why)));
+        CHECK_HAS(why, "zone 'z.test.'");
+        CHECK_HAS(why, "B8t-2");
+    }
     pdns_zone_free(z);
     /* SOA not at the apex */
     reject("SOA below the apex", R(0, "sub.z.test", "SOA", "ns1.z.test hostmaster.z.test 2 7200 3600 1209600 300", 3600, 0), "not at the zone apex");
@@ -1612,14 +1626,38 @@ static void test_ext(void) {
         CHECK_MSG(info.rr_count == 13, "rr_count %llu", (unsigned long long)info.rr_count);
         pdns_zone_free(z);
     }
-    {   /* attributes on the apex SOA (row 1) fail the zone until B8t (tinydns semantics for a hidden SOA) */
+    {   /* B8t-1: attributes on the apex SOA (row 1) are read like any other (the B8 interim rejection is gone); the KDB1 stream
+         * is Extended AXFR v2, whose frame SOA has no attributes, so the zone is refused when it is encoded, with the reason */
         db_tag_row_t ts[] = { { 1, "lan", NULL } };
         pdns_zone_t *z = build_ext(k_ext_rows, 3, NULL, 0, ts, 1, NULL, 0, k_ext_defs, 4);
-        CHECK(z->failed && strstr(z->error, "tags on the apex SOA record are not supported yet") && z->error_row_id == 1);
+        CHECK_MSG(!z->failed, "%s", z->error);
+        CHECK(z->arena.records[z->soa_index].bind_location_tag && strcmp(z->arena.records[z->soa_index].bind_location_tag, "lan") == 0);
+        rt_info_t info;
+        char why[300];
+        CHECK(!pdns_roundtrip(z, &info, why, sizeof(why)));
+        CHECK_HAS(why, "B8t-2");
         pdns_zone_free(z);
         db_tinydns_row_t tds[] = { { 1, false, 10, "l2", false } };
-        z = build_ext(k_ext_rows, 3, NULL, 0, NULL, 0, tds, 1, NULL, 0);
-        CHECK(z->failed && strstr(z->error, "on the apex SOA record are not supported yet") && z->error_row_id == 1);
+        db_tagdef_row_t td_defs[] = { { "tinydns", "l2", "127.0.0.2/32" } };
+        z = build_ext(k_ext_rows, 3, NULL, 0, NULL, 0, tds, 1, td_defs, 1);
+        CHECK_MSG(!z->failed, "%s", z->error);
+        CHECK(z->arena.records[z->soa_index].tinydns_ttd == 10 && z->arena.records[z->soa_index].tinydns_loc[0] == 'l');
+        CHECK(!pdns_roundtrip(z, &info, why, sizeof(why)));
+        CHECK_HAS(why, "B8t-2");
+        pdns_zone_free(z);
+        /* a tag on a second SOA row: the SOA without attributes is the reference, the serial is the one of both */
+        db_record_row_t soa2[] = { R(9, "z.test", "SOA", "ns2.z.test hostmaster.z.test 2024010101 7200 3600 1209600 300", 3600, 0) };
+        db_tag_row_t ts2[] = { { 1, "lan", NULL } };
+        z = pdns_zone_new("z.test", NULL);
+        db_record_row_t first = SOA();
+        pdns_zone_add_record(z, &first);
+        pdns_zone_add_record(z, &soa2[0]);
+        pdns_zone_add_tags(z, &ts2[0]);
+        for (size_t i = 0; i < 3; i++) pdns_zone_add_record(z, &k_ext_rows[i]);
+        for (size_t i = 0; i < 4; i++) pdns_zone_add_tagdef(z, &k_ext_defs[i]);
+        pdns_zone_finish(z);
+        CHECK_MSG(!z->failed, "%s", z->error);
+        CHECK(z->arena.records[z->soa_index].bind_location_tag == NULL && strncmp(z->arena.records[z->soa_index].rdata[0], "ns2.z.test", 10) == 0);
         pdns_zone_free(z);
     }
     {   /* the digest covers the attributes */
@@ -1693,8 +1731,7 @@ static void test_ext(void) {
         pdns_zone_t *z = build_ext(k_ext_rows, 3, NULL, 0, two, 2, NULL, 0, NULL, 0);
         CHECK(z->failed && strstr(z->error, "two rows"));
         pdns_zone_free(z);
-        /* warnings only: a row of an unknown kind, a row of no enabled record (tags on the SOA fail the zone until B8t:
-         * see the block "attributes on the apex SOA" above) */
+        /* warnings only: a row of an unknown kind, a row of no enabled record */
         db_tagdef_row_t gu = { "foo", "x", "192.0.2.0/24" };
         db_tag_row_t ts[] = { { 99, "lan", NULL } };
         z = build_ext(k_ext_rows, 3, NULL, 0, ts, 1, NULL, 0, &gu, 1);

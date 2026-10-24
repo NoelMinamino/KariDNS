@@ -238,6 +238,10 @@ td_case naptr_pref 1 "NAPTR preference '70000' out of range" 'Nexample.com:1:700
 td_case sshfp_gen  1 "SSHFP record requires 3 fields" ':sshfp.example.com:44:\001\001\252\273:300'
 td_case loc_dup    0 "Duplicate location code 'lo'" '%lo:10.0
 %lo:10.1'
+td_case soa_serial 1 "different serials" '%in:10.0
+Zexample.com:a.ns.example.com.:h.example.com.:5:3600:900:604800:300:300::in'
+td_case soa_nobody 1 "restricted to location 'zz', which the zone does not define" '%in:10.0
+Zexample.com:a.ns.example.com.:h.example.com.:5:3600:900:604800:300:300::zz'
 td_case clean      0 "0 error(s), 0 warning(s)" '=www.example.com:192.0.2.10:300
 +alias.example.com:192.0.2.11:300'
 

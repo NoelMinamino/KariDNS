@@ -225,14 +225,16 @@ KariDNS solves this with **Extended AXFR**:
   - In BIND zones: tag definitions (`$LOCATION-TAG` as TYPE `65403`, `$ECS-SUBNET-TAG` as TYPE `65404`), record state transitions (`$LOCATION` as TYPE `65401`, `$ECS-SUBNET` as TYPE `65402`) and the zone's trusted ECS resolvers (TYPE `65407`).
   - In tinydns zones: location definitions (`%`, TYPE `65405`) and wrapped records (TYPE `65406`) preserving location tags and countdown timestamps.
 - An IXFR request that carries Option 65153 is answered with a full Extended AXFR only when the zone has KariDNS-specific data (tag definitions, location definitions, tinydns data, or trusted ECS resolvers for the zone or the server). Otherwise it is answered like any IXFR (RFC 1995): a single SOA when the secondary is up to date, the differences when the primary's history covers the secondary's serial, else a full (Extended) AXFR. A secondary that receives an IXFR copies its current data and applies the differences, so changes of KariDNS-specific data always reach it by a full transfer.
+- A zone with several SOA records or a restricted SOA record (a tinydns `Z` line per location, a `$LOCATION`-tagged SOA) is **not** sent as an Extended AXFR of this format: the request is refused (REFUSED) until the next format version can carry the SOA attributes.
 - Secondary seamlessly unwraps the transfer and populates its in-memory arena, enabling identical steering on the secondary server.
 
 ### 6.2 Standard AXFR Fallback (Plan B)
 - When a standard AXFR client (such as BIND9, NSD, or `dig`) requests a transfer without Option 65153:
-  - KariDNS filters out all location-tagged, ECS-tagged, and tinydns-tagged records.
-  - KariDNS hides all internal CLASS `65302` directive markers.
-  - The standard slave receives a clean, compliant zone containing only unrestricted (default) records.
-  - This prevents confidential internal steering records and unknown meta-records from leaking to external secondary servers.
+  - KariDNS sends the zone **as the requester sees it now** (the way `axfrdns` of djbdns does): the unrestricted records, plus the records whose tinydns location or `$LOCATION` tag matches the requester's address and whose tinydns time stamp is active. Records of other locations and tags are not sent, and neither are `$ECS-SUBNET`-tagged records (a transfer has no client subnet). A tinydns countdown record is sent with TTL 2.
+  - The opening and closing SOA is the first SOA the requester sees (a zone can have one SOA per location or tag, all with one serial; see karidns(8) "Several SOA records"); every other SOA record is left out. A requester that sees no SOA is refused (REFUSED, AA=0, EDE 18).
+  - KariDNS hides all internal CLASS `65302` directive markers, locations, tags and time stamps: the standard slave receives a clean, compliant zone.
+  - This prevents the records of other locations and tags, and unknown meta-records, from leaking to external secondary servers. (Before B8t-1 only the unrestricted records were sent.)
+  - A standard IXFR of a zone with such records is answered with the whole zone (RFC 1995 §4).
 
 ---
 

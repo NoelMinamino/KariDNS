@@ -143,8 +143,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         char why[400];
         /* B8: the extension records (tags, definitions) count in rr_count, so a zone that pdns_zone_finish() accepts can
          * still exceed max-zone-records when it is encoded; the loader fails that zone with this reason (zres_fail) */
+        /* B8t-1: several SOA rows and attributes on a SOA row are read, but the v2 stream cannot carry them: refused with the B8t-2 reason */
         if (!pdns_roundtrip(z, NULL, why, sizeof(why)) &&
-            !(strncmp(why, "encode: zone 'fuzz.test.': ", 27) == 0 && strstr(why + 27, " records exceed max-zone-records"))) {
+            !(strncmp(why, "encode: zone 'fuzz.test.': ", 27) == 0 &&
+              (strstr(why + 27, " records exceed max-zone-records") || strstr(why + 27, "B8t-2")))) {
             fprintf(stderr, "fuzz_pdns_content: round trip failed: %s\n", why);
             __builtin_trap();
         }

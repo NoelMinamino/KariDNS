@@ -210,6 +210,16 @@ size_t zone_arena_drop_out_of_zone(zone_arena_t *arena, const char *apex,
                                    void (*report)(const dns_record_t *rec, void *ud), void *ud);
 /* X-32: drop records whose RDATA cannot be written in wire format (call before build_zone_index). */
 size_t zone_arena_drop_unencodable(zone_arena_t *arena, void (*report)(const dns_record_t *rec, void *ud), void *ud);
+/* B8t-1: SOA RRs at the apex of a zone (builder form). A SOA is restricted when it has a tinydns location or time stamp, or a
+ * $LOCATION / $ECS-SUBNET tag: some clients do not see it. */
+bool dns_record_is_restricted(const dns_record_t *r);
+/* The reference SOA of the zone `zone`: the apex SOA (with a complete RDATA) that is not restricted if there is one, else the
+ * first in record order; NULL when there is none. Zone-wide values (serial, refresh / retry / expire, EDNS EXPIRE) come from it. */
+const dns_record_t *zone_arena_reference_soa(const zone_arena_t *arena, const char *zone);
+/* Rules for the SOA RRs of one zone (RFC 2181 §6.1: a zone has one serial; a signature of the SOA RRset would not hold for
+ * per-client SOA RRs): all apex SOA RRs have the same serial, and none is restricted or accompanied by another SOA in a
+ * zone that holds DNSSEC records (RRSIG, DNSKEY, NSEC, NSEC3). 0 = ok, -1 = the zone must not be loaded (reason in err). */
+int zone_arena_check_soa_set(const zone_arena_t *arena, const char *zone, char *err, size_t errlen);
 bool compare_records(const dns_record_t *a, const dns_record_t *b, bool ignore_ttl);
 bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target);
 uint32_t calc_fnv1a_str(const char *str);

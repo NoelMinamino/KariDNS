@@ -640,6 +640,16 @@ static void check_flags(const zone_arena_t *a, const zone_image_t *img) {
 }
 
 static void check_ext(const zone_arena_t *a, const zone_image_t *img, const uint32_t *map) {
+    /* ZONE_IMAGE_F_VIEW: set iff some RR is restricted (an ext[] entry that only keeps an owner spelling does not count; a
+     * standard IXFR of such a zone stays incremental) */
+    bool restricted = false;
+    for (size_t i = 0; i < a->count; i++) {
+        const dns_record_t *r = &a->records[i];
+        if (map[i] != ZONE_IMAGE_NONE && (r->tinydns_ttd || r->tinydns_ttl_countdown || r->tinydns_loc[0] || r->tinydns_loc[1] ||
+                                          r->ecs_subnet_tag || r->bind_location_tag))
+            restricted = true;
+    }
+    CHECK(((img->flags & ZONE_IMAGE_F_VIEW) != 0) == restricted);
     for (size_t i = 0; i < a->count; i++) {
         const dns_record_t *r = &a->records[i];
         if (map[i] == ZONE_IMAGE_NONE) continue;
@@ -1161,6 +1171,147 @@ static void run_perm(void) {
     free_zone(&z);
 }
 
+/* B8t-1: several apex SOA RRs with attributes: the reference SOA, the SOA a client sees, ZONE_IMAGE_F_SOA_ATTR, the serial rule */
+static bool soa_mname_is(const zone_image_t *img, uint32_t rr, const char *mname) {
+    char m[DNS_NAME_TEXT_SIZE];
+    return rr != ZONE_IMAGE_NONE && zone_image_soa(img, rr, m, sizeof(m), NULL, 0, NULL) == 0 && strcasecmp(m, mname) == 0;
+}
+
+static void run_soa_set(void) {
+    g_label = "soa set";
+    static const char *DATA =
+        "%in:127.0.0.1\n%ex:10.0.0.0/8\n"
+        "Zss.test:ns1.in.ss.test.:h.ss.test.:5:7200:3600:1209600:300:300::in\n"
+        "Zss.test:ns1.ex.ss.test.:h.ss.test.:5:7200:3600:1209600:300:300::ex\n"
+        "Zss.test:ns1.all.ss.test.:h.ss.test.:5:7200:3600:1209600:300:300:\n"
+        "&ss.test::ns1.ss.test:300\n+ns1.ss.test:192.0.2.1:300\n";
+    zone_t z;
+    CHECK(load_zone(&z, DATA, "ss.test.", NULL, true));
+    if (!z.ok) return;
+    char err[256];
+    CHECK(zone_arena_check_soa_set(&z.a, "ss.test.", err, sizeof(err)) == 0);
+    const dns_record_t *ref = zone_arena_reference_soa(&z.a, "ss.test.");
+    CHECK(ref && strcasecmp(ref->rdata[0], "ns1.all.ss.test.") == 0 && !dns_record_is_restricted(ref));
+    zone_image_t *img = zone_image_freeze(&z.a, "ss.test.");
+    CHECK(img != NULL);
+    if (img) {
+        CHECK(img->flags & ZONE_IMAGE_F_SOA_ATTR);
+        /* the reference SOA is the one for everybody although it is the last in file order */
+        CHECK(soa_mname_is(img, zone_image_apex_soa(img), "ns1.all.ss.test."));
+        zone_image_view_t v = { {'i', 'n'}, NULL, NULL, 0 };
+        uint32_t ttl = 0;
+        CHECK(soa_mname_is(img, zone_image_visible_soa(img, &v, &ttl), "ns1.in.ss.test.") && ttl == 300);
+        v.loc[0] = 'e'; v.loc[1] = 'x';
+        CHECK(soa_mname_is(img, zone_image_visible_soa(img, &v, NULL), "ns1.ex.ss.test."));
+        v.loc[0] = 'z'; v.loc[1] = 'z';
+        CHECK(soa_mname_is(img, zone_image_visible_soa(img, &v, NULL), "ns1.all.ss.test."));    /* the unrestricted SOA is seen by all */
+        zone_image_free(img);
+    }
+    free_zone(&z);
+
+    /* every SOA restricted: the reference is the first in file order; a client of no listed location sees none */
+    static const char *ALL_R =
+        "%in:127.0.0.1\n%ex:10.0.0.0/8\n%zz:192.0.2\n"
+        "Zrr.test:ns1.in.rr.test.:h.rr.test.:5:7200:3600:1209600:300:300::in\n"
+        "Zrr.test:ns1.ex.rr.test.:h.rr.test.:5:7200:3600:1209600:300:300::ex\n"
+        "&rr.test::ns1.rr.test:300\n+ns1.rr.test:192.0.2.1:300\n";
+    CHECK(load_zone(&z, ALL_R, "rr.test.", NULL, true));
+    if (!z.ok) return;
+    img = zone_image_freeze(&z.a, "rr.test.");
+    CHECK(img != NULL);
+    if (img) {
+        CHECK(soa_mname_is(img, zone_image_apex_soa(img), "ns1.in.rr.test."));
+        zone_image_view_t v = { {'z', 'z'}, NULL, NULL, 0 };
+        CHECK(zone_image_visible_soa(img, &v, NULL) == ZONE_IMAGE_NONE);
+        v.loc[0] = 0; v.loc[1] = 0;
+        CHECK(zone_image_visible_soa(img, &v, NULL) == ZONE_IMAGE_NONE);
+        zone_image_free(img);
+    }
+    free_zone(&z);
+
+    /* a time stamp is an attribute too: a countdown SOA is visible until it runs out (TTL 2..3600), an activation stamp
+     * in the future hides it until then */
+    static const char *TS =
+        "Ztt.test:ns1.cd.tt.test.:h.tt.test.:5:7200:3600:1209600:300:0:4000000099999999:\n"
+        "Ztt.test:ns1.old.tt.test.:h.tt.test.:5:7200:3600:1209600:300:0:400000003b9aca00:\n"
+        "Ztt.test:ns1.fut.tt.test.:h.tt.test.:5:7200:3600:1209600:300:300:40000000b2d05e00:\n"
+        "&tt.test::ns1.tt.test:300\n+ns1.tt.test:192.0.2.1:300\n";
+    CHECK(load_zone(&z, TS, "tt.test.", NULL, true));
+    if (!z.ok) return;
+    img = zone_image_freeze(&z.a, "tt.test.");
+    CHECK(img != NULL);
+    if (img) {
+        CHECK(img->flags & ZONE_IMAGE_F_SOA_ATTR);
+        time_t cd_end = (time_t)0x99999999LL;
+        zone_image_view_t v = { {0, 0}, NULL, NULL, cd_end - 100 };
+        uint32_t ttl = 0;
+        CHECK(soa_mname_is(img, zone_image_visible_soa(img, &v, &ttl), "ns1.cd.tt.test.") && ttl == 100);
+        v.now = cd_end + 5;                                 /* the countdown is over, the old one too, the future one is not active */
+        CHECK(zone_image_visible_soa(img, &v, NULL) == ZONE_IMAGE_NONE);
+        v.now = (time_t)0xb2d05e00LL + 1;                   /* after the activation of the last */
+        CHECK(soa_mname_is(img, zone_image_visible_soa(img, &v, NULL), "ns1.fut.tt.test."));
+        zone_image_free(img);
+    }
+    free_zone(&z);
+
+    /* BIND $LOCATION on the SOA */
+    static const char *TAGGED =
+        "$ORIGIN tg.test.\n$TTL 300\n"
+        "$LOCATION-TAG office 192.0.2.0/24\n$LOCATION-TAG far 198.51.100.0/24\n"
+        "$LOCATION office\n@ IN SOA ns1.office.tg.test. h 4 7200 3600 1209600 300\n"
+        "$LOCATION far\n@ IN SOA ns1.far.tg.test. h 4 7200 3600 1209600 300\n"
+        "$LOCATION none\n@ IN NS ns1\nns1 IN A 192.0.2.1\n";
+    CHECK(load_zone(&z, TAGGED, "tg.test.", NULL, false));
+    if (!z.ok) return;
+    CHECK(zone_arena_check_soa_set(&z.a, "tg.test.", err, sizeof(err)) == 0);
+    img = zone_image_freeze(&z.a, "tg.test.");
+    CHECK(img != NULL);
+    if (img) {
+        CHECK(img->flags & ZONE_IMAGE_F_SOA_ATTR);
+        zone_image_view_t v = { {0, 0}, "far", NULL, 0 };
+        CHECK(soa_mname_is(img, zone_image_visible_soa(img, &v, NULL), "ns1.far.tg.test."));
+        v.loc_tag = "none-such";
+        CHECK(zone_image_visible_soa(img, &v, NULL) == ZONE_IMAGE_NONE);
+        v.loc_tag = NULL;
+        CHECK(zone_image_visible_soa(img, &v, NULL) == ZONE_IMAGE_NONE);
+        zone_image_free(img);
+    }
+    free_zone(&z);
+
+    /* the serial rule (RFC 2181 s6.1) and the DNSSEC rule */
+    static const char *MISMATCH =
+        "%in:127.0.0.1\n"
+        "Zmm.test:ns1.a.mm.test.:h.mm.test.:1:7200:3600:1209600:300:300::in\n"
+        "Zmm.test:ns1.b.mm.test.:h.mm.test.:2:7200:3600:1209600:300:300:\n&mm.test::ns1.mm.test:300\n";
+    CHECK(load_zone(&z, MISMATCH, "mm.test.", NULL, true));
+    err[0] = 0;
+    CHECK(zone_arena_check_soa_set(&z.a, "mm.test.", err, sizeof(err)) == -1 && strstr(err, "different serials") && strstr(err, "1 and 2"));
+    free_zone(&z);
+    static const char *SIGNED =
+        "$ORIGIN sg.test.\n$TTL 300\n"
+        "$LOCATION-TAG office 192.0.2.0/24\n"
+        "$LOCATION office\n@ IN SOA ns1 h 4 7200 3600 1209600 300\n$LOCATION none\n"
+        "@ IN NS ns1\nns1 IN A 192.0.2.1\n"
+        "@ IN DNSKEY 257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==\n";
+    CHECK(load_zone(&z, SIGNED, "sg.test.", NULL, false));
+    err[0] = 0;
+    CHECK(zone_arena_check_soa_set(&z.a, "sg.test.", err, sizeof(err)) == -1 && strstr(err, "DNSSEC"));
+    free_zone(&z);
+
+    /* a zone with one plain SOA is unchanged: no flag, the SOA is the reference and the visible one */
+    static const char *PLAIN = "$ORIGIN pl.test.\n$TTL 300\n@ IN SOA ns1 h 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n";
+    CHECK(load_zone(&z, PLAIN, "pl.test.", NULL, false));
+    img = zone_image_freeze(&z.a, "pl.test.");
+    CHECK(img != NULL);
+    if (img) {
+        CHECK(!(img->flags & ZONE_IMAGE_F_SOA_ATTR));
+        zone_image_view_t v = { {0, 0}, NULL, NULL, 0 };
+        CHECK(zone_image_apex_soa(img) != ZONE_IMAGE_NONE && zone_image_apex_soa(img) == zone_image_visible_soa(img, &v, NULL));
+        zone_image_free(img);
+    }
+    free_zone(&z);
+}
+
 /* B-1: more than 256 distinct targets (some without addresses, some used twice) and wildcard / DNAME owners */
 static void run_glue_flags(void) {
     g_label = "glue flags";
@@ -1326,6 +1477,8 @@ int main(void) {
     run_glue_flags();
     printf("[TEST] file order of interleaved owners (B-2)\n");
     run_perm();
+    printf("[TEST] several / restricted apex SOA records (B8t-1)\n");
+    run_soa_set();
     printf("[TEST] zero-length RDATA read from the wire (D15-1)\n");
     run_empty_rdata_wire();
     printf("[TEST] empty zone\n");

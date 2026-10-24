@@ -486,3 +486,20 @@ void tinydns_resolve_client_location(const zone_image_t *zone, const char *clien
         out_loc[1] = locations[best].code[1];
     }
 }
+
+/* B8t-1: what a client sees of a zone: its tinydns location, the BIND location tag, the ECS tag (only for a trusted resolver's
+ * ECS) and the time. *zone_scope is the ECS SCOPE the zone's tag definitions need (RFC 7871 §7.2.1). The one place for the query
+ * path, the REFUSED check and AXFR, so that all decide from the same view. */
+void zone_client_view(const zone_image_t *img, const server_config_t *cfg, const zone_config_t *zcfg, const char *client_ip,
+                      bool ecs_trusted, const uint8_t *ecs_addr, uint16_t ecs_family, zone_image_view_t *v,
+                      uint8_t *zone_scope) {
+    v->now = (img->flags & ZONE_IMAGE_F_TINYDNS) ? time(NULL) : 0;
+    v->loc[0] = 0;
+    v->loc[1] = 0;
+    tinydns_resolve_client_location(img, client_ip, v->loc);
+    v->loc_tag = resolve_bind_location_tag(img, cfg, zcfg, client_ip);
+    v->ecs_tag = NULL;
+    if (zone_scope) *zone_scope = 0;
+    if (ecs_trusted && ecs_addr)
+        v->ecs_tag = resolve_ecs_subnet_tag(img, cfg, zcfg, ecs_addr, ecs_family, zone_scope);
+}

@@ -933,56 +933,25 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
              entry->domain, file, parse_err.error_message);
       return RELOAD_ERR_PARSE;
   }
+  /* B8t-1: the zone-wide values (serial, refresh, retry, expire) come from the reference SOA (the SOA without location, time stamp
+   * or tag if there is one, else the first). All SOA RRs of the zone must have the same serial; a zone that breaks this is not
+   * loaded, the version in service stays. */
   bool has_soa = false;
-  uint32_t hash = calc_fnv1a_str(entry->domain);
-  size_t idx = hash & (z_standby->hash_size - 1);
-  for (int i = z_standby->hash_table[idx]; i != -1; i = z_standby->records[i].next_record) {
-      if (z_standby->records[i].type_code == 6 && domain_names_match_ci(z_standby->records[i].name, entry->domain)) {
+  {
+      char soa_err[320];
+      if (zone_arena_check_soa_set(z_standby, entry->domain, soa_err, sizeof(soa_err)) < 0) {
+          zone_arena_destroy(z_standby);
+          pthread_mutex_unlock(&entry->writer_lock);
+          syslog(LOG_ERR, "[Zone] zone '%s' not loaded from '%s': %s", entry->domain, file, soa_err);
+          return RELOAD_ERR_PARSE;
+      }
+      const dns_record_t *ref = zone_arena_reference_soa(z_standby, entry->domain);
+      if (ref) {
           has_soa = true;
-          if (z_standby->records[i].rdata_count >= 7) {
-              entry->serial = strtoul(z_standby->records[i].rdata[2], NULL, 10);
-              entry->refresh = parse_ttl_value(z_standby->records[i].rdata[3]);
-              entry->retry = parse_ttl_value(z_standby->records[i].rdata[4]);
-              entry->expire = parse_ttl_value(z_standby->records[i].rdata[5]);
-          }
-          break;
-      }
-  }
-  if (!has_soa) {
-      size_t elen = strlen(entry->domain);
-      if (elen > 0 && dns_name_len_no_root(entry->domain, elen) == elen && elen + 2 < 256) {
-          char dot_domain[256];
-          memcpy(dot_domain, entry->domain, elen);
-          dot_domain[elen] = '.';
-          dot_domain[elen + 1] = '\0';
-          uint32_t dot_hash = calc_fnv1a_str(dot_domain);
-          size_t dot_idx = dot_hash & (z_standby->hash_size - 1);
-          for (int i = z_standby->hash_table[dot_idx]; i != -1; i = z_standby->records[i].next_record) {
-              if (z_standby->records[i].type_code == 6 && domain_names_match_ci(z_standby->records[i].name, entry->domain)) {
-                  has_soa = true;
-                  if (z_standby->records[i].rdata_count >= 7) {
-                      entry->serial = strtoul(z_standby->records[i].rdata[2], NULL, 10);
-                      entry->refresh = parse_ttl_value(z_standby->records[i].rdata[3]);
-                      entry->retry = parse_ttl_value(z_standby->records[i].rdata[4]);
-                      entry->expire = parse_ttl_value(z_standby->records[i].rdata[5]);
-                  }
-                  break;
-              }
-          }
-      }
-  }
-  if (!has_soa) {
-      for (size_t i = 0; i < z_standby->count; i++) {
-          if (z_standby->records[i].type_code == 6 && domain_names_match_ci(z_standby->records[i].name, entry->domain)) {
-              has_soa = true;
-              if (z_standby->records[i].rdata_count >= 7) {
-                  entry->serial = strtoul(z_standby->records[i].rdata[2], NULL, 10);
-                  entry->refresh = parse_ttl_value(z_standby->records[i].rdata[3]);
-                  entry->retry = parse_ttl_value(z_standby->records[i].rdata[4]);
-                  entry->expire = parse_ttl_value(z_standby->records[i].rdata[5]);
-              }
-              break;
-          }
+          entry->serial = strtoul(ref->rdata[2], NULL, 10);
+          entry->refresh = parse_ttl_value(ref->rdata[3]);
+          entry->retry = parse_ttl_value(ref->rdata[4]);
+          entry->expire = parse_ttl_value(ref->rdata[5]);
       }
   }
   if (!has_soa) {
