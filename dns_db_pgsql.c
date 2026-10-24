@@ -1,0 +1,901 @@
+/*
+ * dns_db_pgsql.c - PostgreSQL driver of karidns-dbloader (beta design 2.2, 3.1, 6; milestone B10).  Compiled only when
+ * "postgresql" is listed in DB_DRIVERS (-DKARIDNS_DB_POSTGRESQL); karidns itself never links libpq.  The interface and its
+ * contract are dns_db_driver.h; the queries are the ones of dns_db_sqlite3.c (the reader above the driver is shared, so
+ * two drivers give the same stream for the same rows).
+ *
+ * Opening (design 2.2, 7.2):
+ *   - the libpq connection string is the content of `conninfo-file`.  The file must be a regular file owned by the user
+ *     the loader runs as, mode 0600 or 0400; anything else is refused before it is read (the string may hold a password).
+ *     Its content is never logged or put in an error message.  Parse errors are reported without libpq's text, which
+ *     can echo a fragment of the string.
+ *   - session settings are set right after the connection: read only (default_transaction_read_only), the client
+ *     encoding SQL_ASCII (bytes are passed through unchanged, exactly like the SQLite3 driver), application_name
+ *     karidns-dbloader, statement / lock / idle-in-transaction timeouts, cursor_tuple_fraction 1 (a bulk scan is read to
+ *     the end), and search_path = the schema of the view (database-schema) when there is one.
+ *
+ * Reading:
+ *   - a snapshot is BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; every scan is a cursor (DECLARE ... FETCH FORWARD n),
+ *     so a result set is never buffered whole (n rows at a time) and a scan that the callback stops is closed cleanly
+ *     without reading the rest.  Every PQresultStatus is checked.
+ *   - names are never compared with SQL collations by the callers (the only SQL comparison is the apex SOA join; the
+ *     reader checks the owner in C again).  ORDER BY on a text column uses COLLATE "C" so the order is the one of SQLite3.
+ *   - strings are zero copy from PQgetvalue(); a NULL pointer is SQL NULL.  PostgreSQL cannot store a NUL in text; the
+ *     length is still compared with strlen().
+ *
+ * Errors: a lost connection and the transient SQLSTATEs (class 08 connection exception, 40 transaction rollback, 53
+ * insufficient resources, 55P03 lock not available, 57 operator intervention incl. statement timeout and administrator
+ * shutdown) are DB_ERR_RETRY; the loader backs off and tries again with a new connection.
+ *
+ * Change log (the one place where PostgreSQL differs from SQLite3; design 3.7, 6, advance decision of B10):
+ *   karidns_changes.seq is taken when the statement ends, but rows become visible when their transaction commits, in
+ *   another order: a transaction that took seq 5 may commit after one that took seq 6.  A reader that remembered "seq 6"
+ *   would never see seq 5.  So every row carries the xid8 of its transaction (karidns_changes.xid, schema version 2),
+ *   and the cursor this driver hands to the loader is NOT a seq but the xmin of the reading snapshot
+ *   (pg_snapshot_xmin(pg_current_snapshot())): every transaction below it has finished and its rows are visible in the
+ *   snapshot, so they are final.  changes_max() returns that cursor; changes_since(after) lists the rows with xid >= after
+ *   (those of finished transactions that were not read before, and those of transactions that were still running when the
+ *   cursor was taken, which are read again: the diff that follows is idempotent) and returns the new cursor in *last_seq.
+ *   Rows of a transaction that is still open are never skipped, whatever the order of the seq values.  A cursor is only
+ *   compared by the loader (<, >, ==), never added to; the dbstatus "seq" of a PostgreSQL view is this cursor.
+ *   A database whose karidns_changes has no xid column (schema version 1) is served without a change log (has_changes
+ *   false: the zones are compared by serial; apply db/karidns_ext_v1_to_v2.pgsql.sql).
+ *   Pruning (design 3.7): the log keeps the newest 1,000,000 rows.  A gap is reported when the log has rows but none below
+ *   the cursor (the rows the loader has already seen are gone) and the first seq is not 1.
+ *
+ * Auto reload (design 6): `LISTEN karidns_changes` on the persistent connection; wait_fd() is its socket, poll_version()
+ * drains the notifications and returns a counter that changes when one arrived (it also pings the server now and then,
+ * so a dead connection is noticed).
+ */
+
+#ifdef KARIDNS_DB_POSTGRESQL
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <stdarg.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <time.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <libpq-fe.h>
+
+#include "dns_db_driver.h"
+
+#define PG_FETCH_ROWS 1000          /* rows per FETCH: the most a scan holds at a time */
+#define PG_CONNINFO_MAX 8192
+#define PG_PING_SECONDS 15
+
+struct db_conn {
+    PGconn *pg;
+    char err[DB_ERRLEN];
+    bool in_snapshot;
+    bool listening;
+    uint64_t nver;                  /* poll_version(): number of notifications seen */
+    time_t last_ping;
+    bool has_changes, has_domain_views, has_profiles, has_ext, has_tagdef_id;
+};
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* errors                                                                                                         */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+static void set_err(db_conn_t *c, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void set_err(db_conn_t *c, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(c->err, sizeof(c->err), fmt, ap);
+    va_end(ap);
+}
+
+/* the first line of a libpq message, without the trailing newline */
+static void first_line(const char *m, char *out, size_t cap) {
+    if (!m) m = "";
+    size_t n = strcspn(m, "\r\n");
+    if (n >= cap) n = cap - 1;
+    memcpy(out, m, n);
+    out[n] = '\0';
+}
+
+static bool sqlstate_transient(const char *s) {
+    if (!s) return false;
+    return strncmp(s, "08", 2) == 0 || strncmp(s, "40", 2) == 0 || strncmp(s, "53", 2) == 0 || strcmp(s, "55P03") == 0 ||
+           strncmp(s, "57", 2) == 0;
+}
+
+/* error of a failed libpq call: DB_ERR_RETRY for a lost connection and the transient SQLSTATEs, else -1 */
+static int pq_fail(db_conn_t *c, PGresult *r, const char *what) {
+    char line[260];
+    first_line(r ? PQresultErrorMessage(r) : PQerrorMessage(c->pg), line, sizeof(line));
+    if (!line[0]) first_line(PQerrorMessage(c->pg), line, sizeof(line));
+    const char *state = r ? PQresultErrorField(r, PG_DIAG_SQLSTATE) : NULL;
+    bool retry = PQstatus(c->pg) != CONNECTION_OK || sqlstate_transient(state);
+    set_err(c, "postgresql %s: %s%s", what, line, retry ? " (retry later)" : "");
+    return retry ? DB_ERR_RETRY : -1;
+}
+
+/* run one statement that returns no rows */
+static int exec_cmd(db_conn_t *c, const char *sql, const char *what) {
+    PGresult *r = PQexec(c->pg, sql);
+    if (!r || PQresultStatus(r) != PGRES_COMMAND_OK) {
+        int ret = pq_fail(c, r, what);
+        PQclear(r);
+        return ret;
+    }
+    PQclear(r);
+    return 0;
+}
+
+/* run one statement that returns rows; *out is the result (caller clears) */
+static int exec_rows(db_conn_t *c, const char *sql, int np, const char *const *pv, PGresult **out, const char *what) {
+    PGresult *r = np ? PQexecParams(c->pg, sql, np, NULL, pv, NULL, NULL, 0) : PQexec(c->pg, sql);
+    if (!r || PQresultStatus(r) != PGRES_TUPLES_OK) {
+        int ret = pq_fail(c, r, what);
+        PQclear(r);
+        return ret;
+    }
+    *out = r;
+    return 0;
+}
+
+static void ignore_notice(void *arg, const PGresult *res) {
+    (void)arg;
+    (void)res;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* cells                                                                                                          */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* A text cell as a C string (NULL for SQL NULL).  *bad is set when it has an embedded NUL; c->err then names the
+ * table, the row id and the column. */
+static const char *cell_text(db_conn_t *c, PGresult *r, int row, int col, const char *table, int64_t id, const char *name,
+                             bool *bad) {
+    if (PQgetisnull(r, row, col)) return NULL;
+    const char *t = PQgetvalue(r, row, col);
+    if ((size_t)PQgetlength(r, row, col) != strlen(t)) {
+        set_err(c, "table %s id %lld: column %s contains a NUL byte", table, (long long)id, name);
+        *bad = true;
+        return NULL;
+    }
+    return t;
+}
+
+static int64_t cell_i64(PGresult *r, int row, int col) { return PQgetisnull(r, row, col) ? 0 : strtoll(PQgetvalue(r, row, col), NULL, 10); }
+static bool cell_true(PGresult *r, int row, int col) { return !PQgetisnull(r, row, col) && PQgetvalue(r, row, col)[0] == 't'; }
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* open / close                                                                                                   */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* the content of conninfo-file into buf (NUL terminated, comment lines and line ends turned into blanks); 0 or -1 with err */
+static int read_conninfo(const char *path, char *buf, size_t cap, char *err, size_t errlen) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        snprintf(err, errlen, "postgresql: cannot open conninfo-file: %s", strerror(errno));
+        return -1;
+    }
+    struct stat sb;
+    if (fstat(fd, &sb) != 0 || !S_ISREG(sb.st_mode)) {
+        snprintf(err, errlen, "postgresql: conninfo-file is not a regular file");
+        close(fd);
+        return -1;
+    }
+    if (sb.st_uid != geteuid()) {
+        snprintf(err, errlen, "postgresql: conninfo-file is not owned by the user the loader runs as (uid %lu)", (unsigned long)geteuid());
+        close(fd);
+        return -1;
+    }
+    if ((sb.st_mode & 07777) != 0600 && (sb.st_mode & 07777) != 0400) {
+        snprintf(err, errlen, "postgresql: conninfo-file must have mode 0600 or 0400 (it may hold a password); it has %04o",
+                 (unsigned)(sb.st_mode & 07777));
+        close(fd);
+        return -1;
+    }
+    if (sb.st_size <= 0 || sb.st_size >= (off_t)cap) {
+        snprintf(err, errlen, "postgresql: conninfo-file is empty or larger than %zu bytes", cap - 1);
+        close(fd);
+        return -1;
+    }
+    size_t n = 0;
+    while (n < (size_t)sb.st_size) {
+        ssize_t k = read(fd, buf + n, (size_t)sb.st_size - n);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) break;
+        n += (size_t)k;
+    }
+    close(fd);
+    buf[n] = '\0';
+    if (strlen(buf) != n) {
+        snprintf(err, errlen, "postgresql: conninfo-file contains a NUL byte");
+        return -1;
+    }
+    /* '#' starts a comment line; line ends separate keyword=value pairs like blanks */
+    size_t o = 0;
+    bool bol = true, skip = false;
+    for (size_t i = 0; i < n; i++) {
+        char ch = buf[i];
+        if (ch == '\n' || ch == '\r') {
+            bol = true;
+            skip = false;
+            buf[o++] = ' ';
+            continue;
+        }
+        if (bol && ch == '#') skip = true;
+        if (ch != ' ' && ch != '\t') bol = false;
+        if (!skip) buf[o++] = ch;
+    }
+    while (o > 0 && (buf[o - 1] == ' ' || buf[o - 1] == '\t')) o--;
+    buf[o] = '\0';
+    if (o == 0) {
+        snprintf(err, errlen, "postgresql: conninfo-file holds no connection string");
+        return -1;
+    }
+    return 0;
+}
+
+static void wipe(void *p, size_t n) {
+    volatile char *v = p;
+    while (n--) *v++ = 0;
+}
+
+static int pg_open(db_conn_t **out, const db_source_t *src, char *err, size_t errlen) {
+    *out = NULL;
+    if (!src || !src->conninfo_file || !*src->conninfo_file) {
+        snprintf(err, errlen, "postgresql: no conninfo-file given");
+        return -1;
+    }
+    char conninfo[PG_CONNINFO_MAX];
+    if (read_conninfo(src->conninfo_file, conninfo, sizeof(conninfo), err, errlen) != 0) return -1;
+    char *perr = NULL;
+    PQconninfoOption *opts = PQconninfoParse(conninfo, &perr);
+    if (!opts) {
+        /* libpq's text can echo a part of the string; the string may hold a password */
+        snprintf(err, errlen, "postgresql: the connection string in conninfo-file is not valid");
+        if (perr) PQfreemem(perr);
+        wipe(conninfo, sizeof(conninfo));
+        return -1;
+    }
+    PQconninfoFree(opts);
+    db_conn_t *c = calloc(1, sizeof(*c));
+    if (!c) {
+        snprintf(err, errlen, "postgresql: out of memory");
+        wipe(conninfo, sizeof(conninfo));
+        return -1;
+    }
+    /* our defaults first: a keyword in the user's string (the dbname value is expanded as a connection string and its
+     * keywords win) replaces them */
+    const char *kw[] = { "application_name", "connect_timeout", "keepalives_idle", "keepalives_interval", "keepalives_count", "dbname", NULL };
+    const char *vl[] = { "karidns-dbloader", "10", "60", "10", "3", conninfo, NULL };
+    c->pg = PQconnectdbParams(kw, vl, 1);
+    wipe(conninfo, sizeof(conninfo));
+    if (!c->pg) {
+        snprintf(err, errlen, "postgresql: out of memory");
+        free(c);
+        return -1;
+    }
+    if (PQstatus(c->pg) != CONNECTION_OK) {
+        char line[260];
+        first_line(PQerrorMessage(c->pg), line, sizeof(line));
+        snprintf(err, errlen, "postgresql: cannot connect: %s (retry later)", line);
+        PQfinish(c->pg);
+        free(c);
+        return DB_ERR_RETRY;
+    }
+    PQsetNoticeReceiver(c->pg, ignore_notice, NULL);
+    PGresult *pr = PQexec(c->pg, "SET client_encoding TO 'SQL_ASCII'");     /* bytes unchanged, like SQLite3 */
+    bool ok = pr && PQresultStatus(pr) == PGRES_COMMAND_OK;
+    PQclear(pr);
+    if (ok) {
+        pr = PQexec(c->pg, "SET default_transaction_read_only = on; SET application_name = 'karidns-dbloader'; "
+                           "SET statement_timeout = '900s'; SET lock_timeout = '10s'; "
+                           "SET idle_in_transaction_session_timeout = '1h'; SET cursor_tuple_fraction = 1; "
+                           "SET standard_conforming_strings = on");
+        ok = pr && PQresultStatus(pr) == PGRES_COMMAND_OK;
+        PQclear(pr);
+    }
+    int ret = ok ? 0 : pq_fail(c, NULL, "session setup");
+    if (ret == 0 && src->schema && *src->schema) {
+        char *q = PQescapeIdentifier(c->pg, src->schema, strlen(src->schema));
+        if (!q) {
+            set_err(c, "postgresql: cannot quote the schema name");
+            ret = -1;
+        } else {
+            char sql[400];
+            int n = snprintf(sql, sizeof(sql), "SET search_path TO %s", q);
+            PQfreemem(q);
+            if (n < 0 || (size_t)n >= sizeof(sql)) {
+                set_err(c, "postgresql: the schema name is too long");
+                ret = -1;
+            } else {
+                ret = exec_cmd(c, sql, "SET search_path");
+            }
+        }
+    }
+    if (ret != 0) {
+        snprintf(err, errlen, "%s", c->err);
+        PQfinish(c->pg);
+        free(c);
+        return ret;
+    }
+    c->last_ping = time(NULL);
+    *out = c;
+    return 0;
+}
+
+static void pg_close(db_conn_t *c) {
+    if (!c) return;
+    PQfinish(c->pg);
+    free(c);
+}
+
+static const char *pg_errmsg(db_conn_t *c) { return c->err; }
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* schema                                                                                                         */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+#define SCHEMA_MAX_COLS 12
+static const struct { const char *table; const char *cols[SCHEMA_MAX_COLS]; int required; } k_tables[] = {
+    /* PowerDNS 5.1 columns the loader reads (design 3.1) */
+    { "domains", { "id", "name", "type", "master", "catalog", NULL }, 5 },
+    { "records", { "domain_id", "id", "name", "type", "content", "ttl", "prio", "disabled", "ordername", NULL }, 9 },
+    { "domainmetadata", { "domain_id", "id", "kind", "content", NULL }, 4 },
+    { "cryptokeys", { "domain_id", NULL }, 1 },
+    /* karidns_* (design 3.7); the last column of the zone tagdefs (id, schema version 2) is optional */
+    { "karidns_changes", { "seq", "domain_id", "xid", NULL }, 3 },
+    { "karidns_domain_views", { "domain_id", "view_name", NULL }, 2 },
+    { "karidns_profiles", { "name", "settings", NULL }, 2 },
+    { "karidns_record_tags", { "record_id", "location_tag", "ecs_tag", NULL }, 3 },
+    { "karidns_record_tinydns", { "record_id", "ttd", "loc", "countdown", NULL }, 4 },
+    { "karidns_zone_tagdefs", { "domain_id", "kind", "tag", "cidr", "id", NULL }, 4 },
+    { "karidns_schema_version", { "version", NULL }, 1 },
+};
+#define N_TABLES (sizeof(k_tables) / sizeof(k_tables[0]))
+enum { T_DOMAINS, T_RECORDS, T_META, T_KEYS, T_CHANGES, T_DV, T_PROF, T_TAGS, T_TDNS, T_TAGDEFS, T_VERSION };
+
+static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
+    PGresult *r = NULL;
+    /* the schema of the view must exist (search_path to a missing schema is not an error in PostgreSQL) */
+    int ret = exec_rows(c, "SELECT current_schemas(false)::text", 0, NULL, &r, "schema lookup");
+    if (ret != 0) return ret;
+    const char *path = PQgetvalue(r, 0, 0);
+    bool empty_path = !path || strcmp(path, "{}") == 0;
+    PQclear(r);
+    if (empty_path) {
+        set_err(c, "schema: the database-schema does not exist (or the role has no USAGE on it)");
+        return -1;
+    }
+    /* one catalog query for the columns of every table (to_regclass follows search_path; no privilege on the tables is needed) */
+    char sql[1400];
+    size_t o = (size_t)snprintf(sql, sizeof(sql), "SELECT c.relname, a.attname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid "
+                                                  "AND a.attnum > 0 AND NOT a.attisdropped WHERE c.oid = ANY (ARRAY[");
+    for (size_t t = 0; t < N_TABLES; t++)
+        o += (size_t)snprintf(sql + o, sizeof(sql) - o, "%sto_regclass('%s')::oid", t ? "," : "", k_tables[t].table);
+    snprintf(sql + o, sizeof(sql) - o, "])");
+    ret = exec_rows(c, sql, 0, NULL, &r, "schema");
+    if (ret != 0) return ret;
+    unsigned found[N_TABLES];
+    bool exists[N_TABLES];
+    memset(found, 0, sizeof(found));
+    memset(exists, 0, sizeof(exists));
+    for (int i = 0; i < PQntuples(r); i++) {
+        const char *rel = PQgetvalue(r, i, 0), *att = PQgetvalue(r, i, 1);
+        for (size_t t = 0; t < N_TABLES; t++) {
+            if (strcmp(rel, k_tables[t].table) != 0) continue;
+            exists[t] = true;
+            for (int k = 0; k_tables[t].cols[k]; k++)
+                if (strcmp(att, k_tables[t].cols[k]) == 0) found[t] |= 1u << k;
+        }
+    }
+    PQclear(r);
+    for (size_t t = T_DOMAINS; t <= T_KEYS; t++) {
+        if (!exists[t]) {
+            set_err(c, "schema: table %s is missing (PowerDNS 5.1 schema expected)", k_tables[t].table);
+            return -1;
+        }
+        for (int k = 0; k_tables[t].cols[k]; k++)
+            if (!(found[t] & (1u << k))) {
+                set_err(c, "schema: table %s has no column %s (PowerDNS 5.1 schema expected)", k_tables[t].table, k_tables[t].cols[k]);
+                return -1;
+            }
+    }
+#define HAVE(t) (exists[t] && (found[t] & ((1u << k_tables[t].required) - 1u)) == ((1u << k_tables[t].required) - 1u))
+    /* a log without the xid column is the one of schema version 1: no change log (see the top of this file) */
+    c->has_changes = HAVE(T_CHANGES);
+    c->has_domain_views = HAVE(T_DV);
+    c->has_profiles = HAVE(T_PROF);
+    c->has_ext = HAVE(T_TAGS) && HAVE(T_TDNS) && HAVE(T_TAGDEFS);
+    c->has_tagdef_id = exists[T_TAGDEFS] && (found[T_TAGDEFS] & (1u << 4)) != 0;
+    bool has_version = HAVE(T_VERSION);
+#undef HAVE
+    if (has_version) {
+        /* version 1 and 2 are read; a newer one was written for a later loader */
+        ret = exec_rows(c, "SELECT max(version) FROM karidns_schema_version", 0, NULL, &r, "karidns_schema_version");
+        if (ret != 0) return ret;
+        long long v = PQgetisnull(r, 0, 0) ? 0 : strtoll(PQgetvalue(r, 0, 0), NULL, 10);
+        PQclear(r);
+        if (v > 2) {
+            set_err(c, "schema: karidns_schema_version is %lld; this loader reads versions 1 and 2", v);
+            return -1;
+        }
+    }
+    if (out) {
+        out->has_changes = c->has_changes;
+        out->has_domain_views = c->has_domain_views;
+        out->has_profiles = c->has_profiles;
+        out->has_ext = c->has_ext;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* snapshot                                                                                                       */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+static int pg_begin_snapshot(db_conn_t *c) {
+    if (c->in_snapshot) {
+        set_err(c, "begin_snapshot: a snapshot is already open");
+        return -1;
+    }
+    int rc = exec_cmd(c, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", "begin snapshot");
+    if (rc != 0) return rc;
+    c->in_snapshot = true;
+    /* the snapshot of a REPEATABLE READ transaction is taken by its first statement, which must not wait */
+    PGresult *r = NULL;
+    rc = exec_rows(c, "SELECT 1", 0, NULL, &r, "begin snapshot");
+    if (rc != 0) {
+        PQclear(PQexec(c->pg, "ROLLBACK"));
+        c->in_snapshot = false;
+        return rc;
+    }
+    PQclear(r);
+    return 0;
+}
+
+static int pg_end_snapshot(db_conn_t *c) {
+    if (!c->in_snapshot) return 0;
+    c->in_snapshot = false;
+    return exec_cmd(c, "COMMIT", "end snapshot");      /* also ends an aborted transaction (the server answers ROLLBACK, which is OK) */
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* cursor scans                                                                                                   */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* called for each row of a FETCH result: 0 = go on, non-zero = stop (DB_STOPPED) or an error (-1, c->err set) */
+typedef int (*row_fn)(db_conn_t *c, PGresult *r, int row, void *ud);
+
+/* One cursor over `query`, rows to fn in batches.  Callbacks must not use this connection.  0, DB_STOPPED, -1, DB_ERR_RETRY. */
+static int pg_scan(db_conn_t *c, const char *what, const char *query, int np, const char *const *pv, row_fn fn, void *ud) {
+    if (!c->in_snapshot) {
+        set_err(c, "%s: no snapshot is open", what);
+        return -1;
+    }
+    char sql[1500];
+    int n = snprintf(sql, sizeof(sql), "DECLARE karidns_cur NO SCROLL CURSOR FOR %s", query);
+    if (n < 0 || (size_t)n >= sizeof(sql)) {
+        set_err(c, "%s: query too long", what);
+        return -1;
+    }
+    PGresult *r = PQexecParams(c->pg, sql, np, NULL, pv, NULL, NULL, 0);
+    if (!r || PQresultStatus(r) != PGRES_COMMAND_OK) {
+        int ret = pq_fail(c, r, what);
+        PQclear(r);
+        return ret;
+    }
+    PQclear(r);
+    int ret = 0;
+    char fetch[64];
+    snprintf(fetch, sizeof(fetch), "FETCH FORWARD %d FROM karidns_cur", PG_FETCH_ROWS);
+    for (;;) {
+        r = PQexec(c->pg, fetch);
+        if (!r || PQresultStatus(r) != PGRES_TUPLES_OK) {
+            ret = pq_fail(c, r, what);
+            PQclear(r);
+            break;
+        }
+        int rows = PQntuples(r);
+        for (int i = 0; i < rows && ret == 0; i++) {
+            int rc = fn(c, r, i, ud);
+            if (rc == DB_STOPPED || rc > 0) ret = DB_STOPPED;
+            else if (rc != 0) ret = rc;
+        }
+        PQclear(r);
+        if (ret != 0 || rows < PG_FETCH_ROWS) break;
+    }
+    if (PQstatus(c->pg) == CONNECTION_OK) {
+        /* normally the cursor is exhausted or the callback stopped it; after a server error the transaction is aborted
+         * and the CLOSE fails, which is harmless (the caller ends the snapshot) */
+        r = PQexec(c->pg, "CLOSE karidns_cur");
+        PQclear(r);
+    }
+    return ret;
+}
+
+/* ---- zones ---- */
+typedef struct { db_zone_cb cb; void *ud; bool have_prev; int64_t prev; } zl_t;
+
+static int zl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
+    zl_t *z = ud;
+    int64_t id = cell_i64(r, i, 0);
+    if (z->have_prev && id == z->prev) return 0;      /* more than one enabled apex SOA: the first is enough here */
+    z->have_prev = true;
+    z->prev = id;
+    bool bad = false;
+    db_zone_row_t row;
+    row.id = id;
+    row.name = cell_text(c, r, i, 1, "domains", id, "name", &bad);
+    row.type = cell_text(c, r, i, 2, "domains", id, "type", &bad);
+    row.master = cell_text(c, r, i, 3, "domains", id, "master", &bad);
+    row.catalog = cell_text(c, r, i, 4, "domains", id, "catalog", &bad);
+    row.soa_content = cell_text(c, r, i, 5, "records", id, "content", &bad);
+    if (bad) return -1;
+    return z->cb(z->ud, &row) != 0 ? DB_STOPPED : 0;
+}
+
+static int pg_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
+    zl_t z = { cb, ud, false, 0 };
+    return pg_scan(c, "list_zones",
+                   "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content FROM domains d "
+                   "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND lower(r.name) = lower(d.name) AND r.disabled = false "
+                   "ORDER BY d.id, r.id",
+                   0, NULL, zl_row, &z);
+}
+
+/* ---- records ---- */
+typedef struct { db_record_cb cb; void *ud; } rl_t;
+
+static int rl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
+    rl_t *l = ud;
+    bool bad = false;
+    int64_t did = cell_i64(r, i, 0);
+    db_record_row_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.id = cell_i64(r, i, 1);
+    rec.name = cell_text(c, r, i, 2, "records", rec.id, "name", &bad);
+    rec.type = cell_text(c, r, i, 3, "records", rec.id, "type", &bad);
+    rec.content = cell_text(c, r, i, 4, "records", rec.id, "content", &bad);
+    rec.ttl_null = PQgetisnull(r, i, 5);
+    rec.ttl = cell_i64(r, i, 5);
+    rec.prio_null = PQgetisnull(r, i, 6);
+    rec.prio = cell_i64(r, i, 6);
+    rec.disabled = PQgetisnull(r, i, 7) || cell_true(r, i, 7) ? true : false;      /* NULL = disabled, like SQLite3 */
+    rec.ordername = cell_text(c, r, i, 8, "records", rec.id, "ordername", &bad);
+    if (bad) return -1;
+    return l->cb(l->ud, did, &rec) != 0 ? DB_STOPPED : 0;
+}
+
+#define REC_COLS "SELECT domain_id, id, name, type, content, ttl, prio, disabled, ordername FROM records "
+
+static int pg_scan_records(db_conn_t *c, const int64_t *domain_id, db_record_cb cb, void *ud) {
+    rl_t l = { cb, ud };
+    if (domain_id) {
+        char p[32];
+        snprintf(p, sizeof(p), "%lld", (long long)*domain_id);
+        const char *pv[1] = { p };
+        return pg_scan(c, "scan_records", REC_COLS "WHERE domain_id = $1::bigint ORDER BY id", 1, pv, rl_row, &l);
+    }
+    return pg_scan(c, "scan_records", REC_COLS "ORDER BY domain_id, id", 0, NULL, rl_row, &l);
+}
+
+static int pg_scan_records_range(db_conn_t *c, int64_t lo, int64_t hi, db_record_cb cb, void *ud) {
+    rl_t l = { cb, ud };
+    char p1[32], p2[32];
+    snprintf(p1, sizeof(p1), "%lld", (long long)lo);
+    snprintf(p2, sizeof(p2), "%lld", (long long)hi);
+    const char *pv[2] = { p1, p2 };
+    return pg_scan(c, "scan_records", REC_COLS "WHERE domain_id >= $1::bigint AND domain_id <= $2::bigint ORDER BY domain_id, id", 2, pv,
+                   rl_row, &l);
+}
+
+/* ---- metadata ---- */
+typedef struct { db_meta_cb cb; void *ud; } ml_t;
+
+static int ml_row(db_conn_t *c, PGresult *r, int i, void *ud) {
+    ml_t *l = ud;
+    bool bad = false;
+    int64_t id = cell_i64(r, i, 3);
+    db_meta_row_t m;
+    m.domain_id = cell_i64(r, i, 0);
+    m.kind = cell_text(c, r, i, 1, "domainmetadata", id, "kind", &bad);
+    m.content = cell_text(c, r, i, 2, "domainmetadata", id, "content", &bad);
+    if (bad) return -1;
+    return l->cb(l->ud, &m) != 0 ? DB_STOPPED : 0;
+}
+
+static int pg_scan_metadata(db_conn_t *c, const int64_t *domain_id, db_meta_cb cb, void *ud) {
+    ml_t l = { cb, ud };
+    if (domain_id) {
+        char p[32];
+        snprintf(p, sizeof(p), "%lld", (long long)*domain_id);
+        const char *pv[1] = { p };
+        return pg_scan(c, "scan_metadata", "SELECT domain_id, kind, content, id FROM domainmetadata WHERE domain_id = $1::bigint ORDER BY id", 1, pv,
+                       ml_row, &l);
+    }
+    return pg_scan(c, "scan_metadata", "SELECT domain_id, kind, content, id FROM domainmetadata ORDER BY domain_id, id", 0, NULL, ml_row, &l);
+}
+
+/* ---- cryptokeys (existence only: the loader role has the column privilege SELECT (domain_id, active, published), D11) ---- */
+typedef struct { db_key_cb cb; void *ud; } kl_t;
+
+static int kl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
+    (void)c;
+    kl_t *l = ud;
+    if (PQgetisnull(r, i, 0)) return 0;
+    return l->cb(l->ud, cell_i64(r, i, 0)) != 0 ? DB_STOPPED : 0;
+}
+
+static int pg_zones_with_keys(db_conn_t *c, db_key_cb cb, void *ud) {
+    kl_t l = { cb, ud };
+    return pg_scan(c, "zones_with_keys", "SELECT DISTINCT domain_id FROM cryptokeys ORDER BY domain_id", 0, NULL, kl_row, &l);
+}
+
+/* ---- karidns_domain_views ---- */
+typedef struct { db_domain_view_cb cb; void *ud; } dl_t;
+
+static int dl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
+    dl_t *l = ud;
+    bool bad = false;
+    int64_t did = cell_i64(r, i, 0);
+    const char *vn = cell_text(c, r, i, 1, "karidns_domain_views", did, "view_name", &bad);
+    if (bad) return -1;
+    if (!vn) return 0;                                  /* the column is NOT NULL; a NULL name maps to no view */
+    return l->cb(l->ud, did, vn) != 0 ? DB_STOPPED : 0;
+}
+
+static int pg_scan_domain_views(db_conn_t *c, const int64_t *domain_id, db_domain_view_cb cb, void *ud) {
+    if (!c->has_domain_views) {
+        set_err(c, "karidns_domain_views does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    dl_t l = { cb, ud };
+    if (domain_id) {
+        char p[32];
+        snprintf(p, sizeof(p), "%lld", (long long)*domain_id);
+        const char *pv[1] = { p };
+        return pg_scan(c, "scan_domain_views", "SELECT domain_id, view_name FROM karidns_domain_views WHERE domain_id = $1::bigint", 1, pv, dl_row, &l);
+    }
+    return pg_scan(c, "scan_domain_views", "SELECT domain_id, view_name FROM karidns_domain_views ORDER BY domain_id", 0, NULL, dl_row, &l);
+}
+
+/* ---- karidns_profiles ---- */
+typedef struct { db_profile_cb cb; void *ud; } pl_t;
+
+static int pl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
+    pl_t *l = ud;
+    bool bad = false;
+    db_profile_row_t p;
+    p.name = cell_text(c, r, i, 0, "karidns_profiles", 0, "name", &bad);
+    p.settings = cell_text(c, r, i, 1, "karidns_profiles", 0, "settings", &bad);
+    if (bad) return -1;
+    if (!p.name) return 0;
+    return l->cb(l->ud, &p) != 0 ? DB_STOPPED : 0;
+}
+
+static int pg_scan_profiles(db_conn_t *c, db_profile_cb cb, void *ud) {
+    if (!c->has_profiles) {
+        set_err(c, "karidns_profiles does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    pl_t l = { cb, ud };
+    return pg_scan(c, "scan_profiles", "SELECT name, settings FROM karidns_profiles ORDER BY name COLLATE \"C\"", 0, NULL, pl_row, &l);
+}
+
+/* ---- the extension tables (B8) ---- */
+static int xt_row(db_conn_t *c, PGresult *r, int i, void *ud) {
+    const db_ext_sink_t *s = ud;
+    bool bad = false;
+    int64_t did = cell_i64(r, i, 0);
+    db_tag_row_t row;
+    row.record_id = cell_i64(r, i, 1);
+    row.location_tag = cell_text(c, r, i, 2, "karidns_record_tags", row.record_id, "location_tag", &bad);
+    row.ecs_tag = cell_text(c, r, i, 3, "karidns_record_tags", row.record_id, "ecs_tag", &bad);
+    if (bad) return -1;
+    return s->record_tags(s->ud, did, &row) != 0 ? DB_STOPPED : 0;
+}
+
+static int xd_row(db_conn_t *c, PGresult *r, int i, void *ud) {
+    const db_ext_sink_t *s = ud;
+    bool bad = false;
+    int64_t did = cell_i64(r, i, 0);
+    db_tinydns_row_t row;
+    row.record_id = cell_i64(r, i, 1);
+    row.ttd_null = PQgetisnull(r, i, 2);
+    row.ttd = cell_i64(r, i, 2);
+    row.loc = cell_text(c, r, i, 3, "karidns_record_tinydns", row.record_id, "loc", &bad);
+    row.countdown = cell_true(r, i, 4);
+    if (bad) return -1;
+    return s->record_tinydns(s->ud, did, &row) != 0 ? DB_STOPPED : 0;
+}
+
+static int xg_row(db_conn_t *c, PGresult *r, int i, void *ud) {
+    const db_ext_sink_t *s = ud;
+    bool bad = false;
+    int64_t did = cell_i64(r, i, 0);
+    db_tagdef_row_t row;
+    row.kind = cell_text(c, r, i, 1, "karidns_zone_tagdefs", did, "kind", &bad);
+    row.tag = cell_text(c, r, i, 2, "karidns_zone_tagdefs", did, "tag", &bad);
+    row.cidr = cell_text(c, r, i, 3, "karidns_zone_tagdefs", did, "cidr", &bad);
+    if (bad) return -1;
+    return s->tagdef(s->ud, did, &row) != 0 ? DB_STOPPED : 0;
+}
+
+/* Each table in its own pass, rows ordered by (domain_id, record_id); the tag definitions by (domain_id, id) with the id
+ * of schema version 2, or (domain_id, ctid) of version 1: the order the rows were inserted in is the order of the
+ * definitions in a zone file, and the first definition that matches a client wins. */
+static int pg_scan_ext(db_conn_t *c, const int64_t *domain_id, const db_ext_sink_t *sink) {
+    if (!c->has_ext) {
+        set_err(c, "the karidns_record_tags / karidns_record_tinydns / karidns_zone_tagdefs tables do not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    char p[32];
+    const char *pv[1] = { p };
+    int np = 0;
+    if (domain_id) {
+        snprintf(p, sizeof(p), "%lld", (long long)*domain_id);
+        np = 1;
+    }
+    int ret = pg_scan(c, "scan_ext (karidns_record_tags)",
+                      domain_id ? "SELECT r.domain_id, t.record_id, t.location_tag, t.ecs_tag FROM karidns_record_tags t JOIN records r ON r.id = t.record_id "
+                                  "WHERE r.domain_id = $1::bigint ORDER BY t.record_id"
+                                : "SELECT r.domain_id, t.record_id, t.location_tag, t.ecs_tag FROM karidns_record_tags t JOIN records r ON r.id = t.record_id "
+                                  "ORDER BY r.domain_id, t.record_id",
+                      np, pv, xt_row, (void *)sink);
+    if (ret != 0) return ret;
+    ret = pg_scan(c, "scan_ext (karidns_record_tinydns)",
+                  domain_id ? "SELECT r.domain_id, t.record_id, t.ttd, t.loc::text, t.countdown FROM karidns_record_tinydns t JOIN records r ON r.id = t.record_id "
+                              "WHERE r.domain_id = $1::bigint ORDER BY t.record_id"
+                            : "SELECT r.domain_id, t.record_id, t.ttd, t.loc::text, t.countdown FROM karidns_record_tinydns t JOIN records r ON r.id = t.record_id "
+                              "ORDER BY r.domain_id, t.record_id",
+                  np, pv, xd_row, (void *)sink);
+    if (ret != 0) return ret;
+    const char *ord = c->has_tagdef_id ? "id" : "ctid";
+    char q[300];
+    if (domain_id)
+        snprintf(q, sizeof(q), "SELECT domain_id, kind, tag, cidr FROM karidns_zone_tagdefs WHERE domain_id = $1::bigint ORDER BY %s", ord);
+    else
+        snprintf(q, sizeof(q), "SELECT domain_id, kind, tag, cidr FROM karidns_zone_tagdefs ORDER BY domain_id, %s", ord);
+    return pg_scan(c, "scan_ext (karidns_zone_tagdefs)", q, np, pv, xg_row, (void *)sink);
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* change log                                                                                                     */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* the xmin of the current snapshot (the cursor), as an unsigned number */
+static int snapshot_xmin(db_conn_t *c, uint64_t *xmin) {
+    PGresult *r = NULL;
+    int ret = exec_rows(c, "SELECT pg_snapshot_xmin(pg_current_snapshot())::text", 0, NULL, &r, "changes cursor");
+    if (ret != 0) return ret;
+    *xmin = PQgetisnull(r, 0, 0) ? 0 : strtoull(PQgetvalue(r, 0, 0), NULL, 10);
+    PQclear(r);
+    return 0;
+}
+
+static int pg_changes_max(db_conn_t *c, uint64_t *seq) {
+    if (!c->has_changes) {
+        set_err(c, "karidns_changes (schema version 2: with the xid column) does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    return snapshot_xmin(c, seq);
+}
+
+typedef struct { db_change_cb cb; void *ud; } cl_t;
+
+static int cl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
+    (void)c;
+    cl_t *l = ud;
+    db_change_row_t row;
+    row.seq = (uint64_t)cell_i64(r, i, 0);
+    row.domain_id = cell_i64(r, i, 1);
+    return l->cb(l->ud, &row) != 0 ? DB_STOPPED : 0;
+}
+
+static int pg_changes_since(db_conn_t *c, uint64_t after, db_change_cb cb, void *ud, uint64_t *last_seq, bool *gap) {
+    if (!c->has_changes) {
+        set_err(c, "karidns_changes (schema version 2: with the xid column) does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    uint64_t xmin = 0;
+    int ret = snapshot_xmin(c, &xmin);
+    if (ret != 0) return ret;
+    char p[32];
+    snprintf(p, sizeof(p), "%llu", (unsigned long long)after);
+    const char *pv[1] = { p };
+    bool g = false;
+    if (after > 0) {
+        /* pruned rows: the log has rows, the first seq is not 1, and nothing is left below the cursor (the rows the
+         * loader has seen are gone, so some of the ones after them may be too) */
+        PGresult *r = NULL;
+        ret = exec_rows(c, "SELECT (SELECT min(seq) FROM karidns_changes), EXISTS (SELECT 1 FROM karidns_changes WHERE xid < $1::xid8)", 1, pv, &r,
+                        "changes_since");
+        if (ret != 0) return ret;
+        if (!PQgetisnull(r, 0, 0) && strtoll(PQgetvalue(r, 0, 0), NULL, 10) > 1 && !cell_true(r, 0, 1)) g = true;
+        PQclear(r);
+    }
+    cl_t l = { cb, ud };
+    ret = pg_scan(c, "changes_since", "SELECT seq, domain_id FROM karidns_changes WHERE xid >= $1::xid8 ORDER BY seq", 1, pv, cl_row, &l);
+    if (last_seq) *last_seq = xmin;
+    if (gap) *gap = g;
+    return ret;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* notifications                                                                                                  */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+static int ensure_listen(db_conn_t *c) {
+    if (c->listening) return 0;
+    if (c->in_snapshot) {
+        set_err(c, "LISTEN: a snapshot is open");
+        return -1;
+    }
+    int rc = exec_cmd(c, "LISTEN karidns_changes", "LISTEN");
+    if (rc == 0) c->listening = true;
+    return rc;
+}
+
+static int pg_wait_fd(db_conn_t *c) {
+    if (ensure_listen(c) != 0) return -1;
+    return PQsocket(c->pg);
+}
+
+static int pg_drain_notifications(db_conn_t *c, bool *changed) {
+    if (changed) *changed = false;
+    if (!PQconsumeInput(c->pg) || PQstatus(c->pg) != CONNECTION_OK) {
+        char line[260];
+        first_line(PQerrorMessage(c->pg), line, sizeof(line));
+        set_err(c, "postgresql: the connection was lost: %s (retry later)", line);
+        return DB_ERR_RETRY;
+    }
+    PGnotify *n;
+    while ((n = PQnotifies(c->pg)) != NULL) {
+        if (changed) *changed = true;
+        c->nver++;
+        PQfreemem(n);
+    }
+    return 0;
+}
+
+/* The change detector of the auto reload loop (dns_db_driver.h poll_version): LISTEN is started by the first call, so
+ * the baseline is taken after it; the counter changes when a notification arrived.  A ping now and then notices a
+ * connection that died silently (the server went away, a firewall dropped it). */
+static int pg_poll_version(db_conn_t *c, uint64_t *version, bool *replaced) {
+    *replaced = false;
+    int ret = ensure_listen(c);
+    if (ret != 0) return ret;
+    ret = pg_drain_notifications(c, NULL);
+    if (ret != 0) return ret;
+    time_t now = time(NULL);
+    if (now - c->last_ping >= PG_PING_SECONDS || now < c->last_ping) {
+        c->last_ping = now;
+        PGresult *r = NULL;
+        ret = exec_rows(c, "SELECT 1", 0, NULL, &r, "ping");
+        if (ret != 0) return ret;
+        PQclear(r);
+        ret = pg_drain_notifications(c, NULL);
+        if (ret != 0) return ret;
+    }
+    *version = c->nver;
+    return 0;
+}
+
+static int pg_report_status(db_conn_t *c, const db_status_t *st) {
+    (void)c;
+    (void)st;
+    return 0;       /* karidns_server_status is written from B11 */
+}
+
+const db_driver_t db_driver_postgresql = {
+    "postgresql",    pg_open,         pg_close,           pg_errmsg,           pg_check_schema,
+    pg_begin_snapshot, pg_end_snapshot, pg_list_zones,    pg_scan_records,     pg_scan_metadata,
+    pg_zones_with_keys, pg_changes_since, pg_wait_fd,     pg_drain_notifications, pg_report_status,
+    pg_changes_max,  pg_scan_records_range, pg_scan_domain_views, pg_scan_profiles, pg_scan_ext, pg_poll_version,
+    true,
+};
+
+#endif /* KARIDNS_DB_POSTGRESQL */

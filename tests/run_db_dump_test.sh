@@ -164,7 +164,7 @@ expect() {   # expect STATUS "description" command...
 expect 2 "no arguments" "$LOADER"
 expect 2 "--dump without --driver" "$LOADER" --dump "$T/x.kdb"
 expect 2 "unknown driver" "$LOADER" --dump "$T/x.kdb" --driver mysql --database-file "$T/z.db"
-expect 2 "postgresql is not built yet" "$LOADER" --dump "$T/x.kdb" --driver postgresql --database-file "$T/z.db"
+expect 2 "postgresql with --database-file (needs --conninfo-file; or the driver is not built)" "$LOADER" --dump "$T/x.kdb" --driver postgresql --database-file "$T/z.db"
 expect 2 "sqlite3 without --database-file" "$LOADER" --dump "$T/x.kdb" --driver sqlite3
 expect 2 "-s with a descriptor that is not open" "$LOADER" -s 9 9>&-
 expect 2 "-s with a file instead of a stream socket" "$LOADER" -s 9 9<"$T/z.db"
@@ -214,6 +214,9 @@ NEX=$(wc -l < "$T/examples.txt" | tr -d ' ')
 n=0
 while read -r line; do
     n=$((n + 1))
+    case $line in *"--driver postgresql"*)       # needs a server: tests/run_db_pg_sqlite_diff_test.sh runs this example against its test database
+        ok "example $n (PostgreSQL) is run by run_db_pg_sqlite_diff_test.sh"; continue ;;
+    esac
     cmd=$(printf '%s\n' "$line" | sed -e "s#/tmp/#$T/ex/#g" -e "s#/var/db/karidns/#$T/var/db/karidns/#")
     ( cd "$T/ex" && PATH="$T/bin:$PATH" sh -c "$cmd" > "$T/ex$n.out" 2> "$T/ex$n.err" )
     r=$?

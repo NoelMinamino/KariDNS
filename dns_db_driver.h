@@ -101,7 +101,9 @@ typedef struct db_driver {
     /* DISTINCT cryptokeys.domain_id (existence only: the loader never reads key material) */
     int (*zones_with_keys)(db_conn_t *c, db_key_cb cb, void *ud);
     /* rows of karidns_changes after `after`, ORDER BY seq.  *last_seq = highest seq seen (or after); *gap = rows
-     * after `after` were pruned (the first row is not after + 1).  DB_ERR_UNAVAILABLE when the table does not exist. */
+     * after `after` were pruned (the first row is not after + 1).  DB_ERR_UNAVAILABLE when the table does not exist.
+     * PostgreSQL: `after` and *last_seq are the cursor of changes_unsettled (below); the rows listed are those of
+     * transactions at or after the cursor, in seq order. */
     int (*changes_since)(db_conn_t *c, uint64_t after, db_change_cb cb, void *ud, uint64_t *last_seq, bool *gap);
     int (*wait_fd)(db_conn_t *c);                                /* fd to poll for change notifications; -1 = poll by timer */
     int (*drain_notifications)(db_conn_t *c, bool *changed);
@@ -129,6 +131,12 @@ typedef struct db_driver {
      * file is no longer the one that was opened (replaced by another file, deleted, renamed away); the connection still reads
      * the old file then, so the caller reopens.  NULL for a driver that notifies (wait_fd). */
     int (*poll_version)(db_conn_t *c, uint64_t *version, bool *replaced);
+    /* B10: the "seq" of changes_max() / changes_since() is a cursor, not the highest seq.  false (SQLite3): it is the highest
+     * seq in the log, and nothing newer than the cursor is visible, so the caller skips changes_since() while the cursor has
+     * not grown.  true (PostgreSQL): it is the xmin of the reading snapshot (every transaction below it is finished); rows of
+     * transactions that were still running are visible beyond it and are read again by changes_since(cursor), so the caller
+     * must call changes_since() even when the cursor has not grown.  The caller only compares cursors (<, ==, >). */
+    bool changes_unsettled;
 } db_driver_t;
 
 /* compiled in when the driver is listed in DB_DRIVERS (Makefile) */

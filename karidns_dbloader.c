@@ -6,6 +6,7 @@
  * HELLO, BATCH_BEGIN (startup), per zone ZONE_BEGIN / ZONE_DATA... / ZONE_END or ZONE_FAILED, BATCH_END.
  *
  *   karidns-dbloader --dump OUT --driver sqlite3 --database-file PATH [options]     (B3, this file)
+ *   karidns-dbloader --dump OUT --driver postgresql --conninfo-file FILE [--schema NAME] [options]     (B10)
  *   karidns-dbloader -s FD                                                          (B4a: stream mode)
  *
  * Ordinary process code like the tools (malloc and file I/O are fine, no Capsicum in beta); what it reads from the
@@ -23,7 +24,8 @@
  * first load of a loader process, a change of sources, an unusable change log).  A converted zone whose digest is the one
  * the Backend has is not sent.  Zones the Backend has and the database no longer lists get a ZONE_DELETE.
  *
- * Auto reload (B9, design 6): the same diff, started by the loader itself; see the block before run_stream().
+ * Auto reload (B9, design 6): the same diff, started by the loader itself; see the block before run_stream().  B10: a driver
+ * with a socket to wait on (PostgreSQL LISTEN, wait_fd()) wakes the main loop at once; the others are polled by timer.
  */
 
 #include <stdio.h>
@@ -415,6 +417,8 @@ struct lio {
     vstate_t *vst;
     size_t nvn, cvn;
     int32_t *idx_slot;                       /* view index -> slot of vnames, -1 = no such view in the current CONFIG */
+    struct pollfd *pfs;                      /* B10: poll set of the main loop: the stream, then the connections that notify (PostgreSQL LISTEN) */
+    size_t *pfs_slot, cpfs;
 };
 
 static uint32_t name_hash(uint16_t vslot, const char *s) {
@@ -520,6 +524,11 @@ static void io_free_views(struct lio *io) {
     free(io->vnames);
     free(io->vst);
     free(io->idx_slot);
+    free(io->pfs);
+    free(io->pfs_slot);
+    io->pfs = NULL;
+    io->pfs_slot = NULL;
+    io->cpfs = 0;
     inv_free(&io->inv);
 }
 
@@ -1477,7 +1486,7 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
                     lg(LOG_NOTICE, "view '%s': the change log was reset (seq %llu < %llu); comparing every zone",
                        io->vnames[x->vslot], (unsigned long long)mx, (unsigned long long)vs->seq);
                     compare_all = true;
-                } else if (mx > vs->seq) {
+                } else if (mx > vs->seq || x->drv->changes_unsettled) {      /* PostgreSQL: rows beyond the cursor may be visible */
                     uint64_t last = 0;
                     bool gap = false;
                     cr = x->drv->changes_since(x->conn, vs->seq, chg_cb, x, &last, &gap);
@@ -1499,8 +1508,9 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
             }
         } else if (!vs->nolog_warned) {
             vs->nolog_warned = true;
-            lg(LOG_NOTICE, "view '%s': the database has no karidns_changes table; zones are compared by serial only (apply "
-                           "db/karidns_ext.*.sql to notice edits that keep the serial; 'karictl reload <zone>' reads one zone)",
+            lg(LOG_NOTICE, "view '%s': the database has no usable karidns_changes table; zones are compared by serial only (apply "
+                           "db/karidns_ext.*.sql, or on PostgreSQL db/karidns_ext_v1_to_v2.pgsql.sql, to notice edits that keep the "
+                           "serial; 'karictl reload <zone>' reads one zone)",
                io->vnames[x->vslot]);
         }
         if (x->nchg > 1) qsort(x->chg, x->nchg, sizeof(int64_t), cmp_i64);
@@ -2261,7 +2271,13 @@ static int64_t now_ms(void) {
  * `karictl reload` (change log since the last load, serials, digest gate, ZONE_DELETE for zones that left the database;
  * a gap in the log or a reset one compares every zone).  Without karidns_changes the batch compares serials only.
  * Everything runs in the main loop of the stream (no thread): a batch in progress is finished before the next poll, and
- * requests of the Backend wait in the queue until the loop comes round again. */
+ * requests of the Backend wait in the queue until the loop comes round again.
+ *
+ * B10, PostgreSQL: poll_version() drains the LISTEN notifications of the persistent connection (and pings the server now and
+ * then, so a dead connection fails the poll and is reopened with a catch-up check); the connection's socket (wait_fd()) is in
+ * the poll set of the main loop, so a notification makes the view due at once instead of at the next poll-interval.  The
+ * position in the change log is the driver's cursor (dns_db_driver.h changes_unsettled): changes_since() is called by every
+ * batch, not only when the cursor grew, and the data_version style pre-check of auto_changed() is not used. */
 
 static void auto_set_err(struct lio *io, uint16_t slot, bool load, const char *what, const char *msg) {
     vstate_t *vs = &io->vst[slot];
@@ -2339,10 +2355,16 @@ static bool auto_open(struct lio *io, const lview_t *v, uint16_t slot, bool star
     vs->perr[0] = '\0';
     if (!si.has_changes && !vs->nolog_auto_warned) {
         vs->nolog_auto_warned = true;
-        lg(LOG_WARNING, "view '%s': auto-reload is on but the database has no karidns_changes table; changes are noticed "
-                        "(PRAGMA data_version) and zones are compared by serial only, so an edit that keeps the serial is not "
-                        "picked up (apply db/karidns_ext.sqlite3.sql, or 'karictl reload <zone>')",
-           io->vnames[slot]);
+        if (strcmp(drv->name, "sqlite3") == 0)
+            lg(LOG_WARNING, "view '%s': auto-reload is on but the database has no karidns_changes table; changes are noticed "
+                            "(PRAGMA data_version) and zones are compared by serial only, so an edit that keeps the serial is not "
+                            "picked up (apply db/karidns_ext.sqlite3.sql, or 'karictl reload <zone>')",
+               io->vnames[slot]);
+        else
+            lg(LOG_WARNING, "view '%s': auto-reload is on but the database has no usable karidns_changes table (schema version 2); "
+                            "nothing is notified without the triggers of db/karidns_ext.pgsql.sql, and zones are compared by serial "
+                            "only (apply db/karidns_ext.pgsql.sql, or db/karidns_ext_v1_to_v2.pgsql.sql, or use 'karictl reload <zone>')",
+               io->vnames[slot]);
     }
     if (!startup_pending) {                                 /* auto reload was just switched on, or the connection was lost: what */
         lg(LOG_INFO, "view '%s': auto reload %s; checking for changes", io->vnames[slot],   /* happened meanwhile is not known */
@@ -2375,7 +2397,7 @@ static void auto_prepare(struct lio *io, bool load_follows) {
 /* the end of the change log decides whether the data_version change touched a zone */
 static void auto_changed(vstate_t *vs, const lview_t *v, int64_t now) {
     uint32_t n = 1;
-    if (vs->has_changes && vs->pdrv->changes_max) {
+    if (vs->has_changes && vs->pdrv->changes_max && !vs->pdrv->changes_unsettled) {
         uint64_t mx = 0;
         if (vs->pdrv->changes_max(vs->pconn, &mx) == 0) {
             if (vs->seq_valid && mx == vs->seq) return;               /* nothing was logged since the last load */
@@ -2507,6 +2529,38 @@ static int auto_wait_ms(const struct lio *io, int limit) {
     return limit;
 }
 
+/* B10: the poll set of the main loop, io->pfs[0..n): the stream to the Backend, then the connections of the views with auto
+ * reload on whose driver notifies (PostgreSQL LISTEN; wait_fd() is -1 for SQLite3, which is polled by timer).  A readable
+ * connection makes its view due at once.  Returns n, or 0 on out of memory. */
+static size_t auto_fds(struct lio *io, bool watch) {
+    if (io->cpfs < 1 + io->nvn) {
+        size_t nc = 1 + io->nvn + 8;
+        struct pollfd *np = realloc(io->pfs, nc * sizeof(*np));
+        if (!np) return 0;
+        io->pfs = np;
+        size_t *ns = realloc(io->pfs_slot, nc * sizeof(*ns));
+        if (!ns) return 0;
+        io->pfs_slot = ns;
+        io->cpfs = nc;
+    }
+    io->pfs[0].fd = io->fd;
+    io->pfs[0].events = POLLIN;
+    io->pfs[0].revents = 0;
+    size_t n = 1;
+    for (size_t s = 0; watch && s < io->nvn; s++) {
+        vstate_t *vs = &io->vst[s];
+        if (!vs->pconn || !vs->pdrv->wait_fd) continue;
+        int wfd = vs->pdrv->wait_fd(vs->pconn);
+        if (wfd < 0) continue;
+        io->pfs[n].fd = wfd;
+        io->pfs[n].events = POLLIN;
+        io->pfs[n].revents = 0;
+        io->pfs_slot[n] = s;
+        n++;
+    }
+    return n;
+}
+
 static int run_stream(int fd) {
     struct lio *io = calloc(1, sizeof(*io));
     uint8_t *body = malloc(KDB_MAX_BODY);
@@ -2632,14 +2686,23 @@ static int run_stream(int fd) {
             if (left < timeout) timeout = (int)left;
         }
         if (startup_done) timeout = auto_wait_ms(io, timeout);
-        struct pollfd p = { io->fd, POLLIN, 0 };
-        int r = poll(&p, 1, timeout);
+        size_t npf = auto_fds(io, startup_done);
+        if (npf == 0) {
+            lg(LOG_ERR, "out of memory");
+            status = EXIT_ERROR;
+            goto done;
+        }
+        int r = poll(io->pfs, (nfds_t)npf, timeout);
         if (r < 0 && errno != EINTR) {
             lg(LOG_ERR, "poll: %s", strerror(errno));
             status = EXIT_ERROR;
             goto done;
         }
-        if (r > 0) io_pump(io);
+        if (r > 0) {
+            for (size_t i = 1; i < npf; i++)
+                if (io->pfs[i].revents) io->vst[io->pfs_slot[i]].next_poll = 0;      /* a notification (or a dead connection): look now */
+            if (io->pfs[0].revents) io_pump(io);
+        }
     }
 stopped:
     if (g_stop) lg(LOG_NOTICE, "stopping on a signal");
@@ -2702,6 +2765,7 @@ static void usage(FILE *fp) {
         "\n"
         "usage:\n"
         "  karidns-dbloader --dump OUT --driver DRIVER --database-file PATH [options]\n"
+        "  karidns-dbloader --dump OUT --driver postgresql --conninfo-file FILE [--schema NAME] [options]\n"
         "  karidns-dbloader -s FD                    (stream mode; started by karidns, not by hand)\n"
         "  karidns-dbloader --drivers                (print the compiled-in drivers, one per line)\n"
         "\n"
@@ -2723,6 +2787,9 @@ static void usage(FILE *fp) {
         "  --driver DRIVER     database driver; compiled in: %s\n"
         "  --database-file F   sqlite3: the database file; it must be in WAL mode.  The name is used byte for byte\n"
         "                      ('%%XX' is not decoded); a name starting with \"file:\" is refused (write ./file:...)\n"
+        "  --conninfo-file F   postgresql: the file holding the libpq connection string (owned by the user running the loader,\n"
+        "                      mode 0600 or 0400; its content is never logged)\n"
+        "  --schema NAME       postgresql: the schema that holds the tables (default: the search_path of the role)\n"
         "  --view-index N      view index in ZONE_BEGIN / ZONE_FAILED (0..65535, default 0)\n"
         "  --zone NAME         dump only this zone (read with one query per zone instead of the bulk scan)\n"
         "  --default-ttl N     TTL for a records.ttl that is NULL (1..2147483647, default 3600)\n"
@@ -2743,7 +2810,8 @@ static void usage(FILE *fp) {
         "examples:\n"
         "  karidns-dbloader --dump /tmp/zones.kdb --driver sqlite3 --database-file /var/db/karidns/zones.sqlite3\n"
         "  karidns-dbloader --dump - --driver sqlite3 --database-file zones.sqlite3 --zone example.test | od -c | head\n"
-        "  karidns-dbloader --dump /tmp/view1.kdb --driver sqlite3 --database-file view1.sqlite3 --view-index 1 --default-ttl 300\n",
+        "  karidns-dbloader --dump /tmp/view1.kdb --driver sqlite3 --database-file view1.sqlite3 --view-index 1 --default-ttl 300\n"
+        "  karidns-dbloader --dump /tmp/zones.kdb --driver postgresql --conninfo-file /usr/local/etc/karidns/database.conf --schema pdns\n",
         KARIDNS_VERSION, drv);
 }
 
@@ -2834,7 +2902,7 @@ int main(int argc, char **argv) {
         drivers_list(list, sizeof(list));
         if (strcmp(driver, "postgresql") == 0 || strcmp(driver, "sqlite3") == 0)
             fprintf(stderr, "karidns-dbloader: driver %s is not available in this build (%s; compiled in: %s)\n", driver,
-                    strcmp(driver, "postgresql") == 0 ? "the PostgreSQL driver comes with milestone B10" : "built without DB_DRIVERS=sqlite3",
+                    strcmp(driver, "postgresql") == 0 ? "built without DB_DRIVERS=postgresql" : "built without DB_DRIVERS=sqlite3",
                     list);
         else
             fprintf(stderr, "karidns-dbloader: unknown driver '%s' (compiled in: %s)\n", driver, list);
@@ -2846,6 +2914,14 @@ int main(int argc, char **argv) {
     }
     if (strcmp(drv->name, "sqlite3") == 0 && (conninfo || schema)) {
         fprintf(stderr, "karidns-dbloader: --conninfo-file and --schema are for the postgresql driver\n");
+        return EXIT_USAGE;
+    }
+    if (strcmp(drv->name, "postgresql") == 0 && !conninfo) {
+        fprintf(stderr, "karidns-dbloader: driver postgresql needs --conninfo-file\n");
+        return EXIT_USAGE;
+    }
+    if (strcmp(drv->name, "postgresql") == 0 && dbfile) {
+        fprintf(stderr, "karidns-dbloader: --database-file is for the sqlite3 driver\n");
         return EXIT_USAGE;
     }
 

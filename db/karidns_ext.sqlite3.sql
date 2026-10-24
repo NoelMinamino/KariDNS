@@ -1,5 +1,5 @@
 -- karidns_ext.sqlite3.sql - the KariDNS extension tables and the change-log triggers for a PowerDNS 5.1 gsqlite3 database
--- (beta design 3.7, 5.1, 6; milestone B6a).  Schema version 1.
+-- (beta design 3.7, 5.1, 6; milestones B6a, B10).  Schema version 2.
 --
 -- Apply it once, as the owner of the database, after the PowerDNS schema (schema.sqlite3.sql):
 --     sqlite3 /var/db/karidns/zones.sqlite3 < karidns_ext.sqlite3.sql
@@ -20,11 +20,14 @@
 -- but a big import makes the loader compare everything once.  DELETE FROM is logged (SQLite has no TRUNCATE).
 -- Foreign keys are only enforced when the connection runs PRAGMA foreign_keys=ON (PowerDNS can, the sqlite3 shell does not).
 --
+-- Version 1 had no karidns_zone_tagdefs.id (the rowid gave the order); db/karidns_ext_v1_to_v2.sqlite3.sql converts a database.
+-- The loader reads both versions.
+--
 -- The retention is the number 1000000 in karidns_changes_prune below; tests/run_db_ddl_test.sh replaces it by 5 to test
 -- the pruning on a small scale.
 
 CREATE TABLE IF NOT EXISTS karidns_schema_version (version INTEGER NOT NULL);
-INSERT INTO karidns_schema_version (version) SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM karidns_schema_version);
+INSERT INTO karidns_schema_version (version) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM karidns_schema_version);
 
 CREATE TABLE IF NOT EXISTS karidns_changes (
   seq        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,6 +60,7 @@ CREATE TABLE IF NOT EXISTS karidns_record_tinydns (
 );
 
 CREATE TABLE IF NOT EXISTS karidns_zone_tagdefs (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,      -- schema version 2: the order of the definitions (the first match wins)
   domain_id INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
   kind      VARCHAR(8) NOT NULL,          -- 'location' | 'ecs' | 'tinydns'
   tag       VARCHAR(63) NOT NULL,

@@ -62,7 +62,10 @@ printf '#!/bin/sh\necho nothing\n' > "$T/notdbl"; chmod 755 "$T/notdbl"
 conf "$T/c.conf" "driver sqlite3; database-file \"$T/wal.db\"; loader-user \"$USER_OK\"; loader-path \"$T/notdbl\";"
 expect "a program that is not the loader" "$T/c.conf" "driver sqlite3 is not available in this installation\|did not answer --drivers"
 printf 'x' > "$T/ci"; chmod 600 "$T/ci"
-conf "$T/c.conf" "driver postgresql; conninfo-file \"$T/ci\"; loader-user \"$USER_OK\"; loader-path \"$T/dbl\";"
+# a loader that has only the SQLite3 driver (the real one may have both since B10)
+printf '#!/bin/sh\necho sqlite3\n' > "$T/dbl_sq"; chmod 755 "$T/dbl_sq"
+if [ "$(id -u)" = "0" ]; then chown 0:0 "$T/dbl_sq"; fi
+conf "$T/c.conf" "driver postgresql; conninfo-file \"$T/ci\"; loader-user \"$USER_OK\"; loader-path \"$T/dbl_sq\";"
 expect "driver the loader does not have" "$T/c.conf" "driver postgresql is not available in this installation"
 
 echo "== users and groups"
@@ -98,6 +101,25 @@ chmod 600 "$T/ci"
 printf 'host=db.example.test dbname=pdns\n' > "$T/ci"
 out=$(run "$T/c.conf")
 if printf '%s\n' "$out" | grep -q "neither a UNIX socket host nor sslmode=verify-full"; then ok "a conninfo without a UNIX socket or verify-full is warned about"; else bad "no conninfo warning" "$out"; fi
+# B10: which connection strings reach the server over a UNIX socket (no warning) or over TCP without verify-full (warning)
+ci_warns() {   # ci_warns DESCRIPTION CONNINFO WANT(yes|no)
+    printf '%s\n' "$2" > "$T/ci"; chmod 600 "$T/ci"
+    out=$(run "$T/c.conf")
+    if printf '%s\n' "$out" | grep -q "neither a UNIX socket host nor sslmode=verify-full"; then got=yes; else got=no; fi
+    if [ "$got" = "$3" ]; then ok "conninfo $1: warning $got"; else bad "conninfo $1: warning $got, wanted $3" "$out"; fi
+}
+ci_warns "host=/var/run/postgresql (UNIX socket)" "host=/var/run/postgresql dbname=pdns" no
+ci_warns "no host at all (libpq's default is the UNIX socket)" "dbname=pdns user=karidns_loader" no
+ci_warns "host='/tmp' in quotes" "host='/tmp' dbname=pdns" no
+ci_warns "a host name with sslmode=verify-full" "host=db.example.test dbname=pdns sslmode=verify-full" no
+ci_warns "a host name with sslmode=require" "host=db.example.test dbname=pdns sslmode=require" yes
+ci_warns "hostaddr only (TCP)" "hostaddr=192.0.2.5 dbname=pdns" yes
+ci_warns "host= inside the value of another option is not a host (no host: the UNIX socket)" "dbname=pdns options=-chost=db.example.test" no
+ci_warns "a comment line, then a socket host" "$(printf '# host=db.example.test\nhost=/tmp dbname=pdns')" no
+ci_warns "URI with a host name" "postgresql://karidns@db.example.test/pdns" yes
+ci_warns "URI without a host (socket)" "postgresql:///pdns" no
+ci_warns "URI with host=/tmp in the query" "postgresql:///pdns?host=/tmp" no
+ci_warns "URI with %2F host" "postgresql://%2Fvar%2Frun%2Fpostgresql/pdns" no
 
 echo "== syntax"
 conf "$T/c.conf" "driver sqlite3; database-file \"$T/wal.db\"; poll-interval 99;"

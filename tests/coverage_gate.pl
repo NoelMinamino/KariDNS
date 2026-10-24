@@ -60,12 +60,19 @@ my %tier_c_files = map { $_ => 1 } (
     "tools/karicheck.c", "tools/karictl.c"
 );
 
+# Tier D (B10, design 8.6): the PostgreSQL driver.  Only gated when the PostgreSQL tests ran (test_db_pgsql found a server): without
+# data for the file the tier is reported as skipped, so a build or a CI run without PostgreSQL is not failed for it.
+my %tier_d_files = map { $_ => 1 } (
+    "dns_db_pgsql.c"
+);
+
 # Threshold definitions (Phase 1 vs Phase 2)
 # Tier thresholds
 my %thresholds = (
     'A' => { line => 93.0, region => 89.0, branch => 80.0 },
     'B' => { line => 87.0, region => 80.0, branch => 68.0 },
     'C' => { line => 90.0, region => 84.0, branch => 72.0 },
+    'D' => { line => 85.0, region => 78.0, branch => 60.0 },     # measured 88.6 / 84.9 / 67.2 with test_db_pgsql alone (B10)
     'Overall' => ($phase == 2)
         ? { line => 92.0, region => 85.0, branch => 75.0 }
         : { line => 90.0, region => 84.0, branch => 72.0 }
@@ -86,7 +93,7 @@ if ($json_file && -f $json_file) {
 if ($json_text eq "") {
     # Generate on the fly using llvm-cov
     my @objs = ();
-    for my $obj (qw(dag karictl karicheck test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_dag_format test_dag_reassembly test_query_engine_protocol test_hash_table test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools)) {
+    for my $obj (qw(dag karictl karicheck test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_dag_format test_dag_reassembly test_query_engine_protocol test_hash_table test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_pgsql)) {
         push @objs, "-object=./$obj" if -x "./$obj";
     }
     if (-d "coverage_fuzz") {
@@ -114,6 +121,7 @@ my %tier_stats = (
     'A' => { lines_cov => 0, lines_cnt => 0, regions_cov => 0, regions_cnt => 0, branches_cov => 0, branches_cnt => 0 },
     'B' => { lines_cov => 0, lines_cnt => 0, regions_cov => 0, regions_cnt => 0, branches_cov => 0, branches_cnt => 0 },
     'C' => { lines_cov => 0, lines_cnt => 0, regions_cov => 0, regions_cnt => 0, branches_cov => 0, branches_cnt => 0 },
+    'D' => { lines_cov => 0, lines_cnt => 0, regions_cov => 0, regions_cnt => 0, branches_cov => 0, branches_cnt => 0 },
     'Overall' => { lines_cov => 0, lines_cnt => 0, regions_cov => 0, regions_cnt => 0, branches_cov => 0, branches_cnt => 0 },
 );
 
@@ -132,6 +140,8 @@ for my $f (@$files) {
         $tier = "B";
     } elsif ($tier_c_files{$relname} || $tier_c_files{basename($relname)}) {
         $tier = "C";
+    } elsif ($tier_d_files{$relname} || $tier_d_files{basename($relname)}) {
+        $tier = "D";
     }
     
     my $summary = $f->{summary} || {};
@@ -188,9 +198,13 @@ print "-" x 90 . "\n";
 
 my $all_passed = 1;
 
-for my $t (qw(A B C Overall)) {
+for my $t (qw(A B C D Overall)) {
     my $st = $tier_stats{$t};
     my $th = $thresholds{$t};
+    if ($t eq 'D' && !$st->{lines_cnt}) {      # the PostgreSQL tests did not run: no data for dns_db_pgsql.c, the tier is not gated
+        printf "%-10s | %-16s | %-16s | %-16s | %-8s\n", "Tier D", "-", "-", "-", "SKIPPED (no PostgreSQL test data)";
+        next;
+    }
     
     my $l_pct = $st->{lines_cnt} ? (100.0 * $st->{lines_cov} / $st->{lines_cnt}) : 100.0;
     my $r_pct = $st->{regions_cnt} ? (100.0 * $st->{regions_cov} / $st->{regions_cnt}) : 100.0;

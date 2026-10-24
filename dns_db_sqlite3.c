@@ -292,6 +292,26 @@ static int sq_check_schema(db_conn_t *c, db_schema_info_t *out) {
         return rc;
     c->has_ext = r1 > 0 && f1 == 7u && r2 > 0 && f2 == 15u && r3 > 0 && f3 == 15u;
     if (out) out->has_ext = c->has_ext;
+    /* B10: schema version 1 and 2 (v2 adds karidns_zone_tagdefs.id; the order of the definitions is the rowid either way);
+     * a newer version was written for a later loader */
+    static const char *const sv_cols[] = { "version", NULL };
+    if ((rc = table_columns(c, "karidns_schema_version", sv_cols, &found, &rows)) != 0) return rc;
+    if (rows > 0 && found == 1u) {
+        sqlite3_stmt *st = NULL;
+        rc = sqlite3_prepare_v2(c->db, "SELECT max(version) FROM karidns_schema_version", -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) {
+            sqlite3_int64 v = sqlite3_column_type(st, 0) == SQLITE_NULL ? 0 : sqlite3_column_int64(st, 0);
+            sqlite3_finalize(st);
+            if (v > 2) {
+                set_err(c, "schema: karidns_schema_version is %lld; this loader reads versions 1 and 2", (long long)v);
+                return -1;
+            }
+            return 0;
+        }
+        sqlite3_finalize(st);
+        return sql_fail(c, rc, "karidns_schema_version");
+    }
     return 0;
 }
 
@@ -779,6 +799,7 @@ const db_driver_t db_driver_sqlite3 = {
     sq_begin_snapshot, sq_end_snapshot, sq_list_zones,    sq_scan_records,     sq_scan_metadata,
     sq_zones_with_keys, sq_changes_since, sq_wait_fd,     sq_drain_notifications, sq_report_status,
     sq_changes_max,   sq_scan_records_range, sq_scan_domain_views, sq_scan_profiles, sq_scan_ext, sq_poll_version,
+    false,          /* changes_unsettled: the cursor is the highest seq */
 };
 
 #endif /* KARIDNS_DB_SQLITE3 */

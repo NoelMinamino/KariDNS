@@ -88,12 +88,14 @@ else
     sq < "$SCHEMA" > /dev/null
     sq < "$EXT" || fail "the ext file does not apply"
     sq < "$EXT" || fail "the ext file does not apply a second time"
-    [ "$(sq 'SELECT count(*) FROM karidns_schema_version')" = "1" ] && [ "$(sq 'SELECT version FROM karidns_schema_version')" = "1" ] &&
-        pass "schema version 1, one row after two applications" || fail "karidns_schema_version"
+    [ "$(sq 'SELECT count(*) FROM karidns_schema_version')" = "1" ] && [ "$(sq 'SELECT version FROM karidns_schema_version')" = "2" ] &&
+        pass "schema version 2, one row after two applications" || fail "karidns_schema_version"
     for t in karidns_schema_version karidns_changes karidns_domain_views karidns_profiles karidns_record_tags karidns_record_tinydns karidns_zone_tagdefs; do
         [ "$(sq "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '$t'")" = "1" ] && pass "table $t" || fail "table $t is missing"
     done
     # 9 tables with INSERT / UPDATE / DELETE triggers (B7a: karidns_profiles) + the prune trigger
+    # B10: karidns_zone_tagdefs.id (schema version 2) is the rowid alias, in the order of the inserts
+    [ "$(sq "SELECT count(*) FROM pragma_table_info('karidns_zone_tagdefs') WHERE name = 'id' AND pk = 1")" = "1" ] && pass "karidns_zone_tagdefs.id is the primary key" || fail "karidns_zone_tagdefs.id"
     [ "$(sq "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'")" = "28" ] && pass "28 triggers (9 tables x 3 + prune)" ||
         fail "trigger count $(sq "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'"), wanted 28"
     sq "PRAGMA foreign_keys = ON" > /dev/null
@@ -226,14 +228,24 @@ else
         pf tests/db/pdns_schema.pgsql.sql > "$T/pg_schema.out" 2>&1 || { fail "the PowerDNS-style schema does not load"; cat "$T/pg_schema.out"; }
         pf db/karidns_ext.pgsql.sql > "$T/pg_ext.out" 2>&1 && pass "the ext file applies" || { fail "the ext file does not apply"; cat "$T/pg_ext.out"; }
         pf db/karidns_ext.pgsql.sql > "$T/pg_ext2.out" 2>&1 && pass "the ext file applies a second time" || { fail "second application"; cat "$T/pg_ext2.out"; }
-        [ "$(pq 'SELECT count(*) FROM karidns_schema_version')" = "1" ] && [ "$(pq 'SELECT version FROM karidns_schema_version')" = "1" ] &&
-            pass "schema version 1, one row after two applications" || fail "karidns_schema_version"
+        [ "$(pq 'SELECT count(*) FROM karidns_schema_version')" = "1" ] && [ "$(pq 'SELECT version FROM karidns_schema_version')" = "2" ] &&
+            pass "schema version 2, one row after two applications" || fail "karidns_schema_version"
         for t in karidns_schema_version karidns_changes karidns_domain_views karidns_profiles karidns_record_tags karidns_record_tinydns karidns_zone_tagdefs; do
             [ "$(pq "SELECT count(*) FROM pg_tables WHERE tablename = '$t' AND schemaname = current_schema()")" = "1" ] && pass "table $t" || fail "table $t is missing"
         done
         [ "$(pq "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND c.relname LIKE '%'")" = "28" ] &&
             pass "28 triggers (9 tables x 3 + prune)" || fail "trigger count $(pq "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal")"
 
+        # B10 (schema version 2): the log rows carry the xid8 of the writing transaction, tagdefs have an id
+        [ "$(pq "SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'karidns_changes'::regclass AND attname = 'xid'")" = "xid8" ] &&
+            pass "karidns_changes.xid is xid8" || fail "karidns_changes.xid"
+        [ "$(pq "SELECT count(*) FROM pg_indexes WHERE tablename = 'karidns_changes' AND indexname = 'karidns_changes_xid_idx'")" = "1" ] && pass "index on karidns_changes.xid" || fail "xid index"
+        [ "$(pq "SELECT count(*) FROM pg_attribute WHERE attrelid = 'karidns_zone_tagdefs'::regclass AND attname = 'id' AND NOT attisdropped")" = "1" ] && pass "karidns_zone_tagdefs.id" || fail "karidns_zone_tagdefs.id"
+        XOUT=$(printf "BEGIN;\nSELECT pg_current_xact_id();\nINSERT INTO domains (id, name, type) VALUES (9001, 'xid1.test', 'NATIVE');\nSELECT xid FROM karidns_changes ORDER BY seq DESC LIMIT 1;\nCOMMIT;\nINSERT INTO domains (id, name, type) VALUES (9002, 'xid2.test', 'NATIVE');\nSELECT xid FROM karidns_changes ORDER BY seq DESC LIMIT 1;\n" | psql -X -q -At -v ON_ERROR_STOP=1 "$PGC" | tr '\n' ' ')
+        set -- $XOUT
+        if [ $# -eq 3 ] && [ "$1" = "$2" ] && [ "$1" != "$3" ] && [ "$1" != "0" ]; then pass "a log row carries the xid8 of the writing transaction ($1), the next transaction has another ($3)"
+        else fail "xid of log rows: '$XOUT'"; fi
+        pq "DELETE FROM domains WHERE name IN ('xid1.test', 'xid2.test'); DELETE FROM karidns_changes" >/dev/null
         pq "INSERT INTO domains (name, type) SELECT 'd' || g || '.test', 'NATIVE' FROM generate_series(1, 3) g" >/dev/null
         expect "INSERT of 3 domains in one statement: one row per domain" "1,2,3"
         pq "INSERT INTO records (domain_id, name, type, content, ttl) SELECT 1, 'h' || g || '.d1.test', 'A', '192.0.2.1', 60 FROM generate_series(1, 1000) g" >/dev/null
@@ -316,6 +328,20 @@ else
               [ "$n" = "5" ] && [ "$mx" = "5" ] && pass "prune: the newest 5 of 20 rows are kept" || fail "prune: $n rows, span $mx";
               psql -X -q -d "$PGMAINT" -c "DROP DATABASE IF EXISTS $PGDB5" >/dev/null 2>&1; } ||
             skip "cannot create a second database for the prune test"
+
+        # the functions pin the search_path of the session that applied the DDL: a writer with another search_path, and a decoy
+        # karidns_changes / karidns_log_domains earlier on its path, still logs into the schema the DDL was installed in
+        pq "CREATE SCHEMA karidns_ddl_home; CREATE SCHEMA karidns_ddl_decoy" >/dev/null
+        { echo "SET search_path TO karidns_ddl_home;"; cat tests/db/pdns_schema.pgsql.sql db/karidns_ext.pgsql.sql; } > "$T/home.sql"
+        pf "$T/home.sql" > "$T/home.out" 2>&1 && pass "the DDL applies in a non-default schema" || { fail "the DDL in a non-default schema"; head -3 "$T/home.out"; }
+        pq "CREATE TABLE karidns_ddl_decoy.karidns_changes (seq BIGSERIAL, domain_id INTEGER, changed_at BIGINT, xid xid8 DEFAULT pg_current_xact_id());
+            CREATE FUNCTION karidns_ddl_decoy.karidns_log_domains(ids INTEGER[]) RETURNS void LANGUAGE sql AS 'INSERT INTO karidns_ddl_decoy.karidns_changes (domain_id, changed_at) SELECT 0, 0'" >/dev/null
+        pq "SET search_path = karidns_ddl_decoy, karidns_ddl_home; INSERT INTO karidns_ddl_home.domains (name, type) VALUES ('home.test', 'NATIVE'); INSERT INTO karidns_ddl_home.records (domain_id, name, type, content, ttl) SELECT id, 'h.home.test', 'A', '192.0.2.1', 60 FROM karidns_ddl_home.domains WHERE name = 'home.test'" >/dev/null
+        [ "$(pq "SELECT count(*) FROM karidns_ddl_home.karidns_changes")" = "2" ] && [ "$(pq "SELECT count(*) FROM karidns_ddl_decoy.karidns_changes")" = "0" ] &&
+            pass "a writer with a different search_path (and a decoy log) still logs into the schema of the DDL" ||
+            fail "log rows: home $(pq "SELECT count(*) FROM karidns_ddl_home.karidns_changes"), decoy $(pq "SELECT count(*) FROM karidns_ddl_decoy.karidns_changes")"
+        [ "$(pq "SELECT count(*) FROM pg_proc WHERE proname LIKE 'karidns\_%' AND pronamespace = 'karidns_ddl_home'::regnamespace AND proconfig IS NULL")" = "0" ] && pass "every karidns_* function pins its search_path" || fail "unpinned functions"
+        pq "DROP SCHEMA karidns_ddl_home CASCADE; DROP SCHEMA karidns_ddl_decoy CASCADE" >/dev/null
 
         # the real PowerDNS schema, if it can be found
         PDNS_PG=${PDNS_SCHEMA_PGSQL:-/usr/local/share/doc/pdns/schema.pgsql.sql}

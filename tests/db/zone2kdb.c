@@ -14,6 +14,9 @@
  *   zone2kdb --extract STREAM NAME
  *       Writes the messages ZONE_BEGIN .. ZONE_END of zone NAME (with or without the trailing dot, any case) of a stream
  *       to standard output; exit status 1 if the stream has no such zone.
+ *   zone2kdb --strip-hello STREAM OUT
+ *       Writes the stream without its first message (HELLO, which names the driver) to OUT: the dumps of two drivers for the
+ *       same data are then identical bytes (tests/run_db_pg_sqlite_diff_test.sh).
  *
  * Not installed.  Built by `make zone2kdb`.
  */
@@ -250,6 +253,32 @@ static int cmd_compare(const char *pa, const char *pb) {
     return 1;
 }
 
+/* B10: the stream without its first message (HELLO names the driver, which is the one difference between the dumps of two
+ * drivers), written to OUT */
+static int cmd_strip_hello(const char *path, const char *outp) {
+    size_t n = 0;
+    uint8_t *a = read_all(path, &n);
+    if (!a) {
+        fprintf(stderr, "zone2kdb: cannot read %s\n", path);
+        return 2;
+    }
+    enum { MAXM = 1 << 20 };
+    msg_t *m = malloc(MAXM * sizeof(msg_t));
+    size_t nm = split(a, n, m, MAXM);
+    if (nm == (size_t)-1 || nm < 1 || m[0].type != KDB_T_HELLO) {
+        fprintf(stderr, "zone2kdb: %s is not a stream that starts with HELLO\n", path);
+        return 2;
+    }
+    FILE *out = fopen(outp, "wb");
+    if (!out || fwrite(a + m[0].len, 1, n - m[0].len, out) != n - m[0].len || fclose(out) != 0) {
+        fprintf(stderr, "zone2kdb: cannot write %s\n", outp);
+        return 2;
+    }
+    free(m);
+    free(a);
+    return 0;
+}
+
 static bool zone_begin_name(const uint8_t *msg, size_t len, char *name, size_t cap) {
     static uint8_t body[KDB_MAX_BODY];
     kdb_framer_t f;
@@ -301,6 +330,7 @@ static int cmd_extract(const char *path, const char *want) {
 int main(int argc, char **argv) {
     if (argc == 4 && strcmp(argv[1], "--compare") == 0) return cmd_compare(argv[2], argv[3]);
     if (argc == 4 && strcmp(argv[1], "--extract") == 0) return cmd_extract(argv[2], argv[3]);
+    if (argc == 4 && strcmp(argv[1], "--strip-hello") == 0) return cmd_strip_hello(argv[2], argv[3]);
     const char *out = NULL, *list = NULL;
     uint32_t ttl = 0;
     int i = 1;
@@ -313,7 +343,8 @@ int main(int argc, char **argv) {
     if (!out || !list || i >= argc) {
         fprintf(stderr, "usage: zone2kdb --ref OUT --list LIST [--default-ttl N] zonefile...\n"
                         "       zone2kdb --compare A B\n"
-                        "       zone2kdb --extract STREAM ZONE\n");
+                        "       zone2kdb --extract STREAM ZONE\n"
+                        "       zone2kdb --strip-hello STREAM OUT\n");
         return 2;
     }
     return cmd_ref(out, list, ttl, argc - i, argv + i);

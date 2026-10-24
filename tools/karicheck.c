@@ -1852,6 +1852,39 @@ KARIDNS_TOOL_FN bool kc_line_listed(const char *list, const char *name) {
     return false;
 }
 
+/* B10: does a libpq connection string reach the server over a UNIX socket?  A host that starts with '/' (%2F in a URI) does, and so
+ * does a string without any host (libpq's default); a host name or address (keyword form or URI authority) does not.  hostaddr
+ * without host is a TCP connection. */
+KARIDNS_TOOL_FN bool kc_conninfo_unix_socket(const char *s) {
+    const char *hv = NULL;
+    bool hostaddr = false;
+    if (strncmp(s, "postgresql://", 13) == 0 || strncmp(s, "postgres://", 11) == 0) {
+        const char *a = strstr(s, "//") + 2;
+        const char *e = a + strcspn(a, "/? ");
+        const char *at = memchr(a, '@', (size_t)(e - a));
+        if (at) a = at + 1;
+        if (a < e) hv = a;                                          /* the host of the authority */
+        const char *q = strchr(s, '?');
+        while (q) {
+            q++;
+            if (strncmp(q, "host=", 5) == 0) hv = q + 5;
+            else if (strncmp(q, "hostaddr=", 9) == 0) hostaddr = true;
+            q = strchr(q, '&');
+        }
+    } else {
+        for (const char *p = s; (p = strstr(p, "host")) != NULL; p++) {
+            if (p != s && p[-1] != ' ' && p[-1] != '\t') continue;      /* a keyword starts a word (not "dbhost=", "hostaddr" is below) */
+            if (strncmp(p, "host=", 5) == 0) hv = p + 5;
+            else if (strncmp(p, "hostaddr=", 9) == 0) hostaddr = true;
+        }
+    }
+    if (hv) {
+        if (*hv == '\'' || *hv == '"') hv++;
+        return *hv == '/' || strncasecmp(hv, "%2f", 3) == 0;
+    }
+    return !hostaddr;
+}
+
 /* An SQLite3 database file: it must exist, be in WAL mode (bytes 18 and 19 of the header are 2: file format
  * write / read version, https://www.sqlite.org/fileformat2.html), not be readable by others, and not sit in a
  * directory others can write to. */
@@ -1986,14 +2019,23 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
                          db->conninfo_file, (unsigned)cs.st_uid, db->loader_user);
             FILE *cf = fopen(db->conninfo_file, "r");
             if (cf) {
-                char line[2048];
-                bool unix_sock = false, verify = false;
-                while (fgets(line, sizeof(line), cf)) {
-                    if (strstr(line, "host=/") || strstr(line, "host='/") || strstr(line, "host=\"/")) unix_sock = true;
-                    if (strstr(line, "sslmode=verify-full")) verify = true;
+                char line[2048], all[4096];
+                size_t used = 0;
+                all[0] = '\0';
+                while (fgets(line, sizeof(line), cf)) {                   /* '#' starts a comment line, like the loader reads the file */
+                    const char *l = line;
+                    while (*l == ' ' || *l == '\t') l++;
+                    if (*l == '#') continue;
+                    size_t n = strcspn(line, "\r\n");
+                    if (used + n + 2 > sizeof(all)) break;
+                    memcpy(all + used, line, n);
+                    used += n;
+                    all[used++] = ' ';
+                    all[used] = '\0';
                 }
                 fclose(cf);
-                if (!unix_sock && !verify)
+                bool verify = strstr(all, "sslmode=verify-full") || strstr(all, "sslmode='verify-full'") || strstr(all, "sslmode=\"verify-full\"");
+                if (!kc_conninfo_unix_socket(all) && !verify)
                     kc_warning(&t, "database conninfo-file '%s' has neither a UNIX socket host nor sslmode=verify-full\n",
                                db->conninfo_file);
             }
