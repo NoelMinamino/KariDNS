@@ -514,18 +514,20 @@ static size_t ceiling_notes(const server_config_t *cfg, const zone_ext_t *x, cha
   size_t n = 0;
   if (cap) out[0] = '\0';
   bool have_acl = x->allow_transfer_count > 0 || x->tsig_keys_count > 0 || x->allow_update_count > 0;
-  if (!have_acl) return 0;
+  bool have_ecs = x->ecs_trusted_resolvers_count > 0;          /* B8: the trusted resolvers are bounded by the ceiling too */
+  if (!have_acl && !have_ecs) return 0;
 #define NOTE(...) do { if (n + 1 < cap) { int w_ = snprintf(out + n, cap - n, __VA_ARGS__); if (w_ > 0) n = (size_t)w_ < cap - n ? n + (size_t)w_ : cap - 1; } } while (0)
   if (!db_acl_ceiling_configured(cfg)) {
-    NOTE("no acl-ceiling is configured: these ACLs refuse everybody");
+    if (have_acl) NOTE("no acl-ceiling is configured: these ACLs refuse everybody");
+    if (have_ecs) NOTE("%sno acl-ceiling is configured: no resolver of ecs-trusted-resolvers is trusted", have_acl ? "; " : "");
     return n;
   }
   const database_config_t *d = &cfg->database;
-  for (int pass = 0; pass < 2; pass++) {
-    const char *what = pass == 0 ? "allow-transfer" : "allow-update";
-    char *const *list = pass == 0 ? x->allow_transfer : x->allow_update;
-    const acl_entry_t *parsed = pass == 0 ? x->allow_transfer_parsed : x->allow_update_parsed;
-    int count = pass == 0 ? x->allow_transfer_count : x->allow_update_count;
+  for (int pass = 0; pass < 3; pass++) {
+    const char *what = pass == 0 ? "allow-transfer" : pass == 1 ? "allow-update" : "ecs-trusted-resolvers";
+    char *const *list = pass == 0 ? x->allow_transfer : pass == 1 ? x->allow_update : x->ecs_trusted_resolvers;
+    const acl_entry_t *parsed = pass == 0 ? x->allow_transfer_parsed : pass == 1 ? x->allow_update_parsed : x->ecs_trusted_resolvers_parsed;
+    int count = pass == 0 ? x->allow_transfer_count : pass == 1 ? x->allow_update_count : x->ecs_trusted_resolvers_count;
     for (int i = 0; parsed && i < count; i++) {
       if (!parsed[i].cidr.valid || parsed[i].is_deny) continue;      /* a key name, none, or an exclusion */
       bool inside = false, overlaps = false;
@@ -568,7 +570,8 @@ static bool check_settings_against_config(const zone_ext_shared_t *sh, const cha
     sane_copy(shown, sizeof(shown), missing, strlen(missing));
     snprintf(why, whylen, "the settings name the TSIG key '%s', which is not defined in karidns.conf", shown);
     ok = false;
-  } else if ((sh->ext.allow_transfer_count > 0 || sh->ext.tsig_keys_count > 0 || sh->ext.allow_update_count > 0) &&
+  } else if ((sh->ext.allow_transfer_count > 0 || sh->ext.tsig_keys_count > 0 || sh->ext.allow_update_count > 0 ||
+              sh->ext.ecs_trusted_resolvers_count > 0) &&
              !db_acl_ceiling_configured(cfg) && !atomic_exchange_explicit(&g_ceiling_warned, true, memory_order_relaxed)) {
     syslog(LOG_WARNING, "[DB] zone '%s' has ACLs in its database settings, but options { database { acl-ceiling } } is not "
                         "configured: database ACLs refuse every client until it is (this is logged once)", zone);
@@ -1284,9 +1287,6 @@ static void on_zone_begin(ing_t *g, const kdb_msg_t *m) {
   if (j->view_name[0] == '\0') {
     j->skip = true;
     job_reject(j, "the view is not in the configuration");
-  } else if (zb->flags & KDB_ZF_EXTENDED) {
-    j->skip = true;
-    job_reject(j, "extended attributes (tags, tinydns) from the database are not supported yet");
   } else if (zb->zone_kind != KDB_ZK_PRIMARY && zb->flags != 0) {
     j->skip = true;                                      /* a SLAVE / CONSUMER has no data to describe */
     job_reject(j, "a secondary zone from the database carries no zone flags");
@@ -1303,7 +1303,7 @@ static void on_zone_begin(ing_t *g, const kdb_msg_t *m) {
   } else if (zb->zone_kind != KDB_ZK_PRIMARY) {
     j->zkind = zb->zone_kind;                            /* no ZONE_DATA follows (the stream rules, dns_db_stream.c): ZONE_END runs it */
   } else {
-    j->build = db_zone_build_new(j->zone, j->rr_count);
+    j->build = db_zone_build_new(j->zone, j->rr_count, zb->flags);
     if (!j->build) {
       j->skip = true;
       job_reject(j, "out of memory");

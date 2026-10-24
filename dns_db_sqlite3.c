@@ -39,6 +39,8 @@ struct db_conn {
     bool has_domain_views;
     sqlite3_stmt *st_prof;
     bool has_profiles;
+    sqlite3_stmt *st_xt[2], *st_xd[2], *st_xg[2];      /* B8: karidns_record_tags, karidns_record_tinydns, karidns_zone_tagdefs; [0] all, [1] one domain */
+    bool has_ext;
 };
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -180,6 +182,11 @@ static void sq_close(db_conn_t *c) {
     sqlite3_finalize(c->st_dv_all);
     sqlite3_finalize(c->st_dv_one);
     sqlite3_finalize(c->st_prof);
+    for (int i = 0; i < 2; i++) {
+        sqlite3_finalize(c->st_xt[i]);
+        sqlite3_finalize(c->st_xd[i]);
+        sqlite3_finalize(c->st_xg[i]);
+    }
     sqlite3_finalize(c->st_meta_all);
     sqlite3_finalize(c->st_meta_one);
     sqlite3_finalize(c->st_keys);
@@ -258,6 +265,17 @@ static int sq_check_schema(db_conn_t *c, db_schema_info_t *out) {
     if (rc != 0) return rc;
     c->has_profiles = rows > 0 && found == 3u;
     if (out) out->has_profiles = c->has_profiles;
+    /* B8: the three extension tables of the tags and tinydns attributes (design 3.7); all three or none */
+    static const char *const xt_cols[] = { "record_id", "location_tag", "ecs_tag", NULL };
+    static const char *const xd_cols[] = { "record_id", "ttd", "loc", "countdown", NULL };
+    static const char *const xg_cols[] = { "domain_id", "kind", "tag", "cidr", NULL };
+    unsigned f1, f2, f3;
+    int r1, r2, r3;
+    if ((rc = table_columns(c, "karidns_record_tags", xt_cols, &f1, &r1)) != 0 || (rc = table_columns(c, "karidns_record_tinydns", xd_cols, &f2, &r2)) != 0 ||
+        (rc = table_columns(c, "karidns_zone_tagdefs", xg_cols, &f3, &r3)) != 0)
+        return rc;
+    c->has_ext = r1 > 0 && f1 == 7u && r2 > 0 && f2 == 15u && r3 > 0 && f3 == 15u;
+    if (out) out->has_ext = c->has_ext;
     return 0;
 }
 
@@ -296,6 +314,11 @@ static int sq_end_snapshot(db_conn_t *c) {
                             c->st_keys, c->st_changes, c->st_dv_all, c->st_dv_one, c->st_prof };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
         if (all[i]) rearm(all[i]);
+    for (int i = 0; i < 2; i++) {
+        if (c->st_xt[i]) rearm(c->st_xt[i]);
+        if (c->st_xd[i]) rearm(c->st_xd[i]);
+        if (c->st_xg[i]) rearm(c->st_xg[i]);
+    }
     c->in_snapshot = false;
     return exec(c, "COMMIT");
 }
@@ -605,11 +628,123 @@ static int sq_report_status(db_conn_t *c, const db_status_t *st) {
     return 0;       /* multi-server status is PostgreSQL only (design 2.2) */
 }
 
+/* B8: karidns_record_tags / karidns_record_tinydns (through records, for the domain id) / karidns_zone_tagdefs.  Each table in its own
+ * pass, rows ordered by (domain_id, record_id); the tag definitions by (domain_id, rowid): the order the rows were inserted in is the
+ * order of the definitions in a zone file, and the first definition that matches a client wins. */
+static int sq_scan_ext(db_conn_t *c, const int64_t *domain_id, const db_ext_sink_t *sink) {
+    if (!c->has_ext) {
+        set_err(c, "the karidns_record_tags / karidns_record_tinydns / karidns_zone_tagdefs tables do not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    const int one = domain_id ? 1 : 0;
+    int ret = prep(c, &c->st_xt[one],
+                   one ? "SELECT r.domain_id, t.record_id, t.location_tag, t.ecs_tag FROM karidns_record_tags t JOIN records r ON r.id = t.record_id "
+                         "WHERE r.domain_id = ?1 ORDER BY t.record_id"
+                       : "SELECT r.domain_id, t.record_id, t.location_tag, t.ecs_tag FROM karidns_record_tags t JOIN records r ON r.id = t.record_id "
+                         "ORDER BY r.domain_id, t.record_id");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = c->st_xt[one];
+    rearm(st);
+    if (one) sqlite3_bind_int64(st, 1, *domain_id);
+    for (;;) {
+        int rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE) break;
+        if (rc != SQLITE_ROW) {
+            ret = sql_fail(c, rc, "scan_ext (karidns_record_tags)");
+            break;
+        }
+        bool bad = false;
+        int64_t did = sqlite3_column_int64(st, 0);
+        db_tag_row_t row;
+        row.record_id = sqlite3_column_int64(st, 1);
+        row.location_tag = col_text(c, st, 2, "karidns_record_tags", row.record_id, "location_tag", &bad);
+        row.ecs_tag = col_text(c, st, 3, "karidns_record_tags", row.record_id, "ecs_tag", &bad);
+        if (bad) {
+            ret = -1;
+            break;
+        }
+        if (sink->record_tags(sink->ud, did, &row) != 0) {
+            ret = DB_STOPPED;
+            break;
+        }
+    }
+    rearm(st);
+    if (ret != 0) return ret;
+
+    ret = prep(c, &c->st_xd[one],
+               one ? "SELECT r.domain_id, t.record_id, t.ttd, t.loc, t.countdown FROM karidns_record_tinydns t JOIN records r ON r.id = t.record_id "
+                     "WHERE r.domain_id = ?1 ORDER BY t.record_id"
+                   : "SELECT r.domain_id, t.record_id, t.ttd, t.loc, t.countdown FROM karidns_record_tinydns t JOIN records r ON r.id = t.record_id "
+                     "ORDER BY r.domain_id, t.record_id");
+    if (ret != 0) return ret;
+    st = c->st_xd[one];
+    rearm(st);
+    if (one) sqlite3_bind_int64(st, 1, *domain_id);
+    for (;;) {
+        int rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE) break;
+        if (rc != SQLITE_ROW) {
+            ret = sql_fail(c, rc, "scan_ext (karidns_record_tinydns)");
+            break;
+        }
+        bool bad = false;
+        int64_t did = sqlite3_column_int64(st, 0);
+        db_tinydns_row_t row;
+        row.record_id = sqlite3_column_int64(st, 1);
+        row.ttd_null = sqlite3_column_type(st, 2) == SQLITE_NULL;
+        row.ttd = row.ttd_null ? 0 : sqlite3_column_int64(st, 2);
+        row.loc = col_text(c, st, 3, "karidns_record_tinydns", row.record_id, "loc", &bad);
+        row.countdown = sqlite3_column_type(st, 4) != SQLITE_NULL && sqlite3_column_int64(st, 4) != 0;
+        if (bad) {
+            ret = -1;
+            break;
+        }
+        if (sink->record_tinydns(sink->ud, did, &row) != 0) {
+            ret = DB_STOPPED;
+            break;
+        }
+    }
+    rearm(st);
+    if (ret != 0) return ret;
+
+    ret = prep(c, &c->st_xg[one],
+               one ? "SELECT domain_id, kind, tag, cidr FROM karidns_zone_tagdefs WHERE domain_id = ?1 ORDER BY rowid"
+                   : "SELECT domain_id, kind, tag, cidr FROM karidns_zone_tagdefs ORDER BY domain_id, rowid");
+    if (ret != 0) return ret;
+    st = c->st_xg[one];
+    rearm(st);
+    if (one) sqlite3_bind_int64(st, 1, *domain_id);
+    for (;;) {
+        int rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE) break;
+        if (rc != SQLITE_ROW) {
+            ret = sql_fail(c, rc, "scan_ext (karidns_zone_tagdefs)");
+            break;
+        }
+        bool bad = false;
+        int64_t did = sqlite3_column_int64(st, 0);
+        db_tagdef_row_t row;
+        row.kind = col_text(c, st, 1, "karidns_zone_tagdefs", did, "kind", &bad);
+        row.tag = col_text(c, st, 2, "karidns_zone_tagdefs", did, "tag", &bad);
+        row.cidr = col_text(c, st, 3, "karidns_zone_tagdefs", did, "cidr", &bad);
+        if (bad) {
+            ret = -1;
+            break;
+        }
+        if (sink->tagdef(sink->ud, did, &row) != 0) {
+            ret = DB_STOPPED;
+            break;
+        }
+    }
+    rearm(st);
+    return ret;
+}
+
 const db_driver_t db_driver_sqlite3 = {
     "sqlite3",       sq_open,         sq_close,           sq_errmsg,           sq_check_schema,
     sq_begin_snapshot, sq_end_snapshot, sq_list_zones,    sq_scan_records,     sq_scan_metadata,
     sq_zones_with_keys, sq_changes_since, sq_wait_fd,     sq_drain_notifications, sq_report_status,
-    sq_changes_max,   sq_scan_records_range, sq_scan_domain_views, sq_scan_profiles,
+    sq_changes_max,   sq_scan_records_range, sq_scan_domain_views, sq_scan_profiles, sq_scan_ext,
 };
 
 #endif /* KARIDNS_DB_SQLITE3 */

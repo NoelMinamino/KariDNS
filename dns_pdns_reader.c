@@ -22,6 +22,8 @@
 #define PDNS_MAX_LIST 1024
 #define PDNS_MAX_NAME_TEXT 1024
 
+static void ext_free(pdns_zone_t *z);
+
 /* ------------------------------------------------------------------------------------------------------------- */
 /* diagnostics                                                                                                    */
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -290,6 +292,7 @@ void pdns_zone_free(pdns_zone_t *z) {
     free(z->ents);
     free(z->settings);
     free(z->master);
+    ext_free(z);
     free(z->nsec3param);
     for (size_t i = 0; i < z->n_warnings; i++) free(z->warnings[i]);
     free(z->warnings);
@@ -602,6 +605,333 @@ int pdns_zone_add_meta(pdns_zone_t *z, const db_meta_row_t *row) {
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
+/* B8: Extended AXFR attributes (design 3.6a, 3.7)                                                                */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+#define PDNS_MAX_TAG 63             /* a tag state record carries at most 63 octets (axfr_session_t.current_*_tag) */
+#define PDNS_MAX_TDNS_LOCS 4096     /* the limit of the tinydns data parser */
+
+/* a tag name: 1-63 printable characters, no blank; "none" and "default" clear a tag in a zone file ($LOCATION none) */
+static bool tag_name_ok(const char *s) {
+    size_t n = strlen(s);
+    if (n == 0 || n > PDNS_MAX_TAG) return false;
+    for (size_t i = 0; i < n; i++)
+        if ((unsigned char)s[i] < 0x21 || (unsigned char)s[i] > 0x7E) return false;
+    return strcasecmp(s, "none") != 0 && strcasecmp(s, "default") != 0;
+}
+
+/* a tinydns location code: 1-2 printable characters (the data file takes any octet but the colon; the database keeps text) */
+static bool tdns_code_ok(const char *s) {
+    size_t n = strlen(s);
+    if (n == 0 || n > 2) return false;
+    for (size_t i = 0; i < n; i++)
+        if ((unsigned char)s[i] < 0x21 || (unsigned char)s[i] > 0x7E) return false;
+    return true;
+}
+
+static int ext_prep(pdns_zone_t *z, const char *what) {
+    if (z->failed) return -1;
+    if (z->finished) {
+        zfail(z, false, 0, "internal error: %s added after pdns_zone_finish()", what);
+        return -1;
+    }
+    return 0;
+}
+
+static bool ext_grow(void **v, size_t *cap, size_t n, size_t esz) {
+    if (n < *cap) return true;
+    size_t nc = *cap ? *cap * 2 : 16;
+    void *nv = realloc(*v, nc * esz);
+    if (!nv) return false;
+    *v = nv;
+    *cap = nc;
+    return true;
+}
+
+int pdns_zone_add_tags(pdns_zone_t *z, const db_tag_row_t *row) {
+    if (ext_prep(z, "record tags") != 0) return -1;
+    const char *loc = row->location_tag && *row->location_tag ? row->location_tag : NULL;
+    const char *ecs = row->ecs_tag && *row->ecs_tag ? row->ecs_tag : NULL;
+    if (!loc && !ecs) return 0;
+    if (loc && !tag_name_ok(loc)) {
+        zfail(z, true, row->record_id, "karidns_record_tags.location_tag is not a tag name (1-63 printable characters without blanks; none and default are reserved)");
+        return -1;
+    }
+    if (ecs && !tag_name_ok(ecs)) {
+        zfail(z, true, row->record_id, "karidns_record_tags.ecs_tag is not a tag name (1-63 printable characters without blanks; none and default are reserved)");
+        return -1;
+    }
+    if (z->n_tags >= z->opts.max_records) {
+        zfail(z, false, 0, "more karidns_record_tags rows than max-zone-records");
+        return -1;
+    }
+    char *l = loc ? strdup(loc) : NULL, *e = ecs ? strdup(ecs) : NULL;
+    if ((loc && !l) || (ecs && !e) || !ext_grow((void **)&z->tags, &z->tags_cap, z->n_tags, sizeof(*z->tags))) {
+        free(l);
+        free(e);
+        zfail(z, false, 0, "out of memory");
+        return -1;
+    }
+    z->tags[z->n_tags++] = (struct pdns_tagrow){ row->record_id, l, e };
+    return 0;
+}
+
+int pdns_zone_add_tinydns(pdns_zone_t *z, const db_tinydns_row_t *row) {
+    if (ext_prep(z, "tinydns attributes") != 0) return -1;
+    const char *loc = row->loc && *row->loc ? row->loc : NULL;
+    int64_t ttd = row->ttd_null ? 0 : row->ttd;
+    if (loc && !tdns_code_ok(loc)) {
+        zfail(z, true, row->record_id, "karidns_record_tinydns.loc is not a location code (1 or 2 printable characters)");
+        return -1;
+    }
+    if (ttd < 0) {
+        zfail(z, true, row->record_id, "karidns_record_tinydns.ttd is negative");
+        return -1;
+    }
+    if (row->countdown && ttd == 0) {
+        zfail(z, true, row->record_id, "karidns_record_tinydns: countdown without a ttd");
+        return -1;
+    }
+    if (!loc && ttd == 0) return 0;
+    if (z->n_tdns >= z->opts.max_records) {
+        zfail(z, false, 0, "more karidns_record_tinydns rows than max-zone-records");
+        return -1;
+    }
+    if (!ext_grow((void **)&z->tdns, &z->tdns_cap, z->n_tdns, sizeof(*z->tdns))) {
+        zfail(z, false, 0, "out of memory");
+        return -1;
+    }
+    struct pdns_tdrow *t = &z->tdns[z->n_tdns++];
+    t->id = row->record_id;
+    t->ttd = ttd;
+    t->loc[0] = loc ? loc[0] : 0;
+    t->loc[1] = loc && loc[1] ? loc[1] : 0;
+    t->countdown = row->countdown;
+    return 0;
+}
+
+static void defs_free(ecs_tag_def_t *d, int n) {
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < d[i].cidr_count; j++) free(d[i].cidrs[j].cidr);
+        free(d[i].cidrs);
+        free(d[i].tag);
+    }
+    free(d);
+}
+
+/* a $LOCATION-TAG / $ECS-SUBNET-TAG line of a zone file is one definition (one tag, several CIDRs, first match wins); the
+ * database has one CIDR per row, so the consecutive rows of one tag are one definition.  -1: out of memory */
+static int defs_add(ecs_tag_def_t **defs, int *n, const char *tag, const char *cidr) {
+    if (*n > 0 && strcmp((*defs)[*n - 1].tag, tag) == 0) {
+        ecs_tag_def_t *d = &(*defs)[*n - 1];
+        ecs_cidr_entry_t *nc = realloc(d->cidrs, (size_t)(d->cidr_count + 1) * sizeof(*nc));
+        if (!nc) return -1;
+        d->cidrs = nc;
+        char *c = strdup(cidr);
+        if (!c) return -1;
+        memset(&nc[d->cidr_count], 0, sizeof(*nc));
+        nc[d->cidr_count].cidr = c;
+        cidr_entry_parse(&nc[d->cidr_count].parsed, c);
+        d->cidr_count++;
+        return 0;
+    }
+    ecs_tag_def_t *nd = realloc(*defs, (size_t)(*n + 1) * sizeof(*nd));
+    if (!nd) return -1;
+    *defs = nd;
+    ecs_tag_def_t *d = &nd[*n];
+    memset(d, 0, sizeof(*d));
+    d->tag = strdup(tag);
+    d->cidrs = calloc(1, sizeof(*d->cidrs));
+    if (d->cidrs) d->cidrs[0].cidr = strdup(cidr);
+    if (!d->tag || !d->cidrs || !d->cidrs[0].cidr) {
+        free(d->tag);
+        if (d->cidrs) free(d->cidrs[0].cidr);
+        free(d->cidrs);
+        return -1;
+    }
+    cidr_entry_parse(&d->cidrs[0].parsed, d->cidrs[0].cidr);
+    d->cidr_count = 1;
+    (*n)++;
+    return 0;
+}
+
+int pdns_zone_add_tagdef(pdns_zone_t *z, const db_tagdef_row_t *row) {
+    if (ext_prep(z, "tag definitions") != 0) return -1;
+    const char *kind = row->kind ? row->kind : "";
+    const char *tag = row->tag ? row->tag : "";
+    const char *cidr = row->cidr ? row->cidr : "";
+    int k;
+    if (strcasecmp(kind, "location") == 0) k = 0;
+    else if (strcasecmp(kind, "ecs") == 0) k = 1;
+    else if (strcasecmp(kind, "tinydns") == 0) k = 2;
+    else {
+        zwarn(z, false, 0, "karidns_zone_tagdefs row of kind '%.20s' ignored (location, ecs or tinydns)", kind);
+        return 0;
+    }
+    if (z->n_def_rows >= z->opts.max_records) {
+        zfail(z, false, 0, "more karidns_zone_tagdefs rows than max-zone-records");
+        return -1;
+    }
+    cidr_entry_t ce;
+    if (strlen(cidr) > 64 || !cidr_entry_parse(&ce, cidr) || ce.is_any) {
+        zfail(z, false, 0, "karidns_zone_tagdefs (%.20s '%.40s'): '%.70s' is not an address or prefix", kind, tag, cidr);
+        return -1;
+    }
+    z->n_def_rows++;
+    if (k == 2) {
+        if (!tdns_code_ok(tag)) {
+            zfail(z, false, 0, "karidns_zone_tagdefs (tinydns): '%.40s' is not a location code (1 or 2 printable characters)", tag);
+            return -1;
+        }
+        if (ce.family != AF_INET) {
+            zfail(z, false, 0, "karidns_zone_tagdefs (tinydns '%.4s'): '%.70s' is not an IPv4 prefix (tinydns locations are IPv4 only)", tag, cidr);
+            return -1;
+        }
+        if (z->n_locs >= PDNS_MAX_TDNS_LOCS) {
+            zfail(z, false, 0, "more than %d tinydns location definitions", PDNS_MAX_TDNS_LOCS);
+            return -1;
+        }
+        tinydns_location_entry_t *nl = realloc(z->locs, (size_t)(z->n_locs + 1) * sizeof(*nl));
+        if (!nl) {
+            zfail(z, false, 0, "out of memory");
+            return -1;
+        }
+        z->locs = nl;
+        tinydns_location_entry_t *e = &nl[z->n_locs++];
+        memset(e, 0, sizeof(*e));
+        e->code[0] = tag[0];
+        e->code[1] = tag[1] ? tag[1] : 0;
+        e->prefix_bits = ce.prefix;
+        for (int i = 0; i < 4; i++) e->prefix[i] = (uint8_t)(ce.addr[i] & ce.mask[i]);     /* the network part only, as the data file parser does */
+        return 0;
+    }
+    if (!tag_name_ok(tag)) {
+        zfail(z, false, 0, "karidns_zone_tagdefs (%.20s): '%.70s' is not a tag name (1-63 printable characters without blanks; none and default are reserved)", kind, tag);
+        return -1;
+    }
+    if (k == 0 ? defs_add(&z->loc_defs, &z->n_loc_defs, tag, cidr) : defs_add(&z->ecs_defs, &z->n_ecs_defs, tag, cidr)) {
+        zfail(z, false, 0, "out of memory");
+        return -1;
+    }
+    return 0;
+}
+
+static void ext_free(pdns_zone_t *z) {
+    for (size_t i = 0; i < z->n_tags; i++) {
+        free(z->tags[i].loc);
+        free(z->tags[i].ecs);
+    }
+    free(z->tags);
+    free(z->tdns);
+    defs_free(z->loc_defs, z->n_loc_defs);
+    defs_free(z->ecs_defs, z->n_ecs_defs);
+    free(z->locs);
+}
+
+typedef struct { int64_t id; size_t idx; } id_idx_t;
+
+static int id_idx_cmp(const void *a, const void *b) {
+    const id_idx_t *x = a, *y = b;
+    if (x->id != y->id) return x->id < y->id ? -1 : 1;
+    return x->idx < y->idx ? -1 : x->idx > y->idx;
+}
+
+/* the arena index of the row with records.id id, (size_t)-1 if no enabled non-ENT row has it */
+static size_t id_find(const id_idx_t *v, size_t n, int64_t id) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (v[mid].id < id) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < n && v[lo].id == id ? v[lo].idx : (size_t)-1;
+}
+
+/* Attach the attributes to the parsed records (one row = one line = one record, so arena.records[i] is the row z->line_id[i]) and
+ * hand the zone level tables to the arena.  Before the presigned rebuild: the arena holds the rows only.  0, or -1 (zone failed). */
+static int ext_apply(pdns_zone_t *z) {
+    zone_arena_t *a = &z->arena;
+    if (z->n_tags || z->n_tdns) {
+        id_idx_t *v = malloc((a->count ? a->count : 1) * sizeof(*v));
+        if (!v) {
+            zfail(z, false, 0, "out of memory");
+            return -1;
+        }
+        for (size_t i = 0; i < a->count; i++) {
+            v[i].id = z->line_id[i];
+            v[i].idx = i;
+        }
+        qsort(v, a->count, sizeof(*v), id_idx_cmp);
+        size_t stale = 0;
+        int64_t first_stale = 0;
+        for (size_t t = 0; t < z->n_tags && !z->failed; t++) {
+            size_t i = id_find(v, a->count, z->tags[t].id);
+            if (i == (size_t)-1) {
+                if (!stale++) first_stale = z->tags[t].id;
+                continue;
+            }
+            dns_record_t *r = &a->records[i];
+            if (i == z->soa_row_index) {
+                /* until B8t: the apex SOA frames every transfer without attributes (RFC 5936 s2.2), so a tagged SOA
+                 * would answer differently on a secondary; tinydns semantics for it (tdlookup.c) come with B8t */
+                zfail(z, true, z->tags[t].id, "tags on the apex SOA record are not supported yet");
+                break;
+            }
+            if (r->bind_location_tag || r->ecs_subnet_tag) {
+                zfail(z, true, z->tags[t].id, "two rows in karidns_record_tags for this record");
+                break;
+            }
+            if ((z->tags[t].loc && !(r->bind_location_tag = arena_strdup(a, z->tags[t].loc))) ||
+                (z->tags[t].ecs && !(r->ecs_subnet_tag = arena_strdup(a, z->tags[t].ecs)))) {
+                zfail(z, false, 0, "out of memory");
+                break;
+            }
+        }
+        for (size_t t = 0; t < z->n_tdns && !z->failed; t++) {
+            size_t i = id_find(v, a->count, z->tdns[t].id);
+            if (i == (size_t)-1) {
+                if (!stale++) first_stale = z->tdns[t].id;
+                continue;
+            }
+            dns_record_t *r = &a->records[i];
+            if (i == z->soa_row_index) {        /* until B8t, as for the tags above */
+                zfail(z, true, z->tdns[t].id, "tinydns attributes (time stamp, location) on the apex SOA record are not supported yet");
+                break;
+            }
+            if (r->tinydns_ttd || r->tinydns_loc[0] || r->tinydns_loc[1]) {
+                zfail(z, true, z->tdns[t].id, "two rows in karidns_record_tinydns for this record");
+                break;
+            }
+            r->tinydns_ttd = (time_t)z->tdns[t].ttd;
+            r->tinydns_ttl_countdown = z->tdns[t].countdown;
+            r->tinydns_loc[0] = z->tdns[t].loc[0];
+            r->tinydns_loc[1] = z->tdns[t].loc[1];
+        }
+        free(v);
+        if (z->failed) return -1;
+        if (stale)
+            zwarn(z, true, first_stale, "%zu row(s) of karidns_record_tags / karidns_record_tinydns belong to no enabled record of the zone (first shown)", stale);
+    }
+    a->bind_location_tags = z->loc_defs;
+    a->bind_location_tag_count = z->n_loc_defs;
+    a->bind_ecs_tags = z->ecs_defs;
+    a->bind_ecs_tag_count = z->n_ecs_defs;
+    a->locations = z->locs;
+    a->location_count = z->n_locs;
+    z->loc_defs = z->ecs_defs = NULL;
+    z->n_loc_defs = z->n_ecs_defs = 0;
+    z->locs = NULL;
+    z->n_locs = 0;
+    if (z->flags & PDNS_F_TINYDNS) a->is_tinydns_format = true;
+    z->has_ext = a->bind_location_tag_count || a->bind_ecs_tag_count || a->location_count;
+    for (size_t i = 0; i < a->count && !z->has_ext; i++) {
+        const dns_record_t *r = &a->records[i];
+        if (r->bind_location_tag || r->ecs_subnet_tag || r->tinydns_ttd || r->tinydns_loc[0] || r->tinydns_loc[1]) z->has_ext = true;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
 /* metadata -> flags, profile, settings text (design 3.5)                                                         */
 /* ------------------------------------------------------------------------------------------------------------- */
 
@@ -851,7 +1181,7 @@ static bool build_masters(pdns_zone_t *z, sbuf_t *sb) {
 }
 
 static bool build_settings(pdns_zone_t *z) {
-    strlist_t axfr_from = {0}, axfr_keys = {0}, notify = {0}, upd_from = {0}, upd_keys = {0};
+    strlist_t axfr_from = {0}, axfr_keys = {0}, notify = {0}, upd_from = {0}, upd_keys = {0}, trusted = {0};
     bool have_axfr = false, have_upd = false, have_notify = false, have_nsec3param = false, have_presigned = false,
          have_format = false, have_profile = false, have_tsig = false;
     char tsig_key[256] = "";
@@ -933,6 +1263,28 @@ static bool build_settings(pdns_zone_t *z) {
             have_tsig = true;
             if (key_name_ok(content)) snprintf(tsig_key, sizeof(tsig_key), "%s", content);
             else zwarn(z, false, 0, "AXFR-MASTER-TSIG key name is not valid, ignored");
+        } else if (strcasecmp(kind, "X-KARIDNS-ECS-TRUSTED-RESOLVERS") == 0) {
+            /* B8 (design 3.5): the resolvers whose EDNS Client Subnet option is believed (zone option ecs-trusted-resolvers): addresses / prefixes,
+             * blank or comma separated, one or several rows, a leading '!' excludes (first match decides).  An entry that is not an address
+             * or prefix fails the zone: dropping a '!' entry would trust more than the operator wrote.  The Backend bounds the list by
+             * acl-ceiling when the query is answered (dns_edns_ecs.c). */
+            char *copy = strdup(content);
+            if (!copy) {
+                ok = false;
+                break;
+            }
+            for (char *save = NULL, *tok = strtok_r(copy, ", \t", &save); tok && ok; tok = strtok_r(NULL, ", \t", &save)) {
+                if (!acl_addr_ok(tok[0] == '!' ? tok + 1 : tok)) {
+                    zfail(z, false, 0, "X-KARIDNS-ECS-TRUSTED-RESOLVERS entry '%.64s' is not an address or prefix (a leading ! excludes)", tok);
+                    ok = false;
+                } else if (trusted.n >= PDNS_MAX_LIST) {
+                    zwarn(z, false, 0, "X-KARIDNS-ECS-TRUSTED-RESOLVERS has more than %d entries, rest ignored", PDNS_MAX_LIST);
+                    break;
+                } else if (!strlist_add(&trusted, tok, &dup)) {
+                    ok = false;
+                }
+            }
+            free(copy);
         } else if (strncasecmp(kind, "X-KARIDNS-", 10) == 0) {
             size_t oi;
             for (oi = 0; oi < N_OPTIONS; oi++)
@@ -996,6 +1348,11 @@ static bool build_settings(pdns_zone_t *z) {
             /* D14 (B7a): PowerDNS needs the address AND the TSIG key for an update; allow-update alone would take either */
             if (upd_from.n && upd_keys.n) sb_add(&sb, "update-acl-match all; ");
         }
+        if (trusted.n) {
+            sb_add(&sb, "ecs-trusted-resolvers {");
+            for (size_t i = 0; i < trusted.n; i++) { sb_add(&sb, " "); sb_add(&sb, trusted.v[i]); sb_add(&sb, ";"); }
+            sb_add(&sb, " }; ");
+        }
         for (size_t oi = 0; oi < N_OPTIONS; oi++) {
             if (!opt_val[oi][0]) continue;
             snprintf(tmp, sizeof(tmp), "%s %s; ", k_options[oi].name, opt_val[oi]);
@@ -1008,6 +1365,7 @@ static bool build_settings(pdns_zone_t *z) {
     strlist_free(&notify);
     strlist_free(&upd_from);
     strlist_free(&upd_keys);
+    strlist_free(&trusted);
     if (!ok || sb.oom) {
         free(sb.buf);
         zfail(z, false, 0, "out of memory");
@@ -1300,6 +1658,7 @@ int pdns_zone_finish(pdns_zone_t *z) {
             return -1;
         }
     }
+    if (ext_apply(z) != 0) return -1;
     if ((z->flags & PDNS_F_PRESIGNED) && apply_presigned(z) != 0) return -1;
     if (z->flags & PDNS_F_PRESIGNED) (void)presigned_upper_hash_owners(&z->arena);   /* open item 1: BIND's spelling */
     if (build_zone_index(&z->arena, false) != 0) {
@@ -1329,55 +1688,116 @@ int pdns_zone_convert(pdns_zone_t *z, const db_record_row_t *rows, size_t n_rows
 
 typedef int (*body_sink_t)(void *ud, const uint8_t *body, size_t len);
 
-/* The ZONE_DATA bodies of the zone, in stream order, each handed to sink.  *rr_total = RRs written. */
-static int gen_bodies(const pdns_zone_t *z, body_sink_t sink, void *ud, char *err, size_t errlen) {
-    uint8_t *buf = malloc(KDB_MAX_ZONE_DATA);
-    if (!buf) {
+/* The ZONE_DATA bodies of the zone, in stream order, each handed to sink.  *rr_total = RRs written.
+ *
+ * Plain zone: SOA, the other rows in records.id order, SOA.  A zone with Extended AXFR attributes (z->has_ext, B8) is written
+ * the way Extended AXFR out writes a zone (dns_axfr_ixfr.c send_axfr_response(), one shared encoder: xext_* in dns_wire.c): the SOA,
+ * the tag definitions (location, ECS) and the tinydns location definitions, then the rows with the state records in front
+ * of the row that changes the tag in force (a tinydns row with a time stamp or a location as a TINYDNS_WRAP record), the
+ * resetting state records, the SOA.  The marker and definition records are RRs of the stream: they count in rr_count. */
+typedef struct {
+    const pdns_zone_t *z;
+    uint8_t *buf;
+    uint16_t off, an;
+    body_sink_t sink;
+    void *ud;
+    char *err;
+    size_t errlen;
+    size_t cur;                     /* arena index of the row being written */
+    uint64_t total;
+    bool sink_failed;
+} gen_t;
+
+static int gen_flush(gen_t *g) {
+    g->buf[6] = (uint8_t)(g->an >> 8);
+    g->buf[7] = (uint8_t)g->an;
+    if (g->sink(g->ud, g->buf, g->off) != 0) {
+        g->sink_failed = true;
+        return -1;
+    }
+    g->off = DNS_HEADER_SIZE;
+    g->an = 0;
+    return 0;
+}
+
+/* one RR into the current message (a new message when it does not fit); xext_emit_fn */
+static int gen_put(void *ud, const dns_record_t *rec) {
+    gen_t *g = ud;
+    for (int attempt = 0;; attempt++) {
+        uint16_t o2 = g->off;
+        if (serialize_dns_record(g->buf, KDB_MAX_ZONE_DATA, &o2, rec, NULL, NULL, 0xFFFFFFFFu) == 0) {
+            g->off = o2;
+            g->an++;
+            g->total++;
+            return 0;
+        }
+        if (g->an == 0 || attempt > 0) {
+            snprintf(g->err, g->errlen, "zone '%s' records.id %lld: RR does not fit a ZONE_DATA message", g->z->name,
+                     (long long)g->z->line_id[g->cur]);
+            return -1;
+        }
+        if (gen_flush(g) != 0) return -1;
+    }
+}
+
+static int gen_bodies(const pdns_zone_t *z, body_sink_t sink, void *ud, uint64_t *rr_total, char *err, size_t errlen) {
+    gen_t g = { z, malloc(KDB_MAX_ZONE_DATA), DNS_HEADER_SIZE, 0, sink, ud, err, errlen, z->soa_index, 0, false };
+    if (!g.buf) {
         snprintf(err, errlen, "zone '%s': out of memory", z->name);
         return -1;
     }
-    const size_t total = z->arena.count + 1;      /* SOA first and last (RFC 5936 2.2) */
-    size_t next = 0;
-    uint16_t off = DNS_HEADER_SIZE, an = 0;
+    xext_t x;
+    xext_init(&x, z->name, gen_put, &g);
+    const dns_record_t *recs = z->arena.records;
     int rc = -1;
-    memset(buf, 0, DNS_HEADER_SIZE);
-    buf[2] = 0x84;                                /* QR=1 AA=1, opcode QUERY, RCODE 0 */
+    memset(g.buf, 0, DNS_HEADER_SIZE);
+    g.buf[2] = 0x84;                              /* QR=1 AA=1, opcode QUERY, RCODE 0 */
 
-    for (size_t step = 0; step < total; step++) {
-        size_t idx;
-        if (step == 0 || step == total - 1) idx = z->soa_index;
-        else {
-            if (next == z->soa_index) next++;
-            idx = next++;
+    if (gen_put(&g, &recs[z->soa_index]) != 0) goto out;                 /* SOA first (RFC 5936 2.2) */
+    if (z->has_ext) {
+        const zone_arena_t *a = &z->arena;
+        for (int i = 0; i < a->bind_location_tag_count; i++)
+            if (xext_emit_tagdef(&x, false, &a->bind_location_tags[i]) != 0) goto defs_failed;
+        for (int i = 0; i < a->bind_ecs_tag_count; i++)
+            if (xext_emit_tagdef(&x, true, &a->bind_ecs_tags[i]) != 0) goto defs_failed;
+        for (int i = 0; i < a->location_count; i++)
+            if (xext_emit_locdef(&x, a->locations[i].code, a->locations[i].prefix_bits, a->locations[i].prefix) != 0) goto defs_failed;
+    }
+    for (size_t idx = 0; idx < z->arena.count; idx++) {
+        if (idx == z->soa_index) continue;
+        const dns_record_t *r = &recs[idx];
+        g.cur = idx;
+        if (!z->has_ext) {
+            if (gen_put(&g, r) != 0) goto out;
+            continue;
         }
-        for (int attempt = 0;; attempt++) {
-            uint16_t o2 = off;
-            if (serialize_dns_record(buf, KDB_MAX_ZONE_DATA, &o2, &z->arena.records[idx], NULL, NULL, 0xFFFFFFFFu) == 0) {
-                off = o2;
-                an++;
-                break;
-            }
-            if (an == 0 || attempt > 0) {
-                snprintf(err, errlen, "zone '%s' records.id %lld: RR does not fit a ZONE_DATA message", z->name,
+        if (xext_select(&x, r->bind_location_tag, r->ecs_subnet_tag) != 0) goto out;
+        if (xext_rr_is_tinydns(r->tinydns_loc, (int64_t)r->tinydns_ttd)) {
+            dns_record_t wrap;
+            uint8_t wbuf[4096];
+            if (!wrap_tinydns_record(r, &wrap, wbuf, sizeof(wbuf))) {
+                snprintf(err, errlen, "zone '%s' records.id %lld: RR with tinydns attributes is too large to be wrapped", z->name,
                          (long long)z->line_id[idx]);
                 goto out;
             }
-            buf[6] = (uint8_t)(an >> 8);
-            buf[7] = (uint8_t)an;
-            if (sink(ud, buf, off) != 0) goto out_sink;
-            off = DNS_HEADER_SIZE;
-            an = 0;
+            if (gen_put(&g, &wrap) != 0) goto out;
+        } else if (gen_put(&g, r) != 0) {
+            goto out;
         }
     }
-    buf[6] = (uint8_t)(an >> 8);
-    buf[7] = (uint8_t)an;
-    if (an && sink(ud, buf, off) != 0) goto out_sink;
+    g.cur = z->soa_index;
+    if (z->has_ext && xext_finish(&x) != 0) goto out;
+    if (gen_put(&g, &recs[z->soa_index]) != 0) goto out;                 /* SOA last */
+    if (g.an && gen_flush(&g) != 0) goto out;
+    *rr_total = g.total;
     rc = 0;
     goto out;
-out_sink:
-    snprintf(err, errlen, "zone '%s': output stopped or size limit exceeded", z->name);
+defs_failed:
+    snprintf(err, errlen, "zone '%s': a tag or location definition does not fit one RR (or out of memory)", z->name);
 out:
-    free(buf);
+    if (rc != 0 && g.sink_failed) snprintf(err, errlen, "zone '%s': output stopped or size limit exceeded", z->name);
+    xext_free(&x);
+    free(g.buf);
     return rc;
 }
 
@@ -1414,15 +1834,7 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
         snprintf(err, errlen, "zone '%s': not converted", z->name);
         return -1;
     }
-    if (!sec && (z->flags & PDNS_F_TINYDNS)) {
-        snprintf(err, errlen, "zone '%s': tinydns zones are encoded in milestone B8", z->name);
-        return -1;
-    }
-    uint64_t rr_count = sec ? 0 : (uint64_t)z->arena.count + 1;
-    if (rr_count > z->opts.max_records) {
-        snprintf(err, errlen, "zone '%s': %llu records exceed max-zone-records", z->name, (unsigned long long)rr_count);
-        return -1;
-    }
+    uint64_t rr_count = 0;       /* every RR of the stream: both SOAs, the rows, and the Extended AXFR records (B8); known after pass 1 */
 
     /* pass 1: digest over the bodies */
     uint8_t digest[KDB_DIGEST_LEN];
@@ -1434,7 +1846,17 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
         return -1;
     }
     const char *profile = p->profile ? p->profile : z->profile;
-    int rc = sec ? 0 : gen_bodies(z, digest_sink, &dd, err, errlen);
+    int rc = sec ? 0 : gen_bodies(z, digest_sink, &dd, &rr_count, err, errlen);
+    if (rc == 0 && rr_count > z->opts.max_records) {
+        snprintf(err, errlen, "zone '%s': %llu records exceed max-zone-records", z->name, (unsigned long long)rr_count);
+        rc = -1;
+    }
+    /* B8: the tinydns flag is part of what the Backend serves (time-dependent TTLs, no response cache) also when no RR carries a time
+     * stamp or a location; the attributes themselves are in the bodies */
+    if (rc == 0 && !sec && (z->flags & PDNS_F_TINYDNS)) {
+        static const uint8_t ftag[] = "KDB1-TINYDNS";
+        if (EVP_DigestUpdate(dd.md, ftag, sizeof(ftag)) != 1) rc = -1;
+    }
     /* B7a: a metadata-only edit (the settings text, the profile that is named, the text of that profile) must change the
      * digest, or the diff would find the zone up to date.  Zones without settings and profile keep the digest of the data
      * alone.  Every field is length-prefixed, so two different splits cannot give the same input. */
@@ -1468,7 +1890,8 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
         kdb_enc_u16(&enc, 1, p->view) != 0 || kdb_enc_name(&enc, 2, z->name) != 0 ||
         kdb_enc_i64(&enc, 3, p->source_id) != 0 || kdb_enc_u8(&enc, 4, sec ? z->zkind : p->zone_kind) != 0 ||
         kdb_enc_u32(&enc, 5, sec ? 0 : z->serial) != 0 ||
-        kdb_enc_u32(&enc, 6, (!sec && (z->flags & PDNS_F_PRESIGNED)) ? KDB_ZF_PRESIGNED : 0) != 0 ||
+        kdb_enc_u32(&enc, 6, sec ? 0 : ((z->flags & PDNS_F_PRESIGNED ? KDB_ZF_PRESIGNED : 0) | (z->has_ext ? KDB_ZF_EXTENDED : 0) |
+                                  (z->flags & PDNS_F_TINYDNS ? KDB_ZF_TINYDNS : 0))) != 0 ||
         kdb_enc_u64(&enc, 7, rr_count) != 0 || kdb_enc_bytes(&enc, 8, digest, KDB_DIGEST_LEN) != 0 ||
         (z->settings && *z->settings && kdb_enc_str(&enc, 9, z->settings) != 0) ||
         (profile && *profile && kdb_enc_str(&enc, 10, profile) != 0) || kdb_enc_end(&enc) != 0 ||
@@ -1476,7 +1899,15 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
         snprintf(err, errlen, "zone '%s': ZONE_BEGIN could not be encoded or sent", z->name);
         goto out;
     }
-    if (!sec && gen_bodies(z, data_sink, &eu, err, errlen) != 0) goto out;
+    if (!sec) {
+        uint64_t again = 0;
+        if (gen_bodies(z, data_sink, &eu, &again, err, errlen) != 0) goto out;
+        if (again != rr_count) {
+            snprintf(err, errlen, "zone '%s': internal error: the second pass wrote %llu RRs, the first %llu", z->name,
+                     (unsigned long long)again, (unsigned long long)rr_count);
+            goto out;
+        }
+    }
     if (kdb_enc_begin(&enc, KDB_T_ZONE_END) != 0 || kdb_enc_u64(&enc, 1, rr_count) != 0 || kdb_enc_end(&enc) != 0 ||
         emit_msg(&eu) != 0) {
         snprintf(err, errlen, "zone '%s': ZONE_END could not be encoded or sent", z->name);

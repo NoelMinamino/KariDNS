@@ -133,22 +133,7 @@ void add_ede(edns_info_t *edns, bool enabled, uint16_t code, const char *text) {
     }
 }
 
-size_t pack_tag_def_rdata(uint8_t *buf, size_t buf_cap, const ecs_tag_def_t *def) {
-  if (!def || !buf) return 0;
-  size_t tag_len = strlen(def->tag) + 1;
-  if (tag_len + 2 > buf_cap) return 0;
-  memcpy(buf, def->tag, tag_len);
-  size_t off = tag_len;
-  buf[off++] = (def->cidr_count >> 8) & 0xFF;
-  buf[off++] = def->cidr_count & 0xFF;
-  for (int j = 0; j < def->cidr_count; j++) {
-    size_t c_len = strlen(def->cidrs[j].cidr) + 1;
-    if (off + c_len > buf_cap) return 0;
-    memcpy(buf + off, def->cidrs[j].cidr, c_len);
-    off += c_len;
-  }
-  return off;
-}
+/* pack_tag_def_rdata() and the 65406 wrapper encoders are in dns_wire.c (shared with karidns-dbloader, xext_*) */
 
 bool unpack_tag_def_rdata(const uint8_t *data, size_t len, ecs_tag_def_t **defs_out, int *count_out) {
   if (!data || len < 3 || !defs_out || !count_out) return false;
@@ -261,70 +246,6 @@ bool unpack_tinydns_loc_rdata(const uint8_t *data, size_t len, tinydns_location_
   *locs_out = new_locs;
   *count_out = cur_count + 1;
   return true;
-}
-
-/* The wrapper record around the RR written at tmp_wire[0, tmp_off) (owner, fixed fields, RDATA compressed against
- * tmp_wire itself): the original TYPE / CLASS / TTL / RDATA, the tinydns location and time stamp. */
-static bool wrap_tinydns_wire(const uint8_t *tmp_wire, uint16_t tmp_off, const char loc[2], int64_t tinydns_ttd,
-                              bool countdown, const char *name, uint32_t ttl_value,
-                              dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap) {
-  size_t p = 0;
-  if (skip_wire_name(tmp_wire, tmp_off, 0, &p) != 0) return false;
-  if (p + 10 > tmp_off) return false;
-  uint16_t orig_type = (tmp_wire[p] << 8) | tmp_wire[p+1];
-  uint16_t orig_class = (tmp_wire[p+2] << 8) | tmp_wire[p+3];
-  uint32_t orig_ttl = ((uint32_t)tmp_wire[p+4] << 24) | ((uint32_t)tmp_wire[p+5] << 16) | ((uint32_t)tmp_wire[p+6] << 8) | tmp_wire[p+7];
-  uint16_t orig_rdlen = (tmp_wire[p+8] << 8) | tmp_wire[p+9];
-  if (p + 10 + orig_rdlen > tmp_off) return false;
-  const uint8_t *orig_rdata = &tmp_wire[p+10];
-
-  size_t total_wrap_len = 21 + orig_rdlen;
-  if (total_wrap_len > wrap_buf_cap) return false;
-
-  wrap_buf[0] = (orig_type >> 8) & 0xFF;
-  wrap_buf[1] = orig_type & 0xFF;
-  wrap_buf[2] = (orig_class >> 8) & 0xFF;
-  wrap_buf[3] = orig_class & 0xFF;
-  wrap_buf[4] = (orig_ttl >> 24) & 0xFF;
-  wrap_buf[5] = (orig_ttl >> 16) & 0xFF;
-  wrap_buf[6] = (orig_ttl >> 8) & 0xFF;
-  wrap_buf[7] = orig_ttl & 0xFF;
-  wrap_buf[8] = (uint8_t)loc[0];
-  wrap_buf[9] = (uint8_t)loc[1];
-  uint64_t ttd = (uint64_t)tinydns_ttd;
-  for (int b = 0; b < 8; b++) {
-    wrap_buf[10 + b] = (ttd >> ((7 - b) * 8)) & 0xFF;
-  }
-  wrap_buf[18] = countdown ? 1 : 0;
-  wrap_buf[19] = (orig_rdlen >> 8) & 0xFF;
-  wrap_buf[20] = orig_rdlen & 0xFF;
-  if (orig_rdlen > 0) {
-    memcpy(&wrap_buf[21], orig_rdata, orig_rdlen);
-  }
-
-  memset(out_wrap, 0, sizeof(*out_wrap));
-  out_wrap->name = (char *)name;
-  out_wrap->type_code = DNS_TYPE_KARIDNS_TINYDNS_WRAP;
-  out_wrap->class_val = DNS_CLASS_KARIDNS_EXT;
-  out_wrap->class_str = "KARIDNS";
-  out_wrap->ttl_value = ttl_value;
-  out_wrap->generic_data = wrap_buf;
-  out_wrap->generic_len = total_wrap_len;
-  return true;
-}
-
-bool wrap_tinydns_record(const dns_record_t *rec, dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap) {
-  if (!rec || !out_wrap || !wrap_buf) return false;
-  uint8_t tmp_wire[4096];
-  uint16_t tmp_off = 0;
-  compress_ctx_t dummy_comp;
-  memset(&dummy_comp, 0, sizeof(dummy_comp));
-  compress_ctx_init_packet(&dummy_comp);
-  if (serialize_dns_record(tmp_wire, sizeof(tmp_wire), &tmp_off, (dns_record_t *)rec, &dummy_comp, NULL, 0xFFFFFFFF) < 0) {
-    return false;
-  }
-  return wrap_tinydns_wire(tmp_wire, tmp_off, rec->tinydns_loc, (int64_t)rec->tinydns_ttd, rec->tinydns_ttl_countdown,
-                           rec->name, rec->ttl_value, out_wrap, wrap_buf, wrap_buf_cap);
 }
 
 /* The same for an RR of an image (Extended AXFR out of a tinydns zone). image_serialize_rr() writes what
@@ -514,7 +435,12 @@ bool is_ecs_trusted_resolver(const zone_image_t *zone, const server_config_t *cf
     count = (zcfg && zext(zcfg)->ecs_trusted_resolvers_parsed) ? zext(zcfg)->ecs_trusted_resolvers_count
                                                          : (cfg ? cfg->ecs_trusted_resolvers_count : 0);
     if (parsed && count > 0) {
-        return check_acl_bin(client_ip, parsed, count);
+        bool match = check_acl_bin(client_ip, parsed, count);
+        /* B8: the list of a database zone (settings text) is bounded by acl-ceiling, as the ACLs of such a zone are: the resolver must
+         * also be inside the ceiling's address list (no ceiling configured: nobody).  The list of karidns.conf is not bounded. */
+        if (match && zcfg && zext(zcfg)->ecs_trusted_resolvers_parsed && zext(zcfg)->db_acl_ceiling)
+            match = db_ceiling_allows_address(cfg, client_ip);
+        return match;
     }
 
     char **resolvers = (zcfg && zext(zcfg)->ecs_trusted_resolvers) ? zext(zcfg)->ecs_trusted_resolvers
@@ -522,7 +448,10 @@ bool is_ecs_trusted_resolver(const zone_image_t *zone, const server_config_t *cf
     count = (zcfg && zext(zcfg)->ecs_trusted_resolvers) ? zext(zcfg)->ecs_trusted_resolvers_count
                                                    : (cfg ? cfg->ecs_trusted_resolvers_count : 0);
     if (!resolvers || count == 0) return false;
-    return check_acl(client_ip, resolvers, count);
+    bool match = check_acl(client_ip, resolvers, count);
+    if (match && zcfg && zext(zcfg)->ecs_trusted_resolvers && zext(zcfg)->db_acl_ceiling)
+        match = db_ceiling_allows_address(cfg, client_ip);
+    return match;
 }
 
 void tinydns_resolve_client_location(const zone_image_t *zone, const char *client_ip,

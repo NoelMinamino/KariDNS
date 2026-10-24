@@ -10,6 +10,7 @@
 #include <time.h>
 
 #include "dns_axfr_ixfr.h"
+#include "dns_db_stream.h"
 #include "dns_dynamic_update.h"
 #include "dns_utils.h"
 #include "dns_wire.h"
@@ -20,16 +21,21 @@ struct db_zone_build {
   axfr_session_t sess;
   char zone[DNS_NAME_TEXT_SIZE];
   uint64_t rr_count;
+  uint32_t flags;               /* ZONE_BEGIN flags (KDB_ZF_*) */
 };
 
 static void set_why(char *why, size_t whylen, const char *msg) {
   if (why && whylen) snprintf(why, whylen, "%s", msg);
 }
 
-db_zone_build_t *db_zone_build_new(const char *zone, uint64_t rr_count) {
+db_zone_build_t *db_zone_build_new(const char *zone, uint64_t rr_count, uint32_t flags) {
   db_zone_build_t *b = calloc(1, sizeof(*b));
   if (!b) return NULL;
   zone_arena_init(&b->arena);
+  b->flags = flags;
+  b->sess.db_stream = true;      /* the strict reading of the Extended AXFR records (dns_server_internal.h) */
+  /* a tinydns zone is a tinydns zone also when no RR carries a time stamp or a location (design 3.6a): ZONE_IMAGE_F_TINYDNS */
+  if (flags & KDB_ZF_TINYDNS) b->arena.is_tinydns_format = true;
   /* a plain AXFR (design 1.5): no IXFR path, no client serial, no version to thaw */
   b->sess.is_ixfr = false;
   b->sess.client_serial = 0;
@@ -51,6 +57,11 @@ int db_zone_build_feed(db_zone_build_t *b, const uint8_t *msg, size_t len, char 
   }
   if (parse_xfr_packet(msg, len, &b->arena, NULL, &b->sess, b->zone) != 0) {
     set_why(why, whylen, "malformed zone data");
+    return -1;
+  }
+  /* the Extended AXFR records (tags, tinydns) are only accepted for a zone that announced them: ZONE_BEGIN flag extended */
+  if (!(b->flags & KDB_ZF_EXTENDED) && (b->sess.ext_records > 0 || b->sess.ext_wrapped > 0)) {
+    set_why(why, whylen, "Extended AXFR records in a zone that did not announce them");
     return -1;
   }
   if (b->sess.out_of_zone_skipped > 0) {
@@ -80,10 +91,10 @@ int db_zone_build_install(db_zone_build_t *b, zone_db_entry_t *entry, bool *noti
     set_why(why, whylen, "zone data ends before the final SOA");
     return -1;
   }
-  /* the parser dropped the final SOA: the declared count has both */
-  if ((uint64_t)a->count + 1 != b->rr_count) {
+  /* the parser dropped the final SOA and the Extended AXFR marker and definition RRs: the declared count has all of them */
+  if ((uint64_t)a->count + 1 + b->sess.ext_records != b->rr_count) {
     snprintf(why, whylen, "RR count mismatch: %llu received, %llu declared",
-             (unsigned long long)a->count + 1, (unsigned long long)b->rr_count);
+             (unsigned long long)a->count + 1 + b->sess.ext_records, (unsigned long long)b->rr_count);
     return -1;
   }
   if (a->count == 0 || a->records[0].type_code != 6 || !domain_names_match_ci(a->records[0].name, b->zone) ||

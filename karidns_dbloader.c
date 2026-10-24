@@ -122,6 +122,147 @@ typedef struct {
 typedef struct { int64_t domain_id; char *kind; char *content; } meta_t;
 typedef struct { meta_t *v; size_t n, cap; bool oom; } mset_t;
 
+/* ---- B8: the rows of karidns_record_tags / karidns_record_tinydns / karidns_zone_tagdefs (design 3.7) ----
+ * Copies, in scan order (domain_id ascending; within a domain the order of the table's scan).  A bulk load keeps the rows of every
+ * zone (x->ext, read only while the conversion threads run); a one-zone read fills the worker's own set. */
+typedef struct { int64_t domain_id, record_id; char *loc, *ecs; } xtag_t;
+typedef struct { int64_t domain_id, record_id; bool ttd_null; int64_t ttd; char *loc; bool countdown; } xtd_t;
+typedef struct { int64_t domain_id; char *kind, *tag, *cidr; } xdef_t;
+typedef struct {
+    xtag_t *tags; size_t nt, ct;
+    xtd_t *td; size_t nd, cd;
+    xdef_t *defs; size_t ng, cg;
+    bool oom;
+} eset_t;
+
+static bool eset_grow(void **v, size_t *cap, size_t n, size_t esz) {
+    if (n < *cap) return true;
+    size_t nc = *cap ? *cap * 2 : 64;
+    void *nv = realloc(*v, nc * esz);
+    if (!nv) return false;
+    *v = nv;
+    *cap = nc;
+    return true;
+}
+
+static char *dup_or_null(const char *s, bool *oom) {
+    if (!s) return NULL;
+    char *d = strdup(s);
+    if (!d) *oom = true;
+    return d;
+}
+
+static int eset_tags_cb(void *ud, int64_t did, const db_tag_row_t *r) {
+    eset_t *e = ud;
+    if (!eset_grow((void **)&e->tags, &e->ct, e->nt, sizeof(*e->tags))) return e->oom = true;
+    xtag_t *t = &e->tags[e->nt];
+    t->domain_id = did;
+    t->record_id = r->record_id;
+    t->loc = dup_or_null(r->location_tag, &e->oom);
+    t->ecs = dup_or_null(r->ecs_tag, &e->oom);
+    if (e->oom) {
+        free(t->loc);
+        free(t->ecs);
+        return 1;
+    }
+    e->nt++;
+    return 0;
+}
+
+static int eset_td_cb(void *ud, int64_t did, const db_tinydns_row_t *r) {
+    eset_t *e = ud;
+    if (!eset_grow((void **)&e->td, &e->cd, e->nd, sizeof(*e->td))) return e->oom = true;
+    xtd_t *t = &e->td[e->nd];
+    t->domain_id = did;
+    t->record_id = r->record_id;
+    t->ttd_null = r->ttd_null;
+    t->ttd = r->ttd;
+    t->countdown = r->countdown;
+    t->loc = dup_or_null(r->loc, &e->oom);
+    if (e->oom) return 1;
+    e->nd++;
+    return 0;
+}
+
+static int eset_def_cb(void *ud, int64_t did, const db_tagdef_row_t *r) {
+    eset_t *e = ud;
+    if (!eset_grow((void **)&e->defs, &e->cg, e->ng, sizeof(*e->defs))) return e->oom = true;
+    xdef_t *t = &e->defs[e->ng];
+    t->domain_id = did;
+    t->kind = dup_or_null(r->kind, &e->oom);
+    t->tag = dup_or_null(r->tag, &e->oom);
+    t->cidr = dup_or_null(r->cidr, &e->oom);
+    if (e->oom) {
+        free(t->kind);
+        free(t->tag);
+        free(t->cidr);
+        return 1;
+    }
+    e->ng++;
+    return 0;
+}
+
+static void eset_reset(eset_t *e) {
+    for (size_t i = 0; i < e->nt; i++) {
+        free(e->tags[i].loc);
+        free(e->tags[i].ecs);
+    }
+    for (size_t i = 0; i < e->nd; i++) free(e->td[i].loc);
+    for (size_t i = 0; i < e->ng; i++) {
+        free(e->defs[i].kind);
+        free(e->defs[i].tag);
+        free(e->defs[i].cidr);
+    }
+    e->nt = e->nd = e->ng = 0;
+    e->oom = false;
+}
+
+static void eset_free(eset_t *e) {
+    eset_reset(e);
+    free(e->tags);
+    free(e->td);
+    free(e->defs);
+    memset(e, 0, sizeof(*e));
+}
+
+/* read the rows of one domain (id) or of every domain (NULL) into e; the driver's return value */
+static int eset_load(const db_driver_t *drv, db_conn_t *conn, const int64_t *id, eset_t *e) {
+    db_ext_sink_t sink = { eset_tags_cb, eset_td_cb, eset_def_cb, e };
+    return drv->scan_ext(conn, id, &sink);
+}
+
+/* first row of the vector with domain_id >= id */
+#define ESET_LOWER(NAME, TYPE, FIELD)                                                                  \
+    static size_t NAME(const TYPE *v, size_t n, int64_t id) {                                          \
+        size_t lo = 0, hi = n;                                                                         \
+        while (lo < hi) {                                                                              \
+            size_t mid = lo + (hi - lo) / 2;                                                           \
+            if (v[mid].domain_id < id) lo = mid + 1;                                                   \
+            else hi = mid;                                                                             \
+        }                                                                                              \
+        return lo;                                                                                     \
+    }
+ESET_LOWER(eset_lower_tags, xtag_t, tags)
+ESET_LOWER(eset_lower_td, xtd_t, td)
+ESET_LOWER(eset_lower_defs, xdef_t, defs)
+
+/* the rows of zone `id` into the reader; the reader checks them (a bad row fails the zone at pdns_zone_finish()) */
+static void eset_feed(const eset_t *e, int64_t id, pdns_zone_t *z) {
+    for (size_t i = eset_lower_tags(e->tags, e->nt, id); i < e->nt && e->tags[i].domain_id == id && !z->failed; i++) {
+        db_tag_row_t r = { e->tags[i].record_id, e->tags[i].loc, e->tags[i].ecs };
+        pdns_zone_add_tags(z, &r);
+    }
+    for (size_t i = eset_lower_td(e->td, e->nd, id); i < e->nd && e->td[i].domain_id == id && !z->failed; i++) {
+        db_tinydns_row_t r = { e->td[i].record_id, e->td[i].ttd_null, e->td[i].ttd, e->td[i].loc, e->td[i].countdown };
+        pdns_zone_add_tinydns(z, &r);
+    }
+    for (size_t i = eset_lower_defs(e->defs, e->ng, id); i < e->ng && e->defs[i].domain_id == id && !z->failed; i++) {
+        db_tagdef_row_t r = { e->defs[i].kind, e->defs[i].tag, e->defs[i].cidr };
+        pdns_zone_add_tagdef(z, &r);
+    }
+}
+
+
 /* What the Backend has (stream mode): one entry per (view, zone name), filled from the Backend's INVENTORY and kept up
  * to date from its ZONE_RESULTs.  A version that was sent but not answered yet is "pending". */
 typedef struct inv_ent {
@@ -158,6 +299,8 @@ typedef struct {
     mset_t meta;
     int64_t *keys;
     size_t nk, kcap;
+    bool has_ext;                     /* B8: the source has the extension tables (check_schema) */
+    eset_t ext;                       /* B8: bulk scan: their rows for every zone (sorted by domain_id) */
     /* B6b: the zones to read (positions in zones[], ascending), the conversion threads, the view mapping */
     size_t *wl;
     size_t nwl;
@@ -621,6 +764,7 @@ typedef struct wk {
     db_conn_t *conn;
     const mset_t *bulk_meta;          /* bulk scan: the metadata of every zone; NULL = read them zone by zone into zmeta */
     mset_t zmeta;
+    eset_t zext;                      /* B8: one-zone reads: the extension rows of the zone */
     size_t wi, wend;                  /* the next position of x->wl to finish, and the end of the task */
     pdns_zone_t *cur;
     bool cur_open;
@@ -638,6 +782,7 @@ static void wk_free(wk_t *w) {
     w->cur = NULL;
     w->cur_open = false;
     mset_free(&w->zmeta);
+    eset_free(&w->zext);
     zres_free(&w->res);
 }
 
@@ -784,6 +929,7 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
             db_meta_row_t row = { zi->id, m->v[mi].kind, m->v[mi].content };
             pdns_zone_add_meta(z, &row);
         }
+        if (skind == KDB_ZK_PRIMARY && x->has_ext) eset_feed(w->bulk_meta ? &x->ext : &w->zext, zi->id, z);      // B8: tags, tinydns attributes, tag definitions
         const char *why = NULL;
         if (pdns_zone_finish(z) != 0) {
             why = z->error;
@@ -937,9 +1083,11 @@ static int run_task(wk_t *w, size_t a, size_t b, bool bulk, bool all) {
         w->wi = pos;
         mset_reset(&w->zmeta);
         bool sec = zone_sec_kind(WZ(w, pos)->type) != KDB_ZK_PRIMARY;      /* B7b: no records are read for a secondary zone */
-        if ((rc = drv->scan_metadata(w->conn, &id, meta_cb, &w->zmeta)) != 0 || (!sec && (rc = drv->scan_records(w->conn, &id, rec_cb, w)) != 0)) {
+        eset_reset(&w->zext);
+        if ((rc = drv->scan_metadata(w->conn, &id, meta_cb, &w->zmeta)) != 0 || (!sec && (rc = drv->scan_records(w->conn, &id, rec_cb, w)) != 0) ||
+            (!sec && w->x->has_ext && (rc = eset_load(drv, w->conn, &id, &w->zext)) != 0)) {
             if (rc == DB_STOPPED) {
-                if (w->zmeta.oom) w->oom = true;
+                if (w->zmeta.oom || w->zext.oom) w->oom = true;
                 return TK_FATAL;
             }
             return db_err_c(drv, w->conn, w->errtext, sizeof(w->errtext), rc, "reading the zone");
@@ -1252,6 +1400,8 @@ static void ctx_view_reset(ctx_t *x) {
     x->zones = NULL;
     x->nz = x->zcap = 0;
     mset_free(&x->meta);
+    eset_free(&x->ext);
+    x->has_ext = false;
     free(x->keys);
     x->keys = NULL;
     x->nk = x->kcap = 0;
@@ -1527,6 +1677,7 @@ static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, boo
         status = db_err(x, rc, "snapshot");
         goto out;
     }
+    x->has_ext = si.has_ext && x->drv->scan_ext;
     rc = x->drv->list_zones(x->conn, zone_cb, x);
     if (rc == DB_STOPPED && x->only_name && x->nz == 1 && !x->oom) rc = 0;     /* the one zone was found */
     if (rc != 0) {
@@ -1585,6 +1736,11 @@ static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, boo
             if ((rc = x->drv->scan_metadata(x->conn, NULL, meta_cb, &x->meta)) != 0) {
                 status = x->meta.oom ? EXIT_ERROR : db_err(x, rc, "reading metadata");
                 if (x->meta.oom) lg(LOG_ERR, "out of memory");
+                goto out_snap;
+            }
+            if (x->has_ext && (rc = eset_load(x->drv, x->conn, NULL, &x->ext)) != 0) {
+                status = x->ext.oom ? EXIT_ERROR : db_err(x, rc, "reading the tags and tinydns attributes");
+                if (x->ext.oom) lg(LOG_ERR, "out of memory");
                 goto out_snap;
             }
         }

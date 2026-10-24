@@ -83,6 +83,7 @@ if [ "$NZ" -ge 15 ]; then ok "$NZ zone files in the reference stream"; else bad 
 import() {     # import DBFILE: the zones of list.txt, in order, plus example.test
     rm -f "$1" "$1-wal" "$1-shm"
     sqlite3 "$1" < "$SCHEMA" > /dev/null || return 1
+    sqlite3 "$1" < "$ROOT/db/karidns_ext.sqlite3.sql" || return 1      # B8: zone2sql writes tags and tinydns attributes into the karidns_* tables
     while read -r f; do
         "$Z2S" --dialect sqlite3 "$f" | sqlite3 "$1" || return 1
     done < "$T/list.txt"

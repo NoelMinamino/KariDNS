@@ -507,6 +507,38 @@ static void test_ecs_trusted_resolver_precedence(void) {
     assert(is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "192.0.2.7"));
     assert(!is_ecs_trusted_resolver(test_zimg(&zone), &cfg, &zcfg, "198.51.100.1"));
 
+    // B8: the list of a database zone is bounded by acl-ceiling (a resolver must be in both); karidns.conf lists are not bounded.
+    {
+        char *dbl[] = { (char *)"198.51.100.0/24", (char *)"192.0.2.0/24" };
+        char *ceil[] = { (char *)"192.0.2.0/24" };
+        tzx(&zcfg)->ecs_trusted_resolvers = dbl;
+        tzx(&zcfg)->ecs_trusted_resolvers_count = 2;
+        tzx(&zcfg)->ecs_trusted_resolvers_parsed = acl_list_parse(dbl, 2);
+        assert(is_ecs_trusted_resolver(NULL, &cfg, &zcfg, "198.51.100.1"));          // karidns.conf zone: no ceiling
+        tzx(&zcfg)->db_acl_ceiling = true;
+        assert(!is_ecs_trusted_resolver(NULL, &cfg, &zcfg, "192.0.2.7"));            // no ceiling configured: nobody
+        cfg.database.enabled = true;
+        cfg.database.acl_ceiling = ceil;
+        cfg.database.acl_ceiling_count = 1;
+        cfg.database.acl_ceiling_parsed = acl_list_parse(ceil, 1);
+        assert(cfg.database.acl_ceiling_parsed != NULL);
+        assert(is_ecs_trusted_resolver(NULL, &cfg, &zcfg, "192.0.2.7"));             // in the list and in the ceiling
+        assert(!is_ecs_trusted_resolver(NULL, &cfg, &zcfg, "198.51.100.1"));         // in the list, outside the ceiling
+        assert(!is_ecs_trusted_resolver(NULL, &cfg, &zcfg, "203.0.113.1"));          // in neither
+        free(zext(&zcfg)->ecs_trusted_resolvers_parsed);
+        tzx(&zcfg)->ecs_trusted_resolvers_parsed = NULL;                             // the textual list is bounded the same way
+        assert(is_ecs_trusted_resolver(NULL, &cfg, &zcfg, "192.0.2.7"));
+        assert(!is_ecs_trusted_resolver(NULL, &cfg, &zcfg, "198.51.100.1"));
+        free(cfg.database.acl_ceiling_parsed);
+        cfg.database.acl_ceiling_parsed = NULL;
+        cfg.database.acl_ceiling = NULL;
+        cfg.database.acl_ceiling_count = 0;
+        cfg.database.enabled = false;
+        tzx(&zcfg)->db_acl_ceiling = false;
+        tzx(&zcfg)->ecs_trusted_resolvers = NULL;
+        tzx(&zcfg)->ecs_trusted_resolvers_count = 0;
+    }
+
     // ACL semantics: first match wins, `!` negates (BIND 9 address_match_list), IPv6 prefixes.
     char *neg[] = { (char *)"!192.0.2.7", (char *)"192.0.2.0/24", (char *)"2001:db8::/32" };
     cfg.ecs_trusted_resolvers = neg;

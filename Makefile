@@ -346,7 +346,7 @@ presigned_test: test_presigned
 
 # test importer: zone file -> SQL for the PowerDNS 5.1 schema (beta design 8.2); built for tests, not installed
 ZONE2SQL_TARGET = tests/db/zone2sql
-ZONE2SQL_SRCS = tests/db/zone2sql.c dns_presigned.c dns_wire.c dns_zone_parser.c dns_utils.c dns_cidr.c
+ZONE2SQL_SRCS = tests/db/zone2sql.c dns_presigned.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c
 
 zone2sql: $(ZONE2SQL_SRCS)
 	$(CC) $(CFLAGS) -I. $(ZONE2SQL_SRCS) -o $(ZONE2SQL_TARGET) $(LDFLAGS) -lcrypto

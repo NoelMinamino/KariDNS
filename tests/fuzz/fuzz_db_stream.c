@@ -185,7 +185,7 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
             zone_ext_shared_unref(zsh);
             zsh = fuzz_settings(&m.u.zone_begin);
             skind = m.u.zone_begin.zone_kind;
-            b = (skind == KDB_ZK_PRIMARY) ? db_zone_build_new(zone, m.u.zone_begin.rr_count) : NULL;
+            b = (skind == KDB_ZK_PRIMARY) ? db_zone_build_new(zone, m.u.zone_begin.rr_count, m.u.zone_begin.flags) : NULL;
             /* B7b: a secondary zone needs masters in its settings and has no data (job_execute_secondary()) */
             if (skind == KDB_ZK_PRIMARY ? !b : !(zsh && zsh->ext.masters_count > 0)) failed = true;
             break;

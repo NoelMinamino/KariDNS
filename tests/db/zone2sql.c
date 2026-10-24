@@ -138,6 +138,107 @@ bool z2s_load_zone_file(const char *path, const char *apex_override, zone_arena_
     return true;
 }
 
+
+/* ---- B8: tinydns data files ---- */
+static bool z2s_tdns_parse(const char *path, const char *origin, const char *const *zones, int nzones, zone_arena_t *arena,
+                           char *err, size_t errlen) {
+    zone_arena_init(arena);
+    char *buf = z2s_read_file(path);
+    struct stat st;
+    if (!buf || stat(path, &st) != 0) {
+        free(buf);
+        snprintf(err, errlen, "cannot read %s", path);
+        return false;
+    }
+    char *display = strdup(buf);
+    char *path_copy = strdup(path);
+    if (!display || !path_copy || zone_arena_add_file(arena, buf, display, path_copy) != 0) {
+        free(display);
+        free(path_copy);
+        free(buf);
+        snprintf(err, errlen, "out of memory");
+        return false;
+    }
+    parse_error_t perr = {0};
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.default_origin = origin;
+    ctx.err_out = &perr;
+    ctx.source_mtime = st.st_mtime;
+    ctx.all_zone_names = (const char **)zones;       /* the parser only reads the names */
+    ctx.all_zone_count = nzones;
+    if (parse_tinydns_data(buf, strlen(buf), arena, &ctx) < 0) {
+        snprintf(err, errlen, "%s: %s", path, perr.error_message ? perr.error_message : "parse error");
+        zone_arena_destroy(arena);
+        return false;
+    }
+    return true;
+}
+
+bool z2s_tinydns_apexes(const char *path, char ***names, int *n, char *err, size_t errlen) {
+    zone_arena_t a;
+    *names = NULL;
+    *n = 0;
+    if (!z2s_tdns_parse(path, ".", NULL, 0, &a, err, errlen)) return false;
+    char **v = calloc(a.count ? a.count : 1, sizeof(char *));
+    if (!v) {
+        zone_arena_destroy(&a);
+        snprintf(err, errlen, "out of memory");
+        return false;
+    }
+    int k = 0;
+    for (size_t i = 0; i < a.count; i++) {
+        if (a.records[i].type_code != 6) continue;
+        bool dup = false;
+        for (int j = 0; j < k; j++)
+            if (strcasecmp(v[j], a.records[i].name) == 0) dup = true;
+        if (!dup && !(v[k] = strdup(a.records[i].name))) {
+            zone_arena_destroy(&a);
+            snprintf(err, errlen, "out of memory");
+            return false;
+        }
+        if (!dup) k++;
+    }
+    zone_arena_destroy(&a);
+    if (k == 0) {
+        free(v);
+        snprintf(err, errlen, "%s: no SOA record (a . or Z line)", path);
+        return false;
+    }
+    *names = v;
+    *n = k;
+    return true;
+}
+
+bool z2s_load_tinydns_file(const char *path, const char *apex_override, const char *const *zones, int nzones, zone_arena_t *arena,
+                           char *apex_out, size_t apex_cap, char *err, size_t errlen) {
+    char apex[DNS_NAME_TEXT_SIZE];
+    if (apex_override) {
+        snprintf(apex, sizeof(apex), "%s", apex_override);
+    } else {
+        char **names;
+        int nn;
+        if (!z2s_tinydns_apexes(path, &names, &nn, err, errlen)) return false;
+        snprintf(apex, sizeof(apex), "%s", names[0]);
+        for (int i = 0; i < nn; i++) free(names[i]);
+        free(names);
+    }
+    size_t al = strlen(apex);
+    if (al == 0 || apex[al - 1] != '.') {                    /* the data file parser wants the absolute form */
+        if (al + 2 > sizeof(apex)) {
+            snprintf(err, errlen, "zone name too long");
+            return false;
+        }
+        apex[al] = '.';
+        apex[al + 1] = '\0';
+    }
+    if (!z2s_tdns_parse(path, apex, zones, nzones, arena, err, errlen)) return false;
+    snprintf(apex_out, apex_cap, "%s", apex);
+    zone_arena_drop_out_of_zone(arena, apex_out, NULL, NULL);
+    zone_arena_drop_unencodable(arena, NULL, NULL);
+    return true;
+}
+
 /* ------------------------------------------------------------------------------------------------------------- */
 /* rows                                                                                                           */
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -292,6 +393,8 @@ static bool record_content(const dns_record_t *r, dstr_t *out, long *prio, char 
     return !out->oom;
 }
 
+static bool z2s_pool_dup(z2s_rows_t *o, const char *s, const char **out);
+
 static bool pool_add(z2s_rows_t *o, char *s) {
     if (o->n_pool >= o->cap_pool) {
         size_t nc = o->cap_pool ? o->cap_pool * 2 : 64;
@@ -310,10 +413,46 @@ void z2s_rows_free(z2s_rows_t *r) {
     free(r->rows);
     free(r->auth);
     free(r->nsec3param);
+    free(r->tags);
+    free(r->td);
+    free(r->defs);
     memset(r, 0, sizeof(*r));
 }
 
 /* B5: the presigned layout (design 3.6, 8.2) is made by z2s_make_presigned() below, at the end of z2s_rows_from_arena(). */
+
+/* B8: the tag definitions ($LOCATION-TAG, $ECS-SUBNET-TAG) and the tinydns location definitions (% lines) of the zone, one row per CIDR */
+static bool z2s_def_add(z2s_rows_t *o, size_t *cap, const char *kind, const char *tag, const char *cidr) {
+    if (o->ndefs >= *cap) {
+        size_t nc = *cap ? *cap * 2 : 16;
+        z2s_def_t *nd = realloc(o->defs, nc * sizeof(*nd));
+        if (!nd) return false;
+        o->defs = nd;
+        *cap = nc;
+    }
+    z2s_def_t *d = &o->defs[o->ndefs];
+    d->kind = kind;                                 /* a string literal */
+    if (!z2s_pool_dup(o, tag, &d->tag) || !z2s_pool_dup(o, cidr, &d->cidr)) return false;
+    o->ndefs++;
+    return true;
+}
+
+static bool z2s_defs_from_arena(z2s_rows_t *o, const zone_arena_t *a) {
+    size_t cap = 0;
+    for (int i = 0; i < a->bind_location_tag_count; i++)
+        for (int j = 0; j < a->bind_location_tags[i].cidr_count; j++)
+            if (!z2s_def_add(o, &cap, "location", a->bind_location_tags[i].tag, a->bind_location_tags[i].cidrs[j].cidr)) return false;
+    for (int i = 0; i < a->bind_ecs_tag_count; i++)
+        for (int j = 0; j < a->bind_ecs_tags[i].cidr_count; j++)
+            if (!z2s_def_add(o, &cap, "ecs", a->bind_ecs_tags[i].tag, a->bind_ecs_tags[i].cidrs[j].cidr)) return false;
+    for (int i = 0; i < a->location_count; i++) {
+        const tinydns_location_entry_t *l = &a->locations[i];
+        char code[3] = { l->code[0], l->code[1], '\0' }, cidr[24];
+        snprintf(cidr, sizeof(cidr), "%u.%u.%u.%u/%u", l->prefix[0], l->prefix[1], l->prefix[2], l->prefix[3], l->prefix_bits);
+        if (!z2s_def_add(o, &cap, "tinydns", code, cidr)) return false;
+    }
+    return true;
+}
 
 bool z2s_rows_from_arena(zone_arena_t *arena, const char *apex, z2s_rows_t *out, char *err, size_t errlen) {
     memset(out, 0, sizeof(*out));
@@ -385,13 +524,34 @@ bool z2s_rows_from_arena(zone_arena_t *arena, const char *apex, z2s_rows_t *out,
         row->prio = prio;
         row->ttl_null = row->prio_null = row->disabled = false;
         if (r->type_code == 46 || r->type_code == 47 || r->type_code == 50) out->signed_zone = true;
+        if (r->bind_location_tag || r->ecs_subnet_tag) {                // B8: karidns_record_tags
+            if (!out->tags && !(out->tags = calloc(arena->count, sizeof(*out->tags)))) goto oom_ext;
+            if ((r->bind_location_tag && !z2s_pool_dup(out, r->bind_location_tag, &out->tags[out->n].loc)) ||
+                (r->ecs_subnet_tag && !z2s_pool_dup(out, r->ecs_subnet_tag, &out->tags[out->n].ecs)))
+                goto oom_ext;
+        }
+        if (r->tinydns_ttd || r->tinydns_loc[0] || r->tinydns_loc[1]) {  // B8: karidns_record_tinydns
+            if (!out->td && !(out->td = calloc(arena->count, sizeof(*out->td)))) goto oom_ext;
+            z2s_td_t *t = &out->td[out->n];
+            t->has = true;
+            t->ttd = (int64_t)r->tinydns_ttd;
+            t->countdown = r->tinydns_ttl_countdown;
+            t->loc[0] = r->tinydns_loc[0];
+            t->loc[1] = r->tinydns_loc[1];
+        }
         out->n++;
     }
+    out->tinydns = arena->is_tinydns_format;
+    if (!z2s_defs_from_arena(out, arena)) goto oom_ext;
     if (!z2s_plain_signed && !z2s_make_presigned(out, err, errlen)) {
         z2s_rows_free(out);
         return false;
     }
     return true;
+oom_ext:
+    snprintf(err, errlen, "out of memory");
+    z2s_rows_free(out);
+    return false;
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -506,6 +666,8 @@ bool z2s_make_presigned(z2s_rows_t *o, char *err, size_t errlen) {
     z2s_set_t deleg = {0}, ds = {0}, all = {0}, ents = {0};
     db_record_row_t *nr = NULL;
     uint8_t *na = NULL;
+    z2s_tag_t *ntag = NULL;
+    z2s_td_t *ntd = NULL;
     size_t nn = 0, n_ents_out = 0;
     bool ok = false;
     char hash[33], rel[600], abs[DNS_NAME_TEXT_SIZE + 2];
@@ -545,6 +707,8 @@ bool z2s_make_presigned(z2s_rows_t *o, char *err, size_t errlen) {
     nr = calloc(o->n + ents.n + 1, sizeof(*nr));
     na = calloc(o->n + ents.n + 1, 1);
     if (!nr || !na) goto oom;
+    if (o->tags && !(ntag = calloc(o->n + ents.n + 1, sizeof(*ntag)))) goto oom;
+    if (o->td && !(ntd = calloc(o->n + ents.n + 1, sizeof(*ntd)))) goto oom;
     for (size_t i = 0; i < o->n; i++) {
         db_record_row_t *r = &o->rows[i];
         const char *ty = r->type ? r->type : "";
@@ -552,6 +716,8 @@ bool z2s_make_presigned(z2s_rows_t *o, char *err, size_t errlen) {
         if (!mode3 && strcmp(ty, "NSEC") == 0) continue;
         db_record_row_t *d = &nr[nn];
         *d = *r;
+        if (o->tags) ntag[nn] = o->tags[i];                      // B8: the attributes stay with their row
+        if (o->td) ntd[nn] = o->td[i];
         d->ordername = NULL;
         na[nn] = 1;
         bool is_rrsig = strcmp(ty, "RRSIG") == 0;
@@ -597,6 +763,16 @@ bool z2s_make_presigned(z2s_rows_t *o, char *err, size_t errlen) {
     free(o->auth);
     o->auth = na;
     na = NULL;
+    if (o->tags) {
+        free(o->tags);
+        o->tags = ntag;
+        ntag = NULL;
+    }
+    if (o->td) {
+        free(o->td);
+        o->td = ntd;
+        ntd = NULL;
+    }
     o->presigned = true;
     if (mode3) {
         o->nsec3param = strdup(meta);
@@ -613,7 +789,31 @@ done:
     free(ents.v);
     free(nr);
     free(na);
+    free(ntag);
+    free(ntd);
     return ok;
+}
+
+int z2s_feed_ext(const z2s_rows_t *r, pdns_zone_t *z) {
+    if (r->tinydns) {
+        db_meta_row_t m = { 1, "X-KARIDNS-FORMAT", "tinydns" };
+        if (pdns_zone_add_meta(z, &m) != 0) return -1;
+    }
+    for (size_t i = 0; i < r->n; i++) {
+        if (r->tags && (r->tags[i].loc || r->tags[i].ecs)) {
+            db_tag_row_t t = { r->rows[i].id, r->tags[i].loc, r->tags[i].ecs };
+            if (pdns_zone_add_tags(z, &t) != 0) return -1;
+        }
+        if (r->td && r->td[i].has) {
+            db_tinydns_row_t t = { r->rows[i].id, false, r->td[i].ttd, r->td[i].loc[0] ? r->td[i].loc : NULL, r->td[i].countdown };
+            if (pdns_zone_add_tinydns(z, &t) != 0) return -1;
+        }
+    }
+    for (size_t i = 0; i < r->ndefs; i++) {
+        db_tagdef_row_t d = { r->defs[i].kind, r->defs[i].tag, r->defs[i].cidr };
+        if (pdns_zone_add_tagdef(z, &d) != 0) return -1;
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -663,6 +863,33 @@ void z2s_print_sql(FILE *fp, z2s_dialect_t d, const z2s_rows_t *r) {
         fprintf(fp, ", %s, %s, ", f, (!r->auth || r->auth[i]) ? t : f);
         sql_val(fp, row->ordername);
         fputs(");\n", fp);
+        const char *last = d == Z2S_PGSQL ? "currval(pg_get_serial_sequence('records', 'id'))" : "last_insert_rowid()";
+        if (r->tags && (r->tags[i].loc || r->tags[i].ecs)) {                    /* B8: the row just inserted */
+            fprintf(fp, "INSERT INTO karidns_record_tags (record_id, location_tag, ecs_tag) VALUES (%s, ", last);
+            sql_val(fp, r->tags[i].loc);
+            fputs(", ", fp);
+            sql_val(fp, r->tags[i].ecs);
+            fputs(");\n", fp);
+        }
+        if (r->td && r->td[i].has) {
+            fprintf(fp, "INSERT INTO karidns_record_tinydns (record_id, ttd, loc, countdown) VALUES (%s, %lld, ", last, (long long)r->td[i].ttd);
+            sql_val(fp, r->td[i].loc[0] ? r->td[i].loc : NULL);
+            fprintf(fp, ", %s);\n", r->td[i].countdown ? t : f);
+        }
+    }
+    for (size_t i = 0; i < r->ndefs; i++) {                                     /* B8: tag definitions, in definition order */
+        fputs("INSERT INTO karidns_zone_tagdefs (domain_id, kind, tag, cidr) VALUES ((SELECT id FROM domains WHERE name = ", fp);
+        sql_str(fp, r->zone);
+        fprintf(fp, "), '%s', ", r->defs[i].kind);
+        sql_str(fp, r->defs[i].tag);
+        fputs(", ", fp);
+        sql_str(fp, r->defs[i].cidr);
+        fputs(");\n", fp);
+    }
+    if (r->tinydns) {
+        fputs("INSERT INTO domainmetadata (domain_id, kind, content) VALUES ((SELECT id FROM domains WHERE name = ", fp);
+        sql_str(fp, r->zone);
+        fputs("), 'X-KARIDNS-FORMAT', 'tinydns');\n", fp);
     }
     if (r->presigned) {
         fputs("INSERT INTO domainmetadata (domain_id, kind, content) VALUES ((SELECT id FROM domains WHERE name = ", fp);
@@ -683,6 +910,7 @@ void z2s_print_sql(FILE *fp, z2s_dialect_t d, const z2s_rows_t *r) {
 int main(int argc, char **argv) {
     z2s_dialect_t dialect = Z2S_SQLITE3;
     const char *apex_override = NULL;
+    bool tinydns = false;
     int i = 1;
     for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
         if (strcmp(argv[i], "--dialect") == 0 && i + 1 < argc) {
@@ -691,6 +919,14 @@ int main(int argc, char **argv) {
             else if (strcmp(argv[i], "pgsql") == 0) dialect = Z2S_PGSQL;
             else {
                 fprintf(stderr, "zone2sql: unknown dialect '%s' (sqlite3 or pgsql)\n", argv[i]);
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
+            i++;
+            if (strcmp(argv[i], "tinydns") == 0) tinydns = true;
+            else if (strcmp(argv[i], "bind") == 0) tinydns = false;
+            else {
+                fprintf(stderr, "zone2sql: unknown format '%s' (bind or tinydns)\n", argv[i]);
                 return 2;
             }
         } else if (strcmp(argv[i], "--plain-signed") == 0) {
@@ -706,8 +942,10 @@ int main(int argc, char **argv) {
     }
     if (i >= argc) {
     usage:
-        fprintf(stderr, "usage: zone2sql --dialect sqlite3|pgsql [--zone NAME.] [--plain-signed] zonefile...\n"
-                        "  Writes SQL for the PowerDNS 5.1 schema (domains + records) to stdout, one transaction per file.\n"
+        fprintf(stderr, "usage: zone2sql --dialect sqlite3|pgsql [--format bind|tinydns] [--zone NAME.] [--plain-signed] zonefile...\n"
+                        "  Writes SQL for the PowerDNS 5.1 schema (domains + records) to stdout, one transaction per zone.\n"
+                        "  $LOCATION / $ECS-SUBNET tags, tag definitions, tinydns time stamps and locations go into the karidns_* tables\n"
+                        "  (db/karidns_ext.*.sql must be applied first); --format tinydns reads a tinydns data file (every zone with an SOA).\n"
                         "  A zone that holds NSEC3 or NSEC records is written the way PowerDNS 5.1 stores a presigned zone (PRESIGNED\n"
                         "  metadata, NSEC3PARAM metadata, no NSEC3 / NSEC3PARAM / NSEC rows, ordername, ENT rows);\n"
                         "  --plain-signed writes the DNSSEC records as ordinary rows instead.\n"
@@ -716,23 +954,49 @@ int main(int argc, char **argv) {
     }
     int rc = 0;
     for (; i < argc; i++) {
-        zone_arena_t arena;
-        char apex[DNS_NAME_TEXT_SIZE], err[400];
-        if (!z2s_load_zone_file(argv[i], apex_override, &arena, apex, sizeof(apex), err, sizeof(err))) {
-            fprintf(stderr, "zone2sql: %s\n", err);
-            rc = 1;
-            continue;
+        /* a tinydns data file can hold several zones: one SQL transaction per zone (the apex of every SOA), and a record of a child zone
+         * is left out of its parent, as the server loads a data file whose zones are all configured */
+        char **names = NULL;
+        int nnames = 0;
+        char err[400];
+        if (tinydns) {
+            if (apex_override) {
+                names = malloc(sizeof(char *));
+                if (!names || !(names[0] = strdup(apex_override))) {
+                    fprintf(stderr, "zone2sql: out of memory\n");
+                    return 1;
+                }
+                nnames = 1;
+            } else if (!z2s_tinydns_apexes(argv[i], &names, &nnames, err, sizeof(err))) {
+                fprintf(stderr, "zone2sql: %s\n", err);
+                rc = 1;
+                continue;
+            }
         }
-        z2s_rows_t rows;
-        if (!z2s_rows_from_arena(&arena, apex, &rows, err, sizeof(err))) {
-            fprintf(stderr, "zone2sql: %s: %s\n", argv[i], err);
+        for (int zi = 0; zi < (tinydns ? nnames : 1); zi++) {
+            zone_arena_t arena;
+            char apex[DNS_NAME_TEXT_SIZE];
+            bool ok = tinydns ? z2s_load_tinydns_file(argv[i], names[zi], (const char *const *)names, nnames, &arena, apex, sizeof(apex), err,
+                                                      sizeof(err))
+                              : z2s_load_zone_file(argv[i], apex_override, &arena, apex, sizeof(apex), err, sizeof(err));
+            if (!ok) {
+                fprintf(stderr, "zone2sql: %s\n", err);
+                rc = 1;
+                continue;
+            }
+            z2s_rows_t rows;
+            if (!z2s_rows_from_arena(&arena, apex, &rows, err, sizeof(err))) {
+                fprintf(stderr, "zone2sql: %s: %s\n", argv[i], err);
+                zone_arena_destroy(&arena);
+                rc = 1;
+                continue;
+            }
+            z2s_print_sql(stdout, dialect, &rows);
+            z2s_rows_free(&rows);
             zone_arena_destroy(&arena);
-            rc = 1;
-            continue;
         }
-        z2s_print_sql(stdout, dialect, &rows);
-        z2s_rows_free(&rows);
-        zone_arena_destroy(&arena);
+        for (int zi = 0; zi < nnames; zi++) free(names[zi]);
+        free(names);
     }
     return rc;
 }

@@ -1757,7 +1757,8 @@ static int unknown_statement(token_ctx_t *ctx, const char *kind, const char *nam
 static const char *const k_db_zone_statements[] = {
   "allow-transfer", "allow-update", "also-notify", "tsig-key", "notify-retries", "notify-retry-interval",
   "notify-retry-backoff", "ixfr-history", "additional-from-auth", "disable-auto-tc-flag", "zone-udp-bufsize",
-  "zone-tcp-mss", "zone-tcp-window", "zone-tcp-sndbuf", "transfer-acl-match", "update-acl-match", "masters", "primaries", NULL
+  "zone-tcp-mss", "zone-tcp-window", "zone-tcp-sndbuf", "transfer-acl-match", "update-acl-match", "masters", "primaries",
+  "ecs-trusted-resolvers", NULL
 };
 
 /* The statement `key` is about to be read in restricted mode: refuse it unless it is on the list, and forget what an
@@ -1798,6 +1799,13 @@ static bool restricted_statement(token_ctx_t *ctx, zone_ext_t *x, const char *ke
   } else if (strcmp(key, "tsig-key") == 0) {
     free(x->tsig_key);
     x->tsig_key = NULL;
+  } else if (strcmp(key, "ecs-trusted-resolvers") == 0) {         /* B8: the later statement replaces the earlier one */
+    for (int i = 0; i < x->ecs_trusted_resolvers_count; i++) free(x->ecs_trusted_resolvers[i]);
+    free(x->ecs_trusted_resolvers);
+    free(x->ecs_trusted_resolvers_parsed);
+    x->ecs_trusted_resolvers = NULL;
+    x->ecs_trusted_resolvers_parsed = NULL;
+    x->ecs_trusted_resolvers_count = 0;
   } else if (strcmp(key, "masters") == 0 || strcmp(key, "primaries") == 0) {
     for (int i = 0; i < x->masters_count; i++) free(x->masters[i].ip);
     free(x->masters);
@@ -2362,7 +2370,8 @@ zone_ext_shared_t *db_settings_parse(const char *text, size_t len, char *err, si
     } else if (!trailing) {
       const char *bad = NULL;
       if (!db_acl_entries_ok(ox->allow_transfer, ox->allow_transfer_count, false, err, errlen, "allow-transfer") ||
-          !db_acl_entries_ok(ox->allow_update, ox->allow_update_count, true, err, errlen, "allow-update"))
+          !db_acl_entries_ok(ox->allow_update, ox->allow_update_count, true, err, errlen, "allow-update") ||
+          !db_acl_entries_ok(ox->ecs_trusted_resolvers, ox->ecs_trusted_resolvers_count, false, err, errlen, "ecs-trusted-resolvers"))
         bad = err;
       for (int i = 0; !bad && i < ox->also_notify_count; i++)
         if (!db_ip_literal_ok(ox->also_notify[i].ip)) {

@@ -137,7 +137,13 @@ static int cmd_ref(const char *out_path, const char *list_path, uint32_t default
         size_t nmeta = 0;
         if (rows.presigned) meta[nmeta++] = (db_meta_row_t){ 1, "PRESIGNED", "1" };
         if (rows.nsec3param) meta[nmeta++] = (db_meta_row_t){ 1, "NSEC3PARAM", rows.nsec3param };
-        int rc = z ? pdns_zone_convert(z, rows.rows, rows.n, meta, nmeta) : -1;
+        int rc = z ? 0 : -1;
+        for (size_t k = 0; rc == 0 && k < rows.n; k++)
+            if (pdns_zone_add_record(z, &rows.rows[k]) != 0) rc = -1;
+        for (size_t k = 0; rc == 0 && k < nmeta; k++)
+            if (pdns_zone_add_meta(z, &meta[k]) != 0) rc = -1;
+        if (rc == 0 && z2s_feed_ext(&rows, z) != 0) rc = -1;        // B8: tags, tinydns attributes, tag definitions
+        if (rc == 0) rc = pdns_zone_finish(z);
         buf_t zb = {0};
         char why[400] = "";
         if (rc == 0) {

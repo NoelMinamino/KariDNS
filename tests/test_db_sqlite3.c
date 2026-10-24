@@ -845,6 +845,81 @@ static void test_range_views(void) {
     sqlite3_close(db);
 }
 
+/* B8: scan_ext reads the three extension tables, one domain or all */
+typedef struct { int tags, td, defs; int64_t last_tag_did, last_rec; char kinds[200]; bool ordered; int64_t prev_did; } ext_collect_t;
+static int ext_tags(void *ud, int64_t did, const db_tag_row_t *r) {
+    ext_collect_t *x = ud;
+    x->tags++;
+    x->last_tag_did = did;
+    x->last_rec = r->record_id;
+    if (did < x->prev_did) x->ordered = false;
+    x->prev_did = did;
+    return 0;
+}
+static int ext_td(void *ud, int64_t did, const db_tinydns_row_t *r) {
+    ext_collect_t *x = ud;
+    (void)did;
+    x->td++;
+    if (r->ttd_null && !r->loc) x->ordered = false;
+    return 0;
+}
+static int ext_def(void *ud, int64_t did, const db_tagdef_row_t *r) {
+    ext_collect_t *x = ud;
+    (void)did;
+    x->defs++;
+    strncat(x->kinds, r->cidr, sizeof(x->kinds) - strlen(x->kinds) - 2);
+    strcat(x->kinds, ",");
+    return 0;
+}
+static int ext_stop(void *ud, int64_t did, const db_tag_row_t *r) { (void)ud; (void)did; (void)r; return 1; }
+
+static void test_ext_tables(void) {
+    printf("scan_ext\n");
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("ext.db", path, sizeof(path));
+    add_simple_zone(db, 1, 10, "e1.test");
+    add_simple_zone(db, 2, 20, "e2.test");
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (!c) { sqlite3_close(db); return; }
+    db_schema_info_t si;
+    CHECK(db_driver_sqlite3.check_schema(c, &si) == 0 && !si.has_ext);
+    db_ext_sink_t none_sink = { ext_tags, ext_td, ext_def, NULL };
+    CHECK(db_driver_sqlite3.scan_ext(c, NULL, &none_sink) == DB_ERR_UNAVAILABLE);
+    db_driver_sqlite3.close(c);
+
+    raw_exec(db, "CREATE TABLE karidns_record_tags (record_id INTEGER PRIMARY KEY, location_tag VARCHAR(63), ecs_tag VARCHAR(63))");
+    raw_exec(db, "CREATE TABLE karidns_record_tinydns (record_id INTEGER PRIMARY KEY, ttd BIGINT, loc CHAR(2), countdown BOOLEAN NOT NULL DEFAULT 0)");
+    raw_exec(db, "CREATE TABLE karidns_zone_tagdefs (domain_id INTEGER NOT NULL, kind VARCHAR(8) NOT NULL, tag VARCHAR(63) NOT NULL, cidr VARCHAR(64) NOT NULL)");
+    raw_exec(db, "INSERT INTO karidns_record_tags VALUES (21, 'lan', NULL), (12, NULL, 'east'), (22, 'wan', 'west')");
+    raw_exec(db, "INSERT INTO karidns_record_tinydns VALUES (11, 2147483647, 'l2', 1), (12, NULL, 'lw', 0)");
+    raw_exec(db, "INSERT INTO karidns_zone_tagdefs VALUES (2, 'tinydns', 'l2', '127.0.0.2/32'), (1, 'location', 'a', '192.0.2.0/24'), (1, 'location', 'a', '198.51.100.0/24')");
+    c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (!c) { sqlite3_close(db); return; }
+    CHECK(db_driver_sqlite3.check_schema(c, &si) == 0 && si.has_ext);
+    CHECK(db_driver_sqlite3.begin_snapshot(c) == 0);
+    ext_collect_t x;
+    memset(&x, 0, sizeof(x));
+    x.ordered = true;
+    db_ext_sink_t sink = { ext_tags, ext_td, ext_def, &x };
+    CHECK(db_driver_sqlite3.scan_ext(c, NULL, &sink) == 0);
+    CHECK_MSG(x.tags == 3 && x.td == 2 && x.defs == 3, "%d %d %d", x.tags, x.td, x.defs);
+    CHECK(x.ordered);
+    CHECK_MSG(strcmp(x.kinds, "192.0.2.0/24,198.51.100.0/24,127.0.0.2/32,") == 0, "definitions in domain, insertion order: %s", x.kinds);
+    memset(&x, 0, sizeof(x));
+    x.ordered = true;
+    int64_t d1 = 1;
+    CHECK(db_driver_sqlite3.scan_ext(c, &d1, &sink) == 0);
+    CHECK_MSG(x.tags == 1 && x.td == 2, "rows of domain 1: %d tags, %d tinydns", x.tags, x.td);
+    CHECK(x.defs == 2);
+    CHECK(db_driver_sqlite3.scan_ext(c, NULL, &(db_ext_sink_t){ ext_stop, ext_td, ext_def, NULL }) == DB_STOPPED);
+    CHECK(db_driver_sqlite3.scan_ext(c, NULL, &sink) == 0);       /* usable again after a stopped scan */
+    CHECK(db_driver_sqlite3.end_snapshot(c) == 0);
+    db_driver_sqlite3.close(c);
+    sqlite3_close(db);
+}
+
 static void test_dump(void) {
     printf("dump\n");
     char path[600];
@@ -960,6 +1035,7 @@ int main(int argc, char **argv) {
     test_busy();
     test_changes();
     test_range_views();
+    test_ext_tables();
     test_dump();
     free(g_schema_sql);
     rm_tree(g_dir);

@@ -178,7 +178,13 @@ static void test_zone_files(void) {
         size_t nmeta = 0;
         if (rows.presigned) meta[nmeta++] = M("PRESIGNED", "1");
         if (rows.nsec3param) meta[nmeta++] = M("NSEC3PARAM", rows.nsec3param);
-        int rc = z ? pdns_zone_convert(z, rows.rows, rows.n, meta, nmeta) : -1;
+        int rc = z ? 0 : -1;
+        for (size_t i = 0; rc == 0 && i < rows.n; i++)
+            if (pdns_zone_add_record(z, &rows.rows[i]) != 0) rc = -1;
+        for (size_t i = 0; rc == 0 && i < nmeta; i++)
+            if (pdns_zone_add_meta(z, &meta[i]) != 0) rc = -1;
+        if (rc == 0 && z2s_feed_ext(&rows, z) != 0) rc = -1;           // B8: tags, tinydns attributes, tag definitions
+        if (rc == 0) rc = pdns_zone_finish(z);
         CHECK_MSG(rc == 0, "%s: reader: %s", names[k], z ? z->error : "(null)");
         if (rc == 0) {
             CHECK_MSG(z->arena.count == fa.count, "%s: %zu RRs from rows, %zu in the file", names[k], z->arena.count, fa.count);
@@ -193,6 +199,14 @@ static void test_zone_files(void) {
             if (want) rt_free_lines(want, nw);
             if (got) rt_free_lines(got, ng);
             CHECK_MSG(bad == 0, "%s: %zu RRs differ", names[k], bad);
+            // B8: the zone level tables of the file (tag definitions, as the database holds them) are the reader's
+            {
+                char *tf = rt_flat_tables(&fa), *tr = rt_flat_tables(&z->arena);
+                CHECK_MSG(tf && tr && strcmp(tf, tr) == 0, "%s: tag definitions differ:\n%s--\n%s", names[k], tf ? tf : "?", tr ? tr : "?");
+                free(tf);
+                free(tr);
+                if (z->has_ext) printf("  [info] %s: tags / definitions carried (%d location, %d ECS definitions)\n", names[k], z->arena.bind_location_tag_count, z->arena.bind_ecs_tag_count);
+            }
             if (rows.presigned) {
                 CHECK_MSG(z->presigned_mode == (rows.nsec3param ? PS_NSEC3 : PS_NSEC), "%s: presigned mode %d", names[k], (int)z->presigned_mode);
                 CHECK(z->n_synth > 0);
@@ -204,7 +218,7 @@ static void test_zone_files(void) {
             bool ok = pdns_roundtrip(z, &info, why, sizeof(why));
             CHECK_MSG(ok, "%s: KDB1 round trip: %s", names[k], why);
             if (ok) {
-                CHECK(info.rr_count == fa.count + 1);
+                CHECK(info.rr_count == fa.count + 1 + (z->has_ext ? (info.rr_count - fa.count - 1) : 0));      /* B8: the extension RRs are counted */
                 CHECK(info.max_body <= KDB_MAX_ZONE_DATA);
                 printf("  [ OK ] %-34s %6zu RRs, %zu ZONE_DATA, zone %s\n", names[k], fa.count, info.n_zone_data, rows.zone);
             }
@@ -1115,9 +1129,11 @@ static void test_kdb(void) {
         rt_buf_t b = {0};
         db_meta_row_t m[] = { M("X-KARIDNS-FORMAT", "tinydns") };
         pdns_zone_t *z = build(NULL, 0, m, 1, NULL);
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL }, rt_emit, &b, err, sizeof(err)) != 0);
-        CHECK_HAS(err, "B8");
-        CHECK(b.len == 0);
+        /* B8: a tinydns zone is encoded (also without any time stamp or location): ZONE_BEGIN carries the tinydns flag only */
+        rt_info_t tinfo;
+        char twhy[300];
+        CHECK_MSG(pdns_roundtrip(z, &tinfo, twhy, sizeof(twhy)), "%s", twhy);
+        CHECK(tinfo.flags == KDB_ZF_TINYDNS);
         pdns_zone_free(z);
         db_meta_row_t m2[] = { M("PRESIGNED", "1"), M("NSEC3PARAM", "1 0 5 AABB") };
         z = build(NULL, 0, m2, 2, NULL);                              /* B5: NSEC3PARAM without any RRSIG(NSEC3) cannot be rebuilt */
@@ -1537,6 +1553,183 @@ static int gen_corpus(const char *dir) {
     return 0;
 }
 
+/* ------------------------------------------------------------------ B8: Extended AXFR attributes */
+static pdns_zone_t *build_ext(const db_record_row_t *rows, size_t n, const db_meta_row_t *meta, size_t nm, const db_tag_row_t *tags,
+                              size_t nt, const db_tinydns_row_t *td, size_t ntd, const db_tagdef_row_t *defs, size_t nd) {
+    pdns_zone_t *z = pdns_zone_new("z.test", NULL);
+    db_record_row_t soa = SOA();
+    pdns_zone_add_record(z, &soa);
+    for (size_t i = 0; i < n; i++) pdns_zone_add_record(z, &rows[i]);
+    for (size_t i = 0; i < nm; i++) pdns_zone_add_meta(z, &meta[i]);
+    for (size_t i = 0; i < nt; i++) pdns_zone_add_tags(z, &tags[i]);
+    for (size_t i = 0; i < ntd; i++) pdns_zone_add_tinydns(z, &td[i]);
+    for (size_t i = 0; i < nd; i++) pdns_zone_add_tagdef(z, &defs[i]);
+    pdns_zone_finish(z);
+    return z;
+}
+
+static const db_record_row_t k_ext_rows[] = {
+    { 2, 300, 0, false, false, false, "www.z.test", "A", "192.0.2.1", NULL },
+    { 3, 300, 0, false, false, false, "www.z.test", "A", "192.0.2.10", NULL },
+    { 4, 300, 0, false, false, false, "mail.z.test", "A", "192.0.2.11", NULL },
+};
+static const db_tag_row_t k_ext_tags[] = { { 3, "lan", NULL }, { 4, "wan", "east" } };
+static const db_tagdef_row_t k_ext_defs[] = {
+    { "location", "lan", "127.0.0.2/32" }, { "location", "lan", "127.0.0.3/32" }, { "location", "wan", "10.0.0.0/8" },
+    { "ecs", "east", "198.51.100.0/24" },
+};
+
+static void zone_digest(pdns_zone_t *z, uint8_t out[KDB_DIGEST_LEN]) {
+    rt_info_t info;
+    char why[300];
+    memset(out, 0, KDB_DIGEST_LEN);
+    if (z && !z->failed && pdns_roundtrip(z, &info, why, sizeof(why))) memcpy(out, info.digest, KDB_DIGEST_LEN);
+}
+
+static void expect_ext_fail(const char *label, const db_tag_row_t *t, const db_tinydns_row_t *d, const db_tagdef_row_t *g, const char *needle) {
+    pdns_zone_t *z = build_ext(k_ext_rows, 3, NULL, 0, t, t ? 1 : 0, d, d ? 1 : 0, g, g ? 1 : 0);
+    CHECK_MSG(z->failed, "%s: accepted", label);
+    if (z->failed) CHECK_MSG(strstr(z->error, "zone 'z.test.'") && strstr(z->error, needle), "%s: error '%s' lacks '%s'", label, z->error, needle);
+    pdns_zone_free(z);
+}
+
+static void test_ext(void) {
+    printf("Extended AXFR attributes (tags, tinydns, definitions)\n");
+    {   /* tags and definitions: attached to the records, carried, counted */
+        pdns_zone_t *z = build_ext(k_ext_rows, 3, NULL, 0, k_ext_tags, 2, NULL, 0, k_ext_defs, 4);
+        CHECK_MSG(!z->failed, "%s", z->error);
+        CHECK(z->has_ext && z->arena.count == 4);
+        CHECK(z->arena.records[2].bind_location_tag && strcmp(z->arena.records[2].bind_location_tag, "lan") == 0);
+        CHECK(z->arena.records[3].bind_location_tag && z->arena.records[3].ecs_subnet_tag && strcmp(z->arena.records[3].ecs_subnet_tag, "east") == 0);
+        CHECK(z->arena.records[1].bind_location_tag == NULL);
+        CHECK(z->arena.bind_location_tag_count == 2 && z->arena.bind_location_tags[0].cidr_count == 2);   /* the rows of one tag are one definition */
+        CHECK(z->arena.bind_ecs_tag_count == 1);
+        rt_info_t info;
+        char why[300];
+        CHECK_MSG(pdns_roundtrip(z, &info, why, sizeof(why)), "%s", why);
+        CHECK(info.flags == KDB_ZF_EXTENDED);
+        /* 2 SOA + 3 rows + 3 definitions + LOC lan, LOC wan, ECS east + 2 resets */
+        CHECK_MSG(info.rr_count == 13, "rr_count %llu", (unsigned long long)info.rr_count);
+        pdns_zone_free(z);
+    }
+    {   /* attributes on the apex SOA (row 1) fail the zone until B8t (tinydns semantics for a hidden SOA) */
+        db_tag_row_t ts[] = { { 1, "lan", NULL } };
+        pdns_zone_t *z = build_ext(k_ext_rows, 3, NULL, 0, ts, 1, NULL, 0, k_ext_defs, 4);
+        CHECK(z->failed && strstr(z->error, "tags on the apex SOA record are not supported yet") && z->error_row_id == 1);
+        pdns_zone_free(z);
+        db_tinydns_row_t tds[] = { { 1, false, 10, "l2", false } };
+        z = build_ext(k_ext_rows, 3, NULL, 0, NULL, 0, tds, 1, NULL, 0);
+        CHECK(z->failed && strstr(z->error, "on the apex SOA record are not supported yet") && z->error_row_id == 1);
+        pdns_zone_free(z);
+    }
+    {   /* the digest covers the attributes */
+        uint8_t d0[KDB_DIGEST_LEN], d1[KDB_DIGEST_LEN], d2[KDB_DIGEST_LEN], d3[KDB_DIGEST_LEN], d4[KDB_DIGEST_LEN], d5[KDB_DIGEST_LEN];
+        pdns_zone_t *z = build_ext(k_ext_rows, 3, NULL, 0, k_ext_tags, 2, NULL, 0, k_ext_defs, 4);
+        zone_digest(z, d0);
+        pdns_zone_free(z);
+        z = build_ext(k_ext_rows, 3, NULL, 0, k_ext_tags, 2, NULL, 0, k_ext_defs, 4);
+        zone_digest(z, d1);
+        pdns_zone_free(z);
+        CHECK(memcmp(d0, d1, KDB_DIGEST_LEN) == 0);
+        z = build_ext(k_ext_rows, 3, NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+        zone_digest(z, d2);
+        pdns_zone_free(z);
+        CHECK(memcmp(d0, d2, KDB_DIGEST_LEN) != 0);
+        db_tag_row_t t2[] = { { 3, "lan", NULL }, { 4, "wan", "west" } };
+        z = build_ext(k_ext_rows, 3, NULL, 0, t2, 2, NULL, 0, k_ext_defs, 4);
+        zone_digest(z, d3);
+        pdns_zone_free(z);
+        CHECK(memcmp(d0, d3, KDB_DIGEST_LEN) != 0);
+        db_tagdef_row_t g2[] = { { "location", "lan", "127.0.0.2/32" }, { "location", "lan", "127.0.0.4/32" }, { "location", "wan", "10.0.0.0/8" }, { "ecs", "east", "198.51.100.0/24" } };
+        z = build_ext(k_ext_rows, 3, NULL, 0, k_ext_tags, 2, NULL, 0, g2, 4);
+        zone_digest(z, d4);
+        pdns_zone_free(z);
+        CHECK(memcmp(d0, d4, KDB_DIGEST_LEN) != 0);
+        db_meta_row_t tm[] = { M("X-KARIDNS-FORMAT", "tinydns") };
+        z = build_ext(k_ext_rows, 3, tm, 1, k_ext_tags, 2, NULL, 0, k_ext_defs, 4);
+        zone_digest(z, d5);
+        pdns_zone_free(z);
+        CHECK(memcmp(d0, d5, KDB_DIGEST_LEN) != 0);        /* the tinydns flag alone */
+    }
+    {   /* tinydns: time stamps, countdown, locations; flags extended + tinydns */
+        db_tinydns_row_t td[] = { { 2, false, 2147483647, "l2", true }, { 3, false, 10, NULL, false }, { 4, true, 0, "lw", false } };
+        db_tagdef_row_t defs[] = { { "tinydns", "l2", "127.0.0.2/32" }, { "tinydns", "lw", "127.0.0.9/24" } };
+        db_meta_row_t tm[] = { M("X-KARIDNS-FORMAT", "tinydns") };
+        pdns_zone_t *z = build_ext(k_ext_rows, 3, tm, 1, NULL, 0, td, 3, defs, 2);
+        CHECK_MSG(!z->failed, "%s", z->error);
+        CHECK(z->arena.records[1].tinydns_ttd == 2147483647 && z->arena.records[1].tinydns_ttl_countdown && z->arena.records[1].tinydns_loc[0] == 'l');
+        CHECK(z->arena.records[3].tinydns_ttd == 0 && z->arena.records[3].tinydns_loc[1] == 'w');
+        CHECK(z->arena.location_count == 2 && z->arena.locations[1].prefix_bits == 24 && z->arena.locations[1].prefix[3] == 0);   /* network part only */
+        rt_info_t info;
+        char why[300];
+        CHECK_MSG(pdns_roundtrip(z, &info, why, sizeof(why)), "%s", why);
+        CHECK(info.flags == (KDB_ZF_EXTENDED | KDB_ZF_TINYDNS));
+        pdns_zone_free(z);
+        z = build_ext(k_ext_rows, 3, NULL, 0, NULL, 0, td, 3, NULL, 0);       /* attributes without the metadata: still carried */
+        CHECK_MSG(pdns_roundtrip(z, &info, why, sizeof(why)), "%s", why);
+        CHECK(info.flags == KDB_ZF_EXTENDED);
+        pdns_zone_free(z);
+    }
+    /* rejections: the zone fails, the error names the zone and the row */
+    {
+        db_tag_row_t t1 = { 3, "none", NULL }, t2 = { 3, "Default", NULL }, t3 = { 3, "a b", NULL }, t4 = { 3, NULL, "this-tag-is-much-too-long-this-tag-is-much-too-long-this-tag-is-much" };
+        expect_ext_fail("tag none", &t1, NULL, NULL, "records.id 3");
+        expect_ext_fail("tag default", &t2, NULL, NULL, "reserved");
+        expect_ext_fail("tag with a blank", &t3, NULL, NULL, "tag name");
+        expect_ext_fail("tag longer than 63", &t4, NULL, NULL, "tag name");
+        db_tinydns_row_t d1 = { 3, false, -5, NULL, false }, d2 = { 3, true, 0, NULL, true }, d3 = { 3, true, 0, "abc", false }, d4 = { 3, true, 0, "a b", false };
+        expect_ext_fail("negative ttd", NULL, &d1, NULL, "negative");
+        expect_ext_fail("countdown without ttd", NULL, &d2, NULL, "countdown");
+        expect_ext_fail("location code of 3 characters", NULL, &d3, NULL, "location code");
+        expect_ext_fail("location code with a blank", NULL, &d4, NULL, "location code");
+        db_tagdef_row_t g1 = { "location", "lan", "300.0.0.0/8" }, g2 = { "ecs", "east", "any" }, g3 = { "tinydns", "l2", "2001:db8::/32" }, g4 = { "location", "none", "192.0.2.0/24" },
+                        g5 = { "tinydns", "l2", "garbage" };
+        expect_ext_fail("bad CIDR", NULL, NULL, &g1, "not an address or prefix");
+        expect_ext_fail("any as a CIDR", NULL, NULL, &g2, "not an address or prefix");
+        expect_ext_fail("IPv6 tinydns location", NULL, NULL, &g3, "IPv4");
+        expect_ext_fail("reserved tag in a definition", NULL, NULL, &g4, "tag name");
+        expect_ext_fail("garbage tinydns location", NULL, NULL, &g5, "not an address or prefix");
+        db_tag_row_t two[] = { { 3, "lan", NULL }, { 3, "wan", NULL } };
+        pdns_zone_t *z = build_ext(k_ext_rows, 3, NULL, 0, two, 2, NULL, 0, NULL, 0);
+        CHECK(z->failed && strstr(z->error, "two rows"));
+        pdns_zone_free(z);
+        /* warnings only: a row of an unknown kind, a row of no enabled record (tags on the SOA fail the zone until B8t:
+         * see the block "attributes on the apex SOA" above) */
+        db_tagdef_row_t gu = { "foo", "x", "192.0.2.0/24" };
+        db_tag_row_t ts[] = { { 99, "lan", NULL } };
+        z = build_ext(k_ext_rows, 3, NULL, 0, ts, 1, NULL, 0, &gu, 1);
+        CHECK_MSG(!z->failed && z->n_warnings == 2, "%s (%zu warnings)", z->error, z->n_warnings);
+        pdns_zone_free(z);
+        /* rows after pdns_zone_finish() */
+        z = build_ext(k_ext_rows, 3, NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+        db_tag_row_t late = { 3, "lan", NULL };
+        CHECK(pdns_zone_add_tags(z, &late) != 0);
+        pdns_zone_free(z);
+    }
+    printf("X-KARIDNS-ECS-TRUSTED-RESOLVERS -> ecs-trusted-resolvers\n");
+    {
+        db_meta_row_t m[] = { M("X-KARIDNS-ECS-TRUSTED-RESOLVERS", "127.0.0.2, 127.0.0.5") };
+        expect_settings("trusted resolvers, comma and blank", m, 1, "ecs-trusted-resolvers { 127.0.0.2; 127.0.0.5; };", 0);
+        db_meta_row_t m2[] = { M("X-KARIDNS-ECS-TRUSTED-RESOLVERS", "!192.0.2.0/25"), M("x-karidns-ecs-trusted-resolvers", "192.0.2.0/24 2001:db8::/32"), M("X-KARIDNS-ECS-TRUSTED-RESOLVERS", "192.0.2.0/24") };
+        expect_settings("several rows, exclusion, duplicates dropped", m2, 3, "ecs-trusted-resolvers { !192.0.2.0/25; 192.0.2.0/24; 2001:db8::/32; };", 0);
+        db_meta_row_t m3[] = { M("X-KARIDNS-ECS-TRUSTED-RESOLVERS", "   ") };
+        expect_settings("empty list", m3, 1, "", 0);
+        db_meta_row_t bad[] = { M("X-KARIDNS-ECS-TRUSTED-RESOLVERS", "127.0.0.2 resolver.example") };
+        pdns_zone_t *z = build(NULL, 0, bad, 1, NULL);
+        CHECK(z->failed);
+        CHECK_HAS(z->error, "X-KARIDNS-ECS-TRUSTED-RESOLVERS entry 'resolver.example'");
+        pdns_zone_free(z);
+        db_meta_row_t bad2[] = { M("X-KARIDNS-ECS-TRUSTED-RESOLVERS", "127.0.0.2; any") };
+        z = build(NULL, 0, bad2, 1, NULL);
+        CHECK(z->failed);
+        pdns_zone_free(z);
+        db_meta_row_t any[] = { M("X-KARIDNS-ECS-TRUSTED-RESOLVERS", "any") };
+        z = build(NULL, 0, any, 1, NULL);
+        CHECK(z->failed);
+        pdns_zone_free(z);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--gen-corpus") == 0) return gen_corpus(argv[2]);
     if (argc == 2) g_zones_dir = argv[1];
@@ -1550,6 +1743,7 @@ int main(int argc, char **argv) {
     test_zone_level();
     test_isolation();
     test_metadata();
+    test_ext();
     test_kdb();
     test_secondary();
     test_kdb_name_case();

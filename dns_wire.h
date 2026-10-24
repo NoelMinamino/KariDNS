@@ -618,6 +618,52 @@ typedef struct {
     uint64_t wirecache_bytes;
 } zone_observatory_snapshot_t;
 
+/* ---- Extended AXFR records (KariDNS extension): the one encoder, shared by Extended AXFR out (dns_axfr_ixfr.c, from the
+ * zone image or the IXFR history) and karidns-dbloader (dns_pdns_reader.c, from the parsed zone).
+ *
+ * The records have CLASS 65302 and TYPE 65401-65407, both in the private use range (RFC 6895 section 3.1, 3.2); their RDATA is
+ * opaque to everybody else, so it is never compressed (RFC 3597 section 4).  All of them are owned by the zone apex.
+ *   65401 LOC_STATE  RDATA = tag text (empty = no tag): the $LOCATION in force for the RRs that follow
+ *   65402 ECS_STATE  the same for $ECS-SUBNET
+ *   65403 LOC_TAGDEF, 65404 ECS_TAGDEF  pack_tag_def_rdata(): tag NUL, u16 n, n x (CIDR text NUL)
+ *   65405 TINYDNS_LOCDEF  code(2) + prefix length in bits(1) + network(4)  (KARIDNS_EXT_VERSION 2)
+ *   65406 TINYDNS_WRAP    see wrap_tinydns_wire()
+ *   65407 ECS_TRUSTED     u8 n, n x (u8 length, address / prefix text)
+ * The sender emits, after the first SOA: the tag definitions, the trusted resolvers, the location definitions; then every RR
+ * (a tinydns RR with a time stamp or a location as a 65406 wrapper), with the state records in front of the RR that changes
+ * the tag in force; at the end the tags are reset; then the last SOA. */
+typedef int (*xext_emit_fn)(void *ud, const dns_record_t *rec);   /* write one RR into the message stream; < 0 = failure */
+
+typedef struct {
+    xext_emit_fn emit;
+    void *ud;
+    const char *zone;           /* owner of the records this encoder makes (the caller keeps it alive) */
+    const char *cur_loc;        /* the tags in force (pointers into the caller's data); NULL = none */
+    const char *cur_ecs;
+    uint8_t *scratch;           /* RDATA of the definitions: allocated on first use (64 KiB), freed by xext_free() */
+} xext_t;
+
+void xext_init(xext_t *x, const char *zone, xext_emit_fn emit, void *ud);
+void xext_free(xext_t *x);
+/* write the state records that make (loc_tag, ecs_tag) the tags in force (none when they already are; tags compare
+ * case-insensitively, as the zone file parser's tag matching does) */
+int xext_select(xext_t *x, const char *loc_tag, const char *ecs_tag);
+/* the end of a transfer: reset the tags that are still in force */
+int xext_finish(xext_t *x);
+int xext_emit_tagdef(xext_t *x, bool ecs, const ecs_tag_def_t *def);
+int xext_emit_trusted(xext_t *x, char *const *list, int count);
+int xext_emit_locdef(xext_t *x, const char code[2], uint8_t prefix_bits, const uint8_t network[4]);
+/* TYPE 65401-65407 RDATA helpers */
+size_t pack_tag_def_rdata(uint8_t *buf, size_t buf_cap, const ecs_tag_def_t *def);
+/* Does the RR carry a tinydns attribute (location code or time stamp) that must travel as a 65406 wrapper? */
+static inline bool xext_rr_is_tinydns(const char loc[2], int64_t ttd) { return loc[0] != 0 || loc[1] != 0 || ttd != 0; }
+/* The 65406 wrapper of an RR (tinydns location, time stamp, countdown flag): RDATA = original TYPE(2) CLASS(2) TTL(4)
+ * location(2) ttd(8, big endian) flags(1, bit0 countdown) RDLENGTH(2) RDATA; the RDATA is the one serialize_dns_record()
+ * wrote, compressed against the RR's own owner name.  false when it does not fit wrap_buf_cap. */
+bool wrap_tinydns_wire(const uint8_t *tmp_wire, uint16_t tmp_off, const char loc[2], int64_t tinydns_ttd, bool countdown,
+                       const char *name, uint32_t ttl_value, dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap);
+bool wrap_tinydns_record(const dns_record_t *rec, dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap);
+
 // 最初の質問 (UPDATE ではゾーンセクション) の名前に圧縮ポインタがあるか (X-15)。メッセージ最初の名前の
 // ポインタは前に現れた名前を指せない (RFC 1035 §4.1.4) ので、そのような要求は FORMERR にする。
 bool wire_question_name_compressed(const uint8_t *buf, size_t len);

@@ -207,6 +207,9 @@ typedef struct {
   uint16_t query_type;
   bool got_first_msg;
   uint8_t rcode;          /* エラーの RCODE で転送が終わったときの値 (0 = エラー応答ではない) */
+  uint64_t ext_records;   /* B8: number of Extended AXFR marker / definition RRs (65401-65405, 65407) read: they count as RRs but are not kept, so the database loader's declared count is checked against them */
+  uint64_t ext_wrapped;   /* B8: TINYDNS_WRAP (65406) records read; each is a normal RR in the zone (already in the RR count) */
+  bool db_stream;         /* B8: the messages come from the database loader (ZONE_DATA): the Extended AXFR records are checked strictly (a malformed definition, state or wrapper record rejects the zone) and ECS_TRUSTED (65407) is refused: the trusted resolvers come from the settings text only, inside acl-ceiling */
 } axfr_session_t;
 
 // クエリログ用 固定長イベント構造体 (バイナリ保持)

@@ -82,6 +82,13 @@ typedef struct {                                /* one row of `records` */
 } db_record_row_t;
 
 typedef struct { int64_t domain_id; const char *kind, *content; } db_meta_row_t;
+/* B8: rows of the extension tables (design 3.7).  karidns_record_tags: record_id -> location_tag, ecs_tag (NULL or "" = no tag).
+ * karidns_record_tinydns: record_id -> ttd (unix time of the TAI64 time stamp; NULL = none), loc (1-2 characters, NULL = none),
+ * countdown (a ttd that is the expiry of a countdown TTL).  karidns_zone_tagdefs: kind 'location' | 'ecs' | 'tinydns', tag,
+ * cidr; the rows of a zone are given in table order (the order of the definitions in a zone file: the first tag that matches wins). */
+typedef struct { int64_t record_id; const char *location_tag, *ecs_tag; } db_tag_row_t;
+typedef struct { int64_t record_id; bool ttd_null; int64_t ttd; const char *loc; bool countdown; } db_tinydns_row_t;
+typedef struct { const char *kind, *tag, *cidr; } db_tagdef_row_t;
 typedef struct { uint64_t seq; int64_t domain_id; } db_change_row_t;
 /* Strings in rows stay valid until the callback returns (zero copy from sqlite3_column_text / PQgetvalue).  They
  * are C strings: a driver must reject (or never pass) a value that has an embedded NUL (sqlite3_column_bytes() !=
@@ -139,6 +146,17 @@ typedef struct pdns_zone_s {
     int64_t first_null_ttl_id, first_prio_ignored_id;
     bool finished;
 
+    /* ---- B8: the Extended AXFR attributes (design 3.6a, 3.7), checked when added, attached to the records by pdns_zone_finish() */
+    struct pdns_tagrow { int64_t id; char *loc, *ecs; } *tags;
+    size_t n_tags, tags_cap;
+    struct pdns_tdrow { int64_t id; int64_t ttd; char loc[2]; bool countdown; } *tdns;
+    size_t n_tdns, tdns_cap;
+    ecs_tag_def_t *loc_defs, *ecs_defs;       /* $LOCATION-TAG / $ECS-SUBNET-TAG; at finish they move into arena.bind_*_tags */
+    int n_loc_defs, n_ecs_defs;
+    tinydns_location_entry_t *locs;           /* the %% lines; at finish they move into arena.locations */
+    int n_locs;
+    size_t n_def_rows;
+
     /* ---- result (valid after pdns_zone_finish() returned 0) */
     zone_arena_t arena;             /* parsed, build_zone_index(false) done; arena.records[i] is row i of the text */
     bool arena_ready;
@@ -154,6 +172,7 @@ typedef struct pdns_zone_s {
     char *nsec3param;               /* NSEC3PARAM metadata (first row), NULL if none */
     presigned_mode_t presigned_mode;   /* PS_NSEC3 / PS_NSEC: the chain was rebuilt; PS_NONE: served as stored */
     size_t n_synth;                 /* records presigned_rebuild() added at the end of arena.records */
+    bool has_ext;                   /* B8: the zone carries Extended AXFR records (tags, tag definitions, tinydns attributes or locations) */
 
     /* ---- diagnostics */
     char **warnings;
@@ -186,6 +205,13 @@ int pdns_zone_set_secondary(pdns_zone_t *z, uint8_t kind, const char *master);
 int pdns_zone_add_record(pdns_zone_t *z, const db_record_row_t *row);
 /* One row of `domainmetadata` (domain_id is ignored).  Rows of one kind are used in the order given. */
 int pdns_zone_add_meta(pdns_zone_t *z, const db_meta_row_t *row);
+/* B8: one row of karidns_record_tags / karidns_record_tinydns / karidns_zone_tagdefs (before pdns_zone_finish(); any order relative to the
+ * records).  A tag name is 1-63 printable characters without blanks ("none" and "default" are the zone file's way to clear a tag,
+ * so they are no names); a tag definition CIDR must parse; a tinydns location definition is an IPv4 prefix; a countdown needs a ttd.
+ * 0 = accepted (a row without any attribute is skipped); -1 = the zone has failed (z->error). */
+int pdns_zone_add_tags(pdns_zone_t *z, const db_tag_row_t *row);
+int pdns_zone_add_tinydns(pdns_zone_t *z, const db_tinydns_row_t *row);
+int pdns_zone_add_tagdef(pdns_zone_t *z, const db_tagdef_row_t *row);
 /* Parse, check and index.  0 = ok (result fields valid); -1 = failed.  Call once. */
 int pdns_zone_finish(pdns_zone_t *z);
 

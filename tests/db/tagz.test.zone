@@ -1,0 +1,41 @@
+; tests/db/tagz.test.zone - a zone with $LOCATION / $ECS-SUBNET tags for the B8 tests (run_db_tags_test.sh): the same zone is
+; served from this file and, through tests/db/zone2sql, from a SQLite3 database; every client must get the same answer.
+; Clients are 127.0.0.1 (and the loopback aliases 127.0.0.2 ... 127.0.0.5) and ECS subnets of RFC 5737 addresses.
+$TTL 300
+$ORIGIN tagz.test.
+@       IN SOA  ns1.tagz.test. hostmaster.tagz.test. ( 2026102401 3600 600 86400 300 )
+        IN NS   ns1.tagz.test.
+ns1     IN A    192.0.2.53
+
+$LOCATION-TAG lan 127.0.0.2/32 127.0.0.3/32
+$LOCATION-TAG wan 127.0.0.4/32 10.0.0.0/8
+$LOCATION-TAG lo6 ::1/128
+$ECS-SUBNET-TAG east 198.51.100.0/24 2001:db8:1::/48
+$ECS-SUBNET-TAG west 203.0.113.0/24
+
+www     IN A    192.0.2.1
+$LOCATION lan
+www     IN A    192.0.2.10
+mail    IN A    192.0.2.11
+$LOCATION wan
+www     IN A    192.0.2.20
+www     IN AAAA 2001:db8::20
+$LOCATION
+$ECS-SUBNET east
+geo     IN A    192.0.2.30
+$ECS-SUBNET west
+geo     IN A    192.0.2.40
+$ECS-SUBNET
+geo     IN A    192.0.2.50
+$LOCATION lan
+$ECS-SUBNET east
+both    IN TXT  "lan and east"
+$LOCATION wan
+$ECS-SUBNET
+both    IN TXT  "wan only"
+$LOCATION
+both    IN TXT  "everybody"
+txt     IN TXT  "a \"quoted\" text" "second"
+srv     IN SRV  10 5 5060 sip.tagz.test.
+sip     IN A    192.0.2.60
+mx      IN MX   10 mail.tagz.test.

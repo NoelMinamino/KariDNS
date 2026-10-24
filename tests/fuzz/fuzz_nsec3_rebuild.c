@@ -257,7 +257,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (getenv("FUZZ_NSEC3_VERBOSE")) fprintf(stderr, "rc=%d mode=%d %s\n", rc, (int)z->presigned_mode, rc ? z->error : "");
     if (rc != 0) {
         trap_if(!z->failed || strncmp(z->error, "zone 'fuzz.test.'", 17) != 0);
-        trap_if(strstr(z->error, "internal error") != NULL);
+        trap_if(pdns_error_is_internal(z));   /* not a quoted row text that happens to say so */
     } else if (z->presigned_mode != PS_NONE) {
         const zone_arena_t *a = &z->arena;
         /* The synthesized RRs are not at the end: each one sits right before the stored RRSIG row that covers it.  They are

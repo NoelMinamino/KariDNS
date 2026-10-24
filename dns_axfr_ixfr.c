@@ -332,6 +332,12 @@ int xfr_check_response_header(const uint8_t *msg, size_t msg_len, axfr_session_t
   return 0;
 }
 
+/* B8: a record of the Extended AXFR stream of the database loader that the Backend will not take; -1 for parse_xfr_packet() */
+static int xfr_ext_reject(const char *domain, const char *what) {
+  syslog(LOG_WARNING, "[AXFR] zone '%s': rejecting transfer: %s", domain, what);
+  return -1;
+}
+
 int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
                      zone_arena_t *standby, const zone_version_t *active,
                      axfr_session_t *session, const char *domain) {
@@ -408,6 +414,8 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
     if (rec->class_val == DNS_CLASS_KARIDNS_EXT) {
       if (type == DNS_TYPE_KARIDNS_LOC_STATE) {
         standby->count--;
+        session->ext_records++;
+        if (session->db_stream && rec->generic_len >= sizeof(session->current_loc_tag)) return xfr_ext_reject(domain, "a LOC_STATE tag longer than 63 octets");
         if (rec->generic_data && rec->generic_len > 0) {
           size_t copy_len = rec->generic_len < sizeof(session->current_loc_tag) - 1 ? rec->generic_len : sizeof(session->current_loc_tag) - 1;
           memcpy(session->current_loc_tag, rec->generic_data, copy_len);
@@ -420,6 +428,8 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
         continue;
       } else if (type == DNS_TYPE_KARIDNS_ECS_STATE) {
         standby->count--;
+        session->ext_records++;
+        if (session->db_stream && rec->generic_len >= sizeof(session->current_ecs_tag)) return xfr_ext_reject(domain, "an ECS_STATE tag longer than 63 octets");
         if (rec->generic_data && rec->generic_len > 0) {
           size_t copy_len = rec->generic_len < sizeof(session->current_ecs_tag) - 1 ? rec->generic_len : sizeof(session->current_ecs_tag) - 1;
           memcpy(session->current_ecs_tag, rec->generic_data, copy_len);
@@ -432,14 +442,23 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
         continue;
       } else if (type == DNS_TYPE_KARIDNS_LOC_TAGDEF) {
         standby->count--;
-        unpack_tag_def_rdata(rec->generic_data, rec->generic_len, &standby->bind_location_tags, &standby->bind_location_tag_count);
+        session->ext_records++;
+        if (!unpack_tag_def_rdata(rec->generic_data, rec->generic_len, &standby->bind_location_tags, &standby->bind_location_tag_count) && session->db_stream)
+          return xfr_ext_reject(domain, "a malformed LOC_TAGDEF");
         continue;
       } else if (type == DNS_TYPE_KARIDNS_ECS_TAGDEF) {
         standby->count--;
-        unpack_tag_def_rdata(rec->generic_data, rec->generic_len, &standby->bind_ecs_tags, &standby->bind_ecs_tag_count);
+        session->ext_records++;
+        if (!unpack_tag_def_rdata(rec->generic_data, rec->generic_len, &standby->bind_ecs_tags, &standby->bind_ecs_tag_count) && session->db_stream)
+          return xfr_ext_reject(domain, "a malformed ECS_TAGDEF");
         continue;
       } else if (type == DNS_TYPE_KARIDNS_ECS_TRUSTED) {
         standby->count--;
+        session->ext_records++;
+        if (session->db_stream) {
+          syslog(LOG_WARNING, "[AXFR] zone '%s': rejecting transfer: ECS_TRUSTED (TYPE 65407) is not allowed in this stream (the database loader's trusted resolvers come from the zone settings)", domain);
+          return -1;
+        }
         unpack_trusted_resolvers_rdata(rec->generic_data, rec->generic_len, &standby->bind_ecs_trusted_resolvers, &standby->bind_ecs_trusted_resolver_count);
         if (standby->bind_ecs_trusted_resolvers_parsed) {
           free(standby->bind_ecs_trusted_resolvers_parsed);
@@ -451,11 +470,18 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
         continue;
       } else if (type == DNS_TYPE_KARIDNS_TINYDNS_LOCDEF) {
         standby->count--;
+        session->ext_records++;
         standby->is_tinydns_format = true;
-        unpack_tinydns_loc_rdata(rec->generic_data, rec->generic_len, &standby->locations, &standby->location_count);
+        if (!unpack_tinydns_loc_rdata(rec->generic_data, rec->generic_len, &standby->locations, &standby->location_count) && session->db_stream)
+          return xfr_ext_reject(domain, "a malformed TINYDNS_LOCDEF");
+        if (session->db_stream && standby->location_count > 4096)      /* the limit of the tinydns data parser */
+          return xfr_ext_reject(domain, "more than 4096 TINYDNS_LOCDEF records");
         continue;
       } else if (type == DNS_TYPE_KARIDNS_TINYDNS_WRAP) {
+        session->ext_wrapped++;
         standby->is_tinydns_format = true;
+        if (session->db_stream && (!rec->generic_data || rec->generic_len < 21))
+          return xfr_ext_reject(domain, "a TINYDNS_WRAP shorter than its fixed part");
         if (rec->generic_data && rec->generic_len >= 21) {
           uint16_t orig_type = (rec->generic_data[0] << 8) | rec->generic_data[1];
           uint16_t orig_class = (rec->generic_data[2] << 8) | rec->generic_data[3];
@@ -467,23 +493,18 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           }
           uint8_t flags = rec->generic_data[18];
           uint16_t orig_rdlen = (rec->generic_data[19] << 8) | rec->generic_data[20];
+          if (session->db_stream && 21 + (size_t)orig_rdlen > rec->generic_len)
+            return xfr_ext_reject(domain, "a TINYDNS_WRAP whose RDLENGTH is longer than the record");
           if (21 + orig_rdlen <= rec->generic_len) {
             uint8_t fake_wire[4096];
             size_t fake_len = 0;
             bool reconstructed = false;
-            const char *d = rec->name;
-            while (*d) {
-              const char *dot = strchr_unescaped(d, '.');
-              size_t len = dot ? (size_t)(dot - d) : strlen(d);
-              if (len > 63) len = 63;
-              if (fake_len + len + 2 > sizeof(fake_wire) - 100) break;
-              fake_wire[fake_len++] = (uint8_t)len;
-              memcpy(&fake_wire[fake_len], d, len);
-              fake_len += len;
-              if (!dot) break;
-              d = dot + 1;
-            }
-            fake_wire[fake_len++] = 0;
+            /* 所有者名は表示形式 (\. や \DDD を含みうる)。ラベルのバイトをそのまま写すとエスケープが
+             * 壊れるので、ワイヤー形式に正しく直す (大文字小文字は保つ、RFC 4343) */
+            long nw = rec->name ? write_uncompressed_name_ext(fake_wire, 0, sizeof(fake_wire) - 100, rec->name, false) : -1;
+            bool name_ok = nw > 0;
+            fake_len = name_ok ? (size_t)nw : 1;
+            if (!name_ok) fake_wire[0] = 0;
             fake_wire[fake_len++] = (orig_type >> 8) & 0xFF;
             fake_wire[fake_len++] = orig_type & 0xFF;
             fake_wire[fake_len++] = (orig_class >> 8) & 0xFF;
@@ -506,6 +527,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
             } else if (orig_rdlen > 0) {
               fake_len = 0; /* force fallback below; do not attempt to parse */
             }
+            if (!name_ok) fake_len = 0; /* 名前を直せない: 下の代替の経路 (root を所有者にしない) */
             size_t fake_off = 0;
             uint16_t parsed_t;
             dns_record_t unwrapped;
@@ -517,6 +539,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
               reconstructed = true;
             }
             if (!reconstructed) {
+              if (session->db_stream) return xfr_ext_reject(domain, "a TINYDNS_WRAP whose RR cannot be decoded");
               rec->generic_data = NULL;
               rec->generic_len = 0;
               rec->type_code = orig_type;
@@ -1127,6 +1150,7 @@ typedef struct {
   const struct sockaddr_storage *server_addr;
   bool has_server_addr;
   const char *domain;
+  xext_t xe;             /* Extended AXFR: the one encoder of the extension records (dns_wire.h), state markers included */
 } axfr_emit_ctx_t;
 
 /* One RR to send: a builder record (IXFR history, KariDNS markers) or RR `rr` of a zone image (S5 B-2: the zone itself) */
@@ -1189,9 +1213,11 @@ static int axfr_emit_item(axfr_emit_ctx_t *ec, const dns_record_t *rec, const zo
 
 static int axfr_emit_record(axfr_emit_ctx_t *ec, const dns_record_t *rec) { return axfr_emit_item(ec, rec, NULL, 0); }
 
+/* the output of xext_t: the records go into the message stream like any other */
+static int axfr_xext_emit(void *ud, const dns_record_t *rec) { return axfr_emit_record((axfr_emit_ctx_t *)ud, rec); }
+
 /* A zone RR (builder record of the IXFR history, or image RR) with the Extended AXFR state markers around it */
-static int axfr_emit_zone_item(axfr_emit_ctx_t *ec, const dns_record_t *rec_item, const zone_image_t *img, uint32_t rr,
-                               const char **cur_loc_io, const char **cur_ecs_io) {
+static int axfr_emit_zone_item(axfr_emit_ctx_t *ec, const dns_record_t *rec_item, const zone_image_t *img, uint32_t rr) {
   const zone_image_ext_t *ext = img ? zone_image_rr_ext(img, rr) : NULL;
   const char *item_loc_tag = img ? (ext ? zone_image_str(img, ext->loc_tag_off) : NULL) : rec_item->bind_location_tag;
   const char *item_ecs_tag = img ? (ext ? zone_image_str(img, ext->ecs_tag_off) : NULL) : rec_item->ecs_subnet_tag;
@@ -1205,33 +1231,8 @@ static int axfr_emit_zone_item(axfr_emit_ctx_t *ec, const dns_record_t *rec_item
     return axfr_emit_item(ec, rec_item, img, rr);
   }
 
-  const char *r_loc = item_loc_tag ? item_loc_tag : "";
-  if (strcasecmp(r_loc, *(cur_loc_io) ? *(cur_loc_io) : "") != 0) {
-    dns_record_t set_rec;
-    memset(&set_rec, 0, sizeof(set_rec));
-    set_rec.name = (char *)ec->domain;
-    set_rec.type_code = DNS_TYPE_KARIDNS_LOC_STATE;
-    set_rec.class_val = DNS_CLASS_KARIDNS_EXT;
-    set_rec.class_str = "KARIDNS";
-    set_rec.generic_data = (uint8_t *)r_loc;
-    set_rec.generic_len = strlen(r_loc);
-    if (axfr_emit_record(ec, &set_rec) < 0) return -1;
-    *(cur_loc_io) = item_loc_tag;
-  }
-  const char *r_ecs = item_ecs_tag ? item_ecs_tag : "";
-  if (strcasecmp(r_ecs, *(cur_ecs_io) ? *(cur_ecs_io) : "") != 0) {
-    dns_record_t set_rec;
-    memset(&set_rec, 0, sizeof(set_rec));
-    set_rec.name = (char *)ec->domain;
-    set_rec.type_code = DNS_TYPE_KARIDNS_ECS_STATE;
-    set_rec.class_val = DNS_CLASS_KARIDNS_EXT;
-    set_rec.class_str = "KARIDNS";
-    set_rec.generic_data = (uint8_t *)r_ecs;
-    set_rec.generic_len = strlen(r_ecs);
-    if (axfr_emit_record(ec, &set_rec) < 0) return -1;
-    *(cur_ecs_io) = item_ecs_tag;
-  }
-  if (item_tloc[0] != 0 || item_tloc[1] != 0 || item_ttd != 0) {
+  if (xext_select(&ec->xe, item_loc_tag, item_ecs_tag) < 0) return -1;
+  if (xext_rr_is_tinydns(item_tloc, item_ttd)) {
     dns_record_t wrap_rec;
     uint8_t wrap_buf[4096];
     if (img ? wrap_tinydns_image_rr(img, rr, &wrap_rec, wrap_buf, sizeof(wrap_buf))
@@ -1244,9 +1245,8 @@ static int axfr_emit_zone_item(axfr_emit_ctx_t *ec, const dns_record_t *rec_item
   return axfr_emit_item(ec, rec_item, img, rr);
 }
 
-static int axfr_emit_zone_record(axfr_emit_ctx_t *ec, const dns_record_t *rec_item,
-                                 const char **cur_loc_io, const char **cur_ecs_io) {
-  return axfr_emit_zone_item(ec, rec_item, NULL, 0, cur_loc_io, cur_ecs_io);
+static int axfr_emit_zone_record(axfr_emit_ctx_t *ec, const dns_record_t *rec_item) {
+  return axfr_emit_zone_item(ec, rec_item, NULL, 0);
 }
 
 /* 転送要求への1通だけのエラー応答 (RFC 5936 §2.2: 質問セクションを写し、それで転送を終える)。
@@ -1478,6 +1478,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   ec.server_addr = server_addr;
   ec.has_server_addr = has_server_addr;
   ec.domain = entry->domain;
+  xext_init(&ec.xe, entry->domain, axfr_xext_emit, &ec);
 
   memset(res, 0, 65535);
   memcpy(res, req, q_offset);
@@ -1492,8 +1493,6 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   if (!send_ixfr && is_extended_axfr && zone_image_zattr_load(current_zone, &zattr) != 0) goto axfr_error;
   if (send_ixfr) {
     if (axfr_emit_item(&ec, NULL, current_zone, soa_rr) < 0) goto axfr_error;
-    const char *ixfr_loc = NULL;
-    const char *ixfr_ecs = NULL;
     for (int t = 0; t < txn_count; t++) {
       ixfr_txn_t *txn = txn_list[t];
       int soa_del_idx = -1;
@@ -1505,7 +1504,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       }
       for (int i = 0; i < txn->deleted_count; i++) {
         if (i == soa_del_idx) continue;
-        if (axfr_emit_zone_record(&ec, &txn->deleted[i], &ixfr_loc, &ixfr_ecs) < 0) goto axfr_error;
+        if (axfr_emit_zone_record(&ec, &txn->deleted[i]) < 0) goto axfr_error;
       }
       int soa_add_idx = -1;
       for (int i = 0; i < txn->added_count; i++) {
@@ -1516,7 +1515,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       }
       for (int i = 0; i < txn->added_count; i++) {
         if (i == soa_add_idx) continue;
-        if (axfr_emit_zone_record(&ec, &txn->added[i], &ixfr_loc, &ixfr_ecs) < 0) goto axfr_error;
+        if (axfr_emit_zone_record(&ec, &txn->added[i]) < 0) goto axfr_error;
       }
     }
     if (txn_count > 0) {
@@ -1528,36 +1527,10 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
 
     // Definitions emitted after first SOA in extended mode
     if (is_extended_axfr) {
-      for (int i = 0; i < zattr.bind_location_tag_count; i++) {
-        uint8_t tag_buf[2048];
-        size_t dlen = pack_tag_def_rdata(tag_buf, sizeof(tag_buf), &zattr.bind_location_tags[i]);
-        if (dlen > 0) {
-          dns_record_t tag_rec;
-          memset(&tag_rec, 0, sizeof(tag_rec));
-          tag_rec.name = entry->domain;
-          tag_rec.type_code = DNS_TYPE_KARIDNS_LOC_TAGDEF;
-          tag_rec.class_val = DNS_CLASS_KARIDNS_EXT;
-          tag_rec.class_str = "KARIDNS";
-          tag_rec.generic_data = tag_buf;
-          tag_rec.generic_len = dlen;
-          if (axfr_emit_record(&ec, &tag_rec) < 0) goto axfr_error;
-        }
-      }
-      for (int i = 0; i < zattr.bind_ecs_tag_count; i++) {
-        uint8_t tag_buf[2048];
-        size_t dlen = pack_tag_def_rdata(tag_buf, sizeof(tag_buf), &zattr.bind_ecs_tags[i]);
-        if (dlen > 0) {
-          dns_record_t tag_rec;
-          memset(&tag_rec, 0, sizeof(tag_rec));
-          tag_rec.name = entry->domain;
-          tag_rec.type_code = DNS_TYPE_KARIDNS_ECS_TAGDEF;
-          tag_rec.class_val = DNS_CLASS_KARIDNS_EXT;
-          tag_rec.class_str = "KARIDNS";
-          tag_rec.generic_data = tag_buf;
-          tag_rec.generic_len = dlen;
-          if (axfr_emit_record(&ec, &tag_rec) < 0) goto axfr_error;
-        }
-      }
+      for (int i = 0; i < zattr.bind_location_tag_count; i++)
+        if (xext_emit_tagdef(&ec.xe, false, &zattr.bind_location_tags[i]) < 0) goto axfr_error;
+      for (int i = 0; i < zattr.bind_ecs_tag_count; i++)
+        if (xext_emit_tagdef(&ec.xe, true, &zattr.bind_ecs_tags[i]) < 0) goto axfr_error;
       server_config_t *axfr_cfg = acquire_config_snapshot();
       const zone_config_t *axfr_zcfg = axfr_cfg ? zone_entry_config(axfr_cfg, entry) : NULL;
       char **trusted_res = (zattr.bind_ecs_trusted_resolver_count > 0 && zattr.bind_ecs_trusted_resolvers)
@@ -1569,87 +1542,24 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
         trusted_count = (axfr_zcfg && zext(axfr_zcfg)->ecs_trusted_resolvers) ? zext(axfr_zcfg)->ecs_trusted_resolvers_count
                                                                    : (axfr_cfg ? axfr_cfg->ecs_trusted_resolvers_count : 0);
       }
-      if (trusted_count > 0 && trusted_res) {
-        uint8_t trusted_buf[2048];
-        size_t toffset = 0;
-        trusted_buf[toffset++] = (uint8_t)(trusted_count > 255 ? 255 : trusted_count);
-        for (int i = 0; i < trusted_count && toffset < sizeof(trusted_buf); i++) {
-          if (!trusted_res[i]) continue;
-          size_t slen = strlen(trusted_res[i]);
-          if (slen > 255) slen = 255;
-          if (toffset + 1 + slen > sizeof(trusted_buf)) break;
-          trusted_buf[toffset++] = (uint8_t)slen;
-          memcpy(&trusted_buf[toffset], trusted_res[i], slen);
-          toffset += slen;
-        }
-        dns_record_t trusted_rec;
-        memset(&trusted_rec, 0, sizeof(trusted_rec));
-        trusted_rec.name = entry->domain;
-        trusted_rec.type_code = DNS_TYPE_KARIDNS_ECS_TRUSTED;
-        trusted_rec.class_val = DNS_CLASS_KARIDNS_EXT;
-        trusted_rec.class_str = "KARIDNS";
-        trusted_rec.generic_data = trusted_buf;
-        trusted_rec.generic_len = toffset;
-        if (axfr_emit_record(&ec, &trusted_rec) < 0) {
-          if (axfr_cfg) release_config_snapshot(axfr_cfg);
-          goto axfr_error;
-        }
-      }
+      int trusted_rc = (trusted_count > 0 && trusted_res) ? xext_emit_trusted(&ec.xe, trusted_res, trusted_count) : 0;
       if (axfr_cfg) release_config_snapshot(axfr_cfg);
+      if (trusted_rc < 0) goto axfr_error;
       for (int i = 0; i < zattr.location_count; i++) {
         const tinydns_location_entry_t *loc = &zattr.locations[i];
-        /* Extended AXFR v2: code(2) + prefix length in bits(1) + network(4) */
-        uint8_t loc_buf[7];
-        loc_buf[0] = loc->code[0];
-        loc_buf[1] = loc->code[1];
-        loc_buf[2] = loc->prefix_bits;
-        memcpy(&loc_buf[3], loc->prefix, 4);
-        dns_record_t loc_rec;
-        memset(&loc_rec, 0, sizeof(loc_rec));
-        loc_rec.name = entry->domain;
-        loc_rec.type_code = DNS_TYPE_KARIDNS_TINYDNS_LOCDEF;
-        loc_rec.class_val = DNS_CLASS_KARIDNS_EXT;
-        loc_rec.class_str = "KARIDNS";
-        loc_rec.generic_data = loc_buf;
-        loc_rec.generic_len = sizeof(loc_buf);
-        if (axfr_emit_record(&ec, &loc_rec) < 0) goto axfr_error;
+        if (xext_emit_locdef(&ec.xe, loc->code, loc->prefix_bits, loc->prefix) < 0) goto axfr_error;
       }
     }
 
-    const char *current_stream_loc = NULL;
-    const char *current_stream_ecs = NULL;
     /* file order (zone_image_seq_rr), as the builder was walked before */
     for (uint32_t seq = 0; seq < current_zone->n_rrs; seq++) {
       uint32_t rr = zone_image_seq_rr(current_zone, seq);
       if (rr == soa_rr)
         continue;
-      if (axfr_emit_zone_item(&ec, NULL, current_zone, rr, &current_stream_loc, &current_stream_ecs) < 0) goto axfr_error;
+      if (axfr_emit_zone_item(&ec, NULL, current_zone, rr) < 0) goto axfr_error;
     }
 
-    if (is_extended_axfr) {
-      if (current_stream_loc && *current_stream_loc) {
-        dns_record_t set_rec;
-        memset(&set_rec, 0, sizeof(set_rec));
-        set_rec.name = entry->domain;
-        set_rec.type_code = DNS_TYPE_KARIDNS_LOC_STATE;
-        set_rec.class_val = DNS_CLASS_KARIDNS_EXT;
-        set_rec.class_str = "KARIDNS";
-        set_rec.generic_data = (uint8_t *)"";
-        set_rec.generic_len = 0;
-        if (axfr_emit_record(&ec, &set_rec) < 0) goto axfr_error;
-      }
-      if (current_stream_ecs && *current_stream_ecs) {
-        dns_record_t set_rec;
-        memset(&set_rec, 0, sizeof(set_rec));
-        set_rec.name = entry->domain;
-        set_rec.type_code = DNS_TYPE_KARIDNS_ECS_STATE;
-        set_rec.class_val = DNS_CLASS_KARIDNS_EXT;
-        set_rec.class_str = "KARIDNS";
-        set_rec.generic_data = (uint8_t *)"";
-        set_rec.generic_len = 0;
-        if (axfr_emit_record(&ec, &set_rec) < 0) goto axfr_error;
-      }
-    }
+    if (is_extended_axfr && xext_finish(&ec.xe) < 0) goto axfr_error;
 
     // 3. Trailing SOA
     if (axfr_emit_item(&ec, NULL, current_zone, soa_rr) < 0) goto axfr_error;
@@ -1686,10 +1596,12 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     }
   }
   if (res) free(res);
+  xext_free(&ec.xe);
   zone_arena_destroy(&zattr);
   return;
 
 axfr_error:
+  xext_free(&ec.xe);
   zone_arena_destroy(&zattr);
   for (int t = 0; t < txn_count; t++) {
     if (atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_acq_rel) == 1) {

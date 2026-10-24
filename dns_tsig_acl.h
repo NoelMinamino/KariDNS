@@ -23,6 +23,10 @@ bool zone_transfer_acl_allows(const server_config_t *cfg, const zone_config_t *z
                               const char *key_name);
 bool zone_update_acl_allows(const server_config_t *cfg, const zone_config_t *zcfg, const char *client_ip,
                             const char *key_name);
+/* B8: is client_ip inside the address entries of options { database { acl-ceiling } } ("!" excludes, first match decides)?  Used for the
+ * ecs-trusted-resolvers list of a database zone: a resolver is trusted only when the zone's list and the ceiling both accept its address
+ * (keys of the ceiling do not count: ECS trust has no key).  No ceiling configured: nobody. */
+bool db_ceiling_allows_address(const server_config_t *cfg, const char *client_ip);
 /* 鍵名 (DNS 名) が同じか。大文字小文字と末尾のドットは区別しない (RFC 4343 §2、D-03) */
 bool tsig_key_names_equal(const char *a, const char *b);
 

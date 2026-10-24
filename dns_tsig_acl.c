@@ -95,6 +95,12 @@ static bool ceiling_allows(const server_config_t *cfg, const char *client_ip, co
     return addr_in || key_in;
 }
 
+bool db_ceiling_allows_address(const server_config_t *cfg, const char *client_ip) {
+    if (!db_acl_ceiling_configured(cfg) || !client_ip) return false;
+    const database_config_t *d = &cfg->database;
+    return addr_list_match(client_ip, d->acl_ceiling, d->acl_ceiling_parsed, d->acl_ceiling_count);
+}
+
 bool zone_transfer_acl_allows(const server_config_t *cfg, const zone_config_t *zcfg, const char *client_ip,
                               const char *key_name) {
     if (!zcfg || !client_ip) return false;

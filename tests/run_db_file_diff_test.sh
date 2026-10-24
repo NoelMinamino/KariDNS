@@ -5,7 +5,7 @@
 # For every zone file of tests/zones/ that tests/db/zone2sql takes (the zone parser accepts it, one zone, no DNSSEC
 # records, no extended attributes) two servers are started on the same data: A loads the file (type primary, file), B
 # gets the zone from a SQLite3 database through karidns-dbloader.  Files that define the same zone name (example.com has
-# many variants) go into separate rounds.  Zones with location / ECS tags are left out until the database carries tags (B8).  For each zone, every owner x every type present, ANY, the types NS MX TXT AAAA
+# many variants) go into separate rounds.  Zones with location / ECS tags (B8) go through the karidns_* tables and are compared as the client 127.0.0.1 (the per-client comparison is run_db_tags_test.sh).  For each zone, every owner x every type present, ANY, the types NS MX TXT AAAA
 # A CNAME at every owner, a name below every owner, the apex types, NXDOMAIN names and a differently-cased name are
 # asked in three flavours (plain query = 512 byte limit, EDNS0 DO=0, EDNS0 DO=1) with tests/db/dbquery.c, which writes
 # the exact response bytes with the message ID zeroed.  The responses of A and B must be identical.  Since B7b the zones are also transferred: A allows 127.0.0.1 in the zone
@@ -97,17 +97,17 @@ WWW A 192.0.2.2
 Mail.Sub A 192.0.2.3
 @ MX 10 Mail.Sub
 EOF2
-for f in tests/zones/*.zone "$T/cand/mixed.test.zone"; do
+for f in tests/zones/*.zone tests/db/tagz.test.zone "$T/cand/mixed.test.zone"; do
     [ -f "$f" ] || continue
     N=$((N + 1))
     sz=$(wc -c < "$f" | tr -d ' ')
     if [ "$sz" -gt 300000 ]; then echo "$f: larger than 300 kB" >> "$T/skipped.txt"; continue; fi
-    if grep -Eq '^[[:space:]]*[$](LOCATION|ECS)' "$f"; then echo "$f: location / ECS tags (the database carries them from B8)" >> "$T/skipped.txt"; continue; fi
     if ! ./tests/db/zone2sql --dialect sqlite3 "$f" > "$T/sql/$N.sql" 2> "$T/z2s.err"; then
         echo "$f: zone2sql cannot take it ($(head -1 "$T/z2s.err" | cut -c1-90))" >> "$T/skipped.txt"; continue
     fi
     rm -f "$T/scratch.db"
     sqlite3 "$T/scratch.db" < "$SCHEMA" > /dev/null
+    sqlite3 "$T/scratch.db" < db/karidns_ext.sqlite3.sql > /dev/null          # B8: tags and tinydns attributes of a zone file go into the karidns_* tables
     sqlite3 "$T/scratch.db" < "$T/sql/$N.sql" > /dev/null 2>&1 || { echo "$f: the SQL does not import" >> "$T/skipped.txt"; continue; }
     ND=$(sqlite3 "$T/scratch.db" "SELECT count(*) FROM domains")
     APEX=$(sqlite3 "$T/scratch.db" "SELECT name FROM domains LIMIT 1")
@@ -182,6 +182,7 @@ while [ $k -le $R ]; do
     echo "== round $k"
     D="$T/r$k"; mkdir "$D"
     sqlite3 "$D/z.db" < "$SCHEMA" > /dev/null
+    sqlite3 "$D/z.db" < db/karidns_ext.sqlite3.sql > /dev/null
     {
         printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n};\n' "$PA"
     } > "$D/a.conf"

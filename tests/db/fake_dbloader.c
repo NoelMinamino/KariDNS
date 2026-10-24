@@ -27,7 +27,14 @@
  *   secondary-prim   a primary zone whose settings name masters                                   -> zone rejected
  *   secondary-ok     secondary with masters { 127.0.0.1 port 1; } (the transfer fails, the zone is registered) -> applied
  *   catalog-ok       zone_kind catalog (a CONSUMER) with masters                                  -> applied
- *   extended-flag    the extended-attributes flag (not supported yet)                   -> zone rejected
+ *   ext-no-flag      a state record (CLASS 65302) in a zone without the extended flag    -> zone rejected
+ *   ext-trusted      an ECS_TRUSTED record (settings only)                               -> zone rejected
+ *   ext-bad-def      a malformed LOC_TAGDEF                                              -> zone rejected
+ *   ext-bad-locdef   a malformed TINYDNS_LOCDEF                                          -> zone rejected
+ *   ext-bad-wrap     a TINYDNS_WRAP shorter than its fixed part                          -> zone rejected
+ *   ext-long-tag     a LOC_STATE tag of 70 octets                                        -> zone rejected
+ *   ext-flag-bit     a reserved zone flag bit                                            -> protocol error
+ *   ext-ok           state records and the extended + tinydns flags                      -> applied
  *   non-in-class     an RR of class CH                                                  -> zone rejected
  *   again            ok1.test twice in one batch (the second replaces the first)       -> both applied
  *   slow             ok1.test, a pause of 3 s, ok2.test: ok1.test must answer during the pause (the view delta runs
@@ -281,9 +288,33 @@ static void bad_zone(int fd, const char *mode) {
         zone_begin_ex(fd, z, 1, 0, 0, 0, "masters { 127.0.0.1 port 1; 2001:db8::1; }; ixfr-history 3;", NULL); zone_end(fd, 0);
     } else if (strcmp(mode, "catalog-ok") == 0) {
         zone_begin_ex(fd, z, 2, 0, 0, 0, "masters { 127.0.0.1 port 1; };", NULL); zone_end(fd, 0);
-    } else if (strcmp(mode, "extended-flag") == 0) {
-        dm_soa(&m, z, 5); dm_soa(&m, z, 5);
-        zone_begin(fd, z, 0, 2, 2, 0); zone_data(fd, &m); zone_end(fd, 2);
+    } else if (strncmp(mode, "ext-", 4) == 0) {                   /* B8: Extended AXFR records in the stream */
+        uint8_t lan[3] = { 'l', 'a', 'n' }, tr[2] = { 1, 0 }, bad1[1] = { 'x' }, longtag[70];
+        memset(longtag, 'a', sizeof(longtag));
+        uint32_t flags = 2;                                       /* KDB_ZF_EXTENDED */
+        uint64_t declared = 3;
+        dm_soa(&m, z, 5);
+        if (strcmp(mode, "ext-no-flag") == 0) {                   /* state record, flag 0 */
+            dm_rr(&m, z, 65401, 65302, lan, 3); flags = 0;
+        } else if (strcmp(mode, "ext-trusted") == 0) {            /* ECS_TRUSTED is not for the stream */
+            dm_rr(&m, z, 65407, 65302, tr, 2);
+        } else if (strcmp(mode, "ext-bad-def") == 0) {
+            dm_rr(&m, z, 65403, 65302, bad1, 1);
+        } else if (strcmp(mode, "ext-bad-locdef") == 0) {
+            dm_rr(&m, z, 65405, 65302, bad1, 1);
+        } else if (strcmp(mode, "ext-bad-wrap") == 0) {
+            dm_rr(&m, "www.bad.test", 65406, 65302, bad1, 1); declared = 3;
+        } else if (strcmp(mode, "ext-long-tag") == 0) {
+            dm_rr(&m, z, 65401, 65302, longtag, sizeof(longtag));
+        } else if (strcmp(mode, "ext-flag-bit") == 0) {           /* a reserved zone flag: protocol error */
+            flags = 8; declared = 2;
+        } else {                                                  /* ext-ok: the state records and the tinydns flag are accepted */
+            dm_rr(&m, z, 65401, 65302, lan, 3); dm_a(&m, "www.bad.test", 1);
+            dm_rr(&m, z, 65401, 65302, (const uint8_t *)"", 0);
+            flags = 6; declared = 5;
+        }
+        dm_soa(&m, z, 5);
+        zone_begin(fd, z, 0, flags, declared, 0); zone_data(fd, &m); zone_end(fd, declared);
     } else if (strcmp(mode, "non-in-class") == 0) {
         uint8_t rd[4] = { 192, 0, 2, 1 };
         dm_soa(&m, z, 5); dm_rr(&m, "www.bad.test", 1, 3, rd, 4); dm_soa(&m, z, 5);

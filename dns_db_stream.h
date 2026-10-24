@@ -46,8 +46,8 @@
  *   BATCH_BEGIN (3)   1 batch_id u64 R | 2 kind u8 R (0 startup,1 full,2 diff,3 zone,4 auto) | 3 change_seq u64 R |
  *                     4 request_id u64 O (B6a: the batch answers that RELOAD_REQ; absent or 0 = not an answer)
  *   ZONE_BEGIN (4)    1 view view R | 2 zone name R | 3 source_id i64 R | 4 zone_kind u8 R (0 primary,1 secondary,
- *                     2 catalog) | 5 serial u32 R | 6 flags u32 R (bit0 presigned, bit1 extended; others 0) |
- *                     7 rr_count u64 R (primary: both SOAs counted, >= 2; secondary and catalog: 0, no ZONE_DATA, B7b) | 8 digest bytes R (exactly 32) |
+ *                     2 catalog) | 5 serial u32 R | 6 flags u32 R (bit0 presigned, bit1 extended, bit2 tinydns; others 0) |
+ *                     7 rr_count u64 R (primary: both SOAs and, with bit1, the Extended AXFR marker and definition RRs counted, >= 2; secondary and catalog: 0, no ZONE_DATA, B7b) | 8 digest bytes R (exactly 32) |
  *                     9 settings text<=65535 O | 10 profile str ne <=255 O
  *   ZONE_DATA (5)     raw DNS message (<= 65,535 bytes), no TLV
  *   ZONE_END (6)      1 rr_count u64 R
@@ -106,7 +106,8 @@ enum {
 enum { KDB_BATCH_STARTUP = 0, KDB_BATCH_FULL, KDB_BATCH_DIFF, KDB_BATCH_ZONE, KDB_BATCH_AUTO };
 enum { KDB_ZK_PRIMARY = 0, KDB_ZK_SECONDARY, KDB_ZK_CATALOG };
 #define KDB_ZF_PRESIGNED 0x1u
-#define KDB_ZF_EXTENDED 0x2u
+#define KDB_ZF_EXTENDED 0x2u    /* ZONE_DATA carries Extended AXFR records (dns_wire.h, xext_*): location / ECS tags, tinydns time stamps and locations */
+#define KDB_ZF_TINYDNS 0x4u     /* B8: the zone is a tinydns zone (ZONE_IMAGE_F_TINYDNS: time-dependent TTLs, never cached), also without any time stamp or location */
 enum { KDB_ST_APPLIED = 0, KDB_ST_UNCHANGED, KDB_ST_REJECTED, KDB_ST_SHADOWED, KDB_ST_DELETED };
 
 typedef enum {

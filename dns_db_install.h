@@ -23,8 +23,10 @@
 
 typedef struct db_zone_build db_zone_build_t;
 
-/* zone: canonical absolute name; rr_count: the count ZONE_BEGIN declared (both SOAs counted).  NULL: out of memory */
-db_zone_build_t *db_zone_build_new(const char *zone, uint64_t rr_count);
+/* zone: canonical absolute name; rr_count: the count ZONE_BEGIN declared (both SOAs counted, and, with KDB_ZF_EXTENDED, the Extended AXFR
+ * marker and definition RRs: tag state records, tag definitions, tinydns location definitions; B8); flags: ZONE_BEGIN flags.  NULL: out
+ * of memory */
+db_zone_build_t *db_zone_build_new(const char *zone, uint64_t rr_count, uint32_t flags);
 /* One ZONE_DATA message.  0, or -1 with a short reason in why (no bytes of the message in it) */
 int db_zone_build_feed(db_zone_build_t *b, const uint8_t *msg, size_t len, char *why, size_t whylen);
 /* ZONE_END: check and publish into entry.  0: published (*notified: a NOTIFY was requested because the serial of a

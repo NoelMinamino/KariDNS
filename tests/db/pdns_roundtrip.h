@@ -56,7 +56,7 @@ static char *rt_canon(const dns_record_t *r) {
     static uint8_t rd[65535];
     long n = dns_record_canonical_rdata(r, rd, sizeof(rd));
     size_t ol = r->name ? strlen(r->name) : 0;
-    char *s = malloc(ol + 64 + (n > 0 ? (size_t)n * 2 : 8));
+    char *s = malloc(ol + 64 + (n > 0 ? (size_t)n * 2 : 8) + (r->bind_location_tag ? strlen(r->bind_location_tag) : 0) + (r->ecs_subnet_tag ? strlen(r->ecs_subnet_tag) : 0) + 64);
     if (!s) return NULL;
     size_t k = 0;
     for (size_t i = 0; i < ol; i++) s[k++] = (char)tolower((unsigned char)r->name[i]);
@@ -68,6 +68,45 @@ static char *rt_canon(const dns_record_t *r) {
         for (long i = 0; i < n; i++) k += (size_t)sprintf(s + k, "%02x", rd[i]);
         s[k] = '\0';
     }
+    /* B8: the Extended AXFR attributes are part of the record: tags (compared without case, as the server matches them), tinydns time
+     * stamp / countdown flag / location */
+    k = strlen(s);
+    if (r->bind_location_tag || r->ecs_subnet_tag || r->tinydns_ttd || r->tinydns_loc[0] || r->tinydns_loc[1]) {
+        k += (size_t)sprintf(s + k, " |loc=");
+        for (const char *p = r->bind_location_tag; p && *p; p++) s[k++] = (char)tolower((unsigned char)*p);
+        k += (size_t)sprintf(s + k, "|ecs=");
+        for (const char *p = r->ecs_subnet_tag; p && *p; p++) s[k++] = (char)tolower((unsigned char)*p);
+        k += (size_t)sprintf(s + k, "|td=%lld|%d|%02x%02x", (long long)r->tinydns_ttd, r->tinydns_ttl_countdown ? 1 : 0,
+                             (unsigned)(uint8_t)r->tinydns_loc[0], (unsigned)(uint8_t)r->tinydns_loc[1]);
+    }
+    return s;
+}
+
+/* B8: the zone level tables of an arena as one text, flattened the way the database holds them: every (tag, CIDR) of the location
+ * definitions, of the ECS definitions, and every tinydns location, in definition order.  Two consecutive definitions of one tag and
+ * one definition with all their CIDRs read the same (the first matching tag wins), so the zone file and the database give one text. */
+static char *rt_flat_tables(const zone_arena_t *a) {
+    size_t cap = 256;
+    for (int i = 0; i < a->bind_location_tag_count; i++)
+        for (int j = 0; j < a->bind_location_tags[i].cidr_count; j++) cap += strlen(a->bind_location_tags[i].tag) + strlen(a->bind_location_tags[i].cidrs[j].cidr) + 8;
+    for (int i = 0; i < a->bind_ecs_tag_count; i++)
+        for (int j = 0; j < a->bind_ecs_tags[i].cidr_count; j++) cap += strlen(a->bind_ecs_tags[i].tag) + strlen(a->bind_ecs_tags[i].cidrs[j].cidr) + 8;
+    cap += (size_t)a->location_count * 40;
+    char *s = malloc(cap);
+    if (!s) return NULL;
+    size_t k = 0;
+    for (int i = 0; i < a->bind_location_tag_count; i++)
+        for (int j = 0; j < a->bind_location_tags[i].cidr_count; j++)
+            k += (size_t)sprintf(s + k, "L %s %s\n", a->bind_location_tags[i].tag, a->bind_location_tags[i].cidrs[j].cidr);
+    for (int i = 0; i < a->bind_ecs_tag_count; i++)
+        for (int j = 0; j < a->bind_ecs_tags[i].cidr_count; j++)
+            k += (size_t)sprintf(s + k, "E %s %s\n", a->bind_ecs_tags[i].tag, a->bind_ecs_tags[i].cidrs[j].cidr);
+    for (int i = 0; i < a->location_count; i++) {
+        const tinydns_location_entry_t *l = &a->locations[i];
+        k += (size_t)sprintf(s + k, "T %02x%02x %u.%u.%u.%u/%u\n", (unsigned)(uint8_t)l->code[0], (unsigned)(uint8_t)l->code[1], l->prefix[0], l->prefix[1],
+                             l->prefix[2], l->prefix[3], l->prefix_bits);
+    }
+    s[k] = '\0';
     return s;
 }
 
@@ -106,6 +145,7 @@ static bool pdns_roundtrip(const pdns_zone_t *z, rt_info_t *info, char *why, siz
     zone_arena_init(&standby);
     axfr_session_t session;
     memset(&session, 0, sizeof(session));
+    session.db_stream = true;            // B8: the Backend reads the loader's stream strictly (dns_db_install.c)
     EVP_MD_CTX *md = EVP_MD_CTX_new();
     char **want = NULL, **got = NULL;
     size_t nwant = 0, ngot = 0;
@@ -155,13 +195,33 @@ static bool pdns_roundtrip(const pdns_zone_t *z, rt_info_t *info, char *why, siz
     }
     if (!begun || !ended) RT_FAIL("stream without ZONE_BEGIN / ZONE_END");
     {
+        if (inf.flags & KDB_ZF_TINYDNS) {                       /* B8: the tinydns flag is part of the digest (dns_pdns_reader.c) */
+            static const uint8_t ftag[] = "KDB1-TINYDNS";
+            EVP_DigestUpdate(md, ftag, sizeof(ftag));
+        }
         uint8_t dg[EVP_MAX_MD_SIZE];
         unsigned dl = 0;
         if (EVP_DigestFinal_ex(md, dg, &dl) != 1 || dl != KDB_DIGEST_LEN || memcmp(dg, inf.digest, dl) != 0)
             RT_FAIL("digest in ZONE_BEGIN does not match the ZONE_DATA bodies");
     }
     if (!session.is_finished) RT_FAIL("transfer not finished (closing SOA missing)");
-    if (standby.count + 1 != inf.rr_count) RT_FAIL("rr_count %llu but %zu RRs parsed", (unsigned long long)inf.rr_count, standby.count);
+    if (standby.count + 1 + session.ext_records != inf.rr_count)
+        RT_FAIL("rr_count %llu but %zu RRs and %llu extension RRs parsed", (unsigned long long)inf.rr_count, standby.count + 1,
+                (unsigned long long)session.ext_records);
+    if (((inf.flags & KDB_ZF_EXTENDED) != 0) != z->has_ext || (z->has_ext != (session.ext_records > 0 || session.ext_wrapped > 0)))
+        RT_FAIL("ZONE_BEGIN flags 0x%x but the zone has_ext is %d and %llu extension RRs were read", inf.flags, (int)z->has_ext,
+                (unsigned long long)session.ext_records);
+    if (((inf.flags & KDB_ZF_TINYDNS) != 0) != ((z->flags & PDNS_F_TINYDNS) != 0)) RT_FAIL("ZONE_BEGIN flags 0x%x lack the tinydns bit", inf.flags);
+    {
+        char *tin = rt_flat_tables(&z->arena), *tout = rt_flat_tables(&standby);
+        bool same = tin && tout && strcmp(tin, tout) == 0;
+        free(tin);
+        free(tout);
+        if (!same) RT_FAIL("the tag and location definitions that came out are not the ones that went in");
+    }
+    /* the flag alone is applied by db_zone_build_new() (dns_db_install.c), not by the transfer parser */
+    if ((z->arena.location_count > 0 || session.ext_wrapped > 0) != standby.is_tinydns_format)
+        RT_FAIL("is_tinydns_format %d after the transfer", (int)standby.is_tinydns_format);
     if (standby.count != z->arena.count) RT_FAIL("%zu RRs came back, %zu went in", standby.count, z->arena.count);
     if (standby.count == 0 || standby.records[0].type_code != 6) RT_FAIL("first RR is not the SOA");
 
@@ -182,5 +242,22 @@ done:
     return ok;
 }
 #undef RT_FAIL
+
+/* Is the zone's error the reader's own "internal error" (a bug for the harnesses)?  The message is "zone 'Z': MSG" or
+ * "zone 'Z' records.id N: MSG" and MSG may quote row text, so only an MSG that starts with "internal error" counts (a
+ * fuzzed tag name "einternal error.0/24" inside a message is not one). */
+static inline bool pdns_error_is_internal(const pdns_zone_t *z) {
+    const char *e = z->error;
+    size_t zl = strlen(z->name);
+    if (strncmp(e, "zone '", 6) != 0 || strncmp(e + 6, z->name, zl) != 0 || e[6 + zl] != '\'') return false;
+    const char *p = e + 6 + zl + 1;
+    if (strncmp(p, " records.id ", 12) == 0) {
+        p += 12;
+        if (*p == '-') p++;
+        while (isdigit((unsigned char)*p)) p++;
+    }
+    if (strncmp(p, ": ", 2) != 0) return false;
+    return strncmp(p + 2, "internal error", 14) == 0;
+}
 
 #endif

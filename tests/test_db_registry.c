@@ -30,6 +30,7 @@
 
 #include "../dns_config_parser.h"
 #include "../dns_db_install.h"
+#include "../dns_db_stream.h"
 #include "../dns_utils.h"
 #include "db/xfr_mocks.h"
 
@@ -158,9 +159,19 @@ static zone_db_entry_t *new_entry(const char *view, const char *zone) {
     return e;
 }
 
+static int install_msgs_f(zone_db_entry_t *e, const char *zone, uint64_t declared, uint32_t flags, const msg_t *ms, int nm, char *why, size_t whylen) {
+    db_zone_build_t *b = db_zone_build_new(zone, declared, flags);
+    CHECK(b != NULL);
+    int rc = 0;
+    for (int i = 0; i < nm && rc == 0; i++) rc = db_zone_build_feed(b, ms[i].b, ms[i].n, why, whylen);
+    if (rc == 0) rc = db_zone_build_install(b, e, NULL, why, whylen);
+    db_zone_build_free(b);
+    return rc;
+}
+
 static int install_msgs(zone_db_entry_t *e, const char *zone, uint64_t declared, const msg_t *ms, int nm,
                         char *why, size_t whylen, bool *notified) {
-    db_zone_build_t *b = db_zone_build_new(zone, declared);
+    db_zone_build_t *b = db_zone_build_new(zone, declared, 0);
     CHECK(b != NULL);
     int rc = 0;
     for (int i = 0; i < nm && rc == 0; i++) rc = db_zone_build_feed(b, ms[i].b, ms[i].n, why, whylen);
@@ -254,13 +265,13 @@ static void test_install(void) {
     CHECK(install_msgs(e, "a.test.", 4, &m, 1, why, sizeof(why), NULL) != 0 && strstr(why, "count mismatch"));
     {   /* an owner outside the zone: AXFR-in would skip it, the DB path refuses the zone */
         msg_init(&m); msg_soa(&m, "a.test.", 31); msg_a(&m, "host.other.test.", 1); msg_soa(&m, "a.test.", 31);
-        db_zone_build_t *b = db_zone_build_new("a.test.", 3);
+        db_zone_build_t *b = db_zone_build_new("a.test.", 3, 0);
         CHECK(db_zone_build_feed(b, m.b, m.n, why, sizeof(why)) != 0 && strstr(why, "outside the zone"));
         db_zone_build_free(b);
     }
     {   /* the apex SOA of another zone */
         msg_init(&m); msg_soa(&m, "b.test.", 31); msg_soa(&m, "b.test.", 31);
-        db_zone_build_t *b = db_zone_build_new("a.test.", 2);
+        db_zone_build_t *b = db_zone_build_new("a.test.", 2, 0);
         CHECK(db_zone_build_feed(b, m.b, m.n, why, sizeof(why)) != 0);
         db_zone_build_free(b);
     }
@@ -274,13 +285,13 @@ static void test_install(void) {
     }
     {   /* a record after the closing SOA, in the same message and in a later one */
         msg_init(&m); msg_soa(&m, "a.test.", 31); msg_soa(&m, "a.test.", 31); msg_a(&m, "x.a.test.", 1);
-        db_zone_build_t *b = db_zone_build_new("a.test.", 3);
+        db_zone_build_t *b = db_zone_build_new("a.test.", 3, 0);
         CHECK(db_zone_build_feed(b, m.b, m.n, why, sizeof(why)) != 0 && strstr(why, "after the final SOA"));
         db_zone_build_free(b);
         msg_t a, c;
         msg_init(&a); msg_soa(&a, "a.test.", 31); msg_soa(&a, "a.test.", 31);
         msg_init(&c); msg_a(&c, "x.a.test.", 1);
-        b = db_zone_build_new("a.test.", 3);
+        b = db_zone_build_new("a.test.", 3, 0);
         CHECK(db_zone_build_feed(b, a.b, a.n, why, sizeof(why)) == 0);
         CHECK(db_zone_build_feed(b, c.b, c.n, why, sizeof(why)) != 0 && strstr(why, "after the final SOA"));
         db_zone_build_free(b);
@@ -298,11 +309,55 @@ static void test_install(void) {
     {   /* garbage inside a valid frame: a truncated RR */
         zone_msg(&m, "a.test.", 31, 2);
         m.n -= 7;
-        db_zone_build_t *b = db_zone_build_new("a.test.", 6);
+        db_zone_build_t *b = db_zone_build_new("a.test.", 6, 0);
         CHECK(db_zone_build_feed(b, m.b, m.n, why, sizeof(why)) != 0 && strstr(why, "malformed"));
         db_zone_build_free(b);
     }
+    {   /* B8: Extended AXFR records of the database stream */
+        uint8_t lan[3] = { 'l', 'a', 'n' };
+        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_rr(&m, "a.test.", 65401, 65302, lan, 3); msg_a(&m, "x.a.test.", 1);
+        msg_rr(&m, "a.test.", 65401, 65302, (const uint8_t *)"", 0); msg_soa(&m, "a.test.", 31);
+        CHECK(install_msgs_f(e, "a.test.", 5, 0, &m, 1, why, sizeof(why)) != 0 && strstr(why, "did not announce"));
+        CHECK(install_msgs_f(e, "a.test.", 3, KDB_ZF_EXTENDED, &m, 1, why, sizeof(why)) != 0 && strstr(why, "count mismatch"));
+        uint8_t tr[2] = { 1, 0 };
+        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_rr(&m, "a.test.", 65407, 65302, tr, 2); msg_soa(&m, "a.test.", 31);
+        CHECK(install_msgs_f(e, "a.test.", 3, KDB_ZF_EXTENDED, &m, 1, why, sizeof(why)) != 0);                 /* ECS_TRUSTED: settings only */
+        uint8_t bad[1] = { 'x' };
+        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_rr(&m, "a.test.", 65403, 65302, bad, 1); msg_soa(&m, "a.test.", 31);
+        CHECK(install_msgs_f(e, "a.test.", 3, KDB_ZF_EXTENDED, &m, 1, why, sizeof(why)) != 0);                 /* malformed LOC_TAGDEF */
+        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_rr(&m, "a.test.", 65405, 65302, bad, 1); msg_soa(&m, "a.test.", 31);
+        CHECK(install_msgs_f(e, "a.test.", 3, KDB_ZF_EXTENDED, &m, 1, why, sizeof(why)) != 0);                 /* malformed TINYDNS_LOCDEF */
+        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_rr(&m, "x.a.test.", 65406, 65302, bad, 1); msg_soa(&m, "a.test.", 31);
+        CHECK(install_msgs_f(e, "a.test.", 3, KDB_ZF_EXTENDED, &m, 1, why, sizeof(why)) != 0);                 /* TINYDNS_WRAP shorter than its fixed part */
+        uint8_t longtag[70];
+        memset(longtag, 'a', sizeof(longtag));
+        msg_init(&m); msg_soa(&m, "a.test.", 31); msg_rr(&m, "a.test.", 65401, 65302, longtag, sizeof(longtag)); msg_soa(&m, "a.test.", 31);
+        CHECK(install_msgs_f(e, "a.test.", 3, KDB_ZF_EXTENDED, &m, 1, why, sizeof(why)) != 0);                 /* tag state longer than 63 */
+    }
     CHECK(e->serial == keep_serial && atomic_load(&e->rcu.active)->image->n_rrs == keep_rrs);
+    {   /* B8: an announced zone is installed: the tag reaches the image, the tinydns flag too */
+        uint8_t lan[3] = { 'l', 'a', 'n' };
+        msg_t m;
+        char why[128];
+        msg_init(&m); msg_soa(&m, "a.test.", 40); msg_rr(&m, "a.test.", 65401, 65302, lan, 3); msg_a(&m, "x.a.test.", 1);
+        msg_rr(&m, "a.test.", 65401, 65302, (const uint8_t *)"", 0); msg_soa(&m, "a.test.", 40);
+        CHECK(install_msgs_f(e, "a.test.", 5, KDB_ZF_EXTENDED | KDB_ZF_TINYDNS, &m, 1, why, sizeof(why)) == 0);
+        const zone_image_t *img = atomic_load(&e->rcu.active)->image;
+        CHECK(img && img->n_rrs == 2 && (img->flags & ZONE_IMAGE_F_TINYDNS));
+        bool tagged = false;
+        for (uint32_t k = 0; img && k < img->n_rrs; k++) {
+            const zone_image_ext_t *x = zone_image_rr_ext(img, k);
+            if (x && x->loc_tag_off && strcmp(zone_image_str(img, x->loc_tag_off), "lan") == 0) tagged = true;
+        }
+        CHECK(tagged);
+        msg_init(&m); msg_soa(&m, "a.test.", 41); msg_a(&m, "x.a.test.", 1); msg_soa(&m, "a.test.", 41);   /* the flag alone: no extension records */
+        CHECK(install_msgs_f(e, "a.test.", 3, KDB_ZF_TINYDNS, &m, 1, why, sizeof(why)) == 0);
+        img = atomic_load(&e->rcu.active)->image;
+        CHECK(img && (img->flags & ZONE_IMAGE_F_TINYDNS));
+        CHECK(install_msgs_f(e, "a.test.", 3, 0, &m, 1, why, sizeof(why)) == 0);
+        img = atomic_load(&e->rcu.active)->image;
+        CHECK(img && !(img->flags & ZONE_IMAGE_F_TINYDNS));
+    }
     zone_retire_process(true);          /* the retired versions hold a reference of the entry */
     free_zone_db_entry(e);
 }

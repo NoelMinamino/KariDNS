@@ -55,6 +55,7 @@ typedef struct {
     bool has_changes;               /* karidns_changes exists (created by the B6 DDL) */
     bool has_domain_views;          /* karidns_domain_views exists (B6b, design 3.7, 7.1) */
     bool has_profiles;              /* karidns_profiles exists (B7a, design 3.7) */
+    bool has_ext;                   /* karidns_record_tags, karidns_record_tinydns and karidns_zone_tagdefs exist (B8, design 3.7) */
 } db_schema_info_t;
 
 /* PostgreSQL only: written to karidns_server_status (B11).  SQLite3 ignores it. */
@@ -74,6 +75,13 @@ typedef int (*db_change_cb)(void *ud, const db_change_row_t *row);
 typedef int (*db_domain_view_cb)(void *ud, int64_t domain_id, const char *view_name);
 typedef struct { const char *name, *settings; } db_profile_row_t;       /* one row of karidns_profiles */
 typedef int (*db_profile_cb)(void *ud, const db_profile_row_t *row);
+/* B8: the three extension tables, one callback each.  domain_id is the zone of the row (records.domain_id for the record tables). */
+typedef struct {
+    int (*record_tags)(void *ud, int64_t domain_id, const db_tag_row_t *row);
+    int (*record_tinydns)(void *ud, int64_t domain_id, const db_tinydns_row_t *row);
+    int (*tagdef)(void *ud, int64_t domain_id, const db_tagdef_row_t *row);
+    void *ud;
+} db_ext_sink_t;
 
 typedef struct db_driver {
     const char *name;               /* "sqlite3", "postgresql" */
@@ -110,6 +118,11 @@ typedef struct db_driver {
     /* B7a: rows of karidns_profiles (name, settings), ORDER BY name.  DB_ERR_UNAVAILABLE when the table does not exist (the
      * database has no profiles).  A NULL name or settings, or one with an embedded NUL, is an error naming the table. */
     int (*scan_profiles)(db_conn_t *c, db_profile_cb cb, void *ud);
+    /* B8: rows of karidns_record_tags, karidns_record_tinydns (ordered by domain_id, record_id) and karidns_zone_tagdefs (ordered by
+     * domain_id, then in the order the rows were inserted: the order of the definitions of a zone file) for domain_id, or for every
+     * domain when it is NULL; the three tables one after the other.  A callback returning non-zero stops the scan (DB_STOPPED).
+     * DB_ERR_UNAVAILABLE when the tables do not exist (a plain PowerDNS database: no tags). */
+    int (*scan_ext)(db_conn_t *c, const int64_t *domain_id, const db_ext_sink_t *sink);
 } db_driver_t;
 
 /* compiled in when the driver is listed in DB_DRIVERS (Makefile) */

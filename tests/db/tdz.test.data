@@ -1,0 +1,24 @@
+# tests/db/tdz.test.data - tinydns data with locations, activation time stamps and countdown TTLs for the B8 tests
+# (run_db_tags_test.sh).  Time stamps are TAI64 labels: 400000007fffffff is 2038-01-19 (far in the future: a record with a
+# TTL is not served yet, a record with TTL 0 counts down and is capped at 3600), 400000000000000a is in the past.
+Ztdz.test:ns1.tdz.test:hostmaster.tdz.test:2026102401:3600:600:86400:300:300
+&tdz.test::ns1.tdz.test:300
++ns1.tdz.test:192.0.2.53:300
+%l2:127.0.0.2
+%l3:127.0.0.3
+%lw:127.0.0.0/24
++www.tdz.test:192.0.2.1:300
++www.tdz.test:192.0.2.12:300::l2
++www.tdz.test:192.0.2.13:300::l3
++www.tdz.test:192.0.2.14:300::lw
++cd.tdz.test:192.0.2.20:0:400000007fffffff
++cd2.tdz.test:192.0.2.25:0:400000007fffffff:l2
++act.tdz.test:192.0.2.21:300:400000000000000a
++fut.tdz.test:192.0.2.22:300:400000007fffffff
++both.tdz.test:192.0.2.23:300:400000000000000a:l3
++a\056b.tdz.test:192.0.2.30:300::l2
+@tdz.test::mail.tdz.test:10:300
++mail.tdz.test:192.0.2.60:300
+'tdz.test:v=spf1 -all:300
+Cc.tdz.test:www.tdz.test:300
+3ip6.tdz.test:20010db8000000000000000000000001:300

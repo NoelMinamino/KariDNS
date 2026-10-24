@@ -3,12 +3,15 @@
  * a list to one server and writes the exact response bytes, so the answers of two servers can be compared with the
  * message ID masked (dag output has times and servers in it).
  *
- *   dbquery -p PORT [-s ADDR] [-t SECONDS] LIST OUT
+ *   dbquery -p PORT [-s ADDR] [-b SRC] [-t SECONDS] LIST OUT
  *
- * LIST: one query per line, "name TYPE MODE"; MODE is
+ * LIST: one query per line, "name TYPE MODE [ECS]"; MODE is
  *   p   plain query (no EDNS: the 512 byte limit applies)
  *   e   EDNS0, UDP size 1232, DO = 0
  *   d   EDNS0, UDP size 1232, DO = 1
+ * ECS (modes e and d only): "a.b.c.d/N" or "x:y::/N" adds an EDNS Client Subnet option (RFC 7871 section 6: FAMILY, SOURCE
+ * PREFIX-LENGTH N, SCOPE PREFIX-LENGTH 0, ADDRESS truncated to N bits).  -b SRC binds the source address of the queries (the
+ * 127.0.0.x aliases of the per-client comparisons of tags and tinydns locations, B8).
  * Lines starting with '#' and empty lines are ignored.  TYPE is a mnemonic (A NS CNAME SOA PTR MX TXT AAAA SRV
  * NAPTR DS DNSKEY RRSIG NSEC NSEC3 NSEC3PARAM TLSA SVCB HTTPS CAA ANY, ...) or TYPEnnn.
  *
@@ -147,18 +150,48 @@ static void fold_owners(uint8_t *m, size_t len) {
     }
 }
 
+/* EDNS Client Subnet option (RFC 7871 section 6) from "addr/len"; 0, or -1 */
+static int add_ecs(uint8_t *q, size_t *np, const char *spec) {
+    char a[64];
+    const char *sl = strchr(spec, '/');
+    if (!sl || (size_t)(sl - spec) >= sizeof(a)) return -1;
+    memcpy(a, spec, (size_t)(sl - spec));
+    a[sl - spec] = '\0';
+    char *end;
+    long len = strtol(sl + 1, &end, 10);
+    uint8_t addr[16];
+    uint16_t fam;
+    long maxbits;
+    if (inet_pton(AF_INET, a, addr) == 1) { fam = 1; maxbits = 32; }
+    else if (inet_pton(AF_INET6, a, addr) == 1) { fam = 2; maxbits = 128; }
+    else return -1;
+    if (*end || len < 0 || len > maxbits) return -1;
+    size_t nb = ((size_t)len + 7) / 8;
+    if (len % 8) addr[nb - 1] &= (uint8_t)(0xFF << (8 - len % 8));
+    size_t n = *np;
+    q[n++] = 0; q[n++] = 8;                            /* option code 8 */
+    q[n++] = 0; q[n++] = (uint8_t)(4 + nb);
+    q[n++] = (uint8_t)(fam >> 8); q[n++] = (uint8_t)fam;
+    q[n++] = (uint8_t)len; q[n++] = 0;
+    memcpy(q + n, addr, nb);
+    n += nb;
+    *np = n;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int port = 0, tmo = 2;
-    const char *addr = "127.0.0.1";
+    const char *addr = "127.0.0.1", *src = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "p:s:t:")) != -1) {
+    while ((opt = getopt(argc, argv, "p:s:b:t:")) != -1) {
         if (opt == 'p') port = atoi(optarg);
+        else if (opt == 'b') src = optarg;
         else if (opt == 's') addr = optarg;
         else if (opt == 't') tmo = atoi(optarg);
         else return 2;
     }
     if (port <= 0 || optind + 2 != argc) {
-        fprintf(stderr, "usage: dbquery -p PORT [-s ADDR] [-t SECONDS] LIST OUT\n");
+        fprintf(stderr, "usage: dbquery -p PORT [-s ADDR] [-b SRC] [-t SECONDS] LIST OUT\n");
         return 2;
     }
     FILE *in = fopen(argv[optind], "r");
@@ -176,6 +209,15 @@ int main(int argc, char **argv) {
         return 2;
     }
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd >= 0 && src) {
+        struct sockaddr_in bsa;
+        memset(&bsa, 0, sizeof(bsa));
+        bsa.sin_family = AF_INET;
+        if (inet_pton(AF_INET, src, &bsa.sin_addr) != 1 || bind(fd, (struct sockaddr *)&bsa, sizeof(bsa)) != 0) {
+            perror("bind");
+            return 2;
+        }
+    }
     if (fd < 0 || connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
         perror("socket/connect");
         return 2;
@@ -187,8 +229,8 @@ int main(int argc, char **argv) {
         size_t ll = strlen(line);
         while (ll > 0 && (line[ll - 1] == '\n' || line[ll - 1] == '\r')) line[--ll] = '\0';
         if (ll == 0 || line[0] == '#') continue;
-        char name[1500], type[64], mode[8];
-        if (sscanf(line, "%1499s %63s %7s", name, type, mode) != 3) {
+        char name[1500], type[64], mode[8], ecs[80] = "";
+        if (sscanf(line, "%1499s %63s %7s %79s", name, type, mode, ecs) < 3) {
             fprintf(stderr, "bad line: %s\n", line);
             return 2;
         }
@@ -220,7 +262,16 @@ int main(int argc, char **argv) {
             q[n++] = 0; q[n++] = 0;                      /* extended rcode, version */
             q[n++] = mode[0] == 'd' ? 0x80 : 0;          /* DO */
             q[n++] = 0;
+            size_t rdl_at = n;
             q[n++] = 0; q[n++] = 0;                      /* RDLEN */
+            if (ecs[0]) {
+                if (add_ecs(q, &n, ecs) != 0) {
+                    fprintf(stderr, "bad ECS in: %s\n", line);
+                    return 2;
+                }
+                q[rdl_at] = (uint8_t)((n - rdl_at - 2) >> 8);
+                q[rdl_at + 1] = (uint8_t)(n - rdl_at - 2);
+            }
         }
         uint8_t r[65536];
         ssize_t rn = -1;

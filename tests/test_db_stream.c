@@ -664,10 +664,10 @@ static void test_tlv_rejects(void) {
     {   /* reserved zone flag bit */
         uint8_t dig[KDB_DIGEST_LEN] = { 0 };
         kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, ZN); kdb_enc_i64(&e, 3, 1); kdb_enc_u8(&e, 4, 0); kdb_enc_u32(&e, 5, 1);
-        kdb_enc_u32(&e, 6, 4); kdb_enc_u64(&e, 7, 4); kdb_enc_bytes(&e, 8, dig, sizeof(dig));
+        kdb_enc_u32(&e, 6, 8); kdb_enc_u64(&e, 7, 4); kdb_enc_bytes(&e, 8, dig, sizeof(dig));
     }
     kdb_enc_end(&e);
-    CHECK_RC("reserved zone flag", send_enc(KDB_S_IN_BATCH, &e), KDB_E_RANGE);
+    CHECK_RC("reserved zone flag (bit 3; bit 2 is the tinydns flag since B8)", send_enc(KDB_S_IN_BATCH, &e), KDB_E_RANGE);
     kdb_enc_free(&e);
 }
 

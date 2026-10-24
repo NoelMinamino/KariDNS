@@ -5015,3 +5015,182 @@ bool parse_query_question_fast(const uint8_t *buf, size_t len, char *qname, size
     return false;
 }
 
+
+/* ============================================================================
+ * Extended AXFR records: the one encoder (see dns_wire.h)
+ * ============================================================================ */
+
+#define XEXT_SCRATCH 65535u
+
+void xext_init(xext_t *x, const char *zone, xext_emit_fn emit, void *ud) {
+    memset(x, 0, sizeof(*x));
+    x->zone = zone;
+    x->emit = emit;
+    x->ud = ud;
+}
+
+void xext_free(xext_t *x) {
+    free(x->scratch);
+    x->scratch = NULL;
+}
+
+static int xext_emit_blob(xext_t *x, uint16_t type, const uint8_t *data, size_t len) {
+    if (len > 0xFFFF) return -1;
+    dns_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.name = (char *)x->zone;
+    rec.type_code = type;
+    rec.class_val = DNS_CLASS_KARIDNS_EXT;
+    rec.class_str = "KARIDNS";
+    rec.generic_data = (uint8_t *)data;
+    rec.generic_len = (uint16_t)len;
+    return x->emit(x->ud, &rec);
+}
+
+static uint8_t *xext_buf(xext_t *x) {
+    if (!x->scratch) x->scratch = malloc(XEXT_SCRATCH);
+    return x->scratch;
+}
+
+int xext_select(xext_t *x, const char *loc_tag, const char *ecs_tag) {
+    const char *r_loc = loc_tag ? loc_tag : "";
+    if (strcasecmp(r_loc, x->cur_loc ? x->cur_loc : "") != 0) {
+        if (xext_emit_blob(x, DNS_TYPE_KARIDNS_LOC_STATE, (const uint8_t *)r_loc, strlen(r_loc)) < 0) return -1;
+        x->cur_loc = loc_tag;
+    }
+    const char *r_ecs = ecs_tag ? ecs_tag : "";
+    if (strcasecmp(r_ecs, x->cur_ecs ? x->cur_ecs : "") != 0) {
+        if (xext_emit_blob(x, DNS_TYPE_KARIDNS_ECS_STATE, (const uint8_t *)r_ecs, strlen(r_ecs)) < 0) return -1;
+        x->cur_ecs = ecs_tag;
+    }
+    return 0;
+}
+
+int xext_finish(xext_t *x) {
+    if (x->cur_loc && *x->cur_loc) {
+        if (xext_emit_blob(x, DNS_TYPE_KARIDNS_LOC_STATE, (const uint8_t *)"", 0) < 0) return -1;
+        x->cur_loc = NULL;
+    }
+    if (x->cur_ecs && *x->cur_ecs) {
+        if (xext_emit_blob(x, DNS_TYPE_KARIDNS_ECS_STATE, (const uint8_t *)"", 0) < 0) return -1;
+        x->cur_ecs = NULL;
+    }
+    return 0;
+}
+
+size_t pack_tag_def_rdata(uint8_t *buf, size_t buf_cap, const ecs_tag_def_t *def) {
+  if (!def || !buf) return 0;
+  size_t tag_len = strlen(def->tag) + 1;
+  if (tag_len + 2 > buf_cap) return 0;
+  memcpy(buf, def->tag, tag_len);
+  size_t off = tag_len;
+  buf[off++] = (def->cidr_count >> 8) & 0xFF;
+  buf[off++] = def->cidr_count & 0xFF;
+  for (int j = 0; j < def->cidr_count; j++) {
+    size_t c_len = strlen(def->cidrs[j].cidr) + 1;
+    if (off + c_len > buf_cap) return 0;
+    memcpy(buf + off, def->cidrs[j].cidr, c_len);
+    off += c_len;
+  }
+  return off;
+}
+
+int xext_emit_tagdef(xext_t *x, bool ecs, const ecs_tag_def_t *def) {
+    uint8_t *buf = xext_buf(x);
+    if (!buf) return -1;
+    size_t dlen = pack_tag_def_rdata(buf, XEXT_SCRATCH, def);
+    if (dlen == 0) return -1;      /* a definition that does not fit one RR: the transfer fails rather than serving a different zone */
+    return xext_emit_blob(x, ecs ? DNS_TYPE_KARIDNS_ECS_TAGDEF : DNS_TYPE_KARIDNS_LOC_TAGDEF, buf, dlen);
+}
+
+int xext_emit_trusted(xext_t *x, char *const *list, int count) {
+    if (count <= 0 || !list) return 0;
+    uint8_t *buf = xext_buf(x);
+    if (!buf) return -1;
+    if (count > 255) count = 255;
+    size_t off = 0;
+    buf[off++] = (uint8_t)count;
+    for (int i = 0; i < count; i++) {
+        if (!list[i]) continue;
+        size_t slen = strlen(list[i]);
+        if (slen > 255) slen = 255;
+        if (off + 1 + slen > XEXT_SCRATCH) break;
+        buf[off++] = (uint8_t)slen;
+        memcpy(&buf[off], list[i], slen);
+        off += slen;
+    }
+    return xext_emit_blob(x, DNS_TYPE_KARIDNS_ECS_TRUSTED, buf, off);
+}
+
+int xext_emit_locdef(xext_t *x, const char code[2], uint8_t prefix_bits, const uint8_t network[4]) {
+    uint8_t b[7];
+    b[0] = (uint8_t)code[0];
+    b[1] = (uint8_t)code[1];
+    b[2] = prefix_bits;
+    memcpy(&b[3], network, 4);
+    return xext_emit_blob(x, DNS_TYPE_KARIDNS_TINYDNS_LOCDEF, b, sizeof(b));
+}
+
+/* The wrapper record around the RR written at tmp_wire[0, tmp_off) (owner, fixed fields, RDATA compressed against
+ * tmp_wire itself): the original TYPE / CLASS / TTL / RDATA, the tinydns location and time stamp. */
+bool wrap_tinydns_wire(const uint8_t *tmp_wire, uint16_t tmp_off, const char loc[2], int64_t tinydns_ttd,
+                       bool countdown, const char *name, uint32_t ttl_value,
+                       dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap) {
+  size_t p = 0;
+  if (skip_wire_name(tmp_wire, tmp_off, 0, &p) != 0) return false;
+  if (p + 10 > tmp_off) return false;
+  uint16_t orig_type = (tmp_wire[p] << 8) | tmp_wire[p+1];
+  uint16_t orig_class = (tmp_wire[p+2] << 8) | tmp_wire[p+3];
+  uint32_t orig_ttl = ((uint32_t)tmp_wire[p+4] << 24) | ((uint32_t)tmp_wire[p+5] << 16) | ((uint32_t)tmp_wire[p+6] << 8) | tmp_wire[p+7];
+  uint16_t orig_rdlen = (tmp_wire[p+8] << 8) | tmp_wire[p+9];
+  if (p + 10 + orig_rdlen > tmp_off) return false;
+  const uint8_t *orig_rdata = &tmp_wire[p+10];
+
+  size_t total_wrap_len = 21 + orig_rdlen;
+  if (total_wrap_len > wrap_buf_cap) return false;
+
+  wrap_buf[0] = (orig_type >> 8) & 0xFF;
+  wrap_buf[1] = orig_type & 0xFF;
+  wrap_buf[2] = (orig_class >> 8) & 0xFF;
+  wrap_buf[3] = orig_class & 0xFF;
+  wrap_buf[4] = (orig_ttl >> 24) & 0xFF;
+  wrap_buf[5] = (orig_ttl >> 16) & 0xFF;
+  wrap_buf[6] = (orig_ttl >> 8) & 0xFF;
+  wrap_buf[7] = orig_ttl & 0xFF;
+  wrap_buf[8] = (uint8_t)loc[0];
+  wrap_buf[9] = (uint8_t)loc[1];
+  uint64_t ttd = (uint64_t)tinydns_ttd;
+  for (int b = 0; b < 8; b++) {
+    wrap_buf[10 + b] = (ttd >> ((7 - b) * 8)) & 0xFF;
+  }
+  wrap_buf[18] = countdown ? 1 : 0;
+  wrap_buf[19] = (orig_rdlen >> 8) & 0xFF;
+  wrap_buf[20] = orig_rdlen & 0xFF;
+  if (orig_rdlen > 0) {
+    memcpy(&wrap_buf[21], orig_rdata, orig_rdlen);
+  }
+
+  memset(out_wrap, 0, sizeof(*out_wrap));
+  out_wrap->name = (char *)name;
+  out_wrap->type_code = DNS_TYPE_KARIDNS_TINYDNS_WRAP;
+  out_wrap->class_val = DNS_CLASS_KARIDNS_EXT;
+  out_wrap->class_str = "KARIDNS";
+  out_wrap->ttl_value = ttl_value;
+  out_wrap->generic_data = wrap_buf;
+  out_wrap->generic_len = total_wrap_len;
+  return true;
+}
+
+bool wrap_tinydns_record(const dns_record_t *rec, dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap) {
+  if (!rec || !out_wrap || !wrap_buf) return false;
+  uint8_t tmp_wire[4096];
+  uint16_t tmp_off = 0;
+  compress_ctx_t dummy_comp;
+  memset(&dummy_comp, 0, sizeof(dummy_comp));
+  compress_ctx_init_packet(&dummy_comp);
+  if (serialize_dns_record(tmp_wire, sizeof(tmp_wire), &tmp_off, (dns_record_t *)rec, &dummy_comp, NULL, 0xFFFFFFFF) < 0) {
+    return false;
+  }
+  return wrap_tinydns_wire(tmp_wire, tmp_off, rec->tinydns_loc, (int64_t)rec->tinydns_ttd, rec->tinydns_ttl_countdown,
+                           rec->name, rec->ttl_value, out_wrap, wrap_buf, wrap_buf_cap);
+}

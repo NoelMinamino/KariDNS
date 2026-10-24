@@ -1831,6 +1831,25 @@ static zone_config_t *db_zone_from(const char *text) {
     return z;
 }
 
+/* B8: ecs-trusted-resolvers in the settings text of a DB zone */
+static void test_db_ecs_trusted(void) {
+    char err[200];
+    zone_ext_shared_t *sh = db_parse_quiet("ecs-trusted-resolvers { 127.0.0.2; !192.0.2.0/25; 192.0.2.0/24; 2001:db8::/32; };", err, sizeof(err));
+    CHECK(sh != NULL);
+    if (sh) {
+        CHECK(sh->ext.ecs_trusted_resolvers_count == 4 && sh->ext.ecs_trusted_resolvers_parsed && sh->ext.db_acl_ceiling);
+        CHECK(sh->ext.ecs_trusted_resolvers_parsed[1].is_deny);
+        zone_ext_shared_unref(sh);
+    }
+    /* a later statement replaces the earlier one (profile text first, zone text after it) */
+    sh = db_parse_quiet("ecs-trusted-resolvers { 192.0.2.1; 192.0.2.2; }; ecs-trusted-resolvers { 198.51.100.1; };", err, sizeof(err));
+    CHECK(sh != NULL && sh->ext.ecs_trusted_resolvers_count == 1 && strcmp(sh->ext.ecs_trusted_resolvers[0], "198.51.100.1") == 0);
+    if (sh) zone_ext_shared_unref(sh);
+    expect_db_reject("ecs-trusted-resolvers { resolver.example; };", "ecs-trusted-resolvers");
+    expect_db_reject("ecs-trusted-resolvers { 192.0.2.1 };", NULL);
+    expect_db_reject("ecs-tags { };", "not allowed");
+}
+
 static void test_db_settings_and_acl_match(void) {
     printf("[TEST] transfer-acl-match / update-acl-match, DB zone settings (restricted parse), acl-ceiling...\n");
     server_config_t cfg;
@@ -2232,6 +2251,7 @@ int main(void) {
     test_zone_ext_layout();
     test_zone_flat_list_removed();
     test_db_settings_and_acl_match();
+    test_db_ecs_trusted();
     test_acl_ceiling_match_and_masters();
 
     printf("[*] %d checks, %d failed\n", g_checks, g_failed);
