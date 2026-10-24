@@ -113,6 +113,10 @@ void *arena_alloc(zone_arena_t *arena, size_t size);
 // KariDNS 拡張定数 (Private Use 範囲: RFC 6895 / IANA DNS Parameters)
 // ============================================================================
 #define DNS_CLASS_KARIDNS_EXT           65302
+/* B9a: PowerDNS's ALIAS and LUA records, TYPE 65401 / 65402 of CLASS IN (design 3.6b).  The Extended AXFR records below use the
+ * same type numbers in CLASS 65302, so a record is told apart by the pair (type, class), never by the type alone. */
+#define DNS_TYPE_PDNS_ALIAS             65401
+#define DNS_TYPE_PDNS_LUA               65402
 #define DNS_TYPE_KARIDNS_LOC_STATE      65401
 #define DNS_TYPE_KARIDNS_ECS_STATE      65402
 #define DNS_TYPE_KARIDNS_LOC_TAGDEF     65403

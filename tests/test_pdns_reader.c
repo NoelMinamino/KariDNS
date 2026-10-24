@@ -536,10 +536,6 @@ static void test_rejections(void) {
     reject("type unknown to the parser", R(0, "x.z.test", "FOOBAR", "192.0.2.1", 300, 0), "Unknown record type");
     reject("type meta (AXFR)", R(0, "x.z.test", "AXFR", "192.0.2.1", 300, 0), "Meta-type");
     reject("type OPT", R(0, "x.z.test", "OPT", "0", 300, 0), "Meta-type");
-    /* ALIAS and LUA: distinct reasons for B9a */
-    reject("ALIAS", R(0, "x.z.test", "ALIAS", "target.z.test", 300, 0), "ALIAS records are not supported yet");
-    reject("alias lowercase", R(0, "x.z.test", "alias", "target.z.test", 300, 0), "ALIAS records are not supported yet");
-    reject("LUA", R(0, "x.z.test", "LUA", "A \"ifportup(443, {'192.0.2.1'})\"", 300, 0), "LUA records are not supported yet");
     /* ttl */
     reject("ttl negative", R(0, "x.z.test", "A", "192.0.2.1", -1, 0), "ttl -1");
     reject("ttl 2^31", R(0, "x.z.test", "A", "192.0.2.1", 2147483648LL, 0), "ttl 2147483648");
@@ -614,6 +610,75 @@ static void test_ttl_rules(void) {
     z = build(rows, 3, NULL, 0, NULL);                /* default-ttl 3600 */
     CHECK(z->arena.records[1].ttl_value == 3600);
     pdns_zone_free(z);
+}
+
+/* B9a: ALIAS and LUA rows are read (TYPE65401 / TYPE65402, PowerDNS's own transfer form); their zone rules are checked */
+static void test_b9a_alias_lua(void) {
+    printf("ALIAS and LUA rows (B9a)\n");
+    {
+        db_record_row_t rows[] = {
+            R(10, "a.z.test", "ALIAS", "target.example.net.", 120, 0),
+            R(11, "l.z.test", "LUA", "A \";return {'192.0.2.1'}\"", 120, 0),
+            R(12, "l.z.test", "TXT", "\"x\"", 120, 0),
+            R(13, "rel.z.test", "ALIAS", "Rel", 120, 0),                     /* a name without a trailing dot is relative to the root in PowerDNS content: here too */
+        };
+        pdns_zone_t *z = build(rows, 4, NULL, 0, NULL);
+        CHECK_MSG(!z->failed, "%s", z->error);
+        CHECK(z->arena.count == 5);
+        if (z->arena.count == 5) {
+            char hex[256];
+            CHECK(z->arena.records[1].type_code == 65401 && z->arena.records[1].class_val == 1);
+            rdata_hex(z, 1, hex, sizeof(hex));
+            CHECK_STR(hex, "06746172676574076578616d706c65036e657400");
+            CHECK(z->arena.records[2].type_code == 65402);
+            rdata_hex(z, 2, hex, sizeof(hex));
+            CHECK_STR(hex, "0001153b72657475726e207b273139322e302e322e31277d");
+            rdata_hex(z, 4, hex, sizeof(hex));
+            CHECK_STR(hex, "0352656c00");
+        }
+        rt_info_t info;
+        char why[300];
+        CHECK_MSG(pdns_roundtrip(z, &info, why, sizeof(why)), "%s", why);     /* KDB1 encoding -> Backend decoder -> the same RRs */
+        pdns_zone_free(z);
+    }
+    {   /* the zone rules */
+        db_record_row_t both[] = { R(10, "a.z.test", "ALIAS", "t.example.net.", 120, 0), R(11, "A.z.test", "AAAA", "2001:db8::1", 120, 0) };
+        pdns_zone_t *z = build(both, 2, NULL, 0, NULL);
+        CHECK(z->failed);
+        CHECK_HAS(z->error, "an A or AAAA record");
+        pdns_zone_free(z);
+        db_record_row_t sig[] = { R(10, "a.z.test", "ALIAS", "t.example.net.", 120, 0),
+                                  R(11, "z.test", "DNSKEY", "257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==", 120, 0) };
+        z = build(sig, 2, NULL, 0, NULL);
+        CHECK(z->failed);
+        CHECK_HAS(z->error, "DNSSEC");
+        pdns_zone_free(z);
+        db_meta_row_t pre[] = { M("PRESIGNED", "1") };
+        db_record_row_t one[] = { R(10, "a.z.test", "ALIAS", "t.example.net.", 120, 0) };
+        z = build(one, 1, pre, 1, NULL);                                   /* a presigned zone carries NSEC3PARAM / signatures, or fails for another reason: never loads with an ALIAS */
+        CHECK(z->failed);
+        pdns_zone_free(z);
+        db_record_row_t txt[] = { R(10, "a.z.test", "ALIAS", "t.example.net.", 120, 0), R(11, "a.z.test", "TXT", "\"x\"", 120, 0) };
+        z = build(txt, 2, NULL, 0, NULL);
+        CHECK_MSG(!z->failed, "%s", z->error);
+        pdns_zone_free(z);
+        db_record_row_t badalias[] = { R(10, "a.z.test", "ALIAS", "two names.example.", 120, 0) };
+        z = build(badalias, 1, NULL, 0, NULL);
+        CHECK(z->failed);
+        pdns_zone_free(z);
+    }
+    {   /* ENABLE-LUA-RECORDS=1: LUA is not run here, so the zone is refused; 0 or no row is fine */
+        db_meta_row_t on[] = { M("ENABLE-LUA-RECORDS", "1") };
+        pdns_zone_t *z = build(NULL, 0, on, 1, NULL);
+        CHECK(z->failed);
+        CHECK_HAS(z->error, "ENABLE-LUA-RECORDS");
+        pdns_zone_free(z);
+        db_meta_row_t off[] = { M("ENABLE-LUA-RECORDS", "0") };
+        z = build(NULL, 0, off, 1, NULL);
+        CHECK_MSG(!z->failed, "%s", z->error);
+        CHECK(z->n_warnings == 0);
+        pdns_zone_free(z);
+    }
 }
 
 static void test_disabled_and_ent(void) {
@@ -945,7 +1010,7 @@ static void test_metadata(void) {
         pdns_zone_free(z);
     }
     {
-        db_meta_row_t m[] = { M("SOA-EDIT", "INCEPTION-INCREMENT"), M("SOA-EDIT", "EPOCH"), M("ENABLE-LUA-RECORDS", "1"), M("NSEC3NARROW", "1"),
+        db_meta_row_t m[] = { M("SOA-EDIT", "INCEPTION-INCREMENT"), M("SOA-EDIT", "EPOCH"), M("LUA-AXFR-SCRIPT", "x"), M("NSEC3NARROW", "1"),
                               M("PUBLISH-CDS", "2") };
         expect_settings("answer-changing kinds warn once per kind", m, 5, "", 4);
     }
@@ -1537,6 +1602,9 @@ static int gen_corpus(const char *dir) {
         "\x01" "a.fuzz.test" FS "MX" FS "mail.fuzz.test" FS "10" FS "300" RS "b.fuzz.test" FS "SRV" FS "1 2 mail.fuzz.test" FS "3" FS "",
         "\x01" "fuzz.test" FS "NS" FS "ns1.fuzz.test" FS FS "300" RS "p.fuzz.test" FS "" FS "" FS FS RS "q.p.fuzz.test" FS "A" FS "192.0.2.7" FS FS "0",
         "\x01" "a.fuzz.test" FS "ALIAS" FS "t.fuzz.test" FS FS "300",
+        "\x01" "l.fuzz.test" FS "LUA" FS "A \";return {'192.0.2.1'}\"" FS FS "300",
+        "\x01" "a.fuzz.test" FS "ALIAS" FS "t.fuzz.test" FS FS "300" RS "a.fuzz.test" FS "A" FS "192.0.2.1" FS FS "300",
+        "\x01" "l.fuzz.test" FS "LUA" FS "TXT \"a\" \"b\" \"c\"" FS FS "300" RS "l.fuzz.test" FS "TXT" FS "\"x\"" FS FS "300",
     };
     char name[64];
     for (size_t i = 0; i < sizeof(hostile) / sizeof(hostile[0]); i++) {
@@ -1774,6 +1842,7 @@ int main(int argc, char **argv) {
     test_prio_rules();
     test_ttl_rules();
     test_disabled_and_ent();
+    test_b9a_alias_lua();
     test_zone_level();
     test_isolation();
     test_metadata();

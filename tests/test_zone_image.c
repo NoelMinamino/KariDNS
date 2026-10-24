@@ -1465,6 +1465,66 @@ static void run_edges(void) {
     zone_arena_destroy(&a);
 }
 
+/* B9a: ALIAS (TYPE 65401, CLASS IN) marks the image and its owner; an ALIAS beside A / AAAA or DNSSEC records is not published; the
+ * Extended AXFR record of the same number (CLASS 65302) is no ALIAS */
+static void run_b9a_alias(void) {
+    g_label = "alias";
+    static const char *OK =
+        "$ORIGIN al.test.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n"
+        "a ALIAS t.target.test.\na TXT \"x\"\nl LUA A \"c\"\nb A 192.0.2.2\n";
+    zone_t z;
+    CHECK(load_zone(&z, OK, "al.test.", NULL, false));
+    if (z.ok) {
+        zone_image_t *img = zone_image_freeze(&z.a, "al.test.");
+        CHECK(img != NULL);
+        if (img) {
+            CHECK(img->flags & ZONE_IMAGE_F_ALIAS);
+            uint32_t a = zone_image_find_name(img, "a.al.test.");
+            uint32_t b = zone_image_find_name(img, "b.al.test.");
+            uint32_t l = zone_image_find_name(img, "l.al.test.");
+            CHECK(a != ZONE_IMAGE_NONE && (zone_image_name_flags(img, a) & ZONE_IMAGE_NAME_ALIAS));
+            CHECK(b != ZONE_IMAGE_NONE && !(zone_image_name_flags(img, b) & ZONE_IMAGE_NAME_ALIAS));
+            CHECK(l != ZONE_IMAGE_NONE && !(zone_image_name_flags(img, l) & ZONE_IMAGE_NAME_ALIAS));   /* LUA is no ALIAS */
+            uint32_t rr = zone_image_rrset_next(img, a, 65401, zone_image_name_first_rr(img, a));
+            CHECK(rr != ZONE_IMAGE_NONE && zone_image_rr_class(img, rr) == 1 && zone_image_rr_rdlen(img, rr) == 15);
+            /* thaw gives the same records back */
+            zone_arena_t t;
+            zone_arena_init(&t);
+            CHECK(zone_image_thaw(img, &t) == 0);
+            size_t n_alias = 0, n_lua = 0;
+            for (size_t i = 0; i < t.count; i++) {
+                n_alias += t.records[i].type_code == 65401 && t.records[i].class_val == 1;
+                n_lua += t.records[i].type_code == 65402 && t.records[i].class_val == 1;
+            }
+            CHECK(n_alias == 1 && n_lua == 1);
+            zone_arena_destroy(&t);
+            zone_image_free(img);
+        }
+        free_zone(&z);
+    }
+    /* no ALIAS: no flag */
+    CHECK(load_zone(&z, "$ORIGIN na.test.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n", "na.test.", NULL, false));
+    if (z.ok) {
+        zone_image_t *img = zone_image_freeze(&z.a, "na.test.");
+        CHECK(img && !(img->flags & ZONE_IMAGE_F_ALIAS));
+        zone_image_free(img);
+        free_zone(&z);
+    }
+    /* refused: the image is not made */
+    static const char *const BAD[] = {
+        "$ORIGIN bad.test.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\na ALIAS t.target.test.\na A 192.0.2.1\n",
+        "$ORIGIN bad.test.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\na ALIAS t.target.test.\nA AAAA 2001:db8::1\n",
+        "$ORIGIN bad.test.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\na ALIAS t.target.test.\n@ DNSKEY 257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==\n",
+        "$ORIGIN bad.test.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\nx TYPE65401 \\# 2 0161\n",
+    };
+    for (size_t i = 0; i < sizeof(BAD) / sizeof(BAD[0]); i++) {
+        CHECK(load_zone(&z, BAD[i], "bad.test.", NULL, false));
+        if (!z.ok) continue;
+        CHECK(zone_image_freeze(&z.a, "bad.test.") == NULL);
+        free_zone(&z);
+    }
+}
+
 int main(void) {
     printf("=== test_zone_image ===\n");
     printf("[TEST] synthetic zones: one line per RR type\n");
@@ -1481,6 +1541,8 @@ int main(void) {
     run_soa_set();
     printf("[TEST] zero-length RDATA read from the wire (D15-1)\n");
     run_empty_rdata_wire();
+    printf("[TEST] B9a: ALIAS flag and the zone rules at freeze\n");
+    run_b9a_alias();
     printf("[TEST] empty zone\n");
     run_edges();
     printf("[TEST] tests/zones/*.zone\n");

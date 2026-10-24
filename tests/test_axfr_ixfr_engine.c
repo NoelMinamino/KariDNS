@@ -6635,6 +6635,71 @@ static void test_b8t2_xext_records(void) {
     printf("  -> encoder records passed.\n");
 }
 
+/* B9a (decision: the type numbers of PowerDNS's ALIAS / LUA records and of two Extended AXFR records are the same): everything that
+ * reads an Extended AXFR stream decides on (type, class).  A zone RR of CLASS IN is a zone RR whatever its type number; a record of
+ * CLASS 65302 is an Extended AXFR record whatever it holds. */
+static void test_b9a_type_class_audit(void) {
+    printf("[TEST] B9a: ALIAS / LUA (TYPE 65401 / 65402, CLASS IN) next to the Extended AXFR records of the same numbers (CLASS 65302)...\n");
+    const char *z = "z.example.";
+    uint8_t alias_rd[32];
+    size_t alias_len = b8_name(alias_rd, "t.target.example.");
+    static const uint8_t lua_rd[] = { 0, 1, 3, 'a', 'b', 'c' };
+    static const uint8_t a_rd[4] = { 192, 0, 2, 1 };
+
+    for (int ver = 0; ver <= 3; ver += 3) {           /* a standard AXFR and an Extended AXFR (version 3) */
+        zone_arena_t a;
+        axfr_session_t s;
+        b8_pk_t p;
+        zone_arena_init(&a);
+        b8_session(&s, (uint8_t)ver);
+        b8_init(&p);
+        b8_soa(&p, z, 7, 3600);
+        if (ver) b8_rr(&p, z, 65401, 65302, (const uint8_t *)"lan", 3);        /* LOC_STATE: the RRs that follow are in the tag lan */
+        b8_rr(&p, "a.z.example.", 65401, 1, alias_rd, alias_len);               /* ALIAS */
+        b8_rr(&p, "l.z.example.", 65402, 1, lua_rd, sizeof(lua_rd));            /* LUA */
+        if (ver) b8_rr(&p, z, 65401, 65302, (const uint8_t *)"", 0);            /* LOC_STATE: no tag */
+        b8_rr(&p, "www.z.example.", 1, 1, a_rd, 4);
+        b8_soa(&p, z, 7, 3600);
+        assert(b8_feed(&s, &a, &p, z) == 0 && s.is_finished);
+        int n_alias = 0, n_lua = 0, n_ext = 0;
+        for (size_t i = 0; i < a.count; i++) {
+            const dns_record_t *r = &a.records[i];
+            if (r->class_val == 65302) n_ext++;
+            if (r->type_code == 65401 && r->class_val == 1) {
+                n_alias++;
+                assert(r->generic_len == alias_len && memcmp(r->generic_data, alias_rd, alias_len) == 0);
+                if (ver) assert(r->bind_location_tag && strcmp(r->bind_location_tag, "lan") == 0);   /* in the tag, as the state record said */
+                else assert(!r->bind_location_tag);
+            }
+            if (r->type_code == 65402 && r->class_val == 1) {
+                n_lua++;
+                assert(r->generic_len == sizeof(lua_rd) && memcmp(r->generic_data, lua_rd, sizeof(lua_rd)) == 0);
+            }
+        }
+        assert(n_alias == 1 && n_lua == 1 && n_ext == 0);                       /* the state records were consumed, the zone RRs kept */
+        assert(s.ext_records == (ver ? 2u : 0u));                               /* only the CLASS 65302 records are Extended AXFR records */
+        zone_arena_destroy(&a);
+    }
+
+    /* the same numbers in CLASS 65302 in a standard (non-extended) session are not zone data either: they are never stored as ALIAS / LUA */
+    {
+        zone_arena_t a;
+        axfr_session_t s;
+        b8_pk_t p;
+        zone_arena_init(&a);
+        b8_session(&s, 0);
+        b8_init(&p);
+        b8_soa(&p, z, 7, 3600);
+        b8_rr(&p, "a.z.example.", 65401, 65302, alias_rd, alias_len);
+        b8_soa(&p, z, 7, 3600);
+        int rc = b8_feed(&s, &a, &p, z);
+        for (size_t i = 0; i < a.count; i++) assert(!(a.records[i].type_code == 65401 && a.records[i].class_val == 1));
+        (void)rc;                                                               /* accepted or refused: the point is that it did not become an ALIAS */
+        zone_arena_destroy(&a);
+    }
+    printf("  -> (type, class) audit passed.\n");
+}
+
 static void test_b8t2_receiver_soa_set(void) {
     printf("[TEST] B8t-2: the receiver reads a SOA set, SETTINGS and rejects what does not fit...\n");
     const char *z = "z.example.";
@@ -7268,6 +7333,7 @@ int main(void) {
     test_axfr_ixfr_feature_case_157();
     test_axfr_ixfr_feature_case_158();
     test_b8t2_xext_records();
+    test_b9a_type_class_audit();
     test_b8t2_receiver_soa_set();
     test_b8t2_ixfr_settings_survive_thaw();
     test_b8t2_ext_version_fallback_decision();

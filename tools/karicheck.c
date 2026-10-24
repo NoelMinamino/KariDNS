@@ -1090,8 +1090,33 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         free(root_path);
         return 1;
     }
+    {   /* B9a (design 3.6b): PowerDNS ALIAS / LUA records.  The same rules the server applies when it publishes the zone. */
+        char pdns_why[400];
+        if (validate_zone_pdns_types(&arena, &err, pdns_why, sizeof(pdns_why)) < 0) {
+            kc_error(&tally, "Zone '%s': %s (the server does not load this zone)\n", domain, pdns_why);
+            free((void*)ctx.base_dir);
+            zone_arena_destroy(&arena);
+            free(root_path);
+            return 1;
+        }
+    }
 
     fprintf(stdout, "[OK] Zone '%s' parsed successfully (%zu records)\n", domain, arena.count);
+    {
+        size_t n_alias = 0, n_lua = 0;
+        for (size_t i = 0; i < arena.count; i++) {
+            const dns_record_t *r = &arena.records[i];
+            if (r->class_val != 1 && r->class_val != 0) continue;
+            if (r->type_code == DNS_TYPE_PDNS_ALIAS) n_alias++;
+            else if (r->type_code == DNS_TYPE_PDNS_LUA) n_lua++;
+        }
+        if (n_alias > 0)
+            fprintf(stdout, "[INFO] Zone '%s': %zu ALIAS record(s); A/AAAA at those names are NODATA unless an alias-resolver { } is configured for the zone (design 3.6b)\n",
+                    domain, n_alias);
+        if (n_lua > 0)
+            kc_warning(&tally, "Zone '%s': %zu LUA record(s) are kept for zone transfers and never answered (PowerDNS enable-lua-records=no behaviour; LUA records are not executed)\n",
+                       domain, n_lua);
+    }
     bool has_soa = false;
     int soa_count = 0; /* [T3] SOA重複検出用 */
     int soa_plain_count = 0; /* B8t-1: apex SOA RRs that every client sees (no location, time stamp or tag) */

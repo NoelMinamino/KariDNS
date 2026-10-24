@@ -223,7 +223,8 @@ Duplicate zones (in the same view or at top level), duplicate views, duplicate k
 | `minimal-responses yes\|no;` | `no` | Do not add glue / additional-section records. |
 | `minimal-any yes\|no;` | `no` | RFC 8482: answer `QTYPE=ANY` with a synthesized `HINFO "RFC8482" ""` record instead of all RRsets. When the query has DO=1 and the name has RRSIG records, a single RRset is returned instead (RFC 8482 §4.2). |
 | `minimal-any-ttl <seconds>;` | `86400` | TTL of the synthesized RFC 8482 `HINFO` record. |
-| `additional-from-auth yes\|in-domain\|no;` | `yes` | Whether additional-section data (glue, MX/SRV targets) is taken from the server's authoritative data. `in-domain` (alias `in-zone`) limits it to names inside the zone of the answer. Any other value is a configuration error. Can be overridden per zone. |
+| `additional-from-auth yes\| `alias-resolver { <addr> [port <n>]; ... };` | none | The resolvers that expand the ALIAS records of every zone (PowerDNS `expand-alias`); 1 to 8 IP addresses. Without it ALIAS is stored and transferred and A / AAAA at an ALIAS name are NODATA. Can be overridden per zone. See [POWERDNS ALIAS AND LUA RECORDS](#powerdns-alias-and-lua-records-milestone-b9a). |
+|in-domain\|no;` | `yes` | Whether additional-section data (glue, MX/SRV targets) is taken from the server's authoritative data. `in-domain` (alias `in-zone`) limits it to names inside the zone of the answer. Any other value is a configuration error. Can be overridden per zone. |
 | `send-extended-errors yes\|no;` | `yes` | Add Extended DNS Errors (EDE, RFC 8914) to responses of EDNS queries. |
 | `ixfr-history <n>;` | `4` | 0–32. How many past versions of a zone are kept as IXFR differences (RFC 1995 §4). A secondary that is at most this many versions behind gets an incremental transfer; a secondary that is further behind, or any secondary when the value is `0`, gets the whole zone in the AXFR-style IXFR answer that RFC 1995 §4 allows when an incremental answer is not available (a client that is already up to date still gets a single SOA, §2). The history is kept in memory only and is allocated when the first difference is stored, so a zone that never changes after loading costs nothing. `0` also skips computing differences. A reload that lowers the value drops the oldest differences at once; a higher value takes effect with the next stored difference. A value outside 0–32 is a configuration error. Can be overridden per zone. |
 | `notify-retries <n>;` | `5` | 0–10. How many times a NOTIFY that got no answer is sent again (RFC 1996 §3.6). Can be overridden per zone. |
@@ -420,7 +421,7 @@ view "other"    { database none; };
 | `db-reload-timeout <s>;` | `30` | 1..3600. How long a `karictl reload <zone>` of a database zone waits for the loader's answer; then it gets `ERROR timeout` (the reload may still be applied). The control thread never waits itself: the client is parked (at most 32 at once). |
 | `ingest-threads <n>;` `loader-threads <n>;` | `1` | 1..16 each. `ingest-threads` is the number of builder threads of the Backend: with 1 the thread that reads the stream also builds the zones; with more, complete zones are handed to that many builders (at most that many zones in flight; read when the server starts). `loader-threads` is the number of workers of the loader: each has its own database connection and snapshot and reads and converts a disjoint set of zones (consecutive zones in `domains.id` order); the loader writes the results to the stream in `domains.id` order whatever the number is, so the stream (and `karidns-dbloader --dump`) is byte for byte the same with 1 and with 16 workers. More workers help when converting is the cost (many zones, a cold start); one zone or a handful is always read by the loader's main thread. Zones that wait for their turn are held in memory (at most 256 MB). |
 | `server-id "<id>";` | none | postgresql multi-server status (milestone B11); a warning in `karicheck conf` with sqlite3. |
-| `alias-resolver { <ip>; ... };` | none | Parsed and stored (milestone B9a). |
+| `alias-resolver { <ip>; ... };` | none | The resolvers for the ALIAS records of the zones of the database when neither the zone's settings nor `options { alias-resolver }` name any (port 53; see POWERDNS ALIAS AND LUA RECORDS). |
 
 In a `view`: `database-file "<path>";` (sqlite3) or `database-schema "<name>";` (postgresql) gives the view its own source; `database none;` makes it take no DB zones. A view without these uses the global source.
 
@@ -461,9 +462,10 @@ A zone in `karidns.conf` takes its per-zone options from its `zone { }` statemen
 | `X-KARIDNS-<OPTION>` | `<option> <value>;` | `NOTIFY-RETRIES`, `NOTIFY-RETRY-INTERVAL`, `NOTIFY-RETRY-BACKOFF`, `IXFR-HISTORY`, `ADDITIONAL-FROM-AUTH`, `DISABLE-AUTO-TC-FLAG`, `ZONE-UDP-BUFSIZE`, `ZONE-TCP-MSS`, `ZONE-TCP-WINDOW`, `ZONE-TCP-SNDBUF`, with the ranges of the zone options. An invalid value or an unknown option is dropped with a warning. |
 | `X-KARIDNS-PROFILE` | the profile of the zone | See below. |
 | `X-KARIDNS-ECS-TRUSTED-RESOLVERS` | `ecs-trusted-resolvers { <addr>; ... };` | Addresses and prefixes, a leading `!` excludes; bounded by `acl-ceiling` when queries are answered: see "Location / ECS tags and tinydns zones in the database". |
+| (a profile text or the loader's own text, no metadata kind) | `alias-resolver { <addr> [port <n>]; ... };` | May be written in a profile (`karidns_profiles`); the ALIAS resolvers of the zone, see POWERDNS ALIAS AND LUA RECORDS. Not sent with Extended AXFR. |
 | `PRESIGNED`, `NSEC3PARAM`, `X-KARIDNS-FORMAT` | (zone flags, not settings) | `X-KARIDNS-FORMAT tinydns`: B8. |
 
-Other kinds are ignored; those that change answers in PowerDNS (`SOA-EDIT`, `ENABLE-LUA-RECORDS`, ...) get a warning once per zone. A zone with `ALLOW-AXFR-FROM` rows but none of them usable gets `allow-transfer { none; }`.
+Other kinds are ignored; those that change answers in PowerDNS (`SOA-EDIT`, `NSEC3NARROW`, ...) get a warning once per zone; `ENABLE-LUA-RECORDS` with the value 1 rejects the zone (LUA records are not run). A zone with `ALLOW-AXFR-FROM` rows but none of them usable gets `allow-transfer { none; }`.
 
 **Match modes: `transfer-acl-match any|all;` and `update-acl-match any|all;`** are zone options of `karidns.conf` too. They only matter for an ACL that has both addresses and keys. For `allow-transfer`: `all` (the default, as in earlier versions) needs a matching address **and** a listed key; `any` accepts a matching address **or** a request signed with a listed key. For `allow-update`: `any` (the default) accepts a matching address **or** a request signed with a listed key; `all` needs every kind of entry that is written to match (addresses only: the address; keys only: the key; both: the address **and** the key). A zone without the options behaves exactly as before. The loader writes `transfer-acl-match any;` and `update-acl-match all;`, which is the PowerDNS meaning (AXFR is allowed by `ALLOW-AXFR-FROM` or by a `TSIG-ALLOW-AXFR` signature; an UPDATE needs `ALLOW-DNSUPDATE-FROM` and a `TSIG-ALLOW-DNSUPDATE` signature). PowerDNS also adds its server-wide `allow-axfr-ips` and `allow-dnsupdate-from` (default `127.0.0.0/8, ::1`) to these lists; KariDNS applies exactly the lists in the database. `karicheck conf` warns when an option has nothing to choose between.
 
@@ -545,6 +547,7 @@ A zone file with `$LOCATION` / `$ECS-SUBNET` tags or a tinydns data file is not 
 | `additional-from-auth yes\|in-domain\|no;` | all | Per-zone override of the `options` value. |
 | `disable-auto-tc-flag yes\|no;` | program | See PROGRAM ZONE PLUGINS. Any other value is an error. |
 | `zone-tcp-mss`, `zone-tcp-window`, `zone-tcp-sndbuf`, `zone-udp-bufsize` | all | Per-zone transport settings; see TRANSPORT TUNING. |
+| `alias-resolver { <addr> [port <n>]; ... };` | master, slave | The resolvers that expand the ALIAS records of this zone; replaces the `options` value. See POWERDNS ALIAS AND LUA RECORDS. |
 | `forwarders { <addr> [port <n>]; ... };` | forward | Upstream servers; see FORWARD ZONES. |
 | `forward-timeout <ms>;` | forward | Total time budget in milliseconds (default 2000), shared by the forwarders: each one gets the remaining time divided by the number of forwarders not tried yet. |
 | `program "<path>";`, `program-args { "<arg>"; ... };`, `program-user "<user>";`, `program-timeout <ms>;`, `program-max-failures <n>;` | program | See PROGRAM ZONE PLUGINS. |
@@ -763,11 +766,84 @@ zone "corp.example.com." {
 
 ---
 
+## POWERDNS ALIAS AND LUA RECORDS (milestone B9a)
+
+KariDNS reads, serves and transfers the two record types that PowerDNS adds to the DNS: **ALIAS** (a name that stands for the addresses of another name, the "ANAME" idea) and **LUA** (a record whose answer is the result of a Lua snippet). They are not IETF types. PowerDNS stores them as private-use types of CLASS IN and sends them like that in a zone transfer (RFC 6895 §3.1): ALIAS is **TYPE65401** (RDATA = the target name, uncompressed, RFC 3597 §4) and LUA is **TYPE65402** (RDATA = the 16-bit type of the answer, then the code as `<character-string>`s). KariDNS keeps exactly that form, so an AXFR out is byte for byte what PowerDNS sends (`outgoing-axfr-expand-alias=no`), and a zone transferred in from PowerDNS keeps its ALIAS and LUA records.
+
+> [!NOTE]
+> The Extended AXFR records of KariDNS use the same two type numbers (65401, 65402) in **CLASS 65302**. Everything that reads or writes a transfer tells them apart by the pair (type, class), never by the type alone: a record of CLASS IN is a zone record, whatever its type number; a record of CLASS 65302 is an Extended AXFR record, whatever it holds.
+
+**Zone files.** `ALIAS <target>` and `LUA <type> "<code>" ["<more code>" ...]` are accepted next to the generic forms (`TYPE65401 \# 15 ...`, RFC 3597 §5). A relative target is relative to the origin. The code of a LUA record is cut into `<character-string>`s of at most 255 octets, as PowerDNS does. In a PowerDNS database the rows are `type = ALIAS` with the target in `content` (`t.target.example.`) and `type = LUA` with `A ";return {'192.0.2.1'}"`. `tests/db/zone2sql` writes these rows.
+
+```
+@    300 IN ALIAS lb.target.example.      ; A / AAAA of the apex from another name (RFC 1034 §3.6.2 forbids a CNAME here)
+www  300 IN ALIAS lb.target.example.
+txt  300 IN LUA   TXT ";return 'hello'"   ; kept for transfers, never answered
+```
+
+**Zone rules** (a zone that breaks them is not loaded; `karicheck zone` and `karicheck zones` report them; a database zone that breaks them is rejected with the reason in the log and in `karictl dbstatus`; an incoming transfer that breaks them is refused):
+
+- an ALIAS name must not also own an A or AAAA RRset (the ALIAS stands for them). TXT, MX, NS and the other types may coexist;
+- a zone with an ALIAS must not hold DNSSEC records (DNSKEY, RRSIG, NSEC, NSEC3, NSEC3PARAM), and a database zone with `PRESIGNED` metadata must not hold an ALIAS: an expanded answer cannot be signed offline. KariDNS does no online signing;
+- the RDATA of both types must be well formed (one uncompressed name; a type and `<character-string>`s that fill the RDATA);
+- `ENABLE-LUA-RECORDS` metadata with the value `1` rejects the database zone (LUA records are not run, so enabling them would silently change the answers); `0` or no row is fine.
+
+### Default behaviour (no `alias-resolver`)
+
+This is PowerDNS with `expand-alias=no` and `enable-lua-records=no`, and the answers are the same (checked against PowerDNS 5.1.4, `tests/run_db_alias_lua_test.sh`):
+
+| Query | Answer |
+|---|---|
+| A or AAAA (or any other type the name does not own) at an ALIAS name | NOERROR, no data |
+| `TYPE65401` at an ALIAS name, and `ANY` there | the ALIAS RR (`ANY` lists it with the other RRsets) |
+| ALIAS at a wildcard, a name below it | the ALIAS RR for `TYPE65401` and `ANY`, no data for A and AAAA (an ALIAS RR is a plain RR in this mode) |
+| anything at a name that owns **only LUA** records, including `TYPE65402` and `ANY` | NXDOMAIN (as if the name did not exist; a wildcard that holds only LUA records is not there either) |
+| `ANY` or `TYPE65402` at a name with LUA and other records | `ANY` lists the other RRsets only; `TYPE65402` gets no data |
+| AXFR / IXFR, Extended AXFR | every ALIAS and LUA RR, as TYPE65401 / TYPE65402 |
+
+A name that owns LUA records and descendants is an empty non-terminal like any other (NOERROR, no data).
+
+### Expansion (`alias-resolver`)
+
+```
+options { alias-resolver { 192.0.2.53; 2001:db8::53 port 5353; }; };   # every zone
+zone "example.test." { ...; alias-resolver { 192.0.2.54; }; };         # this zone only (replaces the options value)
+```
+
+`alias-resolver` names 1 to 8 resolvers (IP addresses, never names). A zone's list replaces the options list; for the zones of the database the order is the zone's settings text (or its profile), then `options { alias-resolver }`, then `options { database { alias-resolver } }`. It works for file zones, transferred zones and database zones alike. A statement may be written in the settings text of a database zone and in a profile (it is not sent with Extended AXFR: a resolver address is local to the server). A configuration reload takes effect at once.
+
+With it, A and AAAA at an ALIAS name are answered with the addresses the resolver gives for the target, as PowerDNS does with `expand-alias=yes` and `resolver=...`:
+
+| Query | Answer |
+|---|---|
+| A, AAAA | the addresses of the target (the CNAME chain of the resolver's answer is followed, at most 8 hops); NOERROR with no data when the target has none |
+| `ANY` | the expanded A and AAAA only (PowerDNS answers `ANY` at an ALIAS name with these two and leaves the other RRsets out) |
+| `TYPE65401` | no data: the ALIAS RR is not an answer any more (AXFR still carries it) |
+| a target that cannot be resolved: the resolver does not answer, or answers SERVFAIL, REFUSED or NXDOMAIN, a CNAME loop or a chain longer than 8 | SERVFAIL (with EDE 22 when the client sent EDNS and `send-extended-errors` is on) |
+| a wildcard ALIAS | not expanded (as in PowerDNS 5.1.4): no data for A and AAAA, the ALIAS RR for `ANY` |
+| the glue of an MX / NS / SRV target that is an ALIAS name | none |
+
+**How it is done.** The Backend never waits for a resolver. One auxiliary thread resolves every ALIAS target of the published zones in advance, through the same broker path as the forwarders of a `type forward` zone and the transfers of a secondary (no socket call is added to the sandboxed Backend): a UDP query with RD=1 and EDNS0, TCP when the answer is truncated; the answer must come back on the connected socket with the right ID and the question asked, and RCODE NOERROR (RFC 5452 §9.1). The thread publishes the results as one immutable table that queries only read (the table is replaced and the old one freed after a grace period, like zone versions). Answers that carry expanded addresses are never put into the shared response cache. The resolver is trusted: nothing is DNSSEC-validated.
+
+- **TTL.** The TTL of an expanded answer is the smaller of the ALIAS record's TTL and what is left of the TTL of the resolver's answer (the TTL of the final A / AAAA RRset, as PowerDNS takes it; CNAME TTLs are not mixed in), counting down, so a downstream cache never keeps the data longer than the resolver allowed. (PowerDNS gives the upstream TTL as it is, without the ALIAS record's TTL and without counting down.)
+- **Refresh.** A target is queried again after two thirds of its TTL and at least 5 seconds after the last time (an upstream TTL of 0 gives a 5 second refresh and TTL 0 answers). A new zone version keeps the results of the targets it still has; a target that no zone has any more is dropped.
+- **Failure.** A target that has **never** been resolved (a zone that was just loaded, or a resolver that is down since the start) answers SERVFAIL until the first resolution works; PowerDNS resolves at the first query, so the first answers after a load may be SERVFAIL where PowerDNS would wait. A target that **was** resolved keeps its last result when a refresh fails: it is served for up to one day after its TTL ran out, with TTL 30 (RFC 8767 §4, §5; the answer is the last known data, not an error), and the refresh is retried in the background after 5 s, 10 s, 20 s ... up to 320 s. After a day without a success the target answers SERVFAIL. A resolver set that does not answer at all is left alone for 10 s between tries.
+- **Bounds.** At most 1,024 ALIAS records per zone are looked at (the rest answer SERVFAIL, logged), 16,384 jobs in all (a target is two jobs: A and AAAA), 32 addresses per type, 64 different resolver lists, 20 upstream queries per 200 ms tick (about 100 per second) and 3 s for one resolution. The results are about 100 octets each.
+- **Logs.** The first failure of a target and its recovery are logged once (`[Alias] ...` in syslog).
+
+Differences from PowerDNS, on purpose: the TTL rule above; the stale answers and the "never resolved" SERVFAIL window; the SOA record that every NODATA answer carries (RFC 2308 §2.2; PowerDNS 5.1.4 sends none with the NODATA of an expansion); a truncated answer of the resolver is retried over TCP (PowerDNS 5.1.4 takes it for an answer without data); an ALIAS beside A / AAAA and an ALIAS in a signed zone are zone errors; `ENABLE-LUA-RECORDS=1` is refused. LUA records themselves are **not** run: this release implements what PowerDNS does with `enable-lua-records=no` (design decision D13).
+
+> [!NOTE]
+> Dynamic Update (RFC 2136) works on zones that hold ALIAS records, but an update that would put an A or AAAA RR at an ALIAS name is refused with the rest of the zone check (SERVFAIL), and the "name is in use" prerequisite counts a name that holds only LUA records as in use although queries get NXDOMAIN.
+
+---
+
 ## ZONE FILE FORMAT
 
 The default `file-format` is the master file format of RFC 1035 §5 as BIND reads it.
 
 - **Records**: `<owner> [<TTL>] [<class>] <type> <RDATA>`; TTL and class may appear in either order, each once.
+  PowerDNS's `ALIAS <target>` and `LUA <type> "<code>"` are accepted too (see POWERDNS ALIAS AND LUA RECORDS).
   Type and class mnemonics are case-insensitive (`in a`, `IN Mx`). Unknown types and classes use the RFC 3597
   forms `TYPEnn`, `CLASSnn` and `\# <length> <hex>`. The generic form of a type the server knows must carry RDATA
   that is valid for that type (RFC 3597 §5): `PTR \# 0`, `NS \# 3 010203` or a compressed name in the hex are

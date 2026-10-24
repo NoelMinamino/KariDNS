@@ -61,6 +61,7 @@
 #include "dns_snapshot_rcu.h"
 #include "dns_db_supervisor.h"
 #include "dns_db_ingest.h"
+#include "dns_alias.h"
 
 // karidns
 // Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)
@@ -5778,6 +5779,11 @@ int main(int argc, char **argv) {
   }
   /* 送信スレッドは終了時 (dnstap_shutdown) に自分で戻る。誰も join しない */
   pthread_detach(dnstap_sender_thread);
+
+  // B9a: the thread that resolves the targets of ALIAS records (dns_alias.h).  It resolves through the broker like the forwarders of a
+  // type forward zone and does nothing while no zone has an ALIAS record and an alias-resolver.
+  if (!alias_start())
+    syslog(LOG_ERR, "[Backend] Cannot start the ALIAS resolver thread; ALIAS records are not expanded");
 
   // beta design 1.3 / 1.5: the db ingest thread.  It limits the rights of the two descriptors the supervisor made
   // (stream, control) and uses only them (read / write / recvmsg / kevent) once the sandbox is on.

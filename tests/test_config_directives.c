@@ -2217,6 +2217,42 @@ static void test_acl_ceiling_match_and_masters(void) {
     }
 }
 
+/* B9a: alias-resolver { <ip> [port <n>]; ... }; in options, in a zone, and in the settings text of a database zone */
+static void test_alias_resolver_option(void) {
+    printf("[TEST] alias-resolver in options, zones and database settings (B9a)...\n");
+    server_config_t cfg;
+    if (parse_ok("options { alias-resolver { 192.0.2.53; 2001:db8::53 port 5353; }; };", &cfg)) {
+        CHECK(cfg.alias_resolvers_count == 2);
+        CHECK_STR(cfg.alias_resolvers[0].ip, "192.0.2.53");
+        CHECK(cfg.alias_resolvers[0].port == 53 && cfg.alias_resolvers[1].port == 5353);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { alias-resolver { 192.0.2.1; }; alias-resolver { 192.0.2.2; }; };", &cfg)) {   /* a later statement replaces */
+        CHECK(cfg.alias_resolvers_count == 1 && strcmp(cfg.alias_resolvers[0].ip, "192.0.2.2") == 0);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("zone \"z.test.\" { type primary; file \"z.zone\"; alias-resolver { 192.0.2.7 port 5300; }; };", &cfg)) {
+        const zone_config_t *z = first_zone(&cfg);
+        CHECK(z && zext(z)->alias_resolvers_count == 1 && zext(z)->alias_resolvers[0].port == 5300);
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("alias-resolver with a host name", "options { alias-resolver { ns.example.test; }; };");
+    expect_reject("alias-resolver with a bad port", "options { alias-resolver { 192.0.2.1 port 0; }; };");
+    expect_reject("alias-resolver without braces", "options { alias-resolver 192.0.2.1; };");
+    expect_reject("zone alias-resolver with a host name", "zone \"z.test.\" { type primary; file \"z\"; alias-resolver { example.test; }; };");
+    expect_reject("alias-resolver with nine entries",
+                  "options { alias-resolver { 192.0.2.1; 192.0.2.2; 192.0.2.3; 192.0.2.4; 192.0.2.5; 192.0.2.6; 192.0.2.7; 192.0.2.8; 192.0.2.9; }; };");
+    /* the settings text of a database zone (the loader and karidns_profiles write this statement): the later statement replaces */
+    char err[200];
+    zone_ext_shared_t *sh = db_parse_quiet("alias-resolver { 192.0.2.1; }; alias-resolver { 192.0.2.9 port 54; };", err, sizeof(err));
+    CHECK(sh != NULL);
+    if (sh) {
+        CHECK(sh->ext.alias_resolvers_count == 1 && strcmp(sh->ext.alias_resolvers[0].ip, "192.0.2.9") == 0 && sh->ext.alias_resolvers[0].port == 54);
+        zone_ext_shared_unref(sh);
+    }
+    expect_db_reject("alias-resolver { example.test; };", NULL);
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
     test_defaults();
@@ -2247,6 +2283,7 @@ int main(void) {
     test_logging_category_lists();
     test_zone_type_case();
     test_named_acls();
+    test_alias_resolver_option();
     test_zone_config_index();
     test_zone_ext_layout();
     test_zone_flat_list_removed();

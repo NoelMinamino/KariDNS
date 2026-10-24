@@ -67,6 +67,7 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
 - Every entry of `allow-transfer`, `allow-update`, `match-clients`, `ecs-trusted-resolvers` and `acl` must be an address, a prefix, `any`, `none`, a defined `acl` (or, in `allow-update`, a defined key); anything else, including `localhost` and `localnets`, is an error.
 - A logging `category` that lists more than one channel gives a warning (only the first one is used).
 - `type program` zones: `program` must be set and be an absolute path, and `program-args` may have at most 62 entries (errors); a `program` that is not executable and a `program-user` that differs from `options { user }` give warnings. `allow-program-zones yes;` is required when any program zone exists.
+- `alias-resolver { ... };` (in `options`, in a zone, and in `options { database { } }`): at most 8 entries, each an IP address (a host name is an error).
 - `type forward` zones must have `forwarders`; a forwarder equal to one of the server's own `bind-address` / `port` pairs gives a self-loop warning.
 - Every CIDR in `ecs-tags` and `location-tags` (in `options` and in zones) must be valid; `ecs-tags` without `ecs-enable yes;` gives a warning.
 - `transfer-acl-match` and `update-acl-match` take `any` or `all` (anything else is an error). A warning says when an option has nothing to choose between: without `allow-transfer` / `allow-update`, or with an ACL that lists only addresses or only keys (see karidns(8) "Settings of database zones").
@@ -86,6 +87,7 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
    - Inconsistent TTLs within one RRset (warning); RRs with a location, time stamp or tag are not harmonized with RRs that every client sees, and an unrestricted and a restricted RR of one name and type with different TTLs are reported as such (a client that sees both gets an RRset with differing TTLs; the TTLs are kept)
    - SOA MNAME pointing to a CNAME (warning)
    - Meta-types (e.g. `OPT`, `TSIG`, `AXFR`) must not appear in zone data
+   - PowerDNS ALIAS and LUA records (TYPE65401 / TYPE65402 of CLASS IN, see karidns(8) "POWERDNS ALIAS AND LUA RECORDS"): an ALIAS name that also owns an A or AAAA RRset, an ALIAS in a zone with DNSKEY, RRSIG, NSEC, NSEC3 or NSEC3PARAM records, and malformed ALIAS / LUA RDATA are errors (the server does not load such a zone); an `[INFO]` line counts the ALIAS records (A and AAAA at those names are NODATA unless an `alias-resolver` is configured), and a warning says that LUA records are kept for transfers and never answered
    - Every record must be serializable to wire format
    - Catalog zones (`catalog-zone yes;`): `version.<zone> TXT "2"` is required, and group TXT records without a member PTR record give warnings
 3. **Record Field Validation**:

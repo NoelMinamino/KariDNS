@@ -233,6 +233,14 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
     }
     const size_t n = a->count;
     if (n >= 0x7FFFFFFFu) return NULL;
+    {   /* B9a: ALIAS / LUA rules (RDATA, ALIAS beside A/AAAA or DNSSEC records): a zone that breaks them is not published */
+        char why[400];
+        parse_error_t pe;
+        if (validate_zone_pdns_types(a, &pe, why, sizeof(why)) != 0) {
+            syslog(LOG_ERR, "[Image] freeze: %s", why);
+            return NULL;
+        }
+    }
 
     zone_image_t *img = NULL;
     tmp_index_t ix = { 0 };
@@ -253,6 +261,7 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
     bool ok = false;
     bool has_wild = false;
     bool has_dname = false;
+    bool has_alias = false;
 
     /* strings area: offset 0 is "none", so the first 8 octets are padding */
     { uint8_t pad[8] = { 0 }; sb_add(&sb, pad, sizeof(pad)); }
@@ -430,6 +439,10 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
             has_dname = true;
         }
         else if (rrs[k].type == 47) names[id].rr_count_flags |= ZONE_IMAGE_NAME_NSEC;
+        else if (rrs[k].type == DNS_TYPE_PDNS_ALIAS && rrs[k].class_val == 1) {   /* not the Extended AXFR record of CLASS 65302 */
+            names[id].rr_count_flags |= ZONE_IMAGE_NAME_ALIAS;
+            has_alias = true;
+        }
     }
     for (uint32_t id = 0; id < n_names; id++) {
         const char *t = ix.names[id].text;
@@ -592,7 +605,7 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
         img->magic = ZONE_IMAGE_MAGIC;
         img->version = ZONE_IMAGE_VERSION;
         img->total_size = (uint32_t)off;
-        img->flags = (a->is_tinydns_format ? ZONE_IMAGE_F_TINYDNS : 0) | (n_ext ? ZONE_IMAGE_F_EXT : 0) | (has_view ? ZONE_IMAGE_F_VIEW : 0) | (has_wild ? ZONE_IMAGE_F_WILDCARD : 0) | (has_dname ? ZONE_IMAGE_F_DNAME : 0) | (perm ? ZONE_IMAGE_F_PERM : 0);
+        img->flags = (a->is_tinydns_format ? ZONE_IMAGE_F_TINYDNS : 0) | (n_ext ? ZONE_IMAGE_F_EXT : 0) | (has_view ? ZONE_IMAGE_F_VIEW : 0) | (has_wild ? ZONE_IMAGE_F_WILDCARD : 0) | (has_dname ? ZONE_IMAGE_F_DNAME : 0) | (has_alias ? ZONE_IMAGE_F_ALIAS : 0) | (perm ? ZONE_IMAGE_F_PERM : 0);
         img->off_perm = perm ? (uint32_t)o_perm : 0;
         img->n_names = n_names; img->n_rrs = n_rrs; img->n_ext = (uint32_t)n_ext;
         img->n_canon = (uint32_t)n_canon; img->n_nsec = (uint32_t)a->nsec_count;

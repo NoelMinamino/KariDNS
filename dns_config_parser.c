@@ -389,6 +389,9 @@ static void free_zone_ext_fields(zone_ext_t *x) {
     free(x->also_notify[i].ip);
   free(x->also_notify);
   free(x->notify_source);
+  for (int i = 0; i < x->alias_resolvers_count; i++)
+    free(x->alias_resolvers[i].ip);
+  free(x->alias_resolvers);
   for (int i = 0; i < x->allow_transfer_count; i++)
     free(x->allow_transfer[i]);
   free(x->allow_transfer);
@@ -727,6 +730,10 @@ void free_server_config_fields(server_config_t *cfg) {
   if (cfg->group) { free(cfg->group); cfg->group = NULL; }
   if (cfg->pid_file) { free(cfg->pid_file); cfg->pid_file = NULL; }
   if (cfg->nsid_string) { free(cfg->nsid_string); cfg->nsid_string = NULL; }
+  for (int j = 0; j < cfg->alias_resolvers_count; j++) free(cfg->alias_resolvers[j].ip);
+  free(cfg->alias_resolvers);
+  cfg->alias_resolvers = NULL;
+  cfg->alias_resolvers_count = 0;
   OPENSSL_cleanse(cfg->cookie_secrets, sizeof(cfg->cookie_secrets));
   cfg->cookie_secret_count = 0;
   zone_cfg_index_free(&cfg->top_zone_index);
@@ -1276,6 +1283,35 @@ static int parse_ip_port_list(token_ctx_t *ctx, ip_port_t **list, int *count) {
   return 0;
 }
 
+/* B9a: alias-resolver { <ip> [port <n>]; ... };  1..KARIDNS_ALIAS_RESOLVERS_MAX IP address literals (the Backend connects to addresses only,
+ * never to a host name).  A later statement replaces an earlier one.  -1 with an error message on a bad entry. */
+static int parse_alias_resolvers(token_ctx_t *ctx, const char *where, ip_port_t **list, int *count) {
+  for (int i = 0; i < *count; i++) free((*list)[i].ip);
+  free(*list);
+  *list = NULL;
+  *count = 0;
+  if (parse_ip_port_list(ctx, list, count) != 0) return -1;
+  const char *bad = NULL;
+  if (*count > KARIDNS_ALIAS_RESOLVERS_MAX) {
+    bad = "more than 8 entries";
+  } else {
+    for (int i = 0; i < *count && !bad; i++) {
+      struct in_addr a4;
+      struct in6_addr a6;
+      if (inet_pton(AF_INET, (*list)[i].ip, &a4) != 1 && inet_pton(AF_INET6, (*list)[i].ip, &a6) != 1) bad = (*list)[i].ip;
+    }
+  }
+  if (bad) {
+    syslog(LOG_ERR, "[Config] %s: alias-resolver: '%.64s' is not an IP address (or the list has more than %d entries)", where, bad,
+           KARIDNS_ALIAS_RESOLVERS_MAX);
+    fprintf(stderr, "[ERROR] %s: alias-resolver: '%.64s' is not an IP address (or the list has more than %d entries)\n", where, bad,
+            KARIDNS_ALIAS_RESOLVERS_MAX);
+    if (ctx) ctx->error_occurred = true;
+    return -1;
+  }
+  return 0;
+}
+
 static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
   conf_token_t tok = get_next_token(ctx);
   if (tok.type != TOKEN_LBRACE) {
@@ -1758,7 +1794,7 @@ static const char *const k_db_zone_statements[] = {
   "allow-transfer", "allow-update", "also-notify", "tsig-key", "notify-retries", "notify-retry-interval",
   "notify-retry-backoff", "ixfr-history", "additional-from-auth", "disable-auto-tc-flag", "zone-udp-bufsize",
   "zone-tcp-mss", "zone-tcp-window", "zone-tcp-sndbuf", "transfer-acl-match", "update-acl-match", "masters", "primaries",
-  "ecs-trusted-resolvers", NULL
+  "ecs-trusted-resolvers", "alias-resolver", NULL
 };
 
 /* The statement `key` is about to be read in restricted mode: refuse it unless it is on the list, and forget what an
@@ -1806,6 +1842,11 @@ static bool restricted_statement(token_ctx_t *ctx, zone_ext_t *x, const char *ke
     x->ecs_trusted_resolvers = NULL;
     x->ecs_trusted_resolvers_parsed = NULL;
     x->ecs_trusted_resolvers_count = 0;
+  } else if (strcmp(key, "alias-resolver") == 0) {                 /* B9a: the later statement replaces the earlier one (parse_alias_resolvers() clears it too) */
+    for (int i = 0; i < x->alias_resolvers_count; i++) free(x->alias_resolvers[i].ip);
+    free(x->alias_resolvers);
+    x->alias_resolvers = NULL;
+    x->alias_resolvers_count = 0;
   } else if (strcmp(key, "masters") == 0 || strcmp(key, "primaries") == 0) {
     for (int i = 0; i < x->masters_count; i++) free(x->masters[i].ip);
     free(x->masters);
@@ -2075,6 +2116,10 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
       free_token(&tok);
+    } else if (strcmp(key, "alias-resolver") == 0) {
+      if (parse_alias_resolvers(ctx, zone->domain ? zone->domain : "zone", &x->alias_resolvers, &x->alias_resolvers_count) != 0) {
+        free(key); free_zone_config(zone); return -1;
+      }
     } else if (strcmp(key, "forwarders") == 0) {
       if (parse_ip_port_list(ctx, &x->forwarders, &x->forwarders_count) != 0) {
         free(key); free_zone_config(zone); return -1;
@@ -3259,6 +3304,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           free_token(&tok);
+        } else if (strcmp(key, "alias-resolver") == 0) {
+          if (parse_alias_resolvers(ctx, "options", &config->alias_resolvers, &config->alias_resolvers_count) != 0) {
+            free(key);
+            return -1;
+          }
         } else if (strcmp(key, "ixfr-history") == 0) {
           if (parse_transport_param(ctx, NULL, key, false, 0, IXFR_HISTORY_MAX, &config->ixfr_history) != 0) {
             free(key);
@@ -4500,6 +4550,7 @@ static zone_ext_t *zone_ext_clone(const zone_ext_t *s) {
   d->program_path = NULL; d->program_args = NULL; d->program_args_count = 0; d->program_user = NULL;
   d->forwarders = NULL; d->forwarders_count = 0;
   d->file_format = NULL;
+  d->alias_resolvers = NULL; d->alias_resolvers_count = 0;
   d->ecs_tags = NULL; d->ecs_tag_count = 0;
   d->location_tags = NULL; d->location_tag_count = 0;
   d->ecs_trusted_resolvers = NULL; d->ecs_trusted_resolvers_count = 0; d->ecs_trusted_resolvers_parsed = NULL;
@@ -4511,6 +4562,7 @@ static zone_ext_t *zone_ext_clone(const zone_ext_t *s) {
             zx_ipports(&d->rrl.exempt_clients, &d->rrl.exempt_clients_count, s->rrl.exempt_clients, s->rrl.exempt_clients_count) &&
             zx_strs(&d->program_args, &d->program_args_count, s->program_args, s->program_args_count) &&
             zx_ipports(&d->forwarders, &d->forwarders_count, s->forwarders, s->forwarders_count) &&
+            zx_ipports(&d->alias_resolvers, &d->alias_resolvers_count, s->alias_resolvers, s->alias_resolvers_count) &&
             zx_tags(&d->ecs_tags, &d->ecs_tag_count, s->ecs_tags, s->ecs_tag_count) &&
             zx_tags(&d->location_tags, &d->location_tag_count, s->location_tags, s->location_tag_count) &&
             zx_strs(&d->ecs_trusted_resolvers, &d->ecs_trusted_resolvers_count, s->ecs_trusted_resolvers, s->ecs_trusted_resolvers_count);

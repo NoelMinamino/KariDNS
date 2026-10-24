@@ -1597,6 +1597,112 @@ static void test_x16_x25_compare_records(void) {
     printf("  -> canonical RR comparison passed.\n");
 }
 
+/* ---------------------------------------------------------------- B9a: PowerDNS ALIAS and LUA */
+static bool b9_rd_is(const dns_record_t *r, const uint8_t *want, size_t n) {
+    return r && r->generic_data && r->generic_len == n && memcmp(r->generic_data, want, n) == 0;
+}
+
+static void test_b9a_alias_lua(void) {
+    printf("[TEST] Zone parser: PowerDNS ALIAS and LUA records (B9a)...\n");
+    zt_t z;
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ NS ns\n"
+                "a ALIAS Target.Example.\n"
+                "r ALIAS rel\n"
+                "m 120 IN alias t.example.\n"
+                "l LUA A \";return {'192.0.2.1'}\"\n"
+                "l2 LUA TXT \"a\" \"b\"\n"
+                "l3 lua TYPE99 \"x\"\n"
+                "g TYPE65401 \\# 3 016100\n");
+    ASSERT_PARSED(&z);
+    /* ALIAS: TYPE 65401, CLASS IN, RDATA = the target name uncompressed, case kept (PowerDNS's AXFR form) */
+    static const uint8_t a_rd[] = { 6, 'T', 'a', 'r', 'g', 'e', 't', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    static const uint8_t r_rd[] = { 3, 'r', 'e', 'l', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    static const uint8_t m_rd[] = { 1, 't', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    dns_record_t *a = zt_find(&z, "a.example.", 65401);
+    assert(a && a->class_val == 1 && b9_rd_is(a, a_rd, sizeof(a_rd)));
+    assert(b9_rd_is(zt_find(&z, "r.example.", 65401), r_rd, sizeof(r_rd)));
+    dns_record_t *m = zt_find(&z, "m.example.", 65401);
+    assert(b9_rd_is(m, m_rd, sizeof(m_rd)) && m->ttl_value == 120);
+    assert(dns_type_to_string(65401) && strcmp(dns_type_to_string(65401), "TYPE65401") == 0);
+    /* LUA: the 16-bit type, then the code as <character-string>s: "A" + a string of 21 octets = 00 01 15 ... (PowerDNS's AXFR form) */
+    static const uint8_t l_rd[] = { 0, 1, 21, ';', 'r', 'e', 't', 'u', 'r', 'n', ' ', '{', '\'', '1', '9', '2', '.', '0', '.', '2', '.', '1', '\'', '}' };
+    static const uint8_t l2_rd[] = { 0, 16, 1, 'a', 1, 'b' };
+    static const uint8_t l3_rd[] = { 0, 99, 1, 'x' };
+    static const uint8_t g_rd[] = { 1, 'a', 0 };
+    assert(b9_rd_is(zt_find(&z, "l.example.", 65402), l_rd, sizeof(l_rd)));
+    assert(b9_rd_is(zt_find(&z, "l2.example.", 65402), l2_rd, sizeof(l2_rd)));
+    assert(b9_rd_is(zt_find(&z, "l3.example.", 65402), l3_rd, sizeof(l3_rd)));
+    assert(b9_rd_is(zt_find(&z, "g.example.", 65401), g_rd, sizeof(g_rd)));    /* the generic form reaches the same record */
+    assert(build_zone_index(&z.arena, true) == 0);
+    parse_error_t pe = {0};
+    char why[400];
+    assert(validate_zone_pdns_types(&z.arena, &pe, why, sizeof(why)) == 0);
+    zt_free(&z);
+
+    /* a code string above 255 octets is cut into <character-string>s, as PowerDNS does */
+    {
+        char text[1024];
+        char code[301];
+        memset(code, 'x', 300);
+        code[300] = '\0';
+        snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\nlong LUA A \"%s\"\n", code);
+        zt_load(&z, text);
+        ASSERT_PARSED(&z);
+        dns_record_t *l = zt_find(&z, "long.example.", 65402);
+        assert(l && l->generic_len == 2 + 1 + 255 + 1 + 45 && l->generic_data[2] == 255 && l->generic_data[3 + 255] == 45);
+        zt_free(&z);
+    }
+
+    /* what is refused */
+    static const char *const bad[] = {
+        "x ALIAS\n", "x ALIAS a.example. b.example.\n", "x ALIAS a..example.\n", "x ALIAS .\n", "x ALIAS \\# 3 016100\n",
+        "x LUA\n", "x LUA A\n", "x LUA FOOBAR \"x\"\n", "x LUA AXFR \"x\"\n", "x LUA 0 \"x\"\n",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        char text[256];
+        snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n%s", bad[i]);
+        zt_load(&z, text);
+        if (z.rc >= 0) fprintf(stderr, "B9a: '%s' was accepted\n", bad[i]);
+        assert(z.rc < 0);
+        zt_free(&z);
+    }
+
+    /* the zone rules: ALIAS beside A / AAAA (any spelling of the owner), ALIAS beside DNSSEC records, malformed RDATA of the generic form */
+    static const struct { const char *body; bool ok; const char *msg; } rules[] = {
+        { "x ALIAS t.example.\nx TXT \"t\"\nx MX 10 m.example.\ny LUA A \"c\"\ny A 192.0.2.1\n", true, "" },
+        { "x ALIAS t.example.\nX A 192.0.2.1\n", false, "an A or AAAA record" },
+        { "x ALIAS t.example.\nx AAAA 2001:db8::1\n", false, "an A or AAAA record" },
+        { "x ALIAS t.example.\n@ DNSKEY 257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==\n", false, "DNSSEC" },
+        { "x ALIAS t.example.\nn NSEC o.example. A RRSIG NSEC\n", false, "DNSSEC" },
+        { "x TYPE65401 \\# 3 010161\n", false, "malformed RDATA" },           /* not one name filling the RDATA */
+        { "x TYPE65401 \\# 4 01610000\n", false, "malformed RDATA" },         /* trailing octet */
+        { "x TYPE65402 \\# 2 0001\n", false, "malformed RDATA" },             /* no code */
+        { "x TYPE65402 \\# 4 00010500\n", false, "malformed RDATA" },         /* a string that runs past the end */
+        { "x TYPE65402 \\# 3 000100\n", true, "" },                           /* an empty code string */
+        { "d A 192.0.2.1\n@ DNSKEY 257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==\n", true, "" },   /* no ALIAS */
+    };
+    for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
+        char text[1024];
+        snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n%s", rules[i].body);
+        zt_load(&z, text);
+        ASSERT_PARSED(&z);
+        assert(build_zone_index(&z.arena, true) == 0);
+        int rc = validate_zone_pdns_types(&z.arena, &pe, why, sizeof(why));
+        if ((rc == 0) != rules[i].ok || (!rules[i].ok && !strstr(why, rules[i].msg)))
+            fprintf(stderr, "B9a rule %zu: rc=%d '%s'\n", i, rc, rc ? why : "");
+        assert((rc == 0) == rules[i].ok);
+        if (!rules[i].ok) assert(strstr(why, rules[i].msg) && pe.error_message == why);
+        zt_free(&z);
+    }
+
+    /* $GENERATE accepts the mnemonic */
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-3 g$ ALIAS t$.example.\n");
+    ASSERT_PARSED(&z);
+    assert(zt_count(&z, NULL, 65401) == 3);
+    zt_free(&z);
+    printf("  -> ALIAS / LUA parsing and zone rules passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Zone Parser Path Coverage Tests ===\n");
     test_x37_rdata_name_case();
@@ -1623,6 +1729,7 @@ int main(void) {
     test_include();
     test_tags_and_semantics();
     test_extended_negative_paths();
+    test_b9a_alias_lua();
     printf("=== All Zone Parser Path Coverage Tests PASSED ===\n");
     return 0;
 }

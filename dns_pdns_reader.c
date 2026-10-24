@@ -438,14 +438,8 @@ int pdns_zone_add_record(pdns_zone_t *z, const db_record_row_t *row) {
     char type[PDNS_MAX_TYPE_LEN + 1];
     size_t tl = strlen(row->type);
     for (size_t i = 0; i <= tl; i++) type[i] = (char)toupper((unsigned char)row->type[i]);
-    if (strcmp(type, "ALIAS") == 0) {                              /* B9a replaces this */
-        zfail(z, true, id, "ALIAS records are not supported yet (milestone B9a)");
-        return -1;
-    }
-    if (strcmp(type, "LUA") == 0) {                                /* B9a replaces this */
-        zfail(z, true, id, "LUA records are not supported yet (milestone B9a)");
-        return -1;
-    }
+    /* ALIAS and LUA (B9a, design 3.6b) go through like any type: the zone parser turns the two mnemonics into PowerDNS's TYPE65401 / TYPE65402 form
+     * (dns_zone_parser.c); their rules (an ALIAS beside A / AAAA or DNSSEC records) are checked on the parsed zone in pdns_zone_finish() */
 
     /* rule 5: ttl */
     uint32_t ttl;
@@ -1200,6 +1194,14 @@ static bool build_settings(pdns_zone_t *z) {
             if (strcasecmp(content, "tinydns") == 0) z->flags |= PDNS_F_TINYDNS;
             else if (strcasecmp(content, "bind") != 0 && strcasecmp(content, "zone") != 0)
                 zwarn(z, false, 0, "X-KARIDNS-FORMAT value '%.32s' unknown, ignored", content);
+        } else if (strcasecmp(kind, "ENABLE-LUA-RECORDS") == 0) {
+            /* B9a, D13: LUA records are not run.  PowerDNS answers them when this metadata is 1; here that would silently change the answers, so the
+             * zone is refused (the version in service stays) until the operator takes the metadata away.  The rows themselves are kept for the
+             * transfer (TYPE65402) and never answered, as in PowerDNS with enable-lua-records=no */
+            if (strcmp(content, "1") == 0) {
+                zfail(z, false, 0, "domainmetadata ENABLE-LUA-RECORDS is 1: LUA records are not supported (KariDNS keeps them for the zone transfer and does not answer them)");
+                ok = false;
+            }
         } else if (strcasecmp(kind, "NSEC3PARAM") == 0) {
             if (have_nsec3param) continue;
             have_nsec3param = true;
@@ -1674,6 +1676,22 @@ int pdns_zone_finish(pdns_zone_t *z) {
     if (validate_zone_dname(&z->arena, &verr) < 0 || validate_zone_name_lengths(&z->arena, &verr) < 0) {
         zfail(z, false, 0, "%s", verr.error_message ? verr.error_message : "zone check failed");
         return -1;
+    }
+    {   /* B9a: ALIAS beside A / AAAA, ALIAS in a zone with DNSSEC records (also a PRESIGNED zone), malformed ALIAS / LUA RDATA */
+        char why[400];
+        if (validate_zone_pdns_types(&z->arena, &verr, why, sizeof(why)) < 0) {
+            zfail(z, false, 0, "%s", why);
+            return -1;
+        }
+        if (z->flags & PDNS_F_PRESIGNED) {          /* the zone is served with the signatures it has, so an ALIAS answer could never be signed */
+            for (size_t i = 0; i < z->arena.count; i++) {
+                const dns_record_t *r = &z->arena.records[i];
+                if (r->type_code == DNS_TYPE_PDNS_ALIAS && (r->class_val == 1 || r->class_val == 0)) {
+                    zfail(z, false, 0, "the zone is PRESIGNED and has an ALIAS record at '%.200s': an ALIAS answer cannot be signed offline", r->name ? r->name : "");
+                    return -1;
+                }
+            }
+        }
     }
     return 0;
 }

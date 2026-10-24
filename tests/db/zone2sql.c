@@ -340,6 +340,38 @@ static void ds_add_quoted(dstr_t *d, const char *s) {
 /* content (and prio) of a record in PowerDNS form.  false: not representable (message in err) */
 static bool record_content(const dns_record_t *r, dstr_t *out, long *prio, char *err, size_t errlen) {
     *prio = 0;
+    /* B9a: PowerDNS's ALIAS and LUA rows (the zone parser keeps them as TYPE65401 / TYPE65402 of CLASS IN, the form PowerDNS transfers) */
+    if (r->generic_data && (r->class_val == 1 || r->class_val == 0) && r->type_code == DNS_TYPE_PDNS_ALIAS) {
+        char nm[DNS_NAME_TEXT_SIZE];
+        size_t nx = 0;
+        if (expand_wire_name_to_buffer(r->generic_data, r->generic_len, 0, &nx, nm, sizeof(nm)) < 0 || nx != r->generic_len) {
+            snprintf(err, errlen, "ALIAS RDATA is not one name");
+            return false;
+        }
+        ds_adds(out, nm);
+        return true;
+    }
+    if (r->generic_data && (r->class_val == 1 || r->class_val == 0) && r->type_code == DNS_TYPE_PDNS_LUA) {
+        if (r->generic_len < 3) {
+            snprintf(err, errlen, "LUA RDATA is too short");
+            return false;
+        }
+        ds_adds(out, dns_type_to_string((uint16_t)((r->generic_data[0] << 8) | r->generic_data[1])));
+        for (unsigned p = 2; p < r->generic_len;) {
+            unsigned l = r->generic_data[p++];
+            if (r->generic_len - p < l) {
+                snprintf(err, errlen, "LUA RDATA runs past its end");
+                return false;
+            }
+            char tmp[256];
+            memcpy(tmp, r->generic_data + p, l);
+            tmp[l] = '\0';
+            ds_adds(out, " ");
+            ds_add_quoted(out, tmp);
+            p += l;
+        }
+        return true;
+    }
     if (r->generic_data) {       /* RFC 3597 form as written in the zone */
         char b[32];
         snprintf(b, sizeof(b), "\\# %u", (unsigned)r->generic_len);
@@ -487,7 +519,9 @@ bool z2s_rows_from_arena(zone_arena_t *arena, const char *apex, z2s_rows_t *out,
             z2s_rows_free(out);
             return false;
         }
-        char *type = strdup(get_type_str(r->type_code, arena));
+        char *type = strdup((r->generic_data && (r->class_val == 1 || r->class_val == 0) && r->type_code == DNS_TYPE_PDNS_ALIAS) ? "ALIAS"
+                                  : (r->generic_data && (r->class_val == 1 || r->class_val == 0) && r->type_code == DNS_TYPE_PDNS_LUA) ? "LUA"
+                                  : get_type_str(r->type_code, arena));
         if (!type) {
             free(name.p);
             free(content.p);

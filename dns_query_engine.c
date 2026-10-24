@@ -10,6 +10,7 @@
 #include "dns_dynamic_update.h"
 #include "dns_siphash.h"
 #include "dns_zone_image.h"
+#include "dns_alias.h"
 
 #ifdef __FreeBSD__
 #include <sys/capsicum.h>
@@ -25,6 +26,10 @@ static _Thread_local bool t_resolve_crossed_zone;
 /* 応答の大きさの上限で Additional を途中で打ち切ったか (TC は立てない、RFC 2181 §9)。キャッシュの鍵は
  * 問い合わせの受信バッファの大きさを含まないので、打ち切った応答は入れない */
 static _Thread_local bool t_resolve_additional_cut;
+/* B9a: the answer holds ALIAS-expanded addresses (or an ALIAS target that could not be resolved): the result changes with the resolver's TTLs, so it
+ * is not stored in the shared response cache; and the SERVFAIL gets an extended error */
+static _Thread_local bool t_resolve_alias_expanded;
+static _Thread_local bool t_resolve_alias_failed;
 
 program_plugin_t *g_program_plugins = NULL;
 int g_program_plugins_count = 0;
@@ -105,6 +110,15 @@ static bool is_nsec3_chain_rr(const zone_image_t *img, uint32_t rr) {
   if (type == 50) return true;
   uint16_t covered = 0;
   return type == 46 && zone_image_rrsig_covered(img, rr, &covered) == 0 && covered == 50;
+}
+
+/* B9a (design 3.6b): PowerDNS's LUA records (TYPE 65402 of CLASS IN) are in the zone for the transfer only.  Like PowerDNS with
+ * enable-lua-records=no, a query never sees them: not as an answer (not for QTYPE 65402 or ANY), and a name that holds nothing else
+ * does not exist (NXDOMAIN).  KariDNS's own Extended AXFR record of the same number (CLASS 65302) is not a zone RR at all. */
+static bool rr_not_served(const zone_image_t *img, uint32_t rr) {
+  const zone_image_rr_t *r = &zone_image_rrs(img)[rr];
+  if (r->type == DNS_TYPE_PDNS_LUA && r->class_val == 1) return true;
+  return is_nsec3_chain_rr(img, rr);
 }
 
 static resolve_checkpoint_t save_checkpoint(uint16_t *offset, uint16_t *ancount,
@@ -209,7 +223,7 @@ static int emit_rrset(const zone_image_t *img, uint32_t name_id, const char *own
   uint32_t end = k + zone_image_name_rr_count(img, name_id);
   for (; k < end; k++) {
     if (rrs[k].type != type) continue;
-    if (is_nsec3_chain_rr(img, k)) continue; // RFC 5155 §7.2.8: 否定の証明でだけ書く (attach_nsec3_record)
+    if (rr_not_served(img, k)) continue; // RFC 5155 §7.2.8 / LUA: 否定の証明でだけ書く (attach_nsec3_record)
     if (qclass != 255 && qclass != rrs[k].class_val) continue;
     if (f->answer_scope) note_ecs_variant(img, k, type, f->zone_scope, f->answer_scope);
     uint32_t eff_ttl;
@@ -374,7 +388,7 @@ STATIC_TEST bool name_exists_in_zone(const zone_image_t *img, const char *name, 
     uint32_t k = zone_image_name_first_rr(img, id);
     uint32_t end = k + zone_image_name_rr_count(img, id);
     for (; k < end; k++) {
-      if (is_nsec3_chain_rr(img, k)) continue; // RFC 5155 §7.2.8
+      if (rr_not_served(img, k)) continue; // RFC 5155 §7.2.8, LUA
       uint32_t eff_ttl;
       if (rr_valid(img, k, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) return true;
     }
@@ -706,6 +720,52 @@ static bool rrset_type_seen(uint16_t types[64], int *count, uint16_t t) {
   return false;
 }
 
+/* B9a (design 3.6b): the A / AAAA RRsets that the ALIAS RRs of owner `name_id` stand for, from the result table of dns_alias.c (no allocation, no
+ * waiting).  qtype 1, 28 or 255 (ANY: A then AAAA).  The TTL is the smaller of the ALIAS RR's and what is left of the upstream TTL.
+ * Returns the RRs written (0 = NODATA), or -1 when they do not fit (nothing is left of them: the caller sets TC); *ok_types counts the
+ * (ALIAS RR, type) pairs that had a usable result: when it stays 0 the caller answers SERVFAIL (PowerDNS does when it cannot resolve). */
+static int answer_alias(const zone_image_t *img, uint32_t name_id, uint64_t key, const char *owner, uint16_t qtype, uint8_t *res,
+                        size_t max_res_len, uint16_t *offset, compress_ctx_t *comp_ctx, uint16_t *ancount, int *ok_types) {
+  static const uint16_t types[2] = { 1, 28 };
+  const zone_image_rr_t *rrs = zone_image_rrs(img);
+  uint16_t start_offset = *offset, start_count = *ancount;
+  int written = 0;
+  *ok_types = 0;
+  uint32_t k = zone_image_name_first_rr(img, name_id);
+  uint32_t end = k + zone_image_name_rr_count(img, name_id);
+  for (; k < end; k++) {
+    if (rrs[k].type != DNS_TYPE_PDNS_ALIAS || rrs[k].class_val != 1) continue;
+    uint8_t target[256];
+    size_t tlen;
+    if (!alias_wire_lower(zone_image_rr_rdata(img, k), zone_image_rr_rdlen(img, k), target, &tlen)) continue;
+    for (int t = 0; t < 2; t++) {
+      if (qtype != 255 && qtype != types[t]) continue;
+      alias_answer_t a;
+      if (!alias_lookup(key, target, tlen, types[t], &a)) continue;
+      (*ok_types)++;
+      uint32_t ttl = a.ttl < rrs[k].ttl ? a.ttl : rrs[k].ttl;
+      for (uint8_t i = 0; i < a.n; i++) {
+        dns_record_t r;
+        memset(&r, 0, sizeof(r));
+        r.name = (char *)owner;
+        r.type_code = types[t];
+        r.class_val = 1;
+        r.ttl_value = ttl;
+        r.generic_data = (uint8_t *)(uintptr_t)(a.rdata + (size_t)i * a.rdlen);
+        r.generic_len = a.rdlen;
+        if (serialize_dns_record(res, max_res_len, offset, &r, comp_ctx, owner, 0xFFFFFFFF) < 0) {
+          *offset = start_offset;
+          *ancount = start_count;
+          return -1;
+        }
+        (*ancount)++;
+        written++;
+      }
+    }
+  }
+  return written;
+}
+
 static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
                          zone_db_entry_t **db_entry_ptr,
                          zone_version_t **current_zone_ptr, uint8_t *res,
@@ -789,6 +849,10 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
       q_first = img_names[qname_id].first_rr;
       q_end = q_first + (img_names[qname_id].rr_count_flags & ZONE_IMAGE_NAME_COUNT_MASK);
     }
+    /* B9a: this owner has an ALIAS RR and the zone has resolvers (alias-resolver): the ALIAS is expanded, not answered */
+    uint64_t alias_key = 0;
+    if (qname_id != ZONE_IMAGE_NONE && (img_names[qname_id].rr_count_flags & ZONE_IMAGE_NAME_ALIAS) && (qclass == 1 || qclass == 255))
+      alias_key = alias_resolvers_key(cfg, zcfg, db_entry->source == ZONE_SRC_DB);
     uint16_t written_types[64];
     int written_count = 0;
     rr_filter_t flt = { client_loc, client_ecs_tag, client_loc_tag, zone_scope, answer_scope };
@@ -797,7 +861,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     if (has_any && minimal_any) {
       bool name_exists = false, has_cname = false, has_rrsig = false;
       for (uint32_t k = q_first; k < q_end; k++) {
-        if (is_nsec3_chain_rr(img, k)) continue; // RFC 5155 §7.2.8: 名前の存在に数えない
+        if (rr_not_served(img, k)) continue; // RFC 5155 §7.2.8 / LUA: 名前の存在に数えない
         uint32_t eff_ttl;
         note_ecs_variant(img, k, 255, zone_scope, answer_scope);
         if (!rr_valid(img, k, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
@@ -835,7 +899,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
       bool class_matches = (qclass == 255 || qclass == r_class);
       if (!class_matches) continue;
       // RFC 5155 §7.2.8: NSEC3 チェーンのレコードは QTYPE NSEC3/RRSIG/ANY でも答えず、名前の存在にも数えない
-      if (is_nsec3_chain_rr(img, k)) continue;
+      if (rr_not_served(img, k)) continue;
       uint32_t eff_ttl;
       note_ecs_variant(img, k, qtypes[0], zone_scope, answer_scope);
       if (!rr_valid(img, k, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
@@ -879,6 +943,8 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
         }
         break;
       } else {
+        /* B9a: with an alias-resolver the ALIAS RR itself is no answer (PowerDNS with expand-alias=yes), and ANY gives the expanded A and AAAA only */
+        if (alias_key && ((rec_type == DNS_TYPE_PDNS_ALIAS && r_class == 1) || (has_any && rec_type != 5))) continue;
         /* [RFC 8482 §4.2] DNSSECゾーンでのANYクエリ: 最初に見つかった1つのRRsetのみを返し、他は展開しない */
         if (has_any && minimal_any && skip_synthesis) {
           if (rec_type != 46) {
@@ -905,6 +971,27 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
           }
         }
       }
+    }
+
+    // ==== B9a: ALIAS の展開 (A / AAAA / ANY) ====
+    if (alias_key && found && !type_matched && !cname_followed && (qtypes[0] == 1 || qtypes[0] == 28 || has_any)) {
+      int ok_types = 0;
+      t_resolve_alias_expanded = true;
+      int w = answer_alias(img, qname_id, alias_key, current_qname, qtypes[0], res, max_res_len, offset, comp_ctx, ancount, &ok_types);
+      if (w < 0) {
+        res[2] |= 0x02;
+        return;
+      }
+      if (ok_types == 0) {                       // not resolved (yet), or the result is older than the stale limit
+        t_resolve_alias_failed = true;
+        res[3] = (res[3] & 0xF0) | 0x02;      // SERVFAIL
+        *offset = initial_offset;
+        *ancount = initial_ancount;
+        *nscount = initial_nscount;
+        *arcount = initial_arcount;
+        return;
+      }
+      if (w > 0) type_matched = true;
     }
 
     // ==== フェーズ3: DNAME合成 ====
@@ -1019,6 +1106,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
               uint16_t r_class = img_rrs[k].class_val;
               bool class_matches = (qclass == 255 || qclass == r_class);
               if (!class_matches) continue;
+              if (rr_not_served(img, k)) continue; // LUA (B9a): a wildcard that holds only LUA records is not there
               uint32_t eff_ttl;
               note_ecs_variant(img, k, qtypes[0], zone_scope, answer_scope);
               if (!rr_valid(img, k, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
@@ -1131,10 +1219,22 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
         int qtx_mode = (sign_answers && qtx != 46) ? RRSIG_REQUIRED : RRSIG_NONE;
 
         // O-16: RRset を続けて書き、その後ろに RRSIG (exact-name と同じヘルパー)
-        int w = emit_rrset(img, final_id, NULL, qtx, qclass, &flt, qtx_mode, res,
-                           max_res_len, offset, comp_ctx, ancount, &glue);
+        int w = (alias_key && qtx == DNS_TYPE_PDNS_ALIAS)   /* B9a: with an alias-resolver the ALIAS RR is not an answer (as for the first QTYPE) */
+                    ? 0
+                    : emit_rrset(img, final_id, NULL, qtx, qclass, &flt, qtx_mode, res,
+                                 max_res_len, offset, comp_ctx, ancount, &glue);
         if (w < 0) this_qtx_failed = true;
         else if (w > 0) qtx_matched = true;
+
+        /* B9a: the extra QTYPEs A / AAAA of an RFC 10029 query at an ALIAS name are expanded like the first one (a type without a usable
+         * result is simply not matched here: only the first QTYPE decides SERVFAIL) */
+        if (!qtx_matched && !this_qtx_failed && alias_key && (qtx == 1 || qtx == 28) && final_id == qname_id) {
+          int ok_x = 0;
+          t_resolve_alias_expanded = true;
+          int wa = answer_alias(img, final_id, alias_key, current_qname, qtx, res, max_res_len, offset, comp_ctx, ancount, &ok_x);
+          if (wa < 0) this_qtx_failed = true;
+          else if (wa > 0) qtx_matched = true;
+        }
 
         if (!qtx_matched && !this_qtx_failed && (img->flags & ZONE_IMAGE_F_WILDCARD)) {
           const char *parent = current_qname;
@@ -3237,6 +3337,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   uint32_t qtx_included = 0;
   t_resolve_crossed_zone = false;
   t_resolve_additional_cut = false;
+  t_resolve_alias_expanded = false;
+  t_resolve_alias_failed = false;
   resolve_name(current_qname, qclass, qtypes, num_qtypes, &db_entry, &current_zone, res, body_max_len,
                &offset, comp_ctx, &ancount, &nscount, &arcount,
                cfg_for_ede ? cfg_for_ede->minimal_responses : false,
@@ -3246,6 +3348,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
                cfg, ecs_trusted, edns.ecs_addr, edns.ecs_family,
                edns.ecs_source_prefix,
                &edns.ecs_scope_prefix);
+  if (t_resolve_alias_failed && (res[3] & 0x0F) == 2) add_ede(&edns, send_ede, 22, "ALIAS target could not be resolved");   // 22: No Reachable Authority (RFC 8914)
 
   if (edns.has_mqtype_query) {
     if (res[2] & 0x02) {
@@ -3263,7 +3366,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
   /* 応答キャッシュに入れる: NOERROR、AA、TC なしで answer があり、EDE の付かない応答
    * (ヒットした応答は UDP の 512 オクテットに入る大きさに限る)。別のゾーンへ移った応答と、Additional を打ち切った応答は入れない */
-  if (rc_tag && !t_resolve_crossed_zone && !t_resolve_additional_cut && (res[3] & 0x0F) == 0 && (res[2] & 0x04) && !(res[2] & 0x02) && ancount > 0 &&
+  if (rc_tag && !t_resolve_crossed_zone && !t_resolve_additional_cut && !t_resolve_alias_expanded && (res[3] & 0x0F) == 0 && (res[2] & 0x04) && !(res[2] & 0x02) && ancount > 0 &&
       edns.ede_count == 0 && offset > q_offset && offset <= UDP_DEFAULT_MAX_RES_LEN) {
     rcache_store(rc_tag, rc_gen, qtype, res + q_offset, (size_t)(offset - q_offset), ancount, nscount, arcount);
   }

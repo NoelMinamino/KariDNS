@@ -40,6 +40,7 @@
 #define ZONE_IMAGE_F_PERM     0x10u /* the file (builder) order of the RRs differs from the image order: perm[] lists the RR indexes in that order (AXFR out and thaw use it) */
 #define ZONE_IMAGE_F_VIEW     0x40u /* B8t-1: some RR is seen only by some clients or at some times (tinydns location / time stamp / countdown, $LOCATION / $ECS-SUBNET tag); an ext[] entry that only keeps an owner spelling (alt text) does not count */
 #define ZONE_IMAGE_F_SOA_ATTR 0x20u /* B8t-1: some apex SOA RR is restricted (tinydns location / time stamp, $LOCATION / $ECS-SUBNET tag): a client may see no SOA of the zone, and the SOA it sees is the first visible one */
+#define ZONE_IMAGE_F_ALIAS 0x80u /* B9a: some owner has an ALIAS RRset (TYPE 65401 of CLASS IN): lets the alias module and the engine skip a zone without one */
 
 /* zone_image_name_t.rr_count_flags: low 24 bits RR count, high 8 bits flags */
 #define ZONE_IMAGE_NAME_COUNT_MASK 0x00FFFFFFu
@@ -49,6 +50,7 @@
 #define ZONE_IMAGE_NAME_APEX       (1u << 27)
 #define ZONE_IMAGE_NAME_NSEC       (1u << 28) /* has an NSEC RR */
 #define ZONE_IMAGE_NAME_GLUE       (1u << 29) /* prelinked glue target: among the first MAX_PRELINK_TARGETS (256) distinct NS/MX/SRV targets in record order and has A/AAAA RRs here (what zone_glue_track_build() links); the engine answers it with the RRs in RR order (see append_glue_records) */
+#define ZONE_IMAGE_NAME_ALIAS      (1u << 30) /* B9a: has an ALIAS RR (TYPE 65401, CLASS IN) */
 
 /* zone_image_rr_t.flags */
 #define ZONE_IMAGE_RR_RAW        0x1u /* RDATA written as is (generic_data / KARIDNS_EXT class): never compressed */

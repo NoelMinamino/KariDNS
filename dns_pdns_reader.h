@@ -19,8 +19,10 @@
  * Row rules (design 3.3), in the order they are applied:
  *   1. disabled                          skipped (before every other check)
  *   2. type NULL                         empty non-terminal: no RR; (name, ordername) kept in z->ents (B5)
- *   3. type token                        letters, digits, '-', first character a letter, <= 32; ALIAS / LUA fail the
- *                                        zone with a distinct reason (support: milestone B9a, design 3.6b)
+ *   3. type token                        letters, digits, '-', first character a letter, <= 32.  ALIAS and LUA (B9a, design 3.6b) are
+ *                                        accepted: the zone parser makes them TYPE65401 / TYPE65402 as PowerDNS transfers them; an ALIAS
+ *                                        beside an A / AAAA RRset or in a zone with DNSSEC records, and domainmetadata
+ *                                        ENABLE-LUA-RECORDS=1, fail the zone
  *   4. owner                             not empty; the zone name or below it at a label boundary (compared in C,
  *                                        never with SQL collations); safe as a zone-file token
  *   5. ttl                               NULL -> opts.default_ttl (one aggregated warning per zone); outside

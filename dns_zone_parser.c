@@ -381,6 +381,88 @@ static void zone_generic_rdata_error(parse_context_t *ctx, const char *type, con
   }
 }
 
+/* B9a: the PowerDNS record types ALIAS and LUA.  Neither is an IETF type; PowerDNS keeps them as TYPE65401 (ALIAS: RDATA =
+ * the target name, uncompressed) and TYPE65402 (LUA: RDATA = the 16-bit type, then the code as <character-string>s) and sends
+ * them like that in a zone transfer (design 3.6b), so a zone file written with the mnemonics is turned into exactly that
+ * RFC 3597 generic form here.  Both are private use type codes (RFC 6895 section 3.1) of CLASS IN; KariDNS's own Extended
+ * AXFR records use the same numbers in CLASS 65302 (DNS_CLASS_KARIDNS_EXT), so everything that tells them apart looks at the
+ * pair (type, class).  ALIAS <target> / LUA <type> "<code>" ["<more code>" ...]; names are not compressed (RFC 3597 section 4). */
+static int zone_pdns_type_rewrite(dns_record_t *rec, bool is_alias, const char *origin, zone_arena_t *arena,
+                                  parse_context_t *ctx, const char *buf) {
+  uint8_t *rd = (uint8_t *)malloc(65536);
+  char *hex = NULL;
+  const char *why = NULL;
+  size_t n = 0;
+  if (!rd) {
+    zone_generic_rdata_error(ctx, rec->type, buf, "Out of memory");
+    return -1;
+  }
+  if (is_alias) {
+    if (rec->rdata_count != 1) {
+      why = "ALIAS needs exactly one target name";
+    } else {
+      char *name = expand_domain_name(rec->rdata[0], origin, arena);
+      if (!name || strcmp(name, ".") == 0 || !validate_domain_name_length(name, NULL, NULL, NULL)) {
+        why = "ALIAS target is not a valid domain name";
+      } else {
+        long w = write_uncompressed_name_ext(rd, 0, 256, name, false);
+        if (w <= 0) why = "ALIAS target is not a valid domain name";
+        else n = (size_t)w;
+      }
+    }
+  } else {
+    uint16_t qt = rec->rdata_count >= 2 ? get_type_code(rec->rdata[0]) : 0;
+    if (rec->rdata_count < 2) {
+      why = "LUA needs a record type and the code as a quoted string";
+    } else if (qt == 0 || is_meta_rrtype(qt)) {
+      why = "LUA: the first field must be a record type (A, TXT, TYPEnnn, ...)";
+    } else {
+      rd[n++] = (uint8_t)(qt >> 8);
+      rd[n++] = (uint8_t)qt;
+      for (int j = 1; j < rec->rdata_count && !why; j++) {
+        unescape_string_in_place(rec->rdata[j]);
+        size_t len = strlen(rec->rdata[j]);
+        size_t off = 0;
+        do {                      /* a string longer than 255 octets is cut into <character-string>s, as PowerDNS does */
+          size_t chunk = len - off > 255 ? 255 : len - off;
+          if (n + 1 + chunk > 65535) { why = "LUA code is too long (RDATA above 65535 octets)"; break; }
+          rd[n++] = (uint8_t)chunk;
+          memcpy(rd + n, rec->rdata[j] + off, chunk);
+          n += chunk;
+          off += chunk;
+        } while (off < len);
+      }
+    }
+  }
+  if (!why) {
+    hex = (char *)arena_alloc(arena, n * 2 + 1);
+    char *lenstr = (char *)arena_alloc(arena, 8);
+    if (!hex || !lenstr || !arena_record_alloc_rdata(arena, rec, 3)) {
+      why = "Out of memory";
+    } else {
+      static const char digits[] = "0123456789abcdef";
+      for (size_t i = 0; i < n; i++) {
+        hex[2 * i] = digits[rd[i] >> 4];
+        hex[2 * i + 1] = digits[rd[i] & 15];
+      }
+      hex[2 * n] = '\0';
+      snprintf(lenstr, 8, "%zu", n);
+      rec->rdata[0] = arena_strdup(arena, "\\#");
+      rec->rdata[1] = lenstr;
+      rec->rdata[2] = hex;
+      rec->rdata_count = 3;
+      rec->type = arena_strdup(arena, is_alias ? "TYPE65401" : "TYPE65402");
+      if (!rec->rdata[0] || !rec->type) why = "Out of memory";
+    }
+  }
+  free(rd);
+  if (why) {
+    zone_generic_rdata_error(ctx, rec->type, buf, why);
+    return -1;
+  }
+  return 0;
+}
+
 static int parse_zone_buffer(char *buf, size_t size, zone_arena_t *arena, parse_context_t *ctx,
                              const zone_parse_state_t *st, bool finalize);
 
@@ -797,7 +879,7 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
                        fields[i + 2], cur_buf);
         return -1;
     }
-    if (get_type_code(type_str) == 0) {
+    if (get_type_code(type_str) == 0 && strcasecmp(type_str, "ALIAS") != 0 && strcasecmp(type_str, "LUA") != 0) {
         generate_error(ctx, "Unknown record type", type_str, cur_buf);
         return -1;
     }
@@ -1368,6 +1450,10 @@ PROCESS_RECORD:
     return -1;
   }
   
+  if (strcasecmp(rec->type, "ALIAS") == 0 || strcasecmp(rec->type, "LUA") == 0) {
+    if (zone_pdns_type_rewrite(rec, toupper((unsigned char)rec->type[0]) == 'A', *origin_io, arena, ctx, buf) != 0)
+      return -1;
+  }
   rec->type_code = get_type_code(rec->type);
   if (rec->type_code == 0) {
     if (ctx && ctx->err_out) {
@@ -2340,6 +2426,107 @@ int validate_zone_dname(zone_arena_t *arena, parse_error_t *err) {
     }
   }
   return 0;
+}
+
+/* B9a (design 3.6b): the rules for PowerDNS's ALIAS (TYPE 65401) and LUA (TYPE 65402) records of CLASS IN.  Not the Extended AXFR
+ * records of CLASS 65302 that share the numbers.
+ *  - the RDATA must be what the types are: ALIAS = one uncompressed domain name filling the RDATA (RFC 3597 section 4); LUA = a
+ *    16-bit type and one or more <character-string>s filling the RDATA.
+ *  - an ALIAS name must not also have an A or AAAA RRset: the ALIAS stands for those RRsets (PowerDNS has no rule, but the answer would
+ *    be one or the other depending on the mode).  Other types (TXT, MX, NS, ...) may coexist.
+ *  - a zone with an ALIAS must not hold DNSSEC records (DNSKEY, RRSIG, NSEC, NSEC3, NSEC3PARAM): an expanded answer cannot be signed
+ *    offline (a PRESIGNED zone, or a signed zone file, fails).
+ * One implementation for the loaders (via zone_image_freeze(), so every path that publishes a zone), the database reader and karicheck.
+ * `detail` receives the message, which err->error_message then points to. */
+static bool pdns_alias_rdata_ok(const uint8_t *rd, size_t len) {
+  size_t p = 0;
+  for (;;) {
+    if (p >= len) return false;
+    uint8_t l = rd[p++];
+    if (l == 0) return p == len;
+    if (l > 63 || len - p < l) return false;
+    p += l;
+  }
+}
+
+static bool pdns_lua_rdata_ok(const uint8_t *rd, size_t len) {
+  if (len < 3) return false;
+  size_t p = 2;
+  while (p < len) {
+    size_t l = rd[p++];
+    if (len - p < l) return false;
+    p += l;
+  }
+  return true;
+}
+
+int validate_zone_pdns_types(const zone_arena_t *arena, parse_error_t *err, char *detail, size_t detail_cap) {
+  if (!arena || !arena->records || arena->count == 0) return 0;
+  size_t n_alias = 0;
+  bool dnssec = false;
+  const char *dnssec_owner = NULL;
+  for (size_t i = 0; i < arena->count; i++) {
+    const dns_record_t *r = &arena->records[i];
+    if (r->class_val != 1 && r->class_val != 0) continue;
+    if (r->type_code == DNS_TYPE_PDNS_ALIAS || r->type_code == DNS_TYPE_PDNS_LUA) {
+      bool alias = r->type_code == DNS_TYPE_PDNS_ALIAS;
+      if (!r->generic_data || !(alias ? pdns_alias_rdata_ok(r->generic_data, r->generic_len)
+                                       : pdns_lua_rdata_ok(r->generic_data, r->generic_len))) {
+        snprintf(detail, detail_cap, "%s record at '%.200s' has malformed RDATA (%s)", alias ? "ALIAS" : "LUA", r->name ? r->name : "",
+                 alias ? "one uncompressed domain name expected" : "a 16-bit type and <character-string>s expected");
+        goto fail;
+      }
+      if (alias) n_alias++;
+    } else if (!dnssec && (r->type_code == 46 || r->type_code == 47 || r->type_code == 48 || r->type_code == 50 || r->type_code == 51)) {
+      dnssec = true;
+      dnssec_owner = r->name;
+    }
+  }
+  if (n_alias == 0) return 0;
+  if (dnssec) {
+    snprintf(detail, detail_cap, "the zone has ALIAS records and DNSSEC records (first at '%.200s'): an ALIAS answer cannot be signed offline",
+             dnssec_owner ? dnssec_owner : "");
+    goto fail;
+  }
+  /* the owners of the ALIAS records, in a small open-addressing set */
+  size_t cap = 16;
+  while (cap < n_alias * 2) cap <<= 1;
+  const char **set = (const char **)calloc(cap, sizeof(*set));
+  if (!set) {
+    snprintf(detail, detail_cap, "out of memory checking the ALIAS records");
+    goto fail;
+  }
+  for (size_t i = 0; i < arena->count; i++) {
+    const dns_record_t *r = &arena->records[i];
+    if (r->type_code != DNS_TYPE_PDNS_ALIAS || (r->class_val != 1 && r->class_val != 0) || !r->name) continue;
+    size_t h = dns_name_hash_ci(r->name) & (cap - 1);
+    while (set[h] && !domain_names_match_ci(set[h], r->name)) h = (h + 1) & (cap - 1);
+    set[h] = r->name;
+  }
+  const char *bad = NULL;
+  for (size_t i = 0; i < arena->count && !bad; i++) {
+    const dns_record_t *r = &arena->records[i];
+    if ((r->type_code != 1 && r->type_code != 28) || (r->class_val != 1 && r->class_val != 0) || !r->name) continue;
+    size_t h = dns_name_hash_ci(r->name) & (cap - 1);
+    while (set[h]) {
+      if (domain_names_match_ci(set[h], r->name)) { bad = r->name; break; }
+      h = (h + 1) & (cap - 1);
+    }
+  }
+  free(set);
+  if (bad) {
+    snprintf(detail, detail_cap, "'%.200s' has an ALIAS record and an A or AAAA record: the ALIAS stands for those RRsets", bad);
+    goto fail;
+  }
+  return 0;
+fail:
+  if (err) {
+    err->error_message = detail;
+    err->error_offset = 0;
+    err->token_length = 0;
+    err->file_path = NULL;
+  }
+  return -1;
 }
 
 int validate_zone_name_lengths(zone_arena_t *arena, parse_error_t *err) {

@@ -11,6 +11,8 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "dns_wire.h"
@@ -21,6 +23,7 @@
 #include "test_image_helper.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_query_engine.h"
+#include "dns_alias.h"
 #include "dns_server_internal.h"
 #include "dns_dynamic_update.h"
 #include "tst_entry.h"
@@ -46,7 +49,9 @@ server_config_t *acquire_config_snapshot(void) {
 }
 void release_config_snapshot(server_config_t *snap) { (void)snap; }
 
+static int (*g_b9_broker)(int family, int type, struct sockaddr *addr, size_t addr_len);   /* B9a: a test can stand in for the broker */
 int broker_connect(int family, int type, struct sockaddr *addr, size_t addr_len) {
+    if (g_b9_broker) return g_b9_broker(family, type, addr, addr_len);
     (void)family; (void)type; (void)addr; (void)addr_len; return -1;
 }
 
@@ -9598,6 +9603,572 @@ static void test_query_engine_dname_cname_wildcard_truncation(void) {
     printf("  -> DNAME / CNAME loops / Wildcard coexistence / TC truncation / Glue tests passed.\n");
 }
 
+/* ------------------------------------------------------------------------------------------------------------------------------------ */
+/* B9a: PowerDNS ALIAS and LUA records (design 3.6b)                                                                                    */
+/* ------------------------------------------------------------------------------------------------------------------------------------ */
+typedef struct { uint8_t rcode; uint16_t an, ns; int n; uint16_t type[16]; uint32_t ttl[16]; int rdlen[16]; uint8_t first[16][16]; uint8_t flags2; } b9_resp_t;
+
+static size_t b9_skip_name(const uint8_t *p, size_t off, size_t len) {
+    while (off < len) {
+        if ((p[off] & 0xC0) == 0xC0) return off + 2;
+        if (p[off] == 0) return off + 1;
+        off += 1 + p[off];
+    }
+    return len;
+}
+
+static void b9_parse(const uint8_t *res, int len, b9_resp_t *o) {
+    memset(o, 0, sizeof(*o));
+    o->rcode = res[3] & 0x0F;
+    o->flags2 = res[2];
+    o->an = (uint16_t)((res[6] << 8) | res[7]);
+    o->ns = (uint16_t)((res[8] << 8) | res[9]);
+    size_t off = b9_skip_name(res, 12, (size_t)len) + 4;
+    for (int i = 0; i < o->an && i < 16; i++) {
+        off = b9_skip_name(res, off, (size_t)len);
+        o->type[i] = (uint16_t)((res[off] << 8) | res[off + 1]);
+        o->ttl[i] = ((uint32_t)res[off + 4] << 24) | ((uint32_t)res[off + 5] << 16) | ((uint32_t)res[off + 6] << 8) | res[off + 7];
+        o->rdlen[i] = (res[off + 8] << 8) | res[off + 9];
+        memcpy(o->first[i], res + off + 10, (size_t)(o->rdlen[i] < 16 ? o->rdlen[i] : 16));
+        off += 10 + (size_t)o->rdlen[i];
+        o->n++;
+    }
+}
+
+typedef struct {
+    zone_arena_t arena;
+    zone_db_entry_t entry;
+    zone_db_entry_t *entries[1];
+    char *acl[1];
+    view_snapshot_t view;
+    zone_db_snapshot_t snap;
+} b9_zone_t;
+
+static void b9_zone_load(b9_zone_t *z, const char *apex, const char *text) {
+    memset(z, 0, sizeof(*z));
+    zone_arena_init(&z->arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = apex, .is_standalone_mode = true, .err_out = &err };
+    assert(parse_zone_fast((char *)text, strlen(text), &z->arena, &ctx) >= 0);
+    assert(test_build_index(&z->arena, true) == 0);
+    strncpy(z->entry.domain, apex, sizeof(z->entry.domain) - 1);
+    atomic_store_explicit(&z->entry.rcu.active, &z->arena.ver, memory_order_release);
+    z->entries[0] = &z->entry;
+    z->acl[0] = (char *)"any";
+    z->view.name = "default";
+    z->view.entries = z->entries;
+    z->view.zone_count = 1;
+    z->view.match_clients = z->acl;
+    z->view.match_clients_count = 1;
+    z->snap.views = &z->view;
+    z->snap.view_count = 1;
+}
+
+static void b9_ask(b9_zone_t *z, server_config_t *cfg, const char *qname, uint16_t qtype, b9_resp_t *o) {
+    uint8_t req[512], res[4096];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 0x4242, qname, qtype, false);
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    compress_ctx_init_packet(&comp_ctx);
+    const rate_limit_config_t *rrl = NULL;
+    zone_db_entry_t *matched = NULL;
+    int n = process_dns_query_impl(req, req_len, res, sizeof(res), qname, qtype, "192.0.2.100", &comp_ctx, false, &rrl, &z->snap, cfg, &matched);
+    assert(n >= DNS_HEADER_SIZE);
+    b9_parse(res, n, o);
+}
+
+/* an RFC 10029 query: QTYPE `qtype` and one more QTYPE `mq` in the MQTYPE-Query option */
+static void b9_ask_mq(b9_zone_t *z, server_config_t *cfg, const char *qname, uint16_t qtype, uint16_t mq, b9_resp_t *o) {
+    uint8_t req[512], res[4096];
+    memset(req, 0, sizeof(req));
+    req[0] = 0xAB; req[1] = 0xCD; req[2] = 0x01; req[5] = 0x01; req[11] = 0x01;
+    long w = write_uncompressed_name(req, 12, sizeof(req), qname);
+    assert(w > 0);
+    size_t off = 12 + (size_t)w;
+    req[off++] = (uint8_t)(qtype >> 8); req[off++] = (uint8_t)qtype; req[off++] = 0; req[off++] = 1;
+    req[off++] = 0; req[off++] = 0; req[off++] = 41; req[off++] = 0x10; req[off++] = 0;       /* OPT, UDP payload 4096 */
+    req[off++] = 0; req[off++] = 0; req[off++] = 0; req[off++] = 0;
+    req[off++] = 0; req[off++] = 6; req[off++] = 0; req[off++] = 20; req[off++] = 0; req[off++] = 2;   /* option 20: MQTYPE-Query */
+    req[off++] = (uint8_t)(mq >> 8); req[off++] = (uint8_t)mq;
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    compress_ctx_init_packet(&comp_ctx);
+    const rate_limit_config_t *rrl = NULL;
+    zone_db_entry_t *matched = NULL;
+    int n = process_dns_query_impl(req, off, res, sizeof(res), qname, qtype, "192.0.2.100", &comp_ctx, false, &rrl, &z->snap, cfg, &matched);
+    assert(n >= DNS_HEADER_SIZE);
+    b9_parse(res, n, o);
+}
+
+/* the fake resolver: t.target.test. -> A 192.0.2.10 192.0.2.11 (TTL 60), AAAA 2001:db8::10 (TTL 90); everything else fails */
+static int g_b9_fail;
+static int g_b9_calls;
+static int64_t g_b9_now = 1000;
+static int64_t b9_now(void) { return g_b9_now; }
+static int b9_resolve(const alias_rset_t *rs, const uint8_t *name, size_t nlen, uint16_t qtype, alias_parsed_t *out) {
+    static const uint8_t t_name[] = { 1, 't', 6, 't', 'a', 'r', 'g', 'e', 't', 4, 't', 'e', 's', 't', 0 };
+    (void)rs;
+    memset(out, 0, sizeof(*out));
+    g_b9_calls++;
+    if (g_b9_fail) return 2;
+    if (nlen != sizeof(t_name) || memcmp(name, t_name, nlen) != 0) return 1;
+    out->rc = 0;
+    if (qtype == 1) {
+        out->n = 2; out->rdlen = 4; out->ttl = 60;
+        memcpy(out->rd, "\xC0\x00\x02\x0A\xC0\x00\x02\x0B", 8);
+    } else {
+        out->n = 1; out->rdlen = 16; out->ttl = 90;
+        memcpy(out->rd, "\x20\x01\x0d\xb8\0\0\0\0\0\0\0\0\0\0\0\x10", 16);
+    }
+    return 0;
+}
+
+static void test_b9a_alias_lua_queries(void) {
+    printf("[TEST] B9a: ALIAS and LUA records in the query engine (default mode, expansion, stale, failure)...\n");
+    char zone_text[] =
+        "$ORIGIN al.test.\n$TTL 3600\n"
+        "@ IN SOA ns1 hm 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n"
+        "a 120 IN ALIAS t.target.test.\n"
+        "short 20 IN ALIAS t.target.test.\n"
+        "bad 120 IN ALIAS nowhere.target.test.\n"
+        "both IN ALIAS t.target.test.\nboth IN TXT \"hello\"\n"
+        "l IN LUA A \";return {'192.0.2.1'}\"\n"
+        "lm IN LUA A \"x\"\nlm IN TXT \"x\"\n"
+        "*.wl IN LUA A \"y\"\n"
+        "*.w IN ALIAS t.target.test.\n";
+    b9_zone_t z;
+    b9_zone_load(&z, "al.test.", zone_text);
+    b9_resp_t r;
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    /* default mode (no alias-resolver): PowerDNS's behaviour with expand-alias=no, enable-lua-records=no */
+    b9_ask(&z, &cfg, "a.al.test.", 1, &r);          assert(r.rcode == 0 && r.an == 0 && r.ns == 1);                 /* A at an ALIAS name: NODATA */
+    b9_ask(&z, &cfg, "a.al.test.", 28, &r);         assert(r.rcode == 0 && r.an == 0);
+    b9_ask(&z, &cfg, "a.al.test.", 65401, &r);      assert(r.rcode == 0 && r.an == 1 && r.type[0] == 65401 && r.rdlen[0] == 15 && r.ttl[0] == 120);
+    b9_ask(&z, &cfg, "a.al.test.", 255, &r);        assert(r.rcode == 0 && r.an == 1 && r.type[0] == 65401);       /* ANY lists the ALIAS RR */
+    b9_ask(&z, &cfg, "both.al.test.", 255, &r);     assert(r.rcode == 0 && r.an == 2);
+    b9_ask(&z, &cfg, "both.al.test.", 16, &r);      assert(r.rcode == 0 && r.an == 1 && r.type[0] == 16);
+    b9_ask(&z, &cfg, "x.w.al.test.", 255, &r);      assert(r.rcode == 0 && r.an == 1 && r.type[0] == 65401);       /* a wildcard ALIAS is a plain RR */
+    b9_ask(&z, &cfg, "x.w.al.test.", 1, &r);        assert(r.rcode == 0 && r.an == 0);
+    b9_ask(&z, &cfg, "l.al.test.", 1, &r);          assert(r.rcode == 3);                                           /* LUA only: the name does not exist */
+    b9_ask(&z, &cfg, "l.al.test.", 65402, &r);      assert(r.rcode == 3 && r.an == 0);                              /* ... and is not answered for its own type */
+    b9_ask(&z, &cfg, "l.al.test.", 255, &r);        assert(r.rcode == 3 && r.an == 0);
+    b9_ask(&z, &cfg, "lm.al.test.", 255, &r);       assert(r.rcode == 0 && r.an == 1 && r.type[0] == 16);          /* the LUA RR is not listed by ANY */
+    b9_ask(&z, &cfg, "lm.al.test.", 65402, &r);     assert(r.rcode == 0 && r.an == 0);
+    b9_ask(&z, &cfg, "x.wl.al.test.", 1, &r);       assert(r.rcode == 3);                                           /* a wildcard of LUA records only */
+
+    /* expansion: alias-resolver set; the fake resolver stands in for the network */
+    cfg.alias_resolvers = calloc(1, sizeof(ip_port_t));
+    cfg.alias_resolvers[0].ip = strdup("192.0.2.53");
+    cfg.alias_resolvers[0].port = 53;
+    cfg.alias_resolvers_count = 1;
+    alias_test_reset();
+    g_alias_now_hook = b9_now;
+    g_alias_resolve_hook = b9_resolve;
+    g_b9_now = 1000;
+    g_b9_fail = 0;
+    g_b9_calls = 0;
+    alias_rset_t rs;
+    assert(alias_resolvers_fill(&cfg, NULL, false, &rs) == 1 && rs.key != 0);
+    assert(alias_resolvers_key(&cfg, NULL, false) == rs.key);
+    uint8_t t_name[] = { 1, 't', 6, 't', 'a', 'r', 'g', 'e', 't', 4, 't', 'e', 's', 't', 0 };
+    uint8_t bad_name[] = { 7, 'n', 'o', 'w', 'h', 'e', 'r', 'e', 6, 't', 'a', 'r', 'g', 'e', 't', 4, 't', 'e', 's', 't', 0 };
+    b9_ask(&z, &cfg, "a.al.test.", 1, &r);          assert(r.rcode == 2 && r.an == 0);                              /* never resolved: SERVFAIL */
+    b9_ask(&z, &cfg, "a.al.test.", 65401, &r);      assert(r.rcode == 0 && r.an == 0);                              /* the ALIAS RR is not an answer any more */
+    alias_test_want(&rs, t_name, sizeof(t_name));
+    alias_test_want(&rs, bad_name, sizeof(bad_name));
+    assert(alias_test_job_count() == 4);
+    alias_test_pass();
+    assert(g_b9_calls == 4);
+    b9_ask(&z, &cfg, "a.al.test.", 1, &r);          assert(r.rcode == 0 && r.an == 2 && r.type[0] == 1 && r.ttl[0] == 60 && memcmp(r.first[0], "\xC0\x00\x02\x0A", 4) == 0);
+    b9_ask(&z, &cfg, "a.al.test.", 28, &r);         assert(r.rcode == 0 && r.an == 1 && r.type[0] == 28 && r.ttl[0] == 90 && r.rdlen[0] == 16);
+    b9_ask(&z, &cfg, "a.al.test.", 255, &r);        assert(r.rcode == 0 && r.an == 3 && r.type[0] == 1 && r.type[2] == 28);   /* A then AAAA, nothing else */
+    b9_ask(&z, &cfg, "short.al.test.", 1, &r);      assert(r.an == 2 && r.ttl[0] == 20);                            /* min(ALIAS TTL, upstream TTL) */
+    b9_ask(&z, &cfg, "both.al.test.", 255, &r);     assert(r.rcode == 0 && r.an == 3 && r.type[0] == 1 && r.type[1] == 1 && r.type[2] == 28);   /* the TXT RR is not listed (PowerDNS) */
+    b9_ask(&z, &cfg, "both.al.test.", 16, &r);      assert(r.rcode == 0 && r.an == 1 && r.type[0] == 16);
+    cfg.rfc10029_mqtype_enable = true;                                                                              /* RFC 10029: the extra QTYPEs are expanded too */
+    cfg.max_mqtypes = 4;
+    b9_ask_mq(&z, &cfg, "both.al.test.", 16, 1, &r); assert(r.rcode == 0 && r.an == 3 && r.type[0] == 16 && r.type[1] == 1 && r.type[2] == 1);
+    b9_ask_mq(&z, &cfg, "both.al.test.", 1, 16, &r); assert(r.rcode == 0 && r.an == 3 && r.type[0] == 1 && r.type[2] == 16);
+    b9_ask_mq(&z, &cfg, "both.al.test.", 16, 65401, &r); assert(r.rcode == 0 && r.an == 1 && r.type[0] == 16);   /* the ALIAS RR is hidden here too */
+    cfg.rfc10029_mqtype_enable = false;
+    b9_ask(&z, &cfg, "bad.al.test.", 1, &r);        assert(r.rcode == 2 && r.an == 0);                              /* the target failed: SERVFAIL */
+    b9_ask(&z, &cfg, "x.w.al.test.", 1, &r);        assert(r.rcode == 0 && r.an == 0);                              /* not expanded at a wildcard (PowerDNS) */
+    b9_ask(&z, &cfg, "x.w.al.test.", 255, &r);      assert(r.rcode == 0 && r.an == 1 && r.type[0] == 65401);
+    b9_ask(&z, &cfg, "lm.al.test.", 255, &r);       assert(r.rcode == 0 && r.an == 1);
+    /* the TTL counts down, the data is refreshed after two thirds of it */
+    g_b9_now += 20;
+    b9_ask(&z, &cfg, "a.al.test.", 1, &r);          assert(r.an == 2 && r.ttl[0] == 40);
+    int calls = g_b9_calls;
+    alias_test_pass();
+    assert(g_b9_calls == calls + 2);                                                                                /* only the failed target is retried (back-off 5 s); the good one is due at 40 s */
+    g_b9_now += 20;                                                                                                 /* 40 s after the fetch */
+    alias_test_pass();
+    assert(g_b9_calls == calls + 5);                                                                                /* the good target's A (the AAAA has TTL 90: due at 60 s) and the failed one again (back-off 10 s) */
+    b9_ask(&z, &cfg, "a.al.test.", 1, &r);          assert(r.an == 2 && r.ttl[0] == 60);                            /* refreshed: a fresh TTL again */
+    /* the resolver stops answering: the last result is served stale, with a short TTL, up to a day past its TTL */
+    g_b9_fail = 1;
+    g_b9_now += 100;                                                                                                /* past the TTL, the refresh fails */
+    alias_test_pass();
+    b9_ask(&z, &cfg, "a.al.test.", 1, &r);          assert(r.rcode == 0 && r.an == 2 && r.ttl[0] == ALIAS_STALE_TTL);
+    b9_ask(&z, &cfg, "short.al.test.", 1, &r);      assert(r.an == 2 && r.ttl[0] == 20);                            /* min(ALIAS TTL 20, stale TTL 30) */
+    g_b9_now += ALIAS_STALE_MAX;
+    alias_test_pass();
+    b9_ask(&z, &cfg, "a.al.test.", 1, &r);          assert(r.rcode == 2);                                           /* older than the stale limit: SERVFAIL */
+    g_b9_fail = 0;
+    g_b9_now += 400;                                                                                                /* the back-off is over */
+    alias_test_pass();
+    b9_ask(&z, &cfg, "a.al.test.", 1, &r);          assert(r.rcode == 0 && r.an == 2 && r.ttl[0] == 60);            /* recovered */
+
+    /* a result is keyed by the resolver set: another list does not see it */
+    server_config_t cfg2;
+    memset(&cfg2, 0, sizeof(cfg2));
+    cfg2.alias_resolvers = calloc(1, sizeof(ip_port_t));
+    cfg2.alias_resolvers[0].ip = strdup("192.0.2.54");
+    cfg2.alias_resolvers[0].port = 53;
+    cfg2.alias_resolvers_count = 1;
+    b9_ask(&z, &cfg2, "a.al.test.", 1, &r);         assert(r.rcode == 2);
+    free_server_config_fields(&cfg2);
+
+    /* precedence: a zone's list over options over the database block (database zones only) */
+    {
+        zone_config_t zc;
+        memset(&zc, 0, sizeof(zc));
+        zone_ext_t *x = zone_ext_mut(&zc);
+        x->alias_resolvers = calloc(1, sizeof(ip_port_t));
+        x->alias_resolvers[0].ip = strdup("192.0.2.99");
+        x->alias_resolvers[0].port = 5353;
+        x->alias_resolvers_count = 1;
+        assert(alias_resolvers_key(&cfg, &zc, false) != 0 && alias_resolvers_key(&cfg, &zc, false) != rs.key);
+        alias_rset_t zr;
+        assert(alias_resolvers_fill(&cfg, &zc, false, &zr) == 1 && ((struct sockaddr_in *)&zr.sa[0])->sin_port == htons(5353));
+        free(x->alias_resolvers[0].ip);
+        free(x->alias_resolvers);
+        free(zc.ext);
+        server_config_t dbc;
+        memset(&dbc, 0, sizeof(dbc));
+        dbc.database.enabled = true;
+        dbc.database.alias_resolver = calloc(1, sizeof(char *));
+        dbc.database.alias_resolver[0] = strdup("2001:db8::53");
+        dbc.database.alias_resolver_count = 1;
+        assert(alias_resolvers_key(&dbc, NULL, false) == 0);                                                        /* not a database zone: not used */
+        assert(alias_resolvers_key(&dbc, NULL, true) != 0);
+        assert(alias_resolvers_fill(&dbc, NULL, true, &zr) == 1 && zr.sa[0].ss_family == AF_INET6);
+        free(dbc.database.alias_resolver[0]);
+        free(dbc.database.alias_resolver);
+    }
+
+    alias_test_reset();
+    g_alias_now_hook = NULL;
+    g_alias_resolve_hook = NULL;
+    free_server_config_fields(&cfg);
+    zone_arena_destroy(&z.arena);
+    printf("  -> ALIAS / LUA in the query engine passed.\n");
+}
+
+/* a response packet by hand */
+typedef struct { uint8_t b[2048]; size_t n; } b9_pk_t;
+static void b9_pk_hdr(b9_pk_t *p, uint16_t id, uint8_t flags1, uint8_t rcode, uint16_t an, const char *qname, uint16_t qtype) {
+    memset(p, 0, sizeof(*p));
+    p->b[0] = (uint8_t)(id >> 8); p->b[1] = (uint8_t)id;
+    p->b[2] = flags1; p->b[3] = rcode;
+    p->b[5] = 1;
+    p->b[6] = (uint8_t)(an >> 8); p->b[7] = (uint8_t)an;
+    p->n = 12;
+    long w = write_uncompressed_name(p->b, p->n, sizeof(p->b), qname);
+    assert(w > 0);
+    p->n += (size_t)w;
+    p->b[p->n++] = (uint8_t)(qtype >> 8); p->b[p->n++] = (uint8_t)qtype; p->b[p->n++] = 0; p->b[p->n++] = 1;
+}
+static void b9_pk_rr(b9_pk_t *p, const char *owner, uint16_t type, uint16_t cls, uint32_t ttl, const uint8_t *rd, size_t rdlen) {
+    if (owner) {
+        long w = write_uncompressed_name(p->b, p->n, sizeof(p->b), owner);
+        assert(w > 0);
+        p->n += (size_t)w;
+    } else {
+        p->b[p->n++] = 0xC0; p->b[p->n++] = 0x0C;                /* the question name */
+    }
+    p->b[p->n++] = (uint8_t)(type >> 8); p->b[p->n++] = (uint8_t)type;
+    p->b[p->n++] = (uint8_t)(cls >> 8); p->b[p->n++] = (uint8_t)cls;
+    p->b[p->n++] = (uint8_t)(ttl >> 24); p->b[p->n++] = (uint8_t)(ttl >> 16); p->b[p->n++] = (uint8_t)(ttl >> 8); p->b[p->n++] = (uint8_t)ttl;
+    p->b[p->n++] = (uint8_t)(rdlen >> 8); p->b[p->n++] = (uint8_t)rdlen;
+    memcpy(p->b + p->n, rd, rdlen);
+    p->n += rdlen;
+}
+static size_t b9_pk_name(uint8_t *o, const char *name) { long w = write_uncompressed_name(o, 0, 256, name); assert(w > 0); return (size_t)w; }
+
+static void test_b9a_alias_response_parser(void) {
+    printf("[TEST] B9a: the ALIAS resolver's response parser (QID, question, RCODE, CNAME chain, TTL)...\n");
+    uint8_t qn[64];
+    size_t qnl = b9_pk_name(qn, "t.target.test.");
+    alias_parsed_t o;
+    b9_pk_t p;
+    uint8_t a1[4] = { 192, 0, 2, 10 }, a2[4] = { 192, 0, 2, 11 };
+    uint8_t cn[64], cn2[64];
+    size_t l, l2;
+
+    /* a plain answer, owner compressed to the question; the TTL is the smallest of the RRset */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 2, "T.Target.Test.", 1);
+    b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+    b9_pk_rr(&p, NULL, 1, 1, 50, a2, 4);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o);
+    assert(o.rc == 0 && o.n == 2 && o.rdlen == 4 && o.ttl == 50 && memcmp(o.rd, a1, 4) == 0 && memcmp(o.rd + 4, a2, 4) == 0);
+    /* a duplicate address is kept once */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 2, "t.target.test.", 1);
+    b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+    b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o);
+    assert(o.rc == 0 && o.n == 1);
+    /* not our answer: ID, QR, opcode, question (name, type) */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+    alias_parse_response(p.b, p.n, 0x1235, qn, qnl, 1, &o); assert(o.rc == -2);
+    b9_pk_hdr(&p, 0x1234, 0x00, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == -2);                       /* QR=0 */
+    b9_pk_hdr(&p, 0x1234, 0x80 | 0x28, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == -2);                       /* opcode 5 */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "u.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == -2);                       /* another question */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 28); b9_pk_rr(&p, NULL, 28, 1, 60, a1, 4);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == -2);                       /* another type */
+    /* RCODE: NXDOMAIN, SERVFAIL and REFUSED are not an answer; TC asks for TCP */
+    b9_pk_hdr(&p, 0x1234, 0x80, 3, 0, "t.target.test.", 1);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == 1);
+    b9_pk_hdr(&p, 0x1234, 0x80, 2, 0, "t.target.test.", 1);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == 1);
+    b9_pk_hdr(&p, 0x1234, 0x82, 0, 0, "t.target.test.", 1);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.truncated && o.rc == -1);
+    /* NODATA: NOERROR without addresses is an answer (empty, short TTL) */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 0, "t.target.test.", 1);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == 0 && o.n == 0 && o.ttl == ALIAS_NEG_TTL);
+    /* a CNAME chain (the owner of the second link in upper case), the final RRset's TTL is the one used; records of other names and
+     * classes are ignored */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 5, "t.target.test.", 1);
+    l = b9_pk_name(cn, "mid.other.test.");
+    b9_pk_rr(&p, NULL, 5, 1, 500, cn, l);                         /* t.target.test. CNAME mid.other.test. */
+    l2 = b9_pk_name(cn2, "end.other.test.");
+    b9_pk_rr(&p, "MID.other.test.", 5, 1, 20, cn2, l2);           /* mid CNAME end */
+    b9_pk_rr(&p, "end.other.test.", 1, 1, 77, a1, 4);
+    b9_pk_rr(&p, "end.other.test.", 1, 3, 77, a2, 4);             /* CLASS CH: ignored */
+    b9_pk_rr(&p, "unrelated.test.", 1, 1, 77, a2, 4);             /* not in the chain: ignored */
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o);
+    assert(o.rc == 0 && o.n == 1 && o.ttl == 77 && memcmp(o.rd, a1, 4) == 0);
+    /* a chain that ends without addresses is NODATA */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1);
+    l = b9_pk_name(cn, "gone.other.test.");
+    b9_pk_rr(&p, NULL, 5, 1, 500, cn, l);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == 0 && o.n == 0);
+    /* a loop, and a chain longer than ALIAS_MAX_CNAME, are refused */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 2, "t.target.test.", 1);
+    l = b9_pk_name(cn, "b.test.");   b9_pk_rr(&p, NULL, 5, 1, 60, cn, l);
+    l = b9_pk_name(cn, "t.target.test."); b9_pk_rr(&p, "b.test.", 5, 1, 60, cn, l);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == -1);
+    {
+        char owner[32], target[32];
+        b9_pk_hdr(&p, 0x1234, 0x80, 0, 12, "t.target.test.", 1);
+        snprintf(owner, sizeof(owner), "t.target.test.");
+        for (int i = 0; i < 12; i++) {
+            snprintf(target, sizeof(target), "h%d.test.", i);
+            l = b9_pk_name(cn, target);
+            b9_pk_rr(&p, i == 0 ? NULL : owner, 5, 1, 60, cn, l);
+            snprintf(owner, sizeof(owner), "%s", target);
+        }
+        alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == -1);
+    }
+    /* malformed: an RR that runs past the end, a compression pointer that goes forward, a pointer to itself, a wrong A length */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+    alias_parse_response(p.b, p.n - 2, 0x1234, qn, qnl, 1, &o); assert(o.rc == -1);
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+    p.b[p.n - 4 - 10 - 2 + 1] = 0xFF;                              /* the owner pointer now points far forward */
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == -1);
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 3);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == 0 && o.n == 0);          /* a 3-octet A is no address */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1);
+    {
+        size_t at = p.n;
+        p.b[p.n++] = 0xC0; p.b[p.n++] = (uint8_t)at;                /* the owner points at itself */
+        p.b[p.n++] = 0; p.b[p.n++] = 1; p.b[p.n++] = 0; p.b[p.n++] = 1;
+        memset(p.b + p.n, 0, 6);
+        p.n += 6;
+    }
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == -1);
+    for (size_t cut = 0; cut < 40; cut++) {                       /* truncated at every length: never a crash */
+        b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+        alias_parse_response(p.b, cut < p.n ? cut : p.n, 0x1234, qn, qnl, 1, &o);
+    }
+    /* AAAA */
+    uint8_t v6[16] = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 28); b9_pk_rr(&p, NULL, 28, 1, 90, v6, 16);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 28, &o); assert(o.rc == 0 && o.n == 1 && o.rdlen == 16 && o.ttl == 90 && memcmp(o.rd, v6, 16) == 0);
+    /* an upstream TTL is cut to ALIAS_MAX_TTL; the high bit is not a negative TTL */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 0xFFFFFFFFu, a1, 4);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == 0 && o.ttl == ALIAS_MAX_TTL);
+    /* the query */
+    uint8_t q[600];
+    size_t ql = alias_build_query(q, sizeof(q), 0xBEEF, qn, qnl, 1);
+    assert(ql == 12 + qnl + 4 + 11 && q[0] == 0xBE && q[1] == 0xEF && q[2] == 0x01 && q[5] == 1 && q[11] == 1 && q[ql - 11] == 0 && q[ql - 10] == 0 && q[ql - 9] == 41);
+    /* names: lower-casing, validity */
+    uint8_t w[256];
+    size_t wl;
+    uint8_t mixed[] = { 3, 'W', 'w', 'W', 4, 'T', 'e', 'S', 't', 0 };
+    assert(alias_wire_lower(mixed, sizeof(mixed), w, &wl) && wl == sizeof(mixed) && memcmp(w, "\x03www\x04test", 9) == 0 && w[9] == 0);
+    uint8_t trailing[] = { 1, 'a', 0, 0 };
+    assert(!alias_wire_lower(trailing, sizeof(trailing), w, &wl));
+    uint8_t ptr[] = { 0xC0, 0x0C };
+    assert(!alias_wire_lower(ptr, sizeof(ptr), w, &wl));
+    assert(!alias_wire_lower(NULL, 0, w, &wl));
+    printf("  -> response parser passed.\n");
+}
+
+/* ---- B9a: the network side of the ALIAS resolver (dns_alias.c net_resolve / tcp_query) against a resolver thread behind socketpairs ---- */
+enum { B9N_OK, B9N_TC, B9N_WRONGID, B9N_NXDOMAIN, B9N_DOWN };
+static int g_b9n_mode;
+static int g_b9n_udp, g_b9n_tcp;
+typedef struct { int fd; int type; int mode; } b9n_srv_t;
+
+static size_t b9n_response(const uint8_t *q, size_t n, int mode, bool tcp, uint8_t *r) {
+    size_t qe = 12;
+    while (qe < n && q[qe]) qe += 1 + q[qe];
+    qe += 1 + 4;
+    uint16_t qtype = (uint16_t)((q[qe - 4] << 8) | q[qe - 3]);
+    memcpy(r, q, qe);
+    r[2] = 0x81 | ((mode == B9N_TC && !tcp) ? 0x02 : 0);          /* QR, RD, TC */
+    r[3] = (uint8_t)(0x80 | (mode == B9N_NXDOMAIN ? 3 : 0));        /* RA, RCODE */
+    r[4] = 0; r[5] = 1; r[6] = 0; r[7] = 0; r[8] = r[9] = r[10] = r[11] = 0;
+    size_t o = qe;
+    int cnt = 0;
+    if (mode != B9N_NXDOMAIN && !(mode == B9N_TC && !tcp)) cnt = qtype == 1 ? (mode == B9N_TC ? 3 : 2) : (qtype == 28 ? 1 : 0);
+    for (int i = 0; i < cnt; i++) {
+        r[o++] = 0xC0; r[o++] = 0x0C; r[o++] = 0; r[o++] = (uint8_t)qtype; r[o++] = 0; r[o++] = 1;
+        r[o++] = 0; r[o++] = 0; r[o++] = 0; r[o++] = 60;
+        size_t rl = qtype == 1 ? 4 : 16;
+        r[o++] = 0; r[o++] = (uint8_t)rl;
+        memset(r + o, 0, rl);
+        if (qtype == 1) { r[o] = 192; r[o + 2] = 2; r[o + 3] = (uint8_t)(10 + i); }
+        else { r[o] = 0x20; r[o + 1] = 0x01; r[o + 15] = 0x10; }
+        o += rl;
+    }
+    r[7] = (uint8_t)cnt;
+    return o;
+}
+
+static void *b9n_server(void *arg) {
+    b9n_srv_t *s = arg;
+    uint8_t q[600], r[1200];
+    if (s->type == SOCK_DGRAM) {
+        ssize_t n = recv(s->fd, q, sizeof(q), 0);
+        if (n > 12) {
+            size_t rl = b9n_response(q, (size_t)n, s->mode, false, r);
+            if (s->mode == B9N_WRONGID) {                              /* a datagram with another ID first: ignored (RFC 5452 9.1) */
+                uint8_t w[1200];
+                memcpy(w, r, rl);
+                w[1] ^= 0xFF;
+                (void)send(s->fd, w, rl, 0);
+            }
+            (void)send(s->fd, r, rl, 0);
+        }
+    } else {
+        uint8_t lp[2];
+        if (recv(s->fd, lp, 2, MSG_WAITALL) == 2) {
+            size_t ql = (size_t)((lp[0] << 8) | lp[1]);
+            if (ql <= sizeof(q) && recv(s->fd, q, ql, MSG_WAITALL) == (ssize_t)ql && ql > 12) {
+                uint8_t out[1202];
+                size_t rl = b9n_response(q, ql, s->mode, true, out + 2);
+                out[0] = (uint8_t)(rl >> 8); out[1] = (uint8_t)rl;
+                (void)send(s->fd, out, rl + 2, 0);
+            }
+        }
+    }
+    close(s->fd);
+    free(s);
+    return NULL;
+}
+
+static int b9n_broker(int family, int type, struct sockaddr *addr, size_t addr_len) {
+    (void)family; (void)addr; (void)addr_len;
+    if (g_b9n_mode == B9N_DOWN) return -1;
+    int sv[2];
+    if (socketpair(AF_UNIX, type == SOCK_DGRAM ? SOCK_DGRAM : SOCK_STREAM, 0, sv) != 0) return -1;
+    if (type == SOCK_DGRAM) g_b9n_udp++; else g_b9n_tcp++;
+    b9n_srv_t *s = malloc(sizeof(*s));
+    s->fd = sv[1];
+    s->type = type == SOCK_DGRAM ? SOCK_DGRAM : SOCK_STREAM;
+    s->mode = g_b9n_mode;
+    pthread_t t;
+    int prc = pthread_create(&t, NULL, b9n_server, s);
+    assert(prc == 0);
+    pthread_detach(t);
+    return sv[0];
+}
+
+static void test_b9a_alias_network(void) {
+    printf("[TEST] B9a: the ALIAS resolver client (UDP, TCP after TC, wrong ID, NXDOMAIN, resolver down)...\n");
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.alias_resolvers = calloc(1, sizeof(ip_port_t));
+    cfg.alias_resolvers[0].ip = strdup("192.0.2.53");
+    cfg.alias_resolvers[0].port = 53;
+    cfg.alias_resolvers_count = 1;
+    alias_rset_t rs;
+    assert(alias_resolvers_fill(&cfg, NULL, false, &rs) == 1);
+    alias_test_reset();
+    g_alias_now_hook = b9_now;
+    g_alias_resolve_hook = NULL;
+    g_b9_now = 5000;
+    g_b9_broker = b9n_broker;
+    g_b9n_udp = g_b9n_tcp = 0;
+    alias_answer_t a;
+    uint8_t n_ok[] = { 2, 'o', 'k', 4, 't', 'e', 's', 't', 0 };
+    uint8_t n_tc[] = { 2, 't', 'c', 4, 't', 'e', 's', 't', 0 };
+    uint8_t n_id[] = { 2, 'i', 'd', 4, 't', 'e', 's', 't', 0 };
+    uint8_t n_nx[] = { 2, 'n', 'x', 4, 't', 'e', 's', 't', 0 };
+    uint8_t n_dn[] = { 2, 'd', 'n', 4, 't', 'e', 's', 't', 0 };
+
+    g_b9n_mode = B9N_OK;
+    alias_test_want(&rs, n_ok, sizeof(n_ok));
+    alias_test_pass();
+    assert(alias_lookup(rs.key, n_ok, sizeof(n_ok), 1, &a) && a.n == 2 && a.rdlen == 4 && a.ttl == 60 && a.rdata[3] == 10 && a.rdata[7] == 11);
+    assert(alias_lookup(rs.key, n_ok, sizeof(n_ok), 28, &a) && a.n == 1 && a.rdlen == 16 && a.rdata[15] == 0x10);
+    assert(g_b9n_udp == 2 && g_b9n_tcp == 0);
+
+    g_b9n_mode = B9N_TC;                                              /* a truncated answer: the same question over TCP */
+    alias_test_want(&rs, n_tc, sizeof(n_tc));
+    alias_test_pass();
+    assert(alias_lookup(rs.key, n_tc, sizeof(n_tc), 1, &a) && a.n == 3);
+    assert(g_b9n_tcp >= 1);
+
+    g_b9n_mode = B9N_WRONGID;
+    alias_test_want(&rs, n_id, sizeof(n_id));
+    alias_test_pass();
+    assert(alias_lookup(rs.key, n_id, sizeof(n_id), 1, &a) && a.n == 2);
+
+    g_b9n_mode = B9N_NXDOMAIN;                                        /* no result: SERVFAIL for the query */
+    alias_test_want(&rs, n_nx, sizeof(n_nx));
+    alias_test_pass();
+    assert(!alias_lookup(rs.key, n_nx, sizeof(n_nx), 1, &a));
+
+    g_b9n_mode = B9N_DOWN;                                            /* the broker cannot connect: the resolver set is left alone for a while */
+    alias_test_want(&rs, n_dn, sizeof(n_dn));
+    int before = g_b9n_udp;
+    alias_test_pass();
+    assert(!alias_lookup(rs.key, n_dn, sizeof(n_dn), 1, &a));
+    g_b9n_mode = B9N_OK;
+    g_b9_now += 6;                                                    /* past the retry delay, not past the dead time of the set */
+    alias_test_pass();
+    assert(g_b9n_udp == before);
+    assert(!alias_lookup(rs.key, n_dn, sizeof(n_dn), 1, &a));
+    g_b9_now += ALIAS_DEAD_SECS + 1;
+    alias_test_pass();
+    assert(alias_lookup(rs.key, n_dn, sizeof(n_dn), 1, &a) && a.n == 2);
+
+    alias_test_reset();
+    g_alias_now_hook = NULL;
+    g_b9_broker = NULL;
+    free_server_config_fields(&cfg);
+    printf("  -> resolver client passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
     test_query_engine_dname_cname_wildcard_truncation();
@@ -9656,6 +10227,9 @@ int main(void) {
     test_cname_chain_maximum_length_stop();
     test_cname_alias_to_cname_loop_prevention();
     test_wildcard_covering_multiple_subdomains();
+    test_b9a_alias_lua_queries();
+    test_b9a_alias_response_parser();
+    test_b9a_alias_network();
     test_wildcard_priority_over_cname_synthesis();
     test_edns_client_subnet_ipv6_scope_prefix_zero();
     test_edns_client_subnet_ipv4_prefix_clamping();

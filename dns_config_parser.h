@@ -34,6 +34,9 @@ typedef struct {
   int port;
 } ip_port_t;
 
+/* B9a: the most alias-resolver addresses of a zone, of options, or of the database block */
+#define KARIDNS_ALIAS_RESOLVERS_MAX 8
+
 typedef struct {
   bool configured;
   bool early_drop;
@@ -169,6 +172,11 @@ typedef struct zone_ext {
   bool db_acl_ceiling;
   /* --- B8t-2: primary-settings no; ignores the settings the primary sends with the zone (Extended AXFR v3).  Default: they are used. --- */
   bool primary_settings_off;
+  /* --- B9a: alias-resolver { <ip> [port <n>]; ... };  the resolvers that expand the ALIAS records of this zone (dns_alias.h).  A zone value
+   * replaces the options value and the options { database { alias-resolver } } value.  Never sent with Extended AXFR (it names a resolver
+   * of this server's own network). --- */
+  ip_port_t *alias_resolvers;
+  int alias_resolvers_count;
 } zone_ext_t;
 
 /* transfer-acl-match / update-acl-match values (zone_ext_t) */
@@ -412,6 +420,8 @@ typedef struct server_config_s {
   int ecs_tag_count;
   ecs_tag_def_t *location_tags;
   int location_tag_count;
+  ip_port_t *alias_resolvers;   /* B9a: options { alias-resolver { ip [port n]; ... }; }: the default of every zone (dns_alias.h) */
+  int alias_resolvers_count;
   _Atomic int reader_count;
 } server_config_t;
 

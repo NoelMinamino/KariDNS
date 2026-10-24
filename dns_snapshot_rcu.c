@@ -12,6 +12,7 @@
 #include "dns_utils.h"
 #include "dns_tsig_acl.h"
 #include "dns_query_engine.h"
+#include "dns_alias.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -635,6 +636,8 @@ bool zone_retire_object(zone_db_entry_t *entry, void *obj, void (*free_fn)(void 
  * なら、制御スレッドに依存するゾーンの応答の版の更新を頼む。 */
 void zone_publish(zone_db_entry_t *entry, zone_version_t *next) {
   zone_version_t *old = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  /* B9a: a version with ALIAS RRs appears, changes or goes: the resolver thread looks for the targets again.  Read before the publish: the old version is retired by it. */
+  bool alias_touch = (next && next->image && (next->image->flags & ZONE_IMAGE_F_ALIAS)) || (old && old->image && (old->image->flags & ZONE_IMAGE_F_ALIAS));
   bool first = atomic_load_explicit(&entry->publish_order, memory_order_relaxed) == 0;
   uint64_t epoch = rcu_writer_publish(&entry->rcu.active, next);
   atomic_store_explicit(&entry->publish_order,
@@ -658,6 +661,8 @@ void zone_publish(zone_db_entry_t *entry, zone_version_t *next) {
   }
   if (first || atomic_load_explicit(&entry->glue_provider, memory_order_relaxed))
     atomic_store_explicit(&g_glue_dirty, true, memory_order_release);
+  if (alias_touch)
+    alias_notify();
 }
 
 typedef struct {
