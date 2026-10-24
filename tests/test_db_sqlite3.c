@@ -667,6 +667,37 @@ static void test_changes(void) {
     sqlite3_close(db);
 }
 
+/* ------------------------------------------------------------------ 7b. poll_version (B9) */
+static void test_poll_version(void) {
+    printf("poll_version\n");
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("pv.db", path, sizeof(path));
+    add_simple_zone(db, 1, 1, "p.test");
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (!c) { sqlite3_close(db); return; }
+    uint64_t v0 = 0, v1 = 0, v2 = 0;
+    bool repl = true;
+    CHECK(db_driver_sqlite3.poll_version(c, &v0, &repl) == 0 && !repl);
+    CHECK(db_driver_sqlite3.poll_version(c, &v1, &repl) == 0 && !repl && v1 == v0);       /* nothing committed in between */
+    add_simple_zone(db, 2, 4, "q.test");                                                    /* another connection commits */
+    CHECK(db_driver_sqlite3.poll_version(c, &v2, &repl) == 0 && !repl && v2 != v1);
+    CHECK(db_driver_sqlite3.poll_version(c, &v1, &repl) == 0 && v1 == v2);
+    /* the connection reads its own database only through the open file: renamed away, replaced by another file, deleted */
+    char moved[620];
+    snprintf(moved, sizeof(moved), "%s.moved", path);
+    CHECK(rename(path, moved) == 0);
+    CHECK(db_driver_sqlite3.poll_version(c, &v1, &repl) == 0 && repl);                      /* the name is gone */
+    FILE *f = fopen(path, "w");
+    if (f) fclose(f);
+    CHECK(db_driver_sqlite3.poll_version(c, &v1, &repl) == 0 && repl);                      /* the name is another file */
+    unlink(path);
+    rename(moved, path);
+    CHECK(db_driver_sqlite3.poll_version(c, &v1, &repl) == 0 && !repl);                     /* the same file again */
+    db_driver_sqlite3.close(c);
+    sqlite3_close(db);
+}
+
 /* ------------------------------------------------------------------ 8. the dump */
 typedef struct {
     int status;
@@ -1034,6 +1065,7 @@ int main(int argc, char **argv) {
     test_snapshot();
     test_busy();
     test_changes();
+    test_poll_version();
     test_range_views();
     test_ext_tables();
     test_dump();

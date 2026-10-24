@@ -115,6 +115,17 @@ static void m_batch_end(kdb_enc_t *e, uint64_t id, uint32_t z, uint32_t f, uint3
     kdb_enc_u64(e, 1, id); kdb_enc_u32(e, 2, z); kdb_enc_u32(e, 3, f); kdb_enc_u32(e, 4, d);
     kdb_enc_end(e);
 }
+/* B9: AUTO_STATUS with n entries (view index i % 3) */
+static void m_auto_status(kdb_enc_t *e, unsigned n) {
+    kdb_enc_begin(e, KDB_T_AUTO_STATUS);
+    for (unsigned i = 0; i < n; i++) {
+        kdb_enc_nest_begin(e, 1);
+        kdb_enc_u16(e, 1, (uint16_t)(i % 3)); kdb_enc_u64(e, 2, 1700000000u + i); kdb_enc_u64(e, 3, 41 + i); kdb_enc_u32(e, 4, i);
+        if (i == 1) kdb_enc_str(e, 5, "cannot open the database");
+        kdb_enc_nest_end(e);
+    }
+    kdb_enc_end(e);
+}
 /* a message of the given type that is well formed and acceptable in the state where the type is legal */
 static void m_valid(kdb_enc_t *e, uint16_t t) {
     switch (t) {
@@ -129,6 +140,7 @@ static void m_valid(kdb_enc_t *e, uint16_t t) {
     case KDB_T_ZONE_DELETE: m_zone_delete(e); break;
     case KDB_T_PROFILE: m_profile(e); break;
     case KDB_T_BATCH_END: m_batch_end(e, 7, 0, 0, 0); break;
+    case KDB_T_AUTO_STATUS: m_auto_status(e, 2); break;
     }
 }
 
@@ -849,18 +861,18 @@ static void test_state_matrix(void) {
     printf("[state machine: type x state]\n");
     static const uint16_t types[] = { KDB_T_HELLO, KDB_T_INVENTORY_REQ, KDB_T_BATCH_BEGIN, KDB_T_ZONE_BEGIN,
         KDB_T_ZONE_DATA, KDB_T_ZONE_END, KDB_T_ZONE_ABORT, KDB_T_ZONE_FAILED, KDB_T_ZONE_DELETE, KDB_T_PROFILE,
-        KDB_T_BATCH_END };
+        KDB_T_BATCH_END, KDB_T_AUTO_STATUS };
     /* legal[state][type index] */
-    static const bool legal[4][11] = {
-        /* AWAIT_HELLO */ { 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-        /* READY       */ { 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0 },
-        /* IN_BATCH    */ { 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1 },
-        /* IN_ZONE     */ { 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0 },
+    static const bool legal[4][12] = {
+        /* AWAIT_HELLO */ { 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        /* READY       */ { 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        /* IN_BATCH    */ { 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 0 },
+        /* IN_ZONE     */ { 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0 },
     };
     kdb_enc_t e;
     kdb_enc_init(&e);
     for (int st = 0; st < 4; st++)
-        for (size_t t = 0; t < 11; t++) {
+        for (size_t t = 0; t < 12; t++) {
             kdb_enc_reset(&e);
             m_valid(&e, types[t]);
             kdb_rc_t rc = send_enc((kdb_state_t)st, &e);
@@ -1262,6 +1274,9 @@ static int gen_corpus(const char *dir) {
     kdb_enc_reset(&e);
     m_hello(&e, 1); m_batch_begin(&e, 1);
     rc |= write_seed(dir, "seed_hello_batch_chunked.bin", 0x05, &e);
+    kdb_enc_reset(&e);        /* B9: the auto reload report between two batches */
+    m_batch_begin(&e, 2); m_batch_end(&e, 2, 0, 0, 0); m_auto_status(&e, 3); m_batch_begin(&e, 3); m_batch_end(&e, 3, 0, 0, 0);
+    rc |= write_seed(dir, "seed_loader_auto_status.bin", 0xC0, &e);
     kdb_enc_free(&e);
     return rc;
 }
@@ -1305,6 +1320,80 @@ static void test_batch_request_id(void) {
     kdb_enc_free(&e);
 }
 
+/* B9: AUTO_STATUS, the loader's report on auto reload (legal between batches only, no state change) */
+static void test_auto_status(void) {
+    printf("[AUTO_STATUS]\n");
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    sess_t *s = malloc(sizeof(*s));
+    sess_init(s, &LIM);
+    sess_to(s, KDB_S_READY);
+    m_auto_status(&e, 3);
+    CHECK_RC("accepted between batches", sess_feed(s, e.buf, e.len, 0), KDB_OK);
+    CHECK(s->sm.state == KDB_S_READY && s->m.type == KDB_T_AUTO_STATUS && s->m.u.auto_status.n_entries == 3);
+    kdb_iter_t it;
+    kdb_auto_status_entry_t en;
+    kdb_auto_status_entries(&s->m, &it);
+    for (unsigned i = 0; i < 3; i++) {
+        CHECK(kdb_auto_status_entries_next(&it, &en));
+        CHECK(en.view == i && en.last_poll == 1700000000u + i && en.applied_seq == 41 + i && en.pending == i);
+        CHECK(i == 1 ? (en.error.len == 24 && memcmp(en.error.p, "cannot open the database", 24) == 0) : en.error.p == NULL);
+    }
+    CHECK(!kdb_auto_status_entries_next(&it, &en));
+    /* a batch follows and ends as usual; a report after it is fine again */
+    kdb_enc_reset(&e); m_batch_begin(&e, 8); m_batch_end(&e, 8, 0, 0, 0); m_auto_status(&e, 1); m_batch_begin(&e, 9);
+    CHECK_RC("around a batch", sess_feed(s, e.buf, e.len, 0), KDB_OK);
+    CHECK(s->sm.state == KDB_S_IN_BATCH);
+    /* an empty report is valid */
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS); kdb_enc_end(&e);
+    CHECK_RC("no entries", send_enc(KDB_S_READY, &e), KDB_OK);
+    /* decoded with chunks of one byte too */
+    sess_init(s, &LIM);
+    sess_to(s, KDB_S_READY);
+    kdb_enc_reset(&e); m_auto_status(&e, 2);
+    CHECK_RC("one byte at a time", sess_feed(s, e.buf, e.len, 1), KDB_OK);
+    CHECK(s->m.u.auto_status.n_entries == 2);
+    /* the rules of an entry */
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, NVIEWS); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("view index out of range", send_enc(KDB_S_READY, &e), KDB_E_RANGE);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u32(&e, 4, 1); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("missing applied_seq", send_enc(KDB_S_READY, &e), KDB_E_TLV_MISSING);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u16(&e, 4, 1); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("pending of 2 bytes", send_enc(KDB_S_READY, &e), KDB_E_TLV_LEN);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_u8(&e, 6, 1); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("unknown tag 6", send_enc(KDB_S_READY, &e), KDB_E_TLV_UNKNOWN);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_bytes(&e, 5, "bad\x01text", 8); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("control character in the error", send_enc(KDB_S_READY, &e), KDB_E_TLV_STR);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_u8(&e, 2, 1);
+    kdb_enc_end(&e);
+    CHECK_RC("tag 2 at the top is unknown", send_enc(KDB_S_READY, &e), KDB_E_TLV_UNKNOWN);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    for (int i = 0; i <= KDB_MAX_CONFIG_VIEWS; i++) {
+        kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1); kdb_enc_nest_end(&e);
+    }
+    kdb_enc_end(&e);
+    CHECK(!e.err);
+    CHECK_RC("1025 entries", send_enc(KDB_S_READY, &e), KDB_E_RANGE);
+    /* before the HELLO it is refused */
+    kdb_enc_reset(&e); m_auto_status(&e, 1);
+    CHECK_RC("before HELLO", send_enc(KDB_S_AWAIT_HELLO, &e), KDB_E_STATE);
+    free(s);
+    kdb_enc_free(&e);
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--gen-corpus") == 0) return gen_corpus(argv[2]) ? 1 : 0;
     test_roundtrip_loader();
@@ -1319,6 +1408,7 @@ int main(int argc, char **argv) {
     test_chunking();
     test_encoder();
     test_batch_request_id();
+    test_auto_status();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

@@ -25,12 +25,19 @@
 #include <string.h>
 #include <strings.h>
 #include <stdarg.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <sqlite3.h>
 
 #include "dns_db_driver.h"
 
 struct db_conn {
     sqlite3 *db;
+    char *path;                 /* B9: the file that was opened, and which file it was (poll_version) */
+    dev_t dev;
+    ino_t ino;
+    bool have_id;
+    sqlite3_stmt *st_pv;
     char err[DB_ERRLEN];
     bool in_snapshot;
     bool has_changes;
@@ -169,12 +176,21 @@ static int sq_open(db_conn_t **out, const db_source_t *src, char *err, size_t er
         free(c);
         return ret;
     }
+    c->path = strdup(path);
+    struct stat sb;
+    if (c->path && stat(path, &sb) == 0) {
+        c->dev = sb.st_dev;
+        c->ino = sb.st_ino;
+        c->have_id = true;
+    }
     *out = c;
     return 0;
 }
 
 static void sq_close(db_conn_t *c) {
     if (!c) return;
+    sqlite3_finalize(c->st_pv);
+    free(c->path);
     sqlite3_finalize(c->st_zones);
     sqlite3_finalize(c->st_rec_all);
     sqlite3_finalize(c->st_rec_one);
@@ -740,11 +756,29 @@ static int sq_scan_ext(db_conn_t *c, const int64_t *domain_id, const db_ext_sink
     return ret;
 }
 
+/* B9: PRAGMA data_version on the persistent connection (it reports commits of other connections only; the loader never
+ * writes, so every change it sees is somebody else's).  The statement is reset after each step so that no read
+ * transaction stays open.  The file is looked up by name each time: a replaced or deleted file keeps being read through the
+ * old descriptor, so only the name can tell. */
+static int sq_poll_version(db_conn_t *c, uint64_t *version, bool *replaced) {
+    struct stat sb;
+    *replaced = !c->path || stat(c->path, &sb) != 0 || (c->have_id && (sb.st_dev != c->dev || sb.st_ino != c->ino));
+    int ret = prep(c, &c->st_pv, "PRAGMA data_version");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = c->st_pv;
+    rearm(st);
+    int rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) *version = (uint64_t)sqlite3_column_int64(st, 0);
+    else ret = sql_fail(c, rc, "PRAGMA data_version");
+    rearm(st);
+    return ret;
+}
+
 const db_driver_t db_driver_sqlite3 = {
     "sqlite3",       sq_open,         sq_close,           sq_errmsg,           sq_check_schema,
     sq_begin_snapshot, sq_end_snapshot, sq_list_zones,    sq_scan_records,     sq_scan_metadata,
     sq_zones_with_keys, sq_changes_since, sq_wait_fd,     sq_drain_notifications, sq_report_status,
-    sq_changes_max,   sq_scan_records_range, sq_scan_domain_views, sq_scan_profiles, sq_scan_ext,
+    sq_changes_max,   sq_scan_records_range, sq_scan_domain_views, sq_scan_profiles, sq_scan_ext, sq_poll_version,
 };
 
 #endif /* KARIDNS_DB_SQLITE3 */

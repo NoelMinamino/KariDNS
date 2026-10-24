@@ -63,6 +63,8 @@ typedef struct {
   uint32_t nviews;
   uint64_t max_zone_records, max_zone_bytes;
   uint32_t ingest_threads;
+  bool auto_reload;
+  uint32_t poll_interval, coalesce_ms;
   bool enabled;
 } ing_cfg_t;
 
@@ -232,6 +234,7 @@ static struct {
   _Atomic uint32_t pid, b_applied, b_rejected, b_shadowed, b_deleted;
   _Atomic int64_t since;                                    /* connected since / disconnected since */
   _Atomic uint64_t tot_applied, tot_rejected, tot_shadowed, tot_deleted, tot_failed;
+  _Atomic uint64_t tot_auto_batches;                        /* B9: batches of kind auto since the start */
   _Atomic uint64_t batch_id;
   _Atomic int batch_kind;
   _Atomic int64_t batch_time;
@@ -280,6 +283,52 @@ static void st_get_strings(char *err, size_t en, char *ver, size_t vn, int64_t *
   }
 }
 
+/* B9: what the loader reports about auto reload (AUTO_STATUS), per view index; written by the stream thread (one writer, a
+ * seqlock per entry), read by the control thread for `karictl dbstatus`. */
+#define AS_ERR 120
+static struct as_ent {
+  _Atomic uint32_t seq;
+  _Atomic bool valid;
+  _Atomic int64_t last_poll;
+  _Atomic uint64_t applied_seq;
+  _Atomic uint32_t pending;
+  _Atomic char err[AS_ERR];
+} g_as[KARIDNS_DB_MAX_VIEWS];
+
+static void as_set(struct as_ent *a, int64_t last_poll, uint64_t applied, uint32_t pending, const char *err, size_t errn) {
+  uint32_t s = atomic_load_explicit(&a->seq, memory_order_relaxed);
+  atomic_store_explicit(&a->seq, s + 1, memory_order_release);
+  atomic_thread_fence(memory_order_seq_cst);
+  atomic_store_explicit(&a->last_poll, last_poll, memory_order_relaxed);
+  atomic_store_explicit(&a->applied_seq, applied, memory_order_relaxed);
+  atomic_store_explicit(&a->pending, pending, memory_order_relaxed);
+  size_t i = 0;
+  for (; err && i < errn && i + 1 < AS_ERR; i++)
+    atomic_store_explicit(&a->err[i], (err[i] >= 0x20 && err[i] <= 0x7E) ? err[i] : '?', memory_order_relaxed);
+  atomic_store_explicit(&a->err[i], '\0', memory_order_relaxed);
+  atomic_store_explicit(&a->valid, true, memory_order_relaxed);
+  atomic_store_explicit(&a->seq, s + 2, memory_order_release);
+}
+
+static bool as_get(struct as_ent *a, int64_t *last_poll, uint64_t *applied, uint32_t *pending, char *err, size_t en) {
+  for (int tries = 0; tries < 1000; tries++) {
+    uint32_t s1 = atomic_load_explicit(&a->seq, memory_order_acquire);
+    if (s1 & 1) continue;
+    bool valid = atomic_load_explicit(&a->valid, memory_order_relaxed);
+    *last_poll = atomic_load_explicit(&a->last_poll, memory_order_relaxed);
+    *applied = atomic_load_explicit(&a->applied_seq, memory_order_relaxed);
+    *pending = atomic_load_explicit(&a->pending, memory_order_relaxed);
+    st_str_get(a->err, err, en);
+    atomic_thread_fence(memory_order_seq_cst);
+    if (atomic_load_explicit(&a->seq, memory_order_acquire) == s1) return valid;
+  }
+  return false;
+}
+
+static void as_reset(void) {                                /* a new loader: what the old one said is stale */
+  for (size_t i = 0; i < KARIDNS_DB_MAX_VIEWS; i++) atomic_store_explicit(&g_as[i].valid, false, memory_order_relaxed);
+}
+
 static int64_t now_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -319,6 +368,9 @@ static void fill_snap(const server_config_t *cfg, ing_cfg_t *c) {
     c->max_zone_records = cfg->database.max_zone_records;
     c->max_zone_bytes = cfg->database.max_zone_bytes;
     c->ingest_threads = cfg->database.ingest_threads;
+    c->auto_reload = cfg->database.auto_reload;
+    c->poll_interval = cfg->database.poll_interval;
+    c->coalesce_ms = cfg->database.coalesce_ms;
   }
 }
 
@@ -1159,6 +1211,7 @@ static void on_hello(ing_t *g, const kdb_msg_t *m) {
   atomic_store_explicit(&g_st.since, (int64_t)time(NULL), memory_order_relaxed);
   atomic_store_explicit(&g_st.ever_connected, true, memory_order_relaxed);
   atomic_store_explicit(&g_st.connected, true, memory_order_relaxed);
+  as_reset();
   g->hello_done = true;
   send_config(g, "handshake");
 }
@@ -1395,6 +1448,7 @@ static void on_batch_end(ing_t *g, const kdb_msg_t *m) {
   atomic_store_explicit(&g_st.b_deleted, g->b_deleted, memory_order_relaxed);
   atomic_store_explicit(&g_st.batch_time, (int64_t)time(NULL), memory_order_relaxed);
   atomic_store_explicit(&g_st.batch_done, true, memory_order_relaxed);
+  if (g->batch_kind == KDB_BATCH_AUTO) atomic_fetch_add_explicit(&g_st.tot_auto_batches, 1, memory_order_relaxed);
   syslog(LOG_INFO, "[DB] batch %llu complete: %u zone(s) received (%u installed, %u hidden by karidns.conf, %u rejected), "
                    "%u failed in the loader, %u deleted",
          (unsigned long long)b->batch_id, b->n_zones, g->b_applied, g->b_shadowed, g->b_rejected, b->n_failed,
@@ -1415,6 +1469,17 @@ static void on_batch_end(ing_t *g, const kdb_msg_t *m) {
     g->enc.err = true;
   }
   send_enc(g);
+}
+
+/* B9: the loader's report on auto reload, one entry per view that has it on */
+static void on_auto_status(const kdb_msg_t *m) {
+  kdb_iter_t it;
+  kdb_auto_status_entry_t e;
+  kdb_auto_status_entries(m, &it);
+  while (kdb_auto_status_entries_next(&it, &e)) {
+    if (e.view >= KARIDNS_DB_MAX_VIEWS) continue;
+    as_set(&g_as[e.view], (int64_t)e.last_poll, e.applied_seq, e.pending, e.error.p, e.error.len);
+  }
 }
 
 static void handle_msg(ing_t *g, const kdb_msg_t *m) {
@@ -1452,6 +1517,9 @@ static void handle_msg(ing_t *g, const kdb_msg_t *m) {
     break;
   case KDB_T_PROFILE:
     on_profile(g, m);
+    break;
+  case KDB_T_AUTO_STATUS:
+    on_auto_status(m);
     break;
   default:
     break;
@@ -2229,6 +2297,31 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
               (unsigned long long)atomic_load(&g_st.batch_id), kind_name(atomic_load(&g_st.batch_kind)),
               atomic_load(&g_st.batch_done) ? "finished" : "started", t2, atomic_load(&g_st.b_applied),
               atomic_load(&g_st.b_rejected), atomic_load(&g_st.b_shadowed), atomic_load(&g_st.b_deleted));
+  if (!snap.auto_reload) {
+    st_append(&c, "auto reload: off\n");
+  } else {
+    st_append(&c, "auto reload: on (poll-interval %u s, coalesce %u ms), %llu auto batch(es) since start\n", snap.poll_interval,
+              snap.coalesce_ms, (unsigned long long)atomic_load(&g_st.tot_auto_batches));
+    rcu_aux_read_lock();
+    const server_config_t *vcfg = acquire_config_snapshot();
+    uint32_t vidx = 0;
+    for (const view_config_t *v = vcfg ? vcfg->views : NULL; v; v = v->next, vidx++) {
+      if (v->database_none) continue;
+      int64_t lp = 0;
+      uint64_t aseq = 0;
+      uint32_t pend = 0;
+      char aerr[AS_ERR] = "";
+      char tp[40];
+      if (vidx >= KARIDNS_DB_MAX_VIEWS || !as_get(&g_as[vidx], &lp, &aseq, &pend, aerr, sizeof(aerr))) {
+        st_append(&c, "  view %.64s: no report from the loader yet\n", v->name ? v->name : "?");
+        continue;
+      }
+      fmt_time(lp, tp, sizeof(tp));
+      st_append(&c, "  view %.64s: last poll %s, applied change seq %llu, pending changes %u, last error: %s\n",
+                v->name ? v->name : "?", tp, (unsigned long long)aseq, pend, aerr[0] ? aerr : "none");
+    }
+    rcu_aux_read_unlock();
+  }
   st_append(&c, "since start: %llu applied, %llu rejected, %llu shadowed, %llu deleted, %llu failed in the loader\n",
             (unsigned long long)atomic_load(&g_st.tot_applied), (unsigned long long)atomic_load(&g_st.tot_rejected),
             (unsigned long long)atomic_load(&g_st.tot_shadowed), (unsigned long long)atomic_load(&g_st.tot_deleted),

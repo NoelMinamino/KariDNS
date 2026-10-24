@@ -123,6 +123,12 @@ typedef struct db_driver {
      * domain when it is NULL; the three tables one after the other.  A callback returning non-zero stops the scan (DB_STOPPED).
      * DB_ERR_UNAVAILABLE when the tables do not exist (a plain PowerDNS database: no tags). */
     int (*scan_ext)(db_conn_t *c, const int64_t *domain_id, const db_ext_sink_t *sink);
+    /* B9 (auto reload, SQLite3): the change detector on a persistent connection, called outside a snapshot.  *version is
+     * an opaque value that differs from the one the previous call on this connection returned when another connection
+     * committed in between (PRAGMA data_version; the first call only sets the baseline).  *replaced is set when the database
+     * file is no longer the one that was opened (replaced by another file, deleted, renamed away); the connection still reads
+     * the old file then, so the caller reopens.  NULL for a driver that notifies (wait_fd). */
+    int (*poll_version)(db_conn_t *c, uint64_t *version, bool *replaced);
 } db_driver_t;
 
 /* compiled in when the driver is listed in DB_DRIVERS (Makefile) */

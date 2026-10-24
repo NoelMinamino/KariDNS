@@ -52,6 +52,11 @@ static const kdb_tspec_t sp_zone_failed[] = { S(KT_U16, KS_REQ | KS_VIEW, 0), S(
 static const kdb_tspec_t sp_zone_delete[] = { S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0) };
 static const kdb_tspec_t sp_profile[] = { S(KT_STR, KS_REQ | KS_NE, 255), S(KT_TEXT, KS_REQ, 65535) };
 static const kdb_tspec_t sp_batch_end[] = { S(KT_U64, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0) };
+static const kdb_tspec_t sp_auto_entry[] = {
+    S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_U64, KS_REQ, 0), S(KT_U64, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_STR, 0, 255) };
+TDEF(td_auto_entry, "AUTO_STATUS.ENTRY", sp_auto_entry);
+static const kdb_tspec_t sp_auto_status[] = { { KT_NEST, 0, KDB_MAX_CONFIG_VIEWS, &td_auto_entry } };
+TDEF(td_auto_status, "AUTO_STATUS", sp_auto_status);
 TDEF(td_hello, "HELLO", sp_hello);
 TDEF(td_batch_begin, "BATCH_BEGIN", sp_batch_begin);
 TDEF(td_zone_begin, "ZONE_BEGIN", sp_zone_begin);
@@ -113,6 +118,7 @@ static const kdb_mdef_t mdefs[] = {
     { KDB_T_ZONE_DELETE, "ZONE_DELETE", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_zone_delete },
     { KDB_T_PROFILE, "PROFILE", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_profile },
     { KDB_T_BATCH_END, "BATCH_END", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_batch_end },
+    { KDB_T_AUTO_STATUS, "AUTO_STATUS", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_auto_status },
     { KDB_T_CONFIG, "CONFIG", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_config },
     { KDB_T_RELOAD_REQ, "RELOAD_REQ", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_reload_req },
     { KDB_T_INVENTORY, "INVENTORY", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_inventory },
@@ -359,6 +365,11 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         m->u.batch_end.n_failed = (uint32_t)V(3).u;
         m->u.batch_end.n_deleted = (uint32_t)V(4).u;
         break;
+    case KDB_T_AUTO_STATUS:
+        m->u.auto_status.n_entries = nrep;
+        m->u.auto_status.body = fr->body;
+        m->u.auto_status.body_len = fr->len;
+        break;
     case KDB_T_CONFIG:
         m->u.config.generation = V(1).u;
         m->u.config.driver = gstr(&V(2));
@@ -429,6 +440,24 @@ static bool nest_next(kdb_iter_t *it, uint16_t tag, const kdb_tdef_t *sub, kdb_v
     }
     it->left = 0;
     return false;
+}
+
+void kdb_auto_status_entries(const kdb_msg_t *m, kdb_iter_t *it) {
+    bool ok = m->type == KDB_T_AUTO_STATUS;
+    it->p = ok ? m->u.auto_status.body : NULL;
+    it->left = ok ? m->u.auto_status.body_len : 0;
+    it->view_count = m->view_count;
+}
+
+bool kdb_auto_status_entries_next(kdb_iter_t *it, kdb_auto_status_entry_t *o) {
+    kdb_val_t vals[KDB_MAX_TAGS];
+    if (!nest_next(it, 1, &td_auto_entry, vals)) return false;
+    o->view = (uint16_t)V(1).u;
+    o->last_poll = V(2).u;
+    o->applied_seq = V(3).u;
+    o->pending = (uint32_t)V(4).u;
+    o->error = gstr(&V(5));
+    return true;
 }
 
 void kdb_config_views(const kdb_msg_t *m, kdb_iter_t *it) {
@@ -647,7 +676,8 @@ static bool sm_legal(const kdb_sm_t *sm, uint16_t t) {
     switch (sm->state) {
     case KDB_S_AWAIT_HELLO: return t == KDB_T_HELLO;
     case KDB_S_READY:
-        return (t == KDB_T_INVENTORY_REQ && !sm->inventory_req_seen && !sm->batch_seen) || t == KDB_T_BATCH_BEGIN;
+        return (t == KDB_T_INVENTORY_REQ && !sm->inventory_req_seen && !sm->batch_seen) || t == KDB_T_BATCH_BEGIN ||
+               t == KDB_T_AUTO_STATUS;
     case KDB_S_IN_BATCH:
         return t == KDB_T_ZONE_BEGIN || t == KDB_T_ZONE_FAILED || t == KDB_T_ZONE_DELETE || t == KDB_T_PROFILE ||
                t == KDB_T_BATCH_END;
@@ -674,6 +704,8 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
     case KDB_T_INVENTORY_REQ:
         sm->inventory_req_seen = true;
         break;
+    case KDB_T_AUTO_STATUS:
+        break;                                   /* B9: informational, no state change */
     case KDB_T_BATCH_BEGIN:
         sm->batch_seen = true;
         sm->batch_id = m->u.batch_begin.batch_id;

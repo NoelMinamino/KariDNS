@@ -69,6 +69,18 @@ static void run_loader(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, ru
             if (fr.type == KDB_T_ZONE_BEGIN) mix(&r->sum, m.u.zone_begin.rr_count + strlen(m.u.zone_begin.name));
             if (fr.type == KDB_T_ZONE_DATA) mix(&r->sum, m.u.zone_data.ancount);
             if (fr.type == KDB_T_PROFILE) mix(&r->sum, m.u.profile.settings.len);
+            if (fr.type == KDB_T_AUTO_STATUS) {            /* B9: the iterator sees exactly the validated entries */
+                kdb_iter_t it;
+                kdb_auto_status_entry_t en;
+                uint32_t k = 0;
+                kdb_auto_status_entries(&m, &it);
+                while (kdb_auto_status_entries_next(&it, &en)) {
+                    if (en.view >= 3) abort();
+                    mix(&r->sum, en.applied_seq + en.pending + en.error.len);
+                    k++;
+                }
+                if (k != m.u.auto_status.n_entries) abort();
+            }
         }
         if (rc != KDB_OK) { r->rc = rc; break; }
     } while (off < n);

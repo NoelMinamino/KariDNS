@@ -22,6 +22,8 @@
  * differs, when the change log lists it, when the Backend rejected its last version, or when everything is compared (the
  * first load of a loader process, a change of sources, an unusable change log).  A converted zone whose digest is the one
  * the Backend has is not sent.  Zones the Backend has and the database no longer lists get a ZONE_DELETE.
+ *
+ * Auto reload (B9, design 6): the same diff, started by the loader itself; see the block before run_stream().
  */
 
 #include <stdio.h>
@@ -281,8 +283,26 @@ typedef struct inv_ent {
 
 typedef struct { inv_ent_t **tab; size_t nb, count; } inv_t;
 
-/* per source (view name): the change log position of the last complete load */
-typedef struct { uint64_t seq; bool seq_valid; bool nolog_warned; } vstate_t;
+/* per source (view name): the change log position of the last complete load, and (B9) the state of its auto reload */
+#define AUTO_ERRLEN 160
+typedef struct {
+    uint64_t seq;
+    bool seq_valid;
+    bool nolog_warned;
+    /* B9, auto reload: one persistent connection that only asks PRAGMA data_version (and the end of the change log);
+     * the loads read through connections of their own.  Times are CLOCK_MONOTONIC milliseconds, 0 = not set. */
+    const db_driver_t *pdrv;
+    db_conn_t *pconn;
+    bool has_changes;                    /* the database has karidns_changes (else: detection by data_version, zones compared by serial) */
+    bool dv_valid;
+    uint64_t dv;                         /* the last data_version seen */
+    bool opened_once, nolog_auto_warned;
+    bool need_full;                      /* the next auto load compares every zone (the database file was replaced) */
+    int64_t next_poll, flush_at, open_retry_at;
+    uint32_t pending;                    /* changes seen in the log, not applied yet */
+    int64_t last_poll;                   /* wall clock seconds, 0 = never */
+    char perr[AUTO_ERRLEN], lerr[AUTO_ERRLEN];   /* last poll error, last load error ("" = none) */
+} vstate_t;
 
 typedef struct {
     const db_driver_t *drv;
@@ -493,7 +513,10 @@ static int vslot_get(struct lio *io, const char *name) {
 }
 
 static void io_free_views(struct lio *io) {
-    for (size_t i = 0; i < io->nvn; i++) free(io->vnames[i]);
+    for (size_t i = 0; i < io->nvn; i++) {
+        if (io->vst[i].pconn) io->vst[i].pdrv->close(io->vst[i].pconn);
+        free(io->vnames[i]);
+    }
     free(io->vnames);
     free(io->vst);
     free(io->idx_slot);
@@ -2127,6 +2150,16 @@ static int send_request_failure(ctx_t *x, uint16_t view, const char *zone, const
     return send_enc(x);
 }
 
+/* where the data of a view is: the file (sqlite3) or the schema (postgresql) in `source` */
+static void view_source(const db_driver_t *drv, const lview_t *v, db_source_t *src) {
+    bool sqlite = strcmp(drv->name, "sqlite3") == 0;
+    src->driver = drv->name;
+    src->database_file = sqlite ? v->source : NULL;
+    src->conninfo_file = v->conninfo;
+    src->schema = sqlite ? NULL : v->source;
+    src->busy_timeout_ms = 0;
+}
+
 /* One batch: the difference between the databases and the Backend's inventory, for every view (only_view >= 0: for that
  * view; only_zone: for that zone, read whatever its serial; req_id: the RELOAD_REQ the batch answers; force: send even
  * a version the Backend has; reconcile: read every zone and let the digest decide).  The batch is sent when something
@@ -2154,7 +2187,6 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
     io->first_reject[0] = '\0';
     int errs = 0;
     bool seen_view = false;
-    bool sqlite = strcmp(drv->name, "sqlite3") == 0;
     for (size_t i = 0; i < c->nviews; i++) {
         const lview_t *v = &c->views[i];
         if (only_view >= 0 && v->index != only_view) continue;
@@ -2172,7 +2204,8 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
         x->opts.max_zone_bytes = v->max_bytes;
         x->errtext[0] = '\0';
         x->map_view = v->shared ? v->name : NULL;      /* karidns_domain_views decides which zones of the shared source are this view's */
-        db_source_t src = { drv->name, sqlite ? v->source : NULL, v->conninfo, sqlite ? NULL : v->source, 0 };
+        db_source_t src;
+        view_source(drv, v, &src);
         int st = run_view(x, &src, only_zone, false);
         if (x->io_error || x->oom || g_stop) {
             ctx_view_reset(x);
@@ -2203,9 +2236,11 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
             return -1;
         }
         io->batches_ended++;
-        lg(LOG_INFO, "batch %llu (%s) sent: %u zone(s) read, %u sent, %u failed in the loader, %u deleted, %u unchanged%s",
+        char vtxt[300] = "";                       /* an auto batch is made for one view: say which */
+        if (kind == KDB_BATCH_AUTO) snprintf(vtxt, sizeof(vtxt), " (view '%.200s')", io->vnames[x->vslot]);
+        lg(LOG_INFO, "batch %llu (%s) sent: %u zone(s) read, %u sent, %u failed in the loader, %u deleted, %u unchanged%s%s",
            (unsigned long long)x->batch_id, batch_kind_name(kind), x->n_read, x->n_zones, x->n_failed, x->n_deleted,
-           x->n_unchanged, req_id ? " (answers a request)" : "");
+           x->n_unchanged, req_id ? " (answers a request)" : "", vtxt);
         if (io_wait_results(io) != 0) return -1;
     }
     return errs ? 1 : 0;
@@ -2215,6 +2250,261 @@ static int64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* auto reload (B9, design 6): `auto-reload yes;`                                                                 */
+/* ------------------------------------------------------------------------------------------------------------- */
+/* Every poll-interval a view with auto reload asks its persistent connection for PRAGMA data_version.  When it changed,
+ * the end of the change log decides whether a zone was touched (no new rows: nothing to do); the first change starts a
+ * coalesce window, and when it ends one batch of kind auto is made by do_load() for that view: the same diff as a
+ * `karictl reload` (change log since the last load, serials, digest gate, ZONE_DELETE for zones that left the database;
+ * a gap in the log or a reset one compares every zone).  Without karidns_changes the batch compares serials only.
+ * Everything runs in the main loop of the stream (no thread): a batch in progress is finished before the next poll, and
+ * requests of the Backend wait in the queue until the loop comes round again. */
+
+static void auto_set_err(struct lio *io, uint16_t slot, bool load, const char *what, const char *msg) {
+    vstate_t *vs = &io->vst[slot];
+    char *dst = load ? vs->lerr : vs->perr;
+    char shown[100], text[AUTO_ERRLEN];
+    clean_reason(msg, shown, sizeof(shown));
+    snprintf(text, sizeof(text), "%s: %s", what, shown);
+    if (strcmp(dst, text) != 0) {                          /* log a condition once, not at every poll */
+        snprintf(dst, AUTO_ERRLEN, "%s", text);
+        lg(LOG_WARNING, "view '%s': auto reload: %s", io->vnames[slot], text);
+    }
+}
+
+static uint64_t auto_poll_ms(const lview_t *v) { return (uint64_t)(v->poll_interval ? v->poll_interval : 1) * 1000u; }
+
+static void auto_close(vstate_t *vs) {
+    if (vs->pconn) vs->pdrv->close(vs->pconn);
+    vs->pconn = NULL;
+    vs->dv_valid = false;
+}
+
+/* auto reload is (now) off for this view: forget everything about it */
+static void auto_off(vstate_t *vs) {
+    auto_close(vs);
+    vs->opened_once = false;
+    vs->need_full = false;
+    vs->next_poll = vs->flush_at = vs->open_retry_at = 0;
+    vs->pending = 0;
+    vs->last_poll = 0;
+    vs->perr[0] = vs->lerr[0] = '\0';
+}
+
+/* a change was seen: the first one starts the coalesce window, which later ones do not extend */
+static void auto_mark(vstate_t *vs, int64_t now, uint32_t coalesce_ms, uint32_t n) {
+    if (!vs->flush_at) vs->flush_at = now + (int64_t)coalesce_ms;
+    if (n > vs->pending) vs->pending = n;
+}
+
+/* open the persistent connection and take the baseline.  startup_pending: a load follows (the baseline is taken before it,
+ * so that a commit during the load is seen by the next poll); otherwise changes may have been missed (auto reload was off,
+ * the connection was lost): check, which costs one diff. */
+static bool auto_open(struct lio *io, const lview_t *v, uint16_t slot, bool startup_pending) {
+    vstate_t *vs = &io->vst[slot];
+    const db_driver_t *drv = driver_find(io->cfg.driver);
+    int64_t now = now_ms();
+    vs->open_retry_at = now + (int64_t)auto_poll_ms(v);
+    if (!drv || !drv->poll_version) {
+        auto_set_err(io, slot, false, "cannot watch the database", "the driver has no change detector");
+        return false;
+    }
+    db_source_t src;
+    view_source(drv, v, &src);
+    char err[DB_ERRLEN];
+    db_conn_t *c = NULL;
+    int rc = drv->open(&c, &src, err, sizeof(err));
+    if (rc != 0) {
+        auto_set_err(io, slot, false, "cannot open the database", err);
+        return false;
+    }
+    db_schema_info_t si;
+    memset(&si, 0, sizeof(si));
+    uint64_t dv = 0;
+    bool repl = false;
+    if ((rc = drv->check_schema(c, &si)) != 0 || (rc = drv->poll_version(c, &dv, &repl)) != 0) {
+        auto_set_err(io, slot, false, "cannot watch the database", drv->errmsg(c));
+        drv->close(c);
+        return false;
+    }
+    vs->pconn = c;
+    vs->pdrv = drv;
+    vs->has_changes = si.has_changes;
+    vs->dv = dv;
+    vs->dv_valid = true;
+    vs->next_poll = now + (int64_t)auto_poll_ms(v);
+    vs->perr[0] = '\0';
+    if (!si.has_changes && !vs->nolog_auto_warned) {
+        vs->nolog_auto_warned = true;
+        lg(LOG_WARNING, "view '%s': auto-reload is on but the database has no karidns_changes table; changes are noticed "
+                        "(PRAGMA data_version) and zones are compared by serial only, so an edit that keeps the serial is not "
+                        "picked up (apply db/karidns_ext.sqlite3.sql, or 'karictl reload <zone>')",
+           io->vnames[slot]);
+    }
+    if (!startup_pending) {                                 /* auto reload was just switched on, or the connection was lost: what */
+        lg(LOG_INFO, "view '%s': auto reload %s; checking for changes", io->vnames[slot],   /* happened meanwhile is not known */
+           vs->opened_once ? "reopened the database" : "is on");
+        auto_mark(vs, now, v->coalesce_ms, 1);
+    }
+    vs->opened_once = true;
+    return true;
+}
+
+/* top of the loop, before a load: views that have auto reload on get their connection (and baseline) first; views that
+ * have it off, or left the configuration, lose theirs.  A change of karidns.conf takes effect here. */
+static void auto_prepare(struct lio *io, bool load_follows) {
+    int64_t now = now_ms();
+    for (size_t s = 0; s < io->nvn; s++) {
+        const lview_t *v = NULL;
+        for (size_t i = 0; i < io->cfg.nviews; i++)
+            if (strcasecmp(io->cfg.views[i].name, io->vnames[s]) == 0) v = &io->cfg.views[i];
+        if (!v || !v->auto_reload) {
+            if (io->vst[s].pconn || io->vst[s].opened_once || io->vst[s].flush_at) {
+                lg(LOG_NOTICE, "view '%s': auto reload is off", io->vnames[s]);
+                auto_off(&io->vst[s]);
+            }
+            continue;
+        }
+        if (!io->vst[s].pconn && now >= io->vst[s].open_retry_at) auto_open(io, v, (uint16_t)s, load_follows);
+    }
+}
+
+/* the end of the change log decides whether the data_version change touched a zone */
+static void auto_changed(vstate_t *vs, const lview_t *v, int64_t now) {
+    uint32_t n = 1;
+    if (vs->has_changes && vs->pdrv->changes_max) {
+        uint64_t mx = 0;
+        if (vs->pdrv->changes_max(vs->pconn, &mx) == 0) {
+            if (vs->seq_valid && mx == vs->seq) return;               /* nothing was logged since the last load */
+            if (vs->seq_valid && mx > vs->seq) n = mx - vs->seq > UINT32_MAX ? UINT32_MAX : (uint32_t)(mx - vs->seq);
+        }                                                              /* else: the log was reset or cannot be read: the load decides */
+    }
+    auto_mark(vs, now, v->coalesce_ms, n);
+}
+
+/* one view: poll when it is due, then make the batch when the coalesce window has ended.  0, or -1 (fatal: stream, stop) */
+static int auto_view(ctx_t *x, struct lio *io, const lview_t *v, uint16_t slot, bool *dirty) {
+    vstate_t *vs = &io->vst[slot];
+    int64_t now = now_ms();
+    uint64_t poll_ms = auto_poll_ms(v);
+    if (!vs->pconn) {
+        if (now >= vs->open_retry_at) {
+            auto_open(io, v, slot, false);
+            *dirty = true;
+        }
+    } else if (now >= vs->next_poll) {
+        *dirty = true;
+        vs->next_poll = now + (int64_t)poll_ms;
+        vs->last_poll = (int64_t)time(NULL);
+        uint64_t dv = 0;
+        bool repl = false;
+        int rc = vs->pdrv->poll_version(vs->pconn, &dv, &repl);
+        if (rc != 0) {
+            auto_set_err(io, slot, false, "poll failed", vs->pdrv->errmsg(vs->pconn));
+            auto_close(vs);                                            /* reopened at the next due time, which then checks for changes */
+            vs->open_retry_at = now + (int64_t)poll_ms;
+        } else if (repl) {
+            lg(LOG_NOTICE, "view '%s': the database file was replaced or removed; reopening and comparing every zone",
+               io->vnames[slot]);
+            vs->need_full = true;
+            auto_close(vs);
+            auto_mark(vs, now, v->coalesce_ms, 1);
+            auto_open(io, v, slot, true);
+        } else {
+            vs->perr[0] = '\0';
+            if (!vs->dv_valid || dv != vs->dv) {
+                vs->dv = dv;
+                vs->dv_valid = true;
+                auto_changed(vs, v, now);
+            }
+        }
+    }
+    vs = &io->vst[slot];
+    if (vs->flush_at && now_ms() >= vs->flush_at) {
+        vs->flush_at = 0;
+        int rc = do_load(x, io, KDB_BATCH_AUTO, v->index, NULL, 0, false, vs->need_full);
+        if (rc < 0) return -1;
+        vs = &io->vst[slot];
+        *dirty = true;
+        if (rc == 0) {
+            vs->pending = 0;
+            vs->need_full = false;
+            vs->lerr[0] = '\0';
+        } else {                                                       /* the database could not be read: try again at the next poll time */
+            vs->flush_at = now_ms() + (int64_t)poll_ms;
+            auto_set_err(io, slot, true, "cannot read the database", x->errtext[0] ? x->errtext : "the database could not be read");
+        }
+    }
+    return 0;
+}
+
+/* AUTO_STATUS: what `karictl dbstatus` shows for each view that has auto reload on */
+static int auto_send_status(ctx_t *x, struct lio *io) {
+    bool any = false;
+    if (kdb_enc_begin(&x->enc, KDB_T_AUTO_STATUS) != 0) return -1;
+    for (size_t i = 0; i < io->cfg.nviews; i++) {
+        const lview_t *v = &io->cfg.views[i];
+        if (!v->auto_reload) continue;
+        int slot = vslot_get(io, v->name);
+        if (slot < 0) return -1;
+        const vstate_t *vs = &io->vst[slot];
+        const char *err = vs->lerr[0] ? vs->lerr : vs->perr;
+        any = true;
+        if (kdb_enc_nest_begin(&x->enc, 1) != 0 || kdb_enc_u16(&x->enc, 1, v->index) != 0 ||
+            kdb_enc_u64(&x->enc, 2, (uint64_t)vs->last_poll) != 0 ||
+            kdb_enc_u64(&x->enc, 3, vs->seq_valid ? vs->seq : 0) != 0 || kdb_enc_u32(&x->enc, 4, vs->pending) != 0 ||
+            (err[0] && kdb_enc_str(&x->enc, 5, err) != 0) || kdb_enc_nest_end(&x->enc) != 0)
+            return -1;
+    }
+    if (!any || kdb_enc_end(&x->enc) != 0) {
+        kdb_enc_reset(&x->enc);
+        return any ? -1 : 0;
+    }
+    return send_enc(x);
+}
+
+/* the auto reload step of the loop, after the startup batch: 0, or -1 (fatal) */
+static int auto_run(ctx_t *x, struct lio *io) {
+    bool dirty = false;
+    if (io->have_newcfg) return 0;                                     /* a CONFIG is waiting: adopt it first (view indexes, settings) */
+    for (size_t i = 0; i < io->cfg.nviews && !g_stop; i++) {
+        const lview_t *v = &io->cfg.views[i];
+        if (!v->auto_reload) continue;
+        int slot = vslot_get(io, v->name);
+        if (slot < 0) {
+            lg(LOG_ERR, "out of memory");
+            return -1;
+        }
+        if (auto_view(x, io, v, (uint16_t)slot, &dirty) != 0) return -1;
+        if (io->eof || io->failed) return 0;                           /* the main loop ends */
+    }
+    if (dirty && !g_stop && auto_send_status(x, io) != 0) {
+        lg(LOG_ERR, "cannot write the output: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/* milliseconds until the next poll / coalesce deadline / reopen of any view with auto reload on, at most `limit` */
+static int auto_wait_ms(const struct lio *io, int limit) {
+    int64_t now = now_ms();
+    for (size_t i = 0; i < io->cfg.nviews; i++) {
+        const lview_t *v = &io->cfg.views[i];
+        if (!v->auto_reload) continue;
+        for (size_t s = 0; s < io->nvn; s++) {
+            if (strcasecmp(io->vnames[s], v->name) != 0) continue;
+            const vstate_t *vs = &io->vst[s];
+            int64_t t = vs->pconn ? vs->next_poll : vs->open_retry_at;
+            if (vs->flush_at && vs->flush_at < t) t = vs->flush_at;
+            int64_t left = t - now;
+            if (left < 0) left = 0;
+            if (left < limit) limit = (int)left;
+        }
+    }
+    return limit;
 }
 
 static int run_stream(int fd) {
@@ -2287,6 +2577,7 @@ static int run_stream(int fd) {
                 lg(LOG_NOTICE, "the database sources changed; comparing every zone with the Backend's");
                 need_load = true;
                 reconcile = true;
+                for (size_t s = 0; s < io->nvn; s++) auto_close(&io->vst[s]);     /* B9: reopened below, before the load */
             }
         }
         uint64_t load_req = 0;
@@ -2300,6 +2591,7 @@ static int run_stream(int fd) {
             retry_pending = false;
             need_load = true;
         }
+        auto_prepare(io, need_load);
         if (need_load) {
             need_load = false;
             int rc = do_load(&x, io, startup_done ? KDB_BATCH_DIFF : KDB_BATCH_STARTUP, -1, NULL, load_req, false, reconcile);
@@ -2328,12 +2620,18 @@ static int run_stream(int fd) {
             }
         }
         io->nreq = 0;
+        if (startup_done && auto_run(&x, io) != 0) {
+            if (g_stop) goto stopped;
+            status = EXIT_ERROR;
+            goto done;
+        }
         int timeout = 1000;
         if (retry_pending) {
             int64_t left = retry_at - now_ms();
             if (left < 0) left = 0;
             if (left < timeout) timeout = (int)left;
         }
+        if (startup_done) timeout = auto_wait_ms(io, timeout);
         struct pollfd p = { io->fd, POLLIN, 0 };
         int r = poll(&p, 1, timeout);
         if (r < 0 && errno != EINTR) {
@@ -2416,6 +2714,8 @@ static void usage(FILE *fp) {
         "On RELOAD_REQ (karictl reload) it compares the databases with the inventory (new zones, other serial, zones listed\n"
         "in the change log table karidns_changes, zones the Backend refused; ZONE_DELETE for zones that left the database),\n"
         "or reads one zone (karictl reload ZONE [force]); a change of the configured sources compares everything again.\n"
+        "With auto-reload yes it also polls PRAGMA data_version of each database every poll-interval seconds and, a coalesce\n"
+        "window after the first change, sends one batch of kind auto with the same comparison (docs/karidns.md).\n"
         "It logs to syslog and ends when the Backend closes the stream or on SIGTERM / SIGINT; SIGHUP is ignored.\n"
         "\n"
         "options:\n"

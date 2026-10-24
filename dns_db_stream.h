@@ -56,6 +56,10 @@
  *   ZONE_DELETE (9)   1 view view R | 2 zone name R | 3 source_id i64 R
  *   PROFILE (10)      1 name str ne <=255 R | 2 settings text<=65535 R
  *   BATCH_END (11)    1 batch_id u64 R | 2 n_zones u32 R | 3 n_failed u32 R | 4 n_deleted u32 R
+ *   AUTO_STATUS (12)  B9; only between batches (state READY), no state change.  1 ENTRY nested, repeatable (<= 1024), one per view
+ *                     that has auto reload on: 1 view view R | 2 last_poll u64 R (unix seconds, 0 = never) |
+ *                     3 applied_seq u64 R (change log position of the last complete load) | 4 pending u32 R (changes seen, not yet
+ *                     applied) | 5 error str<=255 O (the last poll / load error of the view, absent = none)
  * Backend -> loader (type | 0x8000)
  *   CONFIG (0x8001)   1 generation u64 R | 2 driver str ne <=32 R | 3 server_id str<=64 O |
  *                     4 VIEW nested, repeatable (<= 1024):
@@ -97,7 +101,7 @@ enum {
     /* loader -> Backend */
     KDB_T_HELLO = 1, KDB_T_INVENTORY_REQ = 2, KDB_T_BATCH_BEGIN = 3, KDB_T_ZONE_BEGIN = 4, KDB_T_ZONE_DATA = 5,
     KDB_T_ZONE_END = 6, KDB_T_ZONE_ABORT = 7, KDB_T_ZONE_FAILED = 8, KDB_T_ZONE_DELETE = 9, KDB_T_PROFILE = 10,
-    KDB_T_BATCH_END = 11,
+    KDB_T_BATCH_END = 11, KDB_T_AUTO_STATUS = 12,
     /* Backend -> loader: high bit set */
     KDB_T_CONFIG = 0x8001, KDB_T_RELOAD_REQ = 0x8002, KDB_T_INVENTORY = 0x8003, KDB_T_INVENTORY_END = 0x8004,
     KDB_T_ZONE_RESULT = 0x8005, KDB_T_BATCH_RESULT = 0x8006
@@ -198,6 +202,7 @@ typedef struct { uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id
 typedef struct { uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; } kdb_zone_delete_t;
 typedef struct { kdb_str_t name, settings; } kdb_profile_t;
 typedef struct { uint64_t batch_id; uint32_t n_zones, n_failed, n_deleted; } kdb_batch_end_t;
+typedef struct { uint32_t n_entries; const uint8_t *body; uint32_t body_len; } kdb_auto_status_t;     /* entries: kdb_auto_status_entries() */
 
 typedef struct {
     uint64_t generation; kdb_str_t driver, server_id;
@@ -224,7 +229,7 @@ typedef struct {
     union {
         kdb_hello_t hello; kdb_batch_begin_t batch_begin; kdb_zone_begin_t zone_begin; kdb_zone_data_t zone_data;
         kdb_zone_end_t zone_end; kdb_zone_abort_t zone_abort; kdb_zone_failed_t zone_failed;
-        kdb_zone_delete_t zone_delete; kdb_profile_t profile; kdb_batch_end_t batch_end;
+        kdb_zone_delete_t zone_delete; kdb_profile_t profile; kdb_batch_end_t batch_end; kdb_auto_status_t auto_status;
         kdb_config_t config; kdb_reload_req_t reload_req; kdb_inventory_t inventory;
         kdb_inventory_end_t inventory_end; kdb_zone_result_t zone_result; kdb_batch_result_t batch_result;
     } u;
@@ -245,6 +250,9 @@ typedef struct {
 typedef struct {
     uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; uint32_t serial; uint8_t digest[KDB_DIGEST_LEN];
 } kdb_inventory_entry_t;
+typedef struct { uint16_t view; uint64_t last_poll, applied_seq; uint32_t pending; kdb_str_t error; } kdb_auto_status_entry_t;
+void kdb_auto_status_entries(const kdb_msg_t *m, kdb_iter_t *it);
+bool kdb_auto_status_entries_next(kdb_iter_t *it, kdb_auto_status_entry_t *out);
 void kdb_config_views(const kdb_msg_t *m, kdb_iter_t *it);
 bool kdb_config_views_next(kdb_iter_t *it, kdb_config_view_t *out);
 void kdb_inventory_entries(const kdb_msg_t *m, kdb_iter_t *it);
