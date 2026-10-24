@@ -891,7 +891,7 @@ static void test_dump(void) {
     bool f_keys = false, f_slave = false, f_nosoa = false, f_weird = false;
     for (size_t i = 0; i < d.n_failed && i < 16; i++) {
         if (!strcmp(d.failed_name[i], "keys.test.")) f_keys = strstr(d.failed_reason[i], "cryptokeys") && strstr(d.failed_reason[i], "PRESIGNED");
-        if (!strcmp(d.failed_name[i], "slave.test.")) f_slave = strstr(d.failed_reason[i], "B7") != NULL;
+        if (!strcmp(d.failed_name[i], "slave.test.")) f_slave = strstr(d.failed_reason[i], "domains.master") != NULL;      /* B7b: a SLAVE needs a master (it has none here) */
         if (!strcmp(d.failed_name[i], "nosoa.test.")) f_nosoa = strstr(d.failed_reason[i], "SOA") != NULL;
         if (!strcmp(d.failed_name[i], "weird.test.")) f_weird = strstr(d.failed_reason[i], "domains.type") != NULL;
     }

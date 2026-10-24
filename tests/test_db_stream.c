@@ -68,6 +68,16 @@ static void m_zone_begin(kdb_enc_t *e, uint16_t view, const char *name, uint64_t
     zb_required(e, view, name, rr);
     kdb_enc_end(e);
 }
+/* B7b: a ZONE_BEGIN of another kind (secondary / catalog consumer zones carry no data) */
+static void m_zone_begin_kind(kdb_enc_t *e, uint16_t view, const char *name, uint64_t rr, uint8_t kind) {
+    uint8_t dig[KDB_DIGEST_LEN];
+    memset(dig, 0xCD, sizeof(dig));
+    kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
+    kdb_enc_u16(e, 1, view); kdb_enc_name(e, 2, name); kdb_enc_i64(e, 3, 9); kdb_enc_u8(e, 4, kind);
+    kdb_enc_u32(e, 5, 0); kdb_enc_u32(e, 6, 0); kdb_enc_u64(e, 7, rr); kdb_enc_bytes(e, 8, dig, sizeof(dig));
+    kdb_enc_str(e, 9, "masters { 192.0.2.1; };");
+    kdb_enc_end(e);
+}
 /* ZONE_DATA: DNS header (RFC 1035 4.1.1) with the given flags / counts, then pad bytes standing for the RRs */
 static void m_zone_data_raw(kdb_enc_t *e, uint16_t flags, uint16_t qd, uint16_t an, uint16_t ns, uint16_t ar, size_t pad) {
     uint8_t b[12 + 4096];
@@ -990,6 +1000,27 @@ static void test_counts_and_limits(void) {
     CHECK(strstr(reason, "max-zone-records") != NULL);
     kdb_enc_reset(&e); m_zone_begin(&e, 0, ZN, UINT64_MAX);
     CHECK_RC("rr_count 2^64-1", send_enc(KDB_S_IN_BATCH, &e), KDB_E_LIMIT_RECORDS);
+    /* B7b: secondary and catalog consumer zones have rr_count 0 and no ZONE_DATA (the primary rule of two SOAs does not apply) */
+    for (uint8_t zk = KDB_ZK_SECONDARY; zk <= KDB_ZK_CATALOG; zk++) {
+        kdb_enc_reset(&e); m_zone_begin_kind(&e, 0, ZN, 0, zk);
+        CHECK_RC("secondary kind, rr_count 0", send_enc(KDB_S_IN_BATCH, &e), KDB_OK);
+        kdb_enc_reset(&e); m_zone_begin_kind(&e, 0, ZN, 2, zk);
+        CHECK_RC("secondary kind, rr_count 2", send_enc(KDB_S_IN_BATCH, &e), KDB_E_COUNT);
+        kdb_enc_reset(&e); m_zone_begin_kind(&e, 0, ZN, 1, zk);
+        CHECK_RC("secondary kind, rr_count 1", send_enc(KDB_S_IN_BATCH, &e), KDB_E_COUNT);
+        sess_init(s, &LIM); sess_to(s, KDB_S_IN_BATCH);
+        kdb_enc_reset(&e); m_zone_begin_kind(&e, 0, ZN, 0, zk); m_zone_end(&e, 0);
+        CHECK_RC("secondary kind: BEGIN, END", sess_feed(s, e.buf, e.len, 0), KDB_OK);
+        CHECK(s->sm.state == KDB_S_IN_BATCH && s->sm.n_zones == 1);
+        sess_init(s, &LIM); sess_to(s, KDB_S_IN_BATCH);
+        kdb_enc_reset(&e); m_zone_begin_kind(&e, 0, ZN, 0, zk); m_zone_data(&e, 1, 0, 8);
+        CHECK_RC("secondary kind: ZONE_DATA is more than declared", sess_feed(s, e.buf, e.len, 0), KDB_E_COUNT);
+        sess_init(s, &LIM); sess_to(s, KDB_S_IN_BATCH);
+        kdb_enc_reset(&e); m_zone_begin_kind(&e, 0, ZN, 0, zk); m_zone_end(&e, 2);
+        CHECK_RC("secondary kind: ZONE_END count differs", sess_feed(s, e.buf, e.len, 0), KDB_E_COUNT);
+    }
+    kdb_enc_reset(&e); m_zone_begin_kind(&e, 0, ZN, 0, KDB_ZK_PRIMARY);
+    CHECK_RC("primary kind, rr_count 0", send_enc(KDB_S_IN_BATCH, &e), KDB_E_COUNT);
     {   /* the default limits */
         kdb_limits_t d = { KDB_DEFAULT_MAX_ZONE_RECORDS, KDB_DEFAULT_MAX_ZONE_BYTES, KDB_VIEWS_ANY };
         kdb_enc_reset(&e); m_zone_begin(&e, 0, ZN, KDB_DEFAULT_MAX_ZONE_RECORDS);
@@ -1221,6 +1252,13 @@ static int gen_corpus(const char *dir) {
     m_config(&e); m_reload_req(&e, false); m_reload_req(&e, true); m_inventory(&e); m_inventory_end(&e);
     m_zone_result(&e); m_batch_result(&e);
     rc |= write_seed(dir, "seed_backend.bin", 0x80, &e);
+    kdb_enc_reset(&e);        /* B7b: a SLAVE and a CONSUMER zone (no data), a primary around them; start inside a batch for the install run */
+    m_zone_begin(&e, 0, ZN, 4); m_zone_data(&e, 3, 1, 40); m_zone_data(&e, 1, 0, 20); m_zone_end(&e, 4);
+    m_zone_begin_kind(&e, 0, "s.test.", 0, KDB_ZK_SECONDARY); m_zone_end(&e, 0);
+    m_zone_begin_kind(&e, 1, "c.test.", 0, KDB_ZK_CATALOG); m_zone_end(&e, 0);
+    m_zone_begin_kind(&e, 0, "s.test.", 0, KDB_ZK_SECONDARY); m_zone_end(&e, 0);
+    m_zone_begin(&e, 0, "s.test.", 4); m_zone_data(&e, 3, 1, 40); m_zone_data(&e, 1, 0, 20); m_zone_end(&e, 4);
+    rc |= write_seed(dir, "seed_install_secondary.bin", 0xD0, &e);
     kdb_enc_reset(&e);
     m_hello(&e, 1); m_batch_begin(&e, 1);
     rc |= write_seed(dir, "seed_hello_batch_chunked.bin", 0x05, &e);

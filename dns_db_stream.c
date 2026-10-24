@@ -693,7 +693,13 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         break;
     case KDB_T_ZONE_BEGIN: {
         uint64_t n = m->u.zone_begin.rr_count;
-        if (n < 2) SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: rr_count %llu, an AXFR has at least two SOAs (RFC 5936 2.2)", (unsigned long long)n);
+        uint8_t zk = m->u.zone_begin.zone_kind;
+        if (zk == KDB_ZK_PRIMARY) {
+            if (n < 2) SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: rr_count %llu, an AXFR has at least two SOAs (RFC 5936 2.2)", (unsigned long long)n);
+        } else if (n != 0) {
+            /* B7b: a secondary / catalog consumer zone carries no data (the Backend transfers it from the masters in the settings) */
+            SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: a secondary zone has rr_count 0, not %llu", (unsigned long long)n);
+        }
         if (n > sm->lim.max_zone_records) SMFAIL(sm, KDB_E_LIMIT_RECORDS, "ZONE_BEGIN: rr_count above max-zone-records");
         sm->zone_rr_declared = n;
         sm->zone_rr_sum = 0;

@@ -296,6 +296,8 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
   zone_version_free(atomic_load_explicit(&entry->rcu.active, memory_order_relaxed));
   /* a DB zone's settings (the entry owns the current block; replaced ones go through zone_retire_object()) */
   free_zone_config((zone_config_t *)atomic_load_explicit(&entry->dbcfg, memory_order_relaxed));
+  /* the member ids of a catalog zone belong to its entry (a rebuild only copies the pointers while it runs) */
+  if (entry->catalog_members) free_catalog_member_ids(entry->catalog_members, entry->catalog_member_count);
   free(entry->catalog_master);
   free(entry->catalog_member_unique_id);
   free(entry->owning_catalog_domain);
@@ -1587,11 +1589,46 @@ int snapshot_apply_db_delta(void) {
             vs->entries = calloc(ov->zone_count + nadd ? ov->zone_count + nadd : 1, sizeof(zone_db_entry_t *));
             ok = vs->entries != NULL;
         }
+        /* B7b: a catalog consumer that leaves (its row was deleted or it became another kind of zone) takes the member zones it
+         * created with it, as a configured catalog zone's members go at the next reconfiguration */
+        bool drop_members = false;
+        for (size_t i = 0; ok && i < nrem; i++) {
+            if (rem[i]->catalog_member_count > 0) drop_members = true;
+            int p = 0;
+            while (p < g_pending_coo_count) {
+                if (strcasecmp(g_pending_coo[p].old_catalog, rem[i]->domain) == 0) {
+                    g_pending_coo[p] = g_pending_coo[g_pending_coo_count - 1];
+                    g_pending_coo_count--;
+                } else {
+                    p++;
+                }
+            }
+        }
         if (ok) {
             size_t k = 0;
             for (size_t i = 0; i < ov->zone_count; i++) {
                 zone_db_entry_t *e = ov->entries[i];
                 if (!e || (nrem && ptr_in_sorted(rem, nrem, e))) continue;
+                if (drop_members && e->is_catalog_member) {
+                    bool owned = false;
+                    for (size_t j = 0; j < nrem && !owned; j++)
+                        owned = rem[j]->catalog_member_count > 0 && strcasecmp(zone_entry_catalog_owner(e), rem[j]->domain) == 0;
+                    if (owned) {
+                        syslog(LOG_INFO, "[Catalog] Removed member '%s': its catalog zone '%s' left the database", e->domain,
+                               zone_entry_catalog_owner(e));
+                        /* D17-1: a DB zone of this name that the member hid comes back (unless the name is taken meanwhile) */
+                        dbreg_zone_t *hz = dbreg_catalog_hidden_zone_locked(vs->name, e->domain);
+                        if (hz && hz->entry != e) {
+                            dbreg_entry_ref(hz->entry);
+                            vs->entries[k++] = hz->entry;
+                            hz->shadowed = false;
+                            hz->shadow_by = DBREG_SH_NONE;
+                            syslog(LOG_NOTICE, "[DB] zone %s (view '%s') is served from the DB again: the catalog member is gone",
+                                   hz->name, vs->name);
+                        }
+                        continue;
+                    }
+                }
                 dbreg_entry_ref(e);
                 vs->entries[k++] = e;
             }
@@ -1761,10 +1798,17 @@ void dbreg_reset(void) {
 }
 
 zone_config_t *db_zone_config_new(const char *domain, zone_ext_shared_t *shared) {
+    return db_zone_config_new_kind(domain, shared, 0);
+}
+
+/* kind: 0 primary (type master), 1 secondary (type slave: the masters and the key are in the settings), 2 catalog consumer (type
+ * slave and catalog-zone, as a configured catalog zone; the members it lists are created by the catalog code) */
+zone_config_t *db_zone_config_new_kind(const char *domain, zone_ext_shared_t *shared, int kind) {
     zone_config_t *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
     c->domain = strdup(domain);
-    c->type = strdup("master");
+    c->type = strdup(kind == 0 ? "master" : "slave");
+    c->is_catalog = kind == 2;
     if (!c->domain || !c->type) {
         free_zone_config(c);
         return NULL;

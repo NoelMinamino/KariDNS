@@ -1693,7 +1693,7 @@ static const char *const k_bind_zone_options[] = {
   "max-journal-size", "max-records", "max-refresh-time", "max-retry-time", "max-transfer-idle-in", "max-transfer-idle-out",
   "max-transfer-time-in", "max-transfer-time-out", "max-zone-ttl", "min-refresh-time", "min-retry-time", "multi-master",
   "notify", "notify-delay", "notify-source-v6", "notify-to-soa", "nta-lifetime", "nta-recheck", "parental-agents",
-  "parental-source", "parental-source-v6", "primaries", "request-expire", "request-ixfr", "request-nsid",
+  "parental-source", "parental-source-v6", "request-expire", "request-ixfr", "request-nsid",
   "require-server-cookie", "send-report-channel", "serial-update-method", "server-addresses", "server-names",
   "sig-signing-nodes", "sig-signing-signatures", "sig-signing-type", "sig-validity-interval", "transfer-source",
   "transfer-source-v6", "try-tcp-refresh", "update-check-ksk", "update-policy", "use-alt-transfer-source",
@@ -1757,7 +1757,7 @@ static int unknown_statement(token_ctx_t *ctx, const char *kind, const char *nam
 static const char *const k_db_zone_statements[] = {
   "allow-transfer", "allow-update", "also-notify", "tsig-key", "notify-retries", "notify-retry-interval",
   "notify-retry-backoff", "ixfr-history", "additional-from-auth", "disable-auto-tc-flag", "zone-udp-bufsize",
-  "zone-tcp-mss", "zone-tcp-window", "zone-tcp-sndbuf", "transfer-acl-match", "update-acl-match", NULL
+  "zone-tcp-mss", "zone-tcp-window", "zone-tcp-sndbuf", "transfer-acl-match", "update-acl-match", "masters", "primaries", NULL
 };
 
 /* The statement `key` is about to be read in restricted mode: refuse it unless it is on the list, and forget what an
@@ -1798,6 +1798,13 @@ static bool restricted_statement(token_ctx_t *ctx, zone_ext_t *x, const char *ke
   } else if (strcmp(key, "tsig-key") == 0) {
     free(x->tsig_key);
     x->tsig_key = NULL;
+  } else if (strcmp(key, "masters") == 0 || strcmp(key, "primaries") == 0) {
+    for (int i = 0; i < x->masters_count; i++) free(x->masters[i].ip);
+    free(x->masters);
+    x->masters = NULL;
+    x->masters_count = 0;
+    free(x->masters_parsed);
+    x->masters_parsed = NULL;
   }
   return true;
 }
@@ -1888,7 +1895,7 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       free_zone_config(zone);
       return -1;
     }
-    if (strcmp(key, "masters") == 0) {
+    if (strcmp(key, "masters") == 0 || strcmp(key, "primaries") == 0) {
       if (parse_ip_port_list(ctx, &x->masters, &x->masters_count) !=
           0) {
         free(key);
@@ -2362,6 +2369,15 @@ zone_ext_shared_t *db_settings_parse(const char *text, size_t len, char *err, si
           db_set_err(err, errlen, "also-notify has an entry that is not an IP address");
           bad = err;
         }
+      for (int i = 0; !bad && i < ox->masters_count; i++)
+        if (!db_ip_literal_ok(ox->masters[i].ip)) {
+          db_set_err(err, errlen, "masters has an entry that is not an IP address");
+          bad = err;
+        }
+      if (!bad && ox->masters_count > 32) {
+        db_set_err(err, errlen, "masters has more than 32 entries");
+        bad = err;
+      }
       for (int i = 0; !bad && i < ox->tsig_keys_count; i++)
         if (!ox->tsig_keys[i] || !ox->tsig_keys[i][0]) {
           db_set_err(err, errlen, "allow-transfer has an empty key name");
@@ -2637,7 +2653,7 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     return 0;
   }
   if (strcmp(key, "acl-ceiling") == 0) {
-    /* addresses and "key" entries like allow-transfer; enforcement comes with milestone B7 */
+    /* addresses and "key" entries like allow-transfer (see zone_transfer_acl_allows(), dns_tsig_acl.c) */
     free_str_list(db->acl_ceiling, db->acl_ceiling_count);
     free(db->acl_ceiling_parsed);
     free_str_list(db->acl_ceiling_keys, db->acl_ceiling_keys_count);
@@ -2647,6 +2663,17 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     db->acl_ceiling_count = db->acl_ceiling_keys_count = 0;
     return parse_acl_list(ctx, &db->acl_ceiling, &db->acl_ceiling_count, ACL_KEY_AS_TSIG_FIELD,
                           &db->acl_ceiling_keys, &db->acl_ceiling_keys_count);
+  }
+  if (strcmp(key, "acl-ceiling-match") == 0) {
+    /* B7b: with both addresses and keys in acl-ceiling, "any" (default) lets a client in by either, "all" needs both */
+    char *v = NULL;
+    if (db_take_string(ctx, "database", key, 8, &v) != 0) { free(v); return -1; }
+    uint8_t m = strcasecmp(v, "any") == 0 ? ACL_MATCH_ANY : strcasecmp(v, "all") == 0 ? ACL_MATCH_ALL : ACL_MATCH_DEFAULT;
+    if (m == ACL_MATCH_DEFAULT) report_bad_value(ctx, NULL, key, v, "any or all");
+    free(v);
+    if (m == ACL_MATCH_DEFAULT) return -1;
+    db->acl_ceiling_match = m;
+    return 0;
   }
   if (strcmp(key, "alias-resolver") == 0) {
     free_str_list(db->alias_resolver, db->alias_resolver_count);

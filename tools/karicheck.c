@@ -1880,6 +1880,10 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
     if (db->acl_ceiling_count == 0 && db->acl_ceiling_keys_count == 0)
         kc_warning(&t, "database: no acl-ceiling; the ACLs of database zones (zone transfers, dynamic updates) refuse every "
                        "client until one is set (acl-ceiling { 192.0.2.0/24; key \"name\"; };)\n");
+    /* B7b: acl-ceiling-match all needs both kinds of entry to say anything; with one kind that kind decides, as with any */
+    else if (db->acl_ceiling_match == ACL_MATCH_ALL && (db->acl_ceiling_count == 0 || db->acl_ceiling_keys_count == 0))
+        kc_warning(&t, "database: acl-ceiling-match all has no effect: acl-ceiling lists only %s, and that kind alone decides\n",
+                   db->acl_ceiling_count == 0 ? "keys" : "addresses");
 
     /* sources */
     if (sqlite) {

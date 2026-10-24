@@ -1171,6 +1171,138 @@ static void test_kdb(void) {
     }
 }
 
+/* ------------------------------------------------------------------ B7b: SLAVE and CONSUMER zones */
+static pdns_zone_t *build_sec(uint8_t kind, const char *master, const db_meta_row_t *meta, size_t nm) {
+    pdns_zone_t *z = pdns_zone_new("s.test", NULL);
+    CHECK(z != NULL);
+    CHECK(pdns_zone_set_secondary(z, kind, master) == 0);
+    for (size_t i = 0; i < nm; i++) pdns_zone_add_meta(z, &meta[i]);
+    pdns_zone_finish(z);
+    return z;
+}
+
+static void sec_digest(const pdns_zone_t *z, uint8_t out[KDB_DIGEST_LEN], uint32_t *serial) {
+    gate_seen_t g = { 0, 0, { 0 }, 1 };
+    pdns_kdb_params_t p = { 0, 7, KDB_ZK_PRIMARY, NULL, test_gate, &g, NULL };
+    char err[200];
+    rt_buf_t nb = {0};
+    CHECK(pdns_zone_encode_kdb(z, &p, rt_emit, &nb, err, sizeof(err)) == 1 && g.calls == 1);
+    memcpy(out, g.digest, KDB_DIGEST_LEN);
+    if (serial) *serial = g.serial;
+}
+
+static void test_secondary(void) {
+    printf("SLAVE / CONSUMER zones (B7b): domains.master, settings, KDB1 without data, digest\n");
+    struct { const char *master, *want; } ok[] = {
+        { "192.0.2.1", "masters { 192.0.2.1; };" },
+        { "192.0.2.1:5353", "masters { 192.0.2.1 port 5353; };" },
+        { "[2001:db8::1]:5353", "masters { 2001:db8::1 port 5353; };" },
+        { "2001:db8::1", "masters { 2001:db8::1; };" },
+        { "[2001:db8::1]", "masters { 2001:db8::1; };" },
+        { "192.0.2.1,192.0.2.2:53", "masters { 192.0.2.1; 192.0.2.2 port 53; };" },
+        { " 192.0.2.1 , 2001:db8::2 \t192.0.2.1 ", "masters { 192.0.2.1; 2001:db8::2; };" },     /* blanks tolerated, a repeated address once */
+    };
+    for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
+        pdns_zone_t *z = build_sec(KDB_ZK_SECONDARY, ok[i].master, NULL, 0);
+        CHECK_MSG(!z->failed, "%s: %s", ok[i].master, z->error);
+        CHECK_STR(z->settings, ok[i].want);
+        char err[200];
+        zone_ext_shared_t *sh = db_settings_parse(z->settings, strlen(z->settings), err, sizeof(err));
+        CHECK_MSG(sh != NULL, "%s: %s", ok[i].want, err);
+        if (sh) zone_ext_shared_unref(sh);
+        pdns_zone_free(z);
+    }
+    const char *bad[] = { NULL, "", "   ", ",", "ns1.example.net", "192.0.2.1,ns1.example.net", "192.0.2.1:0", "192.0.2.1:65536", "192.0.2.1:x",
+                          "[2001:db8::1", "[2001:db8::1]:", "[192.0.2.1]:53", "2001:db8::1:53x", "192.0.2.1;",
+                          "192.0.2.1 }; file \"/etc/passwd\"; masters {", "fe80::1%em0" };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        pdns_zone_t *z = build_sec(KDB_ZK_SECONDARY, bad[i], NULL, 0);
+        CHECK_MSG(z->failed, "master %s was accepted", bad[i] ? bad[i] : "(NULL)");
+        CHECK_HAS(z->error, "zone 's.test.'");
+        CHECK_HAS(z->error, "domains.master");
+        pdns_zone_free(z);
+    }
+    {   /* more than 16 masters: the rest is ignored with a warning */
+        char many[600] = "";
+        for (int i = 1; i <= 20; i++) {
+            char one[24];
+            snprintf(one, sizeof(one), "%s192.0.2.%d", i > 1 ? "," : "", i);
+            strcat(many, one);
+        }
+        pdns_zone_t *z = build_sec(KDB_ZK_SECONDARY, many, NULL, 0);
+        CHECK(!z->failed && z->n_warnings == 1);
+        CHECK_HAS(z->settings, "192.0.2.16;");
+        CHECK(strstr(z->settings, "192.0.2.17") == NULL);
+        pdns_zone_free(z);
+    }
+    {   /* the key, the usual settings and a profile ride along; the records of a SLAVE are not needed (no SOA row either) */
+        db_meta_row_t m[] = { M("AXFR-MASTER-TSIG", "k1"), M("ALLOW-AXFR-FROM", "192.0.2.9"), M("ALSO-NOTIFY", "192.0.2.50:5353"),
+                              M("X-KARIDNS-PROFILE", "p1"), M("PRESIGNED", "1") };
+        pdns_zone_t *z = build_sec(KDB_ZK_CATALOG, "192.0.2.1", m, 5);
+        CHECK_MSG(!z->failed, "%s", z->error);
+        CHECK_STR(z->settings, "masters { 192.0.2.1; }; tsig-key \"k1\"; allow-transfer { 192.0.2.9; }; also-notify { 192.0.2.50 port 5353; };");
+        CHECK(z->profile[0] == 'p' && z->serial == 0);
+        char err[200];
+        zone_ext_shared_t *sh = db_settings_parse(z->settings, strlen(z->settings), err, sizeof(err));
+        CHECK_MSG(sh != NULL, "%s", err);
+        if (sh) {
+            CHECK(sh->ext.masters_count == 1 && sh->ext.tsig_key && strcmp(sh->ext.tsig_key, "k1") == 0 && sh->ext.allow_transfer_count == 1);
+            zone_ext_shared_unref(sh);
+        }
+        /* KDB1: ZONE_BEGIN (catalog kind, serial 0, flags 0, rr_count 0, the settings, the profile) and ZONE_END, nothing between */
+        rt_buf_t b = {0};
+        pdns_kdb_params_t kp = { 3, 77, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL };       /* the zone's own kind wins */
+        CHECK(pdns_zone_encode_kdb(z, &kp, rt_emit, &b, err, sizeof(err)) == 0 && b.n_msgs == 2);
+        static uint8_t fb[KDB_MAX_BODY];
+        kdb_framer_t f;
+        kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
+        CHECK(kdb_framer_feed(&f, b.buf, b.len) == KDB_OK);
+        kdb_frame_t fr;
+        kdb_msg_t msg;
+        char why[200];
+        CHECK(kdb_framer_next(&f, &fr) == KDB_OK && fr.type == KDB_T_ZONE_BEGIN && kdb_decode(&fr, KDB_VIEWS_ANY, &msg, why, sizeof(why)) == KDB_OK);
+        CHECK(msg.u.zone_begin.view == 3 && msg.u.zone_begin.source_id == 77 && msg.u.zone_begin.zone_kind == KDB_ZK_CATALOG);
+        CHECK(msg.u.zone_begin.serial == 0 && msg.u.zone_begin.flags == 0 && msg.u.zone_begin.rr_count == 0);
+        CHECK(msg.u.zone_begin.settings.len == strlen(z->settings) && memcmp(msg.u.zone_begin.settings.p, z->settings, strlen(z->settings)) == 0);
+        CHECK(msg.u.zone_begin.profile.len == 2);
+        CHECK(kdb_framer_next(&f, &fr) == KDB_OK && fr.type == KDB_T_ZONE_END && kdb_decode(&fr, KDB_VIEWS_ANY, &msg, why, sizeof(why)) == KDB_OK);
+        CHECK(msg.u.zone_end.rr_count == 0 && kdb_framer_next(&f, &fr) == KDB_MORE);
+        free(b.buf);
+        pdns_zone_free(z);
+    }
+    {   /* the digest covers the settings: masters, key, kind, profile and ACLs change it; the same input gives the same digest */
+        uint8_t d0[KDB_DIGEST_LEN], d1[KDB_DIGEST_LEN];
+        db_meta_row_t k1[] = { M("AXFR-MASTER-TSIG", "k1") }, k2[] = { M("AXFR-MASTER-TSIG", "k2") }, acl[] = { M("ALLOW-AXFR-FROM", "192.0.2.9") },
+                      pr[] = { M("X-KARIDNS-PROFILE", "p1") };
+        pdns_zone_t *za = build_sec(KDB_ZK_SECONDARY, "192.0.2.1", NULL, 0), *zb = build_sec(KDB_ZK_SECONDARY, "192.0.2.1", NULL, 0);
+        uint32_t ser = 9;
+        sec_digest(za, d0, &ser);
+        CHECK(ser == 0);
+        sec_digest(zb, d1, NULL);
+        CHECK(memcmp(d0, d1, KDB_DIGEST_LEN) == 0);
+        pdns_zone_t *others[] = { build_sec(KDB_ZK_SECONDARY, "192.0.2.2", NULL, 0), build_sec(KDB_ZK_SECONDARY, "192.0.2.1:5353", NULL, 0),
+                                  build_sec(KDB_ZK_CATALOG, "192.0.2.1", NULL, 0), build_sec(KDB_ZK_SECONDARY, "192.0.2.1", k1, 1),
+                                  build_sec(KDB_ZK_SECONDARY, "192.0.2.1", k2, 1), build_sec(KDB_ZK_SECONDARY, "192.0.2.1", acl, 1),
+                                  build_sec(KDB_ZK_SECONDARY, "192.0.2.1", pr, 1) };
+        for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); i++) {
+            sec_digest(others[i], d1, NULL);
+            CHECK_MSG(memcmp(d0, d1, KDB_DIGEST_LEN) != 0, "variant %zu has the digest of the plain zone", i);
+            for (size_t j = 0; j < i; j++) {
+                uint8_t dj[KDB_DIGEST_LEN];
+                sec_digest(others[j], dj, NULL);
+                CHECK_MSG(memcmp(dj, d1, KDB_DIGEST_LEN) != 0, "variants %zu and %zu share a digest", i, j);
+            }
+        }
+        for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); i++) pdns_zone_free(others[i]);
+        pdns_zone_free(za);
+        pdns_zone_free(zb);
+        /* a primary zone has no masters statement even when it has the key */
+        pdns_zone_t *zp = build(NULL, 0, k1, 1, NULL);
+        CHECK(!zp->failed && strstr(zp->settings, "masters") == NULL);
+        pdns_zone_free(zp);
+    }
+}
+
 /* ------------------------------------------------------------------ zone2sql */
 /* D17-4 (found by the B4b file vs DB comparison of the lab zones, MINFO; RP / AFSDB / RT / KX and others answered in lower
  * case too): the RDATA names keep the case as written (RFC 4343 s2-s4) in the KDB1 stream and in the file zone alike;
@@ -1419,6 +1551,7 @@ int main(int argc, char **argv) {
     test_isolation();
     test_metadata();
     test_kdb();
+    test_secondary();
     test_kdb_name_case();
     test_zone2sql();
     test_zone_files();

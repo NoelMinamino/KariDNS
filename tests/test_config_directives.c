@@ -49,6 +49,11 @@ static int g_failed = 0;
     if (!(cond)) { g_failed++; printf("  [FAIL] %s:%d: %s\n", __FILE__, __LINE__, #cond); } \
 } while (0)
 
+#define CHECK_MSG(cond, ...) do { \
+    g_checks++; \
+    if (!(cond)) { g_failed++; printf("  [FAIL] %s:%d: %s: ", __FILE__, __LINE__, #cond); printf(__VA_ARGS__); printf("\n"); } \
+} while (0)
+
 #define CHECK_STR(actual, expected) do { \
     g_checks++; \
     const char *a_ = (actual); const char *e_ = (expected); \
@@ -1908,8 +1913,7 @@ static void test_db_settings_and_acl_match(void) {
     /* ... and refuses everything else */
     expect_db_reject("file \"/etc/passwd\";", "not allowed");
     expect_db_reject("type slave;", "not allowed");
-    expect_db_reject("masters { 192.0.2.1; };", "not allowed");
-    expect_db_reject("primaries { 192.0.2.1; };", "not allowed");
+    /* (masters and primaries are accepted since B7b: test_acl_ceiling_match_and_masters) */
     expect_db_reject("program \"/bin/sh\";", "not allowed");
     expect_db_reject("program-args { \"-c\"; };", "not allowed");
     expect_db_reject("program-user \"root\";", "not allowed");
@@ -2083,6 +2087,117 @@ static void test_db_settings_and_acl_match(void) {
     }
 }
 
+/* ------------------------------------------------------------------------ */
+/* B7b: acl-ceiling-match (any = address OR key, all = address AND key; one kind of entry: that kind decides), and
+ * masters / primaries in the settings of a database zone (a SLAVE / CONSUMER) and in zone { } of karidns.conf */
+static void test_acl_ceiling_match_and_masters(void) {
+    printf("[TEST] acl-ceiling-match, masters / primaries in DB settings and in zones...\n");
+    char txt[2048];
+    server_config_t cfg;
+    if (parse_ok("options { database { driver sqlite3; database-file \"/x.db\"; }; };", &cfg)) {
+        CHECK(cfg.database.acl_ceiling_match == ACL_MATCH_DEFAULT);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { database { driver sqlite3; database-file \"/x.db\"; acl-ceiling-match all; }; };", &cfg)) {
+        CHECK(cfg.database.acl_ceiling_match == ACL_MATCH_ALL);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { database { driver sqlite3; database-file \"/x.db\"; acl-ceiling-match ANY; }; };", &cfg)) {
+        CHECK(cfg.database.acl_ceiling_match == ACL_MATCH_ANY);
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("acl-ceiling-match both", "options { database { driver sqlite3; database-file \"/x.db\"; acl-ceiling-match both; }; };");
+    expect_reject("acl-ceiling-match no value", "options { database { driver sqlite3; database-file \"/x.db\"; acl-ceiling-match; }; };");
+
+    /* evaluation: ceiling { 192.0.2.0/24; key xfr; } with any / all, and ceilings with one kind of entry */
+    static const char *const ceil_any = "acl-ceiling { 192.0.2.0/24; key \"xfr\"; };";
+    struct { const char *ceiling_stmt; const char *mode; } v[] = {
+        { ceil_any, "" }, { ceil_any, "acl-ceiling-match any;" }, { ceil_any, "acl-ceiling-match all;" },
+        { "acl-ceiling { 192.0.2.0/24; };", "acl-ceiling-match all;" }, { "acl-ceiling { key \"xfr\"; };", "acl-ceiling-match all;" },
+        { "acl-ceiling { 192.0.2.0/24; };", "" }, { "acl-ceiling { key \"xfr\"; };", "" },
+    };
+    for (size_t i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
+        snprintf(txt, sizeof(txt), "key \"xfr\" { algorithm hmac-sha256; secret \"%s\"; }; key \"oth\" { algorithm hmac-sha256; secret \"%s\"; };"
+                 "options { database { driver sqlite3; database-file \"/x.db\"; %s %s }; };", SECRET_OK, SECRET_OK, v[i].ceiling_stmt, v[i].mode);
+        server_config_t c;
+        if (!parse_ok(txt, &c)) continue;
+        zone_config_t *z = db_zone_from("allow-transfer { any; };");        /* the zone's own ACL lets everybody in: the ceiling decides */
+        bool all = strstr(v[i].mode, "all") != NULL;
+        bool both = strstr(v[i].ceiling_stmt, "192.0.2") && strstr(v[i].ceiling_stmt, "key");
+        bool has_addr = strstr(v[i].ceiling_stmt, "192.0.2") != NULL, has_key = strstr(v[i].ceiling_stmt, "key") != NULL;
+        bool in_addr_only = z && zone_transfer_acl_allows(&c, z, "192.0.2.9", NULL);                 /* address inside, no key */
+        bool in_key_only = z && zone_transfer_acl_allows(&c, z, "198.51.100.9", "xfr");              /* address outside, ceiling key */
+        bool in_both = z && zone_transfer_acl_allows(&c, z, "192.0.2.9", "xfr");
+        bool in_neither = z && zone_transfer_acl_allows(&c, z, "198.51.100.9", NULL);
+        bool in_other_key = z && zone_transfer_acl_allows(&c, z, "198.51.100.9", "oth");
+        bool in_addr_other_key = z && zone_transfer_acl_allows(&c, z, "192.0.2.9", "oth");
+        bool and_mode = all && both;
+        CHECK_MSG(in_both, "variant %zu: inside by both", i);
+        CHECK_MSG(!in_neither && !in_other_key, "variant %zu: outside", i);
+        CHECK_MSG(in_addr_only == (has_addr && !and_mode), "variant %zu: address only -> %d", i, (int)in_addr_only);
+        CHECK_MSG(in_key_only == (has_key && !and_mode), "variant %zu: key only -> %d", i, (int)in_key_only);
+        CHECK_MSG(in_addr_other_key == (has_addr && !and_mode), "variant %zu: address and a key the ceiling does not list -> %d", i, (int)in_addr_other_key);
+        free_zone_config(z);
+        /* the same for updates, and a zone ACL narrower than the ceiling stays narrower */
+        z = db_zone_from("allow-update { 192.0.2.0/24; };");
+        CHECK_MSG(z && zone_update_acl_allows(&c, z, "192.0.2.9", "xfr"), "variant %zu: update by both", i);
+        CHECK_MSG(z && zone_update_acl_allows(&c, z, "192.0.2.9", NULL) == (has_addr && !and_mode), "variant %zu: update by address", i);
+        free_zone_config(z);
+        z = db_zone_from("allow-transfer { 203.0.113.0/24; };");
+        CHECK_MSG(z && !zone_transfer_acl_allows(&c, z, "192.0.2.9", "xfr"), "variant %zu: the zone's ACL does not list it", i);
+        CHECK_MSG(z && zone_transfer_acl_allows(&c, z, "203.0.113.9", "xfr") == (has_key && !and_mode ? true : and_mode ? false : false),
+                  "variant %zu: ACL address outside the address part of the ceiling", i);
+        free_zone_config(z);
+        free_server_config_fields(&c);
+    }
+
+    /* masters and primaries in the restricted settings text */
+    char err[200];
+    zone_ext_shared_t *sh = db_parse_quiet("masters { 192.0.2.1 port 5300; 2001:db8::1; }; tsig-key \"k\";", err, sizeof(err));
+    CHECK(sh && sh->ext.masters_count == 2 && sh->ext.masters[0].port == 5300 && sh->ext.masters[1].port == 53 && sh->ext.masters_parsed);
+    if (sh) zone_ext_shared_unref(sh);
+    sh = db_parse_quiet("primaries { 192.0.2.7; };", err, sizeof(err));
+    CHECK(sh && sh->ext.masters_count == 1 && strcmp(sh->ext.masters[0].ip, "192.0.2.7") == 0);
+    if (sh) zone_ext_shared_unref(sh);
+    /* a later statement replaces an earlier one (a profile first, the zone after it), masters and primaries are one statement */
+    sh = db_parse_quiet("masters { 192.0.2.1; 192.0.2.2; }; primaries { 192.0.2.9 port 54; };", err, sizeof(err));
+    CHECK(sh && sh->ext.masters_count == 1 && strcmp(sh->ext.masters[0].ip, "192.0.2.9") == 0 && sh->ext.masters[0].port == 54);
+    if (sh) zone_ext_shared_unref(sh);
+    expect_db_reject("masters { ns1.example.net; };", "not an IP address");
+    expect_db_reject("masters { 192.0.2.1 port 0; };", NULL);
+    expect_db_reject("masters { 192.0.2.1 port 99999; };", NULL);
+    expect_db_reject("masters { 192.0.2.1 }; ", NULL);
+    expect_db_reject("masters { 192.0.2.1; ", NULL);
+    expect_db_reject("masters 192.0.2.1;", NULL);
+    {
+        char many[1200] = "masters {";
+        for (int i = 1; i <= 33; i++) {
+            char one[24];
+            snprintf(one, sizeof(one), " 192.0.2.%d;", i);
+            strcat(many, one);
+        }
+        strcat(many, " };");
+        expect_db_reject(many, "more than 32");
+        sh = db_parse_quiet(many + 0, err, sizeof(err));
+        CHECK(sh == NULL);
+        strcpy(strstr(many, " 192.0.2.33;"), " };");
+        sh = db_parse_quiet(many, err, sizeof(err));
+        CHECK(sh && sh->ext.masters_count == 32);
+        if (sh) zone_ext_shared_unref(sh);
+    }
+    expect_db_reject("type slave; masters { 192.0.2.1; };", "statement 'type' is not allowed");
+    expect_db_reject("masters { 192.0.2.1; }; file \"/etc/passwd\";", "statement 'file' is not allowed");
+
+    /* karidns.conf: primaries is the BIND 9.16+ name of masters */
+    if (parse_ok("zone \"s.test\" { type secondary; primaries { 192.0.2.1 port 5353; }; };"
+                 "zone \"t.test\" { type slave; masters { 192.0.2.2; }; };", &cfg)) {
+        const zone_config_t *s = first_zone(&cfg), *t = s ? s->next : NULL;
+        CHECK(s && zext(s)->masters_count == 1 && zext(s)->masters[0].port == 5353 && strcmp(zext(s)->masters[0].ip, "192.0.2.1") == 0);
+        CHECK(t && zext(t)->masters_count == 1 && strcmp(zext(t)->masters[0].ip, "192.0.2.2") == 0);
+        free_server_config_fields(&cfg);
+    }
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
     test_defaults();
@@ -2117,6 +2232,7 @@ int main(void) {
     test_zone_ext_layout();
     test_zone_flat_list_removed();
     test_db_settings_and_acl_match();
+    test_acl_ceiling_match_and_masters();
 
     printf("[*] %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) {

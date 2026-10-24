@@ -45,7 +45,8 @@ cleanup() {
     LP2=$(pgrep -P "${SRV:-0}" -f 'karidns-dbloader -s 3' 2>/dev/null | head -1)
     [ -n "$LP2" ] && kill -CONT "$LP2" 2>/dev/null
     [ -n "$SRV" ] && kill -TERM "$SRV" 2>/dev/null
-    sleep 1
+    # wait for the manager (it stops its children first; a sanitizer build is slow): a KILL too early orphans them
+    i=0; while [ -n "$SRV" ] && [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     [ -n "$SRV" ] && kill -KILL "$SRV" 2>/dev/null
     rm -rf "$T"
 }

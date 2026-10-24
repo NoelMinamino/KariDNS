@@ -20,7 +20,13 @@
  *   soa-subdomain    the first SOA belongs to sub.bad.test, not the apex                -> zone rejected
  *   trailing-rr      a record after the closing SOA                                     -> zone rejected
  *   later-message    a record in a second ZONE_DATA after the closing SOA               -> zone rejected
- *   secondary-kind   zone_kind secondary (not supported yet)                            -> zone rejected
+ *   secondary-kind   zone_kind secondary, rr_count 0, no settings (B7b: no masters)              -> zone rejected
+ *   secondary-data   zone_kind secondary with rr_count 2 and ZONE_DATA                           -> protocol error
+ *   secondary-flag   zone_kind secondary with the presigned flag                                 -> zone rejected
+ *   secondary-host   secondary whose masters statement names a host name                         -> zone rejected
+ *   secondary-prim   a primary zone whose settings name masters                                   -> zone rejected
+ *   secondary-ok     secondary with masters { 127.0.0.1 port 1; } (the transfer fails, the zone is registered) -> applied
+ *   catalog-ok       zone_kind catalog (a CONSUMER) with masters                                  -> applied
  *   extended-flag    the extended-attributes flag (not supported yet)                   -> zone rejected
  *   non-in-class     an RR of class CH                                                  -> zone rejected
  *   again            ok1.test twice in one batch (the second replaces the first)       -> both applied
@@ -260,8 +266,21 @@ static void bad_zone(int fd, const char *mode) {
         dm_init(&m2); dm_a(&m2, "www.bad.test", 1);
         zone_begin(fd, z, 0, 0, 3, 0); zone_data(fd, &m); zone_data(fd, &m2); zone_end(fd, 3);
     } else if (strcmp(mode, "secondary-kind") == 0) {
+        zone_begin(fd, z, 1, 0, 0, 0); zone_end(fd, 0);
+    } else if (strcmp(mode, "secondary-data") == 0) {
         dm_soa(&m, z, 5); dm_soa(&m, z, 5);
-        zone_begin(fd, z, 1, 0, 2, 0); zone_data(fd, &m); zone_end(fd, 2);
+        zone_begin_ex(fd, z, 1, 0, 2, 0, "masters { 192.0.2.1; };", NULL); zone_data(fd, &m); zone_end(fd, 2);
+    } else if (strcmp(mode, "secondary-flag") == 0) {
+        zone_begin_ex(fd, z, 1, 1, 0, 0, "masters { 192.0.2.1; };", NULL); zone_end(fd, 0);
+    } else if (strcmp(mode, "secondary-host") == 0) {
+        zone_begin_ex(fd, z, 1, 0, 0, 0, "masters { ns1.example.net; };", NULL); zone_end(fd, 0);
+    } else if (strcmp(mode, "secondary-prim") == 0) {
+        dm_soa(&m, z, 5); dm_a(&m, "www.bad.test", 1); dm_soa(&m, z, 5);
+        zone_begin_ex(fd, z, 0, 0, 3, 0, "masters { 192.0.2.1; };", NULL); zone_data(fd, &m); zone_end(fd, 3);
+    } else if (strcmp(mode, "secondary-ok") == 0) {
+        zone_begin_ex(fd, z, 1, 0, 0, 0, "masters { 127.0.0.1 port 1; 2001:db8::1; }; ixfr-history 3;", NULL); zone_end(fd, 0);
+    } else if (strcmp(mode, "catalog-ok") == 0) {
+        zone_begin_ex(fd, z, 2, 0, 0, 0, "masters { 127.0.0.1 port 1; };", NULL); zone_end(fd, 0);
     } else if (strcmp(mode, "extended-flag") == 0) {
         dm_soa(&m, z, 5); dm_soa(&m, z, 5);
         zone_begin(fd, z, 0, 2, 2, 0); zone_data(fd, &m); zone_end(fd, 2);

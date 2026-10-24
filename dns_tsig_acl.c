@@ -83,10 +83,16 @@ static bool addr_list_match(const char *client_ip, char **list, const acl_entry_
 static bool ceiling_allows(const server_config_t *cfg, const char *client_ip, const char *key_name) {
     if (!db_acl_ceiling_configured(cfg)) return false;
     const database_config_t *d = &cfg->database;
-    if (client_ip && addr_list_match(client_ip, d->acl_ceiling, d->acl_ceiling_parsed, d->acl_ceiling_count)) return true;
-    for (int i = 0; key_name && i < d->acl_ceiling_keys_count; i++)
-        if (tsig_key_names_equal(key_name, d->acl_ceiling_keys[i])) return true;
-    return false;
+    bool addr_in = client_ip && addr_list_match(client_ip, d->acl_ceiling, d->acl_ceiling_parsed, d->acl_ceiling_count);
+    bool key_in = false;
+    for (int i = 0; key_name && i < d->acl_ceiling_keys_count && !key_in; i++)
+        key_in = tsig_key_names_equal(key_name, d->acl_ceiling_keys[i]);
+    /* acl-ceiling-match all (B7b): both kinds of entry must match, so a request must come from a listed address and be
+     * signed with a listed key (BIND's ACLs cannot say that).  With only one kind listed that kind decides, and so it does
+     * for "any", which is the meaning B7a had. */
+    if (d->acl_ceiling_match == ACL_MATCH_ALL && d->acl_ceiling_count > 0 && d->acl_ceiling_keys_count > 0)
+        return addr_in && key_in;
+    return addr_in || key_in;
 }
 
 bool zone_transfer_acl_allows(const server_config_t *cfg, const zone_config_t *zcfg, const char *client_ip,

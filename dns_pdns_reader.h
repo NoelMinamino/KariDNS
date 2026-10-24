@@ -149,6 +149,8 @@ typedef struct pdns_zone_s {
     size_t n_ents, ents_cap;
     char *settings;                 /* settings text (design 3.5), "" when the metadata give none */
     char profile[256];              /* X-KARIDNS-PROFILE, "" if none */
+    uint8_t zkind;                  /* B7b: KDB_ZK_PRIMARY (0, rows), KDB_ZK_SECONDARY (SLAVE) or KDB_ZK_CATALOG (CONSUMER): no rows */
+    char *master;                   /* B7b: domains.master of such a zone (private copy) */
     char *nsec3param;               /* NSEC3PARAM metadata (first row), NULL if none */
     presigned_mode_t presigned_mode;   /* PS_NSEC3 / PS_NSEC: the chain was rebuilt; PS_NONE: served as stored */
     size_t n_synth;                 /* records presigned_rebuild() added at the end of arena.records */
@@ -171,6 +173,13 @@ void pdns_zone_free(pdns_zone_t *z);
 /* The canonical absolute name pdns_zone_new() gives a zone called dbname (domains.name); false if that would be a failed zone
  * (empty, root, bad escape, label or name too long).  out: DNS_NAME_TEXT_SIZE bytes. */
 bool pdns_canonical_zone_name(const char *dbname, char out[DNS_NAME_TEXT_SIZE]);
+
+/* B7b: make the zone a SLAVE (kind KDB_ZK_SECONDARY) or a CONSUMER (KDB_ZK_CATALOG) before pdns_zone_finish(); master is
+ * domains.master (NULL if the column is NULL).  Rows of `records` are then not needed (pdns_zone_add_record() is not called
+ * by the loader); pdns_zone_finish() only converts the metadata and puts `masters { ... };` (every address of domains.master,
+ * PowerDNS syntax ip, ip:port, [ip]:port, comma separated) in front of the settings text, and fails a zone without a usable
+ * master.  Returns -1 on out of memory. */
+int pdns_zone_set_secondary(pdns_zone_t *z, uint8_t kind, const char *master);
 
 /* One row of `records` (the driver passes them in records.id order).  0 = accepted or skipped; -1 = the zone has
  * failed (z->error says why; later calls return -1 at once, so a driver callback can stop its scan). */
@@ -223,6 +232,9 @@ typedef int (*pdns_emit_fn)(void *ud, const uint8_t *msg, size_t len);
  *               a marker and the length-prefixed settings text, profile name and profile text (B7a: a metadata-only
  *               edit changes the digest); two loaders on the same rows send the same digest
  *   flags       bit0 presigned.  Extended AXFR attributes (tags, tinydns) are B8.
+ *   B7b         a zone made secondary by pdns_zone_set_secondary() is encoded as ZONE_BEGIN (zone_kind secondary / catalog, serial 0,
+ *               flags 0, rr_count 0, the settings text with the masters) and ZONE_END (0): no ZONE_DATA.  Its digest covers the
+ *               settings text, the profile name and the profile text only, so a loader that restarts finds the zone up to date.
  * Returns 1 (nothing emitted) when p->gate asked to skip the zone.
  *
  * Fails (-1, *err filled) for a tinydns zone, for an RR that does not fit a message, and above max_zone_bytes. */

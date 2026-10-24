@@ -95,6 +95,63 @@ static bool has_word(const char *text, const char *w) {
     return false;
 }
 
+/* the rows of the input into a zone (the buffer is modified: separators become NUL) */
+static void feed_rows(pdns_zone_t *z, char *buf, size_t size) {
+    size_t pos = 0, nrows = 0;
+    while (pos <= size && nrows < MAX_ROWS) {
+        char *row = buf + pos;
+        size_t rend = pos;
+        while (rend < size && (uint8_t)buf[rend] != 0x1E) rend++;
+        buf[rend] = '\0';
+        char *kind = row, *content = (char *)"";
+        char *q = row;
+        while (*q && (uint8_t)*q != 0x1F) q++;
+        if ((uint8_t)*q == 0x1F) {
+            *q = '\0';
+            content = q + 1;
+            for (char *r = content; *r; r++)
+                if ((uint8_t)*r == 0x1F) *r = ' ';
+        }
+        db_meta_row_t m = { 1, kind, content };
+        pdns_zone_add_meta(z, &m);
+        nrows++;
+        pos = rend + 1;
+    }
+}
+
+/* B7b: a SLAVE / CONSUMER zone made of the same rows, with the content of the first row as domains.master (hostile text).
+ * When it converts, the Backend's restricted parse must take its settings and find at least one master. */
+static void check_secondary(const uint8_t *data, size_t size) {
+    char *buf = malloc(size + 1);
+    if (!buf) return;
+    memcpy(buf, data, size);
+    buf[size] = '\0';
+    char *master = buf;
+    for (char *q = buf; *q; q++)
+        if ((uint8_t)*q == 0x1F) { master = q + 1; break; }
+    for (char *q = master; *q; q++)
+        if ((uint8_t)*q == 0x1E) { *q = '\0'; break; }
+    char *mcopy = strdup(master);
+    memcpy(buf, data, size);                      /* feed_rows() needs the separators */
+    buf[size] = '\0';
+    pdns_zone_t *z = pdns_zone_new("z.test", NULL);
+    if (z && mcopy && pdns_zone_set_secondary(z, (size & 1) ? KDB_ZK_SECONDARY : KDB_ZK_CATALOG, mcopy) == 0) {
+        feed_rows(z, buf, size);
+        if (pdns_zone_finish(z) == 0) {
+            const char *s = z->settings;
+            if (!s || strlen(s) > PDNS_MAX_SETTINGS || !has_word(s, "masters")) __builtin_trap();
+            char err[200];
+            zone_ext_shared_t *sh = db_settings_parse(s, strlen(s), err, sizeof(err));
+            if (!sh || sh->ext.masters_count < 1 || sh->ext.masters_count > 32) __builtin_trap();
+            zone_ext_shared_unref(sh);
+            check_restricted(s, strlen(s), true);
+        }
+    }
+    pdns_zone_free(z);
+    free(mcopy);
+    free(buf);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size < 1 || size > (1u << 16)) return 0;
     char *buf = malloc(size + 1);
@@ -123,26 +180,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     soa.content = "ns.z.test hostmaster.z.test 1 7200 3600 1209600 300";
     pdns_zone_add_record(z, &soa);
 
-    size_t pos = 0, nrows = 0;
-    while (pos <= size && nrows < MAX_ROWS) {
-        char *row = buf + pos;
-        size_t rend = pos;
-        while (rend < size && (uint8_t)buf[rend] != 0x1E) rend++;
-        buf[rend] = '\0';
-        char *kind = row, *content = (char *)"";
-        char *q = row;
-        while (*q && (uint8_t)*q != 0x1F) q++;
-        if ((uint8_t)*q == 0x1F) {
-            *q = '\0';
-            content = q + 1;
-            for (char *r = content; *r; r++)
-                if ((uint8_t)*r == 0x1F) *r = ' ';
-        }
-        db_meta_row_t m = { 1, kind, content };
-        pdns_zone_add_meta(z, &m);
-        nrows++;
-        pos = rend + 1;
-    }
+    feed_rows(z, buf, size);
     if (pdns_zone_finish(z) == 0) {
         const char *s = z->settings;
         if (!s || strlen(s) > PDNS_MAX_SETTINGS) __builtin_trap();
@@ -164,5 +202,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
     pdns_zone_free(z);
     free(buf);
+    check_secondary(data, size);
     return 0;
 }

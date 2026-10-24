@@ -651,6 +651,8 @@ void db_entry_retire_config(zone_db_entry_t *entry, const zone_config_t *old, ui
 /* A zone_config_t for a DB zone: type "master", the zone name, and (B7a) the interned settings `shared` (may be NULL:
  * no options); the zone takes its own reference of shared. */
 zone_config_t *db_zone_config_new(const char *domain, zone_ext_shared_t *shared);
+/* B7b: kind 0 primary, 1 secondary (a SLAVE), 2 catalog consumer (a CONSUMER) */
+zone_config_t *db_zone_config_new_kind(const char *domain, zone_ext_shared_t *shared, int kind);
 /* Interned settings of DB zones (B7a, design 4.2).  The key is what makes two settings the same (profile name, profile text,
  * zone text).  find: a new reference of the object with this key, or NULL.  intern: enters `fresh` (refs 1, hash and key
  * set) into the table, or, when an equal object is there already, drops fresh and returns that one; the result carries a

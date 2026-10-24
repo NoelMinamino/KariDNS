@@ -252,6 +252,17 @@ pdns_zone_t *pdns_zone_new(const char *zone_name, const pdns_opts_t *opts) {
     return z;
 }
 
+/* B7b: make the zone a secondary (KDB_ZK_SECONDARY, a SLAVE) or a catalog consumer (KDB_ZK_CATALOG, a CONSUMER) whose masters are
+ * domains.master.  Records are ignored; pdns_zone_finish() converts the metadata only. */
+int pdns_zone_set_secondary(pdns_zone_t *z, uint8_t kind, const char *master) {
+    char *m = master ? strdup(master) : NULL;
+    if (master && !m) return -1;
+    free(z->master);
+    z->master = m;
+    z->zkind = kind;
+    return 0;
+}
+
 /* The canonical absolute name pdns_zone_new() would give a zone called dbname; false when it would be a failed zone. */
 bool pdns_canonical_zone_name(const char *dbname, char out[DNS_NAME_TEXT_SIZE]) {
     if (!dbname) return false;
@@ -278,6 +289,7 @@ void pdns_zone_free(pdns_zone_t *z) {
     }
     free(z->ents);
     free(z->settings);
+    free(z->master);
     free(z->nsec3param);
     for (size_t i = 0; i < z->n_warnings; i++) free(z->warnings[i]);
     free(z->warnings);
@@ -791,6 +803,53 @@ static bool kind_answer_changing(const char *k) {
     return false;
 }
 
+/* B7b: domains.master of a SLAVE / CONSUMER zone -> "masters { ip; ip port N; }; ".  PowerDNS writes the addresses separated by
+ * commas (blanks are tolerated), each ip, ip:port, [ip]:port or a bare IPv6 address; a host name is not supported (the Backend
+ * connects to addresses only).  An entry that is none of these fails the zone: a transfer from a wrong master is worse than none. */
+#define PDNS_MAX_MASTERS 16
+#define MASTER_SEP ", \t\r\n"
+
+static bool build_masters(pdns_zone_t *z, sbuf_t *sb) {
+    strlist_t l = {0};
+    char *copy = z->master ? strdup(z->master) : NULL;
+    bool ok = true;
+    if (z->master && !copy) {
+        zfail(z, false, 0, "out of memory");
+        return false;
+    }
+    for (char *save = NULL, *tok = copy ? strtok_r(copy, MASTER_SEP, &save) : NULL; tok && ok; tok = strtok_r(NULL, MASTER_SEP, &save)) {
+        char ent[160];
+        bool dup;
+        if (!notify_entry(tok, ent, sizeof(ent))) {
+            zfail(z, false, 0, "domains.master entry '%.64s' is not an IP address[:port] (host names are not supported)", tok);
+            ok = false;
+        } else if (l.n >= PDNS_MAX_MASTERS) {
+            zwarn(z, false, 0, "domains.master has more than %d entries, the rest is ignored", PDNS_MAX_MASTERS);
+            break;
+        } else if (!strlist_add(&l, ent, &dup)) {
+            zfail(z, false, 0, "out of memory");
+            ok = false;
+        }
+    }
+    free(copy);
+    if (ok && l.n == 0) {
+        zfail(z, false, 0, "domains.master is %s: a %s zone needs at least one master address", z->master ? "empty" : "NULL",
+              z->zkind == KDB_ZK_CATALOG ? "CONSUMER" : "SLAVE");
+        ok = false;
+    }
+    if (ok) {
+        sb_add(sb, "masters {");
+        for (size_t i = 0; i < l.n; i++) {
+            sb_add(sb, " ");
+            sb_add(sb, l.v[i]);
+            sb_add(sb, ";");
+        }
+        sb_add(sb, " }; ");
+    }
+    strlist_free(&l);
+    return ok;
+}
+
 static bool build_settings(pdns_zone_t *z) {
     strlist_t axfr_from = {0}, axfr_keys = {0}, notify = {0}, upd_from = {0}, upd_keys = {0};
     bool have_axfr = false, have_upd = false, have_notify = false, have_nsec3param = false, have_presigned = false,
@@ -905,7 +964,8 @@ static bool build_settings(pdns_zone_t *z) {
     sbuf_t sb = {0};
     if (ok) {
         char tmp[512];
-        if (tsig_key[0]) {
+        if (z->zkind != KDB_ZK_PRIMARY && !build_masters(z, &sb)) ok = false;
+        if (ok && tsig_key[0]) {
             snprintf(tmp, sizeof(tmp), "tsig-key \"%s\"; ", tsig_key);
             sb_add(&sb, tmp);
         }
@@ -1150,6 +1210,10 @@ int pdns_zone_finish(pdns_zone_t *z) {
     z->finished = true;
 
     if (!build_settings(z)) return -1;
+    if (z->zkind != KDB_ZK_PRIMARY) {      /* B7b: a secondary zone has no rows to convert; the settings text is all of it */
+        z->serial = 0;
+        return 0;
+    }
     if (z->n_null_ttl)
         zwarn(z, true, z->first_null_ttl_id, "%llu record(s) have a NULL ttl; default-ttl %u used (first shown)",
               (unsigned long long)z->n_null_ttl, z->opts.default_ttl);
@@ -1345,15 +1409,16 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
                          char *err, size_t errlen) {
     char dummy[8];
     if (!err || errlen == 0) { err = dummy; errlen = sizeof(dummy); }
-    if (z->failed || !z->finished || !z->arena_ready) {
+    const bool sec = z->zkind != KDB_ZK_PRIMARY;         /* B7b: no rows, the settings text is the zone */
+    if (z->failed || !z->finished || (!z->arena_ready && !sec)) {
         snprintf(err, errlen, "zone '%s': not converted", z->name);
         return -1;
     }
-    if (z->flags & PDNS_F_TINYDNS) {
+    if (!sec && (z->flags & PDNS_F_TINYDNS)) {
         snprintf(err, errlen, "zone '%s': tinydns zones are encoded in milestone B8", z->name);
         return -1;
     }
-    uint64_t rr_count = (uint64_t)z->arena.count + 1;
+    uint64_t rr_count = sec ? 0 : (uint64_t)z->arena.count + 1;
     if (rr_count > z->opts.max_records) {
         snprintf(err, errlen, "zone '%s': %llu records exceed max-zone-records", z->name, (unsigned long long)rr_count);
         return -1;
@@ -1369,7 +1434,7 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
         return -1;
     }
     const char *profile = p->profile ? p->profile : z->profile;
-    int rc = gen_bodies(z, digest_sink, &dd, err, errlen);
+    int rc = sec ? 0 : gen_bodies(z, digest_sink, &dd, err, errlen);
     /* B7a: a metadata-only edit (the settings text, the profile that is named, the text of that profile) must change the
      * digest, or the diff would find the zone up to date.  Zones without settings and profile keep the digest of the data
      * alone.  Every field is length-prefixed, so two different splits cannot give the same input. */
@@ -1377,6 +1442,7 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
         const char *parts[3] = { z->settings ? z->settings : "", profile ? profile : "", p->profile_text ? p->profile_text : "" };
         static const uint8_t tag[] = "KDB1-SETTINGS";
         if (EVP_DigestUpdate(dd.md, tag, sizeof(tag)) != 1) rc = -1;
+        if (sec && EVP_DigestUpdate(dd.md, &z->zkind, 1) != 1) rc = -1;       /* SLAVE and CONSUMER with the same masters differ */
         for (int k = 0; rc == 0 && k < 3; k++) {
             uint64_t n = strlen(parts[k]);
             uint8_t lb[8];
@@ -1400,9 +1466,9 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
     rc = -1;
     if (kdb_enc_begin(&enc, KDB_T_ZONE_BEGIN) != 0 ||
         kdb_enc_u16(&enc, 1, p->view) != 0 || kdb_enc_name(&enc, 2, z->name) != 0 ||
-        kdb_enc_i64(&enc, 3, p->source_id) != 0 || kdb_enc_u8(&enc, 4, p->zone_kind) != 0 ||
-        kdb_enc_u32(&enc, 5, z->serial) != 0 ||
-        kdb_enc_u32(&enc, 6, (z->flags & PDNS_F_PRESIGNED) ? KDB_ZF_PRESIGNED : 0) != 0 ||
+        kdb_enc_i64(&enc, 3, p->source_id) != 0 || kdb_enc_u8(&enc, 4, sec ? z->zkind : p->zone_kind) != 0 ||
+        kdb_enc_u32(&enc, 5, sec ? 0 : z->serial) != 0 ||
+        kdb_enc_u32(&enc, 6, (!sec && (z->flags & PDNS_F_PRESIGNED)) ? KDB_ZF_PRESIGNED : 0) != 0 ||
         kdb_enc_u64(&enc, 7, rr_count) != 0 || kdb_enc_bytes(&enc, 8, digest, KDB_DIGEST_LEN) != 0 ||
         (z->settings && *z->settings && kdb_enc_str(&enc, 9, z->settings) != 0) ||
         (profile && *profile && kdb_enc_str(&enc, 10, profile) != 0) || kdb_enc_end(&enc) != 0 ||
@@ -1410,7 +1476,7 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
         snprintf(err, errlen, "zone '%s': ZONE_BEGIN could not be encoded or sent", z->name);
         goto out;
     }
-    if (gen_bodies(z, data_sink, &eu, err, errlen) != 0) goto out;
+    if (!sec && gen_bodies(z, data_sink, &eu, err, errlen) != 0) goto out;
     if (kdb_enc_begin(&enc, KDB_T_ZONE_END) != 0 || kdb_enc_u64(&enc, 1, rr_count) != 0 || kdb_enc_end(&enc) != 0 ||
         emit_msg(&eu) != 0) {
         snprintf(err, errlen, "zone '%s': ZONE_END could not be encoded or sent", z->name);

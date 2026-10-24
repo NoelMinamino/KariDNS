@@ -8,7 +8,10 @@
 # many variants) go into separate rounds.  Zones with location / ECS tags are left out until the database carries tags (B8).  For each zone, every owner x every type present, ANY, the types NS MX TXT AAAA
 # A CNAME at every owner, a name below every owner, the apex types, NXDOMAIN names and a differently-cased name are
 # asked in three flavours (plain query = 512 byte limit, EDNS0 DO=0, EDNS0 DO=1) with tests/db/dbquery.c, which writes
-# the exact response bytes with the message ID zeroed.  The responses of A and B must be identical.
+# the exact response bytes with the message ID zeroed.  The responses of A and B must be identical.  Since B7b the zones are also transferred: A allows 127.0.0.1 in the zone
+# statement, B in domainmetadata (ALLOW-AXFR-FROM, bounded by acl-ceiling); the AXFR of A and B must hold the same RRs.  A third
+# server C has neither a zone file nor a database but is a secondary (type slave) of B: it must answer the same list of
+# queries as B byte for byte, and its AXFR is the same set of RRs too (database primary -> file-free KariDNS secondary).
 #
 # Owner case: PowerDNS stores owners in lower case and zone2sql does the same, so a zone file with upper-case letters in
 # an owner could differ from the database version in the case of that owner name (RFC 4343: the same name).  The
@@ -36,18 +39,21 @@ id nobody >/dev/null 2>&1 || { echo "SKIP: no user nobody"; exit 0; }
 
 T=$(mktemp -d "${TMPDIR:-/tmp}/karidns_dbdiff.XXXXXX") || exit 1
 chmod 755 "$T"
-SA=""; SB=""
+SA=""; SB=""; SC=""
 stop_servers() {
     [ -n "$SA" ] && kill -TERM "$SA" 2>/dev/null
     [ -n "$SB" ] && kill -TERM "$SB" 2>/dev/null
+    [ -n "$SC" ] && kill -TERM "$SC" 2>/dev/null
     i=0
     while [ $i -lt 50 ]; do
-        { [ -z "$SA" ] || ! kill -0 "$SA" 2>/dev/null; } && { [ -z "$SB" ] || ! kill -0 "$SB" 2>/dev/null; } && break
+        { [ -z "$SA" ] || ! kill -0 "$SA" 2>/dev/null; } && { [ -z "$SB" ] || ! kill -0 "$SB" 2>/dev/null; } &&
+            { [ -z "$SC" ] || ! kill -0 "$SC" 2>/dev/null; } && break
         sleep 0.1; i=$((i + 1))
     done
     [ -n "$SA" ] && kill -KILL "$SA" 2>/dev/null
     [ -n "$SB" ] && kill -KILL "$SB" 2>/dev/null
-    SA=""; SB=""
+    [ -n "$SC" ] && kill -KILL "$SC" 2>/dev/null
+    SA=""; SB=""; SC=""
 }
 cleanup() { stop_servers; rm -rf "$T"; }
 trap cleanup EXIT INT TERM
@@ -59,6 +65,7 @@ TAB=$(printf '	')
 BASE=$((20000 + $$ % 20000))
 PA=$BASE
 PB=$((BASE + 1))
+PC=$((BASE + 2))
 SCHEMA=tests/db/pdns_schema.sqlite3.sql
 
 cc -O1 -o "$T/dbquery" tests/db/dbquery.c 2> "$T/cc.log" || { echo "SKIP: tests/db/dbquery.c does not compile"; cat "$T/cc.log"; exit 0; }
@@ -169,7 +176,7 @@ rcode_of() {   # the first answer line "key TAB strict TAB folded" -> "rcode anc
     printf '%d %d\n' "0x$(printf '%s' "$h" | cut -c8)" "0x$(printf '%s' "$h" | cut -c13-16)"
 }
 
-TOTAL_Q=0; TOTAL_OK=0; TOTAL_FOLD=0; COMPARED=0; FOLDED_ZONES=""
+TOTAL_C=0; OK_C=0; TOTAL_Q=0; TOTAL_OK=0; TOTAL_FOLD=0; COMPARED=0; FOLDED_ZONES=""
 k=1
 while [ $k -le $R ]; do
     echo "== round $k"
@@ -182,12 +189,15 @@ while [ $k -le $R ]; do
     if [ $((k % 2)) -eq 0 ]; then TH=4; else TH=1; fi
     {
         printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n' "$PB"
-        printf '    database { driver sqlite3; database-file "%s/z.db"; loader-user "nobody"; loader-path "%s/karidns-dbloader"; ingest-threads %s; };\n};\n' "$D" "$T" "$TH"
+        printf '    database { driver sqlite3; database-file "%s/z.db"; loader-user "nobody"; loader-path "%s/karidns-dbloader"; ingest-threads %s; acl-ceiling { 127.0.0.1; }; };\n};\n' "$D" "$T" "$TH"
     } > "$D/b.conf"
+    printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n};\n' "$PC" > "$D/c.conf"
     while IFS="$TAB" read -r apex f sqlf; do
         sqlite3 "$D/z.db" < "$sqlf" > /dev/null 2>&1
+        sqlite3 "$D/z.db" "INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'ALLOW-AXFR-FROM', '127.0.0.1' FROM domains WHERE name = '$apex'"
         case $f in /*) zf=$f ;; *) zf="$ROOT/$f" ;; esac
-        printf 'zone "%s" { type primary; file "%s"; };\n' "$apex" "$zf" >> "$D/a.conf"
+        printf 'zone "%s" { type primary; file "%s"; allow-transfer { 127.0.0.1; }; };\n' "$apex" "$zf" >> "$D/a.conf"
+        printf 'zone "%s" { type slave; masters { 127.0.0.1 port %s; }; allow-transfer { 127.0.0.1; }; };\n' "$apex" "$PB" >> "$D/c.conf"
     done < "$T/round.$k.list"
     chown -R nobody "$D"; chmod 600 "$D/z.db"*
     NZR=$(wc -l < "$T/round.$k.list" | tr -d ' ')
@@ -195,6 +205,8 @@ while [ $k -le $R ]; do
     SA=$!
     "$KARIDNS" -c "$D/b.conf" -f > "$D/b.log" 2>&1 &
     SB=$!
+    "$KARIDNS" -c "$D/c.conf" -f > "$D/c.log" 2>&1 &
+    SC=$!
     if ! wait_log "$D/b.log" "\[DB\] initial load complete" 30; then fail "round $k: the database server did not finish its startup batch"; sed 's/^/         /' "$D/b.log" | tail -10; stop_servers; k=$((k + 1)); continue; fi
     sleep 0.5
     while IFS="$TAB" read -r apex f sqlf; do
@@ -218,6 +230,46 @@ while [ $k -le $R ]; do
             fail "$apex ($f): $bad of $tot queries differ (list had $NQ)"
             cat "$D/cmp.err"
         fi
+        # AXFR of A (file) and B (database) hold the same RRs; C (a secondary of B, no file, no database) answers like B
+        ./dag @127.0.0.1 -p "$PA" "$apex" AXFR +nohexdump +noall +answer 2> /dev/null | sort > "$D/axfr.a"
+        ./dag @127.0.0.1 -p "$PB" "$apex" AXFR +nohexdump +noall +answer 2> /dev/null | sort > "$D/axfr.b"
+        NAX=$(wc -l < "$D/axfr.a" | tr -d ' ')
+        if [ "$NAX" -lt 2 ]; then fail "$apex: the file server did not transfer the zone"
+        elif cmp -s "$D/axfr.a" "$D/axfr.b"; then pass "$apex: AXFR from the database server is the same set of $NAX RRs as the file server's"
+        else
+            # PowerDNS keeps owner names in lower case (the zone file may not): the same RRs once the case is folded
+            tr 'A-Z' 'a-z' < "$D/axfr.a" | sort > "$D/axfr.a.l"
+            tr 'A-Z' 'a-z' < "$D/axfr.b" | sort > "$D/axfr.b.l"
+            if cmp -s "$D/axfr.a.l" "$D/axfr.b.l"; then pass "$apex: AXFR is the same set of $NAX RRs once the case of names is folded (the file has upper-case names)"
+            else fail "$apex: AXFR differs ($NAX vs $(wc -l < "$D/axfr.b" | tr -d ' ') lines)"; diff "$D/axfr.a" "$D/axfr.b" | head -6; fi
+        fi
+        j=0
+        while [ $j -lt 300 ]; do
+            "$T/dbquery" -p "$PC" -t 2 "$D/soa.list" "$D/soa.c" > /dev/null 2>&1
+            rcode_of "$D/soa.c" | grep -q "^0 [1-9]" && break
+            sleep 0.1; j=$((j + 1))
+        done
+        "$T/dbquery" -p "$PC" -t 3 "$D/q.list" "$D/q.c" > /dev/null 2>&1
+        set -- $(compare "$D/q.b" "$D/q.c" 2> "$D/cmp.err")
+        TOTAL_C=$((TOTAL_C + $1)); OK_C=$((OK_C + $2))
+        if [ "$4" = "0" ] && [ "$1" = "$NQ" ] && [ "$1" -gt 0 ]; then pass "$apex: the secondary C answers all $1 queries as the database server does"
+        elif [ "$1" = "$NQ" ] && [ "$4" -le 40 ]; then
+            # A zone transfer compresses names (RFC 1035 4.1.4), and the target of an MX / NS / CNAME takes the case of an earlier
+            # owner name: a secondary of a database zone (lower-case owners) can hold "mail.sub" where the primary has "Mail.Sub".
+            # Such an answer is the same name (RFC 4343); every differing query is asked again as text and must match when folded.
+            awk -F'\t' 'NR == FNR { s[FNR] = $2; next } $1 != "" && $2 != s[FNR] { print $1 }' "$D/q.b" "$D/q.c" | sort -u > "$D/diff.keys"
+            unres=0
+            while read -r qn qt qf; do
+                ./dag @127.0.0.1 -p "$PB" "$qn" "$qt" +noall +answer +authority +additional +nohexdump 2> /dev/null | tr 'A-Z' 'a-z' | sort > "$D/dq.b"
+                ./dag @127.0.0.1 -p "$PC" "$qn" "$qt" +noall +answer +authority +additional +nohexdump 2> /dev/null | tr 'A-Z' 'a-z' | sort > "$D/dq.c"
+                cmp -s "$D/dq.b" "$D/dq.c" || { unres=$((unres + 1)); echo "         DIFFERENT also as text: $qn $qt"; }
+            done < "$D/diff.keys"
+            if [ "$unres" = "0" ]; then pass "$apex: the secondary C answers like the database server ($4 queries differ only in the case of a name inside the data, which a transfer folds)"
+            else fail "$apex: $unres queries differ between the database server and its secondary C"; fi
+        else fail "$apex: $4 of $1 queries differ between the database server and its secondary C"; cat "$D/cmp.err"; fi
+        ./dag @127.0.0.1 -p "$PC" "$apex" AXFR +nohexdump +noall +answer 2> /dev/null | sort > "$D/axfr.c"
+        if cmp -s "$D/axfr.b" "$D/axfr.c"; then pass "$apex: AXFR from C is the same set of RRs"
+        else fail "$apex: AXFR from C differs from B's ($(wc -l < "$D/axfr.b" | tr -d ' ') vs $(wc -l < "$D/axfr.c" | tr -d ' ') lines)"; diff "$D/axfr.b" "$D/axfr.c" | head -6; fi
     done < "$T/round.$k.list"
     stop_servers
     k=$((k + 1))
@@ -228,6 +280,7 @@ echo "== skipped zone files (not compared)"
 sed 's/^/  /' "$T/skipped.txt"
 echo
 echo "$COMPARED zones compared, $TOTAL_Q queries: $TOTAL_OK byte-identical, $TOTAL_FOLD identical after folding the owner case"
+echo "secondary C: $TOTAL_C queries, $OK_C byte-identical to the database server's answers"
 [ -n "$FOLDED_ZONES" ] && echo "zones that differ only in the case of owner names (zone file has upper-case letters):$FOLDED_ZONES"
 if [ "$COMPARED" -ge 8 ]; then pass "at least 8 zones could be compared ($COMPARED)"; else fail "only $COMPARED zones could be compared (8 needed)"; fi
 if [ "$FAILS" -eq 0 ]; then echo "=== run_db_file_diff_test: all $PASS checks passed (file vs DB = 0 differences) ==="; exit 0; fi

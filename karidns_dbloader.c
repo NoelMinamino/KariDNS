@@ -109,6 +109,7 @@ typedef struct {
     int64_t id;
     char *name;
     char *type;
+    char *master;                     /* domains.master (SLAVE / CONSUMER: the masters), NULL if NULL */
     char *canon;                      /* stream mode: the canonical absolute name, NULL if the name is unusable */
     uint32_t serial;                  /* serial of the enabled apex SOA */
     bool has_serial;
@@ -408,9 +409,11 @@ static int zone_cb(void *ud, const db_zone_row_t *r) {
     z->id = r->id;
     z->name = r->name ? strdup(r->name) : NULL;
     z->type = r->type ? strdup(r->type) : NULL;
-    if ((r->name && !z->name) || (r->type && !z->type)) {
+    z->master = r->master ? strdup(r->master) : NULL;
+    if ((r->name && !z->name) || (r->type && !z->type) || (r->master && !z->master)) {
         free(z->name);
         free(z->type);
+        free(z->master);
         return x->oom = true;
     }
     if (x->io) {                                     /* stream mode: the diff needs the canonical name and the serial */
@@ -420,6 +423,7 @@ static int zone_cb(void *ud, const db_zone_row_t *r) {
             if (!z->canon) {
                 free(z->name);
                 free(z->type);
+                free(z->master);
                 return x->oom = true;
             }
         }
@@ -536,11 +540,20 @@ static int send_failed(ctx_t *x, const zinfo_t *zi, const char *reason) {
     return send_enc(x);
 }
 
+/* B7b: a SLAVE zone is a secondary (its masters are domains.master, its data comes by zone transfer, never from `records`); a
+ * CONSUMER is a catalog consumer (the existing catalog secondary support: the member zones it lists are created and
+ * transferred from the same masters).  Both are sent as ZONE_BEGIN without data (design 1.4); the Backend keeps the transferred
+ * data in memory only.  0 = a zone with rows (NATIVE / MASTER). */
+static uint8_t zone_sec_kind(const char *type) {
+    if (type && strcasecmp(type, "SLAVE") == 0) return KDB_ZK_SECONDARY;
+    if (type && strcasecmp(type, "CONSUMER") == 0) return KDB_ZK_CATALOG;
+    return KDB_ZK_PRIMARY;
+}
+
 static const char *zone_type_reason(const char *type) {
     if (!type) return "domains.type is NULL";
     if (strcasecmp(type, "NATIVE") == 0 || strcasecmp(type, "MASTER") == 0) return NULL;
-    if (strcasecmp(type, "SLAVE") == 0 || strcasecmp(type, "CONSUMER") == 0)
-        return "secondary zones (type SLAVE / CONSUMER) are not loaded yet (milestone B7)";
+    if (strcasecmp(type, "SLAVE") == 0 || strcasecmp(type, "CONSUMER") == 0) return NULL;      /* B7b: see zone_sec_kind() */
     if (strcasecmp(type, "PRODUCER") == 0) return "catalog producer zones (type PRODUCER) are not loaded yet (later 0.6.x)";
     return "unsupported domains.type";
 }
@@ -756,6 +769,8 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
     open_current(w, zi);
     pdns_zone_t *z = w->cur;
     const char *tr = zone_type_reason(zi->type);
+    const uint8_t skind = zone_sec_kind(zi->type);
+    if (z && skind != KDB_ZK_PRIMARY && pdns_zone_set_secondary(z, skind, zi->master) != 0) w->oom = true;
     if (w->oom) {
         r->kind = ZR_FATAL;
     } else if (!zi->name) {
@@ -772,7 +787,7 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
         const char *why = NULL;
         if (pdns_zone_finish(z) != 0) {
             why = z->error;
-        } else if (zone_has_keys(x, zi->id) && !(z->flags & PDNS_F_PRESIGNED)) {
+        } else if (skind == KDB_ZK_PRIMARY && zone_has_keys(x, zi->id) && !(z->flags & PDNS_F_PRESIGNED)) {
             /* design 3.5: PowerDNS would sign the zone online, KariDNS serves pre-signed data only */
             why = "the zone has cryptokeys but no PRESIGNED=1 metadata (online signing is not supported)";
         }
@@ -885,7 +900,7 @@ static int rec_cb(void *ud, int64_t did, const db_record_row_t *row) {
         w->stop = true;
         return 1;
     }
-    if (w->cur && !w->cur->failed) pdns_zone_add_record(w->cur, row);
+    if (w->cur && !w->cur->failed && !zone_sec_kind(WZ(w, w->wi)->type)) pdns_zone_add_record(w->cur, row);   /* B7b: a SLAVE's rows are PowerDNS's copy of the transfer */
     return 0;
 }
 
@@ -921,7 +936,8 @@ static int run_task(wk_t *w, size_t a, size_t b, bool bulk, bool all) {
         int64_t id = WZ(w, pos)->id;
         w->wi = pos;
         mset_reset(&w->zmeta);
-        if ((rc = drv->scan_metadata(w->conn, &id, meta_cb, &w->zmeta)) != 0 || (rc = drv->scan_records(w->conn, &id, rec_cb, w)) != 0) {
+        bool sec = zone_sec_kind(WZ(w, pos)->type) != KDB_ZK_PRIMARY;      /* B7b: no records are read for a secondary zone */
+        if ((rc = drv->scan_metadata(w->conn, &id, meta_cb, &w->zmeta)) != 0 || (!sec && (rc = drv->scan_records(w->conn, &id, rec_cb, w)) != 0)) {
             if (rc == DB_STOPPED) {
                 if (w->zmeta.oom) w->oom = true;
                 return TK_FATAL;
@@ -1229,6 +1245,7 @@ static void ctx_view_reset(ctx_t *x) {
     for (size_t i = 0; i < x->nz; i++) {
         free(x->zones[i].name);
         free(x->zones[i].type);
+        free(x->zones[i].master);
         free(x->zones[i].canon);
     }
     free(x->zones);
@@ -1335,8 +1352,10 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
         if (zone_type_reason(z->type)) {
             z->want = compare_all || changed;      /* not loadable: reported again only when something happened to it */
         } else {
-            z->want = compare_all || changed || !e || !e->known || e->dirty || e->source_id != z->id || !z->has_serial ||
-                      z->serial != e->serial;
+            /* B7b: a secondary zone has no SOA of its own to compare (what the Backend transferred is its business, and its inventory
+             * serial is the 0 it was sent with); the change log, the digest and the source id decide */
+            z->want = compare_all || changed || !e || !e->known || e->dirty || e->source_id != z->id ||
+                      (!zone_sec_kind(z->type) && (!z->has_serial || z->serial != e->serial));
         }
     }
     /* what the Backend has and the database no longer lists */
@@ -1457,6 +1476,7 @@ static int apply_mapping(ctx_t *x, const db_schema_info_t *si) {
             } else {
                 free(x->zones[i].name);
                 free(x->zones[i].type);
+                free(x->zones[i].master);
                 free(x->zones[i].canon);
             }
         }

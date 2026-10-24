@@ -79,6 +79,7 @@ typedef struct ing_job {
   db_zone_build_t *build;
   bool skip;                             /* decided at ZONE_BEGIN: the data is discarded, the zone is rejected */
   bool failed;                           /* a ZONE_DATA message was refused */
+  uint8_t zkind;                          /* B7b: KDB_ZK_*; secondary (SLAVE) and catalog (CONSUMER) zones have no data: the masters are in the settings */
   zone_ext_shared_t *shared;             /* B7a: the interned settings of the zone (this job holds a reference), NULL = none */
   uint8_t *buf;                        /* ingest-threads > 1: the ZONE_DATA messages, [u32 length][bytes] each */
   size_t buf_len, buf_cap;
@@ -680,18 +681,20 @@ static void apply_ixfr_depth(zone_db_entry_t *e, const zone_config_t *dc) {
   rcu_aux_read_unlock();
 }
 
-/* A new entry for a DB zone (design 4.2): source DB, a primary, its settings block (interned settings or none) */
-static zone_db_entry_t *new_db_entry(const char *view, const char *zone, zone_ext_shared_t *shared) {
+/* A new entry for a DB zone (design 4.2): source DB, its settings block (interned settings or none).  zkind: a primary (its data
+ * comes in ZONE_DATA), or (B7b) a secondary / catalog consumer, which the existing secondary machinery of the control thread
+ * transfers from the masters in its settings (refresh timer, SOA retry and expire, NOTIFY, IXFR), like a configured one. */
+static zone_db_entry_t *new_db_entry(const char *view, const char *zone, zone_ext_shared_t *shared, uint8_t zkind) {
   zone_db_entry_t *e = create_new_zone_entry(zone, view);
   if (!e) return NULL;
-  zone_config_t *dc = db_zone_config_new(zone, shared);
+  zone_config_t *dc = db_zone_config_new_kind(zone, shared, zkind == KDB_ZK_PRIMARY ? 0 : zkind == KDB_ZK_SECONDARY ? 1 : 2);
   if (!dc) {
     free_zone_db_entry(e);
     return NULL;
   }
   e->source = ZONE_SRC_DB;
-  e->kind = ZONE_KIND_PRIMARY;
-  e->is_secondary = false;
+  e->kind = zkind == KDB_ZK_PRIMARY ? ZONE_KIND_PRIMARY : ZONE_KIND_SECONDARY;
+  e->is_secondary = zkind != KDB_ZK_PRIMARY;
   atomic_store_explicit(&e->dbcfg, dc, memory_order_release);
   apply_ixfr_depth(e, dc);
   return e;
@@ -704,11 +707,57 @@ static bool entry_has_settings(const zone_db_entry_t *e, const zone_ext_shared_t
   return sh ? (c->ext_shared && c->ext == &sh->ext) : (c->ext == NULL);
 }
 
+/* B7b: ZONE_END of a secondary (SLAVE) or catalog consumer (CONSUMER) zone: there is no data.  The zone's entry is created, or its
+ * settings are replaced (new masters or key: the zone is re-pointed and asked to refresh at once), and entered in the registry
+ * with the serial and digest the loader sent (serial 0, the digest of the settings), which is what a restarted loader compares:
+ * a zone that did not change is not sent again, so nothing is transferred again.  What the entry holds (the zone it transferred
+ * from the masters) is not touched here, and it lives in memory only. */
+static void job_execute_secondary(ing_job_t *j) {
+  zone_db_entry_t *entry = dbreg_lookup_entry(j->view_name, j->zone);
+  bool created = false;
+  if (entry) {
+    const zone_config_t *oc = atomic_load_explicit(&entry->dbcfg, memory_order_acquire);
+    /* the zone was a primary, or a SLAVE became a CONSUMER (or back): a new entry replaces it */
+    if (entry->source != ZONE_SRC_DB || !entry->is_secondary || !oc || oc->is_catalog != (j->zkind == KDB_ZK_CATALOG)) entry = NULL;
+  }
+  if (!entry) {
+    entry = new_db_entry(j->view_name, j->zone, j->shared, j->zkind);
+    if (!entry) {
+      job_reject(j, "out of memory");
+      goto rejected;
+    }
+    created = true;
+  } else if (!entry_has_settings(entry, j->shared)) {
+    zone_config_t *nc = db_zone_config_new_kind(j->zone, j->shared, j->zkind == KDB_ZK_CATALOG ? 2 : 1);
+    if (!nc) {
+      job_reject(j, "out of memory");
+      goto rejected;
+    }
+    db_entry_set_config(entry, nc);
+    apply_ixfr_depth(entry, nc);
+    atomic_store_explicit(&entry->refresh_now, true, memory_order_release);      /* the masters or the key may have changed */
+  }
+  bool shadowed = false;
+  if (dbreg_commit(j->view_name, j->zone, entry, created, j->source_id, j->serial, j->digest, &shadowed) != 0) {
+    if (created) free_zone_db_entry(entry);
+    job_reject(j, "out of memory registering the zone");
+    goto rejected;
+  }
+  j->status = shadowed ? KDB_ST_SHADOWED : KDB_ST_APPLIED;
+  return;
+rejected:
+  (void)dbreg_reject(j->view_name, j->zone, j->source_id, j->reason);
+}
+
 /* ZONE_END work, on the stream thread (ingest-threads 1) or a builder: feed what was buffered, check, publish the
  * image into the entry, enter the zone in the registry.  Sets j->status / j->reason; the reply is the caller's. */
 static void job_execute(ing_job_t *j) {
   if (j->skip) {                                         /* status and reason were set at ZONE_BEGIN */
     if (j->view_name[0]) (void)dbreg_reject(j->view_name, j->zone, j->source_id, j->reason);
+    return;
+  }
+  if (j->zkind != KDB_ZK_PRIMARY) {
+    job_execute_secondary(j);
     return;
   }
   /* ingest-threads > 1: the messages were buffered by the stream thread */
@@ -727,8 +776,9 @@ static void job_execute(ing_job_t *j) {
   }
   zone_db_entry_t *entry = dbreg_lookup_entry(j->view_name, j->zone);
   bool created = false;
+  if (entry && entry->is_secondary) entry = NULL;          /* B7b: the zone was a SLAVE / CONSUMER; a new primary entry replaces it */
   if (!entry) {
-    entry = new_db_entry(j->view_name, j->zone, j->shared);
+    entry = new_db_entry(j->view_name, j->zone, j->shared, KDB_ZK_PRIMARY);
     if (!entry) {
       job_reject(j, "out of memory");
       goto rejected;
@@ -1234,14 +1284,24 @@ static void on_zone_begin(ing_t *g, const kdb_msg_t *m) {
   if (j->view_name[0] == '\0') {
     j->skip = true;
     job_reject(j, "the view is not in the configuration");
-  } else if (zb->zone_kind != KDB_ZK_PRIMARY) {
-    j->skip = true;
-    job_reject(j, "secondary and catalog zones from the database are not supported yet");
   } else if (zb->flags & KDB_ZF_EXTENDED) {
     j->skip = true;
     job_reject(j, "extended attributes (tags, tinydns) from the database are not supported yet");
+  } else if (zb->zone_kind != KDB_ZK_PRIMARY && zb->flags != 0) {
+    j->skip = true;                                      /* a SLAVE / CONSUMER has no data to describe */
+    job_reject(j, "a secondary zone from the database carries no zone flags");
   } else if (!resolve_zone_settings(g, j, zb)) {
     j->skip = true;                                      /* job_reject() was called: the zone is rejected, its data skipped */
+  } else if (zb->zone_kind != KDB_ZK_PRIMARY && (!j->shared || j->shared->ext.masters_count <= 0)) {
+    j->skip = true;
+    job_reject(j, "a secondary zone from the database needs masters in its settings");
+  } else if (zb->zone_kind == KDB_ZK_PRIMARY && j->shared && j->shared->ext.masters_count > 0) {
+    /* a profile shared with secondary zones may carry masters; a primary has nothing to transfer, and the NOTIFY check
+     * (masters = who may notify) would otherwise treat it as a secondary */
+    j->skip = true;
+    job_reject(j, "the settings of a primary zone name masters (masters / primaries belong to SLAVE and CONSUMER zones)");
+  } else if (zb->zone_kind != KDB_ZK_PRIMARY) {
+    j->zkind = zb->zone_kind;                            /* no ZONE_DATA follows (the stream rules, dns_db_stream.c): ZONE_END runs it */
   } else {
     j->build = db_zone_build_new(j->zone, j->rr_count);
     if (!j->build) {
@@ -2051,9 +2111,29 @@ static void st_list(status_ctx_t *c, const char *label, char *const *list, int n
   if (n > 8) st_append(c, ", ... (%d entries)", n);
 }
 
+/* B7b: a SLAVE / CONSUMER zone: where it transfers from and how far it got (its data is in memory only) */
+static void secondary_status(status_ctx_t *c, const zone_db_entry_t *e, const zone_config_t *dc) {
+  const zone_ext_t *x = dc->ext;
+  st_append(c, "  type: %s, masters", dc->is_catalog ? "catalog consumer (CONSUMER)" : "secondary (SLAVE)");
+  for (int i = 0; x && i < x->masters_count && i < 8; i++)
+    st_append(c, "%s%.64s port %d", i ? ", " : " ", x->masters[i].ip ? x->masters[i].ip : "?", x->masters[i].port);
+  if (x && x->masters_count > 8) st_append(c, ", ... (%d entries; only the first is used for transfers)", x->masters_count);
+  if (x && x->tsig_key) st_append(c, ", TSIG key '%.64s'", x->tsig_key);
+  st_append(c, "\n");
+  time_t last = atomic_load_explicit(&e->last_successful_transfer, memory_order_acquire);
+  char t[40];
+  fmt_time((int64_t)last, t, sizeof(t));
+  if (last > 0)
+    st_append(c, "  transfer: last successful %s, serial %u (kept in memory only; a restart transfers it again)\n", t,
+              (unsigned)atomic_load_explicit(&e->serial, memory_order_relaxed));
+  else
+    st_append(c, "  transfer: no transfer has succeeded yet (kept in memory only)\n");
+}
+
 /* B7a: where the settings of a DB zone come from and what acl-ceiling makes of its ACLs */
 static void settings_status(status_ctx_t *c, const zone_db_entry_t *e) {
   const zone_config_t *dc = atomic_load_explicit(&e->dbcfg, memory_order_acquire);
+  if (dc && e->is_secondary) secondary_status(c, e, dc);
   if (!dc || !dc->ext_shared) {
     st_append(c, "  settings: none (the defaults; no ACLs, so transfers and updates are refused)\n");
     return;
@@ -2092,7 +2172,7 @@ static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   c->matches++;
   const char *st = z->shadowed ? "shadowed" : (z->last_result == DBREG_REJECTED ? "rejected" : "applied");
   st_append(c, "zone %s view %s: source id %lld, serial %u, status %s", z->name, view, (long long)z->source_id,
-            z->entry ? z->serial : 0u, st);
+            z->entry ? (z->entry->is_secondary ? atomic_load_explicit(&z->entry->serial, memory_order_relaxed) : z->serial) : 0u, st);
   if (z->shadowed) st_append(c, z->shadow_by == DBREG_SH_CATALOG ? " (hidden by a catalog member)" : " (hidden by a zone in karidns.conf)");
   if (z->last_result == DBREG_REJECTED && z->entry) st_append(c, " (serving the last good version, serial %u)", z->serial);
   if (!z->entry) st_append(c, " (no version loaded)");

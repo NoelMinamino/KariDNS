@@ -31,7 +31,8 @@ chmod 755 "$T"
 SRV=""
 cleanup() {
     [ -n "$SRV" ] && kill -TERM "$SRV" 2>/dev/null
-    sleep 1
+    # wait for the manager (it stops its children first; a sanitizer build is slow): a KILL too early orphans them
+    i=0; while [ -n "$SRV" ] && [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     [ -n "$SRV" ] && kill -KILL "$SRV" 2>/dev/null
     rm -rf "$T"
 }
@@ -170,7 +171,14 @@ run_mode two-soa reject "more than one SOA"
 run_mode soa-subdomain reject "SOA of its apex"
 run_mode trailing-rr reject "after the final SOA"
 run_mode later-message reject "after the final SOA"
-run_mode secondary-kind reject "secondary and catalog zones"
+# B7b: SLAVE / CONSUMER zones carry no data; a secondary needs masters, and its rr_count is 0 (a ZONE_DATA after it is a protocol error)
+run_mode secondary-kind reject "needs masters in its settings"
+run_mode secondary-data error "a secondary zone has rr_count 0"
+run_mode secondary-flag reject "carries no zone flags"
+run_mode secondary-host reject "masters has an entry that is not an IP address"
+run_mode secondary-prim reject "settings of a primary zone name masters"
+run_mode secondary-ok ok "" "batch 1 complete: 3 zone(s) received (3 installed"
+run_mode catalog-ok ok "" "batch 1 complete: 3 zone(s) received (3 installed"
 run_mode extended-flag reject "extended attributes"
 run_mode non-in-class reject "class|malformed"
 run_mode delete-unknown ok "" "batch 1 complete: 2 zone(s) received (2 installed"

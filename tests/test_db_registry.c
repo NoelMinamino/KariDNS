@@ -761,6 +761,111 @@ static void test_settings_interning(void) {
     CHECK(db_settings_count() == 0);
 }
 
+/* ---------------------------------------------------------------- 6. B7b: secondary and catalog consumer entries */
+/* is the entry of this name in the view exactly e?  (compares pointers only: e may be freed after its grace period) */
+static bool name_in_snapshot_is(const char *view, const char *name, const zone_db_entry_t *e) {
+    zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+    view_snapshot_t *v = snapshot_find_view(s, view);
+    bool r = v && find_zone_exact_in_view(v, name) == e;
+    release_zone_snapshot(s);
+    return r;
+}
+
+static zone_db_entry_t *new_secondary_entry(const char *view, const char *zone, zone_ext_shared_t *sh, int kind) {
+    zone_db_entry_t *e = create_new_zone_entry(zone, view);
+    CHECK(e != NULL);
+    zone_config_t *dc = db_zone_config_new_kind(zone, sh, kind);
+    CHECK(dc != NULL);
+    e->source = ZONE_SRC_DB;
+    e->kind = ZONE_KIND_SECONDARY;
+    e->is_secondary = true;
+    atomic_store_explicit(&e->dbcfg, dc, memory_order_release);
+    return e;
+}
+
+static void test_secondary_entries(void) {
+    printf("[TEST] DB secondary zones: settings with masters, type of the block, replacement, a deleted consumer takes its members...\n");
+    db_settings_reset();
+    dbreg_reset();
+    server_config_t *cfg = load_conf("view \"default\" { match-clients { any; }; };\n");
+    rebuild(cfg);
+    char err[200];
+    const char *txt = "masters { 192.0.2.1 port 5300; 2001:db8::1; }; tsig-key \"k1\";";
+    zone_ext_shared_t *sh = db_settings_parse(txt, strlen(txt), err, sizeof(err));
+    CHECK(sh != NULL && sh->ext.masters_count == 2 && sh->ext.masters[0].port == 5300 && sh->ext.masters[1].port == 53);
+    CHECK(sh && strcmp(sh->ext.masters[0].ip, "192.0.2.1") == 0 && sh->ext.tsig_key && strcmp(sh->ext.tsig_key, "k1") == 0);
+    CHECK(sh && sh->ext.masters_parsed != NULL);
+
+    /* a SLAVE entry: type slave, the masters and the key where the control thread reads them (zone_entry_config) */
+    zone_db_entry_t *s1 = new_secondary_entry("default", "slave.test.", sh, 1);
+    const zone_config_t *c1 = zone_entry_config(NULL, s1);
+    CHECK(c1 && c1->type && strcmp(c1->type, "slave") == 0 && !c1->is_catalog && zext(c1)->masters_count == 2);
+    uint8_t dg[32] = { 7 };
+    bool shd = false;
+    CHECK(dbreg_commit("default", "slave.test.", s1, true, 11, 0, dg, &shd) == 0 && !shd);
+    CHECK(snapshot_apply_db_delta() == 1 && in_snapshot("default", s1));
+    dbreg_info_t info[2];
+    CHECK(dbreg_find_info("default", "slave.test.", info, 2) == 1 && info[0].serial == 0 && info[0].has_entry);
+    CHECK(s1->kind == ZONE_KIND_SECONDARY && s1->is_secondary);
+    /* a full reconfiguration keeps the very same entry (a secondary's transferred data is not thrown away) */
+    rebuild(cfg);
+    CHECK(in_snapshot("default", s1) && dbreg_lookup_entry("default", "slave.test.") == s1);
+
+    /* same name, other kind of zone: a new primary entry replaces the secondary one in the next delta */
+    zone_db_entry_t *p1 = new_entry("default", "slave.test.");
+    {
+        msg_t m;
+        char why[128];
+        zone_msg(&m, "slave.test.", 5, 1);
+        CHECK(install_msgs(p1, "slave.test.", 4, &m, 1, why, sizeof(why), NULL) == 0);
+        CHECK(dbreg_commit("default", "slave.test.", p1, true, 11, 5, dg, &shd) == 0);
+    }
+    CHECK(snapshot_apply_db_delta() == 2 && in_snapshot("default", p1) && !name_in_snapshot_is("default", "slave.test.", s1));
+    CHECK(dbreg_lookup_entry("default", "slave.test.") == p1);
+
+    /* a catalog consumer: type slave with catalog-zone, its members come and go with it */
+    zone_db_entry_t *cat = new_secondary_entry("default", "cat.test.", sh, 2);
+    const zone_config_t *cc = zone_entry_config(NULL, cat);
+    CHECK(cc && cc->is_catalog && cc->type && strcmp(cc->type, "slave") == 0);
+    CHECK(dbreg_commit("default", "cat.test.", cat, true, 12, 0, dg, &shd) == 0);
+    /* a primary DB zone that the member of the catalog will hide */
+    zone_db_entry_t *hid = add_zone("default", "m1.test.", 3, 1, 13);
+    CHECK(snapshot_apply_db_delta() >= 2 && in_snapshot("default", cat) && in_snapshot("default", hid));
+    catalog_member_id_t *desired = calloc(2, sizeof(*desired));
+    CHECK(desired != NULL);
+    snprintf(desired[0].unique_id, sizeof(desired[0].unique_id), "uid1");
+    snprintf(desired[0].domain, sizeof(desired[0].domain), "m1.test.");
+    snprintf(desired[1].unique_id, sizeof(desired[1].unique_id), "uid2");
+    snprintf(desired[1].domain, sizeof(desired[1].domain), "m2.test.");
+    CHECK(rebuild_zone_db_snapshot(NULL, "default", cat, cc, desired, 2) != NULL);       /* the catalog was transferred */
+    zone_db_entry_t *mem1 = NULL, *mem2 = NULL;
+    {
+        zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+        view_snapshot_t *v = snapshot_find_view(s, "default");
+        mem1 = find_zone_exact_in_view(v, "m1.test.");
+        mem2 = find_zone_exact_in_view(v, "m2.test.");
+        release_zone_snapshot(s);
+    }
+    CHECK(mem2 && mem2->is_catalog_member && mem2->is_secondary && mem2->catalog_master != NULL);
+    CHECK(mem2 && strcmp(mem2->catalog_master->ip, "192.0.2.1") == 0 && mem2->catalog_master->port == 5300 &&
+          strcmp(mem2->catalog_master->tsig_key, "k1") == 0);                              /* the masters and the key of the consumer */
+    CHECK(mem1 && mem1 != hid && mem1->is_catalog_member);                                  /* D17-1: the member wins */
+    CHECK(!in_snapshot("default", hid) && dbreg_find_info("default", "m1.test.", info, 1) == 1 && info[0].shadowed);
+
+    /* the consumer's row is deleted: it leaves with its members, and the DB zone they hid is served again */
+    CHECK(dbreg_delete("default", "cat.test.", 12) == 1);
+    CHECK(snapshot_apply_db_delta() >= 1);
+    CHECK(!name_in_snapshot("default", "cat.test.") && !name_in_snapshot("default", "m2.test."));
+    CHECK(in_snapshot("default", hid));
+    CHECK(dbreg_find_info("default", "m1.test.", info, 1) == 1 && !info[0].shadowed);
+    CHECK(in_snapshot("default", p1));
+
+    zone_ext_shared_unref(sh);
+    zone_retire_process(true);
+    dbreg_reset();
+    db_settings_reset();
+}
+
 int main(void) {
     snprintf(g_dir, sizeof(g_dir), "/tmp/karidns_dbreg.XXXXXX");
     if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
@@ -770,6 +875,7 @@ int main(void) {
     test_catalog_member_wins();
     test_dbcfg();
     test_settings_interning();
+    test_secondary_entries();
     test_concurrent();
     char cmd[300];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", g_dir);

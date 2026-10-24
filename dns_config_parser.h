@@ -201,7 +201,8 @@ void zone_ext_shared_unref(zone_ext_shared_t *s);
 /* Restricted parse of the settings text of a DB zone (beta design 1.3, 3.5).  The text is hostile: only the statements the
  * loader can write are accepted (allow-transfer, allow-update, also-notify, tsig-key, notify-retries, notify-retry-interval,
  * notify-retry-backoff, ixfr-history, additional-from-auth, disable-auto-tc-flag, zone-udp-bufsize, zone-tcp-mss,
- * zone-tcp-window, zone-tcp-sndbuf, transfer-acl-match, update-acl-match); everything else (file, type, masters, program*,
+ * zone-tcp-window, zone-tcp-sndbuf, transfer-acl-match, update-acl-match, and (B7b) masters / primaries: IP addresses with an optional
+ * port, at most 32, for a database secondary zone); everything else (file, type, program*,
  * include, unknown) is an error.  A statement that is written twice replaces the first (so the text of a profile followed by
  * the text of a zone is "the zone overrides the profile, statement by statement").  The ACL entries must be addresses,
  * prefixes, any or none ("!" allowed); in allow-update a name that is not an address is a TSIG key name.  Named ACLs of
@@ -311,6 +312,7 @@ typedef struct {
   acl_entry_t *acl_ceiling_parsed;
   char **acl_ceiling_keys;
   int acl_ceiling_keys_count;
+  uint8_t acl_ceiling_match;   /* acl-ceiling-match: ACL_MATCH_DEFAULT/ANY = address OR key (B7a), ACL_MATCH_ALL = address AND key */
   bool auto_reload;
   uint32_t poll_interval;      /* seconds, 1..60 */
   uint32_t coalesce_ms;        /* 0..10000 */

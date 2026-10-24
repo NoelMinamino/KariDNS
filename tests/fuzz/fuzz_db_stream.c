@@ -137,16 +137,17 @@ static zone_ext_shared_t *fuzz_settings(const kdb_zone_begin_t *zb) {
     return sh;
 }
 
-static zone_db_entry_t *scratch_entry(const char *view, const char *zone, zone_ext_shared_t *sh) {
+static zone_db_entry_t *scratch_entry(const char *view, const char *zone, zone_ext_shared_t *sh, uint8_t kind) {
     zone_db_entry_t *e = create_new_zone_entry(zone, view);
     if (!e) return NULL;
-    zone_config_t *dc = db_zone_config_new(zone, sh);
+    zone_config_t *dc = db_zone_config_new_kind(zone, sh, kind == KDB_ZK_PRIMARY ? 0 : kind == KDB_ZK_SECONDARY ? 1 : 2);
     if (!dc) {
         free_zone_db_entry(e);
         return NULL;
     }
     e->source = ZONE_SRC_DB;
-    e->kind = ZONE_KIND_PRIMARY;
+    e->kind = kind == KDB_ZK_PRIMARY ? ZONE_KIND_PRIMARY : ZONE_KIND_SECONDARY;
+    e->is_secondary = kind != KDB_ZK_PRIMARY;      /* B7b */
     atomic_store_explicit(&e->dbcfg, dc, memory_order_release);
     return e;
 }
@@ -168,6 +169,7 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
     bool failed = false;
     char why[KDB_REASON_LEN];
     zone_ext_shared_t *zsh = NULL;
+    uint8_t skind = KDB_ZK_PRIMARY;
     g_prof_len = 0;
     for (;;) {
         kdb_frame_t fr;
@@ -182,8 +184,10 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
             failed = false;
             zone_ext_shared_unref(zsh);
             zsh = fuzz_settings(&m.u.zone_begin);
-            b = (m.u.zone_begin.zone_kind == KDB_ZK_PRIMARY) ? db_zone_build_new(zone, m.u.zone_begin.rr_count) : NULL;
-            if (!b) failed = true;
+            skind = m.u.zone_begin.zone_kind;
+            b = (skind == KDB_ZK_PRIMARY) ? db_zone_build_new(zone, m.u.zone_begin.rr_count) : NULL;
+            /* B7b: a secondary zone needs masters in its settings and has no data (job_execute_secondary()) */
+            if (skind == KDB_ZK_PRIMARY ? !b : !(zsh && zsh->ext.masters_count > 0)) failed = true;
             break;
         case KDB_T_PROFILE:
             g_prof_len = m.u.profile.settings.len < sizeof(g_prof) ? m.u.profile.settings.len : sizeof(g_prof);
@@ -198,11 +202,32 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
             b = NULL;
             break;
         case KDB_T_ZONE_END:
-            if (b && !failed) {
+            if (skind != KDB_ZK_PRIMARY && !failed) {
+                zone_db_entry_t *e = dbreg_lookup_entry(view, zone);
+                const zone_config_t *oc = e ? atomic_load(&e->dbcfg) : NULL;
+                bool created = false;
+                if (e && (!e->is_secondary || !oc || oc->is_catalog != (skind == KDB_ZK_CATALOG))) e = NULL;
+                if (!e) {
+                    e = scratch_entry(view, zone, zsh, skind);
+                    created = e != NULL;
+                } else if (!(zsh ? (oc->ext_shared && oc->ext == &zsh->ext) : oc->ext == NULL)) {
+                    zone_config_t *nc = db_zone_config_new_kind(zone, zsh, skind == KDB_ZK_CATALOG ? 2 : 1);
+                    if (nc) db_entry_set_config(e, nc);
+                }
+                uint8_t dg[32] = { 0 };
+                bool sh;
+                if (!e || dbreg_commit(view, zone, e, created, source_id, 0, dg, &sh) != 0) {
+                    if (created) free_zone_db_entry(e);
+                    (void)dbreg_reject(view, zone, source_id, "rejected");
+                }
+            } else if (skind != KDB_ZK_PRIMARY) {
+                (void)dbreg_reject(view, zone, source_id, "rejected");
+            } else if (b && !failed) {
                 zone_db_entry_t *e = dbreg_lookup_entry(view, zone);
                 bool created = false;
+                if (e && e->is_secondary) e = NULL;       /* B7b: a SLAVE that became a primary is replaced */
                 if (!e) {
-                    e = scratch_entry(view, zone, zsh);
+                    e = scratch_entry(view, zone, zsh, KDB_ZK_PRIMARY);
                     created = e != NULL;
                 }
                 if (e && db_zone_build_install(b, e, NULL, why, sizeof(why)) == 0) {

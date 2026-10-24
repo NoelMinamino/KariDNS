@@ -11,8 +11,11 @@
 # a name below every owner (wildcard, NXDOMAIN, below a delegation, below a DNAME), the hashed owner names of the
 # NSEC3 chain and NXDOMAIN probes are asked in three flavours (plain, EDNS0 DO=0, EDNS0 DO=1) with tests/db/dbquery.c;
 # the responses must be identical byte for byte (message ID masked).  Then the AXFR of both servers is compared as a
-# set of RRs, and, when BIND's dnssec-verify is installed, the zone transferred from the database-backed server is
-# verified (every signature, every NSEC / NSEC3 link and Opt-Out rule).
+# set of RRs (B7b: the database zones may be transferred now: ALLOW-AXFR-FROM in domainmetadata, bounded by acl-ceiling), and,
+# when BIND's dnssec-verify is installed, the zone transferred from the database-backed server is verified (every signature,
+# every NSEC / NSEC3 link and Opt-Out rule).  A third server C has no zone file and no database: it is a plain secondary of B
+# (type slave).  Everything it was asked must come back as B answers it (byte for byte), its own AXFR is the same set of RRs,
+# and dnssec-verify accepts that too (database primary -> file-free KariDNS secondary, B7b).
 #
 # Needs root (the loader must be root-owned and runs as nobody).  SKIP otherwise and when a binary, the sqlite3 CLI, a C
 # compiler or dnssec-keygen / dnssec-signzone is missing.
@@ -33,18 +36,21 @@ id nobody >/dev/null 2>&1 || { echo "SKIP: no user nobody"; exit 0; }
 
 T=$(mktemp -d "${TMPDIR:-/tmp}/karidns_dbsigned.XXXXXX") || exit 1
 chmod 755 "$T"
-SA=""; SB=""
+SA=""; SB=""; SC=""
 stop_servers() {
     [ -n "$SA" ] && kill -TERM "$SA" 2>/dev/null
     [ -n "$SB" ] && kill -TERM "$SB" 2>/dev/null
+    [ -n "$SC" ] && kill -TERM "$SC" 2>/dev/null
     i=0
     while [ $i -lt 50 ]; do
-        { [ -z "$SA" ] || ! kill -0 "$SA" 2>/dev/null; } && { [ -z "$SB" ] || ! kill -0 "$SB" 2>/dev/null; } && break
+        { [ -z "$SA" ] || ! kill -0 "$SA" 2>/dev/null; } && { [ -z "$SB" ] || ! kill -0 "$SB" 2>/dev/null; } &&
+            { [ -z "$SC" ] || ! kill -0 "$SC" 2>/dev/null; } && break
         sleep 0.1; i=$((i + 1))
     done
     [ -n "$SA" ] && kill -KILL "$SA" 2>/dev/null
     [ -n "$SB" ] && kill -KILL "$SB" 2>/dev/null
-    SA=""; SB=""
+    [ -n "$SC" ] && kill -KILL "$SC" 2>/dev/null
+    SA=""; SB=""; SC=""
 }
 cleanup() { stop_servers; if [ -n "${KARI_KEEP:-}" ]; then echo "kept $T"; else rm -rf "$T"; fi; }
 trap cleanup EXIT INT TERM
@@ -55,6 +61,7 @@ fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
 BASE=$((20000 + $$ % 20000))
 PA=$BASE
 PB=$((BASE + 1))
+PC=$((BASE + 2))
 SCHEMA=tests/db/pdns_schema.sqlite3.sql
 
 cc -O1 -o "$T/dbquery" tests/db/dbquery.c 2> "$T/cc.log" || { echo "SKIP: tests/db/dbquery.c does not compile"; cat "$T/cc.log"; exit 0; }
@@ -152,14 +159,32 @@ chown -R nobody "$T/db"; chmod 600 "$T/db/z.db"*
 } > "$T/a.conf"
 {
     printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n' "$PB"
-    printf '    database { driver sqlite3; database-file "%s/db/z.db"; loader-user "nobody"; loader-path "%s/karidns-dbloader"; };\n};\n' "$T" "$T"
+    printf '    database { driver sqlite3; database-file "%s/db/z.db"; loader-user "nobody"; loader-path "%s/karidns-dbloader"; acl-ceiling { 127.0.0.1; }; };\n};\n' "$T" "$T"
 } > "$T/b.conf"
+{   # C: no zone file, no database; a secondary of B for every zone (B7b)
+    printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n};\n' "$PC"
+    for z in $ZONES; do printf 'zone "%s" { type slave; masters { 127.0.0.1 port %s; }; allow-transfer { 127.0.0.1; }; };\n' "$z" "$PB"; done
+} > "$T/c.conf"
 "$KARIDNS" -c "$T/a.conf" -f > "$T/a.log" 2>&1 &
 SA=$!
 "$KARIDNS" -c "$T/b.conf" -f > "$T/b.log" 2>&1 &
 SB=$!
 if ! wait_log "$T/b.log" "\[DB\] initial load complete" 30; then fail "the database server did not finish its startup batch"; sed 's/^/         /' "$T/b.log" | tail -15; exit 1; fi
 sleep 0.5
+"$KARIDNS" -c "$T/c.conf" -f > "$T/c.log" 2>&1 &
+SC=$!
+# C has every zone when each one answers its SOA record (the first transfer is made at the first tick of its control thread).
+# Only a real SOA counts: a zone whose first transfer is still going answers SERVFAIL with EDE 14 "Zone not ready", and +short prints
+# the EDE text, so "any output" is not enough (with a slow server, e.g. under TSan, the queries below would hit the empty zone).
+for z in $ZONES; do
+    i=0; got=""
+    while [ $i -lt 300 ]; do
+        if ./dag @127.0.0.1 -p "$PC" "$z" SOA +short +nohexdump +time=1 +tries=1 2>/dev/null | grep -Eq '( [0-9]+){5}$'; then got=1; break; fi
+        sleep 0.1; i=$((i + 1))
+    done
+    if [ -n "$got" ]; then pass "$z: the file-free secondary C has transferred the zone from the database server"
+    else fail "$z: C did not get the zone from B within 30 s"; grep -h "$z" "$T/c.log" | tail -3 | sed 's/^/         /'; fi
+done
 
 gen_queries() {   # gen_queries APEX: the query list on stdout
     apex=$1
@@ -241,29 +266,47 @@ for z in $ZONES; do
         if [ "$4" = "0" ] && [ "$1" -gt 0 ]; then pass "$z: $1 queries for the NSEC3 owner names, all byte-identical"
         else fail "$z: $4 of $1 NSEC3 owner name queries differ"; cat "$T/cmp.err"; fi
     fi
-    # AXFR as a set of RRs.  DB zones run with the default settings until B7 (the allow-transfer of the metadata is not
-    # applied yet), so the server refuses to transfer them: then only the file server's transfer is checked to work and the
-    # comparison and the dnssec-verify of the transferred zone are skipped (test_presigned runs dnssec-verify on the zone the
-    # reader makes of the same rows).
+    # C, the file-free secondary of B: every query B answered must come back byte for byte as B gave it (the same list)
+    "$T/dbquery" -p "$PC" -t 3 "$T/q.list" "$T/q.c" > /dev/null 2>&1
+    set -- $(compare "$T/q.b" "$T/q.c" 2> "$T/cmp.err")
+    TOTAL=$((TOTAL + $1)); IDENT=$((IDENT + $2))
+    if [ "$4" = "0" ] && [ "$1" = "$NQ" ] && [ "$1" -gt 0 ]; then pass "$z: the secondary C answers all $1 queries as the database server B does (byte-identical)"
+    else fail "$z: $4 of $1 queries differ between the database server and its secondary C (list had $NQ)"; cat "$T/cmp.err"; fi
+    if [ -s "$T/h.list" ]; then
+        "$T/dbquery" -p "$PC" -t 3 "$T/h.list" "$T/h.c" > /dev/null 2>&1
+        set -- $(compare "$T/h.b" "$T/h.c" 2> "$T/cmp.err")
+        TOTAL=$((TOTAL + $1)); IDENT=$((IDENT + $2))
+        if [ "$4" = "0" ] && [ "$1" -gt 0 ]; then pass "$z: C answers the $1 NSEC3 owner name queries as B does"
+        else fail "$z: $4 of $1 NSEC3 owner name queries differ between B and C"; cat "$T/cmp.err"; fi
+    fi
+    # AXFR as a set of RRs: A (the signed file), B (the database zone; its metadata allows 127.0.0.1 and acl-ceiling lets the
+    # address in) and C (a secondary of B).  They must all hold the same RRs.
     ./dag @127.0.0.1 -p "$PA" "$z" AXFR +nohexdump +noall +answer 2> /dev/null | sort > "$T/axfr.a"
     ./dag @127.0.0.1 -p "$PB" "$z" AXFR +nohexdump +noall +answer 2> /dev/null > "$T/axfr.b.raw"
+    ./dag @127.0.0.1 -p "$PC" "$z" AXFR +nohexdump +noall +answer 2> /dev/null > "$T/axfr.c.raw"
     sort "$T/axfr.b.raw" > "$T/axfr.b"
-    if [ ! -s "$T/axfr.a" ]; then fail "$z: the file server did not transfer the zone"
-    elif [ "$(wc -l < "$T/axfr.b" | tr -d ' ')" -lt 10 ]; then echo "  [SKIP] $z: AXFR of a database zone is refused until B7 (default settings); file AXFR $(wc -l < "$T/axfr.a" | tr -d ' ') lines"
+    sort "$T/axfr.c.raw" > "$T/axfr.c"
+    NA=$(wc -l < "$T/axfr.a" | tr -d ' ')
+    if [ "$NA" -lt 10 ]; then fail "$z: the file server did not transfer the zone"
+    elif [ "$(wc -l < "$T/axfr.b" | tr -d ' ')" -lt 10 ]; then fail "$z: the database server refused the AXFR (allow-transfer from the metadata and acl-ceiling)"; grep -h "$z" "$T/b.log" | tail -3 | sed 's/^/         /'
     else
-        if cmp -s "$T/axfr.a" "$T/axfr.b"; then pass "$z: AXFR is the same set of $(wc -l < "$T/axfr.a" | tr -d ' ') lines"
-        else fail "$z: AXFR differs ($(wc -l < "$T/axfr.a" | tr -d ' ') vs $(wc -l < "$T/axfr.b" | tr -d ' ') lines)"; diff "$T/axfr.a" "$T/axfr.b" | head -6; fi
+        if cmp -s "$T/axfr.a" "$T/axfr.b"; then pass "$z: AXFR from the database server is the same set of $NA RRs as the signed file's"
+        else fail "$z: AXFR differs ($NA vs $(wc -l < "$T/axfr.b" | tr -d ' ') lines)"; diff "$T/axfr.a" "$T/axfr.b" | head -6; fi
+        if cmp -s "$T/axfr.b" "$T/axfr.c"; then pass "$z: AXFR from the secondary C is the same set of RRs"
+        else fail "$z: AXFR from C differs from B's ($(wc -l < "$T/axfr.b" | tr -d ' ') vs $(wc -l < "$T/axfr.c" | tr -d ' ') lines)"; diff "$T/axfr.b" "$T/axfr.c" | head -6; fi
         if command -v dnssec-verify >/dev/null 2>&1; then
-            sed '$d' "$T/axfr.b.raw" > "$T/verify.zone"
-            if dnssec-verify -q -o "$z" "$T/verify.zone" > "$T/verify.out" 2>&1; then pass "$z: dnssec-verify of the AXFR from the database server"
-            else fail "$z: dnssec-verify: $(head -3 "$T/verify.out" | tr '\n' ' ')"; fi
+            for who in b c; do
+                sed '$d' "$T/axfr.$who.raw" > "$T/verify.zone"
+                if dnssec-verify -q -o "$z" "$T/verify.zone" > "$T/verify.out" 2>&1; then pass "$z: dnssec-verify of the AXFR from $(echo $who | tr bc BC)"
+                else fail "$z: dnssec-verify of the AXFR from $(echo $who | tr bc BC): $(head -3 "$T/verify.out" | tr '\n' ' ')"; fi
+            done
         fi
     fi
 done
 echo
 echo "$TOTAL queries: $IDENT byte-identical"
 stop_servers
-if grep -q "AddressSanitizer\|runtime error:" "$T/a.log" "$T/b.log" 2>/dev/null; then fail "sanitizer report in a server log"; fi
+if grep -q "AddressSanitizer\|runtime error:" "$T/a.log" "$T/b.log" "$T/c.log" 2>/dev/null; then fail "sanitizer report in a server log"; fi
 if [ "$FAILS" -eq 0 ]; then echo "=== run_db_signed_diff_test: all $PASS checks passed (file vs DB = 0 differences, signed zones) ==="; exit 0; fi
 echo "=== run_db_signed_diff_test: $FAILS check(s) FAILED ($PASS passed) ==="
 exit 1

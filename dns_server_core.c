@@ -2999,9 +2999,20 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
     if (snap) release_zone_snapshot(snap);
     return true;
   }
-  /* retransfer: a database zone is a primary zone; its data comes from the loader, not from a primary server */
-  static const char msg[] = "ERROR zone is a primary zone from the database; read it again with 'karictl reload <zone>'\n";
-  send(cfd, msg, sizeof(msg) - 1, 0);
+  /* retransfer: a SLAVE / CONSUMER zone of the database (B7b) transfers again from its masters, as a configured secondary does;
+   * a primary zone's data comes from the loader, not from a primary server */
+  zone_db_snapshot_t *rsnap = acquire_retained_zone_snapshot();
+  zone_db_entry_t *re = rsnap ? dbreg_snapshot_entry(rsnap, zi->view, zone) : NULL;
+  if (re && re->is_secondary) {
+    syslog(LOG_NOTICE, "[Control] Received retransfer command for zone: %s (database zone, view %s)", zone, zi->view);
+    atomic_store_explicit(&re->serial, 0, memory_order_release);
+    atomic_store_explicit(&re->refresh_now, true, memory_order_release);
+    send(cfd, "OK\n", 3, 0);
+  } else {
+    static const char msg[] = "ERROR zone is a primary zone from the database; read it again with 'karictl reload <zone>'\n";
+    send(cfd, msg, sizeof(msg) - 1, 0);
+  }
+  if (rsnap) release_zone_snapshot(rsnap);
   return true;
 }
 

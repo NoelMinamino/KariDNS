@@ -17,6 +17,8 @@
 #     profile fails the zone in the loader; profile text with `include`, `file`, `type`, or an unclosed brace is refused by the
 #     Backend; editing a profile re-sends the zones that use it (the change log), a metadata-only edit that keeps the serial is
 #     applied (digest), identical settings are shared (dbstatus);
+#   - acl-ceiling-match all (B7b): the client must be inside the ceiling by its address AND its key; any (the default) = either; a
+#     ceiling with one kind of entry: that kind alone decides;
 #   - karidns.conf zones keep "address AND key" for transfers and "address OR key" for updates unless transfer-acl-match /
 #     update-acl-match say otherwise (the options work in karidns.conf too).
 #
@@ -41,7 +43,8 @@ SRV=""
 ADDED_ALIASES=""
 cleanup() {
     [ -n "$SRV" ] && kill -TERM "$SRV" 2>/dev/null
-    sleep 1
+    # wait for the manager (it stops its children first; a sanitizer build is slow): a KILL too early orphans them
+    i=0; while [ -n "$SRV" ] && [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     [ -n "$SRV" ] && kill -KILL "$SRV" 2>/dev/null
     for ip in $ADDED_ALIASES; do ifconfig lo0 inet "$ip" -alias 2>/dev/null || ifconfig lo inet "$ip" -alias 2>/dev/null; done
     rm -rf "$T"
@@ -134,7 +137,8 @@ EOF
 chmod 600 "$T/karictl.conf"
 KCTL="./karictl -c $T/karictl.conf"
 
-# conf FILE VARIANT: full = keys xfr, upd and the ceiling; nokey = no key xfr (and no key in the ceiling); noceil = no ceiling
+# conf FILE VARIANT: full = keys xfr, upd and the ceiling; nokey = no key xfr (and no key in the ceiling); noceil = no ceiling;
+# ceilall / ceilany / ceilalladdr = acl-ceiling-match all / any / all with addresses only (B7b)
 conf() {
     v=${2:-full}
     {
@@ -146,6 +150,9 @@ conf() {
         nokey) CEIL='acl-ceiling { 127.0.0.1; 127.0.0.2; };' ;;
         noceil) CEIL='' ;;
         narrow) CEIL='acl-ceiling { 127.0.0.1; key "xfr"; };' ;;
+        ceilall) CEIL='acl-ceiling { 127.0.0.1; 127.0.0.2; key "xfr"; }; acl-ceiling-match all;' ;;
+        ceilany) CEIL='acl-ceiling { 127.0.0.1; 127.0.0.2; key "xfr"; }; acl-ceiling-match any;' ;;
+        ceilalladdr) CEIL='acl-ceiling { 127.0.0.1; 127.0.0.2; }; acl-ceiling-match all;' ;;
         esac
         cat <<EOF
 options {
@@ -372,6 +379,43 @@ xfr_ok "file zones are not bounded by the ceiling: fdef.test" fdef.test 127.0.0.
 conf "$T/k.conf" full
 $KCTL reconfig > /dev/null 2>&1
 xfr_ok "addr.test: the ceiling is back" addr.test 127.0.0.2
+
+# ================================================================ acl-ceiling-match (B7b)
+echo "== acl-ceiling-match all: the client must be inside the ceiling by its address AND by its key"
+conf "$T/k.conf" ceilall
+OUT=$($KCTL reconfig 2>&1)
+printf '%s\n' "$OUT" | grep -q "^OK" && pass "reconfig with acl-ceiling-match all: $OUT" || fail "reconfig: '$OUT'"
+./karicheck conf "$T/k.conf" > "$T/kc.out" 2>&1; RC=$?
+[ $RC -eq 0 ] && ! grep -q "acl-ceiling-match" "$T/kc.out" && pass "karicheck conf accepts acl-ceiling-match all with addresses and keys, without a warning" || { fail "karicheck conf (ceilall): rc $RC"; sed 's/^/         /' "$T/kc.out" | tail -4; }
+xfr_no "addr.test: 127.0.0.2 is in the database ACL and in the ceiling by address, but not signed" addr.test 127.0.0.2
+xfr_ok "addr.test: 127.0.0.2 signed with xfr (address and key are both inside)" addr.test 127.0.0.2 "xfr:$S_XFR"
+xfr_no "addr.test: 127.0.0.3 signed with xfr (the key is inside, the address is not)" addr.test 127.0.0.3 "xfr:$S_XFR"
+xfr_no "addr.test: 127.0.0.2 signed with a key the ceiling does not name" addr.test 127.0.0.2 "oth:$S_OTH"
+xfr_no "meta.test: 127.0.0.1 unsigned (database ACL: address or key; the ceiling needs both)" meta.test 127.0.0.1
+xfr_ok "meta.test: 127.0.0.1 signed with xfr" meta.test 127.0.0.1 "xfr:$S_XFR"
+xfr_no "meta.test: 127.0.0.3 signed with xfr (the database ACL allows the key, the ceiling does not allow the address)" meta.test 127.0.0.3 "xfr:$S_XFR"
+upd_is "meta.test: the update ACL (address AND upd) is bounded by the ceiling too; upd is not a ceiling key" REFUSED meta.test 127.0.0.1 "upd:$S_UPD"
+xfr_ok "fdef.test: file zones are not bounded by the ceiling" fdef.test 127.0.0.1 "xfr:$S_XFR"
+echo "== acl-ceiling-match any (the default, B7a): address OR key"
+conf "$T/k.conf" ceilany
+$KCTL reconfig > /dev/null 2>&1
+xfr_ok "addr.test: 127.0.0.2 unsigned" addr.test 127.0.0.2
+xfr_ok "addr.test: 127.0.0.3 signed with xfr" addr.test 127.0.0.3 "xfr:$S_XFR"
+xfr_no "addr.test: 127.0.0.3 unsigned" addr.test 127.0.0.3
+xfr_ok "meta.test: 127.0.0.1 unsigned" meta.test 127.0.0.1
+echo "== acl-ceiling-match all with only addresses in the ceiling: that kind alone decides"
+conf "$T/k.conf" ceilalladdr
+$KCTL reconfig > /dev/null 2>&1
+xfr_ok "addr.test: 127.0.0.2 unsigned" addr.test 127.0.0.2
+xfr_no "addr.test: 127.0.0.3 signed with xfr (no key is listed in the ceiling)" addr.test 127.0.0.3 "xfr:$S_XFR"
+./karicheck conf "$T/k.conf" > "$T/kc.out" 2>&1
+grep -q "acl-ceiling-match all has no effect: acl-ceiling lists only addresses" "$T/kc.out" && pass "karicheck conf warns that all has no effect with one kind of entry" || { fail "karicheck conf (ceilalladdr)"; sed 's/^/         /' "$T/kc.out" | tail -4; }
+printf 'options { database { driver sqlite3; database-file "%s/db/z.db"; acl-ceiling-match both; }; };\n' "$T" > "$T/bad.conf"
+./karicheck conf "$T/bad.conf" > "$T/bad.out" 2>&1; RC=$?
+[ $RC -ne 0 ] && grep -q "any or all" "$T/bad.out" && pass "karicheck conf refuses acl-ceiling-match both (any or all)" || { fail "karicheck conf bad.conf (ceiling): rc $RC"; sed 's/^/         /' "$T/bad.out" | tail -4; }
+conf "$T/k.conf" full
+$KCTL reconfig > /dev/null 2>&1
+xfr_ok "addr.test: back to the default, 127.0.0.2 unsigned" addr.test 127.0.0.2
 
 # ================================================================ karicheck conf with the new options
 echo "== karicheck conf: the options"
