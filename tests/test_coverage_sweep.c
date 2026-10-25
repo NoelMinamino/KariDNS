@@ -44,6 +44,14 @@
 #include "test_zone_slots.h"
 #include "tst_entry.h"
 
+/* fork() from a process that has no helper thread running: the snapshot cleanup threads that a reload started are
+ * detached or still on their way out, and a fork() in that window deadlocks under ASan on FreeBSD (the ASan fork handler
+ * holds the allocator lock while waiting for the rtld lock that a starting thread holds). gc_snapshot_wait_idle() joins them. */
+static pid_t quiet_fork(void) {
+    gc_snapshot_wait_idle();
+    return fork();
+}
+
 // Mock globals
 _Atomic int g_control_kq = -1;
 int g_notify_ipc[2] = {-1, -1};
@@ -2366,7 +2374,7 @@ static void xfr_replay(const uint8_t *stream, size_t len, const char *dom, const
     zone_db_entry_t sec; xfr_entry_init(&sec, sec_text, dom);
     int sp[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
     int one = 1 << 22; setsockopt(sp[0], SOL_SOCKET, SO_SNDBUF, &one, sizeof(one)); setsockopt(sp[1], SOL_SOCKET, SO_RCVBUF, &one, sizeof(one));
-    pid_t pid = fork();
+    pid_t pid = quiet_fork();
     if (pid == 0) wd_child();
     if (pid == 0) { close(sp[1]); size_t w = 0; while (w < len) { ssize_t n = write(sp[0], stream + w, len - w); if (n <= 0) break; w += (size_t)n; } close(sp[0]); _exit(0); }
     close(sp[0]);

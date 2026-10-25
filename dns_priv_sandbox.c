@@ -398,14 +398,27 @@ bool apply_run_identity(const char *user, const char *group, char *err, size_t e
 __attribute__((weak)) int __llvm_profile_write_file(void);
 #endif
 
+/* カバレッジ計測ビルド (clang の -fprofile-instr-generate) でだけプロファイルを書き出す。
+ * プロファイル用ランタイムが無い通常のビルドでは weak シンボルが NULL なので何もしない。
+ * capability mode の中では呼ばない: FreeBSD の LLVM プロファイルランタイムは書き出しの前後で
+ * procctl() (lprofSuspendSigKill / lprofRestoreSigKill) を呼び、capability mode では ECAPMODE になる。
+ * Backend は PROC_TRAPCAP を有効にしているので SIGTRAP (TRAP_CAP) で落ちる (終了ステータス 133)。
+ * Backend のカウンタは continuous mode (-mllvm -runtime-counter-relocation=true) で起動時に
+ * mmap 済みのプロファイルへ直接加算されるので、capability mode の中では書き出さなくても失われない。
+ * 書き出しが必要な classic mode でも、cap_enter() 後はプロファイルを open() できないので元々書けない。 */
+void backend_profile_flush(void) {
+#ifdef __clang__
+  unsigned int capmode = 0;
+  if (__llvm_profile_write_file && !(cap_getmode(&capmode) == 0 && capmode != 0))
+    __llvm_profile_write_file();
+#endif
+}
+
 /* Backend でスレッドを1本でも起動した後は exit() を使わない。exit() は atexit ハンドラ
  * (OpenSSL のクリーンアップなど) を、まだ動いている他のスレッドと並行して実行するため、
  * 解放済みのロックやテーブルを他スレッドが使う窓ができる。_exit() はそれを実行しない。
  * カバレッジ計測ビルドではプロファイルだけ先に書き出す。 */
 __attribute__((noreturn)) void backend_exit(int code) {
-#ifdef __clang__
-  if (__llvm_profile_write_file)
-    __llvm_profile_write_file();
-#endif
+  backend_profile_flush();
   _exit(code);
 }

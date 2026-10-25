@@ -52,4 +52,8 @@ bool lookup_group_id(const char *group, gid_t *gid);
  * ハンドラを他スレッドと並行して走らせない)。 */
 __attribute__((noreturn)) void backend_exit(int code);
 
+/* カバレッジ計測ビルドでプロファイルを書き出す (通常ビルドと capability mode の中では何もしない)。
+ * シグナルハンドラからも呼べる。 */
+void backend_profile_flush(void);
+
 #endif /* DNS_PRIV_SANDBOX_H */

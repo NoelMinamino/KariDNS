@@ -368,7 +368,7 @@ register_test "core" "sh" "tests/run_zone_oom_partial_load_test.sh" "OOM fail-cl
 register_test "core" "sh" "tests/run_coverage_merge_test.sh" "Coverage report tolerates corrupt raw profiles (SIGKILL during profile write)"
 register_test "core" "sh" "tests/run_malformed_detection_default_test.sh" "Structural malformation detection in default mode (RFC 1035 §4.1.1)"
 register_test "core" "sh" "tests/run_matrix_queries_test.sh" "Table-driven Query Engine Matrix: Wildcard, DNAME, Delegation & NSEC proofs"
-register_test "core" "sh" "tests/run_server_lifecycle_test.sh" "Server lifecycle: port conflict, bad syntax, signals, and crash recovery"
+register_test "core" "sh" "tests/run_server_lifecycle_test.sh" "Server lifecycle: port conflict, bad syntax, signals, and crash recovery (root only, SKIP otherwise)"
 register_test "core" "sh" "tests/run_tcp_adversary_test.sh" "TCP state machine adversary: slowloris, framing errors, trickle, flood"
 register_test "core" "sh" "tests/run_control_adversary_test.sh" "Control channel adversary: bad AUTH, oversized line, idle client, karictl exit statuses"
 register_test "core" "sh" "tests/run_karicheck_rules_test.sh" "karicheck diagnostic rules: SSHFP, RFC 8624, tcp-idle-timeout, program zones"

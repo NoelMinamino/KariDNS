@@ -40,6 +40,14 @@
 #include <pwd.h>
 #include <grp.h>
 
+/* fork() from a process that has no helper thread running: the snapshot cleanup threads that a reload started are
+ * detached or still on their way out, and a fork() in that window deadlocks under ASan on FreeBSD (the ASan fork handler
+ * holds the allocator lock while waiting for the rtld lock that a starting thread holds). gc_snapshot_wait_idle() joins them. */
+static pid_t quiet_fork(void) {
+    gc_snapshot_wait_idle();
+    return fork();
+}
+
 // Internal server core prototypes for testing
 // (perform_config_reload / perform_config_reload_ext / reload_all_zones come from dns_server_internal.h)
 void run_frontend_router(pid_t backend_pid, int router_id);
@@ -628,7 +636,7 @@ static void test_tcp_pool_and_single_write(void) {
     setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
     static uint8_t big[60000], got[60002];
     for (size_t i = 0; i < sizeof(big); i++) big[i] = (uint8_t)(i * 7);
-    pid_t reader = fork();
+    pid_t reader = quiet_fork();
     assert(reader >= 0);
     if (reader == 0) {
         size_t have = 0;
@@ -1859,7 +1867,7 @@ static void test_server_core_process_lifecycle_and_signals(void) {
     close(g_notify_ipc[1]);
 
     // 4. backend_sig_handler in child process: during startup it exits at once
-    pid_t cpid1 = fork();
+    pid_t cpid1 = quiet_fork();
     assert(cpid1 >= 0);
     if (cpid1 == 0) {
         atomic_store(&g_privilege_drop_complete, false);
@@ -1872,7 +1880,7 @@ static void test_server_core_process_lifecycle_and_signals(void) {
 
     // 4b. O-03: after startup the control thread shuts down (dnstap STOP); the handler only
     // records the signal. A second signal (shutdown stuck) exits at once.
-    pid_t cpid1b = fork();
+    pid_t cpid1b = quiet_fork();
     assert(cpid1b >= 0);
     if (cpid1b == 0) {
         atomic_store(&g_privilege_drop_complete, true);
@@ -1887,7 +1895,7 @@ static void test_server_core_process_lifecycle_and_signals(void) {
     assert(WIFEXITED(status1) && WEXITSTATUS(status1) == 0);
 
     // 5. daemonize in child process
-    pid_t cpid2 = fork();
+    pid_t cpid2 = quiet_fork();
     assert(cpid2 >= 0);
     if (cpid2 == 0) {
         daemonize();
@@ -1909,7 +1917,7 @@ static void test_server_core_process_lifecycle_and_signals(void) {
     assert(wres == NULL);
 
     // 7. run_frontend_router in child process
-    pid_t cpid3 = fork();
+    pid_t cpid3 = quiet_fork();
     assert(cpid3 >= 0);
     if (cpid3 == 0) {
         server_config_t test_cfg;
@@ -2051,7 +2059,7 @@ static void test_nonroot_startup_identity_and_preflight(void) {
 
         struct passwd *nb = getpwnam("nobody");
         assert(nb);
-        pid_t pid = fork();
+        pid_t pid = quiet_fork();
         assert(pid >= 0);
         if (pid == 0) {
             if (setgroups(0, NULL) != 0 || setgid(nb->pw_gid) != 0 || setuid(nb->pw_uid) != 0)
@@ -2212,7 +2220,7 @@ static void test_crypto_prewarm_survives_capability_mode(void) {
     printf("[TEST] Server Core: tsig_prewarm_crypto() keeps HMAC usable in capability mode...\n");
     fflush(stdout);
 #ifdef __FreeBSD__
-    pid_t pid = fork();
+    pid_t pid = quiet_fork();
     assert(pid >= 0);
     if (pid == 0) {
         // Child: same order as main() in dns_server_core.c: pre-warm, then cap_enter().
