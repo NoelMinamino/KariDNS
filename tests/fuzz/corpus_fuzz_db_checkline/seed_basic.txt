@@ -1,0 +1,8 @@
+BI		0	karidns_* schema version 2
+Z	ok.test.	1	primary	*
+W	ok.test.	1	records.id 5: 1 record(s) have a NULL ttl; default-ttl 3600 used (first shown)
+E	ok.test.	1	records.id 7: MX content already has a preference and prio is 5: ambiguous
+D	ok.test.	1	       Expected: 00ff
+S	ok.test.	1	allow-transfer { 192.0.2.0/24; key "k"; };
+O	ok.test.	1	ZONEMD (Scheme 1, Hash 1) for 'ok.test.' is VALID.
+R	1	1	1

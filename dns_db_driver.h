@@ -33,6 +33,8 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
 #include "dns_pdns_reader.h"
 
 #define DB_STOPPED 1
@@ -77,6 +79,30 @@ typedef struct {
 } db_reload_row_t;
 
 typedef struct db_conn db_conn_t;   /* opaque, one per source (view file / schema) */
+
+/* B12 (karidns-dbloader --check, `karicheck db`, beta design 7.2): what schema_findings() needs to know about the configuration. */
+typedef struct {
+    bool auto_reload;               /* options { database { auto-reload yes; } }: the change log and its triggers are needed */
+    const char *server_id;          /* PostgreSQL: the server-id of the configuration, NULL if none */
+} db_check_opts_t;
+/* level: 'E' error, 'W' warning, 'I' information; text is one line of printable ASCII or UTF-8 (it may carry a database name) */
+typedef void (*db_finding_cb)(void *ud, char level, const char *text);
+
+/* The change log triggers db/karidns_ext.*.sql creates: karidns_trg_<infix>_{ins,upd,del} on <table>, and karidns_changes_prune on
+ * karidns_changes.  schema_findings() looks for them by name when auto-reload is on. */
+#define DB_CHANGE_TRIGGERS(X)                                                                                        \
+    X(domains, "domains") X(records, "records") X(domainmetadata, "domainmetadata") X(cryptokeys, "cryptokeys")         \
+    X(domain_views, "karidns_domain_views") X(zone_tagdefs, "karidns_zone_tagdefs") X(record_tags, "karidns_record_tags") \
+    X(record_tinydns, "karidns_record_tinydns") X(profiles, "karidns_profiles")
+
+/* "a, b, c, and N more" in list[cap]: add one name (at most 6 are written, the rest is counted in *more) */
+static inline void db_list_add(char *list, size_t cap, unsigned *n, const char *name) {
+    if (*n < 6) {
+        size_t l = strlen(list);
+        snprintf(list + l, cap - l, "%s%s", *n ? ", " : "", name);
+    }
+    (*n)++;
+}
 
 typedef int (*db_zone_cb)(void *ud, const db_zone_row_t *row);
 typedef int (*db_record_cb)(void *ud, int64_t domain_id, const db_record_row_t *row);
@@ -166,6 +192,12 @@ typedef struct db_driver {
     int (*watch_requests)(db_conn_t *c);
     int (*requests_max)(db_conn_t *c, uint64_t *generation);
     int (*reload_requests)(db_conn_t *c, uint64_t after, db_reload_cb cb, void *ud, uint64_t *max_gen, bool *gap);
+    /* B12 (`karicheck db`): everything the schema check of design 7.2 can say, read only, inside or outside a snapshot: the required PowerDNS
+     * tables and columns (all that are missing, not only the first), the karidns_* tables and their version, the change log triggers when
+     * o->auto_reload, and (PostgreSQL) the privileges of the role the connection uses, as far as the catalog functions
+     * has_table_privilege() / has_column_privilege() show them.  Call it after open(), before check_schema() (which stops at the first
+     * missing column).  0, or -1 / DB_ERR_RETRY with db_errmsg(). */
+    int (*schema_findings)(db_conn_t *c, const db_check_opts_t *o, db_finding_cb cb, void *ud);
 } db_driver_t;
 
 /* compiled in when the driver is listed in DB_DRIVERS (Makefile) */

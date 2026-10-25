@@ -14,7 +14,7 @@ Measured on 2026-09-28 at commit `bea0c17` (`main`).
 
 ### Coverage Gate (`tests/coverage_gate.pl`)
 
-The CI job "Coverage gate" runs the Phase 2 thresholds with `--strict`. The tiers are defined in `tests/coverage_gate.pl`: Tier A = protocol and parser modules (`dns_wire.c`, `dns_zone_parser.c`, `dns_config_parser.c`, `dns_tinydns_parser.c`, `dns_utils.c`, `dns_cidr.c`, `dns_tsig_acl.c`, `dns_query_engine.c`, `dns_axfr_ixfr.c`, `dns_dynamic_update.c`, `dns_catalog_zone.c`, `dns_rrl.c`, `dns_edns_ecs.c`), Tier B = server runtime (`dns_server_core.c`, `dns_snapshot_rcu.c`, `dns_dnstap.c`, `dns_priv_sandbox.c`, `dns_epoch_rcu.c`), Tier C = tools (`tools/dag*.c`, `tools/karicheck.c`, `tools/karictl.c`).
+The CI job "Coverage gate" runs the Phase 2 thresholds with `--strict`. The tiers are defined in `tests/coverage_gate.pl`: Tier A = protocol and parser modules (`dns_wire.c`, `dns_zone_parser.c`, `dns_config_parser.c`, `dns_tinydns_parser.c`, `dns_utils.c`, `dns_cidr.c`, `dns_tsig_acl.c`, `dns_query_engine.c`, `dns_axfr_ixfr.c`, `dns_dynamic_update.c`, `dns_catalog_zone.c`, `dns_rrl.c`, `dns_edns_ecs.c`), Tier B = server runtime (`dns_server_core.c`, `dns_snapshot_rcu.c`, `dns_dnstap.c`, `dns_priv_sandbox.c`, `dns_epoch_rcu.c`), Tier C = tools (`tools/dag*.c`, `tools/karicheck.c` with `dns_zone_lint.c`, `tools/karictl.c`).
 
 | Tier | Line (target) | Region (target) | Branch (target) | Status |
 |---|---|---|---|---|

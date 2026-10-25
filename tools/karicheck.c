@@ -10,6 +10,9 @@
 #include "../dns_zone_parser.h"
 #include "../dns_utils.h"
 #include "../dns_wire.h"
+#include "../dns_zone_lint.h"
+#include "../dns_db_checkproto.h"
+#include "../dns_cidr.h"
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -17,6 +20,7 @@
 #include <pwd.h>
 #include <grp.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -24,146 +28,6 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include "karidns_tool_linkage.h"
-
-/* K-04: ゾーンの検査中に出す [ERROR] / [WARNING] は全て kc_error() / kc_warning() を通して数え、
- * [RESULT] の件数を出力した行と一致させる。t == NULL なら数えずに出力だけする。 */
-typedef struct { int errors; int warnings; } kc_tally_t;
-
-static void kc_vreport(int *counter, const char *tag, const char *fmt, va_list ap) {
-    fprintf(stderr, "[%s] ", tag);
-    vfprintf(stderr, fmt, ap);
-    if (counter) (*counter)++;
-}
-
-KARIDNS_TOOL_FN void kc_error(kc_tally_t *t, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
-KARIDNS_TOOL_FN void kc_error(kc_tally_t *t, const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    kc_vreport(t ? &t->errors : NULL, "ERROR", fmt, ap);
-    va_end(ap);
-}
-
-KARIDNS_TOOL_FN void kc_warning(kc_tally_t *t, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
-KARIDNS_TOOL_FN void kc_warning(kc_tally_t *t, const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    kc_vreport(t ? &t->warnings : NULL, "WARNING", fmt, ap);
-    va_end(ap);
-}
-
-/* [T6] RFC 2181 §5.2 TTL不整合検出用ソート比較関数
- * build_zone_index() 実行前の生データを qsort で正規化前に冗丸を検出する */
-KARIDNS_TOOL_FN int cmp_rec_by_name_type(const void *pa, const void *pb) {
-    const dns_record_t *ra = *(const dns_record_t **)pa;
-    const dns_record_t *rb = *(const dns_record_t **)pb;
-    if (!ra->name || !rb->name) return ra->name ? 1 : (rb->name ? -1 : 0);
-    int c = strcasecmp(ra->name, rb->name);
-    if (c != 0) return c;
-    if (ra->type_code != rb->type_code) return (ra->type_code < rb->type_code) ? -1 : 1;
-    return 0;
-}
-
-typedef struct { int alg_num; const char *name; const char *status; } dnssec_alg_info_t;
-
-static const dnssec_alg_info_t KNOWN_DNSSEC_ALGS[] = {
-    {1,  "RSAMD5",              "MUST NOT (非推奨・危殆化)"},
-    {3,  "DSA",                 "MUST NOT (非推奨)"},
-    {5,  "RSASHA1",             "NOT RECOMMENDED"},
-    {6,  "DSA-NSEC3-SHA1",      "MUST NOT (非推奨)"},
-    {7,  "RSASHA1-NSEC3-SHA1",  "NOT RECOMMENDED"},
-    {8,  "RSASHA256",           "MUST"},
-    {10, "RSASHA512",           "NOT RECOMMENDED"},
-    {12, "ECC-GOST",            "MUST NOT (非推奨)"},
-    {13, "ECDSAP256SHA256",     "MUST"},
-    {14, "ECDSAP384SHA384",     "MAY"},
-    {15, "ED25519",             "RECOMMENDED"},
-    {16, "ED448",               "MAY"},
-    {18, "MLDSA44",             "MAY"},  // draft-westerbaan-dnssec-mldsa (IANA: MAY for signing and validation)
-};
-
-KARIDNS_TOOL_FN void check_dnssec_algorithm(kc_tally_t *t, int alg_num, const char *rec_name, const char *rec_type, int flags, int protocol) {
-    // RFC 8078 §4: CDNSKEY delete signal (flags=0, protocol=3, algorithm=0)
-    if (strcmp(rec_type, "CDNSKEY") == 0 && alg_num == 0 && flags == 0 && protocol == 3) {
-        return;
-    }
-    for (size_t i = 0; i < sizeof(KNOWN_DNSSEC_ALGS)/sizeof(KNOWN_DNSSEC_ALGS[0]); i++) {
-        if (KNOWN_DNSSEC_ALGS[i].alg_num == alg_num) {
-            if (strstr(KNOWN_DNSSEC_ALGS[i].status, "MUST NOT") ||
-                strstr(KNOWN_DNSSEC_ALGS[i].status, "NOT RECOMMENDED")) {
-                kc_warning(t, "%s '%s': DNSSEC algorithm %d (%s) is %s (RFC 8624)\n",
-                        rec_type, rec_name, alg_num, KNOWN_DNSSEC_ALGS[i].name, KNOWN_DNSSEC_ALGS[i].status);
-            }
-            return;
-        }
-    }
-    kc_warning(t, "%s '%s': unknown DNSSEC algorithm number %d\n", rec_type, rec_name, alg_num);
-}
-
-/* Decoded length of base64 text split over several fields (whitespace inside the value is allowed), or -1 when the
- * text is not a whole number of base64 quanta. */
-static long b64_fields_decoded_len(char *const *fields, int count) {
-    size_t chars = 0, pad = 0;
-    for (int i = 0; i < count; i++) {
-        for (const char *c = fields[i]; *c; c++) {
-            if (*c == '=') pad++;
-            else if (isalnum((unsigned char)*c) || *c == '+' || *c == '/') { if (pad) return -1; }
-            else return -1;
-            chars++;
-        }
-    }
-    if (chars == 0 || chars % 4 != 0 || pad > 2) return -1;
-    return (long)(chars / 4 * 3 - pad);
-}
-
-/* Algorithms whose public key / signature has a fixed size: a DNSKEY or RRSIG of another size cannot validate.
- * ML-DSA-44 (algorithm 18, draft-westerbaan-dnssec-mldsa): 1312-octet public key, 2420-octet signature. */
-KARIDNS_TOOL_FN void check_dnssec_blob_length(kc_tally_t *t, int alg_num, const char *rec_name, const char *rec_type,
-                                              bool is_signature, char *const *fields, int count) {
-    long want;
-    if (alg_num == 18) want = is_signature ? 2420 : 1312;
-    else return;
-    long got = b64_fields_decoded_len(fields, count);
-    if (got < 0) {
-        kc_warning(t, "%s '%s': %s is not valid base64\n", rec_type, rec_name, is_signature ? "signature" : "public key");
-    } else if (got != want) {
-        kc_warning(t, "%s '%s': algorithm %d (MLDSA44) %s must be %ld octets, found %ld "
-                      "(draft-westerbaan-dnssec-mldsa)\n",
-                   rec_type, rec_name, alg_num, is_signature ? "signature" : "public key", want, got);
-    }
-}
-
-typedef struct { int digest_type; const char *name; const char *status; } ds_digest_info_t;
-static const ds_digest_info_t KNOWN_DS_DIGESTS[] = {
-    {1, "SHA-1",            "MUST NOT (非推奨・危殆化, RFC 8624 §3.3)"},
-    {2, "SHA-256",          "MUST"},
-    {3, "GOST R 34.11-94",  "MUST NOT (非推奨, RFC 8624 §3.3)"},
-    {4, "SHA-384",          "MAY"},
-};
-
-KARIDNS_TOOL_FN void check_ds_digest_type(kc_tally_t *t, int digest_type, int algorithm, int key_tag,
-                                 const char *rec_name, const char *rec_type) {
-    // RFC 8078 §4: CDS delete signal (digest_type=0, algorithm=0, key_tag=0)
-    if (strcmp(rec_type, "CDS") == 0 && digest_type == 0 &&
-        algorithm == 0 && key_tag == 0) {
-        return; // RFC 8078 delete signal: 正当、警告不要
-    }
-    if (digest_type == 0) {
-        kc_warning(t, "%s '%s': digest type 0 (NULL) is invalid outside of the RFC 8078 CDS delete signal\n",
-                rec_type, rec_name);
-        return;
-    }
-    for (size_t i = 0; i < sizeof(KNOWN_DS_DIGESTS)/sizeof(KNOWN_DS_DIGESTS[0]); i++) {
-        if (KNOWN_DS_DIGESTS[i].digest_type == digest_type) {
-            if (strstr(KNOWN_DS_DIGESTS[i].status, "MUST NOT")) {
-                kc_warning(t, "%s '%s': DS digest type %d (%s) is %s\n",
-                        rec_type, rec_name, digest_type,
-                        KNOWN_DS_DIGESTS[i].name, KNOWN_DS_DIGESTS[i].status);
-            }
-            return;
-        }
-    }
-    kc_warning(t, "%s '%s': unknown DS digest type %d\n", rec_type, rec_name, digest_type);
-}
 
 // Stub for open_via_dir_cache used by dns_config_parser.c
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) {
@@ -309,238 +173,6 @@ KARIDNS_TOOL_FN void print_error_context(const char *root_file_path, const char 
     fprintf(stderr, "\033[0m\n\n");
 }
 
-/* RFC 4034 §6.2 の正規形の RR 1 件 (名前は非圧縮、所有者名と item 3 の型の RDATA 内の名前は小文字)。 */
-typedef struct {
-    const dns_record_t *rec;
-    uint8_t *wire;      /* 所有者名, TYPE, CLASS, TTL, RDLENGTH, RDATA */
-    uint16_t len;
-    uint16_t rdata_off;
-} kc_canon_rr_t;
-
-KARIDNS_TOOL_FN bool kc_canonical_rr(const dns_record_t *rec, kc_canon_rr_t *out) {
-    uint8_t buf[65535];
-    uint16_t len = 0;
-    /* owner_name を渡すと所有者名は非圧縮形で書かれる (rec->name_wire は元の大文字小文字のまま)。D17-4 以降
-     * serialize_dns_record() は名前の大文字小文字を変えないので、正規形 (RFC 4034 §6.2) の小文字化はここで行う */
-    if (serialize_dns_record(buf, sizeof(buf), &len, rec, NULL, rec->name, 0xFFFFFFFF) != 0) return false;
-    size_t owner = 0;
-    while (owner < len && buf[owner] != 0) owner += 1 + (size_t)buf[owner];
-    owner++;
-    if (owner + 10 > len) return false;
-    dns_canonical_downcase_rdata(2 /* one name */, buf, owner);
-    size_t rdlen = ((size_t)buf[owner + 8] << 8) | buf[owner + 9];
-    if (owner + 10 + rdlen != len) return false;
-    /* RFC 4034 §6.2 item 3 の型の RDATA 内の名前を小文字に (K-01。共通関数は dns_wire.c) */
-    dns_canonical_downcase_rdata(rec->type_code, buf + owner + 10, rdlen);
-    out->wire = malloc(len);
-    if (!out->wire) return false;
-    memcpy(out->wire, buf, len);
-    out->rec = rec;
-    out->len = len;
-    out->rdata_off = (uint16_t)(owner + 10);
-    return true;
-}
-
-/* RFC 4034 §6.1 (所有者名)、RFC 8976 §3.3.1 (同じ所有者名の RRset は TYPE の昇順)、RFC 4034 §6.3 (RDATA を
- * 左詰めのオクテット列として比べ、短い方が先)。全順序なので、重複した RR は qsort() 後に必ず隣り合う。 */
-KARIDNS_TOOL_FN int kc_cmp_canon_rr(const void *a, const void *b) {
-    const kc_canon_rr_t *x = a, *y = b;
-    int c = compare_canonical_name(x->rec->name, y->rec->name);
-    if (c != 0) return c;
-    if (x->rec->type_code != y->rec->type_code) return x->rec->type_code < y->rec->type_code ? -1 : 1;
-    size_t lx = (size_t)(x->len - x->rdata_off), ly = (size_t)(y->len - y->rdata_off);
-    int m = memcmp(x->wire + x->rdata_off, y->wire + y->rdata_off, lx < ly ? lx : ly);
-    if (m != 0) return m;
-    return lx < ly ? -1 : (lx > ly ? 1 : 0);
-}
-
-KARIDNS_TOOL_FN bool validate_zonemd_scheme_halg(const dns_record_t *zm, uint8_t *out_scheme,
-                                        uint8_t *out_halg, bool warn, kc_tally_t *t) {
-    if (!zm || zm->rdata_count < 3 || !zm->rdata[1] || !zm->rdata[2]) return false;
-    char *scheme_endptr, *halg_endptr;
-    long scheme_val = strtol(zm->rdata[1], &scheme_endptr, 10);
-    long halg_val = strtol(zm->rdata[2], &halg_endptr, 10);
-    if (*scheme_endptr != '\0' || scheme_val < 0 || scheme_val > 255) {
-        if (warn) {
-            kc_warning(t, "ZONEMD scheme '%s' is not a valid number (0-255) for name '%s'\n",
-                    zm->rdata[1], zm->name);
-        }
-        return false;
-    }
-    if (*halg_endptr != '\0' || halg_val < 0 || halg_val > 255) {
-        if (warn) {
-            kc_warning(t, "ZONEMD hash algorithm '%s' is not a valid number (0-255) for name '%s'\n",
-                    zm->rdata[2], zm->name);
-        }
-        return false;
-    }
-    if (out_scheme) *out_scheme = (uint8_t)scheme_val;
-    if (out_halg) *out_halg = (uint8_t)halg_val;
-    return true;
-}
-
-/* RFC 8976 §3.3.1 の SIMPLE scheme でゾーンのダイジェストを計算する。halg 1 = SHA-384, 2 = SHA-512。 */
-static bool kc_zone_digest(const kc_canon_rr_t *rrs, size_t n, uint8_t halg, uint8_t *md, unsigned int *md_len) {
-    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-    if (!mdctx) return false;
-    bool ok = EVP_DigestInit_ex(mdctx, halg == 1 ? EVP_sha384() : EVP_sha512(), NULL) == 1;
-    for (size_t i = 0; ok && i < n; i++) {
-        /* RFC 8976 §3.3.1.1 / RFC 4034 §6.3: 所有者名・CLASS・TYPE・RDATA が等しい重複は 1 回だけ含める */
-        if (i > 0 && kc_cmp_canon_rr(&rrs[i - 1], &rrs[i]) == 0 &&
-            rrs[i - 1].rec->class_val == rrs[i].rec->class_val) continue;
-        ok = EVP_DigestUpdate(mdctx, rrs[i].wire, rrs[i].len) == 1;
-    }
-    if (ok) ok = EVP_DigestFinal_ex(mdctx, md, md_len) == 1;
-    EVP_MD_CTX_free(mdctx);
-    return ok;
-}
-
-/* RFC 8976 §4: apex の ZONEMD を全て検証する。対応している scheme と hash algorithm の ZONEMD は全て一致しなければ
- * エラーとする (§4 の注記は「どれか 1 つが一致すれば十分」だが、karicheck は公開する側の検査なので、受け手が
- * 扱えるどの ZONEMD も正しいことを求める)。 */
-KARIDNS_TOOL_FN bool verify_zonemd(const char *domain, zone_arena_t *arena, kc_tally_t *t) {
-    const dns_record_t *soa = NULL;
-    size_t zm_count = 0;
-    for (size_t i = 0; i < arena->count; i++) {
-        const dns_record_t *r = &arena->records[i];
-        if (!domain_names_match_ci(r->name, domain)) continue;
-        if (r->type_code == 63) zm_count++;
-        if (r->type_code == 6 && !soa) soa = r;
-    }
-    if (zm_count == 0) return true; // ZONEMD がなければ検証しない
-
-    uint32_t soa_serial = 0;
-    if (soa && soa->is_cached) {
-        soa_serial = soa->cache.soa.serial;
-    } else if (soa && soa->rdata_count >= 3 && soa->rdata[2]) {
-        soa_serial = (uint32_t)strtoul(soa->rdata[2], NULL, 10);
-    }
-
-    kc_canon_rr_t *rrs = calloc(arena->count, sizeof(*rrs));
-    if (!rrs) {
-        kc_error(t, "Out of memory computing the ZONEMD digest of zone '%s'\n", domain);
-        return false;
-    }
-    size_t n = 0;
-    bool canon_ok = true;
-    for (size_t i = 0; i < arena->count; i++) {
-        const dns_record_t *r = &arena->records[i];
-        bool at_apex = domain_names_match_ci(r->name, domain);
-        /* RFC 8976 §3.3.1.1: apex の ZONEMD とそれを覆う RRSIG は含めない。apex 以外の ZONEMD は普通の RR として
-         * 含める (Appendix A.2 の non-apex)。ゾーン外のデータは zone_arena_drop_out_of_zone() で除いてある。 */
-        if (at_apex && r->type_code == 63) continue;
-        if (at_apex && r->type_code == 46 && r->rdata_count > 0 && get_type_code(r->rdata[0]) == 63) continue;
-        if (!kc_canonical_rr(r, &rrs[n])) {
-            kc_error(t, "Record '%s %s' cannot be converted to canonical wire form; the ZONEMD digest of zone '%s' "
-                        "is not computed\n", r->name, r->type ? r->type : "", domain);
-            canon_ok = false;
-            break;
-        }
-        n++;
-    }
-    if (canon_ok) qsort(rrs, n, sizeof(*rrs), kc_cmp_canon_rr);
-
-    bool all_valid = canon_ok;
-    bool have_md[3] = {false, false, false};
-    uint8_t md[3][EVP_MAX_MD_SIZE];
-    unsigned int md_len[3] = {0, 0, 0};
-    for (size_t i = 0; canon_ok && i < arena->count; i++) {
-        const dns_record_t *zm = &arena->records[i];
-        if (zm->type_code != 63 || !domain_names_match_ci(zm->name, domain)) continue;
-        uint8_t scheme, halg;
-        /* フィールドの不足や範囲外は check_zone() の RR ごとの検査で警告済み */
-        if (zm->rdata_count < 4 || !validate_zonemd_scheme_halg(zm, &scheme, &halg, false, NULL)) continue;
-
-        /* RFC 8976 §4 step 5a */
-        uint32_t zm_serial = (uint32_t)strtoul(zm->rdata[0], NULL, 10);
-        if (soa && zm_serial != soa_serial) {
-            kc_error(t, "ZONEMD serial %u does not match SOA serial %u in zone '%s'\n", zm_serial, soa_serial, domain);
-            all_valid = false;
-            continue;
-        }
-        /* step 5b, 5c */
-        if (scheme != 1 || (halg != 1 && halg != 2)) {
-            printf("[INFO] ZONEMD (Scheme %d, Hash %d) for '%s' is not verified: unsupported scheme or hash "
-                   "algorithm (RFC 8976 section 4)\n", scheme, halg, domain);
-            continue;
-        }
-        /* step 4: 同じ (Scheme, Hash Algorithm) の ZONEMD が複数あれば、それらでの検証は成功としない */
-        bool dup_before = false, dup_after = false;
-        for (size_t j = 0; j < arena->count; j++) {
-            const dns_record_t *o = &arena->records[j];
-            uint8_t os, oh;
-            if (j == i || o->type_code != 63 || !domain_names_match_ci(o->name, domain) || o->rdata_count < 4 ||
-                !validate_zonemd_scheme_halg(o, &os, &oh, false, NULL) || os != scheme || oh != halg) continue;
-            if (j < i) dup_before = true;
-            else dup_after = true;
-        }
-        if (dup_before) continue; // 最初の 1 件で報告済み
-        if (dup_after) {
-            kc_error(t, "Zone '%s' has more than one ZONEMD with Scheme %d and Hash %d; none of them can be "
-                        "verified (RFC 8976 section 4, step 4)\n", domain, scheme, halg);
-            all_valid = false;
-            continue;
-        }
-        /* step 5d: ダイジェストの長さはハッシュの出力長 (SHA-384 は 48、SHA-512 は 64 オクテット) */
-        char hex[2048] = "";
-        size_t hex_len = 0;
-        bool hex_overflow = false;
-        for (int k = 3; k < zm->rdata_count; k++) {
-            size_t flen = strlen(zm->rdata[k]);
-            if (hex_len + flen >= sizeof(hex)) {
-                hex_overflow = true;
-                break;
-            }
-            memcpy(hex + hex_len, zm->rdata[k], flen);
-            hex_len += flen;
-            hex[hex_len] = '\0';
-        }
-        uint8_t expected[EVP_MAX_MD_SIZE];
-        size_t exp_len = hex_overflow ? (size_t)-1 : hex_decode(hex, expected, sizeof(expected));
-        size_t want = halg == 1 ? 48 : 64;
-        if (exp_len != want) {
-            kc_error(t, "ZONEMD (Scheme %d, Hash %d) for '%s': the digest is not %zu octets "
-                        "(RFC 8976 section 4, step 5d)\n", scheme, halg, domain, want);
-            all_valid = false;
-            continue;
-        }
-        if (!have_md[halg]) {
-            if (!kc_zone_digest(rrs, n, halg, md[halg], &md_len[halg])) {
-                kc_error(t, "Computing the ZONEMD digest (Hash %d) of zone '%s' failed\n", halg, domain);
-                all_valid = false;
-                continue;
-            }
-            have_md[halg] = true;
-        }
-        if (md_len[halg] == exp_len && memcmp(md[halg], expected, exp_len) == 0) {
-            fprintf(stdout, "[OK] ZONEMD (Scheme %d, Hash %d) for '%s' is VALID.\n", scheme, halg, domain);
-        } else {
-            kc_error(t, "ZONEMD (Scheme %d, Hash %d) for '%s' is INVALID.\n", scheme, halg, domain);
-            fprintf(stderr, "       Expected: %s\n", hex);
-            fprintf(stderr, "       Computed: ");
-            for (unsigned int j = 0; j < md_len[halg]; j++) fprintf(stderr, "%02x", md[halg][j]);
-            fprintf(stderr, "\n");
-            all_valid = false;
-        }
-    }
-
-    for (size_t i = 0; i < n; i++) free(rrs[i].wire);
-    free(rrs);
-    return all_valid;
-}
-
-KARIDNS_TOOL_FN bool is_cname(zone_arena_t *arena, const char *name) {
-    if (!arena->hash_table || arena->hash_size == 0) return false;
-    uint32_t hash = calc_fnv1a_str(name);
-    size_t idx = hash & (arena->hash_size - 1);
-    for (int j = arena->hash_table[idx]; j != -1; j = arena->records[j].next_record) {
-        if (arena->records[j].type_code == 5 && strcasecmp(arena->records[j].name, name) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 KARIDNS_TOOL_FN void normalize_domain_fqdn(const char *in, char *out, size_t out_cap) {
     size_t len = strlen(in);
     if (len > 0 && dns_name_len_no_root(in, len) == len && len + 1 < out_cap) {
@@ -577,309 +209,6 @@ KARIDNS_TOOL_FN bool validate_cidr_syntax(const char *cidr) {
     return false;
 }
 
-/* 以下 2 つは名前 (ゾーンパーサが作る正規形) のラベル単位の包含判定。ラベル境界はエスケープ
- * されない '.' だけ (R-29 / O-08 と同じ規則。domain_name_is_at_or_below() を使う)。 */
-KARIDNS_TOOL_FN bool is_subdomain_of(const char *name, const char *parent) {
-    if (!name || !parent) return false;
-    return domain_name_is_at_or_below(name, parent);
-}
-
-KARIDNS_TOOL_FN bool is_strict_subdomain_of(const char *name, const char *parent) {
-    if (!name || !parent) return false;
-    return domain_name_is_at_or_below(name, parent) && !domain_names_match_ci(name, parent);
-}
-
-/* NS のターゲットに名前があり、そのアドレスがこのゾーンに無ければ委任/ゾーンが引けない (ERROR、RFC 9471 は委任の
- * グルー)。MX/SRV のターゲットにアドレスを求める RFC はないので警告にとどめる (K-02、RFC 8976 Appendix A.2)。
- * 重複の検査は NS と MX/SRV で分ける (同じ名前の MX が先にあっても NS のエラーを隠さない)。 */
-KARIDNS_TOOL_FN void lint_glue_consistency(const char *domain, zone_arena_t *arena, kc_tally_t *t) {
-    char checked_targets[2][64][256];
-    int checked_count[2] = {0, 0};
-
-    for (size_t i = 0; i < arena->count; i++) {
-        dns_record_t *rec = &arena->records[i];
-        const char *target = NULL;
-        const char *type_str = NULL;
-        if (rec->type_code == 2 && rec->rdata_count >= 1) {
-            target = rec->rdata[0];
-            type_str = "NS";
-        } else if (rec->type_code == 15 && rec->rdata_count >= 2) {
-            target = rec->rdata[1];
-            type_str = "MX";
-        } else if (rec->type_code == 33 && rec->rdata_count >= 4) {
-            target = rec->rdata[3];
-            type_str = "SRV";
-        }
-        if (!target || !is_subdomain_of(target, domain)) continue;
-        int kind = rec->type_code == 2 ? 0 : 1;
-
-        bool already_checked = false;
-        for (int c = 0; c < checked_count[kind]; c++) {
-            if (domain_names_match_ci(checked_targets[kind][c], target)) {
-                already_checked = true;
-                break;
-            }
-        }
-        if (already_checked) continue;
-        if (checked_count[kind] < 64) {
-            snprintf(checked_targets[kind][checked_count[kind]++], sizeof(checked_targets[kind][0]), "%s", target);
-        }
-
-        // If target points to a CNAME, it will be flagged as ERROR by lint_cname_targets (RFC 2181 §10.3).
-        bool target_is_cname = false;
-        for (size_t j = 0; j < arena->count; j++) {
-            if (arena->records[j].type_code == 5 && domain_names_match_ci(arena->records[j].name, target)) {
-                target_is_cname = true;
-                break;
-            }
-        }
-        if (target_is_cname) continue;
-
-        bool found_address = false;
-        for (size_t j = 0; j < arena->count; j++) {
-            dns_record_t *ar = &arena->records[j];
-            if ((ar->type_code == 1 || ar->type_code == 28) && domain_names_match_ci(ar->name, target)) {
-                found_address = true;
-                break;
-            }
-        }
-        if (found_address) continue;
-        if (kind == 0) {
-            kc_error(t, "In-bailiwick NS target '%s' lacks A/AAAA glue record in zone '%s'\n", target, domain);
-        } else {
-            kc_warning(t, "In-bailiwick %s target '%s' has no A/AAAA record in zone '%s'\n", type_str, target, domain);
-        }
-    }
-    /* グルーのアドレスの書式はゾーンパーサが検査済み。ゾーン外のアドレス (ゾーン外のターゲットのグルー) は
-     * check_zone() の zone_arena_drop_out_of_zone() で報告して除いてある (R-27)。 */
-}
-
-KARIDNS_TOOL_FN void lint_cname_coexistence(const char *domain, zone_arena_t *arena, kc_tally_t *t) {
-    (void)domain;
-    for (size_t i = 0; i < arena->count; i++) {
-        dns_record_t *r1 = &arena->records[i];
-        if (r1->type_code != 5) continue; // CNAME
-        for (size_t j = 0; j < arena->count; j++) {
-            if (i == j) continue;
-            dns_record_t *r2 = &arena->records[j];
-            if (!domain_names_match_ci(r1->name, r2->name)) continue;
-            // Exceptions: RRSIG (46), NSEC (47), NSEC3 (50), SIG (24), KEY (25)
-            if (r2->type_code == 46 || r2->type_code == 47 || r2->type_code == 50 ||
-                r2->type_code == 24 || r2->type_code == 25) continue;
-            if (r2->type_code == 5) continue;
-            kc_error(t, "CNAME record at '%s' coexists with other record type '%s'\n",
-                    r1->name, r2->type ? r2->type : "<unknown>");
-            break;
-        }
-    }
-}
-
-KARIDNS_TOOL_FN void lint_delegation_occlusion(const char *domain, zone_arena_t *arena, kc_tally_t *t) {
-    for (size_t i = 0; i < arena->count; i++) {
-        dns_record_t *del_ns = &arena->records[i];
-        if (del_ns->type_code != 2) continue; // NS
-        if (domain_names_match_ci(del_ns->name, domain)) continue; // apex NS is not child delegation
-
-        const char *del_name = del_ns->name;
-        for (size_t j = 0; j < arena->count; j++) {
-            dns_record_t *r = &arena->records[j];
-            if (!is_strict_subdomain_of(r->name, del_name)) continue;
-
-            bool is_glue = false;
-            if (r->type_code == 1 || r->type_code == 28) {
-                for (size_t k = 0; k < arena->count; k++) {
-                    dns_record_t *ns = &arena->records[k];
-                    if (ns->type_code == 2 && domain_names_match_ci(ns->name, del_name)) {
-                        if (ns->rdata_count >= 1 && domain_names_match_ci(r->name, ns->rdata[0])) {
-                            is_glue = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (!is_glue) {
-                kc_warning(t, "Record '%s %s' is occluded by delegation at '%s'\n",
-                        r->name, r->type ? r->type : "<type>", del_name);
-            }
-        }
-    }
-}
-
-KARIDNS_TOOL_FN void lint_cname_targets(const char *domain, zone_arena_t *arena, kc_tally_t *t) {
-    (void)domain;
-    // 1. RFC 2181 section 10.3: NS and MX targets must not point to CNAME (ERROR)
-    for (size_t i = 0; i < arena->count; i++) {
-        dns_record_t *rec = &arena->records[i];
-        const char *target = NULL;
-        const char *type_name = NULL;
-        if (rec->type_code == 2 && rec->rdata_count >= 1) {
-            target = rec->rdata[0];
-            type_name = "NS";
-        } else if (rec->type_code == 15 && rec->rdata_count >= 2) {
-            target = rec->rdata[1];
-            type_name = "MX";
-        }
-        if (!target) continue;
-
-        for (size_t j = 0; j < arena->count; j++) {
-            dns_record_t *c = &arena->records[j];
-            if (c->type_code == 5 && domain_names_match_ci(c->name, target)) {
-                kc_error(t, "%s record '%s' points to CNAME target '%s' (RFC 2181 section 10.3)\n",
-                        type_name, rec->name, target);
-                break;
-            }
-        }
-    }
-
-    /* X-39: RFC 2782 "Target": the name "MUST NOT be an alias". BIND の check-srv-cname の既定 (warn) に合わせて
-     * 警告にする。"." はサービスが無いことを表す (同じ節) ので調べない。 */
-    for (size_t i = 0; i < arena->count; i++) {
-        dns_record_t *rec = &arena->records[i];
-        if (rec->type_code != 33 || rec->rdata_count < 4 || !rec->rdata[3] || strcmp(rec->rdata[3], ".") == 0) continue;
-        for (size_t j = 0; j < arena->count; j++) {
-            dns_record_t *c = &arena->records[j];
-            if (c->type_code == 5 && domain_names_match_ci(c->name, rec->rdata[3])) {
-                kc_warning(t, "SRV record '%s' points to CNAME target '%s' (RFC 2782)\n", rec->name, rec->rdata[3]);
-                break;
-            }
-        }
-    }
-
-    // 2. CNAME loops (ERROR) and CNAME chains (WARNING)
-    for (size_t i = 0; i < arena->count; i++) {
-        dns_record_t *cname = &arena->records[i];
-        if (cname->type_code != 5) continue;
-        if (cname->rdata_count < 1 || !cname->rdata[0]) continue;
-        const char *target = cname->rdata[0];
-
-        if (domain_names_match_ci(cname->name, target)) {
-            kc_error(t, "CNAME loop detected: '%s' points to itself\n", cname->name);
-            continue;
-        }
-
-        for (size_t j = 0; j < arena->count; j++) {
-            if (i == j) continue;
-            dns_record_t *t_rec = &arena->records[j];
-            if (t_rec->type_code == 5 && domain_names_match_ci(t_rec->name, target)) {
-                kc_warning(t, "CNAME chain detected: '%s' points to CNAME '%s'\n",
-                        cname->name, target);
-                break;
-            }
-        }
-    }
-}
-
-/* 表示用: NSEC3 の salt ("" と "-" は salt なし) */
-static const char *kc_salt_text(const char *salt) {
-    return (!salt || salt[0] == '\0') ? "-" : salt;
-}
-
-static bool kc_has_salt(const char *salt) {
-    return salt && salt[0] != '\0' && strcmp(salt, "-") != 0;
-}
-
-/* K-05: NSEC3PARAM (RFC 5155 §4、RFC 9276 §3.1) と NSEC3 チェーン。チェーンはサーバーと同じ build_zone_index() の
- * 索引 (arena->nsec3_chains) と、サーバーが選んだ NSEC3PARAM (arena->nsec3_active、R-31) を使う。NSEC3 の警告は
- * RR ごとではなくチェーンごとに 1 回出す (署名済みゾーンの全 NSEC3 RR で同じ警告を繰り返さない)。 */
-KARIDNS_TOOL_FN void lint_nsec3(const char *domain, zone_arena_t *arena, kc_tally_t *t) {
-    size_t params = 0, usable = 0;
-    for (size_t i = 0; i < arena->count; i++) {
-        const dns_record_t *r = &arena->records[i];
-        if (r->type_code != 51 || r->rdata_count < 4) continue; // 欠けたフィールドはシリアライズの試行で報告される
-        if (!domain_names_match_ci(r->name, domain)) {
-            kc_warning(t, "NSEC3PARAM '%s' is not at the zone apex '%s'; the owner name of an NSEC3PARAM is the zone "
-                          "apex (RFC 5155 section 4), so the server ignores it\n", r->name, domain);
-            continue;
-        }
-        params++;
-        int algo = (int)strtol(r->rdata[0], NULL, 10);
-        int flags = (int)strtol(r->rdata[1], NULL, 10);
-        long iterations = strtol(r->rdata[2], NULL, 10);
-        uint8_t salt_buf[255];
-        bool salt_ok = hex_to_bytes(r->rdata[3], salt_buf, sizeof(salt_buf)) != (size_t)-1;
-        if (algo != 1) {
-            kc_warning(t, "NSEC3PARAM for '%s' uses hash algorithm %d; only 1 (SHA-1) is defined "
-                          "(RFC 5155 section 4.1.1), so the server ignores this NSEC3PARAM\n", r->name, algo);
-        }
-        if (flags != 0) {
-            kc_error(t, "NSEC3PARAM for '%s' has Flags %d; the Flags field must be 0 (the opt-out flag is only "
-                        "meaningful in NSEC3 records) and an NSEC3PARAM with other Flags MUST be ignored "
-                        "(RFC 5155 section 4.1.2), so the server ignores it\n", r->name, flags);
-        }
-        if (iterations > 100) {
-            kc_error(t, "NSEC3PARAM for '%s': iterations value is excessively high (%ld) and may cause severe "
-                        "performance/DoS issues\n", r->name, iterations);
-        } else if (iterations != 0) {
-            kc_warning(t, "NSEC3PARAM for '%s': iterations %ld; the iteration count MUST be 0 (RFC 9276 section 3.1)\n",
-                       r->name, iterations);
-        }
-        if (kc_has_salt(r->rdata[3])) {
-            kc_warning(t, "NSEC3PARAM for '%s' uses salt %s; operators SHOULD NOT use a salt (RFC 9276 section 3.1)\n",
-                       r->name, r->rdata[3]);
-        }
-        if (algo == 1 && flags == 0 && salt_ok) usable++;
-    }
-    if (params > 0 && usable == 0) {
-        kc_warning(t, "None of the %zu NSEC3PARAM RRs of zone '%s' is usable (Flags 0, hash algorithm 1); the server "
-                      "does not use NSEC3 for denial of existence\n", params, domain);
-    }
-    const nsec3_params_t *active = &arena->nsec3_active;
-    if (active->param && !active->chain) {
-        kc_warning(t, "Zone '%s' has no NSEC3 RRs with the parameters of the NSEC3PARAM the server uses "
-                      "(1 0 %u %s); the zone MUST contain a complete NSEC3 chain with these parameters (RFC 5155 section 4)\n",
-                   domain, active->iterations, kc_salt_text(active->param->rdata[3]));
-    }
-
-    for (size_t c = 0; c < arena->nsec3_chain_count; c++) {
-        const nsec3_chain_t *ch = &arena->nsec3_chains[c];
-        size_t optout = 0, reserved = 0;
-        for (size_t k = 0; k < ch->count; k++) {
-            int flags = (int)strtol(ch->entries[k].rec->rdata[1], NULL, 10);
-            if (flags & 0x01) optout++;
-            if (flags & ~0x01) reserved++;
-        }
-        bool matched = false;
-        for (size_t i = 0; i < arena->count && !matched; i++) {
-            const dns_record_t *p = &arena->records[i];
-            if (p->type_code != 51 || p->rdata_count < 4 || !domain_names_match_ci(p->name, domain)) continue;
-            if (strtol(p->rdata[1], NULL, 10) != 0) continue; // RFC 5155 §4.1.2: 無視される NSEC3PARAM
-            matched = zone_find_nsec3_chain(arena, p) == ch;
-        }
-        const char *salt = kc_salt_text(ch->salt);
-        if (ch->algorithm != 1) {
-            kc_warning(t, "NSEC3 chain (hash algorithm %u, iterations %u, salt %s; %zu RRs) in zone '%s': only hash "
-                          "algorithm 1 (SHA-1) is defined (RFC 5155 section 3.1.1)\n",
-                       ch->algorithm, ch->iterations, salt, ch->count, domain);
-        }
-        if (reserved > 0) {
-            kc_warning(t, "%zu NSEC3 RR(s) of the chain (iterations %u, salt %s) in zone '%s' have reserved Flags bits "
-                          "set; only bit 0 (opt-out) is defined (RFC 5155 section 3.1.2)\n",
-                       reserved, ch->iterations, salt, domain);
-        }
-        if (optout > 0) {
-            kc_warning(t, "NSEC3 opt-out is set on %zu RR(s) of the chain (iterations %u, salt %s) in zone '%s'; "
-                          "RFC 9276 section 3.1 recommends opt-out only for very large, sparsely signed zones\n",
-                       optout, ch->iterations, salt, domain);
-        }
-        if (ch->iterations > 100) {
-            kc_error(t, "NSEC3 chain (iterations %u, salt %s; %zu RRs) in zone '%s': iterations value is excessively "
-                        "high and may cause severe performance/DoS issues\n", ch->iterations, salt, ch->count, domain);
-        } else if (ch->iterations != 0) {
-            kc_warning(t, "NSEC3 chain (iterations %u, salt %s; %zu RRs) in zone '%s': the iteration count MUST be 0 "
-                          "(RFC 9276 section 3.1)\n", ch->iterations, salt, ch->count, domain);
-        }
-        if (kc_has_salt(ch->salt)) {
-            kc_warning(t, "NSEC3 chain (iterations %u, salt %s; %zu RRs) in zone '%s' uses a salt; operators SHOULD NOT "
-                          "use a salt (RFC 9276 section 3.1)\n", ch->iterations, salt, ch->count, domain);
-        }
-        if (!matched) {
-            kc_warning(t, "NSEC3 chain (hash algorithm %u, iterations %u, salt %s; %zu RRs) in zone '%s' matches no "
-                          "NSEC3PARAM with Flags 0 at the apex; the server does not use it (RFC 5155 section 4)\n",
-                       ch->algorithm, ch->iterations, salt, ch->count, domain);
-        }
-    }
-}
-
 typedef struct { const char *zone; kc_tally_t *tally; } kc_out_of_zone_ud_t;
 
 static void karicheck_report_out_of_zone(const dns_record_t *rec, void *ud) {
@@ -900,7 +229,7 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     char domain_buf[256];
     normalize_domain_fqdn(domain_raw, domain_buf, sizeof(domain_buf));
     const char *domain = domain_buf;
-    kc_tally_t tally = {0, 0};
+    kc_tally_t tally = {0};
 
     /* D-24: karidns は相対パス ("../" を含むものも) を起動時のディレクトリから、絶対パスはそのまま
      * 開くので、standalone モードでも絶対パスや "../" を警告しない */
@@ -1018,56 +347,7 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         return 1;
     }
 
-    /* [T6] RFC 2181 §5.2: build_zone_index() による TTL 自動正規化が行われる"前"に、
-     * ソースゾーンファイル上の生データで RRset 内 TTL 不整合を検出し警告する。
-     * (正規化後に検査すると値が湰っているため、必ずこの位置で実施すること) */
-    if (arena.count > 0) {
-        dns_record_t **sorted = malloc(sizeof(dns_record_t *) * arena.count);
-        if (sorted) {
-            for (size_t k = 0; k < arena.count; k++) sorted[k] = &arena.records[k];
-            qsort(sorted, arena.count, sizeof(dns_record_t *), cmp_rec_by_name_type);
-            /* B8t-2: the TTLs of an RRset are harmonized (lowest wins) among the RRs that have the same visibility only (location, time
-             * stamp, tag); an RR that only some clients see keeps its TTL, so an unrestricted RR and a restricted RR of one name and type
-             * with different TTLs make a client that sees both get an RRset with differing TTLs (tinydns serves them that way). */
-            for (size_t k = 0; k < arena.count;) {
-                size_t e = k + 1;
-                while (e < arena.count && sorted[e]->name && sorted[k]->name && sorted[e]->type_code == sorted[k]->type_code &&
-                       strcasecmp(sorted[e]->name, sorted[k]->name) == 0)
-                    e++;
-                if (!sorted[k]->name || sorted[k]->type_code == 46 || e - k < 2) {
-                    k = e;
-                    continue;
-                }
-                size_t lim = e - k > 64 ? k + 64 : e;     /* a very large RRset: compare the first 64 */
-                bool warned_norm = false, warned_covis = false;
-                for (size_t a = k; a < lim; a++) {
-                    for (size_t b = a + 1; b < lim; b++) {
-                        if (sorted[a]->ttl_value == sorted[b]->ttl_value) continue;
-                        if (dns_record_same_visibility(sorted[a], sorted[b])) {
-                            if (warned_norm) continue;
-                            warned_norm = true;
-                            kc_warning(&tally,
-                                "RRset '%s' type %d has inconsistent TTLs (%u vs %u) in the source "
-                                "zone file; RFC 2181 §5.2 requires all RRs in an RRset to share the same TTL. "
-                                "KariDNS will normalize this to the minimum value at load time, "
-                                "but the zone file should be corrected.\n",
-                                sorted[a]->name, sorted[a]->type_code, sorted[a]->ttl_value, sorted[b]->ttl_value);
-                        } else if (dns_record_is_restricted(sorted[a]) != dns_record_is_restricted(sorted[b])) {
-                            if (warned_covis) continue;
-                            warned_covis = true;
-                            kc_warning(&tally,
-                                "RRset '%s' type %d: an RR that every client sees and an RR with a location, time stamp or tag have "
-                                "different TTLs (%u vs %u). A client that sees both gets an RRset with differing TTLs (RFC 2181 §5.2); "
-                                "KariDNS keeps the TTL written on each RR, as tinydns does.\n",
-                                sorted[a]->name, sorted[a]->type_code, sorted[a]->ttl_value, sorted[b]->ttl_value);
-                        }
-                    }
-                }
-                k = e;
-            }
-            free(sorted);
-        }
-    }
+    zone_lint_ttl(&arena, "zone file", &tally);
 
     if (build_zone_index(&arena, true) != 0) {
         kc_error(&tally, "Memory allocation failed during index build for '%s'\n", domain);
@@ -1102,696 +382,20 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     }
 
     fprintf(stdout, "[OK] Zone '%s' parsed successfully (%zu records)\n", domain, arena.count);
+    zone_lint_pdns_types(&arena, domain, &tally);
     {
-        size_t n_alias = 0, n_lua = 0;
-        for (size_t i = 0; i < arena.count; i++) {
-            const dns_record_t *r = &arena.records[i];
-            if (r->class_val != 1 && r->class_val != 0) continue;
-            if (r->type_code == DNS_TYPE_PDNS_ALIAS) n_alias++;
-            else if (r->type_code == DNS_TYPE_PDNS_LUA) n_lua++;
-        }
-        if (n_alias > 0)
-            fprintf(stdout, "[INFO] Zone '%s': %zu ALIAS record(s); A/AAAA at those names are NODATA unless an alias-resolver { } is configured for the zone (design 3.6b)\n",
-                    domain, n_alias);
-        if (n_lua > 0)
-            kc_warning(&tally, "Zone '%s': %zu LUA record(s) are kept for zone transfers and never answered (PowerDNS enable-lua-records=no behaviour; LUA records are not executed)\n",
-                       domain, n_lua);
+        /* the library of zone checks (dns_zone_lint.c) is shared with karidns-dbloader --check, which runs it on database zones */
+        zone_lint_in_t lin = {0};
+        lin.domain = domain;
+        lin.src = file_path;
+        lin.raw_text = buf;
+        lin.is_catalog = is_catalog;
+        lin.ecs_tags = (zcfg && zext(zcfg)->ecs_tags) ? zext(zcfg)->ecs_tags : (cfg ? cfg->ecs_tags : NULL);
+        lin.ecs_tag_count = (zcfg && zext(zcfg)->ecs_tags) ? zext(zcfg)->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0);
+        lin.loc_tags = (zcfg && zext(zcfg)->location_tags) ? zext(zcfg)->location_tags : (cfg ? cfg->location_tags : NULL);
+        lin.loc_tag_count = (zcfg && zext(zcfg)->location_tags) ? zext(zcfg)->location_tag_count : (cfg ? cfg->location_tag_count : 0);
+        zone_lint_records(&arena, &lin, &tally);
     }
-    bool has_soa = false;
-    int soa_count = 0; /* [T3] SOA重複検出用 */
-    int soa_plain_count = 0; /* B8t-1: apex SOA RRs that every client sees (no location, time stamp or tag) */
-    bool has_apex_ns = false;
-
-    if (arena.is_tinydns_format) {
-        for (int i = 0; i < arena.location_count; i++) {
-            const tinydns_location_entry_t *loc = &arena.locations[i];
-            if (loc->prefix_bits > 32) {
-                kc_error(&tally, "Location prefix length /%u exceeds /32 for location '%.2s' in zone '%s'\n",
-                        loc->prefix_bits, loc->code, domain);
-            }
-            for (int j = i + 1; j < arena.location_count; j++) {
-                if (arena.locations[j].code[0] == loc->code[0] &&
-                    arena.locations[j].code[1] == loc->code[1]) {
-                    kc_warning(&tally, "Duplicate location code '%.2s' in zone '%s' (%s)\n",
-                            loc->code, domain, file_path);
-                    break;
-                }
-            }
-        }
-
-        // Tinydns third-party patch syntax validations on raw lines
-        size_t linestart = 0;
-        size_t buflen = strlen(buf);
-        unsigned long linenum = 1;
-        while (linestart < buflen) {
-            size_t lineend = linestart;
-            while (lineend < buflen && buf[lineend] != '\n') lineend++;
-            size_t linelen = lineend - linestart;
-            const char *line = buf + linestart;
-
-            while (linelen > 0 && (line[linelen - 1] == ' ' || line[linelen - 1] == '\t' ||
-                                   line[linelen - 1] == '\n' || line[linelen - 1] == '\r')) {
-                linelen--;
-            }
-
-            if (linelen > 0 && line[0] != '#' && line[0] != '-') {
-                char ch = line[0];
-                if (ch == '3' || ch == '6' || ch == 'S' || ch == 'N' || ch == '_') {
-                    // Extract fields separated by ':'
-                    char fld[12][256];
-                    size_t flen[12];
-                    int fcount = 0;
-                    size_t j = 1;
-                    while (fcount < 12 && j <= linelen) {
-                        size_t k = j;
-                        while (k < linelen && line[k] != ':') k++;
-                        size_t clen = k - j;
-                        if (clen >= sizeof(fld[fcount])) clen = sizeof(fld[fcount]) - 1;
-                        memcpy(fld[fcount], line + j, clen);
-                        fld[fcount][clen] = '\0';
-                        flen[fcount] = clen;
-                        fcount++;
-                        j = k + 1;
-                    }
-                    while (fcount < 12) {
-                        fld[fcount][0] = '\0';
-                        flen[fcount] = 0;
-                        fcount++;
-                    }
-
-                    if (ch == '3' || ch == '6') {
-                        // f[1] is ip6: must be 32 hex chars
-                        bool hex_ok = (flen[1] == 32);
-                        if (hex_ok) {
-                            for (size_t x = 0; x < 32; x++) {
-                                if (hex_char_to_val(fld[1][x]) < 0) {
-                                    hex_ok = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if (!hex_ok) {
-                            kc_error(&tally, "Zone '%s' (line %lu): type '%c' requires a 32-character hexadecimal IPv6 address, got '%.*s'\n",
-                                    domain, linenum, ch, (int)flen[1], fld[1]);
-                        }
-                        if (ch == '6') {
-                            fprintf(stdout, "[INFO] Zone '%s' (line %lu): type '6' generates deprecated PTR in 'ip6.int'; consider using type '3' with explicit '^' PTR record instead\n",
-                                    domain, linenum);
-                        }
-                    } else if (ch == 'S') {
-                        // Sfqdn:ip:x:port:weight:priority:ttl:timestamp:lo
-                        if (flen[3] > 0) {
-                            char *endp;
-                            unsigned long p = strtoul(fld[3], &endp, 10);
-                            if (*endp != '\0' || p > 65535) {
-                                kc_error(&tally, "Zone '%s' (line %lu): SRV port '%s' out of range (0-65535)\n",
-                                        domain, linenum, fld[3]);
-                            }
-                        }
-                        if (flen[4] > 0) {
-                            char *endp;
-                            unsigned long w = strtoul(fld[4], &endp, 10);
-                            if (*endp != '\0' || w > 65535) {
-                                kc_error(&tally, "Zone '%s' (line %lu): SRV weight '%s' out of range (0-65535)\n",
-                                        domain, linenum, fld[4]);
-                            }
-                        }
-                        if (flen[5] > 0) {
-                            char *endp;
-                            unsigned long prio = strtoul(fld[5], &endp, 10);
-                            if (*endp != '\0' || prio > 65535) {
-                                kc_error(&tally, "Zone '%s' (line %lu): SRV priority '%s' out of range (0-65535)\n",
-                                        domain, linenum, fld[5]);
-                            }
-                        }
-                    } else if (ch == 'N') {
-                        // Nfqdn:order:pref:flags:service:regexp:replacement:ttl:timestamp:lo
-                        if (flen[1] > 0) {
-                            char *endp;
-                            unsigned long ord = strtoul(fld[1], &endp, 10);
-                            if (*endp != '\0' || ord > 65535) {
-                                kc_error(&tally, "Zone '%s' (line %lu): NAPTR order '%s' out of range (0-65535)\n",
-                                        domain, linenum, fld[1]);
-                            }
-                        }
-                        if (flen[2] > 0) {
-                            char *endp;
-                            unsigned long pref = strtoul(fld[2], &endp, 10);
-                            if (*endp != '\0' || pref > 65535) {
-                                kc_error(&tally, "Zone '%s' (line %lu): NAPTR preference '%s' out of range (0-65535)\n",
-                                        domain, linenum, fld[2]);
-                            }
-                        }
-                    } else if (ch == '_') {
-                        // _fqdn:algorithm:fp_type:fingerprint:ttl:timestamp:lo
-                        if (flen[1] > 0) {
-                            char *endp;
-                            unsigned long alg = strtoul(fld[1], &endp, 10);
-                            if (*endp != '\0' || alg > 255) {
-                                kc_error(&tally, "Zone '%s' (line %lu): SSHFP algorithm '%s' out of range (0-255)\n",
-                                        domain, linenum, fld[1]);
-                            } else if (alg == 0 || alg > 4) {
-                                kc_warning(&tally, "Zone '%s' (line %lu): SSHFP algorithm '%lu' is outside standard RFC assignments (1-4)\n",
-                                        domain, linenum, alg);
-                            }
-                        }
-                        if (flen[2] > 0) {
-                            char *endp;
-                            unsigned long fpt = strtoul(fld[2], &endp, 10);
-                            if (*endp != '\0' || fpt > 255) {
-                                kc_error(&tally, "Zone '%s' (line %lu): SSHFP fp_type '%s' out of range (0-255)\n",
-                                        domain, linenum, fld[2]);
-                            } else if (fpt == 0 || fpt > 2) {
-                                kc_warning(&tally, "Zone '%s' (line %lu): SSHFP fp_type '%lu' is outside standard RFC assignments (1-2)\n",
-                                        domain, linenum, fpt);
-                            }
-                        }
-                        uint8_t fp_bin[64];
-                        size_t dec_len = hex_decode(fld[3], fp_bin, sizeof(fp_bin));
-                        if (flen[3] == 0 || dec_len == 0 || dec_len == (size_t)-1) {
-                            kc_error(&tally, "Zone '%s' (line %lu): SSHFP invalid fingerprint hex string '%s'\n",
-                                    domain, linenum, fld[3]);
-                        }
-                    }
-                }
-            }
-
-            linestart = lineend + 1;
-            linenum++;
-        }
-    }
-
-    ecs_tag_def_t *active_ecs_tags = (arena.bind_ecs_tags && arena.bind_ecs_tag_count > 0) ? arena.bind_ecs_tags :
-                                     ((zcfg && zext(zcfg)->ecs_tags) ? zext(zcfg)->ecs_tags : (cfg ? cfg->ecs_tags : NULL));
-    int active_ecs_tag_count = (arena.bind_ecs_tags && arena.bind_ecs_tag_count > 0) ? arena.bind_ecs_tag_count :
-                               ((zcfg && zext(zcfg)->ecs_tags) ? zext(zcfg)->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0));
-
-    ecs_tag_def_t *active_loc_tags = (arena.bind_location_tags && arena.bind_location_tag_count > 0) ? arena.bind_location_tags :
-                                     ((zcfg && zext(zcfg)->location_tags) ? zext(zcfg)->location_tags : (cfg ? cfg->location_tags : NULL));
-    int active_loc_tag_count = (arena.bind_location_tags && arena.bind_location_tag_count > 0) ? arena.bind_location_tag_count :
-                               ((zcfg && zext(zcfg)->location_tags) ? zext(zcfg)->location_tag_count : (cfg ? cfg->location_tag_count : 0));
-
-    for (size_t i = 0; i < arena.count; i++) {
-        if (arena.records[i].ecs_subnet_tag != NULL) {
-            bool tag_found = false;
-            for (int ti = 0; ti < active_ecs_tag_count; ti++) {
-                if (strcasecmp(active_ecs_tags[ti].tag, arena.records[i].ecs_subnet_tag) == 0) {
-                    tag_found = true;
-                    break;
-                }
-            }
-            if (!tag_found) {
-                kc_error(&tally, "Zone '%s': record '%s' references undefined ECS subnet tag '%s'\n",
-                        domain, arena.records[i].name, arena.records[i].ecs_subnet_tag);
-            }
-        }
-
-        if (arena.records[i].bind_location_tag != NULL) {
-            bool tag_found = false;
-            for (int ti = 0; ti < active_loc_tag_count; ti++) {
-                if (strcasecmp(active_loc_tags[ti].tag, arena.records[i].bind_location_tag) == 0) {
-                    tag_found = true;
-                    break;
-                }
-            }
-            if (!tag_found) {
-                kc_error(&tally, "Zone '%s': record '%s' references undefined location tag '%s'\n",
-                        domain, arena.records[i].name, arena.records[i].bind_location_tag);
-            }
-        }
-
-        uint16_t tcode = arena.records[i].type_code;
-        int rcount = arena.records[i].rdata_count;
-        char **rdata = arena.records[i].rdata;
-
-        if (tcode == 1) { // A
-            if (rcount != 1) {
-                kc_error(&tally, "A record must have exactly 1 parameter for name '%s' in zone '%s'\n", arena.records[i].name, domain);
-            } else {
-                struct in_addr tmp;
-                if (inet_pton(AF_INET, rdata[0], &tmp) != 1) {
-                    kc_error(&tally, "Invalid IPv4 address '%s' for name '%s' in zone '%s'\n", rdata[0], arena.records[i].name, domain);
-                }
-            }
-        }
-        if (tcode == 28) { // AAAA
-            if (rcount != 1) {
-                kc_error(&tally, "AAAA record must have exactly 1 parameter for name '%s' in zone '%s'\n", arena.records[i].name, domain);
-            } else {
-                struct in6_addr tmp;
-                if (inet_pton(AF_INET6, rdata[0], &tmp) != 1) {
-                    kc_error(&tally, "Invalid IPv6 address '%s' for name '%s' in zone '%s'\n", rdata[0], arena.records[i].name, domain);
-                }
-            }
-        }
-
-        if (tcode == 6 && strcasecmp(arena.records[i].name, domain) == 0) {
-            has_soa = true;
-            /* [T3] SOA重複検出: apexに2度以上の SOAは破損ゾーンファイル */
-            soa_count++;
-            if (!dns_record_is_restricted(&arena.records[i])) soa_plain_count++;
-        }
-        if (tcode == 2 && strcasecmp(arena.records[i].name, domain) == 0) {
-            has_apex_ns = true;
-        }
-        if (tcode == 62) { // CSYNC
-            for (int j = 2; j < rcount; j++) {
-                if (get_type_code(rdata[j]) == 0) {
-                    kc_warning(&tally, "CSYNC record contains unknown type '%s' in zone '%s' (%s)\n", rdata[j], domain, file_path);
-                }
-            }
-        }
-        if (tcode == 64 || tcode == 65) { // SVCB / HTTPS
-            if (rcount > 1) {
-                const char *target = rdata[1];
-                size_t len = strlen(target);
-                if (len > 0 && target[len - 1] != '.' && strcmp(target, ".") != 0) {
-                    kc_warning(&tally, "%s record TargetName '%s' does not end with a dot in zone '%s' (%s)\n",
-                            tcode == 64 ? "SVCB" : "HTTPS",
-                            target, domain, file_path);
-                }
-            }
-        }
-        
-        // --- Add specific field validations ---
-        if (tcode == 63) { // ZONEMD
-            if (strcasecmp(arena.records[i].name, domain) != 0) {
-                kc_warning(&tally, "ZONEMD record '%s' is not at the zone apex '%s' (RFC 8976 section 2.1)\n",
-                        arena.records[i].name, domain);
-            }
-            if (rcount < 4) {
-                kc_warning(&tally, "ZONEMD record for '%s' has fewer than 4 fields "
-                                "(serial, scheme, hash-algorithm, digest)\n", arena.records[i].name);
-            } else {
-                validate_zonemd_scheme_halg(&arena.records[i], NULL, NULL, true, &tally);
-            }
-        }
-        if (tcode == 48 || tcode == 60) { // DNSKEY / CDNSKEY
-            if (rcount >= 3) {
-                int flags = (int)strtol(rdata[0], NULL, 10);
-                int protocol = (int)strtol(rdata[1], NULL, 10);
-                int alg = (int)strtol(rdata[2], NULL, 10);
-                check_dnssec_algorithm(&tally, alg, arena.records[i].name, tcode == 48 ? "DNSKEY" : "CDNSKEY", flags, protocol);
-                if (rcount >= 4)
-                    check_dnssec_blob_length(&tally, alg, arena.records[i].name, tcode == 48 ? "DNSKEY" : "CDNSKEY",
-                                             false, &rdata[3], rcount - 3);
-            }
-        }
-        if (tcode == 43 || tcode == 59) { // DS / CDS
-            if (rcount >= 4) {
-                int key_tag = (int)strtol(rdata[0], NULL, 10);
-                int algorithm = (int)strtol(rdata[1], NULL, 10);
-                int digest_type = (int)strtol(rdata[2], NULL, 10);
-                check_ds_digest_type(&tally, digest_type, algorithm, key_tag,
-                                     arena.records[i].name, tcode == 43 ? "DS" : "CDS");
-            }
-        }
-        if (tcode == 46) { // RRSIG
-            if (rcount >= 2) {
-                check_dnssec_algorithm(&tally, (int)strtol(rdata[1], NULL, 10), arena.records[i].name, "RRSIG", -1, -1);
-                if (rcount >= 9)
-                    check_dnssec_blob_length(&tally, (int)strtol(rdata[1], NULL, 10), arena.records[i].name, "RRSIG",
-                                             true, &rdata[8], rcount - 8);
-            }
-        }
-        if (tcode == 55) { // HIP
-            if (rcount < 3) {
-                kc_warning(&tally, "HIP record requires at least 3 fields: HIT algorithm, HIT (hex), and public key (base64) for name '%s'\n", arena.records[i].name);
-            } else {
-                /* Reconstruct the concatenated public-key base64 token the same way
-                 * the server's serializer does, and reject lengths that are not a
-                 * non-zero multiple of 4: such input makes EVP_DecodeBlock's
-                 * returned length smaller than the base64 padding count, which
-                 * underflows the RR's public-key length field at response time. */
-                size_t pk_b64_len = 0;
-                bool pk_finished = false;
-                for (int r_idx = 2; r_idx < rcount && !pk_finished; r_idx++) {
-                    if (strchr(rdata[r_idx], '.') != NULL) break;
-                    size_t tlen = strlen(rdata[r_idx]);
-                    pk_b64_len += tlen;
-                    if (tlen > 0 && rdata[r_idx][tlen - 1] == '=') pk_finished = true;
-                }
-                if (pk_b64_len == 0 || (pk_b64_len % 4) != 0) {
-                    kc_error(&tally, "HIP record public key for name '%s' is not valid base64 (length %zu is not a non-zero multiple of 4) in zone '%s'\n",
-                            arena.records[i].name, pk_b64_len, domain);
-                }
-            }
-        }
-        if (tcode == 11) { // WKS
-            /* K-03: プロトコルはサーバーのシリアライザと同じ規則で読む (番号 0-255、または TCP/UDP) */
-            uint8_t proto = 0;
-            if (rcount >= 2 && !dns_wks_protocol_from_text(rdata[1], &proto)) {
-                kc_warning(&tally, "WKS record protocol '%s' is neither a number (0-255) nor TCP/UDP for name '%s'\n",
-                           rdata[1], arena.records[i].name);
-            }
-            /* X-38: ポート名はサーバーと同じ固定表で引く。読めないポートがあるとレコードは書けない (下の試し書き) */
-            for (int j = 2; j < rcount; j++) {
-                uint16_t port;
-                if (!dns_wks_port_from_text(rdata[j], proto, &port)) {
-                    kc_warning(&tally, "WKS record port '%s' for name '%s' is neither a number (0-65535) nor a known "
-                                       "service name for protocol %u\n", rdata[j], arena.records[i].name, proto);
-                }
-            }
-        }
-        if (tcode == 27 && rcount < 3) { // GPOS
-            kc_warning(&tally, "GPOS record requires exactly 3 fields (Longitude, Latitude, Altitude) for name '%s'\n", arena.records[i].name);
-        }
-        if (tcode == 19 && rcount < 1) { // X25
-            kc_warning(&tally, "X25 record requires at least 1 field for name '%s'\n", arena.records[i].name);
-        }
-        if (tcode == 33) { // SRV
-            if (rcount < 4) {
-                kc_error(&tally, "SRV record requires 4 fields (priority, weight, port, target) for name '%s' in zone '%s'\n",
-                        arena.records[i].name, domain);
-            } else {
-                char *endp;
-                unsigned long prio = strtoul(rdata[0], &endp, 10);
-                if (*endp != '\0' || prio > 65535) {
-                    kc_error(&tally, "SRV priority '%s' out of range (0-65535) for name '%s' in zone '%s'\n",
-                            rdata[0], arena.records[i].name, domain);
-                }
-                unsigned long weight = strtoul(rdata[1], &endp, 10);
-                if (*endp != '\0' || weight > 65535) {
-                    kc_error(&tally, "SRV weight '%s' out of range (0-65535) for name '%s' in zone '%s'\n",
-                            rdata[1], arena.records[i].name, domain);
-                }
-                unsigned long port = strtoul(rdata[2], &endp, 10);
-                if (*endp != '\0' || port > 65535) {
-                    kc_error(&tally, "SRV port '%s' out of range (0-65535) for name '%s' in zone '%s'\n",
-                            rdata[2], arena.records[i].name, domain);
-                }
-            }
-        }
-        if (tcode == 35) { // NAPTR
-            if (rcount < 6) {
-                kc_error(&tally, "NAPTR record requires 6 fields (order, preference, flags, service, regexp, replacement) for name '%s' in zone '%s'\n",
-                        arena.records[i].name, domain);
-            } else {
-                char *endp;
-                unsigned long ord = strtoul(rdata[0], &endp, 10);
-                if (*endp != '\0' || ord > 65535) {
-                    kc_error(&tally, "NAPTR order '%s' out of range (0-65535) for name '%s' in zone '%s'\n",
-                            rdata[0], arena.records[i].name, domain);
-                }
-                unsigned long pref = strtoul(rdata[1], &endp, 10);
-                if (*endp != '\0' || pref > 65535) {
-                    kc_error(&tally, "NAPTR preference '%s' out of range (0-65535) for name '%s' in zone '%s'\n",
-                            rdata[1], arena.records[i].name, domain);
-                }
-                /* [T5] RFC 3403 §4.1: flags は [A-Za-z0-9] のみ許容 */
-                const char *naptr_flags = rdata[2];
-                size_t naptr_flags_len = strlen(naptr_flags);
-                bool naptr_flags_ok = true;
-                for (size_t fi = 0; fi < naptr_flags_len; fi++) {
-                    char c = naptr_flags[fi];
-                    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) {
-                        naptr_flags_ok = false;
-                        break;
-                    }
-                }
-                if (!naptr_flags_ok) {
-                    kc_error(&tally, "NAPTR flags '%s' for name '%s' in zone '%s' must contain only "
-                            "[A-Za-z0-9] characters (RFC 3403 §4.1)\n",
-                            naptr_flags, arena.records[i].name, domain);
-                }
-                /* [T5] RFC 2915 §2: regexp と replacement は同時に非空であってはならない */
-                bool naptr_has_regexp = (strlen(rdata[4]) > 0);
-                bool naptr_has_replacement = (strlen(rdata[5]) > 0 && strcmp(rdata[5], ".") != 0);
-                if (naptr_has_regexp && naptr_has_replacement) {
-                    kc_error(&tally, "NAPTR record for '%s' in zone '%s' sets both a regexp and a "
-                            "non-root replacement field; RFC 2915 requires exactly one of them to be empty\n",
-                            arena.records[i].name, domain);
-                }
-            }
-        }
-        if (tcode == 257) { // CAA (RFC 8659)
-            /* [T4] RFC 8659 CAAレコード検証 */
-            if (rcount < 3) {
-                kc_error(&tally, "CAA record requires 3 fields (flags, tag, value) for name '%s' in zone '%s'\n",
-                        arena.records[i].name, domain);
-            } else {
-                char *endp;
-                unsigned long caa_flags = strtoul(rdata[0], &endp, 10);
-                if (*endp != '\0' || caa_flags > 255) {
-                    kc_error(&tally, "CAA flags '%s' out of range (0-255) for name '%s' in zone '%s'\n",
-                            rdata[0], arena.records[i].name, domain);
-                } else if ((caa_flags & ~0x80UL) != 0) {
-                    /* RFC 8659 §4: bit0(critical=0x80)以外の未定義ビット */
-                    kc_warning(&tally, "CAA record for '%s' sets undefined flag bits (0x%02lx); "
-                            "only the critical bit (0x80) is defined by RFC 8659\n",
-                            arena.records[i].name, caa_flags);
-                }
-                const char *caa_tag = rdata[1];
-                size_t caa_tag_len = strlen(caa_tag);
-                bool caa_tag_ok = (caa_tag_len >= 1 && caa_tag_len <= 15);
-                for (size_t ti = 0; caa_tag_ok && ti < caa_tag_len; ti++) {
-                    char c = caa_tag[ti];
-                    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')))
-                        caa_tag_ok = false;
-                }
-                if (!caa_tag_ok) {
-                    kc_error(&tally, "CAA tag '%s' for name '%s' does not match RFC 8659 syntax "
-                            "(1-15 chars, [a-zA-Z0-9] only)\n",
-                            caa_tag, arena.records[i].name);
-                } else {
-                    bool known_tag = (strcasecmp(caa_tag, "issue") == 0 ||
-                                      strcasecmp(caa_tag, "issuewild") == 0 ||
-                                      strcasecmp(caa_tag, "iodef") == 0 ||
-                                      strcasecmp(caa_tag, "contactemail") == 0 ||
-                                      strcasecmp(caa_tag, "contactphone") == 0);
-                    if (!known_tag) {
-                        bool is_critical = ((strtoul(rdata[0], NULL, 10) & 0x80) != 0);
-                        if (is_critical) {
-                            kc_error(&tally, "CAA record for '%s' has unknown tag '%s' with the critical flag set; "
-                                    "RFC 8659 requires issuers to refuse issuance\n",
-                                    arena.records[i].name, caa_tag);
-                        } else {
-                            kc_warning(&tally, "CAA record for '%s' has unrecognized tag '%s' "
-                                    "(not one of issue/issuewild/iodef/contactemail/contactphone)\n",
-                                    arena.records[i].name, caa_tag);
-                        }
-                    }
-                }
-            }
-        }
-        if (tcode == 44) { // SSHFP
-            if (rcount < 3) {
-                kc_error(&tally, "SSHFP record requires 3 fields (algorithm, fp_type, fingerprint) for name '%s' in zone '%s'\n",
-                        arena.records[i].name, domain);
-            } else {
-                char *endp;
-                unsigned long alg = strtoul(rdata[0], &endp, 10);
-                if (*endp != '\0' || alg > 255) {
-                    kc_error(&tally, "SSHFP algorithm '%s' out of range (0-255) for name '%s' in zone '%s'\n",
-                            rdata[0], arena.records[i].name, domain);
-                } else if (alg == 0 || alg > 4) {
-                    kc_warning(&tally, "SSHFP record for '%s' uses algorithm '%lu' which is outside standard RFC assignments (1=RSA, 2=DSA, 3=ECDSA, 4=Ed25519)\n",
-                            arena.records[i].name, alg);
-                }
-                unsigned long fpt = strtoul(rdata[1], &endp, 10);
-                if (*endp != '\0' || fpt > 255) {
-                    kc_error(&tally, "SSHFP fp_type '%s' out of range (0-255) for name '%s' in zone '%s'\n",
-                            rdata[1], arena.records[i].name, domain);
-                } else if (fpt == 0 || fpt > 2) {
-                    kc_warning(&tally, "SSHFP record for '%s' uses fp_type '%lu' which is outside standard RFC assignments (1=SHA-1, 2=SHA-256)\n",
-                            arena.records[i].name, fpt);
-                }
-                uint8_t fp_bin[64];
-                size_t dec_len = hex_decode(rdata[2], fp_bin, sizeof(fp_bin));
-                if (dec_len == 0 || dec_len == (size_t)-1) {
-                    kc_error(&tally, "SSHFP invalid fingerprint hex string '%s' for name '%s' in zone '%s'\n",
-                            rdata[2], arena.records[i].name, domain);
-                }
-            }
-        }
-
-        // --- RFC 1912 Operational Checks ---
-        /* in-bailiwick の NS ターゲットのアドレスは lint_glue_consistency() が ERROR として検査する */
-        if (tcode == 6 && rcount >= 2) { // SOA
-            if (is_cname(&arena, rdata[0])) {
-                kc_warning(&tally, "SOA MNAME for '%s' points to a CNAME '%s' (RFC 1912)\n", arena.records[i].name, rdata[0]);
-            }
-        }
-        if (tcode == 5) { // CNAME
-            if (arena.hash_table && arena.hash_size > 0) {
-                uint32_t hash = calc_fnv1a_str(arena.records[i].name);
-                size_t idx = hash & (arena.hash_size - 1);
-                for (int j = arena.hash_table[idx]; j != -1; j = arena.records[j].next_record) {
-                    if (i != (size_t)j && strcasecmp(arena.records[j].name, arena.records[i].name) == 0) {
-                        uint16_t other = arena.records[j].type_code;
-                        // Ignore DNSSEC records
-                        if (other != 5 && other != 46 && other != 47 && other != 50) {
-                            kc_warning(&tally, "CNAME '%s' co-exists with other records (type %d) (RFC 1912)\n", arena.records[i].name, other);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        
-        if (tcode == 20 && (rcount < 1 || rcount > 2)) { // ISDN
-            kc_warning(&tally, "ISDN record requires 1 or 2 fields for name '%s'\n", arena.records[i].name);
-        }
-        if (tcode == 108 || tcode == 109) { // EUI48 / EUI64
-            if (rcount >= 1) {
-                int dashes = 0;
-                for (const char *p = rdata[0]; *p; p++) {
-                    if (*p == '-') dashes++;
-                }
-                if (tcode == 108 && dashes != 5) {
-                    kc_warning(&tally, "EUI48 requires 6 octets (5 dashes) for name '%s'\n", arena.records[i].name);
-                } else if (tcode == 109 && dashes != 7) {
-                    kc_warning(&tally, "EUI64 requires 8 octets (7 dashes) for name '%s'\n", arena.records[i].name);
-                }
-            }
-        }
-
-        // Meta-types (OPT/TKEY/TSIG/IXFR/AXFR/MAILB/MAILA/ANY, and NXNAME
-        // per RFC 9824) must NOT appear as standalone RRsets in zone data.
-        // Shared with the runtime loader's check in dns_zone_parser.c so
-        // karicheck and the actual server never disagree on this.
-        if (is_meta_rrtype(tcode)) {
-            kc_error(&tally, "type %u is a meta-type and must not appear "
-                    "as a standalone RRset in zone '%s' (name '%s')\n", tcode, domain, arena.records[i].name);
-        }
-
-        // DSYNC (66, RFC 9859): validate RRtype mnemonic
-        if (tcode == 66 && rcount >= 1) {
-            if (get_type_code(rdata[0]) == 0) {
-                kc_warning(&tally, "DSYNC record has unknown RRtype mnemonic '%s' for name '%s'\n",
-                        rdata[0], arena.records[i].name);
-            }
-        }
-
-        /* NSEC3 / NSEC3PARAM は lint_nsec3() でチェーンごとに検査する (K-05) */
-
-        // --- Dry-run serialize_dns_record ---
-        uint8_t scratch[65535];
-        uint16_t scratch_offset = 0;
-        compress_ctx_t comp_ctx = {0};
-        compress_ctx_init_packet(&comp_ctx);
-        int wire_result = serialize_dns_record(
-            scratch, sizeof(scratch), &scratch_offset,
-            &arena.records[i], &comp_ctx,
-            NULL,          // owner_name: NULL
-            0xFFFFFFFF     // override_ttl: use record TTL
-        );
-        if (wire_result < 0) {
-            kc_error(&tally,
-                "Record '%s %s' at index %zu cannot be serialized to wire format "
-                "(the server leaves this record out with a warning when it loads the zone). "
-                "Check field count and value ranges for this record type.\n",
-                arena.records[i].name, arena.records[i].type, i);
-        }
-    }
-
-    if (!has_soa) {
-        kc_error(&tally, "No SOA record found in zone '%s' (%s) at origin\n", domain, file_path);
-        printf("[RESULT] Zone '%s': %d error(s), %d warning(s)\n", domain, tally.errors, tally.warnings);
-        fprintf(stderr, "[FAIL] Zone '%s' contains invalid records.\n", domain);
-        free((void*)ctx.base_dir);
-        zone_arena_destroy(&arena);
-        free(root_path);
-        return 1;
-    }
-    /* [T3] SOA重複検出: apexに 2以上の SOAは失敗 */
-    /* B8t-1: a tinydns zone (one Z line per location) and a zone with $LOCATION / $ECS-SUBNET tags may hold several SOA RRs when the
-     * others are restricted; at most one is for everybody, and all have one serial */
-    if (soa_plain_count > 1) {
-        kc_error(&tally, "Zone '%s' (%s) has %d SOA records at the apex that every client sees; "
-                "exactly one SOA record is required (more only with a location, time stamp or tag on the others)\n",
-                domain, file_path, soa_plain_count);
-    }
-    (void)soa_count;
-    {
-        char soa_err[320];
-        if (zone_arena_check_soa_set(&arena, domain, soa_err, sizeof(soa_err)) < 0)
-            kc_error(&tally, "%s (%s)\n", soa_err, file_path);
-        /* a SOA that no client can see: a location the zone does not define, or a countdown time stamp that is over (tdlookup.c) */
-        time_t soa_now = time(NULL);
-        for (size_t i = 0; i < arena.count; i++) {
-            const dns_record_t *sr = &arena.records[i];
-            if (sr->type_code != 6 || !sr->name || strcasecmp(sr->name, domain) != 0 || !dns_record_is_restricted(sr)) continue;
-            bool defined = true;
-            if (sr->tinydns_loc[0] || sr->tinydns_loc[1]) {
-                defined = false;
-                for (int li = 0; li < arena.location_count; li++)
-                    if (arena.locations[li].code[0] == sr->tinydns_loc[0] && arena.locations[li].code[1] == sr->tinydns_loc[1]) defined = true;
-            }
-            if (!defined)
-                kc_warning(&tally, "The SOA record of zone '%s' (%s) is restricted to location '%.2s', which the zone does not define: no client sees it\n",
-                        domain, file_path, sr->tinydns_loc);
-            else if (sr->tinydns_ttd != 0 && sr->tinydns_ttl_countdown && sr->tinydns_ttd < soa_now)
-                kc_warning(&tally, "The SOA record of zone '%s' (%s) has expired (countdown time stamp in the past): no client sees it\n",
-                        domain, file_path);
-        }
-    }
-
-    if (!has_apex_ns) {
-        kc_error(&tally, "No NS record found at zone apex '%s' (%s); this zone cannot be properly delegated\n", domain, file_path);
-    }
-
-    if (is_catalog) {
-        char version_txt[256];
-        snprintf(version_txt, sizeof(version_txt), "version.%s", domain);
-        bool found_version = false;
-        for (size_t i = 0; i < arena.count; i++) {
-            if (arena.records[i].type_code == 16 && strcasecmp(arena.records[i].name, version_txt) == 0) {
-                if (arena.records[i].rdata_count > 0 && strcmp(arena.records[i].rdata[0], "2") == 0) {
-                    found_version = true;
-                    break;
-                }
-            }
-        }
-        if (!found_version) {
-            kc_error(&tally, "Catalog zone '%s' is missing '%s TXT \"2\"'\n", domain, version_txt);
-        }
-
-        // Check for orphaned group TXT records
-        char group_prefix[10] = "group.";
-        char zones_suffix[256];
-        snprintf(zones_suffix, sizeof(zones_suffix), ".zones.%s", domain);
-        size_t zones_suffix_len = strlen(zones_suffix);
-        for (size_t i = 0; i < arena.count; i++) {
-            if (arena.records[i].type_code == 16) { // TXT
-                size_t name_len = strlen(arena.records[i].name);
-                if (name_len > 6 && strncasecmp(arena.records[i].name, group_prefix, 6) == 0) {
-                    if (name_len > zones_suffix_len && strcasecmp(arena.records[i].name + name_len - zones_suffix_len, zones_suffix) == 0) {
-                        // This is a group.<unique-N>.zones.$CATZ record. Check if PTR exists for <unique-N>.zones.$CATZ
-                        size_t ptr_name_len = name_len - 6;
-                        char ptr_name[512];
-                        if (ptr_name_len >= sizeof(ptr_name)) {
-                            kc_error(&tally,
-                                    "Catalog zone '%s': owner name '%s' is too long to process (unique-id part exceeds %zu bytes); skipping orphan check for this record\n",
-                                    domain, arena.records[i].name, sizeof(ptr_name) - 1);
-                            continue; // このTXTレコードについてはスキップし、境界外書き込みを回避
-                        }
-                        strncpy(ptr_name, arena.records[i].name + 6, ptr_name_len);
-                        ptr_name[ptr_name_len] = '\0';
-                        
-                        bool has_ptr = false;
-                        for (size_t j = 0; j < arena.count; j++) {
-                            if (arena.records[j].type_code == 12 && strcasecmp(arena.records[j].name, ptr_name) == 0) {
-                                has_ptr = true;
-                                break;
-                            }
-                        }
-                        if (!has_ptr) {
-                            kc_warning(&tally, "Orphaned group TXT record '%s' (no corresponding PTR record '%s')\n", arena.records[i].name, ptr_name);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    lint_glue_consistency(domain, &arena, &tally);
-    lint_cname_coexistence(domain, &arena, &tally);
-    lint_delegation_occlusion(domain, &arena, &tally);
-    lint_cname_targets(domain, &arena, &tally);
-    lint_nsec3(domain, &arena, &tally);
-    /* K-02: 他のエラーがあっても ZONEMD は検証する (結果は件数に入る) */
-    verify_zonemd(domain, &arena, &tally);
 
     printf("[RESULT] Zone '%s': %d error(s), %d warning(s)\n", domain, tally.errors, tally.warnings);
     free((void*)ctx.base_dir);
@@ -1850,6 +454,19 @@ KARIDNS_TOOL_FN bool kc_line_listed(const char *list, const char *name) {
         p += l + (e ? 1 : 0);
     }
     return false;
+}
+
+/* has the loader at `lp` been built with the driver `driver`?  (karicheck conf and karicheck db) */
+KARIDNS_TOOL_FN void kc_check_loader_driver(kc_tally_t *t, const char *lp, const char *driver) {
+    char drivers[256];
+    if (!kc_loader_drivers(lp, drivers, sizeof(drivers)))
+        kc_error(t, "database loader '%s' did not answer --drivers; is it karidns-dbloader?\n", lp);
+    else if (!kc_line_listed(drivers, driver)) {
+        for (char *c = drivers; *c; c++)
+            if (*c == '\n') *c = (c[1] ? ',' : '\0');
+        kc_error(t, "driver %s is not available in this installation (the loader '%s' has: %s)\n", driver, lp,
+                 drivers[0] ? drivers : "no driver");
+    }
 }
 
 /* B10: does a libpq connection string reach the server over a UNIX socket?  A host that starts with '/' (%2F in a URI) does, and so
@@ -1935,7 +552,7 @@ KARIDNS_TOOL_FN void kc_check_sqlite_file(kc_tally_t *t, const char *what, const
 KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
     const database_config_t *db = &cfg->database;
     if (!db->enabled) return 0;
-    kc_tally_t t = {0, 0};
+    kc_tally_t t = {0};
     bool sqlite = db->driver && strcmp(db->driver, "sqlite3") == 0;
 
     /* loader-user / loader-group */
@@ -1972,17 +589,7 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
             loader_ok = false;
         }
     }
-    if (loader_ok && db->driver) {
-        char drivers[256];
-        if (!kc_loader_drivers(lp, drivers, sizeof(drivers)))
-            kc_error(&t, "database loader '%s' did not answer --drivers; is it karidns-dbloader?\n", lp);
-        else if (!kc_line_listed(drivers, db->driver)) {
-            for (char *c = drivers; *c; c++)
-                if (*c == '\n') *c = (c[1] ? ',' : '\0');
-            kc_error(&t, "driver %s is not available in this installation (the loader '%s' has: %s)\n", db->driver, lp,
-                     drivers[0] ? drivers : "no driver");
-        }
-    }
+    if (loader_ok && db->driver) kc_check_loader_driver(&t, lp, db->driver);
 
     /* B7a: without acl-ceiling the ACLs a database zone carries (allow-transfer, allow-update from the metadata or a profile)
      * refuse every client; the zones still answer queries */
@@ -2255,6 +862,724 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
     return 0;
 }
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* karicheck db [view]  (B12, beta design 7.2)                                                                    */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* `karicheck db` links no database library.  It runs `karidns-dbloader --check` once per database the views read, as the user the
+ * loader of karidns runs as (when karicheck is run by root it drops to loader-user / loader-group first, D-B12-1; otherwise it runs
+ * with its own rights), reads the lines of the check protocol (dns_db_checkproto.h) from a pipe and prints them in the style of
+ * `karicheck zone`.  What needs the configuration is done here, on the lines the loader sends: the restricted parse of the settings
+ * texts with the key names and acl-ceiling, the views a zone is mapped to, and the zones of karidns.conf that shadow a database zone
+ * (D-PRIO / D-PROG).  Everything the loader sends is untrusted (it runs with fewer rights than we may have): fields are bounded,
+ * unescaped strictly, and printed through kc_pr(). */
+
+/* printable copy of s for a message (one of four rotating buffers) */
+KARIDNS_TOOL_FN const char *kc_pr(const char *s) {
+    static char buf[4][600];
+    static unsigned k;
+    char *b = buf[k++ % 4];
+    size_t i = 0;
+    for (; s && s[i] && i < sizeof(buf[0]) - 4; i++) b[i] = ((unsigned char)s[i] >= 0x20 && (unsigned char)s[i] < 0x7F) ? s[i] : '?';
+    if (s && s[i]) {
+        b[i++] = '.';
+        b[i++] = '.';
+        b[i++] = '.';
+    }
+    b[i] = '\0';
+    return b;
+}
+
+typedef struct { const view_config_t *v; bool shared; } kc_member_t;
+typedef struct {
+    const char *source;             /* sqlite3: the database file; postgresql: the schema (NULL: the search_path of the role) */
+    kc_member_t *mem;               /* the views that read it, and whether through the shared source (karidns_domain_views decides) */
+    size_t nmem, cmem;
+} kc_dbsrc_t;
+
+typedef struct {
+    const server_config_t *cfg;
+    const kc_dbsrc_t *src;
+    const view_config_t *only;      /* karicheck db VIEW: only the zones that view gets are shown */
+    const char *label;
+    kc_tally_t t;
+    unsigned zones;                 /* Z lines */
+    bool vis;                       /* the zone of the last Z line is shown */
+    char zone[DNS_NAME_TEXT_SIZE + 4];
+    long long zid;
+    bool have_r;
+    unsigned r_errors;
+    char raw[3][160];               /* lines that are not protocol lines */
+    unsigned nraw, nraw_all;
+    bool overlong;
+} kc_dbrun_t;
+
+/* "the view 'x'", or "the default view" for the view karidns makes when the configuration has no view {} */
+KARIDNS_TOOL_FN const char *kc_vdesc(const char *name) {
+    static char buf[2][320];
+    static unsigned k;
+    char *b = buf[k++ % 2];
+    if (!name || strcmp(name, "__default__") == 0) snprintf(b, sizeof(buf[0]), "the default view");
+    else snprintf(b, sizeof(buf[0]), "the view '%s'", kc_pr(name));
+    return b;
+}
+
+/* the message of a finding, with the database and, for a zone, the zone */
+KARIDNS_TOOL_FN void kc_db_say(kc_dbrun_t *r, char level, const char *zone, long long id, const char *text) {
+    char head[DNS_NAME_TEXT_SIZE + 128];
+    if (zone && zone[0]) snprintf(head, sizeof(head), "%s: zone '%s' (domains.id %lld): ", r->label, kc_pr(zone), id);
+    else snprintf(head, sizeof(head), "%s: ", r->label);
+    switch (level) {
+    case 'E': kc_error(&r->t, "%s%s\n", head, kc_pr(text)); break;
+    case 'W': kc_warning(&r->t, "%s%s\n", head, kc_pr(text)); break;
+    case 'I': kc_info(&r->t, "%s%s\n", head, kc_pr(text)); break;
+    case 'O': kc_ok(&r->t, "%s%s\n", head, kc_pr(text)); break;
+    default: kc_detail(&r->t, "%s\n", kc_pr(text)); break;
+    }
+}
+
+KARIDNS_TOOL_FN void kc_db_sayf(kc_dbrun_t *r, char level, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+KARIDNS_TOOL_FN void kc_db_sayf(kc_dbrun_t *r, char level, const char *fmt, ...) {
+    char msg[1200];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    kc_db_say(r, level, r->zone, r->zid, msg);
+}
+
+KARIDNS_TOOL_FN const view_config_t *kc_find_view(const server_config_t *cfg, const char *name) {
+    for (const view_config_t *v = cfg->views; v; v = v->next)
+        if (v->name && strcasecmp(v->name, name) == 0) return v;
+    return NULL;
+}
+
+/* is the view listed for the zone: through the shared source of the database, or because the view has its own source */
+KARIDNS_TOOL_FN bool kc_db_view_gets(const kc_member_t *m, char **maps, int nmaps) {
+    if (!m->shared) return true;                   /* a view's own database ignores karidns_domain_views */
+    if (nmaps == 1 && strcmp(maps[0], "*") == 0) return true;
+    for (int i = 0; i < nmaps; i++)
+        if (m->v->name && strcasecmp(m->v->name, maps[i]) == 0) return true;
+    return false;
+}
+
+/* A Z line: Z <zone> <id> <kind> <view>... */
+KARIDNS_TOOL_FN void kc_db_zone(kc_dbrun_t *r, char **f, int n) {
+    char name[DNS_NAME_TEXT_SIZE + 4], *maps[CHK_MAX_FIELDS];
+    char mapbuf[CHK_MAX_FIELDS][270];
+    int nmaps = 0;
+    r->zones++;
+    if (chk_unescape(f[1], strlen(f[1]), name, sizeof(name)) == (size_t)-1) {
+        r->zone[0] = '\0';
+        r->zid = 0;
+        r->vis = !r->only;
+        kc_db_say(r, 'E', "", 0, "the loader sent a zone line that does not decode");
+        return;
+    }
+    snprintf(r->zone, sizeof(r->zone), "%s", name);
+    r->zid = strtoll(f[2], NULL, 10);
+    for (int i = 4; i < n && nmaps < CHK_MAX_FIELDS; i++) {
+        if (chk_unescape(f[i], strlen(f[i]), mapbuf[nmaps], sizeof(mapbuf[nmaps])) == (size_t)-1) continue;
+        maps[nmaps] = mapbuf[nmaps];
+        nmaps++;
+    }
+    if (nmaps == 0) {
+        snprintf(mapbuf[0], sizeof(mapbuf[0]), "*");
+        maps[0] = mapbuf[0];
+        nmaps = 1;
+    }
+    bool any_shared = false, served_shared = false;
+    bool in_only = false;
+    const kc_member_t *served[64];
+    size_t nserved = 0;
+    for (size_t i = 0; i < r->src->nmem; i++) {
+        const kc_member_t *m = &r->src->mem[i];
+        if (m->shared) any_shared = true;
+        if (!kc_db_view_gets(m, maps, nmaps)) continue;
+        if (m->shared) served_shared = true;
+        if (m->v == r->only) in_only = true;
+        if (nserved < sizeof(served) / sizeof(served[0])) served[nserved++] = m;
+    }
+    r->vis = !r->only || in_only;
+    bool valid = strcmp(f[3], "invalid") != 0;
+    if (!r->vis || !valid) return;
+    /* karidns_domain_views: rows that name a view this server does not have, or one that does not read this database through the shared
+     * source, are ignored by the server (it logs them); a zone that only such rows map is served by no view (design 7.1) */
+    if (any_shared && !(nmaps == 1 && strcmp(maps[0], "*") == 0)) {
+        for (int i = 0; i < nmaps; i++) {
+            const view_config_t *v = kc_find_view(r->cfg, maps[i]);
+            bool shared_member = false;
+            for (size_t k = 0; k < r->src->nmem; k++)
+                if (r->src->mem[k].shared && r->src->mem[k].v == v) shared_member = true;
+            if (!v)
+                kc_db_sayf(r, 'W', "karidns_domain_views names the view '%s', which is not defined in the configuration; the row is ignored", kc_pr(maps[i]));
+            else if (!shared_member)
+                kc_db_sayf(r, 'W', "karidns_domain_views names the view '%s', which does not read this database through the shared source "
+                                   "(database none, or a database-file / database-schema of its own); the row is ignored", kc_pr(maps[i]));
+        }
+        if (!served_shared)
+            kc_db_sayf(r, 'W', "karidns_domain_views maps the zone only to views that do not read it, so no view serves the zone");
+    }
+    /* D-PRIO / D-PROG: a zone of karidns.conf with the same name hides the database zone in that view (design 4.5) */
+    for (size_t i = 0; i < nserved; i++) {
+        if (r->only && served[i]->v != r->only) continue;                    /* karicheck db VIEW: the views of the other zones are not asked about */
+        const zone_config_t *zc = view_find_zone_config(served[i]->v, name);
+        if (!zc) continue;
+        const char *vn = served[i]->v->name ? served[i]->v->name : "";
+        if (zc->type && (strcasecmp(zc->type, "program") == 0 || strcasecmp(zc->type, "forward") == 0))
+            kc_db_sayf(r, 'W', "D-PROG: %s has a zone of type %s with this name in the configuration; it hides the database zone", kc_vdesc(vn),
+                       zc->type);
+        else
+            kc_db_sayf(r, 'W', "D-PRIO: %s has a zone with this name in the configuration%s%s%s; it hides the database zone", kc_vdesc(vn),
+                       zc->file ? " (file '" : "", zc->file ? kc_pr(zc->file) : "", zc->file ? "')" : "");
+    }
+}
+
+/* is the address / prefix entry e (not negated) inside the address entries of acl-ceiling?  First match decides, as at run time. */
+KARIDNS_TOOL_FN bool kc_ceiling_covers(const database_config_t *db, const cidr_entry_t *e) {
+    for (int i = 0; i < db->acl_ceiling_count; i++) {
+        const cidr_entry_t *c = &db->acl_ceiling_parsed[i].cidr;
+        if (!c->valid) continue;
+        bool covers;
+        if (c->is_any) {
+            covers = true;
+        } else if (e->is_any || c->family != e->family || c->prefix > e->prefix) {
+            covers = false;
+        } else {
+            covers = true;
+            for (int b = 0; b < 16 && covers; b++)
+                if ((e->addr[b] & c->mask[b]) != c->addr[b]) covers = false;
+        }
+        if (covers) return !db->acl_ceiling_parsed[i].is_deny;
+    }
+    return false;
+}
+
+KARIDNS_TOOL_FN void kc_db_acl_list(kc_dbrun_t *r, const char *what, char *const *entries, int count, bool keys_too) {
+    const database_config_t *db = &r->cfg->database;
+    for (int i = 0; i < count; i++) {
+        const char *e = entries[i];
+        if (!e || !*e || e[0] == '!' || strcmp(e, "none") == 0) continue;
+        cidr_entry_t ce;
+        if (cidr_entry_parse(&ce, e)) {
+            if (!kc_ceiling_covers(db, &ce))
+                kc_db_sayf(r, 'W', "%s entry '%s' is outside acl-ceiling; a client there is refused", what, kc_pr(e));
+        } else if (keys_too) {
+            bool listed = false;
+            for (int k = 0; k < db->acl_ceiling_keys_count; k++)
+                if (db->acl_ceiling_keys[k] && strcasecmp(db->acl_ceiling_keys[k], e) == 0) listed = true;
+            if (!listed)
+                kc_db_sayf(r, 'W', "%s key '%s' is not listed in acl-ceiling; a client that uses it is refused unless its address is inside the ceiling", what, kc_pr(e));
+        }
+    }
+}
+
+KARIDNS_TOOL_FN void kc_db_ceiling(kc_dbrun_t *r, const zone_ext_t *x) {
+    const database_config_t *db = &r->cfg->database;
+    if (db->acl_ceiling_count == 0 && db->acl_ceiling_keys_count == 0) {
+        if (x->allow_transfer_count > 0 || x->tsig_keys_count > 0 || x->allow_update_count > 0 || x->ecs_trusted_resolvers_count > 0)
+            kc_db_sayf(r, 'W', "the settings have allow-transfer / allow-update / ecs-trusted-resolvers entries, but acl-ceiling is not configured; "
+                               "the ACLs of a database zone refuse every client without it");
+        return;
+    }
+    kc_db_acl_list(r, "allow-transfer", x->allow_transfer, x->allow_transfer_count, false);
+    for (int i = 0; i < x->tsig_keys_count; i++) {
+        bool listed = false;
+        for (int k = 0; k < db->acl_ceiling_keys_count; k++)
+            if (x->tsig_keys[i] && db->acl_ceiling_keys[k] && strcasecmp(db->acl_ceiling_keys[k], x->tsig_keys[i]) == 0) listed = true;
+        if (!listed)
+            kc_db_sayf(r, 'W', "allow-transfer key '%s' is not listed in acl-ceiling; a client that uses it is refused unless its address is inside the ceiling",
+                       kc_pr(x->tsig_keys[i] ? x->tsig_keys[i] : ""));
+    }
+    kc_db_acl_list(r, "allow-update", x->allow_update, x->allow_update_count, true);
+    kc_db_acl_list(r, "ecs-trusted-resolvers", x->ecs_trusted_resolvers, x->ecs_trusted_resolvers_count, false);
+}
+
+/* db_settings_parse() prints the parser's own "[ERROR] zone 'settings.': ..." lines on stderr.  Here they would be lines about no zone, so the
+ * parse runs with stderr on /dev/null; when it fails, it is repeated once with stderr on a temporary file to learn the parser's reason
+ * (the `err` text is often only "syntax error or invalid value"), which then goes into our message.  false: no second run. */
+static bool kc_settings_capture = true;
+
+KARIDNS_TOOL_FN zone_ext_shared_t *kc_parse_settings(const char *text, size_t len, char *err, size_t errlen) {
+    static int devnull = -2;
+    if (devnull == -2) devnull = open("/dev/null", O_WRONLY);
+    fflush(stderr);
+    int saved = dup(2);
+    if (devnull >= 0 && saved >= 0) dup2(devnull, 2);
+    zone_ext_shared_t *sh = db_settings_parse(text, len, err, errlen);
+    fflush(stderr);
+    if (saved >= 0) {
+        dup2(saved, 2);
+        close(saved);
+    }
+    if (!sh && kc_settings_capture) {
+        FILE *tf = tmpfile();
+        saved = dup(2);
+        if (tf && saved >= 0) {
+            char e2[200], line[300];
+            dup2(fileno(tf), 2);
+            zone_ext_shared_t *x2 = db_settings_parse(text, len, e2, sizeof(e2));
+            fflush(stderr);
+            dup2(saved, 2);
+            if (x2) zone_ext_shared_unref(x2);
+            rewind(tf);
+            if (fgets(line, sizeof(line), tf)) {
+                size_t n = strcspn(line, "\r\n");
+                line[n] = '\0';
+                const char *p = strncmp(line, "[ERROR] ", 8) == 0 ? line + 8 : line;
+                if (*p) snprintf(err, errlen, "%s", p);
+            }
+        }
+        if (saved >= 0) close(saved);
+        if (tf) fclose(tf);
+    }
+    return sh;
+}
+
+/* An S line: S <zone> <id> <settings text> <profile> <profile text>.  The Backend parses the profile text alone, the zone text alone, and the
+ * profile text followed by a line feed and the zone text, in restricted mode (design 7.3). */
+KARIDNS_TOOL_FN void kc_db_settings(kc_dbrun_t *r, char **f) {
+    if (!r->vis) return;
+    size_t zl = strlen(f[3]), pl = strlen(f[5]);
+    char *zt = malloc(zl + 1), *pt = malloc(pl + 1), *both = malloc(zl + pl + 2);
+    if (!zt || !pt || !both) {
+        kc_db_say(r, 'E', r->zone, r->zid, "out of memory");
+        goto out;
+    }
+    size_t zn = chk_unescape(f[3], zl, zt, zl + 1), pn = chk_unescape(f[5], pl, pt, pl + 1);
+    if (zn == (size_t)-1 || pn == (size_t)-1) {
+        kc_db_say(r, 'E', r->zone, r->zid, "the loader sent a settings line that does not decode");
+        goto out;
+    }
+    char pname[300];
+    if (chk_unescape(f[4], strlen(f[4]), pname, sizeof(pname)) == (size_t)-1) pname[0] = '\0';
+    char err[200];
+    zone_ext_shared_t *sh;
+    if (pn > 0) {
+        sh = kc_parse_settings(pt, pn, err, sizeof(err));
+        if (!sh) {
+            kc_db_sayf(r, 'E', "the settings text of the profile '%s' does not parse in restricted mode: %s", kc_pr(pname), kc_pr(err));
+            goto out;
+        }
+        zone_ext_shared_unref(sh);
+    }
+    if (zn > 0) {
+        sh = kc_parse_settings(zt, zn, err, sizeof(err));
+        if (!sh) {
+            kc_db_sayf(r, 'E', "the settings from domainmetadata do not parse in restricted mode: %s", kc_pr(err));
+            goto out;
+        }
+        zone_ext_shared_unref(sh);
+    }
+    size_t bn = 0;
+    if (pn > 0) {
+        memcpy(both, pt, pn);
+        bn = pn;
+    }
+    if (pn > 0 && zn > 0) both[bn++] = '\n';
+    if (zn > 0) {
+        memcpy(both + bn, zt, zn);
+        bn += zn;
+    }
+    sh = kc_parse_settings(both, bn, err, sizeof(err));
+    if (!sh) {
+        kc_db_sayf(r, 'E', "the settings of the profile '%s' and of the zone together do not parse in restricted mode: %s", kc_pr(pname), kc_pr(err));
+        goto out;
+    }
+    const char *missing = db_settings_missing_key(&sh->ext, r->cfg);
+    if (missing)
+        kc_db_sayf(r, 'E', "the settings name the TSIG key '%s', which is not defined in the configuration (key \"%s\" { ... };); the server refuses the zone",
+                   kc_pr(missing), kc_pr(missing));
+    kc_db_ceiling(r, &sh->ext);
+    zone_ext_shared_unref(sh);
+out:
+    free(zt);
+    free(pt);
+    free(both);
+}
+
+/* One line of the loader */
+KARIDNS_TOOL_FN void kc_db_line(kc_dbrun_t *r, char *line) {
+    char *f[CHK_MAX_FIELDS], shown[160];
+    size_t sk = 0;
+    for (; line[sk] && sk < sizeof(shown) - 1; sk++)                 // what to print if this is not a line of the protocol
+        shown[sk] = line[sk] == '\t' ? ' ' : ((unsigned char)line[sk] >= 0x20 && (unsigned char)line[sk] < 0x7F) ? line[sk] : '?';
+    shown[sk] = '\0';
+    int n = chk_split(line, f, CHK_MAX_FIELDS);
+    char tag = n > 0 && f[0][0] && !f[0][1] ? f[0][0] : 0;
+    bool proto = (tag && strchr("EWIOD", tag) && n == 4) || (tag == 'Z' && n >= 5) || (tag == 'S' && n == 6) || (tag == 'R' && n == 4);
+    if (!proto) {
+        r->nraw_all++;
+        if (r->nraw < 3) {
+            snprintf(r->raw[r->nraw++], sizeof(r->raw[0]), "%s", shown);
+        }
+        return;
+    }
+    if (tag == 'Z') {
+        kc_db_zone(r, f, n);
+        return;
+    }
+    if (tag == 'S') {
+        kc_db_settings(r, f);
+        return;
+    }
+    if (tag == 'R') {
+        r->have_r = true;
+        r->r_errors = (unsigned)strtoul(f[2], NULL, 10);
+        return;
+    }
+    char zone[DNS_NAME_TEXT_SIZE + 4], text[4 * CHK_TEXT_MAX + 16];
+    if (chk_unescape(f[1], strlen(f[1]), zone, sizeof(zone)) == (size_t)-1 || chk_unescape(f[3], strlen(f[3]), text, sizeof(text)) == (size_t)-1) {
+        r->nraw_all++;
+        return;
+    }
+    long long id = strtoll(f[2], NULL, 10);
+    if (zone[0] && r->only && !(r->vis && strcmp(zone, r->zone) == 0)) return;          /* a zone of another view */
+    kc_db_say(r, tag, zone, id, text);
+}
+
+/* The user the loader of karidns runs as (design 1.2): when root runs karicheck, loader-user / loader-group; else the caller. */
+KARIDNS_TOOL_FN bool kc_db_identity(const database_config_t *db, uid_t *uid, gid_t *gid, bool *drop, char *who, size_t whocap) {
+    *drop = false;
+    if (geteuid() != 0) {
+        struct passwd *pw = getpwuid(geteuid());
+        snprintf(who, whocap, "the rights of the user %s (uid %u)", pw ? pw->pw_name : "?", (unsigned)geteuid());
+        struct passwd *lu = db->loader_user ? getpwnam(db->loader_user) : NULL;
+        if (lu && lu->pw_uid != geteuid()) {
+            size_t l = strlen(who);
+            snprintf(who + l, whocap - l, "; loader-user is '%s', so what the files allow can differ (run karicheck as root or as that user)", kc_pr(db->loader_user));
+        }
+        return true;
+    }
+    if (!db->loader_user) {
+        fprintf(stderr, "[ERROR] karicheck is run by root, but options { database { loader-user } } is not set: karidns does not run the loader as root, "
+                        "so there are no rights to check with; run karicheck as the user of the loader, or set loader-user\n");
+        return false;
+    }
+    struct passwd *pw = getpwnam(db->loader_user);
+    if (!pw) {
+        fprintf(stderr, "[ERROR] database loader-user '%s' does not exist\n", kc_pr(db->loader_user));
+        return false;
+    }
+    *uid = pw->pw_uid;
+    *gid = pw->pw_gid;
+    if (db->loader_group) {
+        struct group *gr = getgrnam(db->loader_group);
+        if (!gr) {
+            fprintf(stderr, "[ERROR] database loader-group '%s' does not exist\n", kc_pr(db->loader_group));
+            return false;
+        }
+        *gid = gr->gr_gid;
+    }
+    *drop = true;
+    snprintf(who, whocap, "the rights of loader-user '%s'%s%s (karicheck was run by root and drops to it, as karidns does for the loader)",
+             kc_pr(db->loader_user), db->loader_group ? " / loader-group " : "", db->loader_group ? kc_pr(db->loader_group) : "");
+    return true;
+}
+
+extern char **environ;
+
+/* Run the loader for one source.  Returns 0, or 1 when something was wrong (also: it could not be run). */
+KARIDNS_TOOL_FN int kc_db_run_source(const server_config_t *cfg, const kc_dbsrc_t *src, const view_config_t *only, bool sqlite, unsigned *zones_out,
+                                     int *errors_out, int *warnings_out) {
+    const database_config_t *db = &cfg->database;
+    char label[1200], who[400];
+    if (sqlite) snprintf(label, sizeof(label), "Database file '%s'", kc_pr(src->source));
+    else if (src->source) snprintf(label, sizeof(label), "Database schema '%s'", kc_pr(src->source));
+    else snprintf(label, sizeof(label), "Database (default schema)");
+    uid_t uid = 0;
+    gid_t gid = 0;
+    bool drop = false;
+    if (!kc_db_identity(db, &uid, &gid, &drop, who, sizeof(who))) return 1;
+    char names[600] = "";
+    for (size_t i = 0; i < src->nmem; i++) {
+        size_t l = strlen(names);
+        snprintf(names + l, sizeof(names) - l, "%s%s", i ? ", " : "", kc_pr(src->mem[i].v->name ? src->mem[i].v->name : ""));
+    }
+    if (src->nmem == 1 && src->mem[0].v->name && strcmp(src->mem[0].v->name, "__default__") == 0)
+        printf("[INFO] Checking %s (the default view) with %s\n", label, who);
+    else
+        printf("[INFO] Checking %s (view%s %s) with %s\n", label, src->nmem > 1 ? "s" : "", names, who);
+    fflush(stdout);
+
+    /* the arguments: the source, and what the configuration says about the load */
+    const char *argv[1100];
+    char num[4][40];
+    int a = 0;
+    const char *lp = db_loader_path(cfg);
+    argv[a++] = "karidns-dbloader";
+    argv[a++] = "--check";
+    argv[a++] = "--driver";
+    argv[a++] = db->driver;
+    if (sqlite) {
+        argv[a++] = "--database-file";
+        argv[a++] = src->source;
+    } else {
+        argv[a++] = "--conninfo-file";
+        argv[a++] = db->conninfo_file;
+        if (src->source) {
+            argv[a++] = "--schema";
+            argv[a++] = src->source;
+        }
+    }
+    if (db->default_ttl) {
+        snprintf(num[0], sizeof(num[0]), "%u", (unsigned)db->default_ttl);
+        argv[a++] = "--default-ttl";
+        argv[a++] = num[0];
+    }
+    if (db->max_zone_records) {
+        snprintf(num[1], sizeof(num[1]), "%llu", (unsigned long long)db->max_zone_records);
+        argv[a++] = "--max-zone-records";
+        argv[a++] = num[1];
+    }
+    if (db->max_zone_bytes) {
+        snprintf(num[2], sizeof(num[2]), "%llu", (unsigned long long)db->max_zone_bytes);
+        argv[a++] = "--max-zone-bytes";
+        argv[a++] = num[2];
+    }
+    if (db->auto_reload) argv[a++] = "--auto-reload";
+    if (db->server_id) {
+        argv[a++] = "--server-id";
+        argv[a++] = db->server_id;
+    }
+    for (int i = 0; i < cfg->ecs_tag_count && i < 256; i++) {
+        argv[a++] = "--ecs-tag";
+        argv[a++] = cfg->ecs_tags[i].tag;
+    }
+    for (int i = 0; i < cfg->location_tag_count && i < 256; i++) {
+        argv[a++] = "--location-tag";
+        argv[a++] = cfg->location_tags[i].tag;
+    }
+    argv[a] = NULL;
+
+    int fds[2];
+    if (pipe(fds) != 0) {
+        fprintf(stderr, "[ERROR] %s: pipe: %s\n", label, strerror(errno));
+        return 1;
+    }
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "[ERROR] %s: fork: %s\n", label, strerror(errno));
+        close(fds[0]);
+        close(fds[1]);
+        return 1;
+    }
+    if (pid == 0) {                                                     /* the child: the loader's rights, nothing else */
+        char msg[400];
+        int dn = open("/dev/null", O_RDWR);
+        if (dn >= 0) dup2(dn, 0);
+        dup2(fds[1], 1);
+        dup2(fds[1], 2);
+        for (int fd = 3; fd < 256; fd++) close(fd);
+        signal(SIGPIPE, SIG_DFL);
+        if (drop) {
+            if (setgroups(0, NULL) != 0 || setgid(gid) != 0 || setuid(uid) != 0 || getuid() != uid || geteuid() != uid) {
+                int n = snprintf(msg, sizeof(msg), "cannot drop to the loader user: %s\n", strerror(errno));
+                if (n > 0) (void)!write(2, msg, (size_t)n);
+                _exit(126);
+            }
+        }
+        static char *empty_env[] = { NULL };
+        environ = empty_env;
+        if (chdir("/") != 0) _exit(126);
+        execv(lp, (char *const *)argv);
+        int n = snprintf(msg, sizeof(msg), "cannot execute '%s': %s\n", lp, strerror(errno));
+        if (n > 0) (void)!write(2, msg, (size_t)n);
+        _exit(127);
+    }
+    close(fds[1]);
+
+    kc_dbrun_t r;
+    memset(&r, 0, sizeof(r));
+    r.cfg = cfg;
+    r.src = src;
+    r.only = only;
+    r.label = label;
+    r.vis = !only;
+    char *buf = malloc(CHK_LINE_MAX + 2);
+    size_t len = 0;
+    bool skipping = false;
+    if (!buf) {
+        fprintf(stderr, "[ERROR] %s: out of memory\n", label);
+        close(fds[0]);
+        kill(pid, SIGKILL);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        return 1;
+    }
+    char chunk[16384];
+    for (;;) {
+        ssize_t got = read(fds[0], chunk, sizeof(chunk));
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) break;
+        for (ssize_t i = 0; i < got; i++) {
+            char ch = chunk[i];
+            if (ch == '\n') {
+                if (!skipping) {
+                    buf[len] = '\0';
+                    if (strlen(buf) == len) kc_db_line(&r, buf);
+                    else r.nraw_all++;                              /* a NUL inside a line */
+                }
+                len = 0;
+                skipping = false;
+            } else if (!skipping) {
+                if (len >= CHK_LINE_MAX) {
+                    skipping = true;
+                    r.overlong = true;
+                    len = 0;
+                } else {
+                    buf[len++] = ch;
+                }
+            }
+        }
+    }
+    close(fds[0]);
+    if (len > 0 && !skipping) {                                         /* a last line without its line feed */
+        buf[len] = '\0';
+        kc_db_line(&r, buf);
+    }
+    free(buf);
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    int rc = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+    if (r.overlong) kc_error(&r.t, "%s: the loader wrote a line longer than %d bytes; it was skipped\n", label, CHK_LINE_MAX);
+    if (rc >= 2 || !r.have_r) {
+        /* it did not finish its job (usage, cannot run, database error, killed): whatever it said that was not a finding is the reason */
+        if (r.t.errors == 0 || r.nraw > 0) {
+            char why[500] = "";
+            for (unsigned i = 0; i < r.nraw; i++) {
+                size_t l = strlen(why);
+                snprintf(why + l, sizeof(why) - l, "%s%s", i ? " / " : "", r.raw[i]);
+            }
+            kc_error(&r.t, "%s: the loader %s%s%s\n", label,
+                     WIFSIGNALED(st) ? "was killed by a signal" : (rc == 127 ? "could not be executed" : rc == 4 ? "found the database busy or unreachable (try again)" :
+                                                                          rc < 2 ? "ended without its final line" : "could not check the database"),
+                     why[0] ? ": " : "", why);
+        }
+    } else if (r.nraw_all > 0) {
+        kc_warning(&r.t, "%s: the loader printed %u line(s) that are not part of its protocol (first: %s)\n", label, r.nraw_all, r.nraw ? r.raw[0] : "?");
+    }
+    printf("[RESULT] %s: %u zone(s) read, %d error(s), %d warning(s)\n", label, r.zones, r.t.errors, r.t.warnings);
+    if (r.t.errors > 0) fprintf(stderr, "[FAIL] %s has errors.\n", label);
+    else printf("[OK] %s is valid.\n", label);
+    *zones_out += r.zones;
+    *errors_out += r.t.errors;
+    *warnings_out += r.t.warnings;
+    return r.t.errors > 0 ? 1 : 0;
+}
+
+/* karicheck db [view] [config_path] */
+KARIDNS_TOOL_FN int kc_db_main(const char *config_path, const char *view_arg) {
+    setvbuf(stdout, NULL, _IOLBF, 0);                   // the lines of stdout and stderr come out in the order they were written even in a pipe
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    printf("[INFO] Loading config %s...\n", config_path);
+    bool failed = false;
+    char *buf = read_file_or_die(config_path, &failed);
+    if (failed || !buf) return 1;
+    if (parse_named_conf_ext(buf, config_path, &cfg) != 0) {
+        fprintf(stderr, "[ERROR] Syntax error in config file: %s\n", config_path);
+        free(buf);
+        return 1;
+    }
+    free(buf);
+    const database_config_t *db = &cfg.database;
+    if (!db->enabled) {
+        fprintf(stderr, "[ERROR] The configuration has no options { database { } } block; there is no database to check\n");
+        return 1;
+    }
+    const char *lp = db_loader_path(&cfg);
+    struct stat lst;
+    if (stat(lp, &lst) != 0 && errno == ENOENT) {
+        fprintf(stderr, "[ERROR] DB support is not installed: the database loader '%s' does not exist (this installation has no karidns-dbloader; "
+                        "install the karidns-sqlite3, karidns-postgresql or karidns-db package, or set loader-path)\n", kc_pr(lp));
+        return 1;
+    }
+    const view_config_t *only = NULL;
+    if (view_arg) {
+        only = kc_find_view(&cfg, view_arg);
+        if (!only) {
+            fprintf(stderr, "[ERROR] The view '%s' is not defined in %s\n", kc_pr(view_arg), config_path);
+            return 1;
+        }
+        if (only->database_none) {
+            fprintf(stderr, "[ERROR] The view '%s' takes no zones from the database (database none)\n", kc_pr(view_arg));
+            return 1;
+        }
+    }
+    /* The rest of the database block (loader-user, the ownership of the loader, the mode of the files) is for `karicheck conf`: the loader
+     * says what it cannot read, with the rights it runs with.  What this command needs: a loader that can be executed and has the driver. */
+    {
+        kc_tally_t ct = {0};
+        if (!db->driver) kc_error(&ct, "options { database { } } has no driver\n");
+        else if (access(lp, X_OK) != 0) kc_error(&ct, "database loader '%s' is not executable by this user: %s\n", lp, strerror(errno));
+        else if (geteuid() != 0) kc_check_loader_driver(&ct, lp, db->driver);      /* root does not run the loader, not even --drivers: the loader after the privilege drop says it */
+        if (ct.errors > 0) return 1;
+    }
+
+    /* the databases the views read: the global source for the views without one of their own, and the own source of each other view */
+    bool sqlite = db->driver && strcmp(db->driver, "sqlite3") == 0;
+    kc_dbsrc_t *srcs = NULL;
+    size_t nsrc = 0, csrc = 0;
+    for (const view_config_t *v = cfg.views; v; v = v->next) {
+        if (v->database_none) continue;
+        const char *own = sqlite ? v->database_file : v->database_schema;
+        const char *source = own ? own : (sqlite ? db->database_file : db->schema);
+        if (sqlite && !source) continue;                                /* reported by karicheck conf */
+        size_t k = 0;
+        for (; k < nsrc; k++)
+            if ((srcs[k].source == NULL) == (source == NULL) && (!source || strcmp(srcs[k].source, source) == 0)) break;
+        if (k == nsrc) {
+            if (nsrc == csrc) {
+                csrc = csrc ? csrc * 2 : 8;
+                kc_dbsrc_t *ns = realloc(srcs, csrc * sizeof(*ns));
+                if (!ns) {
+                    fprintf(stderr, "[ERROR] Out of memory\n");
+                    free(srcs);
+                    return 1;
+                }
+                srcs = ns;
+            }
+            memset(&srcs[nsrc], 0, sizeof(srcs[0]));
+            srcs[nsrc++].source = source;
+        }
+        kc_dbsrc_t *s = &srcs[k];
+        if (s->nmem == s->cmem) {
+            s->cmem = s->cmem ? s->cmem * 2 : 4;
+            kc_member_t *nm = realloc(s->mem, s->cmem * sizeof(*nm));
+            if (!nm) {
+                fprintf(stderr, "[ERROR] Out of memory\n");
+                return 1;
+            }
+            s->mem = nm;
+        }
+        s->mem[s->nmem].v = v;
+        s->mem[s->nmem].shared = own == NULL;
+        s->nmem++;
+    }
+    int bad = 0, total_err = 0, total_warn = 0;
+    unsigned total_zones = 0;
+    size_t ran = 0;
+    for (size_t i = 0; i < nsrc; i++) {
+        bool has_only = !only;
+        for (size_t k = 0; k < srcs[i].nmem; k++)
+            if (srcs[i].mem[k].v == only) has_only = true;
+        if (!has_only) continue;
+        ran++;
+        if (kc_db_run_source(&cfg, &srcs[i], only, sqlite, &total_zones, &total_err, &total_warn) != 0) bad++;
+    }
+    if (ran == 0) {
+        fprintf(stderr, "[ERROR] No view reads a database: nothing to check\n");
+        bad++;
+    }
+    printf("[INFO] Checked %zu database%s (%u zone%s). Errors: %d, warnings: %d\n", ran, ran == 1 ? "" : "s", total_zones, total_zones == 1 ? "" : "s", total_err,
+           total_warn);
+    for (size_t i = 0; i < nsrc; i++) free(srcs[i].mem);
+    free(srcs);
+    return bad > 0 ? 1 : 0;
+}
+
 KARIDNS_TOOL_FN void print_usage(const char *prog) {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s [-v | --version]\n", prog);
@@ -2262,6 +1587,15 @@ KARIDNS_TOOL_FN void print_usage(const char *prog) {
     fprintf(stderr, "  %s zones [config_path]\n", prog);
     fprintf(stderr, "  %s zone <domain> [config_path]\n", prog);
     fprintf(stderr, "  %s zone <domain> <zone_file_path>\n", prog);
+    fprintf(stderr, "  %s db [view] [config_path]\n", prog);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "db reads the PowerDNS tables of options { database { } } (read only, through karidns-dbloader --check) and checks the schema,\n");
+    fprintf(stderr, "every zone (as zone does), the settings texts, the views and the zones that karidns.conf defines with the same name.  Run by\n");
+    fprintf(stderr, "root it drops to loader-user / loader-group first; run by another user it checks with that user's rights.  Exit status 0: no\n");
+    fprintf(stderr, "error, 1: errors (or the check could not be run).  A single argument is a view unless it contains a '/' or ends in .conf.\n");
+    fprintf(stderr, "Examples:\n");
+    fprintf(stderr, "  %s db\n", prog);
+    fprintf(stderr, "  %s db internal /usr/local/etc/karidns/karidns.conf\n", prog);
 }
 
 #if defined(KARIDNS_COVERAGE_LINKAGE) && !defined(main)
@@ -2360,6 +1694,21 @@ int main(int argc, char **argv) {
             }
             return failed > 0 ? 1 : 0;
         }
+    } else if (strcmp(cmd, "db") == 0) {
+        /* db [view] [config_path]: one argument is the configuration when it looks like a path, else a view */
+        const char *view = NULL, *cfg_path = default_config;
+        if (argc > 4) {
+            print_usage(argv[0]);
+            return 1;
+        }
+        if (argc == 4) {
+            view = argv[2];
+            cfg_path = argv[3];
+        } else if (argc == 3) {
+            if (strchr(argv[2], '/') || (strlen(argv[2]) > 5 && strcmp(argv[2] + strlen(argv[2]) - 5, ".conf") == 0)) cfg_path = argv[2];
+            else view = argv[2];
+        }
+        return kc_db_main(cfg_path, view);
     } else {
         print_usage(argv[0]);
         return 1;

@@ -349,6 +349,79 @@ static void test_schema(void) {
     }
 }
 
+/* B12: schema_findings() (`karicheck db`): all faults at once, the triggers by name, the multi-server tables, the privileges */
+typedef struct { char text[4096]; } fnd_t;
+static void fnd_sink(void *ud, char level, const char *text) {
+    fnd_t *f = ud;
+    size_t l = strlen(f->text);
+    snprintf(f->text + l, sizeof(f->text) - l, "%c:%s\n", level, text);
+}
+
+static void test_schema_findings(void) {
+    printf("schema findings (B12)\n");
+    db_conn_t *c = open_drv(NULL);
+    if (!c) return;
+    fnd_t f;
+    db_check_opts_t o = { true, "ns1" };
+    memset(&f, 0, sizeof(f));
+    CHECK(D->schema_findings(c, &o, fnd_sink, &f) == 0);
+    CHECK(strstr(f.text, "E:") == NULL);                                         /* everything is there, triggers too */
+    CHECK_HAS(f.text, "I:karidns_* schema version 2");
+
+    /* several faults at once: all named */
+    Q("ALTER TABLE records RENAME COLUMN ordername TO ordername_x; ALTER TABLE records RENAME COLUMN prio TO prio_x");
+    Q("ALTER TABLE domainmetadata RENAME TO domainmetadata_x");
+    memset(&f, 0, sizeof(f));
+    CHECK(D->schema_findings(c, &o, fnd_sink, &f) == 0);
+    CHECK_HAS(f.text, "E:table records has no column prio, ordername (PowerDNS 5.1 schema expected)");
+    CHECK_HAS(f.text, "E:table domainmetadata is missing (PowerDNS 5.1 schema expected)");
+    Q("ALTER TABLE records RENAME COLUMN ordername_x TO ordername; ALTER TABLE records RENAME COLUMN prio_x TO prio");
+    Q("ALTER TABLE domainmetadata_x RENAME TO domainmetadata");
+
+    /* a trigger missing: an error only with auto-reload */
+    Q("ALTER TRIGGER karidns_trg_records_upd ON records RENAME TO karidns_trg_records_upd_x");
+    memset(&f, 0, sizeof(f));
+    CHECK(D->schema_findings(c, &o, fnd_sink, &f) == 0);
+    CHECK_HAS(f.text, "E:auto-reload yes needs the change log triggers, but 1 are missing: karidns_trg_records_upd");
+    o.auto_reload = false;
+    memset(&f, 0, sizeof(f));
+    CHECK(D->schema_findings(c, &o, fnd_sink, &f) == 0);
+    CHECK(strstr(f.text, "trigger") == NULL);
+    Q("ALTER TRIGGER karidns_trg_records_upd_x ON records RENAME TO karidns_trg_records_upd");
+
+    /* the multi-server tables: one of two; none with a server-id */
+    Q("ALTER TABLE karidns_server_status RENAME TO karidns_server_status_x");
+    memset(&f, 0, sizeof(f));
+    CHECK(D->schema_findings(c, &o, fnd_sink, &f) == 0);
+    CHECK_HAS(f.text, "W:only one of karidns_reload_requests and karidns_server_status exists");
+    Q("ALTER TABLE karidns_reload_requests RENAME TO karidns_reload_requests_x");
+    memset(&f, 0, sizeof(f));
+    CHECK(D->schema_findings(c, &o, fnd_sink, &f) == 0);
+    CHECK_HAS(f.text, "W:server-id is set but karidns_reload_requests and karidns_server_status do not exist");
+    o.server_id = NULL;
+    memset(&f, 0, sizeof(f));
+    CHECK(D->schema_findings(c, &o, fnd_sink, &f) == 0);
+    CHECK(strstr(f.text, "server-id") == NULL && strstr(f.text, "only one of") == NULL);
+    Q("ALTER TABLE karidns_reload_requests_x RENAME TO karidns_reload_requests; ALTER TABLE karidns_server_status_x RENAME TO karidns_server_status");
+
+    /* no extension table at all, and the version-1 change log */
+    Q("ALTER TABLE karidns_changes RENAME COLUMN xid TO xid_x");
+    memset(&f, 0, sizeof(f));
+    CHECK(D->schema_findings(c, &o, fnd_sink, &f) == 0);
+    CHECK_HAS(f.text, "W:table karidns_changes has no xid column (schema version 1)");
+    Q("ALTER TABLE karidns_changes RENAME COLUMN xid_x TO xid");
+
+    /* a schema that does not exist */
+    D->close(c);
+    c = open_drv("karidns_test_no_such_schema");
+    if (c) {
+        memset(&f, 0, sizeof(f));
+        CHECK(D->schema_findings(c, &o, fnd_sink, &f) == 0);
+        CHECK_HAS(f.text, "E:the database-schema does not exist");
+        D->close(c);
+    }
+}
+
 static void test_rows(void) {
     printf("rows\n");
     Q("INSERT INTO domains (id, name, type, master, catalog) VALUES (1, 'a.test', 'NATIVE', NULL, NULL), (2, 'b.test', 'SLAVE', '192.0.2.1', 'cat.test'), (3, 'c.test', 'MASTER', NULL, NULL)");
@@ -1102,6 +1175,7 @@ int main(int argc, char **argv) {
     free(ext);
     test_conninfo();
     test_schema();
+    test_schema_findings();
     test_rows();
     test_ext_and_profiles();
     test_search_path();

@@ -371,19 +371,19 @@ static const struct { const char *table; const char *cols[SCHEMA_MAX_COLS]; int 
 #define N_TABLES (sizeof(k_tables) / sizeof(k_tables[0]))
 enum { T_DOMAINS, T_RECORDS, T_META, T_KEYS, T_CHANGES, T_DV, T_PROF, T_TAGS, T_TDNS, T_TAGDEFS, T_VERSION, T_REQ, T_STATUS };
 
-static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
+/* Which of k_tables exist in the search_path (exists[]) and which of their columns (found[], bit k = cols[k]); *schema_ok = the search_path
+ * names at least one existing schema (a SET search_path to a missing schema is not an error in PostgreSQL).  One catalog query (to_regclass
+ * follows search_path; no privilege on the tables is needed). */
+static int schema_scan(db_conn_t *c, bool exists[N_TABLES], unsigned found[N_TABLES], bool *schema_ok) {
     PGresult *r = NULL;
-    /* the schema of the view must exist (search_path to a missing schema is not an error in PostgreSQL) */
+    memset(found, 0, sizeof(unsigned) * N_TABLES);
+    memset(exists, 0, sizeof(bool) * N_TABLES);
     int ret = exec_rows(c, "SELECT current_schemas(false)::text", 0, NULL, &r, "schema lookup");
     if (ret != 0) return ret;
     const char *path = PQgetvalue(r, 0, 0);
-    bool empty_path = !path || strcmp(path, "{}") == 0;
+    *schema_ok = path && strcmp(path, "{}") != 0;
     PQclear(r);
-    if (empty_path) {
-        set_err(c, "schema: the database-schema does not exist (or the role has no USAGE on it)");
-        return -1;
-    }
-    /* one catalog query for the columns of every table (to_regclass follows search_path; no privilege on the tables is needed) */
+    if (!*schema_ok) return 0;
     char sql[1400];
     size_t o = (size_t)snprintf(sql, sizeof(sql), "SELECT c.relname, a.attname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid "
                                                   "AND a.attnum > 0 AND NOT a.attisdropped WHERE c.oid = ANY (ARRAY[");
@@ -392,10 +392,6 @@ static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
     snprintf(sql + o, sizeof(sql) - o, "])");
     ret = exec_rows(c, sql, 0, NULL, &r, "schema");
     if (ret != 0) return ret;
-    unsigned found[N_TABLES];
-    bool exists[N_TABLES];
-    memset(found, 0, sizeof(found));
-    memset(exists, 0, sizeof(exists));
     for (int i = 0; i < PQntuples(r); i++) {
         const char *rel = PQgetvalue(r, i, 0), *att = PQgetvalue(r, i, 1);
         for (size_t t = 0; t < N_TABLES; t++) {
@@ -406,6 +402,20 @@ static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
         }
     }
     PQclear(r);
+    return 0;
+}
+
+static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
+    PGresult *r = NULL;
+    unsigned found[N_TABLES];
+    bool exists[N_TABLES];
+    bool schema_ok = false;
+    int ret = schema_scan(c, exists, found, &schema_ok);
+    if (ret != 0) return ret;
+    if (!schema_ok) {
+        set_err(c, "schema: the database-schema does not exist (or the role has no USAGE on it)");
+        return -1;
+    }
     for (size_t t = T_DOMAINS; t <= T_KEYS; t++) {
         if (!exists[t]) {
             set_err(c, "schema: table %s is missing (PowerDNS 5.1 schema expected)", k_tables[t].table);
@@ -447,6 +457,185 @@ static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
         out->has_reload_requests = c->has_reload_requests;
         out->has_server_status = c->has_server_status;
     }
+    return 0;
+}
+
+/* B12: the schema check of `karicheck db` (design 7.2): catalog reads only, nothing is written. */
+static void fnd(db_finding_cb cb, void *ud, char level, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+static void fnd(db_finding_cb cb, void *ud, char level, const char *fmt, ...) {
+    char t[600];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(t, sizeof(t), fmt, ap);
+    va_end(ap);
+    cb(ud, level, t);
+}
+
+/* a query that returns one boolean: *out = 1 / 0, or -1 for NULL (the object is not there) */
+static int one_bool(db_conn_t *c, const char *sql, int np, const char *const *pv, int *out) {
+    PGresult *r = NULL;
+    int ret = exec_rows(c, sql, np, pv, &r, "privileges");
+    if (ret != 0) return ret;
+    *out = PQgetisnull(r, 0, 0) ? -1 : PQgetvalue(r, 0, 0)[0] == 't';
+    PQclear(r);
+    return 0;
+}
+
+static int priv_table(db_conn_t *c, const char *table, const char *priv, int *out) {
+    const char *pv[2] = { table, priv };
+    return one_bool(c, "SELECT has_table_privilege(to_regclass($1::text)::oid, $2::text)", 2, pv, out);
+}
+
+static int priv_column(db_conn_t *c, const char *table, const char *col, int *out) {
+    const char *pv[2] = { table, col };
+    return one_bool(c, "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = to_regclass($1::text)::oid AND a.attname::text = $2::text "
+                       "AND NOT a.attisdropped) THEN has_column_privilege(to_regclass($1::text)::oid, $2::text, 'SELECT') END", 2, pv, out);
+}
+
+static int pg_schema_findings(db_conn_t *c, const db_check_opts_t *o, db_finding_cb cb, void *ud) {
+    PGresult *r = NULL;
+    unsigned found[N_TABLES];
+    bool exists[N_TABLES], schema_ok = false;
+    int ret = schema_scan(c, exists, found, &schema_ok);
+    if (ret != 0) return ret;
+    if (!schema_ok) {
+        fnd(cb, ud, 'E', "the database-schema does not exist (or the role has no USAGE on it)");
+        return 0;
+    }
+    char role[130] = "?";
+    if ((ret = exec_rows(c, "SELECT current_user::text", 0, NULL, &r, "current_user")) != 0) return ret;
+    snprintf(role, sizeof(role), "%s", PQgetvalue(r, 0, 0));
+    PQclear(r);
+#define FULL(t) (exists[t] && (found[t] & ((1u << k_tables[t].required) - 1u)) == ((1u << k_tables[t].required) - 1u))
+    for (size_t t = T_DOMAINS; t <= T_KEYS; t++) {
+        if (!exists[t]) {
+            fnd(cb, ud, 'E', "table %s is missing (PowerDNS 5.1 schema expected)", k_tables[t].table);
+            continue;
+        }
+        char miss[200] = "";
+        unsigned nm = 0;
+        for (int k = 0; k_tables[t].cols[k]; k++)
+            if (!(found[t] & (1u << k))) db_list_add(miss, sizeof(miss), &nm, k_tables[t].cols[k]);
+        if (nm) fnd(cb, ud, 'E', "table %s has no column %s%s (PowerDNS 5.1 schema expected)", k_tables[t].table, miss, nm > 6 ? ", ..." : "");
+    }
+    /* the karidns_* tables (design 3.7); what a missing one costs */
+    static const struct { int t; const char *effect; } k_eff[] = {
+        { T_VERSION, "the version of the extension tables is not known" },
+        { T_CHANGES, "there is no change log, so an edit that keeps the SOA serial is not noticed by a reload" },
+        { T_DV, "the zone to view mapping is not available: every zone goes to every view that uses this schema" },
+        { T_PROF, "a zone that names a profile (X-KARIDNS-PROFILE) fails to load" },
+        { T_TAGS, "location and ECS tags are ignored (the three tag tables are used together)" },
+        { T_TDNS, "tinydns time stamps and locations are ignored (the three tag tables are used together)" },
+        { T_TAGDEFS, "tag definitions are ignored (the three tag tables are used together)" },
+    };
+    unsigned present = 0;
+    for (size_t i = 0; i < sizeof(k_eff) / sizeof(k_eff[0]); i++)
+        if (exists[k_eff[i].t]) present++;
+    if (present == 0) {
+        fnd(cb, ud, 'W', "none of the karidns_* extension tables exists (db/karidns_ext.pgsql.sql was not applied): no change log, no zone to view "
+                         "mapping, no profiles, no tags; a reload compares the SOA serials");
+    } else {
+        for (size_t i = 0; i < sizeof(k_eff) / sizeof(k_eff[0]); i++) {
+            int t = k_eff[i].t;
+            if (FULL(t)) continue;
+            if (t == T_CHANGES && exists[t] && (found[t] & 3u) == 3u)
+                fnd(cb, ud, 'W', "table karidns_changes has no xid column (schema version 1): there is no change log; apply db/karidns_ext_v1_to_v2.pgsql.sql");
+            else
+                fnd(cb, ud, 'W', "table %s is missing or incomplete: %s", k_tables[t].table, k_eff[i].effect);
+        }
+    }
+    /* privileges of the role the loader connects as (db/karidns_loader_role.pgsql.sql): SELECT on what it reads, nothing on the keys */
+    bool can_sel[N_TABLES];
+    memset(can_sel, 0, sizeof(can_sel));
+    for (size_t t = 0; t < N_TABLES; t++) {
+        if (t == T_KEYS || !FULL(t)) continue;
+        int ok = 0;
+        if ((ret = priv_table(c, k_tables[t].table, "SELECT", &ok)) != 0) return ret;
+        can_sel[t] = ok > 0;
+        if (ok == 0)
+            fnd(cb, ud, 'E', "the role %s cannot SELECT from table %s (db/karidns_loader_role.pgsql.sql grants what the loader reads)", role, k_tables[t].table);
+    }
+    if (FULL(T_KEYS)) {
+        int ok = 0, content = 0;
+        if ((ret = priv_column(c, "cryptokeys", "domain_id", &ok)) != 0) return ret;
+        if (ok == 0)
+            fnd(cb, ud, 'E', "the role %s cannot SELECT cryptokeys.domain_id: the loader asks which zones have keys (db/karidns_loader_role.pgsql.sql)", role);
+        /* cryptokeys.content is not among the columns the loader needs */
+        if ((ret = priv_column(c, "cryptokeys", "content", &content)) != 0) return ret;
+        if (content > 0)
+            fnd(cb, ud, 'W', "the role %s can read cryptokeys.content (the private keys); the loader needs only domain_id (db/karidns_loader_role.pgsql.sql "
+                                 "grants just that)", role);
+    }
+    if (can_sel[T_VERSION]) {
+        if ((ret = exec_rows(c, "SELECT max(version) FROM karidns_schema_version", 0, NULL, &r, "karidns_schema_version")) != 0) return ret;
+        bool none = PQgetisnull(r, 0, 0);
+        long long v = none ? 0 : strtoll(PQgetvalue(r, 0, 0), NULL, 10);
+        PQclear(r);
+        if (none) fnd(cb, ud, 'W', "karidns_schema_version has no row");
+        else if (v > 2) fnd(cb, ud, 'E', "karidns_schema_version is %lld; this loader reads versions 1 and 2", v);
+        else fnd(cb, ud, 'I', "karidns_* schema version %lld", v);
+    }
+    /* B11: the multi-server tables (db/karidns_ext.pgsql.sql, release plan 4.8) */
+    bool have_req = FULL(T_REQ), have_st = FULL(T_STATUS);
+    if (have_req != have_st)
+        fnd(cb, ud, 'W', "only one of karidns_reload_requests and karidns_server_status exists: reload requests and the status of the servers need both "
+                         "(db/karidns_ext.pgsql.sql)");
+    else if (!have_req && o && o->server_id)
+        fnd(cb, ud, 'W', "server-id is set but karidns_reload_requests and karidns_server_status do not exist: this server cannot receive reload requests "
+                         "or report its status (db/karidns_ext.pgsql.sql)");
+    if (have_st) {
+        int ins = 0, upd = 0;
+        if ((ret = priv_table(c, "karidns_server_status", "INSERT", &ins)) != 0 || (ret = priv_table(c, "karidns_server_status", "UPDATE", &upd)) != 0) return ret;
+        if (ins <= 0 || upd <= 0)
+            fnd(cb, ud, 'W', "the role %s cannot %s karidns_server_status: the outcome of the reloads is not reported there "
+                             "(db/karidns_loader_role.pgsql.sql grants INSERT and UPDATE)", role, ins <= 0 && upd <= 0 ? "INSERT or UPDATE" : (ins <= 0 ? "INSERT into" : "UPDATE"));
+    }
+    if (o && o->auto_reload) {
+        if (!FULL(T_CHANGES)) {
+            fnd(cb, ud, 'E', "auto-reload yes needs the change log: table karidns_changes is missing or incomplete (apply db/karidns_ext.pgsql.sql)");
+        } else {
+            static const struct { const char *infix, *table; } k_trg[] = {
+#define X(i, t) { #i, t },
+                DB_CHANGE_TRIGGERS(X)
+#undef X
+            };
+            /* the triggers of the tables that are here, by name */
+            char sql[1400];
+            size_t n = (size_t)snprintf(sql, sizeof(sql), "SELECT t.tgname FROM pg_trigger t WHERE NOT t.tgisinternal AND t.tgrelid = ANY (ARRAY[");
+            for (size_t i = 0; i < sizeof(k_trg) / sizeof(k_trg[0]) + 1; i++) {
+                const char *tbl = i == 0 ? "karidns_changes" : k_trg[i - 1].table;
+                n += (size_t)snprintf(sql + n, sizeof(sql) - n, "%sto_regclass('%s')::oid", i ? "," : "", tbl);
+            }
+            snprintf(sql + n, sizeof(sql) - n, "])");
+            if ((ret = exec_rows(c, sql, 0, NULL, &r, "pg_trigger")) != 0) return ret;
+            char miss[300] = "";
+            unsigned nm = 0;
+            for (size_t i = 0; i < sizeof(k_trg) / sizeof(k_trg[0]) * 3 + 1; i++) {
+                char name[96];
+                if (i == 0) {
+                    snprintf(name, sizeof(name), "karidns_changes_prune");
+                } else {
+                    size_t k = (i - 1) / 3;
+                    static const char *const sfx[3] = { "ins", "upd", "del" };
+                    bool table_here = true;
+                    if (strncmp(k_trg[k].table, "karidns_", 8) == 0)
+                        for (size_t t = 0; t < N_TABLES; t++)
+                            if (strcmp(k_tables[t].table, k_trg[k].table) == 0) table_here = FULL(t);
+                    if (!table_here) continue;                 /* its table is reported above */
+                    snprintf(name, sizeof(name), "karidns_trg_%s_%s", k_trg[k].infix, sfx[(i - 1) % 3]);
+                }
+                bool seen = false;
+                for (int j = 0; j < PQntuples(r) && !seen; j++)
+                    if (strcmp(PQgetvalue(r, j, 0), name) == 0) seen = true;
+                if (!seen) db_list_add(miss, sizeof(miss), &nm, name);
+            }
+            PQclear(r);
+            if (nm)
+                fnd(cb, ud, 'E', "auto-reload yes needs the change log triggers, but %u are missing: %s%s (apply db/karidns_ext.pgsql.sql)", nm, miss,
+                    nm > 6 ? ", ..." : "");
+        }
+    }
+#undef FULL
     return 0;
 }
 
@@ -1026,6 +1215,7 @@ const db_driver_t db_driver_postgresql = {
     pg_changes_max,  pg_scan_records_range, pg_scan_domain_views, pg_scan_profiles, pg_scan_ext, pg_poll_version,
     true,
     pg_watch_requests, pg_requests_max, pg_reload_requests,
+    pg_schema_findings, /* B12 */
 };
 
 #endif /* KARIDNS_DB_POSTGRESQL */

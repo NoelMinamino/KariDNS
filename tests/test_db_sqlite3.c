@@ -1310,6 +1310,144 @@ static void test_status_entry(void) {
     free(io);
 }
 
+/* ---------------------------------------------------------------- --check (B12, `karicheck db`) */
+
+/* run_check() on path; the protocol lines it writes, and its status */
+static char *check_run(const char *path, bool auto_reload, int *status) {
+    char outp[700];
+    snprintf(outp, sizeof(outp), "%s/check.out", g_dir);
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    x.drv = &db_driver_sqlite3;
+    x.nthreads = 1;
+    x.check = true;
+    x.chk_opts.auto_reload = auto_reload;
+    kdb_enc_init(&x.enc);
+    g_chk_out = fopen(outp, "wb");
+    g_chk_errors = g_chk_warnings = 0;
+    g_chk_zone[0] = '\0';
+    g_chk_id = 0;
+    db_source_t src = { "sqlite3", path, NULL, NULL, 0 };
+    *status = run_check(&x, &src);
+    fprintf(g_chk_out, "R\t%u\t%u\t%u\n", x.chk_zones, g_chk_errors, g_chk_warnings);
+    fclose(g_chk_out);
+    g_chk_out = NULL;
+    ctx_view_reset(&x);
+    kdb_enc_free(&x.enc);
+    char *s = slurp(outp);
+    unlink(outp);
+    return s ? s : strdup("");
+}
+
+/* every line of s is a line of the protocol: a known tag, the field count of the tag, no byte outside 0x20..0x7e but the TABs */
+static bool check_lines_ok(const char *s) {
+    char *copy = strdup(s), *save = NULL;
+    bool ok = true;
+    for (char *ln = strtok_r(copy, "\n", &save); ln; ln = strtok_r(NULL, "\n", &save)) {
+        char *f[CHK_MAX_FIELDS];
+        int n = chk_split(ln, f, CHK_MAX_FIELDS);
+        char t = n > 0 ? f[0][0] : 0;
+        if (n < 1 || f[0][1] != '\0' || !t) { ok = false; continue; }
+        if (strchr("EWIOD", t) && n == 4) continue;
+        if (t == 'Z' && n >= 5) continue;
+        if (t == 'S' && n == 6) continue;
+        if (t == 'R' && n == 4) continue;
+        ok = false;
+    }
+    free(copy);
+    return ok;
+}
+
+static void test_check_mode(void) {
+    printf("check mode (B12)\n");
+    char path[500];
+    int st;
+    sqlite3 *db = make_db("chk.db", path, sizeof(path));
+    CHECK(db != NULL);
+    add_simple_zone(db, 1, 1, "good.test");
+    char *out = check_run(path, false, &st);
+    CHECK(st == EXIT_OK);
+    CHECK_HAS(out, "Z\tgood.test.\t1\tprimary\t*\n");
+    CHECK_HAS(out, "W\t\t0\tnone of the karidns_* extension tables exists");
+    CHECK_HAS(out, "R\t1\t0\t1\n");
+    CHECK(check_lines_ok(out));
+    free(out);
+
+    /* a zone the production load refuses is an error with its records.id; the good zone is still read */
+    add_zone(db, 2, "bad.test", "NATIVE");
+    add_rec(db, 10, 2, "bad.test", "SOA", "ns1.bad.test hostmaster.bad.test 7 7200 3600 1209600 300", 3600, -1, 0, NULL);
+    add_rec(db, 11, 2, "bad.test", "NS", "ns1.bad.test", 3600, -1, 0, NULL);
+    add_rec(db, 12, 2, "x.bad.test", "A", "not an address", 3600, -1, 0, NULL);
+    out = check_run(path, false, &st);
+    CHECK(st == EXIT_ZONES_FAILED);
+    CHECK_HAS(out, "E\tbad.test.\t2\trecords.id 12: ");
+    CHECK_HAS(out, "Z\tgood.test.\t1\tprimary\t*\n");
+    CHECK_HAS(out, "R\t2\t1\t1\n");
+    CHECK(check_lines_ok(out));
+    free(out);
+
+    /* text from the database never carries a control character or a backslash into a line: it is escaped */
+    add_zone(db, 3, "esc.test", "NATIVE");
+    add_rec(db, 20, 3, "esc.test", "SOA", "ns1.esc.test hostmaster.esc.test 7 7200 3600 1209600 300", 3600, -1, 0, NULL);
+    add_rec(db, 21, 3, "esc.test", "NS", "ns1.esc.test", 3600, -1, 0, NULL);
+    add_rec(db, 22, 3, "esc.test", "TXT", "\"a\tb\\c\"", 3600, -1, 0, NULL);
+    add_rec(db, 23, 3, "esc.test", "FOO", "x\ty", 3600, -1, 0, NULL);
+    out = check_run(path, false, &st);
+    CHECK(check_lines_ok(out));
+    CHECK(st == EXIT_ZONES_FAILED);
+    CHECK_HAS(out, "E\tesc.test.\t3\trecords.id ");
+    free(out);
+
+    /* the views that karidns_domain_views names, and a zone type that is not loaded */
+    raw_exec(db, "CREATE TABLE karidns_domain_views (domain_id INTEGER NOT NULL, view_name VARCHAR(64) NOT NULL, PRIMARY KEY (domain_id, view_name))");
+    sqlf(db, "INSERT INTO karidns_domain_views VALUES (1, 'va'), (1, 'Vb')");
+    add_zone(db, 4, "prod.test", "PRODUCER");
+    sqlf(db, "UPDATE domains SET catalog = 'nothere.test' WHERE id = 1");
+    out = check_run(path, false, &st);
+    CHECK(check_lines_ok(out));
+    CHECK(strstr(out, "Z\tgood.test.\t1\tprimary\tva\tVb\n") || strstr(out, "Z\tgood.test.\t1\tprimary\tVb\tva\n"));       /* the rows of one zone come in table order */
+    CHECK_HAS(out, "Z\tprod.test.\t4\tother\t*\n");
+    CHECK_HAS(out, "E\tprod.test.\t4\t");
+    CHECK_HAS(out, "W\tgood.test.\t1\tdomains.catalog names 'nothere.test'");
+    free(out);
+
+    /* schema: all missing columns are named; the zones are not read */
+    sqlite3 *db2 = make_db("chk2.db", path, sizeof(path));
+    raw_exec(db2, "ALTER TABLE records DROP COLUMN ttl; ALTER TABLE records DROP COLUMN prio");
+    out = check_run(path, false, &st);
+    CHECK(st == EXIT_ZONES_FAILED);
+    CHECK_HAS(out, "E\t\t0\ttable records has no column ttl, prio (PowerDNS 5.1 schema expected)\n");
+    CHECK(strstr(out, "\nZ\t") == NULL && out[0] != 'Z');
+    free(out);
+    sqlite3_close(db2);
+
+    /* auto-reload needs the change log and its triggers */
+    sqlite3 *db3 = make_db("chk3.db", path, sizeof(path));
+    out = check_run(path, true, &st);
+    CHECK(st == EXIT_ZONES_FAILED);
+    CHECK_HAS(out, "E\t\t0\tauto-reload yes needs the change log: table karidns_changes is missing");
+    free(out);
+    raw_exec(db3, "CREATE TABLE karidns_changes (seq INTEGER PRIMARY KEY AUTOINCREMENT, domain_id INTEGER NOT NULL, changed_at INTEGER NOT NULL)");
+    out = check_run(path, true, &st);
+    CHECK(st == EXIT_ZONES_FAILED);
+    CHECK_HAS(out, "auto-reload yes needs the change log triggers, but 13 are missing: karidns_changes_prune, karidns_trg_domains_ins, ");
+    free(out);
+    out = check_run(path, false, &st);
+    CHECK(st == EXIT_OK);
+    CHECK(strstr(out, "triggers") == NULL);
+    free(out);
+    sqlite3_close(db3);
+
+    /* a database file that is not there or is not a database */
+    snprintf(path, sizeof(path), "%s/nothere.db", g_dir);
+    out = check_run(path, false, &st);
+    CHECK(st == EXIT_ERROR);
+    CHECK_HAS(out, "E\t\t0\tdatabase file '");
+    CHECK_HAS(out, "No such file or directory");
+    free(out);
+    sqlite3_close(db);
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/db";
     snprintf(g_schema, sizeof(g_schema), "%s/pdns_schema.sqlite3.sql", dir);
@@ -1342,6 +1480,7 @@ int main(int argc, char **argv) {
     test_requests_batch();
     test_server_id();
     test_status_entry();
+    test_check_mode();
     free(g_schema_sql);
     rm_tree(g_dir);
     printf("\n%d checks, %d failed\n", g_checks, g_failed);

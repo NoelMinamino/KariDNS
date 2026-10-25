@@ -23,6 +23,8 @@ karicheck zone <domain> [config_path]
 
 karicheck zone <domain> <zone_file_path>
 
+karicheck db [view] [config_path]
+
 karicheck -v | --version
 ```
 
@@ -51,6 +53,9 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
 
 `zone <domain> <zone_file_path>`
 : Standalone mode: parse and validate `<zone_file_path>` as a BIND-format zone for `<domain>` without a configuration file. The third argument is treated as a configuration file if it contains `.conf`, and as a zone file otherwise. A relative path is resolved against the current directory; the server resolves relative zone paths (also with `../`) against the directory it was started from.
+
+`db [view] [config_path]`
+: Read the PowerDNS tables of `options { database { } }` (read only, through `karidns-dbloader --check`) and check the schema, every zone (with the checks of `zone`), the settings texts, the views, and the zones of the configuration that hide a database zone. With `view`, only the zones that view gets are reported. A single argument is a view unless it contains a `/` or ends in `.conf`. See [Database checks](#database-checks-karicheck-db).
 
 `-v`, `--version`
 : Print the version and exit.
@@ -109,6 +114,81 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
 
 Each zone check prints `[RESULT] Zone '<zone>': <n> error(s), <n> warning(s)` followed by `[OK]` or `[FAIL]`. The counts are the numbers of `[ERROR]` and `[WARNING]` lines printed for that zone, including the ZONEMD verification; `[INFO]` lines are not counted.
 
+### Database checks (`karicheck db`)
+
+`karicheck db [view] [config_path]` reads the PowerDNS tables that `options { database { } }` names, **read only**, and reports what the server would refuse or what looks wrong, before the data goes live. It links no database library: it runs `karidns-dbloader --check` (see [`karidns(8)`](karidns.md) "Settings of database zones") once per database the views read, and prints what the loader finds in the style of `karicheck zone`. The loader reads through the same driver calls and the same reader as the production load, so a zone that `--check` accepts is a zone the loader sends, and the other way round. Nothing is written to the database (the connection is `query_only` / `READ ONLY`, no status row is written, no `LISTEN`).
+
+`[view]` limits the output to the zones that view gets: those of its own database, or, for a view on the shared database, those `karidns_domain_views` maps to it (or all, when a zone has no row). A single argument is a view unless it contains a `/` or ends in `.conf`, in which case it is the configuration file. `karicheck conf` still does the checks that need no connection; `karicheck db` assumes it was run. It needs a loader that can be executed and has the driver; if `loader-path` does not exist, it says `DB support is not installed` (the package without `karidns-dbloader`).
+
+**Rights.** The check should see the database the way the loader of `karidns` does:
+
+- run by **root**, `karicheck` drops to `loader-user` / `loader-group` before it executes the loader (it refuses to run the loader as root, so `loader-user` must be set);
+- run by **another user**, it uses that user's rights.
+
+The first `[INFO]` line of each database names the rights used. When the database file or the `conninfo-file` cannot be used with them, the message names the file and the missing permission (`is not readable by the user ...: it needs read permission`, `has no search (x) permission on the directory ...`, SQLite3: `is not writable by the user ...` because even a reader of a WAL database writes the `-shm` file, and its directory or the `-wal` / `-shm` files must be writable), and no zone is read.
+
+Every database gets a line `[RESULT] Database ...: N zone(s) read, E error(s), W warning(s)` followed by `[OK]` or `[FAIL]`, then one summary line. A zone the loader would refuse is reported with its first failing row, as the loader does (one bad row fails the zone): `zone 'example.test.' (domains.id 3): records.id 41: ...`. Everything that came from the database is escaped before it is printed. The exit status is 1 when any error was found or the check could not be run, else 0 (warnings do not change it). `--json` comes with a later release.
+
+| Check | Level |
+|---|---|
+| **Schema** | |
+| a PowerDNS table or column the loader reads is missing (`domains`, `records`, `domainmetadata`, `cryptokeys`; all missing columns are named) | error |
+| none of the `karidns_*` tables exists (a plain PowerDNS database), or one is missing or incomplete (what it costs is said: no change log, no view mapping, no profiles, no tags) | warning |
+| `karidns_schema_version` is newer than 2 / has no row | error / warning |
+| `auto-reload yes` and `karidns_changes` is missing, or change log triggers are missing (named) | error |
+| PostgreSQL: `karidns_changes` has no `xid` column (schema version 1: no change log) | warning |
+| PostgreSQL: the role cannot `SELECT` a table the loader reads, or `cryptokeys.domain_id` | error |
+| PostgreSQL: the role can read `cryptokeys.content` (the private keys) | warning |
+| PostgreSQL: the role cannot `INSERT` / `UPDATE` `karidns_server_status`; only one of the multi-server tables exists; `server-id` is set but they are missing | warning |
+| the schema named by `database-schema` does not exist | error |
+| **Every zone** | |
+| the reader's refusals, with `records.id`: a content the zone parser rejects, an unsupported type, an owner outside the zone, a name that is not a domain name, a prio that contradicts the content (MX / SRV), a TTL out of range, a row that is not safe as a line of text, no enabled apex SOA, a zone type that is not loaded (`PRODUCER`), a `SLAVE` / `CONSUMER` without usable `masters` | error |
+| `ALIAS` in a `PRESIGNED` zone, `ENABLE-LUA-RECORDS=1`, malformed `ALIAS` / `LUA` data | error |
+| `LUA` records (kept for transfers, never answered); `ALIAS` records (`[INFO]`, NODATA unless an `alias-resolver` is set) | warning / info |
+| records with a NULL `ttl` (`default-ttl` is used); a `prio` on a type other than MX / SRV; metadata that is ignored | warning |
+| the SOA serial is 0 | warning |
+| every check of `karicheck zone` on the zone (the very same code): missing NS at the apex, CNAME with other data, glue and delegation rules, inconsistent TTLs in an RRset, field ranges of SRV / NAPTR / CAA / SSHFP / HIP / WKS ..., DNSSEC algorithm and digest recommendations, NSEC3 and NSEC3PARAM rules, ZONEMD verification | as in `karicheck zone` |
+| `domains.catalog` names a zone that is not a `PRODUCER` zone of the database | warning |
+| **Keys and presigned zones** | |
+| `cryptokeys` rows without `PRESIGNED=1` (PowerDNS would sign online, KariDNS serves signed data only) | error |
+| `NSEC3PARAM` metadata with a bad syntax; a presigned NSEC3 or NSEC chain that does not match the zone (a name without its `RRSIG(NSEC3)` owner, an `ordername` that is not the hash, parameters outside RFC 5155 §10.3) | error |
+| NSEC3 iterations other than 0 (RFC 9276) | warning |
+| **Settings (metadata and profiles)** | |
+| the settings text of a zone or of its profile (`karidns_profiles`) does not parse in restricted mode, the profile is not defined | error |
+| the settings name a TSIG key that `karidns.conf` does not define | error |
+| an `allow-transfer` / `allow-update` / `ecs-trusted-resolvers` entry that lies outside `acl-ceiling`, a key that `acl-ceiling` does not list, or ACLs while no `acl-ceiling` is configured (a database ACL refuses every client then) | warning |
+| **Zones of `karidns.conf` and views** | |
+| a zone of the same name in the view of the configuration hides the database zone: with `file` / `type master` (D-PRIO), `type program` / `type forward` (D-PROG) | warning |
+| a `karidns_domain_views` row names a view that is not defined, or one that does not read the database through the shared source | warning |
+| a zone that only such rows map is served by no view | warning |
+
+Examples (the paths are those of a test installation; `example.test` and friends are test names):
+
+```text
+$ karicheck db /usr/local/etc/karidns/karidns.conf
+[INFO] Loading config /usr/local/etc/karidns/karidns.conf...
+[INFO] Checking Database file '/usr/local/etc/karidns/zones.sqlite3' (the default view) with the rights of the user claude (uid 1002)
+[INFO] Database file '/usr/local/etc/karidns/zones.sqlite3': karidns_* schema version 2
+[WARNING] Database file '/usr/local/etc/karidns/zones.sqlite3': zone 'example.test.' (domains.id 1): records.id 4: 1 record(s) have a NULL ttl; default-ttl 3600 used (first shown)
+[WARNING] Database file '/usr/local/etc/karidns/zones.sqlite3': zone 'example.test.' (domains.id 1): allow-transfer entry '198.51.100.0/24' is outside acl-ceiling; a client there is refused
+[ERROR] Database file '/usr/local/etc/karidns/zones.sqlite3': zone 'broken.test.' (domains.id 2): records.id 9: invalid IPv4 address literal in A record
+[WARNING] Database file '/usr/local/etc/karidns/zones.sqlite3': zone 'shadow.test.' (domains.id 3): D-PRIO: the default view has a zone with this name in the configuration (file '/usr/local/etc/karidns/shadow.zone'); it hides the database zone
+[RESULT] Database file '/usr/local/etc/karidns/zones.sqlite3': 3 zone(s) read, 1 error(s), 3 warning(s)
+[FAIL] Database file '/usr/local/etc/karidns/zones.sqlite3' has errors.
+[INFO] Checked 1 database (3 zones). Errors: 1, warnings: 3
+```
+
+Run by root, the same check says `with the rights of loader-user 'karidns-db' (karicheck was run by root and drops to it, as karidns does for the loader)`. A package without the loader, and a database file the user cannot read:
+
+```text
+$ karicheck db /usr/local/etc/karidns/noloader.conf
+[ERROR] DB support is not installed: the database loader '/usr/local/etc/karidns/no-such-loader' does not exist (this installation has no karidns-dbloader; install the karidns-sqlite3, karidns-postgresql or karidns-db package, or set loader-path)
+
+$ karicheck db /usr/local/etc/karidns/karidns.conf
+[ERROR] Database file '/usr/local/etc/karidns/zones.sqlite3': database file '/usr/local/etc/karidns/zones.sqlite3' is not readable by the user claude (uid 1002): it needs read permission (mode 0000, owner uid 1002, group gid 0)
+```
+
+
 ---
 
 ## EXIT STATUS
@@ -117,7 +197,7 @@ Each zone check prints `[RESULT] Zone '<zone>': <n> error(s), <n> warning(s)` fo
 : All checked configuration files and zone files are valid. Warnings do not change the exit status.
 
 `1`
-: Usage error, unreadable file, syntax error, validation error, or ZONEMD digest mismatch detected.
+: Usage error, unreadable file, syntax error, validation error, or ZONEMD digest mismatch detected. `db`: an error in the database or its data, a database that cannot be read with the rights of the loader, or a loader that is not installed (`DB support is not installed`).
 
 ---
 
@@ -141,6 +221,12 @@ karicheck zone example.com /usr/local/etc/karidns/karidns.conf
 ### Validate a Specific Master Zone Standalone
 ```sh
 karicheck zone example.com master/example.com.zone
+```
+
+### Check the Zones of a Database
+```sh
+karicheck db /usr/local/etc/karidns/karidns.conf
+karicheck db internal /usr/local/etc/karidns/karidns.conf
 ```
 
 ---

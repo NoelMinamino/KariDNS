@@ -18,6 +18,7 @@
 #include <syslog.h>
 
 #include "../dns_db_stream.h"
+#include "../dns_db_checkproto.h"
 
 static int g_checks = 0, g_failed = 0;
 #define CHECK(cond) do { g_checks++; if (!(cond)) { g_failed++; \
@@ -1446,6 +1447,57 @@ static void test_auto_status(void) {
     kdb_enc_free(&e);
 }
 
+/* ---------------------------------------------------------------- the check protocol (B12, dns_db_checkproto.h) */
+static void test_checkproto(void) {
+    char out[64], back[64];
+    bool trunc;
+    /* escape: printable ASCII as it is; TAB, LF, backslash, DEL and bytes above 0x7e as \DDD (decimal) */
+    size_t n = chk_escape("a b\tc\n\\d\x7f\xc3\xa9", 11, out, sizeof(out), &trunc);
+    CHECK_STR(out, "a b\\009c\\010\\092d\\127\\195\\169");
+    CHECK(n == strlen(out) && !trunc);
+    /* round trip, byte for byte, with a NUL in the middle */
+    const char raw[] = { 'x', 0, 'y', '\r', '"', '\'', (char)0xff, '\\', '1', '2', '3' };
+    n = chk_escape(raw, sizeof(raw), out, sizeof(out), &trunc);
+    CHECK(!trunc);
+    size_t m = chk_unescape(out, n, back, sizeof(back));
+    CHECK(m == sizeof(raw) && memcmp(back, raw, sizeof(raw)) == 0);
+    /* truncation never cuts an escape, and says so */
+    n = chk_escape("\x01\x02\x03\x04", 4, out, 10, &trunc);
+    CHECK(trunc && n == 8 && strcmp(out, "\\001\\002") == 0);
+    n = chk_escape("abcdef", 6, out, 4, &trunc);
+    CHECK(trunc && n == 3 && strcmp(out, "abc") == 0);
+    CHECK(chk_escape("abc", 3, out, 0, &trunc) == 0 && !trunc);
+    /* unescape: every malformed input is refused */
+    CHECK(chk_unescape("a\\", 2, back, sizeof(back)) == (size_t)-1);          /* a backslash at the end */
+    CHECK(chk_unescape("\\12", 3, back, sizeof(back)) == (size_t)-1);         /* two digits */
+    CHECK(chk_unescape("\\1x3", 4, back, sizeof(back)) == (size_t)-1);        /* not a digit */
+    CHECK(chk_unescape("\\256", 4, back, sizeof(back)) == (size_t)-1);        /* above 255 */
+    CHECK(chk_unescape("a\tb", 3, back, sizeof(back)) == (size_t)-1);         /* a raw TAB */
+    CHECK(chk_unescape("\x80", 1, back, sizeof(back)) == (size_t)-1);         /* a high byte */
+    CHECK(chk_unescape("abcd", 4, back, 4) == (size_t)-1);                    /* does not fit with its NUL */
+    CHECK(chk_unescape("abc", 3, back, 4) == 3 && strcmp(back, "abc") == 0);
+    CHECK(chk_unescape("", 0, back, 1) == 0);
+    CHECK(chk_unescape("a", 1, back, 0) == (size_t)-1);
+    /* split */
+    char line[] = "E\t\ta.test.\t12\ttext";
+    char *f[8];
+    CHECK(chk_split(line, f, 8) == 5 && strcmp(f[0], "E") == 0 && f[1][0] == '\0' && strcmp(f[4], "text") == 0);
+    char l2[] = "R\t1\t2\t3";
+    CHECK(chk_split(l2, f, 3) == -1);                                          /* more fields than room */
+    char l2b[] = "R\t1\t2\t3";
+    CHECK(chk_split(l2b, f, 4) == 4);
+    char l3[] = "Z\tbad\001ctl";
+    CHECK(chk_split(l3, f, 8) == -1);                                          /* a control character other than TAB */
+    char l4[] = "";
+    CHECK(chk_split(l4, f, 8) == 1 && f[0][0] == '\0');
+    char l5[] = "a\t";
+    CHECK(chk_split(l5, f, 8) == 2 && f[1][0] == '\0');
+    /* printable */
+    char p[] = "ok\x01\x1b[31m\x7f\xc3z";
+    chk_printable(p);
+    CHECK_STR(p, "ok??[31m??z");
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--gen-corpus") == 0) return gen_corpus(argv[2]) ? 1 : 0;
     test_roundtrip_loader();
@@ -1461,6 +1513,7 @@ int main(int argc, char **argv) {
     test_encoder();
     test_batch_request_id();
     test_auto_status();
+    test_checkproto();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

@@ -1,0 +1,10 @@
+AZ	d.test.	2	primary	va	vb	ghost
+W	d.test.	2	a finding of a zone of the view va
+Z	p.test.	3	primary	*
+W	p.test.	3	shadowed by a program zone
+Z	f.test.	4	secondary	vown
+Z	g.test.	5	other	vb	VA	vown
+E	g.test.	5	catalog producer zones (type PRODUCER) are not loaded yet
+Z	bad\092name.	6	invalid	*
+E	nothere.test.	7	a zone line that never came
+BZ	d.test.	2	primary	va

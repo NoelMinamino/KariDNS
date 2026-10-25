@@ -57,7 +57,8 @@ my %tier_c_files = map { $_ => 1 } (
     "tools/dag_iter.c", "tools/dag_roothints.c", "tools/dag_tsig_client.c",
     "tools/dag_edns_client.c", "tools/dag_transport.c", "tools/dag_replay.c",
     "tools/dag_pcap_l4.c", "tools/dag_tcp_reassembly.c", "tools/dag_http.c",
-    "tools/karicheck.c", "tools/karictl.c"
+    "tools/karicheck.c", "tools/karictl.c",
+    "dns_zone_lint.c"    # the zone checks of karicheck (moved out of tools/karicheck.c in B12; karidns-dbloader --check runs them too)
 );
 
 # Tier D (B10, design 8.6; B11c, D-B11-4): the database layer: the PostgreSQL driver, and since B11 the SQLite3 driver and the loader
@@ -65,7 +66,8 @@ my %tier_c_files = map { $_ => 1 } (
 # ran (test_db_pgsql found a server, or the loader / SQLite3 unit test produced data): without data for the tier it is reported as
 # skipped, so a build or a CI run without them is not failed for it.
 my %tier_d_files = map { $_ => 1 } (
-    "dns_db_pgsql.c", "dns_db_sqlite3.c", "karidns_dbloader.c"
+    "dns_db_pgsql.c", "dns_db_sqlite3.c", "karidns_dbloader.c",
+    "dns_db_checkproto.c"      # B12: the line protocol of karidns-dbloader --check / karicheck db
 );
 
 # Threshold definitions (Phase 1 vs Phase 2)
