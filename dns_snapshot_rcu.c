@@ -419,6 +419,10 @@ void *gc_snapshot_thread(void *arg) {
   useconds_t sleep_time = 1;
   while (atomic_load_explicit(&snap->reader_count, memory_order_acquire) > 0) {
     rcu_exponential_backoff(&retries, &sleep_time);
+    /* 期限は設けない (参照を持つ読み手がいる限り解放できない) が、長引いたら記録する (wait_until_safe と同じ間隔) */
+    if (sleep_time >= 100000 && (retries % 10) == 0)
+      syslog(LOG_WARNING, "[GC] snapshot %p still has %d reader(s) after %d waits; not freed yet", (void *)snap,
+             (int)atomic_load_explicit(&snap->reader_count, memory_order_relaxed), retries);
   }
   free_zone_db_snapshot(snap);
   atomic_fetch_sub_explicit(&g_gc_live, 1, memory_order_release);
