@@ -121,6 +121,26 @@ ci_warns "URI without a host (socket)" "postgresql:///pdns" no
 ci_warns "URI with host=/tmp in the query" "postgresql:///pdns?host=/tmp" no
 ci_warns "URI with %2F host" "postgresql://%2Fvar%2Frun%2Fpostgresql/pdns" no
 
+echo "== server-id (postgresql; B11: the id of karidns_server_status)"
+printf 'host=/tmp dbname=pdns\n' > "$T/ci"; chmod 600 "$T/ci"
+sid_warns() {   # sid_warns DESCRIPTION DBBLOCK-STATEMENT WANT(yes|no)
+    conf "$T/c.conf" "driver postgresql; conninfo-file \"$T/ci\"; loader-user \"$USER_OK\"; loader-path \"$T/dbl\"; $2"
+    out=$(run "$T/c.conf")
+    if printf '%s\n' "$out" | grep -q "server-id '.*' has characters other than"; then got=yes; else got=no; fi
+    if [ "$got" = "$3" ]; then ok "server-id $1: warning $got"; else bad "server-id $1: warning $got, wanted $3" "$out"; fi
+}
+sid_warns "ns1" 'server-id "ns1";' no
+sid_warns "a-b.c_d:5 (the characters that are fine)" 'server-id "a-b.c_d:5";' no
+sid_warns "with a blank" 'server-id "ns 1";' yes
+sid_warns "with a slash" 'server-id "dc1/ns1";' yes
+sid_warns "non-ASCII UTF-8" 'server-id "caf'"$(printf '\303\251')"'";' yes
+sid_warns "not set (the host name is used)" '' no
+long=0123456789012345678901234567890123456789012345678901234567890123456789
+conf "$T/c.conf" "driver postgresql; conninfo-file \"$T/ci\"; loader-user \"$USER_OK\"; loader-path \"$T/dbl\"; server-id \"$long\";"
+expect "server-id of 70 bytes (the column holds 64)" "$T/c.conf" "Syntax error"
+conf "$T/c.conf" "driver postgresql; conninfo-file \"$T/ci\"; loader-user \"$USER_OK\"; loader-path \"$T/dbl\"; server-id \"\";"
+expect "empty server-id" "$T/c.conf" "Syntax error"
+
 echo "== syntax"
 conf "$T/c.conf" "driver sqlite3; database-file \"$T/wal.db\"; poll-interval 99;"
 expect "poll-interval out of range" "$T/c.conf" "Syntax error"

@@ -59,7 +59,13 @@
  *   AUTO_STATUS (12)  B9; only between batches (state READY), no state change.  1 ENTRY nested, repeatable (<= 1024), one per view
  *                     that has auto reload on: 1 view view R | 2 last_poll u64 R (unix seconds, 0 = never) |
  *                     3 applied_seq u64 R (change log position of the last complete load) | 4 pending u32 R (changes seen, not yet
- *                     applied) | 5 error str<=255 O (the last poll / load error of the view, absent = none)
+ *                     applied) | 5 error str<=255 O (the last poll / load error of the view, absent = none) |
+ *                     B11 (multi-server reload requests, PostgreSQL), all optional: 6 flags u8 (bit0 the auto reload fields 2..5 are
+ *                     real, bit1 the request fields 7..11 are real; absent = 1) | 7 server_id str ne <=64 (the id the loader reports
+ *                     under) | 8 req_generation u64 (the last reload request applied; 0 = none) | 9 req_ok u8 (0/1: every zone of
+ *                     that reload loaded) | 10 req_error str<=255 (why the last read of the requests or write of the status
+ *                     row failed, absent = none) | 11 req_time u64 (unix seconds of the last status row written, 0 = never).
+ *                     An entry is sent for a view that has auto reload on or whose source has the multi-server tables.
  * Backend -> loader (type | 0x8000)
  *   CONFIG (0x8001)   1 generation u64 R | 2 driver str ne <=32 R | 3 server_id str<=64 O |
  *                     4 VIEW nested, repeatable (<= 1024):
@@ -250,7 +256,12 @@ typedef struct {
 typedef struct {
     uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; uint32_t serial; uint8_t digest[KDB_DIGEST_LEN];
 } kdb_inventory_entry_t;
-typedef struct { uint16_t view; uint64_t last_poll, applied_seq; uint32_t pending; kdb_str_t error; } kdb_auto_status_entry_t;
+#define KDB_AS_AUTO 1u      /* AUTO_STATUS entry flags: the auto reload fields are real */
+#define KDB_AS_REQ 2u       /* the reload request fields are real (B11) */
+typedef struct {
+    uint16_t view; uint64_t last_poll, applied_seq; uint32_t pending; kdb_str_t error;
+    uint8_t flags; kdb_str_t server_id; uint64_t req_generation; bool req_ok; kdb_str_t req_error; uint64_t req_time;   /* B11 */
+} kdb_auto_status_entry_t;
 void kdb_auto_status_entries(const kdb_msg_t *m, kdb_iter_t *it);
 bool kdb_auto_status_entries_next(kdb_iter_t *it, kdb_auto_status_entry_t *out);
 void kdb_config_views(const kdb_msg_t *m, kdb_iter_t *it);

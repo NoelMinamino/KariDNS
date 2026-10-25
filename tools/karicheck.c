@@ -2041,6 +2041,30 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
             }
         }
     }
+    /* B11: the id under which this server writes its row of karidns_server_status (release plan 4.8): server-id, else the host name.
+     * The column holds 1..64 bytes (the parser limits server-id to that).  (sqlite3: warned about above.) */
+    if (db->driver && !sqlite) {
+        if (db->server_id) {
+            size_t n = strlen(db->server_id);
+            bool odd = false;
+            for (size_t i = 0; i < n; i++) {
+                unsigned char ch = (unsigned char)db->server_id[i];
+                if (!isalnum(ch) && ch != '.' && ch != '-' && ch != '_' && ch != ':') odd = true;
+            }
+            if (odd)       /* the length (1..64 bytes) is checked by the parser */
+                kc_warning(&t, "database: server-id '%s' has characters other than ASCII letters, digits and . - _ : ; use only those, "
+                               "so that it reads the same in every tool and tables of other character sets take it\n", db->server_id);
+        } else {
+            char h[256];
+            if (gethostname(h, sizeof(h)) == 0) {
+                h[sizeof(h) - 1] = '\0';
+                size_t n = strlen(h);
+                if (n == 0 || n > 64)
+                    kc_warning(&t, "database: server-id is not set and the host name has %zu bytes (karidns_server_status takes 1 to 64): "
+                                   "a server with reload requests (karidns_reload_requests) cannot report its status; set server-id\n", n);
+            }
+        }
+    }
     return t.errors;
 }
 

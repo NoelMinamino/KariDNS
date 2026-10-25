@@ -230,7 +230,7 @@ static void test_open(void) {
         CHECK(db_driver_sqlite3.wait_fd(c) == -1);
         bool changed = true;
         CHECK(db_driver_sqlite3.drain_notifications(c, &changed) == 0 && !changed);
-        db_status_t st = { 1, true, NULL };
+        db_status_t st = { 1, true, NULL, "ns1" };
         CHECK(db_driver_sqlite3.report_status(c, &st) == 0);
         db_driver_sqlite3.close(c);
     }
@@ -1041,6 +1041,275 @@ static void test_dump(void) {
     dump_free(&d);
 }
 
+/* ------------------------------------------------------------------ B11: failed zones, requests, the server id, the status entry */
+static void test_failed_zones(void) {
+    printf("failed_zones (B11)\n");
+    char out[FZ_LINE];
+
+    /* escaping: printable ASCII as it is; control characters, DEL and bytes >= 0x80 as \DDD (no line end survives) */
+    size_t n = fz_escape("a\nb\r\tc\x7f" "d\xc3\xa9", 10, out, sizeof(out));
+    CHECK_MSG(!strcmp(out, "a\\010b\\013\\009c\\127d\\195\\169"), "escaped: %s", out);
+    CHECK(n == strlen(out));
+    n = fz_escape("a\r", 2, out, sizeof(out));
+    CHECK_MSG(!strcmp(out, "a\\013"), "CR: %s", out);
+    n = fz_escape("back\\slash \"q\"", 14, out, sizeof(out));
+    CHECK_MSG(!strcmp(out, "back\\slash \"q\""), "printable as it is: %s", out);
+    CHECK(strchr(out, '\n') == NULL);
+    char small[8];
+    n = fz_escape("abc\ndef", 7, small, sizeof(small));                  /* "abc" + "\010" = 7 bytes + NUL fits */
+    CHECK_MSG(!strcmp(small, "abc\\010") && n == 7, "fits: %s", small);
+    n = fz_escape("abcd\ndef", 8, small, sizeof(small));                 /* the escape does not fit: it is not cut in the middle */
+    CHECK_MSG(!strcmp(small, "abcd") && n == 4, "not cut: %s", small);
+    n = fz_escape("ab\0cd", 5, small, sizeof(small));                    /* stops at a NUL */
+    CHECK(n == 2);
+
+    /* collecting: only while on; the view is kept; "name: reason" */
+    fz_t *f = calloc(1, sizeof(*f));
+    uint16_t v0[] = { 0 }, v1[] = { 1 }, v01[] = { 0, 1 };
+    char text[FZ_REPORT_BYTES + 1];
+    bool ok = false;
+    fz_add(f, 0, "off.test.", "ignored", 7);
+    CHECK(f->n == 0);
+    fz_report(f, v01, 2, text, &ok);
+    CHECK(ok && text[0] == '\0');
+    fz_reset(f, true);
+    fz_add(f, 0, "z1.test.", "bad rdata", 9);
+    fz_add(f, 1, "z2.test.", "serial went back", 16);
+    fz_add(f, 0, "we\nird\x01" "name", "multi\0line", 5);                 /* the length bounds the reason: "multi" */
+    fz_add(f, 0, NULL, NULL, 0);
+    fz_report(f, v0, 1, text, &ok);
+    CHECK(!ok);
+    CHECK_MSG(!strcmp(text, "z1.test.: bad rdata\nwe\\010ird\\001name: multi\n(NULL): rejected"), "view 0: %s", text);
+    fz_report(f, v1, 1, text, &ok);
+    CHECK(!ok && !strcmp(text, "z2.test.: serial went back"));
+    uint16_t v2[] = { 2 };
+    fz_report(f, v2, 1, text, &ok);
+    CHECK_MSG(ok && !text[0], "a view without failures is ok");
+    fz_report(f, v01, 2, text, &ok);
+    CHECK(!ok && strchr(text, '\n') != NULL);
+    /* nothing in the text can break a line: every newline is a separator between "name: reason" lines */
+    int lines = 1;
+    for (const char *p = text; *p; p++) if (*p == '\n') lines++;
+    CHECK(lines == 4);
+
+    /* at most 64 lines */
+    fz_reset(f, true);
+    for (int i = 0; i < 70; i++) {
+        char nm[32];
+        snprintf(nm, sizeof(nm), "z%d.test.", i);
+        fz_add(f, 0, nm, "r", 1);
+    }
+    fz_report(f, v0, 1, text, &ok);
+    lines = 1;
+    for (const char *p = text; *p; p++) if (*p == '\n') lines++;
+    CHECK_MSG(!ok && lines == 65 && strstr(text, "\n... and 6 more") != NULL && strlen(text) <= FZ_REPORT_BYTES, "70 failures: %d lines", lines);
+    CHECK(!strncmp(text, "z0.test.: r\nz1.test.: r\n", 24));
+    /* at most 4 KiB: long names and reasons */
+    fz_reset(f, true);
+    char longname[300], longreason[300];
+    memset(longname, 'n', sizeof(longname) - 1);
+    longname[sizeof(longname) - 1] = '\0';
+    memset(longreason, 'r', sizeof(longreason) - 1);
+    longreason[sizeof(longreason) - 1] = '\0';
+    for (int i = 0; i < 40; i++) fz_add(f, 0, longname, longreason, strlen(longreason));
+    fz_report(f, v0, 1, text, &ok);
+    CHECK_MSG(!ok && strlen(text) <= FZ_REPORT_BYTES && strstr(text, " more") != NULL, "bytes: %zu", strlen(text));
+    CHECK_MSG(strstr(text, "nnnnnnnnnnnnnnnn: rrrr") != NULL, "name and reason are both there");
+    /* more failures than are kept: not ok for anybody, and the text says the list is incomplete */
+    fz_reset(f, true);
+    for (int i = 0; i < FZ_MAX_ENT + 5; i++) fz_add(f, 0, "x.test.", "r", 1);
+    CHECK(f->n == FZ_MAX_ENT && f->overflow);
+    fz_report(f, v1, 1, text, &ok);
+    CHECK_MSG(!ok && strstr(text, "more zones failed") != NULL, "overflow: %s", text);
+    free(f);
+
+    /* the ZONE_RESULT of the Backend reaches the collector (rejected only), the loader's own failures too (send_failed) */
+    struct lio *io = calloc(1, sizeof(*io));
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_enc_begin(&e, KDB_T_ZONE_RESULT);
+    kdb_enc_u16(&e, 1, 3);
+    kdb_enc_name(&e, 2, "z9.test.");
+    kdb_enc_u8(&e, 3, KDB_ST_REJECTED);
+    kdb_enc_str(&e, 4, "CNAME and other data");
+    kdb_enc_end(&e);
+    kdb_frame_t fr = { KDB_T_ZONE_RESULT, e.buf + KDB_HEADER_LEN, (uint32_t)(e.len - KDB_HEADER_LEN) };
+    io_dispatch(io, &fr);                                                /* not collecting */
+    CHECK(io->fz.n == 0 && io->n_rejected == 1 && !io->failed);
+    fz_reset(&io->fz, true);
+    io_dispatch(io, &fr);
+    CHECK(io->fz.n == 1 && io->fz.ent[0].view == 3 && !strcmp(io->fz.ent[0].text, "z9.test.: CNAME and other data"));
+    kdb_enc_reset(&e);
+    kdb_enc_begin(&e, KDB_T_ZONE_RESULT);
+    kdb_enc_u16(&e, 1, 3);
+    kdb_enc_name(&e, 2, "z8.test.");
+    kdb_enc_u8(&e, 3, KDB_ST_APPLIED);
+    kdb_enc_end(&e);
+    fr.body = e.buf + KDB_HEADER_LEN;
+    fr.len = (uint32_t)(e.len - KDB_HEADER_LEN);
+    io_dispatch(io, &fr);
+    CHECK_MSG(io->fz.n == 1, "an applied zone is not a failure");
+    kdb_enc_free(&e);
+    {
+        ctx_t x;
+        memset(&x, 0, sizeof(x));
+        x.io = io;
+        x.view = 5;
+        kdb_enc_init(&x.enc);
+        zinfo_t zi;
+        memset(&zi, 0, sizeof(zi));
+        zi.id = 77;
+        zi.name = "bad\nname..test";                                    /* cannot be a zone name: not written to the stream, still reported */
+        CHECK(send_failed(&x, &zi, "domains row is odd") == 0 && x.n_unwritten == 1);
+        CHECK_MSG(io->fz.n == 2 && io->fz.ent[1].view == 5 && !strcmp(io->fz.ent[1].text, "bad\\010name..test: domains row is odd"),
+                  "loader failure: %s", io->fz.n > 1 ? io->fz.ent[1].text : "(none)");
+        kdb_enc_free(&x.enc);
+    }
+    free(io);
+}
+
+static void test_requests_batch(void) {
+    printf("reload request batch (B11)\n");
+    rq_batch_t *b = calloc(1, sizeof(*b));
+    b->zone = calloc(RW_ZONES, DNS_NAME_TEXT_SIZE);
+    db_reload_row_t r1 = { 1, "Example.TEST", false }, r2 = { 2, "example.test.", true }, r3 = { 3, "b.test", false };
+    rq_row(b, &r1);
+    rq_row(b, &r2);
+    rq_row(b, &r3);
+    CHECK_MSG(b->rows == 3 && !b->all && b->force && b->nz == 2 && !b->nbad, "rows=%llu nz=%zu", (unsigned long long)b->rows, b->nz);
+    CHECK_MSG(!strcasecmp(b->zone[0], "example.test.") && !strcmp(b->zone[1], "b.test."), "canonical: %s %s", b->zone[0], b->zone[1]);
+    /* untrusted names: never handed on; the first few are kept (printable) for the status row */
+    db_reload_row_t bad1 = { 4, "", false }, bad2 = { 5, "a..b", false }, bad3 = { 6, "x\ny.test", false };
+    rq_row(b, &bad1);
+    rq_row(b, &bad2);
+    rq_row(b, &bad3);
+    CHECK_MSG(b->nbad == 3 && b->nz == 2 && !b->all, "bad names: %u", b->nbad);
+    CHECK(strchr(b->bad[2], '\n') == NULL);
+    db_reload_row_t all = { 7, NULL, false };
+    rq_row(b, &all);
+    CHECK(b->all && b->rows == 7);
+    free(b->zone);
+    free(b);
+    /* more than RW_ZONES different zones: the whole source */
+    b = calloc(1, sizeof(*b));
+    b->zone = calloc(RW_ZONES, DNS_NAME_TEXT_SIZE);
+    for (int i = 0; i < RW_ZONES + 1; i++) {
+        char nm[32];
+        snprintf(nm, sizeof(nm), "z%d.test", i);
+        db_reload_row_t rr = { (uint64_t)i + 1, nm, false };
+        rq_row(b, &rr);
+    }
+    CHECK_MSG(b->all && b->nz == RW_ZONES, "65 zones: all=%d nz=%zu", b->all, b->nz);
+    free(b->zone);
+    free(b);
+}
+
+static void test_server_id(void) {
+    printf("server-id (B11)\n");
+    struct lio *io = calloc(1, sizeof(*io));
+    snprintf(io->cfg.server_id, sizeof(io->cfg.server_id), "ns1");
+    sid_resolve(io);
+    CHECK(io->sid_ok && !strcmp(io->sid, "ns1"));
+    /* none set: the host name (D-B11-6) */
+    io->cfg.server_id[0] = '\0';
+    char h[256];
+    h[0] = '\0';
+    CHECK(gethostname(h, sizeof(h)) == 0);
+    h[sizeof(h) - 1] = '\0';
+    sid_resolve(io);
+    if (h[0] && strlen(h) <= 64) CHECK_MSG(io->sid_ok && !strcmp(io->sid, h), "host name: '%s' vs '%s'", io->sid, h);
+    else CHECK_MSG(!io->sid_ok && io->sid_why[0], "host name unusable (%zu bytes): reporting is off", strlen(h));
+    /* longer than 64 bytes: no id, a reason, and the warning is given once */
+    memset(io->cfg.server_id, 'a', 65);
+    io->cfg.server_id[65] = '\0';
+    io->sid_warned = false;
+    sid_resolve(io);
+    CHECK(!io->sid_ok && !io->sid[0] && strstr(io->sid_why, "longer than 64") != NULL && io->sid_warned);
+    io->cfg.server_id[64] = '\0';
+    sid_resolve(io);
+    CHECK(io->sid_ok && strlen(io->sid) == 64 && !io->sid_warned);
+    free(io);
+}
+
+/* the AUTO_STATUS entry of a view whose source has reload requests: the flags, the server id, the generation, ok, the error, the time */
+static void test_status_entry(void) {
+    printf("AUTO_STATUS entry (B11)\n");
+    struct lio *io = calloc(1, sizeof(*io));
+    io->cfg.views = calloc(2, sizeof(lview_t));
+    io->cfg.nviews = 2;
+    io->cfg.views[0].index = 0;
+    io->cfg.views[0].name = strdup("default");
+    io->cfg.views[1].index = 1;
+    io->cfg.views[1].name = strdup("other");
+    io->cfg.views[1].auto_reload = 1;
+    snprintf(io->sid, sizeof(io->sid), "ns7");
+    io->sid_ok = true;
+    rw_t *r = &io->rw[0];
+    io->nrw = 1;
+    r->seeded = true;
+    r->views = malloc(sizeof(uint16_t));
+    r->views[0] = 0;
+    r->nv = r->cv = 1;
+    r->last = 42;
+    r->applied_ok = false;
+    r->rep_time = 1700000000;
+    snprintf(r->rerr, sizeof(r->rerr), "cannot write karidns_server_status: permission denied");
+    char path[600];
+    snprintf(path, sizeof(path), "%s/status.bin", g_dir);
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    kdb_enc_init(&x.enc);
+    x.out = fopen(path, "wb");
+    CHECK(auto_send_status(&x, io) == 0);
+    fclose(x.out);
+    kdb_enc_free(&x.enc);
+    char *bin = slurp(path);
+    FILE *fp = fopen(path, "rb");
+    fseek(fp, 0, SEEK_END);
+    long len = ftell(fp);
+    fclose(fp);
+    CHECK(bin && len > KDB_HEADER_LEN);
+    uint8_t *body = malloc(KDB_MAX_BODY);
+    kdb_framer_t fr;
+    kdb_framer_init(&fr, KDB_FROM_LOADER, body, KDB_MAX_BODY);
+    CHECK(kdb_framer_feed(&fr, (const uint8_t *)bin, (size_t)len) == KDB_OK);
+    kdb_frame_t frame;
+    kdb_msg_t m;
+    char why[KDB_REASON_LEN];
+    CHECK(kdb_framer_next(&fr, &frame) == KDB_OK && frame.type == KDB_T_AUTO_STATUS);
+    CHECK_MSG(kdb_decode(&frame, 2, &m, why, sizeof(why)) == KDB_OK, "decode: %s", why);
+    kdb_iter_t it;
+    kdb_auto_status_entry_t en;
+    kdb_auto_status_entries(&m, &it);
+    CHECK(kdb_auto_status_entries_next(&it, &en));
+    CHECK_MSG(en.view == 0 && en.flags == KDB_AS_REQ && en.server_id.len == 3 && !memcmp(en.server_id.p, "ns7", 3) && en.req_generation == 42 &&
+                  !en.req_ok && en.req_time == 1700000000 && en.req_error.len > 10 && !memcmp(en.req_error.p, "cannot write", 12),
+              "request entry: flags %u gen %llu", en.flags, (unsigned long long)en.req_generation);
+    CHECK(kdb_auto_status_entries_next(&it, &en));
+    CHECK_MSG(en.view == 1 && en.flags == KDB_AS_AUTO && en.server_id.p == NULL && en.req_generation == 0, "auto entry of the other view: flags %u", en.flags);
+    CHECK(!kdb_auto_status_entries_next(&it, &en));
+    /* neither auto reload nor a watcher: no entry, no message */
+    io->cfg.views[1].auto_reload = 0;
+    r->absent = true;
+    ctx_t x2;
+    memset(&x2, 0, sizeof(x2));
+    kdb_enc_init(&x2.enc);
+    x2.out = fopen(path, "wb");
+    CHECK(auto_send_status(&x2, io) == 0);
+    fclose(x2.out);
+    kdb_enc_free(&x2.enc);
+    fp = fopen(path, "rb");
+    fseek(fp, 0, SEEK_END);
+    CHECK(ftell(fp) == 0);
+    fclose(fp);
+    free(bin);
+    free(body);
+    free(r->views);
+    cfg_free(&io->cfg);
+    io_free_views(io);
+    free(io);
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/db";
     snprintf(g_schema, sizeof(g_schema), "%s/pdns_schema.sqlite3.sql", dir);
@@ -1069,6 +1338,10 @@ int main(int argc, char **argv) {
     test_range_views();
     test_ext_tables();
     test_dump();
+    test_failed_zones();
+    test_requests_batch();
+    test_server_id();
+    test_status_entry();
     free(g_schema_sql);
     rm_tree(g_dir);
     printf("\n%d checks, %d failed\n", g_checks, g_failed);

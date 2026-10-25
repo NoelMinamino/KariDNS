@@ -291,7 +291,10 @@ static int sq_check_schema(db_conn_t *c, db_schema_info_t *out) {
         (rc = table_columns(c, "karidns_zone_tagdefs", xg_cols, &f3, &r3)) != 0)
         return rc;
     c->has_ext = r1 > 0 && f1 == 7u && r2 > 0 && f2 == 15u && r3 > 0 && f3 == 15u;
-    if (out) out->has_ext = c->has_ext;
+    if (out) {
+        out->has_ext = c->has_ext;
+        out->has_reload_requests = out->has_server_status = false;     /* B11: the multi-server tables are PostgreSQL only */
+    }
     /* B10: schema version 1 and 2 (v2 adds karidns_zone_tagdefs.id; the order of the definitions is the rowid either way);
      * a newer version was written for a later loader */
     static const char *const sv_cols[] = { "version", NULL };
@@ -800,6 +803,7 @@ const db_driver_t db_driver_sqlite3 = {
     sq_zones_with_keys, sq_changes_since, sq_wait_fd,     sq_drain_notifications, sq_report_status,
     sq_changes_max,   sq_scan_records_range, sq_scan_domain_views, sq_scan_profiles, sq_scan_ext, sq_poll_version,
     false,          /* changes_unsettled: the cursor is the highest seq */
+    NULL, NULL, NULL,   /* B11 reload requests: PostgreSQL only (watch_requests, requests_max, reload_requests) */
 };
 
 #endif /* KARIDNS_DB_SQLITE3 */

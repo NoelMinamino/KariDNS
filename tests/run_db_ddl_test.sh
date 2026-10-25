@@ -230,11 +230,11 @@ else
         pf db/karidns_ext.pgsql.sql > "$T/pg_ext2.out" 2>&1 && pass "the ext file applies a second time" || { fail "second application"; cat "$T/pg_ext2.out"; }
         [ "$(pq 'SELECT count(*) FROM karidns_schema_version')" = "1" ] && [ "$(pq 'SELECT version FROM karidns_schema_version')" = "2" ] &&
             pass "schema version 2, one row after two applications" || fail "karidns_schema_version"
-        for t in karidns_schema_version karidns_changes karidns_domain_views karidns_profiles karidns_record_tags karidns_record_tinydns karidns_zone_tagdefs; do
+        for t in karidns_schema_version karidns_changes karidns_domain_views karidns_profiles karidns_record_tags karidns_record_tinydns karidns_zone_tagdefs karidns_reload_requests karidns_server_status; do
             [ "$(pq "SELECT count(*) FROM pg_tables WHERE tablename = '$t' AND schemaname = current_schema()")" = "1" ] && pass "table $t" || fail "table $t is missing"
         done
-        [ "$(pq "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND c.relname LIKE '%'")" = "28" ] &&
-            pass "28 triggers (9 tables x 3 + prune)" || fail "trigger count $(pq "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal")"
+        [ "$(pq "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND c.relname LIKE '%'")" = "31" ] &&
+            pass "31 triggers (9 tables x 3 + prune + the 3 of karidns_reload_requests: lock, notify, prune)" || fail "trigger count $(pq "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal")"
 
         # B10 (schema version 2): the log rows carry the xid8 of the writing transaction, tagdefs have an id
         [ "$(pq "SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'karidns_changes'::regclass AND attname = 'xid'")" = "xid8" ] &&
@@ -314,6 +314,29 @@ else
             psql -X "$PGC" > "$T/pg_notify.out" 2>&1
         grep -q 'Asynchronous notification "karidns_changes" received' "$T/pg_notify.out" && pass "pg_notify('karidns_changes') reaches a listener" ||
             { fail "no notification"; sed 's/^/         /' "$T/pg_notify.out"; }
+
+        # B11 (multi-server): karidns_reload_requests numbers the requests, NOTIFYs karidns_reload with the generation, keeps the
+        # newest 1000, and the INSERT takes a lock that is held until commit (generations become visible in order)
+        pq "INSERT INTO karidns_reload_requests DEFAULT VALUES; INSERT INTO karidns_reload_requests (zone, force) VALUES ('z.test', true)" > /dev/null
+        [ "$(pq "SELECT generation || ':' || coalesce(zone, '-') || ':' || force FROM karidns_reload_requests ORDER BY generation" | tr '\n' ' ')" = "1:-:false 2:z.test:true " ] &&
+            pass "karidns_reload_requests: generations 1, 2; zone NULL = all, force defaults to false" || fail "karidns_reload_requests rows"
+        printf "LISTEN karidns_reload;\nINSERT INTO karidns_reload_requests DEFAULT VALUES;\nSELECT 1;\n" | psql -X "$PGC" > "$T/pg_notify2.out" 2>&1
+        grep -q 'Asynchronous notification "karidns_reload" with payload "3" received' "$T/pg_notify2.out" && pass "pg_notify('karidns_reload', generation) reaches a listener" ||
+            { fail "no karidns_reload notification"; sed 's/^/         /' "$T/pg_notify2.out"; }
+        pq "INSERT INTO karidns_reload_requests (zone) SELECT 'p' || g || '.test' FROM generate_series(1, 1200) g" > /dev/null
+        [ "$(pq "SELECT count(*) || ':' || max(generation) - min(generation) + 1 FROM karidns_reload_requests")" = "1000:1000" ] && pass "karidns_reload_requests keeps the newest 1000 requests" ||
+            fail "request prune: $(pq "SELECT count(*), min(generation), max(generation) FROM karidns_reload_requests")"
+        pq "INSERT INTO karidns_server_status (server_id, generation, applied_at, ok) VALUES ('ns1', 5, now(), true)" > /dev/null
+        [ "$(pq "SELECT failed_zones = '' FROM karidns_server_status WHERE server_id = 'ns1'")" = "t" ] && pass "karidns_server_status: failed_zones defaults to an empty text" || fail "karidns_server_status default"
+        pq "INSERT INTO karidns_server_status (server_id, generation, applied_at, ok) VALUES ('ns1', 6, now(), true)" > /dev/null 2>&1 && fail "a second row for the same server_id was accepted" || pass "server_id is the primary key of karidns_server_status"
+        # a requester that is still in its transaction keeps the next one waiting (statement-level BEFORE trigger, advisory lock)
+        { printf "BEGIN;\nINSERT INTO karidns_reload_requests (zone) VALUES ('first.test');\nSELECT pg_sleep(2);\nCOMMIT;\n" | psql -X "$PGC" > /dev/null 2>&1 & } ; sleep 0.7
+        pq "SET lock_timeout = '500ms'; INSERT INTO karidns_reload_requests (zone) VALUES ('second.test')" > "$T/lock.out" 2>&1 && fail "the second requester did not wait for the first" ||
+            { grep -q "lock timeout" "$T/lock.out" && pass "a second requester waits while the first one has not committed (lock timeout after the advisory lock)" || { fail "lock test"; cat "$T/lock.out"; }; }
+        wait
+        pq "INSERT INTO karidns_reload_requests (zone) VALUES ('after.test')" > /dev/null
+        [ "$(pq "SELECT (SELECT generation FROM karidns_reload_requests WHERE zone = 'after.test') > (SELECT generation FROM karidns_reload_requests WHERE zone = 'first.test')")" = "t" ] &&
+            pass "after the first requester committed the next one goes on, with a higher generation" || fail "generation order after the lock"
 
         # prune: a second copy of the DDL with the retention 5, in a second database
         sed 's/1000000/5/g' db/karidns_ext.pgsql.sql > "$T/pg_ext5.sql"

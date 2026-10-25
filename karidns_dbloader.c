@@ -26,6 +26,10 @@
  *
  * Auto reload (B9, design 6): the same diff, started by the loader itself; see the block before run_stream().  B10: a driver
  * with a socket to wait on (PostgreSQL LISTEN, wait_fd()) wakes the main loop at once; the others are polled by timer.
+ *
+ * Multi-server operation (B11, release plan 4.8, PostgreSQL only): reload requests written to karidns_reload_requests by a
+ * management tool make every server reload, and each loader writes the outcome to karidns_server_status; see the block
+ * "multi-server reload requests" before auto_send_status().
  */
 
 #include <stdio.h>
@@ -390,6 +394,51 @@ typedef struct { uint64_t id; uint16_t view; bool force; char zone[DNS_NAME_TEXT
 #define LREQ_MAX 64
 #define IDX_SLOTS 65536                      /* view indexes are u16 */
 
+/* B11: the zones that failed in a load (the loader could not read or convert them, or the Backend rejected them), for the
+ * failed_zones column of karidns_server_status.  Collected while fz.on; entries keep the view so that the load of several sources
+ * can be split per source. */
+#define FZ_MAX_ENT 256                       /* failures kept; more set `overflow` */
+#define FZ_LINE 512
+#define FZ_REPORT_LINES 64                   /* lines of failed_zones */
+#define FZ_REPORT_BYTES 4096                 /* bytes of failed_zones (without the NUL) */
+typedef struct { uint16_t view; char text[FZ_LINE]; } fz_ent_t;
+typedef struct {
+    bool on, overflow;
+    unsigned n;
+    fz_ent_t ent[FZ_MAX_ENT];
+} fz_t;
+
+/* B11: one watcher per source (schema) whose database has karidns_reload_requests; see the block before auto_send_status() */
+#define RW_MAX 64                            /* sources watched */
+#define RW_ZONES 64                          /* different zones of one coalesced request batch; more is a diff of the whole source */
+#define RW_ERRLEN 160
+#define RW_RETRY_MS 10000                    /* a status row that could not be written is tried again after this */
+#define RW_ABSENT_MS 60000                   /* a source without the tables is looked at again after this */
+#define RW_FD_BASE ((size_t)1 << 20)         /* pfs_slot values from here on are watchers (index = value - RW_FD_BASE) */
+typedef struct {
+    char *source, *conninfo;                 /* the key: the view's source (schema) and conninfo-file */
+    uint16_t *views;                         /* indexes of the views that read this source (from the CONFIG) */
+    size_t nv, cv;
+    bool in_cfg;
+    const db_driver_t *drv;
+    db_conn_t *conn;
+    bool absent;                             /* the source has no karidns_reload_requests (looked at again later) */
+    bool seeded;                             /* `last` is valid */
+    bool startup_seeded;                     /* `last` was taken before a load that follows: that load's outcome is reported */
+    bool has_status;                         /* karidns_server_status exists */
+    bool applied_ok;                         /* the outcome of the last reload that counted (every zone loaded) */
+    uint64_t last;                           /* the highest generation applied */
+    int64_t next_poll, flush_at, open_retry_at, report_retry_at;
+    bool rep_pending;                        /* a status row is waiting to be written */
+    uint64_t rep_gen;
+    bool rep_ok;
+    char *rep_text;                          /* FZ_REPORT_BYTES + 1 */
+    char (*zbuf)[DNS_NAME_TEXT_SIZE];        /* RW_ZONES names of the request batch being built (allocated at the first request) */
+    int64_t rep_time;                        /* wall clock seconds of the last status row written, 0 = never */
+    bool listen_noted;
+    char perr[RW_ERRLEN], rerr[RW_ERRLEN];   /* the last error reading requests / loading, and writing the status row ("" = none) */
+} rw_t;
+
 struct lio {
     int fd;
     kdb_framer_t fr;
@@ -419,6 +468,13 @@ struct lio {
     int32_t *idx_slot;                       /* view index -> slot of vnames, -1 = no such view in the current CONFIG */
     struct pollfd *pfs;                      /* B10: poll set of the main loop: the stream, then the connections that notify (PostgreSQL LISTEN) */
     size_t *pfs_slot, cpfs;
+    /* B11: multi-server reload requests */
+    fz_t fz;
+    rw_t rw[RW_MAX];
+    size_t nrw;
+    char sid[72], sid_why[100];              /* the server id the loader reports under; why it has none */
+    bool sid_ok, sid_warned;
+    bool status_dirty;                       /* an AUTO_STATUS is due (auto reload or reload request state changed) */
 };
 
 static uint32_t name_hash(uint16_t vslot, const char *s) {
@@ -564,6 +620,78 @@ static void clean_reason(const char *in, char *out, size_t cap) {
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
+/* B11: the zones that failed, for karidns_server_status.failed_zones                                            */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* in[0..n) (up to a NUL) into out: printable ASCII as it is, every other byte (control characters, DEL, bytes >= 0x80: the column
+ * is TEXT and must be valid in the database encoding, and a line must not contain a line end) as \DDD (decimal, like a DNS name).
+ * At most cap - 1 bytes and an escape is never cut.  Returns the length. */
+static size_t fz_escape(const char *in, size_t n, char *out, size_t cap) {
+    size_t o = 0;
+    for (size_t i = 0; i < n && in[i] && cap > 0; i++) {
+        unsigned char ch = (unsigned char)in[i];
+        if (ch >= 0x20 && ch < 0x7F) {
+            if (o + 1 >= cap) break;
+            out[o++] = (char)ch;
+        } else {
+            if (o + 4 >= cap) break;
+            out[o++] = '\\';
+            out[o++] = (char)('0' + ch / 100);
+            out[o++] = (char)('0' + ch / 10 % 10);
+            out[o++] = (char)('0' + ch % 10);
+        }
+    }
+    if (cap > 0) out[o] = '\0';
+    return o;
+}
+
+static void fz_reset(fz_t *f, bool on) {
+    f->on = on;
+    f->overflow = false;
+    f->n = 0;
+}
+
+/* one failed zone of `view` (while collecting): the line is "name: reason", both escaped, the name cut at 255 bytes */
+static void fz_add(fz_t *f, uint16_t view, const char *name, const char *reason, size_t rlen) {
+    if (!f->on) return;
+    if (f->n >= FZ_MAX_ENT) {
+        f->overflow = true;
+        return;
+    }
+    fz_ent_t *e = &f->ent[f->n++];
+    e->view = view;
+    size_t o = fz_escape(name ? name : "(NULL)", name ? strlen(name) : 6, e->text, 260);
+    o += (size_t)snprintf(e->text + o, FZ_LINE - o, ": ");
+    fz_escape(reason ? reason : "rejected", reason ? rlen : 8, e->text + o, FZ_LINE - o);
+}
+
+/* failed_zones of the views listed, into out (FZ_REPORT_BYTES + 1 bytes): their lines in the order they happened, at most
+ * FZ_REPORT_LINES lines and FZ_REPORT_BYTES bytes, "... and N more" for the rest.  *ok = none of the views had a failure (and
+ * nothing was dropped for want of room: then the text says so, as the view of the dropped one is not known). */
+static void fz_report(const fz_t *f, const uint16_t *views, size_t nv, char *out, bool *ok) {
+    size_t o = 0;
+    unsigned lines = 0, sel = 0;
+    out[0] = '\0';
+    for (unsigned i = 0; i < f->n; i++) {
+        bool mine = false;
+        for (size_t k = 0; k < nv; k++)
+            if (views[k] == f->ent[i].view) mine = true;
+        if (!mine) continue;
+        sel++;
+        size_t l = strlen(f->ent[i].text);
+        if (lines >= FZ_REPORT_LINES || o + (lines ? 1 : 0) + l > FZ_REPORT_BYTES - 40) continue;     /* 40 bytes: the "... and N more" line */
+        if (lines) out[o++] = '\n';
+        memcpy(out + o, f->ent[i].text, l);
+        o += l;
+        lines++;
+    }
+    out[o] = '\0';
+    if (sel > lines) snprintf(out + o, FZ_REPORT_BYTES + 1 - o, "%s... and %u more", lines ? "\n" : "", sel - lines);
+    else if (sel == 0 && f->overflow) snprintf(out, FZ_REPORT_BYTES + 1, "(more zones failed than are listed)");
+    *ok = sel == 0 && !f->overflow;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
 /* collecting the lists                                                                                           */
 /* ------------------------------------------------------------------------------------------------------------- */
 
@@ -697,6 +825,7 @@ static int send_failed(ctx_t *x, const zinfo_t *zi, const char *reason) {
     char name[DNS_NAME_TEXT_SIZE], why[260], shown[210];
     clean_reason(zi->name ? zi->name : "(NULL)", shown, sizeof(shown));
     lg(LOG_ERR, "zone '%s' (domains.id %lld): %s", shown, (long long)zi->id, reason);
+    if (x->io) fz_add(&x->io->fz, x->view, zi->name, reason, reason ? strlen(reason) : 0);       /* B11: failed_zones (also a name the stream cannot carry) */
     if (!pdns_canonical_zone_name(zi->name, name)) {
         lg(LOG_ERR, "the zone name is not a valid domain name; not written to the stream");
         x->n_unwritten++;
@@ -1980,6 +2109,7 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
         }
         if (m.u.zone_result.status == KDB_ST_REJECTED) {
             io->n_rejected++;
+            fz_add(&io->fz, m.u.zone_result.view, m.u.zone_result.name, m.u.zone_result.reason.p, m.u.zone_result.reason.len);
             if (!io->first_reject[0] && m.u.zone_result.reason.p)
                 snprintf(io->first_reject, sizeof(io->first_reject), "%.*s", (int)m.u.zone_result.reason.len,
                          m.u.zone_result.reason.p);
@@ -2463,29 +2593,500 @@ static int auto_view(ctx_t *x, struct lio *io, const lview_t *v, uint16_t slot, 
     return 0;
 }
 
-/* AUTO_STATUS: what `karictl dbstatus` shows for each view that has auto reload on */
+/* ------------------------------------------------------------------------------------------------------------- */
+/* multi-server reload requests (B11, release plan 4.8, design 3.7)                                               */
+/* ------------------------------------------------------------------------------------------------------------- */
+/* PostgreSQL only (a driver with watch_requests).  For every source (schema) whose database has karidns_reload_requests the
+ * loader keeps one watcher: a connection of its own that LISTENs karidns_reload (its socket is in the poll set of the main loop)
+ * and, every poll-interval, reads the requests with a generation above the last one it applied.  Whether auto reload is on or
+ * not.  When the watcher is opened before a load (the startup load, or a load after a change of sources) the highest generation
+ * counts as applied: that load covers it.  Requests that arrive together (the coalesce window) are one reload: a request for all
+ * zones, a hole in the generations (pruned or rolled back requests), or more than RW_ZONES different zones makes it a diff of the
+ * whole source, else the zones listed are reloaded; force is the OR of the requests.  The reload is the one of `karictl
+ * reload` (do_load(), kinds diff / zone) for every view that reads the source.  When the BATCH_RESULTs are in, report_status()
+ * writes the outcome (every zone loaded, or the zones that failed) to this server's row of karidns_server_status, in a
+ * transaction of its own on the watcher's connection (never inside the read snapshot of a load).  The load that follows the
+ * opening of a watcher is reported the same way.
+ * Nothing here puts the loader into an error state (D-B11-5): a request that cannot be read, a source that cannot be loaded or a
+ * status row that cannot be written is logged once (again when the text changes), shown by `karictl dbstatus` and retried; the
+ * zones keep being served.  A request is only counted as applied after every view of the source was loaded. */
+
+static const lview_t *rw_view(const struct lio *io, uint16_t index) {
+    for (size_t i = 0; i < io->cfg.nviews; i++)
+        if (io->cfg.views[i].index == index) return &io->cfg.views[i];
+    return NULL;
+}
+
+static const lview_t *rw_view0(const struct lio *io, const rw_t *r) { return r->nv ? rw_view(io, r->views[0]) : NULL; }
+
+static uint64_t rw_poll_ms(const struct lio *io, const rw_t *r) {
+    const lview_t *v = rw_view0(io, r);
+    return v ? auto_poll_ms(v) : 2000;
+}
+
+static void rw_set_err(struct lio *io, rw_t *r, bool report, const char *what, const char *msg) {
+    char shown[100], text[RW_ERRLEN];
+    clean_reason(msg, shown, sizeof(shown));
+    snprintf(text, sizeof(text), "%s: %s", what, shown);
+    char *dst = report ? r->rerr : r->perr;
+    if (strcmp(dst, text) != 0) {                          /* log a condition once, not at every attempt */
+        snprintf(dst, RW_ERRLEN, "%s", text);
+        const lview_t *v = rw_view0(io, r);
+        lg(LOG_WARNING, "view '%s': reload requests: %s", v ? v->name : "?", text);
+        io->status_dirty = true;
+    }
+}
+
+static void rw_close(rw_t *r) {
+    if (r->conn) r->drv->close(r->conn);
+    r->conn = NULL;
+}
+
+static void rw_free(rw_t *r) {
+    rw_close(r);
+    free(r->source);
+    free(r->conninfo);
+    free(r->views);
+    free(r->rep_text);
+    free(r->zbuf);
+    memset(r, 0, sizeof(*r));
+}
+
+/* the server id: server-id of the database block, else the host name (D-B11-6); io->sid_ok is false when there is none that fits
+ * the column (1..64 bytes), and io->sid_why says why */
+static void sid_resolve(struct lio *io) {
+    char h[256];
+    const char *src = io->cfg.server_id, *why = NULL;
+    if (!*src) {
+        if (gethostname(h, sizeof(h)) != 0) h[0] = '\0';
+        h[sizeof(h) - 1] = '\0';
+        src = h;
+        if (!*src) why = "no server-id is set and the host name is empty";
+        else if (strlen(src) > 64) why = "no server-id is set and the host name is longer than 64 bytes";
+    } else if (strlen(src) > 64) {
+        why = "server-id is longer than 64 bytes";
+    }
+    if (why) {
+        io->sid[0] = '\0';
+        io->sid_ok = false;
+        snprintf(io->sid_why, sizeof(io->sid_why), "%s", why);
+        if (!io->sid_warned) {
+            io->sid_warned = true;
+            lg(LOG_WARNING, "%s: the outcome of reload requests is not written to karidns_server_status (set server-id in the database block)", why);
+        }
+        return;
+    }
+    snprintf(io->sid, sizeof(io->sid), "%s", src);
+    io->sid_ok = true;
+    io->sid_warned = false;
+}
+
+static rw_t *rw_find(struct lio *io, const char *source, const char *conninfo) {
+    for (size_t i = 0; i < io->nrw; i++)
+        if (streq_n(io->rw[i].source, source) && streq_n(io->rw[i].conninfo, conninfo)) return &io->rw[i];
+    return NULL;
+}
+
+/* the watcher that serves view v (its source has the tables), or NULL */
+static const rw_t *rw_for_view(const struct lio *io, const lview_t *v) {
+    for (size_t i = 0; i < io->nrw; i++) {
+        const rw_t *r = &io->rw[i];
+        if (r->absent || !r->seeded) continue;
+        for (size_t k = 0; k < r->nv; k++)
+            if (r->views[k] == v->index) return r;
+    }
+    return NULL;
+}
+
+/* Open the connection, look for the tables, LISTEN, and take the position: the highest generation when a load follows
+ * (startup_pending), else 0 (whatever the table holds is looked at: one diff, like auto reload that was just switched on); a
+ * reopened watcher keeps its position and checks what came meanwhile. */
+static bool rw_open(struct lio *io, rw_t *r, bool startup_pending) {
+    int64_t now = now_ms();
+    const lview_t *v = rw_view0(io, r);
+    uint64_t poll_ms = rw_poll_ms(io, r);
+    r->open_retry_at = now + (int64_t)poll_ms;
+    if (!v) return false;
+    db_source_t src;
+    view_source(r->drv, v, &src);
+    char err[DB_ERRLEN];
+    db_conn_t *c = NULL;
+    int rc = r->drv->open(&c, &src, err, sizeof(err));
+    if (rc != 0) {
+        rw_set_err(io, r, false, "cannot open the database", err);
+        return false;
+    }
+    db_schema_info_t si;
+    memset(&si, 0, sizeof(si));
+    if ((rc = r->drv->check_schema(c, &si)) != 0) {
+        rw_set_err(io, r, false, "cannot check the database", r->drv->errmsg(c));
+        r->drv->close(c);
+        return false;
+    }
+    if (!si.has_reload_requests) {                           /* the multi-server tables are optional */
+        r->drv->close(c);
+        r->absent = true;
+        r->open_retry_at = now + RW_ABSENT_MS;
+        return false;
+    }
+    r->absent = false;
+    r->has_status = si.has_server_status;
+    sid_resolve(io);
+    if ((rc = r->drv->watch_requests(c)) == DB_ERR_RETRY) {
+        rw_set_err(io, r, false, "cannot listen", r->drv->errmsg(c));
+        r->drv->close(c);
+        return false;
+    }
+    if (rc != 0 && !r->listen_noted) {                       /* a standby cannot LISTEN: the timer does it */
+        r->listen_noted = true;
+        lg(LOG_NOTICE, "view '%s': reload requests: cannot LISTEN karidns_reload (%s); the requests are read every %llu s", v->name,
+           r->drv->errmsg(c), (unsigned long long)(poll_ms / 1000));
+    }
+    if (!r->seeded) {
+        if (startup_pending) {
+            uint64_t mx = 0;
+            if ((rc = r->drv->requests_max(c, &mx)) != 0) {
+                rw_set_err(io, r, false, "cannot read the requests", r->drv->errmsg(c));
+                r->drv->close(c);
+                return false;
+            }
+            r->last = mx;
+            r->startup_seeded = true;
+        } else {
+            r->last = 0;
+            r->flush_at = now;
+        }
+        r->seeded = true;
+        r->applied_ok = true;
+    } else {
+        r->flush_at = now;                                   /* reopened: what was requested meanwhile */
+    }
+    r->conn = c;
+    r->next_poll = now + (int64_t)poll_ms;
+    r->perr[0] = '\0';
+    io->status_dirty = true;
+    lg(LOG_INFO, "view '%s': reload requests: watching karidns_reload_requests (generation %llu%s)", v->name, (unsigned long long)r->last,
+       r->has_status ? "" : "; no karidns_server_status table, the outcome is not written");
+    return true;
+}
+
+/* top of the loop: the watchers follow the CONFIG (one per source), and the ones that have no connection get one */
+static void rw_prepare(struct lio *io, bool load_follows) {
+    int64_t now = now_ms();
+    for (size_t i = 0; i < io->nrw; i++) {
+        io->rw[i].in_cfg = false;
+        io->rw[i].nv = 0;
+    }
+    const db_driver_t *drv = driver_find(io->cfg.driver);
+    for (size_t i = 0; drv && drv->watch_requests && i < io->cfg.nviews; i++) {
+        const lview_t *v = &io->cfg.views[i];
+        rw_t *r = rw_find(io, v->source, v->conninfo);
+        if (!r) {
+            if (io->nrw >= RW_MAX) {
+                lg(LOG_WARNING, "view '%s': more than %d database sources: reload requests are not watched for it", v->name, RW_MAX);
+                continue;
+            }
+            r = &io->rw[io->nrw];
+            memset(r, 0, sizeof(*r));
+            r->drv = drv;
+            r->applied_ok = true;
+            r->source = v->source ? strdup(v->source) : NULL;
+            r->conninfo = v->conninfo ? strdup(v->conninfo) : NULL;
+            if ((v->source && !r->source) || (v->conninfo && !r->conninfo)) {
+                free(r->source);
+                free(r->conninfo);
+                lg(LOG_ERR, "out of memory");
+                continue;
+            }
+            io->nrw++;
+        }
+        if (r->nv == r->cv) {
+            size_t nc = r->cv ? r->cv * 2 : 4;
+            uint16_t *nvw = realloc(r->views, nc * sizeof(*nvw));
+            if (!nvw) continue;
+            r->views = nvw;
+            r->cv = nc;
+        }
+        r->views[r->nv++] = v->index;
+        r->in_cfg = true;
+    }
+    for (size_t i = 0; i < io->nrw;) {                       /* sources that left the configuration */
+        if (io->rw[i].in_cfg) {
+            i++;
+            continue;
+        }
+        rw_free(&io->rw[i]);
+        memmove(&io->rw[i], &io->rw[i + 1], (io->nrw - i - 1) * sizeof(io->rw[0]));
+        io->nrw--;
+        memset(&io->rw[io->nrw], 0, sizeof(io->rw[0]));
+    }
+    for (size_t i = 0; i < io->nrw; i++)
+        if (!io->rw[i].conn && now >= io->rw[i].open_retry_at) rw_open(io, &io->rw[i], load_follows);
+}
+
+/* write the status row waiting in r (a failure is shown and tried again after RW_RETRY_MS) */
+static void rw_try_report(struct lio *io, rw_t *r) {
+    if (!r->rep_pending || !r->conn) return;
+    db_status_t st = { r->rep_gen, r->rep_ok, r->rep_text, io->sid };
+    int rc = r->drv->report_status(r->conn, &st);
+    int64_t now = now_ms();
+    if (rc == 0) {
+        r->rep_pending = false;
+        r->rep_time = (int64_t)time(NULL);
+        if (r->rerr[0]) {
+            const lview_t *v = rw_view0(io, r);
+            lg(LOG_NOTICE, "view '%s': reload requests: the status row is written again", v ? v->name : "?");
+            r->rerr[0] = '\0';
+        }
+        io->status_dirty = true;
+        return;
+    }
+    rw_set_err(io, r, true, "cannot write karidns_server_status", r->drv->errmsg(r->conn));
+    r->report_retry_at = now + RW_RETRY_MS;
+    if (rc == DB_ERR_RETRY) {                                /* the connection is gone: reopen (which also checks for new requests) */
+        rw_close(r);
+        r->open_retry_at = now + (int64_t)rw_poll_ms(io, r);
+    }
+}
+
+/* the outcome of generation gen: remember it and write it */
+static void rw_report(struct lio *io, rw_t *r, uint64_t gen, bool ok, const char *text) {
+    r->applied_ok = ok;
+    io->status_dirty = true;
+    sid_resolve(io);
+    if (!io->sid_ok) {                                       /* sid_resolve() has warned (once); dbstatus says why */
+        r->rep_pending = false;
+        snprintf(r->rerr, sizeof(r->rerr), "the status row is not written: %s", io->sid_why);
+        return;
+    }
+    if (!r->has_status) {
+        r->rep_pending = false;
+        rw_set_err(io, r, true, "the status row is not written", "this database has no karidns_server_status table");
+        return;
+    }
+    if (!r->rep_text && !(r->rep_text = malloc(FZ_REPORT_BYTES + 1))) {
+        r->rep_pending = false;
+        lg(LOG_ERR, "out of memory");
+        return;
+    }
+    snprintf(r->rep_text, FZ_REPORT_BYTES + 1, "%s", text);
+    r->rep_gen = gen;
+    r->rep_ok = ok;
+    r->rep_pending = true;
+    rw_try_report(io, r);
+}
+
+/* a request batch under construction */
+typedef struct {
+    uint64_t rows;
+    bool all, force;
+    size_t nz;
+    char (*zone)[DNS_NAME_TEXT_SIZE];                        /* RW_ZONES canonical names */
+    unsigned nbad;
+    char bad[4][260];                                        /* the first invalid zone names (printable) */
+} rq_batch_t;
+
+static int rq_row(void *ud, const db_reload_row_t *row) {
+    rq_batch_t *b = ud;
+    b->rows++;
+    if (row->force) b->force = true;
+    if (!row->zone) {
+        b->all = true;
+        return 0;
+    }
+    char canon[DNS_NAME_TEXT_SIZE];
+    if (!pdns_canonical_zone_name(row->zone, canon)) {       /* untrusted text: never hand it to a one-zone load as it is */
+        if (b->nbad < 4) clean_reason(row->zone, b->bad[b->nbad], sizeof(b->bad[0]));
+        b->nbad++;
+        return 0;
+    }
+    if (b->all) return 0;
+    for (size_t i = 0; i < b->nz; i++)
+        if (names_equal(b->zone[i], canon)) return 0;
+    if (b->nz >= RW_ZONES) {
+        b->all = true;
+        return 0;
+    }
+    snprintf(b->zone[b->nz++], DNS_NAME_TEXT_SIZE, "%s", canon);
+    return 0;
+}
+
+/* Read the requests above r->last; when there are some, reload and report.  0, or -1 (fatal: stream, memory, stop). */
+static int rw_process(ctx_t *x, struct lio *io, rw_t *r) {
+    int64_t now = now_ms();
+    uint64_t poll_ms = rw_poll_ms(io, r);
+    if (!r->zbuf && !(r->zbuf = calloc(RW_ZONES, DNS_NAME_TEXT_SIZE))) {
+        lg(LOG_ERR, "out of memory");
+        return -1;
+    }
+    rq_batch_t bs;
+    memset(&bs, 0, sizeof(bs));
+    bs.zone = r->zbuf;
+    rq_batch_t *b = &bs;
+    uint64_t maxg = r->last;
+    bool gap = false;
+    int rc = r->drv->reload_requests(r->conn, r->last, rq_row, b, &maxg, &gap);
+    if (rc != 0) {
+        rw_set_err(io, r, false, "cannot read the requests", r->drv->errmsg(r->conn));
+        if (rc == DB_ERR_RETRY) {
+            rw_close(r);
+            r->open_retry_at = now + (int64_t)poll_ms;
+        } else {
+            r->flush_at = now + (int64_t)poll_ms;
+        }
+        goto out;
+    }
+    if (b->rows == 0) {
+        r->perr[0] = '\0';
+        goto out;
+    }
+    if (gap) b->all = true;                                  /* requests between were pruned or rolled back: do not guess */
+    fz_reset(&io->fz, true);
+    for (unsigned i = 0; i < b->nbad && i < 4; i++)
+        fz_add(&io->fz, r->views[0], b->bad[i], "not a valid zone name; the request is ignored", 44);
+    int fail = 0;
+    for (size_t vi = 0; vi < r->nv && !fail && !g_stop; vi++) {
+        int lrc = 0;
+        if (b->all) {
+            lrc = do_load(x, io, KDB_BATCH_DIFF, (int)r->views[vi], NULL, 0, b->force, false);
+        } else {
+            for (size_t zi = 0; zi < b->nz && lrc == 0; zi++)
+                lrc = do_load(x, io, KDB_BATCH_ZONE, (int)r->views[vi], b->zone[zi], 0, b->force, false);
+        }
+        if (lrc < 0) {
+            io->fz.on = false;
+            return -1;
+        }
+        if (lrc > 0) fail = 1;
+    }
+    io->fz.on = false;
+    if (g_stop) return -1;                                   /* told to stop between two loads: nothing is counted as applied */
+    if (fail) {                                              /* the position stays: the same requests are read again */
+        rw_set_err(io, r, false, "cannot read the database", x->errtext[0] ? x->errtext : "the database could not be read");
+        r->flush_at = now_ms() + (int64_t)poll_ms;
+        goto out;
+    }
+    r->last = maxg;
+    r->perr[0] = '\0';
+    char text[FZ_REPORT_BYTES + 1];
+    bool ok;
+    fz_report(&io->fz, r->views, r->nv, text, &ok);
+    const lview_t *v0 = rw_view0(io, r);
+    lg(LOG_INFO, "view '%s': reload request(s) up to generation %llu applied (%s%s%s)", v0 ? v0->name : "?", (unsigned long long)maxg,
+       b->all ? "all zones" : "listed zones", b->force ? ", force" : "", ok ? "" : "; some zones failed");
+    rw_report(io, r, maxg, ok, text);
+out:
+    return 0;
+}
+
+/* before a load: collect the failures when a watcher waits for the outcome of the load that follows its opening */
+static void rw_collect_begin(struct lio *io) {
+    bool any = false;
+    for (size_t i = 0; i < io->nrw; i++)
+        if (io->rw[i].startup_seeded) any = true;
+    fz_reset(&io->fz, any);
+}
+
+/* after a successful load: report its outcome for the watchers that were opened before it */
+static void rw_load_report(struct lio *io) {
+    for (size_t i = 0; i < io->nrw; i++) {
+        rw_t *r = &io->rw[i];
+        if (!r->startup_seeded) continue;
+        r->startup_seeded = false;
+        if (!r->conn || r->last == 0) continue;              /* no request was ever made: there is nothing to say */
+        char text[FZ_REPORT_BYTES + 1];
+        bool ok;
+        fz_report(&io->fz, r->views, r->nv, text, &ok);
+        rw_report(io, r, r->last, ok, text);
+    }
+    io->fz.on = false;
+}
+
+/* a notification (or a dead connection) on the watcher's socket */
+static void rw_ready(struct lio *io, size_t ri) {
+    if (ri >= io->nrw || !io->rw[ri].conn) return;
+    rw_t *r = &io->rw[ri];
+    bool changed = false;
+    int rc = r->drv->drain_notifications(r->conn, &changed);
+    int64_t now = now_ms();
+    const lview_t *v0 = rw_view0(io, r);
+    if (rc != 0) {
+        rw_set_err(io, r, false, "the connection was lost", r->drv->errmsg(r->conn));
+        rw_close(r);
+        r->open_retry_at = now + (int64_t)rw_poll_ms(io, r);
+        return;
+    }
+    if (changed && !r->flush_at) r->flush_at = now + (v0 ? (int64_t)v0->coalesce_ms : 0);
+}
+
+/* the request step of the loop, after the startup batch: 0, or -1 (fatal) */
+static int rw_run(ctx_t *x, struct lio *io) {
+    if (io->have_newcfg) return 0;                           /* a CONFIG is waiting: adopt it first */
+    for (size_t i = 0; i < io->nrw && !g_stop; i++) {
+        rw_t *r = &io->rw[i];
+        int64_t now = now_ms();
+        if (!rw_view0(io, r)) continue;
+        if (!r->conn) {
+            if (now >= r->open_retry_at) rw_open(io, r, false);
+        } else if (now >= r->next_poll) {                    /* the safety net: read the table even when no notification came */
+            r->next_poll = now + (int64_t)rw_poll_ms(io, r);
+            if (!r->flush_at) r->flush_at = now;
+        }
+        if (r->conn && r->flush_at && now_ms() >= r->flush_at) {
+            r->flush_at = 0;
+            if (rw_process(x, io, r) != 0) return -1;
+        }
+        if (r->conn && r->rep_pending && now_ms() >= r->report_retry_at) rw_try_report(io, r);
+        if (io->eof || io->failed) return 0;
+    }
+    return 0;
+}
+
+/* AUTO_STATUS: what `karictl dbstatus` shows for each view that has auto reload on or whose source has reload requests */
 static int auto_send_status(ctx_t *x, struct lio *io) {
     bool any = false;
     if (kdb_enc_begin(&x->enc, KDB_T_AUTO_STATUS) != 0) return -1;
     for (size_t i = 0; i < io->cfg.nviews; i++) {
         const lview_t *v = &io->cfg.views[i];
-        if (!v->auto_reload) continue;
+        const rw_t *r = rw_for_view(io, v);
+        bool au = v->auto_reload != 0;
+        if (!au && !r) continue;
         int slot = vslot_get(io, v->name);
         if (slot < 0) return -1;
         const vstate_t *vs = &io->vst[slot];
-        const char *err = vs->lerr[0] ? vs->lerr : vs->perr;
+        const char *err = !au ? "" : vs->lerr[0] ? vs->lerr : vs->perr;
         any = true;
         if (kdb_enc_nest_begin(&x->enc, 1) != 0 || kdb_enc_u16(&x->enc, 1, v->index) != 0 ||
-            kdb_enc_u64(&x->enc, 2, (uint64_t)vs->last_poll) != 0 ||
-            kdb_enc_u64(&x->enc, 3, vs->seq_valid ? vs->seq : 0) != 0 || kdb_enc_u32(&x->enc, 4, vs->pending) != 0 ||
-            (err[0] && kdb_enc_str(&x->enc, 5, err) != 0) || kdb_enc_nest_end(&x->enc) != 0)
+            kdb_enc_u64(&x->enc, 2, au ? (uint64_t)vs->last_poll : 0) != 0 ||
+            kdb_enc_u64(&x->enc, 3, au && vs->seq_valid ? vs->seq : 0) != 0 || kdb_enc_u32(&x->enc, 4, au ? vs->pending : 0) != 0 ||
+            (err[0] && kdb_enc_str(&x->enc, 5, err) != 0) ||
+            kdb_enc_u8(&x->enc, 6, (uint8_t)((au ? KDB_AS_AUTO : 0) | (r ? KDB_AS_REQ : 0))) != 0)
             return -1;
+        if (r) {
+            const char *rerr = r->rerr[0] ? r->rerr : r->perr;
+            if ((io->sid_ok && kdb_enc_str(&x->enc, 7, io->sid) != 0) || kdb_enc_u64(&x->enc, 8, r->last) != 0 ||
+                kdb_enc_u8(&x->enc, 9, r->applied_ok ? 1 : 0) != 0 || (rerr[0] && kdb_enc_str(&x->enc, 10, rerr) != 0) ||
+                kdb_enc_u64(&x->enc, 11, (uint64_t)r->rep_time) != 0)
+                return -1;
+        }
+        if (kdb_enc_nest_end(&x->enc) != 0) return -1;
     }
     if (!any || kdb_enc_end(&x->enc) != 0) {
         kdb_enc_reset(&x->enc);
         return any ? -1 : 0;
     }
     return send_enc(x);
+}
+
+/* send the AUTO_STATUS when something it shows changed */
+static int status_flush(ctx_t *x, struct lio *io) {
+    if (!io->status_dirty || g_stop) return 0;
+    io->status_dirty = false;
+    if (auto_send_status(x, io) != 0) {
+        lg(LOG_ERR, "cannot write the output: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 /* the auto reload step of the loop, after the startup batch: 0, or -1 (fatal) */
@@ -2503,10 +3104,7 @@ static int auto_run(ctx_t *x, struct lio *io) {
         if (auto_view(x, io, v, (uint16_t)slot, &dirty) != 0) return -1;
         if (io->eof || io->failed) return 0;                           /* the main loop ends */
     }
-    if (dirty && !g_stop && auto_send_status(x, io) != 0) {
-        lg(LOG_ERR, "cannot write the output: %s", strerror(errno));
-        return -1;
-    }
+    if (dirty) io->status_dirty = true;                                 /* sent by status_flush() once the request step has run too */
     return 0;
 }
 
@@ -2526,6 +3124,15 @@ static int auto_wait_ms(const struct lio *io, int limit) {
             if (left < limit) limit = (int)left;
         }
     }
+    for (size_t i = 0; i < io->nrw; i++) {                           /* B11: the request watchers */
+        const rw_t *r = &io->rw[i];
+        int64_t t = r->conn ? r->next_poll : r->open_retry_at;
+        if (r->conn && r->flush_at && r->flush_at < t) t = r->flush_at;
+        if (r->conn && r->rep_pending && r->report_retry_at < t) t = r->report_retry_at;
+        int64_t left = t - now;
+        if (left < 0) left = 0;
+        if (left < limit) limit = (int)left;
+    }
     return limit;
 }
 
@@ -2533,8 +3140,8 @@ static int auto_wait_ms(const struct lio *io, int limit) {
  * reload on whose driver notifies (PostgreSQL LISTEN; wait_fd() is -1 for SQLite3, which is polled by timer).  A readable
  * connection makes its view due at once.  Returns n, or 0 on out of memory. */
 static size_t auto_fds(struct lio *io, bool watch) {
-    if (io->cpfs < 1 + io->nvn) {
-        size_t nc = 1 + io->nvn + 8;
+    if (io->cpfs < 1 + io->nvn + RW_MAX) {
+        size_t nc = 1 + io->nvn + RW_MAX + 8;
         struct pollfd *np = realloc(io->pfs, nc * sizeof(*np));
         if (!np) return 0;
         io->pfs = np;
@@ -2556,6 +3163,17 @@ static size_t auto_fds(struct lio *io, bool watch) {
         io->pfs[n].events = POLLIN;
         io->pfs[n].revents = 0;
         io->pfs_slot[n] = s;
+        n++;
+    }
+    for (size_t i = 0; watch && i < io->nrw; i++) {                  /* B11: the connections that LISTEN karidns_reload */
+        rw_t *r = &io->rw[i];
+        if (!r->conn || !r->drv->wait_fd) continue;
+        int wfd = r->drv->wait_fd(r->conn);
+        if (wfd < 0) continue;
+        io->pfs[n].fd = wfd;
+        io->pfs[n].events = POLLIN;
+        io->pfs[n].revents = 0;
+        io->pfs_slot[n] = RW_FD_BASE + i;
         n++;
     }
     return n;
@@ -2646,8 +3264,10 @@ static int run_stream(int fd) {
             need_load = true;
         }
         auto_prepare(io, need_load);
+        rw_prepare(io, need_load);                  /* B11: before the load, so that the generation it covers is the one read here */
         if (need_load) {
             need_load = false;
+            rw_collect_begin(io);
             int rc = do_load(&x, io, startup_done ? KDB_BATCH_DIFF : KDB_BATCH_STARTUP, -1, NULL, load_req, false, reconcile);
             if (rc < 0) {
                 if (g_stop) goto stopped;
@@ -2658,7 +3278,9 @@ static int run_stream(int fd) {
                 startup_done = true;
                 reconcile = false;
                 backoff = 1;
-            } else {                           /* a database error: retry with backoff, do not crash (design 1.2) */
+                rw_load_report(io);
+            } else {
+                io->fz.on = false;                           /* a database error: retry with backoff, do not crash (design 1.2) */
                 retry_pending = true;
                 retry_at = now_ms() + (int64_t)backoff * 1000;
                 lg(LOG_WARNING, "retrying in %u s", backoff);
@@ -2675,6 +3297,11 @@ static int run_stream(int fd) {
         }
         io->nreq = 0;
         if (startup_done && auto_run(&x, io) != 0) {
+            if (g_stop) goto stopped;
+            status = EXIT_ERROR;
+            goto done;
+        }
+        if (startup_done && (rw_run(&x, io) != 0 || status_flush(&x, io) != 0)) {
             if (g_stop) goto stopped;
             status = EXIT_ERROR;
             goto done;
@@ -2699,8 +3326,11 @@ static int run_stream(int fd) {
             goto done;
         }
         if (r > 0) {
-            for (size_t i = 1; i < npf; i++)
-                if (io->pfs[i].revents) io->vst[io->pfs_slot[i]].next_poll = 0;      /* a notification (or a dead connection): look now */
+            for (size_t i = 1; i < npf; i++) {
+                if (!io->pfs[i].revents) continue;
+                if (io->pfs_slot[i] >= RW_FD_BASE) rw_ready(io, io->pfs_slot[i] - RW_FD_BASE);     /* B11: a reload request */
+                else io->vst[io->pfs_slot[i]].next_poll = 0;      /* a notification (or a dead connection): look now */
+            }
             if (io->pfs[0].revents) io_pump(io);
         }
     }
@@ -2711,6 +3341,7 @@ stopped:
 done:
     ctx_view_reset(&x);
     kdb_enc_free(&x.enc);
+    for (size_t i = 0; i < io->nrw; i++) rw_free(&io->rw[i]);
     cfg_free(&io->cfg);
     cfg_free(&io->newcfg);
     io_free_views(io);

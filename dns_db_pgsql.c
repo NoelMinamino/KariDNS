@@ -46,6 +46,14 @@
  * Auto reload (design 6): `LISTEN karidns_changes` on the persistent connection; wait_fd() is its socket, poll_version()
  * drains the notifications and returns a counter that changes when one arrived (it also pings the server now and then,
  * so a dead connection is noticed).
+ *
+ * Multi-server operation (B11, release plan 4.8; db/karidns_ext.pgsql.sql): a connection that called watch_requests() LISTENs
+ * `karidns_reload` instead, requests_max() / reload_requests() read karidns_reload_requests (generation > the last applied,
+ * each call its own statement, never inside a snapshot), and report_status() upserts the row of this server in
+ * karidns_server_status in its own BEGIN READ WRITE ... COMMIT.  The session stays default_transaction_read_only = on; only that
+ * explicit transaction writes, and the role needs INSERT and UPDATE on that one table (db/karidns_loader_role.pgsql.sql).
+ * Generations are made visible in order by the advisory lock of the INSERT trigger, so a position kept as a generation number
+ * never skips a request (unlike karidns_changes.seq, which needs the xmin cursor above).
  */
 
 #ifdef KARIDNS_DB_POSTGRESQL
@@ -77,6 +85,9 @@ struct db_conn {
     uint64_t nver;                  /* poll_version(): number of notifications seen */
     time_t last_ping;
     bool has_changes, has_domain_views, has_profiles, has_ext, has_tagdef_id;
+    bool has_reload_requests, has_server_status;    /* B11 */
+    bool chan_reload;               /* B11: LISTEN karidns_reload (watch_requests) instead of karidns_changes */
+    bool listen_failed;             /* LISTEN was refused (a standby): wait_fd() stays -1, the caller polls by timer */
 };
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -353,9 +364,12 @@ static const struct { const char *table; const char *cols[SCHEMA_MAX_COLS]; int 
     { "karidns_record_tinydns", { "record_id", "ttd", "loc", "countdown", NULL }, 4 },
     { "karidns_zone_tagdefs", { "domain_id", "kind", "tag", "cidr", "id", NULL }, 4 },
     { "karidns_schema_version", { "version", NULL }, 1 },
+    /* B11, optional (the multi-server tables) */
+    { "karidns_reload_requests", { "generation", "zone", "force", NULL }, 3 },
+    { "karidns_server_status", { "server_id", "generation", "applied_at", "ok", "failed_zones", NULL }, 5 },
 };
 #define N_TABLES (sizeof(k_tables) / sizeof(k_tables[0]))
-enum { T_DOMAINS, T_RECORDS, T_META, T_KEYS, T_CHANGES, T_DV, T_PROF, T_TAGS, T_TDNS, T_TAGDEFS, T_VERSION };
+enum { T_DOMAINS, T_RECORDS, T_META, T_KEYS, T_CHANGES, T_DV, T_PROF, T_TAGS, T_TDNS, T_TAGDEFS, T_VERSION, T_REQ, T_STATUS };
 
 static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
     PGresult *r = NULL;
@@ -410,6 +424,8 @@ static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
     c->has_profiles = HAVE(T_PROF);
     c->has_ext = HAVE(T_TAGS) && HAVE(T_TDNS) && HAVE(T_TAGDEFS);
     c->has_tagdef_id = exists[T_TAGDEFS] && (found[T_TAGDEFS] & (1u << 4)) != 0;
+    c->has_reload_requests = HAVE(T_REQ);
+    c->has_server_status = HAVE(T_STATUS);
     bool has_version = HAVE(T_VERSION);
 #undef HAVE
     if (has_version) {
@@ -428,6 +444,8 @@ static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
         out->has_domain_views = c->has_domain_views;
         out->has_profiles = c->has_profiles;
         out->has_ext = c->has_ext;
+        out->has_reload_requests = c->has_reload_requests;
+        out->has_server_status = c->has_server_status;
     }
     return 0;
 }
@@ -830,12 +848,14 @@ static int pg_changes_since(db_conn_t *c, uint64_t after, db_change_cb cb, void 
 
 static int ensure_listen(db_conn_t *c) {
     if (c->listening) return 0;
+    if (c->listen_failed) return -1;                    /* refused for good (a standby cannot LISTEN): do not ask at every loop */
     if (c->in_snapshot) {
         set_err(c, "LISTEN: a snapshot is open");
         return -1;
     }
-    int rc = exec_cmd(c, "LISTEN karidns_changes", "LISTEN");
+    int rc = exec_cmd(c, c->chan_reload ? "LISTEN karidns_reload" : "LISTEN karidns_changes", "LISTEN");
     if (rc == 0) c->listening = true;
+    else if (rc == -1) c->listen_failed = true;         /* not a transient condition */
     return rc;
 }
 
@@ -884,10 +904,119 @@ static int pg_poll_version(db_conn_t *c, uint64_t *version, bool *replaced) {
     return 0;
 }
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* reload requests and the status row (B11)                                                                       */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+#define REQ_CHUNK 500                       /* requests per query (the table keeps 1000, but nothing here depends on a trigger) */
+#define REQ_STR2(x) #x
+#define REQ_STR(x) REQ_STR2(x)
+
+static int pg_watch_requests(db_conn_t *c) {
+    if (c->listening && !c->chan_reload) {
+        set_err(c, "watch_requests: the connection already listens to karidns_changes");
+        return -1;
+    }
+    c->chan_reload = true;
+    return ensure_listen(c);
+}
+
+static int pg_requests_max(db_conn_t *c, uint64_t *generation) {
+    if (!c->has_reload_requests) {
+        set_err(c, "karidns_reload_requests does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    if (c->in_snapshot) {
+        set_err(c, "requests_max: a snapshot is open");
+        return -1;
+    }
+    PGresult *r = NULL;
+    int ret = exec_rows(c, "SELECT coalesce(max(generation), 0)::text FROM karidns_reload_requests", 0, NULL, &r, "requests_max");
+    if (ret != 0) return ret;
+    *generation = PQgetisnull(r, 0, 0) ? 0 : strtoull(PQgetvalue(r, 0, 0), NULL, 10);
+    PQclear(r);
+    return 0;
+}
+
+static int pg_reload_requests(db_conn_t *c, uint64_t after, db_reload_cb cb, void *ud, uint64_t *max_gen, bool *gap) {
+    if (!c->has_reload_requests) {
+        set_err(c, "karidns_reload_requests does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    if (c->in_snapshot) {
+        set_err(c, "reload_requests: a snapshot is open");
+        return -1;
+    }
+    uint64_t cur = after;
+    bool first = true, g = false;
+    int ret = 0;
+    while (ret == 0) {
+        char p[32];
+        snprintf(p, sizeof(p), "%llu", (unsigned long long)cur);
+        const char *pv[1] = { p };
+        PGresult *r = NULL;
+        ret = exec_rows(c, "SELECT generation, zone, force FROM karidns_reload_requests WHERE generation > $1::bigint ORDER BY generation LIMIT " REQ_STR(REQ_CHUNK),
+                        1, pv, &r, "reload_requests");
+        if (ret != 0) break;
+        int n = PQntuples(r);
+        for (int i = 0; i < n && ret == 0; i++) {
+            bool bad = false;
+            db_reload_row_t row;
+            row.generation = (uint64_t)cell_i64(r, i, 0);
+            row.zone = cell_text(c, r, i, 1, "karidns_reload_requests", (int64_t)row.generation, "zone", &bad);
+            row.force = cell_true(r, i, 2);
+            if (bad) {
+                ret = -1;
+                break;
+            }
+            if (first) {
+                g = row.generation != after + 1;      /* pruned or rolled back requests lie between */
+                first = false;
+            }
+            if (row.generation <= cur) continue;      /* cannot happen (ORDER BY, > cur); never go backwards */
+            cur = row.generation;
+            if (cb(ud, &row) != 0) ret = DB_STOPPED;
+        }
+        PQclear(r);
+        if (n < REQ_CHUNK) break;
+    }
+    if (max_gen) *max_gen = cur;
+    if (gap) *gap = g;
+    return ret;
+}
+
 static int pg_report_status(db_conn_t *c, const db_status_t *st) {
-    (void)c;
-    (void)st;
-    return 0;       /* karidns_server_status is written from B11 */
+    if (!c->has_server_status) {
+        set_err(c, "karidns_server_status does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    if (c->in_snapshot) {
+        set_err(c, "report_status: a snapshot is open");     /* the write must not share the read snapshot */
+        return -1;
+    }
+    if (!st || !st->server_id || !*st->server_id || strlen(st->server_id) > 64) {
+        set_err(c, "report_status: the server id must be 1 to 64 bytes");
+        return -1;
+    }
+    char gen[32];
+    snprintf(gen, sizeof(gen), "%llu", (unsigned long long)st->generation);
+    const char *pv[4] = { st->server_id, gen, st->ok ? "t" : "f", st->failed_zones ? st->failed_zones : "" };
+    int rc = exec_cmd(c, "BEGIN READ WRITE", "report status");     /* the session is read only by default: this one writes */
+    if (rc != 0) return rc;
+    PGresult *r = PQexecParams(c->pg,
+                               "INSERT INTO karidns_server_status (server_id, generation, applied_at, ok, failed_zones) "
+                               "VALUES ($1, $2::bigint, now(), $3::boolean, $4) "
+                               "ON CONFLICT (server_id) DO UPDATE SET generation = EXCLUDED.generation, applied_at = EXCLUDED.applied_at, "
+                               "ok = EXCLUDED.ok, failed_zones = EXCLUDED.failed_zones",
+                               4, NULL, pv, NULL, NULL, 0);
+    if (!r || PQresultStatus(r) != PGRES_COMMAND_OK) {
+        rc = pq_fail(c, r, "report status");
+        PQclear(r);
+        PQclear(PQexec(c->pg, "ROLLBACK"));                     /* ends the aborted transaction (harmless when the connection is gone) */
+        return rc;
+    }
+    PQclear(r);
+    return exec_cmd(c, "COMMIT", "report status");
 }
 
 const db_driver_t db_driver_postgresql = {
@@ -896,6 +1025,7 @@ const db_driver_t db_driver_postgresql = {
     pg_zones_with_keys, pg_changes_since, pg_wait_fd,     pg_drain_notifications, pg_report_status,
     pg_changes_max,  pg_scan_records_range, pg_scan_domain_views, pg_scan_profiles, pg_scan_ext, pg_poll_version,
     true,
+    pg_watch_requests, pg_requests_max, pg_reload_requests,
 };
 
 #endif /* KARIDNS_DB_POSTGRESQL */

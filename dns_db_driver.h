@@ -56,14 +56,25 @@ typedef struct {
     bool has_domain_views;          /* karidns_domain_views exists (B6b, design 3.7, 7.1) */
     bool has_profiles;              /* karidns_profiles exists (B7a, design 3.7) */
     bool has_ext;                   /* karidns_record_tags, karidns_record_tinydns and karidns_zone_tagdefs exist (B8, design 3.7) */
+    bool has_reload_requests;       /* PostgreSQL: karidns_reload_requests exists (B11, release plan 4.8) */
+    bool has_server_status;         /* PostgreSQL: karidns_server_status exists (B11) */
 } db_schema_info_t;
 
-/* PostgreSQL only: written to karidns_server_status (B11).  SQLite3 ignores it. */
+/* PostgreSQL only: written to karidns_server_status (B11).  SQLite3 ignores it.  server_id: 1..64 bytes; failed_zones: the
+ * "zone: reason" lines ("" = none, at most 4 KiB, printable ASCII and newlines). */
 typedef struct {
     uint64_t generation;
     bool ok;
     const char *failed_zones;
+    const char *server_id;
 } db_status_t;
+
+/* B11: one row of karidns_reload_requests.  zone NULL = every zone of the source. */
+typedef struct {
+    uint64_t generation;
+    const char *zone;
+    bool force;
+} db_reload_row_t;
 
 typedef struct db_conn db_conn_t;   /* opaque, one per source (view file / schema) */
 
@@ -72,6 +83,7 @@ typedef int (*db_record_cb)(void *ud, int64_t domain_id, const db_record_row_t *
 typedef int (*db_meta_cb)(void *ud, const db_meta_row_t *row);
 typedef int (*db_key_cb)(void *ud, int64_t domain_id);
 typedef int (*db_change_cb)(void *ud, const db_change_row_t *row);
+typedef int (*db_reload_cb)(void *ud, const db_reload_row_t *row);
 typedef int (*db_domain_view_cb)(void *ud, int64_t domain_id, const char *view_name);
 typedef struct { const char *name, *settings; } db_profile_row_t;       /* one row of karidns_profiles */
 typedef int (*db_profile_cb)(void *ud, const db_profile_row_t *row);
@@ -107,7 +119,11 @@ typedef struct db_driver {
     int (*changes_since)(db_conn_t *c, uint64_t after, db_change_cb cb, void *ud, uint64_t *last_seq, bool *gap);
     int (*wait_fd)(db_conn_t *c);                                /* fd to poll for change notifications; -1 = poll by timer */
     int (*drain_notifications)(db_conn_t *c, bool *changed);
-    int (*report_status)(db_conn_t *c, const db_status_t *st);   /* PostgreSQL only; SQLite3: no-op */
+    /* B11, PostgreSQL only (SQLite3: no-op): upserts the row of st->server_id in karidns_server_status in a READ WRITE transaction of its
+     * own (BEGIN READ WRITE ... COMMIT; never inside a snapshot, so it is not mixed with the read snapshot).  Needs INSERT and UPDATE on
+     * the table.  0, -1 (privilege, missing table, bad value: db_errmsg() says why), DB_ERR_RETRY (connection loss), DB_ERR_UNAVAILABLE
+     * (the table does not exist). */
+    int (*report_status)(db_conn_t *c, const db_status_t *st);
     /* B6a: the highest seq in karidns_changes inside the open snapshot (0 = the table is empty); DB_ERR_UNAVAILABLE when
      * the table does not exist.  Used for the first reading of the change log (no need to list a million rows). */
     int (*changes_max)(db_conn_t *c, uint64_t *seq);
@@ -137,6 +153,19 @@ typedef struct db_driver {
      * transactions that were still running are visible beyond it and are read again by changes_since(cursor), so the caller
      * must call changes_since() even when the cursor has not grown.  The caller only compares cursors (<, ==, >). */
     bool changes_unsettled;
+    /* B11 (reload requests, PostgreSQL only; NULL for SQLite3).  The requests of karidns_reload_requests are read on a persistent connection
+     * outside a snapshot (every call is its own statement).
+     * watch_requests: from now on wait_fd() is the socket of LISTEN karidns_reload (instead of karidns_changes) and drain_notifications()
+     *   reports those notifications.  Best effort: when LISTEN is not possible (a standby) wait_fd() stays -1 and the caller polls
+     *   requests by timer.  Call it before the first wait_fd() of the connection.
+     * requests_max: the highest generation in the table (0 = empty); DB_ERR_UNAVAILABLE when there is no karidns_reload_requests.
+     * reload_requests: the rows with generation > after, in generation order, to cb (a non-zero return stops the scan: DB_STOPPED).
+     *   *max_gen = the highest generation seen (or after).  *gap = the first row is not after + 1 (requests were pruned or rolled
+     *   back; the caller reloads everything).  Generations are made visible in order by the INSERT trigger of db/karidns_ext.pgsql.sql
+     *   (an advisory lock), so a reader that remembers a generation never skips a later-committed lower one. */
+    int (*watch_requests)(db_conn_t *c);
+    int (*requests_max)(db_conn_t *c, uint64_t *generation);
+    int (*reload_requests)(db_conn_t *c, uint64_t after, db_reload_cb cb, void *ud, uint64_t *max_gen, bool *gap);
 } db_driver_t;
 
 /* compiled in when the driver is listed in DB_DRIVERS (Makefile) */

@@ -122,6 +122,10 @@ static void m_auto_status(kdb_enc_t *e, unsigned n) {
         kdb_enc_nest_begin(e, 1);
         kdb_enc_u16(e, 1, (uint16_t)(i % 3)); kdb_enc_u64(e, 2, 1700000000u + i); kdb_enc_u64(e, 3, 41 + i); kdb_enc_u32(e, 4, i);
         if (i == 1) kdb_enc_str(e, 5, "cannot open the database");
+        if (i == 2) {                                   /* B11: the reload request fields */
+            kdb_enc_u8(e, 6, KDB_AS_AUTO | KDB_AS_REQ); kdb_enc_str(e, 7, "ns1"); kdb_enc_u64(e, 8, 7); kdb_enc_u8(e, 9, 1);
+            kdb_enc_str(e, 10, "cannot write karidns_server_status"); kdb_enc_u64(e, 11, 1700000000u);
+        }
         kdb_enc_nest_end(e);
     }
     kdb_enc_end(e);
@@ -1368,9 +1372,57 @@ static void test_auto_status(void) {
     CHECK_RC("pending of 2 bytes", send_enc(KDB_S_READY, &e), KDB_E_TLV_LEN);
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
     kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
-    kdb_enc_u8(&e, 6, 1); kdb_enc_nest_end(&e);
+    kdb_enc_u8(&e, 12, 1); kdb_enc_nest_end(&e);
     kdb_enc_end(&e);
-    CHECK_RC("unknown tag 6", send_enc(KDB_S_READY, &e), KDB_E_TLV_UNKNOWN);
+    CHECK_RC("unknown tag 12", send_enc(KDB_S_READY, &e), KDB_E_TLV_UNKNOWN);
+    /* B11: the optional tags 6..11 (reload requests of a multi-server database) */
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 1); kdb_enc_u64(&e, 2, 0); kdb_enc_u64(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+    kdb_enc_u8(&e, 6, KDB_AS_REQ); kdb_enc_str(&e, 7, "ns1"); kdb_enc_u64(&e, 8, 1234567890123ull); kdb_enc_u8(&e, 9, 1);
+    kdb_enc_str(&e, 10, "cannot write karidns_server_status"); kdb_enc_u64(&e, 11, 1700000001u); kdb_enc_nest_end(&e);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 2); kdb_enc_u64(&e, 2, 5); kdb_enc_u64(&e, 3, 6); kdb_enc_u32(&e, 4, 7); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    sess_init(s, &LIM);
+    sess_to(s, KDB_S_READY);
+    CHECK_RC("request fields", sess_feed(s, e.buf, e.len, 0), KDB_OK);
+    kdb_auto_status_entries(&s->m, &it);
+    CHECK(kdb_auto_status_entries_next(&it, &en));
+    CHECK(en.view == 1 && en.flags == KDB_AS_REQ && en.server_id.len == 3 && memcmp(en.server_id.p, "ns1", 3) == 0 &&
+          en.req_generation == 1234567890123ull && en.req_ok && en.req_error.len == 34 && en.req_time == 1700000001u);
+    CHECK(kdb_auto_status_entries_next(&it, &en));
+    CHECK(en.view == 2 && en.flags == KDB_AS_AUTO && en.server_id.p == NULL && en.req_generation == 0 && !en.req_ok &&
+          en.req_error.p == NULL && en.req_time == 0);      /* an entry of B9 / B10 (no flags) is about auto reload */
+    CHECK(!kdb_auto_status_entries_next(&it, &en));
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_u8(&e, 6, 4); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("flags above 3", send_enc(KDB_S_READY, &e), KDB_E_RANGE);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_u8(&e, 9, 2); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("req_ok above 1", send_enc(KDB_S_READY, &e), KDB_E_RANGE);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_str(&e, 7, ""); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("empty server id", send_enc(KDB_S_READY, &e), KDB_E_TLV_STR);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_str(&e, 7, "01234567890123456789012345678901234567890123456789012345678901234"); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("server id of 65 bytes", send_enc(KDB_S_READY, &e), KDB_E_TLV_STR);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_bytes(&e, 10, "bad\x01text", 8); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("control character in req_error", send_enc(KDB_S_READY, &e), KDB_E_TLV_STR);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_u32(&e, 8, 1); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("req_generation of 4 bytes", send_enc(KDB_S_READY, &e), KDB_E_TLV_LEN);
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
     kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
     kdb_enc_bytes(&e, 5, "bad\x01text", 8); kdb_enc_nest_end(&e);

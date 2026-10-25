@@ -905,6 +905,12 @@ COV_CONT_CFLAGS_1 = -mllvm -runtime-counter-relocation=true
 COV_CONT_CFLAGS_0 =
 COV_PROFILE_PAT_1 = cov_%c%m.profraw
 COV_PROFILE_PAT_0 = karidns_%p_%m.profraw
+# B11c: karidns clears the environment before it starts the loader (dns_db_supervisor.c), so LLVM_PROFILE_FILE never reaches the
+# loader the integration tests run.  The instrumented loader therefore gets its profile file name compiled in (clang
+# -fprofile-instr-generate=FILE; the environment still wins when it is set, as in --dump runs), one file per process (%p): the
+# loader runs as other users than root, which cannot write a file another user created.
+COV_DBL_PAT_1 = cov_dbloader_%p%c.profraw
+COV_DBL_PAT_0 = karidns_dbloader_%p_%m.profraw
 COV_CFLAGS  = $(COV_CONT_CFLAGS_$(COV_CONTINUOUS)) -Wno-unused-command-line-argument -fprofile-instr-generate -fcoverage-mapping -DKARIDNS_COVERAGE_LINKAGE -O0 -g -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -Wall -Wextra -std=c11 -fPIE $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
 COV_LDFLAGS = -fprofile-instr-generate -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS)
 COV_DIR     = coverage_raw
@@ -1075,6 +1081,9 @@ COV_BIN_OBJS += -object=test_coverage_sweep -object=test_coverage_sweep_dag -obj
 COV_BIN_OBJS += -object=test_db_stream -object=test_db_registry -object=test_pdns_reader -object=test_presigned
 COV_PG_OBJ != [ -n "$(DBPG_HAVE)" ] && printf -- '-object=test_db_pgsql' || true
 COV_BIN_OBJS += $(COV_PG_OBJ)
+# B11c: the loader itself (karidns_dbloader.c, with the drivers the build host has) and the SQLite3 driver / loader unit test
+COV_BIN_OBJS += -object=karidns-dbloader -object=test_db_sqlite3
+COV_DB_DRIVERS != if [ -n "$(DBPG_HAVE)" ]; then echo "sqlite3 postgresql"; else echo sqlite3; fi
 COV_BIN_OBJS += $(COV_FUZZ_OBJS)
 
 coverage-clean:
@@ -1084,7 +1093,9 @@ coverage-build:
 	@echo "=== Building KariDNS & Test Suite with Profile Coverage ==="
 	$(MAKE) clean
 	$(MAKE) -j$(COV_JOBS) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" all karicheck
-	$(MAKE) -j$(COV_JOBS) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_pgsql test_db_stream test_db_registry test_pdns_reader test_presigned
+	$(MAKE) -j$(COV_JOBS) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_pgsql test_db_sqlite3 test_db_stream test_db_registry test_pdns_reader test_presigned
+	@# B11c: the loader the integration tests start, instrumented, with the sqlite3 and (when libpq is there) the postgresql driver
+	$(MAKE) -j$(COV_JOBS) CC="clang" CFLAGS="$(COV_CFLAGS) -fprofile-instr-generate=$$(pwd)/$(COV_DIR)/$(COV_DBL_PAT_$(COV_CONTINUOUS))" LDFLAGS="$(COV_LDFLAGS) -fprofile-instr-generate=$$(pwd)/$(COV_DIR)/$(COV_DBL_PAT_$(COV_CONTINUOUS))" DB_DRIVERS="$(COV_DB_DRIVERS)" karidns-dbloader
 	$(MAKE) -j$(COV_JOBS) coverage-fuzz-build
 	@# ASan builds some integration tests use (built here in parallel, instead of
 	@# one by one in the middle of the suite)

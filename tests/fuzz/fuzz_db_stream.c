@@ -77,6 +77,12 @@ static void run_loader(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, ru
                 while (kdb_auto_status_entries_next(&it, &en)) {
                     if (en.view >= 3) abort();
                     mix(&r->sum, en.applied_seq + en.pending + en.error.len);
+                    /* B11: the optional tags 6..11 hold what the decoder promised: flags 0..3, an id of 1..64 printable bytes, ok 0/1 */
+                    if (en.flags > (KDB_AS_AUTO | KDB_AS_REQ)) abort();
+                    if (en.server_id.p && (en.server_id.len < 1 || en.server_id.len > 64)) abort();
+                    if (en.server_id.p) for (uint32_t q = 0; q < en.server_id.len; q++) if ((uint8_t)en.server_id.p[q] < 0x20 || (uint8_t)en.server_id.p[q] > 0x7E) abort();
+                    if (en.req_error.len > 255) abort();
+                    mix(&r->sum, en.req_generation + en.req_time + en.server_id.len + en.req_error.len + (en.req_ok ? 1u : 0u) + en.flags);
                     k++;
                 }
                 if (k != m.u.auto_status.n_entries) abort();

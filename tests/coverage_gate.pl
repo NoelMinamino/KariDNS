@@ -60,10 +60,12 @@ my %tier_c_files = map { $_ => 1 } (
     "tools/karicheck.c", "tools/karictl.c"
 );
 
-# Tier D (B10, design 8.6): the PostgreSQL driver.  Only gated when the PostgreSQL tests ran (test_db_pgsql found a server): without
-# data for the file the tier is reported as skipped, so a build or a CI run without PostgreSQL is not failed for it.
+# Tier D (B10, design 8.6; B11c, D-B11-4): the database layer: the PostgreSQL driver, and since B11 the SQLite3 driver and the loader
+# itself (karidns-dbloader and test_db_sqlite3, which includes karidns_dbloader.c, are counted).  Only gated when the database tests
+# ran (test_db_pgsql found a server, or the loader / SQLite3 unit test produced data): without data for the tier it is reported as
+# skipped, so a build or a CI run without them is not failed for it.
 my %tier_d_files = map { $_ => 1 } (
-    "dns_db_pgsql.c"
+    "dns_db_pgsql.c", "dns_db_sqlite3.c", "karidns_dbloader.c"
 );
 
 # Threshold definitions (Phase 1 vs Phase 2)
@@ -93,7 +95,7 @@ if ($json_file && -f $json_file) {
 if ($json_text eq "") {
     # Generate on the fly using llvm-cov
     my @objs = ();
-    for my $obj (qw(dag karictl karicheck test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_zone_image test_dag_format test_dag_iter test_dag_reassembly test_query_engine_protocol test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_pgsql test_db_stream test_db_registry test_pdns_reader test_presigned)) {
+    for my $obj (qw(dag karictl karicheck test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_zone_image test_dag_format test_dag_iter test_dag_reassembly test_query_engine_protocol test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_pgsql test_db_sqlite3 test_db_stream test_db_registry test_pdns_reader test_presigned karidns-dbloader)) {
         push @objs, "-object=./$obj" if -x "./$obj";
     }
     if (-d "coverage_fuzz") {

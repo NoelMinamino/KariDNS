@@ -12,6 +12,10 @@
  * the order of the profiles (C collation) and of the tag definitions, the change log cursor with interleaved transactions
  * (a transaction that took a lower seq commits later: nothing is skipped; an idle transaction in front does not hide later
  * commits), the gap rule, notifications (LISTEN, wait_fd, poll_version), a terminated backend maps to DB_ERR_RETRY.
+ * B11: karidns_reload_requests (reading order, NULL / named zone, force, generations pruned or rolled back are a gap, more rows than
+ * one query, a callback that stops, the INSERT lock that makes generations visible in order, LISTEN karidns_reload) and
+ * karidns_server_status (the upsert in its own READ WRITE transaction on a read only session, not inside a snapshot, a role
+ * without INSERT, the connection usable afterwards, a source without the tables, a terminated backend).
  *
  * Usage: test_db_pgsql [tests/db]   (the directory of pdns_schema.pgsql.sql)
  */
@@ -761,6 +765,267 @@ static void test_errors(void) {
     D->close(c);
 }
 
+/* ---- B11: reload requests and the status row ---- */
+typedef struct {
+    int n;
+    uint64_t gen[1200];
+    bool all[1200], force[1200];
+    char zone[12][32];
+    int stop_after;
+} qacc_t;
+static int cb_req(void *ud, const db_reload_row_t *r) {
+    qacc_t *a = ud;
+    if (a->n < 1200) {
+        a->gen[a->n] = r->generation;
+        a->all[a->n] = r->zone == NULL;
+        a->force[a->n] = r->force;
+    }
+    if (a->n < 12) snprintf(a->zone[a->n], sizeof(a->zone[0]), "%s", r->zone ? r->zone : "<NULL>");
+    a->n++;
+    return a->stop_after && a->n >= a->stop_after;
+}
+
+static void test_requests(void) {
+    printf("reload requests (B11)\n");
+    db_conn_t *c = open_drv(NULL);
+    if (!c) return;
+    db_schema_info_t si;
+    memset(&si, 0xff, sizeof(si));
+    CHECK(D->check_schema(c, &si) == 0);
+    CHECK(si.has_reload_requests && si.has_server_status);
+    uint64_t mx = 99;
+    CHECK(D->requests_max(c, &mx) == 0 && mx == 0);
+
+    /* the order, a NULL zone (all), a named zone, force */
+    Q("INSERT INTO karidns_reload_requests DEFAULT VALUES");
+    Q("INSERT INTO karidns_reload_requests (zone) VALUES ('a.test')");
+    Q("INSERT INTO karidns_reload_requests (zone, force) VALUES ('b.test', true)");
+    qacc_t *a = calloc(1, sizeof(*a));
+    uint64_t last = 0;
+    bool gap = true;
+    CHECK(D->requests_max(c, &mx) == 0 && mx == 3);
+    CHECK(D->reload_requests(c, 0, cb_req, a, &last, &gap) == 0);
+    CHECK_MSG(a->n == 3 && last == 3 && !gap, "n=%d last=%llu gap=%d", a->n, (unsigned long long)last, gap);
+    CHECK(a->gen[0] == 1 && a->gen[1] == 2 && a->gen[2] == 3);
+    CHECK(a->all[0] && !a->all[1] && !a->all[2]);
+    CHECK(!strcmp(a->zone[1], "a.test") && !strcmp(a->zone[2], "b.test"));
+    CHECK(!a->force[0] && !a->force[1] && a->force[2]);
+    memset(a, 0, sizeof(*a));
+    CHECK(D->reload_requests(c, 1, cb_req, a, &last, &gap) == 0 && a->n == 2 && last == 3 && !gap && a->gen[0] == 2);
+    memset(a, 0, sizeof(*a));
+    CHECK(D->reload_requests(c, 3, cb_req, a, &last, &gap) == 0 && a->n == 0 && last == 3 && !gap);
+    memset(a, 0, sizeof(*a));
+    a->stop_after = 1;
+    CHECK(D->reload_requests(c, 0, cb_req, a, &last, &gap) == DB_STOPPED && a->n == 1 && last == 1);
+
+    /* a request rolled back leaves a hole: the first row after it is not after + 1 */
+    Q("BEGIN");
+    Q("INSERT INTO karidns_reload_requests (zone) VALUES ('lost.test')");
+    Q("ROLLBACK");
+    Q("INSERT INTO karidns_reload_requests (zone) VALUES ('c.test')");
+    memset(a, 0, sizeof(*a));
+    CHECK(D->reload_requests(c, 3, cb_req, a, &last, &gap) == 0 && a->n == 1 && a->gen[0] == 5 && last == 5 && gap);
+    memset(a, 0, sizeof(*a));
+    CHECK(D->reload_requests(c, 4, cb_req, a, &last, &gap) == 0 && a->n == 1 && !gap);
+
+    /* the INSERT trigger keeps the newest 1000; more rows than one query (500) are all delivered */
+    Q("INSERT INTO karidns_reload_requests (zone) SELECT 'bulk' || g || '.test' FROM generate_series(1, 1100) g");
+    char v[64];
+    qv(g_admin, "SELECT count(*) FROM karidns_reload_requests", v, sizeof(v));
+    CHECK_MSG(!strcmp(v, "1000"), "pruned to %s rows", v);
+    CHECK(D->requests_max(c, &mx) == 0 && mx == 1105);
+    memset(a, 0, sizeof(*a));
+    CHECK(D->reload_requests(c, 5, cb_req, a, &last, &gap) == 0);
+    CHECK_MSG(a->n == 1000 && last == 1105 && gap && a->gen[0] == 106 && a->gen[999] == 1105, "n=%d first=%llu last=%llu gap=%d", a->n,
+              (unsigned long long)a->gen[0], (unsigned long long)last, gap);
+    memset(a, 0, sizeof(*a));
+    CHECK(D->reload_requests(c, 1104, cb_req, a, &last, &gap) == 0 && a->n == 1 && last == 1105 && !gap);
+    /* a zone name with a byte the callback must see as it is (untrusted text; the loader checks it) */
+    Q("INSERT INTO karidns_reload_requests (zone) VALUES (E'x\\ny.test')");
+    memset(a, 0, sizeof(*a));
+    CHECK(D->reload_requests(c, 1105, cb_req, a, &last, &gap) == 0 && a->n == 1 && !strcmp(a->zone[0], "x\ny.test"));
+
+    /* not inside a snapshot (the read snapshot must not be mixed with anything) */
+    CHECK(D->begin_snapshot(c) == 0);
+    CHECK(D->reload_requests(c, 0, cb_req, a, &last, &gap) == -1);
+    CHECK_HAS(D->errmsg(c), "snapshot");
+    CHECK(D->requests_max(c, &mx) == -1);
+    db_status_t st0 = { 1, true, "", "ns1" };
+    CHECK(D->report_status(c, &st0) == -1);
+    CHECK_HAS(D->errmsg(c), "snapshot");
+    D->end_snapshot(c);
+    free(a);
+
+    /* LISTEN karidns_reload: the notification of an INSERT wakes the socket; karidns_changes notifications do not */
+    CHECK(D->watch_requests(c) == 0);
+    int fd = D->wait_fd(c);
+    CHECK(fd >= 0);
+    bool changed = true;
+    CHECK(D->drain_notifications(c, &changed) == 0 && !changed);
+    Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (2, 'rq1.b.test', 'A', '192.0.2.31', 60)");
+    usleep(200000);
+    CHECK(D->drain_notifications(c, &changed) == 0 && !changed);
+    Q("INSERT INTO karidns_reload_requests DEFAULT VALUES");
+    struct pollfd pf = { fd, POLLIN, 0 };
+    CHECK_MSG(poll(&pf, 1, 5000) == 1, "the socket becomes readable");
+    CHECK(D->drain_notifications(c, &changed) == 0 && changed);
+    D->close(c);
+
+    /* a connection that listens to karidns_changes cannot be switched */
+    c = open_drv(NULL);
+    if (c) {
+        CHECK(D->check_schema(c, &si) == 0);
+        uint64_t ver = 0;
+        bool repl = false;
+        CHECK(D->poll_version(c, &ver, &repl) == 0);
+        CHECK(D->watch_requests(c) == -1);
+        D->close(c);
+    }
+
+    /* requesters take the lock in the trigger and keep it until they commit: generations become visible in order */
+    PGconn *w1 = connect_db(g_db), *w2 = connect_db(g_db);
+    if (w1 && w2) {
+        qx(w1, "BEGIN");
+        qx(w1, "INSERT INTO karidns_reload_requests (zone) VALUES ('w1.test')");
+        qx(w2, "SET lock_timeout = '300ms'");
+        PGresult *r = PQexec(w2, "INSERT INTO karidns_reload_requests (zone) VALUES ('w2.test')");
+        CHECK_MSG(r && PQresultStatus(r) == PGRES_FATAL_ERROR && PQresultErrorField(r, PG_DIAG_SQLSTATE) &&
+                      !strcmp(PQresultErrorField(r, PG_DIAG_SQLSTATE), "55P03"),
+                  "the second requester waits for the first to commit");
+        PQclear(r);
+        qx(w1, "COMMIT");
+        CHECK(qx(w2, "INSERT INTO karidns_reload_requests (zone) VALUES ('w2.test')"));
+        qv(g_admin, "SELECT (SELECT generation FROM karidns_reload_requests WHERE zone = 'w2.test') > (SELECT generation FROM karidns_reload_requests WHERE zone = 'w1.test')", v, sizeof(v));
+        CHECK_MSG(!strcmp(v, "t"), "the generation order is the commit order");
+    }
+    if (w1) PQfinish(w1);
+    if (w2) PQfinish(w2);
+}
+
+static void status_row(const char *sid, char *out, size_t cap) {
+    char sql[300];
+    snprintf(sql, sizeof(sql), "SELECT generation || '|' || ok || '|' || failed_zones || '|' || (applied_at > now() - interval '1 minute') FROM karidns_server_status WHERE server_id = '%s'", sid);
+    qv(g_admin, sql, out, cap);
+}
+
+static void test_status(void) {
+    printf("server status (B11)\n");
+    db_conn_t *c = open_drv(NULL);
+    if (!c) return;
+    db_schema_info_t si;
+    CHECK(D->check_schema(c, &si) == 0);
+    /* the session is read only by default; the status write is a READ WRITE transaction of its own */
+    PGresult *r = PQexec(c->pg, "SHOW default_transaction_read_only");
+    CHECK(r && PQresultStatus(r) == PGRES_TUPLES_OK && !strcmp(PQgetvalue(r, 0, 0), "on"));
+    PQclear(r);
+    db_status_t s1 = { 7, true, "", "ns1" };
+    CHECK_MSG(D->report_status(c, &s1) == 0, "%s", D->errmsg(c));
+    char row[600];
+    status_row("ns1", row, sizeof(row));
+    CHECK_MSG(!strcmp(row, "7|true||true"), "row: %s", row);
+    /* upsert: the same server id, another outcome, with the lines of failed zones; another server id is another row */
+    db_status_t s2 = { 9, false, "z.test.: reason one\nw.test.: reason \\010 two", "ns1" };
+    CHECK(D->report_status(c, &s2) == 0);
+    status_row("ns1", row, sizeof(row));
+    CHECK_MSG(!strcmp(row, "9|false|z.test.: reason one\nw.test.: reason \\010 two|true"), "row: %s", row);
+    db_status_t s3 = { 4, true, NULL, "ns2" };
+    CHECK(D->report_status(c, &s3) == 0);
+    status_row("ns2", row, sizeof(row));
+    CHECK_MSG(!strcmp(row, "4|true||true"), "row: %s", row);
+    qv(g_admin, "SELECT count(*) FROM karidns_server_status", row, sizeof(row));
+    CHECK(!strcmp(row, "2"));
+    /* a value that is not text (an invalid UTF-8 byte): the server refuses it, the transaction is rolled back, the connection works on */
+    char enc[32];
+    qv(g_admin, "SHOW server_encoding", enc, sizeof(enc));
+    db_status_t sbad = { 10, false, "\xff\xfe: bad", "ns1" };
+    int rc = D->report_status(c, &sbad);
+    if (strcmp(enc, "SQL_ASCII") != 0) {                  /* a SQL_ASCII database takes any byte */
+        CHECK_MSG(rc == -1, "invalid UTF-8: %d", rc);
+        status_row("ns1", row, sizeof(row));
+        CHECK_MSG(!strncmp(row, "9|false|", 8), "the failed write changed nothing: %s", row);
+    }
+    CHECK(D->report_status(c, &s1) == 0);
+    /* the server id: 1..64 bytes */
+    db_status_t se = { 1, true, "", "" };
+    CHECK(D->report_status(c, &se) == -1);
+    char longid[80];
+    memset(longid, 'a', 65);
+    longid[65] = '\0';
+    db_status_t sl = { 1, true, "", longid };
+    CHECK(D->report_status(c, &sl) == -1);
+    longid[64] = '\0';
+    CHECK(D->report_status(c, &sl) == 0);
+    Q("DELETE FROM karidns_server_status WHERE server_id <> 'ns1'");
+
+    /* a role that may read but not write (the loader role before the script's grant): permission denied, not retryable, and the
+     * connection is usable afterwards; then with INSERT, UPDATE the same session writes although it is read only by default */
+    char role[64], sql[300];
+    snprintf(role, sizeof(role), "karidns_test_st_%d", (int)getpid());
+    snprintf(sql, sizeof(sql), "CREATE ROLE %s", role);
+    PGresult *cr = PQexec(g_maintc, sql);
+    bool have_role = PQresultStatus(cr) == PGRES_COMMAND_OK;
+    PQclear(cr);
+    if (!have_role) {
+        printf("  [SKIP] the PostgreSQL role may not create roles: the privilege cases are not tested\n");
+    } else {
+        snprintf(sql, sizeof(sql), "GRANT SELECT ON ALL TABLES IN SCHEMA public TO %s", role);
+        Q(sql);
+        snprintf(sql, sizeof(sql), "SET ROLE %s", role);
+        CHECK(qx(c->pg, sql));
+        int rc2 = D->report_status(c, &s2);
+        CHECK_MSG(rc2 == -1, "no INSERT privilege: %d", rc2);
+        CHECK_HAS(D->errmsg(c), "permission denied");
+        CHECK(strstr(D->errmsg(c), "retry later") == NULL);
+        uint64_t mx = 0;
+        CHECK(D->requests_max(c, &mx) == 0);                       /* the aborted transaction was rolled back */
+        status_row("ns1", row, sizeof(row));
+        CHECK_MSG(!strncmp(row, "7|true|", 7), "nothing written: %s", row);
+        CHECK(qx(c->pg, "RESET ROLE"));
+        snprintf(sql, sizeof(sql), "GRANT INSERT, UPDATE ON karidns_server_status TO %s", role);
+        Q(sql);
+        snprintf(sql, sizeof(sql), "SET ROLE %s", role);
+        CHECK(qx(c->pg, sql));
+        CHECK_MSG(D->report_status(c, &s2) == 0, "%s", D->errmsg(c));
+        status_row("ns1", row, sizeof(row));
+        CHECK_MSG(!strncmp(row, "9|false|", 8), "written with INSERT, UPDATE: %s", row);
+        CHECK(qx(c->pg, "RESET ROLE"));
+        snprintf(sql, sizeof(sql), "DROP OWNED BY %s", role);
+        Q(sql);
+        snprintf(sql, sizeof(sql), "DROP ROLE %s", role);
+        PQclear(PQexec(g_maintc, sql));
+    }
+
+    /* a source without the tables */
+    Q("CREATE SCHEMA karidns_test_noreq");
+    Q("CREATE TABLE karidns_test_noreq.domains (id SERIAL PRIMARY KEY, name VARCHAR(255) NOT NULL, master VARCHAR(128), last_check INT, type TEXT NOT NULL, notified_serial BIGINT, account VARCHAR(40), options TEXT, catalog VARCHAR(255))");
+    Q("CREATE TABLE karidns_test_noreq.records (id BIGSERIAL PRIMARY KEY, domain_id INT, name VARCHAR(255), type VARCHAR(10), content VARCHAR(65535), ttl INT, prio INT, disabled BOOL, ordername VARCHAR(255), auth BOOL)");
+    Q("CREATE TABLE karidns_test_noreq.domainmetadata (id SERIAL PRIMARY KEY, domain_id INT, kind VARCHAR(32), content TEXT)");
+    Q("CREATE TABLE karidns_test_noreq.cryptokeys (id SERIAL PRIMARY KEY, domain_id INT, flags INT, active BOOL, published BOOL, content TEXT)");
+    db_conn_t *c2 = open_drv("karidns_test_noreq");
+    if (c2) {
+        CHECK(D->check_schema(c2, &si) == 0);
+        CHECK_MSG(!si.has_reload_requests && !si.has_server_status, "no tables, no flags");
+        uint64_t mx = 0, lg_ = 0;
+        bool g_ = false;
+        CHECK(D->requests_max(c2, &mx) == DB_ERR_UNAVAILABLE);
+        CHECK(D->reload_requests(c2, 0, cb_req, NULL, &lg_, &g_) == DB_ERR_UNAVAILABLE);
+        CHECK(D->report_status(c2, &s1) == DB_ERR_UNAVAILABLE);
+        CHECK_HAS(D->errmsg(c2), "does not exist");
+        D->close(c2);
+    }
+    Q("DROP SCHEMA karidns_test_noreq CASCADE");
+
+    /* the backend is terminated from outside: a transient error */
+    char pid[32];
+    qv(c->pg, "SELECT pg_backend_pid()", pid, sizeof(pid));
+    snprintf(sql, sizeof(sql), "SELECT pg_terminate_backend(%s)", pid);
+    Q(sql);
+    usleep(300000);
+    CHECK(D->report_status(c, &s1) == DB_ERR_RETRY);
+    CHECK_HAS(D->errmsg(c), "retry later");
+    D->close(c);
+}
+
 /* ------------------------------------------------------------------ main */
 static void cleanup(void) {
     if (g_admin) PQfinish(g_admin);
@@ -843,6 +1108,8 @@ int main(int argc, char **argv) {
     test_changes();
     test_notify();
     test_errors();
+    test_requests();
+    test_status();
     test_v1_and_migration();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
