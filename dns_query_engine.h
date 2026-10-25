@@ -87,7 +87,6 @@ typedef struct resolve_checkpoint {
     uint16_t arcount;
 } resolve_checkpoint_t;
 
-void build_zone_response_cache(zone_version_t *arena, server_config_t *cfg, const char *view_name, const char *domain);
 /* 共有の応答キャッシュを bytes 以内で確保する (以前の表は捨てる)。0 なら使わない。確保した大きさを返す */
 size_t response_cache_init(size_t bytes);
 /* ゾーンのデータを公開するたび (と兄弟ゾーンが変わるたび) に使う、一意の版の番号 */
@@ -162,7 +161,7 @@ ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
                         const uint8_t *query, size_t query_len,
                         uint8_t *resp_out, size_t resp_out_cap,
                         uint32_t timeout_ms);
-int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t req_len,
+int dispatch_forward_zone(const zone_config_t *zcfg, const uint8_t *req, size_t req_len,
                           uint8_t *res, size_t max_res_len);
 bool nsec_covers_name(const zone_image_t *img, uint32_t rr, const char *name);
 uint32_t find_covering_nsec(const zone_image_t *img, const char *name);

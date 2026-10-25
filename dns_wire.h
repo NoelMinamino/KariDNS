@@ -113,6 +113,10 @@ void *arena_alloc(zone_arena_t *arena, size_t size);
 // KariDNS 拡張定数 (Private Use 範囲: RFC 6895 / IANA DNS Parameters)
 // ============================================================================
 #define DNS_CLASS_KARIDNS_EXT           65302
+/* B9a: PowerDNS's ALIAS and LUA records, TYPE 65401 / 65402 of CLASS IN (design 3.6b).  The Extended AXFR records below use the
+ * same type numbers in CLASS 65302, so a record is told apart by the pair (type, class), never by the type alone. */
+#define DNS_TYPE_PDNS_ALIAS             65401
+#define DNS_TYPE_PDNS_LUA               65402
 #define DNS_TYPE_KARIDNS_LOC_STATE      65401
 #define DNS_TYPE_KARIDNS_ECS_STATE      65402
 #define DNS_TYPE_KARIDNS_LOC_TAGDEF     65403
@@ -120,12 +124,20 @@ void *arena_alloc(zone_arena_t *arena, size_t size);
 #define DNS_TYPE_KARIDNS_TINYDNS_LOCDEF 65405
 #define DNS_TYPE_KARIDNS_TINYDNS_WRAP   65406
 #define DNS_TYPE_KARIDNS_ECS_TRUSTED    65407
+#define DNS_TYPE_KARIDNS_SETTINGS       65408   /* KARIDNS_EXT_VERSION 3: the zone settings text of the primary */
+#define DNS_TYPE_KARIDNS_SOA_SET        65409   /* KARIDNS_EXT_VERSION 3: the apex SOA RRs travel in the body */
 
 #define EDNS_OPTION_KARIDNS_EXT         65153
 #define EDNS_OPTION_EXPIRE              9     /* RFC 7314 */
 /* 2: TYPE 65405 (tinydns location) carries the prefix length in bits + 4-octet network.
- * Peers with a different version fall back to a standard AXFR. */
-#define KARIDNS_EXT_VERSION             2
+ * 3 (B8t-2): every apex SOA RR of a zone with several or restricted SOAs travels in the body (TYPE 65409), and the zone
+ *    settings of the primary travel in TYPE 65408.
+ * A requester sends the version it speaks.  A primary answers version 2 and 3 requests with a stream of that version
+ * (KARIDNS_EXT_VERSION_MIN is the oldest it still speaks); a secondary accepts the same two versions in the answer.  Any other
+ * version falls back to a standard AXFR. */
+#define KARIDNS_EXT_VERSION             3
+#define KARIDNS_EXT_VERSION_MIN         2
+#define KARIDNS_EXT_VERSION_OK(v)       ((v) >= KARIDNS_EXT_VERSION_MIN && (v) <= KARIDNS_EXT_VERSION)
 
 // ECS / Location サブネットタグ構造体
 typedef struct {
@@ -363,6 +375,13 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
 // レコード型変換・解析
 const char *get_type_str(uint16_t type, zone_arena_t *arena);
 int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offset, zone_arena_t *arena, dns_record_t *rec, uint16_t *type_out);
+/* RFC 3597 5: NULL if rd[0..len) is valid RDATA for `type` (the decoder a secondary applies to it accepts it and the
+ * record writes back as the same octets, no compression), else a static reason.  Types without a decoder accept
+ * any octets.  Not for the query path (allocates). */
+const char *dns_generic_rdata_check(uint16_t type, const uint8_t *rd, size_t len);
+/* RFC 3597 5: decode "\# <length> <hex>..." (tok[0] = "\#" or "#") into out (>= 65535 octets); *outlen = the octets.
+ * NULL on success, else a static message.  Used by the zone parser and by dag's UPDATE operands. */
+const char *dns_generic_rdata_parse(uint16_t type, char *const *tok, int ntok, uint8_t *out, size_t *outlen);
 
 // TSIG
 bool tsig_algorithm_is_supported(const char *alg);
@@ -456,6 +475,10 @@ size_t dns_label_to_text(const uint8_t *label, size_t len, char *out, size_t cap
 // 戻り値は strlen(out)。不正なエスケープ、空ラベル、63 オクテット超のラベル、
 // 255 オクテット超の名前 (RFC 1035 §2.3.4)、バッファ不足なら (size_t)-1。
 size_t dns_name_normalize(const char *in, char *out, size_t cap);
+// 正規形の名前をゾーンファイルの 1 トークンとして書く。正規形がエスケープしない文字のうち
+// ゾーンファイルの字句解析で意味を持つもの (RFC 1035 §5.1: ';' '"' '(' ')'、行頭の '$'、'@') にも
+// '\' を付ける。戻り値は strlen(out)、入りきらなければ (size_t)-1。out の大きさは 2 * strlen(name) + 1 あれば足りる。
+size_t dns_name_zone_token(const char *name, char *out, size_t cap);
 
 /* メッセージ中の TSIG RR (RFC 8945 §4.2) */
 typedef struct {
@@ -606,6 +629,65 @@ typedef struct {
     uint64_t wirecache_entries;
     uint64_t wirecache_bytes;
 } zone_observatory_snapshot_t;
+
+/* ---- Extended AXFR records (KariDNS extension): the one encoder, shared by Extended AXFR out (dns_axfr_ixfr.c, from the
+ * zone image or the IXFR history) and karidns-dbloader (dns_pdns_reader.c, from the parsed zone).
+ *
+ * The records have CLASS 65302 and TYPE 65401-65409, both in the private use range (RFC 6895 section 3.1, 3.2); their RDATA is
+ * opaque to everybody else, so it is never compressed (RFC 3597 section 4).  All of them are owned by the zone apex.
+ *   65401 LOC_STATE  RDATA = tag text (empty = no tag): the $LOCATION in force for the RRs that follow
+ *   65402 ECS_STATE  the same for $ECS-SUBNET
+ *   65403 LOC_TAGDEF, 65404 ECS_TAGDEF  pack_tag_def_rdata(): tag NUL, u16 n, n x (CIDR text NUL)
+ *   65405 TINYDNS_LOCDEF  code(2) + prefix length in bits(1) + network(4)  (KARIDNS_EXT_VERSION 2)
+ *   65406 TINYDNS_WRAP    see wrap_tinydns_wire()
+ *   65407 ECS_TRUSTED     u8 n, n x (u8 length, address / prefix text)
+ *   65408 SETTINGS        the zone settings of the primary as text (zone statement syntax, the statements of
+ *                           db_settings_parse(); KARIDNS_EXT_VERSION 3), at most KARIDNS_SETTINGS_MAX octets
+ *   65409 SOA_SET         u8 flags (bit 0: the opening and closing SOA is not zone data), u16 n: the number of apex SOA RRs
+ *                           that follow in the body, each as a 65406 wrapper (KARIDNS_EXT_VERSION 3)
+ * The sender emits, after the first SOA: the tag definitions, the trusted resolvers, the location definitions; then every RR
+ * (a tinydns RR with a time stamp or a location as a 65406 wrapper), with the state records in front of the RR that changes
+ * the tag in force; at the end the tags are reset; then the last SOA.
+ * Version 3 (a zone with several or restricted apex SOA RRs): the opening and closing SOA is the reference SOA; right after the
+ * opening SOA comes SOA_SET (n), and every apex SOA RR is a body RR, always as a 65406 wrapper (with its tinydns attributes, if
+ * any, and the tags in force), so that the receiver does not take it for the end of the transfer and does not store the frame.
+ * Version 3 may also carry one SETTINGS record after the opening SOA (or SOA_SET). */
+#define KARIDNS_SETTINGS_MAX            32768u
+#define KARIDNS_SOA_SET_MAX             4096u   /* the most apex SOA RRs one zone may have (the limit of the tinydns data parser's locations) */
+typedef int (*xext_emit_fn)(void *ud, const dns_record_t *rec);   /* write one RR into the message stream; < 0 = failure */
+
+typedef struct {
+    xext_emit_fn emit;
+    void *ud;
+    const char *zone;           /* owner of the records this encoder makes (the caller keeps it alive) */
+    const char *cur_loc;        /* the tags in force (pointers into the caller's data); NULL = none */
+    const char *cur_ecs;
+    uint8_t *scratch;           /* RDATA of the definitions: allocated on first use (64 KiB), freed by xext_free() */
+} xext_t;
+
+void xext_init(xext_t *x, const char *zone, xext_emit_fn emit, void *ud);
+void xext_free(xext_t *x);
+/* write the state records that make (loc_tag, ecs_tag) the tags in force (none when they already are; tags compare
+ * case-insensitively, as the zone file parser's tag matching does) */
+int xext_select(xext_t *x, const char *loc_tag, const char *ecs_tag);
+/* the end of a transfer: reset the tags that are still in force */
+int xext_finish(xext_t *x);
+int xext_emit_tagdef(xext_t *x, bool ecs, const ecs_tag_def_t *def);
+int xext_emit_trusted(xext_t *x, char *const *list, int count);
+int xext_emit_locdef(xext_t *x, const char code[2], uint8_t prefix_bits, const uint8_t network[4]);
+/* version 3: SOA_SET (the frame SOA is not zone data; n apex SOA RRs follow as wrappers) and SETTINGS */
+int xext_emit_soa_set(xext_t *x, uint16_t n);
+int xext_emit_settings(xext_t *x, const char *text, size_t len);
+/* TYPE 65401-65409 RDATA helpers */
+size_t pack_tag_def_rdata(uint8_t *buf, size_t buf_cap, const ecs_tag_def_t *def);
+/* Does the RR carry a tinydns attribute (location code or time stamp) that must travel as a 65406 wrapper? */
+static inline bool xext_rr_is_tinydns(const char loc[2], int64_t ttd) { return loc[0] != 0 || loc[1] != 0 || ttd != 0; }
+/* The 65406 wrapper of an RR (tinydns location, time stamp, countdown flag): RDATA = original TYPE(2) CLASS(2) TTL(4)
+ * location(2) ttd(8, big endian) flags(1, bit0 countdown) RDLENGTH(2) RDATA; the RDATA is the one serialize_dns_record()
+ * wrote, compressed against the RR's own owner name.  false when it does not fit wrap_buf_cap. */
+bool wrap_tinydns_wire(const uint8_t *tmp_wire, uint16_t tmp_off, const char loc[2], int64_t tinydns_ttd, bool countdown,
+                       const char *name, uint32_t ttl_value, dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap);
+bool wrap_tinydns_record(const dns_record_t *rec, dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap);
 
 // 最初の質問 (UPDATE ではゾーンセクション) の名前に圧縮ポインタがあるか (X-15)。メッセージ最初の名前の
 // ポインタは前に現れた名前を指せない (RFC 1035 §4.1.4) ので、そのような要求は FORMERR にする。

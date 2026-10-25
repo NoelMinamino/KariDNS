@@ -372,7 +372,7 @@ int main(void) {
         create_file("tests_inc_tmp/unknown_blocks.conf",
                     "unknown-top-block { opt1 \"val\"; nested { opt2 \"val\"; }; };\n"
                     "key \"test-key\" { unknown-prop \"val\"; algorithm \"hmac-sha256\"; secret \"k7e8vW8f0W4v9B+5Y8f0W4v9B+5Y8f0W4v9B+5Y8f0U=\"; };\n"
-                    "zone \"example.com\" { type master; file \"example.com.zone\"; unknown-zone-prop \"ignore\"; };\n");
+                    "zone \"example.com\" { type master; file \"example.com.zone\"; zone-statistics yes; inline-signing { a; }; };\n");
 
         char *buf = read_entire_file("tests_inc_tmp/unknown_blocks.conf", NULL, NULL);
         assert(buf != NULL);
@@ -384,6 +384,43 @@ int main(void) {
         assert(cfg.keys != NULL && strcmp(cfg.keys->name, "test-key") == 0);
         assert(cfg.views->zones != NULL && strcmp(cfg.views->zones->domain, "example.com.") == 0);
         free_server_config_fields(&cfg);
+        printf("  -> PASS (BIND-only zone options are skipped with a warning)\n");
+    }
+
+    // Test 11b (B6a, open item 2): a statement that neither KariDNS nor BIND knows inside zone { } / view { } is an error
+    {
+        printf("[Test 11b] Unknown statements inside zone { } and view { } are configuration errors...\n");
+        static const char *const bad[] = {
+            "zone \"example.com\" { type master; file \"example.com.zone\"; unknown-zone-prop \"ignore\"; };\n",
+            "zone \"example.com\" { type master; file \"example.com.zone\"; alow-transfer { any; }; };\n",
+            "zone \"example.com\" { type master; file \"example.com.zone\"; notify-retry-foo 3; };\n",
+            "view \"v\" { match-clients { any; }; bogus-view-option yes; zone \"example.com\" { type master; file \"example.com.zone\"; }; };\n",
+            "view \"v\" { zone \"example.com\" { type master; file \"example.com.zone\"; nonsense { a; b; }; }; };\n",
+        };
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+            server_config_t cfg;
+            memset(&cfg, 0, sizeof(cfg));
+            int res = parse_named_conf_ext(bad[i], "bad_unknown.conf", &cfg);
+            if (res == 0) {
+                printf("  [FAIL] accepted: %s", bad[i]);
+                assert(0);
+            }
+            free_server_config_fields(&cfg);
+        }
+        static const char *const good[] = {
+            "view \"v\" { match-clients { any; }; recursion no; allow-query { any; }; zone \"example.com\" { type master; file \"example.com.zone\"; notify no; }; };\n",
+            "zone \"example.com\" { type master; file \"example.com.zone\"; allow-query { any; }; dnssec-policy default; max-journal-size 1M; };\n",
+        };
+        for (size_t i = 0; i < sizeof(good) / sizeof(good[0]); i++) {
+            server_config_t cfg;
+            memset(&cfg, 0, sizeof(cfg));
+            int res = parse_named_conf_ext(good[i], "good_bind_only.conf", &cfg);
+            if (res != 0) {
+                printf("  [FAIL] refused: %s", good[i]);
+                assert(0);
+            }
+            free_server_config_fields(&cfg);
+        }
         printf("  -> PASS\n");
     }
 

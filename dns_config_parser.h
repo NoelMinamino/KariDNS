@@ -3,6 +3,9 @@
 
 #define KARIDNS_MAX_CONFIG_FILE_SIZE (256 * 1024 * 1024)
 
+/* view 名の上限 (NUL 込みのバイト数)。zone_db_entry_t などが view 名をこの長さの配列で持つ */
+#define KARIDNS_VIEW_NAME_MAX 64
+
 /* tcp-mss / tcp-window / udp-bufsize と zone-tcp-* / zone-udp-bufsize の許容範囲 */
 #define KARIDNS_TCP_MSS_MIN      536                 /* RFC 1122 §3.3.3 の既定 MSS */
 #define KARIDNS_TCP_MSS_MAX      65495               /* 65535 - IPv4/TCP ヘッダ 40 */
@@ -30,6 +33,9 @@ typedef struct {
   char *ip;
   int port;
 } ip_port_t;
+
+/* B9a: the most alias-resolver addresses of a zone, of options, or of the database block */
+#define KARIDNS_ALIAS_RESOLVERS_MAX 8
 
 typedef struct {
   bool configured;
@@ -154,16 +160,65 @@ typedef struct zone_ext {
 
   bool ixfr_history_set;     /* ixfr-history をこのゾーンで指定した */
   uint8_t ixfr_history;      /* その値 (0..IXFR_HISTORY_MAX) */
+
+  /* --- transfer-acl-match / update-acl-match (B7a, beta design D14): which kinds of entry of an ACL must match.
+   * ACL_MATCH_DEFAULT = the meaning karidns.conf always had: allow-transfer with addresses and keys = address AND key,
+   * allow-update = address OR key.  The DB loader writes ACL_MATCH_ANY for transfers and ACL_MATCH_ALL for updates, which
+   * is what PowerDNS does. --- */
+  uint8_t transfer_acl_match;
+  uint8_t update_acl_match;
+  /* --- set by the code that installs the settings of a DB zone, never by text: the ACLs of this zone also have to pass
+   * options { database { acl-ceiling } } (dns_tsig_acl.c) --- */
+  bool db_acl_ceiling;
+  /* --- B8t-2: primary-settings no; ignores the settings the primary sends with the zone (Extended AXFR v3).  Default: they are used. --- */
+  bool primary_settings_off;
+  /* --- B9a: alias-resolver { <ip> [port <n>]; ... };  the resolvers that expand the ALIAS records of this zone (dns_alias.h).  A zone value
+   * replaces the options value and the options { database { alias-resolver } } value.  Never sent with Extended AXFR (it names a resolver
+   * of this server's own network). --- */
+  ip_port_t *alias_resolvers;
+  int alias_resolvers_count;
 } zone_ext_t;
+
+/* transfer-acl-match / update-acl-match values (zone_ext_t) */
+enum { ACL_MATCH_DEFAULT = 0, ACL_MATCH_ANY = 1, ACL_MATCH_ALL = 2 };
 
 typedef struct zone_config {
   char *domain;
   char *file;
   char *type;
   bool is_catalog;
+  bool ext_shared; /* ext points to the zone_ext_t at the start of a zone_ext_shared_t (reference counted, DB zones) */
   zone_ext_t *ext; /* NULL = 全オプション既定。直接読まず zext() を使う */
   struct zone_config *next;
 } zone_config_t;
+
+/* B7a: the settings of DB zones are interned: zones whose settings text is the same share one parsed zone_ext_t.  The
+ * object is reference counted; the intern table (dns_snapshot_rcu.c) holds one reference, every zone_config_t with
+ * ext_shared one more.  free_zone_config() drops that reference. */
+typedef struct zone_ext_shared {
+  zone_ext_t ext;               /* must stay first */
+  _Atomic uint32_t refs;
+  struct zone_ext_shared *next; /* intern table chain */
+  uint64_t hash;
+  char *key;                    /* profile name, NUL, profile text, NUL, zone text: what makes two settings the same */
+  size_t key_len;
+  char profile[256];            /* "" = none */
+} zone_ext_shared_t;
+
+zone_ext_shared_t *zone_ext_shared_ref(zone_ext_shared_t *s);
+void zone_ext_shared_unref(zone_ext_shared_t *s);
+
+/* Restricted parse of the settings text of a DB zone (beta design 1.3, 3.5).  The text is hostile: only the statements the
+ * loader can write are accepted (allow-transfer, allow-update, also-notify, tsig-key, notify-retries, notify-retry-interval,
+ * notify-retry-backoff, ixfr-history, additional-from-auth, disable-auto-tc-flag, zone-udp-bufsize, zone-tcp-mss,
+ * zone-tcp-window, zone-tcp-sndbuf, transfer-acl-match, update-acl-match, and (B7b) masters / primaries: IP addresses with an optional
+ * port, at most 32, for a database secondary zone); everything else (file, type, program*,
+ * include, unknown) is an error.  A statement that is written twice replaces the first (so the text of a profile followed by
+ * the text of a zone is "the zone overrides the profile, statement by statement").  The ACL entries must be addresses,
+ * prefixes, any or none ("!" allowed); in allow-update a name that is not an address is a TSIG key name.  Named ACLs of
+ * karidns.conf are not available.  On success returns a new zone_ext_shared_t (refs 1, profile/key empty) whose ext has
+ * db_acl_ceiling set; NULL with a one-line reason in err.  key_text/profile/key are the caller's to fill. */
+zone_ext_shared_t *db_settings_parse(const char *text, size_t len, char *err, size_t errlen);
 
 /* 全オプション既定 (全ゼロ) の共有ブロック。読み取り専用 */
 extern const zone_ext_t zone_ext_default;
@@ -242,8 +297,57 @@ typedef struct view_config {
   acl_entry_t *match_clients_parsed;
   zone_config_t *zones;
   zone_cfg_index_t zone_index; /* zones の索引。手で組んだ設定 (テスト) では空で、線形探索になる */
+  /* beta design 7.1: DB zone source of this view. NULL/false = the global source of options { database { } } */
+  char *database_file;         /* "database-file": sqlite3, this view's own file */
+  char *database_schema;       /* "database-schema": postgresql, this view's own schema */
+  bool database_none;          /* "database none;": this view takes no DB zones */
   struct view_config *next;
 } view_config_t;
+
+/* options { database { ... }; }  (beta design 7.1). enabled == false: the block is absent and the rest is zero.
+ * Paths and schema names are UTF-8 strings kept byte for byte (dns_path_is_valid_utf8()). */
+#define KARIDNS_DB_PATH_MAX 1023            /* same limit as the CONFIG path TLV (dns_db_stream.h) */
+#define KARIDNS_DB_DEFAULT_LOADER_PATH "/usr/local/libexec/karidns-dbloader"
+typedef struct {
+  bool enabled;
+  char *driver;                /* "sqlite3" | "postgresql" */
+  char *database_file;         /* sqlite3: source of the views without their own file */
+  char *conninfo_file;         /* postgresql */
+  char *schema;                /* postgresql: schema of the views without their own */
+  char *loader_user;           /* restart-only */
+  char *loader_group;          /* restart-only */
+  char *loader_path;           /* restart-only; NULL = KARIDNS_DB_DEFAULT_LOADER_PATH */
+  char **acl_ceiling;          /* stored only (enforced from B7): addresses, "!" negation like allow-transfer */
+  int acl_ceiling_count;
+  acl_entry_t *acl_ceiling_parsed;
+  char **acl_ceiling_keys;
+  int acl_ceiling_keys_count;
+  uint8_t acl_ceiling_match;   /* acl-ceiling-match: ACL_MATCH_DEFAULT/ANY = address OR key (B7a), ACL_MATCH_ALL = address AND key */
+  bool auto_reload;
+  uint32_t poll_interval;      /* seconds, 1..60 */
+  uint32_t coalesce_ms;        /* 0..10000 */
+  uint32_t default_ttl;        /* 1..2147483647 */
+  uint32_t bulk_threshold;     /* percent, 0..100 */
+  uint64_t max_zone_records;   /* 2..4294967295 */
+  uint64_t max_zone_bytes;     /* 65535..64G */
+  uint32_t db_reload_timeout;  /* seconds, 1..3600 */
+  uint32_t ingest_threads;     /* 1..16 */
+  uint32_t loader_threads;     /* 1..16 */
+  char *server_id;             /* postgresql only (B11) */
+  char **alias_resolver;       /* stored only (B9a): IP address literals */
+  int alias_resolver_count;
+} database_config_t;
+
+#define KARIDNS_DB_POLL_MIN 1
+#define KARIDNS_DB_POLL_MAX 60
+#define KARIDNS_DB_COALESCE_MAX 10000
+#define KARIDNS_DB_TTL_MAX 2147483647u
+#define KARIDNS_DB_RELOAD_TIMEOUT_MAX 3600
+#define KARIDNS_DB_THREADS_MAX 16
+#define KARIDNS_DB_MAX_VIEWS 1024   /* views that take DB zones: the CONFIG message of the loader link lists at most this many (KDB_MAX_CONFIG_VIEWS) */
+#define KARIDNS_DB_MAX_ZONE_RECORDS_MAX 4294967295ull
+#define KARIDNS_DB_MAX_ZONE_BYTES_MIN 65535ull
+#define KARIDNS_DB_MAX_ZONE_BYTES_MAX (64ull << 30)
 
 /* D-22: トップレベルの acl "name" { ... }; 。要素は parse 時の文字列のまま持ち、
  * 設定全体を読んだ後に各 ACL の参照を展開する。key 要素は ACL_KEY_MARK を先頭に付けて区別する */
@@ -272,6 +376,7 @@ typedef struct server_config_s {
   logging_config_t logging;
   control_channel_config_t control;
   dnstap_config_t dnstap;
+  database_config_t database;  /* options { database { } }; .enabled == false when absent */
   rate_limit_config_t rrl;
   bool serve_stale;
   bool send_extended_errors;
@@ -315,8 +420,36 @@ typedef struct server_config_s {
   int ecs_tag_count;
   ecs_tag_def_t *location_tags;
   int location_tag_count;
+  ip_port_t *alias_resolvers;   /* B9a: options { alias-resolver { ip [port n]; ... }; }: the default of every zone (dns_alias.h) */
+  int alias_resolvers_count;
   _Atomic int reader_count;
 } server_config_t;
+
+/* B7a: the first TSIG key name that the settings x of a DB zone name (allow-transfer key, allow-update name, tsig-key) and
+ * cfg does not define in a key {} block, or NULL when all exist */
+const char *db_settings_missing_key(const zone_ext_t *x, const server_config_t *cfg);
+
+/* B8t-2: the settings of a zone as its primary sends them to the secondaries (Extended AXFR v3, TYPE 65408), in the syntax of
+ * db_settings_parse(): allow-transfer (addresses and keys; the zone's tsig-key of a master zone), transfer-acl-match,
+ * ecs-trusted-resolvers (the zone's list, else options'; not when omit_trusted: the zone data carries its own), additional-from-auth
+ * and zone-udp-bufsize, each with the value the primary applies (the zone's, else options').  The ACLs of a database zone are cut at
+ * acl-ceiling (only what lies inside it is written; no ceiling configured = none).  Never acl-ceiling itself, TSIG secrets or any other
+ * server-level policy.  Returns the length (0 = nothing to send), (size_t)-1 when it does not fit cap. */
+size_t zone_settings_render(const server_config_t *cfg, const zone_config_t *zcfg, bool omit_trusted, char *out, size_t cap);
+/* B8t-2: the zone configuration a secondary uses for a zone that received settings rx (a db_settings_parse() result) from its primary:
+ * a copy of base (the zone {} of karidns.conf, or the settings block of a database zone; NULL for a catalog member) in which a
+ * statement the secondary did not write itself is taken from rx; the rest falls back to options as always.  A TSIG key the received
+ * allow-transfer names and this server does not define makes the received allow-transfer "none" (note says why).  NULL when out of
+ * memory.  The result owns everything it points to. */
+zone_config_t *zone_config_with_received(const char *domain, const zone_config_t *base, const zone_ext_t *rx,
+                                         const server_config_t *cfg, char *note, size_t notelen);
+/* B7a: is options { database { acl-ceiling } } configured (any address or key entry)?  No ceiling = DB ACLs refuse everyone */
+bool db_acl_ceiling_configured(const server_config_t *cfg);
+
+/* loader-path with its default */
+static inline const char *db_loader_path(const server_config_t *c) {
+  return c->database.loader_path ? c->database.loader_path : KARIDNS_DB_DEFAULT_LOADER_PATH;
+}
 
 #define MAX_INCLUDE_DEPTH 16
 
@@ -348,6 +481,9 @@ typedef struct {
   config_file_frame_t stack[MAX_INCLUDE_DEPTH];
   int depth;            // 現在のスタック深さ (0 = トップレベル)
   bool error_occurred;  // 循環/不存在等のエラーフラグ
+  bool no_include;      // B7a: 'include' is an error (settings text of a DB zone is hostile and must not open files)
+  bool restricted;      // B7a: zone statements are limited to what a DB zone may set (db_settings_parse)
+  char restricted_err[160]; // restricted: why a statement was refused (printable, no input bytes beyond the statement name)
 } token_ctx_t;
 
 int parse_named_conf(const char *config_str, server_config_t *config);

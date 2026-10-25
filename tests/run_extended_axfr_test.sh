@@ -333,9 +333,9 @@ else
     FAILED=$((FAILED + 1))
 fi
 
-echo -n "Checking that tagged records are NOT leaked in standard AXFR ... "
+echo -n "Checking that a standard AXFR is the requester's view (B8t-1: tag local of 127.0.0.1 yes, tag remote and ECS tags no) ... "
 LEAK_FOUND=0
-if echo "$STD_AXFR" | grep -E -q "10\.1\.1\.1|10\.2\.2\.2|172\.16\.1\.1|172\.16\.2\.2"; then
+if ! echo "$STD_AXFR" | grep -q "10\.1\.1\.1" || echo "$STD_AXFR" | grep -E -q "10\.2\.2\.2|172\.16\.1\.1|172\.16\.2\.2"; then
     LEAK_FOUND=1
 fi
 if echo "$STD_AXFR" | grep -E -q "65401|65402|65403|65404|65405|65406|65407|65302"; then
@@ -343,7 +343,7 @@ if echo "$STD_AXFR" | grep -E -q "65401|65402|65403|65404|65405|65406|65407|6530
 fi
 
 if [ "$LEAK_FOUND" -eq 0 ]; then
-    echo "OK (Tagged records and internal CLASS 65302 markers properly hidden)"
+    echo "OK (Records of the requester's tag sent; other tags, ECS tags and internal CLASS 65302 markers hidden)"
 else
     echo "FAILED (Tagged records or marker RRs leaked into standard AXFR response!)"
     echo "$STD_AXFR"
@@ -389,8 +389,8 @@ fi
 echo -n "Verifying Master standard AXFR of tinydns zone filters location tags ... "
 TINY_STD_AXFR=$("$DAG" tiny.example.com AXFR @127.0.0.1 -p "$PORT1" +tcp 2>&1 || true)
 if echo "$TINY_STD_AXFR" | grep -q "10.10.0.1" && echo "$TINY_STD_AXFR" | grep -q "10.99.99.1" && \
-   ! echo "$TINY_STD_AXFR" | grep -E -q "10\.10\.1\.1|10\.10\.2\.2"; then
-    echo "OK (Standard AXFR hid location-specific tinydns records)"
+   echo "$TINY_STD_AXFR" | grep -q "10\.10\.1\.1" && ! echo "$TINY_STD_AXFR" | grep -q "10\.10\.2\.2"; then
+    echo "OK (Standard AXFR is the requester's view: location lo (127.0.0.1) records sent, location re records hidden)"
 else
     echo "FAILED (Standard AXFR did not filter tagged records properly)"
     echo "$TINY_STD_AXFR"

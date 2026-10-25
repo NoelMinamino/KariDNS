@@ -13,6 +13,10 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <limits.h>
+#include <pwd.h>
+#include <grp.h>
+#include <sys/wait.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -316,13 +320,14 @@ typedef struct {
 KARIDNS_TOOL_FN bool kc_canonical_rr(const dns_record_t *rec, kc_canon_rr_t *out) {
     uint8_t buf[65535];
     uint16_t len = 0;
-    /* owner_name を渡すと所有者名は write_uncompressed_name() で小文字の非圧縮形になる
-     * (rec->name_wire は元の大文字小文字のまま) */
+    /* owner_name を渡すと所有者名は非圧縮形で書かれる (rec->name_wire は元の大文字小文字のまま)。D17-4 以降
+     * serialize_dns_record() は名前の大文字小文字を変えないので、正規形 (RFC 4034 §6.2) の小文字化はここで行う */
     if (serialize_dns_record(buf, sizeof(buf), &len, rec, NULL, rec->name, 0xFFFFFFFF) != 0) return false;
     size_t owner = 0;
     while (owner < len && buf[owner] != 0) owner += 1 + (size_t)buf[owner];
     owner++;
     if (owner + 10 > len) return false;
+    dns_canonical_downcase_rdata(2 /* one name */, buf, owner);
     size_t rdlen = ((size_t)buf[owner + 8] << 8) | buf[owner + 9];
     if (owner + 10 + rdlen != len) return false;
     /* RFC 4034 §6.2 item 3 の型の RDATA 内の名前を小文字に (K-01。共通関数は dns_wire.c) */
@@ -1021,21 +1026,44 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         if (sorted) {
             for (size_t k = 0; k < arena.count; k++) sorted[k] = &arena.records[k];
             qsort(sorted, arena.count, sizeof(dns_record_t *), cmp_rec_by_name_type);
-            for (size_t k = 0; k + 1 < arena.count; k++) {
-                if (!sorted[k]->name || !sorted[k + 1]->name) continue;
-                /* RRSIG(46)同士の比較は被覆タイプが異なる場合に誤検知する可能性があるため除外 */
-                if (sorted[k]->type_code == 46 && sorted[k + 1]->type_code == 46) continue;
-                if (sorted[k]->type_code == sorted[k + 1]->type_code &&
-                    strcasecmp(sorted[k]->name, sorted[k + 1]->name) == 0 &&
-                    sorted[k]->ttl_value != sorted[k + 1]->ttl_value) {
-                    kc_warning(&tally,
-                        "RRset '%s' type %d has inconsistent TTLs (%u vs %u) in the source "
-                        "zone file; RFC 2181 §5.2 requires all RRs in an RRset to share the same TTL. "
-                        "KariDNS will normalize this to the minimum value at load time, "
-                        "but the zone file should be corrected.\n",
-                        sorted[k]->name, sorted[k]->type_code,
-                        sorted[k]->ttl_value, sorted[k + 1]->ttl_value);
+            /* B8t-2: the TTLs of an RRset are harmonized (lowest wins) among the RRs that have the same visibility only (location, time
+             * stamp, tag); an RR that only some clients see keeps its TTL, so an unrestricted RR and a restricted RR of one name and type
+             * with different TTLs make a client that sees both get an RRset with differing TTLs (tinydns serves them that way). */
+            for (size_t k = 0; k < arena.count;) {
+                size_t e = k + 1;
+                while (e < arena.count && sorted[e]->name && sorted[k]->name && sorted[e]->type_code == sorted[k]->type_code &&
+                       strcasecmp(sorted[e]->name, sorted[k]->name) == 0)
+                    e++;
+                if (!sorted[k]->name || sorted[k]->type_code == 46 || e - k < 2) {
+                    k = e;
+                    continue;
                 }
+                size_t lim = e - k > 64 ? k + 64 : e;     /* a very large RRset: compare the first 64 */
+                bool warned_norm = false, warned_covis = false;
+                for (size_t a = k; a < lim; a++) {
+                    for (size_t b = a + 1; b < lim; b++) {
+                        if (sorted[a]->ttl_value == sorted[b]->ttl_value) continue;
+                        if (dns_record_same_visibility(sorted[a], sorted[b])) {
+                            if (warned_norm) continue;
+                            warned_norm = true;
+                            kc_warning(&tally,
+                                "RRset '%s' type %d has inconsistent TTLs (%u vs %u) in the source "
+                                "zone file; RFC 2181 §5.2 requires all RRs in an RRset to share the same TTL. "
+                                "KariDNS will normalize this to the minimum value at load time, "
+                                "but the zone file should be corrected.\n",
+                                sorted[a]->name, sorted[a]->type_code, sorted[a]->ttl_value, sorted[b]->ttl_value);
+                        } else if (dns_record_is_restricted(sorted[a]) != dns_record_is_restricted(sorted[b])) {
+                            if (warned_covis) continue;
+                            warned_covis = true;
+                            kc_warning(&tally,
+                                "RRset '%s' type %d: an RR that every client sees and an RR with a location, time stamp or tag have "
+                                "different TTLs (%u vs %u). A client that sees both gets an RRset with differing TTLs (RFC 2181 §5.2); "
+                                "KariDNS keeps the TTL written on each RR, as tinydns does.\n",
+                                sorted[a]->name, sorted[a]->type_code, sorted[a]->ttl_value, sorted[b]->ttl_value);
+                        }
+                    }
+                }
+                k = e;
             }
             free(sorted);
         }
@@ -1062,10 +1090,36 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         free(root_path);
         return 1;
     }
+    {   /* B9a (design 3.6b): PowerDNS ALIAS / LUA records.  The same rules the server applies when it publishes the zone. */
+        char pdns_why[400];
+        if (validate_zone_pdns_types(&arena, &err, pdns_why, sizeof(pdns_why)) < 0) {
+            kc_error(&tally, "Zone '%s': %s (the server does not load this zone)\n", domain, pdns_why);
+            free((void*)ctx.base_dir);
+            zone_arena_destroy(&arena);
+            free(root_path);
+            return 1;
+        }
+    }
 
     fprintf(stdout, "[OK] Zone '%s' parsed successfully (%zu records)\n", domain, arena.count);
+    {
+        size_t n_alias = 0, n_lua = 0;
+        for (size_t i = 0; i < arena.count; i++) {
+            const dns_record_t *r = &arena.records[i];
+            if (r->class_val != 1 && r->class_val != 0) continue;
+            if (r->type_code == DNS_TYPE_PDNS_ALIAS) n_alias++;
+            else if (r->type_code == DNS_TYPE_PDNS_LUA) n_lua++;
+        }
+        if (n_alias > 0)
+            fprintf(stdout, "[INFO] Zone '%s': %zu ALIAS record(s); A/AAAA at those names are NODATA unless an alias-resolver { } is configured for the zone (design 3.6b)\n",
+                    domain, n_alias);
+        if (n_lua > 0)
+            kc_warning(&tally, "Zone '%s': %zu LUA record(s) are kept for zone transfers and never answered (PowerDNS enable-lua-records=no behaviour; LUA records are not executed)\n",
+                       domain, n_lua);
+    }
     bool has_soa = false;
     int soa_count = 0; /* [T3] SOA重複検出用 */
+    int soa_plain_count = 0; /* B8t-1: apex SOA RRs that every client sees (no location, time stamp or tag) */
     bool has_apex_ns = false;
 
     if (arena.is_tinydns_format) {
@@ -1295,6 +1349,7 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
             has_soa = true;
             /* [T3] SOA重複検出: apexに2度以上の SOAは破損ゾーンファイル */
             soa_count++;
+            if (!dns_record_is_restricted(&arena.records[i])) soa_plain_count++;
         }
         if (tcode == 2 && strcasecmp(arena.records[i].name, domain) == 0) {
             has_apex_ns = true;
@@ -1640,10 +1695,36 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         return 1;
     }
     /* [T3] SOA重複検出: apexに 2以上の SOAは失敗 */
-    if (soa_count > 1) {
-        kc_error(&tally, "Zone '%s' (%s) has %d SOA records at the apex; "
-                "exactly one SOA record is required\n",
-                domain, file_path, soa_count);
+    /* B8t-1: a tinydns zone (one Z line per location) and a zone with $LOCATION / $ECS-SUBNET tags may hold several SOA RRs when the
+     * others are restricted; at most one is for everybody, and all have one serial */
+    if (soa_plain_count > 1) {
+        kc_error(&tally, "Zone '%s' (%s) has %d SOA records at the apex that every client sees; "
+                "exactly one SOA record is required (more only with a location, time stamp or tag on the others)\n",
+                domain, file_path, soa_plain_count);
+    }
+    (void)soa_count;
+    {
+        char soa_err[320];
+        if (zone_arena_check_soa_set(&arena, domain, soa_err, sizeof(soa_err)) < 0)
+            kc_error(&tally, "%s (%s)\n", soa_err, file_path);
+        /* a SOA that no client can see: a location the zone does not define, or a countdown time stamp that is over (tdlookup.c) */
+        time_t soa_now = time(NULL);
+        for (size_t i = 0; i < arena.count; i++) {
+            const dns_record_t *sr = &arena.records[i];
+            if (sr->type_code != 6 || !sr->name || strcasecmp(sr->name, domain) != 0 || !dns_record_is_restricted(sr)) continue;
+            bool defined = true;
+            if (sr->tinydns_loc[0] || sr->tinydns_loc[1]) {
+                defined = false;
+                for (int li = 0; li < arena.location_count; li++)
+                    if (arena.locations[li].code[0] == sr->tinydns_loc[0] && arena.locations[li].code[1] == sr->tinydns_loc[1]) defined = true;
+            }
+            if (!defined)
+                kc_warning(&tally, "The SOA record of zone '%s' (%s) is restricted to location '%.2s', which the zone does not define: no client sees it\n",
+                        domain, file_path, sr->tinydns_loc);
+            else if (sr->tinydns_ttd != 0 && sr->tinydns_ttl_countdown && sr->tinydns_ttd < soa_now)
+                kc_warning(&tally, "The SOA record of zone '%s' (%s) has expired (countdown time stamp in the past): no client sees it\n",
+                        domain, file_path);
+        }
     }
 
     if (!has_apex_ns) {
@@ -1724,6 +1805,245 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     return 0;
 }
 
+/* The drivers the loader at `path` was built with (`karidns-dbloader --drivers`, one name per line), run without a
+ * shell.  false: it could not be run or did not succeed. */
+KARIDNS_TOOL_FN bool kc_loader_drivers(const char *path, char *out, size_t cap) {
+    int fds[2];
+    out[0] = '\0';
+    if (pipe(fds) != 0) return false;
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return false;
+    }
+    if (pid == 0) {
+        int dn = open("/dev/null", O_RDWR);
+        if (dn >= 0) {
+            dup2(dn, 0);
+            dup2(dn, 2);
+        }
+        dup2(fds[1], 1);
+        close(fds[0]);
+        close(fds[1]);
+        execl(path, "karidns-dbloader", "--drivers", (char *)NULL);
+        _exit(127);
+    }
+    close(fds[1]);
+    size_t n = 0;
+    ssize_t r;
+    while ((r = read(fds[0], out + n, cap - 1 - n)) > 0 && (n += (size_t)r) < cap - 1) {}
+    out[n] = '\0';
+    close(fds[0]);
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+/* is `name` one of the lines of `list`? */
+KARIDNS_TOOL_FN bool kc_line_listed(const char *list, const char *name) {
+    size_t nl = strlen(name);
+    for (const char *p = list; *p;) {
+        const char *e = strchr(p, '\n');
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        if (l == nl && strncmp(p, name, nl) == 0) return true;
+        p += l + (e ? 1 : 0);
+    }
+    return false;
+}
+
+/* B10: does a libpq connection string reach the server over a UNIX socket?  A host that starts with '/' (%2F in a URI) does, and so
+ * does a string without any host (libpq's default); a host name or address (keyword form or URI authority) does not.  hostaddr
+ * without host is a TCP connection. */
+KARIDNS_TOOL_FN bool kc_conninfo_unix_socket(const char *s) {
+    const char *hv = NULL;
+    bool hostaddr = false;
+    if (strncmp(s, "postgresql://", 13) == 0 || strncmp(s, "postgres://", 11) == 0) {
+        const char *a = strstr(s, "//") + 2;
+        const char *e = a + strcspn(a, "/? ");
+        const char *at = memchr(a, '@', (size_t)(e - a));
+        if (at) a = at + 1;
+        if (a < e) hv = a;                                          /* the host of the authority */
+        const char *q = strchr(s, '?');
+        while (q) {
+            q++;
+            if (strncmp(q, "host=", 5) == 0) hv = q + 5;
+            else if (strncmp(q, "hostaddr=", 9) == 0) hostaddr = true;
+            q = strchr(q, '&');
+        }
+    } else {
+        for (const char *p = s; (p = strstr(p, "host")) != NULL; p++) {
+            if (p != s && p[-1] != ' ' && p[-1] != '\t') continue;      /* a keyword starts a word (not "dbhost=", "hostaddr" is below) */
+            if (strncmp(p, "host=", 5) == 0) hv = p + 5;
+            else if (strncmp(p, "hostaddr=", 9) == 0) hostaddr = true;
+        }
+    }
+    if (hv) {
+        if (*hv == '\'' || *hv == '"') hv++;
+        return *hv == '/' || strncasecmp(hv, "%2f", 3) == 0;
+    }
+    return !hostaddr;
+}
+
+/* An SQLite3 database file: it must exist, be in WAL mode (bytes 18 and 19 of the header are 2: file format
+ * write / read version, https://www.sqlite.org/fileformat2.html), not be readable by others, and not sit in a
+ * directory others can write to. */
+KARIDNS_TOOL_FN void kc_check_sqlite_file(kc_tally_t *t, const char *what, const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        kc_error(t, "%s: database file '%s': %s\n", what, path, strerror(errno));
+        return;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        kc_error(t, "%s: database file '%s' is not a regular file\n", what, path);
+        return;
+    }
+    if (st.st_mode & S_IROTH)
+        kc_warning(t, "%s: database file '%s' is readable by everyone (mode %04o); the zone data should be private\n",
+                   what, path, (unsigned)(st.st_mode & 07777));
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) *(slash == dir ? slash + 1 : slash) = '\0';
+    else snprintf(dir, sizeof(dir), ".");
+    struct stat ds;
+    if (stat(dir, &ds) == 0 && (ds.st_mode & S_IWOTH) && !(ds.st_mode & S_ISVTX))
+        kc_warning(t, "%s: the directory '%s' of the database file is writable by everyone\n", what, dir);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        kc_warning(t, "%s: cannot read '%s' to check its journal mode: %s (run karicheck as the loader user to check it)\n",
+                   what, path, strerror(errno));
+        return;
+    }
+    unsigned char h[100];
+    ssize_t n = read(fd, h, sizeof(h));
+    close(fd);
+    if (n < 20 || memcmp(h, "SQLite format 3\0", 16) != 0) {
+        if (n == 0)
+            kc_error(t, "%s: database file '%s' is empty; create the PowerDNS schema first\n", what, path);
+        else
+            kc_error(t, "%s: '%s' is not an SQLite3 database\n", what, path);
+        return;
+    }
+    if (h[18] != 2 || h[19] != 2)
+        kc_error(t, "%s: database file '%s' is not in WAL mode (run: sqlite3 '%s' 'PRAGMA journal_mode=WAL;')\n", what,
+                 path, path);
+}
+
+/* beta design 7.2: the checks of options { database { } } that need no connection.  `karicheck db` (B12) reads the
+ * data.  Returns the number of errors. */
+KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
+    const database_config_t *db = &cfg->database;
+    if (!db->enabled) return 0;
+    kc_tally_t t = {0, 0};
+    bool sqlite = db->driver && strcmp(db->driver, "sqlite3") == 0;
+
+    /* loader-user / loader-group */
+    uid_t loader_uid = (uid_t)-1;
+    bool have_uid = false;
+    if (db->loader_user) {
+        struct passwd *pw = getpwnam(db->loader_user);
+        if (!pw) kc_error(&t, "database loader-user '%s' does not exist\n", db->loader_user);
+        else { loader_uid = pw->pw_uid; have_uid = true; }
+    } else {
+        kc_warning(&t, "database: no loader-user; karidns refuses to start as root without one\n");
+    }
+    if (db->loader_group && !getgrnam(db->loader_group))
+        kc_error(&t, "database loader-group '%s' does not exist\n", db->loader_group);
+
+    /* loader-path: exists, root-owned, not group / world writable; and it has the driver */
+    const char *lp = db_loader_path(cfg);
+    struct stat st;
+    bool loader_ok = false;
+    if (stat(lp, &st) != 0) {
+        kc_error(&t, "database loader '%s': %s\n", lp, strerror(errno));
+    } else if (!S_ISREG(st.st_mode)) {
+        kc_error(&t, "database loader '%s' is not a regular file\n", lp);
+    } else {
+        loader_ok = true;
+        if (st.st_uid != 0)
+            kc_error(&t, "database loader '%s' is not owned by root (uid %u); karidns refuses to run it\n", lp,
+                     (unsigned)st.st_uid);
+        if (st.st_mode & (S_IWGRP | S_IWOTH))
+            kc_error(&t, "database loader '%s' is writable by group or others (mode %04o); karidns refuses to run it\n",
+                     lp, (unsigned)(st.st_mode & 07777));
+        if (access(lp, X_OK) != 0) {
+            kc_error(&t, "database loader '%s' is not executable by this user\n", lp);
+            loader_ok = false;
+        }
+    }
+    if (loader_ok && db->driver) {
+        char drivers[256];
+        if (!kc_loader_drivers(lp, drivers, sizeof(drivers)))
+            kc_error(&t, "database loader '%s' did not answer --drivers; is it karidns-dbloader?\n", lp);
+        else if (!kc_line_listed(drivers, db->driver)) {
+            for (char *c = drivers; *c; c++)
+                if (*c == '\n') *c = (c[1] ? ',' : '\0');
+            kc_error(&t, "driver %s is not available in this installation (the loader '%s' has: %s)\n", db->driver, lp,
+                     drivers[0] ? drivers : "no driver");
+        }
+    }
+
+    /* B7a: without acl-ceiling the ACLs a database zone carries (allow-transfer, allow-update from the metadata or a profile)
+     * refuse every client; the zones still answer queries */
+    if (db->acl_ceiling_count == 0 && db->acl_ceiling_keys_count == 0)
+        kc_warning(&t, "database: no acl-ceiling; the ACLs of database zones (zone transfers, dynamic updates) refuse every "
+                       "client until one is set (acl-ceiling { 192.0.2.0/24; key \"name\"; };)\n");
+    /* B7b: acl-ceiling-match all needs both kinds of entry to say anything; with one kind that kind decides, as with any */
+    else if (db->acl_ceiling_match == ACL_MATCH_ALL && (db->acl_ceiling_count == 0 || db->acl_ceiling_keys_count == 0))
+        kc_warning(&t, "database: acl-ceiling-match all has no effect: acl-ceiling lists only %s, and that kind alone decides\n",
+                   db->acl_ceiling_count == 0 ? "keys" : "addresses");
+
+    /* sources */
+    if (sqlite) {
+        if (db->database_file) kc_check_sqlite_file(&t, "database", db->database_file);
+        for (const view_config_t *v = cfg->views; v; v = v->next)
+            if (v->database_file) {
+                char what[KARIDNS_VIEW_NAME_MAX + 16];
+                snprintf(what, sizeof(what), "view '%s'", v->name);
+                kc_check_sqlite_file(&t, what, v->database_file);
+            }
+        if (db->server_id)
+            kc_warning(&t, "database: server-id is for driver postgresql (ignored with sqlite3)\n");
+    } else if (db->conninfo_file) {
+        struct stat cs;
+        if (stat(db->conninfo_file, &cs) != 0) {
+            kc_error(&t, "database conninfo-file '%s': %s\n", db->conninfo_file, strerror(errno));
+        } else {
+            mode_t m = cs.st_mode & 0777;
+            if (m != 0600 && m != 0400)
+                kc_error(&t, "database conninfo-file '%s' has mode %04o; it must be 0600 or 0400\n", db->conninfo_file,
+                         (unsigned)m);
+            if (have_uid && cs.st_uid != loader_uid)
+                kc_error(&t, "database conninfo-file '%s' is owned by uid %u; it must belong to the loader user '%s'\n",
+                         db->conninfo_file, (unsigned)cs.st_uid, db->loader_user);
+            FILE *cf = fopen(db->conninfo_file, "r");
+            if (cf) {
+                char line[2048], all[4096];
+                size_t used = 0;
+                all[0] = '\0';
+                while (fgets(line, sizeof(line), cf)) {                   /* '#' starts a comment line, like the loader reads the file */
+                    const char *l = line;
+                    while (*l == ' ' || *l == '\t') l++;
+                    if (*l == '#') continue;
+                    size_t n = strcspn(line, "\r\n");
+                    if (used + n + 2 > sizeof(all)) break;
+                    memcpy(all + used, line, n);
+                    used += n;
+                    all[used++] = ' ';
+                    all[used] = '\0';
+                }
+                fclose(cf);
+                bool verify = strstr(all, "sslmode=verify-full") || strstr(all, "sslmode='verify-full'") || strstr(all, "sslmode=\"verify-full\"");
+                if (!kc_conninfo_unix_socket(all) && !verify)
+                    kc_warning(&t, "database conninfo-file '%s' has neither a UNIX socket host nor sslmode=verify-full\n",
+                               db->conninfo_file);
+            }
+        }
+    }
+    return t.errors;
+}
+
 KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) {
     printf("[INFO] Loading config %s...\n", config_path);
     bool failed = false;
@@ -1741,6 +2061,29 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
     zone_config_t *z;
     CONFIG_FOR_EACH_ZONE(cfg, zv, z) {
         const zone_ext_t *zx = zext(z);
+        /* D14 (B7a): transfer-acl-match / update-acl-match only choose between the entries of an ACL */
+        if (zx->transfer_acl_match != ACL_MATCH_DEFAULT) {
+            if (zx->allow_transfer_count == 0 && zx->tsig_keys_count == 0)
+                fprintf(stderr, "[WARNING] Zone '%s': transfer-acl-match has no effect without allow-transfer\n", z->domain);
+            else if (zx->allow_transfer_count == 0 || zx->tsig_keys_count == 0)
+                fprintf(stderr, "[WARNING] Zone '%s': transfer-acl-match has no effect: allow-transfer lists only %s "
+                                "(the option chooses between addresses and keys)\n",
+                        z->domain, zx->allow_transfer_count ? "addresses" : "keys");
+        }
+        if (zx->update_acl_match != ACL_MATCH_DEFAULT) {
+            bool addr = false, key = false;
+            for (int i = 0; i < zx->allow_update_count; i++) {
+                const char *e = zx->allow_update[i];
+                cidr_entry_t ce;
+                if (!e || e[0] == '!' || strcmp(e, "none") == 0 || cidr_entry_parse(&ce, e)) addr = true;
+                else key = true;
+            }
+            if (zx->allow_update_count == 0)
+                fprintf(stderr, "[WARNING] Zone '%s': update-acl-match has no effect without allow-update\n", z->domain);
+            else if (!addr || !key)
+                fprintf(stderr, "[WARNING] Zone '%s': update-acl-match has no effect: allow-update lists only %s "
+                                "(the option chooses between addresses and keys)\n", z->domain, addr ? "addresses" : "keys");
+        }
         if (z->type && strcasecmp(z->type, "program") == 0) {
             program_zone_count++;
             if (zx->program_path) {
@@ -1866,6 +2209,11 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
         fprintf(stderr, "[WARNING] ecs-tags defined, but ecs-enable is not set to 'yes' in options{}\n");
     }
     if (ecs_error) {
+        free(buf);
+        return 1;
+    }
+
+    if (kc_check_database(cfg) > 0) {
         free(buf);
         return 1;
     }

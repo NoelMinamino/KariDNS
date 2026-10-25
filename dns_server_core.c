@@ -59,6 +59,9 @@
 #include "dns_axfr_ixfr.h"
 #include "dns_query_engine.h"
 #include "dns_snapshot_rcu.h"
+#include "dns_db_supervisor.h"
+#include "dns_db_ingest.h"
+#include "dns_alias.h"
 
 // karidns
 // Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)
@@ -103,7 +106,8 @@ bool config_standby_reap(bool wait) {
   g_config_db.standby_freed++;
   return true;
 }
-int g_control_kq = -1;
+/* written once by the control thread (release); the workers and transfer threads read it (acquire) */
+_Atomic int g_control_kq = -1;
 int g_cwd_fd = -1;
 STATIC_TEST const char *g_config_path = NULL;
 static int g_cli_port_override = 0;
@@ -240,6 +244,7 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
   /* 降格先は main() が起動時に解決した g_run_identity (O-18: ここで名前を引き直さない) */
   bool need_drop = (geteuid() == 0);
 
+  gc_snapshot_wait_idle();
   pid_t pid = fork();
   if (pid < 0) {
     close(sv[0]);
@@ -1176,7 +1181,7 @@ void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, z
     out->is_secondary = e->is_secondary;
     out->soa_serial = (uint32_t)atomic_load_explicit(&e->serial, memory_order_relaxed);
 
-    zone_config_t *zc = find_zone_config_in_view(cfg, e->view_name, e->domain);
+    const zone_config_t *zc = zone_entry_config(cfg, e);
     out->slaves_configured = zc ? zext(zc)->also_notify_count : 0;
 
     out->last_notify_time = atomic_load_explicit(&e->observatory.last_notify_time, memory_order_relaxed);
@@ -1571,7 +1576,7 @@ bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, con
   bool is_synth = false;
   zone_db_entry_t *entry = find_zone_for_query(view, qname, qtype); // R-32: DS at a child apex goes to the parent
   if (entry) {
-    zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, entry->domain);
+    const zone_config_t *zcfg = zone_entry_config(cfg, entry);
     if (zcfg && zcfg->type && (strcasecmp(zcfg->type, "program") == 0 || strcasecmp(zcfg->type, "forward") == 0)) {
       is_synth = true;
     }
@@ -2311,9 +2316,18 @@ process_tcp_client: ;
           zone_db_snapshot_t *snap = acquire_zone_snapshot();
           view_snapshot_t *xfr_view = select_view(snap, ctx_tcp->client_ip);
           server_config_t *cfg = acquire_config_snapshot();
-          zone_config_t *zcfg = xfr_view
+          const zone_config_t *zcfg = xfr_view
               ? find_zone_config_in_view(cfg, xfr_view->name, qname)
               : NULL;
+          if (xfr_view && (qtype == 252 || qtype == 251)) {
+            /* a DB zone has settings of its own (dbcfg), and a secondary may have settings received from its primary (B8t-2: rxcfg,
+             * the zone's own statements first): the transfer checks below read them like a configured zone's */
+            zone_db_entry_t *xfr_entry = find_zone_exact_in_view(xfr_view, qname);
+            if (xfr_entry && (!zcfg || xfr_entry->source == ZONE_SRC_DB || atomic_load_explicit(&xfr_entry->rxcfg, memory_order_acquire))) {
+              const zone_config_t *ec = zone_entry_config(cfg, xfr_entry);
+              if (ec) zcfg = ec;
+            }
+          }
           bool is_synthetic_zone = (zcfg && zcfg->type &&
                                     (strcasecmp(zcfg->type, "program") == 0 ||
                                      strcasecmp(zcfg->type, "forward") == 0));
@@ -2322,12 +2336,12 @@ process_tcp_client: ;
            * (AXFR/IXFR 用)、それ以外は QNAME を含む最も近いゾーンを引き直す。
            * どのゾーンにも指定がなければ検索自体を省く。AXFR ワーカーへ渡す前に
            * 適用しておくことで、転送スレッドもこの値で送信する。 */
-          if (cfg && cfg->any_zone_tcp_opts) {
-            zone_config_t *tcp_zcfg = zcfg;
+          if (cfg && (cfg->any_zone_tcp_opts || atomic_load_explicit(&g_db_zone_tcp_opts, memory_order_relaxed))) {
+            const zone_config_t *tcp_zcfg = zcfg;
             if (!tcp_zcfg && xfr_view) {
               zone_db_entry_t *tcp_entry = find_zone_in_view(xfr_view, qname);
               if (tcp_entry)
-                tcp_zcfg = find_zone_config_in_view(cfg, xfr_view->name, tcp_entry->domain);
+                tcp_zcfg = zone_entry_config(cfg, tcp_entry);
             }
             apply_zone_tcp_opts(client_fd, ctx_tcp, tcp_zcfg);
           }
@@ -2345,30 +2359,9 @@ process_tcp_client: ;
                            edns_version_unsupported(&edns);
             bool allowed = false;
             if (zcfg && !badvers && tsig.status != TSIG_REQ_ERROR && tsig.status != TSIG_REQ_FORMERR) {
-              bool has_acl = (zext(zcfg)->allow_transfer_count > 0);
-              bool has_keys = (zext(zcfg)->tsig_keys_count > 0) || (zext(zcfg)->tsig_key != NULL);
-              bool acl_ok = false;
-              if (has_acl) {
-                if (zext(zcfg)->allow_transfer_parsed) {
-                  acl_ok = check_acl_bin(ctx_tcp->client_ip, zext(zcfg)->allow_transfer_parsed, zext(zcfg)->allow_transfer_count);
-                } else {
-                  acl_ok = check_acl(ctx_tcp->client_ip, zext(zcfg)->allow_transfer, zext(zcfg)->allow_transfer_count);
-                }
-              }
-              /* allow-transfer { key "A"; ... } の鍵か、ゾーンの tsig-key で署名されていること (D-03: 名前は DNS 名として比較) */
-              bool key_ok = false;
-              for (int ki = 0; matched_key && ki < zext(zcfg)->tsig_keys_count && !key_ok; ki++)
-                key_ok = tsig_key_names_equal(matched_key->name, zext(zcfg)->tsig_keys[ki]);
-              if (matched_key && !key_ok && zext(zcfg)->tsig_key)
-                key_ok = tsig_key_names_equal(matched_key->name, zext(zcfg)->tsig_key);
-              /* アドレスと鍵の両方があれば両方を満たすこと (docs/karidns.md allow-transfer) */
-              if (has_acl && has_keys) {
-                  allowed = (acl_ok && key_ok);
-              } else if (has_acl) {
-                  allowed = acl_ok;
-              } else if (has_keys) {
-                  allowed = key_ok;
-              }
+              /* allow-transfer のアドレスと鍵 (鍵名は DNS 名として比較 D-03)、zone の tsig-key、transfer-acl-match、
+               * DB ゾーンの acl-ceiling は zone_transfer_acl_allows() が見る (dns_tsig_acl.c) */
+              allowed = zone_transfer_acl_allows(cfg, zcfg, ctx_tcp->client_ip, matched_key ? matched_key->name : NULL);
             }
             uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
             static_assert(sizeof(tsig_mac) >= sizeof(tsig.mac), "tsig_mac must hold the request MAC");
@@ -2611,7 +2604,8 @@ process_tcp_client: ;
 typedef enum {
   CTRL_STATE_NEW,
   CTRL_STATE_AUTH_WAIT,
-  CTRL_STATE_CMD_WAIT
+  CTRL_STATE_CMD_WAIT,
+  CTRL_STATE_PARKED  /* B6a: `reload <zone>` of a database zone, waiting for the loader's answer (see db_ingest_reload) */
 } ctrl_state_t;
 
 typedef struct ctrl_client {
@@ -2622,10 +2616,14 @@ typedef struct ctrl_client {
   char challenge[65];
   char buf[1024];
   size_t buf_len;
+  uint64_t req_id;       /* PARKED: the reload request this client waits for */
+  time_t park_deadline;  /* PARKED: answer "timeout" at this time (db-reload-timeout) */
   struct ctrl_client *next;
 } ctrl_client_t;
 
 static ctrl_client_t *g_ctrl_clients = NULL;
+#define CTRL_PARK_MAX 32 /* parked clients: bounded, so the request rings never fill (dns_db_ingest.c) */
+static int g_ctrl_parked = 0;
 
 static void free_ctrl_client(int fd) {
   ctrl_client_t **p = &g_ctrl_clients;
@@ -2633,6 +2631,10 @@ static void free_ctrl_client(int fd) {
     if ((*p)->fd == fd) {
       ctrl_client_t *c = *p;
       *p = c->next;
+      if (c->state == CTRL_STATE_PARKED) {
+        g_ctrl_parked--;
+        db_ingest_reload_cancel(c->req_id);
+      }
       close(c->fd);
       free(c);
       return;
@@ -2690,6 +2692,16 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
     append_list_item(buf, sz, "control-channel socket");
   if (o->dnstap.enabled != n->dnstap.enabled || str_differs(o->dnstap.socket_path, n->dnstap.socket_path))
     append_list_item(buf, sz, "dnstap socket");
+  /* beta design 7.1: the loader is started once by the supervisor, so adding or removing the database block and
+   * these four options take effect only after a restart (everything else in the block reloads) */
+  if (o->database.enabled != n->database.enabled) {
+    append_list_item(buf, sz, "database block");
+  } else if (o->database.enabled) {
+    if (str_differs(o->database.driver, n->database.driver)) append_list_item(buf, sz, "database driver");
+    if (str_differs(o->database.loader_user, n->database.loader_user)) append_list_item(buf, sz, "database loader-user");
+    if (str_differs(o->database.loader_group, n->database.loader_group)) append_list_item(buf, sz, "database loader-group");
+    if (str_differs(db_loader_path(o), db_loader_path(n))) append_list_item(buf, sz, "database loader-path");
+  }
 }
 
 STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged) {
@@ -2760,6 +2772,7 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
   g_config_db.retire_epoch = rcu_writer_publish(&g_config_db.active, standby);
   g_config_db.standby_pending = true; /* 退いた設定 (旧 active) は猶予期間の後で config_standby_reap() が解放する */
   g_last_configured_time = time(NULL);
+  db_ingest_config_changed(); /* beta design 4.5: the loader gets a CONFIG with the new generation */
   // dnstap の接続先は起動時のみだが、出力するメッセージ種別はリロードで反映できる
   if (standby->dnstap.enabled) {
     dnstap_set_message_types(standby->dnstap.log_auth_query, standby->dnstap.log_auth_response);
@@ -2870,6 +2883,152 @@ const char *find_configured_domain(const char *arg, char *out_buf, size_t out_si
   return out_buf;
 }
 
+/* B6a: an answer of the database loader for a parked `reload <zone>` client (control thread) */
+static void control_db_results(void) {
+  db_reload_result_t r;
+  while (db_ingest_reload_result(&r)) {
+    ctrl_client_t *c = g_ctrl_clients;
+    while (c && !(c->state == CTRL_STATE_PARKED && c->req_id == r.id)) c = c->next;
+    if (!c) continue; /* the client left or timed out: nothing to do */
+    char reply[sizeof(r.text) + 16];
+    int n = snprintf(reply, sizeof(reply), "%s %s\n", r.ok ? "OK" : "ERROR", r.text);
+    if (n > 0) (void)send(c->fd, reply, (size_t)n, 0);
+    syslog(LOG_NOTICE, "[Control] reload of a database zone answered: %s", r.text);
+    c->state = CTRL_STATE_CMD_WAIT; /* it is no longer waiting: free_ctrl_client() must not cancel the finished request */
+    g_ctrl_parked--;
+    free_ctrl_client(c->fd);
+  }
+}
+
+/* B6a: parked clients whose db-reload-timeout has passed get an error; the request is forgotten */
+static void control_park_timeouts(time_t now) {
+  ctrl_client_t *c = g_ctrl_clients;
+  while (c) {
+    ctrl_client_t *next = c->next;
+    if (c->state == CTRL_STATE_PARKED && now >= c->park_deadline) {
+      static const char msg[] = "ERROR timeout: the database loader did not answer within db-reload-timeout; "
+                                "the reload may still be applied (see 'karictl dbstatus')\n";
+      (void)send(c->fd, msg, sizeof(msg) - 1, 0);
+      syslog(LOG_WARNING, "[Control] reload of a database zone timed out (request %llu)", (unsigned long long)c->req_id);
+      free_ctrl_client(c->fd); /* cancels the request */
+    }
+    c = next;
+  }
+}
+
+/* D17-2 / B6a: a command about a zone that is not in karidns.conf, which may be a zone of the database.  Returns true
+ * when it was answered (or the client was parked), false when there is no such DB zone ("zone not found").  The registry
+ * is looked at without any wait for the loader; `reload` hands the request to the ingest thread and parks the client. */
+static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone, const char *view_arg, bool force) {
+  int cfd = c->fd;
+  server_config_t *cfg = acquire_config_snapshot();
+  bool enabled = cfg && cfg->database.enabled;
+  uint32_t tmo = cfg && cfg->database.db_reload_timeout ? cfg->database.db_reload_timeout : 30;
+  release_config_snapshot(cfg);
+  if (!enabled || !db_ingest_enabled()) return false;
+  bool is_reload = strcmp(cmd, "reload") == 0;
+  dbreg_info_t info[2];
+  int n = dbreg_find_info(view_arg, zone, info, 2);
+  /* B6b: `reload <zone>` with several views that take database zones and none named asks every one of them: a mapping
+   * (karidns_domain_views) may have moved the zone to another view, which only the loader can tell */
+  bool all_views = false;
+  char view[KARIDNS_VIEW_NAME_MAX];
+  if (is_reload && !view_arg) {
+    char why0[200];
+    all_views = db_ingest_pick_view(NULL, view, sizeof(view), why0, sizeof(why0)) && !view[0];
+  }
+  if (n >= 2 && !all_views) {
+    char m[160];
+    int l = snprintf(m, sizeof(m), "ERROR zone exists in multiple views; specify view (e.g. '%s <zone> <view>')\n", cmd);
+    send(cfd, m, (size_t)l, 0);
+    return true;
+  }
+  if (n == 0 && !is_reload) return false;
+  if (all_views) {
+    /* view stays empty: dns_db_ingest.c asks every view that takes database zones */
+  } else if (n == 1) {
+    snprintf(view, sizeof(view), "%s", info[0].view);
+  } else { /* not in the registry yet: a zone added to the database; ask the loader for it */
+    char why[200];
+    if (!db_ingest_pick_view(view_arg, view, sizeof(view), why, sizeof(why))) {
+      char m[300];
+      int l = snprintf(m, sizeof(m), "ERROR zone not found (%s)\n", why);
+      send(cfd, m, (size_t)l, 0);
+      return true;
+    }
+  }
+  if (is_reload) {
+    if (g_ctrl_parked >= CTRL_PARK_MAX) {
+      static const char msg[] = "ERROR too many reloads are waiting for the database loader; try again later\n";
+      send(cfd, msg, sizeof(msg) - 1, 0);
+      return true;
+    }
+    uint64_t id = db_ingest_reload(false, view, zone, force);
+    if (id == 0) {
+      static const char msg[] = "ERROR cannot queue the reload request for the database loader\n";
+      send(cfd, msg, sizeof(msg) - 1, 0);
+      return true;
+    }
+    syslog(LOG_NOTICE, "[Control] Received reload command for database zone: %s (%s%s)%s", zone,
+           all_views ? "every view" : "view ", view, force ? ", force" : "");
+    c->state = CTRL_STATE_PARKED;
+    c->req_id = id;
+    c->park_deadline = time(NULL) + (time_t)tmo;
+    g_ctrl_parked++;
+    return true;
+  }
+  const dbreg_info_t *zi = &info[0];
+  if (strcmp(cmd, "zonestatus") == 0) {
+    char m[600];
+    const char *res = zi->shadowed ? (zi->shadow_by == DBREG_SH_CATALOG ? "shadowed (hidden by a catalog member)"
+                                                                         : "shadowed (hidden by a zone in karidns.conf)")
+                                   : (zi->last_result == DBREG_REJECTED ? "rejected" : "applied");
+    /* B8t-2: a database secondary with settings received from its primary */
+    bool rx_on = false;
+    {
+      zone_db_snapshot_t *zsnap = acquire_retained_zone_snapshot();
+      zone_db_entry_t *ze = zsnap ? dbreg_snapshot_entry(zsnap, zi->view, zone) : NULL;
+      if (ze) rx_on = zone_rx_settings_status(ze, NULL, 0);
+      if (zsnap) release_zone_snapshot(zsnap);
+    }
+    int l = snprintf(m, sizeof(m), "OK serial=%u refresh=%u source=database view=%s id=%lld result=%s%s%s%s%s\n", zi->serial,
+                     zi->refresh, zi->view, (long long)zi->source_id, res, zi->has_entry ? "" : " (no version loaded)",
+                     zi->error[0] ? " last-error: " : "", zi->error, rx_on ? " settings=primary" : "");
+    if (l >= (int)sizeof(m)) l = (int)sizeof(m) - 1, m[l - 1] = '\n';
+    send(cfd, m, (size_t)l, 0);
+    return true;
+  }
+  if (strcmp(cmd, "notify") == 0) {
+    zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
+    zone_db_entry_t *e = snap ? dbreg_snapshot_entry(snap, zi->view, zone) : NULL;
+    if (e) {
+      syslog(LOG_NOTICE, "[Control] Received notify command for zone: %s (database zone, view %s)", zone, zi->view);
+      atomic_store_explicit(&e->notify_now, true, memory_order_release);
+      send(cfd, "OK\n", 3, 0);
+    } else {
+      static const char msg[] = "ERROR zone is not served from the database (hidden by another zone of the same name)\n";
+      send(cfd, msg, sizeof(msg) - 1, 0);
+    }
+    if (snap) release_zone_snapshot(snap);
+    return true;
+  }
+  /* retransfer: a SLAVE / CONSUMER zone of the database (B7b) transfers again from its masters, as a configured secondary does;
+   * a primary zone's data comes from the loader, not from a primary server */
+  zone_db_snapshot_t *rsnap = acquire_retained_zone_snapshot();
+  zone_db_entry_t *re = rsnap ? dbreg_snapshot_entry(rsnap, zi->view, zone) : NULL;
+  if (re && re->is_secondary) {
+    syslog(LOG_NOTICE, "[Control] Received retransfer command for zone: %s (database zone, view %s)", zone, zi->view);
+    atomic_store_explicit(&re->serial, 0, memory_order_release);
+    atomic_store_explicit(&re->refresh_now, true, memory_order_release);
+    send(cfd, "OK\n", 3, 0);
+  } else {
+    static const char msg[] = "ERROR zone is a primary zone from the database; read it again with 'karictl reload <zone>'\n";
+    send(cfd, msg, sizeof(msg) - 1, 0);
+  }
+  if (rsnap) release_zone_snapshot(rsnap);
+  return true;
+}
+
 /* P5: SIGHUP はバックエンドの全スレッドでブロックされ、保留のまま EVFILT_SIGNAL で通知される。
  * 保留分を sigtimedwait() で取り出して送信元を見る。pkill -HUP karidns のように全プロセスへ
  * 送られると、直接届いたものとマネージャーが転送したものの2つになり、両方でリロードすると
@@ -2909,8 +3068,8 @@ void *control_thread_func(void *arg) {
   int kq = kqueue();
   if (kq < 0)
     pthread_exit(NULL);
-  g_control_kq = kq;
-  struct kevent ev_set[5];
+  atomic_store_explicit(&g_control_kq, kq, memory_order_release);
+  struct kevent ev_set[6];
   EV_SET(&ev_set[0], SIGHUP, EVFILT_SIGNAL, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev_set[1], 1, EVFILT_TIMER, EV_ADD | EV_CLEAR, 0, 1000, NULL);
   EV_SET(&ev_set[2], 2, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
@@ -2918,7 +3077,8 @@ void *control_thread_func(void *arg) {
    * backend_shutdown() する (EVFILT_SIGNAL はハンドラがあっても配送を記録する) */
   EV_SET(&ev_set[3], SIGTERM, EVFILT_SIGNAL, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev_set[4], SIGINT, EVFILT_SIGNAL, EV_ADD | EV_CLEAR, 0, 0, NULL);
-  if (kevent(kq, ev_set, 5, NULL, 0, NULL) == -1) {
+  EV_SET(&ev_set[5], DB_INGEST_CTL_EVENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL); /* B6a: an answer of the DB loader */
+  if (kevent(kq, ev_set, 6, NULL, 0, NULL) == -1) {
     close(kq);
     pthread_exit(NULL);
   }
@@ -2952,6 +3112,10 @@ void *control_thread_func(void *arg) {
       break;
     }
     for (int i = 0; i < n; i++) {
+      if (ev_list[i].filter == EVFILT_USER && ev_list[i].ident == DB_INGEST_CTL_EVENT) {
+        control_db_results();
+        continue;
+      }
       if (ev_list[i].filter == EVFILT_READ && g_notify_resp_ipc[0] >= 0 &&
           ev_list[i].ident == (uintptr_t)g_notify_resp_ipc[0]) {
         /* UDP ワーカーが回してきた NOTIFY の応答 (udp_ipc_t + DNS メッセージ) */
@@ -3017,7 +3181,7 @@ void *control_thread_func(void *arg) {
           
           struct kevent ev_c;
           EV_SET(&ev_c, cfd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void*)1);
-          kevent(g_control_kq, &ev_c, 1, NULL, 0, NULL);
+          kevent(kq, &ev_c, 1, NULL, 0, NULL);
           
           uint8_t rand_bytes[32];
           arc4random_buf(rand_bytes, 32);
@@ -3035,6 +3199,12 @@ void *control_thread_func(void *arg) {
         if (!c) continue;
         if (ev_list[i].flags & EV_EOF) {
           free_ctrl_client(cfd);
+          continue;
+        }
+        if (c->state == CTRL_STATE_PARKED) { /* waiting for the loader: nothing more is expected; a closed socket frees it */
+          char junk[128];
+          ssize_t pr = recv(cfd, junk, sizeof(junk), 0);
+          if (pr == 0 || (pr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) free_ctrl_client(cfd);
           continue;
         }
         /* 行の処理後は buf_len < sizeof(c->buf) - 1 (改行の無いまま満杯になったクライアントは下で切断する) */
@@ -3117,6 +3287,19 @@ void *control_thread_func(void *arg) {
               }
             }
             
+            bool want_force = false; /* `reload <zone> [<view>] [force]` (B6a): force is the last word */
+            if (strcmp(cmd, "reload") == 0 && view_arg) {
+              char *fw = strrchr(view_arg, ' ');
+              if (strcmp(view_arg, "force") == 0) {
+                want_force = true;
+                view_arg = NULL;
+              } else if (fw && strcmp(fw + 1, "force") == 0) {
+                want_force = true;
+                while (fw > view_arg && fw[-1] == ' ') fw--;
+                *fw = '\0';
+              }
+            }
+
             if (strcmp(cmd, "reload") == 0) {
               if (arg && strlen(arg) > 0) {
                 char canon_buf[256];
@@ -3126,8 +3309,12 @@ void *control_thread_func(void *arg) {
                 zone_lookup_result_t lr = {0};
                 int nmatches = lookup_zone_across_views(snap, active, canon_arg, view_arg, &lr);
                 if (nmatches == 0) {
-                  syslog(LOG_ERR, "[Control] Command 'reload' failed: zone '%s' not found", canon_arg);
-                  send(cfd, "ERROR zone not found\n", 21, 0);
+                  if (db_zone_command(c, cmd, canon_arg, view_arg, want_force)) {
+                    /* answered or parked (D17-2) */
+                  } else {
+                    syslog(LOG_ERR, "[Control] Command 'reload' failed: zone '%s' not found", canon_arg);
+                    send(cfd, "ERROR zone not found\n", 21, 0);
+                  }
                 } else if (nmatches > 1) {
                   send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'reload <zone> <view>')\n", 82, 0);
                 } else if (lr.entry && lr.zcfg) {
@@ -3138,7 +3325,7 @@ void *control_thread_func(void *arg) {
                         case RELOAD_OK:
                             syslog(LOG_NOTICE, "[Control] Targeted reload successful for %s", lr.zcfg->domain);
                             if (lr.zcfg->is_catalog) {
-                                void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
+                                void catalog_process_membership(zone_db_entry_t *catalog_entry, const zone_config_t *catalog_cfg, const char *view_name);
                                 catalog_process_membership(lr.entry, lr.zcfg, lr.view_name);
                             }
                             send(cfd, "OK reloaded\n", 12, 0);
@@ -3174,6 +3361,16 @@ void *control_thread_func(void *arg) {
                 config_reload_result_t rr = run_config_reload(false);
                 char reply[CTRL_RELOAD_REPLY_SIZE];
                 int rlen = format_reload_reply(&rr, "OK reloaded", reply, sizeof(reply));
+                /* B6a (design 5.2): after the configuration, ask the loader to compare its sources with the zones served;
+                 * the answer is not waited for (karictl dbstatus shows the batch) */
+                if ((rr.status == CONFIG_RELOAD_OK || rr.status == CONFIG_RELOAD_ZONE_ERRORS) && db_ingest_enabled()) {
+                  uint64_t rid = db_ingest_reload(true, NULL, NULL, false);
+                  if (rid && rlen > 0 && reply[rlen - 1] == '\n' && (size_t)rlen + 64 < sizeof(reply)) {
+                    rlen--;
+                    rlen += snprintf(reply + rlen, sizeof(reply) - (size_t)rlen, "; DB reload requested (request %llu)\n",
+                                     (unsigned long long)rid);
+                  }
+                }
                 send(cfd, reply, (size_t)rlen, 0);
               }
             } else if (strcmp(cmd, "reconfig") == 0) {
@@ -3254,13 +3451,21 @@ void *control_thread_func(void *arg) {
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
               if (nmatches == 0) {
-                syslog(LOG_ERR, "[Control] Command 'zonestatus' failed: zone '%s' not found", canon_arg);
-                send(cfd, "ERROR zone not found\n", 21, 0);
+                if (!db_zone_command(c, cmd, canon_arg, view_arg, false)) {
+                  syslog(LOG_ERR, "[Control] Command 'zonestatus' failed: zone '%s' not found", canon_arg);
+                  send(cfd, "ERROR zone not found\n", 21, 0);
+                }
               } else if (nmatches > 1) {
                 send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'zonestatus <zone> <view>')\n", 86, 0);
               } else if (lr.entry) {
-                char smsg[256];
-                int slen = snprintf(smsg, sizeof(smsg), "OK serial=%u refresh=%u\n", (uint32_t)lr.entry->serial, (uint32_t)lr.entry->refresh);
+                char smsg[384];
+                char rx_note[160];
+                /* B8t-2: a secondary says that settings received from its primary are in force (and which part is not) */
+                bool rx_on = zone_rx_settings_status(lr.entry, rx_note, sizeof(rx_note));
+                int slen = snprintf(smsg, sizeof(smsg), "OK serial=%u refresh=%u%s%s%s\n", (uint32_t)lr.entry->serial,
+                                    (uint32_t)lr.entry->refresh, rx_on ? " settings=primary" : "", rx_note[0] ? " note: " : "",
+                                    rx_note);
+                if (slen >= (int)sizeof(smsg)) slen = (int)sizeof(smsg) - 1, smsg[slen - 1] = '\n';
                 send(cfd, smsg, slen, 0);
               } else {
                 send(cfd, "ERROR zone not found\n", 21, 0);
@@ -3317,8 +3522,10 @@ void *control_thread_func(void *arg) {
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
               if (nmatches == 0) {
-                syslog(LOG_ERR, "[Control] Command 'notify' failed: zone '%s' not found", canon_arg);
-                send(cfd, "ERROR zone not found\n", 21, 0);
+                if (!db_zone_command(c, cmd, canon_arg, view_arg, false)) {
+                  syslog(LOG_ERR, "[Control] Command 'notify' failed: zone '%s' not found", canon_arg);
+                  send(cfd, "ERROR zone not found\n", 21, 0);
+                }
               } else if (nmatches > 1) {
                 send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'notify <zone> <view>')\n", 82, 0);
               } else if (lr.entry) {
@@ -3338,8 +3545,10 @@ void *control_thread_func(void *arg) {
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
               if (nmatches == 0) {
-                syslog(LOG_ERR, "[Control] Command 'retransfer' failed: zone '%s' not found", canon_arg);
-                send(cfd, "ERROR zone not found\n", 21, 0);
+                if (!db_zone_command(c, cmd, canon_arg, view_arg, false)) {
+                  syslog(LOG_ERR, "[Control] Command 'retransfer' failed: zone '%s' not found", canon_arg);
+                  send(cfd, "ERROR zone not found\n", 21, 0);
+                }
               } else if (nmatches > 1) {
                 send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'retransfer <zone> <view>')\n", 86, 0);
               } else if (lr.entry && !lr.entry->is_secondary) {
@@ -3357,11 +3566,17 @@ void *control_thread_func(void *arg) {
               }
               release_config_snapshot(active_cfg);
               release_zone_snapshot(snap);
+            } else if (strcmp(cmd, "dbstatus") == 0) {
+              /* beta design 5.2: the loader, the batches and the DB zones of the registry */
+              char dbbuf[4096];
+              size_t dblen = db_ingest_status(arg, view_arg, dbbuf, sizeof(dbbuf));
+              if (dblen == 0) send(cfd, "ERROR no database block is configured\n", 38, 0);
+              else send(cfd, dbbuf, dblen, 0);
             } else {
               syslog(LOG_ERR, "[Control] Received unknown command: %s", cmd);
               send(cfd, "ERROR unknown command\n", 22, 0);
             }
-            free_ctrl_client(cfd);
+            if (c->state != CTRL_STATE_PARKED) free_ctrl_client(cfd); /* a parked client waits for the loader's answer */
             continue;
           }
           size_t rem = c->buf_len - (nl + 1 - c->buf);
@@ -3403,6 +3618,10 @@ void *control_thread_func(void *arg) {
         while (curr_c) {
           ctrl_client_t *next_c = curr_c->next;
           bool timed_out = false;
+          if (curr_c->state == CTRL_STATE_PARKED) {
+            curr_c = next_c;                             /* control_park_timeouts() below */
+            continue;
+          }
           if (curr_c->state != CTRL_STATE_CMD_WAIT) {
             if (now - curr_c->connect_time >= 5) {
               timed_out = true;
@@ -3419,25 +3638,34 @@ void *control_thread_func(void *arg) {
           curr_c = next_c;
         }
 
+        control_db_results(); /* an answer whose wake-up was missed */
+        control_park_timeouts(now);
         notify_retransmit_due(now); /* RFC 1996 §3.6: 応答の無い NOTIFY の再送 */
 
         server_config_t *active = acquire_config_snapshot();
         zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
         if (snap) {
+            /* B7a: the settings block of a DB zone (entry->dbcfg) is replaced when the zone's metadata change and freed after a
+             * grace period, so zone_entry_config() below must be read inside a read section (the blocks of file zones belong
+             * to the configuration snapshot held in `active`) */
+            rcu_aux_read_lock();
             for (size_t v = 0; v < snap->view_count; v++) {
                 for (size_t i = 0; i < snap->views[v].zone_count; i++) {
                     zone_db_entry_t *entry = snap->views[v].entries[i];
 
+                    /* B8t-2: settings received from the primary follow a changed karidns.conf (a secondary's own statements win) */
+                    if (atomic_load_explicit(&entry->rx_present, memory_order_relaxed)) zone_rx_settings_refresh(entry, active);
+
                     if (atomic_exchange_explicit(&entry->notify_now, false, memory_order_acquire)) {
                         syslog(LOG_INFO, "[Control] Executing manual NOTIFY for %s", entry->domain);
-                        send_notify_to_all(entry->domain, entry->view_name);
+                        send_notify_to_all(entry);
                     }
 
                     bool is_slave = false;
                     char master_ip[64] = {0};
                     int master_port = 53;
                     char tsig_key_name[64] = {0};
-                    zone_config_t *slave_zcfg = NULL; /* カタログのメンバーゾーンは zone{} を持たない */
+                    const zone_config_t *slave_zcfg = NULL; /* カタログのメンバーゾーンは zone{} を持たない */
                     
                     if (entry->is_catalog_member) {
                         is_slave = true;
@@ -3447,7 +3675,7 @@ void *control_thread_func(void *arg) {
                             strncpy(tsig_key_name, entry->catalog_master->tsig_key, sizeof(tsig_key_name) - 1);
                         }
                     } else {
-                        zone_config_t *zcfg = find_zone_config_in_view(active, entry->view_name, entry->domain);
+                        const zone_config_t *zcfg = zone_entry_config(active, entry);
                         slave_zcfg = zcfg;
                         if (zcfg && zcfg->type && (strcasecmp(zcfg->type, "slave") == 0 || strcasecmp(zcfg->type, "secondary") == 0) &&
                             zext(zcfg)->masters_count > 0 && zext(zcfg)->masters[0].ip != NULL) {
@@ -3537,6 +3765,7 @@ void *control_thread_func(void *arg) {
                     }
                 }
             }
+            rcu_aux_read_unlock();
             release_zone_snapshot(snap);
         }
         release_config_snapshot(active);
@@ -4433,6 +4662,11 @@ STATIC_TEST void supervisor_sig_handler(int sig) {
   }
 }
 
+/* SIGCHLD only has to stay pending for the supervisor's sigtimedwait(); the children are collected with waitpid() */
+STATIC_TEST void supervisor_sigchld_handler(int sig) {
+  (void)sig;
+}
+
 STATIC_TEST void cleanup_pid_file(void) {
   if (g_supervisor_pid != 0 && getpid() == g_supervisor_pid) {
     if (g_pid_fd >= 0) {
@@ -4920,6 +5154,19 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // beta design 1.2: loader-user / loader-group and loader-path are checked once, here, where stderr still
+  // reaches the terminal.  Without a database block dbsup.enabled is false and nothing below touches it.
+  db_sup_t dbsup;
+  {
+    char db_err[512];
+    if (!db_sup_init(&dbsup, &g_config_db.config_a, db_err, sizeof(db_err))) {
+      syslog(LOG_ERR, "[Config] Refusing to start: %s", db_err);
+      fprintf(stderr, "[ERROR] Refusing to start: %s\n", db_err);
+      free_server_config_fields(&g_config_db.config_a);
+      return 1;
+    }
+  }
+
   // ログファイルを開く (開けなければ起動しない)。fd は daemonize() 後も引き継がれる。
   // 実行ユーザーへの所有者の引き渡しは pid file / 制御ソケットのディレクトリ検証の
   // 後 (hand_off_logging_channels) に行う。
@@ -5127,6 +5374,18 @@ int main(int argc, char **argv) {
   // ログと同じディレクトリに置いた pid file 等の検証が「root所有でない」として失敗する。
   hand_off_logging_channels(&g_config_db.config_a);
 
+  // beta design 1.2 step 2: the loader sockets exist before the Backend is forked
+  {
+    char db_err[512];
+    if (!db_sup_open_pairs(&dbsup, db_err, sizeof(db_err))) {
+      syslog(LOG_CRIT, "[Startup] %s", db_err);
+      if (g_broker_pid > 0) kill(g_broker_pid, SIGTERM);
+      cleanup_pid_file();
+      exit(1);
+    }
+  }
+
+  gc_snapshot_wait_idle(); // GC threads of the startup configuration must be gone: the Backend is forked from one thread
   pid_t backend_pid = fork();
   if (backend_pid < 0) {
     syslog(LOG_CRIT, "fork for backend process failed: %m");
@@ -5137,6 +5396,7 @@ int main(int argc, char **argv) {
 
   if (backend_pid > 0) {
     // === Parent Process (Process Manager / Supervisor) ===
+    db_sup_after_fork_supervisor(&dbsup); // the Backend's ends of the loader sockets belong to the Backend
     sigset_t unblock_set;
     sigemptyset(&unblock_set);
     sigaddset(&unblock_set, SIGHUP);
@@ -5153,6 +5413,7 @@ int main(int argc, char **argv) {
 
     pid_t router_pids[MAX_FRONTEND_ROUTERS];
     for (int r = 0; r < g_num_frontend_routers; r++) {
+      gc_snapshot_wait_idle();
       pid_t rpid = fork();
       if (rpid < 0) {
         syslog(LOG_CRIT, "fork for frontend router %d failed: %m", r);
@@ -5173,6 +5434,7 @@ int main(int argc, char **argv) {
           close(g_broker_sock);
           g_broker_sock = -1;
         }
+        db_sup_close_supervisor_ends(&dbsup);
         run_frontend_router(backend_pid, r);
         exit(0);
       }
@@ -5199,7 +5461,31 @@ int main(int argc, char **argv) {
       g_broker_sock = -1;
     }
 
-    // 子プロセスの死活監視ループ (いずれかの子プロセスが終了した場合は全子プロセスを停止)
+    // beta design 1.2 step 4: the loader is started last, when the Backend and the routers exist
+    if (dbsup.enabled) db_sup_spawn(&dbsup);
+    // The loop keeps SIGCHLD / SIGTERM / SIGINT / SIGHUP blocked and takes them synchronously with sigtimedwait(),
+    // so a signal cannot slip in between the checks and the sleep, and no handler runs inside the loop (handlers
+    // that run late, as under ThreadSanitizer, left the supervisor deaf to SIGTERM with the earlier ppoll() wait).
+    // SIGCHLD gets a handler that does nothing: with its default action (ignore) a blocked SIGCHLD may be discarded
+    // instead of staying pending (POSIX leaves it unspecified).
+    {
+      struct sigaction ca;
+      memset(&ca, 0, sizeof(ca));
+      ca.sa_handler = supervisor_sigchld_handler;
+      sigemptyset(&ca.sa_mask);
+      ca.sa_flags = SA_NOCLDSTOP;
+      sigaction(SIGCHLD, &ca, NULL);
+    }
+    sigset_t loop_block, loop_orig;
+    sigemptyset(&loop_block);
+    sigaddset(&loop_block, SIGCHLD);
+    sigaddset(&loop_block, SIGTERM);
+    sigaddset(&loop_block, SIGINT);
+    sigaddset(&loop_block, SIGHUP);
+    sigprocmask(SIG_BLOCK, &loop_block, &loop_orig);
+
+    // 子プロセスの死活監視ループ (いずれかの子プロセスが終了した場合は全子プロセスを停止。
+    // ただし karidns-dbloader の終了は致命的ではなく、待ち時間を置いて起動し直す)
     pid_t dead = 0;
     int child_exit_code = 0;
     while (!g_supervisor_should_exit) {
@@ -5209,8 +5495,11 @@ int main(int argc, char **argv) {
         kill(backend_pid, SIGHUP);
       }
       int status;
-      dead = wait(&status);
-      if (dead > 0) {
+      pid_t w;
+      bool child_died = false;
+      while ((w = waitpid(-1, &status, WNOHANG)) > 0) {
+        if (db_sup_child_exited(&dbsup, w, status)) continue;
+        dead = w;
         if (WIFEXITED(status)) {
           int code = WEXITSTATUS(status);
           if (code != 0) child_exit_code = code;
@@ -5222,15 +5511,27 @@ int main(int argc, char **argv) {
         } else {
           child_exit_code = 1;
         }
+        child_died = true;
         break;
       }
-      if (dead < 0 && errno == ECHILD) {
+      if (child_died) break;
+      if (w < 0 && errno == ECHILD) {
         break;
       }
-      if (dead < 0 && errno == EINTR) {
-        continue;
-      }
+      db_sup_tick(&dbsup);
+      struct timespec nap;
+      int nap_ms = db_sup_timeout_ms(&dbsup);
+      nap.tv_sec = nap_ms / 1000;
+      nap.tv_nsec = (long)(nap_ms % 1000) * 1000000L;
+      siginfo_t si;
+      int sig = nap_ms >= 0 ? sigtimedwait(&loop_block, &si, &nap) : sigwaitinfo(&loop_block, &si);
+      if (sig == SIGHUP)
+        g_supervisor_got_sighup = 1;
+      else if (sig == SIGTERM || sig == SIGINT)
+        g_supervisor_should_exit = 1;
+      /* SIGCHLD, a timeout (the loader restart time) or EINTR: the top of the loop collects children and restarts */
     }
+    sigprocmask(SIG_SETMASK, &loop_orig, NULL);
     if (g_supervisor_should_exit && dead <= 0) {
       syslog(LOG_INFO, "[Manager] Received termination signal. Shutting down children.");
     }
@@ -5241,9 +5542,33 @@ int main(int argc, char **argv) {
     if (g_broker_pid > 0) {
       kill(g_broker_pid, SIGTERM);
     }
+    db_sup_signal(&dbsup, SIGTERM);
+    int64_t loader_kill_ms = 0; // a loader that does not end on SIGTERM (stuck in a database call) is killed after 10 s
     while (1) {
       int status;
-      pid_t w = wait(&status);
+      pid_t w;
+      if (dbsup.enabled && dbsup.pid > 0) {
+        w = waitpid(-1, &status, WNOHANG);
+        if (w == 0) {
+          struct timespec now_ts;
+          clock_gettime(CLOCK_MONOTONIC, &now_ts);
+          int64_t now_ms = (int64_t)now_ts.tv_sec * 1000 + now_ts.tv_nsec / 1000000;
+          if (loader_kill_ms == 0) loader_kill_ms = now_ms + 10000;
+          else if (now_ms >= loader_kill_ms) {
+            syslog(LOG_WARNING, "[Manager] Database loader (pid %d) did not stop; killing it", (int)dbsup.pid);
+            db_sup_signal(&dbsup, SIGKILL);
+            loader_kill_ms = now_ms + 3600 * 1000;
+          }
+          usleep(20000);
+          continue;
+        }
+      } else {
+        w = wait(&status);
+      }
+      if (w > 0 && dbsup.enabled && w == dbsup.pid) {
+        dbsup.pid = 0; // the loader's own status does not decide the exit code of the server
+        continue;
+      }
       if (w > 0) {
         if (WIFEXITED(status)) {
           int code = WEXITSTATUS(status);
@@ -5267,6 +5592,7 @@ int main(int argc, char **argv) {
   }
 
   // === Backend Process (backend_pid == 0) ===
+  gc_snapshot_detach_only();
   struct sigaction b_sa;
   memset(&b_sa, 0, sizeof(b_sa));
   b_sa.sa_handler = backend_sig_handler;
@@ -5289,6 +5615,7 @@ int main(int argc, char **argv) {
     close(g_pid_fd);
     g_pid_fd = -1;
   }
+  db_sup_close_supervisor_ends(&dbsup); // the loader sockets: the Backend keeps only its own ends
 
   // 指示2: Backendプロセス側もFrontend用端点を直ちにclose
   for (int f = 0; f < g_num_frontend_routers; f++) {
@@ -5452,7 +5779,20 @@ int main(int argc, char **argv) {
   }
   /* 送信スレッドは終了時 (dnstap_shutdown) に自分で戻る。誰も join しない */
   pthread_detach(dnstap_sender_thread);
-  
+
+  // B9a: the thread that resolves the targets of ALIAS records (dns_alias.h).  It resolves through the broker like the forwarders of a
+  // type forward zone and does nothing while no zone has an ALIAS record and an alias-resolver.
+  if (!alias_start())
+    syslog(LOG_ERR, "[Backend] Cannot start the ALIAS resolver thread; ALIAS records are not expanded");
+
+  // beta design 1.3 / 1.5: the db ingest thread.  It limits the rights of the two descriptors the supervisor made
+  // (stream, control) and uses only them (read / write / recvmsg / kevent) once the sandbox is on.
+  if (cfg->database.enabled && !db_ingest_start(g_db_stream_fd, g_db_ctrl_fd)) {
+    syslog(LOG_ERR, "[Backend] Cannot start the database ingest thread; aborting startup");
+    fprintf(stderr, "[ERROR] [Backend] Cannot start the database ingest thread; aborting startup\n");
+    backend_exit(EXIT_FAILURE);
+  }
+
   enter_capsicum_sandbox(); // サンドボックス突入
 
   // 特権分離(setuid+Capsicum)が完了したため、各Workerスレッドにクエリ処理の開始を許可する

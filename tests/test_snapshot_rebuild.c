@@ -35,7 +35,7 @@
 #include "test_zone_slots.h"
 
 // Mock globals
-int g_control_kq = -1;
+_Atomic int g_control_kq = -1;
 int g_notify_ipc[2] = {-1, -1};
 int g_broker_sock = -1;
 config_rcu_t g_config_db;
@@ -446,8 +446,8 @@ static void test_snapshot_catalog_member_sync_and_deltas(void) {
         "options { directory \"%s\"; };\n"
         "view \"default\" {\n"
         "  zone \"cat.example\" { type master; file \"%s/cat_v1.zone\"; };\n"
-        "  zone \"member1.example\" { type master; file \"%s/m1.zone\"; in-catalog-zone \"cat.example\"; };\n"
-        "  zone \"member2.example\" { type master; file \"%s/m2.zone\"; in-catalog-zone \"cat.example\"; };\n"
+        "  zone \"member1.example\" { type master; file \"%s/m1.zone\"; };\n"
+        "  zone \"member2.example\" { type master; file \"%s/m2.zone\"; };\n"
         "};\n",
         g_dir, g_dir, g_dir, g_dir);
 
@@ -462,8 +462,8 @@ static void test_snapshot_catalog_member_sync_and_deltas(void) {
         "options { directory \"%s\"; };\n"
         "view \"default\" {\n"
         "  zone \"cat.example\" { type master; file \"%s/cat_v2.zone\"; };\n"
-        "  zone \"member1.example\" { type master; file \"%s/m1.zone\"; in-catalog-zone \"cat.example\"; };\n"
-        "  zone \"member3.example\" { type master; file \"%s/m3.zone\"; in-catalog-zone \"cat.example\"; };\n"
+        "  zone \"member1.example\" { type master; file \"%s/m1.zone\"; };\n"
+        "  zone \"member3.example\" { type master; file \"%s/m3.zone\"; };\n"
         "};\n",
         g_dir, g_dir, g_dir, g_dir);
 
@@ -558,7 +558,7 @@ static void test_snapshot_rebuild_case_8(void) {
     printf("[TEST] Snapshot Rebuild: Program zone configuration snapshot...\n");
     server_config_t *cfg = load_conf(
         "options { directory \"%s\"; allow-program-zones yes; };\n"
-        "view \"default\" { zone \"prog.example\" { type program; program-path \"/bin/echo\"; }; };\n",
+        "view \"default\" { zone \"prog.example\" { type program; program \"/bin/echo\"; }; };\n",
         g_dir);
     zone_db_snapshot_t *snap = build(cfg, false);
     assert(snap != NULL);
@@ -937,6 +937,85 @@ static void test_snapshot_rebuild_case_35(void) {
     release_zone_snapshot(snap);
 }
 
+static int g_retired_obj_freed;
+static void retired_obj_free(void *p) {
+    g_retired_obj_freed++;
+    free(p);
+}
+
+/* B0: zone_retire_object() frees an object only after the grace period and while the entry has no AXFR out /
+ * transfer in (the same conditions as a retired version); zone_entry_config() picks dbcfg for DB zones */
+static void test_retire_object_and_entry_config(void) {
+    printf("[TEST] Snapshot Rebuild: zone_retire_object() grace period / pinning, zone_entry_config()...\n");
+    zone_db_entry_t *e = create_new_zone_entry("objret.example", "");
+    assert(e && e->source == ZONE_SRC_CONFIG && atomic_load(&e->dbcfg) == NULL);
+    assert(atomic_load(&e->snapshot_refs) == 1);
+    void *spare = malloc(1);
+    assert(!zone_retire_object(NULL, spare, retired_obj_free, 0));
+    assert(!zone_retire_object(e, NULL, retired_obj_free, 0));
+    assert(!zone_retire_object(e, spare, NULL, 0));
+    free(spare);
+    assert(atomic_load(&e->snapshot_refs) == 1);
+
+    /* pinned by an outgoing AXFR: not freed even after a blocking grace period */
+    g_retired_obj_freed = 0;
+    atomic_store(&e->active_axfr, 1);
+    uint64_t ep = rcu_writer_advance_epoch();
+    assert(zone_retire_object(e, malloc(8), retired_obj_free, ep));
+    assert(atomic_load(&e->snapshot_refs) == 2);
+    zone_retire_process(true);
+    assert(g_retired_obj_freed == 0 && atomic_load(&e->snapshot_refs) == 2);
+    /* pinned by an inbound transfer */
+    atomic_store(&e->active_axfr, 0);
+    atomic_store(&e->is_transferring, true);
+    zone_retire_process(true);
+    assert(g_retired_obj_freed == 0 && atomic_load(&e->snapshot_refs) == 2);
+    atomic_store(&e->is_transferring, false);
+
+    /* unpinned: freed once the grace period has passed */
+    zone_retire_process(true);
+    assert(g_retired_obj_freed == 1 && atomic_load(&e->snapshot_refs) == 1);
+
+    /* a reader that entered before the retire epoch holds it back (no-wait variant) */
+    rcu_aux_read_lock();
+    ep = rcu_writer_advance_epoch();
+    assert(zone_retire_object(e, malloc(8), retired_obj_free, ep));
+    zone_retire_process(false);
+    assert(g_retired_obj_freed == 1 && atomic_load(&e->snapshot_refs) == 2);
+    rcu_aux_read_unlock();
+    zone_retire_process(false);
+    assert(g_retired_obj_freed == 2 && atomic_load(&e->snapshot_refs) == 1);
+
+    /* several objects on the stack, all pinned together */
+    atomic_store(&e->active_axfr, 1);
+    ep = rcu_writer_advance_epoch();
+    assert(zone_retire_object(e, malloc(8), retired_obj_free, ep));
+    assert(zone_retire_object(e, malloc(8), retired_obj_free, ep));
+    zone_retire_process(true);
+    assert(g_retired_obj_freed == 2);
+    atomic_store(&e->active_axfr, 0);
+    zone_retire_process(true);
+    assert(g_retired_obj_freed == 4 && atomic_load(&e->snapshot_refs) == 1);
+
+    /* zone_entry_config(): the DB zone's own settings; the others go through the config index */
+    zone_config_t dbc;
+    memset(&dbc, 0, sizeof(dbc));
+    assert(zone_entry_config(NULL, e) == NULL);
+    e->source = ZONE_SRC_DB;
+    assert(zone_entry_config(NULL, e) == NULL); /* dbcfg not set yet */
+    atomic_store(&e->dbcfg, &dbc);
+    assert(zone_entry_config(NULL, e) == &dbc);
+    atomic_store(&e->dbcfg, NULL);
+    e->source = ZONE_SRC_CATALOG;
+    server_config_t *cfg = load_conf("zone \"objret.example\" { type master; file \"/nonexistent\"; };\n");
+    const zone_config_t *c = zone_entry_config(cfg, e);
+    assert(c && c == find_zone_config_in_view(cfg, e->view_name, e->domain));
+    atomic_store(&e->dbcfg, &dbc); /* ignored unless source == ZONE_SRC_DB */
+    assert(zone_entry_config(cfg, e) == c);
+    atomic_store(&e->dbcfg, NULL);
+    free_zone_db_entry(e);
+}
+
 static void test_snapshot_standby_ecs_and_soa_serial(void) {
     printf("[TEST] Snapshot rebuild: Standby zone reload, ECS resolvers & SOA serial...\n");
 
@@ -954,7 +1033,6 @@ static void test_snapshot_standby_ecs_and_soa_serial(void) {
         "  zone \"standby.example\" {\n"
         "    type master;\n"
         "    file \"%s/standby.zone\";\n"
-        "    bind-ecs-trusted-resolvers { 192.0.2.0/24; 2001:db8::/32; };\n"
         "  };\n"
         "};\n",
         g_dir, g_dir);
@@ -1100,6 +1178,7 @@ int main(void) {
     test_snapshot_rebuild_case_32();
     test_snapshot_rebuild_case_33();
     test_snapshot_rebuild_case_35();
+    test_retire_object_and_entry_config();
     /* Remove the scratch directory in-process: detached snapshot GC threads may
      * still be running here, and fork()/exec from a multi-threaded process (as
      * system("rm -rf") did) can deadlock the child under ASan. */

@@ -31,7 +31,7 @@
 #include "test_zone_slots.h"
 
 // Mock globals
-int g_control_kq = -1;
+_Atomic int g_control_kq = -1;
 int g_notify_ipc[2] = {-1, -1};
 int g_broker_sock = -1;
 config_rcu_t g_config_db;
@@ -6528,6 +6528,580 @@ static void test_ixfr_history_depth(void) {
     printf("  -> ixfr-history depth passed.\n");
 }
 
+/* ---------------------------------------------------------------------------------------------------------------------------------
+ * B8t-2: Extended AXFR version 3 - the encoder records, the receiver (SOA_SET, wrapped SOA RRs, SETTINGS), the sender (version
+ * negotiation, v2 refusal, byte-identity of v2 and v3 for a plain zone) and the settings (render, precedence, fail closed).
+ * ------------------------------------------------------------------------------------------------------------------------------ */
+
+typedef struct { uint8_t b[8192]; size_t n; uint16_t an; } b8_pk_t;
+
+static void b8_init(b8_pk_t *p) { memset(p, 0, sizeof(*p)); p->b[2] = 0x84; p->n = DNS_HEADER_SIZE; }
+
+static size_t b8_name(uint8_t *o, const char *name) {
+    size_t n = 0;
+    const char *s = name;
+    while (*s) {
+        const char *dot = strchr(s, '.');
+        size_t l = dot ? (size_t)(dot - s) : strlen(s);
+        o[n++] = (uint8_t)l;
+        memcpy(o + n, s, l);
+        n += l;
+        if (!dot) break;
+        s = dot + 1;
+    }
+    o[n++] = 0;
+    return n;
+}
+
+static void b8_u16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+static void b8_u32(uint8_t *p, uint32_t v) { b8_u16(p, (uint16_t)(v >> 16)); b8_u16(p + 2, (uint16_t)v); }
+
+static void b8_rr(b8_pk_t *p, const char *owner, uint16_t type, uint16_t cls, const uint8_t *rd, size_t rdlen) {
+    p->n += b8_name(p->b + p->n, owner);
+    b8_u16(p->b + p->n, type); p->n += 2;
+    b8_u16(p->b + p->n, cls); p->n += 2;
+    b8_u32(p->b + p->n, 300); p->n += 4;
+    b8_u16(p->b + p->n, (uint16_t)rdlen); p->n += 2;
+    memcpy(p->b + p->n, rd, rdlen);
+    p->n += rdlen;
+    p->an++;
+    b8_u16(p->b + 6, p->an);
+}
+
+static size_t b8_soa_rdata(uint8_t *rd, const char *zone, uint32_t serial, uint32_t refresh) {
+    char mn[200], rn[200];
+    snprintf(mn, sizeof(mn), "ns.%s", zone);
+    snprintf(rn, sizeof(rn), "host.%s", zone);
+    size_t n = b8_name(rd, mn);
+    n += b8_name(rd + n, rn);
+    b8_u32(rd + n, serial); b8_u32(rd + n + 4, refresh); b8_u32(rd + n + 8, 600); b8_u32(rd + n + 12, 86400); b8_u32(rd + n + 16, 300);
+    return n + 20;
+}
+
+static void b8_soa(b8_pk_t *p, const char *zone, uint32_t serial, uint32_t refresh) {
+    uint8_t rd[400];
+    b8_rr(p, zone, 6, 1, rd, b8_soa_rdata(rd, zone, serial, refresh));
+}
+
+/* a SOA of a SOA set: TYPE 65406 around it, with the tinydns location loc ("" = none) */
+static void b8_wsoa(b8_pk_t *p, const char *zone, uint32_t serial, uint32_t refresh, const char *loc) {
+    uint8_t rd[400], w[500];
+    size_t n = b8_soa_rdata(rd, zone, serial, refresh);
+    memset(w, 0, sizeof(w));
+    b8_u16(w, 6); b8_u16(w + 2, 1); b8_u32(w + 4, 300);
+    w[8] = (uint8_t)loc[0]; w[9] = loc[0] ? (uint8_t)loc[1] : 0;
+    b8_u16(w + 19, (uint16_t)n);
+    memcpy(w + 21, rd, n);
+    b8_rr(p, zone, 65406, 65302, w, 21 + n);
+}
+
+static int b8_feed(axfr_session_t *s, zone_arena_t *a, const b8_pk_t *p, const char *zone) {
+    return parse_xfr_packet(p->b, p->n, a, NULL, s, zone);
+}
+
+static void b8_session(axfr_session_t *s, uint8_t ver) {
+    memset(s, 0, sizeof(*s));
+    s->is_extended_mode = ver != 0;
+    s->ext_version = ver;
+}
+
+typedef struct { uint16_t type; uint16_t cls; uint8_t rd[64]; size_t len; int n; } b8_cap_t;
+
+static int b8_cap_cb(void *ud, const dns_record_t *rec) {
+    b8_cap_t *k = ud;
+    k->type = rec->type_code;
+    k->cls = rec->class_val;
+    k->len = rec->generic_len;
+    if (rec->generic_len <= sizeof(k->rd)) memcpy(k->rd, rec->generic_data, rec->generic_len);
+    k->n++;
+    return 0;
+}
+
+static void test_b8t2_xext_records(void) {
+    printf("[TEST] B8t-2: the encoder writes SOA_SET (65409) and SETTINGS (65408)...\n");
+    b8_cap_t c;
+    memset(&c, 0, sizeof(c));
+    xext_t x;
+    xext_init(&x, "z.example.", b8_cap_cb, &c);
+    assert(xext_emit_soa_set(&x, 258) == 0);
+    assert(c.n == 1 && c.type == 65409 && c.cls == 65302 && c.len == 3 && c.rd[0] == 1 && c.rd[1] == 1 && c.rd[2] == 2);
+    assert(xext_emit_settings(&x, "allow-transfer { none; };\n", 25) == 0);
+    assert(c.n == 2 && c.type == 65408 && c.cls == 65302 && c.len == 25 && memcmp(c.rd, "allow-transfer", 14) == 0);
+    assert(xext_emit_settings(&x, "", 0) < 0);                               /* nothing to send is the caller's choice */
+    char big[KARIDNS_SETTINGS_MAX + 2];
+    memset(big, 'a', sizeof(big));
+    assert(xext_emit_settings(&x, big, KARIDNS_SETTINGS_MAX + 1) < 0);       /* too long: refused, not truncated */
+    xext_free(&x);
+    printf("  -> encoder records passed.\n");
+}
+
+/* B9a (decision: the type numbers of PowerDNS's ALIAS / LUA records and of two Extended AXFR records are the same): everything that
+ * reads an Extended AXFR stream decides on (type, class).  A zone RR of CLASS IN is a zone RR whatever its type number; a record of
+ * CLASS 65302 is an Extended AXFR record whatever it holds. */
+static void test_b9a_type_class_audit(void) {
+    printf("[TEST] B9a: ALIAS / LUA (TYPE 65401 / 65402, CLASS IN) next to the Extended AXFR records of the same numbers (CLASS 65302)...\n");
+    const char *z = "z.example.";
+    uint8_t alias_rd[32];
+    size_t alias_len = b8_name(alias_rd, "t.target.example.");
+    static const uint8_t lua_rd[] = { 0, 1, 3, 'a', 'b', 'c' };
+    static const uint8_t a_rd[4] = { 192, 0, 2, 1 };
+
+    for (int ver = 0; ver <= 3; ver += 3) {           /* a standard AXFR and an Extended AXFR (version 3) */
+        zone_arena_t a;
+        axfr_session_t s;
+        b8_pk_t p;
+        zone_arena_init(&a);
+        b8_session(&s, (uint8_t)ver);
+        b8_init(&p);
+        b8_soa(&p, z, 7, 3600);
+        if (ver) b8_rr(&p, z, 65401, 65302, (const uint8_t *)"lan", 3);        /* LOC_STATE: the RRs that follow are in the tag lan */
+        b8_rr(&p, "a.z.example.", 65401, 1, alias_rd, alias_len);               /* ALIAS */
+        b8_rr(&p, "l.z.example.", 65402, 1, lua_rd, sizeof(lua_rd));            /* LUA */
+        if (ver) b8_rr(&p, z, 65401, 65302, (const uint8_t *)"", 0);            /* LOC_STATE: no tag */
+        b8_rr(&p, "www.z.example.", 1, 1, a_rd, 4);
+        b8_soa(&p, z, 7, 3600);
+        assert(b8_feed(&s, &a, &p, z) == 0 && s.is_finished);
+        int n_alias = 0, n_lua = 0, n_ext = 0;
+        for (size_t i = 0; i < a.count; i++) {
+            const dns_record_t *r = &a.records[i];
+            if (r->class_val == 65302) n_ext++;
+            if (r->type_code == 65401 && r->class_val == 1) {
+                n_alias++;
+                assert(r->generic_len == alias_len && memcmp(r->generic_data, alias_rd, alias_len) == 0);
+                if (ver) assert(r->bind_location_tag && strcmp(r->bind_location_tag, "lan") == 0);   /* in the tag, as the state record said */
+                else assert(!r->bind_location_tag);
+            }
+            if (r->type_code == 65402 && r->class_val == 1) {
+                n_lua++;
+                assert(r->generic_len == sizeof(lua_rd) && memcmp(r->generic_data, lua_rd, sizeof(lua_rd)) == 0);
+            }
+        }
+        assert(n_alias == 1 && n_lua == 1 && n_ext == 0);                       /* the state records were consumed, the zone RRs kept */
+        assert(s.ext_records == (ver ? 2u : 0u));                               /* only the CLASS 65302 records are Extended AXFR records */
+        zone_arena_destroy(&a);
+    }
+
+    /* the same numbers in CLASS 65302 in a standard (non-extended) session are not zone data either: they are never stored as ALIAS / LUA */
+    {
+        zone_arena_t a;
+        axfr_session_t s;
+        b8_pk_t p;
+        zone_arena_init(&a);
+        b8_session(&s, 0);
+        b8_init(&p);
+        b8_soa(&p, z, 7, 3600);
+        b8_rr(&p, "a.z.example.", 65401, 65302, alias_rd, alias_len);
+        b8_soa(&p, z, 7, 3600);
+        int rc = b8_feed(&s, &a, &p, z);
+        for (size_t i = 0; i < a.count; i++) assert(!(a.records[i].type_code == 65401 && a.records[i].class_val == 1));
+        (void)rc;                                                               /* accepted or refused: the point is that it did not become an ALIAS */
+        zone_arena_destroy(&a);
+    }
+    printf("  -> (type, class) audit passed.\n");
+}
+
+static void test_b8t2_receiver_soa_set(void) {
+    printf("[TEST] B8t-2: the receiver reads a SOA set, SETTINGS and rejects what does not fit...\n");
+    const char *z = "z.example.";
+    zone_arena_t a;
+    axfr_session_t s;
+    b8_pk_t p;
+    uint8_t set2[3] = { 1, 0, 2 };
+    const char *txt = "allow-transfer { 192.0.2.1; };";
+
+    /* a complete version 3 stream in two messages */
+    zone_arena_init(&a);
+    b8_session(&s, 3);
+    b8_init(&p);
+    b8_soa(&p, z, 7, 3600);
+    b8_rr(&p, z, 65409, 65302, set2, 3);
+    b8_rr(&p, z, 65408, 65302, (const uint8_t *)txt, strlen(txt));
+    b8_wsoa(&p, z, 7, 3600, "in");
+    assert(b8_feed(&s, &a, &p, z) == 0);
+    assert(s.soa_set && s.soa_set_expected == 2 && s.frame_valid && s.frame_refresh == 3600 && a.count == 1);
+    assert(s.has_settings && s.settings_len == strlen(txt) && strcmp(s.settings_text, txt) == 0 && !s.is_finished);
+    assert(a.records[0].type_code == 6 && a.records[0].tinydns_loc[0] == 'i' && a.records[0].tinydns_loc[1] == 'n');
+    /* the location makes it a tinydns zone: */
+    assert(a.is_tinydns_format);
+    b8_init(&p);
+    b8_wsoa(&p, z, 7, 3600, "");
+    b8_soa(&p, z, 7, 3600);
+    assert(b8_feed(&s, &a, &p, z) == 0);
+    assert(s.is_finished && s.soa_set_seen == 2 && a.count == 2 && s.soa_count == 2);   /* the frame is not stored; the wrappers are not frames */
+    assert(a.records[1].tinydns_loc[0] == 0 && a.records[1].type_code == 6);
+    zone_arena_destroy(&a);
+
+    /* a wrapper with no tinydns attribute (a tag only) does not make a tinydns zone */
+    zone_arena_init(&a);
+    b8_session(&s, 3);
+    b8_init(&p);
+    b8_soa(&p, z, 7, 3600);
+    b8_rr(&p, z, 65409, 65302, (uint8_t[]){ 1, 0, 1 }, 3);
+    b8_wsoa(&p, z, 7, 3600, "");
+    b8_soa(&p, z, 7, 3600);
+    assert(b8_feed(&s, &a, &p, z) == 0 && s.is_finished && !a.is_tinydns_format && a.count == 1);
+    zone_arena_destroy(&a);
+
+    /* SOA_SET not right after the opening SOA (a data record first) */
+    zone_arena_init(&a);
+    b8_session(&s, 3);
+    b8_init(&p);
+    b8_soa(&p, z, 7, 3600);
+    b8_rr(&p, "www.z.example.", 1, 1, (uint8_t[]){ 192, 0, 2, 1 }, 4);
+    b8_rr(&p, z, 65409, 65302, set2, 3);
+    assert(b8_feed(&s, &a, &p, z) != 0);
+    zone_arena_destroy(&a);
+
+    /* the transfer ends before all the announced SOA RRs */
+    zone_arena_init(&a);
+    b8_session(&s, 3);
+    b8_init(&p);
+    b8_soa(&p, z, 7, 3600);
+    b8_rr(&p, z, 65409, 65302, set2, 3);
+    b8_wsoa(&p, z, 7, 3600, "in");
+    b8_soa(&p, z, 7, 3600);
+    assert(b8_feed(&s, &a, &p, z) != 0);
+    zone_arena_destroy(&a);
+
+    /* a body SOA with another serial, more body SOAs than announced, a body SOA outside the apex */
+    for (int k = 0; k < 3; k++) {
+        zone_arena_init(&a);
+        b8_session(&s, 3);
+        b8_init(&p);
+        b8_soa(&p, z, 7, 3600);
+        b8_rr(&p, z, 65409, 65302, (uint8_t[]){ 1, 0, 1 }, 3);
+        if (k == 0) b8_wsoa(&p, z, 8, 3600, "in");
+        else if (k == 1) { b8_wsoa(&p, z, 7, 3600, "in"); b8_wsoa(&p, z, 7, 3600, "ex"); }
+        else b8_wsoa(&p, "sub.z.example.", 7, 3600, "in");
+        assert(b8_feed(&s, &a, &p, z) != 0);
+        zone_arena_destroy(&a);
+    }
+
+    /* SOA_SET announcing nothing, or more than the limit, or with the flag clear */
+    for (int k = 0; k < 3; k++) {
+        uint8_t bad[3] = { 1, 0, 0 };
+        if (k == 1) { bad[1] = 0x20; }                              /* 8192 > KARIDNS_SOA_SET_MAX */
+        if (k == 2) { bad[0] = 0; bad[2] = 1; }
+        zone_arena_init(&a);
+        b8_session(&s, 3);
+        b8_init(&p);
+        b8_soa(&p, z, 7, 3600);
+        b8_rr(&p, z, 65409, 65302, bad, 3);
+        assert(b8_feed(&s, &a, &p, z) != 0);
+        zone_arena_destroy(&a);
+    }
+
+    /* SETTINGS: ignored for a version 2 stream and for a stream that was not negotiated; a second one is ignored; the database
+     * loader may not send one */
+    for (int k = 0; k < 4; k++) {
+        zone_arena_init(&a);
+        b8_session(&s, k == 0 ? 2 : k == 1 ? 0 : 3);
+        s.db_stream = k == 3;
+        b8_init(&p);
+        b8_soa(&p, z, 7, 3600);
+        b8_rr(&p, z, 65408, 65302, (const uint8_t *)txt, strlen(txt));
+        if (k == 2) b8_rr(&p, z, 65408, 65302, (const uint8_t *)"zone-udp-bufsize 512;", 21);
+        int rc = b8_feed(&s, &a, &p, z);
+        if (k == 3) assert(rc != 0);
+        else assert(rc == 0 && s.has_settings == (k == 2) && (k != 2 || strcmp(s.settings_text, txt) == 0));
+        zone_arena_destroy(&a);
+    }
+
+    /* a wrapper around a SOA whose RDATA cannot be decoded (fuzz_xfr_packet found a NULL RDATA read here): the transfer is refused */
+    for (int k = 0; k < 2; k++) {
+        zone_arena_init(&a);
+        b8_session(&s, k == 0 ? 3 : 2);
+        b8_init(&p);
+        b8_soa(&p, z, 7, 3600);
+        uint8_t w[24];
+        memset(w, 0, sizeof(w));
+        b8_u16(w, 6); b8_u16(w + 2, 1); b8_u32(w + 4, 300);
+        b8_u16(w + 19, 3);
+        memcpy(w + 21, "abc", 3);
+        b8_rr(&p, z, 65406, 65302, w, 24);
+        b8_soa(&p, z, 7, 3600);
+        assert(b8_feed(&s, &a, &p, z) != 0);
+        zone_arena_destroy(&a);
+    }
+
+    /* a wrapped SOA with no SOA_SET before it is an ordinary closing SOA of the same serial (the version 2 behaviour) */
+    zone_arena_init(&a);
+    b8_session(&s, 3);
+    b8_init(&p);
+    b8_soa(&p, z, 7, 3600);
+    b8_wsoa(&p, z, 7, 3600, "in");
+    assert(b8_feed(&s, &a, &p, z) == 0 && s.is_finished && !s.soa_set);
+    zone_arena_destroy(&a);
+    printf("  -> receiver SOA set and SETTINGS passed.\n");
+}
+
+/* the record types of the answers of the first message in g_tcp_out, e.g. "6,65409,65406,6" */
+static void b8_types(char *out, size_t cap) {
+    const uint8_t *p = g_tcp_out + 2;
+    size_t len = ((size_t)g_tcp_out[0] << 8) | g_tcp_out[1];
+    unsigned qd = (p[4] << 8) | p[5], an = (p[6] << 8) | p[7];
+    size_t o = DNS_HEADER_SIZE, n;
+    out[0] = '\0';
+    for (unsigned i = 0; i < qd; i++) { assert(skip_wire_name(p, len, o, &n) == 0); o = n + 4; }
+    for (unsigned i = 0; i < an; i++) {
+        assert(skip_wire_name(p, len, o, &n) == 0);
+        unsigned t = (p[n] << 8) | p[n + 1], c = (p[n + 2] << 8) | p[n + 3];
+        size_t rdlen = (p[n + 8] << 8) | p[n + 9];
+        char one[16];
+        snprintf(one, sizeof(one), "%s%u", out[0] ? "," : "", c == 65302 ? t : (t == 6 ? 6u : 1u));
+        strlcat(out, one, cap);
+        o = n + 10 + rdlen;
+    }
+}
+
+static size_t b8_query(uint8_t *q, size_t cap, const char *zone, uint8_t ver) {
+    size_t ql = p10_query(q, cap, zone, 252, -1, true, true);
+    /* p10_query writes KARIDNS_EXT_VERSION as the first octet of the option's data: the 7th octet from the end of the option */
+    assert(ql > 5 && q[ql - 5] == KARIDNS_EXT_VERSION);
+    q[ql - 5] = ver;
+    return ql;
+}
+
+/* An IXFR rebuilds the transfer's arena from the current version when it reads the second SOA, after the SETTINGS record: the text
+ * must not live in that arena (an intermittent garbled settings text in run_ext_axfr_v3_test.sh) */
+static void test_b8t2_ixfr_settings_survive_thaw(void) {
+    printf("[TEST] B8t-2: SETTINGS before the second SOA of an IXFR survives the rebuild of the arena...\n");
+    const char *z = "ix.example.";
+    zone_arena_t active;
+    p10_init_zone(&active, z, "7", "www IN A 192.0.2.80\n");
+    zone_arena_t a;
+    zone_arena_init(&a);
+    axfr_session_t s;
+    b8_session(&s, 3);
+    s.is_ixfr = true;
+    s.client_serial = 7;
+    const char *txt = "allow-transfer { 192.0.2.1; 192.0.2.2; 192.0.2.3; };\necs-trusted-resolvers { 192.0.2.50; };\n";
+    b8_pk_t p;
+    b8_init(&p);
+    b8_soa(&p, z, 8, 3600);
+    b8_rr(&p, z, 65408, 65302, (const uint8_t *)txt, strlen(txt));
+    b8_soa(&p, z, 7, 3600);
+    b8_rr(&p, "www.ix.example.", 1, 1, (uint8_t[]){ 192, 0, 2, 80 }, 4);
+    b8_soa(&p, z, 8, 3600);
+    b8_rr(&p, "www.ix.example.", 1, 1, (uint8_t[]){ 192, 0, 2, 81 }, 4);
+    b8_soa(&p, z, 8, 3600);
+    assert(parse_xfr_packet(p.b, p.n, &a, &active.ver, &s, z) == 0);
+    assert(s.is_finished && s.is_ixfr && s.has_settings && s.settings_len == strlen(txt) && strcmp(s.settings_text, txt) == 0);
+    zone_arena_destroy(&a);
+    zone_arena_destroy(&active);
+    printf("  -> IXFR settings passed.\n");
+}
+
+static void test_b8t2_ext_version_fallback_decision(void) {
+    printf("[TEST] B8t-2: the secondary's choice of Extended AXFR version (v3, fall back to v2, re-probe)...\n");
+    time_t t0 = 1000000;
+    /* nothing known: ask for 3, and a standard answer means "try 2" */
+    assert(xfr_ext_effective(XFR_EXT_UNKNOWN, 0, t0) == XFR_EXT_UNKNOWN);
+    assert(xfr_ext_request_version(XFR_EXT_UNKNOWN) == 3 && xfr_ext_probe(XFR_EXT_UNKNOWN));
+    /* the answer to version 2 was extended with version 2: remembered, version 2 is asked for from then on, without a probe */
+    assert(xfr_ext_learn(true, 2) == XFR_EXT_V2);
+    assert(xfr_ext_request_version(XFR_EXT_V2) == 2 && !xfr_ext_probe(XFR_EXT_V2));
+    assert(xfr_ext_effective(XFR_EXT_V2, t0, t0 + XFR_EXT_REPROBE_SECS) == XFR_EXT_V2);
+    assert(xfr_ext_effective(XFR_EXT_V2, t0, t0 + XFR_EXT_REPROBE_SECS + 1) == XFR_EXT_UNKNOWN);   /* probed again later */
+    /* a primary that answers a standard transfer to version 2 as well: version 3 is asked, a standard answer is accepted at once */
+    assert(xfr_ext_learn(false, 0) == XFR_EXT_STANDARD);
+    assert(xfr_ext_request_version(XFR_EXT_STANDARD) == 3 && !xfr_ext_probe(XFR_EXT_STANDARD));
+    assert(xfr_ext_effective(XFR_EXT_STANDARD, t0, t0 + XFR_EXT_REPROBE_SECS + 1) == XFR_EXT_UNKNOWN);
+    /* a version 3 primary stays at 3 (no expiry); if it later answers a standard transfer the probe runs */
+    assert(xfr_ext_learn(true, 3) == XFR_EXT_V3 && xfr_ext_probe(XFR_EXT_V3));
+    assert(xfr_ext_effective(XFR_EXT_V3, t0, t0 + 10 * XFR_EXT_REPROBE_SECS) == XFR_EXT_V3);
+    printf("  -> version fallback decision passed.\n");
+}
+
+static void test_b8t2_sender_versions(void) {
+    printf("[TEST] B8t-2: the sender answers version 2 and 3, refuses a SOA set to version 2, v2 and v3 of a plain zone agree...\n");
+    zone_db_entry_t e;
+    memset(&e, 0, sizeof(e));
+    strlcpy(e.domain, "b8.example.", sizeof(e.domain));
+    strlcpy(e.view_name, "default", sizeof(e.view_name));
+    pthread_mutex_init(&e.writer_lock, NULL);
+    pthread_mutex_init(&e.ixfr_history.lock, NULL);
+    uint8_t q[512];
+    char t2[256], t3[256];
+    p10_msg_t m;
+
+    /* a plain zone: the version 3 stream is the version 2 stream (no settings without a configuration, no SOA_SET) */
+    p10_init_zone(test_zone_slot(&e, 0), "b8.example.", "100", "www IN A 192.0.2.80\n");
+    atomic_store_explicit(&e.rcu.active, &test_zone_slot(&e, 0)->ver, memory_order_release);
+    size_t ql = b8_query(q, sizeof(q), "b8.example.", 2);
+    p10_send(&e, q, ql);
+    m = p10_first_msg();
+    assert(m.rcode == 0 && m.soa_count == 2 && m.opt);
+    b8_types(t2, sizeof(t2));
+    size_t len2 = g_tcp_out_len;
+    ql = b8_query(q, sizeof(q), "b8.example.", 3);
+    p10_send(&e, q, ql);
+    b8_types(t3, sizeof(t3));
+    assert(strcmp(t2, t3) == 0 && g_tcp_out_len == len2);
+    ql = b8_query(q, sizeof(q), "b8.example.", 4);                 /* an unknown version: a standard transfer */
+    p10_send(&e, q, ql);
+    m = p10_first_msg();
+    assert(m.rcode == 0 && m.soa_count == 2);
+    zone_arena_destroy(test_zone_slot(&e, 0));
+
+    /* a zone with a second, tagged SOA of the same serial */
+    p10_init_zone(test_zone_slot(&e, 0), "b8.example.", "100",
+                  "$LOCATION lt-a\n@ IN SOA ns9.b8.example. hostmaster.b8.example. 100 7200 3600 1209600 300\n$LOCATION\nwww IN A 192.0.2.80\n");
+    atomic_store_explicit(&e.rcu.active, &test_zone_slot(&e, 0)->ver, memory_order_release);
+    ql = b8_query(q, sizeof(q), "b8.example.", 2);
+    p10_send(&e, q, ql);
+    m = p10_first_msg();
+    assert(m.rcode == 5);                                           /* version 2 cannot carry the SOA set: refused */
+    ql = b8_query(q, sizeof(q), "b8.example.", 3);
+    p10_send(&e, q, ql);
+    m = p10_first_msg();
+    b8_types(t3, sizeof(t3));
+    assert(m.rcode == 0 && strncmp(t3, "6,65409,", 8) == 0);
+    assert(strstr(t3, "65406") && strstr(t3, ",65406,") && t3[strlen(t3) - 1] == '6');
+    int nwrap = 0;
+    for (const char *s = t3; (s = strstr(s, "65406")); s += 5) nwrap++;
+    assert(nwrap == 2);                                             /* both apex SOA RRs are body RRs */
+    /* a plain transfer (no option) is the zone as the requester sees it */
+    ql = p10_query(q, sizeof(q), "b8.example.", 252, -1, true, false);
+    p10_send(&e, q, ql);
+    m = p10_first_msg();
+    assert(m.rcode == 0 || m.rcode == 5);
+
+    ixfr_history_clear(&e.ixfr_history);
+    zone_arena_destroy(test_zone_slot(&e, 0));
+    pthread_mutex_destroy(&e.writer_lock);
+    pthread_mutex_destroy(&e.ixfr_history.lock);
+    printf("  -> sender versions passed.\n");
+}
+
+static void test_b8t2_settings(void) {
+    printf("[TEST] B8t-2: zone settings: render, precedence of the secondary's own statements, fail closed...\n");
+    server_config_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    const char *ptext =
+        "options { ecs-trusted-resolvers { 192.0.2.50; }; additional-from-auth in-domain; udp-bufsize 1400; };\n"
+        "key \"kx\" { algorithm hmac-sha256; secret \"dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl\"; };\n"
+        "zone \"a.example\" { type master; file \"a.zone\"; allow-transfer { 192.0.2.1; !192.0.2.9; key \"kx\"; }; transfer-acl-match any; };\n"
+        "zone \"b.example\" { type master; file \"b.zone\"; ecs-trusted-resolvers { 192.0.2.60; 198.51.100.0/24; }; zone-udp-bufsize 800; additional-from-auth no; };\n";
+    assert(parse_named_conf(ptext, &pcfg) == 0);
+    char buf[KARIDNS_SETTINGS_MAX + 1];
+    const zone_config_t *za = config_find_zone_any_view(&pcfg, "a.example.");
+    const zone_config_t *zb = config_find_zone_any_view(&pcfg, "b.example.");
+    assert(za && zb);
+
+    size_t n = zone_settings_render(&pcfg, za, false, buf, sizeof(buf));
+    assert(n > 0 && n == strlen(buf));
+    assert(strstr(buf, "allow-transfer { 192.0.2.1; !192.0.2.9; key \"kx\"; };\n"));
+    assert(strstr(buf, "transfer-acl-match any;\n"));
+    assert(strstr(buf, "ecs-trusted-resolvers { 192.0.2.50; };\n"));          /* options' list: the zone has none */
+    assert(strstr(buf, "additional-from-auth in-domain;\n") && strstr(buf, "zone-udp-bufsize 1400;\n"));
+    assert(!strstr(buf, "secret") && !strstr(buf, "dGVzdC1v") && !strstr(buf, "acl-ceiling") && !strstr(buf, "masters"));
+    n = zone_settings_render(&pcfg, za, true, buf, sizeof(buf));              /* the zone's data carries its own list */
+    assert(n > 0 && !strstr(buf, "ecs-trusted-resolvers"));
+    n = zone_settings_render(&pcfg, zb, false, buf, sizeof(buf));
+    assert(strstr(buf, "ecs-trusted-resolvers { 192.0.2.60; 198.51.100.0/24; };\n") && strstr(buf, "zone-udp-bufsize 800;\n") &&
+           strstr(buf, "additional-from-auth no;\n") && !strstr(buf, "allow-transfer"));
+    assert(zone_settings_render(&pcfg, za, false, buf, 40) == (size_t)-1);    /* does not fit: reported, never cut */
+
+    /* the secondary: it parses what it got, with the restricted parser, and merges it with its own zone block */
+    char err[200];
+    n = zone_settings_render(&pcfg, za, false, buf, sizeof(buf));
+    zone_ext_shared_t *rx = db_settings_parse(buf, n, err, sizeof(err));
+    assert(rx != NULL);
+    server_config_t scfg;
+    memset(&scfg, 0, sizeof(scfg));
+    const char *stext =
+        "options { ecs-trusted-resolvers { 203.0.113.1; }; };\n"
+        "key \"kx\" { algorithm hmac-sha256; secret \"dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl\"; };\n"
+        "zone \"a.example\" { type slave; masters { 192.0.2.254; }; };\n"
+        "zone \"own.example\" { type slave; masters { 192.0.2.254; }; allow-transfer { 198.51.100.7; }; ecs-trusted-resolvers { 198.51.100.8; }; zone-udp-bufsize 700; additional-from-auth yes; };\n"
+        "zone \"off.example\" { type slave; masters { 192.0.2.254; }; primary-settings no; };\n"
+        "zone \"nokey.example\" { type slave; masters { 192.0.2.254; }; };\n";
+    assert(parse_named_conf(stext, &scfg) == 0);
+    const zone_config_t *sa = config_find_zone_any_view(&scfg, "a.example.");
+    const zone_config_t *so = config_find_zone_any_view(&scfg, "own.example.");
+    const zone_config_t *sf = config_find_zone_any_view(&scfg, "off.example.");
+    assert(sa && so && sf && zext(sf)->primary_settings_off && !zext(sa)->primary_settings_off);
+    char note[160];
+
+    zone_config_t *m1 = zone_config_with_received("a.example.", sa, &rx->ext, &scfg, note, sizeof(note));
+    assert(m1 && note[0] == '\0' && strcmp(m1->type, "slave") == 0);
+    assert(zext(m1)->masters_count == 1 && strcmp(zext(m1)->masters[0].ip, "192.0.2.254") == 0);   /* the zone's own statements stay */
+    assert(zext(m1)->allow_transfer_count == 2 && strcmp(zext(m1)->allow_transfer[0], "192.0.2.1") == 0 &&
+           strcmp(zext(m1)->allow_transfer[1], "!192.0.2.9") == 0 && zext(m1)->tsig_keys_count == 1 &&
+           zext(m1)->allow_transfer_parsed != NULL && zext(m1)->transfer_acl_match == ACL_MATCH_ANY);
+    assert(zext(m1)->ecs_trusted_resolvers_count == 1 && strcmp(zext(m1)->ecs_trusted_resolvers[0], "192.0.2.50") == 0 &&
+           zext(m1)->ecs_trusted_resolvers_parsed != NULL);                  /* received > the secondary's options */
+    assert(zext(m1)->additional_from_auth_specified && zext(m1)->additional_from_auth == ADDITIONAL_AUTH_IN_DOMAIN &&
+           zext(m1)->zone_udp_bufsize == 1400);
+    assert(!zext(m1)->db_acl_ceiling);
+    free_zone_config(m1);
+
+    m1 = zone_config_with_received("own.example.", so, &rx->ext, &scfg, note, sizeof(note));    /* the secondary's own statements win */
+    assert(m1 && zext(m1)->allow_transfer_count == 1 && strcmp(zext(m1)->allow_transfer[0], "198.51.100.7") == 0 &&
+           zext(m1)->tsig_keys_count == 0);
+    assert(zext(m1)->ecs_trusted_resolvers_count == 1 && strcmp(zext(m1)->ecs_trusted_resolvers[0], "198.51.100.8") == 0);
+    assert(zext(m1)->zone_udp_bufsize == 700 && zext(m1)->additional_from_auth == ADDITIONAL_AUTH_YES);
+    free_zone_config(m1);
+
+    m1 = zone_config_with_received("cat.example.", NULL, &rx->ext, &scfg, note, sizeof(note));  /* a catalog member has no zone block */
+    assert(m1 && strcmp(m1->type, "slave") == 0 && zext(m1)->allow_transfer_count == 2);
+    free_zone_config(m1);
+
+    /* the received allow-transfer names a key this server does not have: it becomes "none" */
+    server_config_t kcfg;
+    memset(&kcfg, 0, sizeof(kcfg));
+    assert(parse_named_conf("zone \"nokey.example\" { type slave; masters { 192.0.2.254; }; };\n", &kcfg) == 0);
+    const zone_config_t *sk = config_find_zone_any_view(&kcfg, "nokey.example.");
+    m1 = zone_config_with_received("nokey.example.", sk, &rx->ext, &kcfg, note, sizeof(note));
+    assert(m1 && strstr(note, "'kx'") && zext(m1)->allow_transfer_count == 1 && strcmp(zext(m1)->allow_transfer[0], "none") == 0 &&
+           zext(m1)->tsig_keys_count == 0 && zext(m1)->allow_transfer_parsed != NULL);
+    assert(zext(m1)->ecs_trusted_resolvers_count == 1);                       /* the rest is still applied */
+    free_zone_config(m1);
+    free_server_config_fields(&kcfg);
+
+    /* settings cannot name a statement outside the whitelist: a hostile primary cannot set file, type, include... */
+    assert(db_settings_parse("file \"/etc/passwd\";", 19, err, sizeof(err)) == NULL);
+    assert(db_settings_parse("include \"/etc/passwd\";", 22, err, sizeof(err)) == NULL);
+    assert(db_settings_parse("masters { 192.0.2.1; }; allow-transfer { any; };", 48, err, sizeof(err)) != NULL);   /* parsed, then ignored */
+
+    zone_ext_shared_unref(rx);
+    free_server_config_fields(&pcfg);
+    free_server_config_fields(&scfg);
+    printf("  -> settings passed.\n");
+}
+
+static void test_b8t2_same_visibility_ttl(void) {
+    printf("[TEST] B8t-2: RRset TTLs are harmonized among RRs of the same visibility only...\n");
+    zone_arena_t a;
+    zone_arena_init(&a);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "t.example.", .is_standalone_mode = true, .err_out = &err };
+    const char *text =
+        "$ORIGIN t.example.\n$TTL 300\n@ IN SOA ns1 hm 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n"
+        "plain 300 IN A 192.0.2.10\nplain 100 IN A 192.0.2.11\n"
+        "$LOCATION lt-a\nmix 60 IN A 192.0.2.20\nloc 50 IN A 192.0.2.30\n"
+        "$LOCATION lt-b\nloc 70 IN A 192.0.2.31\n"
+        "$LOCATION\nmix 300 IN A 192.0.2.21\n"
+        "$LOCATION lt-a\nsame 90 IN A 192.0.2.40\nsame 120 IN A 192.0.2.41\n";
+    char *buf = arena_strdup(&a, text);
+    assert(parse_zone_fast(buf, strlen(buf), &a, &ctx) >= 0);
+    assert(build_zone_index(&a, true) == 0);
+    int seen = 0;
+    for (size_t i = 0; i < a.count; i++) {
+        const dns_record_t *r = &a.records[i];
+        if (!r->name || r->type_code != 1) continue;
+        if (strncmp(r->name, "plain.", 6) == 0) { assert(r->ttl_value == 100); seen++; }                 /* harmonized: the lowest */
+        if (strncmp(r->name, "mix.", 4) == 0) { assert(r->ttl_value == (r->bind_location_tag ? 60u : 300u)); seen++; }   /* kept */
+        if (strncmp(r->name, "loc.", 4) == 0) { assert(r->ttl_value == (strcmp(r->bind_location_tag, "lt-a") == 0 ? 50u : 70u)); seen++; }
+        if (strncmp(r->name, "same.", 5) == 0) { assert(r->ttl_value == 90); seen++; }                   /* same tag: harmonized */
+    }
+    assert(seen == 8);
+    assert(dns_record_same_visibility(&a.records[0], &a.records[0]));
+    zone_arena_destroy(&a);
+    printf("  -> same-visibility TTL harmonization passed.\n");
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     test_edns_expire_rfc7314();
@@ -6758,6 +7332,14 @@ int main(void) {
     test_axfr_ixfr_feature_case_156();
     test_axfr_ixfr_feature_case_157();
     test_axfr_ixfr_feature_case_158();
+    test_b8t2_xext_records();
+    test_b9a_type_class_audit();
+    test_b8t2_receiver_soa_set();
+    test_b8t2_ixfr_settings_survive_thaw();
+    test_b8t2_ext_version_fallback_decision();
+    test_b8t2_sender_versions();
+    test_b8t2_settings();
+    test_b8t2_same_visibility_ttl();
     printf("=== All AXFR/IXFR Engine Unit Tests PASSED ===\n");
     return 0;
 }

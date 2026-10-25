@@ -1,0 +1,19 @@
+$ORIGIN fuzz.test.
+$TTL 300
+@ IN SOA ns hostmaster 1 3600 600 86400 300
+@ IN NS ns
+ns IN A 192.0.2.1
+@ IN ALIAS lb.target.test.
+a 120 IN ALIAS T.Target.Test.
+r IN alias rel
+both IN ALIAS t.target.test.
+both IN TXT "hello"
+l IN LUA A ";return {'192.0.2.1'}"
+l2 IN LUA TXT "a" "b"
+l3 IN lua TYPE99 "x"
+g IN TYPE65401 \# 3 016100
+h IN TYPE65402 \# 6 000101610162
+$GENERATE 1-3 gen$ ALIAS t$.target.test.
+*.w IN ALIAS t.target.test.
+*.wl IN LUA A "y"
+bad IN ALIAS

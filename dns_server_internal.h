@@ -61,7 +61,7 @@ struct mmsghdr {
 #include "dns_priv_sandbox.h"
 
 extern int g_cwd_fd;
-extern int g_control_kq;
+extern _Atomic int g_control_kq;
 extern int g_notify_ipc[2];
 extern int g_notify_resp_ipc[2];
 extern char g_startup_cwd[PATH_MAX];
@@ -202,10 +202,24 @@ typedef struct {
   char current_ecs_tag[64];
   bool has_current_ecs_tag;
   uint32_t out_of_zone_skipped; /* R-27: 読み飛ばしたゾーン外 RR の数 */
+  bool trailing_rrs;      /* AXFR: 終わりの SOA の後ろに同じメッセージの RR が続いていた (取り込み側は拒否する) */
   uint16_t query_id;      /* R-19: 送った要求の ID と QTYPE (xfr_check_response_header() が照合する) */
   uint16_t query_type;
   bool got_first_msg;
   uint8_t rcode;          /* エラーの RCODE で転送が終わったときの値 (0 = エラー応答ではない) */
+  uint64_t ext_records;   /* B8: number of Extended AXFR marker / definition RRs (65401-65405, 65407) read: they count as RRs but are not kept, so the database loader's declared count is checked against them */
+  uint64_t ext_wrapped;   /* B8: TINYDNS_WRAP (65406) records read; each is a normal RR in the zone (already in the RR count) */
+  uint8_t ext_version;    /* B8t-2: the Extended AXFR version of the stream (2 or 3) the primary answered with; 0 = not extended */
+  bool soa_set;           /* B8t-2 (v3): SOA_SET (TYPE 65409) was read: the opening and closing SOA is not zone data, and the apex SOA RRs follow as wrappers */
+  uint32_t soa_set_expected, soa_set_seen; /* the number of body SOA RRs SOA_SET announced, and read */
+  bool frame_valid;       /* soa_set: the numbers of the frame SOA (the reference SOA) that was not stored */
+  uint32_t frame_refresh, frame_retry, frame_expire;
+  bool has_settings;      /* B8t-2 (v3): a SETTINGS record (TYPE 65408) was read; its text is in settings_text */
+  char settings_text[KARIDNS_SETTINGS_MAX + 1]; /* NUL terminated; not in the transfer's arena: an IXFR rebuilds the arena after the SETTINGS record */
+  size_t settings_len;
+  bool ext_probe;         /* B8t-2: version 3 was asked for and a standard answer means "try version 2" (xfr_ext_probe()) */
+  bool no_ext_answer;     /* set when handle_axfr_event() stopped for that reason */
+  bool db_stream;         /* B8: the messages come from the database loader (ZONE_DATA): the Extended AXFR records are checked strictly (a malformed definition, state or wrapper record rejects the zone) and ECS_TRUSTED (65407) is refused: the trusted resolvers come from the settings text only, inside acl-ceiling */
 } axfr_session_t;
 
 // クエリログ用 固定長イベント構造体 (バイナリ保持)
@@ -344,9 +358,16 @@ typedef struct {
   char tsig_key[64];
 } catalog_master_t;
 
+/* ゾーンエントリの出どころ (zone_db_entry_t.source)。ZONE_SRC_DB はまだ使われない */
+typedef enum {
+  ZONE_SRC_CONFIG = 0, /* karidns.conf の zone {} */
+  ZONE_SRC_CATALOG,    /* カタログゾーンのメンバー */
+  ZONE_SRC_DB,         /* データベースから取り込んだゾーン */
+} zone_source_t;
+
 typedef struct {
   char domain[256];
-  char view_name[64];
+  char view_name[KARIDNS_VIEW_NAME_MAX];
   zone_kind_t kind;
   zone_rcu_t rcu;
   pthread_mutex_t writer_lock;
@@ -366,11 +387,27 @@ typedef struct {
   int catalog_member_count;
   bool is_catalog_member;
   bool is_secondary;
+  uint8_t source; /* zone_source_t: どこから来たゾーンか。作成時に決まり、変わらない */
   char *catalog_member_unique_id; /* S5: malloc。カタログのメンバーでなければ NULL (読むときは zone_entry_catalog_uid) */
   char **groups;
   int group_count;
   catalog_master_t *catalog_master; /* B-3: malloc, catalog members only (primary and TSIG key of the catalog zone) */
   char *owning_catalog_domain;    /* S5: malloc。同上 (読むときは zone_entry_catalog_owner) */
+  /* source == ZONE_SRC_DB のゾーンの設定 (それ以外は NULL)。読むのは zone_entry_config() だけ。
+   * 差し替えは新しい物を公開してから、古い物を zone_retire_object() で積む */
+  _Atomic(const zone_config_t *) dbcfg;
+  /* B8t-2: the settings the primary sent with the zone (Extended AXFR v3).  rxcfg is the zone configuration in force: a copy of the
+   * zone's own block (karidns.conf zone {}, or dbcfg) in which the statements the secondary did not write itself come from the
+   * received settings (zone_config_with_received()); NULL = no received settings in force.  Read by zone_entry_config(); replaced
+   * through the S2 retire stack.  rx_sh (the parsed text), rx_base, rx_gen and rx_note belong to the writers (entry->writer_lock) */
+  uint8_t xfr_ext_state;          /* B8t-2: what the primary speaks (XFR_EXT_*, dns_axfr_ixfr.h); written by the transfer thread only */
+  time_t xfr_ext_set;             /* when it was learned */
+  _Atomic(const zone_config_t *) rxcfg;
+  zone_ext_shared_t *rx_sh;
+  _Atomic bool rx_present;        /* rx_sh != NULL (read without the lock by the control thread's tick) */
+  const zone_config_t *rx_base;   /* the block rxcfg was made from (compared, never dereferenced) */
+  uint64_t rx_gen;                /* server_config_t.generation of that merge */
+  char rx_note[160];              /* why part of the received settings is not in force ("" = all of it is) */
   _Atomic(time_t) last_successful_transfer;
   /* RFC 7314 §4: セカンダリの expire タイマーが切れる時刻。0 なら
    * last_successful_transfer + expire (従来どおり SOA EXPIRE で数える)。 */
@@ -385,6 +422,9 @@ typedef struct {
   /* 最後に公開したときの全体の公開カウンタ */
   _Atomic uint64_t publish_order;
 } zone_db_entry_t;
+/* 制御チャネルで送る統計 (dns_wire.h、karictl も読む) も同じ長さで view 名を持つ */
+_Static_assert(sizeof(((zone_observatory_snapshot_t *)0)->view_name) == KARIDNS_VIEW_NAME_MAX,
+               "view name buffers must match KARIDNS_VIEW_NAME_MAX");
 
 /* S5: カタログ関連の文字列は非カタログのゾーンでは NULL。比較や表示には空文字列として読む */
 static inline const char *zone_entry_catalog_uid(const zone_db_entry_t *e) {
@@ -457,7 +497,7 @@ typedef struct {
 
 typedef struct program_plugin {
   char domain[256];      /* zone_db_entry_t->domain と同じ形式(FQDN, 末尾ドット) */
-  char view_name[64];     /* 同じゾーン名が別の view にもあり得るので view と組で引く (O-12) */
+  char view_name[KARIDNS_VIEW_NAME_MAX]; /* 同じゾーン名が別の view にもあり得るので view と組で引く (O-12) */
   pid_t pid;
   int proc_fd;            /* FreeBSD: pdfork() のプロセス記述子 (CAP_PDKILL のみ)。-1 = なし。
                            * capability mode では kill(pid) ができないので pdkill() で止める (X-11) */
@@ -509,10 +549,31 @@ void retain_zone_snapshot(zone_db_snapshot_t *snap);
 zone_db_snapshot_t *acquire_retained_zone_snapshot(void);
 void release_zone_snapshot(zone_db_snapshot_t *snap);
 zone_config_t *find_zone_config_in_view(server_config_t *cfg, const char *view_name, const char *domain);
+/* ゾーンエントリの設定。DB のゾーンは entry->dbcfg、それ以外は cfg の索引 (find_zone_config_in_view)。
+ * 無ければ NULL。返した物は cfg を保持している間 (DB のゾーンは読み取り区間の中) だけ有効 */
+static inline const zone_config_t *zone_entry_config(server_config_t *cfg, const zone_db_entry_t *entry) {
+  const zone_config_t *rx = atomic_load_explicit(&entry->rxcfg, memory_order_acquire); /* B8t-2 */
+  if (rx) return rx;
+  if (entry->source == ZONE_SRC_DB) return atomic_load_explicit(&entry->dbcfg, memory_order_acquire);
+  return find_zone_config_in_view(cfg, entry->view_name, entry->domain);
+}
+/* B8t-2: the settings a primary sent with the zone.  zone_rx_settings_parse() reads the text with the restricted parser (NULL when
+ * there is none, or it is not accepted: logged; the text is never trusted).  zone_rx_settings_apply_locked() makes sh (ownership
+ * moves to the entry; NULL = none) the settings in force: it merges them with the zone's own configuration and publishes the result,
+ * and returns the settings that were in force (the caller unrefs them, or puts them back when the data cannot be installed).  The
+ * caller holds entry->writer_lock; the data is installed after the settings, so that the glue and the response cache of the new
+ * version are built with them.  zone_rx_settings_refresh() redoes the merge when karidns.conf (or the settings block of a database
+ * zone) changed under it (control thread, once per tick; skips the zone when a writer holds the entry). */
+zone_ext_shared_t *zone_rx_settings_parse(const char *zone, const char *text, size_t len);
+zone_ext_shared_t *zone_rx_settings_apply_locked(zone_db_entry_t *entry, zone_ext_shared_t *sh);
+void zone_rx_settings_refresh(zone_db_entry_t *entry, server_config_t *cfg);
+/* are received settings in force for the zone?  note (cap octets, may be NULL) gets why not all of them are ("" if all are, or when a writer
+ * holds the entry at the moment) */
+bool zone_rx_settings_status(zone_db_entry_t *entry, char *note, size_t cap);
 zone_db_snapshot_t *rebuild_zone_db_snapshot(server_config_t *config,
                                              const char *target_view_name,
                                              zone_db_entry_t *catalog_entry_to_update,
-                                             zone_config_t *catalog_cfg,
+                                             const zone_config_t *catalog_cfg,
                                              catalog_member_id_t *new_desired_members,
                                              int new_desired_count);
 
@@ -535,8 +596,117 @@ size_t zone_drop_unencodable_logged(zone_arena_t *a, const char *zone, const cha
 /* S2: 公開、解放待ちの処理、兄弟ゾーンの変更に伴うグルーの作り直し (dns_snapshot_rcu.c) */
 void zone_publish(zone_db_entry_t *entry, zone_version_t *next);
 void zone_retire_process(bool wait);
+bool zone_retire_object(zone_db_entry_t *entry, void *obj, void (*free_fn)(void *), uint64_t epoch);
+/* builder を新しい版として公開する (dns_axfr_ixfr.c)。entry->writer_lock を持って呼ぶ。約束は定義の前の注釈に */
+int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const char *what);
+/* 公開直前に呼ぶ: 応答キャッシュに入れてよいか (rcache_ok) を決める。ゾーンの設定は zone_entry_config(cfg, entry)
+ * (DB のゾーンは dbcfg)。entry は view_name、domain、source (と DB のゾーンなら dbcfg) だけを読む */
+void build_zone_response_cache(zone_version_t *ver, server_config_t *cfg, const zone_db_entry_t *entry);
 void zone_glue_refresh_dependents(bool force);
 uint64_t zone_entry_next_id(void);
+
+/* ---- DB zone registry and view delta (beta design 4.2, 4.4; implemented in dns_snapshot_rcu.c) ----
+ * The registry is the source of truth for which DB zones exist.  Per view (by name) it maps a zone name to
+ * {entry, source id, serial, digest, last result, shadowed}.  Everything below takes g_zone_db_rebuild_lock itself
+ * (the "_locked" ones expect it to be held); the ingest threads and the full-configuration rebuild are the only
+ * writers, queries never touch it.  The registry holds one snapshot_refs reference of each entry it knows; every
+ * snapshot that lists the entry holds another.  Callers on aux threads must rcu_aux_thread_pin() first (the
+ * commit reads the configuration inside the lock). */
+extern pthread_mutex_t g_zone_db_rebuild_lock;
+
+typedef struct dbreg_zone {
+  struct dbreg_zone *next;     /* hash chain */
+  zone_db_entry_t *entry;      /* NULL: the zone has never been applied (only a rejection is recorded) */
+  char *error;                 /* last rejection / loader error, malloc; NULL = none */
+  int64_t source_id;
+  uint32_t serial;
+  uint32_t hash;
+  uint8_t digest[32];
+  uint8_t last_result;         /* DBREG_APPLIED or DBREG_REJECTED (the last version offered) */
+  bool shadowed;               /* a zone of karidns.conf (D-PRIO) or a catalog member (D17-1) with this name hides it */
+  uint8_t shadow_by;           /* DBREG_SH_*, meaningful while shadowed */
+  char name[];                 /* canonical absolute name, lower case, with the trailing dot */
+} dbreg_zone_t;
+enum { DBREG_APPLIED = 0, DBREG_REJECTED = 1 };
+enum { DBREG_SH_NONE = 0, DBREG_SH_CONFIG = 1, DBREG_SH_CATALOG = 2 };
+
+/* Commit an installed zone.  entry is either a new entry (created = true, the registry takes over its initial
+ * reference and the entry is queued to enter the view snapshot, unless a configured zone shadows it) or the entry
+ * already registered under name.  *shadowed tells whether a zone of karidns.conf hides it.  0, or -1 (out of
+ * memory: the caller keeps ownership of a new entry). */
+int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, bool created, int64_t source_id,
+                 uint32_t serial, const uint8_t digest[32], bool *shadowed);
+/* The entry registered for (view, name) or NULL.  Valid while the caller is the only ingest thread working on that
+ * name (the ingest thread serializes zones of the same name). */
+zone_db_entry_t *dbreg_lookup_entry(const char *view, const char *name);
+/* Record that the version offered for (view, name) was rejected (an existing entry keeps serving its last good
+ * version; without one only the error is recorded).  false: out of memory. */
+bool dbreg_reject(const char *view, const char *name, int64_t source_id, const char *reason);
+/* ZONE_DELETE: forget the zone; its entry leaves the view snapshot with the next snapshot_apply_db_delta().  1:
+ * removed, 0: not registered or registered with another source id (nothing done). */
+int dbreg_delete(const char *view, const char *name, int64_t source_id);
+/* Publish the queued additions and removals as one new snapshot (beta design 4.4): per view the entry array is
+ * copied without the removed and with the added entries and its hash tables are rebuilt.  The other views are copied
+ * too (view_snapshot_t has no reference count to share them by).  Returns the number of entries added plus removed,
+ * or -1 (out of memory, the queue is kept). */
+int snapshot_apply_db_delta(void);
+/* Number of queued changes (cheap, no lock) */
+size_t dbreg_pending_count(void);
+
+typedef struct { size_t view, bucket, skip; } dbreg_cursor_t;
+/* Walk the registry from *cur; cb returns false to stop (the cursor then points at the zone that was refused).
+ * Returns true when the end was reached. */
+typedef bool (*dbreg_walk_cb)(void *ud, const char *view, const dbreg_zone_t *z);
+bool dbreg_walk(dbreg_cursor_t *cur, dbreg_walk_cb cb, void *ud);
+/* counts: zones with an entry (applied+shadowed), rejected-only records and shadowed ones */
+void dbreg_counts(size_t *total, size_t *rejected, size_t *shadowed);
+/* the same, with the shadowed zones told apart: by a zone of karidns.conf, by a catalog member (D17-1) */
+void dbreg_counts2(size_t *total, size_t *rejected, size_t *shadowed_config, size_t *shadowed_catalog);
+/* What the registry knows about a zone, copied under the lock (control commands, D17-2). */
+typedef struct {
+  char view[KARIDNS_VIEW_NAME_MAX];
+  int64_t source_id;
+  uint32_t serial;             /* the serial of the version served (0 without an entry) */
+  uint32_t refresh;            /* SOA refresh of that version */
+  bool has_entry;              /* a version was installed */
+  bool shadowed;
+  uint8_t shadow_by;           /* DBREG_SH_* */
+  uint8_t last_result;         /* DBREG_APPLIED / DBREG_REJECTED: the last version offered */
+  char error[160];             /* last rejection / loader error, "" = none */
+} dbreg_info_t;
+/* The registry records of the zone `name` (any case, with or without the trailing dot) in the view `view` (NULL: every
+ * view), at most max of them copied to out.  Returns how many there are. */
+int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int max);
+/* The entry of the DB zone (view, name) when it is in the active snapshot, i.e. served (not shadowed), else NULL.  Valid
+ * while the caller holds the snapshot (acquire_retained_zone_snapshot()). */
+zone_db_entry_t *dbreg_snapshot_entry(zone_db_snapshot_t *snap, const char *view, const char *name);
+/* Publish new settings for a DB zone; the old ones are freed after a grace period (zone_retire_object()).  cfg is
+ * owned by the entry afterwards (freed with it). */
+void db_entry_set_config(zone_db_entry_t *entry, const zone_config_t *cfg);
+/* The same in two steps, so that settings can be taken back when the data that came with them is refused: swap publishes
+ * cfg and returns the previous block without retiring it; retire hands a block (the previous one, or the one that was
+ * taken back) to the S2 retire stack with the epoch swap returned. */
+const zone_config_t *db_entry_swap_config(zone_db_entry_t *entry, const zone_config_t *cfg, uint64_t *epoch);
+void db_entry_retire_config(zone_db_entry_t *entry, const zone_config_t *old, uint64_t epoch);
+/* A zone_config_t for a DB zone: type "master", the zone name, and (B7a) the interned settings `shared` (may be NULL:
+ * no options); the zone takes its own reference of shared. */
+zone_config_t *db_zone_config_new(const char *domain, zone_ext_shared_t *shared);
+/* B7b: kind 0 primary, 1 secondary (a SLAVE), 2 catalog consumer (a CONSUMER) */
+zone_config_t *db_zone_config_new_kind(const char *domain, zone_ext_shared_t *shared, int kind);
+/* Interned settings of DB zones (B7a, design 4.2).  The key is what makes two settings the same (profile name, profile text,
+ * zone text).  find: a new reference of the object with this key, or NULL.  intern: enters `fresh` (refs 1, hash and key
+ * set) into the table, or, when an equal object is there already, drops fresh and returns that one; the result carries a
+ * reference for the caller.  Unused objects are dropped by a later intern. */
+uint64_t db_settings_hash(const char *key, size_t len);
+zone_ext_shared_t *db_settings_find(const char *key, size_t len);
+zone_ext_shared_t *db_settings_intern(zone_ext_shared_t *fresh);
+size_t db_settings_count(void);
+void db_settings_reset(void);
+/* true once any DB zone's settings carry zone-tcp-mss / zone-tcp-window / zone-tcp-sndbuf (cfg->any_zone_tcp_opts only
+ * knows the zones of karidns.conf) */
+extern _Atomic bool g_db_zone_tcp_opts;
+/* Free every registry record and queued change (unit tests, fuzzers).  Entries lose the registry's reference. */
+void dbreg_reset(void);
 
 int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out, uint16_t *msg_len_out);
 ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len);
@@ -701,7 +871,7 @@ void *worker_thread_func(void *arg);
 
 extern config_rcu_t g_config_db;
 extern int g_control_sock;
-extern int g_control_kq;
+extern _Atomic int g_control_kq;
 extern time_t g_boot_time;
 extern time_t g_last_configured_time;
 extern _Atomic int g_tcp_clients;

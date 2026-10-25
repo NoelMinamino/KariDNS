@@ -561,6 +561,34 @@ bool serial_is_newer(uint32_t s1, uint32_t s2) {
     return ((int32_t)(s1 - s2)) > 0;
 }
 
+bool dns_path_is_valid_utf8(const unsigned char *p, size_t n) {
+  size_t i = 0;
+  while (i < n) {
+    unsigned char c = p[i];
+    if (c < 0x80) {
+      if (c < 0x20 || c == 0x7F) return false;
+      i++;
+      continue;
+    }
+    uint32_t cp;
+    size_t k;
+    if (c >= 0xC2 && c <= 0xDF) { cp = c & 0x1Fu; k = 1; }
+    else if (c >= 0xE0 && c <= 0xEF) { cp = c & 0x0Fu; k = 2; }
+    else if (c >= 0xF0 && c <= 0xF4) { cp = c & 0x07u; k = 3; }
+    else return false; /* continuation byte, 0xC0/0xC1 (overlong) or 0xF5.. */
+    if (k > n - i - 1) return false; /* truncated sequence */
+    for (size_t j = 1; j <= k; j++) {
+      if ((p[i + j] & 0xC0) != 0x80) return false;
+      cp = (cp << 6) | (p[i + j] & 0x3Fu);
+    }
+    static const uint32_t min_cp[] = {0, 0x80, 0x800, 0x10000};
+    if (cp < min_cp[k] || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) || (cp >= 0x80 && cp <= 0x9F))
+      return false;
+    i += k + 1;
+  }
+  return true;
+}
+
 const char *strchr_unescaped(const char *s, char c) {
     if (!s) return NULL;
     for (const char *p = s; *p != '\0'; p++) {

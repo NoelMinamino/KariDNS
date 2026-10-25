@@ -10,6 +10,23 @@ bool check_acl(const char *client_ip, char **acl_list, int acl_count);
 acl_entry_t *acl_list_parse(char **acl_list, int count);
 bool check_acl_bin(const char *client_ip, const acl_entry_t *parsed, int count);
 tsig_key_t *find_tsig_key_by_name(const server_config_t *cfg, const char *key_name);
+
+/* Is a transfer (AXFR/IXFR) / a dynamic update from client_ip allowed by the ACLs of the zone?  key_name is the TSIG key the
+ * request was verified with, NULL when it was not signed (RFC 8945 §5.2).  transfer: allow-transfer addresses and keys, as
+ * transfer-acl-match says (default all: address AND key when both are written; any: address OR key).  update: allow-update,
+ * as update-acl-match says (default any: the address matches or the key is named; all: every kind of entry that is written
+ * must match).  A zone whose settings come from a database (zone_ext_t.db_acl_ceiling) is also bounded by
+ * options { database { acl-ceiling } }: the client must be inside it too, and with no ceiling configured nobody is.  Inside the
+ * ceiling = its address matches or the request is signed with a listed key (acl-ceiling-match any, the default); with
+ * acl-ceiling-match all and both kinds listed, both (B7b). */
+bool zone_transfer_acl_allows(const server_config_t *cfg, const zone_config_t *zcfg, const char *client_ip,
+                              const char *key_name);
+bool zone_update_acl_allows(const server_config_t *cfg, const zone_config_t *zcfg, const char *client_ip,
+                            const char *key_name);
+/* B8: is client_ip inside the address entries of options { database { acl-ceiling } } ("!" excludes, first match decides)?  Used for the
+ * ecs-trusted-resolvers list of a database zone: a resolver is trusted only when the zone's list and the ceiling both accept its address
+ * (keys of the ceiling do not count: ECS trust has no key).  No ceiling configured: nobody. */
+bool db_ceiling_allows_address(const server_config_t *cfg, const char *client_ip);
 /* 鍵名 (DNS 名) が同じか。大文字小文字と末尾のドットは区別しない (RFC 4343 §2、D-03) */
 bool tsig_key_names_equal(const char *a, const char *b);
 

@@ -755,7 +755,8 @@ int main() {
             printf("FAIL: Zero-length RDATA rejected\n");
             return 1;
         }
-        if (rec4.generic_data != NULL || rec4.generic_len != 0) {
+        /* D15-1 (RFC 3597 5): zero-length RDATA is an empty blob, not "no blob" */
+        if (rec4.generic_data == NULL || rec4.generic_len != 0) {
             printf("FAIL: Zero-length RDATA badly parsed\n");
             return 1;
         }

@@ -30,15 +30,19 @@
 uint32_t bump_soa_serial_in_arena(zone_arena_t *arena, const char *zone_name) {
   if (!arena || !zone_name) return 0;
   uint32_t new_serial = 0;
+  /* B8t-1: a zone can hold several apex SOA RRs (tinydns locations, tags), all with the one zone serial (RFC 2181 §6.1):
+   * every one gets the new serial, computed once from the first. */
   for (size_t i = 0; i < arena->count; i++) {
     if (arena->records[i].type_code == 6 && domain_names_match_ci(arena->records[i].name, zone_name) && arena->records[i].rdata_count >= 3) {
       if (arena->records[i].rdata[2]) {
-        uint32_t serial = strtoul(arena->records[i].rdata[2], NULL, 10);
-        serial++;
-        if (serial == 0) serial = 1;
-        new_serial = serial;
+        if (new_serial == 0) {
+          uint32_t serial = strtoul(arena->records[i].rdata[2], NULL, 10);
+          serial++;
+          if (serial == 0) serial = 1;
+          new_serial = serial;
+        }
         char buf[32];
-        snprintf(buf, sizeof(buf), "%u", serial);
+        snprintf(buf, sizeof(buf), "%u", new_serial);
         /* [C-2] arena_strdup 失敗時は NULL が代入されることを防ぐ */
         char *new_rdata = arena_strdup(arena, buf);
         if (!new_rdata) {
@@ -49,7 +53,6 @@ uint32_t bump_soa_serial_in_arena(zone_arena_t *arena, const char *zone_name) {
         arena->records[i].is_cached = false;
         dns_record_preparse_cache(arena, &arena->records[i]);
       }
-      break;
     }
   }
   return new_serial;
@@ -151,12 +154,12 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
   if (cur_snap) retain_zone_snapshot(cur_snap);
   server_config_t *active_cfg_prelink = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  zone_config_t *zcfg = find_zone_config_in_view(active_cfg_prelink, entry->view_name, entry->domain);
+  const zone_config_t *zcfg = zone_entry_config(active_cfg_prelink, entry);
   additional_from_auth_t policy = (zcfg && zext(zcfg)->additional_from_auth_specified)
                                       ? zext(zcfg)->additional_from_auth
                                       : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
   zone_glue_track_build(z_next, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
-  build_zone_response_cache(z_next, active_cfg_prelink, entry->view_name, entry->domain);
+  build_zone_response_cache(z_next, active_cfg_prelink, entry);
   if (cur_snap) release_zone_snapshot(cur_snap);
 
   compute_ixfr_diff(entry, z_active, z_next);
@@ -178,10 +181,11 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
 
 void notify_request_send(zone_db_entry_t *entry) {
   atomic_store_explicit(&entry->notify_now, true, memory_order_release);
-  if (g_control_kq != -1) {
+  int kq = atomic_load_explicit(&g_control_kq, memory_order_acquire);
+  if (kq != -1) {
     struct kevent ev;
     EV_SET(&ev, 2, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
-    kevent(g_control_kq, &ev, 1, NULL, 0, NULL);
+    kevent(kq, &ev, 1, NULL, 0, NULL);
   }
 }
 
@@ -495,7 +499,9 @@ static bool notify_add_glue(const zone_image_t *img, const char *name, struct so
   return found;
 }
 
-void send_notify_to_all(const char *domain, const char *view_name) {
+void send_notify_to_all(zone_db_entry_t *entry) {
+  const char *domain = entry->domain;
+  const char *view_name = entry->view_name;
   /* 制御スレッドだけが呼ぶ (応答待ちの表を持つため。他のスレッドは notify_request_send())。
    * 設定・スナップショット・arena を読むので、全体を読み取り区間に入れる (UDP の送信だけで、待ちは無い)。*/
   rcu_aux_read_lock();
@@ -507,7 +513,8 @@ void send_notify_to_all(const char *domain, const char *view_name) {
     return;
   }
 
-  zone_config_t *zone = active ? find_zone_config_in_view(active, view_name, domain) : NULL;
+  /* DB のゾーンは dbcfg (DB のゾーンは active が無くても設定を持つ) */
+  const zone_config_t *zone = zone_entry_config(active, entry);
   const char *notify_source = zone ? zext(zone)->notify_source : NULL;
   notify_retry_config_t nr = notify_retry_effective(active, zone);
   /* D-09: ゾーンに tsig-key があれば NOTIFY に署名する */
@@ -528,18 +535,16 @@ void send_notify_to_all(const char *domain, const char *view_name) {
   }
 
   // 2. Addresses of the apex NS hosts except the SOA MNAME host (RFC 1996 §3.2)
-  zone_db_entry_t *entry = NULL;
-  view_snapshot_t *view = snap ? snapshot_find_view(snap, view_name) : NULL;
   // 同じゾーン名が別の view にもあり得るので、呼び出し元のエントリの view で引く (R-26)
-  if (view) entry = find_zone_exact_in_view(view, domain);
-  zone_version_t *arena = entry ? atomic_load_explicit(&entry->rcu.active, memory_order_acquire) : NULL;
+  view_snapshot_t *view = snap ? snapshot_find_view(snap, view_name) : NULL;
+  zone_version_t *arena = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   const zone_image_t *img = arena ? arena->image : NULL;
   uint32_t apex_id = img ? zone_image_find_name(img, entry->domain) : ZONE_IMAGE_NONE;
   if (apex_id != ZONE_IMAGE_NONE) {
     char mname_buf[DNS_NAME_TEXT_SIZE];
     const char *mname = NULL;
     uint32_t apex_end = zone_image_name_first_rr(img, apex_id) + zone_image_name_rr_count(img, apex_id);
-    uint32_t soa = zone_image_rrset_next(img, apex_id, 6, zone_image_name_first_rr(img, apex_id));
+    uint32_t soa = zone_image_apex_soa(img); /* B8t-1: the reference SOA (the SOA RRs of a zone can differ in MNAME) */
     if (soa != ZONE_IMAGE_NONE && zone_image_soa(img, soa, mname_buf, sizeof(mname_buf), NULL, 0, NULL) == 0)
       mname = mname_buf;
     for (uint32_t i = zone_image_name_first_rr(img, apex_id); i < apex_end; i++) {
@@ -559,7 +564,7 @@ void send_notify_to_all(const char *domain, const char *view_name) {
 
   for (int i = 0; i < ntargets; i++) notify_send_to(domain, view_name, &targets[i], notify_source, key, &nr);
 
-  if (entry && ntargets > 0) {
+  if (ntargets > 0) {
     atomic_fetch_add_explicit(&entry->observatory.notify_sent, ntargets, memory_order_relaxed);
     atomic_store_explicit(&entry->observatory.last_notify_time, (uint64_t)time(NULL), memory_order_relaxed);
   }

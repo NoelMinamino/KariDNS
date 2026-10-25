@@ -238,6 +238,10 @@ td_case naptr_pref 1 "NAPTR preference '70000' out of range" 'Nexample.com:1:700
 td_case sshfp_gen  1 "SSHFP record requires 3 fields" ':sshfp.example.com:44:\001\001\252\273:300'
 td_case loc_dup    0 "Duplicate location code 'lo'" '%lo:10.0
 %lo:10.1'
+td_case soa_serial 1 "different serials" '%in:10.0
+Zexample.com:a.ns.example.com.:h.example.com.:5:3600:900:604800:300:300::in'
+td_case soa_nobody 1 "restricted to location 'zz', which the zone does not define" '%in:10.0
+Zexample.com:a.ns.example.com.:h.example.com.:5:3600:900:604800:300:300::zz'
 td_case clean      0 "0 error(s), 0 warning(s)" '=www.example.com:192.0.2.10:300
 +alias.example.com:192.0.2.11:300'
 
@@ -285,6 +289,9 @@ conf_case ixfr_hist_bad conf 1 "Invalid ixfr-history value '33'" 'options { ixfr
 conf_case ixfr_hist_zbad conf 1 "invalid ixfr-history value '-1'" 'zone "h.example" { type master; file "h.zone"; ixfr-history -1; };'
 conf_case bad_b64       conf 1 "secret is not valid base64" 'key "k" { algorithm "hmac-sha256"; secret "NOT_BASE64="; };'
 conf_case bad_b64_ctl   conf 1 "control-channel: secret is not valid base64" 'control-channel { algorithm "hmac-sha256"; secret "NOT_BASE64="; };'
+conf_case ctl_in_options conf 1 "control-channel is written inside options" 'options { port 5300; control-channel { algorithm "hmac-sha256"; secret "dGVzdC1zZWNyZXQ="; }; };'
+conf_case ctl_top_level conf 0 "is valid" 'options { port 5300; };
+control-channel { algorithm "hmac-sha256"; secret "dGVzdC1zZWNyZXQ="; };'
 printf '$ORIGIN m.example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n' > "$TMP/m.zone"
 printf 'zone "m.example" { type master; file "%s/m.zone"; };\nzone "p.example" { type program; program "/bin/true"; };\noptions { allow-program-zones yes; };\n' "$TMP" > "$TMP/zm.conf"
 out=$("$KC" zone m.example. "$TMP/zm.conf" 2>&1); rc=$?

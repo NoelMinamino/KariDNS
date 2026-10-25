@@ -13,7 +13,7 @@
 #include "../../dns_server_internal.h"
 
 // Mock globals
-int g_control_kq = -1;
+_Atomic int g_control_kq = -1;
 int g_notify_ipc[2] = {-1, -1};
 int g_broker_sock = -1;
 config_rcu_t g_config_db;
@@ -61,6 +61,12 @@ size_t resolve_ip_port_to_sockaddr(const char *ip, int port, struct sockaddr_sto
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size == 0) return 0;
+    /* byte 0: the transfer's state before the message (B8t-2): bits 0-1 the Extended AXFR version the primary answered with (0: none,
+     * 1: 2, 2 and 3: 3), bit 2 the stream comes from the database loader.  The rest is the DNS message. */
+    uint8_t sel = data[0];
+    data++;
+    size--;
+    if (size == 0) return 0;
 
     zone_arena_t standby;
     memset(&standby, 0, sizeof(standby));
@@ -74,6 +80,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
     axfr_session_t session;
     memset(&session, 0, sizeof(session));
+    session.ext_version = (sel & 3) == 0 ? 0 : (sel & 3) == 1 ? 2 : 3;
+    session.is_extended_mode = session.ext_version != 0;
+    session.db_stream = (sel & 4) != 0;
 
     parse_xfr_packet(data, size, &standby, &active.ver, &session, "fuzz.example.com.");
 

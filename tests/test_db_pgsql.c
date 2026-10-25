@@ -1,0 +1,858 @@
+/*
+ * test_db_pgsql.c - the PostgreSQL driver (dns_db_pgsql.c, dns_db_driver.h; milestone B10).  The driver source is included, so the
+ * static helpers are tested too.
+ *
+ * Needs a reachable PostgreSQL server (SKIP with the reason otherwise).  KARIDNS_TEST_PG is the conninfo of the maintenance
+ * connection (default "dbname=postgres"); the role must be allowed to create databases.  Each run creates the database
+ * karidns_test_unit_<pid> from tests/db/pdns_schema.pgsql.sql and db/karidns_ext.pgsql.sql and drops it at the end.
+ *
+ * Cases: conninfo-file checks (mode, bad string, no content in messages), schema check (missing table / column, version 3,
+ * version 1 without xid / tagdefs.id, the v1 to v2 migration), rows (NULLs, second SOA, ENT, disabled NULL), more rows than one
+ * FETCH, a scan the callback stops followed by another query in the same snapshot, snapshot isolation, per-schema search_path,
+ * the order of the profiles (C collation) and of the tag definitions, the change log cursor with interleaved transactions
+ * (a transaction that took a lower seq commits later: nothing is skipped; an idle transaction in front does not hide later
+ * commits), the gap rule, notifications (LISTEN, wait_fd, poll_version), a terminated backend maps to DB_ERR_RETRY.
+ *
+ * Usage: test_db_pgsql [tests/db]   (the directory of pdns_schema.pgsql.sql)
+ */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <unistd.h>
+#include <poll.h>
+#include <dirent.h>
+#include <sys/stat.h>
+
+#ifdef KARIDNS_DB_POSTGRESQL
+
+#include "../dns_db_pgsql.c"
+
+static int g_checks = 0, g_failed = 0;
+#define CHECK(cond) do { g_checks++; if (!(cond)) { g_failed++; \
+    printf("  [FAIL] %s:%d: %s\n", __FILE__, __LINE__, #cond); } } while (0)
+#define CHECK_MSG(cond, ...) do { g_checks++; if (!(cond)) { g_failed++; \
+    printf("  [FAIL] %s:%d: %s: ", __FILE__, __LINE__, #cond); printf(__VA_ARGS__); printf("\n"); } } while (0)
+#define CHECK_HAS(actual, needle) do { g_checks++; const char *a_ = (actual); const char *n_ = (needle); \
+    if (!a_ || !strstr(a_, n_)) { g_failed++; printf("  [FAIL] %s:%d: \"%s\" lacks \"%s\"\n", \
+        __FILE__, __LINE__, a_ ? a_ : "(null)", n_); } } while (0)
+
+static const db_driver_t *D = &db_driver_postgresql;
+static char g_maint[1024];          /* the maintenance conninfo */
+static char g_db[96];               /* the test database */
+static char g_dir[400];             /* temporary directory */
+static char g_ci[460];              /* conninfo-file of the test database */
+static char g_root[300];            /* tests/db */
+static PGconn *g_admin;             /* connection of the test (writer / second session) */
+static PGconn *g_maintc;            /* connection to the maintenance database */
+
+/* ------------------------------------------------------------------ helpers */
+static char *slurp(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *b = malloc((size_t)n + 1);
+    if (b && fread(b, 1, (size_t)n, f) != (size_t)n) {
+        free(b);
+        b = NULL;
+    }
+    if (b) b[n] = '\0';
+    fclose(f);
+    return b;
+}
+
+static void rm_tree(const char *dir) {
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char p[1024];
+        snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
+        if (unlink(p) != 0) rmdir(p);                  /* the empty directory of test_conninfo */
+    }
+    closedir(d);
+    rmdir(dir);
+}
+
+/* run SQL on a connection; a failure is a FAIL with the message */
+static bool qx(PGconn *c, const char *sql) {
+    PGresult *r = PQexec(c, sql);
+    ExecStatusType st = r ? PQresultStatus(r) : PGRES_FATAL_ERROR;
+    bool ok = st == PGRES_COMMAND_OK || st == PGRES_TUPLES_OK;
+    if (!ok) {
+        printf("  [FAIL] sql error: %s    %.200s\n", PQerrorMessage(c), sql);
+        g_failed++;
+    }
+    PQclear(r);
+    return ok;
+}
+#define Q(sql) qx(g_admin, (sql))
+
+/* one value (first column of the first row) as text; "" for NULL / error */
+static void qv(PGconn *c, const char *sql, char *out, size_t cap) {
+    PGresult *r = PQexec(c, sql);
+    out[0] = '\0';
+    if (r && PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) > 0 && !PQgetisnull(r, 0, 0)) snprintf(out, cap, "%s", PQgetvalue(r, 0, 0));
+    else if (!r || PQresultStatus(r) != PGRES_TUPLES_OK) {
+        printf("  [FAIL] query error: %s    %.200s\n", PQerrorMessage(c), sql);
+        g_failed++;
+    }
+    PQclear(r);
+}
+
+static PGconn *connect_db(const char *dbname) {
+    char ci[1200];
+    snprintf(ci, sizeof(ci), "%s dbname=%s", g_maint, dbname);
+    PGconn *c = PQconnectdb(ci);
+    if (PQstatus(c) != CONNECTION_OK) {
+        printf("  [FAIL] cannot connect: %s", PQerrorMessage(c));
+        g_failed++;
+        PQfinish(c);
+        return NULL;
+    }
+    PQsetNoticeReceiver(c, ignore_notice, NULL);
+    return c;
+}
+
+static void write_file(const char *path, const char *content, mode_t mode) {
+    unlink(path);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (fd >= 0) {
+        if (write(fd, content, strlen(content)) < 0) g_failed++;
+        close(fd);
+        chmod(path, mode);
+    }
+}
+
+static void write_ci(const char *dbname) {
+    char content[1300];
+    snprintf(content, sizeof(content), "# test\n%s\ndbname=%s\n", g_maint, dbname);
+    write_file(g_ci, content, 0600);
+}
+
+static db_conn_t *open_drv(const char *schema) {
+    db_source_t src = { "postgresql", NULL, g_ci, schema, 0 };
+    char err[DB_ERRLEN];
+    db_conn_t *c = NULL;
+    int rc = D->open(&c, &src, err, sizeof(err));
+    CHECK_MSG(rc == 0 && c, "open: %s", err);
+    return rc == 0 ? c : NULL;
+}
+
+/* ---- callbacks that collect ---- */
+typedef struct { int n; int64_t id[4000]; char name[8][64]; char type[8][16]; char master[8][32]; char soa[8][80]; bool soa_null[8]; bool master_null[8]; int stop_after; } zacc_t;
+static int cb_zone(void *ud, const db_zone_row_t *z) {
+    zacc_t *a = ud;
+    if (a->n < 8) {
+        snprintf(a->name[a->n], sizeof(a->name[0]), "%s", z->name ? z->name : "");
+        snprintf(a->type[a->n], sizeof(a->type[0]), "%s", z->type ? z->type : "");
+        a->master_null[a->n] = z->master == NULL;
+        snprintf(a->master[a->n], sizeof(a->master[0]), "%s", z->master ? z->master : "");
+        a->soa_null[a->n] = z->soa_content == NULL;
+        snprintf(a->soa[a->n], sizeof(a->soa[0]), "%.70s", z->soa_content ? z->soa_content : "");
+    }
+    if (a->n < 4000) a->id[a->n] = z->id;
+    a->n++;
+    return a->stop_after && a->n >= a->stop_after;
+}
+
+typedef struct { int n; int64_t did[4000], id[4000]; db_record_row_t r[16]; char s[16][3][80]; } racc_t;
+static int cb_rec(void *ud, int64_t did, const db_record_row_t *r) {
+    racc_t *a = ud;
+    if (a->n < 4000) {
+        a->did[a->n] = did;
+        a->id[a->n] = r->id;
+    }
+    if (a->n < 16) {
+        a->r[a->n] = *r;
+        snprintf(a->s[a->n][0], 80, "%s", r->name ? r->name : "<NULL>");
+        snprintf(a->s[a->n][1], 80, "%s", r->type ? r->type : "<NULL>");
+        snprintf(a->s[a->n][2], 80, "%s", r->ordername ? r->ordername : "<NULL>");
+    }
+    a->n++;
+    return 0;
+}
+
+typedef struct { int n; int64_t v[64]; uint64_t seq[64]; } cacc_t;
+static int cb_chg(void *ud, const db_change_row_t *r) {
+    cacc_t *a = ud;
+    if (a->n < 64) {
+        a->v[a->n] = r->domain_id;
+        a->seq[a->n] = r->seq;
+    }
+    a->n++;
+    return 0;
+}
+static bool has_dom(const cacc_t *a, int64_t d) {
+    for (int i = 0; i < a->n && i < 64; i++) if (a->v[i] == d) return true;
+    return false;
+}
+
+static int cb_key(void *ud, int64_t id) {
+    int *n = ud;
+    *n = *n * 10 + (int)id;
+    return 0;
+}
+
+typedef struct { int n; char kind[4][32]; int64_t d[4]; } macc_t;
+static int cb_meta(void *ud, const db_meta_row_t *x) {
+    macc_t *a = ud;
+    if (a->n < 4) {
+        a->d[a->n] = x->domain_id;
+        snprintf(a->kind[a->n], 32, "%s", x->kind);
+    }
+    a->n++;
+    return 0;
+}
+
+typedef struct { int n; char name[8][32]; } pacc_t;
+static int cb_prof(void *ud, const db_profile_row_t *x) {
+    pacc_t *a = ud;
+    if (a->n < 8) snprintf(a->name[a->n], 32, "%s", x->name);
+    a->n++;
+    return 0;
+}
+
+typedef struct { int n; int64_t d[8]; char v[8][16]; } vacc_t;
+static int cb_view(void *ud, int64_t d, const char *name) {
+    vacc_t *a = ud;
+    if (a->n < 8) {
+        a->d[a->n] = d;
+        snprintf(a->v[a->n], 16, "%s", name);
+    }
+    a->n++;
+    return 0;
+}
+
+typedef struct { int tags, tdns, defs; int64_t def_dom[8]; char def_tag[8][16]; } xacc_t;
+static int cb_xtag(void *ud, int64_t d, const db_tag_row_t *r) { xacc_t *a = ud; (void)d; a->tags++; return !r->location_tag; }
+static int cb_xtdns(void *ud, int64_t d, const db_tinydns_row_t *r) {
+    xacc_t *a = ud;
+    (void)d;
+    a->tdns++;
+    return !(r->ttd_null && r->countdown && !strcmp(r->loc, "k"));
+}
+static int cb_xdef(void *ud, int64_t d, const db_tagdef_row_t *r) {
+    xacc_t *a = ud;
+    if (a->defs < 8) {
+        a->def_dom[a->defs] = d;
+        snprintf(a->def_tag[a->defs], 16, "%s", r->tag);
+    }
+    a->defs++;
+    return 0;
+}
+static int cb_xcount(void *ud, int64_t d, const db_tagdef_row_t *r) { (void)d; (void)r; (*(int *)ud)++; return 0; }
+static int cb_xnop_tag(void *ud, int64_t d, const db_tag_row_t *r) { (void)ud; (void)d; (void)r; return 0; }
+static int cb_xnop_tdns(void *ud, int64_t d, const db_tinydns_row_t *r) { (void)ud; (void)d; (void)r; return 0; }
+
+/* ------------------------------------------------------------------ the cases */
+static void test_conninfo(void) {
+    printf("conninfo-file\n");
+    char err[DB_ERRLEN], path[460];
+    db_conn_t *c = NULL;
+    db_source_t src = { "postgresql", NULL, NULL, NULL, 0 };
+    CHECK(D->open(&c, &src, err, sizeof(err)) == -1);
+    CHECK_HAS(err, "no conninfo-file");
+    snprintf(path, sizeof(path), "%s/ci_bad", g_dir);
+    write_file(path, "host=localhost password=SECRETWORD123\n", 0644);
+    src.conninfo_file = path;
+    CHECK(D->open(&c, &src, err, sizeof(err)) == -1);
+    CHECK_HAS(err, "mode 0600 or 0400");
+    CHECK(strstr(err, "SECRETWORD123") == NULL);
+    write_file(path, "host=localhost password=SECRETWORD123 =\n", 0600);
+    CHECK(D->open(&c, &src, err, sizeof(err)) == -1);
+    CHECK_HAS(err, "not valid");
+    CHECK_MSG(strstr(err, "SECRETWORD123") == NULL, "the message must not echo the string: %s", err);
+    write_file(path, "# only a comment\n   \n", 0600);
+    CHECK(D->open(&c, &src, err, sizeof(err)) == -1);
+    CHECK_HAS(err, "no connection string");
+    write_file(path, "host=/nonexistent-dir-karidns port=1 dbname=x connect_timeout=2\n", 0400);
+    int rc = D->open(&c, &src, err, sizeof(err));
+    CHECK_MSG(rc == DB_ERR_RETRY, "an unreachable server is a retry: %d %s", rc, err);
+    CHECK_HAS(err, "cannot connect");
+    snprintf(path, sizeof(path), "%s/ci_missing", g_dir);
+    CHECK(D->open(&c, &src, err, sizeof(err)) == -1);
+    CHECK_HAS(err, "cannot open conninfo-file");
+    char dirp[460];
+    snprintf(dirp, sizeof(dirp), "%s/ci_dir", g_dir);
+    mkdir(dirp, 0700);
+    src.conninfo_file = dirp;
+    CHECK(D->open(&c, &src, err, sizeof(err)) == -1);
+    CHECK_HAS(err, "not a regular file");
+    /* a comment line, line ends as blanks, an option of our own that the user may override */
+    write_ci(g_db);
+    db_conn_t *ok = open_drv(NULL);
+    CHECK(ok != NULL);
+    if (ok) {
+        PGresult *r = PQexec(ok->pg, "SHOW application_name");
+        CHECK(r && PQresultStatus(r) == PGRES_TUPLES_OK && strcmp(PQgetvalue(r, 0, 0), "karidns-dbloader") == 0);
+        PQclear(r);
+        r = PQexec(ok->pg, "SHOW default_transaction_read_only");
+        CHECK(r && strcmp(PQgetvalue(r, 0, 0), "on") == 0);
+        PQclear(r);
+        D->close(ok);
+    }
+}
+
+static void test_schema(void) {
+    printf("schema\n");
+    db_conn_t *c = open_drv(NULL);
+    if (!c) return;
+    db_schema_info_t si;
+    CHECK(D->check_schema(c, &si) == 0);
+    CHECK(si.has_changes && si.has_domain_views && si.has_profiles && si.has_ext);
+    CHECK(c->has_tagdef_id);
+    CHECK(D->changes_unsettled);
+
+    /* a missing PowerDNS table, a missing column (the error says which) */
+    Q("ALTER TABLE domainmetadata RENAME TO domainmetadata_x");
+    CHECK(D->check_schema(c, &si) == -1);
+    CHECK_HAS(D->errmsg(c), "table domainmetadata is missing");
+    Q("ALTER TABLE domainmetadata_x RENAME TO domainmetadata");
+    Q("ALTER TABLE records RENAME COLUMN ordername TO ordername_x");
+    CHECK(D->check_schema(c, &si) == -1);
+    CHECK_HAS(D->errmsg(c), "table records has no column ordername");
+    Q("ALTER TABLE records RENAME COLUMN ordername_x TO ordername");
+    CHECK(D->check_schema(c, &si) == 0);
+
+    /* a newer schema version */
+    Q("UPDATE karidns_schema_version SET version = 3");
+    CHECK(D->check_schema(c, &si) == -1);
+    CHECK_HAS(D->errmsg(c), "versions 1 and 2");
+    Q("UPDATE karidns_schema_version SET version = 2");
+    CHECK(D->check_schema(c, &si) == 0);
+
+    /* a table of the optional set missing: no change log, no mapping */
+    Q("ALTER TABLE karidns_domain_views RENAME TO karidns_domain_views_x");
+    CHECK(D->check_schema(c, &si) == 0 && !si.has_domain_views && si.has_changes);
+    CHECK(D->scan_domain_views(c, NULL, NULL, NULL) == DB_ERR_UNAVAILABLE);
+    Q("ALTER TABLE karidns_domain_views_x RENAME TO karidns_domain_views");
+
+    /* a schema that does not exist */
+    D->close(c);
+    c = open_drv("karidns_test_no_such_schema");
+    if (c) {
+        CHECK(D->check_schema(c, &si) == -1);
+        CHECK_HAS(D->errmsg(c), "does not exist");
+        D->close(c);
+    }
+}
+
+static void test_rows(void) {
+    printf("rows\n");
+    Q("INSERT INTO domains (id, name, type, master, catalog) VALUES (1, 'a.test', 'NATIVE', NULL, NULL), (2, 'b.test', 'SLAVE', '192.0.2.1', 'cat.test'), (3, 'c.test', 'MASTER', NULL, NULL)");
+    Q("INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled, ordername) VALUES "
+      "(1, 'a.test', 'SOA', 'ns.a.test h.a.test 1 3600 600 86400 300', 3600, NULL, false, NULL),"
+      "(1, 'a.test', 'SOA', 'ns2.a.test h.a.test 9 3600 600 86400 300', 3600, NULL, false, NULL),"
+      "(1, 'www.a.test', 'A', '192.0.2.1', NULL, NULL, false, 'wwwx'),"
+      "(1, 'mx.a.test', 'MX', 'mail.a.test', 60, 10, NULL, NULL),"
+      "(1, 'a.test', 'TXT', 'off', 60, NULL, true, NULL),"
+      "(1, 'ent.a.test', NULL, NULL, NULL, NULL, false, 'e'),"
+      "(3, 'c.test', 'SOA', 'ns.c.test h.c.test 1 3600 600 86400 300', 60, NULL, true, NULL)");
+    db_conn_t *c = open_drv(NULL);
+    if (!c) return;
+    db_schema_info_t si;
+    CHECK(D->check_schema(c, &si) == 0);
+    CHECK(D->scan_records(c, NULL, cb_rec, &(racc_t){0}) == -1);       /* no snapshot */
+    CHECK_HAS(D->errmsg(c), "no snapshot");
+    CHECK(D->begin_snapshot(c) == 0);
+    CHECK(D->begin_snapshot(c) == -1);                                 /* already open */
+    zacc_t *z = calloc(1, sizeof(*z));
+    CHECK(D->list_zones(c, cb_zone, z) == 0);
+    CHECK(z->n == 3);
+    CHECK(z->id[0] == 1 && z->id[1] == 2 && z->id[2] == 3);
+    CHECK(!strcmp(z->name[0], "a.test") && !strcmp(z->type[0], "NATIVE") && z->master_null[0]);
+    CHECK_MSG(!z->soa_null[0] && !strncmp(z->soa[0], "ns.a.test ", 10), "first enabled apex SOA: %s", z->soa[0]);
+    CHECK(!strcmp(z->type[1], "SLAVE") && !z->master_null[1] && !strcmp(z->master[1], "192.0.2.1") && z->soa_null[1]);
+    CHECK(z->soa_null[2]);                                             /* the only SOA is disabled */
+    memset(z, 0, sizeof(*z));
+    z->stop_after = 2;
+    CHECK(D->list_zones(c, cb_zone, z) == DB_STOPPED && z->n == 2);    /* stopped scan, then another query works */
+
+    racc_t *r = calloc(1, sizeof(*r));
+    CHECK(D->scan_records(c, NULL, cb_rec, r) == 0);
+    CHECK(r->n == 7);
+    CHECK(r->did[0] == 1 && r->did[6] == 3);
+    int www = -1, mx = -1, txt = -1, ent = -1;
+    for (int i = 0; i < r->n && i < 16; i++) {
+        if (!strcmp(r->s[i][0], "www.a.test")) www = i;
+        if (!strcmp(r->s[i][0], "mx.a.test")) mx = i;
+        if (!strcmp(r->s[i][1], "TXT")) txt = i;
+        if (!strcmp(r->s[i][0], "ent.a.test")) ent = i;
+    }
+    CHECK(www >= 0 && r->r[www].ttl_null && r->r[www].prio_null && !r->r[www].disabled && !strcmp(r->s[www][2], "wwwx"));
+    CHECK(mx >= 0 && !r->r[mx].ttl_null && r->r[mx].ttl == 60 && !r->r[mx].prio_null && r->r[mx].prio == 10);
+    CHECK_MSG(mx >= 0 && r->r[mx].disabled, "a NULL disabled is a disabled row");
+    CHECK(txt >= 0 && r->r[txt].disabled);
+    CHECK(ent >= 0 && r->r[ent].type == NULL && r->r[ent].content == NULL && !strcmp(r->s[ent][1], "<NULL>"));
+    racc_t *r1 = calloc(1, sizeof(*r1));
+    int64_t one = 1;
+    CHECK(D->scan_records(c, &one, cb_rec, r1) == 0 && r1->n == 6);
+    for (int i = 1; i < r1->n; i++) CHECK(r1->id[i - 1] < r1->id[i]);
+    racc_t *rr = calloc(1, sizeof(*rr));
+    CHECK(D->scan_records_range(c, 1, 2, cb_rec, rr) == 0 && rr->n == 6);
+    memset(rr, 0, sizeof(*rr));
+    CHECK(D->scan_records_range(c, 3, 3, cb_rec, rr) == 0 && rr->n == 1);
+
+    /* snapshot isolation: a commit by another session is not seen inside the open snapshot */
+    Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (2, 'late.b.test', 'A', '192.0.2.9', 60)");
+    memset(r, 0, sizeof(*r));
+    CHECK(D->scan_records(c, NULL, cb_rec, r) == 0 && r->n == 7);
+    CHECK(D->end_snapshot(c) == 0);
+    CHECK(D->begin_snapshot(c) == 0);
+    memset(r, 0, sizeof(*r));
+    CHECK(D->scan_records(c, NULL, cb_rec, r) == 0 && r->n == 8);
+
+    /* more rows than one FETCH, in order, and a bulk scan equals per-zone scans */
+    Q("INSERT INTO records (domain_id, name, type, content, ttl) SELECT 3, 'h' || g || '.c.test', 'A', '192.0.2.' || (g % 250 + 1), 60 FROM generate_series(1, 2600) g");
+    CHECK(D->end_snapshot(c) == 0);
+    CHECK(D->begin_snapshot(c) == 0);
+    memset(r, 0, sizeof(*r));
+    CHECK(D->scan_records(c, NULL, cb_rec, r) == 0);
+    CHECK_MSG(r->n == 2608, "%d rows", r->n);
+    bool ordered = true;
+    for (int i = 1; i < r->n && i < 4000; i++) if (r->did[i - 1] > r->did[i] || (r->did[i - 1] == r->did[i] && r->id[i - 1] >= r->id[i])) ordered = false;
+    CHECK(ordered);
+    int64_t three = 3;
+    memset(r1, 0, sizeof(*r1));
+    CHECK(D->scan_records(c, &three, cb_rec, r1) == 0 && r1->n == 2601);
+    memset(rr, 0, sizeof(*rr));
+    CHECK(D->scan_records_range(c, 2, 3, cb_rec, rr) == 0 && rr->n == 2602);
+
+    /* metadata, keys */
+    D->end_snapshot(c);
+    Q("INSERT INTO domainmetadata (domain_id, kind, content) VALUES (1, 'PRESIGNED', '1'), (1, 'ALLOW-AXFR-FROM', '192.0.2.1'), (3, 'SOA-EDIT', 'INCEPTION-EPOCH')");
+    Q("INSERT INTO cryptokeys (domain_id, flags, active, content) VALUES (3, 257, true, 'SECRET-KEY-CONTENT'), (1, 256, true, 'x'), (3, 256, true, 'y')");
+    D->begin_snapshot(c);
+    int keys = 0;
+    CHECK(D->zones_with_keys(c, cb_key, &keys) == 0 && keys == 13);
+    macc_t m = {0};
+    CHECK(D->scan_metadata(c, NULL, cb_meta, &m) == 0 && m.n == 3 && m.d[0] == 1 && !strcmp(m.kind[0], "PRESIGNED") && m.d[2] == 3);
+    memset(&m, 0, sizeof(m));
+    CHECK(D->scan_metadata(c, &three, cb_meta, &m) == 0 && m.n == 1);
+    D->end_snapshot(c);
+    D->close(c);
+    free(z);
+    free(r);
+    free(r1);
+    free(rr);
+}
+
+static void test_ext_and_profiles(void) {
+    printf("profiles, domain views, tags\n");
+    db_conn_t *c = open_drv(NULL);
+    if (!c) return;
+    db_schema_info_t si;
+    CHECK(D->check_schema(c, &si) == 0);
+    Q("INSERT INTO karidns_profiles (name, settings) VALUES ('b-lower', 's2'), ('Z-Upper', 's1'), ('a-lower', 's3'), ('B-Upper', 's4')");
+    Q("INSERT INTO karidns_domain_views (domain_id, view_name) VALUES (3, 'internal'), (1, 'external'), (1, 'internal')");
+    Q("INSERT INTO karidns_zone_tagdefs (domain_id, kind, tag, cidr) VALUES (1, 'location', 'tokyo', '192.0.2.0/24'), (3, 'ecs', 'e1', '198.51.100.0/24'), (1, 'location', 'osaka', '192.0.2.0/25'), (1, 'location', 'tokyo2', '192.0.2.0/24')");
+    char rid[32];
+    qv(g_admin, "SELECT id FROM records WHERE name = 'www.a.test'", rid, sizeof(rid));
+    char sql[300];
+    snprintf(sql, sizeof(sql), "INSERT INTO karidns_record_tags (record_id, location_tag, ecs_tag) VALUES (%s, 'tokyo', NULL)", rid);
+    Q(sql);
+    snprintf(sql, sizeof(sql), "INSERT INTO karidns_record_tinydns (record_id, ttd, loc, countdown) VALUES (%s, NULL, 'k', true)", rid);
+    Q(sql);
+    CHECK(D->begin_snapshot(c) == 0);
+    pacc_t p = {0};
+    CHECK(D->scan_profiles(c, cb_prof, &p) == 0 && p.n == 4);
+    CHECK_MSG(!strcmp(p.name[0], "B-Upper") && !strcmp(p.name[1], "Z-Upper") && !strcmp(p.name[2], "a-lower") && !strcmp(p.name[3], "b-lower"),
+              "binary (C) order: %s %s %s %s", p.name[0], p.name[1], p.name[2], p.name[3]);
+    vacc_t v = {0};
+    CHECK(D->scan_domain_views(c, NULL, cb_view, &v) == 0 && v.n == 3 && v.d[0] == 1 && v.d[2] == 3);
+    memset(&v, 0, sizeof(v));
+    int64_t one = 1;
+    CHECK(D->scan_domain_views(c, &one, cb_view, &v) == 0 && v.n == 2);
+
+    xacc_t x = {0};
+    db_ext_sink_t sink = { cb_xtag, cb_xtdns, cb_xdef, &x };
+    CHECK(D->scan_ext(c, NULL, &sink) == 0);
+    CHECK(x.tags == 1 && x.tdns == 1 && x.defs == 4);
+    CHECK_MSG(x.def_dom[0] == 1 && !strcmp(x.def_tag[0], "tokyo") && !strcmp(x.def_tag[1], "osaka") && !strcmp(x.def_tag[2], "tokyo2") && x.def_dom[3] == 3,
+              "definitions in id order: %s %s %s", x.def_tag[0], x.def_tag[1], x.def_tag[2]);
+    memset(&x, 0, sizeof(x));
+    CHECK(D->scan_ext(c, &one, &sink) == 0 && x.tags == 1 && x.defs == 3);
+    D->end_snapshot(c);
+    D->close(c);
+}
+
+static void test_search_path(void) {
+    printf("schema (search_path)\n");
+    Q("CREATE SCHEMA karidns_test_s1");
+    char path[500];
+    snprintf(path, sizeof(path), "%s/pdns_schema.pgsql.sql", g_root);
+    char *sql = slurp(path);
+    CHECK(sql != NULL);
+    if (!sql) return;
+    Q("SET search_path TO karidns_test_s1");
+    Q(sql);
+    snprintf(path, sizeof(path), "%s/../../db/karidns_ext.pgsql.sql", g_root);
+    char *ext = slurp(path);
+    if (ext) Q(ext);
+    free(ext);
+    free(sql);
+    Q("INSERT INTO domains (id, name, type) VALUES (77, 'only-in-s1.test', 'NATIVE')");
+    Q("RESET search_path");
+    db_conn_t *c = open_drv("karidns_test_s1");
+    if (!c) return;
+    db_schema_info_t si;
+    CHECK(D->check_schema(c, &si) == 0 && si.has_changes);
+    CHECK(D->begin_snapshot(c) == 0);
+    zacc_t *z = calloc(1, sizeof(*z));
+    CHECK(D->list_zones(c, cb_zone, z) == 0 && z->n == 1 && z->id[0] == 77);
+    free(z);
+    D->end_snapshot(c);
+    D->close(c);
+    c = open_drv("odd \"schema\"; DROP TABLE domains; --");
+    if (c) {
+        CHECK(D->check_schema(c, &si) == -1);                      /* quoted as an identifier: no such schema, and nothing dropped */
+        D->close(c);
+    }
+    char v[32];
+    qv(g_admin, "SELECT count(*) FROM domains", v, sizeof(v));
+    CHECK(!strcmp(v, "3"));
+    Q("DROP SCHEMA karidns_test_s1 CASCADE");
+}
+
+/* the cursor protocol the loader uses: changes_max() inside a snapshot, changes_since(cursor) */
+static uint64_t snap_max(db_conn_t *c) {
+    uint64_t m = 0;
+    CHECK(D->begin_snapshot(c) == 0);
+    CHECK(D->changes_max(c, &m) == 0);
+    CHECK(D->end_snapshot(c) == 0);
+    return m;
+}
+
+static uint64_t snap_since(db_conn_t *c, uint64_t after, cacc_t *a, bool *gap) {
+    uint64_t last = 0;
+    memset(a, 0, sizeof(*a));
+    CHECK(D->begin_snapshot(c) == 0);
+    int rc = D->changes_since(c, after, cb_chg, a, &last, gap);
+    CHECK_MSG(rc == 0, "changes_since: %s", D->errmsg(c));
+    CHECK(D->end_snapshot(c) == 0);
+    return last;
+}
+
+static void test_changes(void) {
+    printf("change log\n");
+    PGconn *t1 = connect_db(g_db), *t2 = connect_db(g_db), *t3 = connect_db(g_db);
+    db_conn_t *c = open_drv(NULL);
+    if (!c || !t1 || !t2 || !t3) return;
+    db_schema_info_t si;
+    CHECK(D->check_schema(c, &si) == 0 && si.has_changes);
+    cacc_t a;
+    bool gap = false;
+
+    /* a plain edit: seen once, the cursor moves on, nothing is listed again below it */
+    uint64_t cur0 = snap_max(c);
+    Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (1, 'plain.a.test', 'A', '192.0.2.77', 60)");
+    uint64_t cur1 = snap_since(c, cur0, &a, &gap);
+    CHECK_MSG(a.n == 1 && a.v[0] == 1 && !gap, "plain edit: %d rows", a.n);
+    CHECK(cur1 > cur0);
+    uint64_t cur1b = snap_since(c, cur1, &a, &gap);
+    CHECK_MSG(a.n == 0 && cur1b == cur1, "nothing new: %d rows", a.n);
+
+    /* A: T1 takes the lower seq and stays open, T2 takes the higher seq and commits */
+    CHECK(qx(t1, "BEGIN"));
+    CHECK(qx(t1, "INSERT INTO records (domain_id, name, type, content, ttl) VALUES (1, 'slow.a.test', 'A', '192.0.2.1', 60)"));
+    Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (2, 'fast.b.test', 'A', '192.0.2.2', 60)");
+    uint64_t cur2 = snap_since(c, cur1, &a, &gap);
+    CHECK_MSG(a.n == 1 && a.v[0] == 2, "only the committed edit is visible: %d rows", a.n);
+    char xs[40];
+    {
+        PGresult *xr = PQexec(t1, "SELECT pg_current_xact_id()::text");
+        snprintf(xs, sizeof(xs), "%s", xr && PQntuples(xr) ? PQgetvalue(xr, 0, 0) : "0");
+        PQclear(xr);
+    }
+    CHECK_MSG(cur2 >= cur1 && cur2 <= strtoull(xs, NULL, 10), "the cursor does not pass the open transaction (%llu, xid %s)", (unsigned long long)cur2, xs);
+    CHECK(qx(t1, "COMMIT"));
+    uint64_t cur3 = snap_since(c, cur2, &a, &gap);
+    CHECK_MSG(has_dom(&a, 1), "the transaction that committed late is listed (%d rows)", a.n);
+    CHECK(cur3 > cur2);
+
+    /* B: the transaction that takes the HIGHER seq has the LOWER xid and commits first (a seq based position would skip the other) */
+    CHECK(qx(t2, "BEGIN"));
+    CHECK(qx(t2, "SELECT pg_current_xact_id()"));                      /* t2 gets its xid first ... */
+    CHECK(qx(t1, "BEGIN"));
+    CHECK(qx(t1, "INSERT INTO records (domain_id, name, type, content, ttl) VALUES (1, 'low-seq.a.test', 'A', '192.0.2.3', 60)"));   /* ... t1 takes seq N */
+    CHECK(qx(t2, "INSERT INTO records (domain_id, name, type, content, ttl) VALUES (2, 'high-seq.b.test', 'A', '192.0.2.4', 60)")); /* ... t2 takes seq N+1 */
+    CHECK(qx(t2, "COMMIT"));
+    char v1[32];
+    uint64_t cur4 = snap_since(c, cur3, &a, &gap);
+    CHECK_MSG(a.n >= 1 && has_dom(&a, 2) && !has_dom(&a, 1), "B: the committed edit of zone 2 only (%d rows)", a.n);
+    CHECK(qx(t1, "COMMIT"));
+    uint64_t cur5 = snap_since(c, cur4, &a, &gap);
+    CHECK_MSG(has_dom(&a, 1), "B: the edit of zone 1 (lower seq, committed last) is listed");
+    CHECK(cur5 >= cur4);
+    qv(g_admin, "SELECT (SELECT seq FROM karidns_changes WHERE domain_id = 1 ORDER BY seq DESC LIMIT 1) < (SELECT seq FROM karidns_changes WHERE domain_id = 2 ORDER BY seq DESC LIMIT 1)", v1, sizeof(v1));
+    CHECK_MSG(!strcmp(v1, "t"), "the interleaving really happened (zone 1 has the lower seq)");
+    /* C: an idle transaction with an xid in front does not hide later commits (the cursor stays, the rows are still listed) */
+    CHECK(qx(t3, "BEGIN"));
+    CHECK(qx(t3, "SELECT pg_current_xact_id()"));
+    uint64_t cur6 = snap_max(c);
+    Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (3, 'behind-idle.c.test', 'A', '192.0.2.5', 60)");
+    uint64_t cur7 = snap_max(c);
+    CHECK_MSG(cur7 == cur6 || cur7 > cur6, "the cursor does not go back (%llu %llu)", (unsigned long long)cur6, (unsigned long long)cur7);
+    snap_since(c, cur6, &a, &gap);
+    CHECK_MSG(has_dom(&a, 3), "the commit behind the idle transaction is listed although the cursor did not grow");
+    CHECK(qx(t3, "COMMIT"));
+    uint64_t cur8 = snap_max(c);
+    CHECK(cur8 > cur7);
+
+    /* an aborted transaction leaves a hole in seq and nothing else; it is not a gap */
+    CHECK(qx(t1, "BEGIN"));
+    CHECK(qx(t1, "INSERT INTO records (domain_id, name, type, content, ttl) VALUES (1, 'rolled.a.test', 'A', '192.0.2.6', 60)"));
+    CHECK(qx(t1, "ROLLBACK"));
+    Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (1, 'after-hole.a.test', 'A', '192.0.2.7', 60)");
+    snap_since(c, cur8, &a, &gap);
+    CHECK_MSG(a.n == 1 && !gap, "a rolled back transaction is no gap (%d rows, gap %d)", a.n, gap);
+
+    /* pruning: rows below the cursor are gone, the first seq is not 1 -> gap; with rows left below the cursor -> no gap */
+    uint64_t cur9 = snap_max(c);
+    char sqlb[160];
+    Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (1, 'p1.a.test', 'A', '192.0.2.8', 60)");
+    snap_since(c, cur9, &a, &gap);
+    CHECK_MSG(!gap && a.n == 1, "rows below the cursor exist: no gap");
+    snprintf(sqlb, sizeof(sqlb), "DELETE FROM karidns_changes WHERE xid < '%llu'::xid8", (unsigned long long)cur9);
+    Q(sqlb);
+    snap_since(c, cur9, &a, &gap);
+    CHECK_MSG(gap, "the rows the loader has seen are gone and the first seq is not 1: gap");
+    Q("DELETE FROM karidns_changes");
+    snap_since(c, cur9, &a, &gap);
+    CHECK_MSG(!gap && a.n == 0, "an empty log is no gap");
+    CHECK(D->changes_since(c, 0, cb_chg, &a, NULL, NULL) != 0);        /* needs a snapshot: the cursor query is a cursor scan */
+
+    /* a database without karidns_changes.xid (schema version 1) has no change log */
+    D->close(c);
+    PQfinish(t1);
+    PQfinish(t2);
+    PQfinish(t3);
+}
+
+static void test_v1_and_migration(void) {
+    printf("schema version 1 and the migration to 2\n");
+    Q("INSERT INTO karidns_changes (domain_id, changed_at) VALUES (1, 1)");
+    Q("DROP INDEX karidns_changes_xid_idx");
+    Q("ALTER TABLE karidns_changes DROP COLUMN xid");
+    Q("ALTER TABLE karidns_zone_tagdefs DROP COLUMN id");
+    Q("UPDATE karidns_schema_version SET version = 1");
+    db_conn_t *c = open_drv(NULL);
+    if (!c) return;
+    db_schema_info_t si;
+    CHECK(D->check_schema(c, &si) == 0);
+    CHECK_MSG(!si.has_changes && si.has_ext && si.has_domain_views && si.has_profiles, "v1: no change log, the rest works");
+    CHECK(!c->has_tagdef_id);
+    uint64_t m = 0;
+    CHECK(D->begin_snapshot(c) == 0);
+    CHECK(D->changes_max(c, &m) == DB_ERR_UNAVAILABLE);
+    CHECK(D->changes_since(c, 0, cb_chg, &(cacc_t){0}, NULL, NULL) == DB_ERR_UNAVAILABLE);
+    int defs = 0;
+    db_ext_sink_t sink = { cb_xnop_tag, cb_xnop_tdns, cb_xcount, &defs };
+    CHECK(D->scan_ext(c, NULL, &sink) == 0 && defs == 4);              /* ctid order */
+    D->end_snapshot(c);
+    D->close(c);
+
+    /* the migration script (twice: it is idempotent) */
+    char path[500];
+    snprintf(path, sizeof(path), "%s/../../db/karidns_ext_v1_to_v2.pgsql.sql", g_root);
+    char *mig = slurp(path);
+    CHECK(mig != NULL);
+    if (!mig) return;
+    CHECK(qx(g_admin, mig));
+    CHECK(qx(g_admin, mig));
+    free(mig);
+    char v[64];
+    qv(g_admin, "SELECT version FROM karidns_schema_version", v, sizeof(v));
+    CHECK_MSG(!strcmp(v, "2"), "version %s", v);
+    qv(g_admin, "SELECT count(*) FROM karidns_schema_version", v, sizeof(v));
+    CHECK(!strcmp(v, "1"));
+    qv(g_admin, "SELECT string_agg(tag, ',' ORDER BY id) FROM karidns_zone_tagdefs WHERE domain_id = 1", v, sizeof(v));
+    CHECK_MSG(!strcmp(v, "tokyo,osaka,tokyo2"), "the order of the definitions survives the migration: %s", v);
+    qv(g_admin, "SELECT count(*) FROM karidns_changes WHERE xid = '0'::xid8", v, sizeof(v));
+    CHECK_MSG(strcmp(v, "0") != 0, "old log rows have xid 0");
+    c = open_drv(NULL);
+    if (!c) return;
+    CHECK(D->check_schema(c, &si) == 0 && si.has_changes && c->has_tagdef_id);
+    Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (2, 'v2.b.test', 'A', '192.0.2.10', 60)");
+    qv(g_admin, "SELECT count(*) FROM karidns_changes WHERE xid <> '0'::xid8", v, sizeof(v));
+    CHECK_MSG(!strcmp(v, "1"), "a new row gets the xid of its transaction (%s)", v);
+    D->close(c);
+}
+
+static void test_notify(void) {
+    printf("notifications\n");
+    db_conn_t *c = open_drv(NULL);
+    if (!c) return;
+    db_schema_info_t si;
+    CHECK(D->check_schema(c, &si) == 0);
+    uint64_t v0 = 0, v1 = 0;
+    bool repl = true;
+    CHECK(D->poll_version(c, &v0, &repl) == 0 && !repl);
+    int fd = D->wait_fd(c);
+    CHECK(fd >= 0);
+    bool changed = true;
+    CHECK(D->drain_notifications(c, &changed) == 0 && !changed);
+    CHECK(D->poll_version(c, &v1, &repl) == 0 && v1 == v0);
+    Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (2, 'n1.b.test', 'A', '192.0.2.11', 60)");
+    struct pollfd pf = { fd, POLLIN, 0 };
+    CHECK_MSG(poll(&pf, 1, 5000) == 1, "the socket becomes readable");
+    CHECK(D->poll_version(c, &v1, &repl) == 0 && v1 > v0);
+    /* a notification that arrived while the connection ran a query (changes_max) is seen by the next poll_version */
+    uint64_t m;
+    Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (2, 'n2.b.test', 'A', '192.0.2.12', 60)");
+    usleep(200000);
+    CHECK(D->begin_snapshot(c) == -1 || true);
+    if (c->in_snapshot) D->end_snapshot(c);
+    CHECK(D->changes_max(c, &m) == 0);
+    uint64_t v2 = 0;
+    CHECK(D->poll_version(c, &v2, &repl) == 0 && v2 > v1);
+    CHECK(D->drain_notifications(c, &changed) == 0 && !changed);
+
+    /* LISTEN cannot start inside a snapshot */
+    db_conn_t *c2 = open_drv(NULL);
+    if (c2) {
+        CHECK(D->check_schema(c2, &si) == 0 && D->begin_snapshot(c2) == 0);
+        CHECK(D->wait_fd(c2) == -1);
+        D->end_snapshot(c2);
+        CHECK(D->wait_fd(c2) >= 0);
+        D->close(c2);
+    }
+
+    /* the backend is terminated from outside: the driver reports a transient error */
+    char sql[300], pid[32];
+    snprintf(sql, sizeof(sql), "SELECT pid FROM pg_stat_activity WHERE application_name = 'karidns-dbloader' AND datname = '%s' ORDER BY backend_start LIMIT 1", g_db);
+    qv(g_admin, sql, pid, sizeof(pid));
+    CHECK(pid[0] != '\0');
+    snprintf(sql, sizeof(sql), "SELECT pg_terminate_backend(%s)", pid);
+    Q(sql);
+    usleep(300000);
+    int rc = D->poll_version(c, &v2, &repl);
+    int rc2 = D->drain_notifications(c, &changed);
+    CHECK_MSG(rc == DB_ERR_RETRY || rc2 == DB_ERR_RETRY, "terminated connection: %d %d (%s)", rc, rc2, D->errmsg(c));
+    CHECK(D->begin_snapshot(c) == DB_ERR_RETRY);
+    CHECK_HAS(D->errmsg(c), "retry later");
+    D->close(c);
+}
+
+static void test_errors(void) {
+    printf("errors in a snapshot\n");
+    db_conn_t *c = open_drv(NULL);
+    if (!c) return;
+    db_schema_info_t si;
+    CHECK(D->check_schema(c, &si) == 0);
+    CHECK(D->begin_snapshot(c) == 0);
+    /* the session is read only */
+    PGresult *r = PQexec(c->pg, "INSERT INTO domains (name, type) VALUES ('rw.test', 'NATIVE')");
+    CHECK(r && PQresultStatus(r) == PGRES_FATAL_ERROR);
+    PQclear(r);
+    /* after a server error the transaction is aborted; end_snapshot still returns and the connection can start a new one */
+    D->end_snapshot(c);
+    CHECK(D->begin_snapshot(c) == 0);
+    D->end_snapshot(c);
+    /* a NUL cannot be stored; a text cell is checked anyway */
+    D->close(c);
+}
+
+/* ------------------------------------------------------------------ main */
+static void cleanup(void) {
+    if (g_admin) PQfinish(g_admin);
+    g_admin = NULL;
+    if (g_maintc && g_db[0]) {
+        char sql[200];
+        snprintf(sql, sizeof(sql), "DROP DATABASE IF EXISTS %s", g_db);
+        PGresult *r = PQexec(g_maintc, sql);
+        PQclear(r);
+    }
+    if (g_maintc) PQfinish(g_maintc);
+    g_maintc = NULL;
+    if (g_dir[0]) rm_tree(g_dir);
+}
+
+int main(int argc, char **argv) {
+    snprintf(g_root, sizeof(g_root), "%s", argc > 1 ? argv[1] : "tests/db");
+    const char *pg = getenv("KARIDNS_TEST_PG");
+    snprintf(g_maint, sizeof(g_maint), "%s", pg && *pg ? pg : "dbname=postgres");
+    char ci[1200];
+    snprintf(ci, sizeof(ci), "%s connect_timeout=5", g_maint);
+    g_maintc = PQconnectdb(ci);
+    if (PQstatus(g_maintc) != CONNECTION_OK) {
+        char line[200];
+        first_line(PQerrorMessage(g_maintc), line, sizeof(line));
+        printf("SKIP: no PostgreSQL server for the driver tests (%s); set KARIDNS_TEST_PG to a conninfo\n", line);
+        PQfinish(g_maintc);
+        g_maintc = NULL;
+        return 0;
+    }
+    snprintf(g_db, sizeof(g_db), "karidns_test_unit_%d", (int)getpid());
+    char sql[200];
+    snprintf(sql, sizeof(sql), "CREATE DATABASE %s", g_db);
+    PGresult *r = PQexec(g_maintc, sql);
+    bool made = PQresultStatus(r) == PGRES_COMMAND_OK;
+    if (!made) {
+        char line[200];
+        first_line(PQerrorMessage(g_maintc), line, sizeof(line));
+        printf("SKIP: the PostgreSQL role may not create databases (%s)\n", line);
+    }
+    PQclear(r);
+    if (!made) {
+        PQfinish(g_maintc);
+        return 0;
+    }
+    atexit(cleanup);
+    const char *tmp = getenv("TMPDIR");
+    snprintf(g_dir, sizeof(g_dir), "%s/karidns_dbpg_XXXXXX", tmp && *tmp ? tmp : "/tmp");
+    if (!mkdtemp(g_dir)) {
+        printf("  [FAIL] cannot create a temporary directory\n");
+        return 1;
+    }
+    snprintf(g_ci, sizeof(g_ci), "%s/conninfo", g_dir);
+    write_ci(g_db);
+    printf("libpq %d, server %d, test database %s\n", PQlibVersion(), PQserverVersion(g_maintc), g_db);
+    if (PQserverVersion(g_maintc) < 130000) {
+        printf("SKIP: PostgreSQL 13 or newer is needed (xid8)\n");
+        return 0;
+    }
+    g_admin = connect_db(g_db);
+    if (!g_admin) return 1;
+    char path[500];
+    snprintf(path, sizeof(path), "%s/pdns_schema.pgsql.sql", g_root);
+    char *schema = slurp(path);
+    snprintf(path, sizeof(path), "%s/../../db/karidns_ext.pgsql.sql", g_root);
+    char *ext = slurp(path);
+    if (!schema || !ext) {
+        printf("  [FAIL] cannot read the schema files below %s\n", g_root);
+        return 1;
+    }
+    CHECK(qx(g_admin, schema));
+    CHECK(qx(g_admin, ext));
+    free(schema);
+    free(ext);
+    test_conninfo();
+    test_schema();
+    test_rows();
+    test_ext_and_profiles();
+    test_search_path();
+    test_changes();
+    test_notify();
+    test_errors();
+    test_v1_and_migration();
+    printf("\n%d checks, %d failed\n", g_checks, g_failed);
+    return g_failed ? 1 : 0;
+}
+
+#else /* !KARIDNS_DB_POSTGRESQL */
+
+int main(void) {
+    printf("SKIP: built without the PostgreSQL driver\n");
+    return 0;
+}
+
+#endif

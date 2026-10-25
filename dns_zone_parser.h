@@ -182,8 +182,7 @@ void zone_arena_destroy(zone_arena_t *arena);
  * the kept zone file text. image, glue, rcache_ok and generation are kept. */
 void zone_arena_free_builder(zone_arena_t *arena);
 void zone_arena_free_include_buffers(zone_arena_t *arena);
-/* 公開直前に呼ぶ: 応答キャッシュに入れてよいか (rcache_ok) を決める */
-void build_zone_response_cache(zone_version_t *ver, struct server_config_s *cfg, const char *view_name, const char *domain);
+/* build_zone_response_cache() is declared in dns_server_internal.h (it takes the zone entry) */
 /* S5 B-3: make the published version out of a frozen builder: a new heap zone_version_t takes over builder->image (the builder
  * keeps nothing of it and can be destroyed). NULL on out of memory; the builder still owns the image then. */
 zone_version_t *zone_version_new(zone_arena_t *builder);
@@ -211,6 +210,20 @@ size_t zone_arena_drop_out_of_zone(zone_arena_t *arena, const char *apex,
                                    void (*report)(const dns_record_t *rec, void *ud), void *ud);
 /* X-32: drop records whose RDATA cannot be written in wire format (call before build_zone_index). */
 size_t zone_arena_drop_unencodable(zone_arena_t *arena, void (*report)(const dns_record_t *rec, void *ud), void *ud);
+/* B8t-1: SOA RRs at the apex of a zone (builder form). A SOA is restricted when it has a tinydns location or time stamp, or a
+ * $LOCATION / $ECS-SUBNET tag: some clients do not see it. */
+bool dns_record_is_restricted(const dns_record_t *r);
+/* B8t-2: do two RRs have the same visibility (the same tinydns location, time stamp and countdown flag, the same $LOCATION and
+ * $ECS-SUBNET tags)?  Two unrestricted RRs do.  RRset TTL harmonization (RFC 2181 §5.2) applies among RRs of the same visibility
+ * only: the TTL a zone author wrote for an RR that only some clients see is kept. */
+bool dns_record_same_visibility(const dns_record_t *a, const dns_record_t *b);
+/* The reference SOA of the zone `zone`: the apex SOA (with a complete RDATA) that is not restricted if there is one, else the
+ * first in record order; NULL when there is none. Zone-wide values (serial, refresh / retry / expire, EDNS EXPIRE) come from it. */
+const dns_record_t *zone_arena_reference_soa(const zone_arena_t *arena, const char *zone);
+/* Rules for the SOA RRs of one zone (RFC 2181 §6.1: a zone has one serial; a signature of the SOA RRset would not hold for
+ * per-client SOA RRs): all apex SOA RRs have the same serial, and none is restricted or accompanied by another SOA in a
+ * zone that holds DNSSEC records (RRSIG, DNSKEY, NSEC, NSEC3). 0 = ok, -1 = the zone must not be loaded (reason in err). */
+int zone_arena_check_soa_set(const zone_arena_t *arena, const char *zone, char *err, size_t errlen);
 bool compare_records(const dns_record_t *a, const dns_record_t *b, bool ignore_ttl);
 bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target);
 uint32_t calc_fnv1a_str(const char *str);
@@ -238,6 +251,8 @@ static inline uint32_t calc_fnv1a_other_root_form(const char *name) {
 }
 int validate_zone_dname(zone_arena_t *arena, parse_error_t *err);
 int validate_zone_name_lengths(zone_arena_t *arena, parse_error_t *err);
+/* B9a: ALIAS / LUA rules (RDATA, ALIAS beside A/AAAA, ALIAS beside DNSSEC records); -1 with the reason in detail (err->error_message points to it) */
+int validate_zone_pdns_types(const zone_arena_t *arena, parse_error_t *err, char *detail, size_t detail_cap);
 void free_ecs_tags_array(ecs_tag_def_t *tags, int count);
 ecs_tag_def_t *clone_ecs_tags_array(const ecs_tag_def_t *src, int count);
 

@@ -21,9 +21,10 @@
 #include "../../dns_dynamic_update.h"
 #include "../../dns_axfr_ixfr.h"
 #include "../../dns_server_internal.h"
+#include "../tst_entry.h"
 
 // Mock globals
-int g_control_kq = -1;
+_Atomic int g_control_kq = -1;
 int g_notify_ipc[2] = {-1, -1};
 int g_broker_sock = -1;
 config_rcu_t g_config_db;
@@ -217,9 +218,9 @@ static void init_rich_fuzz_engine(void) {
 
     /* The shared response cache (filled on a miss, read on later inputs) and its eligibility per zone */
     response_cache_init(256 * 1024);
-    build_zone_response_cache(&g_fuzz_arena_main.ver, &g_fuzz_cfg, "default", "example.com.");
-    build_zone_response_cache(&g_fuzz_arena_sub.ver, &g_fuzz_cfg, "default", "sub.example.org.");
-    build_zone_response_cache(&g_fuzz_arena_nsec3.ver, &g_fuzz_cfg, "default", "signed.local.");
+    build_zone_response_cache(&g_fuzz_arena_main.ver, &g_fuzz_cfg, tst_entry("default", "example.com."));
+    build_zone_response_cache(&g_fuzz_arena_sub.ver, &g_fuzz_cfg, tst_entry("default", "sub.example.org."));
+    build_zone_response_cache(&g_fuzz_arena_nsec3.ver, &g_fuzz_cfg, tst_entry("default", "signed.local."));
 
     g_fuzz_qe_initialized = true;
 }

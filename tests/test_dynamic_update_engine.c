@@ -27,7 +27,7 @@
 #include "test_zone_slots.h"
 
 // Mock globals needed by server internal dependencies
-int g_control_kq = -1;
+_Atomic int g_control_kq = -1;
 int g_notify_ipc[2] = {-1, -1};
 int g_broker_sock = -1;
 config_rcu_t g_config_db;
@@ -531,7 +531,7 @@ static void test_send_notify_to_all_comprehensive(void) {
     assert(test_build_index(a2, true) == 0);
     atomic_store_explicit(&z2->rcu.active, &a2->ver, memory_order_release);
 
-    send_notify_to_all("example.com.", "default");
+    send_notify_to_all(z1);
 
     // Count received NOTIFY packets from IPC
     int pkt_count = 0;

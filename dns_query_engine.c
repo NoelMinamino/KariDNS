@@ -10,6 +10,7 @@
 #include "dns_dynamic_update.h"
 #include "dns_siphash.h"
 #include "dns_zone_image.h"
+#include "dns_alias.h"
 
 #ifdef __FreeBSD__
 #include <sys/capsicum.h>
@@ -25,6 +26,10 @@ static _Thread_local bool t_resolve_crossed_zone;
 /* 応答の大きさの上限で Additional を途中で打ち切ったか (TC は立てない、RFC 2181 §9)。キャッシュの鍵は
  * 問い合わせの受信バッファの大きさを含まないので、打ち切った応答は入れない */
 static _Thread_local bool t_resolve_additional_cut;
+/* B9a: the answer holds ALIAS-expanded addresses (or an ALIAS target that could not be resolved): the result changes with the resolver's TTLs, so it
+ * is not stored in the shared response cache; and the SERVFAIL gets an extended error */
+static _Thread_local bool t_resolve_alias_expanded;
+static _Thread_local bool t_resolve_alias_failed;
 
 program_plugin_t *g_program_plugins = NULL;
 int g_program_plugins_count = 0;
@@ -107,6 +112,15 @@ static bool is_nsec3_chain_rr(const zone_image_t *img, uint32_t rr) {
   return type == 46 && zone_image_rrsig_covered(img, rr, &covered) == 0 && covered == 50;
 }
 
+/* B9a (design 3.6b): PowerDNS's LUA records (TYPE 65402 of CLASS IN) are in the zone for the transfer only.  Like PowerDNS with
+ * enable-lua-records=no, a query never sees them: not as an answer (not for QTYPE 65402 or ANY), and a name that holds nothing else
+ * does not exist (NXDOMAIN).  KariDNS's own Extended AXFR record of the same number (CLASS 65302) is not a zone RR at all. */
+static bool rr_not_served(const zone_image_t *img, uint32_t rr) {
+  const zone_image_rr_t *r = &zone_image_rrs(img)[rr];
+  if (r->type == DNS_TYPE_PDNS_LUA && r->class_val == 1) return true;
+  return is_nsec3_chain_rr(img, rr);
+}
+
 static resolve_checkpoint_t save_checkpoint(uint16_t *offset, uint16_t *ancount,
 
                                              uint16_t *nscount, uint16_t *arcount) {
@@ -134,47 +148,7 @@ STATIC_TEST bool image_rr_currently_valid(const zone_image_t *img, uint32_t rr, 
                                           const char *client_ecs_tag,
                                           const char *client_loc_tag,
                                           uint32_t *effective_ttl_out) {
-    const zone_image_ext_t *e = zone_image_rr_ext(img, rr);
-    uint32_t ttl = zone_image_rr_ttl(img, rr);
-    if (!e) {
-        *effective_ttl_out = ttl;
-        return true;
-    }
-    if (e->loc[0] != 0 || e->loc[1] != 0) {
-        if (e->loc[0] != client_loc[0] || e->loc[1] != client_loc[1]) {
-            return false;
-        }
-    }
-    if (e->ecs_tag_off != 0) {
-        if (client_ecs_tag == NULL || strcasecmp(zone_image_str(img, e->ecs_tag_off), client_ecs_tag) != 0) {
-            return false;
-        }
-    }
-    if (e->loc_tag_off != 0) {
-        if (client_loc_tag == NULL || strcasecmp(zone_image_str(img, e->loc_tag_off), client_loc_tag) != 0) {
-            return false;
-        }
-    }
-    time_t ttd = (time_t)e->ttd;
-    if (ttd == 0) {
-        *effective_ttl_out = ttl;
-        return true;
-    }
-
-    if (!(e->flags & ZONE_IMAGE_EXT_COUNTDOWN)) {
-        /* アクティベーション時刻としてのtimestamp */
-        if (ttd >= now) return false; /* まだ未来 */
-        *effective_ttl_out = ttl;
-        return true;
-    }
-
-    /* カウントダウンTTL(有効期限としてのtimestamp)。 */
-    if (ttd < now) return false; /* 既に期限切れ */
-    double remaining = difftime(ttd, now);
-    if (remaining < 2.0) remaining = 2.0;
-    if (remaining > 3600.0) remaining = 3600.0;
-    *effective_ttl_out = (uint32_t)remaining;
-    return true;
+    return zone_image_rr_valid(img, rr, now, client_loc, client_ecs_tag, client_loc_tag, effective_ttl_out);
 }
 
 /* The common case (an RR with no ext[] entry) without the call */
@@ -249,7 +223,7 @@ static int emit_rrset(const zone_image_t *img, uint32_t name_id, const char *own
   uint32_t end = k + zone_image_name_rr_count(img, name_id);
   for (; k < end; k++) {
     if (rrs[k].type != type) continue;
-    if (is_nsec3_chain_rr(img, k)) continue; // RFC 5155 §7.2.8: 否定の証明でだけ書く (attach_nsec3_record)
+    if (rr_not_served(img, k)) continue; // RFC 5155 §7.2.8 / LUA: 否定の証明でだけ書く (attach_nsec3_record)
     if (qclass != 255 && qclass != rrs[k].class_val) continue;
     if (f->answer_scope) note_ecs_variant(img, k, type, f->zone_scope, f->answer_scope);
     uint32_t eff_ttl;
@@ -263,6 +237,9 @@ static int emit_rrset(const zone_image_t *img, uint32_t name_id, const char *own
     (*count)++;
     written++;
     if (glue) collect_additional_rr_glue(img, k, glue);
+    /* B8t-1: a zone with restricted SOA RRs answers with the first SOA the client sees, never with several (as tinydns does, djbdns 1.05;
+     * RFC 2181 §6.1: one SOA per zone) */
+    if (type == 6 && (img->flags & ZONE_IMAGE_F_SOA_ATTR)) break;
   }
   if (written == 0 || rrsig_mode == RRSIG_NONE || type == 46) return written;
   uint16_t rrset_offset = *offset, rrset_count = *count;
@@ -411,7 +388,7 @@ STATIC_TEST bool name_exists_in_zone(const zone_image_t *img, const char *name, 
     uint32_t k = zone_image_name_first_rr(img, id);
     uint32_t end = k + zone_image_name_rr_count(img, id);
     for (; k < end; k++) {
-      if (is_nsec3_chain_rr(img, k)) continue; // RFC 5155 §7.2.8
+      if (rr_not_served(img, k)) continue; // RFC 5155 §7.2.8, LUA
       uint32_t eff_ttl;
       if (rr_valid(img, k, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) return true;
     }
@@ -743,6 +720,52 @@ static bool rrset_type_seen(uint16_t types[64], int *count, uint16_t t) {
   return false;
 }
 
+/* B9a (design 3.6b): the A / AAAA RRsets that the ALIAS RRs of owner `name_id` stand for, from the result table of dns_alias.c (no allocation, no
+ * waiting).  qtype 1, 28 or 255 (ANY: A then AAAA).  The TTL is the smaller of the ALIAS RR's and what is left of the upstream TTL.
+ * Returns the RRs written (0 = NODATA), or -1 when they do not fit (nothing is left of them: the caller sets TC); *ok_types counts the
+ * (ALIAS RR, type) pairs that had a usable result: when it stays 0 the caller answers SERVFAIL (PowerDNS does when it cannot resolve). */
+static int answer_alias(const zone_image_t *img, uint32_t name_id, uint64_t key, const char *owner, uint16_t qtype, uint8_t *res,
+                        size_t max_res_len, uint16_t *offset, compress_ctx_t *comp_ctx, uint16_t *ancount, int *ok_types) {
+  static const uint16_t types[2] = { 1, 28 };
+  const zone_image_rr_t *rrs = zone_image_rrs(img);
+  uint16_t start_offset = *offset, start_count = *ancount;
+  int written = 0;
+  *ok_types = 0;
+  uint32_t k = zone_image_name_first_rr(img, name_id);
+  uint32_t end = k + zone_image_name_rr_count(img, name_id);
+  for (; k < end; k++) {
+    if (rrs[k].type != DNS_TYPE_PDNS_ALIAS || rrs[k].class_val != 1) continue;
+    uint8_t target[256];
+    size_t tlen;
+    if (!alias_wire_lower(zone_image_rr_rdata(img, k), zone_image_rr_rdlen(img, k), target, &tlen)) continue;
+    for (int t = 0; t < 2; t++) {
+      if (qtype != 255 && qtype != types[t]) continue;
+      alias_answer_t a;
+      if (!alias_lookup(key, target, tlen, types[t], &a)) continue;
+      (*ok_types)++;
+      uint32_t ttl = a.ttl < rrs[k].ttl ? a.ttl : rrs[k].ttl;
+      for (uint8_t i = 0; i < a.n; i++) {
+        dns_record_t r;
+        memset(&r, 0, sizeof(r));
+        r.name = (char *)owner;
+        r.type_code = types[t];
+        r.class_val = 1;
+        r.ttl_value = ttl;
+        r.generic_data = (uint8_t *)(uintptr_t)(a.rdata + (size_t)i * a.rdlen);
+        r.generic_len = a.rdlen;
+        if (serialize_dns_record(res, max_res_len, offset, &r, comp_ctx, owner, 0xFFFFFFFF) < 0) {
+          *offset = start_offset;
+          *ancount = start_count;
+          return -1;
+        }
+        (*ancount)++;
+        written++;
+      }
+    }
+  }
+  return written;
+}
+
 static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
                          zone_db_entry_t **db_entry_ptr,
                          zone_version_t **current_zone_ptr, uint8_t *res,
@@ -795,20 +818,18 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     const zone_image_name_t *img_names = zone_image_names(img);
     const zone_image_rr_t *img_rrs = zone_image_rrs(img);
 
-    time_t tinydns_now = 0;
-    if (img->flags & ZONE_IMAGE_F_TINYDNS) {
-      tinydns_now = time(NULL);
-    }
-    char client_loc[2] = {0, 0};
-    tinydns_resolve_client_location(img, client_ip, client_loc);
-
-    zone_config_t *zcfg = (cfg && db_entry) ? find_zone_config_in_view(cfg, db_entry->view_name, db_entry->domain) : NULL;
-    const char *client_loc_tag = resolve_bind_location_tag(img, cfg, zcfg, client_ip);
-    const char *client_ecs_tag = NULL;
+    const zone_config_t *zcfg = (cfg && db_entry) ? zone_entry_config(cfg, db_entry) : NULL;
+    zone_image_view_t cview;
     uint8_t zone_scope = 0;
-    if (ecs_trusted && ecs_addr) {
-      client_ecs_tag = resolve_ecs_subnet_tag(img, cfg, zcfg, ecs_addr, ecs_family, &zone_scope);
-    }
+    zone_client_view(img, cfg, zcfg, client_ip, ecs_trusted, ecs_addr, ecs_family, &cview, &zone_scope);
+    time_t tinydns_now = cview.now;
+    const char *client_loc = cview.loc;
+    const char *client_loc_tag = cview.loc_tag;
+    const char *client_ecs_tag = cview.ecs_tag;
+    /* B8t-1: a zone cut over to by a CNAME whose SOA this client does not see is not served to it: the chain stops here
+     * (the query's own zone was checked before, REFUSED) */
+    if (depth > 0 && (img->flags & ZONE_IMAGE_F_SOA_ATTR) && zone_image_visible_soa(img, &cview, NULL) == ZONE_IMAGE_NONE)
+      return;
 
     // ==== フェーズ1: 委任判定 ====
     additional_from_auth_t policy = (zcfg && zext(zcfg)->additional_from_auth_specified)
@@ -828,6 +849,10 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
       q_first = img_names[qname_id].first_rr;
       q_end = q_first + (img_names[qname_id].rr_count_flags & ZONE_IMAGE_NAME_COUNT_MASK);
     }
+    /* B9a: this owner has an ALIAS RR and the zone has resolvers (alias-resolver): the ALIAS is expanded, not answered */
+    uint64_t alias_key = 0;
+    if (qname_id != ZONE_IMAGE_NONE && (img_names[qname_id].rr_count_flags & ZONE_IMAGE_NAME_ALIAS) && (qclass == 1 || qclass == 255))
+      alias_key = alias_resolvers_key(cfg, zcfg, db_entry->source == ZONE_SRC_DB);
     uint16_t written_types[64];
     int written_count = 0;
     rr_filter_t flt = { client_loc, client_ecs_tag, client_loc_tag, zone_scope, answer_scope };
@@ -836,7 +861,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     if (has_any && minimal_any) {
       bool name_exists = false, has_cname = false, has_rrsig = false;
       for (uint32_t k = q_first; k < q_end; k++) {
-        if (is_nsec3_chain_rr(img, k)) continue; // RFC 5155 §7.2.8: 名前の存在に数えない
+        if (rr_not_served(img, k)) continue; // RFC 5155 §7.2.8 / LUA: 名前の存在に数えない
         uint32_t eff_ttl;
         note_ecs_variant(img, k, 255, zone_scope, answer_scope);
         if (!rr_valid(img, k, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
@@ -874,7 +899,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
       bool class_matches = (qclass == 255 || qclass == r_class);
       if (!class_matches) continue;
       // RFC 5155 §7.2.8: NSEC3 チェーンのレコードは QTYPE NSEC3/RRSIG/ANY でも答えず、名前の存在にも数えない
-      if (is_nsec3_chain_rr(img, k)) continue;
+      if (rr_not_served(img, k)) continue;
       uint32_t eff_ttl;
       note_ecs_variant(img, k, qtypes[0], zone_scope, answer_scope);
       if (!rr_valid(img, k, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
@@ -918,6 +943,8 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
         }
         break;
       } else {
+        /* B9a: with an alias-resolver the ALIAS RR itself is no answer (PowerDNS with expand-alias=yes), and ANY gives the expanded A and AAAA only */
+        if (alias_key && ((rec_type == DNS_TYPE_PDNS_ALIAS && r_class == 1) || (has_any && rec_type != 5))) continue;
         /* [RFC 8482 §4.2] DNSSECゾーンでのANYクエリ: 最初に見つかった1つのRRsetのみを返し、他は展開しない */
         if (has_any && minimal_any && skip_synthesis) {
           if (rec_type != 46) {
@@ -944,6 +971,27 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
           }
         }
       }
+    }
+
+    // ==== B9a: ALIAS の展開 (A / AAAA / ANY) ====
+    if (alias_key && found && !type_matched && !cname_followed && (qtypes[0] == 1 || qtypes[0] == 28 || has_any)) {
+      int ok_types = 0;
+      t_resolve_alias_expanded = true;
+      int w = answer_alias(img, qname_id, alias_key, current_qname, qtypes[0], res, max_res_len, offset, comp_ctx, ancount, &ok_types);
+      if (w < 0) {
+        res[2] |= 0x02;
+        return;
+      }
+      if (ok_types == 0) {                       // not resolved (yet), or the result is older than the stale limit
+        t_resolve_alias_failed = true;
+        res[3] = (res[3] & 0xF0) | 0x02;      // SERVFAIL
+        *offset = initial_offset;
+        *ancount = initial_ancount;
+        *nscount = initial_nscount;
+        *arcount = initial_arcount;
+        return;
+      }
+      if (w > 0) type_matched = true;
     }
 
     // ==== フェーズ3: DNAME合成 ====
@@ -1058,6 +1106,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
               uint16_t r_class = img_rrs[k].class_val;
               bool class_matches = (qclass == 255 || qclass == r_class);
               if (!class_matches) continue;
+              if (rr_not_served(img, k)) continue; // LUA (B9a): a wildcard that holds only LUA records is not there
               uint32_t eff_ttl;
               note_ecs_variant(img, k, qtypes[0], zone_scope, answer_scope);
               if (!rr_valid(img, k, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
@@ -1170,10 +1219,22 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
         int qtx_mode = (sign_answers && qtx != 46) ? RRSIG_REQUIRED : RRSIG_NONE;
 
         // O-16: RRset を続けて書き、その後ろに RRSIG (exact-name と同じヘルパー)
-        int w = emit_rrset(img, final_id, NULL, qtx, qclass, &flt, qtx_mode, res,
-                           max_res_len, offset, comp_ctx, ancount, &glue);
+        int w = (alias_key && qtx == DNS_TYPE_PDNS_ALIAS)   /* B9a: with an alias-resolver the ALIAS RR is not an answer (as for the first QTYPE) */
+                    ? 0
+                    : emit_rrset(img, final_id, NULL, qtx, qclass, &flt, qtx_mode, res,
+                                 max_res_len, offset, comp_ctx, ancount, &glue);
         if (w < 0) this_qtx_failed = true;
         else if (w > 0) qtx_matched = true;
+
+        /* B9a: the extra QTYPEs A / AAAA of an RFC 10029 query at an ALIAS name are expanded like the first one (a type without a usable
+         * result is simply not matched here: only the first QTYPE decides SERVFAIL) */
+        if (!qtx_matched && !this_qtx_failed && alias_key && (qtx == 1 || qtx == 28) && final_id == qname_id) {
+          int ok_x = 0;
+          t_resolve_alias_expanded = true;
+          int wa = answer_alias(img, final_id, alias_key, current_qname, qtx, res, max_res_len, offset, comp_ctx, ancount, &ok_x);
+          if (wa < 0) this_qtx_failed = true;
+          else if (wa > 0) qtx_matched = true;
+        }
 
         if (!qtx_matched && !this_qtx_failed && (img->flags & ZONE_IMAGE_F_WILDCARD)) {
           const char *parent = current_qname;
@@ -1965,7 +2026,7 @@ size_t dns_rrl_slip_response(uint8_t *res, size_t res_len, size_t buf_cap) {
 _Thread_local static uint8_t s_forward_req_buf[65535];
 _Thread_local static uint8_t s_forward_res_buf[65535];
 
-STATIC_TEST int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t req_len,
+STATIC_TEST int dispatch_forward_zone(const zone_config_t *zcfg, const uint8_t *req, size_t req_len,
                                  uint8_t *res, size_t max_res_len) {
   const zone_ext_t *x = zext(zcfg);
   if (req_len < DNS_HEADER_SIZE || x->forwarders_count == 0) {
@@ -2452,7 +2513,7 @@ STATIC_TEST void rcache_store(uint64_t tag, uint64_t gen, uint16_t qtype, const 
 
 /* 公開する直前に呼ぶ。このゾーンの応答を共有キャッシュに入れてよいかを決める (応答がクライアントの
  * アドレス、ECS、時刻で変わるゾーンは入れない)。 */
-void build_zone_response_cache(zone_version_t *arena, server_config_t *cfg, const char *view_name, const char *domain) {
+void build_zone_response_cache(zone_version_t *arena, server_config_t *cfg, const zone_db_entry_t *entry) {
   if (!arena) return;
   arena->rcache_ok = false;
   atomic_store_explicit(&arena->generation, zone_data_generation_next(), memory_order_release); /* 公開する版ごとに 1 回 */
@@ -2470,7 +2531,7 @@ void build_zone_response_cache(zone_version_t *arena, server_config_t *cfg, cons
   if (cfg && cfg->wire_cache_max_records > 0 && img->n_rrs > cfg->wire_cache_max_records) return;
 
   // O-07: 同じゾーン名が別の view にもあるので、このエントリの view の設定を見る
-  zone_config_t *zcfg = cfg ? find_zone_config_in_view(cfg, view_name, domain) : NULL;
+  const zone_config_t *zcfg = zone_entry_config(cfg, entry);
   if (zcfg) {
     if (zext(zcfg)->location_tags != NULL && zext(zcfg)->location_tag_count > 0) return;
     if (zext(zcfg)->ecs_tags != NULL && zext(zcfg)->ecs_tag_count > 0) return;
@@ -2595,8 +2656,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     }
   }
 
-  zone_config_t *matched_zcfg = (db_entry && view && cfg)
-      ? find_zone_config_in_view(cfg, view->name, db_entry->domain)
+  const zone_config_t *matched_zcfg = (db_entry && view && cfg)
+      ? zone_entry_config(cfg, db_entry)
       : NULL;
   /* D-05: RRL のキー (NXDOMAIN はゾーン名、ワイルドカードの答えは "*.<ゾーン>") */
   t_query_rrl_info.zone = db_entry ? db_entry->domain : NULL;
@@ -2745,7 +2806,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   if (opcode == 4) { // NOTIFY
     if (db_entry && view) {
       server_config_t *cfg_chk = cfg;
-      zone_config_t *zc = find_zone_config_in_view(cfg_chk, view->name, db_entry->domain);
+      const zone_config_t *zc = zone_entry_config(cfg_chk, db_entry);
       if (zc && zc->type && (strcasecmp(zc->type, "program") == 0 ||
                               strcasecmp(zc->type, "forward") == 0)) {
         /* R-12: 要求の本体は返さず質問セクションで切り、OPT と EDE 21 (RFC 8914 §4.22) を付ける。
@@ -2768,7 +2829,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     tsig_key_t *tkey = (tsig && tsig->status == TSIG_REQ_VALID) ? tsig->key : NULL;
     bool auth = false;
     if (db_entry && view) {
-      zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
+      const zone_config_t *zcfg = zone_entry_config(cfg, db_entry);
       const zone_ext_t *zx = zext(zcfg);
       if (zcfg && zx->masters_count > 0) {
         bool from_master = false;
@@ -2788,10 +2849,11 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     uint8_t notify_rcode = 0;
     if (auth) {
       atomic_store_explicit(&db_entry->refresh_now, true, memory_order_release);
-      if (g_control_kq != -1) {
+      int kq = atomic_load_explicit(&g_control_kq, memory_order_acquire);
+      if (kq != -1) {
         struct kevent ev;
         EV_SET(&ev, 2, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
-        kevent(g_control_kq, &ev, 1, NULL, 0, NULL);
+        kevent(kq, &ev, 1, NULL, 0, NULL);
       }
     } else {
       notify_rcode = 5; // REFUSED
@@ -2809,7 +2871,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   if (opcode == 5) { // UPDATE
     if (db_entry && view) {
       server_config_t *cfg_chk = cfg;
-      zone_config_t *zc = find_zone_config_in_view(cfg_chk, view->name, db_entry->domain);
+      const zone_config_t *zc = zone_entry_config(cfg_chk, db_entry);
       if (zc && zc->type && (strcasecmp(zc->type, "program") == 0 ||
                               strcasecmp(zc->type, "forward") == 0)) {
         /* R-12: 要求の本体は返さず質問セクションで切り、OPT と EDE 21 (RFC 8914 §4.22) を付ける。
@@ -2846,25 +2908,14 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     bool auth = false;
     bool zone_is_master = false;
     if (zone_rcode == 0) {
-      zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
+      const zone_config_t *zcfg = zone_entry_config(cfg, db_entry);
       if (zcfg) {
         if (zcfg->type && (strcasecmp(zcfg->type, "master") == 0 || strcasecmp(zcfg->type, "primary") == 0)) {
           zone_is_master = true;
         }
       }
-      const zone_ext_t *zu = zext(zcfg);
-      if (zcfg && zu->allow_update_count > 0) {
-        if (zu->allow_update_parsed) {
-          if (check_acl_bin(client_ip, zu->allow_update_parsed, zu->allow_update_count)) {
-            auth = true;
-          }
-        } else if (check_acl(client_ip, zu->allow_update, zu->allow_update_count)) {
-          auth = true;
-        }
-        for (int i = 0; !auth && tkey && i < zu->allow_update_count; i++) {
-          if (tsig_key_names_equal(tkey->name, zu->allow_update[i])) auth = true;
-        }
-      }
+      /* the address list, the named keys, update-acl-match and (DB zones) acl-ceiling: dns_tsig_acl.c */
+      if (zcfg) auth = zone_update_acl_allows(cfg, zcfg, client_ip, tkey ? tkey->name : NULL);
     }
 
     int rcode = 5; // REFUSED
@@ -3010,7 +3061,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   dns_init_response_header(res, req, 0, true);
   if (db_entry && view) {
     server_config_t *cfg_lookup = cfg;
-    zone_config_t *zcfg = find_zone_config_in_view(cfg_lookup, view->name, db_entry->domain);
+    const zone_config_t *zcfg = zone_entry_config(cfg_lookup, db_entry);
     if (zcfg && zcfg->type && strcasecmp(zcfg->type, "program") == 0) {
       const rate_limit_config_t *rrl = zext(zcfg)->rrl.configured ? &zext(zcfg)->rrl : (cfg ? &cfg->rrl : NULL);
       if (!is_tcp && rrl && rrl->configured && rrl->early_drop) {
@@ -3078,6 +3129,43 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     return offset;
   }
 
+  const zone_config_t *zcfg = (db_entry && view) ? zone_entry_config(cfg, db_entry) : NULL;
+  bool ecs_trusted = (cfg && cfg->ecs_enable && edns.has_ecs && client_ip &&
+                      is_ecs_trusted_resolver(current_zone->image, cfg, zcfg, client_ip));
+
+  /* B8t-1: a zone whose SOA RRs are restricted (tinydns location / time stamp, $LOCATION / $ECS-SUBNET tag) is served only to the
+   * clients that see one of them. For the others it is a zone that is not served to them: REFUSED, AA=0, EDE 18 Prohibited
+   * (RFC 1035 §4.1.1, RFC 8914 §4.19), as BIND 9.20 answers a client the zone is not served to (no matching view, allow-query
+   * denial). The closest zone decides: there is no fall back to a parent zone's answer. tinydns differs (tdlookup.c: a
+   * referral without AA, or no answer at all); documented in docs/karidns.md. */
+  /* B8t-2: a SOA (or IXFR) question that carries the KariDNS extension option for this zone (a KariDNS secondary checking the serial)
+   * is answered with the reference SOA, whatever location, tag or time the requester has: a secondary outside every SOA's location
+   * must still be able to refresh.  The SOA of a zone is public data; the option adds nothing a plain query could not learn from a
+   * client the zone is served to. */
+  const bool ref_soa_ask = db_entry && (qtype == 6 || qtype == 251) && qclass == 1 && edns.has_karidns_ext &&
+                           KARIDNS_EXT_VERSION_OK(edns.karidns_ext_version) &&
+                           edns.karidns_ext_hash == calc_fnv1a_str(db_entry->domain) &&
+                           domain_names_match_ci(current_qname_lc, db_entry->domain);
+
+  if ((current_zone->image->flags & ZONE_IMAGE_F_SOA_ATTR) && db_entry && !ref_soa_ask) {
+    zone_image_view_t cv;
+    uint8_t cv_scope;
+    zone_client_view(current_zone->image, cfg, zcfg, client_ip, ecs_trusted, edns.ecs_addr, edns.ecs_family, &cv, &cv_scope);
+    if (zone_image_visible_soa(current_zone->image, &cv, NULL) == ZONE_IMAGE_NONE) {
+      res[2] &= ~0x04;
+      res[3] = (res[3] & 0xF0) | 5;
+      add_ede(&edns, send_ede, 18, "Query refused: the zone is not served to this client");
+      uint16_t roff = q_offset;
+      uint16_t rar = 0;
+      if (edns.present) {
+        assemble_edns_opt(res, max_res_len, &roff, &rar, &edns, ext_rcode_out, is_tcp, cfg);
+        res[10] = (uint8_t)(rar >> 8);
+        res[11] = (uint8_t)(rar & 0xFF);
+      }
+      return roff;
+    }
+  }
+
   /* RFC 7314 §3: 権威を持つゾーンへの EXPIRE 付き問い合わせには、SOA EXPIRE (プライマリ)
    * または expire タイマーの残り (セカンダリ) を返す。権威が無い応答 (上の REFUSED) には
    * 付けない (§3.3)。値は本体に依存しないので wire キャッシュのヒット時も同じく付く。 */
@@ -3111,10 +3199,19 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
 
     const zone_image_t *zimg = current_zone->image;
+    /* B8t-1: the SOA this client sees (the zone has one, checked above); the serial is the zone's, the same in all of them */
     uint32_t soa_rr = ZONE_IMAGE_NONE;
-    uint32_t apex_id = zone_image_find_name(zimg, db_entry->domain);
-    if (apex_id != ZONE_IMAGE_NONE)
-      soa_rr = zone_image_rrset_next(zimg, apex_id, 6, zone_image_name_first_rr(zimg, apex_id));
+    uint32_t soa_ttl = 0;
+    {
+      zone_image_view_t iv;
+      uint8_t iv_scope;
+      zone_client_view(zimg, cfg, zcfg, client_ip, ecs_trusted, edns.ecs_addr, edns.ecs_family, &iv, &iv_scope);
+      soa_rr = zone_image_visible_soa(zimg, &iv, &soa_ttl);
+      if (ref_soa_ask) {
+        soa_rr = zone_image_apex_soa(zimg);
+        if (soa_rr != ZONE_IMAGE_NONE) soa_ttl = zone_image_rr_ttl(zimg, soa_rr);
+      }
+    }
 
     uint32_t current_serial = 0;
     zone_image_soa_t soa_nums;
@@ -3131,10 +3228,27 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     }
 
     if (soa_rr != ZONE_IMAGE_NONE) {
-      if (image_serialize_rr(zimg, soa_rr, res, body_max_len, &offset, comp_ctx, NULL, zone_image_rr_ttl(zimg, soa_rr)) >= 0) {
+      if (image_serialize_rr(zimg, soa_rr, res, body_max_len, &offset, comp_ctx, NULL, soa_ttl) >= 0) {
         ancount = 1;
       }
     }
+    res[6] = (uint8_t)(ancount >> 8);
+    res[7] = (uint8_t)(ancount & 0xFF);
+    res[8] = 0; res[9] = 0;
+    if (edns.present) {
+      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
+    }
+    res[10] = (uint8_t)(arcount >> 8);
+    res[11] = (uint8_t)(arcount & 0xFF);
+    return offset;
+  }
+
+  if (ref_soa_ask && qtype == 6 && (current_zone->image->flags & ZONE_IMAGE_F_SOA_ATTR)) {
+    const zone_image_t *zimg = current_zone->image;
+    uint32_t soa_rr = zone_image_apex_soa(zimg);
+    if (soa_rr != ZONE_IMAGE_NONE &&
+        image_serialize_rr(zimg, soa_rr, res, body_max_len, &offset, comp_ctx, NULL, zone_image_rr_ttl(zimg, soa_rr)) >= 0)
+      ancount = 1;
     res[6] = (uint8_t)(ancount >> 8);
     res[7] = (uint8_t)(ancount & 0xFF);
     res[8] = 0; res[9] = 0;
@@ -3221,11 +3335,10 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   uint32_t qtx_included = 0;
-  zone_config_t *zcfg = (db_entry && view) ? find_zone_config_in_view(cfg, view->name, db_entry->domain) : NULL;
-  bool ecs_trusted = (cfg && cfg->ecs_enable && edns.has_ecs && client_ip &&
-                      is_ecs_trusted_resolver(current_zone ? current_zone->image : NULL, cfg, zcfg, client_ip));
   t_resolve_crossed_zone = false;
   t_resolve_additional_cut = false;
+  t_resolve_alias_expanded = false;
+  t_resolve_alias_failed = false;
   resolve_name(current_qname, qclass, qtypes, num_qtypes, &db_entry, &current_zone, res, body_max_len,
                &offset, comp_ctx, &ancount, &nscount, &arcount,
                cfg_for_ede ? cfg_for_ede->minimal_responses : false,
@@ -3235,6 +3348,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
                cfg, ecs_trusted, edns.ecs_addr, edns.ecs_family,
                edns.ecs_source_prefix,
                &edns.ecs_scope_prefix);
+  if (t_resolve_alias_failed && (res[3] & 0x0F) == 2) add_ede(&edns, send_ede, 22, "ALIAS target could not be resolved");   // 22: No Reachable Authority (RFC 8914)
 
   if (edns.has_mqtype_query) {
     if (res[2] & 0x02) {
@@ -3252,7 +3366,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
   /* 応答キャッシュに入れる: NOERROR、AA、TC なしで answer があり、EDE の付かない応答
    * (ヒットした応答は UDP の 512 オクテットに入る大きさに限る)。別のゾーンへ移った応答と、Additional を打ち切った応答は入れない */
-  if (rc_tag && !t_resolve_crossed_zone && !t_resolve_additional_cut && (res[3] & 0x0F) == 0 && (res[2] & 0x04) && !(res[2] & 0x02) && ancount > 0 &&
+  if (rc_tag && !t_resolve_crossed_zone && !t_resolve_additional_cut && !t_resolve_alias_expanded && (res[3] & 0x0F) == 0 && (res[2] & 0x04) && !(res[2] & 0x02) && ancount > 0 &&
       edns.ede_count == 0 && offset > q_offset && offset <= UDP_DEFAULT_MAX_RES_LEN) {
     rcache_store(rc_tag, rc_gen, qtype, res + q_offset, (size_t)(offset - q_offset), ancount, nscount, arcount);
   }

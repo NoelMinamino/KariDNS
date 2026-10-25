@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include <errno.h>
+#include <stdarg.h>
 #include "dns_wire.h"
 #include "dns_tsig_acl.h"
 
@@ -256,6 +257,11 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
 
     if (tok.type == TOKEN_STRING && tok.value && !tok.is_quoted && strcmp(tok.value, "include") == 0) {
       free_token(&tok);
+      if (ctx->no_include) { /* B7a: settings text of a DB zone: no file is ever opened for it */
+        snprintf(ctx->restricted_err, sizeof(ctx->restricted_err), "'include' is not allowed in the settings of a database zone");
+        ctx->error_occurred = true;
+        return (conf_token_t){TOKEN_EOF, NULL, false};
+      }
 
       conf_token_t tok_file = get_raw_token_from_frame(frame);
       if (tok_file.type != TOKEN_STRING) {
@@ -364,7 +370,8 @@ zone_ext_t *zone_ext_mut(zone_config_t *z) {
   return z->ext;
 }
 
-static void free_zone_ext(zone_ext_t *x) {
+/* everything x points to (not x itself: a zone_ext_shared_t embeds it) */
+static void free_zone_ext_fields(zone_ext_t *x) {
   if (!x)
     return;
   for (int i = 0; i < x->masters_count; i++)
@@ -382,6 +389,9 @@ static void free_zone_ext(zone_ext_t *x) {
     free(x->also_notify[i].ip);
   free(x->also_notify);
   free(x->notify_source);
+  for (int i = 0; i < x->alias_resolvers_count; i++)
+    free(x->alias_resolvers[i].ip);
+  free(x->alias_resolvers);
   for (int i = 0; i < x->allow_transfer_count; i++)
     free(x->allow_transfer[i]);
   free(x->allow_transfer);
@@ -442,7 +452,28 @@ static void free_zone_ext(zone_ext_t *x) {
     free(x->ecs_trusted_resolvers_parsed);
     x->ecs_trusted_resolvers_parsed = NULL;
   }
+}
+
+static void free_zone_ext(zone_ext_t *x) {
+  if (!x)
+    return;
+  free_zone_ext_fields(x);
   free(x);
+}
+
+zone_ext_shared_t *zone_ext_shared_ref(zone_ext_shared_t *s) {
+  if (s) atomic_fetch_add_explicit(&s->refs, 1, memory_order_relaxed);
+  return s;
+}
+
+void zone_ext_shared_unref(zone_ext_shared_t *s) {
+  if (!s)
+    return;
+  if (atomic_fetch_sub_explicit(&s->refs, 1, memory_order_acq_rel) == 1) {
+    free_zone_ext_fields(&s->ext);
+    free(s->key);
+    free(s);
+  }
 }
 
 void free_zone_config(zone_config_t *zone) {
@@ -451,7 +482,10 @@ void free_zone_config(zone_config_t *zone) {
   free(zone->domain);
   free(zone->type);
   free(zone->file);
-  free_zone_ext(zone->ext);
+  if (zone->ext_shared)
+    zone_ext_shared_unref((zone_ext_shared_t *)zone->ext); /* ext is the first member of the shared object */
+  else
+    free_zone_ext(zone->ext);
   free(zone);
 }
 
@@ -527,9 +561,38 @@ zone_config_t *config_find_zone_any_view(const server_config_t *cfg, const char 
   return NULL;
 }
 
+static void free_str_list(char **list, int count) {
+  for (int i = 0; i < count; i++) free(list[i]);
+  free(list);
+}
+
+static void free_database_config(database_config_t *db) {
+  free(db->driver);
+  free(db->database_file);
+  free(db->conninfo_file);
+  free(db->schema);
+  free(db->loader_user);
+  free(db->loader_group);
+  free(db->loader_path);
+  free_str_list(db->acl_ceiling, db->acl_ceiling_count);
+  free(db->acl_ceiling_parsed);
+  free_str_list(db->acl_ceiling_keys, db->acl_ceiling_keys_count);
+  free(db->server_id);
+  free_str_list(db->alias_resolver, db->alias_resolver_count);
+  memset(db, 0, sizeof(*db));
+}
+
+static void free_view_db_fields(view_config_t *view) {
+  free(view->database_file);
+  free(view->database_schema);
+  view->database_file = view->database_schema = NULL;
+  view->database_none = false;
+}
+
 static void free_partial_view(view_config_t *view) {
   if (!view) return;
   zone_cfg_index_free(&view->zone_index);
+  free_view_db_fields(view);
   if (view->name) free(view->name);
   for (int i = 0; i < view->match_clients_count; i++) free(view->match_clients[i]);
   if (view->match_clients) free(view->match_clients);
@@ -667,6 +730,10 @@ void free_server_config_fields(server_config_t *cfg) {
   if (cfg->group) { free(cfg->group); cfg->group = NULL; }
   if (cfg->pid_file) { free(cfg->pid_file); cfg->pid_file = NULL; }
   if (cfg->nsid_string) { free(cfg->nsid_string); cfg->nsid_string = NULL; }
+  for (int j = 0; j < cfg->alias_resolvers_count; j++) free(cfg->alias_resolvers[j].ip);
+  free(cfg->alias_resolvers);
+  cfg->alias_resolvers = NULL;
+  cfg->alias_resolvers_count = 0;
   OPENSSL_cleanse(cfg->cookie_secrets, sizeof(cfg->cookie_secrets));
   cfg->cookie_secret_count = 0;
   zone_cfg_index_free(&cfg->top_zone_index);
@@ -686,6 +753,7 @@ void free_server_config_fields(server_config_t *cfg) {
   while (v) {
     view_config_t *next_v = v->next;
     zone_cfg_index_free(&v->zone_index);
+    free_view_db_fields(v);
     if (v->name) free(v->name);
     for (int i = 0; i < v->match_clients_count; i++) free(v->match_clients[i]);
     if (v->match_clients) free(v->match_clients);
@@ -731,6 +799,7 @@ void free_server_config_fields(server_config_t *cfg) {
   if (cfg->dnstap.identity) { free(cfg->dnstap.identity); cfg->dnstap.identity = NULL; }
   if (cfg->dnstap.version) { free(cfg->dnstap.version); cfg->dnstap.version = NULL; }
   memset(&cfg->dnstap, 0, sizeof(dnstap_config_t));
+  free_database_config(&cfg->database);
   free_rate_limit_config(&cfg->rrl);
   memset(&cfg->rrl, 0, sizeof(rate_limit_config_t));
 
@@ -1214,6 +1283,35 @@ static int parse_ip_port_list(token_ctx_t *ctx, ip_port_t **list, int *count) {
   return 0;
 }
 
+/* B9a: alias-resolver { <ip> [port <n>]; ... };  1..KARIDNS_ALIAS_RESOLVERS_MAX IP address literals (the Backend connects to addresses only,
+ * never to a host name).  A later statement replaces an earlier one.  -1 with an error message on a bad entry. */
+static int parse_alias_resolvers(token_ctx_t *ctx, const char *where, ip_port_t **list, int *count) {
+  for (int i = 0; i < *count; i++) free((*list)[i].ip);
+  free(*list);
+  *list = NULL;
+  *count = 0;
+  if (parse_ip_port_list(ctx, list, count) != 0) return -1;
+  const char *bad = NULL;
+  if (*count > KARIDNS_ALIAS_RESOLVERS_MAX) {
+    bad = "more than 8 entries";
+  } else {
+    for (int i = 0; i < *count && !bad; i++) {
+      struct in_addr a4;
+      struct in6_addr a6;
+      if (inet_pton(AF_INET, (*list)[i].ip, &a4) != 1 && inet_pton(AF_INET6, (*list)[i].ip, &a6) != 1) bad = (*list)[i].ip;
+    }
+  }
+  if (bad) {
+    syslog(LOG_ERR, "[Config] %s: alias-resolver: '%.64s' is not an IP address (or the list has more than %d entries)", where, bad,
+           KARIDNS_ALIAS_RESOLVERS_MAX);
+    fprintf(stderr, "[ERROR] %s: alias-resolver: '%.64s' is not an IP address (or the list has more than %d entries)\n", where, bad,
+            KARIDNS_ALIAS_RESOLVERS_MAX);
+    if (ctx) ctx->error_occurred = true;
+    return -1;
+  }
+  return 0;
+}
+
 static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
   conf_token_t tok = get_next_token(ctx);
   if (tok.type != TOKEN_LBRACE) {
@@ -1615,9 +1713,155 @@ int ixfr_history_effective(const server_config_t *cfg, const zone_config_t *zone
   return cfg ? cfg->ixfr_history : IXFR_HISTORY_DEFAULT;
 }
 
+/* B6a (open item 2, decided 2026-10-21): an unknown statement inside zone { } or view { } used to be skipped without a
+ * word, so a typo ("alow-transfer") silently left a zone open or closed.  Now:
+ *   - an option BIND 9 documents for a zone / view statement but KariDNS does not implement is skipped with a warning;
+ *   - anything else is a configuration error, shown by karidns and by `karicheck conf`.
+ * The lists are the zone and view options of the BIND 9.18 / 9.20 ARM ("zone Statement Grammar", "view Statement
+ * Grammar") minus what KariDNS reads; options of options { } that a view may also carry are on the view list.  Only
+ * zone { } and view { } are strict; key { }, control-channel { }, logging { } and options { } keep skipping unknowns. */
+static const char *const k_bind_zone_options[] = {
+  "allow-notify", "allow-query", "allow-query-on", "allow-update-forwarding", "auto-dnssec", "check-dup-records",
+  "check-integrity", "check-mx", "check-mx-cname", "check-names", "check-sibling", "check-spf", "check-srv-cname",
+  "check-wildcard", "database", "delegation-only", "dialup", "dlz", "dnssec-dnskey-kskonly", "dnssec-loadkeys-interval",
+  "dnssec-policy", "dnssec-secure-to-insecure", "dnssec-update-mode", "forward", "in-view", "inline-signing",
+  "ixfr-from-differences", "journal", "key-directory", "masterfile-format", "masterfile-style", "max-ixfr-ratio",
+  "max-journal-size", "max-records", "max-refresh-time", "max-retry-time", "max-transfer-idle-in", "max-transfer-idle-out",
+  "max-transfer-time-in", "max-transfer-time-out", "max-zone-ttl", "min-refresh-time", "min-retry-time", "multi-master",
+  "notify", "notify-delay", "notify-source-v6", "notify-to-soa", "nta-lifetime", "nta-recheck", "parental-agents",
+  "parental-source", "parental-source-v6", "request-expire", "request-ixfr", "request-nsid",
+  "require-server-cookie", "send-report-channel", "serial-update-method", "server-addresses", "server-names",
+  "sig-signing-nodes", "sig-signing-signatures", "sig-signing-type", "sig-validity-interval", "transfer-source",
+  "transfer-source-v6", "try-tcp-refresh", "update-check-ksk", "update-policy", "use-alt-transfer-source",
+  "zero-no-soa-ttl", "zone-statistics", NULL
+};
+
+static const char *const k_bind_view_options[] = {
+  "allow-notify", "allow-query", "allow-query-cache", "allow-query-cache-on", "allow-query-on", "allow-recursion",
+  "allow-recursion-on", "allow-transfer", "allow-update", "allow-update-forwarding", "also-notify", "attach-cache",
+  "auto-dnssec", "cache-file", "check-dup-records", "check-integrity", "check-mx", "check-mx-cname", "check-names",
+  "check-sibling", "check-spf", "check-srv-cname", "check-wildcard", "clients-per-query", "deny-answer-addresses",
+  "deny-answer-aliases", "disable-algorithms", "disable-ds-digests", "disable-empty-zone", "dns64", "dns64-contact",
+  "dns64-server", "dnssec-accept-expired", "dnssec-enable", "dnssec-lookaside", "dnssec-must-be-secure",
+  "dnssec-policy", "dnssec-validation", "dnstap", "dual-stack-servers", "edns-udp-size", "empty-contact", "empty-server",
+  "empty-zones-enable", "fetch-quota-params", "fetches-per-server", "fetches-per-zone", "forward", "forwarders",
+  "glue-cache", "inline-signing", "ixfr-from-differences", "key", "key-directory", "lame-ttl", "lmdb-mapsize",
+  "managed-keys", "match-destinations", "match-recursive-only", "max-cache-size", "max-cache-ttl", "max-clients-per-query",
+  "max-ixfr-ratio", "max-journal-size", "max-ncache-ttl", "max-records", "max-recursion-depth", "max-recursion-queries",
+  "max-refresh-time", "max-retry-time", "max-stale-ttl", "max-udp-size", "max-zone-ttl", "message-compression",
+  "min-cache-ttl", "min-ncache-ttl", "min-refresh-time", "min-retry-time", "minimal-any", "minimal-responses", "notify",
+  "notify-delay", "notify-source", "notify-source-v6", "notify-to-soa", "nocookie-udp-size", "nosit-udp-size",
+  "nta-lifetime", "nta-recheck", "nxdomain-redirect", "parental-source", "parental-source-v6", "preferred-glue",
+  "prefetch", "provide-ixfr", "qname-minimization", "query-source", "query-source-v6", "rate-limit", "recursion",
+  "request-expire", "request-ixfr", "request-nsid", "require-server-cookie", "resolver-nonbackoff-tries",
+  "resolver-query-timeout", "resolver-retry-interval", "response-padding", "response-policy", "root-delegation-only",
+  "rrset-order", "send-cookie", "serial-update-method", "servfail-ttl", "sig-signing-nodes", "sig-signing-signatures",
+  "sig-signing-type", "sig-validity-interval", "sortlist", "stale-answer-client-timeout", "stale-answer-enable",
+  "stale-answer-ttl", "stale-cache-enable", "stale-refresh-time", "synth-from-dnssec", "transfer-format",
+  "transfer-source", "transfer-source-v6", "trust-anchor-telemetry", "trust-anchors", "trusted-keys", "try-tcp-refresh",
+  "update-check-ksk", "v6-bias", "validate-except", "zero-no-soa-ttl", "zone-statistics", NULL
+};
+
+static bool name_in_list(const char *const *list, const char *key) {
+  for (size_t i = 0; list[i]; i++)
+    if (strcmp(list[i], key) == 0) return true;
+  return false;
+}
+
+/* The statement `key` (already read) inside zone / view `what` is not one KariDNS implements.  Skips the statement and
+ * returns 0 when BIND documents it (warning), or reports a configuration error and returns -1 (the caller frees its
+ * partial result and returns -1). */
+static int unknown_statement(token_ctx_t *ctx, const char *kind, const char *name, const char *key, bool in_view) {
+  if (name_in_list(in_view ? k_bind_view_options : k_bind_zone_options, key)) {
+    syslog(LOG_WARNING, "[Config] %s '%s': option '%s' is a BIND option that KariDNS does not implement; it is ignored", kind,
+           name, key);
+    fprintf(stderr, "[WARNING] %s '%s': option '%s' is a BIND option that KariDNS does not implement; it is ignored\n", kind,
+            name, key);
+    skip_unknown_block(ctx);
+    return 0;
+  }
+  syslog(LOG_ERR, "[Config] %s '%s': unknown option '%.64s' (neither a KariDNS option nor a BIND option for this statement; check the spelling)", kind, name,
+         key);
+  fprintf(stderr, "[ERROR] %s '%s': unknown option '%.64s' (neither a KariDNS option nor a BIND option for this statement; check the spelling)\n", kind,
+          name, key);
+  if (ctx) ctx->error_occurred = true;
+  return -1;
+}
+
+/* B7a: what a DB zone's settings text may contain (db_settings_parse).  The statements karidns-dbloader writes (the output
+ * of build_settings() in dns_pdns_reader.c) and the profile texts of karidns_profiles are made of these. */
+static const char *const k_db_zone_statements[] = {
+  "allow-transfer", "allow-update", "also-notify", "tsig-key", "notify-retries", "notify-retry-interval",
+  "notify-retry-backoff", "ixfr-history", "additional-from-auth", "disable-auto-tc-flag", "zone-udp-bufsize",
+  "zone-tcp-mss", "zone-tcp-window", "zone-tcp-sndbuf", "transfer-acl-match", "update-acl-match", "masters", "primaries",
+  "ecs-trusted-resolvers", "alias-resolver", NULL
+};
+
+/* The statement `key` is about to be read in restricted mode: refuse it unless it is on the list, and forget what an
+ * earlier statement of the same name set (the later statement replaces it: profile text first, zone text after it). */
+static bool restricted_statement(token_ctx_t *ctx, zone_ext_t *x, const char *key) {
+  if (!name_in_list(k_db_zone_statements, key)) {
+    bool plain = key[0] != '\0' && strlen(key) <= 40;
+    for (const char *p = key; plain && *p; p++)
+      if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_') plain = false;
+    snprintf(ctx->restricted_err, sizeof(ctx->restricted_err),
+             "statement '%s' is not allowed in the settings of a database zone", plain ? key : "?");
+    ctx->error_occurred = true;
+    return false;
+  }
+  if (strcmp(key, "also-notify") == 0) {
+    for (int i = 0; i < x->also_notify_count; i++) free(x->also_notify[i].ip);
+    free(x->also_notify);
+    x->also_notify = NULL;
+    x->also_notify_count = 0;
+  } else if (strcmp(key, "allow-transfer") == 0) {
+    for (int i = 0; i < x->allow_transfer_count; i++) free(x->allow_transfer[i]);
+    free(x->allow_transfer);
+    free(x->allow_transfer_parsed);
+    x->allow_transfer = NULL;
+    x->allow_transfer_parsed = NULL;
+    x->allow_transfer_count = 0;
+    for (int i = 0; i < x->tsig_keys_count; i++) free(x->tsig_keys[i]);
+    free(x->tsig_keys);
+    x->tsig_keys = NULL;
+    x->tsig_keys_count = 0;
+  } else if (strcmp(key, "allow-update") == 0) {
+    for (int i = 0; i < x->allow_update_count; i++) free(x->allow_update[i]);
+    free(x->allow_update);
+    free(x->allow_update_parsed);
+    x->allow_update = NULL;
+    x->allow_update_parsed = NULL;
+    x->allow_update_count = 0;
+  } else if (strcmp(key, "tsig-key") == 0) {
+    free(x->tsig_key);
+    x->tsig_key = NULL;
+  } else if (strcmp(key, "ecs-trusted-resolvers") == 0) {         /* B8: the later statement replaces the earlier one */
+    for (int i = 0; i < x->ecs_trusted_resolvers_count; i++) free(x->ecs_trusted_resolvers[i]);
+    free(x->ecs_trusted_resolvers);
+    free(x->ecs_trusted_resolvers_parsed);
+    x->ecs_trusted_resolvers = NULL;
+    x->ecs_trusted_resolvers_parsed = NULL;
+    x->ecs_trusted_resolvers_count = 0;
+  } else if (strcmp(key, "alias-resolver") == 0) {                 /* B9a: the later statement replaces the earlier one (parse_alias_resolvers() clears it too) */
+    for (int i = 0; i < x->alias_resolvers_count; i++) free(x->alias_resolvers[i].ip);
+    free(x->alias_resolvers);
+    x->alias_resolvers = NULL;
+    x->alias_resolvers_count = 0;
+  } else if (strcmp(key, "masters") == 0 || strcmp(key, "primaries") == 0) {
+    for (int i = 0; i < x->masters_count; i++) free(x->masters[i].ip);
+    free(x->masters);
+    x->masters = NULL;
+    x->masters_count = 0;
+    free(x->masters_parsed);
+    x->masters_parsed = NULL;
+  }
+  return true;
+}
+
+static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t **zone_out);
+
 static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
   conf_token_t tok = get_next_token(ctx);
-  int nr_rc = 0;
   if (tok.type != TOKEN_STRING) {
     free_token(&tok);
     return -1;
@@ -1667,7 +1911,14 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       zone->domain = copy;
     }
   }
-  tok = get_next_token(ctx);
+  return parse_zone_body(ctx, zone, zone_out);
+}
+
+/* "{ statements };" of a zone whose name and (empty) ext are in place.  Owns zone: freed on every failure. */
+static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t **zone_out) {
+  zone_ext_t *x = zone->ext;
+  int nr_rc = 0;
+  conf_token_t tok = get_next_token(ctx);
   if (tok.type != TOKEN_LBRACE) {
     free_zone_config(zone);
     free_token(&tok);
@@ -1688,7 +1939,12 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
     char *key = tok.value;
     tok.value = NULL;
     free_token(&tok);
-    if (strcmp(key, "masters") == 0) {
+    if (ctx->restricted && !restricted_statement(ctx, x, key)) {
+      free(key);
+      free_zone_config(zone);
+      return -1;
+    }
+    if (strcmp(key, "masters") == 0 || strcmp(key, "primaries") == 0) {
       if (parse_ip_port_list(ctx, &x->masters, &x->masters_count) !=
           0) {
         free(key);
@@ -1777,8 +2033,10 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
           return -1;
         }
       }
-      else if (strcmp(key, "file") == 0)
+      else if (strcmp(key, "file") == 0) {
+        free(zone->file); /* 同じ文が 2 回あれば後の値 (前の値を解放する) */
         zone->file = val;
+      }
       else if (strcmp(key, "file-format") == 0) {
         if (strcasecmp(val, "bind") != 0 && strcasecmp(val, "tinydns") != 0) {
           syslog(LOG_ERR, "[Config] zone '%s': file-format must be 'bind' or 'tinydns' (got '%s')", zone->domain, val);
@@ -1788,12 +2046,17 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
           free_zone_config(zone);
           return -1;
         }
+        free(x->file_format);
         x->file_format = val;
       }
-      else if (strcmp(key, "tsig-key") == 0)
+      else if (strcmp(key, "tsig-key") == 0) {
+        free(x->tsig_key);
         x->tsig_key = val;
-      else if (strcmp(key, "notify-source") == 0)
+      }
+      else if (strcmp(key, "notify-source") == 0) {
+        free(x->notify_source);
         x->notify_source = val;
+      }
       else if (strcmp(key, "catalog-zone") == 0) {
         if (!parse_config_bool(val, &zone->is_catalog)) {
           report_bad_bool(ctx, zone->domain, key, val);
@@ -1853,6 +2116,10 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
       free_token(&tok);
+    } else if (strcmp(key, "alias-resolver") == 0) {
+      if (parse_alias_resolvers(ctx, zone->domain ? zone->domain : "zone", &x->alias_resolvers, &x->alias_resolvers_count) != 0) {
+        free(key); free_zone_config(zone); return -1;
+      }
     } else if (strcmp(key, "forwarders") == 0) {
       if (parse_ip_port_list(ctx, &x->forwarders, &x->forwarders_count) != 0) {
         free(key); free_zone_config(zone); return -1;
@@ -1980,8 +2247,58 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       else if (strcmp(key, "zone-tcp-window") == 0) x->zone_tcp_window = v;
       else if (strcmp(key, "zone-tcp-sndbuf") == 0) x->zone_tcp_sndbuf = v;
       else x->zone_udp_bufsize = (uint16_t)v;
-    } else
-      skip_unknown_block(ctx);
+    } else if (strcmp(key, "primary-settings") == 0) {
+      /* B8t-2: use (default) or ignore the settings the primary sends with the zone */
+      tok = get_next_token(ctx);
+      bool v = true;
+      if (tok.type != TOKEN_STRING || !parse_config_bool(tok.value, &v)) {
+        report_bad_bool(ctx, zone->domain, key, tok.type == TOKEN_STRING ? tok.value : "");
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) {
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+      x->primary_settings_off = !v;
+    } else if (strcmp(key, "transfer-acl-match") == 0 || strcmp(key, "update-acl-match") == 0) {
+      /* D14: which kinds of entry of allow-transfer / allow-update have to match (docs/karidns.md) */
+      tok = get_next_token(ctx);
+      uint8_t m = ACL_MATCH_DEFAULT;
+      if (tok.type == TOKEN_STRING && tok.value) {
+        if (strcasecmp(tok.value, "any") == 0) m = ACL_MATCH_ANY;
+        else if (strcasecmp(tok.value, "all") == 0) m = ACL_MATCH_ALL;
+      }
+      if (m == ACL_MATCH_DEFAULT) {
+        report_bad_value(ctx, zone->domain, key, tok.type == TOKEN_STRING ? tok.value : "", "any or all");
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) {
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+      if (key[0] == 't') x->transfer_acl_match = m;
+      else x->update_acl_match = m;
+    } else if (unknown_statement(ctx, "zone", zone->domain, key, false) != 0) {
+      free(key);
+      free_zone_config(zone);
+      return -1;
+    }
     free(key);
   }
   tok = get_next_token(ctx);
@@ -2029,6 +2346,161 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
   }
   *zone_out = zone;
   return 0;
+}
+
+/* ---- settings text of DB zones (B7a, beta design 1.3, 3.5) ---- */
+
+static void db_set_err(char *err, size_t errlen, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void db_set_err(char *err, size_t errlen, const char *fmt, ...) {
+  if (!err || errlen == 0) return;
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(err, errlen, fmt, ap);
+  va_end(ap);
+}
+
+/* The entries of an ACL must be something this module can evaluate without karidns.conf: an address, a prefix, any, none
+ * (each with an optional leading "!").  Names of ACLs of karidns.conf, localhost and localnets are refused: they would be
+ * read as something else (a key name in allow-update) or never match. */
+static bool db_acl_entries_ok(char *const *list, int count, bool keys_allowed, char *err, size_t errlen, const char *what) {
+  for (int i = 0; i < count; i++) {
+    const char *e = list[i] ? list[i] : "";
+    const char *t = e[0] == '!' ? e + 1 : e;
+    if (acl_entry_is_address(t)) continue;
+    /* allow-update keeps a key as a bare name; a negated or odd name is not a key */
+    bool name_ok = keys_allowed && e[0] != '!' && e[0] != '\0' && strlen(e) <= 255 && !acl_name_is_builtin(e);
+    for (const char *p = e; name_ok && *p; p++)
+      if ((unsigned char)*p < 0x21 || (unsigned char)*p > 0x7E) name_ok = false;
+    if (!name_ok) {
+      db_set_err(err, errlen, "%s has an entry that is not an address, prefix, any, none%s", what,
+                 keys_allowed ? " or key name" : "");
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool db_ip_literal_ok(const char *s) {
+  struct in_addr a4;
+  struct in6_addr a6;
+  return s && (inet_pton(AF_INET, s, &a4) == 1 || inet_pton(AF_INET6, s, &a6) == 1);
+}
+
+zone_ext_shared_t *db_settings_parse(const char *text, size_t len, char *err, size_t errlen) {
+  if (err && errlen) err[0] = '\0';
+  if (!text) return NULL;
+  if (len > (size_t)262144) {
+    db_set_err(err, errlen, "settings text is too long");
+    return NULL;
+  }
+  char *buf = malloc(len + 16);
+  zone_config_t *zone = calloc(1, sizeof(*zone));
+  zone_ext_t *x = calloc(1, sizeof(*x));
+  if (!buf || !zone || !x) {
+    free(buf);
+    free(zone);
+    free(x);
+    db_set_err(err, errlen, "out of memory");
+    return NULL;
+  }
+  buf[0] = '{';
+  memcpy(buf + 1, text, len);
+  memcpy(buf + 1 + len, "\n};", 4);        /* a text that ends inside a comment still gets its closing brace */
+  zone->domain = strdup("settings.");
+  zone->type = strdup("master");
+  zone->ext = x;
+  if (!zone->domain || !zone->type) {
+    free_zone_config(zone);
+    free(buf);
+    db_set_err(err, errlen, "out of memory");
+    return NULL;
+  }
+  token_ctx_t ctx;
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.stack[0].src = buf;
+  ctx.stack[0].len = len + 4;
+  ctx.restricted = true;
+  ctx.no_include = true;
+  zone_config_t *out = NULL;
+  int rc = parse_zone_body(&ctx, zone, &out);      /* frees zone on failure */
+  zone_ext_shared_t *sh = NULL;
+  if (rc == 0 && !ctx.error_occurred) {
+    conf_token_t tail = get_next_token(&ctx);       /* a stray '}' in the text would end the block early */
+    bool trailing = tail.type != TOKEN_EOF;
+    free_token(&tail);
+    if (trailing) db_set_err(err, errlen, "unbalanced braces in the settings text");
+    else if (!out->ext) out->ext = calloc(1, sizeof(zone_ext_t));
+    zone_ext_t *ox = out->ext;
+    if (!trailing && !ox) {
+      db_set_err(err, errlen, "out of memory");
+    } else if (!trailing) {
+      const char *bad = NULL;
+      if (!db_acl_entries_ok(ox->allow_transfer, ox->allow_transfer_count, false, err, errlen, "allow-transfer") ||
+          !db_acl_entries_ok(ox->allow_update, ox->allow_update_count, true, err, errlen, "allow-update") ||
+          !db_acl_entries_ok(ox->ecs_trusted_resolvers, ox->ecs_trusted_resolvers_count, false, err, errlen, "ecs-trusted-resolvers"))
+        bad = err;
+      for (int i = 0; !bad && i < ox->also_notify_count; i++)
+        if (!db_ip_literal_ok(ox->also_notify[i].ip)) {
+          db_set_err(err, errlen, "also-notify has an entry that is not an IP address");
+          bad = err;
+        }
+      for (int i = 0; !bad && i < ox->masters_count; i++)
+        if (!db_ip_literal_ok(ox->masters[i].ip)) {
+          db_set_err(err, errlen, "masters has an entry that is not an IP address");
+          bad = err;
+        }
+      if (!bad && ox->masters_count > 32) {
+        db_set_err(err, errlen, "masters has more than 32 entries");
+        bad = err;
+      }
+      for (int i = 0; !bad && i < ox->tsig_keys_count; i++)
+        if (!ox->tsig_keys[i] || !ox->tsig_keys[i][0]) {
+          db_set_err(err, errlen, "allow-transfer has an empty key name");
+          bad = err;
+        }
+      if (!bad && ox->tsig_key && !ox->tsig_key[0]) {
+        db_set_err(err, errlen, "tsig-key is empty");
+        bad = err;
+      }
+      if (!bad) {
+        sh = calloc(1, sizeof(*sh));
+        if (!sh) {
+          db_set_err(err, errlen, "out of memory");
+        } else {
+          sh->ext = *ox;                            /* the pointers move to the shared object */
+          free(ox);
+          out->ext = NULL;
+          sh->ext.db_acl_ceiling = true;
+          atomic_init(&sh->refs, 1);
+        }
+      }
+    }
+    free_zone_config(out);
+  } else {
+    if (rc == 0) free_zone_config(out);
+    if (err && errlen && !err[0])
+      db_set_err(err, errlen, "%s", ctx.restricted_err[0] ? ctx.restricted_err : "syntax error or invalid value in the settings text");
+  }
+  config_lexer_cleanup(&ctx);
+  free(buf);
+  return sh;
+}
+
+const char *db_settings_missing_key(const zone_ext_t *x, const server_config_t *cfg) {
+  if (!x) return NULL;
+  for (int i = 0; i < x->tsig_keys_count; i++)
+    if (!cfg || !key_name_is_defined(cfg->keys, x->tsig_keys[i])) return x->tsig_keys[i];
+  if (x->tsig_key && (!cfg || !key_name_is_defined(cfg->keys, x->tsig_key))) return x->tsig_key;
+  for (int i = 0; i < x->allow_update_count; i++) {
+    const char *e = x->allow_update[i];
+    if (!e || acl_entry_is_address(e[0] == '!' ? e + 1 : e)) continue;
+    if (!cfg || !key_name_is_defined(cfg->keys, e)) return e;
+  }
+  return NULL;
+}
+
+bool db_acl_ceiling_configured(const server_config_t *cfg) {
+  return cfg && cfg->database.enabled && (cfg->database.acl_ceiling_count > 0 || cfg->database.acl_ceiling_keys_count > 0);
 }
 
 static int parse_buffer_size_value(const char *str) {
@@ -2115,6 +2587,305 @@ static int parse_dnstap_block(token_ctx_t *ctx, server_config_t *config) {
   tok = get_next_token(ctx);
   if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
   free_token(&tok);
+  return 0;
+}
+
+/* ---- options { database { ... }; } and the per-view database options (beta design 7.1) ---------------------------- */
+
+static void db_cfg_error(token_ctx_t *ctx, const char *fmt, ...) {
+  char msg[512];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  syslog(LOG_ERR, "[Config] %s", msg);
+  fprintf(stderr, "[ERROR] %s\n", msg);
+  if (ctx) ctx->error_occurred = true;
+}
+
+/* The value of "<key> <string>;" is a UTF-8 string without control characters of 1..maxlen bytes (paths and schema
+ * names are used byte for byte, so nothing is decoded here).  *dst takes the string (a previous value is freed). */
+static int db_take_string(token_ctx_t *ctx, const char *scope, const char *key, size_t maxlen, char **dst) {
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+  char *val = tok.value;
+  tok.value = NULL;
+  free_token(&tok);
+  size_t n = strlen(val);
+  if (n == 0 || n > maxlen || !dns_path_is_valid_utf8((const unsigned char *)val, n)) {
+    db_cfg_error(ctx, "%s: invalid %s value (expected 1..%zu bytes of UTF-8 without control characters)", scope,
+                 key, maxlen);
+    free(val);
+    return -1;
+  }
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free(val); free_token(&tok); return -1; }
+  free_token(&tok);
+  free(*dst);
+  *dst = val;
+  return 0;
+}
+
+/* "<key> <number>;" with an optional K/M/G suffix (1024 based) when allow_suffix.  Digits only, lo..hi. */
+static int db_take_uint(token_ctx_t *ctx, const char *key, bool allow_suffix, uint64_t lo, uint64_t hi,
+                        uint64_t *out) {
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+  const char *s = tok.value;
+  bool ok = false;
+  uint64_t v = 0;
+  if (isdigit((unsigned char)s[0])) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long long x = strtoull(s, &end, 10);
+    if (errno == 0) {
+      uint64_t mult = 1;
+      if (allow_suffix && (*end == 'k' || *end == 'K')) { mult = 1ull << 10; end++; }
+      else if (allow_suffix && (*end == 'm' || *end == 'M')) { mult = 1ull << 20; end++; }
+      else if (allow_suffix && (*end == 'g' || *end == 'G')) { mult = 1ull << 30; end++; }
+      if (*end == '\0' && x <= UINT64_MAX / mult) {
+        v = (uint64_t)x * mult;
+        ok = v >= lo && v <= hi;
+      }
+    }
+  }
+  if (!ok) {
+    char expected[96];
+    snprintf(expected, sizeof(expected), "%llu..%llu%s", (unsigned long long)lo, (unsigned long long)hi,
+             allow_suffix ? ", K/M/G suffix allowed" : "");
+    report_bad_value(ctx, NULL, key, s, expected);
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  free_token(&tok);
+  *out = v;
+  return 0;
+}
+
+static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const char *key) {
+  uint64_t u = 0;
+  if (strcmp(key, "driver") == 0) {
+    char *v = NULL;
+    if (db_take_string(ctx, "database", key, 32, &v) != 0) { free(v); return -1; }
+    if (strcmp(v, "sqlite3") != 0 && strcmp(v, "postgresql") != 0) {
+      db_cfg_error(ctx, "database: unknown driver '%.32s' (expected sqlite3 or postgresql)", v);
+      free(v);
+      return -1;
+    }
+    free(db->driver);
+    db->driver = v;
+    return 0;
+  }
+  if (strcmp(key, "database-file") == 0) return db_take_string(ctx, "database", key, KARIDNS_DB_PATH_MAX, &db->database_file);
+  if (strcmp(key, "conninfo-file") == 0) return db_take_string(ctx, "database", key, KARIDNS_DB_PATH_MAX, &db->conninfo_file);
+  if (strcmp(key, "schema") == 0) return db_take_string(ctx, "database", key, KARIDNS_DB_PATH_MAX, &db->schema);
+  if (strcmp(key, "loader-user") == 0) return db_take_string(ctx, "database", key, 255, &db->loader_user);
+  if (strcmp(key, "loader-group") == 0) return db_take_string(ctx, "database", key, 255, &db->loader_group);
+  if (strcmp(key, "loader-path") == 0) return db_take_string(ctx, "database", key, KARIDNS_DB_PATH_MAX, &db->loader_path);
+  if (strcmp(key, "server-id") == 0) return db_take_string(ctx, "database", key, 64, &db->server_id);
+  if (strcmp(key, "auto-reload") == 0) return parse_bool_statement(ctx, NULL, key, &db->auto_reload);
+  if (strcmp(key, "poll-interval") == 0) {
+    if (db_take_uint(ctx, key, false, KARIDNS_DB_POLL_MIN, KARIDNS_DB_POLL_MAX, &u) != 0) return -1;
+    db->poll_interval = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "coalesce") == 0) {
+    if (db_take_uint(ctx, key, false, 0, KARIDNS_DB_COALESCE_MAX, &u) != 0) return -1;
+    db->coalesce_ms = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "default-ttl") == 0) {
+    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_TTL_MAX, &u) != 0) return -1;
+    db->default_ttl = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "bulk-threshold") == 0) {
+    if (db_take_uint(ctx, key, false, 0, 100, &u) != 0) return -1;
+    db->bulk_threshold = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "max-zone-records") == 0)
+    return db_take_uint(ctx, key, false, 2, KARIDNS_DB_MAX_ZONE_RECORDS_MAX, &db->max_zone_records);
+  if (strcmp(key, "max-zone-bytes") == 0)
+    return db_take_uint(ctx, key, true, KARIDNS_DB_MAX_ZONE_BYTES_MIN, KARIDNS_DB_MAX_ZONE_BYTES_MAX,
+                        &db->max_zone_bytes);
+  if (strcmp(key, "db-reload-timeout") == 0) {
+    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_RELOAD_TIMEOUT_MAX, &u) != 0) return -1;
+    db->db_reload_timeout = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "ingest-threads") == 0) {
+    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_THREADS_MAX, &u) != 0) return -1;
+    db->ingest_threads = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "loader-threads") == 0) {
+    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_THREADS_MAX, &u) != 0) return -1;
+    db->loader_threads = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "acl-ceiling") == 0) {
+    /* addresses and "key" entries like allow-transfer (see zone_transfer_acl_allows(), dns_tsig_acl.c) */
+    free_str_list(db->acl_ceiling, db->acl_ceiling_count);
+    free(db->acl_ceiling_parsed);
+    free_str_list(db->acl_ceiling_keys, db->acl_ceiling_keys_count);
+    db->acl_ceiling = NULL;
+    db->acl_ceiling_parsed = NULL;
+    db->acl_ceiling_keys = NULL;
+    db->acl_ceiling_count = db->acl_ceiling_keys_count = 0;
+    return parse_acl_list(ctx, &db->acl_ceiling, &db->acl_ceiling_count, ACL_KEY_AS_TSIG_FIELD,
+                          &db->acl_ceiling_keys, &db->acl_ceiling_keys_count);
+  }
+  if (strcmp(key, "acl-ceiling-match") == 0) {
+    /* B7b: with both addresses and keys in acl-ceiling, "any" (default) lets a client in by either, "all" needs both */
+    char *v = NULL;
+    if (db_take_string(ctx, "database", key, 8, &v) != 0) { free(v); return -1; }
+    uint8_t m = strcasecmp(v, "any") == 0 ? ACL_MATCH_ANY : strcasecmp(v, "all") == 0 ? ACL_MATCH_ALL : ACL_MATCH_DEFAULT;
+    if (m == ACL_MATCH_DEFAULT) report_bad_value(ctx, NULL, key, v, "any or all");
+    free(v);
+    if (m == ACL_MATCH_DEFAULT) return -1;
+    db->acl_ceiling_match = m;
+    return 0;
+  }
+  if (strcmp(key, "alias-resolver") == 0) {
+    free_str_list(db->alias_resolver, db->alias_resolver_count);
+    db->alias_resolver = NULL;
+    db->alias_resolver_count = 0;
+    if (parse_string_list(ctx, &db->alias_resolver, &db->alias_resolver_count) != 0) return -1;
+    for (int i = 0; i < db->alias_resolver_count; i++) {
+      struct in_addr a4;
+      struct in6_addr a6;
+      if (inet_pton(AF_INET, db->alias_resolver[i], &a4) != 1 && inet_pton(AF_INET6, db->alias_resolver[i], &a6) != 1) {
+        db_cfg_error(ctx, "database: alias-resolver entry '%.64s' is not an IP address", db->alias_resolver[i]);
+        return -1;
+      }
+    }
+    return 0;
+  }
+  db_cfg_error(ctx, "database: unknown option '%.64s'", key);
+  return -1;
+}
+
+static int parse_database_block(token_ctx_t *ctx, server_config_t *config) {
+  database_config_t *db = &config->database;
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_LBRACE) { free_token(&tok); return -1; }
+  free_token(&tok);
+  if (db->enabled) {
+    db_cfg_error(ctx, "database: the block is given twice");
+    return -1;
+  }
+  db->enabled = true;
+  db->poll_interval = 2;
+  db->coalesce_ms = 1000;
+  db->default_ttl = 3600;
+  db->bulk_threshold = 25;
+  db->max_zone_records = 10000000ull;
+  db->max_zone_bytes = 1ull << 30;
+  db->db_reload_timeout = 30;
+  db->ingest_threads = 1;
+  db->loader_threads = 1;
+  while (1) {
+    tok = get_next_token(ctx);
+    if (tok.type == TOKEN_RBRACE) { free_token(&tok); break; }
+    if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
+    char *key = tok.value;
+    tok.value = NULL;
+    free_token(&tok);
+    int rc = parse_database_option(ctx, db, key);
+    free(key);
+    if (rc != 0) return -1;
+  }
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  free_token(&tok);
+  return 0;
+}
+
+/* view { database-file "..."; database-schema "..."; database none; } */
+static int parse_view_database_option(token_ctx_t *ctx, view_config_t *view, const char *key) {
+  if (strcmp(key, "database-file") == 0) return db_take_string(ctx, view->name, key, KARIDNS_DB_PATH_MAX, &view->database_file);
+  if (strcmp(key, "database-schema") == 0) return db_take_string(ctx, view->name, key, KARIDNS_DB_PATH_MAX, &view->database_schema);
+  /* "database none;" */
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+  if (strcmp(tok.value, "none") != 0) {
+    db_cfg_error(ctx, "view '%s': invalid database value '%.32s' (expected none)", view->name, tok.value);
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  free_token(&tok);
+  view->database_none = true;
+  return 0;
+}
+
+/* The rules that need the whole configuration (design 7.1): required fields per driver, driver / view option
+ * consistency, view options without a database block. */
+static int validate_database_config(token_ctx_t *ctx, server_config_t *config) {
+  const database_config_t *db = &config->database;
+  bool sqlite = db->enabled && db->driver && strcmp(db->driver, "sqlite3") == 0;
+  bool pg = db->enabled && db->driver && strcmp(db->driver, "postgresql") == 0;
+  bool need_global = false;
+  unsigned db_views = 0;
+  for (const view_config_t *v = config->views; v; v = v->next) {
+    if (!v->database_none) db_views++;
+    if ((v->database_file || v->database_schema || v->database_none) && !db->enabled) {
+      db_cfg_error(ctx, "view '%s': database options need an options { database { ... }; } block", v->name);
+      return -1;
+    }
+    if (v->database_none && (v->database_file || v->database_schema)) {
+      db_cfg_error(ctx, "view '%s': \"database none;\" cannot be combined with database-file or database-schema", v->name);
+      return -1;
+    }
+    if (pg && v->database_file) {
+      db_cfg_error(ctx, "view '%s': database-file is for driver sqlite3 (this configuration uses postgresql)", v->name);
+      return -1;
+    }
+    if (sqlite && v->database_schema) {
+      db_cfg_error(ctx, "view '%s': database-schema is for driver postgresql (this configuration uses sqlite3)", v->name);
+      return -1;
+    }
+    if (!v->database_none && !v->database_file && !v->database_schema) need_global = true;
+  }
+  if (!db->enabled) return 0;
+  if (db_views > KARIDNS_DB_MAX_VIEWS) {
+    /* the CONFIG message of the loader link lists every view that takes DB zones (dns_db_stream.h, KDB_MAX_CONFIG_VIEWS):
+     * with more it cannot be sent and the loader would be restarted forever */
+    db_cfg_error(ctx, "database: %u views take DB zones, at most %d are supported (mark the others with "
+                      "\"database none;\")", db_views, KARIDNS_DB_MAX_VIEWS);
+    return -1;
+  }
+  if (!db->driver) {
+    db_cfg_error(ctx, "database: 'driver' is required (sqlite3 or postgresql)");
+    return -1;
+  }
+  if (sqlite) {
+    if (db->conninfo_file || db->schema) {
+      db_cfg_error(ctx, "database: %s is for driver postgresql (this configuration uses sqlite3)",
+                   db->conninfo_file ? "conninfo-file" : "schema");
+      return -1;
+    }
+    if (!db->database_file && need_global) {
+      db_cfg_error(ctx, "database: driver sqlite3 needs 'database-file' (a view without its own database-file or "
+                        "\"database none;\" uses it)");
+      return -1;
+    }
+  } else if (pg) {
+    if (db->database_file) {
+      db_cfg_error(ctx, "database: database-file is for driver sqlite3 (this configuration uses postgresql)");
+      return -1;
+    }
+    if (!db->conninfo_file) {
+      db_cfg_error(ctx, "database: driver postgresql needs 'conninfo-file'");
+      return -1;
+    }
+  }
   return 0;
 }
 
@@ -2533,6 +3304,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           free_token(&tok);
+        } else if (strcmp(key, "alias-resolver") == 0) {
+          if (parse_alias_resolvers(ctx, "options", &config->alias_resolvers, &config->alias_resolvers_count) != 0) {
+            free(key);
+            return -1;
+          }
         } else if (strcmp(key, "ixfr-history") == 0) {
           if (parse_transport_param(ctx, NULL, key, false, 0, IXFR_HISTORY_MAX, &config->ixfr_history) != 0) {
             free(key);
@@ -2608,6 +3384,21 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key);
             return -1;
           }
+        } else if (strcmp(key, "database") == 0) {
+          if (parse_database_block(ctx, config) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "control-channel") == 0) {
+          /* D17-3: it used to be skipped like any unknown option, so the control socket silently did not exist.  It is a
+           * top-level statement (like in the sample configuration); say so instead of ignoring it. */
+          syslog(LOG_ERR, "[Config] control-channel is written inside options { }: it is a top-level statement, "
+                          "write it outside options { }");
+          fprintf(stderr, "[ERROR] control-channel is written inside options { }: it is a top-level statement, "
+                          "write it outside options { }\n");
+          if (ctx) ctx->error_occurred = true;
+          free(key);
+          return -1;
         } else
           skip_unknown_block(ctx);
         free(key);
@@ -2622,6 +3413,17 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       free_token(&tok);
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
+      /* ゾーンのエントリなどは view 名を固定長 (KARIDNS_VIEW_NAME_MAX、NUL 込み) で持つ。それより長い名前は
+       * 切り詰められ、その view のゾーンの設定を引けなくなる (転送、リロード、UPDATE、応答) ので受け付けない */
+      if (strlen(tok.value) >= KARIDNS_VIEW_NAME_MAX) {
+        syslog(LOG_ERR, "[Config] View name '%.40s...' is longer than %d characters; rejecting configuration",
+               tok.value, KARIDNS_VIEW_NAME_MAX - 1);
+        fprintf(stderr, "[ERROR] View name '%.40s...' is longer than %d characters\n", tok.value,
+                KARIDNS_VIEW_NAME_MAX - 1);
+        free_token(&tok);
+        if (ctx) ctx->error_occurred = true;
+        return -1;
+      }
       view_config_t *view = safe_calloc_or_die(1, sizeof(view_config_t));
       if (!view) { free_token(&tok); if (ctx) ctx->error_occurred = true; return -1; }
       view->name = tok.value;
@@ -2666,9 +3468,21 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
           if (!view->zones) view->zones = z; else last_view_zone->next = z;
           last_view_zone = z;
-        } else {
+        } else if (strcmp(tok.value, "database-file") == 0 || strcmp(tok.value, "database-schema") == 0 ||
+                   strcmp(tok.value, "database") == 0) {
+          char *vkey = tok.value;
+          tok.value = NULL;
           free_token(&tok);
-          skip_unknown_block(ctx);
+          int vrc = parse_view_database_option(ctx, view, vkey);
+          free(vkey);
+          if (vrc != 0) { free_partial_view(view); return -1; }
+        } else {
+          char *ukey = tok.value;
+          tok.value = NULL;
+          free_token(&tok);
+          int urc = unknown_statement(ctx, "view", view->name, ukey, true);
+          free(ukey);
+          if (urc != 0) { free_partial_view(view); return -1; }
         }
       }
       tok = get_next_token(ctx);
@@ -3348,6 +4162,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
     config->views = default_view;
   }
 
+  if (validate_database_config(ctx, config) != 0) return -1;
+
   // Inherit options.user as default program-user if unspecified
   for (view_config_t *v = config->views; v; v = v->next) {
     for (zone_config_t *z = v->zones; z; z = z->next) {
@@ -3371,6 +4187,20 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                          &config->ecs_trusted_resolvers, &config->ecs_trusted_resolvers_count,
                          &config->ecs_trusted_resolvers_parsed, NULL, NULL) != 0)
       return -1;
+    /* database acl-ceiling: like allow-transfer (addresses, named ACLs, key "name"); the keys must exist */
+    if (config->database.enabled && config->database.acl_ceiling_count > 0 &&
+        acl_expand_field(ctx, config, "options database acl-ceiling", ACL_USE_TRANSFER,
+                         &config->database.acl_ceiling, &config->database.acl_ceiling_count,
+                         &config->database.acl_ceiling_parsed, &config->database.acl_ceiling_keys,
+                         &config->database.acl_ceiling_keys_count) != 0)
+      return -1;
+    for (int i = 0; i < config->database.acl_ceiling_keys_count; i++) {
+      if (!key_name_is_defined(config->keys, config->database.acl_ceiling_keys[i])) {
+        db_cfg_error(ctx, "database acl-ceiling: key '%.64s' is not defined in any key {} block",
+                     config->database.acl_ceiling_keys[i]);
+        return -1;
+      }
+    }
     for (view_config_t *v = config->views; v; v = v->next) {
       snprintf(where, sizeof(where), "view '%s' match-clients", v->name);
       if (acl_expand_field(ctx, config, where, ACL_USE_ADDRESS, &v->match_clients, &v->match_clients_count,
@@ -3482,4 +4312,356 @@ int parse_named_conf_ext(const char *config_str, const char *initial_file_path, 
 
 int parse_named_conf(const char *config_str, server_config_t *config) {
   return parse_named_conf_ext(config_str, NULL, config);
+}
+
+/* ---- B8t-2: the settings of a zone travel from its primary to the secondaries (Extended AXFR v3, TYPE 65408) ---- */
+
+typedef struct {
+  char *buf;
+  size_t cap, len;
+  bool ovf;
+} rs_t;
+
+static void rs_add(rs_t *r, const char *s) {
+  size_t n = strlen(s);
+  if (r->ovf || r->len + n + 1 > r->cap) {
+    r->ovf = true;
+    return;
+  }
+  memcpy(r->buf + r->len, s, n);
+  r->len += n;
+  r->buf[r->len] = '\0';
+}
+
+static bool settings_key_name_ok(const char *k) {
+  size_t n = k ? strlen(k) : 0;
+  if (n == 0 || n > 255) return false;
+  for (const char *p = k; *p; p++)
+    if (!isalnum((unsigned char)*p) && *p != '.' && *p != '_' && *p != '-') return false;
+  return true;
+}
+
+/* Is every address of the prefix inside options { database { acl-ceiling } }?  The first and the last address decide (and the
+ * ends of the whole address space for "any"): a prefix the ceiling only partly covers is not sent. */
+static bool cidr_inside_ceiling(const server_config_t *cfg, const cidr_entry_t *e) {
+  char ip[INET6_ADDRSTRLEN];
+  for (int fam = 0; fam < 2; fam++) {
+    int af = fam == 0 ? AF_INET : AF_INET6;
+    if (!e->is_any && e->family != af) continue;
+    size_t n = fam == 0 ? 4 : 16;
+    uint8_t lo[16] = {0}, hi[16] = {0};
+    for (size_t i = 0; i < n; i++) {
+      uint8_t a = e->is_any ? 0 : e->addr[i], m = e->is_any ? 0 : e->mask[i];
+      lo[i] = a & m;
+      hi[i] = (uint8_t)(a | (uint8_t)~m);
+    }
+    if (!inet_ntop(af, lo, ip, sizeof(ip)) || !db_ceiling_allows_address(cfg, ip)) return false;
+    if (!inet_ntop(af, hi, ip, sizeof(ip)) || !db_ceiling_allows_address(cfg, ip)) return false;
+  }
+  return true;
+}
+
+static bool ceiling_has_key(const server_config_t *cfg, const char *name) {
+  const database_config_t *d = &cfg->database;
+  for (int i = 0; i < d->acl_ceiling_keys_count; i++)
+    if (d->acl_ceiling_keys[i] && domain_names_match_ci(d->acl_ceiling_keys[i], name)) return true;
+  return false;
+}
+
+/* "stmt { entries; key "k"; };": the ACL as the primary applies it.  For the ACL of a database zone (ceiling) only what lies inside
+ * the ceiling is written; an entry this module cannot write (not an address, a key name with odd octets) makes the whole ACL
+ * "none": the secondary must never get a wider list than the primary has. */
+static void rs_acl(rs_t *r, const char *stmt, char *const *list, int n, char *const *keys, int nkeys, const char *zone_key,
+                   bool ceiling, const server_config_t *cfg) {
+  bool bad = false;
+  for (int i = 0; i < n; i++) {
+    const char *e = list[i] ? list[i] : "";
+    if (!acl_entry_is_address(e[0] == '!' ? e + 1 : e)) bad = true;
+  }
+  for (int i = 0; i < nkeys; i++)
+    if (!settings_key_name_ok(keys[i])) bad = true;
+  if (zone_key && !settings_key_name_ok(zone_key)) bad = true;
+  rs_add(r, stmt);
+  rs_add(r, " {");
+  int written = 0;
+  for (int i = 0; !bad && i < n; i++) {
+    const char *e = list[i];
+    bool neg = e[0] == '!';
+    const char *t = neg ? e + 1 : e;
+    if (ceiling && !neg && strcmp(t, "none") != 0) {
+      cidr_entry_t c;
+      if (strcmp(t, "any") == 0) {
+        memset(&c, 0, sizeof(c));
+        c.is_any = true;
+      } else if (!cidr_entry_parse(&c, t)) {
+        continue;
+      }
+      if (!cidr_inside_ceiling(cfg, &c)) continue;
+    }
+    rs_add(r, " ");
+    rs_add(r, e);
+    rs_add(r, ";");
+    if (!neg) written++;
+  }
+  for (int i = 0; !bad && i <= nkeys; i++) {
+    const char *k = i < nkeys ? keys[i] : zone_key;
+    if (!k) continue;
+    if (ceiling && !ceiling_has_key(cfg, k)) continue;
+    rs_add(r, " key \"");
+    rs_add(r, k);
+    rs_add(r, "\";");
+    written++;
+  }
+  if (bad || written == 0) rs_add(r, " none;");
+  rs_add(r, " };\n");
+}
+
+size_t zone_settings_render(const server_config_t *cfg, const zone_config_t *zcfg, bool omit_trusted, char *out, size_t cap) {
+  if (!cfg || !out || cap < 16) return 0;
+  out[0] = '\0';
+  const zone_ext_t *x = zext(zcfg);
+  rs_t r = { out, cap, 0, false };
+  /* a database zone's ACLs also have to pass the ceiling (dns_tsig_acl.c); without a ceiling they refuse everybody */
+  bool ceil = x->db_acl_ceiling;
+  bool no_ceiling = ceil && !db_acl_ceiling_configured(cfg);
+  bool is_master = zcfg && zcfg->type && strcasecmp(zcfg->type, "master") == 0;
+
+  /* allow-transfer: the addresses, the keys, and (file zone of type master) the zone's tsig-key, which also may transfer */
+  const char *zone_key = (is_master && !ceil && x->tsig_key) ? x->tsig_key : NULL;
+  if (x->allow_transfer_count > 0 || x->tsig_keys_count > 0 || zone_key) {
+    if (no_ceiling) {
+      rs_add(&r, "allow-transfer { none; };\n");
+    } else {
+      rs_acl(&r, "allow-transfer", x->allow_transfer, x->allow_transfer_count, x->tsig_keys, x->tsig_keys_count, zone_key, ceil, cfg);
+    }
+    if (x->transfer_acl_match == ACL_MATCH_ANY) rs_add(&r, "transfer-acl-match any;\n");
+    else if (x->transfer_acl_match == ACL_MATCH_ALL) rs_add(&r, "transfer-acl-match all;\n");
+  }
+
+  /* ecs-trusted-resolvers: the list the zone has, else options' (the zone's data may carry its own list: omit_trusted) */
+  if (!omit_trusted) {
+    char *const *tl = x->ecs_trusted_resolvers_count > 0 ? x->ecs_trusted_resolvers : cfg->ecs_trusted_resolvers;
+    int tn = x->ecs_trusted_resolvers_count > 0 ? x->ecs_trusted_resolvers_count : cfg->ecs_trusted_resolvers_count;
+    if (tn > 0 && tl) {
+      if (no_ceiling) rs_add(&r, "ecs-trusted-resolvers { none; };\n");
+      else rs_acl(&r, "ecs-trusted-resolvers", tl, tn, NULL, 0, NULL, ceil && x->ecs_trusted_resolvers_count > 0, cfg);
+    }
+  }
+
+  additional_from_auth_t afa = x->additional_from_auth_specified ? x->additional_from_auth : cfg->additional_from_auth;
+  if (x->additional_from_auth_specified || afa != ADDITIONAL_AUTH_YES)
+    rs_add(&r, afa == ADDITIONAL_AUTH_NO ? "additional-from-auth no;\n"
+               : afa == ADDITIONAL_AUTH_IN_DOMAIN ? "additional-from-auth in-domain;\n" : "additional-from-auth yes;\n");
+
+  unsigned bs = x->zone_udp_bufsize > 0 ? x->zone_udp_bufsize : cfg->udp_bufsize;
+  if (bs >= KARIDNS_UDP_BUFSIZE_MIN && bs <= KARIDNS_UDP_BUFSIZE_MAX) {
+    char tmp[48];
+    snprintf(tmp, sizeof(tmp), "zone-udp-bufsize %u;\n", bs);
+    rs_add(&r, tmp);
+  }
+  if (r.ovf) {
+    out[0] = '\0';
+    return (size_t)-1;
+  }
+  return r.len;
+}
+
+/* ---- a deep copy of a zone's option block, and the zone configuration of a secondary with the settings it received ---- */
+
+static char *zx_strdup(const char *s) { return s ? strdup(s) : NULL; }
+
+static void *zx_memdup(const void *p, size_t n) {
+  if (!p || n == 0) return NULL;
+  void *q = malloc(n);
+  if (q) memcpy(q, p, n);
+  return q;
+}
+
+static bool zx_strs(char ***dst, int *dn, char *const *src, int sn) {
+  *dst = NULL;
+  *dn = 0;
+  if (sn <= 0 || !src) return true;
+  char **a = calloc((size_t)sn, sizeof(char *));
+  if (!a) return false;
+  *dst = a;
+  *dn = sn;
+  for (int i = 0; i < sn; i++) {
+    a[i] = zx_strdup(src[i]);
+    if (src[i] && !a[i]) return false;
+  }
+  return true;
+}
+
+static bool zx_ipports(ip_port_t **dst, int *dn, const ip_port_t *src, int sn) {
+  *dst = NULL;
+  *dn = 0;
+  if (sn <= 0 || !src) return true;
+  ip_port_t *a = calloc((size_t)sn, sizeof(ip_port_t));
+  if (!a) return false;
+  *dst = a;
+  *dn = sn;
+  for (int i = 0; i < sn; i++) {
+    a[i].port = src[i].port;
+    a[i].ip = zx_strdup(src[i].ip);
+    if (src[i].ip && !a[i].ip) return false;
+  }
+  return true;
+}
+
+static bool zx_tags(struct ecs_tag_def_s **dst, int *dn, const struct ecs_tag_def_s *src, int sn) {
+  *dst = NULL;
+  *dn = 0;
+  if (sn <= 0 || !src) return true;
+  struct ecs_tag_def_s *a = calloc((size_t)sn, sizeof(*a));
+  if (!a) return false;
+  *dst = a;
+  *dn = sn;
+  for (int i = 0; i < sn; i++) {
+    a[i].tag = zx_strdup(src[i].tag);
+    if (src[i].tag && !a[i].tag) return false;
+    if (src[i].cidr_count > 0 && src[i].cidrs) {
+      a[i].cidrs = calloc((size_t)src[i].cidr_count, sizeof(ecs_cidr_entry_t));
+      if (!a[i].cidrs) return false;
+      a[i].cidr_count = src[i].cidr_count;
+      for (int j = 0; j < src[i].cidr_count; j++) {
+        a[i].cidrs[j].parsed = src[i].cidrs[j].parsed;
+        a[i].cidrs[j].cidr = zx_strdup(src[i].cidrs[j].cidr);
+        if (src[i].cidrs[j].cidr && !a[i].cidrs[j].cidr) return false;
+      }
+    }
+  }
+  return true;
+}
+
+/* A deep copy: the copy owns everything it points to (free_zone_ext()).  NULL when out of memory. */
+static zone_ext_t *zone_ext_clone(const zone_ext_t *s) {
+  zone_ext_t *d = calloc(1, sizeof(*d));
+  if (!d) return NULL;
+  *d = *s;
+  /* every pointer of the copy is rebuilt below; until then it must not alias the source */
+  d->masters = NULL; d->masters_count = 0; d->masters_parsed = NULL;
+  d->tsig_key = NULL;
+  d->tsig_keys = NULL; d->tsig_keys_count = 0;
+  d->also_notify = NULL; d->also_notify_count = 0;
+  d->notify_source = NULL;
+  d->allow_transfer = NULL; d->allow_transfer_count = 0; d->allow_transfer_parsed = NULL;
+  d->allow_update = NULL; d->allow_update_count = 0; d->allow_update_parsed = NULL;
+  d->rrl.exempt_clients = NULL; d->rrl.exempt_clients_count = 0; d->rrl.exempt_clients_parsed = NULL;
+  d->program_path = NULL; d->program_args = NULL; d->program_args_count = 0; d->program_user = NULL;
+  d->forwarders = NULL; d->forwarders_count = 0;
+  d->file_format = NULL;
+  d->alias_resolvers = NULL; d->alias_resolvers_count = 0;
+  d->ecs_tags = NULL; d->ecs_tag_count = 0;
+  d->location_tags = NULL; d->location_tag_count = 0;
+  d->ecs_trusted_resolvers = NULL; d->ecs_trusted_resolvers_count = 0; d->ecs_trusted_resolvers_parsed = NULL;
+  bool ok = zx_ipports(&d->masters, &d->masters_count, s->masters, s->masters_count) &&
+            zx_strs(&d->tsig_keys, &d->tsig_keys_count, s->tsig_keys, s->tsig_keys_count) &&
+            zx_ipports(&d->also_notify, &d->also_notify_count, s->also_notify, s->also_notify_count) &&
+            zx_strs(&d->allow_transfer, &d->allow_transfer_count, s->allow_transfer, s->allow_transfer_count) &&
+            zx_strs(&d->allow_update, &d->allow_update_count, s->allow_update, s->allow_update_count) &&
+            zx_ipports(&d->rrl.exempt_clients, &d->rrl.exempt_clients_count, s->rrl.exempt_clients, s->rrl.exempt_clients_count) &&
+            zx_strs(&d->program_args, &d->program_args_count, s->program_args, s->program_args_count) &&
+            zx_ipports(&d->forwarders, &d->forwarders_count, s->forwarders, s->forwarders_count) &&
+            zx_ipports(&d->alias_resolvers, &d->alias_resolvers_count, s->alias_resolvers, s->alias_resolvers_count) &&
+            zx_tags(&d->ecs_tags, &d->ecs_tag_count, s->ecs_tags, s->ecs_tag_count) &&
+            zx_tags(&d->location_tags, &d->location_tag_count, s->location_tags, s->location_tag_count) &&
+            zx_strs(&d->ecs_trusted_resolvers, &d->ecs_trusted_resolvers_count, s->ecs_trusted_resolvers, s->ecs_trusted_resolvers_count);
+  if (ok && s->tsig_key && !(d->tsig_key = strdup(s->tsig_key))) ok = false;
+  if (ok && s->notify_source && !(d->notify_source = strdup(s->notify_source))) ok = false;
+  if (ok && s->program_path && !(d->program_path = strdup(s->program_path))) ok = false;
+  if (ok && s->program_user && !(d->program_user = strdup(s->program_user))) ok = false;
+  if (ok && s->file_format && !(d->file_format = strdup(s->file_format))) ok = false;
+  /* the parsed forms are plain arrays of structs without pointers */
+  if (ok && s->masters_parsed && s->masters_count > 0 &&
+      !(d->masters_parsed = zx_memdup(s->masters_parsed, (size_t)s->masters_count * sizeof(cidr_entry_t))))
+    ok = false;
+  if (ok && s->allow_transfer_parsed && s->allow_transfer_count > 0 &&
+      !(d->allow_transfer_parsed = zx_memdup(s->allow_transfer_parsed, (size_t)s->allow_transfer_count * sizeof(acl_entry_t))))
+    ok = false;
+  if (ok && s->allow_update_parsed && s->allow_update_count > 0 &&
+      !(d->allow_update_parsed = zx_memdup(s->allow_update_parsed, (size_t)s->allow_update_count * sizeof(acl_entry_t))))
+    ok = false;
+  if (ok && s->rrl.exempt_clients_parsed && s->rrl.exempt_clients_count > 0 &&
+      !(d->rrl.exempt_clients_parsed = zx_memdup(s->rrl.exempt_clients_parsed, (size_t)s->rrl.exempt_clients_count * sizeof(cidr_entry_t))))
+    ok = false;
+  if (ok && s->ecs_trusted_resolvers_parsed && s->ecs_trusted_resolvers_count > 0 &&
+      !(d->ecs_trusted_resolvers_parsed = zx_memdup(s->ecs_trusted_resolvers_parsed, (size_t)s->ecs_trusted_resolvers_count * sizeof(acl_entry_t))))
+    ok = false;
+  if (!ok) {
+    free_zone_ext(d);
+    return NULL;
+  }
+  return d;
+}
+
+/* Move the received statement lists into d (replacing d's), as parsed lists of their own. */
+static bool zx_take_acl(zone_ext_t *d, const zone_ext_t *rx, char *note, size_t notelen, const server_config_t *cfg) {
+  for (int i = 0; i < d->allow_transfer_count; i++) free(d->allow_transfer[i]);
+  free(d->allow_transfer);
+  free(d->allow_transfer_parsed);
+  for (int i = 0; i < d->tsig_keys_count; i++) free(d->tsig_keys[i]);
+  free(d->tsig_keys);
+  d->allow_transfer = NULL; d->allow_transfer_parsed = NULL; d->allow_transfer_count = 0;
+  d->tsig_keys = NULL; d->tsig_keys_count = 0;
+  /* a key the secondary does not have: the ACL fails closed (as for a database zone), whatever else it lists */
+  const char *missing = NULL;
+  for (int i = 0; i < rx->tsig_keys_count && !missing; i++)
+    if (!cfg || !key_name_is_defined(cfg->keys, rx->tsig_keys[i])) missing = rx->tsig_keys[i];
+  if (missing) {
+    char *none[1] = { "none" };
+    if (!zx_strs(&d->allow_transfer, &d->allow_transfer_count, none, 1)) return false;
+    d->allow_transfer_parsed = acl_list_parse(d->allow_transfer, d->allow_transfer_count);
+    if (note && notelen) snprintf(note, notelen, "the received allow-transfer names the TSIG key '%.64s', which is not defined here: transfers are refused", missing);
+    return true;
+  }
+  if (!zx_strs(&d->allow_transfer, &d->allow_transfer_count, rx->allow_transfer, rx->allow_transfer_count) ||
+      !zx_strs(&d->tsig_keys, &d->tsig_keys_count, rx->tsig_keys, rx->tsig_keys_count))
+    return false;
+  if (d->allow_transfer_count > 0) d->allow_transfer_parsed = acl_list_parse(d->allow_transfer, d->allow_transfer_count);
+  return true;
+}
+
+zone_config_t *zone_config_with_received(const char *domain, const zone_config_t *base, const zone_ext_t *rx,
+                                         const server_config_t *cfg, char *note, size_t notelen) {
+  if (note && notelen) note[0] = '\0';
+  zone_config_t *c = calloc(1, sizeof(*c));
+  if (!c) return NULL;
+  c->domain = strdup(domain);
+  c->type = strdup(base && base->type ? base->type : "slave");
+  c->file = base && base->file ? strdup(base->file) : NULL;
+  c->is_catalog = base ? base->is_catalog : false;
+  zone_ext_t *x = zone_ext_clone(zext(base));
+  if (!c->domain || !c->type || (base && base->file && !c->file) || !x) {
+    if (x) free_zone_ext(x);
+    free_zone_config(c);
+    return NULL;
+  }
+  c->ext = x;
+  const zone_ext_t *b = zext(base);
+  /* precedence: a statement written in the secondary's own zone {} > the received one > options (the lookups fall back to options
+   * where the zone has no value) */
+  if (rx && b->allow_transfer_count == 0 && b->tsig_keys_count == 0 && rx->allow_transfer_count + rx->tsig_keys_count > 0) {
+    if (!zx_take_acl(x, rx, note, notelen, cfg)) {
+      free_zone_config(c);
+      return NULL;
+    }
+    if (b->transfer_acl_match == ACL_MATCH_DEFAULT) x->transfer_acl_match = rx->transfer_acl_match;
+  }
+  if (rx && b->ecs_trusted_resolvers_count == 0 && rx->ecs_trusted_resolvers_count > 0) {
+    for (int i = 0; i < x->ecs_trusted_resolvers_count; i++) free(x->ecs_trusted_resolvers[i]);
+    free(x->ecs_trusted_resolvers);
+    free(x->ecs_trusted_resolvers_parsed);
+    x->ecs_trusted_resolvers = NULL; x->ecs_trusted_resolvers_parsed = NULL; x->ecs_trusted_resolvers_count = 0;
+    if (!zx_strs(&x->ecs_trusted_resolvers, &x->ecs_trusted_resolvers_count, rx->ecs_trusted_resolvers, rx->ecs_trusted_resolvers_count)) {
+      free_zone_config(c);
+      return NULL;
+    }
+    x->ecs_trusted_resolvers_parsed = acl_list_parse(x->ecs_trusted_resolvers, x->ecs_trusted_resolvers_count);
+  }
+  if (rx && !b->additional_from_auth_specified && rx->additional_from_auth_specified) {
+    x->additional_from_auth = rx->additional_from_auth;
+    x->additional_from_auth_specified = true;
+  }
+  if (rx && b->zone_udp_bufsize == 0 && rx->zone_udp_bufsize > 0) x->zone_udp_bufsize = rx->zone_udp_bufsize;
+  return c;
 }

@@ -113,6 +113,35 @@ txtrec IN TXT "unclosed quote
 EOF
 run_check_zone "TXT unterminated quote" "example.com." "${TMP_ZONE_DIR}/unterminated_quote.zone" 1
 
+# 6e. RFC 3597 section 5 (D15-2): the generic form "\# len hex" of a KNOWN type must carry RDATA that is valid for the
+#     type.  "PTR \# 0" and "NS \# 3 010203" used to be accepted and served as raw octets, which the wire decoder of
+#     a secondary refuses.  karicheck reports the record at its own line; an unknown type may be empty.
+check_generic() {
+    _desc="$1"; _rr="$2"; _line="$3"; _reason="$4"
+    printf '$ORIGIN example.com.\n$TTL 300\n@ SOA ns host 1 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n%s\n' "${_rr}" > "${TMP_ZONE_DIR}/generic.zone"
+    echo "[+] Testing ${_desc}..."
+    set +e
+    _out=$(./karicheck zone example.com. "${TMP_ZONE_DIR}/generic.zone" 2>&1)
+    _rc=$?
+    set -e
+    if [ "${_rc}" -ne 0 ] && echo "${_out}" | grep -Eq "at line ${_line}([^0-9]|\$)" && echo "${_out}" | grep -q "${_reason}"; then
+        echo "  PASS: rejected at line ${_line} (${_reason})"
+    else
+        echo "  FAIL: rc=${_rc}, expected 'at line ${_line}' and '${_reason}':"
+        echo "${_out}"
+        FAILED=1
+    fi
+}
+check_generic "generic PTR with empty RDATA" 'x IN PTR \# 0' 6 "not terminated"
+check_generic "generic NS with a label that runs past the end" 'x IN NS \# 3 010203' 6 "runs past the end"
+check_generic "generic NS with a compressed name" 'x IN NS \# 2 C00C' 6 "compressed"
+check_generic "generic NS with a trailing octet" 'x IN NS \# 6 036E733100FF' 6 "trailing octets"
+check_generic "generic MX without an exchange" 'x IN MX \# 2 000A' 6 "not terminated"
+check_generic "generic TXT longer than its RDATA" 'x IN TXT \# 2 0361' 6 "not valid for this record type"
+
+printf '$ORIGIN example.com.\n$TTL 300\n@ SOA ns host 1 2 3 4 5\n@ NS ns\nns A 192.0.2.1\nok1 PTR \\# 5 036e733100\nok2 TYPE65534 \\# 0\nok3 MX \\# 7 000a036e733100\n' > "${TMP_ZONE_DIR}/generic_ok.zone"
+run_check_zone "valid generic RDATA of known types and an empty unknown type" "example.com." "${TMP_ZONE_DIR}/generic_ok.zone" 0
+
 if [ "${FAILED}" -ne 0 ]; then
     echo "=== Some Zone Parser Error Path Tests FAILED ==="
     exit 1

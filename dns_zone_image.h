@@ -38,6 +38,9 @@
 #define ZONE_IMAGE_F_WILDCARD 0x4u /* some owner is a wildcard (first label "*"): lets the engine skip the wildcard search of a zone without one */
 #define ZONE_IMAGE_F_DNAME    0x8u /* some owner has a DNAME RRset: lets the engine skip the DNAME search of a zone without one */
 #define ZONE_IMAGE_F_PERM     0x10u /* the file (builder) order of the RRs differs from the image order: perm[] lists the RR indexes in that order (AXFR out and thaw use it) */
+#define ZONE_IMAGE_F_VIEW     0x40u /* B8t-1: some RR is seen only by some clients or at some times (tinydns location / time stamp / countdown, $LOCATION / $ECS-SUBNET tag); an ext[] entry that only keeps an owner spelling (alt text) does not count */
+#define ZONE_IMAGE_F_SOA_ATTR 0x20u /* B8t-1: some apex SOA RR is restricted (tinydns location / time stamp, $LOCATION / $ECS-SUBNET tag): a client may see no SOA of the zone, and the SOA it sees is the first visible one */
+#define ZONE_IMAGE_F_ALIAS 0x80u /* B9a: some owner has an ALIAS RRset (TYPE 65401 of CLASS IN): lets the alias module and the engine skip a zone without one */
 
 /* zone_image_name_t.rr_count_flags: low 24 bits RR count, high 8 bits flags */
 #define ZONE_IMAGE_NAME_COUNT_MASK 0x00FFFFFFu
@@ -47,6 +50,7 @@
 #define ZONE_IMAGE_NAME_APEX       (1u << 27)
 #define ZONE_IMAGE_NAME_NSEC       (1u << 28) /* has an NSEC RR */
 #define ZONE_IMAGE_NAME_GLUE       (1u << 29) /* prelinked glue target: among the first MAX_PRELINK_TARGETS (256) distinct NS/MX/SRV targets in record order and has A/AAAA RRs here (what zone_glue_track_build() links); the engine answers it with the RRs in RR order (see append_glue_records) */
+#define ZONE_IMAGE_NAME_ALIAS      (1u << 30) /* B9a: has an ALIAS RR (TYPE 65401, CLASS IN) */
 
 /* zone_image_rr_t.flags */
 #define ZONE_IMAGE_RR_RAW        0x1u /* RDATA written as is (generic_data / KARIDNS_EXT class): never compressed */
@@ -280,8 +284,31 @@ static inline uint32_t zone_image_glue_name(const zone_image_t *img, uint32_t i)
 static inline uint32_t zone_image_seq_rr(const zone_image_t *img, uint32_t seq) {
     return img->off_perm ? zone_image_u32s(img, img->off_perm)[seq] : seq;
 }
-/* The apex SOA RR (first in file order), ZONE_IMAGE_NONE when there is none. */
+/* The reference SOA RR of the zone (B8t-1): the apex SOA that has no location, time stamp or tag if there is one, else
+ * the first apex SOA in file order; ZONE_IMAGE_NONE when there is none. Zone-wide values (serial, timers, the
+ * transfer frame) come from it. A zone with one SOA (nearly all) returns that SOA. */
 uint32_t zone_image_apex_soa(const zone_image_t *img);
+
+/* What one client sees of a zone: its tinydns location (char[2]), tag names and the time (tinydns time stamps).
+ * A tag is NULL when the client matches none (an RR with a tag is then not visible). */
+typedef struct {
+    char loc[2];
+    const char *loc_tag;
+    const char *ecs_tag;
+    time_t now;
+} zone_image_view_t;
+
+/* Is RR `rr` visible to a client that has this view? On true *effective_ttl is the TTL to serve it with (a tinydns
+ * countdown RR: the time left, 2..3600, as tinydns does). The one implementation behind the query engine and AXFR. */
+bool zone_image_rr_valid(const zone_image_t *img, uint32_t rr, time_t now, const char client_loc[2],
+                         const char *client_ecs_tag, const char *client_loc_tag, uint32_t *effective_ttl);
+static inline bool zone_image_rr_visible(const zone_image_t *img, uint32_t rr, const zone_image_view_t *v,
+                                         uint32_t *effective_ttl) {
+    return zone_image_rr_valid(img, rr, v->now, v->loc, v->ecs_tag, v->loc_tag, effective_ttl);
+}
+/* The SOA RR a client with this view sees: the first visible apex SOA RR in file order (tdlookup.c: the first SOA
+ * the client can see); ZONE_IMAGE_NONE when it sees none. *effective_ttl may be NULL. */
+uint32_t zone_image_visible_soa(const zone_image_t *img, const zone_image_view_t *v, uint32_t *effective_ttl);
 
 /* ---- zone level tables: tinydns locations, $LOCATION-TAG / $ECS-SUBNET-TAG definitions, ECS trusted resolvers
  *      (stored in the image's zattr area; nothing is allocated when they are read) ---- */

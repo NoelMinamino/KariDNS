@@ -44,13 +44,28 @@ jobs:
           run: |
             set -e
 
-            echo "::group::📦 [Setup] Install test dependencies (perl5)"
+            echo "::group::📦 [Setup] Install test dependencies (perl5, sqlite3 for karidns-dbloader and its tests)"
             pkg install -y perl5 || true
+            pkg install -y sqlite3
+            echo "::endgroup::"
+
+            echo "::group::📦 [Setup] PostgreSQL server and libpq (PostgreSQL driver of karidns-dbloader, B10)"
+            # The job runs inside this VM, so the PostgreSQL "service" is a server started here (a service container of the
+            # runner is not reachable from the VM).  initdb's default pg_hba.conf trusts the UNIX socket and 127.0.0.1; the tests
+            # create and drop their own databases and roles (karidns_test_*) as the user postgres (tests/db/pg_lib.sh).
+            pkg install -y postgresql17-server postgresql17-client
+            sysrc postgresql_enable=YES
+            service postgresql initdb
+            service postgresql start
+            export KARIDNS_TEST_PG="host=127.0.0.1 user=postgres"
+            export KARIDNS_TEST_PG_USER=postgres
+            i=0; until pg_isready -q -h 127.0.0.1 || [ $i -ge 30 ]; do sleep 1; i=$((i + 1)); done
+            psql -X -At -h 127.0.0.1 -U postgres -d postgres -c "SELECT version()"
             echo "::endgroup::"
 
             echo "::group::📦 [Build] Parallel Build KariDNS, Sanitizers, Tests & Fuzzers"
             NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
-            make -j"$NCPU" all asan tsan tools-asan fuzz_all asan_test tinydns_test hash_test include_test response_cache_test vulnerability_test bench_serialize
+            make -j"$NCPU" DB_DRIVERS="sqlite3 postgresql" all karidns-dbloader zone2sql zone2kdb asan tsan tools-asan fuzz_all asan_test tinydns_test hash_test include_test response_cache_test vulnerability_test bench_serialize
             echo "::endgroup::"
 
             echo "::group::🧪 [Unit Tests] All C unit tests (incl. RFC published-vector tests)"
@@ -101,6 +116,17 @@ jobs:
             sh ./tests/run_extended_axfr_test.sh
             sh ./tests/run_dnstap_capture_test.sh
             sh ./tests/run_karicheck_semantic_lint_test.sh
+            sh ./tests/run_db_dump_test.sh
+            sh ./tests/run_db_sqlite_basic_test.sh
+            sh ./tests/run_db_file_diff_test.sh
+            sh ./tests/run_db_hostile_loader_test.sh
+            sh ./tests/run_db_ddl_test.sh
+            sh ./tests/run_db_schema_migrate_test.sh
+            sh ./tests/run_db_pg_sqlite_diff_test.sh
+            sh ./tests/run_db_pg_autoreload_test.sh
+            sh ./tests/run_db_pg_role_test.sh
+            sh ./tests/run_karicheck_database_conf_test.sh
+            sh ./tests/run_dag_update_generic_rdata_test.sh
             sh ./tests/run_karictl_observatory_test.sh
             sh ./tests/run_axfr_multikey_tsig_test.sh
             sh ./tests/run_config_duplicate_rejection_test.sh
@@ -296,7 +322,17 @@ jobs:
             # Base llvm-cov on FreeBSD 15 aborts in "show"; the llvmNN-lite package
             # provides llvm-covNN / llvm-profdataNN, which the Makefile picks up.
             V=$(cc --version | sed -n 's/.*clang version \([0-9][0-9]*\).*/\1/p' | head -n 1)
-            pkg install -y perl5 "llvm${V}-lite"
+            pkg install -y perl5 sqlite3 "llvm${V}-lite"
+            echo "::endgroup::"
+
+            echo "::group::📦 [Setup] PostgreSQL for the PostgreSQL driver tier (test_db_pgsql)"
+            pkg install -y postgresql17-server postgresql17-client
+            sysrc postgresql_enable=YES
+            service postgresql initdb
+            service postgresql start
+            export KARIDNS_TEST_PG="host=127.0.0.1 user=postgres"
+            export KARIDNS_TEST_PG_USER=postgres
+            i=0; until pg_isready -q -h 127.0.0.1 || [ $i -ge 30 ]; do sleep 1; i=$((i + 1)); done
             echo "::endgroup::"
 
             echo "::group::🧪 [Coverage] make coverage"

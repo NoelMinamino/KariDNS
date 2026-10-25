@@ -341,6 +341,31 @@ done:
     return offset;
 }
 
+/* RFC 3597 5: the RDATA operand of an UPDATE record (--update-add, --update-del-exact, the yxrrset prerequisite)
+ * may be written "\# <length> <hex>".  When it is, decode it into rec->generic_data (the server and the serializer
+ * handle it like an unknown type) and return the malloc'ed blob in *blob for the caller to free.  false: malformed
+ * (reported on stderr), the operand is not sent.  Not in the generic form: true, *blob NULL. */
+static bool update_generic_rdata(dns_record_t *rec, uint8_t **blob, const char *what, const char *raw) {
+    *blob = NULL;
+    if (rec->rdata_count < 2 || strcmp(rec->rdata[0], "\\#") != 0) return true;
+    uint8_t *buf = malloc(65535);
+    if (!buf) {
+        fprintf(stderr, "Failed to serialize %s record: out of memory: %s\n", what, raw);
+        return false;
+    }
+    size_t n = 0;
+    const char *why = dns_generic_rdata_parse(rec->type_code, rec->rdata, rec->rdata_count, buf, &n);
+    if (why) {
+        fprintf(stderr, "Failed to serialize %s record: %s: %s\n", what, why, raw);
+        free(buf);
+        return false;
+    }
+    rec->generic_data = n ? buf : (uint8_t *)"";
+    rec->generic_len = (uint16_t)n;
+    *blob = buf;
+    return true;
+}
+
 /* ========================================================================
  * 5. Packet construction (normal path + structural --break variants)
  * ==================================================================== */
@@ -510,7 +535,12 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                 rec.rdata_count = token_count;
                 rec.rdata = tokens; // S5: rdata は tokens を指す (rdata_count 個)
 
+                uint8_t *gblob = NULL;
                 uint16_t out_offset = offset;
+                if (!update_generic_rdata(&rec, &gblob, "yxrrset prerequisite", qo->prereqs[pi].rdata)) {
+                    free(buf);
+                    continue;
+                }
                 if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0) == 0) {
                     offset = out_offset;
                     uint16_t prcount = (pkt[6] << 8) | pkt[7];
@@ -519,6 +549,7 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                 } else {
                     fprintf(stderr, "warning: failed to serialize yxrrset prereq rdata: %s\n", qo->prereqs[pi].rdata);
                 }
+                free(gblob);
                 free(buf);
                 continue;
             }
@@ -630,7 +661,12 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                         rec.rdata_count = token_count - (type_idx + 1);
                         rec.rdata = tokens + (type_idx + 1);
 
+                        uint8_t *gblob = NULL;
                         uint16_t out_offset = offset;
+                        if (!update_generic_rdata(&rec, &gblob, "update-add", raw)) {
+                            free(buf);
+                            continue;
+                        }
                         if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0xFFFFFFFF) == 0) {
                             offset = out_offset;
                             uint16_t upcount = (pkt[8] << 8) | pkt[9];
@@ -639,6 +675,7 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                         } else {
                             fprintf(stderr, "Failed to serialize update-add record: %s\n", raw);
                         }
+                        free(gblob);
                     } else {
                         fprintf(stderr, "Invalid update-add string format: %s\n", raw);
                     }
@@ -748,7 +785,12 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                         rec.rdata_count = token_count - (type_idx + 1);
                         rec.rdata = tokens + (type_idx + 1);
 
+                        uint8_t *gblob = NULL;
                         uint16_t out_offset = offset;
+                        if (!update_generic_rdata(&rec, &gblob, "update-del-exact", raw)) {
+                            free(buf);
+                            continue;
+                        }
                         if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0) == 0) {
                             offset = out_offset;
                             uint16_t upcount = (pkt[8] << 8) | pkt[9];
@@ -757,6 +799,7 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                         } else {
                             fprintf(stderr, "Failed to serialize update-del-exact record: %s\n", raw);
                         }
+                        free(gblob);
                     } else {
                         fprintf(stderr, "Invalid update-del-exact string format: %s\n", raw);
                     }

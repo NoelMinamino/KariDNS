@@ -1,0 +1,1 @@
+allow-transfer { 192.0.2.1; 2001:db8::/32; key "xfr"; }; transfer-acl-match any; allow-update { 192.0.2.9; key "upd"; }; update-acl-match all; also-notify { 192.0.2.53 port 5300; }; tsig-key "m"; ixfr-history 8;

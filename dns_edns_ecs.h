@@ -70,12 +70,17 @@ bool is_ecs_trusted_resolver(const zone_image_t *zone, const server_config_t *cf
 void tinydns_resolve_client_location(const zone_image_t *zone, const char *client_ip,
                                      char out_loc[2]);
 
-size_t pack_tag_def_rdata(uint8_t *buf, size_t buf_cap, const ecs_tag_def_t *def);
+/* B8t-1: what a client sees of a zone (location, tags, time): zone_image_view_t of dns_zone_image.h. ecs_trusted / ecs_addr: the ECS of
+ * a trusted resolver (NULL ecs_addr = none). *zone_scope (may be NULL) is the ECS SCOPE the zone's tag definitions need. */
+void zone_client_view(const zone_image_t *img, const server_config_t *cfg, const zone_config_t *zcfg, const char *client_ip,
+                      bool ecs_trusted, const uint8_t *ecs_addr, uint16_t ecs_family, zone_image_view_t *v,
+                      uint8_t *zone_scope);
+
+/* pack_tag_def_rdata(), wrap_tinydns_record() and the other encoders of the Extended AXFR records: dns_wire.h (xext_*) */
 bool unpack_tag_def_rdata(const uint8_t *data, size_t len, ecs_tag_def_t **defs_out, int *count_out);
 bool unpack_trusted_resolvers_rdata(const uint8_t *data, size_t len, char ***resolvers_out, int *count_out);
 bool unpack_tinydns_loc_rdata(const uint8_t *data, size_t len, tinydns_location_entry_t **locs_out, int *count_out);
-bool wrap_tinydns_record(const dns_record_t *rec, dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap);
-/* the same for RR `rr` of a zone image */
+/* wrap_tinydns_record() (dns_wire.h) for RR `rr` of a zone image */
 bool wrap_tinydns_image_rr(const zone_image_t *img, uint32_t rr, dns_record_t *out_wrap, uint8_t *wrap_buf,
                            size_t wrap_buf_cap);
 

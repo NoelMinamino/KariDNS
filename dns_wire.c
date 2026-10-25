@@ -728,15 +728,18 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
         uint16_t pref = (packet[rdata_p+2] << 8) | packet[rdata_p+3];
         rdata_p += 4;
         char *cstrs[3];
+        bool has_nul = false;
         for (int k = 0; k < 3; k++) {
             if (rdata_p >= *offset + rdlen) return -1;
             uint8_t slen = packet[rdata_p++];
             if (rdata_p + slen > *offset + rdlen) return -1;
+            if (slen && memchr(&packet[rdata_p], 0, slen)) has_nul = true;
             char *s = arena_alloc(arena, slen + 1); if (!s) return -1;
             memcpy(s, &packet[rdata_p], slen); s[slen] = '\0';
             cstrs[k] = s;
             rdata_p += slen;
         }
+        size_t repl_start = rdata_p;
         char *replacement;
         if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &replacement) != 0) return -1;
         if (rdata_p > *offset + rdlen) return -1;
@@ -749,6 +752,26 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
         rec->rdata[2] = cstrs[0]; rec->rdata[3] = cstrs[1]; rec->rdata[4] = cstrs[2];
         rec->rdata[5] = replacement;
         rec->rdata_count = 6;
+        if (has_nul) {
+            /* D16-1: a NUL in flags / services / regexp (RFC 3403 4.1, character-strings) cannot live in the text
+             * fields; keep the RDATA octets.  They are copied as they are, so the replacement name must be written
+             * out in full (RFC 3597 4: no compression in the RDATA of this type) and end the RDATA. */
+            size_t q = repl_start, end = *offset + rdlen;
+            for (;;) {
+                if (q >= end) return -1;
+                uint8_t l = packet[q++];
+                if (l == 0) break;
+                if (l > 63 || end - q < l) return -1;
+                q += l;
+            }
+            if (q != end) return -1;
+            uint8_t *blob = (uint8_t *)arena_alloc(arena, rdlen);
+            if (!blob) return -1;
+            memcpy(blob, &packet[*offset], rdlen);
+            rec->generic_data = blob;
+            rec->generic_len = rdlen;
+            rec->rdata_count = 0;
+        }
     } else if (type == 15) {
         if (rdlen < 3) return -1;
         size_t rdata_p = *offset; char *target;
@@ -761,14 +784,27 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
         rec->rdata[0] = pref_buf; rec->rdata[1] = target; rec->rdata_count = 2;
     } else if (type == 16) {
         size_t rdata_p = *offset;
+        bool has_nul = false;
         while (rdata_p < *offset + rdlen) {
             if (rec->rdata_count >= MAX_RDATA) return -1;
             uint8_t len = packet[rdata_p++];
             if (rdata_p + len > *offset + rdlen) return -1;
+            if (len && memchr(&packet[rdata_p], 0, len)) has_nul = true;
             char *txt = arena_alloc(arena, len + 1); if (!txt) return -1;
             memcpy(txt, &packet[rdata_p], len); txt[len] = '\0';
             rec->rdata[rec->rdata_count++] = txt;
             rdata_p += len;
+        }
+        /* D16-1, RFC 1035 3.3.14: a character-string may hold any octet, NUL included, but the text fields are C
+         * strings.  Such an RR is kept as the RDATA octets (the form of an unknown type, RFC 3597 5) instead of
+         * fields that would stop at the NUL. */
+        if (has_nul && rdlen > 0) {
+            uint8_t *blob = (uint8_t *)arena_alloc(arena, rdlen);
+            if (!blob) return -1;
+            memcpy(blob, &packet[*offset], rdlen);
+            rec->generic_data = blob;
+            rec->generic_len = rdlen;
+            rec->rdata_count = 0;
         }
     } else if (type == 28) {
         if (rdlen != 16) return -1;
@@ -782,7 +818,9 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
             if (!blob) return -1;
             memcpy(blob, &packet[*offset], rdlen);
         }
-        rec->generic_data = blob;
+        /* RFC 3597 §5: zero-length RDATA is legal.  It is an empty blob, not "no blob": generic_data == NULL means
+         * "written from the text fields", and an RR with neither could not be written (it was dropped as unencodable) */
+        rec->generic_data = blob ? blob : (uint8_t *)"";
         rec->generic_len = rdlen;
         rec->rdata_count = 0;
         // R-33: DNSSEC の型はテキストのフィールドも持たせる (RDATA は blob のまま応答に使う)
@@ -814,6 +852,125 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
     rec->rdata = keep;
     if (rc != 0) rec->rdata_count = 0;
     return rc;
+}
+
+/* D15-2.  RFC 3597 §5: "\# <length> <hex>" is only another way to write the RDATA, and a known type written that way is processed as the known type afterwards (RFC 3597 5; the RFC does not say
+ * "invalid RDATA is an error" outright, but type-specific processing needs valid RDATA), so the RDATA of a type the server
+ * knows must be valid for that type.  The test is the decoder a secondary applies to the same bytes
+ * (parse_resource_record), plus two things that decoder is lenient about:
+ *   - a compressed name: RFC 3597 §4 (and RFC 1035 §4.1.4: a pointer needs the message it points into);
+ *   - bytes the text form cannot hold (trailing octets after the names, a pointer that expands to a name of another
+ *     length): the decoded record, written back without compression, must be the same octets (names compared
+ *     case-insensitively, RFC 4034 §6.2). */
+const char *dns_generic_rdata_check(uint16_t type, const uint8_t *rd, size_t len) {
+    if (len > 65535) return "RDATA is longer than 65535 octets";
+    const dns_rdata_name_layout_t *lay = dns_rdata_name_layout(type);
+    if (lay) {
+        size_t p = lay->skip;
+        if (p > len) return "RDATA is shorter than the fixed part of this type";
+        for (unsigned n = 0; n < lay->nnames; n++) {
+            for (;;) {
+                if (p >= len) return "domain name in RDATA is not terminated";
+                uint8_t l = rd[p++];
+                if (l == 0) break;
+                if (l > 63) return "domain name in RDATA is compressed or has an extended label (RFC 3597 4)";
+                if (len - p < l) return "domain name in RDATA runs past the end of the RDATA";
+                p += l;
+            }
+        }
+    }
+    uint8_t *pkt = malloc(11 + len);
+    uint8_t *back = malloc(65535);
+    uint8_t *want = malloc(len ? len : 1);
+    const char *why = NULL;
+    zone_arena_t a;
+    zone_arena_init(&a);
+    if (!pkt || !back || !want) {
+        why = "out of memory";
+        goto done;
+    }
+    pkt[0] = 0;                                   /* owner: the root */
+    pkt[1] = (uint8_t)(type >> 8); pkt[2] = (uint8_t)type;
+    pkt[3] = 0; pkt[4] = 1;                       /* CLASS IN */
+    pkt[5] = pkt[6] = pkt[7] = pkt[8] = 0;        /* TTL */
+    pkt[9] = (uint8_t)(len >> 8); pkt[10] = (uint8_t)len;
+    if (len) memcpy(pkt + 11, rd, len);
+    dns_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    size_t off = 0;
+    uint16_t t;
+    if (parse_resource_record(pkt, 11 + len, &off, &a, &rec, &t) != 0 || off != 11 + len) {
+        why = "RDATA is not valid for this record type (RFC 3597 5)";
+    } else if (rec.generic_data == NULL) {      /* decoded into text fields: write it back */
+        long n = dns_record_canonical_rdata(&rec, back, 65535);
+        if (len) memcpy(want, rd, len);
+        dns_canonical_downcase_rdata(type, want, len);
+        if (n < 0 || (size_t)n != len || (len && memcmp(back, want, len) != 0))
+            why = "RDATA is not valid for this record type: it has trailing octets or a compressed name (RFC 3597 5)";
+    }
+done:
+    zone_arena_destroy(&a);
+    free(pkt);
+    free(back);
+    free(want);
+    return why;
+}
+
+static int generic_hex_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* RFC 3597 5.  tok[0] is "\#" (or "#": the zone parser's unescaping leaves that), tok[1] the decimal length, tok[2..]
+ * the hex digits, split into any number of tokens.  One implementation for the zone parser and for dag's UPDATE
+ * operands.  The length must equal the number of octets; a fixed-size type must have its size; RDATA the type
+ * does not accept is refused (dns_generic_rdata_check()). */
+const char *dns_generic_rdata_parse(uint16_t type, char *const *tok, int ntok, uint8_t *out, size_t *outlen) {
+    if (ntok < 2 || !tok[0] || !tok[1] || (strcmp(tok[0], "\\#") != 0 && strcmp(tok[0], "#") != 0))
+        return "Generic RDATA (\\#) is malformed";
+    size_t len_tok_len = strlen(tok[1]);
+    if (len_tok_len == 0 || len_tok_len > 5 || strspn(tok[1], "0123456789") != len_tok_len)
+        return "Generic RDATA length (\\#) is not a decimal number";
+    long declared = atol(tok[1]);
+    if (declared < 0 || declared > 65535) return "Generic RDATA length (\\#) out of range (0-65535)";
+    size_t nibbles = 0;
+    for (int j = 2; j < ntok; j++) {
+        for (const char *h = tok[j]; *h; h++) {
+            if (generic_hex_val(*h) < 0) return "Generic RDATA (\\#) contains a non-hexadecimal character";
+            nibbles++;
+        }
+    }
+    if ((nibbles & 1) != 0) return "Generic RDATA (\\#) has an odd number of hex digits";
+    if (nibbles / 2 != (size_t)declared) return "Generic RDATA (\\#) length does not match the declared length";
+    /* Types whose RDATA has a fixed size must not be given in a different size, even in generic form. */
+    int fixed = -1;
+    switch (type) {
+        case 1:   fixed = 4;  break;   /* A */
+        case 28:  fixed = 16; break;   /* AAAA */
+        case 108: fixed = 6;  break;   /* EUI48 */
+        case 109: fixed = 8;  break;   /* EUI64 */
+        case 105: fixed = 6;  break;   /* L32 */
+        case 104: fixed = 10; break;   /* NID */
+        case 106: fixed = 10; break;   /* L64 */
+        default: break;
+    }
+    if (fixed >= 0 && declared != fixed) return "Generic RDATA (\\#) has the wrong length for this fixed-size record type";
+    size_t b = 0;
+    int high = -1;
+    for (int j = 2; j < ntok; j++) {
+        for (const char *h = tok[j]; *h; h++) {
+            int v = generic_hex_val(*h);
+            if (high < 0) high = v;
+            else { out[b++] = (uint8_t)((high << 4) | v); high = -1; }
+        }
+    }
+    /* D15-2, RFC 3597 5: the RDATA must be valid for the type ("PTR \# 0", "NS \# 3 010203" are not). */
+    const char *why = dns_generic_rdata_check(type, out, b);
+    if (why) return why;
+    *outlen = b;
+    return NULL;
 }
 
 int dns_record_dup_rdata(zone_arena_t *arena, dns_record_t *rec) {
@@ -1094,7 +1251,28 @@ size_t dns_name_normalize(const char *in, char *out, size_t cap) {
     return w;
 }
 
-
+size_t dns_name_zone_token(const char *name, char *out, size_t cap) {
+    if (!name || !out || cap == 0) return (size_t)-1;
+    size_t w = 0;
+    for (const char *p = name; *p; p++) {
+        size_t n = 1;
+        bool esc = false;
+        if (*p == '\\') { // 正規形のエスケープ (\. \\ \DDD) はそのまま写す
+            n = (p[1] >= '0' && p[1] <= '9') ? 4 : 2;
+            for (size_t k = 1; k < n; k++)
+                if (p[k] == '\0') return (size_t)-1;
+        } else if (strchr(";\"()$@", *p)) {
+            esc = true;
+        }
+        if (w + n + (esc ? 1 : 0) >= cap) return (size_t)-1;
+        if (esc) out[w++] = '\\';
+        memcpy(out + w, p, n);
+        w += n;
+        p += n - 1;
+    }
+    out[w] = '\0';
+    return w;
+}
 
 static size_t base32hex_decode(const char *in, uint8_t *out, size_t out_cap) {
     static const int8_t map[256] = {
@@ -1901,7 +2079,9 @@ int sig0_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, sig0_k
 
 int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, compress_ctx_t *ctx, size_t max_len) {
     if (!ctx) {
-        long w = write_uncompressed_name(packet_buf, *offset, max_len, name);
+        /* D17-4: the case as written, like the compressed form (RFC 4343 s2-s4: a response keeps the case of the zone data;
+         * the lower-case canonical form is only for DNSSEC, dns_record_canonical_rdata()) */
+        long w = write_uncompressed_name_ext(packet_buf, *offset, max_len, name, false);
         if (w < 0) return -1;
         *offset += w;
         return 0;
@@ -2345,8 +2525,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     break;
                 }
                 if (rec->rdata_count == 0) return -1;
-                /* X-37: RFC 4034 §6.2 item 3 に無い NSAP-PTR の名前は大文字小文字を保つ (DNAME は一覧にある) */
-                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[0], rec_type == 39);
+                /* D17-4: the case as written for every RDATA name (RFC 4343 s2-s4).  RFC 4034 s6.2 item 3 (DNAME is in the
+                 * list, NSAP-PTR is not) only matters for the canonical form, dns_canonical_downcase_rdata() */
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[0], false);
                 if (w < 0) return -1;
                 offset += w;
                 break;
@@ -2407,7 +2588,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 res[offset++] = prio >> 8; res[offset++] = prio & 0xFF;
                 res[offset++] = weight >> 8; res[offset++] = weight & 0xFF;
                 res[offset++] = port >> 8; res[offset++] = port & 0xFF;
-                long w = write_uncompressed_name(res, offset, max_res_len, target);
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, target, false);   /* D17-4 */
                 if (w < 0) return -1;
                 offset += w;
                 break;
@@ -2803,7 +2984,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 res[offset++] = (sig_inc >> 8) & 0xFF; res[offset++] = sig_inc & 0xFF;
                 res[offset++] = key_tag >> 8; res[offset++] = key_tag & 0xFF;
 
-                long w = write_uncompressed_name_ext(res, offset, max_res_len, signer, true);
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, signer, false);   /* D17-4 */
                 if (w < 0) return -1;
                 offset += w;
 
@@ -2900,7 +3081,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 for (int k = 0; k < 3; k++) {
                     if (write_char_string(res, max_res_len, &offset, cstrs[k]) != 0) return -1;
                 }
-                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[5], true);
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[5], false);   /* D17-4 */
                 if (w < 0) return -1;
                 offset += (size_t)w;
                 break;
@@ -3385,10 +3566,10 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 17: { // RP
                 if (rec->rdata_count < 2) return -1;
-                long w1 = write_uncompressed_name(res, offset, max_res_len, rec->rdata[0]);
+                long w1 = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[0], false);   /* D17-4 */
                 if (w1 < 0) return -1;
                 offset += w1;
-                long w2 = write_uncompressed_name(res, offset, max_res_len, rec->rdata[1]);
+                long w2 = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[1], false);
                 if (w2 < 0) return -1;
                 offset += w2;
                 break;
@@ -3399,8 +3580,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 uint16_t pref;
                 if (!parse_u16(rec->rdata[0], &pref)) return -1;
                 res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
-                /* X-37: LP (RFC 6742) は RFC 4034 §6.2 item 3 の一覧に無い: 大文字小文字を保つ */
-                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[1], rec_type != 107);
+                /* D17-4: the case as written for all four (RFC 4343 s2-s4); AFSDB, RT and KX are lower-cased only in the
+                 * canonical form (RFC 4034 s6.2 item 3, dns_canonical_downcase_rdata()); LP (RFC 6742) never */
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[1], false);
                 if (w < 0) return -1;
                 offset += w;
                 break;
@@ -3411,10 +3593,10 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 uint16_t pref;
                 if (!parse_u16(rec->rdata[0], &pref)) return -1;
                 res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
-                long w1 = write_uncompressed_name(res, offset, max_res_len, rec->rdata[1]);
+                long w1 = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[1], false);   /* D17-4 */
                 if (w1 < 0) return -1;
                 offset += w1;
-                long w2 = write_uncompressed_name(res, offset, max_res_len, rec->rdata[2]);
+                long w2 = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[2], false);
                 if (w2 < 0) return -1;
                 offset += w2;
                 break;
@@ -3491,7 +3673,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             case 30: { // NXT (RFC 2535 §5.1): 非圧縮ドメイン名 + シンプルタイプビットマップ
                 // rdata[0] = Next Domain Name (非圧縮、RFC 2535 §5.1 — 圧縮禁止)
                 if (rec->rdata_count < 1) return -1;
-                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[0]);
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[0], false);   /* D17-4 */
                 if (w < 0) return -1;
                 offset += (size_t)w;
                 // Type Bit Map: ビット n がタイプ n に対応 (RFC 2535 §5.2)
@@ -3573,7 +3755,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 // プレフィックス名 (prefix_len > 0 のとき必須, 非圧縮)
                 if (prefix_len > 0) {
                     const char *pfx_name = (rec->rdata_count >= 3) ? rec->rdata[2] : ".";
-                    long w = write_uncompressed_name(res, offset, max_res_len, pfx_name);
+                    long w = write_uncompressed_name_ext(res, offset, max_res_len, pfx_name, false);   /* D17-4 */
                     if (w < 0) return -1;
                     offset += (size_t)w;
                 }
@@ -4833,3 +5015,195 @@ bool parse_query_question_fast(const uint8_t *buf, size_t len, char *qname, size
     return false;
 }
 
+
+/* ============================================================================
+ * Extended AXFR records: the one encoder (see dns_wire.h)
+ * ============================================================================ */
+
+#define XEXT_SCRATCH 65535u
+
+void xext_init(xext_t *x, const char *zone, xext_emit_fn emit, void *ud) {
+    memset(x, 0, sizeof(*x));
+    x->zone = zone;
+    x->emit = emit;
+    x->ud = ud;
+}
+
+void xext_free(xext_t *x) {
+    free(x->scratch);
+    x->scratch = NULL;
+}
+
+static int xext_emit_blob(xext_t *x, uint16_t type, const uint8_t *data, size_t len) {
+    if (len > 0xFFFF) return -1;
+    dns_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.name = (char *)x->zone;
+    rec.type_code = type;
+    rec.class_val = DNS_CLASS_KARIDNS_EXT;
+    rec.class_str = "KARIDNS";
+    rec.generic_data = (uint8_t *)data;
+    rec.generic_len = (uint16_t)len;
+    return x->emit(x->ud, &rec);
+}
+
+static uint8_t *xext_buf(xext_t *x) {
+    if (!x->scratch) x->scratch = malloc(XEXT_SCRATCH);
+    return x->scratch;
+}
+
+int xext_select(xext_t *x, const char *loc_tag, const char *ecs_tag) {
+    const char *r_loc = loc_tag ? loc_tag : "";
+    if (strcasecmp(r_loc, x->cur_loc ? x->cur_loc : "") != 0) {
+        if (xext_emit_blob(x, DNS_TYPE_KARIDNS_LOC_STATE, (const uint8_t *)r_loc, strlen(r_loc)) < 0) return -1;
+        x->cur_loc = loc_tag;
+    }
+    const char *r_ecs = ecs_tag ? ecs_tag : "";
+    if (strcasecmp(r_ecs, x->cur_ecs ? x->cur_ecs : "") != 0) {
+        if (xext_emit_blob(x, DNS_TYPE_KARIDNS_ECS_STATE, (const uint8_t *)r_ecs, strlen(r_ecs)) < 0) return -1;
+        x->cur_ecs = ecs_tag;
+    }
+    return 0;
+}
+
+int xext_finish(xext_t *x) {
+    if (x->cur_loc && *x->cur_loc) {
+        if (xext_emit_blob(x, DNS_TYPE_KARIDNS_LOC_STATE, (const uint8_t *)"", 0) < 0) return -1;
+        x->cur_loc = NULL;
+    }
+    if (x->cur_ecs && *x->cur_ecs) {
+        if (xext_emit_blob(x, DNS_TYPE_KARIDNS_ECS_STATE, (const uint8_t *)"", 0) < 0) return -1;
+        x->cur_ecs = NULL;
+    }
+    return 0;
+}
+
+size_t pack_tag_def_rdata(uint8_t *buf, size_t buf_cap, const ecs_tag_def_t *def) {
+  if (!def || !buf) return 0;
+  size_t tag_len = strlen(def->tag) + 1;
+  if (tag_len + 2 > buf_cap) return 0;
+  memcpy(buf, def->tag, tag_len);
+  size_t off = tag_len;
+  buf[off++] = (def->cidr_count >> 8) & 0xFF;
+  buf[off++] = def->cidr_count & 0xFF;
+  for (int j = 0; j < def->cidr_count; j++) {
+    size_t c_len = strlen(def->cidrs[j].cidr) + 1;
+    if (off + c_len > buf_cap) return 0;
+    memcpy(buf + off, def->cidrs[j].cidr, c_len);
+    off += c_len;
+  }
+  return off;
+}
+
+int xext_emit_tagdef(xext_t *x, bool ecs, const ecs_tag_def_t *def) {
+    uint8_t *buf = xext_buf(x);
+    if (!buf) return -1;
+    size_t dlen = pack_tag_def_rdata(buf, XEXT_SCRATCH, def);
+    if (dlen == 0) return -1;      /* a definition that does not fit one RR: the transfer fails rather than serving a different zone */
+    return xext_emit_blob(x, ecs ? DNS_TYPE_KARIDNS_ECS_TAGDEF : DNS_TYPE_KARIDNS_LOC_TAGDEF, buf, dlen);
+}
+
+int xext_emit_trusted(xext_t *x, char *const *list, int count) {
+    if (count <= 0 || !list) return 0;
+    uint8_t *buf = xext_buf(x);
+    if (!buf) return -1;
+    if (count > 255) count = 255;
+    size_t off = 0;
+    buf[off++] = (uint8_t)count;
+    for (int i = 0; i < count; i++) {
+        if (!list[i]) continue;
+        size_t slen = strlen(list[i]);
+        if (slen > 255) slen = 255;
+        if (off + 1 + slen > XEXT_SCRATCH) break;
+        buf[off++] = (uint8_t)slen;
+        memcpy(&buf[off], list[i], slen);
+        off += slen;
+    }
+    return xext_emit_blob(x, DNS_TYPE_KARIDNS_ECS_TRUSTED, buf, off);
+}
+
+int xext_emit_locdef(xext_t *x, const char code[2], uint8_t prefix_bits, const uint8_t network[4]) {
+    uint8_t b[7];
+    b[0] = (uint8_t)code[0];
+    b[1] = (uint8_t)code[1];
+    b[2] = prefix_bits;
+    memcpy(&b[3], network, 4);
+    return xext_emit_blob(x, DNS_TYPE_KARIDNS_TINYDNS_LOCDEF, b, sizeof(b));
+}
+
+int xext_emit_soa_set(xext_t *x, uint16_t n) {
+    uint8_t b[3];
+    b[0] = 0x01;                        /* bit 0: the opening and closing SOA is not zone data */
+    b[1] = (uint8_t)(n >> 8);
+    b[2] = (uint8_t)n;
+    return xext_emit_blob(x, DNS_TYPE_KARIDNS_SOA_SET, b, sizeof(b));
+}
+
+int xext_emit_settings(xext_t *x, const char *text, size_t len) {
+    if (!text || len == 0 || len > KARIDNS_SETTINGS_MAX) return -1;
+    return xext_emit_blob(x, DNS_TYPE_KARIDNS_SETTINGS, (const uint8_t *)text, len);
+}
+
+/* The wrapper record around the RR written at tmp_wire[0, tmp_off) (owner, fixed fields, RDATA compressed against
+ * tmp_wire itself): the original TYPE / CLASS / TTL / RDATA, the tinydns location and time stamp. */
+bool wrap_tinydns_wire(const uint8_t *tmp_wire, uint16_t tmp_off, const char loc[2], int64_t tinydns_ttd,
+                       bool countdown, const char *name, uint32_t ttl_value,
+                       dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap) {
+  size_t p = 0;
+  if (skip_wire_name(tmp_wire, tmp_off, 0, &p) != 0) return false;
+  if (p + 10 > tmp_off) return false;
+  uint16_t orig_type = (tmp_wire[p] << 8) | tmp_wire[p+1];
+  uint16_t orig_class = (tmp_wire[p+2] << 8) | tmp_wire[p+3];
+  uint32_t orig_ttl = ((uint32_t)tmp_wire[p+4] << 24) | ((uint32_t)tmp_wire[p+5] << 16) | ((uint32_t)tmp_wire[p+6] << 8) | tmp_wire[p+7];
+  uint16_t orig_rdlen = (tmp_wire[p+8] << 8) | tmp_wire[p+9];
+  if (p + 10 + orig_rdlen > tmp_off) return false;
+  const uint8_t *orig_rdata = &tmp_wire[p+10];
+
+  size_t total_wrap_len = 21 + orig_rdlen;
+  if (total_wrap_len > wrap_buf_cap) return false;
+
+  wrap_buf[0] = (orig_type >> 8) & 0xFF;
+  wrap_buf[1] = orig_type & 0xFF;
+  wrap_buf[2] = (orig_class >> 8) & 0xFF;
+  wrap_buf[3] = orig_class & 0xFF;
+  wrap_buf[4] = (orig_ttl >> 24) & 0xFF;
+  wrap_buf[5] = (orig_ttl >> 16) & 0xFF;
+  wrap_buf[6] = (orig_ttl >> 8) & 0xFF;
+  wrap_buf[7] = orig_ttl & 0xFF;
+  wrap_buf[8] = (uint8_t)loc[0];
+  wrap_buf[9] = (uint8_t)loc[1];
+  uint64_t ttd = (uint64_t)tinydns_ttd;
+  for (int b = 0; b < 8; b++) {
+    wrap_buf[10 + b] = (ttd >> ((7 - b) * 8)) & 0xFF;
+  }
+  wrap_buf[18] = countdown ? 1 : 0;
+  wrap_buf[19] = (orig_rdlen >> 8) & 0xFF;
+  wrap_buf[20] = orig_rdlen & 0xFF;
+  if (orig_rdlen > 0) {
+    memcpy(&wrap_buf[21], orig_rdata, orig_rdlen);
+  }
+
+  memset(out_wrap, 0, sizeof(*out_wrap));
+  out_wrap->name = (char *)name;
+  out_wrap->type_code = DNS_TYPE_KARIDNS_TINYDNS_WRAP;
+  out_wrap->class_val = DNS_CLASS_KARIDNS_EXT;
+  out_wrap->class_str = "KARIDNS";
+  out_wrap->ttl_value = ttl_value;
+  out_wrap->generic_data = wrap_buf;
+  out_wrap->generic_len = total_wrap_len;
+  return true;
+}
+
+bool wrap_tinydns_record(const dns_record_t *rec, dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap) {
+  if (!rec || !out_wrap || !wrap_buf) return false;
+  uint8_t tmp_wire[4096];
+  uint16_t tmp_off = 0;
+  compress_ctx_t dummy_comp;
+  memset(&dummy_comp, 0, sizeof(dummy_comp));
+  compress_ctx_init_packet(&dummy_comp);
+  if (serialize_dns_record(tmp_wire, sizeof(tmp_wire), &tmp_off, (dns_record_t *)rec, &dummy_comp, NULL, 0xFFFFFFFF) < 0) {
+    return false;
+  }
+  return wrap_tinydns_wire(tmp_wire, tmp_off, rec->tinydns_loc, (int64_t)rec->tinydns_ttd, rec->tinydns_ttl_countdown,
+                           rec->name, rec->ttl_value, out_wrap, wrap_buf, wrap_buf_cap);
+}

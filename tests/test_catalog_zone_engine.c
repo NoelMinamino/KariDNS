@@ -23,7 +23,7 @@
 void free_catalog_desired_list(catalog_member_id_t *list, int count);
 
 // Mock globals
-int g_control_kq = -1;
+_Atomic int g_control_kq = -1;
 int g_notify_ipc[2] = {-1, -1};
 int g_broker_sock = -1;
 config_rcu_t g_config_db;

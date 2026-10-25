@@ -42,9 +42,10 @@
 #include <sys/wait.h>
 #include <netinet/in.h>
 #include "test_zone_slots.h"
+#include "tst_entry.h"
 
 // Mock globals
-int g_control_kq = -1;
+_Atomic int g_control_kq = -1;
 int g_notify_ipc[2] = {-1, -1};
 int g_broker_sock = -1;
 config_rcu_t g_config_db;
@@ -668,10 +669,20 @@ static void sw_setup_all(const char *conf, bool optout) {
     sw_finish_view();
 }
 
+/* send_notify_to_all() takes the zone entry: the one of the active snapshot, or a stand-in when the zone is not there */
+static void sw_notify(const char *domain, const char *view) {
+    zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
+    zone_db_entry_t *e = (snap && view) ? snapshot_get_zone_in_view(snap, view, domain) : NULL;
+    zone_db_entry_t *stand = e ? NULL : create_new_zone_entry(domain, view ? view : "");
+    send_notify_to_all(e ? e : stand);
+    if (stand) free_zone_db_entry(stand);
+    release_zone_snapshot(snap);
+}
+
 static void sw_prelink_and_cache(additional_from_auth_t policy) {
     for (int i = 0; i < g_sw.zone_count; i++) {
         zone_glue_track_build(&g_sw.arena[i].ver, g_sw.entry[i].domain, &g_sw.view, policy);
-        build_zone_response_cache(&g_sw.arena[i].ver, g_sw.cfg, NULL, g_sw.entry[i].domain);
+        build_zone_response_cache(&g_sw.arena[i].ver, g_sw.cfg, tst_entry(NULL, g_sw.entry[i].domain));
     }
 }
 
@@ -1848,14 +1859,14 @@ static void test_snapshot_catalog_sequence(void) {
         fcntl(sp[1], F_SETFL, O_NONBLOCK);
         int saved0 = g_notify_ipc[0], saved1 = g_notify_ipc[1];
         g_notify_ipc[0] = sp[0]; g_notify_ipc[1] = sp[1];
-        send_notify_to_all("notify.example.", "internal");
-        send_notify_to_all("notify.example.", "external");
-        send_notify_to_all("notify.example.", NULL);
-        send_notify_to_all("static.example.", "internal");
-        send_notify_to_all("unknown.example.", "nope");
-        for (int i = 0; i < 300; i++) send_notify_to_all("notify.example.", "internal");  /* fill -> EAGAIN */
+        sw_notify("notify.example.", "internal");
+        sw_notify("notify.example.", "external");
+        sw_notify("notify.example.", NULL);
+        sw_notify("static.example.", "internal");
+        sw_notify("unknown.example.", "nope");
+        for (int i = 0; i < 300; i++) sw_notify("notify.example.", "internal");  /* fill -> EAGAIN */
         close(sp[0]);
-        send_notify_to_all("notify.example.", "internal");                             /* peer gone */
+        sw_notify("notify.example.", "internal");                             /* peer gone */
         close(sp[1]);
         g_notify_ipc[0] = saved0; g_notify_ipc[1] = saved1;
     }

@@ -640,6 +640,16 @@ static void check_flags(const zone_arena_t *a, const zone_image_t *img) {
 }
 
 static void check_ext(const zone_arena_t *a, const zone_image_t *img, const uint32_t *map) {
+    /* ZONE_IMAGE_F_VIEW: set iff some RR is restricted (an ext[] entry that only keeps an owner spelling does not count; a
+     * standard IXFR of such a zone stays incremental) */
+    bool restricted = false;
+    for (size_t i = 0; i < a->count; i++) {
+        const dns_record_t *r = &a->records[i];
+        if (map[i] != ZONE_IMAGE_NONE && (r->tinydns_ttd || r->tinydns_ttl_countdown || r->tinydns_loc[0] || r->tinydns_loc[1] ||
+                                          r->ecs_subnet_tag || r->bind_location_tag))
+            restricted = true;
+    }
+    CHECK(((img->flags & ZONE_IMAGE_F_VIEW) != 0) == restricted);
     for (size_t i = 0; i < a->count; i++) {
         const dns_record_t *r = &a->records[i];
         if (map[i] == ZONE_IMAGE_NONE) continue;
@@ -700,9 +710,7 @@ static void check_thaw(const zone_arena_t *a, const zone_image_t *img, const uin
         uint16_t oa = 0, ob = 0;
         int ra = serialize_dns_record(ba, sizeof(ba), &oa, x, NULL, NULL, 0xFFFFFFFFu);
         int rb = serialize_dns_record(bb, sizeof(bb), &ob, y, NULL, NULL, 0xFFFFFFFFu);
-        if (x->type_code != 14) { /* MINFO is lowercased without a context in both; compare with a context below */
-            CHECK(ra == rb && oa == ob && memcmp(ba, bb, oa) == 0);
-        }
+        CHECK(ra == rb && oa == ob && memcmp(ba, bb, oa) == 0);      /* D17-4: every type keeps the case as written, MINFO too */
         compress_ctx_t c1, c2;
         compress_ctx_init(&c1);
         compress_ctx_init(&c2);
@@ -1163,6 +1171,147 @@ static void run_perm(void) {
     free_zone(&z);
 }
 
+/* B8t-1: several apex SOA RRs with attributes: the reference SOA, the SOA a client sees, ZONE_IMAGE_F_SOA_ATTR, the serial rule */
+static bool soa_mname_is(const zone_image_t *img, uint32_t rr, const char *mname) {
+    char m[DNS_NAME_TEXT_SIZE];
+    return rr != ZONE_IMAGE_NONE && zone_image_soa(img, rr, m, sizeof(m), NULL, 0, NULL) == 0 && strcasecmp(m, mname) == 0;
+}
+
+static void run_soa_set(void) {
+    g_label = "soa set";
+    static const char *DATA =
+        "%in:127.0.0.1\n%ex:10.0.0.0/8\n"
+        "Zss.test:ns1.in.ss.test.:h.ss.test.:5:7200:3600:1209600:300:300::in\n"
+        "Zss.test:ns1.ex.ss.test.:h.ss.test.:5:7200:3600:1209600:300:300::ex\n"
+        "Zss.test:ns1.all.ss.test.:h.ss.test.:5:7200:3600:1209600:300:300:\n"
+        "&ss.test::ns1.ss.test:300\n+ns1.ss.test:192.0.2.1:300\n";
+    zone_t z;
+    CHECK(load_zone(&z, DATA, "ss.test.", NULL, true));
+    if (!z.ok) return;
+    char err[256];
+    CHECK(zone_arena_check_soa_set(&z.a, "ss.test.", err, sizeof(err)) == 0);
+    const dns_record_t *ref = zone_arena_reference_soa(&z.a, "ss.test.");
+    CHECK(ref && strcasecmp(ref->rdata[0], "ns1.all.ss.test.") == 0 && !dns_record_is_restricted(ref));
+    zone_image_t *img = zone_image_freeze(&z.a, "ss.test.");
+    CHECK(img != NULL);
+    if (img) {
+        CHECK(img->flags & ZONE_IMAGE_F_SOA_ATTR);
+        /* the reference SOA is the one for everybody although it is the last in file order */
+        CHECK(soa_mname_is(img, zone_image_apex_soa(img), "ns1.all.ss.test."));
+        zone_image_view_t v = { {'i', 'n'}, NULL, NULL, 0 };
+        uint32_t ttl = 0;
+        CHECK(soa_mname_is(img, zone_image_visible_soa(img, &v, &ttl), "ns1.in.ss.test.") && ttl == 300);
+        v.loc[0] = 'e'; v.loc[1] = 'x';
+        CHECK(soa_mname_is(img, zone_image_visible_soa(img, &v, NULL), "ns1.ex.ss.test."));
+        v.loc[0] = 'z'; v.loc[1] = 'z';
+        CHECK(soa_mname_is(img, zone_image_visible_soa(img, &v, NULL), "ns1.all.ss.test."));    /* the unrestricted SOA is seen by all */
+        zone_image_free(img);
+    }
+    free_zone(&z);
+
+    /* every SOA restricted: the reference is the first in file order; a client of no listed location sees none */
+    static const char *ALL_R =
+        "%in:127.0.0.1\n%ex:10.0.0.0/8\n%zz:192.0.2\n"
+        "Zrr.test:ns1.in.rr.test.:h.rr.test.:5:7200:3600:1209600:300:300::in\n"
+        "Zrr.test:ns1.ex.rr.test.:h.rr.test.:5:7200:3600:1209600:300:300::ex\n"
+        "&rr.test::ns1.rr.test:300\n+ns1.rr.test:192.0.2.1:300\n";
+    CHECK(load_zone(&z, ALL_R, "rr.test.", NULL, true));
+    if (!z.ok) return;
+    img = zone_image_freeze(&z.a, "rr.test.");
+    CHECK(img != NULL);
+    if (img) {
+        CHECK(soa_mname_is(img, zone_image_apex_soa(img), "ns1.in.rr.test."));
+        zone_image_view_t v = { {'z', 'z'}, NULL, NULL, 0 };
+        CHECK(zone_image_visible_soa(img, &v, NULL) == ZONE_IMAGE_NONE);
+        v.loc[0] = 0; v.loc[1] = 0;
+        CHECK(zone_image_visible_soa(img, &v, NULL) == ZONE_IMAGE_NONE);
+        zone_image_free(img);
+    }
+    free_zone(&z);
+
+    /* a time stamp is an attribute too: a countdown SOA is visible until it runs out (TTL 2..3600), an activation stamp
+     * in the future hides it until then */
+    static const char *TS =
+        "Ztt.test:ns1.cd.tt.test.:h.tt.test.:5:7200:3600:1209600:300:0:4000000099999999:\n"
+        "Ztt.test:ns1.old.tt.test.:h.tt.test.:5:7200:3600:1209600:300:0:400000003b9aca00:\n"
+        "Ztt.test:ns1.fut.tt.test.:h.tt.test.:5:7200:3600:1209600:300:300:40000000b2d05e00:\n"
+        "&tt.test::ns1.tt.test:300\n+ns1.tt.test:192.0.2.1:300\n";
+    CHECK(load_zone(&z, TS, "tt.test.", NULL, true));
+    if (!z.ok) return;
+    img = zone_image_freeze(&z.a, "tt.test.");
+    CHECK(img != NULL);
+    if (img) {
+        CHECK(img->flags & ZONE_IMAGE_F_SOA_ATTR);
+        time_t cd_end = (time_t)0x99999999LL;
+        zone_image_view_t v = { {0, 0}, NULL, NULL, cd_end - 100 };
+        uint32_t ttl = 0;
+        CHECK(soa_mname_is(img, zone_image_visible_soa(img, &v, &ttl), "ns1.cd.tt.test.") && ttl == 100);
+        v.now = cd_end + 5;                                 /* the countdown is over, the old one too, the future one is not active */
+        CHECK(zone_image_visible_soa(img, &v, NULL) == ZONE_IMAGE_NONE);
+        v.now = (time_t)0xb2d05e00LL + 1;                   /* after the activation of the last */
+        CHECK(soa_mname_is(img, zone_image_visible_soa(img, &v, NULL), "ns1.fut.tt.test."));
+        zone_image_free(img);
+    }
+    free_zone(&z);
+
+    /* BIND $LOCATION on the SOA */
+    static const char *TAGGED =
+        "$ORIGIN tg.test.\n$TTL 300\n"
+        "$LOCATION-TAG office 192.0.2.0/24\n$LOCATION-TAG far 198.51.100.0/24\n"
+        "$LOCATION office\n@ IN SOA ns1.office.tg.test. h 4 7200 3600 1209600 300\n"
+        "$LOCATION far\n@ IN SOA ns1.far.tg.test. h 4 7200 3600 1209600 300\n"
+        "$LOCATION none\n@ IN NS ns1\nns1 IN A 192.0.2.1\n";
+    CHECK(load_zone(&z, TAGGED, "tg.test.", NULL, false));
+    if (!z.ok) return;
+    CHECK(zone_arena_check_soa_set(&z.a, "tg.test.", err, sizeof(err)) == 0);
+    img = zone_image_freeze(&z.a, "tg.test.");
+    CHECK(img != NULL);
+    if (img) {
+        CHECK(img->flags & ZONE_IMAGE_F_SOA_ATTR);
+        zone_image_view_t v = { {0, 0}, "far", NULL, 0 };
+        CHECK(soa_mname_is(img, zone_image_visible_soa(img, &v, NULL), "ns1.far.tg.test."));
+        v.loc_tag = "none-such";
+        CHECK(zone_image_visible_soa(img, &v, NULL) == ZONE_IMAGE_NONE);
+        v.loc_tag = NULL;
+        CHECK(zone_image_visible_soa(img, &v, NULL) == ZONE_IMAGE_NONE);
+        zone_image_free(img);
+    }
+    free_zone(&z);
+
+    /* the serial rule (RFC 2181 s6.1) and the DNSSEC rule */
+    static const char *MISMATCH =
+        "%in:127.0.0.1\n"
+        "Zmm.test:ns1.a.mm.test.:h.mm.test.:1:7200:3600:1209600:300:300::in\n"
+        "Zmm.test:ns1.b.mm.test.:h.mm.test.:2:7200:3600:1209600:300:300:\n&mm.test::ns1.mm.test:300\n";
+    CHECK(load_zone(&z, MISMATCH, "mm.test.", NULL, true));
+    err[0] = 0;
+    CHECK(zone_arena_check_soa_set(&z.a, "mm.test.", err, sizeof(err)) == -1 && strstr(err, "different serials") && strstr(err, "1 and 2"));
+    free_zone(&z);
+    static const char *SIGNED =
+        "$ORIGIN sg.test.\n$TTL 300\n"
+        "$LOCATION-TAG office 192.0.2.0/24\n"
+        "$LOCATION office\n@ IN SOA ns1 h 4 7200 3600 1209600 300\n$LOCATION none\n"
+        "@ IN NS ns1\nns1 IN A 192.0.2.1\n"
+        "@ IN DNSKEY 257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==\n";
+    CHECK(load_zone(&z, SIGNED, "sg.test.", NULL, false));
+    err[0] = 0;
+    CHECK(zone_arena_check_soa_set(&z.a, "sg.test.", err, sizeof(err)) == -1 && strstr(err, "DNSSEC"));
+    free_zone(&z);
+
+    /* a zone with one plain SOA is unchanged: no flag, the SOA is the reference and the visible one */
+    static const char *PLAIN = "$ORIGIN pl.test.\n$TTL 300\n@ IN SOA ns1 h 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n";
+    CHECK(load_zone(&z, PLAIN, "pl.test.", NULL, false));
+    img = zone_image_freeze(&z.a, "pl.test.");
+    CHECK(img != NULL);
+    if (img) {
+        CHECK(!(img->flags & ZONE_IMAGE_F_SOA_ATTR));
+        zone_image_view_t v = { {0, 0}, NULL, NULL, 0 };
+        CHECK(zone_image_apex_soa(img) != ZONE_IMAGE_NONE && zone_image_apex_soa(img) == zone_image_visible_soa(img, &v, NULL));
+        zone_image_free(img);
+    }
+    free_zone(&z);
+}
+
 /* B-1: more than 256 distinct targets (some without addresses, some used twice) and wildcard / DNAME owners */
 static void run_glue_flags(void) {
     g_label = "glue flags";
@@ -1214,6 +1363,87 @@ static void run_glue_flags(void) {
     free_zone(&z);
 }
 
+/* D15-1 (RFC 3597 5: zero-length RDATA is legal).  A secondary reads every RR with parse_resource_record(); an RR of a type
+ * that has no dedicated decoder and RDLENGTH 0 used to come out with generic_data == NULL: nothing to write, so it was
+ * dropped as unencodable (a primary serving "x TYPE65534 \# 0" answered it, its secondary said NXDOMAIN).  It must be an
+ * empty blob that survives dropping, indexing, freeze, thaw, comparison (IXFR diff) and serialization. */
+static void run_empty_rdata_wire(void) {
+    g_label = "empty RDATA";
+    static const char *text =
+        "$ORIGIN e.test.\n$TTL 300\n@ IN SOA ns1 hm 1 3600 600 86400 60\n@ IN NS ns1\nns1 IN A 192.0.2.1\n"
+        "empty IN TYPE65534 \\# 0\nempty IN TYPE65534 \\# 2 0102\nnul IN NULL \\# 0\nx25 IN X25 \\# 0\nlast IN TXT \"z\"\n";
+    zone_t a;
+    CHECK(load_zone(&a, text, "e.test.", ".", false));
+    if (!a.ok) return;
+    size_t n_empty = 0;
+    for (size_t i = 0; i < a.a.count; i++)
+        if (a.a.records[i].generic_data && a.a.records[i].generic_len == 0) n_empty++;
+    CHECK(n_empty == 3);
+
+    /* the secondary: every RR written to the wire and read back the way AXFR-in does it */
+    zone_arena_t b;
+    zone_arena_init(&b);
+    b.records = calloc(a.a.count, sizeof(dns_record_t));
+    b.records_cap = a.a.count;
+    CHECK(b.records != NULL);
+    static uint8_t wire[65535];
+    size_t n_empty_b = 0;
+    for (size_t i = 0; b.records && i < a.a.count; i++) {
+        uint16_t off = 0;
+        CHECK(serialize_dns_record(wire, sizeof(wire), &off, &a.a.records[i], NULL, NULL, 0xFFFFFFFFu) == 0);
+        dns_record_t rec;
+        memset(&rec, 0, sizeof(rec));
+        size_t pos = 0;
+        uint16_t t = 0;
+        CHECK(parse_resource_record(wire, off, &pos, &b, &rec, &t) == 0 && pos == off);
+        b.records[b.count++] = rec;
+        if (a.a.records[i].generic_data && a.a.records[i].generic_len == 0) {
+            CHECK(rec.generic_data != NULL && rec.generic_len == 0 && rec.rdata_count == 0);   /* an empty blob, not "no blob" */
+            n_empty_b++;
+        }
+        CHECK(compare_records(&a.a.records[i], &rec, false));
+        uint8_t canon[64];
+        CHECK(dns_record_canonical_rdata(&rec, canon, sizeof(canon)) >= 0);
+        /* and it is written back byte for byte */
+        uint8_t wire2[65535];
+        uint16_t off2 = 0;
+        CHECK(serialize_dns_record(wire2, sizeof(wire2), &off2, &rec, NULL, NULL, 0xFFFFFFFFu) == 0 && off2 == off &&
+              memcmp(wire, wire2, off) == 0);
+    }
+    CHECK(n_empty_b == 3);
+    CHECK(zone_arena_drop_unencodable(&b, silent_report, NULL) == 0);       /* nothing is dropped any more */
+    CHECK(b.count == a.a.count);
+    /* an IXFR diff sees empty == empty and empty != a one-record-different RDATA */
+    dns_record_t *e0 = NULL, *e2 = NULL;
+    for (size_t i = 0; i < b.count; i++) {
+        if (b.records[i].type_code == 65534 && b.records[i].generic_len == 0) e0 = &b.records[i];
+        if (b.records[i].type_code == 65534 && b.records[i].generic_len == 2) e2 = &b.records[i];
+    }
+    CHECK(e0 && e2 && !compare_records(e0, e2, false) && compare_records(e0, e0, false));
+    CHECK(build_zone_index(&b, true) == 0);
+    zone_image_t *img = zone_image_freeze(&b, "e.test.");
+    CHECK(img != NULL);
+    if (img) {
+        size_t raw_empty = 0;
+        for (uint32_t k = 0; k < img->n_rrs; k++) {
+            uint16_t ty = zone_image_rr_type(img, k);
+            if ((ty == 65534 || ty == 10 || ty == 19) && zone_image_rr_rdlen(img, k) == 0) raw_empty++;
+        }
+        CHECK(raw_empty == 3);
+        zone_arena_t c;
+        zone_arena_init(&c);
+        CHECK(zone_image_thaw(img, &c) == 0 && c.count == b.count);
+        size_t found = 0;
+        for (size_t i = 0; i < b.count; i++)
+            if (record_exists_in_arena(&c, &b.records[i])) found++;
+        CHECK(found == b.count);
+        zone_arena_destroy(&c);
+        zone_image_free(img);
+    }
+    zone_arena_destroy(&b);
+    free_zone(&a);
+}
+
 /* an empty zone, a zone of one RR, and the builder contract */
 static void run_edges(void) {
     g_label = "edges";
@@ -1235,6 +1465,66 @@ static void run_edges(void) {
     zone_arena_destroy(&a);
 }
 
+/* B9a: ALIAS (TYPE 65401, CLASS IN) marks the image and its owner; an ALIAS beside A / AAAA or DNSSEC records is not published; the
+ * Extended AXFR record of the same number (CLASS 65302) is no ALIAS */
+static void run_b9a_alias(void) {
+    g_label = "alias";
+    static const char *OK =
+        "$ORIGIN al.test.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n"
+        "a ALIAS t.target.test.\na TXT \"x\"\nl LUA A \"c\"\nb A 192.0.2.2\n";
+    zone_t z;
+    CHECK(load_zone(&z, OK, "al.test.", NULL, false));
+    if (z.ok) {
+        zone_image_t *img = zone_image_freeze(&z.a, "al.test.");
+        CHECK(img != NULL);
+        if (img) {
+            CHECK(img->flags & ZONE_IMAGE_F_ALIAS);
+            uint32_t a = zone_image_find_name(img, "a.al.test.");
+            uint32_t b = zone_image_find_name(img, "b.al.test.");
+            uint32_t l = zone_image_find_name(img, "l.al.test.");
+            CHECK(a != ZONE_IMAGE_NONE && (zone_image_name_flags(img, a) & ZONE_IMAGE_NAME_ALIAS));
+            CHECK(b != ZONE_IMAGE_NONE && !(zone_image_name_flags(img, b) & ZONE_IMAGE_NAME_ALIAS));
+            CHECK(l != ZONE_IMAGE_NONE && !(zone_image_name_flags(img, l) & ZONE_IMAGE_NAME_ALIAS));   /* LUA is no ALIAS */
+            uint32_t rr = zone_image_rrset_next(img, a, 65401, zone_image_name_first_rr(img, a));
+            CHECK(rr != ZONE_IMAGE_NONE && zone_image_rr_class(img, rr) == 1 && zone_image_rr_rdlen(img, rr) == 15);
+            /* thaw gives the same records back */
+            zone_arena_t t;
+            zone_arena_init(&t);
+            CHECK(zone_image_thaw(img, &t) == 0);
+            size_t n_alias = 0, n_lua = 0;
+            for (size_t i = 0; i < t.count; i++) {
+                n_alias += t.records[i].type_code == 65401 && t.records[i].class_val == 1;
+                n_lua += t.records[i].type_code == 65402 && t.records[i].class_val == 1;
+            }
+            CHECK(n_alias == 1 && n_lua == 1);
+            zone_arena_destroy(&t);
+            zone_image_free(img);
+        }
+        free_zone(&z);
+    }
+    /* no ALIAS: no flag */
+    CHECK(load_zone(&z, "$ORIGIN na.test.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n", "na.test.", NULL, false));
+    if (z.ok) {
+        zone_image_t *img = zone_image_freeze(&z.a, "na.test.");
+        CHECK(img && !(img->flags & ZONE_IMAGE_F_ALIAS));
+        zone_image_free(img);
+        free_zone(&z);
+    }
+    /* refused: the image is not made */
+    static const char *const BAD[] = {
+        "$ORIGIN bad.test.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\na ALIAS t.target.test.\na A 192.0.2.1\n",
+        "$ORIGIN bad.test.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\na ALIAS t.target.test.\nA AAAA 2001:db8::1\n",
+        "$ORIGIN bad.test.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\na ALIAS t.target.test.\n@ DNSKEY 257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==\n",
+        "$ORIGIN bad.test.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\nx TYPE65401 \\# 2 0161\n",
+    };
+    for (size_t i = 0; i < sizeof(BAD) / sizeof(BAD[0]); i++) {
+        CHECK(load_zone(&z, BAD[i], "bad.test.", NULL, false));
+        if (!z.ok) continue;
+        CHECK(zone_image_freeze(&z.a, "bad.test.") == NULL);
+        free_zone(&z);
+    }
+}
+
 int main(void) {
     printf("=== test_zone_image ===\n");
     printf("[TEST] synthetic zones: one line per RR type\n");
@@ -1247,6 +1537,12 @@ int main(void) {
     run_glue_flags();
     printf("[TEST] file order of interleaved owners (B-2)\n");
     run_perm();
+    printf("[TEST] several / restricted apex SOA records (B8t-1)\n");
+    run_soa_set();
+    printf("[TEST] zero-length RDATA read from the wire (D15-1)\n");
+    run_empty_rdata_wire();
+    printf("[TEST] B9a: ALIAS flag and the zone rules at freeze\n");
+    run_b9a_alias();
     printf("[TEST] empty zone\n");
     run_edges();
     printf("[TEST] tests/zones/*.zone\n");

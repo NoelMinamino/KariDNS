@@ -775,6 +775,23 @@ static void test_rfc3597_generic_form(void) {
         { "IN L32 \\# 6 000ac0000201", "000ac0000201" },
         { "IN NID \\# 10 000a00144fffff20ee64", "000a00144fffff20ee64" },
         { "IN L64 \\# 10 000a20010db811401000", "000a20010db811401000" },
+        /* D15-2: a known type may use the generic form when the RDATA is valid for it (RFC 3597 5) */
+        { "IN PTR \\# 5 036e733100", "036e733100" },
+        { "IN NS \\# 5 036E733100", "036e733100" },
+        { "IN CNAME \\# 5 036e733100", "036e733100" },
+        { "IN DNAME \\# 1 00", "00" },
+        { "IN MX \\# 7 000a036e733100", "000a036e733100" },
+        { "IN MX \\# 3 000a00", "000a00" },                                     /* null MX "10 ." */
+        { "IN SRV \\# 11 0001000213c4036e733100", "0001000213c4036e733100" },
+        { "IN SOA \\# 31 036e733100 04686f737400 00000001 00000e10 00000258 00015180 0000003c",
+          "036e73310004686f73740000000001" "00000e10" "00000258" "00015180" "0000003c" },
+        { "IN TXT \\# 4 03616263", "03616263" },
+        { "IN TXT \\# 4 03610062", "03610062" },                               /* D16-1: a NUL octet is legal (RFC 1035 3.3.14) */
+        { "IN HINFO \\# 4 0161 0162", "01610162" },
+        { "IN NULL \\# 0", "" },
+        { "IN TYPE65534 \\# 0", "" },
+        { "IN X25 \\# 0", "" },
+        { "IN RP \\# 2 0000", "0000" },
     };
     for (size_t i = 0; i < N(ok); i++) {
         zt_t z;
@@ -810,6 +827,23 @@ static void test_rfc3597_generic_form(void) {
         { "IN L32 \\# 4 c0000201",          "wrong length for this fixed-size" },
         { "IN NID \\# 8 00144fffff20ee64",  "wrong length for this fixed-size" },
         { "IN L64 \\# 8 20010db811401000",  "wrong length for this fixed-size" },
+        /* D15-2: RDATA that is not valid for a known type is refused (RFC 3597 5), not served as raw octets */
+        { "IN PTR \\# 0",                    "not terminated" },
+        { "IN CNAME \\# 0",                  "not terminated" },
+        { "IN DNAME \\# 0",                  "not terminated" },
+        { "IN NS \\# 3 010203",              "runs past the end" },
+        { "IN NS \\# 2 C00C",                "compressed" },                           /* a pointer has no message to point into */
+        { "IN NS \\# 6 036E733100FF",        "trailing octets" },
+        { "IN MX \\# 1 00",                  "shorter than the fixed part" },
+        { "IN MX \\# 2 000A",                "not terminated" },
+        { "IN SRV \\# 6 000100020003",       "not terminated" },
+        { "IN SOA \\# 5 036E733100",         "not terminated" },
+        { "IN SOA \\# 11 036E73310004686F737400", "not valid for this record type" },   /* names, no timers */
+        { "IN RP \\# 1 00",                  "not terminated" },
+        { "IN TXT \\# 2 0361",               "not valid for this record type" },       /* string longer than the RDATA */
+        { "IN NAPTR \\# 9 00010001000000C000", "compressed" },                         /* replacement is a pointer */
+        { "IN RRSIG \\# 3 000000",           "shorter than the fixed part" },
+        { "IN NSEC \\# 0",                   "not terminated" },
     };
     for (size_t i = 0; i < N(bad); i++) {
         zt_t z;
@@ -817,6 +851,11 @@ static void test_rfc3597_generic_form(void) {
         if (z.rc >= 0) { fprintf(stderr, "must be rejected: %s\n", bad[i].line); assert(0); }
         if (!z.err.error_message || !strstr(z.err.error_message, bad[i].msg)) {
             fprintf(stderr, "%s: wrong message '%s' (want '%s')\n", bad[i].line, z.err.error_message ? z.err.error_message : "-", bad[i].msg);
+            assert(0);
+        }
+        /* the error is reported at the record's own line (after the SOA line), not at the top of the file */
+        if (z.err.error_offset < strlen(SOA_HEAD)) {
+            fprintf(stderr, "%s: error offset %zu is not in the record\n", bad[i].line, z.err.error_offset);
             assert(0);
         }
         zt_free(&z);
@@ -1395,7 +1434,7 @@ static void test_d08_readme_types(void) {
 
 /* ---------------------------------------------------------------- phase 15b: X-16, X-25, X-32, X-37, X-38 */
 static void test_x37_rdata_name_case(void) {
-    printf("[TEST] X-37: RDATA names of types outside RFC 4034 6.2 keep their case...\n");
+    printf("[TEST] X-37 / D17-4: RDATA names keep their case (RFC 4343); the canonical form is separate...\n");
     static const uint8_t ipsec[] = { 10, 3, 2, 2, 'G', 'w', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0, 0x01, 0x03, 0x51 };
     expect_rdata("IN IPSECKEY 10 3 2 Gw.Example. AQNR", ipsec, sizeof(ipsec));
     static const uint8_t talink[] = { 1, 'P', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0, 1, 'n', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
@@ -1408,9 +1447,18 @@ static void test_x37_rdata_name_case(void) {
     expect_rdata("IN NSAP-PTR F.Example.", nsap_ptr, sizeof(nsap_ptr));
     static const uint8_t dsync[] = { 0, 59, 1, 0x14, 0xb4, 1, 'S', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
     expect_rdata("IN DSYNC CDS NOTIFY 5300 S.Example.", dsync, sizeof(dsync));
-    /* types in the RFC 4034 6.2 list are still written in lower case in the uncompressed text path */
-    static const uint8_t afsdb[] = { 0, 1, 1, 'a', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    /* D17-4: the types of the RFC 4034 6.2 list keep their case as well (RFC 4343 s2-s4); only the canonical form below
+     * (dns_canonical_downcase_rdata) lower-cases them */
+    static const uint8_t afsdb[] = { 0, 1, 1, 'A', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
     expect_rdata("IN AFSDB 1 A.Example.", afsdb, sizeof(afsdb));
+    static const uint8_t rp[] = { 1, 'M', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0, 1, 'T', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    expect_rdata("IN RP M.Example. T.Example.", rp, sizeof(rp));
+    static const uint8_t rt[] = { 0, 10, 1, 'R', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    expect_rdata("IN RT 10 R.Example.", rt, sizeof(rt));
+    static const uint8_t kx[] = { 0, 10, 1, 'K', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    expect_rdata("IN KX 10 K.Example.", kx, sizeof(kx));
+    static const uint8_t minfo[] = { 1, 'R', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0, 1, 'E', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    expect_rdata("IN MINFO R.Example. E.Example.", minfo, sizeof(minfo));
     /* the canonical form lower-cases only the listed types */
     uint8_t rd[] = { 0, 1, 1, 'A', 0 };
     dns_canonical_downcase_rdata(18, rd, sizeof(rd));
@@ -1549,6 +1597,112 @@ static void test_x16_x25_compare_records(void) {
     printf("  -> canonical RR comparison passed.\n");
 }
 
+/* ---------------------------------------------------------------- B9a: PowerDNS ALIAS and LUA */
+static bool b9_rd_is(const dns_record_t *r, const uint8_t *want, size_t n) {
+    return r && r->generic_data && r->generic_len == n && memcmp(r->generic_data, want, n) == 0;
+}
+
+static void test_b9a_alias_lua(void) {
+    printf("[TEST] Zone parser: PowerDNS ALIAS and LUA records (B9a)...\n");
+    zt_t z;
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ NS ns\n"
+                "a ALIAS Target.Example.\n"
+                "r ALIAS rel\n"
+                "m 120 IN alias t.example.\n"
+                "l LUA A \";return {'192.0.2.1'}\"\n"
+                "l2 LUA TXT \"a\" \"b\"\n"
+                "l3 lua TYPE99 \"x\"\n"
+                "g TYPE65401 \\# 3 016100\n");
+    ASSERT_PARSED(&z);
+    /* ALIAS: TYPE 65401, CLASS IN, RDATA = the target name uncompressed, case kept (PowerDNS's AXFR form) */
+    static const uint8_t a_rd[] = { 6, 'T', 'a', 'r', 'g', 'e', 't', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    static const uint8_t r_rd[] = { 3, 'r', 'e', 'l', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    static const uint8_t m_rd[] = { 1, 't', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    dns_record_t *a = zt_find(&z, "a.example.", 65401);
+    assert(a && a->class_val == 1 && b9_rd_is(a, a_rd, sizeof(a_rd)));
+    assert(b9_rd_is(zt_find(&z, "r.example.", 65401), r_rd, sizeof(r_rd)));
+    dns_record_t *m = zt_find(&z, "m.example.", 65401);
+    assert(b9_rd_is(m, m_rd, sizeof(m_rd)) && m->ttl_value == 120);
+    assert(dns_type_to_string(65401) && strcmp(dns_type_to_string(65401), "TYPE65401") == 0);
+    /* LUA: the 16-bit type, then the code as <character-string>s: "A" + a string of 21 octets = 00 01 15 ... (PowerDNS's AXFR form) */
+    static const uint8_t l_rd[] = { 0, 1, 21, ';', 'r', 'e', 't', 'u', 'r', 'n', ' ', '{', '\'', '1', '9', '2', '.', '0', '.', '2', '.', '1', '\'', '}' };
+    static const uint8_t l2_rd[] = { 0, 16, 1, 'a', 1, 'b' };
+    static const uint8_t l3_rd[] = { 0, 99, 1, 'x' };
+    static const uint8_t g_rd[] = { 1, 'a', 0 };
+    assert(b9_rd_is(zt_find(&z, "l.example.", 65402), l_rd, sizeof(l_rd)));
+    assert(b9_rd_is(zt_find(&z, "l2.example.", 65402), l2_rd, sizeof(l2_rd)));
+    assert(b9_rd_is(zt_find(&z, "l3.example.", 65402), l3_rd, sizeof(l3_rd)));
+    assert(b9_rd_is(zt_find(&z, "g.example.", 65401), g_rd, sizeof(g_rd)));    /* the generic form reaches the same record */
+    assert(build_zone_index(&z.arena, true) == 0);
+    parse_error_t pe = {0};
+    char why[400];
+    assert(validate_zone_pdns_types(&z.arena, &pe, why, sizeof(why)) == 0);
+    zt_free(&z);
+
+    /* a code string above 255 octets is cut into <character-string>s, as PowerDNS does */
+    {
+        char text[1024];
+        char code[301];
+        memset(code, 'x', 300);
+        code[300] = '\0';
+        snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\nlong LUA A \"%s\"\n", code);
+        zt_load(&z, text);
+        ASSERT_PARSED(&z);
+        dns_record_t *l = zt_find(&z, "long.example.", 65402);
+        assert(l && l->generic_len == 2 + 1 + 255 + 1 + 45 && l->generic_data[2] == 255 && l->generic_data[3 + 255] == 45);
+        zt_free(&z);
+    }
+
+    /* what is refused */
+    static const char *const bad[] = {
+        "x ALIAS\n", "x ALIAS a.example. b.example.\n", "x ALIAS a..example.\n", "x ALIAS .\n", "x ALIAS \\# 3 016100\n",
+        "x LUA\n", "x LUA A\n", "x LUA FOOBAR \"x\"\n", "x LUA AXFR \"x\"\n", "x LUA 0 \"x\"\n",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        char text[256];
+        snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n%s", bad[i]);
+        zt_load(&z, text);
+        if (z.rc >= 0) fprintf(stderr, "B9a: '%s' was accepted\n", bad[i]);
+        assert(z.rc < 0);
+        zt_free(&z);
+    }
+
+    /* the zone rules: ALIAS beside A / AAAA (any spelling of the owner), ALIAS beside DNSSEC records, malformed RDATA of the generic form */
+    static const struct { const char *body; bool ok; const char *msg; } rules[] = {
+        { "x ALIAS t.example.\nx TXT \"t\"\nx MX 10 m.example.\ny LUA A \"c\"\ny A 192.0.2.1\n", true, "" },
+        { "x ALIAS t.example.\nX A 192.0.2.1\n", false, "an A or AAAA record" },
+        { "x ALIAS t.example.\nx AAAA 2001:db8::1\n", false, "an A or AAAA record" },
+        { "x ALIAS t.example.\n@ DNSKEY 257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==\n", false, "DNSSEC" },
+        { "x ALIAS t.example.\nn NSEC o.example. A RRSIG NSEC\n", false, "DNSSEC" },
+        { "x TYPE65401 \\# 3 010161\n", false, "malformed RDATA" },           /* not one name filling the RDATA */
+        { "x TYPE65401 \\# 4 01610000\n", false, "malformed RDATA" },         /* trailing octet */
+        { "x TYPE65402 \\# 2 0001\n", false, "malformed RDATA" },             /* no code */
+        { "x TYPE65402 \\# 4 00010500\n", false, "malformed RDATA" },         /* a string that runs past the end */
+        { "x TYPE65402 \\# 3 000100\n", true, "" },                           /* an empty code string */
+        { "d A 192.0.2.1\n@ DNSKEY 257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==\n", true, "" },   /* no ALIAS */
+    };
+    for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
+        char text[1024];
+        snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n%s", rules[i].body);
+        zt_load(&z, text);
+        ASSERT_PARSED(&z);
+        assert(build_zone_index(&z.arena, true) == 0);
+        int rc = validate_zone_pdns_types(&z.arena, &pe, why, sizeof(why));
+        if ((rc == 0) != rules[i].ok || (!rules[i].ok && !strstr(why, rules[i].msg)))
+            fprintf(stderr, "B9a rule %zu: rc=%d '%s'\n", i, rc, rc ? why : "");
+        assert((rc == 0) == rules[i].ok);
+        if (!rules[i].ok) assert(strstr(why, rules[i].msg) && pe.error_message == why);
+        zt_free(&z);
+    }
+
+    /* $GENERATE accepts the mnemonic */
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-3 g$ ALIAS t$.example.\n");
+    ASSERT_PARSED(&z);
+    assert(zt_count(&z, NULL, 65401) == 3);
+    zt_free(&z);
+    printf("  -> ALIAS / LUA parsing and zone rules passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Zone Parser Path Coverage Tests ===\n");
     test_x37_rdata_name_case();
@@ -1575,6 +1729,7 @@ int main(void) {
     test_include();
     test_tags_and_semantics();
     test_extended_negative_paths();
+    test_b9a_alias_lua();
     printf("=== All Zone Parser Path Coverage Tests PASSED ===\n");
     return 0;
 }

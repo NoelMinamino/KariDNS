@@ -3,9 +3,9 @@
  *
  * Byte parity with serialize_dns_record() (CLAUDE.md Rule 3/4):
  *  - freeze asks serialize_dns_record() itself for the RDATA (no compress_ctx_t, so every name is expanded and
- *    nothing depends on what was written before) and stores those bytes. The only type whose uncompressed output
- *    differs in case from the compressed one is MINFO (write_dns_name_str() lowercases without a context), so it
- *    is rebuilt from the text with the case kept.
+ *    nothing depends on what was written before) and stores those bytes.  Every RDATA name keeps the case as
+ *    written, with or without a context (D17-4, RFC 4343 s2-s4); the lower-case form exists only in
+ *    dns_record_canonical_rdata().
  *  - image_serialize_rr() copies the stored bytes and sends the domain names at the places listed in
  *    dns_rdata_name_layout() through compress_name(), the function serialize_dns_record() uses, in the same order,
  *    so the bytes, the status and the compress_ctx_t table are those of serialize_dns_record().
@@ -32,6 +32,7 @@ _Static_assert(sizeof(zone_image_t) % 8 == 0, "zone_image_t alignment");
 
 #define IMG_MAX_RDLEN 65524u /* 65535 - 11: a root owner and the fixed fields precede the RDATA when captured */
 #define IMG_MAX_PRELINK_TARGETS 256 /* MAX_PRELINK_TARGETS in dns_snapshot_rcu.c */
+static bool image_soa_restricted(const zone_image_t *img);
 #define IMG_FAIL() do { syslog(LOG_ERR, "[Image] freeze failed at dns_zone_image.c:%d", __LINE__); goto out; } while (0)
 
 /* ------------------------------------------------------------------------------------------------------------
@@ -232,6 +233,14 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
     }
     const size_t n = a->count;
     if (n >= 0x7FFFFFFFu) return NULL;
+    {   /* B9a: ALIAS / LUA rules (RDATA, ALIAS beside A/AAAA or DNSSEC records): a zone that breaks them is not published */
+        char why[400];
+        parse_error_t pe;
+        if (validate_zone_pdns_types(a, &pe, why, sizeof(why)) != 0) {
+            syslog(LOG_ERR, "[Image] freeze: %s", why);
+            return NULL;
+        }
+    }
 
     zone_image_t *img = NULL;
     tmp_index_t ix = { 0 };
@@ -241,6 +250,7 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
     zone_image_rr_t *rrs = NULL;
     zone_image_ext_t *exts = NULL;
     size_t n_ext = 0, cap_ext = 0;
+    bool has_view = false;   /* ZONE_IMAGE_F_VIEW */
     uint32_t *canon = NULL, *nsec = NULL, *n3entries = NULL, *glue = NULL, *hashtab = NULL, *perm = NULL;
     zone_image_n3chain_t *n3chains = NULL;
     uint8_t *cap = NULL;
@@ -251,6 +261,7 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
     bool ok = false;
     bool has_wild = false;
     bool has_dname = false;
+    bool has_alias = false;
 
     /* strings area: offset 0 is "none", so the first 8 octets are padding */
     { uint8_t pad[8] = { 0 }; sb_add(&sb, pad, sizeof(pad)); }
@@ -373,18 +384,7 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
         }
         size_t rdlen = ((size_t)cap[9] << 8) | cap[10];
         if (11 + rdlen != len || rdlen > IMG_MAX_RDLEN) IMG_FAIL();
-        const uint8_t *rd = cap + 11;
-        uint8_t minfo[512];
-        if (!raw && r->type_code == 14) {
-            /* serialize_dns_record() lowercases a MINFO name without a context but keeps its case with one */
-            if (r->rdata_count < 2) IMG_FAIL();
-            long w1 = write_uncompressed_name_ext(minfo, 0, sizeof(minfo), r->rdata[0], false);
-            if (w1 < 0) IMG_FAIL();
-            long w2 = write_uncompressed_name_ext(minfo, (size_t)w1, sizeof(minfo), r->rdata[1], false);
-            if (w2 < 0) IMG_FAIL();
-            rd = minfo;
-            rdlen = (size_t)(w1 + w2);
-        }
+        uint8_t *rd = cap + 11;
         rr->rdata_len = (uint16_t)rdlen;
         rr->rdata_off = rdlen ? sb_add(&sb, rd, rdlen) : 0;
 
@@ -400,8 +400,10 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
             else if (ew && wire_name_len(ew, 256) != rwl) alt = true;
             else if (ew && memcmp(ew, rw, (size_t)rwl) != 0) alt = true;
         }
-        bool need_ext = alt || r->tinydns_ttd != 0 || r->tinydns_ttl_countdown || r->tinydns_loc[0] || r->tinydns_loc[1] ||
-                        r->ecs_subnet_tag || r->bind_location_tag;
+        bool restricted = r->tinydns_ttd != 0 || r->tinydns_ttl_countdown || r->tinydns_loc[0] || r->tinydns_loc[1] ||
+                          r->ecs_subnet_tag || r->bind_location_tag;
+        if (restricted) has_view = true;
+        bool need_ext = alt || restricted;
         if (need_ext) {
             if (n_ext == cap_ext) {
                 size_t ncap = cap_ext ? cap_ext * 2 : 8;
@@ -437,6 +439,10 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
             has_dname = true;
         }
         else if (rrs[k].type == 47) names[id].rr_count_flags |= ZONE_IMAGE_NAME_NSEC;
+        else if (rrs[k].type == DNS_TYPE_PDNS_ALIAS && rrs[k].class_val == 1) {   /* not the Extended AXFR record of CLASS 65302 */
+            names[id].rr_count_flags |= ZONE_IMAGE_NAME_ALIAS;
+            has_alias = true;
+        }
     }
     for (uint32_t id = 0; id < n_names; id++) {
         const char *t = ix.names[id].text;
@@ -599,7 +605,7 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
         img->magic = ZONE_IMAGE_MAGIC;
         img->version = ZONE_IMAGE_VERSION;
         img->total_size = (uint32_t)off;
-        img->flags = (a->is_tinydns_format ? ZONE_IMAGE_F_TINYDNS : 0) | (n_ext ? ZONE_IMAGE_F_EXT : 0) | (has_wild ? ZONE_IMAGE_F_WILDCARD : 0) | (has_dname ? ZONE_IMAGE_F_DNAME : 0) | (perm ? ZONE_IMAGE_F_PERM : 0);
+        img->flags = (a->is_tinydns_format ? ZONE_IMAGE_F_TINYDNS : 0) | (n_ext ? ZONE_IMAGE_F_EXT : 0) | (has_view ? ZONE_IMAGE_F_VIEW : 0) | (has_wild ? ZONE_IMAGE_F_WILDCARD : 0) | (has_dname ? ZONE_IMAGE_F_DNAME : 0) | (has_alias ? ZONE_IMAGE_F_ALIAS : 0) | (perm ? ZONE_IMAGE_F_PERM : 0);
         img->off_perm = perm ? (uint32_t)o_perm : 0;
         img->n_names = n_names; img->n_rrs = n_rrs; img->n_ext = (uint32_t)n_ext;
         img->n_canon = (uint32_t)n_canon; img->n_nsec = (uint32_t)a->nsec_count;
@@ -626,6 +632,7 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
         if (perm) memcpy(b + o_perm, perm, (size_t)n_rrs * sizeof(uint32_t));
         if (za.len) memcpy(b + o_zattr, za.p, za.len);
         memcpy(b + o_str, sb.p, sb.len);
+        if (image_soa_restricted(img)) img->flags |= ZONE_IMAGE_F_SOA_ATTR;
     }
     ok = true;
 
@@ -805,7 +812,6 @@ int image_serialize_rr(const zone_image_t *img, uint32_t rr_idx, uint8_t *res, s
             } else {
                 if ((size_t)offset + (size_t)wl > max_res_len) return -1;
                 memcpy(&res[offset], rd + pos, (size_t)wl);
-                if (rec_type == 14) dns_canonical_downcase_rdata(2 /* one name */, &res[offset], (size_t)wl);
                 offset = (uint16_t)(offset + wl);
             }
             pos += (size_t)wl;
@@ -1137,21 +1143,84 @@ const acl_entry_t *zone_image_ecs_trusted(const zone_image_t *img, int *count) {
 
 int zone_image_zattr_load(const zone_image_t *img, zone_arena_t *a) { return thaw_zattr(img, a); }
 
+/* Does the RR have anything that hides it from some client (tinydns location or time stamp, a tag)? An ext[] entry that
+ * only keeps the owner spelling does not. */
+static bool ext_restricts(const zone_image_ext_t *e) {
+    return e && (e->loc[0] != 0 || e->loc[1] != 0 || e->ecs_tag_off != 0 || e->loc_tag_off != 0 || e->ttd != 0);
+}
+
+/* The RRs of one owner are in builder (file) order (zone_image_name_t.first_rr), so "first" below is the first in file order */
 uint32_t zone_image_apex_soa(const zone_image_t *img) {
     if (!img || img->apex_name == ZONE_IMAGE_NONE) return ZONE_IMAGE_NONE;
-    uint32_t first = ZONE_IMAGE_NONE, nsoa = 0;
+    uint32_t first = ZONE_IMAGE_NONE;
     uint32_t end = zone_image_name_first_rr(img, img->apex_name) + zone_image_name_rr_count(img, img->apex_name);
     for (uint32_t k = zone_image_name_first_rr(img, img->apex_name); k < end; k++) {
         if (zone_image_rr_type(img, k) != 6) continue;
-        if (nsoa++ == 0) first = k;
-    }
-    if (nsoa <= 1 || !img->off_perm) return first;
-    /* several SOAs at the apex: the one that comes first in file order */
-    for (uint32_t seq = 0; seq < img->n_rrs; seq++) {
-        uint32_t k = zone_image_seq_rr(img, seq);
-        if (zone_image_rr_name(img, k) == img->apex_name && zone_image_rr_type(img, k) == 6) return k;
+        if (first == ZONE_IMAGE_NONE) first = k;
+        if (!ext_restricts(zone_image_rr_ext(img, k))) return k;
     }
     return first;
+}
+
+/* The one implementation of the tinydns / tag visibility of an RR (tinydns behaviour, djbdns 1.05: a record with a location is
+ * skipped unless it equals the client's; ttl 0 = countdown until the stamp, TTL clamped to 2..3600; ttl != 0 = active only
+ * after the stamp). An RR without ext[] returns at once. */
+bool zone_image_rr_valid(const zone_image_t *img, uint32_t rr, time_t now, const char client_loc[2],
+                         const char *client_ecs_tag, const char *client_loc_tag, uint32_t *effective_ttl) {
+    const zone_image_ext_t *e = zone_image_rr_ext(img, rr);
+    uint32_t ttl = zone_image_rr_ttl(img, rr);
+    if (!e) {
+        *effective_ttl = ttl;
+        return true;
+    }
+    if (e->loc[0] != 0 || e->loc[1] != 0) {
+        if (e->loc[0] != client_loc[0] || e->loc[1] != client_loc[1]) return false;
+    }
+    if (e->ecs_tag_off != 0) {
+        if (client_ecs_tag == NULL || strcasecmp(zone_image_str(img, e->ecs_tag_off), client_ecs_tag) != 0) return false;
+    }
+    if (e->loc_tag_off != 0) {
+        if (client_loc_tag == NULL || strcasecmp(zone_image_str(img, e->loc_tag_off), client_loc_tag) != 0) return false;
+    }
+    time_t ttd = (time_t)e->ttd;
+    if (ttd == 0) {
+        *effective_ttl = ttl;
+        return true;
+    }
+    if (!(e->flags & ZONE_IMAGE_EXT_COUNTDOWN)) {
+        /* the time stamp is the moment the RR becomes active */
+        if (ttd >= now) return false;
+        *effective_ttl = ttl;
+        return true;
+    }
+    /* countdown TTL: the time stamp is the expiry */
+    if (ttd < now) return false;
+    double remaining = difftime(ttd, now);
+    if (remaining < 2.0) remaining = 2.0;
+    if (remaining > 3600.0) remaining = 3600.0;
+    *effective_ttl = (uint32_t)remaining;
+    return true;
+}
+
+uint32_t zone_image_visible_soa(const zone_image_t *img, const zone_image_view_t *v, uint32_t *effective_ttl) {
+    if (!img || img->apex_name == ZONE_IMAGE_NONE) return ZONE_IMAGE_NONE;
+    uint32_t end = zone_image_name_first_rr(img, img->apex_name) + zone_image_name_rr_count(img, img->apex_name);
+    for (uint32_t k = zone_image_name_first_rr(img, img->apex_name); k < end; k++) {
+        uint32_t ttl;
+        if (zone_image_rr_type(img, k) != 6 || !zone_image_rr_visible(img, k, v, &ttl)) continue;
+        if (effective_ttl) *effective_ttl = ttl;
+        return k;
+    }
+    return ZONE_IMAGE_NONE;
+}
+
+/* freeze: ZONE_IMAGE_F_SOA_ATTR when some apex SOA RR is restricted */
+static bool image_soa_restricted(const zone_image_t *img) {
+    if (img->apex_name == ZONE_IMAGE_NONE) return false;
+    uint32_t end = zone_image_name_first_rr(img, img->apex_name) + zone_image_name_rr_count(img, img->apex_name);
+    for (uint32_t k = zone_image_name_first_rr(img, img->apex_name); k < end; k++)
+        if (zone_image_rr_type(img, k) == 6 && ext_restricts(zone_image_rr_ext(img, k))) return true;
+    return false;
 }
 
 /* One RR as a builder record (the way AXFR / UPDATE records look: text RDATA for the types parse_resource_record()
@@ -1240,7 +1309,6 @@ static int thaw_one(const zone_image_t *img, uint32_t k, zone_arena_t *a, uint8_
     uint16_t clen = 0;
     bool same = serialize_dns_record(chk, 65535, &clen, &rec, NULL, ".", 0xFFFFFFFFu) == 0 && clen == 11 + rr->rdata_len &&
                 (rr->rdata_len == 0 || memcmp(chk + 11, zone_image_rr_rdata(img, k), rr->rdata_len) == 0);
-    if (!same && rec.type_code == 14 && rec.rdata_count >= 2) same = true; /* MINFO: lowercased without a context */
     if (!same) {
         const dns_rdata_name_layout_t *lay = dns_rdata_name_layout(rr->type);
         if (lay && lay->compress) {

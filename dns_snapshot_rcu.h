@@ -36,6 +36,8 @@ zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname);
 zone_db_entry_t *find_zone_for_query(view_snapshot_t *view, const char *qname, uint16_t qtype);
 void free_zone_db_entry(zone_db_entry_t *entry);
 void *gc_snapshot_thread(void *arg);
+void gc_snapshot_detach_only(void); /* the Backend, right after fork: its cleanup threads are detached from now on */
+void gc_snapshot_wait_idle(void); /* the process manager calls it before every fork(): no helper thread may be running */
 zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name);
 
 reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg);
@@ -43,7 +45,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
     server_config_t *active_config, 
     const char *catalog_view_name,
     zone_db_entry_t *catalog_entry_to_update,
-    zone_config_t *catalog_cfg,
+    const zone_config_t *catalog_cfg,
     catalog_member_id_t *new_desired_members, int new_desired_count);
 int rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged);
 int rebuild_zone_db_from_config_ext(server_config_t *config, bool skip_unchanged, char *failed, size_t failed_sz);
