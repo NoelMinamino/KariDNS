@@ -228,6 +228,11 @@ register_test "unit" "bin" "test_coverage_sweep_dag" "dag coverage sweeps: every
 register_test "unit" "bin" "test_coverage_sweep_net" "dag network sweeps: UDP/TCP/DoT/DoH fake server, trace/nssearch, AXFR/IXFR, UPDATE, SIG(0) keys, --replay pcap/dnstap"
 register_test "unit" "bin" "test_coverage_sweep_tools" "karicheck lint-rule sweep and karictl control-socket protocol sweep"
 register_test "unit" "bin" "test_db_pgsql" "PostgreSQL driver of karidns-dbloader: conninfo-file checks, schema versions, rows, cursors, change log cursor with interleaved transactions, LISTEN, v1 to v2 migration (B10; SKIP without libpq or a PostgreSQL server)"
+register_test "unit" "bin" "test_db_stream" "KDB1 loader/Backend stream: encoder, framer, decoder and state machine of all message types, one test per rejection rule, byte-at-a-time feeding"
+register_test "unit" "bin" "test_db_registry" "DB zone registry: zone install from AXFR-format messages and its rejection rules, registry commit / delete, shadowing, concurrent readers"
+register_test "unit" "bin" "test_pdns_reader" "PowerDNS 5.1 reader core: every test zone through zone2sql rows and back, per-type row corpus, rejection rules naming records.id, domainmetadata settings, KDB1 encoding"
+register_test "unit" "bin" "test_presigned" "Pre-signed DB zones: NSEC / NSEC3 / Opt-Out zones signed at test time equal the signer byte for byte through zone2sql, reader and KDB1 (SKIP part without dnssec-signzone)"
+register_test "unit" "bin" "test_dag_iter" "dag +trace2 response classification, bailiwick filtering of glue, truncated-packet sweep, named.root and CLI option parsing"
 register_test "unit" "bin" "test_dnstap_engine" "DNSTAP Protobuf encoder, frame sender & ring buffers"
 register_test "unit" "bin" "test_edns_ecs_engine" "EDNS Cookies, EDE error codes & ECS subnet LPM resolution"
 register_test "unit" "bin" "test_rfc_vectors" "RFC 9018 Server Cookie vectors, SipHash-2-4, RFC 4034 key tag & cookie-secret config"
@@ -562,7 +567,7 @@ FAILED_TEST_NAMES=""
 # Ensure unit test binaries are built if category 'unit' is active
 if is_category_selected "unit"; then
     echo "${C_CYAN}==> Ensuring unit test binaries are built...${C_RESET}"
-    for _b in test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_config_directives test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_epoch_rcu test_cidr test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_db_pgsql; do
+    for _b in test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_config_directives test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_epoch_rcu test_cidr test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_db_pgsql test_db_stream test_db_registry test_pdns_reader test_presigned test_dag_iter; do
         if [ ! -x "./${_b}" ]; then
             make "${_b}" >/dev/null 2>&1 || true
         fi

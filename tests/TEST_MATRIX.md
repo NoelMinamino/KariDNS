@@ -396,7 +396,7 @@ The complete inventory of all test targets registered in `tests/run_all_suite.sh
 
 ### 3.13 Built and Run Outside `run_all_suite.sh`
 
-These targets are not registered in `tests/run_all_suite.sh`: `test_dag_iter` runs with `make unit-tests` (`make dag_iter_test`), `test_db_stream` with `make unit-tests` (`make db_stream_test`), `test_db_registry` with `make unit-tests` (`make db_registry_test`), `test_pdns_reader` with `make unit-tests` (`make pdns_reader_test`), `test_presigned` with `make unit-tests` (`make presigned_test`), `test_db_sqlite3` with `make unit-tests` (`make db_sqlite3_test`), `test_db_pgsql` with `make unit-tests` (`make db_pgsql_test`; SKIP without libpq or a PostgreSQL server), and the libFuzzer harnesses run with `make fuzz_dag_all` / `sh tests/run_fuzz_smoke_test.sh dag`.
+These targets are not registered in `tests/run_all_suite.sh`: `test_db_sqlite3` runs with `make unit-tests` (`make db_sqlite3_test`; it needs the `tests/db` argument and is left out of the coverage gate until karidns-dbloader itself is counted), and the libFuzzer harnesses run with `make fuzz_dag_all` / `sh tests/run_fuzz_smoke_test.sh dag`.
 
 | ID | Test Target | Subsystems / Files | RFC / Spec | Test Classification | Verification Objective |
 |:---:|:---|:---|:---|:---|:---|
