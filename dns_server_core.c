@@ -4612,12 +4612,6 @@ STATIC_TEST int g_pid_fd = -1;
 STATIC_TEST volatile sig_atomic_t g_supervisor_should_exit = 0;
 STATIC_TEST volatile sig_atomic_t g_supervisor_got_sighup = 0;
 
-#if defined(__FreeBSD__) || defined(__linux__) || defined(__APPLE__)
-#ifdef __clang__
-__attribute__((weak)) int __llvm_profile_write_file(void);
-#endif
-#endif
-
 /* X-01: ハンドラはどのスレッドでも動くので、volatile sig_atomic_t ではなくロックフリーの
  * atomic にする (C11 7.14.1.1 はハンドラと割り込まれたコードの間しか定めない)。 */
 STATIC_TEST _Atomic int g_backend_should_exit = 0;
@@ -4632,11 +4626,7 @@ STATIC_TEST void backend_sig_handler(int sig) {
       atomic_load_explicit(&g_control_signals_ready, memory_order_acquire)) {
     return;
   }
-#ifdef __clang__
-  if (__llvm_profile_write_file) {
-    __llvm_profile_write_file();
-  }
-#endif
+  backend_profile_flush();
   _exit(0);
 }
 
