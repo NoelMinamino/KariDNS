@@ -606,5 +606,25 @@ const char *strchr_unescaped(const char *s, char c) {
     return NULL;
 }
 
+/* ThreadSanitizer builds only: built-in suppressions (used without any TSAN_OPTIONS).  The system libcrypto is not built
+ * with TSan, so the synchronization inside it (OpenSSL's run-once initialization and its atomics) is invisible, and an
+ * interceptor it calls (bcmp, memcpy, ...) may be reported as a race; one such report came from two loader workers that
+ * started SHA-256 at the same time.  called_from_lib silences only interceptors called from libcrypto: races in KariDNS's
+ * own code are still reported. */
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define KARIDNS_TSAN_BUILD 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#define KARIDNS_TSAN_BUILD 1
+#endif
+#ifdef KARIDNS_TSAN_BUILD
+const char *__tsan_default_suppressions(void);
+const char *__tsan_default_suppressions(void) {
+    return "called_from_lib:libcrypto.so\n";
+}
+#endif
+
 
 
