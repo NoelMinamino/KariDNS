@@ -706,6 +706,9 @@ unit-tests: cidr_test tinydns_test asan_test include_test config_directives_test
 #   make unit-tests-asan                 # leak detection off (default)
 #   make unit-tests-asan UT_ASAN_LEAKS=1 # also enable LeakSanitizer
 UT_ASAN_LEAKS ?= 0
+# each binary of unit-tests-asan gets at most UT_TIMEOUT seconds; a hung one prints its thread backtraces and fails
+# (tests/run_unit_with_watchdog.sh) instead of blocking CI until the job timeout
+UT_TIMEOUT ?= 300
 UT_ASAN_CFLAGS = -O1 -g -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -DSANITIZER_BUILD -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -fPIE -DKARIDNS_VERSION=\"$(VERSION)\" $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
 UT_ASAN_LDFLAGS = -fsanitize=address,undefined -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS)
 
@@ -857,7 +860,7 @@ unit-tests-asan: $(UT_ASAN_BINS)
 	@rc=0; for t in $(UT_ASAN_BINS); do \
 	  echo "=== $$t"; \
 	  ASAN_OPTIONS="detect_leaks=$(UT_ASAN_LEAKS):abort_on_error=0:print_summary=1" \
-	  UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" ./$$t || { echo "*** FAILED: $$t"; rc=1; }; \
+	  UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" sh tests/run_unit_with_watchdog.sh $(UT_TIMEOUT) ./$$t || { echo "*** FAILED: $$t"; rc=1; }; \
 	done; exit $$rc
 
 # --- Portable subset: unit tests that build and run on Linux/macOS without FreeBSD-only APIs
