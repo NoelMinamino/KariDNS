@@ -987,7 +987,11 @@ int dns_record_dup_rdata(zone_arena_t *arena, dns_record_t *rec) {
 // TSIG ヘルパー
 // ============================================================================
 
-static _Thread_local uint8_t g_tsig_pre_mac_buf[68000];
+/* TSIG の MAC 計算の入力 (RFC 8945 §4.3.3) を並べる作業領域の大きさ。呼び出しごとにスタックに置く
+ * (thread stack は 2 MB)。_Thread_local にしていた頃は、短命な AXFR ワーカーが終わった後に libthr が
+ * TLS ブロックを次のスレッドへ使い回し、ThreadSanitizer が実在しない競合を報告していた。
+ * これを超える入力は malloc する (hot path の通常の応答は収まる)。 */
+#define TSIG_PRE_MAC_STACK 68000
 
 int const_time_memcmp(const void *a, const void *b, size_t len) {
     const unsigned char *p1 = a; const unsigned char *p2 = b;
@@ -1497,9 +1501,10 @@ int tsig_sign_packet_ex(uint8_t *packet, size_t *packet_len, size_t max_len, tsi
                        + (tsig_error == 18 ? 6 : 0);
 
     uint8_t *pre_mac = NULL;
-    bool use_malloc = pre_mac_cap > sizeof(g_tsig_pre_mac_buf);
+    uint8_t pre_mac_stack[TSIG_PRE_MAC_STACK];
+    bool use_malloc = pre_mac_cap > sizeof(pre_mac_stack);
     if (use_malloc) pre_mac = malloc(pre_mac_cap);
-    else pre_mac = g_tsig_pre_mac_buf;
+    else pre_mac = pre_mac_stack;
     if (!pre_mac) return -1;
     size_t offset = 0;
     if (prior_mac_len && *prior_mac_len > 0) {
@@ -1720,9 +1725,10 @@ int tsig_verify_packet_ex(const uint8_t *packet, size_t packet_len, tsig_key_t *
                        + last_rr_offset + keyname_wire_len + 6 + alg_wire_len + 8 + 4 + rr.other_len;
 
     uint8_t *pre_mac = NULL;
-    bool use_malloc = pre_mac_cap > sizeof(g_tsig_pre_mac_buf);
+    uint8_t pre_mac_stack[TSIG_PRE_MAC_STACK];
+    bool use_malloc = pre_mac_cap > sizeof(pre_mac_stack);
     if (use_malloc) pre_mac = malloc(pre_mac_cap);
-    else pre_mac = g_tsig_pre_mac_buf;
+    else pre_mac = pre_mac_stack;
     if (!pre_mac) return -1;
 
     size_t p_offset = 0;
