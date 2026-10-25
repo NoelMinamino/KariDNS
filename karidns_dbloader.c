@@ -1339,6 +1339,17 @@ static void *worker_main(void *arg) {
         pool_fail(p, w, rc == DB_ERR_RETRY ? EXIT_RETRY : EXIT_ERROR);
         return NULL;
     }
+    /* B11b: the driver learns which optional tables the source has (has_ext, ...) from check_schema(), as in run_view(); a worker
+     * that skipped it read the zones one by one (bulk off) with scan_ext() failing "the ... tables do not exist" on a database that
+     * has them, so a reload of two or more zones with loader-threads > 1 failed as a whole */
+    db_schema_info_t si;
+    memset(&si, 0, sizeof(si));
+    if ((rc = w->drv->check_schema(w->conn, &si)) != 0) {
+        pool_fail(p, w, db_err_c(w->drv, w->conn, w->errtext, sizeof(w->errtext), rc, "schema"));
+        w->drv->close(w->conn);
+        w->conn = NULL;
+        return NULL;
+    }
     if ((rc = w->drv->begin_snapshot(w->conn)) != 0) {
         pool_fail(p, w, db_err_c(w->drv, w->conn, w->errtext, sizeof(w->errtext), rc, "snapshot"));
         w->drv->close(w->conn);

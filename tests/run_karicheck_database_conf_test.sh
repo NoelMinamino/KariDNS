@@ -141,6 +141,24 @@ expect "server-id of 70 bytes (the column holds 64)" "$T/c.conf" "Syntax error"
 conf "$T/c.conf" "driver postgresql; conninfo-file \"$T/ci\"; loader-user \"$USER_OK\"; loader-path \"$T/dbl\"; server-id \"\";"
 expect "empty server-id" "$T/c.conf" "Syntax error"
 
+echo "== several servers and alias-resolver (B11b, D-B11-3: ALIAS answers may differ between servers)"
+ar_warns() {   # ar_warns DESCRIPTION DRIVERSTATEMENTS DBBLOCK-STATEMENT OPTIONS-STATEMENT WANT(yes|no)
+    printf 'options {\n  user "%s";\n  %s\n  database { %s loader-user "%s"; loader-path "%s"; %s };\n};\nzone "z.test" { type primary; file "%s/z.zone"; };\n' \
+        "$USER_OK" "$4" "$2" "$USER_OK" "$T/dbl" "$3" "$T" > "$T/c.conf"
+    out=$(run "$T/c.conf")
+    if printf '%s\n' "$out" | grep -q "alias-resolver expands ALIAS records"; then got=yes; else got=no; fi
+    if [ "$got" = "$5" ]; then ok "$1: warning $got"; else bad "$1: warning $got, wanted $5" "$out"; fi
+}
+PGD="driver postgresql; conninfo-file \"$T/ci\";"
+ar_warns "server-id and a database alias-resolver" "$PGD" 'server-id "ns1"; alias-resolver { 192.0.2.53; };' '' yes
+ar_warns "server-id and an options alias-resolver" "$PGD" 'server-id "ns1";' 'alias-resolver { 192.0.2.53; };' yes
+ar_warns "server-id and both" "$PGD" 'server-id "ns1"; alias-resolver { 192.0.2.53; 2001:db8::53; };' 'alias-resolver { 192.0.2.54; };' yes
+ar_warns "an alias-resolver without server-id (a single server, or the host name)" "$PGD" 'alias-resolver { 192.0.2.53; };' '' no
+ar_warns "server-id without an alias-resolver" "$PGD" 'server-id "ns1";' '' no
+ar_warns "sqlite3 (server-id is ignored there)" "driver sqlite3; database-file \"$T/wal.db\";" 'server-id "ns1"; alias-resolver { 192.0.2.53; };' '' no
+out=$(run "$T/c.conf")
+printf '%s\n' "$out" | grep -q "server-id is for driver postgresql" && ok "sqlite3: the server-id warning is the one given" || bad "sqlite3: no server-id warning" "$out"
+
 echo "== syntax"
 conf "$T/c.conf" "driver sqlite3; database-file \"$T/wal.db\"; poll-interval 99;"
 expect "poll-interval out of range" "$T/c.conf" "Syntax error"

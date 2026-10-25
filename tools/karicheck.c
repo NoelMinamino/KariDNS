@@ -2064,6 +2064,14 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
                                    "a server with reload requests (karidns_reload_requests) cannot report its status; set server-id\n", n);
             }
         }
+        /* B11b (D-B11-3): server-id is the signal that several servers may read this database.  An alias-resolver expands ALIAS
+         * records at query time, so what each server answers for an ALIAS name depends on its resolver and the moment of the lookup;
+         * the SOA serials and the zone transfers (which carry the ALIAS RR itself) stay the same.  (A resolver that a zone's profile
+         * text names is not visible here.  LUA records are never run, so they are the same everywhere.) */
+        if (db->server_id && (db->alias_resolver_count > 0 || cfg->alias_resolvers_count > 0))
+            kc_warning(&t, "database: server-id is set and alias-resolver expands ALIAS records: the A and AAAA answers at an ALIAS name depend on "
+                           "the resolver and the moment of the lookup, so two servers that share this database can answer differently "
+                           "(SOA serials and zone transfers are the same); see karidns(8) \"Several servers on one PostgreSQL database\"\n");
     }
     return t.errors;
 }
