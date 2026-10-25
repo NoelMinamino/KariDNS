@@ -1,6 +1,9 @@
 -- karidns_ext.sqlite3.sql - the KariDNS extension tables and the change-log triggers for a PowerDNS 5.1 gsqlite3 database
 -- (beta design 3.7, 5.1, 6; milestones B6a, B10).  Schema version 2.
 --
+-- Manual: docs/karidns-dbloader.md (the schema and trigger files, the privileges, the drivers) and the database chapter of
+-- docs/karidns.md.  The packages karidns-sqlite3, karidns-postgresql and karidns-db install this file in /usr/local/share/karidns/db/.
+--
 -- Apply it once, as the owner of the database, after the PowerDNS schema (schema.sqlite3.sql):
 --     sqlite3 /var/db/karidns/zones.sqlite3 < karidns_ext.sqlite3.sql
 -- It can be applied again (CREATE ... IF NOT EXISTS); the version row is only inserted once.

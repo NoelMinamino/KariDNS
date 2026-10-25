@@ -1,6 +1,9 @@
 -- karidns_ext_v1_to_v2.sqlite3.sql - converts the KariDNS extension tables of a SQLite3 database from schema version 1
 -- (db/karidns_ext.sqlite3.sql of milestone B6a..B9) to version 2 (milestone B10).
 --
+-- Manual: docs/karidns-dbloader.md (the schema and trigger files, the privileges, the drivers) and the database chapter of
+-- docs/karidns.md.  The packages karidns-sqlite3, karidns-postgresql and karidns-db install this file in /usr/local/share/karidns/db/.
+--
 -- Apply it once, as the owner of the database, while nothing else writes to it:
 --     sqlite3 /var/db/karidns/zones.sqlite3 < karidns_ext_v1_to_v2.sqlite3.sql
 -- Applying it to a version 2 database rebuilds the table once more with the same content and the same order; it changes nothing.

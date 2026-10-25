@@ -198,6 +198,10 @@ typedef struct db_driver {
      * has_table_privilege() / has_column_privilege() show them.  Call it after open(), before check_schema() (which stops at the first
      * missing column).  0, or -1 / DB_ERR_RETRY with db_errmsg(). */
     int (*schema_findings)(db_conn_t *c, const db_check_opts_t *o, db_finding_cb cb, void *ud);
+    /* B13: the one zone called name (the cb gets its row, like list_zones; not called when there is none), found through the index on
+     * domains.name instead of the list of all zones.  name matches the way the loader's names_equal() does: ASCII case-insensitive, one
+     * optional trailing dot.  Inside a snapshot, 0 or an error as list_zones; DB_STOPPED when the callback stopped it. */
+    int (*find_zone)(db_conn_t *c, const char *name, db_zone_cb cb, void *ud);
 } db_driver_t;
 
 /* compiled in when the driver is listed in DB_DRIVERS (Makefile) */

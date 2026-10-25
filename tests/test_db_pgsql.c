@@ -453,6 +453,22 @@ static void test_rows(void) {
     z->stop_after = 2;
     CHECK(D->list_zones(c, cb_zone, z) == DB_STOPPED && z->n == 2);    /* stopped scan, then another query works */
 
+    /* B13 find_zone: the same row as the list, by name: exact spelling by index, other capitals / trailing dot by the lower() fallback */
+    memset(z, 0, sizeof(*z));
+    CHECK(D->find_zone(c, "b.test", cb_zone, z) == 0 && z->n == 1 && z->id[0] == 2 && !strcmp(z->type[0], "SLAVE") && z->soa_null[0]);
+    memset(z, 0, sizeof(*z));
+    CHECK(D->find_zone(c, "A.TEST.", cb_zone, z) == 0 && z->n == 1 && z->id[0] == 1 && !strncmp(z->soa[0], "ns.a.test ", 10));   /* two SOAs: the first */
+    memset(z, 0, sizeof(*z));
+    CHECK(D->find_zone(c, "c.test.", cb_zone, z) == 0 && z->n == 1 && z->id[0] == 3 && z->soa_null[0]);
+    memset(z, 0, sizeof(*z));
+    CHECK(D->find_zone(c, "nope.test", cb_zone, z) == 0 && z->n == 0);
+    CHECK(D->find_zone(c, "a.test..", cb_zone, z) == 0 && z->n == 0);
+    CHECK(D->find_zone(c, "a.tes", cb_zone, z) == 0 && z->n == 0);
+    z->stop_after = 1;
+    CHECK(D->find_zone(c, "a.test", cb_zone, z) == DB_STOPPED && z->n == 1);
+    memset(z, 0, sizeof(*z));
+    CHECK(D->list_zones(c, cb_zone, z) == 0 && z->n == 3);              /* the cursor was closed: the next query works */
+
     racc_t *r = calloc(1, sizeof(*r));
     CHECK(D->scan_records(c, NULL, cb_rec, r) == 0);
     CHECK(r->n == 7);

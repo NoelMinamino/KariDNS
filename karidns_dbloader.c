@@ -1338,6 +1338,10 @@ static int commit_zone(ctx_t *x, const zinfo_t *zi, zres_t *r) {
 
 /* convert and hand over the zone at w->wi; nonzero when the load must stop */
 static int finish_pos(wk_t *w) {
+    if (g_stop) {                                      /* B13: SIGTERM / SIGINT: stop reading and converting at the next zone (the main thread sees g_stop and ends the load) */
+        w->stop = true;
+        return 1;
+    }
     size_t pos = w->wi++;
     convert_zone(w, WZ(w, pos));
     if (w->deliver(w, pos, &w->res) != 0) {
@@ -1349,6 +1353,10 @@ static int finish_pos(wk_t *w) {
 
 static int rec_cb(void *ud, int64_t did, const db_record_row_t *row) {
     wk_t *w = ud;
+    if (g_stop) {                                      /* B13: also inside a long scan, which converts nothing for the rows of unwanted zones */
+        w->stop = true;
+        return 1;
+    }
     while (w->wi < w->wend && WZ(w, w->wi)->id < did) {
         if (finish_pos(w) != 0) return 1;
     }
@@ -1858,10 +1866,12 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
     size_t ng = 0, cg = 0;
     char only_canon[DNS_NAME_TEXT_SIZE];
     bool have_only = only_zone && pdns_canonical_zone_name(only_zone, only_canon);
-    for (size_t b = 0; b < io->inv.nb; b++) {
-        for (inv_ent_t *e = io->inv.tab[b]; e; e = e->next) {
+    /* B13: a one-zone request asks the inventory for that one name (names are unique per view); the walk over every entry is only for a
+     * full comparison */
+    inv_ent_t *one = (only_zone && have_only) ? inv_find(&io->inv, x->vslot, only_canon) : NULL;
+    for (size_t b = 0; b < (only_zone ? (one ? 1u : 0u) : io->inv.nb); b++) {
+        for (inv_ent_t *e = only_zone ? one : io->inv.tab[b]; e; e = only_zone ? NULL : e->next) {
             if (e->vslot != x->vslot || e->mark == gen || !e->known) continue;
-            if (only_zone && !(have_only && strcasecmp(e->name, only_canon) == 0)) continue;
             if (ng == cg) {
                 size_t nc = cg ? cg * 2 : 16;
                 gone_t *n = realloc(gone, nc * sizeof(*n));
@@ -2023,7 +2033,9 @@ static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, boo
         goto out;
     }
     x->has_ext = si.has_ext && x->drv->scan_ext;
-    rc = x->drv->list_zones(x->conn, zone_cb, x);
+    /* B13: a one-zone request looks the zone up by name (index) instead of listing every zone of the source, so its cost does
+     * not grow with the number of zones; a missing zone is the same empty result as before (nz == 0: a deletion in stream mode) */
+    rc = x->only_name && x->drv->find_zone ? x->drv->find_zone(x->conn, x->only_name, zone_cb, x) : x->drv->list_zones(x->conn, zone_cb, x);
     if (rc == DB_STOPPED && x->only_name && x->nz == 1 && !x->oom) rc = 0;     /* the one zone was found */
     if (rc != 0) {
         status = x->oom ? EXIT_ERROR : db_err(x, rc, "reading the zone list");
@@ -2109,6 +2121,10 @@ static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, boo
         for (size_t i = 0; i < ngone && !fatal; i++)
             if (send_delete(x, &gone[i]) != 0) fatal = 1;
         if (fatal || x->io_error || x->oom) {
+            if (g_stop && !x->io_error && !x->oom) {         /* B13: told to stop (the caller ends the load); nothing went wrong */
+                status = EXIT_ERROR;
+                goto out_snap;
+            }
             if (x->oom) lg(LOG_ERR, "out of memory");
             else lg(LOG_ERR, "cannot write the output: %s", strerror(errno));
             status = EXIT_ERROR;

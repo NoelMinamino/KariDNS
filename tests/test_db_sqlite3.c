@@ -202,6 +202,8 @@ static int zl_collect(void *ud, const db_zone_row_t *z) {
     return 0;
 }
 
+static int stop_zone(void *ud, const db_zone_row_t *z) { (void)ud; (void)z; return 1; }
+
 static void zl_free(zl_t *l) {
     for (size_t i = 0; i < l->n; i++) { free(l->name[i]); free(l->type[i]); free(l->soa[i]); }
     l->n = 0;
@@ -496,6 +498,21 @@ static void test_scans(void) {
         CHECK(l.soa[3] == NULL);                       /* the SOA is disabled */
         CHECK(l.soa[1] != NULL);
     }
+    zl_free(&l);
+
+    /* B13 find_zone: the same row as the list gives, found by name (ASCII case-insensitive, one optional trailing dot) */
+    CHECK(db_driver_sqlite3.find_zone(c, "TWO.Test.", zl_collect, &l) == 0 && l.n == 1);
+    CHECK(l.n == 1 && l.id[0] == 2 && strcmp(l.name[0], "two.test") == 0 && l.soa[0] != NULL);   /* two enabled SOAs: one row */
+    zl_free(&l);
+    CHECK(db_driver_sqlite3.find_zone(c, "four.test", zl_collect, &l) == 0 && l.n == 1 && l.id[0] == 4 && l.soa[0] == NULL);
+    zl_free(&l);
+    CHECK(db_driver_sqlite3.find_zone(c, "three.test.", zl_collect, &l) == 0 && l.n == 1 && l.id[0] == 3 && strcmp(l.type[0], "SLAVE") == 0);
+    zl_free(&l);
+    CHECK(db_driver_sqlite3.find_zone(c, "nope.test", zl_collect, &l) == 0 && l.n == 0);       /* absent: no row, no error */
+    CHECK(db_driver_sqlite3.find_zone(c, "one.test..", zl_collect, &l) == 0 && l.n == 0);      /* only one trailing dot is ignored */
+    CHECK(db_driver_sqlite3.find_zone(c, "ne.test", zl_collect, &l) == 0 && l.n == 0);         /* no partial match */
+    CHECK(db_driver_sqlite3.find_zone(c, "one.test", stop_zone, &l) == DB_STOPPED);
+    CHECK(db_driver_sqlite3.find_zone(c, "one.test", zl_collect, &l) == 0 && l.n == 1 && l.id[0] == 1);   /* the statement is usable again */
     zl_free(&l);
 
     /* bulk == the per-zone scans one after the other (orphans only in the bulk scan) */

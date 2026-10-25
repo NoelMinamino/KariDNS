@@ -235,6 +235,7 @@ karicheck db internal /usr/local/etc/karidns/karidns.conf
 
 - [`karidns(8)`](karidns.md) — KariDNS authoritative DNS server daemon
 - [`karictl(8)`](karictl.md) — KariDNS server management and control utility
+- [`karidns-dbloader(8)`](karidns-dbloader.md) — The database loader that `karicheck db` runs with `--check`
 - [`dag(1)`](dag.md) — DNS anomaly generator and test client
 - [`KariDNS RFC Guideline`](../KariDNS_RFC_GUIDELINE.md) — Detailed RFC compliance and design boundary document
 

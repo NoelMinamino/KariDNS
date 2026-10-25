@@ -169,6 +169,7 @@ The file is not parsed as a full configuration file: `karictl` takes the quoted 
 
 - [`karidns(8)`](karidns.md) — KariDNS authoritative DNS server daemon
 - [`karicheck(1)`](karicheck.md) — Configuration and zone file validation utility
+- [`karidns-dbloader(8)`](karidns-dbloader.md) — The database loader that `reload` and `dbstatus` talk to
 - [`dag(1)`](dag.md) — DNS anomaly generator and test client
 - [`KariDNS RFC Guideline`](../KariDNS_RFC_GUIDELINE.md) — Detailed RFC compliance and design boundary document
 

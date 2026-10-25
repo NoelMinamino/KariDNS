@@ -130,6 +130,7 @@ my %tier_stats = (
 );
 
 my @file_records = ();
+my $pg_driver_skipped = 0;
 
 for my $f (@$files) {
     my $filename = $f->{filename} || "";
@@ -159,6 +160,15 @@ for my $f (@$files) {
     my $r_cnt = $regions->{count} || 0;
     my $b_cov = $branches->{covered} || 0;
     my $b_cnt = $branches->{count} || 0;
+
+    # dns_db_pgsql.c is compiled into karidns-dbloader whenever libpq is installed, but only test_db_pgsql and the PostgreSQL integration
+    # tests execute it, and those SKIP without a server.  A pgsql driver that is almost never executed (under 10% of its lines; a real
+    # run reaches about 85%) means "the PostgreSQL tests did not run": the file is left out of Tier D and of the totals (design 8.6), so
+    # a build or CI run without a PostgreSQL server is not failed for it.  The rest of Tier D (loader, SQLite3 driver, check protocol) is
+    # always exercised and stays gated.
+    my $pg_skipped = (basename($relname) eq "dns_db_pgsql.c" && $l_cnt && $l_cov * 10 < $l_cnt) ? 1 : 0;
+    $pg_driver_skipped = 1 if $pg_skipped;
+    $tier = "D (skipped)" if $pg_skipped;
     
     push @file_records, {
         file => $relname,
@@ -168,6 +178,8 @@ for my $f (@$files) {
         b_cov => $b_cov, b_cnt => $b_cnt, b_pct => ($b_cnt ? 100.0 * $b_cov / $b_cnt : 100.0),
     };
     
+    next if $pg_skipped;                       # counted in neither the tier nor the totals
+
     if (exists $tier_stats{$tier}) {
         $tier_stats{$tier}{lines_cov} += $l_cov;
         $tier_stats{$tier}{lines_cnt} += $l_cnt;
@@ -205,8 +217,8 @@ my $all_passed = 1;
 for my $t (qw(A B C D Overall)) {
     my $st = $tier_stats{$t};
     my $th = $thresholds{$t};
-    if ($t eq 'D' && !$st->{lines_cnt}) {      # the PostgreSQL tests did not run: no data for dns_db_pgsql.c, the tier is not gated
-        printf "%-10s | %-16s | %-16s | %-16s | %-8s\n", "Tier D", "-", "-", "-", "SKIPPED (no PostgreSQL test data)";
+    if ($t eq 'D' && !$st->{lines_cnt}) {      # no data for any file of the tier (no loader built): not gated
+        printf "%-10s | %-16s | %-16s | %-16s | %-8s\n", "Tier D", "-", "-", "-", "SKIPPED (no database test data)";
         next;
     }
     
@@ -232,6 +244,9 @@ for my $t (qw(A B C D Overall)) {
 }
 
 print "=" x 90 . "\n\n";
+if ($pg_driver_skipped) {
+    print "[i] dns_db_pgsql.c was left out of Tier D and the totals: the PostgreSQL tests did not run (under 10% of its lines executed)\n\n";
+}
 
 if (!$all_passed) {
     print "[-] Coverage Gate Status: FAILED (One or more tiers below target)\n";

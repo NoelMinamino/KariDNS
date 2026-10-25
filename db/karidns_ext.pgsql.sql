@@ -1,6 +1,9 @@
 -- karidns_ext.pgsql.sql - the KariDNS extension tables and the change-log triggers for a PowerDNS 5.1 gpgsql database
 -- (beta design 3.7, 5.1, 6; milestones B6a, B10).  Schema version 2.  PostgreSQL 13 or later (transition tables, xid8).
 --
+-- Manual: docs/karidns-dbloader.md (the schema and trigger files, the privileges, the drivers) and the database chapter of
+-- docs/karidns.md.  The packages karidns-sqlite3, karidns-postgresql and karidns-db install this file in /usr/local/share/karidns/db/.
+--
 -- Apply it once, as the owner of the PowerDNS tables, after the PowerDNS schema (schema.pgsql.sql), in the schema that
 -- holds them (a view with its own schema needs its own copy: SET search_path TO that_schema first):
 --     psql -v ON_ERROR_STOP=1 -f karidns_ext.pgsql.sql karidns

@@ -41,7 +41,7 @@ struct db_conn {
     char err[DB_ERRLEN];
     bool in_snapshot;
     bool has_changes;
-    sqlite3_stmt *st_zones, *st_rec_all, *st_rec_one, *st_rec_rng, *st_meta_all, *st_meta_one, *st_keys, *st_changes;
+    sqlite3_stmt *st_zones, *st_zone_one, *st_rec_all, *st_rec_one, *st_rec_rng, *st_meta_all, *st_meta_one, *st_keys, *st_changes;
     sqlite3_stmt *st_dv_all, *st_dv_one;
     bool has_domain_views;
     sqlite3_stmt *st_prof;
@@ -192,6 +192,7 @@ static void sq_close(db_conn_t *c) {
     sqlite3_finalize(c->st_pv);
     free(c->path);
     sqlite3_finalize(c->st_zones);
+    sqlite3_finalize(c->st_zone_one);
     sqlite3_finalize(c->st_rec_all);
     sqlite3_finalize(c->st_rec_one);
     sqlite3_finalize(c->st_rec_rng);
@@ -466,7 +467,7 @@ static int sq_begin_snapshot(db_conn_t *c) {
 
 static int sq_end_snapshot(db_conn_t *c) {
     if (!c->in_snapshot) return 0;
-    sqlite3_stmt *all[] = { c->st_zones, c->st_rec_all, c->st_rec_one, c->st_rec_rng, c->st_meta_all, c->st_meta_one,
+    sqlite3_stmt *all[] = { c->st_zones, c->st_zone_one, c->st_rec_all, c->st_rec_one, c->st_rec_rng, c->st_meta_all, c->st_meta_one,
                             c->st_keys, c->st_changes, c->st_dv_all, c->st_dv_one, c->st_prof };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
         if (all[i]) rearm(all[i]);
@@ -483,14 +484,8 @@ static int sq_end_snapshot(db_conn_t *c) {
 /* scans                                                                                                          */
 /* ------------------------------------------------------------------------------------------------------------- */
 
-static int sq_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
-    int ret = prep(c, &c->st_zones,
-                   "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content FROM domains d "
-                   "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND r.name = d.name AND r.disabled = 0 "
-                   "ORDER BY d.id");
-    if (ret != 0) return ret;
-    sqlite3_stmt *st = c->st_zones;
-    rearm(st);
+static int sq_zone_loop(db_conn_t *c, sqlite3_stmt *st, db_zone_cb cb, void *ud) {
+    int ret = 0;
     bool have_prev = false;
     int64_t prev = 0;
     for (;;) {
@@ -522,6 +517,57 @@ static int sq_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
         }
     }
     rearm(st);
+    return ret;
+}
+
+static int sq_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
+    int ret = prep(c, &c->st_zones,
+                   "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content FROM domains d "
+                   "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND r.name = d.name AND r.disabled = 0 "
+                   "ORDER BY d.id");
+    if (ret != 0) return ret;
+    rearm(c->st_zones);
+    return sq_zone_loop(c, c->st_zones, cb, ud);
+}
+
+/* B13: one zone by name, through the index on domains.name (a one-zone reload must not read the list of all zones).  The name
+ * matches like names_equal() of the loader: ASCII case-insensitive, with or without one trailing dot.  COLLATE NOCASE is explicit so
+ * that the answer does not depend on the collation the schema gave the column (the PowerDNS schema has NOCASE, which lets the
+ * index serve both comparisons). */
+static int sq_find_zone(db_conn_t *c, const char *name, db_zone_cb cb, void *ud) {
+    size_t n = strlen(name);
+    if (n > 1 && name[n - 1] == '.') n--;
+    char *a = malloc(n + 2);
+    if (!a) {
+        set_err(c, "out of memory");
+        return -1;
+    }
+    memcpy(a, name, n);
+    a[n] = '\0';
+    a[n + 1] = '\0';
+    int ret = prep(c, &c->st_zone_one,
+                   "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content FROM domains d "
+                   "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND r.name = d.name AND r.disabled = 0 "
+                   "WHERE d.name COLLATE NOCASE = ?1 OR d.name COLLATE NOCASE = ?2 ORDER BY d.id");
+    if (ret != 0) {
+        free(a);
+        return ret;
+    }
+    sqlite3_stmt *st = c->st_zone_one;
+    rearm(st);
+    sqlite3_bind_text(st, 1, a, (int)n, SQLITE_TRANSIENT);
+    char *b = malloc(n + 2);
+    if (!b) {
+        free(a);
+        set_err(c, "out of memory");
+        return -1;
+    }
+    memcpy(b, a, n);
+    b[n] = '.';
+    sqlite3_bind_text(st, 2, b, (int)n + 1, SQLITE_TRANSIENT);
+    ret = sq_zone_loop(c, st, cb, ud);
+    free(a);
+    free(b);
     return ret;
 }
 
@@ -922,6 +968,7 @@ const db_driver_t db_driver_sqlite3 = {
     false,          /* changes_unsettled: the cursor is the highest seq */
     NULL, NULL, NULL,   /* B11 reload requests: PostgreSQL only (watch_requests, requests_max, reload_requests) */
     sq_schema_findings, /* B12 */
+    sq_find_zone,       /* B13 */
 };
 
 #endif /* KARIDNS_DB_SQLITE3 */

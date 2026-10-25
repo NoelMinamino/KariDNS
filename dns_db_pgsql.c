@@ -724,7 +724,7 @@ static int pg_scan(db_conn_t *c, const char *what, const char *query, int np, co
 }
 
 /* ---- zones ---- */
-typedef struct { db_zone_cb cb; void *ud; bool have_prev; int64_t prev; } zl_t;
+typedef struct { db_zone_cb cb; void *ud; bool have_prev; int64_t prev; bool any; } zl_t;
 
 static int zl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     zl_t *z = ud;
@@ -732,6 +732,7 @@ static int zl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     if (z->have_prev && id == z->prev) return 0;      /* more than one enabled apex SOA: the first is enough here */
     z->have_prev = true;
     z->prev = id;
+    z->any = true;
     bool bad = false;
     db_zone_row_t row;
     row.id = id;
@@ -745,12 +746,49 @@ static int zl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
 }
 
 static int pg_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
-    zl_t z = { cb, ud, false, 0 };
+    zl_t z = { cb, ud, false, 0, false };
     return pg_scan(c, "list_zones",
                    "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content FROM domains d "
                    "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND lower(r.name) = lower(d.name) AND r.disabled = false "
                    "ORDER BY d.id, r.id",
                    0, NULL, zl_row, &z);
+}
+
+/* B13: one zone by name for a one-zone reload.  Names are compared like names_equal() of the loader: ASCII case-insensitive, with or
+ * without one trailing dot.  The PowerDNS schema has only an index on domains.name (case-sensitive), so the first query asks for the
+ * two spellings exactly (index scan, the usual case: names are stored in lower case); only when it finds nothing is lower() used,
+ * which scans the table once (a zone stored with capitals, or a zone that is not there, i.e. a deletion).  Unlike the list, which
+ * stops at the lowest id, an exact spelling wins over another capitalisation of the same name (two such rows are a data error). */
+static int pg_find_zone(db_conn_t *c, const char *name, db_zone_cb cb, void *ud) {
+    size_t n = strlen(name);
+    if (n > 1 && name[n - 1] == '.') n--;
+    char *a = malloc(n + 1), *b = malloc(n + 2);
+    if (!a || !b) {
+        free(a);
+        free(b);
+        set_err(c, "out of memory");
+        return -1;
+    }
+    memcpy(a, name, n);
+    a[n] = '\0';
+    memcpy(b, a, n);
+    b[n] = '.';
+    b[n + 1] = '\0';
+    const char *pv[2] = { a, b };
+    static const char *const sel =
+        "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content FROM domains d "
+        "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND lower(r.name) = lower(d.name) AND r.disabled = false ";
+    char q[700];
+    zl_t z = { cb, ud, false, 0, false };
+    snprintf(q, sizeof(q), "%sWHERE d.name IN ($1, $2) ORDER BY d.id, r.id", sel);
+    int ret = pg_scan(c, "find_zone", q, 2, pv, zl_row, &z);
+    if (ret == 0 && !z.any) {
+        snprintf(q, sizeof(q), "%sWHERE lower(d.name) IN (lower($1), lower($2)) ORDER BY d.id, r.id", sel);
+        ret = pg_scan(c, "find_zone", q, 2, pv, zl_row, &z);
+    }
+    free(a);
+    free(b);
+    return ret;
 }
 
 /* ---- records ---- */
@@ -1216,6 +1254,7 @@ const db_driver_t db_driver_postgresql = {
     true,
     pg_watch_requests, pg_requests_max, pg_reload_requests,
     pg_schema_findings, /* B12 */
+    pg_find_zone,       /* B13 */
 };
 
 #endif /* KARIDNS_DB_POSTGRESQL */

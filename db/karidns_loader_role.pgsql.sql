@@ -2,8 +2,11 @@
 -- D11; milestones B10, B11).  The loader only reads: SELECT on the PowerDNS tables it uses and on the karidns_* tables, and
 -- nothing on the key material of cryptokeys; the one thing it writes is its own status row (B11, below).
 --
+-- Manual: docs/karidns-dbloader.md (the schema and trigger files, the privileges, the drivers) and the database chapter of
+-- docs/karidns.md.  The packages karidns-sqlite3, karidns-postgresql and karidns-db install this file in /usr/local/share/karidns/db/.
+--
 -- Create the role yourself (authentication is yours: a UNIX socket with peer authentication for the user the loader runs
--- as is the simplest, see `conninfo-file` in docs/karidns.md), then, as the owner of the tables:
+-- as is the simplest, see `conninfo-file` in docs/karidns.md), then, as a superuser (or the owner of the tables with CREATEROLE and the ADMIN option on the role: the script also runs ALTER ROLE):
 --     psql -v ON_ERROR_STOP=1 -v role=karidns_loader -v schema=public -f karidns_loader_role.pgsql.sql karidns
 -- `role` is the loader's role, `schema` the schema that holds the PowerDNS and karidns_* tables (one run per schema when the
 -- views have schemas of their own).  The script can be run again.

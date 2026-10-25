@@ -24,6 +24,16 @@ The CI job "Coverage gate" runs the Phase 2 thresholds with `--strict`. The tier
 | Total, Phase 1 | 92.10% (90.0%) | 89.97% (84.0%) | 78.88% (72.0%) | **PASS** |
 | Total, Phase 2 | 92.10% (92.0%) | 89.97% (85.0%) | 78.88% (75.0%) | **PASS** |
 
+#### Tier D: the database layer (v0.6 beta)
+
+The tables above were measured before the database layer existed. Since v0.6 beta `tests/coverage_gate.pl` has a fourth tier, **Tier D**: `karidns_dbloader.c` (the loader, including the unit-test build `test_db_sqlite3`), `dns_db_sqlite3.c`, `dns_db_pgsql.c` and `dns_db_checkproto.c` (the line protocol of `karicheck db`). Its thresholds are 85.0% lines, 78.0% regions and 60.0% branches. `make coverage-build` always builds `karidns-dbloader` with the SQLite3 driver and adds the PostgreSQL driver when libpq is installed (`COV_DB_DRIVERS`); the SQLite3 tests need nothing but the `sqlite3` library, so they run everywhere and Tier D is always gated. How the gate treats what it cannot know:
+
+- **No PostgreSQL server (or no libpq):** the PostgreSQL tests (`test_db_pgsql`, `run_db_pg_*_test.sh`) SKIP. `dns_db_pgsql.c` is then either absent from the coverage data (no libpq at build time), or present with almost no executed lines (libpq built into the loader, no server). A pgsql driver with **fewer than 10% of its lines executed** (a run with a server reaches about 85%) is left out of Tier D **and** of the totals, and the gate prints `[i] dns_db_pgsql.c was left out of Tier D and the totals: the PostgreSQL tests did not run`. The rest of Tier D (loader, SQLite3 driver, check protocol) stays gated. Before B13 the whole tier was skipped when the tier had no data at all, which no longer happens once the loader and the SQLite3 driver are part of it; the per-file rule replaces it.
+- **No data for any Tier D file** (the loader was not built, for example a build with `DB_DRIVERS=` empty): the tier line reads `SKIPPED (no database test data)`.
+- **Root-only tests:** `run_db_zoneadd_perf_test.sh` and the loader-user tests need root and SKIP otherwise; the unit tests (`test_db_sqlite3`, `test_db_pgsql`, `test_db_registry`) and the non-root integration tests cover the loader and both drivers without root.
+
+To gate the PostgreSQL driver, run the suite with a server the test user can reach (`tests/db/pg_lib.sh` finds it: the default socket for the user running the tests, or `KARIDNS_TEST_PG_USER` for root shells).
+
 ### Per-File Results
 
 | File | Lines | Regions | Branches |
