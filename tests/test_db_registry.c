@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include <syslog.h>
 #include <sys/stat.h>
+#include <ftw.h>
 
 #include "../dns_config_parser.h"
 #include "../dns_db_install.h"
@@ -129,6 +130,11 @@ static void zone_msg(msg_t *m, const char *zone, uint32_t serial, int nrr) {
 
 /* ---------------------------------------------------------------- fixtures */
 static char g_dir[128];
+
+static int rm_entry(const char *path, const struct stat *sb, int type, struct FTW *ftw) {
+    (void)sb; (void)type; (void)ftw;
+    return remove(path);
+}
 
 static server_config_t *load_conf(const char *fmt, ...) {
     char text[8192];
@@ -932,9 +938,11 @@ int main(void) {
     test_settings_interning();
     test_secondary_entries();
     test_concurrent();
-    char cmd[300];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", g_dir);
-    if (system(cmd) != 0) { /* leave the directory */ }
+    /* Remove the scratch directory in-process: the detached snapshot GC threads of test_concurrent may still be starting
+     * or exiting here, and fork() from a multi-threaded process (as system("rm -rf") did) deadlocks under ASan on FreeBSD:
+     * the ASan fork handler holds the allocator lock while waiting for the rtld lock, which a starting thread holds while
+     * waiting for the allocator lock. */
+    if (nftw(g_dir, rm_entry, 16, FTW_DEPTH | FTW_PHYS) != 0) { /* leave the directory */ }
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) return 1;
     printf("=== test_db_registry: all checks passed ===\n");

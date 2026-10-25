@@ -708,7 +708,7 @@ unit-tests: cidr_test tinydns_test asan_test include_test config_directives_test
 UT_ASAN_LEAKS ?= 0
 # each binary of unit-tests-asan gets at most UT_TIMEOUT seconds; a hung one prints its thread backtraces and fails
 # (tests/run_unit_with_watchdog.sh) instead of blocking CI until the job timeout
-UT_TIMEOUT ?= 600
+UT_TIMEOUT ?= 300
 UT_ASAN_CFLAGS = -O1 -g -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -DSANITIZER_BUILD -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -fPIE -DKARIDNS_VERSION=\"$(VERSION)\" $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
 UT_ASAN_LDFLAGS = -fsanitize=address,undefined -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS)
 
