@@ -285,6 +285,23 @@ static void test_install(void) {
         msg_init(&m); msg_soa(&m, "sub.a.test.", 31); msg_a(&m, "a.test.", 1); msg_soa(&m, "sub.a.test.", 31);
         CHECK(install_msgs(e, "a.test.", 3, &m, 1, why, sizeof(why), NULL) != 0 && strstr(why, "SOA of its apex"));
     }
+    {   /* ZONE_BEGIN declared another serial than the SOA of the data (B8t-2): refused at ZONE_END, the entry stays */
+        zone_msg(&m, "a.test.", 41, 1);
+        db_zone_build_t *b = db_zone_build_new("a.test.", 4, 0);
+        db_zone_build_set_serial(b, 40);
+        CHECK(db_zone_build_feed(b, m.b, m.n, why, sizeof(why)) == 0);
+        CHECK(db_zone_build_install(b, e, NULL, why, sizeof(why)) != 0 && strstr(why, "not the one ZONE_BEGIN declared"));
+        db_zone_build_free(b);
+        CHECK(e->serial == keep_serial);
+        b = db_zone_build_new("a.test.", 4, 0);
+        db_zone_build_set_serial(b, 41);                       /* the declared serial is the one in the data: published */
+        CHECK(db_zone_build_feed(b, m.b, m.n, why, sizeof(why)) == 0);
+        CHECK(db_zone_build_install(b, e, NULL, why, sizeof(why)) == 0);
+        db_zone_build_free(b);
+        CHECK(e->serial == 41);
+        keep_serial = 41;
+        keep_rrs = atomic_load(&e->rcu.active)->image->n_rrs;
+    }
     {   /* no closing SOA */
         msg_init(&m); msg_soa(&m, "a.test.", 31); msg_a(&m, "x.a.test.", 1);
         CHECK(install_msgs(e, "a.test.", 3, &m, 1, why, sizeof(why), NULL) != 0 && strstr(why, "final SOA"));

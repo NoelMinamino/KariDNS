@@ -284,8 +284,24 @@ static void st_get_strings(char *err, size_t en, char *ver, size_t vn, int64_t *
 }
 
 /* B9: what the loader reports about auto reload (AUTO_STATUS), per view index; written by the stream thread (one writer, a
- * seqlock per entry), read by the control thread for `karictl dbstatus`. */
+ * seqlock per entry), read by the control thread for `karictl dbstatus`.  B11: the same entry carries the multi-server reload
+ * request state of the view's source (the server id, the last request applied and whether it loaded every zone, the last error
+ * of reading requests or writing the status row); as_data_t is the plain copy the two sides exchange. */
 #define AS_ERR 120
+#define AS_SID 68
+typedef struct {
+  int64_t last_poll;
+  uint64_t applied_seq;
+  uint32_t pending;
+  char err[AS_ERR];
+  unsigned flags;                    /* KDB_AS_AUTO: last_poll .. err are real; KDB_AS_REQ: the rest is real */
+  char server_id[AS_SID];
+  uint64_t req_generation;
+  bool req_ok;
+  char req_err[AS_ERR];
+  int64_t req_time;
+} as_data_t;
+
 static struct as_ent {
   _Atomic uint32_t seq;
   _Atomic bool valid;
@@ -293,32 +309,55 @@ static struct as_ent {
   _Atomic uint64_t applied_seq;
   _Atomic uint32_t pending;
   _Atomic char err[AS_ERR];
+  _Atomic unsigned flags;
+  _Atomic char server_id[AS_SID];
+  _Atomic uint64_t req_generation;
+  _Atomic bool req_ok;
+  _Atomic char req_err[AS_ERR];
+  _Atomic int64_t req_time;
 } g_as[KARIDNS_DB_MAX_VIEWS];
 
-static void as_set(struct as_ent *a, int64_t last_poll, uint64_t applied, uint32_t pending, const char *err, size_t errn) {
+/* printable ASCII only, whatever the loader sent */
+static void as_put_str(_Atomic char *dst, size_t cap, const char *src, size_t n) {
+  size_t i = 0;
+  for (; src && i < n && i + 1 < cap; i++)
+    atomic_store_explicit(&dst[i], (src[i] >= 0x20 && src[i] <= 0x7E) ? src[i] : '?', memory_order_relaxed);
+  atomic_store_explicit(&dst[i], '\0', memory_order_relaxed);
+}
+
+static void as_set(struct as_ent *a, const as_data_t *d, const char *err, size_t errn, const char *sid, size_t sidn, const char *rerr, size_t rerrn) {
   uint32_t s = atomic_load_explicit(&a->seq, memory_order_relaxed);
   atomic_store_explicit(&a->seq, s + 1, memory_order_release);
   atomic_thread_fence(memory_order_seq_cst);
-  atomic_store_explicit(&a->last_poll, last_poll, memory_order_relaxed);
-  atomic_store_explicit(&a->applied_seq, applied, memory_order_relaxed);
-  atomic_store_explicit(&a->pending, pending, memory_order_relaxed);
-  size_t i = 0;
-  for (; err && i < errn && i + 1 < AS_ERR; i++)
-    atomic_store_explicit(&a->err[i], (err[i] >= 0x20 && err[i] <= 0x7E) ? err[i] : '?', memory_order_relaxed);
-  atomic_store_explicit(&a->err[i], '\0', memory_order_relaxed);
+  atomic_store_explicit(&a->last_poll, d->last_poll, memory_order_relaxed);
+  atomic_store_explicit(&a->applied_seq, d->applied_seq, memory_order_relaxed);
+  atomic_store_explicit(&a->pending, d->pending, memory_order_relaxed);
+  as_put_str(a->err, AS_ERR, err, errn);
+  atomic_store_explicit(&a->flags, d->flags, memory_order_relaxed);
+  as_put_str(a->server_id, AS_SID, sid, sidn);
+  atomic_store_explicit(&a->req_generation, d->req_generation, memory_order_relaxed);
+  atomic_store_explicit(&a->req_ok, d->req_ok, memory_order_relaxed);
+  as_put_str(a->req_err, AS_ERR, rerr, rerrn);
+  atomic_store_explicit(&a->req_time, d->req_time, memory_order_relaxed);
   atomic_store_explicit(&a->valid, true, memory_order_relaxed);
   atomic_store_explicit(&a->seq, s + 2, memory_order_release);
 }
 
-static bool as_get(struct as_ent *a, int64_t *last_poll, uint64_t *applied, uint32_t *pending, char *err, size_t en) {
+static bool as_get(struct as_ent *a, as_data_t *d) {
   for (int tries = 0; tries < 1000; tries++) {
     uint32_t s1 = atomic_load_explicit(&a->seq, memory_order_acquire);
     if (s1 & 1) continue;
     bool valid = atomic_load_explicit(&a->valid, memory_order_relaxed);
-    *last_poll = atomic_load_explicit(&a->last_poll, memory_order_relaxed);
-    *applied = atomic_load_explicit(&a->applied_seq, memory_order_relaxed);
-    *pending = atomic_load_explicit(&a->pending, memory_order_relaxed);
-    st_str_get(a->err, err, en);
+    d->last_poll = atomic_load_explicit(&a->last_poll, memory_order_relaxed);
+    d->applied_seq = atomic_load_explicit(&a->applied_seq, memory_order_relaxed);
+    d->pending = atomic_load_explicit(&a->pending, memory_order_relaxed);
+    st_str_get(a->err, d->err, sizeof(d->err));
+    d->flags = atomic_load_explicit(&a->flags, memory_order_relaxed);
+    st_str_get(a->server_id, d->server_id, sizeof(d->server_id));
+    d->req_generation = atomic_load_explicit(&a->req_generation, memory_order_relaxed);
+    d->req_ok = atomic_load_explicit(&a->req_ok, memory_order_relaxed);
+    st_str_get(a->req_err, d->req_err, sizeof(d->req_err));
+    d->req_time = atomic_load_explicit(&a->req_time, memory_order_relaxed);
     atomic_thread_fence(memory_order_seq_cst);
     if (atomic_load_explicit(&a->seq, memory_order_acquire) == s1) return valid;
   }
@@ -1478,7 +1517,16 @@ static void on_auto_status(const kdb_msg_t *m) {
   kdb_auto_status_entries(m, &it);
   while (kdb_auto_status_entries_next(&it, &e)) {
     if (e.view >= KARIDNS_DB_MAX_VIEWS) continue;
-    as_set(&g_as[e.view], (int64_t)e.last_poll, e.applied_seq, e.pending, e.error.p, e.error.len);
+    as_data_t d;
+    memset(&d, 0, sizeof(d));
+    d.last_poll = (int64_t)e.last_poll;
+    d.applied_seq = e.applied_seq;
+    d.pending = e.pending;
+    d.flags = e.flags;
+    d.req_generation = e.req_generation;
+    d.req_ok = e.req_ok;
+    d.req_time = (int64_t)e.req_time;
+    as_set(&g_as[e.view], &d, e.error.p, e.error.len, e.server_id.p, e.server_id.len, e.req_error.p, e.req_error.len);
   }
 }
 
@@ -2307,18 +2355,33 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     uint32_t vidx = 0;
     for (const view_config_t *v = vcfg ? vcfg->views : NULL; v; v = v->next, vidx++) {
       if (v->database_none) continue;
-      int64_t lp = 0;
-      uint64_t aseq = 0;
-      uint32_t pend = 0;
-      char aerr[AS_ERR] = "";
+      as_data_t ad;
       char tp[40];
-      if (vidx >= KARIDNS_DB_MAX_VIEWS || !as_get(&g_as[vidx], &lp, &aseq, &pend, aerr, sizeof(aerr))) {
+      if (vidx >= KARIDNS_DB_MAX_VIEWS || !as_get(&g_as[vidx], &ad) || !(ad.flags & KDB_AS_AUTO)) {
         st_append(&c, "  view %.64s: no report from the loader yet\n", v->name ? v->name : "?");
         continue;
       }
-      fmt_time(lp, tp, sizeof(tp));
+      fmt_time(ad.last_poll, tp, sizeof(tp));
       st_append(&c, "  view %.64s: last poll %s, applied change seq %llu, pending changes %u, last error: %s\n",
-                v->name ? v->name : "?", tp, (unsigned long long)aseq, pend, aerr[0] ? aerr : "none");
+                v->name ? v->name : "?", tp, (unsigned long long)ad.applied_seq, ad.pending, ad.err[0] ? ad.err : "none");
+    }
+    rcu_aux_read_unlock();
+  }
+  /* B11: multi-server reload requests, one line per view whose source has the tables (the loader reports them whether or not
+   * auto reload is on) */
+  {
+    rcu_aux_read_lock();
+    const server_config_t *vcfg = acquire_config_snapshot();
+    uint32_t vidx = 0;
+    for (const view_config_t *v = vcfg ? vcfg->views : NULL; v; v = v->next, vidx++) {
+      if (v->database_none || vidx >= KARIDNS_DB_MAX_VIEWS) continue;
+      as_data_t rd;
+      if (!as_get(&g_as[vidx], &rd) || !(rd.flags & KDB_AS_REQ)) continue;
+      char tw[40];
+      fmt_time(rd.req_time, tw, sizeof(tw));
+      st_append(&c, "reload requests (view %.64s): server-id %s, last applied generation %llu, ok %s, status written %s, last error: %s\n",
+                v->name ? v->name : "?", rd.server_id[0] ? rd.server_id : "(none)", (unsigned long long)rd.req_generation,
+                rd.req_ok ? "yes" : "no", tw, rd.req_err[0] ? rd.req_err : "none");
     }
     rcu_aux_read_unlock();
   }

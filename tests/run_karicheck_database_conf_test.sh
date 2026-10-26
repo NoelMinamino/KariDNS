@@ -121,6 +121,44 @@ ci_warns "URI without a host (socket)" "postgresql:///pdns" no
 ci_warns "URI with host=/tmp in the query" "postgresql:///pdns?host=/tmp" no
 ci_warns "URI with %2F host" "postgresql://%2Fvar%2Frun%2Fpostgresql/pdns" no
 
+echo "== server-id (postgresql; B11: the id of karidns_server_status)"
+printf 'host=/tmp dbname=pdns\n' > "$T/ci"; chmod 600 "$T/ci"
+sid_warns() {   # sid_warns DESCRIPTION DBBLOCK-STATEMENT WANT(yes|no)
+    conf "$T/c.conf" "driver postgresql; conninfo-file \"$T/ci\"; loader-user \"$USER_OK\"; loader-path \"$T/dbl\"; $2"
+    out=$(run "$T/c.conf")
+    if printf '%s\n' "$out" | grep -q "server-id '.*' has characters other than"; then got=yes; else got=no; fi
+    if [ "$got" = "$3" ]; then ok "server-id $1: warning $got"; else bad "server-id $1: warning $got, wanted $3" "$out"; fi
+}
+sid_warns "ns1" 'server-id "ns1";' no
+sid_warns "a-b.c_d:5 (the characters that are fine)" 'server-id "a-b.c_d:5";' no
+sid_warns "with a blank" 'server-id "ns 1";' yes
+sid_warns "with a slash" 'server-id "dc1/ns1";' yes
+sid_warns "non-ASCII UTF-8" 'server-id "caf'"$(printf '\303\251')"'";' yes
+sid_warns "not set (the host name is used)" '' no
+long=0123456789012345678901234567890123456789012345678901234567890123456789
+conf "$T/c.conf" "driver postgresql; conninfo-file \"$T/ci\"; loader-user \"$USER_OK\"; loader-path \"$T/dbl\"; server-id \"$long\";"
+expect "server-id of 70 bytes (the column holds 64)" "$T/c.conf" "Syntax error"
+conf "$T/c.conf" "driver postgresql; conninfo-file \"$T/ci\"; loader-user \"$USER_OK\"; loader-path \"$T/dbl\"; server-id \"\";"
+expect "empty server-id" "$T/c.conf" "Syntax error"
+
+echo "== several servers and alias-resolver (B11b, D-B11-3: ALIAS answers may differ between servers)"
+ar_warns() {   # ar_warns DESCRIPTION DRIVERSTATEMENTS DBBLOCK-STATEMENT OPTIONS-STATEMENT WANT(yes|no)
+    printf 'options {\n  user "%s";\n  %s\n  database { %s loader-user "%s"; loader-path "%s"; %s };\n};\nzone "z.test" { type primary; file "%s/z.zone"; };\n' \
+        "$USER_OK" "$4" "$2" "$USER_OK" "$T/dbl" "$3" "$T" > "$T/c.conf"
+    out=$(run "$T/c.conf")
+    if printf '%s\n' "$out" | grep -q "alias-resolver expands ALIAS records"; then got=yes; else got=no; fi
+    if [ "$got" = "$5" ]; then ok "$1: warning $got"; else bad "$1: warning $got, wanted $5" "$out"; fi
+}
+PGD="driver postgresql; conninfo-file \"$T/ci\";"
+ar_warns "server-id and a database alias-resolver" "$PGD" 'server-id "ns1"; alias-resolver { 192.0.2.53; };' '' yes
+ar_warns "server-id and an options alias-resolver" "$PGD" 'server-id "ns1";' 'alias-resolver { 192.0.2.53; };' yes
+ar_warns "server-id and both" "$PGD" 'server-id "ns1"; alias-resolver { 192.0.2.53; 2001:db8::53; };' 'alias-resolver { 192.0.2.54; };' yes
+ar_warns "an alias-resolver without server-id (a single server, or the host name)" "$PGD" 'alias-resolver { 192.0.2.53; };' '' no
+ar_warns "server-id without an alias-resolver" "$PGD" 'server-id "ns1";' '' no
+ar_warns "sqlite3 (server-id is ignored there)" "driver sqlite3; database-file \"$T/wal.db\";" 'server-id "ns1"; alias-resolver { 192.0.2.53; };' '' no
+out=$(run "$T/c.conf")
+printf '%s\n' "$out" | grep -q "server-id is for driver postgresql" && ok "sqlite3: the server-id warning is the one given" || bad "sqlite3: no server-id warning" "$out"
+
 echo "== syntax"
 conf "$T/c.conf" "driver sqlite3; database-file \"$T/wal.db\"; poll-interval 99;"
 expect "poll-interval out of range" "$T/c.conf" "Syntax error"
@@ -140,6 +178,65 @@ if printf '%s\n' "$out" | grep -q "views take DB zones"; then bad "1024 views th
 views_conf "$T/vnone.conf" 1100 1025
 out=$(run "$T/vnone.conf")
 if printf '%s\n' "$out" | grep -q "views take DB zones"; then bad "1100 views of which 76 are \"database none;\" were refused" "$out"; else ok "views marked \"database none;\" are not counted"; fi
+
+echo "== more loader, database file, conninfo and ACL-option checks"
+# a "needs" check: the output (errors and warnings, whatever the exit status) has the text
+has() {   # has DESC CONF PATTERN
+    out=$(run "$2")
+    if printf '%s\n' "$out" | grep -q -- "$3"; then ok "$1"; else bad "$1 (pattern: $3)" "$out"; fi
+}
+conf "$T/c.conf" "driver sqlite3; database-file \"$T/wal.db\"; loader-path \"$T/dbl\";"
+has "no loader-user is warned about" "$T/c.conf" "database: no loader-user; karidns refuses to start as root without one"
+mkdir "$T/adir"
+conf "$T/c.conf" "driver sqlite3; database-file \"$T/wal.db\"; loader-user \"$USER_OK\"; loader-path \"$T/adir\";"
+has "loader-path is a directory" "$T/c.conf" "database loader '$T/adir' is not a regular file"
+cp "$T/dbl" "$T/dbl_nx" && chmod 644 "$T/dbl_nx"
+conf "$T/c.conf" "driver sqlite3; database-file \"$T/wal.db\"; loader-user \"$USER_OK\"; loader-path \"$T/dbl_nx\";"
+has "loader without an execute bit" "$T/c.conf" "database loader '$T/dbl_nx' is not executable by this user"
+conf "$T/c.conf" "driver sqlite3; database-file \"$T/adir\"; loader-user \"$USER_OK\"; loader-path \"$T/dbl\";"
+has "the database file is a directory" "$T/c.conf" "database file '$T/adir' is not a regular file"
+: > "$T/empty.db"; chmod 600 "$T/empty.db"
+conf "$T/c.conf" "driver sqlite3; database-file \"$T/empty.db\"; loader-user \"$USER_OK\"; loader-path \"$T/dbl\";"
+has "an empty database file" "$T/c.conf" "database file '$T/empty.db' is empty; create the PowerDNS schema first"
+mkdir "$T/ww" && chmod 777 "$T/ww" && cp "$T/wal.db" "$T/ww/wal.db" && chmod 600 "$T/ww/wal.db"
+conf "$T/c.conf" "driver sqlite3; database-file \"$T/ww/wal.db\"; loader-user \"$USER_OK\"; loader-path \"$T/dbl\";"
+has "a database file in a directory everyone can write to" "$T/c.conf" "the directory '$T/ww' of the database file is writable by everyone"
+if [ "$(id -u)" != "0" ]; then       # root reads every file; for others mode 000 is "cannot read"
+    cp "$T/wal.db" "$T/noread.db" && chmod 000 "$T/noread.db"
+    conf "$T/c.conf" "driver sqlite3; database-file \"$T/noread.db\"; loader-user \"$USER_OK\"; loader-path \"$T/dbl\";"
+    has "a database file this user cannot read" "$T/c.conf" "cannot read '$T/noread.db' to check its journal mode"
+fi
+conf "$T/c.conf" "driver postgresql; conninfo-file \"$T/ci_missing\"; loader-user \"$USER_OK\"; loader-path \"$T/dbl\";"
+has "conninfo-file that is not there" "$T/c.conf" "database conninfo-file '$T/ci_missing': No such file"
+if [ "$(id -u)" = "0" ]; then
+    printf 'host=/tmp dbname=pdns\n' > "$T/ci_other"; chmod 600 "$T/ci_other"; chown 12345 "$T/ci_other"
+    conf "$T/c.conf" "driver postgresql; conninfo-file \"$T/ci_other\"; loader-user \"$USER_OK\"; loader-path \"$T/dbl\";"
+    has "conninfo-file owned by another user than the loader user" "$T/c.conf" "conninfo-file '$T/ci_other' is owned by uid 12345; it must belong to the loader user '$USER_OK'"
+fi
+longpath=$T/$(printf 'a/%.0s' $(seq 1 400))x
+conf "$T/c.conf" "driver sqlite3; database-file \"$T/wal.db\"; loader-user \"$USER_OK\"; loader-path \"$longpath\";"
+out=$("$KC" db "$T/c.conf" 2>&1)
+if printf '%s\n' "$out" | grep -q "DB support is not installed" && printf '%s\n' "$out" | grep -q "a[.][.][.]'"; then ok "karicheck db shortens a very long loader-path in its message"; else bad "karicheck db and a very long loader-path" "$out"; fi
+
+# transfer-acl-match / update-acl-match only choose between the entries of an ACL (D14): without both kinds they have no effect
+acl_conf() {   # acl_conf ZONE-STATEMENTS
+    printf 'options { user "%s"; };\nkey "k" { algorithm hmac-sha256; secret "dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"; };\nzone "z.test" { type primary; file "%s/z.zone"; %s };\n' "$USER_OK" "$T" "$1" > "$T/acl.conf"
+}
+acl_conf 'transfer-acl-match all;'
+has "transfer-acl-match without allow-transfer" "$T/acl.conf" "Zone 'z.test.': transfer-acl-match has no effect without allow-transfer"
+acl_conf 'allow-transfer { 192.0.2.1; }; transfer-acl-match all;'
+has "transfer-acl-match with addresses only" "$T/acl.conf" "transfer-acl-match has no effect: allow-transfer lists only addresses"
+acl_conf 'allow-transfer { key k; }; transfer-acl-match any;'
+has "transfer-acl-match with keys only" "$T/acl.conf" "transfer-acl-match has no effect: allow-transfer lists only keys"
+acl_conf 'allow-transfer { 192.0.2.1; key k; }; transfer-acl-match all;'
+out=$(run "$T/acl.conf")
+if printf '%s\n' "$out" | grep -q "transfer-acl-match has no effect"; then bad "transfer-acl-match with addresses and keys was warned about" "$out"; else ok "transfer-acl-match with addresses and keys: no warning"; fi
+acl_conf 'update-acl-match all;'
+has "update-acl-match without allow-update" "$T/acl.conf" "Zone 'z.test.': update-acl-match has no effect without allow-update"
+acl_conf 'allow-update { 192.0.2.1; }; update-acl-match all;'
+has "update-acl-match with addresses only" "$T/acl.conf" "update-acl-match has no effect: allow-update lists only addresses"
+acl_conf 'allow-update { key k; }; update-acl-match any;'
+has "update-acl-match with keys only" "$T/acl.conf" "update-acl-match has no effect: allow-update lists only keys"
 
 if [ "$FAILS" -eq 0 ]; then echo "=== run_karicheck_database_conf_test: all checks passed ==="; exit 0; fi
 echo "=== run_karicheck_database_conf_test: $FAILS check(s) FAILED ==="

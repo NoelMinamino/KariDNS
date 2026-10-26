@@ -342,6 +342,186 @@ static void test_karictl(void) {
     printf("  -> karictl runs done.\n");
 }
 
+/* ---------------------------------------------------------------- the zone checks of dns_zone_lint.c, message by message
+ * (the runs above only execute them: here a zone is fed to the checks and the findings are compared) */
+typedef struct { char text[16384]; } lint_out_t;
+
+static void lint_sink(void *ud, char level, const char *text) {
+    lint_out_t *o = ud;
+    size_t l = strlen(o->text);
+    snprintf(o->text + l, sizeof(o->text) - l, "%c %s\n", level, text);
+}
+
+/* Parse `body` (after a plain header) as a BIND zone of a.test. and run the checks; fix lets a test change the arena first.  Returns the
+ * findings, one per line ("E ..." / "W ..."). */
+static void lint_zone(lint_out_t *o, const char *body, const char *raw, void (*fix)(zone_arena_t *)) {
+    memset(o, 0, sizeof(*o));
+    char text[4096];
+    snprintf(text, sizeof(text), "$ORIGIN a.test.\n$TTL 300\n@ IN SOA ns1.a.test. h.a.test. 1 7200 3600 1209600 300\n@ IN NS ns1.a.test.\nns1 IN A 192.0.2.1\n%s", body);
+    zone_arena_t a;
+    zone_arena_init(&a);
+    parse_error_t err;
+    memset(&err, 0, sizeof(err));
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.default_origin = "a.test.";
+    ctx.err_out = &err;
+    ctx.is_standalone_mode = true;
+    char *buf = arena_strdup(&a, text);
+    assert(buf && parse_zone_fast(buf, strlen(buf), &a, &ctx) >= 0);
+    build_zone_index(&a, true);
+    if (fix) fix(&a);
+    kc_tally_t t = { 0, 0, lint_sink, o };
+    zone_lint_ttl(&a, "zone file", &t);
+    zone_lint_in_t in;
+    memset(&in, 0, sizeof(in));
+    in.domain = "a.test.";
+    in.src = "lint.zone";
+    in.raw_text = raw;
+    zone_lint_records(&a, &in, &t);
+    zone_arena_destroy(&a);
+}
+
+static void lint_expect(const char *label, const lint_out_t *o, const char *needle) {
+    if (!strstr(o->text, needle)) {
+        fprintf(stderr, "lint: %s: no \"%s\" in\n%s", label, needle, o->text);
+        assert(0);
+    }
+}
+
+static void fix_tinydns(zone_arena_t *a) {
+    tinydns_location_entry_t *locs = calloc(3, sizeof(*locs));      /* the arena frees it */
+    memcpy(locs[0].code, "ab", 2); locs[0].prefix_bits = 33;
+    memcpy(locs[1].code, "cd", 2); locs[1].prefix_bits = 8;
+    memcpy(locs[2].code, "cd", 2); locs[2].prefix_bits = 16;
+    a->is_tinydns_format = true;
+    a->locations = locs;
+    a->location_count = 3;
+}
+
+static void fix_soa_restricted(zone_arena_t *a) {
+    tinydns_location_entry_t *locs = calloc(1, sizeof(*locs));
+    memcpy(locs[0].code, "ab", 2);
+    locs[0].prefix_bits = 8;
+    a->is_tinydns_format = true;
+    a->locations = locs;
+    a->location_count = 1;
+    for (size_t i = 0; i < a->count; i++)
+        if (a->records[i].type_code == 6) {
+            a->records[i].tinydns_ttd = 1;                 /* a countdown time stamp in the past */
+            a->records[i].tinydns_ttl_countdown = true;
+        }
+}
+
+static void fix_soa_loc(zone_arena_t *a) {
+    fix_soa_restricted(a);
+    for (size_t i = 0; i < a->count; i++)
+        if (a->records[i].type_code == 6) {
+            a->records[i].tinydns_ttd = 0;
+            a->records[i].tinydns_loc[0] = 'z';             /* a location the zone does not define */
+            a->records[i].tinydns_loc[1] = 'z';
+        }
+}
+
+/* record shapes the parser never produces (lint is also fed the zones a database reader builds): the arena is changed after the parse */
+static int g_mut;
+static void fix_mutate(zone_arena_t *a) {
+    for (size_t i = 0; i < a->count; i++) {
+        dns_record_t *r = &a->records[i];
+        if (!r->name || strncmp(r->name, "x.", 2) != 0) continue;
+        switch (g_mut) {
+        case 1: if (r->type_code == 1) r->rdata_count = 0; break;
+        case 2: if (r->type_code == 1) r->rdata[0] = (char *)"999.1.1.1"; break;
+        case 3: if (r->type_code == 28) r->rdata_count = 0; break;
+        case 4: if (r->type_code == 28) r->rdata[0] = (char *)"2001:zz::1"; break;
+        case 5: if (r->type_code == 64) r->rdata[1] = (char *)"target"; break;
+        case 6: if (r->type_code == 27) r->rdata_count = 2; break;
+        case 7: if (r->type_code == 19) r->rdata_count = 0; break;
+        case 8: if (r->type_code == 20) r->rdata_count = 0; break;
+        case 9: if (r->type_code == 1) r->type_code = 251; break;
+        }
+    }
+}
+
+static void test_lint_messages(void) {
+    printf("[TEST] tools: zone checks, message by message...\n");
+    lint_out_t o;
+    /* ML-DSA-44 (draft-westerbaan-dnssec-mldsa): the sizes of the key and the signature */
+    lint_zone(&o, "@ IN DNSKEY 257 3 18 AwEAAQ==\n", NULL, NULL);
+    lint_expect("mldsa key", &o, "algorithm 18 (MLDSA44) public key must be 1312 octets, found 4");
+    lint_zone(&o, "@ IN RRSIG A 18 2 300 20300101000000 20200101000000 1 a.test. AwEAAQ==\n", NULL, NULL);
+    lint_expect("mldsa signature", &o, "algorithm 18 (MLDSA44) signature must be 2420 octets, found 4");
+    lint_zone(&o, "@ IN DNSKEY 257 3 18 !!!!\n", NULL, NULL);
+    lint_expect("mldsa base64", &o, "public key is not valid base64");
+    /* NSEC3 chains the server does not use or that are unwise (RFC 5155, RFC 9276) */
+    lint_zone(&o, "@ IN NSEC3 2 0 1 AABB 2t7b4g4vsa5smi47k61mv5bv1a22bojr A\n", NULL, NULL);
+    lint_expect("nsec3 algorithm", &o, "only hash algorithm 1 (SHA-1) is defined (RFC 5155 section 3.1.1)");
+    lint_expect("nsec3 iterations", &o, "the iteration count MUST be 0 (RFC 9276 section 3.1)");
+    lint_expect("nsec3 salt", &o, "operators SHOULD NOT use a salt");
+    lint_expect("nsec3 param", &o, "matches no NSEC3PARAM with Flags 0 at the apex");
+    lint_zone(&o, "@ IN NSEC3 1 128 1 AABB 2t7b4g4vsa5smi47k61mv5bv1a22bojr A\n", NULL, NULL);
+    lint_expect("nsec3 flags", &o, "have reserved Flags bits set; only bit 0 (opt-out) is defined (RFC 5155 section 3.1.2)");
+    lint_zone(&o, "@ IN NSEC3 1 0 600 AABB 2t7b4g4vsa5smi47k61mv5bv1a22bojr A\n", NULL, NULL);
+    lint_expect("nsec3 excessive", &o, "E NSEC3 chain (iterations 600, salt AABB; 1 RRs) in zone 'a.test.': iterations value is excessively high");
+
+    /* tinydns: locations and the raw lines of the data file */
+    lint_zone(&o, "", "", fix_tinydns);
+    lint_expect("location /33", &o, "E Location prefix length /33 exceeds /32 for location 'ab' in zone 'a.test.'");
+    lint_expect("duplicate location", &o, "W Duplicate location code 'cd' in zone 'a.test.' (lint.zone)");
+    lint_zone(&o,
+              "",
+              "-comment\r\n"
+              "6x.a.test.:zz:300\r\n"
+              "3v6.a.test.:2001:300\n"
+              "Ss.a.test.:192.0.2.3:t:99999:70000:80000:300\n"
+              "Ssz.a.test.:192.0.2.3:t:80:10:10:300\n"
+              "Nn.a.test.:70000:80000:u:E2U+sip:!x!y!:.:300\n"
+              "_k.a.test.:300:9:0123\n"
+              "_k2.a.test.:1:1:zz\n"
+              "_k3.a.test.:1:1:\n",
+              fix_tinydns);
+    lint_expect("type 6", &o, "(line 2): type '6' requires a 32-character hexadecimal IPv6 address, got 'zz'");
+    lint_expect("type 3", &o, "(line 3): type '3' requires a 32-character hexadecimal IPv6 address, got '2001'");
+    lint_expect("srv port", &o, "(line 4): SRV port '99999' out of range (0-65535)");
+    lint_expect("srv weight", &o, "(line 4): SRV weight '70000' out of range (0-65535)");
+    lint_expect("srv priority", &o, "(line 4): SRV priority '80000' out of range (0-65535)");
+    lint_expect("naptr order", &o, "(line 6): NAPTR order '70000' out of range (0-65535)");
+    lint_expect("naptr preference", &o, "(line 6): NAPTR preference '80000' out of range (0-65535)");
+    lint_expect("sshfp algorithm", &o, "(line 7): SSHFP algorithm '300' out of range (0-255)");
+    lint_expect("sshfp fp_type", &o, "(line 7): SSHFP fp_type '9' is outside standard RFC assignments (1-2)");
+    lint_expect("sshfp hex", &o, "(line 8): SSHFP invalid fingerprint hex string 'zz'");
+    lint_expect("sshfp empty", &o, "(line 9): SSHFP invalid fingerprint hex string ''");
+    lint_zone(&o, "", "_k.a.test.:0:300:0123\n", fix_tinydns);
+    lint_expect("sshfp fp_type range", &o, "SSHFP fp_type '300' out of range (0-255)");
+    lint_expect("sshfp algorithm 0", &o, "SSHFP algorithm '0' is outside standard RFC assignments (1-4)");
+
+    /* the apex SOA that no client sees */
+    lint_zone(&o, "", "", fix_soa_restricted);
+    lint_expect("soa expired", &o, "has expired (countdown time stamp in the past): no client sees it");
+    lint_zone(&o, "", "", fix_soa_loc);
+    lint_expect("soa location", &o, "is restricted to location 'zz', which the zone does not define: no client sees it");
+    /* shapes of records that the zone parser would not accept: A / AAAA parameters and addresses, SVCB target, GPOS / X25 / ISDN fields, meta-types */
+    static const struct { int mut; const char *body; const char *needle; } shapes[] = {
+        { 1, "x IN A 192.0.2.7\n", "E A record must have exactly 1 parameter for name 'x.a.test.'" },
+        { 2, "x IN A 192.0.2.7\n", "E Invalid IPv4 address '999.1.1.1' for name 'x.a.test.'" },
+        { 3, "x IN AAAA 2001:db8::1\n", "E AAAA record must have exactly 1 parameter for name 'x.a.test.'" },
+        { 4, "x IN AAAA 2001:db8::1\n", "E Invalid IPv6 address '2001:zz::1' for name 'x.a.test.'" },
+        { 5, "x IN SVCB 1 target.a.test. alpn=h2\n", "W SVCB record TargetName 'target' does not end with a dot" },
+        { 6, "x IN GPOS 1 2 3\n", "W GPOS record requires exactly 3 fields" },
+        { 7, "x IN X25 12345\n", "W X25 record requires at least 1 field for name 'x.a.test.'" },
+        { 8, "x IN ISDN \"150862028003217\"\n", "W ISDN record requires 1 or 2 fields for name 'x.a.test.'" },
+        { 9, "x IN A 192.0.2.7\n", "E type 251 is a meta-type and must not appear as a standalone RRset in zone 'a.test.'" },
+    };
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        g_mut = shapes[i].mut;
+        lint_zone(&o, shapes[i].body, NULL, fix_mutate);
+        lint_expect("record shape", &o, shapes[i].needle);
+    }
+    lint_zone(&o, "", "6x.a.test.:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz:300\n", fix_tinydns);
+    lint_expect("type 6, 32 characters that are not hexadecimal", &o, "type '6' requires a 32-character hexadecimal IPv6 address, got 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz'");
+    printf("  -> zone check messages compared.\n");
+}
+
 int main(void) {
     wd_start("test_coverage_sweep_tools", 300);
     printf("=== Tools Coverage Sweep Tests ===\n");
@@ -349,6 +529,7 @@ int main(void) {
     snprintf(g_tmp, sizeof(g_tmp), "/tmp/ktools_XXXXXX");
     if (!mkdtemp(g_tmp)) { perror("mkdtemp"); return 1; }
     WD_PHASE("test_karicheck"); test_karicheck();
+    WD_PHASE("test_lint_messages"); test_lint_messages();
     WD_PHASE("test_karictl"); test_karictl();
     printf("=== All Tools Coverage Sweep Tests PASSED (%d runs) ===\n", g_runs);
     return 0;

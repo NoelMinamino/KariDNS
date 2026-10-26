@@ -286,9 +286,81 @@ static void test_capsicum_sandbox_execution(void) {
     printf("  -> enter_capsicum_sandbox passed.\n");
 }
 
+static void dc_name(const char *name, void *ud) {
+    int *found = ud;
+    if (strcmp(name, "a.txt") == 0) (*found)++;
+}
+
+/* the same calls with paths the cache must refuse (no file name, "." / ".." as the name), a directory that is not there, a directory
+ * first opened read-only and then asked for with write access, a ".." inside a relative directory (D-24), listing and unlinking */
+static void test_priv_sandbox_path_errors(void) {
+    printf("[TEST] Priv Sandbox: refused paths, list and unlink through the directory cache...\n");
+    static const char *const bad[] = { "", "/tmp/dir/", "/tmp/..", "/tmp/." };
+    struct stat sb;
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        errno = 0; assert(open_via_dir_cache(bad[i], O_RDONLY, 0, false) == -1 && errno == EINVAL);
+        errno = 0; assert(stat_via_dir_cache(bad[i], &sb) == -1 && errno == EINVAL);
+        errno = 0; assert(unlink_via_dir_cache(bad[i]) == -1 && errno == EINVAL);
+        errno = 0; assert(list_dir_via_dir_cache(bad[i], dc_name, NULL) == -1 && errno == EINVAL);
+        assert(renameat_via_dir_cache(bad[i], "/tmp/karidns_dc_never") == -1);
+        assert(renameat_via_dir_cache("/tmp/karidns_dc_never", bad[i]) == -1);
+    }
+    char dir[] = "/tmp/karidns_dc_XXXXXX";
+    assert(mkdtemp(dir) != NULL);
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/a.txt", dir);
+    int fd = open(p, O_CREAT | O_WRONLY, 0600);
+    assert(fd >= 0);
+    close(fd);
+
+    errno = 0;
+    snprintf(p, sizeof(p), "%s_nope/x.txt", dir);
+    assert(open_via_dir_cache(p, O_RDONLY, 0, false) == -1 && errno == ENOENT);       /* the directory is not there */
+    assert(stat_via_dir_cache(p, &sb) == -1);
+    assert(list_dir_via_dir_cache(p, dc_name, NULL) == -1);
+    assert(unlink_via_dir_cache(p) == -1);
+
+    snprintf(p, sizeof(p), "%s/a.txt", dir);
+    fd = open_via_dir_cache(p, O_RDONLY, 0, false);                                    /* the directory is cached read-only ... */
+    assert(fd >= 0);
+    close(fd);
+    char q[PATH_MAX];
+    snprintf(q, sizeof(q), "%s/b.txt", dir);
+    fd = open_via_dir_cache(q, O_CREAT | O_WRONLY, 0600, true);                        /* ... and opened again for writing */
+    assert(fd >= 0);
+    close(fd);
+    assert(stat_via_dir_cache(q, &sb) == 0);
+
+    int found = 0;
+    assert(list_dir_via_dir_cache(p, dc_name, &found) == 0 && found == 1);
+    assert(unlink_via_dir_cache(q) == 0);
+    assert(stat_via_dir_cache(q, &sb) == -1);
+    assert(unlink_via_dir_cache(q) == -1);                                             /* gone already */
+
+    /* a relative directory with ".." in it: opened from the start-up directory (D-24) */
+    char old[PATH_MAX];
+    assert(getcwd(old, sizeof(old)) != NULL);
+    assert(chdir(dir) == 0);
+    assert(mkdir("sub", 0700) == 0);
+    snprintf(g_startup_cwd, sizeof(g_startup_cwd), "%s", dir);
+    fd = open_via_dir_cache("sub/../a.txt", O_RDONLY, 0, false);
+    assert(fd >= 0);
+    close(fd);
+    g_startup_cwd[0] = '\0';
+    assert(chdir(old) == 0);
+
+    snprintf(p, sizeof(p), "%s/a.txt", dir);
+    unlink(p);
+    snprintf(p, sizeof(p), "%s/sub", dir);
+    rmdir(p);
+    rmdir(dir);
+    printf("  -> Priv Sandbox refused paths passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Sandbox & Snapshot RCU Engine Unit Tests ===\n");
     test_priv_sandbox_directory_caching();
+    test_priv_sandbox_path_errors();
     test_snapshot_rcu_lifecycle_and_suffix_lookup();
     test_capsicum_sandbox_execution();
     printf("=== All Sandbox & Snapshot RCU Engine Unit Tests PASSED ===\n");

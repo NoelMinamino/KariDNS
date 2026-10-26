@@ -10,7 +10,7 @@ In the commands below, replace `?.?.?` with the release version (for example `0.
 
 | OS / Platform | Artifact | Included Binaries / Assets | Installation Method |
 |---|---|---|---|
-| **FreeBSD** 14.x / 15.x (amd64) | `karidns-?.?.?-FreeBSD-14-amd64.pkg`, `karidns-?.?.?-FreeBSD-15-amd64.pkg` | `karidns`, `karictl`, `karicheck`, `dag`, sample configs, rc.d script | `pkg add` |
+| **FreeBSD** 14.x / 15.x (amd64) | `karidns-?.?.?-FreeBSD-14-amd64.pkg`, `karidns-?.?.?-FreeBSD-15-amd64.pkg`; with a database loader: `karidns-sqlite3-?.?.?-FreeBSD-14-amd64.pkg`, `karidns-postgresql-...`, `karidns-db-...`, each for FreeBSD 14 and 15 (see [§2.5](#25-packages-with-the-database-loader)) | `karidns`, `karictl`, `karicheck`, `dag`, sample configs, rc.d script, manuals (database packages: `karidns-dbloader` and the SQL files) | `pkg add` |
 | **Linux (RPM)** RHEL 9 / Rocky / AlmaLinux / Fedora (x86_64) | `dag-?.?.?-1.el9.x86_64.rpm` | `dag` | `dnf install` / `rpm -ivh` |
 | **Linux (DEB)** Ubuntu / Debian (amd64) | `dag_?.?.?_amd64.deb` | `dag` | `dpkg -i` |
 | **Linux (Generic)** x86_64 | `dag-?.?.?-linux-x86_64.tar.gz` | `dag` (standalone binary) | Extract & copy to `/usr/local/bin` |
@@ -57,6 +57,12 @@ Use `pkg add -f` to replace an already installed version in place.
   - `/usr/local/etc/karidns/zones/example.local.zone.sample`
 - **Service Management:**
   - `/usr/local/etc/rc.d/karidns`
+- **Manuals:**
+  - `/usr/local/share/doc/karidns/` (`karidns.md`, `karictl.md`, `karicheck.md`, `dag.md`, `dag_replay.md`)
+- **Database packages only** (§2.5):
+  - `/usr/local/libexec/karidns-dbloader` (the database loader, root:wheel, 0555)
+  - `/usr/local/share/karidns/db/*.sql` (extension tables, change-log triggers, role script of the packaged drivers)
+  - `/usr/local/share/doc/karidns/karidns-dbloader.md`
 
 ### 2.3 Starting the Service
 1. Copy the configuration and sample zone, then edit them (`user`, `group`, secrets, zones):
@@ -79,6 +85,26 @@ The rc.d script supports these `rc.conf` variables:
 | `karidns_flags` | `${karidns_config}` | Arguments passed to `karidns`. |
 
 Before starting, the script validates the configuration with `karicheck conf`, creates `/var/run/karidns` (root:wheel, 0755) and `/var/log/named` (owned by the `bind` user, or `named` if `bind` does not exist). `service karidns reload` runs `karictl reload` (or sends `SIGHUP` when `karictl` is not installed), and `service karidns checkconf` runs `karicheck conf`.
+
+### 2.5 Packages with the database loader
+
+Zones can be served from a PowerDNS 5.1 SQLite3 or PostgreSQL database ([`karidns-dbloader(8)`](karidns-dbloader.md)). The server never links a database library; only the loader `karidns-dbloader` does, so the loader and its dependencies decide which package you install. There are four FreeBSD packages, built from the same server and tools by `packaging/freebsd/build_pkg.sh --db none|sqlite3|postgresql|both`. They install the same files, so each one `conflicts` with the other three (install only one):
+
+| Package | `--db` | `karidns-dbloader` | Dependencies besides `libidn2` |
+|---|---|---|---|
+| `karidns` | `none` (default) | not installed | none |
+| `karidns-sqlite3` | `sqlite3` | SQLite3 driver | `databases/sqlite3` |
+| `karidns-postgresql` | `postgresql` | PostgreSQL driver | `databases/postgresqlNN-client` (libpq; NN is the version installed on the build host) |
+| `karidns-db` | `both` | both drivers | both |
+
+The release workflow builds and publishes all four packages for each FreeBSD version (the database packages with `build_pkg.sh --db sqlite3`, `--db postgresql` and `--db both` in a VM that has `sqlite3` and `postgresql17-client` installed, so the PostgreSQL packages depend on `postgresql17-client`), and checks that the loader of each reports exactly the drivers of its package. To build one yourself, use a FreeBSD host that has the library, as a normal user, from the top of the source tree (each run starts with `make clean`; the version is the first argument and is only used for the file name and the package metadata):
+
+```sh
+sh packaging/freebsd/build_pkg.sh --db sqlite3 0.5.0 ./dist
+pkg add ./dist/karidns-sqlite3-0.5.0-FreeBSD-15-amd64.pkg
+```
+
+`pkg add` of a downloaded file does not fetch dependencies: install `libidn2` and `sqlite3` (or `postgresqlNN-client`) first, as in §2.1. The packages with a loader also install the SQL files that create the KariDNS tables and triggers (`/usr/local/share/karidns/db/`, for example `sqlite3 /var/db/karidns/zones.sqlite3 < /usr/local/share/karidns/db/karidns_ext.sqlite3.sql`) and the manual. `karidns` refuses a `database { driver x; }` that the installed loader does not have, and `karicheck db` in the plain package says `DB support is not installed`. To go from one package to another, remove the installed one first (`pkg delete karidns`) and install the other; the configuration files you created are not touched.
 
 ---
 

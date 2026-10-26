@@ -1,9 +1,12 @@
 -- karidns_loader_role.pgsql.sql - the privileges of the PostgreSQL role that karidns-dbloader connects as (beta design 2.2, 7.1,
--- D11; milestone B10).  The loader only reads: SELECT on the PowerDNS tables it uses and on the karidns_* tables, and
--- nothing on the key material of cryptokeys.
+-- D11; milestones B10, B11).  The loader only reads: SELECT on the PowerDNS tables it uses and on the karidns_* tables, and
+-- nothing on the key material of cryptokeys; the one thing it writes is its own status row (B11, below).
+--
+-- Manual: docs/karidns-dbloader.md (the schema and trigger files, the privileges, the drivers) and the database chapter of
+-- docs/karidns.md.  The packages karidns-sqlite3, karidns-postgresql and karidns-db install this file in /usr/local/share/karidns/db/.
 --
 -- Create the role yourself (authentication is yours: a UNIX socket with peer authentication for the user the loader runs
--- as is the simplest, see `conninfo-file` in docs/karidns.md), then, as the owner of the tables:
+-- as is the simplest, see `conninfo-file` in docs/karidns.md), then, as a superuser (or the owner of the tables with CREATEROLE and the ADMIN option on the role: the script also runs ALTER ROLE):
 --     psql -v ON_ERROR_STOP=1 -v role=karidns_loader -v schema=public -f karidns_loader_role.pgsql.sql karidns
 -- `role` is the loader's role, `schema` the schema that holds the PowerDNS and karidns_* tables (one run per schema when the
 -- views have schemas of their own).  The script can be run again.
@@ -17,7 +20,10 @@
 --   published): the loader asks which zones have keys (a zone with keys but without PRESIGNED metadata is refused) and can
 --   never read `content`, the private keys.  Everything else is revoked from the role on cryptokeys first.
 --   default_transaction_read_only = on for the role (the loader also sets it per session and begins READ ONLY transactions).
--- Multi-server status (B11) will add INSERT / UPDATE on karidns_server_status for the same role.
+--   Multi-server status (B11): INSERT and UPDATE on karidns_server_status, the one table the loader writes (the outcome of each reload
+--   request, db/karidns_ext.pgsql.sql); SELECT on karidns_reload_requests comes with the karidns_* grant above.  The write is an explicit
+--   BEGIN READ WRITE ... COMMIT of its own, so default_transaction_read_only = on stays: every other transaction of the loader is read
+--   only.  The grant is only made when the table exists (the multi-server tables are optional); run the script again after adding them.
 
 \if :{?role}
 \else
@@ -38,6 +44,12 @@ SELECT format('GRANT SELECT ON %I.%I TO %I', :'schema', c.relname, :'role')
   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
  WHERE n.nspname = :'schema' AND c.relkind IN ('r', 'p') AND c.relname LIKE 'karidns\_%' ESCAPE '\'
  ORDER BY c.relname
+\gexec
+
+-- B11: the loader reports the outcome of a reload request to karidns_server_status (only when the table exists)
+SELECT format('GRANT INSERT, UPDATE ON %I.%I TO %I', :'schema', c.relname, :'role')
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = :'schema' AND c.relkind IN ('r', 'p') AND c.relname = 'karidns_server_status'
 \gexec
 
 ALTER ROLE :"role" SET default_transaction_read_only = on;

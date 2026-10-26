@@ -1,6 +1,9 @@
 -- karidns_ext.pgsql.sql - the KariDNS extension tables and the change-log triggers for a PowerDNS 5.1 gpgsql database
 -- (beta design 3.7, 5.1, 6; milestones B6a, B10).  Schema version 2.  PostgreSQL 13 or later (transition tables, xid8).
 --
+-- Manual: docs/karidns-dbloader.md (the schema and trigger files, the privileges, the drivers) and the database chapter of
+-- docs/karidns.md.  The packages karidns-sqlite3, karidns-postgresql and karidns-db install this file in /usr/local/share/karidns/db/.
+--
 -- Apply it once, as the owner of the PowerDNS tables, after the PowerDNS schema (schema.pgsql.sql), in the schema that
 -- holds them (a view with its own schema needs its own copy: SET search_path TO that_schema first):
 --     psql -v ON_ERROR_STOP=1 -f karidns_ext.pgsql.sql karidns
@@ -28,8 +31,13 @@
 -- first for a non-default schema) is pinned into the functions, so a trigger fired by a writer with another search_path still logs into
 -- the karidns_changes of the schema the DDL was installed in (tests/run_db_ddl_test.sh).
 --
+-- Multi-server operation (B11; release plan 4.8, beta design 3.7): karidns_reload_requests and karidns_server_status, at the end of
+-- this file.  They are optional: karidns-dbloader looks for them like for the other karidns_* tables, and without them a server
+-- simply does not watch for requests or report (so the schema version stays 2: applying this file again to a version 2 database
+-- adds the two tables, nothing else changes, and db/karidns_ext_v1_to_v2.pgsql.sql needs no new step).
+--
 -- TRUNCATE is not logged (a trigger on TRUNCATE has no transition tables); use DELETE, or `karictl reload` afterwards.
--- The loader role needs SELECT on karidns_changes (and the other tables it reads); it never writes.
+-- The loader role needs SELECT on karidns_changes (and the other tables it reads); it only writes karidns_server_status (B11).
 --
 -- The retention is the number 1000000 in karidns_changes_prune_fn below; tests/run_db_ddl_test.sh replaces it by 5 to test
 -- the pruning on a small scale.
@@ -258,3 +266,73 @@ CREATE TRIGGER karidns_trg_profiles_upd AFTER UPDATE ON karidns_profiles REFEREN
   FOR EACH STATEMENT EXECUTE FUNCTION karidns_trg_profiles_upd_fn();
 CREATE TRIGGER karidns_trg_profiles_del AFTER DELETE ON karidns_profiles REFERENCING OLD TABLE AS old_rows
   FOR EACH STATEMENT EXECUTE FUNCTION karidns_trg_profiles_del_fn();
+
+-- ---------------------------------------------------------------------------------------------------------------------------------
+-- Multi-server operation (B11; release plan 4.8).  Several karidns servers read one database.  A management tool (WebAdmin, a
+-- script) that wants every server to reload INSERTs one row into karidns_reload_requests, after the data it wants them to see
+-- is committed; every server's karidns-dbloader LISTENs, reads the new rows, reloads, and writes the outcome to its row of
+-- karidns_server_status.  "At the same time" means within seconds, with visible per-server status; it is not atomic.
+--     INSERT INTO karidns_reload_requests DEFAULT VALUES;                 -- every zone of this schema
+--     INSERT INTO karidns_reload_requests (zone) VALUES ('example.test'); -- one zone (name without a trailing dot is fine)
+--     INSERT INTO karidns_reload_requests (zone, force) VALUES (NULL, true);   -- compare and send everything, even unchanged zones
+--     SELECT server_id, generation, ok, applied_at, failed_zones FROM karidns_server_status ORDER BY server_id;
+-- A server that has applied generation G has the data of every transaction that committed before request G (replicas included:
+-- the request row reaches a replica after the data, by WAL order).  Several requests that arrive together are one reload: any
+-- request for all zones (zone NULL), or a hole in the generations (rows pruned or rolled back), makes it a full diff, else the
+-- listed zones are reloaded; force is the OR of the requests.  The tables are per schema (a view with a schema of its own needs
+-- its own copy of this file, like the other karidns_* tables).
+--
+--   karidns_reload_requests   generation: the order of the requests (an IDENTITY column; the loader reads generation > the last it
+--                             applied).  The INSERT trigger first takes a transaction-level advisory lock on the table, so that
+--                             two concurrent requesters take their generations in the order they commit (otherwise a request with
+--                             a lower generation could become visible after a higher one was applied, and be skipped); requesters
+--                             wait for each other until commit, so commit soon.  Then AFTER INSERT, pg_notify('karidns_reload',
+--                             generation).  Only the newest 1000 requests are kept.
+--   karidns_server_status     one row per server-id (the `server-id` of the database block, default the host name): the last
+--                             request the server applied, when, whether every zone loaded (ok), and, if not, the zones that
+--                             did not ("zone: reason" lines, at most 64 lines and 4 KiB, control characters written as \DDD).
+--                             The loader role needs INSERT and UPDATE on this table (db/karidns_loader_role.pgsql.sql).
+CREATE TABLE IF NOT EXISTS karidns_reload_requests (
+  generation   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  zone         VARCHAR(255) NULL,                 -- NULL = all zones of this schema
+  force        BOOLEAN NOT NULL DEFAULT false
+);
+
+CREATE TABLE IF NOT EXISTS karidns_server_status (
+  server_id    VARCHAR(64) PRIMARY KEY,
+  generation   BIGINT NOT NULL,                   -- the last request applied
+  applied_at   TIMESTAMPTZ NOT NULL,
+  ok           BOOLEAN NOT NULL,
+  failed_zones TEXT NOT NULL DEFAULT ''           -- "zone: reason" lines, capped
+);
+
+-- requesters take the lock before the generation is drawn (a statement-level BEFORE trigger runs before any row), and keep it
+-- until they commit: generations then become visible in order.  The key is the OID of this table (one lock per schema's copy).
+CREATE OR REPLACE FUNCTION karidns_reload_requests_lock_fn() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock('karidns_reload_requests'::regclass::oid::bigint);
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS karidns_reload_requests_lock ON karidns_reload_requests;
+CREATE TRIGGER karidns_reload_requests_lock BEFORE INSERT ON karidns_reload_requests
+  FOR EACH STATEMENT EXECUTE FUNCTION karidns_reload_requests_lock_fn();
+
+CREATE OR REPLACE FUNCTION karidns_reload_requests_notify_fn() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  PERFORM pg_notify('karidns_reload', (SELECT max(generation)::text FROM new_rows));
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS karidns_reload_requests_notify ON karidns_reload_requests;
+CREATE TRIGGER karidns_reload_requests_notify AFTER INSERT ON karidns_reload_requests
+  REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION karidns_reload_requests_notify_fn();
+
+-- prune: keep the newest 1000 requests
+CREATE OR REPLACE FUNCTION karidns_reload_requests_prune_fn() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  DELETE FROM karidns_reload_requests WHERE generation <= (SELECT max(generation) FROM new_rows) - 1000;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS karidns_reload_requests_prune ON karidns_reload_requests;
+CREATE TRIGGER karidns_reload_requests_prune AFTER INSERT ON karidns_reload_requests
+  REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION karidns_reload_requests_prune_fn();

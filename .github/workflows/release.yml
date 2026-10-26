@@ -84,6 +84,52 @@ jobs:
           name: freebsd-${{ matrix.release }}-packages
           path: dist/karidns-*.pkg*
 
+      # The packages with a database loader (docs/distribution.md 2.5): karidns-sqlite3, karidns-postgresql, karidns-db.
+      # Built in their own directory (dist-db), so that "pkg add dist/karidns-*.pkg" above stays the plain package only
+      # (the four packages conflict with each other).
+      - name: Build FreeBSD ${{ matrix.release }} Database Packages inside FreeBSD VM
+        uses: vmactions/freebsd-vm@v1.4.8
+        with:
+          release: ${{ matrix.release }}
+          run: |
+            set -e
+            # sqlite3: libsqlite3 for the SQLite3 driver; postgresql17-client: libpq for the PostgreSQL driver
+            # (the same version as the coverage job of ci.yml; build_pkg.sh takes the dependency from the libpq it linked)
+            pkg install -y pkgconf libidn2 sqlite3 postgresql17-client
+            # the binaries must link the base system OpenSSL (see the step above)
+            if pkg info -e openssl; then pkg delete -fy openssl; fi
+            mkdir -p dist-db
+            TAG_VER="${{ env.RELEASE_VER }}"
+            chmod +x packaging/freebsd/build_pkg.sh
+            ./packaging/freebsd/build_pkg.sh --db sqlite3 "$TAG_VER" ./dist-db
+            ./packaging/freebsd/build_pkg.sh --db postgresql "$TAG_VER" ./dist-db
+            ./packaging/freebsd/build_pkg.sh --db both "$TAG_VER" ./dist-db
+            ls -l dist-db
+
+            echo "::group::🧪 [Verification] Test installing the database packages on ${{ matrix.release }}"
+            # one at a time: the four packages install the same files
+            for spec in "karidns-sqlite3:sqlite3" "karidns-postgresql:postgresql" "karidns-db:sqlite3 postgresql"; do
+              name="${spec%%:*}"; want="${spec#*:}"
+              pkg add dist-db/${name}-[0-9]*.pkg
+              pkg info -d "$name"
+              test -x /usr/local/libexec/karidns-dbloader
+              got=$(/usr/local/libexec/karidns-dbloader --drivers | tr '\n' ' ' | sed 's/ $//')
+              if [ "$got" != "$want" ]; then
+                echo "::error::$name: karidns-dbloader has the drivers '$got', expected '$want'"; exit 1
+              fi
+              if ldd /usr/local/libexec/karidns-dbloader | grep -E 'lib(crypto|ssl)[.]so' | grep -q '/usr/local/'; then
+                echo "::error::$name: karidns-dbloader links the ports OpenSSL"; exit 1
+              fi
+              pkg delete -y "$name"
+            done
+            echo "::endgroup::"
+
+      - name: Upload FreeBSD ${{ matrix.release }} Database Package Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: freebsd-${{ matrix.release }}-db-packages
+          path: dist-db/karidns-*.pkg*
+
   build-and-test-linux:
     name: Build & Test Linux Packages (RPM, DEB, tar.gz)
     runs-on: ubuntu-latest

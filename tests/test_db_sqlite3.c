@@ -202,6 +202,8 @@ static int zl_collect(void *ud, const db_zone_row_t *z) {
     return 0;
 }
 
+static int stop_zone(void *ud, const db_zone_row_t *z) { (void)ud; (void)z; return 1; }
+
 static void zl_free(zl_t *l) {
     for (size_t i = 0; i < l->n; i++) { free(l->name[i]); free(l->type[i]); free(l->soa[i]); }
     l->n = 0;
@@ -230,7 +232,7 @@ static void test_open(void) {
         CHECK(db_driver_sqlite3.wait_fd(c) == -1);
         bool changed = true;
         CHECK(db_driver_sqlite3.drain_notifications(c, &changed) == 0 && !changed);
-        db_status_t st = { 1, true, NULL };
+        db_status_t st = { 1, true, NULL, "ns1" };
         CHECK(db_driver_sqlite3.report_status(c, &st) == 0);
         db_driver_sqlite3.close(c);
     }
@@ -496,6 +498,21 @@ static void test_scans(void) {
         CHECK(l.soa[3] == NULL);                       /* the SOA is disabled */
         CHECK(l.soa[1] != NULL);
     }
+    zl_free(&l);
+
+    /* B13 find_zone: the same row as the list gives, found by name (ASCII case-insensitive, one optional trailing dot) */
+    CHECK(db_driver_sqlite3.find_zone(c, "TWO.Test.", zl_collect, &l) == 0 && l.n == 1);
+    CHECK(l.n == 1 && l.id[0] == 2 && strcmp(l.name[0], "two.test") == 0 && l.soa[0] != NULL);   /* two enabled SOAs: one row */
+    zl_free(&l);
+    CHECK(db_driver_sqlite3.find_zone(c, "four.test", zl_collect, &l) == 0 && l.n == 1 && l.id[0] == 4 && l.soa[0] == NULL);
+    zl_free(&l);
+    CHECK(db_driver_sqlite3.find_zone(c, "three.test.", zl_collect, &l) == 0 && l.n == 1 && l.id[0] == 3 && strcmp(l.type[0], "SLAVE") == 0);
+    zl_free(&l);
+    CHECK(db_driver_sqlite3.find_zone(c, "nope.test", zl_collect, &l) == 0 && l.n == 0);       /* absent: no row, no error */
+    CHECK(db_driver_sqlite3.find_zone(c, "one.test..", zl_collect, &l) == 0 && l.n == 0);      /* only one trailing dot is ignored */
+    CHECK(db_driver_sqlite3.find_zone(c, "ne.test", zl_collect, &l) == 0 && l.n == 0);         /* no partial match */
+    CHECK(db_driver_sqlite3.find_zone(c, "one.test", stop_zone, &l) == DB_STOPPED);
+    CHECK(db_driver_sqlite3.find_zone(c, "one.test", zl_collect, &l) == 0 && l.n == 1 && l.id[0] == 1);   /* the statement is usable again */
     zl_free(&l);
 
     /* bulk == the per-zone scans one after the other (orphans only in the bulk scan) */
@@ -1041,6 +1058,988 @@ static void test_dump(void) {
     dump_free(&d);
 }
 
+/* ------------------------------------------------------------------ B11: failed zones, requests, the server id, the status entry */
+static void test_failed_zones(void) {
+    printf("failed_zones (B11)\n");
+    char out[FZ_LINE];
+
+    /* escaping: printable ASCII as it is; control characters, DEL and bytes >= 0x80 as \DDD (no line end survives) */
+    size_t n = fz_escape("a\nb\r\tc\x7f" "d\xc3\xa9", 10, out, sizeof(out));
+    CHECK_MSG(!strcmp(out, "a\\010b\\013\\009c\\127d\\195\\169"), "escaped: %s", out);
+    CHECK(n == strlen(out));
+    n = fz_escape("a\r", 2, out, sizeof(out));
+    CHECK_MSG(!strcmp(out, "a\\013"), "CR: %s", out);
+    n = fz_escape("back\\slash \"q\"", 14, out, sizeof(out));
+    CHECK_MSG(!strcmp(out, "back\\slash \"q\""), "printable as it is: %s", out);
+    CHECK(strchr(out, '\n') == NULL);
+    char small[8];
+    n = fz_escape("abc\ndef", 7, small, sizeof(small));                  /* "abc" + "\010" = 7 bytes + NUL fits */
+    CHECK_MSG(!strcmp(small, "abc\\010") && n == 7, "fits: %s", small);
+    n = fz_escape("abcd\ndef", 8, small, sizeof(small));                 /* the escape does not fit: it is not cut in the middle */
+    CHECK_MSG(!strcmp(small, "abcd") && n == 4, "not cut: %s", small);
+    n = fz_escape("ab\0cd", 5, small, sizeof(small));                    /* stops at a NUL */
+    CHECK(n == 2);
+
+    /* collecting: only while on; the view is kept; "name: reason" */
+    fz_t *f = calloc(1, sizeof(*f));
+    uint16_t v0[] = { 0 }, v1[] = { 1 }, v01[] = { 0, 1 };
+    char text[FZ_REPORT_BYTES + 1];
+    bool ok = false;
+    fz_add(f, 0, "off.test.", "ignored", 7);
+    CHECK(f->n == 0);
+    fz_report(f, v01, 2, text, &ok);
+    CHECK(ok && text[0] == '\0');
+    fz_reset(f, true);
+    fz_add(f, 0, "z1.test.", "bad rdata", 9);
+    fz_add(f, 1, "z2.test.", "serial went back", 16);
+    fz_add(f, 0, "we\nird\x01" "name", "multi\0line", 5);                 /* the length bounds the reason: "multi" */
+    fz_add(f, 0, NULL, NULL, 0);
+    fz_report(f, v0, 1, text, &ok);
+    CHECK(!ok);
+    CHECK_MSG(!strcmp(text, "z1.test.: bad rdata\nwe\\010ird\\001name: multi\n(NULL): rejected"), "view 0: %s", text);
+    fz_report(f, v1, 1, text, &ok);
+    CHECK(!ok && !strcmp(text, "z2.test.: serial went back"));
+    uint16_t v2[] = { 2 };
+    fz_report(f, v2, 1, text, &ok);
+    CHECK_MSG(ok && !text[0], "a view without failures is ok");
+    fz_report(f, v01, 2, text, &ok);
+    CHECK(!ok && strchr(text, '\n') != NULL);
+    /* nothing in the text can break a line: every newline is a separator between "name: reason" lines */
+    int lines = 1;
+    for (const char *p = text; *p; p++) if (*p == '\n') lines++;
+    CHECK(lines == 4);
+
+    /* at most 64 lines */
+    fz_reset(f, true);
+    for (int i = 0; i < 70; i++) {
+        char nm[32];
+        snprintf(nm, sizeof(nm), "z%d.test.", i);
+        fz_add(f, 0, nm, "r", 1);
+    }
+    fz_report(f, v0, 1, text, &ok);
+    lines = 1;
+    for (const char *p = text; *p; p++) if (*p == '\n') lines++;
+    CHECK_MSG(!ok && lines == 65 && strstr(text, "\n... and 6 more") != NULL && strlen(text) <= FZ_REPORT_BYTES, "70 failures: %d lines", lines);
+    CHECK(!strncmp(text, "z0.test.: r\nz1.test.: r\n", 24));
+    /* at most 4 KiB: long names and reasons */
+    fz_reset(f, true);
+    char longname[300], longreason[300];
+    memset(longname, 'n', sizeof(longname) - 1);
+    longname[sizeof(longname) - 1] = '\0';
+    memset(longreason, 'r', sizeof(longreason) - 1);
+    longreason[sizeof(longreason) - 1] = '\0';
+    for (int i = 0; i < 40; i++) fz_add(f, 0, longname, longreason, strlen(longreason));
+    fz_report(f, v0, 1, text, &ok);
+    CHECK_MSG(!ok && strlen(text) <= FZ_REPORT_BYTES && strstr(text, " more") != NULL, "bytes: %zu", strlen(text));
+    CHECK_MSG(strstr(text, "nnnnnnnnnnnnnnnn: rrrr") != NULL, "name and reason are both there");
+    /* more failures than are kept: not ok for anybody, and the text says the list is incomplete */
+    fz_reset(f, true);
+    for (int i = 0; i < FZ_MAX_ENT + 5; i++) fz_add(f, 0, "x.test.", "r", 1);
+    CHECK(f->n == FZ_MAX_ENT && f->overflow);
+    fz_report(f, v1, 1, text, &ok);
+    CHECK_MSG(!ok && strstr(text, "more zones failed") != NULL, "overflow: %s", text);
+    free(f);
+
+    /* the ZONE_RESULT of the Backend reaches the collector (rejected only), the loader's own failures too (send_failed) */
+    struct lio *io = calloc(1, sizeof(*io));
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_enc_begin(&e, KDB_T_ZONE_RESULT);
+    kdb_enc_u16(&e, 1, 3);
+    kdb_enc_name(&e, 2, "z9.test.");
+    kdb_enc_u8(&e, 3, KDB_ST_REJECTED);
+    kdb_enc_str(&e, 4, "CNAME and other data");
+    kdb_enc_end(&e);
+    kdb_frame_t fr = { KDB_T_ZONE_RESULT, e.buf + KDB_HEADER_LEN, (uint32_t)(e.len - KDB_HEADER_LEN) };
+    io_dispatch(io, &fr);                                                /* not collecting */
+    CHECK(io->fz.n == 0 && io->n_rejected == 1 && !io->failed);
+    fz_reset(&io->fz, true);
+    io_dispatch(io, &fr);
+    CHECK(io->fz.n == 1 && io->fz.ent[0].view == 3 && !strcmp(io->fz.ent[0].text, "z9.test.: CNAME and other data"));
+    kdb_enc_reset(&e);
+    kdb_enc_begin(&e, KDB_T_ZONE_RESULT);
+    kdb_enc_u16(&e, 1, 3);
+    kdb_enc_name(&e, 2, "z8.test.");
+    kdb_enc_u8(&e, 3, KDB_ST_APPLIED);
+    kdb_enc_end(&e);
+    fr.body = e.buf + KDB_HEADER_LEN;
+    fr.len = (uint32_t)(e.len - KDB_HEADER_LEN);
+    io_dispatch(io, &fr);
+    CHECK_MSG(io->fz.n == 1, "an applied zone is not a failure");
+    kdb_enc_free(&e);
+    {
+        ctx_t x;
+        memset(&x, 0, sizeof(x));
+        x.io = io;
+        x.view = 5;
+        kdb_enc_init(&x.enc);
+        zinfo_t zi;
+        memset(&zi, 0, sizeof(zi));
+        zi.id = 77;
+        zi.name = "bad\nname..test";                                    /* cannot be a zone name: not written to the stream, still reported */
+        CHECK(send_failed(&x, &zi, "domains row is odd") == 0 && x.n_unwritten == 1);
+        CHECK_MSG(io->fz.n == 2 && io->fz.ent[1].view == 5 && !strcmp(io->fz.ent[1].text, "bad\\010name..test: domains row is odd"),
+                  "loader failure: %s", io->fz.n > 1 ? io->fz.ent[1].text : "(none)");
+        kdb_enc_free(&x.enc);
+    }
+    free(io);
+}
+
+static void test_requests_batch(void) {
+    printf("reload request batch (B11)\n");
+    rq_batch_t *b = calloc(1, sizeof(*b));
+    b->zone = calloc(RW_ZONES, DNS_NAME_TEXT_SIZE);
+    db_reload_row_t r1 = { 1, "Example.TEST", false }, r2 = { 2, "example.test.", true }, r3 = { 3, "b.test", false };
+    rq_row(b, &r1);
+    rq_row(b, &r2);
+    rq_row(b, &r3);
+    CHECK_MSG(b->rows == 3 && !b->all && b->force && b->nz == 2 && !b->nbad, "rows=%llu nz=%zu", (unsigned long long)b->rows, b->nz);
+    CHECK_MSG(!strcasecmp(b->zone[0], "example.test.") && !strcmp(b->zone[1], "b.test."), "canonical: %s %s", b->zone[0], b->zone[1]);
+    /* untrusted names: never handed on; the first few are kept (printable) for the status row */
+    db_reload_row_t bad1 = { 4, "", false }, bad2 = { 5, "a..b", false }, bad3 = { 6, "x\ny.test", false };
+    rq_row(b, &bad1);
+    rq_row(b, &bad2);
+    rq_row(b, &bad3);
+    CHECK_MSG(b->nbad == 3 && b->nz == 2 && !b->all, "bad names: %u", b->nbad);
+    CHECK(strchr(b->bad[2], '\n') == NULL);
+    db_reload_row_t all = { 7, NULL, false };
+    rq_row(b, &all);
+    CHECK(b->all && b->rows == 7);
+    free(b->zone);
+    free(b);
+    /* more than RW_ZONES different zones: the whole source */
+    b = calloc(1, sizeof(*b));
+    b->zone = calloc(RW_ZONES, DNS_NAME_TEXT_SIZE);
+    for (int i = 0; i < RW_ZONES + 1; i++) {
+        char nm[32];
+        snprintf(nm, sizeof(nm), "z%d.test", i);
+        db_reload_row_t rr = { (uint64_t)i + 1, nm, false };
+        rq_row(b, &rr);
+    }
+    CHECK_MSG(b->all && b->nz == RW_ZONES, "65 zones: all=%d nz=%zu", b->all, b->nz);
+    free(b->zone);
+    free(b);
+}
+
+static void test_server_id(void) {
+    printf("server-id (B11)\n");
+    struct lio *io = calloc(1, sizeof(*io));
+    snprintf(io->cfg.server_id, sizeof(io->cfg.server_id), "ns1");
+    sid_resolve(io);
+    CHECK(io->sid_ok && !strcmp(io->sid, "ns1"));
+    /* none set: the host name (D-B11-6) */
+    io->cfg.server_id[0] = '\0';
+    char h[256];
+    h[0] = '\0';
+    CHECK(gethostname(h, sizeof(h)) == 0);
+    h[sizeof(h) - 1] = '\0';
+    sid_resolve(io);
+    if (h[0] && strlen(h) <= 64) CHECK_MSG(io->sid_ok && !strcmp(io->sid, h), "host name: '%s' vs '%s'", io->sid, h);
+    else CHECK_MSG(!io->sid_ok && io->sid_why[0], "host name unusable (%zu bytes): reporting is off", strlen(h));
+    /* longer than 64 bytes: no id, a reason, and the warning is given once */
+    memset(io->cfg.server_id, 'a', 65);
+    io->cfg.server_id[65] = '\0';
+    io->sid_warned = false;
+    sid_resolve(io);
+    CHECK(!io->sid_ok && !io->sid[0] && strstr(io->sid_why, "longer than 64") != NULL && io->sid_warned);
+    io->cfg.server_id[64] = '\0';
+    sid_resolve(io);
+    CHECK(io->sid_ok && strlen(io->sid) == 64 && !io->sid_warned);
+    free(io);
+}
+
+/* the AUTO_STATUS entry of a view whose source has reload requests: the flags, the server id, the generation, ok, the error, the time */
+static void test_status_entry(void) {
+    printf("AUTO_STATUS entry (B11)\n");
+    struct lio *io = calloc(1, sizeof(*io));
+    io->cfg.views = calloc(2, sizeof(lview_t));
+    io->cfg.nviews = 2;
+    io->cfg.views[0].index = 0;
+    io->cfg.views[0].name = strdup("default");
+    io->cfg.views[1].index = 1;
+    io->cfg.views[1].name = strdup("other");
+    io->cfg.views[1].auto_reload = 1;
+    snprintf(io->sid, sizeof(io->sid), "ns7");
+    io->sid_ok = true;
+    rw_t *r = &io->rw[0];
+    io->nrw = 1;
+    r->seeded = true;
+    r->views = malloc(sizeof(uint16_t));
+    r->views[0] = 0;
+    r->nv = r->cv = 1;
+    r->last = 42;
+    r->applied_ok = false;
+    r->rep_time = 1700000000;
+    snprintf(r->rerr, sizeof(r->rerr), "cannot write karidns_server_status: permission denied");
+    char path[600];
+    snprintf(path, sizeof(path), "%s/status.bin", g_dir);
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    kdb_enc_init(&x.enc);
+    x.out = fopen(path, "wb");
+    CHECK(auto_send_status(&x, io) == 0);
+    fclose(x.out);
+    kdb_enc_free(&x.enc);
+    char *bin = slurp(path);
+    FILE *fp = fopen(path, "rb");
+    fseek(fp, 0, SEEK_END);
+    long len = ftell(fp);
+    fclose(fp);
+    CHECK(bin && len > KDB_HEADER_LEN);
+    uint8_t *body = malloc(KDB_MAX_BODY);
+    kdb_framer_t fr;
+    kdb_framer_init(&fr, KDB_FROM_LOADER, body, KDB_MAX_BODY);
+    CHECK(kdb_framer_feed(&fr, (const uint8_t *)bin, (size_t)len) == KDB_OK);
+    kdb_frame_t frame;
+    kdb_msg_t m;
+    char why[KDB_REASON_LEN];
+    CHECK(kdb_framer_next(&fr, &frame) == KDB_OK && frame.type == KDB_T_AUTO_STATUS);
+    CHECK_MSG(kdb_decode(&frame, 2, &m, why, sizeof(why)) == KDB_OK, "decode: %s", why);
+    kdb_iter_t it;
+    kdb_auto_status_entry_t en;
+    kdb_auto_status_entries(&m, &it);
+    CHECK(kdb_auto_status_entries_next(&it, &en));
+    CHECK_MSG(en.view == 0 && en.flags == KDB_AS_REQ && en.server_id.len == 3 && !memcmp(en.server_id.p, "ns7", 3) && en.req_generation == 42 &&
+                  !en.req_ok && en.req_time == 1700000000 && en.req_error.len > 10 && !memcmp(en.req_error.p, "cannot write", 12),
+              "request entry: flags %u gen %llu", en.flags, (unsigned long long)en.req_generation);
+    CHECK(kdb_auto_status_entries_next(&it, &en));
+    CHECK_MSG(en.view == 1 && en.flags == KDB_AS_AUTO && en.server_id.p == NULL && en.req_generation == 0, "auto entry of the other view: flags %u", en.flags);
+    CHECK(!kdb_auto_status_entries_next(&it, &en));
+    /* neither auto reload nor a watcher: no entry, no message */
+    io->cfg.views[1].auto_reload = 0;
+    r->absent = true;
+    ctx_t x2;
+    memset(&x2, 0, sizeof(x2));
+    kdb_enc_init(&x2.enc);
+    x2.out = fopen(path, "wb");
+    CHECK(auto_send_status(&x2, io) == 0);
+    fclose(x2.out);
+    kdb_enc_free(&x2.enc);
+    fp = fopen(path, "rb");
+    fseek(fp, 0, SEEK_END);
+    CHECK(ftell(fp) == 0);
+    fclose(fp);
+    free(bin);
+    free(body);
+    free(r->views);
+    cfg_free(&io->cfg);
+    io_free_views(io);
+    free(io);
+}
+
+/* ---------------------------------------------------------------- --check (B12, `karicheck db`) */
+
+/* run_check() on path; the protocol lines it writes, and its status */
+static char *check_run(const char *path, bool auto_reload, int *status) {
+    char outp[700];
+    snprintf(outp, sizeof(outp), "%s/check.out", g_dir);
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    x.drv = &db_driver_sqlite3;
+    x.nthreads = 1;
+    x.check = true;
+    x.chk_opts.auto_reload = auto_reload;
+    kdb_enc_init(&x.enc);
+    g_chk_out = fopen(outp, "wb");
+    g_chk_errors = g_chk_warnings = 0;
+    g_chk_zone[0] = '\0';
+    g_chk_id = 0;
+    db_source_t src = { "sqlite3", path, NULL, NULL, 0 };
+    *status = run_check(&x, &src);
+    fprintf(g_chk_out, "R\t%u\t%u\t%u\n", x.chk_zones, g_chk_errors, g_chk_warnings);
+    fclose(g_chk_out);
+    g_chk_out = NULL;
+    ctx_view_reset(&x);
+    kdb_enc_free(&x.enc);
+    char *s = slurp(outp);
+    unlink(outp);
+    return s ? s : strdup("");
+}
+
+/* every line of s is a line of the protocol: a known tag, the field count of the tag, no byte outside 0x20..0x7e but the TABs */
+static bool check_lines_ok(const char *s) {
+    char *copy = strdup(s), *save = NULL;
+    bool ok = true;
+    for (char *ln = strtok_r(copy, "\n", &save); ln; ln = strtok_r(NULL, "\n", &save)) {
+        char *f[CHK_MAX_FIELDS];
+        int n = chk_split(ln, f, CHK_MAX_FIELDS);
+        char t = n > 0 ? f[0][0] : 0;
+        if (n < 1 || f[0][1] != '\0' || !t) { ok = false; continue; }
+        if (strchr("EWIOD", t) && n == 4) continue;
+        if (t == 'Z' && n >= 5) continue;
+        if (t == 'S' && n == 6) continue;
+        if (t == 'R' && n == 4) continue;
+        ok = false;
+    }
+    free(copy);
+    return ok;
+}
+
+static void test_check_mode(void) {
+    printf("check mode (B12)\n");
+    char path[500];
+    int st;
+    sqlite3 *db = make_db("chk.db", path, sizeof(path));
+    CHECK(db != NULL);
+    add_simple_zone(db, 1, 1, "good.test");
+    char *out = check_run(path, false, &st);
+    CHECK(st == EXIT_OK);
+    CHECK_HAS(out, "Z\tgood.test.\t1\tprimary\t*\n");
+    CHECK_HAS(out, "W\t\t0\tnone of the karidns_* extension tables exists");
+    CHECK_HAS(out, "R\t1\t0\t1\n");
+    CHECK(check_lines_ok(out));
+    free(out);
+
+    /* a zone the production load refuses is an error with its records.id; the good zone is still read */
+    add_zone(db, 2, "bad.test", "NATIVE");
+    add_rec(db, 10, 2, "bad.test", "SOA", "ns1.bad.test hostmaster.bad.test 7 7200 3600 1209600 300", 3600, -1, 0, NULL);
+    add_rec(db, 11, 2, "bad.test", "NS", "ns1.bad.test", 3600, -1, 0, NULL);
+    add_rec(db, 12, 2, "x.bad.test", "A", "not an address", 3600, -1, 0, NULL);
+    out = check_run(path, false, &st);
+    CHECK(st == EXIT_ZONES_FAILED);
+    CHECK_HAS(out, "E\tbad.test.\t2\trecords.id 12: ");
+    CHECK_HAS(out, "Z\tgood.test.\t1\tprimary\t*\n");
+    CHECK_HAS(out, "R\t2\t1\t1\n");
+    CHECK(check_lines_ok(out));
+    free(out);
+
+    /* text from the database never carries a control character or a backslash into a line: it is escaped */
+    add_zone(db, 3, "esc.test", "NATIVE");
+    add_rec(db, 20, 3, "esc.test", "SOA", "ns1.esc.test hostmaster.esc.test 7 7200 3600 1209600 300", 3600, -1, 0, NULL);
+    add_rec(db, 21, 3, "esc.test", "NS", "ns1.esc.test", 3600, -1, 0, NULL);
+    add_rec(db, 22, 3, "esc.test", "TXT", "\"a\tb\\c\"", 3600, -1, 0, NULL);
+    add_rec(db, 23, 3, "esc.test", "FOO", "x\ty", 3600, -1, 0, NULL);
+    out = check_run(path, false, &st);
+    CHECK(check_lines_ok(out));
+    CHECK(st == EXIT_ZONES_FAILED);
+    CHECK_HAS(out, "E\tesc.test.\t3\trecords.id ");
+    free(out);
+
+    /* the views that karidns_domain_views names, and a zone type that is not loaded */
+    raw_exec(db, "CREATE TABLE karidns_domain_views (domain_id INTEGER NOT NULL, view_name VARCHAR(64) NOT NULL, PRIMARY KEY (domain_id, view_name))");
+    sqlf(db, "INSERT INTO karidns_domain_views VALUES (1, 'va'), (1, 'Vb')");
+    add_zone(db, 4, "prod.test", "PRODUCER");
+    sqlf(db, "UPDATE domains SET catalog = 'nothere.test' WHERE id = 1");
+    out = check_run(path, false, &st);
+    CHECK(check_lines_ok(out));
+    CHECK(strstr(out, "Z\tgood.test.\t1\tprimary\tva\tVb\n") || strstr(out, "Z\tgood.test.\t1\tprimary\tVb\tva\n"));       /* the rows of one zone come in table order */
+    CHECK_HAS(out, "Z\tprod.test.\t4\tother\t*\n");
+    CHECK_HAS(out, "W\tprod.test.\t4\tthe catalog zone prod.test. is not served (catalog producer zones are not supported yet); its 0 member zones are served; secondaries that take the catalog from KariDNS will not get it\n");
+    CHECK(strstr(out, "E\tprod.test.") == NULL);
+    CHECK_HAS(out, "W\tgood.test.\t1\tdomains.catalog names 'nothere.test'");
+    free(out);
+
+    /* schema: all missing columns are named; the zones are not read */
+    sqlite3 *db2 = make_db("chk2.db", path, sizeof(path));
+    raw_exec(db2, "ALTER TABLE records DROP COLUMN ttl; ALTER TABLE records DROP COLUMN prio");
+    out = check_run(path, false, &st);
+    CHECK(st == EXIT_ZONES_FAILED);
+    CHECK_HAS(out, "E\t\t0\ttable records has no column ttl, prio (PowerDNS 5.1 schema expected)\n");
+    CHECK(strstr(out, "\nZ\t") == NULL && out[0] != 'Z');
+    free(out);
+    sqlite3_close(db2);
+
+    /* auto-reload needs the change log and its triggers */
+    sqlite3 *db3 = make_db("chk3.db", path, sizeof(path));
+    out = check_run(path, true, &st);
+    CHECK(st == EXIT_ZONES_FAILED);
+    CHECK_HAS(out, "E\t\t0\tauto-reload yes needs the change log: table karidns_changes is missing");
+    free(out);
+    raw_exec(db3, "CREATE TABLE karidns_changes (seq INTEGER PRIMARY KEY AUTOINCREMENT, domain_id INTEGER NOT NULL, changed_at INTEGER NOT NULL)");
+    out = check_run(path, true, &st);
+    CHECK(st == EXIT_ZONES_FAILED);
+    CHECK_HAS(out, "auto-reload yes needs the change log triggers, but 13 are missing: karidns_changes_prune, karidns_trg_domains_ins, ");
+    free(out);
+    out = check_run(path, false, &st);
+    CHECK(st == EXIT_OK);
+    CHECK(strstr(out, "triggers") == NULL);
+    free(out);
+    sqlite3_close(db3);
+
+    /* a database file that is not there or is not a database */
+    snprintf(path, sizeof(path), "%s/nothere.db", g_dir);
+    out = check_run(path, false, &st);
+    CHECK(st == EXIT_ERROR);
+    CHECK_HAS(out, "E\t\t0\tdatabase file '");
+    CHECK_HAS(out, "No such file or directory");
+    free(out);
+    sqlite3_close(db);
+}
+
+/* ------------------------------------------------------------------ coverage: failures of a scan after the schema check, callbacks that stop a scan */
+
+static int cov_ok_zone(void *ud, const db_zone_row_t *z) { (void)ud; (void)z; return 0; }
+static int cov_ok_rec(void *ud, int64_t did, const db_record_row_t *r) { (void)ud; (void)did; (void)r; return 0; }
+static int cov_ok_meta(void *ud, const db_meta_row_t *m) { (void)ud; (void)m; return 0; }
+static int cov_ok_key(void *ud, int64_t id) { (void)ud; (void)id; return 0; }
+static int cov_ok_dv(void *ud, int64_t did, const char *v) { (void)ud; (void)did; (void)v; return 0; }
+static int cov_ok_prof(void *ud, const db_profile_row_t *p) { (void)ud; (void)p; return 0; }
+static int cov_ok_chg(void *ud, const db_change_row_t *r) { (void)ud; (void)r; return 0; }
+static int cov_ok_tags(void *ud, int64_t did, const db_tag_row_t *r) { (void)ud; (void)did; (void)r; return 0; }
+static int cov_ok_td(void *ud, int64_t did, const db_tinydns_row_t *r) { (void)ud; (void)did; (void)r; return 0; }
+static int cov_ok_def(void *ud, int64_t did, const db_tagdef_row_t *r) { (void)ud; (void)did; (void)r; return 0; }
+static int cov_stop_dv(void *ud, int64_t did, const char *v) { (void)ud; (void)did; (void)v; return 1; }
+static int cov_stop_prof(void *ud, const db_profile_row_t *p) { (void)ud; (void)p; return 1; }
+static int cov_stop_meta(void *ud, const db_meta_row_t *m) { (void)ud; (void)m; return 1; }
+static int cov_stop_key(void *ud, int64_t id) { (void)ud; (void)id; return 1; }
+static int cov_stop_chg(void *ud, const db_change_row_t *r) { (void)ud; (void)r; return 1; }
+static int cov_stop_td(void *ud, int64_t did, const db_tinydns_row_t *r) { (void)ud; (void)did; (void)r; return 1; }
+static int cov_stop_def(void *ud, int64_t did, const db_tagdef_row_t *r) { (void)ud; (void)did; (void)r; return 1; }
+
+static int cov_run_zones(db_conn_t *c) { return db_driver_sqlite3.list_zones(c, cov_ok_zone, NULL); }
+static int cov_run_rec_all(db_conn_t *c) { return db_driver_sqlite3.scan_records(c, NULL, cov_ok_rec, NULL); }
+static int cov_run_rec_one(db_conn_t *c) { int64_t d = 1; return db_driver_sqlite3.scan_records(c, &d, cov_ok_rec, NULL); }
+static int cov_run_rec_rng(db_conn_t *c) { return db_driver_sqlite3.scan_records_range(c, 1, 9, cov_ok_rec, NULL); }
+static int cov_run_meta(db_conn_t *c) { return db_driver_sqlite3.scan_metadata(c, NULL, cov_ok_meta, NULL); }
+static int cov_run_keys(db_conn_t *c) { return db_driver_sqlite3.zones_with_keys(c, cov_ok_key, NULL); }
+static int cov_run_dv(db_conn_t *c) { return db_driver_sqlite3.scan_domain_views(c, NULL, cov_ok_dv, NULL); }
+static int cov_run_prof(db_conn_t *c) { return db_driver_sqlite3.scan_profiles(c, cov_ok_prof, NULL); }
+static int cov_run_chg(db_conn_t *c) { uint64_t last; bool gap; return db_driver_sqlite3.changes_since(c, 0, cov_ok_chg, NULL, &last, &gap); }
+static int cov_run_ext(db_conn_t *c) {
+    db_ext_sink_t s = { cov_ok_tags, cov_ok_td, cov_ok_def, NULL };
+    return db_driver_sqlite3.scan_ext(c, NULL, &s);
+}
+
+/* a database with every table the driver can read, and a row in each */
+static sqlite3 *cov_make_db(const char *name, char *path, size_t cap) {
+    sqlite3 *db = make_db(name, path, cap);
+    if (!db) return NULL;
+    add_simple_zone(db, 1, 10, "s1.test");
+    add_simple_zone(db, 2, 20, "s2.test");
+    raw_exec(db, "CREATE TABLE karidns_changes (seq INTEGER PRIMARY KEY AUTOINCREMENT, domain_id INTEGER NOT NULL, changed_at INTEGER NOT NULL)");
+    raw_exec(db, "CREATE TABLE karidns_domain_views (domain_id INTEGER NOT NULL, view_name VARCHAR(64) NOT NULL, PRIMARY KEY (domain_id, view_name))");
+    raw_exec(db, "CREATE TABLE karidns_profiles (name VARCHAR(64) PRIMARY KEY, settings TEXT NOT NULL)");
+    raw_exec(db, "CREATE TABLE karidns_record_tags (record_id INTEGER PRIMARY KEY, location_tag VARCHAR(63), ecs_tag VARCHAR(63))");
+    raw_exec(db, "CREATE TABLE karidns_record_tinydns (record_id INTEGER PRIMARY KEY, ttd BIGINT, loc CHAR(2), countdown BOOLEAN NOT NULL DEFAULT 0)");
+    raw_exec(db, "CREATE TABLE karidns_zone_tagdefs (domain_id INTEGER NOT NULL, kind VARCHAR(8) NOT NULL, tag VARCHAR(63) NOT NULL, cidr VARCHAR(64) NOT NULL)");
+    raw_exec(db, "INSERT INTO karidns_changes (domain_id, changed_at) VALUES (1, 1), (2, 2)");
+    raw_exec(db, "INSERT INTO karidns_domain_views VALUES (1, 'va'), (2, 'vb')");
+    raw_exec(db, "INSERT INTO karidns_profiles VALUES ('p1', 'x'), ('p2', 'y')");
+    raw_exec(db, "INSERT INTO karidns_record_tags VALUES (11, 'lan', 'east')");
+    raw_exec(db, "INSERT INTO karidns_record_tinydns VALUES (12, 100, 'l2', 0)");
+    raw_exec(db, "INSERT INTO karidns_zone_tagdefs VALUES (1, 'location', 'a', '192.0.2.0/24')");
+    raw_exec(db, "INSERT INTO domainmetadata (id, domain_id, kind, content) VALUES (1, 1, 'ALSO-NOTIFY', '192.0.2.1')");
+    raw_exec(db, "INSERT INTO cryptokeys (id, domain_id, flags, active, content) VALUES (1, 2, 257, 1, 'x')");
+    raw_exec(db, "INSERT INTO domainmetadata (id, domain_id, kind, content) VALUES (2, 2, 'PRESIGNED', '1')");
+    return db;
+}
+
+static void test_scan_failures(void) {
+    printf("scans: a table that disappears after the schema check, callbacks that stop a scan, NUL bytes in the extension tables\n");
+    static const struct { const char *table; int (*run)(db_conn_t *); const char *what; } cases[] = {
+        { "domains",               cov_run_zones,   "list_zones" },
+        { "records",               cov_run_rec_all, "scan_records" },
+        { "records",               cov_run_rec_one, "scan_records" },
+        { "records",               cov_run_rec_rng, "scan_records" },
+        { "domainmetadata",        cov_run_meta,    "scan_metadata" },
+        { "cryptokeys",            cov_run_keys,    "zones_with_keys" },
+        { "karidns_domain_views",  cov_run_dv,      "scan_domain_views" },
+        { "karidns_profiles",      cov_run_prof,    "scan_profiles" },
+        { "karidns_changes",       cov_run_chg,     "changes_since" },
+        { "karidns_record_tags",   cov_run_ext,     "karidns_record_tags" },
+        { "karidns_record_tinydns", cov_run_ext,    "karidns_record_tinydns" },
+        { "karidns_zone_tagdefs",  cov_run_ext,     "karidns_zone_tagdefs" },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char path[600], err[DB_ERRLEN], sql[200];
+        sqlite3 *db = cov_make_db("scanfail.db", path, sizeof(path));
+        db_conn_t *c = db ? open_driver(path, 0, err, sizeof(err), NULL) : NULL;
+        CHECK(c != NULL);
+        if (!c) { if (db) sqlite3_close(db); continue; }
+        CHECK(db_driver_sqlite3.check_schema(c, NULL) == 0);
+        CHECK_MSG(cases[i].run(c) == 0, "%s: the scan works before the table goes", cases[i].what);       /* the statement is prepared and cached */
+        snprintf(sql, sizeof(sql), "ALTER TABLE %s RENAME TO %s_gone", cases[i].table, cases[i].table);
+        raw_exec(db, sql);
+        int rc = cases[i].run(c);
+        CHECK_MSG(rc == -1, "%s: a step that fails is an error, not DB_STOPPED / retry: %d", cases[i].what, rc);
+        CHECK_HAS(db_driver_sqlite3.errmsg(c), cases[i].what);
+        db_driver_sqlite3.close(c);
+        sqlite3_close(db);
+        unlink(path);
+    }
+
+    /* the callback of every scan can stop it (a non-zero return): DB_STOPPED, and the scan works again afterwards */
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = cov_make_db("scanstop.db", path, sizeof(path));
+    db_conn_t *c = db ? open_driver(path, 0, err, sizeof(err), NULL) : NULL;
+    CHECK(c != NULL);
+    if (!c) { if (db) sqlite3_close(db); return; }
+    CHECK(db_driver_sqlite3.check_schema(c, NULL) == 0);
+    CHECK(db_driver_sqlite3.scan_domain_views(c, NULL, cov_stop_dv, NULL) == DB_STOPPED);
+    CHECK(db_driver_sqlite3.scan_domain_views(c, NULL, cov_ok_dv, NULL) == 0);
+    CHECK(db_driver_sqlite3.scan_profiles(c, cov_stop_prof, NULL) == DB_STOPPED);
+    CHECK(db_driver_sqlite3.scan_profiles(c, cov_ok_prof, NULL) == 0);
+    CHECK(db_driver_sqlite3.scan_metadata(c, NULL, cov_stop_meta, NULL) == DB_STOPPED);
+    CHECK(db_driver_sqlite3.scan_metadata(c, NULL, cov_ok_meta, NULL) == 0);
+    CHECK(db_driver_sqlite3.zones_with_keys(c, cov_stop_key, NULL) == DB_STOPPED);
+    CHECK(db_driver_sqlite3.zones_with_keys(c, cov_ok_key, NULL) == 0);
+    {
+        uint64_t last = 99;
+        bool gap = true;
+        CHECK(db_driver_sqlite3.changes_since(c, 0, cov_stop_chg, NULL, &last, &gap) == DB_STOPPED);
+        CHECK_MSG(last == 1 && !gap, "the cursor stops at the row the callback refused: %llu", (unsigned long long)last);
+    }
+    {
+        db_ext_sink_t s1 = { cov_ok_tags, cov_stop_td, cov_ok_def, NULL };
+        db_ext_sink_t s2 = { cov_ok_tags, cov_ok_td, cov_stop_def, NULL };
+        CHECK(db_driver_sqlite3.scan_ext(c, NULL, &s1) == DB_STOPPED);
+        CHECK(db_driver_sqlite3.scan_ext(c, NULL, &s2) == DB_STOPPED);
+    }
+    /* B8: a value with an embedded NUL byte cannot be handed on as a C string: the scan fails and names the table, row and column */
+    raw_exec(db, "UPDATE karidns_domain_views SET view_name = 'v' || char(0) || 'x' WHERE domain_id = 1");
+    CHECK(db_driver_sqlite3.scan_domain_views(c, NULL, cov_ok_dv, NULL) == -1);
+    CHECK_HAS(db_driver_sqlite3.errmsg(c), "karidns_domain_views");
+    CHECK_HAS(db_driver_sqlite3.errmsg(c), "NUL");
+    raw_exec(db, "UPDATE karidns_profiles SET name = 'p' || char(0) || 'x' WHERE name = 'p1'");
+    CHECK(db_driver_sqlite3.scan_profiles(c, cov_ok_prof, NULL) == -1);
+    CHECK_HAS(db_driver_sqlite3.errmsg(c), "karidns_profiles");
+    raw_exec(db, "UPDATE karidns_record_tags SET location_tag = 'l' || char(0) || 'x'");
+    CHECK(db_driver_sqlite3.scan_ext(c, NULL, &(db_ext_sink_t){ cov_ok_tags, cov_ok_td, cov_ok_def, NULL }) == -1);
+    CHECK_HAS(db_driver_sqlite3.errmsg(c), "karidns_record_tags");
+    raw_exec(db, "UPDATE karidns_record_tags SET location_tag = 'lan'");
+    raw_exec(db, "UPDATE karidns_record_tinydns SET loc = 'l' || char(0)");
+    CHECK(db_driver_sqlite3.scan_ext(c, NULL, &(db_ext_sink_t){ cov_ok_tags, cov_ok_td, cov_ok_def, NULL }) == -1);
+    CHECK_HAS(db_driver_sqlite3.errmsg(c), "karidns_record_tinydns");
+    raw_exec(db, "UPDATE karidns_record_tinydns SET loc = 'l2'");
+    raw_exec(db, "UPDATE karidns_zone_tagdefs SET tag = 't' || char(0) || 'x'");
+    CHECK(db_driver_sqlite3.scan_ext(c, NULL, &(db_ext_sink_t){ cov_ok_tags, cov_ok_td, cov_ok_def, NULL }) == -1);
+    CHECK_HAS(db_driver_sqlite3.errmsg(c), "karidns_zone_tagdefs");
+    db_driver_sqlite3.close(c);
+
+    /* a database without the optional tables: the scans of the extension tables answer "unavailable", with the reason */
+    sqlite3 *plain = make_db("scanplain.db", path, sizeof(path));
+    add_simple_zone(plain, 1, 1, "plain.test");
+    c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (c) {
+        CHECK(db_driver_sqlite3.check_schema(c, NULL) == 0);
+        CHECK(db_driver_sqlite3.scan_profiles(c, cov_ok_prof, NULL) == DB_ERR_UNAVAILABLE);
+        CHECK_HAS(db_driver_sqlite3.errmsg(c), "karidns_profiles does not exist");
+        uint64_t seq = 0;
+        CHECK(db_driver_sqlite3.changes_max(c, &seq) == DB_ERR_UNAVAILABLE);
+        CHECK_HAS(db_driver_sqlite3.errmsg(c), "karidns_changes does not exist");
+        CHECK(db_driver_sqlite3.scan_domain_views(c, NULL, cov_ok_dv, NULL) == DB_ERR_UNAVAILABLE);
+        db_driver_sqlite3.close(c);
+    }
+    sqlite3_close(plain);
+    sqlite3_close(db);
+}
+
+/* ------------------------------------------------------------------ coverage: the loader's handling of a driver that fails, and its command line */
+
+/* standard output and error of the code under test go to a file until cap_end() (the CHECKs of the test print after it) */
+static int g_cap_fd1 = -1, g_cap_fd2 = -1;
+static char g_cap_path[700];
+
+static void cap_begin(void) {
+    snprintf(g_cap_path, sizeof(g_cap_path), "%s/cap.out", g_dir);
+    fflush(stdout);
+    fflush(stderr);
+    g_cap_fd1 = dup(1);
+    g_cap_fd2 = dup(2);
+    int fd = open(g_cap_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    dup2(fd, 1);
+    dup2(fd, 2);
+    close(fd);
+}
+
+static char *cap_end(void) {
+    fflush(stdout);
+    fflush(stderr);
+    dup2(g_cap_fd1, 1);
+    dup2(g_cap_fd2, 2);
+    close(g_cap_fd1);
+    close(g_cap_fd2);
+    char *s = slurp(g_cap_path);
+    unlink(g_cap_path);
+    return s ? s : strdup("");
+}
+
+/* db_driver_sqlite3 with one call that fails: the (after+1)th and every later call of g_ff_fn returns g_ff_rc, and errmsg() then says
+ * "injected failure of <call>".  The counters are atomic: the workers of loader-threads > 1 call it from several threads. */
+static const char *volatile g_ff_fn;
+static atomic_int g_ff_left;
+static int g_ff_rc;
+static atomic_bool g_ff_hit;
+static db_driver_t g_fdrv, g_pgdrv;          /* g_pgdrv: the same, under the name of the PostgreSQL driver (for the conninfo-file checks) */
+
+static bool ff_hit(const char *fn) {
+    const char *f = g_ff_fn;
+    if (!f || strcmp(f, fn) != 0) return false;
+    if (atomic_fetch_sub(&g_ff_left, 1) > 0) return false;
+    atomic_store(&g_ff_hit, true);
+    return true;
+}
+
+static int ff_open(db_conn_t **c, const db_source_t *s, char *err, size_t n) {
+    if (ff_hit("open")) {
+        *c = NULL;
+        snprintf(err, n, "injected failure of open");
+        return g_ff_rc;
+    }
+    return db_driver_sqlite3.open(c, s, err, n);
+}
+static char g_ff_msg[80];
+static const char *ff_errmsg(db_conn_t *c) { return atomic_load(&g_ff_hit) ? g_ff_msg : db_driver_sqlite3.errmsg(c); }
+static int ff_check_schema(db_conn_t *c, db_schema_info_t *o) { return ff_hit("check_schema") ? g_ff_rc : db_driver_sqlite3.check_schema(c, o); }
+static int ff_begin(db_conn_t *c) { return ff_hit("begin_snapshot") ? g_ff_rc : db_driver_sqlite3.begin_snapshot(c); }
+static int ff_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) { return ff_hit("list_zones") ? g_ff_rc : db_driver_sqlite3.list_zones(c, cb, ud); }
+static int ff_find_zone(db_conn_t *c, const char *n, db_zone_cb cb, void *ud) { return ff_hit("find_zone") ? g_ff_rc : db_driver_sqlite3.find_zone(c, n, cb, ud); }
+static int ff_scan_records(db_conn_t *c, const int64_t *d, db_record_cb cb, void *ud) { return ff_hit("scan_records") ? g_ff_rc : db_driver_sqlite3.scan_records(c, d, cb, ud); }
+static int ff_scan_range(db_conn_t *c, int64_t lo, int64_t hi, db_record_cb cb, void *ud) { return ff_hit("scan_records_range") ? g_ff_rc : db_driver_sqlite3.scan_records_range(c, lo, hi, cb, ud); }
+static int ff_scan_metadata(db_conn_t *c, const int64_t *d, db_meta_cb cb, void *ud) { return ff_hit("scan_metadata") ? g_ff_rc : db_driver_sqlite3.scan_metadata(c, d, cb, ud); }
+static int ff_keys(db_conn_t *c, db_key_cb cb, void *ud) { return ff_hit("zones_with_keys") ? g_ff_rc : db_driver_sqlite3.zones_with_keys(c, cb, ud); }
+static int ff_views(db_conn_t *c, const int64_t *d, db_domain_view_cb cb, void *ud) { return ff_hit("scan_domain_views") ? g_ff_rc : db_driver_sqlite3.scan_domain_views(c, d, cb, ud); }
+static int ff_profiles(db_conn_t *c, db_profile_cb cb, void *ud) { return ff_hit("scan_profiles") ? g_ff_rc : db_driver_sqlite3.scan_profiles(c, cb, ud); }
+static int ff_ext(db_conn_t *c, const int64_t *d, const db_ext_sink_t *s) { return ff_hit("scan_ext") ? g_ff_rc : db_driver_sqlite3.scan_ext(c, d, s); }
+static int ff_findings(db_conn_t *c, const db_check_opts_t *o, db_finding_cb cb, void *ud) { return ff_hit("schema_findings") ? g_ff_rc : db_driver_sqlite3.schema_findings(c, o, cb, ud); }
+
+static void ff_init(void) {
+    g_fdrv = db_driver_sqlite3;
+    g_fdrv.open = ff_open;
+    g_fdrv.errmsg = ff_errmsg;
+    g_fdrv.check_schema = ff_check_schema;
+    g_fdrv.begin_snapshot = ff_begin;
+    g_fdrv.list_zones = ff_list_zones;
+    g_fdrv.find_zone = ff_find_zone;
+    g_fdrv.scan_records = ff_scan_records;
+    g_fdrv.scan_records_range = ff_scan_range;
+    g_fdrv.scan_metadata = ff_scan_metadata;
+    g_fdrv.zones_with_keys = ff_keys;
+    g_fdrv.scan_domain_views = ff_views;
+    g_fdrv.scan_profiles = ff_profiles;
+    g_fdrv.scan_ext = ff_ext;
+    g_fdrv.schema_findings = ff_findings;
+    g_pgdrv = g_fdrv;
+    g_pgdrv.name = "postgresql";
+}
+
+static void ff_arm(const char *fn, int rc, int after) {
+    snprintf(g_ff_msg, sizeof(g_ff_msg), "injected failure of %s", fn ? fn : "-");
+    g_ff_fn = fn;
+    g_ff_rc = rc;
+    atomic_store(&g_ff_left, after);
+    atomic_store(&g_ff_hit, false);
+}
+
+/* run_dump() with the failing driver; *log is what the loader wrote to standard error */
+static int ff_dump(const char *path, const char *only, uint32_t threads, const char *map_view, char **log) {
+    char outp[700];
+    snprintf(outp, sizeof(outp), "%s/ffdump.out", g_dir);
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    x.drv = &g_fdrv;
+    x.nthreads = threads;
+    x.map_view = map_view;
+    kdb_enc_init(&x.enc);
+    x.out = fopen(outp, "wb");
+    db_source_t src = { "sqlite3", path, NULL, NULL, 0 };
+    cap_begin();
+    int st = run_dump(&x, &src, only);
+    *log = cap_end();
+    fclose(x.out);
+    ctx_view_reset(&x);
+    kdb_enc_free(&x.enc);
+    unlink(outp);
+    return st;
+}
+
+/* run_check() with the failing driver (drv: g_fdrv or g_pgdrv, src: its source); *out is the protocol text */
+static int ff_check(const db_driver_t *drv, const db_source_t *src, char **out) {
+    char outp[700];
+    snprintf(outp, sizeof(outp), "%s/ffcheck.out", g_dir);
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    x.drv = drv;
+    x.nthreads = 1;
+    x.check = true;
+    kdb_enc_init(&x.enc);
+    g_chk_out = fopen(outp, "wb");
+    g_chk_errors = g_chk_warnings = 0;
+    g_chk_zone[0] = '\0';
+    g_chk_id = 0;
+    int st = run_check(&x, src);
+    fclose(g_chk_out);
+    g_chk_out = NULL;
+    ctx_view_reset(&x);
+    kdb_enc_free(&x.enc);
+    *out = slurp(outp);
+    unlink(outp);
+    if (!*out) *out = strdup("");
+    return st;
+}
+
+static void test_driver_faults(void) {
+    printf("loader: a driver call that fails (dump, loader-threads, check)\n");
+    ff_init();
+    char path[600], ppath[600], *log;
+    sqlite3 *db = cov_make_db("ff.db", path, sizeof(path));
+    sqlite3_close(db);
+    sqlite3 *pdb = make_db("ffpool.db", ppath, sizeof(ppath));
+    for (int i = 1; i <= 8; i++) {
+        char n[40];
+        snprintf(n, sizeof(n), "p%d.test", i);
+        add_simple_zone(pdb, i, i * 10, n);
+    }
+    sqlite3_close(pdb);
+
+    ff_arm(NULL, 0, 0);
+    { int hs = ff_dump(path, NULL, 1, NULL, &log); CHECK_MSG(hs == EXIT_OK, "healthy: %d %s", hs, log); }        /* the wrapper alone changes nothing */
+    free(log);
+
+    /* a dump: the failing call, the words the loader logs for it, and the exit status for a failure and for "busy, try again" */
+    static const struct { const char *fn; const char *map_view; const char *only; const char *what; } dump_cases[] = {
+        { "open",              NULL, NULL,      "injected failure of open" },
+        { "check_schema",      NULL, NULL,      "schema: " },
+        { "begin_snapshot",    NULL, NULL,      "snapshot: " },
+        { "list_zones",        NULL, NULL,      "reading the zone list: " },
+        { "find_zone",         NULL, "s1.test", "reading the zone list: " },
+        { "scan_domain_views", "va", NULL,      "reading karidns_domain_views: " },
+        { "zones_with_keys",   NULL, NULL,      "reading metadata: " },
+        { "scan_profiles",     NULL, NULL,      "reading karidns_profiles: " },
+        { "scan_metadata",     NULL, NULL,      "reading metadata: " },
+        { "scan_ext",          NULL, NULL,      "reading the tags and tinydns attributes: " },
+        { "scan_records",      NULL, NULL,      "reading records: " },
+        { "scan_records",      NULL, "s1.test", "reading the zone: " },
+        { "scan_metadata",     NULL, "s1.test", "reading the zone: " },
+    };
+    for (size_t i = 0; i < sizeof(dump_cases) / sizeof(dump_cases[0]); i++) {
+        for (int retry = 0; retry < 2; retry++) {
+            ff_arm(dump_cases[i].fn, retry ? DB_ERR_RETRY : -1, 0);
+            int st = ff_dump(path, dump_cases[i].only, 1, dump_cases[i].map_view, &log);
+            CHECK_MSG(st == (retry ? EXIT_RETRY : EXIT_ERROR), "dump, %s fails (%s): exit status %d", dump_cases[i].fn, retry ? "busy" : "error", st);
+            CHECK_MSG(strstr(log, dump_cases[i].what) != NULL && strstr(log, "injected failure") != NULL, "dump, %s fails: log \"%s\"", dump_cases[i].fn, log);
+            free(log);
+        }
+    }
+
+    /* loader-threads 4: a worker has its own connection; its failure ends the load with that status */
+    static const struct { const char *fn; int after; const char *what; } pool_cases[] = {
+        { "open",               1, "injected failure of open" },       /* the first open is the main thread's */
+        { "check_schema",       1, "schema: " },
+        { "begin_snapshot",     1, "snapshot: " },
+        { "scan_records_range", 0, "reading records: " },
+    };
+    for (size_t i = 0; i < sizeof(pool_cases) / sizeof(pool_cases[0]); i++) {
+        for (int retry = 0; retry < 2; retry++) {
+            ff_arm(pool_cases[i].fn, retry ? DB_ERR_RETRY : -1, pool_cases[i].after);
+            int st = ff_dump(ppath, NULL, 4, NULL, &log);
+            CHECK_MSG(st == (retry ? EXIT_RETRY : EXIT_ERROR), "4 threads, %s fails (%s): exit status %d", pool_cases[i].fn, retry ? "busy" : "error", st);
+            CHECK_MSG(strstr(log, pool_cases[i].what) != NULL, "4 threads, %s fails: log \"%s\"", pool_cases[i].fn, log);
+            free(log);
+        }
+    }
+    ff_arm(NULL, 0, 0);
+    CHECK(ff_dump(ppath, NULL, 4, NULL, &log) == EXIT_OK);
+    free(log);
+
+    /* --check: a failing call is an E line and the exit status of a source that could not be read */
+    static const struct { const char *fn; const char *what; } chk_cases[] = {
+        { "open",              "injected failure of open" },
+        { "schema_findings",   "schema: " },
+        { "check_schema",      "schema: " },
+        { "begin_snapshot",    "snapshot: " },
+        { "list_zones",        "reading the zone list: " },
+        { "scan_domain_views", "reading karidns_domain_views: " },
+        { "zones_with_keys",   "reading metadata: " },
+        { "scan_profiles",     "reading karidns_profiles: " },
+        { "scan_metadata",     "reading metadata: " },
+        { "scan_ext",          "reading the tags and tinydns attributes: " },
+        { "scan_records",      "reading records: " },
+    };
+    db_source_t src = { "sqlite3", path, NULL, NULL, 0 };
+    for (size_t i = 0; i < sizeof(chk_cases) / sizeof(chk_cases[0]); i++) {
+        for (int retry = 0; retry < 2; retry++) {
+            ff_arm(chk_cases[i].fn, retry ? DB_ERR_RETRY : -1, 0);
+            char *out;
+            int st = ff_check(&g_fdrv, &src, &out);
+            CHECK_MSG(st == (retry ? EXIT_RETRY : EXIT_ERROR), "check, %s fails (%s): exit status %d", chk_cases[i].fn, retry ? "busy" : "error", st);
+            CHECK_MSG(strstr(out, chk_cases[i].what) != NULL && strstr(out, "injected failure") != NULL && check_lines_ok(out),
+                      "check, %s fails: \"%s\"", chk_cases[i].fn, out);
+            free(out);
+        }
+    }
+    /* the production schema check refuses, but the findings had nothing to say (check_schema is the only one that fails) */
+    ff_arm("check_schema", -1, 0);
+    {
+        char *out;
+        CHECK(ff_check(&g_fdrv, &src, &out) == EXIT_ERROR);
+        CHECK_HAS(out, "E\t\t0\tschema: ");
+        free(out);
+    }
+    ff_arm(NULL, 0, 0);
+
+    /* the file a source is read from is checked before the driver opens it: the words for what is wrong with it */
+    char out_path[700], *out;
+    snprintf(out_path, sizeof(out_path), "%s/ffdir", g_dir);
+    mkdir(out_path, 0700);
+    db_source_t dsrc = { "sqlite3", out_path, NULL, NULL, 0 };
+    CHECK(ff_check(&g_fdrv, &dsrc, &out) == EXIT_ERROR);
+    CHECK_HAS(out, "database file '");
+    CHECK_HAS(out, "is not a regular file");
+    free(out);
+    db_source_t psrc = { "postgresql", NULL, out_path, NULL, 0 };
+    CHECK(ff_check(&g_pgdrv, &psrc, &out) == EXIT_ERROR);
+    CHECK_HAS(out, "conninfo-file '");
+    CHECK_HAS(out, "is not a regular file");
+    free(out);
+    snprintf(out_path, sizeof(out_path), "%s/ffconninfo", g_dir);
+    FILE *cf = fopen(out_path, "w");
+    if (cf) { fputs("host=db.example.test\n", cf); fclose(cf); }
+    chmod(out_path, 0644);
+    psrc.conninfo_file = out_path;
+    psrc.database_file = path;
+    CHECK(ff_check(&g_pgdrv, &psrc, &out) == EXIT_ERROR);
+    CHECK_HAS(out, "has mode 0644; the loader requires 0600 or 0400");
+    free(out);
+    chmod(out_path, 0600);
+    CHECK(ff_check(&g_pgdrv, &psrc, &out) != EXIT_ERROR);      /* mode 0600, owned by this user: the check goes on to read the source */
+    CHECK(strstr(out, "conninfo-file") == NULL);
+    free(out);
+    unlink(out_path);
+    snprintf(out_path, sizeof(out_path), "%s/ffdir", g_dir);
+    rmdir(out_path);
+    unlink(path);
+    unlink(ppath);
+}
+
+/* main() of the loader with an argument vector; its standard output and error, and the exit status */
+static int cli_argv(int n, const char **argv, char **out) {
+    cap_begin();
+    optind = 1;
+#if defined(__FreeBSD__) || defined(__APPLE__)
+    optreset = 1;
+#else
+    optind = 0;
+#endif
+    int st = dbloader_main(n, (char **)argv);
+    *out = cap_end();
+    return st;
+}
+
+static void test_cli(void) {
+    printf("loader: command line\n");
+    char path[600];
+    sqlite3 *db = make_db("cli.db", path, sizeof(path));
+    add_simple_zone(db, 1, 1, "cli.test");
+    sqlite3_close(db);
+    static const struct { const char *args[16]; int status; const char *needle; } cases[] = {
+        { { "--view-index", "70000", NULL }, EXIT_USAGE, "--view-index must be 0..65535" },
+        { { "--view-index", "-1", NULL }, EXIT_USAGE, "--view-index must be 0..65535" },
+        { { "--default-ttl", "0", NULL }, EXIT_USAGE, "--default-ttl must be 1.." },
+        { { "--loader-threads", "17", NULL }, EXIT_USAGE, "--loader-threads must be 1..16" },
+        { { "--max-zone-records", "1", NULL }, EXIT_USAGE, "--max-zone-records must be 2..4294967295" },
+        { { "--max-zone-bytes", "100", NULL }, EXIT_USAGE, "--max-zone-bytes must be 65535..68719476736" },
+        { { "--no-such-option", NULL }, EXIT_USAGE, "usage:" },
+        { { "stray", NULL }, EXIT_USAGE, "unexpected argument 'stray'" },
+        { { "-s", "abc", NULL }, EXIT_USAGE, "-s needs a file descriptor number" },
+        { { "-s", "5", "--dump", "-", NULL }, EXIT_USAGE, "-s cannot be combined with the dump options" },
+        { { "--check", "--dump", "-", NULL }, EXIT_USAGE, "--check cannot be combined with --dump, --zone or --map-view" },
+        { { "--check", "--zone", "a.test", NULL }, EXIT_USAGE, "--check cannot be combined" },
+        { { "--check", "--map-view", "v", NULL }, EXIT_USAGE, "--check cannot be combined" },
+        { { "--auto-reload", NULL }, EXIT_USAGE, "are for --check" },
+        { { "--server-id", "ns1", NULL }, EXIT_USAGE, "are for --check" },
+        { { "--ecs-tag", "a", NULL }, EXIT_USAGE, "are for --check" },
+        { { "--location-tag", "a", NULL }, EXIT_USAGE, "are for --check" },
+        { { "--max-zone-records", "9", NULL }, EXIT_USAGE, "are for --check" },
+        { { "--max-zone-bytes", "70000", NULL }, EXIT_USAGE, "are for --check" },
+        { { NULL }, EXIT_USAGE, "--dump (or --check) and --driver are required" },
+        { { "--dump", "-", NULL }, EXIT_USAGE, "--dump (or --check) and --driver are required" },
+        { { "--driver", "sqlite3", NULL }, EXIT_USAGE, "--dump (or --check) and --driver are required" },
+        { { "--dump", "-", "--driver", "nosuch", NULL }, EXIT_USAGE, "unknown driver 'nosuch' (compiled in: " },
+#ifndef KARIDNS_DB_POSTGRESQL
+        { { "--dump", "-", "--driver", "postgresql", "--conninfo-file", "c", NULL }, EXIT_USAGE, "driver postgresql is not available in this build" },
+#endif
+        { { "--dump", "-", "--driver", "sqlite3", NULL }, EXIT_USAGE, "driver sqlite3 needs --database-file" },
+        { { "--dump", "-", "--driver", "sqlite3", "--database-file", "@DB@", "--schema", "s", NULL }, EXIT_USAGE, "are for the postgresql driver" },
+        { { "--dump", "-", "--driver", "sqlite3", "--database-file", "@DB@", "--conninfo-file", "c", NULL }, EXIT_USAGE, "are for the postgresql driver" },
+        { { "--dump", "/nonexistent.example/dir/out", "--driver", "sqlite3", "--database-file", "@DB@", NULL }, EXIT_ERROR, "cannot create /nonexistent.example/dir/out" },
+        { { "--version", NULL }, EXIT_OK, "karidns-dbloader " },
+        { { "--drivers", NULL }, EXIT_OK, "sqlite3\n" },
+        { { "-h", NULL }, EXIT_OK, "exit status:" },
+        { { "--dump", "-", "--driver", "sqlite3", "--database-file", "@DB@", "--zone", "cli.test", "--view-index", "3", "--default-ttl", "60", NULL }, EXIT_OK, NULL },
+        { { "--dump", "-", "--driver", "sqlite3", "--database-file", "@DB@", "--loader-threads", "2", NULL }, EXIT_OK, NULL },
+        { { "--check", "--driver", "sqlite3", "--database-file", "@DB@", "--auto-reload", "--server-id", "ns1", "--ecs-tag", "e1", "--location-tag", "l1", NULL },
+          EXIT_ZONES_FAILED, "R\t" },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *argv[32];
+        int n = 0;
+        argv[n++] = "karidns-dbloader";
+        for (int k = 0; cases[i].args[k]; k++) argv[n++] = strcmp(cases[i].args[k], "@DB@") == 0 ? path : cases[i].args[k];
+        argv[n] = NULL;
+        char *out;
+        int st = cli_argv(n, argv, &out);
+        CHECK_MSG(st == cases[i].status, "case %zu (%s): exit status %d, wanted %d: %.200s", i, n > 1 ? argv[1] : "no argument", st, cases[i].status, out);
+        if (cases[i].needle) CHECK_MSG(strstr(out, cases[i].needle) != NULL, "case %zu (%s): output lacks \"%s\": %.200s", i, n > 1 ? argv[1] : "no argument", cases[i].needle, out);
+        free(out);
+    }
+    {   /* 256 --ecs-tag / --location-tag is the limit */
+        static char tags[300][8];
+        const char *argv[700];
+        int n = 0;
+        argv[n++] = "karidns-dbloader";
+        argv[n++] = "--check";
+        for (int i = 0; i < 257; i++) {
+            snprintf(tags[i], sizeof(tags[i]), "t%d", i);
+            argv[n++] = "--ecs-tag";
+            argv[n++] = tags[i];
+        }
+        char *out;
+        CHECK(cli_argv(n, argv, &out) == EXIT_USAGE);
+        CHECK_HAS(out, "at most 256 --ecs-tag and 256 --location-tag");
+        free(out);
+    }
+    unlink(path);
+}
+
+/* profiles a zone names that cannot be used, a zone mapped to more views than --check lists: the findings of --check and the ZONE_FAILED reasons of the dump */
+static void test_profiles_and_views(void) {
+    printf("check and dump: unusable profiles, more than 40 views of a zone\n");
+    char path[600];
+    sqlite3 *db = make_db("prof.db", path, sizeof(path));
+    CHECK(db != NULL);
+    if (!db) return;
+    raw_exec(db, "CREATE TABLE karidns_profiles (name VARCHAR(64) PRIMARY KEY, settings TEXT NOT NULL)");
+    raw_exec(db, "CREATE TABLE karidns_domain_views (domain_id INTEGER NOT NULL, view_name VARCHAR(64) NOT NULL, PRIMARY KEY (domain_id, view_name))");
+    raw_exec(db, "INSERT INTO karidns_profiles VALUES ('okp', 'rate-limit { responses-per-second 5; };')");
+    raw_exec(db, "INSERT INTO karidns_profiles VALUES ('ctl', 'rate-limit { responses-per-second 5; };' || char(1))");
+    raw_exec(db, "INSERT INTO karidns_profiles VALUES ('big', replace(hex(zeroblob(35000)), '0', 'a'))");
+    static const char *const names[] = { "ok.test", "ctl.test", "big.test", "gone.test", "views.test" };
+    static const char *const prof[] = { "okp", "ctl", "big", "nosuchprofile", NULL };
+    for (int i = 0; i < 5; i++) {
+        add_simple_zone(db, i + 1, (i + 1) * 10, names[i]);
+        if (prof[i]) sqlf(db, "INSERT INTO domainmetadata (domain_id, kind, content) VALUES (%d, 'X-KARIDNS-PROFILE', %Q)", i + 1, prof[i]);
+    }
+    for (int v = 0; v < 45; v++) sqlf(db, "INSERT INTO karidns_domain_views VALUES (5, 'view%02d')", v);
+    sqlite3_close(db);
+
+    int st;
+    char *out = check_run(path, false, &st);
+    CHECK(check_lines_ok(out));
+    CHECK(st == EXIT_ZONES_FAILED);
+    CHECK_HAS(out, "E\tctl.test.\t2\tthe profile 'ctl' cannot be used: its settings text has a character other than printable ASCII, TAB and LF");
+    CHECK_HAS(out, "E\tbig.test.\t3\tthe profile 'big' cannot be used: its settings text is longer than 65535 bytes");
+    CHECK_HAS(out, "E\tgone.test.\t4\tthe profile 'nosuchprofile' (X-KARIDNS-PROFILE) is not defined in karidns_profiles");
+    CHECK_HAS(out, "W\tviews.test.\t5\tkaridns_domain_views has more than 40 rows for this zone; the rest are not checked");
+    CHECK(strstr(out, "E\tok.test.") == NULL);
+    free(out);
+
+    dump_t d;
+    run_dump_mem(path, NULL, &d);
+    CHECK_MSG(d.status == EXIT_ZONES_FAILED, "dump exit status %d", d.status);
+    CHECK_MSG(d.n_failed == 3, "%zu zones failed", d.n_failed);
+    bool f_ctl = false, f_big = false, f_gone = false;
+    for (size_t i = 0; i < d.n_failed && i < 16; i++) {
+        if (!strcmp(d.failed_name[i], "ctl.test.")) f_ctl = strstr(d.failed_reason[i], "character other than printable ASCII") != NULL;
+        if (!strcmp(d.failed_name[i], "big.test.")) f_big = strstr(d.failed_reason[i], "longer than 65535 bytes") != NULL;
+        if (!strcmp(d.failed_name[i], "gone.test.")) f_gone = strstr(d.failed_reason[i], "not defined in karidns_profiles") != NULL;
+    }
+    CHECK(f_ctl && f_big && f_gone);
+    dump_free(&d);
+    unlink(path);
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/db";
     snprintf(g_schema, sizeof(g_schema), "%s/pdns_schema.sqlite3.sql", dir);
@@ -1069,6 +2068,15 @@ int main(int argc, char **argv) {
     test_range_views();
     test_ext_tables();
     test_dump();
+    test_failed_zones();
+    test_requests_batch();
+    test_server_id();
+    test_status_entry();
+    test_check_mode();
+    test_scan_failures();
+    test_profiles_and_views();
+    test_driver_faults();
+    test_cli();
     free(g_schema_sql);
     rm_tree(g_dir);
     printf("\n%d checks, %d failed\n", g_checks, g_failed);

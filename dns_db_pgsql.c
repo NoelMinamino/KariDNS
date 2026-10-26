@@ -46,6 +46,14 @@
  * Auto reload (design 6): `LISTEN karidns_changes` on the persistent connection; wait_fd() is its socket, poll_version()
  * drains the notifications and returns a counter that changes when one arrived (it also pings the server now and then,
  * so a dead connection is noticed).
+ *
+ * Multi-server operation (B11, release plan 4.8; db/karidns_ext.pgsql.sql): a connection that called watch_requests() LISTENs
+ * `karidns_reload` instead, requests_max() / reload_requests() read karidns_reload_requests (generation > the last applied,
+ * each call its own statement, never inside a snapshot), and report_status() upserts the row of this server in
+ * karidns_server_status in its own BEGIN READ WRITE ... COMMIT.  The session stays default_transaction_read_only = on; only that
+ * explicit transaction writes, and the role needs INSERT and UPDATE on that one table (db/karidns_loader_role.pgsql.sql).
+ * Generations are made visible in order by the advisory lock of the INSERT trigger, so a position kept as a generation number
+ * never skips a request (unlike karidns_changes.seq, which needs the xmin cursor above).
  */
 
 #ifdef KARIDNS_DB_POSTGRESQL
@@ -77,6 +85,9 @@ struct db_conn {
     uint64_t nver;                  /* poll_version(): number of notifications seen */
     time_t last_ping;
     bool has_changes, has_domain_views, has_profiles, has_ext, has_tagdef_id;
+    bool has_reload_requests, has_server_status;    /* B11 */
+    bool chan_reload;               /* B11: LISTEN karidns_reload (watch_requests) instead of karidns_changes */
+    bool listen_failed;             /* LISTEN was refused (a standby): wait_fd() stays -1, the caller polls by timer */
 };
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -353,23 +364,26 @@ static const struct { const char *table; const char *cols[SCHEMA_MAX_COLS]; int 
     { "karidns_record_tinydns", { "record_id", "ttd", "loc", "countdown", NULL }, 4 },
     { "karidns_zone_tagdefs", { "domain_id", "kind", "tag", "cidr", "id", NULL }, 4 },
     { "karidns_schema_version", { "version", NULL }, 1 },
+    /* B11, optional (the multi-server tables) */
+    { "karidns_reload_requests", { "generation", "zone", "force", NULL }, 3 },
+    { "karidns_server_status", { "server_id", "generation", "applied_at", "ok", "failed_zones", NULL }, 5 },
 };
 #define N_TABLES (sizeof(k_tables) / sizeof(k_tables[0]))
-enum { T_DOMAINS, T_RECORDS, T_META, T_KEYS, T_CHANGES, T_DV, T_PROF, T_TAGS, T_TDNS, T_TAGDEFS, T_VERSION };
+enum { T_DOMAINS, T_RECORDS, T_META, T_KEYS, T_CHANGES, T_DV, T_PROF, T_TAGS, T_TDNS, T_TAGDEFS, T_VERSION, T_REQ, T_STATUS };
 
-static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
+/* Which of k_tables exist in the search_path (exists[]) and which of their columns (found[], bit k = cols[k]); *schema_ok = the search_path
+ * names at least one existing schema (a SET search_path to a missing schema is not an error in PostgreSQL).  One catalog query (to_regclass
+ * follows search_path; no privilege on the tables is needed). */
+static int schema_scan(db_conn_t *c, bool exists[N_TABLES], unsigned found[N_TABLES], bool *schema_ok) {
     PGresult *r = NULL;
-    /* the schema of the view must exist (search_path to a missing schema is not an error in PostgreSQL) */
+    memset(found, 0, sizeof(unsigned) * N_TABLES);
+    memset(exists, 0, sizeof(bool) * N_TABLES);
     int ret = exec_rows(c, "SELECT current_schemas(false)::text", 0, NULL, &r, "schema lookup");
     if (ret != 0) return ret;
     const char *path = PQgetvalue(r, 0, 0);
-    bool empty_path = !path || strcmp(path, "{}") == 0;
+    *schema_ok = path && strcmp(path, "{}") != 0;
     PQclear(r);
-    if (empty_path) {
-        set_err(c, "schema: the database-schema does not exist (or the role has no USAGE on it)");
-        return -1;
-    }
-    /* one catalog query for the columns of every table (to_regclass follows search_path; no privilege on the tables is needed) */
+    if (!*schema_ok) return 0;
     char sql[1400];
     size_t o = (size_t)snprintf(sql, sizeof(sql), "SELECT c.relname, a.attname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid "
                                                   "AND a.attnum > 0 AND NOT a.attisdropped WHERE c.oid = ANY (ARRAY[");
@@ -378,10 +392,6 @@ static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
     snprintf(sql + o, sizeof(sql) - o, "])");
     ret = exec_rows(c, sql, 0, NULL, &r, "schema");
     if (ret != 0) return ret;
-    unsigned found[N_TABLES];
-    bool exists[N_TABLES];
-    memset(found, 0, sizeof(found));
-    memset(exists, 0, sizeof(exists));
     for (int i = 0; i < PQntuples(r); i++) {
         const char *rel = PQgetvalue(r, i, 0), *att = PQgetvalue(r, i, 1);
         for (size_t t = 0; t < N_TABLES; t++) {
@@ -392,6 +402,20 @@ static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
         }
     }
     PQclear(r);
+    return 0;
+}
+
+static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
+    PGresult *r = NULL;
+    unsigned found[N_TABLES];
+    bool exists[N_TABLES];
+    bool schema_ok = false;
+    int ret = schema_scan(c, exists, found, &schema_ok);
+    if (ret != 0) return ret;
+    if (!schema_ok) {
+        set_err(c, "schema: the database-schema does not exist (or the role has no USAGE on it)");
+        return -1;
+    }
     for (size_t t = T_DOMAINS; t <= T_KEYS; t++) {
         if (!exists[t]) {
             set_err(c, "schema: table %s is missing (PowerDNS 5.1 schema expected)", k_tables[t].table);
@@ -410,6 +434,8 @@ static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
     c->has_profiles = HAVE(T_PROF);
     c->has_ext = HAVE(T_TAGS) && HAVE(T_TDNS) && HAVE(T_TAGDEFS);
     c->has_tagdef_id = exists[T_TAGDEFS] && (found[T_TAGDEFS] & (1u << 4)) != 0;
+    c->has_reload_requests = HAVE(T_REQ);
+    c->has_server_status = HAVE(T_STATUS);
     bool has_version = HAVE(T_VERSION);
 #undef HAVE
     if (has_version) {
@@ -428,7 +454,188 @@ static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
         out->has_domain_views = c->has_domain_views;
         out->has_profiles = c->has_profiles;
         out->has_ext = c->has_ext;
+        out->has_reload_requests = c->has_reload_requests;
+        out->has_server_status = c->has_server_status;
     }
+    return 0;
+}
+
+/* B12: the schema check of `karicheck db` (design 7.2): catalog reads only, nothing is written. */
+static void fnd(db_finding_cb cb, void *ud, char level, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+static void fnd(db_finding_cb cb, void *ud, char level, const char *fmt, ...) {
+    char t[600];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(t, sizeof(t), fmt, ap);
+    va_end(ap);
+    cb(ud, level, t);
+}
+
+/* a query that returns one boolean: *out = 1 / 0, or -1 for NULL (the object is not there) */
+static int one_bool(db_conn_t *c, const char *sql, int np, const char *const *pv, int *out) {
+    PGresult *r = NULL;
+    int ret = exec_rows(c, sql, np, pv, &r, "privileges");
+    if (ret != 0) return ret;
+    *out = PQgetisnull(r, 0, 0) ? -1 : PQgetvalue(r, 0, 0)[0] == 't';
+    PQclear(r);
+    return 0;
+}
+
+static int priv_table(db_conn_t *c, const char *table, const char *priv, int *out) {
+    const char *pv[2] = { table, priv };
+    return one_bool(c, "SELECT has_table_privilege(to_regclass($1::text)::oid, $2::text)", 2, pv, out);
+}
+
+static int priv_column(db_conn_t *c, const char *table, const char *col, int *out) {
+    const char *pv[2] = { table, col };
+    return one_bool(c, "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = to_regclass($1::text)::oid AND a.attname::text = $2::text "
+                       "AND NOT a.attisdropped) THEN has_column_privilege(to_regclass($1::text)::oid, $2::text, 'SELECT') END", 2, pv, out);
+}
+
+static int pg_schema_findings(db_conn_t *c, const db_check_opts_t *o, db_finding_cb cb, void *ud) {
+    PGresult *r = NULL;
+    unsigned found[N_TABLES];
+    bool exists[N_TABLES], schema_ok = false;
+    int ret = schema_scan(c, exists, found, &schema_ok);
+    if (ret != 0) return ret;
+    if (!schema_ok) {
+        fnd(cb, ud, 'E', "the database-schema does not exist (or the role has no USAGE on it)");
+        return 0;
+    }
+    char role[130] = "?";
+    if ((ret = exec_rows(c, "SELECT current_user::text", 0, NULL, &r, "current_user")) != 0) return ret;
+    snprintf(role, sizeof(role), "%s", PQgetvalue(r, 0, 0));
+    PQclear(r);
+#define FULL(t) (exists[t] && (found[t] & ((1u << k_tables[t].required) - 1u)) == ((1u << k_tables[t].required) - 1u))
+    for (size_t t = T_DOMAINS; t <= T_KEYS; t++) {
+        if (!exists[t]) {
+            fnd(cb, ud, 'E', "table %s is missing (PowerDNS 5.1 schema expected)", k_tables[t].table);
+            continue;
+        }
+        char miss[200] = "";
+        unsigned nm = 0;
+        for (int k = 0; k_tables[t].cols[k]; k++)
+            if (!(found[t] & (1u << k))) db_list_add(miss, sizeof(miss), &nm, k_tables[t].cols[k]);
+        if (nm) fnd(cb, ud, 'E', "table %s has no column %s%s (PowerDNS 5.1 schema expected)", k_tables[t].table, miss, nm > 6 ? ", ..." : "");
+    }
+    /* the karidns_* tables (design 3.7); what a missing one costs */
+    static const struct { int t; const char *effect; } k_eff[] = {
+        { T_VERSION, "the version of the extension tables is not known" },
+        { T_CHANGES, "there is no change log, so an edit that keeps the SOA serial is not noticed by a reload" },
+        { T_DV, "the zone to view mapping is not available: every zone goes to every view that uses this schema" },
+        { T_PROF, "a zone that names a profile (X-KARIDNS-PROFILE) fails to load" },
+        { T_TAGS, "location and ECS tags are ignored (the three tag tables are used together)" },
+        { T_TDNS, "tinydns time stamps and locations are ignored (the three tag tables are used together)" },
+        { T_TAGDEFS, "tag definitions are ignored (the three tag tables are used together)" },
+    };
+    unsigned present = 0;
+    for (size_t i = 0; i < sizeof(k_eff) / sizeof(k_eff[0]); i++)
+        if (exists[k_eff[i].t]) present++;
+    if (present == 0) {
+        fnd(cb, ud, 'W', "none of the karidns_* extension tables exists (db/karidns_ext.pgsql.sql was not applied): no change log, no zone to view "
+                         "mapping, no profiles, no tags; a reload compares the SOA serials");
+    } else {
+        for (size_t i = 0; i < sizeof(k_eff) / sizeof(k_eff[0]); i++) {
+            int t = k_eff[i].t;
+            if (FULL(t)) continue;
+            if (t == T_CHANGES && exists[t] && (found[t] & 3u) == 3u)
+                fnd(cb, ud, 'W', "table karidns_changes has no xid column (schema version 1): there is no change log; apply db/karidns_ext_v1_to_v2.pgsql.sql");
+            else
+                fnd(cb, ud, 'W', "table %s is missing or incomplete: %s", k_tables[t].table, k_eff[i].effect);
+        }
+    }
+    /* privileges of the role the loader connects as (db/karidns_loader_role.pgsql.sql): SELECT on what it reads, nothing on the keys */
+    bool can_sel[N_TABLES];
+    memset(can_sel, 0, sizeof(can_sel));
+    for (size_t t = 0; t < N_TABLES; t++) {
+        if (t == T_KEYS || !FULL(t)) continue;
+        int ok = 0;
+        if ((ret = priv_table(c, k_tables[t].table, "SELECT", &ok)) != 0) return ret;
+        can_sel[t] = ok > 0;
+        if (ok == 0)
+            fnd(cb, ud, 'E', "the role %s cannot SELECT from table %s (db/karidns_loader_role.pgsql.sql grants what the loader reads)", role, k_tables[t].table);
+    }
+    if (FULL(T_KEYS)) {
+        int ok = 0, content = 0;
+        if ((ret = priv_column(c, "cryptokeys", "domain_id", &ok)) != 0) return ret;
+        if (ok == 0)
+            fnd(cb, ud, 'E', "the role %s cannot SELECT cryptokeys.domain_id: the loader asks which zones have keys (db/karidns_loader_role.pgsql.sql)", role);
+        /* cryptokeys.content is not among the columns the loader needs */
+        if ((ret = priv_column(c, "cryptokeys", "content", &content)) != 0) return ret;
+        if (content > 0)
+            fnd(cb, ud, 'W', "the role %s can read cryptokeys.content (the private keys); the loader needs only domain_id (db/karidns_loader_role.pgsql.sql "
+                                 "grants just that)", role);
+    }
+    if (can_sel[T_VERSION]) {
+        if ((ret = exec_rows(c, "SELECT max(version) FROM karidns_schema_version", 0, NULL, &r, "karidns_schema_version")) != 0) return ret;
+        bool none = PQgetisnull(r, 0, 0);
+        long long v = none ? 0 : strtoll(PQgetvalue(r, 0, 0), NULL, 10);
+        PQclear(r);
+        if (none) fnd(cb, ud, 'W', "karidns_schema_version has no row");
+        else if (v > 2) fnd(cb, ud, 'E', "karidns_schema_version is %lld; this loader reads versions 1 and 2", v);
+        else fnd(cb, ud, 'I', "karidns_* schema version %lld", v);
+    }
+    /* B11: the multi-server tables (db/karidns_ext.pgsql.sql, release plan 4.8) */
+    bool have_req = FULL(T_REQ), have_st = FULL(T_STATUS);
+    if (have_req != have_st)
+        fnd(cb, ud, 'W', "only one of karidns_reload_requests and karidns_server_status exists: reload requests and the status of the servers need both "
+                         "(db/karidns_ext.pgsql.sql)");
+    else if (!have_req && o && o->server_id)
+        fnd(cb, ud, 'W', "server-id is set but karidns_reload_requests and karidns_server_status do not exist: this server cannot receive reload requests "
+                         "or report its status (db/karidns_ext.pgsql.sql)");
+    if (have_st) {
+        int ins = 0, upd = 0;
+        if ((ret = priv_table(c, "karidns_server_status", "INSERT", &ins)) != 0 || (ret = priv_table(c, "karidns_server_status", "UPDATE", &upd)) != 0) return ret;
+        if (ins <= 0 || upd <= 0)
+            fnd(cb, ud, 'W', "the role %s cannot %s karidns_server_status: the outcome of the reloads is not reported there "
+                             "(db/karidns_loader_role.pgsql.sql grants INSERT and UPDATE)", role, ins <= 0 && upd <= 0 ? "INSERT or UPDATE" : (ins <= 0 ? "INSERT into" : "UPDATE"));
+    }
+    if (o && o->auto_reload) {
+        if (!FULL(T_CHANGES)) {
+            fnd(cb, ud, 'E', "auto-reload yes needs the change log: table karidns_changes is missing or incomplete (apply db/karidns_ext.pgsql.sql)");
+        } else {
+            static const struct { const char *infix, *table; } k_trg[] = {
+#define X(i, t) { #i, t },
+                DB_CHANGE_TRIGGERS(X)
+#undef X
+            };
+            /* the triggers of the tables that are here, by name */
+            char sql[1400];
+            size_t n = (size_t)snprintf(sql, sizeof(sql), "SELECT t.tgname FROM pg_trigger t WHERE NOT t.tgisinternal AND t.tgrelid = ANY (ARRAY[");
+            for (size_t i = 0; i < sizeof(k_trg) / sizeof(k_trg[0]) + 1; i++) {
+                const char *tbl = i == 0 ? "karidns_changes" : k_trg[i - 1].table;
+                n += (size_t)snprintf(sql + n, sizeof(sql) - n, "%sto_regclass('%s')::oid", i ? "," : "", tbl);
+            }
+            snprintf(sql + n, sizeof(sql) - n, "])");
+            if ((ret = exec_rows(c, sql, 0, NULL, &r, "pg_trigger")) != 0) return ret;
+            char miss[300] = "";
+            unsigned nm = 0;
+            for (size_t i = 0; i < sizeof(k_trg) / sizeof(k_trg[0]) * 3 + 1; i++) {
+                char name[96];
+                if (i == 0) {
+                    snprintf(name, sizeof(name), "karidns_changes_prune");
+                } else {
+                    size_t k = (i - 1) / 3;
+                    static const char *const sfx[3] = { "ins", "upd", "del" };
+                    bool table_here = true;
+                    if (strncmp(k_trg[k].table, "karidns_", 8) == 0)
+                        for (size_t t = 0; t < N_TABLES; t++)
+                            if (strcmp(k_tables[t].table, k_trg[k].table) == 0) table_here = FULL(t);
+                    if (!table_here) continue;                 /* its table is reported above */
+                    snprintf(name, sizeof(name), "karidns_trg_%s_%s", k_trg[k].infix, sfx[(i - 1) % 3]);
+                }
+                bool seen = false;
+                for (int j = 0; j < PQntuples(r) && !seen; j++)
+                    if (strcmp(PQgetvalue(r, j, 0), name) == 0) seen = true;
+                if (!seen) db_list_add(miss, sizeof(miss), &nm, name);
+            }
+            PQclear(r);
+            if (nm)
+                fnd(cb, ud, 'E', "auto-reload yes needs the change log triggers, but %u are missing: %s%s (apply db/karidns_ext.pgsql.sql)", nm, miss,
+                    nm > 6 ? ", ..." : "");
+        }
+    }
+#undef FULL
     return 0;
 }
 
@@ -517,7 +724,7 @@ static int pg_scan(db_conn_t *c, const char *what, const char *query, int np, co
 }
 
 /* ---- zones ---- */
-typedef struct { db_zone_cb cb; void *ud; bool have_prev; int64_t prev; } zl_t;
+typedef struct { db_zone_cb cb; void *ud; bool have_prev; int64_t prev; bool any; } zl_t;
 
 static int zl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     zl_t *z = ud;
@@ -525,6 +732,7 @@ static int zl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     if (z->have_prev && id == z->prev) return 0;      /* more than one enabled apex SOA: the first is enough here */
     z->have_prev = true;
     z->prev = id;
+    z->any = true;
     bool bad = false;
     db_zone_row_t row;
     row.id = id;
@@ -538,12 +746,49 @@ static int zl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
 }
 
 static int pg_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
-    zl_t z = { cb, ud, false, 0 };
+    zl_t z = { cb, ud, false, 0, false };
     return pg_scan(c, "list_zones",
                    "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content FROM domains d "
                    "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND lower(r.name) = lower(d.name) AND r.disabled = false "
                    "ORDER BY d.id, r.id",
                    0, NULL, zl_row, &z);
+}
+
+/* B13: one zone by name for a one-zone reload.  Names are compared like names_equal() of the loader: ASCII case-insensitive, with or
+ * without one trailing dot.  The PowerDNS schema has only an index on domains.name (case-sensitive), so the first query asks for the
+ * two spellings exactly (index scan, the usual case: names are stored in lower case); only when it finds nothing is lower() used,
+ * which scans the table once (a zone stored with capitals, or a zone that is not there, i.e. a deletion).  Unlike the list, which
+ * stops at the lowest id, an exact spelling wins over another capitalisation of the same name (two such rows are a data error). */
+static int pg_find_zone(db_conn_t *c, const char *name, db_zone_cb cb, void *ud) {
+    size_t n = strlen(name);
+    if (n > 1 && name[n - 1] == '.') n--;
+    char *a = malloc(n + 1), *b = malloc(n + 2);
+    if (!a || !b) {
+        free(a);
+        free(b);
+        set_err(c, "out of memory");
+        return -1;
+    }
+    memcpy(a, name, n);
+    a[n] = '\0';
+    memcpy(b, a, n);
+    b[n] = '.';
+    b[n + 1] = '\0';
+    const char *pv[2] = { a, b };
+    static const char *const sel =
+        "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content FROM domains d "
+        "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND lower(r.name) = lower(d.name) AND r.disabled = false ";
+    char q[700];
+    zl_t z = { cb, ud, false, 0, false };
+    snprintf(q, sizeof(q), "%sWHERE d.name IN ($1, $2) ORDER BY d.id, r.id", sel);
+    int ret = pg_scan(c, "find_zone", q, 2, pv, zl_row, &z);
+    if (ret == 0 && !z.any) {
+        snprintf(q, sizeof(q), "%sWHERE lower(d.name) IN (lower($1), lower($2)) ORDER BY d.id, r.id", sel);
+        ret = pg_scan(c, "find_zone", q, 2, pv, zl_row, &z);
+    }
+    free(a);
+    free(b);
+    return ret;
 }
 
 /* ---- records ---- */
@@ -830,12 +1075,14 @@ static int pg_changes_since(db_conn_t *c, uint64_t after, db_change_cb cb, void 
 
 static int ensure_listen(db_conn_t *c) {
     if (c->listening) return 0;
+    if (c->listen_failed) return -1;                    /* refused for good (a standby cannot LISTEN): do not ask at every loop */
     if (c->in_snapshot) {
         set_err(c, "LISTEN: a snapshot is open");
         return -1;
     }
-    int rc = exec_cmd(c, "LISTEN karidns_changes", "LISTEN");
+    int rc = exec_cmd(c, c->chan_reload ? "LISTEN karidns_reload" : "LISTEN karidns_changes", "LISTEN");
     if (rc == 0) c->listening = true;
+    else if (rc == -1) c->listen_failed = true;         /* not a transient condition */
     return rc;
 }
 
@@ -884,10 +1131,119 @@ static int pg_poll_version(db_conn_t *c, uint64_t *version, bool *replaced) {
     return 0;
 }
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* reload requests and the status row (B11)                                                                       */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+#define REQ_CHUNK 500                       /* requests per query (the table keeps 1000, but nothing here depends on a trigger) */
+#define REQ_STR2(x) #x
+#define REQ_STR(x) REQ_STR2(x)
+
+static int pg_watch_requests(db_conn_t *c) {
+    if (c->listening && !c->chan_reload) {
+        set_err(c, "watch_requests: the connection already listens to karidns_changes");
+        return -1;
+    }
+    c->chan_reload = true;
+    return ensure_listen(c);
+}
+
+static int pg_requests_max(db_conn_t *c, uint64_t *generation) {
+    if (!c->has_reload_requests) {
+        set_err(c, "karidns_reload_requests does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    if (c->in_snapshot) {
+        set_err(c, "requests_max: a snapshot is open");
+        return -1;
+    }
+    PGresult *r = NULL;
+    int ret = exec_rows(c, "SELECT coalesce(max(generation), 0)::text FROM karidns_reload_requests", 0, NULL, &r, "requests_max");
+    if (ret != 0) return ret;
+    *generation = PQgetisnull(r, 0, 0) ? 0 : strtoull(PQgetvalue(r, 0, 0), NULL, 10);
+    PQclear(r);
+    return 0;
+}
+
+static int pg_reload_requests(db_conn_t *c, uint64_t after, db_reload_cb cb, void *ud, uint64_t *max_gen, bool *gap) {
+    if (!c->has_reload_requests) {
+        set_err(c, "karidns_reload_requests does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    if (c->in_snapshot) {
+        set_err(c, "reload_requests: a snapshot is open");
+        return -1;
+    }
+    uint64_t cur = after;
+    bool first = true, g = false;
+    int ret = 0;
+    while (ret == 0) {
+        char p[32];
+        snprintf(p, sizeof(p), "%llu", (unsigned long long)cur);
+        const char *pv[1] = { p };
+        PGresult *r = NULL;
+        ret = exec_rows(c, "SELECT generation, zone, force FROM karidns_reload_requests WHERE generation > $1::bigint ORDER BY generation LIMIT " REQ_STR(REQ_CHUNK),
+                        1, pv, &r, "reload_requests");
+        if (ret != 0) break;
+        int n = PQntuples(r);
+        for (int i = 0; i < n && ret == 0; i++) {
+            bool bad = false;
+            db_reload_row_t row;
+            row.generation = (uint64_t)cell_i64(r, i, 0);
+            row.zone = cell_text(c, r, i, 1, "karidns_reload_requests", (int64_t)row.generation, "zone", &bad);
+            row.force = cell_true(r, i, 2);
+            if (bad) {
+                ret = -1;
+                break;
+            }
+            if (first) {
+                g = row.generation != after + 1;      /* pruned or rolled back requests lie between */
+                first = false;
+            }
+            if (row.generation <= cur) continue;      /* cannot happen (ORDER BY, > cur); never go backwards */
+            cur = row.generation;
+            if (cb(ud, &row) != 0) ret = DB_STOPPED;
+        }
+        PQclear(r);
+        if (n < REQ_CHUNK) break;
+    }
+    if (max_gen) *max_gen = cur;
+    if (gap) *gap = g;
+    return ret;
+}
+
 static int pg_report_status(db_conn_t *c, const db_status_t *st) {
-    (void)c;
-    (void)st;
-    return 0;       /* karidns_server_status is written from B11 */
+    if (!c->has_server_status) {
+        set_err(c, "karidns_server_status does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    if (c->in_snapshot) {
+        set_err(c, "report_status: a snapshot is open");     /* the write must not share the read snapshot */
+        return -1;
+    }
+    if (!st || !st->server_id || !*st->server_id || strlen(st->server_id) > 64) {
+        set_err(c, "report_status: the server id must be 1 to 64 bytes");
+        return -1;
+    }
+    char gen[32];
+    snprintf(gen, sizeof(gen), "%llu", (unsigned long long)st->generation);
+    const char *pv[4] = { st->server_id, gen, st->ok ? "t" : "f", st->failed_zones ? st->failed_zones : "" };
+    int rc = exec_cmd(c, "BEGIN READ WRITE", "report status");     /* the session is read only by default: this one writes */
+    if (rc != 0) return rc;
+    PGresult *r = PQexecParams(c->pg,
+                               "INSERT INTO karidns_server_status (server_id, generation, applied_at, ok, failed_zones) "
+                               "VALUES ($1, $2::bigint, now(), $3::boolean, $4) "
+                               "ON CONFLICT (server_id) DO UPDATE SET generation = EXCLUDED.generation, applied_at = EXCLUDED.applied_at, "
+                               "ok = EXCLUDED.ok, failed_zones = EXCLUDED.failed_zones",
+                               4, NULL, pv, NULL, NULL, 0);
+    if (!r || PQresultStatus(r) != PGRES_COMMAND_OK) {
+        rc = pq_fail(c, r, "report status");
+        PQclear(r);
+        PQclear(PQexec(c->pg, "ROLLBACK"));                     /* ends the aborted transaction (harmless when the connection is gone) */
+        return rc;
+    }
+    PQclear(r);
+    return exec_cmd(c, "COMMIT", "report status");
 }
 
 const db_driver_t db_driver_postgresql = {
@@ -896,6 +1252,9 @@ const db_driver_t db_driver_postgresql = {
     pg_zones_with_keys, pg_changes_since, pg_wait_fd,     pg_drain_notifications, pg_report_status,
     pg_changes_max,  pg_scan_records_range, pg_scan_domain_views, pg_scan_profiles, pg_scan_ext, pg_poll_version,
     true,
+    pg_watch_requests, pg_requests_max, pg_reload_requests,
+    pg_schema_findings, /* B12 */
+    pg_find_zone,       /* B13 */
 };
 
 #endif /* KARIDNS_DB_POSTGRESQL */

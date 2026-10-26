@@ -18,6 +18,7 @@
 #include <syslog.h>
 
 #include "../dns_db_stream.h"
+#include "../dns_db_checkproto.h"
 
 static int g_checks = 0, g_failed = 0;
 #define CHECK(cond) do { g_checks++; if (!(cond)) { g_failed++; \
@@ -122,6 +123,10 @@ static void m_auto_status(kdb_enc_t *e, unsigned n) {
         kdb_enc_nest_begin(e, 1);
         kdb_enc_u16(e, 1, (uint16_t)(i % 3)); kdb_enc_u64(e, 2, 1700000000u + i); kdb_enc_u64(e, 3, 41 + i); kdb_enc_u32(e, 4, i);
         if (i == 1) kdb_enc_str(e, 5, "cannot open the database");
+        if (i == 2) {                                   /* B11: the reload request fields */
+            kdb_enc_u8(e, 6, KDB_AS_AUTO | KDB_AS_REQ); kdb_enc_str(e, 7, "ns1"); kdb_enc_u64(e, 8, 7); kdb_enc_u8(e, 9, 1);
+            kdb_enc_str(e, 10, "cannot write karidns_server_status"); kdb_enc_u64(e, 11, 1700000000u);
+        }
         kdb_enc_nest_end(e);
     }
     kdb_enc_end(e);
@@ -1368,9 +1373,57 @@ static void test_auto_status(void) {
     CHECK_RC("pending of 2 bytes", send_enc(KDB_S_READY, &e), KDB_E_TLV_LEN);
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
     kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
-    kdb_enc_u8(&e, 6, 1); kdb_enc_nest_end(&e);
+    kdb_enc_u8(&e, 12, 1); kdb_enc_nest_end(&e);
     kdb_enc_end(&e);
-    CHECK_RC("unknown tag 6", send_enc(KDB_S_READY, &e), KDB_E_TLV_UNKNOWN);
+    CHECK_RC("unknown tag 12", send_enc(KDB_S_READY, &e), KDB_E_TLV_UNKNOWN);
+    /* B11: the optional tags 6..11 (reload requests of a multi-server database) */
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 1); kdb_enc_u64(&e, 2, 0); kdb_enc_u64(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+    kdb_enc_u8(&e, 6, KDB_AS_REQ); kdb_enc_str(&e, 7, "ns1"); kdb_enc_u64(&e, 8, 1234567890123ull); kdb_enc_u8(&e, 9, 1);
+    kdb_enc_str(&e, 10, "cannot write karidns_server_status"); kdb_enc_u64(&e, 11, 1700000001u); kdb_enc_nest_end(&e);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 2); kdb_enc_u64(&e, 2, 5); kdb_enc_u64(&e, 3, 6); kdb_enc_u32(&e, 4, 7); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    sess_init(s, &LIM);
+    sess_to(s, KDB_S_READY);
+    CHECK_RC("request fields", sess_feed(s, e.buf, e.len, 0), KDB_OK);
+    kdb_auto_status_entries(&s->m, &it);
+    CHECK(kdb_auto_status_entries_next(&it, &en));
+    CHECK(en.view == 1 && en.flags == KDB_AS_REQ && en.server_id.len == 3 && memcmp(en.server_id.p, "ns1", 3) == 0 &&
+          en.req_generation == 1234567890123ull && en.req_ok && en.req_error.len == 34 && en.req_time == 1700000001u);
+    CHECK(kdb_auto_status_entries_next(&it, &en));
+    CHECK(en.view == 2 && en.flags == KDB_AS_AUTO && en.server_id.p == NULL && en.req_generation == 0 && !en.req_ok &&
+          en.req_error.p == NULL && en.req_time == 0);      /* an entry of B9 / B10 (no flags) is about auto reload */
+    CHECK(!kdb_auto_status_entries_next(&it, &en));
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_u8(&e, 6, 4); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("flags above 3", send_enc(KDB_S_READY, &e), KDB_E_RANGE);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_u8(&e, 9, 2); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("req_ok above 1", send_enc(KDB_S_READY, &e), KDB_E_RANGE);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_str(&e, 7, ""); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("empty server id", send_enc(KDB_S_READY, &e), KDB_E_TLV_STR);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_str(&e, 7, "01234567890123456789012345678901234567890123456789012345678901234"); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("server id of 65 bytes", send_enc(KDB_S_READY, &e), KDB_E_TLV_STR);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_bytes(&e, 10, "bad\x01text", 8); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("control character in req_error", send_enc(KDB_S_READY, &e), KDB_E_TLV_STR);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_u32(&e, 8, 1); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("req_generation of 4 bytes", send_enc(KDB_S_READY, &e), KDB_E_TLV_LEN);
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_AUTO_STATUS);
     kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_u64(&e, 2, 1); kdb_enc_u64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
     kdb_enc_bytes(&e, 5, "bad\x01text", 8); kdb_enc_nest_end(&e);
@@ -1394,6 +1447,78 @@ static void test_auto_status(void) {
     kdb_enc_free(&e);
 }
 
+/* ---------------------------------------------------------------- the check protocol (B12, dns_db_checkproto.h) */
+static void test_checkproto(void) {
+    char out[64], back[64];
+    bool trunc;
+    /* escape: printable ASCII as it is; TAB, LF, backslash, DEL and bytes above 0x7e as \DDD (decimal) */
+    size_t n = chk_escape("a b\tc\n\\d\x7f\xc3\xa9", 11, out, sizeof(out), &trunc);
+    CHECK_STR(out, "a b\\009c\\010\\092d\\127\\195\\169");
+    CHECK(n == strlen(out) && !trunc);
+    /* round trip, byte for byte, with a NUL in the middle */
+    const char raw[] = { 'x', 0, 'y', '\r', '"', '\'', (char)0xff, '\\', '1', '2', '3' };
+    n = chk_escape(raw, sizeof(raw), out, sizeof(out), &trunc);
+    CHECK(!trunc);
+    size_t m = chk_unescape(out, n, back, sizeof(back));
+    CHECK(m == sizeof(raw) && memcmp(back, raw, sizeof(raw)) == 0);
+    /* truncation never cuts an escape, and says so */
+    n = chk_escape("\x01\x02\x03\x04", 4, out, 10, &trunc);
+    CHECK(trunc && n == 8 && strcmp(out, "\\001\\002") == 0);
+    n = chk_escape("abcdef", 6, out, 4, &trunc);
+    CHECK(trunc && n == 3 && strcmp(out, "abc") == 0);
+    CHECK(chk_escape("abc", 3, out, 0, &trunc) == 0 && !trunc);
+    /* unescape: every malformed input is refused */
+    CHECK(chk_unescape("a\\", 2, back, sizeof(back)) == (size_t)-1);          /* a backslash at the end */
+    CHECK(chk_unescape("\\12", 3, back, sizeof(back)) == (size_t)-1);         /* two digits */
+    CHECK(chk_unescape("\\1x3", 4, back, sizeof(back)) == (size_t)-1);        /* not a digit */
+    CHECK(chk_unescape("\\256", 4, back, sizeof(back)) == (size_t)-1);        /* above 255 */
+    CHECK(chk_unescape("a\tb", 3, back, sizeof(back)) == (size_t)-1);         /* a raw TAB */
+    CHECK(chk_unescape("\x80", 1, back, sizeof(back)) == (size_t)-1);         /* a high byte */
+    CHECK(chk_unescape("abcd", 4, back, 4) == (size_t)-1);                    /* does not fit with its NUL */
+    CHECK(chk_unescape("abc", 3, back, 4) == 3 && strcmp(back, "abc") == 0);
+    CHECK(chk_unescape("", 0, back, 1) == 0);
+    CHECK(chk_unescape("a", 1, back, 0) == (size_t)-1);
+    /* split */
+    char line[] = "E\t\ta.test.\t12\ttext";
+    char *f[8];
+    CHECK(chk_split(line, f, 8) == 5 && strcmp(f[0], "E") == 0 && f[1][0] == '\0' && strcmp(f[4], "text") == 0);
+    char l2[] = "R\t1\t2\t3";
+    CHECK(chk_split(l2, f, 3) == -1);                                          /* more fields than room */
+    char l2b[] = "R\t1\t2\t3";
+    CHECK(chk_split(l2b, f, 4) == 4);
+    char l3[] = "Z\tbad\001ctl";
+    CHECK(chk_split(l3, f, 8) == -1);                                          /* a control character other than TAB */
+    char l4[] = "";
+    CHECK(chk_split(l4, f, 8) == 1 && f[0][0] == '\0');
+    char l5[] = "a\t";
+    CHECK(chk_split(l5, f, 8) == 2 && f[1][0] == '\0');
+    /* printable */
+    char p[] = "ok\x01\x1b[31m\x7f\xc3z";
+    chk_printable(p);
+    CHECK_STR(p, "ok??[31m??z");
+}
+
+/* the names the loader and the Backend log for a result code and a message type: one each, none empty, "?" for the unknown */
+static void test_names(void) {
+    printf("result code and message type names\n");
+    static const struct { kdb_rc_t rc; const char *name; } rcs[] = {
+        { KDB_OK, "ok" }, { KDB_MORE, "more" }, { KDB_E_MAGIC, "bad magic" }, { KDB_E_TYPE, "unknown type" },
+        { KDB_E_FLAGS, "bad flags" }, { KDB_E_LENGTH, "bad length" }, { KDB_E_TLV_TRUNC, "truncated TLV" },
+        { KDB_E_TLV_DUP, "duplicate tag" }, { KDB_E_TLV_UNKNOWN, "unknown tag" }, { KDB_E_TLV_MISSING, "missing tag" },
+        { KDB_E_TLV_LEN, "bad value length" }, { KDB_E_TLV_STR, "bad string" }, { KDB_E_TLV_NAME, "bad name" },
+        { KDB_E_RANGE, "value out of range" }, { KDB_E_STATE, "message not allowed in this state" },
+        { KDB_E_VERSION, "protocol version mismatch" }, { KDB_E_DNSHDR, "bad ZONE_DATA DNS header" },
+        { KDB_E_OPT, "OPT outside the first ZONE_DATA" }, { KDB_E_COUNT, "RR count mismatch" }, { KDB_E_SEQ, "batch mismatch" },
+        { KDB_E_LIMIT_BYTES, "zone byte limit exceeded" }, { KDB_E_LIMIT_RECORDS, "zone record limit exceeded" },
+        { KDB_E_LIMIT_PROFILES, "profile limit exceeded" },
+    };
+    for (size_t i = 0; i < sizeof(rcs) / sizeof(rcs[0]); i++) CHECK_STR(kdb_rc_name(rcs[i].rc), rcs[i].name);
+    CHECK_STR(kdb_rc_name((kdb_rc_t)9999), "?");
+    CHECK_STR(kdb_type_name(KDB_T_HELLO), "HELLO");
+    CHECK_STR(kdb_type_name(KDB_T_ZONE_FAILED), "ZONE_FAILED");
+    CHECK_STR(kdb_type_name(0x7fff), "?");
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--gen-corpus") == 0) return gen_corpus(argv[2]) ? 1 : 0;
     test_roundtrip_loader();
@@ -1409,6 +1534,8 @@ int main(int argc, char **argv) {
     test_encoder();
     test_batch_request_id();
     test_auto_status();
+    test_checkproto();
+    test_names();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

@@ -41,7 +41,7 @@ struct db_conn {
     char err[DB_ERRLEN];
     bool in_snapshot;
     bool has_changes;
-    sqlite3_stmt *st_zones, *st_rec_all, *st_rec_one, *st_rec_rng, *st_meta_all, *st_meta_one, *st_keys, *st_changes;
+    sqlite3_stmt *st_zones, *st_zone_one, *st_rec_all, *st_rec_one, *st_rec_rng, *st_meta_all, *st_meta_one, *st_keys, *st_changes;
     sqlite3_stmt *st_dv_all, *st_dv_one;
     bool has_domain_views;
     sqlite3_stmt *st_prof;
@@ -192,6 +192,7 @@ static void sq_close(db_conn_t *c) {
     sqlite3_finalize(c->st_pv);
     free(c->path);
     sqlite3_finalize(c->st_zones);
+    sqlite3_finalize(c->st_zone_one);
     sqlite3_finalize(c->st_rec_all);
     sqlite3_finalize(c->st_rec_one);
     sqlite3_finalize(c->st_rec_rng);
@@ -291,7 +292,10 @@ static int sq_check_schema(db_conn_t *c, db_schema_info_t *out) {
         (rc = table_columns(c, "karidns_zone_tagdefs", xg_cols, &f3, &r3)) != 0)
         return rc;
     c->has_ext = r1 > 0 && f1 == 7u && r2 > 0 && f2 == 15u && r3 > 0 && f3 == 15u;
-    if (out) out->has_ext = c->has_ext;
+    if (out) {
+        out->has_ext = c->has_ext;
+        out->has_reload_requests = out->has_server_status = false;     /* B11: the multi-server tables are PostgreSQL only */
+    }
     /* B10: schema version 1 and 2 (v2 adds karidns_zone_tagdefs.id; the order of the definitions is the rowid either way);
      * a newer version was written for a later loader */
     static const char *const sv_cols[] = { "version", NULL };
@@ -311,6 +315,123 @@ static int sq_check_schema(db_conn_t *c, db_schema_info_t *out) {
         }
         sqlite3_finalize(st);
         return sql_fail(c, rc, "karidns_schema_version");
+    }
+    return 0;
+}
+
+/* B12: the schema check of `karicheck db` (design 7.2).  Everything is a catalog read; nothing is written. */
+static void fnd(db_finding_cb cb, void *ud, char level, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+static void fnd(db_finding_cb cb, void *ud, char level, const char *fmt, ...) {
+    char t[600];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(t, sizeof(t), fmt, ap);
+    va_end(ap);
+    cb(ud, level, t);
+}
+
+/* the karidns_* tables of db/karidns_ext.sqlite3.sql (design 3.7) with the columns the loader reads and what a missing one costs */
+static const struct { const char *table; const char *cols[6]; unsigned all; const char *effect; } k_ext[] = {
+    { "karidns_schema_version", { "version", NULL }, 1u, "the version of the extension tables is not known" },
+    { "karidns_changes", { "seq", "domain_id", NULL }, 3u, "there is no change log, so an edit that keeps the SOA serial is not noticed by a reload" },
+    { "karidns_domain_views", { "domain_id", "view_name", NULL }, 3u, "the zone to view mapping is not available: every zone goes to every view that uses this source" },
+    { "karidns_profiles", { "name", "settings", NULL }, 3u, "a zone that names a profile (X-KARIDNS-PROFILE) fails to load" },
+    { "karidns_record_tags", { "record_id", "location_tag", "ecs_tag", NULL }, 7u, "location and ECS tags are ignored (the three tag tables are used together)" },
+    { "karidns_record_tinydns", { "record_id", "ttd", "loc", "countdown", NULL }, 15u, "tinydns time stamps and locations are ignored (the three tag tables are used together)" },
+    { "karidns_zone_tagdefs", { "domain_id", "kind", "tag", "cidr", NULL }, 15u, "tag definitions are ignored (the three tag tables are used together)" },
+};
+#define N_EXT (sizeof(k_ext) / sizeof(k_ext[0]))
+
+static int sq_schema_findings(db_conn_t *c, const db_check_opts_t *o, db_finding_cb cb, void *ud) {
+    for (size_t t = 0; t < sizeof(k_required) / sizeof(k_required[0]); t++) {
+        unsigned found;
+        int rows;
+        int rc = table_columns(c, k_required[t].table, k_required[t].cols, &found, &rows);
+        if (rc != 0) return rc;
+        if (rows == 0) {
+            fnd(cb, ud, 'E', "table %s is missing (PowerDNS 5.1 schema expected)", k_required[t].table);
+            continue;
+        }
+        char miss[200] = "";
+        unsigned nm = 0;
+        for (int i = 0; k_required[t].cols[i]; i++)
+            if (!(found & (1u << i))) db_list_add(miss, sizeof(miss), &nm, k_required[t].cols[i]);
+        if (nm) fnd(cb, ud, 'E', "table %s has no column %s%s (PowerDNS 5.1 schema expected)", k_required[t].table, miss, nm > 6 ? ", ..." : "");
+    }
+    bool have[N_EXT];
+    unsigned present = 0;
+    for (size_t t = 0; t < N_EXT; t++) {
+        unsigned found;
+        int rows;
+        int rc = table_columns(c, k_ext[t].table, k_ext[t].cols, &found, &rows);
+        if (rc != 0) return rc;
+        have[t] = rows > 0 && found == k_ext[t].all;
+        if (rows > 0) present++;
+    }
+    if (present == 0) {
+        fnd(cb, ud, 'W', "none of the karidns_* extension tables exists (db/karidns_ext.sqlite3.sql was not applied): no change log, no zone to view "
+                         "mapping, no profiles, no tags; a reload compares the SOA serials");
+    } else {
+        for (size_t t = 0; t < N_EXT; t++)
+            if (!have[t]) fnd(cb, ud, 'W', "table %s is missing or incomplete: %s", k_ext[t].table, k_ext[t].effect);
+    }
+    if (have[0]) {
+        sqlite3_stmt *st = NULL;
+        int rc = sqlite3_prepare_v2(c->db, "SELECT max(version), count(*) FROM karidns_schema_version", -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc != SQLITE_ROW) {
+            sqlite3_finalize(st);
+            return sql_fail(c, rc, "karidns_schema_version");
+        }
+        long long v = sqlite3_column_type(st, 0) == SQLITE_NULL ? 0 : sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+        if (v == 0) fnd(cb, ud, 'W', "karidns_schema_version has no row");
+        else if (v > 2) fnd(cb, ud, 'E', "karidns_schema_version is %lld; this loader reads versions 1 and 2", v);
+        else fnd(cb, ud, 'I', "karidns_* schema version %lld", v);
+    }
+    if (o && o->auto_reload) {
+        if (!have[1]) {
+            fnd(cb, ud, 'E', "auto-reload yes needs the change log: table karidns_changes is missing or incomplete (apply db/karidns_ext.sqlite3.sql)");
+        } else {
+            static const struct { const char *infix, *table; } k_trg[] = {
+#define X(i, t) { #i, t },
+                DB_CHANGE_TRIGGERS(X)
+#undef X
+            };
+            sqlite3_stmt *st = NULL;
+            int rc = sqlite3_prepare_v2(c->db, "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?1", -1, &st, NULL);
+            if (rc != SQLITE_OK) return sql_fail(c, rc, "prepare");
+            char miss[300] = "";
+            unsigned nm = 0;
+            for (size_t i = 0; i < sizeof(k_trg) / sizeof(k_trg[0]) * 3 + 1; i++) {
+                char name[96];
+                if (i == 0) {
+                    snprintf(name, sizeof(name), "karidns_changes_prune");
+                } else {
+                    size_t k = (i - 1) / 3;
+                    static const char *const sfx[3] = { "ins", "upd", "del" };
+                    bool ext = strncmp(k_trg[k].table, "karidns_", 8) == 0;
+                    bool table_here = true;
+                    if (ext)
+                        for (size_t t = 0; t < N_EXT; t++)
+                            if (strcmp(k_ext[t].table, k_trg[k].table) == 0) table_here = have[t];
+                    if (!table_here) continue;                 /* its table is reported above */
+                    snprintf(name, sizeof(name), "karidns_trg_%s_%s", k_trg[k].infix, sfx[(i - 1) % 3]);
+                }
+                sqlite3_reset(st);
+                sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
+                rc = sqlite3_step(st);
+                if (rc == SQLITE_DONE) db_list_add(miss, sizeof(miss), &nm, name);
+                else if (rc != SQLITE_ROW) {
+                    sqlite3_finalize(st);
+                    return sql_fail(c, rc, "sqlite_master");
+                }
+            }
+            sqlite3_finalize(st);
+            if (nm)
+                fnd(cb, ud, 'E', "auto-reload yes needs the change log triggers, but %u are missing: %s%s (apply db/karidns_ext.sqlite3.sql)", nm, miss,
+                    nm > 6 ? ", ..." : "");
+        }
     }
     return 0;
 }
@@ -346,7 +467,7 @@ static int sq_begin_snapshot(db_conn_t *c) {
 
 static int sq_end_snapshot(db_conn_t *c) {
     if (!c->in_snapshot) return 0;
-    sqlite3_stmt *all[] = { c->st_zones, c->st_rec_all, c->st_rec_one, c->st_rec_rng, c->st_meta_all, c->st_meta_one,
+    sqlite3_stmt *all[] = { c->st_zones, c->st_zone_one, c->st_rec_all, c->st_rec_one, c->st_rec_rng, c->st_meta_all, c->st_meta_one,
                             c->st_keys, c->st_changes, c->st_dv_all, c->st_dv_one, c->st_prof };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
         if (all[i]) rearm(all[i]);
@@ -363,14 +484,8 @@ static int sq_end_snapshot(db_conn_t *c) {
 /* scans                                                                                                          */
 /* ------------------------------------------------------------------------------------------------------------- */
 
-static int sq_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
-    int ret = prep(c, &c->st_zones,
-                   "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content FROM domains d "
-                   "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND r.name = d.name AND r.disabled = 0 "
-                   "ORDER BY d.id");
-    if (ret != 0) return ret;
-    sqlite3_stmt *st = c->st_zones;
-    rearm(st);
+static int sq_zone_loop(db_conn_t *c, sqlite3_stmt *st, db_zone_cb cb, void *ud) {
+    int ret = 0;
     bool have_prev = false;
     int64_t prev = 0;
     for (;;) {
@@ -402,6 +517,57 @@ static int sq_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
         }
     }
     rearm(st);
+    return ret;
+}
+
+static int sq_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
+    int ret = prep(c, &c->st_zones,
+                   "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content FROM domains d "
+                   "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND r.name = d.name AND r.disabled = 0 "
+                   "ORDER BY d.id");
+    if (ret != 0) return ret;
+    rearm(c->st_zones);
+    return sq_zone_loop(c, c->st_zones, cb, ud);
+}
+
+/* B13: one zone by name, through the index on domains.name (a one-zone reload must not read the list of all zones).  The name
+ * matches like names_equal() of the loader: ASCII case-insensitive, with or without one trailing dot.  COLLATE NOCASE is explicit so
+ * that the answer does not depend on the collation the schema gave the column (the PowerDNS schema has NOCASE, which lets the
+ * index serve both comparisons). */
+static int sq_find_zone(db_conn_t *c, const char *name, db_zone_cb cb, void *ud) {
+    size_t n = strlen(name);
+    if (n > 1 && name[n - 1] == '.') n--;
+    char *a = malloc(n + 2);
+    if (!a) {
+        set_err(c, "out of memory");
+        return -1;
+    }
+    memcpy(a, name, n);
+    a[n] = '\0';
+    a[n + 1] = '\0';
+    int ret = prep(c, &c->st_zone_one,
+                   "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content FROM domains d "
+                   "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND r.name = d.name AND r.disabled = 0 "
+                   "WHERE d.name COLLATE NOCASE = ?1 OR d.name COLLATE NOCASE = ?2 ORDER BY d.id");
+    if (ret != 0) {
+        free(a);
+        return ret;
+    }
+    sqlite3_stmt *st = c->st_zone_one;
+    rearm(st);
+    sqlite3_bind_text(st, 1, a, (int)n, SQLITE_TRANSIENT);
+    char *b = malloc(n + 2);
+    if (!b) {
+        free(a);
+        set_err(c, "out of memory");
+        return -1;
+    }
+    memcpy(b, a, n);
+    b[n] = '.';
+    sqlite3_bind_text(st, 2, b, (int)n + 1, SQLITE_TRANSIENT);
+    ret = sq_zone_loop(c, st, cb, ud);
+    free(a);
+    free(b);
     return ret;
 }
 
@@ -800,6 +966,9 @@ const db_driver_t db_driver_sqlite3 = {
     sq_zones_with_keys, sq_changes_since, sq_wait_fd,     sq_drain_notifications, sq_report_status,
     sq_changes_max,   sq_scan_records_range, sq_scan_domain_views, sq_scan_profiles, sq_scan_ext, sq_poll_version,
     false,          /* changes_unsettled: the cursor is the highest seq */
+    NULL, NULL, NULL,   /* B11 reload requests: PostgreSQL only (watch_requests, requests_max, reload_requests) */
+    sq_schema_findings, /* B12 */
+    sq_find_zone,       /* B13 */
 };
 
 #endif /* KARIDNS_DB_SQLITE3 */

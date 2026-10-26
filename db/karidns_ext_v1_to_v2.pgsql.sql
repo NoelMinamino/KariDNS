@@ -1,6 +1,9 @@
 -- karidns_ext_v1_to_v2.pgsql.sql - converts the KariDNS extension tables of a PostgreSQL database from schema version 1
 -- (db/karidns_ext.pgsql.sql of milestone B6a..B9) to version 2 (milestone B10).  PostgreSQL 13 or later (xid8).
 --
+-- Manual: docs/karidns-dbloader.md (the schema and trigger files, the privileges, the drivers) and the database chapter of
+-- docs/karidns.md.  The packages karidns-sqlite3, karidns-postgresql and karidns-db install this file in /usr/local/share/karidns/db/.
+--
 -- Apply it once, as the owner of the tables, in the schema that holds them (SET search_path TO that_schema first):
 --     psql -v ON_ERROR_STOP=1 -f karidns_ext_v1_to_v2.pgsql.sql karidns
 -- It can be applied again (every step is IF NOT EXISTS / a no-op on version 2).  Then apply db/karidns_ext.pgsql.sql again

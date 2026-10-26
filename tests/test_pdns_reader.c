@@ -1832,6 +1832,174 @@ static void test_ext(void) {
     }
 }
 
+/* ------------------------------------------------------------------ limits and rejections that need many rows or a small max-zone-records */
+static bool has_warning(const pdns_zone_t *z, const char *needle) {
+    for (size_t i = 0; i < z->n_warnings; i++)
+        if (strstr(z->warnings[i], needle)) return true;
+    return false;
+}
+
+static void test_limits(void) {
+    printf("limits: max-zone-records, list lengths, metadata rows, tinydns definitions, SOA rules\n");
+    char text[64];
+    {   /* max-zone-records counts the enabled rows (the SOA is one) and, separately, the RRs of the zone (the SOA counts twice) */
+        pdns_opts_t o;
+        memset(&o, 0, sizeof(o));
+        o.max_records = 4;
+        db_record_row_t rows[4];
+        for (int i = 0; i < 4; i++) {
+            snprintf(text, sizeof(text), "192.0.2.%d", i + 1);
+            rows[i] = R(2 + i, "a.z.test", "A", strdup(text), 300, 0);
+        }
+        pdns_zone_t *z = build(rows, 3, NULL, 0, &o);        /* 4 rows, 5 RRs */
+        CHECK(z->failed);
+        if (z->failed) CHECK_MSG(strstr(z->error, "more than 4 records") && strstr(z->error, "SOA counts twice"), "%s", z->error);
+        pdns_zone_free(z);
+        {
+            db_record_row_t ent[4];
+            char en[4][24];
+            for (int i = 0; i < 4; i++) {
+                snprintf(en[i], sizeof(en[i]), "e%d.z.test", i);
+                ent[i] = R(10 + i, en[i], NULL, NULL, 0, 0);               /* an empty non-terminal is a row but no RR */
+            }
+            z = build(ent, 4, NULL, 0, &o);                 /* SOA and 4 ENT rows: the 5th row */
+        }
+        CHECK(z->failed);
+        if (z->failed) CHECK_MSG(strstr(z->error, "more than 4 rows (max-zone-records)") != NULL, "%s", z->error);
+        pdns_zone_free(z);
+        o.max_records = 6;
+        z = build(rows, 3, NULL, 0, &o);                     /* 4 rows, 5 RRs: inside the limit */
+        CHECK_MSG(!z->failed, "%s", z->error);
+        pdns_zone_free(z);
+        for (int i = 0; i < 4; i++) free((char *)rows[i].content);
+    }
+    {   /* metadata: a long content is ignored with a warning; the number of rows is bounded */
+        char *big = malloc(PDNS_MAX_META_CONTENT + 10);
+        memset(big, 'a', PDNS_MAX_META_CONTENT + 1);
+        big[PDNS_MAX_META_CONTENT + 1] = '\0';
+        db_meta_row_t m[] = { M("X-KARIDNS-PROFILE", big) };
+        pdns_zone_t *z = build(NULL, 0, m, 1, NULL);
+        CHECK_MSG(!z->failed && has_warning(z, "longer than 4096 bytes ignored"), "%s", z->error);
+        pdns_zone_free(z);
+        free(big);
+        pdns_zone_t *zm = pdns_zone_new("z.test", NULL);
+        db_meta_row_t row = M("X-KARIDNS-PROFILE", "p");
+        int last = 0;
+        for (unsigned i = 0; i <= PDNS_MAX_META_ROWS && last == 0; i++) last = pdns_zone_add_meta(zm, &row);
+        CHECK(last == -1 && zm->failed);
+        CHECK_HAS(zm->error, "more than 65536 domainmetadata rows");
+        pdns_zone_free(zm);
+    }
+    {   /* the lists of an ACL / key / notify kind keep 1024 entries, the rest is ignored with a warning */
+        static const char *const kinds[] = { "ALLOW-AXFR-FROM", "ALLOW-DNSUPDATE-FROM", "TSIG-ALLOW-AXFR", "TSIG-ALLOW-DNSUPDATE", "ALSO-NOTIFY" };
+        for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+            pdns_zone_t *z = pdns_zone_new("z.test", NULL);
+            db_record_row_t soa = SOA();
+            pdns_zone_add_record(z, &soa);
+            for (int i = 0; i < 1030; i++) {
+                char c[48];
+                if (strncmp(kinds[k], "TSIG", 4) == 0) snprintf(c, sizeof(c), "key%d.example", i);
+                else snprintf(c, sizeof(c), "10.%d.%d.1", i / 256, i % 256);
+                db_meta_row_t m = M(kinds[k], c);
+                pdns_zone_add_meta(z, &m);
+            }
+            pdns_zone_finish(z);
+            CHECK_MSG(!z->failed && has_warning(z, "has more than 1024 entries"), "%s: %s (%zu warnings)", kinds[k], z->error, z->n_warnings);
+            pdns_zone_free(z);
+        }
+        pdns_zone_t *z = pdns_zone_new("z.test", NULL);   /* trusted resolvers: one row may hold many entries */
+        db_record_row_t soa = SOA();
+        pdns_zone_add_record(z, &soa);
+        for (int r = 0; r < 4; r++) {
+            char *c = malloc(4096);
+            size_t n = 0;
+            for (int i = 0; i < 300; i++) n += (size_t)snprintf(c + n, 4096 - n, "10.%d.%d.1 ", r, i % 256);
+            db_meta_row_t m = M("X-KARIDNS-ECS-TRUSTED-RESOLVERS", c);
+            pdns_zone_add_meta(z, &m);
+            free(c);
+        }
+        pdns_zone_finish(z);
+        CHECK_MSG(!z->failed && has_warning(z, "X-KARIDNS-ECS-TRUSTED-RESOLVERS has more than 1024 entries"), "%s", z->error);
+        pdns_zone_free(z);
+    }
+    {   /* the extension rows are bounded by max-zone-records too, and a tinydns location needs a code of one or two characters */
+        pdns_opts_t o;
+        memset(&o, 0, sizeof(o));
+        o.max_records = 2;
+        pdns_zone_t *z = pdns_zone_new("z.test", &o);
+        db_record_row_t soa = SOA();
+        pdns_zone_add_record(z, &soa);
+        db_tag_row_t t = { 1, "lan", NULL };
+        CHECK(pdns_zone_add_tags(z, &t) == 0 && pdns_zone_add_tags(z, &t) == 0 && pdns_zone_add_tags(z, &t) == -1);
+        CHECK_HAS(z->error, "more karidns_record_tags rows than max-zone-records");
+        pdns_zone_free(z);
+        z = pdns_zone_new("z.test", &o);
+        pdns_zone_add_record(z, &soa);
+        db_tinydns_row_t d = { 1, false, 10, "l2", false };
+        CHECK(pdns_zone_add_tinydns(z, &d) == 0 && pdns_zone_add_tinydns(z, &d) == 0 && pdns_zone_add_tinydns(z, &d) == -1);
+        CHECK_HAS(z->error, "more karidns_record_tinydns rows than max-zone-records");
+        pdns_zone_free(z);
+        z = pdns_zone_new("z.test", &o);
+        pdns_zone_add_record(z, &soa);
+        db_tagdef_row_t g = { "location", "lan", "127.0.0.2/32" };
+        CHECK(pdns_zone_add_tagdef(z, &g) == 0 && pdns_zone_add_tagdef(z, &g) == 0 && pdns_zone_add_tagdef(z, &g) == -1);
+        CHECK_HAS(z->error, "more karidns_zone_tagdefs rows than max-zone-records");
+        pdns_zone_free(z);
+        db_tagdef_row_t bad_code = { "tinydns", "abc", "127.0.0.2/32" };
+        z = pdns_zone_new("z.test", NULL);
+        pdns_zone_add_record(z, &soa);
+        CHECK(pdns_zone_add_tagdef(z, &bad_code) == -1);
+        CHECK_HAS(z->error, "is not a location code");
+        pdns_zone_free(z);
+        z = pdns_zone_new("z.test", NULL);               /* 4096 locations are the limit of the tinydns data parser */
+        pdns_zone_add_record(z, &soa);
+        int rc = 0;
+        for (int i = 0; i <= 4096 && rc == 0; i++) {
+            char cidr[40];
+            snprintf(cidr, sizeof(cidr), "10.%d.%d.0/24", i / 256, i % 256);
+            db_tagdef_row_t l = { "tinydns", "l2", cidr };
+            rc = pdns_zone_add_tagdef(z, &l);
+        }
+        CHECK(rc == -1);
+        CHECK_HAS(z->error, "more than 4096 tinydns location definitions");
+        pdns_zone_free(z);
+        /* two rows of karidns_record_tinydns for one record */
+        db_tinydns_row_t two[] = { { 3, false, 10, "l2", false }, { 3, false, 20, "l2", false } };
+        db_tagdef_row_t defs[] = { { "tinydns", "l2", "127.0.0.2/32" } };
+        z = build_ext(k_ext_rows, 3, NULL, 0, NULL, 0, two, 2, defs, 1);
+        CHECK(z->failed);
+        if (z->failed) CHECK_HAS(z->error, "two rows in karidns_record_tinydns for this record");
+        pdns_zone_free(z);
+    }
+    {   /* the SOA row: its serial, its fields, and a presigned zone with more than one SOA */
+        pdns_zone_t *z = pdns_zone_new("z.test", NULL);
+        db_record_row_t soa = R(1, "z.test", "SOA", "ns1.z.test hostmaster.z.test 4294967296 7200 3600 1209600 300", 3600, 0);
+        pdns_zone_add_record(z, &soa);
+        pdns_zone_finish(z);
+        CHECK(z->failed);
+        if (z->failed) CHECK_MSG(strstr(z->error, "serial") != NULL, "%s", z->error);
+        pdns_zone_free(z);
+        z = pdns_zone_new("z.test", NULL);
+        soa = R(1, "z.test", "SOA", "ns1.z.test hostmaster.z.test", 3600, 0);
+        pdns_zone_add_record(z, &soa);
+        pdns_zone_finish(z);
+        CHECK(z->failed);
+        if (z->failed) CHECK_MSG(strstr(z->error, "SOA") != NULL, "%s", z->error);
+        pdns_zone_free(z);
+        z = pdns_zone_new("z.test", NULL);
+        soa = SOA();
+        db_record_row_t soa2 = R(9, "z.test", "SOA", "ns2.z.test hostmaster.z.test 2024010101 7200 3600 1209600 300", 3600, 0);
+        db_meta_row_t pm = M("PRESIGNED", "1");
+        pdns_zone_add_record(z, &soa);
+        pdns_zone_add_record(z, &soa2);
+        pdns_zone_add_meta(z, &pm);
+        pdns_zone_finish(z);
+        CHECK(z->failed);
+        if (z->failed) CHECK_MSG(strstr(z->error, "presigned zone cannot have several") != NULL, "%s", z->error);
+        pdns_zone_free(z);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--gen-corpus") == 0) return gen_corpus(argv[2]);
     if (argc == 2) g_zones_dir = argv[1];
@@ -1847,6 +2015,7 @@ int main(int argc, char **argv) {
     test_isolation();
     test_metadata();
     test_ext();
+    test_limits();
     test_kdb();
     test_secondary();
     test_kdb_name_case();

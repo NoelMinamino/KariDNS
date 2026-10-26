@@ -26,6 +26,10 @@
  *
  * Auto reload (B9, design 6): the same diff, started by the loader itself; see the block before run_stream().  B10: a driver
  * with a socket to wait on (PostgreSQL LISTEN, wait_fd()) wakes the main loop at once; the others are polled by timer.
+ *
+ * Multi-server operation (B11, release plan 4.8, PostgreSQL only): reload requests written to karidns_reload_requests by a
+ * management tool make every server reload, and each loader writes the outcome to karidns_server_status; see the block
+ * "multi-server reload requests" before auto_send_status().
  */
 
 #include <stdio.h>
@@ -50,10 +54,14 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <pwd.h>
+#include <limits.h>
 
 #include "dns_db_driver.h"
 #include "dns_db_stream.h"
+#include "dns_db_checkproto.h"
 #include "dns_pdns_reader.h"
+#include "dns_zone_lint.h"
 
 #ifndef KARIDNS_VERSION
 #define KARIDNS_VERSION "dev"
@@ -65,6 +73,36 @@ enum { EXIT_OK = 0, EXIT_ZONES_FAILED = 1, EXIT_USAGE = 2, EXIT_ERROR = 3, EXIT_
  * (openlog() has LOG_PERROR, so a foreground server still shows them on stderr). */
 static bool g_stream_mode;
 static volatile sig_atomic_t g_stop;      /* SIGTERM / SIGINT in stream mode */
+
+/* B12, --check: every message of the run is a line of the check protocol (dns_db_checkproto.h) on g_chk_out; g_chk_zone / g_chk_id say
+ * which zone the findings are about ("" / 0: the source).  The run is single threaded. */
+static FILE *g_chk_out;
+static unsigned g_chk_errors, g_chk_warnings;
+static char g_chk_zone[DNS_NAME_TEXT_SIZE + 16];
+static int64_t g_chk_id;
+
+/* one finding: level E W I O D, text of any bytes (cut at CHK_TEXT_MAX, escaped) */
+static void chk_line(char level, const char *text) {
+    char zone[4 * DNS_NAME_TEXT_SIZE + 4], body[4 * CHK_TEXT_MAX + 8];
+    size_t tl = strlen(text);
+    bool cut = false;
+    if (level == 'E') g_chk_errors++;
+    else if (level == 'W') g_chk_warnings++;
+    chk_escape(g_chk_zone, strlen(g_chk_zone), zone, sizeof(zone), NULL);
+    chk_escape(text, tl > CHK_TEXT_MAX ? CHK_TEXT_MAX : tl, body, sizeof(body), &cut);
+    fprintf(g_chk_out, "%c\t%s\t%lld\t%s%s\n", level, zone, (long long)g_chk_id, body, tl > CHK_TEXT_MAX || cut ? "..." : "");
+}
+
+static void chk_linef(char level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void chk_linef(char level, const char *fmt, ...) {
+    char msg[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    chk_line(level, msg);
+}
+
 static void lg(int prio, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void lg(int prio, const char *fmt, ...) {
     char msg[1024];
@@ -72,7 +110,8 @@ static void lg(int prio, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
-    if (g_stream_mode) syslog(prio, "%s", msg);
+    if (g_chk_out) chk_line(prio <= LOG_ERR ? 'E' : prio == LOG_WARNING ? 'W' : 'I', msg);
+    else if (g_stream_mode) syslog(prio, "%s", msg);
     else fprintf(stderr, "karidns-dbloader: %s\n", msg);
 }
 
@@ -359,6 +398,16 @@ typedef struct {
     bool prof_oom;
     struct psent { char name[256]; uint64_t hash; size_t len; } *psent;
     size_t npsent, cpsent;
+    /* B12, --check (read only, nothing is sent): the zone checks of `karicheck db`; all zero in the other modes */
+    bool check;
+    db_check_opts_t chk_opts;
+    unsigned chk_zones;               /* zones read */
+    char **chk_cat;                   /* domains.catalog of zones[i] (NULL if NULL) */
+    size_t chk_ncat, chk_ccat;
+    struct chk_map { int64_t did; char *view; } *chk_map;     /* the rows of karidns_domain_views, in domain_id order */
+    size_t chk_nmap, chk_cmap;
+    ecs_tag_def_t *chk_ecs, *chk_loc; /* names of the tag definitions of the server configuration (--ecs-tag / --location-tag): only .tag is set */
+    int chk_necs, chk_nloc;
 } ctx_t;
 
 static int stream_write(ctx_t *x, const uint8_t *msg, size_t len);
@@ -390,6 +439,51 @@ typedef struct { uint64_t id; uint16_t view; bool force; char zone[DNS_NAME_TEXT
 #define LREQ_MAX 64
 #define IDX_SLOTS 65536                      /* view indexes are u16 */
 
+/* B11: the zones that failed in a load (the loader could not read or convert them, or the Backend rejected them), for the
+ * failed_zones column of karidns_server_status.  Collected while fz.on; entries keep the view so that the load of several sources
+ * can be split per source. */
+#define FZ_MAX_ENT 256                       /* failures kept; more set `overflow` */
+#define FZ_LINE 512
+#define FZ_REPORT_LINES 64                   /* lines of failed_zones */
+#define FZ_REPORT_BYTES 4096                 /* bytes of failed_zones (without the NUL) */
+typedef struct { uint16_t view; char text[FZ_LINE]; } fz_ent_t;
+typedef struct {
+    bool on, overflow;
+    unsigned n;
+    fz_ent_t ent[FZ_MAX_ENT];
+} fz_t;
+
+/* B11: one watcher per source (schema) whose database has karidns_reload_requests; see the block before auto_send_status() */
+#define RW_MAX 64                            /* sources watched */
+#define RW_ZONES 64                          /* different zones of one coalesced request batch; more is a diff of the whole source */
+#define RW_ERRLEN 160
+#define RW_RETRY_MS 10000                    /* a status row that could not be written is tried again after this */
+#define RW_ABSENT_MS 60000                   /* a source without the tables is looked at again after this */
+#define RW_FD_BASE ((size_t)1 << 20)         /* pfs_slot values from here on are watchers (index = value - RW_FD_BASE) */
+typedef struct {
+    char *source, *conninfo;                 /* the key: the view's source (schema) and conninfo-file */
+    uint16_t *views;                         /* indexes of the views that read this source (from the CONFIG) */
+    size_t nv, cv;
+    bool in_cfg;
+    const db_driver_t *drv;
+    db_conn_t *conn;
+    bool absent;                             /* the source has no karidns_reload_requests (looked at again later) */
+    bool seeded;                             /* `last` is valid */
+    bool startup_seeded;                     /* `last` was taken before a load that follows: that load's outcome is reported */
+    bool has_status;                         /* karidns_server_status exists */
+    bool applied_ok;                         /* the outcome of the last reload that counted (every zone loaded) */
+    uint64_t last;                           /* the highest generation applied */
+    int64_t next_poll, flush_at, open_retry_at, report_retry_at;
+    bool rep_pending;                        /* a status row is waiting to be written */
+    uint64_t rep_gen;
+    bool rep_ok;
+    char *rep_text;                          /* FZ_REPORT_BYTES + 1 */
+    char (*zbuf)[DNS_NAME_TEXT_SIZE];        /* RW_ZONES names of the request batch being built (allocated at the first request) */
+    int64_t rep_time;                        /* wall clock seconds of the last status row written, 0 = never */
+    bool listen_noted;
+    char perr[RW_ERRLEN], rerr[RW_ERRLEN];   /* the last error reading requests / loading, and writing the status row ("" = none) */
+} rw_t;
+
 struct lio {
     int fd;
     kdb_framer_t fr;
@@ -419,6 +513,13 @@ struct lio {
     int32_t *idx_slot;                       /* view index -> slot of vnames, -1 = no such view in the current CONFIG */
     struct pollfd *pfs;                      /* B10: poll set of the main loop: the stream, then the connections that notify (PostgreSQL LISTEN) */
     size_t *pfs_slot, cpfs;
+    /* B11: multi-server reload requests */
+    fz_t fz;
+    rw_t rw[RW_MAX];
+    size_t nrw;
+    char sid[72], sid_why[100];              /* the server id the loader reports under; why it has none */
+    bool sid_ok, sid_warned;
+    bool status_dirty;                       /* an AUTO_STATUS is due (auto reload or reload request state changed) */
 };
 
 static uint32_t name_hash(uint16_t vslot, const char *s) {
@@ -564,6 +665,78 @@ static void clean_reason(const char *in, char *out, size_t cap) {
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
+/* B11: the zones that failed, for karidns_server_status.failed_zones                                            */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* in[0..n) (up to a NUL) into out: printable ASCII as it is, every other byte (control characters, DEL, bytes >= 0x80: the column
+ * is TEXT and must be valid in the database encoding, and a line must not contain a line end) as \DDD (decimal, like a DNS name).
+ * At most cap - 1 bytes and an escape is never cut.  Returns the length. */
+static size_t fz_escape(const char *in, size_t n, char *out, size_t cap) {
+    size_t o = 0;
+    for (size_t i = 0; i < n && in[i] && cap > 0; i++) {
+        unsigned char ch = (unsigned char)in[i];
+        if (ch >= 0x20 && ch < 0x7F) {
+            if (o + 1 >= cap) break;
+            out[o++] = (char)ch;
+        } else {
+            if (o + 4 >= cap) break;
+            out[o++] = '\\';
+            out[o++] = (char)('0' + ch / 100);
+            out[o++] = (char)('0' + ch / 10 % 10);
+            out[o++] = (char)('0' + ch % 10);
+        }
+    }
+    if (cap > 0) out[o] = '\0';
+    return o;
+}
+
+static void fz_reset(fz_t *f, bool on) {
+    f->on = on;
+    f->overflow = false;
+    f->n = 0;
+}
+
+/* one failed zone of `view` (while collecting): the line is "name: reason", both escaped, the name cut at 255 bytes */
+static void fz_add(fz_t *f, uint16_t view, const char *name, const char *reason, size_t rlen) {
+    if (!f->on) return;
+    if (f->n >= FZ_MAX_ENT) {
+        f->overflow = true;
+        return;
+    }
+    fz_ent_t *e = &f->ent[f->n++];
+    e->view = view;
+    size_t o = fz_escape(name ? name : "(NULL)", name ? strlen(name) : 6, e->text, 260);
+    o += (size_t)snprintf(e->text + o, FZ_LINE - o, ": ");
+    fz_escape(reason ? reason : "rejected", reason ? rlen : 8, e->text + o, FZ_LINE - o);
+}
+
+/* failed_zones of the views listed, into out (FZ_REPORT_BYTES + 1 bytes): their lines in the order they happened, at most
+ * FZ_REPORT_LINES lines and FZ_REPORT_BYTES bytes, "... and N more" for the rest.  *ok = none of the views had a failure (and
+ * nothing was dropped for want of room: then the text says so, as the view of the dropped one is not known). */
+static void fz_report(const fz_t *f, const uint16_t *views, size_t nv, char *out, bool *ok) {
+    size_t o = 0;
+    unsigned lines = 0, sel = 0;
+    out[0] = '\0';
+    for (unsigned i = 0; i < f->n; i++) {
+        bool mine = false;
+        for (size_t k = 0; k < nv; k++)
+            if (views[k] == f->ent[i].view) mine = true;
+        if (!mine) continue;
+        sel++;
+        size_t l = strlen(f->ent[i].text);
+        if (lines >= FZ_REPORT_LINES || o + (lines ? 1 : 0) + l > FZ_REPORT_BYTES - 40) continue;     /* 40 bytes: the "... and N more" line */
+        if (lines) out[o++] = '\n';
+        memcpy(out + o, f->ent[i].text, l);
+        o += l;
+        lines++;
+    }
+    out[o] = '\0';
+    if (sel > lines) snprintf(out + o, FZ_REPORT_BYTES + 1 - o, "%s... and %u more", lines ? "\n" : "", sel - lines);
+    else if (sel == 0 && f->overflow) snprintf(out, FZ_REPORT_BYTES + 1, "(more zones failed than are listed)");
+    *ok = sel == 0 && !f->overflow;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
 /* collecting the lists                                                                                           */
 /* ------------------------------------------------------------------------------------------------------------- */
 
@@ -603,6 +776,18 @@ static int zone_cb(void *ud, const db_zone_row_t *r) {
             }
         }
         z->has_serial = r->soa_content && pdns_soa_serial(r->soa_content, &z->serial);
+    }
+    if (x->check) {                                  /* B12: domains.catalog, in step with zones[] */
+        if (x->chk_ncat >= x->chk_ccat) {
+            size_t nc = x->chk_ccat ? x->chk_ccat * 2 : 256;
+            char **ncat = realloc(x->chk_cat, nc * sizeof(*ncat));
+            if (!ncat) return x->oom = true;
+            x->chk_cat = ncat;
+            x->chk_ccat = nc;
+        }
+        x->chk_cat[x->chk_ncat] = r->catalog ? strdup(r->catalog) : NULL;
+        if (r->catalog && !x->chk_cat[x->chk_ncat]) return x->oom = true;
+        x->chk_ncat++;
     }
     x->nz++;
     return x->only_name ? 1 : 0;                    /* one zone wanted: stop after it (names are unique) */
@@ -697,6 +882,7 @@ static int send_failed(ctx_t *x, const zinfo_t *zi, const char *reason) {
     char name[DNS_NAME_TEXT_SIZE], why[260], shown[210];
     clean_reason(zi->name ? zi->name : "(NULL)", shown, sizeof(shown));
     lg(LOG_ERR, "zone '%s' (domains.id %lld): %s", shown, (long long)zi->id, reason);
+    if (x->io) fz_add(&x->io->fz, x->view, zi->name, reason, reason ? strlen(reason) : 0);       /* B11: failed_zones (also a name the stream cannot carry) */
     if (!pdns_canonical_zone_name(zi->name, name)) {
         lg(LOG_ERR, "the zone name is not a valid domain name; not written to the stream");
         x->n_unwritten++;
@@ -938,6 +1124,97 @@ static size_t meta_lower(const mset_t *m, int64_t id) {
     return lo;
 }
 
+/* ---- B12, --check: what is said about a zone (design 7.2) ----
+ * The conversion above is the production one; --check only adds what it says.  The reader's own messages and the zone checks of
+ * karicheck (dns_zone_lint.c, the same code as `karicheck zone`) are lines of the check protocol. */
+
+/* the reader prefixes its messages with "zone 'NAME' " or "zone 'NAME': "; the line already says which zone */
+static const char *chk_strip_zone(const char *msg) {
+    size_t n = strlen(g_chk_zone);
+    if (n && strncmp(msg, "zone '", 6) == 0 && strncmp(msg + 6, g_chk_zone, n) == 0 && msg[6 + n] == '\'') {
+        const char *p = msg + 7 + n;
+        if (*p == ':') p++;
+        while (*p == ' ') p++;
+        return p;
+    }
+    return msg;
+}
+
+static void chk_sink(void *ud, char level, const char *text) {
+    (void)ud;
+    chk_line(level, text);
+}
+
+/* the first line of a zone: Z <zone> <id> <kind> <view>... (the views karidns_domain_views names, "*" = no row) */
+static void chk_zone_begin(ctx_t *x, const zinfo_t *zi, const char *kind) {
+    char canon[DNS_NAME_TEXT_SIZE], esc[4 * DNS_NAME_TEXT_SIZE + 4];
+    bool ok = zi->name && pdns_canonical_zone_name(zi->name, canon);
+    snprintf(g_chk_zone, sizeof(g_chk_zone), "%s", ok ? canon : (zi->name ? zi->name : ""));
+    g_chk_id = zi->id;
+    chk_escape(g_chk_zone, strlen(g_chk_zone), esc, sizeof(esc), NULL);
+    fprintf(g_chk_out, "Z\t%s\t%lld\t%s", esc, (long long)zi->id, ok ? kind : "invalid");
+    size_t lo = 0, hi = x->chk_nmap;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (x->chk_map[mid].did < zi->id) lo = mid + 1;
+        else hi = mid;
+    }
+    unsigned n = 0;
+    for (size_t i = lo; i < x->chk_nmap && x->chk_map[i].did == zi->id; i++, n++) {
+        if (n >= 40) break;
+        char v[4 * 256 + 4];
+        chk_escape(x->chk_map[i].view, strlen(x->chk_map[i].view), v, sizeof(v), NULL);
+        fprintf(g_chk_out, "\t%s", v);
+    }
+    if (n == 0) fprintf(g_chk_out, "\t*");
+    fputc('\n', g_chk_out);
+    if (n >= 40 && lo + 40 < x->chk_nmap && x->chk_map[lo + 40].did == zi->id)
+        chk_linef('W', "karidns_domain_views has more than 40 rows for this zone; the rest are not checked");
+}
+
+/* after pdns_zone_finish(): the reader's warnings, the checks of `karicheck zone` on the parsed zone, the SOA serial, the settings text */
+static void chk_zone_report(ctx_t *x, const zinfo_t *zi, pdns_zone_t *z, const struct lprof *pf) {
+    for (size_t i = 0; i < z->n_warnings; i++) chk_line('W', chk_strip_zone(z->warnings[i]));
+    if (z->warnings_dropped) chk_linef('W', "%zu more warning(s) were dropped", z->warnings_dropped);
+    if (z->failed) return;
+    if (z->zkind == KDB_ZK_PRIMARY && z->arena_ready) {
+        kc_tally_t t = {0};
+        t.sink = chk_sink;
+        char src[40];
+        snprintf(src, sizeof(src), "domains.id %lld", (long long)zi->id);
+        zone_lint_ttl(&z->arena, "database", &t);
+        zone_lint_pdns_types(&z->arena, z->name, &t);
+        zone_lint_in_t in = {0};
+        in.domain = z->name;
+        in.src = src;
+        in.ecs_tags = x->chk_ecs;
+        in.ecs_tag_count = x->chk_necs;
+        in.loc_tags = x->chk_loc;
+        in.loc_tag_count = x->chk_nloc;
+        zone_lint_records(&z->arena, &in, &t);
+        if (z->serial == 0)
+            chk_linef('W', "the SOA serial is 0; PowerDNS may compute the served serial (SOA-EDIT, auto-serial), but KariDNS uses the stored value as it is, "
+                              "so secondaries and NOTIFY see serial 0");
+    }
+    if (z->settings[0] || pf) {          /* karicheck parses the text with the configuration (keys, acl-ceiling) */
+        const char *ptext = pf ? pf->text : "";
+        size_t zl = strlen(z->settings), pl = strlen(ptext);
+        char *zt = malloc(4 * zl + 8), *pt = malloc(4 * pl + 8);
+        char zn[4 * DNS_NAME_TEXT_SIZE + 4], pn[4 * 256 + 4];
+        if (zt && pt) {
+            chk_escape(g_chk_zone, strlen(g_chk_zone), zn, sizeof(zn), NULL);
+            chk_escape(z->settings, zl, zt, 4 * zl + 8, NULL);
+            chk_escape(pf ? pf->name : "", pf ? strlen(pf->name) : 0, pn, sizeof(pn), NULL);
+            chk_escape(ptext, pl, pt, 4 * pl + 8, NULL);
+            fprintf(g_chk_out, "S\t%s\t%lld\t%s\t%s\t%s\n", zn, (long long)zi->id, zt, pn, pt);
+        } else {
+            chk_linef('E', "out of memory");
+        }
+        free(zt);
+        free(pt);
+    }
+}
+
 /* Convert the zone zi (its rows were added to w->cur) into w->res.  Never fails: a bad zone is a ZR_FAILED result. */
 static void convert_zone(wk_t *w, const zinfo_t *zi) {
     ctx_t *x = w->x;
@@ -947,6 +1224,7 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
     pdns_zone_t *z = w->cur;
     const char *tr = zone_type_reason(zi->type);
     const uint8_t skind = zone_sec_kind(zi->type);
+    if (x->check) chk_zone_begin(x, zi, tr ? "other" : skind == KDB_ZK_SECONDARY ? "secondary" : skind == KDB_ZK_CATALOG ? "catalog" : "primary");
     if (z && skind != KDB_ZK_PRIMARY && pdns_zone_set_secondary(z, skind, zi->master) != 0) w->oom = true;
     if (w->oom) {
         r->kind = ZR_FATAL;
@@ -969,8 +1247,9 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
             /* design 3.5: PowerDNS would sign the zone online, KariDNS serves pre-signed data only */
             why = "the zone has cryptokeys but no PRESIGNED=1 metadata (online signing is not supported)";
         }
-        for (size_t i = 0; i < z->n_warnings; i++)
-            lg(LOG_WARNING, "warning: %s", z->warnings[i]);
+        if (!x->check)
+            for (size_t i = 0; i < z->n_warnings; i++)
+                lg(LOG_WARNING, "warning: %s", z->warnings[i]);
         /* B7a: the profile a zone names must be in karidns_profiles and fit the stream (design 3.7, 1.4) */
         const struct lprof *pf = NULL;
         char pwhy[200];
@@ -984,6 +1263,7 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
                 why = pwhy;
             }
         }
+        if (x->check) chk_zone_report(x, zi, z, pf && !pf->bad ? pf : NULL);        // B12: warnings, the zone checks of karicheck, the settings text
         if (why) {
             zres_fail(r, why);
         } else {
@@ -997,6 +1277,11 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
             if (er == 0) {
                 r->kind = ZR_SENT;
                 r->serial = z->serial;
+                /* design 3.2: serial 0 is loaded as it is, with a warning.  Here, not before the digest gate: a zone the Backend already
+                 * has (ZR_UNCHANGED) is not said again on every reload, only a new version of it */
+                if (!x->check && skind == KDB_ZK_PRIMARY && z->serial == 0)
+                    lg(LOG_WARNING, "zone '%s' (domains.id %lld): the SOA serial is 0; PowerDNS may compute the served serial (SOA-EDIT, auto-serial), "
+                                    "but KariDNS uses the stored value as it is, so secondaries and NOTIFY see serial 0", z->name, (long long)zi->id);
                 snprintf(r->profile, sizeof(r->profile), "%s", z->profile);
                 memcpy(r->digest, g.digest, KDB_DIGEST_LEN);
             } else if (er == 1) {
@@ -1058,6 +1343,10 @@ static int commit_zone(ctx_t *x, const zinfo_t *zi, zres_t *r) {
 
 /* convert and hand over the zone at w->wi; nonzero when the load must stop */
 static int finish_pos(wk_t *w) {
+    if (g_stop) {                                      /* B13: SIGTERM / SIGINT: stop reading and converting at the next zone (the main thread sees g_stop and ends the load) */
+        w->stop = true;
+        return 1;
+    }
     size_t pos = w->wi++;
     convert_zone(w, WZ(w, pos));
     if (w->deliver(w, pos, &w->res) != 0) {
@@ -1069,6 +1358,10 @@ static int finish_pos(wk_t *w) {
 
 static int rec_cb(void *ud, int64_t did, const db_record_row_t *row) {
     wk_t *w = ud;
+    if (g_stop) {                                      /* B13: also inside a long scan, which converts nothing for the rows of unwanted zones */
+        w->stop = true;
+        return 1;
+    }
     while (w->wi < w->wend && WZ(w, w->wi)->id < did) {
         if (finish_pos(w) != 0) return 1;
     }
@@ -1132,6 +1425,31 @@ static int run_task(wk_t *w, size_t a, size_t b, bool bulk, bool all) {
 /* loader-threads 1 (or a single zone): the main thread converts and commits, zone by zone, on the connection of the view */
 static int deliver_inline(wk_t *w, size_t pos, zres_t *r) {
     return commit_zone(w->x, WZ(w, pos), r);
+}
+
+/* --check: nothing is sent; the zones the production load would refuse are the errors (the converted stream is discarded) */
+static int deliver_check(wk_t *w, size_t pos, zres_t *r) {
+    ctx_t *x = w->x;
+    x->chk_zones++;
+    if (r->kind == ZR_FATAL) {
+        x->oom = true;
+        return -1;
+    }
+    if (r->kind == ZR_FAILED) {
+        const zinfo_t *zi = WZ(w, pos);
+        if (zi->type && zi->name && strcasecmp(zi->type, "PRODUCER") == 0) {
+            /* D9: the production load reports the PRODUCER zone as failed (ZONE_FAILED) and serves its members; for the operator that is
+             * a gap in the catalog service, not a broken zone, so --check says so as a warning (zone_type_reason() is the same fact) */
+            size_t members = 0;
+            for (size_t j = 0; j < x->nz && j < x->chk_ncat; j++)
+                if (x->chk_cat[j] && names_equal(x->chk_cat[j], zi->name)) members++;
+            chk_linef('W', "the catalog zone %.200s is not served (catalog producer zones are not supported yet); its %zu member zones are served; "
+                           "secondaries that take the catalog from KariDNS will not get it", g_chk_zone, members);
+        } else {
+            chk_line('E', chk_strip_zone(r->reason));
+        }
+    }
+    return 0;
 }
 
 /* ---- loader-threads N > 1 (design 1.5, D10) ----
@@ -1208,6 +1526,17 @@ static void *worker_main(void *arg) {
         lg(LOG_ERR, "%s", err);
         clean_reason(err, w->errtext, sizeof(w->errtext));
         pool_fail(p, w, rc == DB_ERR_RETRY ? EXIT_RETRY : EXIT_ERROR);
+        return NULL;
+    }
+    /* B11b: the driver learns which optional tables the source has (has_ext, ...) from check_schema(), as in run_view(); a worker
+     * that skipped it read the zones one by one (bulk off) with scan_ext() failing "the ... tables do not exist" on a database that
+     * has them, so a reload of two or more zones with loader-threads > 1 failed as a whole */
+    db_schema_info_t si;
+    memset(&si, 0, sizeof(si));
+    if ((rc = w->drv->check_schema(w->conn, &si)) != 0) {
+        pool_fail(p, w, db_err_c(w->drv, w->conn, w->errtext, sizeof(w->errtext), rc, "schema"));
+        w->drv->close(w->conn);
+        w->conn = NULL;
         return NULL;
     }
     if ((rc = w->drv->begin_snapshot(w->conn)) != 0) {
@@ -1351,7 +1680,7 @@ static int run_zones(ctx_t *x, const db_source_t *src, bool bulk, size_t n_want)
     w.drv = x->drv;
     w.conn = x->conn;
     w.bulk_meta = bulk ? &x->meta : NULL;
-    w.deliver = deliver_inline;
+    w.deliver = x->check ? deliver_check : deliver_inline;
     int st = run_task(&w, 0, n_want, bulk, true);
     if (w.oom) x->oom = true;
     if (st > 0) snprintf(x->errtext, sizeof(x->errtext), "%s", w.errtext);
@@ -1451,6 +1780,14 @@ static void ctx_view_reset(ctx_t *x) {
     x->profs = NULL;
     x->nprofs = x->cprofs = 0;
     x->prof_oom = false;
+    for (size_t i = 0; i < x->chk_ncat; i++) free(x->chk_cat[i]);       /* B12 */
+    free(x->chk_cat);
+    x->chk_cat = NULL;
+    x->chk_ncat = x->chk_ccat = 0;
+    for (size_t i = 0; i < x->chk_nmap; i++) free(x->chk_map[i].view);
+    free(x->chk_map);
+    x->chk_map = NULL;
+    x->chk_nmap = x->chk_cmap = 0;
 }
 
 /* a zone the Backend has and the database no longer lists */
@@ -1546,10 +1883,12 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
     size_t ng = 0, cg = 0;
     char only_canon[DNS_NAME_TEXT_SIZE];
     bool have_only = only_zone && pdns_canonical_zone_name(only_zone, only_canon);
-    for (size_t b = 0; b < io->inv.nb; b++) {
-        for (inv_ent_t *e = io->inv.tab[b]; e; e = e->next) {
+    /* B13: a one-zone request asks the inventory for that one name (names are unique per view); the walk over every entry is only for a
+     * full comparison */
+    inv_ent_t *one = (only_zone && have_only) ? inv_find(&io->inv, x->vslot, only_canon) : NULL;
+    for (size_t b = 0; b < (only_zone ? (one ? 1u : 0u) : io->inv.nb); b++) {
+        for (inv_ent_t *e = only_zone ? one : io->inv.tab[b]; e; e = only_zone ? NULL : e->next) {
             if (e->vslot != x->vslot || e->mark == gen || !e->known) continue;
-            if (only_zone && !(have_only && strcasecmp(e->name, only_canon) == 0)) continue;
             if (ng == cg) {
                 size_t nc = cg ? cg * 2 : 16;
                 gone_t *n = realloc(gone, nc * sizeof(*n));
@@ -1711,7 +2050,9 @@ static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, boo
         goto out;
     }
     x->has_ext = si.has_ext && x->drv->scan_ext;
-    rc = x->drv->list_zones(x->conn, zone_cb, x);
+    /* B13: a one-zone request looks the zone up by name (index) instead of listing every zone of the source, so its cost does
+     * not grow with the number of zones; a missing zone is the same empty result as before (nz == 0: a deletion in stream mode) */
+    rc = x->only_name && x->drv->find_zone ? x->drv->find_zone(x->conn, x->only_name, zone_cb, x) : x->drv->list_zones(x->conn, zone_cb, x);
     if (rc == DB_STOPPED && x->only_name && x->nz == 1 && !x->oom) rc = 0;     /* the one zone was found */
     if (rc != 0) {
         status = x->oom ? EXIT_ERROR : db_err(x, rc, "reading the zone list");
@@ -1797,6 +2138,10 @@ static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, boo
         for (size_t i = 0; i < ngone && !fatal; i++)
             if (send_delete(x, &gone[i]) != 0) fatal = 1;
         if (fatal || x->io_error || x->oom) {
+            if (g_stop && !x->io_error && !x->oom) {         /* B13: told to stop (the caller ends the load); nothing went wrong */
+                status = EXIT_ERROR;
+                goto out_snap;
+            }
             if (x->oom) lg(LOG_ERR, "out of memory");
             else lg(LOG_ERR, "cannot write the output: %s", strerror(errno));
             status = EXIT_ERROR;
@@ -1826,6 +2171,250 @@ out:
 /* The whole dump.  Returns an exit status. */
 static int run_dump(ctx_t *x, const db_source_t *src, const char *only_zone) {
     return run_view(x, src, only_zone, true);
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* --check: `karicheck db` (B12, beta design 7.2)                                                                 */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* The checks of one database, read only (the connection is query_only / READ ONLY, nothing is written, no status row, no LISTEN) and
+ * through the same functions as the production load: the same driver calls and the same reader (convert_zone() above is the one the
+ * production load runs), so a zone that --check accepts is a zone the loader sends, and the other way round.  The lines it writes are
+ * the check protocol (dns_db_checkproto.h): karicheck prints them and applies the part that needs the configuration (settings text,
+ * keys, acl-ceiling, views, the zones of karidns.conf).
+ *
+ * Rights: the process runs with the rights of whoever started it.  karicheck, when it is run as root, drops to loader-user /
+ * loader-group before it executes this program (D-B12-1), so the check reads the source the way the loader of karidns does. */
+
+static const char *chk_me(char *buf, size_t cap) {
+    struct passwd *pw = getpwuid(geteuid());
+    snprintf(buf, cap, "%s (uid %u)", pw ? pw->pw_name : "?", (unsigned)geteuid());
+    return buf;
+}
+
+/* Can this user use `path`?  If not, say which file or directory lacks which permission.  rw: the file is opened for writing too
+ * (SQLite opens a WAL database read-write because even a reader writes the -shm file). */
+static bool chk_path_access(const char *what, const char *path, bool rw) {
+    char me[160];
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        int e = errno;
+        if (e == EACCES) {
+            /* the directory (from the top) that cannot be searched: the first prefix that cannot be stat()ed is the one below it */
+            char prefix[PATH_MAX];
+            snprintf(prefix, sizeof(prefix), "%s", path);
+            for (size_t i = 1; prefix[i]; i++) {
+                if (prefix[i] != '/') continue;
+                prefix[i] = '\0';
+                struct stat ds;
+                if (stat(prefix, &ds) != 0 || access(prefix, X_OK) != 0) {
+                    if (stat(prefix, &ds) == 0)
+                        chk_linef('E', "cannot reach %s '%s': the user %s has no search (x) permission on the directory '%s' (mode %04o, owner uid %u, group gid %u)",
+                                  what, path, chk_me(me, sizeof(me)), prefix, (unsigned)(ds.st_mode & 07777), (unsigned)ds.st_uid, (unsigned)ds.st_gid);
+                    else
+                        chk_linef('E', "cannot reach %s '%s': the user %s cannot use the directory '%s' (%s)", what, path, chk_me(me, sizeof(me)), prefix,
+                                  strerror(errno));
+                    return false;
+                }
+                prefix[i] = '/';
+            }
+        }
+        if (e == EACCES) chk_linef('E', "cannot reach %s '%s': permission denied for the user %s", what, path, chk_me(me, sizeof(me)));
+        else chk_linef('E', "%s '%s': %s", what, path, strerror(e));
+        return false;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        chk_linef('E', "%s '%s' is not a regular file", what, path);
+        return false;
+    }
+    if (access(path, R_OK) != 0) {
+        chk_linef('E', "%s '%s' is not readable by the user %s: it needs read permission (mode %04o, owner uid %u, group gid %u)", what, path,
+                  chk_me(me, sizeof(me)), (unsigned)(st.st_mode & 07777), (unsigned)st.st_uid, (unsigned)st.st_gid);
+        return false;
+    }
+    if (strcmp(what, "conninfo-file") == 0) {          /* what the PostgreSQL driver demands before it reads the file (it may hold a password) */
+        if (st.st_uid != geteuid()) {
+            chk_linef('E', "%s '%s' is owned by uid %u; the loader refuses it unless it is owned by the user it runs as, %s", what, path, (unsigned)st.st_uid,
+                      chk_me(me, sizeof(me)));
+            return false;
+        }
+        if ((st.st_mode & 07777) != 0600 && (st.st_mode & 07777) != 0400) {
+            chk_linef('E', "%s '%s' has mode %04o; the loader requires 0600 or 0400 (it may hold a password)", what, path, (unsigned)(st.st_mode & 07777));
+            return false;
+        }
+    }
+    if (rw && access(path, W_OK) != 0) {
+        chk_linef('E', "%s '%s' is not writable by the user %s: SQLite needs write permission on the database file even for a reader in WAL mode "
+                       "(mode %04o, owner uid %u, group gid %u)", what, path, chk_me(me, sizeof(me)), (unsigned)(st.st_mode & 07777),
+                  (unsigned)st.st_uid, (unsigned)st.st_gid);
+        return false;
+    }
+    if (rw) {                                           /* the -wal / -shm files live next to the database */
+        char dir[PATH_MAX], shm[PATH_MAX + 8], wal[PATH_MAX + 8];
+        snprintf(dir, sizeof(dir), "%s", path);
+        char *s = strrchr(dir, '/');
+        if (s) *(s == dir ? s + 1 : s) = '\0';
+        else snprintf(dir, sizeof(dir), ".");
+        snprintf(shm, sizeof(shm), "%s-shm", path);
+        snprintf(wal, sizeof(wal), "%s-wal", path);
+        if (access(dir, W_OK) != 0 && (access(shm, W_OK) != 0 || access(wal, W_OK) != 0)) {
+            chk_linef('E', "the directory '%s' of the database file is not writable by the user %s, and '%s' / '%s' do not both exist and are writable: a reader "
+                           "in WAL mode needs the -shm and -wal files (the directory needs write permission, or both files must exist and be writable)", dir,
+                      chk_me(me, sizeof(me)), shm, wal);
+            return false;
+        }
+    }
+    return true;
+}
+
+static int chk_map_cb(void *ud, int64_t did, const char *vn) {
+    ctx_t *x = ud;
+    if (x->chk_nmap >= x->chk_cmap) {
+        size_t nc = x->chk_cmap ? x->chk_cmap * 2 : 256;
+        struct chk_map *nm = realloc(x->chk_map, nc * sizeof(*nm));
+        if (!nm) return x->oom = true;
+        x->chk_map = nm;
+        x->chk_cmap = nc;
+    }
+    x->chk_map[x->chk_nmap].did = did;
+    x->chk_map[x->chk_nmap].view = strdup(vn);
+    if (!x->chk_map[x->chk_nmap].view) return x->oom = true;
+    x->chk_nmap++;
+    return 0;
+}
+
+static void chk_driver_sink(void *ud, char level, const char *text) {
+    (void)ud;
+    chk_line(level, text);
+}
+
+/* domains.catalog (PowerDNS catalog zones): the column names the PRODUCER zone a member belongs to.  KariDNS does not read it yet
+ * (PRODUCER zones are refused above), so a name that is no PRODUCER zone of this database is only worth a warning. */
+static void chk_catalogs(ctx_t *x) {
+    struct { char name[DNS_NAME_TEXT_SIZE]; bool ok; } seen[64];
+    size_t nseen = 0;
+    for (size_t i = 0; i < x->nz && i < x->chk_ncat; i++) {
+        const char *cat = x->chk_cat[i];
+        if (!cat || !*cat) continue;
+        bool ok = false, known = false;
+        for (size_t k = 0; k < nseen && !known; k++)
+            if (strcasecmp(seen[k].name, cat) == 0) {
+                known = true;
+                ok = seen[k].ok;
+            }
+        if (!known) {
+            for (size_t j = 0; j < x->nz; j++)
+                if (x->zones[j].name && names_equal(x->zones[j].name, cat) && x->zones[j].type && strcasecmp(x->zones[j].type, "PRODUCER") == 0) ok = true;
+            if (nseen < sizeof(seen) / sizeof(seen[0]) && strlen(cat) < sizeof(seen[0].name)) {
+                snprintf(seen[nseen].name, sizeof(seen[0].name), "%s", cat);
+                seen[nseen++].ok = ok;
+            }
+        }
+        if (ok) continue;
+        char canon[DNS_NAME_TEXT_SIZE];
+        snprintf(g_chk_zone, sizeof(g_chk_zone), "%s", x->zones[i].name && pdns_canonical_zone_name(x->zones[i].name, canon) ? canon : (x->zones[i].name ? x->zones[i].name : ""));
+        g_chk_id = x->zones[i].id;
+        chk_linef('W', "domains.catalog names '%.200s', which is not a PRODUCER zone of this database (KariDNS ignores the column; catalog producer zones are not served yet)", cat);
+    }
+    g_chk_zone[0] = '\0';
+    g_chk_id = 0;
+}
+
+/* One source.  Returns an exit status: 0 nothing wrong, EXIT_ZONES_FAILED errors were found, EXIT_ERROR / EXIT_RETRY the source could not be read. */
+static int run_check(ctx_t *x, const db_source_t *src) {
+    char err[DB_ERRLEN];
+    ctx_view_reset(x);
+    g_chk_zone[0] = '\0';
+    g_chk_id = 0;
+    bool sqlite = strcmp(x->drv->name, "sqlite3") == 0;
+    const char *file = sqlite ? src->database_file : src->conninfo_file;
+    if (file && !chk_path_access(sqlite ? "database file" : "conninfo-file", file, sqlite)) return EXIT_ERROR;
+    int rc = x->drv->open(&x->conn, src, err, sizeof(err));
+    if (rc != 0) {
+        chk_linef('E', "%s", err);
+        return rc == DB_ERR_RETRY ? EXIT_RETRY : EXIT_ERROR;
+    }
+    int status = EXIT_OK;
+    db_schema_info_t si;
+    memset(&si, 0, sizeof(si));
+    unsigned e0 = g_chk_errors;
+    if (x->drv->schema_findings && (rc = x->drv->schema_findings(x->conn, &x->chk_opts, chk_driver_sink, NULL)) != 0) {
+        status = db_err(x, rc, "schema");
+        goto out;
+    }
+    if ((rc = x->drv->check_schema(x->conn, &si)) != 0) {
+        if (g_chk_errors == e0) status = db_err(x, rc, "schema");          /* schema_findings() said nothing, but the production check refuses */
+        else status = EXIT_ZONES_FAILED;
+        goto out;
+    }
+    if (g_chk_errors != e0) {                       /* the schema has errors (a privilege, say): reading would only repeat them */
+        status = EXIT_ZONES_FAILED;
+        goto out;
+    }
+    if ((rc = x->drv->begin_snapshot(x->conn)) != 0) {
+        status = db_err(x, rc, "snapshot");
+        goto out;
+    }
+    x->has_ext = si.has_ext && x->drv->scan_ext;
+    rc = x->drv->list_zones(x->conn, zone_cb, x);
+    if (rc != 0) {
+        status = x->oom ? EXIT_ERROR : db_err(x, rc, "reading the zone list");
+        if (x->oom) lg(LOG_ERR, "out of memory");
+        goto out_snap;
+    }
+    if (si.has_domain_views && x->nz > 0 && (rc = x->drv->scan_domain_views(x->conn, NULL, chk_map_cb, x)) != 0) {
+        status = x->oom ? EXIT_ERROR : db_err(x, rc, "reading karidns_domain_views");
+        if (x->oom) lg(LOG_ERR, "out of memory");
+        goto out_snap;
+    }
+    x->wl = malloc((x->nz ? x->nz : 1) * sizeof(*x->wl));
+    if (!x->wl) {
+        lg(LOG_ERR, "out of memory");
+        status = EXIT_ERROR;
+        goto out_snap;
+    }
+    for (size_t i = 0; i < x->nz; i++) x->wl[x->nwl++] = i;
+    if (x->nz > 0) {
+        if ((rc = x->drv->zones_with_keys(x->conn, key_cb, x)) != 0) {
+            status = x->oom ? EXIT_ERROR : db_err(x, rc, "reading metadata");
+            if (x->oom) lg(LOG_ERR, "out of memory");
+            goto out_snap;
+        }
+        qsort(x->keys, x->nk, sizeof(int64_t), cmp_i64);
+        if (si.has_profiles && x->drv->scan_profiles && (rc = x->drv->scan_profiles(x->conn, prof_cb, x)) != 0) {
+            status = x->prof_oom ? EXIT_ERROR : db_err(x, rc, "reading karidns_profiles");
+            if (x->prof_oom) lg(LOG_ERR, "out of memory");
+            goto out_snap;
+        }
+        if ((rc = x->drv->scan_metadata(x->conn, NULL, meta_cb, &x->meta)) != 0) {
+            status = x->meta.oom ? EXIT_ERROR : db_err(x, rc, "reading metadata");
+            if (x->meta.oom) lg(LOG_ERR, "out of memory");
+            goto out_snap;
+        }
+        if (x->has_ext && (rc = eset_load(x->drv, x->conn, NULL, &x->ext)) != 0) {
+            status = x->ext.oom ? EXIT_ERROR : db_err(x, rc, "reading the tags and tinydns attributes");
+            if (x->ext.oom) lg(LOG_ERR, "out of memory");
+            goto out_snap;
+        }
+        int st = run_zones(x, src, true, x->nz);
+        if (st == TK_FATAL) {
+            if (x->oom) lg(LOG_ERR, "out of memory");
+            status = EXIT_ERROR;
+            goto out_snap;
+        }
+        if (st != 0) {
+            status = st;
+            goto out_snap;
+        }
+        chk_catalogs(x);
+    }
+    if (g_chk_errors != e0) status = EXIT_ZONES_FAILED;
+out_snap:
+    x->drv->end_snapshot(x->conn);
+out:
+    x->drv->close(x->conn);
+    x->conn = NULL;
+    return status;
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -1980,6 +2569,7 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
         }
         if (m.u.zone_result.status == KDB_ST_REJECTED) {
             io->n_rejected++;
+            fz_add(&io->fz, m.u.zone_result.view, m.u.zone_result.name, m.u.zone_result.reason.p, m.u.zone_result.reason.len);
             if (!io->first_reject[0] && m.u.zone_result.reason.p)
                 snprintf(io->first_reject, sizeof(io->first_reject), "%.*s", (int)m.u.zone_result.reason.len,
                          m.u.zone_result.reason.p);
@@ -2463,29 +3053,500 @@ static int auto_view(ctx_t *x, struct lio *io, const lview_t *v, uint16_t slot, 
     return 0;
 }
 
-/* AUTO_STATUS: what `karictl dbstatus` shows for each view that has auto reload on */
+/* ------------------------------------------------------------------------------------------------------------- */
+/* multi-server reload requests (B11, release plan 4.8, design 3.7)                                               */
+/* ------------------------------------------------------------------------------------------------------------- */
+/* PostgreSQL only (a driver with watch_requests).  For every source (schema) whose database has karidns_reload_requests the
+ * loader keeps one watcher: a connection of its own that LISTENs karidns_reload (its socket is in the poll set of the main loop)
+ * and, every poll-interval, reads the requests with a generation above the last one it applied.  Whether auto reload is on or
+ * not.  When the watcher is opened before a load (the startup load, or a load after a change of sources) the highest generation
+ * counts as applied: that load covers it.  Requests that arrive together (the coalesce window) are one reload: a request for all
+ * zones, a hole in the generations (pruned or rolled back requests), or more than RW_ZONES different zones makes it a diff of the
+ * whole source, else the zones listed are reloaded; force is the OR of the requests.  The reload is the one of `karictl
+ * reload` (do_load(), kinds diff / zone) for every view that reads the source.  When the BATCH_RESULTs are in, report_status()
+ * writes the outcome (every zone loaded, or the zones that failed) to this server's row of karidns_server_status, in a
+ * transaction of its own on the watcher's connection (never inside the read snapshot of a load).  The load that follows the
+ * opening of a watcher is reported the same way.
+ * Nothing here puts the loader into an error state (D-B11-5): a request that cannot be read, a source that cannot be loaded or a
+ * status row that cannot be written is logged once (again when the text changes), shown by `karictl dbstatus` and retried; the
+ * zones keep being served.  A request is only counted as applied after every view of the source was loaded. */
+
+static const lview_t *rw_view(const struct lio *io, uint16_t index) {
+    for (size_t i = 0; i < io->cfg.nviews; i++)
+        if (io->cfg.views[i].index == index) return &io->cfg.views[i];
+    return NULL;
+}
+
+static const lview_t *rw_view0(const struct lio *io, const rw_t *r) { return r->nv ? rw_view(io, r->views[0]) : NULL; }
+
+static uint64_t rw_poll_ms(const struct lio *io, const rw_t *r) {
+    const lview_t *v = rw_view0(io, r);
+    return v ? auto_poll_ms(v) : 2000;
+}
+
+static void rw_set_err(struct lio *io, rw_t *r, bool report, const char *what, const char *msg) {
+    char shown[100], text[RW_ERRLEN];
+    clean_reason(msg, shown, sizeof(shown));
+    snprintf(text, sizeof(text), "%s: %s", what, shown);
+    char *dst = report ? r->rerr : r->perr;
+    if (strcmp(dst, text) != 0) {                          /* log a condition once, not at every attempt */
+        snprintf(dst, RW_ERRLEN, "%s", text);
+        const lview_t *v = rw_view0(io, r);
+        lg(LOG_WARNING, "view '%s': reload requests: %s", v ? v->name : "?", text);
+        io->status_dirty = true;
+    }
+}
+
+static void rw_close(rw_t *r) {
+    if (r->conn) r->drv->close(r->conn);
+    r->conn = NULL;
+}
+
+static void rw_free(rw_t *r) {
+    rw_close(r);
+    free(r->source);
+    free(r->conninfo);
+    free(r->views);
+    free(r->rep_text);
+    free(r->zbuf);
+    memset(r, 0, sizeof(*r));
+}
+
+/* the server id: server-id of the database block, else the host name (D-B11-6); io->sid_ok is false when there is none that fits
+ * the column (1..64 bytes), and io->sid_why says why */
+static void sid_resolve(struct lio *io) {
+    char h[256];
+    const char *src = io->cfg.server_id, *why = NULL;
+    if (!*src) {
+        if (gethostname(h, sizeof(h)) != 0) h[0] = '\0';
+        h[sizeof(h) - 1] = '\0';
+        src = h;
+        if (!*src) why = "no server-id is set and the host name is empty";
+        else if (strlen(src) > 64) why = "no server-id is set and the host name is longer than 64 bytes";
+    } else if (strlen(src) > 64) {
+        why = "server-id is longer than 64 bytes";
+    }
+    if (why) {
+        io->sid[0] = '\0';
+        io->sid_ok = false;
+        snprintf(io->sid_why, sizeof(io->sid_why), "%s", why);
+        if (!io->sid_warned) {
+            io->sid_warned = true;
+            lg(LOG_WARNING, "%s: the outcome of reload requests is not written to karidns_server_status (set server-id in the database block)", why);
+        }
+        return;
+    }
+    snprintf(io->sid, sizeof(io->sid), "%s", src);
+    io->sid_ok = true;
+    io->sid_warned = false;
+}
+
+static rw_t *rw_find(struct lio *io, const char *source, const char *conninfo) {
+    for (size_t i = 0; i < io->nrw; i++)
+        if (streq_n(io->rw[i].source, source) && streq_n(io->rw[i].conninfo, conninfo)) return &io->rw[i];
+    return NULL;
+}
+
+/* the watcher that serves view v (its source has the tables), or NULL */
+static const rw_t *rw_for_view(const struct lio *io, const lview_t *v) {
+    for (size_t i = 0; i < io->nrw; i++) {
+        const rw_t *r = &io->rw[i];
+        if (r->absent || !r->seeded) continue;
+        for (size_t k = 0; k < r->nv; k++)
+            if (r->views[k] == v->index) return r;
+    }
+    return NULL;
+}
+
+/* Open the connection, look for the tables, LISTEN, and take the position: the highest generation when a load follows
+ * (startup_pending), else 0 (whatever the table holds is looked at: one diff, like auto reload that was just switched on); a
+ * reopened watcher keeps its position and checks what came meanwhile. */
+static bool rw_open(struct lio *io, rw_t *r, bool startup_pending) {
+    int64_t now = now_ms();
+    const lview_t *v = rw_view0(io, r);
+    uint64_t poll_ms = rw_poll_ms(io, r);
+    r->open_retry_at = now + (int64_t)poll_ms;
+    if (!v) return false;
+    db_source_t src;
+    view_source(r->drv, v, &src);
+    char err[DB_ERRLEN];
+    db_conn_t *c = NULL;
+    int rc = r->drv->open(&c, &src, err, sizeof(err));
+    if (rc != 0) {
+        rw_set_err(io, r, false, "cannot open the database", err);
+        return false;
+    }
+    db_schema_info_t si;
+    memset(&si, 0, sizeof(si));
+    if ((rc = r->drv->check_schema(c, &si)) != 0) {
+        rw_set_err(io, r, false, "cannot check the database", r->drv->errmsg(c));
+        r->drv->close(c);
+        return false;
+    }
+    if (!si.has_reload_requests) {                           /* the multi-server tables are optional */
+        r->drv->close(c);
+        r->absent = true;
+        r->open_retry_at = now + RW_ABSENT_MS;
+        return false;
+    }
+    r->absent = false;
+    r->has_status = si.has_server_status;
+    sid_resolve(io);
+    if ((rc = r->drv->watch_requests(c)) == DB_ERR_RETRY) {
+        rw_set_err(io, r, false, "cannot listen", r->drv->errmsg(c));
+        r->drv->close(c);
+        return false;
+    }
+    if (rc != 0 && !r->listen_noted) {                       /* a standby cannot LISTEN: the timer does it */
+        r->listen_noted = true;
+        lg(LOG_NOTICE, "view '%s': reload requests: cannot LISTEN karidns_reload (%s); the requests are read every %llu s", v->name,
+           r->drv->errmsg(c), (unsigned long long)(poll_ms / 1000));
+    }
+    if (!r->seeded) {
+        if (startup_pending) {
+            uint64_t mx = 0;
+            if ((rc = r->drv->requests_max(c, &mx)) != 0) {
+                rw_set_err(io, r, false, "cannot read the requests", r->drv->errmsg(c));
+                r->drv->close(c);
+                return false;
+            }
+            r->last = mx;
+            r->startup_seeded = true;
+        } else {
+            r->last = 0;
+            r->flush_at = now;
+        }
+        r->seeded = true;
+        r->applied_ok = true;
+    } else {
+        r->flush_at = now;                                   /* reopened: what was requested meanwhile */
+    }
+    r->conn = c;
+    r->next_poll = now + (int64_t)poll_ms;
+    r->perr[0] = '\0';
+    io->status_dirty = true;
+    lg(LOG_INFO, "view '%s': reload requests: watching karidns_reload_requests (generation %llu%s)", v->name, (unsigned long long)r->last,
+       r->has_status ? "" : "; no karidns_server_status table, the outcome is not written");
+    return true;
+}
+
+/* top of the loop: the watchers follow the CONFIG (one per source), and the ones that have no connection get one */
+static void rw_prepare(struct lio *io, bool load_follows) {
+    int64_t now = now_ms();
+    for (size_t i = 0; i < io->nrw; i++) {
+        io->rw[i].in_cfg = false;
+        io->rw[i].nv = 0;
+    }
+    const db_driver_t *drv = driver_find(io->cfg.driver);
+    for (size_t i = 0; drv && drv->watch_requests && i < io->cfg.nviews; i++) {
+        const lview_t *v = &io->cfg.views[i];
+        rw_t *r = rw_find(io, v->source, v->conninfo);
+        if (!r) {
+            if (io->nrw >= RW_MAX) {
+                lg(LOG_WARNING, "view '%s': more than %d database sources: reload requests are not watched for it", v->name, RW_MAX);
+                continue;
+            }
+            r = &io->rw[io->nrw];
+            memset(r, 0, sizeof(*r));
+            r->drv = drv;
+            r->applied_ok = true;
+            r->source = v->source ? strdup(v->source) : NULL;
+            r->conninfo = v->conninfo ? strdup(v->conninfo) : NULL;
+            if ((v->source && !r->source) || (v->conninfo && !r->conninfo)) {
+                free(r->source);
+                free(r->conninfo);
+                lg(LOG_ERR, "out of memory");
+                continue;
+            }
+            io->nrw++;
+        }
+        if (r->nv == r->cv) {
+            size_t nc = r->cv ? r->cv * 2 : 4;
+            uint16_t *nvw = realloc(r->views, nc * sizeof(*nvw));
+            if (!nvw) continue;
+            r->views = nvw;
+            r->cv = nc;
+        }
+        r->views[r->nv++] = v->index;
+        r->in_cfg = true;
+    }
+    for (size_t i = 0; i < io->nrw;) {                       /* sources that left the configuration */
+        if (io->rw[i].in_cfg) {
+            i++;
+            continue;
+        }
+        rw_free(&io->rw[i]);
+        memmove(&io->rw[i], &io->rw[i + 1], (io->nrw - i - 1) * sizeof(io->rw[0]));
+        io->nrw--;
+        memset(&io->rw[io->nrw], 0, sizeof(io->rw[0]));
+    }
+    for (size_t i = 0; i < io->nrw; i++)
+        if (!io->rw[i].conn && now >= io->rw[i].open_retry_at) rw_open(io, &io->rw[i], load_follows);
+}
+
+/* write the status row waiting in r (a failure is shown and tried again after RW_RETRY_MS) */
+static void rw_try_report(struct lio *io, rw_t *r) {
+    if (!r->rep_pending || !r->conn) return;
+    db_status_t st = { r->rep_gen, r->rep_ok, r->rep_text, io->sid };
+    int rc = r->drv->report_status(r->conn, &st);
+    int64_t now = now_ms();
+    if (rc == 0) {
+        r->rep_pending = false;
+        r->rep_time = (int64_t)time(NULL);
+        if (r->rerr[0]) {
+            const lview_t *v = rw_view0(io, r);
+            lg(LOG_NOTICE, "view '%s': reload requests: the status row is written again", v ? v->name : "?");
+            r->rerr[0] = '\0';
+        }
+        io->status_dirty = true;
+        return;
+    }
+    rw_set_err(io, r, true, "cannot write karidns_server_status", r->drv->errmsg(r->conn));
+    r->report_retry_at = now + RW_RETRY_MS;
+    if (rc == DB_ERR_RETRY) {                                /* the connection is gone: reopen (which also checks for new requests) */
+        rw_close(r);
+        r->open_retry_at = now + (int64_t)rw_poll_ms(io, r);
+    }
+}
+
+/* the outcome of generation gen: remember it and write it */
+static void rw_report(struct lio *io, rw_t *r, uint64_t gen, bool ok, const char *text) {
+    r->applied_ok = ok;
+    io->status_dirty = true;
+    sid_resolve(io);
+    if (!io->sid_ok) {                                       /* sid_resolve() has warned (once); dbstatus says why */
+        r->rep_pending = false;
+        snprintf(r->rerr, sizeof(r->rerr), "the status row is not written: %s", io->sid_why);
+        return;
+    }
+    if (!r->has_status) {
+        r->rep_pending = false;
+        rw_set_err(io, r, true, "the status row is not written", "this database has no karidns_server_status table");
+        return;
+    }
+    if (!r->rep_text && !(r->rep_text = malloc(FZ_REPORT_BYTES + 1))) {
+        r->rep_pending = false;
+        lg(LOG_ERR, "out of memory");
+        return;
+    }
+    snprintf(r->rep_text, FZ_REPORT_BYTES + 1, "%s", text);
+    r->rep_gen = gen;
+    r->rep_ok = ok;
+    r->rep_pending = true;
+    rw_try_report(io, r);
+}
+
+/* a request batch under construction */
+typedef struct {
+    uint64_t rows;
+    bool all, force;
+    size_t nz;
+    char (*zone)[DNS_NAME_TEXT_SIZE];                        /* RW_ZONES canonical names */
+    unsigned nbad;
+    char bad[4][260];                                        /* the first invalid zone names (printable) */
+} rq_batch_t;
+
+static int rq_row(void *ud, const db_reload_row_t *row) {
+    rq_batch_t *b = ud;
+    b->rows++;
+    if (row->force) b->force = true;
+    if (!row->zone) {
+        b->all = true;
+        return 0;
+    }
+    char canon[DNS_NAME_TEXT_SIZE];
+    if (!pdns_canonical_zone_name(row->zone, canon)) {       /* untrusted text: never hand it to a one-zone load as it is */
+        if (b->nbad < 4) clean_reason(row->zone, b->bad[b->nbad], sizeof(b->bad[0]));
+        b->nbad++;
+        return 0;
+    }
+    if (b->all) return 0;
+    for (size_t i = 0; i < b->nz; i++)
+        if (names_equal(b->zone[i], canon)) return 0;
+    if (b->nz >= RW_ZONES) {
+        b->all = true;
+        return 0;
+    }
+    snprintf(b->zone[b->nz++], DNS_NAME_TEXT_SIZE, "%s", canon);
+    return 0;
+}
+
+/* Read the requests above r->last; when there are some, reload and report.  0, or -1 (fatal: stream, memory, stop). */
+static int rw_process(ctx_t *x, struct lio *io, rw_t *r) {
+    int64_t now = now_ms();
+    uint64_t poll_ms = rw_poll_ms(io, r);
+    if (!r->zbuf && !(r->zbuf = calloc(RW_ZONES, DNS_NAME_TEXT_SIZE))) {
+        lg(LOG_ERR, "out of memory");
+        return -1;
+    }
+    rq_batch_t bs;
+    memset(&bs, 0, sizeof(bs));
+    bs.zone = r->zbuf;
+    rq_batch_t *b = &bs;
+    uint64_t maxg = r->last;
+    bool gap = false;
+    int rc = r->drv->reload_requests(r->conn, r->last, rq_row, b, &maxg, &gap);
+    if (rc != 0) {
+        rw_set_err(io, r, false, "cannot read the requests", r->drv->errmsg(r->conn));
+        if (rc == DB_ERR_RETRY) {
+            rw_close(r);
+            r->open_retry_at = now + (int64_t)poll_ms;
+        } else {
+            r->flush_at = now + (int64_t)poll_ms;
+        }
+        goto out;
+    }
+    if (b->rows == 0) {
+        r->perr[0] = '\0';
+        goto out;
+    }
+    if (gap) b->all = true;                                  /* requests between were pruned or rolled back: do not guess */
+    fz_reset(&io->fz, true);
+    for (unsigned i = 0; i < b->nbad && i < 4; i++)
+        fz_add(&io->fz, r->views[0], b->bad[i], "not a valid zone name; the request is ignored", 44);
+    int fail = 0;
+    for (size_t vi = 0; vi < r->nv && !fail && !g_stop; vi++) {
+        int lrc = 0;
+        if (b->all) {
+            lrc = do_load(x, io, KDB_BATCH_DIFF, (int)r->views[vi], NULL, 0, b->force, false);
+        } else {
+            for (size_t zi = 0; zi < b->nz && lrc == 0; zi++)
+                lrc = do_load(x, io, KDB_BATCH_ZONE, (int)r->views[vi], b->zone[zi], 0, b->force, false);
+        }
+        if (lrc < 0) {
+            io->fz.on = false;
+            return -1;
+        }
+        if (lrc > 0) fail = 1;
+    }
+    io->fz.on = false;
+    if (g_stop) return -1;                                   /* told to stop between two loads: nothing is counted as applied */
+    if (fail) {                                              /* the position stays: the same requests are read again */
+        rw_set_err(io, r, false, "cannot read the database", x->errtext[0] ? x->errtext : "the database could not be read");
+        r->flush_at = now_ms() + (int64_t)poll_ms;
+        goto out;
+    }
+    r->last = maxg;
+    r->perr[0] = '\0';
+    char text[FZ_REPORT_BYTES + 1];
+    bool ok;
+    fz_report(&io->fz, r->views, r->nv, text, &ok);
+    const lview_t *v0 = rw_view0(io, r);
+    lg(LOG_INFO, "view '%s': reload request(s) up to generation %llu applied (%s%s%s)", v0 ? v0->name : "?", (unsigned long long)maxg,
+       b->all ? "all zones" : "listed zones", b->force ? ", force" : "", ok ? "" : "; some zones failed");
+    rw_report(io, r, maxg, ok, text);
+out:
+    return 0;
+}
+
+/* before a load: collect the failures when a watcher waits for the outcome of the load that follows its opening */
+static void rw_collect_begin(struct lio *io) {
+    bool any = false;
+    for (size_t i = 0; i < io->nrw; i++)
+        if (io->rw[i].startup_seeded) any = true;
+    fz_reset(&io->fz, any);
+}
+
+/* after a successful load: report its outcome for the watchers that were opened before it */
+static void rw_load_report(struct lio *io) {
+    for (size_t i = 0; i < io->nrw; i++) {
+        rw_t *r = &io->rw[i];
+        if (!r->startup_seeded) continue;
+        r->startup_seeded = false;
+        if (!r->conn || r->last == 0) continue;              /* no request was ever made: there is nothing to say */
+        char text[FZ_REPORT_BYTES + 1];
+        bool ok;
+        fz_report(&io->fz, r->views, r->nv, text, &ok);
+        rw_report(io, r, r->last, ok, text);
+    }
+    io->fz.on = false;
+}
+
+/* a notification (or a dead connection) on the watcher's socket */
+static void rw_ready(struct lio *io, size_t ri) {
+    if (ri >= io->nrw || !io->rw[ri].conn) return;
+    rw_t *r = &io->rw[ri];
+    bool changed = false;
+    int rc = r->drv->drain_notifications(r->conn, &changed);
+    int64_t now = now_ms();
+    const lview_t *v0 = rw_view0(io, r);
+    if (rc != 0) {
+        rw_set_err(io, r, false, "the connection was lost", r->drv->errmsg(r->conn));
+        rw_close(r);
+        r->open_retry_at = now + (int64_t)rw_poll_ms(io, r);
+        return;
+    }
+    if (changed && !r->flush_at) r->flush_at = now + (v0 ? (int64_t)v0->coalesce_ms : 0);
+}
+
+/* the request step of the loop, after the startup batch: 0, or -1 (fatal) */
+static int rw_run(ctx_t *x, struct lio *io) {
+    if (io->have_newcfg) return 0;                           /* a CONFIG is waiting: adopt it first */
+    for (size_t i = 0; i < io->nrw && !g_stop; i++) {
+        rw_t *r = &io->rw[i];
+        int64_t now = now_ms();
+        if (!rw_view0(io, r)) continue;
+        if (!r->conn) {
+            if (now >= r->open_retry_at) rw_open(io, r, false);
+        } else if (now >= r->next_poll) {                    /* the safety net: read the table even when no notification came */
+            r->next_poll = now + (int64_t)rw_poll_ms(io, r);
+            if (!r->flush_at) r->flush_at = now;
+        }
+        if (r->conn && r->flush_at && now_ms() >= r->flush_at) {
+            r->flush_at = 0;
+            if (rw_process(x, io, r) != 0) return -1;
+        }
+        if (r->conn && r->rep_pending && now_ms() >= r->report_retry_at) rw_try_report(io, r);
+        if (io->eof || io->failed) return 0;
+    }
+    return 0;
+}
+
+/* AUTO_STATUS: what `karictl dbstatus` shows for each view that has auto reload on or whose source has reload requests */
 static int auto_send_status(ctx_t *x, struct lio *io) {
     bool any = false;
     if (kdb_enc_begin(&x->enc, KDB_T_AUTO_STATUS) != 0) return -1;
     for (size_t i = 0; i < io->cfg.nviews; i++) {
         const lview_t *v = &io->cfg.views[i];
-        if (!v->auto_reload) continue;
+        const rw_t *r = rw_for_view(io, v);
+        bool au = v->auto_reload != 0;
+        if (!au && !r) continue;
         int slot = vslot_get(io, v->name);
         if (slot < 0) return -1;
         const vstate_t *vs = &io->vst[slot];
-        const char *err = vs->lerr[0] ? vs->lerr : vs->perr;
+        const char *err = !au ? "" : vs->lerr[0] ? vs->lerr : vs->perr;
         any = true;
         if (kdb_enc_nest_begin(&x->enc, 1) != 0 || kdb_enc_u16(&x->enc, 1, v->index) != 0 ||
-            kdb_enc_u64(&x->enc, 2, (uint64_t)vs->last_poll) != 0 ||
-            kdb_enc_u64(&x->enc, 3, vs->seq_valid ? vs->seq : 0) != 0 || kdb_enc_u32(&x->enc, 4, vs->pending) != 0 ||
-            (err[0] && kdb_enc_str(&x->enc, 5, err) != 0) || kdb_enc_nest_end(&x->enc) != 0)
+            kdb_enc_u64(&x->enc, 2, au ? (uint64_t)vs->last_poll : 0) != 0 ||
+            kdb_enc_u64(&x->enc, 3, au && vs->seq_valid ? vs->seq : 0) != 0 || kdb_enc_u32(&x->enc, 4, au ? vs->pending : 0) != 0 ||
+            (err[0] && kdb_enc_str(&x->enc, 5, err) != 0) ||
+            kdb_enc_u8(&x->enc, 6, (uint8_t)((au ? KDB_AS_AUTO : 0) | (r ? KDB_AS_REQ : 0))) != 0)
             return -1;
+        if (r) {
+            const char *rerr = r->rerr[0] ? r->rerr : r->perr;
+            if ((io->sid_ok && kdb_enc_str(&x->enc, 7, io->sid) != 0) || kdb_enc_u64(&x->enc, 8, r->last) != 0 ||
+                kdb_enc_u8(&x->enc, 9, r->applied_ok ? 1 : 0) != 0 || (rerr[0] && kdb_enc_str(&x->enc, 10, rerr) != 0) ||
+                kdb_enc_u64(&x->enc, 11, (uint64_t)r->rep_time) != 0)
+                return -1;
+        }
+        if (kdb_enc_nest_end(&x->enc) != 0) return -1;
     }
     if (!any || kdb_enc_end(&x->enc) != 0) {
         kdb_enc_reset(&x->enc);
         return any ? -1 : 0;
     }
     return send_enc(x);
+}
+
+/* send the AUTO_STATUS when something it shows changed */
+static int status_flush(ctx_t *x, struct lio *io) {
+    if (!io->status_dirty || g_stop) return 0;
+    io->status_dirty = false;
+    if (auto_send_status(x, io) != 0) {
+        lg(LOG_ERR, "cannot write the output: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 /* the auto reload step of the loop, after the startup batch: 0, or -1 (fatal) */
@@ -2503,10 +3564,7 @@ static int auto_run(ctx_t *x, struct lio *io) {
         if (auto_view(x, io, v, (uint16_t)slot, &dirty) != 0) return -1;
         if (io->eof || io->failed) return 0;                           /* the main loop ends */
     }
-    if (dirty && !g_stop && auto_send_status(x, io) != 0) {
-        lg(LOG_ERR, "cannot write the output: %s", strerror(errno));
-        return -1;
-    }
+    if (dirty) io->status_dirty = true;                                 /* sent by status_flush() once the request step has run too */
     return 0;
 }
 
@@ -2526,6 +3584,15 @@ static int auto_wait_ms(const struct lio *io, int limit) {
             if (left < limit) limit = (int)left;
         }
     }
+    for (size_t i = 0; i < io->nrw; i++) {                           /* B11: the request watchers */
+        const rw_t *r = &io->rw[i];
+        int64_t t = r->conn ? r->next_poll : r->open_retry_at;
+        if (r->conn && r->flush_at && r->flush_at < t) t = r->flush_at;
+        if (r->conn && r->rep_pending && r->report_retry_at < t) t = r->report_retry_at;
+        int64_t left = t - now;
+        if (left < 0) left = 0;
+        if (left < limit) limit = (int)left;
+    }
     return limit;
 }
 
@@ -2533,8 +3600,8 @@ static int auto_wait_ms(const struct lio *io, int limit) {
  * reload on whose driver notifies (PostgreSQL LISTEN; wait_fd() is -1 for SQLite3, which is polled by timer).  A readable
  * connection makes its view due at once.  Returns n, or 0 on out of memory. */
 static size_t auto_fds(struct lio *io, bool watch) {
-    if (io->cpfs < 1 + io->nvn) {
-        size_t nc = 1 + io->nvn + 8;
+    if (io->cpfs < 1 + io->nvn + RW_MAX) {
+        size_t nc = 1 + io->nvn + RW_MAX + 8;
         struct pollfd *np = realloc(io->pfs, nc * sizeof(*np));
         if (!np) return 0;
         io->pfs = np;
@@ -2556,6 +3623,17 @@ static size_t auto_fds(struct lio *io, bool watch) {
         io->pfs[n].events = POLLIN;
         io->pfs[n].revents = 0;
         io->pfs_slot[n] = s;
+        n++;
+    }
+    for (size_t i = 0; watch && i < io->nrw; i++) {                  /* B11: the connections that LISTEN karidns_reload */
+        rw_t *r = &io->rw[i];
+        if (!r->conn || !r->drv->wait_fd) continue;
+        int wfd = r->drv->wait_fd(r->conn);
+        if (wfd < 0) continue;
+        io->pfs[n].fd = wfd;
+        io->pfs[n].events = POLLIN;
+        io->pfs[n].revents = 0;
+        io->pfs_slot[n] = RW_FD_BASE + i;
         n++;
     }
     return n;
@@ -2646,8 +3724,10 @@ static int run_stream(int fd) {
             need_load = true;
         }
         auto_prepare(io, need_load);
+        rw_prepare(io, need_load);                  /* B11: before the load, so that the generation it covers is the one read here */
         if (need_load) {
             need_load = false;
+            rw_collect_begin(io);
             int rc = do_load(&x, io, startup_done ? KDB_BATCH_DIFF : KDB_BATCH_STARTUP, -1, NULL, load_req, false, reconcile);
             if (rc < 0) {
                 if (g_stop) goto stopped;
@@ -2658,7 +3738,9 @@ static int run_stream(int fd) {
                 startup_done = true;
                 reconcile = false;
                 backoff = 1;
-            } else {                           /* a database error: retry with backoff, do not crash (design 1.2) */
+                rw_load_report(io);
+            } else {
+                io->fz.on = false;                           /* a database error: retry with backoff, do not crash (design 1.2) */
                 retry_pending = true;
                 retry_at = now_ms() + (int64_t)backoff * 1000;
                 lg(LOG_WARNING, "retrying in %u s", backoff);
@@ -2675,6 +3757,11 @@ static int run_stream(int fd) {
         }
         io->nreq = 0;
         if (startup_done && auto_run(&x, io) != 0) {
+            if (g_stop) goto stopped;
+            status = EXIT_ERROR;
+            goto done;
+        }
+        if (startup_done && (rw_run(&x, io) != 0 || status_flush(&x, io) != 0)) {
             if (g_stop) goto stopped;
             status = EXIT_ERROR;
             goto done;
@@ -2699,8 +3786,11 @@ static int run_stream(int fd) {
             goto done;
         }
         if (r > 0) {
-            for (size_t i = 1; i < npf; i++)
-                if (io->pfs[i].revents) io->vst[io->pfs_slot[i]].next_poll = 0;      /* a notification (or a dead connection): look now */
+            for (size_t i = 1; i < npf; i++) {
+                if (!io->pfs[i].revents) continue;
+                if (io->pfs_slot[i] >= RW_FD_BASE) rw_ready(io, io->pfs_slot[i] - RW_FD_BASE);     /* B11: a reload request */
+                else io->vst[io->pfs_slot[i]].next_poll = 0;      /* a notification (or a dead connection): look now */
+            }
             if (io->pfs[0].revents) io_pump(io);
         }
     }
@@ -2711,6 +3801,7 @@ stopped:
 done:
     ctx_view_reset(&x);
     kdb_enc_free(&x.enc);
+    for (size_t i = 0; i < io->nrw; i++) rw_free(&io->rw[i]);
     cfg_free(&io->cfg);
     cfg_free(&io->newcfg);
     io_free_views(io);
@@ -2768,6 +3859,8 @@ static void usage(FILE *fp) {
         "  karidns-dbloader --dump OUT --driver postgresql --conninfo-file FILE [--schema NAME] [options]\n"
         "  karidns-dbloader -s FD                    (stream mode; started by karidns, not by hand)\n"
         "  karidns-dbloader --drivers                (print the compiled-in drivers, one per line)\n"
+        "  karidns-dbloader --check --driver DRIVER --database-file PATH [options]       (read only; what `karicheck db` runs)\n"
+        "  karidns-dbloader --check --driver postgresql --conninfo-file FILE [--schema NAME] [options]\n"
         "\n"
         "Dump mode writes the stream exactly as the loader sends it to the Backend: HELLO, BATCH_BEGIN (startup), per\n"
         "zone ZONE_BEGIN / ZONE_DATA... / ZONE_END (or ZONE_FAILED with the reason), BATCH_END.  Zones come in\n"
@@ -2781,6 +3874,10 @@ static void usage(FILE *fp) {
         "With auto-reload yes it also polls PRAGMA data_version of each database every poll-interval seconds and, a coalesce\n"
         "window after the first change, sends one batch of kind auto with the same comparison (docs/karidns.md).\n"
         "It logs to syslog and ends when the Backend closes the stream or on SIGTERM / SIGINT; SIGHUP is ignored.\n"
+        "--check (what `karicheck db` runs) reads the same tables through the same code, sends nothing, writes nothing to the database,\n"
+        "and prints what is wrong or odd as lines of the check protocol on standard output (dns_db_checkproto.h): the schema, every zone\n"
+        "(the reader's errors with records.id, the zone checks of `karicheck zone`), the settings texts, the views a zone is mapped to.\n"
+        "Run it as the user the loader runs as (karicheck does that for root); its output is meant to be read by karicheck.\n"
         "\n"
         "options:\n"
         "  --dump OUT          write the stream to the file OUT (\"-\" = standard output)\n"
@@ -2797,6 +3894,12 @@ static void usage(FILE *fp) {
         "                      zones; the output is written in domains.id order whatever N is, so the bytes are the same\n"
         "  --map-view NAME     keep only the zones karidns_domain_views maps to the view NAME (a domain without a row is kept):\n"
         "                      what a view that uses the shared source of a server gets (docs/karidns.md)\n"
+        "  --check             check mode (see above); no --dump.  Exit status 0: nothing wrong, 1: errors found, 3 / 4 as below\n"
+        "  --auto-reload       with --check: auto-reload is on, so the change log triggers are required\n"
+        "  --server-id ID      with --check (postgresql): the server-id of the configuration\n"
+        "  --ecs-tag NAME      with --check: a tag of options { ecs-tags }; repeatable (records may name it)\n"
+        "  --location-tag NAME with --check: a tag of options { location-tags }; repeatable\n"
+        "  --max-zone-records N, --max-zone-bytes N   with --check: the limits of the database block\n"
         "  --version           print the version\n"
         "  -h, --help          this text\n"
         "\n"
@@ -2833,11 +3936,19 @@ int main(int argc, char **argv) {
         { "zone", required_argument, NULL, 'z' },          { "default-ttl", required_argument, NULL, 't' },
         { "loader-threads", required_argument, NULL, 'j' }, { "version", no_argument, NULL, 'V' },
         { "drivers", no_argument, NULL, 'L' },             { "map-view", required_argument, NULL, 'm' },
+        { "check", no_argument, NULL, 1001 },              { "auto-reload", no_argument, NULL, 1002 },
+        { "server-id", required_argument, NULL, 1003 },    { "ecs-tag", required_argument, NULL, 1004 },
+        { "location-tag", required_argument, NULL, 1005 }, { "max-zone-records", required_argument, NULL, 1006 },
+        { "max-zone-bytes", required_argument, NULL, 1007 },
         { "help", no_argument, NULL, 'h' },                { NULL, 0, NULL, 0 }
     };
     const char *dump = NULL, *driver = NULL, *dbfile = NULL, *conninfo = NULL, *schema = NULL, *zone = NULL, *map_view = NULL;
     const char *stream_fd = NULL;
-    unsigned long view = 0, ttl = 0, threads = 1, v;
+    unsigned long view = 0, ttl = 0, threads = 1, v, max_records = 0, max_bytes = 0;
+    bool check = false, chk_auto = false;                 // B12
+    const char *chk_server_id = NULL;
+    const char *chk_ecs[256], *chk_loc[256];
+    int n_chk_ecs = 0, n_chk_loc = 0;
     int ch;
     while ((ch = getopt_long(argc, argv, "hs:", longopts, NULL)) != -1) {
         switch (ch) {
@@ -2867,6 +3978,30 @@ int main(int argc, char **argv) {
                 return EXIT_USAGE;
             }
             break;
+        case 1001: check = true; break;
+        case 1002: chk_auto = true; break;
+        case 1003: chk_server_id = optarg; break;
+        case 1004:
+        case 1005:
+            if (ch == 1004 ? n_chk_ecs >= 256 : n_chk_loc >= 256) {
+                fprintf(stderr, "karidns-dbloader: at most 256 --ecs-tag and 256 --location-tag\n");
+                return EXIT_USAGE;
+            }
+            if (ch == 1004) chk_ecs[n_chk_ecs++] = optarg;
+            else chk_loc[n_chk_loc++] = optarg;
+            break;
+        case 1006:
+            if (!parse_uint(optarg, 2, 4294967295ul, &max_records)) {
+                fprintf(stderr, "karidns-dbloader: --max-zone-records must be 2..4294967295\n");
+                return EXIT_USAGE;
+            }
+            break;
+        case 1007:
+            if (!parse_uint(optarg, 65535, 1ul << 36, &max_bytes)) {
+                fprintf(stderr, "karidns-dbloader: --max-zone-bytes must be 65535..68719476736\n");
+                return EXIT_USAGE;
+            }
+            break;
         case 'L':
             for (size_t i = 0; k_drivers[i]; i++) printf("%s\n", k_drivers[i]->name);
             return EXIT_OK;
@@ -2885,14 +4020,22 @@ int main(int argc, char **argv) {
             fprintf(stderr, "karidns-dbloader: -s needs a file descriptor number\n");
             return EXIT_USAGE;
         }
-        if (dump || driver || dbfile || conninfo || schema || zone || map_view) {
+        if (dump || driver || dbfile || conninfo || schema || zone || map_view || check) {
             fprintf(stderr, "karidns-dbloader: -s cannot be combined with the dump options\n");
             return EXIT_USAGE;
         }
         return stream_main((int)v);
     }
-    if (!dump || !driver) {
-        fprintf(stderr, "karidns-dbloader: --dump and --driver are required\n");
+    if (check && (dump || zone || map_view)) {
+        fprintf(stderr, "karidns-dbloader: --check cannot be combined with --dump, --zone or --map-view\n");
+        return EXIT_USAGE;
+    }
+    if (!check && (chk_auto || chk_server_id || n_chk_ecs || n_chk_loc || max_records || max_bytes)) {
+        fprintf(stderr, "karidns-dbloader: --auto-reload, --server-id, --ecs-tag, --location-tag, --max-zone-records and --max-zone-bytes are for --check\n");
+        return EXIT_USAGE;
+    }
+    if ((!dump && !check) || !driver) {
+        fprintf(stderr, "karidns-dbloader: --dump (or --check) and --driver are required\n");
         usage(stderr);
         return EXIT_USAGE;
     }
@@ -2933,6 +4076,35 @@ int main(int argc, char **argv) {
     x.nthreads = (uint32_t)threads;
     x.map_view = map_view;
     kdb_enc_init(&x.enc);
+    if (check) {                       /* B12: one source, read only, the findings as lines of the check protocol on standard output */
+        x.check = true;
+        x.nthreads = 1;
+        x.opts.max_records = max_records;
+        x.opts.max_zone_bytes = max_bytes;
+        x.chk_opts.auto_reload = chk_auto;
+        x.chk_opts.server_id = chk_server_id;
+        ecs_tag_def_t *tags = calloc((size_t)n_chk_ecs + (size_t)n_chk_loc + 1, sizeof(*tags));
+        if (!tags) {
+            fprintf(stderr, "karidns-dbloader: out of memory\n");
+            return EXIT_ERROR;
+        }
+        for (int i = 0; i < n_chk_ecs; i++) tags[i].tag = (char *)chk_ecs[i];       /* the zone checks only compare the names */
+        for (int i = 0; i < n_chk_loc; i++) tags[n_chk_ecs + i].tag = (char *)chk_loc[i];
+        x.chk_ecs = tags;
+        x.chk_necs = n_chk_ecs;
+        x.chk_loc = tags + n_chk_ecs;
+        x.chk_nloc = n_chk_loc;
+        g_chk_out = stdout;
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        db_source_t csrc = { drv->name, dbfile, conninfo, schema, 0 };
+        int cst = run_check(&x, &csrc);
+        fprintf(stdout, "R\t%u\t%u\t%u\n", x.chk_zones, g_chk_errors, g_chk_warnings);
+        if (fflush(stdout) != 0 && cst < EXIT_ERROR) cst = EXIT_ERROR;
+        ctx_view_reset(&x);
+        kdb_enc_free(&x.enc);
+        free(tags);
+        return cst;
+    }
     bool to_stdout = strcmp(dump, "-") == 0;
     x.out = to_stdout ? stdout : fopen(dump, "wb");
     if (!x.out) {

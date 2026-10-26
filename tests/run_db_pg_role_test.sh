@@ -106,6 +106,19 @@ rq "DELETE FROM karidns_changes" > "$T/w.out" 2>&1; grep -q "permission denied\|
 [ "$(rq "SHOW default_transaction_read_only")" = "on" ] && pass "default_transaction_read_only is on for the role" || fail "default_transaction_read_only"
 rq "SELECT count(*) FROM karidns_changes" > /dev/null 2>&1 && pass "karidns_changes is readable" || fail "karidns_changes"
 
+# ---- B11: reload requests are read, the status row is the one thing the role writes (in an explicit READ WRITE transaction)
+rq "SELECT count(*) FROM karidns_reload_requests" > /dev/null 2>&1 && pass "karidns_reload_requests is readable" || fail "karidns_reload_requests"
+rq "INSERT INTO karidns_reload_requests DEFAULT VALUES" > "$T/w.out" 2>&1; grep -q "permission denied\|read-only" "$T/w.out" && pass "a request cannot be inserted by the loader role" || { fail "INSERT into karidns_reload_requests"; head -2 "$T/w.out"; }
+rq "DELETE FROM karidns_reload_requests" > "$T/w.out" 2>&1; grep -q "permission denied\|read-only" "$T/w.out" && pass "requests cannot be deleted by the loader role" || fail "DELETE from karidns_reload_requests"
+rq "INSERT INTO karidns_server_status (server_id, generation, applied_at, ok) VALUES ('ro', 1, now(), true)" > "$T/w.out" 2>&1
+grep -q "read-only" "$T/w.out" && pass "the status table is not writable in the role's default (read only) transaction" || { fail "default transaction can write the status table"; head -2 "$T/w.out"; }
+rq "BEGIN READ WRITE; INSERT INTO karidns_server_status (server_id, generation, applied_at, ok, failed_zones) VALUES ('role', 1, now(), true, '') ON CONFLICT (server_id) DO UPDATE SET generation = EXCLUDED.generation, ok = EXCLUDED.ok; COMMIT" > "$T/w.out" 2>&1 \
+    && pass "an explicit BEGIN READ WRITE can upsert the status row (INSERT, UPDATE granted)" || { fail "READ WRITE upsert of the status row"; head -3 "$T/w.out"; }
+rq "BEGIN READ WRITE; INSERT INTO karidns_server_status (server_id, generation, applied_at, ok, failed_zones) VALUES ('role', 2, now(), false, 'x') ON CONFLICT (server_id) DO UPDATE SET generation = EXCLUDED.generation, ok = EXCLUDED.ok; COMMIT" > "$T/w.out" 2>&1 \
+    && [ "$(pq "SELECT generation::text || ok::text FROM karidns_server_status WHERE server_id = 'role'")" = "2false" ] && pass "...and update it" || { fail "update of the status row"; head -3 "$T/w.out"; }
+rq "BEGIN READ WRITE; DELETE FROM karidns_server_status; COMMIT" > "$T/w.out" 2>&1; grep -q "permission denied" "$T/w.out" && pass "the status table cannot be emptied by the loader role (no DELETE)" || { fail "DELETE from karidns_server_status"; head -2 "$T/w.out"; }
+rq "BEGIN READ WRITE; INSERT INTO domains (name, type) VALUES ('rw.test', 'NATIVE'); COMMIT" > "$T/w.out" 2>&1; grep -q "permission denied" "$T/w.out" && pass "an explicit READ WRITE transaction does not give the role any other write" || { fail "READ WRITE INSERT into domains"; head -2 "$T/w.out"; }
+
 # ---- the column privilege is what makes it work
 pq "REVOKE SELECT (domain_id, active, published) ON cryptokeys FROM $ROLE" > /dev/null
 as_pg "$PGLOADER" --dump "$T/nock.kdb" --driver postgresql --conninfo-file "$T/ci_role" 2> "$T/nock.err"; rk=$?

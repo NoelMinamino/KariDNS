@@ -1,0 +1,8 @@
+BE	\065x\009y	1	control \001 and \009 and \255 and \256 and \0 and \
+W		0	text with a lone \ backslash and a \12 short escape
+I	a	b	c	d	e
+Z
+E
+R	x	y	z
+Q	not a tag
+EE	two letter tag	1	x

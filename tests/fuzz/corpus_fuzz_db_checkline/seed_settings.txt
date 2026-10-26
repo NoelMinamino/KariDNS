@@ -1,0 +1,8 @@
+BZ	a.test.	5	primary	*
+S	a.test.	5	allow-transfer { 198.51.100.0/24; key "k"; key "nokey"; };	gold	also-notify { 192.0.2.7; };
+S	b.test.	6	file \092"/etc/passwd\092";
+S	c.test.	7	masters { 192.0.2.53; }; tsig-key "k";
+S	d.test.	8
+S	e.test.	9	allow-update { 192.0.2.1; k; none; !10.0.0.0/8; any; };	p	allow-transfer { any; };
+S	f.test.	10	allow-transfer { 192.0.2.0/23; };	p	ecs-trusted-resolvers { 203.0.113.9; };
+S	g.test.	11	bad \09 text\256 \

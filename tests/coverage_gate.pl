@@ -57,13 +57,17 @@ my %tier_c_files = map { $_ => 1 } (
     "tools/dag_iter.c", "tools/dag_roothints.c", "tools/dag_tsig_client.c",
     "tools/dag_edns_client.c", "tools/dag_transport.c", "tools/dag_replay.c",
     "tools/dag_pcap_l4.c", "tools/dag_tcp_reassembly.c", "tools/dag_http.c",
-    "tools/karicheck.c", "tools/karictl.c"
+    "tools/karicheck.c", "tools/karictl.c",
+    "dns_zone_lint.c"    # the zone checks of karicheck (moved out of tools/karicheck.c in B12; karidns-dbloader --check runs them too)
 );
 
-# Tier D (B10, design 8.6): the PostgreSQL driver.  Only gated when the PostgreSQL tests ran (test_db_pgsql found a server): without
-# data for the file the tier is reported as skipped, so a build or a CI run without PostgreSQL is not failed for it.
+# Tier D (B10, design 8.6; B11c, D-B11-4): the database layer: the PostgreSQL driver, and since B11 the SQLite3 driver and the loader
+# itself (karidns-dbloader and test_db_sqlite3, which includes karidns_dbloader.c, are counted).  Only gated when the database tests
+# ran (test_db_pgsql found a server, or the loader / SQLite3 unit test produced data): without data for the tier it is reported as
+# skipped, so a build or a CI run without them is not failed for it.
 my %tier_d_files = map { $_ => 1 } (
-    "dns_db_pgsql.c"
+    "dns_db_pgsql.c", "dns_db_sqlite3.c", "karidns_dbloader.c",
+    "dns_db_checkproto.c"      # B12: the line protocol of karidns-dbloader --check / karicheck db
 );
 
 # Threshold definitions (Phase 1 vs Phase 2)
@@ -93,7 +97,7 @@ if ($json_file && -f $json_file) {
 if ($json_text eq "") {
     # Generate on the fly using llvm-cov
     my @objs = ();
-    for my $obj (qw(dag karictl karicheck test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_zone_image test_dag_format test_dag_iter test_dag_reassembly test_query_engine_protocol test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_pgsql test_db_stream test_db_registry test_pdns_reader test_presigned)) {
+    for my $obj (qw(dag karictl karicheck test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_zone_image test_dag_format test_dag_iter test_dag_reassembly test_query_engine_protocol test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_pgsql test_db_sqlite3 test_db_stream test_db_registry test_pdns_reader test_presigned test_db_supervisor karidns-dbloader)) {
         push @objs, "-object=./$obj" if -x "./$obj";
     }
     if (-d "coverage_fuzz") {
@@ -126,6 +130,7 @@ my %tier_stats = (
 );
 
 my @file_records = ();
+my $pg_driver_skipped = 0;
 
 for my $f (@$files) {
     my $filename = $f->{filename} || "";
@@ -155,6 +160,15 @@ for my $f (@$files) {
     my $r_cnt = $regions->{count} || 0;
     my $b_cov = $branches->{covered} || 0;
     my $b_cnt = $branches->{count} || 0;
+
+    # dns_db_pgsql.c is compiled into karidns-dbloader whenever libpq is installed, but only test_db_pgsql and the PostgreSQL integration
+    # tests execute it, and those SKIP without a server.  A pgsql driver that is almost never executed (under 10% of its lines; a real
+    # run reaches about 85%) means "the PostgreSQL tests did not run": the file is left out of Tier D and of the totals (design 8.6), so
+    # a build or CI run without a PostgreSQL server is not failed for it.  The rest of Tier D (loader, SQLite3 driver, check protocol) is
+    # always exercised and stays gated.
+    my $pg_skipped = (basename($relname) eq "dns_db_pgsql.c" && $l_cnt && $l_cov * 10 < $l_cnt) ? 1 : 0;
+    $pg_driver_skipped = 1 if $pg_skipped;
+    $tier = "D (skipped)" if $pg_skipped;
     
     push @file_records, {
         file => $relname,
@@ -164,6 +178,8 @@ for my $f (@$files) {
         b_cov => $b_cov, b_cnt => $b_cnt, b_pct => ($b_cnt ? 100.0 * $b_cov / $b_cnt : 100.0),
     };
     
+    next if $pg_skipped;                       # counted in neither the tier nor the totals
+
     if (exists $tier_stats{$tier}) {
         $tier_stats{$tier}{lines_cov} += $l_cov;
         $tier_stats{$tier}{lines_cnt} += $l_cnt;
@@ -201,8 +217,8 @@ my $all_passed = 1;
 for my $t (qw(A B C D Overall)) {
     my $st = $tier_stats{$t};
     my $th = $thresholds{$t};
-    if ($t eq 'D' && !$st->{lines_cnt}) {      # the PostgreSQL tests did not run: no data for dns_db_pgsql.c, the tier is not gated
-        printf "%-10s | %-16s | %-16s | %-16s | %-8s\n", "Tier D", "-", "-", "-", "SKIPPED (no PostgreSQL test data)";
+    if ($t eq 'D' && !$st->{lines_cnt}) {      # no data for any file of the tier (no loader built): not gated
+        printf "%-10s | %-16s | %-16s | %-16s | %-8s\n", "Tier D", "-", "-", "-", "SKIPPED (no database test data)";
         next;
     }
     
@@ -228,6 +244,9 @@ for my $t (qw(A B C D Overall)) {
 }
 
 print "=" x 90 . "\n\n";
+if ($pg_driver_skipped) {
+    print "[i] dns_db_pgsql.c was left out of Tier D and the totals: the PostgreSQL tests did not run (under 10% of its lines executed)\n\n";
+}
 
 if (!$all_passed) {
     print "[-] Coverage Gate Status: FAILED (One or more tiers below target)\n";

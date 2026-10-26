@@ -171,8 +171,30 @@ static void free_test_snapshot(zone_db_snapshot_t *snap) {
     free(snap);
 }
 
+/* FNV-1a (32 bit) with ASCII case folding, as the zone hash tables use it; the "other root form" is the hash of the same name with the
+ * final dot added or removed (a lookup by the name with or without it finds the same bucket); an escaped final dot is part of the label */
+static void test_fnv1a_root_forms(void) {
+    printf("--- FNV-1a hash helpers: case folding, continuing a hash, the other root form ---\n");
+    /* published FNV-1a 32-bit test vectors (Fowler, Noll, Vo): "a" and "foobar" */
+    assert(calc_fnv1a_str("a") == 0xe40c292cu);
+    assert(calc_fnv1a_str("foobar") == 0xbf9cf968u);
+    assert(calc_fnv1a_str("FooBar") == calc_fnv1a_str("foobar"));                    /* ASCII case is folded */
+    assert(calc_fnv1a_strn("foobar-and-more", 6) == calc_fnv1a_str("foobar"));
+    assert(calc_fnv1a_continue(calc_fnv1a_str("foo"), "bar") == calc_fnv1a_str("foobar"));
+    assert(calc_fnv1a_continue(calc_fnv1a_str("FOO"), "BAR") == calc_fnv1a_str("foobar"));
+    assert(calc_fnv1a_continue(calc_fnv1a_str("foo"), "") == calc_fnv1a_str("foo"));
+
+    assert(calc_fnv1a_other_root_form("example.com.") == calc_fnv1a_str("example.com"));       /* with the dot: the form without it */
+    assert(calc_fnv1a_other_root_form("example.com") == calc_fnv1a_str("example.com."));       /* without: the form with it */
+    assert(calc_fnv1a_other_root_form("Example.COM.") == calc_fnv1a_str("example.com"));
+    assert(calc_fnv1a_other_root_form("a\\.") == calc_fnv1a_str("a\\.."));                      /* "a\." : the dot belongs to the label */
+    assert(calc_fnv1a_other_root_form("example.com") != calc_fnv1a_other_root_form("example.org"));
+    printf("  -> FNV-1a helpers passed.\n");
+}
+
 int main(void) {
     printf("--- Running Hash Table & Suffix Lookup Tests (Production Snapshot Linkage) ---\n");
+    test_fnv1a_root_forms();
     
     const char *domains[] = {
         "example.com.",
