@@ -26,6 +26,8 @@ karicheck zone <domain> <zone_file_path>
 karicheck db [view] [config_path]
 
 karicheck -v | --version
+
+karicheck -h | --help
 ```
 
 ---
@@ -150,6 +152,7 @@ Every database gets a line `[RESULT] Database ...: N zone(s) read, E error(s), W
 | every check of `karicheck zone` on the zone (the very same code): missing NS at the apex, CNAME with other data, glue and delegation rules, inconsistent TTLs in an RRset, field ranges of SRV / NAPTR / CAA / SSHFP / HIP / WKS ..., DNSSEC algorithm and digest recommendations, NSEC3 and NSEC3PARAM rules, ZONEMD verification | as in `karicheck zone` |
 | a `PRODUCER` zone: the catalog zone itself is not served yet (decision D9, a later 0.6.x release), but its member zones are (`its N member zones are served`); secondaries that take the catalog from KariDNS will not get it. Migrating from PowerDNS works; only the catalog zone is missing. Exit status 0 when this is the only finding | warning |
 | `domains.catalog` names a zone that is not a `PRODUCER` zone of the database | warning |
+| two `domains` rows of one source whose names are equal ignoring case (`Example.test` and `example.test`; both drivers; the message names both `domains.id`): not supported, PowerDNS stores names in lower case, and a full read and a one-zone read (reload request, auto reload) may pick different rows | warning |
 | **Keys and presigned zones** | |
 | `cryptokeys` rows without `PRESIGNED=1` (PowerDNS would sign online, KariDNS serves signed data only) | error |
 | `NSEC3PARAM` metadata with a bad syntax; a presigned NSEC3 or NSEC chain that does not match the zone (a name without its `RRSIG(NSEC3)` owner, an `ordername` that is not the hash, parameters outside RFC 5155 §10.3) | error |
@@ -195,10 +198,10 @@ $ karicheck db /usr/local/etc/karidns/karidns.conf
 ## EXIT STATUS
 
 `0`
-: All checked configuration files and zone files are valid. Warnings do not change the exit status.
+: All checked configuration files and zone files are valid. Warnings do not change the exit status. `-h` and `--help` print the usage text to standard output and also exit with 0 (as `karictl` and `karidns-dbloader` do).
 
 `1`
-: Usage error, unreadable file, syntax error, validation error, or ZONEMD digest mismatch detected. `db`: an error in the database or its data, a database that cannot be read with the rights of the loader, or a loader that is not installed (`DB support is not installed`).
+: Usage error (a missing or unknown command, missing arguments; the usage text goes to standard error), unreadable file, syntax error, validation error, or ZONEMD digest mismatch detected. `db`: an error in the database or its data, a database that cannot be read with the rights of the loader, or a loader that is not installed (`DB support is not installed`).
 
 ---
 

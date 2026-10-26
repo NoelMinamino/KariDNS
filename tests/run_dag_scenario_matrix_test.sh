@@ -46,6 +46,7 @@ FAILED=0
 PASSED=0
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     if [ -n "$MOCK_PID" ]; then
         kill "$MOCK_PID" 2>/dev/null || true
         wait "$MOCK_PID" 2>/dev/null || true

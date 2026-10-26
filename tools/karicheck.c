@@ -1588,22 +1588,22 @@ KARIDNS_TOOL_FN int kc_db_main(const char *config_path, const char *view_arg) {
     return bad > 0 ? 1 : 0;
 }
 
-KARIDNS_TOOL_FN void print_usage(const char *prog) {
-    fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  %s [-v | --version]\n", prog);
-    fprintf(stderr, "  %s conf [config_path]\n", prog);
-    fprintf(stderr, "  %s zones [config_path]\n", prog);
-    fprintf(stderr, "  %s zone <domain> [config_path]\n", prog);
-    fprintf(stderr, "  %s zone <domain> <zone_file_path>\n", prog);
-    fprintf(stderr, "  %s db [view] [config_path]\n", prog);
-    fprintf(stderr, "\n");
-    fprintf(stderr, "db reads the PowerDNS tables of options { database { } } (read only, through karidns-dbloader --check) and checks the schema,\n");
-    fprintf(stderr, "every zone (as zone does), the settings texts, the views and the zones that karidns.conf defines with the same name.  Run by\n");
-    fprintf(stderr, "root it drops to loader-user / loader-group first; run by another user it checks with that user's rights.  Exit status 0: no\n");
-    fprintf(stderr, "error, 1: errors (or the check could not be run).  A single argument is a view unless it contains a '/' or ends in .conf.\n");
-    fprintf(stderr, "Examples:\n");
-    fprintf(stderr, "  %s db\n", prog);
-    fprintf(stderr, "  %s db internal /usr/local/etc/karidns/karidns.conf\n", prog);
+KARIDNS_TOOL_FN void print_usage(FILE *fp, const char *prog) {
+    fprintf(fp, "Usage:\n");
+    fprintf(fp, "  %s [-v | --version]\n", prog);
+    fprintf(fp, "  %s conf [config_path]\n", prog);
+    fprintf(fp, "  %s zones [config_path]\n", prog);
+    fprintf(fp, "  %s zone <domain> [config_path]\n", prog);
+    fprintf(fp, "  %s zone <domain> <zone_file_path>\n", prog);
+    fprintf(fp, "  %s db [view] [config_path]\n", prog);
+    fprintf(fp, "\n");
+    fprintf(fp, "db reads the PowerDNS tables of options { database { } } (read only, through karidns-dbloader --check) and checks the schema,\n");
+    fprintf(fp, "every zone (as zone does), the settings texts, the views and the zones that karidns.conf defines with the same name.  Run by\n");
+    fprintf(fp, "root it drops to loader-user / loader-group first; run by another user it checks with that user's rights.  Exit status 0: no\n");
+    fprintf(fp, "error, 1: errors (or the check could not be run).  A single argument is a view unless it contains a '/' or ends in .conf.\n");
+    fprintf(fp, "Examples:\n");
+    fprintf(fp, "  %s db\n", prog);
+    fprintf(fp, "  %s db internal /usr/local/etc/karidns/karidns.conf\n", prog);
 }
 
 #if defined(KARIDNS_COVERAGE_LINKAGE) && !defined(main)
@@ -1616,8 +1616,14 @@ int main(int argc, char **argv) { return karicheck_main(argc, argv); }
 #endif
 int main(int argc, char **argv) {
     if (argc < 2) {
-        print_usage(argv[0]);
+        print_usage(stderr, argv[0]);
         return 1;
+    }
+
+    /* -h / --help: the text goes to stdout and the exit status is 0 (as karictl and karidns-dbloader do); a usage error goes to stderr with 1 */
+    if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+        print_usage(stdout, argv[0]);
+        return 0;
     }
 
     if (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0) {
@@ -1663,7 +1669,7 @@ int main(int argc, char **argv) {
         return (error_count > 0) ? 1 : 0;
     } else if (strcmp(cmd, "zone") == 0) {
         if (argc < 3) {
-            print_usage(argv[0]);
+            print_usage(stderr, argv[0]);
             return 1;
         }
         const char *domain = argv[2];
@@ -1706,7 +1712,7 @@ int main(int argc, char **argv) {
         /* db [view] [config_path]: one argument is the configuration when it looks like a path, else a view */
         const char *view = NULL, *cfg_path = default_config;
         if (argc > 4) {
-            print_usage(argv[0]);
+            print_usage(stderr, argv[0]);
             return 1;
         }
         if (argc == 4) {
@@ -1718,7 +1724,7 @@ int main(int argc, char **argv) {
         }
         return kc_db_main(cfg_path, view);
     } else {
-        print_usage(argv[0]);
+        print_usage(stderr, argv[0]);
         return 1;
     }
     return 0;

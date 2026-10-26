@@ -45,6 +45,7 @@ rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR"
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     kari_kill_tree "${PID1:-}" "${PID2:-}" "${PRIM_PID:-}" "${SEC_PID:-}" "${NOPID_PID:-}" "${K2_PID:-}"
     # Test 6 kills only the supervisor; its children are orphans by now.
     kari_kill_conf "$TMP_DIR/server1.conf" "$TMP_DIR/server2.conf" "$TMP_DIR/server_nopid.conf"

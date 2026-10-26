@@ -14,6 +14,7 @@ TMP_DIR="$(mktemp -d /tmp/dag_ede_truncation_test.XXXXXX)"
 MOCK_PID=""
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     if [ -n "$MOCK_PID" ]; then
         kill -9 "$MOCK_PID" 2>/dev/null || true
     fi

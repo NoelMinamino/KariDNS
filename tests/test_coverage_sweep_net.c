@@ -11,6 +11,7 @@
  * dag.c is compiled into this test with main() renamed (same as test_dag_format).
  */
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
@@ -60,10 +61,10 @@ typedef struct {
     int port, tls_port, http_port;
     int variant;                 /* 1 = second server for replay diffs */
     SSL_CTX *ctx;
-    pthread_t thr;
+    pid_t pid;                   /* the process that runs the server (see fs_start) */
+    pid_t parent;                /* the test process: the server ends when this changes */
 } fsrv_t;
 
-static volatile int g_stop;
 static pthread_mutex_t g_hop_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_hop_count[64];
 
@@ -367,7 +368,7 @@ out:
 
 static void *srv_thread(void *arg) {
     fsrv_t *s = arg;
-    while (!g_stop) {
+    while (getppid() == s->parent) {
         struct pollfd p[4] = { { s->udp, POLLIN, 0 }, { s->tcp, POLLIN, 0 }, { s->tls, POLLIN, 0 }, { s->http, POLLIN, 0 } };
         if (poll(p, 4, 100) <= 0) continue;
         if (p[0].revents & POLLIN) {
@@ -438,7 +439,27 @@ static void fs_start(fsrv_t *s, int variant) {
     s->ctx = SSL_CTX_new(TLS_server_method());
     SSL_CTX_use_certificate_file(s->ctx, g_cert_path, SSL_FILETYPE_PEM);
     SSL_CTX_use_PrivateKey_file(s->ctx, g_key_path, SSL_FILETYPE_PEM);
-    pthread_create(&s->thr, NULL, srv_thread, s);
+    /* The server runs in a process of its own (its connection threads live there), so the test process stays single threaded and
+     * every later fork() (one per dag run) is safe: forking a multi-threaded process deadlocks under ASan on FreeBSD (the fork
+     * handler of ASan waits for the allocator lock that a starting thread holds, #112).  The hop counters are only used by the
+     * server, so they live in this process alone.  The server ends when the test process ends or calls fs_stop(). */
+    fflush(stdout); fflush(stderr);
+    s->parent = getpid();
+    s->pid = fork();
+    assert(s->pid >= 0);
+    if (s->pid == 0) {
+        (void)srv_thread(s);
+        _exit(0);
+    }
+    close(s->udp); close(s->tcp); close(s->tls); close(s->http);   /* the server process owns the sockets */
+}
+
+static void fs_stop(fsrv_t *s) {
+    if (s->pid <= 0) return;
+    kill(s->pid, SIGTERM);
+    int st = 0;
+    while (waitpid(s->pid, &st, 0) < 0 && errno == EINTR) {}
+    s->pid = 0;
 }
 
 /* ======================================================================
@@ -1161,8 +1182,8 @@ int main(void) {
     }
     WD_PHASE("test_dag_cli_matrix"); test_dag_cli_matrix(&s1, &s2);
     WD_PHASE("test_replay"); test_replay(&s1, &s2);
-    g_stop = 1;
-    pthread_join(s1.thr, NULL); pthread_join(s2.thr, NULL);
+    fs_stop(&s1);
+    fs_stop(&s2);
     printf("=== All dag Network Coverage Sweep Tests PASSED ===\n");
     return 0;
 }

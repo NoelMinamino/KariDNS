@@ -27,6 +27,7 @@ fi
 SERVER_PID=""
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     kari_kill_tree "$SERVER_PID"
     rm -rf "$W"
 }

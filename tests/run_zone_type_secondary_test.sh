@@ -35,6 +35,7 @@ SECONDARY_PID=""
 STALE_PID=""
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     [ -n "$PRIMARY_PID" ] && kari_kill_tree "$PRIMARY_PID"
     [ -n "$SECONDARY_PID" ] && kari_kill_tree "$SECONDARY_PID"
     [ -n "$STALE_PID" ] && kari_kill_tree "$STALE_PID"

@@ -36,6 +36,7 @@ TMP_DIR="/tmp/karidns_tls_keepopen_test_$$"
 mkdir -p "$TMP_DIR"
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT INT TERM

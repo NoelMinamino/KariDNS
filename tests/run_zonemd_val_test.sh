@@ -19,7 +19,7 @@ if [ ! -x "$KARICHECK" ]; then
 fi
 
 TMP_DIR=$(mktemp -d /tmp/zonemd_val.XXXXXX)
-trap 'rm -rf "$TMP_DIR"' EXIT
+trap 'rm -rf "$TMP_DIR" || true' EXIT
 
 fail() {
     echo "[-] FAIL: $1"

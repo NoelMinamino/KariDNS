@@ -72,6 +72,7 @@ sleep 1
 WORKER_PIDS=""
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     echo "=== Cleaning up ==="
     [ -n "$WORKER_PIDS" ] && kill $WORKER_PIDS 2>/dev/null || true
     kari_kill_tree "${SERVER_PID:-}"

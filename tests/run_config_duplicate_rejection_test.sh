@@ -17,6 +17,7 @@ CONF_DUP_VIEW_ZONE="$DIR/conf_dup_view_zone.conf"
 CONF_GOOD="$DIR/conf_good.conf"
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     rm -f "$CONF_DUP_ZONE" "$CONF_DUP_KEY" "$CONF_DUP_VIEW" "$CONF_DUP_VIEW_ZONE" "$CONF_GOOD"
 }
 trap cleanup EXIT INT TERM

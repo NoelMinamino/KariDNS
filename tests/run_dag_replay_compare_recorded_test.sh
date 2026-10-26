@@ -40,6 +40,7 @@ LOG1="$TMP_DIR/server1.log"
 DNSTAP_SOCK="$TMP_DIR/dnstap.sock"
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     [ -n "$PID1" ] && kill "$PID1" 2>/dev/null || true
     rm -rf "$TMP_DIR" 2>/dev/null || true
 }

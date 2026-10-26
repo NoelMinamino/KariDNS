@@ -36,6 +36,7 @@ PID2=""
 PID3=""
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     echo "[*] Cleaning up test processes..."
     kari_kill_tree "$PID1" "$PID2" "$PID3"
     kari_kill_conf "$W/parent.conf" "$W/both.conf" "$W/child.conf"

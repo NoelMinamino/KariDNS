@@ -2320,6 +2320,46 @@ static void chk_catalogs(ctx_t *x) {
     g_chk_id = 0;
 }
 
+/* Two domains rows of one source whose names differ only in case ('Example.test' and 'example.test').  PowerDNS stores names in lower
+ * case, so this is not supported: the pgsql find_zone (one-zone reads: reload requests, auto reload) matches the indexed name exactly
+ * first and falls back to lower() only when that finds nothing, so it can pick another row than the full read does.  Warn instead of
+ * making find_zone slower (the finding is about the source, not one zone: it is shown for every view).  The names are compared as names_equal() does (one trailing dot ignored). */
+static const zinfo_t *g_dup_zones;
+static int dup_name_cmp(const void *pa, const void *pb) {
+    const char *a = g_dup_zones[*(const size_t *)pa].name, *b = g_dup_zones[*(const size_t *)pb].name;
+    if (!a) a = "";                                     /* domains.name is NOT NULL; a total order all the same */
+    if (!b) b = "";
+    size_t la = strlen(a), lb = strlen(b);
+    if (la > 1 && a[la - 1] == '.') la--;
+    if (lb > 1 && b[lb - 1] == '.') lb--;
+    size_t n = la < lb ? la : lb;
+    int c = strncasecmp(a, b, n);
+    if (c != 0) return c;
+    return la < lb ? -1 : la > lb;
+}
+
+static void chk_case_duplicates(ctx_t *x) {
+    if (x->nz < 2) return;
+    size_t *ix = malloc(x->nz * sizeof(*ix));
+    if (!ix) return;                                    /* a diagnostic only: out of memory is reported by the real work that follows */
+    for (size_t i = 0; i < x->nz; i++) ix[i] = i;
+    g_dup_zones = x->zones;
+    qsort(ix, x->nz, sizeof(*ix), dup_name_cmp);
+    unsigned shown = 0, total = 0;
+    for (size_t i = 1; i < x->nz; i++) {
+        const zinfo_t *a = &x->zones[ix[i - 1]], *b = &x->zones[ix[i]];
+        if (!a->name || !b->name || !names_equal(a->name, b->name)) continue;
+        total++;
+        if (shown >= 20) continue;
+        shown++;
+        chk_linef('W', "domains.id %lld ('%.100s') and domains.id %lld ('%.100s') have names that differ only in case; this is not supported (PowerDNS "
+                       "stores names in lower case): a full read and a one-zone read (reload request, auto reload) may pick different rows",
+                  (long long)a->id, a->name, (long long)b->id, b->name);
+    }
+    if (total > shown) chk_linef('W', "%u more pairs of domains names differ only in case (the first %u are listed)", total - shown, shown);
+    free(ix);
+}
+
 /* One source.  Returns an exit status: 0 nothing wrong, EXIT_ZONES_FAILED errors were found, EXIT_ERROR / EXIT_RETRY the source could not be read. */
 static int run_check(ctx_t *x, const db_source_t *src) {
     char err[DB_ERRLEN];
@@ -2396,6 +2436,7 @@ static int run_check(ctx_t *x, const db_source_t *src) {
             if (x->ext.oom) lg(LOG_ERR, "out of memory");
             goto out_snap;
         }
+        chk_case_duplicates(x);
         int st = run_zones(x, src, true, x->nz);
         if (st == TK_FATAL) {
             if (x->oom) lg(LOG_ERR, "out of memory");
@@ -2943,6 +2984,9 @@ static bool auto_open(struct lio *io, const lview_t *v, uint16_t slot, bool star
     vs->dv_valid = true;
     vs->next_poll = now + (int64_t)auto_poll_ms(v);
     vs->perr[0] = '\0';
+    if (strcmp(drv->name, "postgresql") == 0 && drv->wait_fd && drv->wait_fd(c) < 0)         /* the driver then reads the change log by timer */
+        lg(LOG_NOTICE, "view '%s': auto reload: the server refuses LISTEN (a standby?); the change log is read every %llu s instead",
+           io->vnames[slot], (unsigned long long)(auto_poll_ms(v) / 1000));
     if (!si.has_changes && !vs->nolog_auto_warned) {
         vs->nolog_auto_warned = true;
         if (strcmp(drv->name, "sqlite3") == 0)

@@ -267,6 +267,19 @@ sql "$(zone 16 serial1.test 1)"
 conf; run
 nowarn "SOA serial 1 is fine" "serial is 0"
 db_reset
+# two rows whose names differ only in case: the SQLite3 schema has a NOCASE unique index and the PostgreSQL schema a lower-case CHECK (as PowerDNS's own does), so those are dropped first
+if [ "$BACKEND" = sqlite3 ]; then sql "DROP INDEX name_index"; else sql "ALTER TABLE domains DROP CONSTRAINT c_lowercase_name; ALTER TABLE records DROP CONSTRAINT c_lowercase_name"; fi
+sql "$(zone 18 CaseDup.test)
+$(zone 19 casedup.test)"
+conf; run
+warn "names that differ only in case" "domains.id 18 ('CaseDup.test') and domains.id 19 ('casedup.test') have names that differ only in case"
+status "names that differ only in case: a warning, exit 0" 0
+db_reset
+sql "$(zone 18 casedup.test)
+$(zone 19 other.test)"
+conf; run
+nowarn "different names: no case warning" "differ only in case"
+db_reset
 sql "$(zone 17 cnamex.test)
 $(rec 17 www.cnamex.test CNAME ok.test)
 $(rec 17 www.cnamex.test A 192.0.2.6)"

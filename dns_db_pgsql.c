@@ -1108,13 +1108,36 @@ static int pg_drain_notifications(db_conn_t *c, bool *changed) {
     return 0;
 }
 
+/* LISTEN is refused (a hot standby: "cannot execute LISTEN during recovery"), so nothing announces a commit.  The standby does
+ * replay the change log, so poll_version() looks at it instead: the counter is a fingerprint of karidns_changes, the number of rows
+ * and the highest seq (one index-only count per poll interval, over at most the 1,000,000 rows the log keeps).  A row that a
+ * transaction adds when it commits late changes the number of rows even when its seq is below the highest one; pruning changes the
+ * highest seq.  The query also notices a connection that died.  A database without the change log has nothing to look at: the
+ * counter stays 0, as a primary without the triggers never notifies either. */
+static int pg_poll_log(db_conn_t *c, uint64_t *version) {
+    if (!c->has_changes) {
+        c->nver = 0;
+        *version = 0;
+        return 0;
+    }
+    PGresult *r = NULL;
+    int ret = exec_rows(c, "SELECT count(*)::text, coalesce(max(seq), 0)::text FROM karidns_changes", 0, NULL, &r, "poll the change log");
+    if (ret != 0) return ret;
+    uint64_t n = strtoull(PQgetvalue(r, 0, 0), NULL, 10), mx = strtoull(PQgetvalue(r, 0, 1), NULL, 10);
+    PQclear(r);
+    c->nver = mx * 2654435761u + n;
+    *version = c->nver;
+    return 0;
+}
+
 /* The change detector of the auto reload loop (dns_db_driver.h poll_version): LISTEN is started by the first call, so
  * the baseline is taken after it; the counter changes when a notification arrived.  A ping now and then notices a
- * connection that died silently (the server went away, a firewall dropped it). */
+ * connection that died silently (the server went away, a firewall dropped it).  When LISTEN is refused for good (a standby),
+ * the counter is the fingerprint of the change log instead (pg_poll_log). */
 static int pg_poll_version(db_conn_t *c, uint64_t *version, bool *replaced) {
     *replaced = false;
     int ret = ensure_listen(c);
-    if (ret != 0) return ret;
+    if (ret != 0) return c->listen_failed ? pg_poll_log(c, version) : ret;
     ret = pg_drain_notifications(c, NULL);
     if (ret != 0) return ret;
     time_t now = time(NULL);

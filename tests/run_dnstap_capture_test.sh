@@ -27,6 +27,7 @@ PID_RECEIVER=""
 PID_SERVER=""
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     [ -n "$PID_SERVER" ] && kill -TERM "$PID_SERVER" 2>/dev/null || true
     [ -n "$PID_RECEIVER" ] && kill -TERM "$PID_RECEIVER" 2>/dev/null || true
     pkill -f "$CONF_PATH" 2>/dev/null || true

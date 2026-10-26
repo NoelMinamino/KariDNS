@@ -406,6 +406,7 @@ register_test "core" "sh" "tests/run_karicheck_db_test.sh" "karicheck db (B12): 
 register_test "core" "sh" "tests/run_db_loader_sigterm_test.sh" "The loader ends within 2 s of SIGTERM in the middle of a long load (restarted loader comparing every zone; loader-threads 1 and 2; beta B13; root only, SKIP otherwise)"
 register_test "core" "sh" "tests/run_karicheck_unknown_statement_test.sh" "Unknown statements in zone { } and view { } are configuration errors (karicheck conf and karidns); BIND-only options are skipped with a warning (beta B6a)"
 register_test "core" "sh" "tests/run_karicheck_db_loader_output_test.sh" "karicheck db against a loader that misbehaves (a shell script that writes what a case needs): line longer than CHK_LINE_MAX, text / NUL byte / bad escape instead of protocol lines, last line without line feed, no final R line, exit status 4 / 3 / 127, death by a signal, findings with records.id, clean run (run as root and as a normal user)"
+register_test "core" "sh" "tests/run_trap_cleanup_status_test.sh" "A failing EXIT-trap cleanup must not change the exit status of a test (FreeBSD sh applies set -e inside the trap): the shell behaviour, and every tests/run_*.sh with set -e and an EXIT trap has set +e in its handler"
 
 # 11. Regression, Sanitizer & Concurrency Stress
 register_test "regression" "sh" "tests/run_sanitizer_smoke_test.sh" "ASan & UBSan runtime memory error smoke test"

@@ -50,6 +50,7 @@ for _ in $(seq 1 50); do
 done
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     kari_kill_tree "${SERVER_PID:-}"
     rm -rf "$SCRIPT_DIR/$TEST_DIR" 2>/dev/null || true
 }

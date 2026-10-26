@@ -17,6 +17,7 @@ MIXED_ZONE="$DIR/axfr_multikey_mixed.zone"
 OTHER_ZONE="$DIR/axfr_multikey_other.zone"
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     kari_kill_tree "${SERVER_PID:-}"
     rm -f "$CONF_FILE" "$ZONE_FILE" "$MIXED_ZONE" "$OTHER_ZONE" /tmp/karidns_axfr_multikey.log
 }

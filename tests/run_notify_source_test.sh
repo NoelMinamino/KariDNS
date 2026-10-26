@@ -124,6 +124,7 @@ $BIN -f -c "$CONF" > "$DIR/server_notify.log" 2>&1 &
 SERVER_PID=$!
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     echo "[*] Cleaning up test processes and aliases..."
     kari_kill_tree "${SERVER_PID:-}"
     kari_kill_tree "${PERL_PID:-}"

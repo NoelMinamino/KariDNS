@@ -96,6 +96,7 @@ TMP_DIR="/tmp/karidns_fixes_val_test_$$"
 mkdir -p "$TMP_DIR"
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     [ -n "$TCP_PID" ] && kill -9 "$TCP_PID" 2>/dev/null || true
     [ -n "$DOH_PID" ] && kill -9 "$DOH_PID" 2>/dev/null || true
     [ -n "$UDP_PID" ] && kill -9 "$UDP_PID" 2>/dev/null || true

@@ -16,6 +16,7 @@ TMP_DIR="$(mktemp -d /tmp/dag_edge_cases_phase3_test.XXXXXX)"
 SERVER_PID=""
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     if [ -n "$SERVER_PID" ]; then
         kill "$SERVER_PID" 2>/dev/null || true
         pkill -P "$SERVER_PID" 2>/dev/null || true

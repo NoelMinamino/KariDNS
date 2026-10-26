@@ -64,6 +64,7 @@ TMP_DIR="/tmp/dag_audit_test_$$"
 mkdir -p "$TMP_DIR"
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     if [ -n "$MOCK_TLS_PID" ] && kill -0 "$MOCK_TLS_PID" 2>/dev/null; then
         kill -9 "$MOCK_TLS_PID" 2>/dev/null || true
     fi

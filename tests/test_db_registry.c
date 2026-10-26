@@ -6,6 +6,7 @@
  *  1. install: a zone built from AXFR-format messages is published into an entry (serial, SOA timers, image, NOTIFY
  *     only when a loaded zone changes its serial); every rejection rule leaves the entry as it was.
  *  2. registry and delta: commit / apply / delete, idempotence, source id check, rejected-only records, walk.
+ *  2b. the view delta patches copies of the hash tables (and rebuilds them when they would get too full).
  *  3. D-PRIO: a configured zone hides a DB zone, the DB zone comes back when the configured zone is removed.
  *  4. dbcfg: zone_entry_config() returns it for DB zones, a replaced block is retired and freed.
  *  5. concurrent readers while zones are added and removed: a reader never sees a DB zone without its image.
@@ -487,6 +488,104 @@ static void test_registry_delta(void) {
     CHECK(dbreg_pending_count() == 0);
 }
 
+/* ---------------------------------------------------------------- 2b. the delta patches the hash tables */
+/* snapshot_apply_db_delta() copies and patches the hash tables of the old snapshot (append for an addition, move-the-last-entry
+ * for a removal) and rebuilds them only when the load factor would pass one half.  After every step every live zone must be found
+ * by its exact name and by a name below it, every removed one by neither, whichever of the two ways was taken. */
+#define INC_N 520
+static void inc_verify(const char *view, zone_db_entry_t **ent, const bool *alive, int n) {
+    zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+    view_snapshot_t *v = snapshot_find_view(s, view);
+    CHECK(v != NULL);
+    int live = 0;
+    for (int i = 0; v && i < n; i++) {
+        char name[64], sub[96];
+        snprintf(name, sizeof(name), "t%d.test.", i);
+        snprintf(sub, sizeof(sub), "www.t%d.test.", i);
+        zone_db_entry_t *x = find_zone_exact_in_view(v, name), *y = find_zone_in_view(v, sub);
+        if (alive[i]) {
+            live++;
+            if (x != ent[i] || y != ent[i]) printf("  zone %s: exact %p suffix %p expected %p\n", name, (void *)x, (void *)y, (void *)ent[i]);
+            CHECK(x == ent[i] && y == ent[i]);
+        } else {
+            CHECK(x == NULL && y == NULL);
+        }
+    }
+    CHECK(v && find_zone_exact_in_view(v, "file.test.") != NULL);        /* the configured zone is untouched */
+    size_t counted = 0;
+    for (size_t k = 0; v && k < v->zone_count; k++) if (v->entries[k]) counted++;
+    CHECK(counted == (size_t)live + 1);                                  /* no entry twice, none lost, no stale pointer */
+    release_zone_snapshot(s);
+}
+
+static void inc_add(const char *view, zone_db_entry_t **ent, bool *alive, int i) {
+    char name[64];
+    snprintf(name, sizeof(name), "t%d.test.", i);
+    ent[i] = add_zone(view, name, 1, 1, 5000 + i);
+    alive[i] = ent[i] != NULL;
+}
+
+static void inc_del(const char *view, bool *alive, int i) {
+    char name[64];
+    snprintf(name, sizeof(name), "t%d.test.", i);
+    CHECK(dbreg_delete(view, name, 5000 + i) == 1);
+    alive[i] = false;
+}
+
+static void test_incremental_delta(void) {
+    printf("[TEST] view delta: patched hash tables (add, remove, swap of the last entry, growth)...\n");
+    char path[300];
+    snprintf(path, sizeof(path), "%s/inc.zone", g_dir);
+    FILE *f = fopen(path, "w");
+    fputs("$ORIGIN file.test.\n$TTL 300\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.1\n", f);
+    fclose(f);
+    server_config_t *cfg = load_conf("view \"default\" { match-clients { any; };\n"
+                                     "  zone \"file.test\" { type master; file \"%s\"; }; };\n", path);
+    rebuild(cfg);
+    static zone_db_entry_t *ent[INC_N];
+    static bool alive[INC_N];
+    memset(ent, 0, sizeof(ent));
+    memset(alive, 0, sizeof(alive));
+    int next = 0;
+
+    for (int k = 0; k < 100; k++) inc_add("default", ent, alive, next++);       /* 1 + 100 zones: fits 256 slots at half load */
+    CHECK(snapshot_apply_db_delta() == 100);
+    inc_verify("default", ent, alive, next);
+
+    /* the first, a middle and the last entry out, two in: the last slot is moved into the hole of a removed one */
+    inc_del("default", alive, 0);
+    inc_del("default", alive, 57);
+    inc_del("default", alive, 99);
+    inc_add("default", ent, alive, next++);
+    inc_add("default", ent, alive, next++);
+    CHECK(snapshot_apply_db_delta() == 5);
+    inc_verify("default", ent, alive, next);
+
+    /* one removal per delta, from the front (every one moves the last entry), until a few are left */
+    for (int i = 1; i < 90; i++) {
+        if (!alive[i]) continue;
+        inc_del("default", alive, i);
+        CHECK(snapshot_apply_db_delta() == 1);
+        if (i % 7 == 0) inc_verify("default", ent, alive, next);
+    }
+    inc_verify("default", ent, alive, next);
+
+    /* more than half of 256 slots: the tables are rebuilt (bigger), then patched again */
+    for (int k = 0; k < 260; k++) inc_add("default", ent, alive, next++);
+    CHECK(snapshot_apply_db_delta() == 260);
+    inc_verify("default", ent, alive, next);
+    inc_add("default", ent, alive, next++);
+    CHECK(snapshot_apply_db_delta() == 1);
+    inc_del("default", alive, 150);
+    inc_del("default", alive, next - 1);
+    CHECK(snapshot_apply_db_delta() == 2);
+    inc_verify("default", ent, alive, next);
+    CHECK(next < INC_N);
+
+    dbreg_reset();
+    CHECK(dbreg_pending_count() == 0);
+}
+
 /* ---------------------------------------------------------------- 3. D-PRIO */
 static void test_shadowing(void) {
     printf("[TEST] DB registry: a configured zone hides a DB zone, and the DB zone comes back...\n");
@@ -949,6 +1048,7 @@ int main(void) {
     if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
     test_install();
     test_registry_delta();
+    test_incremental_delta();
     test_shadowing();
     test_catalog_member_wins();
     test_dbcfg();

@@ -45,6 +45,7 @@ PID1=""
 PID2=""
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     kari_kill_tree "${PID1:-}"
     kari_kill_tree "${PID2:-}"
     rm -rf "$TMP_DIR" 2>/dev/null || true

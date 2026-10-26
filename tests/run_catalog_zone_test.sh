@@ -21,6 +21,7 @@ TEST_DIR_ABS=$(pwd)
 # Trap for cleanup and automatic kdump on failure
 cleanup() {
     EXIT_CODE=$?
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     kari_kill_tree "${SERVER_PID:-}"
     if [ $EXIT_CODE -ne 0 ]; then
         echo "[-] Test failed with exit code $EXIT_CODE"

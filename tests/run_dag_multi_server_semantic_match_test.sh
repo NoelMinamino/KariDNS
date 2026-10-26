@@ -43,6 +43,7 @@ TMP_DIR="/tmp/karidns_semantic_match_test_$$"
 mkdir -p "$TMP_DIR"
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     [ -n "$SRV1_PID" ] && kill -9 "$SRV1_PID" 2>/dev/null || true
     [ -n "$SRV2_PID" ] && kill -9 "$SRV2_PID" 2>/dev/null || true
     [ -n "$SRV3_PID" ] && kill -9 "$SRV3_PID" 2>/dev/null || true

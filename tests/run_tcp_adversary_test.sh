@@ -18,6 +18,7 @@ PID_FILE="${TMP_DIR}/karidns.pid"
 CONF_FILE="${TMP_DIR}/karidns.conf"
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     if [ -f "${PID_FILE}" ]; then
         PID=$(cat "${PID_FILE}" 2>/dev/null || true)
         if [ -n "${PID}" ]; then
