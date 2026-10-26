@@ -2772,12 +2772,14 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
   g_config_db.retire_epoch = rcu_writer_publish(&g_config_db.active, standby);
   g_config_db.standby_pending = true; /* 退いた設定 (旧 active) は猶予期間の後で config_standby_reap() が解放する */
   g_last_configured_time = time(NULL);
-  db_ingest_config_changed(); /* beta design 4.5: the loader gets a CONFIG with the new generation */
   // dnstap の接続先は起動時のみだが、出力するメッセージ種別はリロードで反映できる
   if (standby->dnstap.enabled) {
     dnstap_set_message_types(standby->dnstap.log_auth_query, standby->dnstap.log_auth_response);
   }
   res.zones_failed = rebuild_zone_db_from_config_ext(standby, skip_unchanged, res.detail, sizeof(res.detail));
+  /* beta design 4.5: the loader gets a CONFIG with the new generation.  After the snapshot: the ingest thread answers it
+   * with a walk of the registry (reeval_settings()) under the rebuild lock, which the rebuild would otherwise wait for. */
+  db_ingest_config_changed();
   if (res.zones_failed < 0) {
     res.zones_failed = 0;
     snprintf(res.detail, sizeof(res.detail), "zone database could not be rebuilt (out of memory)");

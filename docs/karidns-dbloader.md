@@ -126,6 +126,17 @@ The loader reads the tables of the **PowerDNS 5.1 generic SQLite3 / PostgreSQL b
 
 A bulk import writes one change-log row per changed row (SQLite3) or per statement (PostgreSQL); a big import makes the next reload compare every zone once. The files carry their own documentation in their first lines.
 
+### Indexes
+
+The extension files create `karidns_zone_tagdefs_domain_idx` on `karidns_zone_tagdefs (domain_id)` (the loader reads the tag definitions of one zone at a time; without the index every such read scans the table). It was added after schema version 2, which stays 2: apply `db/karidns_ext.*.sql` (or the `v1_to_v2` script) again to get it on an existing database.
+
+**The loader is read-only and never creates an index.** Two optional PostgreSQL indexes on the PowerDNS tables make the big reads faster; create them yourself when the database is large:
+
+| Index | Effect |
+|---|---|
+| `CREATE INDEX records_soa_cover_idx ON records (domain_id) INCLUDE (name, content) WHERE type = 'SOA' AND disabled = false;` | The zone list of every full comparison (`karictl reload`, auto reload, a loader restart) joins each domain to its apex SOA. With this partial covering index the join is an index-only merge over one row per zone. The loader looks the index up once per connection (`pg_indexes`) and then leaves the planner's `cursor_tuple_fraction` at its default (0.1) for the list; without the index it plans the list for all of its rows (`1`), which is then the faster plan. Measured at 1,000,000 zones x 11 records (`psql`, 3 runs): without the index 2.2 s planned for all rows (one pass over the SOA rows) against 2.6 s at the default (a walk of the whole `records` table through its `domain_id` index); with the index 1.7 s planned for all rows (the planner still reads every SOA row) against 1.0 s at the default (the index-only merge). |
+| `CREATE INDEX domains_lower_name_idx ON domains (lower(name));` | A one-zone read of a zone that is not in the database (a deletion, a typo in `karictl reload <zone>`) falls back to `lower(d.name)`, a table scan of `domains` without this expression index (about 0.2 s at 1,000,000 zones). |
+
 **Zone names that differ only in case are not supported.** PowerDNS stores `domains.name` in lower case, and so should the data: two rows of one source such as `Example.test` and `example.test` are two rows for PostgreSQL's case-sensitive unique index (the PowerDNS PostgreSQL schema has a `CHECK` constraint `c_lowercase_name` that refuses upper case, and SQLite3's schema declares the column `COLLATE NOCASE`; such rows only exist when a constraint was dropped or the data was written around it). The loader keeps the one-zone lookup (`--zone`, used by reload requests and auto reload) fast: it matches the indexed name exactly first and falls back to `lower()` only when that finds nothing. With such duplicates a full read and a one-zone read may therefore pick different rows. `karicheck db` (`karidns-dbloader --check`) warns about every pair of `domains` rows of one source whose names are equal ignoring case, with both `domains.id` values (both drivers); fix the data, do not rely on either row.
 
 ## PACKAGES

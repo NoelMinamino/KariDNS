@@ -13,6 +13,10 @@
  *  6. (B6a) D17-1: a catalog member with the name of a DB zone hides it (catalog delta), the DB zone returns when the
  *     member leaves, a DB zone committed behind an existing member is hidden; dbreg_find_info(), dbreg_counts2(),
  *     dbreg_snapshot_entry().
+ *  7. the reload fast path: an unchanged zone set takes the old view over (same arrays and tables, the pending queue
+ *     survives, match-clients and options { ixfr-history } still apply); a zone { } added, removed or retyped, or a view
+ *     added, rebuilds from the registry; the queue of a view that left is dropped.
+ *  8. a DB zone that leaves marks the glue dirty: the zones whose glue came from it are looked at again by the tick.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -1067,6 +1071,214 @@ static void test_secondary_entries(void) {
     db_settings_reset();
 }
 
+/* ---------------------------------------------------------------- 7. the reload fast path */
+/* A reload whose zone { } blocks did not change takes the old view over (entries, hash tables, tick list: the same
+ * contents), keeps the registry's pending queue, and applies what changed in the view's own settings (match-clients,
+ * options { ixfr-history }).  A zone { } added, removed or of another type, or a view added, rebuilds from the registry
+ * (observable: the pending queue is dropped, since the registry already has what it queued). */
+typedef struct {
+    zone_db_entry_t **entries, **tick;
+    int *ht, *chain, *sht, *schain;
+    size_t n, hs, tn, sc;
+} view_copy_t;
+
+static void copy_view(const char *view, view_copy_t *c) {
+    memset(c, 0, sizeof(*c));
+    zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+    view_snapshot_t *v = snapshot_find_view(s, view);
+    CHECK(v != NULL && v->suffix_hash_size == v->hash_size);
+    if (v) {
+        c->n = v->zone_count;
+        c->hs = v->hash_size;
+        c->tn = v->tick_count;
+        c->sc = v->static_count;
+        c->entries = malloc((c->n + 1) * sizeof(*c->entries));
+        c->tick = malloc((c->tn + 1) * sizeof(*c->tick));
+        c->ht = malloc((c->hs + 1) * sizeof(int));
+        c->sht = malloc((c->hs + 1) * sizeof(int));
+        c->chain = malloc((c->n + 1) * sizeof(int));
+        c->schain = malloc((c->n + 1) * sizeof(int));
+        memcpy(c->entries, v->entries, c->n * sizeof(*c->entries));
+        memcpy(c->tick, v->tick_entries, c->tn * sizeof(*c->tick));
+        memcpy(c->ht, v->hash_table, c->hs * sizeof(int));
+        memcpy(c->sht, v->suffix_hash_table, c->hs * sizeof(int));
+        memcpy(c->chain, v->chain_next, c->n * sizeof(int));
+        memcpy(c->schain, v->suffix_chain_next, c->n * sizeof(int));
+    }
+    release_zone_snapshot(s);
+}
+
+static bool same_view(const view_copy_t *a, const view_copy_t *b) {
+    return a->n == b->n && a->hs == b->hs && a->tn == b->tn && a->sc == b->sc &&
+           memcmp(a->entries, b->entries, a->n * sizeof(*a->entries)) == 0 && memcmp(a->tick, b->tick, a->tn * sizeof(*a->tick)) == 0 &&
+           memcmp(a->ht, b->ht, a->hs * sizeof(int)) == 0 && memcmp(a->sht, b->sht, a->hs * sizeof(int)) == 0 &&
+           memcmp(a->chain, b->chain, a->n * sizeof(int)) == 0 && memcmp(a->schain, b->schain, a->n * sizeof(int)) == 0;
+}
+
+static void free_copy(view_copy_t *c) {
+    free(c->entries); free(c->tick); free(c->ht); free(c->sht); free(c->chain); free(c->schain);
+}
+
+static zone_db_snapshot_t *current_snapshot(void) {
+    zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+    release_zone_snapshot(s);
+    return s;
+}
+
+static void test_reuse_fast_path(void) {
+    printf("[TEST] reload fast path: an unchanged zone set takes the view over, a changed one rebuilds it...\n");
+    char path[300], path2[300];
+    snprintf(path, sizeof(path), "%s/fp.zone", g_dir);
+    snprintf(path2, sizeof(path2), "%s/ra.zone", g_dir);
+    FILE *f = fopen(path, "w");
+    fputs("$ORIGIN fp.test.\n$TTL 300\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.1\n", f);
+    fclose(f);
+    f = fopen(path2, "w");
+    fputs("$ORIGIN ra.test.\n$TTL 300\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.2\n", f);
+    fclose(f);
+    const char *one = "view \"default\" { match-clients { any; };\n  zone \"fp.test\" { type master; file \"%s\"; }; };\n";
+    server_config_t *cfg = load_conf(one, path);
+    rebuild(cfg);
+    zone_db_entry_t *a = add_zone("default", "ra.test.", 1, 2, 71);
+    zone_db_entry_t *b = add_zone("default", "rb.test.", 1, 2, 72);
+    zone_db_entry_t *c = add_zone("default", "rc.test.", 1, 2, 73);
+    CHECK(a && b && c && snapshot_apply_db_delta() == 3);
+    view_copy_t before, after;
+    copy_view("default", &before);
+    CHECK(before.n == 4 && before.sc == 1);
+
+    /* the same configuration again: a new snapshot with the same arrays and tables; a queued addition survives it */
+    zone_db_entry_t *d = add_zone("default", "rd.test.", 1, 2, 74);
+    CHECK(d && dbreg_pending_count() == 1);
+    zone_db_snapshot_t *s0 = current_snapshot();
+    rebuild(cfg);
+    CHECK(current_snapshot() != s0);
+    copy_view("default", &after);
+    CHECK(same_view(&before, &after));
+    CHECK(dbreg_pending_count() == 1 && !in_snapshot("default", d));
+    CHECK(snapshot_apply_db_delta() == 1 && in_snapshot("default", d));
+    free_copy(&before);
+    free_copy(&after);
+
+    /* match-clients changed: applied, the view is still taken over */
+    server_config_t *cfg_acl = load_conf("view \"default\" { match-clients { 192.0.2.0/24; };\n"
+                                         "  zone \"fp.test\" { type master; file \"%s\"; }; };\n", path);
+    copy_view("default", &before);
+    CHECK(before.n == 5);
+    rebuild(cfg_acl);
+    {
+        zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+        view_snapshot_t *v = snapshot_find_view(s, "default");
+        CHECK(v && v->match_clients_count == 1 && v->match_clients[0] && strcmp(v->match_clients[0], "192.0.2.0/24") == 0);
+        release_zone_snapshot(s);
+    }
+    copy_view("default", &after);
+    CHECK(same_view(&before, &after));
+    free_copy(&after);
+
+    /* options { ixfr-history } changed: the depth of every entry follows, the view is still taken over */
+    server_config_t *cfg_ix = load_conf("options { ixfr-history 7; };\nview \"default\" { match-clients { any; };\n"
+                                        "  zone \"fp.test\" { type master; file \"%s\"; }; };\n", path);
+    CHECK(ixfr_history_depth(&a->ixfr_history) != 7);
+    rebuild(cfg_ix);
+    CHECK(ixfr_history_depth(&a->ixfr_history) == 7 && ixfr_history_depth(&b->ixfr_history) == 7 &&
+          ixfr_history_depth(&c->ixfr_history) == 7 && ixfr_history_depth(&d->ixfr_history) == 7);
+    {
+        zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+        zone_db_entry_t *fp = find_zone_exact_in_view(snapshot_find_view(s, "default"), "fp.test.");
+        CHECK(fp && ixfr_history_depth(&fp->ixfr_history) == 7);
+        release_zone_snapshot(s);
+    }
+    copy_view("default", &after);
+    CHECK(same_view(&before, &after));
+    free_copy(&before);
+    free_copy(&after);
+
+    /* a zone { } added: the full rebuild (the queued zone is dropped from the queue and comes from the registry) */
+    zone_db_entry_t *e5 = add_zone("default", "re.test.", 1, 2, 75);
+    CHECK(e5 && dbreg_pending_count() == 1);
+    server_config_t *cfg_add = load_conf("view \"default\" { match-clients { any; };\n"
+                                         "  zone \"fp.test\" { type master; file \"%s\"; };\n"
+                                         "  zone \"ra.test\" { type master; file \"%s\"; }; };\n", path, path2);
+    rebuild(cfg_add);
+    CHECK(dbreg_pending_count() == 0 && in_snapshot("default", e5) && !in_snapshot("default", a));
+    /* a zone { } removed: the full rebuild, the DB zone of that name is served again */
+    zone_db_entry_t *e6 = add_zone("default", "rf.test.", 1, 2, 76);
+    CHECK(e6 && dbreg_pending_count() == 1);
+    rebuild(cfg);
+    CHECK(dbreg_pending_count() == 0 && in_snapshot("default", e6) && in_snapshot("default", a));
+    /* a view added: the full rebuild */
+    zone_db_entry_t *e7 = add_zone("default", "rg.test.", 1, 2, 77);
+    CHECK(e7 && dbreg_pending_count() == 1);
+    server_config_t *cfg_v2 = load_conf("view \"default\" { match-clients { any; };\n"
+                                        "  zone \"fp.test\" { type master; file \"%s\"; }; };\n"
+                                        "view \"other\" { match-clients { 10.0.0.0/8; }; };\n", path);
+    rebuild(cfg_v2);
+    CHECK(dbreg_pending_count() == 0 && in_snapshot("default", e7));
+    /* a view removed: the queue of its registry view is dropped, the kept view is taken over */
+    zone_db_entry_t *o = add_zone("other", "o.test.", 1, 2, 78);
+    zone_db_entry_t *e8 = add_zone("default", "rh.test.", 1, 2, 79);
+    CHECK(o && e8 && dbreg_pending_count() == 2);
+    copy_view("default", &before);
+    rebuild(cfg);
+    CHECK(dbreg_pending_count() == 1 && !in_snapshot("default", e8));
+    copy_view("default", &after);
+    CHECK(same_view(&before, &after));
+    free_copy(&before);
+    free_copy(&after);
+    CHECK(snapshot_apply_db_delta() == 1 && in_snapshot("default", e8));
+    /* the zone's type changed: the full rebuild (a new entry of the other kind) */
+    zone_db_entry_t *e9 = add_zone("default", "ri.test.", 1, 2, 80);
+    CHECK(e9 && dbreg_pending_count() == 1);
+    server_config_t *cfg_sec = load_conf("view \"default\" { match-clients { any; };\n"
+                                         "  zone \"fp.test\" { type slave; masters { 192.0.2.9; }; file \"%s\"; }; };\n", path);
+    rebuild(cfg_sec);
+    CHECK(dbreg_pending_count() == 0 && in_snapshot("default", e9));
+    {
+        zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+        zone_db_entry_t *fp = find_zone_exact_in_view(snapshot_find_view(s, "default"), "fp.test.");
+        CHECK(fp && fp->is_secondary);
+        release_zone_snapshot(s);
+    }
+    dbreg_reset();
+}
+
+/* ---------------------------------------------------------------- 8. a DB zone that leaves and the glue of its dependents */
+static void test_glue_dirty_on_delete(void) {
+    printf("[TEST] a DB zone that leaves: the zones that used its addresses as glue are looked at again by the tick...\n");
+    server_config_t *cfg = load_conf("view \"default\" { match-clients { any; }; };\n");
+    rebuild(cfg);
+    msg_t m;
+    char why[128];
+    uint8_t dg[32] = { 0 };
+    bool sh = false;
+    zone_db_entry_t *y = new_entry("default", "y.test.");
+    msg_init(&m); msg_soa(&m, "y.test.", 1); msg_ns(&m, "y.test.", "ns.y.test."); msg_a(&m, "ns.y.test.", 9); msg_soa(&m, "y.test.", 1);
+    CHECK(install_msgs(y, "y.test.", 4, &m, 1, why, sizeof(why), NULL) == 0);
+    CHECK(dbreg_commit("default", "y.test.", y, true, 81, 1, dg, &sh) == 0);
+    CHECK(snapshot_apply_db_delta() == 1);
+    uint64_t yid = y->id;
+    /* x.test names ns.y.test as its NS: its glue comes from y.test, which is in the view when x.test is built */
+    zone_db_entry_t *x = new_entry("default", "x.test.");
+    msg_init(&m); msg_soa(&m, "x.test.", 1); msg_ns(&m, "x.test.", "ns.y.test."); msg_soa(&m, "x.test.", 1);
+    CHECK(install_msgs(x, "x.test.", 3, &m, 1, why, sizeof(why), NULL) == 0);
+    CHECK(dbreg_commit("default", "x.test.", x, true, 82, 1, dg, &sh) == 0);
+    CHECK(snapshot_apply_db_delta() == 1);
+    zone_version_t *xv = atomic_load(&x->rcu.active);
+    CHECK(xv && xv->glue && xv->glue->count == 1 && xv->glue->ids[0] == yid);
+    zone_glue_refresh_dependents(false);         /* the two publications marked the glue dirty: consume that */
+    xv = atomic_load(&x->rcu.active);
+    CHECK(xv && xv->glue && xv->glue->ids[0] == yid);
+    /* y.test leaves the database: nothing is published, the delta itself must mark the glue dirty */
+    CHECK(dbreg_delete("default", "y.test.", 81) == 1);
+    CHECK(snapshot_apply_db_delta() == 1);
+    CHECK(!name_in_snapshot("default", "y.test.") && in_snapshot("default", x));
+    zone_glue_refresh_dependents(false);
+    xv = atomic_load(&x->rcu.active);
+    CHECK(xv && xv->glue && xv->glue->ids[0] == 0);
+    dbreg_reset();
+}
+
 int main(void) {
     snprintf(g_dir, sizeof(g_dir), "/tmp/karidns_dbreg.XXXXXX");
     if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
@@ -1078,6 +1290,8 @@ int main(void) {
     test_dbcfg();
     test_settings_interning();
     test_secondary_entries();
+    test_reuse_fast_path();
+    test_glue_dirty_on_delete();
     test_concurrent();
     /* Remove the scratch directory in-process: the detached snapshot GC threads of test_concurrent may still be starting
      * or exiting here, and fork() from a multi-threaded process (as system("rm -rf") did) deadlocks under ASan on FreeBSD:

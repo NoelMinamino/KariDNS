@@ -157,19 +157,22 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-# karidns processes that were already running when the suite started (another
-# working copy, a long-running server). cleanup_stale_processes() leaves them
-# alone and stops only servers that the tests started. Match the process name,
-# not the argument list: "-f karidns" would also match any command whose path
-# contains "karidns" (e.g. a checkout in ~/karidns).
+# cleanup_stale_processes() stops only the karidns servers that the tests of
+# THIS suite run started (tests/lib_proc.sh: never an unscoped pkill).  It used
+# to stop every karidns that was not running when the suite began, which also
+# hit the servers of another suite or benchmark started on the host meanwhile.
+# The tests inherit KARIDNS_SUITE_ID, and so do the servers they start (the
+# environment survives the privilege drop); a server whose environment carries
+# this suite's id is ours.  Match the process name, not the argument list:
+# "-f karidns" would also match any command whose path contains "karidns".
 KARIDNS_PROC_RE='karidns(-asan|-tsan)?'
-PREEXISTING_KARIDNS_PIDS=" $(pgrep -x "$KARIDNS_PROC_RE" 2>/dev/null | tr '\n' ' ')"
+KARIDNS_SUITE_ID="suite-$$-$(date +%s)"
+export KARIDNS_SUITE_ID
 
 suite_karidns_pids() {
     for _p in $(pgrep -x "$KARIDNS_PROC_RE" 2>/dev/null); do
-        case "$PREEXISTING_KARIDNS_PIDS" in
-            *" $_p "*) ;;
-            *) echo "$_p" ;;
+        case "$(ps -e -ww -o command= -p "$_p" 2>/dev/null)" in
+            *" KARIDNS_SUITE_ID=$KARIDNS_SUITE_ID"|*" KARIDNS_SUITE_ID=$KARIDNS_SUITE_ID "*) echo "$_p" ;;
         esac
     done
 }

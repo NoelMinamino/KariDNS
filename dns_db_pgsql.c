@@ -88,7 +88,9 @@ struct db_conn {
     bool has_reload_requests, has_server_status;    /* B11 */
     bool chan_reload;               /* B11: LISTEN karidns_reload (watch_requests) instead of karidns_changes */
     bool listen_failed;             /* LISTEN was refused (a standby): wait_fd() stays -1, the caller polls by timer */
+    int soa_cover_idx;              /* records (domain_id) INCLUDE (name, content) WHERE type = 'SOA' ...: 0 unknown, 1 yes, -1 no */
 };
+static bool pg_has_soa_cover_index(db_conn_t *c);
 
 /* ------------------------------------------------------------------------------------------------------------- */
 /* errors                                                                                                         */
@@ -436,6 +438,7 @@ static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
     c->has_tagdef_id = exists[T_TAGDEFS] && (found[T_TAGDEFS] & (1u << 4)) != 0;
     c->has_reload_requests = HAVE(T_REQ);
     c->has_server_status = HAVE(T_STATUS);
+    c->soa_cover_idx = pg_has_soa_cover_index(c) ? 1 : -1;
     bool has_version = HAVE(T_VERSION);
 #undef HAVE
     if (has_version) {
@@ -760,6 +763,18 @@ static int zl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     "AND s.disabled = false AND lower(s.name) = lower(d.name) ORDER BY s.id LIMIT 1) ELSE r.content END "                        \
     "FROM domains d LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND r.name = d.name AND r.disabled = false "
 
+/* The optional covering index on the SOA rows of records (docs/karidns-dbloader.md "Optional indexes"): a btree on (domain_id)
+ * that INCLUDEs name and content and is partial on type = 'SOA' and disabled = false.  Looked up in pg_indexes of the schema in
+ * use, outside a snapshot (an error inside one would abort it).  false when the catalog cannot be read. */
+static bool pg_has_soa_cover_index(db_conn_t *c) {
+    PGresult *pr = PQexec(c->pg, "SELECT 1 FROM pg_catalog.pg_indexes WHERE schemaname = current_schema() AND tablename = 'records' "
+                                 "AND indexdef ~* 'USING btree \\(domain_id\\) INCLUDE \\(name, content\\) WHERE' "
+                                 "AND indexdef ~* 'type[^,]*= *''SOA''' AND indexdef ~* 'disabled' LIMIT 1");
+    bool yes = pr && PQresultStatus(pr) == PGRES_TUPLES_OK && PQntuples(pr) == 1;
+    PQclear(pr);
+    return yes;
+}
+
 static int pg_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
     zl_t z = { cb, ud, false, 0, false };
     if (!c->in_snapshot) {
@@ -769,8 +784,13 @@ static int pg_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
     /* A cursor is planned for its first 10% of rows (cursor_tuple_fraction 0.1), which here means a merge join that walks the whole
      * records table through its domain_id index (2.9 s in psql at 1,000,000 zones).  The whole list is read, so plan for all of it; the
      * planner then chooses between probing the name index per zone and one pass over the SOA rows by its cost (1.7 s in psql at 1,000,000
-     * zones x 11 records, 0.2 s at 10,000 x 1,000).  The setting ends with the snapshot and is reset after the scan. */
-    int ret = exec_cmd(c, "SET LOCAL cursor_tuple_fraction = 1", "list_zones");
+     * zones x 11 records, 0.2 s at 10,000 x 1,000).  The setting ends with the snapshot and is reset after the scan.
+     * With the optional covering index on the SOA rows (docs/karidns-dbloader.md: records (domain_id) INCLUDE (name, content) WHERE
+     * type = 'SOA' AND disabled = false) the planner's default (0.1, the first rows first) is used instead: the index gives it an
+     * index-only merge join, and the session default of 1 (set for the bulk scans) is what made it read every SOA row.  Whether the
+     * index exists was looked up once, when the connection checked the schema (pg_has_soa_cover_index()). */
+    int ret = exec_cmd(c, c->soa_cover_idx > 0 ? "SET LOCAL cursor_tuple_fraction = 0.1" : "SET LOCAL cursor_tuple_fraction = 1",
+                       "list_zones");
     if (ret != 0) return ret;
     ret = pg_scan(c, "list_zones", PG_ZONE_SELECT "ORDER BY d.id, r.id", 0, NULL, zl_row, &z);
     if (ret == 0 || ret == DB_STOPPED) {

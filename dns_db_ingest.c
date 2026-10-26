@@ -930,6 +930,7 @@ static void *builder_thread(void *arg) {
   ing_t *g = &g_ing;
   rcu_aux_thread_pin();
   struct kevent ev;
+  burst_yield_t by = BURST_YIELD_INIT;
   for (;;) {
     if (kevent(b->kq, NULL, 0, &ev, 1, NULL) < 0) {
       if (errno == EINTR) continue;
@@ -938,6 +939,7 @@ static void *builder_thread(void *arg) {
     }
     ing_job_t *j = atomic_exchange_explicit(&b->slot, NULL, memory_order_acquire);
     if (!j) continue;
+    burst_yield_check(&by);                /* a batch of a million zones: the pinned worker on this CPU gets its turns */
     job_execute(j);
     ing_job_t *h = atomic_load_explicit(&g->res_head, memory_order_relaxed);
     do {
@@ -1292,7 +1294,9 @@ static bool inv_cb(void *ud, const char *view, const dbreg_zone_t *z) {
 }
 
 static void pump_inventory(ing_t *g) {
+  burst_yield_t by = BURST_YIELD_INIT;
   while (g->inv_active && g->stream_fd >= 0 && g->out_len - g->out_off < ING_INV_QUEUE_LOW) {
+    burst_yield_check(&by);                /* a million zones are read in chunks; the pinned worker on this CPU gets its turns */
     inv_ctx_t c = { g, 0, false };
     kdb_enc_reset(&g->enc);
     if (kdb_enc_begin(&g->enc, KDB_T_INVENTORY) != 0) {
@@ -1709,12 +1713,19 @@ static void on_ctrl_readable(ing_t *g) {
 typedef struct {
   const server_config_t *cfg;
   uint32_t zones, with_acl, missing, logged;
+  uint32_t chunk;     /* zones seen in the current hold of the lock */
 } reeval_ctx_t;
 
 static _Atomic uint32_t g_settings_missing_keys;     /* zones with a missing key, as of the last reload (dbstatus) */
 
+#define REEVAL_CHUNK 4096     /* zones per hold of the rebuild lock (about 1 ms); the walk sleeps between chunks */
+
 static bool reeval_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   reeval_ctx_t *c = ud;
+  if (++c->chunk > REEVAL_CHUNK) {     /* stop before this zone: the next chunk starts at it */
+    c->chunk = 0;
+    return false;
+  }
   if (!z->entry) return true;
   const zone_config_t *dc = atomic_load_explicit(&z->entry->dbcfg, memory_order_acquire);
   if (!dc || !dc->ext_shared) return true;
@@ -1737,12 +1748,17 @@ static bool reeval_cb(void *ud, const char *view, const dbreg_zone_t *z) {
 
 static void reeval_settings(ing_t *g) {
   (void)g;
-  reeval_ctx_t c = { NULL, 0, 0, 0, 0 };
+  reeval_ctx_t c = { NULL, 0, 0, 0, 0, 0 };
   rcu_aux_read_lock();
   c.cfg = acquire_config_snapshot();
   dbreg_cursor_t cur;
   memset(&cur, 0, sizeof(cur));
-  (void)dbreg_walk(&cur, reeval_cb, &c);
+  /* in chunks: a hold of the rebuild lock over a million zones (50 ms) would stall a reload or a delta that needs it, and
+   * the ingest thread shares its CPU with a pinned worker (burst_yield()) */
+  while (!dbreg_walk(&cur, reeval_cb, &c)) {
+    struct timespec ts = { 0, BURST_YIELD_NS };
+    nanosleep(&ts, NULL);
+  }
   if (c.with_acl > 0 && !db_acl_ceiling_configured(c.cfg))
     syslog(LOG_WARNING, "[DB] %u zone(s) have ACLs in their database settings, but options { database { acl-ceiling } } is not "
                         "configured: they refuse every client", c.with_acl);
