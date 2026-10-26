@@ -1498,6 +1498,27 @@ static void test_checkproto(void) {
     CHECK_STR(p, "ok??[31m??z");
 }
 
+/* the names the loader and the Backend log for a result code and a message type: one each, none empty, "?" for the unknown */
+static void test_names(void) {
+    printf("result code and message type names\n");
+    static const struct { kdb_rc_t rc; const char *name; } rcs[] = {
+        { KDB_OK, "ok" }, { KDB_MORE, "more" }, { KDB_E_MAGIC, "bad magic" }, { KDB_E_TYPE, "unknown type" },
+        { KDB_E_FLAGS, "bad flags" }, { KDB_E_LENGTH, "bad length" }, { KDB_E_TLV_TRUNC, "truncated TLV" },
+        { KDB_E_TLV_DUP, "duplicate tag" }, { KDB_E_TLV_UNKNOWN, "unknown tag" }, { KDB_E_TLV_MISSING, "missing tag" },
+        { KDB_E_TLV_LEN, "bad value length" }, { KDB_E_TLV_STR, "bad string" }, { KDB_E_TLV_NAME, "bad name" },
+        { KDB_E_RANGE, "value out of range" }, { KDB_E_STATE, "message not allowed in this state" },
+        { KDB_E_VERSION, "protocol version mismatch" }, { KDB_E_DNSHDR, "bad ZONE_DATA DNS header" },
+        { KDB_E_OPT, "OPT outside the first ZONE_DATA" }, { KDB_E_COUNT, "RR count mismatch" }, { KDB_E_SEQ, "batch mismatch" },
+        { KDB_E_LIMIT_BYTES, "zone byte limit exceeded" }, { KDB_E_LIMIT_RECORDS, "zone record limit exceeded" },
+        { KDB_E_LIMIT_PROFILES, "profile limit exceeded" },
+    };
+    for (size_t i = 0; i < sizeof(rcs) / sizeof(rcs[0]); i++) CHECK_STR(kdb_rc_name(rcs[i].rc), rcs[i].name);
+    CHECK_STR(kdb_rc_name((kdb_rc_t)9999), "?");
+    CHECK_STR(kdb_type_name(KDB_T_HELLO), "HELLO");
+    CHECK_STR(kdb_type_name(KDB_T_ZONE_FAILED), "ZONE_FAILED");
+    CHECK_STR(kdb_type_name(0x7fff), "?");
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--gen-corpus") == 0) return gen_corpus(argv[2]) ? 1 : 0;
     test_roundtrip_loader();
@@ -1514,6 +1535,7 @@ int main(int argc, char **argv) {
     test_batch_request_id();
     test_auto_status();
     test_checkproto();
+    test_names();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

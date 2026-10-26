@@ -649,6 +649,68 @@ static void test_dag_replay_mode_cli_and_protobuf_varint(void) {
     printf("  -> replay mode CLI parsing & protobuf varint decoding passed.\n");
 }
 
+/* a dnstap frame with fields of the wire types the reader does not use (fixed32, fixed64) around the ones it does, and frames cut short */
+static size_t dt_frame(uint8_t *out, const uint8_t *outer_pre, size_t pre_len, const uint8_t *inner, size_t inner_len) {
+    size_t o = 0;
+    if (pre_len) { memcpy(out, outer_pre, pre_len); o = pre_len; }
+    out[o++] = 0x72;                                  /* field 14: dnstap.Dnstap.message */
+    out[o++] = (uint8_t)inner_len;
+    memcpy(out + o, inner, inner_len);
+    return o + inner_len;
+}
+
+static void test_dnstap_other_wire_types(void) {
+    printf("[TEST] DAG Tools: dnstap frames with fixed32 / fixed64 fields and truncated fields...\n");
+    static const uint8_t query[12] = { 0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0 };
+    uint8_t inner[64];
+    size_t n = 0;
+    inner[n++] = 0x08; inner[n++] = 0x01;                              /* message type 1 */
+    inner[n++] = 0x18; inner[n++] = 0x02;                              /* TCP */
+    inner[n++] = 0xA5; inner[n++] = 0x01; inner[n++] = 1; inner[n++] = 2; inner[n++] = 3; inner[n++] = 4;       /* field 20, fixed32 */
+    inner[n++] = 0xA9; inner[n++] = 0x01; memset(inner + n, 7, 8); n += 8;                                      /* field 21, fixed64 */
+    inner[n++] = 0x22; inner[n++] = 4; inner[n++] = 192; inner[n++] = 0; inner[n++] = 2; inner[n++] = 1;       /* query address */
+    inner[n++] = 0x30; inner[n++] = 53;                                /* query port */
+    inner[n++] = 0x52; inner[n++] = 12; memcpy(inner + n, query, 12); n += 12;                                  /* query message */
+    const uint8_t pre[] = { 0x0D, 1, 2, 3, 4,                         /* field 1, fixed32 */
+                            0x11, 1, 2, 3, 4, 5, 6, 7, 8,             /* field 2, fixed64 */
+                            0x18, 0x07 };                             /* field 3, varint */
+    uint8_t frame[160];
+    size_t fl = dt_frame(frame, pre, sizeof(pre), inner, n);
+
+    uint8_t dns[4096];
+    size_t dns_len = 0;
+    char tr[16];
+    assert(parse_dnstap_data_frame_ex(frame, fl, dns, &dns_len, tr, sizeof(tr)));
+    assert(dns_len == 12 && memcmp(dns, query, 12) == 0 && strcmp(tr, "tcp") == 0);
+    dnstap_frame_info_t info;
+    assert(parse_dnstap_data_frame_full(frame, fl, &info) && info.message_type == 1 && info.protocol == 6 && info.client_port == 53);
+    assert(info.client_addr[0] == 192 && info.client_addr[3] == 1 && info.wire_len == 12);
+
+    /* the outer message cut inside a fixed32 / a fixed64, or a group (wire type 3): no message found */
+    static const uint8_t cut32[] = { 0x0D, 1, 2 };
+    static const uint8_t cut64[] = { 0x11, 1, 2, 3 };
+    static const uint8_t group[] = { 0x0B, 1, 2, 3 };
+    assert(!parse_dnstap_data_frame_ex(cut32, sizeof(cut32), dns, &dns_len, tr, sizeof(tr)));
+    assert(!parse_dnstap_data_frame_full(cut32, sizeof(cut32), &info));
+    assert(!parse_dnstap_data_frame_ex(cut64, sizeof(cut64), dns, &dns_len, tr, sizeof(tr)));
+    assert(!parse_dnstap_data_frame_full(cut64, sizeof(cut64), &info));
+    assert(!parse_dnstap_data_frame_ex(group, sizeof(group), dns, &dns_len, tr, sizeof(tr)));
+    assert(!parse_dnstap_data_frame_full(group, sizeof(group), &info));
+
+    /* the inner message cut the same way: the query it carried before is not there, so there is nothing to replay */
+    static const uint8_t in32[] = { 0x08, 0x01, 0xA5, 0x01, 1, 2 };
+    static const uint8_t in64[] = { 0x08, 0x01, 0xA9, 0x01, 1, 2, 3 };
+    static const uint8_t ingr[] = { 0x08, 0x01, 0x0B, 1, 2, 3 };
+    const uint8_t *cuts[] = { in32, in64, ingr };
+    const size_t cut_len[] = { sizeof(in32), sizeof(in64), sizeof(ingr) };
+    for (int i = 0; i < 3; i++) {
+        fl = dt_frame(frame, NULL, 0, cuts[i], cut_len[i]);
+        assert(!parse_dnstap_data_frame_ex(frame, fl, dns, &dns_len, tr, sizeof(tr)));
+        assert(!parse_dnstap_data_frame_full(frame, fl, &info));
+    }
+    printf("  -> dnstap other wire types passed.\n");
+}
+
 static void test_dag_tsig_client_signing_and_verify(void) {
     printf("[TEST] DAG Tools: TSIG client signing and response verification...\n");
 
@@ -760,6 +822,107 @@ static void test_dag_replay_comparison_and_filtering(void) {
     printf("  -> replay response comparison and filtering passed.\n");
 }
 
+
+/* ---- diff_dns_responses: EDNS options (ECS, COOKIE, others) and the DNSSEC records the comparison names separately ---- */
+static size_t drf_rr(uint8_t *b, size_t off, const char *name, uint16_t type, uint16_t cls, uint32_t ttl, const uint8_t *rd, size_t rdlen) {
+    off += write_uncompressed_name(b, off, 512, name);
+    b[off++] = (uint8_t)(type >> 8); b[off++] = (uint8_t)type;
+    b[off++] = (uint8_t)(cls >> 8); b[off++] = (uint8_t)cls;
+    b[off++] = (uint8_t)(ttl >> 24); b[off++] = (uint8_t)(ttl >> 16); b[off++] = (uint8_t)(ttl >> 8); b[off++] = (uint8_t)ttl;
+    b[off++] = (uint8_t)(rdlen >> 8); b[off++] = (uint8_t)rdlen;
+    if (rdlen) memcpy(b + off, rd, rdlen);
+    return off + rdlen;
+}
+
+/* a NOERROR answer for dr.example. A with an RRSIG in the answer, an NSEC in the authority section and an OPT with the given RDATA / flags */
+static size_t drf_build(uint8_t *b, uint8_t sigbyte, const char *nsec_next, bool with_opt, uint16_t udp, uint8_t ext_rcode, uint16_t opt_flags,
+                        const uint8_t *opt_rd, size_t opt_rdlen) {
+    memset(b, 0, 512);
+    b[0] = 0x44; b[1] = 0x55; b[2] = 0x85; b[3] = 0x80;
+    b[5] = 1; b[7] = 2; b[9] = 1; b[11] = with_opt ? 1 : 0;
+    size_t off = 12;
+    off += write_uncompressed_name(b, off, 512, "dr.example.");
+    b[off++] = 0; b[off++] = 1; b[off++] = 0; b[off++] = 1;
+    const uint8_t a[4] = { 192, 0, 2, 1 };
+    off = drf_rr(b, off, "dr.example.", 1, 1, 300, a, 4);
+    uint8_t sig[18 + 1 + 8] = { 0, 1, 13, 2, 0, 0, 1, 0x2C, 0x66, 0, 0, 0, 0x65, 0, 0, 0, 0x12, 0x34, 0 };
+    memset(sig + 19, sigbyte, 8);                             /* the signer is the root, then 8 octets of signature */
+    off = drf_rr(b, off, "dr.example.", 46, 1, 300, sig, sizeof(sig));
+    uint8_t nsec[64];
+    size_t nl = write_uncompressed_name(nsec, 0, sizeof(nsec), nsec_next);
+    nsec[nl++] = 0; nsec[nl++] = 1; nsec[nl++] = 0x40;       /* window 0, one octet: A */
+    off = drf_rr(b, off, "dr.example.", 47, 1, 300, nsec, nl);
+    if (with_opt) {
+        b[off++] = 0;                                         /* root owner */
+        b[off++] = 0; b[off++] = 41;
+        b[off++] = (uint8_t)(udp >> 8); b[off++] = (uint8_t)udp;
+        b[off++] = ext_rcode; b[off++] = 0; b[off++] = (uint8_t)(opt_flags >> 8); b[off++] = (uint8_t)opt_flags;
+        b[off++] = (uint8_t)(opt_rdlen >> 8); b[off++] = (uint8_t)opt_rdlen;
+        if (opt_rdlen) memcpy(b + off, opt_rd, opt_rdlen);
+        off += opt_rdlen;
+    }
+    return off;
+}
+
+static uint32_t drf_diff(const uint8_t *r1, size_t l1, const uint8_t *r2, size_t l2) {
+    diff_result_t d;
+    memset(&d, 0, sizeof(d));
+    diff_dns_responses(r1, l1, r2, l2, false, &d);
+    return d.diff_flags;
+}
+
+static void test_dag_replay_diff_edns_and_dnssec(void) {
+    printf("[TEST] DAG Tools: diff_dns_responses EDNS options and DNSSEC records...\n");
+    uint8_t r1[512], r2[512];
+    size_t l1 = drf_build(r1, 0xAA, "next.example.", false, 0, 0, 0, NULL, 0);
+    size_t l2 = drf_build(r2, 0xAA, "next.example.", false, 0, 0, 0, NULL, 0);
+    assert(l1 == l2 && drf_diff(r1, l1, r2, l2) == 0);
+
+    l2 = drf_build(r2, 0xBB, "next.example.", false, 0, 0, 0, NULL, 0);                /* another signature */
+    uint32_t f = drf_diff(r1, l1, r2, l2);
+    assert((f & DIFF_DNSSEC_RRSIG) && (f & DIFF_ANSWER_RRSET));
+    f = drf_diff(r2, l2, r1, l1);
+    assert(f & DIFF_DNSSEC_RRSIG);                                                       /* the same the other way round */
+
+    l2 = drf_build(r2, 0xAA, "other.example.", false, 0, 0, 0, NULL, 0);               /* another NSEC next name */
+    f = drf_diff(r1, l1, r2, l2);
+    assert((f & DIFF_DNSSEC_NSEC) && (f & DIFF_AUTH_RRSET));
+    f = drf_diff(r2, l2, r1, l1);
+    assert(f & DIFF_DNSSEC_NSEC);
+
+    /* EDNS: ECS (family 1, source 24, scope 0, 3 address octets) */
+    const uint8_t ecs_a[] = { 0, 8, 0, 7, 0, 1, 24, 0, 192, 0, 2 };
+    const uint8_t ecs_b[] = { 0, 8, 0, 7, 0, 1, 24, 0, 198, 51, 100 };
+    const uint8_t ecs_c[] = { 0, 8, 0, 7, 0, 1, 20, 0, 192, 0, 2 };
+    const uint8_t cookie[] = { 0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8 };
+    const uint8_t other_a[] = { 0, 15, 0, 2, 0, 18 };                                    /* EDE */
+    const uint8_t other_b[] = { 0, 15, 0, 2, 0, 20 };
+    l1 = drf_build(r1, 0xAA, "next.example.", true, 1232, 0, 0x8000, ecs_a, sizeof(ecs_a));
+    l2 = drf_build(r2, 0xAA, "next.example.", true, 1232, 0, 0x8000, ecs_a, sizeof(ecs_a));
+    assert(drf_diff(r1, l1, r2, l2) == 0);
+    l2 = drf_build(r2, 0xAA, "next.example.", true, 1232, 0, 0x8000, ecs_b, sizeof(ecs_b));
+    assert(drf_diff(r1, l1, r2, l2) & DIFF_EDNS);                                        /* another client address */
+    l2 = drf_build(r2, 0xAA, "next.example.", true, 1232, 0, 0x8000, ecs_c, sizeof(ecs_c));
+    assert(drf_diff(r1, l1, r2, l2) & DIFF_EDNS);                                        /* another source prefix */
+    l2 = drf_build(r2, 0xAA, "next.example.", true, 1232, 0, 0x8000, cookie, sizeof(cookie));
+    assert(drf_diff(r1, l1, r2, l2) & DIFF_EDNS);                                        /* ECS against COOKIE */
+    l1 = drf_build(r1, 0xAA, "next.example.", true, 1232, 0, 0x8000, cookie, sizeof(cookie));
+    l2 = drf_build(r2, 0xAA, "next.example.", true, 1232, 0, 0x8000, NULL, 0);
+    assert(drf_diff(r1, l1, r2, l2) & DIFF_EDNS);                                        /* COOKIE against nothing */
+    l1 = drf_build(r1, 0xAA, "next.example.", true, 1232, 0, 0x8000, other_a, sizeof(other_a));
+    l2 = drf_build(r2, 0xAA, "next.example.", true, 1232, 0, 0x8000, other_b, sizeof(other_b));
+    assert(drf_diff(r1, l1, r2, l2) & DIFF_EDNS);                                        /* another option */
+    l2 = drf_build(r2, 0xAA, "next.example.", true, 4096, 0, 0x8000, other_a, sizeof(other_a));
+    assert(drf_diff(r1, l1, r2, l2) & DIFF_EDNS);                                        /* UDP payload size */
+    l2 = drf_build(r2, 0xAA, "next.example.", true, 1232, 0, 0x0000, other_a, sizeof(other_a));
+    assert(drf_diff(r1, l1, r2, l2) & DIFF_EDNS);                                        /* DO bit */
+    l2 = drf_build(r2, 0xAA, "next.example.", true, 1232, 1, 0x8000, other_a, sizeof(other_a));
+    f = drf_diff(r1, l1, r2, l2);
+    assert((f & DIFF_EDNS) && (f & DIFF_RCODE));                                         /* extended RCODE */
+    l2 = drf_build(r2, 0xAA, "next.example.", false, 0, 0, 0, NULL, 0);
+    assert(drf_diff(r1, l1, r2, l2) & DIFF_EDNS);                                        /* EDNS against none */
+    printf("  -> diff_dns_responses EDNS and DNSSEC passed.\n");
+}
 
 static void test_dag_replay_diff_flags_all_bits(void) {
     printf("[TEST] DAG Tools: diff_dns_responses testing all DIFF_* bitmasks...\n");
@@ -3688,6 +3851,8 @@ int main(void) {
     test_dag_transport_helpers();
     test_dag_internal_helpers();
     test_dag_replay_diff_flags_all_bits();
+    test_dag_replay_diff_edns_and_dnssec();
+    test_dnstap_other_wire_types();
     test_dag_replay_ignore_ttl_flag();
     test_dag_tsig_client_multiple_algorithms();
     test_dag_tsig_client_bad_base64_secret();

@@ -290,6 +290,46 @@ static void test_conninfo(void) {
     src.conninfo_file = dirp;
     CHECK(D->open(&c, &src, err, sizeof(err)) == -1);
     CHECK_HAS(err, "not a regular file");
+    /* an empty file, a file with a NUL byte, a file that is too large: refused before libpq sees anything */
+    snprintf(path, sizeof(path), "%s/ci_empty", g_dir);
+    write_file(path, "", 0600);
+    src.conninfo_file = path;
+    CHECK(D->open(&c, &src, err, sizeof(err)) == -1);
+    CHECK_HAS(err, "empty or larger than");
+    {
+        int fd = open(path, O_WRONLY | O_TRUNC);
+        if (fd >= 0) {
+            CHECK(write(fd, "host=a\0b\n", 9) == 9);
+            close(fd);
+        }
+        CHECK(D->open(&c, &src, err, sizeof(err)) == -1);
+        CHECK_HAS(err, "contains a NUL byte");
+        char *big = malloc(PG_CONNINFO_MAX + 10);
+        if (big) {
+            memset(big, 'x', PG_CONNINFO_MAX + 8);
+            big[PG_CONNINFO_MAX + 8] = '\0';
+            write_file(path, big, 0600);
+            CHECK(D->open(&c, &src, err, sizeof(err)) == -1);
+            CHECK_HAS(err, "empty or larger than");
+            free(big);
+        }
+    }
+    if (geteuid() == 0) {                       /* a file that another user owns (root only: nobody else can give a file away) */
+        write_file(path, "host=localhost\n", 0600);
+        CHECK(chown(path, 12345, 12345) == 0);
+        CHECK(D->open(&c, &src, err, sizeof(err)) == -1);
+        CHECK_HAS(err, "not owned by the user the loader runs as");
+    }
+    /* a schema name too long for the SET search_path statement */
+    {
+        char longname[600];
+        memset(longname, 's', sizeof(longname) - 1);
+        longname[sizeof(longname) - 1] = '\0';
+        write_ci(g_db);
+        db_source_t ls = { "postgresql", NULL, g_ci, longname, 0 };
+        CHECK(D->open(&c, &ls, err, sizeof(err)) == -1);
+        CHECK_HAS(err, "schema name is too long");
+    }
     /* a comment line, line ends as blanks, an option of our own that the user may override */
     write_ci(g_db);
     db_conn_t *ok = open_drv(NULL);
@@ -854,6 +894,172 @@ static void test_errors(void) {
     D->close(c);
 }
 
+/* ---- a table that disappears after the schema check, callbacks that stop a scan, a source without the optional tables ---- */
+static int pgc_zone(void *ud, const db_zone_row_t *z) { (void)ud; (void)z; return 0; }
+static int pgc_rec(void *ud, int64_t d, const db_record_row_t *r) { (void)ud; (void)d; (void)r; return 0; }
+static int pgc_meta(void *ud, const db_meta_row_t *m) { (void)ud; (void)m; return 0; }
+static int pgc_key(void *ud, int64_t id) { (void)ud; (void)id; return 0; }
+static int pgc_dv(void *ud, int64_t d, const char *v) { (void)ud; (void)d; (void)v; return 0; }
+static int pgc_prof(void *ud, const db_profile_row_t *p) { (void)ud; (void)p; return 0; }
+static int pgc_chg(void *ud, const db_change_row_t *r) { (void)ud; (void)r; return 0; }
+static int pgc_tags(void *ud, int64_t d, const db_tag_row_t *r) { (void)ud; (void)d; (void)r; return 0; }
+static int pgc_td(void *ud, int64_t d, const db_tinydns_row_t *r) { (void)ud; (void)d; (void)r; return 0; }
+static int pgc_def(void *ud, int64_t d, const db_tagdef_row_t *r) { (void)ud; (void)d; (void)r; return 0; }
+static int pgc_stop_dv(void *ud, int64_t d, const char *v) { (void)ud; (void)d; (void)v; return 1; }
+static int pgc_stop_prof(void *ud, const db_profile_row_t *p) { (void)ud; (void)p; return 1; }
+static int pgc_stop_meta(void *ud, const db_meta_row_t *m) { (void)ud; (void)m; return 1; }
+static int pgc_stop_key(void *ud, int64_t id) { (void)ud; (void)id; return 1; }
+static int pgc_stop_chg(void *ud, const db_change_row_t *r) { (void)ud; (void)r; return 1; }
+static int pgc_stop_tags(void *ud, int64_t d, const db_tag_row_t *r) { (void)ud; (void)d; (void)r; return 1; }
+static int pgc_stop_td(void *ud, int64_t d, const db_tinydns_row_t *r) { (void)ud; (void)d; (void)r; return 1; }
+static int pgc_stop_def(void *ud, int64_t d, const db_tagdef_row_t *r) { (void)ud; (void)d; (void)r; return 1; }
+
+static int pgr_zones(db_conn_t *c) { return D->list_zones(c, pgc_zone, NULL); }
+static int pgr_rec_all(db_conn_t *c) { return D->scan_records(c, NULL, pgc_rec, NULL); }
+static int pgr_rec_one(db_conn_t *c) { int64_t d = 1; return D->scan_records(c, &d, pgc_rec, NULL); }
+static int pgr_rec_rng(db_conn_t *c) { return D->scan_records_range(c, 1, 9, pgc_rec, NULL); }
+static int pgr_meta(db_conn_t *c) { return D->scan_metadata(c, NULL, pgc_meta, NULL); }
+static int pgr_keys(db_conn_t *c) { return D->zones_with_keys(c, pgc_key, NULL); }
+static int pgr_dv(db_conn_t *c) { return D->scan_domain_views(c, NULL, pgc_dv, NULL); }
+static int pgr_prof(db_conn_t *c) { return D->scan_profiles(c, pgc_prof, NULL); }
+static int pgr_chg(db_conn_t *c) { uint64_t last; bool gap; return D->changes_since(c, 0, pgc_chg, NULL, &last, &gap); }
+static int pgr_ext(db_conn_t *c) { db_ext_sink_t s = { pgc_tags, pgc_td, pgc_def, NULL }; return D->scan_ext(c, NULL, &s); }
+
+/* a schema of its own (the tables of g_db belong to the other cases) with a row in every table the driver reads */
+static void pg_scratch(const char *schema, bool with_ext) {
+    char path[500], sql[300];
+    snprintf(sql, sizeof(sql), "CREATE SCHEMA %s", schema);
+    Q(sql);
+    snprintf(sql, sizeof(sql), "SET search_path TO %s", schema);
+    Q(sql);
+    snprintf(path, sizeof(path), "%s/pdns_schema.pgsql.sql", g_root);
+    char *base = slurp(path);
+    CHECK(base != NULL);
+    if (base) Q(base);
+    free(base);
+    if (with_ext) {
+        snprintf(path, sizeof(path), "%s/../../db/karidns_ext.pgsql.sql", g_root);
+        char *ext = slurp(path);
+        CHECK(ext != NULL);
+        if (ext) Q(ext);
+        free(ext);
+    }
+    Q("INSERT INTO domains (id, name, type) VALUES (1, 's1.test', 'NATIVE'), (2, 's2.test', 'NATIVE')");
+    Q("INSERT INTO records (id, domain_id, name, type, content, ttl, prio, disabled, ordername) VALUES "
+      "(10, 1, 's1.test', 'SOA', 'ns1.s1.test h.s1.test 1 3600 600 86400 300', 3600, NULL, false, NULL),"
+      "(11, 1, 's1.test', 'NS', 'ns1.s1.test', 3600, NULL, false, NULL),"
+      "(12, 1, 'ns1.s1.test', 'A', '192.0.2.1', 300, NULL, false, NULL)");
+    Q("INSERT INTO domainmetadata (domain_id, kind, content) VALUES (1, 'ALSO-NOTIFY', '192.0.2.1')");
+    Q("INSERT INTO cryptokeys (domain_id, flags, active, content) VALUES (1, 257, true, 'x')");
+    if (with_ext) {
+        Q("INSERT INTO karidns_domain_views (domain_id, view_name) VALUES (1, 'va'), (2, 'vb')");
+        Q("INSERT INTO karidns_profiles (name, settings) VALUES ('p1', 'x'), ('p2', 'y')");
+        Q("INSERT INTO karidns_record_tags (record_id, location_tag, ecs_tag) VALUES (11, 'lan', 'east')");
+        Q("INSERT INTO karidns_record_tinydns (record_id, ttd, loc, countdown) VALUES (12, 100, 'l2', false)");
+        Q("INSERT INTO karidns_zone_tagdefs (domain_id, kind, tag, cidr) VALUES (1, 'location', 'a', '192.0.2.0/24')");
+    }
+    Q("RESET search_path");
+}
+
+static void test_scan_failures(void) {
+    printf("scans: a table that disappears after the schema check, callbacks that stop a scan, a source without the optional tables\n");
+    static const struct { const char *table; int (*run)(db_conn_t *); const char *what; } cases[] = {
+        { "domains",                pgr_zones,   "list_zones" },
+        { "records",                pgr_rec_all, "scan_records" },
+        { "records",                pgr_rec_one, "scan_records" },
+        { "records",                pgr_rec_rng, "scan_records" },
+        { "domainmetadata",         pgr_meta,    "scan_metadata" },
+        { "cryptokeys",             pgr_keys,    "zones_with_keys" },
+        { "karidns_domain_views",   pgr_dv,      "scan_domain_views" },
+        { "karidns_profiles",       pgr_prof,    "scan_profiles" },
+        { "karidns_changes",        pgr_chg,     "changes_since" },
+        { "karidns_record_tags",    pgr_ext,     "karidns_record_tags" },
+        { "karidns_record_tinydns", pgr_ext,     "karidns_record_tinydns" },
+        { "karidns_zone_tagdefs",   pgr_ext,     "karidns_zone_tagdefs" },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        pg_scratch("karidns_test_sf", true);
+        db_conn_t *c = open_drv("karidns_test_sf");
+        if (c) {
+            db_schema_info_t si;
+            CHECK(D->check_schema(c, &si) == 0 && si.has_ext && si.has_profiles && si.has_domain_views && si.has_changes);
+            CHECK(D->begin_snapshot(c) == 0);
+            CHECK_MSG(cases[i].run(c) == 0, "%s: the scan works before the table goes: %s", cases[i].what, D->errmsg(c));
+            CHECK(D->end_snapshot(c) == 0);
+            char sql[200];
+            snprintf(sql, sizeof(sql), "ALTER TABLE karidns_test_sf.%s RENAME TO %s_gone", cases[i].table, cases[i].table);
+            Q(sql);
+            CHECK(D->begin_snapshot(c) == 0);
+            int rc = cases[i].run(c);
+            CHECK_MSG(rc == -1, "%s: a statement that fails is an error, not DB_STOPPED / retry: %d", cases[i].what, rc);
+            CHECK_HAS(D->errmsg(c), cases[i].what);
+            D->end_snapshot(c);                   /* ends the aborted transaction too */
+            D->close(c);
+        }
+        Q("DROP SCHEMA karidns_test_sf CASCADE");
+    }
+
+    /* the callback of every scan can stop it: DB_STOPPED, and the next query on the connection works */
+    pg_scratch("karidns_test_sf", true);
+    db_conn_t *c = open_drv("karidns_test_sf");
+    if (c) {
+        db_schema_info_t si;
+        CHECK(D->check_schema(c, &si) == 0);
+        CHECK(D->begin_snapshot(c) == 0);
+        CHECK(D->scan_domain_views(c, NULL, pgc_stop_dv, NULL) == DB_STOPPED);
+        CHECK(D->scan_profiles(c, pgc_stop_prof, NULL) == DB_STOPPED);
+        CHECK(D->scan_metadata(c, NULL, pgc_stop_meta, NULL) == DB_STOPPED);
+        CHECK(D->zones_with_keys(c, pgc_stop_key, NULL) == DB_STOPPED);
+        {
+            uint64_t last = 0;
+            bool gap = false;
+            CHECK(D->changes_since(c, 0, pgc_stop_chg, NULL, &last, &gap) == DB_STOPPED);
+        }
+        {
+            db_ext_sink_t s1 = { pgc_stop_tags, pgc_td, pgc_def, NULL };
+            db_ext_sink_t s2 = { pgc_tags, pgc_stop_td, pgc_def, NULL };
+            db_ext_sink_t s3 = { pgc_tags, pgc_td, pgc_stop_def, NULL };
+            CHECK(D->scan_ext(c, NULL, &s1) == DB_STOPPED);
+            CHECK(D->scan_ext(c, NULL, &s2) == DB_STOPPED);
+            CHECK(D->scan_ext(c, NULL, &s3) == DB_STOPPED);
+        }
+        CHECK(pgr_dv(c) == 0 && pgr_prof(c) == 0 && pgr_meta(c) == 0 && pgr_keys(c) == 0 && pgr_ext(c) == 0);
+        D->end_snapshot(c);
+        D->close(c);
+    }
+    Q("DROP SCHEMA karidns_test_sf CASCADE");
+
+    /* a source without the optional tables: the scans of them say "unavailable" with the reason */
+    pg_scratch("karidns_test_sf", false);
+    c = open_drv("karidns_test_sf");
+    if (c) {
+        db_schema_info_t si;
+        CHECK(D->check_schema(c, &si) == 0 && !si.has_ext && !si.has_profiles && !si.has_domain_views && !si.has_changes);
+        CHECK(D->begin_snapshot(c) == 0);
+        CHECK(pgr_prof(c) == DB_ERR_UNAVAILABLE);
+        CHECK_HAS(D->errmsg(c), "karidns_profiles does not exist");
+        CHECK(pgr_dv(c) == DB_ERR_UNAVAILABLE);
+        CHECK_HAS(D->errmsg(c), "karidns_domain_views does not exist");
+        CHECK(pgr_chg(c) == DB_ERR_UNAVAILABLE);
+        CHECK_HAS(D->errmsg(c), "karidns_changes");
+        uint64_t seq = 0;
+        CHECK(D->changes_max(c, &seq) == DB_ERR_UNAVAILABLE);
+        CHECK(pgr_ext(c) == DB_ERR_UNAVAILABLE);
+        D->end_snapshot(c);
+        D->close(c);
+    }
+    Q("DROP SCHEMA karidns_test_sf CASCADE");
+
+    /* a schema that does not exist: the schema check says so (and the findings of karicheck db) */
+    c = open_drv("karidns_test_nosuchschema");
+    if (c) {
+        db_schema_info_t si;
+        CHECK(D->check_schema(c, &si) == -1);
+        CHECK_HAS(D->errmsg(c), "database-schema does not exist");
+        D->close(c);
+    }
+}
+
 /* ---- B11: reload requests and the status row ---- */
 typedef struct {
     int n;
@@ -1198,6 +1404,7 @@ int main(int argc, char **argv) {
     test_changes();
     test_notify();
     test_errors();
+    test_scan_failures();
     test_requests();
     test_status();
     test_v1_and_migration();

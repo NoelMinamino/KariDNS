@@ -1703,6 +1703,42 @@ static void test_b9a_alias_lua(void) {
     printf("  -> ALIAS / LUA parsing and zone rules passed.\n");
 }
 
+/* the message of a parse error, not only that there is one: parentheses, label length, tag definitions */
+static void test_error_messages(void) {
+    printf("[TEST] Zone parser: the message of each structural error...\n");
+    char lab64[80];
+    memset(lab64, 'a', 64);
+    strcpy(lab64 + 64, " A 192.0.2.1\n");
+    static const struct { const char *body; const char *needle; } cases[] = {
+        { "www A 192.0.2.1 ( (\n 192.0.2.1 ) )\n", "Nested parentheses" },
+        { "www A 192.0.2.1 )\n", "Unmatched ')'" },
+        { "www A ( 192.0.2.1\n", "Unbalanced parenthesis" },
+        { "www A 192.0.2.1 (", "Unbalanced parenthesis" },
+        { "$LOCATION-TAG office\n", "requires tag name and at least one CIDR" },
+        { "$ECS-SUBNET-TAG eu\n", "requires tag name and at least one CIDR" },
+        { "$INCLUDE\n", "requires a filename" },
+    };
+    for (size_t i = 0; i < N(cases); i++) {
+        char text[2048];
+        snprintf(text, sizeof(text), "%s%s", SOA_HEAD, cases[i].body);
+        zt_t z;
+        zt_load(&z, text);
+        if (z.rc >= 0 || !z.err.error_message || !strstr(z.err.error_message, cases[i].needle)) {
+            fprintf(stderr, "wrong result for: %s  (rc %d, message '%s', wanted '%s')\n", cases[i].body, z.rc,
+                    z.err.error_message ? z.err.error_message : "(none)", cases[i].needle);
+            assert(0);
+        }
+        zt_free(&z);
+    }
+    char text[2048];
+    snprintf(text, sizeof(text), "%s%s", SOA_HEAD, lab64);
+    zt_t z;
+    zt_load(&z, text);
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "label exceeds 63 octets"));
+    zt_free(&z);
+    printf("  -> error messages checked.\n");
+}
+
 int main(void) {
     printf("=== Starting Zone Parser Path Coverage Tests ===\n");
     test_x37_rdata_name_case();
@@ -1724,6 +1760,7 @@ int main(void) {
     test_field_mutations();
     test_origin_ttl_owner_syntax();
     test_syntax_errors();
+    test_error_messages();
     test_generate();
     test_generate_offset_range();
     test_include();

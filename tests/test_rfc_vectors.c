@@ -460,6 +460,87 @@ static void test_tsig_prewarm_and_all_algorithms(void) {
     printf("  -> TSIG pre-warm and per-algorithm sign/verify passed.\n");
 }
 
+/* RFC 8945 5.3: a response that cannot carry its TSIG becomes the question alone with TC=1 and NOERROR, signed */
+static size_t rv_put_name(uint8_t *p, const char *lab1, const char *lab2) {
+    size_t o = 0;
+    p[o++] = (uint8_t)strlen(lab1); memcpy(p + o, lab1, strlen(lab1)); o += strlen(lab1);
+    p[o++] = (uint8_t)strlen(lab2); memcpy(p + o, lab2, strlen(lab2)); o += strlen(lab2);
+    p[o++] = 0;
+    return o;
+}
+
+static void test_tsig_response_too_big_for_tsig(void) {
+    printf("[TEST] RFC vectors: RFC 8945 s5.3 response that does not fit its TSIG -> question only, TC=1, signed...\n");
+    tsig_key_t key = {0};
+    key.name = "resp-key.example.";
+    key.algorithm = "hmac-sha256";
+    key.secret_decoded_len = 32;
+    memset(key.secret_decoded, 0x5A, 32);
+
+    tsig_request_t t;
+    memset(&t, 0, sizeof(t));
+    t.status = TSIG_REQ_VALID;
+    t.key = &key;
+    t.mac_len = 32;
+    memset(t.mac, 0x11, 32);                          /* the MAC of the request the response answers */
+    t.time_signed = (uint64_t)time(NULL);
+    t.fudge = 300;
+
+    uint8_t res[4096];
+    memset(res, 0, sizeof(res));
+    res[0] = 0x12; res[1] = 0x34;
+    res[2] = 0x84;                                    /* QR AA */
+    res[5] = 1;                                       /* QDCOUNT */
+    size_t off = 12;
+    off += rv_put_name(res + off, "big", "test");
+    res[off++] = 0; res[off++] = 16; res[off++] = 0; res[off++] = 1;      /* TXT IN */
+    size_t qend = off;
+    for (int i = 0; i < 8; i++) {                     /* 8 TXT RRs of 255 octets: 2.2 KB */
+        res[off++] = 0xC0; res[off++] = 12;
+        res[off++] = 0; res[off++] = 16; res[off++] = 0; res[off++] = 1;
+        res[off++] = 0; res[off++] = 0; res[off++] = 0; res[off++] = 60;
+        res[off++] = 1; res[off++] = 0;               /* RDLENGTH 256 */
+        res[off++] = 255;
+        memset(res + off, 'a' + i, 255); off += 255;
+    }
+    res[7] = 8;                                       /* ANCOUNT */
+    size_t res_len = off;
+
+    int n = tsig_finish_response(res, res_len, 512, &t);
+    assert(n > (int)qend && n <= 512);
+    assert(res[2] & 0x02);                            /* TC */
+    assert((res[3] & 0x0F) == 0);                     /* NOERROR */
+    assert(res[4] == 0 && res[5] == 1);               /* the question is still there */
+    assert(res[6] == 0 && res[7] == 0 && res[8] == 0 && res[9] == 0);   /* no answer, no authority */
+    assert(res[10] == 0 && res[11] == 1);             /* the TSIG RR is the only additional record */
+    assert(packet_has_tsig(res, (size_t)n));
+    uint8_t vmac[64];
+    size_t vmac_len = 0;
+    assert(tsig_verify_packet(res, (size_t)n, &key, t.mac, t.mac_len, NULL, 0, false, vmac, &vmac_len) == 0);
+
+    /* when the response fits, it is signed as it is */
+    memset(res, 0, sizeof(res));
+    res[0] = 0x12; res[1] = 0x34; res[2] = 0x84; res[5] = 1;
+    off = 12;
+    off += rv_put_name(res + off, "big", "test");
+    res[off++] = 0; res[off++] = 1; res[off++] = 0; res[off++] = 1;
+    n = tsig_finish_response(res, off, 512, &t);
+    assert(n > (int)off && !(res[2] & 0x02) && res[11] == 1);
+    assert(tsig_verify_packet(res, (size_t)n, &key, t.mac, t.mac_len, NULL, 0, false, vmac, &vmac_len) == 0);
+
+    /* no key for a VALID request: nothing to sign with */
+    tsig_request_t nokey = t;
+    nokey.key = NULL;
+    assert(tsig_finish_response(res, off, 512, &nokey) == -1);
+
+    /* too big and the question cannot be read (RFC 1035 4.1.4: a label length that runs past the message) */
+    memset(res, 0, sizeof(res));
+    res[5] = 1;
+    res[12] = 63;                                     /* label of 63 octets, but the message ends first */
+    assert(tsig_finish_response(res, 20, 24, &t) == -1);
+    printf("  -> oversized response handled per RFC 8945 5.3.\n");
+}
+
 int main(void) {
     printf("=== Starting RFC Published-Vector Conformance Tests ===\n");
     test_siphash_reference_vectors();
@@ -468,6 +549,7 @@ int main(void) {
     test_cookie_config_directives();
     test_rfc4034_key_tag();
     test_tsig_prewarm_and_all_algorithms();
+    test_tsig_response_too_big_for_tsig();
     printf("=== All RFC Published-Vector Conformance Tests PASSED ===\n");
     return 0;
 }

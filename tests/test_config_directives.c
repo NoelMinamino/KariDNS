@@ -2253,6 +2253,146 @@ static void test_alias_resolver_option(void) {
     expect_db_reject("alias-resolver { example.test; };", NULL);
 }
 
+/* refusals that free what was built so far, values that are ignored with a warning, the size limit of a settings text */
+static void test_refusals_and_limits(void) {
+    printf("[TEST] config: refusals, ignored values, settings text limit...\n");
+    server_config_t cfg;
+    expect_reject("zone name with an empty label", "zone \"a..b\" { type master; file \"z\"; };");
+    expect_reject("zone name with a bad escape", "zone \"a\\999.test\" { type master; file \"z\"; };");
+    /* rate-limit values that are not numbers are ignored (the option keeps its default); the parse goes on */
+    if (parse_ok("zone \"r.test\" { type master; file \"z\"; rate-limit { responses-per-second 20; nodata-per-second abc; "
+                 "nxdomains-per-second abc; errors-per-second abc; referrals-per-second abc; all-per-second abc; }; };", &cfg)) {
+        const zone_config_t *z = first_zone(&cfg);
+        CHECK(z != NULL);
+        if (z) {
+            const rate_limit_config_t *r = &zext(z)->rrl;
+            CHECK(r->configured && r->responses_per_second == 20);
+            CHECK(!r->nodata_per_second_set && !r->referrals_per_second_set);
+            CHECK(r->nodata_per_second == 20);
+        }
+        free_server_config_fields(&cfg);
+    }
+    /* a negated block with separate "!" tokens inside */
+    if (parse_ok("zone \"n.test\" { type master; file \"z\"; allow-transfer { !{ ! 192.0.2.1; ! any; 198.51.100.0/24; }; }; };", &cfg)) {
+        const zone_config_t *z = first_zone(&cfg);
+        CHECK(z != NULL);
+        if (z) CHECK_MSG(zext(z)->allow_transfer_count == 2, "%d entries", zext(z)->allow_transfer_count);
+        free_server_config_fields(&cfg);
+    }
+    /* the text of a database zone: at most 262144 bytes, no empty key name */
+    char err[200];
+    size_t big = 262144 + 1;
+    char *txt = malloc(big + 1);
+    memset(txt, ' ', big);
+    txt[big] = '\0';
+    zone_ext_shared_t *sh = db_settings_parse(txt, big, err, sizeof(err));
+    CHECK(sh == NULL);
+    CHECK_STR(err, "settings text is too long");
+    free(txt);
+    expect_db_reject("allow-transfer { 192.0.2.1; key \"\"; };", "empty key name");
+    expect_db_reject("tsig-key \"\";", "tsig-key");
+}
+
+/* a statement is closed by a semicolon (named.conf syntax): none of these may be taken without it, and a value of the wrong kind is refused
+ * too; the parser frees what it built so far on each of these paths (run under ASan to see that) */
+static void test_statements_need_a_semicolon(void) {
+    printf("[TEST] config: a statement without its semicolon, a value of the wrong kind...\n");
+    static const char *const bad[] = {
+        "options { port 5300 };",
+        "options { udp-bufsize 1232 };",
+        "options { tcp-idle-timeout 10 };",
+        "options { min-table-size 10 };",
+        "options { max-table-size 100 };",
+        "options { response-cache-size 1000 };",
+        "options { nsid \"x\" };",
+        "options { pid-file \"/tmp/x.pid\" };",
+        "options { user \"x\" };",
+        "options { group \"x\" };",
+        "options { minimal-any yes };",
+        "options { minimal-responses yes };",
+        "options { ecs-enable yes };",
+        "options { send-extended-errors yes };",
+        "options { serve-stale yes };",
+        "options { tcp-connection-reuse yes };",
+        "options { notify-retries 3 };",
+        "options { notify-retry-interval 10 };",
+        "options { notify-source 192.0.2.1 };",
+        "options { query-log-buffer-size 1000 };",
+        "options { query-log-max-qps 5 };",
+        "options { ixfr-history 5 };",
+        "options { cookie-secret \"x\" };",
+        "options { cookie-algorithm siphash24 };",
+        "options { qps-scale 4 };",
+        "options { wire-cache-max-records 5 };",
+        "options { max-mqtypes 3 };",
+        "options { rfc10029-mqtype yes };",
+        "options { allow-program-zones yes };",
+        "options { tcp-mss 1200 };",
+        "options { tcp-window 5000 };",
+        "options { tcp-initial-timeout 5 };",
+        "options { udp-recvbuf-size 1000 };",
+        "options { udp-sndbuf-size 1000 };",
+        "options { bind-address { 192.0.2.1 } };",
+        "options { additional-from-auth yes };",
+        "options { database { driver sqlite3 } };",
+        "options { database { database-file \"x\" } };",
+        "options { database { poll-interval 5 } };",
+        "options { database { auto-reload yes } };",
+        "options { database { coalesce 5 } };",
+        "options { database { loader-threads 2 } };",
+        "options { database { ingest-threads 2 } };",
+        "options { database { db-reload-timeout 5 } };",
+        "options { database { bulk-threshold 5 } };",
+        "options { database { max-zone-records 5 } };",
+        "options { database { max-zone-bytes 100000 } };",
+        "options { database { default-ttl 5 } };",
+        "options { database { server-id \"x\" } };",
+        "options { database { loader-user \"x\" } };",
+        "options { database { loader-path \"x\" } };",
+        "options { database { schema \"x\" } };",
+        "options { database { conninfo-file \"x\" } };",
+        "zone \"z.test\" { type master; file \"z\" };",
+        "zone \"z.test\" { type master; file \"z\"; also-notify { 192.0.2.1 } };",
+        "zone \"z.test\" { type master; file \"z\"; notify-source 192.0.2.1 };",
+        "zone \"z.test\" { type master; file \"z\"; forward-timeout 5 };",
+        "zone \"z.test\" { type master; file \"z\"; additional-from-auth yes };",
+        "zone \"z.test\" { type master; file \"z\"; additional-from-auth maybe; };",
+        "zone \"z.test\" { type master; file \"z\"; disable-auto-tc-flag yes };",
+        "zone \"z.test\" { type master; file \"z\"; disable-auto-tc-flag maybe; };",
+        "zone \"z.test\" { type master; file \"z\"; primary-settings yes };",
+        "zone \"z.test\" { type master; file \"z\"; primary-settings maybe; };",
+        "zone \"z.test\" { type master; file \"z\"; minimal-any yes };",
+        "zone \"z.test\" { type master; file \"z\"; ecs-enable yes };",
+        "zone \"z.test\" { type master; file \"z\"; send-extended-errors yes };",
+        "zone \"z.test\" { type master; file \"z\"; serve-stale yes };",
+        "zone \"z.test\" { type master; file \"z\"; ixfr-history 5 };",
+        "zone \"z.test\" { type master; file \"z\"; notify-retries 3 };",
+        "zone \"z.test\" { type master; file \"z\"; notify-retry-interval 10 };",
+        "zone \"z.test\" { type master; file \"z\"; masters { 192.0.2.1 } };",
+        "zone \"z.test\" { type master; file \"z\"; allow-update { 192.0.2.1 } };",
+        "zone \"z.test\" { type master; file \"z\"; allow-transfer { 192.0.2.1 } };",
+        "zone \"z.test\" { type master; file \"z\"; ecs-trusted-resolvers { 192.0.2.1 } };",
+        "zone \"z.test\" { type master; file \"z\"; rate-limit { slip 5 } };",
+        "zone \"z.test\" { type master; file \"z\"; rate-limit { slip 5; }; extra };",
+        "zone \"z.test\" { type master; file \"z\"; zone-tcp-mss 1200 };",
+        "zone \"z.test\" { type master; file \"z\"; zone-tcp-window 1200 };",
+        "zone \"z.test\" { type master; file \"z\"; zone-udp-bufsize 1200 };",
+        "zone \"z.test\" { type master; file \"z\"; zone-tcp-sndbuf 1200 };",
+        "zone \"z.test\" { type master; file \"z\"; transfer-acl-match all };",
+        "zone \"z.test\" { type master; file \"z\"; update-acl-match all };",
+        "zone \"z.test\" { type master; file \"z\"; file-format \"tinydns\" };",
+        "zone \"z.test\" { type master; file \"z\"; catalog-zone yes };",
+        "zone \"z.test\" { type program; program \"x\" };",
+        "zone \"z.test\" { type program; program \"x\"; program-user \"x\" };",
+        "zone \"z.test\" { type program; program \"x\"; program-timeout 5 };",
+        "zone \"z.test\" { type program; program \"x\"; program-max-failures 5 };",
+        "zone \"z.test\" { type program; program \"x\"; program-args { \"a\" } };",
+        "zone \"z.test\" { type forward; forwarders { 192.0.2.1 } };",
+        "zone \"z.test\" { type forward; forwarders { 192.0.2.1; }; forward-timeout 5 };",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) expect_reject("missing semicolon or bad value", bad[i]);
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
     test_defaults();
@@ -2290,6 +2430,8 @@ int main(void) {
     test_db_settings_and_acl_match();
     test_db_ecs_trusted();
     test_acl_ceiling_match_and_masters();
+    test_refusals_and_limits();
+    test_statements_need_a_semicolon();
 
     printf("[*] %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) {
