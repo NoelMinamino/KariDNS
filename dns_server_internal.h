@@ -193,7 +193,18 @@ typedef struct {
   int soa_count;
   uint32_t initial_soa_serial;
   uint32_t client_serial;
-  char initial_soa_name[256];
+  /* I1 (RFC 1995 §4): the serial the next deletion sequence must start from: the client's serial for the first
+   * sequence, then the serial of the SOA that ended the previous (addition) sequence */
+  uint32_t ixfr_expected_serial;
+  bool ixfr_bad_sequence;   /* the IXFR did not start from our serial or the sequences did not chain: ask for an AXFR */
+  /* I2: the limits of one inbound transfer (0 = none; xfr_attempt() sets them from the zone / options): the RRs of the
+   * zone being built and the octets of the messages read (the unsigned messages kept for TSIG are among them) */
+  uint64_t max_records;
+  uint64_t max_bytes;
+  uint64_t tagdef_cidrs;    /* I3: CIDRs read in LOC_TAGDEF / ECS_TAGDEF records so far (XFR_TAGDEF_CIDR_MAX) */
+  int loc_tagdef_cap, ecs_tagdef_cap; /* I3: the capacity of the builder's tag arrays (unpack_tag_def_rdata() grows them geometrically) */
+  /* I4: an escaped apex name can take up to DNS_NAME_TEXT_SIZE - 1 characters in text form */
+  char initial_soa_name[DNS_NAME_TEXT_SIZE];
   bool is_extended_mode;
   bool has_expire;        /* RFC 7314: 最初の応答に付いていた EXPIRE の値 */
   uint32_t expire;

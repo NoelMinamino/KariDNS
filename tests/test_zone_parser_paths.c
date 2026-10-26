@@ -1403,16 +1403,59 @@ static void test_mldsa44_large_blobs(void) {
         zt_free(&z);
     }
 
-    /* Only a trailing base64/hex value is joined: a TXT with more strings than MAX_RDATA is still rejected. */
-    static char txt[4096];
-    snprintf(txt, sizeof(txt), "%st1 TXT", SOA_HEAD);
-    for (int i = 0; i < MAX_RDATA + 1; i++) strcat(txt, " x");
-    strcat(txt, "\n");
-    zt_t z;
-    zt_load(&z, txt);
-    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "MAX_RDATA"));
-    zt_free(&z);
+    /* Only a trailing base64/hex value is joined.  I5: a TXT with more strings than MAX_RDATA is not refused (RFC 1035 §3.3.14:
+     * "one or more <character-string>s", no limit on the count) but kept as its RDATA octets, like a TXT with a NUL. */
     printf("  -> ML-DSA-44 DNSKEY/RRSIG serialize to the exact 1312/2420-octet values.\n");
+}
+
+static void test_i5_txt_many_strings(void) {
+    printf("[TEST] I5: TXT / SPF / AVC with more character-strings than MAX_RDATA are kept as they are...\n");
+    static const struct { const char *type; uint16_t code; } kinds[] = { { "TXT", 16 }, { "SPF", 99 }, { "AVC", 258 }, { "NINFO", 56 } };
+    static const int counts[] = { MAX_RDATA, MAX_RDATA + 1, 60, 200 };
+    for (size_t t = 0; t < N(kinds); t++) {
+        for (size_t c = 0; c < N(counts); c++) {
+            static char txt[8192];
+            static uint8_t want[8192], wire[16384];
+            size_t wl = 0;
+            snprintf(txt, sizeof(txt), "%st1 %s", SOA_HEAD, kinds[t].type);
+            for (int i = 0; i < counts[c]; i++) {
+                char s[32];
+                snprintf(s, sizeof(s), "s%d\\032\\\"q", i);                /* an escape and a quote inside the string */
+                strcat(txt, " \"");
+                strcat(txt, s);
+                strcat(txt, "\"");
+                int n = snprintf((char *)want + wl + 1, 32, "s%d \"q", i);
+                want[wl] = (uint8_t)n;
+                wl += 1 + (size_t)n;
+            }
+            strcat(txt, "\n");
+            zt_t z;
+            zt_load(&z, txt);
+            ASSERT_PARSED(&z);
+            dns_record_t *r = zt_find(&z, "t1.example.", kinds[t].code);
+            assert(r);
+            const uint8_t *rd;
+            size_t rdlen;
+            assert(ser_rdata(r, wire, sizeof(wire), &rd, &rdlen) == 0);
+            assert(rdlen == wl && memcmp(rd, want, wl) == 0);
+            if (counts[c] > MAX_RDATA) assert(r->generic_data && r->rdata_count == 0);   /* kept as the RDATA octets */
+            zt_free(&z);
+        }
+    }
+    /* the same RR as the RFC 3597 generic form still works, and a TXT whose RDATA cannot fit 65535 octets is refused */
+    static char big[80000];
+    snprintf(big, sizeof(big), "%st1 TXT", SOA_HEAD);
+    for (int i = 0; i < 300; i++) {
+        strcat(big, " \"");
+        for (int k = 0; k < 250; k++) strcat(big, "a");
+        strcat(big, "\"");
+    }
+    strcat(big, "\n");
+    zt_t z;
+    zt_load(&z, big);
+    assert(z.rc < 0);                                                        /* 300 * 251 = 75300 octets */
+    zt_free(&z);
+    printf("  -> I5 passed.\n");
 }
 
 static void test_d08_readme_types(void) {
@@ -1747,6 +1790,7 @@ int main(void) {
     test_x16_x25_compare_records();
     test_d08_readme_types();
     test_mldsa44_large_blobs();
+    test_i5_txt_many_strings();
     test_r22_mnemonics_and_classes();
     test_r22_omitted_ttl();
     test_r22_relative_origin();

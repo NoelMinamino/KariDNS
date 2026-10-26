@@ -654,6 +654,14 @@ typedef struct {
  * Version 3 may also carry one SETTINGS record after the opening SOA (or SOA_SET). */
 #define KARIDNS_SETTINGS_MAX            32768u
 #define KARIDNS_SOA_SET_MAX             4096u   /* the most apex SOA RRs one zone may have (the limit of the tinydns data parser's locations) */
+/* I3: the most LOC_TAGDEF / ECS_TAGDEF records (each one definition) one transferred zone may carry, and the most CIDRs in all of
+ * them (the style of the TINYDNS_LOCDEF limit, 4096 = the tinydns data parser's).  Enforced by parse_xfr_packet() on AXFR-in and on
+ * the database loader's stream. */
+#define XFR_TAGDEF_MAX                  4096
+#define XFR_TAGDEF_CIDR_MAX             65536u
+/* I2 (RFC 8945 §5.3.1): a TSIG-verifying client MUST accept up to 99 unsigned messages between two signed ones; more means the
+ * primary does not sign often enough and the transfer is given up. */
+#define XFR_TSIG_UNSIGNED_MAX           99
 typedef int (*xext_emit_fn)(void *ud, const dns_record_t *rec);   /* write one RR into the message stream; < 0 = failure */
 
 typedef struct {

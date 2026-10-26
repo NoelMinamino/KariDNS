@@ -154,7 +154,7 @@ static void test_tag_def_pack_unpack(void) {
     // Unpack
     ecs_tag_def_t *unpacked_defs = NULL;
     int unpacked_count = 0;
-    bool ok = unpack_tag_def_rdata(buf, packed_len, &unpacked_defs, &unpacked_count);
+    bool ok = unpack_tag_def_rdata(buf, packed_len, &unpacked_defs, &unpacked_count, NULL);
     assert(ok == true);
     assert(unpacked_count == 1);
     assert(strcmp(unpacked_defs[0].tag, "tokyo") == 0);
@@ -177,8 +177,8 @@ static void test_tag_def_pack_unpack(void) {
     // Unpack truncated / invalid
     unpacked_defs = NULL;
     unpacked_count = 0;
-    assert(unpack_tag_def_rdata(NULL, 0, &unpacked_defs, &unpacked_count) == false);
-    assert(unpack_tag_def_rdata(buf, 2, &unpacked_defs, &unpacked_count) == false);
+    assert(unpack_tag_def_rdata(NULL, 0, &unpacked_defs, &unpacked_count, NULL) == false);
+    assert(unpack_tag_def_rdata(buf, 2, &unpacked_defs, &unpacked_count, NULL) == false);
 
     printf("  -> Tag def pack/unpack passed.\n");
 }

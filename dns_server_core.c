@@ -508,8 +508,22 @@ static void resolve_log_owner(uid_t *uid, gid_t *gid) {
   }
 }
 
-/* root起動時: ログファイルの親ディレクトリを(無ければ)作成し、
- * target_uid が指定されていればその所有者へ変更する。 */
+/* root起動時: ログファイルの親ディレクトリが無ければ作成し、このとき作ったディレクトリだけを
+ * target_uid の所有にする。既にあるディレクトリの所有者は変えない (P2: 運用者が用意した
+ * ディレクトリを root 権限で実行ユーザーのものにしない。BIND と同じく、既存のディレクトリは
+ * 運用者が実行ユーザーが書ける状態にしておく。docs/karidns.md "logging")。 */
+/* The directories this process created (startup opens the logs first and hands them over later, hand_off_logging_channels():
+ * the second call finds the directory there and must still know that it made it). */
+#define LOG_DIRS_CREATED_MAX 64
+static char g_log_dirs_created[LOG_DIRS_CREATED_MAX][PATH_MAX];
+static int g_log_dirs_created_n;
+
+static bool log_dir_was_created(const char *dir) {
+  for (int i = 0; i < g_log_dirs_created_n; i++)
+    if (strcmp(g_log_dirs_created[i], dir) == 0) return true;
+  return false;
+}
+
 static void prepare_log_dir(const char *file_path, uid_t target_uid, gid_t target_gid) {
   if (geteuid() != 0)
     return;
@@ -538,17 +552,16 @@ static void prepare_log_dir(const char *file_path, uid_t target_uid, gid_t targe
         leaf = leaf_buf;
       }
       if (pfd >= 0 && leaf) {
-        if (mkdirat(pfd, leaf, 0755) != 0 && errno != EEXIST) {
-          /* 作成失敗時もopenatへフォールスルーし、既存の可能性を試す */
-        }
+        /* P2: only a directory this call made is handed to the run user; an existing one (EEXIST, or a
+         * failure that openat below then explains) keeps its owner */
+        bool created = mkdirat(pfd, leaf, 0755) == 0;
+        if (created && g_log_dirs_created_n < LOG_DIRS_CREATED_MAX && strlen(dirbuf) < PATH_MAX)
+          strcpy(g_log_dirs_created[g_log_dirs_created_n++], dirbuf);
+        bool mine = created || log_dir_was_created(dirbuf);
         int ddfd = openat(pfd, leaf, O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_RDONLY);
         if (ddfd >= 0) {
-          if (target_uid != (uid_t)-1 &&
-              strcmp(dirbuf, "/var") != 0 &&
-              strcmp(dirbuf, "/var/log") != 0 && strcmp(dirbuf, "/tmp") != 0 &&
-              strcmp(dirbuf, "/etc") != 0) {
+          if (mine && target_uid != (uid_t)-1)
             fchown(ddfd, target_uid, target_gid);
-          }
           close(ddfd);
         }
         close(pfd);
@@ -564,12 +577,44 @@ static void prepare_log_dir(const char *file_path, uid_t target_uid, gid_t targe
  * pid file / 制御ソケットのディレクトリ検証 (ensure_priv_dir_safe) の後に
  * hand_off_logging_channels() で行う (ログと pid file が同じディレクトリの
  * 場合、先に実行ユーザーへ chown すると検証が失敗するため)。 */
+/* P3: a log file that was just opened (O_CREAT | O_APPEND, through the directory fd) is written to, and as root
+ * handed to the run user with fchown().  Only a plain file with one link whose owner is root, the user karidns runs
+ * as now, or the run user it will drop to is accepted: a hard link planted at the log path would otherwise let the
+ * file it points to be appended to and handed over.  Returns the file's size, or -1 (logged) when it is refused. */
+static off_t log_file_accept(int fd, const char *path, uid_t target_uid) {
+  struct stat st;
+  const char *why = NULL;
+  char detail[96] = "";
+  if (fstat(fd, &st) != 0) {
+    snprintf(detail, sizeof(detail), "fstat: %s", strerror(errno));
+    why = detail;
+  } else if (!S_ISREG(st.st_mode)) {
+    why = "not a regular file";
+  } else if (st.st_nlink != 1) {
+    snprintf(detail, sizeof(detail), "it has %u links (a hard link?)", (unsigned)st.st_nlink);
+    why = detail;
+  } else if (st.st_uid != 0 && st.st_uid != geteuid() && (target_uid == (uid_t)-1 || st.st_uid != target_uid)) {
+    snprintf(detail, sizeof(detail), "owned by uid %u, neither root nor the user karidns runs as", (unsigned)st.st_uid);
+    why = detail;
+  }
+  if (why) {
+    syslog(LOG_ERR, "[Logging] Refusing to use log file '%s': %s", path, why);
+    fprintf(stderr, "[ERROR] [Logging] Refusing to use log file '%s': %s\n", path, why);
+    return -1;
+  }
+  return st.st_size;
+}
+
 bool init_logging_channels_ex(server_config_t *cfg, bool hand_off) {
   bool ok = true;
   uid_t target_uid = (uid_t)-1;
   gid_t target_gid = (gid_t)-1;
-  if (hand_off)
-    resolve_log_owner(&target_uid, &target_gid);
+  uid_t run_uid, run_gid;
+  resolve_log_owner(&run_uid, &run_gid);   /* the run user: the owner of a log file from an earlier start (P3) */
+  if (hand_off) {
+    target_uid = run_uid;
+    target_gid = run_gid;
+  }
 
   log_channel_t *ch = cfg->logging.channels;
   while (ch) {
@@ -579,12 +624,17 @@ bool init_logging_channels_ex(server_config_t *cfg, bool hand_off) {
       ch->fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_CREAT | O_APPEND,
                                   0644, true);
       if (ch->fd >= 0) {
-        if (geteuid() == 0 && target_uid != (uid_t)-1) {
-          fchown(ch->fd, target_uid, target_gid);
+        off_t size = log_file_accept(ch->fd, ch->file_path, run_uid);
+        if (size < 0) {
+          close(ch->fd);
+          ch->fd = -1;
+          ok = false;
+        } else {
+          if (geteuid() == 0 && target_uid != (uid_t)-1) {
+            fchown(ch->fd, target_uid, target_gid);
+          }
+          ch->current_size = size;
         }
-        struct stat st;
-        if (fstat(ch->fd, &st) == 0)
-          ch->current_size = st.st_size;
       } else {
         int open_errno = errno;
         const char *hint = (open_errno == EACCES || open_errno == EPERM || open_errno == EROFS)
@@ -623,7 +673,9 @@ void hand_off_logging_channels(server_config_t *cfg) {
     if (!ch->file_path || ch->fd < 0)
       continue;
     prepare_log_dir(ch->file_path, target_uid, target_gid);
-    fchown(ch->fd, target_uid, target_gid);
+    /* P3: the file was accepted when it was opened; a link added since would make the chown reach another name */
+    if (log_file_accept(ch->fd, ch->file_path, target_uid) >= 0)
+      fchown(ch->fd, target_uid, target_gid);
   }
 }
 
@@ -830,9 +882,13 @@ void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct t
         if (!rotate_rename_failed || (reopen_flags & O_TRUNC)) {
             if (old_fd >= 0) close(old_fd);
             ch->fd = open_via_dir_cache(ch->file_path, reopen_flags, 0644, true);
+            off_t size = ch->fd >= 0 ? log_file_accept(ch->fd, ch->file_path, (uid_t)-1) : -1;   /* P3 */
+            if (ch->fd >= 0 && size < 0) {
+                close(ch->fd);
+                ch->fd = -1;
+            }
             if (ch->fd >= 0) {
-                struct stat st;
-                ch->current_size = (fstat(ch->fd, &st) == 0) ? st.st_size : 0;
+                ch->current_size = size;
                 ch->current_date = today;
             } else {
                 syslog(LOG_ERR, "[Logging] Failed to reopen log file '%s' after rotation: %m", ch->file_path);
@@ -847,9 +903,13 @@ void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct t
             } else {
                 ch->fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_APPEND, 0644, true);
                 if (ch->fd >= 0) {
-                    struct stat st;
-                    if (fstat(ch->fd, &st) == 0)
-                        ch->current_size = st.st_size;
+                    off_t size = log_file_accept(ch->fd, ch->file_path, (uid_t)-1);   /* P3 */
+                    if (size < 0) {
+                        close(ch->fd);
+                        ch->fd = -1;
+                    } else {
+                        ch->current_size = size;
+                    }
                 }
             }
         }
@@ -2756,6 +2816,10 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
     snprintf(res.detail, sizeof(res.detail), "running as root but the configuration has no 'user' in options{}");
     return res;
   }
+  /* P4 is not checked here: the Backend runs in capability mode and cannot resolve names (getpwnam() would open the user
+   * database and trap).  user / group, loader-user / loader-group and the program-user of a program zone take effect only
+   * after a restart (the plugins are started at startup, the identities are resolved then); the start refuses a root one
+   * (resolve_run_identity(), validate_program_zone_users()) and karicheck conf shows it before. */
   if (!init_logging_channels(standby)) {
     syslog(LOG_ERR, "[Config] Reload rejected: one or more log files could not be opened; "
                     "keeping the current configuration.");
@@ -3731,6 +3795,7 @@ void *control_thread_func(void *arg) {
                                     bg_ctx->snap = snap;
                                     retain_zone_snapshot(snap);
                                     bg_ctx->tcp_opts = xfr_tcp_sockopts(active, slave_zcfg);
+                                    xfr_zone_limits(active, slave_zcfg, &bg_ctx->max_records, &bg_ctx->max_bytes); /* I2 */
                                     
                                     /* [H-4] config ポインタをそのまま渡すと UAF になるため、
                                      * TSIG キーのデータをスレッド起動前に bg_ctx へ値コピーする。*/
@@ -4814,7 +4879,7 @@ STATIC_TEST bool preflight_writable_path(const char *path, const char *what, boo
  * 継承) が実行ユーザーと異なると、プラグイン子プロセスは setuid できず
  * 応答不能のまま動き続けてしまう。起動前に検出して起動を中止する。 */
 STATIC_TEST bool validate_program_zone_users(server_config_t *cfg) {
-  if (!cfg || geteuid() == 0)
+  if (!cfg)
     return true;
   for (view_config_t *v = cfg->views; v; v = v->next) {
     for (zone_config_t *z = v->zones; z; z = z->next) {
@@ -4823,6 +4888,16 @@ STATIC_TEST bool validate_program_zone_users(server_config_t *cfg) {
       uid_t puid;
       gid_t pgid;
       bool found = lookup_user_ids(zext(z)->program_user, &puid, &pgid);
+      /* P4: a program-user that is root by another name (uid 0, or the root group as its primary group) is refused,
+       * as a start as root with no program-user is not run either (spawn_one_program_plugin()) */
+      char id_err[256];
+      if (identity_names_root(zext(z)->program_user, NULL, id_err, sizeof(id_err))) {
+        syslog(LOG_ERR, "[Config] Refusing: zone '%s': program-user: %s", z->domain, id_err);
+        fprintf(stderr, "[ERROR] Refusing: zone '%s': program-user: %s\n", z->domain, id_err);
+        return false;
+      }
+      if (geteuid() == 0)
+        continue;
       if (found && puid == geteuid() && puid == getuid())
         continue;
       syslog(LOG_ERR, "[Config] Refusing to start: zone '%s': program-user '%s' %s; a non-root "

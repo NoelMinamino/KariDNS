@@ -33,7 +33,10 @@
 #include <sys/uio.h>
 #include <sys/wait.h>
 
+#include <pwd.h>
 #include "../dns_db_supervisor.h"
+#include "../dns_priv_sandbox.h"
+#include "../dns_utils.h"
 
 /* what dns_priv_sandbox.c and dns_utils.c take from the server (dns_server_core.c, dns_dnstap.c, dns_wire.c, dns_snapshot_rcu.c): not used here */
 char g_startup_cwd[PATH_MAX];
@@ -77,7 +80,7 @@ static void make_cfg(server_config_t *cfg, const char *path) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->database.enabled = true;
     cfg->database.loader_path = (char *)path;
-    cfg->database.loader_user = geteuid() == 0 ? (char *)"root" : NULL;
+    cfg->database.loader_user = geteuid() == 0 ? (char *)"nobody" : NULL;   /* P4: root by name is refused */
 }
 
 /* reap the loader: the status of the child the supervisor started */
@@ -137,7 +140,10 @@ static void test_init(void) {
         cfg.database.loader_user = NULL;
         CHECK(!db_sup_init(&s, &cfg, err, sizeof(err)));
         CHECK_HAS(err, "loader-user");
-        cfg.database.loader_group = (char *)getgrgid(0)->gr_name;                      /* a group alone would leave the loader root */
+        cfg.database.loader_group = (char *)getgrgid(0)->gr_name;                      /* P4: the root group is refused by name */
+        CHECK(!db_sup_init(&s, &cfg, err, sizeof(err)));
+        CHECK_HAS(err, "is gid 0");
+        cfg.database.loader_group = (char *)"nobody";                                  /* a group alone would leave the loader root */
         CHECK(!db_sup_init(&s, &cfg, err, sizeof(err)));
         CHECK_HAS(err, "loader-group without loader-user");
     } else {
@@ -275,6 +281,122 @@ static void test_spawn_and_restart(void) {
     unlink(path);
 }
 
+/* P5 (a checked file is the file that runs), P1 (a file that fails the checks is not executed), P4 (root by another name) */
+static bool copy_file(const char *from, const char *to, mode_t mode) {
+    FILE *in = fopen(from, "rb"), *out = fopen(to, "wb");
+    bool ok = in && out;
+    char buf[8192];
+    size_t n;
+    while (ok && (n = fread(buf, 1, sizeof(buf), in)) > 0) ok = fwrite(buf, 1, n, out) == n;
+    if (in) fclose(in);
+    if (out && fclose(out) != 0) ok = false;
+    if (ok) chmod(to, mode);
+    return ok;
+}
+
+static int run_fd(int fd, const char *path) {   /* execute through exec_file_exec_fd() in a child; the exit status */
+    pid_t pid = fork();
+    if (pid == 0) {
+        char *argv[] = { (char *)"prog", NULL };
+        char *envp[] = { NULL };
+        exec_file_exec_fd(fd, path, argv, envp);
+        _exit(99);
+    }
+    int st = reap(pid);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+static void test_exec_file(void) {
+    printf("exec_file_open_checked / exec_file_exec_fd (P1, P5)\n");
+    char err[300], path[400], old[400];
+    uid_t me = geteuid();
+    snprintf(path, sizeof(path), "%s/prog", g_dir);
+    snprintf(old, sizeof(old), "%s/prog.old", g_dir);
+
+    CHECK(exec_file_open_checked(path, me, "database loader", "this user", err, sizeof(err)) < 0);
+    CHECK_HAS(err, "No such file or directory");
+    mkdir(old, 0755);
+    CHECK(exec_file_open_checked(old, me, "database loader", "this user", err, sizeof(err)) < 0);
+    CHECK_HAS(err, "is not a regular file");
+    rmdir(old);
+
+    if (!copy_file("/usr/bin/true", path, 0755)) {
+        printf("  (no /usr/bin/true to copy: the execution checks are skipped)\n");
+        return;
+    }
+    chmod(path, 0775);
+    CHECK(exec_file_open_checked(path, me, "database loader", "this user", err, sizeof(err)) < 0);
+    CHECK_HAS(err, "is writable by group or others (mode 0775)");
+    chmod(path, 0757);
+    CHECK(exec_file_open_checked(path, me, "database loader", "this user", err, sizeof(err)) < 0);
+    CHECK_HAS(err, "is writable by group or others (mode 0757)");
+    chmod(path, 0644);
+    CHECK(exec_file_open_checked(path, me, "database loader", "this user", err, sizeof(err)) < 0);
+    CHECK_HAS(err, "is not executable by this user");
+    chmod(path, 0755);
+    if (me == 0) {
+        chown(path, 12345, 12345);                                           /* P1: not root's, not the caller's */
+        CHECK(exec_file_open_checked(path, me, "database loader", "this user", err, sizeof(err)) < 0);
+        CHECK_HAS(err, "is owned by uid 12345; it must belong to root");
+        chown(path, 0, 0);
+    }
+
+    /* P5: the descriptor that was checked is what runs: the path is replaced between the check and the exec */
+    int fd = exec_file_open_checked(path, me, "database loader", "this user", err, sizeof(err));
+    CHECK_MSG(fd >= 0, "%s", err);
+    CHECK(rename(path, old) == 0);
+    CHECK(copy_file("/usr/bin/false", path, 0755));                         /* what execv(path) would have run: exit 1 */
+#ifdef __FreeBSD__
+    CHECK_MSG(run_fd(fd, path) == 0, "the replaced file was run");
+#endif
+    close(fd);
+    unlink(path);
+    unlink(old);
+
+    /* a script: run after the same checks (by its descriptor when fdescfs is there, else by its path) */
+    FILE *f = fopen(path, "w");
+    if (f) { fputs("#!/bin/sh\nexit 7\n", f); fclose(f); }
+    chmod(path, 0755);
+    fd = exec_file_open_checked(path, me, "database loader", "this user", err, sizeof(err));
+    CHECK_MSG(fd >= 0, "%s", err);
+    CHECK(run_fd(fd, path) == 7);
+    close(fd);
+    unlink(path);
+}
+
+static void test_identity_names_root(void) {
+    printf("identity_names_root / resolve_run_identity (P4)\n");
+    char err[300];
+    run_identity_t id;
+    CHECK(identity_names_root("root", NULL, err, sizeof(err)));
+    CHECK_HAS(err, "uid 0");
+    CHECK(identity_names_root("root", "nobody", err, sizeof(err)));
+    CHECK(!resolve_run_identity("root", NULL, &id, err, sizeof(err)));
+    CHECK_HAS(err, "uid 0");
+    if (getpwnam("toor")) {                                                  /* root by another name (FreeBSD: toor, uid 0) */
+        CHECK(identity_names_root("toor", NULL, err, sizeof(err)));
+        CHECK(!resolve_run_identity("toor", "nobody", &id, err, sizeof(err)));
+        CHECK_HAS(err, "uid 0");
+    }
+    struct group *g0 = getgrgid(0);
+    if (g0) {
+        CHECK(identity_names_root(NULL, g0->gr_name, err, sizeof(err)));
+        CHECK_HAS(err, "gid 0");
+        CHECK(!resolve_run_identity(NULL, g0->gr_name, &id, err, sizeof(err)));
+        if (getpwnam("nobody")) {
+            CHECK(identity_names_root("nobody", g0->gr_name, err, sizeof(err)));   /* the group named is the one used */
+            CHECK(!resolve_run_identity("nobody", g0->gr_name, &id, err, sizeof(err)));
+        }
+    }
+    if (getpwnam("nobody")) {
+        CHECK(!identity_names_root("nobody", NULL, err, sizeof(err)));
+        CHECK(!identity_names_root("nobody", "nobody", err, sizeof(err)));
+        if (geteuid() == 0) CHECK(resolve_run_identity("nobody", NULL, &id, err, sizeof(err)));
+    }
+    CHECK(!identity_names_root(NULL, NULL, err, sizeof(err)));
+    CHECK(!identity_names_root("no-such-user-karidns-test", "no-such-group-karidns-test", err, sizeof(err)));
+}
+
 int main(void) {
     const char *tmp = getenv("TMPDIR");
     snprintf(g_dir, sizeof(g_dir), "%s/karidns_dbsup_XXXXXX", tmp && *tmp ? tmp : "/tmp");
@@ -286,6 +408,8 @@ int main(void) {
     signal(SIGPIPE, SIG_IGN);
     test_init();
     test_spawn_and_restart();
+    test_exec_file();
+    test_identity_names_root();
     rmdir(g_dir);
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;

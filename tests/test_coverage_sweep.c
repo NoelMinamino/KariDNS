@@ -1918,11 +1918,11 @@ static void test_ecs_cookie_rrl_dnstap_edges(void) {
     pl = pack_tag_def_rdata(pk, sizeof(pk), &tags[0]);
     for (size_t cut = 0; cut <= pl; cut++) {
         ecs_tag_def_t *out = NULL; int cnt = 0;
-        (void)unpack_tag_def_rdata(pk, cut, &out, &cnt);
+        (void)unpack_tag_def_rdata(pk, cut, &out, &cnt, NULL);
         free_ecs_tags_array(out, cnt);
     }
     { ecs_tag_def_t *out = NULL; int cnt = 0;
-      assert(!unpack_tag_def_rdata(NULL, 5, &out, &cnt) && !unpack_tag_def_rdata(pk, pl, NULL, &cnt) && !unpack_tag_def_rdata(pk, pl, &out, NULL)); }
+      assert(!unpack_tag_def_rdata(NULL, 5, &out, &cnt, NULL) && !unpack_tag_def_rdata(pk, pl, NULL, &cnt, NULL) && !unpack_tag_def_rdata(pk, pl, &out, NULL, NULL)); }
     for (size_t cut = 0; cut < 40; cut++) {
         uint8_t rb[64]; for (size_t i = 0; i < sizeof(rb); i++) rb[i] = (uint8_t)(i % 5 == 0 ? 3 : 'a' + i % 26);
         rb[0] = (uint8_t)(cut % 4);

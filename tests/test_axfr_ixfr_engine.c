@@ -47,7 +47,7 @@ static size_t g_tcp_out_len = 0;
 static int g_tcp_send_count = 0;
 
 // Mock TCP stream message queue for read_dns_tcp_message
-#define MAX_MOCK_TCP_MSGS 32
+#define MAX_MOCK_TCP_MSGS 128   /* I2: a run of 100 unsigned messages */
 static uint8_t g_mock_tcp_msgs[MAX_MOCK_TCP_MSGS][65536];
 static uint16_t g_mock_tcp_msg_lens[MAX_MOCK_TCP_MSGS];
 static int g_mock_tcp_msg_count = 0;
@@ -585,7 +585,9 @@ static void test_parse_xfr_packet_ixfr_sequence_and_tinydns(void) {
     assert(session.initial_soa_serial == 102);
 
     // Packet 2: Deleted records section start -> SOA serial 100
-    pkt[rdp + 2 + 18] = 100; // serial 100
+    /* the old SOA of the first difference sequence is the client's version (100; RFC 1995 §4, checked since I1).  The serial is the
+     * last octet of the 4 after MNAME (17) and RNAME (19) in the RDATA. */
+    pkt[rdp + 2 + 17 + 19 + 3] = 100;
     rc = parse_xfr_packet(pkt, off, &standby, &active.ver, &session, "example.com.");
     assert(rc == 0);
     assert(session.soa_count == 2);
@@ -7102,6 +7104,395 @@ static void test_b8t2_same_visibility_ttl(void) {
     printf("  -> same-visibility TTL harmonization passed.\n");
 }
 
+/* ============================================================================================================
+ * Security review (2026-10): I1 IXFR sequence chain (RFC 1995 §4), I2 limits (+ RFC 8945 §5.3.1), I3 tag definitions,
+ * I4 long apex name, I5 long TXT, S-I1 record class.  Each of these returned 0 / was accepted before the fixes.
+ * ============================================================================================================ */
+static size_t sr_hdr(uint8_t *p, uint16_t id, uint16_t qd, uint16_t an) {
+    memset(p, 0, 12);
+    p[0] = (uint8_t)(id >> 8); p[1] = (uint8_t)id; p[2] = 0x84;
+    p[4] = (uint8_t)(qd >> 8); p[5] = (uint8_t)qd;
+    p[6] = (uint8_t)(an >> 8); p[7] = (uint8_t)an;
+    return 12;
+}
+
+static size_t sr_put(uint8_t *p, size_t cap, size_t off, const char *owner, uint16_t type, uint16_t cls, const uint8_t *rd, size_t rdlen) {
+    long n = write_uncompressed_name_ext(p, off, cap, owner, false);
+    assert(n > 0);
+    off += (size_t)n;
+    assert(off + 10 + rdlen <= cap);
+    p[off++] = (uint8_t)(type >> 8); p[off++] = (uint8_t)type;
+    p[off++] = (uint8_t)(cls >> 8); p[off++] = (uint8_t)cls;
+    p[off++] = 0; p[off++] = 0; p[off++] = 0; p[off++] = 60;
+    p[off++] = (uint8_t)(rdlen >> 8); p[off++] = (uint8_t)rdlen;
+    if (rdlen) memcpy(p + off, rd, rdlen);
+    return off + rdlen;
+}
+
+static size_t sr_soa(uint8_t *p, size_t cap, size_t off, const char *apex, uint32_t serial) {
+    uint8_t rd[128];
+    size_t l = 0;
+    l += (size_t)write_uncompressed_name(rd, l, sizeof(rd), "ns1.example.com.");
+    l += (size_t)write_uncompressed_name(rd, l, sizeof(rd), "admin.example.com.");
+    rd[l++] = (uint8_t)(serial >> 24); rd[l++] = (uint8_t)(serial >> 16); rd[l++] = (uint8_t)(serial >> 8); rd[l++] = (uint8_t)serial;
+    for (int k = 0; k < 4; k++) { rd[l++] = 0; rd[l++] = 0; rd[l++] = 0; rd[l++] = 10; }
+    return sr_put(p, cap, off, apex, 6, 1, rd, l);
+}
+
+static size_t sr_a(uint8_t *p, size_t cap, size_t off, const char *owner, uint8_t last) {
+    const uint8_t rd[4] = { 192, 0, 2, last };
+    return sr_put(p, cap, off, owner, 1, 1, rd, 4);
+}
+
+static void sr_entry_init(zone_db_entry_t *e, const char *domain) {
+    memset(e, 0, sizeof(*e));
+    strlcpy(e->domain, domain, sizeof(e->domain));
+    strlcpy(e->view_name, "default", sizeof(e->view_name));
+    pthread_mutex_init(&e->writer_lock, NULL);
+    pthread_mutex_init(&e->ixfr_history.lock, NULL);
+    init_axfr_zone(test_zone_slot(e, 0), domain, "100");
+    atomic_store_explicit(&e->rcu.active, &test_zone_slot(e, 0)->ver, memory_order_release);
+    atomic_store_explicit(&e->serial, 100, memory_order_release);
+}
+
+static void sr_entry_free(zone_db_entry_t *e) {
+    zone_arena_destroy(test_zone_slot(e, 0));
+    zone_arena_destroy(test_zone_slot(e, 1));
+    pthread_mutex_destroy(&e->writer_lock);
+    pthread_mutex_destroy(&e->ixfr_history.lock);
+}
+
+/* the start of a message: the question (QDCOUNT 1, the AXFR/IXFR of the zone); the caller appends the `an` answers */
+static size_t sr_msg_q(uint8_t *p, size_t cap, uint16_t id, const char *zone, uint16_t qtype, uint16_t an) {
+    size_t off = sr_hdr(p, id, 1, an);
+    off += (size_t)write_uncompressed_name(p, off, cap, zone);
+    p[off++] = (uint8_t)(qtype >> 8); p[off++] = (uint8_t)qtype; p[off++] = 0; p[off++] = 1;
+    return off;
+}
+
+/* a script of RRs for parse_xfr_packet(): > 0 is a SOA with that serial, 0 is an A record */
+static int sr_ixfr_script(const int *script, int n, axfr_session_t *session) {
+    static uint8_t pkt[8192];
+    zone_arena_t active, standby;
+    zone_arena_init(&standby);
+    init_axfr_zone(&active, "example.com.", "100");
+    size_t off = sr_hdr(pkt, 0x2222, 0, (uint16_t)n);
+    for (int i = 0; i < n; i++)
+        off = script[i] > 0 ? sr_soa(pkt, sizeof(pkt), off, "example.com.", (uint32_t)script[i])
+                            : sr_a(pkt, sizeof(pkt), off, "h.example.com.", (uint8_t)(10 + i));
+    memset(session, 0, sizeof(*session));
+    session->is_ixfr = true;
+    session->client_serial = 100;
+    int rc = parse_xfr_packet(pkt, off, &standby, &active.ver, session, "example.com.");
+    zone_arena_destroy(&standby);
+    zone_arena_destroy(&active);
+    return rc;
+}
+
+static void test_sr_i1_ixfr_sequence_chain(void) {
+    printf("[TEST] AXFR/IXFR: I1 each IXFR difference sequence starts where the previous one ended (RFC 1995 §4)...\n");
+    axfr_session_t s;
+    /* SOA(new) SOA(old) del SOA(a) add SOA(a) del SOA(new) add SOA(new) */
+    static const int good1[] = { 103, 100, 0, 101, 0, 101, 0, 103, 0, 103 };
+    assert(sr_ixfr_script(good1, 10, &s) == 0 && s.is_finished && !s.ixfr_bad_sequence);
+    static const int good3[] = { 105, 100, 0, 101, 0, 101, 0, 103, 0, 103, 0, 105, 0, 105 };
+    assert(sr_ixfr_script(good3, 14, &s) == 0 && s.is_finished && !s.ixfr_bad_sequence);
+    static const int single[] = { 103, 100, 0, 103, 0, 103 };
+    assert(sr_ixfr_script(single, 6, &s) == 0 && s.is_finished);
+
+    /* the first sequence starts at a serial that is not the client's (100) */
+    static const int bad_first[] = { 103, 99, 0, 103, 0, 103 };
+    assert(sr_ixfr_script(bad_first, 6, &s) == -1);
+    assert(s.ixfr_bad_sequence && !s.is_finished);
+    static const int bad_first2[] = { 103, 101, 0, 103, 0, 103 };
+    assert(sr_ixfr_script(bad_first2, 6, &s) == -1 && s.ixfr_bad_sequence);
+
+    /* the second sequence does not start at the serial the first ended at (101) */
+    static const int bad_chain[] = { 103, 100, 0, 101, 0, 102, 0, 103, 0, 103 };
+    assert(sr_ixfr_script(bad_chain, 10, &s) == -1 && s.ixfr_bad_sequence && !s.is_finished);
+    /* the last sequence ends at 101, but the transfer says it ends at 103 */
+    static const int bad_end[] = { 103, 100, 0, 101, 0, 103 };
+    assert(sr_ixfr_script(bad_end, 6, &s) == -1 && s.ixfr_bad_sequence && !s.is_finished);
+
+    /* handle_axfr_event(): the failed IXFR leaves the zone as it was and says why (the caller asks for an AXFR) */
+    zone_db_entry_t entry;
+    sr_entry_init(&entry, "example.com.");
+    uint8_t p1[2048];
+    size_t off = sr_msg_q(p1, sizeof(p1), 0x3131, "example.com.", 251, 6);
+    off = sr_soa(p1, sizeof(p1), off, "example.com.", 103);
+    off = sr_soa(p1, sizeof(p1), off, "example.com.", 98);        /* not our serial 100 */
+    off = sr_a(p1, sizeof(p1), off, "h.example.com.", 1);
+    off = sr_soa(p1, sizeof(p1), off, "example.com.", 103);
+    off = sr_a(p1, sizeof(p1), off, "h.example.com.", 2);
+    off = sr_soa(p1, sizeof(p1), off, "example.com.", 103);
+    tcp_stream_ctx_t sc;
+    memset(&sc, 0, sizeof(sc));
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.query_id = 0x3131; session.query_type = 251; session.is_ixfr = true; session.client_serial = 100;
+    reset_mock_tcp_stream();
+    push_mock_tcp_msg(p1, (uint16_t)off);
+    assert(handle_axfr_event(-1, &entry, &sc, &session, NULL, NULL, 0) == -1);
+    assert(session.ixfr_bad_sequence && entry.serial == 100);
+    sr_entry_free(&entry);
+    printf("  -> I1 passed.\n");
+}
+
+static void test_sr_i2_size_limits(void) {
+    printf("[TEST] AXFR/IXFR: I2 max-zone-records / max-zone-bytes of an inbound transfer...\n");
+    uint8_t p1[2048];
+    size_t len;
+    for (int pass = 0; pass < 5; pass++) {
+        zone_db_entry_t entry;
+        sr_entry_init(&entry, "example.com.");
+        size_t off = sr_msg_q(p1, sizeof(p1), 0x4141, "example.com.", 252, 7);
+        off = sr_soa(p1, sizeof(p1), off, "example.com.", 200);
+        for (int k = 0; k < 5; k++) off = sr_a(p1, sizeof(p1), off, "h.example.com.", (uint8_t)(k + 1));
+        off = sr_soa(p1, sizeof(p1), off, "example.com.", 200);
+        len = off;
+        tcp_stream_ctx_t sc;
+        memset(&sc, 0, sizeof(sc));
+        axfr_session_t session;
+        memset(&session, 0, sizeof(session));
+        session.query_id = 0x4141; session.query_type = 252;
+        /* the zone being built holds 6 RRs (the closing SOA is not stored) */
+        if (pass == 1) session.max_records = 5;
+        if (pass == 2) session.max_records = 6;
+        if (pass == 3) session.max_bytes = len - 1;
+        if (pass == 4) session.max_bytes = len;
+        reset_mock_tcp_stream();
+        push_mock_tcp_msg(p1, (uint16_t)len);
+        int rc = handle_axfr_event(-1, &entry, &sc, &session, NULL, NULL, 0);
+        if (pass == 1 || pass == 3) {
+            assert(rc == -1);
+            assert(entry.serial == 100);             /* nothing was installed */
+        } else {
+            assert(rc == 1);                         /* no limit (0), or the limit is met exactly */
+            assert(entry.serial == 200);
+        }
+        sr_entry_free(&entry);
+    }
+    printf("  -> I2 size limits passed.\n");
+}
+
+/* RFC 8945 §5.3.1: a TSIG-verifying client accepts at most 99 messages in a row without a TSIG; with `unsigned_n` fillers between
+ * the signed first and last message */
+static int sr_tsig_run(int unsigned_n) {
+    zone_db_entry_t entry;
+    sr_entry_init(&entry, "tsigrun.example.");
+    tsig_key_t key;
+    memset(&key, 0, sizeof(key));
+    key.name = "tsigrun-key";
+    key.algorithm = "hmac-sha256";
+    memcpy(key.secret_decoded, "secret1234567890secret1234567890", 32);
+    key.secret_decoded_len = 32;
+    reset_mock_tcp_stream();
+
+    static uint8_t m[65536], cat[65536];
+    size_t off = sr_msg_q(m, sizeof(m), 0x5151, "tsigrun.example.", 252, 1);
+    off = sr_soa(m, sizeof(m), off, "tsigrun.example.", 200);
+    uint8_t cur_mac[64];
+    size_t cur_mac_len = 0, mlen = off, cat_len = 0;
+    tsig_sign_packet(m, &mlen, sizeof(m), &key, 0, cur_mac, &cur_mac_len, NULL, 0, false);
+    push_mock_tcp_msg(m, (uint16_t)mlen);
+    for (int i = 0; i < unsigned_n; i++) {
+        static uint8_t f[512];
+        char owner[64];
+        snprintf(owner, sizeof(owner), "f%03d.tsigrun.example.", i);
+        size_t fo = sr_hdr(f, 0x5151, 0, 1);
+        fo = sr_a(f, sizeof(f), fo, owner, (uint8_t)(i + 1));
+        assert(cat_len + fo <= sizeof(cat));
+        memcpy(cat + cat_len, f, fo);
+        cat_len += fo;
+        push_mock_tcp_msg(f, (uint16_t)fo);
+    }
+    off = sr_hdr(m, 0x5151, 0, 1);
+    off = sr_soa(m, sizeof(m), off, "tsigrun.example.", 200);
+    mlen = off;
+    tsig_sign_packet(m, &mlen, sizeof(m), &key, 0, cur_mac, &cur_mac_len, cat, cat_len, true);
+    push_mock_tcp_msg(m, (uint16_t)mlen);
+
+    tcp_stream_ctx_t sc;
+    memset(&sc, 0, sizeof(sc));
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.query_id = 0x5151; session.query_type = 252;
+    int rc = handle_axfr_event(-1, &entry, &sc, &session, &key, NULL, 0);
+    assert(rc == 1 ? entry.serial == 200 : entry.serial == 100);
+    sr_entry_free(&entry);
+    return rc;
+}
+
+static void test_sr_i2_tsig_unsigned_run(void) {
+    printf("[TEST] AXFR/IXFR: I2 at most 99 unsigned messages between signed ones (RFC 8945 §5.3.1)...\n");
+    assert(sr_tsig_run(0) == 1);
+    assert(sr_tsig_run(99) == 1);      /* 99 in a row are accepted ("MUST accept up to 99") */
+    assert(sr_tsig_run(100) == -1);    /* the 100th is not */
+    printf("  -> I2 unsigned run passed.\n");
+}
+
+/* a LOC_TAGDEF / ECS_TAGDEF record (class 65302) with `ncidr` CIDRs */
+static size_t sr_tagdef(uint8_t *p, size_t cap, size_t off, bool ecs, int idx, int ncidr) {
+    static uint8_t rd[65535];
+    size_t l = (size_t)snprintf((char *)rd, 32, "t%d", idx) + 1;
+    rd[l++] = (uint8_t)(ncidr >> 8); rd[l++] = (uint8_t)ncidr;
+    for (int j = 0; j < ncidr; j++) {
+        int n = snprintf((char *)rd + l, 20, "10.%d.%d.0/24", (j / 256) & 255, j & 255);
+        l += (size_t)n + 1;
+    }
+    assert(l <= sizeof(rd));
+    return sr_put(p, cap, off, "tags.example.com.", ecs ? DNS_TYPE_KARIDNS_ECS_TAGDEF : DNS_TYPE_KARIDNS_LOC_TAGDEF,
+                  DNS_CLASS_KARIDNS_EXT, rd, l);
+}
+
+static void test_sr_i3_tagdef_limits(void) {
+    printf("[TEST] AXFR/IXFR: I3 LOC_TAGDEF / ECS_TAGDEF: at most 4096 definitions and 65536 CIDRs, arrays grow geometrically...\n");
+    static uint8_t pkt[70000];
+    for (int mode = 0; mode < 4; mode++) {     /* loc, ecs, loc on the loader's stream, ecs on the loader's stream */
+        bool ecs = mode & 1;
+        zone_arena_t standby;
+        zone_arena_init(&standby);
+        axfr_session_t s;
+        memset(&s, 0, sizeof(s));
+        s.db_stream = mode >= 2;
+        int rc = 0, n = 0;
+        while (rc == 0 && n < 4200) {
+            size_t off = sr_hdr(pkt, 1, 0, 100);
+            for (int k = 0; k < 100; k++) off = sr_tagdef(pkt, sizeof(pkt), off, ecs, n++, 1);
+            rc = parse_xfr_packet(pkt, off, &standby, NULL, &s, "example.com.");
+            int cnt = ecs ? standby.bind_ecs_tag_count : standby.bind_location_tag_count;
+            int cap = ecs ? s.ecs_tagdef_cap : s.loc_tagdef_cap;
+            if (rc == 0) assert(cap >= cnt && cap <= 2 * cnt);
+        }
+        /* the 41st packet (definitions 4001..4100) holds the 4097th: the transfer fails there, after 4096 were taken */
+        assert(rc == -1 && n == 4100);
+        assert((ecs ? standby.bind_ecs_tag_count : standby.bind_location_tag_count) <= 4097);
+        zone_arena_destroy(&standby);
+    }
+    {   /* the geometric growth: 9 definitions leave a capacity of 16, not 9 */
+        zone_arena_t standby;
+        zone_arena_init(&standby);
+        axfr_session_t s;
+        memset(&s, 0, sizeof(s));
+        size_t off = sr_hdr(pkt, 1, 0, 9);
+        for (int k = 0; k < 9; k++) off = sr_tagdef(pkt, sizeof(pkt), off, false, k, 1);
+        assert(parse_xfr_packet(pkt, off, &standby, NULL, &s, "example.com.") == 0);
+        assert(standby.bind_location_tag_count == 9 && s.loc_tagdef_cap == 16);
+        zone_arena_destroy(&standby);
+    }
+    for (int mode = 0; mode < 2; mode++) {     /* the CIDRs of all the definitions together */
+        zone_arena_t standby;
+        zone_arena_init(&standby);
+        axfr_session_t s;
+        memset(&s, 0, sizeof(s));
+        s.db_stream = mode == 1;
+        int rc = 0, n = 0;
+        while (rc == 0 && n < 30) {
+            size_t off = sr_hdr(pkt, 1, 0, 1);
+            off = sr_tagdef(pkt, sizeof(pkt), off, n & 1, n, 3000);
+            n++;
+            rc = parse_xfr_packet(pkt, off, &standby, NULL, &s, "example.com.");
+        }
+        assert(rc == -1 && n == 22);            /* 21 * 3000 = 63000 fit, the 22nd makes 66000 > 65536 */
+        zone_arena_destroy(&standby);
+    }
+    printf("  -> I3 passed.\n");
+}
+
+static void test_sr_i4_long_escaped_apex(void) {
+    printf("[TEST] AXFR/IXFR: I4 an apex name of 253 octets with escapes (996 characters of text) ends the transfer...\n");
+    char apex[1100];
+    size_t l = 0;
+    for (int lab = 0; lab < 4; lab++) {
+        for (int k = 0; k < 62; k++) l += (size_t)sprintf(apex + l, "\\001");
+        apex[l++] = '.';
+    }
+    apex[l] = '\0';
+    assert(l > 255 && l < DNS_NAME_TEXT_SIZE);
+    static uint8_t pkt[4096];
+    size_t off = sr_hdr(pkt, 1, 0, 3);
+    off = sr_soa(pkt, sizeof(pkt), off, apex, 7);
+    off = sr_a(pkt, sizeof(pkt), off, apex, 1);
+    off = sr_soa(pkt, sizeof(pkt), off, apex, 7);
+    zone_arena_t standby;
+    zone_arena_init(&standby);
+    axfr_session_t s;
+    memset(&s, 0, sizeof(s));
+    assert(parse_xfr_packet(pkt, off, &standby, NULL, &s, apex) == 0);
+    assert(s.is_finished && strlen(s.initial_soa_name) == l);
+    zone_arena_destroy(&standby);
+    printf("  -> I4 passed.\n");
+}
+
+static void test_sr_s_i1_record_class(void) {
+    printf("[TEST] AXFR/IXFR: S-I1 a record of another class than IN refuses the transfer (RFC 5936 §2.2.1)...\n");
+    static uint8_t pkt[1024];
+    for (int cls = 1; cls <= 4; cls++) {
+        size_t off = sr_hdr(pkt, 1, 0, 3);
+        off = sr_soa(pkt, sizeof(pkt), off, "example.com.", 7);
+        static const uint8_t rd[4] = { 192, 0, 2, 1 };
+        off = sr_put(pkt, sizeof(pkt), off, "www.example.com.", 1, (uint16_t)cls, rd, 4);
+        off = sr_soa(pkt, sizeof(pkt), off, "example.com.", 7);
+        zone_arena_t standby;
+        zone_arena_init(&standby);
+        axfr_session_t s;
+        memset(&s, 0, sizeof(s));
+        int rc = parse_xfr_packet(pkt, off, &standby, NULL, &s, "example.com.");
+        assert(cls == 1 ? (rc == 0 && s.is_finished) : rc == -1);
+        zone_arena_destroy(&standby);
+    }
+    printf("  -> S-I1 passed.\n");
+}
+
+static void test_sr_i5_txt_many_strings(void) {
+    printf("[TEST] AXFR/IXFR: I5 a TXT with 60 character-strings is kept and served as it is (RFC 1035 §3.3.14)...\n");
+    uint8_t txt[600];
+    size_t tl = 0;
+    for (int k = 0; k < 60; k++) { txt[tl++] = 3; tl += (size_t)sprintf((char *)txt + tl, "s%02d", k); }
+    assert(tl == 240);
+    static uint8_t pkt[2048];
+    size_t off = sr_msg_q(pkt, sizeof(pkt), 0x6161, "example.com.", 252, 3);
+    off = sr_soa(pkt, sizeof(pkt), off, "example.com.", 7);
+    off = sr_put(pkt, sizeof(pkt), off, "t.example.com.", 16, 1, txt, tl);
+    off = sr_soa(pkt, sizeof(pkt), off, "example.com.", 7);
+
+    zone_arena_t standby;
+    zone_arena_init(&standby);
+    axfr_session_t s;
+    memset(&s, 0, sizeof(s));
+    assert(parse_xfr_packet(pkt, off, &standby, NULL, &s, "example.com.") == 0 && s.is_finished);
+    assert(standby.count == 2 && standby.records[1].type_code == 16);
+    assert(standby.records[1].generic_len == tl && memcmp(standby.records[1].generic_data, txt, tl) == 0);
+    uint8_t chk[1024];
+    uint16_t clen = 0;
+    assert(serialize_dns_record(chk, sizeof(chk), &clen, &standby.records[1], NULL, ".", 0xFFFFFFFFu) == 0);
+    assert(clen == 11 + tl && memcmp(chk + 11, txt, tl) == 0);
+    zone_arena_destroy(&standby);
+
+    /* the whole path: the transfer is installed and the image holds the RDATA unchanged */
+    zone_db_entry_t entry;
+    sr_entry_init(&entry, "example.com.");
+    tcp_stream_ctx_t sc;
+    memset(&sc, 0, sizeof(sc));
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.query_id = 0x6161; session.query_type = 252;
+    reset_mock_tcp_stream();
+    push_mock_tcp_msg(pkt, (uint16_t)off);
+    assert(handle_axfr_event(-1, &entry, &sc, &session, NULL, NULL, 0) == 1);
+    zone_version_t *cur = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
+    assert(cur->image && cur->image->n_rrs == 2);
+    bool seen = false;
+    for (uint32_t k = 0; k < cur->image->n_rrs; k++) {
+        if (zone_image_rr_type(cur->image, k) != 16) continue;
+        assert(zone_image_rr_rdlen(cur->image, k) == tl && memcmp(zone_image_rr_rdata(cur->image, k), txt, tl) == 0);
+        seen = true;
+    }
+    assert(seen);
+    sr_entry_free(&entry);
+    printf("  -> I5 passed.\n");
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     test_edns_expire_rfc7314();
@@ -7340,6 +7731,13 @@ int main(void) {
     test_b8t2_sender_versions();
     test_b8t2_settings();
     test_b8t2_same_visibility_ttl();
+    test_sr_i1_ixfr_sequence_chain();
+    test_sr_i2_size_limits();
+    test_sr_i2_tsig_unsigned_run();
+    test_sr_i3_tagdef_limits();
+    test_sr_i4_long_escaped_apex();
+    test_sr_s_i1_record_class();
+    test_sr_i5_txt_many_strings();
     printf("=== All AXFR/IXFR Engine Unit Tests PASSED ===\n");
     return 0;
 }

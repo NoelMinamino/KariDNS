@@ -313,6 +313,10 @@ bool resolve_run_identity(const char *user, const char *group, run_identity_t *i
   memset(id, 0, sizeof(*id));
   id->uid = (uid_t)-1;
   id->gid = (gid_t)-1;
+  /* P4: a name that resolves to uid 0 (or to the root group) is root by another name: the privilege drop would be no
+   * drop.  Refused for user / group and loader-user / loader-group here (program-user: spawn_one_program_plugin()), at the
+   * configuration check and at start (identity_names_root(), dns_utils.c; karicheck asks it too); not at reload, which cannot change them and runs in capability mode. */
+  if (identity_names_root(user, group, err, errlen)) return false;
   if (user) {
     if (!lookup_user_ids(user, &id->uid, &id->gid)) {
       snprintf(err, errlen, "user '%s' not found", user);

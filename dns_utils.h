@@ -21,6 +21,24 @@ bool split_path_for_openat(const char *path, char *dir_out,
                           size_t dir_out_sz, char *base_out,
                           size_t base_out_sz);
 
+#ifndef _WIN32
+/* P1, P5: an executable the server (or karicheck standing in for it) is going to run with the rights of another user, opened for
+ * execution and checked as the open file: a regular file owned by root or by `self` (the user running karidns, or karicheck
+ * standing in for it), not writable by group or others, executable by that user.  `what` ("database loader") and `who` ("the
+ * user running karidns", "this user") word the messages.  Returns the descriptor (O_EXEC | O_CLOEXEC on FreeBSD) to pass to
+ * exec_file_exec_fd(), or -1 with err filled. */
+int exec_file_open_checked(const char *path, uid_t self, const char *what, const char *who, char *err, size_t errlen);
+/* P5: execute the checked open file (fexecve() on FreeBSD, so the file that was checked is the file that runs).  A script (#!) can
+ * only be run from a descriptor when fdescfs is mounted on /dev/fd; without it the script is started by its path after the same
+ * checks (the window a binary no longer has).  Elsewhere (a portable karicheck build) it is execve() by path.  Returns only on
+ * failure (-1, errno set). */
+int exec_file_exec_fd(int fd, const char *path, char *const argv[], char *const envp[]);
+/* P4: true (err filled) when `user` or `group` names root: a user of uid 0, or the gid that would be used (the group named, else
+ * the user's primary group) being 0.  NULL names are skipped; a name that does not exist is not an error here (the callers say so).
+ * Used for user / group, loader-user / loader-group and program-user, by karidns (start, reload) and karicheck. */
+bool identity_names_root(const char *user, const char *group, char *err, size_t errlen);
+#endif
+
 uint16_t get_type_code(const char *type_str);
 char *get_base_dir(const char *path);
 const char *format_type_name(uint16_t type, char *buf, size_t buf_size);
