@@ -40,6 +40,7 @@
 #define ZONE_IMAGE_F_PERM     0x10u /* the file (builder) order of the RRs differs from the image order: perm[] lists the RR indexes in that order (AXFR out and thaw use it) */
 #define ZONE_IMAGE_F_VIEW     0x40u /* B8t-1: some RR is seen only by some clients or at some times (tinydns location / time stamp / countdown, $LOCATION / $ECS-SUBNET tag); an ext[] entry that only keeps an owner spelling (alt text) does not count */
 #define ZONE_IMAGE_F_SOA_ATTR 0x20u /* B8t-1: some apex SOA RR is restricted (tinydns location / time stamp, $LOCATION / $ECS-SUBNET tag): a client may see no SOA of the zone, and the SOA it sees is the first visible one */
+#define ZONE_IMAGE_F_CUT 0x100u /* E3: some owner other than the apex has an NS RR (a zone cut, ZONE_IMAGE_NAME_CUT): lets find_delegation() skip the walk up the name of a zone without one */
 #define ZONE_IMAGE_F_ALIAS 0x80u /* B9a: some owner has an ALIAS RRset (TYPE 65401 of CLASS IN): lets the alias module and the engine skip a zone without one */
 
 /* zone_image_name_t.rr_count_flags: low 24 bits RR count, high 8 bits flags */

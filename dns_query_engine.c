@@ -26,6 +26,11 @@ static _Thread_local bool t_resolve_crossed_zone;
 /* 応答の大きさの上限で Additional を途中で打ち切ったか (TC は立てない、RFC 2181 §9)。キャッシュの鍵は
  * 問い合わせの受信バッファの大きさを含まないので、打ち切った応答は入れない */
 static _Thread_local bool t_resolve_additional_cut;
+/* C1: the Additional section holds (or looked for) glue of a sibling zone (append_glue_records() step 3).  The cache key holds only the
+ * first zone's data generation; a sibling's publication reaches that generation later (g_glue_dirty and the control thread) and only for
+ * the first MAX_PRELINK_TARGETS targets, so such an answer is not stored.  C2: the sibling's addresses are also chosen with the first
+ * zone's client view (rr_filter_t), which is the same reason. */
+static _Thread_local bool t_resolve_sibling_glue;
 /* B9a: the answer holds ALIAS-expanded addresses (or an ALIAS target that could not be resolved): the result changes with the resolver's TTLs, so it
  * is not stored in the shared response cache; and the SERVFAIL gets an extended error */
 static _Thread_local bool t_resolve_alias_expanded;
@@ -341,6 +346,7 @@ STATIC_TEST bool append_glue_records(const zone_image_t *img, const char *target
     if (sib_entry) {
       zone_version_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
       const zone_image_t *sib = sib_arena ? sib_arena->image : NULL;
+      if (sib != img) t_resolve_sibling_glue = true; /* C1, C2: the answer depends on another zone's version: not cached */
       if (sib && sib != img &&
           append_additional_from_zone(sib, sib_entry->domain, target, zone_image_find_name(sib, target), dnssec_ok,
                                       &f, res, max_res_len, offset, comp_ctx, arcount) < 0)
@@ -581,6 +587,9 @@ STATIC_TEST bool find_delegation(const zone_image_t *img, const char *qname,
                             bool dnssec_ok) {
   if (!img || img->n_names == 0)
     return false;
+  /* E3: no owner below the apex has an NS RR: there is no zone cut to find, so skip the hash lookup per label */
+  if (!(img->flags & ZONE_IMAGE_F_CUT))
+    return false;
   time_t tinydns_now = (img->flags & ZONE_IMAGE_F_TINYDNS) ? time(NULL) : 0;
   const zone_image_rr_t *rrs = zone_image_rrs(img);
   const char *name = qname;
@@ -676,17 +685,30 @@ STATIC_TEST bool find_delegation(const zone_image_t *img, const char *qname,
           }
         }
 
-        // glue for every NS of the delegation (the NS RRs are not filtered: as before)
+        /* glue for every NS of the delegation (the NS RRs are not filtered: as before).
+         * A1, RFC 9471: the glue of a name server inside the delegated zone (target at or below the cut, "in-domain") is required
+         * (§3.1: MUST include all of it, else set TC=1; §3.3 the same for RFC 1034's algorithm).  The glue of the other name
+         * servers (sibling, §3.2) SHOULD be included, but when it does not fit the server MAY set TC=1 and is not obliged to, and
+         * RFC 2181 §9 says TC is not set merely because extra information did not fit.  So only a missing in-domain glue sets TC;
+         * after the first sibling glue that does not fit no more sibling glue is added (as in the positive-answer path, Phase 10 of
+         * resolve_name_answer(): the Additional section is cut there, without TC) while the in-domain glue of the later name
+         * servers is still tried. */
         uint32_t k = zone_image_name_first_rr(img, id);
         uint32_t end = k + zone_image_name_rr_count(img, id);
+        bool optional_full = false;
         for (; k < end; k++) {
           char target[DNS_NAME_TEXT_SIZE];
           if (rrs[k].type == 2 && rr_target_text(img, k, target, sizeof(target))) {
+            bool in_domain = domain_name_is_at_or_below(target, name);
+            if (!in_domain && optional_full) continue;
             if (!append_glue_records(img, target, zone_apex, res,
                                      max_res_len, offset, comp_ctx, arcount, client_loc, client_ecs_tag, client_loc_tag, policy, view,
                                      dnssec_ok)) {
-              res[2] |= 0x02;
-              return true;
+              if (in_domain) {
+                res[2] |= 0x02;
+                return true;
+              }
+              optional_full = true;
             }
           }
         }
@@ -1575,7 +1597,9 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
                                  res, max_res_len, offset, comp_ctx, arcount,
                                  client_loc, client_ecs_tag, client_loc_tag, policy, view, dnssec_ok)) {
           t_resolve_additional_cut = true; // 応答キャッシュに入れない (大きいバッファの問い合わせにも返ってしまう)
-          break; // バッファ上限に達した場合は以後のグルー追加を中断 (RFC 2181 §9)
+          /* バッファ上限に達した場合は以後のグルー追加を中断 (RFC 2181 §9: TC は立てない)。委任の応答 (find_delegation()) も、
+           * 入りきらない兄弟のグルーでは TC を立てず、以後の兄弟のグルーを足さない (RFC 9471 §3.2。A1)。 */
+          break;
         }
       }
     }
@@ -2582,19 +2606,37 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
                               const char *client_ip, compress_ctx_t *comp_ctx,
                               bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                               zone_db_snapshot_t *snap, server_config_t *cfg,
-                              zone_db_entry_t **out_matched_entry, tsig_request_t *tsig);
+                              zone_db_entry_t **out_matched_entry, tsig_request_t *tsig,
+                              const query_route_t *route);
 
-/* res_cap: res の実際の容量 (バイト)。0 なら不明で、従来どおり max_res_len (UDP では EDNS の
- * サイズに置き換えた後の値) を容量とみなす。max_res_len は応答の上限 (UDP ではクライアントの上限)。 */
-/* RFC 8945 §5.2、§5.3: TSIG の付いた要求は、どの OPCODE でも先に TSIG を検証し (鍵は要求の鍵名と
- * アルゴリズムで決める)、TSIG RR を除いた要求を処理して、応答に TSIG を付ける (検証できれば同じ鍵で
- * 署名、鍵と MAC のエラーは無署名)。TSIG のエラーは NOTAUTH、解釈できない TSIG は FORMERR。 */
+static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len, uint8_t *res,
+                                             size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
+                                             const char *client_ip, compress_ctx_t *comp_ctx,
+                                             bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
+                                             zone_db_snapshot_t *snap, server_config_t *cfg,
+                                             zone_db_entry_t **out_matched_entry, const query_route_t *route);
+
 int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
                                size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
                                const char *client_ip, compress_ctx_t *comp_ctx,
                                bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                                zone_db_snapshot_t *snap, server_config_t *cfg,
                                zone_db_entry_t **out_matched_entry) {
+  return process_dns_query_impl_cap_routed(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
+                                           is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL);
+}
+
+/* res_cap: res の実際の容量 (バイト)。0 なら不明で、従来どおり max_res_len (UDP では EDNS の
+ * サイズに置き換えた後の値) を容量とみなす。max_res_len は応答の上限 (UDP ではクライアントの上限)。 */
+/* RFC 8945 §5.2、§5.3: TSIG の付いた要求は、どの OPCODE でも先に TSIG を検証し (鍵は要求の鍵名と
+ * アルゴリズムで決める)、TSIG RR を除いた要求を処理して、応答に TSIG を付ける (検証できれば同じ鍵で
+ * 署名、鍵と MAC のエラーは無署名)。TSIG のエラーは NOTAUTH、解釈できない TSIG は FORMERR。 */
+static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len, uint8_t *res,
+                                             size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
+                                             const char *client_ip, compress_ctx_t *comp_ctx,
+                                             bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
+                                             zone_db_snapshot_t *snap, server_config_t *cfg,
+                                             zone_db_entry_t **out_matched_entry, const query_route_t *route) {
   t_query_rrl_info.zone = NULL; /* D-05: 早い段階で返す応答 (エラー) のために先に消す */
   t_query_rrl_info.wildcard = false;
   if (req_len < DNS_HEADER_SIZE) {
@@ -2605,7 +2647,7 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
   t_query_tsig.status = TSIG_REQ_NONE; /* X-20: slip 応答の署名用。署名のない要求では使わない */
   if (tsig.status == TSIG_REQ_NONE) {
     return process_query_body(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
-                              is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL);
+                              is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL, route);
   }
   /* TSIG RR を除き ARCOUNT を 1 減らした要求 (RFC 8945 §5.2)。解釈できない TSIG はそのまま渡す。 */
   static _Thread_local uint8_t stripped[UINT16_MAX];
@@ -2621,7 +2663,7 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   tsig.res_limit = max_res_len;
   int ret = process_query_body(body_req, body_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
-                               is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, &tsig);
+                               is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, &tsig, route);
   if (ret < DNS_HEADER_SIZE) return ret;
   size_t limit = tsig.res_limit;
   if (res_cap != 0 && limit > res_cap) limit = res_cap;
@@ -2634,7 +2676,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
                               const char *client_ip, compress_ctx_t *comp_ctx,
                               bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                               zone_db_snapshot_t *snap, server_config_t *cfg,
-                              zone_db_entry_t **out_matched_entry, tsig_request_t *tsig) {
+                              zone_db_entry_t **out_matched_entry, tsig_request_t *tsig,
+                              const query_route_t *route) {
   char current_qname[DNS_NAME_TEXT_SIZE];
   strlcpy(current_qname, qname, sizeof(current_qname));
   char current_qname_lc[DNS_NAME_TEXT_SIZE];
@@ -2648,7 +2691,11 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   zone_db_entry_t *db_entry = NULL;
   view_snapshot_t *view = NULL;
 
-  if (snap) {
+  if (snap && route) {
+    /* E2: the caller looked up the same view and zone (query_route_t) */
+    view = route->view;
+    db_entry = route->entry;
+  } else if (snap) {
     view = select_view(snap, client_ip);
     if (view) {
       // R-32: 子ゾーン頂点への DS は親ゾーンで答える (QUERY のみ)。RRL、統計、wire キャッシュもこのゾーンを使う。
@@ -2656,9 +2703,10 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     }
   }
 
-  const zone_config_t *matched_zcfg = (db_entry && view && cfg)
-      ? zone_entry_config(cfg, db_entry)
-      : NULL;
+  /* E2: the zone's configuration, looked up once (it is a hash lookup by view and zone name).  The later users below see the same
+   * result as before: matched_zcfg is NULL without cfg, zone_cfg_any is not (a DB zone's own configuration needs no cfg). */
+  const zone_config_t *zone_cfg_any = (db_entry && view) ? zone_entry_config(cfg, db_entry) : NULL;
+  const zone_config_t *matched_zcfg = cfg ? zone_cfg_any : NULL;
   /* D-05: RRL のキー (NXDOMAIN はゾーン名、ワイルドカードの答えは "*.<ゾーン>") */
   t_query_rrl_info.zone = db_entry ? db_entry->domain : NULL;
   t_query_rrl_info.wildcard = false;
@@ -2675,7 +2723,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
            arcount_req = (req[10] << 8) | req[11];
 
   edns_info_t edns;
-  memset(&edns, 0, sizeof(edns));
+  edns_info_reset(&edns);
   edns.present = false;
   if (parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req, &edns) < 0) {
     /* OPT 自体が使えない (所有者名が root でない、追加セクション以外、複数、RDATA 切れ): OPT なしの FORMERR */
@@ -2805,8 +2853,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (opcode == 4) { // NOTIFY
     if (db_entry && view) {
-      server_config_t *cfg_chk = cfg;
-      const zone_config_t *zc = zone_entry_config(cfg_chk, db_entry);
+      const zone_config_t *zc = zone_cfg_any;
       if (zc && zc->type && (strcasecmp(zc->type, "program") == 0 ||
                               strcasecmp(zc->type, "forward") == 0)) {
         /* R-12: 要求の本体は返さず質問セクションで切り、OPT と EDE 21 (RFC 8914 §4.22) を付ける。
@@ -2829,7 +2876,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     tsig_key_t *tkey = (tsig && tsig->status == TSIG_REQ_VALID) ? tsig->key : NULL;
     bool auth = false;
     if (db_entry && view) {
-      const zone_config_t *zcfg = zone_entry_config(cfg, db_entry);
+      const zone_config_t *zcfg = zone_cfg_any;
       const zone_ext_t *zx = zext(zcfg);
       if (zcfg && zx->masters_count > 0) {
         bool from_master = false;
@@ -2870,8 +2917,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (opcode == 5) { // UPDATE
     if (db_entry && view) {
-      server_config_t *cfg_chk = cfg;
-      const zone_config_t *zc = zone_entry_config(cfg_chk, db_entry);
+      const zone_config_t *zc = zone_cfg_any;
       if (zc && zc->type && (strcasecmp(zc->type, "program") == 0 ||
                               strcasecmp(zc->type, "forward") == 0)) {
         /* R-12: 要求の本体は返さず質問セクションで切り、OPT と EDE 21 (RFC 8914 §4.22) を付ける。
@@ -2908,7 +2954,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     bool auth = false;
     bool zone_is_master = false;
     if (zone_rcode == 0) {
-      const zone_config_t *zcfg = zone_entry_config(cfg, db_entry);
+      const zone_config_t *zcfg = zone_cfg_any; /* zone_rcode == 0: db_entry and view are set */
       if (zcfg) {
         if (zcfg->type && (strcasecmp(zcfg->type, "master") == 0 || strcasecmp(zcfg->type, "primary") == 0)) {
           zone_is_master = true;
@@ -3060,8 +3106,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
    * SERVFAIL・BADCOOKIE ではそれぞれの経路で落とす。 */
   dns_init_response_header(res, req, 0, true);
   if (db_entry && view) {
-    server_config_t *cfg_lookup = cfg;
-    const zone_config_t *zcfg = zone_entry_config(cfg_lookup, db_entry);
+    const zone_config_t *zcfg = zone_cfg_any;
     if (zcfg && zcfg->type && strcasecmp(zcfg->type, "program") == 0) {
       const rate_limit_config_t *rrl = zext(zcfg)->rrl.configured ? &zext(zcfg)->rrl : (cfg ? &cfg->rrl : NULL);
       if (!is_tcp && rrl && rrl->configured && rrl->early_drop) {
@@ -3129,7 +3174,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     return offset;
   }
 
-  const zone_config_t *zcfg = (db_entry && view) ? zone_entry_config(cfg, db_entry) : NULL;
+  const zone_config_t *zcfg = zone_cfg_any;
   bool ecs_trusted = (cfg && cfg->ecs_enable && edns.has_ecs && client_ip &&
                       is_ecs_trusted_resolver(current_zone->image, cfg, zcfg, client_ip));
 
@@ -3337,6 +3382,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   uint32_t qtx_included = 0;
   t_resolve_crossed_zone = false;
   t_resolve_additional_cut = false;
+  t_resolve_sibling_glue = false;
   t_resolve_alias_expanded = false;
   t_resolve_alias_failed = false;
   resolve_name(current_qname, qclass, qtypes, num_qtypes, &db_entry, &current_zone, res, body_max_len,
@@ -3365,8 +3411,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   /* 応答キャッシュに入れる: NOERROR、AA、TC なしで answer があり、EDE の付かない応答
-   * (ヒットした応答は UDP の 512 オクテットに入る大きさに限る)。別のゾーンへ移った応答と、Additional を打ち切った応答は入れない */
-  if (rc_tag && !t_resolve_crossed_zone && !t_resolve_additional_cut && !t_resolve_alias_expanded && (res[3] & 0x0F) == 0 && (res[2] & 0x04) && !(res[2] & 0x02) && ancount > 0 &&
+   * (ヒットした応答は UDP の 512 オクテットに入る大きさに限る)。別のゾーンへ移った応答と、Additional を打ち切った応答、兄弟ゾーンのグルーを使った応答 (C1) は入れない */
+  if (rc_tag && !t_resolve_crossed_zone && !t_resolve_additional_cut && !t_resolve_sibling_glue && !t_resolve_alias_expanded && (res[3] & 0x0F) == 0 && (res[2] & 0x04) && !(res[2] & 0x02) && ancount > 0 &&
       edns.ede_count == 0 && offset > q_offset && offset <= UDP_DEFAULT_MAX_RES_LEN) {
     rcache_store(rc_tag, rc_gen, qtype, res + q_offset, (size_t)(offset - q_offset), ancount, nscount, arcount);
   }
@@ -3415,10 +3461,20 @@ int process_dns_query_cap(const uint8_t *req, size_t req_len, uint8_t *res,
                           const char *client_ip, compress_ctx_t *comp_ctx,
                           bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                           zone_db_snapshot_t *snap) {
+  return process_dns_query_cap_routed(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
+                                      is_tcp, out_rrl_cfg, snap, NULL);
+}
+
+int process_dns_query_cap_routed(const uint8_t *req, size_t req_len, uint8_t *res,
+                                 size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
+                                 const char *client_ip, compress_ctx_t *comp_ctx,
+                                 bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
+                                 zone_db_snapshot_t *snap, const query_route_t *route) {
   server_config_t *cfg = acquire_config_snapshot();
   zone_db_entry_t *matched_entry = NULL;
-  int ret = process_dns_query_impl_cap(req, req_len, res, max_res_len, res_cap, qname, qtype,
-                                       client_ip, comp_ctx, is_tcp, out_rrl_cfg, snap, cfg, &matched_entry);
+  int ret = process_dns_query_impl_cap_routed(req, req_len, res, max_res_len, res_cap, qname, qtype,
+                                              client_ip, comp_ctx, is_tcp, out_rrl_cfg, snap, cfg, &matched_entry,
+                                              route);
   release_config_snapshot(cfg);
   if (ret >= DNS_HEADER_SIZE && matched_entry) {
     uint8_t rcode = res[3] & 0x0F;

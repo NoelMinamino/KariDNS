@@ -2899,6 +2899,42 @@ static void test_wire_unpack_rr_all_types_underflow_matrix(void) {
            sizeof(underflows)/sizeof(underflows[0]));
 }
 
+/* E11: edns_info_reset() clears every field a reader can see (all but ede_list entries at or after ede_count) and leaves the
+ * 16 KiB of ede_list alone; a parse after the reset gives the same result as after a full memset. */
+static void test_edns_info_reset(void) {
+    printf("[TEST] edns_info_reset() equals a full memset for everything outside ede_list...\n");
+    edns_info_t *a = malloc(sizeof(*a)), *b = malloc(sizeof(*b));
+    CHECK(a && b);
+    memset(a, 0xAA, sizeof(*a));
+    memset(b, 0xAA, sizeof(*b));
+    edns_info_reset(a);
+    uint8_t *pa = (uint8_t *)a;
+    size_t ede_off = offsetof(edns_info_t, ede_list), ede_end = ede_off + sizeof(a->ede_list);
+    for (size_t i = 0; i < sizeof(*a); i++) {
+        if (i >= ede_off && i < ede_end) CHECK(pa[i] == 0xAA);   /* the entries nobody reads are not written */
+        else CHECK(pa[i] == 0);
+    }
+    CHECK(a->ede_count == 0 && !a->present && !a->has_cookie && !a->send_expire);
+    /* a query with an OPT that carries EDE and a COOKIE: both structs parse to the same visible state */
+    memset(a, 0xAA, sizeof(*a));
+    memset(b, 0, sizeof(*b));
+    edns_info_reset(a);
+    static const uint8_t opt_q[] = { 0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1,
+                                     1, 'a', 0, 0, 1, 0, 1,
+                                     0, 0, 41, 0x10, 0, 0, 0, 0x80, 0, 0, 10,
+                                     0, 15, 0, 6, 0, 18, 'h', 'i', 'y', 'o' };
+    CHECK(parse_edns_opt(opt_q, sizeof(opt_q), 1, 0, 0, 1, a) == 0);
+    CHECK(parse_edns_opt(opt_q, sizeof(opt_q), 1, 0, 0, 1, b) == 0);
+    CHECK(a->present && a->dnssec_ok && a->ede_count == 1 && b->ede_count == 1);
+    CHECK(a->ede_list[0].code == 18 && strcmp(a->ede_list[0].text, "hiyo") == 0);
+    CHECK(memcmp(a, b, offsetof(edns_info_t, ede_list)) == 0);
+    CHECK(memcmp(a->ede_list, b->ede_list, sizeof(a->ede_list[0])) == 0);
+    CHECK(memcmp((uint8_t *)a + offsetof(edns_info_t, has_nsid_query), (uint8_t *)b + offsetof(edns_info_t, has_nsid_query),
+                 sizeof(*a) - offsetof(edns_info_t, has_nsid_query)) == 0);
+    free(a);
+    free(b);
+}
+
 /* D16-1 (RFC 1035 3.3.14): a character-string may hold a NUL octet.  AXFR/IXFR-in kept TXT as C strings, which stop
  * at the NUL; such an RR is now kept as its RDATA octets.  Also D16-2: dns_generic_rdata_parse(). */
 static void test_char_string_nul(void) {
@@ -3127,6 +3163,7 @@ int main(void) {
     test_name_zone_parser_normalizes();
     test_name_tinydns_normalizes();
     test_serialize_exact_fit_base64();
+    test_edns_info_reset();
     test_char_string_nul();
     printf("[*] Final checks: %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) {

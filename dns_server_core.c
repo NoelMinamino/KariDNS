@@ -1999,7 +1999,12 @@ worker_startup_success:;
             write_dnstap_event(ctx, 1 /*AUTH_QUERY*/, req_buf, payload_received, client_addr, ipc_msg->addr_len,
                                ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
 
-            if (is_zone_synthetic_type(snap, client_ip, qname, ((req_buf[2] >> 3) & 0x0F) == 0 ? qtype : 0)) {
+            /* E2: the view and the zone are looked up here once; process_dns_query_cap_routed() takes them instead of looking
+             * them up again.  A program / forward zone is answered by an async I/O thread (is_zone_synthetic_type()). */
+            query_route_t route;
+            route.view = select_view(snap, client_ip);
+            route.entry = route.view ? find_zone_for_query(route.view, qname, ((req_buf[2] >> 3) & 0x0F) == 0 ? qtype : 0) : NULL;
+            if (route.entry && (route.entry->kind == ZONE_KIND_PROGRAM || route.entry->kind == ZONE_KIND_FORWARD)) {
               uint8_t *heap_req = malloc((size_t)payload_received);
               if (!heap_req) {
                 if (rlog_enabled) {
@@ -2047,9 +2052,9 @@ worker_startup_success:;
             uint8_t *res_buf = batch->tx_buffers[n_tx] + sizeof(udp_ipc_t);
             const rate_limit_config_t *rrl_cfg = NULL;
             int res_len =
-                process_dns_query_cap(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
-                                      UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
-                                      qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap);
+                process_dns_query_cap_routed(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
+                                             UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
+                                             qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap, &route);
             if (res_len > 0) {
               bool drop_packet = false;
               bool tc_packet = false;
@@ -2067,8 +2072,7 @@ worker_startup_success:;
                   } else {
                     drop_packet = true;
                   }
-                  view_snapshot_t *rrl_v = select_view(snap, client_ip);
-                  zone_db_entry_t *rrl_z = rrl_v ? find_zone_for_query(rrl_v, qname, ((req_buf[2] >> 3) & 0x0F) == 0 ? qtype : 0) : NULL;
+                  zone_db_entry_t *rrl_z = route.entry; /* the zone the query was answered from (E2) */
                   if (rrl_z) {
                     if (tc_packet) {
                       atomic_fetch_add_explicit(&rrl_z->observatory.rrl_slipped, 1, memory_order_relaxed);
@@ -2290,7 +2294,7 @@ process_tcp_client: ;
             client_port =
                 ntohs(((struct sockaddr_in6 *)&client_addr)->sin6_port);
           edns_info_t edns;
-          memset(&edns, 0, sizeof(edns));
+          edns_info_reset(&edns); /* E11: the same as in process_query_body() */
           edns.present = false;
           if (msg_len >= DNS_HEADER_SIZE) {
             uint16_t qd = (msg[4] << 8) | msg[5];
@@ -2484,7 +2488,11 @@ process_tcp_client: ;
               break;
             }
           } else {
-            if (is_zone_synthetic_type(snap, ctx_tcp->client_ip, qname, ((msg[2] >> 3) & 0x0F) == 0 ? qtype : 0)) {
+            /* E2: same as the UDP path above */
+            query_route_t route;
+            route.view = select_view(snap, ctx_tcp->client_ip);
+            route.entry = route.view ? find_zone_for_query(route.view, qname, ((msg[2] >> 3) & 0x0F) == 0 ? qtype : 0) : NULL;
+            if (route.entry && (route.entry->kind == ZONE_KIND_PROGRAM || route.entry->kind == ZONE_KIND_FORWARD)) {
               /* forward / program ゾーン: 非同期 I/O スレッドへ渡すために要求を複製する
                * (D-04 で文書化した例外。平文 TCP のホットパスではない) */
               uint8_t *heap_req = malloc(msg_len);
@@ -2535,9 +2543,9 @@ process_tcp_client: ;
               break;
             }
             /* D-04: 応答はワーカーごとのバッファ (起動時に確保) に組み立てる */
-            int res_len = process_dns_query(msg, msg_len, tcp_res_buf, 65535,
-                                            qname, qtype, ctx_tcp->client_ip,
-                                            &thread_compress_ctx, true, NULL, snap);
+            int res_len = process_dns_query_cap_routed(msg, msg_len, tcp_res_buf, 65535, 0,
+                                                       qname, qtype, ctx_tcp->client_ip,
+                                                       &thread_compress_ctx, true, NULL, snap, &route);
             if (res_len > 0) {
               submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname, qclass, qtype,
                                   tcp_res_buf[3] & 0x0F, has_edns, dnssec_ok);

@@ -353,6 +353,14 @@ typedef struct {
     uint32_t send_expire_value;
 } edns_info_t;
 
+/* Clear an edns_info_t for one query without writing the whole struct: ede_list (MAX_EDE_COUNT x 258 octets) is 16 KiB of the
+ * 16.5 KiB, and nothing reads an entry at or after ede_count (parse_edns_opt() and add_ede() write an entry completely before
+ * they count it).  Memory-wise this equals a memset of the whole struct for every field a reader can see. */
+static inline void edns_info_reset(edns_info_t *e) {
+    memset(e, 0, offsetof(edns_info_t, ede_list));
+    memset((char *)e + offsetof(edns_info_t, has_nsid_query), 0, sizeof(*e) - offsetof(edns_info_t, has_nsid_query));
+}
+
 // ============================================================================
 // 関数プロトタイプ
 // ============================================================================
