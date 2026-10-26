@@ -27,6 +27,7 @@ INSERT INTO karidns_zone_tagdefs_v2 (domain_id, kind, tag, cidr)
   SELECT domain_id, kind, tag, cidr FROM karidns_zone_tagdefs ORDER BY rowid;
 DROP TABLE karidns_zone_tagdefs;
 ALTER TABLE karidns_zone_tagdefs_v2 RENAME TO karidns_zone_tagdefs;
+CREATE INDEX IF NOT EXISTS karidns_zone_tagdefs_domain_idx ON karidns_zone_tagdefs (domain_id);
 
 CREATE TRIGGER IF NOT EXISTS karidns_trg_zone_tagdefs_ins AFTER INSERT ON karidns_zone_tagdefs
 BEGIN

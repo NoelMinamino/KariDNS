@@ -218,12 +218,19 @@ int main(int argc, char **argv) {
                 return 0;
             default:
                 karictl_usage(stderr, argv[0]);
-                return 1;
+                return 2;
         }
     }
     if (optind >= argc) {
         karictl_usage(stderr, argv[0]);
-        return 1;
+        return 2;
+    }
+    /* notify / retransfer / zonestatus need a zone name; without one the server could only answer "unknown command" */
+    if (optind + 1 >= argc && (strcmp(argv[optind], "notify") == 0 || strcmp(argv[optind], "retransfer") == 0 ||
+                               strcmp(argv[optind], "zonestatus") == 0)) {
+        fprintf(stderr, "karictl: %s needs a zone name\n", argv[optind]);
+        karictl_usage(stderr, argv[0]);
+        return 2;
     }
 
     if (strcmp(argv[optind], "tsig-keygen") == 0) {

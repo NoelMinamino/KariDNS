@@ -201,7 +201,10 @@ $ karicheck db /usr/local/etc/karidns/karidns.conf
 : All checked configuration files and zone files are valid. Warnings do not change the exit status. `-h` and `--help` print the usage text to standard output and also exit with 0 (as `karictl` and `karidns-dbloader` do).
 
 `1`
-: Usage error (a missing or unknown command, missing arguments; the usage text goes to standard error), unreadable file, syntax error, validation error, or ZONEMD digest mismatch detected. `db`: an error in the database or its data, a database that cannot be read with the rights of the loader, or a loader that is not installed (`DB support is not installed`).
+: Problems found: unreadable file, syntax error, validation error, or ZONEMD digest mismatch detected. `db`: an error in the database or its data, a database that cannot be read with the rights of the loader, or a loader that is not installed (`DB support is not installed`).
+
+`2`
+: Usage error (a missing or unknown command, missing or too many arguments; the usage text goes to standard error). Nothing was checked. Before this release a usage error exited with 1.
 
 ---
 

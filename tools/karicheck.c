@@ -1617,10 +1617,10 @@ int main(int argc, char **argv) { return karicheck_main(argc, argv); }
 int main(int argc, char **argv) {
     if (argc < 2) {
         print_usage(stderr, argv[0]);
-        return 1;
+        return 2;
     }
 
-    /* -h / --help: the text goes to stdout and the exit status is 0 (as karictl and karidns-dbloader do); a usage error goes to stderr with 1 */
+    /* -h / --help: the text goes to stdout and the exit status is 0 (as karictl and karidns-dbloader do); a usage error goes to stderr with 2 (1 is "problems found") */
     if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
         print_usage(stdout, argv[0]);
         return 0;
@@ -1670,7 +1670,7 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "zone") == 0) {
         if (argc < 3) {
             print_usage(stderr, argv[0]);
-            return 1;
+            return 2;
         }
         const char *domain = argv[2];
         if (argc >= 4 && strstr(argv[3], ".conf") == NULL) {
@@ -1713,7 +1713,7 @@ int main(int argc, char **argv) {
         const char *view = NULL, *cfg_path = default_config;
         if (argc > 4) {
             print_usage(stderr, argv[0]);
-            return 1;
+            return 2;
         }
         if (argc == 4) {
             view = argv[2];
@@ -1725,7 +1725,7 @@ int main(int argc, char **argv) {
         return kc_db_main(cfg_path, view);
     } else {
         print_usage(stderr, argv[0]);
-        return 1;
+        return 2;
     }
     return 0;
 }

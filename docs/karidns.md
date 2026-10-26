@@ -415,7 +415,7 @@ view "other"    { database none; };
 | `poll-interval <n>;` | `2` | Seconds, 1..60: how often the loader asks a view's database whether anything was committed (`auto-reload yes` only); with PostgreSQL also how often it reads `karidns_reload_requests` when no notification came and how soon it tries again after an error. |
 | `coalesce <ms>;` | `1000` | Milliseconds, 0..10000: after the first change the loader waits this long for more before it makes one batch (`auto-reload yes` only); with PostgreSQL also the window in which several reload requests become one reload. |
 | `default-ttl <n>;` | `3600` | TTL for a `records.ttl` that is NULL, 1..2147483647. |
-| `bulk-threshold <percent>;` | `25` | 0..100. When a reload has to read more than this percentage of a source's zones, the loader reads all records of the source in one scan (skipping the unchanged zones); below it, one query per zone. A start, a loader restart or a changed source always compares every zone. |
+| `bulk-threshold <percent>;` | `25` | 0..100. When a reload has to read more than this percentage of a source's zones, the loader reads all records of the source in one scan (skipping the unchanged zones); below it, the changed zones are read without scanning the rest: one query per zone, or with PostgreSQL up to 128 zones per statement. A start, a loader restart or a changed source always compares every zone. |
 | `max-zone-records <n>;` | `10000000` | Records of one zone, 2..4294967295. |
 | `max-zone-bytes <size>;` | `1G` | Bytes of one zone on the stream, 65535..64G (K, M, G suffixes). |
 | `db-reload-timeout <s>;` | `30` | 1..3600. How long a `karictl reload <zone>` of a database zone waits for the loader's answer; then it gets `ERROR timeout` (the reload may still be applied). The control thread never waits itself: the client is parked (at most 32 at once). |
@@ -447,7 +447,7 @@ In a `view`: `database-file "<path>";` (sqlite3) or `database-schema "<name>";` 
 - **Schema version 1** (`karidns_changes` without `xid`, `karidns_zone_tagdefs` without `id`) is read: the loader serves it without a change log (zones are compared by serial; `karidns_zone_tagdefs` in physical order) and says so; `db/karidns_ext_v1_to_v2.pgsql.sql` converts a database (SQLite3: `db/karidns_ext_v1_to_v2.sqlite3.sql`). A `karidns_schema_version` above 2 is refused by both drivers.
 - **Several servers on one database** (milestone B11): `karidns_reload_requests` / `karidns_server_status` and `server-id`, see the next section.
 
-**Sizes and times (milestone B13).** Measured on 4 vCPU with SQLite3: 10,000 zones of 1,000 records (10^7 records) are served 24 s after the start (13 s with `ingest-threads 2; loader-threads 2;`) and use about 1.1 GB in the Backend; 1,000,000 zones of 11 records take 33 s (19 s) and about 3 GB. A restart reads the whole database again (there are no persisted images in this release), and so does a restarted loader before it reports its first batch, while the Backend keeps answering. `karictl reload <zone>` of one zone takes about 20-30 ms at 10,000 zones and 76 ms at 100,000 zones (`tests/run_db_zoneadd_perf_test.sh`) and 0.2-0.7 s at 1,000,000 zones (the loader looks the zone up by name); auto reload follows a commit within about `poll-interval` plus `coalesce` (1.0-1.3 s with 1 s and 200 ms). If the loader dies it is restarted after 1 s, 2 s, 4 s ... 60 s. All figures, the thread sweep and the recommended `ingest-threads` / `loader-threads` are in [`karidns-dbloader(8)`](karidns-dbloader.md), "Measurements".
+**Sizes and times (milestone B13).** Measured on 4 vCPU with SQLite3: 10,000 zones of 1,000 records (10^7 records) are served 24 s after the start (13 s with `ingest-threads 2; loader-threads 2;`) and use about 1.1 GB in the Backend; 1,000,000 zones of 11 records take 33 s (19 s) and about 3 GB. A restart reads the whole database again (there are no persisted images in this release), and so does a restarted loader before it reports its first batch, while the Backend keeps answering. `karictl reload <zone>` of one zone takes about 20-30 ms at 10,000 zones and 76 ms at 100,000 zones (`tests/run_db_zoneadd_perf_test.sh`) and 5-11 ms at 1,000,000 zones (the loader looks the zone up by name). At 1,000,000 zones a one-zone change is served 15-25 ms after the command (100 changes); the occasional 0.13-0.52 s of the beta (the control thread's one-second walk of every zone, and the grace-period wait whose sleeps doubled to 131 ms) is gone; auto reload follows a commit within about `poll-interval` plus `coalesce` (1.0-1.3 s with 1 s and 200 ms). If the loader dies it is restarted after 1 s, 2 s, 4 s ... 60 s. All figures, the thread sweep and the recommended `ingest-threads` / `loader-threads` are in [`karidns-dbloader(8)`](karidns-dbloader.md), "Measurements".
 
 **Auto reload (`auto-reload yes;`, milestone B9).** Every `poll-interval` seconds the loader asks each view's database, on a connection it keeps open for that, for `PRAGMA data_version` (a change made by any other connection; one pragma, whatever the size of the database). Only when it changed does it look at the end of the change log `karidns_changes`: no new rows, nothing to do. The first change starts a coalescing window of `coalesce` milliseconds (later changes do not extend it); when it ends the loader makes one **batch of kind `auto`** for that view: the same comparison as `karictl reload` (the zones the change log lists since the last load, zones whose serial differs, zones the Backend refused, `ZONE_DELETE` for zones that left the database, and the digest gate: a zone whose data did not change is not sent). The serial need not change. A change is visible after at most `poll-interval` + `coalesce` + the time to read and build the zones (about 3 to 4 s with the defaults, measured in `tests/run_db_autoreload_test.sh`).
 
@@ -1009,10 +1009,23 @@ For complete configuration syntax, query evaluation flows, and Extended AXFR det
 
 ---
 
+## EXIT STATUS
+
+`0`
+: `-v` / `--version`, or the server was stopped (`SIGTERM`, `SIGINT`, `karictl stop`).
+
+`1`
+: The server did not start or stopped on an error: the configuration file cannot be read or has errors, a port, log file, PID file or control socket cannot be opened, or the server could not carry on.
+
+`2`
+: Usage error: no configuration file was given, or the value of `-p` is a number outside 1-65535. The usage text goes to standard error (and syslog); nothing was started. The tools `karicheck`, `karictl` and `karidns-dbloader` use 2 for usage errors in the same way; `dag` follows `dig` instead.
+
+---
+
 ## SIGNALS
 
 `SIGHUP`
-: Same as `karictl reconfig`: re-reads the configuration file and swaps it in atomically (RCU). Zone files whose modification time has not changed since they were loaded are not re-read; use `karictl reload` to re-read all zone files. Send it to the manager process (the PID in the PID file); the manager forwards it to the backend. When it reaches every process (`pkill -HUP karidns`), the server still reloads once: the backend acts only on the manager's forward, and a `SIGHUP` sent to the backend process alone is logged and ignored.
+: Same as `karictl reconfig`: re-reads the configuration file and swaps it in atomically (RCU). Zone files whose modification time and size have not changed since they were loaded are not re-read; use `karictl reload` to re-read all zone files. Send it to the manager process (the PID in the PID file); the manager forwards it to the backend. When it reaches every process (`pkill -HUP karidns`), the server still reloads once: the backend acts only on the manager's forward, and a `SIGHUP` sent to the backend process alone is logged and ignored.
 
 `SIGTERM`, `SIGINT`
 : Sent to the manager process, stops all child processes (backend, frontend routers, connect broker), removes the PID file and exits.

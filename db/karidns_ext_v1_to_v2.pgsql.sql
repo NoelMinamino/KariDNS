@@ -38,6 +38,7 @@ BEGIN
     ALTER TABLE karidns_zone_tagdefs ADD COLUMN id BIGSERIAL PRIMARY KEY;
   END IF;
 END $$;
+CREATE INDEX IF NOT EXISTS karidns_zone_tagdefs_domain_idx ON karidns_zone_tagdefs (domain_id);
 
 CREATE TABLE IF NOT EXISTS karidns_schema_version (version INTEGER NOT NULL);
 INSERT INTO karidns_schema_version (version) SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM karidns_schema_version);

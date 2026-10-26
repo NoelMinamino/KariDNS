@@ -463,6 +463,55 @@ static void test_nul(void) {
 /* "WHERE d.name COLLATE NOCASE = ?1 OR d.name COLLATE NOCASE = ?2" made SQLite scan all of domains (SCAN d: 8,400 pages and 60 ms at
  * 1,000,000 zones); the IN list is a SEARCH on name_index.  With 200,000 zones a scan costs 10 ms or more, a search microseconds: 300
  * lookups of a missing and of an existing name must stay far below the time of even a handful of scans. */
+/* list_zones / find_zone: the SOA of a zone with several enabled SOA rows is the one with the smallest records.id, whatever order the
+ * rows were written in (the PostgreSQL driver's test_zone_soa() checks the same rule); disabled rows, other owners and other zones'
+ * rows are not used */
+static void test_zone_soa_rows(void) {
+    printf("zone list: the apex SOA\n");
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("zonesoa.db", path, sizeof(path));
+    CHECK(db != NULL);
+    if (!db) return;
+    for (int i = 1; i <= 6; i++) {
+        char n[32];
+        snprintf(n, sizeof(n), "e%d.test", i);
+        add_zone(db, i, n, i == 2 ? "SLAVE" : "NATIVE");
+    }
+    /* e1: the rows were written in the order of ids 9, 3, 5 (3 is the smallest enabled one; 2 is disabled) */
+    add_rec(db, 9, 1, "e1.test", "SOA", "soa-e1-9", 60, -1, 0, NULL);
+    add_rec(db, 3, 1, "e1.test", "SOA", "soa-e1-3", 60, -1, 0, NULL);
+    add_rec(db, 5, 1, "e1.test", "SOA", "soa-e1-5", 60, -1, 0, NULL);
+    add_rec(db, 2, 1, "e1.test", "SOA", "soa-e1-off", 60, -1, 1, NULL);
+    add_rec(db, 4, 1, "sub.e1.test", "SOA", "soa-e1-sub", 60, -1, 0, NULL);          /* not the apex */
+    /* e3: only a disabled SOA; e5: a row of zone 3 carries e5's name (not used); records.name is compared exactly (BINARY: the owner in capitals is not the apex), the PostgreSQL driver falls back to the case-insensitive comparison when no exact SOA exists - a data error either way */
+    add_rec(db, 12, 3, "e3.test", "SOA", "soa-e3-off", 60, -1, 1, NULL);
+    add_rec(db, 13, 3, "e5.test", "SOA", "soa-e5-other-zone", 60, -1, 0, NULL);
+    add_rec(db, 16, 5, "E5.TEST", "SOA", "soa-e5-ci", 60, -1, 0, NULL);
+    add_rec(db, 17, 5, "e5.test", "SOA", "soa-e5-exact", 60, -1, 0, NULL);
+    add_rec(db, 18, 6, "e6.test", "SOA", "soa-e6", 60, -1, 0, NULL);
+    sqlite3_close(db);
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (!c) return;
+    static const char *const want[6] = { "soa-e1-3", NULL, NULL, NULL, "soa-e5-exact", "soa-e6" };
+    zl_t l = {0};
+    CHECK(db_driver_sqlite3.list_zones(c, zl_collect, &l) == 0 && l.n == 6);
+    for (size_t i = 0; i < l.n && i < 6; i++) {
+        CHECK_MSG(l.id[i] == (int64_t)i + 1, "position %zu is zone %lld", i, (long long)l.id[i]);
+        CHECK_MSG(str_eq(l.soa[i], want[i]), "zone %zu: SOA '%s', expected '%s'", i + 1, l.soa[i] ? l.soa[i] : "(none)", want[i] ? want[i] : "(none)");
+    }
+    CHECK(l.n > 1 && strcmp(l.type[1], "SLAVE") == 0);
+    zl_free(&l);
+    static const char *const ask[] = { "e1.test", "E1.TEST.", "e3.test", "e5.test", "e6.test." };
+    static const int askid[] = { 1, 1, 3, 5, 6 };
+    for (size_t k = 0; k < sizeof(ask) / sizeof(ask[0]); k++) {
+        CHECK(db_driver_sqlite3.find_zone(c, ask[k], zl_collect, &l) == 0 && l.n == 1 && l.id[0] == askid[k]);
+        CHECK_MSG(l.n == 1 && str_eq(l.soa[0], want[askid[k] - 1]), "find_zone %s: SOA '%s'", ask[k], l.n && l.soa[0] ? l.soa[0] : "(none)");
+        zl_free(&l);
+    }
+    db_driver_sqlite3.close(c);
+}
+
 static void test_find_zone_index(void) {
     printf("find_zone uses the index on domains.name (200,000 zones)\n");
     char path[600], err[DB_ERRLEN];
@@ -2100,6 +2149,7 @@ int main(int argc, char **argv) {
     test_nul();
     test_scans();
     test_find_zone_index();
+    test_zone_soa_rows();
     test_snapshot();
     test_busy();
     test_changes();

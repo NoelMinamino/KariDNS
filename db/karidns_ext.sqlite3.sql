@@ -69,6 +69,9 @@ CREATE TABLE IF NOT EXISTS karidns_zone_tagdefs (
   tag       VARCHAR(63) NOT NULL,
   cidr      VARCHAR(64) NOT NULL
 );
+-- the loader reads the definitions of one zone at a time (scan_metadata): without this index every such read scans the
+-- table.  Added after version 2; applying this file again creates it (the schema version stays 2).
+CREATE INDEX IF NOT EXISTS karidns_zone_tagdefs_domain_idx ON karidns_zone_tagdefs (domain_id);
 
 -- prune: keep the newest 1000000 rows
 CREATE TRIGGER IF NOT EXISTS karidns_changes_prune AFTER INSERT ON karidns_changes

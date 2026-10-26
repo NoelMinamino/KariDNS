@@ -414,6 +414,7 @@ typedef struct {
   _Atomic(time_t) expire_at;
   _Atomic(time_t) last_stale_log_time;
   time_t last_loaded_mtime;
+  off_t last_loaded_size;        /* with the mtime: a reload re-reads a file only when one of them changed (reload_master_zone()) */
   /* 他のゾーンがこのゾーンの名前をグルーに使っている (prelink が印を付ける)。公開時に
    * 制御スレッドへ依存するゾーンのグルーの作り直しを頼む */
   _Atomic bool glue_provider;
@@ -469,6 +470,15 @@ typedef struct {
   int *suffix_hash_table;
   int *suffix_chain_next;
   size_t suffix_hash_size;
+  /* the entries of this view the control thread's one-second tick must look at (zone_entry_ticks(): secondaries and
+   * catalog members, for their refresh / expire timers and the settings received from the primary).  Built with the
+   * hash tables, inherited by the incremental delta; the tick walks every entry only for a pending NOTIFY request
+   * (g_zone_notify_pending), so a million primary zones from the database cost the tick nothing. */
+  zone_db_entry_t **tick_entries;
+  size_t tick_count;
+  /* entries that come from zone { } blocks of karidns.conf (neither DB zones nor catalog members).  A reload whose
+   * zone { } blocks all map to these entries (name and kind) reuses the view (snapshot_views_reusable()). */
+  size_t static_count;
 } view_snapshot_t;
 
 typedef struct {
@@ -476,7 +486,46 @@ typedef struct {
   size_t view_count;
   _Atomic(int) reader_count;
   uint64_t retire_epoch;
+  int ixfr_history;   /* options { ixfr-history } the entries' depth was set with (a reused view redoes it when it changed) */
 } zone_db_snapshot_t;
+
+/* A long walk over every zone (a rebuild at a million zones, the glue refresh, the registry walks of the ingest thread)
+ * runs on the control or ingest thread, which shares its CPU with a pinned router or worker thread; ULE lets it run on
+ * until its quantum ends, so queries on that CPU stall for the whole walk (sched_yield() does not give the CPU up).  The
+ * walks call burst_yield() per item: every BURST_YIELD_CHECK items it looks at the clock, and after BURST_YIELD_MS of
+ * running it sleeps BURST_YIELD_NS, which puts the thread at the back of the run queue.  The cost is one nanosleep (a
+ * tick, about 1 ms) per BURST_YIELD_MS of work: a full rebuild at 1,000,000 database zones (a zone { } added) took 2.1 s
+ * and takes 2.5 s; a reload that changes no zone set does not walk the zones at all (30 ms). */
+#define BURST_YIELD_CHECK 256
+#define BURST_YIELD_MS 4
+#define BURST_YIELD_NS 500000L
+typedef struct {
+  unsigned n;
+  int64_t since_ms;   /* when the burst started, CLOCK_MONOTONIC in ms; 0 = not started */
+} burst_yield_t;
+static inline int64_t burst_now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+static inline void burst_yield(burst_yield_t *y) {
+  if (++y->n < BURST_YIELD_CHECK) return;
+  y->n = 0;
+  int64_t now = burst_now_ms();
+  if (y->since_ms == 0) {
+    y->since_ms = now;
+  } else if (now - y->since_ms >= BURST_YIELD_MS) {
+    struct timespec ts = { 0, BURST_YIELD_NS };
+    nanosleep(&ts, NULL);
+    y->since_ms = burst_now_ms();
+  }
+}
+/* for a loop whose items are big (a zone installed, an inventory chunk): look at the clock every time */
+static inline void burst_yield_check(burst_yield_t *y) {
+  y->n = BURST_YIELD_CHECK - 1;
+  burst_yield(y);
+}
+#define BURST_YIELD_INIT { 0, 0 }
 
 typedef struct {
   _Atomic(server_config_t *) active;
@@ -548,6 +597,15 @@ zone_db_snapshot_t *acquire_zone_snapshot(void);
 void retain_zone_snapshot(zone_db_snapshot_t *snap);
 zone_db_snapshot_t *acquire_retained_zone_snapshot(void);
 void release_zone_snapshot(zone_db_snapshot_t *snap);
+/* the entries the control thread's tick looks at every second (view_snapshot_t.tick_entries) */
+static inline bool zone_entry_ticks(const zone_db_entry_t *e) { return e->is_secondary || e->is_catalog_member; }
+/* NOTIFY requests (karictl notify, UPDATE) made since the control thread's tick last walked every zone: the flag
+ * notify_now can be set on any zone, so a pending request makes the next tick walk all of them once */
+extern _Atomic uint32_t g_zone_notify_pending;
+static inline void zone_notify_request(zone_db_entry_t *e) {
+  atomic_store_explicit(&e->notify_now, true, memory_order_release);
+  atomic_fetch_add_explicit(&g_zone_notify_pending, 1, memory_order_release);
+}
 zone_config_t *find_zone_config_in_view(server_config_t *cfg, const char *view_name, const char *domain);
 /* ゾーンエントリの設定。DB のゾーンは entry->dbcfg、それ以外は cfg の索引 (find_zone_config_in_view)。
  * 無ければ NULL。返した物は cfg を保持している間 (DB のゾーンは読み取り区間の中) だけ有効 */

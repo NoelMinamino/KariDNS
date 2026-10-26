@@ -180,7 +180,7 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
 }
 
 void notify_request_send(zone_db_entry_t *entry) {
-  atomic_store_explicit(&entry->notify_now, true, memory_order_release);
+  zone_notify_request(entry);
   int kq = atomic_load_explicit(&g_control_kq, memory_order_acquire);
   if (kq != -1) {
     struct kevent ev;

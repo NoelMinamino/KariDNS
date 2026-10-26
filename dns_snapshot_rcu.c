@@ -36,6 +36,7 @@ int g_pending_coo_count = 0;
 int g_pending_coo_capacity = 0;
 
 _Atomic(zone_db_snapshot_t *) g_zone_db_active = ATOMIC_VAR_INIT(NULL);
+_Atomic uint32_t g_zone_notify_pending = ATOMIC_VAR_INIT(0);
 
 zone_db_snapshot_t *acquire_zone_snapshot(void) {
   return atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
@@ -309,11 +310,13 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
 
 void free_zone_db_snapshot(zone_db_snapshot_t *snap) {
   if (!snap) return;
+  burst_yield_t by = BURST_YIELD_INIT;    /* the cleanup thread releases a million entries: not in one burst either */
   if (snap->views) {
     for (size_t v = 0; v < snap->view_count; v++) {
       if (snap->views[v].entries) {
         for (size_t i = 0; i < snap->views[v].zone_count; i++) {
           zone_db_entry_t *entry = snap->views[v].entries[i];
+          burst_yield(&by);
           if (entry) {
             if (atomic_fetch_sub_explicit(&entry->snapshot_refs, 1, memory_order_acq_rel) == 1) {
               syslog(LOG_INFO, "[GC] Freeing deleted zone '%s'", entry->domain);
@@ -355,6 +358,8 @@ void free_zone_db_snapshot(zone_db_snapshot_t *snap) {
         free(snap->views[v].suffix_chain_next);
         snap->views[v].suffix_chain_next = NULL;
       }
+      free(snap->views[v].tick_entries);
+      snap->views[v].tick_entries = NULL;
     }
     free(snap->views);
     snap->views = NULL;
@@ -686,12 +691,14 @@ void zone_glue_refresh_dependents(bool force) {
   glue_todo_t *todo = NULL;
   size_t n = 0, cap = 0;
   bool oom = false;
+  burst_yield_t by = BURST_YIELD_INIT;
   for (size_t v = 0; v < snap->view_count && !oom; v++) {
     view_snapshot_t *view = &snap->views[v];
     rcu_aux_read_lock();
     for (size_t i = 0; i < view->zone_count; i++) {
       zone_db_entry_t *e = view->entries[i];
       if (!e) continue;
+      burst_yield(&by);
       zone_version_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
       zone_glue_t *g = a ? a->glue : NULL;
       if (!g) continue;
@@ -1009,6 +1016,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   struct stat st_loaded;
   if (stat_via_dir_cache(file, &st_loaded) == 0) {
     entry->last_loaded_mtime = st_loaded.st_mtime;
+    entry->last_loaded_size = st_loaded.st_size;
     if (entry->is_secondary) {
       atomic_store_explicit(&entry->last_successful_transfer, (time_t)st_loaded.st_mtime, memory_order_release);
     }
@@ -1101,8 +1109,11 @@ static void catalog_entry_set_groups(zone_db_entry_t *entry, const catalog_membe
     }
 }
 
-/* Both hash tables of a view (zone name, and the suffix table find_zone_in_view() walks) from vs->entries /
- * vs->zone_count.  false: out of memory (the view keeps what was allocated; free_zone_db_snapshot() frees it). */
+static bool view_build_tick_list(view_snapshot_t *vs, const view_snapshot_t *ov, zone_db_entry_t *const *rem, size_t nrem,
+                                 zone_db_entry_t *const *add, size_t nadd);
+
+/* Both hash tables of a view (zone name, and the suffix table find_zone_in_view() walks) and the tick list from
+ * vs->entries / vs->zone_count.  false: out of memory (the view keeps what was allocated; free_zone_db_snapshot() frees it). */
 static bool view_build_hashes(view_snapshot_t *vs) {
     size_t p = 256;
     while (p < vs->zone_count * 2) p <<= 1;
@@ -1139,9 +1150,11 @@ static bool view_build_hashes(view_snapshot_t *vs) {
         return false;
     }
 
+    burst_yield_t by = BURST_YIELD_INIT;
     if (vs->hash_table && vs->chain_next) {
         for (size_t i = 0; i < vs->zone_count; i++) {
             if (!vs->entries[i]) continue;
+            burst_yield(&by);
             uint32_t hash = calc_fnv1a_str(vs->entries[i]->domain);
             size_t idx = hash & (vs->hash_size - 1);
             vs->chain_next[i] = vs->hash_table[idx];
@@ -1152,6 +1165,7 @@ static bool view_build_hashes(view_snapshot_t *vs) {
     if (vs->suffix_hash_table && vs->suffix_chain_next) {
         for (size_t i = 0; i < vs->zone_count; i++) {
             if (!vs->entries[i]) continue;
+            burst_yield(&by);
             size_t z_len = zone_key_len(vs->entries[i]->domain);
             uint32_t hash = calc_fnv1a_strn(vs->entries[i]->domain, z_len);
             size_t idx = hash & (vs->suffix_hash_size - 1);
@@ -1159,7 +1173,7 @@ static bool view_build_hashes(view_snapshot_t *vs) {
             vs->suffix_hash_table[idx] = i;
         }
     }
-    return true;
+    return view_build_tick_list(vs, NULL, NULL, 0, NULL, 0);
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -1180,6 +1194,8 @@ typedef struct {
 static dbreg_view_t *g_dbreg_views;
 static size_t g_dbreg_nviews, g_dbreg_capviews, g_dbreg_hint;
 static _Atomic size_t g_dbreg_pending;
+/* the registry was dropped under the snapshot (dbreg_reset(), unit tests): the next full rebuild must read the registry */
+static bool g_dbreg_force_full;
 
 static void dbreg_entry_ref(zone_db_entry_t *e) {
     atomic_fetch_add_explicit(&e->snapshot_refs, 1, memory_order_release);
@@ -1435,14 +1451,25 @@ size_t dbreg_pending_count(void) {
 }
 
 /* drop the queued additions and removals (with their references); the lock is held */
+static void dbreg_pending_drop_view_locked(dbreg_view_t *rv) {
+    for (size_t i = 0; i < rv->n_adds; i++) zone_entry_unref(rv->adds[i]);
+    for (size_t i = 0; i < rv->n_removes; i++) zone_entry_unref(rv->removes[i]);
+    atomic_fetch_sub_explicit(&g_dbreg_pending, rv->n_adds + rv->n_removes, memory_order_relaxed);
+    rv->n_adds = rv->n_removes = 0;
+}
+
 static void dbreg_pending_drop_locked(void) {
+    for (size_t v = 0; v < g_dbreg_nviews; v++) dbreg_pending_drop_view_locked(&g_dbreg_views[v]);
+}
+
+/* the queues of the views the configuration no longer has (a reused snapshot keeps the queues of its views); the lock is held */
+static void dbreg_pending_drop_gone_locked(const server_config_t *cfg) {
     for (size_t v = 0; v < g_dbreg_nviews; v++) {
         dbreg_view_t *rv = &g_dbreg_views[v];
-        for (size_t i = 0; i < rv->n_adds; i++) zone_entry_unref(rv->adds[i]);
-        for (size_t i = 0; i < rv->n_removes; i++) zone_entry_unref(rv->removes[i]);
-        rv->n_adds = rv->n_removes = 0;
+        bool have = false;
+        for (const view_config_t *vc = cfg->views; vc && !have; vc = vc->next) have = vc->name && strcasecmp(vc->name, rv->name) == 0;
+        if (!have) dbreg_pending_drop_view_locked(rv);
     }
-    atomic_store_explicit(&g_dbreg_pending, 0, memory_order_relaxed);
 }
 
 /* The registry's entries of one view that the new configuration does not hide (beta design 4.5); the lock is held.
@@ -1458,9 +1485,11 @@ static size_t dbreg_collect_view_locked(const view_config_t *vc, view_snapshot_t
     zone_db_entry_t **list = malloc(rv->count * sizeof(*list));
     if (!list) return (size_t)-1;
     size_t n = 0;
+    burst_yield_t by = BURST_YIELD_INIT;
     for (size_t b = 0; b < rv->nb; b++) {
         for (dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
             if (!z->entry) continue;
+            burst_yield(&by);
             bool by_cfg = view_find_zone_config(vc, z->name) != NULL;
             bool by_cat = false;
             if (!by_cfg && old_view) {
@@ -1499,6 +1528,35 @@ static bool ptr_in_sorted(zone_db_entry_t *const *arr, size_t n, const zone_db_e
         else hi = mid;
     }
     return false;
+}
+
+/* The tick list of a view (view_snapshot_t.tick_entries): the entries of vs->entries that zone_entry_ticks().  Without
+ * `ov` every entry is looked at (a rebuild, or a delta that rebuilt the arrays); with `ov` the list of the old view is
+ * inherited minus the removed entries (`rem`, sorted) plus the added ones (the incremental delta, which never touches
+ * the other entries, so their flags are what they were).  false: out of memory. */
+static bool view_build_tick_list(view_snapshot_t *vs, const view_snapshot_t *ov, zone_db_entry_t *const *rem, size_t nrem,
+                                 zone_db_entry_t *const *add, size_t nadd) {
+    free(vs->tick_entries);
+    vs->tick_entries = NULL;
+    vs->tick_count = 0;
+    size_t cap = ov ? ov->tick_count + nadd : vs->zone_count;
+    zone_db_entry_t **list = malloc((cap ? cap : 1) * sizeof(*list));
+    if (!list) return false;
+    size_t n = 0;
+    if (ov) {
+        for (size_t i = 0; i < ov->tick_count; i++) {
+            zone_db_entry_t *e = ov->tick_entries[i];
+            if (!(nrem && ptr_in_sorted(rem, nrem, e))) list[n++] = e;
+        }
+        for (size_t i = 0; i < nadd; i++)
+            if (zone_entry_ticks(add[i])) list[n++] = add[i];
+    } else {
+        for (size_t i = 0; i < vs->zone_count; i++)
+            if (vs->entries[i] && zone_entry_ticks(vs->entries[i])) list[n++] = vs->entries[i];
+    }
+    vs->tick_entries = list;
+    vs->tick_count = n;
+    return true;
 }
 
 /* The delta of one view without rebuilding its hash tables (the O(N) step of snapshot_apply_db_delta(): 90 of the 105 ms at 1,000,000
@@ -1571,6 +1629,23 @@ static void view_incr_add(view_snapshot_t *vs, size_t *n, zone_db_entry_t *e) {
     view_chain_push(vs->suffix_hash_table, vs->suffix_chain_next, vs->suffix_hash_size, view_suffix_hash(e), at);
 }
 
+/* The match-clients of a view snapshot from a list of names (the view's configuration, or the view of the snapshot being
+ * replaced): copies of the names and the parsed ACL.  false: out of memory (what was allocated stays for
+ * free_zone_db_snapshot() to release). */
+static bool view_set_match_clients(view_snapshot_t *vs, char *const *names, int count) {
+    vs->match_clients_count = count;
+    vs->match_clients = NULL;
+    vs->match_clients_parsed = NULL;
+    if (count <= 0) return true;
+    vs->match_clients = calloc(count, sizeof(char *));
+    if (!vs->match_clients) return false;
+    for (int i = 0; i < count; i++) {
+        if (names[i] && !(vs->match_clients[i] = strdup(names[i]))) return false;
+    }
+    vs->match_clients_parsed = acl_list_parse(vs->match_clients, vs->match_clients_count);
+    return true;
+}
+
 int snapshot_apply_db_delta(void) {
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     if (atomic_load_explicit(&g_dbreg_pending, memory_order_relaxed) == 0) {
@@ -1591,22 +1666,15 @@ int snapshot_apply_db_delta(void) {
         return -1;
     }
     ns->view_count = old_snap->view_count;
+    ns->ixfr_history = old_snap->ixfr_history;
     atomic_init(&ns->reader_count, 0);
     int changes = 0;
     for (size_t v = 0; v < old_snap->view_count; v++) {
         view_snapshot_t *ov = &old_snap->views[v];
         view_snapshot_t *vs = &ns->views[v];
         vs->name = strdup(ov->name ? ov->name : "");
-        bool ok = vs->name != NULL;
-        vs->match_clients_count = ov->match_clients_count;
-        if (ok && ov->match_clients_count > 0) {
-            vs->match_clients = calloc(ov->match_clients_count, sizeof(char *));
-            ok = vs->match_clients != NULL;
-            for (int i = 0; ok && i < ov->match_clients_count; i++) {
-                if (ov->match_clients[i]) ok = (vs->match_clients[i] = strdup(ov->match_clients[i])) != NULL;
-            }
-            if (ok) vs->match_clients_parsed = acl_list_parse(vs->match_clients, vs->match_clients_count);
-        }
+        bool ok = vs->name != NULL && view_set_match_clients(vs, ov->match_clients, ov->match_clients_count);
+        vs->static_count = ov->static_count;
         dbreg_view_t *rv = ok ? dbreg_view_get(vs->name, false) : NULL;
         /* removals that are in this view, and additions that are still wanted and not in it yet */
         size_t nrem = 0, nadd = 0;
@@ -1634,6 +1702,9 @@ int snapshot_apply_db_delta(void) {
                 if (ex != a) add[nadd++] = a;
             }
             if (nrem > 1) qsort(rem, nrem, sizeof(*rem), cmp_ptr);
+            /* a zone that leaves publishes nothing, so the zones whose glue came from it are told here: their cached
+             * responses would keep the addresses of a zone that is gone (zone_glue_refresh_dependents() of the tick) */
+            if (nrem > 0) atomic_store_explicit(&g_glue_dirty, true, memory_order_release);
         }
         if (ok) {
             vs->entries = calloc(ov->zone_count + nadd ? ov->zone_count + nadd : 1, sizeof(zone_db_entry_t *));
@@ -1678,6 +1749,9 @@ int snapshot_apply_db_delta(void) {
                 }
                 for (size_t i = 0; i < nrem; i++) view_incr_remove(vs, &n, rem[i]);
                 for (size_t i = 0; i < nadd; i++) view_incr_add(vs, &n, add[i]);
+                ok = view_build_tick_list(vs, ov, rem, nrem, add, nadd);
+            }
+            if (ok) {
                 for (size_t i = 0; i < n; i++)
                     if (vs->entries[i]) dbreg_entry_ref(vs->entries[i]);
                 vs->zone_count = n;
@@ -1853,6 +1927,7 @@ zone_db_entry_t *dbreg_snapshot_entry(zone_db_snapshot_t *snap, const char *view
 
 void dbreg_reset(void) {
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    g_dbreg_force_full = true;
     dbreg_pending_drop_locked();
     for (size_t v = 0; v < g_dbreg_nviews; v++) {
         dbreg_view_t *rv = &g_dbreg_views[v];
@@ -2117,6 +2192,94 @@ void db_settings_reset(void) {                      /* unit tests: drop the tabl
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 }
 
+/* Did the last full-configuration rebuild change the entry set of a view (zones added, removed or recreated)?  The
+ * glue of dependents is then looked at again (rebuild_zone_db_from_config_ext()); a reload that reused every view did
+ * not, and publications set g_glue_dirty by themselves. */
+static bool g_rebuild_sets_changed = true;
+
+/* The reload fast path (zone-change latency): can the view of the new configuration take over the old view as it is?
+ * Yes when every zone { } of the view is an entry of the old view of the same name and kind that is neither a DB zone
+ * nor a catalog member, their number is the old view's number of such entries (so none was removed), and no catalog
+ * zone stopped being one (its members would have to go).  Then nothing hides or uncovers a DB zone (D-PRIO: a zone { }
+ * shadows a DB zone of its name, a catalog member hides one as well), every catalog member stays valid, and the entries,
+ * the hash tables and the tick list of the old view are what the new view would be built to.  A reload at 1,000,000 DB
+ * zones used to walk them four times (the registry, the ixfr depth, both hash tables, the glue): 2.3 s; this is 30 ms. */
+static bool view_reusable(const view_config_t *v, view_snapshot_t *old_view) {
+    if (!old_view || !old_view->entries) return false;
+    size_t n = 0;
+    for (zone_config_t *z = v->zones; z; z = z->next, n++) {
+        zone_db_entry_t *old = z->domain ? find_zone_exact_in_view(old_view, z->domain) : NULL;
+        if (!old || old->source == ZONE_SRC_DB || old->is_catalog_member || old->kind != zone_kind_from_type(z->type)) return false;
+        if (old->catalog_member_count > 0 && !z->is_catalog) return false;
+    }
+    return n == old_view->static_count;
+}
+
+static bool snapshot_views_reusable(zone_db_snapshot_t *old_snap, server_config_t *cfg) {
+    if (g_dbreg_force_full || !old_snap || !old_snap->views) return false;
+    for (view_config_t *v = cfg->views; v; v = v->next) {
+        if (!v->name || !view_reusable(v, snapshot_find_view(old_snap, v->name))) return false;
+    }
+    return true;
+}
+
+/* The view as a copy of the old view (view_reusable() holds): a reference per entry, the hash tables and the tick list
+ * copied (memcpy, no name is hashed), the match-clients from the new configuration.  The ixfr-history depth follows the
+ * new configuration: for the zone { } blocks always (cheap), for every entry when options { ixfr-history } changed.
+ * false: out of memory (free_zone_db_snapshot() releases what was allocated: zone_count is set after the references). */
+static bool view_copy_from_old(view_snapshot_t *vs, const view_config_t *v, const view_snapshot_t *ov, server_config_t *cfg,
+                               bool depth_all) {
+    vs->name = strdup(v->name ? v->name : "");
+    if (!vs->name || !view_set_match_clients(vs, v->match_clients, v->match_clients_count)) return false;
+    size_t n = ov->zone_count;
+    vs->entries = malloc((n ? n : 1) * sizeof(*vs->entries));
+    if (!vs->entries) return false;
+    if (n) memcpy(vs->entries, ov->entries, n * sizeof(*vs->entries));
+    bool tables = ov->hash_table && ov->chain_next && ov->suffix_hash_table && ov->suffix_chain_next && ov->hash_size > 0;
+    if (tables) {
+        vs->hash_size = ov->hash_size;
+        vs->suffix_hash_size = ov->suffix_hash_size;
+        vs->hash_table = malloc(vs->hash_size * sizeof(int));
+        vs->suffix_hash_table = malloc(vs->suffix_hash_size * sizeof(int));
+        vs->chain_next = malloc((n ? n : 1) * sizeof(int));
+        vs->suffix_chain_next = malloc((n ? n : 1) * sizeof(int));
+        vs->tick_entries = malloc((ov->tick_count ? ov->tick_count : 1) * sizeof(*vs->tick_entries));
+        if (!vs->hash_table || !vs->suffix_hash_table || !vs->chain_next || !vs->suffix_chain_next || !vs->tick_entries) return false;
+        memcpy(vs->hash_table, ov->hash_table, vs->hash_size * sizeof(int));
+        memcpy(vs->suffix_hash_table, ov->suffix_hash_table, vs->suffix_hash_size * sizeof(int));
+        if (n) {
+            memcpy(vs->chain_next, ov->chain_next, n * sizeof(int));
+            memcpy(vs->suffix_chain_next, ov->suffix_chain_next, n * sizeof(int));
+        }
+        if (ov->tick_count) memcpy(vs->tick_entries, ov->tick_entries, ov->tick_count * sizeof(*vs->tick_entries));
+        vs->tick_count = ov->tick_count;
+    }
+    burst_yield_t by = BURST_YIELD_INIT;
+    for (size_t i = 0; i < n; i++) {
+        if (vs->entries[i]) atomic_fetch_add_explicit(&vs->entries[i]->snapshot_refs, 1, memory_order_release);
+        burst_yield(&by);
+    }
+    vs->zone_count = n;
+    vs->static_count = ov->static_count;
+    if (!tables && !view_build_hashes(vs)) return false;
+    rcu_aux_read_lock();       /* B7a: a DB zone's settings block can be replaced (and freed after a grace period) meanwhile */
+    for (zone_config_t *z = v->zones; z; z = z->next) {                 /* as the full rebuild sets it for a reused entry */
+        zone_db_entry_t *e = find_zone_exact_in_view(vs, z->domain);
+        if (e) ixfr_history_set_depth(e, ixfr_history_effective(cfg, z));
+    }
+    if (depth_all) {                                                    /* options { ixfr-history } changed: the DB zones and members too */
+        for (size_t i = 0; i < n; i++) {
+            zone_db_entry_t *e = vs->entries[i];
+            if (!e) continue;
+            burst_yield(&by);
+            if (e->source == ZONE_SRC_DB) ixfr_history_set_depth(e, ixfr_history_effective(cfg, zone_entry_config(cfg, e)));
+            else if (e->is_catalog_member) ixfr_history_set_depth(e, ixfr_history_effective(cfg, NULL));
+        }
+    }
+    rcu_aux_read_unlock();
+    return true;
+}
+
 zone_db_snapshot_t *rebuild_zone_db_snapshot(
     server_config_t *active_config, 
     const char *catalog_view_name,
@@ -2132,8 +2295,36 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         return NULL;
     }
     
-    if (active_config) {
+    bool reused = false;
+    burst_yield_t by = BURST_YIELD_INIT;
+    if (active_config && snapshot_views_reusable(old_snap, active_config)) {
+        /* MODE: Full Config Reload, no zone set changed: the views are copies of the old ones (O(views), not O(zones)) */
+        int view_count = 0;
+        for (view_config_t *v = active_config->views; v; v = v->next) view_count++;
+        new_snap->view_count = view_count;
+        new_snap->ixfr_history = active_config->ixfr_history;
+        new_snap->views = view_count > 0 ? calloc(view_count, sizeof(view_snapshot_t)) : NULL;
+        if (view_count > 0 && !new_snap->views) {
+            abort_rebuild_snapshot(new_snap, "new_snap->views");
+            return NULL;
+        }
+        atomic_init(&new_snap->reader_count, 0);
+        int vidx = 0;
+        for (view_config_t *v = active_config->views; v; v = v->next, vidx++) {
+            if (!view_copy_from_old(&new_snap->views[vidx], v, snapshot_find_view(old_snap, v->name), active_config,
+                                    old_snap->ixfr_history != active_config->ixfr_history)) {
+                abort_rebuild_snapshot(new_snap, "view copy");
+                return NULL;
+            }
+        }
+        dbreg_pending_drop_gone_locked(active_config);
+        reused = true;
+        g_rebuild_sets_changed = false;
+    } else if (active_config) {
         // MODE: Full Config Reload
+        g_rebuild_sets_changed = true;
+        g_dbreg_force_full = false;
+        new_snap->ixfr_history = active_config->ixfr_history;
         
         int max_valid_members = 0;
         if (old_snap && old_snap->views) {
@@ -2142,6 +2333,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
                     zone_db_entry_t *entry = old_snap->views[v].entries[i];
                     if (!entry) continue;
+                    burst_yield(&by);
                     if (entry->catalog_member_count > 0) {
                         max_valid_members += entry->catalog_member_count;
                     }
@@ -2161,6 +2353,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
                     zone_db_entry_t *entry = old_snap->views[v].entries[i];
                     if (!entry) continue;
+                    burst_yield(&by);
                     if (entry->catalog_member_count > 0) {
                         const zone_config_t *zcfg = zone_entry_config(active_config, entry);
                         if (zcfg && zcfg->is_catalog) {
@@ -2217,28 +2410,10 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 abort_rebuild_snapshot(new_snap, "vs->name");
                 return NULL;
             }
-            vs->match_clients_count = v->match_clients_count;
-            if (v->match_clients_count > 0) {
-                vs->match_clients = calloc(v->match_clients_count, sizeof(char *));
-                if (!vs->match_clients) {
-                    { free(valid_members); free(vm_ht); free(vm_chain); }
-                    abort_rebuild_snapshot(new_snap, "vs->match_clients");
-                    return NULL;
-                }
-                for (int i = 0; i < v->match_clients_count; i++) {
-                    if (v->match_clients[i]) {
-                        vs->match_clients[i] = strdup(v->match_clients[i]);
-                        if (!vs->match_clients[i]) {
-                            { free(valid_members); free(vm_ht); free(vm_chain); }
-                            abort_rebuild_snapshot(new_snap, "vs->match_clients[i]");
-                            return NULL;
-                        }
-                    }
-                }
-                vs->match_clients_parsed = acl_list_parse(vs->match_clients, vs->match_clients_count);
-            } else {
-                vs->match_clients = NULL;
-                vs->match_clients_parsed = NULL;
+            if (!view_set_match_clients(vs, v->match_clients, v->match_clients_count)) {
+                { free(valid_members); free(vm_ht); free(vm_chain); }
+                abort_rebuild_snapshot(new_snap, "vs->match_clients");
+                return NULL;
             }
 
             int static_count = 0;
@@ -2252,6 +2427,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             if (old_view && old_view->entries) {
                 for (size_t oi = 0; oi < old_view->zone_count; oi++) {
                     zone_db_entry_t *entry = old_view->entries[oi];
+                    burst_yield(&by);
                     if (entry && entry->is_catalog_member &&
                         catalog_member_index(valid_members, valid_member_count, vm_ht, vm_chain, vm_hsize,
                                              entry->domain, zone_entry_catalog_uid(entry)) >= 0 &&
@@ -2318,12 +2494,14 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 }
                 vs->entries[zidx++] = entry;
             }
+            vs->static_count = (size_t)zidx;
 
             /* 有効なカタログメンバーのうち、静的な zone{} で上書きされていないものを引き継ぐ
              * (dynamic_count と同じ判定) */
             if (old_view && old_view->entries) {
                 for (size_t oi = 0; oi < old_view->zone_count; oi++) {
                     zone_db_entry_t *entry = old_view->entries[oi];
+                    burst_yield(&by);
                     if (entry && entry->is_catalog_member &&
                         catalog_member_index(valid_members, valid_member_count, vm_ht, vm_chain, vm_hsize,
                                              entry->domain, zone_entry_catalog_uid(entry)) >= 0 &&
@@ -2336,6 +2514,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             }
             rcu_aux_read_lock();       /* B7a: a DB zone's settings block can be replaced (and freed after a grace period) meanwhile */
             for (size_t k = 0; k < db_n; k++) {
+                burst_yield(&by);
                 atomic_fetch_add_explicit(&db_list[k]->snapshot_refs, 1, memory_order_release);
                 ixfr_history_set_depth(db_list[k], ixfr_history_effective(active_config, zone_entry_config(active_config, db_list[k])));
                 vs->entries[zidx++] = db_list[k];
@@ -2352,6 +2531,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             abort_rebuild_snapshot(new_snap, "null catalog_entry_to_update");
             return NULL;
         }
+        if (old_snap) new_snap->ixfr_history = old_snap->ixfr_history;
         
         // Step A: Update Pending CoO Intentions (acting as $OLDCATZ)
         {
@@ -2653,39 +2833,17 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     abort_rebuild_snapshot(new_snap, "catalog vs->name");
                     return NULL;
                 }
-                vs->match_clients_count = old_snap->views[v].match_clients_count;
-                if (vs->match_clients_count > 0) {
-                    vs->match_clients = calloc(vs->match_clients_count, sizeof(char *));
-                    if (!vs->match_clients) {
-                        if (del_hash_table) free(del_hash_table);
-                        if (del_chain_next) free(del_chain_next);
-                        for (int k = 0; k < actual_added_count; k++) {
-                            if (new_entries[k] && !new_entries_published) free_zone_db_entry(new_entries[k]);
-                        }
-                        free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
-                        abort_rebuild_snapshot(new_snap, "catalog vs->match_clients");
-                        return NULL;
+                if (!view_set_match_clients(vs, old_snap->views[v].match_clients, old_snap->views[v].match_clients_count)) {
+                    if (del_hash_table) free(del_hash_table);
+                    if (del_chain_next) free(del_chain_next);
+                    for (int k = 0; k < actual_added_count; k++) {
+                        if (new_entries[k] && !new_entries_published) free_zone_db_entry(new_entries[k]);
                     }
-                    for (int i = 0; i < vs->match_clients_count; i++) {
-                        if (old_snap->views[v].match_clients[i]) {
-                            vs->match_clients[i] = strdup(old_snap->views[v].match_clients[i]);
-                            if (!vs->match_clients[i]) {
-                                if (del_hash_table) free(del_hash_table);
-                                if (del_chain_next) free(del_chain_next);
-                                for (int k = 0; k < actual_added_count; k++) {
-                                    if (new_entries[k] && !new_entries_published) free_zone_db_entry(new_entries[k]);
-                                }
-                                free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
-                                abort_rebuild_snapshot(new_snap, "catalog vs->match_clients[i]");
-                                return NULL;
-                            }
-                        }
-                    }
-                    vs->match_clients_parsed = acl_list_parse(vs->match_clients, vs->match_clients_count);
-                } else {
-                    vs->match_clients = NULL;
-                    vs->match_clients_parsed = NULL;
+                    free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
+                    abort_rebuild_snapshot(new_snap, "catalog vs->match_clients");
+                    return NULL;
                 }
+                vs->static_count = old_snap->views[v].static_count;
 
                 if (catalog_view_name && strcasecmp(vs->name, catalog_view_name) == 0) {
                     size_t max_zones = old_snap->views[v].zone_count + added_count + (size_t)total_deleted;
@@ -2762,6 +2920,11 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     }
                     new_entries_published = true;
                     vs->zone_count = zidx;
+                    if (added_count > 0 || total_deleted > 0) {
+                        g_rebuild_sets_changed = true;                /* a reload looks at the glue of dependents again */
+                        /* the tick does the same for a delta outside a reload: a member that left published nothing */
+                        if (total_deleted > 0) atomic_store_explicit(&g_glue_dirty, true, memory_order_release);
+                    }
                 } else {
                     vs->zone_count = old_snap->views[v].zone_count;
                     vs->entries = calloc(vs->zone_count > 0 ? vs->zone_count : 1, sizeof(zone_db_entry_t *));
@@ -2801,7 +2964,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         }
     }
 
-    for (size_t v = 0; v < new_snap->view_count; v++) {
+    for (size_t v = 0; !reused && v < new_snap->view_count; v++) {
         view_snapshot_t *vs = &new_snap->views[v];
         if (!view_build_hashes(vs)) {
             syslog(LOG_ERR, "[Core] Hash table allocation failed for view '%s', aborting snapshot rebuild", vs->name ? vs->name : "unknown");
@@ -2812,7 +2975,9 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
 
     /* the registry is the source of truth: what the ingest threads queued for the old snapshot is in (or out of) this
      * one already (full configuration mode); the catalog delta copies the old entries, so its queue stays valid */
-    if (active_config) dbreg_pending_drop_locked();
+    /* (a reused view copied the old entries, so what the ingest thread queued for them stays valid, as in the catalog delta;
+     * dbreg_pending_drop_gone_locked() dropped the queues of the views that left the configuration) */
+    if (active_config && !reused) dbreg_pending_drop_locked();
     uint64_t retire_epoch = rcu_writer_publish(&g_zone_db_active, new_snap);
     if (old_snap) {
         old_snap->retire_epoch = retire_epoch;
@@ -2853,7 +3018,10 @@ int rebuild_zone_db_from_config_ext(server_config_t *config, bool skip_unchanged
                     struct stat st;
                     if (entry->id > first_new_id && atomic_load_explicit(&entry->publish_order, memory_order_seq_cst) != 0) {
                         /* この再構築で作って読み込み済み */
-                    } else if (skip_unchanged && stat_via_dir_cache(z->file, &st) == 0 && entry->last_loaded_mtime != 0 && st.st_mtime == entry->last_loaded_mtime) {
+                    } else if (skip_unchanged && stat_via_dir_cache(z->file, &st) == 0 && entry->last_loaded_mtime != 0 &&
+                               st.st_mtime == entry->last_loaded_mtime && st.st_size == entry->last_loaded_size) {
+                        /* reconfig only: a full reload reads every zone file again (it also drops dynamic updates, RFC 2136
+                         * changes are not written back) */
                         syslog(LOG_DEBUG, "[Config] zone '%s' file unchanged (mtime match), skipping reload", z->domain);
                     } else if (reload_master_zone(entry, z) != RELOAD_OK) {
                         nfailed++;
@@ -2893,8 +3061,9 @@ int rebuild_zone_db_from_config_ext(server_config_t *config, bool skip_unchanged
 
     /* S2: 兄弟ゾーンのアドレスを使うグルーを作り直す。以前は全ゾーンの arena を複製して prelink し
      * 直していた (Pass 2)。今は兄弟ゾーンが後から読み込まれた・変わった・増減したゾーンだけ、
-     * グルーだけを差し替える。ゾーンの増減は公開を伴わないので必ず調べる。 */
-    zone_glue_refresh_dependents(true);
+     * グルーだけを差し替える。ゾーンの増減は公開を伴わないので、増減があった再構築の後は必ず調べる
+     * (旧 view をそのまま引き継いだ reload は増減がなく、公開は g_glue_dirty を立てる)。 */
+    zone_glue_refresh_dependents(g_rebuild_sets_changed);
     zone_retire_process(true);
     return nfailed;
 }
