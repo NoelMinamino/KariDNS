@@ -433,7 +433,8 @@ check_exit $APID "instance A"
 
 # -----------------------------------------------------------------------------
 echo "[B] command line and startup variants"
-"$KARIDNS" >/dev/null 2>&1; [ $? -ne 0 ] && ok "usage without a config" || fail "no-arg start succeeded"
+"$KARIDNS" >/dev/null 2>&1; [ $? -eq 2 ] && ok "usage without a config (exit 2)" || fail "no-arg start: exit status is not 2"
+"$KARIDNS" -p 70000 -c "$TMP/nonexistent.conf" >/dev/null 2>&1; [ $? -eq 2 ] && ok "invalid -p value (exit 2)" || fail "invalid -p: exit status is not 2"
 "$KARIDNS" -v >/dev/null 2>&1 && ok "-v" || fail "-v failed"
 "$KARIDNS" -f "$TMP/nonexistent.conf" >/dev/null 2>&1; [ $? -ne 0 ] && ok "missing config refused" || fail "missing config accepted"
 

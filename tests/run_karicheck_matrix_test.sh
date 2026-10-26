@@ -302,9 +302,10 @@ out=$("$KC" zone nozone.example. "$TMP/zm.conf" 2>&1); rc=$?
 check "zone-from-conf:unknown" 1 "not found in config" "$out" "$rc"
 
 # ---- command line --------------------------------------------------------------------------------------
-out=$("$KC" 2>&1); rc=$?;            check "cli:no-args" 1 "Usage:" "$out" "$rc"
-out=$("$KC" zone 2>&1); rc=$?;       check "cli:zone-without-domain" 1 "Usage:" "$out" "$rc"
-out=$("$KC" bogus 2>&1); rc=$?;      check "cli:unknown-command" 1 "Usage:" "$out" "$rc"
+out=$("$KC" 2>&1); rc=$?;            check "cli:no-args" 2 "Usage:" "$out" "$rc"
+out=$("$KC" zone 2>&1); rc=$?;       check "cli:zone-without-domain" 2 "Usage:" "$out" "$rc"
+out=$("$KC" bogus 2>&1); rc=$?;      check "cli:unknown-command" 2 "Usage:" "$out" "$rc"
+out=$("$KC" db a b c 2>&1); rc=$?;     check "cli:db-too-many-args" 2 "Usage:" "$out" "$rc"
 out=$("$KC" --version 2>&1); rc=$?;  check "cli:version" 0 "karicheck " "$out" "$rc"
 out=$("$KC" -v 2>&1); rc=$?;         check "cli:version-short" 0 "karicheck " "$out" "$rc"
 out=$("$KC" --help 2>/dev/null); rc=$?;   check "cli:help" 0 "Usage:" "$out" "$rc"

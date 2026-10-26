@@ -16,6 +16,8 @@
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "dns_epoch_rcu.h"
 
@@ -212,10 +214,59 @@ static void test_concurrent_reuse(void) {
   printf("  [PASS] no reader observed a buffer that was being reused\n");
 }
 
+/* A reader that stays in its read section for a while (the control thread's one-second tick, a long query): the writer's
+ * wait ends shortly after the reader leaves.  The sleeps of the wait used to double up to 131 ms, so a reader of 40 ms
+ * cost the writer 131 ms (262 / 524 ms for longer ones) - the "0.5 s one-zone reload" of the database path. */
+static _Atomic int64_t g_reader_left_ns;
+static int64_t now_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec;
+}
+static void *hold_reader(void *arg) {
+  worker_ctx_t *r = arg;
+  rcu_reader_enter(r);
+  usleep(200000);
+  rcu_reader_exit(r);
+  atomic_store(&g_reader_left_ns, now_ns());
+  return NULL;
+}
+
+/* The lag is measured from the moment the reader left, not from the start of the wait, so a slow runner that delays the whole
+ * test does not matter; only a preemption of the writer after the reader left does, and the best of three tries is taken.  The old
+ * doubling sleeps (1, 2, 4 ... 131 ms) woke at about 127 and 258 ms for a reader that leaves after 195 ms: a lag of 60 ms or more. */
+static void test_wait_granularity(void) {
+  printf("[TEST] rcu_writer_wait_until_safe: returns soon after a 200 ms reader leaves (sleeps capped at 1 ms)...\n");
+  static int obj_a = 1, obj_b = 2;
+  static _Atomic(int *) slot;
+  atomic_init(&slot, &obj_a);
+  int64_t best = INT64_MAX;
+  for (int attempt = 0; attempt < 3 && best >= 30000000; attempt++) {
+    register_workers(1);
+    atomic_store(&g_reader_left_ns, 0);
+    pthread_t th;
+    assert(pthread_create(&th, NULL, hold_reader, &g_test_workers[0]) == 0);
+    usleep(5000);                                 /* the reader is inside its section */
+    uint64_t retire = rcu_writer_publish(&slot, attempt % 2 ? &obj_a : &obj_b);
+    assert(rcu_writer_wait_until_safe(retire, 5000) == true);
+    int64_t t1 = now_ns();
+    pthread_join(th, NULL);
+    unregister_workers();
+    int64_t left = atomic_load(&g_reader_left_ns);
+    assert(left != 0);                            /* the wait did not end before the reader left */
+    int64_t lag = t1 - left;
+    printf("  attempt %d: the wait ended %lld us after the reader left\n", attempt + 1, (long long)(lag / 1000));
+    if (lag < best) best = lag;
+  }
+  assert(best < 30000000);                        /* well under the 60 ms or more of the doubled sleeps */
+  printf("  [PASS] the grace period ends with the reader, not with the backoff\n");
+}
+
 int main(void) {
   printf("=== Epoch RCU tests (R-25) ===\n");
   test_publish_order();
   test_aux_slots();
+  test_wait_granularity();
   test_concurrent_reuse();
   printf("=== All Epoch RCU tests passed ===\n");
   return 0;

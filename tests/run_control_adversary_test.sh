@@ -165,6 +165,12 @@ expect_exit 2 "decode base64|Authentication failed" "secret that is not base64" 
 expect_exit 2 "too long" "secret longer than 341 characters" ./karictl -c "${TMP_DIR}/long_secret.conf" -s "${CTRL_SOCK}" status
 expect_exit 2 "Authentication failed: AUTH_FAILED" "wrong secret" ./karictl -c "${TMP_DIR}/wrong_secret.conf" -s "${CTRL_SOCK}" status
 expect_exit 3 "ERROR unknown command" "unknown command" ${KARICTL} unknown_bogus_command
+expect_exit 2 "Usage:" "no command" ./karictl -c "${TMP_DIR}/karictl.conf" -s "${CTRL_SOCK}"
+expect_exit 2 "Usage:" "unknown option" ./karictl -x status
+expect_exit 2 "needs a zone name" "zonestatus without a zone" ${KARICTL} zonestatus
+expect_exit 2 "needs a zone name" "notify without a zone" ${KARICTL} notify
+expect_exit 2 "needs a zone name" "retransfer without a zone" ${KARICTL} retransfer
+expect_exit 0 "^Usage:" "karictl --help (stdout)" ./karictl --help
 expect_exit 3 "ERROR zone not found" "zonestatus of an unknown zone" ${KARICTL} zonestatus nonexistent.test
 check_server_ok "karictl error paths"
 

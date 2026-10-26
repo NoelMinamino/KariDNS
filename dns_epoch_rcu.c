@@ -107,11 +107,18 @@ bool rcu_writer_is_safe(uint64_t retire_epoch) {
   return readers_safe(retire_epoch, NULL);
 }
 
+/* 猶予期間の待ちの 1 回の眠りの上限。読み手の区間は短い (問い合わせ 1 件、制御スレッドの tick 1 回) ので、
+ * 眠りを倍々に伸ばし続けると (rcu_exponential_backoff は 131 ms まで) 数十 ms の読み手に 131 / 262 / 524 ms
+ * 待つことになる: DB のゾーン 1 件の reload の BATCH_END (zone_retire_process(true)) がそれだった。1 ms 刻みなら
+ * 読み手が抜けてから 1 ms 以内に戻る。待ちは稀なので CPU は問題にならない。 */
+#define RCU_WAIT_SLEEP_MAX_US 1000u
+
 static bool wait_until_safe_impl(uint64_t retire_epoch, int timeout_ms, _Atomic uint64_t *skip) {
   int retries = 0;
   useconds_t sleep_time = 1;
   struct timespec start, now;
   clock_gettime(CLOCK_MONOTONIC, &start);
+  int64_t stall_logged_ms = 0;
 
   for (;;) {
     bool all_safe = readers_safe(retire_epoch, skip);
@@ -121,17 +128,18 @@ static bool wait_until_safe_impl(uint64_t retire_epoch, int timeout_ms, _Atomic 
     }
 
     rcu_exponential_backoff(&retries, &sleep_time);
+    if (sleep_time > RCU_WAIT_SLEEP_MAX_US) sleep_time = RCU_WAIT_SLEEP_MAX_US;
 
-    if (sleep_time >= 100000 && (retries % 10) == 0) {
-      syslog(LOG_WARNING, "[EpochRCU] wait_until_safe stalled (retire_epoch=%" PRIu64 ")",
-             retire_epoch);
-    }
-
-    if (timeout_ms > 0) {
+    if (sleep_time == RCU_WAIT_SLEEP_MAX_US || timeout_ms > 0) {
       clock_gettime(CLOCK_MONOTONIC, &now);
       int64_t elapsed_ms = (int64_t)(now.tv_sec - start.tv_sec) * 1000 +
                            (int64_t)(now.tv_nsec - start.tv_nsec) / 1000000;
-      if (elapsed_ms >= timeout_ms) {
+      if (elapsed_ms >= stall_logged_ms + 1000) {      /* 1 秒ごとに記録する (以前は眠りが 100 ms に達した後の 10 回ごと) */
+        stall_logged_ms = elapsed_ms;
+        syslog(LOG_WARNING, "[EpochRCU] wait_until_safe stalled for %" PRId64 " ms (retire_epoch=%" PRIu64 ")",
+               elapsed_ms, retire_epoch);
+      }
+      if (timeout_ms > 0 && elapsed_ms >= timeout_ms) {
         syslog(LOG_WARNING, "[EpochRCU] wait_until_safe timed out after %d ms (retire_epoch=%" PRIu64 ")",
                timeout_ms, retire_epoch);
         return false;

@@ -22,6 +22,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -578,6 +579,125 @@ static void test_rows(void) {
     free(rr);
 }
 
+/* list_zones / find_zone: which SOA row a zone gets (the join on records is by the plain name, with a per-zone fallback to the
+ * case-insensitive comparison) */
+typedef struct { int n; int64_t id[4000]; char type[4000][12]; char soa[4000][24]; bool soa_null[4000]; bool master_null[4000]; bool cat_null[4000]; } szacc_t;
+static int cb_szone(void *ud, const db_zone_row_t *z) {
+    szacc_t *a = ud;
+    if (a->n < 4000) {
+        a->id[a->n] = z->id;
+        snprintf(a->type[a->n], sizeof(a->type[0]), "%s", z->type ? z->type : "");
+        a->soa_null[a->n] = z->soa_content == NULL;
+        snprintf(a->soa[a->n], sizeof(a->soa[0]), "%.23s", z->soa_content ? z->soa_content : "");
+        a->master_null[a->n] = z->master == NULL;
+        a->cat_null[a->n] = z->catalog == NULL;
+    }
+    a->n++;
+    return 0;
+}
+
+static void test_zone_soa(void) {
+    printf("zone list: the apex SOA\n");
+    Q("CREATE SCHEMA karidns_test_s2");
+    char path[500];
+    snprintf(path, sizeof(path), "%s/pdns_schema.pgsql.sql", g_root);
+    char *sql = slurp(path);
+    snprintf(path, sizeof(path), "%s/../../db/karidns_ext.pgsql.sql", g_root);
+    char *ext = slurp(path);
+    CHECK(sql != NULL && ext != NULL);
+    if (!sql || !ext) {
+        free(sql);
+        free(ext);
+        return;
+    }
+    Q("SET search_path TO karidns_test_s2");
+    Q(sql);
+    Q(ext);
+    free(sql);
+    free(ext);
+    /* names in capitals can only exist when the schema's CHECK constraints are gone */
+    Q("ALTER TABLE records DROP CONSTRAINT c_lowercase_name");
+    Q("ALTER TABLE domains DROP CONSTRAINT c_lowercase_name");
+    Q("INSERT INTO domains (id, name, type, master, catalog) VALUES (1, 'e1.test', 'NATIVE', NULL, NULL), (2, 'e2.test', 'SLAVE', '192.0.2.1', 'cat.test'),"
+      "(3, 'e3.test', 'MASTER', NULL, NULL), (4, 'e4.test', 'CONSUMER', NULL, NULL), (5, 'e5.test', 'NATIVE', NULL, NULL), (6, 'e6.test', 'NATIVE', NULL, NULL),"
+      "(7, 'e7.test', 'NATIVE', NULL, NULL), (8, 'e8.test', 'NATIVE', NULL, NULL), (9, 'e9.test', 'NATIVE', NULL, NULL), (10, 'E10.test', 'NATIVE', NULL, NULL),"
+      "(11, 'e11.test', 'NATIVE', NULL, NULL)");
+    Q("INSERT INTO records (domain_id, name, type, content, ttl, disabled) VALUES "
+      "(1, 'e1.test', 'SOA', 'soa-e1-off', 60, true), (1, 'e1.test', 'SOA', 'soa-e1-b', 60, false), (1, 'e1.test', 'SOA', 'soa-e1-c', 60, false),"
+      "(1, 'e1.test', 'NS', 'ns.e1.test', 60, false), (1, 'sub.e1.test', 'SOA', 'soa-e1-sub', 60, false),"       /* a child zone's SOA is not the apex */
+      "(3, 'e3.test', 'SOA', 'soa-e3-off', 60, true),"                                                            /* the only SOA is disabled */
+      "(4, 'e4.test', 'SOA', 'soa-e4-null', 60, NULL),"                                                           /* disabled NULL = disabled */
+      "(5, 'sub.e5.test', 'SOA', 'soa-e5-sub', 60, false),"                                                       /* not at the apex */
+      "(6, 'E6.TEST', 'SOA', 'soa-e6', 60, false),"                                                               /* the owner differs in case: the fallback */
+      "(6, 'e7.test', 'SOA', 'soa-e7-other', 60, false),"                                                         /* a SOA of this name that belongs to another zone */
+      "(8, 'E8.test', 'SOA', 'soa-e8-ci', 60, false), (8, 'e8.test', 'SOA', 'soa-e8-exact', 60, false),"          /* two spellings: the exact one wins */
+      "(9, 'e9.test', 'SOA', 'soa-e9-off', 60, true), (9, 'E9.TEST', 'SOA', 'soa-e9-ci', 60, false),"             /* exact disabled: the other spelling */
+      "(10, 'e10.test', 'SOA', 'soa-e10', 60, false),"                                                            /* the domain is in capitals */
+      "(11, 'e11.test', 'SOA', NULL, 60, false)");                                                                /* an enabled SOA without content */
+    db_conn_t *c = open_drv("karidns_test_s2");
+    if (!c) return;
+    db_schema_info_t si;
+    CHECK(D->check_schema(c, &si) == 0);
+    szacc_t *z = calloc(1, sizeof(*z));
+    CHECK(D->begin_snapshot(c) == 0);
+    CHECK(D->list_zones(c, cb_szone, z) == 0);
+    CHECK_MSG(z->n == 11, "%d zones", z->n);
+    static const char *const want[11] = { "soa-e1-b", NULL, NULL, NULL, NULL, "soa-e6", NULL, "soa-e8-exact", "soa-e9-ci", "soa-e10", NULL };
+    for (int i = 0; i < 11 && i < z->n; i++) {
+        CHECK_MSG(z->id[i] == i + 1, "zone %d is at position %d", (int)z->id[i], i);
+        if (want[i]) CHECK_MSG(!z->soa_null[i] && !strcmp(z->soa[i], want[i]), "zone %d: SOA '%s' (null %d), expected '%s'", i + 1, z->soa[i], z->soa_null[i], want[i]);
+        else CHECK_MSG(z->soa_null[i], "zone %d: SOA '%s', expected none", i + 1, z->soa[i]);
+    }
+    CHECK(z->n >= 4 && !strcmp(z->type[1], "SLAVE") && !z->master_null[1] && !z->cat_null[1] && !strcmp(z->type[3], "CONSUMER") && z->master_null[3] && z->cat_null[3]);
+    /* find_zone: the same row for the same zone, whatever the spelling of the name asked for */
+    static const struct { const char *ask; int id; } fz[] = { { "e1.test", 1 }, { "E1.TEST.", 1 }, { "e2.test", 2 }, { "e3.test.", 3 }, { "e6.test", 6 },
+                                                              { "E6.test", 6 }, { "e8.test", 8 }, { "e9.test.", 9 }, { "e10.test", 10 }, { "e7.test", 7 },
+                                                              { "e11.test", 11 } };
+    for (size_t k = 0; k < sizeof(fz) / sizeof(fz[0]); k++) {
+        memset(z, 0, sizeof(*z));
+        CHECK_MSG(D->find_zone(c, fz[k].ask, cb_szone, z) == 0 && z->n == 1 && z->id[0] == fz[k].id, "find_zone %s: %d rows", fz[k].ask, z->n);
+        if (z->n == 1 && fz[k].id >= 1 && fz[k].id <= 11) {
+            const char *w = want[fz[k].id - 1];
+            CHECK_MSG(w ? (!z->soa_null[0] && !strcmp(z->soa[0], w)) : z->soa_null[0], "find_zone %s: SOA '%s' (null %d)", fz[k].ask, z->soa[0], z->soa_null[0]);
+        }
+    }
+    CHECK(D->end_snapshot(c) == 0);
+
+    /* more zones than one FETCH, with and without statistics (the planner may choose either plan): every zone gets its own SOA,
+     * once, in id order; zones 1000..1099 have none */
+    Q("INSERT INTO domains (id, name, type) SELECT g, 'b' || g || '.test', 'NATIVE' FROM generate_series(1000, 3499) g");
+    Q("INSERT INTO records (domain_id, name, type, content, ttl, disabled) SELECT g, 'b' || g || '.test', 'SOA', 'soa-b' || g, 60, false FROM generate_series(1100, 3499) g");
+    Q("INSERT INTO records (domain_id, name, type, content, ttl, disabled) SELECT g, h || '.b' || g || '.test', 'A', '192.0.2.1', 60, false FROM generate_series(1000, 3499) g, generate_series(1, 4) h");
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) Q("ANALYZE domains; ANALYZE records");
+        CHECK(D->begin_snapshot(c) == 0);
+        memset(z, 0, sizeof(*z));
+        CHECK(D->list_zones(c, cb_szone, z) == 0);
+        CHECK_MSG(z->n == 11 + 2500, "pass %d: %d zones", pass, z->n);
+        bool ok = z->n == 11 + 2500;
+        for (int i = 11; ok && i < z->n && i < 4000; i++) {
+            int64_t id = 989 + i;                                       /* 1000 at position 11 */
+            char exp[24];
+            snprintf(exp, sizeof(exp), "soa-b%lld", (long long)id);
+            if (z->id[i] != id || (id < 1100 ? !z->soa_null[i] : (z->soa_null[i] || strcmp(z->soa[i], exp)))) {
+                printf("  [FAIL] pass %d position %d: zone %lld SOA '%s' (null %d)\n", pass, i, (long long)z->id[i], z->soa[i], z->soa_null[i]);
+                g_failed++;
+                ok = false;
+            }
+        }
+        g_checks++;
+        memset(z, 0, sizeof(*z));
+        CHECK(D->find_zone(c, "b2000.test", cb_szone, z) == 0 && z->n == 1 && z->id[0] == 2000 && !strcmp(z->soa[0], "soa-b2000"));
+        memset(z, 0, sizeof(*z));
+        CHECK(D->find_zone(c, "b1050.test", cb_szone, z) == 0 && z->n == 1 && z->id[0] == 1050 && z->soa_null[0]);
+        CHECK(D->end_snapshot(c) == 0);
+    }
+    D->close(c);
+    free(z);
+    Q("RESET search_path");
+    Q("DROP SCHEMA karidns_test_s2 CASCADE");
+}
+
 static void test_ext_and_profiles(void) {
     printf("profiles, domain views, tags\n");
     db_conn_t *c = open_drv(NULL);
@@ -613,6 +733,103 @@ static void test_ext_and_profiles(void) {
               "definitions in id order: %s %s %s", x.def_tag[0], x.def_tag[1], x.def_tag[2]);
     memset(&x, 0, sizeof(x));
     CHECK(D->scan_ext(c, &one, &sink) == 0 && x.tags == 1 && x.defs == 3);
+    D->end_snapshot(c);
+    D->close(c);
+}
+
+/* scan_records_in / scan_metadata_in / scan_ext_in give the same rows, in the same order, as the single-zone calls one after the other
+ * (the loader converts a group of zones from them and must produce the same stream as zone by zone) */
+typedef struct { char *s; size_t n, cap; } sbuf_t;
+static void sb_add(sbuf_t *b, const char *fmt, ...) {
+    char line[1200];
+    va_list ap;
+    va_start(ap, fmt);
+    int l = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (l < 0) return;
+    if ((size_t)l >= sizeof(line)) l = (int)sizeof(line) - 1;
+    if (b->n + (size_t)l + 1 > b->cap) {
+        b->cap = (b->n + (size_t)l + 1) * 2;
+        b->s = realloc(b->s, b->cap);
+    }
+    memcpy(b->s + b->n, line, (size_t)l);
+    b->n += (size_t)l;
+    b->s[b->n] = '\0';
+}
+#define NN(x) ((x) ? (x) : "<NULL>")
+static int sb_rec(void *ud, int64_t did, const db_record_row_t *r) {
+    sb_add(ud, "R %lld %lld %s %s %s %d/%lld %d/%lld %d %s\n", (long long)did, (long long)r->id, NN(r->name), NN(r->type), NN(r->content), r->ttl_null,
+           (long long)r->ttl, r->prio_null, (long long)r->prio, r->disabled, NN(r->ordername));
+    return 0;
+}
+static int sb_meta(void *ud, const db_meta_row_t *m) {
+    sb_add(ud, "M %lld %s %s\n", (long long)m->domain_id, NN(m->kind), NN(m->content));
+    return 0;
+}
+static int sb_tag(void *ud, int64_t d, const db_tag_row_t *r) {
+    sb_add(ud, "T %lld %lld %s %s\n", (long long)d, (long long)r->record_id, NN(r->location_tag), NN(r->ecs_tag));
+    return 0;
+}
+static int sb_td(void *ud, int64_t d, const db_tinydns_row_t *r) {
+    sb_add(ud, "D %lld %lld %d/%lld %s %d\n", (long long)d, (long long)r->record_id, r->ttd_null, (long long)r->ttd, NN(r->loc), r->countdown);
+    return 0;
+}
+static int sb_def(void *ud, int64_t d, const db_tagdef_row_t *r) {
+    sb_add(ud, "G %lld %s %s %s\n", (long long)d, NN(r->kind), NN(r->tag), NN(r->cidr));
+    return 0;
+}
+
+static void test_scan_in(void) {
+    printf("several zones in one statement (scan_*_in)\n");
+    db_conn_t *c = open_drv(NULL);
+    if (!c) return;
+    db_schema_info_t si;
+    CHECK(D->check_schema(c, &si) == 0);
+    CHECK(D->scan_records_in != NULL && D->scan_metadata_in != NULL && D->scan_ext_in != NULL);
+    CHECK(D->begin_snapshot(c) == 0);
+    static const int64_t sets[][3] = { { 1, 2, 3 }, { 1, 3, 0 }, { 2, 0, 0 }, { 3, 0, 0 }, { 2, 3, 0 } };
+    static const size_t counts[] = { 3, 2, 1, 1, 2 };
+    db_ext_sink_t sink = { sb_tag, sb_td, sb_def, NULL };
+    for (size_t k = 0; k < sizeof(counts) / sizeof(counts[0]); k++) {
+        sbuf_t one[3] = { {0}, {0}, {0} }, many[3] = { {0}, {0}, {0} };
+        for (size_t i = 0; i < counts[k]; i++) {
+            int64_t id = sets[k][i];
+            CHECK(D->scan_records(c, &id, sb_rec, &one[0]) == 0);
+            CHECK(D->scan_metadata(c, &id, sb_meta, &one[1]) == 0);
+            db_ext_sink_t s1 = sink;
+            s1.ud = &one[2];
+            CHECK(D->scan_ext(c, &id, &s1) == 0);
+        }
+        sink.ud = &many[2];
+        CHECK(D->scan_records_in(c, sets[k], counts[k], sb_rec, &many[0]) == 0);
+        CHECK(D->scan_metadata_in(c, sets[k], counts[k], sb_meta, &many[1]) == 0);
+        CHECK(D->scan_ext_in(c, sets[k], counts[k], &sink) == 0);
+        for (int t = 0; t < 3; t++) {
+            const char *a = one[t].s ? one[t].s : "", *b = many[t].s ? many[t].s : "";
+            CHECK_MSG(strcmp(a, b) == 0, "set %zu, table %d: %zu bytes one by one, %zu bytes at once", k, t, strlen(a), strlen(b));
+            free(one[t].s);
+            free(many[t].s);
+        }
+    }
+    /* the sets are not empty: records (more than one FETCH for zone 3), metadata and extension rows were compared */
+    sbuf_t chk[3] = { {0}, {0}, {0} };
+    sink.ud = &chk[2];
+    CHECK(D->scan_records_in(c, sets[0], 3, sb_rec, &chk[0]) == 0 && chk[0].n > 100000);
+    CHECK(D->scan_metadata_in(c, sets[0], 3, sb_meta, &chk[1]) == 0 && chk[1].n > 0);
+    CHECK(D->scan_ext_in(c, sets[0], 3, &sink) == 0 && chk[2].n > 0);
+    free(chk[0].s);
+    free(chk[1].s);
+    free(chk[2].s);
+    /* a zone that is not there gives no rows; the limits */
+    sbuf_t none = {0};
+    int64_t gone = 99999;
+    CHECK(D->scan_records_in(c, &gone, 1, sb_rec, &none) == 0 && none.n == 0);
+    CHECK(D->scan_records_in(c, &gone, 0, sb_rec, &none) == -1);
+    int64_t many_ids[DB_IN_MAX + 1];
+    for (size_t i = 0; i < DB_IN_MAX + 1; i++) many_ids[i] = (int64_t)i + 1;
+    CHECK(D->scan_records_in(c, many_ids, DB_IN_MAX + 1, sb_rec, &none) == -1);
+    CHECK(D->scan_records_in(c, many_ids, DB_IN_MAX, sb_rec, &none) == 0);          /* the most allowed */
+    free(none.s);
     D->end_snapshot(c);
     D->close(c);
 }
@@ -1431,7 +1648,9 @@ int main(int argc, char **argv) {
     test_schema();
     test_schema_findings();
     test_rows();
+    test_zone_soa();
     test_ext_and_profiles();
+    test_scan_in();
     test_search_path();
     test_changes();
     test_notify();

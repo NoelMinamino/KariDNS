@@ -845,6 +845,10 @@ static void test_snapshot_rebuild_type_change(void) {
     assert(tc2 && tc2 != tc1);
     assert(tc2->kind == ZONE_KIND_SECONDARY && tc2->is_secondary);
     assert(keep2 == keep1); /* "primary" and "master" are the same kind */
+    /* the control thread's tick list of the view: the secondary only (the primaries have no timers to look at) */
+    view_snapshot_t *v1 = snapshot_find_view(s1, "__default__"), *v2 = snapshot_find_view(s2, "__default__");
+    assert(v1 && v1->tick_count == 0);
+    assert(v2 && v2->tick_count == 1 && v2->tick_entries[0] == tc2);
 
     server_config_t *c3 = load_conf(
         "options { directory \"%s\"; };\n"

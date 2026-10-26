@@ -745,13 +745,39 @@ static int zl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     return z->cb(z->ud, &row) != 0 ? DB_STOPPED : 0;
 }
 
+/* The zone list: every domain with the content of its apex SOA.  The join is on the plain name (r.name = d.name), which the standard
+ * PowerDNS indexes serve (records(name, type) / records(name), records(domain_id)): a plan that probes them costs about 0.2 s for
+ * 10,000 zones of 1,000 records, where the former join on lower(r.name) = lower(d.name) could only be answered by reading every
+ * record (0.8 s there; 2.0 s for 1,000,000 zones x 11, now 1.8 s, measured in the loader).  A zone with no enabled SOA of exactly its own spelling falls back, per zone,
+ * to the case-insensitive comparison of before (the subquery runs only for such zones, through the domain_id index), so a zone whose
+ * SOA owner differs from domains.name in case (the schema's c_lowercase_name CHECK forbids both) still gets its SOA (the SQLite3
+ * driver compares records.name exactly and gives such a zone none: a data error either way).  The row chosen is the lowest enabled records.id of the exact spelling, else of the other spellings;
+ * before it was the lowest of all spellings, which differs only for a zone that has SOA rows of two spellings.  The SQLite3 driver's
+ * list_zones (r.name = d.name, ORDER BY d.id, r.id) selects the same row for every ordinary zone. */
+#define PG_ZONE_SELECT                                                                                                           \
+    "SELECT d.id, d.name, d.type, d.master, d.catalog, "                                                                         \
+    "CASE WHEN r.id IS NULL THEN (SELECT s.content FROM records s WHERE s.domain_id = d.id AND s.type = 'SOA' "                  \
+    "AND s.disabled = false AND lower(s.name) = lower(d.name) ORDER BY s.id LIMIT 1) ELSE r.content END "                        \
+    "FROM domains d LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND r.name = d.name AND r.disabled = false "
+
 static int pg_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
     zl_t z = { cb, ud, false, 0, false };
-    return pg_scan(c, "list_zones",
-                   "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content FROM domains d "
-                   "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND lower(r.name) = lower(d.name) AND r.disabled = false "
-                   "ORDER BY d.id, r.id",
-                   0, NULL, zl_row, &z);
+    if (!c->in_snapshot) {
+        set_err(c, "list_zones: no snapshot is open");
+        return -1;
+    }
+    /* A cursor is planned for its first 10% of rows (cursor_tuple_fraction 0.1), which here means a merge join that walks the whole
+     * records table through its domain_id index (2.9 s in psql at 1,000,000 zones).  The whole list is read, so plan for all of it; the
+     * planner then chooses between probing the name index per zone and one pass over the SOA rows by its cost (1.7 s in psql at 1,000,000
+     * zones x 11 records, 0.2 s at 10,000 x 1,000).  The setting ends with the snapshot and is reset after the scan. */
+    int ret = exec_cmd(c, "SET LOCAL cursor_tuple_fraction = 1", "list_zones");
+    if (ret != 0) return ret;
+    ret = pg_scan(c, "list_zones", PG_ZONE_SELECT "ORDER BY d.id, r.id", 0, NULL, zl_row, &z);
+    if (ret == 0 || ret == DB_STOPPED) {
+        int rc = exec_cmd(c, "RESET cursor_tuple_fraction", "list_zones");
+        if (ret == 0) ret = rc;
+    }
+    return ret;
 }
 
 /* B13: one zone by name for a one-zone reload.  Names are compared like names_equal() of the loader: ASCII case-insensitive, with or
@@ -775,10 +801,8 @@ static int pg_find_zone(db_conn_t *c, const char *name, db_zone_cb cb, void *ud)
     b[n] = '.';
     b[n + 1] = '\0';
     const char *pv[2] = { a, b };
-    static const char *const sel =
-        "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content FROM domains d "
-        "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND lower(r.name) = lower(d.name) AND r.disabled = false ";
-    char q[700];
+    static const char *const sel = PG_ZONE_SELECT;
+    char q[1100];
     zl_t z = { cb, ud, false, 0, false };
     snprintf(q, sizeof(q), "%sWHERE d.name IN ($1, $2) ORDER BY d.id, r.id", sel);
     int ret = pg_scan(c, "find_zone", q, 2, pv, zl_row, &z);
@@ -1006,6 +1030,67 @@ static int pg_scan_ext(db_conn_t *c, const int64_t *domain_id, const db_ext_sink
         snprintf(q, sizeof(q), "SELECT domain_id, kind, tag, cidr FROM karidns_zone_tagdefs ORDER BY domain_id, %s", ord);
     return pg_scan(c, "scan_ext (karidns_zone_tagdefs)", q, np, pv, xg_row, (void *)sink);
 }
+
+/* ---- several zones in one statement per table (scan_records_in, scan_metadata_in, scan_ext_in) ----
+ * A zone read on its own costs a statement per table and three round trips per statement (DECLARE, FETCH, CLOSE), about fifteen with the
+ * extension tables: 0.6 ms for each of the 100,000 zones of a 10% reload at 1,000,000 zones, where the conversion of the zone is a tenth of
+ * that.  The loader asks for up to DB_IN_MAX zones at a time; the cursor still hands the rows over in batches of PG_FETCH_ROWS, so the
+ * memory held is the same as for one zone. */
+static int ids_literal(db_conn_t *c, const int64_t *ids, size_t n, char *out, size_t cap) {
+    if (n == 0 || n > DB_IN_MAX || cap < n * 21 + 3) {
+        set_err(c, "scan_*_in: %zu zones (1..%u allowed)", n, DB_IN_MAX);
+        return -1;
+    }
+    size_t o = 0;
+    out[o++] = '{';
+    for (size_t i = 0; i < n; i++) o += (size_t)snprintf(out + o, cap - o, "%s%lld", i ? "," : "", (long long)ids[i]);
+    out[o++] = '}';
+    out[o] = '\0';
+    return 0;
+}
+#define IDS_BUF (DB_IN_MAX * 21 + 3)
+
+static int pg_scan_records_in(db_conn_t *c, const int64_t *ids, size_t n, db_record_cb cb, void *ud) {
+    char arr[IDS_BUF];
+    if (ids_literal(c, ids, n, arr, sizeof(arr)) != 0) return -1;
+    rl_t l = { cb, ud };
+    const char *pv[1] = { arr };
+    return pg_scan(c, "scan_records", REC_COLS "WHERE domain_id = ANY ($1::bigint[]) ORDER BY domain_id, id", 1, pv, rl_row, &l);
+}
+
+static int pg_scan_metadata_in(db_conn_t *c, const int64_t *ids, size_t n, db_meta_cb cb, void *ud) {
+    char arr[IDS_BUF];
+    if (ids_literal(c, ids, n, arr, sizeof(arr)) != 0) return -1;
+    ml_t l = { cb, ud };
+    const char *pv[1] = { arr };
+    return pg_scan(c, "scan_metadata", "SELECT domain_id, kind, content, id FROM domainmetadata WHERE domain_id = ANY ($1::bigint[]) ORDER BY domain_id, id", 1,
+                   pv, ml_row, &l);
+}
+
+static int pg_scan_ext_in(db_conn_t *c, const int64_t *ids, size_t n, const db_ext_sink_t *sink) {
+    if (!c->has_ext) {
+        set_err(c, "the karidns_record_tags / karidns_record_tinydns / karidns_zone_tagdefs tables do not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    char arr[IDS_BUF];
+    if (ids_literal(c, ids, n, arr, sizeof(arr)) != 0) return -1;
+    const char *pv[1] = { arr };
+    int ret = pg_scan(c, "scan_ext (karidns_record_tags)",
+                      "SELECT r.domain_id, t.record_id, t.location_tag, t.ecs_tag FROM karidns_record_tags t JOIN records r ON r.id = t.record_id "
+                      "WHERE r.domain_id = ANY ($1::bigint[]) ORDER BY r.domain_id, t.record_id",
+                      1, pv, xt_row, (void *)sink);
+    if (ret != 0) return ret;
+    ret = pg_scan(c, "scan_ext (karidns_record_tinydns)",
+                  "SELECT r.domain_id, t.record_id, t.ttd, t.loc::text, t.countdown FROM karidns_record_tinydns t JOIN records r ON r.id = t.record_id "
+                  "WHERE r.domain_id = ANY ($1::bigint[]) ORDER BY r.domain_id, t.record_id",
+                  1, pv, xd_row, (void *)sink);
+    if (ret != 0) return ret;
+    char q[300];
+    snprintf(q, sizeof(q), "SELECT domain_id, kind, tag, cidr FROM karidns_zone_tagdefs WHERE domain_id = ANY ($1::bigint[]) ORDER BY domain_id, %s",
+             c->has_tagdef_id ? "id" : "ctid");
+    return pg_scan(c, "scan_ext (karidns_zone_tagdefs)", q, 1, pv, xg_row, (void *)sink);
+}
+
 
 /* ------------------------------------------------------------------------------------------------------------- */
 /* change log                                                                                                     */
@@ -1278,6 +1363,7 @@ const db_driver_t db_driver_postgresql = {
     pg_watch_requests, pg_requests_max, pg_reload_requests,
     pg_schema_findings, /* B12 */
     pg_find_zone,       /* B13 */
+    pg_scan_records_in, pg_scan_metadata_in, pg_scan_ext_in,      /* B13b */
 };
 
 #endif /* KARIDNS_DB_POSTGRESQL */

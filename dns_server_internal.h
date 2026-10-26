@@ -469,6 +469,12 @@ typedef struct {
   int *suffix_hash_table;
   int *suffix_chain_next;
   size_t suffix_hash_size;
+  /* the entries of this view the control thread's one-second tick must look at (zone_entry_ticks(): secondaries and
+   * catalog members, for their refresh / expire timers and the settings received from the primary).  Built with the
+   * hash tables, inherited by the incremental delta; the tick walks every entry only for a pending NOTIFY request
+   * (g_zone_notify_pending), so a million primary zones from the database cost the tick nothing. */
+  zone_db_entry_t **tick_entries;
+  size_t tick_count;
 } view_snapshot_t;
 
 typedef struct {
@@ -548,6 +554,15 @@ zone_db_snapshot_t *acquire_zone_snapshot(void);
 void retain_zone_snapshot(zone_db_snapshot_t *snap);
 zone_db_snapshot_t *acquire_retained_zone_snapshot(void);
 void release_zone_snapshot(zone_db_snapshot_t *snap);
+/* the entries the control thread's tick looks at every second (view_snapshot_t.tick_entries) */
+static inline bool zone_entry_ticks(const zone_db_entry_t *e) { return e->is_secondary || e->is_catalog_member; }
+/* NOTIFY requests (karictl notify, UPDATE) made since the control thread's tick last walked every zone: the flag
+ * notify_now can be set on any zone, so a pending request makes the next tick walk all of them once */
+extern _Atomic uint32_t g_zone_notify_pending;
+static inline void zone_notify_request(zone_db_entry_t *e) {
+  atomic_store_explicit(&e->notify_now, true, memory_order_release);
+  atomic_fetch_add_explicit(&g_zone_notify_pending, 1, memory_order_release);
+}
 zone_config_t *find_zone_config_in_view(server_config_t *cfg, const char *view_name, const char *domain);
 /* ゾーンエントリの設定。DB のゾーンは entry->dbcfg、それ以外は cfg の索引 (find_zone_config_in_view)。
  * 無ければ NULL。返した物は cfg を保持している間 (DB のゾーンは読み取り区間の中) だけ有効 */

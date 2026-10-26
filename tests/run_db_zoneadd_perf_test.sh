@@ -6,7 +6,8 @@
 # karidns with options { database { } } (SQLite3 filled with sqlite3: one SOA, one NS and one A per zone), the loader run as
 # "nobody" with LOADER_THREADS threads (default 4).  Checked: the startup batch loads all zones; the added zone is applied,
 # answers, and an unrelated zone keeps answering; a deleted zone is gone after `karictl reload <zone>`; the whole round trip
-# of the add stays under LIMIT_MS (default 1000).
+# of the add stays under LIMIT_MS (default 1000).  Then ONE_N (default 50) one-zone edits in a row, each reloaded with
+# `karictl reload <zone>`: every one is served in less than ONE_LIMIT_MS (default 500; the mean and the worst are printed).
 #
 # ZONES=n changes the number of zones (default 100000).  Needs root; SKIP otherwise, and when karidns, dag, karictl,
 # karidns-dbloader (SQLite3 driver), the sqlite3 CLI or perl (Time::HiRes) is missing.
@@ -26,6 +27,8 @@ id nobody >/dev/null 2>&1 || { echo "SKIP: no user nobody"; exit 0; }
 
 ZONES=${ZONES:-100000}
 LIMIT_MS=${LIMIT_MS:-1000}
+ONE_N=${ONE_N:-50}
+ONE_LIMIT_MS=${ONE_LIMIT_MS:-500}
 LOADER_THREADS=${LOADER_THREADS:-4}
 T=$(mktemp -d "${TMPDIR:-/tmp}/karidns_dbzoneadd.XXXXXX") || exit 1
 chmod 755 "$T"
@@ -127,6 +130,27 @@ OUT=$($KCTL reload zone9.test 2>&1)
 t2=$(now_ms)
 printf '%s\n' "$OUT" | grep -q "^OK zone zone9.test. (view [_a-z]*): deleted" && pass "delete: $OUT ($((t2 - t0)) ms)" || fail "delete: '$OUT'"
 ./dag @127.0.0.1 -p $PORT www.zone9.test A +nohexdump 2>/dev/null | grep -q "status: REFUSED" && pass "the deleted zone is gone" || fail "zone9.test still answers"
+
+# A series of one-zone edits, each `karictl reload <zone>` and served at once: no edit may take ONE_LIMIT_MS (default 500).
+# The control thread's one-second tick used to walk every zone (and hold an RCU read section) and the grace period of the
+# batch waited with sleeps doubling up to 131 ms, so about one edit in twenty took 131 / 262 / 524 ms at 1,000,000 zones.
+echo "== $ONE_N one-zone edits in a row (limit $ONE_LIMIT_MS ms each)"
+i=1; worst=0; slow=0; sum=0
+while [ $i -le "$ONE_N" ]; do
+    z=$(( ZONES / 2 + i ))
+    sqlite3 "$DB" "UPDATE records SET content = '192.0.2.$(( i % 200 + 20 ))' WHERE name = 'www.zone$z.test' AND type = 'A'"
+    t0=$(now_ms)
+    OUT=$($KCTL reload "zone$z.test" 2>&1)
+    A=$(ans "www.zone$z.test" A)
+    t2=$(now_ms)
+    d=$((t2 - t0)); sum=$((sum + d))
+    [ $d -gt $worst ] && worst=$d
+    if [ "$A" != "192.0.2.$(( i % 200 + 20 ))" ]; then fail "edit $i of zone$z.test not served after karictl answered: '$A' ($OUT)"; fi
+    [ $d -ge "$ONE_LIMIT_MS" ] && { slow=$((slow + 1)); echo "  edit $i (zone$z.test): $d ms"; }
+    i=$((i + 1))
+done
+echo "T-ZONECHANGE: $ONE_N edits, mean $((sum / ONE_N)) ms, worst $worst ms"
+[ $slow -eq 0 ] && pass "every one of $ONE_N one-zone edits was served in less than $ONE_LIMIT_MS ms (worst $worst ms)" || fail "$slow of $ONE_N one-zone edits took $ONE_LIMIT_MS ms or more (worst $worst ms)"
 
 kill -TERM "$SRV"
 i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done

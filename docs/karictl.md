@@ -145,10 +145,10 @@ The file is not parsed as a full configuration file: `karictl` takes the quoted 
 : Command executed successfully (including `tsig-keygen` and `-v`).
 
 `1`
-: Usage error, socket path too long, connection failure to the control socket, or failure to receive the challenge.
+: Socket path too long, connection failure to the control socket, or failure to receive the challenge.
 
 `2`
-: The secret could not be read or decoded from the configuration file, the challenge was invalid, or authentication failed.
+: Usage error (no command, an unknown option, `notify` / `retransfer` / `zonestatus` without a zone name; the usage text goes to standard error and nothing is sent to the server), or the secret could not be read or decoded from the configuration file, the challenge was invalid, or authentication failed. A command the server does not know is not a usage error for `karictl`: the server answers `ERROR unknown command` and the exit status is 3. `-h` and `--help` print the usage text to standard output and exit with 0.
 
 `3`
 : The server returned an error (`ERROR ...`, including a failed `reload` or `reconfig`, a database zone that was rejected or could not be read, and a reload that timed out) or an invalid `status` or `observatory` response (also `dbstatus` without a database block).

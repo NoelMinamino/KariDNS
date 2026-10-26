@@ -717,7 +717,7 @@ status "example: karicheck db CONFIG" 0
 out=$("$KC" db va "$T/k.conf" 2>&1); st=$?
 err "example: karicheck db VIEW CONFIG (the view must exist)" "view 'va' is not defined"
 out=$("$KC" db a b c d 2>&1); st=$?
-status "too many arguments" 1
+status "too many arguments (a usage error)" 2
 
 # ================================================================================================================================
 if "$LOADER" --drivers | grep -qx postgresql; then

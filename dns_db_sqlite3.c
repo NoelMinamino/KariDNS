@@ -524,7 +524,7 @@ static int sq_list_zones(db_conn_t *c, db_zone_cb cb, void *ud) {
     int ret = prep(c, &c->st_zones,
                    "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content FROM domains d "
                    "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND r.name = d.name AND r.disabled = 0 "
-                   "ORDER BY d.id");
+                   "ORDER BY d.id, r.id");
     if (ret != 0) return ret;
     rearm(c->st_zones);
     return sq_zone_loop(c, c->st_zones, cb, ud);
@@ -550,7 +550,7 @@ static int sq_find_zone(db_conn_t *c, const char *name, db_zone_cb cb, void *ud)
     int ret = prep(c, &c->st_zone_one,
                    "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content FROM domains d "
                    "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND r.name = d.name AND r.disabled = 0 "
-                   "WHERE d.name COLLATE NOCASE IN (?1, ?2) ORDER BY d.id");
+                   "WHERE d.name COLLATE NOCASE IN (?1, ?2) ORDER BY d.id, r.id");
     if (ret != 0) {
         free(a);
         return ret;
@@ -971,6 +971,7 @@ const db_driver_t db_driver_sqlite3 = {
     NULL, NULL, NULL,   /* B11 reload requests: PostgreSQL only (watch_requests, requests_max, reload_requests) */
     sq_schema_findings, /* B12 */
     sq_find_zone,       /* B13 */
+    NULL, NULL, NULL,   /* B13b scan_records_in, scan_metadata_in, scan_ext_in: PostgreSQL only (a statement costs no round trip here) */
 };
 
 #endif /* KARIDNS_DB_SQLITE3 */

@@ -948,6 +948,19 @@ static bool name_in_snapshot_is(const char *view, const char *name, const zone_d
     return r;
 }
 
+/* the tick list of the view (the entries the control thread looks at every second): its length, and whether e is in it;
+ * -1 when the view is missing */
+static int tick_list(const char *view, const zone_db_entry_t *e, bool *in_list) {
+    zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+    view_snapshot_t *v = snapshot_find_view(s, view);
+    int n = v ? (int)v->tick_count : -1;
+    *in_list = false;
+    for (size_t i = 0; v && i < v->tick_count; i++)
+        if (v->tick_entries[i] == e) *in_list = true;
+    release_zone_snapshot(s);
+    return n;
+}
+
 static zone_db_entry_t *new_secondary_entry(const char *view, const char *zone, zone_ext_shared_t *sh, int kind) {
     zone_db_entry_t *e = create_new_zone_entry(zone, view);
     CHECK(e != NULL);
@@ -984,9 +997,17 @@ static void test_secondary_entries(void) {
     dbreg_info_t info[2];
     CHECK(dbreg_find_info("default", "slave.test.", info, 2) == 1 && info[0].serial == 0 && info[0].has_entry);
     CHECK(s1->kind == ZONE_KIND_SECONDARY && s1->is_secondary);
+    /* the control thread's tick list has the secondary (added by the incremental delta) and nothing else */
+    bool in_tick = false;
+    CHECK(tick_list("default", s1, &in_tick) == 1 && in_tick);
     /* a full reconfiguration keeps the very same entry (a secondary's transferred data is not thrown away) */
     rebuild(cfg);
     CHECK(in_snapshot("default", s1) && dbreg_lookup_entry("default", "slave.test.") == s1);
+    CHECK(tick_list("default", s1, &in_tick) == 1 && in_tick);                    /* rebuilt from the entries */
+    /* primaries never enter the tick list, whatever their number */
+    zone_db_entry_t *pr = add_zone("default", "primary.test.", 1, 1, 99);
+    CHECK(snapshot_apply_db_delta() == 1 && in_snapshot("default", pr));
+    CHECK(tick_list("default", pr, &in_tick) == 1 && !in_tick);
 
     /* same name, other kind of zone: a new primary entry replaces the secondary one in the next delta */
     zone_db_entry_t *p1 = new_entry("default", "slave.test.");
@@ -999,6 +1020,7 @@ static void test_secondary_entries(void) {
     }
     CHECK(snapshot_apply_db_delta() == 2 && in_snapshot("default", p1) && !name_in_snapshot_is("default", "slave.test.", s1));
     CHECK(dbreg_lookup_entry("default", "slave.test.") == p1);
+    CHECK(tick_list("default", p1, &in_tick) == 0 && !in_tick);                   /* the removed secondary left the list */
 
     /* a catalog consumer: type slave with catalog-zone, its members come and go with it */
     zone_db_entry_t *cat = new_secondary_entry("default", "cat.test.", sh, 2);
@@ -1024,6 +1046,7 @@ static void test_secondary_entries(void) {
         release_zone_snapshot(s);
     }
     CHECK(mem2 && mem2->is_catalog_member && mem2->is_secondary && mem2->catalog_master != NULL);
+    CHECK(tick_list("default", mem2, &in_tick) == 3 && in_tick);                  /* the consumer and its two members */
     CHECK(mem2 && strcmp(mem2->catalog_master->ip, "192.0.2.1") == 0 && mem2->catalog_master->port == 5300 &&
           strcmp(mem2->catalog_master->tsig_key, "k1") == 0);                              /* the masters and the key of the consumer */
     CHECK(mem1 && mem1 != hid && mem1->is_catalog_member);                                  /* D17-1: the member wins */
@@ -1036,6 +1059,7 @@ static void test_secondary_entries(void) {
     CHECK(in_snapshot("default", hid));
     CHECK(dbreg_find_info("default", "m1.test.", info, 1) == 1 && !info[0].shadowed);
     CHECK(in_snapshot("default", p1));
+    CHECK(tick_list("default", p1, &in_tick) == 0);                               /* the consumer and its members left the list */
 
     zone_ext_shared_unref(sh);
     zone_retire_process(true);

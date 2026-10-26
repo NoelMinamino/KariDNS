@@ -36,6 +36,7 @@ int g_pending_coo_count = 0;
 int g_pending_coo_capacity = 0;
 
 _Atomic(zone_db_snapshot_t *) g_zone_db_active = ATOMIC_VAR_INIT(NULL);
+_Atomic uint32_t g_zone_notify_pending = ATOMIC_VAR_INIT(0);
 
 zone_db_snapshot_t *acquire_zone_snapshot(void) {
   return atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
@@ -355,6 +356,8 @@ void free_zone_db_snapshot(zone_db_snapshot_t *snap) {
         free(snap->views[v].suffix_chain_next);
         snap->views[v].suffix_chain_next = NULL;
       }
+      free(snap->views[v].tick_entries);
+      snap->views[v].tick_entries = NULL;
     }
     free(snap->views);
     snap->views = NULL;
@@ -1101,8 +1104,11 @@ static void catalog_entry_set_groups(zone_db_entry_t *entry, const catalog_membe
     }
 }
 
-/* Both hash tables of a view (zone name, and the suffix table find_zone_in_view() walks) from vs->entries /
- * vs->zone_count.  false: out of memory (the view keeps what was allocated; free_zone_db_snapshot() frees it). */
+static bool view_build_tick_list(view_snapshot_t *vs, const view_snapshot_t *ov, zone_db_entry_t *const *rem, size_t nrem,
+                                 zone_db_entry_t *const *add, size_t nadd);
+
+/* Both hash tables of a view (zone name, and the suffix table find_zone_in_view() walks) and the tick list from
+ * vs->entries / vs->zone_count.  false: out of memory (the view keeps what was allocated; free_zone_db_snapshot() frees it). */
 static bool view_build_hashes(view_snapshot_t *vs) {
     size_t p = 256;
     while (p < vs->zone_count * 2) p <<= 1;
@@ -1159,7 +1165,7 @@ static bool view_build_hashes(view_snapshot_t *vs) {
             vs->suffix_hash_table[idx] = i;
         }
     }
-    return true;
+    return view_build_tick_list(vs, NULL, NULL, 0, NULL, 0);
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -1501,6 +1507,35 @@ static bool ptr_in_sorted(zone_db_entry_t *const *arr, size_t n, const zone_db_e
     return false;
 }
 
+/* The tick list of a view (view_snapshot_t.tick_entries): the entries of vs->entries that zone_entry_ticks().  Without
+ * `ov` every entry is looked at (a rebuild, or a delta that rebuilt the arrays); with `ov` the list of the old view is
+ * inherited minus the removed entries (`rem`, sorted) plus the added ones (the incremental delta, which never touches
+ * the other entries, so their flags are what they were).  false: out of memory. */
+static bool view_build_tick_list(view_snapshot_t *vs, const view_snapshot_t *ov, zone_db_entry_t *const *rem, size_t nrem,
+                                 zone_db_entry_t *const *add, size_t nadd) {
+    free(vs->tick_entries);
+    vs->tick_entries = NULL;
+    vs->tick_count = 0;
+    size_t cap = ov ? ov->tick_count + nadd : vs->zone_count;
+    zone_db_entry_t **list = malloc((cap ? cap : 1) * sizeof(*list));
+    if (!list) return false;
+    size_t n = 0;
+    if (ov) {
+        for (size_t i = 0; i < ov->tick_count; i++) {
+            zone_db_entry_t *e = ov->tick_entries[i];
+            if (!(nrem && ptr_in_sorted(rem, nrem, e))) list[n++] = e;
+        }
+        for (size_t i = 0; i < nadd; i++)
+            if (zone_entry_ticks(add[i])) list[n++] = add[i];
+    } else {
+        for (size_t i = 0; i < vs->zone_count; i++)
+            if (vs->entries[i] && zone_entry_ticks(vs->entries[i])) list[n++] = vs->entries[i];
+    }
+    vs->tick_entries = list;
+    vs->tick_count = n;
+    return true;
+}
+
 /* The delta of one view without rebuilding its hash tables (the O(N) step of snapshot_apply_db_delta(): 90 of the 105 ms at 1,000,000
  * zones).  The tables of the old snapshot are copied (memcpy) and patched: an addition is appended and put at the head of its
  * chains, a removal unlinks the entry from its chains and moves the last entry into its slot (the chains of the moved entry are
@@ -1678,6 +1713,9 @@ int snapshot_apply_db_delta(void) {
                 }
                 for (size_t i = 0; i < nrem; i++) view_incr_remove(vs, &n, rem[i]);
                 for (size_t i = 0; i < nadd; i++) view_incr_add(vs, &n, add[i]);
+                ok = view_build_tick_list(vs, ov, rem, nrem, add, nadd);
+            }
+            if (ok) {
                 for (size_t i = 0; i < n; i++)
                     if (vs->entries[i]) dbreg_entry_ref(vs->entries[i]);
                 vs->zone_count = n;

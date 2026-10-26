@@ -3003,7 +3003,7 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
     zone_db_entry_t *e = snap ? dbreg_snapshot_entry(snap, zi->view, zone) : NULL;
     if (e) {
       syslog(LOG_NOTICE, "[Control] Received notify command for zone: %s (database zone, view %s)", zone, zi->view);
-      atomic_store_explicit(&e->notify_now, true, memory_order_release);
+      zone_notify_request(e);
       send(cfd, "OK\n", 3, 0);
     } else {
       static const char msg[] = "ERROR zone is not served from the database (hidden by another zone of the same name)\n";
@@ -3530,7 +3530,7 @@ void *control_thread_func(void *arg) {
                 send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'notify <zone> <view>')\n", 82, 0);
               } else if (lr.entry) {
                 syslog(LOG_NOTICE, "[Control] Received notify command for zone: %s", canon_arg);
-                atomic_store_explicit(&lr.entry->notify_now, true, memory_order_release);
+                zone_notify_request(lr.entry);
                 send(cfd, "OK\n", 3, 0);
               } else {
                 send(cfd, "ERROR zone not found\n", 21, 0);
@@ -3647,11 +3647,19 @@ void *control_thread_func(void *arg) {
         if (snap) {
             /* B7a: the settings block of a DB zone (entry->dbcfg) is replaced when the zone's metadata change and freed after a
              * grace period, so zone_entry_config() below must be read inside a read section (the blocks of file zones belong
-             * to the configuration snapshot held in `active`) */
+             * to the configuration snapshot held in `active`).
+             * Only the secondaries and catalog members (the view's tick list) have timers to look at; every zone is walked
+             * only when a NOTIFY was requested since the last full walk (notify_now can be set on any zone).  A walk of every
+             * entry costs about 100-250 ms with 1,000,000 database zones, during which this thread answers no karictl and the
+             * read section held here blocks the grace period of the ingest thread's batch (zone_retire_process(true)). */
+            bool walk_all = atomic_exchange_explicit(&g_zone_notify_pending, 0, memory_order_acq_rel) != 0;
             rcu_aux_read_lock();
             for (size_t v = 0; v < snap->view_count; v++) {
-                for (size_t i = 0; i < snap->views[v].zone_count; i++) {
-                    zone_db_entry_t *entry = snap->views[v].entries[i];
+                zone_db_entry_t **list = walk_all ? snap->views[v].entries : snap->views[v].tick_entries;
+                size_t count = walk_all ? snap->views[v].zone_count : snap->views[v].tick_count;
+                for (size_t i = 0; i < count; i++) {
+                    zone_db_entry_t *entry = list[i];
+                    if (!entry) continue;
 
                     /* B8t-2: settings received from the primary follow a changed karidns.conf (a secondary's own statements win) */
                     if (atomic_load_explicit(&entry->rx_present, memory_order_relaxed)) zone_rx_settings_refresh(entry, active);
@@ -5020,7 +5028,7 @@ int main(int argc, char **argv) {
               g_cli_port_override = port;
           } else if (kind < 0) {
               fprintf(stderr, "[ERROR] Invalid port '%s' for -p (expected 1-65535)\n", val);
-              return 1;
+              return 2;
           } else {
               // 互換のため PID ファイル指定も受け付けるが、-P を案内する
               fprintf(stderr, "[WARNING] '-p %s' is taken as a PID file path; use -P <pid_file> for PID files "
@@ -5037,7 +5045,7 @@ int main(int argc, char **argv) {
   if (!config_file) {
     fprintf(stderr, "Usage: %s [-v | --version] [-f] [-p <port|pid_file>] [-P <pid_file>] [-c <config_file> | <config_file>]\n", argv[0]);
     syslog(LOG_ERR, "Usage: %s [-v | --version] [-f] [-p <port|pid_file>] [-P <pid_file>] [-c <config_file> | <config_file>]", argv[0]);
-    return 1;
+    return 2;
   }
   if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
     g_startup_cwd[0] = '\0';

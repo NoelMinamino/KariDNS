@@ -982,6 +982,7 @@ typedef struct wk {
     db_conn_t *conn;
     const mset_t *bulk_meta;          /* bulk scan: the metadata of every zone; NULL = read them zone by zone into zmeta */
     mset_t zmeta;
+    bool grouped;                     /* zmeta / zext hold the rows of a group of zones (scan_*_in), sorted by domain_id, not of one zone */
     eset_t zext;                      /* B8: one-zone reads: the extension rows of the zone */
     size_t wi, wend;                  /* the next position of x->wl to finish, and the end of the task */
     pdns_zone_t *cur;
@@ -1235,7 +1236,7 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
     } else {
         /* metadata of this zone (sorted by domain_id) */
         const mset_t *m = w->bulk_meta ? w->bulk_meta : &w->zmeta;
-        for (size_t mi = w->bulk_meta ? meta_lower(m, zi->id) : 0; !z->failed && mi < m->n && m->v[mi].domain_id == zi->id; mi++) {
+        for (size_t mi = (w->bulk_meta || w->grouped) ? meta_lower(m, zi->id) : 0; !z->failed && mi < m->n && m->v[mi].domain_id == zi->id; mi++) {
             db_meta_row_t row = { zi->id, m->v[mi].kind, m->v[mi].content };
             pdns_zone_add_meta(z, &row);
         }
@@ -1380,6 +1381,53 @@ static int db_err_c(const db_driver_t *drv, db_conn_t *conn, char *errtext, size
 
 enum { TK_FATAL = -1 };      /* a task returns 0, an EXIT_* status of a database error, or this */
 
+/* The extension rows of a group of zones (scan_ext_in) into e. */
+static int eset_load_in(const db_driver_t *drv, db_conn_t *conn, const int64_t *ids, size_t n, eset_t *e) {
+    db_ext_sink_t sink = { eset_tags_cb, eset_td_cb, eset_def_cb, e };
+    return drv->scan_ext_in(conn, ids, n, &sink);
+}
+
+/* Several zones at a time (drivers with scan_*_in): per group of up to DB_IN_MAX consecutive wanted zones one statement for the
+ * metadata, one set for the extension tables and one for the records, instead of fifteen round trips for every zone.  The metadata and
+ * the extension rows of the group are held (a few rows per zone); the records are streamed as in the bulk scan, so a group costs no more
+ * memory than one zone.  The zones are converted and handed over in the same order as one by one, so the stream is the same bytes. */
+static int run_group(wk_t *w, size_t a, size_t b) {
+    const db_driver_t *drv = w->drv;
+    for (size_t pos = a; pos < b;) {
+        size_t e = b - pos > DB_IN_MAX ? pos + DB_IN_MAX : b;
+        int64_t ids[DB_IN_MAX], rids[DB_IN_MAX];
+        size_t nr = 0;
+        for (size_t i = pos; i < e; i++) {
+            ids[i - pos] = WZ(w, i)->id;
+            if (zone_sec_kind(WZ(w, i)->type) == KDB_ZK_PRIMARY) rids[nr++] = WZ(w, i)->id;        /* B7b: no records for a secondary zone */
+        }
+        mset_reset(&w->zmeta);
+        eset_reset(&w->zext);
+        w->grouped = true;
+        w->wi = pos;
+        w->wend = e;
+        int rc = drv->scan_metadata_in(w->conn, ids, e - pos, meta_cb, &w->zmeta);
+        if (rc == 0 && nr && w->x->has_ext) rc = eset_load_in(drv, w->conn, rids, nr, &w->zext);
+        if (rc == 0 && nr) rc = drv->scan_records_in(w->conn, rids, nr, rec_cb, w);
+        if (rc != 0) {
+            w->grouped = false;
+            if (rc == DB_STOPPED) {
+                if (w->zmeta.oom || w->zext.oom) w->oom = true;
+                return TK_FATAL;
+            }
+            return db_err_c(drv, w->conn, w->errtext, sizeof(w->errtext), rc, "reading the zone");
+        }
+        while (w->wi < w->wend)
+            if (finish_pos(w) != 0) {
+                w->grouped = false;
+                return TK_FATAL;
+            }
+        w->grouped = false;
+        pos = e;
+    }
+    return 0;
+}
+
 /* Read and convert the wanted zones at positions a..b-1 of x->wl.  bulk: one scan of the records (all = the whole table,
  * otherwise the domain_id range of the zones), else one query per zone. */
 static int run_task(wk_t *w, size_t a, size_t b, bool bulk, bool all) {
@@ -1403,6 +1451,7 @@ static int run_task(wk_t *w, size_t a, size_t b, bool bulk, bool all) {
             if (finish_pos(w) != 0) return TK_FATAL;
         return 0;
     }
+    if (b - a > 1 && drv->scan_records_in && drv->scan_metadata_in && (!w->x->has_ext || drv->scan_ext_in)) return run_group(w, a, b);
     for (size_t pos = a; pos < b; pos++) {
         int64_t id = WZ(w, pos)->id;
         w->wi = pos;
@@ -1603,7 +1652,7 @@ static int run_pool(ctx_t *x, const db_source_t *src, bool bulk, size_t n_want, 
     p->src = src;
     p->bulk = bulk;
     p->n_want = n_want;
-    size_t cmax = bulk ? 128 : 32;
+    size_t cmax = bulk ? 128 : (x->drv->scan_records_in ? 64 : 32);
     p->chunk = n_want / (nthr * 4);
     if (p->chunk < 1) p->chunk = 1;
     if (p->chunk > cmax) p->chunk = cmax;

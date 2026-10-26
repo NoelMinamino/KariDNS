@@ -202,7 +202,17 @@ typedef struct db_driver {
      * domains.name instead of the list of all zones.  name matches the way the loader's names_equal() does: ASCII case-insensitive, one
      * optional trailing dot.  Inside a snapshot, 0 or an error as list_zones; DB_STOPPED when the callback stopped it. */
     int (*find_zone)(db_conn_t *c, const char *name, db_zone_cb cb, void *ud);
+    /* Optional (NULL = the loader reads zone by zone with scan_records / scan_metadata / scan_ext): the rows of the n zones in ids (at most
+     * DB_IN_MAX, ascending domain ids) in one statement per table, with the order of the bulk scan: records and metadata ORDER BY
+     * domain_id, id; scan_ext as scan_ext(NULL) but only for these domains.  For a driver where a statement costs a network round trip
+     * (PostgreSQL: a cursor is DECLARE, FETCH and CLOSE, and a zone needs about fifteen statements), so that a reload of a few thousand
+     * zones does not pay fifteen round trips for each.  Same return values and callbacks as the single-zone calls. */
+    int (*scan_records_in)(db_conn_t *c, const int64_t *ids, size_t n, db_record_cb cb, void *ud);
+    int (*scan_metadata_in)(db_conn_t *c, const int64_t *ids, size_t n, db_meta_cb cb, void *ud);
+    int (*scan_ext_in)(db_conn_t *c, const int64_t *ids, size_t n, const db_ext_sink_t *sink);
 } db_driver_t;
+
+#define DB_IN_MAX 128u        /* the most zones of one scan_*_in call */
 
 /* compiled in when the driver is listed in DB_DRIVERS (Makefile) */
 #ifdef KARIDNS_DB_SQLITE3
