@@ -456,6 +456,32 @@ KARIDNS_TOOL_FN bool kc_line_listed(const char *list, const char *name) {
     return false;
 }
 
+/* The loader file the way db_sup_init() (dns_db_supervisor.c, check_loader_path) wants it: a regular file that the user running karidns may
+ * execute, owned by root or by that user, not writable by group or others.  Here the user who runs karicheck stands in for the one who
+ * runs karidns (as root the file must be root's).  Reports errors (karicheck conf and karicheck db); true when the file can be executed. */
+KARIDNS_TOOL_FN bool kc_check_loader_file(kc_tally_t *t, const char *lp) {
+    struct stat st;
+    if (stat(lp, &st) != 0) {
+        kc_error(t, "database loader '%s': %s\n", lp, strerror(errno));
+        return false;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        kc_error(t, "database loader '%s' is not a regular file\n", lp);
+        return false;
+    }
+    if (st.st_uid != 0 && st.st_uid != geteuid())
+        kc_error(t, "database loader '%s' is not owned by root%s (uid %u); karidns refuses to run it\n", lp,
+                 geteuid() == 0 ? "" : " or by the user running karidns", (unsigned)st.st_uid);
+    if (st.st_mode & (S_IWGRP | S_IWOTH))
+        kc_error(t, "database loader '%s' is writable by group or others (mode %04o); karidns refuses to run it\n", lp,
+                 (unsigned)(st.st_mode & 07777));
+    if (access(lp, X_OK) != 0) {
+        kc_error(t, "database loader '%s' is not executable by this user\n", lp);
+        return false;
+    }
+    return true;
+}
+
 /* has the loader at `lp` been built with the driver `driver`?  (karicheck conf and karicheck db) */
 KARIDNS_TOOL_FN void kc_check_loader_driver(kc_tally_t *t, const char *lp, const char *driver) {
     char drivers[256];
@@ -568,27 +594,9 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
     if (db->loader_group && !getgrnam(db->loader_group))
         kc_error(&t, "database loader-group '%s' does not exist\n", db->loader_group);
 
-    /* loader-path: exists, root-owned, not group / world writable; and it has the driver */
+    /* loader-path: owned by root (or by the user running karidns), not group / world writable, executable; and it has the driver */
     const char *lp = db_loader_path(cfg);
-    struct stat st;
-    bool loader_ok = false;
-    if (stat(lp, &st) != 0) {
-        kc_error(&t, "database loader '%s': %s\n", lp, strerror(errno));
-    } else if (!S_ISREG(st.st_mode)) {
-        kc_error(&t, "database loader '%s' is not a regular file\n", lp);
-    } else {
-        loader_ok = true;
-        if (st.st_uid != 0)
-            kc_error(&t, "database loader '%s' is not owned by root (uid %u); karidns refuses to run it\n", lp,
-                     (unsigned)st.st_uid);
-        if (st.st_mode & (S_IWGRP | S_IWOTH))
-            kc_error(&t, "database loader '%s' is writable by group or others (mode %04o); karidns refuses to run it\n",
-                     lp, (unsigned)(st.st_mode & 07777));
-        if (access(lp, X_OK) != 0) {
-            kc_error(&t, "database loader '%s' is not executable by this user\n", lp);
-            loader_ok = false;
-        }
-    }
+    bool loader_ok = kc_check_loader_file(&t, lp);
     if (loader_ok && db->driver) kc_check_loader_driver(&t, lp, db->driver);
 
     /* B7a: without acl-ceiling the ACLs a database zone carries (allow-transfer, allow-update from the metadata or a profile)
@@ -1513,7 +1521,7 @@ KARIDNS_TOOL_FN int kc_db_main(const char *config_path, const char *view_arg) {
     {
         kc_tally_t ct = {0};
         if (!db->driver) kc_error(&ct, "options { database { } } has no driver\n");
-        else if (access(lp, X_OK) != 0) kc_error(&ct, "database loader '%s' is not executable by this user: %s\n", lp, strerror(errno));
+        else if (!kc_check_loader_file(&ct, lp) || ct.errors > 0) {}                     /* ownership, mode and X_OK as karidns wants them: before the loader is run */
         else if (geteuid() != 0) kc_check_loader_driver(&ct, lp, db->driver);      /* root does not run the loader, not even --drivers: the loader after the privilege drop says it */
         if (ct.errors > 0) return 1;
     }

@@ -10,7 +10,7 @@ In the commands below, replace `?.?.?` with the release version (for example `0.
 
 | OS / Platform | Artifact | Included Binaries / Assets | Installation Method |
 |---|---|---|---|
-| **FreeBSD** 14.x / 15.x (amd64) | `karidns-?.?.?-FreeBSD-14-amd64.pkg`, `karidns-?.?.?-FreeBSD-15-amd64.pkg`; with a database loader: `karidns-sqlite3-...`, `karidns-postgresql-...`, `karidns-db-...` (see [§2.5](#25-packages-with-the-database-loader)) | `karidns`, `karictl`, `karicheck`, `dag`, sample configs, rc.d script, manuals (database packages: `karidns-dbloader` and the SQL files) | `pkg add` |
+| **FreeBSD** 14.x / 15.x (amd64) | `karidns-?.?.?-FreeBSD-14-amd64.pkg`, `karidns-?.?.?-FreeBSD-15-amd64.pkg`; with a database loader: `karidns-sqlite3-?.?.?-FreeBSD-14-amd64.pkg`, `karidns-postgresql-...`, `karidns-db-...`, each for FreeBSD 14 and 15 (see [§2.5](#25-packages-with-the-database-loader)) | `karidns`, `karictl`, `karicheck`, `dag`, sample configs, rc.d script, manuals (database packages: `karidns-dbloader` and the SQL files) | `pkg add` |
 | **Linux (RPM)** RHEL 9 / Rocky / AlmaLinux / Fedora (x86_64) | `dag-?.?.?-1.el9.x86_64.rpm` | `dag` | `dnf install` / `rpm -ivh` |
 | **Linux (DEB)** Ubuntu / Debian (amd64) | `dag_?.?.?_amd64.deb` | `dag` | `dpkg -i` |
 | **Linux (Generic)** x86_64 | `dag-?.?.?-linux-x86_64.tar.gz` | `dag` (standalone binary) | Extract & copy to `/usr/local/bin` |
@@ -97,7 +97,7 @@ Zones can be served from a PowerDNS 5.1 SQLite3 or PostgreSQL database ([`karidn
 | `karidns-postgresql` | `postgresql` | PostgreSQL driver | `databases/postgresqlNN-client` (libpq; NN is the version installed on the build host) |
 | `karidns-db` | `both` | both drivers | both |
 
-The release workflow builds and publishes the plain `karidns` package. Build a database package on a FreeBSD host that has the library, as a normal user, from the top of the source tree (each run starts with `make clean`; the version is the first argument and is only used for the file name and the package metadata):
+The release workflow builds and publishes all four packages for each FreeBSD version (the database packages with `build_pkg.sh --db sqlite3`, `--db postgresql` and `--db both` in a VM that has `sqlite3` and `postgresql17-client` installed, so the PostgreSQL packages depend on `postgresql17-client`), and checks that the loader of each reports exactly the drivers of its package. To build one yourself, use a FreeBSD host that has the library, as a normal user, from the top of the source tree (each run starts with `make clean`; the version is the first argument and is only used for the file name and the package metadata):
 
 ```sh
 sh packaging/freebsd/build_pkg.sh --db sqlite3 0.5.0 ./dist

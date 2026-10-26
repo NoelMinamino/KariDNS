@@ -214,6 +214,26 @@ kill -9 "$P3"
 i=0; while [ $i -lt 200 ]; do dbst db2.test | grep -q "status applied$" && break; sleep 0.1; i=$((i + 1)); done
 dbst db2.test | grep -q "serial 20, status applied$" && pass "dbstatus db2.test: applied again after the fix" || { fail "db2.test is still not applied"; dbst db2.test | sed 's/^/         /'; }
 
+# ================================================================ serial 0
+# beta design 3.2: a zone with SOA serial 0 is loaded as it is, with a warning (once per version sent, not on every reload)
+echo "== SOA serial 0: loaded with a warning, once"
+printf '$ORIGIN zero.test.\n$TTL 300\n@ SOA ns1.zero.test. host.zero.test. 0 3600 600 86400 300\n@ NS ns1\nns1 A 192.0.2.4\nwww A 192.0.2.40\n' > "$T/z/zero.test.zone"
+./tests/db/zone2sql --dialect sqlite3 "$T/z/zero.test.zone" 2>/dev/null | sqlite3 "$T/db/z.db"
+$KCTL reload > "$T/reload0.out" 2>&1
+i=0; while [ $i -lt 100 ]; do [ "$(ans www.zero.test A)" = "192.0.2.40" ] && break; sleep 0.1; i=$((i + 1)); done
+check_ans "www.zero.test A is served" "192.0.2.40" www.zero.test A
+ans zero.test SOA | grep -q "^ns1.zero.test. host.zero.test. 0 3600 600 86400 300$" && pass "zero.test is served with SOA serial 0" || fail "zero.test SOA: $(ans zero.test SOA)"
+dbst zero.test | grep -q "serial 0, status applied" && pass "dbstatus zero.test: serial 0, applied" || { fail "dbstatus zero.test"; dbst zero.test | sed 's/^/         /'; }
+wait_log "$T/srv.log" "zone 'zero.test.' (domains.id [0-9]*): the SOA serial is 0" 5 && pass "log: the loader warns about serial 0" || { fail "no serial 0 warning"; tail -5 "$T/srv.log" | sed 's/^/         /'; }
+$KCTL reload > "$T/reload1.out" 2>&1
+P4=$(loader_pid)
+kill -9 "$P4"                                   # a new loader compares every zone with the Backend's inventory: same digest, nothing sent
+wait_log "$T/srv.log" "\[DB\] batch [0-9]* complete" 20 5 || true
+sleep 1
+[ "$(grep -c "zone 'zero.test.' (domains.id [0-9]*): the SOA serial is 0" "$T/srv.log")" -eq 1 ] && pass "the warning appears once: not on a reload of the unchanged zone, nor after a loader restart" || { fail "the serial 0 warning was logged $(grep -c "the SOA serial is 0" "$T/srv.log") times"; }
+check_ans "www.zero.test A is still served" "192.0.2.40" www.zero.test A
+sqlite3 "$T/db/z.db" "DELETE FROM records WHERE domain_id = (SELECT id FROM domains WHERE name = 'zero.test'); DELETE FROM domains WHERE name = 'zero.test'"      # the later sections count $NZ zones
+
 # ================================================================ stop
 echo "== SIGTERM"
 kill -TERM "$SRV"

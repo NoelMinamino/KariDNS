@@ -1277,6 +1277,11 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
             if (er == 0) {
                 r->kind = ZR_SENT;
                 r->serial = z->serial;
+                /* design 3.2: serial 0 is loaded as it is, with a warning.  Here, not before the digest gate: a zone the Backend already
+                 * has (ZR_UNCHANGED) is not said again on every reload, only a new version of it */
+                if (!x->check && skind == KDB_ZK_PRIMARY && z->serial == 0)
+                    lg(LOG_WARNING, "zone '%s' (domains.id %lld): the SOA serial is 0; PowerDNS may compute the served serial (SOA-EDIT, auto-serial), "
+                                    "but KariDNS uses the stored value as it is, so secondaries and NOTIFY see serial 0", z->name, (long long)zi->id);
                 snprintf(r->profile, sizeof(r->profile), "%s", z->profile);
                 memcpy(r->digest, g.digest, KDB_DIGEST_LEN);
             } else if (er == 1) {
@@ -1425,13 +1430,25 @@ static int deliver_inline(wk_t *w, size_t pos, zres_t *r) {
 /* --check: nothing is sent; the zones the production load would refuse are the errors (the converted stream is discarded) */
 static int deliver_check(wk_t *w, size_t pos, zres_t *r) {
     ctx_t *x = w->x;
-    (void)pos;
     x->chk_zones++;
     if (r->kind == ZR_FATAL) {
         x->oom = true;
         return -1;
     }
-    if (r->kind == ZR_FAILED) chk_line('E', chk_strip_zone(r->reason));
+    if (r->kind == ZR_FAILED) {
+        const zinfo_t *zi = WZ(w, pos);
+        if (zi->type && zi->name && strcasecmp(zi->type, "PRODUCER") == 0) {
+            /* D9: the production load reports the PRODUCER zone as failed (ZONE_FAILED) and serves its members; for the operator that is
+             * a gap in the catalog service, not a broken zone, so --check says so as a warning (zone_type_reason() is the same fact) */
+            size_t members = 0;
+            for (size_t j = 0; j < x->nz && j < x->chk_ncat; j++)
+                if (x->chk_cat[j] && names_equal(x->chk_cat[j], zi->name)) members++;
+            chk_linef('W', "the catalog zone %.200s is not served (catalog producer zones are not supported yet); its %zu member zones are served; "
+                           "secondaries that take the catalog from KariDNS will not get it", g_chk_zone, members);
+        } else {
+            chk_line('E', chk_strip_zone(r->reason));
+        }
+    }
     return 0;
 }
 
@@ -2297,7 +2314,7 @@ static void chk_catalogs(ctx_t *x) {
         char canon[DNS_NAME_TEXT_SIZE];
         snprintf(g_chk_zone, sizeof(g_chk_zone), "%s", x->zones[i].name && pdns_canonical_zone_name(x->zones[i].name, canon) ? canon : (x->zones[i].name ? x->zones[i].name : ""));
         g_chk_id = x->zones[i].id;
-        chk_linef('W', "domains.catalog names '%.200s', which is not a PRODUCER zone of this database (KariDNS ignores the column; catalog producer zones are not loaded yet)", cat);
+        chk_linef('W', "domains.catalog names '%.200s', which is not a PRODUCER zone of this database (KariDNS ignores the column; catalog producer zones are not served yet)", cat);
     }
     g_chk_zone[0] = '\0';
     g_chk_id = 0;

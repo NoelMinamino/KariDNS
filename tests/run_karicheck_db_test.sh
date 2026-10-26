@@ -345,7 +345,18 @@ clean "a CONSUMER zone with a master"
 db_reset
 sql "INSERT INTO domains (id, name, type) VALUES (32, 'cat.test', 'PRODUCER')"
 conf; run
-err "a PRODUCER zone is not loaded yet" "cat.test.' (domains.id 32): .*PRODUCER"
+warn "a PRODUCER zone is a warning: the catalog zone is not served, nothing else is wrong" "cat.test.' (domains.id 32): the catalog zone cat.test. is not served (catalog producer zones are not supported yet); its 0 member zones are served; secondaries that take the catalog from KariDNS will not get it"
+status "a PRODUCER zone alone: exit 0 (D9: only the catalog zone itself is missing)" 0
+db_reset
+sql "INSERT INTO domains (id, name, type) VALUES (32, 'cat.test', 'PRODUCER');
+$(zone 34 m1.test)
+$(zone 35 m2.test)
+UPDATE domains SET catalog = 'cat.test' WHERE id IN (34, 35)"
+conf; run
+warn "a PRODUCER zone with members: they are counted as served" "cat.test.' (domains.id 32): the catalog zone cat.test. is not served .*its 2 member zones are served; secondaries"
+status "a PRODUCER zone with members: exit 0" 0
+nowarn "the members of a PRODUCER zone have a catalog to name" "domains.catalog names"
+has "the PRODUCER zone and its members are read, no error" "RESULT.*4 zone(s) read, 0 error(s)"
 db_reset
 sql "$(zone 33 member.test)
 UPDATE domains SET catalog = 'nocat.test' WHERE id = 33"
@@ -603,6 +614,28 @@ fi
 rm -f "$DB" "$DB-wal" "$DB-shm"
 conf; run
 err "a database file that does not exist" "database file '$DB': No such file or directory"
+# the ownership and the mode of the loader, as karidns wants them (dns_db_supervisor.c): an error before the loader is run
+printf '#!/bin/sh\ntouch "%s/ran"\n' "$T" > "$T/dbl_gw"; chmod 775 "$T/dbl_gw"; own "$T/dbl_gw"
+rm -f "$T/ran"
+LOADERPATH=$T/dbl_gw; conf; run; LOADERPATH=
+err "a loader writable by group: error" "database loader '$T/dbl_gw' is writable by group or others"
+status "a loader writable by group: exit 1" 1
+[ -e "$T/ran" ] && bad "$BACKEND: a group-writable loader was run" || ok "$BACKEND: a group-writable loader is not run"
+printf '#!/bin/sh\ntouch "%s/ran"\n' "$T" > "$T/dbl_other"; chmod 755 "$T/dbl_other"
+OTHER_OK=0
+if [ $IS_ROOT = 1 ]; then
+    chown "$LUSER" "$T/dbl_other" && OTHER_OK=1
+elif [ "$ME" != nobody ] && sudo -n chown nobody "$T/dbl_other" 2>/dev/null; then
+    OTHER_OK=1
+fi
+if [ $OTHER_OK = 1 ]; then
+    LOADERPATH=$T/dbl_other; conf; run; LOADERPATH=
+    err "a loader owned by another non-root user: error" "database loader '$T/dbl_other' is not owned by root.*(uid [1-9][0-9]*); karidns refuses to run it"
+    status "a loader owned by another non-root user: exit 1" 1
+    [ -e "$T/ran" ] && bad "$BACKEND: a loader of another user was run" || ok "$BACKEND: a loader of another user is not run"
+else
+    echo "  [SKIP] a loader owned by another non-root user (needs passwordless sudo to chown)"
+fi
 db_reset
 LOADERPATH=$T/nope; conf; run; LOADERPATH=
 err "no loader: DB support is not installed" "DB support is not installed"

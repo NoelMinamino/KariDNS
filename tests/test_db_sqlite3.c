@@ -1424,7 +1424,8 @@ static void test_check_mode(void) {
     CHECK(check_lines_ok(out));
     CHECK(strstr(out, "Z\tgood.test.\t1\tprimary\tva\tVb\n") || strstr(out, "Z\tgood.test.\t1\tprimary\tVb\tva\n"));       /* the rows of one zone come in table order */
     CHECK_HAS(out, "Z\tprod.test.\t4\tother\t*\n");
-    CHECK_HAS(out, "E\tprod.test.\t4\t");
+    CHECK_HAS(out, "W\tprod.test.\t4\tthe catalog zone prod.test. is not served (catalog producer zones are not supported yet); its 0 member zones are served; secondaries that take the catalog from KariDNS will not get it\n");
+    CHECK(strstr(out, "E\tprod.test.") == NULL);
     CHECK_HAS(out, "W\tgood.test.\t1\tdomains.catalog names 'nothere.test'");
     free(out);
 
