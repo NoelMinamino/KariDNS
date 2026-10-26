@@ -225,6 +225,7 @@ zone "ovr-yes.jp" {
 EOF
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     echo "[*] Cleaning up test processes..."
     kari_kill_tree "${SERVER_PID_YES:-}"
     kari_kill_tree "${SERVER_PID_IN:-}"

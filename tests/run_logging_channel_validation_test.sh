@@ -16,6 +16,7 @@ CONF_UNDEF_RLOG="$DIR/conf_undef_rlog.conf"
 CONF_MULTI_KEY="$DIR/conf_multi_key_acl.conf"
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     rm -f "$CONF_VALID_LOG" "$CONF_UNDEF_QLOG" "$CONF_UNDEF_RLOG" "$CONF_MULTI_KEY"
 }
 trap cleanup EXIT INT TERM

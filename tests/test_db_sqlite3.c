@@ -459,6 +459,44 @@ static void test_nul(void) {
     }
 }
 
+/* ------------------------------------------------------------------ 3b. find_zone is an index search */
+/* "WHERE d.name COLLATE NOCASE = ?1 OR d.name COLLATE NOCASE = ?2" made SQLite scan all of domains (SCAN d: 8,400 pages and 60 ms at
+ * 1,000,000 zones); the IN list is a SEARCH on name_index.  With 200,000 zones a scan costs 10 ms or more, a search microseconds: 300
+ * lookups of a missing and of an existing name must stay far below the time of even a handful of scans. */
+static void test_find_zone_index(void) {
+    printf("find_zone uses the index on domains.name (200,000 zones)\n");
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("findidx.db", path, sizeof(path));
+    CHECK(db != NULL);
+    if (!db) return;
+    raw_exec(db, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200000) "
+                 "INSERT INTO domains (id, name, type) SELECT i, 'z' || i || '.test', 'NATIVE' FROM n");
+    raw_exec(db, "ANALYZE");
+    sqlite3_close(db);
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (!c) return;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int found = 0, wrong = 0;
+    for (int i = 0; i < 300; i++) {
+        char nm[64];
+        zl_t l = {0};
+        snprintf(nm, sizeof(nm), "nosuch%d.test.", i);
+        if (db_driver_sqlite3.find_zone(c, nm, zl_collect, &l) != 0 || l.n != 0) wrong++;
+        zl_free(&l);
+        snprintf(nm, sizeof(nm), "Z%d.TEST", 150000 + i);
+        if (db_driver_sqlite3.find_zone(c, nm, zl_collect, &l) != 0 || l.n != 1 || l.id[0] != 150000 + i) wrong++;
+        else found++;
+        zl_free(&l);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+    CHECK(wrong == 0 && found == 300);
+    CHECK_MSG(ms < 1000.0, "600 find_zone calls took %.0f ms (an index search takes a few ms; a scan of domains about 6 s)", ms);
+    db_driver_sqlite3.close(c);
+}
+
 /* ------------------------------------------------------------------ 4. zone list, bulk == per zone, keys */
 static void test_scans(void) {
     printf("zone list, bulk and per-zone scans, metadata, keys\n");
@@ -2061,6 +2099,7 @@ int main(int argc, char **argv) {
     test_rows();
     test_nul();
     test_scans();
+    test_find_zone_index();
     test_snapshot();
     test_busy();
     test_changes();

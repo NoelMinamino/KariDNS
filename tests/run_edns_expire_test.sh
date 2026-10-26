@@ -32,6 +32,7 @@ FAILED=0
 PID1=""; PID2=""; PID3=""
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     for p in $PID1 $PID2 $PID3; do kill -9 "$p" 2>/dev/null || true; done
     rm -rf "$TMP_DIR" 2>/dev/null || true
 }

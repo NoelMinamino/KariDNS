@@ -24,6 +24,7 @@ chmod 755 "$TEST_DIR"
 PORT=$((31000 + $$ % 4000))
 KARIDNS_PID=""
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     [ -n "$KARIDNS_PID" ] && kari_kill_tree "$KARIDNS_PID"
     kari_kill_conf "$TEST_DIR/karidns.conf"
     rm -rf "$TEST_DIR"

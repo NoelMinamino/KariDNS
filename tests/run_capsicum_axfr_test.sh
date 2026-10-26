@@ -18,6 +18,7 @@ cp tests/zones/example.com.zone tests/zones/example.com.zone.bak
 echo "\$INCLUDE capsicum_include_test/dir1/init.inc" >> tests/zones/example.com.zone
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     if [ -n "$SERVER_PID" ]; then
         kill -TERM "$SERVER_PID" 2>/dev/null || true
         sleep 0.5 2>/dev/null || true

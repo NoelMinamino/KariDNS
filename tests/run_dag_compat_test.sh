@@ -39,6 +39,7 @@ perl "$MOCK_PL" --port="$PORT" &
 MOCK_PID=$!
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     echo "=== Cleaning up ==="
     if [ -n "$MOCK_PID" ]; then
         kill "$MOCK_PID" 2>/dev/null || true

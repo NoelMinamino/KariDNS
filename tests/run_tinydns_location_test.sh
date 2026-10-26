@@ -27,6 +27,7 @@ if [ "$(id -u)" = "0" ]; then
 fi
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     kari_kill_tree "${SERVER_PID:-}"
     if [ "$ALIAS_ADDED" = "1" ]; then
         ifconfig lo0 inet "$ALIAS_IP" netmask 255.0.0.0 -alias 2>/dev/null || true

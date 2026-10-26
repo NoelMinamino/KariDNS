@@ -15,6 +15,7 @@ CONF_NO_USER="$DIR/conf_no_user.conf"
 CONF_WITH_USER="$DIR/conf_with_user.conf"
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     kari_kill_conf "$CONF_NO_USER" "$CONF_WITH_USER"
     rm -f "$CONF_NO_USER" "$CONF_WITH_USER"
 }

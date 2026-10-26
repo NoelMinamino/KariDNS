@@ -1501,6 +1501,76 @@ static bool ptr_in_sorted(zone_db_entry_t *const *arr, size_t n, const zone_db_e
     return false;
 }
 
+/* The delta of one view without rebuilding its hash tables (the O(N) step of snapshot_apply_db_delta(): 90 of the 105 ms at 1,000,000
+ * zones).  The tables of the old snapshot are copied (memcpy) and patched: an addition is appended and put at the head of its
+ * chains, a removal unlinks the entry from its chains and moves the last entry into its slot (the chains of the moved entry are
+ * relinked to the new index), so the work per change is a chain walk.  The load factor stays at or below one half, the invariant
+ * of view_build_hashes(); the caller falls back to the full rebuild when it would not.  The hash functions are the ones of
+ * view_build_hashes(). */
+static void view_chain_unlink(int *table, int *chain, size_t size, uint32_t hash, int idx) {
+    int *link = &table[hash & (size - 1)];
+    while (*link != -1) {
+        if (*link == idx) {
+            *link = chain[idx];
+            return;
+        }
+        link = &chain[*link];
+    }
+}
+
+static void view_chain_push(int *table, int *chain, size_t size, uint32_t hash, int idx) {
+    size_t b = hash & (size - 1);
+    chain[idx] = table[b];
+    table[b] = idx;
+}
+
+static uint32_t view_main_hash(const zone_db_entry_t *e) {
+    return calc_fnv1a_str(e->domain);
+}
+
+static uint32_t view_suffix_hash(const zone_db_entry_t *e) {
+    return calc_fnv1a_strn(e->domain, zone_key_len(e->domain));
+}
+
+/* vs->entries / hash tables are copies of the old snapshot's with room for cap entries; *n entries are in use */
+static void view_incr_remove(view_snapshot_t *vs, size_t *n, const zone_db_entry_t *e) {
+    size_t b = view_main_hash(e) & (vs->hash_size - 1);
+    int at = -1;
+    for (int j = vs->hash_table[b]; j != -1; j = vs->chain_next[j]) {
+        if (vs->entries[j] == e) {
+            at = j;
+            break;
+        }
+    }
+    if (at < 0) return;
+    view_chain_unlink(vs->hash_table, vs->chain_next, vs->hash_size, view_main_hash(e), at);
+    view_chain_unlink(vs->suffix_hash_table, vs->suffix_chain_next, vs->suffix_hash_size, view_suffix_hash(e), at);
+    int last = (int)*n - 1;
+    if (at != last) {
+        zone_db_entry_t *moved = vs->entries[last];
+        vs->entries[at] = moved;
+        vs->chain_next[at] = -1;
+        vs->suffix_chain_next[at] = -1;
+        if (moved) {
+            view_chain_unlink(vs->hash_table, vs->chain_next, vs->hash_size, view_main_hash(moved), last);
+            view_chain_unlink(vs->suffix_hash_table, vs->suffix_chain_next, vs->suffix_hash_size, view_suffix_hash(moved), last);
+            view_chain_push(vs->hash_table, vs->chain_next, vs->hash_size, view_main_hash(moved), at);
+            view_chain_push(vs->suffix_hash_table, vs->suffix_chain_next, vs->suffix_hash_size, view_suffix_hash(moved), at);
+        }
+    }
+    vs->entries[last] = NULL;
+    vs->chain_next[last] = -1;
+    vs->suffix_chain_next[last] = -1;
+    (*n)--;
+}
+
+static void view_incr_add(view_snapshot_t *vs, size_t *n, zone_db_entry_t *e) {
+    int at = (int)(*n)++;
+    vs->entries[at] = e;
+    view_chain_push(vs->hash_table, vs->chain_next, vs->hash_size, view_main_hash(e), at);
+    view_chain_push(vs->suffix_hash_table, vs->suffix_chain_next, vs->suffix_hash_size, view_suffix_hash(e), at);
+}
+
 int snapshot_apply_db_delta(void) {
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     if (atomic_load_explicit(&g_dbreg_pending, memory_order_relaxed) == 0) {
@@ -1584,7 +1654,36 @@ int snapshot_apply_db_delta(void) {
                 }
             }
         }
-        if (ok) {
+        /* The usual case (no catalog consumer leaves, the tables of the old snapshot have room): patch copies of the old hash tables
+         * instead of rebuilding them from every name; the references of the new snapshot are taken once the arrays are final, so a
+         * failure before that leaves zone_count 0 and nothing to release. */
+        bool incr = ok && !drop_members && ov->hash_table && ov->chain_next && ov->suffix_hash_table && ov->suffix_chain_next &&
+                    ov->hash_size > 0 && ov->hash_size == ov->suffix_hash_size && (ov->zone_count + nadd) * 2 <= ov->hash_size;
+        if (incr) {
+            size_t cap = ov->zone_count + nadd, n = ov->zone_count;
+            vs->hash_size = ov->hash_size;
+            vs->suffix_hash_size = ov->suffix_hash_size;
+            vs->hash_table = malloc(vs->hash_size * sizeof(int));
+            vs->suffix_hash_table = malloc(vs->suffix_hash_size * sizeof(int));
+            vs->chain_next = malloc((cap ? cap : 1) * sizeof(int));
+            vs->suffix_chain_next = malloc((cap ? cap : 1) * sizeof(int));
+            ok = vs->hash_table && vs->suffix_hash_table && vs->chain_next && vs->suffix_chain_next;
+            if (ok) {
+                memcpy(vs->hash_table, ov->hash_table, vs->hash_size * sizeof(int));
+                memcpy(vs->suffix_hash_table, ov->suffix_hash_table, vs->suffix_hash_size * sizeof(int));
+                if (n) {                                                    /* an empty view may have no arrays to copy from */
+                    memcpy(vs->entries, ov->entries, n * sizeof(*vs->entries));
+                    memcpy(vs->chain_next, ov->chain_next, n * sizeof(int));
+                    memcpy(vs->suffix_chain_next, ov->suffix_chain_next, n * sizeof(int));
+                }
+                for (size_t i = 0; i < nrem; i++) view_incr_remove(vs, &n, rem[i]);
+                for (size_t i = 0; i < nadd; i++) view_incr_add(vs, &n, add[i]);
+                for (size_t i = 0; i < n; i++)
+                    if (vs->entries[i]) dbreg_entry_ref(vs->entries[i]);
+                vs->zone_count = n;
+                changes += (int)(nrem + nadd);
+            }
+        } else if (ok) {
             size_t k = 0;
             for (size_t i = 0; i < ov->zone_count; i++) {
                 zone_db_entry_t *e = ov->entries[i];

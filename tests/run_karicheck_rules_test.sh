@@ -16,6 +16,7 @@ TMP_DIR="$(mktemp -d /tmp/karicheck_rules.XXXXXX)"
 FAILED=0
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     rm -rf "${TMP_DIR}"
 }
 trap cleanup EXIT INT TERM

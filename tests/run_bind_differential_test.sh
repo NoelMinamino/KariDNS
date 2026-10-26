@@ -31,6 +31,7 @@ KARI_PID=""
 BIND_PID=""
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     kari_kill_tree "${KARI_PID:-}" "${BIND_PID:-}"
     kari_kill_conf "${TMP_DIR}/karidns.conf"
     rm -rf "${TMP_DIR}"

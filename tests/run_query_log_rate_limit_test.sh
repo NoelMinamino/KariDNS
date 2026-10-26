@@ -76,6 +76,7 @@ zone "example.jp" {
 EOF
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     echo "[*] Cleaning up test processes and temp files..."
     kari_kill_tree "${PID_LIMITED:-}" "${PID_UNLIMITED:-}"
     rm -f "$CONF_LIMITED" "$CONF_UNLIMITED" "$LOG_LIMITED" "$LOG_UNLIMITED" "$ZONE_FILE"

@@ -43,6 +43,7 @@ TMP_DIR="/tmp/karidns_yaml_sockfam_force_test_$$"
 mkdir -p "$TMP_DIR"
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     [ -n "$SRV4_PID" ] && kill -9 "$SRV4_PID" 2>/dev/null || true
     [ -n "$SRV6_PID" ] && kill -9 "$SRV6_PID" 2>/dev/null || true
     rm -rf "$TMP_DIR"

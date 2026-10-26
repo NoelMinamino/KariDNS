@@ -859,6 +859,38 @@ static void test_notify(void) {
         D->close(c2);
     }
 
+    /* LISTEN refused for good (a hot standby cannot LISTEN): wait_fd() is -1 and poll_version() reads a fingerprint of the change
+     * log instead, which changes when a row is added, also one that a transaction adds at its commit with a seq below the highest */
+    db_conn_t *c3 = open_drv(NULL);
+    PGconn *w2 = connect_db(g_db);
+    if (c3 && w2) {
+        CHECK(D->check_schema(c3, &si) == 0 && si.has_changes);
+        c3->listen_failed = true;                      /* what ensure_listen() records when the server answers "cannot execute LISTEN during recovery" */
+        CHECK(D->wait_fd(c3) == -1);
+        uint64_t p0 = 0, p1 = 0, p2 = 0, p3 = 0;
+        bool r3 = true;
+        CHECK(D->poll_version(c3, &p0, &r3) == 0 && !r3);
+        CHECK(D->poll_version(c3, &p1, &r3) == 0 && p1 == p0);              /* nothing happened */
+        Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (2, 'n3.b.test', 'A', '192.0.2.13', 60)");
+        CHECK(D->poll_version(c3, &p2, &r3) == 0 && p2 != p0);              /* a commit */
+        CHECK(D->poll_version(c3, &p1, &r3) == 0 && p1 == p2);
+        CHECK(qx(w2, "BEGIN") && qx(w2, "INSERT INTO records (domain_id, name, type, content, ttl) VALUES (2, 'n4.b.test', 'A', '192.0.2.14', 60)"));
+        Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (2, 'n5.b.test', 'A', '192.0.2.15', 60)");   /* higher seq, commits first */
+        CHECK(D->poll_version(c3, &p3, &r3) == 0 && p3 != p2);
+        CHECK(qx(w2, "COMMIT"));                                            /* the lower seq becomes visible last */
+        CHECK(D->poll_version(c3, &p2, &r3) == 0 && p2 != p3);
+        /* the connection is gone: a transient error, like the notification path */
+        char pidv[32], q2[300];
+        snprintf(q2, sizeof(q2), "SELECT pid FROM pg_stat_activity WHERE application_name = 'karidns-dbloader' AND datname = '%s' ORDER BY backend_start DESC LIMIT 1", g_db);
+        qv(g_admin, q2, pidv, sizeof(pidv));
+        snprintf(q2, sizeof(q2), "SELECT pg_terminate_backend(%s)", pidv);
+        if (pidv[0]) Q(q2);
+        usleep(300000);
+        CHECK(D->poll_version(c3, &p1, &r3) == DB_ERR_RETRY);
+    }
+    if (c3) D->close(c3);
+    if (w2) PQfinish(w2);
+
     /* the backend is terminated from outside: the driver reports a transient error */
     char sql[300], pid[32];
     snprintf(sql, sizeof(sql), "SELECT pid FROM pg_stat_activity WHERE application_name = 'karidns-dbloader' AND datname = '%s' ORDER BY backend_start LIMIT 1", g_db);

@@ -18,6 +18,7 @@ TMP_DIR="$(mktemp -d /tmp/karidns_tinydns_ts_test.XXXXXX)"
 SERVER_PID=""
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     kari_kill_tree "${SERVER_PID:-}"
     rm -rf "$TMP_DIR" 2>/dev/null || true
 }

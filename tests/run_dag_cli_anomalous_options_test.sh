@@ -26,6 +26,7 @@ PORT=$((23000 + $$ % 8000))
 TCP_PORT=$((31000 + $$ % 8000))
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     [ -n "$SRV_PID" ] && kill -9 "$SRV_PID" 2>/dev/null || true
     [ -n "$MOCK_TCP_PID" ] && kill -9 "$MOCK_TCP_PID" 2>/dev/null || true
     rm -rf "$TMP_DIR"

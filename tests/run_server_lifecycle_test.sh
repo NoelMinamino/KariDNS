@@ -33,6 +33,7 @@ chmod 755 "${TMP_DIR}"
 PIDS=""
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     # shellcheck disable=SC2086
     kari_kill_tree ${PIDS}
     kari_kill_conf "${TMP_DIR}/valid.conf" "${TMP_DIR}/conflict.conf"

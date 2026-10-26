@@ -47,6 +47,7 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa IN A 192.0.2.1
 EOF
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     rm -f "$BAD_LABEL_ZONE" "$BAD_NAME_ZONE" "$GOOD_ZONE"
 }
 trap cleanup EXIT INT TERM

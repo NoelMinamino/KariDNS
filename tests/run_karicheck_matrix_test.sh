@@ -307,6 +307,10 @@ out=$("$KC" zone 2>&1); rc=$?;       check "cli:zone-without-domain" 1 "Usage:" 
 out=$("$KC" bogus 2>&1); rc=$?;      check "cli:unknown-command" 1 "Usage:" "$out" "$rc"
 out=$("$KC" --version 2>&1); rc=$?;  check "cli:version" 0 "karicheck " "$out" "$rc"
 out=$("$KC" -v 2>&1); rc=$?;         check "cli:version-short" 0 "karicheck " "$out" "$rc"
+out=$("$KC" --help 2>/dev/null); rc=$?;   check "cli:help" 0 "Usage:" "$out" "$rc"
+out=$("$KC" -h 2>/dev/null); rc=$?;       check "cli:help-short" 0 "Usage:" "$out" "$rc"
+out=$("$KC" --help 2>&1 >/dev/null); rc=$?; check "cli:help-stderr-empty" 0 "" "$out" "$rc"
+[ -z "$out" ] || { echo "  FAIL [cli:help-stderr]: usage text on stderr"; FAIL=$((FAIL + 1)); }
 
 echo "=== karicheck matrix: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]

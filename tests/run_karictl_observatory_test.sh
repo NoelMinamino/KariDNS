@@ -28,6 +28,7 @@ mkdir -p "$TMP_DIR"
 SERVER_PID=""
 
 cleanup() {
+    set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null || true
     rm -rf "$TMP_DIR" 2>/dev/null || true
 }
