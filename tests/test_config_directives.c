@@ -2604,6 +2604,8 @@ static void test_also_notify_bind(void) {
     expect_an_error("unknown list in options", "options {\n also-notify { 192.0.2.1;\n  nolist; };\n};", "line 3|options also-notify|'nolist'");
     expect_an_error("unknown list in view", "view \"v\" { match-clients { any; };\n also-notify { nolist; }; };", "line 2|view 'v' also-notify|'nolist'");
     expect_an_error("hostname is not an address", "options { also-notify { ns1.example.test; }; };", "'ns1.example.test'");
+    expect_an_error("ip:port is not the port syntax", "zone \"s.test\" { type slave; file \"s\";\n  masters { 192.0.2.254:53; }; };",
+                    "line 2|'192.0.2.254:53'|write the port as '<address> port <n>'");
     expect_an_error("undefined key", "options {\n also-notify { 192.0.2.1 key nokey; }; };", "line 2|key 'nokey' is not defined");
     expect_an_error("undefined key on a list", "remote-servers l {\n 192.0.2.1 key nokey; };\noptions { };", "line 2|remote-servers 'l'|key 'nokey'");
     expect_an_error("undefined key on a list name", AN_KEY "remote-servers l { 192.0.2.1; };\noptions { also-notify { l key nokey; }; };",

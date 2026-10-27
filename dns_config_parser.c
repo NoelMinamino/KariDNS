@@ -3245,8 +3245,11 @@ static int expand_targets(token_ctx_t *ctx, const server_config_t *cfg, const ch
       const remote_list_t *l = cfg->remote_lists;
       while (l && strcasecmp(l->name, s->list) != 0) l = l->next;
       if (!l) {
-        notify_cfg_error(ctx, s->where, what, "'%.64s' is neither an IP address nor a remote-servers / primaries / masters list defined in this configuration",
-                         s->list);
+        /* "192.0.2.1:53" was kept as an address string before and never worked; say how to write the port */
+        const char *colon = strrchr(s->list, ':');
+        bool ip_port = colon && colon != s->list && colon[1] && strspn(colon + 1, "0123456789") == strlen(colon + 1);
+        notify_cfg_error(ctx, s->where, what, "'%.64s' is neither an IP address nor a remote-servers / primaries / masters list defined in this configuration%s",
+                         s->list, ip_port ? " (write the port as '<address> port <n>')" : "");
         return -1;
       }
       if (depth + 1 > KARIDNS_REMOTE_LIST_DEPTH) {
