@@ -4220,6 +4220,8 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
            (void *)(uintptr_t)(MAX_BIND_ADDRS + i));
     kevent(kq, &ev, 1, NULL, 0, NULL);
   }
+  /* SIGTERM / SIGINT / SIGCHLD / SIGHUP were reset by the fork site in main() before anything else ran; the calls
+   * stay as the router's own statement of what it expects */
   signal(SIGCHLD, SIG_DFL);
   signal(SIGTERM, SIG_DFL);
   signal(SIGINT, SIG_DFL);
@@ -4234,11 +4236,16 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
   pid_t parent_pid = getppid();
   struct kevent ev_proc;
   EV_SET(&ev_proc, backend_pid, EVFILT_PROC, EV_ADD | EV_CLEAR, NOTE_EXIT, 0, (void *)1000);
-  kevent(kq, &ev_proc, 1, NULL, 0, NULL);
+  /* A failed registration means the process is already gone (ESRCH: exited and reaped), so no NOTE_EXIT will ever
+   * arrive: the router would wait for it forever and keep the UDP port. */
+  if (kevent(kq, &ev_proc, 1, NULL, 0, NULL) < 0) {
+    syslog(LOG_NOTICE, "[Frontend %d] Backend already exited (%m); router exiting.", router_id);
+    exit(0);
+  }
   struct kevent ev_parent;
   EV_SET(&ev_parent, parent_pid, EVFILT_PROC, EV_ADD | EV_CLEAR, NOTE_EXIT, 0, (void *)1001);
-  kevent(kq, &ev_parent, 1, NULL, 0, NULL);
-  if (getppid() != parent_pid) {
+  if (kevent(kq, &ev_parent, 1, NULL, 0, NULL) < 0 || getppid() != parent_pid) {
+    syslog(LOG_NOTICE, "[Frontend %d] Manager already exited; router exiting.", router_id);
     exit(0);
   }
 
@@ -4685,6 +4692,9 @@ STATIC_TEST char g_pid_file_path[1024] = "";
 STATIC_TEST int g_pid_fd = -1;
 STATIC_TEST volatile sig_atomic_t g_supervisor_should_exit = 0;
 STATIC_TEST volatile sig_atomic_t g_supervisor_got_sighup = 0;
+STATIC_TEST volatile sig_atomic_t g_supervisor_term_count = 0; /* SIGTERM / SIGINT taken by the handler (not by sigtimedwait) */
+#define SHUTDOWN_KILL_MS 10000   /* the manager SIGKILLs the children that ignore SIGTERM for this long */
+#define SHUTDOWN_GIVEUP_MS 5000  /* ... and stops waiting for those that do not die from SIGKILL either */
 
 /* X-01: ハンドラはどのスレッドでも動くので、volatile sig_atomic_t ではなくロックフリーの
  * atomic にする (C11 7.14.1.1 はハンドラと割り込まれたコードの間しか定めない)。 */
@@ -4723,6 +4733,7 @@ STATIC_TEST void supervisor_sig_handler(int sig) {
     g_supervisor_got_sighup = 1;
   } else {
     g_supervisor_should_exit = 1;
+    g_supervisor_term_count++;
   }
 }
 
@@ -5485,6 +5496,18 @@ int main(int argc, char **argv) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGHUP, &sa, NULL);
 
+    /* A router must not run the handlers above: they only set a flag, so a SIGTERM that the manager sends while a
+     * router is still starting up (before run_frontend_router() resets it) would be lost.  The signals are blocked
+     * across the forks; the child resets the dispositions and then unblocks, so a signal that arrived meanwhile
+     * stays pending and is delivered with its default action.  The parent unblocks after the last fork. */
+    sigset_t fork_block, fork_orig;
+    sigemptyset(&fork_block);
+    sigaddset(&fork_block, SIGTERM);
+    sigaddset(&fork_block, SIGINT);
+    sigaddset(&fork_block, SIGHUP);
+    sigaddset(&fork_block, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &fork_block, &fork_orig);
+
     pid_t router_pids[MAX_FRONTEND_ROUTERS];
     for (int r = 0; r < g_num_frontend_routers; r++) {
       gc_snapshot_wait_idle();
@@ -5499,6 +5522,11 @@ int main(int argc, char **argv) {
       }
       if (rpid == 0) {
         // Frontend Router Process
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGHUP, SIG_IGN);
+        signal(SIGCHLD, SIG_DFL);
+        sigprocmask(SIG_SETMASK, &fork_orig, NULL);
         g_pid_file_path[0] = '\0';
         if (g_pid_fd >= 0) {
           close(g_pid_fd);
@@ -5514,6 +5542,7 @@ int main(int argc, char **argv) {
       }
       router_pids[r] = rpid;
     }
+    sigprocmask(SIG_SETMASK, &fork_orig, NULL);
 
     // 親プロセス（Manager）はすべての不要なIPCソケット・制御ソケットを確実にクローズ (指示2)
     for (int f = 0; f < g_num_frontend_routers; f++) {
@@ -5609,41 +5638,59 @@ int main(int argc, char **argv) {
     if (g_supervisor_should_exit && dead <= 0) {
       syslog(LOG_INFO, "[Manager] Received termination signal. Shutting down children.");
     }
-    kill(backend_pid, SIGTERM);
-    for (int r = 0; r < g_num_frontend_routers; r++) {
-      kill(router_pids[r], SIGTERM);
-    }
-    if (g_broker_pid > 0) {
-      kill(g_broker_pid, SIGTERM);
+    /* The children that have not been collected yet (the loader is tracked by dbsup).  A pid that was reaped is never
+     * signalled again: it could belong to another process by now. */
+    pid_t kids[MAX_FRONTEND_ROUTERS + 2];
+    int nkids = 0;
+    kids[nkids++] = backend_pid;
+    for (int r = 0; r < g_num_frontend_routers; r++) kids[nkids++] = router_pids[r];
+    if (g_broker_pid > 0) kids[nkids++] = g_broker_pid;
+    for (int k = 0; k < nkids; k++) {
+      if (kids[k] == dead) kids[k] = 0;
+      else kill(kids[k], SIGTERM);
     }
     db_sup_signal(&dbsup, SIGTERM);
-    int64_t loader_kill_ms = 0; // a loader that does not end on SIGTERM (stuck in a database call) is killed after 10 s
+    /* The wait is bounded: a child that does not end on SIGTERM (stuck in a database call, a start-up that missed the
+     * signal) is killed after SHUTDOWN_KILL_MS, and at once by a second SIGTERM / SIGINT to the manager.  Those
+     * signals are taken by the handler now (the mask was restored above), which counts them. */
+    const int shutdown_term_count = g_supervisor_term_count;
+    int64_t shutdown_start_ms = 0, kill_sent_ms = 0;
     while (1) {
       int status;
-      pid_t w;
-      if (dbsup.enabled && dbsup.pid > 0) {
-        w = waitpid(-1, &status, WNOHANG);
-        if (w == 0) {
-          struct timespec now_ts;
-          clock_gettime(CLOCK_MONOTONIC, &now_ts);
-          int64_t now_ms = (int64_t)now_ts.tv_sec * 1000 + now_ts.tv_nsec / 1000000;
-          if (loader_kill_ms == 0) loader_kill_ms = now_ms + 10000;
-          else if (now_ms >= loader_kill_ms) {
+      pid_t w = waitpid(-1, &status, WNOHANG);
+      if (w == 0 || (w < 0 && errno == EINTR)) {
+        struct timespec now_ts;
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        int64_t now_ms = (int64_t)now_ts.tv_sec * 1000 + now_ts.tv_nsec / 1000000;
+        if (shutdown_start_ms == 0) shutdown_start_ms = now_ms;
+        if (kill_sent_ms == 0 &&
+            (now_ms - shutdown_start_ms >= SHUTDOWN_KILL_MS || g_supervisor_term_count != shutdown_term_count)) {
+          kill_sent_ms = now_ms;
+          for (int k = 0; k < nkids; k++) {
+            if (kids[k] == 0) continue;
+            syslog(LOG_WARNING, "[Manager] Child process %d did not stop; killing it", (int)kids[k]);
+            kill(kids[k], SIGKILL);
+          }
+          if (dbsup.enabled && dbsup.pid > 0) {
             syslog(LOG_WARNING, "[Manager] Database loader (pid %d) did not stop; killing it", (int)dbsup.pid);
             db_sup_signal(&dbsup, SIGKILL);
-            loader_kill_ms = now_ms + 3600 * 1000;
           }
-          usleep(20000);
-          continue;
+        } else if (kill_sent_ms != 0 && now_ms - kill_sent_ms >= SHUTDOWN_GIVEUP_MS) {
+          /* a process that does not die even from SIGKILL (a hung kernel call): do not hold the pid file forever */
+          syslog(LOG_CRIT, "[Manager] Child processes did not end after SIGKILL; giving up waiting");
+          if (child_exit_code == 0) child_exit_code = 1;
+          break;
         }
-      } else {
-        w = wait(&status);
+        usleep(20000);
+        continue;
       }
       if (w > 0 && dbsup.enabled && w == dbsup.pid) {
         dbsup.pid = 0; // the loader's own status does not decide the exit code of the server
         continue;
       }
       if (w > 0) {
+        for (int k = 0; k < nkids; k++)
+          if (kids[k] == w) kids[k] = 0;
         if (WIFEXITED(status)) {
           int code = WEXITSTATUS(status);
           if (code != 0) {
@@ -5658,8 +5705,7 @@ int main(int argc, char **argv) {
         }
         continue;
       }
-      if (w < 0 && errno == EINTR) continue;
-      break;
+      break; // ECHILD: everything is collected
     }
     cleanup_pid_file();
     exit(child_exit_code);
