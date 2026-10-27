@@ -609,7 +609,9 @@ STATIC_TEST bool find_delegation(const zone_image_t *img, const char *qname,
     // 参照応答(referral)にせず、権威応答としてフェーズ2の通常検索へ継続させる。
     uint32_t id = (is_ds_query && name == qname) ? ZONE_IMAGE_NONE : zone_image_find_name(img, name);
     if (id != ZONE_IMAGE_NONE) {
-      rr_filter_t flt = { client_loc, client_ecs_tag, client_loc_tag, 0, NULL };
+      /* the referral NS and DS go in the Authority section, which a resolver does not tie to a network (RFC 7871 §7.3.1, §7.4:
+       * SCOPE 0 on delegations): they are chosen without ECS, as the Additional section (append_glue_records()) */
+      rr_filter_t flt = { client_loc, NULL, client_loc_tag, 0, NULL };
       // 委任の NS は子ゾーンのデータで署名されない (RFC 4035 §2.2)。入りきらなければ NS を丸ごと外して TC。
       int ns_written = emit_rrset(img, id, NULL, 2, 255, &flt, RRSIG_NONE, res, max_res_len,
                                   offset, comp_ctx, nscount, NULL);
@@ -1593,7 +1595,8 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     if (qtypes[0] != 2 && qtypes[0] != 255) { needs_ns = true; }
     if (type_matched && !minimal_responses && needs_ns) {
       /* R-03: 頂点の NS は署名された RRset。DO=1 なら RRSIG(NS) も付け、入りきらなければ TC (RFC 4035 §3.1.1) */
-      rr_filter_t ns_flt = { client_loc, client_ecs_tag, client_loc_tag, 0, NULL };
+      /* Authority section: without ECS (RFC 7871 §7.3.1), as find_delegation() */
+      rr_filter_t ns_flt = { client_loc, NULL, client_loc_tag, 0, NULL };
       if (emit_rrset(img, zone_image_find_name(img, db_entry->domain), NULL, 2, 255, &ns_flt,
                      dnssec_ok ? RRSIG_REQUIRED : RRSIG_NONE, res, max_res_len, offset, comp_ctx, nscount,
                      &glue) < 0) {

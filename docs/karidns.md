@@ -313,7 +313,7 @@ ecs-tags {
 };
 ```
 
-The same syntax is used for `location-tags`. The blocks can be placed in `options` and in `zone`. For each zone, tags defined inside the zone file (`$ECS-SUBNET-TAG` / `$LOCATION-TAG`) take precedence, then the `zone` block, then `options`. Tags are checked in the order they are defined and the first tag with a matching CIDR wins. See the [Client Geolocation & Subnet Steering Guide](KariDNS_How_to_use_ECS_and_location.md).
+The same syntax is used for `location-tags`. The blocks can be placed in `options` and in `zone`. For each zone, tags defined inside the zone file (`$ECS-SUBNET-TAG` / `$LOCATION-TAG`) take precedence, then the `zone` block, then `options`. Tags are checked in the order they are defined and the first tag with a matching CIDR wins. ECS tags steer the Answer section only: Additional-section addresses and the NS / DS RRsets of the Authority section are chosen as for a query without ECS (RFC 7871 §7.3.1, §7.4); location tags apply everywhere. See the [Client Geolocation & Subnet Steering Guide](KariDNS_How_to_use_ECS_and_location.md).
 
 ### `logging { ... }`
 

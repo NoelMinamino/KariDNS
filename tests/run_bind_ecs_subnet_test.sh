@@ -127,6 +127,12 @@ www     IN  A   192.0.2.3
 $ECS-SUBNET none
 mail    IN  A   192.0.2.25
 mx      IN  MX  10 www.example.com.
+
+$ECS-SUBNET us
+@       IN  NS  ns-us.example.net.
+deleg   IN  NS  ns-us.example.net.
+$ECS-SUBNET none
+deleg   IN  NS  ns-all.example.net.
 EOF
 
 # Zone 2: Zone-level override of ecs-tags
@@ -417,6 +423,23 @@ run_check_not "Additional: no tagged address of the MX target" \
     "[[:space:]]A[[:space:]]+192\.0\.2\.(1|2|10)$" "[[:space:]]A[[:space:]]+192\.0\.2\.3$"
 run_ecs_check "Additional: SCOPE 0 for the untagged MX answer" \
     "mx.example.com MX @127.0.0.1 -p $PORT +subnet=192.0.2.50/32" "192\.0\.2\.50/32/0"
+
+echo "=== 3d. Authority-section NS ignore ECS (RFC 7871 §7.3.1, §7.4) ==="
+# A 'us' client: the referral for deleg.example.com carries only the untagged NS, and SCOPE is 0 (delegation).
+run_check_not "Authority: the referral has no ECS-tagged NS" \
+    "$DAG www.deleg.example.com A @127.0.0.1 -p $PORT +subnet=192.0.2.50/32 +nohexdump" \
+    "ns-us\.example\.net" "IN[[:space:]]+NS[[:space:]]+ns-all\.example\.net\."
+run_ecs_check "Authority: referral SCOPE 0" \
+    "www.deleg.example.com A @127.0.0.1 -p $PORT +subnet=192.0.2.50/32" "192\.0\.2\.50/32/0"
+# The apex NS in the Authority section of a positive answer: untagged only.
+run_check_not "Authority: the apex NS of an answer has no ECS-tagged NS" \
+    "$DAG mail.example.com A @127.0.0.1 -p $PORT +subnet=192.0.2.50/32 +nohexdump" \
+    "ns-us\.example\.net" "IN[[:space:]]+NS[[:space:]]+ns1\.example\.com\."
+# Asking for the NS RRset itself is an Answer: it is tailored and has the tag's SCOPE.
+run_check "Answer: an NS query from a 'us' client gets the tagged NS" \
+    "$DAG example.com NS @127.0.0.1 -p $PORT +short +subnet=192.0.2.50/32" "ns-us\.example\.net\."
+run_ecs_check "Answer: NS query SCOPE /25" \
+    "example.com NS @127.0.0.1 -p $PORT +subnet=192.0.2.50/32" "192\.0\.2\.50/32/25"
 
 echo "=== 4. Testing Zone-Level Override of ecs-tags ==="
 
