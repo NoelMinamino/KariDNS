@@ -742,10 +742,10 @@ static void test_fill_observatory_snapshot(void) {
 }
 
 // ----------------------------------------------------------------------------
-// 10. is_zone_synthetic_type & find_configured_domain Test
+// 10. find_configured_domain Test
 // ----------------------------------------------------------------------------
-static void test_synthetic_zone_and_find_domain(void) {
-    printf("[TEST] Server Core: is_zone_synthetic_type & find_configured_domain...\n");
+static void test_find_configured_domain(void) {
+    printf("[TEST] Server Core: find_configured_domain...\n");
 
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -779,45 +779,8 @@ static void test_synthetic_zone_and_find_domain(void) {
     found = find_configured_domain("unknown.zone.", buf, sizeof(buf));
     assert(strcmp(found, "unknown.zone.") == 0);
 
-    // 2. is_zone_synthetic_type test with mock zone_db_snapshot_t
-    zone_db_entry_t e_master, e_fwd, e_prog;
-    memset(&e_master, 0, sizeof(e_master));
-    strlcpy(e_master.domain, "master.example.", sizeof(e_master.domain));
-    strlcpy(e_master.view_name, "default", sizeof(e_master.view_name));
-
-    memset(&e_fwd, 0, sizeof(e_fwd));
-    strlcpy(e_fwd.domain, "fwd.example.", sizeof(e_fwd.domain));
-    strlcpy(e_fwd.view_name, "default", sizeof(e_fwd.view_name));
-
-    memset(&e_prog, 0, sizeof(e_prog));
-    strlcpy(e_prog.domain, "prog.example.", sizeof(e_prog.domain));
-    strlcpy(e_prog.view_name, "default", sizeof(e_prog.view_name));
-
-    zone_db_entry_t *entries[3] = {&e_master, &e_fwd, &e_prog};
-    view_snapshot_t view;
-    memset(&view, 0, sizeof(view));
-    view.name = "default";
-    view.entries = entries;
-    view.zone_count = 3;
-
-    zone_db_snapshot_t snap;
-    memset(&snap, 0, sizeof(snap));
-    snap.views = &view;
-    snap.view_count = 1;
-
-    // is_zone_synthetic_type: Master -> false
-    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "master.example.", 1) == false);
-    // is_zone_synthetic_type: Forward -> true
-    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "fwd.example.", 1) == true);
-    // is_zone_synthetic_type: Program -> true
-    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "prog.example.", 1) == true);
-    // Non-existent zone -> false
-    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "nonexistent.example.", 1) == false);
-    // NULL parameters -> false
-    assert(is_zone_synthetic_type(NULL, "127.0.0.1", "fwd.example.", 1) == false);
-
     atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
-    printf("  -> is_zone_synthetic_type & find_configured_domain passed.\n");
+    printf("  -> find_configured_domain passed.\n");
 }
 
 // ----------------------------------------------------------------------------
@@ -2784,40 +2747,6 @@ static void test_fill_observatory_snapshot_all_counters(void) {
     assert(strcmp(snap.domain, "allstats.example.") == 0);
     assert(snap.queries_total == 42);
     printf("  -> observatory snapshot counters passed.\n");
-}
-
-static void test_synthetic_zone_catalog_and_reverse(void) {
-    printf("[TEST] Server Core: is_zone_synthetic_type catalog and reverse zone types...\n");
-    server_config_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    zone_config_t z_prog;
-    memset(&z_prog, 0, sizeof(z_prog));
-    z_prog.domain = "prog.example.";
-    z_prog.type = "program";
-    cfg.zones = &z_prog;
-    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
-
-    zone_db_entry_t e_prog;
-    memset(&e_prog, 0, sizeof(e_prog));
-    strlcpy(e_prog.domain, "prog.example.", sizeof(e_prog.domain));
-    strlcpy(e_prog.view_name, "default", sizeof(e_prog.view_name));
-
-    zone_db_entry_t *entries[1] = {&e_prog};
-    view_snapshot_t view;
-    memset(&view, 0, sizeof(view));
-    view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
-
-    zone_db_snapshot_t snap;
-    memset(&snap, 0, sizeof(snap));
-    snap.views = &view;
-    snap.view_count = 1;
-
-    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "prog.example.", 1) == true);
-    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "other.example.", 1) == false);
-    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release); // cfg is on this stack frame
-    printf("  -> synthetic zone types passed.\n");
 }
 
 static void test_find_configured_domain_case_insensitive(void) {
@@ -5321,7 +5250,7 @@ int main(void) {
     test_log_write_rotated_timestamp_versions();
     test_tcp_pool_and_single_write();
     test_fill_observatory_snapshot();
-    test_synthetic_zone_and_find_domain();
+    test_find_configured_domain();
     test_ensure_priv_dir_safe();
     test_server_core_program_zone_reload_fingerprint_and_added();
     test_server_core_notify_tsig_key_matching_and_transfer_bg_ctx();
@@ -5367,7 +5296,6 @@ int main(void) {
     test_query_log_rate_limiting_decay();
     test_log_write_rotated_size_limit_zero();
     test_fill_observatory_snapshot_all_counters();
-    test_synthetic_zone_catalog_and_reverse();
     test_find_configured_domain_case_insensitive();
     test_ensure_priv_dir_safe_symlink_attack();
     test_ensure_priv_dir_safe_world_writable();

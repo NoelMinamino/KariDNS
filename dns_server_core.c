@@ -1566,25 +1566,6 @@ bool init_async_io_pool(void) {
   return true;
 }
 
-bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname, uint16_t qtype) {
-  if (!snap || !qname) return false;
-  view_snapshot_t *view = select_view(snap, client_ip);
-  if (!view) return false;
-  server_config_t *cfg = acquire_config_snapshot();
-  if (!cfg) return false;
-
-  bool is_synth = false;
-  zone_db_entry_t *entry = find_zone_for_query(view, qname, qtype); // R-32: DS at a child apex goes to the parent
-  if (entry) {
-    const zone_config_t *zcfg = zone_entry_config(cfg, entry);
-    if (zcfg && zcfg->type && (strcasecmp(zcfg->type, "program") == 0 || strcasecmp(zcfg->type, "forward") == 0)) {
-      is_synth = true;
-    }
-  }
-  release_config_snapshot(cfg);
-  return is_synth;
-}
-
 void fast_ipv4_to_str(uint32_t ip_be, char *dst) {
   uint8_t *p = (uint8_t *)&ip_be;
   for (int i = 0; i < 4; i++) {
@@ -2000,7 +1981,7 @@ worker_startup_success:;
                                ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
 
             /* E2: the view and the zone are looked up here once; process_dns_query_cap_routed() takes them instead of looking
-             * them up again.  A program / forward zone is answered by an async I/O thread (is_zone_synthetic_type()). */
+             * them up again. */
             query_route_t route;
             route.view = select_view(snap, client_ip);
             route.entry = route.view ? find_zone_for_query(route.view, qname, ((req_buf[2] >> 3) & 0x0F) == 0 ? qtype : 0) : NULL;
