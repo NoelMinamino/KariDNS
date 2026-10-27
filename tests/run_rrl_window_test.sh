@@ -3,6 +3,7 @@ set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$(dirname "$0")/lib_proc.sh"
+PORT=$(kari_port 0 10053)
 ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 
@@ -27,7 +28,7 @@ EOF
 
 cat << EOF > "$CONF"
 options {
-    port 10053;
+    port ${PORT};
     bind-address { 127.0.0.1; };
     user "nobody";
     group "nobody";
@@ -59,14 +60,14 @@ sleep 2
 
 # Helper function to send N queries in a single microsecond-level burst via Perl
 send_instant_burst() {
-    perl -e '
+    KARI_RRL_PORT=$PORT perl -e '
     use strict;
     use warnings;
     use Socket;
 
     my $count = $ARGV[0] || 25;
     my $qtype = $ARGV[1] || 1; # 1 = A (NOERROR), 28 = AAAA (NODATA)
-    my $port = 10053;
+    my $port = $ENV{KARI_RRL_PORT};
     my $ip = "127.0.0.1";
 
     socket(my $sock, PF_INET, SOCK_DGRAM, getprotobyname("udp")) or die "socket: $!";
@@ -141,7 +142,7 @@ wait "$SERVER_PID" 2>/dev/null || true
 
 cat << EOF > "$CONF"
 options {
-    port 10053;
+    port ${PORT};
     bind-address { 127.0.0.1; };
     user "nobody";
     group "nobody";

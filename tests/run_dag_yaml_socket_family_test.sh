@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # ==============================================================================
@@ -37,8 +38,8 @@ if ! command -v perl >/dev/null 2>&1; then
 fi
 
 FAILED=0
-PORT4=$((20000 + $$ % 5000))
-PORT6=$((25000 + $$ % 5000))
+PORT4=$(kari_port 0 $((20000 + $$ % 5000)))
+PORT6=$(kari_port 100 $((25000 + $$ % 5000)))
 TMP_DIR="/tmp/karidns_yaml_sockfam_test_$$"
 mkdir -p "$TMP_DIR"
 

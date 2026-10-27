@@ -12,6 +12,7 @@
 #
 # Needs root (the server starts as root and drops to nobody; the loader runs as the unprivileged PostgreSQL user).  SKIP otherwise, and
 # when PostgreSQL is not reachable (tests/db/pg_lib.sh) or a binary is missing.
+. "$(dirname "$0")/lib_proc.sh"
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
@@ -43,7 +44,7 @@ pg_setup pggroup || exit 0
 PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
-PORT=$((20000 + $$ % 20000))
+PORT=$(kari_port 0 $((20000 + $$ % 20000)))
 SECRET="dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"
 N=700
 CH=160

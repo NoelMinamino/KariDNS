@@ -8,6 +8,7 @@
 # and positive detection of DIFF_GLUE_MISSING, DIFF_CNAME_CHAIN, DIFF_DNSSEC_*.
 # ==============================================================================
 
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # Comparison mode exit status: 1 when a mismatch was found, 0 otherwise.
@@ -31,7 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$BASE_DIR"
 
-PORT1=${KARIDNS_REPLAY_PORT1:-$((28000 + $$ % 1000))}
+PORT1=${KARIDNS_REPLAY_PORT1:-$(kari_port 0 $((28000 + $$ % 1000)))}
 PORT2=$((PORT1 + 1))
 
 TMP_DIR="$(mktemp -d /tmp/karidns_replay_test.XXXXXX)"

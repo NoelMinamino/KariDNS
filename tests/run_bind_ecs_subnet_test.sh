@@ -38,7 +38,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-PORT=$((31500 + $$ % 3000))
+PORT=$(kari_port 0 $((31500 + $$ % 3000)))
 PORT_UNTRUSTED=$((PORT + 1))
 FAILED=0
 USER_OPT=""

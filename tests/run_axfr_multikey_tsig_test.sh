@@ -6,7 +6,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 DAG="$ROOT/dag"
-PORT=15492
+PORT=$(kari_port 0 15492)
 
 echo "[*] Building karidns and dag..."
 [ -x "$ROOT/karidns" ] && [ -x "$ROOT/dag" ] || make -C "$ROOT" karidns dag
@@ -19,7 +19,7 @@ OTHER_ZONE="$DIR/axfr_multikey_other.zone"
 cleanup() {
     set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     kari_kill_tree "${SERVER_PID:-}"
-    rm -f "$CONF_FILE" "$ZONE_FILE" "$MIXED_ZONE" "$OTHER_ZONE" /tmp/karidns_axfr_multikey.log
+    rm -f "$CONF_FILE" "$ZONE_FILE" "$MIXED_ZONE" "$OTHER_ZONE" /tmp/karidns_axfr_multikey.$$.log
 }
 trap cleanup EXIT INT TERM
 
@@ -91,7 +91,7 @@ zone "other.multikey.test" {
 EOF
 
 echo "[*] Starting KariDNS on port $PORT..."
-"$BIN" -f "$CONF_FILE" > /tmp/karidns_axfr_multikey.log 2>&1 &
+"$BIN" -f "$CONF_FILE" > /tmp/karidns_axfr_multikey.$$.log 2>&1 &
 SERVER_PID=$!
 sleep 0.5
 
@@ -102,7 +102,7 @@ echo "$OUT_A" | grep -q "www.multikey.test." || {
     echo "[FAIL] AXFR with keyA failed!"
     echo "Output:"
     echo "$OUT_A"
-    cat /tmp/karidns_axfr_multikey.log
+    cat /tmp/karidns_axfr_multikey.$$.log
     exit 1
 }
 echo "[OK] AXFR with keyA succeeded."
@@ -114,7 +114,7 @@ echo "$OUT_B" | grep -q "www.multikey.test." || {
     echo "[FAIL] AXFR with keyB failed!"
     echo "Output:"
     echo "$OUT_B"
-    cat /tmp/karidns_axfr_multikey.log
+    cat /tmp/karidns_axfr_multikey.$$.log
     exit 1
 }
 echo "[OK] AXFR with keyB succeeded."

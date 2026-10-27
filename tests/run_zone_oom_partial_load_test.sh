@@ -26,7 +26,7 @@ KARICTL="$ROOT_DIR/karictl"
 DAG="$ROOT_DIR/dag"
 
 FAILED=0
-PORT=$((23000 + $$ % 8000))
+PORT=$(kari_port 0 $((23000 + $$ % 8000)))
 CTRL_PORT=$((PORT + 1))
 TMP_DIR="/tmp/zone_oom_test_$$"
 rm -rf "$TMP_DIR"

@@ -27,7 +27,7 @@ DAG="$ROOT/dag"
 
 W="$(mktemp -d /tmp/zone_secondary.XXXXXX)"
 chmod 755 "$W"
-PPORT=$((25000 + $$ % 5000))
+PPORT=$(kari_port 0 $((25000 + $$ % 5000)))
 SPORT=$((PPORT + 1))   # secondary, serve-stale no
 STALE_PORT=$((PPORT + 2))   # secondary, serve-stale yes (default)
 PRIMARY_PID=""

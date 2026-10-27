@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # ==============================================================================
@@ -25,7 +26,7 @@ PLUGIN_SCRIPT="${SCRIPT_DIR}/mock_anomalous_dns_server.pl"
 TARGET="${1:-dag}"
 
 TMP_DIR="$(mktemp -d /tmp/karidns_anomalous_test.XXXXXX)"
-PORT=$((32000 + $$ % 5000))
+PORT=$(kari_port 0 $((32000 + $$ % 5000)))
 SERVER_PID=""
 
 cleanup() {

@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # ==============================================================================
@@ -76,7 +77,7 @@ run_check() {
 # ==============================================================================
 # 1. Multi-Message AXFR TCP Stream Test (Mock Server sending 2 separate packets)
 # ==============================================================================
-PORT_AXFR=$((18000 + $$ % 10000))
+PORT_AXFR=$(kari_port 0 $((18000 + $$ % 10000)))
 
 cat <<'PL_EOF' > "$TMP_DIR/mock_axfr_server.pl"
 use strict;
@@ -145,7 +146,7 @@ run_check "AXFR multi-message stream terminates on matching SOA" \
 # ==============================================================================
 # 2. Plain-HTTP DoH (+http-plain) Mock Exchange Test
 # ==============================================================================
-PORT_HTTP=$((19000 + $$ % 10000))
+PORT_HTTP=$(kari_port 100 $((19000 + $$ % 10000)))
 
 cat <<'PL_EOF' > "$TMP_DIR/mock_http_server.pl"
 use strict;

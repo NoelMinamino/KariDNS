@@ -24,6 +24,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
+. "$ROOT/tests/lib_proc.sh"
 
 if [ "$(id -u)" != "0" ]; then echo "SKIP: needs root (the loader runs as another user; loopback aliases)"; exit 0; fi
 KARIDNS=${KARIDNS:-./karidns}
@@ -62,7 +63,7 @@ trap cleanup EXIT INT TERM
 PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
-BASE=$((20000 + $$ % 20000))
+BASE=$(kari_port 0 $((20000 + $$ % 20000)))
 PA=$BASE; PB=$((BASE + 1)); PC=$((BASE + 2)); PD=$((BASE + 3))
 SECRET="dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"
 SRCS="127.0.0.1 127.0.0.2 127.0.0.3 127.0.0.4 127.0.0.5"
@@ -168,7 +169,7 @@ printf 'a\\046b.tdz.test. A p\na\\046b.tdz.test. A e\na\\046b.tdz.test. ANY e\n'
 # a plain (no EDNS) query takes no ECS option: the lines "p" are asked once
 compare() {   # compare X.out Y.out: prints "total identical bad"
     awk -F'\t' '
-        NR == FNR { k[FNR] = $1; s[FNR] = $2; next }
+        FILENAME == ARGV[1] { k[FNR] = $1; s[FNR] = $2; next }
         { total++
           if ($1 != k[FNR]) { bad++; if (bad <= 5) print "         query list mismatch at " FNR > "/dev/stderr"; next }
           if ($2 == "TIMEOUT" || s[FNR] == "TIMEOUT") { bad++; if (bad <= 5) print "         timeout: " $1 > "/dev/stderr"; next }

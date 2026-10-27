@@ -35,7 +35,7 @@ KARICHECK="$ROOT_DIR/karicheck"
 }
 
 FAILED=0
-PORT1=$((25000 + $$ % 3500))
+PORT1=$(kari_port 0 $((25000 + $$ % 3500)))
 PORT2=$((PORT1 + 2))
 TMP_DIR="/tmp/karidns_ext_axfr_test_$$"
 rm -rf "$TMP_DIR"

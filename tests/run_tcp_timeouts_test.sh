@@ -21,7 +21,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 [ -x "$ROOT_DIR/karidns" ] || make -C "$ROOT_DIR" karidns
 KARIDNS="$ROOT_DIR/karidns"
 
-PORT=$((26000 + $$ % 4000))
+PORT=$(kari_port 0 $((26000 + $$ % 4000)))
 TMP_DIR="/tmp/tcp_timeouts_test_$$"
 rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR"

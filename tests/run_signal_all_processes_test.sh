@@ -25,7 +25,7 @@ KARIDNS="$ROOT_DIR/karidns"
 DAG="$ROOT_DIR/dag"
 
 FAILED=0
-PORT=$((21000 + $$ % 8000))
+PORT=$(kari_port 0 $((21000 + $$ % 8000)))
 TMP_DIR="/tmp/signal_all_processes_test_$$"
 rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR"

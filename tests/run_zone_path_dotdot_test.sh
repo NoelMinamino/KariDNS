@@ -25,7 +25,7 @@ KARICTL="$ROOT_DIR/karictl"
 KARICHECK="$ROOT_DIR/karicheck"
 DAG="$ROOT_DIR/dag"
 
-PORT=$((30000 + $$ % 4000))
+PORT=$(kari_port 0 $((30000 + $$ % 4000)))
 TMP_DIR="/tmp/zone_path_dotdot_test_$$"
 CTRL_SOCK="$TMP_DIR/control.sock"
 SECRET="ZG90ZG90LXBhdGgtdGVzdC1zZWNyZXQta2V5LTAwMDE="

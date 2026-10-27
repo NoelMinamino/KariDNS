@@ -22,8 +22,8 @@ BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 KARIDNS="$BASE_DIR/karidns"
 DAG="$BASE_DIR/dag"
 KARICTL="$BASE_DIR/karictl"
-PPORT=15461
-SPORT=15462
+PPORT=$(kari_port 0 15461)
+SPORT=$(kari_port 100 15462)
 
 echo "=== Escaped owner names: BIND/tinydns zones, AXFR, NSEC3 (R-29, R-23, O-08) ==="
 

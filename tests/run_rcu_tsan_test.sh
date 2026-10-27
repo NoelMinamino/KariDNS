@@ -14,14 +14,15 @@
 #   reloads of the secondary (Pass 2 while transfers run).
 # Any ThreadSanitizer report fails the test.
 
+. "$(dirname "$0")/lib_proc.sh"
 set -u
 
 cd "$(dirname "$0")/.." || exit 1
 
 # Load parameters can be raised from the environment for longer runs.
-PORT=15361
-P_PORT=15362
-S_PORT=15363
+PORT=$(kari_port 0 15361)
+P_PORT=$(kari_port 100 15362)
+S_PORT=$(kari_port 200 15363)
 CLIENTS=${CLIENTS:-4}
 ROUNDS=${ROUNDS:-60}
 HUPS=${HUPS:-8}

@@ -7,6 +7,7 @@
 # invokes karictl observatory, and validates the per-zone operational stats.
 # ==============================================================================
 
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -19,7 +20,7 @@ KARIDNS="$ROOT_DIR/karidns"
 KARICTL="$ROOT_DIR/karictl"
 DAG="$ROOT_DIR/dag"
 
-PORT=$((25000 + $$ % 5000))
+PORT=$(kari_port 0 $((25000 + $$ % 5000)))
 CTRL_PORT=$((PORT + 1))
 TMP_DIR="/tmp/karictl_observatory_test_$$"
 CTRL_SOCK="$TMP_DIR/control.sock"

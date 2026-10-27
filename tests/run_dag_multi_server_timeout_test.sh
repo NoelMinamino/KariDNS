@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # ==============================================================================
@@ -25,7 +26,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-PORT1=$((33000 + $$ % 4000))
+PORT1=$(kari_port 0 $((33000 + $$ % 4000)))
 PORT2=$((PORT1 + 1))
 FAILED=0
 USER_OPT=""

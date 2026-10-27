@@ -324,7 +324,7 @@ make karidns-asan dag-asan
 # ThreadSanitizer builds of the server and of the database loader (the loader with loader-threads > 1)
 make karidns-tsan karidns-dbloader-tsan
 
-# Full test suite (integration tests that need loopback aliases run only as root)
+# Full test suite, one test per CPU at a time (-j N to change, -j 1 for one at a time; integration tests that need loopback aliases run only as root)
 sh tests/run_all_suite.sh
 
 # Coverage report (clang source-based coverage; see docs/COVERAGE_STATUS.md)

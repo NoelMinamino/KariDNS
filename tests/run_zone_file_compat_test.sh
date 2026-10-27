@@ -15,7 +15,7 @@ BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 KARIDNS="$BASE_DIR/karidns"
 DAG="$BASE_DIR/dag"
 KARICHECK="$BASE_DIR/karicheck"
-PORT=15451
+PORT=$(kari_port 0 15451)
 
 echo "=== Zone file compatibility: R-22, D-18, D-08, O-11 ==="
 

@@ -9,6 +9,7 @@
 # When dig 9.20 is installed, every scenario is also compared with dig directly.
 # ==============================================================================
 
+. "$(dirname "$0")/lib_proc.sh"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 KARIDNS="${KARIDNS:-$BASE_DIR/karidns}"
@@ -22,7 +23,7 @@ if ! command -v perl >/dev/null 2>&1; then
 fi
 
 TMP_DIR="$(mktemp -d /tmp/dag_malformed_compat.XXXXXX)"
-PORT=$((33000 + $$ % 5000))
+PORT=$(kari_port 0 $((33000 + $$ % 5000)))
 SERVER_PID=""
 cleanup() {
     if [ -n "$SERVER_PID" ]; then

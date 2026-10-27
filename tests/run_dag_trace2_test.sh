@@ -15,11 +15,12 @@
 #
 # 127.0.0.2 以降の loopback alias がない場合、root なら追加し、そうでなければ SKIP する。
 
+. "$(dirname "$0")/lib_proc.sh"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 DAG_BIN="${DAG_BIN:-$ROOT/dag}"   # DAG_BIN=./dag-asan で ASan 版を検査できる
-PORT="${TRACE2_TEST_PORT:-15353}"
+PORT="${TRACE2_TEST_PORT:-$(kari_port 0 15353)}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/dag_trace2.XXXXXX")"
 IPS="127.0.0.1 127.0.0.2 127.0.0.3 127.0.0.4 127.0.0.5"
 ADDED_ALIASES=""

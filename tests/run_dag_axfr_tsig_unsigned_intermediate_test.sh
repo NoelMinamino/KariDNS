@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # Test: TSIG AXFR multi-message digest chaining with unsigned intermediate messages (RFC 2845 §4.4 / RFC 8945 §5.4)
@@ -31,7 +32,7 @@ KEY_NAME="tsig-test-key"
 KEY_SECRET="dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl"
 KEY_ALG="hmac-sha256"
 
-PORT_AXFR=53594
+PORT_AXFR=$(kari_port 0 53594)
 
 echo "Running: test_dag_axfr_tsig_unsigned_intermediate ($DAG)"
 

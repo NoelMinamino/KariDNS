@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # Test: RFC 7873 §5.2 DNS Cookie echo verification & mismatch discard test
@@ -30,7 +31,7 @@ fi
 
 echo "Running: test_dag_cookie_mismatch_discard ($DAG)"
 
-PORT_COOKIE_TEST=53610
+PORT_COOKIE_TEST=$(kari_port 0 53610)
 
 # Spawn mock DNS server in background
 perl -e '

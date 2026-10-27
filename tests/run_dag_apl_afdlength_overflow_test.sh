@@ -22,10 +22,11 @@
 # Usage: ./tests/run_dag_apl_afdlength_overflow_test.sh
 # Exit code: 0 = PASS, 1 = FAIL
 
+. "$(dirname "$0")/lib_proc.sh"
 set -u
 cd "$(dirname "$0")/.."
 
-PORT="${DAG_APL_TEST_PORT:-15953}"
+PORT="${DAG_APL_TEST_PORT:-$(kari_port 0 15953)}"
 MOCK_LOG="mock_apl_overflow.log"
 DAG_LOG="dag_apl_overflow.log"
 BUILD_LOG="build_dag_asan.log"

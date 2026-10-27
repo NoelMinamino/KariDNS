@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # ==============================================================================
@@ -66,7 +67,7 @@ run_check() {
 CONF_FILE="/tmp/karidns_trace_tcp_test_$$.conf"
 ZONE_FILE="/tmp/karidns_trace_tcp_test_$$.zone"
 LOG_FILE="/tmp/karidns_trace_test_$$.log"
-PORT=$((15000 + $$ % 10000))
+PORT=$(kari_port 0 $((15000 + $$ % 10000)))
 SERVER_PID=""
 
 cleanup() {

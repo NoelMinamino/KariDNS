@@ -21,7 +21,7 @@ echo "[+] Starting CVE CoO allocation failure test..."
 
 TEST_DIR="$(mktemp -d /tmp/coo_cve_test.XXXXXX)"
 chmod 755 "$TEST_DIR"
-PORT=$((31000 + $$ % 4000))
+PORT=$(kari_port 0 $((31000 + $$ % 4000)))
 KARIDNS_PID=""
 cleanup() {
     set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)

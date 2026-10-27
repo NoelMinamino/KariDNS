@@ -8,6 +8,7 @@
 # at the end is also compared with dig directly (whitespace normalised).
 # ==============================================================================
 
+. "$(dirname "$0")/lib_proc.sh"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 KARIDNS="${KARIDNS:-$BASE_DIR/karidns}"
@@ -16,7 +17,7 @@ DAG="${DAG:-$BASE_DIR/dag}"
 [ -x "$DAG" ] || make -C "$BASE_DIR" dag >/dev/null 2>&1
 
 TMP_DIR="$(mktemp -d /tmp/dag_output_compat.XXXXXX)"
-PORT=$((38000 + $$ % 5000))
+PORT=$(kari_port 0 $((38000 + $$ % 5000)))
 SERVER_PID=""
 cleanup() {
     if [ -n "$SERVER_PID" ]; then

@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # ==============================================================================
@@ -56,7 +57,7 @@ run_check() {
     fi
 }
 
-PORT=$((15000 + $$ % 10000))
+PORT=$(kari_port 0 $((15000 + $$ % 10000)))
 TMP_DIR="/tmp/karidns_yaml_esc_test_$$"
 mkdir -p "$TMP_DIR"
 CONF_FILE="$TMP_DIR/karidns.conf"

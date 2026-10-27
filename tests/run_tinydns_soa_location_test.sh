@@ -29,7 +29,7 @@ command -v perl >/dev/null 2>&1 || { echo "SKIP: perl not found"; exit 0; }
 
 TMP_DIR="$(mktemp -d /tmp/karidns_soaloc.XXXXXX)"
 chmod 755 "$TMP_DIR"
-PORT=$((31000 + $$ % 3000))
+PORT=$(kari_port 0 $((31000 + $$ % 3000)))
 SERVER_PID=""
 DJB_PID=""
 AXFRDNS_PID=""

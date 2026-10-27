@@ -4,6 +4,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$(dirname "$0")/lib_proc.sh"
+PORT=$(kari_port 0 53532)
 BIN_DIR="$SCRIPT_DIR/.."
 ZONES_DIR="$SCRIPT_DIR/zones"
 TEST_DIR="ttl_suffix_test_dir"
@@ -28,7 +29,7 @@ USER_OPT=""
 [ "$(id -u)" = "0" ] && USER_OPT="user \"nobody\"; group \"nobody\";"
 cat << EOF > karidns.conf
 options {
-    port 53532;
+    port ${PORT};
     bind-address { 127.0.0.1; };
     ${USER_OPT}
 };
@@ -45,7 +46,7 @@ EOF
 "$BIN_DIR/karidns" -f karidns.conf > karidns.log 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 50); do
-    "$BIN_DIR/dag" example.com. SOA @127.0.0.1 -p 53532 +short +timeout=1 +tries=1 2>/dev/null | grep -q admin && break
+    "$BIN_DIR/dag" example.com. SOA @127.0.0.1 -p ${PORT} +short +timeout=1 +tries=1 2>/dev/null | grep -q admin && break
     sleep 0.2
 done
 
@@ -62,7 +63,7 @@ check() {
     echo "[OK] $1"
 }
 q() { # name type file
-    "$BIN_DIR/dag" "$1" "$2" @127.0.0.1 -p 53532 +nohexdump +norec > "$3" 2>&1
+    "$BIN_DIR/dag" "$1" "$2" @127.0.0.1 -p ${PORT} +nohexdump +norec > "$3" 2>&1
 }
 
 echo "[+] SOA: owner TTL from \$TTL 1D, RDATA timers 1h 15m 1w 1h..."

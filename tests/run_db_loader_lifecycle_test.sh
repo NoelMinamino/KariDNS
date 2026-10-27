@@ -14,6 +14,7 @@
 #
 # Needs root (the server starts as root and drops to nobody, the loader must be root-owned).  SKIP otherwise, and
 # when karidns, dag, karidns-dbloader (SQLite3 driver), zone2sql or the sqlite3 CLI is missing.
+. "$(dirname "$0")/lib_proc.sh"
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
@@ -41,7 +42,7 @@ trap cleanup EXIT INT TERM
 PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
-PORT=$((20000 + $$ % 20000))
+PORT=$(kari_port 0 $((20000 + $$ % 20000)))
 DAG="./dag @127.0.0.1 -p $PORT"
 
 # ---------------------------------------------------------------- fixtures

@@ -14,6 +14,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$(dirname "$0")/lib_proc.sh"
+PORT=$(kari_port 0 53731)
 BIN_DIR="$SCRIPT_DIR/.."
 ZONES_DIR="$SCRIPT_DIR/zones"
 TEST_DIR="ttl_harmonization_test_dir"
@@ -49,7 +50,7 @@ echo "[PASS] karicheck correctly flags the source zone file issue and produces n
 echo "[+] Step 2: starting karidns with the same zone..."
 cat << EOF > karidns.conf
 options {
-    port 53731;
+    port ${PORT};
     bind-address { 127.0.0.1; };
     user "nobody";
     group "nobody";
@@ -71,7 +72,7 @@ EOF
 
 "$BIN_DIR/karidns" -f karidns.conf > karidns.log 2>&1 &
 SERVER_PID=$!
-sleep 1
+kari_wait_answer "$BIN_DIR/dag" "$PORT" harmonize.test. || true   # the queries below report a server that did not start
 
 cleanup() {
     set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
@@ -94,7 +95,7 @@ check_no_crash() {
 }
 
 echo "[+] Step 3: querying 'mixed.harmonize.test.' A -- both records must show TTL 300 (the minimum)..."
-"$BIN_DIR/dag" mixed.harmonize.test. A @127.0.0.1 -p 53731 > out_mixed_a.txt 2>&1
+"$BIN_DIR/dag" mixed.harmonize.test. A @127.0.0.1 -p ${PORT} > out_mixed_a.txt 2>&1
 cat out_mixed_a.txt
 check_no_crash
 A_COUNT=$(grep -c "^mixed\.harmonize\.test\..*IN.*A" out_mixed_a.txt || true)
@@ -107,7 +108,7 @@ fi
 echo "[PASS] A RRset TTLs normalized to the minimum (300)."
 
 echo "[+] Step 4: querying 'mixed.harmonize.test.' RRSIG -- RRSIG(A) must show TTL 300, RRSIG(MX) must show TTL 600..."
-"$BIN_DIR/dag" mixed.harmonize.test. RRSIG @127.0.0.1 -p 53731 > out_mixed_rrsig.txt 2>&1
+"$BIN_DIR/dag" mixed.harmonize.test. RRSIG @127.0.0.1 -p ${PORT} > out_mixed_rrsig.txt 2>&1
 cat out_mixed_rrsig.txt
 check_no_crash
 
@@ -122,7 +123,7 @@ grep "RRSIG" out_mixed_rrsig.txt | grep -E "RRSIG[[:space:]]+MX " | awk '{print 
 echo "[PASS] Each RRSIG's TTL correctly tracks its own covered RRset, not a sibling RRSIG's TTL."
 
 echo "[+] Step 5: control group 'stable.harmonize.test.' A -- TTL must remain 1800 unchanged..."
-"$BIN_DIR/dag" stable.harmonize.test. A @127.0.0.1 -p 53731 > out_stable.txt 2>&1
+"$BIN_DIR/dag" stable.harmonize.test. A @127.0.0.1 -p ${PORT} > out_stable.txt 2>&1
 cat out_stable.txt
 check_no_crash
 if grep "^stable\.harmonize\.test\..*IN.*A" out_stable.txt | awk '{print $2}' | grep -qv "^1800$"; then
@@ -132,7 +133,7 @@ fi
 echo "[PASS] Consistent RRsets are left unchanged (no unwanted side effects)."
 
 echo "[+] Step 6: orphaned RRSIG (covers NSEC, which does not exist at this name) must be served unchanged and must not crash the server..."
-"$BIN_DIR/dag" orphan.harmonize.test. RRSIG @127.0.0.1 -p 53731 > out_orphan.txt 2>&1
+"$BIN_DIR/dag" orphan.harmonize.test. RRSIG @127.0.0.1 -p ${PORT} > out_orphan.txt 2>&1
 cat out_orphan.txt
 check_no_crash
 grep "^orphan\.harmonize\.test\..*IN.*RRSIG" out_orphan.txt | awk '{print $2}' | grep -q "^3600$" || {

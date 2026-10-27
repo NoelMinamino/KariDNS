@@ -3,6 +3,7 @@ set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$(dirname "$0")/lib_proc.sh"
+PORT=$(kari_port 0 10053)
 ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 DAG="$ROOT/dag"
@@ -38,7 +39,7 @@ EOF
 
 cat << EOF > "$CONF"
 options {
-    port 10053;
+    port ${PORT};
     bind-address { 127.0.0.1; };
     user "nobody";
     group "nobody";
@@ -49,7 +50,7 @@ zone "example.com" {
 };
 EOF
 
-echo "[*] Starting KariDNS on port 10053..."
+echo "[*] Starting KariDNS on port ${PORT}..."
 $BIN -f -c "$CONF" > "$DIR/server_section_order.log" 2>&1 &
 SERVER_PID=$!
 
@@ -67,7 +68,7 @@ sleep 2
 # Test 1: NS Query (User's reported regression scenario)
 # =============================================================================
 echo "[*] Test 1: Querying NS example.com..."
-NS_OUT=$($DAG NS example.com @127.0.0.1 -p 10053 +norec)
+NS_OUT=$($DAG NS example.com @127.0.0.1 -p ${PORT} +norec)
 echo "$NS_OUT"
 
 # Extract ANSWER SECTION
@@ -103,7 +104,7 @@ echo "[PASS] Test 1 (NS Query Section Order) passed!"
 # Test 2: MX Query (Multiple MX targets with glue)
 # =============================================================================
 echo "[*] Test 2: Querying MX example.com..."
-MX_OUT=$($DAG MX example.com @127.0.0.1 -p 10053 +norec)
+MX_OUT=$($DAG MX example.com @127.0.0.1 -p ${PORT} +norec)
 echo "$MX_OUT"
 
 ANS_MX=$(echo "$MX_OUT" | awk '/;; ANSWER SECTION:/{flag=1; next} /^;;/{flag=0} flag')
@@ -124,7 +125,7 @@ echo "[PASS] Test 2 (MX Query Section Order) passed!"
 # Test 3: Standard A Record Query (Authority NS + Glue order)
 # =============================================================================
 echo "[*] Test 3: Querying A ns1.example.com..."
-A_OUT=$($DAG A ns1.example.com @127.0.0.1 -p 10053 +norec)
+A_OUT=$($DAG A ns1.example.com @127.0.0.1 -p ${PORT} +norec)
 echo "$A_OUT"
 
 AUTH_A=$(echo "$A_OUT" | awk '/;; AUTHORITY SECTION:/{flag=1; next} /^;;/{flag=0} flag')

@@ -16,6 +16,9 @@ set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$(dirname "$0")/lib_proc.sh"
+PORT_P=$(kari_port 0 10053)
+PORT_B=$(kari_port 10 10058)
+PORT_C=$(kari_port 20 10059)
 ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 DAG="$ROOT/dag"
@@ -106,11 +109,11 @@ conf() {
         for _z in "$@"; do echo "zone \"$_z\" { type master; file \"$W/$_z.zone\"; };"; done
     } > "$W/$_name.conf"
 }
-conf parent 10053 example.com
-conf both 10058 example.com secure.example.com insecure.example.com other.example
-conf child 10059 secure.example.com
+conf parent ${PORT_P} example.com
+conf both ${PORT_B} example.com secure.example.com insecure.example.com other.example
+conf child ${PORT_C} secure.example.com
 
-echo "[*] Starting KariDNS on ports 10053 (parent), 10058 (parent + children), 10059 (child only)..."
+echo "[*] Starting KariDNS on ports ${PORT_P} (parent), ${PORT_B} (parent + children), ${PORT_C} (child only)..."
 $BIN -f -c "$W/parent.conf" > "$W/parent.log" 2>&1 &
 PID1=$!
 $BIN -f -c "$W/both.conf" > "$W/both.log" 2>&1 &
@@ -118,7 +121,7 @@ PID2=$!
 $BIN -f -c "$W/child.conf" > "$W/child.log" 2>&1 &
 PID3=$!
 
-for p in 10053 10058 10059; do
+for p in ${PORT_P} ${PORT_B} ${PORT_C}; do
     i=0
     until $DAG SOA example.com @127.0.0.1 -p $p +short +nohexdump +tries=1 +time=1 2>/dev/null | grep -q hostmaster ||
           $DAG SOA secure.example.com @127.0.0.1 -p $p +short +nohexdump +tries=1 +time=1 2>/dev/null | grep -q hostmaster; do
@@ -139,7 +142,7 @@ section() {
 # ---------------------------------------------------------------------------------------------------------------
 # 1. Parent only
 echo "[*] Querying DS secure.example.com (RFC 4035 §3.1.4.1 authoritative response)..."
-DS_OUT=$(q 10053 DS secure.example.com +dnssec)
+DS_OUT=$(q ${PORT_P} DS secure.example.com +dnssec)
 echo "$DS_OUT"
 echo "$DS_OUT" | grep -q "flags:.*aa" || fail "AA flag was NOT set for delegation point DS query"
 echo "$DS_OUT" | section ANSWER | grep -Eq "^secure\.example\.com\.[[:space:]].*IN[[:space:]]+DS[[:space:]]+12345 " ||
@@ -147,20 +150,20 @@ echo "$DS_OUT" | section ANSWER | grep -Eq "^secure\.example\.com\.[[:space:]].*
 echo "$DS_OUT" | section ANSWER | grep -Eq "IN[[:space:]]+RRSIG[[:space:]]+DS " || fail "DS answer without RRSIG(DS)"
 
 echo "[*] Querying NS secure.example.com (referral response)..."
-NS_OUT=$(q 10053 NS secure.example.com)
+NS_OUT=$(q ${PORT_P} NS secure.example.com)
 echo "$NS_OUT"
 echo "$NS_OUT" | grep -q "flags:.*aa" && fail "AA flag was incorrectly set for NS referral query"
 echo "$NS_OUT" | section AUTHORITY | grep -Eq "^secure\.example\.com\..*IN[[:space:]]+NS[[:space:]]+ns1\.secure\.example\.com" ||
     fail "Authority section did not contain delegation NS record"
 
 echo "[*] Querying A host.secure.example.com (referral response)..."
-SUB_OUT=$(q 10053 A host.secure.example.com)
+SUB_OUT=$(q ${PORT_P} A host.secure.example.com)
 echo "$SUB_OUT"
 echo "$SUB_OUT" | grep -q "status: NOERROR" || fail "referral is not NOERROR"
 echo "$SUB_OUT" | grep -q "flags:.*aa" && fail "AA flag was incorrectly set for sub-zone referral"
 
 echo "[*] Querying DS insecure.example.com (NODATA authoritative response)..."
-INSEC_OUT=$(q 10053 DS insecure.example.com +dnssec)
+INSEC_OUT=$(q ${PORT_P} DS insecure.example.com +dnssec)
 echo "$INSEC_OUT"
 echo "$INSEC_OUT" | grep -q "flags:.*aa" || fail "AA flag was NOT set for insecure delegation DS NODATA query"
 echo "$INSEC_OUT" | grep -q "status: NOERROR" || fail "DS NODATA is not NOERROR"
@@ -175,17 +178,17 @@ echo "$INSEC_OUT" | section AUTHORITY | grep -Eq "^insecure\.example\.com\.[[:sp
 # 2. Parent and children on one server (R-32)
 echo "[*] Parent and children on one server: DS secure.example.com..."
 for do_bit in +dnssec +nodnssec +nodnssec; do   # DO=0 twice: the second answer may come from the wire cache
-    OUT=$(q 10058 DS secure.example.com $do_bit)
+    OUT=$(q ${PORT_B} DS secure.example.com $do_bit)
     echo "$OUT" | grep -q "flags:.*aa" || { echo "$OUT"; fail "($do_bit) DS for the child apex: AA not set"; }
     echo "$OUT" | section ANSWER | grep -Eq "^secure\.example\.com\.[[:space:]].*IN[[:space:]]+DS[[:space:]]+12345 " ||
         { echo "$OUT"; fail "($do_bit) DS for the child apex not answered from the parent"; }
     echo "$OUT" | grep -q "child-hostmaster" && { echo "$OUT"; fail "($do_bit) DS answered from the child zone"; }
 done
-OUT=$(q 10058 DS secure.example.com +dnssec)
+OUT=$(q ${PORT_B} DS secure.example.com +dnssec)
 echo "$OUT" | section ANSWER | grep -Eq "IN[[:space:]]+RRSIG[[:space:]]+DS " || { echo "$OUT"; fail "DS from the parent without RRSIG(DS)"; }
 
 echo "[*] Parent and children on one server: DS insecure.example.com..."
-OUT=$(q 10058 DS insecure.example.com +dnssec)
+OUT=$(q ${PORT_B} DS insecure.example.com +dnssec)
 echo "$OUT"
 echo "$OUT" | grep -q "status: NOERROR" || fail "DS insecure: not NOERROR"
 echo "$OUT" | section AUTHORITY | grep -Eq "^example\.com\.[[:space:]].*IN[[:space:]]+SOA[[:space:]]+ns1\.example\.com\. " ||
@@ -195,11 +198,11 @@ echo "$OUT" | section AUTHORITY | grep -Eq "^insecure\.example\.com\.[[:space:]]
 echo "$OUT" | grep -q "child-hostmaster" && fail "DS insecure answered from the child zone"
 
 echo "[*] Parent and children on one server: other types and CNAME..."
-OUT=$(q 10058 SOA secure.example.com)
+OUT=$(q ${PORT_B} SOA secure.example.com)
 echo "$OUT" | section ANSWER | grep -q "child-hostmaster" || { echo "$OUT"; fail "SOA at the child apex must come from the child"; }
-OUT=$(q 10058 NS secure.example.com)
+OUT=$(q ${PORT_B} NS secure.example.com)
 echo "$OUT" | grep -q "flags:.*aa" || { echo "$OUT"; fail "NS at the child apex must be the child's authoritative answer"; }
-OUT=$(q 10058 DS alias.other.example +dnssec)
+OUT=$(q ${PORT_B} DS alias.other.example +dnssec)
 echo "$OUT" | section ANSWER | grep -Eq "^alias\.other\.example\..*IN[[:space:]]+CNAME[[:space:]]+secure\.example\.com\." ||
     { echo "$OUT"; fail "DS via CNAME: CNAME missing"; }
 echo "$OUT" | section ANSWER | grep -Eq "^secure\.example\.com\.[[:space:]].*IN[[:space:]]+DS[[:space:]]+12345 " ||
@@ -208,7 +211,7 @@ echo "$OUT" | section ANSWER | grep -Eq "^secure\.example\.com\.[[:space:]].*IN[
 # ---------------------------------------------------------------------------------------------------------------
 # 3. Child only: authoritative NODATA from the child apex
 echo "[*] Child only: DS secure.example.com..."
-OUT=$(q 10059 DS secure.example.com +dnssec)
+OUT=$(q ${PORT_C} DS secure.example.com +dnssec)
 echo "$OUT"
 echo "$OUT" | grep -q "flags:.*aa" || fail "child only: AA not set"
 echo "$OUT" | grep -q "status: NOERROR" || fail "child only: not NOERROR"

@@ -3,6 +3,11 @@ set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$(dirname "$0")/lib_proc.sh"
+PORT_A=$(kari_port 0 10053)
+PORT_B=$(kari_port 10 10054)
+PORT_C=$(kari_port 20 10055)
+PORT_D=$(kari_port 30 10056)
+PORT_E=$(kari_port 40 10057)
 ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 DAG="$ROOT/dag"
@@ -55,7 +60,7 @@ EOF
 # Configuration 1: additional-from-auth yes (default)
 cat << EOF > "$CONF_YES"
 options {
-    port 10053;
+    port ${PORT_A};
     bind-address { 127.0.0.1; };
     additional-from-auth yes;
     user "nobody";
@@ -78,7 +83,7 @@ EOF
 # Configuration 2: additional-from-auth in-domain
 cat << EOF > "$CONF_INDOMAIN"
 options {
-    port 10054;
+    port ${PORT_B};
     bind-address { 127.0.0.1; };
     additional-from-auth in-domain;
     user "nobody";
@@ -101,7 +106,7 @@ EOF
 # Configuration 3: additional-from-auth no
 cat << EOF > "$CONF_NO"
 options {
-    port 10055;
+    port ${PORT_C};
     bind-address { 127.0.0.1; };
     additional-from-auth no;
     user "nobody";
@@ -148,7 +153,7 @@ EOF
 
 cat << EOF > "$CONF_SIBLING"
 options {
-    port 10056;
+    port ${PORT_D};
     bind-address { 127.0.0.1; };
     additional-from-auth yes;
     user "nobody";
@@ -198,7 +203,7 @@ EOF
 CONF_OVERRIDE="$TMP_DIR/sibling_override.conf"
 cat << EOF > "$CONF_OVERRIDE"
 options {
-    port 10057;
+    port ${PORT_E};
     bind-address { 127.0.0.1; };
     additional-from-auth yes;
     user "nobody";
@@ -242,7 +247,7 @@ sleep 1
 # -------------------------------------------------------------
 # Test 1: additional-from-auth yes (BIND compatible)
 # -------------------------------------------------------------
-echo "[*] Starting KariDNS with additional-from-auth yes on port 10053..."
+echo "[*] Starting KariDNS with additional-from-auth yes on port ${PORT_A}..."
 $BIN -f -c "$CONF_YES" > "$DIR/server_sibling_yes.log" 2>&1 &
 SERVER_PID_YES=$!
 sleep 2
@@ -253,8 +258,8 @@ if ! kill -0 "$SERVER_PID_YES" 2>/dev/null; then
     exit 1
 fi
 
-echo "[*] Querying NS example.jp on port 10053..."
-OUT_YES=$($DAG NS example.jp @127.0.0.1 -p 10053)
+echo "[*] Querying NS example.jp on port ${PORT_A}..."
+OUT_YES=$($DAG NS example.jp @127.0.0.1 -p ${PORT_A})
 echo "$OUT_YES"
 
 # Verify Answer section
@@ -302,7 +307,7 @@ sleep 1
 # -------------------------------------------------------------
 # Test 2: additional-from-auth in-domain
 # -------------------------------------------------------------
-echo "[*] Starting KariDNS with additional-from-auth in-domain on port 10054..."
+echo "[*] Starting KariDNS with additional-from-auth in-domain on port ${PORT_B}..."
 $BIN -f -c "$CONF_INDOMAIN" > "$DIR/server_sibling_indomain.log" 2>&1 &
 SERVER_PID_IN=$!
 sleep 2
@@ -313,8 +318,8 @@ if ! kill -0 "$SERVER_PID_IN" 2>/dev/null; then
     exit 1
 fi
 
-echo "[*] Querying NS example.jp on port 10054..."
-OUT_IN=$($DAG NS example.jp @127.0.0.1 -p 10054)
+echo "[*] Querying NS example.jp on port ${PORT_B}..."
+OUT_IN=$($DAG NS example.jp @127.0.0.1 -p ${PORT_B})
 echo "$OUT_IN"
 
 # In-domain record must be present
@@ -342,7 +347,7 @@ sleep 1
 # -------------------------------------------------------------
 # Test 3: additional-from-auth no
 # -------------------------------------------------------------
-echo "[*] Starting KariDNS with additional-from-auth no on port 10055..."
+echo "[*] Starting KariDNS with additional-from-auth no on port ${PORT_C}..."
 $BIN -f -c "$CONF_NO" > "$DIR/server_sibling_no.log" 2>&1 &
 SERVER_PID_NO=$!
 sleep 2
@@ -353,8 +358,8 @@ if ! kill -0 "$SERVER_PID_NO" 2>/dev/null; then
     exit 1
 fi
 
-echo "[*] Querying NS example.jp on port 10055..."
-OUT_NO=$($DAG NS example.jp @127.0.0.1 -p 10055)
+echo "[*] Querying NS example.jp on port ${PORT_C}..."
+OUT_NO=$($DAG NS example.jp @127.0.0.1 -p ${PORT_C})
 echo "$OUT_NO"
 
 # No address records in Additional section
@@ -372,7 +377,7 @@ sleep 1
 # -------------------------------------------------------------
 # Test 4: Sibling domain dynamic resolution with example domains
 # -------------------------------------------------------------
-echo "[*] Starting KariDNS for example-parent.jp & example-sibling.jp on port 10056..."
+echo "[*] Starting KariDNS for example-parent.jp & example-sibling.jp on port ${PORT_D}..."
 $BIN -f -c "$CONF_SIBLING" > "$DIR/server_sibling_dyn.log" 2>&1 &
 SERVER_PID_SIBLING=$!
 sleep 2
@@ -383,8 +388,8 @@ if ! kill -0 "$SERVER_PID_SIBLING" 2>/dev/null; then
     exit 1
 fi
 
-echo "[*] Querying NS example-parent.jp on port 10056..."
-OUT_SIBLING=$($DAG NS example-parent.jp @127.0.0.1 -p 10056)
+echo "[*] Querying NS example-parent.jp on port ${PORT_D}..."
+OUT_SIBLING=$($DAG NS example-parent.jp @127.0.0.1 -p ${PORT_D})
 echo "$OUT_SIBLING"
 
 # Verify all Additional records
@@ -424,7 +429,7 @@ sleep 1
 # -------------------------------------------------------------
 # Test 5: Zone-level additional-from-auth override
 # -------------------------------------------------------------
-echo "[*] Starting KariDNS with zone-level additional-from-auth overrides on port 10057..."
+echo "[*] Starting KariDNS with zone-level additional-from-auth overrides on port ${PORT_E}..."
 $BIN -f -c "$CONF_OVERRIDE" > "$DIR/server_sibling_ovr.log" 2>&1 &
 SERVER_PID_OVERRIDE=$!
 sleep 2
@@ -435,8 +440,8 @@ if ! kill -0 "$SERVER_PID_OVERRIDE" 2>/dev/null; then
     exit 1
 fi
 
-echo "[*] Querying NS ovr-indomain.jp on port 10057..."
-OUT_OVR_IN=$($DAG NS ovr-indomain.jp @127.0.0.1 -p 10057)
+echo "[*] Querying NS ovr-indomain.jp on port ${PORT_E}..."
+OUT_OVR_IN=$($DAG NS ovr-indomain.jp @127.0.0.1 -p ${PORT_E})
 echo "$OUT_OVR_IN"
 if ! echo "$OUT_OVR_IN" | grep -q "ns1.city.ovr-indomain.jp.*192.0.2.15"; then
     echo "[FAIL] In-domain glue missing for ovr-indomain.jp!"
@@ -447,16 +452,16 @@ if echo "$OUT_OVR_IN" | grep -q "192.0.2.86"; then
     exit 1
 fi
 
-echo "[*] Querying NS ovr-no.jp on port 10057..."
-OUT_OVR_NO=$($DAG NS ovr-no.jp @127.0.0.1 -p 10057)
+echo "[*] Querying NS ovr-no.jp on port ${PORT_E}..."
+OUT_OVR_NO=$($DAG NS ovr-no.jp @127.0.0.1 -p ${PORT_E})
 echo "$OUT_OVR_NO"
 if echo "$OUT_OVR_NO" | grep -E "192.0.2.15|192.0.2.86"; then
     echo "[FAIL] Address records returned for ovr-no.jp with additional-from-auth no!"
     exit 1
 fi
 
-echo "[*] Querying NS ovr-yes.jp on port 10057..."
-OUT_OVR_YES=$($DAG NS ovr-yes.jp @127.0.0.1 -p 10057)
+echo "[*] Querying NS ovr-yes.jp on port ${PORT_E}..."
+OUT_OVR_YES=$($DAG NS ovr-yes.jp @127.0.0.1 -p ${PORT_E})
 echo "$OUT_OVR_YES"
 if ! echo "$OUT_OVR_YES" | grep -q "ns1.city.ovr-yes.jp.*192.0.2.15"; then
     echo "[FAIL] In-domain glue missing for ovr-yes.jp!"

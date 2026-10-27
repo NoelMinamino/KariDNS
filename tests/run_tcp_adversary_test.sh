@@ -2,6 +2,7 @@
 # ==============================================================================
 # tests/run_tcp_adversary_test.sh - TCP State Machine Adversary Suite
 # ==============================================================================
+. "$(dirname "$0")/lib_proc.sh"
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -32,7 +33,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-PORT=$((28000 + ( $$ % 10000 )))
+PORT=$(kari_port 0 $((28000 + ( $$ % 10000 ))))
 
 cat > "${CONF_FILE}" <<EOF
 options {

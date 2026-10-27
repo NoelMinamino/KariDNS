@@ -24,7 +24,7 @@ KARIDNS="$ROOT_DIR/karidns"
 DAG="$ROOT_DIR/dag"
 KARICTL="$ROOT_DIR/karictl"
 
-PORT=$((26000 + $$ % 4000))
+PORT=$(kari_port 0 $((26000 + $$ % 4000)))
 TMP_DIR="/tmp/dnstap_lifecycle_test_$$"
 SOCK="$TMP_DIR/dnstap.sock"
 CTRL_SOCK="$TMP_DIR/control.sock"

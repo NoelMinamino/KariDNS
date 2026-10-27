@@ -25,7 +25,7 @@ KARIDNS="$ROOT_DIR/karidns"
 KARICTL="$ROOT_DIR/karictl"
 DAG="$ROOT_DIR/dag"
 
-PORT=$((26000 + $$ % 4000))
+PORT=$(kari_port 0 $((26000 + $$ % 4000)))
 TMP_DIR="/tmp/karictl_reload_failure_test_$$"
 CTRL_SOCK="$TMP_DIR/control.sock"
 SECRET="cmVsb2FkLWZhaWx1cmUtdGVzdC1zZWNyZXQta2V5LTA="

@@ -176,8 +176,8 @@ jobs:
             name: Linux (Ubuntu 24.04)
             experimental: false
           # macOS is verified only by CI itself (not locally): non-blocking until the first green run.
-          - os: macos-14
-            name: macOS 14 (ARM64)
+          - os: macos-15
+            name: macOS 15 (ARM64)
             experimental: true
     steps:
       - name: Checkout code
@@ -219,10 +219,10 @@ jobs:
         include:
           - os: ubuntu-latest
             name: Linux (Ubuntu)
-          - os: macos-14
-            name: macOS 14 (ARM64)
           - os: macos-15
             name: macOS 15 (ARM64)
+          - os: macos-26
+            name: macOS 26 (ARM64)
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -296,6 +296,9 @@ jobs:
   # for PRs labelled "coverage". `make coverage` builds in parallel, skips the
   # ASan/TSan-only suites (they run in build-and-test-freebsd) and runs the
   # server fault-injection sweep and the dag network sweep in parallel lanes.
+  # The test suite itself runs `tests/run_all_suite.sh -j <ncpu>` (COV_JOBS in the
+  # Makefile): one port window and temporary directory per slot, tests registered
+  # "serial" one by one after the parallel batch (tests/TEST_MATRIX.md).
   # ---------------------------------------------------------------------------
   coverage-freebsd:
     name: Coverage gate (FreeBSD 15.1)
@@ -336,6 +339,7 @@ jobs:
             echo "::endgroup::"
 
             echo "::group::🧪 [Coverage] make coverage"
+            # the suite runs with -j $(sysctl -n hw.ncpu) (Makefile: COV_JOBS; make coverage COV_JOBS=1 runs it one test at a time)
             START=$(date +%s)
             make coverage < /dev/null
             echo "make coverage took $(( $(date +%s) - START ))s"

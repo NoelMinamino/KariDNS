@@ -7,13 +7,14 @@
 # sends queries with dag, and verifies captured dnstap Protobuf frames.
 # ==============================================================================
 
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
-PORT=${KARIDNS_TEST_PORT:-$((26000 + $$ % 4000))}
+PORT=${KARIDNS_TEST_PORT:-$(kari_port 0 $((26000 + $$ % 4000)))}
 TMP_DIR="/tmp/karidns_dnstap_test_$$"
 rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR"

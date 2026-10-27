@@ -35,7 +35,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DAG="$ROOT_DIR/dag"
 KARIDNS="$ROOT_DIR/karidns"
 MOCK_PL="$SCRIPT_DIR/mock_dag_scenario_server.pl"
-PORT=$((23000 + $$ % 7000))
+PORT=$(kari_port 0 $((23000 + $$ % 7000)))
 KARI_PORT=$((PORT + 2))
 TMP_DIR="$(mktemp -d /tmp/dag_scenario_matrix.XXXXXX)"
 chmod 755 "$TMP_DIR"

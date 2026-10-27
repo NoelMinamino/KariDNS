@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # Test: UDP spoofing source rejection per RFC 5452 §9.1
@@ -28,8 +29,8 @@ else
     fi
 fi
 
-PORT_QUERY=53592
-PORT_SPOOF=53593
+PORT_QUERY=$(kari_port 0 53592)
+PORT_SPOOF=$(kari_port 100 53593)
 
 echo "Running: test_dag_udp_spoofing_source ($DAG)"
 

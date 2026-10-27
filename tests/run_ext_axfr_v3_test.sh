@@ -36,7 +36,7 @@ command -v perl >/dev/null 2>&1 || { echo "SKIP: perl not found"; exit 0; }
 
 TMP_DIR="$(mktemp -d /tmp/karidns_extv3.XXXXXX)"
 chmod 755 "$TMP_DIR"
-PORT1=$((31000 + $$ % 2500))
+PORT1=$(kari_port 0 $((31000 + $$ % 2500)))
 PORT2=$((PORT1 + 1))
 PORT3=$((PORT1 + 2))
 PID1=""; PID2=""; PID3=""

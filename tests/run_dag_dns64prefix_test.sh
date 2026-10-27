@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # Test: RFC 7050 DNS64 prefix discovery (+dns64prefix) validation
@@ -29,7 +30,7 @@ fi
 
 echo "Running: test_dag_dns64prefix ($DAG)"
 
-PORT_DNS64_TEST=53612
+PORT_DNS64_TEST=$(kari_port 0 53612)
 
 # Spawn mock DNS server in background
 perl -e '

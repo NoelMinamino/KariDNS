@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # Test: Structural malformation detection in default mode (RFC / dig diagnostic quality)
@@ -30,7 +31,7 @@ fi
 
 echo "Running: test_malformed_detection_default ($DAG)"
 
-PORT_MALFORMED_TEST=53616
+PORT_MALFORMED_TEST=$(kari_port 0 53616)
 
 # Spawn mock DNS server in background
 perl -e '

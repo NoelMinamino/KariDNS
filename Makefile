@@ -932,8 +932,9 @@ COV_DBL_PAT_0 = karidns_dbloader_%p_%m.profraw
 COV_CFLAGS  = $(COV_CONT_CFLAGS_$(COV_CONTINUOUS)) -Wno-unused-command-line-argument -fprofile-instr-generate -fcoverage-mapping -DKARIDNS_COVERAGE_LINKAGE -O0 -g -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -Wall -Wextra -std=c11 -fPIE $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
 COV_LDFLAGS = -fprofile-instr-generate -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS)
 COV_DIR     = coverage_raw
-# Parallel jobs for the coverage build (the test suite itself stays sequential:
-# many tests share fixed ports).
+# Parallel jobs for the coverage build and for the test suite (tests/run_all_suite.sh -j:
+# every test gets its own port window and temporary directory; tests registered "serial"
+# run alone afterwards, see tests/TEST_MATRIX.md).
 COV_JOBS != (sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 2) | head -n 1
 # Suites that only exercise ASan/TSan/libFuzzer binaries. Those binaries are not
 # coverage-instrumented, so the suites add ~5 minutes and no coverage; the
@@ -1127,7 +1128,7 @@ coverage-run:
 	@echo "=== Executing Test Suite with Instrumentation ==="
 	@mkdir -p $(COV_DIR)
 	@chmod 1777 $(COV_DIR)
-	@LLVM_PROFILE_FILE="$$(pwd)/$(COV_DIR)/$(COV_PROFILE_PAT_$(COV_CONTINUOUS))" sh tests/run_all_suite.sh --exclude "$(COV_SUITE_EXCLUDE)" || true
+	@LLVM_PROFILE_FILE="$$(pwd)/$(COV_DIR)/$(COV_PROFILE_PAT_$(COV_CONTINUOUS))" sh tests/run_all_suite.sh -j $(COV_JOBS) --exclude "$(COV_SUITE_EXCLUDE)" || true
 	@$(MAKE) coverage-fuzz-run || true
 	@echo "Profile files in $(COV_DIR): $$(ls $(COV_DIR) | wc -l | tr -d ' ') (continuous mode: one file per instrumented binary)"
 

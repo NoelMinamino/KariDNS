@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # ==============================================================================
@@ -80,7 +81,7 @@ trap cleanup EXIT INT TERM
 # ------------------------------------------------------------------------------
 echo "=== 1. Testing P2-1 (Opportunistic TLS Handshake Error Message) ==="
 
-MOCK_TLS_PORT=18853
+MOCK_TLS_PORT=$(kari_port 0 18853)
 # Start a simple TCP server that accepts connections and closes immediately
 perl -MIO::Socket::INET -e '
     my $server = IO::Socket::INET->new(
@@ -138,7 +139,7 @@ fi
 # ------------------------------------------------------------------------------
 echo "=== 3. Testing P3-4 (DoH Chunked Transfer Decoding) ==="
 
-MOCK_DOH_PORT=18880
+MOCK_DOH_PORT=$(kari_port 100 18880)
 # Minimal DNS NOERROR response for example.com A -> 192.0.2.1
 perl -MIO::Socket::INET -e '
     my $server = IO::Socket::INET->new(

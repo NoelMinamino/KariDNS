@@ -21,7 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 KARIDNS="$BASE_DIR/karidns"
 DAG="$BASE_DIR/dag"
-PORT=15471
+PORT=$(kari_port 0 15471)
 NAMES="${NAMES:-30000}"
 SECONDS_PER_RUN="${SECONDS_PER_RUN:-5}"
 

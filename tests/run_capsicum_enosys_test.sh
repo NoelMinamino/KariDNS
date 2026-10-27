@@ -22,7 +22,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 KARIDNS="$ROOT_DIR/karidns"
 DAG="$ROOT_DIR/dag"
 
-PORT=$((26000 + $$ % 4000))
+PORT=$(kari_port 0 $((26000 + $$ % 4000)))
 TMP_DIR="/tmp/capsicum_enosys_test_$$"
 rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR"
@@ -84,7 +84,12 @@ run_with_fault() { # $1 = KARI_FI_SPEC; waits for an answer or for the exit
     done
 }
 
-stop_server() { # sets RC to the exit status
+stop_server() { # sets RC to the exit status; "abort": the server is expected to end by itself
+    if [ "${1:-}" = abort ]; then
+        # a failing start-up ends the server on its own; give it time under load before the TERM
+        i=0
+        while [ $i -lt 300 ] && kill -0 "$SERVER_PID" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    fi
     kill -TERM "$SERVER_PID" 2>/dev/null
     i=0
     while [ $i -lt 100 ] && kill -0 "$SERVER_PID" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
@@ -105,14 +110,14 @@ stop_server; rc=$RC
 
 # 2. other cap_enter() error: clean abort
 run_with_fault "cap_enter@1:errno=EPERM:child"
-stop_server; rc=$RC
+stop_server abort; rc=$RC
 grep -q "cap_enter failed" "$TMP_DIR/karidns.log" && pass "cap_enter EPERM: start-up aborted with a message" \
     || fail "cap_enter EPERM: no message"
 [ "$rc" = 1 ] && pass "cap_enter EPERM: exit status 1, no crash" || fail "cap_enter EPERM: exit status $rc (expected 1)"
 
 # 3. a worker thread cannot be created (pthread_create #2 in the backend: after the async I/O pool)
 run_with_fault "pthread_create@18:child"
-stop_server; rc=$RC
+stop_server abort; rc=$RC
 [ "$rc" = 1 ] && pass "pthread_create fault: exit status 1, no crash" || fail "pthread_create fault: exit status $rc (expected 1)"
 grep -q "Sanitizer\|Segmentation fault" "$TMP_DIR/karidns.log" && fail "pthread_create fault: sanitizer report or segfault"
 

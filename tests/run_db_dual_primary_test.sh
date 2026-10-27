@@ -66,7 +66,7 @@ pg_setup dual || exit 0
 PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
-PORT_A=$((20000 + $$ % 20000))
+PORT_A=$(kari_port 0 $((20000 + $$ % 20000)))
 PORT_B=$((PORT_A + 1))
 BOUND=${BOUND:-20}        # seconds a server may need to show a change (every wait in this test is bounded by it)
 
