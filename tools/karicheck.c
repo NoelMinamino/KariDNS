@@ -409,31 +409,75 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     return 0;
 }
 
+KARIDNS_TOOL_FN bool kc_db_identity(const database_config_t *db, uid_t *uid, gid_t *gid, bool *drop, char *who, size_t whocap);
+
+extern char **environ;
+
+/* Start the loader at `lp` with `argv` (P1, P5, S-5; `karicheck conf` for --drivers and `karicheck db` for --check share it).
+ * The child: stdin from /dev/null, stdout on out_fd, stderr on out_fd too or on /dev/null, every other descriptor closed
+ * (closefrom(3)), the loader file opened for execution and checked as the open file with the rights of the user who runs
+ * karicheck (exec_file_open_checked(): what karidns checks), then the drop to loader-user / loader-group when root runs
+ * karicheck (the loader is never run as root), an empty environment, cwd "/", and the checked file is executed
+ * (exec_file_exec_fd()).  Returns the pid, or -1. */
+KARIDNS_TOOL_FN pid_t kc_loader_spawn(const char *lp, const char *const *argv, bool drop, uid_t uid, gid_t gid, int out_fd,
+                                      bool err_to_out) {
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid != 0) return pid;
+    char msg[400];
+    int dn = open("/dev/null", O_RDWR);
+    if (dn >= 0) dup2(dn, 0);
+    dup2(out_fd, 1);
+    if (err_to_out) dup2(out_fd, 2);
+    else if (dn >= 0) dup2(dn, 2);
+#if defined(__FreeBSD__)
+    closefrom(3);                                       /* S-5: every descriptor, not only 3..255 */
+#else
+    for (int fd = 3; fd < 4096; fd++) close(fd);        /* a portable build of karicheck (no closefrom() on macOS) */
+#endif
+    signal(SIGPIPE, SIG_DFL);
+    char err[400];
+    int xfd = exec_file_open_checked(lp, geteuid(), "database loader", "this user", err, sizeof(err));
+    if (xfd < 0) {
+        int n = snprintf(msg, sizeof(msg), "%s\n", err);
+        if (n > 0) (void)!write(2, msg, (size_t)n);
+        _exit(126);
+    }
+    if (drop) {
+        if (setgroups(0, NULL) != 0 || setgid(gid) != 0 || setuid(uid) != 0 || getuid() != uid || geteuid() != uid) {
+            int n = snprintf(msg, sizeof(msg), "cannot drop to the loader user: %s\n", strerror(errno));
+            if (n > 0) (void)!write(2, msg, (size_t)n);
+            _exit(126);
+        }
+    }
+    static char *empty_env[] = { NULL };
+    environ = empty_env;
+    if (chdir("/") != 0) _exit(126);
+    exec_file_exec_fd(xfd, lp, (char *const *)argv, empty_env);
+    int n = snprintf(msg, sizeof(msg), "cannot execute '%s': %s\n", lp, strerror(errno));
+    if (n > 0) (void)!write(2, msg, (size_t)n);
+    _exit(127);
+}
+
 /* The drivers the loader at `path` was built with (`karidns-dbloader --drivers`, one name per line), run without a
- * shell.  false: it could not be run or did not succeed. */
-KARIDNS_TOOL_FN bool kc_loader_drivers(const char *path, char *out, size_t cap) {
+ * shell and with the loader's rights (kc_loader_spawn()).  false: it could not be run or did not succeed. */
+KARIDNS_TOOL_FN bool kc_loader_drivers(const database_config_t *db, const char *path, char *out, size_t cap) {
     int fds[2];
     out[0] = '\0';
+    uid_t uid = 0;
+    gid_t gid = 0;
+    bool drop = false;
+    char who[400];
+    if (!kc_db_identity(db, &uid, &gid, &drop, who, sizeof(who))) return false;   /* root without loader-user: said on stderr */
     if (pipe(fds) != 0) return false;
-    pid_t pid = fork();
+    static const char *const argv[] = { "karidns-dbloader", "--drivers", NULL };
+    pid_t pid = kc_loader_spawn(path, argv, drop, uid, gid, fds[1], false);
+    close(fds[1]);
     if (pid < 0) {
         close(fds[0]);
-        close(fds[1]);
         return false;
     }
-    if (pid == 0) {
-        int dn = open("/dev/null", O_RDWR);
-        if (dn >= 0) {
-            dup2(dn, 0);
-            dup2(dn, 2);
-        }
-        dup2(fds[1], 1);
-        close(fds[0]);
-        close(fds[1]);
-        execl(path, "karidns-dbloader", "--drivers", (char *)NULL);
-        _exit(127);
-    }
-    close(fds[1]);
     size_t n = 0;
     ssize_t r;
     while ((r = read(fds[0], out + n, cap - 1 - n)) > 0 && (n += (size_t)r) < cap - 1) {}
@@ -460,32 +504,22 @@ KARIDNS_TOOL_FN bool kc_line_listed(const char *list, const char *name) {
  * execute, owned by root or by that user, not writable by group or others.  Here the user who runs karicheck stands in for the one who
  * runs karidns (as root the file must be root's).  Reports errors (karicheck conf and karicheck db); true when the file can be executed. */
 KARIDNS_TOOL_FN bool kc_check_loader_file(kc_tally_t *t, const char *lp) {
-    struct stat st;
-    if (stat(lp, &st) != 0) {
-        kc_error(t, "database loader '%s': %s\n", lp, strerror(errno));
+    /* P1 / P5: the same open-and-check as karidns (exec_file_open_checked()); any violation is an error and false, so the
+     * loader is not run (before B12's fix an owner or mode error still returned true and root ran the file) */
+    char err[600];
+    int fd = exec_file_open_checked(lp, geteuid(), "database loader", "this user", err, sizeof(err));
+    if (fd < 0) {
+        kc_error(t, "%s; karidns refuses to run it\n", err);
         return false;
     }
-    if (!S_ISREG(st.st_mode)) {
-        kc_error(t, "database loader '%s' is not a regular file\n", lp);
-        return false;
-    }
-    if (st.st_uid != 0 && st.st_uid != geteuid())
-        kc_error(t, "database loader '%s' is not owned by root%s (uid %u); karidns refuses to run it\n", lp,
-                 geteuid() == 0 ? "" : " or by the user running karidns", (unsigned)st.st_uid);
-    if (st.st_mode & (S_IWGRP | S_IWOTH))
-        kc_error(t, "database loader '%s' is writable by group or others (mode %04o); karidns refuses to run it\n", lp,
-                 (unsigned)(st.st_mode & 07777));
-    if (access(lp, X_OK) != 0) {
-        kc_error(t, "database loader '%s' is not executable by this user\n", lp);
-        return false;
-    }
+    close(fd);
     return true;
 }
 
-/* has the loader at `lp` been built with the driver `driver`?  (karicheck conf and karicheck db) */
-KARIDNS_TOOL_FN void kc_check_loader_driver(kc_tally_t *t, const char *lp, const char *driver) {
+/* has the loader at `lp` been built with the driver `driver`?  (karicheck conf and karicheck db; run with the loader's rights) */
+KARIDNS_TOOL_FN void kc_check_loader_driver(kc_tally_t *t, const database_config_t *db, const char *lp, const char *driver) {
     char drivers[256];
-    if (!kc_loader_drivers(lp, drivers, sizeof(drivers)))
+    if (!kc_loader_drivers(db, lp, drivers, sizeof(drivers)))
         kc_error(t, "database loader '%s' did not answer --drivers; is it karidns-dbloader?\n", lp);
     else if (!kc_line_listed(drivers, driver)) {
         for (char *c = drivers; *c; c++)
@@ -581,23 +615,32 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
     kc_tally_t t = {0};
     bool sqlite = db->driver && strcmp(db->driver, "sqlite3") == 0;
 
-    /* loader-user / loader-group */
+    /* loader-user / loader-group (P4: root by another name, uid 0 or the root group, is refused as karidns refuses it) */
     uid_t loader_uid = (uid_t)-1;
     bool have_uid = false;
+    char id_err[256];
+    bool id_root = identity_names_root(db->loader_user, db->loader_group, id_err, sizeof(id_err));
     if (db->loader_user) {
         struct passwd *pw = getpwnam(db->loader_user);
         if (!pw) kc_error(&t, "database loader-user '%s' does not exist\n", db->loader_user);
-        else { loader_uid = pw->pw_uid; have_uid = true; }
+        else if (!id_root) { loader_uid = pw->pw_uid; have_uid = true; }
     } else {
         kc_warning(&t, "database: no loader-user; karidns refuses to start as root without one\n");
     }
     if (db->loader_group && !getgrnam(db->loader_group))
         kc_error(&t, "database loader-group '%s' does not exist\n", db->loader_group);
+    if (id_root) kc_error(&t, "database loader-user / loader-group: %s; karidns refuses to start\n", id_err);
 
-    /* loader-path: owned by root (or by the user running karidns), not group / world writable, executable; and it has the driver */
+    /* loader-path: owned by root (or by the user running karidns), not group / world writable, executable; and it has the driver.
+     * Run by root, --drivers is run as loader-user (kc_loader_spawn()); without a loader-user root cannot run it at all. */
     const char *lp = db_loader_path(cfg);
     bool loader_ok = kc_check_loader_file(&t, lp);
-    if (loader_ok && db->driver) kc_check_loader_driver(&t, lp, db->driver);
+    if (loader_ok && db->driver) {
+        if (geteuid() == 0 && !have_uid)
+            kc_warning(&t, "database loader '%s': --drivers was not run: karicheck is run by root and the loader is only run as loader-user\n", lp);
+        else
+            kc_check_loader_driver(&t, db, lp, db->driver);
+    }
 
     /* B7a: without acl-ceiling the ACLs a database zone carries (allow-transfer, allow-update from the metadata or a profile)
      * refuse every client; the zones still answer queries */
@@ -751,6 +794,15 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
                     fprintf(stderr, "[WARNING] Zone '%s' program '%s' is not executable (access X_OK failed: %s)\n",
                             z->domain, zx->program_path, strerror(errno));
                 }
+                if (zx->program_user) {
+                    /* P4: a program-user that is root by another name is refused by karidns (validate_program_zone_users()) */
+                    char id_err[256];
+                    if (identity_names_root(zx->program_user, NULL, id_err, sizeof(id_err))) {
+                        fprintf(stderr, "[ERROR] Zone '%s': program-user: %s; karidns refuses to start\n", z->domain, id_err);
+                        free(buf);
+                        return 1;
+                    }
+                }
                 if (zx->program_user && cfg->user &&
                     strcasecmp(zx->program_user, cfg->user) != 0) {
                     fprintf(stderr,
@@ -858,6 +910,16 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
     if (ecs_error) {
         free(buf);
         return 1;
+    }
+
+    /* P4: options { user; group; } must not be root by another name (karidns refuses to start, resolve_run_identity()) */
+    {
+        char id_err[256];
+        if (identity_names_root(cfg->user, cfg->group, id_err, sizeof(id_err))) {
+            fprintf(stderr, "[ERROR] options user / group: %s; karidns refuses to start\n", id_err);
+            free(buf);
+            return 1;
+        }
     }
 
     if (kc_check_database(cfg) > 0) {
@@ -1264,6 +1326,11 @@ KARIDNS_TOOL_FN bool kc_db_identity(const database_config_t *db, uid_t *uid, gid
                         "so there are no rights to check with; run karicheck as the user of the loader, or set loader-user\n");
         return false;
     }
+    char id_err[256];
+    if (identity_names_root(db->loader_user, db->loader_group, id_err, sizeof(id_err))) {   /* P4: never drop "to" root */
+        fprintf(stderr, "[ERROR] database loader-user / loader-group: %s; karidns refuses to start, and karicheck does not run the loader as root\n", id_err);
+        return false;
+    }
     struct passwd *pw = getpwnam(db->loader_user);
     if (!pw) {
         fprintf(stderr, "[ERROR] database loader-user '%s' does not exist\n", kc_pr(db->loader_user));
@@ -1284,8 +1351,6 @@ KARIDNS_TOOL_FN bool kc_db_identity(const database_config_t *db, uid_t *uid, gid
              kc_pr(db->loader_user), db->loader_group ? " / loader-group " : "", db->loader_group ? kc_pr(db->loader_group) : "");
     return true;
 }
-
-extern char **environ;
 
 /* Run the loader for one source.  Returns 0, or 1 when something was wrong (also: it could not be run). */
 KARIDNS_TOOL_FN int kc_db_run_source(const server_config_t *cfg, const kc_dbsrc_t *src, const view_config_t *only, bool sqlite, unsigned *zones_out,
@@ -1365,37 +1430,12 @@ KARIDNS_TOOL_FN int kc_db_run_source(const server_config_t *cfg, const kc_dbsrc_
         fprintf(stderr, "[ERROR] %s: pipe: %s\n", label, strerror(errno));
         return 1;
     }
-    fflush(stdout);
-    fflush(stderr);
-    pid_t pid = fork();
+    pid_t pid = kc_loader_spawn(lp, argv, drop, uid, gid, fds[1], true);  /* the child: the loader's rights, nothing else */
     if (pid < 0) {
         fprintf(stderr, "[ERROR] %s: fork: %s\n", label, strerror(errno));
         close(fds[0]);
         close(fds[1]);
         return 1;
-    }
-    if (pid == 0) {                                                     /* the child: the loader's rights, nothing else */
-        char msg[400];
-        int dn = open("/dev/null", O_RDWR);
-        if (dn >= 0) dup2(dn, 0);
-        dup2(fds[1], 1);
-        dup2(fds[1], 2);
-        for (int fd = 3; fd < 256; fd++) close(fd);
-        signal(SIGPIPE, SIG_DFL);
-        if (drop) {
-            if (setgroups(0, NULL) != 0 || setgid(gid) != 0 || setuid(uid) != 0 || getuid() != uid || geteuid() != uid) {
-                int n = snprintf(msg, sizeof(msg), "cannot drop to the loader user: %s\n", strerror(errno));
-                if (n > 0) (void)!write(2, msg, (size_t)n);
-                _exit(126);
-            }
-        }
-        static char *empty_env[] = { NULL };
-        environ = empty_env;
-        if (chdir("/") != 0) _exit(126);
-        execv(lp, (char *const *)argv);
-        int n = snprintf(msg, sizeof(msg), "cannot execute '%s': %s\n", lp, strerror(errno));
-        if (n > 0) (void)!write(2, msg, (size_t)n);
-        _exit(127);
     }
     close(fds[1]);
 
@@ -1522,7 +1562,7 @@ KARIDNS_TOOL_FN int kc_db_main(const char *config_path, const char *view_arg) {
         kc_tally_t ct = {0};
         if (!db->driver) kc_error(&ct, "options { database { } } has no driver\n");
         else if (!kc_check_loader_file(&ct, lp) || ct.errors > 0) {}                     /* ownership, mode and X_OK as karidns wants them: before the loader is run */
-        else if (geteuid() != 0) kc_check_loader_driver(&ct, lp, db->driver);      /* root does not run the loader, not even --drivers: the loader after the privilege drop says it */
+        else kc_check_loader_driver(&ct, db, lp, db->driver);                           /* run as the loader user (root drops to it, kc_loader_spawn()) */
         if (ct.errors > 0) return 1;
     }
 

@@ -628,3 +628,117 @@ const char *__tsan_default_suppressions(void) {
 
 
 
+
+#ifndef _WIN32
+/* ---- the files and names the server hands rights to (P1, P4, P5): used by karidns, karicheck and the tests ---- */
+#include <errno.h>
+#include <fcntl.h>
+#include <grp.h>
+#include <pwd.h>
+
+#if defined(__FreeBSD__)
+#define KARIDNS_OPEN_EXEC O_EXEC   /* opened for execution only; fexecve() runs this very file */
+#else
+#define KARIDNS_OPEN_EXEC O_RDONLY /* karicheck on a portable build: no O_EXEC / fexecve(); the checks are made on the open file all the same */
+#endif
+
+int exec_file_open_checked(const char *path, uid_t self, const char *what, const char *who, char *err, size_t errlen) {
+  int fd = open(path, KARIDNS_OPEN_EXEC | O_CLOEXEC);
+  if (fd < 0) {
+    int e = errno;
+    struct stat ps;
+    if (e == EACCES && stat(path, &ps) == 0 && S_ISREG(ps.st_mode))
+      snprintf(err, errlen, "%s '%s' is not executable by %s", what, path, who);
+    else if ((e == EACCES || e == EISDIR) && stat(path, &ps) == 0 && !S_ISREG(ps.st_mode))
+      snprintf(err, errlen, "%s '%s' is not a regular file", what, path);
+    else
+      snprintf(err, errlen, "%s '%s': %s", what, path, strerror(e));
+    return -1;
+  }
+  struct stat st;
+  if (fstat(fd, &st) != 0) {
+    snprintf(err, errlen, "%s '%s': fstat: %s", what, path, strerror(errno));
+    close(fd);
+    return -1;
+  }
+  if (!S_ISREG(st.st_mode)) {
+    snprintf(err, errlen, "%s '%s' is not a regular file", what, path);
+    close(fd);
+    return -1;
+  }
+  /* both findings are reported when both apply (karicheck shows them to the operator in one go) */
+  size_t n = 0;
+  err[0] = '\0';
+  if (st.st_uid != 0 && st.st_uid != self)
+    n += (size_t)snprintf(err, errlen, "%s '%s' is owned by uid %u; it must belong to root%s", what, path, (unsigned)st.st_uid,
+                          self == 0 ? "" : " or to the user running karidns");
+  if ((st.st_mode & (S_IWGRP | S_IWOTH)) && n < errlen)
+    n += (size_t)snprintf(err + n, errlen - n, "%s%s '%s' is writable by group or others (mode %04o)", n ? "; " : "", what, path,
+                          (unsigned)(st.st_mode & 07777));
+  if (n) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+int exec_file_exec_fd(int fd, const char *path, char *const argv[], char *const envp[]) {
+#if defined(__FreeBSD__)
+  /* An O_EXEC descriptor cannot be read, so whether the file is a script (#!) is looked at through a second, read-only
+   * open of the path: only this classification depends on the name (a misread binary is still executed through `fd`; a
+   * misread script fails in its interpreter) */
+  int rfd = open(path, O_RDONLY | O_CLOEXEC);
+  unsigned char head[2] = { 0, 0 };
+  bool script = rfd >= 0 && read(rfd, head, 2) == 2 && head[0] == '#' && head[1] == '!';
+  if (rfd >= 0) close(rfd);
+  if (script) {
+    /* execve(2): the kernel hands a script's interpreter "/dev/fd/N", which exists only when fdescfs(4) is mounted, and the
+     * interpreter must find the descriptor open: it is left open across the exec for this case only */
+    char devfd[32];
+    snprintf(devfd, sizeof(devfd), "/dev/fd/%d", fd);
+    if (access(devfd, F_OK) != 0 || fcntl(fd, F_SETFD, 0) != 0) {
+      execve(path, argv, envp);
+      return -1;
+    }
+  }
+  fexecve(fd, argv, envp);
+#else
+  (void)fd;
+  execve(path, argv, envp);
+#endif
+  return -1;
+}
+
+bool identity_names_root(const char *user, const char *group, char *err, size_t errlen) {
+  char buf[16384];
+  gid_t gid = (gid_t)-1;
+  bool have_gid = false, gid_from_group = false;
+  if (user) {
+    struct passwd pw, *res = NULL;
+    if (getpwnam_r(user, &pw, buf, sizeof(buf), &res) == 0 && res) {
+      if (pw.pw_uid == 0) {
+        snprintf(err, errlen, "user '%s' is uid 0: root is not accepted as the user to run as", user);
+        return true;
+      }
+      gid = pw.pw_gid;
+      have_gid = true;
+    }
+  }
+  if (group) {
+    struct group gr, *res = NULL;
+    if (getgrnam_r(group, &gr, buf, sizeof(buf), &res) == 0 && res) {
+      gid = gr.gr_gid;   /* the group named overrides the user's primary group */
+      have_gid = gid_from_group = true;
+    }
+  }
+  if (have_gid && gid == 0) {
+    if (gid_from_group)
+      snprintf(err, errlen, "group '%s' is gid 0: the root group is not accepted as the group to run as", group);
+    else
+      snprintf(err, errlen, "user '%s' has the root group (gid 0) as its primary group: set a group, the root group is not "
+                            "accepted as the group to run as", user);
+    return true;
+  }
+  return false;
+}
+#endif

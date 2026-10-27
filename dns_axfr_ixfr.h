@@ -27,6 +27,10 @@ typedef struct {
   size_t tsig_secret_decoded_len;
   /* マスターへの TCP 接続に使う zone-tcp-* / tcp-* (xfr_tcp_sockopts()) */
   tcp_sockopts_t tcp_opts;
+  /* I2: the most RRs and message octets one transfer of this zone may bring (max-zone-records / max-zone-bytes of the
+   * zone, else of options; xfr_zone_limits()).  0 = no limit. */
+  uint64_t max_records;
+  uint64_t max_bytes;
 } axfr_bg_ctx_t;
 
 typedef struct {

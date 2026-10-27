@@ -2207,6 +2207,23 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, progra
   uid_t prog_uid = (uid_t)-1;
   gid_t prog_gid = (gid_t)-1;
   bool prog_user_found = x->program_user && lookup_user_ids(x->program_user, &prog_uid, &prog_gid);
+  /* P4: a program-user that is root by another name (uid 0, or the root group as its primary group) is refused, like no
+   * program-user as root below (validate_program_zone_users() refuses the configuration first; this is the fail-closed spawn) */
+  if (prog_user_found && (prog_uid == 0 || prog_gid == 0)) {   /* the ids resolved above: no second name lookup here */
+    syslog(LOG_ERR, "[Plugin] zone '%s': program-user '%s' is uid %u, gid %u; refusing to run the plugin as root or in the root group",
+           zcfg->domain, x->program_user, (unsigned)prog_uid, (unsigned)prog_gid);
+    return false;
+  }
+  /* S-1: the plugin gets an empty environment (as the database loader does, dns_db_supervisor.c): nothing of the
+   * server's environment (paths, debugging variables, anything an operator exported) reaches a zone's program.  TZ is
+   * kept so that its time stamps match the server's.  Read before the fork (no getenv() in the child). */
+  const char *tz = getenv("TZ");
+  char tzenv[136] = "";
+  char *plugin_envp[2] = { NULL, NULL };
+  if (tz) {
+    snprintf(tzenv, sizeof(tzenv), "TZ=%s", tz);
+    plugin_envp[0] = tzenv;
+  }
 
   int in_pipe[2];  // parent(karidns) write -> child(script) stdin
   int out_pipe[2]; // child(script) stdout -> parent(karidns) read
@@ -2286,7 +2303,7 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, progra
     sigemptyset(&plugin_mask);
     sigprocmask(SIG_SETMASK, &plugin_mask, NULL);
 
-    execv(x->program_path, argv);
+    execve(x->program_path, argv, plugin_envp);   /* S-1: an empty environment (plugin_envp, built before the fork) */
     _exit(127);
   }
 

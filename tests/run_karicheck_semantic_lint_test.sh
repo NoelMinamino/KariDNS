@@ -156,8 +156,8 @@ else
     FAILED=1
 fi
 
-# Test 7: rdata Count Overflow (> MAX_RDATA = 48) (ERROR)
-echo "[+] Test 7: rdata field count overflow check (>48 fields)..."
+# Test 7: rdata count > MAX_RDATA = 48: a TXT is accepted (I5), another type is an ERROR
+echo "[+] Test 7: rdata field count check (>48 fields: TXT accepted, HINFO rejected)..."
 RDATA_OVERFLOW_ZONE="tests/zones/test_lint_rdata_overflow.tmp.zone"
 RDATA_OK_ZONE="tests/zones/test_lint_rdata_ok.tmp.zone"
 
@@ -167,6 +167,15 @@ for i in $(seq 1 49); do
     printf ' "txt%d"' "$i" >> "$RDATA_OVERFLOW_ZONE"
 done
 printf '\n' >> "$RDATA_OVERFLOW_ZONE"
+
+# I5: the 49-string TXT above is well-formed (RFC 1035 3.3.14, no limit on the count) and accepted; a type with no list of
+# strings still stops at MAX_RDATA: 49 HINFO fields
+RDATA_HINFO_ZONE="tests/zones/test_lint_rdata_hinfo.tmp.zone"
+printf '\$ORIGIN example.com.\n\$TTL 3600\n@ IN SOA ns1.example.com. hostmaster.example.com. 2026091801 7200 3600 1209600 3600\n@ IN NS ns1.example.com.\nns1 IN A 192.0.2.1\nhinfoover IN HINFO' > "$RDATA_HINFO_ZONE"
+for i in $(seq 1 49); do
+    printf ' "h%d"' "$i" >> "$RDATA_HINFO_ZONE"
+done
+printf '\n' >> "$RDATA_HINFO_ZONE"
 
 # Build 48-field TXT zone (exact MAX_RDATA limit)
 printf '\$ORIGIN example.com.\n\$TTL 3600\n@ IN SOA ns1.example.com. hostmaster.example.com. 2026091801 7200 3600 1209600 3600\n@ IN NS ns1.example.com.\nns1 IN A 192.0.2.1\ntxtok IN TXT' > "$RDATA_OK_ZONE"
@@ -178,16 +187,26 @@ printf '\n' >> "$RDATA_OK_ZONE"
 set +e
 OUT7_BAD=$(./karicheck zone example.com. "$RDATA_OVERFLOW_ZONE" 2>&1)
 EXIT7_BAD=$?
+OUT7_HINFO=$(./karicheck zone example.com. "$RDATA_HINFO_ZONE" 2>&1)
+EXIT7_HINFO=$?
 OUT7_OK=$(./karicheck zone example.com. "$RDATA_OK_ZONE" 2>&1)
 EXIT7_OK=$?
 set -e
-rm -f "$RDATA_OVERFLOW_ZONE" "$RDATA_OK_ZONE"
+rm -f "$RDATA_OVERFLOW_ZONE" "$RDATA_OK_ZONE" "$RDATA_HINFO_ZONE"
 
-if [ $EXIT7_BAD -ne 0 ] && echo "$OUT7_BAD" | grep -qi "Too many rdata fields on record"; then
-    echo "  PASS: 49 rdata fields correctly rejected with MAX_RDATA error (exit=$EXIT7_BAD)."
+if [ $EXIT7_BAD -eq 0 ] && echo "$OUT7_BAD" | grep -q "\[RESULT\] Zone 'example.com.': 0 error(s)"; then
+    echo "  PASS: 49 TXT strings accepted (kept as RDATA octets, exit=$EXIT7_BAD)."
 else
-    echo "  FAIL: Expected MAX_RDATA overflow rejection not detected (exit=$EXIT7_BAD):"
+    echo "  FAIL: Expected 49 TXT strings to be accepted (exit=$EXIT7_BAD):"
     echo "$OUT7_BAD"
+    FAILED=1
+fi
+
+if [ $EXIT7_HINFO -ne 0 ] && echo "$OUT7_HINFO" | grep -qi "Too many rdata fields on record"; then
+    echo "  PASS: 49 HINFO fields correctly rejected with MAX_RDATA error (exit=$EXIT7_HINFO)."
+else
+    echo "  FAIL: Expected MAX_RDATA rejection of 49 HINFO fields not detected (exit=$EXIT7_HINFO):"
+    echo "$OUT7_HINFO"
     FAILED=1
 fi
 

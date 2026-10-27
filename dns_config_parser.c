@@ -16,6 +16,8 @@
 #include <limits.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <pwd.h>
+#include <grp.h>
 #include "dns_wire.h"
 #include "dns_tsig_acl.h"
 
@@ -1713,6 +1715,17 @@ int ixfr_history_effective(const server_config_t *cfg, const zone_config_t *zone
   return cfg ? cfg->ixfr_history : IXFR_HISTORY_DEFAULT;
 }
 
+void xfr_zone_limits(const server_config_t *cfg, const zone_config_t *zone, uint64_t *max_records, uint64_t *max_bytes) {
+  uint64_t r = cfg && cfg->max_zone_records ? cfg->max_zone_records : KARIDNS_DB_MAX_ZONE_RECORDS_DEFAULT;
+  uint64_t b = cfg && cfg->max_zone_bytes ? cfg->max_zone_bytes : KARIDNS_DB_MAX_ZONE_BYTES_DEFAULT;
+  if (zone && zext(zone)->max_zone_records) r = zext(zone)->max_zone_records;
+  if (zone && zext(zone)->max_zone_bytes) b = zext(zone)->max_zone_bytes;
+  *max_records = r;
+  *max_bytes = b;
+}
+
+static int db_take_uint(token_ctx_t *ctx, const char *key, bool allow_suffix, uint64_t lo, uint64_t hi, uint64_t *out);
+
 /* B6a (open item 2, decided 2026-10-21): an unknown statement inside zone { } or view { } used to be skipped without a
  * word, so a typo ("alow-transfer") silently left a zone open or closed.  Now:
  *   - an option BIND 9 documents for a zone / view statement but KariDNS does not implement is skipped with a warning;
@@ -2221,6 +2234,16 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       }
       x->ixfr_history = (uint8_t)v;
       x->ixfr_history_set = true;
+    } else if (strcmp(key, "max-zone-records") == 0 || strcmp(key, "max-zone-bytes") == 0) {
+      /* I2: the limits of one inbound transfer of this zone (the same ranges as the database block) */
+      bool recs = strcmp(key, "max-zone-records") == 0;
+      int rc = recs ? db_take_uint(ctx, key, false, 2, KARIDNS_DB_MAX_ZONE_RECORDS_MAX, &x->max_zone_records)
+                    : db_take_uint(ctx, key, true, KARIDNS_DB_MAX_ZONE_BYTES_MIN, KARIDNS_DB_MAX_ZONE_BYTES_MAX, &x->max_zone_bytes);
+      if (rc != 0) {
+        free(key);
+        free_zone_config(zone);
+        return -1;
+      }
     } else if (strncmp(key, "notify-retr", 11) == 0 &&
                (nr_rc = parse_notify_retry_option(ctx, zone->domain, key, &x->notify_retry)) != 0) {
       if (nr_rc < 0) {
@@ -2783,8 +2806,8 @@ static int parse_database_block(token_ctx_t *ctx, server_config_t *config) {
   db->coalesce_ms = 1000;
   db->default_ttl = 3600;
   db->bulk_threshold = 25;
-  db->max_zone_records = 10000000ull;
-  db->max_zone_bytes = 1ull << 30;
+  db->max_zone_records = KARIDNS_DB_MAX_ZONE_RECORDS_DEFAULT;
+  db->max_zone_bytes = KARIDNS_DB_MAX_ZONE_BYTES_DEFAULT;
   db->db_reload_timeout = 30;
   db->ingest_threads = 1;
   db->loader_threads = 1;
@@ -2918,6 +2941,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->notify_retry.interval = NOTIFY_RETRY_INTERVAL_DEFAULT;
   config->notify_retry.backoff = NOTIFY_BACKOFF_FIXED;
   config->ixfr_history = IXFR_HISTORY_DEFAULT;
+  config->max_zone_records = KARIDNS_DB_MAX_ZONE_RECORDS_DEFAULT;
+  config->max_zone_bytes = KARIDNS_DB_MAX_ZONE_BYTES_DEFAULT;
   config->query_log_max_qps = 5000;
   config->query_log_buffer_size = 32768;
   config->max_mqtypes = 4;
@@ -3311,6 +3336,18 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
         } else if (strcmp(key, "ixfr-history") == 0) {
           if (parse_transport_param(ctx, NULL, key, false, 0, IXFR_HISTORY_MAX, &config->ixfr_history) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "max-zone-records") == 0) {
+          /* I2: the limits of one inbound transfer of every secondary zone (a zone { } value replaces them) */
+          if (db_take_uint(ctx, key, false, 2, KARIDNS_DB_MAX_ZONE_RECORDS_MAX, &config->max_zone_records) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "max-zone-bytes") == 0) {
+          if (db_take_uint(ctx, key, true, KARIDNS_DB_MAX_ZONE_BYTES_MIN, KARIDNS_DB_MAX_ZONE_BYTES_MAX,
+                           &config->max_zone_bytes) != 0) {
             free(key);
             return -1;
           }

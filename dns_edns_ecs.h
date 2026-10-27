@@ -77,7 +77,9 @@ void zone_client_view(const zone_image_t *img, const server_config_t *cfg, const
                       uint8_t *zone_scope);
 
 /* pack_tag_def_rdata(), wrap_tinydns_record() and the other encoders of the Extended AXFR records: dns_wire.h (xext_*) */
-bool unpack_tag_def_rdata(const uint8_t *data, size_t len, ecs_tag_def_t **defs_out, int *count_out);
+/* Appends the definition of one LOC_TAGDEF / ECS_TAGDEF record to *defs_out.  I3: the array grows geometrically; *cap_inout
+ * (NULL allowed) keeps its capacity between calls, see dns_edns_ecs.c. */
+bool unpack_tag_def_rdata(const uint8_t *data, size_t len, ecs_tag_def_t **defs_out, int *count_out, int *cap_inout);
 bool unpack_trusted_resolvers_rdata(const uint8_t *data, size_t len, char ***resolvers_out, int *count_out);
 bool unpack_tinydns_loc_rdata(const uint8_t *data, size_t len, tinydns_location_entry_t **locs_out, int *count_out);
 /* wrap_tinydns_record() (dns_wire.h) for RR `rr` of a zone image */

@@ -160,6 +160,10 @@ typedef struct zone_ext {
 
   bool ixfr_history_set;     /* ixfr-history をこのゾーンで指定した */
   uint8_t ixfr_history;      /* その値 (0..IXFR_HISTORY_MAX) */
+  /* I2: max-zone-records / max-zone-bytes of this zone (the most RRs and message octets one inbound AXFR/IXFR may
+   * bring); 0 = the options value (xfr_zone_limits()) */
+  uint64_t max_zone_records;
+  uint64_t max_zone_bytes;
 
   /* --- transfer-acl-match / update-acl-match (B7a, beta design D14): which kinds of entry of an ACL must match.
    * ACL_MATCH_DEFAULT = the meaning karidns.conf always had: allow-transfer with addresses and keys = address AND key,
@@ -345,6 +349,8 @@ typedef struct {
 #define KARIDNS_DB_RELOAD_TIMEOUT_MAX 3600
 #define KARIDNS_DB_THREADS_MAX 16
 #define KARIDNS_DB_MAX_VIEWS 1024   /* views that take DB zones: the CONFIG message of the loader link lists at most this many (KDB_MAX_CONFIG_VIEWS) */
+#define KARIDNS_DB_MAX_ZONE_RECORDS_DEFAULT 10000000ull   /* the database block and options { max-zone-records } (I2) */
+#define KARIDNS_DB_MAX_ZONE_BYTES_DEFAULT (1ull << 30)     /* the database block and options { max-zone-bytes } (I2) */
 #define KARIDNS_DB_MAX_ZONE_RECORDS_MAX 4294967295ull
 #define KARIDNS_DB_MAX_ZONE_BYTES_MIN 65535ull
 #define KARIDNS_DB_MAX_ZONE_BYTES_MAX (64ull << 30)
@@ -406,6 +412,10 @@ typedef struct server_config_s {
   /* TCP の転送パラメータ (0 = OS 既定) */
   notify_retry_config_t notify_retry;
   int ixfr_history;         /* options の ixfr-history (既定 IXFR_HISTORY_DEFAULT) */
+  /* I2: options { max-zone-records; max-zone-bytes; }: the limits of one inbound AXFR/IXFR of a secondary zone (the same
+   * names and defaults as the database block, KARIDNS_DB_MAX_ZONE_*); a zone value replaces them */
+  uint64_t max_zone_records;
+  uint64_t max_zone_bytes;
   int tcp_mss;              /* TCP_MAXSEG。accept 直後に各接続へ設定 (送信 MSS を下げる方向のみ) */
   int tcp_window;           /* SO_RCVBUF と SO_SNDBUF。listen() 前に設定し accept 済みソケットへ
                              * 継承させる。listen ソケットは reload で作り直さないため再起動が必要 */
@@ -506,6 +516,9 @@ zone_config_t *config_find_zone_any_view(const server_config_t *cfg, const char 
 notify_retry_config_t notify_retry_effective(const server_config_t *cfg, const zone_config_t *zone);
 /* The IXFR history depth of a zone: its own ixfr-history, else the options value, else IXFR_HISTORY_DEFAULT (zone/cfg may be NULL). */
 int ixfr_history_effective(const server_config_t *cfg, const zone_config_t *zone);
+/* I2: the inbound transfer limits of a secondary zone: the zone's max-zone-records / max-zone-bytes, else the options
+ * values (a catalog member has no zone { } and takes the options values; cfg NULL = the database defaults) */
+void xfr_zone_limits(const server_config_t *cfg, const zone_config_t *zone, uint64_t *max_records, uint64_t *max_bytes);
 void free_rate_limit_config(rate_limit_config_t *rrl);
 #include <sys/types.h>
 char *read_entire_file(const char *path, dev_t *out_dev, ino_t *out_ino);

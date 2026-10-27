@@ -1946,8 +1946,16 @@ static void nonroot_startup_checks(void) {
     /* 他ユーザー / 存在しないユーザー: 拒否 */
     err[0] = '\0';
     assert(!resolve_run_identity("root", NULL, &id, err, sizeof(err)));
-    assert(strstr(err, "cannot switch") != NULL);
+    assert(strstr(err, "uid 0") != NULL);            /* P4: root is refused by name, before anything else */
     assert(!apply_run_identity("root", NULL, err, sizeof(err)));
+    {   /* another non-root user: a non-root process cannot switch to it */
+        struct passwd *other = getpwnam("daemon");
+        if (!other || other->pw_uid == geteuid() || other->pw_uid == 0) other = getpwnam("nobody");
+        if (other && other->pw_uid != geteuid() && other->pw_uid != 0 && other->pw_gid != 0) {
+            assert(!resolve_run_identity(other->pw_name, NULL, &id, err, sizeof(err)));
+            assert(strstr(err, "cannot switch") != NULL);
+        }
+    }
     assert(!resolve_run_identity("nonexistent_user_12345", NULL, &id, err, sizeof(err)));
     assert(strstr(err, "not found") != NULL);
     /* 現在の gid と異なる group: 拒否 */
@@ -1956,7 +1964,15 @@ static void nonroot_startup_checks(void) {
         char g0name[256];
         snprintf(g0name, sizeof(g0name), "%s", gr0->gr_name);
         assert(!resolve_run_identity(NULL, g0name, &id, err, sizeof(err)));
-        assert(strstr(err, "primary group") != NULL);
+        assert(strstr(err, "gid 0") != NULL);            /* P4: the root group is refused by name */
+    }
+    {
+        struct group *gx = getgrnam("daemon");
+        if (!gx || gx->gr_gid == getegid() || gx->gr_gid == 0) gx = getgrnam("nobody");
+        if (gx && gx->gr_gid != getegid() && gx->gr_gid != 0) {
+            assert(!resolve_run_identity(NULL, gx->gr_name, &id, err, sizeof(err)));
+            assert(strstr(err, "primary group") != NULL);
+        }
     }
 
     /* pid file / 制御ソケット: 書き込めないディレクトリは拒否 */
@@ -2124,10 +2140,13 @@ static void test_log_hand_off_after_priv_dir_check(void) {
     char *dir = mkdtemp(tmpl);
     assert(dir);
     assert(chmod(dir, 0755) == 0);
-    char sub[256], logp[300];
+    /* P2: only a directory karidns creates is handed to the run user; "a" does not exist yet, "keep" is prepared by the operator */
+    char sub[256], logp[300], keep[256], logp2[300];
     snprintf(sub, sizeof(sub), "%s/a", dir);
-    assert(mkdir(sub, 0755) == 0);
     snprintf(logp, sizeof(logp), "%s/q.log", sub);
+    snprintf(keep, sizeof(keep), "%s/keep", dir);
+    assert(mkdir(keep, 0755) == 0);
+    snprintf(logp2, sizeof(logp2), "%s/r.log", keep);
 
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -2139,11 +2158,18 @@ static void test_log_hand_off_after_priv_dir_check(void) {
     ch.name = ch_name;
     ch.file_path = logp;
     ch.fd = -1;
+    log_channel_t ch2;
+    memset(&ch2, 0, sizeof(ch2));
+    char ch2_name[] = "r";
+    ch2.name = ch2_name;
+    ch2.file_path = logp2;
+    ch2.fd = -1;
+    ch.next = &ch2;
     cfg.logging.channels = &ch;
 
     assert(init_logging_channels_ex(&cfg, false));
     struct stat st;
-    assert(stat(sub, &st) == 0 && st.st_uid == 0);   /* not handed off yet */
+    assert(stat(sub, &st) == 0 && st.st_uid == 0);   /* created, not handed off yet */
     assert(ensure_priv_dir_safe(sub));               /* pid file dir check passes */
     /* the owner comes from the identity main() resolved at startup (O-18) */
     run_identity_t saved_id = g_run_identity;
@@ -2152,16 +2178,22 @@ static void test_log_hand_off_after_priv_dir_check(void) {
     hand_off_logging_channels(&cfg);
     g_run_identity = saved_id;
     uid_t nobody = getpwnam("nobody")->pw_uid;
-    assert(stat(sub, &st) == 0 && st.st_uid == nobody);
+    assert(stat(sub, &st) == 0 && st.st_uid == nobody);      /* the directory karidns created is the run user's */
+    assert(stat(keep, &st) == 0 && st.st_uid == 0);          /* P2: the operator's directory keeps its owner */
     /* The log file itself is not checked: on FreeBSD it is opened via
      * open_via_dir_cache() relative to a cap_rights_limit()ed directory fd, so
      * the file fd inherits rights without CAP_FCHOWN and fchown() on it is a
      * no-op. Handing the directory to "user" is what lets rotation recreate it. */
     assert(stat(logp, &st) == 0);
 
+    assert(stat(logp2, &st) == 0);
+
     close(ch.fd);
+    close(ch2.fd);
     unlink(logp);
+    unlink(logp2);
     rmdir(sub);
+    rmdir(keep);
     rmdir(dir);
     printf("  -> log ownership hand-off after pid-dir check passed.\n");
 }

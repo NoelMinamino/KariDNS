@@ -218,7 +218,13 @@ control-channel { algorithm hmac-sha256; secret \"dGVzdC1vbmx5LWR1bW15LWtleS1kby
 expect_refused "default control socket path" "control socket" -f "$TMP/defctl.conf"
 
 write_conf "$TMP/other.conf" "port $PORT; user \"$OTHER_USER\";"
-expect_refused "user \"$OTHER_USER\" (another user)" "cannot switch" -f "$TMP/other.conf"
+OTHER_WANT="cannot switch"
+[ "$OTHER_USER" = root ] && OTHER_WANT="uid 0"       # P4: root is refused by name before anything else
+expect_refused "user \"$OTHER_USER\" (another user)" "$OTHER_WANT" -f "$TMP/other.conf"
+if [ "$RUN_USER" != daemon ] && id daemon >/dev/null 2>&1 && [ "$(id -u daemon)" != 0 ]; then
+    write_conf "$TMP/other2.conf" "port $PORT; user \"daemon\";"
+    expect_refused "user \"daemon\" (another non-root user)" "cannot switch" -f "$TMP/other2.conf"
+fi
 
 write_conf "$TMP/nouserx.conf" "port $PORT; user \"no_such_user_karidns\";"
 expect_refused "unknown user" "not found" -f "$TMP/nouserx.conf"

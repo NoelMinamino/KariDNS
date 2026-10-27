@@ -1410,10 +1410,20 @@ PROCESS_RECORD:
    * 書ける (RFC 4034 §2.2/§3.2 等)。ML-DSA-44 (algorithm 18) の RRSIG 署名は base64 で 3228 文字あり、
    * dnssec-signzone などの出力では MAX_RDATA を超える数の断片に分かれるので、超えるときは末尾の断片を
    * 1 フィールドに連結する (エンコーダは断片を連結して復号するので、結果のワイヤ形式は変わらない)。 */
+  int txt_wire_from = -1, txt_wire_to = -1;   /* I5: a TXT-like RR with more character-strings than MAX_RDATA */
   if (field_idx - i > MAX_RDATA && rec->type) {
-    int lead = trailing_blob_lead_fields(get_type_code(rec->type));
+    uint16_t tc = get_type_code(rec->type);
+    int lead = trailing_blob_lead_fields(tc);
     if (lead >= 0 && i + lead < field_idx)
       field_idx = join_trailing_fields(fields, i + lead, field_idx);
+    else if ((tc == 16 || tc == 99 || tc == 56 || tc == 258) && strcmp(fields[i], "\\#") != 0 && strcmp(fields[i], "#") != 0) {
+      /* I5, RFC 1035 §3.3.14: TXT (and SPF, NINFO, AVC, the same wire form) is "one or more <character-string>s" with no
+       * count; more strings than the text fields hold are encoded straight into the wire form below (the RR is served and
+       * transferred as it is, like one with a NUL octet from a transfer), not refused */
+      txt_wire_from = i;
+      txt_wire_to = field_idx;
+      field_idx = i;
+    }
   }
   /* S5: rdata[] は個数ぶんだけ arena に持つ (EID/NIMLOC の書き換えだけは下で 3 個の配列に取り直す) */
   {
@@ -1546,6 +1556,45 @@ PROCESS_RECORD:
 
   rec->generic_len = 0;
   rec->generic_data = NULL;
+  if (txt_wire_from >= 0) {
+    /* I5: the character-strings of a long TXT, each unescaped and cut into 255-octet pieces as serialize_dns_record()
+     * does for the text fields, kept as the RDATA octets (RFC 3597 §5 form; the whole RDATA fits a 16-bit RDLENGTH) */
+    uint8_t *blob = (uint8_t *)malloc(65535);
+    size_t glen = 0;
+    if (!blob) {
+      zone_generic_rdata_error(ctx, rec->type, buf, "Out of memory");
+      return -1;
+    }
+    for (int j = txt_wire_from; j < txt_wire_to; j++) {
+      unescape_string_in_place(fields[j]);
+      size_t len = strlen(fields[j]);
+      const char *s = fields[j];
+      do {
+        size_t piece = len > 255 ? 255 : len;
+        if (glen + 1 + piece > 65535) {
+          free(blob);
+          zone_generic_rdata_error(ctx, rec->type, buf, "TXT RDATA longer than 65535 octets");
+          return -1;
+        }
+        blob[glen++] = (uint8_t)piece;
+        memcpy(blob + glen, s, piece);
+        glen += piece;
+        s += piece;
+        len -= piece;
+      } while (len > 0);
+    }
+    uint8_t *keep = (uint8_t *)arena_alloc(arena, glen);
+    if (!keep) {
+      free(blob);
+      zone_generic_rdata_error(ctx, rec->type, buf, "Out of memory");
+      return -1;
+    }
+    memcpy(keep, blob, glen);
+    free(blob);
+    rec->generic_data = keep;
+    rec->generic_len = (uint16_t)glen;
+    rec->rdata_count = 0;
+  }
   /* EID (31) / NIMLOC (32) have no dedicated wire encoder; the server always serves them via the RFC 3597
    * generic form. dig's presentation for these undocumented types is a single bare hex token with no "\# len"
    * prefix, so accept that shape too by rewriting it into an equivalent "\# <len> <hex>" generic record. */

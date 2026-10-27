@@ -51,7 +51,7 @@ CRASHES=0
 fail() { echo "  FAIL: $*"; FAILED=$((FAILED + 1)); }
 ok()   { echo "  ok: $*"; }
 
-# karidns hands its pid/log directories to the unprivileged user and then
+# karidns hands the directories it creates to the unprivileged user and then
 # distrusts them on the next start, so every instance gets a fresh one.
 fresh_dir() { rm -rf "$1"; mkdir -m 755 "$1"; }
 
@@ -184,6 +184,9 @@ echo "=== KariDNS server runtime matrix ==="
 # -----------------------------------------------------------------------------
 echo "[A] dual-stack wildcard instance"
 fresh_dir "$TMP/a"
+# P2: karidns no longer hands an existing directory to the run user, so the logs (which the run user rotates) get a directory of
+# their own that the test prepares; the pid file stays in "$TMP/a" (root-owned, as ensure_priv_dir_safe() wants it)
+fresh_dir "$TMP/alog"; chown nobody "$TMP/alog" 2>/dev/null || true
 make_zone "$TMP/m.zone" m.test
 make_zone "$TMP/m6.zone" m6.test
 make_zone "$TMP/rl.zone" rl.test
@@ -204,8 +207,8 @@ options {
     query-log-max-qps 100000;
 };
 logging {
-    channel q { file "$TMP/a/q.log" versions 2 size 1k; print-time yes; print-category yes; print-severity yes; };
-    channel r { file "$TMP/a/r.log" versions 1 size 2k; };
+    channel q { file "$TMP/alog/q.log" versions 2 size 1k; print-time yes; print-category yes; print-severity yes; };
+    channel r { file "$TMP/alog/r.log" versions 1 size 2k; };
     category queries { q; };
     category responses { r; };
 };
@@ -327,8 +330,8 @@ if wait_up 127.0.0.1 $PA m.test; then
     # replaces an oversized q.log.0.
     # "versions 2 size 1k": q.log.0 (and q.log.1) hold the older queries, nothing beyond .1 is kept
     qlog_rotated() {
-        [ -f "$TMP/a/q.log.0" ] && grep -q "q[0-9]*\.m\.test" "$TMP/a/q.log.0" "$TMP/a/q.log" 2>/dev/null &&
-        [ ! -f "$TMP/a/q.log.2" ] && [ "$(wc -c < "$TMP/a/q.log.0")" -le 1024 ]
+        [ -f "$TMP/alog/q.log.0" ] && grep -q "q[0-9]*\.m\.test" "$TMP/alog/q.log.0" "$TMP/alog/q.log" 2>/dev/null &&
+        [ ! -f "$TMP/alog/q.log.2" ] && [ "$(wc -c < "$TMP/alog/q.log.0")" -le 1024 ]
     }
     j=0
     while [ $j -lt 75 ] && ! qlog_rotated; do
