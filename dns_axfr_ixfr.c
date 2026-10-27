@@ -442,17 +442,24 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           session->has_current_ecs_tag = false;
         }
         continue;
-      } else if (type == DNS_TYPE_KARIDNS_LOC_TAGDEF) {
+      } else if (type == DNS_TYPE_KARIDNS_LOC_TAGDEF || type == DNS_TYPE_KARIDNS_ECS_TAGDEF) {
+        /* I3: a definition per record; the number of definitions and of their CIDRs is bounded (XFR_TAGDEF_MAX,
+         * XFR_TAGDEF_CIDR_MAX, the style of the TINYDNS_LOCDEF limit below) on the loader's stream and on AXFR-in alike */
+        bool loc = type == DNS_TYPE_KARIDNS_LOC_TAGDEF;
+        ecs_tag_def_t **defs = loc ? &standby->bind_location_tags : &standby->bind_ecs_tags;
+        int *ndefs = loc ? &standby->bind_location_tag_count : &standby->bind_ecs_tag_count;
+        int *cap = loc ? &session->loc_tagdef_cap : &session->ecs_tagdef_cap;
         standby->count--;
         session->ext_records++;
-        if (!unpack_tag_def_rdata(rec->generic_data, rec->generic_len, &standby->bind_location_tags, &standby->bind_location_tag_count) && session->db_stream)
-          return xfr_ext_reject(domain, "a malformed LOC_TAGDEF");
-        continue;
-      } else if (type == DNS_TYPE_KARIDNS_ECS_TAGDEF) {
-        standby->count--;
-        session->ext_records++;
-        if (!unpack_tag_def_rdata(rec->generic_data, rec->generic_len, &standby->bind_ecs_tags, &standby->bind_ecs_tag_count) && session->db_stream)
-          return xfr_ext_reject(domain, "a malformed ECS_TAGDEF");
+        if (!unpack_tag_def_rdata(rec->generic_data, rec->generic_len, defs, ndefs, cap)) {
+          if (session->db_stream) return xfr_ext_reject(domain, loc ? "a malformed LOC_TAGDEF" : "a malformed ECS_TAGDEF");
+          continue;
+        }
+        if (*ndefs > XFR_TAGDEF_MAX)
+          return xfr_ext_reject(domain, loc ? "more than 4096 LOC_TAGDEF records" : "more than 4096 ECS_TAGDEF records");
+        session->tagdef_cidrs += (uint64_t)(*defs)[*ndefs - 1].cidr_count;
+        if (session->tagdef_cidrs > XFR_TAGDEF_CIDR_MAX)
+          return xfr_ext_reject(domain, "more than 65536 CIDRs in the LOC_TAGDEF / ECS_TAGDEF records");
         continue;
       } else if (type == DNS_TYPE_KARIDNS_ECS_TRUSTED) {
         standby->count--;
@@ -609,6 +616,15 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
       }
     }
 
+    /* S-I1: RFC 1035 §5.2 ("all RRs in the file should have the same class") and RFC 5936 §2.2.1 (QCLASS is the class of
+     * the zone requested): the zone is asked for in class IN and every RR of the answer is zone data of that class.  A
+     * record of another class is not this zone's data and the transfer is refused, as the database install path does
+     * (an Extended AXFR class 65302 record was taken above; a TINYDNS_WRAP's RR carries its original class). */
+    if (rec->class_val != 1) {
+      syslog(LOG_WARNING, "[AXFR] zone '%s': rejecting transfer: record '%s' type %u of class %u (the zone is class IN)",
+             domain, rec->name ? rec->name : "", (unsigned)type, (unsigned)rec->class_val);
+      return -1;
+    }
     /* RFC 1034 §4.2 / RFC 5936 §2.2: ゾーンは apex とその下のデータ。ゾーン外の RR は
      * 1件で転送全体を捨てず、格納せずに読み飛ばす (BIND も同様に無視する)。
      * SOA は転送の始まりと終わりを示すので、ゾーン外の SOA はプロトコル違反として拒否する。*/
@@ -648,8 +664,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
       session->soa_count++;
       uint32_t current_serial = strtoul(rec->rdata[2], NULL, 10);
       if (session->soa_count == 1) {
-        strncpy(session->initial_soa_name, rec->name,
-                sizeof(session->initial_soa_name) - 1);
+        snprintf(session->initial_soa_name, sizeof(session->initial_soa_name), "%s", rec->name);  /* I4: DNS_NAME_TEXT_SIZE */
         session->initial_soa_serial = current_serial;
         if (session->is_ixfr && ancount == 1 &&
             current_serial == session->client_serial) {
@@ -673,14 +688,27 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           }
         }
       } else if (session->soa_count == 2 && session->is_ixfr) {
+        /* I1, RFC 1995 §4: an incremental response "begins with two SOA RRs, the server's current SOA followed by the
+         * SOA of the client's version which is about to be replaced"; the first deleted RR of each difference sequence is
+         * the older SOA.  A first sequence that does not start from our serial is not a history of our version: give the
+         * IXFR up (the caller asks for an AXFR). */
+        if (current_serial != session->client_serial) {
+          syslog(LOG_WARNING, "[AXFR] zone '%s': rejecting IXFR: the first difference sequence starts at serial %u, not at "
+                 "our serial %u (RFC 1995 §4); asking for a full transfer", domain, current_serial, session->client_serial);
+          session->ixfr_bad_sequence = true;
+          return -1;
+        }
         /* the IXFR is applied to the version we serve now: rebuild its builder from the published image (S5 B-2) */
         if (thaw_zone_arena(active, standby) != 0) {
           syslog(LOG_ERR, "[AXFR] zone '%s': cannot rebuild the current version of the zone to apply the IXFR", domain);
           return -1;
         }
+        session->loc_tagdef_cap = session->ecs_tagdef_cap = 0;   /* I3: the thawed tag arrays are exactly their count */
         session->is_deleting = true;
       } else if (session->is_ixfr && session->is_deleting) {
+        /* the newer SOA that starts the added RRs of this sequence: the next sequence must start from its serial */
         session->is_deleting = false;
+        session->ixfr_expected_serial = current_serial;
         for (size_t k = 0; k < standby->count - 1; k++) {
           if (standby->records[k].type_code == 6 &&
               domain_names_match_ci(standby->records[k].name, domain)) {
@@ -690,9 +718,16 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           }
         }
       } else if (session->is_ixfr && !session->is_deleting) {
-        if (current_serial == session->initial_soa_serial) {
+        if (current_serial == session->initial_soa_serial && session->ixfr_expected_serial == session->initial_soa_serial) {
           session->is_finished = true;
           standby->count--;
+        } else if (current_serial != session->ixfr_expected_serial) {
+          /* I1, RFC 1995 §4: "the differential sequences are the history of changes ... ordered oldest first newest last":
+           * a deletion sequence must start where the previous one ended */
+          syslog(LOG_WARNING, "[AXFR] zone '%s': rejecting IXFR: a difference sequence starts at serial %u, but the previous one "
+                 "ended at serial %u (RFC 1995 §4); asking for a full transfer", domain, current_serial, session->ixfr_expected_serial);
+          session->ixfr_bad_sequence = true;
+          return -1;
         } else {
           session->is_deleting = true;
           standby->count--;
@@ -819,10 +854,20 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
   uint8_t *unsigned_msgs = NULL;
   size_t unsigned_msgs_len = 0;
   size_t unsigned_msgs_cap = 0;
+  unsigned unsigned_run = 0;     /* I2: unsigned messages since the last signed one (RFC 8945 §5.3.1: at most 99) */
+  uint64_t total_bytes = 0;      /* I2: octets of the messages read so far (session->max_bytes) */
 
   while (1) {
     int ret = read_dns_tcp_message(tcp_fd, stream_ctx, &msg, &msg_len);
     if (ret < 0 || ret == 0) {
+      if (unsigned_msgs) free(unsigned_msgs);
+      zone_arena_destroy(&tmp_arena);
+      return -1;
+    }
+    total_bytes += msg_len;
+    if (session->max_bytes && total_bytes > session->max_bytes) {
+      syslog(LOG_ERR, "[AXFR] zone '%s': rejecting transfer: more than %llu bytes received (max-zone-bytes)", entry->domain,
+             (unsigned long long)session->max_bytes);
       if (unsigned_msgs) free(unsigned_msgs);
       zone_arena_destroy(&tmp_arena);
       return -1;
@@ -852,6 +897,15 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
       if (!has_tsig) {
         if (!is_subsequent) {
           syslog(LOG_ERR, "[AXFR] First message missing TSIG");
+          if (unsigned_msgs) free(unsigned_msgs);
+          zone_arena_destroy(&tmp_arena);
+          return -1;
+        }
+        if (++unsigned_run > XFR_TSIG_UNSIGNED_MAX) {
+          /* I2, RFC 8945 §5.3.1: "MUST accept up to 99 intermediary messages without a TSIG"; a primary that signs less
+           * often is not verifiable, "it SHOULD assume the connection has been hijacked, and it SHOULD close the connection" */
+          syslog(LOG_ERR, "[AXFR] zone '%s': rejecting transfer: more than %u messages in a row without a TSIG (RFC 8945 §5.3.1)",
+                 entry->domain, XFR_TSIG_UNSIGNED_MAX);
           if (unsigned_msgs) free(unsigned_msgs);
           zone_arena_destroy(&tmp_arena);
           return -1;
@@ -888,6 +942,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
           return -1;
         }
         unsigned_msgs_len = 0;
+        unsigned_run = 0;
         if (current_mac_len > 0 && current_mac_len <= sizeof(prior_mac)) {
           memcpy(prior_mac, current_mac, current_mac_len);
           prior_mac_len = current_mac_len;
@@ -897,6 +952,14 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
     }
     if (parse_xfr_packet(msg, msg_len, &tmp_arena, active, session,
                          entry->domain) != 0) {
+      if (unsigned_msgs) free(unsigned_msgs);
+      zone_arena_destroy(&tmp_arena);
+      return -1;
+    }
+    if (session->max_records && (uint64_t)tmp_arena.count > session->max_records) {
+      /* I2: the zone being built (after an IXFR's deletions were applied) has more RRs than the zone may have */
+      syslog(LOG_ERR, "[AXFR] zone '%s': rejecting transfer: more than %llu records (max-zone-records)", entry->domain,
+             (unsigned long long)session->max_records);
       if (unsigned_msgs) free(unsigned_msgs);
       zone_arena_destroy(&tmp_arena);
       return -1;
@@ -1109,6 +1172,8 @@ static int xfr_attempt(axfr_bg_ctx_t *ctx, struct sockaddr_storage *master_addr,
   session->is_ixfr = ixfr_serial != 0;
   /* AXFR に切り替えたときも、手元より古い版は受け取らない (parse_xfr_packet() のロールバック検査) */
   session->client_serial = active_serial;
+  session->max_records = ctx->max_records;         /* I2: the limits of the zone (max-zone-records / max-zone-bytes) */
+  session->max_bytes = ctx->max_bytes;
 
   size_t addr_len = (family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
   int tcp_fd = broker_connect_opts(family, SOCK_STREAM, (struct sockaddr *)master_addr, addr_len,
@@ -1226,9 +1291,11 @@ void *axfr_bg_thread_func(void *arg) {
     ext_ver = 2;
     axfr_res = xfr_attempt(ctx, &master_addr, domain_family, ext_ver, false, tsig_key_ptr, active_serial, &session);
   }
-  /* R-19, RFC 1995 §4: IXFR を扱えないプライマリ (FORMERR / NOTIMP) からは AXFR で1回だけ取り直す */
-  if (axfr_res < 0 && active_serial != 0 && (session.rcode == 1 || session.rcode == 4)) {
-    syslog(LOG_NOTICE, "[AXFR] zone %s: %s does not support IXFR, retrying with AXFR", ctx->domain, ctx->master_ip);
+  /* R-19, RFC 1995 §4: IXFR を扱えないプライマリ (FORMERR / NOTIMP) からは AXFR で1回だけ取り直す。
+   * I1: 差分列が手元の版から始まらない (または連続しない) IXFR も同じ (RFC 1995 §4、parse_xfr_packet()) */
+  if (axfr_res < 0 && active_serial != 0 && (session.rcode == 1 || session.rcode == 4 || session.ixfr_bad_sequence)) {
+    syslog(LOG_NOTICE, "[AXFR] zone %s: %s %s, retrying with AXFR", ctx->domain, ctx->master_ip,
+           session.ixfr_bad_sequence ? "sent an IXFR whose difference sequences do not start from our serial" : "does not support IXFR");
     axfr_res = xfr_attempt(ctx, &master_addr, domain_family, ext_ver, false, tsig_key_ptr, 0, &session);
   }
   if (axfr_res > 0 && ctx->entry) {

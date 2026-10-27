@@ -1412,6 +1412,13 @@ static void on_zone_begin(ing_t *g, const kdb_msg_t *m) {
 static void on_zone_data(ing_t *g, const kdb_msg_t *m) {
   ing_job_t *j = g->cur;
   if (!j || j->skip || j->failed) return;
+  if (!j->build) {
+    /* I6: ZONE_DATA for a job without a builder (a secondary zone, whose ZONE_BEGIN starts none, or an earlier failure):
+     * the stream rules (dns_db_stream.c) refuse it before this point; fail the job rather than feed a NULL builder */
+    j->failed = true;
+    snprintf(j->reason, sizeof(j->reason), "zone data for a zone that takes none");
+    return;
+  }
   const kdb_zone_data_t *zd = &m->u.zone_data;
   if (g->nbuilders == 0) {
     if (db_zone_build_feed(j->build, zd->body, zd->len, j->reason, sizeof(j->reason)) != 0) j->failed = true;

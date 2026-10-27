@@ -29,6 +29,13 @@ sqlite3 "$T/del.db" "PRAGMA journal_mode=DELETE; CREATE TABLE t (a INT);" > /dev
 chmod 600 "$T/wal.db" "$T/del.db"
 printf 'not a database, just text, at least a few bytes long....................................\n' > "$T/junk.db"
 USER_OK=$(id -un)
+if [ "$(id -u)" = "0" ]; then
+    # P4: karidns refuses root, by name too, as options user and as loader-user; root runs the check as an unprivileged user
+    id nobody >/dev/null 2>&1 || { echo "SKIP: no user nobody"; exit 0; }
+    USER_OK=nobody
+    chmod 755 "$T"
+    chown nobody "$T/wal.db" "$T/del.db" "$T/junk.db"
+fi
 
 conf() {   # conf FILE DBBLOCKBODY
     printf 'options {\n  user "%s";\n  database { %s };\n};\nzone "z.test" { type primary; file "%s/z.zone"; };\n' "$USER_OK" "$2" "$T" > "$1"

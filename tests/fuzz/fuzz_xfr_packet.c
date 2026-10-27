@@ -62,7 +62,8 @@ size_t resolve_ip_port_to_sockaddr(const char *ip, int port, struct sockaddr_sto
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size == 0) return 0;
     /* byte 0: the transfer's state before the message (B8t-2): bits 0-1 the Extended AXFR version the primary answered with (0: none,
-     * 1: 2, 2 and 3: 3), bit 2 the stream comes from the database loader.  The rest is the DNS message. */
+     * 1: 2, 2 and 3: 3), bit 2 the stream comes from the database loader, bit 3 an IXFR from serial 100 (I1: the difference sequences must chain),
+     * bit 4 the message is parsed a second time (the state of the first one carries over).  The rest is the DNS message. */
     uint8_t sel = data[0];
     data++;
     size--;
@@ -83,8 +84,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     session.ext_version = (sel & 3) == 0 ? 0 : (sel & 3) == 1 ? 2 : 3;
     session.is_extended_mode = session.ext_version != 0;
     session.db_stream = (sel & 4) != 0;
+    session.is_ixfr = (sel & 8) != 0;
+    session.client_serial = (sel & 8) ? 100 : 0;
 
     parse_xfr_packet(data, size, &standby, &active.ver, &session, "fuzz.example.com.");
+    if (sel & 0x10) parse_xfr_packet(data, size, &standby, &active.ver, &session, "fuzz.example.com.");
 
     zone_arena_destroy(&standby);
     zone_arena_destroy(&active);

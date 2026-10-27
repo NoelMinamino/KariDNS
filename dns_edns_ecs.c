@@ -135,7 +135,7 @@ void add_ede(edns_info_t *edns, bool enabled, uint16_t code, const char *text) {
 
 /* pack_tag_def_rdata() and the 65406 wrapper encoders are in dns_wire.c (shared with karidns-dbloader, xext_*) */
 
-bool unpack_tag_def_rdata(const uint8_t *data, size_t len, ecs_tag_def_t **defs_out, int *count_out) {
+bool unpack_tag_def_rdata(const uint8_t *data, size_t len, ecs_tag_def_t **defs_out, int *count_out, int *cap_inout) {
   if (!data || len < 3 || !defs_out || !count_out) return false;
   size_t off = 0;
   const char *tag = (const char *)&data[off];
@@ -182,17 +182,27 @@ bool unpack_tag_def_rdata(const uint8_t *data, size_t len, ecs_tag_def_t **defs_
     off += clen + 1;
   }
 
+  /* I3: the array grows geometrically (doubling, at least 8), not by one definition per record.  *cap_inout is the number of
+   * entries the array holds; NULL, or a value below the count (an array that was not grown here, e.g. one thaw_zone_arena()
+   * made), means "exactly the count". */
   int cur_count = *count_out;
-  ecs_tag_def_t *new_defs = realloc(*defs_out, (cur_count + 1) * sizeof(ecs_tag_def_t));
-  if (!new_defs) {
-    for (int k = 0; k < cidr_count; k++) free(def.cidrs[k].cidr);
-    free(def.cidrs);
-    free(def.tag);
-    return false;
+  int cap = cap_inout && *cap_inout >= cur_count ? *cap_inout : cur_count;
+  ecs_tag_def_t *new_defs = *defs_out;
+  if (cur_count >= cap) {
+    int ncap = cur_count < 4 ? 8 : cur_count * 2;
+    new_defs = realloc(*defs_out, (size_t)ncap * sizeof(ecs_tag_def_t));
+    if (!new_defs) {
+      for (int k = 0; k < cidr_count; k++) free(def.cidrs[k].cidr);
+      free(def.cidrs);
+      free(def.tag);
+      return false;
+    }
+    cap = ncap;
   }
   new_defs[cur_count] = def;
   *defs_out = new_defs;
   *count_out = cur_count + 1;
+  if (cap_inout) *cap_inout = cap;
   return true;
 }
 

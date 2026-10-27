@@ -2393,6 +2393,48 @@ static void test_statements_need_a_semicolon(void) {
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) expect_reject("missing semicolon or bad value", bad[i]);
 }
 
+/* I2: max-zone-records / max-zone-bytes in options and in a zone: the limits of one inbound AXFR/IXFR of a secondary zone */
+static void test_xfr_limits_option(void) {
+    printf("[TEST] max-zone-records / max-zone-bytes (options and zone, ranges as in the database block, defaults 10000000 / 1 GiB)...\n");
+    server_config_t cfg;
+    uint64_t r, b;
+    xfr_zone_limits(NULL, NULL, &r, &b);
+    CHECK(r == 10000000ull && b == (1ull << 30));
+    if (parse_ok("options { };", &cfg)) {
+        CHECK(cfg.max_zone_records == 10000000ull && cfg.max_zone_bytes == (1ull << 30));
+        xfr_zone_limits(&cfg, NULL, &r, &b);
+        CHECK(r == 10000000ull && b == (1ull << 30));
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { max-zone-records 500; max-zone-bytes 2m; };"
+                 "zone \"a.example\" { type master; file \"a.zone\"; max-zone-records 20; max-zone-bytes 70000; };"
+                 "zone \"b.example\" { type master; file \"b.zone\"; max-zone-records 4294967295; };"
+                 "zone \"c.example\" { type master; file \"c.zone\"; };", &cfg)) {
+        const zone_config_t *a = first_zone(&cfg);
+        const zone_config_t *bz = a ? a->next : NULL;
+        const zone_config_t *c = bz ? bz->next : NULL;
+        CHECK(cfg.max_zone_records == 500 && cfg.max_zone_bytes == (2ull << 20));
+        xfr_zone_limits(&cfg, a, &r, &b);
+        CHECK(r == 20 && b == 70000);
+        xfr_zone_limits(&cfg, bz, &r, &b);
+        CHECK(r == 4294967295ull && b == (2ull << 20));           /* a zone value replaces the options one, per limit */
+        xfr_zone_limits(&cfg, c, &r, &b);
+        CHECK(r == 500 && b == (2ull << 20));                     /* the zone inherits options */
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("options max-zone-records 1", "options { max-zone-records 1; };");
+    expect_reject("options max-zone-records above 4294967295", "options { max-zone-records 4294967296; };");
+    expect_reject("options max-zone-records suffix", "options { max-zone-records 10k; };");
+    expect_reject("options max-zone-records junk", "options { max-zone-records many; };");
+    expect_reject("options max-zone-records missing value", "options { max-zone-records; };");
+    expect_reject("options max-zone-bytes below 65535", "options { max-zone-bytes 1000; };");
+    expect_reject("options max-zone-bytes above 64g", "options { max-zone-bytes 65g; };");
+    expect_reject("options max-zone-bytes missing semicolon", "options { max-zone-bytes 1g };");
+    expect_reject("zone max-zone-records 0", "zone \"a.example\" { type master; file \"a.zone\"; max-zone-records 0; };");
+    expect_reject("zone max-zone-bytes junk", "zone \"a.example\" { type master; file \"a.zone\"; max-zone-bytes lots; };");
+    expect_reject("zone max-zone-records empty", "zone \"a.example\" { type master; file \"a.zone\"; max-zone-records ; };");
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
     test_defaults();
@@ -2403,6 +2445,7 @@ int main(void) {
     test_transport_params();
     test_notify_retry();
     test_ixfr_history_option();
+    test_xfr_limits_option();
     test_additional_from_auth();
     test_options_syntax_errors();
     test_ecs_and_location_tags();

@@ -33,31 +33,12 @@ static int64_t mono_ms(void) {
 }
 
 /* The loader runs with the rights of loader-user, and karidns starts it as root: a binary others can replace would
- * be a way to root.  Checked at the start and again before every (re)start. */
+ * be a way to root.  Checked at the start and again before every (re)start, and once more by the child on the open
+ * file it then executes (P5: exec_file_open_checked() / exec_file_exec_fd(), shared with karicheck, dns_utils.c). */
 static bool check_loader_path(const char *path, char *err, size_t errlen) {
-  struct stat st;
-  if (stat(path, &st) != 0) {
-    snprintf(err, errlen, "database loader '%s': %s", path, strerror(errno));
-    return false;
-  }
-  if (!S_ISREG(st.st_mode)) {
-    snprintf(err, errlen, "database loader '%s' is not a regular file", path);
-    return false;
-  }
-  if (st.st_uid != 0 && st.st_uid != geteuid()) {
-    snprintf(err, errlen, "database loader '%s' is owned by uid %u; it must belong to root%s", path, (unsigned)st.st_uid,
-             geteuid() == 0 ? "" : " or to the user running karidns");
-    return false;
-  }
-  if (st.st_mode & (S_IWGRP | S_IWOTH)) {
-    snprintf(err, errlen, "database loader '%s' is writable by group or others (mode %04o)", path,
-             (unsigned)(st.st_mode & 07777));
-    return false;
-  }
-  if (access(path, X_OK) != 0) {
-    snprintf(err, errlen, "database loader '%s' is not executable by the user running karidns", path);
-    return false;
-  }
+  int fd = exec_file_open_checked(path, geteuid(), "database loader", "the user running karidns", err, errlen);
+  if (fd < 0) return false;
+  close(fd);
   return true;
 }
 
@@ -192,7 +173,15 @@ static void child_exec(const db_sup_t *s, int stream_fd) {
   if (dup2(hi, 3) < 0) _exit(127);
   closefrom(4);
 
+  /* P5: the file that is checked is the file that runs: opened and checked here (as the supervisor's user, before the
+   * drop), executed by its descriptor after the drop */
   char err[256];
+  int xfd = exec_file_open_checked(s->path, geteuid(), "database loader", "the user running karidns", err, sizeof(err));
+  if (xfd < 0) {
+    int n = snprintf(msg, sizeof(msg), "[Manager] %s\n", err);
+    if (n > 0) (void)!write(2, msg, (size_t)n);
+    _exit(127);
+  }
   if (!apply_run_identity_id(&s->id, err, sizeof(err))) {
     int n = snprintf(msg, sizeof(msg), "[Manager] database loader: %s\n", err);
     if (n > 0) (void)!write(2, msg, (size_t)n);
@@ -202,7 +191,8 @@ static void child_exec(const db_sup_t *s, int stream_fd) {
   clearenv();
   if (tz) setenv("TZ", tzbuf, 1);
   char *argv[] = { (char *)"karidns-dbloader", (char *)"-s", (char *)"3", NULL };
-  execv(s->path, argv);
+  extern char **environ;
+  exec_file_exec_fd(xfd, s->path, argv, environ);
   int n = snprintf(msg, sizeof(msg), "[Manager] cannot execute '%s': %s\n", s->path, strerror(errno));
   if (n > 0) (void)!write(2, msg, (size_t)n);
   _exit(127);

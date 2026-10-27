@@ -1,0 +1,7 @@
+$ORIGIN example.com.
+$TTL 300
+@ IN SOA ns1 host 1 3600 600 86400 300
+@ IN NS ns1
+ns1 IN A 192.0.2.1
+long IN TXT "str00" "str01" "str02" "str03" "str04" "str05" "str06" "str07" "str08" "str09" "str10" "str11" "str12" "str13" "str14" "str15" "str16" "str17" "str18" "str19" "str20" "str21" "str22" "str23" "str24" "str25" "str26" "str27" "str28" "str29" "str30" "str31" "str32" "str33" "str34" "str35" "str36" "str37" "str38" "str39" "str40" "str41" "str42" "str43" "str44" "str45" "str46" "str47" "str48" "str49" "str50" "str51" "str52" "str53" "str54" "str55" "str56" "str57" "str58" "str59"
+spf IN SPF "str00" "str01" "str02" "str03" "str04" "str05" "str06" "str07" "str08" "str09" "str10" "str11" "str12" "str13" "str14" "str15" "str16" "str17" "str18" "str19" "str20" "str21" "str22" "str23" "str24" "str25" "str26" "str27" "str28" "str29" "str30" "str31" "str32" "str33" "str34" "str35" "str36" "str37" "str38" "str39" "str40" "str41" "str42" "str43" "str44" "str45" "str46" "str47" "str48" "str49" "str50" "str51" "str52" "str53" "str54" "str55" "str56" "str57" "str58" "str59"

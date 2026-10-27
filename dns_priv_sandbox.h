@@ -15,6 +15,8 @@ int stat_via_dir_cache(const char *path, struct stat *sb);
 int renameat_via_dir_cache(const char *old_path, const char *new_path);
 int list_dir_via_dir_cache(const char *file_path, void (*cb)(const char *name, void *ud), void *ud);
 int unlink_via_dir_cache(const char *path);
+void fd_drop_fchown(int fd);
+void dir_fd_cache_drop_fchown(void);
 
 /* options { user / group } の解決結果。privileged=true は root 起動で
  * setgroups/setgid/setuid による降格が必要なことを示す。 */

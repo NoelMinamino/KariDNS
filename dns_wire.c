@@ -784,12 +784,14 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
         rec->rdata[0] = pref_buf; rec->rdata[1] = target; rec->rdata_count = 2;
     } else if (type == 16) {
         size_t rdata_p = *offset;
-        bool has_nul = false;
+        bool has_nul = false, too_many = false;
         while (rdata_p < *offset + rdlen) {
-            if (rec->rdata_count >= MAX_RDATA) return -1;
             uint8_t len = packet[rdata_p++];
             if (rdata_p + len > *offset + rdlen) return -1;
             if (len && memchr(&packet[rdata_p], 0, len)) has_nul = true;
+            /* I5: more character-strings than the text fields hold is well-formed RDATA (RFC 1035 3.3.14 sets no
+             * count); the RR is kept in its wire form below, like one with a NUL */
+            if (rec->rdata_count >= MAX_RDATA) { too_many = true; rdata_p += len; continue; }
             char *txt = arena_alloc(arena, len + 1); if (!txt) return -1;
             memcpy(txt, &packet[rdata_p], len); txt[len] = '\0';
             rec->rdata[rec->rdata_count++] = txt;
@@ -798,7 +800,7 @@ static int parse_resource_record_scratch(const uint8_t *packet, size_t packet_le
         /* D16-1, RFC 1035 3.3.14: a character-string may hold any octet, NUL included, but the text fields are C
          * strings.  Such an RR is kept as the RDATA octets (the form of an unknown type, RFC 3597 5) instead of
          * fields that would stop at the NUL. */
-        if (has_nul && rdlen > 0) {
+        if ((has_nul || too_many) && rdlen > 0) {
             uint8_t *blob = (uint8_t *)arena_alloc(arena, rdlen);
             if (!blob) return -1;
             memcpy(blob, &packet[*offset], rdlen);

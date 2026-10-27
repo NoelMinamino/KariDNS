@@ -643,7 +643,7 @@ elif [ "$ME" != nobody ] && sudo -n chown nobody "$T/dbl_other" 2>/dev/null; the
 fi
 if [ $OTHER_OK = 1 ]; then
     LOADERPATH=$T/dbl_other; conf; run; LOADERPATH=
-    err "a loader owned by another non-root user: error" "database loader '$T/dbl_other' is not owned by root.*(uid [1-9][0-9]*); karidns refuses to run it"
+    err "a loader owned by another non-root user: error" "database loader '$T/dbl_other' is owned by uid [1-9][0-9]*; it must belong to root.*; karidns refuses to run it"
     status "a loader owned by another non-root user: exit 1" 1
     [ -e "$T/ran" ] && bad "$BACKEND: a loader of another user was run" || ok "$BACKEND: a loader of another user is not run"
 else
