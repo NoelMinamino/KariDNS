@@ -124,6 +124,7 @@ void send_proxyv2_if_enabled(int sock, const query_opts_t *qo, bool is_tcp) {
  * ==================================================================== */
 int g_last_socket_family = AF_INET;
 dag_answer_check_fn g_dag_answer_check = NULL;
+dag_discard_dump_fn g_dag_discard_dump = NULL;
 struct timespec g_dag_query_time;
 struct timespec g_dag_response_time;
 
@@ -431,15 +432,20 @@ ssize_t do_udp_exchange(const char *server, int port, const query_opts_t *qo,
         } else {
             if (n < 12) {
                 printf(";; Warning: short (< header size) message received\n");
+                if (g_dag_discard_dump) g_dag_discard_dump(resp, (size_t)n, "UDP", server, port);
                 continue;
             }
             uint16_t resp_id = (resp[0] << 8) | resp[1];
             if (resp_id != sent_id) {
                 printf(";; Warning: ID mismatch: expected ID %u, got %u\n", sent_id, resp_id);
+                if (g_dag_discard_dump) g_dag_discard_dump(resp, (size_t)n, "UDP", server, port);
                 continue;
             }
             /* opcode and question are checked by dag (dag_check_answer() in dag.c) */
-            if (g_dag_answer_check && !g_dag_answer_check(pkt, pkt_len, resp, (size_t)n)) continue;
+            if (g_dag_answer_check && !g_dag_answer_check(pkt, pkt_len, resp, (size_t)n)) {
+                if (g_dag_discard_dump) g_dag_discard_dump(resp, (size_t)n, "UDP", server, port);
+                continue;
+            }
         }
 
         // RFC 7873 §5.2: Client Cookie Echo Verification
@@ -453,6 +459,7 @@ ssize_t do_udp_exchange(const char *server, int port, const query_opts_t *qo,
                 chk_edns.present && chk_edns.has_cookie) {
                 if (memcmp(qo->client_cookie, chk_edns.client_cookie, 8) != 0) {
                     fprintf(stderr, ";; Warning: Client COOKIE mismatch\n");
+                    if (g_dag_discard_dump) g_dag_discard_dump(resp, (size_t)n, "UDP", server, port);
                     continue; // Discard spoofed or stale response and wait for matching cookie (RFC 7873 §5.2)
                 }
             }

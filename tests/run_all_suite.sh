@@ -560,6 +560,7 @@ register_test "dag" "sh" "tests/run_dag_yaml_socket_family_force_test.sh" "dag Y
 register_test "dag" "sh" "tests/run_dag_yaml_socket_family_test.sh" "dag YAML socket_family accuracy test"
 register_test "dag" "sh" "tests/run_dag_dig_output_compat_test.sh" "dag output compatible with dig 9.20 (EDNS, YAML, TSIG, search, multiline)"
 register_test "dag" "sh" "tests/run_dag_malformed_compat_test.sh" "dag malformed-response diagnostics compatible with dig 9.20"
+register_test "dag" "sh" "tests/run_dag_discarded_hexdump_test.sh" "dag hexdump of discarded responses (UDP, TCP; not with +short, +yaml, +nohexdump, +nocomments)"
 register_test "dag" "sh" "tests/run_dag_columns_test.sh" "dag record and question columns identical to dig 9.20 (tabs, +multiline, +nottlid, +noclass; X-40)"
 register_test "dag" "sh" "tests/run_ci_dag_smoke.sh" "dag CI smoke (UDP, TCP, multiple servers, AXFR) against the local mock_dns_server.pl, no real domains (X-09)"
 
