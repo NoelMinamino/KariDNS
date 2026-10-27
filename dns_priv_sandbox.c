@@ -36,6 +36,7 @@ typedef struct dir_fd_entry {
 
 static dir_fd_entry_t *g_dir_fd_table = NULL;
 static pthread_mutex_t g_dir_fd_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool g_dir_fd_fchown_dropped = false;
 bool g_bypass_cap_enter = false;
 // g_capsicum_enabled is defined in dns_utils.c and declared in dns_utils.h
 
@@ -81,12 +82,15 @@ static int get_or_open_dir_fd(const char *dirpath, bool writable) {
     return -1;
   }
   cap_rights_t rights;
-  if (writable)
+  if (writable) {
     cap_rights_init(&rights, CAP_LOOKUP, CAP_READ, CAP_WRITE, CAP_CREATE,
                     CAP_FSTAT, CAP_FSTATFS, CAP_FTRUNCATE, CAP_SEEK,
                     CAP_RENAMEAT_SOURCE, CAP_RENAMEAT_TARGET, CAP_UNLINKAT,
                     CAP_FCNTL);
-  else
+    /* A log file opened at startup inherits this fd's rights and is handed to the run user with fchown()
+     * (hand_off_logging_channels()); dir_fd_cache_drop_fchown() takes the right away again after that. */
+    if (!g_dir_fd_fchown_dropped) cap_rights_set(&rights, CAP_FCHOWN);
+  } else
     cap_rights_init(&rights, CAP_LOOKUP, CAP_READ, CAP_FSTAT, CAP_FSTATFS,
                     CAP_SEEK, CAP_FCNTL);
   if (cap_rights_limit(fd, &rights) != 0 && errno != ENOSYS) {
@@ -131,6 +135,24 @@ int open_via_dir_cache(const char *path, int flags, mode_t mode,
   if (dfd < 0)
     return -1;
   return openat(dfd, basebuf, flags | O_RESOLVE_BENEATH, mode);
+}
+
+/* Takes CAP_FCHOWN off fd (a file opened through a writable directory fd inherits it). */
+void fd_drop_fchown(int fd) {
+  cap_rights_t rights;
+  if (fd < 0 || cap_rights_get(fd, &rights) != 0 || !cap_rights_is_set(&rights, CAP_FCHOWN)) return;
+  cap_rights_clear(&rights, CAP_FCHOWN);
+  cap_rights_limit(fd, &rights);
+}
+
+/* After the startup hand-off of the logs: the writable directory fds lose CAP_FCHOWN, and ones opened later do not get
+ * it.  The processes forked after this (Backend, routers, broker) run as the run user anyway. */
+void dir_fd_cache_drop_fchown(void) {
+  pthread_mutex_lock(&g_dir_fd_lock);
+  g_dir_fd_fchown_dropped = true;
+  for (dir_fd_entry_t *e = g_dir_fd_table; e; e = e->next)
+    if (e->is_writable) fd_drop_fchown(e->fd);
+  pthread_mutex_unlock(&g_dir_fd_lock);
 }
 
 int stat_via_dir_cache(const char *path, struct stat *sb) {

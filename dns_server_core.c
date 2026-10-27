@@ -262,6 +262,7 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
         _exit(1);
       }
     }
+    logging_drop_fchown(&g_config_db.config_a);
     /* AF_UNIX で connect してよいのは起動時に設定された dnstap ソケットだけ (再接続用)。
      * それ以外のローカルソケットへ実行ユーザーとして接続させる口にはしない。 */
     char allowed_unix_path[sizeof(((struct sockaddr_un *)0)->sun_path)] = "";
@@ -667,16 +668,25 @@ void hand_off_logging_channels(server_config_t *cfg) {
   uid_t target_uid;
   gid_t target_gid;
   resolve_log_owner(&target_uid, &target_gid);
-  if (target_uid == (uid_t)-1)
-    return;
   for (log_channel_t *ch = cfg->logging.channels; ch; ch = ch->next) {
     if (!ch->file_path || ch->fd < 0)
       continue;
-    prepare_log_dir(ch->file_path, target_uid, target_gid);
-    /* P3: the file was accepted when it was opened; a link added since would make the chown reach another name */
-    if (log_file_accept(ch->fd, ch->file_path, target_uid) >= 0)
-      fchown(ch->fd, target_uid, target_gid);
+    if (target_uid != (uid_t)-1) {
+      prepare_log_dir(ch->file_path, target_uid, target_gid);
+      /* P3: the file was accepted when it was opened; a link added since would make the chown reach another name */
+      if (log_file_accept(ch->fd, ch->file_path, target_uid) >= 0 && fchown(ch->fd, target_uid, target_gid) != 0)
+        syslog(LOG_WARNING, "[Logging] Could not hand log file '%s' to the run user: %s", ch->file_path, strerror(errno));
+    }
   }
+  logging_drop_fchown(cfg);
+}
+
+/* The log files and the writable directory fds keep CAP_FCHOWN only until the hand-off above (also called by a child
+ * forked before it). */
+void logging_drop_fchown(server_config_t *cfg) {
+  for (log_channel_t *ch = cfg->logging.channels; ch; ch = ch->next)
+    fd_drop_fchown(ch->fd);
+  dir_fd_cache_drop_fchown();
 }
 
 

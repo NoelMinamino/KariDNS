@@ -172,6 +172,8 @@ if [ $IS_ROOT = 1 ]; then
     start_karidns "$T/log.conf" "$T/p2.out" $PORT
     if wait_answer $PORT z.test; then
         [ "$(stat -f %u "$T/existing")" = "0" ] && ok "P2: an existing log directory keeps its owner (root)" || bad "P2: the existing log directory was chowned to uid $(stat -f %u "$T/existing")" "$(cat "$T/p2.out")"
+        # the log file opened through the directory fd is handed over (CAP_FCHOWN on that fd during startup)
+        [ "$(stat -f %u "$T/existing/q.log")" = "$NOBODY_UID" ] && ok "P2: the log file is the run user's" || bad "P2: the log file is owned by uid $(stat -f %u "$T/existing/q.log")" "$(cat "$T/p2.out")"
     else bad "P2: karidns did not start" "$(cat "$T/p2.out")"; fi
     stop_karidns $KPID
     logconf $PORT "$T/newdir/q.log"
@@ -206,6 +208,7 @@ if [ $IS_ROOT = 1 ]; then
     logconf $PORT "$T/existing/ok.log"
     start_karidns "$T/log.conf" "$T/p3c.out" $PORT
     wait_answer $PORT z.test && ok "P3: a plain root-owned log file with one link is accepted" || bad "P3: a plain log file was refused" "$(cat "$T/p3c.out")"
+    [ "$(stat -f %u "$T/existing/ok.log")" = "$NOBODY_UID" ] && ok "P3: that file is handed to the run user" || bad "P3: the accepted file is owned by uid $(stat -f %u "$T/existing/ok.log")"
     stop_karidns $KPID
 else
     echo "  [SKIP] needs root"
