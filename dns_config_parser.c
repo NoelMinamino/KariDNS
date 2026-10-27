@@ -372,13 +372,14 @@ zone_ext_t *zone_ext_mut(zone_config_t *z) {
   return z->ext;
 }
 
+static void notify_targets_free(notify_target_t *l, int n);
+static void remote_lists_free(remote_list_t *r);
+
 /* everything x points to (not x itself: a zone_ext_shared_t embeds it) */
 static void free_zone_ext_fields(zone_ext_t *x) {
   if (!x)
     return;
-  for (int i = 0; i < x->masters_count; i++)
-    free(x->masters[i].ip);
-  free(x->masters);
+  notify_targets_free(x->masters, x->masters_count);
   if (x->masters_parsed) {
     free(x->masters_parsed);
     x->masters_parsed = NULL;
@@ -387,9 +388,7 @@ static void free_zone_ext_fields(zone_ext_t *x) {
   for (int i = 0; i < x->tsig_keys_count; i++)
     free(x->tsig_keys[i]);
   free(x->tsig_keys);
-  for (int i = 0; i < x->also_notify_count; i++)
-    free(x->also_notify[i].ip);
-  free(x->also_notify);
+  notify_targets_free(x->also_notify, x->also_notify_count);
   free(x->notify_source);
   for (int i = 0; i < x->alias_resolvers_count; i++)
     free(x->alias_resolvers[i].ip);
@@ -596,6 +595,7 @@ static void free_partial_view(view_config_t *view) {
   zone_cfg_index_free(&view->zone_index);
   free_view_db_fields(view);
   if (view->name) free(view->name);
+  notify_targets_free(view->also_notify, view->also_notify_count);
   for (int i = 0; i < view->match_clients_count; i++) free(view->match_clients[i]);
   if (view->match_clients) free(view->match_clients);
   if (view->match_clients_parsed) {
@@ -736,6 +736,11 @@ void free_server_config_fields(server_config_t *cfg) {
   free(cfg->alias_resolvers);
   cfg->alias_resolvers = NULL;
   cfg->alias_resolvers_count = 0;
+  notify_targets_free(cfg->also_notify, cfg->also_notify_count);
+  cfg->also_notify = NULL;
+  cfg->also_notify_count = 0;
+  remote_lists_free(cfg->remote_lists);
+  cfg->remote_lists = NULL;
   OPENSSL_cleanse(cfg->cookie_secrets, sizeof(cfg->cookie_secrets));
   cfg->cookie_secret_count = 0;
   zone_cfg_index_free(&cfg->top_zone_index);
@@ -757,6 +762,7 @@ void free_server_config_fields(server_config_t *cfg) {
     zone_cfg_index_free(&v->zone_index);
     free_view_db_fields(v);
     if (v->name) free(v->name);
+    notify_targets_free(v->also_notify, v->also_notify_count);
     for (int i = 0; i < v->match_clients_count; i++) free(v->match_clients[i]);
     if (v->match_clients) free(v->match_clients);
     if (v->match_clients_parsed) free(v->match_clients_parsed);
@@ -1221,9 +1227,240 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
 
 
 
-static int parse_ip_port_list(token_ctx_t *ctx, ip_port_t **list, int *count) {
+/* Where the lexer is: "file:line" (or "line N" for a configuration given as a string).  The line is counted from the text read so far
+ * (the innermost file of the include stack), so it is the line of the token that was read last. */
+static void ctx_location(const token_ctx_t *ctx, char *buf, size_t n) {
+  int depth = ctx->depth >= 0 && ctx->depth < MAX_INCLUDE_DEPTH ? ctx->depth : 0;
+  const config_file_frame_t *f = &ctx->stack[depth];
+  int line = 1;
+  if (f->src) {
+    size_t end = f->pos < f->len ? f->pos : f->len;
+    for (size_t i = 0; i < end; i++)
+      if (f->src[i] == '\n') line++;
+  }
+  if (f->file_path)
+    snprintf(buf, n, "%.200s:%d", f->file_path, line);
+  else
+    snprintf(buf, n, "line %d", line);
+}
+
+static const char *tok_desc(const conf_token_t *t, char *buf, size_t n) {
+  switch (t->type) {
+    case TOKEN_EOF: return "end of file";
+    case TOKEN_LBRACE: return "'{'";
+    case TOKEN_RBRACE: return "'}'";
+    case TOKEN_SEMICOLON: return "';'";
+    default: snprintf(buf, n, "'%.64s'", t->value ? t->value : ""); return buf;
+  }
+}
+
+/* A syntax error in the statement `what`, reported with the place in the file (stderr and syslog) and made fatal.  The settings text of a
+ * database zone is hostile input and is never echoed: restricted mode only records that the statement is wrong (restricted_err). */
+static void conf_error(token_ctx_t *ctx, const char *what, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void conf_error(token_ctx_t *ctx, const char *what, const char *fmt, ...) {
+  if (!ctx) return;
+  if (ctx->restricted) {
+    if (!ctx->restricted_err[0])
+      snprintf(ctx->restricted_err, sizeof(ctx->restricted_err), "%s: syntax error or invalid value", what);
+    ctx->error_occurred = true;
+    return;
+  }
+  char loc[300], msg[400];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  ctx_location(ctx, loc, sizeof(loc));
+  syslog(LOG_ERR, "[Config] %s: %s: %s", loc, what, msg);
+  fprintf(stderr, "[ERROR] %s: %s: %s\n", loc, what, msg);
+  ctx->error_occurred = true;
+}
+
+/* port <n>: 1..65535 */
+static int read_port(token_ctx_t *ctx, const char *what, int *out) {
+  char db[96];
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING) {
+    conf_error(ctx, what, "expected a port number after 'port' but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
+  char *endptr;
+  long pval = strtol(tok.value, &endptr, 10);
+  if (tok.value[0] == '\0' || *endptr != '\0' || pval <= 0 || pval > 65535) {
+    conf_error(ctx, what, "invalid port '%.64s' (expected 1-65535)", tok.value);
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  *out = (int)pval;
+  return 0;
+}
+
+static bool is_ip_literal(const char *s) {
+  struct in_addr a4;
+  struct in6_addr a6;
+  return inet_pton(AF_INET, s, &a4) == 1 || inet_pton(AF_INET6, s, &a6) == 1;
+}
+
+static void notify_targets_free(notify_target_t *l, int n) {
+  for (int i = 0; l && i < n; i++) {
+    free(l[i].ip);
+    free(l[i].key);
+    free(l[i].list);
+    free(l[i].where);
+  }
+  free(l);
+}
+
+static void remote_lists_free(remote_list_t *r) {
+  while (r) {
+    remote_list_t *next = r->next;
+    notify_targets_free(r->items, r->count);
+    free(r->name);
+    free(r->where);
+    free(r);
+    r = next;
+  }
+}
+
+/* The element grammar of also-notify and of the top-level remote-servers / primaries / masters lists, from the BIND 9.20 ARM
+ * ("also-notify", "remote-servers"):
+ *   [ port <integer> ] { ( <list-name> | <ipv4> [ port <integer> ] | <ipv6> [ port <integer> ] ) [ key <string> ]; ... };
+ * `port` before the braces is the port of the elements that have none (default 53).  A name is not looked up here: the lists may be
+ * written after the statement, so the names are expanded when the whole configuration has been read (expand_targets()).  `tls` and
+ * `source` / `source-v6` are in the ARM grammar and are not supported: a clear error instead of a NOTIFY that goes somewhere else.
+ * Appends to *list (the caller owns what was added also on failure); -1 with a message that names the place on a syntax error. */
+static int parse_notify_targets(token_ctx_t *ctx, const char *what, notify_target_t **list, int *count, bool allow_cidr) {
+  char db[96];
+  int first = *count;
+  int defport = 0;
+  conf_token_t tok = get_next_token(ctx);
+  while (tok.type == TOKEN_STRING && tok.value) {
+    if (strcmp(tok.value, "port") == 0) {
+      free_token(&tok);
+      if (defport) {
+        conf_error(ctx, what, "'port' is given twice before '{'");
+        return -1;
+      }
+      if (read_port(ctx, what, &defport) != 0) return -1;
+    } else if (strcmp(tok.value, "source") == 0 || strcmp(tok.value, "source-v6") == 0) {
+      conf_error(ctx, what, "'%s' is not supported (the source address of NOTIFY is set with notify-source in zone { })", tok.value);
+      free_token(&tok);
+      return -1;
+    } else {
+      break;
+    }
+    tok = get_next_token(ctx);
+  }
+  if (tok.type != TOKEN_LBRACE) {
+    conf_error(ctx, what, "expected '{' but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  while (1) {
+    tok = get_next_token(ctx);
+    if (tok.type == TOKEN_RBRACE) {
+      free_token(&tok);
+      break;
+    }
+    if (tok.type != TOKEN_STRING || !tok.value) {
+      conf_error(ctx, what, "expected an address or a list name but found %s%s", tok_desc(&tok, db, sizeof(db)),
+                 tok.type == TOKEN_EOF ? " (missing '}')" : "");
+      free_token(&tok);
+      return -1;
+    }
+    char loc[300];
+    ctx_location(ctx, loc, sizeof(loc));
+    char *name = tok.value;
+    tok.value = NULL;
+    free_token(&tok);
+    notify_target_t *nl = safe_realloc_or_die(*list, sizeof(notify_target_t) * (size_t)(*count + 1));
+    if (!nl) {
+      free(name);
+      ctx->error_occurred = true;
+      return -1;
+    }
+    *list = nl;
+    notify_target_t *e = &nl[*count];
+    memset(e, 0, sizeof(*e));
+    (*count)++;
+    cidr_entry_t cidr_tmp;
+    if (is_ip_literal(name) || (allow_cidr && strchr(name, '/') && cidr_entry_parse(&cidr_tmp, name)))
+      e->ip = name;
+    else
+      e->list = name; /* a list name; in restricted mode (database zone) the caller refuses it */
+    bool have_key = false;
+    while (1) {
+      tok = get_next_token(ctx);
+      if (tok.type == TOKEN_SEMICOLON) {
+        free_token(&tok);
+        break;
+      }
+      if (tok.type != TOKEN_STRING || !tok.value) {
+        conf_error(ctx, what, "expected ';' after '%.64s' but found %s", e->ip ? e->ip : e->list, tok_desc(&tok, db, sizeof(db)));
+        free_token(&tok);
+        return -1;
+      }
+      if (strcmp(tok.value, "port") == 0) {
+        free_token(&tok);
+        if (!e->ip) {
+          conf_error(ctx, what, "'%.64s' is a list name, which takes no port (give the port to the list or to its addresses)", e->list);
+          return -1;
+        }
+        if (e->port) {
+          conf_error(ctx, what, "'%.64s' has two ports", e->ip);
+          return -1;
+        }
+        if (read_port(ctx, what, &e->port) != 0) return -1;
+      } else if (strcmp(tok.value, "key") == 0) {
+        free_token(&tok);
+        tok = get_next_token(ctx);
+        if (tok.type != TOKEN_STRING || !tok.value || have_key) {
+          if (have_key)
+            conf_error(ctx, what, "'%.64s' has two keys", e->ip ? e->ip : e->list);
+          else
+            conf_error(ctx, what, "expected a key name after 'key' but found %s", tok_desc(&tok, db, sizeof(db)));
+          free_token(&tok);
+          return -1;
+        }
+        have_key = true;
+        e->key = tok.value;
+        tok.value = NULL;
+        free_token(&tok);
+      } else if (strcmp(tok.value, "tls") == 0) {
+        conf_error(ctx, what, "'tls' is not supported (NOTIFY is sent over UDP, RFC 1996; remove 'tls')");
+        free_token(&tok);
+        return -1;
+      } else {
+        conf_error(ctx, what, "unexpected '%.64s' after '%.64s' (expected 'port', 'key' or ';')", tok.value,
+                   e->ip ? e->ip : e->list);
+        free_token(&tok);
+        return -1;
+      }
+    }
+    if (!ctx->restricted && (e->list || e->key)) e->where = strdup(loc);
+  }
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) {
+    conf_error(ctx, what, "expected ';' after '}' but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  for (int i = first; i < *count; i++)
+    if ((*list)[i].ip && (*list)[i].port == 0) (*list)[i].port = defport ? defport : 53;
+  return 0;
+}
+
+/* `what` { <address> [port <n>]; ... };  for the statements that list plain addresses (masters, forwarders, exempt-clients, ...):
+ * appends to *list.  -1 with a message that names the place on a syntax error. */
+static int parse_ip_port_list(token_ctx_t *ctx, const char *what, ip_port_t **list, int *count) {
+  char db[96];
   conf_token_t tok = get_next_token(ctx);
   if (tok.type != TOKEN_LBRACE) {
+    conf_error(ctx, what, "expected '{' but found %s", tok_desc(&tok, db, sizeof(db)));
     free_token(&tok);
     return -1;
   }
@@ -1235,6 +1472,8 @@ static int parse_ip_port_list(token_ctx_t *ctx, ip_port_t **list, int *count) {
       break;
     }
     if (tok.type != TOKEN_STRING) {
+      conf_error(ctx, what, "expected an address but found %s%s", tok_desc(&tok, db, sizeof(db)),
+                 tok.type == TOKEN_EOF ? " (missing '}')" : "");
       free_token(&tok);
       return -1;
     }
@@ -1250,27 +1489,15 @@ static int parse_ip_port_list(token_ctx_t *ctx, ip_port_t **list, int *count) {
     *list = _new_list;
     (*list)[*count].ip = ip_val;
     (*list)[*count].port = 53;
+    (*count)++;
     tok = get_next_token(ctx);
     if (tok.type == TOKEN_STRING && strcmp(tok.value, "port") == 0) {
       free_token(&tok);
-      tok = get_next_token(ctx);
-      if (tok.type == TOKEN_STRING) {
-        char *endptr;
-        long pval = strtol(tok.value, &endptr, 10);
-        if (*endptr != '\0' || pval <= 0 || pval > 65535) {
-          free_token(&tok);
-          return -1;
-        }
-        (*list)[*count].port = (int)pval;
-      } else {
-        free_token(&tok);
-        return -1;
-      }
-      free_token(&tok);
+      if (read_port(ctx, what, &(*list)[*count - 1].port) != 0) return -1;
       tok = get_next_token(ctx);
     }
-    (*count)++;
     if (tok.type != TOKEN_SEMICOLON) {
+      conf_error(ctx, what, "expected ';' after '%.64s' but found %s", ip_val, tok_desc(&tok, db, sizeof(db)));
       free_token(&tok);
       return -1;
     }
@@ -1278,6 +1505,7 @@ static int parse_ip_port_list(token_ctx_t *ctx, ip_port_t **list, int *count) {
   }
   tok = get_next_token(ctx);
   if (tok.type != TOKEN_SEMICOLON) {
+    conf_error(ctx, what, "expected ';' after '}' but found %s", tok_desc(&tok, db, sizeof(db)));
     free_token(&tok);
     return -1;
   }
@@ -1292,7 +1520,7 @@ static int parse_alias_resolvers(token_ctx_t *ctx, const char *where, ip_port_t 
   free(*list);
   *list = NULL;
   *count = 0;
-  if (parse_ip_port_list(ctx, list, count) != 0) return -1;
+  if (parse_ip_port_list(ctx, "alias-resolver", list, count) != 0) return -1;
   const char *bad = NULL;
   if (*count > KARIDNS_ALIAS_RESOLVERS_MAX) {
     bad = "more than 8 entries";
@@ -1356,7 +1584,7 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
     free_token(&tok);
 
     if (strcmp(key, "exempt-clients") == 0) {
-      if (parse_ip_port_list(ctx, &rrl->exempt_clients, &rrl->exempt_clients_count) != 0) {
+      if (parse_ip_port_list(ctx, "rate-limit exempt-clients", &rrl->exempt_clients, &rrl->exempt_clients_count) != 0) {
         free(key);
         return -1;
       }
@@ -1741,7 +1969,7 @@ static const char *const k_bind_zone_options[] = {
   "ixfr-from-differences", "journal", "key-directory", "masterfile-format", "masterfile-style", "max-ixfr-ratio",
   "max-journal-size", "max-records", "max-refresh-time", "max-retry-time", "max-transfer-idle-in", "max-transfer-idle-out",
   "max-transfer-time-in", "max-transfer-time-out", "max-zone-ttl", "min-refresh-time", "min-retry-time", "multi-master",
-  "notify", "notify-delay", "notify-source-v6", "notify-to-soa", "nta-lifetime", "nta-recheck", "parental-agents",
+  "notify-delay", "notify-source-v6", "notify-to-soa", "nta-lifetime", "nta-recheck", "parental-agents",
   "parental-source", "parental-source-v6", "request-expire", "request-ixfr", "request-nsid",
   "require-server-cookie", "send-report-channel", "serial-update-method", "server-addresses", "server-names",
   "sig-signing-nodes", "sig-signing-signatures", "sig-signing-type", "sig-validity-interval", "transfer-source",
@@ -1762,7 +1990,7 @@ static const char *const k_bind_view_options[] = {
   "managed-keys", "match-destinations", "match-recursive-only", "max-cache-size", "max-cache-ttl", "max-clients-per-query",
   "max-ixfr-ratio", "max-journal-size", "max-ncache-ttl", "max-records", "max-recursion-depth", "max-recursion-queries",
   "max-refresh-time", "max-retry-time", "max-stale-ttl", "max-udp-size", "max-zone-ttl", "message-compression",
-  "min-cache-ttl", "min-ncache-ttl", "min-refresh-time", "min-retry-time", "minimal-any", "minimal-responses", "notify",
+  "min-cache-ttl", "min-ncache-ttl", "min-refresh-time", "min-retry-time", "minimal-any", "minimal-responses",
   "notify-delay", "notify-source", "notify-source-v6", "notify-to-soa", "nocookie-udp-size", "nosit-udp-size",
   "nta-lifetime", "nta-recheck", "nxdomain-redirect", "parental-source", "parental-source-v6", "preferred-glue",
   "prefetch", "provide-ixfr", "qname-minimization", "query-source", "query-source-v6", "rate-limit", "recursion",
@@ -1823,10 +2051,10 @@ static bool restricted_statement(token_ctx_t *ctx, zone_ext_t *x, const char *ke
     return false;
   }
   if (strcmp(key, "also-notify") == 0) {
-    for (int i = 0; i < x->also_notify_count; i++) free(x->also_notify[i].ip);
-    free(x->also_notify);
+    notify_targets_free(x->also_notify, x->also_notify_count);
     x->also_notify = NULL;
     x->also_notify_count = 0;
+    x->also_notify_set = false;
   } else if (strcmp(key, "allow-transfer") == 0) {
     for (int i = 0; i < x->allow_transfer_count; i++) free(x->allow_transfer[i]);
     free(x->allow_transfer);
@@ -1861,8 +2089,7 @@ static bool restricted_statement(token_ctx_t *ctx, zone_ext_t *x, const char *ke
     x->alias_resolvers = NULL;
     x->alias_resolvers_count = 0;
   } else if (strcmp(key, "masters") == 0 || strcmp(key, "primaries") == 0) {
-    for (int i = 0; i < x->masters_count; i++) free(x->masters[i].ip);
-    free(x->masters);
+    notify_targets_free(x->masters, x->masters_count);
     x->masters = NULL;
     x->masters_count = 0;
     free(x->masters_parsed);
@@ -1872,6 +2099,8 @@ static bool restricted_statement(token_ctx_t *ctx, zone_ext_t *x, const char *ke
 }
 
 static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t **zone_out);
+static int parse_notify_mode(token_ctx_t *ctx, const char *what, uint8_t *out);
+static int masters_build_parsed(zone_ext_t *x);
 
 static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
   conf_token_t tok = get_next_token(ctx);
@@ -1958,24 +2187,43 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       return -1;
     }
     if (strcmp(key, "masters") == 0 || strcmp(key, "primaries") == 0) {
-      if (parse_ip_port_list(ctx, &x->masters, &x->masters_count) !=
-          0) {
+      /* BIND 9.20 ARM "primaries": [ port <n> ] { ( <list> | <ip> [ port <n> ] ) [ key <name> ]; ... };  A later statement replaces the
+       * earlier one.  List names are expanded when the whole file is read (resolve_all_notify_targets), which also builds masters_parsed;
+       * the settings text of a database zone has no lists, so it is built here. */
+      char what[DNS_NAME_TEXT_SIZE + 32];
+      snprintf(what, sizeof(what), "zone '%.255s' %s", zone->domain ? zone->domain : "", key);
+      notify_targets_free(x->masters, x->masters_count);
+      x->masters = NULL;
+      x->masters_count = 0;
+      if (parse_notify_targets(ctx, what, &x->masters, &x->masters_count, true) != 0) {
         free(key);
         free_zone_config(zone);
         return -1;
       }
-      if (x->masters_count > 0 && x->masters) {
-        free(x->masters_parsed);
-        x->masters_parsed = calloc(x->masters_count, sizeof(cidr_entry_t));
-        if (x->masters_parsed) {
-          for (int i = 0; i < x->masters_count; i++) {
-            cidr_entry_parse(&x->masters_parsed[i], x->masters[i].ip);
-          }
-        }
+      if (ctx->restricted && masters_build_parsed(x) != 0) {
+        ctx->error_occurred = true;
+        free(key);
+        free_zone_config(zone);
+        return -1;
+      }
+    } else if (strcmp(key, "notify") == 0) {
+      char what[DNS_NAME_TEXT_SIZE + 32];
+      snprintf(what, sizeof(what), "zone '%.255s' notify", zone->domain ? zone->domain : "");
+      if (parse_notify_mode(ctx, what, &x->notify_mode) != 0) {
+        free(key);
+        free_zone_config(zone);
+        return -1;
       }
     } else if (strcmp(key, "also-notify") == 0) {
-      if (parse_ip_port_list(ctx, &x->also_notify,
-                             &x->also_notify_count) != 0) {
+      /* a later also-notify statement replaces the earlier one; an empty one overrides the view's and options' list (BIND 9.20 ARM) */
+      char what[DNS_NAME_TEXT_SIZE + 32];
+      snprintf(what, sizeof(what), "zone '%.255s' also-notify", zone->domain ? zone->domain : "");
+      notify_targets_free(x->also_notify, x->also_notify_count);
+      x->also_notify = NULL;
+      x->also_notify_count = 0;
+      x->also_notify_set = true;
+      if (parse_notify_targets(ctx, what, &x->also_notify,
+                               &x->also_notify_count, false) != 0) {
         free(key);
         free_zone_config(zone);
         return -1;
@@ -2134,7 +2382,7 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
         free(key); free_zone_config(zone); return -1;
       }
     } else if (strcmp(key, "forwarders") == 0) {
-      if (parse_ip_port_list(ctx, &x->forwarders, &x->forwarders_count) != 0) {
+      if (parse_ip_port_list(ctx, "forwarders", &x->forwarders, &x->forwarders_count) != 0) {
         free(key); free_zone_config(zone); return -1;
       }
     } else if (strcmp(key, "forward-timeout") == 0) {
@@ -2462,14 +2710,23 @@ zone_ext_shared_t *db_settings_parse(const char *text, size_t len, char *err, si
           !db_acl_entries_ok(ox->allow_update, ox->allow_update_count, true, err, errlen, "allow-update") ||
           !db_acl_entries_ok(ox->ecs_trusted_resolvers, ox->ecs_trusted_resolvers_count, false, err, errlen, "ecs-trusted-resolvers"))
         bad = err;
-      for (int i = 0; !bad && i < ox->also_notify_count; i++)
+      /* the database text names addresses only: no list name (karidns.conf is not available to it), no TSIG key (the secret would
+       * have to be found by a name the database chose) */
+      for (int i = 0; !bad && i < ox->also_notify_count; i++) {
         if (!db_ip_literal_ok(ox->also_notify[i].ip)) {
           db_set_err(err, errlen, "also-notify has an entry that is not an IP address");
           bad = err;
+        } else if (ox->also_notify[i].key) {
+          db_set_err(err, errlen, "also-notify has an entry with a key, which a database zone cannot use");
+          bad = err;
         }
+      }
       for (int i = 0; !bad && i < ox->masters_count; i++)
         if (!db_ip_literal_ok(ox->masters[i].ip)) {
           db_set_err(err, errlen, "masters has an entry that is not an IP address");
+          bad = err;
+        } else if (ox->masters[i].key) {
+          db_set_err(err, errlen, "masters has an entry with a key, which a database zone cannot use");
           bad = err;
         }
       if (!bad && ox->masters_count > 32) {
@@ -2909,6 +3166,209 @@ static int validate_database_config(token_ctx_t *ctx, server_config_t *config) {
       return -1;
     }
   }
+  return 0;
+}
+
+/* notify <yes|no|explicit|primary-only|master-only>; of options, view and zone (BIND 9.20 ARM "notify": "notify ( explicit | master-only |
+ * primary-only | <boolean> );").  A value of the wrong kind is an error naming the place. */
+static int parse_notify_mode(token_ctx_t *ctx, const char *what, uint8_t *out) {
+  char db[96];
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) {
+    conf_error(ctx, what, "expected yes, no, explicit or primary-only but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
+  bool b;
+  notify_mode_t m;
+  if (strcasecmp(tok.value, "explicit") == 0) m = NOTIFY_MODE_EXPLICIT;
+  else if (strcasecmp(tok.value, "primary-only") == 0 || strcasecmp(tok.value, "master-only") == 0) m = NOTIFY_MODE_PRIMARY_ONLY;
+  else if (parse_config_bool(tok.value, &b)) m = b ? NOTIFY_MODE_YES : NOTIFY_MODE_NO;
+  else {
+    conf_error(ctx, what, "invalid value '%.64s' (expected yes, no, explicit, primary-only or master-only)", tok.value);
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) {
+    conf_error(ctx, what, "expected ';' after the value but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  *out = (uint8_t)m;
+  return 0;
+}
+
+/* x->masters_parsed (CIDR form of the addresses, for the "NOTIFY only from a primary" check).  0, or -1 when out of memory. */
+static int masters_build_parsed(zone_ext_t *x) {
+  free(x->masters_parsed);
+  x->masters_parsed = NULL;
+  if (x->masters_count <= 0 || !x->masters) return 0;
+  x->masters_parsed = calloc((size_t)x->masters_count, sizeof(cidr_entry_t));
+  if (!x->masters_parsed) return -1;
+  for (int i = 0; i < x->masters_count; i++)
+    if (x->masters[i].ip) cidr_entry_parse(&x->masters_parsed[i], x->masters[i].ip);
+  return 0;
+}
+
+/* A semantic error of an also-notify statement or a remote-servers list (found after the whole configuration was read, so the place is the
+ * "file:line" the element was written at, kept in notify_target_t.where). */
+static void notify_cfg_error(token_ctx_t *ctx, const char *where, const char *what, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+static void notify_cfg_error(token_ctx_t *ctx, const char *where, const char *what, const char *fmt, ...) {
+  char msg[400];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  syslog(LOG_ERR, "[Config] %s%s%s: %s", where ? where : "", where ? ": " : "", what, msg);
+  fprintf(stderr, "[ERROR] %s%s%s: %s\n", where ? where : "", where ? ": " : "", what, msg);
+  if (ctx) ctx->error_occurred = true;
+}
+
+/* Expand the list names of src[0..n) into addresses appended to *out (BIND 9.20 ARM "remote-servers": a list may include other lists).
+ * A `key` written on a list name is the key of those of its addresses that have none of their own.  Every key must be defined in a
+ * key { } block (RFC 8945 needs the secret to sign).  -1 with a message on an unknown name, an undefined key, a list that includes
+ * itself (nesting deeper than KARIDNS_REMOTE_LIST_DEPTH) or more than KARIDNS_ALSO_NOTIFY_MAX addresses. */
+static int expand_targets(token_ctx_t *ctx, const server_config_t *cfg, const char *what, const notify_target_t *src, int n,
+                          const char *inherit_key, int depth, notify_target_t **out, int *outn) {
+  for (int i = 0; i < n; i++) {
+    const notify_target_t *s = &src[i];
+    const char *key = s->key ? s->key : inherit_key;
+    if (s->key && !key_name_is_defined(cfg->keys, s->key)) {
+      notify_cfg_error(ctx, s->where, what, "key '%.64s' is not defined in any key {} block", s->key);
+      return -1;
+    }
+    if (s->list) {
+      const remote_list_t *l = cfg->remote_lists;
+      while (l && strcasecmp(l->name, s->list) != 0) l = l->next;
+      if (!l) {
+        notify_cfg_error(ctx, s->where, what, "'%.64s' is neither an IP address nor a remote-servers / primaries / masters list defined in this configuration",
+                         s->list);
+        return -1;
+      }
+      if (depth + 1 > KARIDNS_REMOTE_LIST_DEPTH) {
+        notify_cfg_error(ctx, s->where, what, "remote-servers lists are nested more than %d deep (does list '%.64s' include itself?)",
+                         KARIDNS_REMOTE_LIST_DEPTH, s->list);
+        return -1;
+      }
+      if (expand_targets(ctx, cfg, what, l->items, l->count, key, depth + 1, out, outn) != 0) return -1;
+      continue;
+    }
+    if (*outn >= KARIDNS_ALSO_NOTIFY_MAX) {
+      notify_cfg_error(ctx, s->where, what, "more than %d addresses after the lists are expanded", KARIDNS_ALSO_NOTIFY_MAX);
+      return -1;
+    }
+    notify_target_t *nl = realloc(*out, sizeof(notify_target_t) * (size_t)(*outn + 1));
+    if (!nl) {
+      if (ctx) ctx->error_occurred = true;
+      return -1;
+    }
+    *out = nl;
+    notify_target_t *t = &nl[*outn];
+    memset(t, 0, sizeof(*t));
+    (*outn)++;
+    t->ip = strdup(s->ip);
+    t->port = s->port;
+    if (key) t->key = strdup(key);
+    if (!t->ip || (key && !t->key)) {
+      if (ctx) ctx->error_occurred = true;
+      return -1;
+    }
+  }
+  return 0;
+}
+
+/* Replace the statement *list by its expansion (every element an address, no `where`, no `list`) */
+static int resolve_notify_field(token_ctx_t *ctx, const server_config_t *cfg, const char *what, notify_target_t **list, int *count) {
+  if (*count == 0) return 0;
+  notify_target_t *out = NULL;
+  int outn = 0;
+  if (expand_targets(ctx, cfg, what, *list, *count, NULL, 0, &out, &outn) != 0) {
+    notify_targets_free(out, outn);
+    return -1;
+  }
+  notify_targets_free(*list, *count);
+  *list = out;
+  *count = outn;
+  return 0;
+}
+
+/* After the whole configuration is read: check every remote-servers list, and expand the lists named in also-notify of options, views
+ * and zones, so that the server only ever sees addresses.  Also the "zone replaces the view's, the view's replaces options'" rule needs
+ * nothing here: it is applied when a NOTIFY is sent (also_notify_effective()). */
+static int resolve_all_notify_targets(token_ctx_t *ctx, server_config_t *config) {
+  char what[DNS_NAME_TEXT_SIZE + 128];
+  for (const remote_list_t *l = config->remote_lists; l; l = l->next) {
+    snprintf(what, sizeof(what), "remote-servers '%.64s'", l->name);
+    notify_target_t *tmp = NULL;
+    int tn = 0;
+    int rc = expand_targets(ctx, config, what, l->items, l->count, NULL, 0, &tmp, &tn);
+    notify_targets_free(tmp, tn);
+    if (rc != 0) return -1;
+  }
+  if (resolve_notify_field(ctx, config, "options also-notify", &config->also_notify, &config->also_notify_count) != 0) return -1;
+  for (view_config_t *v = config->views; v; v = v->next) {
+    snprintf(what, sizeof(what), "view '%.64s' also-notify", v->name);
+    if (resolve_notify_field(ctx, config, what, &v->also_notify, &v->also_notify_count) != 0) return -1;
+    for (zone_config_t *z = v->zones; z; z = z->next) {
+      zone_ext_t *zx = z->ext;
+      if (!zx) continue;
+      snprintf(what, sizeof(what), "zone '%.255s' also-notify", z->domain);
+      if (resolve_notify_field(ctx, config, what, &zx->also_notify, &zx->also_notify_count) != 0) return -1;
+      if (zx->masters_count > 0) {
+        /* primaries / masters of the zone: the same lists, the same checks; masters_parsed is built from the expanded addresses */
+        snprintf(what, sizeof(what), "zone '%.255s' primaries", z->domain);
+        if (resolve_notify_field(ctx, config, what, &zx->masters, &zx->masters_count) != 0) return -1;
+        if (masters_build_parsed(zx) != 0) {
+          if (ctx) ctx->error_occurred = true;
+          return -1;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+notify_mode_t notify_mode_effective(const server_config_t *cfg, const zone_config_t *zone, const char *view_name) {
+  const zone_ext_t *zx = zext(zone);
+  if (zx->notify_mode) return (notify_mode_t)zx->notify_mode;
+  if (cfg) {
+    if (view_name && view_name[0])
+      for (const view_config_t *v = cfg->views; v; v = v->next)
+        if (strcasecmp(v->name, view_name) == 0) {
+          if (v->notify_mode) return (notify_mode_t)v->notify_mode;
+          break;
+        }
+    if (cfg->notify_mode) return (notify_mode_t)cfg->notify_mode;
+  }
+  return NOTIFY_MODE_YES;
+}
+
+int also_notify_effective(const server_config_t *cfg, const zone_config_t *zone, const char *view_name,
+                          const notify_target_t **out) {
+  const zone_ext_t *zx = zext(zone);
+  if (zx->also_notify_set) {
+    *out = zx->also_notify;
+    return zx->also_notify_count;
+  }
+  if (cfg) {
+    if (view_name && view_name[0]) {
+      for (const view_config_t *v = cfg->views; v; v = v->next)
+        if (strcasecmp(v->name, view_name) == 0) {
+          if (v->also_notify_set) {
+            *out = v->also_notify;
+            return v->also_notify_count;
+          }
+          break;
+        }
+    }
+    *out = cfg->also_notify;
+    return cfg->also_notify_count;
+  }
+  *out = NULL;
   return 0;
 }
 
@@ -3426,6 +3886,21 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key);
             return -1;
           }
+        } else if (strcmp(key, "notify") == 0) {
+          if (parse_notify_mode(ctx, "options notify", &config->notify_mode) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "also-notify") == 0) {
+          /* BIND 9.20 ARM: a global list of servers that also get NOTIFY; a zone or view statement overrides it.  A later statement
+           * replaces the earlier one. */
+          notify_targets_free(config->also_notify, config->also_notify_count);
+          config->also_notify = NULL;
+          config->also_notify_count = 0;
+          if (parse_notify_targets(ctx, "options also-notify", &config->also_notify, &config->also_notify_count, false) != 0) {
+            free(key);
+            return -1;
+          }
         } else if (strcmp(key, "control-channel") == 0) {
           /* D17-3: it used to be skipped like any unknown option, so the control socket silently did not exist.  It is a
            * top-level statement (like in the sample configuration); say so instead of ignoring it. */
@@ -3483,6 +3958,27 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
           free(view->match_clients_parsed);
           view->match_clients_parsed = acl_list_parse(view->match_clients, view->match_clients_count);
+        } else if (strcmp(tok.value, "notify") == 0) {
+          free_token(&tok);
+          char nwhat[KARIDNS_VIEW_NAME_MAX + 32];
+          snprintf(nwhat, sizeof(nwhat), "view '%s' notify", view->name);
+          if (parse_notify_mode(ctx, nwhat, &view->notify_mode) != 0) {
+            free_partial_view(view);
+            return -1;
+          }
+        } else if (strcmp(tok.value, "also-notify") == 0) {
+          /* overrides options' also-notify for the zones of this view that have none of their own (BIND 9.20 ARM) */
+          free_token(&tok);
+          char vwhat[KARIDNS_VIEW_NAME_MAX + 32];
+          snprintf(vwhat, sizeof(vwhat), "view '%s' also-notify", view->name);
+          notify_targets_free(view->also_notify, view->also_notify_count);
+          view->also_notify = NULL;
+          view->also_notify_count = 0;
+          view->also_notify_set = true;
+          if (parse_notify_targets(ctx, vwhat, &view->also_notify, &view->also_notify_count, false) != 0) {
+            free_partial_view(view);
+            return -1;
+          }
         } else if (strcmp(tok.value, "zone") == 0) {
           free_token(&tok);
           zone_config_t *z = NULL;
@@ -3557,6 +4053,40 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       else
         last_zone->next = zone;
       last_zone = zone;
+    } else if (strcmp(tok.value, "remote-servers") == 0 || strcmp(tok.value, "primaries") == 0 ||
+               strcmp(tok.value, "masters") == 0) {
+      /* BIND 9.20 ARM "remote-servers" (primaries / masters are the older spellings): a named list of servers that also-notify { }
+       * can name.  Read here, expanded after the whole file is read (a list may be written after its first use). */
+      char stmt[16];
+      snprintf(stmt, sizeof(stmt), "%s", tok.value);
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_STRING || !tok.value) {
+        char db[96];
+        conf_error(ctx, stmt, "expected a list name but found %s", tok_desc(&tok, db, sizeof(db)));
+        free_token(&tok);
+        return -1;
+      }
+      remote_list_t *rl = safe_calloc_or_die(1, sizeof(remote_list_t));
+      if (!rl) { free_token(&tok); if (ctx) ctx->error_occurred = true; return -1; }
+      rl->name = tok.value;
+      tok.value = NULL;
+      free_token(&tok);
+      char loc[300];
+      ctx_location(ctx, loc, sizeof(loc));
+      rl->where = strdup(loc);
+      bool dup_list = false;
+      for (const remote_list_t *e = config->remote_lists; e; e = e->next)
+        if (strcasecmp(e->name, rl->name) == 0) dup_list = true;
+      rl->next = config->remote_lists; /* linked first: freed by free_server_config_fields() on any error */
+      config->remote_lists = rl;
+      if (dup_list) {
+        conf_error(ctx, stmt, "list '%.64s' is defined twice", rl->name);
+        return -1;
+      }
+      char lwhat[96];
+      snprintf(lwhat, sizeof(lwhat), "%s '%.64s'", stmt, rl->name);
+      if (parse_notify_targets(ctx, lwhat, &rl->items, &rl->count, false) != 0) return -1;
     } else if (strcmp(tok.value, "acl") == 0) {
       /* D-22: acl "name" { <address_match_element>; ... }; (BIND named.conf) */
       free_token(&tok);
@@ -4262,6 +4792,9 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
     }
   }
 
+  /* also-notify: expand the remote-servers list names and check the TSIG keys */
+  if (resolve_all_notify_targets(ctx, config) != 0) return -1;
+
   /* [T7] TSIGキー参照の未定義検出 (checkconf相当の健全性チェック) */
   for (view_config_t *v = config->views; v; v = v->next) {
     for (zone_config_t *z = v->zones; z; z = z->next) {
@@ -4545,6 +5078,25 @@ static bool zx_ipports(ip_port_t **dst, int *dn, const ip_port_t *src, int sn) {
   return true;
 }
 
+static bool zx_notify_targets(notify_target_t **dst, int *dn, const notify_target_t *src, int sn) {
+  *dst = NULL;
+  *dn = 0;
+  if (sn <= 0 || !src) return true;
+  notify_target_t *a = calloc((size_t)sn, sizeof(*a));
+  if (!a) return false;
+  *dst = a;
+  *dn = sn;
+  for (int i = 0; i < sn; i++) {
+    a[i].port = src[i].port;
+    a[i].ip = zx_strdup(src[i].ip);
+    a[i].key = zx_strdup(src[i].key);
+    a[i].list = zx_strdup(src[i].list);
+    a[i].where = zx_strdup(src[i].where);
+    if ((src[i].ip && !a[i].ip) || (src[i].key && !a[i].key) || (src[i].list && !a[i].list) || (src[i].where && !a[i].where)) return false;
+  }
+  return true;
+}
+
 static bool zx_tags(struct ecs_tag_def_s **dst, int *dn, const struct ecs_tag_def_s *src, int sn) {
   *dst = NULL;
   *dn = 0;
@@ -4576,10 +5128,10 @@ static zone_ext_t *zone_ext_clone(const zone_ext_t *s) {
   if (!d) return NULL;
   *d = *s;
   /* every pointer of the copy is rebuilt below; until then it must not alias the source */
-  d->masters = NULL; d->masters_count = 0; d->masters_parsed = NULL;
+  d->masters = NULL; d->masters_count = 0; d->masters_parsed = NULL; /* notify_mode is copied with *d = *s */
   d->tsig_key = NULL;
   d->tsig_keys = NULL; d->tsig_keys_count = 0;
-  d->also_notify = NULL; d->also_notify_count = 0;
+  d->also_notify = NULL; d->also_notify_count = 0; /* also_notify_set is copied with *d = *s */
   d->notify_source = NULL;
   d->allow_transfer = NULL; d->allow_transfer_count = 0; d->allow_transfer_parsed = NULL;
   d->allow_update = NULL; d->allow_update_count = 0; d->allow_update_parsed = NULL;
@@ -4591,9 +5143,9 @@ static zone_ext_t *zone_ext_clone(const zone_ext_t *s) {
   d->ecs_tags = NULL; d->ecs_tag_count = 0;
   d->location_tags = NULL; d->location_tag_count = 0;
   d->ecs_trusted_resolvers = NULL; d->ecs_trusted_resolvers_count = 0; d->ecs_trusted_resolvers_parsed = NULL;
-  bool ok = zx_ipports(&d->masters, &d->masters_count, s->masters, s->masters_count) &&
+  bool ok = zx_notify_targets(&d->masters, &d->masters_count, s->masters, s->masters_count) &&
             zx_strs(&d->tsig_keys, &d->tsig_keys_count, s->tsig_keys, s->tsig_keys_count) &&
-            zx_ipports(&d->also_notify, &d->also_notify_count, s->also_notify, s->also_notify_count) &&
+            zx_notify_targets(&d->also_notify, &d->also_notify_count, s->also_notify, s->also_notify_count) &&
             zx_strs(&d->allow_transfer, &d->allow_transfer_count, s->allow_transfer, s->allow_transfer_count) &&
             zx_strs(&d->allow_update, &d->allow_update_count, s->allow_update, s->allow_update_count) &&
             zx_ipports(&d->rrl.exempt_clients, &d->rrl.exempt_clients_count, s->rrl.exempt_clients, s->rrl.exempt_clients_count) &&

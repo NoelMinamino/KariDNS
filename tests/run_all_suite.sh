@@ -439,6 +439,7 @@ register_test "core" "sh" "tests/run_config_duplicate_rejection_test.sh" "Duplic
 register_test "core" "sh" "tests/run_domain_length_rfc1035_test.sh" "RFC 1035 255-byte domain & 63-byte label limits"
 register_test "core" "sh" "tests/run_logging_channel_validation_test.sh" "Syslog & file logging channels configuration"
 register_test "core" "sh" "tests/run_mx_srv_glue_test.sh" "MX & SRV target additional glue inclusion"
+register_test "core" "sh" "tests/run_also_notify_test.sh" "also-notify as in BIND 9.20: options/view/zone, port before the list, remote-servers names, per-address TSIG key; karicheck errors with file:line" "par"
 register_test "core" "sh" "tests/run_notify_source_test.sh" "RFC 1996 notify-source address binding" "serial"   # fixed ports 10053/10054 and the default control socket
 register_test "core" "sh" "tests/run_privilege_drop_root_test.sh" "FreeBSD setuid/setgid privilege drop"
 register_test "core" "sh" "tests/run_nonroot_startup_test.sh" "Non-root startup & fail-closed port/log/pid/control checks"

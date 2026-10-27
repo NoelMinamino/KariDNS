@@ -2435,6 +2435,304 @@ static void test_xfr_limits_option(void) {
     expect_reject("zone max-zone-records empty", "zone \"a.example\" { type master; file \"a.zone\"; max-zone-records ; };");
 }
 
+/* ------------------------------------------------------------------------ */
+/* also-notify, BIND 9.20 ARM ("also-notify", "remote-servers"): options / view / zone, `port` before the list, per-element
+ * port and key, list names, the zone > view > options precedence, and errors that say where they are.  The expectations are the
+ * ARM grammar  [ port <integer> ] { ( <remote-servers> | <ipv4> [ port <integer> ] | <ipv6> [ port <integer> ] ) [ key <string> ]; ... };
+ * and "a zone also-notify overrides the global one". */
+static int parse_capture(const char *txt, server_config_t *cfg, char *msg, size_t msglen) {
+    char path[] = "/tmp/an_err_XXXXXX";
+    int tmp = mkstemp(path);
+    msg[0] = '\0';
+    fflush(stderr);
+    int saved = dup(2);
+    if (tmp >= 0) dup2(tmp, 2);
+    int rc = parse_named_conf(txt, cfg);
+    fflush(stderr);
+    if (saved >= 0) { dup2(saved, 2); close(saved); }
+    if (tmp >= 0) {
+        ssize_t n = pread(tmp, msg, msglen - 1, 0);
+        msg[n > 0 ? n : 0] = '\0';
+        close(tmp);
+        unlink(path);
+    }
+    return rc;
+}
+
+/* the text must be refused and the message must contain every fragment of `want` (separated by '|') */
+static void expect_an_error(const char *label, const char *txt, const char *want) {
+    server_config_t cfg;
+    char msg[2048];
+    int rc = parse_capture(txt, &cfg, msg, sizeof(msg));
+    g_checks++;
+    if (rc != -1) {
+        g_failed++;
+        printf("  [FAIL] should be rejected but parsed (rc=%d): %s\n         %s\n", rc, label, txt);
+        if (rc == 0) free_server_config_fields(&cfg);
+        return;
+    }
+    char frag[256];
+    const char *p = want;
+    while (p && *p) {
+        const char *bar = strchr(p, '|');
+        size_t n = bar ? (size_t)(bar - p) : strlen(p);
+        snprintf(frag, sizeof(frag), "%.*s", (int)n, p);
+        g_checks++;
+        if (!strstr(msg, frag)) {
+            g_failed++;
+            printf("  [FAIL] %s: message lacks '%s'; it is: %s\n", label, frag, msg);
+        }
+        p = bar ? bar + 1 : NULL;
+    }
+}
+
+static const zone_config_t *zone_in_view(const server_config_t *cfg, const char *view, const char *domain) {
+    for (const view_config_t *v = cfg->views; v; v = v->next)
+        if (strcmp(v->name, view) == 0) return view_find_zone_config(v, domain);
+    return NULL;
+}
+
+#define AN_KEY "key \"k1\" { algorithm hmac-sha256; secret \"c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0MTIzNDU2\"; };\n"
+
+static void test_also_notify_bind(void) {
+    printf("[*] also-notify (BIND 9.20)...\n");
+    server_config_t cfg;
+    const notify_target_t *t = NULL;
+    int n;
+
+    /* options-level: every zone without its own statement (also a zone without zone {}: zone == NULL) */
+    if (parse_ok("options { also-notify { 192.0.2.1; 2001:db8::1 port 5301; }; };\n"
+                 "zone \"a.test\" { type master; file \"a\"; };", &cfg)) {
+        n = also_notify_effective(&cfg, zone_in_view(&cfg, "__default__", "a.test"), "__default__", &t);
+        CHECK(n == 2 && t && t[0].port == 53 && t[1].port == 5301);
+        if (n == 2) { CHECK_STR(t[0].ip, "192.0.2.1"); CHECK_STR(t[1].ip, "2001:db8::1"); CHECK(t[0].key == NULL && t[0].list == NULL); }
+        CHECK(also_notify_effective(&cfg, NULL, "__default__", &t) == 2);
+        CHECK(also_notify_effective(NULL, NULL, NULL, &t) == 0);
+        free_server_config_fields(&cfg);
+    }
+    /* zone replaces options; an empty zone statement switches the inherited list off; a later statement replaces an earlier one */
+    if (parse_ok("options { also-notify { 192.0.2.1; }; };\n"
+                 "zone \"a.test\" { type master; file \"a\"; also-notify { 192.0.2.2 port 5302; }; };\n"
+                 "zone \"b.test\" { type master; file \"b\"; also-notify { }; };\n"
+                 "zone \"c.test\" { type master; file \"c\"; also-notify { 192.0.2.7; }; also-notify { 192.0.2.8; 192.0.2.9; }; };\n"
+                 "zone \"d.test\" { type master; file \"d\"; };", &cfg)) {
+        n = also_notify_effective(&cfg, zone_in_view(&cfg, "__default__", "a.test"), "__default__", &t);
+        CHECK(n == 1 && t && t[0].port == 5302);
+        CHECK(also_notify_effective(&cfg, zone_in_view(&cfg, "__default__", "b.test"), "__default__", &t) == 0);
+        n = also_notify_effective(&cfg, zone_in_view(&cfg, "__default__", "c.test"), "__default__", &t);
+        CHECK(n == 2 && t && strcmp(t[0].ip, "192.0.2.8") == 0);
+        n = also_notify_effective(&cfg, zone_in_view(&cfg, "__default__", "d.test"), "__default__", &t);
+        CHECK(n == 1 && t && strcmp(t[0].ip, "192.0.2.1") == 0);
+        free_server_config_fields(&cfg);
+    }
+    /* view-level: overrides options for its zones; a zone still overrides the view; another view keeps options' */
+    if (parse_ok("options { also-notify { 192.0.2.1; }; };\n"
+                 "view \"in\" { match-clients { 10.0.0.0/8; }; also-notify { 192.0.2.50; 192.0.2.51; };\n"
+                 "  zone \"a.test\" { type master; file \"a\"; };\n"
+                 "  zone \"b.test\" { type master; file \"b\"; also-notify { 192.0.2.52; }; }; };\n"
+                 "view \"out\" { match-clients { any; }; zone \"a.test\" { type master; file \"a\"; }; };", &cfg)) {
+        n = also_notify_effective(&cfg, zone_in_view(&cfg, "in", "a.test"), "in", &t);
+        CHECK(n == 2 && t && strcmp(t[0].ip, "192.0.2.50") == 0);
+        n = also_notify_effective(&cfg, zone_in_view(&cfg, "in", "b.test"), "in", &t);
+        CHECK(n == 1 && t && strcmp(t[0].ip, "192.0.2.52") == 0);
+        n = also_notify_effective(&cfg, zone_in_view(&cfg, "out", "a.test"), "out", &t);
+        CHECK(n == 1 && t && strcmp(t[0].ip, "192.0.2.1") == 0);
+        CHECK(also_notify_effective(&cfg, NULL, "in", &t) == 2);   /* a catalog member has no zone { } */
+        free_server_config_fields(&cfg);
+    }
+    /* port before the list is the default port of the elements without their own */
+    if (parse_ok("zone \"a.test\" { type master; file \"a\"; also-notify port 5353 { 192.0.2.1; 192.0.2.2 port 5454; 2001:db8::1; }; };", &cfg)) {
+        n = also_notify_effective(&cfg, zone_in_view(&cfg, "__default__", "a.test"), "__default__", &t);
+        CHECK(n == 3 && t && t[0].port == 5353 && t[1].port == 5454 && t[2].port == 5353);
+        free_server_config_fields(&cfg);
+    }
+    /* key on an element */
+    if (parse_ok(AN_KEY "options { also-notify { 192.0.2.1 key \"k1\"; 192.0.2.2 port 5302 key k1; 192.0.2.3; }; };", &cfg)) {
+        n = also_notify_effective(&cfg, NULL, NULL, &t);
+        CHECK(n == 3 && t && t[0].key && strcmp(t[0].key, "k1") == 0 && t[1].key && t[1].port == 5302 && t[2].key == NULL);
+        free_server_config_fields(&cfg);
+    }
+    /* list names: remote-servers / primaries / masters, written after their use, with a port and keys, nested; a key on a name
+     * is the key of the addresses of the list that have none */
+    if (parse_ok(AN_KEY
+                 "options { also-notify { sec; 192.0.2.99; sec2 key k1; }; };\n"
+                 "zone \"a.test\" { type master; file \"a\"; also-notify port 5300 { inner; }; };\n"
+                 "remote-servers sec port 5301 { 192.0.2.10; 192.0.2.11 port 5311 key \"k1\"; };\n"
+                 "primaries sec2 { 192.0.2.20; sec3; };\n"
+                 "masters sec3 { 2001:db8::30; };\n"
+                 "remote-servers inner { 192.0.2.40; };", &cfg)) {
+        n = also_notify_effective(&cfg, NULL, NULL, &t);
+        CHECK(n == 5);
+        if (n == 5) {
+            CHECK(strcmp(t[0].ip, "192.0.2.10") == 0 && t[0].port == 5301 && t[0].key == NULL);
+            CHECK(strcmp(t[1].ip, "192.0.2.11") == 0 && t[1].port == 5311 && t[1].key && strcmp(t[1].key, "k1") == 0);
+            CHECK(strcmp(t[2].ip, "192.0.2.99") == 0 && t[2].port == 53);
+            CHECK(strcmp(t[3].ip, "192.0.2.20") == 0 && t[3].port == 53 && t[3].key && strcmp(t[3].key, "k1") == 0);
+            CHECK(strcmp(t[4].ip, "2001:db8::30") == 0 && t[4].key && strcmp(t[4].key, "k1") == 0);
+            CHECK(t[0].list == NULL && t[0].where == NULL && t[1].where == NULL);
+        }
+        /* the outer port is not applied to the elements of a list: they have the list's own port (53 here) */
+        n = also_notify_effective(&cfg, zone_in_view(&cfg, "__default__", "a.test"), "__default__", &t);
+        CHECK(n == 1 && t && t[0].port == 53);
+        free_server_config_fields(&cfg);
+    }
+    /* settings text of a database zone: addresses and ports only */
+    {
+        char err[200];
+        zone_ext_shared_t *sh = db_parse_quiet("also-notify port 5353 { 192.0.2.1; 192.0.2.2 port 5301; };", err, sizeof(err));
+        CHECK(sh != NULL);
+        if (sh) {
+            CHECK(sh->ext.also_notify_set && sh->ext.also_notify_count == 2 && sh->ext.also_notify[0].port == 5353 &&
+                  sh->ext.also_notify[1].port == 5301);
+            zone_ext_shared_unref(sh);
+        }
+        expect_db_reject("also-notify { 192.0.2.1 key k; };", "key");
+        expect_db_reject("also-notify { somelist; };", "not an IP");
+        expect_db_reject("also-notify { 192.0.2.1 tls t; };", "also-notify");
+        expect_db_reject("also-notify { 192.0.2.1 };", "also-notify");
+    }
+
+    /* errors say what and where (the line of the element / of the token that was wrong) */
+    expect_an_error("unknown list name", "options { };\nzone \"z.test\" { type master; file \"z\";\n  also-notify { nolist; }; };",
+                    "line 3|zone 'z.test.' also-notify|'nolist'|remote-servers");
+    expect_an_error("unknown list in options", "options {\n also-notify { 192.0.2.1;\n  nolist; };\n};", "line 3|options also-notify|'nolist'");
+    expect_an_error("unknown list in view", "view \"v\" { match-clients { any; };\n also-notify { nolist; }; };", "line 2|view 'v' also-notify|'nolist'");
+    expect_an_error("hostname is not an address", "options { also-notify { ns1.example.test; }; };", "'ns1.example.test'");
+    expect_an_error("undefined key", "options {\n also-notify { 192.0.2.1 key nokey; }; };", "line 2|key 'nokey' is not defined");
+    expect_an_error("undefined key on a list", "remote-servers l {\n 192.0.2.1 key nokey; };\noptions { };", "line 2|remote-servers 'l'|key 'nokey'");
+    expect_an_error("undefined key on a list name", AN_KEY "remote-servers l { 192.0.2.1; };\noptions { also-notify { l key nokey; }; };",
+                    "line 3|key 'nokey' is not defined");
+    expect_an_error("missing semicolon", "options { };\nzone \"z.test\" { type master; file \"z\";\n  also-notify { 192.0.2.1 }; };",
+                    "line 3|zone 'z.test.' also-notify|expected ';' after '192.0.2.1'");
+    expect_an_error("missing semicolon after }", "options {\n also-notify { 192.0.2.1; }\n};", "options also-notify|expected ';' after '}'");
+    expect_an_error("no braces", "options { also-notify 192.0.2.1; };", "expected '{'");
+    expect_an_error("eof in the list", "options { also-notify { 192.0.2.1;", "missing '}'");
+    expect_an_error("bad port", "options { also-notify { 192.0.2.1 port 70000; }; };", "invalid port '70000'");
+    expect_an_error("bad default port", "options { also-notify port 0 { 192.0.2.1; }; };", "invalid port '0'");
+    expect_an_error("port missing", "options { also-notify { 192.0.2.1 port; }; };", "expected a port number");
+    expect_an_error("two ports", "options { also-notify { 192.0.2.1 port 1 port 2; }; };", "two ports");
+    expect_an_error("port on a list name", "options { also-notify { l port 5300; }; }; remote-servers l { 192.0.2.1; };", "takes no port");
+    expect_an_error("two keys", AN_KEY "options { also-notify { 192.0.2.1 key k1 key k1; }; };", "two keys");
+    expect_an_error("key without name", "options { also-notify { 192.0.2.1 key; }; };", "expected a key name");
+    expect_an_error("tls", "options { also-notify { 192.0.2.1 tls t; }; };", "'tls' is not supported");
+    expect_an_error("source", "options { also-notify source 192.0.2.5 { 192.0.2.1; }; };", "'source' is not supported");
+    expect_an_error("junk after element", "options { also-notify { 192.0.2.1 foo; }; };", "unexpected 'foo'");
+    expect_an_error("list includes itself", "options { also-notify { l; }; };\nremote-servers l { 192.0.2.1; l; };", "nested more than");
+    expect_an_error("list defined twice", "remote-servers l { 192.0.2.1; };\nprimaries L { 192.0.2.2; };", "line 2|list 'L' is defined twice");
+    expect_an_error("list without name", "remote-servers { 192.0.2.1; };", "expected a list name");
+    expect_an_error("masters syntax error", "zone \"z.test\" { type slave; masters {\n 192.0.2.1 port x; }; };", "line 2|masters|invalid port 'x'");
+    expect_an_error("forwarders syntax error", "zone \"z.test\" { type forward; forwarders { 192.0.2.1 ; 192.0.2.2 192.0.2.3; }; };", "forwarders|expected ';' after '192.0.2.2'");
+    {
+        /* more than KARIDNS_ALSO_NOTIFY_MAX addresses after expanding: a list that includes a list that includes ... 3 times */
+        char big[8192], *w = big;
+        w += snprintf(w, 64, "remote-servers a { ");
+        for (int i = 0; i < 20; i++) w += snprintf(w, 40, "192.0.2.%d; ", i + 1);
+        w += snprintf(w, 16, "};\n");
+        w += snprintf(w, 128, "remote-servers b { a; a; a; a; a; a; a; a; a; a; a; a; a; a; };\n");
+        w += snprintf(w, 64, "options { also-notify { b; }; };");
+        expect_an_error("too many after expansion", big, "more than 256 addresses");
+    }
+}
+
+/* primaries / masters in a zone (BIND 9.20 ARM "primaries": [ port <integer> ] { ( <remote-servers> | <ipv4> [ port <integer> ] | <ipv6> [ port <integer> ] )
+ * [ key <string> ]; ... };) and notify <yes|no|explicit|primary-only|master-only> in options, view and zone. */
+static void test_primaries_and_notify_mode(void) {
+    printf("[*] primaries / masters lists and notify modes (BIND 9.20)...\n");
+    server_config_t cfg;
+
+    /* list names, ports, keys; the zone's tsig-key is the fallback of an address without a key */
+    if (parse_ok(AN_KEY "key \"k2\" { algorithm hmac-sha256; secret \"c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0MTIzNDU2\"; };\n"
+                 "zone \"s.test\" { type slave; tsig-key \"k2\"; primaries { ps; 2001:db8::5 port 5400; }; };\n"
+                 "zone \"t.test\" { type slave; masters port 5353 { 192.0.2.30; ps2; }; };\n"
+                 "remote-servers ps port 5300 { 192.0.2.1; 192.0.2.2 port 5301 key k1; };\n"
+                 "masters ps2 { 192.0.2.40 port 5360; };", &cfg)) {
+        const zone_config_t *z = zone_in_view(&cfg, "__default__", "s.test");
+        const zone_ext_t *x = zext(z);
+        CHECK(x->masters_count == 3 && x->masters_parsed != NULL);
+        if (x->masters_count == 3) {
+            CHECK(strcmp(x->masters[0].ip, "192.0.2.1") == 0 && x->masters[0].port == 5300 && x->masters[0].list == NULL);
+            CHECK(x->masters[1].port == 5301 && x->masters[1].key && strcmp(x->masters[1].key, "k1") == 0);
+            CHECK(strcmp(x->masters[2].ip, "2001:db8::5") == 0 && x->masters[2].port == 5400);
+            CHECK_STR(zone_primary_key(x, 0), "k2");   /* no key of its own: the zone's tsig-key */
+            CHECK_STR(zone_primary_key(x, 1), "k1");   /* its own key wins */
+        }
+        x = zext(zone_in_view(&cfg, "__default__", "t.test"));
+        CHECK(x->masters_count == 2 && x->masters[0].port == 5353 && x->masters[1].port == 5360 && zone_primary_key(x, 0) == NULL);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("zone \"s.test\" { type slave; masters { 192.0.2.1; }; primaries { 192.0.2.2 port 5353; 192.0.2.3; }; };", &cfg)) {
+        const zone_ext_t *x = zext(zone_in_view(&cfg, "__default__", "s.test"));
+        CHECK(x->masters_count == 2 && strcmp(x->masters[0].ip, "192.0.2.2") == 0 && x->masters[0].port == 5353);   /* a later statement replaces */
+        free_server_config_fields(&cfg);
+    }
+    /* a prefix is accepted in masters (it is only used to decide who may send NOTIFY) and is not read as a list name */
+    if (parse_ok("zone \"s.test\" { type slave; masters { 192.0.2.100; 10.0.0.0/8; }; };", &cfg)) {
+        const zone_ext_t *x = zext(zone_in_view(&cfg, "__default__", "s.test"));
+        CHECK(x->masters_count == 2 && x->masters[1].ip && strcmp(x->masters[1].ip, "10.0.0.0/8") == 0 && x->masters_parsed != NULL);
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("prefix in also-notify is not an address", "options { also-notify { 10.0.0.0/8; }; };", "'10.0.0.0/8'");
+    expect_an_error("unknown primaries list", "zone \"s.test\" { type slave;\n primaries { nolist; }; };", "line 2|zone 's.test.' primaries|'nolist'");
+    expect_an_error("primaries key undefined", "zone \"s.test\" { type slave;\n masters { 192.0.2.1 key nokey; }; };", "line 2|key 'nokey' is not defined");
+    expect_an_error("primaries tls", "zone \"s.test\" { type slave; primaries { 192.0.2.1 tls t; }; };", "'tls' is not supported");
+    expect_an_error("primaries source", "zone \"s.test\" { type slave; primaries source 192.0.2.9 { 192.0.2.1; }; };", "'source' is not supported");
+    expect_an_error("primaries syntax", "zone \"s.test\" { type slave;\n primaries { 192.0.2.1 }; };", "line 2|zone 's.test.' primaries|expected ';'");
+    expect_an_error("primaries port on a name", "zone \"s.test\" { type slave; primaries { l port 5; }; }; remote-servers l { 192.0.2.1; };", "takes no port");
+    {
+        char err[200];
+        zone_ext_shared_t *sh = db_parse_quiet("masters port 5353 { 192.0.2.1; 192.0.2.2 port 5301; };", err, sizeof(err));
+        CHECK(sh != NULL);
+        if (sh) {
+            CHECK(sh->ext.masters_count == 2 && sh->ext.masters[0].port == 5353 && sh->ext.masters[1].port == 5301 && sh->ext.masters_parsed != NULL);
+            zone_ext_shared_unref(sh);
+        }
+        expect_db_reject("masters { 192.0.2.1 key k; };", "key");
+        expect_db_reject("primaries { somelist; };", "not an IP");
+        expect_db_reject("masters { 192.0.2.1 tls t; };", "masters");
+    }
+
+    /* notify */
+    if (parse_ok("options { notify no; };\n"
+                 "view \"v\" { match-clients { any; }; notify explicit;\n"
+                 "  zone \"a.test\" { type master; file \"a\"; };\n"
+                 "  zone \"b.test\" { type master; file \"b\"; notify master-only; };\n"
+                 "  zone \"c.test\" { type master; file \"c\"; notify yes; }; };\n"
+                 "view \"w\" { match-clients { 10.0.0.0/8; }; zone \"a.test\" { type master; file \"a\"; }; zone \"d.test\" { type master; file \"d\"; notify primary-only; }; };", &cfg)) {
+        CHECK(notify_mode_effective(&cfg, zone_in_view(&cfg, "v", "a.test"), "v") == NOTIFY_MODE_EXPLICIT);
+        CHECK(notify_mode_effective(&cfg, zone_in_view(&cfg, "v", "b.test"), "v") == NOTIFY_MODE_PRIMARY_ONLY);
+        CHECK(notify_mode_effective(&cfg, zone_in_view(&cfg, "v", "c.test"), "v") == NOTIFY_MODE_YES);
+        CHECK(notify_mode_effective(&cfg, zone_in_view(&cfg, "w", "a.test"), "w") == NOTIFY_MODE_NO);   /* options' */
+        CHECK(notify_mode_effective(&cfg, zone_in_view(&cfg, "w", "d.test"), "w") == NOTIFY_MODE_PRIMARY_ONLY);
+        CHECK(notify_mode_effective(&cfg, NULL, "v") == NOTIFY_MODE_EXPLICIT);                         /* a catalog member */
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("zone \"a.test\" { type master; file \"a\"; };", &cfg)) {
+        CHECK(notify_mode_effective(&cfg, zone_in_view(&cfg, "__default__", "a.test"), "__default__") == NOTIFY_MODE_YES);   /* the default */
+        free_server_config_fields(&cfg);
+    }
+    CHECK(notify_mode_effective(NULL, NULL, NULL) == NOTIFY_MODE_YES);
+    {
+        const char *vals[] = { "yes", "true", "1", "YES" };
+        for (int i = 0; i < 4; i++) {
+            char t[128];
+            snprintf(t, sizeof(t), "options { notify %s; };", vals[i]);
+            if (parse_ok(t, &cfg)) { CHECK(notify_mode_effective(&cfg, NULL, NULL) == NOTIFY_MODE_YES); free_server_config_fields(&cfg); }
+        }
+        const char *nos[] = { "no", "false", "0" };
+        for (int i = 0; i < 3; i++) {
+            char t[128];
+            snprintf(t, sizeof(t), "options { notify %s; };", nos[i]);
+            if (parse_ok(t, &cfg)) { CHECK(notify_mode_effective(&cfg, NULL, NULL) == NOTIFY_MODE_NO); free_server_config_fields(&cfg); }
+        }
+    }
+    expect_an_error("notify bad value", "options {\n notify maybe; };", "line 2|options notify|invalid value 'maybe'");
+    expect_an_error("notify in zone bad value", "zone \"a.test\" { type master; notify sometimes; };", "zone 'a.test.' notify|invalid value");
+    expect_an_error("notify in view bad value", "view \"v\" { notify x; };", "view 'v' notify");
+    expect_an_error("notify missing semicolon", "options { notify no };", "options notify|expected ';'");
+    expect_an_error("notify missing value", "options { notify; };", "expected yes, no, explicit or primary-only");
+    expect_db_reject("notify no;", "notify");
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
     test_defaults();
@@ -2475,6 +2773,8 @@ int main(void) {
     test_acl_ceiling_match_and_masters();
     test_refusals_and_limits();
     test_statements_need_a_semicolon();
+    test_also_notify_bind();
+    test_primaries_and_notify_mode();
 
     printf("[*] %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) {
