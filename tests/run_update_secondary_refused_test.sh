@@ -15,8 +15,8 @@ DAG="$ROOT/dag"
 [ -x "$DAG" ] || make -C "$ROOT" dag
 [ -x "$BIN" ] || make -C "$ROOT" karidns-asan
 
-PPORT=15471
-SPORT=15472
+PPORT=$(kari_port 0 15471)
+SPORT=$(kari_port 100 15472)
 KEY="hmac-sha256:upd-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y="
 W=$(mktemp -d "${TMPDIR:-/tmp}/karidns-updsec.XXXXXX")
 chmod 755 "$W" # readable after the privilege drop when run as root

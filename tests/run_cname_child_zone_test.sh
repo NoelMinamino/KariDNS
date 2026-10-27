@@ -22,7 +22,7 @@ BIN_DIR="${BIN_DIR:-$ROOT_DIR}"
 KARIDNS="$BIN_DIR/karidns"
 DAG="$BIN_DIR/dag"
 
-PORT=$((34000 + $$ % 3000))
+PORT=$(kari_port 0 $((34000 + $$ % 3000)))
 TMP_DIR="$(mktemp -d /tmp/cname_child_zone.XXXXXX)"
 chmod 755 "$TMP_DIR"
 SERVER_PID=""

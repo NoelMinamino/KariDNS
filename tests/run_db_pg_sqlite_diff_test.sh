@@ -19,6 +19,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
+. "$ROOT/tests/lib_proc.sh"
 
 LOADER=${LOADER:-$ROOT/karidns-dbloader}
 Z2S=$ROOT/tests/db/zone2sql
@@ -202,7 +203,7 @@ gen_queries() {   # gen_queries DB APEX: the query list on stdout
 
 compare() {   # compare A.out B.out: prints "total identical mismatch"; the first mismatches on stderr
     awk -F'\t' '
-        NR == FNR { k[FNR] = $1; s[FNR] = $2; next }
+        FILENAME == ARGV[1] { k[FNR] = $1; s[FNR] = $2; next }
         { total++
           if ($1 != k[FNR]) { bad++; if (bad <= 5) print "         query list mismatch at " FNR > "/dev/stderr"; next }
           if ($2 == s[FNR]) ident++
@@ -230,7 +231,7 @@ if [ $SERVERS -eq 1 ]; then
         install -o root -g wheel -m 755 "$LOADER" "$T/karidns-dbloader" 2>/dev/null || { cp "$LOADER" "$T/karidns-dbloader"; chown 0:0 "$T/karidns-dbloader"; chmod 755 "$T/karidns-dbloader"; }
     else SERVERS=0; echo "  (tests/db/dbquery.c does not compile: the servers are not started)"; fi
 fi
-BASE=$((20000 + $$ % 20000)); PA=$BASE; PB=$((BASE + 1))
+BASE=$(kari_port 0 $((20000 + $$ % 20000))); PA=$BASE; PB=$((BASE + 1))
 
 wait_log() {   # wait_log LOG PATTERN SECONDS
     i=0

@@ -3,6 +3,7 @@ set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$(dirname "$0")/lib_proc.sh"
+PORT=$(kari_port 0 10053)
 ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 DAG="$ROOT/dag"
@@ -34,7 +35,7 @@ EOF
 
 cat << EOF > "$CONF"
 options {
-    port 10053;
+    port ${PORT};
     bind-address { 127.0.0.1; };
     user "nobody";
     group "nobody";
@@ -45,7 +46,7 @@ zone "example.com" {
 };
 EOF
 
-echo "[*] Starting KariDNS on port 10053..."
+echo "[*] Starting KariDNS on port ${PORT}..."
 $BIN -f -c "$CONF" > "$DIR/server_glue.log" 2>&1 &
 SERVER_PID=$!
 
@@ -61,7 +62,7 @@ sleep 2
 
 # 1. Test MX Query (Additional section should contain mail.example.com A and AAAA)
 echo "[*] Querying MX example.com..."
-MX_OUT=$($DAG MX example.com @127.0.0.1 -p 10053)
+MX_OUT=$($DAG MX example.com @127.0.0.1 -p ${PORT})
 echo "$MX_OUT"
 
 if ! echo "$MX_OUT" | grep -q "mail.example.com.*192.0.2.10"; then
@@ -76,7 +77,7 @@ fi
 
 # 2. Test SRV Query (Additional section should contain sip.example.com A)
 echo "[*] Querying SRV _sip._tcp.example.com..."
-SRV_OUT=$($DAG SRV _sip._tcp.example.com @127.0.0.1 -p 10053)
+SRV_OUT=$($DAG SRV _sip._tcp.example.com @127.0.0.1 -p ${PORT})
 echo "$SRV_OUT"
 
 if ! echo "$SRV_OUT" | grep -q "sip.example.com.*192.0.2.20"; then
@@ -86,7 +87,7 @@ fi
 
 # 3. Test Out-of-bailiwick MX Query (Additional section should NOT contain otherdomain.net)
 echo "[*] Querying MX external.example.com (out-of-bailiwick)..."
-EXT_OUT=$($DAG MX external.example.com @127.0.0.1 -p 10053)
+EXT_OUT=$($DAG MX external.example.com @127.0.0.1 -p ${PORT})
 echo "$EXT_OUT"
 
 if echo "$EXT_OUT" | grep -i "otherdomain.net.*IN.*A"; then

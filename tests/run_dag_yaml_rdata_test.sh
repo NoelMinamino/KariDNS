@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # ==============================================================================
@@ -63,7 +64,7 @@ run_skip() {
 }
 
 ZONE_FILE="$ROOT_DIR/tests/zones/example.com.zone"
-PORT=$((15000 + $$ % 10000))
+PORT=$(kari_port 0 $((15000 + $$ % 10000)))
 CONF_FILE="/tmp/karidns_yaml_test_$$.conf"
 LOG_FILE="/tmp/karidns_yaml_test_$$.log"
 SERVER_PID=""

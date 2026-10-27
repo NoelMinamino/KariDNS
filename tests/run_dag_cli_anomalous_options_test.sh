@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # ==============================================================================
@@ -22,8 +23,8 @@ fi
 
 TMP_DIR="/tmp/karidns_dag_anom_test_$$"
 mkdir -p "$TMP_DIR"
-PORT=$((23000 + $$ % 8000))
-TCP_PORT=$((31000 + $$ % 8000))
+PORT=$(kari_port 0 $((23000 + $$ % 8000)))
+TCP_PORT=$(kari_port 100 $((31000 + $$ % 8000)))
 
 cleanup() {
     set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
@@ -181,7 +182,7 @@ PL_EOF
     echo "=== 3. Testing Transport Error Handling (Timeouts & ID Mismatch) ==="
     
     # 1. Non-responsive server timeout
-    DEAD_PORT=$((36000 + $$ % 5000))
+    DEAD_PORT=$(kari_port 200 $((36000 + $$ % 5000)))
     run_expect_fail "Timeout gracefully against non-responsive UDP server" @127.0.0.1 -p $DEAD_PORT example.com A +timeout=1 +tries=1
 
     # 2. Mock server sending TXID mismatch
@@ -205,7 +206,7 @@ while (1) {
 }
 PL_EOF
 
-    MISMATCH_PORT=$((38000 + $$ % 5000))
+    MISMATCH_PORT=$(kari_port 300 $((38000 + $$ % 5000)))
     perl "$TMP_DIR/mock_txid_mismatch_server.pl" "$MISMATCH_PORT" &
     SRV_PID=$!
     sleep 0.3

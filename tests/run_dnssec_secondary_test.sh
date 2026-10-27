@@ -42,10 +42,10 @@ done
 [ -x "$KARICTL" ] || make -C "$ROOT" karictl
 [ -x "$BIN" ] || make -C "$ROOT" karidns-asan
 
-PPORT=15511    # primary
-EPORT=15512    # secondary "ext"
-IPORT=15513    # secondary "ixfr"
-RPORT=15514    # relay to the primary
+PPORT=$(kari_port 0 15511)    # primary
+EPORT=$(kari_port 100 15512)    # secondary "ext"
+IPORT=$(kari_port 200 15513)    # secondary "ixfr"
+RPORT=$(kari_port 300 15514)    # relay to the primary
 ZONES="wn.test n3.test wo.test"
 W=$(mktemp -d "${TMPDIR:-/tmp}/karidns-dnssec2nd.XXXXXX")
 chmod 755 "$W" # readable after the privilege drop when run as root

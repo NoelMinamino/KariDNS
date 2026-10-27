@@ -11,7 +11,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$(dirname "$0")/lib_proc.sh"
 BIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEST_DIR="dag_ci_test_dir"
-PORT=53555
+PORT=$(kari_port 0 53555)
+# the ~35 sub-tests started below choose their own ports (no port window each)
+unset KARI_PORT_BASE
 
 CLIENT_ARG="${1:-dag}"
 if [ "$CLIENT_ARG" = "dig" ]; then
@@ -182,7 +184,7 @@ run_check "No question section (+noquestion)" "$DAG @127.0.0.1 -p $PORT www.exam
 run_check "No command header (+nocmd)" "$DAG @127.0.0.1 -p $PORT www.example.com A +nocmd" "192\.0\.2\.10"
 run_check "No stats section (+nostats)" "$DAG @127.0.0.1 -p $PORT www.example.com A +nostats" "192\.0\.2\.10"
 run_check "Combined +noall +answer" "$DAG @127.0.0.1 -p $PORT www.example.com A +noall +answer" "192\.0\.2\.10"
-run_check "Identify server (+identify)" "$DAG @127.0.0.1 -p $PORT www.example.com A +identify" "(127\.0\.0\.1#53555|from server 127\.0\.0\.1)"
+run_check "Identify server (+identify)" "$DAG @127.0.0.1 -p $PORT www.example.com A +identify" "(127\.0\.0\.1#$PORT|from server 127\.0\.0\.1)"
 run_check "Best effort parsing flag (+besteffort)" "$DAG @127.0.0.1 -p $PORT www.example.com A +besteffort" "192\.0\.2\.10"
 run_check "YAML formatted output (+yaml)" "$DAG @127.0.0.1 -p $PORT www.example.com A +yaml" "(answers:|answer:|name:|opcode:|message:)"
 if [ "$DAG" = "dig" ]; then

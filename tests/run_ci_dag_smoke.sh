@@ -4,11 +4,12 @@
 # resolvers (CLAUDE.md section 6), so the CI does not depend on the Internet.
 #
 # Usage: sh tests/run_ci_dag_smoke.sh          (DAG=./dag.exe on Windows, PORT=10553 by default)
+. "$(dirname "$0")/lib_proc.sh"
 set -u
 cd "$(dirname "$0")/.."
 
 DAG="${DAG:-./dag}"
-PORT="${PORT:-10553}"
+PORT="${PORT:-$(kari_port 0 10553)}"
 LOG="mock_ci_smoke.log"
 
 perl tests/mock_dns_server.pl --port "$PORT" > "$LOG" 2>&1 &

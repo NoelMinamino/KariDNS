@@ -3,6 +3,7 @@ set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$(dirname "$0")/lib_proc.sh"
+PORT=$(kari_port 0 10053)
 ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 DAG="$ROOT/dag"
@@ -35,7 +36,7 @@ EOF
 
 cat << EOF > "$CONF"
 options {
-    port 10053;
+    port ${PORT};
     bind-address { 127.0.0.1; };
     user "nobody";
     group "nobody";
@@ -46,7 +47,7 @@ zone "ttlclamp.test" {
 };
 EOF
 
-echo "[*] Starting KariDNS on port 10053..."
+echo "[*] Starting KariDNS on port ${PORT}..."
 $BIN -f -c "$CONF" > "$DIR/server_ttl_clamp.log" 2>&1 &
 SERVER_PID=$!
 
@@ -62,7 +63,7 @@ sleep 2
 
 # 1. Query record with purely numeric 4000000000 TTL (MUST be clamped to 2147483647 per RFC 2181 §8)
 echo "[*] Querying www.ttlclamp.test (pure numeric 4000000000 TTL)..."
-WWW_OUT=$($DAG www.ttlclamp.test A @127.0.0.1 -p 10053)
+WWW_OUT=$($DAG www.ttlclamp.test A @127.0.0.1 -p ${PORT})
 echo "$WWW_OUT"
 
 if ! echo "$WWW_OUT" | grep -q "www.ttlclamp.test.*2147483647.*IN.*A.*192.0.2.1"; then
@@ -72,7 +73,7 @@ fi
 
 # 2. Query record with unit-suffixed 46296d17m TTL (MUST also be clamped to 2147483647)
 echo "[*] Querying unit.ttlclamp.test (unit suffixed 46296d17m TTL)..."
-UNIT_OUT=$($DAG unit.ttlclamp.test A @127.0.0.1 -p 10053)
+UNIT_OUT=$($DAG unit.ttlclamp.test A @127.0.0.1 -p ${PORT})
 echo "$UNIT_OUT"
 
 if ! echo "$UNIT_OUT" | grep -q "unit.ttlclamp.test.*2147483647.*IN.*A.*192.0.2.2"; then
@@ -82,7 +83,7 @@ fi
 
 # 3. Query NXDOMAIN (negative caching TTL from SOA minimum MUST be clamped to 2147483647)
 echo "[*] Querying NXDOMAIN nonexist.ttlclamp.test..."
-NX_OUT=$($DAG nonexist.ttlclamp.test A @127.0.0.1 -p 10053)
+NX_OUT=$($DAG nonexist.ttlclamp.test A @127.0.0.1 -p ${PORT})
 echo "$NX_OUT"
 
 if ! echo "$NX_OUT" | grep -q "ttlclamp.test.*2147483647.*IN.*SOA"; then

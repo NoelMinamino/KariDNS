@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # ==============================================================================
@@ -35,7 +36,7 @@ if ! command -v perl >/dev/null 2>&1; then
 fi
 
 FAILED=0
-PORT1=$((36000 + $$ % 1500))
+PORT1=$(kari_port 0 $((36000 + $$ % 1500)))
 PORT2=$((PORT1 + 1))
 PORT3=$((PORT1 + 2))
 PORT4=$((PORT1 + 3))

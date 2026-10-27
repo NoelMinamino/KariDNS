@@ -11,6 +11,7 @@
 #
 # Needs root (the loader runs as nobody).  SKIP otherwise, and when karidns, karidns-dbloader (SQLite3 driver), the sqlite3 CLI or perl
 # (Time::HiRes) is missing.
+. "$(dirname "$0")/lib_proc.sh"
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
@@ -44,7 +45,7 @@ trap cleanup EXIT INT TERM
 PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
-PORT=$((20000 + $$ % 20000))
+PORT=$(kari_port 0 $((20000 + $$ % 20000)))
 now_ms() { perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1000'; }
 wait_log() {   # wait_log LOG PATTERN SECONDS [COUNT]
     i=0; want=${4:-1}

@@ -13,6 +13,7 @@
 #
 # [root] sections SKIP when the test is not run by root.  Needs karidns, karicheck, dag; the P1 section also needs
 # karidns-dbloader (as the file to copy).
+. "$(dirname "$0")/lib_proc.sh"
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
@@ -34,7 +35,7 @@ trap cleanup EXIT INT TERM
 PASS=0; FAILS=0
 ok() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 bad() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; [ -n "${2:-}" ] && printf '%s\n' "$2" | head -12 | sed 's/^/         /'; }
-BASEPORT=$((20000 + $$ % 20000))
+BASEPORT=$(kari_port 0 $((20000 + $$ % 20000)))
 RUN_USER=""
 [ $IS_ROOT = 1 ] && RUN_USER='user "nobody"; group "nobody";'
 [ $IS_ROOT = 1 ] && ! id nobody >/dev/null 2>&1 && { echo "SKIP: no user nobody"; exit 0; }
@@ -245,7 +246,7 @@ if [ $IS_ROOT = 1 ]; then
     cat > "$T/plug.sh" <<EOF
 #!/bin/sh
 env > "$T/pout/env"
-exec sleep 30
+exec sleep 30.$PORT
 EOF
     chmod 755 "$T/plug.sh"
     cat > "$T/prog.conf" <<EOF
@@ -262,7 +263,7 @@ EOF
         else ok "S-1: the plugin's environment is empty of the server's variables"; fi
     else bad "S-1: the plugin did not start" "$(cat "$T/s1.out")"; fi
     stop_karidns $KPID
-    pkill -u nobody -f "sleep 30" 2>/dev/null
+    pkill -u nobody -f "sleep 30.$PORT" 2>/dev/null
 else
     echo "  [SKIP] needs root"
 fi

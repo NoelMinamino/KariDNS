@@ -45,3 +45,33 @@ kari_conf_pids() {
 kari_kill_conf() {
     kari_kill_tree $(kari_conf_pids "$@")
 }
+
+# kari_port N [FALLBACK] : a TCP/UDP port for the test.
+# Under tests/run_all_suite.sh (KARI_PORT_BASE set) every test slot has a window
+# of 1000 ports: the result is KARI_PORT_BASE + N, N < 1000.  A test that needs
+# several ports (a neighbour, a secondary) takes them as offsets of its window,
+# and offsets used by one script must differ.  Run on its own the script keeps
+# what it used before: FALLBACK (its old fixed port or PID formula, evaluated by
+# the caller) or, without one, 20000 + PID % 20000 + N.
+kari_port() {
+    if [ -n "${KARI_PORT_BASE:-}" ]; then
+        echo $((KARI_PORT_BASE + $1))
+    else
+        echo "${2:-$((20000 + $$ % 20000 + $1))}"
+    fi
+}
+
+# kari_wait_answer DAG PORT NAME [SECONDS]: wait until the server on 127.0.0.1:PORT
+# answers NAME SOA, at most SECONDS (default 15).  For a test that starts karidns
+# and queries it at once: a fixed sleep is too short when the host is busy (tests
+# run in parallel under tests/run_all_suite.sh).
+kari_wait_answer() {
+    _kw_i=0
+    while [ "${_kw_i}" -lt $(( ${4:-15} * 5 )) ]; do
+        # the exit status, not the output: dag prints "no servers could be reached" too (exit 9, as dig)
+        "$1" @127.0.0.1 -p "$2" "$3" SOA +short +nohexdump +time=1 +tries=1 >/dev/null 2>&1 && return 0
+        sleep 0.2
+        _kw_i=$((_kw_i + 1))
+    done
+    return 1
+}

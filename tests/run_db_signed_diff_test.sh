@@ -22,6 +22,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
+. "$ROOT/tests/lib_proc.sh"
 
 if [ "$(id -u)" != "0" ]; then echo "SKIP: needs root (the loader runs as another user)"; exit 0; fi
 KARIDNS=${KARIDNS:-./karidns}
@@ -58,7 +59,7 @@ trap cleanup EXIT INT TERM
 PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
-BASE=$((20000 + $$ % 20000))
+BASE=$(kari_port 0 $((20000 + $$ % 20000)))
 PA=$BASE
 PB=$((BASE + 1))
 PC=$((BASE + 2))
@@ -227,7 +228,7 @@ gen_queries() {   # gen_queries APEX: the query list on stdout
 # its database copy answer the same bytes.
 compare() {
     awk -F'\t' '
-        NR == FNR { k[FNR] = $1; s[FNR] = $2; next }
+        FILENAME == ARGV[1] { k[FNR] = $1; s[FNR] = $2; next }
         { total++
           if ($1 != k[FNR]) { bad++; if (bad <= 5) print "         query list mismatch at " FNR > "/dev/stderr"; next }
           if ($2 == "TIMEOUT" || s[FNR] == "TIMEOUT") { bad++; if (bad <= 5) print "         timeout: " $1 > "/dev/stderr"; next }

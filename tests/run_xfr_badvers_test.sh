@@ -22,7 +22,7 @@ KARIDNS="$BIN_DIR/karidns"
 DAG="$BIN_DIR/dag"
 TQ="perl $SCRIPT_DIR/tsig_query.pl"
 
-PORT=$((37000 + $$ % 3000))
+PORT=$(kari_port 0 $((37000 + $$ % 3000)))
 TMP_DIR="$(mktemp -d /tmp/xfr_badvers.XXXXXX)"
 chmod 755 "$TMP_DIR"
 SERVER_PID=""

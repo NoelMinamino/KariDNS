@@ -51,7 +51,7 @@ check() {   # check DESCRIPTION EXPECTED ACTUAL
     if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (got '$3', want '$2')"; fi
 }
 
-BASE=$((20000 + $$ % 20000))
+BASE=$(kari_port 0 $((20000 + $$ % 20000)))
 P_DEF=$BASE; P_EXP=$((BASE + 1)); P_UP=$((BASE + 2)); P_PDEF=$((BASE + 3)); P_PEXP=$((BASE + 4)); P_SEC=$((BASE + 5)); P_SEC2=$((BASE + 6)); P_DB=$((BASE + 7))
 USER_OPT=""
 [ "$(id -u)" = "0" ] && USER_OPT='user "nobody"; group "nobody";'

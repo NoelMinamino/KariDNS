@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # Test: UDP transaction ID mismatch packet discard and retry per RFC 5452 §9.2
@@ -28,7 +29,7 @@ else
     fi
 fi
 
-PORT_ID_TEST=53591
+PORT_ID_TEST=$(kari_port 0 53591)
 
 echo "Running: test_dag_udp_id_mismatch_discard ($DAG)"
 

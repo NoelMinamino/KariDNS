@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # ==============================================================================
@@ -37,7 +38,7 @@ if ! command -v perl >/dev/null 2>&1; then
 fi
 
 FAILED=0
-PORT=$((23000 + $$ % 10000))
+PORT=$(kari_port 0 $((23000 + $$ % 10000)))
 TMP_DIR="/tmp/dag_audit_test_$$"
 rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR"

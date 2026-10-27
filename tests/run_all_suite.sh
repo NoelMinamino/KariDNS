@@ -19,7 +19,11 @@
 #                           `make coverage` to skip ASan/TSan-only suites).
 #   -q, --quick             Run fast unit and core tests only.
 #   -x, --stop-on-failure   Abort immediately upon first test failure.
-#   -v, --verbose           Print verbose real-time test output.
+#   -j, --jobs <N>          Run N tests at a time (default: $KARI_JOBS, else the
+#                           number of CPUs; -j 1 runs one test at a time in
+#                           registration order). Tests registered "group:NAME" run one at a
+#                           time next to the others, "serial" ones alone, after the batch. See tests/TEST_MATRIX.md.
+#   -v, --verbose           Print verbose real-time test output (implies -j 1).
 #   -l, --list              List all registered test cases with categories.
 #   -h, --help              Show this help message.
 # ==============================================================================
@@ -66,6 +70,7 @@ VERBOSE=0
 QUICK_MODE=0
 LIST_ONLY=0
 SKIP_DAG=0
+JOBS=""
 
 # Ensure LLVM_PROFILE_FILE is an absolute path so sub-scripts that change directory still write profdata
 if [ -n "${LLVM_PROFILE_FILE:-}" ]; then
@@ -124,6 +129,16 @@ while [ $# -gt 0 ]; do
         -v|--verbose)
             VERBOSE=1
             ;;
+        -j|--jobs)
+            shift
+            [ $# -gt 0 ] && JOBS="$1"
+            ;;
+        -j[0-9]*)
+            JOBS="${1#-j}"
+            ;;
+        --jobs=*)
+            JOBS="${1#*=}"
+            ;;
         -l|--list)
             LIST_ONLY=1
             ;;
@@ -143,7 +158,10 @@ while [ $# -gt 0 ]; do
             echo "  -e, --exclude <list>    Skip tests whose name contains any comma-separated substring"
             echo "  -q, --quick             Run quick unit and core tests only"
             echo "  -x, --stop-on-failure   Stop on first test failure"
-            echo "  -v, --verbose           Print verbose output during execution"
+            echo "  -j, --jobs <N>          Run N tests at a time (default: \$KARI_JOBS, else the CPU count;"
+            echo "                          -j 1 = one at a time, in registration order). 'serial' tests"
+            echo "                          run alone after the parallel batch."
+            echo "  -v, --verbose           Print verbose output during execution (implies -j 1)"
             echo "  -l, --list              List all available tests and exit"
             echo "  -h, --help              Show this help message"
             exit 0
@@ -156,6 +174,28 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+# Parallel execution.  Every test runs in a "slot"; at most JOBS slots are busy
+# at a time.  A test gets its own port window and temporary directory:
+#   KARI_SLOT       slot number, 0 .. JOBS-1
+#   KARI_PORT_BASE  KARI_PORT_BASE_MIN + slot * 1000 (tests take ports from it
+#                   with kari_port N, tests/lib_proc.sh, N < 1000)
+#   KARI_TMP        a per-slot directory, emptied before each test
+# Each test also runs in a session of its own (perl setsid), so the end of a
+# test kills only the processes of that test.  The by-name cleanup below
+# (cleanup_stale_processes) runs only when nothing else is running: at the
+# start, at the end, around serial tests and, with -j 1, between all tests.
+KARI_PORT_BASE_MIN=20000
+KARI_PORT_SLOT_SPAN=1000
+# 20000 + 29 * 1000 + 999 = 48999, below the ephemeral port range (49152 ..)
+KARI_MAX_JOBS=29
+
+detect_ncpu() {
+    _n=$(sysctl -n hw.ncpu 2>/dev/null) || _n=""
+    case "${_n}" in ''|*[!0-9]*) _n=$(nproc 2>/dev/null) || _n="" ;; esac
+    case "${_n}" in ''|*[!0-9]*|0) _n=1 ;; esac
+    echo "${_n}"
+}
 
 # cleanup_stale_processes() stops only the karidns servers that the tests of
 # THIS suite run started (tests/lib_proc.sh: never an unscoped pkill).  It used
@@ -177,7 +217,8 @@ suite_karidns_pids() {
     done
 }
 
-# Environment cleanup helper
+# Environment cleanup helper.  By name, host wide: call it only while no test
+# of this run is running (see above).
 cleanup_stale_processes() {
     # 1. Kill stale background servers / mocks gracefully with TERM, then KILL
     _stale=$(suite_karidns_pids)
@@ -195,13 +236,41 @@ cleanup_stale_processes() {
     pkill -9 -f "mock_dnstap_receiver.pl" 2>/dev/null || true
     pkill -9 -f "mock_dns_server.pl" 2>/dev/null || true
     pkill -9 -f "rr_differential_test.pl" 2>/dev/null || true
-    
+
     # 2. Cleanup temporary sockets and test pipes
     rm -f /tmp/karidns*.sock /tmp/dnstap*.sock /tmp/karidns_test_*.pipe 2>/dev/null || true
     rm -f tests/*.tmp tests/zones/*.tmp /tmp/karictl*.sock 2>/dev/null || true
-    
+
     # Small pause to allow kernel socket release
     sleep 0.05 2>/dev/null || true
+}
+
+# kill_group PGID: TERM, then KILL, every process of the session a test ran in.
+kill_group() {
+    kill -TERM -- "-$1" 2>/dev/null || return 0
+    sleep 0.1 2>/dev/null || true
+    kill -KILL -- "-$1" 2>/dev/null || true
+    return 0
+}
+
+# kill_job_leftovers JOBID: servers and mock servers that carry KARI_JOB_ID=JOBID
+# in their environment and escaped the process group of the test (a server that
+# daemonizes calls setsid).  A leftover would keep its port (SO_REUSEPORT) and
+# answer the next test of the slot with stale data.
+kill_job_leftovers() {
+    for _lp in $(pgrep -x "$KARIDNS_PROC_RE" 2>/dev/null) $(pgrep -f 'mock_(server|anomalous_dns_server|dnstap_receiver|dns_server)\.pl' 2>/dev/null); do
+        case "$(ps -e -ww -o command= -p "${_lp}" 2>/dev/null)" in
+            *" KARI_JOB_ID=$1"|*" KARI_JOB_ID=$1 "*) kill -9 "${_lp}" 2>/dev/null || true ;;
+        esac
+    done
+    return 0
+}
+
+# reset_slot_tmp SLOT: an empty, world-searchable KARI_TMP for the slot (the
+# servers drop privileges and still have to reach the files of the test).
+reset_slot_tmp() {
+    rm -rf "${SUITE_TMP}/s$1" 2>/dev/null || true
+    mkdir -p "${SUITE_TMP}/s$1" && chmod 755 "${SUITE_TMP}/s$1"
 }
 
 # Array-like test registration
@@ -209,14 +278,21 @@ TEST_COUNT=0
 REGISTERED_TESTS=""
 
 register_test() {
-    # $1: Category, $2: ExecType (bin|sh), $3: Command/Path, $4: Description
+    # $1: Category, $2: ExecType (bin|sh), $3: Command/Path, $4: Description,
+    # $5: optional "par" (default), "group:NAME" or "serial".  Tests of one group
+    # run one at a time but next to the par tests (they share a resource: the
+    # loopback aliases, one PostgreSQL server, tests/karidns-test.conf).  "serial"
+    # tests run one by one, alone on the host, after the parallel batch: stress,
+    # performance, sanitizer and fuzz jobs and tests that edit shared files.
     _cat="$1"
     _type="$2"
     _cmd="$3"
     _desc="$4"
-    
+    _mode="${5:-par}"
+    case "${_mode}" in par|serial|group:[A-Za-z0-9_]*) ;; *) echo "register_test: bad mode '${_mode}' for ${_cmd}" >&2; exit 1 ;; esac
+
     TEST_COUNT=$((TEST_COUNT + 1))
-    REGISTERED_TESTS="${REGISTERED_TESTS}${_cat}|${_type}|${_cmd}|${_desc}\n"
+    REGISTERED_TESTS="${REGISTERED_TESTS}${_cat}|${_type}|${_cmd}|${_mode}|${_desc}\n"
 }
 
 # ==============================================================================
@@ -230,7 +306,7 @@ register_test "unit" "bin" "test_coverage_sweep" "Coverage sweeps: engine matrix
 register_test "unit" "bin" "test_coverage_sweep_dag" "dag coverage sweeps: every option token, print_response display matrix, dns64/SVCB corner cases"
 register_test "unit" "bin" "test_coverage_sweep_net" "dag network sweeps: UDP/TCP/DoT/DoH fake server, trace/nssearch, AXFR/IXFR, UPDATE, SIG(0) keys, --replay pcap/dnstap"
 register_test "unit" "bin" "test_coverage_sweep_tools" "karicheck lint-rule sweep and karictl control-socket protocol sweep"
-register_test "unit" "bin" "test_db_pgsql" "PostgreSQL driver of karidns-dbloader: conninfo-file checks, schema versions, rows, cursors, change log cursor with interleaved transactions, LISTEN, v1 to v2 migration (B10; SKIP without libpq or a PostgreSQL server)"
+register_test "unit" "bin" "test_db_pgsql" "PostgreSQL driver of karidns-dbloader: conninfo-file checks, schema versions, rows, cursors, change log cursor with interleaved transactions, LISTEN, v1 to v2 migration (B10; SKIP without libpq or a PostgreSQL server)" "group:pg"   # one PostgreSQL server (roles, databases): one at a time
 register_test "unit" "bin" "test_db_sqlite3" "SQLite3 driver of karidns-dbloader and the loader itself (karidns_dbloader.c is included): rows, scans, snapshots, change log, poll_version, dump; B11: failed_zones (escaping, caps), reload request batches, server-id, the AUTO_STATUS entry (B10 / B11; SKIP without the SQLite3 driver)"
 register_test "unit" "bin" "test_db_stream" "KDB1 loader/Backend stream: encoder, framer, decoder and state machine of all message types, one test per rejection rule, byte-at-a-time feeding"
 register_test "unit" "bin" "test_db_registry" "DB zone registry: zone install from AXFR-format messages and its rejection rules, registry commit / delete, shadowing, concurrent readers"
@@ -274,19 +350,19 @@ register_test "unit" "bin" "test_fi_misc" "Fault Injection: Dynamic update, cata
 register_test "unit" "bin" "test_fi_dag" "Fault Injection: dag client query packet build and YAML formatting sweeps"
 
 # 2. Zone Transfer / Redundancy (AXFR / IXFR)
-register_test "xfr" "sh" "tests/run_capsicum_axfr_test.sh" "Capsicum sandbox capability mode AXFR"
-register_test "xfr" "sh" "tests/run_ixfr_roundtrip_test.sh" "RFC 1995 IXFR incremental diff roundtrip"
+register_test "xfr" "sh" "tests/run_capsicum_axfr_test.sh" "Capsicum sandbox capability mode AXFR" "serial"   # edits tests/zones/example.com.zone (read by other tests) and uses tests/karidns-test.conf
+register_test "xfr" "sh" "tests/run_ixfr_roundtrip_test.sh" "RFC 1995 IXFR incremental diff roundtrip" "serial"   # edits tests/zones/example.com.zone (read by other tests) and uses tests/karidns-test.conf
 register_test "xfr" "sh" "tests/run_xfr_out_of_zone_test.sh" "Out-of-zone records ignored by loader/karicheck; KariDNS primary -> secondary transfer (R-27)"
 register_test "xfr" "sh" "tests/run_xfr_notify_test.sh" "Outbound NOTIFY retransmission/TSIG/reload, transfer client checks and IXFR->AXFR fallback, IXFR serials, OPT in AXFR, retransfer, catalog group change, IXFR between KariDNS servers (R-15, R-16, R-17, D-09, R-19, R-21, R-28, O-06, X-19, X-24)"
 register_test "core" "sh" "tests/run_zone_file_compat_test.sh" "BIND-compatible zone files: case-insensitive mnemonics, CLASSnn/HS, omitted TTL, relative ORIGIN, GENERATE for any type, SINK/ATMA/IPSECKEY gateway 0, tinydns with more than 256 zones (R-22, D-18, D-08, O-11)"
 register_test "xfr" "sh" "tests/run_dnssec_secondary_test.sh" "DNSSEC data on KariDNS secondaries: DO=1 answers equal to the primary after Extended AXFR, AXFR and IXFR (R-33; SKIP without dnssec-signzone)"
 register_test "xfr" "sh" "tests/run_extended_axfr_test.sh" "KariDNS Extended AXFR (Option 65153)"
-register_test "xfr" "sh" "tests/run_ext_axfr_v3_test.sh" "B8t-2: Extended AXFR v3: the SOA set (several / restricted apex SOA RRs) and the zone settings of the primary travel to a KariDNS secondary; v2 interop, a standard AXFR primary, the secondary's own statements win, primary-settings no, a missing TSIG key fails closed, refresh of a secondary outside every SOA location, RRset TTL rule (loopback aliases when root)"
+register_test "xfr" "sh" "tests/run_ext_axfr_v3_test.sh" "B8t-2: Extended AXFR v3: the SOA set (several / restricted apex SOA RRs) and the zone settings of the primary travel to a KariDNS secondary; v2 interop, a standard AXFR primary, the secondary's own statements win, primary-settings no, a missing TSIG key fails closed, refresh of a secondary outside every SOA location, RRset TTL rule (loopback aliases when root)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "xfr" "sh" "tests/run_axfr_multikey_tsig_test.sh" "Multi-key TSIG authentication in AXFR"
 register_test "xfr" "sh" "tests/run_tsig_error_matrix_test.sh" "RFC 8945 TSIG errors and authorization for UPDATE/AXFR/NOTIFY/QUERY (R-07, R-08, R-10, R-30, D-03)"
-register_test "xfr" "sh" "tests/run_udp_ixfr_test.sh" "RFC 1995 IXFR single-UDP packet transfer"
+register_test "xfr" "sh" "tests/run_udp_ixfr_test.sh" "RFC 1995 IXFR single-UDP packet transfer" "group:defctl"   # default control socket (control-channel without socket or port) and tests/karidns-test.conf (port 10053): one at a time
 register_test "xfr" "sh" "tests/run_zone_type_secondary_test.sh" "Secondary zone AXFR, REFRESH, EXPIRE (SERVFAIL + EDE 24, serve-stale EDE 3)"
-register_test "xfr" "sh" "tests/run_edns_expire_test.sh" "RFC 7314 EDNS EXPIRE option (primary, secondary, chained secondaries)"
+register_test "xfr" "sh" "tests/run_edns_expire_test.sh" "RFC 7314 EDNS EXPIRE option (primary, secondary, chained secondaries)" "serial"   # real-time 20 s EXPIRE with 1 s retry: secondary AXFR connect failures under load at -j 4, passes alone
 
 # 3. DNSSEC & Message Digests
 register_test "dnssec" "sh" "tests/run_zonemd_val_test.sh" "RFC 8976 ZONEMD verification against test vectors"
@@ -296,39 +372,39 @@ register_test "dnssec" "sh" "tests/run_dnssec_answer_sections_test.sh" "DNSSEC a
 register_test "dnssec" "sh" "tests/run_nsec3_owner_query_test.sh" "RFC 5155 7.2.8 queries for NSEC3 owner names: NXDOMAIN with the NSEC3 proof for every QTYPE (UDP/TCP, MQTYPE, minimal-any), apex wildcard answers them as BIND does, RCODE/Answer equal to named, AXFR keeps the NSEC3 RRs (SKIP without dnssec-signzone)"
 
 # 4. Dynamic Update (RFC 2136)
-register_test "update" "sh" "tests/run_dynamic_update_test.sh" "RFC 2136 Prerequisites & Update Section handling"
+register_test "update" "sh" "tests/run_dynamic_update_test.sh" "RFC 2136 Prerequisites & Update Section handling" "group:defctl"   # default control socket (control-channel without socket or port) and tests/karidns-test.conf (port 10053): one at a time
 register_test "update" "sh" "tests/run_update_secondary_refused_test.sh" "RFC 2136 §3.1 UPDATE to a secondary refused, NOTAUTH for unserved zones"
 register_test "update" "sh" "tests/run_rdata_canonical_test.sh" "RFC 2136 §1.1 canonical RDATA comparison, RDATA name case, WKS port names, unencodable records (X-16, X-25, X-32, X-37, X-38)"
-register_test "update" "sh" "tests/run_ttl_harmonization_update_test.sh" "TTL harmonization on dynamic updates"
+register_test "update" "sh" "tests/run_ttl_harmonization_update_test.sh" "TTL harmonization on dynamic updates" "group:defctl"   # default control socket (control-channel without socket or port) and tests/karidns-test.conf (port 10053): one at a time
 
 # 5. EDNS / Cookies / ECS / Multi-QTYPE
-register_test "edns" "sh" "tests/run_bind_ecs_subnet_test.sh" "RFC 7871 \$ECS-SUBNET tag split-horizon routing"
-register_test "edns" "sh" "tests/run_mqtype_qdcount0_test.sh" "RFC 10029 Multi-QTYPE & RFC 9619 QDCOUNT=0"
+register_test "edns" "sh" "tests/run_bind_ecs_subnet_test.sh" "RFC 7871 \$ECS-SUBNET tag split-horizon routing" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
+register_test "edns" "sh" "tests/run_mqtype_qdcount0_test.sh" "RFC 10029 Multi-QTYPE & RFC 9619 QDCOUNT=0" "group:defctl"   # default control socket (control-channel without socket or port) and tests/karidns-test.conf (port 10053): one at a time
 register_test "edns" "sh" "tests/run_response_header_test.sh" "RFC 1035 §4.1.1 / RFC 6891 §7 response header bits and error responses (R-05, R-06, R-12, R-13, R-18)"
 
 # 6. Response Rate Limiting (RRL) & Anti-DoS
 register_test "rrl" "sh" "tests/run_rrl_window_test.sh" "RRL sliding window rate limit & SLIP truncated responses"
-register_test "rrl" "sh" "tests/run_query_log_rate_limit_test.sh" "Query log ring buffer rate limiting"
-register_test "rrl" "sh" "tests/run_glue_truncation_test.sh" "Additional section glue truncation & TC bit"
+register_test "rrl" "sh" "tests/run_query_log_rate_limit_test.sh" "Query log ring buffer rate limiting" "serial"   # fixed ports 10055/10056 and fixed log files in /tmp, qps timing
+register_test "rrl" "sh" "tests/run_glue_truncation_test.sh" "Additional section glue truncation & TC bit" "group:defctl"   # default control socket (control-channel without socket or port) and tests/karidns-test.conf (port 10053): one at a time
 
 # 7. Catalog Zones (RFC 9432)
-register_test "catalog" "sh" "tests/run_catalog_zone_test.sh" "RFC 9432 Catalog Zone member provisioning"
+register_test "catalog" "sh" "tests/run_catalog_zone_test.sh" "RFC 9432 Catalog Zone member provisioning" "serial"   # failed 2 of 6 runs at -j 4, passes alone (karictl reload checked right after the command); default control socket
 register_test "catalog" "sh" "tests/run_cve_coo_test.sh" "RFC 9432 CoO tracking under allocation failure"
 
 # 8. DNSTAP Telemetry Logging
 register_test "dnstap" "sh" "tests/run_dnstap_capture_test.sh" "DNSTAP frame streams capture verification"
-register_test "core" "sh" "tests/run_server_core_matrix_test.sh" "Server runtime matrix: dual-stack wildcard, IPv6 NOTIFY, TCP misuse, RRL/TC, log rotation, control errors, daemon/CLI, primary+secondary"
-register_test "core" "sh" "tests/run_server_core_fi_test.sh" "Server fault injection: startup/runtime syscall failures via LD_PRELOAD shim (no crash allowed)"
+register_test "core" "sh" "tests/run_server_core_matrix_test.sh" "Server runtime matrix: dual-stack wildcard, IPv6 NOTIFY, TCP misuse, RRL/TC, log rotation, control errors, daemon/CLI, primary+secondary" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
+register_test "core" "sh" "tests/run_server_core_fi_test.sh" "Server fault injection: startup/runtime syscall failures via LD_PRELOAD shim (no crash allowed)" "serial"   # stress, perf, sanitizer, fuzz or its own parallelism
 
 # 9. tinydns Format & Location
-register_test "tinydns" "sh" "tests/run_tinydns_location_test.sh" "tinydns %location split-horizon resolution"
+register_test "tinydns" "sh" "tests/run_tinydns_location_test.sh" "tinydns %location split-horizon resolution" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "tinydns" "sh" "tests/run_tinydns_timestamp_test.sh" "tinydns TTL countdown & TTD expiration"
-register_test "tinydns" "sh" "tests/run_tinydns_soa_location_test.sh" "B8t-1: several / restricted apex SOA records (tinydns Z lines per location, \-tagged SOA): first visible SOA, RFC 2308 negative answers, REFUSED + EDE 18 for a client that sees none, standard AXFR = requester's view, serial rule, optional djbdns oracle"
+register_test "tinydns" "sh" "tests/run_tinydns_soa_location_test.sh" "B8t-1: several / restricted apex SOA records (tinydns Z lines per location, \-tagged SOA): first visible SOA, RFC 2308 negative answers, REFUSED + EDE 18 for a client that sees none, standard AXFR = requester's view, serial rule, optional djbdns oracle" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 
 # 10. Server Core & Resolution
 register_test "core" "sh" "tests/run_paren_check_test.sh" "Zone file multi-line parentheses tokenizer"
 register_test "core" "sh" "tests/run_ttl_suffix_test.sh" "TTL time unit suffixes (s, m, h, d, w)"
-register_test "core" "sh" "tests/run_roundtrip_test.sh" "Zone parser to wire serialization roundtrip"
+register_test "core" "sh" "tests/run_roundtrip_test.sh" "Zone parser to wire serialization roundtrip" "group:defctl"   # default control socket (control-channel without socket or port) and tests/karidns-test.conf (port 10053): one at a time
 register_test "core" "sh" "tests/run_karicheck_glue_test.sh" "karicheck in-bailiwick glue record verification"
 register_test "core" "sh" "tests/run_karicheck_semantic_lint_test.sh" "karicheck RFC semantic linter checks"
 register_test "core" "sh" "tests/run_karicheck_matrix_test.sh" "karicheck diagnostic matrix: RDATA/DNSSEC/structure/tinydns/catalog/config lint, exit status contract"
@@ -341,7 +417,7 @@ register_test "core" "sh" "tests/run_multi_instance_test.sh" "Multi-instance iso
 register_test "core" "sh" "tests/run_forward_zone_test.sh" "RFC 5452 Forward zone upstream resolution & failover"
 register_test "core" "sh" "tests/run_program_zone_test.sh" "Dynamic backend records via program zone plugin"
 register_test "core" "sh" "tests/run_karictl_observatory_test.sh" "karictl observatory IPC metrics query"
-register_test "core" "sh" "tests/run_karictl_reload_reconfig_test.sh" "karictl reload & dynamic reconfig IPC"
+register_test "core" "sh" "tests/run_karictl_reload_reconfig_test.sh" "karictl reload & dynamic reconfig IPC" "serial"   # failed 3 of 6 runs at -j 4, passes alone (reload/reconfig result checked right after the command)
 register_test "core" "sh" "tests/run_karictl_reload_failure_test.sh" "karictl reload/reconfig report failures (exit 3), restart-only settings, status values and time format (D-13, O-05, O-09, D-12, T-11)"
 register_test "core" "sh" "tests/run_signal_all_processes_test.sh" "SIGHUP/SIGUSR1/SIGUSR2/SIGPIPE to every karidns process: nothing dies, the server reloads and keeps answering"
 register_test "core" "sh" "tests/run_config_acl_bool_test.sh" "named.conf booleans, category lists, zone type case, named acl statements (D-01, D-02, D-22, D-23)"
@@ -350,26 +426,26 @@ register_test "core" "sh" "tests/run_log_rotation_timestamp_test.sh" "suffix tim
 register_test "core" "sh" "tests/run_tcp_timeouts_test.sh" "TCP first-message and idle timeouts, partial messages do not extend them (D-06, R-24)"
 register_test "core" "sh" "tests/run_forward_failover_test.sh" "Forward zones share forward-timeout between forwarders, mismatched replies ignored (D-20)"
 register_test "core" "sh" "tests/run_dnstap_lifecycle_test.sh" "dnstap query_zone, reconnect through the broker, STOP/FINISH at shutdown (O-03)"
-register_test "core" "sh" "tests/run_rrl_bind_keys_test.sh" "RRL keyed like BIND: name, zone for NXDOMAIN, wildcard, client prefix length (D-05)"
+register_test "core" "sh" "tests/run_rrl_bind_keys_test.sh" "RRL keyed like BIND: name, zone for NXDOMAIN, wildcard, client prefix length (D-05)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "core" "sh" "tests/run_capsicum_enosys_test.sh" "cap_enter ENOSYS logged, failing backend start-up ends cleanly (O-02, O-15)"
 register_test "core" "sh" "tests/run_tinydns_reload_test.sh" "karictl reload of a tinydns zone inside the sandbox, SOA serial from the file mtime (X-13)"
 register_test "core" "sh" "tests/run_cname_child_zone_test.sh" "CNAME/DNAME into a child zone on the same server answered from the child (X-27)"
 register_test "core" "sh" "tests/run_xfr_badvers_test.sh" "AXFR/IXFR with an unsupported EDNS version get BADVERS, signed when the TSIG is valid (X-28)"
 register_test "core" "sh" "tests/run_compressed_qname_test.sh" "Compression pointer in the question name -> FORMERR (X-15)"
 register_test "core" "sh" "tests/run_rrl_slip_tsig_test.sh" "RRL slip answers to TSIG-signed queries are signed (X-20)"
-register_test "core" "sh" "tests/run_view_same_zone_test.sh" "Same zone name in two views: data, glue and program plugin per view (R-26, O-12)"
+register_test "core" "sh" "tests/run_view_same_zone_test.sh" "Same zone name in two views: data, glue and program plugin per view (R-26, O-12)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "core" "sh" "tests/run_name_escape_test.sh" "Owner names with master-file escapes: BIND/tinydns zones, AXFR, NSEC3 hashes (R-29, R-23, O-08)"
 register_test "core" "sh" "tests/run_config_duplicate_rejection_test.sh" "Duplicate view/zone rejection in config parser"
 register_test "core" "sh" "tests/run_domain_length_rfc1035_test.sh" "RFC 1035 255-byte domain & 63-byte label limits"
 register_test "core" "sh" "tests/run_logging_channel_validation_test.sh" "Syslog & file logging channels configuration"
 register_test "core" "sh" "tests/run_mx_srv_glue_test.sh" "MX & SRV target additional glue inclusion"
-register_test "core" "sh" "tests/run_notify_source_test.sh" "RFC 1996 notify-source address binding"
+register_test "core" "sh" "tests/run_notify_source_test.sh" "RFC 1996 notify-source address binding" "serial"   # fixed ports 10053/10054 and the default control socket
 register_test "core" "sh" "tests/run_privilege_drop_root_test.sh" "FreeBSD setuid/setgid privilege drop"
 register_test "core" "sh" "tests/run_nonroot_startup_test.sh" "Non-root startup & fail-closed port/log/pid/control checks"
 register_test "core" "sh" "tests/run_response_cache_test.sh" "Response cache hit/miss functional verification"
-register_test "core" "sh" "tests/run_ttl_harmonization_test.sh" "RRset TTL harmonization on zone load"
+register_test "core" "sh" "tests/run_ttl_harmonization_test.sh" "RRset TTL harmonization on zone load" "group:defctl"   # default control socket (control-channel without socket or port) and tests/karidns-test.conf (port 10053): one at a time
 register_test "core" "sh" "tests/run_ttl_rfc2181_clamp_test.sh" "TTL high bit clamped to 2147483647 (RFC 8767 §4, O-14)"
-register_test "core" "sh" "tests/run_zone_oom_partial_load_test.sh" "OOM fail-closed zone loading rollback"
+register_test "core" "sh" "tests/run_zone_oom_partial_load_test.sh" "OOM fail-closed zone loading rollback" "serial"   # failed 2 of 6 runs at -j 4, passes alone (reload after fault injection checked right after the command)
 register_test "core" "sh" "tests/run_coverage_merge_test.sh" "Coverage report tolerates corrupt raw profiles (SIGKILL during profile write)"
 register_test "core" "sh" "tests/run_malformed_detection_default_test.sh" "Structural malformation detection in default mode (RFC 1035 §4.1.1)"
 register_test "core" "sh" "tests/run_matrix_queries_test.sh" "Table-driven Query Engine Matrix: Wildcard, DNAME, Delegation & NSEC proofs"
@@ -388,46 +464,46 @@ register_test "core" "sh" "tests/run_db_file_diff_test.sh" "GATE file vs DB = 0:
 register_test "core" "sh" "tests/run_db_signed_diff_test.sh" "GATE file vs DB = 0 for signed zones: NSEC, NSEC3 (salt), NSEC3 without salt and NSEC3 Opt-Out zones signed with dnssec-signzone answer the same from the signed file and from SQLite3 in the PowerDNS presigned layout (NSEC3 / NSEC chain rebuilt by the loader), DO=1 included; NSEC3 owner name queries; AXFR equal, dnssec-verify of the AXFR from the DB server and from a file-free secondary of it (beta B5, B7b; root only, SKIP without dnssec-signzone)"
 register_test "core" "sh" "tests/run_rdata_name_case_test.sh" "RDATA names keep the case of the zone data in answers and in AXFR (MINFO RP AFSDB RT KX PX SRV NAPTR LP DNAME MX CNAME PTR), file zone and SQLite3 zone identical (beta D17-4; the DB part needs root)"
 register_test "core" "sh" "tests/run_db_hostile_loader_test.sh" "A fake loader sends bad zone data (wrong counts, owner outside the zone, garbage RRs, oversize frames, ...): the zone is rejected or the stream closed, the Backend survives and keeps serving (beta B4b; root only, SKIP otherwise)"
-register_test "core" "sh" "tests/run_db_tags_test.sh" "GATE B8: per-client answers file = SQLite3 = file-free secondary for a zone with \$LOCATION / \$ECS-SUBNET tags and a tinydns zone (locations, activation time stamps, countdown TTLs); ECS from trusted resolvers bounded by acl-ceiling; Extended AXFR of file and database zone byte-identical; a tag edit reaches the answers with karictl reload (root; loopback aliases 127.0.0.2-5)"
-register_test "core" "sh" "tests/run_db_soa_set_test.sh" "B8t-1/B8t-2: database zones with several SOA rows / attributes on a SOA row travel in the Extended AXFR v3 encoding: file = database = file-free secondary per client (SOA, negative answers, TTLs), settings cut at acl-ceiling, serial mismatch reported, other zones served (root only, SKIP otherwise)"
+register_test "core" "sh" "tests/run_db_tags_test.sh" "GATE B8: per-client answers file = SQLite3 = file-free secondary for a zone with \$LOCATION / \$ECS-SUBNET tags and a tinydns zone (locations, activation time stamps, countdown TTLs); ECS from trusted resolvers bounded by acl-ceiling; Extended AXFR of file and database zone byte-identical; a tag edit reaches the answers with karictl reload (root; loopback aliases 127.0.0.2-5)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
+register_test "core" "sh" "tests/run_db_soa_set_test.sh" "B8t-1/B8t-2: database zones with several SOA rows / attributes on a SOA row travel in the Extended AXFR v3 encoding: file = database = file-free secondary per client (SOA, negative answers, TTLs), settings cut at acl-ceiling, serial mismatch reported, other zones served (root only, SKIP otherwise)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "core" "sh" "tests/run_db_reload_test.sh" "Diff reload of a SQLite3 database: karictl reload (all) sends only what changed (serial, change log, nothing), reload <zone> [force] answers applied/unchanged/deleted/failed, a loader restart resends nothing, the control thread never waits for the loader (parked clients, timeout, limit 32), D-PRIO and catalog members hide DB zones (D17-1), zonestatus/notify/retransfer find DB zones (D17-2) (beta B6a; root only, SKIP otherwise)"
 register_test "core" "sh" "tests/run_db_ddl_test.sh" "db/karidns_ext.sqlite3.sql and db/karidns_ext.pgsql.sql: tables, schema version, change-log triggers (OLD and NEW domain ids, one row per domain per statement on PostgreSQL, pg_notify, prune) (beta B6a; SKIP without sqlite3 / PostgreSQL)"
 register_test "core" "sh" "tests/run_security_review_test.sh" "Independent security review fixes (2026-10): root by another name (root, toor, wheel) refused as user / group / loader-user / loader-group / program-user by karicheck conf and karidns (P4); karicheck conf run by root never runs a loader that failed the owner / mode checks or without loader-user, runs --drivers as loader-user with an empty environment and no inherited descriptor above 2 (P1, S-5); an existing log directory keeps its owner, a created one is handed over (P2); a hard-linked or third-user log file is refused and the linked file is untouched (P3); a program zone plugin starts with an empty environment (S-1); a 60-string TXT is served, transferred by AXFR and loaded from SQLite3 as it is (I5); max-zone-records of a secondary refuses a larger transfer (I2) (root for most sections, SKIP otherwise)"
-register_test "core" "sh" "tests/run_db_views_test.sh" "Per-view database sources: karidns_domain_views (no row = every view of the global source, rows = the named views only, unknown view names logged once), a view with its own database-file, database none, a mapping edit moves a zone, karictl reload <zone> without a view asks every view and answers in one line, no mapping table = D6, --dump --map-view is identical with loader-threads 1 and 4 (beta B6b; root only, SKIP otherwise)"
-register_test "core" "sh" "tests/run_db_zoneadd_perf_test.sh" "T-ZONEADD: 100,000 zones in SQLite3, one zone added and karictl reload <zone>: served less than 1 s after the command (times printed), an edit and a delete as fast; 50 one-zone edits in a row each served in less than 500 ms (the tick that walked every zone, the 131 ms grace-period sleeps) (beta B6b; root only, SKIP otherwise)"
-register_test "core" "sh" "tests/run_db_settings_test.sh" "Settings of database zones: metadata ACLs (AXFR address-or-key, UPDATE address-and-key), acl-ceiling (address, key, none configured), transfer-acl-match / update-acl-match in karidns.conf and for database zones, an undefined TSIG key rejects the zone / closes the ACL after a reconfig, profiles (override per statement, unknown, hostile text), metadata-only and profile edits re-sent, dbstatus settings lines, karicheck conf (beta B7a; root only, SKIP otherwise)"
+register_test "core" "sh" "tests/run_db_views_test.sh" "Per-view database sources: karidns_domain_views (no row = every view of the global source, rows = the named views only, unknown view names logged once), a view with its own database-file, database none, a mapping edit moves a zone, karictl reload <zone> without a view asks every view and answers in one line, no mapping table = D6, --dump --map-view is identical with loader-threads 1 and 4 (beta B6b; root only, SKIP otherwise)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
+register_test "core" "sh" "tests/run_db_zoneadd_perf_test.sh" "T-ZONEADD: 100,000 zones in SQLite3, one zone added and karictl reload <zone>: served less than 1 s after the command (times printed), an edit and a delete as fast; 50 one-zone edits in a row each served in less than 500 ms (the tick that walked every zone, the 131 ms grace-period sleeps) (beta B6b; root only, SKIP otherwise)" "serial"   # stress, perf, sanitizer, fuzz or its own parallelism
+register_test "core" "sh" "tests/run_db_settings_test.sh" "Settings of database zones: metadata ACLs (AXFR address-or-key, UPDATE address-and-key), acl-ceiling (address, key, none configured), transfer-acl-match / update-acl-match in karidns.conf and for database zones, an undefined TSIG key rejects the zone / closes the ACL after a reconfig, profiles (override per statement, unknown, hostile text), metadata-only and profile edits re-sent, dbstatus settings lines, karicheck conf (beta B7a; root only, SKIP otherwise)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "core" "sh" "tests/run_db_secondary_test.sh" "SLAVE / CONSUMER zones from a database: initial AXFR (TSIG key from AXFR-MASTER-TSIG), NOTIFY then IXFR, retransfer, rejected zones (undefined key, no master, host name, PRODUCER), master change, SLAVE <-> NATIVE, loader restart without a re-transfer, deleted row, catalog consumer members (appear, disappear, win over a DB zone of the same name) and in-memory data (beta B7b; root only, SKIP otherwise)"
-register_test "core" "sh" "tests/run_db_autoreload_test.sh" "SQLite3 auto reload (auto-reload yes): PRAGMA data_version polling, coalescing into one auto batch, edits with and without a serial bump, new/deleted zones, mapping changes, a database without karidns_changes, a pruned change log, a replaced and a deleted database file, reconfig on/off, dbstatus; T-AUTORELOAD measured (beta B9; root only, SKIP otherwise)"
+register_test "core" "sh" "tests/run_db_autoreload_test.sh" "SQLite3 auto reload (auto-reload yes): PRAGMA data_version polling, coalescing into one auto batch, edits with and without a serial bump, new/deleted zones, mapping changes, a database without karidns_changes, a pruned change log, a replaced and a deleted database file, reconfig on/off, dbstatus; T-AUTORELOAD measured (beta B9; root only, SKIP otherwise)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "core" "sh" "tests/run_db_alias_lua_test.sh" "PowerDNS ALIAS and LUA records (B9a): default mode (A/AAAA NODATA at an ALIAS name, LUA never answered, LUA-only names NXDOMAIN, AXFR carries TYPE65401/65402) equal to PowerDNS 5.1.4 (SKIP without pdns_server), alias-resolver expansion against a mock upstream (TTL min rule, SERVFAIL + EDE 22, CNAME chain, TC to TCP, bounded upstream queries, serve-stale and recovery, config and zone reload), zone errors in karicheck and the server, a secondary (Extended AXFR and standard AXFR), database zones as root"
-register_test "core" "sh" "tests/run_db_pg_sqlite_diff_test.sh" "GATE B10 PostgreSQL vs SQLite3 = 0: the same SQL (zone files of tests/zones/, tags, tinydns, signed zones, a fixture with ALIAS / LUA, NULL ttl / prio / disabled, ENT rows, metadata, profile, views, SLAVE, a bad row, cryptokeys) in both; karidns-dbloader --dump bytes identical after the HELLO (also --loader-threads 4, --zone, --map-view) and, as root, two servers answer a generated query list byte for byte and transfer the same RRs (SKIP without PostgreSQL: KARIDNS_TEST_PG)"
-register_test "core" "sh" "tests/run_db_pg_autoreload_test.sh" "PostgreSQL auto reload (B10): LISTEN karidns_changes wakes the loader (latency with a 20 s poll-interval), coalescing, ZONE_DELETE, open transactions that took a lower seq or a lower xid lose nothing, terminated loader connections reconnect and catch up, a failed read is reported and recovers, the conninfo is not logged; schema version 1 is served by serial and the migration turns the change log on (root only; SKIP without PostgreSQL)"
-register_test "core" "sh" "tests/run_db_schema_migrate_test.sh" "Extension schema version 2 and the v1 to v2 migration on SQLite3 (tagdefs.id, triggers back, idempotent, same dump bytes) and PostgreSQL (xid8 on karidns_changes, tagdefs.id, old rows xid 0, same dump bytes, version 3 refused) (B10; the PostgreSQL part SKIPs without a server)"
-register_test "core" "sh" "tests/run_db_reload_requests_test.sh" "Several servers on one PostgreSQL database (B11): INSERT into karidns_reload_requests (and its NOTIFY) makes two karidns servers (server-id ns1 / ns2) reload and both karidns_server_status rows show the same generation, ok; one zone, requests coalesced, force, an invalid zone name; broken zones give ok = false and failed_zones, then ok again; a stopped server keeps its old row and catches up when restarted; a status table that cannot be written is shown by dbstatus and logged once while both keep serving; two views with schemas of their own; no tables, no report; no server-id = the host name (root only; SKIP without PostgreSQL)"
-register_test "core" "sh" "tests/run_db_dual_primary_test.sh" "Dual (multi) primary determinism (B11b): two karidns servers (server-id ns1 / ns2) on one PostgreSQL database serve the same SOA serial and the same AXFR RR sequence (in order) for every zone of the lab set (tests/zones/, tags, tinydns with per-address views of the zone, ALIAS and LUA, signed NSEC / NSEC3 / Opt-Out, a zone the loader rejects) with and without auto-reload and with other ingest-threads / loader-threads, also in two views; karidns-dbloader --dump from two processes is byte for byte the same (loader-threads 4 and 16, --zone, --schema, --map-view); an edit and a reload request converge both; IXFR: the same answer when both servers hold the same chain, the whole zone (AXFR style, RFC 1995 s4) from a server that lacks the serial (restarted, no history) or for a serial older than any history (root only; SKIP without PostgreSQL)"
+register_test "core" "sh" "tests/run_db_pg_sqlite_diff_test.sh" "GATE B10 PostgreSQL vs SQLite3 = 0: the same SQL (zone files of tests/zones/, tags, tinydns, signed zones, a fixture with ALIAS / LUA, NULL ttl / prio / disabled, ENT rows, metadata, profile, views, SLAVE, a bad row, cryptokeys) in both; karidns-dbloader --dump bytes identical after the HELLO (also --loader-threads 4, --zone, --map-view) and, as root, two servers answer a generated query list byte for byte and transfer the same RRs (SKIP without PostgreSQL: KARIDNS_TEST_PG)" "group:pg"   # one PostgreSQL server (roles, databases): one at a time
+register_test "core" "sh" "tests/run_db_pg_autoreload_test.sh" "PostgreSQL auto reload (B10): LISTEN karidns_changes wakes the loader (latency with a 20 s poll-interval), coalescing, ZONE_DELETE, open transactions that took a lower seq or a lower xid lose nothing, terminated loader connections reconnect and catch up, a failed read is reported and recovers, the conninfo is not logged; schema version 1 is served by serial and the migration turns the change log on (root only; SKIP without PostgreSQL)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
+register_test "core" "sh" "tests/run_db_schema_migrate_test.sh" "Extension schema version 2 and the v1 to v2 migration on SQLite3 (tagdefs.id, triggers back, idempotent, same dump bytes) and PostgreSQL (xid8 on karidns_changes, tagdefs.id, old rows xid 0, same dump bytes, version 3 refused) (B10; the PostgreSQL part SKIPs without a server)" "group:pg"   # one PostgreSQL server (roles, databases): one at a time
+register_test "core" "sh" "tests/run_db_reload_requests_test.sh" "Several servers on one PostgreSQL database (B11): INSERT into karidns_reload_requests (and its NOTIFY) makes two karidns servers (server-id ns1 / ns2) reload and both karidns_server_status rows show the same generation, ok; one zone, requests coalesced, force, an invalid zone name; broken zones give ok = false and failed_zones, then ok again; a stopped server keeps its old row and catches up when restarted; a status table that cannot be written is shown by dbstatus and logged once while both keep serving; two views with schemas of their own; no tables, no report; no server-id = the host name (root only; SKIP without PostgreSQL)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
+register_test "core" "sh" "tests/run_db_dual_primary_test.sh" "Dual (multi) primary determinism (B11b): two karidns servers (server-id ns1 / ns2) on one PostgreSQL database serve the same SOA serial and the same AXFR RR sequence (in order) for every zone of the lab set (tests/zones/, tags, tinydns with per-address views of the zone, ALIAS and LUA, signed NSEC / NSEC3 / Opt-Out, a zone the loader rejects) with and without auto-reload and with other ingest-threads / loader-threads, also in two views; karidns-dbloader --dump from two processes is byte for byte the same (loader-threads 4 and 16, --zone, --schema, --map-view); an edit and a reload request converge both; IXFR: the same answer when both servers hold the same chain, the whole zone (AXFR style, RFC 1995 s4) from a server that lacks the serial (restarted, no history) or for a serial older than any history (root only; SKIP without PostgreSQL)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "core" "sh" "tests/run_db_loader_threads_reload_test.sh" "loader-threads 4 with SQLite3 and the extension tables (B11b regression): a reload (karictl reload and auto-reload) of three zones read one query each below bulk-threshold must succeed in the pool workers and serve the new data, no 'tables do not exist' (root only)"
-register_test "core" "sh" "tests/run_db_pg_role_test.sh" "The PostgreSQL loader role (db/karidns_loader_role.pgsql.sql, D11): the dump with the role equals the owner's, zones_with_keys works with the column privilege on cryptokeys only, key material and writes are denied, no column privilege = permission denied, conninfo-file mode and password hygiene (B10; SKIP without PostgreSQL or CREATEROLE)"
-register_test "core" "sh" "tests/run_karicheck_db_test.sh" "karicheck db (B12): every finding of karidns-dbloader --check / karicheck db on SQLite3 and PostgreSQL, one case with and one without the fault: schema (PowerDNS tables and columns, karidns_* tables and version, change log triggers, role privileges), the reader's errors with records.id, NULL ttl, serial 0, ALIAS / LUA, the zone checks of karicheck zone, cryptokeys without PRESIGNED, presigned NSEC3, restricted settings parse, TSIG key names, acl-ceiling, D-PRIO / D-PROG, views and mapping rows, SLAVE / CONSUMER / PRODUCER (warning), a group-writable or foreign-owned loader (error); root drops to loader-user, other users use their own rights; unreadable files name file and permission; no loader (DB support is not installed); exit codes"
+register_test "core" "sh" "tests/run_db_pg_role_test.sh" "The PostgreSQL loader role (db/karidns_loader_role.pgsql.sql, D11): the dump with the role equals the owner's, zones_with_keys works with the column privilege on cryptokeys only, key material and writes are denied, no column privilege = permission denied, conninfo-file mode and password hygiene (B10; SKIP without PostgreSQL or CREATEROLE)" "group:pg"   # one PostgreSQL server (roles, databases): one at a time
+register_test "core" "sh" "tests/run_karicheck_db_test.sh" "karicheck db (B12): every finding of karidns-dbloader --check / karicheck db on SQLite3 and PostgreSQL, one case with and one without the fault: schema (PowerDNS tables and columns, karidns_* tables and version, change log triggers, role privileges), the reader's errors with records.id, NULL ttl, serial 0, ALIAS / LUA, the zone checks of karicheck zone, cryptokeys without PRESIGNED, presigned NSEC3, restricted settings parse, TSIG key names, acl-ceiling, D-PRIO / D-PROG, views and mapping rows, SLAVE / CONSUMER / PRODUCER (warning), a group-writable or foreign-owned loader (error); root drops to loader-user, other users use their own rights; unreadable files name file and permission; no loader (DB support is not installed); exit codes" "group:pg"   # one PostgreSQL server (roles, databases): one at a time
 register_test "core" "sh" "tests/run_db_loader_sigterm_test.sh" "The loader ends within 2 s of SIGTERM in the middle of a long load (restarted loader comparing every zone; loader-threads 1 and 2; beta B13; root only, SKIP otherwise)"
 register_test "core" "sh" "tests/run_karicheck_unknown_statement_test.sh" "Unknown statements in zone { } and view { } are configuration errors (karicheck conf and karidns); BIND-only options are skipped with a warning (beta B6a)"
 register_test "core" "sh" "tests/run_karicheck_db_loader_output_test.sh" "karicheck db against a loader that misbehaves (a shell script that writes what a case needs): line longer than CHK_LINE_MAX, text / NUL byte / bad escape instead of protocol lines, last line without line feed, no final R line, exit status 4 / 3 / 127, death by a signal, findings with records.id, clean run (run as root and as a normal user)"
 register_test "core" "sh" "tests/run_trap_cleanup_status_test.sh" "A failing EXIT-trap cleanup must not change the exit status of a test (FreeBSD sh applies set -e inside the trap): the shell behaviour, and every tests/run_*.sh with set -e and an EXIT trap has set +e in its handler"
-register_test "core" "sh" "tests/run_db_pg_group_reload_test.sh" "PostgreSQL reload of a few hundred changed zones (below bulk-threshold) read several zones at a time (scan_records_in / scan_metadata_in / scan_ext_in): 700 zones, 160 edited in one transaction (address, serial, SLAVE, delete), every changed zone served as in the database, the others untouched, a second reload sends nothing (root only; SKIP without PostgreSQL: KARIDNS_TEST_PG)"
+register_test "core" "sh" "tests/run_db_pg_group_reload_test.sh" "PostgreSQL reload of a few hundred changed zones (below bulk-threshold) read several zones at a time (scan_records_in / scan_metadata_in / scan_ext_in): 700 zones, 160 edited in one transaction (address, serial, SLAVE, delete), every changed zone served as in the database, the others untouched, a second reload sends nothing (root only; SKIP without PostgreSQL: KARIDNS_TEST_PG)" "group:pg"   # one PostgreSQL server (roles, databases): one at a time
 
 # 11. Regression, Sanitizer & Concurrency Stress
-register_test "regression" "sh" "tests/run_sanitizer_smoke_test.sh" "ASan & UBSan runtime memory error smoke test"
-register_test "regression" "sh" "tests/run_stress_test.sh" "TSan & ASan concurrency stress test (dnsperf + IXFR)"
-register_test "regression" "sh" "tests/run_rcu_tsan_test.sh" "TSan: queries concurrent with reload, UPDATE and AXFR (R-25 RCU publish order)"
-register_test "regression" "sh" "tests/run_nsec3_nxdomain_perf_test.sh" "NSEC3 NXDOMAIN rate vs NSEC with dnsperf, sorted NSEC3 index (R-34; SKIP without dnsperf)"
-register_test "regression" "sh" "tests/run_bind_differential_test.sh" "Differential check against BIND named: wildcard answers (SKIP without named)"
-register_test "regression" "sh" "tests/run_fuzz_smoke_test.sh" "libFuzzer crash-resistance smoke verification"
+register_test "regression" "sh" "tests/run_sanitizer_smoke_test.sh" "ASan & UBSan runtime memory error smoke test" "serial"   # stress, perf, sanitizer, fuzz or its own parallelism
+register_test "regression" "sh" "tests/run_stress_test.sh" "TSan & ASan concurrency stress test (dnsperf + IXFR)" "serial"   # stress, perf, sanitizer, fuzz or its own parallelism
+register_test "regression" "sh" "tests/run_rcu_tsan_test.sh" "TSan: queries concurrent with reload, UPDATE and AXFR (R-25 RCU publish order)" "serial"   # stress, perf, sanitizer, fuzz or its own parallelism
+register_test "regression" "sh" "tests/run_nsec3_nxdomain_perf_test.sh" "NSEC3 NXDOMAIN rate vs NSEC with dnsperf, sorted NSEC3 index (R-34; SKIP without dnsperf)" "serial"   # stress, perf, sanitizer, fuzz or its own parallelism
+register_test "regression" "sh" "tests/run_bind_differential_test.sh" "Differential check against BIND named: wildcard answers (SKIP without named)" "serial"   # stress, perf, sanitizer, fuzz or its own parallelism
+register_test "regression" "sh" "tests/run_fuzz_smoke_test.sh" "libFuzzer crash-resistance smoke verification" "serial"   # stress, perf, sanitizer, fuzz or its own parallelism
 register_test "regression" "sh" "tests/run_break_duplicate_kind_override_test.sh" "Duplicate --break kind parameter override validation"
 
 # 12. dag Diagnostic Client & Scenario Matrix Suite (Run with -c dag or --include-dag)
 register_test "dag" "sh" "tests/run_dag_scenario_matrix_test.sh" "dag scenario matrix: TC fallback, PROXY v2, keepopen, DoH, XFR, replay, TSIG"
-register_test "dag" "sh" "tests/run_dag_ci_test.sh" "dag comprehensive CI test suite (Part 1-19 + Part 20-21 parallel sub-suites)"
+register_test "dag" "sh" "tests/run_dag_ci_test.sh" "dag comprehensive CI test suite (Part 1-19 + Part 20-21 parallel sub-suites)" "serial"   # stress, perf, sanitizer, fuzz or its own parallelism
 register_test "dag" "sh" "tests/run_dag_cli_anomalous_options_test.sh" "dag CLI anomalous options, YAML escaping & transport errors"
 register_test "dag" "sh" "tests/run_dag_batch_advanced_opts_test.sh" "dag Batch mode (-f) with advanced options"
-register_test "dag" "sh" "tests/run_dag_fuzzer_test.sh" "dag fuzzer corpus regression (all harnesses, -runs=0)"
+register_test "dag" "sh" "tests/run_dag_fuzzer_test.sh" "dag fuzzer corpus regression (all harnesses, -runs=0)" "serial"   # stress, perf, sanitizer, fuzz or its own parallelism
 register_test "dag" "sh" "tests/run_dag_apl_afdlength_overflow_test.sh" "dag APL afdlength buffer overflow regression test"
 register_test "dag" "sh" "tests/run_dag_audit_improvements_test.sh" "dag & dig audit improvements validation"
 register_test "dag" "sh" "tests/run_dag_axfr_tsig_unsigned_intermediate_test.sh" "dag AXFR TSIG intermediate unsigned message digest chaining"
@@ -465,7 +541,7 @@ register_test "dag" "sh" "tests/run_dag_trace_cname_glue_test.sh" "dag +trace gl
 register_test "dag" "sh" "tests/run_dag_trace_deep_cname_stack_test.sh" "dag +trace deep CNAME stack exhaustion test"
 register_test "dag" "sh" "tests/run_dag_trace_nssearch_opts_test.sh" "dag +trace and +nssearch options (--hex, +udp)"
 register_test "dag" "sh" "tests/run_dag_trace_nssearch_tcp_test.sh" "dag +trace / +nssearch TCP validation suite"
-register_test "dag" "sh" "tests/run_dag_trace2_test.sh" "dag +trace2 iterative resolution over a KariDNS delegation tree (needs 127.0.0.2-5)"
+register_test "dag" "sh" "tests/run_dag_trace2_test.sh" "dag +trace2 iterative resolution over a KariDNS delegation tree (needs 127.0.0.2-5)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "dag" "sh" "tests/run_dag_udp_id_mismatch_discard_test.sh" "dag UDP transaction ID mismatch packet discard and retry"
 register_test "dag" "sh" "tests/run_dag_udp_spoofing_source_test.sh" "dag UDP spoofing source rejection per RFC 5452"
 register_test "dag" "sh" "tests/run_dag_update_del_exact_ttl_notype_crash_test.sh" "dag --update-del-exact TTL support regression test"
@@ -489,12 +565,12 @@ register_test "dag" "sh" "tests/run_ci_dag_smoke.sh" "dag CI smoke (UDP, TCP, mu
 
 # If -l or --list, print tests and exit
 if [ "${LIST_ONLY}" -eq 1 ]; then
-    printf "${C_BOLD}%-4s %-12s %-6s %-45s %s${C_RESET}\n" "ID" "CATEGORY" "TYPE" "TARGET" "DESCRIPTION"
+    printf "${C_BOLD}%-4s %-12s %-6s %-12s %-45s %s${C_RESET}\n" "ID" "CATEGORY" "TYPE" "MODE" "TARGET" "DESCRIPTION"
     printf "%s\n" "-----------------------------------------------------------------------------------------------------"
     _idx=1
-    printf "%b" "${REGISTERED_TESTS}" | while IFS='|' read -r _cat _type _cmd _desc; do
+    printf "%b" "${REGISTERED_TESTS}" | while IFS='|' read -r _cat _type _cmd _mode _desc; do
         [ -z "${_cat}" ] && continue
-        printf "%-4d %-12s %-6s %-45s %s\n" "${_idx}" "${_cat}" "${_type}" "${_cmd}" "${_desc}"
+        printf "%-4d %-12s %-6s %-12s %-45s %s\n" "${_idx}" "${_cat}" "${_type}" "${_mode}" "${_cmd}" "${_desc}"
         _idx=$((_idx + 1))
     done
     echo ""
@@ -550,6 +626,66 @@ is_name_matched() {
     esac
 }
 
+# Jobs: -j, then KARI_JOBS, then the number of CPUs.  The tests of a slot run
+# in a session of their own (perl setsid); without perl, or with --verbose
+# (the output of the test goes to the terminal), the tests run one by one.
+if [ -z "${JOBS}" ]; then
+    JOBS="${KARI_JOBS:-}"
+fi
+[ -n "${JOBS}" ] || JOBS=$(detect_ncpu)
+case "${JOBS}" in
+    ''|*[!0-9]*|0)
+        echo "Invalid job count: '${JOBS}' (-j N, N >= 1)" >&2
+        exit 1
+        ;;
+esac
+if [ "${JOBS}" -gt "${KARI_MAX_JOBS}" ]; then
+    echo "NOTE: job count ${JOBS} limited to ${KARI_MAX_JOBS} (port windows of 1000 ports from ${KARI_PORT_BASE_MIN})" >&2
+    JOBS="${KARI_MAX_JOBS}"
+fi
+if [ "${JOBS}" -gt 1 ]; then
+    if [ "${VERBOSE}" -eq 1 ]; then
+        echo "NOTE: --verbose runs the tests one by one (-j 1)" >&2
+        JOBS=1
+    elif ! perl -MPOSIX -e 'exit 0' >/dev/null 2>&1; then
+        echo "NOTE: perl (POSIX) not found, the tests cannot get a session each: running one by one (-j 1)" >&2
+        JOBS=1
+    fi
+fi
+
+# Scratch area of this run: the plan, the results, KARI_TMP of every slot
+SUITE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/karisuite.XXXXXX") || exit 1
+chmod 755 "${SUITE_TMP}"
+RES_DIR="${SUITE_TMP}/res"
+PLAN_FILE="${SUITE_TMP}/plan.tsv"
+mkdir -p "${RES_DIR}"
+
+# Slot state: SLOT_PID_<n> (pid of the job, empty = free), SLOT_IDX_<n> (test)
+kill_running_groups() {
+    _s=0
+    while [ "${_s}" -lt "${JOBS}" ]; do
+        eval "_idx=\${SLOT_IDX_${_s}:-}"
+        if [ -n "${_idx}" ] && [ ! -f "${RES_DIR}/${_idx}.res" ] && [ -f "${RES_DIR}/${_idx}.pgid" ]; then
+            kill_group "$(cat "${RES_DIR}/${_idx}.pgid")"
+        fi
+        _s=$((_s + 1))
+    done
+}
+
+on_exit() {
+    kill_running_groups
+    rm -rf "${SUITE_TMP}" 2>/dev/null || true
+}
+on_signal() {
+    echo ""
+    echo "${C_BG_RED} ABORT ${C_RESET} Interrupted, stopping the running tests."
+    kill_running_groups
+    cleanup_stale_processes
+    exit 130
+}
+trap on_exit EXIT
+trap on_signal INT TERM HUP
+
 # Clean environment before starting suite
 cleanup_stale_processes
 
@@ -569,14 +705,10 @@ echo "${C_BOLD}=================================================================
 [ -n "${NAME_FILTER}" ]        && echo "  Name Filter     : ${C_CYAN}${NAME_FILTER}${C_RESET}"
 [ -n "${EXCLUDE_LIST}" ]       && echo "  Excluded        : ${C_CYAN}${EXCLUDE_LIST}${C_RESET}"
 [ "${QUICK_MODE}" -eq 1 ]      && echo "  Mode            : ${C_YELLOW}Quick Mode${C_RESET}"
+echo "  Jobs            : ${C_CYAN}${JOBS}${C_RESET}"
 echo ""
 
-TOTAL_RUN=0
-TOTAL_PASS=0
-TOTAL_FAIL=0
-TOTAL_SKIP=0
 START_TIME=$(date +%s 2>/dev/null || perl -e 'print time')
-FAILED_TEST_NAMES=""
 
 # Ensure unit test binaries are built if category 'unit' is active
 if is_category_selected "unit"; then
@@ -588,69 +720,118 @@ if is_category_selected "unit"; then
     done
 fi
 
+# Test helpers that several DB tests use but only run_db_dump_test.sh builds: built
+# here, before any test starts, or the tests running next to it SKIP their DB parts
+# (as the user who ran sudo, like run_db_dump_test.sh)
+for _h in zone2sql zone2kdb; do
+    [ -x "tests/db/${_h}" ] && continue
+    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+        su -m "${SUDO_USER}" -c "make ${_h}" >/dev/null 2>&1 || true
+    else
+        make "${_h}" >/dev/null 2>&1 || true
+    fi
+done
+
 SUMMARY_FILE="${LOG_DIR}/summary.tsv"
+# The times of the previous run order this one (longest first, see below)
+PREV_SUMMARY="${SUITE_TMP}/prev_summary.tsv"
+if [ -f "${SUMMARY_FILE}" ]; then
+    cp "${SUMMARY_FILE}" "${PREV_SUMMARY}" 2>/dev/null || : > "${PREV_SUMMARY}"
+else
+    : > "${PREV_SUMMARY}"
+fi
 rm -f "${SUMMARY_FILE}"
 touch "${SUMMARY_FILE}"
 
-# Run test cases
-printf "%b" "${REGISTERED_TESTS}" | while IFS='|' read -r _cat _type _cmd _desc; do
-    [ -z "${_cat}" ] && continue
-    
-    if ! is_category_selected "${_cat}"; then
-        continue
-    fi
-    
-    if ! is_name_matched "${_cmd}"; then
-        continue
-    fi
-    
-    TOTAL_RUN=$((TOTAL_RUN + 1))
-    _log="${LOG_DIR}/test_${TOTAL_RUN}.log"
+# Selected tests: PLAN_FILE = index|category|type|command|mode|description
+TOTAL_RUN=0
+: > "${PLAN_FILE}"
+printf "%b" "${REGISTERED_TESTS}" | {
+    _n=0
+    while IFS='|' read -r _cat _type _cmd _mode _desc; do
+        [ -z "${_cat}" ] && continue
+        is_category_selected "${_cat}" || continue
+        is_name_matched "${_cmd}" || continue
+        _n=$((_n + 1))
+        printf '%s|%s|%s|%s|%s|%s\n' "${_n}" "${_cat}" "${_type}" "${_cmd}" "${_mode}" "${_desc}" >> "${PLAN_FILE}"
+    done
+}
+TOTAL_RUN=$(wc -l < "${PLAN_FILE}" | tr -d ' ')
+
+# run_job INDEX SLOT: run test INDEX of the plan in slot SLOT; the result line
+# (the line of summary.tsv) goes to ${RES_DIR}/INDEX.res.  Runs in a subshell
+# when started in the background.
+run_job() {
+    _ji="$1"
+    _jslot="$2"
+    _jline=$(sed -n "${_ji}p" "${PLAN_FILE}")
+    IFS='|' read -r _jx _cat _type _cmd _mode _desc <<EOF
+${_jline}
+EOF
+    _log="${LOG_DIR}/test_${_ji}.log"
     rm -f "${_log}"
-    
-    cleanup_stale_processes
-    
+
+    KARI_SLOT="${_jslot}"
+    KARI_PORT_BASE=$((KARI_PORT_BASE_MIN + _jslot * KARI_PORT_SLOT_SPAN))
+    KARI_TMP="${SUITE_TMP}/s${_jslot}"
+    KARI_JOB_ID="kj${_ji}x"
+    export KARI_SLOT KARI_PORT_BASE KARI_TMP KARI_JOB_ID
+    reset_slot_tmp "${_jslot}"
+
     T_START=$(date +%s 2>/dev/null || perl -e 'print time')
-    
     _status="PASS"
     _exit_code=0
     _skip_reason=""
-    
+
     if [ "${_type}" = "bin" ]; then
         if [ ! -x "./${_cmd}" ]; then
             _status="SKIP"
             _skip_reason="binary ./${_cmd} not found"
         else
-            if [ "${VERBOSE}" -eq 1 ]; then
-                "./${_cmd}" 2>&1 | tee "${_log}"
-                _exit_code=$?
-            else
-                "./${_cmd}" > "${_log}" 2>&1
-                _exit_code=$?
-            fi
-            [ ${_exit_code} -ne 0 ] && _status="FAIL"
+            set -- "./${_cmd}"
         fi
     else
         if [ ! -f "${_cmd}" ]; then
             _status="SKIP"
             _skip_reason="script ${_cmd} not found"
         else
-            if [ "${VERBOSE}" -eq 1 ]; then
-                sh "${_cmd}" 2>&1 | tee "${_log}"
-                _exit_code=$?
-            else
-                sh "${_cmd}" > "${_log}" 2>&1
-                _exit_code=$?
-            fi
-            [ ${_exit_code} -ne 0 ] && _status="FAIL"
+            set -- sh "${_cmd}"
         fi
     fi
-    
+
+    if [ "${_status}" != "SKIP" ]; then
+        if [ "${VERBOSE}" -eq 1 ]; then
+            "$@" 2>&1 | tee "${_log}"
+            _exit_code=$?
+        elif [ "${JOBS}" -gt 1 ]; then
+            # own session: the cleanup below reaches only what this test started
+            perl -MPOSIX -e 'POSIX::setsid(); $SIG{INT} = $SIG{QUIT} = "DEFAULT"; exec @ARGV or exit 127' "$@" </dev/null > "${_log}" 2>&1 &
+            _tpid=$!
+            echo "${_tpid}" > "${RES_DIR}/${_ji}.pgid"
+            wait "${_tpid}"
+            _exit_code=$?
+            kill_group "${_tpid}"
+            kill_job_leftovers "${KARI_JOB_ID}"
+        else
+            "$@" > "${_log}" 2>&1
+            _exit_code=$?
+        fi
+        [ ${_exit_code} -ne 0 ] && _status="FAIL"
+    fi
+
     T_END=$(date +%s 2>/dev/null || perl -e 'print time')
     T_ELAPSED=$((T_END - T_START))
-    
-    echo "${_status}|${_cmd}|${_cat}|${T_ELAPSED}|${_exit_code}|${_desc}|${_skip_reason}" >> "${SUMMARY_FILE}"
-    
+    reset_slot_tmp "${_jslot}"
+
+    echo "${_status}|${_cmd}|${_cat}|${T_ELAPSED}|${_exit_code}|${_desc}|${_skip_reason}" > "${RES_DIR}/${_ji}.tmp"
+    mv "${RES_DIR}/${_ji}.tmp" "${RES_DIR}/${_ji}.res"
+}
+
+# print_result INDEX: the line of the test (and the tail of its log if it failed)
+# Returns 1 for a FAIL.
+print_result() {
+    _pi="$1"
+    IFS='|' read -r _status _cmd _cat T_ELAPSED _exit_code _desc _skip_reason < "${RES_DIR}/${_pi}.res"
     if [ "${_status}" = "PASS" ]; then
         printf "  [ ${C_GREEN}PASS${C_RESET} ] %-42s (${T_ELAPSED}s) ${C_WHITE}%s${C_RESET}\n" "${_cmd}" "${_desc}"
     elif [ "${_status}" = "SKIP" ]; then
@@ -658,20 +839,180 @@ printf "%b" "${REGISTERED_TESTS}" | while IFS='|' read -r _cat _type _cmd _desc;
     else
         printf "  [ ${C_RED}FAIL${C_RESET} ] %-42s (${T_ELAPSED}s) ${C_RED}%s (Exit: ${_exit_code})${C_RESET}\n" "${_cmd}" "${_desc}"
         echo "  ${C_RED}------------------------- [ Error Log Tail: ${_cmd} ] -------------------------${C_RESET}"
-        tail -n 25 "${_log}" | sed 's/^/    /'
+        tail -n 25 "${LOG_DIR}/test_${_pi}.log" | sed 's/^/    /'
         echo "  ${C_RED}----------------------------------------------------------------------------------${C_RESET}"
-        
-        if [ "${STOP_ON_FAILURE}" -eq 1 ]; then
-            echo ""
-            echo "${C_BG_RED} ABORT ${C_RESET} Test failure encountered with --stop-on-failure. Stopping."
-            cleanup_stale_processes
-            exit 1
-        fi
+        return 1
     fi
-done
-PIPELINE_STATUS=$?
+    return 0
+}
 
+# write_summary: summary.tsv in registration order, whatever the finishing order
+write_summary() {
+    : > "${SUMMARY_FILE}"
+    _wi=1
+    while [ "${_wi}" -le "${TOTAL_RUN}" ]; do
+        [ -f "${RES_DIR}/${_wi}.res" ] && cat "${RES_DIR}/${_wi}.res" >> "${SUMMARY_FILE}"
+        _wi=$((_wi + 1))
+    done
+}
+
+abort_on_failure() {
+    kill_running_groups
+    write_summary
+    echo ""
+    echo "${C_BG_RED} ABORT ${C_RESET} Test failure encountered with --stop-on-failure. Stopping."
+    cleanup_stale_processes
+    exit 1
+}
+
+# order_file MODE: the tests of MODE, one per line.  MODE "all": plan indexes
+# in registration order.  MODE "serial": plan indexes of the serial tests.
+# MODE "par": "index|group" of the par tests and of the tests of an exclusive
+# group (group empty for par), longest first (LPT: the long tests, group members
+# included, start first, so none is left running alone at the end) by the times
+# of the previous summary.tsv; tests it does not know count as 10 s; without a
+# previous summary: registration order.
+order_file() {
+    if [ "$1" = "all" ]; then
+        cut -d'|' -f1 "${PLAN_FILE}"
+    elif [ "$1" = "serial" ]; then
+        awk -F'|' '$5 == "serial" { print $1 }' "${PLAN_FILE}"
+    else
+        awk -F'|' '
+            # FILENAME, not NR == FNR: the previous summary may be empty (a fresh
+            # tree), and then NR == FNR would hold for the plan too
+            FILENAME == ARGV[1] { if ($4 ~ /^[0-9]+$/) t[$2] = $4; next }
+            $5 == "par" || $5 ~ /^group:/ {
+                g = ""
+                if ($5 ~ /^group:/) { g = substr($5, 7); gsub(/[^A-Za-z0-9+]/, "_", g) }
+                print ((($4 in t) ? t[$4] : 10) + 0) "|" $1 "|" g
+            }
+        ' "${PREV_SUMMARY}" "${PLAN_FILE}" | sort -t'|' -k1,1nr -k2,2n | cut -d'|' -f2,3
+    fi
+}
+
+# run_sequential ORDER: one test at a time, in slot 0, by-name cleanup before
+# each (nothing else runs, so that is safe)
+run_sequential() {
+    for _qi in $(cat "$1"); do
+        cleanup_stale_processes
+        SLOT_IDX_0="${_qi}"
+        run_job "${_qi}" 0
+        SLOT_IDX_0=""
+        if ! print_result "${_qi}"; then
+            [ "${STOP_ON_FAILURE}" -eq 1 ] && abort_on_failure
+        fi
+    done
+}
+
+# grp_busy GROUPS: success when a test of one of the groups (NAME or NAME+NAME)
+# runs; grp_set GROUPS VALUE marks / unmarks them.
+grp_busy() {
+    [ -n "$1" ] || return 1
+    for _g in $(echo "$1" | tr '+' ' '); do
+        eval "_gr=\${GRP_RUN_${_g}:-}"
+        [ -n "${_gr}" ] && return 0
+    done
+    return 1
+}
+
+grp_set() {
+    [ -n "$1" ] || return 0
+    for _g in $(echo "$1" | tr '+' ' '); do eval "GRP_RUN_${_g}='$2'"; done
+}
+
+# pick_next ORDER: "index|group" of the first test of the queue that has not
+# started and may start now: a test of an exclusive group waits while another
+# test of its group runs (GRP_RUN_<group>).
+pick_next() {
+    while IFS='|' read -r _pi _pg; do
+        [ -f "${SUITE_TMP}/started.${_pi}" ] && continue
+        if grp_busy "${_pg}"; then continue; fi
+        echo "${_pi}|${_pg}"
+        return 0
+    done < "$1"
+    return 1
+}
+
+# run_parallel ORDER: up to JOBS tests at a time, one slot each.  The queue is
+# longest first; whichever slot frees up takes the first test that may start
+# (tests of one exclusive group run one at a time, next to the others).  No
+# by-name cleanup here: it would stop the servers of the other tests.
+run_parallel() {
+    _remaining=$(wc -l < "$1" | tr -d ' ')
+    _running=0
+    _s=0
+    while [ "${_s}" -lt "${JOBS}" ]; do
+        eval "SLOT_PID_${_s}=''; SLOT_IDX_${_s}=''; SLOT_GRP_${_s}=''"
+        _s=$((_s + 1))
+    done
+    while [ "${_remaining}" -gt 0 ] || [ "${_running}" -gt 0 ]; do
+        # fill the free slots
+        _s=0
+        while [ "${_s}" -lt "${JOBS}" ] && [ "${_remaining}" -gt 0 ]; do
+            eval "_sp=\${SLOT_PID_${_s}}"
+            if [ -z "${_sp}" ]; then
+                _pick=$(pick_next "$1") || break
+                _qi="${_pick%%|*}"
+                _qg="${_pick#*|}"
+                : > "${SUITE_TMP}/started.${_qi}"
+                grp_set "${_qg}" 1
+                eval "SLOT_IDX_${_s}='${_qi}'; SLOT_GRP_${_s}='${_qg}'"
+                run_job "${_qi}" "${_s}" &
+                eval "SLOT_PID_${_s}=$!"
+                _running=$((_running + 1))
+                _remaining=$((_remaining - 1))
+            fi
+            _s=$((_s + 1))
+        done
+        # collect the finished ones
+        _done=0
+        _s=0
+        while [ "${_s}" -lt "${JOBS}" ]; do
+            eval "_sp=\${SLOT_PID_${_s}}; _qi=\${SLOT_IDX_${_s}}; _qg=\${SLOT_GRP_${_s}}"
+            if [ -n "${_sp}" ] && [ -f "${RES_DIR}/${_qi}.res" ]; then
+                wait "${_sp}" 2>/dev/null || true
+                eval "SLOT_PID_${_s}=''; SLOT_IDX_${_s}=''; SLOT_GRP_${_s}=''"
+                grp_set "${_qg}" ""
+                _running=$((_running - 1))
+                _done=1
+                if ! print_result "${_qi}"; then
+                    [ "${STOP_ON_FAILURE}" -eq 1 ] && abort_on_failure
+                fi
+            fi
+            _s=$((_s + 1))
+        done
+        [ "${_done}" -eq 1 ] || sleep 0.2
+    done
+}
+
+if [ "${JOBS}" -le 1 ]; then
+    # today's behaviour: registration order, by-name cleanup before each test
+    order_file all > "${SUITE_TMP}/order.all"
+    run_sequential "${SUITE_TMP}/order.all"
+else
+    order_file par > "${SUITE_TMP}/order.par"
+    order_file serial > "${SUITE_TMP}/order.serial"
+    _queued=$(cat "${SUITE_TMP}/order.par" "${SUITE_TMP}/order.serial" | wc -l | tr -d ' ')
+    if [ "${_queued}" -ne "${TOTAL_RUN}" ]; then
+        echo "${C_RED}ERROR: ${_queued} of ${TOTAL_RUN} selected tests were queued (runner bug)${C_RESET}" >&2
+        exit 1
+    fi
+    cleanup_stale_processes
+    run_parallel "${SUITE_TMP}/order.par"
+    # serial tests: alone on the host, one by one, with the by-name cleanup
+    run_sequential "${SUITE_TMP}/order.serial"
+fi
+
+write_summary
 cleanup_stale_processes
+
+# every selected test must have a result: a test that never ran must not let the suite pass
+_results=$(wc -l < "${SUMMARY_FILE}" | tr -d ' ')
+if [ "${TOTAL_RUN}" -gt 0 ] && [ "${_results}" -ne "${TOTAL_RUN}" ]; then
+    echo "${C_RED}ERROR: ${_results} results for ${TOTAL_RUN} selected tests (runner bug)${C_RESET}" >&2
+    exit 1
+fi
 
 if [ ! -f "${SUMMARY_FILE}" ] || [ ! -s "${SUMMARY_FILE}" ]; then
     echo "${C_YELLOW}No matching tests found for execution.${C_RESET}"
@@ -710,7 +1051,7 @@ fi
 if [ "${SKIPPED_COUNT}" -gt 0 ]; then
     printf "  Skipped              : ${C_YELLOW}%d${C_RESET}\n" "${SKIPPED_COUNT}"
 fi
-printf "  Total Execution Time : %ds\n" "${TOTAL_DURATION}"
+printf "  Total Execution Time : %ds (jobs: %d)\n" "${TOTAL_DURATION}" "${JOBS}"
 echo "${C_BOLD}======================================================================${C_RESET}"
 
 if [ "${SKIPPED_COUNT}" -gt 0 ]; then

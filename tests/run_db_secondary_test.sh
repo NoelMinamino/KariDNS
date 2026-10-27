@@ -23,6 +23,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
+. "$ROOT/tests/lib_proc.sh"
 
 if [ "$(id -u)" != "0" ]; then echo "SKIP: needs root (the loader runs as another user)"; exit 0; fi
 KARIDNS=${KARIDNS:-./karidns}
@@ -50,7 +51,7 @@ trap cleanup EXIT INT TERM
 PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
-BASE=$((20000 + $$ % 20000))
+BASE=$(kari_port 0 $((20000 + $$ % 20000)))
 PM1=$BASE; PM2=$((BASE + 1)); PS=$((BASE + 2))
 DAG="./dag @127.0.0.1 -p $PS"
 DAG1="./dag @127.0.0.1 -p $PM1"

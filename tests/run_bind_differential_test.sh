@@ -25,8 +25,8 @@ fi
 
 TMP_DIR="$(mktemp -d /tmp/karidns_bind_diff.XXXXXX 2>/dev/null || mktemp -d)"
 chmod 0755 "${TMP_DIR}"
-KARI_PORT=$((26000 + ( $$ % 10000 )))
-BIND_PORT=$((36000 + ( $$ % 10000 )))
+KARI_PORT=$(kari_port 0 $((26000 + ( $$ % 10000 ))))
+BIND_PORT=$(kari_port 100 $((36000 + ( $$ % 10000 ))))
 KARI_PID=""
 BIND_PID=""
 

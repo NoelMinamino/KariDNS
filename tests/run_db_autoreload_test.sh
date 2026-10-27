@@ -25,6 +25,7 @@
 # added and removed).  SKIP otherwise, and when karidns, dag, karictl, karidns-dbloader (SQLite3 driver), zone2sql or the
 # sqlite3 CLI is missing.  KARIDNS=./karidns-tsan and LOADER=./karidns-dbloader-tsan run the sanitizer builds.
 # PROFILE=1 prints the latencies only.  The latency bounds: BOUND_MS (S1, default 3500) and BOUND_DEFAULT_MS (S2, default 5000).
+. "$(dirname "$0")/lib_proc.sh"
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
@@ -66,7 +67,7 @@ done
 PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
-PORT=$((20000 + $$ % 20000))
+PORT=$(kari_port 0 $((20000 + $$ % 20000)))
 SECRET="dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"
 BOUND_MS=${BOUND_MS:-3500}
 BOUND_DEFAULT_MS=${BOUND_DEFAULT_MS:-5000}

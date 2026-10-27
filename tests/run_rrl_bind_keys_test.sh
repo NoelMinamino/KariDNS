@@ -25,7 +25,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 KARIDNS="$ROOT_DIR/karidns"
 DAG="$ROOT_DIR/dag"
 
-PORT=$((26000 + $$ % 4000))
+PORT=$(kari_port 0 $((26000 + $$ % 4000)))
 TMP_DIR="/tmp/rrl_bind_keys_test_$$"
 rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR"

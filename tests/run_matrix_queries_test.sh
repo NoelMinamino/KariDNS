@@ -2,6 +2,7 @@
 # ==============================================================================
 # tests/run_matrix_queries_test.sh - Table-driven Matrix Query Engine Verification
 # ==============================================================================
+. "$(dirname "$0")/lib_proc.sh"
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -33,7 +34,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Select random dynamic port
-PORT=$((25000 + ( $$ % 15000 )))
+PORT=$(kari_port 0 $((25000 + ( $$ % 15000 ))))
 
 cat > "${CONF_FILE}" <<EOF
 options {

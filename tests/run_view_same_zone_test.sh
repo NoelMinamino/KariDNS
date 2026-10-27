@@ -13,7 +13,7 @@ KARIDNS="$BASE_DIR/karidns"
 DAG="$BASE_DIR/dag"
 KARICTL="$BASE_DIR/karictl"
 KARICHECK="$BASE_DIR/karicheck"
-PORT=15431
+PORT=$(kari_port 0 15431)
 
 echo "=== View / zone identity test (R-26, O-12) ==="
 

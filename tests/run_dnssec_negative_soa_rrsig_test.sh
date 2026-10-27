@@ -3,6 +3,7 @@ set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$(dirname "$0")/lib_proc.sh"
+PORT=$(kari_port 0 10053)
 ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 DAG="$ROOT/dag"
@@ -38,7 +39,7 @@ EOF
 
 cat << EOF > "$CONF"
 options {
-    port 10053;
+    port ${PORT};
     bind-address { 127.0.0.1; };
     user "nobody";
     group "nobody";
@@ -49,7 +50,7 @@ zone "signed.test" {
 };
 EOF
 
-echo "[*] Starting KariDNS on port 10053..."
+echo "[*] Starting KariDNS on port ${PORT}..."
 $BIN -f -c "$CONF" > "$DIR/server_dnssec_neg.log" 2>&1 &
 SERVER_PID=$!
 
@@ -65,7 +66,7 @@ sleep 2
 
 # 1. NXDOMAIN Test: Query non-existent name with DO bit (+dnssec)
 echo "[*] Querying NXDOMAIN with +dnssec (nonexist.signed.test A)..."
-NX_OUT=$($DAG +dnssec nonexist.signed.test A @127.0.0.1 -p 10053)
+NX_OUT=$($DAG +dnssec nonexist.signed.test A @127.0.0.1 -p ${PORT})
 echo "$NX_OUT"
 
 if ! echo "$NX_OUT" | grep -q "status: NXDOMAIN"; then
@@ -85,7 +86,7 @@ fi
 
 # 2. NODATA Test: Query existing name for non-existent type with DO bit (+dnssec)
 echo "[*] Querying NODATA with +dnssec (www.signed.test TXT)..."
-NODATA_OUT=$($DAG +dnssec www.signed.test TXT @127.0.0.1 -p 10053)
+NODATA_OUT=$($DAG +dnssec www.signed.test TXT @127.0.0.1 -p ${PORT})
 echo "$NODATA_OUT"
 
 if ! echo "$NODATA_OUT" | grep -q "status: NOERROR"; then

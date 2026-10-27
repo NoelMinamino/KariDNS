@@ -26,6 +26,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
+. "$ROOT/tests/lib_proc.sh"
 
 if [ "$(id -u)" != "0" ]; then echo "SKIP: needs root (the loader runs as another user)"; exit 0; fi
 KARIDNS=${KARIDNS:-./karidns}
@@ -62,7 +63,7 @@ PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
 TAB=$(printf '	')
-BASE=$((20000 + $$ % 20000))
+BASE=$(kari_port 0 $((20000 + $$ % 20000)))
 PA=$BASE
 PB=$((BASE + 1))
 PC=$((BASE + 2))
@@ -160,7 +161,7 @@ gen_queries() {   # gen_queries DB APEX: the query list on stdout
 
 compare() {   # compare A.out B.out: prints "identical folded mismatch"; mismatches (first 5) on stderr
     awk -F'\t' '
-        NR == FNR { k[FNR] = $1; s[FNR] = $2; f[FNR] = $3; next }
+        FILENAME == ARGV[1] { k[FNR] = $1; s[FNR] = $2; f[FNR] = $3; next }
         { total++
           if ($1 != k[FNR]) { bad++; if (bad <= 5) print "         query list mismatch at " FNR > "/dev/stderr"; next }
           if ($2 == "TIMEOUT" || s[FNR] == "TIMEOUT") { bad++; if (bad <= 5) print "         timeout: " $1 > "/dev/stderr"; next }
@@ -258,7 +259,7 @@ while [ $k -le $R ]; do
             # A zone transfer compresses names (RFC 1035 4.1.4), and the target of an MX / NS / CNAME takes the case of an earlier
             # owner name: a secondary of a database zone (lower-case owners) can hold "mail.sub" where the primary has "Mail.Sub".
             # Such an answer is the same name (RFC 4343); every differing query is asked again as text and must match when folded.
-            awk -F'\t' 'NR == FNR { s[FNR] = $2; next } $1 != "" && $2 != s[FNR] { print $1 }' "$D/q.b" "$D/q.c" | sort -u > "$D/diff.keys"
+            awk -F'\t' 'FILENAME == ARGV[1] { s[FNR] = $2; next } $1 != "" && $2 != s[FNR] { print $1 }' "$D/q.b" "$D/q.c" | sort -u > "$D/diff.keys"
             unres=0
             while read -r qn qt qf; do
                 ./dag @127.0.0.1 -p "$PB" "$qn" "$qt" +noall +answer +authority +additional +nohexdump 2> /dev/null | tr 'A-Z' 'a-z' | sort > "$D/dq.b"

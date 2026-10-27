@@ -18,6 +18,7 @@ set -u
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$DIR/.."
+. "$DIR/lib_proc.sh"
 [ -x "$ROOT/karidns" ] && [ -x "$ROOT/dag" ] || make -C "$ROOT" karidns dag >/dev/null
 
 TMP="$(mktemp -d /tmp/karidns_nonroot.XXXXXX)"
@@ -82,7 +83,7 @@ free_port() {
             my $t = IO::Socket::INET->new(Proto=>"tcp", LocalAddr=>"127.0.0.1", LocalPort=>$p, Listen=>1) or next;
             print $p; exit 0 } exit 1'
 }
-PORT=$(free_port)
+if [ -n "${KARI_PORT_BASE:-}" ]; then PORT=$(kari_port 0); else PORT=$(free_port); fi
 [ -n "$PORT" ] || { echo "FAIL: no free port"; exit 1; }
 
 # write_conf <file> <options-body> [extra top-level text]
@@ -190,7 +191,7 @@ expect_refused "port 53 (daemon mode)" "ports below 1024" "$TMP/p53d.conf"
 expect_refused "-p 53 override" "ports below 1024" -f -p 53 "$TMP/nouser.conf"
 
 # a TCP port held by another process (without SO_REUSEPORT)
-BUSY_PORT=$(free_port)
+if [ -n "${KARI_PORT_BASE:-}" ]; then BUSY_PORT=$(kari_port 10); else BUSY_PORT=$(free_port); fi
 perl -MIO::Socket::INET -e '
     my $t = IO::Socket::INET->new(Proto=>"tcp", LocalAddr=>"127.0.0.1", LocalPort=>$ARGV[0], Listen=>1, ReuseAddr=>0) or exit 1;
     sleep 30' "$BUSY_PORT" &

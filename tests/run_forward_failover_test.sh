@@ -23,7 +23,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 KARIDNS="$ROOT_DIR/karidns"
 DAG="$ROOT_DIR/dag"
 
-PORT=$((26000 + $$ % 4000))
+PORT=$(kari_port 0 $((26000 + $$ % 4000)))
 SILENT=$((PORT + 1))
 WRONG=$((PORT + 2))
 GOOD=$((PORT + 3))

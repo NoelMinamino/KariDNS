@@ -25,9 +25,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 KARIDNS="$BASE_DIR/karidns-asan"
 DAG="$BASE_DIR/dag"
-PORT=15480      # default options
-MPORT=15479     # minimal-any yes
-BPORT=15478     # BIND named (differential check, when installed)
+PORT=$(kari_port 0 15480)      # default options
+MPORT=$(kari_port 100 15479)     # minimal-any yes
+BPORT=$(kari_port 200 15478)     # BIND named (differential check, when installed)
 Z=n3owner.test
 
 echo "=== NSEC3 owner name queries (RFC 5155 §7.2.8) ==="

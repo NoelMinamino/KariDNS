@@ -21,7 +21,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 KARIDNS="$ROOT_DIR/karidns"
 DAG="$ROOT_DIR/dag"
 
-PORT=$((38000 + $$ % 4000))
+PORT=$(kari_port 0 $((38000 + $$ % 4000)))
 TMP_DIR="/tmp/log_rotation_ts_test_$$"
 rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR"

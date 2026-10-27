@@ -15,7 +15,7 @@ DAG="$ROOT/dag"
 [ -x "$DAG" ] || make -C "$ROOT" dag
 [ -x "$BIN" ] || make -C "$ROOT" karidns
 
-PORT=15856
+PORT=$(kari_port 0 15856)
 W=$(mktemp -d "${TMPDIR:-/tmp}/karidns-dagcol.XXXXXX")
 chmod 755 "$W" # readable after the privilege drop when run as root
 USER_OPT=""

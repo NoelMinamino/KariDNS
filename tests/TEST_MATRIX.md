@@ -459,13 +459,32 @@ sh tests/run_all_suite.sh --no-dag
 sh tests/run_all_suite.sh --stop-on-failure
 sh tests/run_all_suite.sh --verbose
 
+# 8. Number of tests running at the same time (default: $KARI_JOBS, else the CPU count)
+sh tests/run_all_suite.sh -j 4
+sh tests/run_all_suite.sh -j 1       # one test at a time, registration order
+
 # 8. List all registered tests
 sh tests/run_all_suite.sh --list
 ```
 
 Integration tests that need loopback aliases (127.0.0.2 and up) add them when run as root and report SKIP otherwise.
 
-Tests stop only the servers they started, so other karidns instances on the host (another working copy, a long-running server) survive a suite run. Test scripts source [`tests/lib_proc.sh`](lib_proc.sh) and use `kari_kill_tree "$SERVER_PID"` (the karidns supervisor and its backend/router/broker children) or `kari_kill_conf <test-specific config path>`; do not use `killall` or an unscoped `pkill`/`pgrep`. `run_all_suite.sh` records the karidns processes that exist when it starts and its stale-process cleanup leaves those alone.
+### 4.1.1 Parallel execution (`-j`)
+
+`run_all_suite.sh` runs `N` tests at a time (`-j N`, `--jobs N`; default `$KARI_JOBS`, else `sysctl -n hw.ncpu`, `nproc`, 1). `-j 1` is the old sequential run: registration order, the by-name cleanup before every test. `--verbose` implies `-j 1`; at most 29 jobs.
+
+- **Slots.** Test `i` of a batch runs in a slot `s` (0 .. N-1) and gets `KARI_SLOT=s`, `KARI_PORT_BASE=20000 + 1000*s` and `KARI_TMP=<scratch>/s<s>` (an empty directory, emptied before and after every test). A script takes its ports with `kari_port <offset> [fallback]` from [`tests/lib_proc.sh`](lib_proc.sh): `KARI_PORT_BASE + offset` under the runner, `fallback` (the port or PID formula it used before) when run on its own, so every script still runs standalone as `sh tests/run_X_test.sh`. A script keeps its offsets below 1000 and different per port (neighbour ports such as `PORT + 1` stay derived from one `kari_port` call; the scripts that need more than one start them 100 apart). Temporary files are made with `mktemp -d` (or a `$$`-suffixed name), never a shared fixed path.
+- **Own session.** Each test runs in a session of its own (`perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV'`); when it ends the runner kills that process group and nothing else. The by-name cleanup (`cleanup_stale_processes`: `pkill -f mock_*.pl`, `/tmp/karidns*.sock`, `tests/*.tmp`) runs only while no test is running: at the start, at the end and around each serial test.
+- **Order.** The parallel tests start longest first, by the times in the previous `tests/.test_logs/summary.tsv` (tests it does not list count as 10 s; no previous file: registration order). One line per test is printed when it finishes, a FAIL with the tail of its log. `summary.tsv` and the final report are in registration order. `--stop-on-failure` kills the running tests and stops.
+- **Exclusive groups and serial tests.** `register_test <category> <bin|sh> <command> <description> [par|group:NAME|serial]`.
+  - `group:NAME` (several: `group:a+b`): the tests of one group run one at a time, but next to the `par` tests (a group occupies one slot while it runs); a free slot takes the first not yet started test of the longest-first queue whose groups are idle. Groups: `alias` (tests that add loopback aliases 127.0.0.2 and up with `ifconfig lo0 ... alias`; checked on FreeBSD 15.1: 240 add/remove cycles, `/32` and `/8` form, did not disturb connections to 127.0.0.1), `pg` (one PostgreSQL server: roles and databases), `defctl` (servers that use the default control socket `/var/run/karidns/control.sock`, i.e. a `control-channel` without `socket` or `port`, and the shared `tests/karidns-test.conf` with port 10053).
+  - `serial`: runs alone, one by one, after the batch: stress, performance, sanitizer, fuzz and TSan jobs, `run_dag_ci_test.sh` (about 35 sub-tests of its own), tests that edit `tests/zones/example.com.zone` (read by other tests), tests with fixed ports or files in `/tmp`, and four tests that failed 2 or 3 of 6 `-j 4` runs but pass alone (`catalog_zone`, `karictl_reload_reconfig`, `zone_oom_partial_load`: the result of a `karictl reload` is checked right after the command; cause not found).
+  - The reason is the comment on the `register_test` line. When you cannot make a new test independent of the others, give it a group or `serial`.
+- **Rules for a new test.** Take every port from `kari_port`; put every file under `mktemp -d` (or `${KARI_TMP:-...}`); stop the servers you started with `kari_kill_tree "$PID"` or `kari_kill_conf <your conf>`, never `killall` or an unscoped `pkill`; do not add or remove loopback aliases unless the test is in group `alias`; a script that starts other `kari_port` scripts at the same time must give them separate windows (`run_dag_ci_test.sh` unsets `KARI_PORT_BASE` for its sub-tests).
+- **Coverage.** `make coverage-run` passes `-j $(COV_JOBS)` (`make coverage COV_JOBS=1` for the sequential run). Profile files are per process (`%p`, classic mode) or per instrumented binary and shared with `mmap` (`%m`, `%c`, continuous mode), both safe for concurrent processes.
+
+
+Tests stop only the servers they started, so other karidns instances on the host (another working copy, a long-running server) survive a suite run. Test scripts source [`tests/lib_proc.sh`](lib_proc.sh) and use `kari_kill_tree "$SERVER_PID"` (the karidns supervisor and its backend/router/broker children) or `kari_kill_conf <test-specific config path>`; do not use `killall` or an unscoped `pkill`/`pgrep`. `run_all_suite.sh` stops only the karidns servers that carry its own `KARIDNS_SUITE_ID` in their environment (and, per test, the process group of that test).
 
 Unit test binaries can also be built and run from the Makefile: `make unit-tests` (all), `make <name>_test` (one), and `make unit-tests-asan` / `make test_<name>-asan` for ASan/UBSan builds.
 

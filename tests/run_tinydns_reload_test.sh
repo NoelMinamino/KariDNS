@@ -18,7 +18,7 @@ DAG="$BIN_DIR/dag"
 
 TMP_DIR="$(mktemp -d /tmp/karidns_tinyreload.XXXXXX)"
 chmod 755 "$TMP_DIR"
-PORT=$((31000 + $$ % 3000))
+PORT=$(kari_port 0 $((31000 + $$ % 3000)))
 SERVER_PID=""
 FAILED=0
 

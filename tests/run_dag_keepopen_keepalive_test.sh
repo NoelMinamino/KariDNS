@@ -1,4 +1,6 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
+DEAD_PORT=$(kari_port 990 10053)
 set -e
 
 # ==============================================================================
@@ -65,7 +67,7 @@ run_skip() {
 CONF_FILE="/tmp/karidns_keepopen_test_$$.conf"
 LOG_FILE="/tmp/karidns_keepopen_test_$$.log"
 BATCH_FILE="/tmp/dag_batch_keepopen_$$.txt"
-PORT=$((15000 + $$ % 10000))
+PORT=$(kari_port 0 $((15000 + $$ % 10000)))
 SERVER_PID=""
 
 cleanup() {
@@ -81,8 +83,8 @@ trap cleanup EXIT INT TERM
 
 echo "=== 1. Testing +keepalive (EDNS TCP Keepalive, RFC 7828) Option Generation ==="
 # +keepalive generates Option Code 11 (0x000B) with length 0
-run_check "+keepalive emits EDNS Option 11 (00 0b 00 00)" "$DAG @127.0.0.1 -p 10053 example.com A +keepalive +qr +timeout=1" "(00 0b 00 00|KEEPALIVE)"
-run_check "+nokeepalive suppresses Option 11" "$DAG @127.0.0.1 -p 10053 example.com A +nokeepalive +qr +timeout=1" "(opcode: QUERY|status: NOERROR)"
+run_check "+keepalive emits EDNS Option 11 (00 0b 00 00)" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +keepalive +qr +timeout=1" "(00 0b 00 00|KEEPALIVE)"
+run_check "+nokeepalive suppresses Option 11" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +nokeepalive +qr +timeout=1" "(opcode: QUERY|status: NOERROR)"
 
 echo "=== 2. Starting KariDNS Server for Live TCP/Keepopen Tests ==="
 

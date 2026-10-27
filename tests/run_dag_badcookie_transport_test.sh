@@ -1,4 +1,6 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
+DEAD_PORT=$(kari_port 990 10053)
 set -e
 
 # ==============================================================================
@@ -71,7 +73,7 @@ run_skip() {
 
 CONF_FILE="/tmp/karidns_badcookie_test_$$.conf"
 LOG_FILE="/tmp/karidns_badcookie_test_$$.log"
-PORT=$((15000 + $$ % 10000))
+PORT=$(kari_port 0 $((15000 + $$ % 10000)))
 SERVER_PID=""
 
 cleanup() {
@@ -91,12 +93,12 @@ if [ "$DAG" = "dig" ]; then
     run_skip "+keepopen flag accepted"
 else
     run_check "--help contains +keepopen RFC 7766 note" "$DAG --help" "Keep TCP socket open between consecutive queries \(RFC 7766\)"
-    run_check "+keepopen flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +tcp +keepopen +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|no servers could be reached)"
+    run_check "+keepopen flag accepted" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +tcp +keepopen +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|no servers could be reached)"
 fi
 
 echo "=== 2. Testing +expire EDNS Option (RFC 7314) Generation ==="
 # +expire should include EDNS Option Code 9 (0x0009) with length 0 (0x0000)
-run_check "+expire emits EDNS option 9 in query" "$DAG @127.0.0.1 -p 10053 example.com A +expire +qr +timeout=1" "(00 09 00 00|EXPIRE)"
+run_check "+expire emits EDNS option 9 in query" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +expire +qr +timeout=1" "(00 09 00 00|EXPIRE)"
 
 echo "=== 3. Testing Real Queries against KariDNS ==="
 

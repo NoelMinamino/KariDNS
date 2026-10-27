@@ -6,6 +6,8 @@ set -e
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SCRIPT_DIR/lib_proc.sh"
+DEAD_PORT=$(kari_port 990 10053)
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 if [ ! -x "$ROOT_DIR/dag" ]; then
@@ -82,35 +84,35 @@ run_skip() {
 
 echo "=== 1. Testing +idn and +noidn flags ==="
 # +idn and +noidn should be recognized as valid options
-run_check "+idn flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +idn +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
-run_check "+noidn flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +noidn +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
-run_check "+idnin and +idnout accepted" "$DAG @127.0.0.1 -p 10053 example.com A +idnin +idnout +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
-run_check "+idnin converts UTF-8 domain to Punycode" "$DAG @127.0.0.1 -p 10053 日本語.jp A +idnin +qr +timeout=1" "(xn--wgv71a119e\.jp|timed out|no usable response|connection refused|no servers could be reached)"
-run_check "+multi flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +multi +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
-run_check "+nomulti flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +nomulti +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+run_check "+idn flag accepted" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +idn +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+run_check "+noidn flag accepted" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +noidn +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+run_check "+idnin and +idnout accepted" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +idnin +idnout +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+run_check "+idnin converts UTF-8 domain to Punycode" "$DAG @127.0.0.1 -p ${DEAD_PORT} 日本語.jp A +idnin +qr +timeout=1" "(xn--wgv71a119e\.jp|timed out|no usable response|connection refused|no servers could be reached)"
+run_check "+multi flag accepted" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +multi +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+run_check "+nomulti flag accepted" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +nomulti +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
 echo "=== 2. Testing +noednsopt and +mqtype flags ==="
 # +ednsopt=65001:0102 adds custom option 65001 (0xfde9 in hex dump)
-run_check "+ednsopt adds custom EDNS option" "$DAG @127.0.0.1 -p 10053 example.com A +ednsopt=65001:0102 +qr +timeout=1" "(fd e9 00 02 01 02|OPT[ =]65001|OPTION: 65001)"
-run_not_check "+noednsopt clears custom EDNS option" "$DAG @127.0.0.1 -p 10053 example.com A +ednsopt=65001:0102 +noednsopt +qr +timeout=1" "(fd e9 00 02 01 02|OPTION: 65001|OPT[ =]65001)"
+run_check "+ednsopt adds custom EDNS option" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +ednsopt=65001:0102 +qr +timeout=1" "(fd e9 00 02 01 02|OPT[ =]65001|OPTION: 65001)"
+run_not_check "+noednsopt clears custom EDNS option" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +ednsopt=65001:0102 +noednsopt +qr +timeout=1" "(fd e9 00 02 01 02|OPTION: 65001|OPT[ =]65001)"
 # +nocookie: the default client cookie (dig parity) would move the option so that its bytes wrap across hexdump lines
-run_check "multiple +mqtype flags merge into single option" "$DAG @127.0.0.1 -p 10053 example.com A +mqtype=A +mqtype=AAAA +nocookie +qr +timeout=1" "(00 14 00 04 00 01 00 1c|OPT[ =]20|OPTION: 20)"
+run_check "multiple +mqtype flags merge into single option" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +mqtype=A +mqtype=AAAA +nocookie +qr +timeout=1" "(00 14 00 04 00 01 00 1c|OPT[ =]20|OPTION: 20)"
 
 # dig defaults: EDNS0 with udp 1232 and a client cookie on ordinary queries
-run_check "default query sends EDNS0 udp 1232" "$DAG @127.0.0.1 -p 10053 example.com A +qr +timeout=1" "EDNS: version: 0, flags:; udp: 1232"
-run_check "default query sends a client cookie" "$DAG @127.0.0.1 -p 10053 example.com A +qr +timeout=1" "; COOKIE: [0-9a-f]{16}"
-run_not_check "+noedns sends no OPT record" "$DAG @127.0.0.1 -p 10053 example.com A +noedns +qr +timeout=1" "OPT PSEUDOSECTION"
-run_check "+nocookie keeps EDNS" "$DAG @127.0.0.1 -p 10053 example.com A +nocookie +qr +timeout=1" "EDNS: version: 0"
-run_not_check "+nocookie sends no cookie" "$DAG @127.0.0.1 -p 10053 example.com A +nocookie +qr +timeout=1" "; COOKIE:"
-run_check "+bufsize changes the advertised size" "$DAG @127.0.0.1 -p 10053 example.com A +bufsize=4096 +qr +timeout=1" "udp: 4096"
+run_check "default query sends EDNS0 udp 1232" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +qr +timeout=1" "EDNS: version: 0, flags:; udp: 1232"
+run_check "default query sends a client cookie" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +qr +timeout=1" "; COOKIE: [0-9a-f]{16}"
+run_not_check "+noedns sends no OPT record" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +noedns +qr +timeout=1" "OPT PSEUDOSECTION"
+run_check "+nocookie keeps EDNS" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +nocookie +qr +timeout=1" "EDNS: version: 0"
+run_not_check "+nocookie sends no cookie" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +nocookie +qr +timeout=1" "; COOKIE:"
+run_check "+bufsize changes the advertised size" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +bufsize=4096 +qr +timeout=1" "udp: 4096"
 # UPDATE and NOTIFY keep no OPT by default (like nsupdate); an explicit EDNS option still adds one
-run_check "UPDATE +qr prints the sent message" "$DAG @127.0.0.1 -p 10053 example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +qr +timeout=1" "opcode: UPDATE.*|ADDITIONAL: 0"
-run_not_check "UPDATE sends no OPT by default" "$DAG @127.0.0.1 -p 10053 example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +qr +timeout=1" "OPT PSEUDOSECTION"
-run_not_check "NOTIFY sends no OPT by default" "$DAG @127.0.0.1 -p 10053 example.com SOA +opcode=NOTIFY +qr +timeout=1" "OPT PSEUDOSECTION"
-run_check "UPDATE sends RD=0 and AD=0 (RFC 2136 Z bits)" "$DAG @127.0.0.1 -p 10053 example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +qr +timeout=1" "^;; flags:; QUERY: 1"
-run_check "UPDATE with explicit +rec sets RD" "$DAG @127.0.0.1 -p 10053 example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +rec +qr +timeout=1" "^;; flags: rd; QUERY: 1"
-run_check "ordinary query keeps RD and AD" "$DAG @127.0.0.1 -p 10053 example.com A +qr +timeout=1" "^;; flags: rd ad; QUERY: 1"
-run_check "UPDATE with explicit +edns sends OPT" "$DAG @127.0.0.1 -p 10053 example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +edns +qr +timeout=1" "OPT PSEUDOSECTION"
+run_check "UPDATE +qr prints the sent message" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +qr +timeout=1" "opcode: UPDATE.*|ADDITIONAL: 0"
+run_not_check "UPDATE sends no OPT by default" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +qr +timeout=1" "OPT PSEUDOSECTION"
+run_not_check "NOTIFY sends no OPT by default" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA +opcode=NOTIFY +qr +timeout=1" "OPT PSEUDOSECTION"
+run_check "UPDATE sends RD=0 and AD=0 (RFC 2136 Z bits)" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +qr +timeout=1" "^;; flags:; QUERY: 1"
+run_check "UPDATE with explicit +rec sets RD" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +rec +qr +timeout=1" "^;; flags: rd; QUERY: 1"
+run_check "ordinary query keeps RD and AD" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +qr +timeout=1" "^;; flags: rd ad; QUERY: 1"
+run_check "UPDATE with explicit +edns sends OPT" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +edns +qr +timeout=1" "OPT PSEUDOSECTION"
 
 echo "=== 3. Testing Dynamic DNS UPDATE prerequisites (--prereq-*) ==="
 if [ "$DAG" = "dig" ]; then
@@ -121,22 +123,22 @@ if [ "$DAG" = "dig" ]; then
     run_skip "--prereq colon-delimited with rdata"
 else
     # Test --prereq-nxrrset with separate arguments (name type)
-    run_check "--prereq-nxrrset separate arguments" "$DAG @127.0.0.1 -p 10053 example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-nxrrset test.example.com A +qr +timeout=1" "Query \([0-9]+ bytes\)"
+    run_check "--prereq-nxrrset separate arguments" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-nxrrset test.example.com A +qr +timeout=1" "Query \([0-9]+ bytes\)"
     # Test --prereq-yxrrset with separate arguments (name type)
-    run_check "--prereq-yxrrset separate arguments without rdata" "$DAG @127.0.0.1 -p 10053 example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxrrset test.example.com A +qr +timeout=1" "Query \([0-9]+ bytes\)"
+    run_check "--prereq-yxrrset separate arguments without rdata" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxrrset test.example.com A +qr +timeout=1" "Query \([0-9]+ bytes\)"
     # Test --prereq-yxrrset with separate arguments including rdata (name type rdata)
-    run_check "--prereq-yxrrset separate arguments with rdata" "$DAG @127.0.0.1 -p 10053 example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxrrset test.example.com A 1.2.3.4 +qr +timeout=1" "Query \([0-9]+ bytes\)"
+    run_check "--prereq-yxrrset separate arguments with rdata" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxrrset test.example.com A 1.2.3.4 +qr +timeout=1" "Query \([0-9]+ bytes\)"
     # Test --prereq-yxrrset with quoted single argument
-    run_check "--prereq-yxrrset quoted argument with rdata" "$DAG @127.0.0.1 -p 10053 example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxrrset 'test.example.com A 1.2.3.4' +qr +timeout=1" "Query \([0-9]+ bytes\)"
+    run_check "--prereq-yxrrset quoted argument with rdata" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxrrset 'test.example.com A 1.2.3.4' +qr +timeout=1" "Query \([0-9]+ bytes\)"
     # Test --prereq=yxrrset:name:type:rdata colon-delimited format
-    run_check "--prereq colon-delimited with rdata" "$DAG @127.0.0.1 -p 10053 example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq='yxrrset:test.example.com:A:1.2.3.4' +qr +timeout=1" "Query \([0-9]+ bytes\)"
+    run_check "--prereq colon-delimited with rdata" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq='yxrrset:test.example.com:A:1.2.3.4' +qr +timeout=1" "Query \([0-9]+ bytes\)"
     # Test --prereq= with colons inside RDATA (e.g. IPv6 address or TXT)
-    run_check "--prereq colon-delimited with IPv6 RDATA" "$DAG @127.0.0.1 -p 10053 example.com SOA --update-add 'test.example.com 300 IN AAAA 2001:db8::1' --prereq='yxrrset:test.example.com:AAAA:2001:db8::1' +qr +timeout=1" "Query \([0-9]+ bytes\)"
+    run_check "--prereq colon-delimited with IPv6 RDATA" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN AAAA 2001:db8::1' --prereq='yxrrset:test.example.com:AAAA:2001:db8::1' +qr +timeout=1" "Query \([0-9]+ bytes\)"
 fi
 
 echo "=== 3.5. Testing +notrace and +nonssearch negation flags ==="
-run_check "+notrace flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +notrace +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
-run_check "+nonssearch flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +nonssearch +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+run_check "+notrace flag accepted" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +notrace +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+run_check "+nonssearch flag accepted" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +nonssearch +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
 echo "=== 4. Testing Structural --break exclusivity warning & help ==="
 if [ "$DAG" = "dig" ]; then
@@ -144,30 +146,30 @@ if [ "$DAG" = "dig" ]; then
     run_skip "--break-help displays exclusivity note"
 else
     # Multiple structural breaks should emit a warning
-    run_check "Multiple structural breaks warning" "$DAG @127.0.0.1 -p 10053 example.com A --break compression-loop --break oversized-qname +timeout=1" "warning: --break 'oversized-qname' ignored; structural break kind is already set"
+    run_check "Multiple structural breaks warning" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A --break compression-loop --break oversized-qname +timeout=1" "warning: --break 'oversized-qname' ignored; structural break kind is already set"
     # --break-help contains exclusivity note
     run_check "--break-help displays exclusivity note" "$DAG --break-help" "NOTE: Only one \*structural\* --break kind"
 fi
 
 echo "=== 6. Testing +nsid, +cookie, +bufsize, and formatting flags ==="
-run_check "+nsid and +nonsid flags" "$DAG @127.0.0.1 -p 10053 example.com A +nsid +qr +timeout=1" "(00 03 00 00|OPT[ =]3|OPTION: 3|timed out|no servers could be reached|no usable response)"
-run_check "+cookie flag" "$DAG @127.0.0.1 -p 10053 example.com A +cookie=0102030405060708 +qr +timeout=1" "(00 0a 00 08 01 02 03 04|COOKIE|OPT[ =]10|OPTION: 10|timed out|no servers could be reached|no usable response)"
-run_check "+bufsize=1232" "$DAG @127.0.0.1 -p 10053 example.com A +bufsize=1232 +qr +timeout=1" "(04 d0|udp: 1232|timed out|no servers could be reached|no usable response)"
-run_check "+ndots=2 +tries=2 +retry=2" "$DAG @127.0.0.1 -p 10053 example.com A +ndots=2 +tries=2 +retry=2 +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
-run_check "+yaml output formatting" "$DAG @127.0.0.1 -p 10053 example.com A +yaml +timeout=1" "(---|\"status\"|timed out|no servers could be reached|no usable response)"
-run_check "+short +multiline" "$DAG @127.0.0.1 -p 10053 example.com A +short +multiline +timeout=1" "(timed out|no servers could be reached|no usable response|^$|[0-9a-fA-F])"
-run_check "--prereq-nxdomain" "$DAG @127.0.0.1 -p 10053 example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-nxdomain nx.example.com +qr +timeout=1" "Query \([0-9]+ bytes\)"
-run_check "--prereq-yxdomain" "$DAG @127.0.0.1 -p 10053 example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxdomain yx.example.com +qr +timeout=1" "Query \([0-9]+ bytes\)"
+run_check "+nsid and +nonsid flags" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +nsid +qr +timeout=1" "(00 03 00 00|OPT[ =]3|OPTION: 3|timed out|no servers could be reached|no usable response)"
+run_check "+cookie flag" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +cookie=0102030405060708 +qr +timeout=1" "(00 0a 00 08 01 02 03 04|COOKIE|OPT[ =]10|OPTION: 10|timed out|no servers could be reached|no usable response)"
+run_check "+bufsize=1232" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +bufsize=1232 +qr +timeout=1" "(04 d0|udp: 1232|timed out|no servers could be reached|no usable response)"
+run_check "+ndots=2 +tries=2 +retry=2" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +ndots=2 +tries=2 +retry=2 +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+run_check "+yaml output formatting" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +yaml +timeout=1" "(---|\"status\"|timed out|no servers could be reached|no usable response)"
+run_check "+short +multiline" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +short +multiline +timeout=1" "(timed out|no servers could be reached|no usable response|^$|[0-9a-fA-F])"
+run_check "--prereq-nxdomain" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-nxdomain nx.example.com +qr +timeout=1" "Query \([0-9]+ bytes\)"
+run_check "--prereq-yxdomain" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxdomain yx.example.com +qr +timeout=1" "Query \([0-9]+ bytes\)"
 
 echo "=== 7. Testing Conflicting Options, Invalid Ports, and Invalid Server IPs ==="
 # Conflicting transport flags: +tcp then +udp (udp wins)
-run_check "Conflicting +tcp and +udp (+udp last)" "$DAG @127.0.0.1 -p 10053 example.com A +tcp +udp +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+run_check "Conflicting +tcp and +udp (+udp last)" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +tcp +udp +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 # Conflicting transport flags: +udp then +tcp (tcp wins)
-run_check "Conflicting +udp and +tcp (+tcp last)" "$DAG @127.0.0.1 -p 10053 example.com A +udp +tcp +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+run_check "Conflicting +udp and +tcp (+tcp last)" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +udp +tcp +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
 if [ "$DAG" != "dig" ]; then
     # TSIG and SIG(0) conflict
-    run_check "TSIG and SIG(0) exclusivity error" "$DAG @127.0.0.1 -p 10053 example.com A +tsig=hmac-sha256:key:c2Vj +sig0 +timeout=1" "cannot be combined"
+    run_check "TSIG and SIG(0) exclusivity error" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +tsig=hmac-sha256:key:c2Vj +sig0 +timeout=1" "cannot be combined"
     # Invalid port in @server#port
     run_check "Invalid port in @server#port warning" "$DAG @127.0.0.1#99999 example.com A +timeout=1" "warning: invalid port"
 fi

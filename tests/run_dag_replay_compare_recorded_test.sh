@@ -8,6 +8,7 @@
 # dnstap Frame Streams, missing response warning handling, and CLI mutual exclusion.
 # ==============================================================================
 
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # Comparison mode exit status: 1 when a mismatch was found, 0 otherwise.
@@ -31,7 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$BASE_DIR"
 
-PORT1=${KARIDNS_COMPARE_PORT1:-$((29000 + $$ % 1000))}
+PORT1=${KARIDNS_COMPARE_PORT1:-$(kari_port 0 $((29000 + $$ % 1000)))}
 TMP_DIR="$(mktemp -d /tmp/karidns_compare_test.XXXXXX)"
 CONF1="$TMP_DIR/server1.conf"
 ZONE1="$TMP_DIR/server1.zone"

@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # ==============================================================================
@@ -42,7 +43,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-KARIDNS_PORT=$((37000 + $$ % 5000))
+KARIDNS_PORT=$(kari_port 0 $((37000 + $$ % 5000)))
 MOCK_PORT=$((KARIDNS_PORT + 1))
 FAILED=0
 USER_OPT=""

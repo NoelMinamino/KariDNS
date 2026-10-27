@@ -1,4 +1,6 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
+DEAD_PORT=$(kari_port 990 10053)
 set -e
 
 # ==============================================================================
@@ -110,15 +112,15 @@ trap cleanup EXIT INT TERM
 echo "=== 1. Testing CLI Flags & Options ==="
 
 run_check "+notrace flag accepted without option error" \
-    "$DAG @127.0.0.1 -p 10053 example.com A +notrace +timeout=1" \
+    "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +notrace +timeout=1" \
     "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
 run_check "+nonssearch flag accepted without option error" \
-    "$DAG @127.0.0.1 -p 10053 example.com A +nonssearch +timeout=1" \
+    "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +nonssearch +timeout=1" \
     "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
 run_check "TSIG signature generation (-y)" \
-    "$DAG @127.0.0.1 -p 10053 example.com A -y hmac-sha256:testkey:dGVzdA== +qr +timeout=1" \
+    "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A -y hmac-sha256:testkey:dGVzdA== +qr +timeout=1" \
     "(TSIG|testkey|ADDITIONAL)"
 
 if [ "$DAG" = "dig" ]; then
@@ -126,42 +128,42 @@ if [ "$DAG" = "dig" ]; then
     run_skip "TSIG with +fuzztime"
 else
     run_check "TSIG signature generation (+tsig=)" \
-        "$DAG @127.0.0.1 -p 10053 example.com A +tsig=hmac-sha256:testkey:dGVzdA== +qr +timeout=1" \
+        "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +tsig=hmac-sha256:testkey:dGVzdA== +qr +timeout=1" \
         "(TSIG|testkey|ADDITIONAL)"
 
     run_check "TSIG with +fuzztime" \
-        "$DAG @127.0.0.1 -p 10053 example.com A +tsig=hmac-sha256:testkey:dGVzdA== +fuzztime=1646972129 +qr +timeout=1" \
+        "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +tsig=hmac-sha256:testkey:dGVzdA== +fuzztime=1646972129 +qr +timeout=1" \
         "(TSIG|testkey|1646972129|ADDITIONAL)"
 fi
 
 run_check "+cookie flag accepted" \
-    "$DAG @127.0.0.1 -p 10053 example.com A +cookie +timeout=1" \
+    "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +cookie +timeout=1" \
     "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
 run_check "+cookie=HEX flag accepted" \
-    "$DAG @127.0.0.1 -p 10053 example.com A +cookie=0102030405060708 +timeout=1" \
+    "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +cookie=0102030405060708 +timeout=1" \
     "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
 if [ "$DAG" != "dig" ]; then
     run_check "+cookies typo flag rejected as invalid option" \
-        "$DAG @127.0.0.1 -p 10053 example.com A +cookies +timeout=1" \
+        "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +cookies +timeout=1" \
         "Invalid option: \+cookies"
 fi
 
 run_check "+subnet=0 privacy flag accepted" \
-    "$DAG @127.0.0.1 -p 10053 example.com A +subnet=0 +timeout=1" \
+    "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +subnet=0 +timeout=1" \
     "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
 run_check "+subnet=0/0, +subnet=0.0.0.0/0, +subnet=::/0 accepted" \
-    "$DAG @127.0.0.1 -p 10053 example.com A +subnet=0/0 +timeout=1" \
+    "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +subnet=0/0 +timeout=1" \
     "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
 run_check "+padding=128 block padding alignment (+qr)" \
-    "$DAG @127.0.0.1 -p 10053 example.com A +padding=128 +qr +timeout=1" \
+    "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +padding=128 +qr +timeout=1" \
     "Query \(128 bytes\)"
 
 run_check "+ednsopt=100:01020304 hex decode accepted" \
-    "$DAG @127.0.0.1 -p 10053 example.com A +ednsopt=100:01020304 +qr +timeout=1" \
+    "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +ednsopt=100:01020304 +qr +timeout=1" \
     "Query \([0-9]+ bytes\)"
 
 cat <<'KEY_EOF' > "$TMP_DIR/tsig_test.key"
@@ -172,11 +174,11 @@ key "tsig-file-key" {
 KEY_EOF
 
 run_check "TSIG keyfile loading (-k)" \
-    "$DAG @127.0.0.1 -p 10053 -k $TMP_DIR/tsig_test.key example.com A +qr +timeout=1" \
+    "$DAG @127.0.0.1 -p ${DEAD_PORT} -k $TMP_DIR/tsig_test.key example.com A +qr +timeout=1" \
     "(TSIG|tsig-file-key|ADDITIONAL)"
 
 run_check "+nodnssec, +nonsid, +nosubnet flags accepted" \
-    "$DAG @127.0.0.1 -p 10053 example.com A +nodnssec +nonsid +nosubnet +timeout=1" \
+    "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +nodnssec +nonsid +nosubnet +timeout=1" \
     "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
 if [ "$DAG" = "dig" ]; then
@@ -184,17 +186,17 @@ if [ "$DAG" = "dig" ]; then
     run_skip "--break too-short=0" "dag-specific break flag"
 else
     run_check "+nopadding, +hexdump, +nohttps flags accepted" \
-        "$DAG @127.0.0.1 -p 10053 example.com A +nopadding +hexdump +nohttps +timeout=1" \
+        "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +nopadding +hexdump +nohttps +timeout=1" \
         "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
     run_check "--break too-short=0 terminates safely without crash" \
-        "$DAG @127.0.0.1 -p 10053 example.com A --break too-short=0 +timeout=1" \
+        "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A --break too-short=0 +timeout=1" \
         "(timed out|no usable response|connection|status:|timed out|no servers could be reached)"
 fi
 
 echo "example.com A @127.0.0.1" > "$TMP_DIR/test_batch.txt"
 run_check "Batch mode (-f) with @server syntax" \
-    "$DAG -f $TMP_DIR/test_batch.txt -p 10053 +timeout=1" \
+    "$DAG -f $TMP_DIR/test_batch.txt -p ${DEAD_PORT} +timeout=1" \
     "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
 # ==============================================================================
@@ -207,11 +209,11 @@ if [ "$DAG" = "dig" ]; then
     run_skip "--prereq= with multi-colon text RDATA"
 else
     run_check "--prereq= with IPv6 address RDATA containing colons" \
-        "$DAG @127.0.0.1 -p 10053 example.com SOA --update-add 'test.example.com 300 IN AAAA 2001:db8::1' --prereq=yxrrset:test.example.com:AAAA:2001:db8::1 +qr +timeout=1" \
+        "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN AAAA 2001:db8::1' --prereq=yxrrset:test.example.com:AAAA:2001:db8::1 +qr +timeout=1" \
         "Query \([0-9]+ bytes\)"
 
     run_check "--prereq= with multi-colon text RDATA" \
-        "$DAG @127.0.0.1 -p 10053 example.com SOA --update-add 'test.example.com 300 IN TXT \"v=1:a:b:c\"' --prereq=yxrrset:test.example.com:TXT:v=1:a:b:c +qr +timeout=1" \
+        "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com SOA --update-add 'test.example.com 300 IN TXT \"v=1:a:b:c\"' --prereq=yxrrset:test.example.com:TXT:v=1:a:b:c +qr +timeout=1" \
         "Query \([0-9]+ bytes\)"
 fi
 
@@ -223,7 +225,7 @@ echo "=== 3. Testing TCP Stream Buffer Bounds (rlen > resp_cap) ==="
 if ! command -v perl >/dev/null 2>&1; then
     echo "[-] perl is not installed; skipping mock server network tests."
 else
-    PORT_TCP=$((21000 + $$ % 8000))
+    PORT_TCP=$(kari_port 0 $((21000 + $$ % 8000)))
     cat <<'PL_EOF' > "$TMP_DIR/mock_tcp_oversize.pl"
 use strict;
 use warnings;
@@ -281,7 +283,7 @@ PL_EOF
         "(NOERROR|status: NOERROR|timed out|no servers could be reached|connection refused)"
 
     echo "--- 4-2. Local Mock HTTP Server (Content-Length & URI Building) ---"
-    PORT_DOH=$((22000 + $$ % 8000))
+    PORT_DOH=$(kari_port 100 $((22000 + $$ % 8000)))
     cat <<'PL_EOF' > "$TMP_DIR/mock_doh_server.pl"
 use strict;
 use warnings;
@@ -358,7 +360,7 @@ PL_EOF
 # ==============================================================================
     echo "=== 5. Testing RDATA Bounds Checking on Malformed Records ==="
 
-    PORT_UDP=$((23000 + $$ % 8000))
+    PORT_UDP=$(kari_port 200 $((23000 + $$ % 8000)))
     cat <<'PL_EOF' > "$TMP_DIR/mock_malformed_rdata.pl"
 use strict;
 use warnings;
@@ -400,7 +402,7 @@ PL_EOF
 # ==============================================================================
     echo "=== 6. Testing +short with +ttlid and +ttlunits ==="
 
-    PORT_SHORT=$((24000 + $$ % 8000))
+    PORT_SHORT=$(kari_port 300 $((24000 + $$ % 8000)))
     cat <<'PL_EOF' > "$TMP_DIR/mock_short_ttl.pl"
 use strict;
 use warnings;
@@ -450,14 +452,14 @@ PL_EOF
     echo "=== 7. Testing IXFR serial default, LOC version != 0, and search absolute name ==="
 
     run_check "IXFR without explicit serial defaults to serial 0 (+qr)" \
-        "$DAG @127.0.0.1 -p 10053 example.com IXFR +qr +timeout=1" \
+        "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com IXFR +qr +timeout=1" \
         "(IXFR|Query \([0-9]+ bytes\))"
 
     run_check "+search with absolute domain name (trailing dot) does not expand" \
-        "$DAG @127.0.0.1 -p 10053 example.com. A +search +domain=sub.example.net +qr +timeout=1" \
+        "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com. A +search +domain=sub.example.net +qr +timeout=1" \
         "example\.com\."
 
-    PORT_LOC=$((25000 + $$ % 8000))
+    PORT_LOC=$(kari_port 400 $((25000 + $$ % 8000)))
     cat <<'PL_EOF' > "$TMP_DIR/mock_loc.pl"
 use strict;
 use warnings;
@@ -500,18 +502,18 @@ PL_EOF
     echo "=== 8. Testing TYPE0 query, +showsearch, CAA escape, and TLS-CA error ==="
 
     run_check "TYPE0 is sent as valid query type (dig compatibility)" \
-        "$DAG @127.0.0.1 -p 10053 example.com TYPE0 +timeout=1 +qr" \
+        "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com TYPE0 +timeout=1 +qr" \
         ";example\.com\.[[:space:]]+IN[[:space:]]+TYPE0"
 
     run_check "TYPE65536 is rejected as invalid/unknown query type" \
-        "$DAG @127.0.0.1 -p 10053 example.com TYPE65536 +timeout=1" \
+        "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com TYPE65536 +timeout=1" \
         "(invalid|unknown|error|Usage)"
 
     run_check "+showsearch flag is accepted and enables search list (+qr)" \
-        "$DAG @127.0.0.1 -p 10053 myhost A +domain=corp.example.com +showsearch +qr +timeout=1" \
+        "$DAG @127.0.0.1 -p ${DEAD_PORT} myhost A +domain=corp.example.com +showsearch +qr +timeout=1" \
         "myhost\.corp\.example\.com"
 
-    PORT_TLS=$((27000 + $$ % 8000))
+    PORT_TLS=$(kari_port 500 $((27000 + $$ % 8000)))
     cat <<'PL_EOF' > "$TMP_DIR/mock_tcp.pl"
 use strict;
 use warnings;
@@ -540,7 +542,7 @@ PL_EOF
     kill -9 "$TLS_PID" 2>/dev/null || true
     TLS_PID=""
 
-    PORT_CAA=$((26000 + $$ % 8000))
+    PORT_CAA=$(kari_port 600 $((26000 + $$ % 8000)))
     cat <<'PL_EOF' > "$TMP_DIR/mock_caa.pl"
 use strict;
 use warnings;
@@ -587,7 +589,7 @@ echo ""
 echo "--- Section 9: APL Record Parser Security and Validation ---"
 
 if command -v perl >/dev/null 2>&1; then
-    PORT_APL=$((25000 + $$ % 8000))
+    PORT_APL=$(kari_port 700 $((25000 + $$ % 8000)))
     cat <<'PL_EOF' > "$TMP_DIR/mock_apl.pl"
 use strict;
 use warnings;

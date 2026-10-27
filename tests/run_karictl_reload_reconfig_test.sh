@@ -24,7 +24,7 @@ KARICTL="$ROOT_DIR/karictl"
 DAG="$ROOT_DIR/dag"
 
 FAILED=0
-PORT=$((21000 + $$ % 8000))
+PORT=$(kari_port 0 $((21000 + $$ % 8000)))
 CTRL_PORT=$((PORT + 1))
 TMP_DIR="/tmp/karictl_reload_reconfig_test_$$"
 rm -rf "$TMP_DIR"

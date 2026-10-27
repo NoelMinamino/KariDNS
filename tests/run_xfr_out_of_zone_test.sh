@@ -12,8 +12,8 @@ BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 KARIDNS="$BASE_DIR/karidns"
 DAG="$BASE_DIR/dag"
 KARICHECK="$BASE_DIR/karicheck"
-PPORT=15441
-SPORT=15442
+PPORT=$(kari_port 0 15441)
+SPORT=$(kari_port 100 15442)
 
 echo "=== Out-of-zone data: loader, karicheck, primary -> secondary transfer (R-27) ==="
 

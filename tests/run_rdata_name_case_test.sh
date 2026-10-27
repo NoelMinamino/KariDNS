@@ -20,6 +20,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
+. "$ROOT/tests/lib_proc.sh"
 
 KARIDNS=${KARIDNS:-./karidns}
 for b in "$KARIDNS" ./dag; do
@@ -38,7 +39,7 @@ trap cleanup EXIT INT TERM
 PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
-PA=$((20000 + $$ % 20000)); PB=$((PA + 1))
+PA=$(kari_port 0 $((20000 + $$ % 20000))); PB=$((PA + 1))
 USER_LINE=""
 [ "$(id -u)" = "0" ] && USER_LINE='user "nobody";'
 
@@ -125,7 +126,7 @@ else
         "$T/dbquery" -p "$PA" -t 3 "$T/q.list" "$T/q.a" > /dev/null 2>&1
         "$T/dbquery" -p "$PB" -t 3 "$T/q.list" "$T/q.b" > /dev/null 2>&1
         NQ=$(wc -l < "$T/q.list" | tr -d ' ')
-        diffs=$(awk -F'\t' 'NR == FNR { s[FNR] = $2; next } { n++; if ($2 != s[FNR] || $2 == "TIMEOUT") bad++ } END { printf "%d %d\n", n, bad }' "$T/q.a" "$T/q.b")
+        diffs=$(awk -F'\t' 'FILENAME == ARGV[1] { s[FNR] = $2; next } { n++; if ($2 != s[FNR] || $2 == "TIMEOUT") bad++ } END { printf "%d %d\n", n, bad }' "$T/q.a" "$T/q.b")
         set -- $diffs
         if [ "$1" = "$NQ" ] && [ "$2" = "0" ]; then pass "database zone: $NQ queries byte-identical to the file zone"; else fail "database zone: $2 of $1 queries differ from the file zone"; fi
         # the DB server did serve the zone with the letters as written (not only "the same as the file server")

@@ -24,7 +24,7 @@ KARIDNS="$ROOT_DIR/karidns"
 KARICHECK="$ROOT_DIR/karicheck"
 DAG="$ROOT_DIR/dag"
 
-PORT=$((34000 + $$ % 4000))
+PORT=$(kari_port 0 $((34000 + $$ % 4000)))
 TMP_DIR="/tmp/config_acl_bool_test_$$"
 rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR/logs"

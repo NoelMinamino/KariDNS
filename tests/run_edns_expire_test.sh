@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(dirname "$0")/lib_proc.sh"
 set -e
 
 # ==============================================================================
@@ -22,7 +23,7 @@ DAG="$ROOT_DIR/dag"
 
 [ -x "$KARIDNS" ] && [ -x "$DAG" ] || make -C "$ROOT_DIR" karidns dag
 
-PORT1=$((27000 + $$ % 3000))
+PORT1=$(kari_port 0 $((27000 + $$ % 3000)))
 PORT2=$((PORT1 + 1))
 PORT3=$((PORT1 + 2))
 TMP_DIR="/tmp/karidns_expire_test_$$"

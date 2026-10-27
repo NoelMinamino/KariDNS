@@ -37,7 +37,7 @@ fail() {
     FAILED=$((FAILED + 1))
 }
 
-PORT=$((29000 + ( $$ % 10000 )))
+PORT=$(kari_port 0 $((29000 + ( $$ % 10000 ))))
 SECRET="c2VjcmV0MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3OA=="
 USER_OPT=""
 [ "$(id -u)" = "0" ] && USER_OPT="user \"nobody\"; group \"nobody\";"

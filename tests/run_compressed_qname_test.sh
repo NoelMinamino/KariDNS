@@ -26,7 +26,7 @@ KARIDNS="$BIN_DIR/karidns"
 DAG="$BIN_DIR/dag"
 TQ="perl $SCRIPT_DIR/tsig_query.pl"
 
-PORT=$((40000 + $$ % 3000))
+PORT=$(kari_port 0 $((40000 + $$ % 3000)))
 TMP_DIR="$(mktemp -d /tmp/compressed_qname.XXXXXX)"
 chmod 755 "$TMP_DIR"
 SERVER_PID=""

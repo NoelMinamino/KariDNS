@@ -82,7 +82,7 @@ fi
 echo "[+] Case 1: Bad syntax cleanly rejected"
 
 # Case 2: Port Conflict (EADDRINUSE)
-PORT=$((30000 + ( $$ % 10000 )))
+PORT=$(kari_port 0 $((30000 + ( $$ % 10000 ))))
 cat > "${TMP_DIR}/valid.conf" <<EOF
 options {
     directory "${TMP_DIR}";

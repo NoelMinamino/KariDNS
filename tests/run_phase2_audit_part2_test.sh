@@ -23,7 +23,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-PORT=$((31000 + $$ % 5000))
+PORT=$(kari_port 0 $((31000 + $$ % 5000)))
 FAILED=0
 USER_OPT=""
 if [ "$(id -u)" = "0" ]; then

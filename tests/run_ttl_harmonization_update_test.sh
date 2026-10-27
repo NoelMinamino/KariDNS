@@ -5,6 +5,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$(dirname "$0")/lib_proc.sh"
+PORT=$(kari_port 0 53732)
 BIN_DIR="$SCRIPT_DIR/.."
 ZONES_DIR="$SCRIPT_DIR/zones"
 TEST_DIR="ttl_harmonization_update_test_dir"
@@ -25,7 +26,7 @@ ZONE_FILE="$(pwd)/dynttl.test.zone"
 
 cat << EOF > karidns.conf
 options {
-    port 53732;
+    port ${PORT};
     bind-address { 127.0.0.1; };
     user "nobody";
     group "nobody";
@@ -53,7 +54,7 @@ EOF
 
 "$BIN_DIR/karidns" -f karidns.conf > karidns.log 2>&1 &
 SERVER_PID=$!
-sleep 1
+kari_wait_answer "$BIN_DIR/dag" "$PORT" dynttl.test. || true   # the queries below report a server that did not start
 
 cleanup() {
     set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
@@ -76,7 +77,7 @@ check_no_crash() {
 }
 
 echo "[+] Step 1: baseline query before UPDATE -- dynhost.dynttl.test. A must show TTL 300..."
-"$BIN_DIR/dag" dynhost.dynttl.test. A @127.0.0.1 -p 53732 > out_before.txt 2>&1
+"$BIN_DIR/dag" dynhost.dynttl.test. A @127.0.0.1 -p ${PORT} > out_before.txt 2>&1
 cat out_before.txt
 check_no_crash
 if grep "^dynhost\.dynttl\.test\..*IN.*A" out_before.txt | awk '{print $2}' | grep -qv "^300$"; then
@@ -85,7 +86,7 @@ if grep "^dynhost\.dynttl\.test\..*IN.*A" out_before.txt | awk '{print $2}' | gr
 fi
 
 echo "[+] Step 2: sending authorized UPDATE adding a second A record with TTL 900 to the same RRset..."
-"$BIN_DIR/dag" dynttl.test a @127.0.0.1 -p 53732 \
+"$BIN_DIR/dag" dynttl.test a @127.0.0.1 -p ${PORT} \
     --update-add 'dynhost.dynttl.test 900 A 192.0.2.101' \
     +nohexdump-response \
     -y hmac-sha256:update-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= \
@@ -98,7 +99,7 @@ grep -qi "NOERROR" out_update.txt || {
 }
 
 echo "[+] Step 3: post-UPDATE query -- both A records must now show the re-normalized minimum TTL (300)..."
-"$BIN_DIR/dag" dynhost.dynttl.test. A @127.0.0.1 -p 53732 > out_after.txt 2>&1
+"$BIN_DIR/dag" dynhost.dynttl.test. A @127.0.0.1 -p ${PORT} > out_after.txt 2>&1
 cat out_after.txt
 check_no_crash
 
