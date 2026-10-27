@@ -1310,11 +1310,12 @@ static void test_rcache_sibling_glue_not_cached(void) {
     printf("  [PASS] sibling glue answers are not cached and follow the sibling at once\n");
 }
 
-/* C2: the sibling's location-tagged address is filtered with the first zone's client view (append_glue_records() passes the first
- * zone's rr_filter), so a client-specific sibling answer must not be shared through the response cache either.  The first zone has
- * no tags, so its response cache is on; the sibling's tagged and untagged addresses are chosen by the first zone's (empty) view. */
+/* C2: the sibling's location-tagged addresses are chosen with the sibling's own tag definitions (append_glue_records() takes the
+ * client's view of the sibling, as a CNAME into another zone does), not with the first zone's: the first zone has no tags, the client
+ * (127.0.0.1) is in the sibling's "tokyo" and not in its "osaka".  Such a client-specific answer is not shared through the response
+ * cache (the first zone's own cache is on, it has no tags). */
 static void test_rcache_sibling_tagged_glue_not_cached(void) {
-    printf("[TEST] Shared response cache: sibling glue with location-tagged addresses is not stored (C2)...\n");
+    printf("[TEST] Shared response cache: sibling glue is chosen with the sibling's tags and not stored (C2)...\n");
     static char text_a[] =
         "a.example. 3600 IN SOA ns.a.example. h.a.example. 1 7200 3600 1209600 3600\n"
         "a.example. 3600 IN NS ns.a.example.\n"
@@ -1322,11 +1323,14 @@ static void test_rcache_sibling_tagged_glue_not_cached(void) {
         "mx.a.example. 3600 IN MX 10 mail.b.example.\n";
     static char text_b[] =
         "$LOCATION-TAG tokyo 127.0.0.0/8\n"
+        "$LOCATION-TAG osaka 198.51.100.0/24\n"
         "b.example. 3600 IN SOA ns.b.example. h.b.example. 1 7200 3600 1209600 3600\n"
         "b.example. 3600 IN NS ns.b.example.\n"
         "ns.b.example. 3600 IN A 192.0.2.2\n"
         "$LOCATION tokyo\n"
         "mail.b.example. 3600 IN A 192.0.2.201\n"
+        "$LOCATION osaka\n"
+        "mail.b.example. 3600 IN A 192.0.2.203\n"
         "$LOCATION \"\"\n"
         "mail.b.example. 3600 IN A 192.0.2.202\n";
     glue_world_t *w = calloc(1, sizeof(*w));
@@ -1339,17 +1343,20 @@ static void test_rcache_sibling_tagged_glue_not_cached(void) {
     world_publish(w, 1, "b.example.");
     world_finish(w, 2);
 
+    static const uint8_t tokyo[4] = {192, 0, 2, 201}, osaka[4] = {192, 0, 2, 203};
     uint8_t res[4096];
     uint64_t hits0 = atomic_load(&w->ent[0].observatory.wirecache_hits);
     for (int round = 0; round < 3; round++) {
         int len = world_query(w, (uint16_t)(0x6200 + round), "mx.a.example.", 15, false, res, sizeof(res), 512);
         assert(len > 12 && (res[3] & 0x0F) == 0);
+        assert(bytes_contain(res, (size_t)len, tokyo, 4));   /* the sibling's own tag matched the client */
+        assert(!bytes_contain(res, (size_t)len, osaka, 4));
     }
     assert(atomic_load(&w->ent[0].observatory.wirecache_hits) == hits0);
 
     for (int i = 0; i < 2; i++) zone_arena_destroy(&w->arena[i]);
     free(w);
-    printf("  [PASS] tagged sibling glue is not cached\n");
+    printf("  [PASS] tagged sibling glue follows the sibling's tags and is not cached\n");
 }
 
 /* A1, RFC 9471 §3.1-§3.3 and RFC 2181 §9: a referral that cannot hold all its glue sets TC=1 only when glue for a name server

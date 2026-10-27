@@ -61,6 +61,18 @@ typedef struct {
   view_snapshot_t *view;
   zone_db_entry_t *entry;
 } query_route_t;
+
+/* C2: a sibling zone of the view that holds a glue target (append_glue_records(), additional-from-auth yes), and what is needed to
+ * choose its records for this client with the sibling's own location / ECS tag definitions (zone_client_view()).  NULL or view
+ * NULL = no sibling lookup. */
+typedef struct {
+  view_snapshot_t *view;
+  server_config_t *cfg;
+  const char *client_ip;
+  bool ecs_trusted;
+  const uint8_t *ecs_addr;
+  uint16_t ecs_family;
+} glue_sibling_ctx_t;
 int process_dns_query_cap_routed(const uint8_t *req, size_t req_len, uint8_t *res,
                                  size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
                                  const char *client_ip, compress_ctx_t *comp_ctx,
@@ -127,7 +139,7 @@ bool append_glue_records(const zone_image_t *img, const char *target,
                          const char *client_ecs_tag,
                          const char *client_loc_tag,
                          additional_from_auth_t policy,
-                         view_snapshot_t *view, bool dnssec_ok);
+                         const glue_sibling_ctx_t *sib_ctx, bool dnssec_ok);
 void collect_additional_rr_glue(const zone_image_t *img, uint32_t rr, glue_list_t *glue);
 bool name_exists_in_zone(const zone_image_t *img, const char *name,
                          const char client_loc[2], const char *client_ecs_tag,
@@ -158,7 +170,7 @@ bool find_delegation(const zone_image_t *img, const char *qname,
                      const char *client_ecs_tag,
                      const char *client_loc_tag,
                      additional_from_auth_t policy,
-                     view_snapshot_t *view,
+                     const glue_sibling_ctx_t *sib_ctx,
                      bool dnssec_ok);
 int build_synthetic_servfail(const uint8_t *req, size_t req_len,
                              uint8_t *res, size_t max_res_len);

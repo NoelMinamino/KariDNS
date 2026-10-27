@@ -297,7 +297,7 @@ STATIC_TEST bool append_glue_records(const zone_image_t *img, const char *target
                                      const char *client_ecs_tag,
                                      const char *client_loc_tag,
                                      additional_from_auth_t policy,
-                                     view_snapshot_t *view, bool dnssec_ok) {
+                                     const glue_sibling_ctx_t *sib_ctx, bool dnssec_ok) {
 
   if (!img || !target || policy == ADDITIONAL_AUTH_NO) return true;
   uint32_t id = zone_image_find_name(img, target);
@@ -341,16 +341,26 @@ STATIC_TEST bool append_glue_records(const zone_image_t *img, const char *target
   if (w > 0) return true;
 
   // 3. Fallback: Search sibling authoritative zones in view dynamically if policy == ADDITIONAL_AUTH_YES
-  if (policy == ADDITIONAL_AUTH_YES && view) {
-    zone_db_entry_t *sib_entry = find_zone_in_view(view, target);
+  if (policy == ADDITIONAL_AUTH_YES && sib_ctx && sib_ctx->view) {
+    zone_db_entry_t *sib_entry = find_zone_in_view(sib_ctx->view, target);
     if (sib_entry) {
       zone_version_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
       const zone_image_t *sib = sib_arena ? sib_arena->image : NULL;
-      if (sib != img) t_resolve_sibling_glue = true; /* C1, C2: the answer depends on another zone's version: not cached */
-      if (sib && sib != img &&
-          append_additional_from_zone(sib, sib_entry->domain, target, zone_image_find_name(sib, target), dnssec_ok,
-                                      &f, res, max_res_len, offset, comp_ctx, arcount) < 0)
-        return false;
+      if (sib != img) t_resolve_sibling_glue = true; /* C1: the answer depends on another zone's version: not cached */
+      if (sib && sib != img) {
+        /* C2: the sibling's records are chosen with the sibling's own tag definitions, as for a CNAME into another zone
+         * (resolve_name_answer()); a sibling whose SOA this client does not see gives no glue (B8t-1).  The ECS SCOPE is not
+         * touched: Additional-section data is not tied to a network (RFC 7871 §7.3.1, §7.4). */
+        const zone_config_t *sib_zcfg = sib_ctx->cfg ? zone_entry_config(sib_ctx->cfg, sib_entry) : NULL;
+        zone_image_view_t sv;
+        zone_client_view(sib, sib_ctx->cfg, sib_zcfg, sib_ctx->client_ip, sib_ctx->ecs_trusted, sib_ctx->ecs_addr,
+                         sib_ctx->ecs_family, &sv, NULL);
+        if ((sib->flags & ZONE_IMAGE_F_SOA_ATTR) && zone_image_visible_soa(sib, &sv, NULL) == ZONE_IMAGE_NONE) return true;
+        rr_filter_t sf = { sv.loc, sv.ecs_tag, sv.loc_tag, 0, NULL };
+        if (append_additional_from_zone(sib, sib_entry->domain, target, zone_image_find_name(sib, target), dnssec_ok,
+                                        &sf, res, max_res_len, offset, comp_ctx, arcount) < 0)
+          return false;
+      }
     }
   }
 
@@ -583,7 +593,7 @@ STATIC_TEST bool find_delegation(const zone_image_t *img, const char *qname,
                             const char *client_ecs_tag,
                             const char *client_loc_tag,
                             additional_from_auth_t policy,
-                            view_snapshot_t *view,
+                            const glue_sibling_ctx_t *sib_ctx,
                             bool dnssec_ok) {
   if (!img || img->n_names == 0)
     return false;
@@ -702,7 +712,7 @@ STATIC_TEST bool find_delegation(const zone_image_t *img, const char *qname,
             bool in_domain = domain_name_is_at_or_below(target, name);
             if (!in_domain && optional_full) continue;
             if (!append_glue_records(img, target, zone_apex, res,
-                                     max_res_len, offset, comp_ctx, arcount, client_loc, client_ecs_tag, client_loc_tag, policy, view,
+                                     max_res_len, offset, comp_ctx, arcount, client_loc, client_ecs_tag, client_loc_tag, policy, sib_ctx,
                                      dnssec_ok)) {
               if (in_domain) {
                 res[2] |= 0x02;
@@ -812,6 +822,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
   int visited_count = 0;
   strlcpy(visited_qnames[visited_count++], current_qname, sizeof(visited_qnames[0]));
   glue_list_t glue;
+  const glue_sibling_ctx_t sib_ctx = { view, cfg, client_ip, ecs_trusted, ecs_addr, ecs_family };
   glue.count = 0;
   glue.minimal = minimal_responses;
   /* R-04: RRSIG 自体が要求されたとき (QTYPE RRSIG、または MQTYPE に RRSIG) は、その名前の RRSIG が全部その
@@ -859,7 +870,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
                                         : (cfg ? cfg->additional_from_auth : ADDITIONAL_AUTH_YES);
     bool is_ds_query = (num_qtypes > 0 && qtypes[0] == 43);
     if (find_delegation(img, current_qname, db_entry->domain, res,
-                        max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc, client_ecs_tag, client_loc_tag, policy, view, dnssec_ok)) {
+                        max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc, client_ecs_tag, client_loc_tag, policy, &sib_ctx, dnssec_ok)) {
       return;
     }
 
@@ -1595,7 +1606,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
       for (int k = 0; k < glue.count; k++) {
         if (!append_glue_records(img, glue.targets[k], db_entry->domain,
                                  res, max_res_len, offset, comp_ctx, arcount,
-                                 client_loc, client_ecs_tag, client_loc_tag, policy, view, dnssec_ok)) {
+                                 client_loc, client_ecs_tag, client_loc_tag, policy, &sib_ctx, dnssec_ok)) {
           t_resolve_additional_cut = true; // 応答キャッシュに入れない (大きいバッファの問い合わせにも返ってしまう)
           /* バッファ上限に達した場合は以後のグルー追加を中断 (RFC 2181 §9: TC は立てない)。委任の応答 (find_delegation()) も、
            * 入りきらない兄弟のグルーでは TC を立てず、以後の兄弟のグルーを足さない (RFC 9471 §3.2。A1)。 */

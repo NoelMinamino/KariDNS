@@ -1977,11 +1977,12 @@ static void test_delegation_referral_and_ds_handling(void) {
     compress_ctx_init(&comp_ctx);   /* full init: init_packet() on an uninitialized stack ctx is UB (reads current_generation) */
     uint16_t nscount = 0;
     uint16_t arcount = 0;
+    glue_sibling_ctx_t sib_ctx = { &view, NULL, "127.0.0.1", false, NULL, 0 };
 
     bool del_res = find_delegation(arena.image, "www.child.example.com.",
                                    "example.com.", res, sizeof(res), &offset,
                                    &comp_ctx, &nscount, &arcount, false /* not DS */,
-                                   NULL, NULL, NULL, ADDITIONAL_AUTH_YES, &view, false);
+                                   NULL, NULL, NULL, ADDITIONAL_AUTH_YES, &sib_ctx, false);
     assert(del_res == true);
     assert(nscount >= 1); // NS in authority section
     assert(arcount >= 1); // Glue A in additional section
@@ -1994,7 +1995,7 @@ static void test_delegation_referral_and_ds_handling(void) {
     del_res = find_delegation(arena.image, "child.example.com.",
                               "example.com.", res, sizeof(res), &offset,
                               &comp_ctx, &nscount, &arcount, true /* is DS query */,
-                              NULL, NULL, NULL, ADDITIONAL_AUTH_YES, &view, false);
+                              NULL, NULL, NULL, ADDITIONAL_AUTH_YES, &sib_ctx, false);
     assert(del_res == false); // Must return false so DS is handled as authoritative answer/NODATA
 
     zone_arena_destroy(&arena);
