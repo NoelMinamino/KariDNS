@@ -25,7 +25,6 @@ DAG="$ROOT_DIR/dag"
 
 FAILED=0
 PORT=$(kari_port 0 $((21000 + $$ % 8000)))
-CTRL_PORT=$((PORT + 1))
 TMP_DIR="/tmp/karictl_reload_reconfig_test_$$"
 rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR"
@@ -76,8 +75,7 @@ options {
 };
 
 control-channel {
-    port $CTRL_PORT;
-    bind-address 127.0.0.1;
+    socket "$TMP_DIR/ctl.sock";
     algorithm hmac-sha256;
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
 };
@@ -96,8 +94,7 @@ view "default" {
 EOF
 
 cat << EOF > "$TMP_DIR/karictl.conf"
-server 127.0.0.1;
-port $CTRL_PORT;
+socket "$TMP_DIR/ctl.sock";
 key "karictl" {
     algorithm hmac-sha256;
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
@@ -107,7 +104,7 @@ EOF
 # Start local test server
 "$KARIDNS" -f "$TMP_DIR/karidns.conf" > "$TMP_DIR/karidns.log" 2>&1 &
 SERVER_PID=$!
-sleep 1
+kari_wait_answer "$DAG" "$PORT" zone1.example.com. || true   # the checks below report a server that did not start
 
 echo "=== 1. Testing 'reconfig' when zone files are UNCHANGED ==="
 echo -n "Test: 'reconfig' skips reload for unchanged zones (mtime match) ... "
@@ -180,8 +177,7 @@ options {
 };
 
 control-channel {
-    port $CTRL_PORT;
-    bind-address 127.0.0.1;
+    socket "$TMP_DIR/ctl.sock";
     algorithm hmac-sha256;
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
 };

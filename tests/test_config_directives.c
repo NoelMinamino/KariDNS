@@ -1043,7 +1043,13 @@ static void test_control_channel(void) {
         free_server_config_fields(&cfg);
     }
     if (parse_ok("control-channel { };", &cfg)) { CHECK(cfg.control.enabled == true); free_server_config_fields(&cfg); }
-    if (parse_ok("control-channel { future-option { a; }; };", &cfg)) { CHECK(cfg.control.enabled == true); free_server_config_fields(&cfg); }
+    /* an unknown key is a configuration error (a misspelt "secret" must not leave the channel open or on the default socket) */
+    expect_reject("unknown key with a block", "control-channel { future-option { a; }; };");
+    expect_reject("unknown key 'port'", "control-channel { port 953; };");
+    expect_reject("unknown key 'bind-address'", "control-channel { bind-address 127.0.0.1; };");
+    expect_reject("unknown key 'enabled'", "control-channel { enabled yes; };");
+    snprintf(txt, sizeof(txt), "control-channel { socket \"/x\"; secrt \"%s\"; };", SECRET_OK);
+    expect_reject("misspelt secret", txt);
 
     expect_reject("unsupported algorithm", "control-channel { algorithm hmac-sha3; };");
     /* D17-3: control-channel is a top-level statement; inside options { } it used to be skipped silently */

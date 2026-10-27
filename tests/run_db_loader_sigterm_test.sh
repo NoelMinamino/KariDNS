@@ -70,7 +70,7 @@ options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT;
     database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; loader-threads $LT; };
 };
-control-channel { enabled yes; socket "$T/ctl.sock"; secret "dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"; };
+control-channel { socket "$T/ctl.sock"; secret "dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"; };
 EOC
     : > "$T/srv$LT.log"
     "$KARIDNS" -c "$T/k.conf" -f > "$T/srv$LT.log" 2>&1 < /dev/null &

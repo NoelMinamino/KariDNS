@@ -62,7 +62,7 @@ options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT;
     database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$2"; };
 };
-control-channel { enabled yes; socket "$T/ctl.sock"; secret "dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"; };
+control-channel { socket "$T/ctl.sock"; secret "dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"; };
 zone "file.test" { type primary; file "$T/file.zone"; };
 EOF
 }

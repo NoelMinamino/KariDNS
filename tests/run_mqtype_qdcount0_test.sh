@@ -27,6 +27,7 @@ options {
 };
 
 control-channel {
+    socket "${TEST_DIR_ABS}/ctl.sock";
     algorithm hmac-sha256;
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
 };
@@ -42,7 +43,7 @@ EOF
 
 "$BIN_DIR/karidns" -f karidns.conf > karidns.log 2>&1 &
 SERVER_PID=$!
-sleep 1
+kari_wait_answer "$BIN_DIR/dag" "$PORT" example.com. || true   # the tests below report a server that did not start
 
 cleanup() {
     set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)

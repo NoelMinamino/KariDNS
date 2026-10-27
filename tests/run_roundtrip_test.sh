@@ -6,18 +6,26 @@ set -e
 [ -x karidns-asan ] && [ -x dag-asan ] || make karidns-asan dag-asan
 
 # 2. tests/karidns-test.conf (example.com.zoneを読み込む既存の設定) でサーバーを起動
-./karidns-asan -f tests/karidns-test.conf > server_asan.log 2>&1 &
+# own port and control socket: the shared tests/karidns-test.conf binds 10053 and the default control socket
+PORT=$(kari_port 0 10053)
+TMP_DIR="/tmp/roundtrip_test_$$"
+rm -rf "$TMP_DIR"
+mkdir -p "$TMP_DIR"
+kari_test_conf tests/karidns-test.conf "$TMP_DIR/karidns.conf" "$PORT" "$TMP_DIR/ctl.sock"
+
+./karidns-asan -f "$TMP_DIR/karidns.conf" > "$TMP_DIR/server_asan.log" 2>&1 &
 SERVER_PID=$!
 cleanup() {
     set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     kari_kill_tree "${SERVER_PID:-}"
+    rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT INT TERM
-sleep 1 # 起動待ち
+kari_wait_answer ./dag-asan "$PORT" example.com. || true   # 起動待ち (the checks below report a server that did not start)
 
 if ! kill -0 $SERVER_PID 2>/dev/null; then
     echo "[FAIL] Server failed to start. ASan output:"
-    cat server_asan.log
+    cat "$TMP_DIR/server_asan.log"
     exit 1
 fi
 
@@ -30,21 +38,20 @@ expected_types=$(grep -E '^[^[:space:]]*[[:space:]]+(IN[[:space:]]+)?[A-Z0-9\-]+
     | sort -u)
 
 # 4. dagでAXFRを実行し、応答中に出現したレコードタイプを集計
-axfr_output=$(./dag-asan example.com AXFR @127.0.0.1 -p 10053 -y transfer-key:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl +tcp)
+axfr_output=$(./dag-asan example.com AXFR @127.0.0.1 -p "$PORT" -y transfer-key:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl +tcp)
 actual_types=$(echo "$axfr_output" | grep -oE '[[:space:]]IN[[:space:]]+[A-Z0-9\-]+[[:space:]]' | awk '{print $2}' | sort -u)
 
 # 5. サーバープロセスがまだ生きているか確認(クラッシュ検出)
 if ! kill -0 $SERVER_PID 2>/dev/null; then
     echo "[FAIL] Server crashed during AXFR. ASan output:"
-    cat server_asan.log
+    cat "$TMP_DIR/server_asan.log"
     exit 1
 fi
 
 # 6. 期待される型がすべてAXFR応答に含まれているか突き合わせる
-echo "$expected_types" > expected.txt
-echo "$actual_types" > actual.txt
-missing=$(comm -23 expected.txt actual.txt)
-rm expected.txt actual.txt
+echo "$expected_types" > "$TMP_DIR/expected.txt"
+echo "$actual_types" > "$TMP_DIR/actual.txt"
+missing=$(comm -23 "$TMP_DIR/expected.txt" "$TMP_DIR/actual.txt")
 
 if [ -n "$missing" ]; then
     echo "[FAIL] The following record types were in the zone file but missing from the AXFR response:"

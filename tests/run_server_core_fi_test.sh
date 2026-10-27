@@ -103,7 +103,6 @@ LANES=${FI_LANES:-$NCPU}
 setup_lane() { # <lane>
     L="$TMP/lane$1"
     LPORT=$((10153 + $1 * 4))
-    LCTRL=$((10954 + $1 * 4))
     mkdir -p "$L"
     cat > "$L/karidns.conf" <<CEOF
 options {
@@ -118,8 +117,7 @@ logging {
     category queries { q; };
 };
 control-channel {
-    port $LCTRL;
-    bind-address 127.0.0.1;
+    socket "$L/ctl.sock";
     algorithm hmac-sha256;
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
 };
@@ -131,8 +129,7 @@ zone "fi.test" {
 };
 CEOF
     cat > "$L/karictl.conf" <<KEOF
-server 127.0.0.1;
-port $LCTRL;
+socket "$L/ctl.sock";
 key "karictl" {
     algorithm hmac-sha256;
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";

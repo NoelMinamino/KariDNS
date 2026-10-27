@@ -10,6 +10,8 @@
 #     failed to load: <zone>", exit 3, and the same line in the log
 #  4. reconfig that changes port -> "OK (restart needed for: port)", exit 0, warning in the log
 #  5. karictl reload <zone> for a zone written "type Master;" (D-23)
+#  6. an unknown key in control-channel { } ("port", a misspelt "secret") is a configuration error: reload is
+#     refused and the running configuration is kept, and karidns does not start with it
 # ==============================================================================
 
 set -u
@@ -105,6 +107,35 @@ for cmd in reconfig reload; do
     case "$out" in "ERROR configuration not applied: "*) pass "$cmd reply";; *) fail "$cmd reply: $out";; esac
 done
 [ "$(answer www.a.example)" = "192.0.2.10" ] && pass "old configuration still answers" || fail "no answer after failed reload"
+
+echo "=== 2b. unknown key in control-channel ==="
+for key in 'port 953' 'secrt "dGVzdA=="'; do
+    write_conf "$PORT" "$TMP_DIR/b.example.zone" "control-channel { socket \"$CTRL_SOCK\"; $key; };"
+    out=$(ctl reload); rc=$?
+    echo "    reload ($key) -> rc=$rc $out"
+    [ "$rc" -eq 3 ] && pass "reload with '$key' exit 3" || fail "reload with '$key' exit $rc (expected 3)"
+    case "$out" in "ERROR configuration not applied: "*) pass "reload reply";; *) fail "reload reply: $out";; esac
+    [ "$(answer www.a.example)" = "192.0.2.10" ] && pass "old configuration still answers" || fail "no answer after refused reload"
+    kname=${key%% *}
+    grep -q "control-channel: unknown option '$kname' (supported: socket, secret, algorithm)" "$TMP_DIR/karidns.log" && pass "log names the key '$kname'" || fail "log does not name '$kname'"
+    # a new server with that configuration does not start
+    sed "s/^options { port $PORT;/options { port $((PORT + 2));/" "$TMP_DIR/karidns.conf" | sed "s|socket \"$CTRL_SOCK\"|socket \"$TMP_DIR/bad.sock\"|" > "$TMP_DIR/bad.conf"
+    "$KARIDNS" -f "$TMP_DIR/bad.conf" > "$TMP_DIR/bad.log" 2>&1 &
+    BAD_PID=$!
+    i=0
+    while [ $i -lt 50 ] && kill -0 "$BAD_PID" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    if kill -0 "$BAD_PID" 2>/dev/null; then
+        kari_kill_tree "$BAD_PID"
+        fail "karidns started with '$key' in control-channel"
+    else
+        wait "$BAD_PID"; rc=$?
+        [ "$rc" -ne 0 ] && pass "startup with '$key' refused (exit $rc)" || fail "startup with '$key' exited 0"
+        grep -q "control-channel: unknown option '$kname'" "$TMP_DIR/bad.log" && pass "startup message names the key" || fail "startup message: $(cat "$TMP_DIR/bad.log")"
+    fi
+done
+write_conf "$PORT" "$TMP_DIR/b.example.zone" ""
+out=$(ctl reload); rc=$?
+[ "$rc" -eq 0 ] && [ "$out" = "OK reloaded" ] && pass "valid configuration reloads again" || fail "reload after the refused ones rc=$rc $out"
 
 echo "=== 3. zone file that cannot be read (D-13) ==="
 write_conf "$PORT" "$TMP_DIR/missing.zone" ""
