@@ -28,8 +28,7 @@ static _Thread_local bool t_resolve_crossed_zone;
 static _Thread_local bool t_resolve_additional_cut;
 /* C1: the Additional section holds (or looked for) glue of a sibling zone (append_glue_records() step 3).  The cache key holds only the
  * first zone's data generation; a sibling's publication reaches that generation later (g_glue_dirty and the control thread) and only for
- * the first MAX_PRELINK_TARGETS targets, so such an answer is not stored.  C2: the sibling's addresses are also chosen with the first
- * zone's client view (rr_filter_t), which is the same reason. */
+ * the first MAX_PRELINK_TARGETS targets, so such an answer is not stored. */
 static _Thread_local bool t_resolve_sibling_glue;
 /* B9a: the answer holds ALIAS-expanded addresses (or an ALIAS target that could not be resolved): the result changes with the resolver's TTLs, so it
  * is not stored in the shared response cache; and the SERVFAIL gets an extended error */
@@ -289,12 +288,15 @@ static int append_additional_from_zone(const zone_image_t *img, const char *apex
   return total;
 }
 
+/* Additional-section addresses ignore ECS data (RFC 7871 §7.4: "Addresses in the Additional section SHOULD therefore ignore ECS
+ * data"; §7.3.1: a resolver does not tie them to a network, so a tailored address would be cached for every client): the records
+ * are chosen as for a query without ECS, i.e. only the ones without an ECS tag ($ECS-SUBNET default / none).  Location tags and
+ * tinydns locations come from the client's own address and still apply. */
 STATIC_TEST bool append_glue_records(const zone_image_t *img, const char *target,
                                      const char *zone_apex, uint8_t *res,
                                      size_t max_res_len, uint16_t *offset,
                                      compress_ctx_t *comp_ctx, uint16_t *arcount,
                                      const char client_loc[2],
-                                     const char *client_ecs_tag,
                                      const char *client_loc_tag,
                                      additional_from_auth_t policy,
                                      const glue_sibling_ctx_t *sib_ctx, bool dnssec_ok) {
@@ -316,7 +318,7 @@ STATIC_TEST bool append_glue_records(const zone_image_t *img, const char *target
       if (rrs[k].type != 1 && rrs[k].type != 28) continue;
       if (++linked > 32) break; // MAX_MATCH_RECS of zone_glue_track_build()
       uint32_t eff_ttl;
-      if (!rr_valid(img, k, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
+      if (!rr_valid(img, k, tinydns_now, client_loc, NULL, client_loc_tag, &eff_ttl)) continue;
       if (image_serialize_rr(img, k, res, max_res_len, offset, comp_ctx, NULL, eff_ttl) < 0) {
         // RFC 2181 §9: この名前のアドレスは一部だけ残さない
         *offset = start_offset;
@@ -328,7 +330,7 @@ STATIC_TEST bool append_glue_records(const zone_image_t *img, const char *target
     return true;
   }
 
-  rr_filter_t f = { client_loc, client_ecs_tag, client_loc_tag, 0, NULL };
+  rr_filter_t f = { client_loc, NULL, client_loc_tag, 0, NULL };
 
   // 2. In-zone search (covers in-domain glue and out-of-zone glue in this zone)
   if (policy == ADDITIONAL_AUTH_IN_DOMAIN && !domain_name_is_at_or_below(target, zone_apex)) {
@@ -349,14 +351,13 @@ STATIC_TEST bool append_glue_records(const zone_image_t *img, const char *target
       if (sib != img) t_resolve_sibling_glue = true; /* C1: the answer depends on another zone's version: not cached */
       if (sib && sib != img) {
         /* C2: the sibling's records are chosen with the sibling's own tag definitions, as for a CNAME into another zone
-         * (resolve_name_answer()); a sibling whose SOA this client does not see gives no glue (B8t-1).  The ECS SCOPE is not
-         * touched: Additional-section data is not tied to a network (RFC 7871 §7.3.1, §7.4). */
+         * (resolve_name_answer()); a sibling whose SOA this client does not see gives no glue (B8t-1).  Its view is taken
+         * without ECS, as above (RFC 7871 §7.4), and the ECS SCOPE is not touched. */
         const zone_config_t *sib_zcfg = sib_ctx->cfg ? zone_entry_config(sib_ctx->cfg, sib_entry) : NULL;
         zone_image_view_t sv;
-        zone_client_view(sib, sib_ctx->cfg, sib_zcfg, sib_ctx->client_ip, sib_ctx->ecs_trusted, sib_ctx->ecs_addr,
-                         sib_ctx->ecs_family, &sv, NULL);
+        zone_client_view(sib, sib_ctx->cfg, sib_zcfg, sib_ctx->client_ip, false, NULL, 0, &sv, NULL);
         if ((sib->flags & ZONE_IMAGE_F_SOA_ATTR) && zone_image_visible_soa(sib, &sv, NULL) == ZONE_IMAGE_NONE) return true;
-        rr_filter_t sf = { sv.loc, sv.ecs_tag, sv.loc_tag, 0, NULL };
+        rr_filter_t sf = { sv.loc, NULL, sv.loc_tag, 0, NULL };
         if (append_additional_from_zone(sib, sib_entry->domain, target, zone_image_find_name(sib, target), dnssec_ok,
                                         &sf, res, max_res_len, offset, comp_ctx, arcount) < 0)
           return false;
@@ -608,7 +609,9 @@ STATIC_TEST bool find_delegation(const zone_image_t *img, const char *qname,
     // 参照応答(referral)にせず、権威応答としてフェーズ2の通常検索へ継続させる。
     uint32_t id = (is_ds_query && name == qname) ? ZONE_IMAGE_NONE : zone_image_find_name(img, name);
     if (id != ZONE_IMAGE_NONE) {
-      rr_filter_t flt = { client_loc, client_ecs_tag, client_loc_tag, 0, NULL };
+      /* the referral NS and DS go in the Authority section, which a resolver does not tie to a network (RFC 7871 §7.3.1, §7.4:
+       * SCOPE 0 on delegations): they are chosen without ECS, as the Additional section (append_glue_records()) */
+      rr_filter_t flt = { client_loc, NULL, client_loc_tag, 0, NULL };
       // 委任の NS は子ゾーンのデータで署名されない (RFC 4035 §2.2)。入りきらなければ NS を丸ごと外して TC。
       int ns_written = emit_rrset(img, id, NULL, 2, 255, &flt, RRSIG_NONE, res, max_res_len,
                                   offset, comp_ctx, nscount, NULL);
@@ -712,7 +715,7 @@ STATIC_TEST bool find_delegation(const zone_image_t *img, const char *qname,
             bool in_domain = domain_name_is_at_or_below(target, name);
             if (!in_domain && optional_full) continue;
             if (!append_glue_records(img, target, zone_apex, res,
-                                     max_res_len, offset, comp_ctx, arcount, client_loc, client_ecs_tag, client_loc_tag, policy, sib_ctx,
+                                     max_res_len, offset, comp_ctx, arcount, client_loc, client_loc_tag, policy, sib_ctx,
                                      dnssec_ok)) {
               if (in_domain) {
                 res[2] |= 0x02;
@@ -822,7 +825,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
   int visited_count = 0;
   strlcpy(visited_qnames[visited_count++], current_qname, sizeof(visited_qnames[0]));
   glue_list_t glue;
-  const glue_sibling_ctx_t sib_ctx = { view, cfg, client_ip, ecs_trusted, ecs_addr, ecs_family };
+  const glue_sibling_ctx_t sib_ctx = { view, cfg, client_ip };
   glue.count = 0;
   glue.minimal = minimal_responses;
   /* R-04: RRSIG 自体が要求されたとき (QTYPE RRSIG、または MQTYPE に RRSIG) は、その名前の RRSIG が全部その
@@ -1592,7 +1595,8 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     if (qtypes[0] != 2 && qtypes[0] != 255) { needs_ns = true; }
     if (type_matched && !minimal_responses && needs_ns) {
       /* R-03: 頂点の NS は署名された RRset。DO=1 なら RRSIG(NS) も付け、入りきらなければ TC (RFC 4035 §3.1.1) */
-      rr_filter_t ns_flt = { client_loc, client_ecs_tag, client_loc_tag, 0, NULL };
+      /* Authority section: without ECS (RFC 7871 §7.3.1), as find_delegation() */
+      rr_filter_t ns_flt = { client_loc, NULL, client_loc_tag, 0, NULL };
       if (emit_rrset(img, zone_image_find_name(img, db_entry->domain), NULL, 2, 255, &ns_flt,
                      dnssec_ok ? RRSIG_REQUIRED : RRSIG_NONE, res, max_res_len, offset, comp_ctx, nscount,
                      &glue) < 0) {
@@ -1606,7 +1610,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
       for (int k = 0; k < glue.count; k++) {
         if (!append_glue_records(img, glue.targets[k], db_entry->domain,
                                  res, max_res_len, offset, comp_ctx, arcount,
-                                 client_loc, client_ecs_tag, client_loc_tag, policy, &sib_ctx, dnssec_ok)) {
+                                 client_loc, client_loc_tag, policy, &sib_ctx, dnssec_ok)) {
           t_resolve_additional_cut = true; // 応答キャッシュに入れない (大きいバッファの問い合わせにも返ってしまう)
           /* バッファ上限に達した場合は以後のグルー追加を中断 (RFC 2181 §9: TC は立てない)。委任の応答 (find_delegation()) も、
            * 入りきらない兄弟のグルーでは TC を立てず、以後の兄弟のグルーを足さない (RFC 9471 §3.2。A1)。 */
