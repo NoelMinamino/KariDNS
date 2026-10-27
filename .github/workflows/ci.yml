@@ -176,8 +176,8 @@ jobs:
             name: Linux (Ubuntu 24.04)
             experimental: false
           # macOS is verified only by CI itself (not locally): non-blocking until the first green run.
-          - os: macos-14
-            name: macOS 14 (ARM64)
+          - os: macos-15
+            name: macOS 15 (ARM64)
             experimental: true
     steps:
       - name: Checkout code
@@ -219,10 +219,10 @@ jobs:
         include:
           - os: ubuntu-latest
             name: Linux (Ubuntu)
-          - os: macos-14
-            name: macOS 14 (ARM64)
           - os: macos-15
             name: macOS 15 (ARM64)
+          - os: macos-26
+            name: macOS 26 (ARM64)
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
