@@ -27,7 +27,6 @@ DAG="$ROOT_DIR/dag"
 
 FAILED=0
 PORT=$(kari_port 0 $((23000 + $$ % 8000)))
-CTRL_PORT=$((PORT + 1))
 TMP_DIR="/tmp/zone_oom_test_$$"
 rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR"
@@ -97,8 +96,7 @@ options {
 };
 
 control-channel {
-    port $CTRL_PORT;
-    bind-address 127.0.0.1;
+    socket "$TMP_DIR/ctl.sock";
     algorithm hmac-sha256;
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
 };
@@ -121,8 +119,7 @@ view "default" {
 EOF
 
 cat << EOF > "$TMP_DIR/karictl.conf"
-server 127.0.0.1;
-port $CTRL_PORT;
+socket "$TMP_DIR/ctl.sock";
 key "karictl" {
     algorithm hmac-sha256;
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
@@ -133,7 +130,7 @@ echo "=== 1. Starting KariDNS with fault-injected OOM on zone2 (call #1) ==="
 # OOM_FAIL_NTH_ZONE_CALLOC=1 will fail create_new_zone_entry() for the 2nd zone (zone2.example.com)
 OOM_FAIL_NTH_ZONE_CALLOC=1 LD_PRELOAD="$TMP_DIR/oom_zone_wrapper.so" "$KARIDNS" -f "$TMP_DIR/karidns.conf" > "$TMP_DIR/karidns.log" 2>&1 &
 SERVER_PID=$!
-sleep 1.5
+kari_wait_answer "$DAG" "$PORT" zone1.example.com. || true   # the checks below report a server that did not start
 
 # Test 1: Server survival
 echo -n "Test 1: Server survives startup with OOM on zone2 ... "

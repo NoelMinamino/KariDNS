@@ -16,9 +16,12 @@ KARICTL="$ROOT/karictl"
 CONF="$DIR/notify_source_test.conf"
 ZONE="$DIR/zones/notify_source_test.zone"
 OUT_NOTIFY="$DIR/notify_received.log"
-CTL_CONF="$DIR/karictl_notify_test.conf"
+TMP_DIR="/tmp/notify_source_test_$$"   # own directory for the control socket (a socket in /tmp itself is refused)
+CTL_CONF="$TMP_DIR/karictl.conf"
 
 mkdir -p "$DIR/zones"
+rm -rf "$TMP_DIR"
+mkdir -p "$TMP_DIR"
 
 # -----------------------------------------------------------------------------
 # FreeBSD / OS loopback alias configuration
@@ -68,6 +71,7 @@ options {
     group "nobody";
 };
 control-channel {
+    socket "$TMP_DIR/ctl.sock";
     algorithm hmac-sha256;
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
 };
@@ -79,7 +83,8 @@ zone "notify.test" {
 };
 EOF
 
-cat << 'EOF' > "$CTL_CONF"
+cat << EOF > "$CTL_CONF"
+socket "$TMP_DIR/ctl.sock";
 key "karictl" {
     algorithm hmac-sha256;
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
@@ -132,11 +137,12 @@ cleanup() {
         ifconfig lo0 inet "$TEST_SRC_IP" -alias 2>/dev/null || \
         ifconfig lo inet "$TEST_SRC_IP" -alias 2>/dev/null || true
     fi
-    rm -f "$CONF" "$ZONE" "$CTL_CONF" "$OUT_NOTIFY" "$DIR/server_notify.log"
+    rm -f "$CONF" "$ZONE" "$OUT_NOTIFY" "$DIR/server_notify.log"
+    rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT INT TERM
 
-sleep 2
+kari_wait_answer "$DAG" 10053 notify.test. || true   # karictl below reports a server that did not start
 
 # Send notify command via karictl
 echo "[*] Sending NOTIFY via karictl..."

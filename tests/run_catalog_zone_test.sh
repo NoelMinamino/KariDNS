@@ -61,6 +61,7 @@ options {
 };
 
 control-channel {
+    socket "${TEST_DIR_ABS}/ctl.sock";
     algorithm hmac-sha256;
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
 };
@@ -75,7 +76,8 @@ view "default" {
 };
 EOF
 
-cat << 'EOF' > karictl.conf
+cat << EOF > karictl.conf
+socket "${TEST_DIR_ABS}/ctl.sock";
 key "karictl" {
     algorithm hmac-sha256;
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
@@ -91,7 +93,7 @@ else
     "$BIN_DIR/karidns" -f karidns.conf > karidns.log 2>&1 &
 fi
 SERVER_PID=$!
-sleep 1
+kari_wait_answer "$BIN_DIR/dag" "$PORT" catalog.example.com. || true   # the checks below report a server that did not start
 
 # Check if member zones are mapped and resolve
 echo "[+] Checking if initial catalog members are resolvable..."
@@ -128,7 +130,8 @@ EOF
 
 "$BIN_DIR/karictl" -f karictl.conf reload
 sleep 1
-grep "Processed membership for 'catalog.example.com.', desired members: 2" karidns.log || { echo "Failed to process membership after reload"; kill $SERVER_PID; exit 1; }
+# the line of the first load is in the log already: the reload adds a second one
+[ "$(grep -c "Processed membership for 'catalog.example.com.', desired members: 2" karidns.log)" -ge 2 ] || { echo "Failed to process membership after reload"; kill $SERVER_PID; exit 1; }
 
 echo "[+] Checking dag resolution after update"
 OUT=$("$BIN_DIR/dag" -p ${PORT} @127.0.0.1 example.net. SOA)
@@ -178,6 +181,7 @@ options {
 };
 
 control-channel {
+    socket "${TEST_DIR_ABS}/ctl.sock";
     algorithm hmac-sha256;
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
 };

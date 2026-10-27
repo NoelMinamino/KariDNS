@@ -18,20 +18,20 @@ if [ ! -x "$BIN" ]; then
     make -C "$ROOT_DIR" asan
 fi
 
-CONF_FILE="$DIR/karidns-test.conf"
-CTL_CONF="$DIR/karictl-test.conf"
-chmod 0600 "$CTL_CONF" 2>/dev/null || true
 ZONE_FILE="$DIR/zones/example.com.zone"
 
-PORT=10053
+PORT=$(kari_port 0 10053)
 TMP_DIR="/tmp/udp_ixfr_test_$$"
 rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR"
+# own port and control socket: the shared tests/karidns-test.conf binds 10053 and the default control socket
+CONF_FILE="$TMP_DIR/karidns.conf"
+kari_test_conf "$DIR/karidns-test.conf" "$CONF_FILE" "$PORT" "$TMP_DIR/ctl.sock"
 
 echo "[*] Starting KariDNS for UDP IXFR tests..."
 $BIN -f "$CONF_FILE" > "$TMP_DIR/server.log" 2>&1 &
 SERVER_PID=$!
-sleep 2
+kari_wait_answer "$DAG" "$PORT" example.com. || true   # the tests below report a server that did not start
 
 cleanup() {
     set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
