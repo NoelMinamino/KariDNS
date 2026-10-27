@@ -202,6 +202,7 @@ When a query carries an ECS option and `ecs-enable yes;` is set, the response ca
   - SCOPE is 0 when the answer does not depend on the subnet: the name has no tagged variants, the resolver is not in `ecs-trusted-resolvers`, or no tag of the client's address family exists.
   - Negative answers (NXDOMAIN, NODATA) and referrals always have SCOPE 0 (RFC 7871 §7.4). A name that exists only for some tags therefore gets a negative answer with SCOPE 0 for the other clients, which resolvers may cache for all networks. Give such names an unrestricted (default) record if clients outside the tags must not see a negative answer.
 - `$LOCATION` and tinydns `%` locations use the resolver's own address, not the ECS option, and do not change SCOPE.
+- Addresses in the Additional section (glue, the addresses of MX/SRV/NS targets) ignore ECS: only their untagged (`default` / `none`) records are given there, for every client subnet, and they do not change SCOPE (RFC 7871 §7.4; a resolver caches Additional data for all networks, §7.3.1). A client gets the tagged address of such a name when it asks for the name itself. Give a target name an untagged record if it must appear in the Additional section.
 
 ---
 

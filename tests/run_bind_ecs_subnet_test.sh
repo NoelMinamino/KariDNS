@@ -126,6 +126,7 @@ www     IN  A   192.0.2.3
 
 $ECS-SUBNET none
 mail    IN  A   192.0.2.25
+mx      IN  MX  10 www.example.com.
 EOF
 
 # Zone 2: Zone-level override of ecs-tags
@@ -403,6 +404,19 @@ run_ecs_check "ECS: NODATA for a tagged name -> SCOPE 0" \
     "www.example.com AAAA @127.0.0.1 -p $PORT +subnet=192.0.2.50/32" "192\.0\.2\.50/32/0"
 run_ecs_check "ECS: zone-level tags (cdn.example 'us-west' 198.51.100.0/25)" \
     "edge.cdn.example A @127.0.0.1 -p $PORT +subnet=198.51.100.4/32" "198\.51\.100\.4/32/25"
+
+echo "=== 3c. Additional-section addresses ignore ECS (RFC 7871 §7.4) ==="
+# The MX target www has tagged addresses; in the Additional section only the untagged ('default') one is given,
+# whatever the client subnet (a resolver caches Additional data for every client, §7.3.1). The MX RRset itself
+# is untagged, so SCOPE is 0.
+run_check "Additional: 'us' client gets the 'default' address of the MX target" \
+    "$DAG mx.example.com MX @127.0.0.1 -p $PORT +subnet=192.0.2.50/32 +nohexdump" \
+    "ADDITIONAL SECTION:.*www\.example\.com\..*192\.0\.2\.3"
+run_check_not "Additional: no tagged address of the MX target" \
+    "$DAG mx.example.com MX @127.0.0.1 -p $PORT +subnet=192.0.2.50/32 +nohexdump" \
+    "[[:space:]]A[[:space:]]+192\.0\.2\.(1|2|10)$" "[[:space:]]A[[:space:]]+192\.0\.2\.3$"
+run_ecs_check "Additional: SCOPE 0 for the untagged MX answer" \
+    "mx.example.com MX @127.0.0.1 -p $PORT +subnet=192.0.2.50/32" "192\.0\.2\.50/32/0"
 
 echo "=== 4. Testing Zone-Level Override of ecs-tags ==="
 

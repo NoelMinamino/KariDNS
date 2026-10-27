@@ -1060,9 +1060,9 @@ static void test_engine_helper_edges(void) {
                            "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false) == false);
     assert(find_delegation(zi, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, &cnt, false,
                            "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false) == false);
-    assert(append_glue_records(NULL, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false));
-    assert(append_glue_records(zi, NULL, "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false));
-    assert(append_glue_records(zi, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_NO, NULL, false));
+    assert(append_glue_records(NULL, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, ADDITIONAL_AUTH_YES, NULL, false));
+    assert(append_glue_records(zi, NULL, "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, ADDITIONAL_AUTH_YES, NULL, false));
+    assert(append_glue_records(zi, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, ADDITIONAL_AUTH_NO, NULL, false));
 
     /* nsec_covers_name: a missing image, an RR that is not an NSEC, the owner/next orders. (A record without an
      * owner, or an NSEC without a type bitmap, cannot be written in wire format, so no image holds one.) */

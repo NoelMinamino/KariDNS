@@ -1977,7 +1977,7 @@ static void test_delegation_referral_and_ds_handling(void) {
     compress_ctx_init(&comp_ctx);   /* full init: init_packet() on an uninitialized stack ctx is UB (reads current_generation) */
     uint16_t nscount = 0;
     uint16_t arcount = 0;
-    glue_sibling_ctx_t sib_ctx = { &view, NULL, "127.0.0.1", false, NULL, 0 };
+    glue_sibling_ctx_t sib_ctx = { &view, NULL, "127.0.0.1" };
 
     bool del_res = find_delegation(arena.image, "www.child.example.com.",
                                    "example.com.", res, sizeof(res), &offset,
@@ -2304,7 +2304,7 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     uint16_t dummy_off = 0, dummy_ar = 0;
     compress_ctx_t comp;
     compress_ctx_init(&comp);
-    assert(append_glue_records(NULL, "target.com.", "apex.com.", dummy_res, sizeof(dummy_res), &dummy_off, &comp, &dummy_ar, "\0\0", NULL, NULL, ADDITIONAL_AUTH_NO, NULL, false) == true);
+    assert(append_glue_records(NULL, "target.com.", "apex.com.", dummy_res, sizeof(dummy_res), &dummy_off, &comp, &dummy_ar, "\0\0", NULL, ADDITIONAL_AUTH_NO, NULL, false) == true);
 
     // 5. record_observatory_response
     zone_db_entry_t obs_entry;
