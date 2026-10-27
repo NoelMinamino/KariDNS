@@ -26,9 +26,9 @@ KARIDNS="$ROOT/karidns"
 DAG="$ROOT/dag"
 KARICTL="$ROOT/karictl"
 SECRET="dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl"
-PA=10253; CA=10255; N4=10256; N6=10257
-PB=10263; CB=10265
-PM=10273; CM=10275; PS=10283; CS=10285
+PA=10253; N4=10256; N6=10257
+PB=10263
+PM=10273; PS=10283
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "SKIP: run_server_core_matrix_test.sh needs root (privilege drop)"
@@ -100,10 +100,9 @@ ZEOF
     done
 }
 
-make_ctl_conf() { # <file> <port>
+make_ctl_conf() { # <file> <control socket>
     cat > "$1" <<KEOF
-server 127.0.0.1;
-port $2;
+socket "$2";
 key "karictl" {
     algorithm hmac-sha256;
     secret "$SECRET";
@@ -133,10 +132,10 @@ start_notify_sink() { # <family 4|6> <port>
 }
 
 # raw control-channel client: send <bytes> then keep the socket open <sec>
-ctl_raw() { # <port> <payload-length> <hold-seconds>
-    perl -MIO::Socket::INET -e '
-        my ($port, $len, $hold) = @ARGV;
-        my $s = IO::Socket::INET->new(PeerAddr => "127.0.0.1", PeerPort => $port, Proto => "tcp") or exit 0;
+ctl_raw() { # <socket path> <payload-length> <hold-seconds>
+    perl -MIO::Socket::UNIX -e '
+        my ($path, $len, $hold) = @ARGV;
+        my $s = IO::Socket::UNIX->new(Peer => $path) or exit 0;
         # in three writes, so that data arrives again after the buffer is full
         if ($len > 0) { for (1 .. 3) { print $s ("x" x int($len / 3)); select(undef, undef, undef, 0.3); } }
         sleep $hold;' "$1" "$2" "$3" >/dev/null 2>&1
@@ -213,8 +212,7 @@ logging {
     category responses { r; };
 };
 control-channel {
-    port $CA;
-    bind-address 127.0.0.1;
+    socket "$TMP/a.sock";
     algorithm hmac-sha256;
     secret "$SECRET";
 };
@@ -280,7 +278,7 @@ zone "fwd2.test" {
 };
 CEOF
 cp "$TMP/a.conf" "$TMP/a.conf.orig"
-make_ctl_conf "$TMP/a.ctl" $CA
+make_ctl_conf "$TMP/a.ctl" "$TMP/a.sock"
 start_notify_sink 4 $N4
 start_notify_sink 6 $N6
 # the receiver takes a handful of frames and leaves: the server must cope
@@ -410,8 +408,8 @@ if wait_up 127.0.0.1 $PA m.test; then
     ctl "$TMP/a.ctl" reconfig >/dev/null
     ctl "$TMP/a.ctl" observatory >/dev/null
     ctl "$TMP/a.ctl" bogus-command >/dev/null
-    ctl_raw $CA 2000 1          # over-long line without a newline
-    ctl_raw $CA 0 7 &           # idle, never authenticates -> timer disconnects it
+    ctl_raw "$TMP/a.sock" 2000 1          # over-long line without a newline
+    ctl_raw "$TMP/a.sock" 0 7 &           # idle, never authenticates -> timer disconnects it
     RAWPID=$!
     kill -HUP $APID 2>/dev/null # supervisor reload
     sleep 1
@@ -547,10 +545,10 @@ done
 # explicit (non-wildcard) listener with notify-source addresses that are not
 # local: the frontend opens a one-off socket for each NOTIFY
 fresh_dir "$TMP/n"
-make_ctl_conf "$TMP/n.ctl" $CB
+make_ctl_conf "$TMP/n.ctl" "$TMP/n.sock"
 cat > "$TMP/n.conf" <<CEOF
 options { port $PB; bind-address { 127.0.0.1; ::1; }; user "nobody"; group "nobody"; };
-control-channel { port $CB; bind-address 127.0.0.1; algorithm hmac-sha256; secret "$SECRET"; };
+control-channel { socket "$TMP/n.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 zone "n4.test" { type master; file "$TMP/n4.zone"; also-notify { 127.0.0.1 port $N4; }; notify-source "127.0.0.3"; };
 zone "n6.test" { type master; file "$TMP/n6.zone"; also-notify { ::1 port $N6; }; notify-source "2001:db8::53"; };
 zone "b.test" { type master; file "$TMP/b.zone"; also-notify { 127.0.0.1 port $N4; ::1 port $N6; }; };
@@ -576,7 +574,7 @@ make_zone "$TMP/deny.zone" deny.test
 cat > "$TMP/prim.conf" <<CEOF
 options { port $PM; bind-address { 127.0.0.1; ::1; }; user "nobody"; group "nobody"; pid-file "$TMP/m/m.pid"; };
 key "xfr" { algorithm hmac-sha256; secret "$SECRET"; };
-control-channel { port $CM; bind-address 127.0.0.1; algorithm hmac-sha256; secret "$SECRET"; };
+control-channel { socket "$TMP/m.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 zone "p.test" {
     type master;
     file "$TMP/p.zone";
@@ -593,7 +591,7 @@ CEOF
 cat > "$TMP/sec.conf" <<CEOF
 options { port $PS; bind-address { 127.0.0.1; }; user "nobody"; group "nobody"; pid-file "$TMP/s/s.pid"; serve-stale yes; };
 key "xfr" { algorithm hmac-sha256; secret "$SECRET"; };
-control-channel { port $CS; bind-address 127.0.0.1; algorithm hmac-sha256; secret "$SECRET"; };
+control-channel { socket "$TMP/s.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 zone "p.test" {
     type slave;
     file "$TMP/s/p.zone";
@@ -601,8 +599,8 @@ zone "p.test" {
     tsig-key "xfr";
 };
 CEOF
-make_ctl_conf "$TMP/m.ctl" $CM
-make_ctl_conf "$TMP/s.ctl" $CS
+make_ctl_conf "$TMP/m.ctl" "$TMP/m.sock"
+make_ctl_conf "$TMP/s.ctl" "$TMP/s.sock"
 "$KARIDNS" -f "$TMP/prim.conf" > "$TMP/prim.log" 2>&1 &
 MPID=$!
 "$KARIDNS" -f "$TMP/sec.conf" > "$TMP/sec.log" 2>&1 &

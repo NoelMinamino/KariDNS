@@ -33,6 +33,7 @@ options {
 };
 
 control-channel {
+    socket "$(pwd)/ctl.sock";
     algorithm hmac-sha256;
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
 };

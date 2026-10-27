@@ -61,6 +61,25 @@ kari_port() {
     fi
 }
 
+# kari_test_conf SRC DST PORT SOCKET : copy the server configuration SRC (tests/karidns-test.conf) to DST with the port of
+# its options { } replaced by PORT and a `socket "SOCKET";` added to its control-channel { }.  A control-channel without a
+# socket binds /var/run/karidns/control.sock, and the server unlinks and re-binds that path: tests that run side by side
+# (tests/run_all_suite.sh -j) would steal it from each other and reach each other's server with karictl.
+# SOCKET must be in a directory of the test that is owned by root (or by the caller) and not writable by others.
+kari_test_conf() {
+    awk -v port="$3" -v sock="$4" '
+        !done_port && /^[ \t]*port[ \t]+[0-9]+[ \t]*;/ { sub(/[0-9]+/, port); done_port = 1 }
+        { print }
+        /^control-channel[ \t]*\{/ { print "    socket \"" sock "\";" }' "$1" > "$2"
+}
+
+# kari_ctl_conf SRC DST SOCKET : the karictl.conf SRC (tests/karictl-test.conf) with the `socket` of the test's server
+# (mode 0600, as karictl wants it).
+kari_ctl_conf() {
+    { printf 'socket "%s";\n' "$3"; cat "$1"; } > "$2"
+    chmod 0600 "$2"
+}
+
 # kari_wait_answer DAG PORT NAME [SECONDS]: wait until the server on 127.0.0.1:PORT
 # answers NAME SOA, at most SECONDS (default 15).  For a test that starts karidns
 # and queries it at once: a fixed sleep is too short when the host is busy (tests

@@ -360,7 +360,7 @@ register_test "xfr" "sh" "tests/run_extended_axfr_test.sh" "KariDNS Extended AXF
 register_test "xfr" "sh" "tests/run_ext_axfr_v3_test.sh" "B8t-2: Extended AXFR v3: the SOA set (several / restricted apex SOA RRs) and the zone settings of the primary travel to a KariDNS secondary; v2 interop, a standard AXFR primary, the secondary's own statements win, primary-settings no, a missing TSIG key fails closed, refresh of a secondary outside every SOA location, RRset TTL rule (loopback aliases when root)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "xfr" "sh" "tests/run_axfr_multikey_tsig_test.sh" "Multi-key TSIG authentication in AXFR"
 register_test "xfr" "sh" "tests/run_tsig_error_matrix_test.sh" "RFC 8945 TSIG errors and authorization for UPDATE/AXFR/NOTIFY/QUERY (R-07, R-08, R-10, R-30, D-03)"
-register_test "xfr" "sh" "tests/run_udp_ixfr_test.sh" "RFC 1995 IXFR single-UDP packet transfer" "group:defctl"   # default control socket (control-channel without socket or port) and tests/karidns-test.conf (port 10053): one at a time
+register_test "xfr" "sh" "tests/run_udp_ixfr_test.sh" "RFC 1995 IXFR single-UDP packet transfer"
 register_test "xfr" "sh" "tests/run_zone_type_secondary_test.sh" "Secondary zone AXFR, REFRESH, EXPIRE (SERVFAIL + EDE 24, serve-stale EDE 3)"
 register_test "xfr" "sh" "tests/run_edns_expire_test.sh" "RFC 7314 EDNS EXPIRE option (primary, secondary, chained secondaries)" "serial"   # real-time 20 s EXPIRE with 1 s retry: secondary AXFR connect failures under load at -j 4, passes alone
 
@@ -372,23 +372,23 @@ register_test "dnssec" "sh" "tests/run_dnssec_answer_sections_test.sh" "DNSSEC a
 register_test "dnssec" "sh" "tests/run_nsec3_owner_query_test.sh" "RFC 5155 7.2.8 queries for NSEC3 owner names: NXDOMAIN with the NSEC3 proof for every QTYPE (UDP/TCP, MQTYPE, minimal-any), apex wildcard answers them as BIND does, RCODE/Answer equal to named, AXFR keeps the NSEC3 RRs (SKIP without dnssec-signzone)"
 
 # 4. Dynamic Update (RFC 2136)
-register_test "update" "sh" "tests/run_dynamic_update_test.sh" "RFC 2136 Prerequisites & Update Section handling" "group:defctl"   # default control socket (control-channel without socket or port) and tests/karidns-test.conf (port 10053): one at a time
+register_test "update" "sh" "tests/run_dynamic_update_test.sh" "RFC 2136 Prerequisites & Update Section handling"
 register_test "update" "sh" "tests/run_update_secondary_refused_test.sh" "RFC 2136 §3.1 UPDATE to a secondary refused, NOTAUTH for unserved zones"
 register_test "update" "sh" "tests/run_rdata_canonical_test.sh" "RFC 2136 §1.1 canonical RDATA comparison, RDATA name case, WKS port names, unencodable records (X-16, X-25, X-32, X-37, X-38)"
-register_test "update" "sh" "tests/run_ttl_harmonization_update_test.sh" "TTL harmonization on dynamic updates" "group:defctl"   # default control socket (control-channel without socket or port) and tests/karidns-test.conf (port 10053): one at a time
+register_test "update" "sh" "tests/run_ttl_harmonization_update_test.sh" "TTL harmonization on dynamic updates"
 
 # 5. EDNS / Cookies / ECS / Multi-QTYPE
 register_test "edns" "sh" "tests/run_bind_ecs_subnet_test.sh" "RFC 7871 \$ECS-SUBNET tag split-horizon routing" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
-register_test "edns" "sh" "tests/run_mqtype_qdcount0_test.sh" "RFC 10029 Multi-QTYPE & RFC 9619 QDCOUNT=0" "group:defctl"   # default control socket (control-channel without socket or port) and tests/karidns-test.conf (port 10053): one at a time
+register_test "edns" "sh" "tests/run_mqtype_qdcount0_test.sh" "RFC 10029 Multi-QTYPE & RFC 9619 QDCOUNT=0"
 register_test "edns" "sh" "tests/run_response_header_test.sh" "RFC 1035 §4.1.1 / RFC 6891 §7 response header bits and error responses (R-05, R-06, R-12, R-13, R-18)"
 
 # 6. Response Rate Limiting (RRL) & Anti-DoS
 register_test "rrl" "sh" "tests/run_rrl_window_test.sh" "RRL sliding window rate limit & SLIP truncated responses"
 register_test "rrl" "sh" "tests/run_query_log_rate_limit_test.sh" "Query log ring buffer rate limiting" "serial"   # fixed ports 10055/10056 and fixed log files in /tmp, qps timing
-register_test "rrl" "sh" "tests/run_glue_truncation_test.sh" "Additional section glue truncation & TC bit" "group:defctl"   # default control socket (control-channel without socket or port) and tests/karidns-test.conf (port 10053): one at a time
+register_test "rrl" "sh" "tests/run_glue_truncation_test.sh" "Additional section glue truncation & TC bit"
 
 # 7. Catalog Zones (RFC 9432)
-register_test "catalog" "sh" "tests/run_catalog_zone_test.sh" "RFC 9432 Catalog Zone member provisioning" "serial"   # failed 2 of 6 runs at -j 4, passes alone (karictl reload checked right after the command); default control socket
+register_test "catalog" "sh" "tests/run_catalog_zone_test.sh" "RFC 9432 Catalog Zone member provisioning"
 register_test "catalog" "sh" "tests/run_cve_coo_test.sh" "RFC 9432 CoO tracking under allocation failure"
 
 # 8. DNSTAP Telemetry Logging
@@ -404,7 +404,7 @@ register_test "tinydns" "sh" "tests/run_tinydns_soa_location_test.sh" "B8t-1: se
 # 10. Server Core & Resolution
 register_test "core" "sh" "tests/run_paren_check_test.sh" "Zone file multi-line parentheses tokenizer"
 register_test "core" "sh" "tests/run_ttl_suffix_test.sh" "TTL time unit suffixes (s, m, h, d, w)"
-register_test "core" "sh" "tests/run_roundtrip_test.sh" "Zone parser to wire serialization roundtrip" "group:defctl"   # default control socket (control-channel without socket or port) and tests/karidns-test.conf (port 10053): one at a time
+register_test "core" "sh" "tests/run_roundtrip_test.sh" "Zone parser to wire serialization roundtrip"
 register_test "core" "sh" "tests/run_karicheck_glue_test.sh" "karicheck in-bailiwick glue record verification"
 register_test "core" "sh" "tests/run_karicheck_semantic_lint_test.sh" "karicheck RFC semantic linter checks"
 register_test "core" "sh" "tests/run_karicheck_matrix_test.sh" "karicheck diagnostic matrix: RDATA/DNSSEC/structure/tinydns/catalog/config lint, exit status contract"
@@ -417,7 +417,7 @@ register_test "core" "sh" "tests/run_multi_instance_test.sh" "Multi-instance iso
 register_test "core" "sh" "tests/run_forward_zone_test.sh" "RFC 5452 Forward zone upstream resolution & failover"
 register_test "core" "sh" "tests/run_program_zone_test.sh" "Dynamic backend records via program zone plugin"
 register_test "core" "sh" "tests/run_karictl_observatory_test.sh" "karictl observatory IPC metrics query"
-register_test "core" "sh" "tests/run_karictl_reload_reconfig_test.sh" "karictl reload & dynamic reconfig IPC" "serial"   # failed 3 of 6 runs at -j 4, passes alone (reload/reconfig result checked right after the command)
+register_test "core" "sh" "tests/run_karictl_reload_reconfig_test.sh" "karictl reload & dynamic reconfig IPC"
 register_test "core" "sh" "tests/run_karictl_reload_failure_test.sh" "karictl reload/reconfig report failures (exit 3), restart-only settings, status values and time format (D-13, O-05, O-09, D-12, T-11)"
 register_test "core" "sh" "tests/run_signal_all_processes_test.sh" "SIGHUP/SIGUSR1/SIGUSR2/SIGPIPE to every karidns process: nothing dies, the server reloads and keeps answering"
 register_test "core" "sh" "tests/run_config_acl_bool_test.sh" "named.conf booleans, category lists, zone type case, named acl statements (D-01, D-02, D-22, D-23)"
@@ -439,13 +439,13 @@ register_test "core" "sh" "tests/run_config_duplicate_rejection_test.sh" "Duplic
 register_test "core" "sh" "tests/run_domain_length_rfc1035_test.sh" "RFC 1035 255-byte domain & 63-byte label limits"
 register_test "core" "sh" "tests/run_logging_channel_validation_test.sh" "Syslog & file logging channels configuration"
 register_test "core" "sh" "tests/run_mx_srv_glue_test.sh" "MX & SRV target additional glue inclusion"
-register_test "core" "sh" "tests/run_notify_source_test.sh" "RFC 1996 notify-source address binding" "serial"   # fixed ports 10053/10054 and the default control socket
+register_test "core" "sh" "tests/run_notify_source_test.sh" "RFC 1996 notify-source address binding" "serial"   # fixed ports 10053/10054 and the loopback alias 127.0.0.2 (the control socket is the test's own)
 register_test "core" "sh" "tests/run_privilege_drop_root_test.sh" "FreeBSD setuid/setgid privilege drop"
 register_test "core" "sh" "tests/run_nonroot_startup_test.sh" "Non-root startup & fail-closed port/log/pid/control checks"
 register_test "core" "sh" "tests/run_response_cache_test.sh" "Response cache hit/miss functional verification"
-register_test "core" "sh" "tests/run_ttl_harmonization_test.sh" "RRset TTL harmonization on zone load" "group:defctl"   # default control socket (control-channel without socket or port) and tests/karidns-test.conf (port 10053): one at a time
+register_test "core" "sh" "tests/run_ttl_harmonization_test.sh" "RRset TTL harmonization on zone load"
 register_test "core" "sh" "tests/run_ttl_rfc2181_clamp_test.sh" "TTL high bit clamped to 2147483647 (RFC 8767 §4, O-14)"
-register_test "core" "sh" "tests/run_zone_oom_partial_load_test.sh" "OOM fail-closed zone loading rollback" "serial"   # failed 2 of 6 runs at -j 4, passes alone (reload after fault injection checked right after the command)
+register_test "core" "sh" "tests/run_zone_oom_partial_load_test.sh" "OOM fail-closed zone loading rollback"
 register_test "core" "sh" "tests/run_coverage_merge_test.sh" "Coverage report tolerates corrupt raw profiles (SIGKILL during profile write)"
 register_test "core" "sh" "tests/run_malformed_detection_default_test.sh" "Structural malformation detection in default mode (RFC 1035 §4.1.1)"
 register_test "core" "sh" "tests/run_matrix_queries_test.sh" "Table-driven Query Engine Matrix: Wildcard, DNAME, Delegation & NSEC proofs"

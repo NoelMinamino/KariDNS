@@ -1732,7 +1732,7 @@ static int db_take_uint(token_ctx_t *ctx, const char *key, bool allow_suffix, ui
  *   - anything else is a configuration error, shown by karidns and by `karicheck conf`.
  * The lists are the zone and view options of the BIND 9.18 / 9.20 ARM ("zone Statement Grammar", "view Statement
  * Grammar") minus what KariDNS reads; options of options { } that a view may also carry are on the view list.  Only
- * zone { } and view { } are strict; key { }, control-channel { }, logging { } and options { } keep skipping unknowns. */
+ * zone { }, view { } and control-channel { } are strict; key { }, logging { } and options { } keep skipping unknowns. */
 static const char *const k_bind_zone_options[] = {
   "allow-notify", "allow-query", "allow-query-on", "allow-update-forwarding", "auto-dnssec", "check-dup-records",
   "check-integrity", "check-mx", "check-mx-cname", "check-names", "check-sibling", "check-spf", "check-srv-cname",
@@ -3837,8 +3837,16 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                       "replace it with the output of 'openssl rand -base64 32'\n");
             }
           }
-        } else
-          skip_unknown_block(ctx);
+        } else {
+          /* An unknown key used to be skipped, so a misspelt "secret" or "socket" left the control channel without a secret
+           * or on the default socket without a word.  It is a configuration error now (startup and reload alike; karicheck
+           * conf shows it as an error because it runs this parser). */
+          syslog(LOG_ERR, "[Config] control-channel: unknown option '%.64s' (supported: socket, secret, algorithm)", key_prop);
+          fprintf(stderr, "[ERROR] control-channel: unknown option '%.64s' (supported: socket, secret, algorithm)\n", key_prop);
+          if (ctx) ctx->error_occurred = true;
+          free(key_prop);
+          return -1;
+        }
         free(key_prop);
       }
       tok = get_next_token(ctx);
