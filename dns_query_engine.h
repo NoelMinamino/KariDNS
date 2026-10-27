@@ -53,6 +53,32 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
                                zone_db_snapshot_t *snap, server_config_t *cfg,
                                zone_db_entry_t **out_matched_entry);
 
+/* E2: the client's view and the closest zone that holds QNAME (find_zone_for_query(): QTYPE 0 for a non-QUERY opcode), when the
+ * caller has already looked them up (to decide program / forward zones).  The *_routed functions take them instead of
+ * looking them up again; route NULL = look them up (what the functions above do).  Valid only for the same snap, client_ip,
+ * qname, qtype and opcode, inside the same read-side section.  entry may be NULL (no zone); view NULL then too. */
+typedef struct {
+  view_snapshot_t *view;
+  zone_db_entry_t *entry;
+} query_route_t;
+
+/* C2: a sibling zone of the view that holds a glue target (append_glue_records(), additional-from-auth yes), and what is needed to
+ * choose its records for this client with the sibling's own location / ECS tag definitions (zone_client_view()).  NULL or view
+ * NULL = no sibling lookup. */
+typedef struct {
+  view_snapshot_t *view;
+  server_config_t *cfg;
+  const char *client_ip;
+  bool ecs_trusted;
+  const uint8_t *ecs_addr;
+  uint16_t ecs_family;
+} glue_sibling_ctx_t;
+int process_dns_query_cap_routed(const uint8_t *req, size_t req_len, uint8_t *res,
+                                 size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
+                                 const char *client_ip, compress_ctx_t *comp_ctx,
+                                 bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
+                                 zone_db_snapshot_t *snap, const query_route_t *route);
+
 view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip);
 bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, program_plugin_t *out);
 void spawn_program_zone_plugins(server_config_t *cfg);
@@ -113,7 +139,7 @@ bool append_glue_records(const zone_image_t *img, const char *target,
                          const char *client_ecs_tag,
                          const char *client_loc_tag,
                          additional_from_auth_t policy,
-                         view_snapshot_t *view, bool dnssec_ok);
+                         const glue_sibling_ctx_t *sib_ctx, bool dnssec_ok);
 void collect_additional_rr_glue(const zone_image_t *img, uint32_t rr, glue_list_t *glue);
 bool name_exists_in_zone(const zone_image_t *img, const char *name,
                          const char client_loc[2], const char *client_ecs_tag,
@@ -144,7 +170,7 @@ bool find_delegation(const zone_image_t *img, const char *qname,
                      const char *client_ecs_tag,
                      const char *client_loc_tag,
                      additional_from_auth_t policy,
-                     view_snapshot_t *view,
+                     const glue_sibling_ctx_t *sib_ctx,
                      bool dnssec_ok);
 int build_synthetic_servfail(const uint8_t *req, size_t req_len,
                              uint8_t *res, size_t max_res_len);

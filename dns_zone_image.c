@@ -262,6 +262,7 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
     bool has_wild = false;
     bool has_dname = false;
     bool has_alias = false;
+    bool has_cut = false;
 
     /* strings area: offset 0 is "none", so the first 8 octets are padding */
     { uint8_t pad[8] = { 0 }; sb_add(&sb, pad, sizeof(pad)); }
@@ -433,7 +434,10 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
     /* 5. name flags */
     for (uint32_t k = 0; k < n_rrs; k++) {
         uint32_t id = rrs[k].name_id;
-        if (rrs[k].type == 2 && id != apex_id) names[id].rr_count_flags |= ZONE_IMAGE_NAME_CUT;
+        if (rrs[k].type == 2 && id != apex_id) {
+            names[id].rr_count_flags |= ZONE_IMAGE_NAME_CUT;
+            has_cut = true;
+        }
         else if (rrs[k].type == 39) {
             names[id].rr_count_flags |= ZONE_IMAGE_NAME_DNAME;
             has_dname = true;
@@ -605,7 +609,7 @@ zone_image_t *zone_image_freeze(const zone_arena_t *a, const char *apex) {
         img->magic = ZONE_IMAGE_MAGIC;
         img->version = ZONE_IMAGE_VERSION;
         img->total_size = (uint32_t)off;
-        img->flags = (a->is_tinydns_format ? ZONE_IMAGE_F_TINYDNS : 0) | (n_ext ? ZONE_IMAGE_F_EXT : 0) | (has_view ? ZONE_IMAGE_F_VIEW : 0) | (has_wild ? ZONE_IMAGE_F_WILDCARD : 0) | (has_dname ? ZONE_IMAGE_F_DNAME : 0) | (has_alias ? ZONE_IMAGE_F_ALIAS : 0) | (perm ? ZONE_IMAGE_F_PERM : 0);
+        img->flags = (a->is_tinydns_format ? ZONE_IMAGE_F_TINYDNS : 0) | (n_ext ? ZONE_IMAGE_F_EXT : 0) | (has_view ? ZONE_IMAGE_F_VIEW : 0) | (has_wild ? ZONE_IMAGE_F_WILDCARD : 0) | (has_dname ? ZONE_IMAGE_F_DNAME : 0) | (has_alias ? ZONE_IMAGE_F_ALIAS : 0) | (has_cut ? ZONE_IMAGE_F_CUT : 0) | (perm ? ZONE_IMAGE_F_PERM : 0);
         img->off_perm = perm ? (uint32_t)o_perm : 0;
         img->n_names = n_names; img->n_rrs = n_rrs; img->n_ext = (uint32_t)n_ext;
         img->n_canon = (uint32_t)n_canon; img->n_nsec = (uint32_t)a->nsec_count;

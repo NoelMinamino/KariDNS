@@ -1184,6 +1184,325 @@ static void test_rcache_cut_additional_not_cached(void) {
     printf("  [PASS] cut Additional section not cached (plain AR=%u, EDNS AR=%u)\n", ar_small, ar_big);
 }
 
+/* Two or three zones of one view (additional-from-auth yes, the default) for the sibling glue tests. */
+typedef struct {
+    zone_arena_t arena[3];
+    zone_db_entry_t ent[3];
+    zone_db_entry_t *entries[3];
+    char *any_acl[1];
+    view_snapshot_t view;
+    zone_db_snapshot_t snap;
+    server_config_t cfg;
+    int n;
+} glue_world_t;
+
+static void world_load(glue_world_t *w, int i, char *text, const char *origin) {
+    zone_arena_init(&w->arena[i]);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = origin, .is_standalone_mode = true, .err_out = &err };
+    assert(parse_zone_fast(text, strlen(text), &w->arena[i], &ctx) >= 0);
+    assert(test_build_index(&w->arena[i], true) == 0);
+    build_zone_response_cache(&w->arena[i].ver, &w->cfg, tst_entry(NULL, origin));
+}
+
+static void world_publish(glue_world_t *w, int i, const char *origin) {
+    memset(&w->ent[i], 0, sizeof(w->ent[i]));
+    strncpy(w->ent[i].domain, origin, sizeof(w->ent[i].domain) - 1);
+    atomic_store_explicit(&w->ent[i].rcu.active, &w->arena[i].ver, memory_order_release);
+    w->entries[i] = &w->ent[i];
+}
+
+static void world_finish(glue_world_t *w, int n) {
+    w->n = n;
+    w->any_acl[0] = (char *)"any";
+    memset(&w->view, 0, sizeof(w->view));
+    w->view.name = "default";
+    w->view.entries = w->entries;
+    w->view.zone_count = (size_t)n;
+    w->view.match_clients = w->any_acl;
+    w->view.match_clients_count = 1;
+    memset(&w->snap, 0, sizeof(w->snap));
+    w->snap.views = &w->view;
+    w->snap.view_count = 1;
+}
+
+static int world_query(glue_world_t *w, uint16_t id, const char *qname, uint16_t qtype, bool edns, uint8_t *res,
+                       size_t res_cap, size_t limit) {
+    uint8_t req[512];
+    size_t req_len = 0;
+    if (edns) build_edns_query(req, &req_len, id, qname, qtype, false);
+    else build_simple_query(req, &req_len, id, qname, qtype);
+    compress_ctx_t cc = {0};
+    compress_ctx_init_packet(&cc);
+    zone_db_entry_t *matched = NULL;
+    (void)res_cap;
+    return process_dns_query_impl(req, req_len, res, limit, qname, qtype, "127.0.0.1", &cc, false, NULL, &w->snap,
+                                  &w->cfg, &matched);
+}
+
+static bool bytes_contain(const uint8_t *buf, size_t len, const uint8_t *pat, size_t plen) {
+    for (size_t i = 0; i + plen <= len; i++)
+        if (memcmp(buf + i, pat, plen) == 0) return true;
+    return false;
+}
+
+/* C1: sibling-zone glue from append_glue_records() (additional-from-auth yes) is not stored in the shared response cache.
+ * The cache key holds only the first zone's data generation; the sibling's publication reaches that generation later, through
+ * g_glue_dirty and the control thread, and only for the first MAX_PRELINK_TARGETS targets.  Until then a cached answer would
+ * keep the old sibling address. */
+static void test_rcache_sibling_glue_not_cached(void) {
+    printf("[TEST] Shared response cache: answers with sibling-zone glue are not stored (C1)...\n");
+    static char text_a[] =
+        "a.example. 3600 IN SOA ns.a.example. h.a.example. 1 7200 3600 1209600 3600\n"
+        "a.example. 3600 IN NS ns.a.example.\n"
+        "ns.a.example. 3600 IN A 192.0.2.1\n"
+        "mx.a.example. 3600 IN MX 10 mail.b.example.\n"
+        "own.a.example. 3600 IN MX 10 ns.a.example.\n";
+    static char text_b[] =
+        "b.example. 3600 IN SOA ns.b.example. h.b.example. 1 7200 3600 1209600 3600\n"
+        "b.example. 3600 IN NS ns.b.example.\n"
+        "ns.b.example. 3600 IN A 192.0.2.2\n"
+        "mail.b.example. 3600 IN A 192.0.2.77\n";
+    static char text_b2[] =
+        "b.example. 3600 IN SOA ns.b.example. h.b.example. 2 7200 3600 1209600 3600\n"
+        "b.example. 3600 IN NS ns.b.example.\n"
+        "ns.b.example. 3600 IN A 192.0.2.2\n"
+        "mail.b.example. 3600 IN A 192.0.2.88\n";
+    glue_world_t *w = calloc(1, sizeof(*w));
+    assert(w);
+    world_load(w, 0, text_a, "a.example.");
+    world_load(w, 1, text_b, "b.example.");
+    assert(w->arena[0].rcache_ok && w->arena[1].rcache_ok);
+    world_publish(w, 0, "a.example.");
+    world_publish(w, 1, "b.example.");
+    world_finish(w, 2);
+
+    static const uint8_t old_addr[4] = {192, 0, 2, 77}, new_addr[4] = {192, 0, 2, 88};
+    uint8_t res[4096];
+    /* the answer carries the sibling's address, and the same query again is not a cache hit */
+    uint64_t hits0 = atomic_load(&w->ent[0].observatory.wirecache_hits);
+    for (int round = 0; round < 3; round++) {
+        int len = world_query(w, (uint16_t)(0x6100 + round), "mx.a.example.", 15, false, res, sizeof(res), 512);
+        assert(len > 12 && (res[3] & 0x0F) == 0 && ((res[6] << 8) | res[7]) == 1);
+        assert(bytes_contain(res, (size_t)len, old_addr, 4));
+    }
+    assert(atomic_load(&w->ent[0].observatory.wirecache_hits) == hits0);
+
+    /* b.example is published again with another address; a.example's generation is not touched (the window before the control
+     * thread's glue refresh, or a target beyond the tracked 256): the next answer must already show the new address */
+    world_load(w, 2, text_b2, "b.example.");
+    atomic_store_explicit(&w->ent[1].rcu.active, &w->arena[2].ver, memory_order_release);
+    int len = world_query(w, 0x6110, "mx.a.example.", 15, false, res, sizeof(res), 512);
+    assert(len > 12);
+    assert(bytes_contain(res, (size_t)len, new_addr, 4));
+    assert(!bytes_contain(res, (size_t)len, old_addr, 4));
+
+    /* a name whose glue is the zone's own address is still cached (the rule is not wider than the sibling lookup) */
+    uint64_t own0 = atomic_load(&w->ent[0].observatory.wirecache_hits);
+    for (int round = 0; round < 2; round++) {
+        len = world_query(w, (uint16_t)(0x6120 + round), "own.a.example.", 15, false, res, sizeof(res), 512);
+        assert(len > 12 && (res[3] & 0x0F) == 0);
+    }
+    assert(atomic_load(&w->ent[0].observatory.wirecache_hits) == own0 + 1);
+
+    for (int i = 0; i < 3; i++) zone_arena_destroy(&w->arena[i]);
+    free(w);
+    printf("  [PASS] sibling glue answers are not cached and follow the sibling at once\n");
+}
+
+/* C2: the sibling's location-tagged addresses are chosen with the sibling's own tag definitions (append_glue_records() takes the
+ * client's view of the sibling, as a CNAME into another zone does), not with the first zone's: the first zone has no tags, the client
+ * (127.0.0.1) is in the sibling's "tokyo" and not in its "osaka".  Such a client-specific answer is not shared through the response
+ * cache (the first zone's own cache is on, it has no tags). */
+static void test_rcache_sibling_tagged_glue_not_cached(void) {
+    printf("[TEST] Shared response cache: sibling glue is chosen with the sibling's tags and not stored (C2)...\n");
+    static char text_a[] =
+        "a.example. 3600 IN SOA ns.a.example. h.a.example. 1 7200 3600 1209600 3600\n"
+        "a.example. 3600 IN NS ns.a.example.\n"
+        "ns.a.example. 3600 IN A 192.0.2.1\n"
+        "mx.a.example. 3600 IN MX 10 mail.b.example.\n";
+    static char text_b[] =
+        "$LOCATION-TAG tokyo 127.0.0.0/8\n"
+        "$LOCATION-TAG osaka 198.51.100.0/24\n"
+        "b.example. 3600 IN SOA ns.b.example. h.b.example. 1 7200 3600 1209600 3600\n"
+        "b.example. 3600 IN NS ns.b.example.\n"
+        "ns.b.example. 3600 IN A 192.0.2.2\n"
+        "$LOCATION tokyo\n"
+        "mail.b.example. 3600 IN A 192.0.2.201\n"
+        "$LOCATION osaka\n"
+        "mail.b.example. 3600 IN A 192.0.2.203\n"
+        "$LOCATION \"\"\n"
+        "mail.b.example. 3600 IN A 192.0.2.202\n";
+    glue_world_t *w = calloc(1, sizeof(*w));
+    assert(w);
+    world_load(w, 0, text_a, "a.example.");
+    world_load(w, 1, text_b, "b.example.");
+    assert(w->arena[0].rcache_ok);
+    assert(!w->arena[1].rcache_ok); /* the tagged zone is not cached itself */
+    world_publish(w, 0, "a.example.");
+    world_publish(w, 1, "b.example.");
+    world_finish(w, 2);
+
+    static const uint8_t tokyo[4] = {192, 0, 2, 201}, osaka[4] = {192, 0, 2, 203};
+    uint8_t res[4096];
+    uint64_t hits0 = atomic_load(&w->ent[0].observatory.wirecache_hits);
+    for (int round = 0; round < 3; round++) {
+        int len = world_query(w, (uint16_t)(0x6200 + round), "mx.a.example.", 15, false, res, sizeof(res), 512);
+        assert(len > 12 && (res[3] & 0x0F) == 0);
+        assert(bytes_contain(res, (size_t)len, tokyo, 4));   /* the sibling's own tag matched the client */
+        assert(!bytes_contain(res, (size_t)len, osaka, 4));
+    }
+    assert(atomic_load(&w->ent[0].observatory.wirecache_hits) == hits0);
+
+    for (int i = 0; i < 2; i++) zone_arena_destroy(&w->arena[i]);
+    free(w);
+    printf("  [PASS] tagged sibling glue follows the sibling's tags and is not cached\n");
+}
+
+/* A1, RFC 9471 §3.1-§3.3 and RFC 2181 §9: a referral that cannot hold all its glue sets TC=1 only when glue for a name server
+ * inside the delegated zone (in-domain) is left out; glue for the other name servers (sibling, RFC 9471 §3.2: SHOULD, "MAY set
+ * TC=1 but is not obligated") is left out without TC.  The positive-answer path (resolve_name_answer(), Additional section after
+ * the apex NS) never sets TC for glue, so after this both paths agree on sibling glue. */
+static void test_referral_tc_only_for_in_domain_glue(void) {
+    printf("[TEST] Referral: TC only when in-domain glue does not fit; sibling glue is dropped without TC (A1)...\n");
+    static char text_p[8192];
+    size_t n = (size_t)snprintf(text_p, sizeof(text_p),
+        "p.example. 3600 IN SOA ns.p.example. h.p.example. 1 7200 3600 1209600 3600\n"
+        "p.example. 3600 IN NS ns.p.example.\n"
+        "ns.p.example. 3600 IN A 192.0.2.1\n"
+        /* c: one in-domain server and a sibling one; s first, then in-domain */
+        "c.p.example. 3600 IN NS ns1.c.p.example.\n"
+        "c.p.example. 3600 IN NS ns.big.example.\n"
+        "ns1.c.p.example. 3600 IN A 192.0.2.5\n"
+        "s.p.example. 3600 IN NS ns.big.example.\n"
+        "s.p.example. 3600 IN NS ns1.s.p.example.\n"
+        "ns1.s.p.example. 3600 IN A 192.0.2.6\n"
+        /* t: an in-domain server whose glue is too large */
+        "t.p.example. 3600 IN NS ns1.t.p.example.\n");
+    for (int i = 1; i <= 20; i++)
+        n += (size_t)snprintf(text_p + n, sizeof(text_p) - n, "ns1.t.p.example. 3600 IN AAAA 2001:db8:1::%x\n", i);
+    /* u: sibling servers only (the second would fit after the first one was left out) */
+    n += (size_t)snprintf(text_p + n, sizeof(text_p) - n,
+        "u.p.example. 3600 IN NS ns.big.example.\nu.p.example. 3600 IN NS ns.small.example.\n");
+    (void)n;
+    /* ns.big.example has one AAAA RRset of 20 addresses (no A): it is all or nothing (RFC 2181 §9) and does not fit in 512 octets */
+    static char text_big[8192];
+    n = (size_t)snprintf(text_big, sizeof(text_big),
+        "big.example. 3600 IN SOA ns.big.example. h.big.example. 1 7200 3600 1209600 3600\n"
+        "big.example. 3600 IN NS ns.big.example.\n");
+    for (int i = 1; i <= 20; i++)
+        n += (size_t)snprintf(text_big + n, sizeof(text_big) - n, "ns.big.example. 3600 IN AAAA 2001:db8:2::%x\n", i);
+    static char text_small[] =
+        "small.example. 3600 IN SOA ns.small.example. h.small.example. 1 7200 3600 1209600 3600\n"
+        "small.example. 3600 IN NS ns.small.example.\n"
+        "ns.small.example. 3600 IN A 192.0.2.9\n";
+    glue_world_t *w = calloc(1, sizeof(*w));
+    assert(w);
+    world_load(w, 0, text_p, "p.example.");
+    world_load(w, 1, text_big, "big.example.");
+    world_load(w, 2, text_small, "small.example.");
+    world_publish(w, 0, "p.example.");
+    world_publish(w, 1, "big.example.");
+    world_publish(w, 2, "small.example.");
+    world_finish(w, 3);
+
+    static const uint8_t in_dom[4] = {192, 0, 2, 5}, in_dom_s[4] = {192, 0, 2, 6};
+    static const uint8_t sib_a[6] = {0x20, 0x01, 0x0d, 0xb8, 0x00, 0x02}; /* 2001:db8:2:: */
+    uint8_t res[4096];
+    /* 1. in-domain glue first, sibling glue (20 AAAA) does not fit in 512 octets: no TC,
+     *    the in-domain address is there, the sibling's is not */
+    int len = world_query(w, 0x6300, "www.c.p.example.", 1, false, res, sizeof(res), 512);
+    assert(len > 12 && len <= 512);
+    assert(!(res[2] & 0x04));                 /* referral: AA clear */
+    assert(((res[8] << 8) | res[9]) == 2);    /* both NS in Authority */
+    assert(!(res[2] & 0x02));                 /* A1: no TC */
+    assert(bytes_contain(res, (size_t)len, in_dom, 4));
+    assert(!bytes_contain(res, (size_t)len, sib_a, 6));
+    /* 2. sibling first, then in-domain: the in-domain glue is still tried after the sibling one did not fit */
+    len = world_query(w, 0x6301, "www.s.p.example.", 1, false, res, sizeof(res), 512);
+    assert(len > 12 && len <= 512);
+    assert(!(res[2] & 0x02));
+    assert(bytes_contain(res, (size_t)len, in_dom_s, 4));
+    assert(!bytes_contain(res, (size_t)len, sib_a, 6));
+    /* 3. in-domain glue too large: TC=1 (RFC 9471 §3.1, §3.3) */
+    len = world_query(w, 0x6302, "www.t.p.example.", 1, false, res, sizeof(res), 512);
+    assert(len > 12 && len <= 512);
+    assert((res[2] & 0x02));
+    /* 4. sibling servers only: no TC, the one that fits after the omitted one is not added either (the optional glue stops at the
+     *    first omission, as in the positive-answer path) */
+    static const uint8_t small_a[4] = {192, 0, 2, 9};
+    len = world_query(w, 0x6303, "www.u.p.example.", 1, false, res, sizeof(res), 512);
+    assert(len > 12 && len <= 512);
+    assert(!(res[2] & 0x02));
+    assert(((res[8] << 8) | res[9]) == 2);
+    assert(!bytes_contain(res, (size_t)len, small_a, 4));
+    /* 5. with EDNS (4096) everything fits: all glue is there, no TC */
+    len = world_query(w, 0x6304, "www.c.p.example.", 1, true, res, sizeof(res), 4096);
+    assert(len > 512 && !(res[2] & 0x02));
+    assert(bytes_contain(res, (size_t)len, in_dom, 4) && bytes_contain(res, (size_t)len, sib_a, 6));
+
+    for (int i = 0; i < 3; i++) zone_arena_destroy(&w->arena[i]);
+    free(w);
+    printf("  [PASS] referral TC only for in-domain glue\n");
+}
+
+/* E2: a caller that already looked up the view and the zone (the Backend does, to find program / forward zones) passes them in
+ * a query_route_t; the answer is the same as when the engine looks them up itself, including the DS question at a child apex
+ * (find_zone_for_query() answers it from the parent zone), a name below a zone cut, a name that no zone holds and EDNS queries. */
+static void test_routed_query_equals_lookup(void) {
+    printf("[TEST] process_dns_query_cap_routed() answers like process_dns_query_cap() (E2)...\n");
+    static char text_a[] =
+        "a.example. 3600 IN SOA ns.a.example. h.a.example. 1 7200 3600 1209600 3600\n"
+        "a.example. 3600 IN NS ns.a.example.\n"
+        "ns.a.example. 3600 IN A 192.0.2.1\n"
+        "mx.a.example. 3600 IN MX 10 ns.a.example.\n"
+        "cut.a.example. 3600 IN NS ns.cut.a.example.\n"
+        "ns.cut.a.example. 3600 IN A 192.0.2.7\n"
+        "sub.a.example. 3600 IN DS 12345 8 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF\n"
+        "sub.a.example. 3600 IN NS ns.sub.a.example.\n";
+    static char text_sub[] =
+        "sub.a.example. 3600 IN SOA ns.sub.a.example. h.sub.a.example. 1 7200 3600 1209600 3600\n"
+        "sub.a.example. 3600 IN NS ns.sub.a.example.\n"
+        "ns.sub.a.example. 3600 IN A 192.0.2.8\n"
+        "www.sub.a.example. 3600 IN A 192.0.2.9\n";
+    glue_world_t *w = calloc(1, sizeof(*w));
+    assert(w);
+    world_load(w, 0, text_a, "a.example.");
+    world_load(w, 1, text_sub, "sub.a.example.");
+    world_publish(w, 0, "a.example.");
+    world_publish(w, 1, "sub.a.example.");
+    world_finish(w, 2);
+
+    struct { const char *qname; uint16_t qtype; bool edns; bool dobit; } cases[] = {
+        { "mx.a.example.", 15, false, false }, { "mx.a.example.", 15, true, false }, { "mx.a.example.", 15, true, true },
+        { "www.cut.a.example.", 1, false, false },  /* referral */
+        { "nx.a.example.", 1, false, false },       /* NXDOMAIN */
+        { "www.sub.a.example.", 1, false, false },  /* the child zone */
+        { "sub.a.example.", 43, true, true },       /* DS at the child apex: answered from the parent zone */
+        { "sub.a.example.", 6, false, false },
+        { "other.example.", 1, false, false },      /* no zone: REFUSED */
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint8_t req[512], r1[4096], r2[4096];
+        size_t req_len = 0;
+        if (cases[i].edns) build_edns_query(req, &req_len, (uint16_t)(0x7000 + i), cases[i].qname, cases[i].qtype, cases[i].dobit);
+        else build_simple_query(req, &req_len, (uint16_t)(0x7000 + i), cases[i].qname, cases[i].qtype);
+        compress_ctx_t cc = {0};
+        compress_ctx_init_packet(&cc);
+        int l1 = process_dns_query_cap(req, req_len, r1, 4096, 0, cases[i].qname, cases[i].qtype, "127.0.0.1", &cc, false, NULL, &w->snap);
+        query_route_t route;
+        route.view = select_view(&w->snap, "127.0.0.1");
+        route.entry = route.view ? find_zone_for_query(route.view, cases[i].qname, cases[i].qtype) : NULL;
+        compress_ctx_init_packet(&cc);
+        int l2 = process_dns_query_cap_routed(req, req_len, r2, 4096, 0, cases[i].qname, cases[i].qtype, "127.0.0.1", &cc, false,
+                                              NULL, &w->snap, &route);
+        assert(l1 > 12 && l1 == l2 && memcmp(r1, r2, (size_t)l1) == 0);
+    }
+    for (int i = 0; i < 2; i++) zone_arena_destroy(&w->arena[i]);
+    free(w);
+    printf("  [PASS] routed and looked-up answers are byte-identical\n");
+}
+
 static void test_wire_cache_observatory_counters(void) {
     printf("[TEST] Running wire cache observatory statistics & counters test...\n");
 
@@ -1412,6 +1731,10 @@ int main(void) {
     test_wire_cache_observatory_counters();
     test_rcache_cross_zone_cname_not_cached();
     test_rcache_cut_additional_not_cached();
+    test_rcache_sibling_glue_not_cached();
+    test_rcache_sibling_tagged_glue_not_cached();
+    test_referral_tc_only_for_in_domain_glue();
+    test_routed_query_equals_lookup();
     test_wire_cache_per_view_config();
     return 0;
 }

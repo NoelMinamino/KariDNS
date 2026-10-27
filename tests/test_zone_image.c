@@ -610,6 +610,11 @@ static void check_flags(const zone_arena_t *a, const zone_image_t *img) {
     }
     CHECK(((img->flags & ZONE_IMAGE_F_WILDCARD) != 0) == wild);
     CHECK(((img->flags & ZONE_IMAGE_F_DNAME) != 0) == dname);
+    /* E3: ZONE_IMAGE_F_CUT iff some RR other than the apex's own has type NS */
+    bool cut = false;
+    for (uint32_t k = 0; k < img->n_rrs; k++)
+        if (zone_image_rr_type(img, k) == 2 && zone_image_rr_name(img, k) != img->apex_name) cut = true;
+    CHECK(((img->flags & ZONE_IMAGE_F_CUT) != 0) == cut);
     for (uint32_t id = 0; id < img->n_names; id++)
         CHECK(((zone_image_name_flags(img, id) & ZONE_IMAGE_NAME_WILDCARD) != 0) ==
               (zone_image_name_text(img, id)[0] == '*' && zone_image_name_text(img, id)[1] == '.'));
