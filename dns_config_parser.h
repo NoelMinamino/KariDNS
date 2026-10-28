@@ -191,7 +191,8 @@ typedef struct {
 /* ---- Batch 5: server <prefix> { ... }; (BIND 9.20 ARM "server Statement Definition and Usage"; lib/isccfg/namedconf.c server_clauses,
  * bin/named/server.c configure_peer()).  A statement describes the remote server(s) an address prefix covers.  Where BIND uses an option
  * (lib/dns/zone.c, xfrin.c, lib/ns/xfrout.c, client.c): keys, transfers, transfer-source(-v6), notify-source(-v6), request-ixfr,
- * request-expire, edns, edns-udp-size, edns-version, request-nsid for our requests to the server; provide-ixfr, transfer-format and
+ * request-expire, edns, edns-udp-size, edns-version, request-nsid for our requests to the server; tcp-only for our NOTIFY (over TCP,
+ * dns_dynamic_update.c notify_tcp_start()); provide-ixfr, transfer-format and
  * max-udp-size for what we send to it.  The others are accepted and have no effect on an authoritative server (resolver.c, checkds). ---- */
 #define SV_B_BOGUS          (1u << 0)
 #define SV_B_EDNS           (1u << 1)
@@ -808,7 +809,7 @@ uint32_t xfr_rate_clamp(uint32_t v);
 enum { XL_TRANSFERS_IN = 0, XL_TRANSFERS_OUT, XL_TRANSFERS_PER_NS, XL_SERIAL_QUERY_RATE, XL_NOTIFY_RATE, XL_STARTUP_NOTIFY_RATE };
 uint32_t xfr_cfg_limit(const server_config_t *cfg, int which);
 /* The source addresses that were in the configuration when the server started are the only ones it can use: the Router pre-binds the NOTIFY
- * sockets and the connect broker (a separate process) is told the transfer sources at its start, neither follows a reload.  The server
+ * sockets and the connect broker (a separate process) is told the transfer sources (and the NOTIFY sources, for NOTIFY over TCP) at its start, neither follows a reload.  The server
  * records the start-up set once (before it forks the children); config_xfr_source_allowed() says whether an address is in it for the
  * use (xfer = transfers, else NOTIFY).  A reload that names another address is a restart-only change. */
 void config_set_startup_xfr_sources(const server_config_t *cfg);

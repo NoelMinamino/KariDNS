@@ -16,7 +16,9 @@
 #   F  transfer-format one-answer (one RR a message), provide-ixfr no (an IXFR is answered with the whole zone), max-udp-size (a UDP answer is
 #      cut at the peer's limit)
 #   E  start-up refuses a server transfer-source it cannot bind, with file:line
-# The loopback aliases 127.0.0.2 .. 127.0.0.5 are added when run as root and removed on exit; without them S and V are SKIPped.
+#   C  NOTIFY over TCP: tcp-only yes sends it over TCP (signed, the answer verified), the retry over TCP after the UDP attempts or an unusable UDP
+#      answer, peers that close / garble / stall do not hang the server, the local address is the one of the UDP NOTIFY (aliases, root)
+# The loopback aliases 127.0.0.2 .. 127.0.0.5 are added when run as root and removed on exit; without them S, V and C11-C13 are SKIPped.
 set -u
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -69,11 +71,11 @@ skip() { echo "SKIP: $*"; SKIPS=$((SKIPS + 1)); }
 cleanup() {
     set +e
     kari_kill_tree $PIDS
-    for n in pp s1 s2 s3 pv sv pn1 pn2 pn3 st1 st2 pf1 pf2 po so snp; do kari_kill_conf "$W/$n.conf"; done
+    for n in pp s1 s2 s3 pv sv pn1 pn2 pn3 st1 st2 pf1 pf2 po so snp pc1 pc2 pc3 pcm pcsec; do kari_kill_conf "$W/$n.conf"; done
     for a in $ALIASES; do ifconfig lo0 inet "$a" -alias 2>/dev/null; done
     if [ "$FAILS" -ne 0 ]; then
-        for f in pp s1 s2 s3 pv sv pn1 pn2 pn3 st1 st2 pf1 pf2 po so snp; do echo "--- $f.log (tail)"; tail -15 "$W/$f.log" 2>/dev/null; done
-        for f in sink1 sink3 sink4; do echo "--- $f.log"; cat "$W/$f.log" 2>/dev/null; done
+        for f in pp s1 s2 s3 pv sv pn1 pn2 pn3 st1 st2 pf1 pf2 po so snp pc1 pc2 pc3 pcm pcsec; do echo "--- $f.log (tail)"; tail -15 "$W/$f.log" 2>/dev/null; done
+        for f in sink1 sink3 sink4 sinkc sinkd sinke; do echo "--- $f.log"; cat "$W/$f.log" 2>/dev/null; done
     fi
     rm -rf "$W"
 }
@@ -131,13 +133,14 @@ EOF
 zone "$W/k1.zone" a.test 1
 "$KARICHECK" conf "$W/k1.conf" > "$W/kc.out" 2>&1
 rc=$?
-for want in "bogus is accepted, no effect in KariDNS" "tcp-only is accepted, no effect in KariDNS" "tcp-keepalive is accepted, no effect in KariDNS" \
+for want in "bogus is accepted, no effect in KariDNS" "tcp-keepalive is accepted, no effect in KariDNS" \
             "padding cannot exceed 512" "padding is accepted, no effect in KariDNS" "send-cookie is accepted, no effect in KariDNS" \
             "require-cookie is accepted, no effect in KariDNS" "query-source is accepted, no effect in KariDNS" \
             "View 'v1': it has server statements of its own, so the top-level server statements do not apply in this view"; do
     if grep -q "$want" "$W/kc.out"; then pass "K: karicheck conf says '$want'"
     else fail "K: karicheck conf has no '$want'"; cat "$W/kc.out"; fi
 done
+grep -q "tcp-only" "$W/kc.out" && { fail "K: tcp-only has an effect now (NOTIFY over TCP) and must not be warned about"; cat "$W/kc.out"; } || pass "K: tcp-only is not warned about"
 grep -q "k1.conf:[0-9]*: server '192.0.2.0/24': bogus" "$W/kc.out" && pass "K: the warnings name file:line and the statement" || { fail "K: no file:line in the warnings"; cat "$W/kc.out"; }
 grep -q "View 'v2'" "$W/kc.out" && fail "K: v2 has no server statements of its own and must not be mentioned" || pass "K: a view without statements of its own is not mentioned"
 [ "$rc" -eq 0 ] && pass "K: the warnings do not make karicheck conf fail" || fail "K: karicheck conf exit status $rc"
@@ -481,6 +484,166 @@ tc() { "$DAG" @127.0.0.1 -p "$1" t.big.test TXT +bufsize=4096 +ignore +nohexdump
 c1=$(tc "$PF1"); c2=$(tc "$PF2")
 if [ "$c1" -ge 1 ] && [ "$c2" -eq 0 ]; then pass "F3: max-udp-size 512 in the server statement: the UDP answer to a client that offers 4096 is cut (TC); otherwise it fits"
 else fail "F3: max-udp-size: truncated with the statement=$c1 (expected 1), without=$c2 (expected 0)"; fi
+
+# ------------------------------------------------------------------------------------------------ C: NOTIFY over TCP
+# `tcp-only yes` in a server statement sends the NOTIFY over TCP; otherwise it is UDP, and a NOTIFY that got no usable answer is made once
+# over TCP (BIND 9.20 zone.c notify_send_toaddr() / notify_done()).  A mock receiver (tests/mock_notify_sink.pl) listens on UDP and TCP of the
+# same port and logs how each NOTIFY came (via=udp / via=tcp) and whether its TSIG is right; its TCP side answers by mode.
+for z in c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 d1 d2 d3; do zone "$W/$z.zone" "$z.test" 1; done
+CPORT=$(kari_port 40)       # 40 .. 59: one port per target, UDP and TCP on it
+cp_of() { echo $((CPORT + $1)); }
+# sink A (UDP answers; TCP by mode): c1 answer | c2 close | c3 garble | c4 short | c5 bigprefix | c6 badid | c7 unsigned | c8 badsig | c9 stall | c10 partial
+# d1: UDP answered, d3: UDP answered without a TSIG although the NOTIFY is signed; both TCP answer
+perl "$DIR/mock_notify_sink.pl" --log "$W/sinkc.log" --key "xk:$XK" --answer \
+    --ports "$(cp_of 1),$(cp_of 2),$(cp_of 3),$(cp_of 4),$(cp_of 5),$(cp_of 6),$(cp_of 7),$(cp_of 8),$(cp_of 9),$(cp_of 10),$(cp_of 11),$(cp_of 13)" \
+    --tcp-ports "$(cp_of 1):answer,$(cp_of 2):close,$(cp_of 3):garble,$(cp_of 4):short,$(cp_of 5):bigprefix,$(cp_of 6):badid,$(cp_of 7):unsigned,$(cp_of 8):badsig,$(cp_of 9):stall,$(cp_of 10):partial,$(cp_of 11):answer,$(cp_of 13):answer" \
+    2>/dev/null &
+PIDS="$PIDS $!"
+# sink B: UDP is silent (no --answer), TCP answers: d2
+perl "$DIR/mock_notify_sink.pl" --log "$W/sinkd.log" --ports "$(cp_of 12)" --tcp-ports "$(cp_of 12):answer" 2>/dev/null &
+PIDS="$PIDS $!"
+{
+    echo "options { port $(cp_of 30); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; };"
+    ctlblock pc1
+    keydef xk "$XK"
+    echo "server 127.0.0.1 { tcp-only yes; keys xk; };"
+    n=1
+    for z in c1 c2 c3 c4 c5 c6 c7 c8 c9 c10; do
+        echo "zone \"$z.test\" { type master; file \"$W/$z.zone\"; also-notify { 127.0.0.1 port $(cp_of $n); }; };"
+        n=$((n + 1))
+    done
+} > "$W/pc1.conf"
+{
+    echo "options { port $(cp_of 31); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; notify-retries 1; notify-retry-interval 1; };"
+    ctlblock pc2
+    keydef xk "$XK"
+    echo "zone \"d1.test\" { type master; file \"$W/d1.zone\"; also-notify { 127.0.0.1 port $(cp_of 11); }; };"
+    echo "zone \"d2.test\" { type master; file \"$W/d2.zone\"; also-notify { 127.0.0.1 port $(cp_of 12); }; };"
+    echo "zone \"d3.test\" { type master; file \"$W/d3.zone\"; tsig-key xk; notify-retries 5; notify-retry-interval 60; also-notify { 127.0.0.1 port $(cp_of 13); }; };"
+} > "$W/pc2.conf"
+sleep 1
+start pc1; start pc2
+kari_wait_answer "$DAG" "$(cp_of 30)" c1.test. || true
+kari_wait_answer "$DAG" "$(cp_of 31)" d1.test. || true
+: > "$W/sinkc.log"; : > "$W/sinkd.log"
+for z in c1 c2 c3 c4 c5 c6 c7 c8 c9 c10; do ctl pc1 notify $z.test > /dev/null; done
+for z in d1 d2 d3; do ctl pc2 notify $z.test > /dev/null; done
+sleep 5
+cnt() { grep -c "NOTIFY port=$2 .* via=$3 " "$1"; }
+# C1: tcp-only: over TCP only, signed with the server statement's key, from a TCP answer that carries a good TSIG
+if [ "$(cnt "$W/sinkc.log" "$(cp_of 1)" tcp)" -eq 1 ] && [ "$(cnt "$W/sinkc.log" "$(cp_of 1)" udp)" -eq 0 ] && grep -q "NOTIFY port=$(cp_of 1) .* qname=c1.test tsig=xk:ok via=tcp" "$W/sinkc.log"; then
+    pass "C1: tcp-only yes: the NOTIFY came once over TCP, none over UDP, signed with the server statement's key (tsig=xk:ok)"
+else fail "C1: expected one signed TCP NOTIFY and no UDP datagram for c1.test"; cat "$W/sinkc.log"; fi
+if ! grep -q "zone 'c1.test.'.*over TCP failed" "$W/pc1.log"; then pass "C2: the signed TCP answer (TSIG verified against the request MAC) is accepted: no failure logged"
+else fail "C2: a failure was logged for c1.test"; grep "c1.test" "$W/pc1.log"; fi
+# C3: d1 has no tcp-only: UDP, answered, nothing over TCP
+if [ "$(cnt "$W/sinkc.log" "$(cp_of 11)" udp)" -eq 1 ] && [ "$(cnt "$W/sinkc.log" "$(cp_of 11)" tcp)" -eq 0 ]; then pass "C3: no tcp-only: the NOTIFY goes over UDP and its answer ends it (nothing over TCP)"
+else fail "C3: d1.test: udp=$(cnt "$W/sinkc.log" "$(cp_of 11)" udp) tcp=$(cnt "$W/sinkc.log" "$(cp_of 11)" tcp)"; cat "$W/sinkc.log"; fi
+# C4: UDP silent, notify-retries 1 / interval 1: two datagrams, then one TCP NOTIFY that is answered
+if [ "$(cnt "$W/sinkd.log" "$(cp_of 12)" udp)" -eq 2 ] && [ "$(cnt "$W/sinkd.log" "$(cp_of 12)" tcp)" -eq 1 ]; then
+    pass "C4: no answer over UDP (1 + notify-retries 1 datagrams): the NOTIFY is made once over TCP and answered"
+else fail "C4: d2.test: udp=$(cnt "$W/sinkd.log" "$(cp_of 12)" udp) (expected 2) tcp=$(cnt "$W/sinkd.log" "$(cp_of 12)" tcp) (expected 1)"; cat "$W/sinkd.log"; fi
+grep -q "zone 'd2.test.': no answer from 127.0.0.1 port $(cp_of 12) after 2 NOTIFY message(s); retrying over TCP" "$W/pc2.log" \
+    && pass "C5: the log says 'no answer ... after 2 NOTIFY message(s); retrying over TCP'" || { fail "C5: no 'retrying over TCP' line for d2.test"; grep d2.test "$W/pc2.log"; }
+# C6: a signed NOTIFY whose UDP answer is unsigned: not accepted, and made over TCP at once (the retry interval of the zone is 60 s)
+if [ "$(cnt "$W/sinkc.log" "$(cp_of 13)" udp)" -eq 1 ] && [ "$(cnt "$W/sinkc.log" "$(cp_of 13)" tcp)" -eq 1 ] && grep -q "NOTIFY port=$(cp_of 13) .* tsig=xk:ok via=tcp" "$W/sinkc.log"; then
+    pass "C6: an answer over UDP that fails TSIG verification: ignored, and the NOTIFY follows over TCP at once, signed (not after 5 x 60 s)"
+else fail "C6: d3.test: udp=$(cnt "$W/sinkc.log" "$(cp_of 13)" udp) tcp=$(cnt "$W/sinkc.log" "$(cp_of 13)" tcp)"; cat "$W/sinkc.log"; fi
+grep -q "zone 'd3.test.': ignoring NOTIFY answer from 127.0.0.1 port $(cp_of 13) that fails TSIG verification" "$W/pc2.log" \
+    && grep -q "zone 'd3.test.': the answer from 127.0.0.1 port $(cp_of 13) was no good; retrying over TCP" "$W/pc2.log" \
+    && pass "C7: the UDP answer is logged as failing TSIG verification, then 'retrying over TCP'" || { fail "C7: log lines of d3.test"; grep d3.test "$W/pc2.log"; }
+# C8: a peer that closes, garbles, sends a short reply, a huge length, another ID, no TSIG or a wrong one: tcp-only makes two attempts, then the failure is logged
+chk_tcp_fail() { # chk_tcp_fail ZONE N MODE REASON
+    _p=$(cp_of "$2")
+    _n=$(cnt "$W/sinkc.log" "$_p" tcp)
+    if [ "$_n" -eq 2 ] && grep -q "zone '$1.test.': NOTIFY to 127.0.0.1 port $_p over TCP failed: $4: retrying over TCP" "$W/pc1.log" \
+        && grep -q "zone '$1.test.': NOTIFY to 127.0.0.1 port $_p over TCP failed: $4\$" "$W/pc1.log"; then
+        pass "C8 $3: two TCP attempts (the second is BIND's 'retrying over TCP'), then 'over TCP failed: $4'"
+    else fail "C8 $3: $1.test: $_n TCP NOTIFYs (expected 2) or no '$4' failure in the log"; grep "$1.test" "$W/pc1.log"; fi
+}
+chk_tcp_fail c2 2 close "the connection was closed before the answer"
+chk_tcp_fail c3 3 garble "the reply is not an answer to this NOTIFY"
+chk_tcp_fail c4 4 short "the answer has an impossible length"
+chk_tcp_fail c5 5 bigprefix "the answer has an impossible length"
+chk_tcp_fail c6 6 badid "the reply is not an answer to this NOTIFY"
+chk_tcp_fail c7 7 unsigned "the answer fails TSIG verification with key 'xk' (unsigned, rcode 0)"
+chk_tcp_fail c8 8 badsig "the answer fails TSIG verification with key 'xk' (BADSIG, rcode 0)"
+# C9: stalling peers hold one thread each, not the server: it still answers and sends other NOTIFYs; they give up after 15 s (two attempts)
+if [ "$(cnt "$W/sinkc.log" "$(cp_of 9)" tcp)" -ge 1 ] && [ "$(cnt "$W/sinkc.log" "$(cp_of 10)" tcp)" -ge 1 ]; then
+    : > "$W/sinkc.log"
+    ctl pc1 notify c1.test > /dev/null
+    sleep 2
+    out=$("$DAG" @127.0.0.1 -p "$(cp_of 30)" c1.test SOA +short +nohexdump +time=2 +tries=1 2>&1)
+    if [ "$(cnt "$W/sinkc.log" "$(cp_of 1)" tcp)" -eq 1 ] && [ -n "$out" ]; then
+        pass "C9: while the stalled and the half-answering peer are waited for, the server answers queries and sends the next NOTIFY over TCP"
+    else fail "C9: during the stalls: c1 NOTIFYs=$(cnt "$W/sinkc.log" "$(cp_of 1)" tcp), query answer='$out'"; fi
+else fail "C9: the stalling receivers were not asked"; cat "$W/sinkc.log"; fi
+i=0
+while [ $i -lt 45 ] && ! { grep -q "zone 'c9.test.': NOTIFY to 127.0.0.1 port $(cp_of 9) over TCP failed: timed out\$" "$W/pc1.log" &&
+                            grep -q "zone 'c10.test.': NOTIFY to 127.0.0.1 port $(cp_of 10) over TCP failed: timed out\$" "$W/pc1.log"; }; do sleep 1; i=$((i + 1)); done
+if [ "$i" -lt 45 ] && [ "$i" -ge 5 ]; then pass "C10: a peer that never answers, and one that sends 3 octets of its answer, are given up after the 15 s of BIND's TCP timeout (both attempts, ~$i s more)"
+else fail "C10: the stalled exchanges ended after $i more seconds (expected 5..44) or not at all"; grep -E "c9.test|c10.test" "$W/pc1.log"; fi
+
+# C11: the source address of a NOTIFY over TCP is the one of the UDP NOTIFY: the server statement's, else the list's, else options' (root: loopback aliases)
+if [ "$HAVE_ALIAS" -ne 1 ]; then
+    skip "C11: the source address of a NOTIFY over TCP needs the loopback aliases 127.0.0.2 - 127.0.0.5 (run as root)"
+else
+    for z in e1 e2 e3; do zone "$W/$z.zone" "$z.test" 1; done
+    perl "$DIR/mock_notify_sink.pl" --log "$W/sinke.log" --key "xk:$XK" --tcp-ports "$(cp_of 41):answer" \
+        --tcp-bind "127.0.0.5:$(cp_of 42):answer,127.0.0.4:$(cp_of 43):answer" 2>/dev/null &
+    PIDS="$PIDS $!"
+    {
+        echo "options { port $(cp_of 32); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; notify-source 127.0.0.3; };"
+        ctlblock pc3
+        keydef xk "$XK"
+        echo "server 127.0.0.1 { tcp-only yes; keys xk; notify-source 127.0.0.2; };"
+        echo "server 127.0.0.5 { tcp-only yes; keys xk; };"
+        echo "server 127.0.0.4 { tcp-only yes; keys xk; };"
+        echo "zone \"e1.test\" { type master; file \"$W/e1.zone\"; also-notify source 127.0.0.4 { 127.0.0.1 port $(cp_of 41); }; };"
+        echo "zone \"e2.test\" { type master; file \"$W/e2.zone\"; also-notify source 127.0.0.4 { 127.0.0.5 port $(cp_of 42); }; };"
+        echo "zone \"e3.test\" { type master; file \"$W/e3.zone\"; also-notify { 127.0.0.4 port $(cp_of 43); }; };"
+    } > "$W/pc3.conf"
+    sleep 1
+    start pc3
+    kari_wait_answer "$DAG" "$(cp_of 32)" e1.test. || true
+    for z in e1 e2 e3; do ctl pc3 notify $z.test > /dev/null; done
+    sleep 3
+    grep -q "NOTIFY port=$(cp_of 41) src=127.0.0.2 .* tsig=xk:ok via=tcp" "$W/sinke.log" \
+        && pass "C11: the server statement's notify-source (127.0.0.2) is the local address of the TCP connection (above the list's 127.0.0.4)" \
+        || { fail "C11: e1.test: expected a TCP NOTIFY from 127.0.0.2"; cat "$W/sinke.log"; }
+    grep -q "NOTIFY port=$(cp_of 42) src=127.0.0.4 .* via=tcp" "$W/sinke.log" \
+        && pass "C12: no server notify-source: the source of the also-notify list (127.0.0.4) is the local address (above options' 127.0.0.3)" \
+        || { fail "C12: e2.test: expected a TCP NOTIFY from 127.0.0.4"; cat "$W/sinke.log"; }
+    grep -q "NOTIFY port=$(cp_of 43) src=127.0.0.3 .* via=tcp" "$W/sinke.log" \
+        && pass "C13: neither: options' notify-source (127.0.0.3) is the local address" \
+        || { fail "C13: e3.test: expected a TCP NOTIFY from 127.0.0.3"; cat "$W/sinke.log"; }
+fi
+
+# C14: KariDNS to KariDNS: a primary with tcp-only yes notifies a secondary over TCP (signed); the secondary's refresh timer is an hour, so
+# the new serial arrives through the NOTIFY (the primary never sends a datagram)
+zone "$W/m.zone" m.test 1 3600 3600 86400
+{
+    echo "options { port $(cp_of 50); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; };"
+    ctlblock pcm
+    keydef xk "$XK"
+    echo "server 127.0.0.1 { tcp-only yes; keys xk; };"
+    echo "zone \"m.test\" { type master; file \"$W/m.zone\"; allow-transfer { key xk; }; also-notify { 127.0.0.1 port $(cp_of 51); }; };"
+} > "$W/pcm.conf"
+{
+    echo "options { port $(cp_of 51); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT };"
+    keydef xk "$XK"
+    echo "zone \"m.test\" { type slave; tsig-key xk; primaries { 127.0.0.1 port $(cp_of 50) key xk; }; };"
+} > "$W/pcsec.conf"
+start pcm
+kari_wait_answer "$DAG" "$(cp_of 50)" m.test. || true
+start pcsec
+if wait_serial "$(cp_of 51)" m.test 1 25; then
+    zone "$W/m.zone" m.test 2 3600 3600 86400
+    ctl pcm reload > /dev/null
+    if wait_serial "$(cp_of 51)" m.test 2 15; then pass "C14: a KariDNS primary with tcp-only yes notified a KariDNS secondary over TCP (signed): serial 2 arrived long before its refresh time"
+    else fail "C14: the secondary did not refresh after the NOTIFY over TCP"; grep -i notify "$W/pcm.log" | tail -5; fi
+    grep -q "over TCP failed" "$W/pcm.log" && fail "C14: the primary logged a failed NOTIFY over TCP" || pass "C14: the primary logged no failure"
+else fail "C14: the secondary did not load m.test"; fi
 
 echo ""
 echo "server statement test: $PASSES passed, $FAILS failed, $SKIPS skipped"

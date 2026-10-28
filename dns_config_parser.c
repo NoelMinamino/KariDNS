@@ -3532,9 +3532,6 @@ static int parse_server_block(token_ctx_t *ctx, server_stmt_t **list, const char
       case SV_B_TCP_KEEPALIVE: case SV_PADDING:
         conf_warn_loc(oloc, what, "%s is accepted, no effect in KariDNS (BIND uses it for the queries of its resolver)", key);
         break;
-      case SV_B_TCP_ONLY:
-        conf_warn_loc(oloc, what, "tcp-only is accepted, no effect in KariDNS (its SOA checks and transfers use TCP already, and NOTIFY is sent over UDP only)");
-        break;
       case 1000:
         conf_warn_loc(oloc, what, "%s is accepted, no effect in KariDNS (BIND uses it for the DS checks of parental-agents)", key);
         break;

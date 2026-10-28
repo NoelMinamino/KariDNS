@@ -169,8 +169,8 @@ if grep -q "zone 's.test.': no answer from 127.0.0.1 port $SINK4" "$W/p.log" &&
     pass "D-09: the secondary's signed answer stops the retransmission (silent receiver still times out)"
 else fail "D-09: retransmission to the KariDNS secondary with the right key was not stopped"; fi
 if grep -q "zone 's.test.': ignoring NOTIFY answer from 127.0.0.1 port $PW that fails TSIG verification" "$W/p.log" &&
-   grep -q "zone 's.test.': no answer from 127.0.0.1 port $PW " "$W/p.log"; then
-    pass "D-09: an answer that fails TSIG verification (wrong secret) is logged and does not stop it (RFC 8945 §5.4)"
+   grep -q "zone 's.test.': the answer from 127.0.0.1 port $PW was no good; retrying over TCP" "$W/p.log"; then
+    pass "D-09: an answer that fails TSIG verification (wrong secret) is logged and not accepted (RFC 8945 §5.4); the NOTIFY is made over TCP (BIND notify_done())"
 else fail "D-09: answer of the secondary with the wrong secret not logged/ignored"; fi
 
 # ---------------------------------------------------------------- R-21: NOTIFY after a reload

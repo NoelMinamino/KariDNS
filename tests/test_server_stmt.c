@@ -144,7 +144,7 @@ static void test_parse_options(void) {
     }
     /* padding 128 is in range; the clamps are tested below.  Warnings: options with no effect on an authoritative server */
     CHECK(strstr(err, "bogus is accepted, no effect in KariDNS") != NULL);
-    CHECK(strstr(err, "tcp-only is accepted, no effect in KariDNS") != NULL);
+    CHECK(strstr(err, "tcp-only") == NULL); /* tcp-only sends NOTIFY over TCP now: no warning */
     CHECK(strstr(err, "tcp-keepalive is accepted, no effect in KariDNS") != NULL);
     CHECK(strstr(err, "padding is accepted, no effect in KariDNS") != NULL);
     CHECK(strstr(err, "send-cookie is accepted, no effect in KariDNS") != NULL);

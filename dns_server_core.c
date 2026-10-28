@@ -319,7 +319,8 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
          * that fails fails the connection (the transfer is not made from another address than the operator asked for). */
         bool src_ok = true;
         if (req.type == SOCK_STREAM && req.family != AF_UNIX && req.tcp_opts.has_src) {
-          if (!config_xfr_source_allowed(req.family, req.tcp_opts.src, true)) {
+          /* a transfer source, or a NOTIFY source (a NOTIFY over TCP leaves from the address of the UDP one) */
+          if (!config_xfr_source_allowed(req.family, req.tcp_opts.src, true) && !config_xfr_source_allowed(req.family, req.tcp_opts.src, false)) {
             src_ok = false;
           } else if (req.family == AF_INET) {
             struct sockaddr_in sin;
