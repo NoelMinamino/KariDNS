@@ -2657,6 +2657,22 @@ bool print_parse_diagnostics(const uint8_t *pkt, size_t len, const dag_parse_t *
     return false;
 }
 
+/* g_dag_discard_dump: the display options of the query being executed (set by execute_query_spec()) */
+static const display_opts_t *g_discard_dopt = NULL;
+static bool g_discard_no_hexdump_response = false;
+
+/* Hexdump of a message that dag received and discarded (the caller has printed the warning line already). Same
+ * conditions as the hexdump of a normal response in run_test(): normal output format (not +short / +yaml), comments
+ * shown, not +nohexdump. The heading has no network-controlled text. len is at most the receive buffer. */
+static void dag_dump_discarded(const uint8_t *msg, size_t len, const char *proto, const char *server, int port) {
+    const display_opts_t *d = g_discard_dopt;
+    if (!d || d->yaml || d->short_mode || !d->show_comments || g_discard_no_hexdump_response) return;
+    printf(";; Discarded response (%zu bytes, %s from %s#%d):\n", len, proto,
+           g_last_server_ip[0] ? g_last_server_ip : server, port);
+    hexdump(msg, len);
+    printf("\n");
+}
+
 /* g_dag_answer_check for do_udp_exchange(): like dig 9.20, an answer without the QR bit is reported and used; an
  * answer with another opcode, or whose question differs from the one sent (name compared case-insensitively,
  * RFC 4343; RFC 5452 §9.1), is reported and ignored, and dag keeps waiting. Questions that cannot be parsed are
@@ -3072,14 +3088,17 @@ static int dag_tcp_check_answer(int sock, const uint8_t *pkt, size_t pkt_len, ui
     for (;;) {
         if (*n < 12) {
             printf(";; ERROR: short (< header size) message\n");
+            dag_dump_discarded(resp, (size_t)*n, "TCP", server, port);
             return 1;
         }
         uint16_t resp_id = (uint16_t)((resp[0] << 8) | resp[1]);
         if (resp_id != expected_id) {
             printf(";; ERROR: ID mismatch: expected ID %u, got %u\n", expected_id, resp_id);
+            dag_dump_discarded(resp, (size_t)*n, "TCP", server, port);
             return 1;
         }
         if (dag_check_answer(pkt, pkt_len, resp, (size_t)*n)) return 0;
+        dag_dump_discarded(resp, (size_t)*n, "TCP", server, port);
         if (((pkt[2] >> 3) & 0x0F) == ((resp[2] >> 3) & 0x0F)) return 1; /* question mismatch */
         errno = 0;
         *n = sock >= 0 ? do_tcp_recv_response(sock, resp, resp_cap) : -1;
@@ -3947,7 +3966,7 @@ KARIDNS_TOOL_FN void usage(const char *prog) {
         "  +[no]header-only             Send DNS query packet without a QUESTION section\n"
         "  +[no]hexdump                 Show/suppress raw packet hex dumps for query and response\n"
         "  +[no]hexdump-query           Show/suppress raw query packet hex dump\n"
-        "  +[no]hexdump-response        Show/suppress raw response packet hex dump\n"
+        "  +[no]hexdump-response        Show/suppress raw response (and discarded response) hex dump\n"
         "  +fuzztime[=N]                [TEST-ONLY] Override TSIG time_signed with a fixed\n"
         "                               timestamp (default 1646972129) instead of current time,\n"
         "                               for reproducible TSIG MAC testing. Do not use against\n"
@@ -5648,6 +5667,8 @@ int execute_query_spec(query_spec_t *spec) {
     if (spec->qo.idnin) spec->qname = (char *)idn_to_ascii(spec->qname, &q_allocated);
 
     int exit_code = 0;
+    g_discard_dopt = &spec->dopt;
+    g_discard_no_hexdump_response = spec->no_hexdump_response;
     if (spec->do_trace2) {
         if (spec->do_trace || spec->do_nssearch) {
             fprintf(stderr, "dag: +trace2 cannot be combined with +trace or +nssearch\n");
@@ -5674,6 +5695,7 @@ int execute_query_spec(query_spec_t *spec) {
                                    spec->no_hexdump_query, spec->no_hexdump_response, spec->qo, spec->hex_payload, &spec->dopt);
     }
 
+    g_discard_dopt = NULL;
 #ifdef HAVE_LIBIDN2
     if (q_allocated) idn2_free((void *)spec->qname);
 #endif
@@ -5804,6 +5826,7 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 #endif
     g_dag_answer_check = dag_check_answer; /* opcode / question checks of UDP answers (T-12) */
+    g_dag_discard_dump = dag_dump_discarded;
 #ifdef _WIN32
     WSADATA wsa_data;
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {

@@ -56,6 +56,7 @@ dag [global-queryopt...] [query...]
 - The query has the RD and AD bits set, like `dig`.
 - Like `dig`, queries carry an EDNS0 OPT record (version 0, UDP payload size 1232) with a random 8-byte client cookie by default; `+noedns` and `+nocookie` turn them off. Dynamic UPDATE and NOTIFY messages (`--update-*`, `--prereq-*`, `+opcode=UPDATE`, `+opcode=NOTIFY`) get no OPT record unless an EDNS option is given explicitly, like `nsupdate`.
 - In the normal output format, a hex dump of the query (`Query (N bytes):`) and of the response is printed in addition to the dig-style sections. Use `+nohexdump` to turn this off; the dumps are not printed with `+short` or `+yaml` (and the response dump not with `+nocomments`). `+noall` turns them off too, so `+noall +answer` prints only the answer like `dig`; `+hexdump` after `+noall` brings them back.
+- A response that `dag` receives and then discards (a message shorter than the 12-octet header, a transaction ID, question or opcode mismatch, or a mismatching client COOKIE; RFC 5452 section 9.1) is dumped as well, right after its warning line: `;; Discarded response (N bytes, UDP from 192.0.2.1#53):` followed by the hex dump of the received octets (`TCP` over TCP). `dig` shows only the warning. The message is still discarded, so the exit code and the retry behaviour are the same as in `dig`. This dump follows the response dump: it is turned off by `+nohexdump`, `+nohexdump-response`, `+nocomments`, `+noall`, `+short` and `+yaml`.
 - Unlike `dig`, a truncated UDP response (`TC=1`) is printed like any other response before `;; Truncated, retrying in TCP mode.` and the TCP retry to the same server; both responses are recorded for the comparison summary and `+ldnsz` (see [Note on TC (Truncation) Retries](#response-equivalence-comparison-allcompare)). `+ignore` keeps the UDP response and does not retry.
 - Per-user defaults can be configured via `${HOME}/.digrc`. This file is read and its options applied before command-line arguments, unless the `-r` option is supplied.
 - Up to 64 queries can be given on one command line (see [MULTIPLE QUERIES & BATCH PROCESSING](#multiple-queries--batch-processing)).
@@ -600,7 +601,7 @@ When `+ldnsz` is supplied:
 : Show or suppress the hex dump of the outgoing query only.
 
 `+[no]hexdump-response`
-: Show or suppress the hex dump of the incoming response only.
+: Show or suppress the hex dump of the incoming response only. It also controls the dump of a discarded response (see "Default Lookup Behavior").
 
 ---
 
