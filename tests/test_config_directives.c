@@ -2912,7 +2912,7 @@ static void test_bind_compat_paths(void) {
         CHECK(qc && qc->file_path && strcmp(qc->file_path, "/var/named/log/q.log") == 0);
         const log_channel_t *ac = find_channel(&cfg, "a");
         CHECK(ac && ac->file_path && strcmp(ac->file_path, "/abs/a.log") == 0);
-        CHECK_STR(cfg.control.socket_path, "/var/named/ctl.sock");
+        CHECK_STR(cfg.control.socket_path, "ctl.sock");   /* sockets are not prefixed: sun_path is short; the server chdir()s to directory */
         free_server_config_fields(&cfg);
     }
     /* "none" for pid-file is not a path */

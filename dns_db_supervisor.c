@@ -188,6 +188,9 @@ static void child_exec(const db_sup_t *s, int stream_fd) {
     if (n > 0) (void)!write(2, msg, (size_t)n);
     _exit(127);
   }
+  /* Kept on purpose, although the server no longer leaves its own directory when it daemonizes: the loader runs as loader-user, which may
+   * not be able to read the starting directory or options { directory }, and it must not hold that file system busy or drop a core file
+   * there.  Everything it opens (database-file, conninfo-file) is an absolute path (config_set_base_cwd), so it does not need a cwd. */
   if (chdir("/") != 0) _exit(127);
   clearenv();
   if (tz) setenv("TZ", tzbuf, 1);

@@ -65,6 +65,7 @@ extern _Atomic bool g_control_signals_ready;
 extern _Atomic int g_backend_should_exit;
 bool preflight_writable_path(const char *path, const char *what, bool foreground,
                              bool check_existing, const char *hint);
+bool check_unix_socket_path(const char *path, const char *what);
 bool validate_program_zone_users(server_config_t *cfg);
 bool preflight_listen_ports(server_config_t *cfg);
 int sendmmsg_skip_failed(int fd, struct mmsghdr *msgs, int n, const char *path, bool is_ipc);
@@ -1987,8 +1988,32 @@ static void nonroot_startup_checks(void) {
     snprintf(path, sizeof(path), "%s/karidns.pid", dir);
     assert(preflight_writable_path(path, "pid file", true, true, ""));
     assert(preflight_writable_path("none", "pid file", true, true, ""));
-    /* デーモン起動時の相対パスは後段の実処理に任せる */
-    assert(preflight_writable_path("rel/karidns.pid", "pid file", false, true, ""));
+    /* daemonize() keeps the working directory, so a relative name is checked where it will be used, daemonized or not */
+    assert(!preflight_writable_path("rel/karidns.pid", "pid file", false, true, ""));
+    assert(!preflight_writable_path("rel/karidns.pid", "pid file", true, true, ""));
+    {
+        int saved_cwd = open(".", O_RDONLY | O_DIRECTORY);
+        assert(saved_cwd >= 0 && chdir(dir) == 0);
+        assert(preflight_writable_path("karidns.pid", "pid file", false, true, ""));
+        assert(preflight_writable_path("control.sock", "control socket", false, false, ""));
+        assert(fchdir(saved_cwd) == 0);
+        close(saved_cwd);
+    }
+    /* a UNIX socket path has to fit sun_path */
+    {
+        char longp[300];
+        memset(longp, 'a', sizeof(longp) - 1);
+        longp[sizeof(longp) - 1] = '\0';
+        assert(check_unix_socket_path("control.sock", "control-channel socket path"));
+        assert(check_unix_socket_path(NULL, "dnstap socket path"));
+        assert(!check_unix_socket_path(longp, "control-channel socket path"));
+        struct sockaddr_un un_probe;
+        longp[sizeof(un_probe.sun_path) - 1] = '\0';          /* 103 characters fit */
+        assert(check_unix_socket_path(longp, "control-channel socket path"));
+        longp[sizeof(un_probe.sun_path) - 1] = 'a';
+        longp[sizeof(un_probe.sun_path)] = '\0';              /* 104 do not */
+        assert(!check_unix_socket_path(longp, "control-channel socket path"));
+    }
     rmdir(dir);
 
     /* program-user が実行ユーザーと異なる program ゾーンは拒否 */

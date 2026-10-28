@@ -4070,13 +4070,14 @@ static int path_absolutize(token_ctx_t *ctx, char **path, const char *what, size
 
 /* options { directory } (BIND 9.20 ARM): the base of every relative path.  Decides which directory applies (the one the running server was
  * started with when config_pin_directory() was called, else the one written), keeps it in config->directory and makes the relative paths
- * of the configuration absolute-or-startup-relative by putting it in front: zone `file`, `pid-file`, the files of logging channels,
- * the control and dnstap sockets and the database files (`include` statements were resolved against it while they were read).
+ * of the configuration absolute-or-startup-relative by putting it in front: zone `file`, `pid-file`, the files of logging channels and the
+ * database files (`include` statements were resolved against it while they were read).  The server chdir()s to the directory once at start-up,
+ * which is what the UNIX socket paths of `control-channel` and `dnstap` rely on.
  * Everything downstream (the directory fd cache, the zone loader, the logging code) then sees ordinary paths and opens the directory
  * once, before the sandbox, like any other.  Without a directory nothing changes: relative paths are relative to the directory the
  * server was started in.
- * When the server told the parser where it was started (config_set_base_cwd), the paths that are used after daemonize() -- which chdir()s to
- * "/" -- are made absolute here, once: the directory itself, pid-file, loader-path and the database files that karidns-dbloader (started
+ * When the server told the parser where it was started (config_set_base_cwd), the paths that the loader child (started from "/") or a
+ * reload in another working directory would not find are made absolute here, once: the directory itself, pid-file, loader-path and the database files that karidns-dbloader (started
  * from "/" too) opens.  UNIX socket paths and the files that go through the directory fd cache (which resolves relative names against the
  * startup directory fd, not the current directory) are left as they are. */
 static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
@@ -4123,8 +4124,9 @@ static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
     }
     for (log_channel_t *c = config->logging.channels; ok && c; c = c->next)
       ok = dir_prefix_path(&c->file_path, eff);
-    ok = ok && dir_prefix_path(&config->control.socket_path, eff) && dir_prefix_path(&config->dnstap.socket_path, eff) &&
-         dir_prefix_path(&config->database.database_file, eff) && dir_prefix_path(&config->database.conninfo_file, eff);
+    /* the control-channel and dnstap sockets are NOT prefixed: a UNIX socket path holds 103 bytes (sun_path), a deep directory would overflow
+     * it, and the server chdir()s to the directory at start-up (and daemonize() no longer leaves it), so the relative name resolves there */
+    ok = ok && dir_prefix_path(&config->database.database_file, eff) && dir_prefix_path(&config->database.conninfo_file, eff);
     if (!ok) goto oom;
   }
   /* what is still relative (no directory, or a relative directory without a startup directory) and is opened after daemonize() */

@@ -2348,6 +2348,10 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, progra
       argv[ai++] = x->program_args[i];
     argv[ai] = NULL;
 
+    /* The plugin runs in "/", as it did when daemonize() changed there: it must not inherit the working directory of the server (the
+     * starting directory or options { directory }, which program-user may not even be able to read) */
+    if (chdir("/") != 0) _exit(126);
+
     /* バックエンドが無視/ブロックしているシグナルをプラグインへ引き継がない
      * (無視の設定とシグナルマスクは exec 後も残る) */
     signal(SIGPIPE, SIG_DFL);

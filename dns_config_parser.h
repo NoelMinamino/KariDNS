@@ -571,9 +571,10 @@ typedef struct {
  * resolves relative paths and `include` against that directory whatever the file now says, and reports a different one as
  * server_config_t.directory_changed (it takes effect after a restart).  Without a pin (karicheck, tests) each parse uses what it reads. */
 /* The directory the server was started in (an absolute path).  Given to the parser before the first parse, it makes the relative paths that
- * are used after daemonize() -- pid-file, the database files and loader-path of options { database } -- absolute against it (or against
- * options { directory }), so that they do not depend on daemonize()'s chdir("/").  A path that becomes longer than 1023 bytes is a
- * configuration error.  Not set (karicheck, tests): those paths stay as written. */
+ * the server hands to something that does not share its working directory -- pid-file, and the database files and loader-path of
+ * options { database } (the loader is started from "/") -- absolute against it (or against options { directory }).  A path that becomes
+ * longer than 1023 bytes is a configuration error.  Not set (karicheck, tests): those paths stay as written.  UNIX socket paths are never
+ * changed: the server chdir()s to options { directory } at start-up and daemonize() keeps the working directory. */
 void config_set_base_cwd(const char *cwd);
 void config_pin_directory(const char *dir);
 void config_unpin_directory(void);
