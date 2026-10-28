@@ -1267,9 +1267,10 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
 /* 転送要求 (AXFR、serial が 0 でなければ IXFR) を TCP の長さ前置き付きで buf に組み立てる。
  * IXFR の Authority にはクライアントの版の SOA (RFC 1995 §3)、OPT には長さ 0 の EXPIRE (RFC 7314 §4。request-expire no なら付けない) と
  * Extended AXFR を付け、鍵があれば署名する (req_mac に要求の MAC)。soa_query なら AXFR/IXFR ではなく SOA の問い合わせ
- * (request-ixfr no: BIND の "SOA before AXFR")。戻り値は全体の長さ、失敗は 0。 */
+ * (request-ixfr no: BIND の "SOA before AXFR")。pe (NULL 可) は相手の server 文 (edns no / edns-udp-size / edns-version / request-nsid)。
+ * 戻り値は全体の長さ、失敗は 0。 */
 static size_t build_xfr_request(uint8_t *buf, size_t cap, const char *domain, uint32_t serial, uint16_t id, uint8_t ext_ver,
-                                bool request_expire, bool soa_query, tsig_key_t *tsig_key, uint8_t *req_mac, size_t *req_mac_len) {
+                                bool request_expire, bool soa_query, tsig_key_t *tsig_key, uint8_t *req_mac, size_t *req_mac_len, const xfr_primary_t *pe) {
   uint8_t *hdr = &buf[2];
   size_t len = 2;
   bool ixfr = serial != 0 && !soa_query;
@@ -1300,15 +1301,24 @@ static size_t build_xfr_request(uint8_t *buf, size_t cap, const char *domain, ui
     len += 16;
   }
   uint32_t domain_hash = calc_fnv1a_str(domain);
-  uint16_t rdlen = (uint16_t)((request_expire ? 4 : 0) + (ext_ver ? 9 : 0));
+  /* the `server` statement of the primary (batch 5): edns no leaves the OPT out; request-nsid, edns-udp-size and edns-version shape it */
+  bool want_nsid = pe && !pe->no_edns && pe->request_nsid;
+  bool explicit_opt = pe && !pe->no_edns && (pe->request_nsid || pe->edns_udp_size || pe->edns_version);
+  uint16_t udp_size = pe && pe->edns_udp_size ? pe->edns_udp_size : 4096;
+  uint16_t rdlen = (uint16_t)((request_expire ? 4 : 0) + (ext_ver ? 9 : 0) + (want_nsid ? 4 : 0));
   *req_mac_len = 0;
-  if (rdlen > 0) {
-    /* the root owner name, TYPE OPT, UDP size 4096, no extended RCODE / flags */
-    static const uint8_t opt_head[] = {0, 0x00, 41, 0x10, 0x00, 0, 0, 0, 0};
+  if (rdlen > 0 || explicit_opt) {
+    /* the root owner name, TYPE OPT, the UDP size (4096 unless edns-udp-size), no extended RCODE, the EDNS version (0 unless edns-version), no flags */
+    const uint8_t opt_head[] = {0, 0x00, 41, (uint8_t)(udp_size >> 8), (uint8_t)(udp_size & 0xFF), 0, pe ? pe->edns_version : 0, 0, 0};
     memcpy(&buf[len], opt_head, sizeof(opt_head));
     len += sizeof(opt_head);
     buf[len++] = (uint8_t)(rdlen >> 8);
     buf[len++] = (uint8_t)(rdlen & 0xFF);
+    if (want_nsid) {   /* RFC 5001 §2.1: an empty NSID option asks the server for its identifier */
+      static const uint8_t nsid_opt[] = {0x00, 0x03, 0x00, 0x00};
+      memcpy(&buf[len], nsid_opt, sizeof(nsid_opt));
+      len += sizeof(nsid_opt);
+    }
     if (request_expire) {
       static const uint8_t expire_opt[] = {0x00, EDNS_OPTION_EXPIRE, 0x00, 0x00};
       memcpy(&buf[len], expire_opt, sizeof(expire_opt));
@@ -1402,7 +1412,7 @@ static int xfr_soa_probe(axfr_bg_ctx_t *ctx, const xfr_primary_t *p, struct sock
   uint8_t req[2048], req_mac[64], *msg = NULL;
   size_t req_mac_len = 0;
   uint16_t id = (uint16_t)(arc4random() & 0xFFFF), msg_len = 0;
-  size_t req_len = sctx ? build_xfr_request(req, sizeof(req), ctx->domain, 0, id, 0, ctx_request_expire(ctx), true, tsig_key, req_mac, &req_mac_len) : 0;
+  size_t req_len = sctx ? build_xfr_request(req, sizeof(req), ctx->domain, 0, id, 0, ctx_request_expire(ctx, p), true, tsig_key, req_mac, &req_mac_len, p) : 0;
   if (req_len == 0 || send(fd, req, req_len, 0) != (ssize_t)req_len) {
     syslog(LOG_ERR, "[AXFR] zone %s: cannot send the SOA query to %s", ctx->domain, p->ip);
   } else if (read_dns_tcp_message(fd, sctx, &msg, &msg_len) <= 0) {
@@ -1470,7 +1480,7 @@ static int xfr_attempt(axfr_bg_ctx_t *ctx, const xfr_primary_t *p, struct sockad
   int axfr_res = -1;
   session->ext_probe = ext_probe;
   size_t req_len = build_xfr_request(axfr_req, sizeof(axfr_req), ctx->domain, ixfr_serial, session->query_id, ext_ver,
-                                     ctx_request_expire(ctx), false, tsig_key, req_mac, &req_mac_len);
+                                     ctx_request_expire(ctx, p), false, tsig_key, req_mac, &req_mac_len, p);
   if (req_len == 0) {
     syslog(LOG_ERR, "[AXFR] Failed to build%s request for zone %s", tsig_key ? " TSIG-signed" : "", ctx->domain);
   } else if (send(tcp_fd, axfr_req, req_len, 0) == (ssize_t)req_len) {
@@ -1534,9 +1544,11 @@ static int xfr_try_primary(void *arg, int idx) {
     syslog(LOG_ERR, "[AXFR] Invalid master IP address format: '%s'", p->ip);
     return XFR_R_FAILED;
   }
-  /* transfers-per-ns: a primary that already serves that many transfers to us is asked later (BIND queues the zone) */
-  if (!xfr_ns_acquire(&master_addr, ctx->has_eff ? ctx->per_ns_limit : UINT32_MAX)) {
-    syslog(LOG_INFO, "[AXFR] zone %s: transfer from %s deferred due to quota (transfers-per-ns %u)", ctx->domain, p->ip, ctx->per_ns_limit);
+  /* transfers-per-ns (the `transfers` of the primary's server statement replaces it): a primary that already serves that many transfers to us is asked
+   * later (BIND queues the zone) */
+  uint32_t per_ns = p->per_ns_set ? p->per_ns : ctx->per_ns_limit;
+  if (!xfr_ns_acquire(&master_addr, ctx->has_eff ? per_ns : UINT32_MAX)) {
+    syslog(LOG_INFO, "[AXFR] zone %s: transfer from %s deferred due to quota (%s %u)", ctx->domain, p->ip, p->per_ns_set ? "transfers of the server statement" : "transfers-per-ns", per_ns);
     return XFR_R_DEFERRED;
   }
 
@@ -1546,7 +1558,7 @@ static int xfr_try_primary(void *arg, int idx) {
   uint32_t active_serial = ctx->entry ? ctx->entry->serial : 0;
   int axfr_res;
   bool probed_newer = false;
-  if (!ctx_request_ixfr(ctx) && active_serial != 0) {
+  if (!ctx_request_ixfr(ctx, p) && active_serial != 0) {
     /* request-ixfr no: SOA first, and the AXFR only when the primary is ahead */
     int pr = xfr_soa_probe(ctx, p, &master_addr, domain_family, tsig_key_ptr, active_serial, &session);
     if (pr == XFR_R_UPTODATE) {
@@ -1574,9 +1586,9 @@ static int xfr_try_primary(void *arg, int idx) {
    * comes back, ask once more with version 2 and remember what the primary did (xfr_ext_*) */
   time_t ext_now = time(NULL);
   uint8_t ext_state = ctx->entry ? xfr_ext_effective(ctx->entry->xfr_ext_state, ctx->entry->xfr_ext_set, ext_now) : XFR_EXT_UNKNOWN;
-  uint8_t ext_ver = xfr_ext_request_version(ext_state);
+  uint8_t ext_ver = p->no_edns ? 0 : xfr_ext_request_version(ext_state);   /* edns no: no OPT, so no Extended AXFR either */
   uint32_t ixfr_serial = probed_newer ? 0 : active_serial;   /* the SOA said the primary is ahead: the whole zone (request-ixfr no) */
-  axfr_res = xfr_attempt(ctx, p, &master_addr, domain_family, ext_ver, xfr_ext_probe(ext_state), tsig_key_ptr, ixfr_serial, &session);
+  axfr_res = xfr_attempt(ctx, p, &master_addr, domain_family, ext_ver, ext_ver && xfr_ext_probe(ext_state), tsig_key_ptr, ixfr_serial, &session);
   if (axfr_res < 0 && session.no_ext_answer) {
     syslog(LOG_NOTICE, "[AXFR] zone %s: %s answered a version 3 request with a standard transfer; asking with version 2", ctx->domain, p->ip);
     ext_ver = 2;
@@ -1590,7 +1602,7 @@ static int xfr_try_primary(void *arg, int idx) {
     axfr_res = xfr_attempt(ctx, p, &master_addr, domain_family, ext_ver, false, tsig_key_ptr, 0, &session);
   }
   xfr_ns_release(&master_addr);
-  if (axfr_res > 0 && ctx->entry) {
+  if (axfr_res > 0 && ctx->entry && !p->no_edns) {   /* edns no asked for nothing, so the answer says nothing about the primary */
     uint8_t learned = xfr_ext_learn(session.is_extended_mode, session.ext_version);
     if (learned != ctx->entry->xfr_ext_state || ext_state != ctx->entry->xfr_ext_state) {
       if (learned == XFR_EXT_V2)
@@ -1674,6 +1686,7 @@ typedef struct {
   const zone_image_view_t *view; /* B8t-1: a standard AXFR carries the requester's view: the RRs it does not see are left out (NULL = no filtering) */
   xext_t xe;            /* Extended AXFR: the one encoder of the extension records (dns_wire.h), state markers included */
   bool wrap_apex_soa;   /* B8t-2 (v3, several or restricted SOA RRs): every apex SOA RR of the body is a 65406 wrapper */
+  bool one_answer;      /* batch 5: the server statement of the requester says `transfer-format one-answer`: one RR in every message (BIND xfrout.c, RFC 5936 §2.2 allows it) */
 } axfr_emit_ctx_t;
 
 /* One RR to send: a builder record (IXFR history, KariDNS markers) or RR `rr` of a zone image (S5 B-2: the zone itself) */
@@ -1690,7 +1703,7 @@ static int axfr_write_item(axfr_emit_ctx_t *ec, const dns_record_t *rec, const z
 
 static int axfr_emit_item(axfr_emit_ctx_t *ec, const dns_record_t *rec, const zone_image_t *img, uint32_t rr) {
   uint16_t prev_offset = ec->offset;
-  if (axfr_write_item(ec, rec, img, rr) < 0) {
+  if ((ec->one_answer && ec->answers > 0) || axfr_write_item(ec, rec, img, rr) < 0) {   /* the message is full, or (one-answer) holds its RR already */
     ec->res[6] = (uint8_t)(ec->answers >> 8);
     ec->res[7] = (uint8_t)(ec->answers & 0xFF);
     if (ec->send_opt && !ec->opt_sent) {
@@ -2068,12 +2081,19 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
 
   /* provide-ixfr no (BIND 9.20 ARM: "only responds with a full zone transfer (AXFR)"): the zone is sent whole, also to a client that is up to
    * date, as with ixfr-history 0 for a client that is behind (RFC 1995 §4 allows an AXFR-style answer to an IXFR request) */
-  if (is_ixfr) {
+  /* The `server` statement that covers the requester (batch 5; the view's, else the top-level ones) can say provide-ixfr (it replaces the
+   * zone's, view's and options' value for this client: BIND xfrout.c) and transfer-format one-answer. */
+  bool one_answer = false;
+  {
     server_config_t *pcfg = acquire_config_snapshot();
-    xfr_eff_t pe;
-    xfr_opts_effective(pcfg, pcfg ? zone_entry_config(pcfg, entry) : NULL, entry->view_name, &pe);
+    const server_stmt_t *srv = config_server_find_sa(pcfg, entry->view_name, (const struct sockaddr *)client_addr);
+    one_answer = srv && (srv->set & SV_TRANSFER_FORMAT) && (srv->bools & SV_B_ONE_ANSWER);
+    if (is_ixfr) {
+      xfr_eff_t pe;
+      xfr_opts_effective_peer(pcfg, pcfg ? zone_entry_config(pcfg, entry) : NULL, entry->view_name, srv, &pe);
+      if (!pe.provide_ixfr) is_ixfr = false;
+    }
     if (pcfg) release_config_snapshot(pcfg);
-    if (!pe.provide_ixfr) is_ixfr = false;
   }
   /* R-15, RFC 1995 §2: 同じか新しい版 (RFC 1982 の比較) を持つクライアントには現在の SOA 1件で答える。 */
   bool client_up_to_date = is_ixfr && (client_serial == current_serial ||
@@ -2177,6 +2197,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   ec.view = (!is_extended_axfr && (current_zone->flags & ZONE_IMAGE_F_VIEW)) ? &xview : NULL;
   xext_init(&ec.xe, entry->domain, axfr_xext_emit, &ec);
   ec.wrap_apex_soa = v3 && soa_multi && !send_ixfr;
+  ec.one_answer = one_answer;
 
   memset(res, 0, 65535);
   memcpy(res, req, q_offset);

@@ -123,6 +123,12 @@ key "tsig-key-example" {
     secret "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy";
 };
 
+// 相手サーバーごとの設定 (BIND の server 文)。アドレスまたはプレフィックスで指定し、最も長く一致するものが使われます。
+// keys はそのサーバーへの転送要求・更新確認・NOTIFY に署名する鍵です (primaries / also-notify の key が優先、zone の tsig-key より優先)。
+// transfer-source / notify-source もこの文が primaries / also-notify の source より優先されます。
+// server 192.168.1.100 { keys "tsig-key-example"; transfer-source 192.168.1.1; transfers 1; };
+// view の中にも key { } (その view だけで有効。トップレベルと同じ名前は不可) と server { } (書くとトップレベルの server は使われない) を書けます。
+
 // マスターゾーンの定義
 zone "example.local" {
     type master;

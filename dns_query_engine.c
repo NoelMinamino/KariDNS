@@ -2731,7 +2731,12 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
     return 0; // 不正な短いパケットは無応答で破棄
   }
   tsig_request_t tsig;
-  tsig_check_request(cfg, req, req_len, client_ip, &tsig);
+  /* the view is chosen first (by the client address), then the key is looked for among the global keys and that view's own (BIND
+   * get_matching_view_sync(): dns_message_checksig(message, view) with the view's ring).  Only a message that carries an additional
+   * section can be signed, so the others do not pay for the view lookup. */
+  const view_snapshot_t *tsig_view = NULL;
+  if ((req[10] | req[11]) != 0) tsig_view = route && route->view ? route->view : (snap ? select_view(snap, client_ip) : NULL);
+  tsig_check_request(cfg, tsig_view ? tsig_view->name : NULL, req, req_len, client_ip, &tsig);
   t_query_tsig.status = TSIG_REQ_NONE; /* X-20: slip 応答の署名用。署名のない要求では使わない */
   if (tsig.status == TSIG_REQ_NONE) {
     int plain = process_query_body(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
@@ -3090,6 +3095,12 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       edns.udp_payload_size = 512;
     if (!is_tcp) {
       uint16_t server_udp_size = edns.server_udp_size ? edns.server_udp_size : KARIDNS_UDP_BUFSIZE_DEFAULT;
+      /* the server statement of the client can set the limit (batch 5; BIND ns client.c: max-udp-size of the peer replaces the view's
+       * for this client, 512..4096).  Only looked for when some statement writes it; no allocation (inet_pton on the text address). */
+      if (cfg && cfg->any_server_max_udp) {
+        const server_stmt_t *psrv = config_server_find_ip(cfg, view ? view->name : NULL, client_ip);
+        if (psrv && (psrv->set & SV_MAX_UDP_SIZE)) server_udp_size = (uint16_t)psrv->max_udp_size;
+      }
       if (edns.udp_payload_size > server_udp_size)
         edns.udp_payload_size = server_udp_size;
       /* UDP 応答の上限はクライアントが OPT で通知したサイズ (512 以上に丸め、サーバーの
@@ -3374,7 +3385,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     /* provide-ixfr no (batch 4): the client is always sent to TCP, where it gets the whole zone (as for the TCP IXFR in send_axfr_response()) */
     {
       xfr_eff_t pe;
-      xfr_opts_effective(cfg, zcfg, db_entry->view_name, &pe);
+      xfr_opts_effective_peer(cfg, zcfg, db_entry->view_name, config_server_find_ip(cfg, db_entry->view_name, client_ip), &pe);   /* the requester's server statement first */
       if (!pe.provide_ixfr) is_up_to_date = false;
     }
     if (!is_up_to_date) {

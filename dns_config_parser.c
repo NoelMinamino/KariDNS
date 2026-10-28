@@ -623,6 +623,28 @@ static void free_view_db_fields(view_config_t *view) {
   view->database_none = false;
 }
 
+static void tsig_keys_free(tsig_key_t *k) {
+  while (k) {
+    tsig_key_t *next_k = k->next;
+    free(k->name);
+    free(k->algorithm);
+    free(k->secret);
+    OPENSSL_cleanse(k->secret_decoded, sizeof(k->secret_decoded));
+    free(k);
+    k = next_k;
+  }
+}
+
+static void server_stmts_free(server_stmt_t *s) {
+  while (s) {
+    server_stmt_t *next = s->next;
+    free(s->key);
+    xo_free_fields(&s->xo);
+    free(s);
+    s = next;
+  }
+}
+
 static void free_partial_view(view_config_t *view) {
   if (!view) return;
   zone_cfg_index_free(&view->zone_index);
@@ -630,6 +652,8 @@ static void free_partial_view(view_config_t *view) {
   if (view->name) free(view->name);
   acl_set_free(&view->acl);
   xo_free_fields(&view->xo);
+  tsig_keys_free(view->keys);
+  server_stmts_free(view->servers);
   notify_targets_free(view->also_notify, view->also_notify_count);
   for (int i = 0; i < view->match_clients_count; i++) free(view->match_clients[i]);
   if (view->match_clients) free(view->match_clients);
@@ -654,6 +678,12 @@ static bool key_name_is_defined(const tsig_key_t *keys, const char *name) {
     if (k->name && domain_names_match_ci(k->name, name)) return true;
   }
   return false;
+}
+
+/* Is the key usable where the statement being checked is?  A key is global, or it is in the view whose statements are being checked
+ * (ctx->scope_keys; BIND bin/named/tsigconf.c: the ring of a view is the global keys plus the view's own). */
+static bool key_is_defined(const token_ctx_t *ctx, const server_config_t *cfg, const char *name) {
+  return key_name_is_defined(cfg->keys, name) || (ctx && key_name_is_defined(ctx->scope_keys, name));
 }
 
 /* D-22: BIND の組み込み ACL 名。any と none は要素として使える。localhost と localnets は
@@ -693,7 +723,7 @@ static int acl_expand_into(token_ctx_t *ctx, const server_config_t *cfg, const c
     if (t[0] == ACL_KEY_MARK) {
       const char *kname = t + 1;
       if (neg) return acl_reject(ctx, where, kname, "is a negated key, which is not supported");
-      if (!key_name_is_defined(cfg->keys, kname))
+      if (!key_is_defined(ctx, cfg, kname))
         return acl_reject(ctx, where, kname, "names a key that is not defined in any key {} block");
       if (use == ACL_USE_ADDRESS) return acl_reject(ctx, where, kname, "is a key; only addresses can be used here");
       if (use == ACL_USE_TRANSFER) {
@@ -750,7 +780,7 @@ static int acl_expand_into(token_ctx_t *ctx, const server_config_t *cfg, const c
       continue;
     }
     /* allow-update は従来どおり鍵名だけの要素も受け付ける (key "name" と同じ意味) */
-    if (use == ACL_USE_UPDATE && !neg && key_name_is_defined(cfg->keys, t)) {
+    if (use == ACL_USE_UPDATE && !neg && key_is_defined(ctx, cfg, t)) {
       APPEND_STR(*out, *out_count, strdup(t));
       continue;
     }
@@ -821,7 +851,7 @@ static int aml_resolve(token_ctx_t *ctx, server_config_t *cfg, aml_t *l, const c
         if (acl_def_resolve(ctx, cfg, a, e->loc) != 0) return -1;
         e->kind = AML_E_LIST;
         e->u.list = aml_ref(a->aml);
-      } else if (bare_keys && !e->neg && key_name_is_defined(cfg->keys, e->text)) {
+      } else if (bare_keys && !e->neg && key_is_defined(ctx, cfg, e->text)) {
         e->kind = AML_E_KEY;
       } else {
         aml_report(ctx, e->loc, what, "entry '%.64s' is not an address, prefix, any, none, localhost, localnets or a defined acl%s", e->text,
@@ -829,7 +859,7 @@ static int aml_resolve(token_ctx_t *ctx, server_config_t *cfg, aml_t *l, const c
         return -1;
       }
     } else if (e->kind == AML_E_KEY) {
-      if (!key_name_is_defined(cfg->keys, e->text)) {
+      if (!key_is_defined(ctx, cfg, e->text)) {
         aml_report(ctx, e->loc, what, "key '%.64s' is not defined in any key {} block", e->text);
         return -1;
       }
@@ -899,10 +929,13 @@ static int resolve_all_acl_lists(token_ctx_t *ctx, server_config_t *cfg) {
   for (view_config_t *v = cfg->views; v; v = v->next) {
     char label[KARIDNS_VIEW_NAME_MAX + 16];
     snprintf(label, sizeof(label), "view '%s'", v->name);
+    ctx->scope_keys = v->keys;
     if (acl_set_resolve(ctx, cfg, &v->acl, label) != 0) return -1;
+    ctx->scope_keys = NULL;
     if (v->acl.query || v->acl.query_on) cfg->acl_query_active = true;
   }
   for (view_config_t *v = cfg->views; v; v = v->next) {
+    ctx->scope_keys = v->keys;
     for (zone_config_t *z = v->zones; z; z = z->next) {
       zone_ext_t *zx = z->ext;
       if (!zx) continue;
@@ -925,6 +958,7 @@ static int resolve_all_acl_lists(token_ctx_t *ctx, server_config_t *cfg) {
         }
       }
     }
+    ctx->scope_keys = NULL;
   }
   return 0;
 }
@@ -989,6 +1023,8 @@ void free_server_config_fields(server_config_t *cfg) {
     if (v->name) free(v->name);
     acl_set_free(&v->acl);
     xo_free_fields(&v->xo);
+    tsig_keys_free(v->keys);
+    server_stmts_free(v->servers);
     notify_targets_free(v->also_notify, v->also_notify_count);
     for (int i = 0; i < v->match_clients_count; i++) free(v->match_clients[i]);
     if (v->match_clients) free(v->match_clients);
@@ -1004,16 +1040,10 @@ void free_server_config_fields(server_config_t *cfg) {
   }
   cfg->views = NULL;
 
-  tsig_key_t *k = cfg->keys;
-  while (k) {
-    tsig_key_t *next_k = k->next;
-    free(k->name);
-    if (k->algorithm) free(k->algorithm);
-    if (k->secret) free(k->secret);
-    free(k);
-    k = next_k;
-  }
+  tsig_keys_free(cfg->keys);
   cfg->keys = NULL;
+  server_stmts_free(cfg->servers);
+  cfg->servers = NULL;
 
   acl_def_t *a = cfg->acls;
   while (a) {
@@ -2310,7 +2340,11 @@ static int parse_notify_targets(token_ctx_t *ctx, const char *what, notify_targe
   free_token(&tok);
   for (int i = first; i < *count; i++) {
     notify_target_t *e = &(*list)[i];
-    if (e->ip && e->port == 0) e->port = defport ? defport : 53;
+    /* An address without a port takes the `port` of its list; when the list has none either, the port stays 0 until expand_targets() knows
+     * the lists this one is named in (BIND getipandkeylist(): an element of a nested list without a port takes the outer list's port),
+     * and then 53.  A list name keeps the `port` of the statement it is written in for the same reason.  A database zone has no lists. */
+    if (e->ip && e->port == 0) e->port = defport ? defport : (ctx->restricted ? 53 : 0);
+    else if (e->list) e->port = defport;
     /* a list name keeps the sources of the list it names (expand_targets()); only the addresses written here get this statement's */
     if (e->ip) {
       for (int v = 0; v < 2; v++) {
@@ -3082,6 +3116,10 @@ static const xfr_opts_t *xo_of_view(const server_config_t *cfg, const char *view
 }
 
 void xfr_opts_effective(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, xfr_eff_t *out) {
+  xfr_opts_effective_peer(cfg, zone, view_name, NULL, out);
+}
+
+void xfr_opts_effective_peer(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, const server_stmt_t *srv, xfr_eff_t *out) {
   memset(out, 0, sizeof(*out));
   out->min_refresh = XFR_MIN_REFRESH_DEFAULT;
   out->max_refresh = XFR_MAX_REFRESH_DEFAULT;
@@ -3093,10 +3131,11 @@ void xfr_opts_effective(const server_config_t *cfg, const zone_config_t *zone, c
   out->xfer_idle_out = xfr_minutes_to_secs(XFR_IDLE_OUT_DEFAULT);
   out->notify_delay = XFR_NOTIFY_DELAY_DEFAULT;
   out->try_tcp_refresh = out->request_ixfr = out->provide_ixfr = out->request_expire = true;
-  /* the first level that wrote an option decides it: zone, then view, then options */
-  const xfr_opts_t *lv[3] = { zone ? zext(zone)->xo : NULL, xo_of_view(cfg, view_name), cfg ? &cfg->xo : NULL };
+  /* the first level that wrote an option decides it: the server statement of the peer (request-ixfr, provide-ixfr, request-expire:
+   * BIND zone.c / xfrout.c use the peer's value when it is set), then zone, view, options */
+  const xfr_opts_t *lv[4] = { srv ? &srv->xo : NULL, zone ? zext(zone)->xo : NULL, xo_of_view(cfg, view_name), cfg ? &cfg->xo : NULL };
   uint32_t done = 0;   /* the options a higher level has decided already */
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 4; i++) {
     const xfr_opts_t *l = lv[i];
     if (!l) continue;
     uint32_t w = l->set & ~done;
@@ -3119,7 +3158,11 @@ void xfr_opts_effective(const server_config_t *cfg, const zone_config_t *zone, c
   }
   /* sources: per statement (notify-source, notify-source-v6, transfer-source, transfer-source-v6), the first level that wrote it */
   for (int s = 0; s < XSRC_N; s++) {
-    for (int i = 0; i < 3; i++) {
+    if (srv && srv->xo.src[s].state) {   /* the peer's own source (BIND: transfer-source / notify-source of the server beats the list's `source`) */
+      out->psrc[s].state = srv->xo.src[s].state;
+      memcpy(out->psrc[s].addr, srv->xo.src[s].addr, 16);
+    }
+    for (int i = 1; i < 4; i++) {
       const xfr_opts_t *l = lv[i];
       if (!l || !l->src[s].state) continue;
       if (l->src[s].state == 1) {
@@ -3133,16 +3176,439 @@ void xfr_opts_effective(const server_config_t *cfg, const zone_config_t *zone, c
 
 bool xfr_source_for(const xfr_eff_t *e, const notify_target_t *t, int family, bool xfer, uint8_t out[16]) {
   int idx = family == AF_INET6 ? 1 : 0;
+  int slot = xfer ? (idx ? XSRC_XFER6 : XSRC_XFER4) : (idx ? XSRC_NOTIFY6 : XSRC_NOTIFY4);
+  /* BIND zone.c soa_query() / notify_send_toaddr(): the source of the server statement first (`*` too: the system chooses), then the
+   * `source` of the list the address is written in, then the zone's / view's / options' transfer-source or notify-source */
+  if (e && e->psrc[slot].state) {
+    if (e->psrc[slot].state != 1) return false;
+    memcpy(out, e->psrc[slot].addr, 16);
+    return true;
+  }
   if (t && t->src_set[idx]) {
     memcpy(out, t->src[idx], 16);
     return true;
   }
-  int slot = xfer ? (idx ? XSRC_XFER6 : XSRC_XFER4) : (idx ? XSRC_NOTIFY6 : XSRC_NOTIFY4);
   if (e && e->src[slot].set) {
     memcpy(out, e->src[slot].addr, 16);
     return true;
   }
   return false;
+}
+
+/* ---- Batch 5: server <prefix> { ... }; (BIND 9.20 ARM "server Statement Definition and Usage"; lib/isccfg/namedconf.c server_clauses and
+ * cfg_parse_netprefix_map(); the checks of lib/isccfg/check.c check_servers(); the values of bin/named/server.c configure_peer()) ---- */
+
+enum { SVK_BOOL = 0, SVK_UINT, SVK_KEYS, SVK_FORMAT, SVK_XO, SVK_IGNORED_SOURCE, SVK_ANCIENT };
+static const struct { const char *name; uint32_t bit; int kind; } k_sv_options[] = {
+  {"bogus", SV_B_BOGUS, SVK_BOOL}, {"edns", SV_B_EDNS, SVK_BOOL}, {"request-nsid", SV_B_REQUEST_NSID, SVK_BOOL},
+  {"send-cookie", SV_B_SEND_COOKIE, SVK_BOOL}, {"require-cookie", SV_B_REQUIRE_COOKIE, SVK_BOOL},
+  {"tcp-keepalive", SV_B_TCP_KEEPALIVE, SVK_BOOL}, {"tcp-only", SV_B_TCP_ONLY, SVK_BOOL},
+  {"edns-udp-size", SV_EDNS_UDP_SIZE, SVK_UINT}, {"edns-version", SV_EDNS_VERSION, SVK_UINT}, {"max-udp-size", SV_MAX_UDP_SIZE, SVK_UINT},
+  {"padding", SV_PADDING, SVK_UINT}, {"transfers", SV_TRANSFERS, SVK_UINT},
+  {"keys", SV_KEYS, SVK_KEYS}, {"transfer-format", SV_TRANSFER_FORMAT, SVK_FORMAT},
+  {"request-ixfr", 0, SVK_XO}, {"provide-ixfr", 0, SVK_XO}, {"request-expire", 0, SVK_XO}, {"notify-source", 0, SVK_XO},
+  {"notify-source-v6", 0, SVK_XO}, {"transfer-source", 0, SVK_XO}, {"transfer-source-v6", 0, SVK_XO},
+  {"query-source", 0, SVK_IGNORED_SOURCE}, {"query-source-v6", 0, SVK_IGNORED_SOURCE},
+  {"request-sit", 0, SVK_ANCIENT}, {"support-ixfr", 0, SVK_ANCIENT},
+};
+
+/* the prefix of a server statement as text ("192.0.2.0/24"; a single address without the length) */
+static void server_prefix_text(const server_stmt_t *s, char *buf, size_t n) {
+  char ip[INET6_ADDRSTRLEN] = "?";
+  inet_ntop(s->family, s->addr, ip, sizeof(ip));
+  if (s->plen == (s->family == AF_INET ? 32 : 128)) snprintf(buf, n, "%s", ip);
+  else snprintf(buf, n, "%s/%u", ip, (unsigned)s->plen);
+}
+
+/* "<address>[/<length>]" into s->family / plen / addr.  false = not a prefix, or bits beyond the length are set (BIND check_servers():
+ * "invalid prefix (extra bits specified)"); *why says which. */
+static bool server_prefix_parse(const char *text, server_stmt_t *s, const char **why) {
+  char buf[96];
+  if (strlen(text) >= sizeof(buf)) { *why = "is not an address or prefix"; return false; }
+  snprintf(buf, sizeof(buf), "%s", text);
+  char *slash = strchr(buf, '/');
+  long plen = -1;
+  if (slash) {
+    *slash++ = '\0';
+    char *end = NULL;
+    if (!isdigit((unsigned char)*slash)) { *why = "has no valid prefix length"; return false; }
+    plen = strtol(slash, &end, 10);
+    if (*end != '\0') { *why = "has no valid prefix length"; return false; }
+  }
+  memset(s->addr, 0, sizeof(s->addr));
+  if (inet_pton(AF_INET, buf, s->addr) == 1) s->family = AF_INET;
+  else if (inet_pton(AF_INET6, buf, s->addr) == 1) s->family = AF_INET6;
+  else { *why = "is not an address or prefix"; return false; }
+  long max = s->family == AF_INET ? 32 : 128;
+  if (plen < 0) plen = max;
+  if (plen > max) { *why = "has a prefix length that is too long"; return false; }
+  s->plen = (uint8_t)plen;
+  for (long b = plen; b < max; b++)
+    if (s->addr[b / 8] & (0x80 >> (b % 8))) { *why = "is an invalid prefix (extra bits specified)"; return false; }
+  return true;
+}
+
+static bool server_prefix_covers(const server_stmt_t *s, int family, const uint8_t *addr) {
+  if (s->family != family) return false;
+  unsigned full = s->plen / 8, rest = s->plen % 8;
+  if (full && memcmp(s->addr, addr, full) != 0) return false;
+  if (rest && ((s->addr[full] ^ addr[full]) & (0xFF << (8 - rest)) & 0xFF) != 0) return false;
+  return true;
+}
+
+const server_stmt_t *server_list_find(const server_stmt_t *list, int family, const uint8_t *addr) {
+  if (!addr) return NULL;
+  for (const server_stmt_t *s = list; s; s = s->next)
+    if (server_prefix_covers(s, family, addr)) return s;
+  return NULL;
+}
+
+const server_stmt_t *config_server_find(const server_config_t *cfg, const char *view_name, int family, const uint8_t *addr) {
+  if (!cfg || !addr) return NULL;
+  const server_stmt_t *list = cfg->servers;
+  if (view_name && view_name[0])
+    for (const view_config_t *v = cfg->views; v; v = v->next)
+      if (strcasecmp(v->name, view_name) == 0) {
+        if (v->servers) list = v->servers;
+        break;
+      }
+  return server_list_find(list, family, addr);
+}
+
+const server_stmt_t *config_server_find_ip(const server_config_t *cfg, const char *view_name, const char *ip) {
+  uint8_t a[16];
+  if (!ip) return NULL;
+  if (inet_pton(AF_INET, ip, a) == 1) return config_server_find(cfg, view_name, AF_INET, a);
+  if (inet_pton(AF_INET6, ip, a) == 1) return config_server_find(cfg, view_name, AF_INET6, a);
+  return NULL;
+}
+
+const server_stmt_t *config_server_find_sa(const server_config_t *cfg, const char *view_name, const struct sockaddr *sa) {
+  if (!sa) return NULL;
+  if (sa->sa_family == AF_INET) return config_server_find(cfg, view_name, AF_INET, (const uint8_t *)&((const struct sockaddr_in *)sa)->sin_addr);
+  if (sa->sa_family != AF_INET6) return NULL;
+  const struct in6_addr *a6 = &((const struct sockaddr_in6 *)sa)->sin6_addr;
+  if (IN6_IS_ADDR_V4MAPPED(a6)) return config_server_find(cfg, view_name, AF_INET, &a6->s6_addr[12]);
+  return config_server_find(cfg, view_name, AF_INET6, a6->s6_addr);
+}
+
+const char *peer_key_name(const char *element_key, const server_stmt_t *srv, const char *zone_key) {
+  if (element_key && element_key[0]) return element_key;
+  if (srv && (srv->set & SV_KEYS) && srv->key && srv->key[0]) return srv->key;
+  return zone_key && zone_key[0] ? zone_key : NULL;
+}
+
+/* value of an unsigned option (BIND cfg_type_uint32) */
+static int server_read_uint(token_ctx_t *ctx, const char *what, const char *key, uint32_t *out) {
+  char db[96];
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) {
+    conf_error(ctx, what, "expected a number after '%s' but found %s", key, tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
+  bool ok = isdigit((unsigned char)tok.value[0]) != 0;
+  unsigned long long v = 0;
+  if (ok) {
+    char *end = NULL;
+    errno = 0;
+    v = strtoull(tok.value, &end, 10);
+    ok = errno == 0 && *end == '\0' && v <= UINT32_MAX;
+  }
+  if (!ok) conf_error(ctx, what, "invalid %s value '%.64s' (expected 0..4294967295)", key, tok.value);
+  free_token(&tok);
+  if (!ok) return -1;
+  *out = (uint32_t)v;
+  return 0;
+}
+
+/* After a value the statement ends with ';' */
+static int server_expect_semicolon(token_ctx_t *ctx, const char *what, const char *key) {
+  char db[96];
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) {
+    conf_error(ctx, what, "expected ';' after the value of '%s' but found %s", key, tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  return 0;
+}
+
+/* keys <name>;  keys { <name>; };  keys { <name> };  (BIND parse_server_key_kludge(): one key, with or without braces).  The name goes to *out. */
+static int server_read_keys(token_ctx_t *ctx, const char *what, char **out) {
+  char db[96];
+  bool braces = false;
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type == TOKEN_LBRACE) {
+    braces = true;
+    free_token(&tok);
+    tok = get_next_token(ctx);
+  }
+  if (tok.type != TOKEN_STRING || !tok.value) {
+    conf_error(ctx, what, "expected a key name after 'keys' but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
+  *out = tok.value;
+  tok.value = NULL;
+  free_token(&tok);
+  if (braces) {
+    tok = get_next_token(ctx);
+    if (tok.type == TOKEN_SEMICOLON) {
+      free_token(&tok);
+      tok = get_next_token(ctx);
+    }
+    if (tok.type != TOKEN_RBRACE) {
+      conf_error(ctx, what, "'keys' takes one key name (expected '}' but found %s)", tok_desc(&tok, db, sizeof(db)));
+      free_token(&tok);
+      free(*out);
+      *out = NULL;
+      return -1;
+    }
+    free_token(&tok);
+  }
+  return 0;
+}
+
+/* server <prefix> { ... }; after the word `server` has been read.  The statement is added to *list (most specific prefix first, a later one
+ * of the same length after the earlier ones: BIND dns_peerlist_addpeer()).  scope is "" at the top level and "view 'x' " in a view. */
+static int parse_server_block(token_ctx_t *ctx, server_stmt_t **list, const char *scope) {
+  char db[96], loc[300], what[200];
+  ctx_location(ctx, loc, sizeof(loc));
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) {
+    conf_error(ctx, "server", "expected an address or prefix but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
+  server_stmt_t *s = calloc(1, sizeof(*s));
+  if (!s) { free_token(&tok); if (ctx) ctx->error_occurred = true; return -1; }
+  snprintf(s->loc, sizeof(s->loc), "%s", loc);
+  const char *why = NULL;
+  snprintf(what, sizeof(what), "%sserver '%.64s'", scope, tok.value);
+  if (!server_prefix_parse(tok.value, s, &why)) {
+    conf_error(ctx, what, "'%.64s' %s", tok.value, why);
+    free_token(&tok);
+    free(s);
+    return -1;
+  }
+  free_token(&tok);
+  {
+    char pt[96];
+    server_prefix_text(s, pt, sizeof(pt));
+    snprintf(what, sizeof(what), "%sserver '%s'", scope, pt);
+  }
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_LBRACE) {
+    conf_error(ctx, what, "expected '{' but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    goto fail;
+  }
+  free_token(&tok);
+  const char *seen[sizeof(k_sv_options) / sizeof(k_sv_options[0])];
+  size_t nseen = 0;
+  for (;;) {
+    tok = get_next_token(ctx);
+    if (tok.type == TOKEN_RBRACE) {
+      free_token(&tok);
+      break;
+    }
+    if (tok.type != TOKEN_STRING || !tok.value) {
+      conf_error(ctx, what, "expected an option name but found %s%s", tok_desc(&tok, db, sizeof(db)),
+                 tok.type == TOKEN_EOF ? " (missing '}')" : "");
+      free_token(&tok);
+      goto fail;
+    }
+    size_t oi = 0;
+    while (oi < sizeof(k_sv_options) / sizeof(k_sv_options[0]) && strcmp(k_sv_options[oi].name, tok.value) != 0) oi++;
+    if (oi == sizeof(k_sv_options) / sizeof(k_sv_options[0])) {
+      conf_error(ctx, what, "unknown option '%.64s' (check the spelling; the options of a server statement are listed in the BIND 9.20 ARM)", tok.value);
+      free_token(&tok);
+      goto fail;
+    }
+    free_token(&tok);
+    const char *key = k_sv_options[oi].name;
+    uint32_t bit = k_sv_options[oi].bit;
+    char owhat[260];
+    snprintf(owhat, sizeof(owhat), "%s: %s", what, key);
+    for (size_t i = 0; i < nseen; i++)
+      if (strcmp(seen[i], key) == 0) {
+        conf_error(ctx, what, "duplicate '%s' option", key);
+        goto fail;
+      }
+    seen[nseen++] = key;
+    char oloc[300];
+    ctx_location(ctx, oloc, sizeof(oloc));
+    switch (k_sv_options[oi].kind) {
+      case SVK_ANCIENT:
+        conf_error(ctx, what, "option '%s' no longer exists", key);
+        goto fail;
+      case SVK_XO:
+        if (parse_xfr_option(ctx, what, key, &s->xo, false, NULL) != 0) goto fail;
+        break;
+      case SVK_KEYS:
+        if (server_read_keys(ctx, what, &s->key) != 0 || server_expect_semicolon(ctx, what, key) != 0) goto fail;
+        s->set |= SV_KEYS;
+        break;
+      case SVK_FORMAT: {
+        tok = get_next_token(ctx);
+        bool one = tok.type == TOKEN_STRING && tok.value && strcasecmp(tok.value, "one-answer") == 0;
+        bool many = tok.type == TOKEN_STRING && tok.value && strcasecmp(tok.value, "many-answers") == 0;
+        if (!one && !many) {
+          conf_error(ctx, what, "invalid transfer-format value %s (expected one-answer or many-answers)", tok_desc(&tok, db, sizeof(db)));
+          free_token(&tok);
+          goto fail;
+        }
+        free_token(&tok);
+        if (server_expect_semicolon(ctx, what, key) != 0) goto fail;
+        s->set |= SV_TRANSFER_FORMAT;
+        if (one) s->bools |= SV_B_ONE_ANSWER;
+        break;
+      }
+      case SVK_BOOL: {
+        tok = get_next_token(ctx);
+        bool b = false;
+        if (tok.type != TOKEN_STRING || !tok.value || !parse_config_bool(tok.value, &b)) {
+          conf_error(ctx, what, "invalid %s value %s (expected yes or no)", key, tok_desc(&tok, db, sizeof(db)));
+          free_token(&tok);
+          goto fail;
+        }
+        free_token(&tok);
+        if (server_expect_semicolon(ctx, what, key) != 0) goto fail;
+        s->set |= bit;
+        if (b) s->bools |= bit;
+        else s->bools &= ~bit;
+        break;
+      }
+      case SVK_UINT: {
+        uint32_t v = 0;
+        if (server_read_uint(ctx, what, key, &v) != 0 || server_expect_semicolon(ctx, what, key) != 0) goto fail;
+        s->set |= bit;
+        /* bin/named/server.c configure_peer(): the values are brought into range, not refused */
+        switch (bit) {
+          case SV_EDNS_UDP_SIZE: s->edns_udp_size = v < 512 ? 512 : (v > 4096 ? 4096 : v); break;
+          case SV_MAX_UDP_SIZE: s->max_udp_size = v < 512 ? 512 : (v > 4096 ? 4096 : v); break;
+          case SV_EDNS_VERSION: s->edns_version = v > 255 ? 255 : v; break;
+          case SV_PADDING:
+            if (v > 512) {
+              conf_warn_loc(oloc, what, "padding cannot exceed 512: lowered to 512");
+              v = 512;
+            }
+            s->padding = v;
+            break;
+          default: s->transfers = v; break;
+        }
+        break;
+      }
+      default: {   /* query-source, query-source-v6: read to the ';' */
+        int n = 0;
+        for (;;) {
+          tok = get_next_token(ctx);
+          if (tok.type == TOKEN_SEMICOLON) { free_token(&tok); break; }
+          if (tok.type != TOKEN_STRING || !tok.value) {
+            conf_error(ctx, what, "expected an address after '%s' but found %s", key, tok_desc(&tok, db, sizeof(db)));
+            free_token(&tok);
+            goto fail;
+          }
+          n++;
+          free_token(&tok);
+        }
+        if (n == 0) {
+          conf_error(ctx, what, "expected an address after '%s'", key);
+          goto fail;
+        }
+        break;
+      }
+    }
+    /* options that BIND uses only for its resolver, DS checks or encrypted transports: valid, and nothing for an authoritative server to do */
+    switch (k_sv_options[oi].kind == SVK_IGNORED_SOURCE ? 1000 : (int)bit) {
+      case SV_B_BOGUS:
+        conf_warn_loc(oloc, what, "bogus is accepted, no effect in KariDNS (BIND uses it to stop its resolver from querying a server)");
+        break;
+      case SV_B_SEND_COOKIE: case SV_B_REQUIRE_COOKIE:
+        conf_warn_loc(oloc, what, "%s is accepted, no effect in KariDNS (it sends no DNS COOKIE in its SOA, transfer and NOTIFY requests)", key);
+        break;
+      case SV_B_TCP_KEEPALIVE: case SV_PADDING:
+        conf_warn_loc(oloc, what, "%s is accepted, no effect in KariDNS (BIND uses it for the queries of its resolver)", key);
+        break;
+      case SV_B_TCP_ONLY:
+        conf_warn_loc(oloc, what, "tcp-only is accepted, no effect in KariDNS (its SOA checks and transfers use TCP already, and NOTIFY is sent over UDP only)");
+        break;
+      case 1000:
+        conf_warn_loc(oloc, what, "%s is accepted, no effect in KariDNS (BIND uses it for the DS checks of parental-agents)", key);
+        break;
+      default: break;
+    }
+  }
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) {
+    conf_error(ctx, what, "expected ';' after '}' but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    goto fail;
+  }
+  free_token(&tok);
+  /* check_servers(): a request to an IPv4 server leaves from an IPv4 address and one to an IPv6 server from an IPv6 address */
+  {
+    int bad = s->family == AF_INET ? (s->xo.src[XSRC_NOTIFY6].state ? XSRC_NOTIFY6 : (s->xo.src[XSRC_XFER6].state ? XSRC_XFER6 : -1))
+                                   : (s->xo.src[XSRC_NOTIFY4].state ? XSRC_NOTIFY4 : (s->xo.src[XSRC_XFER4].state ? XSRC_XFER4 : -1));
+    if (bad >= 0) {
+      conf_error(ctx, what, "%s is not legal for %s server", bad == XSRC_NOTIFY6 ? "notify-source-v6" : bad == XSRC_XFER6 ? "transfer-source-v6"
+                 : bad == XSRC_NOTIFY4 ? "notify-source" : "transfer-source", s->family == AF_INET ? "an IPv4" : "an IPv6");
+      goto fail;
+    }
+  }
+  for (const server_stmt_t *e = *list; e; e = e->next)
+    if (e->family == s->family && e->plen == s->plen && memcmp(e->addr, s->addr, 16) == 0) {
+      conf_error(ctx, what, "already exists, previous definition: %s", e->loc);
+      goto fail;
+    }
+  server_stmt_t **pp = list;
+  while (*pp && (*pp)->plen >= s->plen) pp = &(*pp)->next;
+  s->next = *pp;
+  *pp = s;
+  return 0;
+fail:
+  server_stmts_free(s);
+  if (ctx) ctx->error_occurred = true;
+  return -1;
+}
+
+/* After the parse: the key of every server statement must be defined where the statement applies.  A view's own statements replace the
+ * top-level ones, so each view checks the list it uses against the global keys and its own (check_servers(): "unknown key"). */
+static int servers_check_keys(token_ctx_t *ctx, server_config_t *cfg) {
+  cfg->any_server_max_udp = false;
+  for (const server_stmt_t *s = cfg->servers; s; s = s->next)
+    if (s->set & SV_MAX_UDP_SIZE) cfg->any_server_max_udp = true;
+  for (const view_config_t *v = cfg->views; v; v = v->next)
+    for (const server_stmt_t *s = v->servers; s; s = s->next)
+      if (s->set & SV_MAX_UDP_SIZE) cfg->any_server_max_udp = true;
+  for (const view_config_t *v = cfg->views; v; v = v->next) {
+    const server_stmt_t *list = v->servers ? v->servers : cfg->servers;
+    ctx->scope_keys = v->keys;
+    for (const server_stmt_t *s = list; s; s = s->next) {
+      if (!(s->set & SV_KEYS) || key_is_defined(ctx, cfg, s->key)) continue;
+      char pt[96];
+      server_prefix_text(s, pt, sizeof(pt));
+      bool dflt = strcmp(v->name, "__default__") == 0;
+      syslog(LOG_ERR, "[Config] %s: server '%s': unknown key '%.64s'%s%s%s", s->loc, pt, s->key, dflt ? "" : " (in view '", dflt ? "" : v->name, dflt ? "" : "')");
+      fprintf(stderr, "[ERROR] %s: server '%s': unknown key '%.64s'%s%s%s\n", s->loc, pt, s->key, dflt ? "" : " (in view '", dflt ? "" : v->name, dflt ? "" : "')");
+      ctx->scope_keys = NULL;
+      ctx->error_occurred = true;
+      return -1;
+    }
+  }
+  ctx->scope_keys = NULL;
+  /* a key of a view must not have the name of a global key (check_keylist(): the view is checked together with the global keys) */
+  for (const view_config_t *v = cfg->views; v; v = v->next)
+    for (const tsig_key_t *k = v->keys; k; k = k->next)
+      if (key_name_is_defined(cfg->keys, k->name)) {
+        syslog(LOG_ERR, "[Config] view '%s': key '%s' already exists as a top-level key; the name of a key in a view must be new", v->name, k->name);
+        fprintf(stderr, "[ERROR] view '%s': key '%s' already exists as a top-level key; the name of a key in a view must be new\n", v->name, k->name);
+        ctx->error_occurred = true;
+        return -1;
+      }
+  return 0;
 }
 
 /* B6a (open item 2, decided 2026-10-21): an unknown statement inside zone { } or view { } used to be skipped without a
@@ -3301,6 +3767,131 @@ static int unknown_block_statement(token_ctx_t *ctx, const char *what, const cha
   }
   conf_error(ctx, what, "unknown option '%.64s' (neither a KariDNS option nor a BIND option for this statement; check the spelling)", key);
   return -1;
+}
+
+/* key <name> { algorithm <string>; secret <string>; };  after the word `key` has been read (BIND 9.20 ARM "key Block Definition and Usage"):
+ * top level and inside view { }.  Returns the key (heap, next == NULL), or NULL after an error has been reported. */
+static tsig_key_t *parse_key_block(token_ctx_t *ctx) {
+  char db[96];
+  tsig_key_t *tsig = NULL;
+  char *key_prop = NULL, *val = NULL;
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) {
+    free_token(&tok);
+    if (ctx) ctx->error_occurred = true;
+    return NULL;
+  }
+  tsig = safe_calloc_or_die(1, sizeof(tsig_key_t));
+  if (!tsig) { free_token(&tok); if (ctx) ctx->error_occurred = true; return NULL; }
+  tsig->name = tok.value;
+  tok.value = NULL;
+  free_token(&tok);
+  char what[160];
+  snprintf(what, sizeof(what), "key '%.64s'", tsig->name);
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_LBRACE) {
+    free_token(&tok);
+    goto fail;
+  }
+  free_token(&tok);
+  while (1) {
+    tok = get_next_token(ctx);
+    if (tok.type == TOKEN_RBRACE) {
+      free_token(&tok);
+      break;
+    }
+    if (tok.type != TOKEN_STRING) {
+      free_token(&tok);
+      goto fail;
+    }
+    key_prop = tok.value;
+    tok.value = NULL;
+    free_token(&tok);
+    if (strcmp(key_prop, "algorithm") == 0 || strcmp(key_prop, "secret") == 0) {
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_STRING || !tok.value) {
+        free_token(&tok);
+        goto fail;
+      }
+      val = tok.value;
+      tok.value = NULL;
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) {
+        free_token(&tok);
+        goto fail;
+      }
+      free_token(&tok);
+      if (strcmp(key_prop, "algorithm") == 0 ? tsig->algorithm != NULL : tsig->secret != NULL) {
+        conf_error(ctx, what, "'%s' is given twice", key_prop);
+        goto fail;
+      }
+      if (strcmp(key_prop, "algorithm") == 0) {
+        if (!tsig_algorithm_is_supported(val)) {
+          syslog(LOG_ERR, "[Config] Unsupported TSIG algorithm: %s", val);
+          fprintf(stderr, "[ERROR] Unsupported TSIG algorithm: %s\n", val);
+          goto fail;
+        }
+        if (strstr(val, "md5") || strstr(val, "sha1")) {
+          syslog(LOG_WARNING, "[Config] Warning: TSIG algorithm '%s' is deprecated and insecure (RFC 8945)", val);
+        }
+        tsig->algorithm = val;
+        val = NULL;
+      } else {
+        size_t slen = strlen(val);
+        size_t decoded_upper_bound = ((slen + 3) / 4) * 3;
+        if (slen == 0 || decoded_upper_bound > sizeof(tsig->secret_decoded)) {
+          syslog(LOG_ERR, "[Config] secret too long for algorithm (decodes to %zu bytes, max %zu)", decoded_upper_bound, sizeof(tsig->secret_decoded));
+          fprintf(stderr, "[ERROR] secret too long for algorithm\n");
+          goto fail;
+        }
+        int len = EVP_DecodeBlock(tsig->secret_decoded, (const unsigned char *)val, slen);
+        if (len < 0) {
+          syslog(LOG_ERR, "[Config] key '%s': secret is not valid base64", tsig->name);
+          fprintf(stderr, "[ERROR] key '%s': secret is not valid base64\n", tsig->name);
+          goto fail;
+        }
+        int padding = 0;
+        if (slen > 0 && val[slen - 1] == '=')
+          padding++;
+        if (slen > 1 && val[slen - 2] == '=')
+          padding++;
+        tsig->secret_decoded_len = len - padding;
+        if (strcmp(val, KARIDNS_SAMPLE_SECRET_PLACEHOLDER) == 0) {
+          syslog(LOG_WARNING, "[Config] key '%s': secret is still the sample placeholder; "
+                 "replace it with the output of 'openssl rand -base64 32'", tsig->name);
+          fprintf(stderr, "[WARNING] key '%s': secret is still the sample placeholder; "
+                  "replace it with the output of 'openssl rand -base64 32'\n", tsig->name);
+        }
+        tsig->secret = val;
+        val = NULL;
+      }
+    } else if (unknown_block_statement(ctx, what, k_bind_key_options, key_prop) != 0) {
+      goto fail;
+    }
+    free(key_prop);
+    key_prop = NULL;
+  }
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) {
+    conf_error(ctx, what, "expected ';' after '}' but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    goto fail;
+  }
+  free_token(&tok);
+  /* BIND requires both ("key 'x' must have both 'secret' and 'algorithm' defined").  A key without a secret cannot
+   * sign or verify, and the callers would silently fall back to hmac-sha256 for a missing algorithm. */
+  if (!tsig->secret || !tsig->algorithm) {
+    conf_error(ctx, what, "%s is missing (both 'algorithm' and 'secret' are required)", !tsig->algorithm ? "'algorithm'" : "'secret'");
+    goto fail;
+  }
+  return tsig;
+fail:
+  free(key_prop);
+  free(val);
+  if (ctx) ctx->error_occurred = true;
+  tsig_keys_free(tsig);
+  return NULL;
 }
 
 /* B7a: what a DB zone's settings text may contain (db_settings_parse).  The statements karidns-dbloader writes (the output
@@ -4604,15 +5195,16 @@ static void notify_cfg_error(token_ctx_t *ctx, const char *where, const char *wh
 }
 
 /* Expand the list names of src[0..n) into addresses appended to *out (BIND 9.20 ARM "remote-servers": a list may include other lists).
- * A `key` written on a list name is the key of those of its addresses that have none of their own.  Every key must be defined in a
+ * A `key` written on a list name is the key of those of its addresses that have none of their own; the `port` of a list that is named inside
+ * another is the default of its addresses that have none (inherit_port: the port of the enclosing statement).  Every key must be defined in a
  * key { } block (RFC 8945 needs the secret to sign).  -1 with a message on an unknown name, an undefined key, a list that includes
  * itself (nesting deeper than KARIDNS_REMOTE_LIST_DEPTH) or more than KARIDNS_ALSO_NOTIFY_MAX addresses. */
 static int expand_targets(token_ctx_t *ctx, const server_config_t *cfg, const char *what, const notify_target_t *src, int n,
-                          const char *inherit_key, int depth, notify_target_t **out, int *outn) {
+                          const char *inherit_key, int inherit_port, int depth, notify_target_t **out, int *outn) {
   for (int i = 0; i < n; i++) {
     const notify_target_t *s = &src[i];
     const char *key = s->key ? s->key : inherit_key;
-    if (s->key && !key_name_is_defined(cfg->keys, s->key)) {
+    if (s->key && !key_is_defined(ctx, cfg, s->key)) {
       notify_cfg_error(ctx, s->where, what, "key '%.64s' is not defined in any key {} block", s->key);
       return -1;
     }
@@ -4632,7 +5224,7 @@ static int expand_targets(token_ctx_t *ctx, const server_config_t *cfg, const ch
                          KARIDNS_REMOTE_LIST_DEPTH, s->list);
         return -1;
       }
-      if (expand_targets(ctx, cfg, what, l->items, l->count, key, depth + 1, out, outn) != 0) return -1;
+      if (expand_targets(ctx, cfg, what, l->items, l->count, key, s->port ? s->port : inherit_port, depth + 1, out, outn) != 0) return -1;
       continue;
     }
     if (*outn >= KARIDNS_ALSO_NOTIFY_MAX) {
@@ -4649,7 +5241,7 @@ static int expand_targets(token_ctx_t *ctx, const server_config_t *cfg, const ch
     memset(t, 0, sizeof(*t));
     (*outn)++;
     t->ip = strdup(s->ip);
-    t->port = s->port;
+    t->port = s->port ? s->port : (inherit_port ? inherit_port : 53);   /* the list's port, else the enclosing list's (BIND getipandkeylist()), else 53 */
     if (key) t->key = strdup(key);
     memcpy(t->src_set, s->src_set, sizeof(t->src_set));
     memcpy(t->src, s->src, sizeof(t->src));
@@ -4667,7 +5259,7 @@ static int resolve_notify_field(token_ctx_t *ctx, const server_config_t *cfg, co
   if (*count == 0) return 0;
   notify_target_t *out = NULL;
   int outn = 0;
-  if (expand_targets(ctx, cfg, what, *list, *count, NULL, 0, &out, &outn) != 0) {
+  if (expand_targets(ctx, cfg, what, *list, *count, NULL, 0, 0, &out, &outn) != 0) {
     notify_targets_free(out, outn);
     return -1;
   }
@@ -4686,12 +5278,13 @@ static int resolve_all_notify_targets(token_ctx_t *ctx, server_config_t *config)
     snprintf(what, sizeof(what), "remote-servers '%.64s'", l->name);
     notify_target_t *tmp = NULL;
     int tn = 0;
-    int rc = expand_targets(ctx, config, what, l->items, l->count, NULL, 0, &tmp, &tn);
+    int rc = expand_targets(ctx, config, what, l->items, l->count, NULL, 0, 0, &tmp, &tn);
     notify_targets_free(tmp, tn);
     if (rc != 0) return -1;
   }
   if (resolve_notify_field(ctx, config, "options also-notify", &config->also_notify, &config->also_notify_count) != 0) return -1;
   for (view_config_t *v = config->views; v; v = v->next) {
+    ctx->scope_keys = v->keys;
     snprintf(what, sizeof(what), "view '%.64s' also-notify", v->name);
     if (resolve_notify_field(ctx, config, what, &v->also_notify, &v->also_notify_count) != 0) return -1;
     for (zone_config_t *z = v->zones; z; z = z->next) {
@@ -4709,6 +5302,7 @@ static int resolve_all_notify_targets(token_ctx_t *ctx, server_config_t *config)
         }
       }
     }
+    ctx->scope_keys = NULL;
   }
   return 0;
 }
@@ -4821,7 +5415,11 @@ int config_collect_xfr_sources(token_ctx_t *ctx, server_config_t *cfg) {
   cfg->xfr_sources = NULL;
   cfg->xfr_source_count = 0;
   if (xs_from_xo(ctx, cfg, &cfg->xo) != 0 || xs_from_targets(ctx, cfg, cfg->also_notify, cfg->also_notify_count, true) != 0) return -1;
+  for (const server_stmt_t *s = cfg->servers; s; s = s->next)
+    if (xs_from_xo(ctx, cfg, &s->xo) != 0) return -1;
   for (const view_config_t *v = cfg->views; v; v = v->next) {
+    for (const server_stmt_t *s = v->servers; s; s = s->next)
+      if (xs_from_xo(ctx, cfg, &s->xo) != 0) return -1;
     if (xs_from_xo(ctx, cfg, &v->xo) != 0 || xs_from_targets(ctx, cfg, v->also_notify, v->also_notify_count, true) != 0) return -1;
     for (const zone_config_t *z = v->zones; z; z = z->next) {
       const zone_ext_t *x = z->ext;
@@ -5711,6 +6309,37 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
           if (!view->zones) view->zones = z; else last_view_zone->next = z;
           last_view_zone = z;
+        } else if (strcmp(tok.value, "server") == 0) {
+          /* batch 5: the view's own server statements replace the top-level ones as a whole (BIND named_config_get(cfgmaps, "server")) */
+          free_token(&tok);
+          char vscope[KARIDNS_VIEW_NAME_MAX + 16];
+          snprintf(vscope, sizeof(vscope), "view '%s' ", view->name);
+          if (parse_server_block(ctx, &view->servers, vscope) != 0) {
+            free_partial_view(view);
+            return -1;
+          }
+        } else if (strcmp(tok.value, "key") == 0) {
+          /* batch 5: a key that only this view's statements, ACLs and server statements can use.  Its name must be new: BIND puts the global
+           * keys and the view's into one ring and refuses a second key of the same name (bin/named/tsigconf.c, lib/isccfg/check.c) */
+          free_token(&tok);
+          tsig_key_t *vk = parse_key_block(ctx);
+          if (!vk) {
+            free_partial_view(view);
+            return -1;
+          }
+          tsig_key_t **tail = &view->keys;
+          bool dup = false;
+          for (; *tail; tail = &(*tail)->next)
+            if (domain_names_match_ci((*tail)->name, vk->name)) dup = true;
+          if (dup) {
+            syslog(LOG_ERR, "[Config] view '%s': duplicate TSIG key '%s' defined; rejecting configuration", view->name, vk->name);
+            fprintf(stderr, "[ERROR] view '%s': duplicate TSIG key '%s' defined\n", view->name, vk->name);
+            tsig_keys_free(vk);
+            free_partial_view(view);
+            if (ctx) ctx->error_occurred = true;
+            return -1;
+          }
+          *tail = vk;
         } else if (xo_option_name(tok.value)) {
           /* batch 4: the transfer / NOTIFY options of the view replace options' for the zones of this view that have none of their own */
           char *xkey = tok.value;
@@ -5808,6 +6437,9 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       char lwhat[96];
       snprintf(lwhat, sizeof(lwhat), "%s '%.64s'", stmt, rl->name);
       if (parse_notify_targets(ctx, lwhat, &rl->items, &rl->count, false) != 0) return -1;
+    } else if (strcmp(tok.value, "server") == 0) {
+      free_token(&tok);
+      if (parse_server_block(ctx, &config->servers, "") != 0) return -1;
     } else if (strcmp(tok.value, "acl") == 0) {
       /* D-22: acl "name" { <address_match_element>; ... }; (BIND named.conf) */
       free_token(&tok);
@@ -5840,191 +6472,13 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       }
     } else if (strcmp(tok.value, "key") == 0) {
       free_token(&tok);
-      tok = get_next_token(ctx);
-      if (tok.type != TOKEN_STRING) {
-        free_token(&tok);
-        return -1;
-      }
-      tsig_key_t *tsig = safe_calloc_or_die(1, sizeof(tsig_key_t));
-      if (!tsig) { free_token(&tok); if (ctx) ctx->error_occurred = true; return -1; }
-      tsig->name = tok.value;
-      tok.value = NULL;
-      free_token(&tok);
-      tok = get_next_token(ctx);
-      if (tok.type != TOKEN_LBRACE) {
-        free(tsig->name);
-        free(tsig);
-        free_token(&tok);
-        return -1;
-      }
-      free_token(&tok);
-      while (1) {
-        tok = get_next_token(ctx);
-        if (tok.type == TOKEN_RBRACE) {
-          free_token(&tok);
-          break;
-        }
-        if (tok.type != TOKEN_STRING) {
-          free(tsig->name);
-          if (tsig->algorithm) free(tsig->algorithm);
-          if (tsig->secret) free(tsig->secret);
-          free(tsig);
-          free_token(&tok);
-          return -1;
-        }
-        char *key_prop = tok.value;
-        tok.value = NULL;
-        free_token(&tok);
-        if (strcmp(key_prop, "algorithm") == 0 ||
-            strcmp(key_prop, "secret") == 0) {
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_STRING) {
-            free(key_prop);
-            free(tsig->name);
-            if (tsig->algorithm) free(tsig->algorithm);
-            if (tsig->secret) free(tsig->secret);
-            free(tsig);
-            free_token(&tok);
-            return -1;
-          }
-          char *val = tok.value;
-          tok.value = NULL;
-          free_token(&tok);
-          if (!val) {
-            free(key_prop);
-            free(tsig->name);
-            if (tsig->algorithm) free(tsig->algorithm);
-            if (tsig->secret) free(tsig->secret);
-            free(tsig);
-            if (ctx) ctx->error_occurred = true;
-            return -1;
-          }
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_SEMICOLON) {
-            free(key_prop);
-            free(val);
-            free(tsig->name);
-            if (tsig->algorithm) free(tsig->algorithm);
-            if (tsig->secret) free(tsig->secret);
-            free(tsig);
-            free_token(&tok);
-            return -1;
-          }
-          free_token(&tok);
-          if (strcmp(key_prop, "algorithm") == 0 ? tsig->algorithm != NULL : tsig->secret != NULL) {
-            char what[160];
-            snprintf(what, sizeof(what), "key '%.64s'", tsig->name);
-            conf_error(ctx, what, "'%s' is given twice", key_prop);
-            free(key_prop);
-            free(val);
-            free(tsig->name);
-            if (tsig->algorithm) free(tsig->algorithm);
-            if (tsig->secret) free(tsig->secret);
-            free(tsig);
-            return -1;
-          }
-          if (strcmp(key_prop, "algorithm") == 0) {
-            if (!tsig_algorithm_is_supported(val)) {
-              syslog(LOG_ERR, "[Config] Unsupported TSIG algorithm: %s", val);
-              fprintf(stderr, "[ERROR] Unsupported TSIG algorithm: %s\n", val);
-              free(key_prop);
-              free(val);
-              free(tsig->name);
-              if (tsig->algorithm) free(tsig->algorithm);
-              if (tsig->secret) free(tsig->secret);
-              free(tsig);
-              return -1;
-            }
-            if (strstr(val, "md5") || strstr(val, "sha1")) {
-              syslog(LOG_WARNING, "[Config] Warning: TSIG algorithm '%s' is deprecated and insecure (RFC 8945)", val);
-            }
-            tsig->algorithm = val;
-          } else {
-            tsig->secret = val;
-            size_t slen = strlen(tsig->secret);
-            size_t decoded_upper_bound = ((slen + 3) / 4) * 3;
-            if (slen == 0 || decoded_upper_bound > sizeof(tsig->secret_decoded)) {
-              syslog(LOG_ERR, "[Config] secret too long for algorithm (decodes to %zu bytes, max %zu)", decoded_upper_bound, sizeof(tsig->secret_decoded));
-              fprintf(stderr, "[ERROR] secret too long for algorithm\n");
-              free(key_prop);
-              free(val);
-              tsig->secret = NULL;
-              free(tsig->name);
-              if (tsig->algorithm) free(tsig->algorithm);
-              free(tsig);
-              return -1;
-            }
-            int len = EVP_DecodeBlock(tsig->secret_decoded,
-                                      (const unsigned char *)tsig->secret,
-                                      slen);
-            if (len < 0) {
-              syslog(LOG_ERR, "[Config] key '%s': secret is not valid base64", tsig->name);
-              fprintf(stderr, "[ERROR] key '%s': secret is not valid base64\n", tsig->name);
-              free(key_prop);
-              free(val);
-              tsig->secret = NULL;
-              free(tsig->name);
-              if (tsig->algorithm) free(tsig->algorithm);
-              free(tsig);
-              return -1;
-            }
-            int padding = 0;
-            if (slen > 0 && tsig->secret[slen - 1] == '=')
-              padding++;
-            if (slen > 1 && tsig->secret[slen - 2] == '=')
-              padding++;
-            tsig->secret_decoded_len = len - padding;
-            if (strcmp(tsig->secret, KARIDNS_SAMPLE_SECRET_PLACEHOLDER) == 0) {
-              syslog(LOG_WARNING, "[Config] key '%s': secret is still the sample placeholder; "
-                     "replace it with the output of 'openssl rand -base64 32'", tsig->name);
-              fprintf(stderr, "[WARNING] key '%s': secret is still the sample placeholder; "
-                      "replace it with the output of 'openssl rand -base64 32'\n", tsig->name);
-            }
-          }
-        } else {
-          char what[160];
-          snprintf(what, sizeof(what), "key '%.64s'", tsig->name);
-          if (unknown_block_statement(ctx, what, k_bind_key_options, key_prop) != 0) {
-            free(key_prop);
-            free(tsig->name);
-            if (tsig->algorithm) free(tsig->algorithm);
-            if (tsig->secret) free(tsig->secret);
-            free(tsig);
-            return -1;
-          }
-        }
-        free(key_prop);
-      }
-      tok = get_next_token(ctx);
-      if (tok.type != TOKEN_SEMICOLON) {
-        free(tsig->name);
-        if (tsig->algorithm) free(tsig->algorithm);
-        if (tsig->secret) free(tsig->secret);
-        free(tsig);
-        free_token(&tok);
-        return -1;
-      }
-      free_token(&tok);
-      /* BIND requires both ("key 'x' must have both 'secret' and 'algorithm' defined").  A key without a secret cannot
-       * sign or verify, and the callers would silently fall back to hmac-sha256 for a missing algorithm. */
-      if (!tsig->secret || !tsig->algorithm) {
-        char what[160];
-        snprintf(what, sizeof(what), "key '%.64s'", tsig->name);
-        conf_error(ctx, what, "%s is missing (both 'algorithm' and 'secret' are required)", !tsig->algorithm ? "'algorithm'" : "'secret'");
-        free(tsig->name);
-        if (tsig->algorithm) free(tsig->algorithm);
-        if (tsig->secret) free(tsig->secret);
-        free(tsig);
-        return -1;
-      }
+      tsig_key_t *tsig = parse_key_block(ctx);
+      if (!tsig) return -1;
       for (tsig_key_t *existing = config->keys; existing; existing = existing->next) {
         if (domain_names_match_ci(existing->name, tsig->name)) {
           syslog(LOG_ERR, "[Config] Duplicate TSIG key '%s' defined; rejecting configuration", tsig->name);
           fprintf(stderr, "[ERROR] Duplicate TSIG key '%s' defined\n", tsig->name);
-          free(tsig->name);
-          if (tsig->algorithm) free(tsig->algorithm);
-          if (tsig->secret) free(tsig->secret);
-          free(tsig);
+          tsig_keys_free(tsig);
           return -1;
         }
       }
@@ -6546,6 +7000,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       }
     }
     for (view_config_t *v = config->views; v; v = v->next) {
+      ctx->scope_keys = v->keys;
       snprintf(where, sizeof(where), "view '%s' match-clients", v->name);
       if (acl_expand_field(ctx, config, where, ACL_USE_ADDRESS, &v->match_clients, &v->match_clients_count,
                            &v->match_clients_parsed, NULL, NULL) != 0)
@@ -6566,6 +7021,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                              &zx->ecs_trusted_resolvers_count, &zx->ecs_trusted_resolvers_parsed, NULL, NULL) != 0)
           return -1;
       }
+      ctx->scope_keys = NULL;
     }
   }
 
@@ -6576,11 +7032,12 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
 
   /* [T7] TSIGキー参照の未定義検出 (checkconf相当の健全性チェック) */
   for (view_config_t *v = config->views; v; v = v->next) {
+    ctx->scope_keys = v->keys;
     for (zone_config_t *z = v->zones; z; z = z->next) {
       const zone_ext_t *zx = z->ext;
       if (!zx) continue; /* tsig-key も allow-transfer key も持たない */
       /* tsig-key ディレクティブ: 存在しないキー名は起動失敗 */
-      if (zx->tsig_key && !key_name_is_defined(config->keys, zx->tsig_key)) {
+      if (zx->tsig_key && !key_is_defined(ctx, config, zx->tsig_key)) {
         syslog(LOG_ERR, "[Config] Zone '%s': tsig-key '%s' is not defined in any key {} block",
                z->domain, zx->tsig_key);
         fprintf(stderr, "[ERROR] Zone '%s': tsig-key '%s' is not defined in any key {} block\n",
@@ -6589,7 +7046,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       }
       /* allow-transfer key: 存在しないキー名は起動失敗 */
       for (int i = 0; i < zx->tsig_keys_count; i++) {
-        if (!key_name_is_defined(config->keys, zx->tsig_keys[i])) {
+        if (!key_is_defined(ctx, config, zx->tsig_keys[i])) {
           syslog(LOG_ERR, "[Config] Zone '%s': allow-transfer key '%s' is not defined in any key {} block",
                  z->domain, zx->tsig_keys[i]);
           fprintf(stderr, "[ERROR] Zone '%s': allow-transfer key '%s' is not defined in any key {} block\n",
@@ -6599,6 +7056,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       }
     }
   }
+  ctx->scope_keys = NULL;
+  if (servers_check_keys(ctx, config) != 0) return -1;
 
   config->any_zone_tcp_opts = false;
   for (view_config_t *v = config->views; v && !config->any_zone_tcp_opts; v = v->next) {
@@ -7058,7 +7517,14 @@ static zone_ext_t *zone_ext_clone(const zone_ext_t *s) {
 }
 
 /* Move the received statement lists into d (replacing d's), as parsed lists of their own. */
-static bool zx_take_acl(zone_ext_t *d, const zone_ext_t *rx, char *note, size_t notelen, const server_config_t *cfg) {
+static const tsig_key_t *view_own_keys_of(const server_config_t *cfg, const char *view_name) {
+  if (!cfg || !view_name || !view_name[0]) return NULL;
+  for (const view_config_t *v = cfg->views; v; v = v->next)
+    if (strcasecmp(v->name, view_name) == 0) return v->keys;
+  return NULL;
+}
+
+static bool zx_take_acl(zone_ext_t *d, const zone_ext_t *rx, char *note, size_t notelen, const server_config_t *cfg, const char *view_name) {
   for (int i = 0; i < d->allow_transfer_count; i++) free(d->allow_transfer[i]);
   free(d->allow_transfer);
   free(d->allow_transfer_parsed);
@@ -7069,7 +7535,7 @@ static bool zx_take_acl(zone_ext_t *d, const zone_ext_t *rx, char *note, size_t 
   /* a key the secondary does not have: the ACL fails closed (as for a database zone), whatever else it lists */
   const char *missing = NULL;
   for (int i = 0; i < rx->tsig_keys_count && !missing; i++)
-    if (!cfg || !key_name_is_defined(cfg->keys, rx->tsig_keys[i])) missing = rx->tsig_keys[i];
+    if (!cfg || (!key_name_is_defined(cfg->keys, rx->tsig_keys[i]) && !key_name_is_defined(view_own_keys_of(cfg, view_name), rx->tsig_keys[i]))) missing = rx->tsig_keys[i];
   if (missing) {
     char *none[1] = { "none" };
     if (!zx_strs(&d->allow_transfer, &d->allow_transfer_count, none, 1)) return false;
@@ -7086,6 +7552,11 @@ static bool zx_take_acl(zone_ext_t *d, const zone_ext_t *rx, char *note, size_t 
 
 zone_config_t *zone_config_with_received(const char *domain, const zone_config_t *base, const zone_ext_t *rx,
                                          const server_config_t *cfg, char *note, size_t notelen) {
+  return zone_config_with_received_in_view(domain, NULL, base, rx, cfg, note, notelen);
+}
+
+zone_config_t *zone_config_with_received_in_view(const char *domain, const char *view_name, const zone_config_t *base, const zone_ext_t *rx,
+                                                 const server_config_t *cfg, char *note, size_t notelen) {
   if (note && notelen) note[0] = '\0';
   zone_config_t *c = calloc(1, sizeof(*c));
   if (!c) return NULL;
@@ -7105,7 +7576,7 @@ zone_config_t *zone_config_with_received(const char *domain, const zone_config_t
    * where the zone has no value) */
   if (rx && b->allow_transfer_count == 0 && b->tsig_keys_count == 0 && !b->acl.transfer &&
       rx->allow_transfer_count + rx->tsig_keys_count > 0) {
-    if (!zx_take_acl(x, rx, note, notelen, cfg)) {
+    if (!zx_take_acl(x, rx, note, notelen, cfg, view_name)) {
       free_zone_config(c);
       return NULL;
     }

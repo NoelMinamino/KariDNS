@@ -183,7 +183,43 @@ typedef struct {
   uint32_t notify_delay;
   bool notify_to_soa, try_tcp_refresh, request_ixfr, provide_ixfr, request_expire, multi_master;
   struct { bool set; uint8_t addr[16]; } src[XSRC_N];  /* set == false: `*` or not written, the system chooses the source address */
+  /* batch 5: the source addresses of the `server` statement of the peer (xfr_opts_effective_peer()), above the primaries / also-notify
+   * list's `source` and above src[]: 0 = not written, 1 = an address, 2 = `*` (the system chooses) */
+  struct { uint8_t state; uint8_t addr[16]; } psrc[XSRC_N];
 } xfr_eff_t;
+
+/* ---- Batch 5: server <prefix> { ... }; (BIND 9.20 ARM "server Statement Definition and Usage"; lib/isccfg/namedconf.c server_clauses,
+ * bin/named/server.c configure_peer()).  A statement describes the remote server(s) an address prefix covers.  Where BIND uses an option
+ * (lib/dns/zone.c, xfrin.c, lib/ns/xfrout.c, client.c): keys, transfers, transfer-source(-v6), notify-source(-v6), request-ixfr,
+ * request-expire, edns, edns-udp-size, edns-version, request-nsid for our requests to the server; provide-ixfr, transfer-format and
+ * max-udp-size for what we send to it.  The others are accepted and have no effect on an authoritative server (resolver.c, checkds). ---- */
+#define SV_B_BOGUS          (1u << 0)
+#define SV_B_EDNS           (1u << 1)
+#define SV_B_REQUEST_NSID   (1u << 2)
+#define SV_B_SEND_COOKIE    (1u << 3)
+#define SV_B_REQUIRE_COOKIE (1u << 4)
+#define SV_B_TCP_KEEPALIVE  (1u << 5)
+#define SV_B_TCP_ONLY       (1u << 6)
+#define SV_B_ONE_ANSWER     (1u << 7)    /* transfer-format one-answer (clear: many-answers) */
+#define SV_TRANSFER_FORMAT  (1u << 8)    /* the options below carry a number / a name: the bit says "written" */
+#define SV_TRANSFERS        (1u << 9)
+#define SV_EDNS_UDP_SIZE    (1u << 10)
+#define SV_EDNS_VERSION     (1u << 11)
+#define SV_MAX_UDP_SIZE     (1u << 12)
+#define SV_PADDING          (1u << 13)
+#define SV_KEYS             (1u << 14)
+typedef struct server_stmt {
+  uint8_t family;       /* AF_INET / AF_INET6 */
+  uint8_t plen;         /* prefix length in bits (the address alone: 32 / 128) */
+  uint8_t addr[16];     /* the prefix, network order (4 octets for AF_INET); the bits beyond plen are zero */
+  uint32_t set;         /* SV_* of the options written */
+  uint32_t bools;       /* SV_B_* values (meaningful where the bit is in `set`) */
+  uint32_t transfers, edns_udp_size, edns_version, max_udp_size, padding;
+  char *key;            /* keys: the TSIG key used for requests to this server (SV_KEYS) */
+  xfr_opts_t xo;        /* request-ixfr, provide-ixfr, request-expire, notify-source(-v6), transfer-source(-v6) (the same parser as the zone's) */
+  char loc[240];        /* "file:line" of the statement */
+  struct server_stmt *next;   /* most specific prefix first (BIND dns_peerlist_addpeer()) */
+} server_stmt_t;
 
 /* One distinct source address of the configuration (start-up check, the Router's NOTIFY sockets, the connect broker's allow list) */
 typedef struct {
@@ -438,6 +474,8 @@ typedef struct view_config {
   acl_set_t acl;                /* view { allow-query ... }: overrides options' for the zones of this view that have none of their own */
   uint8_t notify_mode;          /* view { notify }: notify_mode_t, 0 = inherit options' */
   xfr_opts_t xo;                /* view { notify-source, transfer-source, min-refresh-time, ... }: replaces options' for the zones of this view that have none of their own */
+  tsig_key_t *keys;             /* view { key }: keys visible to this view only (BIND bin/named/tsigconf.c: the view's ring is the global keys plus these) */
+  server_stmt_t *servers;       /* view { server }: when there is any, it replaces the whole list of the top-level server statements (named_config_get() finds the view's first) */
   /* beta design 7.1: DB zone source of this view. NULL/false = the global source of options { database { } } */
   char *database_file;         /* "database-file": sqlite3, this view's own file */
   char *database_schema;       /* "database-schema": postgresql, this view's own schema */
@@ -545,6 +583,7 @@ typedef struct server_config_s {
                          * 順に見るには views の zones を辿る (S6a: ゾーン構造体を複製したフラットリストは廃止) */
   zone_cfg_index_t top_zone_index; /* パース中のトップレベル zone の索引。既定の view に移す */
   tsig_key_t *keys;
+  server_stmt_t *servers;       /* top-level server statements, most specific prefix first (a view's own list replaces it) */
   acl_def_t *acls;
   acl_set_t acl;                /* options { allow-query ... }: the default of every view and zone */
   bool acl_query_active;        /* set when the parse ends: allow-query or allow-query-on is written somewhere (options, a view or a zone); false = the query path does not look at ACLs */
@@ -601,6 +640,7 @@ typedef struct server_config_s {
                              * 継承させる。listen ソケットは reload で作り直さないため再起動が必要 */
   uint16_t udp_bufsize;     /* EDNS UDP ペイロードサイズ上限 (0 = 既定 1232) */
   bool any_zone_tcp_opts;   /* zone-tcp-* を持つゾーンが1つでもあるか (TCP 経路の追加検索を省く) */
+  bool any_server_max_udp;  /* some server statement writes max-udp-size: the UDP query path then looks the client up in the server statements (set when the parse ends) */
   bool allow_program_zones; /* 既定 false。trueでない限り type program は起動時エラーで拒否 */
   bool ecs_enable;
   char **ecs_trusted_resolvers;
@@ -633,6 +673,9 @@ size_t zone_settings_render(const server_config_t *cfg, const zone_config_t *zcf
  * memory.  The result owns everything it points to. */
 zone_config_t *zone_config_with_received(const char *domain, const zone_config_t *base, const zone_ext_t *rx,
                                          const server_config_t *cfg, char *note, size_t notelen);
+/* the same for a zone of view view_name: a TSIG key the received allow-transfer names is also found among the keys of that view (batch 5) */
+zone_config_t *zone_config_with_received_in_view(const char *domain, const char *view_name, const zone_config_t *base, const zone_ext_t *rx,
+                                                 const server_config_t *cfg, char *note, size_t notelen);
 /* B7a: is options { database { acl-ceiling } } configured (any address or key entry)?  No ceiling = DB ACLs refuse everyone */
 bool db_acl_ceiling_configured(const server_config_t *cfg);
 
@@ -680,6 +723,7 @@ typedef struct {
   int dir_rel_before;   // relative includes resolved before the last directory statement, not counting the ones that opened the files being read
   bool dir_pinned;      // directory is the one the running server was started with (config_pin_directory): the file cannot change it
   char *dir_written;    // the directory statement as the configuration writes it (owned by parse_named_conf_ext), NULL = none
+  const tsig_key_t *scope_keys; // the keys of the view whose statements are being checked after the parse (a name is defined when it is global or in this list)
 } token_ctx_t;
 
 /* options { directory } (BIND 9.20 ARM: "the working directory of the server"; every relative path is relative to it) is read once, when
@@ -730,6 +774,25 @@ void xfr_opts_effective(const server_config_t *cfg, const zone_config_t *zone, c
 /* The source address of a request to a primary / NOTIFY target `family` (AF_INET / AF_INET6): the address of the list the primary is
  * written in (t may be NULL), else the effective transfer-source(-v6) (xfer = true) or notify-source(-v6).  false = the system chooses. */
 bool xfr_source_for(const xfr_eff_t *e, const notify_target_t *t, int family, bool xfer, uint8_t out[16]);
+/* Batch 5.  The first server statement of list that covers the address (family AF_INET / AF_INET6, addr 4 / 16 octets in network order):
+ * the list is ordered most specific prefix first, so this is BIND's dns_peerlist_peerbyaddr().  NULL = none. */
+const server_stmt_t *server_list_find(const server_stmt_t *list, int family, const uint8_t *addr);
+/* The server statement for a peer of a zone of view view_name (NULL or "" = no view): the view's own statements when it has any (they
+ * replace the top-level ones as a whole, BIND named_config_get(cfgmaps, "server")), else the top-level ones. */
+const server_stmt_t *config_server_find(const server_config_t *cfg, const char *view_name, int family, const uint8_t *addr);
+/* the same for an address given as text (inet_ntop() form); NULL when ip is not an address */
+const server_stmt_t *config_server_find_ip(const server_config_t *cfg, const char *view_name, const char *ip);
+/* the same for the peer address of a socket (struct sockaddr_in / sockaddr_in6; an IPv4-mapped IPv6 address is looked up as the IPv4 address); NULL sa or another family: NULL */
+struct sockaddr;
+const server_stmt_t *config_server_find_sa(const server_config_t *cfg, const char *view_name, const struct sockaddr *sa);
+/* xfr_opts_effective() for a request to / an answer for the peer srv (NULL = no server statement): the statement's request-ixfr,
+ * provide-ixfr and request-expire replace the zone's (BIND zone.c: the peer's value is used when it is set), and its sources fill
+ * psrc[] (xfr_source_for() puts them above the list's `source`) */
+void xfr_opts_effective_peer(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, const server_stmt_t *srv, xfr_eff_t *out);
+/* The TSIG key name that signs a request to a peer: the key written on the primaries / also-notify element, else the `keys` of the server
+ * statement of the peer, else the zone's tsig-key (KariDNS) -- BIND lib/dns/zone.c soa_query(), notify_send_toaddr(): the element's key,
+ * then dns_view_getpeertsig().  NULL = unsigned. */
+const char *peer_key_name(const char *element_key, const server_stmt_t *srv, const char *zone_key);
 /* minutes of max-transfer-*-in/out in seconds.  KARIDNS_XFER_MINUTE_SECS in the environment (a test hook, like BIND's named -T transferinsecs)
  * sets the length of a "minute" to that many seconds (1..60), so that a test does not wait for real minutes. */
 uint32_t xfr_minutes_to_secs(uint32_t minutes);

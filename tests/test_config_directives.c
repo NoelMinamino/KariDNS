@@ -2591,9 +2591,9 @@ static void test_also_notify_bind(void) {
             CHECK(strcmp(t[4].ip, "2001:db8::30") == 0 && t[4].key && strcmp(t[4].key, "k1") == 0);
             CHECK(t[0].list == NULL && t[0].where == NULL && t[1].where == NULL);
         }
-        /* the outer port is not applied to the elements of a list: they have the list's own port (53 here) */
+        /* the port of the enclosing statement is the default of the elements of a nested list that has no port (BIND named_config_getipandkeylist(); batch 5) */
         n = also_notify_effective(&cfg, zone_in_view(&cfg, "__default__", "a.test"), "__default__", &t);
-        CHECK(n == 1 && t && t[0].port == 53);
+        CHECK(n == 1 && t && t[0].port == 5300);
         free_server_config_fields(&cfg);
     }
     /* settings text of a database zone: addresses and ports only */

@@ -10,6 +10,9 @@ bool check_acl(const char *client_ip, char **acl_list, int acl_count);
 acl_entry_t *acl_list_parse(char **acl_list, int count);
 bool check_acl_bin(const char *client_ip, const acl_entry_t *parsed, int count);
 tsig_key_t *find_tsig_key_by_name(const server_config_t *cfg, const char *key_name);
+/* The key key_name as the view view_name sees it: a key of that view, else a global key (BIND bin/named/tsigconf.c: the ring of a view holds the global
+ * keys and the view's own).  view_name NULL or "" (or a view the configuration does not have): the global keys only. */
+tsig_key_t *find_tsig_key_in_view(const server_config_t *cfg, const char *view_name, const char *key_name);
 
 /* ---- BIND address match lists (BIND 9.20 ARM, "Address Match Lists" and "acl Block Definition and Usage") ----
  * An aml_t is a list of elements.  Elements are tried in order and the first one that matches decides: a non-negated match allows,
@@ -148,8 +151,10 @@ typedef struct {
 
 /* 要求の TSIG を、要求が名乗る鍵名とアルゴリズムで設定の鍵から探して検証する。
  * 切り詰めた MAC は、切り詰めを設定する手段がないので BADTRUNC とする (BIND の既定と同じ。§5.2.4)。
+ * view_name: 要求が属する view (先に client のアドレスで決める)。その view だけの key とグローバルの key から探す
+ * (NULL か不明な view ならグローバルだけ。BIND の get_matching_view_sync(): view の鍵束で検証する)。
  * client_ip はログ用 (NULL 可)。 */
-void tsig_check_request(const server_config_t *cfg, const uint8_t *req, size_t req_len, const char *client_ip,
+void tsig_check_request(const server_config_t *cfg, const char *view_name, const uint8_t *req, size_t req_len, const char *client_ip,
                         tsig_request_t *t);
 /* 応答に付ける TSIG RR の最大バイト数 (VALID と BADTIME/BADTRUNC のときに応答の上限から差し引く)。 */
 size_t tsig_response_reserve(const tsig_request_t *t);

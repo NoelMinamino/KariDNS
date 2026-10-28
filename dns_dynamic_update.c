@@ -569,7 +569,7 @@ void send_notify_to_all(zone_db_entry_t *entry) {
   /* D-09: ゾーンに tsig-key があれば NOTIFY に署名する */
   const tsig_key_t *key = NULL;
   if (zone && zext(zone)->tsig_key && zext(zone)->tsig_key[0]) {
-    key = find_tsig_key_by_name(active, zext(zone)->tsig_key);
+    key = find_tsig_key_in_view(active, view_name, zext(zone)->tsig_key);
     if (!key) syslog(LOG_ERR, "[Notify] zone '%s': tsig-key '%s' is not defined; NOTIFY sent unsigned", domain,
                      zext(zone)->tsig_key);
   }
@@ -584,7 +584,7 @@ void send_notify_to_all(zone_db_entry_t *entry) {
   for (int i = 0; i < an_count; i++) {
     const tsig_key_t *tk = key;
     if (an[i].key) {
-      tk = find_tsig_key_by_name(active, an[i].key);
+      tk = find_tsig_key_in_view(active, view_name, an[i].key);
       if (!tk) syslog(LOG_ERR, "[Notify] zone '%s': also-notify key '%s' is not defined; NOTIFY sent unsigned", domain, an[i].key);
     }
     notify_add_target(targets, &ntargets, 64, AF_UNSPEC, an[i].ip, (uint16_t)an[i].port, tk, &an[i]);
@@ -625,7 +625,22 @@ void send_notify_to_all(zone_db_entry_t *entry) {
      * warning (a restart-only change) and the system chooses the source. */
     int fam = targets[i].addr.ss_family;
     uint8_t src[16];
-    bool has_src = xfr_source_for(&eff, targets[i].tpl, fam, false, src);
+    /* the server statement that covers the address (batch 5; the view's, else the top-level ones): its notify-source(-v6) is above the
+     * list's `source` (BIND notify_send_toaddr()), and its `keys` signs the NOTIFY unless the also-notify element has a key of its own
+     * (BIND: notify->key, else dns_view_getpeertsig()); the zone's tsig-key comes after both (KariDNS) */
+    const uint8_t *dst_bytes = fam == AF_INET ? (const uint8_t *)&((const struct sockaddr_in *)&targets[i].addr)->sin_addr
+                                              : (const uint8_t *)&((const struct sockaddr_in6 *)&targets[i].addr)->sin6_addr;
+    const server_stmt_t *srv = config_server_find(active, view_name, fam, dst_bytes);
+    const tsig_key_t *tkey = targets[i].key;
+    if (srv && (srv->set & SV_KEYS) && !(targets[i].tpl && targets[i].tpl->key)) {
+      const tsig_key_t *sk = find_tsig_key_in_view(active, view_name, srv->key);
+      if (sk) tkey = sk;
+      else syslog(LOG_ERR, "[Notify] zone '%s': the key '%s' of the server statement for %s is not defined; NOTIFY sent with the zone's key or unsigned",
+                  domain, srv->key, targets[i].tpl ? targets[i].tpl->ip : "an NS host");
+    }
+    xfr_eff_t peff;
+    xfr_opts_effective_peer(active, zone, view_name, srv, &peff);
+    bool has_src = xfr_source_for(&peff, targets[i].tpl, fam, false, src);
     if (has_src && !config_xfr_source_allowed(fam, src, false)) {
       char txt[INET6_ADDRSTRLEN];
       inet_ntop(fam, src, txt, sizeof(txt));
@@ -633,7 +648,7 @@ void send_notify_to_all(zone_db_entry_t *entry) {
                           "(until then the system chooses the source address)", domain, txt);
       has_src = false;
     }
-    notify_send_to(domain, view_name, &targets[i].addr, has_src, src, targets[i].key, &nr, g_notify_rate);
+    notify_send_to(domain, view_name, &targets[i].addr, has_src, src, tkey, &nr, g_notify_rate);
   }
 
   if (ntargets > 0) {
