@@ -2775,7 +2775,8 @@ static void test_strict_options_and_key(void) {
         {"allow-query", "allow-query { any; };"}, {"allow-query-on", "allow-query-on { any; };"},
         {"allow-transfer", "allow-transfer { none; };"}, {"allow-update", "allow-update { none; };"},
         {"allow-notify", "allow-notify { 192.0.2.1; };"},
-        {"notify-retry-interval", "notify-retry-interval 5;"}, {"notify-retry-backoff", "notify-retry-backoff fixed;"},
+        {"listen-on", "listen-on port 5353 { 127.0.0.1; };"}, {"listen-on-v6", "listen-on-v6 { none; };"},
+        {"blackhole", "blackhole { 192.0.2.0/24; };"}, {"notify-retry-interval", "notify-retry-interval 5;"}, {"notify-retry-backoff", "notify-retry-backoff fixed;"},
     };
     for (size_t i = 0; i < sizeof(impl) / sizeof(impl[0]); i++) {
         snprintf(txt, sizeof(txt), "options { %s };", impl[i].sample);
@@ -2796,7 +2797,7 @@ static void test_strict_options_and_key(void) {
 
     /* a BIND option KariDNS does not implement: warning, skipped, the rest of options { } still applies */
     static const char *const bind_only[] = {
-        "listen-on { 127.0.0.1; };", "listen-on-v6 { any; };", "recursion no;",
+        "recursion no;",
         "transfer-source 192.0.2.1;", "version none;", "dnssec-validation auto;", "forwarders { 192.0.2.1; };",
         "max-cache-size 100m;", "allow-new-zones yes;", "dnssec-enable yes;" /* BIND 9.16 and older */,
         "allow-proxy { any; };" /* BIND 9.20 only */, "use-alt-transfer-source no;" /* BIND 9.18 only */,

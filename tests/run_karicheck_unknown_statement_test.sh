@@ -65,7 +65,7 @@ echo "== options { }"
 check "a plain options" "options { port 5300; minimal-responses yes; }; $Z" ok
 check "a typo in options" "options {${NL} port 5300;${NL} bind-adress { 127.0.0.1; };${NL}}; $Z" error ":3: options: unknown option 'bind-adress'"
 check "an unknown option in options" "options { nonsense-option yes; };" error "options: unknown option 'nonsense-option'"
-for o in listen-on recursion version allow-update-forwarding; do   # directory is implemented (tests/run_bind_compat_paths_test.sh)
+for o in recursion version allow-update-forwarding; do   # directory is implemented (tests/run_bind_compat_paths_test.sh)
     check "BIND option $o in options" "options {${NL} $o yes;${NL}};" warn ":2: options: '$o' is a BIND option that KariDNS does not implement"
 done
 

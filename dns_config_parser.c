@@ -928,6 +928,16 @@ void free_server_config_fields(server_config_t *cfg) {
   free(cfg->bind_addresses);
   cfg->bind_addresses = NULL;
   cfg->bind_address_count = 0;
+  for (int j = 0; j < cfg->listen_stmt_count; j++)
+    aml_unref(cfg->listen_stmts[j].list);
+  free(cfg->listen_stmts);
+  cfg->listen_stmts = NULL;
+  cfg->listen_stmt_count = 0;
+  free(cfg->listen);
+  cfg->listen = NULL;
+  cfg->listen_count = 0;
+  aml_unref(cfg->blackhole);
+  cfg->blackhole = NULL;
 
   if (cfg->user) { free(cfg->user); cfg->user = NULL; }
   if (cfg->group) { free(cfg->group); cfg->group = NULL; }
@@ -1633,6 +1643,297 @@ static aml_t *parse_aml_statement(token_ctx_t *ctx, const char *what) {
   }
   free_token(&tok);
   return l;
+}
+
+/* ---- listen-on, listen-on-v6, bind-address and blackhole (BIND 9.20 ARM "Interfaces", "blackhole") ----
+ *   listen-on [ port <integer> ] [ proxy <string> ] [ tls <string> ] [ http <string> ] { <address_match_element>; ... };   (may be repeated)
+ *   blackhole { <address_match_element>; ... };
+ * The addresses to listen on are computed once, when the parse ends (config_build_listen()); the Frontend and the Backend open their
+ * sockets from server_config_t.listen only and never look at these statements again.  A reload that changes them is "restart needed". */
+#define LISTEN_STMT_MAX 256
+
+static int g_port_override;
+void config_set_port_override(int port) {
+  g_port_override = (port > 0 && port <= 65535) ? port : 0;
+}
+
+static void conf_warn_loc(const char *loc, const char *what, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void conf_warn_loc(const char *loc, const char *what, const char *fmt, ...) {
+  char msg[300];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  syslog(LOG_WARNING, "[Config] %s: %s: %s", loc, what, msg);
+  fprintf(stderr, "[WARNING] %s: %s: %s\n", loc, what, msg);
+}
+
+/* bind-address elements must be IPv4 or IPv6 addresses: a typo used to bind nothing, silently (bind_address_loc says where they were read). */
+static int bind_address_check(token_ctx_t *ctx, server_config_t *cfg, int first_new) {
+  ctx_location(ctx, cfg->bind_address_loc, sizeof(cfg->bind_address_loc));
+  for (int i = first_new; i < cfg->bind_address_count; i++) {
+    uint8_t b[16];
+    const char *a = cfg->bind_addresses[i];
+    if (!a || (inet_pton(AF_INET, a, b) != 1 && inet_pton(AF_INET6, a, b) != 1)) {
+      conf_error(ctx, "options", "bind-address: '%.64s' is not an IPv4 or IPv6 address", a ? a : "");
+      return -1;
+    }
+  }
+  return 0;
+}
+
+/* `listen-on [port n] [proxy x] [tls x] [http x] { list };`  The key has been read.  BIND 9.20 (lib/isccfg/namedconf.c, listenon_tuple_fields)
+ * takes the four keywords in any order; `port` is an integer.  proxy (PROXYv2), tls (DoT) and http (DoH) need listeners this server does not
+ * have: refusing the statement is safer than listening in plain DNS where the operator asked for an encrypted or proxied listener. */
+static int parse_listen_statement(token_ctx_t *ctx, server_config_t *cfg, bool v6) {
+  const char *what = v6 ? "options listen-on-v6" : "options listen-on";
+  char db[96];
+  char loc[300];
+  ctx_location(ctx, loc, sizeof(loc));
+  int port = 0;
+  conf_token_t tok;
+  for (;;) {
+    tok = get_next_token(ctx);
+    if (tok.type == TOKEN_LBRACE) {
+      free_token(&tok);
+      break;
+    }
+    if (tok.type != TOKEN_STRING || !tok.value || tok.is_quoted) {
+      conf_error(ctx, what, "expected 'port' or '{' but found %s", tok_desc(&tok, db, sizeof(db)));
+      free_token(&tok);
+      return -1;
+    }
+    if (strcmp(tok.value, "port") == 0) {
+      free_token(&tok);
+      if (port) {
+        conf_error(ctx, what, "'port' is given twice");
+        return -1;
+      }
+      tok = get_next_token(ctx);
+      char *end = NULL;
+      long p = (tok.type == TOKEN_STRING && tok.value && tok.value[0]) ? strtol(tok.value, &end, 10) : 0;
+      if (tok.type != TOKEN_STRING || !tok.value || !end || *end != '\0' || p < 1 || p > 65535) {
+        conf_error(ctx, what, "port: invalid port '%.64s' (expected 1-65535)", tok.type == TOKEN_STRING && tok.value ? tok.value : "");
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+      port = (int)p;
+    } else if (strcmp(tok.value, "tls") == 0 || strcmp(tok.value, "http") == 0 || strcmp(tok.value, "proxy") == 0) {
+      conf_error(ctx, what, "'%s' is not supported: this server has no DNS-over-TLS, DNS-over-HTTPS or PROXYv2 listener", tok.value);
+      free_token(&tok);
+      return -1;
+    } else {
+      conf_error(ctx, what, "expected 'port' or '{' but found '%.64s'", tok.value);
+      free_token(&tok);
+      return -1;
+    }
+  }
+  aml_t *l = parse_aml_body(ctx, what, 0);
+  if (!l) return -1;
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) {
+    conf_error(ctx, what, "expected ';' after '}' but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    aml_unref(l);
+    return -1;
+  }
+  free_token(&tok);
+  if (cfg->listen_stmt_count >= LISTEN_STMT_MAX) {
+    conf_error(ctx, what, "more than %d listen-on / listen-on-v6 statements", LISTEN_STMT_MAX);
+    aml_unref(l);
+    return -1;
+  }
+  listen_stmt_t *ns = realloc(cfg->listen_stmts, (size_t)(cfg->listen_stmt_count + 1) * sizeof(*ns));
+  if (!ns) {
+    ctx->error_occurred = true;
+    aml_unref(l);
+    return -1;
+  }
+  cfg->listen_stmts = ns;
+  listen_stmt_t *s = &ns[cfg->listen_stmt_count++];
+  memset(s, 0, sizeof(*s));
+  s->v6 = v6;
+  s->port = port;
+  s->list = l;
+  snprintf(s->loc, sizeof(s->loc), "%s", loc);
+  return 0;
+}
+
+/* The lists of listen-on and blackhole are resolved like the others; none may name a TSIG key (nothing is signed at that point). */
+static int listen_lists_resolve(token_ctx_t *ctx, server_config_t *cfg) {
+  for (int i = 0; i < cfg->listen_stmt_count; i++) {
+    listen_stmt_t *s = &cfg->listen_stmts[i];
+    const char *what = s->v6 ? "options listen-on-v6" : "options listen-on";
+    if (aml_resolve(ctx, cfg, s->list, what, false, 0) != 0) return -1;
+    if (s->list->has_key) {
+      aml_report(ctx, s->loc, what, "'key' elements cannot be used in an address list that selects interfaces");
+      return -1;
+    }
+  }
+  if (cfg->blackhole) {
+    if (aml_resolve(ctx, cfg, cfg->blackhole, "options blackhole", false, 0) != 0) return -1;
+    if (cfg->blackhole->has_key) {
+      aml_report(ctx, NULL, "options blackhole", "'key' elements cannot be used here (a request is dropped before it is read)");
+      return -1;
+    }
+  }
+  return 0;
+}
+
+/* `listen-on { any; }`: BIND (lib/ns/interfacemgr.c, listenon_is_ip6_any()) binds one wildcard socket only when the whole list is a plain
+ * `any`; any other list is matched against each interface address.  A named acl that holds just `any` counts (dns_acl_isany()). */
+static bool aml_is_plain_any(const aml_t *l, int depth) {
+  if (!l || depth > AML_MAX_DEPTH || l->count != 1) return false;
+  const aml_elem_t *e = &l->elems[0];
+  if (e->neg) return false;
+  if (e->kind == AML_E_ANY) return true;
+  return e->kind == AML_E_LIST && aml_is_plain_any(e->u.list, depth + 1);
+}
+
+typedef struct {
+  listen_addr_t a;
+  const char *loc;   /* where it came from (a listen-on statement, bind-address, the default) */
+} listen_cand_t;
+
+static const char *const k_listen_default_loc = "the default";
+
+/* Adds one address.  The same address and port again is the same socket (the union of two statements); the same address with another port
+ * is an error (decided for this server: one address, one port).  0, or -1 after reporting. */
+static int listen_cand_add(token_ctx_t *ctx, listen_cand_t *v, int *n, uint8_t family, const uint8_t *addr, int port, const char *loc,
+                           const char *what) {
+  size_t alen = family == AF_INET ? 4 : 16;
+  for (int i = 0; i < *n; i++) {
+    if (v[i].a.family != family || memcmp(v[i].a.addr, addr, alen) != 0) continue;
+    if (v[i].a.port == port) return 0;
+    aml_report(ctx, loc, what, "address %s is listened on at port %d (%s) and at port %d: one address can have only one port", v[i].a.text,
+               (int)v[i].a.port, v[i].loc, port);
+    return -1;
+  }
+  if (*n >= KARIDNS_LISTEN_MAX) {
+    aml_report(ctx, loc, what, "more than %d addresses to listen on (the limit of this server); list fewer addresses or use 'any'", KARIDNS_LISTEN_MAX);
+    return -1;
+  }
+  listen_cand_t *c = &v[(*n)++];
+  memset(c, 0, sizeof(*c));
+  c->a.family = family;
+  memcpy(c->a.addr, addr, alen);
+  c->a.port = (uint16_t)port;
+  c->a.wildcard = true;
+  for (size_t k = 0; k < alen; k++)
+    if (addr[k]) c->a.wildcard = false;
+  inet_ntop(family, addr, c->a.text, sizeof(c->a.text));
+  c->loc = loc;
+  return 0;
+}
+
+/* A literal address in the list that cannot be listened on is the operator's mistake worth a line: an IPv6 address in listen-on is
+ * ignored by BIND ("IPv6 addresses are ignored, with a logged warning", ARM), and BIND listens on an address only when an interface
+ * has it (do_scan() matches the list against the interface addresses). */
+static void listen_warn_elements(const listen_stmt_t *s, const aml_iface_t *ifs, size_t nif) {
+  const char *what = s->v6 ? "options listen-on-v6" : "options listen-on";
+  int fam = s->v6 ? AF_INET6 : AF_INET;
+  for (int i = 0; i < s->list->count; i++) {
+    const aml_elem_t *e = &s->list->elems[i];
+    if (e->kind != AML_E_NET || e->neg) continue;
+    if (e->u.net.family != fam) {
+      conf_warn_loc(s->loc, what, "'%.64s' is %s: it is ignored", e->text, s->v6 ? "an IPv4 address in listen-on-v6" : "an IPv6 address in listen-on");
+      continue;
+    }
+    bool seen = false;
+    for (size_t k = 0; k < nif && !seen; k++)
+      if (ifs[k].family == fam && cidr_entry_match(&e->u.net, fam, ifs[k].addr)) seen = true;
+    if (!seen)
+      conf_warn_loc(s->loc, what, "'%.64s' matches no address of an interface of this host: nothing is listened on for it", e->text);
+  }
+}
+
+/* Computes server_config_t.listen (BIND 9.20 ARM "listen-on", lib/ns/interfacemgr.c do_scan()):
+ *  - a listen-on / listen-on-v6 statement selects the IPv4 / IPv6 interface addresses (of the snapshot aml_init_interfaces() took at start-up)
+ *    that its list allows, at its own port or else options { port }; a plain `any` selects the wildcard address instead (BIND does that for
+ *    IPv6; for IPv4 it binds each interface address, which would leave the addresses added later unserved, so the wildcard is used here too);
+ *  - bind-address (this server's own statement) adds its addresses at options { port };
+ *  - the result is the union, a duplicate collapses, one address with two ports is an error, and a specific address that a wildcard of the
+ *    same family and port already covers is dropped (binding both would need SO_REUSEADDR games for nothing);
+ *  - a family that nothing mentions listens on its wildcard address when some listen-on / listen-on-v6 statement exists (BIND's default of
+ *    listen-on-v6 is "all IPv6 interfaces"); with only bind-address the list is exactly bind-address (as before); with neither, 0.0.0.0 and ::.
+ * -p (config_set_port_override) replaces every port.  IPv6 link-local addresses of the interfaces are not selected: the snapshot has no scope. */
+static int config_build_listen(token_ctx_t *ctx, server_config_t *cfg) {
+  listen_cand_t v[KARIDNS_LISTEN_MAX];
+  int n = 0;
+  const aml_iface_t *ifs = NULL;
+  size_t nif = aml_get_interfaces(&ifs);
+  int defport = g_port_override ? g_port_override : (cfg->port > 0 ? cfg->port : 53);
+  bool explicit_fam[2] = { false, false };   /* [0] IPv4, [1] IPv6 */
+  static const uint8_t zero[16];
+
+  for (int i = 0; i < cfg->listen_stmt_count; i++) {
+    const listen_stmt_t *s = &cfg->listen_stmts[i];
+    const char *what = s->v6 ? "options listen-on-v6" : "options listen-on";
+    uint8_t fam = s->v6 ? AF_INET6 : AF_INET;
+    int port = g_port_override ? g_port_override : (s->port ? s->port : defport);
+    explicit_fam[s->v6 ? 1 : 0] = true;
+    listen_warn_elements(s, ifs, nif);
+    if (aml_is_plain_any(s->list, 0)) {
+      if (listen_cand_add(ctx, v, &n, fam, zero, port, s->loc, what) != 0) return -1;
+      continue;
+    }
+    for (size_t k = 0; k < nif; k++) {
+      if (ifs[k].family != fam) continue;
+      if (fam == AF_INET6 && ifs[k].addr[0] == 0xfe && (ifs[k].addr[1] & 0xc0) == 0x80) continue;   /* link-local: no scope in the snapshot */
+      aml_subject_t subj = { .family = fam, .addr = ifs[k].addr, .key = NULL };
+      if (!aml_allows(s->list, &subj)) continue;
+      if (listen_cand_add(ctx, v, &n, fam, ifs[k].addr, port, s->loc, what) != 0) return -1;
+    }
+  }
+  for (int i = 0; i < cfg->bind_address_count; i++) {
+    uint8_t b[16];
+    uint8_t fam;
+    const char *bloc = cfg->bind_address_loc[0] ? cfg->bind_address_loc : "bind-address";
+    if (inet_pton(AF_INET, cfg->bind_addresses[i], b) == 1) {
+      fam = AF_INET;
+    } else if (inet_pton(AF_INET6, cfg->bind_addresses[i], b) == 1) {
+      fam = AF_INET6;
+    } else {
+      aml_report(ctx, bloc, "options bind-address", "'%.64s' is not an IPv4 or IPv6 address", cfg->bind_addresses[i]);
+      return -1;
+    }
+    explicit_fam[fam == AF_INET6 ? 1 : 0] = true;
+    if (listen_cand_add(ctx, v, &n, fam, b, defport, bloc, "options bind-address") != 0) return -1;
+  }
+  if (cfg->listen_stmt_count > 0 || cfg->bind_address_count == 0) {
+    for (int f = 0; f < 2; f++)
+      if (!explicit_fam[f] && listen_cand_add(ctx, v, &n, f ? AF_INET6 : AF_INET, zero, defport, k_listen_default_loc, "options listen-on") != 0)
+        return -1;
+  }
+  /* a wildcard covers the specific addresses of its family and port */
+  int m = 0;
+  for (int i = 0; i < n; i++) {
+    bool covered = false;
+    if (!v[i].a.wildcard)
+      for (int j = 0; j < n && !covered; j++)
+        covered = v[j].a.wildcard && v[j].a.family == v[i].a.family && v[j].a.port == v[i].a.port;
+    if (!covered) v[m++] = v[i];
+  }
+  n = m;
+  free(cfg->listen);
+  cfg->listen = NULL;
+  cfg->listen_count = 0;
+  if (n > 0) {
+    cfg->listen = calloc((size_t)n, sizeof(listen_addr_t));
+    if (!cfg->listen) {
+      ctx->error_occurred = true;
+      return -1;
+    }
+    for (int i = 0; i < n; i++) cfg->listen[i] = v[i].a;
+    cfg->listen_count = n;
+  } else {
+    char loc[300];
+    ctx_location(ctx, loc, sizeof(loc));
+    conf_warn_loc(loc, "options", "listen-on, listen-on-v6 and bind-address select no address: the server would listen nowhere");
+  }
+  if (g_port_override) cfg->port = g_port_override;
+  return 0;
 }
 
 /* The flat string list parse_acl_list() has always built from the same text: a nested { } list is spliced in (a negated one with every
@@ -4278,11 +4579,16 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             config->pid_file = val;
           }
         } else if (strcmp(key, "bind-address") == 0) {
+          int bind_first_new = config->bind_address_count;
           tok = get_next_token(ctx);
           if (tok.type == TOKEN_LBRACE) {
             free_token(&tok);
             if (parse_string_list_inner(ctx, &config->bind_addresses,
                                   &config->bind_address_count) != 0) {
+              free(key);
+              return -1;
+            }
+            if (bind_address_check(ctx, config, bind_first_new) != 0) {
               free(key);
               return -1;
             }
@@ -4299,11 +4605,28 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             }
             free_token(&tok);
             APPEND_STR(config->bind_addresses, config->bind_address_count, dup_addr);
+            if (bind_address_check(ctx, config, bind_first_new) != 0) {
+              free(key);
+              return -1;
+            }
           } else {
             free(key);
             free_token(&tok);
             return -1;
           }
+        } else if (strcmp(key, "listen-on") == 0 || strcmp(key, "listen-on-v6") == 0) {
+          if (parse_listen_statement(ctx, config, key[9] == '-') != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "blackhole") == 0) {
+          aml_t *bh = parse_aml_statement(ctx, "options blackhole");
+          if (!bh) {
+            free(key);
+            return -1;
+          }
+          aml_unref(config->blackhole);   /* a second blackhole statement replaces the first (like the other options) */
+          config->blackhole = bh;
         } else if (strcmp(key, "rate-limit") == 0) {
           if (parse_rate_limit_config(ctx, &config->rrl) != 0) {
             free(key);
@@ -5640,6 +5963,9 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
 
   /* BIND address match lists: names, keys and flags (before the flat lists below: its messages carry file:line) */
   if (resolve_all_acl_lists(ctx, config) != 0) return -1;
+  /* listen-on, listen-on-v6, bind-address: the addresses to listen on (interface snapshot of start-up); blackhole's list */
+  if (listen_lists_resolve(ctx, config) != 0) return -1;
+  if (config_build_listen(ctx, config) != 0) return -1;
 
   /* D-22: 名前付き ACL の参照を展開し、アドレスでも ACL 名でもない要素を設定エラーにする。
    */

@@ -420,10 +420,36 @@ typedef struct acl_def {
   struct acl_def *next;
 } acl_def_t;
 
+/* One address the server listens on (UDP and TCP), the result of listen-on / listen-on-v6 / bind-address / the defaults (see
+ * config_build_listen()).  Computed once when the configuration is read; the sockets are opened from this list only. */
+#define KARIDNS_LISTEN_MAX 64   /* == MAX_BIND_ADDRS (dns_server_internal.h): the UDP sockets of the Frontend, notify-source pre-binds included */
+typedef struct {
+  uint8_t family;      /* AF_INET / AF_INET6 */
+  bool wildcard;       /* 0.0.0.0 / :: */
+  uint16_t port;
+  uint8_t addr[16];    /* network byte order */
+  char text[48];       /* the address as text (messages, bind()) */
+} listen_addr_t;
+
+/* One listen-on / listen-on-v6 statement as written (kept until the configuration is freed): the list is matched against the interface
+ * addresses of the start-up snapshot when the parse ends. */
+typedef struct {
+  bool v6;
+  int port;            /* 0 = not written: options { port } */
+  aml_t *list;
+  char loc[240];       /* "file:line" of the statement */
+} listen_stmt_t;
+
 typedef struct server_config_s {
   int port;
   char **bind_addresses;
   int bind_address_count;
+  char bind_address_loc[240];   /* "file:line" of the last bind-address statement ("" = none) */
+  listen_stmt_t *listen_stmts;  /* listen-on / listen-on-v6, in the order written */
+  int listen_stmt_count;
+  listen_addr_t *listen;        /* the addresses to listen on, computed by the parse (config_build_listen); NULL / 0 = none */
+  int listen_count;
+  aml_t *blackhole;             /* options { blackhole }: requests from a matching address are dropped; NULL = not written (BIND default none) */
   char *user;
   char *group;
   char *pid_file;
@@ -576,6 +602,9 @@ typedef struct {
  * longer than 1023 bytes is a configuration error.  Not set (karicheck, tests): those paths stay as written.  UNIX socket paths are never
  * changed: the server chdir()s to options { directory } at start-up and daemonize() keeps the working directory. */
 void config_set_base_cwd(const char *cwd);
+/* The port of the command line (-p): when set (> 0) it replaces options { port } and the port of every listen-on / listen-on-v6 statement,
+ * as -p replaced the only port the configuration had before listen-on existed.  Given before the first parse; 0 = none (karicheck, tests). */
+void config_set_port_override(int port);
 void config_pin_directory(const char *dir);
 void config_unpin_directory(void);
 int parse_named_conf(const char *config_str, server_config_t *config);

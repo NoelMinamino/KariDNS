@@ -78,6 +78,7 @@
 
 
 #define MAX_BIND_ADDRS 64
+_Static_assert(KARIDNS_LISTEN_MAX == MAX_BIND_ADDRS, "the parser's limit on listen addresses is the number of Frontend sockets");
 
 
 config_rcu_t g_config_db;
@@ -214,6 +215,24 @@ const char *bind_error_hint(int err, int port) {
   if (err == EADDRNOTAVAIL)
     return " (address is not configured on this host)";
   return "";
+}
+
+/* The socket address of one entry of server_config_t.listen (config_build_listen()).  The UDP sockets of the Frontend, the TCP sockets
+ * of the workers and the start-up check all open the addresses of that list and nothing else. */
+static socklen_t listen_addr_sockaddr(const listen_addr_t *la, struct sockaddr_storage *ss) {
+  memset(ss, 0, sizeof(*ss));
+  if (la->family == AF_INET) {
+    struct sockaddr_in *a4 = (struct sockaddr_in *)ss;
+    a4->sin_family = AF_INET;
+    memcpy(&a4->sin_addr, la->addr, 4);
+    a4->sin_port = htons(la->port);
+    return sizeof(*a4);
+  }
+  struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)ss;
+  a6->sin6_family = AF_INET6;
+  memcpy(&a6->sin6_addr, la->addr, 16);
+  a6->sin6_port = htons(la->port);
+  return sizeof(*a6);
 }
 
 // ワーカースレッドのTCPリスニングソケットの bind() 失敗数。
@@ -1747,6 +1766,22 @@ STATIC_TEST void apply_zone_tcp_opts(int fd, tcp_stream_ctx_t *c, const zone_con
   apply_zone_sockbuf(fd, SO_SNDBUF, zcfg ? zext(zcfg)->zone_tcp_sndbuf : 0, &c->applied_sndbuf, &c->orig_sndbuf);
 }
 
+/* Is the peer sa (sockaddr_in / sockaddr_in6) matched by options { blackhole }?  Reads the list from the current configuration snapshot
+ * (a reload that adds or removes it applies at once); the list is a plain aml_t, so there is no allocation. */
+static bool blackhole_drops(worker_ctx_t *ctx, const void *sa) {
+  bool drop = false;
+  rcu_reader_enter(ctx);
+  server_config_t *cfg = acquire_config_snapshot();
+  if (cfg && cfg->blackhole) {
+    aml_subject_t subj;
+    aml_subject_from_sockaddr(&subj, sa, NULL);
+    drop = aml_allows(cfg->blackhole, &subj);
+  }
+  release_config_snapshot(cfg);
+  rcu_reader_exit(ctx);
+  return drop;
+}
+
 void *worker_thread_func(void *arg) {
   worker_ctx_t *ctx = (worker_ctx_t *)arg;
   uint8_t *tcp_res_buf = NULL;
@@ -1773,95 +1808,36 @@ void *worker_thread_func(void *arg) {
   int opt = 1;
   rcu_reader_enter(ctx);
   server_config_t *active_cfg = acquire_config_snapshot();
-  int port = active_cfg && active_cfg->port > 0 ? active_cfg->port : DNS_PORT;
-  int bind_count = active_cfg ? active_cfg->bind_address_count : 0;
+  int bind_count = active_cfg ? active_cfg->listen_count : 0;
 
-  for (int i = 0; i < (bind_count > 0 ? bind_count : 1); i++) {
-    struct sockaddr_in addr4;
-    struct sockaddr_in6 addr6;
-    bool is_v4 = false;
-    bool is_v6 = false;
-    memset(&addr4, 0, sizeof(addr4));
-    memset(&addr6, 0, sizeof(addr6));
-    if (bind_count == 0) {
-      addr4.sin_family = AF_INET;
-      addr4.sin_addr.s_addr = INADDR_ANY;
-      addr4.sin_port = htons(port);
-      addr6.sin6_family = AF_INET6;
-      addr6.sin6_addr = in6addr_any;
-      addr6.sin6_port = htons(port);
-      is_v4 = true;
-      is_v6 = true;
+  for (int i = 0; i < bind_count; i++) {
+    const listen_addr_t *la = &active_cfg->listen[i];
+    struct sockaddr_storage addr;
+    socklen_t addr_len = listen_addr_sockaddr(la, &addr);
+    int tcp_fd = socket(la->family, SOCK_STREAM, 0);
+    if (tcp_fd < 0) continue;
+    int flags = fcntl(tcp_fd, F_GETFL, 0);
+    fcntl(tcp_fd, F_SETFL, flags | O_NONBLOCK);
+    setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (la->family == AF_INET6) setsockopt(tcp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT_LB
+    setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt, sizeof(opt));
+#else
+    setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
+    apply_tcp_listen_opts(tcp_fd, active_cfg, ctx->thread_id == 0);
+    if (bind(tcp_fd, (struct sockaddr *)&addr, addr_len) == 0) {
+      listen(tcp_fd, 1024);
+      limit_server_socket_rights(tcp_fd, true);
+      struct kevent ev;
+      EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD, 0, 0, (void *)2);
+      kevent(kq, &ev, 1, NULL, 0, NULL);
     } else {
-      if (inet_pton(AF_INET, active_cfg->bind_addresses[i], &addr4.sin_addr) ==
-          1) {
-        addr4.sin_family = AF_INET;
-        addr4.sin_port = htons(port);
-        is_v4 = true;
-      } else if (inet_pton(AF_INET6, active_cfg->bind_addresses[i],
-                           &addr6.sin6_addr) == 1) {
-        addr6.sin6_family = AF_INET6;
-        addr6.sin6_port = htons(port);
-        is_v6 = true;
-      }
-    }
-
-    if (is_v4) {
-      int tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
-      if (tcp_fd >= 0) {
-        int flags = fcntl(tcp_fd, F_GETFL, 0);
-        fcntl(tcp_fd, F_SETFL, flags | O_NONBLOCK);
-        setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-#ifdef SO_REUSEPORT_LB
-        setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt, sizeof(opt));
-#else
-        setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-#endif
-        apply_tcp_listen_opts(tcp_fd, active_cfg, ctx->thread_id == 0);
-        if (bind(tcp_fd, (struct sockaddr *)&addr4, sizeof(addr4)) == 0) {
-          listen(tcp_fd, 1024);
-          limit_server_socket_rights(tcp_fd, true);
-          struct kevent ev;
-          EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD, 0, 0, (void *)2);
-          kevent(kq, &ev, 1, NULL, 0, NULL);
-        } else {
-          int bind_errno = errno;
-          syslog(LOG_CRIT, "[Backend] Failed to bind TCPv4 socket to %s:%d: %s%s",
-                 (bind_count > 0 ? active_cfg->bind_addresses[i] : "0.0.0.0"), port,
-                 strerror(bind_errno), bind_error_hint(bind_errno, port));
-          atomic_fetch_add(&g_tcp_bind_failures, 1);
-          close(tcp_fd);
-        }
-      }
-    }
-    if (is_v6) {
-      int tcp_fd = socket(AF_INET6, SOCK_STREAM, 0);
-      if (tcp_fd >= 0) {
-        int flags = fcntl(tcp_fd, F_GETFL, 0);
-        fcntl(tcp_fd, F_SETFL, flags | O_NONBLOCK);
-        setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        setsockopt(tcp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
-#ifdef SO_REUSEPORT_LB
-        setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt, sizeof(opt));
-#else
-        setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-#endif
-        apply_tcp_listen_opts(tcp_fd, active_cfg, ctx->thread_id == 0);
-        if (bind(tcp_fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0) {
-          listen(tcp_fd, 1024);
-          limit_server_socket_rights(tcp_fd, true);
-          struct kevent ev;
-          EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD, 0, 0, (void *)2);
-          kevent(kq, &ev, 1, NULL, 0, NULL);
-        } else {
-          int bind_errno = errno;
-          syslog(LOG_CRIT, "[Backend] Failed to bind TCPv6 socket to %s:%d: %s%s",
-                 (bind_count > 0 ? active_cfg->bind_addresses[i] : "::"), port,
-                 strerror(bind_errno), bind_error_hint(bind_errno, port));
-          atomic_fetch_add(&g_tcp_bind_failures, 1);
-          close(tcp_fd);
-        }
-      }
+      int bind_errno = errno;
+      syslog(LOG_CRIT, "[Backend] Failed to bind TCP%s socket to %s:%d: %s%s", la->family == AF_INET ? "v4" : "v6", la->text, (int)la->port,
+             strerror(bind_errno), bind_error_hint(bind_errno, la->port));
+      atomic_fetch_add(&g_tcp_bind_failures, 1);
+      close(tcp_fd);
     }
   }
   release_config_snapshot(active_cfg);
@@ -1932,6 +1908,7 @@ worker_startup_success:;
     bool qlog_enabled = (active && active->logging.queries_channel != NULL);
     uint32_t eff_max_qps = qlog_enabled ? get_effective_query_log_max_qps(active) : 0;
     bool rlog_enabled = response_log_enabled(active);
+    bool blackhole_on = (active && active->blackhole);   /* options { blackhole }: read from the snapshot per packet, below */
     /* D-06 / RFC 7766 §6.2.3: 最初のメッセージまでの待ち時間と、メッセージ間の待ち時間 */
     uint32_t tcp_initial_ms = (active && active->tcp_initial_timeout > 0) ? active->tcp_initial_timeout : 10000;
     uint32_t tcp_idle_ms = (active && active->tcp_idle_timeout > 0) ? active->tcp_idle_timeout : 10000;
@@ -1981,6 +1958,11 @@ worker_startup_success:;
             uint8_t *req_buf = batch->rx_buffers[p] + sizeof(udp_ipc_t);
             ssize_t payload_received = ipc_msg->payload_len;
             ipc_sockaddr_t *client_addr = &ipc_msg->client_addr;
+
+            /* options { blackhole } (BIND 9.20 lib/ns/client.c: "dropped request: blackholed peer"; the list's first match for the
+             * source address is not negated): dropped before anything else looks at the packet, the response cache and the logs included,
+             * and a NOTIFY answer from such an address is not passed on either.  No allocation: the subject lives on the stack. */
+            if (__builtin_expect(blackhole_on, 0) && blackhole_drops(ctx, client_addr)) continue;
 
             // クエリパケットの検証: QRビットが0(クエリ)であることを期待
             uint8_t flags = req_buf[2];
@@ -2227,6 +2209,13 @@ worker_startup_success:;
             break;
           }
           accept_count++;
+
+          /* options { blackhole }: BIND refuses the connection of a blackholed peer (lib/ns/client.c, ns_client_checkaccept()); closed here
+           * before a context is taken, so it is not read, answered or counted */
+          if (__builtin_expect(blackhole_on, 0) && blackhole_drops(ctx, &client_addr)) {
+            close(client_fd);
+            continue;
+          }
 
           /* 上限は開いている TCP 接続の数で数える (AXFR スレッドや非同期 I/O スレッドへ渡した
            * 接続はプールのコンテキストを返しているが、閉じるまで g_tcp_clients に数えられる) */
@@ -2750,6 +2739,13 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
   for (int i = 0; !addrs_differ && i < n->bind_address_count; i++)
     addrs_differ = str_differs(o->bind_addresses[i], n->bind_addresses[i]);
   if (addrs_differ) append_list_item(buf, sz, "bind-address");
+  /* listen-on / listen-on-v6 (and the union with bind-address): the sockets are opened once, so a different set of addresses or ports
+   * is a restart.  blackhole is a plain list the workers read from the snapshot, so it is applied by the reload. */
+  bool listen_differs = o->listen_count != n->listen_count;
+  for (int i = 0; !listen_differs && i < n->listen_count; i++)
+    listen_differs = o->listen[i].family != n->listen[i].family || o->listen[i].port != n->listen[i].port ||
+                     memcmp(o->listen[i].addr, n->listen[i].addr, 16) != 0;
+  if (listen_differs && !strstr(buf, "port") && !strstr(buf, "bind-address")) append_list_item(buf, sz, "listen-on");
   if (str_differs(o->user, n->user)) append_list_item(buf, sz, "user");
   if (str_differs(o->group, n->group)) append_list_item(buf, sz, "group");
   if (str_differs(o->pid_file, n->pid_file)) append_list_item(buf, sz, "pid-file");
@@ -3904,118 +3900,57 @@ void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
 int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS]) {
   int num_fds = 0;
   int port = cfg->port > 0 ? cfg->port : DNS_PORT;
-  int bind_count = cfg->bind_address_count;
   int opt = 1;
   int rcvbuf_size = cfg->udp_recvbuf_size > 0 ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
   int sndbuf_size = cfg->udp_sndbuf_size > 0 ? cfg->udp_sndbuf_size : 4 * 1024 * 1024;
 
-  for (int i = 0; i < (bind_count > 0 ? bind_count : 1); i++) {
-    struct sockaddr_in addr4;
-    struct sockaddr_in6 addr6;
-    bool is_v4 = false;
-    bool is_v6 = false;
-    bool is_wildcard = false;
-    memset(&addr4, 0, sizeof(addr4));
-    memset(&addr6, 0, sizeof(addr6));
-    if (bind_count == 0) {
-      addr4.sin_family = AF_INET;
-      addr4.sin_addr.s_addr = INADDR_ANY;
-      addr4.sin_port = htons(port);
-      addr6.sin6_family = AF_INET6;
-      addr6.sin6_addr = in6addr_any;
-      addr6.sin6_port = htons(port);
-      is_v4 = true;
-      is_v6 = true;
-      is_wildcard = true;
-    } else {
-      if (inet_pton(AF_INET, cfg->bind_addresses[i], &addr4.sin_addr) == 1) {
-        addr4.sin_family = AF_INET;
-        addr4.sin_port = htons(port);
-        is_v4 = true;
-        if (addr4.sin_addr.s_addr == INADDR_ANY) is_wildcard = true;
-      } else if (inet_pton(AF_INET6, cfg->bind_addresses[i],
-                           &addr6.sin6_addr) == 1) {
-        addr6.sin6_family = AF_INET6;
-        addr6.sin6_port = htons(port);
-        is_v6 = true;
-        if (IN6_IS_ADDR_UNSPECIFIED(&addr6.sin6_addr)) is_wildcard = true;
-      }
-    }
-
-    if (is_v4 && num_fds < MAX_BIND_ADDRS) {
-      int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-      if (udp_fd >= 0) {
-        setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
-        fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
+  for (int i = 0; i < cfg->listen_count; i++) {
+    const listen_addr_t *la = &cfg->listen[i];
+    struct sockaddr_storage addr;
+    socklen_t addr_len = listen_addr_sockaddr(la, &addr);
+    bool is_wildcard = la->wildcard;
+    if (num_fds >= MAX_BIND_ADDRS) break;
+    int udp_fd = socket(la->family, SOCK_DGRAM, 0);
+    if (udp_fd < 0) continue;
+    setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
+    fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
+    if (la->family == AF_INET6) setsockopt(udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
 #ifdef SO_REUSEPORT_LB
-        int opt_lb = 1;
-        if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt_lb, sizeof(opt_lb)) < 0) {
-          int opt_reuse = 1;
-          setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
-        }
+    int opt_lb = 1;
+    if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt_lb, sizeof(opt_lb)) < 0) {
+      int opt_reuse = 1;
+      setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+    }
 #else
-        int opt_reuse = 1;
-        setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+    int opt_reuse = 1;
+    setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
 #endif
-        int opt_dst = 1;
+    if (la->family == AF_INET) {
+      int opt_dst = 1;
 #ifdef IP_RECVDSTADDR
-        setsockopt(udp_fd, IPPROTO_IP, IP_RECVDSTADDR, &opt_dst, sizeof(opt_dst));
+      setsockopt(udp_fd, IPPROTO_IP, IP_RECVDSTADDR, &opt_dst, sizeof(opt_dst));
 #elif defined(IP_PKTINFO)
-        setsockopt(udp_fd, IPPROTO_IP, IP_PKTINFO, &opt_dst, sizeof(opt_dst));
+      setsockopt(udp_fd, IPPROTO_IP, IP_PKTINFO, &opt_dst, sizeof(opt_dst));
 #endif
-        if (bind(udp_fd, (struct sockaddr *)&addr4, sizeof(addr4)) == 0) {
-          out_is_wildcard[num_fds] = is_wildcard;
-          out_fds[num_fds++] = udp_fd;
-        } else {
-          int bind_errno = errno;
-          syslog(LOG_CRIT, "[Frontend] Failed to bind UDPv4 socket to %s:%d: %s%s",
-                 (bind_count > 0 ? cfg->bind_addresses[i] : "0.0.0.0"), port,
-                 strerror(bind_errno), bind_error_hint(bind_errno, port));
-          fprintf(stderr, "[ERROR] [Frontend] Failed to bind UDPv4 socket to %s:%d: %s%s\n",
-                  (bind_count > 0 ? cfg->bind_addresses[i] : "0.0.0.0"), port,
-                  strerror(bind_errno), bind_error_hint(bind_errno, port));
-          close(udp_fd);
-          exit(EXIT_FAILURE);
-        }
-      }
-    }
-    if (is_v6 && num_fds < MAX_BIND_ADDRS) {
-      int udp_fd = socket(AF_INET6, SOCK_DGRAM, 0);
-      if (udp_fd >= 0) {
-        setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
-        fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
-        setsockopt(udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
-#ifdef SO_REUSEPORT_LB
-        int opt_lb = 1;
-        if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt_lb, sizeof(opt_lb)) < 0) {
-          int opt_reuse = 1;
-          setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
-        }
-#else
-        int opt_reuse = 1;
-        setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
-#endif
-        int opt_pktinfo = 1;
+    } else {
+      int opt_pktinfo = 1;
 #ifdef IPV6_RECVPKTINFO
-        setsockopt(udp_fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &opt_pktinfo, sizeof(opt_pktinfo));
+      setsockopt(udp_fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &opt_pktinfo, sizeof(opt_pktinfo));
 #elif defined(IPV6_PKTINFO)
-        setsockopt(udp_fd, IPPROTO_IPV6, IPV6_PKTINFO, &opt_pktinfo, sizeof(opt_pktinfo));
+      setsockopt(udp_fd, IPPROTO_IPV6, IPV6_PKTINFO, &opt_pktinfo, sizeof(opt_pktinfo));
 #endif
-        if (bind(udp_fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0) {
-          out_is_wildcard[num_fds] = is_wildcard;
-          out_fds[num_fds++] = udp_fd;
-        } else {
-          int bind_errno = errno;
-          syslog(LOG_CRIT, "[Frontend] Failed to bind UDPv6 socket to %s:%d: %s%s",
-                 (bind_count > 0 ? cfg->bind_addresses[i] : "::"), port,
-                 strerror(bind_errno), bind_error_hint(bind_errno, port));
-          fprintf(stderr, "[ERROR] [Frontend] Failed to bind UDPv6 socket to %s:%d: %s%s\n",
-                  (bind_count > 0 ? cfg->bind_addresses[i] : "::"), port,
-                  strerror(bind_errno), bind_error_hint(bind_errno, port));
-          close(udp_fd);
-          exit(EXIT_FAILURE);
-        }
-      }
+    }
+    if (bind(udp_fd, (struct sockaddr *)&addr, addr_len) == 0) {
+      out_is_wildcard[num_fds] = is_wildcard;
+      out_fds[num_fds++] = udp_fd;
+    } else {
+      int bind_errno = errno;
+      syslog(LOG_CRIT, "[Frontend] Failed to bind UDP%s socket to %s:%d: %s%s", la->family == AF_INET ? "v4" : "v6", la->text, (int)la->port,
+             strerror(bind_errno), bind_error_hint(bind_errno, la->port));
+      fprintf(stderr, "[ERROR] [Frontend] Failed to bind UDP%s socket to %s:%d: %s%s\n", la->family == AF_INET ? "v4" : "v6", la->text,
+              (int)la->port, strerror(bind_errno), bind_error_hint(bind_errno, la->port));
+      close(udp_fd);
+      exit(EXIT_FAILURE);
     }
   }
 
@@ -4961,75 +4896,46 @@ STATIC_TEST bool validate_program_zone_users(server_config_t *cfg) {
  * の実処理と揃え、結果が食い違わないようにする。確認後は即 close する
  * (実際の待受ソケットは Frontend / Backend 子プロセスが開く)。 */
 STATIC_TEST bool preflight_listen_ports(server_config_t *cfg) {
-  int port = cfg->port > 0 ? cfg->port : DNS_PORT;
-  int bind_count = cfg->bind_address_count;
   int opt = 1;
 
-  for (int i = 0; i < (bind_count > 0 ? bind_count : 1); i++) {
-    struct sockaddr_storage addrs[2];
-    socklen_t lens[2];
-    const char *names[2];
-    int n = 0;
-    memset(addrs, 0, sizeof(addrs));
-    if (bind_count == 0) {
-      struct sockaddr_in *a4 = (struct sockaddr_in *)&addrs[n];
-      a4->sin_family = AF_INET;
-      a4->sin_addr.s_addr = INADDR_ANY;
-      a4->sin_port = htons(port);
-      lens[n] = sizeof(*a4);
-      names[n++] = "0.0.0.0";
-      struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&addrs[n];
-      a6->sin6_family = AF_INET6;
-      a6->sin6_addr = in6addr_any;
-      a6->sin6_port = htons(port);
-      lens[n] = sizeof(*a6);
-      names[n++] = "::";
-    } else {
-      struct sockaddr_in *a4 = (struct sockaddr_in *)&addrs[0];
-      struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&addrs[0];
-      if (inet_pton(AF_INET, cfg->bind_addresses[i], &a4->sin_addr) == 1) {
-        a4->sin_family = AF_INET;
-        a4->sin_port = htons(port);
-        lens[n] = sizeof(*a4);
-        names[n++] = cfg->bind_addresses[i];
-      } else if (inet_pton(AF_INET6, cfg->bind_addresses[i], &a6->sin6_addr) == 1) {
-        a6->sin6_family = AF_INET6;
-        a6->sin6_port = htons(port);
-        lens[n] = sizeof(*a6);
-        names[n++] = cfg->bind_addresses[i];
-      }
-    }
-
-    for (int k = 0; k < n; k++) {
-      int family = addrs[k].ss_family;
-      for (int t = 0; t < 2; t++) {
-        int type = (t == 0) ? SOCK_DGRAM : SOCK_STREAM;
-        int fd = socket(family, type, 0);
-        if (fd < 0)
-          continue; /* 実処理と同じく、未対応のアドレスファミリは対象外 */
-        if (type == SOCK_STREAM)
-          setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        if (family == AF_INET6)
-          setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
+  for (int i = 0; i < cfg->listen_count; i++) {
+    const listen_addr_t *la = &cfg->listen[i];
+    struct sockaddr_storage addr;
+    socklen_t addr_len = listen_addr_sockaddr(la, &addr);
+    int family = la->family;
+    for (int t = 0; t < 2; t++) {
+      int type = (t == 0) ? SOCK_DGRAM : SOCK_STREAM;
+      int fd = socket(family, type, 0);
+      if (fd < 0)
+        continue; /* 実処理と同じく、未対応のアドレスファミリは対象外 */
+      if (type == SOCK_STREAM)
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+      if (family == AF_INET6)
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
 #ifdef SO_REUSEPORT_LB
-        if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt, sizeof(opt)) < 0)
-          setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-#else
+      if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt, sizeof(opt)) < 0)
         setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#else
+      setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 #endif
-        if (bind(fd, (struct sockaddr *)&addrs[k], lens[k]) != 0) {
-          int err = errno;
-          close(fd);
-          const char *proto = (type == SOCK_DGRAM) ? "UDP" : "TCP";
-          syslog(LOG_ERR, "[Startup] Refusing to start: cannot bind %s port %d on %s: %s%s",
-                 proto, port, names[k], strerror(err), bind_error_hint(err, port));
-          fprintf(stderr, "[ERROR] Refusing to start: cannot bind %s port %d on %s: %s%s\n",
-                  proto, port, names[k], strerror(err), bind_error_hint(err, port));
-          return false;
-        }
+      if (bind(fd, (struct sockaddr *)&addr, addr_len) != 0) {
+        int err = errno;
         close(fd);
+        const char *proto = (type == SOCK_DGRAM) ? "UDP" : "TCP";
+        syslog(LOG_ERR, "[Startup] Refusing to start: cannot bind %s port %d on %s: %s%s",
+               proto, (int)la->port, la->text, strerror(err), bind_error_hint(err, la->port));
+        fprintf(stderr, "[ERROR] Refusing to start: cannot bind %s port %d on %s: %s%s\n",
+                proto, (int)la->port, la->text, strerror(err), bind_error_hint(err, la->port));
+        return false;
       }
+      close(fd);
     }
+  }
+  /* a configuration that selects no address (listen-on { none; } and the like) would start a server that answers nobody */
+  if (cfg->listen_count == 0) {
+    syslog(LOG_ERR, "[Startup] Refusing to start: listen-on, listen-on-v6 and bind-address select no address to listen on");
+    fprintf(stderr, "[ERROR] Refusing to start: listen-on, listen-on-v6 and bind-address select no address to listen on\n");
+    return false;
   }
   return true;
 }
@@ -5143,6 +5049,7 @@ int main(int argc, char **argv) {
           int kind = parse_cli_port_arg(val, &port);
           if (kind == 1) {
               g_cli_port_override = port;
+              config_set_port_override(port);   /* the parse computes the listen addresses with it, and a reload keeps it */
           } else if (kind < 0) {
               fprintf(stderr, "[ERROR] Invalid port '%s' for -p (expected 1-65535)\n", val);
               return 2;
