@@ -10,8 +10,7 @@ on:
       - 'feature/**'
       - 'fix/**'
       - 'improve/**'
-    # "labeled": adding the "coverage" label to a PR starts the coverage job
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
   schedule:
     # nightly coverage gate (03:17 JST)
     - cron: '17 18 * * *'
@@ -292,8 +291,9 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Coverage quality gate (FreeBSD only: the server core needs kqueue/Capsicum).
-  # Too slow for every PR, so it runs on pushes to main, nightly, on demand, and
-  # for PRs labelled "coverage". `make coverage` builds in parallel, skips the
+  # Runs on every PR (in parallel with the other jobs), on pushes to main, nightly
+  # and on demand. It is also the only CI job that runs the whole integration
+  # suite on FreeBSD. `make coverage` builds in parallel, skips the
   # ASan/TSan-only suites (they run in build-and-test-freebsd) and runs the
   # server fault-injection sweep and the dag network sweep in parallel lanes.
   # The test suite itself runs `tests/run_all_suite.sh -j <ncpu>` (COV_JOBS in the
@@ -302,11 +302,6 @@ jobs:
   # ---------------------------------------------------------------------------
   coverage-freebsd:
     name: Coverage gate (FreeBSD 15.1)
-    if: >-
-      github.event_name == 'push' ||
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'coverage'))
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
