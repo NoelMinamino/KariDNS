@@ -17,6 +17,10 @@ int list_dir_via_dir_cache(const char *file_path, void (*cb)(const char *name, v
 int unlink_via_dir_cache(const char *path);
 void fd_drop_fchown(int fd);
 void dir_fd_cache_drop_fchown(void);
+/* Opens dirpath (before the sandbox) for reading and marks it as a root of a directory tree: afterwards a directory below it that nobody
+ * has opened yet can still be opened in capability mode, with openat() on this fd (O_RESOLVE_BENEATH, no ".."), instead of failing with
+ * ENOTCAPABLE.  The server registers options { directory } and the directory of each zone file this way.  false (errno set) = not openable. */
+bool dir_fd_cache_add_root(const char *dirpath);
 
 /* options { user / group } の解決結果。privileged=true は root 起動で
  * setgroups/setgid/setuid による降格が必要なことを示す。 */

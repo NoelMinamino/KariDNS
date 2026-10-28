@@ -427,6 +427,8 @@ typedef struct server_config_s {
   char *user;
   char *group;
   char *pid_file;
+  char *directory;      /* options { directory }: the base of relative paths (see config_pin_directory()); NULL = not set (paths are relative to the startup directory) */
+  bool directory_changed; /* a reload: the file now says another directory than the one the running server was started with (ignored until a restart) */
   view_config_t *views;
   zone_config_t *zones; /* パース中のトップレベル zone のリスト。パースが終わると既定の view に移るので、パース済みの設定では NULL。
                          * 手で組んだ設定 (テスト) では views を持たずにここへ並べる。全ビューのゾーンを引くには config_find_zone_any_view()、
@@ -546,6 +548,7 @@ typedef struct {
   size_t len;
   dev_t dev;            // 循環検出用
   ino_t ino;            // 循環検出用
+  bool via_rel;         // this file was reached by an include with a relative name (options { directory } check)
 } config_file_frame_t;
 
 typedef struct {
@@ -555,8 +558,26 @@ typedef struct {
   bool no_include;      // B7a: 'include' is an error (settings text of a DB zone is hostile and must not open files)
   bool restricted;      // B7a: zone statements are limited to what a DB zone may set (db_settings_parse)
   char restricted_err[160]; // restricted: why a statement was refused (printable, no input bytes beyond the statement name)
+  const char *directory; // options { directory } as far as it is known when an `include` is read: a relative include is resolved against it (NULL: against the including file)
+  int rel_includes;     // relative include statements resolved so far (a `directory` found later must not change their meaning)
+  int dir_rel_before;   // relative includes resolved before the last directory statement, not counting the ones that opened the files being read
+  bool dir_pinned;      // directory is the one the running server was started with (config_pin_directory): the file cannot change it
+  char *dir_written;    // the directory statement as the configuration writes it (owned by parse_named_conf_ext), NULL = none
 } token_ctx_t;
 
+/* options { directory } (BIND 9.20 ARM: "the working directory of the server"; every relative path is relative to it) is read once, when
+ * the server starts: the directory (and the sub-directories of the files below it) is opened then, before the Backend enters capability
+ * mode.  The server calls this with the directory of its first configuration (NULL = none was written); a later parse (reload) then
+ * resolves relative paths and `include` against that directory whatever the file now says, and reports a different one as
+ * server_config_t.directory_changed (it takes effect after a restart).  Without a pin (karicheck, tests) each parse uses what it reads. */
+/* The directory the server was started in (an absolute path).  Given to the parser before the first parse, it makes the relative paths that
+ * the server hands to something that does not share its working directory -- pid-file, and the database files and loader-path of
+ * options { database } (the loader is started from "/") -- absolute against it (or against options { directory }).  A path that becomes
+ * longer than 1023 bytes is a configuration error.  Not set (karicheck, tests): those paths stay as written.  UNIX socket paths are never
+ * changed: the server chdir()s to options { directory } at start-up and daemonize() keeps the working directory. */
+void config_set_base_cwd(const char *cwd);
+void config_pin_directory(const char *dir);
+void config_unpin_directory(void);
 int parse_named_conf(const char *config_str, server_config_t *config);
 int parse_named_conf_ext(const char *config_str, const char *initial_file_path, server_config_t *config);
 void config_lexer_cleanup(token_ctx_t *ctx);

@@ -41,9 +41,55 @@ static void fuzz_tinydns(const uint8_t *data, size_t size) {
     free(buf);
 }
 
+/* $INCLUDE: the path rules (include_path_normalize / include_path_within / resolve_include_path) run on whatever the input names; every
+ * file "exists" and holds one record, so the nesting, the circular check and the origin handling run too */
+static char *fuzz_load_file_cb(parse_context_t *ctx, const char *path, dev_t *out_dev, ino_t *out_ino) {
+    (void)ctx;
+    uint32_t h = 2166136261u;
+    for (const char *p = path; *p; p++) h = (h ^ (unsigned char)*p) * 16777619u;
+    if (out_dev) *out_dev = 1;
+    if (out_ino) *out_ino = (ino_t)(h % 5 + 1);       /* few inodes: the same one comes round again (circular include) */
+    return strdup("inc A 192.0.2.1\n");
+}
+
+static void fuzz_include(const uint8_t *data, size_t size) {
+    char *buf = malloc(size + 1);
+    if (!buf) return;
+    memcpy(buf, data, size);
+    buf[size] = '\0';
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err;
+    memset(&err, 0, sizeof(err));
+    char *visited_paths[16] = { 0 };
+    dev_t visited_devs[16] = { 0 };
+    ino_t visited_inos[16] = { 0 };
+    char *root_ttl = NULL, *root_ecs = NULL, *root_loc = NULL;
+    static const char *const bases[] = { "/z/a", ".", "/", "z/a" };
+    static const char *const dirs[] = { NULL, "/z/d", "/z/a/sub", "d", "/" };
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.default_origin = "fuzz.local.";
+    ctx.base_dir = bases[size % 4];
+    ctx.directory = dirs[(size / 4) % 5];
+    ctx.err_out = &err;
+    ctx.load_file_cb = fuzz_load_file_cb;
+    ctx.visited_paths = visited_paths;
+    ctx.visited_devs = visited_devs;
+    ctx.visited_inos = visited_inos;
+    ctx.visited_cap = 16;
+    ctx.shared_ttl_io = &root_ttl;
+    ctx.shared_ecs_tag_io = &root_ecs;
+    ctx.shared_loc_tag_io = &root_loc;
+    parse_zone_fast(buf, size, &arena, &ctx);
+    zone_arena_destroy(&arena);
+    free(buf);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size == 0) return 0;
     fuzz_tinydns(data, size);
+    fuzz_include(data, size);
 
     char *text_buf = malloc(size + 1);
     if (!text_buf) return 0;

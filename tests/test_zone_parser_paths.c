@@ -269,6 +269,7 @@ typedef struct {
     zone_arena_t arena;
     parse_error_t err;
     int rc;
+    size_t no_ttl;   /* records that got the built-in 3600 (parse_context_t.no_ttl_count) */
 } zt_t;
 
 static const char *SOA_HEAD =
@@ -293,14 +294,14 @@ static char *zt_load_file_cb(parse_context_t *ctx, const char *path, dev_t *out_
     return buf;
 }
 
-static void zt_load_in(zt_t *z, const char *text, const char *origin, const char *base_dir) {
+static void zt_load_dir(zt_t *z, const char *text, const char *origin, const char *base_dir, const char *directory) {
     memset(z, 0, sizeof(*z));
     zone_arena_init(&z->arena);
     char *visited_paths[16] = { 0 };
     dev_t visited_devs[16] = { 0 };
     ino_t visited_inos[16] = { 0 };
     char *root_ttl = NULL, *root_ecs = NULL, *root_loc = NULL;
-    parse_context_t ctx = { .base_dir = base_dir ? base_dir : ".", .default_origin = origin,
+    parse_context_t ctx = { .base_dir = base_dir ? base_dir : ".", .directory = directory, .default_origin = origin,
                             .is_standalone_mode = true, .err_out = &z->err,
                             .visited_paths = visited_paths, .visited_devs = visited_devs, .visited_inos = visited_inos,
                             .visited_count = 0, .visited_cap = 16, .load_file_cb = zt_load_file_cb,
@@ -308,6 +309,10 @@ static void zt_load_in(zt_t *z, const char *text, const char *origin, const char
     char *buf = arena_strdup(&z->arena, text);   /* the parser keeps pointers into its input */
     assert(buf);
     z->rc = parse_zone_fast(buf, strlen(buf), &z->arena, &ctx);
+    z->no_ttl = ctx.no_ttl_count;
+}
+static void zt_load_in(zt_t *z, const char *text, const char *origin, const char *base_dir) {
+    zt_load_dir(z, text, origin, base_dir, NULL);
 }
 static void zt_load(zt_t *z, const char *text) { zt_load_in(z, text, "example.", NULL); }
 static void zt_free(zt_t *z) { zone_arena_destroy(&z->arena); }
@@ -557,6 +562,7 @@ static void test_syntax_errors(void) {
         "www A 192.0.2.1 (\n",                                        /* unbalanced parenthesis */
         "www A 192.0.2.1 )\n",
         "$INCLUDE\n", "$GENERATE\n", "$GENERATE 1-3\n",
+        "$TTL\n", "$TTL abc\n", "$TTL 1x\n", "$TTL 2147483648\n", "$TTL -1\n", "$TTL 1h30mm\n", "$TTL h\n", "$TTL 1hh\n",
         "$GENERATE 5-1 h$ A 10.0.0.$\n",
         "$GENERATE 1-3/0 h$ A 10.0.0.$\n",
         "$ECS-SUBNET-TAG\n", "$LOCATION-TAG onlytag\n",
@@ -564,7 +570,7 @@ static void test_syntax_errors(void) {
         "verylonglabel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa A 192.0.2.1\n",
     };
     /* Accepted today although malformed (a bare $ECS-SUBNET / $LOCATION legitimately clears the tag). Executed only. */
-    static const char *const lenient[] = { "$TTL\n", "$TTL abc\n", "$ORIGIN\n", "$ECS-SUBNET\n", "$LOCATION\n",
+    static const char *const lenient[] = { "$ORIGIN\n", "$ECS-SUBNET\n", "$LOCATION\n",
                                           "\"quoted-owner\" A 192.0.2.1\n", "www IN CH A 192.0.2.1\n" };
     for (size_t i = 0; i < N(lenient); i++) {
         char text[2048];
@@ -909,10 +915,9 @@ static void test_extended_negative_paths(void) {
     for (size_t i = 0; i < N(bad_ttls); i++) {
         zt_t z;
         zt_load(&z, bad_ttls[i]);
-        /* Parser clamps or falls back safely; verify index build works */
-        if (z.rc >= 0) {
-            build_zone_index(&z.arena, true);
-        }
+        /* BIND 9.20 ARM 3.5.5.4: "Valid TTLs are of the range 0-2147483647 seconds"; text that is not a TTL is an error (it used to be 3600) */
+        if (z.rc >= 0) { fprintf(stderr, "bad TTL accepted: %s", bad_ttls[i]); assert(0); }
+        assert(z.err.error_message && strstr(z.err.error_message, "TTL"));
         zt_free(&z);
     }
 
@@ -1782,6 +1787,226 @@ static void test_error_messages(void) {
     printf("  -> error messages checked.\n");
 }
 
+/* BIND compatibility, batch 1.  $INCLUDE (BIND 9.20 ARM 3.5.5.3): "The filename can be an absolute path, or a relative path"; a relative one is
+ * read from named's working directory (options { directory }).  The Backend of this server can open only directories that were opened at
+ * startup, so an absolute path (or one that leaves the base through "..") is accepted only inside the zone file's directory or `directory`.
+ * TTLs (ARM 3.5.5.4): "Valid TTLs are of the range 0-2147483647 seconds", with the s/m/h/d/w units of ARM 3.5.3. */
+#define SOAH_LIT "$ORIGIN example.\n$TTL 300\n@ IN SOA ns.example. h.example. 1 7200 3600 1209600 300\n@ IN NS ns.example.\n"
+static void test_bind_compat_batch1(void) {
+    printf("[TEST] BIND compatibility batch 1: $INCLUDE ranges, strict TTLs...\n");
+    char root[] = "/tmp/karidns_zbc1_XXXXXX";
+    assert(mkdtemp(root));
+    char zdir[600], ddir[600], odir[600], p[1200], text[2400];
+    snprintf(zdir, sizeof(zdir), "%s/zones", root);           assert(mkdir(zdir, 0755) == 0);
+    snprintf(p, sizeof(p), "%s/zones/sub", root);             assert(mkdir(p, 0755) == 0);
+    snprintf(ddir, sizeof(ddir), "%s/named", root);           assert(mkdir(ddir, 0755) == 0);
+    snprintf(p, sizeof(p), "%s/named/common", root);          assert(mkdir(p, 0755) == 0);
+    snprintf(odir, sizeof(odir), "%s/other", root);           assert(mkdir(odir, 0755) == 0);
+    snprintf(p, sizeof(p), "%s/zones/in_zdir.inc", root);     write_file(p, "zd A 192.0.2.1\n");
+    snprintf(p, sizeof(p), "%s/zones/sub/s.inc", root);       write_file(p, "sb A 192.0.2.2\n");
+    snprintf(p, sizeof(p), "%s/named/in_ddir.inc", root);     write_file(p, "dd A 192.0.2.3\n");
+    snprintf(p, sizeof(p), "%s/named/common/c.inc", root);    write_file(p, "cm A 192.0.2.4\n");
+    snprintf(p, sizeof(p), "%s/other/o.inc", root);           write_file(p, "ot A 192.0.2.5\n");
+    zt_t z;
+
+    /* no directory: relative to the zone file's directory; absolute inside it is fine; ".." must stay inside it */
+    zt_load_dir(&z, SOAH_LIT "$INCLUDE in_zdir.inc\n$INCLUDE sub/s.inc\n$INCLUDE ./sub/../in_zdir.inc\n", "example.", zdir, NULL);
+    ASSERT_PARSED(&z);
+    assert(zt_find(&z, "zd.example.", 1) && zt_find(&z, "sb.example.", 1));
+    zt_free(&z);
+    snprintf(text, sizeof(text), SOAH_LIT "$INCLUDE %s/zones/sub/s.inc\n", root);
+    zt_load_dir(&z, text, "example.", zdir, NULL);
+    ASSERT_PARSED(&z);                                          /* absolute, inside the zone file's directory */
+    assert(zt_find(&z, "sb.example.", 1));
+    zt_free(&z);
+    snprintf(text, sizeof(text), SOAH_LIT "$INCLUDE %s/zones/sub/../in_zdir.inc\n", root);
+    zt_load_dir(&z, text, "example.", zdir, NULL);
+    ASSERT_PARSED(&z);                                          /* absolute with "..", normalized inside */
+    zt_free(&z);
+    /* outside: an absolute path, "..", a path that leaves and comes back, a sibling directory with the same prefix */
+    static const char *const outside_rel[] = { "../other/o.inc", "../named/in_ddir.inc", "sub/../../other/o.inc", "../zones2/x.inc",
+                                               "../../../../../../../../etc/passwd" };
+    for (size_t i = 0; i < N(outside_rel); i++) {
+        snprintf(text, sizeof(text), SOAH_LIT "$INCLUDE %s\n", outside_rel[i]);
+        zt_load_dir(&z, text, "example.", zdir, NULL);
+        assert(z.rc < 0);
+        assert(z.err.error_message && strstr(z.err.error_message, "outside the directories opened at startup (zone file dir)"));
+        assert(strstr(z.err.error_message, outside_rel[i]));    /* names the path it refused */
+        zt_free(&z);
+    }
+    snprintf(text, sizeof(text), SOAH_LIT "$INCLUDE %s/other/o.inc\n", root);
+    zt_load_dir(&z, text, "example.", zdir, NULL);
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "outside the directories opened at startup"));
+    zt_free(&z);
+    zt_load_dir(&z, SOAH_LIT "$INCLUDE /etc/hosts\n", "example.", zdir, NULL);
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "outside the directories opened at startup"));
+    zt_free(&z);
+    snprintf(p, sizeof(p), "%s/zones", root);                    /* "/tmp/x/zones" is not a prefix of "/tmp/x/zones2" */
+    snprintf(text, sizeof(text), SOAH_LIT "$INCLUDE %s2/x.inc\n", p);
+    zt_load_dir(&z, text, "example.", zdir, NULL);
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "outside the directories"));
+    zt_free(&z);
+    /* a missing file inside the range is "could not be read", not "outside" */
+    zt_load_dir(&z, SOAH_LIT "$INCLUDE nonexistent.inc\n", "example.", zdir, NULL);
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "could not be read"));
+    zt_free(&z);
+
+    /* with directory: relative names are read from it; the zone file's directory and the directory are both ranges */
+    zt_load_dir(&z, SOAH_LIT "$INCLUDE in_ddir.inc\n$INCLUDE common/c.inc\n", "example.", zdir, ddir);
+    ASSERT_PARSED(&z);
+    assert(zt_find(&z, "dd.example.", 1) && zt_find(&z, "cm.example.", 1));
+    zt_free(&z);
+    zt_load_dir(&z, SOAH_LIT "$INCLUDE in_zdir.inc\n", "example.", zdir, ddir);
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "could not be read"));     /* not in directory */
+    zt_free(&z);
+    snprintf(text, sizeof(text), SOAH_LIT "$INCLUDE %s/zones/in_zdir.inc\n$INCLUDE %s/named/common/c.inc\n$INCLUDE ../zones/sub/s.inc\n", root, root);
+    zt_load_dir(&z, text, "example.", zdir, ddir);
+    ASSERT_PARSED(&z);                                          /* absolute paths in each range; ".." from directory into the zone dir */
+    assert(zt_find(&z, "zd.example.", 1) && zt_find(&z, "cm.example.", 1) && zt_find(&z, "sb.example.", 1));
+    zt_free(&z);
+    zt_load_dir(&z, SOAH_LIT "$INCLUDE ../other/o.inc\n", "example.", zdir, ddir);
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "outside the directories opened at startup (zone file dir, directory)"));
+    zt_free(&z);
+    snprintf(text, sizeof(text), SOAH_LIT "$INCLUDE %s/other/o.inc\n", root);
+    zt_load_dir(&z, text, "example.", zdir, ddir);
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "(zone file dir, directory)"));
+    zt_free(&z);
+    /* an include inside an include is checked against the same two ranges */
+    snprintf(p, sizeof(p), "%s/named/nest.inc", root);
+    snprintf(text, sizeof(text), "$INCLUDE %s/other/o.inc\n", root);
+    write_file(p, text);
+    zt_load_dir(&z, SOAH_LIT "$INCLUDE nest.inc\n", "example.", zdir, ddir);
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "outside the directories"));
+    zt_free(&z);
+    /* ".": the working directory is a range of its own (the zone file given with a relative path) */
+    zt_load_dir(&z, SOAH_LIT "$INCLUDE ../../etc/hosts\n", "example.", ".", NULL);
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "outside the directories"));
+    zt_free(&z);
+    /* a zone file directly in "/": only the files directly in "/" are inside, not the whole file system */
+    zt_load_dir(&z, SOAH_LIT "$INCLUDE /etc/hosts\n", "example.", "/", NULL);
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "outside the directories"));
+    zt_free(&z);
+    zt_load_dir(&z, SOAH_LIT "$INCLUDE /karidns-no-such-file.inc\n", "example.", "/", NULL);
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "could not be read"));
+    zt_free(&z);
+    snprintf(text, sizeof(text), "rm -rf %s", root);
+    assert(system(text) == 0);
+
+    /* TTLs: units, boundaries, errors with the position */
+    uint32_t v = 0;
+    assert(parse_ttl_strict("0", 2147483647u, &v) && v == 0);
+    assert(parse_ttl_strict("2147483647", 2147483647u, &v) && v == 2147483647u);
+    assert(parse_ttl_strict("1w2d3h4m5s", 2147483647u, &v) && v == 788645u);
+    assert(parse_ttl_strict("1H30M", 2147483647u, &v) && v == 5400u);
+    assert(parse_ttl_strict("30", 2147483647u, &v) && v == 30u);            /* a plain number alone is seconds ... */
+    assert(!parse_ttl_strict("1h30", 2147483647u, &v));                     /* ... but not after a unit (BIND bind_ttl(): DNS_R_SYNTAX) */
+    assert(!parse_ttl_strict("1w2d30", 2147483647u, &v));
+    {   char long64[80];                                                    /* bind_ttl(): at most 63 characters */
+        memset(long64, '0', sizeof(long64)); long64[63] = '1'; long64[64] = '\0';
+        assert(!parse_ttl_strict(long64, 2147483647u, &v));
+        long64[63] = '\0';
+        assert(parse_ttl_strict(long64, 2147483647u, &v) && v == 0u);   }
+    assert(parse_ttl_strict("035", 2147483647u, &v) && v == 35u);
+    assert(parse_ttl_strict("4294967295", 0xFFFFFFFFu, &v) && v == 4294967295u);
+    static const char *const bad_ttl[] = { "", "abc", "1x", "1hh", "h", "-1", "+1", " 1", "1 ", "1.5", "2147483648", "4294967296",
+                                           "99999999999999999999", "99999999999999999999w", "3556w", "24856d", "1h-5", "0x10" };
+    for (size_t i = 0; i < N(bad_ttl); i++) {
+        v = 77;
+        if (parse_ttl_strict(bad_ttl[i], 2147483647u, &v) || v != 77) { fprintf(stderr, "TTL '%s' accepted\n", bad_ttl[i]); assert(0); }
+    }
+    assert(!parse_ttl_strict(NULL, 2147483647u, &v));
+    assert(parse_ttl_value("1x") == 3600 && parse_ttl_value("4294967296") == 2147483647u);      /* the lenient form is unchanged */
+    /* the same notation in a zone file */
+    zt_load(&z, "$ORIGIN example.\n$TTL 1h30m\n@ SOA ns h 1 2 3 4 5\n@ 2147483647 NS ns\nns 0 A 192.0.2.1\nw 1d A 192.0.2.2\n");
+    ASSERT_PARSED(&z);
+    assert(zt_find(&z, "example.", 2)->ttl_value == 2147483647u && zt_find(&z, "ns.example.", 1)->ttl_value == 0);
+    assert(zt_find(&z, "w.example.", 1)->ttl_value == 86400u && zt_find(&z, "example.", 6)->ttl_value == 5400u);
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n@ SOA ns h 1 2 3 4 5\n@ 1x NS ns\n");
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "Invalid TTL"));
+    assert(z.err.error_offset == strlen("$ORIGIN example.\n@ SOA ns h 1 2 3 4 5\n@ ") && z.err.token_length == 2);
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$TTL zzz\n");
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "Invalid $TTL") && z.err.token_length == 3);
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$TTL\n@ SOA ns h 1 2 3 4 5\n");
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "$TTL requires a value"));
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$TTL 300\n$GENERATE 1-2 g$ 3x A 192.0.2.$\n");
+    assert(z.rc < 0);                                                         /* $GENERATE: the TTL goes through the same check */
+    zt_free(&z);
+    /* the SOA fields written like TTLs */
+    zt_load(&z, "$ORIGIN example.\n$TTL 300\n@ SOA ns h 1 2h 1h30m 1w 1d\n");
+    ASSERT_PARSED(&z);
+    zt_free(&z);
+    static const char *const bad_soa[] = { "@ SOA ns h 1 2x 3 4 5\n", "@ SOA ns h 1 2 abc 4 5\n", "@ SOA ns h 1 2 3 4 1y\n",
+                                           "@ SOA ns h 1 2 3 99999999999 5\n" };
+    for (size_t i = 0; i < N(bad_soa); i++) {
+        snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 300\n%s", bad_soa[i]);
+        zt_load(&z, text);
+        assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "SOA"));
+        zt_free(&z);
+    }
+    /* the SOA serial (BIND 9.20 soa_6.c fromtext_soa: a number token, lexer: decimal digits up to a delimiter; isc_parse_uint32: > 32 bits is
+     * ISC_R_RANGE): digits only, 0..4294967295; anything else rejects the zone (it used to read as 0 or be cut to 32 bits) */
+    {
+        uint32_t sv = 77;
+        int se = -1;
+        assert(parse_soa_serial_strict("0", &sv, &se) && sv == 0 && se == 0);
+        assert(parse_soa_serial_strict("4294967295", &sv, &se) && sv == 4294967295u);
+        assert(parse_soa_serial_strict("000000000000000000000000000001", &sv, &se) && sv == 1u);
+        static const char *const bad_num[] = { "", "abc", "1x", "-1", "+1", " 1", "1 ", "1.5", "0x10", "1h", "1e3" };
+        for (size_t i = 0; i < N(bad_num); i++) {
+            sv = 77; se = -1;
+            if (parse_soa_serial_strict(bad_num[i], &sv, &se) || se != 1 || sv != 77) { fprintf(stderr, "serial '%s'\n", bad_num[i]); assert(0); }
+        }
+        static const char *const big[] = { "4294967296", "99999999999999999999999999", "18446744073709551616", "10000000000" };
+        for (size_t i = 0; i < N(big); i++) {
+            sv = 77; se = -1;
+            if (parse_soa_serial_strict(big[i], &sv, &se) || se != 2 || sv != 77) { fprintf(stderr, "serial '%s'\n", big[i]); assert(0); }
+        }
+        assert(!parse_soa_serial_strict(NULL, &sv, NULL));
+    }
+    zt_load(&z, "$ORIGIN example.\n$TTL 300\n@ SOA ns h 4294967295 2 3 4 5\n");
+    ASSERT_PARSED(&z);
+    zt_free(&z);
+    static const char *const bad_serial[] = {
+        "@ SOA ns h abc 2 3 4 5\n", "@ SOA ns h -1 2 3 4 5\n", "@ SOA ns h +1 2 3 4 5\n", "@ SOA ns h 1x 2 3 4 5\n", "@ SOA ns h 1h 2 3 4 5\n",
+        "@ SOA ns h 4294967296 2 3 4 5\n", "@ SOA ns h 99999999999999999999 2 3 4 5\n",
+        "@ SOA ns h 0x10 2 3 4 5\n", "@ SOA ns h 1.5 2 3 4 5\n",
+    };
+    for (size_t i = 0; i < N(bad_serial); i++) {
+        snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 300\n%s", bad_serial[i]);
+        zt_load(&z, text);
+        assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "SOA serial"));
+        assert(z.err.error_offset == strlen("$ORIGIN example.\n$TTL 300\n@ SOA ns h "));
+        zt_free(&z);
+    }
+    zt_load(&z, "$ORIGIN example.\n$TTL 300\n@ SOA ns h \"\" 2 3 4 5\n");        /* an empty (quoted) serial */
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "SOA serial"));
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$TTL 300\n@ SOA ns h 4294967296 2 3 4 5\n");
+    assert(z.rc < 0 && strstr(z.err.error_message, "out of range"));
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$TTL 300\n@ SOA ns h abc 2 3 4 5\n");
+    assert(z.rc < 0 && strstr(z.err.error_message, "Invalid SOA serial") && z.err.token_length == 3);
+    zt_free(&z);
+    /* records that had no TTL at all are counted (BIND: "no TTL specified"); a SOA minimum, a $TTL or an earlier TTL is a source */
+    zt_load(&z, "$ORIGIN example.\nw A 192.0.2.2\nx A 192.0.2.3\n@ SOA ns h 1 2 3 4 5\ny A 192.0.2.4\n");
+    ASSERT_PARSED(&z);
+    assert(z.no_ttl == 2 && zt_find(&z, "w.example.", 1)->ttl_value == 3600);
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\nw A 192.0.2.2\n");
+    ASSERT_PARSED(&z);
+    assert(z.no_ttl == 0);
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\nw 60 A 192.0.2.2\nx A 192.0.2.3\n");
+    ASSERT_PARSED(&z);
+    assert(z.no_ttl == 0);
+    zt_free(&z);
+    printf("  -> batch 1 passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Zone Parser Path Coverage Tests ===\n");
     test_x37_rdata_name_case();
@@ -1811,6 +2036,7 @@ int main(void) {
     test_tags_and_semantics();
     test_extended_negative_paths();
     test_b9a_alias_lua();
+    test_bind_compat_batch1();
     printf("=== All Zone Parser Path Coverage Tests PASSED ===\n");
     return 0;
 }

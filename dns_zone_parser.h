@@ -14,12 +14,16 @@ typedef struct {
     size_t error_offset;
     size_t token_length;
     const char *file_path; // 霑ｽ蜉: 縺薙・繧ｨ繝ｩ繝ｼ縺後←縺ｮ繝輔ぃ繧､繝ｫ縺ｧ逋ｺ逕溘＠縺溘°
+    char detail[512];      // text of error_message when it has to carry a path ($INCLUDE outside the opened directories)
 } parse_error_t;
 
 typedef struct parse_context_s {
     const char *base_dir;
+    /* options { directory }: NULL = not set.  A relative $INCLUDE is read from here instead of base_dir (BIND 9.20 ARM 3.5.5.3:
+     * relative to named's working directory), and the tree below it is one of the two ranges an $INCLUDE may lie in. */
+    const char *directory;
     const char *default_origin;
-    bool is_standalone_mode;
+    bool is_standalone_mode;   /* unused by the $INCLUDE rules: server and karicheck share them (resolve_include_path) */
     parse_error_t *err_out;
     int current_depth;
     char* (*load_file_cb)(struct parse_context_s *ctx, const char *rel_path, dev_t *out_dev, ino_t *out_ino);
@@ -51,6 +55,11 @@ typedef struct parse_context_s {
     /* tinydns: SOA serial に使うデータファイルの mtime (0 = 不明、読み込み時刻を使う)。
      * パーサ自身はファイルを stat しない (X-13: サンドボックス内の再読み込みではパスを使えない)。 */
     time_t source_mtime;
+    /* BIND rejects a zone in which a record has no TTL and there is no $TTL, no earlier TTL and no SOA to take one from
+     * ("no TTL specified", dns_master_load).  This parser uses 3600 instead; the records that got it are counted here
+     * (arena-owned owner name of the first one) so that the caller can warn.  Not counted for tinydns data. */
+    size_t no_ttl_count;
+    const char *first_no_ttl_owner;
 } parse_context_t;
 
 typedef struct {

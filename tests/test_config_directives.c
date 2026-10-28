@@ -700,7 +700,7 @@ static void test_zone_types_and_files(void) {
             free_server_config_fields(&cfg);
         }
     }
-    expect_reject("unknown zone type", "zone \"example.com\" { type hint; file \"z\"; };");
+    expect_reject("unknown zone type", "zone \"example.com\" { type hint_; file \"z\"; };");   /* hint itself is skipped with a warning (test_bind_compat_paths) */
     expect_reject("type value missing", "zone \"example.com\" { type; };");
     expect_reject("';' missing after type", "zone \"example.com\" { type master };");
     expect_reject("zone name is not a string", "zone { type master; };");
@@ -2749,7 +2749,7 @@ static void test_strict_options_and_key(void) {
 
     /* every implemented options statement: parses, and neither warns nor errors about being unknown */
     static const struct { const char *name, *sample; } impl[] = {
-        {"port", "port 5353;"}, {"user", "user \"nobody\";"}, {"group", "group \"nobody\";"},
+        {"port", "port 5353;"}, {"directory", "directory \"/var/db\";"}, {"user", "user \"nobody\";"}, {"group", "group \"nobody\";"},
         {"pid-file", "pid-file \"/var/run/x.pid\";"}, {"bind-address", "bind-address { 192.0.2.1; };"},
         {"rate-limit", "rate-limit { responses-per-second 5; };"}, {"ecs-enable", "ecs-enable yes;"},
         {"ecs-trusted-resolvers", "ecs-trusted-resolvers { 192.0.2.53; };"},
@@ -2796,7 +2796,7 @@ static void test_strict_options_and_key(void) {
 
     /* a BIND option KariDNS does not implement: warning, skipped, the rest of options { } still applies */
     static const char *const bind_only[] = {
-        "listen-on { 127.0.0.1; };", "listen-on-v6 { any; };", "directory \"/var/db\";", "recursion no;",
+        "listen-on { 127.0.0.1; };", "listen-on-v6 { any; };", "recursion no;",
         "transfer-source 192.0.2.1;", "version none;", "dnssec-validation auto;", "forwarders { 192.0.2.1; };",
         "max-cache-size 100m;", "allow-new-zones yes;", "dnssec-enable yes;" /* BIND 9.16 and older */,
         "allow-proxy { any; };" /* BIND 9.20 only */, "use-alt-transfer-source no;" /* BIND 9.18 only */,
@@ -2850,6 +2850,274 @@ static void test_strict_options_and_key(void) {
     if (parse_ok("logging { frobnicate yes; }; frobnicate-block { a; };", &cfg)) free_server_config_fields(&cfg);
 }
 
+/* ---- BIND compatibility, batch 1: directory, class after zone / view names, zone types that are not loaded, port errors ----
+ * Expectations from the BIND 9.20 ARM: `directory` "sets the working directory of the server" and "all relative paths use this directory as
+ * a base" (named.conf sample, 3.1.1); `zone <string> [ <class> ] {`, `view <string> [ <class> ] {`; zone types "primary (or master), secondary
+ * (or slave), mirror, hint, stub, static-stub, forward, or redirect". */
+#define N_ELEM(a) (sizeof(a) / sizeof((a)[0]))
+static void write_file_t(const char *path, const char *text) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { printf("  [FAIL] cannot write %s\n", path); g_failed++; return; }
+    fputs(text, f);
+    fclose(f);
+}
+
+static bool parse_file_capture(const char *path, server_config_t *cfg, char *msg, size_t msglen) {
+    char *text = read_entire_file(path, NULL, NULL);
+    if (!text) { msg[0] = '\0'; return false; }
+    char errpath[] = "/tmp/bcp_err_XXXXXX";
+    int tmp = mkstemp(errpath);
+    fflush(stderr);
+    int saved = dup(2);
+    if (tmp >= 0) dup2(tmp, 2);
+    int rc = parse_named_conf_ext(text, path, cfg);
+    fflush(stderr);
+    if (saved >= 0) { dup2(saved, 2); close(saved); }
+    msg[0] = '\0';
+    if (tmp >= 0) {
+        ssize_t n = pread(tmp, msg, msglen - 1, 0);
+        msg[n > 0 ? n : 0] = '\0';
+        close(tmp);
+        unlink(errpath);
+    }
+    free(text);
+    return rc == 0;
+}
+
+static void test_bind_compat_paths(void) {
+    printf("[TEST] BIND compatibility batch 1: directory, class, skipped zone types, port...\n");
+    server_config_t cfg;
+    char msg[2048];
+
+    /* directory: every relative path of the configuration is relative to it (also when the statement comes last) */
+    if (parse_ok("options { pid-file \"run/k.pid\"; directory \"/var/named\"; };\n"
+                 "logging { channel q { file \"log/q.log\"; }; channel a { file \"/abs/a.log\"; }; };\n"
+                 "control-channel { socket \"ctl.sock\"; secret \"c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0MTIzNDU2\"; algorithm hmac-sha256; };\n"
+                 "zone \"example\" { type primary; file \"db.example\"; };\n"
+                 "zone \"abs.example\" { type primary; file \"/srv/abs.db\"; };\n"
+                 "zone \"sub.example\" { type primary; file \"zones/sub.db\"; };\n", &cfg)) {
+        CHECK_STR(cfg.directory, "/var/named");
+        CHECK_STR(cfg.pid_file, "/var/named/run/k.pid");
+        CHECK(!cfg.directory_changed);
+        const zone_config_t *z = first_zone(&cfg);
+        CHECK(z != NULL);
+        if (z) CHECK_STR(z->file, "/var/named/db.example");
+        const view_config_t *v = cfg.views;
+        CHECK(v && v->zones && v->zones->next && v->zones->next->next);
+        if (v && v->zones && v->zones->next && v->zones->next->next) {
+            CHECK_STR(v->zones->next->file, "/srv/abs.db");
+            CHECK_STR(v->zones->next->next->file, "/var/named/zones/sub.db");
+        }
+        const log_channel_t *qc = find_channel(&cfg, "q");
+        CHECK(qc && qc->file_path && strcmp(qc->file_path, "/var/named/log/q.log") == 0);
+        const log_channel_t *ac = find_channel(&cfg, "a");
+        CHECK(ac && ac->file_path && strcmp(ac->file_path, "/abs/a.log") == 0);
+        CHECK_STR(cfg.control.socket_path, "ctl.sock");   /* sockets are not prefixed: sun_path is short; the server chdir()s to directory */
+        free_server_config_fields(&cfg);
+    }
+    /* "none" for pid-file is not a path */
+    if (parse_ok("options { directory \"/var/named\"; pid-file \"none\"; };", &cfg)) {
+        CHECK_STR(cfg.pid_file, "none");
+        free_server_config_fields(&cfg);
+    }
+    /* no directory: paths are untouched (relative to the directory the server is started in) */
+    if (parse_ok("options { pid-file \"run/k.pid\"; };\nzone \"example\" { type primary; file \"db.example\"; };", &cfg)) {
+        CHECK(cfg.directory == NULL);
+        CHECK_STR(cfg.pid_file, "run/k.pid");
+        const zone_config_t *z = first_zone(&cfg);
+        if (z) CHECK_STR(z->file, "db.example");
+        free_server_config_fields(&cfg);
+    }
+    /* a relative directory is kept as written (relative to the startup directory) */
+    if (parse_ok("options { directory \"named\"; };\nzone \"example\" { type primary; file \"db.example\"; };", &cfg)) {
+        CHECK_STR(cfg.directory, "named");
+        const zone_config_t *z = first_zone(&cfg);
+        if (z) CHECK_STR(z->file, "named/db.example");
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("empty directory", "options { directory \"\"; };", "line 1|options|directory");
+
+    /* the directory of the running server (config_pin_directory) wins on a reload; another one is reported */
+    config_pin_directory("/pinned");
+    if (parse_ok("options { directory \"/other\"; };\nzone \"example\" { type primary; file \"db.example\"; };", &cfg)) {
+        CHECK_STR(cfg.directory, "/pinned");
+        CHECK(cfg.directory_changed);
+        const zone_config_t *z = first_zone(&cfg);
+        if (z) CHECK_STR(z->file, "/pinned/db.example");
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { directory \"/pinned\"; };\nzone \"example\" { type primary; file \"db.example\"; };", &cfg)) {
+        CHECK_STR(cfg.directory, "/pinned");
+        CHECK(!cfg.directory_changed);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("zone \"example\" { type primary; file \"db.example\"; };", &cfg)) {     /* the file no longer has it */
+        CHECK_STR(cfg.directory, "/pinned");
+        CHECK(cfg.directory_changed);
+        free_server_config_fields(&cfg);
+    }
+    config_pin_directory(NULL);                                                          /* started without a directory */
+    if (parse_ok("options { directory \"/new\"; };\nzone \"example\" { type primary; file \"db.example\"; };", &cfg)) {
+        CHECK(cfg.directory == NULL);
+        CHECK(cfg.directory_changed);
+        const zone_config_t *z = first_zone(&cfg);
+        if (z) CHECK_STR(z->file, "db.example");
+        free_server_config_fields(&cfg);
+    }
+    config_unpin_directory();
+
+    /* include: relative to directory when it is set, else to the including file */
+    char root[] = "/tmp/bcp_dir_XXXXXX";
+    if (!mkdtemp(root)) { printf("  [FAIL] mkdtemp\n"); g_failed++; return; }
+    char p[PATH_MAX], q[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/etc", root);   mkdir(p, 0755);
+    snprintf(p, sizeof(p), "%s/base", root);  mkdir(p, 0755);
+    snprintf(p, sizeof(p), "%s/other", root); mkdir(p, 0755);
+    snprintf(p, sizeof(p), "%s/base/keys.conf", root);
+    write_file_t(p, "key \"kb\" { algorithm hmac-sha256; secret \"c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0MTIzNDU2\"; };\n");
+    snprintf(p, sizeof(p), "%s/etc/keys.conf", root);
+    write_file_t(p, "key \"ke\" { algorithm hmac-sha256; secret \"c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0MTIzNDU2\"; };\n");
+    snprintf(p, sizeof(p), "%s/etc/main.conf", root);
+    snprintf(q, sizeof(q), "options { directory \"%s/base\"; };\ninclude \"keys.conf\";\n", root);
+    write_file_t(p, q);
+    if (parse_file_capture(p, &cfg, msg, sizeof(msg))) {
+        CHECK(cfg.keys && strcmp(cfg.keys->name, "kb") == 0);      /* base/keys.conf, not etc/keys.conf */
+        free_server_config_fields(&cfg);
+    } else { g_failed++; printf("  [FAIL] include relative to directory: %s\n", msg); }
+    /* the same file with directory after the include (BIND applies it to all of them) */
+    snprintf(q, sizeof(q), "include \"keys.conf\";\noptions { directory \"%s/base\"; };\n", root);
+    write_file_t(p, q);
+    if (parse_file_capture(p, &cfg, msg, sizeof(msg))) {
+        CHECK(cfg.keys && strcmp(cfg.keys->name, "kb") == 0);
+        free_server_config_fields(&cfg);
+    } else { g_failed++; printf("  [FAIL] include before directory: %s\n", msg); }
+    /* no directory: relative to the including file */
+    write_file_t(p, "include \"keys.conf\";\n");
+    if (parse_file_capture(p, &cfg, msg, sizeof(msg))) {
+        CHECK(cfg.keys && strcmp(cfg.keys->name, "ke") == 0);
+        free_server_config_fields(&cfg);
+    } else { g_failed++; printf("  [FAIL] include without directory: %s\n", msg); }
+    /* an absolute include is untouched by directory */
+    snprintf(q, sizeof(q), "options { directory \"%s/other\"; };\ninclude \"%s/etc/keys.conf\";\n", root, root);
+    write_file_t(p, q);
+    if (parse_file_capture(p, &cfg, msg, sizeof(msg))) {
+        CHECK(cfg.keys && strcmp(cfg.keys->name, "ke") == 0);
+        free_server_config_fields(&cfg);
+    } else { g_failed++; printf("  [FAIL] absolute include: %s\n", msg); }
+    /* directory written in an included file after a relative include was read: cannot be applied to it, so it is refused */
+    snprintf(q, sizeof(q), "%s/etc/dir.conf", root);
+    snprintf(p, sizeof(p), "%s/other", root);
+    {
+        char body[PATH_MAX + 64];
+        snprintf(body, sizeof(body), "options { directory \"%s\"; };\n", p);
+        write_file_t(q, body);
+    }
+    snprintf(p, sizeof(p), "%s/etc/main.conf", root);
+    write_file_t(p, "include \"keys.conf\";\ninclude \"dir.conf\";\n");
+    CHECK(!parse_file_capture(p, &cfg, msg, sizeof(msg)));
+    CHECK(strstr(msg, "main configuration file") != NULL);
+    /* ... but directory only in an included file, with no relative include before it, is fine */
+    write_file_t(p, "include \"dir.conf\";\n");
+    if (parse_file_capture(p, &cfg, msg, sizeof(msg))) {
+        char want[PATH_MAX];
+        snprintf(want, sizeof(want), "%s/other", root);
+        CHECK_STR(cfg.directory, want);
+        free_server_config_fields(&cfg);
+    } else { g_failed++; printf("  [FAIL] directory in an included file: %s\n", msg); }
+    {
+        char cmd[PATH_MAX + 16];
+        snprintf(cmd, sizeof(cmd), "rm -rf %s", root);
+        if (system(cmd) != 0) printf("  [WARN] cleanup of %s failed\n", root);
+    }
+
+    /* a class after the zone / view name: IN (any case) is accepted and ignored */
+    static const char *const in_ok[] = {
+        "zone \"example\" IN { type primary; file \"a.db\"; };",
+        "zone \"example\" in { type primary; file \"a.db\"; };",
+        "zone \"example\" In { type primary; file \"a.db\"; };",
+        "view \"v\" IN { match-clients { any; }; zone \"example\" IN { type primary; file \"a.db\"; }; };",
+        "view \"v\" in { zone \"example\" { type primary; file \"a.db\"; }; };",
+    };
+    for (size_t i = 0; i < N_ELEM(in_ok); i++) {
+        if (parse_ok(in_ok[i], &cfg)) {
+            const zone_config_t *z = first_zone(&cfg);
+            CHECK(z != NULL);
+            if (z) CHECK_STR(z->file, "a.db");
+            free_server_config_fields(&cfg);
+        }
+    }
+    /* any other class is an error with file:line and the name of the zone / view */
+    expect_an_error("zone CH", "options { };\nzone \"example\" CH { type primary; file \"a.db\"; };", "line 2|zone 'example.'|class 'CH' is not supported (only IN)");
+    expect_an_error("zone hs", "zone \"example\" hs { type primary; };", "line 1|class 'hs'");
+    expect_an_error("zone CHAOS", "zone \"example\" CHAOS { type primary; };", "class 'CHAOS'");
+    expect_an_error("zone CLASS3", "zone \"example\" CLASS3 { type primary; };", "class 'CLASS3'");
+    expect_an_error("view CH", "\n\nview \"v\" CH { match-clients { any; }; };", "line 3|view 'v'|class 'CH' is not supported");
+    expect_an_error("zone junk", "zone \"example\" frobnicate { type primary; };", "line 1|zone 'example.'|expected '{'");
+    expect_an_error("zone no brace", "zone \"example\" IN type primary;", "line 1|expected '{'");
+    expect_an_error("quoted class", "zone \"example\" \"IN\" { type primary; };", "expected '{'");
+
+    /* zone types of resolvers: the zone is not loaded and the configuration is accepted (a stock BIND named.conf) */
+    static const char *const skipped[] = { "hint", "stub", "static-stub", "mirror", "redirect", "delegation-only", "HINT", "Stub" };
+    for (size_t i = 0; i < N_ELEM(skipped); i++) {
+        char txt[512];
+        snprintf(txt, sizeof(txt),
+                 "zone \".\" IN { type %s; file \"named.root\"; masters { 192.0.2.1; }; forwarders { 192.0.2.2 port 5353; }; "
+                 "server-addresses { 2001:db8::1; }; };\nzone \"example\" { type primary; file \"a.db\"; };", skipped[i]);
+        int rc = parse_capture(txt, &cfg, msg, sizeof(msg));
+        CHECK_MSG(rc == 0, "type %s: %s", skipped[i], msg);
+        if (rc == 0) {
+            CHECK(strstr(msg, "line 1") != NULL && strstr(msg, "is not loaded") != NULL);
+            CHECK(view_find_zone_config(cfg.views, ".") == NULL);
+            const zone_config_t *z = first_zone(&cfg);
+            CHECK(z != NULL && strcmp(z->domain, "example.") == 0);
+            CHECK(cfg.views && cfg.views->zones && !cfg.views->zones->next);
+            free_server_config_fields(&cfg);
+        }
+    }
+    /* only skipped zones: an empty configuration, still valid; a skipped top-level zone does not forbid views */
+    if (parse_ok("zone \".\" { type hint; file \"named.root\"; };", &cfg)) {
+        CHECK(cfg.views && !cfg.views->zones);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("zone \".\" { type hint; file \"named.root\"; };\nview \"v\" { match-clients { any; }; zone \"x\" { type primary; file \"x.db\"; }; };", &cfg)) {
+        CHECK(cfg.views && strcmp(cfg.views->name, "v") == 0 && cfg.views->zones);
+        free_server_config_fields(&cfg);
+    }
+    /* inside a view */
+    if (parse_ok("view \"v\" { match-clients { any; }; zone \".\" { type hint; file \"r\"; }; zone \"x\" { type primary; file \"x.db\"; }; };", &cfg)) {
+        CHECK(view_find_zone_config(cfg.views, ".") == NULL && view_find_zone_config(cfg.views, "x") != NULL);
+        free_server_config_fields(&cfg);
+    }
+    /* the rest of a skipped block is skipped as a whole, braces and all; an unterminated one is an error */
+    expect_an_error("unterminated skipped zone", "zone \".\" { type hint; file \"r\"; ", "");
+    expect_reject("skipped zone without ';'", "zone \".\" { type hint; } zone \"x\" { type primary; };");
+    /* forward keeps its KariDNS meaning; in-view is a clear error (not an empty zone) */
+    if (parse_ok("zone \"f.example\" { type forward; forwarders { 192.0.2.53; }; };", &cfg)) {
+        const zone_config_t *z = first_zone(&cfg);
+        CHECK(z && z->type && strcmp(z->type, "forward") == 0);
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("in-view", "view \"a\" { zone \"x\" { type primary; file \"x.db\"; }; };\nview \"b\" { zone \"x\" { in-view \"a\"; }; };",
+                    "zone 'x.'|in-view|not supported");
+    expect_an_error("unknown type", "zone \"x\" { type frobnicate; };", "Unknown zone type 'frobnicate'");
+
+    /* options { port }: only 1..65535 digits */
+    static const char *const bad_ports[] = { "abc", "0", "65536", "53x", "-1", "99999999999", "0x35", "" };
+    for (size_t i = 0; i < N_ELEM(bad_ports); i++) {
+        char txt[128];
+        snprintf(txt, sizeof(txt), "\noptions { port \"%s\"; };", bad_ports[i]);
+        expect_an_error(bad_ports[i], txt, "line 2|options|port|1-65535");
+    }
+    if (parse_ok("options { port 65535; };", &cfg)) { CHECK(cfg.port == 65535); free_server_config_fields(&cfg); }
+    if (parse_ok("options { port 1; };", &cfg)) { CHECK(cfg.port == 1); free_server_config_fields(&cfg); }
+    /* the port of the other statements that take one */
+    expect_an_error("forwarders port", "zone \"f\" { type forward; forwarders { 192.0.2.1 port 0; }; };", "port|1-65535");
+    expect_an_error("forwarders port text", "zone \"f\" { type forward; forwarders { 192.0.2.1 port x; }; };", "port|1-65535");
+    expect_an_error("also-notify port", "options { also-notify { 192.0.2.1 port 70000; }; };", "port|1-65535");
+    expect_an_error("masters list port", "primaries p port 0 { 192.0.2.1; };", "port|1-65535");
+    expect_an_error("masters port", "zone \"s\" { type secondary; primaries { 192.0.2.1 port 65536; }; };", "port|1-65535");
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
     test_defaults();
@@ -2893,6 +3161,7 @@ int main(void) {
     test_also_notify_bind();
     test_primaries_and_notify_mode();
     test_strict_options_and_key();
+    test_bind_compat_paths();
 
     printf("[*] %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) {

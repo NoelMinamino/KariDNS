@@ -1,0 +1,11 @@
+$ORIGIN fuzz.local.
+$TTL 300
+@ SOA ns.fuzz.local. hostmaster.fuzz.local. 4294967295 2h 1h30m 1w 1d
+@ SOA ns.fuzz.local. hostmaster.fuzz.local. 4294967296 2h 1h 1w 1d
+@ SOA ns.fuzz.local. hostmaster.fuzz.local. -1 2h 1h 1w 1d
+@ SOA ns.fuzz.local. hostmaster.fuzz.local. 1h 2h 1h 1w 1d
+@ SOA ns.fuzz.local. hostmaster.fuzz.local. "" 2h 1h 1w 1d
+@ SOA ns.fuzz.local. hostmaster.fuzz.local. 0x10 2h 1h 1w 1h30
+$TTL 1h30
+Zfuzz.local:ns1.fuzz.local:hostmaster.fuzz.local:4294967296:2:3:4:5:300
+Zfuzz.local:ns1.fuzz.local:hostmaster.fuzz.local:abc:2:3:4:5:300

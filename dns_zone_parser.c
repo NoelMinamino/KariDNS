@@ -324,38 +324,112 @@ static bool validate_domain_name_length(const char *fqdn, parse_error_t *err_out
 #define PATH_MAX 4096
 #endif
 
-static char *resolve_include_path(const char *base_dir, const char *rel_path,
-                                   bool is_standalone_mode, parse_error_t *err_out) {
-    if (rel_path[0] == '\0') return NULL;
-
-    // Reject absolute paths unless in standalone mode
-    if (rel_path[0] == '/') {
-        if (!is_standalone_mode) {
-            if (err_out) err_out->error_message = "Absolute path in $INCLUDE is not allowed";
-            return NULL;
+/* Lexical normalization of a path into out: "." and empty components and "x/.." pairs are removed.  An absolute path whose ".." would
+ * climb above "/" is refused (false).  A relative path keeps the ".." it cannot collapse; an empty relative result is ".".  No
+ * symbolic link is looked at: the $INCLUDE ranges are decided on the text (the loader opens the last component with O_NOFOLLOW). */
+#define INCLUDE_PATH_COMPONENTS_MAX 256
+static bool include_path_normalize(const char *in, char *out, size_t cap) {
+    const char *comp[INCLUDE_PATH_COMPONENTS_MAX];
+    size_t clen[INCLUDE_PATH_COMPONENTS_MAX];
+    size_t n = 0;
+    bool is_abs = in[0] == '/';
+    const char *p = in;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *e = p;
+        while (*e && *e != '/') e++;
+        size_t cl = (size_t)(e - p);
+        if (cl == 1 && p[0] == '.') {
+            /* nothing */
+        } else if (cl == 2 && p[0] == '.' && p[1] == '.') {
+            if (n > 0 && !(clen[n - 1] == 2 && comp[n - 1][0] == '.' && comp[n - 1][1] == '.')) {
+                n--;
+            } else if (is_abs) {
+                return false;
+            } else {
+                if (n >= INCLUDE_PATH_COMPONENTS_MAX) return false;
+                comp[n] = p; clen[n++] = cl;
+            }
+        } else {
+            if (n >= INCLUDE_PATH_COMPONENTS_MAX) return false;
+            comp[n] = p; clen[n++] = cl;
         }
+        p = e;
     }
+    size_t o = 0;
+    if (is_abs) {
+        if (cap < 2) return false;
+        out[o++] = '/';
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (o + clen[i] + 2 > cap) return false;
+        if (i > 0) out[o++] = '/';
+        memcpy(out + o, comp[i], clen[i]);
+        o += clen[i];
+    }
+    if (o == 0) {
+        if (cap < 2) return false;
+        out[o++] = '.';
+    }
+    out[o] = '\0';
+    return true;
+}
 
-    // Completely reject any directory traversal attempts (../)
-    if (strstr(rel_path, "../") != NULL ||
-        (strlen(rel_path) >= 2 && strcmp(rel_path + strlen(rel_path) - 2, "..") == 0)) {
-        if (err_out) err_out->error_message = "Directory traversal (..) in $INCLUDE is not allowed";
+/* Is the normalized path inside the tree of the normalized directory root (or equal to it)?  Both absolute, or both relative. */
+static bool include_path_within(const char *path, const char *root) {
+    bool pabs = path[0] == '/', rabs = root[0] == '/';
+    if (pabs != rabs) return false;
+    if (strcmp(root, ".") == 0)        /* the working directory: any relative path that does not climb out of it */
+        return !(path[0] == '.' && path[1] == '.' && (path[2] == '\0' || path[2] == '/'));
+    size_t rl = strlen(root);
+    /* "/" as a root is only the files directly in it: the server cannot open directories below "/" (dir_fd_cache_add_root() does not
+     * make "/" a root), so a zone file in "/" does not make the whole file system an $INCLUDE range */
+    if (strcmp(root, "/") == 0) return strchr(path + 1, '/') == NULL;
+    return strncmp(path, root, rl) == 0 && (path[rl] == '\0' || path[rl] == '/');
+}
+
+/* The file an $INCLUDE names, or NULL with the reason in ctx->err_out.
+ * BIND 9.20 ARM 3.5.5.3: "The filename can be an absolute path, or a relative path"; a relative one is read from named's working directory,
+ * which is options { directory } (ctx->directory); without it the directory of the zone file (ctx->base_dir) is used, as always.
+ * The Backend runs in capability mode and can open files only below directories that were opened at startup: the directory of the zone
+ * file and options { directory }.  An absolute path, or one that leaves the base through "..", is accepted only if the normalized path
+ * stays inside one of those two trees; the same rule applies in karicheck so that it gives the same verdict as the server. */
+static char *resolve_include_path(const parse_context_t *ctx, const char *path) {
+    parse_error_t *err = ctx->err_out;
+    if (path[0] == '\0') {
+        if (err) err->error_message = "$INCLUDE requires a filename";
         return NULL;
     }
-
-    // Strip leading "./" to help with simple circular detection
-    while (strncmp(rel_path, "./", 2) == 0) {
-        rel_path += 2;
-    }
-
-    char raw[PATH_MAX];
-    if (rel_path[0] == '/') {
-        snprintf(raw, sizeof(raw), "%s", rel_path);
+    char raw[PATH_MAX], norm[PATH_MAX], root1[PATH_MAX], root2[PATH_MAX];
+    bool inside = false;
+    const char *base = ctx->directory && ctx->directory[0] ? ctx->directory : ctx->base_dir;
+    if (path[0] == '/') {
+        if (snprintf(raw, sizeof(raw), "%s", path) >= (int)sizeof(raw)) goto too_long;
     } else {
-        snprintf(raw, sizeof(raw), "%s/%s", base_dir, rel_path);
+        if (snprintf(raw, sizeof(raw), "%s/%s", base, path) >= (int)sizeof(raw)) goto too_long;
     }
-
-    return strdup(raw);
+    if (include_path_normalize(raw, norm, sizeof(norm))) {
+        if (ctx->base_dir && include_path_normalize(ctx->base_dir, root1, sizeof(root1)) && include_path_within(norm, root1))
+            inside = true;
+        if (!inside && ctx->directory && ctx->directory[0] &&
+            include_path_normalize(ctx->directory, root2, sizeof(root2)) && include_path_within(norm, root2))
+            inside = true;
+    }
+    if (!inside) {
+        if (err) {
+            snprintf(err->detail, sizeof(err->detail),
+                     "$INCLUDE '%.200s' is outside the directories opened at startup (zone file dir%s): the sandboxed server can read "
+                     "only below them",
+                     path, ctx->directory && ctx->directory[0] ? ", directory" : "");
+            err->error_message = err->detail;
+        }
+        return NULL;
+    }
+    return strdup(norm);
+too_long:
+    if (err) err->error_message = "$INCLUDE path too long";
+    return NULL;
 }
 
 #define MAX_INCLUDE_DEPTH 16
@@ -485,11 +559,9 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
         return -1;
     }
 
-    parse_error_t path_err = {0};
-    char *resolved = resolve_include_path(ctx->base_dir, fields[1], ctx->is_standalone_mode, &path_err);
+    char *resolved = resolve_include_path(ctx, fields[1]);
     if (!resolved) {
         if (ctx->err_out) {
-            ctx->err_out->error_message = path_err.error_message;
             ctx->err_out->error_offset = (size_t)(fields[1] - cur_buf);
             ctx->err_out->token_length = strlen(fields[1]);
         }
@@ -566,6 +638,8 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
     child_st.origin_io = &child_origin;
 
     int rc = parse_zone_buffer(file_content, strlen(file_content), arena, &child_ctx, &child_st, false);
+    ctx->no_ttl_count = child_ctx.no_ttl_count;               /* the child worked on a copy */
+    ctx->first_no_ttl_owner = child_ctx.first_no_ttl_owner;
 
     if (rc < 0 && ctx && ctx->err_out && !ctx->err_out->file_path) {
         ctx->err_out->file_path = resolved;
@@ -1239,8 +1313,19 @@ PROCESS_RECORD:
         goto DONE;
     }
   if (fields[0][0] == '$' && strcasecmp(fields[0], "$TTL") == 0) {
-    if (field_idx > 1)
-      *default_ttl_str_io = fields[1];
+    /* BIND 9.20 ARM 3.5.5.4: "Valid TTLs are of the range 0-2147483647 seconds"; a value that is not a TTL is an error (it used to
+     * become 3600 without a word) */
+    uint32_t dtv;
+    if (field_idx < 2 || !parse_ttl_strict(fields[1], 2147483647u, &dtv)) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = field_idx < 2 ? "$TTL requires a value"
+                                                    : "Invalid $TTL value (expected 0-2147483647 seconds, or units such as 1h30m)";
+        ctx->err_out->error_offset = (size_t)((field_idx < 2 ? fields[0] : fields[1]) - buf);
+        ctx->err_out->token_length = strlen(field_idx < 2 ? fields[0] : fields[1]);
+      }
+      return -1;
+    }
+    *default_ttl_str_io = fields[1];
     if (p < end)
       goto STATE_START_LINE;
     goto DONE;
@@ -1493,6 +1578,47 @@ PROCESS_RECORD:
   /* TTL を省略したときの値 (R-22 c)。BIND (lib/dns/master.c) と同じ順で決める:
    * 明示した TTL > $TTL (RFC 2308 §4) > 最後に明示された TTL (RFC 1035 §5.1) >
    * TTL の手がかりが無い SOA ならその MINIMUM (以後の既定値になる) > 3600。 */
+  uint32_t ttl_val = 0;
+  bool ttl_val_known = false;
+  if (explicit_ttl) {
+    if (!parse_ttl_strict(explicit_ttl, 2147483647u, &ttl_val)) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = "Invalid TTL (expected 0-2147483647 seconds, or units such as 1h30m)";
+        ctx->err_out->error_offset = (size_t)(explicit_ttl - buf);
+        ctx->err_out->token_length = strlen(explicit_ttl);
+      }
+      return -1;
+    }
+    ttl_val_known = true;
+  }
+  /* The SOA fields refresh, retry, expire and minimum are written like TTLs (RFC 1035 §3.3.13; BIND parses them with
+   * dns_ttl_fromtext): text that is not a number with optional units used to become 3600 in the SOA. */
+  if (rec->type_code == 6 && rec->rdata_count == 7) {
+    /* the serial is a plain number up to 4294967295 (BIND soa_6.c fromtext_soa: a number token, then uint32_tobuffer); anything else rejects
+     * the zone in BIND, here it used to be read as 0 or truncated */
+    uint32_t serial_v;
+    int serial_err;
+    if (!parse_soa_serial_strict(rec->rdata[2], &serial_v, &serial_err)) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = serial_err == 2 ? "SOA serial out of range (expected 0-4294967295)"
+                                                      : "Invalid SOA serial (expected a number 0-4294967295)";
+        ctx->err_out->error_offset = (size_t)(rec->rdata[2] - buf);
+        ctx->err_out->token_length = strlen(rec->rdata[2]);
+      }
+      return -1;
+    }
+    for (int sf = 3; sf <= 6; sf++) {
+      uint32_t sv;
+      if (!parse_ttl_strict(rec->rdata[sf], 0xFFFFFFFFu, &sv)) {
+        if (ctx && ctx->err_out) {
+          ctx->err_out->error_message = "Invalid SOA refresh/retry/expire/minimum value (expected a number, or units such as 1h30m)";
+          ctx->err_out->error_offset = (size_t)(rec->rdata[sf] - buf);
+          ctx->err_out->token_length = strlen(rec->rdata[sf]);
+        }
+        return -1;
+      }
+    }
+  }
   if (explicit_ttl) {
     rec->ttl = explicit_ttl;
     *st->last_ttl_io = explicit_ttl;
@@ -1504,7 +1630,19 @@ PROCESS_RECORD:
     rec->ttl = rec->rdata[6];
     *default_ttl_str_io = rec->rdata[6];
   }
-  rec->ttl_value = rec->ttl ? parse_ttl_value(rec->ttl) : 3600;
+  if (ttl_val_known) {
+    rec->ttl_value = ttl_val;
+  } else if (rec->ttl) {
+    /* $TTL and the earlier explicit TTLs were checked when they were read; the SOA minimum above (0xFFFFFFFF allowed there) is
+     * clamped to 2147483647 like a transferred one (RFC 8767 §4) */
+    rec->ttl_value = parse_ttl_value(rec->ttl);
+  } else {
+    rec->ttl_value = 3600;
+    if (ctx) {
+      if (ctx->no_ttl_count == 0) ctx->first_no_ttl_owner = rec->name;
+      ctx->no_ttl_count++;
+    }
+  }
   rec->class_val = class_val;
   
   // A-1: Unescape fields appropriately

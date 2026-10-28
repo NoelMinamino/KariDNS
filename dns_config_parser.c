@@ -283,12 +283,17 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
       }
       free_token(&tok_semi);
 
+      /* A relative name is read from options { directory } when there is one (BIND 9.20 ARM: every relative path in the configuration
+       * is relative to it), else from the directory of the file that contains the include (what this server has always done). */
       const char *parent_path = frame->file_path;
-      char *base_dir = parent_path ? get_base_dir(parent_path) : strdup(".");
+      char *base_dir = ctx->directory ? strdup(ctx->directory) : parent_path ? get_base_dir(parent_path) : strdup(".");
       char resolved[PATH_MAX];
+      bool was_rel = false;
       if (tok_file.value[0] == '/') {
         snprintf(resolved, sizeof(resolved), "%s", tok_file.value);
       } else {
+        was_rel = true;
+        ctx->rel_includes++;
         snprintf(resolved, sizeof(resolved), "%s/%s", base_dir ? base_dir : ".", tok_file.value);
       }
       if (base_dir) free(base_dir);
@@ -342,6 +347,7 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
       ctx->stack[ctx->depth].len = strlen(content);
       ctx->stack[ctx->depth].dev = inc_dev;
       ctx->stack[ctx->depth].ino = inc_ino;
+      ctx->stack[ctx->depth].via_rel = was_rel;
 
       continue;
     }
@@ -926,6 +932,8 @@ void free_server_config_fields(server_config_t *cfg) {
   if (cfg->user) { free(cfg->user); cfg->user = NULL; }
   if (cfg->group) { free(cfg->group); cfg->group = NULL; }
   if (cfg->pid_file) { free(cfg->pid_file); cfg->pid_file = NULL; }
+  free(cfg->directory);
+  cfg->directory = NULL;
   if (cfg->nsid_string) { free(cfg->nsid_string); cfg->nsid_string = NULL; }
   for (int j = 0; j < cfg->alias_resolvers_count; j++) free(cfg->alias_resolvers[j].ip);
   free(cfg->alias_resolvers);
@@ -2520,7 +2528,7 @@ static const char *const k_bind_options_options[] = {
   "avoid-v4-udp-ports", "avoid-v6-udp-ports", "bindkeys-file", "blackhole", "catalog-zones", "check-dup-records",
   "check-integrity", "check-mx", "check-mx-cname", "check-names", "check-sibling", "check-spf", "check-srv-cname",
   "check-svcb", "check-wildcard", "cleaning-interval", "clients-per-query", "coresize", "datasize", "deallocate-on-exit",
-  "deny-answer-addresses", "deny-answer-aliases", "dialup", "directory", "disable-algorithms", "disable-ds-digests",
+  "deny-answer-addresses", "deny-answer-aliases", "dialup", "disable-algorithms", "disable-ds-digests",
   "disable-empty-zone", "dns64", "dns64-contact", "dns64-server", "dnskey-sig-validity", "dnsrps-enable",
   "dnsrps-library", "dnsrps-options", "dnssec-accept-expired", "dnssec-dnskey-kskonly", "dnssec-enable",
   "dnssec-loadkeys-interval", "dnssec-lookaside", "dnssec-must-be-secure", "dnssec-policy", "dnssec-secure-to-insecure",
@@ -2649,6 +2657,64 @@ static bool restricted_statement(token_ctx_t *ctx, zone_ext_t *x, const char *ke
   return true;
 }
 
+/* Reads what follows the name of a zone or view up to and including the '{': an optional class, then the brace (BIND 9.20 ARM:
+ * `zone <string> [ <class> ] { ... };`, `view <string> [ <class> ] { ... };`).  Only IN is served (case-insensitive); another class is a
+ * configuration error with file:line.  0 = the '{' has been read. */
+static int read_block_open(token_ctx_t *ctx, const char *what) {
+  char db[96];
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type == TOKEN_STRING && tok.value && !tok.is_quoted && !ctx->restricted) {
+    if (strcasecmp(tok.value, "IN") == 0) {
+      free_token(&tok);
+      tok = get_next_token(ctx);
+    } else if (strcasecmp(tok.value, "CH") == 0 || strcasecmp(tok.value, "CHAOS") == 0 || strcasecmp(tok.value, "HS") == 0 ||
+               strcasecmp(tok.value, "HESIOD") == 0 || strncasecmp(tok.value, "CLASS", 5) == 0) {
+      conf_error(ctx, what, "class '%.16s' is not supported (only IN)", tok.value);
+      free_token(&tok);
+      return -1;
+    }
+  }
+  if (tok.type != TOKEN_LBRACE) {
+    if (!ctx->restricted)
+      conf_error(ctx, what, "expected '{' (or a class, IN) but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  return 0;
+}
+
+/* BIND 9.20 ARM "Zone Types": hint, stub, static-stub, mirror and redirect belong to a server that resolves or caches.  delegation-only
+ * was a type of older BIND versions (the 9.20 ARM has it only as the root-delegation-only / delegation-only options). */
+static bool zone_type_is_skipped(const char *t) {
+  static const char *const names[] = {"hint", "stub", "static-stub", "mirror", "redirect", "delegation-only", NULL};
+  for (size_t i = 0; names[i]; i++)
+    if (strcasecmp(t, names[i]) == 0) return true;
+  return false;
+}
+
+/* The statements of a zone block after the one just read, up to and including the closing "};" */
+static int skip_rest_of_zone_block(token_ctx_t *ctx) {
+  int depth = 0;
+  for (;;) {
+    conf_token_t tok = get_next_token(ctx);
+    if (tok.type == TOKEN_EOF) {
+      free_token(&tok);
+      if (ctx) ctx->error_occurred = true;
+      return -1;
+    }
+    bool close = tok.type == TOKEN_RBRACE && depth == 0;
+    if (tok.type == TOKEN_LBRACE) depth++;
+    else if (tok.type == TOKEN_RBRACE && depth > 0) depth--;
+    free_token(&tok);
+    if (close) break;
+  }
+  conf_token_t tok = get_next_token(ctx);
+  bool ok = tok.type == TOKEN_SEMICOLON;
+  free_token(&tok);
+  return ok ? 0 : -1;
+}
+
 static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t **zone_out);
 static int parse_notify_mode(token_ctx_t *ctx, const char *what, uint8_t *out);
 static int masters_build_parsed(zone_ext_t *x);
@@ -2711,13 +2777,15 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
 static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t **zone_out) {
   zone_ext_t *x = zone->ext;
   int nr_rc = 0;
-  conf_token_t tok = get_next_token(ctx);
-  if (tok.type != TOKEN_LBRACE) {
-    free_zone_config(zone);
-    free_token(&tok);
-    return -1;
+  conf_token_t tok;
+  {
+    char zw[DNS_NAME_TEXT_SIZE + 16];
+    snprintf(zw, sizeof(zw), "zone '%.255s'", zone->domain ? zone->domain : "");
+    if (read_block_open(ctx, zw) != 0) {
+      free_zone_config(zone);
+      return -1;
+    }
   }
-  free_token(&tok);
   while (1) {
     tok = get_next_token(ctx);
     if (tok.type == TOKEN_RBRACE) {
@@ -2827,6 +2895,23 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
           canon = "program";
         else if (strcasecmp(val, "forward") == 0)
           canon = "forward";
+        if (!canon && zone_type_is_skipped(val)) {
+          /* a BIND zone type that only a caching / resolving server uses (hint, stub, static-stub, mirror, redirect): the zone is not
+           * loaded, the rest of its block is skipped, and the configuration is accepted so that a stock BIND named.conf can be checked
+           * and used (BIND 9.20 ARM "Zone Types") */
+          char loc[300];
+          ctx_location(ctx, loc, sizeof(loc));
+          syslog(LOG_WARNING, "[Config] %s: zone '%s': type '%s' is a BIND zone type for resolvers that KariDNS (authoritative only) does not "
+                 "implement; the zone is not loaded", loc, zone->domain, val);
+          fprintf(stderr, "[WARNING] %s: zone '%s': type '%s' is a BIND zone type for resolvers that KariDNS (authoritative only) does not "
+                  "implement; the zone is not loaded\n", loc, zone->domain, val);
+          free(key);
+          free(val);
+          free_zone_config(zone);
+          if (skip_rest_of_zone_block(ctx) != 0) return -1;
+          *zone_out = NULL;
+          return 0;
+        }
         if (canon) {
           free(val);
           free(zone->type);
@@ -3117,6 +3202,15 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       free_token(&tok);
       if (key[0] == 't') x->transfer_acl_match = m;
       else x->update_acl_match = m;
+    } else if (strcmp(key, "in-view") == 0) {
+      /* BIND: the zone is the one of another view.  Skipping the statement would leave an empty primary zone, so it is an error until
+       * zones can be shared between views */
+      char iw[DNS_NAME_TEXT_SIZE + 16];
+      snprintf(iw, sizeof(iw), "zone '%.255s'", zone->domain);
+      conf_error(ctx, iw, "'in-view' (a zone shared with another view) is not supported");
+      free(key);
+      free_zone_config(zone);
+      return -1;
     } else if (unknown_statement(ctx, "zone", zone->domain, key, false) != 0) {
       free(key);
       free_zone_config(zone);
@@ -3927,6 +4021,132 @@ int also_notify_effective(const server_config_t *cfg, const zone_config_t *zone,
   return 0;
 }
 
+/* *path becomes "dir/path" when it is a relative path (an absolute one, "" and NULL stay).  false = out of memory. */
+static bool dir_prefix_path(char **path, const char *dir) {
+  if (!*path || (*path)[0] == '\0' || (*path)[0] == '/') return true;
+  size_t n = strlen(dir) + 1 + strlen(*path) + 1;
+  char *p = malloc(n);
+  if (!p) return false;
+  snprintf(p, n, "%s/%s", dir, *path);
+  free(*path);
+  *path = p;
+  return true;
+}
+
+static bool dir_prefix_zones(zone_config_t *z, const char *dir) {
+  for (; z; z = z->next)
+    if (!dir_prefix_path(&z->file, dir)) return false;
+  return true;
+}
+
+/* The directory the server was started in (config_set_base_cwd), NULL in karicheck and the tests. */
+static char *g_conf_base_cwd = NULL;
+
+void config_set_base_cwd(const char *cwd) {
+  free(g_conf_base_cwd);
+  g_conf_base_cwd = (cwd && cwd[0] == '/') ? strdup(cwd) : NULL;
+}
+
+/* *path becomes "<startup directory>/<path>" when a startup directory is known and *path is relative; an absolute path, "" and NULL stay.
+ * The result must not be longer than maxlen bytes: a configuration error, never a truncated path.  -1 = error (reported, ctx marked). */
+static int path_absolutize(token_ctx_t *ctx, char **path, const char *what, size_t maxlen) {
+  if (!g_conf_base_cwd || !*path || (*path)[0] == '\0' || (*path)[0] == '/') return 0;
+  size_t n = strlen(g_conf_base_cwd) + 1 + strlen(*path);
+  if (n > maxlen) {
+    conf_error(ctx, "options", "%s: the relative path '%.64s' is %zu bytes long once it is made absolute against the directory karidns was "
+               "started in (at most %zu); use a shorter path", what, *path, n, maxlen);
+    return -1;
+  }
+  char *p = malloc(n + 1);
+  if (!p) {
+    ctx->error_occurred = true;
+    return -1;
+  }
+  snprintf(p, n + 1, "%s/%s", g_conf_base_cwd, *path);
+  free(*path);
+  *path = p;
+  return 0;
+}
+
+/* options { directory } (BIND 9.20 ARM): the base of every relative path.  Decides which directory applies (the one the running server was
+ * started with when config_pin_directory() was called, else the one written), keeps it in config->directory and makes the relative paths
+ * of the configuration absolute-or-startup-relative by putting it in front: zone `file`, `pid-file`, the files of logging channels and the
+ * database files (`include` statements were resolved against it while they were read).  The server chdir()s to the directory once at start-up,
+ * which is what the UNIX socket paths of `control-channel` and `dnstap` rely on.
+ * Everything downstream (the directory fd cache, the zone loader, the logging code) then sees ordinary paths and opens the directory
+ * once, before the sandbox, like any other.  Without a directory nothing changes: relative paths are relative to the directory the
+ * server was started in.
+ * When the server told the parser where it was started (config_set_base_cwd), the paths that the loader child (started from "/") or a
+ * reload in another working directory would not find are made absolute here, once: the directory itself, pid-file, loader-path and the database files that karidns-dbloader (started
+ * from "/" too) opens.  UNIX socket paths and the files that go through the directory fd cache (which resolves relative names against the
+ * startup directory fd, not the current directory) are left as they are. */
+static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
+  char *written = ctx->dir_written ? strdup(ctx->dir_written) : NULL;
+  char *eff = NULL;
+  int rc = -1;
+  if (ctx->dir_written && !written) goto oom;
+  if (written && path_absolutize(ctx, &written, "options: directory", KARIDNS_DB_PATH_MAX) != 0) goto out;
+  if (ctx->dir_pinned) {
+    if (ctx->directory) {
+      eff = strdup(ctx->directory);
+      if (!eff) goto oom;
+      if (path_absolutize(ctx, &eff, "options: directory", KARIDNS_DB_PATH_MAX) != 0) goto out;
+    }
+    bool same = written ? (eff && strcmp(written, eff) == 0) : eff == NULL;
+    if (!same) {
+      syslog(LOG_WARNING, "[Config] options: directory %s%s%s differs from the directory the server was started with (%s%s%s); "
+             "the running server keeps using the old one until it is restarted",
+             written ? "'" : "", written ? written : "(not set)", written ? "'" : "", eff ? "'" : "", eff ? eff : "not set", eff ? "'" : "");
+      fprintf(stderr, "[WARNING] options: directory %s%s%s differs from the directory the server was started with (%s%s%s); "
+              "the running server keeps using the old one until it is restarted\n",
+              written ? "'" : "", written ? written : "(not set)", written ? "'" : "", eff ? "'" : "", eff ? eff : "not set", eff ? "'" : "");
+      config->directory_changed = true;
+    }
+    free(written);
+  } else {
+    bool seen_by_include = ctx->dir_written && ctx->directory && strcmp(ctx->dir_written, ctx->directory) == 0;
+    if (ctx->dir_written && !seen_by_include && ctx->dir_rel_before > 0) {
+      conf_error(ctx, "options", "directory: relative 'include' statements were read before this statement, which is not in the main "
+                 "configuration file; write 'directory' in the main file (BIND applies it to every include)");
+      goto out;
+    }
+    eff = written;
+  }
+  written = NULL;
+  if (eff) {
+    config->directory = strdup(eff);
+    if (!config->directory) goto oom;
+    bool ok = true;
+    if (config->pid_file && strcmp(config->pid_file, "none") != 0) ok = ok && dir_prefix_path(&config->pid_file, eff);
+    ok = ok && dir_prefix_zones(config->zones, eff);
+    for (view_config_t *v = config->views; ok && v; v = v->next) {
+      ok = dir_prefix_zones(v->zones, eff) && dir_prefix_path(&v->database_file, eff);
+    }
+    for (log_channel_t *c = config->logging.channels; ok && c; c = c->next)
+      ok = dir_prefix_path(&c->file_path, eff);
+    /* the control-channel and dnstap sockets are NOT prefixed: a UNIX socket path holds 103 bytes (sun_path), a deep directory would overflow
+     * it, and the server chdir()s to the directory at start-up (and daemonize() no longer leaves it), so the relative name resolves there */
+    ok = ok && dir_prefix_path(&config->database.database_file, eff) && dir_prefix_path(&config->database.conninfo_file, eff);
+    if (!ok) goto oom;
+  }
+  /* what is still relative (no directory, or a relative directory without a startup directory) and is opened after daemonize() */
+  if (config->pid_file && strcmp(config->pid_file, "none") != 0 &&
+      path_absolutize(ctx, &config->pid_file, "pid-file", KARIDNS_DB_PATH_MAX) != 0) goto out;
+  if (path_absolutize(ctx, &config->database.database_file, "database database-file", KARIDNS_DB_PATH_MAX) != 0 ||
+      path_absolutize(ctx, &config->database.conninfo_file, "database conninfo-file", KARIDNS_DB_PATH_MAX) != 0 ||
+      path_absolutize(ctx, &config->database.loader_path, "database loader-path", KARIDNS_DB_PATH_MAX) != 0) goto out;
+  for (view_config_t *v = config->views; v; v = v->next)
+    if (path_absolutize(ctx, &v->database_file, "view database-file", KARIDNS_DB_PATH_MAX) != 0) goto out;
+  rc = 0;
+  goto out;
+oom:
+  ctx->error_occurred = true;
+out:
+  free(written);
+  free(eff);
+  return rc;
+}
+
 static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) {
   int nr_rc = 0;
   memset(config, 0, sizeof(server_config_t));
@@ -4003,7 +4223,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         tok.value = NULL;
         free_token(&tok);
         if (strcmp(key, "port") == 0 || strcmp(key, "user") == 0 ||
-            strcmp(key, "group") == 0 || strcmp(key, "pid-file") == 0) {
+            strcmp(key, "group") == 0 || strcmp(key, "pid-file") == 0 || strcmp(key, "directory") == 0) {
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(key);
@@ -4024,8 +4244,29 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           if (strcmp(key, "port") == 0) {
             char *endptr;
             long pval = strtol(val, &endptr, 10);
-            if (*endptr == '\0' && pval > 0 && pval <= 65535) config->port = (int)pval;
+            if (val[0] == '\0' || *endptr != '\0' || pval <= 0 || pval > 65535) {
+              conf_error(ctx, "options", "port: invalid port '%.64s' (expected 1-65535)", val);
+              free(key);
+              free(val);
+              return -1;
+            }
+            config->port = (int)pval;
             free(val);
+          } else if (strcmp(key, "directory") == 0) {
+            /* BIND 9.20 ARM: "This sets the working directory of the server"; every relative path of the configuration is relative to
+             * it.  Applied when the whole configuration has been read (config_apply_directory), so the statement may come after the
+             * paths it affects. */
+            if (val[0] == '\0') {
+              conf_error(ctx, "options", "directory: an empty directory name");
+              free(key);
+              free(val);
+              return -1;
+            }
+            free(ctx->dir_written);
+            ctx->dir_written = val;
+            ctx->dir_rel_before = ctx->rel_includes;
+            for (int fi = 1; fi <= ctx->depth && fi < MAX_INCLUDE_DEPTH; fi++)
+              if (ctx->stack[fi].via_rel) ctx->dir_rel_before--;
           } else if (strcmp(key, "user") == 0) {
             if (config->user) free(config->user);
             config->user = val;
@@ -4511,9 +4752,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       view->name = tok.value;
       tok.value = NULL;
       free_token(&tok);
-      tok = get_next_token(ctx);
-      if (tok.type != TOKEN_LBRACE) { free(view->name); free(view); free_token(&tok); return -1; }
-      free_token(&tok);
+      {
+        char vw[KARIDNS_VIEW_NAME_MAX + 16];
+        snprintf(vw, sizeof(vw), "view '%s'", view->name);
+        if (read_block_open(ctx, vw) != 0) { free(view->name); free(view); return -1; }
+      }
       zone_config_t *last_view_zone = NULL;
       while (1) {
         tok = get_next_token(ctx);
@@ -4584,6 +4827,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free_partial_view(view);
             return -1;
           }
+          if (!z) continue; /* a zone type that is not loaded (zone_type_is_skipped) */
           /* 重複は検索と同じ規則で判定する ("example.test" と "example.test." は同じゾーン) */
           int ins = zone_cfg_index_insert(&view->zone_index, z, NULL);
           if (ins != 0) {
@@ -4634,6 +4878,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       free_token(&tok);
       zone_config_t *zone = NULL;
       if (parse_zone_block(ctx, &zone) != 0) return -1;
+      if (!zone) continue; /* a zone type that is not loaded (zone_type_is_skipped); it does not make the configuration a "top-level zone" one */
       int ins = zone_cfg_index_insert(&config->top_zone_index, zone, NULL);
       if (ins != 0) {
         if (ins > 0) {
@@ -5337,6 +5582,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       skip_unknown_block(ctx);
     }
   }
+  if (config_apply_directory(ctx, config) != 0) return -1;
   if (saw_view_block && saw_top_level_zone) {
     syslog(LOG_ERR, "Cannot mix top-level zone and view blocks");
     // トップレベル直付けの zone_config_t リストを完全解放してリークを防ぐ
@@ -5491,6 +5737,78 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   return 0;
 }
 
+/* ---- options { directory } ---- */
+
+static bool g_dir_pinned = false;
+static char *g_dir_pinned_val = NULL;
+
+void config_pin_directory(const char *dir) {
+  free(g_dir_pinned_val);
+  g_dir_pinned_val = dir ? strdup(dir) : NULL;
+  g_dir_pinned = dir == NULL || g_dir_pinned_val != NULL;
+}
+
+void config_unpin_directory(void) {
+  free(g_dir_pinned_val);
+  g_dir_pinned_val = NULL;
+  g_dir_pinned = false;
+}
+
+/* The value of the last `directory "..."` statement of an `options { }` block in text (the main configuration file only: nothing
+ * is included, no file is opened).  The relative `include` statements that come before the statement in the file need the value
+ * when they are read, and BIND applies `directory` to all of them.  Returns a new string, or NULL when there is none. */
+static char *config_scan_directory(const char *text) {
+  config_file_frame_t fr;
+  memset(&fr, 0, sizeof(fr));
+  fr.src = (char *)text;
+  fr.len = strlen(text);
+  char *found = NULL;
+  int depth = 0;
+  bool in_options = false;     /* depth 1 of an options block */
+  bool stmt_start = true;      /* the next token begins a statement (at depth 0, or at depth 1 of options) */
+  bool cand_options = false;   /* the token just read was the unquoted word `options` at the start of a top-level statement */
+  char *key = NULL, *val = NULL;
+  int nstr = 0;                /* string tokens of the statement being read at depth 1 of options */
+  for (;;) {
+    conf_token_t t = get_raw_token_from_frame(&fr);
+    if (t.type == TOKEN_EOF) { free_token(&t); break; }
+    if (t.type == TOKEN_STRING && !t.value) break;
+    if (t.type == TOKEN_LBRACE) {
+      if (depth == 0 && cand_options) in_options = true;
+      depth++;
+      nstr = 0;
+      cand_options = false;
+      stmt_start = in_options && depth == 1;
+    } else if (t.type == TOKEN_RBRACE) {
+      if (depth > 0) depth--;
+      if (depth == 0) in_options = false;
+      nstr = 0;
+      cand_options = false;
+      stmt_start = depth == 0 || (in_options && depth == 1);
+    } else if (t.type == TOKEN_SEMICOLON) {
+      if (in_options && depth == 1 && nstr == 2 && key && val && strcmp(key, "directory") == 0) {
+        free(found);
+        found = strdup(val);
+      }
+      nstr = 0;
+      cand_options = false;
+      stmt_start = depth == 0 || (in_options && depth == 1);
+    } else {
+      cand_options = depth == 0 && stmt_start && !t.is_quoted && t.value && strcmp(t.value, "options") == 0;
+      if (in_options && depth == 1) {
+        if (nstr == 0) { free(key); key = t.value ? strdup(t.value) : NULL; }
+        else if (nstr == 1) { free(val); val = t.value ? strdup(t.value) : NULL; }
+        nstr++;
+      }
+      stmt_start = false;
+    }
+    free_token(&t);
+  }
+  free(key);
+  free(val);
+  return found;
+}
+
 int parse_named_conf_ext(const char *config_str, const char *initial_file_path, server_config_t *config) {
   if (!config_str || !config) return -1;
   token_ctx_t ctx;
@@ -5520,8 +5838,16 @@ int parse_named_conf_ext(const char *config_str, const char *initial_file_path, 
   ctx.depth = 0;
   ctx.error_occurred = false;
 
+  /* the directory the relative `include` statements are read from: the one the server was started with, else the one the main file
+   * writes (see config_scan_directory) */
+  char *scanned = g_dir_pinned ? NULL : config_scan_directory(config_str);
+  ctx.directory = g_dir_pinned ? g_dir_pinned_val : scanned;
+  ctx.dir_pinned = g_dir_pinned;
+
   int res = parse_named_conf_internal(&ctx, config);
 
+  free(ctx.dir_written);
+  free(scanned);
   config_lexer_cleanup(&ctx);
   if (res != 0 || ctx.error_occurred) {
     free_server_config_fields(config);

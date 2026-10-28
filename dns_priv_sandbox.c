@@ -31,6 +31,7 @@ typedef struct dir_fd_entry {
   char *dirpath;
   int fd;
   bool is_writable;
+  bool is_root;   /* dir_fd_cache_add_root(): directories below this one can be opened through fd in capability mode */
   struct dir_fd_entry *next;
 } dir_fd_entry_t;
 
@@ -47,6 +48,43 @@ static bool path_has_dotdot_component(const char *p) {
   return false;
 }
 
+#ifndef O_RESOLVE_BENEATH
+#define O_RESOLVE_BENEATH 0
+#endif
+
+/* Capability mode, directory not cached: open it through the fd of a root registered with dir_fd_cache_add_root() that contains it
+ * (the longest such root), as a read-only directory below it.  Only a plain relative remainder is accepted ("a/b", no "..", no leading
+ * '/'), and O_RESOLVE_BENEATH keeps symbolic links from leading out.  The new fd is cached like any other.  g_dir_fd_lock is held. */
+static int open_dir_below_root_locked(const char *dirpath) {
+  dir_fd_entry_t *best = NULL;
+  size_t best_len = 0;
+  for (dir_fd_entry_t *e = g_dir_fd_table; e; e = e->next) {
+    if (!e->is_root) continue;
+    size_t n = strlen(e->dirpath);
+    if (n == 0 || n >= strlen(dirpath) || strncmp(dirpath, e->dirpath, n) != 0 || dirpath[n] != '/') continue;
+    if (n > best_len) { best = e; best_len = n; }
+  }
+  if (!best) return -1;
+  const char *rem = dirpath + best_len + 1;
+  while (*rem == '/') rem++;
+  if (!*rem || path_has_dotdot_component(rem)) return -1;
+  int fd = openat(best->fd, rem, O_DIRECTORY | O_CLOEXEC | O_RDONLY | O_RESOLVE_BENEATH);
+  if (fd < 0) return -1;
+  cap_rights_t rights;
+  cap_rights_init(&rights, CAP_LOOKUP, CAP_READ, CAP_FSTAT, CAP_FSTATFS, CAP_SEEK, CAP_FCNTL);
+  dir_fd_entry_t *ne = calloc(1, sizeof(*ne));
+  if ((cap_rights_limit(fd, &rights) != 0 && errno != ENOSYS) || !ne || !(ne->dirpath = strdup(dirpath))) {
+    if (ne) free(ne->dirpath);
+    free(ne);
+    close(fd);
+    return -1;
+  }
+  ne->fd = fd;
+  ne->next = g_dir_fd_table;
+  g_dir_fd_table = ne;
+  return fd;
+}
+
 static int get_or_open_dir_fd(const char *dirpath, bool writable) {
   pthread_mutex_lock(&g_dir_fd_lock);
   for (dir_fd_entry_t *e = g_dir_fd_table; e; e = e->next) {
@@ -59,9 +97,10 @@ static int get_or_open_dir_fd(const char *dirpath, bool writable) {
     }
   }
   if (atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
+    int bfd = writable ? -1 : open_dir_below_root_locked(dirpath);
     pthread_mutex_unlock(&g_dir_fd_lock);
-    errno = ENOTCAPABLE;
-    return -1;
+    if (bfd < 0) errno = ENOTCAPABLE;
+    return bfd;
   }
   int fd;
   char abs_dir[PATH_MAX];
@@ -135,6 +174,20 @@ int open_via_dir_cache(const char *path, int flags, mode_t mode,
   if (dfd < 0)
     return -1;
   return openat(dfd, basebuf, flags | O_RESOLVE_BENEATH, mode);
+}
+
+bool dir_fd_cache_add_root(const char *dirpath) {
+  if (!dirpath || !*dirpath) {
+    errno = EINVAL;
+    return false;
+  }
+  int fd = get_or_open_dir_fd(dirpath, false);
+  if (fd < 0) return false;
+  pthread_mutex_lock(&g_dir_fd_lock);
+  for (dir_fd_entry_t *e = g_dir_fd_table; e; e = e->next)
+    if (strcmp(e->dirpath, dirpath) == 0) e->is_root = true;
+  pthread_mutex_unlock(&g_dir_fd_lock);
+  return true;
 }
 
 /* Takes CAP_FCHOWN off fd (a file opened through a writable directory fd inherits it). */

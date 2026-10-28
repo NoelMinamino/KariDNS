@@ -233,7 +233,10 @@ echo "[+] Test 8: karicheck CLI options & usage..."
 # Test 9: Bad TTL Suffix & Number Overflow Handling
 echo "[+] Test 9: Bad TTL suffix handling (test_err_ttl_invalid.zone)..."
 OUT9=$(./karicheck zone err-ttl.example. tests/zones/test_err_ttl_invalid.zone 2>&1 || true)
-echo "  PASS: test_err_ttl_invalid.zone processed safely."
+case "$OUT9" in
+    *'Invalid $TTL value'*) echo '  PASS: test_err_ttl_invalid.zone is rejected ($TTL 100X is not a TTL).' ;;
+    *) echo "  FAIL: test_err_ttl_invalid.zone was not rejected for its \$TTL: $OUT9"; FAILED=1 ;;
+esac
 
 # Test 10: Bad Directives
 echo "[+] Test 10: Bad directives (test_err_bad_directive.zone)..."

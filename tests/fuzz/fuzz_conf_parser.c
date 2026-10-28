@@ -34,7 +34,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     server_config_t config;
     memset(&config, 0, sizeof(config));
 
+    /* options { directory }: the directory of a running server (a reload) is pinned, one that was not started with a directory is a pin
+     * to "none"; the bytes choose, so that the prefixing of relative paths, the changed-directory report and the unpinned scan all run */
+    if (size & 2) config_pin_directory((size & 4) ? "/pinned" : NULL);
+    else config_unpin_directory();
     int prc = parse_named_conf(text_buf, &config);
+    config_unpin_directory();
 
     /* B8t-2: the settings a primary sends for each zone (zone_settings_render) must be accepted by the restricted parser on the secondary,
      * and merging them into a zone block (zone_config_with_received) must not fail or leak */

@@ -2753,6 +2753,7 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
   if (str_differs(o->user, n->user)) append_list_item(buf, sz, "user");
   if (str_differs(o->group, n->group)) append_list_item(buf, sz, "group");
   if (str_differs(o->pid_file, n->pid_file)) append_list_item(buf, sz, "pid-file");
+  if (n->directory_changed) append_list_item(buf, sz, "directory");
   if (o->udp_recvbuf_size != n->udp_recvbuf_size) append_list_item(buf, sz, "udp-recvbuf-size");
   if (o->udp_sndbuf_size != n->udp_sndbuf_size) append_list_item(buf, sz, "udp-sndbuf-size");
   if (o->tcp_window != n->tcp_window) append_list_item(buf, sz, "tcp-window");
@@ -4779,8 +4780,10 @@ STATIC_TEST void daemonize(void) {
     exit(EXIT_FAILURE);
   if (pid > 0)
     exit(EXIT_SUCCESS);
-  if (chdir("/") < 0)
-    exit(EXIT_FAILURE);
+  /* No chdir("/") here (BIND's named_os_daemonize() does not either): the daemon keeps the directory it was started in, or options
+   * { directory } (main() chdir()s there once), so that a relative UNIX socket path (control-channel, dnstap) means the same after this
+   * point as before it.  A pid file and the other files are opened through absolute names or the directory fd cache anyway.  The cost is
+   * the one BIND has: that directory's file system stays busy, and a core dump is written there. */
   close(STDIN_FILENO);
   close(STDOUT_FILENO);
   close(STDERR_FILENO);
@@ -4855,15 +4858,15 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
 
 /* 非root起動時に、path (pid file / 制御ソケット) を作成できるかを
  * daemonize() 前に検査する。root起動時は ensure_priv_dir_safe() が
- * ディレクトリを用意するため対象外。daemonize() は chdir("/") するため、
- * デーモン起動時の相対パスは後段の実処理 (失敗すれば起動中止) に任せる。
+ * ディレクトリを用意するため対象外。daemonize() は cwd を変えないので、
+ * 相対パスもデーモン起動時を含め、実際に使われるときと同じ cwd (起動ディレクトリ、
+ * または options { directory }) で検査する。
  * check_existing: 既存ファイルを上書きオープンする場合 (pid file) は
  * ファイル自体の書き込み権も検査する。 */
 STATIC_TEST bool preflight_writable_path(const char *path, const char *what, bool foreground,
                                          bool check_existing, const char *hint) {
+  (void)foreground;
   if (!path || path[0] == '\0' || strcmp(path, "none") == 0 || geteuid() == 0)
-    return true;
-  if (path[0] != '/' && !foreground)
     return true;
 
   char dir[PATH_MAX];
@@ -4893,6 +4896,22 @@ STATIC_TEST bool preflight_writable_path(const char *path, const char *what, boo
          what, path, problem, (unsigned)geteuid(), strerror(err), hint);
   fprintf(stderr, "[ERROR] Cannot create %s '%s': '%s' is not writable by uid %u (%s). %s\n",
           what, path, problem, (unsigned)geteuid(), strerror(err), hint);
+  return false;
+}
+
+/* A UNIX socket path (control-channel, dnstap) must fit sun_path.  Checked before daemonize() so that the message reaches the terminal
+ * (the later bind() / connect() would cut the name or fail with ENAMETOOLONG after stderr is gone).  The name is used as written: a relative
+ * one resolves against the working directory, which is options { directory } when that is set (main() chdir()s there). */
+STATIC_TEST bool check_unix_socket_path(const char *path, const char *what) {
+  struct sockaddr_un un;
+  if (!path || strlen(path) < sizeof(un.sun_path))
+    return true;
+  syslog(LOG_ERR, "[Config] Refusing to start: the %s '%.40s...' is %zu bytes long; a UNIX socket path holds at most %zu bytes (sun_path). "
+         "Use a shorter name: a relative one is resolved against options { directory } or the directory karidns was started in.",
+         what, path, strlen(path), sizeof(un.sun_path) - 1);
+  fprintf(stderr, "[ERROR] Refusing to start: the %s '%.40s...' is %zu bytes long; a UNIX socket path holds at most %zu bytes (sun_path). "
+          "Use a shorter name: a relative one is resolved against options { directory } or the directory karidns was started in.\n",
+          what, path, strlen(path), sizeof(un.sun_path) - 1);
   return false;
 }
 
@@ -5148,6 +5167,8 @@ int main(int argc, char **argv) {
   if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
     g_startup_cwd[0] = '\0';
   }
+  /* the parser makes the paths that the loader child (started from "/") and the pid file use absolute against this directory (or options { directory }) */
+  config_set_base_cwd(g_startup_cwd[0] == '/' ? g_startup_cwd : NULL);
   signal(SIGPIPE, SIG_IGN);
   /* SIGHUP/SIGUSR1/SIGUSR2 の既定動作はプロセス終了。fork する全子プロセス (ブローカー・
    * フロントエンドルーター・バックエンド) のために fork 前に無視にしておく。pkill -HUP karidns の
@@ -5188,6 +5209,28 @@ int main(int argc, char **argv) {
     return 1;
   }
   free(config_str);
+  /* options { directory }: opened once, here, before any sandbox; a reload keeps using it (config_pin_directory) and reports a changed
+   * value as needing a restart.  Its sub-directories (zone files below it, $INCLUDE files) are reached through this fd afterwards. */
+  config_pin_directory(g_config_db.config_a.directory);
+  if (g_config_db.config_a.directory && !dir_fd_cache_add_root(g_config_db.config_a.directory)) {
+    syslog(LOG_ERR, "[Config] Refusing to start: options { directory \"%s\"; } cannot be opened: %s", g_config_db.config_a.directory,
+           strerror(errno));
+    fprintf(stderr, "[ERROR] Refusing to start: options { directory \"%s\"; } cannot be opened: %s\n", g_config_db.config_a.directory,
+            strerror(errno));
+    free_server_config_fields(&g_config_db.config_a);
+    return 1;
+  }
+  /* BIND changes into the directory as soon as it has read the statement (directory_callback in bin/named/server.c).  Done once here, before
+   * the start-up checks and daemonize() (which no longer leaves the directory): a relative control-channel or dnstap socket path is then
+   * looked for in the same place by the pre-flight check, bind() and connect().  A reload never changes directory. */
+  if (g_config_db.config_a.directory && chdir(g_config_db.config_a.directory) != 0) {
+    syslog(LOG_ERR, "[Config] Refusing to start: cannot change to options { directory \"%s\"; }: %s", g_config_db.config_a.directory,
+           strerror(errno));
+    fprintf(stderr, "[ERROR] Refusing to start: cannot change to options { directory \"%s\"; }: %s\n", g_config_db.config_a.directory,
+            strerror(errno));
+    free_server_config_fields(&g_config_db.config_a);
+    return 1;
+  }
   g_config_db.config_a.generation = 1;
   /* 共有の応答キャッシュ: 起動時に 1 回だけ確保する (大きさの変更は再起動で反映) */
   if (g_config_db.config_a.response_cache_size > 0 &&
@@ -5206,6 +5249,31 @@ int main(int argc, char **argv) {
     effective_pid_file = g_config_db.config_a.pid_file;
   } else if (!foreground) {
     effective_pid_file = "/var/run/karidns/karidns.pid";
+  }
+  /* A relative pid file name from -P / -p is made absolute against the startup directory here, like the one from the configuration
+   * (config_set_base_cwd): with options { directory } the process is in that directory by now, and -P is relative to where the command
+   * was typed.  A name that does not fit g_pid_file_path is an error, never a truncated path. */
+  char cli_pid_abs[sizeof(g_pid_file_path)];
+  if (effective_pid_file && effective_pid_file == cli_pid_file && effective_pid_file[0] != '/' &&
+      strcmp(effective_pid_file, "none") != 0 && effective_pid_file[0] != '\0' && g_startup_cwd[0] == '/') {
+    int pn = snprintf(cli_pid_abs, sizeof(cli_pid_abs), "%s/%s", g_startup_cwd, effective_pid_file);
+    if (pn < 0 || (size_t)pn >= sizeof(cli_pid_abs)) {
+      syslog(LOG_ERR, "[Config] Refusing to start: the PID file '%.64s' is %d bytes long once it is made absolute against the directory "
+             "karidns was started in (at most %zu); use a shorter path or an absolute one", effective_pid_file, pn, sizeof(cli_pid_abs) - 1);
+      fprintf(stderr, "[ERROR] Refusing to start: the PID file '%.64s' is %d bytes long once it is made absolute against the directory "
+              "karidns was started in (at most %zu); use a shorter path or an absolute one\n", effective_pid_file, pn, sizeof(cli_pid_abs) - 1);
+      free_server_config_fields(&g_config_db.config_a);
+      return 1;
+    }
+    effective_pid_file = cli_pid_abs;
+  }
+  if (effective_pid_file && strlen(effective_pid_file) >= sizeof(g_pid_file_path)) {
+    syslog(LOG_ERR, "[Config] Refusing to start: the PID file path is %zu bytes long (at most %zu)", strlen(effective_pid_file),
+           sizeof(g_pid_file_path) - 1);
+    fprintf(stderr, "[ERROR] Refusing to start: the PID file path is %zu bytes long (at most %zu)\n", strlen(effective_pid_file),
+            sizeof(g_pid_file_path) - 1);
+    free_server_config_fields(&g_config_db.config_a);
+    return 1;
   }
 
   // ---- 起動前検証 ----------------------------------------------------------
@@ -5241,6 +5309,11 @@ int main(int argc, char **argv) {
     }
   }
   if (!validate_program_zone_users(&g_config_db.config_a) ||
+      (g_config_db.config_a.control.enabled &&
+       !check_unix_socket_path(g_config_db.config_a.control.socket_path ? g_config_db.config_a.control.socket_path :
+                                   "/var/run/karidns/control.sock", "control-channel socket path")) ||
+      (g_config_db.config_a.dnstap.enabled &&
+       !check_unix_socket_path(g_config_db.config_a.dnstap.socket_path, "dnstap socket path")) ||
       !preflight_writable_path(effective_pid_file, "pid file", foreground, true,
                                "Use -P <path> or options { pid-file \"<path>\"; } to point it at a "
                                "directory you can write to, or pid-file \"none\".") ||
