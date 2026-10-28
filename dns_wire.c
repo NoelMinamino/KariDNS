@@ -25,7 +25,7 @@
 #define LOG_DEBUG   7
 #define syslog(prio, ...) ((void)0)
 #else
-#include <syslog.h>
+#include "dns_log.h"
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>

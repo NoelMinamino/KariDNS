@@ -832,10 +832,44 @@ uint32_t get_effective_query_log_max_qps(const server_config_t *cfg);
 void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct tm *tm_info);
 void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, zone_observatory_snapshot_t *out);
 bool ensure_priv_dir_safe(const char *dir_buf);
-bool init_logging_channels(server_config_t *cfg);
-bool init_logging_channels_ex(server_config_t *cfg, bool hand_off);
-void hand_off_logging_channels(server_config_t *cfg);
-void logging_drop_fchown(server_config_t *cfg);
+/* dns_server_core.c: open the files of the channels in `list` (the other kinds of channel need nothing).  0 = all open; 1 = nothing wrong but a
+ * file in a directory the sandbox cannot reach any more (a reload that names a new directory: it takes effect after a restart); -1 = a
+ * file could not be opened or is refused (logged).  hand_off: give the files to the run user (the start-up does that later, see
+ * hand_off_logging_channels()). */
+int log_open_channels(log_channel_t *list, bool hand_off);
+/* the files of the installed runtime: give them to the run user (root start-up with `user`), and take away the fchown right */
+void hand_off_logging_channels(void);
+void logging_drop_fchown(void);
+
+/* dns_log.c: the operational log (see the top of that file) */
+typedef struct log_runtime log_runtime_t;
+typedef enum { LOGRT_OK = 0, LOGRT_RESTART, LOGRT_ERROR } logrt_status_t;
+typedef enum { KLOG_ROLE_BACKEND = 0, KLOG_ROLE_AUX } klog_role_t;
+typedef struct {
+  char buf[32768];
+  size_t len;
+} klog_batch_t;
+/* Build the runtime of a parsed `logging` statement and open its files.  NULL with *status LOGRT_RESTART: only a new directory stood in the way
+ * (keep the runtime in use and report "restart needed"); LOGRT_ERROR: a file could not be opened (reject the configuration). */
+log_runtime_t *log_runtime_build(const logging_config_t *lc, bool hand_off, logrt_status_t *status);
+bool log_runtime_install(log_runtime_t *rt);   /* false: the runtime before the previous one is still in use; rt is not installed */
+void log_runtime_free(log_runtime_t *rt);
+void log_channel_free(log_channel_t *ch);
+log_runtime_t *log_runtime_acquire(void);
+void log_runtime_release(log_runtime_t *rt);
+log_channel_t *log_runtime_current_channels(void);
+log_channel_t *const *log_runtime_route(const log_runtime_t *rt, int cat, int *n);
+void klog_set_role(klog_role_t role);
+bool klog_guard_enter(void);
+void klog_guard_leave(bool prev);
+int klog_category_for_message(const char *fmt);
+int klog_level_from_priority(int prio);
+bool klog_level_passes(int channel_level, int level);
+size_t klog_build_line(const log_channel_t *ch, int cat, int level, const struct timespec *ts, const char *msg, char *out, size_t n);
+void klog_channel_emit(log_channel_t *ch, int cat, int level, const struct timespec *ts, const char *msg);
+void klog_record(log_runtime_t *rt, int cat, int level, const struct timespec *ts, const char *msg);
+void klog_batch_add(klog_batch_t *b, log_channel_t *ch, int cat, int level, const struct timespec *ts, const char *msg);
+void klog_batch_flush(klog_batch_t *b, log_channel_t *ch);
 const char *bind_error_hint(int err, int port);
 int parse_cli_port_arg(const char *val, int *port_out);
 const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size);

@@ -16,7 +16,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
-#include <syslog.h>
+#include "dns_log.h"
 #include <assert.h>
 
 #include "dns_zone_image.h"

@@ -742,3 +742,100 @@ bool identity_names_root(const char *user, const char *group, char *err, size_t 
   return false;
 }
 #endif
+
+#ifndef _WIN32
+/* ---- the entry points of the operational log (dns_log.h) ---- */
+#include <errno.h>
+#include <stdarg.h>
+#include <syslog.h>
+#include "dns_logcat.h"
+#include "dns_log.h"
+#undef syslog   /* the calls below are the real syslog() (or the unit test's stub), not kdns_syslog() */
+
+/* Written once, before the threads exist (the server installs it at start-up); null = no routing. */
+static _Atomic(klog_hook_t) g_klog_hook;
+
+void klog_set_hook(klog_hook_t hook) {
+  atomic_store_explicit(&g_klog_hook, hook, memory_order_release);
+}
+
+const char *const log_category_names[LOGC_COUNT] = {
+  [LOGC_DEFAULT] = "default", [LOGC_GENERAL] = "general", [LOGC_SSLKEYLOG] = "sslkeylog", [LOGC_NOTIFY] = "notify",
+  [LOGC_DATABASE] = "database", [LOGC_SECURITY] = "security", [LOGC_DNSSEC] = "dnssec", [LOGC_RESOLVER] = "resolver",
+  [LOGC_XFER_IN] = "xfer-in", [LOGC_XFER_OUT] = "xfer-out", [LOGC_DISPATCH] = "dispatch", [LOGC_LAME_SERVERS] = "lame-servers",
+  [LOGC_EDNS_DISABLED] = "edns-disabled", [LOGC_RPZ] = "rpz", [LOGC_RATE_LIMIT] = "rate-limit", [LOGC_CNAME] = "cname",
+  [LOGC_SPILL] = "spill", [LOGC_DNSTAP] = "dnstap", [LOGC_ZONELOAD] = "zoneload", [LOGC_NSID] = "nsid",
+  [LOGC_RPZ_PASSTHRU] = "rpz-passthru", [LOGC_CLIENT] = "client", [LOGC_NETWORK] = "network", [LOGC_UPDATE] = "update",
+  [LOGC_QUERIES] = "queries", [LOGC_UPDATE_SECURITY] = "update-security", [LOGC_QUERY_ERRORS] = "query-errors",
+  [LOGC_TRUST_ANCHOR_TELEMETRY] = "trust-anchor-telemetry", [LOGC_SERVE_STALE] = "serve-stale", [LOGC_RESPONSES] = "responses",
+  [LOGC_CONFIG] = "config", [LOGC_UNMATCHED] = "unmatched",
+};
+
+int log_category_from_name(const char *name) {
+  if (!name) return -1;
+  for (int i = 0; i < LOGC_COUNT; i++)
+    if (strcmp(name, log_category_names[i]) == 0) return i;
+  return -1;
+}
+
+/* syslog() understands %m (the text of errno); vsnprintf() does not everywhere.  Expand it first (a '%' inside the text is doubled).
+ * A format too long to expand is left as it is. */
+size_t klog_vformat(char *buf, size_t n, const char *fmt, va_list ap, int saved_errno) {
+  if (!buf || n == 0) return 0;
+  char fbuf[KLOG_MSG_MAX];
+  const char *f = fmt;
+  if (strstr(fmt, "%m") && strlen(fmt) < sizeof(fbuf) / 2) {
+    size_t o = 0;
+    for (const char *p = fmt; *p && o + 2 < sizeof(fbuf); p++) {
+      if (p[0] == '%' && p[1] == '%') {
+        fbuf[o++] = '%';
+        fbuf[o++] = '%';
+        p++;
+      } else if (p[0] == '%' && p[1] == 'm') {
+        for (const char *e = strerror(saved_errno); *e && o + 3 < sizeof(fbuf); e++) {
+          if (*e == '%') fbuf[o++] = '%';
+          fbuf[o++] = *e;
+        }
+        p++;
+      } else {
+        fbuf[o++] = *p;
+      }
+    }
+    fbuf[o] = '\0';
+    f = fbuf;
+  }
+  int r = vsnprintf(buf, n, f, ap);
+  if (r < 0) {
+    buf[0] = '\0';
+    return 0;
+  }
+  return (size_t)r < n ? (size_t)r : n - 1;
+}
+
+static void klog_dispatch(int cat, int prio, const char *fmt, va_list ap, int saved_errno) {
+  klog_hook_t hook = atomic_load_explicit(&g_klog_hook, memory_order_acquire);
+  if (hook) {
+    hook(cat, prio, fmt, ap, saved_errno);
+    return;
+  }
+  char msg[KLOG_MSG_MAX];
+  klog_vformat(msg, sizeof(msg), fmt, ap, saved_errno);
+  syslog(prio, "%s", msg);
+}
+
+void kdns_syslog(int prio, const char *fmt, ...) {
+  int saved = errno;
+  va_list ap;
+  va_start(ap, fmt);
+  klog_dispatch(LOGC_AUTO, prio, fmt, ap, saved);
+  va_end(ap);
+}
+
+void kdns_logc(int cat, int prio, const char *fmt, ...) {
+  int saved = errno;
+  va_list ap;
+  va_start(ap, fmt);
+  klog_dispatch(cat, prio, fmt, ap, saved);
+  va_end(ap);
+}
+#endif

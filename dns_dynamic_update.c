@@ -23,7 +23,7 @@
 #include <string.h>
 #include <sys/event.h>
 #include <sys/socket.h>
-#include <syslog.h>
+#include "dns_log.h"
 #include <time.h>
 #include <unistd.h>
 
@@ -363,7 +363,7 @@ static const char *notify_tsig_why(int tv) {
 /* An answer that was accepted: log it (the same words over UDP and TCP) */
 static void notify_log_answer(const notify_pending_t *p, const char *a, unsigned rcode, const char *via) {
   if (rcode != 0) syslog(LOG_WARNING, "[Notify] zone '%s': %s answered NOTIFY%s with rcode %u", p->domain, a, via, rcode);
-  else syslog(LOG_DEBUG, "[Notify] zone '%s': NOTIFY acknowledged by %s%s", p->domain, a, via);
+  else syslog(LOG_INFO, "[Notify] zone '%s': NOTIFY acknowledged by %s%s", p->domain, a, via);
 }
 
 /* ---- NOTIFY over TCP ----

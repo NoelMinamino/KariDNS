@@ -13,7 +13,7 @@
 #define LOG_DEBUG   7
 #define syslog(prio, ...) ((void)0)
 #else
-#include <syslog.h>
+#include "dns_log.h"
 #endif
 
 static void compute_mask(uint8_t *mask, int prefix, int total_bytes) {

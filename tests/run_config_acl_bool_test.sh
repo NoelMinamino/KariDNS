@@ -5,7 +5,7 @@
 # Phase 12 (D-01, D-02, D-22, D-23): configuration parser behaviour seen through karicheck and a
 # running server.
 #  karicheck conf: invalid boolean values and invalid ACL entries are errors; a category with
-#  several channels is accepted with a warning; karicheck zones checks "type Master;" zones and
+#  several channels is accepted (BIND writes to all of them); karicheck zones checks "type Master;" zones and
 #  reports skipped ones.
 #  karidns: a named acl in allow-transfer allows AXFR from 127.0.0.1, "!acl" refuses it, and
 #  "print-time true;" puts the time in the query log.
@@ -73,7 +73,7 @@ karicheck_case "D-02 catalog-zone maybe" conf 1 "invalid catalog-zone value 'may
 karicheck_case "D-02 additional-from-auth bogus" conf 1 "invalid additional-from-auth value 'bogus'" \
     "options { additional-from-auth bogus; }; $Z"
 karicheck_case "D-02 TRUE and 0 accepted" conf 0 "is valid" "options { serve-stale TRUE; minimal-any 0; }; $Z"
-karicheck_case "D-01 category list" conf 0 "only the first channel ('a') is used, ignoring 'b'" \
+karicheck_case "D-01 category list" conf 0 "is valid" \
     "logging { channel a { file \"$TMP_DIR/logs/a.log\"; }; channel b { file \"$TMP_DIR/logs/b.log\"; }; category queries { a; b; }; }; $Z"
 karicheck_case "D-22 bad address" conf 1 "entry '192.0.2.300' is not an address" \
     "zone \"acl.example\" { type master; file \"$TMP_DIR/acl.example.zone\"; allow-transfer { 192.0.2.300; }; };"

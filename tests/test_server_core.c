@@ -37,6 +37,8 @@
 #include "dns_query_engine.h"
 #include "dns_edns_ecs.h"
 #include "dns_priv_sandbox.h"
+#include "dns_log.h"
+#include <stdarg.h>
 #include <pwd.h>
 #include <grp.h>
 
@@ -402,9 +404,7 @@ static void test_submit_response_log(void) {
     // Setup active config with response logging enabled
     server_config_t mock_cfg;
     memset(&mock_cfg, 0, sizeof(mock_cfg));
-    log_channel_t resp_ch;
-    memset(&resp_ch, 0, sizeof(resp_ch));
-    mock_cfg.logging.responses_channel = &resp_ch;
+    mock_cfg.logging.responses_enabled = true;
 
     atomic_store_explicit(&g_config_db.active, &mock_cfg, memory_order_release);
 
@@ -869,6 +869,49 @@ static void test_ensure_priv_dir_safe(void) {
     printf("  -> ensure_priv_dir_safe passed.\n");
 }
 
+/* A logging runtime with one file channel for `cat`, printing the time, the category and the severity, installed for the logger threads
+ * (they read the channels from the runtime, the switch from the configuration).  Returns it; test_retire_runtime() replaces it by an empty one. */
+static log_runtime_t *test_install_file_runtime(int cat, const char *name, const char *path, bool prefixes) {
+    log_channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.name = (char *)name;
+    ch.file_path = (char *)path;
+    ch.dest = LOGDEST_FILE;
+    ch.level = LOG_LVL_INFO;
+    ch.versions = LOG_VERSIONS_UNSET;
+    ch.fd = -1;
+    ch.time_fmt = prefixes ? LOGTIME_LOCAL : LOGTIME_NONE;
+    ch.print_category = ch.print_severity = prefixes;
+    logging_config_t lc;
+    memset(&lc, 0, sizeof(lc));
+    lc.channels = &ch;
+    lc.cat[cat].n = 1;
+    lc.cat[cat].name[0] = (char *)name;
+    logrt_status_t st;
+    log_runtime_t *rt = log_runtime_build(&lc, false, &st);
+    assert(rt && st == LOGRT_OK);
+    assert(log_runtime_install(rt));
+    return rt;
+}
+
+static void test_retire_runtime(log_runtime_t *rt) {
+    (void)rt;
+    logrt_status_t st;
+    log_runtime_t *empty = log_runtime_build(NULL, false, &st);
+    assert(empty);
+    assert(log_runtime_install(empty));
+}
+
+static bool test_file_has(const char *path, const char *needle) {
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    char buf[65536];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+    return strstr(buf, needle) != NULL;
+}
+
 // ----------------------------------------------------------------------------
 // 12. Response Logger Background Thread Test
 // ----------------------------------------------------------------------------
@@ -879,19 +922,10 @@ static void test_response_logger_thread_func(void) {
     snprintf(log_path, sizeof(log_path), "/tmp/karidns_test_resp_thread_%ld.log", (long)time(NULL));
     unlink(log_path);
 
-    log_channel_t resp_ch;
-    memset(&resp_ch, 0, sizeof(resp_ch));
-    resp_ch.file_path = log_path;
-    resp_ch.print_time = true;
-    resp_ch.print_category = true;
-    resp_ch.print_severity = true;
-    resp_ch.fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    assert(resp_ch.fd >= 0);
-    pthread_mutex_init(&resp_ch.lock, NULL);
-
+    log_runtime_t *test_rt = test_install_file_runtime(LOGC_RESPONSES, "resp", log_path, true);
     server_config_t mock_cfg;
     memset(&mock_cfg, 0, sizeof(mock_cfg));
-    mock_cfg.logging.responses_channel = &resp_ch;
+    mock_cfg.logging.responses_enabled = true;
 
     atomic_store_explicit(&g_config_db.active, &mock_cfg, memory_order_release);
     atomic_store_explicit(&g_resp_log_tail, 0, memory_order_relaxed);
@@ -931,12 +965,14 @@ static void test_response_logger_thread_func(void) {
     pthread_join(th, NULL);
 
     atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
-    if (resp_ch.fd >= 0) close(resp_ch.fd);
-    pthread_mutex_destroy(&resp_ch.lock);
+    test_retire_runtime(test_rt);
 
     struct stat st;
     assert(stat(log_path, &st) == 0);
     assert(st.st_size > 0);
+    /* <time> responses: info: client <ip>#<port> (<qname>): response: ...  The channel adds the prefix (the time, "responses: ", "info: ") */
+    assert(test_file_has(log_path, " responses: info: client 192.0.2.1#5353 (example.com.): response: example.com. IN A +E(0)D -> NOERROR\n"));
+    assert(test_file_has(log_path, " responses: info: client 198.51.100.1#4000 (rrl.example.com.): response: rrl.example.com. IN A  -> SERVFAIL [DROP:RRL]\n"));
     unlink(log_path);
 
     printf("  -> response_logger_thread_func passed.\n");
@@ -952,19 +988,10 @@ static void test_query_logger_thread_func(void) {
     snprintf(log_path, sizeof(log_path), "/tmp/karidns_test_query_thread_%ld.log", (long)time(NULL));
     unlink(log_path);
 
-    log_channel_t q_ch;
-    memset(&q_ch, 0, sizeof(q_ch));
-    q_ch.file_path = log_path;
-    q_ch.print_time = true;
-    q_ch.print_category = true;
-    q_ch.print_severity = true;
-    q_ch.fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    assert(q_ch.fd >= 0);
-    pthread_mutex_init(&q_ch.lock, NULL);
-
+    log_runtime_t *test_rt = test_install_file_runtime(LOGC_QUERIES, "q", log_path, true);
     server_config_t mock_cfg;
     memset(&mock_cfg, 0, sizeof(mock_cfg));
-    mock_cfg.logging.queries_channel = &q_ch;
+    mock_cfg.logging.queries_enabled = true;
 
     worker_ctx_t worker;
     memset(&worker, 0, sizeof(worker));
@@ -1022,13 +1049,14 @@ static void test_query_logger_thread_func(void) {
     atomic_store_explicit(&g_worker_ctxs, NULL, memory_order_release);
     atomic_store_explicit(&g_worker_count, 0, memory_order_relaxed);
 
-    if (q_ch.fd >= 0) close(q_ch.fd);
-    pthread_mutex_destroy(&q_ch.lock);
+    test_retire_runtime(test_rt);
     free(worker.qlog_ring.events);
 
     struct stat st;
     assert(stat(log_path, &st) == 0);
     assert(st.st_size > 0);
+    assert(test_file_has(log_path, " queries: info: client 192.0.2.55#5300 (q1.example.com.): query: q1.example.com. IN A +E(0)D\n"));
+    assert(test_file_has(log_path, " queries: info: client 2001:db8::99#5301 (q2.example.com.): query: q2.example.com. ANY AAAA +E(0)K\n"));
     unlink(log_path);
 
     printf("  -> query_logger_thread_func passed.\n");
@@ -2143,7 +2171,7 @@ static void test_nonroot_startup_identity_and_preflight(void) {
     test_set_listen(&cfg, "127.0.0.1", cfg.port);
     assert(preflight_listen_ports(&cfg));
 
-    /* ログファイルを開けなければ init_logging_channels は false を返す */
+    /* ログファイルを開けなければ log_open_channels は 0 以外を返す */
     log_channel_t ch;
     memset(&ch, 0, sizeof(ch));
     char ch_name[] = "bad";
@@ -2151,10 +2179,7 @@ static void test_nonroot_startup_identity_and_preflight(void) {
     ch.name = ch_name;
     ch.file_path = ch_path;
     ch.fd = -1;
-    server_config_t lcfg;
-    memset(&lcfg, 0, sizeof(lcfg));
-    lcfg.logging.channels = &ch;
-    assert(!init_logging_channels(&lcfg));
+    assert(log_open_channels(&ch, true) == -1);
     assert(ch.fd < 0);
 
     printf("  -> non-root startup identity / preflight checks passed.\n");
@@ -2200,9 +2225,13 @@ static void test_log_hand_off_after_priv_dir_check(void) {
     ch2.file_path = logp2;
     ch2.fd = -1;
     ch.next = &ch2;
-    cfg.logging.channels = &ch;
 
-    assert(init_logging_channels_ex(&cfg, false));
+    logging_config_t lcfg;
+    memset(&lcfg, 0, sizeof(lcfg));
+    lcfg.channels = &ch;
+    logrt_status_t lst;
+    log_runtime_t *hrt = log_runtime_build(&lcfg, false, &lst);
+    assert(hrt && log_runtime_install(hrt));
     struct stat st;
     assert(stat(sub, &st) == 0 && st.st_uid == 0);   /* created, not handed off yet */
     assert(ensure_priv_dir_safe(sub));               /* pid file dir check passes */
@@ -2210,7 +2239,7 @@ static void test_log_hand_off_after_priv_dir_check(void) {
     run_identity_t saved_id = g_run_identity;
     char id_err[256];
     assert(resolve_run_identity(cfg.user, NULL, &g_run_identity, id_err, sizeof(id_err)));
-    hand_off_logging_channels(&cfg);
+    hand_off_logging_channels();
     g_run_identity = saved_id;
     uid_t nobody = getpwnam("nobody")->pw_uid;
     assert(stat(sub, &st) == 0 && st.st_uid == nobody);      /* the directory karidns created is the run user's */
@@ -2223,14 +2252,567 @@ static void test_log_hand_off_after_priv_dir_check(void) {
 
     assert(stat(logp2, &st) == 0);
 
-    close(ch.fd);
-    close(ch2.fd);
+    test_retire_runtime(hrt);
     unlink(logp);
     unlink(logp2);
     rmdir(sub);
     rmdir(keep);
     rmdir(dir);
     printf("  -> log ownership hand-off after pid-dir check passed.\n");
+}
+
+// ----------------------------------------------------------------------------
+// BIND logging (batch 6): categories of the messages, severities, lines, channels, the runtime and its replacement
+// Expectations from BIND 9.20.4 lib/isc/log.c (isc_log_doit(): the channel list, the default category, the severity test, the line, the
+// syslog map; isc_log_open(): rolling; FILE_MAXREACHED), lib/isc/time.c (the three time formats), bin/named/log.c (the built-in channels).
+// ----------------------------------------------------------------------------
+static char *klog_slurp(const char *path) {
+    FILE *f = fopen(path, "r");
+    char *buf = calloc(1, 262144);
+    assert(buf);
+    if (f) {
+        size_t n = fread(buf, 1, 262143, f);
+        buf[n] = '\0';
+        fclose(f);
+    }
+    return buf;
+}
+
+static int klog_lines(const char *path) {
+    char *s = klog_slurp(path);
+    int n = 0;
+    for (const char *p = s; *p; p++)
+        if (*p == '\n') n++;
+    free(s);
+    return n;
+}
+
+static void klog_expect(const char *path, const char *want) {
+    char *s = klog_slurp(path);
+    if (strcmp(s, want) != 0) {
+        printf("  [FAIL] %s:\n--- want\n%s--- got\n%s---\n", path, want, s);
+        assert(0);
+    }
+    free(s);
+}
+
+/* parse the logging statement of `text` and install the runtime built from it (files in `dir`) */
+static log_runtime_t *klog_install_conf(const char *text) {
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    assert(parse_named_conf(text, &cfg) == 0);
+    logrt_status_t st;
+    log_runtime_t *rt = log_runtime_build(&cfg.logging, false, &st);
+    assert(rt && st == LOGRT_OK);
+    free_server_config_fields(&cfg);   /* the runtime has copied everything */
+    assert(log_runtime_install(rt));
+    return rt;
+}
+
+static void test_klog_categories_levels_lines(void) {
+    printf("[TEST] Logging: category of a message, severities, the text of a line...\n");
+    static const struct { const char *msg; int cat; } t[] = {
+        { "[Config] x", LOGC_CONFIG }, { "[AXFR] x", LOGC_XFER_IN }, { "[IXFR] x", LOGC_XFER_IN }, { "[XFR] x", LOGC_XFER_IN },
+        { "[Notify] x", LOGC_NOTIFY }, { "[Update] x", LOGC_UPDATE }, { "[TSIG] x", LOGC_SECURITY }, { "[Cookie] x", LOGC_SECURITY },
+        { "[Zone] x", LOGC_ZONELOAD }, { "[ZoneLoader] x", LOGC_ZONELOAD }, { "[Image] x", LOGC_ZONELOAD }, { "[tinydns] x", LOGC_ZONELOAD },
+        { "[DB] x", LOGC_DATABASE }, { "[Network] x", LOGC_NETWORK }, { "[RRL] x", LOGC_RATE_LIMIT }, { "[dnstap] x", LOGC_DNSTAP },
+        { "[QueryLog] x", LOGC_GENERAL }, { "[Control] x", LOGC_GENERAL }, { "[Catalog] x", LOGC_GENERAL }, { "[Manager] x", LOGC_GENERAL },
+        { "[Backend] x", LOGC_GENERAL }, { "[Frontend 2] x", LOGC_GENERAL }, { "[Core] x", LOGC_GENERAL }, { "[Startup] x", LOGC_GENERAL },
+        { "[Broker] x", LOGC_GENERAL }, { "[IPC] x", LOGC_GENERAL }, { "[EpochRCU] x", LOGC_GENERAL }, { "[GC] x", LOGC_GENERAL },
+        { "[Logging] x", LOGC_GENERAL }, { "[Plugin] x", LOGC_GENERAL }, { "[Alias] x", LOGC_GENERAL }, { "[Forward] x", LOGC_GENERAL },
+        { "[Notify]", LOGC_NOTIFY },                       /* the prefix is all there is */
+        { "[%s] dropped", LOGC_GENERAL },                  /* a prefix made at run time */
+        { "[Unknown] x", LOGC_GENERAL }, { "[Notifyxxxxxxxxxxxxxxxxxxxxxx] x", LOGC_GENERAL }, { "no prefix", LOGC_GENERAL }, { "[", LOGC_GENERAL },
+        { "", LOGC_GENERAL },
+    };
+    for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+        if (klog_category_for_message(t[i].msg) != t[i].cat)
+            printf("  [FAIL] category of \"%s\": %d, wanted %d\n", t[i].msg, klog_category_for_message(t[i].msg), t[i].cat);
+        assert(klog_category_for_message(t[i].msg) == t[i].cat);
+    }
+    assert(klog_category_for_message(NULL) == LOGC_GENERAL);
+
+    /* syslog priorities -> BIND levels (the facility bits do not matter) */
+    assert(klog_level_from_priority(LOG_EMERG) == LOG_LVL_CRITICAL && klog_level_from_priority(LOG_ALERT) == LOG_LVL_CRITICAL);
+    assert(klog_level_from_priority(LOG_CRIT) == LOG_LVL_CRITICAL && klog_level_from_priority(LOG_ERR) == LOG_LVL_ERROR);
+    assert(klog_level_from_priority(LOG_WARNING) == LOG_LVL_WARNING && klog_level_from_priority(LOG_NOTICE) == LOG_LVL_NOTICE);
+    assert(klog_level_from_priority(LOG_INFO) == LOG_LVL_INFO && klog_level_from_priority(LOG_DEBUG) == 1);
+    assert(klog_level_from_priority(LOG_LOCAL3 | LOG_WARNING) == LOG_LVL_WARNING);
+
+    /* a channel passes a message whose level is at most its own; dynamic: at most the debug level in force (0) */
+    assert(klog_level_passes(LOG_LVL_CRITICAL, LOG_LVL_CRITICAL) && !klog_level_passes(LOG_LVL_CRITICAL, LOG_LVL_ERROR));
+    assert(klog_level_passes(LOG_LVL_WARNING, LOG_LVL_ERROR) && klog_level_passes(LOG_LVL_WARNING, LOG_LVL_WARNING));
+    assert(!klog_level_passes(LOG_LVL_WARNING, LOG_LVL_NOTICE) && !klog_level_passes(LOG_LVL_WARNING, LOG_LVL_INFO));
+    assert(klog_level_passes(LOG_LVL_INFO, LOG_LVL_INFO) && !klog_level_passes(LOG_LVL_INFO, 1));
+    assert(klog_level_passes(LOG_LVL_DYNAMIC, LOG_LVL_INFO) && klog_level_passes(LOG_LVL_DYNAMIC, LOG_LVL_CRITICAL) && !klog_level_passes(LOG_LVL_DYNAMIC, 1));
+    assert(klog_level_passes(3, 1) && klog_level_passes(3, 3) && !klog_level_passes(3, 4) && klog_level_passes(3, LOG_LVL_INFO));
+
+    /* the lines.  The zone is UTC so that the local formats can be compared with text */
+    setenv("TZ", "UTC", 1);
+    tzset();
+    struct timespec ts = { .tv_sec = 1793156645, .tv_nsec = 678912345 };   /* 2026-10-28 03:04:05.678 UTC */
+    log_channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    char line[512];
+    ch.time_fmt = LOGTIME_NONE;
+    assert(klog_build_line(&ch, LOGC_QUERIES, LOG_LVL_INFO, &ts, "hello", line, sizeof(line)) == 5 && strcmp(line, "hello") == 0);
+    ch.time_fmt = LOGTIME_LOCAL;
+    klog_build_line(&ch, LOGC_QUERIES, LOG_LVL_INFO, &ts, "hello", line, sizeof(line));
+    assert(strcmp(line, "28-Oct-2026 03:04:05.678 hello") == 0);
+    ch.time_fmt = LOGTIME_ISO8601;
+    klog_build_line(&ch, LOGC_QUERIES, LOG_LVL_INFO, &ts, "hello", line, sizeof(line));
+    assert(strcmp(line, "2026-10-28T03:04:05.678 hello") == 0);          /* no zone, like isc_time_formatISO8601Lms() */
+    ch.time_fmt = LOGTIME_ISO8601_UTC;
+    klog_build_line(&ch, LOGC_QUERIES, LOG_LVL_INFO, &ts, "hello", line, sizeof(line));
+    assert(strcmp(line, "2026-10-28T03:04:05.678Z hello") == 0);
+    ts.tv_sec += 1;   /* the cached second must not be reused */
+    klog_build_line(&ch, LOGC_QUERIES, LOG_LVL_INFO, &ts, "hello", line, sizeof(line));
+    assert(strcmp(line, "2026-10-28T03:04:06.678Z hello") == 0);
+    /* the UTC form is computed without gmtime_r() (it loads a zone file, which capability mode forbids): the edge dates */
+    static const struct { time_t t; const char *text; } utc[] = {
+        { 0, "1970-01-01T00:00:00.678Z m" }, { -1, "1969-12-31T23:59:59.678Z m" }, { 951782400, "2000-02-29T00:00:00.678Z m" },
+        { 951868800, "2000-03-01T00:00:00.678Z m" }, { 4107542400LL, "2100-03-01T00:00:00.678Z m" },
+        { 253402300799LL, "9999-12-31T23:59:59.678Z m" }, { 1793156645, "2026-10-28T03:04:05.678Z m" },
+        { 1709164799, "2024-02-28T23:59:59.678Z m" }, { 1709251199, "2024-02-29T23:59:59.678Z m" },
+    };
+    for (size_t i = 0; i < sizeof(utc) / sizeof(utc[0]); i++) {
+        struct timespec u = { .tv_sec = utc[i].t, .tv_nsec = 678912345 };
+        klog_build_line(&ch, LOGC_QUERIES, LOG_LVL_INFO, &u, "m", line, sizeof(line));
+        if (strcmp(line, utc[i].text) != 0) printf("  [FAIL] utc %lld: %s, wanted %s\n", (long long)utc[i].t, line, utc[i].text);
+        assert(strcmp(line, utc[i].text) == 0);
+    }
+    ch.time_fmt = LOGTIME_NONE;
+    ch.print_category = true;
+    klog_build_line(&ch, LOGC_XFER_IN, LOG_LVL_INFO, &ts, "m", line, sizeof(line));
+    assert(strcmp(line, "xfer-in: m") == 0);
+    ch.print_category = false;
+    ch.print_severity = true;
+    static const struct { int level; const char *text; } lv[] = {
+        { LOG_LVL_CRITICAL, "critical: m" }, { LOG_LVL_ERROR, "error: m" }, { LOG_LVL_WARNING, "warning: m" }, { LOG_LVL_NOTICE, "notice: m" },
+        { LOG_LVL_INFO, "info: m" }, { 1, "debug 1: m" }, { 7, "debug 7: m" }, { -9, "level -9: m" },
+    };
+    for (size_t i = 0; i < sizeof(lv) / sizeof(lv[0]); i++) {
+        klog_build_line(&ch, LOGC_DEFAULT, lv[i].level, &ts, "m", line, sizeof(line));
+        assert(strcmp(line, lv[i].text) == 0);
+    }
+    ch.time_fmt = LOGTIME_LOCAL;
+    ch.print_category = true;
+    klog_build_line(&ch, LOGC_UPDATE_SECURITY, LOG_LVL_ERROR, &ts, "denied", line, sizeof(line));
+    assert(strcmp(line, "28-Oct-2026 03:04:06.678 update-security: error: denied") == 0);
+    klog_build_line(&ch, 999, LOG_LVL_ERROR, &ts, "x", line, sizeof(line));   /* an unknown category prints nothing for it */
+    assert(strcmp(line, "28-Oct-2026 03:04:06.678 error: x") == 0);
+    /* a small buffer cuts the line and keeps it terminated */
+    char small[12];
+    assert(klog_build_line(&ch, LOGC_DEFAULT, LOG_LVL_ERROR, &ts, "a long message", small, sizeof(small)) == sizeof(small) - 1);
+    assert(small[sizeof(small) - 1] == '\0');
+    assert(klog_build_line(&ch, LOGC_DEFAULT, LOG_LVL_ERROR, &ts, "m", small, 0) == 0);
+
+    printf("  -> categories / levels / lines passed.\n");
+}
+
+static char g_vf_out[KLOG_MSG_MAX];
+static size_t g_vf_len;
+static void test_klog_vformat(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    g_vf_len = klog_vformat(g_vf_out, sizeof(g_vf_out), fmt, ap, ENOENT);
+    va_end(ap);
+}
+
+static void test_klog_format(void) {
+    printf("[TEST] Logging: klog_vformat() (%%m, cutting)...\n");
+    test_klog_vformat("open %s: %m", "/x");
+    assert(strcmp(g_vf_out, "open /x: No such file or directory") == 0 && g_vf_len == strlen(g_vf_out));
+    test_klog_vformat("100%% sure: %m (%d)", 5);
+    assert(strcmp(g_vf_out, "100% sure: No such file or directory (5)") == 0);
+    test_klog_vformat("%%m is not an error text");
+    assert(strcmp(g_vf_out, "%m is not an error text") == 0);
+    test_klog_vformat("no conversion");
+    assert(strcmp(g_vf_out, "no conversion") == 0);
+    char big[2000];
+    memset(big, 'x', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+    test_klog_vformat("%s", big);
+    assert(g_vf_len == KLOG_MSG_MAX - 1 && strlen(g_vf_out) == KLOG_MSG_MAX - 1);
+    test_klog_vformat("%.0s%m%.0s", "", "");    /* nothing but the error text */
+    assert(strcmp(g_vf_out, "No such file or directory") == 0);
+    /* a long format with %m is expanded without overflowing the buffer used for it; a message that does not fit is cut */
+    char longfmt[501];
+    memset(longfmt, 'f', sizeof(longfmt) - 1);
+    longfmt[sizeof(longfmt) - 1] = '\0';
+    memcpy(longfmt + 10, "%m", 2);
+    test_klog_vformat(longfmt);
+    assert(g_vf_len == 498 + strlen("No such file or directory") && strncmp(g_vf_out + 10, "No such file", 12) == 0);
+    char tiny[8];
+    va_list none;
+    memset(&none, 0, sizeof(none));
+    assert(klog_vformat(tiny, 0, "x", none, 0) == 0);          /* no room: nothing written (the va_list is not touched) */
+    printf("  -> klog_vformat passed.\n");
+}
+
+static void test_klog_routing(void) {
+    printf("[TEST] Logging: routing of messages to channels (categories, default category, severities, duplicates)...\n");
+    setenv("TZ", "UTC", 1);
+    tzset();
+    char dir[] = "/tmp/karidns_klog_XXXXXX";
+    assert(mkdtemp(dir));
+    char conf[4096];
+    snprintf(conf, sizeof(conf),
+             "logging {\n"
+             " channel gen  { file \"%s/gen.log\"; print-category yes; print-severity yes; };\n"
+             " channel warn { file \"%s/warn.log\"; severity warning; print-time iso8601-utc; };\n"
+             " channel nul  { null; };\n"
+             " channel dbg  { file \"%s/dbg.log\"; severity debug 5; print-severity yes; };\n"
+             " channel dyn  { file \"%s/dyn.log\"; severity dynamic; };\n"
+             " category default { gen; };\n category notify { warn; dbg; };\n category xfer-in { nul; };\n category security { dyn; dbg; };\n"
+             "};\n", dir, dir, dir, dir);
+    char p_gen[300], p_warn[300], p_dbg[300], p_dyn[300];
+    snprintf(p_gen, sizeof(p_gen), "%s/gen.log", dir);
+    snprintf(p_warn, sizeof(p_warn), "%s/warn.log", dir);
+    snprintf(p_dbg, sizeof(p_dbg), "%s/dbg.log", dir);
+    snprintf(p_dyn, sizeof(p_dyn), "%s/dyn.log", dir);
+    log_runtime_t *rt = klog_install_conf(conf);
+    (void)rt;
+
+    kdns_syslog(LOG_INFO, "[Config] reloaded %d zones", 3);             /* config has no channel: the default category's */
+    kdns_syslog(LOG_WARNING, "[Notify] zone '%s': failed", "a.test");   /* notify: warn and dbg */
+    kdns_syslog(LOG_INFO, "[Notify] acknowledged");                     /* below warning: only dbg */
+    kdns_syslog(LOG_DEBUG, "[Notify] debug text");                      /* debug 1: dbg (debug 5) only */
+    kdns_syslog(LOG_DEBUG, "[Config] debug text");                      /* default: gen is info, drops it */
+    kdns_syslog(LOG_ERR, "[AXFR] goes nowhere");                        /* xfer-in has the null channel only */
+    kdns_syslog(LOG_NOTICE, "[TSIG] bad signature");                    /* security: dyn and dbg */
+    kdns_syslog(LOG_DEBUG, "[TSIG] debug text");                        /* dynamic drops debug 1, dbg keeps it */
+    errno = ENOENT;
+    kdns_syslog(LOG_ERR, "[Update] open: %m");                          /* %m is the errno of the call */
+    kdns_logc(LOGC_XFER_OUT, LOG_WARNING, "[AXFR] outbound");           /* the category given beats the prefix; xfer-out falls back to default */
+    kdns_logc(LOGC_XFER_IN, LOG_WARNING, "[Config] given category");    /* ... also against another prefix: null */
+    kdns_logc(999, LOG_WARNING, "[Notify] bad category given");         /* out of range: by the prefix */
+    kdns_syslog(LOG_CRIT, "[Startup] critical %s", "text");
+    kdns_syslog(LOG_EMERG, "[Startup] emergency");
+    kdns_syslog(LOG_CRIT, "[Startup] forged\nline\r\n2026 general: critical: x\x7f" "end\ttab");   /* control characters cannot start a line */
+
+    klog_expect(p_gen,
+                "config: info: [Config] reloaded 3 zones\n"
+                "update: error: [Update] open: No such file or directory\n"
+                "xfer-out: warning: [AXFR] outbound\n"
+                "general: critical: [Startup] critical text\n"
+                "general: critical: [Startup] emergency\n"
+                "general: critical: [Startup] forged?line??2026 general: critical: x?end\ttab\n");
+    char *w = klog_slurp(p_warn);
+    /* "<iso8601-utc time> [Notify] ..." : no category, no severity */
+    assert(strlen(w) > 24 && w[4] == '-' && w[10] == 'T' && w[23] == 'Z' && w[24] == ' ');
+    const char *nl = strchr(w, '\n');      /* each line has its own time */
+    assert(nl && strncmp(w + 25, "[Notify] zone 'a.test': failed", 30) == 0 && nl[1] == '2' && nl[24] == 'Z');
+    assert(strcmp(nl + 26, "[Notify] bad category given\n") == 0);
+    free(w);
+    klog_expect(p_dbg,
+                "warning: [Notify] zone 'a.test': failed\n"
+                "info: [Notify] acknowledged\n"
+                "debug 1: [Notify] debug text\n"
+                "notice: [TSIG] bad signature\n"
+                "debug 1: [TSIG] debug text\n"
+                "warning: [Notify] bad category given\n");
+    klog_expect(p_dyn, "[TSIG] bad signature\n");
+
+    /* a new runtime replaces the routing: nothing reaches the old files any more */
+    log_runtime_t *rt2 = klog_install_conf("logging { category default { null; }; };");
+    (void)rt2;
+    kdns_syslog(LOG_ERR, "[Config] after the swap");
+    assert(klog_lines(p_gen) == 6);
+    /* an acquired runtime stays valid while it is used (the user count), and a thread inside a log call logs to syslog() alone */
+    log_runtime_t *held = log_runtime_acquire();
+    assert(held);
+    int n = 0;
+    log_channel_t *const *r = log_runtime_route(held, LOGC_QUERIES, &n);
+    assert(n == 1 && r[0]->name && strcmp(r[0]->name, "null") == 0);
+    log_runtime_release(held);
+
+    bool prev = klog_guard_enter();
+    assert(!prev);
+    log_runtime_t *none_while_inside = klog_install_conf("logging { channel g2 { file \"/tmp/karidns_klog_guard.log\"; }; category default { g2; }; };");
+    (void)none_while_inside;
+    kdns_syslog(LOG_ERR, "[Config] logged inside a log call");          /* syslog() only */
+    assert(klog_lines("/tmp/karidns_klog_guard.log") == 0);
+    klog_guard_leave(prev);
+    kdns_syslog(LOG_ERR, "[Config] logged outside");
+    assert(klog_lines("/tmp/karidns_klog_guard.log") == 1);
+    unlink("/tmp/karidns_klog_guard.log");
+
+    /* a supervisor / router / broker process opens the file by name for every line, so it follows a roll done by the Backend */
+    char p_aux[300], p_aux_old[320];
+    snprintf(p_aux, sizeof(p_aux), "%s/aux.log", dir);
+    snprintf(p_aux_old, sizeof(p_aux_old), "%s/aux.log.0", dir);
+    snprintf(conf, sizeof(conf), "logging { channel aux { file \"%s\"; }; category default { aux; }; };", p_aux);
+    klog_install_conf(conf);
+    kdns_syslog(LOG_ERR, "[Config] before the roll");
+    assert(klog_lines(p_aux) == 1);
+    klog_set_role(KLOG_ROLE_AUX);
+    assert(rename(p_aux, p_aux_old) == 0);
+    kdns_syslog(LOG_ERR, "[Config] after the roll");
+    klog_set_role(KLOG_ROLE_BACKEND);
+    klog_expect(p_aux, "[Config] after the roll\n");
+    klog_expect(p_aux_old, "[Config] before the roll\n");
+    unlink(p_aux);
+    unlink(p_aux_old);
+
+    test_retire_runtime(NULL);
+    unlink(p_gen);
+    unlink(p_warn);
+    unlink(p_dbg);
+    unlink(p_dyn);
+    rmdir(dir);
+    printf("  -> routing passed.\n");
+}
+
+static void test_klog_destinations_and_batches(void) {
+    printf("[TEST] Logging: stderr, syslog and null channels, batches...\n");
+    char dir[] = "/tmp/karidns_klog_XXXXXX";
+    assert(mkdtemp(dir));
+    char errfile[300], conf[2048];
+    snprintf(errfile, sizeof(errfile), "%s/stderr.txt", dir);
+    snprintf(conf, sizeof(conf),
+             "logging { channel se { stderr; print-severity yes; print-category yes; }; channel sy { syslog local3; severity debug 9; print-time yes; };\n"
+             " channel nu { null; }; channel lim { file \"%s/lim.log\" size 2k versions 1; };\n"
+             " category queries { se; sy; nu; lim; }; category default { default_stderr; default_debug; null; }; };", dir);
+    klog_install_conf(conf);
+    int saved = dup(2);
+    int fd = open(errfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    assert(saved >= 0 && fd >= 0);
+    dup2(fd, 2);
+    close(fd);
+    kdns_logc(LOGC_QUERIES, LOG_NOTICE, "to stderr, syslog and nowhere");
+    kdns_syslog(LOG_ERR, "[Config] default_stderr prints the time");
+    kdns_syslog(LOG_DEBUG, "[Config] default_stderr is info: this is dropped");
+    /* a batch: lines for a stderr channel are collected and written at once; syslog and null channels are written (not collected) */
+    log_runtime_t *rt = log_runtime_acquire();
+    assert(rt);
+    int n = 0;
+    log_channel_t *const *route = log_runtime_route(rt, LOGC_QUERIES, &n);
+    assert(n == 4);
+    static klog_batch_t b[4];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    for (int i = 0; i < 4; i++) b[i].len = 0;
+    for (int k = 0; k < 600; k++)             /* 600 lines of about 70 bytes: more than a batch holds, so one flush happens in between */
+        for (int i = 0; i < 4; i++)
+            klog_batch_add(&b[i], route[i], LOGC_QUERIES, LOG_LVL_INFO, &ts, "batched line of the query log with a padding of some more text...");
+    assert(b[0].len > 0 && b[1].len == 0 && b[2].len == 0 && b[3].len == 0);   /* a file with a size limit is written line by line */
+    for (int i = 0; i < 4; i++) klog_batch_flush(&b[i], route[i]);
+    assert(b[0].len == 0);
+    klog_batch_flush(&b[0], route[0]);        /* nothing left: nothing written */
+    log_runtime_release(rt);
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    char *s = klog_slurp(errfile);
+    assert(strstr(s, "info: queries: to stderr") == NULL);                        /* order: category, then severity */
+    assert(strstr(s, "queries: notice: to stderr, syslog and nowhere\n") != NULL);
+    assert(strstr(s, "[Config] default_stderr prints the time\n") != NULL && strstr(s, "default_stderr is info") == NULL);
+    const char *dflt = strstr(s, "[Config] default_stderr prints the time\n");
+    assert(dflt && dflt[-1] == ' ' && dflt[-5] == '.');                           /* default_stderr prints the time: "28-Oct-2026 03:04:05.678 [Config] ..." */
+    free(s);
+    assert(klog_lines(errfile) == 1 + 1 + 600);                                   /* the notice, the default_stderr line, 600 batched lines */
+    char lim[300], lim0[310], lim1[310];
+    snprintf(lim, sizeof(lim), "%s/lim.log", dir);
+    snprintf(lim0, sizeof(lim0), "%s/lim.log.0", dir);
+    snprintf(lim1, sizeof(lim1), "%s/lim.log.1", dir);
+    struct stat lst;
+    assert(stat(lim, &lst) == 0 && lst.st_size > 0 && lst.st_size <= 2048);   /* never over the size ... */
+    assert(stat(lim0, &lst) == 0 && lst.st_size > 0 && lst.st_size <= 2048);  /* ... rolled once, versions 1 keeps one old file */
+    assert(access(lim1, F_OK) != 0);
+    unlink(lim);
+    unlink(lim0);
+    unlink(errfile);
+    test_retire_runtime(NULL);
+    rmdir(dir);
+    printf("  -> destinations and batches passed.\n");
+}
+
+static void test_klog_rolling(void) {
+    printf("[TEST] Logging: size without versions stops the file, versions unlimited, versions 0...\n");
+    char dir[] = "/tmp/karidns_klog_XXXXXX";
+    assert(mkdtemp(dir));
+    char path[300], p0[320], p1[320], p4[320];
+    snprintf(path, sizeof(path), "%s/r.log", dir);
+    struct tm tm_info;
+    time_t now = time(NULL);
+    localtime_r(&now, &tm_info);
+
+    /* BIND ISC_LOG_ROLLNEVER: when the file is full nothing more is written, until it is removed or shorter (looked at once a second) */
+    log_channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.name = (char *)"r";
+    ch.file_path = path;
+    ch.dest = LOGDEST_FILE;
+    ch.fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    ch.versions = LOG_VERSIONS_UNSET;
+    ch.size_limit = 100;
+    pthread_mutex_init(&ch.lock, NULL);
+    assert(ch.fd >= 0);
+    const char *l40 = "0123456789012345678901234567890123456789\n";   /* 41 bytes */
+    log_write_rotated(&ch, l40, 41, &tm_info);
+    log_write_rotated(&ch, l40, 41, &tm_info);
+    assert(klog_lines(path) == 2 && !ch.size_reached);
+    log_write_rotated(&ch, l40, 41, &tm_info);                      /* 123 > 100: not written, the file is full */
+    assert(klog_lines(path) == 2 && ch.size_reached);
+    log_write_rotated(&ch, l40, 41, &tm_info);                      /* still full, and looked at again only after a second */
+    assert(klog_lines(path) == 2);
+    sleep(2);
+    log_write_rotated(&ch, l40, 41, &tm_info);                      /* the file is still full: stays full */
+    assert(klog_lines(path) == 2 && ch.size_reached);
+    assert(truncate(path, 0) == 0);                                 /* an operator empties it ... */
+    sleep(2);
+    log_write_rotated(&ch, l40, 41, &tm_info);                      /* ... and the next line is written */
+    assert(klog_lines(path) == 1 && !ch.size_reached);
+    unlink(path);                                                   /* removed: the file is made again */
+    log_write_rotated(&ch, l40, 41, &tm_info);
+    log_write_rotated(&ch, l40, 41, &tm_info);
+    log_write_rotated(&ch, l40, 41, &tm_info);
+    assert(ch.size_reached);
+    sleep(2);
+    log_write_rotated(&ch, l40, 41, &tm_info);
+    assert(klog_lines(path) == 1 && !ch.size_reached);
+    close(ch.fd);
+    unlink(path);
+
+    /* versions unlimited: every roll adds one file (.0 is the newest) */
+    ch.fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    assert(ch.fd >= 0);
+    ch.versions = LOG_VERSIONS_UNLIMITED;
+    ch.size_limit = 50;
+    ch.current_size = 0;
+    ch.size_reached = false;
+    char line[32];
+    for (int i = 1; i <= 6; i++) {
+        snprintf(line, sizeof(line), "line %d xxxxxxxxxxxxxxxxxxxxxxx\n", i);    /* 30 bytes */
+        log_write_rotated(&ch, line, (int)strlen(line), &tm_info);
+    }
+    snprintf(p0, sizeof(p0), "%s.0", path);
+    snprintf(p1, sizeof(p1), "%s.1", path);
+    snprintf(p4, sizeof(p4), "%s.4", path);
+    klog_expect(path, "line 6 xxxxxxxxxxxxxxxxxxxxxxx\n");
+    klog_expect(p0, "line 5 xxxxxxxxxxxxxxxxxxxxxxx\n");
+    klog_expect(p1, "line 4 xxxxxxxxxxxxxxxxxxxxxxx\n");
+    klog_expect(p4, "line 1 xxxxxxxxxxxxxxxxxxxxxxx\n");
+    for (int i = 0; i < 5; i++) {
+        char pn[320];
+        snprintf(pn, sizeof(pn), "%s.%d", path, i);
+        unlink(pn);
+    }
+    unlink(path);
+
+    /* versions 3 with .0 and .1 present: the roll makes .2 and stops there; the oldest is dropped at the next */
+    close(ch.fd);
+    ch.fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    ch.versions = 3;
+    ch.current_size = 0;
+    for (int i = 1; i <= 6; i++) {
+        snprintf(line, sizeof(line), "line %d xxxxxxxxxxxxxxxxxxxxxxx\n", i);
+        log_write_rotated(&ch, line, (int)strlen(line), &tm_info);
+    }
+    char p2[320], p3[320];
+    snprintf(p2, sizeof(p2), "%s.2", path);
+    snprintf(p3, sizeof(p3), "%s.3", path);
+    klog_expect(path, "line 6 xxxxxxxxxxxxxxxxxxxxxxx\n");
+    klog_expect(p0, "line 5 xxxxxxxxxxxxxxxxxxxxxxx\n");
+    klog_expect(p2, "line 3 xxxxxxxxxxxxxxxxxxxxxxx\n");       /* line 2 and line 1 were rolled out: versions 3 keeps .0 .1 .2 */
+    assert(access(p3, F_OK) != 0);
+    unlink(path);
+    unlink(p0);
+    unlink(p1);
+    unlink(p2);
+
+    /* versions 0: the file is emptied at a roll (it is removed in BIND) */
+    close(ch.fd);
+    ch.fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    ch.versions = 0;
+    ch.current_size = 0;
+    for (int i = 1; i <= 3; i++) {
+        snprintf(line, sizeof(line), "line %d xxxxxxxxxxxxxxxxxxxxxxx\n", i);
+        log_write_rotated(&ch, line, (int)strlen(line), &tm_info);
+    }
+    klog_expect(path, "line 3 xxxxxxxxxxxxxxxxxxxxxxx\n");
+    assert(access(p0, F_OK) != 0);
+    close(ch.fd);
+    unlink(path);
+    pthread_mutex_destroy(&ch.lock);
+    rmdir(dir);
+    printf("  -> rolling passed.\n");
+}
+
+/* threads log while the runtime is replaced over and over: no line is lost, nothing is used after it is freed (run under TSan / ASan) */
+static pthread_t g_klog_threads[4];
+static void *klog_thread_main(void *arg) {
+    long id = (long)(intptr_t)arg;
+    for (int i = 0; i < 1500; i++) kdns_syslog(LOG_INFO, "[Config] thread %ld line %d", id, i);
+    return NULL;
+}
+
+static void test_klog_replacement_under_load(void) {
+    printf("[TEST] Logging: the runtime is replaced while four threads log...\n");
+    char dir[] = "/tmp/karidns_klog_XXXXXX";
+    assert(mkdtemp(dir));
+    char path[300], conf[1024];
+    snprintf(path, sizeof(path), "%s/load.log", dir);
+    snprintf(conf, sizeof(conf), "logging { channel l { file \"%s\"; }; category default { l; }; };", path);
+    klog_install_conf(conf);
+    for (long i = 0; i < 4; i++) assert(pthread_create(&g_klog_threads[i], NULL, klog_thread_main, (void *)(intptr_t)i) == 0);
+    for (int i = 0; i < 30; i++) {
+        klog_install_conf(conf);
+        usleep(1000);
+    }
+    for (int i = 0; i < 4; i++) pthread_join(g_klog_threads[i], NULL);
+    assert(klog_lines(path) == 4 * 1500);
+    test_retire_runtime(NULL);
+    unlink(path);
+    rmdir(dir);
+    printf("  -> replacement under load passed.\n");
+}
+
+static void test_klog_install_with_a_slow_user(void) {
+    printf("[TEST] Logging: install keeps the old runtime when a user does not let go, restart-needed status...\n");
+    log_runtime_t *a = klog_install_conf("logging { };");
+    log_runtime_t *b = klog_install_conf("logging { };");
+    (void)a;
+    (void)b;
+    log_runtime_t *held = log_runtime_acquire();                  /* the user of the runtime installed last */
+    assert(held);
+    klog_install_conf("logging { };");                            /* the other slot: the held runtime is retired, but cannot be freed yet */
+    logrt_status_t st;
+    log_runtime_t *c = log_runtime_build(NULL, false, &st);
+    assert(c && st == LOGRT_OK);
+    assert(!log_runtime_install(c));                              /* the slot is still in use: refused after waiting */
+    log_runtime_free(c);
+    log_runtime_release(held);
+    klog_install_conf("logging { };");                            /* the user has gone: the old runtime is freed and the install works */
+
+    /* a file in a directory the sandbox cannot reach: the build says "restart", it is not a failure (log_open_channels()) */
+    char dir[] = "/tmp/karidns_klog_XXXXXX";
+    assert(mkdtemp(dir));
+    char path[300];
+    snprintf(path, sizeof(path), "%s/new.log", dir);
+    log_channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.name = (char *)"n";
+    ch.file_path = path;
+    ch.dest = LOGDEST_FILE;
+    ch.fd = -1;
+    ch.versions = LOG_VERSIONS_UNSET;
+    logging_config_t lc;
+    memset(&lc, 0, sizeof(lc));
+    lc.channels = &ch;
+    atomic_store(&g_capsicum_enabled, true);                      /* what the Backend is: a directory that was not opened before is out of reach */
+    log_runtime_t *rt = log_runtime_build(&lc, false, &st);
+    atomic_store(&g_capsicum_enabled, false);
+    assert(!rt && st == LOGRT_RESTART);
+    assert(access(path, F_OK) != 0);
+    /* ... and a file that cannot be opened for another reason is an error */
+    ch.file_path = (char *)"/nonexistent_dir_karidns_test/sub/x.log";
+    rt = log_runtime_build(&lc, false, &st);
+    assert(!rt && st == LOGRT_ERROR);
+    rmdir(dir);
+    test_retire_runtime(NULL);
+    printf("  -> install / status passed.\n");
 }
 
 // ----------------------------------------------------------------------------
@@ -2494,9 +3076,7 @@ static void test_response_log_ring_buffer_overflow(void) {
 
     server_config_t mock_cfg;
     memset(&mock_cfg, 0, sizeof(mock_cfg));
-    log_channel_t resp_ch;
-    memset(&resp_ch, 0, sizeof(resp_ch));
-    mock_cfg.logging.responses_channel = &resp_ch;
+    mock_cfg.logging.responses_enabled = true;
     atomic_store_explicit(&g_config_db.active, &mock_cfg, memory_order_release);
 
     atomic_store_explicit(&g_resp_log_tail, 0, memory_order_relaxed);
@@ -5339,6 +5919,19 @@ static void test_server_core_rrl_slip_truncation_and_metrics(void) {
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     printf("=== Starting KariDNS Server Core Unit Tests ===\n");
+    if (getenv("KARIDNS_TEST_LOGGING_ONLY")) {   /* the logging tests alone: quick enough for a ThreadSanitizer build */
+        test_klog_categories_levels_lines();
+        test_klog_format();
+        test_klog_routing();
+        test_klog_destinations_and_batches();
+        test_klog_rolling();
+        test_klog_replacement_under_load();
+        test_klog_install_with_a_slow_user();
+        test_response_logger_thread_func();
+        test_query_logger_thread_func();
+        printf("=== Logging tests PASSED ===\n");
+        return 0;
+    }
 
     test_crypto_prewarm_survives_capability_mode();
     test_fast_ipv4_to_str();
@@ -5398,6 +5991,13 @@ int main(void) {
     test_response_log_entry_formatting();
     test_query_log_rate_limiting_decay();
     test_log_write_rotated_size_limit_zero();
+    test_klog_categories_levels_lines();
+    test_klog_format();
+    test_klog_routing();
+    test_klog_destinations_and_batches();
+    test_klog_rolling();
+    test_klog_replacement_under_load();
+    test_klog_install_with_a_slow_user();
     test_fill_observatory_snapshot_all_counters();
     test_find_configured_domain_case_insensitive();
     test_ensure_priv_dir_safe_symlink_attack();

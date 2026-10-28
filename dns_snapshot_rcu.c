@@ -21,7 +21,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <pthread.h>
-#include <syslog.h>
+#include "dns_log.h"
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -3040,7 +3040,7 @@ int rebuild_zone_db_from_config_ext(server_config_t *config, bool skip_unchanged
                                st.st_mtime == entry->last_loaded_mtime && st.st_size == entry->last_loaded_size) {
                         /* reconfig only: a full reload reads every zone file again (it also drops dynamic updates, RFC 2136
                          * changes are not written back) */
-                        syslog(LOG_DEBUG, "[Config] zone '%s' file unchanged (mtime match), skipping reload", z->domain);
+                        syslog(LOG_INFO, "[Config] zone '%s' file unchanged (mtime match), skipping reload", z->domain);
                     } else if (reload_master_zone(entry, z) != RELOAD_OK) {
                         nfailed++;
                         if (failed && failed_sz > 0) {

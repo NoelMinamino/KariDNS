@@ -1,5 +1,6 @@
 #include "dns_dnstap.h"
 #include "dns_server_internal.h"
+#include "dns_log.h"
 
 #ifdef __FreeBSD__
 #include <sys/capsicum.h> /* 再接続したソケットの権利を絞る (Capsicum は FreeBSD のみ) */

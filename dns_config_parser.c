@@ -6,7 +6,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <arpa/inet.h>
-#include <syslog.h>
+#include "dns_log.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -963,6 +963,23 @@ static int resolve_all_acl_lists(token_ctx_t *ctx, server_config_t *cfg) {
   return 0;
 }
 
+static void logging_config_free(logging_config_t *lc) {
+  log_channel_t *ch = lc->channels;
+  while (ch) {
+    log_channel_t *next_ch = ch->next;
+    free(ch->name);
+    free(ch->file_path);
+    pthread_mutex_destroy(&ch->lock);
+    free(ch);
+    ch = next_ch;
+  }
+  for (int c = 0; c < LOGC_COUNT; c++)
+    for (int i = 0; i < lc->cat[c].n; i++) free(lc->cat[c].name[i]);
+  free(lc->queries_channel_name);
+  free(lc->responses_channel_name);
+  memset(lc, 0, sizeof(*lc));
+}
+
 void free_server_config_fields(server_config_t *cfg) {
   if (!cfg) return;
   for (int j = 0; j < cfg->bind_address_count; j++)
@@ -1071,26 +1088,19 @@ void free_server_config_fields(server_config_t *cfg) {
   free_rate_limit_config(&cfg->rrl);
   memset(&cfg->rrl, 0, sizeof(rate_limit_config_t));
 
-  log_channel_t *ch = cfg->logging.channels;
-  while (ch) {
-    log_channel_t *next_ch = ch->next;
-    if (ch->fd >= 0) close(ch->fd);
-    if (ch->name) free(ch->name);
-    if (ch->file_path) free(ch->file_path);
-    free(ch);
-    ch = next_ch;
+  logging_config_free(&cfg->logging);
+  for (int j = 0; j < cfg->controls_count; j++) {
+    aml_unref(cfg->controls[j].allow);
+    for (int k = 0; k < cfg->controls[j].nkeys; k++) {
+      free(cfg->controls[j].keys[k]);
+      free(cfg->controls[j].key_loc[k]);
+    }
+    free(cfg->controls[j].keys);
+    free(cfg->controls[j].key_loc);
   }
-  cfg->logging.channels = NULL;
-  cfg->logging.queries_channel = NULL;
-  cfg->logging.responses_channel = NULL;
-  if (cfg->logging.queries_channel_name) {
-    free(cfg->logging.queries_channel_name);
-    cfg->logging.queries_channel_name = NULL;
-  }
-  if (cfg->logging.responses_channel_name) {
-    free(cfg->logging.responses_channel_name);
-    cfg->logging.responses_channel_name = NULL;
-  }
+  free(cfg->controls);
+  cfg->controls = NULL;
+  cfg->controls_count = 0;
   if (cfg->ecs_trusted_resolvers) {
     for (int i = 0; i < cfg->ecs_trusted_resolvers_count; i++) {
       free(cfg->ecs_trusted_resolvers[i]);
@@ -3729,7 +3739,7 @@ static const char *const k_bind_options_options[] = {
   "nocookie-udp-size", "nosit-udp-size", "notify-delay", "notify-rate", "notify-source", "notify-source-v6",
   "notify-to-soa", "nsec3-test-zone", "nta-lifetime", "nta-recheck", "nxdomain-redirect", "parental-source",
   "parental-source-v6", "preferred-glue", "prefetch", "provide-ixfr", "qname-minimization", "query-source",
-  "query-source-v6", "querylog", "queryport-pool-ports", "queryport-pool-updateinterval", "random-device",
+  "query-source-v6", "queryport-pool-ports", "queryport-pool-updateinterval", "random-device",
   "recursing-file", "recursion", "recursive-clients", "request-expire", "request-ixfr", "request-nsid",
   "require-server-cookie", "reserved-sockets", "resolver-nonbackoff-tries", "resolver-query-timeout", "resolver-retry-interval",
   "resolver-use-dns64", "response-padding", "response-policy", "reuseport", "rfc2308-type1", "root-delegation-only",
@@ -5573,6 +5583,805 @@ out:
   return rc;
 }
 
+/* ---- logging { } (BIND 9.20 ARM "logging Block Grammar"; lib/isccfg/namedconf.c channel_clauses, logfile_fields, parse_logfile(),
+ * parse_logseverity(), parse_printtime(), parse_optional_facility(); lib/isccfg/check.c check_logging(); bin/named/logconf.c) ----
+ *   channel <name> { ( file <path> [versions (<n>|unlimited)] [size <size>] [suffix (increment|timestamp)] | syslog [<facility>] | stderr | null );
+ *                    [severity (critical|error|warning|notice|info|dynamic|debug [<n>])]; [print-time (<bool>|local|iso8601|iso8601-utc)];
+ *                    [print-severity <bool>]; [print-category <bool>]; [buffered <bool>]; [max-qps <n>]; };       (max-qps is KariDNS's)
+ *   category <name> { <channel>; ... };
+ * Exactly one destination per channel, an unknown category or channel name is an error (check_logging()); an unknown statement is an error
+ * with the place, as everywhere else in this parser.  What KariDNS does not do (buffered, a facility it does not know, a size without
+ * versions) is accepted with a warning that says so. */
+
+static const struct { const char *name; int facility; } k_log_facilities[] = {
+  { "kern", LOG_KERN }, { "user", LOG_USER }, { "mail", LOG_MAIL }, { "daemon", LOG_DAEMON }, { "auth", LOG_AUTH },
+  { "syslog", LOG_SYSLOG }, { "lpr", LOG_LPR },
+#ifdef LOG_NEWS
+  { "news", LOG_NEWS },
+#endif
+#ifdef LOG_UUCP
+  { "uucp", LOG_UUCP },
+#endif
+#ifdef LOG_CRON
+  { "cron", LOG_CRON },
+#endif
+#ifdef LOG_AUTHPRIV
+  { "authpriv", LOG_AUTHPRIV },
+#endif
+#ifdef LOG_FTP
+  { "ftp", LOG_FTP },
+#endif
+  { "local0", LOG_LOCAL0 }, { "local1", LOG_LOCAL1 }, { "local2", LOG_LOCAL2 }, { "local3", LOG_LOCAL3 },
+  { "local4", LOG_LOCAL4 }, { "local5", LOG_LOCAL5 }, { "local6", LOG_LOCAL6 }, { "local7", LOG_LOCAL7 },
+};
+
+/* isc_syslog_facilityfromstring() (lib/isc/syslog.c): case-insensitive */
+static bool log_facility_from_name(const char *s, int *out) {
+  for (size_t i = 0; i < sizeof(k_log_facilities) / sizeof(k_log_facilities[0]); i++)
+    if (strcasecmp(k_log_facilities[i].name, s) == 0) {
+      *out = k_log_facilities[i].facility;
+      return true;
+    }
+  return false;
+}
+
+/* the channels BIND creates itself (lib/isc/log.c isc_logconfig_create(), bin/named/log.c): a channel of the file with the same name
+ * replaces the built-in one (isc_log_createchannel() prepends) */
+static const char *const k_log_builtin_channels[] = { "default_syslog", "default_stderr", "default_debug", "null", NULL };
+
+static bool log_channel_is_builtin(const char *name) {
+  for (int i = 0; k_log_builtin_channels[i]; i++)
+    if (strcmp(k_log_builtin_channels[i], name) == 0) return true;
+  return false;
+}
+
+/* parse_sizeval() / parse_size(): digits with an optional k, m or g (bytes, KiB, ...); `unlimited` and `default` mean no limit (0).  KariDNS
+ * has always accepted a trailing B after the unit ("10MB"), and still does.  A value BIND would not take (a sign, text) is an error. */
+static bool log_parse_size(const char *s, uint64_t *out) {
+  if (strcasecmp(s, "unlimited") == 0 || strcasecmp(s, "default") == 0) {
+    *out = 0;
+    return true;
+  }
+  if (!isdigit((unsigned char)s[0])) return false;
+  char *end = NULL;
+  errno = 0;
+  unsigned long long v = strtoull(s, &end, 10);
+  if (errno == ERANGE) return false;
+  uint64_t unit = 1;
+  if (*end) {
+    switch (*end) {
+      case 'k': case 'K': unit = 1024ULL; break;
+      case 'm': case 'M': unit = 1024ULL * 1024; break;
+      case 'g': case 'G': unit = 1024ULL * 1024 * 1024; break;
+      default: return false;
+    }
+    end++;
+    if (*end == 'b' || *end == 'B') end++;
+    if (*end) return false;
+  }
+  if (v > UINT64_MAX / unit) return false;
+  uint64_t r = v * unit;
+  *out = r > (uint64_t)INT64_MAX ? 0 : r;   /* logconf.c: a size that does not fit off_t leaves the size unlimited */
+  return true;
+}
+
+static bool log_parse_uint(const char *s, unsigned long max, unsigned long *out) {
+  if (!isdigit((unsigned char)s[0])) return false;
+  char *end = NULL;
+  errno = 0;
+  unsigned long v = strtoul(s, &end, 10);
+  if (errno == ERANGE || *end || v > max) return false;
+  *out = v;
+  return true;
+}
+
+static int log_semi(token_ctx_t *ctx, const char *what, const char *after) {
+  char db[96];
+  conf_token_t t = get_next_token(ctx);
+  if (t.type == TOKEN_SEMICOLON) {
+    free_token(&t);
+    return 0;
+  }
+  conf_error(ctx, what, "expected ';' after %s but found %s", after, tok_desc(&t, db, sizeof(db)));
+  free_token(&t);
+  return -1;
+}
+
+/* The next token, which must be a word or a string.  Returns its text (the caller frees it), or NULL after an error has been reported. */
+static char *log_word(token_ctx_t *ctx, const char *what, const char *expect) {
+  char db[96];
+  conf_token_t t = get_next_token(ctx);
+  if (t.type != TOKEN_STRING || !t.value) {
+    conf_error(ctx, what, "expected %s but found %s", expect, tok_desc(&t, db, sizeof(db)));
+    free_token(&t);
+    return NULL;
+  }
+  char *v = t.value;
+  t.value = NULL;
+  return v;
+}
+
+typedef struct {
+  bool dest, severity, print_time, print_category, print_severity, buffered, max_qps;
+} log_chan_seen_t;
+
+static void log_dup_clause(token_ctx_t *ctx, const char *what, const char *key) {
+  conf_error(ctx, what, "'%s' is given twice", key);
+}
+
+/* `file <path> [versions ..] [size ..] [suffix ..];` after the word `file` (parse_logfile(): the options come in any order, each once) */
+static int log_channel_file(token_ctx_t *ctx, log_channel_t *ch, const char *what) {
+  char *path = log_word(ctx, what, "a file name");
+  if (!path) return -1;
+  if (!path[0]) {
+    conf_error(ctx, what, "file: the file name is empty");
+    free(path);
+    return -1;
+  }
+  free(ch->file_path);
+  ch->file_path = path;
+  ch->dest = LOGDEST_FILE;
+  bool got_versions = false, got_size = false, got_suffix = false;
+  for (;;) {
+    conf_token_t t = get_next_token(ctx);
+    if (t.type == TOKEN_SEMICOLON) {
+      free_token(&t);
+      if (ch->size_limit > 0 && ch->versions == LOG_VERSIONS_UNSET && !ch->suffix_timestamp) {
+        char loc[300];
+        ctx_location(ctx, loc, sizeof(loc));
+        conf_warn_loc(loc, what, "size without versions: when the file is full no more lines are written to it, as in BIND (earlier KariDNS "
+                      "versions truncated it); add 'versions 0' to truncate it or 'versions <n>' to keep <n> old files");
+      }
+      return 0;
+    }
+    char db[96];
+    if (t.type != TOKEN_STRING || !t.value || t.is_quoted) {
+      conf_error(ctx, what, "file: expected versions, size, suffix or ';' but found %s", tok_desc(&t, db, sizeof(db)));
+      free_token(&t);
+      return -1;
+    }
+    char key[16];
+    snprintf(key, sizeof(key), "%.15s", t.value);
+    free_token(&t);
+    bool *got = strcasecmp(key, "versions") == 0 ? &got_versions : strcasecmp(key, "size") == 0 ? &got_size
+              : strcasecmp(key, "suffix") == 0 ? &got_suffix : NULL;
+    if (!got) {
+      conf_error(ctx, what, "file: unknown option '%.64s' (expected versions, size or suffix)", key);
+      return -1;
+    }
+    if (*got) {
+      log_dup_clause(ctx, what, key);
+      return -1;
+    }
+    *got = true;
+    char *val = log_word(ctx, what, "a value");
+    if (!val) return -1;
+    bool ok = true;
+    if (strcasecmp(key, "versions") == 0) {
+      if (strcasecmp(val, "unlimited") == 0) {
+        ch->versions = LOG_VERSIONS_UNLIMITED;
+      } else {
+        unsigned long n;
+        ok = log_parse_uint(val, INT_MAX, &n);
+        if (ok) ch->versions = (int)n;
+      }
+      if (!ok) conf_error(ctx, what, "file: invalid versions value '%.64s' (expected a number or unlimited)", val);
+    } else if (strcasecmp(key, "size") == 0) {
+      uint64_t sz;
+      ok = log_parse_size(val, &sz);
+      if (ok) ch->size_limit = (size_t)sz;
+      else conf_error(ctx, what, "file: invalid size value '%.64s' (expected a number with an optional k, m or g, unlimited or default)", val);
+    } else if (strcasecmp(val, "timestamp") == 0) {
+      ch->suffix_timestamp = true;
+    } else if (strcasecmp(val, "increment") == 0) {
+      ch->suffix_timestamp = false;
+    } else {
+      ok = false;
+      conf_error(ctx, what, "file: invalid suffix '%.64s' (expected increment or timestamp)", val);
+    }
+    free(val);
+    if (!ok) return -1;
+  }
+}
+
+/* One statement of a channel block; the key has been read.  Returns 0, or -1 after an error has been reported. */
+static int log_channel_clause(token_ctx_t *ctx, log_channel_t *ch, const char *what, const char *key, log_chan_seen_t *seen) {
+  char db[96];
+  if (strcmp(key, "file") == 0 || strcmp(key, "syslog") == 0 || strcmp(key, "null") == 0 || strcmp(key, "stderr") == 0) {
+    if (seen->dest) {
+      conf_error(ctx, what, "exactly one of file, syslog, null, and stderr must be present");
+      return -1;
+    }
+    seen->dest = true;
+    if (strcmp(key, "file") == 0) return log_channel_file(ctx, ch, what);
+    if (strcmp(key, "null") == 0) {
+      ch->dest = LOGDEST_NULL;
+      return log_semi(ctx, what, "null");
+    }
+    if (strcmp(key, "stderr") == 0) {
+      ch->dest = LOGDEST_STDERR;
+      return log_semi(ctx, what, "stderr");
+    }
+    ch->dest = LOGDEST_SYSLOG;
+    ch->syslog_facility = LOG_DAEMON;
+    conf_token_t t = get_next_token(ctx);
+    if (t.type == TOKEN_SEMICOLON) {
+      free_token(&t);
+      return 0;
+    }
+    if (t.type != TOKEN_STRING || !t.value) {
+      conf_error(ctx, what, "syslog: expected a facility or ';' but found %s", tok_desc(&t, db, sizeof(db)));
+      free_token(&t);
+      return -1;
+    }
+    int fac;
+    if (log_facility_from_name(t.value, &fac)) {
+      ch->syslog_facility = fac;
+    } else {
+      char loc[300];
+      ctx_location(ctx, loc, sizeof(loc));
+      conf_warn_loc(loc, what, "syslog: unknown facility '%.40s'; daemon is used (BIND does the same)", t.value);
+    }
+    free_token(&t);
+    return log_semi(ctx, what, "the syslog facility");
+  }
+  if (strcmp(key, "severity") == 0) {
+    if (seen->severity) { log_dup_clause(ctx, what, key); return -1; }
+    seen->severity = true;
+    char *v = log_word(ctx, what, "a severity");
+    if (!v) return -1;
+    static const struct { const char *name; int level; } names[] = {
+      { "critical", LOG_LVL_CRITICAL }, { "error", LOG_LVL_ERROR }, { "warning", LOG_LVL_WARNING },
+      { "notice", LOG_LVL_NOTICE }, { "info", LOG_LVL_INFO }, { "dynamic", LOG_LVL_DYNAMIC },
+    };
+    bool ok = false;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && !ok; i++)
+      if (strcasecmp(v, names[i].name) == 0) {
+        ch->level = names[i].level;
+        ok = true;
+      }
+    if (!ok && strcasecmp(v, "debug") == 0) {
+      /* parse_logseverity(): the level is optional and defaults to 1; `debug 0` is the dynamic level (logconf.c passes the number on) */
+      conf_token_t t = get_next_token(ctx);
+      if (t.type == TOKEN_SEMICOLON) {
+        free_token(&t);
+        ch->level = 1;
+        free(v);
+        return 0;
+      }
+      unsigned long n;
+      if (t.type != TOKEN_STRING || !t.value || !log_parse_uint(t.value, INT_MAX, &n)) {
+        conf_error(ctx, what, "severity: invalid debug level %s (expected a number)", tok_desc(&t, db, sizeof(db)));
+        free_token(&t);
+        free(v);
+        return -1;
+      }
+      free_token(&t);
+      ch->level = (int)n;
+      ok = true;
+    }
+    if (!ok) {
+      conf_error(ctx, what, "severity: invalid severity '%.64s' (expected critical, error, warning, notice, info, dynamic or debug [n])", v);
+      free(v);
+      return -1;
+    }
+    free(v);
+    return log_semi(ctx, what, "the severity");
+  }
+  if (strcmp(key, "print-time") == 0) {
+    if (seen->print_time) { log_dup_clause(ctx, what, key); return -1; }
+    seen->print_time = true;
+    char *v = log_word(ctx, what, "yes, no, local, iso8601 or iso8601-utc");
+    if (!v) return -1;
+    bool b, ok = true;
+    if (strcasecmp(v, "local") == 0) ch->time_fmt = LOGTIME_LOCAL;
+    else if (strcasecmp(v, "iso8601") == 0) ch->time_fmt = LOGTIME_ISO8601;
+    else if (strcasecmp(v, "iso8601-utc") == 0) ch->time_fmt = LOGTIME_ISO8601_UTC;
+    else if (parse_config_bool(v, &b)) ch->time_fmt = b ? LOGTIME_LOCAL : LOGTIME_NONE;
+    else ok = false;
+    if (!ok) conf_error(ctx, what, "print-time: invalid value '%.64s' (expected yes, no, local, iso8601 or iso8601-utc)", v);
+    free(v);
+    return ok ? log_semi(ctx, what, "print-time") : -1;
+  }
+  if (strcmp(key, "print-category") == 0 || strcmp(key, "print-severity") == 0 || strcmp(key, "buffered") == 0) {
+    /* "print-category" / "print-severity" differ at index 6; "buffered" is the third */
+    bool *dup = key[0] == 'b' ? &seen->buffered : key[6] == 'c' ? &seen->print_category : &seen->print_severity;
+    bool *dst = key[0] == 'b' ? &ch->buffered : key[6] == 'c' ? &ch->print_category : &ch->print_severity;
+    if (*dup) { log_dup_clause(ctx, what, key); return -1; }
+    *dup = true;
+    char *v = log_word(ctx, what, "yes or no");
+    if (!v) return -1;
+    bool ok = parse_config_bool(v, dst);
+    if (!ok) conf_error(ctx, what, "%s: invalid value '%.64s' (expected yes or no)", key, v);
+    free(v);
+    if (!ok || log_semi(ctx, what, key) != 0) return -1;
+    if (key[0] == 'b' && *dst) {
+      char loc[300];
+      ctx_location(ctx, loc, sizeof(loc));
+      conf_warn_loc(loc, what, "buffered is accepted but has no effect: every line is written at once");
+    }
+    return 0;
+  }
+  if (strcmp(key, "max-qps") == 0) {
+    if (seen->max_qps) { log_dup_clause(ctx, what, key); return -1; }
+    seen->max_qps = true;
+    char *v = log_word(ctx, what, "a number");
+    if (!v) return -1;
+    unsigned long n;
+    bool ok = log_parse_uint(v, UINT32_MAX, &n);
+    if (ok) {
+      ch->max_qps = (uint32_t)n;
+      ch->max_qps_specified = true;
+    } else {
+      conf_error(ctx, what, "max-qps: invalid value '%.64s' (expected a number)", v);
+    }
+    free(v);
+    return ok ? log_semi(ctx, what, "max-qps") : -1;
+  }
+  conf_error(ctx, what, "unknown option '%.64s' (expected file, syslog, null, stderr, severity, print-time, print-severity, print-category, "
+                        "buffered or max-qps)", key);
+  return -1;
+}
+
+/* `channel <name> { ... };` after the word `channel` */
+static int parse_log_channel(token_ctx_t *ctx, server_config_t *config) {
+  char db[96], loc[300];
+  logging_config_t *lc = &config->logging;
+  char *name = log_word(ctx, "logging", "a channel name after 'channel'");
+  if (!name) return -1;
+  char what[160];
+  snprintf(what, sizeof(what), "logging channel '%.64s'", name);
+  conf_token_t t = get_next_token(ctx);
+  if (t.type != TOKEN_LBRACE) {
+    conf_error(ctx, what, "expected '{' but found %s", tok_desc(&t, db, sizeof(db)));
+    free_token(&t);
+    free(name);
+    return -1;
+  }
+  free_token(&t);
+  ctx_location(ctx, loc, sizeof(loc));
+  log_channel_t *ch = calloc(1, sizeof(*ch));
+  if (!ch) {
+    ctx->error_occurred = true;
+    free(name);
+    return -1;
+  }
+  ch->name = name;
+  ch->fd = -1;
+  ch->level = LOG_LVL_INFO;
+  ch->versions = LOG_VERSIONS_UNSET;
+  ch->syslog_facility = LOG_DAEMON;
+  ch->max_qps = config->query_log_max_qps;
+  pthread_mutex_init(&ch->lock, NULL);
+  bool defined_before = false;
+  for (log_channel_t *o = lc->channels; o; o = o->next)
+    if (o->name && strcmp(o->name, name) == 0) defined_before = true;
+  if (defined_before)
+    conf_warn_loc(loc, what, "the channel is defined twice; the later definition is used");
+  else if (log_channel_is_builtin(name))
+    conf_warn_loc(loc, what, "this replaces the built-in channel of that name");
+  /* linked first: an error below leaves the channel for the cleanup of the configuration */
+  ch->next = lc->channels;
+  lc->channels = ch;
+  log_chan_seen_t seen;
+  memset(&seen, 0, sizeof(seen));
+  for (;;) {
+    t = get_next_token(ctx);
+    if (t.type == TOKEN_RBRACE) {
+      free_token(&t);
+      break;
+    }
+    if (t.type != TOKEN_STRING || !t.value || t.is_quoted) {
+      conf_error(ctx, what, "expected a channel option or '}' but found %s", tok_desc(&t, db, sizeof(db)));
+      free_token(&t);
+      return -1;
+    }
+    char key[40];
+    snprintf(key, sizeof(key), "%.39s", t.value);
+    free_token(&t);
+    if (log_channel_clause(ctx, ch, what, key, &seen) != 0) return -1;
+  }
+  if (log_semi(ctx, what, "'}'") != 0) return -1;
+  if (!seen.dest) {
+    conf_error(ctx, what, "exactly one of file, syslog, null, and stderr must be present");
+    return -1;
+  }
+  return 0;
+}
+
+typedef struct {
+  int cat;
+  char *name;
+  char loc[200];
+} log_pend_t;
+
+/* `category <name> { <channel>; ... };` after the word `category`: the channel names are bound when the block is complete (a channel may
+ * be defined after the category that uses it) */
+static int parse_log_category(token_ctx_t *ctx, log_pend_t **pend, int *npend, int *cap) {
+  char db[96], loc[300];
+  char *cname = log_word(ctx, "logging", "a category name after 'category'");
+  if (!cname) return -1;
+  int cat = log_category_from_name(cname);
+  char what[160];
+  snprintf(what, sizeof(what), "logging category '%.64s'", cname);
+  if (cat < 0) {
+    conf_error(ctx, "logging", "undefined category: '%.64s'", cname);
+    free(cname);
+    return -1;
+  }
+  free(cname);
+  conf_token_t t = get_next_token(ctx);
+  if (t.type != TOKEN_LBRACE) {
+    conf_error(ctx, what, "expected '{' but found %s", tok_desc(&t, db, sizeof(db)));
+    free_token(&t);
+    return -1;
+  }
+  free_token(&t);
+  for (;;) {
+    t = get_next_token(ctx);
+    if (t.type == TOKEN_RBRACE) {
+      free_token(&t);
+      break;
+    }
+    if (t.type != TOKEN_STRING || !t.value) {
+      conf_error(ctx, what, "expected a channel name or '}' but found %s", tok_desc(&t, db, sizeof(db)));
+      free_token(&t);
+      return -1;
+    }
+    ctx_location(ctx, loc, sizeof(loc));
+    if (*npend == *cap) {
+      int ncap = *cap ? *cap * 2 : 8;
+      log_pend_t *np = realloc(*pend, (size_t)ncap * sizeof(**pend));
+      if (!np) {
+        ctx->error_occurred = true;
+        free_token(&t);
+        return -1;
+      }
+      *pend = np;
+      *cap = ncap;
+    }
+    log_pend_t *p = &(*pend)[(*npend)++];
+    p->cat = cat;
+    p->name = t.value;
+    t.value = NULL;
+    snprintf(p->loc, sizeof(p->loc), "%s", loc);
+    if (log_semi(ctx, what, "the channel name") != 0) return -1;
+  }
+  return log_semi(ctx, what, "'}'");
+}
+
+/* The channel of the file by that name (the newest definition), NULL if there is none */
+static log_channel_t *log_find_channel(logging_config_t *lc, const char *name) {
+  for (log_channel_t *c = lc->channels; c; c = c->next)
+    if (c->name && strcmp(c->name, name) == 0) return c;
+  return NULL;
+}
+
+static void logging_set_first_channel(logging_config_t *lc, int cat, char **name_slot, log_channel_t **chan_slot) {
+  free(*name_slot);
+  *name_slot = NULL;
+  *chan_slot = NULL;
+  if (lc->cat[cat].n > 0) {
+    *name_slot = strdup(lc->cat[cat].name[0]);
+    *chan_slot = log_find_channel(lc, lc->cat[cat].name[0]);
+  }
+}
+
+/* After the block: bind the names (check_logging(): "undefined channel"), append them to their categories (BIND appends: two statements for
+ * a category write to the channels of both) */
+static int logging_bind_categories(token_ctx_t *ctx, server_config_t *config, log_pend_t *pend, int npend) {
+  logging_config_t *lc = &config->logging;
+  for (int i = 0; i < npend; i++) {
+    log_pend_t *p = &pend[i];
+    if (!log_find_channel(lc, p->name) && !log_channel_is_builtin(p->name)) {
+      aml_report(ctx, p->loc, "logging", "undefined channel: '%.64s'", p->name);
+      return -1;
+    }
+    log_cat_cfg_t *c = &lc->cat[p->cat];
+    bool dup = false;
+    for (int k = 0; k < c->n; k++)
+      if (strcmp(c->name[k], p->name) == 0) dup = true;
+    if (dup) {
+      conf_warn_loc(p->loc, "logging", "category '%s': channel '%.64s' is listed twice; once is enough", log_category_names[p->cat], p->name);
+      continue;
+    }
+    if (c->n >= LOG_ROUTE_MAX) {
+      aml_report(ctx, p->loc, "logging", "category '%s': more than %d channels", log_category_names[p->cat], LOG_ROUTE_MAX);
+      return -1;
+    }
+    c->name[c->n] = p->name;
+    p->name = NULL;
+    c->n++;
+  }
+  logging_set_first_channel(lc, LOGC_QUERIES, &lc->queries_channel_name, &lc->queries_channel);
+  logging_set_first_channel(lc, LOGC_RESPONSES, &lc->responses_channel_name, &lc->responses_channel);
+  return 0;
+}
+
+static int parse_logging_statement(token_ctx_t *ctx, server_config_t *config) {
+  char db[96], loc[300];
+  logging_config_t *lc = &config->logging;
+  conf_token_t t = get_next_token(ctx);
+  if (t.type != TOKEN_LBRACE) {
+    conf_error(ctx, "logging", "expected '{' but found %s", tok_desc(&t, db, sizeof(db)));
+    free_token(&t);
+    return -1;
+  }
+  free_token(&t);
+  ctx_location(ctx, loc, sizeof(loc));
+  if (lc->seen)
+    conf_warn_loc(loc, "logging", "a second logging statement: BIND accepts only one; the channels and categories of both are used");
+  lc->seen = true;
+  log_pend_t *pend = NULL;
+  int npend = 0, cap = 0, rc = -1;
+  for (;;) {
+    t = get_next_token(ctx);
+    if (t.type == TOKEN_RBRACE) {
+      free_token(&t);
+      break;
+    }
+    if (t.type != TOKEN_STRING || !t.value || t.is_quoted) {
+      conf_error(ctx, "logging", "expected 'channel', 'category' or '}' but found %s", tok_desc(&t, db, sizeof(db)));
+      free_token(&t);
+      goto out;
+    }
+    char key[24];
+    snprintf(key, sizeof(key), "%.23s", t.value);
+    free_token(&t);
+    if (strcmp(key, "channel") == 0) {
+      if (parse_log_channel(ctx, config) != 0) goto out;
+    } else if (strcmp(key, "category") == 0) {
+      if (parse_log_category(ctx, &pend, &npend, &cap) != 0) goto out;
+    } else {
+      conf_error(ctx, "logging", "unknown statement '%.64s' (expected channel or category)", key);
+      goto out;
+    }
+  }
+  t = get_next_token(ctx);
+  if (t.type != TOKEN_SEMICOLON) {
+    conf_error(ctx, "logging", "expected ';' after '}' but found %s", tok_desc(&t, db, sizeof(db)));
+    free_token(&t);
+    goto out;
+  }
+  free_token(&t);
+  rc = logging_bind_categories(ctx, config, pend, npend);
+out:
+  for (int i = 0; i < npend; i++) free(pend[i].name);
+  free(pend);
+  return rc;
+}
+
+/* The two switches the query path reads, once the whole file is known: the query log is on with `querylog yes`, off with `querylog no`, and
+ * (not written) when `category queries` lists a channel -- BIND leaves it off until `rndc querylog`, KariDNS has always logged queries when
+ * the category is configured; the response log (KariDNS's own category, also BIND 9.20's name) when `category responses` lists one */
+static void logging_finish(server_config_t *config) {
+  logging_config_t *lc = &config->logging;
+  lc->queries_enabled = config->querylog_set ? config->querylog : lc->cat[LOGC_QUERIES].n > 0;
+  lc->responses_enabled = lc->cat[LOGC_RESPONSES].n > 0;
+}
+
+/* ---- controls { } (BIND 9.20 ARM "controls Block Grammar"; lib/isccfg/namedconf.c inetcontrol_fields / controls_sockaddr_flags,
+ * lib/isccfg/check.c check_controls()) ----
+ *   controls { inet ( <ip_address> | * ) [ port ( <integer> | * ) ] allow { <address_match_element>; ... } [ keys { <string>; ... } ] [ read-only <boolean> ];
+ *              unix <quoted_string> perm <integer> owner <integer> group <integer> [ keys { ... } ] [ read-only <boolean> ]; };
+ * rndc speaks a protocol (ISCCC) KariDNS does not implement: karictl and control-channel are its control interface.  So an inet entry is
+ * read and checked (the allow list, the keys, a duplicate address) and then ignored with a warning; `unix` is an error, as in BIND 9.20
+ * ("unix control '%s': not supported"). */
+static int parse_controls_inet(token_ctx_t *ctx, server_config_t *config) {
+  char db[96], loc[300];
+  const char *what = "controls";
+  ctx_location(ctx, loc, sizeof(loc));
+  char *addr = log_word(ctx, what, "an address or '*'");
+  if (!addr) return -1;
+  uint8_t ab[16];
+  char norm[INET6_ADDRSTRLEN] = "";
+  if (strcmp(addr, "*") == 0) {
+    snprintf(norm, sizeof(norm), "0.0.0.0");   /* check.c: the wildcard is the IPv4 wildcard */
+  } else if (inet_pton(AF_INET, addr, ab) == 1) {
+    inet_ntop(AF_INET, ab, norm, sizeof(norm));
+  } else if (inet_pton(AF_INET6, addr, ab) == 1) {
+    inet_ntop(AF_INET6, ab, norm, sizeof(norm));
+  } else {
+    conf_error(ctx, what, "inet: '%.64s' is not an IPv4 or IPv6 address (or '*')", addr);
+    free(addr);
+    return -1;
+  }
+  int port = 0;
+  conf_token_t t = get_next_token(ctx);
+  if (t.type == TOKEN_STRING && t.value && !t.is_quoted && strcmp(t.value, "port") == 0) {
+    free_token(&t);
+    char *pv = log_word(ctx, what, "a port number or '*'");
+    unsigned long p;
+    if (!pv) { free(addr); return -1; }
+    if (strcmp(pv, "*") == 0) {
+      port = 0;
+    } else if (log_parse_uint(pv, 65535, &p)) {
+      port = (int)p;
+    } else {
+      conf_error(ctx, what, "inet %.64s: invalid port '%.64s'", addr, pv);
+      free(pv);
+      free(addr);
+      return -1;
+    }
+    free(pv);
+    t = get_next_token(ctx);
+  }
+  if (t.type != TOKEN_STRING || !t.value || t.is_quoted || strcmp(t.value, "allow") != 0) {
+    conf_error(ctx, what, "inet %.64s: expected 'allow' but found %s", addr, tok_desc(&t, db, sizeof(db)));
+    free_token(&t);
+    free(addr);
+    return -1;
+  }
+  free_token(&t);
+  t = get_next_token(ctx);
+  if (t.type != TOKEN_LBRACE) {
+    conf_error(ctx, what, "inet %.64s: expected '{' after allow but found %s", addr, tok_desc(&t, db, sizeof(db)));
+    free_token(&t);
+    free(addr);
+    return -1;
+  }
+  free_token(&t);
+  char awhat[200];
+  snprintf(awhat, sizeof(awhat), "controls inet %.64s allow", addr);
+  aml_t *allow = parse_aml_body(ctx, awhat, 0);
+  if (!allow) { free(addr); return -1; }
+  /* BIND: the address and the port are the identity of the entry ("already defined") */
+  for (int i = 0; i < config->controls_count; i++)
+    if (strcmp(config->controls[i].addr, norm) == 0 && (config->controls[i].port ? config->controls[i].port : 953) == (port ? port : 953)) {
+      conf_error(ctx, what, "inet control socket '%s#%d': already defined, previous definition: %s", norm, port ? port : 953,
+                 config->controls[i].loc);
+      aml_unref(allow);
+      free(addr);
+      return -1;
+    }
+  controls_inet_t *nc = realloc(config->controls, (size_t)(config->controls_count + 1) * sizeof(*nc));
+  if (!nc) {
+    ctx->error_occurred = true;
+    aml_unref(allow);
+    free(addr);
+    return -1;
+  }
+  config->controls = nc;
+  controls_inet_t *c = &nc[config->controls_count++];
+  memset(c, 0, sizeof(*c));
+  snprintf(c->loc, sizeof(c->loc), "%s", loc);
+  snprintf(c->addr, sizeof(c->addr), "%s", norm);
+  c->port = port;
+  c->allow = allow;
+  free(addr);
+  /* [ keys { name; ... } ] [ read-only <bool> ] ; */
+  bool got_keys = false, got_ro = false;
+  for (;;) {
+    t = get_next_token(ctx);
+    if (t.type == TOKEN_SEMICOLON) {
+      free_token(&t);
+      break;
+    }
+    if (t.type != TOKEN_STRING || !t.value || t.is_quoted ||
+        !((!got_keys && !got_ro && strcmp(t.value, "keys") == 0) || (!got_ro && strcmp(t.value, "read-only") == 0))) {
+      conf_error(ctx, what, "inet %s: expected %s but found %s", c->addr, got_ro ? "';'" : got_keys ? "'read-only' or ';'" : "'keys', 'read-only' or ';'",
+                 tok_desc(&t, db, sizeof(db)));
+      free_token(&t);
+      return -1;
+    }
+    bool is_keys = strcmp(t.value, "keys") == 0;
+    free_token(&t);
+    if (!is_keys) {
+      got_ro = true;
+      bool ro;
+      char *v = log_word(ctx, what, "yes or no");
+      if (!v) return -1;
+      bool ok = parse_config_bool(v, &ro);
+      if (!ok) conf_error(ctx, what, "inet %s: read-only: invalid value '%.64s' (expected yes or no)", c->addr, v);
+      free(v);
+      if (!ok) return -1;
+      continue;
+    }
+    got_keys = true;
+    t = get_next_token(ctx);
+    if (t.type != TOKEN_LBRACE) {
+      conf_error(ctx, what, "inet %s: expected '{' after keys but found %s", c->addr, tok_desc(&t, db, sizeof(db)));
+      free_token(&t);
+      return -1;
+    }
+    free_token(&t);
+    for (;;) {
+      t = get_next_token(ctx);
+      if (t.type == TOKEN_RBRACE) {
+        free_token(&t);
+        break;
+      }
+      if (t.type != TOKEN_STRING || !t.value) {
+        conf_error(ctx, what, "inet %s: expected a key name or '}' but found %s", c->addr, tok_desc(&t, db, sizeof(db)));
+        free_token(&t);
+        return -1;
+      }
+      char kloc[300];
+      ctx_location(ctx, kloc, sizeof(kloc));
+      char **nk = realloc(c->keys, (size_t)(c->nkeys + 1) * sizeof(*nk));
+      if (nk) c->keys = nk;
+      char **nl = nk ? realloc(c->key_loc, (size_t)(c->nkeys + 1) * sizeof(*nl)) : NULL;
+      if (nl) c->key_loc = nl;
+      if (!nk || !nl) {
+        ctx->error_occurred = true;
+        free_token(&t);
+        return -1;
+      }
+      c->keys[c->nkeys] = t.value;
+      t.value = NULL;
+      c->key_loc[c->nkeys] = strdup(kloc);
+      c->nkeys++;
+      if (!c->key_loc[c->nkeys - 1] || log_semi(ctx, what, "the key name") != 0) {
+        ctx->error_occurred = true;
+        return -1;
+      }
+    }
+  }
+  conf_warn_loc(loc, what, "inet %s port %d: rndc is not supported; karictl and control-channel are the control interface of KariDNS. The "
+                "entry is accepted and has no effect", c->addr, port ? port : 953);
+  return 0;
+}
+
+static int parse_controls_statement(token_ctx_t *ctx, server_config_t *config) {
+  char db[96];
+  conf_token_t t = get_next_token(ctx);
+  if (t.type != TOKEN_LBRACE) {
+    conf_error(ctx, "controls", "expected '{' but found %s", tok_desc(&t, db, sizeof(db)));
+    free_token(&t);
+    return -1;
+  }
+  free_token(&t);
+  for (;;) {
+    t = get_next_token(ctx);
+    if (t.type == TOKEN_RBRACE) {
+      free_token(&t);
+      break;
+    }
+    if (t.type != TOKEN_STRING || !t.value || t.is_quoted) {
+      conf_error(ctx, "controls", "expected 'inet' or '}' but found %s", tok_desc(&t, db, sizeof(db)));
+      free_token(&t);
+      return -1;
+    }
+    bool is_inet = strcmp(t.value, "inet") == 0, is_unix = strcmp(t.value, "unix") == 0;
+    char key[24];
+    snprintf(key, sizeof(key), "%.23s", t.value);
+    free_token(&t);
+    if (is_inet) {
+      if (parse_controls_inet(ctx, config) != 0) return -1;
+    } else if (is_unix) {
+      char *path = log_word(ctx, "controls", "a path");
+      if (!path) return -1;
+      conf_error(ctx, "controls", "unix control '%.200s': not supported (BIND 9.20 rejects it too)", path);
+      free(path);
+      return -1;
+    } else {
+      conf_error(ctx, "controls", "unknown statement '%.64s' (expected inet or unix)", key);
+      return -1;
+    }
+  }
+  return log_semi(ctx, "controls", "'}'");
+}
+
+/* check_controls(): the allow lists must name defined acls, the keys must be defined (top-level) keys.  Run when the file has been read. */
+static int controls_resolve(token_ctx_t *ctx, server_config_t *cfg) {
+  for (int i = 0; i < cfg->controls_count; i++) {
+    controls_inet_t *c = &cfg->controls[i];
+    char what[200];
+    snprintf(what, sizeof(what), "controls inet %.64s allow", c->addr);
+    if (aml_resolve(ctx, cfg, c->allow, what, false, 0) != 0) return -1;
+    for (int k = 0; k < c->nkeys; k++) {
+      bool found = false;
+      for (const tsig_key_t *key = cfg->keys; key && !found; key = key->next)
+        found = key->name && strcasecmp(key->name, c->keys[k]) == 0;
+      if (!found) {
+        aml_report(ctx, c->key_loc[k], "controls", "unknown key '%.64s'", c->keys[k]);
+        return -1;
+      }
+    }
+  }
+  return 0;
+}
+
 static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) {
   int nr_rc = 0;
   memset(config, 0, sizeof(server_config_t));
@@ -5605,6 +6414,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->max_zone_records = KARIDNS_DB_MAX_ZONE_RECORDS_DEFAULT;
   config->max_zone_bytes = KARIDNS_DB_MAX_ZONE_BYTES_DEFAULT;
   config->query_log_max_qps = 5000;
+  config->querylog_set = false;
+  config->querylog = false;
   config->query_log_buffer_size = 32768;
   config->max_mqtypes = 4;
   config->rfc10029_mqtype_enable = false;
@@ -5797,6 +6608,13 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key);
             return -1;
           }
+        } else if (strcmp(key, "querylog") == 0) {
+          /* BIND 9.20 options { querylog <boolean>; }: on or off for the `queries` category (see logging_finish()) */
+          if (parse_bool_statement(ctx, NULL, key, &config->querylog) != 0) {
+            free(key);
+            return -1;
+          }
+          config->querylog_set = true;
         } else if (strcmp(key, "rfc10029-mqtype") == 0) {
           if (parse_bool_statement(ctx, NULL, key, &config->rfc10029_mqtype_enable) != 0) {
             free(key);
@@ -6605,313 +7423,25 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       }
     } else if (strcmp(tok.value, "logging") == 0) {
       free_token(&tok);
-      tok = get_next_token(ctx);
-      if (tok.type != TOKEN_LBRACE) {
-        free_token(&tok);
-        return -1;
-      }
+      if (parse_logging_statement(ctx, config) != 0) return -1;
+    } else if (strcmp(tok.value, "controls") == 0) {
       free_token(&tok);
-      while (1) {
-        tok = get_next_token(ctx);
-        if (tok.type == TOKEN_RBRACE) {
-          free_token(&tok);
-          break;
-        }
-        if (tok.type != TOKEN_STRING) {
-          free_token(&tok);
-          return -1;
-        }
-        char *dir = tok.value;
-        tok.value = NULL;
-        free_token(&tok);
-        if (strcmp(dir, "channel") == 0) {
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_STRING) {
-            free(dir);
-            free_token(&tok);
-            return -1;
-          }
-          log_channel_t *ch = safe_calloc_or_die(1, sizeof(log_channel_t));
-          if (!ch) {
-            free(dir);
-            free_token(&tok);
-            if (ctx) ctx->error_occurred = true;
-            return -1;
-          }
-          ch->name = tok.value;
-          tok.value = NULL;
-          free_token(&tok);
-          ch->fd = -1;
-          ch->max_qps = config->query_log_max_qps;
-          ch->max_qps_specified = false;
-          pthread_mutex_init(&ch->lock, NULL);
-          /* 先にリストへつなぐ。途中のエラーでも free_server_config_fields() が解放する */
-          ch->next = config->logging.channels;
-          config->logging.channels = ch;
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_LBRACE) {
-            free(dir);
-            free_token(&tok);
-            return -1;
-          }
-          free_token(&tok);
-          while (1) {
-            tok = get_next_token(ctx);
-            if (tok.type == TOKEN_RBRACE) {
-              free_token(&tok);
-              break;
-            }
-            if (tok.type != TOKEN_STRING) {
-              free(dir);
-              free_token(&tok);
-              return -1;
-            }
-            char *opt = tok.value;
-            tok.value = NULL;
-            free_token(&tok);
-            if (strcmp(opt, "file") == 0) {
-              tok = get_next_token(ctx);
-              if (tok.type != TOKEN_STRING) {
-                free(opt);
-                free(dir);
-                free_token(&tok);
-                return -1;
-              }
-              if (ch->file_path) free(ch->file_path);
-              ch->file_path = tok.value;
-              tok.value = NULL;
-              free_token(&tok);
-              while (1) {
-                tok = get_next_token(ctx);
-                if (tok.type == TOKEN_EOF) {
-                  free_token(&tok);
-                  break;
-                }
-                if (tok.type == TOKEN_SEMICOLON) {
-                  free_token(&tok);
-                  break;
-                }
-                if (tok.type == TOKEN_STRING &&
-                    strcmp(tok.value, "versions") == 0) {
-                  free_token(&tok);
-                  tok = get_next_token(ctx);
-                  if (tok.type == TOKEN_STRING) {
-                    char *endptr;
-                    long vval = strtol(tok.value, &endptr, 10);
-                    if (*endptr == '\0' && vval >= 0) ch->versions = (int)vval;
-                  }
-                  free_token(&tok);
-                } else if (tok.type == TOKEN_STRING &&
-                           strcmp(tok.value, "size") == 0) {
-                  free_token(&tok);
-                  tok = get_next_token(ctx);
-                  if (tok.type == TOKEN_STRING) {
-                    size_t mult = 1;
-                    size_t len = strlen(tok.value);
-                    if (len > 0) {
-                      size_t check_len = len;
-                      if (check_len > 1 && (tok.value[check_len - 1] == 'B' || tok.value[check_len - 1] == 'b')) {
-                        check_len--;
-                      }
-                      char last = tok.value[check_len - 1];
-                      char numeric_part[64];
-                      size_t numeric_len = len;
-                      if (last == 'M' || last == 'm') {
-                        mult = 1024 * 1024;
-                        numeric_len = check_len - 1;
-                      } else if (last == 'K' || last == 'k') {
-                        mult = 1024;
-                        numeric_len = check_len - 1;
-                      } else if (last == 'G' || last == 'g') {
-                        mult = 1024 * 1024 * 1024;
-                        numeric_len = check_len - 1;
-                      }
-                      if (numeric_len == 0 || numeric_len >= sizeof(numeric_part) || tok.value[0] == '-' || isspace((unsigned char)tok.value[0])) {
-                        syslog(LOG_ERR, "[Config] Invalid log channel size value '%s'", tok.value);
-                        fprintf(stderr, "[ERROR] Invalid log channel size value '%s'\n", tok.value);
-                      } else {
-                        memcpy(numeric_part, tok.value, numeric_len);
-                        numeric_part[numeric_len] = '\0';
-                        char *endptr;
-                        unsigned long long v = strtoull(numeric_part, &endptr, 10);
-                        if (*endptr == '\0') {
-                          ch->size_limit = v * mult;
-                        } else {
-                          syslog(LOG_ERR, "[Config] Invalid log channel size value '%s'", tok.value);
-                          fprintf(stderr, "[ERROR] Invalid log channel size value '%s'\n", tok.value);
-                        }
-                      }
-                    }
-                  }
-                  free_token(&tok);
-                } else if (tok.type == TOKEN_STRING &&
-                           strcmp(tok.value, "suffix") == 0) {
-                  free_token(&tok);
-                  tok = get_next_token(ctx);
-                  if (tok.type == TOKEN_STRING &&
-                      strcmp(tok.value, "timestamp") == 0)
-                    ch->suffix_timestamp = true;
-                  free_token(&tok);
-                } else {
-                  free_token(&tok);
-                }
-              }
-            } else if (strcmp(opt, "print-time") == 0 ||
-                       strcmp(opt, "print-category") == 0 ||
-                       strcmp(opt, "print-severity") == 0) {
-              bool *dst = (strcmp(opt, "print-time") == 0) ? &ch->print_time
-                        : (strcmp(opt, "print-category") == 0) ? &ch->print_category
-                        : &ch->print_severity;
-              if (parse_bool_statement(ctx, NULL, opt, dst) != 0) {
-                free(opt);
-                free(dir);
-                return -1;
-              }
-            } else if (strcmp(opt, "max-qps") == 0) {
-              tok = get_next_token(ctx);
-              if (tok.type == TOKEN_STRING) {
-                char *endptr;
-                unsigned long v = strtoul(tok.value, &endptr, 10);
-                if (*endptr == '\0') {
-                  ch->max_qps = (uint32_t)v;
-                  ch->max_qps_specified = true;
-                } else {
-                  syslog(LOG_ERR, "[Config] Invalid max-qps value '%s'", tok.value);
-                  fprintf(stderr, "[ERROR] Invalid max-qps value '%s'\n", tok.value);
-                }
-              }
-              free_token(&tok);
-              tok = get_next_token(ctx);
-              if (tok.type == TOKEN_SEMICOLON)
-                free_token(&tok);
-            } else
-              skip_unknown_block(ctx);
-            free(opt);
-          }
-          tok = get_next_token(ctx);
-          if (tok.type == TOKEN_SEMICOLON)
-            free_token(&tok);
-        } else if (strcmp(dir, "category") == 0) {
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_STRING) {
-            free(dir);
-            free_token(&tok);
-            return -1;
-          }
-          char *cat_name = tok.value;
-          tok.value = NULL;
-          free_token(&tok);
-          /* D-01: category <name> { <channel>; ... }; 先頭のチャネルを使い、残りは警告して無視する */
-          char **slot = NULL;
-          if (strcmp(cat_name, "queries") == 0) {
-            slot = &config->logging.queries_channel_name;
-          } else if (strcmp(cat_name, "responses") == 0) {
-            slot = &config->logging.responses_channel_name;
-          } else {
-            syslog(LOG_WARNING, "[Config] Unknown logging category '%s', ignoring", cat_name);
-            fprintf(stderr, "[WARNING] Unknown logging category '%s', ignoring\n", cat_name);
-          }
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_LBRACE) {
-            free(cat_name);
-            free(dir);
-            free_token(&tok);
-            return -1;
-          }
-          free_token(&tok);
-          if (slot) {
-            free(*slot); /* 空のリストはそのカテゴリを出力しない */
-            *slot = NULL;
-          }
-          while (1) {
-            tok = get_next_token(ctx);
-            if (tok.type == TOKEN_RBRACE) {
-              free_token(&tok);
-              break;
-            }
-            if (tok.type != TOKEN_STRING) {
-              free(cat_name);
-              free(dir);
-              free_token(&tok);
-              return -1;
-            }
-            if (slot && !*slot) {
-              *slot = tok.value;
-              tok.value = NULL;
-            } else if (slot) {
-              syslog(LOG_WARNING, "[Config] logging category '%s': only the first channel ('%s') is used, ignoring '%s'",
-                     cat_name, *slot, tok.value);
-              fprintf(stderr, "[WARNING] logging category '%s': only the first channel ('%s') is used, ignoring '%s'\n",
-                      cat_name, *slot, tok.value);
-            }
-            free_token(&tok);
-            tok = get_next_token(ctx);
-            if (tok.type != TOKEN_SEMICOLON) {
-              free(cat_name);
-              free(dir);
-              free_token(&tok);
-              return -1;
-            }
-            free_token(&tok);
-          }
-          free(cat_name);
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_SEMICOLON) {
-            free(dir);
-            free_token(&tok);
-            return -1;
-          }
-          free_token(&tok);
-        } else
-          skip_unknown_block(ctx);
-        free(dir);
-      }
-      tok = get_next_token(ctx);
-      if (tok.type != TOKEN_SEMICOLON) {
-        free_token(&tok);
-        return -1;
-      }
+      if (parse_controls_statement(ctx, config) != 0) return -1;
+    } else if (strcmp(tok.value, "statistics-channels") == 0) {
+      /* BIND's HTTP statistics server (lib/isccfg/namedconf.c statschannel): not implemented; the block is skipped */
+      char loc[300];
+      ctx_location(ctx, loc, sizeof(loc));
+      conf_warn_loc(loc, "statistics-channels", "KariDNS has no statistics channel; the statement is accepted and ignored");
       free_token(&tok);
-      if (config->logging.queries_channel_name) {
-        log_channel_t *ch = config->logging.channels;
-        while (ch) {
-          if (ch->name && strcmp(ch->name, config->logging.queries_channel_name) == 0) {
-            config->logging.queries_channel = ch;
-            break;
-          }
-          ch = ch->next;
-        }
-        if (!config->logging.queries_channel) {
-          syslog(LOG_ERR, "[Config] logging category 'queries' references undefined channel '%s'",
-                 config->logging.queries_channel_name);
-          fprintf(stderr, "[ERROR] logging category 'queries' references undefined channel '%s'\n",
-                 config->logging.queries_channel_name);
-          return -1;
-        }
-      }
-      if (config->logging.responses_channel_name) {
-        log_channel_t *ch = config->logging.channels;
-        while (ch) {
-          if (ch->name && strcmp(ch->name, config->logging.responses_channel_name) == 0) {
-            config->logging.responses_channel = ch;
-            break;
-          }
-          ch = ch->next;
-        }
-        if (!config->logging.responses_channel) {
-          syslog(LOG_ERR, "[Config] logging category 'responses' references undefined channel '%s'",
-                 config->logging.responses_channel_name);
-          fprintf(stderr, "[ERROR] logging category 'responses' references undefined channel '%s'\n",
-                 config->logging.responses_channel_name);
-          return -1;
-        }
-      }
+      skip_unknown_block(ctx);
     } else {
       free_token(&tok);
       skip_unknown_block(ctx);
     }
   }
   if (config_apply_directory(ctx, config) != 0) return -1;
+  logging_finish(config);
+  if (controls_resolve(ctx, config) != 0) return -1;
   if (saw_view_block && saw_top_level_zone) {
     syslog(LOG_ERR, "Cannot mix top-level zone and view blocks");
     // トップレベル直付けの zone_config_t リストを完全解放してリークを防ぐ

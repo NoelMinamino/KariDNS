@@ -23,6 +23,13 @@
 
 #include "dns_epoch_rcu.h"
 
+/* dns_epoch_rcu.c logs through kdns_syslog() (dns_log.h, defined in dns_utils.c, which this test does not link): the messages are not
+ * what is tested here. */
+void kdns_syslog(int prio, const char *fmt, ...) {
+    (void)prio;
+    (void)fmt;
+}
+
 _Atomic(worker_ctx_t *) g_worker_ctxs = ATOMIC_VAR_INIT(NULL);
 _Atomic int g_worker_count = ATOMIC_VAR_INIT(0);
 
