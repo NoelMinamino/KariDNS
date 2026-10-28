@@ -2029,6 +2029,89 @@ static int unknown_statement(token_ctx_t *ctx, const char *kind, const char *nam
   return -1;
 }
 
+/* Strict options { } and key { } (decided 2026-10-28; zone { } and view { } have been strict since B6a).  A misspelt
+ * `bind-address`, `user`, `listen-on` or `secret` used to be skipped without a word and had no effect.  Now a statement
+ * that BIND documents for the block but KariDNS does not implement is skipped with a warning, and anything else is a
+ * configuration error with file:line.
+ * k_bind_options_options: the union of the "options Statement Grammar" of the BIND 9.18.28 ARM and of the 9.20.0 ARM
+ * (fetched from bind9.readthedocs.io; 9.20 added allow-proxy, allow-proxy-on, check-svcb, dnsrps-library,
+ * max-validation-failures-per-fetch, max-validations-per-fetch, resolver-use-dns64, sig0checks-quota[-exempt];
+ * 9.18-only ones kept: alt-transfer-source[-v6], auto-dnssec, coresize, datasize, dscp, files, glue-cache, lock-file,
+ * random-device, reserved-sockets, resolver-nonbackoff-tries, resolver-retry-interval, root-delegation-only,
+ * stacksize, suppress-initial-notify, tkey-dhkey, use-alt-transfer-source), plus options of BIND 9.16 and older that
+ * old configurations may still carry (acache-*, cleaning-interval, dnssec-enable, dnssec-lookaside, ...; from memory of
+ * the older ARMs, not re-checked against them), minus what KariDNS implements (those are matched before this list is
+ * consulted, so a few names, e.g. "port", are implemented and documented by BIND alike).
+ * k_bind_key_options: the key statement of both ARMs has only `algorithm` and `secret`, both implemented, so nothing
+ * is "BIND but unimplemented" there. */
+static const char *const k_bind_options_options[] = {
+  "acache-cleaning-interval", "acache-enable", "allow-new-zones", "allow-notify", "allow-proxy", "allow-proxy-on",
+  "allow-query", "allow-query-cache", "allow-query-cache-on", "allow-query-on", "allow-recursion", "allow-recursion-on",
+  "allow-transfer", "allow-update", "allow-update-forwarding", "allow-v6-synthesis", "alt-transfer-source",
+  "alt-transfer-source-v6", "answer-cookie", "attach-cache", "auth-nxdomain", "auto-dnssec", "automatic-interface-scan",
+  "avoid-v4-udp-ports", "avoid-v6-udp-ports", "bindkeys-file", "blackhole", "catalog-zones", "check-dup-records",
+  "check-integrity", "check-mx", "check-mx-cname", "check-names", "check-sibling", "check-spf", "check-srv-cname",
+  "check-svcb", "check-wildcard", "cleaning-interval", "clients-per-query", "coresize", "datasize", "deallocate-on-exit",
+  "deny-answer-addresses", "deny-answer-aliases", "dialup", "directory", "disable-algorithms", "disable-ds-digests",
+  "disable-empty-zone", "dns64", "dns64-contact", "dns64-server", "dnskey-sig-validity", "dnsrps-enable",
+  "dnsrps-library", "dnsrps-options", "dnssec-accept-expired", "dnssec-dnskey-kskonly", "dnssec-enable",
+  "dnssec-loadkeys-interval", "dnssec-lookaside", "dnssec-must-be-secure", "dnssec-policy", "dnssec-secure-to-insecure",
+  "dnssec-update-mode", "dnssec-validation", "dnstap-identity", "dnstap-output", "dnstap-version", "dscp",
+  "dual-stack-servers", "dump-file", "edns-udp-size", "empty-contact", "empty-server", "empty-zones-enable",
+  "fake-iquery", "fetch-quota-params", "fetches-per-server", "fetches-per-zone", "files", "flush-zones-on-shutdown",
+  "forward", "forwarders", "fstrm-set-buffer-hint", "fstrm-set-flush-timeout", "fstrm-set-input-queue-size",
+  "fstrm-set-output-notify-threshold", "fstrm-set-output-queue-model", "fstrm-set-output-queue-size", "fstrm-set-reopen-interval",
+  "geoip-directory", "glue-cache", "has-old-clients", "heartbeat-interval", "hostname", "http-listener-clients",
+  "http-port", "http-streams-per-connection", "https-port", "interface-interval", "ipv4only-contact", "ipv4only-enable",
+  "ipv4only-server", "ixfr-from-differences", "keep-response-order", "key-directory", "lame-ttl", "listen-on",
+  "listen-on-v6", "lmdb-mapsize", "lock-file", "maintain-ixfr-base", "managed-keys-directory", "masterfile-format",
+  "masterfile-style", "match-mapped-addresses", "max-acache-size", "max-cache-size", "max-cache-ttl", "max-clients-per-query",
+  "max-ixfr-log-size", "max-ixfr-ratio", "max-journal-size", "max-ncache-ttl", "max-records", "max-records-per-type",
+  "max-recursion-depth", "max-recursion-queries", "max-refresh-time", "max-retry-time", "max-rsa-exponent-size",
+  "max-stale-ttl", "max-transfer-idle-in", "max-transfer-idle-out", "max-transfer-time-in", "max-transfer-time-out",
+  "max-types-per-name", "max-udp-size", "max-validation-failures-per-fetch", "max-validations-per-fetch",
+  "max-zone-ttl", "memstatistics", "memstatistics-file", "message-compression", "min-cache-ttl", "min-ncache-ttl",
+  "min-refresh-time", "min-retry-time", "multi-master", "named-xfer", "new-zones-directory", "no-case-compress",
+  "nocookie-udp-size", "nosit-udp-size", "notify-delay", "notify-rate", "notify-source", "notify-source-v6",
+  "notify-to-soa", "nsec3-test-zone", "nta-lifetime", "nta-recheck", "nxdomain-redirect", "parental-source",
+  "parental-source-v6", "preferred-glue", "prefetch", "provide-ixfr", "qname-minimization", "query-source",
+  "query-source-v6", "querylog", "queryport-pool-ports", "queryport-pool-updateinterval", "random-device",
+  "recursing-file", "recursion", "recursive-clients", "request-expire", "request-ixfr", "request-nsid",
+  "require-server-cookie", "reserved-sockets", "resolver-nonbackoff-tries", "resolver-query-timeout", "resolver-retry-interval",
+  "resolver-use-dns64", "response-padding", "response-policy", "reuseport", "rfc2308-type1", "root-delegation-only",
+  "root-key-sentinel", "rrset-order", "secroots-file", "send-cookie", "serial-query-rate", "serial-update-method",
+  "server-id", "servfail-ttl", "session-keyalg", "session-keyfile", "session-keyname", "sig-signing-nodes",
+  "sig-signing-signatures", "sig-signing-type", "sig-validity-interval", "sig0checks-quota", "sig0checks-quota-exempt",
+  "sit-secret", "sortlist", "stacksize", "stale-answer-client-timeout", "stale-answer-enable", "stale-answer-ttl",
+  "stale-cache-enable", "stale-refresh-time", "startup-notify-rate", "statistics-file", "suppress-initial-notify",
+  "synth-from-dnssec", "tcp-advertised-timeout", "tcp-clients", "tcp-keepalive-timeout", "tcp-listen-queue",
+  "tcp-receive-buffer", "tcp-send-buffer", "tkey-dhkey", "tkey-domain", "tkey-gssapi-credential", "tkey-gssapi-keytab",
+  "tls-port", "topology", "transfer-format", "transfer-message-size", "transfer-source", "transfer-source-v6",
+  "transfers-in", "transfers-out", "transfers-per-ns", "treat-cr-as-space", "trust-anchor-telemetry", "try-tcp-refresh",
+  "udp-receive-buffer", "udp-send-buffer", "update-check-ksk", "update-quota", "use-alt-transfer-source",
+  "use-id-pool", "use-ixfr", "use-queryport-pool", "use-v4-udp-ports", "use-v6-udp-ports", "v6-bias", "validate-except",
+  "version", "zero-no-soa-ttl", "zero-no-soa-ttl-cache", "zone-statistics",
+  NULL
+};
+
+static const char *const k_bind_key_options[] = { NULL };
+
+/* The statement `key` (already read) inside the block `what` (options, key 'name') is not one KariDNS implements.
+ * Skips the statement and returns 0 when BIND documents it (warning), else reports a configuration error with the place
+ * in the file and returns -1 (the caller frees its partial result and returns -1). */
+static int unknown_block_statement(token_ctx_t *ctx, const char *what, const char *const *bind_list, const char *key) {
+  if (name_in_list(bind_list, key)) {
+    char loc[300];
+    ctx_location(ctx, loc, sizeof(loc));
+    syslog(LOG_WARNING, "[Config] %s: %s: '%.64s' is a BIND option that KariDNS does not implement; it is ignored", loc, what, key);
+    fprintf(stderr, "[WARNING] %s: %s: '%.64s' is a BIND option that KariDNS does not implement; it is ignored\n", loc, what, key);
+    skip_unknown_block(ctx);
+    return 0;
+  }
+  conf_error(ctx, what, "unknown option '%.64s' (neither a KariDNS option nor a BIND option for this statement; check the spelling)", key);
+  return -1;
+}
+
 /* B7a: what a DB zone's settings text may contain (db_settings_parse).  The statements karidns-dbloader writes (the output
  * of build_settings() in dns_pdns_reader.c) and the profile texts of karidns_profiles are made of these. */
 static const char *const k_db_zone_statements[] = {
@@ -3914,8 +3997,10 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           if (ctx) ctx->error_occurred = true;
           free(key);
           return -1;
-        } else
-          skip_unknown_block(ctx);
+        } else if (unknown_block_statement(ctx, "options", k_bind_options_options, key) != 0) {
+          free(key);
+          return -1;
+        }
         free(key);
       }
       tok = get_next_token(ctx);
@@ -4186,6 +4271,18 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           free_token(&tok);
+          if (strcmp(key_prop, "algorithm") == 0 ? tsig->algorithm != NULL : tsig->secret != NULL) {
+            char what[160];
+            snprintf(what, sizeof(what), "key '%.64s'", tsig->name);
+            conf_error(ctx, what, "'%s' is given twice", key_prop);
+            free(key_prop);
+            free(val);
+            free(tsig->name);
+            if (tsig->algorithm) free(tsig->algorithm);
+            if (tsig->secret) free(tsig->secret);
+            free(tsig);
+            return -1;
+          }
           if (strcmp(key_prop, "algorithm") == 0) {
             if (!tsig_algorithm_is_supported(val)) {
               syslog(LOG_ERR, "[Config] Unsupported TSIG algorithm: %s", val);
@@ -4244,8 +4341,18 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                       "replace it with the output of 'openssl rand -base64 32'\n", tsig->name);
             }
           }
-        } else
-          skip_unknown_block(ctx);
+        } else {
+          char what[160];
+          snprintf(what, sizeof(what), "key '%.64s'", tsig->name);
+          if (unknown_block_statement(ctx, what, k_bind_key_options, key_prop) != 0) {
+            free(key_prop);
+            free(tsig->name);
+            if (tsig->algorithm) free(tsig->algorithm);
+            if (tsig->secret) free(tsig->secret);
+            free(tsig);
+            return -1;
+          }
+        }
         free(key_prop);
       }
       tok = get_next_token(ctx);
@@ -4258,6 +4365,18 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         return -1;
       }
       free_token(&tok);
+      /* BIND requires both ("key 'x' must have both 'secret' and 'algorithm' defined").  A key without a secret cannot
+       * sign or verify, and the callers would silently fall back to hmac-sha256 for a missing algorithm. */
+      if (!tsig->secret || !tsig->algorithm) {
+        char what[160];
+        snprintf(what, sizeof(what), "key '%.64s'", tsig->name);
+        conf_error(ctx, what, "%s is missing (both 'algorithm' and 'secret' are required)", !tsig->algorithm ? "'algorithm'" : "'secret'");
+        free(tsig->name);
+        if (tsig->algorithm) free(tsig->algorithm);
+        if (tsig->secret) free(tsig->secret);
+        free(tsig);
+        return -1;
+      }
       for (tsig_key_t *existing = config->keys; existing; existing = existing->next) {
         if (domain_names_match_ci(existing->name, tsig->name)) {
           syslog(LOG_ERR, "[Config] Duplicate TSIG key '%s' defined; rejecting configuration", tsig->name);

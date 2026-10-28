@@ -993,9 +993,9 @@ static void test_tsig_key_blocks(void) {
         free_server_config_fields(&cfg);
     }
 
-    /* an unknown property inside key{} is skipped, the key stays usable */
+    /* an unknown property inside key{} is a configuration error (it used to be skipped; see test_strict_options_and_key) */
     snprintf(txt, sizeof(txt), "key \"k\" { algorithm hmac-sha256; comment { x; }; secret \"%s\"; };", SECRET_OK);
-    if (parse_ok(txt, &cfg)) { CHECK(cfg.keys && cfg.keys->secret_decoded_len == 32); free_server_config_fields(&cfg); }
+    expect_reject("unknown property inside key", txt);
 
     /* rejections */
     snprintf(txt, sizeof(txt), "key \"k\" { algorithm hmac-sha3; secret \"%s\"; };", SECRET_OK);
@@ -2741,6 +2741,114 @@ static void test_primaries_and_notify_mode(void) {
     expect_db_reject("notify no;", "notify");
 }
 
+/* Strict options { } and key { } (decided 2026-10-28): an unknown statement is a configuration error with file:line, a BIND
+ * option KariDNS does not implement is skipped with a warning, and every statement KariDNS implements is accepted without
+ * either message. */
+static void test_strict_options_and_key(void) {
+    printf("[TEST] strict options { } and key { }...\n");
+    server_config_t cfg;
+    char msg[2048], txt[1024];
+
+    /* every implemented options statement: parses, and neither warns nor errors about being unknown */
+    static const struct { const char *name, *sample; } impl[] = {
+        {"port", "port 5353;"}, {"user", "user \"nobody\";"}, {"group", "group \"nobody\";"},
+        {"pid-file", "pid-file \"/var/run/x.pid\";"}, {"bind-address", "bind-address { 192.0.2.1; };"},
+        {"rate-limit", "rate-limit { responses-per-second 5; };"}, {"ecs-enable", "ecs-enable yes;"},
+        {"ecs-trusted-resolvers", "ecs-trusted-resolvers { 192.0.2.53; };"},
+        {"ecs-tags", "ecs-tags { tag \"a\" { 192.0.2.0/24; }; };"},
+        {"location-tags", "location-tags { tag \"a\" { 192.0.2.0/24; }; };"},
+        {"send-extended-errors", "send-extended-errors yes;"}, {"serve-stale", "serve-stale yes;"},
+        {"rfc10029-mqtype", "rfc10029-mqtype yes;"}, {"tcp-connection-reuse", "tcp-connection-reuse yes;"},
+        {"tcp-idle-timeout", "tcp-idle-timeout 5000;"}, {"tcp-initial-timeout", "tcp-initial-timeout 5000;"},
+        {"cookie-secret", "cookie-secret \"00112233445566778899aabbccddeeff\";"},
+        {"cookie-algorithm", "cookie-algorithm siphash24;"}, {"nsid", "nsid \"ns1.example\";"},
+        {"minimal-responses", "minimal-responses yes;"}, {"minimal-any", "minimal-any yes;"},
+        {"additional-from-auth", "additional-from-auth yes;"}, {"query-log-max-qps", "query-log-max-qps 10;"},
+        {"query-log-buffer-size", "query-log-buffer-size 4096;"}, {"allow-program-zones", "allow-program-zones yes;"},
+        {"max-mqtypes", "max-mqtypes 3;"}, {"minimal-any-ttl", "minimal-any-ttl 300;"},
+        {"wire-cache-max-records", "wire-cache-max-records 100;"}, {"alias-resolver", "alias-resolver { 192.0.2.53; };"},
+        {"ixfr-history", "ixfr-history 10;"}, {"max-zone-records", "max-zone-records 100000;"},
+        {"max-zone-bytes", "max-zone-bytes 1m;"}, {"tcp-mss", "tcp-mss 1220;"}, {"tcp-window", "tcp-window 65536;"},
+        {"udp-bufsize", "udp-bufsize 1232;"}, {"udp-recvbuf-size", "udp-recvbuf-size 1m;"},
+        {"response-cache-size", "response-cache-size 1m;"}, {"udp-sndbuf-size", "udp-sndbuf-size 1m;"},
+        {"dnstap", "dnstap { socket \"/x.sock\"; };"},
+        {"database", "database { driver sqlite3; database-file \"/x.db\"; };"}, {"notify", "notify yes;"},
+        {"also-notify", "also-notify { 192.0.2.1; };"}, {"notify-retries", "notify-retries 3;"},
+        {"notify-retry-interval", "notify-retry-interval 5;"}, {"notify-retry-backoff", "notify-retry-backoff fixed;"},
+    };
+    for (size_t i = 0; i < sizeof(impl) / sizeof(impl[0]); i++) {
+        snprintf(txt, sizeof(txt), "options { %s };", impl[i].sample);
+        int rc = parse_capture(txt, &cfg, msg, sizeof(msg));
+        g_checks++;
+        if (rc != 0) {
+            g_failed++;
+            printf("  [FAIL] implemented option '%s' rejected: %s\n         %s\n", impl[i].name, txt, msg);
+            continue;
+        }
+        free_server_config_fields(&cfg);
+        g_checks++;
+        if (strstr(msg, "does not implement") || strstr(msg, "unknown option")) {
+            g_failed++;
+            printf("  [FAIL] implemented option '%s' reported as unknown/unimplemented: %s\n", impl[i].name, msg);
+        }
+    }
+
+    /* a BIND option KariDNS does not implement: warning, skipped, the rest of options { } still applies */
+    static const char *const bind_only[] = {
+        "listen-on { 127.0.0.1; };", "listen-on-v6 { any; };", "directory \"/var/db\";", "recursion no;",
+        "allow-transfer { none; };", "version none;", "dnssec-validation auto;", "forwarders { 192.0.2.1; };",
+        "max-cache-size 100m;", "allow-new-zones yes;", "dnssec-enable yes;" /* BIND 9.16 and older */,
+        "allow-proxy { any; };" /* BIND 9.20 only */, "use-alt-transfer-source no;" /* BIND 9.18 only */,
+        "check-names primary ignore;", "tkey-dhkey \"k\" 1;",
+    };
+    for (size_t i = 0; i < sizeof(bind_only) / sizeof(bind_only[0]); i++) {
+        snprintf(txt, sizeof(txt), "options {\n %s\n port 5300;\n};", bind_only[i]);
+        int rc = parse_capture(txt, &cfg, msg, sizeof(msg));
+        g_checks += 3;
+        if (rc != 0) { g_failed++; printf("  [FAIL] BIND option rejected: %s\n         %s\n", bind_only[i], msg); continue; }
+        if (cfg.port != 5300) { g_failed++; printf("  [FAIL] statement after '%s' lost\n", bind_only[i]); }
+        free_server_config_fields(&cfg);
+        /* the location is "line 2" for a configuration given as a string */
+        if (!strstr(msg, "[WARNING]") || !strstr(msg, "is a BIND option that KariDNS does not implement") || !strstr(msg, "line 2")) {
+            g_failed++;
+            printf("  [FAIL] no warning with a line for '%s': %s\n", bind_only[i], msg);
+        }
+    }
+
+    /* anything else is an error with the line */
+    expect_an_error("misspelt bind-address", "options {\n port 53;\n bind-adress { 192.0.2.1; };\n};",
+                    "line 3|options|unknown option 'bind-adress'");
+    expect_an_error("misspelt user", "options { usr \"nobody\"; };", "unknown option 'usr'");
+    expect_an_error("misspelt pid-file", "options { pidfile \"/x\"; };", "unknown option 'pidfile'");
+    expect_an_error("misspelt allow-transfer is not a BIND option either", "options { allow-tranfer { any; }; };",
+                    "unknown option 'allow-tranfer'");
+    expect_an_error("unknown block", "options { frobnicate { a; b; }; };", "unknown option 'frobnicate'");
+    expect_an_error("karidns option in the wrong block", "options { tcp-idle-timeouts 5; };", "unknown option");
+    expect_an_error("statement after the typo is not reached", "options { qps-scale 4; port 5300; };", "unknown option 'qps-scale'");
+
+    /* key { }: algorithm and secret; BIND documents nothing else, so any other statement is an error */
+    snprintf(txt, sizeof(txt), "key \"k\" { algorithm hmac-sha256; secret \"%s\"; };", SECRET_OK);
+    if (parse_ok(txt, &cfg)) { CHECK(cfg.keys && cfg.keys->secret_decoded_len == 32); free_server_config_fields(&cfg); }
+    snprintf(txt, sizeof(txt), "key \"k\" {\n algorithm hmac-sha256;\n scret \"%s\";\n};", SECRET_OK);
+    expect_an_error("misspelt secret", txt, "line 3|key 'k'|unknown option 'scret'");
+    snprintf(txt, sizeof(txt), "key \"k\" { algorithm hmac-sha256; secret \"%s\"; comment { x; }; };", SECRET_OK);
+    expect_an_error("unknown block in key", txt, "unknown option 'comment'");
+    snprintf(txt, sizeof(txt), "key \"k\" { algorithm hmac-sha256; algo hmac-sha256; secret \"%s\"; };", SECRET_OK);
+    expect_an_error("misspelt algorithm", txt, "unknown option 'algo'");
+    /* a key that cannot sign must not exist */
+    expect_an_error("key without secret", "key \"k\" { algorithm hmac-sha256; };", "key 'k'|'secret' is missing");
+    snprintf(txt, sizeof(txt), "key \"k\" { secret \"%s\"; };", SECRET_OK);
+    expect_an_error("key without algorithm", txt, "key 'k'|'algorithm' is missing");
+    expect_an_error("empty key", "key \"k\" { };", "is missing");
+    snprintf(txt, sizeof(txt), "key \"k\" { algorithm hmac-sha256; algorithm hmac-sha512; secret \"%s\"; };", SECRET_OK);
+    expect_an_error("algorithm twice", txt, "'algorithm' is given twice");
+    snprintf(txt, sizeof(txt), "key \"k\" { algorithm hmac-sha256; secret \"%s\"; secret \"%s\"; };", SECRET_OK, SECRET_OK);
+    expect_an_error("secret twice", txt, "'secret' is given twice");
+
+    /* logging { } and unknown top-level statements still skip unknowns (out of scope) */
+    if (parse_ok("logging { frobnicate yes; }; frobnicate-block { a; };", &cfg)) free_server_config_fields(&cfg);
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
     test_defaults();
@@ -2783,6 +2891,7 @@ int main(void) {
     test_statements_need_a_semicolon();
     test_also_notify_bind();
     test_primaries_and_notify_mode();
+    test_strict_options_and_key();
 
     printf("[*] %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) {

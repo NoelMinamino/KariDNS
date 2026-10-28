@@ -1537,8 +1537,11 @@ static void test_config_parser_unrecognized_option_warning(void) {
     const char *cfg_txt = "options { custom-option-foo-bar 123; port 5353; };";
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
-    parse_named_conf(cfg_txt, &cfg);
-    CHECK(cfg.port == 5353 || cfg.port == 0);
+    /* an unknown statement in options { } is a configuration error (2026-10-28); a BIND-only one is skipped with a warning */
+    CHECK(parse_named_conf(cfg_txt, &cfg) != 0);
+    free_server_config_fields(&cfg);
+    memset(&cfg, 0, sizeof(cfg));
+    CHECK(parse_named_conf("options { recursion no; port 5353; };", &cfg) == 0 && cfg.port == 5353);
     free_server_config_fields(&cfg);
 }
 
