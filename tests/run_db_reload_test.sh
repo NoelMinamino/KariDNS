@@ -288,7 +288,7 @@ echo "== D-PRIO: a zone of karidns.conf with the name of a database zone"
 OUT=$($KCTL reload db5.test 2>&1)
 printf '%s\n' "$OUT" | grep -q "^OK reloaded$" && pass "reload db5.test reads the file zone of karidns.conf: $OUT" || fail "reload db5.test: '$OUT'"
 OUT=$($KCTL zonestatus db5.test 2>&1)
-printf '%s\n' "$OUT" | grep -q "^OK serial=99 refresh=3600$" && pass "zonestatus db5.test is the file zone's" || fail "zonestatus db5.test: '$OUT'"
+printf '%s\n' "$OUT" | grep -q "^OK serial=99 refresh=3600 retry=600 expire=86400$" && pass "zonestatus db5.test is the file zone's" || fail "zonestatus db5.test: '$OUT'"
 
 # ================================================================ D17-1: catalog members win
 echo "== D17-1: a catalog member with the name of a database zone wins"

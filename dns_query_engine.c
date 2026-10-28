@@ -3371,6 +3371,12 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
     /* R-15, RFC 1995 §2: 同じか新しい版 (RFC 1982) なら最新なので、TC を立てずに SOA 1件で答える */
     bool is_up_to_date = (client_serial == current_serial || serial_is_newer(client_serial, current_serial));
+    /* provide-ixfr no (batch 4): the client is always sent to TCP, where it gets the whole zone (as for the TCP IXFR in send_axfr_response()) */
+    {
+      xfr_eff_t pe;
+      xfr_opts_effective(cfg, zcfg, db_entry->view_name, &pe);
+      if (!pe.provide_ixfr) is_up_to_date = false;
+    }
     if (!is_up_to_date) {
       res[2] |= 0x02; // Set TC (Truncated) bit to prompt TCP retry
     }

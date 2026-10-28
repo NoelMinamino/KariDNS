@@ -118,7 +118,6 @@ STATIC_TEST _Atomic bool g_privilege_drop_complete = false;
 STATIC_TEST _Atomic bool g_control_signals_ready = false;
 // P5: バックエンドを fork したマネージャーの PID。SIGHUP はマネージャーから転送されたものだけでリロードする
 static pid_t g_manager_pid = 0;
-#define MAX_ZONE_AXFR 4
 
 #define NUM_FRONTEND_ROUTERS 2
 #define MAX_FRONTEND_ROUTERS 4
@@ -315,9 +314,32 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
          * すぐ返し、完了待ち (と TCP_MAXSEG) は要求側が自分の期限で行う。待っている間に
          * 他の要求 (別のゾーン転送や forward) がブローカーで止まらない。 */
         fcntl(sock, F_SETFL, fcntl(sock, F_GETFL, 0) | O_NONBLOCK);
-        ret = connect(sock, (struct sockaddr *)&req.addr, addr_len);
-        if (ret < 0 && errno == EINPROGRESS)
-          ret = 0;
+        /* transfer-source / primaries source (batch 4): bind the local address (port 0) before connect().  Only an address that was in the
+         * configuration when the server started is accepted -- the broker must not bind whatever a compromised Backend names -- and a bind
+         * that fails fails the connection (the transfer is not made from another address than the operator asked for). */
+        bool src_ok = true;
+        if (req.type == SOCK_STREAM && req.family != AF_UNIX && req.tcp_opts.has_src) {
+          if (!config_xfr_source_allowed(req.family, req.tcp_opts.src, true)) {
+            src_ok = false;
+          } else if (req.family == AF_INET) {
+            struct sockaddr_in sin;
+            memset(&sin, 0, sizeof(sin));
+            sin.sin_family = AF_INET;
+            memcpy(&sin.sin_addr, req.tcp_opts.src, sizeof(sin.sin_addr));
+            src_ok = bind(sock, (struct sockaddr *)&sin, sizeof(sin)) == 0;
+          } else {
+            struct sockaddr_in6 sin6;
+            memset(&sin6, 0, sizeof(sin6));
+            sin6.sin6_family = AF_INET6;
+            memcpy(&sin6.sin6_addr, req.tcp_opts.src, sizeof(sin6.sin6_addr));
+            src_ok = bind(sock, (struct sockaddr *)&sin6, sizeof(sin6)) == 0;
+          }
+        }
+        if (src_ok) {
+          ret = connect(sock, (struct sockaddr *)&req.addr, addr_len);
+          if (ret < 0 && errno == EINPROGRESS)
+            ret = 0;
+        }
       }
       if (ret == 0) {
         struct msghdr msg = {0};
@@ -1340,6 +1362,10 @@ ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len) {
   struct iovec *cur = iov;
   int cnt = 2;
   /* sendmsg(): クライアント fd の権限は CAP_SEND で、writev() の CAP_WRITE は無い */
+  /* max-transfer-time-out / max-transfer-idle-out (an outbound AXFR/IXFR thread sets them): the transfer is given up after the deadline, or when the
+   * client takes nothing for the idle time (the socket is blocking with SO_SNDTIMEO = idle, so EAGAIN here is the timeout) */
+  if (g_tcp_send_deadline_secs && time(NULL) > g_tcp_send_deadline_secs)
+    return -1;
   while (cnt > 0) {
     struct msghdr mh = {.msg_iov = cur, .msg_iovlen = cnt};
     ssize_t n = sendmsg(fd, &mh, 0);
@@ -1347,6 +1373,8 @@ ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len) {
       if (errno == EINTR)
         continue;
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (g_tcp_send_idle_secs)
+          return -1;
         struct pollfd pfd = {.fd = fd, .events = POLLOUT};
         if (poll(&pfd, 1, 30000) <= 0)
           return -1;
@@ -1684,7 +1712,7 @@ void fast_ipv4_to_str(uint32_t ip_be, char *dst) {
  * (zone-tcp-mss / zone-tcp-window / zone-tcp-sndbuf) があればそれを、なければ
  * グローバルの tcp-mss / tcp-window を使う。受信側なので rcvbuf が主に効く。 */
 STATIC_TEST tcp_sockopts_t xfr_tcp_sockopts(const server_config_t *cfg, const zone_config_t *zcfg) {
-  tcp_sockopts_t o = {0, 0, 0, 0};
+  tcp_sockopts_t o = {0};
   if (cfg) {
     o.mss = cfg->tcp_mss;
     o.rcvbuf = cfg->tcp_window;
@@ -1696,6 +1724,91 @@ STATIC_TEST tcp_sockopts_t xfr_tcp_sockopts(const server_config_t *cfg, const zo
     if (zext(zcfg)->zone_tcp_sndbuf > 0) o.sndbuf = zext(zcfg)->zone_tcp_sndbuf;
   }
   return o;
+}
+
+/* serial-query-rate: the budget of refresh checks a second (the control thread only) */
+static xfr_rl_t g_serial_query_rl;
+/* where the walk of the secondaries starts in this tick (the control thread only); see the loop */
+static size_t g_tick_rotor;
+
+/* Copies the TSIG key `name` of the configuration into p by value ([H-4]: the thread must not point into the configuration) */
+static void xfr_primary_copy_key(const server_config_t *active, const char *name, xfr_primary_t *p) {
+  if (!name || !name[0] || !active) return;
+  for (const tsig_key_t *k = active->keys; k; k = k->next) {
+    if (!tsig_key_names_equal(k->name, name)) continue;
+    p->has_tsig = true;
+    strlcpy(p->tsig_name, k->name, sizeof(p->tsig_name));
+    strlcpy(p->tsig_algorithm, k->algorithm ? k->algorithm : "hmac-sha256", sizeof(p->tsig_algorithm));
+    size_t copy_len = k->secret_decoded_len;
+    if (copy_len > sizeof(p->tsig_secret_decoded)) copy_len = sizeof(p->tsig_secret_decoded);
+    memcpy(p->tsig_secret_decoded, k->secret_decoded, copy_len);
+    p->tsig_secret_decoded_len = copy_len;
+    return;
+  }
+}
+
+/* The local address of the connection to p: the `source` of the primaries list it is written in, else transfer-source(-v6) (BIND zone.c
+ * soa_query(): the list's source unless it is `*`, then the zone's xfrsource).  Only an address the server had at start-up can be bound (the
+ * connect broker was told then); another one is ignored with a warning, once per address, until a restart. */
+static void xfr_primary_set_source(const xfr_eff_t *eff, const notify_target_t *t, xfr_primary_t *p, const char *domain) {
+  struct in_addr a4;
+  int fam = inet_pton(AF_INET, p->ip, &a4) == 1 ? AF_INET : AF_INET6;
+  uint8_t src[16];
+  if (!xfr_source_for(eff, t, fam, true, src)) return;
+  if (config_xfr_source_allowed(fam, src, true)) {
+    p->has_src = true;
+    memcpy(p->src, src, sizeof(p->src));
+    return;
+  }
+  static _Atomic uint32_t warned;
+  if (atomic_fetch_add_explicit(&warned, 1, memory_order_relaxed) < 16) {
+    char txt[INET6_ADDRSTRLEN];
+    inet_ntop(fam, src, txt, sizeof(txt));
+    syslog(LOG_WARNING, "[AXFR] zone %s: the transfer source address %s was not in the configuration at start-up; it is used after a restart "
+                        "(until then the system chooses the source address)", domain, txt);
+  }
+}
+
+/* The primaries a secondary zone is refreshed from, in order, and the options that govern the refresh (batch 4).  A configured secondary
+ * and a database secondary list them in their zone settings; a catalog member takes the primaries of its catalog zone (all of them; the
+ * single copy kept in the entry when the member was created is the fallback).  The options (timers, multi-master, request-ixfr, sources)
+ * are those of the zone, else of the catalog zone for a member, then the view's and options'. */
+static void xfr_build_primaries(server_config_t *active, zone_db_snapshot_t *snap, const zone_db_entry_t *entry,
+                                const zone_config_t *zcfg, axfr_bg_ctx_t *ctx) {
+  const zone_config_t *mcfg = zcfg;
+  if (entry->is_catalog_member) {
+    mcfg = NULL;
+    if (entry->owning_catalog_domain && snap) {
+      view_snapshot_t *vs = snapshot_find_view(snap, entry->view_name);
+      zone_db_entry_t *cat = vs ? find_zone_in_view(vs, entry->owning_catalog_domain) : NULL;
+      const zone_config_t *cc = cat ? zone_entry_config(active, cat) : NULL;
+      if (cc && zext(cc)->masters_count > 0) mcfg = cc;
+    }
+  }
+  xfr_opts_effective(active, mcfg, entry->view_name, &ctx->eff);
+  ctx->has_eff = true;
+  ctx->per_ns_limit = xfr_cfg_limit(active, XL_TRANSFERS_PER_NS);
+  int n = 0;
+  if (mcfg) {
+    const zone_ext_t *x = zext(mcfg);
+    for (int i = 0; i < x->masters_count && n < XFR_PRIMARIES_MAX; i++) {
+      if (!x->masters[i].ip) continue;
+      xfr_primary_t *p = &ctx->prim[n++];
+      strlcpy(p->ip, x->masters[i].ip, sizeof(p->ip));
+      p->port = x->masters[i].port;
+      xfr_primary_copy_key(active, zone_primary_key(x, i), p);
+      xfr_primary_set_source(&ctx->eff, &x->masters[i], p, ctx->domain);
+    }
+    if (x->masters_count > XFR_PRIMARIES_MAX)
+      syslog(LOG_WARNING, "[AXFR] zone %s: %d primaries are listed; only the first %d are used", ctx->domain, x->masters_count, XFR_PRIMARIES_MAX);
+  } else if (entry->catalog_master && entry->catalog_master->ip[0]) {
+    xfr_primary_t *p = &ctx->prim[n++];
+    strlcpy(p->ip, entry->catalog_master->ip, sizeof(p->ip));
+    p->port = entry->catalog_master->port;
+    xfr_primary_copy_key(active, entry->catalog_master->tsig_key, p);
+    xfr_primary_set_source(&ctx->eff, NULL, p, ctx->domain);
+  }
+  ctx->nprim = n;
 }
 
 /* tcp-window: listen() 前に listen ソケットの SO_RCVBUF / SO_SNDBUF を設定する。
@@ -2421,11 +2534,15 @@ process_tcp_client: ;
             if (tsig_mac_len > 0) memcpy(tsig_mac, tsig.mac, tsig_mac_len);
             zone_db_entry_t *entry = xfr_view ? find_zone_in_view(xfr_view, qname) : NULL;
             if (allowed && entry) {
+              /* transfers-out and max-transfer-time-out / max-transfer-idle-out (BIND 9.20), read before the configuration is released */
+              uint32_t out_limit = xfr_cfg_limit(cfg, XL_TRANSFERS_OUT);
+              xfr_eff_t out_eff;
+              xfr_opts_effective(cfg, zcfg, xfr_view ? xfr_view->name : NULL, &out_eff);
               release_config_snapshot(cfg);
-              if (atomic_fetch_add(&entry->active_axfr, 1) >= MAX_ZONE_AXFR) {
-                atomic_fetch_sub(&entry->active_axfr, 1);
-                allowed = false;
+              if (!xfr_counter_acquire(&g_xfr_out_active, out_limit)) {
+                allowed = false; /* "Zone transfer requests in excess of the limit are refused" (ARM transfers-out) */
               } else {
+                atomic_fetch_add(&entry->active_axfr, 1);
                 axfr_worker_args_t *args = malloc(sizeof(axfr_worker_args_t));
                 if (args) {
                   args->client_fd = client_fd;
@@ -2461,6 +2578,8 @@ process_tcp_client: ;
                   args->tsig_mac_len = tsig_mac_len;
                   if (tsig_mac_len > 0) memcpy(args->tsig_mac, tsig_mac, tsig_mac_len);
                   args->entry = entry;
+                  args->idle_out_secs = out_eff.xfer_idle_out;
+                  args->time_out_secs = out_eff.xfer_time_out;
                   args->snap = snap;
                   retain_zone_snapshot(args->snap);
                   int cflags = fcntl(client_fd, F_GETFL, 0);
@@ -2477,6 +2596,7 @@ process_tcp_client: ;
                     release_zone_snapshot(args->snap);
                     free(args);
                     atomic_fetch_sub(&entry->active_axfr, 1);
+                    xfr_counter_release(&g_xfr_out_active);
                     allowed = false;
                   } else {
                     pthread_detach(t);
@@ -2488,6 +2608,7 @@ process_tcp_client: ;
                   }
                 } else {
                   atomic_fetch_sub(&entry->active_axfr, 1);
+                  xfr_counter_release(&g_xfr_out_active);
                   allowed = false;
                 }
               }
@@ -2746,6 +2867,17 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
     listen_differs = o->listen[i].family != n->listen[i].family || o->listen[i].port != n->listen[i].port ||
                      memcmp(o->listen[i].addr, n->listen[i].addr, 16) != 0;
   if (listen_differs && !strstr(buf, "port") && !strstr(buf, "bind-address")) append_list_item(buf, sz, "listen-on");
+  /* notify-source / transfer-source / primaries source: the Router pre-binds its NOTIFY sockets and the connect broker learns the transfer
+   * sources at start-up, so an address that was not in the configuration then needs a restart (until then the system chooses the source).
+   * Compared with the start-up set, not with the previous reload, so that every reload keeps saying so. */
+  for (int i = 0; i < n->xfr_source_count; i++) {
+    const xfr_source_t *s = &n->xfr_sources[i];
+    if ((s->notify && !config_xfr_source_allowed(s->family, s->addr, false)) || (s->xfer && !config_xfr_source_allowed(s->family, s->addr, true))) {
+      syslog(LOG_WARNING, "[Config] %s: %s %s was not in the configuration when the server started; it is used after a restart (until then the "
+                          "system chooses the source address)", s->loc[0] ? s->loc : "configuration", s->what, s->text);
+      if (!strstr(buf, "source-address")) append_list_item(buf, sz, "source-address");
+    }
+  }
   if (str_differs(o->user, n->user)) append_list_item(buf, sz, "user");
   if (str_differs(o->group, n->group)) append_list_item(buf, sz, "group");
   if (str_differs(o->pid_file, n->pid_file)) append_list_item(buf, sz, "pid-file");
@@ -3534,9 +3666,11 @@ void *control_thread_func(void *arg) {
                 char rx_note[160];
                 /* B8t-2: a secondary says that settings received from its primary are in force (and which part is not) */
                 bool rx_on = zone_rx_settings_status(lr.entry, rx_note, sizeof(rx_note));
-                int slen = snprintf(smsg, sizeof(smsg), "OK serial=%u refresh=%u%s%s%s\n", (uint32_t)lr.entry->serial,
-                                    (uint32_t)lr.entry->refresh, rx_on ? " settings=primary" : "", rx_note[0] ? " note: " : "",
-                                    rx_note);
+                /* refresh, retry and expire are the values the zone uses: a secondary holds the SOA's to min/max-refresh-time and
+                 * min/max-retry-time (batch 4) */
+                int slen = snprintf(smsg, sizeof(smsg), "OK serial=%u refresh=%u retry=%u expire=%u%s%s%s\n", (uint32_t)lr.entry->serial,
+                                    (uint32_t)lr.entry->refresh, (uint32_t)lr.entry->retry, (uint32_t)lr.entry->expire,
+                                    rx_on ? " settings=primary" : "", rx_note[0] ? " note: " : "", rx_note);
                 if (slen >= (int)sizeof(smsg)) slen = (int)sizeof(smsg) - 1, smsg[slen - 1] = '\n';
                 send(cfd, smsg, slen, 0);
               } else {
@@ -3729,7 +3863,11 @@ void *control_thread_func(void *arg) {
             for (size_t v = 0; v < snap->view_count; v++) {
                 zone_db_entry_t **list = walk_all ? snap->views[v].entries : snap->views[v].tick_entries;
                 size_t count = walk_all ? snap->views[v].zone_count : snap->views[v].tick_count;
-                for (size_t i = 0; i < count; i++) {
+                /* transfers-in and serial-query-rate leave a refresh that is over the limit for a later tick; the walk starts one entry
+                 * further each tick so that the zones at the end of the list are not always the ones that wait (BIND queues them in order) */
+                size_t rot = count ? g_tick_rotor % count : 0;
+                for (size_t kk = 0; kk < count; kk++) {
+                    size_t i = (kk + rot) % count;
                     zone_db_entry_t *entry = list[i];
                     if (!entry) continue;
 
@@ -3737,39 +3875,37 @@ void *control_thread_func(void *arg) {
                     if (atomic_load_explicit(&entry->rx_present, memory_order_relaxed)) zone_rx_settings_refresh(entry, active);
 
                     if (atomic_exchange_explicit(&entry->notify_now, false, memory_order_acquire)) {
-                        syslog(LOG_INFO, "[Control] Executing manual NOTIFY for %s", entry->domain);
-                        send_notify_to_all(entry);
+                        /* notify-delay (BIND 9.20 ARM): the delay between two sets of NOTIFY messages for a zone; a request inside it waits */
+                        if (now < entry->notify_next) {
+                            atomic_store_explicit(&entry->notify_now, true, memory_order_release);
+                            atomic_fetch_add_explicit(&g_zone_notify_pending, 1, memory_order_release);
+                        } else {
+                            xfr_eff_t nd;
+                            xfr_opts_effective(active, zone_entry_config(active, entry), entry->view_name, &nd);
+                            entry->notify_next = now + (time_t)nd.notify_delay;
+                            syslog(LOG_INFO, "[Control] Executing manual NOTIFY for %s", entry->domain);
+                            send_notify_to_all(entry);
+                        }
                     }
 
                     bool is_slave = false;
-                    char master_ip[64] = {0};
-                    int master_port = 53;
-                    char tsig_key_name[64] = {0};
+                    bool have_primary = false;
                     const zone_config_t *slave_zcfg = NULL; /* カタログのメンバーゾーンは zone{} を持たない */
-                    
+
                     if (entry->is_catalog_member) {
                         is_slave = true;
-                        if (entry->catalog_master) {
-                            strncpy(master_ip, entry->catalog_master->ip, sizeof(master_ip) - 1);
-                            master_port = entry->catalog_master->port;
-                            strncpy(tsig_key_name, entry->catalog_master->tsig_key, sizeof(tsig_key_name) - 1);
-                        }
+                        have_primary = entry->catalog_master != NULL && entry->catalog_master->ip[0] != '\0';
                     } else {
                         const zone_config_t *zcfg = zone_entry_config(active, entry);
                         slave_zcfg = zcfg;
                         if (zcfg && zcfg->type && (strcasecmp(zcfg->type, "slave") == 0 || strcasecmp(zcfg->type, "secondary") == 0) &&
                             zext(zcfg)->masters_count > 0 && zext(zcfg)->masters[0].ip != NULL) {
                             is_slave = true;
-                            strncpy(master_ip, zext(zcfg)->masters[0].ip, sizeof(master_ip) - 1);
-                            master_port = zext(zcfg)->masters[0].port;
-                            /* the first primary is the one asked: its own key, else the zone's tsig-key (signs SOA/IXFR/AXFR and
-                             * verifies the answers) */
-                            const char *pk = zone_primary_key(zext(zcfg), 0);
-                            if (pk) strncpy(tsig_key_name, pk, sizeof(tsig_key_name) - 1);
+                            have_primary = true;
                         }
                     }
 
-                    if (is_slave && master_ip[0] != '\0') {
+                    if (is_slave && have_primary) {
                         time_t deadline = zone_expire_deadline(entry);
                         if (deadline > 0 && now > deadline) {
                             time_t last_log = atomic_load_explicit(&entry->last_stale_log_time, memory_order_acquire);
@@ -3790,56 +3926,46 @@ void *control_thread_func(void *arg) {
                             if (atomic_compare_exchange_strong_explicit(
                                     &entry->is_transferring, &expected, true,
                                     memory_order_acquire, memory_order_relaxed)) {
+                                /* transfers-in (concurrent inbound transfers) and serial-query-rate (refresh checks a second): a refresh over
+                                 * a limit waits for a later tick, with its timers untouched (BIND queues the zone) */
+                                bool admitted = xfr_counter_acquire(&g_xfr_in_active, xfr_cfg_limit(active, XL_TRANSFERS_IN));
+                                if (admitted && !xfr_rl_take(&g_serial_query_rl, xfr_cfg_limit(active, XL_SERIAL_QUERY_RATE), now)) {
+                                    xfr_counter_release(&g_xfr_in_active);
+                                    admitted = false;
+                                }
+                                if (!admitted) {
+                                    atomic_store_explicit(&entry->is_transferring, false, memory_order_release);
+                                    if (force) atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
+                                    continue;
+                                }
                                 uint32_t retry = atomic_load_explicit(&entry->retry, memory_order_acquire);
                                 atomic_store_explicit(&entry->next_check, now + (retry ? retry : 60), memory_order_release);
-                                
+
                                 axfr_bg_ctx_t *bg_ctx = calloc(1, sizeof(axfr_bg_ctx_t));
                                 if (bg_ctx) {
-                                    strncpy(bg_ctx->master_ip, master_ip, sizeof(bg_ctx->master_ip) - 1);
-                                    bg_ctx->master_port = master_port;
                                     strncpy(bg_ctx->domain, entry->domain, sizeof(bg_ctx->domain) - 1);
                                     bg_ctx->entry = entry;
-                                    bg_ctx->snap = snap;
-                                    retain_zone_snapshot(snap);
+                                    bg_ctx->snap = snap;   /* retained below, once the thread is certain to start */
                                     bg_ctx->tcp_opts = xfr_tcp_sockopts(active, slave_zcfg);
                                     xfr_zone_limits(active, slave_zcfg, &bg_ctx->max_records, &bg_ctx->max_bytes); /* I2 */
-                                    
-                                    /* [H-4] config ポインタをそのまま渡すと UAF になるため、
-                                     * TSIG キーのデータをスレッド起動前に bg_ctx へ値コピーする。*/
-                                    if (tsig_key_name[0] != '\0' && active) {
-                                        tsig_key_t *k = active->keys;
-                                        while (k) {
-                                            if (tsig_key_names_equal(k->name, tsig_key_name)) {
-                                                bg_ctx->has_tsig = true;
-                                                strncpy(bg_ctx->tsig_name, k->name,
-                                                        sizeof(bg_ctx->tsig_name) - 1);
-                                                strncpy(bg_ctx->tsig_algorithm,
-                                                        k->algorithm ? k->algorithm : "hmac-sha256",
-                                                        sizeof(bg_ctx->tsig_algorithm) - 1);
-                                                size_t copy_len = k->secret_decoded_len;
-                                                if (copy_len > sizeof(bg_ctx->tsig_secret_decoded))
-                                                    copy_len = sizeof(bg_ctx->tsig_secret_decoded);
-                                                memcpy(bg_ctx->tsig_secret_decoded,
-                                                       k->secret_decoded, copy_len);
-                                                bg_ctx->tsig_secret_decoded_len = copy_len;
-                                                break;
-                                            }
-                                            k = k->next;
-                                        }
-                                    }
-                                    
+                                    /* the primaries in order, with their keys copied by value ([H-4]: a pointer into the configuration would
+                                     * dangle after a reload) and the options of the zone */
+                                    xfr_build_primaries(active, snap, entry, slave_zcfg, bg_ctx);
                                     pthread_t bg_thread;
                                     pthread_attr_t attr;
                                     pthread_attr_init(&attr);
                                     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
                                     pthread_attr_setstacksize(&attr, 2 * 1024 * 1024);
-                                    if (pthread_create(&bg_thread, &attr, axfr_bg_thread_func, bg_ctx) != 0) {
+                                    retain_zone_snapshot(snap);
+                                    if (bg_ctx->nprim == 0 || pthread_create(&bg_thread, &attr, axfr_bg_thread_func, bg_ctx) != 0) {
                                         release_zone_snapshot(snap);
                                         free(bg_ctx);
+                                        xfr_counter_release(&g_xfr_in_active);
                                         atomic_store_explicit(&entry->is_transferring, false, memory_order_release);
                                     }
                                     pthread_attr_destroy(&attr);
                                 } else {
+                                    xfr_counter_release(&g_xfr_in_active);
                                     atomic_store_explicit(&entry->is_transferring, false, memory_order_release);
                                 }
                             }
@@ -3847,6 +3973,7 @@ void *control_thread_func(void *arg) {
                     }
                 }
             }
+            g_tick_rotor++;
             rcu_aux_read_unlock();
             release_zone_snapshot(snap);
         }
@@ -3899,7 +4026,6 @@ void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
 
 int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS]) {
   int num_fds = 0;
-  int port = cfg->port > 0 ? cfg->port : DNS_PORT;
   int opt = 1;
   int rcvbuf_size = cfg->udp_recvbuf_size > 0 ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
   int sndbuf_size = cfg->udp_sndbuf_size > 0 ? cfg->udp_sndbuf_size : 4 * 1024 * 1024;
@@ -3954,120 +4080,55 @@ int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], b
     }
   }
 
-  // Pre-bind any explicit notify-source configured on zones if not already bound
+  // Pre-bind the NOTIFY source addresses of the configuration (notify-source, notify-source-v6, the `source` of also-notify lists: every
+  // distinct address in cfg->xfr_sources with notify set, from options, views, zones and lists) that no listening socket has yet.
+  // The socket gets an ephemeral port (BIND 9.20 notify-source has no port): it only sends the NOTIFY and receives the answer, so it is
+  // not another listening port of the server -- the old pre-bind used cfg->port (and its "already bound" test looked at the address
+  // only), which made the server answer queries on the source address at the default port whatever listen-on said.  An address that a
+  // listening socket has, at whatever port that statement gave it, is used as it is: the NOTIFY leaves from that socket.
   if (cfg) {
-    for (view_config_t *v = cfg->views; v; v = v->next) {
-      for (zone_config_t *z = v->zones; z; z = z->next) {
-        if (!zext(z)->notify_source || !*zext(z)->notify_source) continue;
-        if (num_fds >= MAX_BIND_ADDRS) break;
-
-        struct sockaddr_in addr4;
-        struct sockaddr_in6 addr6;
-        bool is_v4 = false;
-        bool is_v6 = false;
-        memset(&addr4, 0, sizeof(addr4));
-        memset(&addr6, 0, sizeof(addr6));
-
-        if (inet_pton(AF_INET, zext(z)->notify_source, &addr4.sin_addr) == 1) {
-          addr4.sin_family = AF_INET;
-          addr4.sin_port = htons(port);
-          is_v4 = true;
-        } else if (inet_pton(AF_INET6, zext(z)->notify_source, &addr6.sin6_addr) == 1) {
-          addr6.sin6_family = AF_INET6;
-          addr6.sin6_port = htons(port);
-          is_v6 = true;
-        }
-
-        bool already_bound = false;
-        for (int k = 0; k < num_fds; k++) {
-          struct sockaddr_storage ss = {0};
-          socklen_t slen = sizeof(ss);
-          if (getsockname(out_fds[k], (struct sockaddr *)&ss, &slen) == 0) {
-            if (is_v4 && ss.ss_family == AF_INET) {
-              if (((struct sockaddr_in *)&ss)->sin_addr.s_addr == addr4.sin_addr.s_addr) {
-                already_bound = true;
-                break;
-              }
-            } else if (is_v6 && ss.ss_family == AF_INET6) {
-              if (memcmp(&((struct sockaddr_in6 *)&ss)->sin6_addr, &addr6.sin6_addr, sizeof(struct in6_addr)) == 0) {
-                already_bound = true;
-                break;
-              }
-            }
-          }
-        }
-        if (already_bound) continue;
-
-        if (is_v4 && num_fds < MAX_BIND_ADDRS) {
-          int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-          if (udp_fd >= 0) {
-            setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
-            fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
-#ifdef SO_REUSEPORT_LB
-            int opt_lb = 1;
-            if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt_lb, sizeof(opt_lb)) < 0) {
-              int opt_reuse = 1;
-              setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
-            }
-#else
-            int opt_reuse = 1;
-            setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
-#endif
-            int opt_dst = 1;
-#ifdef IP_RECVDSTADDR
-            setsockopt(udp_fd, IPPROTO_IP, IP_RECVDSTADDR, &opt_dst, sizeof(opt_dst));
-#elif defined(IP_PKTINFO)
-            setsockopt(udp_fd, IPPROTO_IP, IP_PKTINFO, &opt_dst, sizeof(opt_dst));
-#endif
-            if (bind(udp_fd, (struct sockaddr *)&addr4, sizeof(addr4)) == 0) {
-              out_is_wildcard[num_fds] = (addr4.sin_addr.s_addr == INADDR_ANY);
-              out_fds[num_fds++] = udp_fd;
-            } else {
-              // notify-source の事前bindは best-effort (NOTIFY送信時に再試行し、
-              // 失敗すればエフェメラルポートで送信する)。非root起動で1024未満の
-              // ポートを指定した場合などに気付けるよう警告だけ残す。
-              int bind_errno = errno;
-              syslog(LOG_WARNING, "[Frontend] Could not pre-bind notify-source for zone '%s': %s%s",
-                     z->domain, strerror(bind_errno), bind_error_hint(bind_errno, port));
-              close(udp_fd);
-            }
-          }
-        } else if (is_v6 && num_fds < MAX_BIND_ADDRS) {
-          int udp_fd = socket(AF_INET6, SOCK_DGRAM, 0);
-          if (udp_fd >= 0) {
-            setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
-            fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
-            setsockopt(udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
-#ifdef SO_REUSEPORT_LB
-            int opt_lb = 1;
-            if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt_lb, sizeof(opt_lb)) < 0) {
-              int opt_reuse = 1;
-              setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
-            }
-#else
-            int opt_reuse = 1;
-            setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
-#endif
-            int opt_pktinfo = 1;
-#ifdef IPV6_RECVPKTINFO
-            setsockopt(udp_fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &opt_pktinfo, sizeof(opt_pktinfo));
-#elif defined(IPV6_PKTINFO)
-            setsockopt(udp_fd, IPPROTO_IPV6, IPV6_PKTINFO, &opt_pktinfo, sizeof(opt_pktinfo));
-#endif
-            if (bind(udp_fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0) {
-              out_is_wildcard[num_fds] = IN6_IS_ADDR_UNSPECIFIED(&addr6.sin6_addr);
-              out_fds[num_fds++] = udp_fd;
-            } else {
-              // notify-source の事前bindは best-effort (NOTIFY送信時に再試行し、
-              // 失敗すればエフェメラルポートで送信する)。非root起動で1024未満の
-              // ポートを指定した場合などに気付けるよう警告だけ残す。
-              int bind_errno = errno;
-              syslog(LOG_WARNING, "[Frontend] Could not pre-bind notify-source for zone '%s': %s%s",
-                     z->domain, strerror(bind_errno), bind_error_hint(bind_errno, port));
-              close(udp_fd);
-            }
-          }
-        }
+    for (int xi = 0; xi < cfg->xfr_source_count && num_fds < MAX_BIND_ADDRS; xi++) {
+      const xfr_source_t *xs = &cfg->xfr_sources[xi];
+      if (!xs->notify) continue;
+      bool already_bound = false;
+      for (int k = 0; k < num_fds && !already_bound; k++) {
+        struct sockaddr_storage ss = {0};
+        socklen_t slen = sizeof(ss);
+        if (getsockname(out_fds[k], (struct sockaddr *)&ss, &slen) != 0 || ss.ss_family != xs->family) continue;
+        if (xs->family == AF_INET)
+          already_bound = memcmp(&((struct sockaddr_in *)&ss)->sin_addr, xs->addr, 4) == 0;
+        else
+          already_bound = memcmp(&((struct sockaddr_in6 *)&ss)->sin6_addr, xs->addr, 16) == 0;
+      }
+      if (already_bound) continue;
+      int udp_fd = socket(xs->family, SOCK_DGRAM, 0);
+      if (udp_fd < 0) continue;
+      setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
+      fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
+      struct sockaddr_storage bs;
+      memset(&bs, 0, sizeof(bs));
+      socklen_t bl;
+      if (xs->family == AF_INET) {
+        struct sockaddr_in *b4 = (struct sockaddr_in *)&bs;
+        b4->sin_family = AF_INET;
+        memcpy(&b4->sin_addr, xs->addr, 4);
+        bl = sizeof(*b4);
+      } else {
+        struct sockaddr_in6 *b6 = (struct sockaddr_in6 *)&bs;
+        setsockopt(udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
+        b6->sin6_family = AF_INET6;
+        memcpy(&b6->sin6_addr, xs->addr, 16);
+        bl = sizeof(*b6);
+      }
+      if (bind(udp_fd, (struct sockaddr *)&bs, bl) == 0) {
+        out_is_wildcard[num_fds] = false;
+        out_fds[num_fds++] = udp_fd;
+      } else {
+        // start-up already bound this address once (preflight_xfr_sources()), so this is rare; the NOTIFY then leaves from the system's choice
+        int bind_errno = errno;
+        syslog(LOG_WARNING, "[Frontend] %s: could not pre-bind the NOTIFY source %s: %s", xs->loc[0] ? xs->loc : "configuration", xs->text,
+               strerror(bind_errno));
+        close(udp_fd);
       }
     }
   }
@@ -4413,14 +4474,8 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
 #ifdef SO_REUSEPORT_LB
               setsockopt(s, SOL_SOCKET, SO_REUSEPORT_LB, &opt_reuse, sizeof(opt_reuse));
 #endif
-              uint16_t src_port = 0;
-              if (notify_v4_sock >= 0) {
-                struct sockaddr_storage pss;
-                socklen_t plen = sizeof(pss);
-                if (getsockname(notify_v4_sock, (struct sockaddr *)&pss, &plen) == 0) {
-                  src_port = ntohs(((struct sockaddr_in *)&pss)->sin_port);
-                }
-              }
+              /* the source address is one the Backend found in the start-up configuration but the Router could not pre-bind (rare): a one-off
+               * socket with an ephemeral port.  If even that cannot be bound the NOTIFY is not sent from another address than the operator named. */
               struct sockaddr_storage bind_sa;
               memset(&bind_sa, 0, sizeof(bind_sa));
               socklen_t b_len = 0;
@@ -4428,24 +4483,17 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
                 struct sockaddr_in *b_in = (struct sockaddr_in *)&bind_sa;
                 b_in->sin_family = AF_INET;
                 b_in->sin_addr = msg->source_addr.sin.sin_addr;
-                b_in->sin_port = htons(src_port);
                 b_len = sizeof(struct sockaddr_in);
               } else if (msg->source_addr.ss_family == AF_INET6) {
                 struct sockaddr_in6 *b_in6 = (struct sockaddr_in6 *)&bind_sa;
                 b_in6->sin6_family = AF_INET6;
                 b_in6->sin6_addr = msg->source_addr.sin6.sin6_addr;
-                b_in6->sin6_port = htons(src_port);
                 b_len = sizeof(struct sockaddr_in6);
               }
-              if (b_len > 0) {
-                if (bind(s, (struct sockaddr *)&bind_sa, b_len) < 0) {
-                  if (msg->source_addr.ss_family == AF_INET) {
-                    ((struct sockaddr_in *)&bind_sa)->sin_port = 0;
-                  } else {
-                    ((struct sockaddr_in6 *)&bind_sa)->sin6_port = 0;
-                  }
-                  bind(s, (struct sockaddr *)&bind_sa, b_len);
-                }
+              if (b_len > 0 && bind(s, (struct sockaddr *)&bind_sa, b_len) < 0) {
+                syslog(LOG_WARNING, "[Frontend %d] Cannot bind the NOTIFY source address: %m; NOTIFY not sent", router_id);
+                close(s);
+                continue;
               }
               sendto(s, buffer + sizeof(udp_ipc_t), msg->payload_len, 0,
                      (struct sockaddr *)&msg->client_addr, msg->addr_len);
@@ -4940,6 +4988,46 @@ STATIC_TEST bool preflight_listen_ports(server_config_t *cfg) {
   return true;
 }
 
+/* notify-source / transfer-source (and their -v6 forms) and the `source` of primaries / also-notify lists: BIND refuses to start a
+ * server whose source address it cannot bind.  Every distinct address of the configuration (server_config_t.xfr_sources, with the
+ * place where it is written) is bound once, UDP for a NOTIFY source and TCP for a transfer source, with port 0, and closed again;
+ * the sockets that are used are made later by the Router (NOTIFY) and the connect broker (transfers). */
+STATIC_TEST bool preflight_xfr_sources(server_config_t *cfg) {
+  for (int i = 0; i < cfg->xfr_source_count; i++) {
+    const xfr_source_t *s = &cfg->xfr_sources[i];
+    for (int t = 0; t < 2; t++) {
+      if (t == 0 ? !s->notify : !s->xfer) continue;
+      int fd = socket(s->family, t == 0 ? SOCK_DGRAM : SOCK_STREAM, 0);
+      if (fd < 0) continue;
+      struct sockaddr_storage ss;
+      memset(&ss, 0, sizeof(ss));
+      socklen_t sl;
+      if (s->family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
+        sin->sin_family = AF_INET;
+        memcpy(&sin->sin_addr, s->addr, sizeof(sin->sin_addr));
+        sl = sizeof(*sin);
+      } else {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
+        sin6->sin6_family = AF_INET6;
+        memcpy(&sin6->sin6_addr, s->addr, sizeof(sin6->sin6_addr));
+        sl = sizeof(*sin6);
+      }
+      if (bind(fd, (struct sockaddr *)&ss, sl) != 0) {
+        int err = errno;
+        close(fd);
+        syslog(LOG_ERR, "[Startup] Refusing to start: %s: %s %s: cannot use it as a source address: %s", s->loc[0] ? s->loc : "configuration",
+               s->what, s->text, strerror(err));
+        fprintf(stderr, "[ERROR] Refusing to start: %s: %s %s: cannot use it as a source address: %s\n", s->loc[0] ? s->loc : "configuration",
+                s->what, s->text, strerror(err));
+        return false;
+      }
+      close(fd);
+    }
+  }
+  return true;
+}
+
 /* [SEC] pidfile / control-socket 用ディレクトリの安全性検証。
  *
  * mkdir(dir_buf, 0755) 自体はシンボリックリンクを追跡しないため作成時の
@@ -5263,6 +5351,13 @@ int main(int argc, char **argv) {
     free_server_config_fields(&g_config_db.config_a);
     return 1;
   }
+  // notify-source / transfer-source / primaries の source: ここで bind できなければ起動しない (file:line 付き)。
+  // 起動時の集合は子プロセス (Router、connect broker、Backend) が fork で引き継ぐ。リロードで増えた送信元は再起動まで使えない。
+  if (!preflight_xfr_sources(&g_config_db.config_a)) {
+    free_server_config_fields(&g_config_db.config_a);
+    return 1;
+  }
+  config_set_startup_xfr_sources(&g_config_db.config_a);
   // ---------------------------------------------------------------------------
 
   if (!foreground) {

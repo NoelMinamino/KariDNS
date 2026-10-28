@@ -238,19 +238,19 @@ zone "m6.test" {
     also-notify { ::1 port $N6; };
     notify-source "::1";
 };
-# notify-source addresses that are not configured locally: the frontend has
-# to fall back to the wildcard sockets
+# notify-source addresses: a source that is not a local address is refused at start-up (tests/run_xfr_sources_test.sh), so these are
+# the addresses the server listens on; the frontend sends from the matching socket
 zone "n4.test" {
     type master;
     file "$TMP/n4.zone";
     also-notify { 127.0.0.1 port $N4; };
-    notify-source "127.0.0.3";
+    notify-source "127.0.0.1";
 };
 zone "n6.test" {
     type master;
     file "$TMP/n6.zone";
     also-notify { ::1 port $N6; };
-    notify-source "2001:db8::53";
+    notify-source "::1";
 };
 # program (plugin) zone: answered through the async I/O pool, rate limited
 zone "prog.test" {
@@ -542,15 +542,14 @@ CEOF
     check_exit $PPID_ "privilege variant '$priv'"
 done
 
-# explicit (non-wildcard) listener with notify-source addresses that are not
-# local: the frontend opens a one-off socket for each NOTIFY
+# explicit (non-wildcard) listener with notify-source addresses that are its listening addresses
 fresh_dir "$TMP/n"
 make_ctl_conf "$TMP/n.ctl" "$TMP/n.sock"
 cat > "$TMP/n.conf" <<CEOF
 options { port $PB; bind-address { 127.0.0.1; ::1; }; user "nobody"; group "nobody"; };
 control-channel { socket "$TMP/n.sock"; algorithm hmac-sha256; secret "$SECRET"; };
-zone "n4.test" { type master; file "$TMP/n4.zone"; also-notify { 127.0.0.1 port $N4; }; notify-source "127.0.0.3"; };
-zone "n6.test" { type master; file "$TMP/n6.zone"; also-notify { ::1 port $N6; }; notify-source "2001:db8::53"; };
+zone "n4.test" { type master; file "$TMP/n4.zone"; also-notify { 127.0.0.1 port $N4; }; notify-source "127.0.0.1"; };
+zone "n6.test" { type master; file "$TMP/n6.zone"; also-notify { ::1 port $N6; }; notify-source "::1"; };
 zone "b.test" { type master; file "$TMP/b.zone"; also-notify { 127.0.0.1 port $N4; ::1 port $N6; }; };
 CEOF
 "$KARIDNS" -f "$TMP/n.conf" > "$TMP/n.log" 2>&1 &
@@ -559,7 +558,7 @@ PIDS="$PIDS $NPID"
 if wait_up 127.0.0.1 $PB b.test; then
     for z in n4.test n6.test b.test; do ctl "$TMP/n.ctl" notify $z >/dev/null; done
     sleep 1
-    wait_up 127.0.0.1 $PB n4.test && ok "NOTIFY from non-local notify-source addresses" || fail "instance stopped answering after NOTIFY"
+    wait_up 127.0.0.1 $PB n4.test && ok "NOTIFY from notify-source addresses that are listening addresses" || fail "instance stopped answering after NOTIFY"
 else
     fail "notify instance did not come up"
 fi

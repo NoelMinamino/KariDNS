@@ -2621,7 +2621,8 @@ static void test_also_notify_bind(void) {
     expect_an_error("two keys", AN_KEY "options { also-notify { 192.0.2.1 key k1 key k1; }; };", "two keys");
     expect_an_error("key without name", "options { also-notify { 192.0.2.1 key; }; };", "expected a key name");
     expect_an_error("tls", "options { also-notify { 192.0.2.1 tls t; }; };", "'tls' is not supported");
-    expect_an_error("source", "options { also-notify source 192.0.2.5 { 192.0.2.1; }; };", "'source' is not supported");
+    expect_an_error("source then junk", "options { also-notify source 192.0.2.5 foo { 192.0.2.1; }; };", "expected '{'");
+    expect_an_error("source of the wrong family", "options { also-notify source 2001:db8::5 { 192.0.2.1; }; };", "not an IPv4 address");
     expect_an_error("junk after element", "options { also-notify { 192.0.2.1 foo; }; };", "unexpected 'foo'");
     expect_an_error("list includes itself", "options { also-notify { l; }; };\nremote-servers l { 192.0.2.1; l; };", "nested more than");
     expect_an_error("list defined twice", "remote-servers l { 192.0.2.1; };\nprimaries L { 192.0.2.2; };", "line 2|list 'L' is defined twice");
@@ -2681,7 +2682,7 @@ static void test_primaries_and_notify_mode(void) {
     expect_an_error("unknown primaries list", "zone \"s.test\" { type slave;\n primaries { nolist; }; };", "line 2|zone 's.test.' primaries|'nolist'");
     expect_an_error("primaries key undefined", "zone \"s.test\" { type slave;\n masters { 192.0.2.1 key nokey; }; };", "line 2|key 'nokey' is not defined");
     expect_an_error("primaries tls", "zone \"s.test\" { type slave; primaries { 192.0.2.1 tls t; }; };", "'tls' is not supported");
-    expect_an_error("primaries source", "zone \"s.test\" { type slave; primaries source 192.0.2.9 { 192.0.2.1; }; };", "'source' is not supported");
+    expect_an_error("primaries source-v6 with an IPv4 address", "zone \"s.test\" { type slave; primaries source-v6 192.0.2.9 { 192.0.2.1; }; };", "not an IPv6 address");
     expect_an_error("primaries syntax", "zone \"s.test\" { type slave;\n primaries { 192.0.2.1 }; };", "line 2|zone 's.test.' primaries|expected ';'");
     expect_an_error("primaries port on a name", "zone \"s.test\" { type slave; primaries { l port 5; }; }; remote-servers l { 192.0.2.1; };", "takes no port");
     {
@@ -2798,7 +2799,7 @@ static void test_strict_options_and_key(void) {
     /* a BIND option KariDNS does not implement: warning, skipped, the rest of options { } still applies */
     static const char *const bind_only[] = {
         "recursion no;",
-        "transfer-source 192.0.2.1;", "version none;", "dnssec-validation auto;", "forwarders { 192.0.2.1; };",
+        "min-transfer-rate-in 10240 5;" /* BIND 9.20 only; not implemented */, "version none;", "dnssec-validation auto;", "forwarders { 192.0.2.1; };",
         "max-cache-size 100m;", "allow-new-zones yes;", "dnssec-enable yes;" /* BIND 9.16 and older */,
         "allow-proxy { any; };" /* BIND 9.20 only */, "use-alt-transfer-source no;" /* BIND 9.18 only */,
         "check-names primary ignore;", "tkey-dhkey \"k\" 1;",

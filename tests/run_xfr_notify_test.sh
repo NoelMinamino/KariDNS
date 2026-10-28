@@ -188,7 +188,7 @@ if grep -q "zone 'x1.test.': primary answered the AXFR request with REFUSED (5)"
     pass "R-19: REFUSED ends the transfer at once and is logged with the RCODE"
 else fail "R-19: REFUSED answer not recognised"; grep "x1.test" "$W/s.log" | head -3; fi
 if wait_grep "zone x2.test.: 127.0.0.1 does not support IXFR, retrying with AXFR" "$W/s.log" 5 &&
-   [ "$(sed -n 's/REQ qtype=//p' "$W/mx2.log" | head -2 | tr '\n' ' ')" = "251 252 " ] &&
+   [ "$(sed -n -E 's/REQ qtype=([0-9]*).*/\1/p' "$W/mx2.log" | head -2 | tr '\n' ' ')" = "251 252 " ] &&
    "$DAG" @127.0.0.1 -p $PS www.x2.test A +short +nohexdump | grep -qx 192.0.2.80; then
     pass "R-19: NOTIMP to IXFR -> one AXFR retry, zone served (RFC 1995 §4)"
 else fail "R-19: IXFR -> AXFR fallback"; cat "$W/mx2.log"; grep "x2.test" "$W/s.log" | head -5; fi

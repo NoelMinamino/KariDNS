@@ -182,13 +182,13 @@ EOF
     done
 } > "$W/primary.conf"
 {
-    echo "options { port $EPORT; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT };"
+    echo "options { port $EPORT; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT min-refresh-time 1; min-retry-time 1; };"
     for z in $ZONES; do
         echo "zone \"$z\" { type slave; masters { 127.0.0.1 port $PPORT; }; };"
     done
 } > "$W/ext.conf"
 {
-    echo "options { port $IPORT; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT };"
+    echo "options { port $IPORT; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT min-refresh-time 1; min-retry-time 1; };"
     echo "control-channel { socket \"$W/ixfr.sock\"; algorithm hmac-sha256; secret \"ZG5zc2VjLXNlY29uZGFyeS10ZXN0LWtleS0wMDE=\"; };"
     for z in $ZONES; do
         echo "zone \"$z\" { type slave; masters { 127.0.0.1 port $RPORT; }; };"

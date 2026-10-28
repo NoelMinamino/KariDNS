@@ -43,6 +43,13 @@ typedef struct {
   char *key;   /* TSIG key name that signs the NOTIFY to this address (RFC 8945), or NULL */
   char *list;  /* name of the list, until the parse has expanded it */
   char *where; /* "file:line" of the element, until the parse has checked it (only elements with a list name or a key) */
+  /* The `source` / `source-v6` of the list statement this address is written in (BIND 9.20 ARM "primaries", "also-notify"): src_set[0] =
+   * IPv4 (src[0], 4 octets), src_set[1] = IPv6 (src[1]).  `*` is the same as not written (the transfer-source / notify-source of the zone,
+   * view or options applies).  An address of a named list keeps the source of that list (BIND lib/isccfg getipandkeylist()).  src_loc is
+   * the "file:line" of the statement, for the start-up check of the address; NULL when no source is written. */
+  uint8_t src_set[2];
+  uint8_t src[2][16];
+  char *src_loc;
 } notify_target_t;
 
 /* Top-level remote-servers <name> [port <n>] { ... }; (also written primaries / masters).  Items may name other lists. */
@@ -114,6 +121,81 @@ typedef struct {
 #define IXFR_HISTORY_DEFAULT 4
 #define IXFR_HISTORY_MAX 32
 
+/* ---- Batch 4: the transfer / NOTIFY options of BIND 9.20 (ARM "Zone Transfers", "Boolean Options", "Zone Transfers" and the zone
+ * statement), written in options, view and zone and resolved per option, zone > view > options (the lower level replaces, never merges). ---- */
+
+/* notify-source / notify-source-v6 / transfer-source / transfer-source-v6: `( <address> | * )`, no port (9.20 grammar; a port is refused) */
+enum { XSRC_NOTIFY4 = 0, XSRC_NOTIFY6, XSRC_XFER4, XSRC_XFER6, XSRC_N };
+typedef struct {
+  uint8_t state;      /* 0 = not written at this level, 1 = an address, 2 = `*` (the system chooses) */
+  uint8_t addr[16];   /* network order; 4 octets for XSRC_*4 */
+  char *loc;          /* "file:line" of the statement (owned) */
+} xfr_src_t;
+
+/* The numeric / boolean options; the bit says "written at this level" */
+#define XO_MIN_REFRESH   (1u << 0)
+#define XO_MAX_REFRESH   (1u << 1)
+#define XO_MIN_RETRY     (1u << 2)
+#define XO_MAX_RETRY     (1u << 3)
+#define XO_XFER_TIME_IN  (1u << 4)
+#define XO_XFER_IDLE_IN  (1u << 5)
+#define XO_XFER_TIME_OUT (1u << 6)
+#define XO_XFER_IDLE_OUT (1u << 7)
+#define XO_NOTIFY_DELAY  (1u << 8)
+#define XO_B_NOTIFY_TO_SOA   (1u << 9)
+#define XO_B_TRY_TCP_REFRESH (1u << 10)
+#define XO_B_REQUEST_IXFR    (1u << 11)
+#define XO_B_PROVIDE_IXFR    (1u << 12)
+#define XO_B_REQUEST_EXPIRE  (1u << 13)
+#define XO_B_MULTI_MASTER    (1u << 14)
+#define XO_LEGACY_NOTIFY6    (1u << 15)   /* the IPv6 notify source came from the KariDNS zone statement `notify-source <ipv6>`; notify-source-v6 replaces it */
+
+/* BIND 9.20 defaults (bin/named/config.c) and ranges (lib/isccfg/check.c) */
+#define XFR_MIN_REFRESH_DEFAULT   300u
+#define XFR_MAX_REFRESH_DEFAULT   2419200u   /* 4 weeks */
+#define XFR_MIN_RETRY_DEFAULT     500u
+#define XFR_MAX_RETRY_DEFAULT     1209600u   /* 2 weeks */
+#define XFR_TIME_IN_DEFAULT       120u       /* minutes */
+#define XFR_IDLE_IN_DEFAULT       60u
+#define XFR_TIME_OUT_DEFAULT      120u
+#define XFR_IDLE_OUT_DEFAULT      60u
+#define XFR_MINUTES_MAX           40320u     /* 28 days */
+#define XFR_NOTIFY_DELAY_DEFAULT  5u
+#define XFR_MAX_EXPIRE            14515200u  /* 24 weeks: BIND's DNS_MAX_EXPIRE, the upper bound of the SOA EXPIRE a zone uses */
+#define XFR_TRANSFERS_IN_DEFAULT  10u
+#define XFR_TRANSFERS_OUT_DEFAULT 10u
+#define XFR_TRANSFERS_PER_NS_DEFAULT 2u
+#define XFR_RATE_DEFAULT          20u
+
+typedef struct xfr_opts {
+  uint32_t set;                                 /* XO_* bits of the options written at this level */
+  uint32_t min_refresh, max_refresh, min_retry, max_retry;        /* seconds */
+  uint32_t xfer_time_in, xfer_idle_in, xfer_time_out, xfer_idle_out; /* minutes */
+  uint32_t notify_delay;                        /* seconds */
+  uint32_t bools;                               /* the XO_B_* values (meaningful where the bit is in `set`) */
+  xfr_src_t src[XSRC_N];
+} xfr_opts_t;
+
+/* The value that applies to a zone (xfr_opts_effective()) */
+typedef struct {
+  uint32_t min_refresh, max_refresh, min_retry, max_retry;
+  uint32_t xfer_time_in, xfer_idle_in, xfer_time_out, xfer_idle_out;   /* seconds (minutes * 60) */
+  uint32_t notify_delay;
+  bool notify_to_soa, try_tcp_refresh, request_ixfr, provide_ixfr, request_expire, multi_master;
+  struct { bool set; uint8_t addr[16]; } src[XSRC_N];  /* set == false: `*` or not written, the system chooses the source address */
+} xfr_eff_t;
+
+/* One distinct source address of the configuration (start-up check, the Router's NOTIFY sockets, the connect broker's allow list) */
+typedef struct {
+  uint8_t family;       /* AF_INET / AF_INET6 */
+  uint8_t addr[16];
+  bool notify, xfer;    /* used as a NOTIFY source / a transfer source */
+  char text[48];
+  char loc[240];        /* "file:line" of the first statement that names it */
+  char what[48];        /* the statement ("notify-source", "primaries source-v6", ...) */
+} xfr_source_t;
+#define KARIDNS_XFR_SOURCES_MAX 128
+
 /* BIND address match list (BIND 9.20 ARM "Address Match Lists"), compiled: elements are evaluated in order and the first one that
  * matches decides (dns_tsig_acl.h: aml_t, aml_match()).  The statements below are shared with the zone, view and options level. */
 typedef struct aml aml_t;
@@ -146,6 +228,7 @@ typedef struct zone_ext {
   uint8_t notify_mode;   /* notify_mode_t of the zone's own `notify` statement, 0 = inherit */
   bool also_notify_set;  /* the zone has an also-notify statement (even an empty one): it replaces the view's and options' list */
   char *notify_source;
+  xfr_opts_t *xo;   /* batch 4 transfer / NOTIFY options written in this zone (NULL = none); `notify-source <address>` above is also entered here */
   char **allow_transfer;
   int allow_transfer_count;
   acl_entry_t *allow_transfer_parsed;
@@ -354,6 +437,7 @@ typedef struct view_config {
   bool also_notify_set;
   acl_set_t acl;                /* view { allow-query ... }: overrides options' for the zones of this view that have none of their own */
   uint8_t notify_mode;          /* view { notify }: notify_mode_t, 0 = inherit options' */
+  xfr_opts_t xo;                /* view { notify-source, transfer-source, min-refresh-time, ... }: replaces options' for the zones of this view that have none of their own */
   /* beta design 7.1: DB zone source of this view. NULL/false = the global source of options { database { } } */
   char *database_file;         /* "database-file": sqlite3, this view's own file */
   char *database_schema;       /* "database-schema": postgresql, this view's own schema */
@@ -468,6 +552,13 @@ typedef struct server_config_s {
   notify_target_t *also_notify; /* options { also-notify { } }: the default of every zone, view and catalog member */
   int also_notify_count;
   uint8_t notify_mode;          /* options { notify }: notify_mode_t, 0 = yes */
+  xfr_opts_t xo;                /* options { notify-source, transfer-source, min-refresh-time, ... }: the default of every view and zone */
+  /* options-only limits of the transfer machinery (BIND 9.20 ARM "transfers-in" ...); the *_set flags say that the file wrote them */
+  uint32_t transfers_in, transfers_out, transfers_per_ns;   /* concurrent inbound / outbound transfers, inbound per primary */
+  uint32_t serial_query_rate, notify_rate, startup_notify_rate;   /* per second; 0 written = 1 */
+  bool transfers_in_set, transfers_out_set, transfers_per_ns_set, serial_query_rate_set, notify_rate_set, startup_notify_rate_set;
+  xfr_source_t *xfr_sources;    /* every distinct source address the configuration names, computed when the parse ends (config_collect_xfr_sources()) */
+  int xfr_source_count;
   logging_config_t logging;
   control_channel_config_t control;
   dnstap_config_t dnstap;
@@ -632,6 +723,36 @@ int also_notify_effective(const server_config_t *cfg, const zone_config_t *zone,
                           const notify_target_t **out);
 /* The notify mode that applies to a zone (never NOTIFY_MODE_INHERIT): the zone's `notify`, else its view's, else options', else yes. */
 notify_mode_t notify_mode_effective(const server_config_t *cfg, const zone_config_t *zone, const char *view_name);
+/* The transfer / NOTIFY options that apply to a zone: every option from the zone, else its view (view_name; NULL or "" = none), else
+ * options, else the BIND 9.20 default (see XFR_*_DEFAULT).  zone may be NULL (catalog member, zone without zone {}) and cfg may be NULL
+ * (defaults only).  multi_master is the option as written (BIND only looks at it when a zone has more than one primary). */
+void xfr_opts_effective(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, xfr_eff_t *out);
+/* The source address of a request to a primary / NOTIFY target `family` (AF_INET / AF_INET6): the address of the list the primary is
+ * written in (t may be NULL), else the effective transfer-source(-v6) (xfer = true) or notify-source(-v6).  false = the system chooses. */
+bool xfr_source_for(const xfr_eff_t *e, const notify_target_t *t, int family, bool xfer, uint8_t out[16]);
+/* minutes of max-transfer-*-in/out in seconds.  KARIDNS_XFER_MINUTE_SECS in the environment (a test hook, like BIND's named -T transferinsecs)
+ * sets the length of a "minute" to that many seconds (1..60), so that a test does not wait for real minutes. */
+uint32_t xfr_minutes_to_secs(uint32_t minutes);
+/* RANGE() of BIND lib/dns/zone.c: a < lo -> lo, else a < hi -> a, else hi (lo > hi gives hi for a >= lo) */
+uint32_t xfr_range(uint32_t a, uint32_t lo, uint32_t hi);
+/* The timers a zone uses after a transfer or an up-to-date answer (BIND zone_xfrdone()): refresh and retry are clamped to
+ * [min-*-time, max-*-time], expire to [refresh + retry, XFR_MAX_EXPIRE].  Any pointer may be NULL. */
+void xfr_clamp_timers(const xfr_eff_t *e, uint32_t soa_refresh, uint32_t soa_retry, uint32_t soa_expire, uint32_t *refresh,
+                      uint32_t *retry, uint32_t *expire);
+/* BIND setrl(): serial-query-rate / notify-rate / startup-notify-rate: 0 is silently raised to 1 */
+uint32_t xfr_rate_clamp(uint32_t v);
+/* The options-only limits (cfg may be NULL: the defaults); the rates come back clamped (>= 1) */
+enum { XL_TRANSFERS_IN = 0, XL_TRANSFERS_OUT, XL_TRANSFERS_PER_NS, XL_SERIAL_QUERY_RATE, XL_NOTIFY_RATE, XL_STARTUP_NOTIFY_RATE };
+uint32_t xfr_cfg_limit(const server_config_t *cfg, int which);
+/* The source addresses that were in the configuration when the server started are the only ones it can use: the Router pre-binds the NOTIFY
+ * sockets and the connect broker (a separate process) is told the transfer sources at its start, neither follows a reload.  The server
+ * records the start-up set once (before it forks the children); config_xfr_source_allowed() says whether an address is in it for the
+ * use (xfer = transfers, else NOTIFY).  A reload that names another address is a restart-only change. */
+void config_set_startup_xfr_sources(const server_config_t *cfg);
+bool config_xfr_source_allowed(int family, const uint8_t addr[16], bool xfer);
+/* Fills cfg->xfr_sources from every level of the configuration; called when the parse ends.  -1 = out of memory or more than
+ * KARIDNS_XFR_SOURCES_MAX distinct addresses (an error with the place has been printed) */
+int config_collect_xfr_sources(token_ctx_t *ctx, server_config_t *cfg);
 /* The TSIG key that signs the requests to primary i of a zone (and verifies its answers; also the key a NOTIFY from it must carry):
  * the primary's own `key`, else the zone's tsig-key, else NULL.  Precedence as for also-notify. */
 static inline const char *zone_primary_key(const zone_ext_t *x, int i) {

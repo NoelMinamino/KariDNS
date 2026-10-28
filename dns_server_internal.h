@@ -75,7 +75,6 @@ extern char g_startup_cwd[PATH_MAX];
  * IXFR_HISTORY_DEFAULT; dns_config_parser.h) is the number of versions a secondary may lag behind and still get an
  * incremental transfer. */
 #define MAX_IXFR_HISTORY IXFR_HISTORY_MAX
-#define MAX_ZONE_AXFR 4
 #define MAX_TCP_CLIENTS 1000
 
 // Frontend/Backendプロセス間のUDPパケット受け渡し用コンパクトソケットアドレス (IPv4: 16B, IPv6: 28B, 8B aligned)
@@ -185,6 +184,9 @@ void tcp_ctx_free(tcp_stream_ctx_t *ctx);
 /* DNS メッセージを 2 バイトの長さと一緒に1回の sendmsg() で送る (RFC 7766 §8)。
  * 送り切れなければ書き込み可能になるのを待って続ける。戻り値は送ったメッセージ長、失敗時 -1。 */
 ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len);
+/* max-transfer-time-out / max-transfer-idle-out of the outbound AXFR/IXFR this thread serves (0 = none); defined in dns_axfr_ixfr.c */
+extern _Thread_local time_t g_tcp_send_deadline_secs;
+extern _Thread_local uint32_t g_tcp_send_idle_secs;
 
 typedef struct {
   bool is_finished;
@@ -231,6 +233,11 @@ typedef struct {
   bool ext_probe;         /* B8t-2: version 3 was asked for and a standard answer means "try version 2" (xfr_ext_probe()) */
   bool no_ext_answer;     /* set when handle_axfr_event() stopped for that reason */
   bool db_stream;         /* B8: the messages come from the database loader (ZONE_DATA): the Extended AXFR records are checked strictly (a malformed definition, state or wrapper record rejects the zone) and ECS_TRUSTED (65407) is refused: the trusted resolvers come from the settings text only, inside acl-ceiling */
+  /* batch 4 (BIND 9.20 zone.c refresh_callback(), zone_xfrdone()) */
+  bool serial_behind;     /* the primary's serial is older than ours: "serial number received from primary < ours" -- not a failure, the next primary is asked */
+  const xfr_eff_t *eff;   /* the transfer / timer options of the zone (NULL: the SOA timers are stored as received, no time limit) */
+  time_t deadline;        /* max-transfer-time-in: the time at which the transfer is given up (0 = none) */
+  uint32_t idle_secs;     /* max-transfer-idle-in: the longest wait for the next message (0 = none) */
 } axfr_session_t;
 
 // クエリログ用 固定長イベント構造体 (バイナリ保持)
@@ -389,6 +396,7 @@ typedef struct {
   _Atomic(time_t) next_check;
   _Atomic bool refresh_now;
   _Atomic bool notify_now;
+  time_t notify_next;             /* notify-delay: the time before which the next set of NOTIFY messages for the zone is not sent (the control thread only) */
   _Atomic bool is_transferring;
   _Atomic(int) active_axfr;
   _Atomic int snapshot_refs;
@@ -796,6 +804,10 @@ typedef struct {
   int rcvbuf;
   int sndbuf;
   int connect_timeout_ms;
+  /* transfer-source / primaries source (batch 4): the local address the connect broker binds (port 0) before connect(); the family is the
+   * request's.  The broker refuses an address that was not in the configuration when the server started (config_xfr_source_allowed()). */
+  uint8_t has_src;
+  uint8_t src[16];
 } tcp_sockopts_t;
 #define BROKER_CONNECT_TIMEOUT_MS 4000
 

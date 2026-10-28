@@ -2393,7 +2393,7 @@ static void test_broker_connect_opts_and_xfr_tcp_sockopts(void) {
     g_run_identity = saved_id;
     assert(g_broker_sock >= 0);
 
-    tcp_sockopts_t want = { 1200, 512 * 1024, 256 * 1024, 0 };
+    tcp_sockopts_t want = { 1200, 512 * 1024, 256 * 1024, 0, 0, {0} };
     int fd = broker_connect_opts(AF_INET, SOCK_STREAM, (struct sockaddr *)&sa, sizeof(sa), &want);
     assert(fd >= 0);
     int v = 0;

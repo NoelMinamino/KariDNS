@@ -13,25 +13,75 @@
  * 引数 ctx 以外のヒープ・スタック構造体へのアクセスを避け、
  * tsig_key_t など呼び出し元のメモリを直接参照しないように
  * ポインタ参照を一切排除する。*/
+/* One primary a secondary zone is refreshed from (batch 4: the refresh asks the primaries in order, BIND 9.20 zone.c refresh_callback()).
+ * The key is copied by value (no pointer into the configuration). */
+#define XFR_PRIMARIES_MAX 32
 typedef struct {
-  char master_ip[64];
-  int master_port;
-  char domain[256];
-  zone_db_entry_t *entry;
-  zone_db_snapshot_t *snap;
-  /* tsig_key_t の内容を値コピーして保持 (ポインタ参照排除) */
+  char ip[64];
+  int port;
   bool has_tsig;
   char tsig_name[256];
   char tsig_algorithm[64];
   uint8_t tsig_secret_decoded[256];
   size_t tsig_secret_decoded_len;
+  bool has_src;      /* the local address of the connection (primaries source, else transfer-source), allowed at start-up only */
+  uint8_t src[16];
+} xfr_primary_t;
+
+typedef struct {
+  char domain[256];
+  zone_db_entry_t *entry;
+  zone_db_snapshot_t *snap;
+  int nprim;
+  xfr_primary_t prim[XFR_PRIMARIES_MAX];
   /* マスターへの TCP 接続に使う zone-tcp-* / tcp-* (xfr_tcp_sockopts()) */
   tcp_sockopts_t tcp_opts;
   /* I2: the most RRs and message octets one transfer of this zone may bring (max-zone-records / max-zone-bytes of the
    * zone, else of options; xfr_zone_limits()).  0 = no limit. */
   uint64_t max_records;
   uint64_t max_bytes;
+  bool has_eff;               /* eff is filled in (the scheduler does); a zeroed context (a unit test) asks for IXFR with EXPIRE and has no time limits */
+  xfr_eff_t eff;              /* the transfer / timer options of the zone (xfr_opts_effective()); multi-master is applied only with several primaries */
+  uint32_t per_ns_limit;      /* transfers-per-ns */
 } axfr_bg_ctx_t;
+
+static inline bool ctx_request_ixfr(const axfr_bg_ctx_t *c) { return !c->has_eff || c->eff.request_ixfr; }
+static inline bool ctx_request_expire(const axfr_bg_ctx_t *c) { return !c->has_eff || c->eff.request_expire; }
+/* BIND (zoneconf.c) looks at multi-master only when the zone has more than one primary */
+static inline bool ctx_multi_master(const axfr_bg_ctx_t *c) { return c->has_eff && c->eff.multi_master && c->nprim > 1; }
+
+/* ---- batch 4: the policy of the secondary side, kept free of sockets so that it can be tested ---- */
+
+/* The result of one try at a primary (xfr_run_primaries()) */
+enum { XFR_R_FAILED = -1, XFR_R_TRANSFERRED = 1, XFR_R_UPTODATE = 2, XFR_R_BEHIND = 3, XFR_R_DEFERRED = 4 };
+typedef int (*xfr_try_fn)(void *arg, int idx);
+typedef struct {
+  int tried;            /* primaries asked */
+  int transferred_idx;  /* index of the primary the zone came from, -1 = none */
+  int uptodate, behind, failed, deferred;
+} xfr_run_t;
+/* BIND's order: the primaries are asked one after the other from the first; a failure, an up-to-date answer, a primary that is behind and
+ * a primary that cannot be asked now (the per-server quota) all go on to the next; a transfer ends the refresh. */
+void xfr_run_primaries(int n, xfr_try_fn fn, void *arg, xfr_run_t *out);
+/* transfers-per-ns: at most `limit` inbound transfers from one remote address at a time.  false = the quota is full (counts nothing). */
+bool xfr_ns_acquire(const struct sockaddr_storage *a, uint32_t limit);
+void xfr_ns_release(const struct sockaddr_storage *a);
+/* transfers-in / transfers-out: a counter taken up to limit */
+bool xfr_counter_acquire(_Atomic int *c, uint32_t limit);
+void xfr_counter_release(_Atomic int *c);
+extern _Atomic int g_xfr_in_active;    /* inbound transfers in progress (the threads of the secondary side) */
+extern _Atomic int g_xfr_out_active;   /* outbound AXFR / IXFR in progress */
+/* serial-query-rate / notify-rate: at most `rate` operations in a wall-clock second (BIND setrl() spaces them evenly; the control thread
+ * wakes once a second, so the budget is per second).  true = the operation may run now (and has used one); false = the budget of this
+ * second is spent, ask again at the next tick.  The control thread only, one limiter per kind. */
+typedef struct { time_t sec; uint32_t used; } xfr_rl_t;
+bool xfr_rl_take(xfr_rl_t *rl, uint32_t rate, time_t now);
+/* max-transfer-time-in / max-transfer-idle-in: the longest the next read may wait, given the start-up deadline: min(idle, deadline - now), 0 when
+ * the deadline has passed (idle 0 = no idle limit, deadline 0 = no total limit; the result 0 with no limit at all would mean "forever", so
+ * *expired tells the two apart) */
+uint32_t xfr_read_budget(time_t now, time_t deadline, uint32_t idle_secs, bool *expired);
+/* The serial-behind test of a refresh (RFC 1982): the primary is behind when its serial is older than ours */
+bool xfr_serial_behind(uint32_t ours, uint32_t theirs);
 
 typedef struct {
   int client_fd;
@@ -58,6 +108,8 @@ typedef struct {
   size_t tsig_mac_len;
   zone_db_entry_t *entry;
   zone_db_snapshot_t *snap;
+  uint32_t idle_out_secs;   /* max-transfer-idle-out: the longest a send may wait for the client (0 = no limit) */
+  uint32_t time_out_secs;   /* max-transfer-time-out: the longest the whole transfer may take (0 = no limit) */
 } axfr_worker_args_t;
 
 int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
