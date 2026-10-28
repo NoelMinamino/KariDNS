@@ -10,6 +10,8 @@
  *     reuses the retired buffer only after the grace period and poisons it first,
  *     so a reader that is not protected sees the poison. Run under
  *     test_epoch_rcu-tsan as well.
+ *  5. rcu_writer_wait_until_safe_in_reader(): skips the caller's own read section (zone_publish() when it cannot queue the retired
+ *     version), still waits for every other one, and times out with false.
  */
 #include <assert.h>
 #include <pthread.h>
@@ -262,11 +264,38 @@ static void test_wait_granularity(void) {
   printf("  [PASS] the grace period ends with the reader, not with the backoff\n");
 }
 
+/* zone_publish() waits for the grace period of the version it retires while it is itself inside a read section (the thread that
+ * publishes has its own slot entered): rcu_writer_wait_until_safe_in_reader() skips that slot and no other. */
+static void test_wait_in_reader(void) {
+  printf("[TEST] rcu_writer_wait_until_safe_in_reader: the caller's own read section does not block it, another one does...\n");
+  static int obj_a = 1, obj_b = 2;
+  static _Atomic(int *) slot;
+  atomic_init(&slot, &obj_a);
+  register_workers(2);
+  worker_ctx_t *other = &g_test_workers[1], *self = &g_test_workers[0];
+  rcu_reader_enter(other);
+  rcu_reader_enter(self);                         /* the last enter names the caller's own slot (t_rcu_own_observed) */
+  uint64_t retire = rcu_writer_publish(&slot, &obj_b);
+
+  assert(rcu_writer_wait_until_safe(retire, 20) == false);             /* both sections are older than the publish */
+  assert(rcu_writer_wait_until_safe_in_reader(retire, 20) == false);   /* the other one still blocks: timeout */
+  rcu_reader_exit(other);
+  assert(rcu_writer_wait_until_safe_in_reader(retire, 50) == true);    /* only its own section is left */
+  assert(rcu_writer_wait_until_safe(retire, 20) == false);             /* the plain wait does not skip it */
+  rcu_reader_exit(self);
+  assert(rcu_writer_wait_until_safe_in_reader(retire, 50) == true);
+  assert(rcu_writer_wait_until_safe(retire, 50) == true);
+
+  unregister_workers();
+  printf("  [PASS] only the caller's own slot is skipped; the timeout result is false\n");
+}
+
 int main(void) {
   printf("=== Epoch RCU tests (R-25) ===\n");
   test_publish_order();
   test_aux_slots();
   test_wait_granularity();
+  test_wait_in_reader();
   test_concurrent_reuse();
   printf("=== All Epoch RCU tests passed ===\n");
   return 0;

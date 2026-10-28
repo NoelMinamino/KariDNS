@@ -257,7 +257,6 @@ static inline uint32_t zone_image_nsec_rr(const zone_image_t *img, uint32_t i) {
 uint32_t zone_image_nsec_floor(const zone_image_t *img, const char *name);
 
 /* ---- NSEC3 index (RFC 5155 §7.2.8) ---- */
-static inline uint32_t zone_image_n3chain_count(const zone_image_t *img) { return img->n_n3chains; }
 static inline const zone_image_n3chain_t *zone_image_n3chain(const zone_image_t *img, uint32_t c) {
     return &zone_image_n3chains(img)[c];
 }
@@ -275,7 +274,6 @@ uint32_t zone_image_n3chain_lower_bound(const zone_image_t *img, uint32_t c, con
 
 /* ---- glue targets: names that NS / MX / SRV RRs point to and that have A or AAAA RRs in the zone, in order of
  *      first appearance. The addresses are the A / AAAA RRs of the name (type 1 / 28 in its RR range). ---- */
-static inline uint32_t zone_image_glue_count(const zone_image_t *img) { return img->n_glue; }
 static inline uint32_t zone_image_glue_name(const zone_image_t *img, uint32_t i) { return zone_image_u32s(img, img->off_glue)[i]; }
 
 /* ---- file order of the RRs ----

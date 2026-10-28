@@ -164,7 +164,9 @@ static db_record_row_t *rs_find(rs_t *s, const char *type, const char *name, con
 
 static pdns_zone_t *rs_build(const fx_t *f, rs_t *s, const db_meta_row_t *meta, size_t nmeta) {
     pdns_zone_t *z = pdns_zone_new(f->z.zone, NULL);
-    pdns_zone_convert(z, s->r, s->n, meta, nmeta);
+    for (size_t i = 0; i < s->n; i++) (void)pdns_zone_add_record(z, &s->r[i]);
+    for (size_t i = 0; i < nmeta; i++) (void)pdns_zone_add_meta(z, &meta[i]);
+    (void)pdns_zone_finish(z);
     return z;
 }
 

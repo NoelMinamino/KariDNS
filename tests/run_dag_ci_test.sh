@@ -237,6 +237,8 @@ run_check "EDNS Negotiation flag (+ednsnegotiation)" "$DAG @127.0.0.1 -p $PORT w
 run_check "BADCOOKIE retry (+badcookie)" "$DAG @127.0.0.1 -p $PORT www.example.com A +badcookie" "192\.0\.2\.10"
 run_check "Show BADCOOKIE diagnostic (+showbadcookie)" "$DAG @127.0.0.1 -p $PORT www.example.com A +showbadcookie" "192\.0\.2\.10"
 run_check "Show BADVERS diagnostic (+showbadvers)" "$DAG @127.0.0.1 -p $PORT www.example.com A +showbadvers" "192\.0\.2\.10"
+run_check "Show the discarded BADVERS answer (+edns=1 +showbadvers; EDNS version 1 is answered BADVERS)" "$DAG @127.0.0.1 -p $PORT www.example.com A +edns=1 +showbadvers" "status: BADVERS"
+run_check "Retry after BADVERS with EDNS version 0 (+edns=1 +showbadvers)" "$DAG @127.0.0.1 -p $PORT www.example.com A +edns=1 +showbadvers" ";; BADVERS, retrying with EDNS version 0\."
 run_check "Keep TCP socket open (+keepopen)" "$DAG @127.0.0.1 -p $PORT www.example.com A +tcp +keepopen" "192\.0\.2\.10"
 run_check "Generic EDNS option (+ednsopt)" "$DAG @127.0.0.1 -p $PORT www.example.com A +ednsopt=65001:01020304 +qr" "; (OPTION:[[:space:]]+|OPT=)65001"
 if [ "$DAG" = "dig" ]; then

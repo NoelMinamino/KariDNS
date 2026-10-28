@@ -832,7 +832,6 @@ static void scan_zones(void) {
 /* ------------------------------------------------------------------------------------------------------------- */
 
 static _Atomic uint64_t g_dirty;
-static _Atomic bool g_stop;
 static pthread_t g_tid;
 static bool g_started;
 
@@ -842,7 +841,8 @@ static void *alias_thread(void *arg) {
     (void)arg;
     uint64_t seen_dirty = (uint64_t)-1, seen_gen = (uint64_t)-1;
     const void *seen_snap = NULL;
-    while (!atomic_load_explicit(&g_stop, memory_order_acquire)) {
+    /* runs until the Backend ends with _exit(); nothing joins or stops it */
+    for (;;) {
         uint64_t d = atomic_load_explicit(&g_dirty, memory_order_relaxed);
         uint64_t gen = 0;
         const void *sp;
@@ -865,12 +865,10 @@ static void *alias_thread(void *arg) {
         struct timespec ts = { 0, ALIAS_TICK_MS * 1000000L };
         nanosleep(&ts, NULL);
     }
-    return NULL;
 }
 
 bool alias_start(void) {
     if (g_started) return true;
-    atomic_store_explicit(&g_stop, false, memory_order_release);
     if (pthread_create(&g_tid, NULL, alias_thread, NULL) != 0) return false;
     g_started = true;
     return true;
@@ -887,15 +885,6 @@ static void free_jobs(void) {
     memset(g_rset_dead, 0, sizeof(g_rset_dead));
     g_rot = 0;
     g_changed = false;
-}
-
-void alias_stop(void) {
-    if (g_started) {
-        atomic_store_explicit(&g_stop, true, memory_order_release);
-        pthread_join(g_tid, NULL);
-        g_started = false;
-    }
-    alias_test_reset();
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */

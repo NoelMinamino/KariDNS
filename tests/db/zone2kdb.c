@@ -3,7 +3,7 @@
  *
  *   zone2kdb --ref OUT --list LIST [--default-ttl N] zonefile...
  *       Reads the zone files, converts every one the way the reader does it for rows held in memory (zone2sql rows ->
- *       pdns_zone_convert() -> pdns_zone_encode_kdb()) and writes the stream "karidns-dbloader --dump" must write for
+ *       pdns_zone_add_record() ... pdns_zone_finish() -> pdns_zone_encode_kdb()) and writes the stream "karidns-dbloader --dump" must write for
  *       a SQLite database made from the same files by zone2sql: HELLO (driver sqlite3, pid 0), BATCH_BEGIN, one zone
  *       per file in the order given (source id = 1, 2, ... = the domains.id the import gives), BATCH_END.  A file the
  *       zone parser, zone2sql or the reader cannot take, a tinydns file, a non-IN zone or a zone name seen before is

@@ -85,7 +85,6 @@ bool alias_wire_lower(const uint8_t *rdata, size_t rdlen, uint8_t *out, size_t *
 
 /* ---- the thread ---- */
 bool alias_start(void);              /* before the sandbox; false = the thread could not start */
-void alias_stop(void);               /* shutdown: stops the thread and frees the table */
 void alias_notify(void);             /* a zone with ALIAS RRs was published or removed: rescan soon */
 
 /* ---- exposed for the unit tests ---- */

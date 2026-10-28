@@ -4709,6 +4709,13 @@ STATIC_TEST void backend_sig_handler(int sig) {
   _exit(0);
 }
 
+/* P5: バックエンドの SIGHUP。保留させるためだけのハンドラ (sighup_from_manager())。SIG_IGN だと届いた時点で捨てられて
+ * 送信元が取り出せず、SIG_DFL だとブロックしていないスレッドに届いたときにプロセスが終わる。全スレッドがブロックして
+ * いる間は実行されない (保留のまま sigtimedwait() が取り出す) ので、単体テストが直接呼び、実際に配って確かめる。 */
+STATIC_TEST void backend_sighup_noop(int sig) {
+  (void)sig;
+}
+
 /* Backend の通常の終了 (SIGTERM、karictl stop、Supervisor の終了)。dnstap のリングを
  * 送り切って STOP / FINISH を交わしてから _exit() する (O-03、O-15)。複数のスレッドから
  * 同時に呼ばれたら、最初の1つだけが進み、残りはプロセスの終了を待つ。 */
@@ -5074,11 +5081,6 @@ bool ensure_priv_dir_safe(const char *dir_buf) {
 }
 
 #ifndef KARIDNS_UNIT_TEST
-/* P5: バックエンドの SIGHUP。保留させるためだけのハンドラ (sighup_from_manager()) */
-static void backend_sighup_noop(int sig) {
-  (void)sig;
-}
-
 int main(int argc, char **argv) {
   assert(calc_fnv1a_str("*.") == FNV1A_WILDCARD_PREFIX_HASH);
   init_server_cookie_secret();

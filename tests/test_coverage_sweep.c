@@ -15,6 +15,7 @@
 #include "dns_wire.h"
 #include "dns_config_parser.h"
 #include "test_zext.h"
+#include "test_tmpdir.h"
 #include "dns_zone_parser.h"
 #include "dns_zone_image.h"
 #include "test_image_helper.h"
@@ -2687,6 +2688,7 @@ int main(void) {
     WD_PHASE("test_forward_zone_scenarios"); test_forward_zone_scenarios();
     WD_PHASE("test_sweep_query_engine"); test_sweep_query_engine();
     WD_PHASE("test_opcode_tsig_matrix"); test_opcode_tsig_matrix();
+    tmpdir_remove(g_sdir);
     printf("=== All Coverage Sweep Tests PASSED ===\n");
     return 0;
 }

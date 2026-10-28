@@ -1696,15 +1696,6 @@ int pdns_zone_finish(pdns_zone_t *z) {
     return 0;
 }
 
-int pdns_zone_convert(pdns_zone_t *z, const db_record_row_t *rows, size_t n_rows,
-                      const db_meta_row_t *meta, size_t n_meta) {
-    for (size_t i = 0; i < n_rows; i++)
-        if (pdns_zone_add_record(z, &rows[i]) != 0) return -1;
-    for (size_t i = 0; i < n_meta; i++)
-        if (pdns_zone_add_meta(z, &meta[i]) != 0) return -1;
-    return pdns_zone_finish(z);
-}
-
 /* ------------------------------------------------------------------------------------------------------------- */
 /* KDB1 encoding                                                                                                  */
 /* ------------------------------------------------------------------------------------------------------------- */
