@@ -113,7 +113,7 @@ zone "example.com" {
 zone "secondary.com" {
     type secondary;
     file "$TMP_DIR/secondary.com.zone";
-    masters { 192.0.2.254:53; };
+    masters { 192.0.2.254 port 53; };
 };
 
 zone "slow.test" {
