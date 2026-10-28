@@ -1827,7 +1827,7 @@ static void test_snapshot_catalog_sequence(void) {
         "  zone \"missing.example\" { type master; file \"%s/missing.zone\"; };\n"
         "  zone \"sec.example\" { type slave; file \"%s/sec.zone\"; masters { 127.0.0.1; }; };\n"
         "  zone \"notify.example\" { type master; file \"%s/notify.zone\"; notify-source \"192.0.2.250\";\n"
-        "      also-notify { 198.51.100.1; 198.51.100.1; 198.51.100.2 port 5353; 2001:db8::77; not-an-ip; 192.0.2.102; }; };\n"
+        "      also-notify { 198.51.100.1; 198.51.100.1; 198.51.100.2 port 5353; 2001:db8::77; 192.0.2.102; }; };\n"
         "};\n"
         "view \"external\" { match-clients { any; };\n"
         "  zone \"cat1.example\" { type master; file \"%s/cat1.zone\"; catalog-zone yes; };\n"

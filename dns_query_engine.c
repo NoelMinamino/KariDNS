@@ -2911,17 +2911,14 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       const zone_config_t *zcfg = zone_cfg_any;
       const zone_ext_t *zx = zext(zcfg);
       if (zcfg && zx->masters_count > 0) {
-        bool from_master = false;
-        for (int k = 0; k < zx->masters_count; k++) {
-          if (zx->masters_parsed ? cidr_entry_match_str(&zx->masters_parsed[k], client_ip)
-                                   : match_cidr(client_ip, zx->masters[k].ip)) {
-            from_master = true;
-            break;
-          }
+        /* from one of the primaries, signed with that primary's key (else the zone's tsig-key) when it has one */
+        for (int k = 0; k < zx->masters_count && !auth; k++) {
+          if (!(zx->masters_parsed ? cidr_entry_match_str(&zx->masters_parsed[k], client_ip)
+                                   : match_cidr(client_ip, zx->masters[k].ip)))
+            continue;
+          const char *need = zone_primary_key(zx, k);
+          if (!need || (tkey && tsig_key_names_equal(tkey->name, need))) auth = true;
         }
-        bool key_ok = !(zx->tsig_key && zx->tsig_key[0] != '\0') ||
-                      (tkey && tsig_key_names_equal(tkey->name, zx->tsig_key));
-        auth = from_master && key_ok;
       }
     }
 

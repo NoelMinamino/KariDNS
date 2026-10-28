@@ -2765,14 +2765,15 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 }
             }
             bool has_master = catalog_cfg && zext(catalog_cfg)->masters_count > 0 && zext(catalog_cfg)->masters[0].ip != NULL;
-            if (has_master || (catalog_cfg && zext(catalog_cfg)->tsig_key)) {
+            const char *cat_key = catalog_cfg ? zone_primary_key(zext(catalog_cfg), 0) : NULL; /* the primary's own key, else the zone's */
+            if (has_master || cat_key) {
                 entry->catalog_master = calloc(1, sizeof(*entry->catalog_master));
                 if (entry->catalog_master && has_master) {
                     strncpy(entry->catalog_master->ip, zext(catalog_cfg)->masters[0].ip, sizeof(entry->catalog_master->ip) - 1);
                     entry->catalog_master->port = zext(catalog_cfg)->masters[0].port;
                 }
-                if (entry->catalog_master && zext(catalog_cfg)->tsig_key)
-                    strncpy(entry->catalog_master->tsig_key, zext(catalog_cfg)->tsig_key, sizeof(entry->catalog_master->tsig_key) - 1);
+                if (entry->catalog_master && cat_key)
+                    strncpy(entry->catalog_master->tsig_key, cat_key, sizeof(entry->catalog_master->tsig_key) - 1);
             }
             atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
             new_entries[actual_added_count++] = entry;

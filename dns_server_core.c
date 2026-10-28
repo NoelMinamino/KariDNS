@@ -1252,7 +1252,8 @@ void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, z
     out->soa_serial = (uint32_t)atomic_load_explicit(&e->serial, memory_order_relaxed);
 
     const zone_config_t *zc = zone_entry_config(cfg, e);
-    out->slaves_configured = zc ? zext(zc)->also_notify_count : 0;
+    const notify_target_t *an = NULL;
+    out->slaves_configured = also_notify_effective(cfg, zc, e->view_name, &an); /* the zone's, the view's or options' list */
 
     out->last_notify_time = atomic_load_explicit(&e->observatory.last_notify_time, memory_order_relaxed);
     out->last_transfer_time = atomic_load_explicit(&e->observatory.last_transfer_time, memory_order_relaxed);
@@ -3755,9 +3756,10 @@ void *control_thread_func(void *arg) {
                             is_slave = true;
                             strncpy(master_ip, zext(zcfg)->masters[0].ip, sizeof(master_ip) - 1);
                             master_port = zext(zcfg)->masters[0].port;
-                            if (zext(zcfg)->tsig_key) {
-                                strncpy(tsig_key_name, zext(zcfg)->tsig_key, sizeof(tsig_key_name) - 1);
-                            }
+                            /* the first primary is the one asked: its own key, else the zone's tsig-key (signs SOA/IXFR/AXFR and
+                             * verifies the answers) */
+                            const char *pk = zone_primary_key(zext(zcfg), 0);
+                            if (pk) strncpy(tsig_key_name, pk, sizeof(tsig_key_name) - 1);
                         }
                     }
 

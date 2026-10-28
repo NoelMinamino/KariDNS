@@ -34,6 +34,34 @@ typedef struct {
   int port;
 } ip_port_t;
 
+/* One element of an also-notify { } list (BIND 9.20 ARM, "also-notify"): an address with its port and an optional TSIG key, or --
+ * while the configuration is being read -- the name of a remote-servers / primaries / masters list.  After the parse has finished
+ * every element is an address (list == NULL, port set, where == NULL): the names are expanded into the addresses of the list. */
+typedef struct {
+  char *ip;    /* address literal; NULL while the element is a list name */
+  int port;    /* 1..65535; 0 only while the element is a list name */
+  char *key;   /* TSIG key name that signs the NOTIFY to this address (RFC 8945), or NULL */
+  char *list;  /* name of the list, until the parse has expanded it */
+  char *where; /* "file:line" of the element, until the parse has checked it (only elements with a list name or a key) */
+} notify_target_t;
+
+/* Top-level remote-servers <name> [port <n>] { ... }; (also written primaries / masters).  Items may name other lists. */
+typedef struct remote_list {
+  char *name;
+  notify_target_t *items;
+  int count;
+  char *where;
+  struct remote_list *next;
+} remote_list_t;
+
+/* notify <yes|no|explicit|primary-only|master-only>; (BIND 9.20 ARM "notify").  0 = not written: inherit (zone, else view, else
+ * options; default yes).  master-only is the older spelling of primary-only. */
+typedef enum { NOTIFY_MODE_INHERIT = 0, NOTIFY_MODE_YES = 1, NOTIFY_MODE_NO = 2, NOTIFY_MODE_EXPLICIT = 3, NOTIFY_MODE_PRIMARY_ONLY = 4 } notify_mode_t;
+
+/* The most elements of one also-notify statement after the lists are expanded, and how deep lists may include lists */
+#define KARIDNS_ALSO_NOTIFY_MAX 256
+#define KARIDNS_REMOTE_LIST_DEPTH 8
+
 /* B9a: the most alias-resolver addresses of a zone, of options, or of the database block */
 #define KARIDNS_ALIAS_RESOLVERS_MAX 8
 
@@ -92,14 +120,16 @@ typedef struct {
  * ext == NULL は「全部既定 (ゼロ)」。読み手は必ず zext(z) 経由で読むこと。
  * 書き手 (パーサ、テスト) は zone_ext_mut(z) で確保してから書く。 */
 typedef struct zone_ext {
-  ip_port_t *masters;
+  notify_target_t *masters; /* primaries / masters: addresses with port and optional TSIG key (list names are expanded when the parse ends) */
   int masters_count;
   cidr_entry_t *masters_parsed;
   char *tsig_key;
   char **tsig_keys;
   int tsig_keys_count;
-  ip_port_t *also_notify;
+  notify_target_t *also_notify;
   int also_notify_count;
+  uint8_t notify_mode;   /* notify_mode_t of the zone's own `notify` statement, 0 = inherit */
+  bool also_notify_set;  /* the zone has an also-notify statement (even an empty one): it replaces the view's and options' list */
   char *notify_source;
   char **allow_transfer;
   int allow_transfer_count;
@@ -301,6 +331,10 @@ typedef struct view_config {
   acl_entry_t *match_clients_parsed;
   zone_config_t *zones;
   zone_cfg_index_t zone_index; /* zones の索引。手で組んだ設定 (テスト) では空で、線形探索になる */
+  notify_target_t *also_notify; /* view { also-notify { } }: replaces the options list for the zones of this view that have none of their own */
+  int also_notify_count;
+  bool also_notify_set;
+  uint8_t notify_mode;          /* view { notify }: notify_mode_t, 0 = inherit options' */
   /* beta design 7.1: DB zone source of this view. NULL/false = the global source of options { database { } } */
   char *database_file;         /* "database-file": sqlite3, this view's own file */
   char *database_schema;       /* "database-schema": postgresql, this view's own schema */
@@ -379,6 +413,10 @@ typedef struct server_config_s {
   zone_cfg_index_t top_zone_index; /* パース中のトップレベル zone の索引。既定の view に移す */
   tsig_key_t *keys;
   acl_def_t *acls;
+  remote_list_t *remote_lists;  /* top-level remote-servers / primaries / masters lists (also-notify names are expanded after the parse; the lists are kept until the configuration is freed) */
+  notify_target_t *also_notify; /* options { also-notify { } }: the default of every zone, view and catalog member */
+  int also_notify_count;
+  uint8_t notify_mode;          /* options { notify }: notify_mode_t, 0 = yes */
   logging_config_t logging;
   control_channel_config_t control;
   dnstap_config_t dnstap;
@@ -514,6 +552,19 @@ zone_config_t *view_find_zone_config(const view_config_t *v, const char *domain)
 zone_config_t *config_find_zone_any_view(const server_config_t *cfg, const char *domain);
 /* zone (NULL 可) の NOTIFY 再送の設定を、options の値で補って返す */
 notify_retry_config_t notify_retry_effective(const server_config_t *cfg, const zone_config_t *zone);
+/* The also-notify list that applies to a zone: the zone's own statement, else that of its view (view_name; NULL or "" = none),
+ * else options' (BIND 9.20 ARM: a zone / view statement overrides the global one).  zone may be NULL (catalog member, zone without
+ * zone {}).  *out points into cfg / zone; returns the number of elements (all addresses, see notify_target_t). */
+int also_notify_effective(const server_config_t *cfg, const zone_config_t *zone, const char *view_name,
+                          const notify_target_t **out);
+/* The notify mode that applies to a zone (never NOTIFY_MODE_INHERIT): the zone's `notify`, else its view's, else options', else yes. */
+notify_mode_t notify_mode_effective(const server_config_t *cfg, const zone_config_t *zone, const char *view_name);
+/* The TSIG key that signs the requests to primary i of a zone (and verifies its answers; also the key a NOTIFY from it must carry):
+ * the primary's own `key`, else the zone's tsig-key, else NULL.  Precedence as for also-notify. */
+static inline const char *zone_primary_key(const zone_ext_t *x, int i) {
+  if (i >= 0 && i < x->masters_count && x->masters[i].key && x->masters[i].key[0]) return x->masters[i].key;
+  return x->tsig_key && x->tsig_key[0] ? x->tsig_key : NULL;
+}
 /* The IXFR history depth of a zone: its own ixfr-history, else the options value, else IXFR_HISTORY_DEFAULT (zone/cfg may be NULL). */
 int ixfr_history_effective(const server_config_t *cfg, const zone_config_t *zone);
 /* I2: the inbound transfer limits of a secondary zone: the zone's max-zone-records / max-zone-bytes, else the options

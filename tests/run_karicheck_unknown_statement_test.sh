@@ -42,11 +42,11 @@ check "a typo in a zone" "zone \"a.test\" { type primary; file \"$T/a.zone\"; al
 check "an unknown option with a value" "zone \"a.test\" { type primary; file \"$T/a.zone\"; frobnicate 3; };" error "unknown option 'frobnicate'"
 check "an unknown option with a block" "zone \"a.test\" { type primary; file \"$T/a.zone\"; frobnicate { a; b; }; };" error "unknown option 'frobnicate'"
 check "notify-retr... that is not an option" "zone \"a.test\" { type primary; file \"$T/a.zone\"; notify-retry-foo 3; };" error "unknown option 'notify-retry-foo'"
-for o in zone-statistics inline-signing key-directory dnssec-policy auto-dnssec max-journal-size allow-query notify check-names masterfile-format; do
+for o in zone-statistics inline-signing key-directory dnssec-policy auto-dnssec max-journal-size allow-query check-names masterfile-format; do
     check "BIND option $o" "zone \"a.test\" { type primary; file \"$T/a.zone\"; $o yes; };" warn "option '$o' is a BIND option that KariDNS does not implement"
 done
 check "BIND option with a block" "zone \"a.test\" { type primary; file \"$T/a.zone\"; update-policy { grant a.test zonesub any; }; };" warn "option 'update-policy' is a BIND option"
-check "BIND option and a known one together" "zone \"a.test\" { type primary; file \"$T/a.zone\"; also-notify { 192.0.2.9; }; notify explicit; };" warn "option 'notify' is a BIND option"
+check "BIND option and a known one together" "zone \"a.test\" { type primary; file \"$T/a.zone\"; also-notify { 192.0.2.9; }; notify-delay 5; };" warn "option 'notify-delay' is a BIND option"
 
 echo "== view { }"
 check "a plain view" "view \"v\" { match-clients { any; }; zone \"a.test\" { type primary; file \"$T/a.zone\"; }; };" ok
