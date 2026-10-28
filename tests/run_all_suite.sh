@@ -428,6 +428,7 @@ register_test "core" "sh" "tests/run_forward_failover_test.sh" "Forward zones sh
 register_test "core" "sh" "tests/run_dnstap_lifecycle_test.sh" "dnstap query_zone, reconnect through the broker, STOP/FINISH at shutdown (O-03)"
 register_test "core" "sh" "tests/run_rrl_bind_keys_test.sh" "RRL keyed like BIND: name, zone for NXDOMAIN, wildcard, client prefix length (D-05)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "core" "sh" "tests/run_capsicum_enosys_test.sh" "cap_enter ENOSYS logged, failing backend start-up ends cleanly (O-02, O-15)"
+register_test "core" "sh" "tests/run_manager_signal_race_test.sh" "Manager ends by itself when the Backend dies while routers start; children that ignore SIGTERM are SIGKILLed after the bounded wait, a second SIGTERM at once"
 register_test "core" "sh" "tests/run_tinydns_reload_test.sh" "karictl reload of a tinydns zone inside the sandbox, SOA serial from the file mtime (X-13)"
 register_test "core" "sh" "tests/run_cname_child_zone_test.sh" "CNAME/DNAME into a child zone on the same server answered from the child (X-27)"
 register_test "core" "sh" "tests/run_xfr_badvers_test.sh" "AXFR/IXFR with an unsupported EDNS version get BADVERS, signed when the TSIG is valid (X-28)"

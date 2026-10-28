@@ -145,9 +145,7 @@ static bool send_fd(int ctrl, int fd) {
 /* The child between fork() and exec (design 1.2 step 4).  Never returns. */
 static void child_exec(const db_sup_t *s, int stream_fd) {
   char msg[300];
-  sigset_t empty;
-  sigemptyset(&empty);
-  sigprocmask(SIG_SETMASK, &empty, NULL);
+  /* The parent blocked the signals across the fork: the dispositions are reset first, the mask is emptied last */
   /* An ignored disposition survives exec: a "pkill -HUP karidns" cannot kill a loader that has not installed its
    * handlers yet.  The loader handles SIGTERM / SIGINT itself. */
   signal(SIGHUP, SIG_IGN);
@@ -157,6 +155,9 @@ static void child_exec(const db_sup_t *s, int stream_fd) {
   signal(SIGTERM, SIG_DFL);
   signal(SIGINT, SIG_DFL);
   signal(SIGCHLD, SIG_DFL);
+  sigset_t empty;
+  sigemptyset(&empty);
+  sigprocmask(SIG_SETMASK, &empty, NULL);
 
   const char *tz = getenv("TZ");
   char tzbuf[128] = "";
@@ -241,17 +242,29 @@ bool db_sup_spawn(db_sup_t *s) {
     backend_fd = sv[1];
   }
   gc_snapshot_wait_idle();   /* fork from a single thread (see dns_snapshot_rcu.c) */
+  /* The child inherits the manager's flag-only handlers until child_exec() resets them: block the signals across the
+   * fork so one that arrives meanwhile stays pending and is delivered with the default action after the reset */
+  sigset_t fork_block, fork_orig;
+  sigemptyset(&fork_block);
+  sigaddset(&fork_block, SIGTERM);
+  sigaddset(&fork_block, SIGINT);
+  sigaddset(&fork_block, SIGHUP);
+  sigaddset(&fork_block, SIGCHLD);
+  sigprocmask(SIG_BLOCK, &fork_block, &fork_orig);
   pid_t pid = fork();
+  if (pid == 0) {
+    if (backend_fd >= 0) close(backend_fd);
+    child_exec(s, loader_fd); /* resets the dispositions, then unblocks */
+  }
+  int fork_errno = errno;
+  sigprocmask(SIG_SETMASK, &fork_orig, NULL);
+  errno = fork_errno;
   if (pid < 0) {
     syslog(LOG_ERR, "[Manager] fork for the database loader failed: %m");
     close(loader_fd);
     if (backend_fd >= 0) close(backend_fd);
     schedule_restart(s, now);
     return false;
-  }
-  if (pid == 0) {
-    if (backend_fd >= 0) close(backend_fd);
-    child_exec(s, loader_fd);
   }
   close(loader_fd);
   if (backend_fd >= 0) {

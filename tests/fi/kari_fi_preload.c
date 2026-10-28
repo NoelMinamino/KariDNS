@@ -29,6 +29,7 @@ typedef struct {
     int err_code;
     int is_noop;
     int child_only;   /* ":child": count only in forked children, not the first process */
+    int delay_ms;     /* "delay=MS": sleep that long on the Nth call, then let the call through */
     int call_count;
 } fi_spec_item_t;
 
@@ -121,6 +122,10 @@ static void init_preload_hooks(void) {
             if (strstr(rest, "child")) {
                 it->child_only = 1;
             }
+            char *delay_sub = strstr(rest, "delay=");
+            if (delay_sub) {
+                it->delay_ms = atoi(delay_sub + 6);
+            }
             char *nth_sub = strstr(rest, "nth=");
             if (nth_sub) {
                 it->nth = atoi(nth_sub + 4);
@@ -157,6 +162,11 @@ static bool check_and_trigger_fi(const char *name, int *out_errno, int *out_noop
             /* hooks run on many threads: count atomically */
             int c = __atomic_add_fetch(&g_specs[i].call_count, 1, __ATOMIC_SEQ_CST);
             if (c == g_specs[i].nth) {
+                if (g_specs[i].delay_ms > 0) {
+                    log_fired(name, c);
+                    usleep((useconds_t)g_specs[i].delay_ms * 1000);
+                    continue;
+                }
                 if (out_errno) *out_errno = g_specs[i].err_code;
                 if (out_noop) *out_noop = g_specs[i].is_noop;
                 log_fired(name, c);
@@ -499,5 +509,28 @@ int cap_enter(void) {
     if (check_and_trigger_fi("cap_enter", &err, &noop)) { if (noop) return 0; errno = err; return -1; }
     FI_REAL(int, cap_enter, (void));
     return real_fn ? real_fn() : -1;
+}
+#endif
+
+/* "_exit@1:delay=MS:child" holds a child back at its exit (the Backend leaves through _exit() after SIGTERM), so a
+ * test can have a child that does not end when the manager asks it to.  A signal cannot be ignored for this: the
+ * Backend takes SIGTERM through EVFILT_SIGNAL, which sees ignored signals too. */
+void _exit(int status) {
+    int err = 0, noop = 0;
+    check_and_trigger_fi("_exit", &err, &noop);
+    FI_REAL(void, _exit, (int));
+    if (real_fn) real_fn(status);
+    for (;;) pause();
+}
+
+#ifdef __FreeBSD__
+#include <sys/param.h>
+#include <sys/cpuset.h>
+/* the first call of a Frontend router (run_frontend_router()); "delay=" holds the router in its start-up */
+int cpuset_setaffinity(cpulevel_t level, cpuwhich_t which, id_t id, size_t setsize, const cpuset_t *mask) {
+    int err = 0, noop = 0;
+    if (check_and_trigger_fi("cpuset_setaffinity", &err, &noop)) { errno = err; return -1; }
+    FI_REAL(int, cpuset_setaffinity, (cpulevel_t, cpuwhich_t, id_t, size_t, const cpuset_t *));
+    return real_fn ? real_fn(level, which, id, setsize, mask) : -1;
 }
 #endif
