@@ -44,7 +44,6 @@ options {
     user "nobody";
     group "nobody";
     tcp-idle-timeout 1;
-    tcp-max-clients 32;
     minimal-responses yes;
 };
 zone "example.com" {
