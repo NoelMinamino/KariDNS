@@ -47,7 +47,7 @@ for o in zone-statistics inline-signing key-directory dnssec-policy auto-dnssec 
 done
 check "allow-query in a zone is implemented (no warning)" "zone \"a.test\" { type primary; file \"$T/a.zone\"; allow-query { 192.0.2.0/24; }; allow-query-on { any; }; allow-notify { none; }; };" ok
 check "BIND option with a block""zone \"a.test\" { type primary; file \"$T/a.zone\"; update-policy { grant a.test zonesub any; }; };" warn "option 'update-policy' is a BIND option"
-check "BIND option and a known one together" "zone \"a.test\" { type primary; file \"$T/a.zone\"; also-notify { 192.0.2.9; }; notify-delay 5; };" warn "option 'notify-delay' is a BIND option"
+check "BIND option and a known one together" "zone \"a.test\" { type primary; file \"$T/a.zone\"; also-notify { 192.0.2.9; }; zone-statistics yes; };" warn "option 'zone-statistics' is a BIND option"
 
 echo "== view { }"
 check "a plain view" "view \"v\" { match-clients { any; }; zone \"a.test\" { type primary; file \"$T/a.zone\"; }; };" ok

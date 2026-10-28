@@ -400,6 +400,8 @@ static void acl_set_copy(acl_set_t *d, const acl_set_t *s) {
   d->match = aml_ref(s->match);
 }
 
+static void xo_free_fields(xfr_opts_t *xo);
+
 /* everything x points to (not x itself: a zone_ext_shared_t embeds it) */
 static void free_zone_ext_fields(zone_ext_t *x) {
   if (!x)
@@ -416,6 +418,11 @@ static void free_zone_ext_fields(zone_ext_t *x) {
   free(x->tsig_keys);
   notify_targets_free(x->also_notify, x->also_notify_count);
   free(x->notify_source);
+  if (x->xo) {
+    xo_free_fields(x->xo);
+    free(x->xo);
+    x->xo = NULL;
+  }
   for (int i = 0; i < x->alias_resolvers_count; i++)
     free(x->alias_resolvers[i].ip);
   free(x->alias_resolvers);
@@ -622,6 +629,7 @@ static void free_partial_view(view_config_t *view) {
   free_view_db_fields(view);
   if (view->name) free(view->name);
   acl_set_free(&view->acl);
+  xo_free_fields(&view->xo);
   notify_targets_free(view->also_notify, view->also_notify_count);
   for (int i = 0; i < view->match_clients_count; i++) free(view->match_clients[i]);
   if (view->match_clients) free(view->match_clients);
@@ -952,6 +960,10 @@ void free_server_config_fields(server_config_t *cfg) {
   notify_targets_free(cfg->also_notify, cfg->also_notify_count);
   cfg->also_notify = NULL;
   cfg->also_notify_count = 0;
+  xo_free_fields(&cfg->xo);
+  free(cfg->xfr_sources);
+  cfg->xfr_sources = NULL;
+  cfg->xfr_source_count = 0;
   remote_lists_free(cfg->remote_lists);
   cfg->remote_lists = NULL;
   OPENSSL_cleanse(cfg->cookie_secrets, sizeof(cfg->cookie_secrets));
@@ -976,6 +988,7 @@ void free_server_config_fields(server_config_t *cfg) {
     free_view_db_fields(v);
     if (v->name) free(v->name);
     acl_set_free(&v->acl);
+    xo_free_fields(&v->xo);
     notify_targets_free(v->also_notify, v->also_notify_count);
     for (int i = 0; i < v->match_clients_count; i++) free(v->match_clients[i]);
     if (v->match_clients) free(v->match_clients);
@@ -2086,6 +2099,7 @@ static void notify_targets_free(notify_target_t *l, int n) {
     free(l[i].key);
     free(l[i].list);
     free(l[i].where);
+    free(l[i].src_loc);
   }
   free(l);
 }
@@ -2101,17 +2115,73 @@ static void remote_lists_free(remote_list_t *r) {
   }
 }
 
+/* `( <address> | * )` after the keyword kw (BIND 9.20 ARM: notify-source, transfer-source and their -v6 forms, the `source` / `source-v6` of a
+ * primaries / also-notify list).  The 9.20 grammar has no port ("port configuration is deprecated" in the ARM; the grammar flags of
+ * lib/isccfg/namedconf.c do not accept one): a following `port` is reported by the caller as the missing ';'.  family is the family of
+ * the statement; allow_other accepts an address of the other family too (the KariDNS zone statement `notify-source` has always taken
+ * either).  *state = 1 with addr, or 2 for `*`; *fam is the family found (AF_UNSPEC for `*`); *text (optional) gets a copy of the token.
+ * -1 with a message that names the place. */
+static int read_source_value(token_ctx_t *ctx, const char *what, const char *kw, int family, uint8_t *state, uint8_t addr[16],
+                             bool allow_other, int *fam, char **text) {
+  char db[96];
+  uint8_t tmp[16] = {0};
+  int other = family == AF_INET ? AF_INET6 : AF_INET;
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) {
+    conf_error(ctx, what, "expected an %s address or '*' after '%s' but found %s", family == AF_INET ? "IPv4" : "IPv6", kw,
+               tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
+  int rc = 0;
+  if (strcmp(tok.value, "*") == 0) {
+    *state = 2;
+    memset(addr, 0, 16);
+    *fam = AF_UNSPEC;
+  } else if (inet_pton(family, tok.value, tmp) == 1) {
+    *state = 1;
+    memset(addr, 0, 16);
+    memcpy(addr, tmp, family == AF_INET ? 4 : 16);
+    *fam = family;
+  } else if (allow_other && inet_pton(other, tok.value, tmp) == 1) {
+    *state = 1;
+    memset(addr, 0, 16);
+    memcpy(addr, tmp, other == AF_INET ? 4 : 16);
+    *fam = other;
+  } else {
+    bool wrong_family = inet_pton(other, tok.value, tmp) == 1;
+    conf_error(ctx, what, "'%.64s' after '%s' is not an %s address or '*'%s", tok.value, kw, family == AF_INET ? "IPv4" : "IPv6",
+               wrong_family ? (family == AF_INET ? " (an IPv6 address: use the -v6 form)" : " (an IPv4 address: use the form without -v6)") : "");
+    rc = -1;
+  }
+  if (rc == 0 && text) {
+    *text = strdup(tok.value);
+    if (!*text) {
+      ctx->error_occurred = true;
+      rc = -1;
+    }
+  }
+  free_token(&tok);
+  return rc;
+}
+
 /* The element grammar of also-notify and of the top-level remote-servers / primaries / masters lists, from the BIND 9.20 ARM
  * ("also-notify", "remote-servers"):
- *   [ port <integer> ] { ( <list-name> | <ipv4> [ port <integer> ] | <ipv6> [ port <integer> ] ) [ key <string> ]; ... };
+ *   [ port <integer> ] [ source ( <ipv4> | * ) ] [ source-v6 ( <ipv6> | * ) ] { ( <list-name> | <ipv4> [ port <integer> ] | <ipv6> [ port <integer> ] ) [ key <string> ]; ... };
  * `port` before the braces is the port of the elements that have none (default 53).  A name is not looked up here: the lists may be
- * written after the statement, so the names are expanded when the whole configuration has been read (expand_targets()).  `tls` and
- * `source` / `source-v6` are in the ARM grammar and are not supported: a clear error instead of a NOTIFY that goes somewhere else.
+ * written after the statement, so the names are expanded when the whole configuration has been read (expand_targets()).  `tls` is in the
+ * ARM grammar and is not supported: a clear error instead of a NOTIFY that goes somewhere else.  `source` / `source-v6` (no port in
+ * 9.20) is the local address of the requests to the addresses written in this statement; `*` is the same as not written.
  * Appends to *list (the caller owns what was added also on failure); -1 with a message that names the place on a syntax error. */
 static int parse_notify_targets(token_ctx_t *ctx, const char *what, notify_target_t **list, int *count, bool allow_cidr) {
   char db[96];
   int first = *count;
   int defport = 0;
+  /* source / source-v6 of the statement (BIND 9.20 ARM): the address the requests to the addresses of this list leave from */
+  uint8_t lsrc_state[2] = {0, 0};
+  uint8_t lsrc[2][16];
+  char lsrc_loc[300] = "";
+  memset(lsrc, 0, sizeof(lsrc));
   conf_token_t tok = get_next_token(ctx);
   while (tok.type == TOKEN_STRING && tok.value) {
     if (strcmp(tok.value, "port") == 0) {
@@ -2122,9 +2192,21 @@ static int parse_notify_targets(token_ctx_t *ctx, const char *what, notify_targe
       }
       if (read_port(ctx, what, &defport) != 0) return -1;
     } else if (strcmp(tok.value, "source") == 0 || strcmp(tok.value, "source-v6") == 0) {
-      conf_error(ctx, what, "'%s' is not supported (the source address of NOTIFY is set with notify-source in zone { })", tok.value);
+      int v6 = tok.value[6] != '\0';
+      char kw[12];
+      snprintf(kw, sizeof(kw), "%s", tok.value);
       free_token(&tok);
-      return -1;
+      if (ctx->restricted) {
+        conf_error(ctx, what, "'%s' is not allowed here", kw);
+        return -1;
+      }
+      if (lsrc_state[v6]) {
+        conf_error(ctx, what, "'%s' is given twice before '{'", kw);
+        return -1;
+      }
+      int fam = AF_UNSPEC;
+      if (read_source_value(ctx, what, kw, v6 ? AF_INET6 : AF_INET, &lsrc_state[v6], lsrc[v6], false, &fam, NULL) != 0) return -1;
+      ctx_location(ctx, lsrc_loc, sizeof(lsrc_loc));
     } else {
       break;
     }
@@ -2226,8 +2308,19 @@ static int parse_notify_targets(token_ctx_t *ctx, const char *what, notify_targe
     return -1;
   }
   free_token(&tok);
-  for (int i = first; i < *count; i++)
-    if ((*list)[i].ip && (*list)[i].port == 0) (*list)[i].port = defport ? defport : 53;
+  for (int i = first; i < *count; i++) {
+    notify_target_t *e = &(*list)[i];
+    if (e->ip && e->port == 0) e->port = defport ? defport : 53;
+    /* a list name keeps the sources of the list it names (expand_targets()); only the addresses written here get this statement's */
+    if (e->ip) {
+      for (int v = 0; v < 2; v++) {
+        if (lsrc_state[v] != 1) continue; /* `*` is the same as not written */
+        e->src_set[v] = 1;
+        memcpy(e->src[v], lsrc[v], 16);
+        if (!e->src_loc) e->src_loc = strdup(lsrc_loc);
+      }
+    }
+  }
   return 0;
 }
 
@@ -2731,6 +2824,327 @@ void xfr_zone_limits(const server_config_t *cfg, const zone_config_t *zone, uint
 
 static int db_take_uint(token_ctx_t *ctx, const char *key, bool allow_suffix, uint64_t lo, uint64_t hi, uint64_t *out);
 
+/* ---- Batch 4: the transfer / NOTIFY options of options { }, view { } and zone { } (BIND 9.20 ARM "Zone Transfers", "Boolean Options"
+ * and the zone statement; defaults from bin/named/config.c, ranges from lib/isccfg/check.c) ---- */
+
+static const struct { const char *name; uint32_t bit; int src; } k_xo_options[] = {
+  {"notify-source", 0, XSRC_NOTIFY4}, {"notify-source-v6", 0, XSRC_NOTIFY6}, {"transfer-source", 0, XSRC_XFER4},
+  {"transfer-source-v6", 0, XSRC_XFER6},
+  {"min-refresh-time", XO_MIN_REFRESH, -1}, {"max-refresh-time", XO_MAX_REFRESH, -1}, {"min-retry-time", XO_MIN_RETRY, -1},
+  {"max-retry-time", XO_MAX_RETRY, -1}, {"max-transfer-time-in", XO_XFER_TIME_IN, -1}, {"max-transfer-idle-in", XO_XFER_IDLE_IN, -1},
+  {"max-transfer-time-out", XO_XFER_TIME_OUT, -1}, {"max-transfer-idle-out", XO_XFER_IDLE_OUT, -1},
+  {"notify-delay", XO_NOTIFY_DELAY, -1}, {"notify-to-soa", XO_B_NOTIFY_TO_SOA, -1}, {"try-tcp-refresh", XO_B_TRY_TCP_REFRESH, -1},
+  {"request-ixfr", XO_B_REQUEST_IXFR, -1}, {"provide-ixfr", XO_B_PROVIDE_IXFR, -1}, {"request-expire", XO_B_REQUEST_EXPIRE, -1},
+  {"multi-master", XO_B_MULTI_MASTER, -1},
+};
+
+static bool xo_option_name(const char *key) {
+  for (size_t i = 0; i < sizeof(k_xo_options) / sizeof(k_xo_options[0]); i++)
+    if (strcmp(k_xo_options[i].name, key) == 0) return true;
+  return false;
+}
+
+static void xo_free_fields(xfr_opts_t *xo) {
+  if (!xo) return;
+  for (int i = 0; i < XSRC_N; i++) free(xo->src[i].loc);
+  memset(xo, 0, sizeof(*xo));
+}
+
+/* a deep copy of s into d (d is overwritten); false = out of memory */
+static bool xo_copy(xfr_opts_t *d, const xfr_opts_t *s) {
+  *d = *s;
+  for (int i = 0; i < XSRC_N; i++) d->src[i].loc = NULL;
+  for (int i = 0; i < XSRC_N; i++) {
+    if (s->src[i].loc && !(d->src[i].loc = strdup(s->src[i].loc))) {
+      xo_free_fields(d);
+      return false;
+    }
+  }
+  return true;
+}
+
+static xfr_opts_t *zone_xo_mut(zone_ext_t *x) {
+  if (!x->xo) x->xo = calloc(1, sizeof(*x->xo));
+  return x->xo;
+}
+
+/* One transfer / NOTIFY statement of a block: `key` has been read and is one of k_xo_options.  The value and the ';' are read here.
+ * zone_level: the KariDNS zone statement `notify-source <address>` takes an address of either family (as before batch 4), and *legacy
+ * receives a copy of the value for zext()->notify_source.  A later statement of the same name replaces the earlier one.  0 = done,
+ * -1 = error (reported). */
+static int parse_xfr_option(token_ctx_t *ctx, const char *what, const char *key, xfr_opts_t *xo, bool zone_level, char **legacy) {
+  char loc[300], db[96];
+  ctx_location(ctx, loc, sizeof(loc));
+  size_t oi = 0;
+  while (oi < sizeof(k_xo_options) / sizeof(k_xo_options[0]) && strcmp(k_xo_options[oi].name, key) != 0) oi++;
+  if (oi == sizeof(k_xo_options) / sizeof(k_xo_options[0])) return -1;
+  int si = k_xo_options[oi].src;
+  uint32_t bit = k_xo_options[oi].bit;
+  if (si >= 0) {
+    bool v6 = si == XSRC_NOTIFY6 || si == XSRC_XFER6;
+    bool is_legacy = zone_level && si == XSRC_NOTIFY4;
+    uint8_t st = 0, a[16];
+    int fam = AF_UNSPEC;
+    char *text = NULL;
+    if (read_source_value(ctx, what, key, v6 ? AF_INET6 : AF_INET, &st, a, is_legacy, &fam, is_legacy ? &text : NULL) != 0) return -1;
+    conf_token_t tok = get_next_token(ctx);
+    if (tok.type != TOKEN_SEMICOLON) {
+      if (tok.type == TOKEN_STRING && tok.value && strcmp(tok.value, "port") == 0)
+        conf_error(ctx, what, "'%s' takes no port (BIND 9.20 binds the source address with an ephemeral port)", key);
+      else
+        conf_error(ctx, what, "expected ';' after the address of '%s' but found %s", key, tok_desc(&tok, db, sizeof(db)));
+      free_token(&tok);
+      free(text);
+      return -1;
+    }
+    free_token(&tok);
+    int slot = si;
+    if (is_legacy) {
+      /* the KariDNS statement is one source for either family; a later one replaces the earlier (and what it set), and notify-source-v6
+       * of the same zone wins for IPv6 whichever is written first */
+      free(xo->src[XSRC_NOTIFY4].loc);
+      memset(&xo->src[XSRC_NOTIFY4], 0, sizeof(xo->src[XSRC_NOTIFY4]));
+      if (xo->set & XO_LEGACY_NOTIFY6) {
+        free(xo->src[XSRC_NOTIFY6].loc);
+        memset(&xo->src[XSRC_NOTIFY6], 0, sizeof(xo->src[XSRC_NOTIFY6]));
+        xo->set &= ~XO_LEGACY_NOTIFY6;
+      }
+      if (fam == AF_INET6) {
+        if (xo->src[XSRC_NOTIFY6].state) {
+          free(text);
+          if (legacy) *legacy = NULL;
+          return 0; /* notify-source-v6 is written: the address of the old statement is not the IPv6 source */
+        }
+        slot = XSRC_NOTIFY6;
+        xo->set |= XO_LEGACY_NOTIFY6;
+      }
+      if (legacy) *legacy = text;
+      else free(text);
+    } else if (si == XSRC_NOTIFY6) {
+      xo->set &= ~XO_LEGACY_NOTIFY6;
+    }
+    free(xo->src[slot].loc);
+    xo->src[slot].state = st;
+    memcpy(xo->src[slot].addr, a, 16);
+    xo->src[slot].loc = st == 1 ? strdup(loc) : NULL;
+    return 0;
+  }
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) {
+    conf_error(ctx, what, "expected a value after '%s' but found %s", key, tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
+  if (bit >= XO_B_NOTIFY_TO_SOA && bit <= XO_B_MULTI_MASTER) {
+    bool b = false;
+    if (!parse_config_bool(tok.value, &b)) {
+      conf_error(ctx, what, "invalid %s value '%.64s' (expected yes or no)", key, tok.value);
+      free_token(&tok);
+      return -1;
+    }
+    if (b) xo->bools |= bit;
+    else xo->bools &= ~bit;
+    if (bit == XO_B_TRY_TCP_REFRESH && !b && !ctx->restricted)
+      conf_warn_loc(loc, what, "KariDNS checks a secondary zone over TCP only (its IXFR / SOA check); 'try-tcp-refresh no' (UDP first) has no effect");
+  } else {
+    uint32_t lo = 0, hi = UINT32_MAX;
+    const char *range = "0..4294967295";
+    if (bit == XO_MIN_REFRESH || bit == XO_MAX_REFRESH || bit == XO_MIN_RETRY || bit == XO_MAX_RETRY) {
+      lo = 1;
+      range = "1..4294967295 seconds (BIND: must not be zero)";
+    } else if (bit >= XO_XFER_TIME_IN && bit <= XO_XFER_IDLE_OUT) {
+      hi = XFR_MINUTES_MAX;
+      range = "0..40320 minutes (28 days)";
+    }
+    uint64_t v = 0;
+    bool ok = isdigit((unsigned char)tok.value[0]) != 0;
+    if (ok) {
+      char *end = NULL;
+      errno = 0;
+      v = strtoull(tok.value, &end, 10);
+      ok = errno == 0 && *end == '\0' && v >= lo && v <= hi;
+    }
+    if (!ok) {
+      conf_error(ctx, what, "invalid %s value '%.64s' (expected %s)", key, tok.value, range);
+      free_token(&tok);
+      return -1;
+    }
+    switch (bit) {
+      case XO_MIN_REFRESH: xo->min_refresh = (uint32_t)v; break;
+      case XO_MAX_REFRESH: xo->max_refresh = (uint32_t)v; break;
+      case XO_MIN_RETRY: xo->min_retry = (uint32_t)v; break;
+      case XO_MAX_RETRY: xo->max_retry = (uint32_t)v; break;
+      case XO_XFER_TIME_IN: xo->xfer_time_in = (uint32_t)v; break;
+      case XO_XFER_IDLE_IN: xo->xfer_idle_in = (uint32_t)v; break;
+      case XO_XFER_TIME_OUT: xo->xfer_time_out = (uint32_t)v; break;
+      case XO_XFER_IDLE_OUT: xo->xfer_idle_out = (uint32_t)v; break;
+      default: xo->notify_delay = (uint32_t)v; break;
+    }
+  }
+  free_token(&tok);
+  xo->set |= bit;
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) {
+    conf_error(ctx, what, "expected ';' after the value of '%s' but found %s", key, tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  return 0;
+}
+
+/* options { transfers-in; transfers-out; transfers-per-ns; serial-query-rate; notify-rate; startup-notify-rate; }: one unsigned
+ * number (BIND: uint32).  1 = taken, 0 = not one of these, -1 = error.  The rates are raised to 1 when 0 (xfr_rate_clamp()). */
+static int parse_options_xfr_limit(token_ctx_t *ctx, server_config_t *config, const char *key) {
+  struct { const char *name; uint32_t *v; bool *set; } t[] = {
+    {"transfers-in", &config->transfers_in, &config->transfers_in_set},
+    {"transfers-out", &config->transfers_out, &config->transfers_out_set},
+    {"transfers-per-ns", &config->transfers_per_ns, &config->transfers_per_ns_set},
+    {"serial-query-rate", &config->serial_query_rate, &config->serial_query_rate_set},
+    {"notify-rate", &config->notify_rate, &config->notify_rate_set},
+    {"startup-notify-rate", &config->startup_notify_rate, &config->startup_notify_rate_set},
+  };
+  for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+    if (strcmp(t[i].name, key) != 0) continue;
+    char what[64], db[96];
+    snprintf(what, sizeof(what), "options %s", key);
+    conf_token_t tok = get_next_token(ctx);
+    uint64_t u = 0;
+    bool ok = tok.type == TOKEN_STRING && tok.value && isdigit((unsigned char)tok.value[0]);
+    if (ok) {
+      char *end = NULL;
+      errno = 0;
+      u = strtoull(tok.value, &end, 10);
+      ok = errno == 0 && *end == '\0' && u <= UINT32_MAX;
+    }
+    if (!ok) {
+      conf_error(ctx, what, "invalid value '%.64s' (expected 0..4294967295)", tok.type == TOKEN_STRING && tok.value ? tok.value : tok_desc(&tok, db, sizeof(db)));
+      free_token(&tok);
+      return -1;
+    }
+    free_token(&tok);
+    tok = get_next_token(ctx);
+    if (tok.type != TOKEN_SEMICOLON) {
+      conf_error(ctx, what, "expected ';' after the value but found %s", tok_desc(&tok, db, sizeof(db)));
+      free_token(&tok);
+      return -1;
+    }
+    free_token(&tok);
+    *t[i].v = (uint32_t)u;
+    *t[i].set = true;
+    return 1;
+  }
+  return 0;
+}
+
+uint32_t xfr_cfg_limit(const server_config_t *cfg, int which) {
+  switch (which) {
+    case XL_TRANSFERS_IN: return cfg && cfg->transfers_in_set ? cfg->transfers_in : XFR_TRANSFERS_IN_DEFAULT;
+    case XL_TRANSFERS_OUT: return cfg && cfg->transfers_out_set ? cfg->transfers_out : XFR_TRANSFERS_OUT_DEFAULT;
+    case XL_TRANSFERS_PER_NS: return cfg && cfg->transfers_per_ns_set ? cfg->transfers_per_ns : XFR_TRANSFERS_PER_NS_DEFAULT;
+    case XL_SERIAL_QUERY_RATE: return xfr_rate_clamp(cfg && cfg->serial_query_rate_set ? cfg->serial_query_rate : XFR_RATE_DEFAULT);
+    case XL_NOTIFY_RATE: return xfr_rate_clamp(cfg && cfg->notify_rate_set ? cfg->notify_rate : XFR_RATE_DEFAULT);
+    default: return xfr_rate_clamp(cfg && cfg->startup_notify_rate_set ? cfg->startup_notify_rate : XFR_RATE_DEFAULT);
+  }
+}
+
+uint32_t xfr_rate_clamp(uint32_t v) { return v == 0 ? 1 : v; }
+
+uint32_t xfr_minutes_to_secs(uint32_t minutes) {
+  uint32_t unit = 60;
+  const char *e = getenv("KARIDNS_XFER_MINUTE_SECS");
+  if (e && *e) {
+    char *end = NULL;
+    long v = strtol(e, &end, 10);
+    if (*end == '\0' && v >= 1 && v <= 60) unit = (uint32_t)v;
+  }
+  return minutes * unit; /* minutes <= 40320: no overflow */
+}
+
+uint32_t xfr_range(uint32_t a, uint32_t lo, uint32_t hi) { return a < lo ? lo : (a < hi ? a : hi); }
+
+void xfr_clamp_timers(const xfr_eff_t *e, uint32_t soa_refresh, uint32_t soa_retry, uint32_t soa_expire, uint32_t *refresh,
+                      uint32_t *retry, uint32_t *expire) {
+  uint32_t r = xfr_range(soa_refresh, e->min_refresh, e->max_refresh);
+  uint32_t t = xfr_range(soa_retry, e->min_retry, e->max_retry);
+  uint64_t floor_expire = (uint64_t)r + t;
+  uint32_t x = xfr_range(soa_expire, floor_expire > UINT32_MAX ? UINT32_MAX : (uint32_t)floor_expire, XFR_MAX_EXPIRE);
+  if (refresh) *refresh = r;
+  if (retry) *retry = t;
+  if (expire) *expire = x;
+}
+
+static const xfr_opts_t *xo_of_view(const server_config_t *cfg, const char *view_name) {
+  if (!cfg || !view_name || !view_name[0]) return NULL;
+  for (const view_config_t *v = cfg->views; v; v = v->next)
+    if (strcasecmp(v->name, view_name) == 0) return &v->xo;
+  return NULL;
+}
+
+void xfr_opts_effective(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, xfr_eff_t *out) {
+  memset(out, 0, sizeof(*out));
+  out->min_refresh = XFR_MIN_REFRESH_DEFAULT;
+  out->max_refresh = XFR_MAX_REFRESH_DEFAULT;
+  out->min_retry = XFR_MIN_RETRY_DEFAULT;
+  out->max_retry = XFR_MAX_RETRY_DEFAULT;
+  out->xfer_time_in = xfr_minutes_to_secs(XFR_TIME_IN_DEFAULT);
+  out->xfer_idle_in = xfr_minutes_to_secs(XFR_IDLE_IN_DEFAULT);
+  out->xfer_time_out = xfr_minutes_to_secs(XFR_TIME_OUT_DEFAULT);
+  out->xfer_idle_out = xfr_minutes_to_secs(XFR_IDLE_OUT_DEFAULT);
+  out->notify_delay = XFR_NOTIFY_DELAY_DEFAULT;
+  out->try_tcp_refresh = out->request_ixfr = out->provide_ixfr = out->request_expire = true;
+  /* the first level that wrote an option decides it: zone, then view, then options */
+  const xfr_opts_t *lv[3] = { zone ? zext(zone)->xo : NULL, xo_of_view(cfg, view_name), cfg ? &cfg->xo : NULL };
+  uint32_t done = 0;   /* the options a higher level has decided already */
+  for (int i = 0; i < 3; i++) {
+    const xfr_opts_t *l = lv[i];
+    if (!l) continue;
+    uint32_t w = l->set & ~done;
+    if (w & XO_MIN_REFRESH) out->min_refresh = l->min_refresh;
+    if (w & XO_MAX_REFRESH) out->max_refresh = l->max_refresh;
+    if (w & XO_MIN_RETRY) out->min_retry = l->min_retry;
+    if (w & XO_MAX_RETRY) out->max_retry = l->max_retry;
+    if (w & XO_XFER_TIME_IN) out->xfer_time_in = xfr_minutes_to_secs(l->xfer_time_in);
+    if (w & XO_XFER_IDLE_IN) out->xfer_idle_in = xfr_minutes_to_secs(l->xfer_idle_in);
+    if (w & XO_XFER_TIME_OUT) out->xfer_time_out = xfr_minutes_to_secs(l->xfer_time_out);
+    if (w & XO_XFER_IDLE_OUT) out->xfer_idle_out = xfr_minutes_to_secs(l->xfer_idle_out);
+    if (w & XO_NOTIFY_DELAY) out->notify_delay = l->notify_delay;
+    if (w & XO_B_NOTIFY_TO_SOA) out->notify_to_soa = (l->bools & XO_B_NOTIFY_TO_SOA) != 0;
+    if (w & XO_B_TRY_TCP_REFRESH) out->try_tcp_refresh = (l->bools & XO_B_TRY_TCP_REFRESH) != 0;
+    if (w & XO_B_REQUEST_IXFR) out->request_ixfr = (l->bools & XO_B_REQUEST_IXFR) != 0;
+    if (w & XO_B_PROVIDE_IXFR) out->provide_ixfr = (l->bools & XO_B_PROVIDE_IXFR) != 0;
+    if (w & XO_B_REQUEST_EXPIRE) out->request_expire = (l->bools & XO_B_REQUEST_EXPIRE) != 0;
+    if (w & XO_B_MULTI_MASTER) out->multi_master = (l->bools & XO_B_MULTI_MASTER) != 0;
+    done |= l->set;
+  }
+  /* sources: per statement (notify-source, notify-source-v6, transfer-source, transfer-source-v6), the first level that wrote it */
+  for (int s = 0; s < XSRC_N; s++) {
+    for (int i = 0; i < 3; i++) {
+      const xfr_opts_t *l = lv[i];
+      if (!l || !l->src[s].state) continue;
+      if (l->src[s].state == 1) {
+        out->src[s].set = true;
+        memcpy(out->src[s].addr, l->src[s].addr, 16);
+      }
+      break; /* `*` (state 2) also ends the search: the system chooses */
+    }
+  }
+}
+
+bool xfr_source_for(const xfr_eff_t *e, const notify_target_t *t, int family, bool xfer, uint8_t out[16]) {
+  int idx = family == AF_INET6 ? 1 : 0;
+  if (t && t->src_set[idx]) {
+    memcpy(out, t->src[idx], 16);
+    return true;
+  }
+  int slot = xfer ? (idx ? XSRC_XFER6 : XSRC_XFER4) : (idx ? XSRC_NOTIFY6 : XSRC_NOTIFY4);
+  if (e && e->src[slot].set) {
+    memcpy(out, e->src[slot].addr, 16);
+    return true;
+  }
+  return false;
+}
+
 /* B6a (open item 2, decided 2026-10-21): an unknown statement inside zone { } or view { } used to be skipped without a
  * word, so a typo ("alow-transfer") silently left a zone open or closed.  Now:
  *   - an option BIND 9 documents for a zone / view statement but KariDNS does not implement is skipped with a warning;
@@ -2745,7 +3159,7 @@ static const char *const k_bind_zone_options[] = {
   "dnssec-policy", "dnssec-secure-to-insecure", "dnssec-update-mode", "forward", "in-view", "inline-signing",
   "ixfr-from-differences", "journal", "key-directory", "masterfile-format", "masterfile-style", "max-ixfr-ratio",
   "max-journal-size", "max-records", "max-refresh-time", "max-retry-time", "max-transfer-idle-in", "max-transfer-idle-out",
-  "max-transfer-time-in", "max-transfer-time-out", "max-zone-ttl", "min-refresh-time", "min-retry-time", "multi-master",
+  "max-transfer-time-in", "max-transfer-time-out", "max-zone-ttl", "min-refresh-time", "min-retry-time", "min-transfer-rate-in", "multi-master",
   "notify-delay", "notify-source-v6", "notify-to-soa", "nta-lifetime", "nta-recheck", "parental-agents",
   "parental-source", "parental-source-v6", "request-expire", "request-ixfr", "request-nsid",
   "require-server-cookie", "send-report-channel", "serial-update-method", "server-addresses", "server-names",
@@ -2767,7 +3181,7 @@ static const char *const k_bind_view_options[] = {
   "managed-keys", "match-destinations", "match-recursive-only", "max-cache-size", "max-cache-ttl", "max-clients-per-query",
   "max-ixfr-ratio", "max-journal-size", "max-ncache-ttl", "max-records", "max-recursion-depth", "max-recursion-queries",
   "max-refresh-time", "max-retry-time", "max-stale-ttl", "max-udp-size", "max-zone-ttl", "message-compression",
-  "min-cache-ttl", "min-ncache-ttl", "min-refresh-time", "min-retry-time", "minimal-any", "minimal-responses",
+  "min-cache-ttl", "min-ncache-ttl", "min-refresh-time", "min-retry-time", "min-transfer-rate-in", "minimal-any", "minimal-responses",
   "notify-delay", "notify-source", "notify-source-v6", "notify-to-soa", "nocookie-udp-size", "nosit-udp-size",
   "nta-lifetime", "nta-recheck", "nxdomain-redirect", "parental-source", "parental-source-v6", "preferred-glue",
   "prefetch", "provide-ixfr", "qname-minimization", "query-source", "query-source-v6", "rate-limit", "recursion",
@@ -2848,7 +3262,7 @@ static const char *const k_bind_options_options[] = {
   "max-stale-ttl", "max-transfer-idle-in", "max-transfer-idle-out", "max-transfer-time-in", "max-transfer-time-out",
   "max-types-per-name", "max-udp-size", "max-validation-failures-per-fetch", "max-validations-per-fetch",
   "max-zone-ttl", "memstatistics", "memstatistics-file", "message-compression", "min-cache-ttl", "min-ncache-ttl",
-  "min-refresh-time", "min-retry-time", "multi-master", "named-xfer", "new-zones-directory", "no-case-compress",
+  "min-refresh-time", "min-retry-time", "min-transfer-rate-in", "multi-master", "named-xfer", "new-zones-directory", "no-case-compress",
   "nocookie-udp-size", "nosit-udp-size", "notify-delay", "notify-rate", "notify-source", "notify-source-v6",
   "notify-to-soa", "nsec3-test-zone", "nta-lifetime", "nta-recheck", "nxdomain-redirect", "parental-source",
   "parental-source-v6", "preferred-glue", "prefetch", "provide-ixfr", "qname-minimization", "query-source",
@@ -3161,10 +3575,28 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       if (parse_aml_slot(ctx, awhat, slot) != 0) {
         free(key); free_zone_config(zone); return -1;
       }
+    } else if (xo_option_name(key)) {
+      /* batch 4: notify-source(-v6), transfer-source(-v6), min/max-refresh/retry-time, max-transfer-*, notify-delay, notify-to-soa,
+       * try-tcp-refresh, request-ixfr, provide-ixfr, request-expire, multi-master (BIND 9.20) */
+      char xwhat[DNS_NAME_TEXT_SIZE + 48];
+      snprintf(xwhat, sizeof(xwhat), "zone '%.255s' %s", zone->domain ? zone->domain : "", key);
+      xfr_opts_t *xo = zone_xo_mut(x);
+      bool is_ns = strcmp(key, "notify-source") == 0;
+      char *legacy = NULL;
+      if (!xo || parse_xfr_option(ctx, xwhat, key, xo, true, is_ns ? &legacy : NULL) != 0) {
+        if (!xo && ctx) ctx->error_occurred = true;
+        free(legacy);
+        free(key);
+        free_zone_config(zone);
+        return -1;
+      }
+      if (is_ns) {
+        free(x->notify_source);
+        x->notify_source = legacy;
+      }
     } else if (strcmp(key, "type") == 0 || strcmp(key, "file") == 0 ||
                strcmp(key, "file-format") == 0 ||
                strcmp(key, "tsig-key") == 0 ||
-               strcmp(key, "notify-source") == 0 ||
                strcmp(key, "catalog-zone") == 0) {
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_STRING) {
@@ -3251,10 +3683,6 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       else if (strcmp(key, "tsig-key") == 0) {
         free(x->tsig_key);
         x->tsig_key = val;
-      }
-      else if (strcmp(key, "notify-source") == 0) {
-        free(x->notify_source);
-        x->notify_source = val;
       }
       else if (strcmp(key, "catalog-zone") == 0) {
         if (!parse_config_bool(val, &zone->is_catalog)) {
@@ -4223,7 +4651,10 @@ static int expand_targets(token_ctx_t *ctx, const server_config_t *cfg, const ch
     t->ip = strdup(s->ip);
     t->port = s->port;
     if (key) t->key = strdup(key);
-    if (!t->ip || (key && !t->key)) {
+    memcpy(t->src_set, s->src_set, sizeof(t->src_set));
+    memcpy(t->src, s->src, sizeof(t->src));
+    if (s->src_loc) t->src_loc = strdup(s->src_loc);
+    if (!t->ip || (key && !t->key) || (s->src_loc && !t->src_loc)) {
       if (ctx) ctx->error_occurred = true;
       return -1;
     }
@@ -4320,6 +4751,105 @@ int also_notify_effective(const server_config_t *cfg, const zone_config_t *zone,
   }
   *out = NULL;
   return 0;
+}
+
+/* ---- the source addresses of the configuration (batch 4) ---- */
+
+static const char *const k_xsrc_names[XSRC_N] = {"notify-source", "notify-source-v6", "transfer-source", "transfer-source-v6"};
+
+static int xs_add(token_ctx_t *ctx, server_config_t *cfg, int family, const uint8_t addr[16], bool notify, bool xfer, const char *loc,
+                  const char *what) {
+  size_t alen = family == AF_INET ? 4 : 16;
+  for (int i = 0; i < cfg->xfr_source_count; i++) {
+    xfr_source_t *s = &cfg->xfr_sources[i];
+    if (s->family == family && memcmp(s->addr, addr, alen) == 0) {
+      s->notify |= notify;
+      s->xfer |= xfer;
+      return 0;
+    }
+  }
+  if (cfg->xfr_source_count >= KARIDNS_XFR_SOURCES_MAX) {
+    syslog(LOG_ERR, "[Config] %s: %s: more than %d distinct source addresses", loc && loc[0] ? loc : "configuration", what,
+           KARIDNS_XFR_SOURCES_MAX);
+    fprintf(stderr, "[ERROR] %s: %s: more than %d distinct source addresses\n", loc && loc[0] ? loc : "configuration", what,
+            KARIDNS_XFR_SOURCES_MAX);
+    if (ctx) ctx->error_occurred = true;
+    return -1;
+  }
+  xfr_source_t *n = realloc(cfg->xfr_sources, sizeof(*n) * (size_t)(cfg->xfr_source_count + 1));
+  if (!n) {
+    if (ctx) ctx->error_occurred = true;
+    return -1;
+  }
+  cfg->xfr_sources = n;
+  xfr_source_t *s = &n[cfg->xfr_source_count++];
+  memset(s, 0, sizeof(*s));
+  s->family = (uint8_t)family;
+  memcpy(s->addr, addr, alen);
+  s->notify = notify;
+  s->xfer = xfer;
+  inet_ntop(family, addr, s->text, sizeof(s->text));
+  snprintf(s->loc, sizeof(s->loc), "%s", loc ? loc : "");
+  snprintf(s->what, sizeof(s->what), "%s", what);
+  return 0;
+}
+
+static int xs_from_xo(token_ctx_t *ctx, server_config_t *cfg, const xfr_opts_t *xo) {
+  if (!xo) return 0;
+  for (int s = 0; s < XSRC_N; s++) {
+    if (xo->src[s].state != 1) continue;
+    bool v6 = s == XSRC_NOTIFY6 || s == XSRC_XFER6;
+    if (xs_add(ctx, cfg, v6 ? AF_INET6 : AF_INET, xo->src[s].addr, s < XSRC_XFER4, s >= XSRC_XFER4, xo->src[s].loc, k_xsrc_names[s]) != 0)
+      return -1;
+  }
+  return 0;
+}
+
+static int xs_from_targets(token_ctx_t *ctx, server_config_t *cfg, const notify_target_t *t, int n, bool notify) {
+  for (int i = 0; i < n; i++)
+    for (int v = 0; v < 2; v++) {
+      if (!t[i].src_set[v]) continue;
+      if (xs_add(ctx, cfg, v ? AF_INET6 : AF_INET, t[i].src[v], notify, !notify, t[i].src_loc,
+                 notify ? (v ? "also-notify source-v6" : "also-notify source") : (v ? "primaries source-v6" : "primaries source")) != 0)
+        return -1;
+    }
+  return 0;
+}
+
+int config_collect_xfr_sources(token_ctx_t *ctx, server_config_t *cfg) {
+  free(cfg->xfr_sources);
+  cfg->xfr_sources = NULL;
+  cfg->xfr_source_count = 0;
+  if (xs_from_xo(ctx, cfg, &cfg->xo) != 0 || xs_from_targets(ctx, cfg, cfg->also_notify, cfg->also_notify_count, true) != 0) return -1;
+  for (const view_config_t *v = cfg->views; v; v = v->next) {
+    if (xs_from_xo(ctx, cfg, &v->xo) != 0 || xs_from_targets(ctx, cfg, v->also_notify, v->also_notify_count, true) != 0) return -1;
+    for (const zone_config_t *z = v->zones; z; z = z->next) {
+      const zone_ext_t *x = z->ext;
+      if (!x) continue;
+      if (xs_from_xo(ctx, cfg, x->xo) != 0 || xs_from_targets(ctx, cfg, x->also_notify, x->also_notify_count, true) != 0 ||
+          xs_from_targets(ctx, cfg, x->masters, x->masters_count, false) != 0)
+        return -1;
+    }
+  }
+  return 0;
+}
+
+static xfr_source_t g_startup_xfr_sources[KARIDNS_XFR_SOURCES_MAX];
+static int g_startup_xfr_source_count;
+
+void config_set_startup_xfr_sources(const server_config_t *cfg) {
+  g_startup_xfr_source_count = 0;
+  if (!cfg) return;
+  for (int i = 0; i < cfg->xfr_source_count && i < KARIDNS_XFR_SOURCES_MAX; i++) g_startup_xfr_sources[g_startup_xfr_source_count++] = cfg->xfr_sources[i];
+}
+
+bool config_xfr_source_allowed(int family, const uint8_t addr[16], bool xfer) {
+  size_t alen = family == AF_INET ? 4 : 16;
+  for (int i = 0; i < g_startup_xfr_source_count; i++) {
+    const xfr_source_t *s = &g_startup_xfr_sources[i];
+    if (s->family == family && memcmp(s->addr, addr, alen) == 0) return xfer ? s->xfer : s->notify;
+  }
+  return false;
 }
 
 /* *path becomes "dir/path" when it is a relative path (an absolute one, "" and NULL stay).  false = out of memory. */
@@ -5005,6 +5535,21 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key);
             return -1;
           }
+        } else if (xo_option_name(key)) {
+          /* batch 4: the default of every view and zone (BIND 9.20) */
+          char owhat[64];
+          snprintf(owhat, sizeof(owhat), "options %s", key);
+          if (parse_xfr_option(ctx, owhat, key, &config->xo, false, NULL) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "transfers-in") == 0 || strcmp(key, "transfers-out") == 0 || strcmp(key, "transfers-per-ns") == 0 ||
+                   strcmp(key, "serial-query-rate") == 0 || strcmp(key, "notify-rate") == 0 ||
+                   strcmp(key, "startup-notify-rate") == 0) {
+          if (parse_options_xfr_limit(ctx, config, key) < 0) {
+            free(key);
+            return -1;
+          }
         } else if (strcmp(key, "notify") == 0) {
           if (parse_notify_mode(ctx, "options notify", &config->notify_mode) != 0) {
             free(key);
@@ -5166,6 +5711,16 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
           if (!view->zones) view->zones = z; else last_view_zone->next = z;
           last_view_zone = z;
+        } else if (xo_option_name(tok.value)) {
+          /* batch 4: the transfer / NOTIFY options of the view replace options' for the zones of this view that have none of their own */
+          char *xkey = tok.value;
+          tok.value = NULL;
+          free_token(&tok);
+          char xwhat[KARIDNS_VIEW_NAME_MAX + 64];
+          snprintf(xwhat, sizeof(xwhat), "view '%s' %s", view->name, xkey);
+          int xrc = parse_xfr_option(ctx, xwhat, xkey, &view->xo, false, NULL);
+          free(xkey);
+          if (xrc != 0) { free_partial_view(view); return -1; }
         } else if (strcmp(tok.value, "database-file") == 0 || strcmp(tok.value, "database-schema") == 0 ||
                    strcmp(tok.value, "database") == 0) {
           char *vkey = tok.value;
@@ -6016,6 +6571,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
 
   /* also-notify: expand the remote-servers list names and check the TSIG keys */
   if (resolve_all_notify_targets(ctx, config) != 0) return -1;
+  /* the source addresses the configuration names (start-up check, the Router's NOTIFY sockets, the connect broker) */
+  if (config_collect_xfr_sources(ctx, config) != 0) return -1;
 
   /* [T7] TSIGキー参照の未定義検出 (checkconf相当の健全性チェック) */
   for (view_config_t *v = config->views; v; v = v->next) {
@@ -6394,7 +6951,12 @@ static bool zx_notify_targets(notify_target_t **dst, int *dn, const notify_targe
     a[i].key = zx_strdup(src[i].key);
     a[i].list = zx_strdup(src[i].list);
     a[i].where = zx_strdup(src[i].where);
-    if ((src[i].ip && !a[i].ip) || (src[i].key && !a[i].key) || (src[i].list && !a[i].list) || (src[i].where && !a[i].where)) return false;
+    memcpy(a[i].src_set, src[i].src_set, sizeof(a[i].src_set));
+    memcpy(a[i].src, src[i].src, sizeof(a[i].src));
+    a[i].src_loc = zx_strdup(src[i].src_loc);
+    if ((src[i].ip && !a[i].ip) || (src[i].key && !a[i].key) || (src[i].list && !a[i].list) || (src[i].where && !a[i].where) ||
+        (src[i].src_loc && !a[i].src_loc))
+      return false;
   }
   return true;
 }
@@ -6435,6 +6997,7 @@ static zone_ext_t *zone_ext_clone(const zone_ext_t *s) {
   d->tsig_keys = NULL; d->tsig_keys_count = 0;
   d->also_notify = NULL; d->also_notify_count = 0; /* also_notify_set is copied with *d = *s */
   d->notify_source = NULL;
+  d->xo = NULL;
   d->allow_transfer = NULL; d->allow_transfer_count = 0; d->allow_transfer_parsed = NULL;
   d->allow_update = NULL; d->allow_update_count = 0; d->allow_update_parsed = NULL;
   acl_set_copy(&d->acl, &s->acl);   /* the lists are immutable: shared by reference */
@@ -6460,6 +7023,14 @@ static zone_ext_t *zone_ext_clone(const zone_ext_t *s) {
             zx_strs(&d->ecs_trusted_resolvers, &d->ecs_trusted_resolvers_count, s->ecs_trusted_resolvers, s->ecs_trusted_resolvers_count);
   if (ok && s->tsig_key && !(d->tsig_key = strdup(s->tsig_key))) ok = false;
   if (ok && s->notify_source && !(d->notify_source = strdup(s->notify_source))) ok = false;
+  if (ok && s->xo) {
+    d->xo = calloc(1, sizeof(*d->xo));
+    if (!d->xo || !xo_copy(d->xo, s->xo)) {
+      free(d->xo);
+      d->xo = NULL;
+      ok = false;
+    }
+  }
   if (ok && s->program_path && !(d->program_path = strdup(s->program_path))) ok = false;
   if (ok && s->program_user && !(d->program_user = strdup(s->program_user))) ok = false;
   if (ok && s->file_format && !(d->file_format = strdup(s->file_format))) ok = false;

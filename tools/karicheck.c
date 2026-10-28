@@ -773,6 +773,54 @@ KARIDNS_TOOL_FN bool kc_aml_negation(const aml_t *l, int depth) {
     return false;
 }
 
+/* Batch 4: the transfer / NOTIFY options of BIND 9.20 and the places where KariDNS differs.  The lines go to stderr like the warnings. */
+static void kc_xfr_notes(const server_config_t *cfg) {
+    if (cfg->startup_notify_rate_set)
+        fprintf(stderr, "[NOTE] options: startup-notify-rate %u is accepted but has no effect: KariDNS sends no NOTIFY when it starts (only after a "
+                        "zone has changed or a secondary has transferred it)\n", (unsigned)cfg->startup_notify_rate);
+    if (cfg->transfers_in_set && cfg->transfers_in == 0)
+        fprintf(stderr, "[WARNING] options: transfers-in 0: no zone is transferred in\n");
+    if (cfg->transfers_out_set && cfg->transfers_out == 0)
+        fprintf(stderr, "[WARNING] options: transfers-out 0: every zone transfer request is refused\n");
+    if (cfg->transfers_per_ns_set && cfg->transfers_per_ns == 0)
+        fprintf(stderr, "[WARNING] options: transfers-per-ns 0: no zone is transferred in\n");
+    if (cfg->xfr_source_count > 0) {
+        printf("[INFO] Source addresses (bound at start-up; a new one needs a restart):");
+        for (int i = 0; i < cfg->xfr_source_count; i++) {
+            const xfr_source_t *s = &cfg->xfr_sources[i];
+            printf(" %s (%s%s%s)", s->text, s->notify ? "NOTIFY" : "", s->notify && s->xfer ? "+" : "", s->xfer ? "transfer" : "");
+        }
+        printf("\n");
+    }
+    const view_config_t *zv;
+    const zone_config_t *z;
+    CONFIG_FOR_EACH_ZONE(cfg, zv, z) {
+        const zone_ext_t *zx = zext(z);
+        bool sec = z->type && (strcasecmp(z->type, "slave") == 0 || strcasecmp(z->type, "secondary") == 0);
+        bool pri = z->type && strcasecmp(z->type, "master") == 0;
+        xfr_eff_t e;
+        xfr_opts_effective(cfg, z, zv->name, &e);
+        if (zx->xo && pri) {
+            const uint32_t sec_only = XO_MIN_REFRESH | XO_MAX_REFRESH | XO_MIN_RETRY | XO_MAX_RETRY | XO_XFER_TIME_IN | XO_XFER_IDLE_IN |
+                                      XO_B_MULTI_MASTER | XO_B_TRY_TCP_REFRESH | XO_B_REQUEST_IXFR | XO_B_REQUEST_EXPIRE;
+            if ((zx->xo->set & sec_only) || zx->xo->src[XSRC_XFER4].state || zx->xo->src[XSRC_XFER6].state)
+                fprintf(stderr, "[NOTE] Zone '%s': the refresh and inbound-transfer options (min/max-refresh-time, min/max-retry-time, max-transfer-*-in, "
+                                "multi-master, request-ixfr, request-expire, try-tcp-refresh, transfer-source) have no effect in a primary zone\n",
+                        z->domain);
+        }
+        if (sec) {
+            if (e.multi_master && zx->masters_count < 2)
+                fprintf(stderr, "[NOTE] Zone '%s': multi-master has no effect with fewer than two primaries (BIND looks at it only then)\n", z->domain);
+            if (e.min_refresh > e.max_refresh)
+                fprintf(stderr, "[WARNING] Zone '%s': min-refresh-time %u is larger than max-refresh-time %u: the refresh interval is always %u\n",
+                        z->domain, (unsigned)e.min_refresh, (unsigned)e.max_refresh, (unsigned)e.max_refresh);
+            if (e.min_retry > e.max_retry)
+                fprintf(stderr, "[WARNING] Zone '%s': min-retry-time %u is larger than max-retry-time %u: the retry interval is always %u\n",
+                        z->domain, (unsigned)e.min_retry, (unsigned)e.max_retry, (unsigned)e.max_retry);
+        }
+    }
+}
+
 KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) {
     printf("[INFO] Loading config %s...\n", config_path);
     bool failed = false;
@@ -798,6 +846,8 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
                 printf(" %s:%u", cfg->listen[li].text, (unsigned)cfg->listen[li].port);
         printf("\n");
     }
+
+    kc_xfr_notes(cfg);
 
     if (cfg->directory) {
         /* karidns opens options { directory } at start-up and refuses to start without it */
