@@ -179,6 +179,11 @@ extern int g_last_socket_family;
  * Returns false to ignore the answer and keep waiting. NULL in programs that do not set it. */
 typedef bool (*dag_answer_check_fn)(const uint8_t *query, size_t query_len, const uint8_t *resp, size_t resp_len);
 extern dag_answer_check_fn g_dag_answer_check;
+/* Called (after the warning line) with the bytes of a message that dag received and then discarded (short message,
+ * ID / question / opcode mismatch, client COOKIE mismatch). proto is "UDP" or "TCP"; server / port name the server.
+ * dag.c prints the hexdump when the response hexdump is enabled. NULL in programs that do not set it. */
+typedef void (*dag_discard_dump_fn)(const uint8_t *msg, size_t len, const char *proto, const char *server, int port);
+extern dag_discard_dump_fn g_dag_discard_dump;
 /* do_udp_exchange() return value for a timeout (dig: ";; communications error to ...: timed out") */
 #define DAG_EXCHANGE_TIMEOUT (-2)
 
