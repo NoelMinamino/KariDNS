@@ -4,6 +4,7 @@
 # ==============================================================================
 # Reads JSON summary from `llvm-cov export -format=text -summary-only`
 # and evaluates Line, Region, and Branch coverage against Tier A/B/C targets.
+# Function coverage must be 100% in every measured file.
 #
 # Usage:
 #   llvm-cov export ... -format=text -summary-only | perl tests/coverage_gate.pl [options]
@@ -84,6 +85,7 @@ my %thresholds = (
 
 # Read JSON data
 my $json_text = "";
+my $export_cmd = "";       # the llvm-cov export command when the summary is generated here (reused to name never-executed functions)
 if ($json_file && -f $json_file) {
     open my $fh, '<', $json_file or die "Cannot open $json_file: $!";
     $json_text = do { local $/; <$fh> };
@@ -107,6 +109,7 @@ if ($json_text eq "") {
     }
     my $obj_str = join(" ", @objs);
     my $cmd = "$llvm_cov export $target $obj_str -instr-profile=$profdata -summary-only -ignore-filename-regex=\"tests/|scratch/|old_patches/|third_party/\"";
+    $export_cmd = $cmd;
     $json_text = `$cmd`;
     if ($? != 0 || !$json_text) {
         die "Error running llvm-cov export command: $cmd\n";
@@ -131,6 +134,7 @@ my %tier_stats = (
 
 my @file_records = ();
 my $pg_driver_skipped = 0;
+my @missed_functions = ();
 
 for my $f (@$files) {
     my $filename = $f->{filename} || "";
@@ -153,13 +157,16 @@ for my $f (@$files) {
     my $lines = $summary->{lines} || {};
     my $regions = $summary->{regions} || {};
     my $branches = $summary->{branches} || {};
-    
+    my $functions = $summary->{functions} || {};
+
     my $l_cov = $lines->{covered} || 0;
     my $l_cnt = $lines->{count} || 0;
     my $r_cov = $regions->{covered} || 0;
     my $r_cnt = $regions->{count} || 0;
     my $b_cov = $branches->{covered} || 0;
     my $b_cnt = $branches->{count} || 0;
+    my $f_cov = $functions->{covered} || 0;
+    my $f_cnt = $functions->{count} || 0;
 
     # dns_db_pgsql.c is compiled into karidns-dbloader whenever libpq is installed, but only test_db_pgsql and the PostgreSQL integration
     # tests execute it, and those SKIP without a server.  A pgsql driver that is almost never executed (under 10% of its lines; a real
@@ -180,6 +187,10 @@ for my $f (@$files) {
     
     next if $pg_skipped;                       # counted in neither the tier nor the totals
 
+    # Function coverage is gated per file, not per tier: every function of every measured file must have run at least once (a function
+    # no test reaches is either missing a test or dead code, and dead code is deleted)
+    push @missed_functions, sprintf("%-40s %d of %d functions never executed", $relname, $f_cnt - $f_cov, $f_cnt) if $f_cov < $f_cnt;
+
     if (exists $tier_stats{$tier}) {
         $tier_stats{$tier}{lines_cov} += $l_cov;
         $tier_stats{$tier}{lines_cnt} += $l_cnt;
@@ -195,6 +206,31 @@ for my $f (@$files) {
     $tier_stats{'Overall'}{regions_cnt} += $r_cnt;
     $tier_stats{'Overall'}{branches_cov} += $b_cov;
     $tier_stats{'Overall'}{branches_cnt} += $b_cnt;
+}
+
+# "file:line name" of every function no instance of which ran, from an lcov export of the same binaries.  A static inline function of a
+# header is one function per translation unit in lcov; llvm-cov's summary counts it once, as covered when any instance ran, and so does
+# this (grouped by file and line).
+sub never_executed_functions {
+    return ("(names: run llvm-cov export -format=lcov on the same binaries)") unless $export_cmd;
+    (my $cmd = $export_cmd) =~ s/ -summary-only/ -format=lcov/;
+    my (%hit, %name, %line_of);
+    my $file = "";
+    open my $fh, '-|', $cmd or return ("(llvm-cov export -format=lcov failed: $!)");
+    while (my $l = <$fh>) {
+        if ($l =~ /^SF:(.*)/) {
+            ($file = $1) =~ s{^.*?/(tools/[^/]+)$}{$1} or $file =~ s{^.*/}{};
+            %line_of = ();
+        } elsif ($l =~ /^FN:(\d+),(.*)/) {
+            $line_of{$2} = $1;
+            $hit{"$file:$1"} //= 0;
+            ($name{"$file:$1"} //= $2) =~ s/^[^:]+\.c://;   # "file.c:name" for a static function of a header
+        } elsif ($l =~ /^FNDA:(\d+),(.*)/ && defined $line_of{$2}) {
+            $hit{"$file:$line_of{$2}"} += $1;
+        }
+    }
+    close $fh;
+    return map { "$_ $name{$_}" } grep { !$hit{$_} && !($pg_driver_skipped && /^dns_db_pgsql\.c:/) } sort keys %hit;
 }
 
 sub basename {
@@ -248,8 +284,17 @@ if ($pg_driver_skipped) {
     print "[i] dns_db_pgsql.c was left out of Tier D and the totals: the PostgreSQL tests did not run (under 10% of its lines executed)\n\n";
 }
 
+if (@missed_functions) {
+    print "[-] Function coverage below 100%:\n";
+    print "    $_\n" for @missed_functions;
+    print "\n";
+    print "    $_\n" for never_executed_functions();
+    print "\n";
+    $all_passed = 0;
+}
+
 if (!$all_passed) {
-    print "[-] Coverage Gate Status: FAILED (One or more tiers below target)\n";
+    print "[-] Coverage Gate Status: FAILED (One or more tiers below target, or a function never executed)\n";
     if ($strict) {
         exit 1;
     }
