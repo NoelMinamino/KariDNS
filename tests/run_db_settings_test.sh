@@ -168,11 +168,12 @@ EOF
 zone "fany.test" { type primary; file "$T/fany.zone"; allow-transfer { 127.0.0.1; key "xfr"; }; transfer-acl-match any;
                    allow-update { 127.0.0.1; key "upd"; }; update-acl-match all; };
 zone "fdef.test" { type primary; file "$T/fdef.zone"; allow-transfer { 127.0.0.1; key "xfr"; }; allow-update { 127.0.0.1; key "upd"; }; };
+zone "fall.test" { type primary; file "$T/fall.zone"; allow-transfer { 127.0.0.1; key "xfr"; }; transfer-acl-match all; };
 EOF
         fi
     } > "$1"
 }
-for n in fany fdef; do mkzone "$n.test" 5; cp "$T/z/$n.test.zone" "$T/$n.zone"; done
+for n in fany fdef fall; do mkzone "$n.test" 5; cp "$T/z/$n.test.zone" "$T/$n.zone"; done
 
 wait_log() {   # wait_log LOG PATTERN SECONDS [COUNT]
     i=0; want=${4:-1}
@@ -240,9 +241,12 @@ upd_is "meta.test: the right address and the right key" NOERROR meta.test 127.0.
 upd_is "noacl.test: no allow-update" REFUSED noacl.test 127.0.0.1
 
 echo "== karidns.conf zones keep their meaning, and the options work there"
-xfr_no "fdef.test (allow-transfer address AND key): the address alone" fdef.test 127.0.0.1
+xfr_ok "fdef.test (allow-transfer with an address and a key, no transfer-acl-match: BIND first match, address or key): the address alone" fdef.test 127.0.0.1
+xfr_no "fall.test (transfer-acl-match all = address AND key, the meaning before the first-match order): the address alone" fall.test 127.0.0.1
+xfr_ok "fall.test: address and key" fall.test 127.0.0.1 "xfr:$S_XFR"
+xfr_no "fall.test: the key from another address" fall.test 127.0.0.3 "xfr:$S_XFR"
 xfr_ok "fdef.test: address and key" fdef.test 127.0.0.1 "xfr:$S_XFR"
-xfr_no "fdef.test: the key from another address" fdef.test 127.0.0.3 "xfr:$S_XFR"
+xfr_ok "fdef.test: the key from another address (first match: the key element)" fdef.test 127.0.0.3 "xfr:$S_XFR"
 xfr_ok "fany.test (transfer-acl-match any): the address alone" fany.test 127.0.0.1
 xfr_ok "fany.test: the key alone, from another address" fany.test 127.0.0.3 "xfr:$S_XFR"
 xfr_no "fany.test: neither" fany.test 127.0.0.3

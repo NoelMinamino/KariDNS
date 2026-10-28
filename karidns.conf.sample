@@ -16,6 +16,11 @@ options {
     // 一般ユーザーで起動する場合は書き込み可能なディレクトリを指定する
     // pid-file "/var/run/karidns/karidns.pid";
 
+    // アクセス制御 (BIND の address match list。先頭から最初に一致した要素で決まる。
+    // 詳細は docs/karidns.md の "Address match lists")。view / zone の同名の文が優先される
+    // allow-query { localhost; localnets; };   // 問い合わせを受け付けるクライアント (未指定は全員)
+    // allow-transfer { 192.0.2.10; };          // ゾーン転送 (AXFR/IXFR) を許可するクライアント (未指定は拒否)
+
     // UDPソケットバッファサイズ (未指定時のデフォルト: 4M)
     // OSの上限値(kern.ipc.maxsockbuf sysctl)を超えると切り詰められます
     udp-recvbuf-size 4M;

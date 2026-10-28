@@ -328,6 +328,7 @@ register_test "unit" "bin" "test_tinydns_parser" "tinydns data file syntax & rec
 register_test "unit" "bin" "test_cidr" "CIDR prefix matching & binary ACL evaluator"
 register_test "unit" "bin" "test_conf_include" "Config file tokenizer & \$INCLUDE nesting"
 register_test "unit" "bin" "test_config_directives" "named.conf directives: options/zone/key/logging/dnstap/ecs-tags, ACL negation & validation"
+register_test "unit" "bin" "test_acl_match" "BIND address match lists: first match, ! and key elements, nested lists, acl blocks, localhost/localnets, zone > view > options inheritance, allow-query / allow-query-on / allow-transfer / allow-update / allow-notify decisions"
 register_test "unit" "bin" "test_wire_helpers" "Wire helpers: question parser, TSIG position, name pointers/compression, path split"
 register_test "unit" "bin" "test_zone_image" "S5-B0 zone image: byte parity with serialize_dns_record(), accessors, canonical/NSEC3 order, thaw round trip"
 register_test "unit" "bin" "test_zone_parser_paths" "Zone parser: 91 RR forms, 44 RFC golden RDATA vectors, rejection tables, \$INCLUDE/\$GENERATE/tags"
@@ -441,6 +442,7 @@ register_test "core" "sh" "tests/run_domain_length_rfc1035_test.sh" "RFC 1035 25
 register_test "core" "sh" "tests/run_logging_channel_validation_test.sh" "Syslog & file logging channels configuration"
 register_test "core" "sh" "tests/run_mx_srv_glue_test.sh" "MX & SRV target additional glue inclusion"
 register_test "core" "sh" "tests/run_also_notify_test.sh" "also-notify as in BIND 9.20: options/view/zone, port before the list, remote-servers names, per-address TSIG key; karicheck errors with file:line" "par"
+register_test "core" "sh" "tests/run_bind_acl_test.sh" "BIND ACL batch: allow-query in options/view/zone (REFUSED + EDE 18 over UDP and TCP, warm response cache, CNAME into a closed zone, reload), allow-query-on, allow-transfer inheritance and first-match key evaluation, karicheck conf errors and the more-permissive warning (loopback alias when root)" "group:alias"   # loopback alias (ifconfig lo0 alias) as a second client / local address: one at a time
 register_test "core" "sh" "tests/run_notify_source_test.sh" "RFC 1996 notify-source address binding" "serial"   # fixed ports 10053/10054 and the loopback alias 127.0.0.2 (the control socket is the test's own)
 register_test "core" "sh" "tests/run_privilege_drop_root_test.sh" "FreeBSD setuid/setgid privilege drop"
 register_test "core" "sh" "tests/run_nonroot_startup_test.sh" "Non-root startup & fail-closed port/log/pid/control checks"
@@ -716,7 +718,7 @@ START_TIME=$(date +%s 2>/dev/null || perl -e 'print time')
 # Ensure unit test binaries are built if category 'unit' is active
 if is_category_selected "unit"; then
     echo "${C_CYAN}==> Ensuring unit test binaries are built...${C_RESET}"
-    for _b in test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_config_directives test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_epoch_rcu test_cidr test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_db_pgsql test_db_sqlite3 test_db_stream test_db_registry test_pdns_reader test_presigned test_db_supervisor test_dag_iter; do
+    for _b in test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_config_directives test_acl_match test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_epoch_rcu test_cidr test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_db_pgsql test_db_sqlite3 test_db_stream test_db_registry test_pdns_reader test_presigned test_db_supervisor test_dag_iter; do
         if [ ! -x "./${_b}" ]; then
             make "${_b}" >/dev/null 2>&1 || true
         fi

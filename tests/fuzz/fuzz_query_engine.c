@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <limits.h>
+#include <assert.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "../../dns_wire.h"
 #include "../../dns_zone_parser.h"
@@ -214,6 +218,21 @@ static void init_rich_fuzz_engine(void) {
     g_fuzz_cfg.ecs_enable = true;
     g_fuzz_cfg.ecs_trusted_resolvers = g_fuzz_any_acl;
     g_fuzz_cfg.ecs_trusted_resolvers_count = 1;
+    /* allow-query { 127.0.0.1; key k; } and allow-query-on { 127.0.0.1; } in options: the harness asks as 127.0.0.1 (allowed) or 127.0.0.9
+     * (refused unless the request is signed with k), to the local address 127.0.0.1 or an unknown one, so the REFUSED path, the check that
+     * comes before the cache and the cross-zone checks run on the mutated inputs too */
+    {
+        aml_t *aq = aml_new(), *aqo = aml_new();
+        aml_elem_t e1, e2, e3;
+        memset(&e1, 0, sizeof(e1)); memset(&e2, 0, sizeof(e2)); memset(&e3, 0, sizeof(e3));
+        e1.kind = AML_E_NET; e1.text = strdup("127.0.0.1"); cidr_entry_parse(&e1.u.net, "127.0.0.1");
+        e2.kind = AML_E_KEY; e2.text = strdup("k");
+        e3 = e1; e3.text = strdup("127.0.0.1");
+        assert(aq && aqo && aml_push(aq, &e1) && aml_push(aq, &e2) && aml_push(aqo, &e3));
+        g_fuzz_cfg.acl.query = aq;
+        g_fuzz_cfg.acl.query_on = aqo;
+        g_fuzz_cfg.acl_query_active = true;
+    }
     atomic_store_explicit(&g_config_db.active, &g_fuzz_cfg, memory_order_release);
 
     /* The shared response cache (filled on a miss, read on later inputs) and its eligibility per zone */
@@ -247,12 +266,17 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     compress_ctx_init(&comp_ctx);
 
     bool is_tcp = (data[0] & 0x01) != 0;
-    
+    struct sockaddr_in local;
+    memset(&local, 0, sizeof(local));
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    query_set_local_addr((data[1] & 0x04) ? NULL : &local);
+
     int resp_len = process_dns_query(
         query_buf, query_len,
         resp_buf, sizeof(resp_buf),
         qname, qtype,
-        "127.0.0.1", &comp_ctx,
+        (data[1] & 0x02) ? "127.0.0.9" : "127.0.0.1", &comp_ctx,
         is_tcp, NULL,
         &g_fuzz_snap
     );

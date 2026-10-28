@@ -13,6 +13,7 @@
 #include "../dns_zone_lint.h"
 #include "../dns_db_checkproto.h"
 #include "../dns_cidr.h"
+#include "../dns_tsig_acl.h"
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -734,11 +735,25 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
     return t.errors;
 }
 
+/* does the list (or a list inside it) have a negated element next to key elements? the order of its elements then decides who is let in */
+KARIDNS_TOOL_FN bool kc_aml_negation(const aml_t *l, int depth) {
+    if (!l || depth > AML_MAX_DEPTH) return false;
+    for (int i = 0; i < l->count; i++) {
+        const aml_elem_t *e = &l->elems[i];
+        if (e->neg && e->kind != AML_E_KEY) return true;
+        if (e->kind == AML_E_LIST && kc_aml_negation(e->u.list, depth + 1)) return true;
+    }
+    return false;
+}
+
 KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) {
     printf("[INFO] Loading config %s...\n", config_path);
     bool failed = false;
     char *buf = read_file_or_die(config_path, &failed);
     if (failed || !buf) return 1;
+
+    /* localhost / localnets in the flat lists the parser builds are the interfaces of this host (the server takes the same snapshot at start-up) */
+    aml_init_interfaces();
 
     if (parse_named_conf_ext(buf, config_path, cfg) != 0) {
         fprintf(stderr, "[ERROR] Syntax error in config file: %s\n", config_path);
@@ -752,27 +767,38 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
     CONFIG_FOR_EACH_ZONE(cfg, zv, z) {
         const zone_ext_t *zx = zext(z);
         /* D14 (B7a): transfer-acl-match / update-acl-match only choose between the entries of an ACL */
+        const aml_t *tl = config_acl_for(cfg, z, zv->name, AML_ACL_TRANSFER);   /* the zone's own list, else the view's, else options' */
+        const aml_t *ul = config_acl_for(cfg, z, zv->name, AML_ACL_UPDATE);
+        bool t_addr = tl ? tl->has_addr : zx->allow_transfer_count > 0;
+        bool t_key = (tl ? tl->has_key : zx->tsig_keys_count > 0) || zx->tsig_key != NULL;   /* the zone's tsig-key may transfer too */
         if (zx->transfer_acl_match != ACL_MATCH_DEFAULT) {
-            if (zx->allow_transfer_count == 0 && zx->tsig_keys_count == 0)
+            if (!t_addr && !t_key)
                 fprintf(stderr, "[WARNING] Zone '%s': transfer-acl-match has no effect without allow-transfer\n", z->domain);
-            else if (zx->allow_transfer_count == 0 || zx->tsig_keys_count == 0)
+            else if (!t_addr || !t_key)
                 fprintf(stderr, "[WARNING] Zone '%s': transfer-acl-match has no effect: allow-transfer lists only %s "
                                 "(the option chooses between addresses and keys)\n",
-                        z->domain, zx->allow_transfer_count ? "addresses" : "keys");
+                        z->domain, t_addr ? "addresses" : "keys");
+        } else if (zx->acl.transfer && tl && tl->has_addr && tl->has_key) {
+            /* with no transfer-acl-match the list is evaluated in BIND's way now: the first element that matches decides, so a client
+             * from a listed address OR signed with a listed key is let in; it used to take the address AND the key.  (A zone's
+             * tsig-key with a list of addresses only is unchanged: the request still has to be signed.) */
+            fprintf(stderr, "[WARNING] Zone '%s': allow-transfer lists addresses and keys: it now lets in a client from a listed address "
+                            "or signed with a listed key (BIND's first-match order; it used to need both). Write "
+                            "'transfer-acl-match all;' in the zone to keep the old meaning, or 'any' to make this one explicit\n",
+                    z->domain);
         }
+        bool u_addr = ul ? ul->has_addr : zx->allow_update_count > 0;
+        bool u_key = ul && ul->has_key;
         if (zx->update_acl_match != ACL_MATCH_DEFAULT) {
-            bool addr = false, key = false;
-            for (int i = 0; i < zx->allow_update_count; i++) {
-                const char *e = zx->allow_update[i];
-                cidr_entry_t ce;
-                if (!e || e[0] == '!' || strcmp(e, "none") == 0 || cidr_entry_parse(&ce, e)) addr = true;
-                else key = true;
-            }
-            if (zx->allow_update_count == 0)
+            if (!ul)
                 fprintf(stderr, "[WARNING] Zone '%s': update-acl-match has no effect without allow-update\n", z->domain);
-            else if (!addr || !key)
+            else if (!u_addr || !u_key)
                 fprintf(stderr, "[WARNING] Zone '%s': update-acl-match has no effect: allow-update lists only %s "
-                                "(the option chooses between addresses and keys)\n", z->domain, addr ? "addresses" : "keys");
+                                "(the option chooses between addresses and keys)\n", z->domain, u_addr ? "addresses" : "keys");
+        } else if (zx->acl.update && u_key && kc_aml_negation(ul, 0)) {
+            fprintf(stderr, "[WARNING] Zone '%s': allow-update has keys and negated entries: it is evaluated in BIND's first-match order now, so a "
+                            "negated entry before a key refuses that key's requests (it used to let in a request signed with a listed key "
+                            "whatever the addresses said). Write 'update-acl-match any;' in the zone to keep the old meaning\n", z->domain);
         }
         if (z->type && strcasecmp(z->type, "program") == 0) {
             program_zone_count++;

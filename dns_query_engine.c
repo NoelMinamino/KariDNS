@@ -35,6 +35,46 @@ static _Thread_local bool t_resolve_sibling_glue;
 static _Thread_local bool t_resolve_alias_expanded;
 static _Thread_local bool t_resolve_alias_failed;
 
+/* allow-query / allow-query-on (BIND 9.20 ARM): what the ACL check needs besides the client address.  The transport sets the address
+ * the query came to (query_set_local_addr()) right before it calls process_dns_query*(); the call reads it and clears it, so a caller
+ * that does not set it (unit tests, fuzzers) gives "unknown".  t_qacl.key is the TSIG key the request was verified with. */
+static _Thread_local struct {
+  struct sockaddr_storage local;
+  bool local_valid;
+  struct sockaddr_storage client;   /* the client in binary, so that the check does not parse client_ip again */
+  bool client_valid;
+  const char *key;
+} t_qacl;
+
+static bool qacl_copy_addr(struct sockaddr_storage *dst, const void *sa) {
+  if (!sa) return false;
+  sa_family_t fam = ((const struct sockaddr *)sa)->sa_family;
+  if (fam == AF_INET) {
+    memcpy(dst, sa, sizeof(struct sockaddr_in));
+  } else if (fam == AF_INET6) {
+    memcpy(dst, sa, sizeof(struct sockaddr_in6));
+  } else {
+    return false;
+  }
+  return true;
+}
+
+void query_set_local_addr(const void *sa) {
+  t_qacl.local_valid = qacl_copy_addr(&t_qacl.local, sa);
+}
+
+void query_set_client_addr(const void *sa) {
+  t_qacl.client_valid = qacl_copy_addr(&t_qacl.client, sa);
+}
+
+/* Does allow-query / allow-query-on of the zone `entry` (of this view) let the client in?  For the zone the query was routed to the
+ * caller has the configuration; a zone that a CNAME or glue lookup reaches is looked up here.  No allocation. */
+static inline bool zone_query_permitted(const server_config_t *cfg, const zone_config_t *zcfg, const char *view_name, const char *client_ip) {
+  if (!cfg || !cfg->acl_query_active) return true;
+  return query_acl_permits_sa(cfg, zcfg, view_name, client_ip, t_qacl.client_valid ? &t_qacl.client : NULL, t_qacl.key,
+                              t_qacl.local_valid ? &t_qacl.local : NULL);
+}
+
 program_plugin_t *g_program_plugins = NULL;
 int g_program_plugins_count = 0;
 
@@ -349,6 +389,10 @@ STATIC_TEST bool append_glue_records(const zone_image_t *img, const char *target
       zone_version_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
       const zone_image_t *sib = sib_arena ? sib_arena->image : NULL;
       if (sib != img) t_resolve_sibling_glue = true; /* C1: the answer depends on another zone's version: not cached */
+      /* allow-query of the sibling zone: no glue from a zone this client may not query */
+      if (sib && sib != img && sib_ctx->cfg && sib_ctx->cfg->acl_query_active &&
+          !zone_query_permitted(sib_ctx->cfg, zone_entry_config(sib_ctx->cfg, sib_entry), sib_ctx->view->name, sib_ctx->client_ip))
+        return true;
       if (sib && sib != img) {
         /* C2: the sibling's records are chosen with the sibling's own tag definitions, as for a CNAME into another zone
          * (resolve_name_answer()); a sibling whose SOA this client does not see gives no glue (B8t-1).  Its view is taken
@@ -1234,6 +1278,13 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
       if (!new_db_entry || new_db_entry->kind == ZONE_KIND_FORWARD || new_db_entry->kind == ZONE_KIND_PROGRAM)
         return;
       if (new_db_entry != db_entry) {
+        /* allow-query of the zone the CNAME leads into: a client that may not ask that zone gets the chain up to here (BIND stops
+         * the same way: the partial answer is returned).  Never stored in the response cache (it depends on the client). */
+        if (cfg && cfg->acl_query_active && view &&
+            !zone_query_permitted(cfg, zone_entry_config(cfg, new_db_entry), view->name, client_ip)) {
+          t_resolve_crossed_zone = true;
+          return;
+        }
         *db_entry_ptr = new_db_entry;
         *current_zone_ptr = atomic_load_explicit(&new_db_entry->rcu.active, memory_order_acquire);
         t_resolve_crossed_zone = true;
@@ -2672,14 +2723,18 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
   t_query_rrl_info.zone = NULL; /* D-05: 早い段階で返す応答 (エラー) のために先に消す */
   t_query_rrl_info.wildcard = false;
   if (req_len < DNS_HEADER_SIZE) {
+    t_qacl.local_valid = t_qacl.client_valid = false;
     return 0; // 不正な短いパケットは無応答で破棄
   }
   tsig_request_t tsig;
   tsig_check_request(cfg, req, req_len, client_ip, &tsig);
   t_query_tsig.status = TSIG_REQ_NONE; /* X-20: slip 応答の署名用。署名のない要求では使わない */
   if (tsig.status == TSIG_REQ_NONE) {
-    return process_query_body(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
-                              is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL, route);
+    int plain = process_query_body(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
+                                   is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL, route);
+    t_qacl.local_valid = t_qacl.client_valid = false;   /* the address of the next query is set by its transport */
+    t_qacl.key = NULL;
+    return plain;
   }
   /* TSIG RR を除き ARCOUNT を 1 減らした要求 (RFC 8945 §5.2)。解釈できない TSIG はそのまま渡す。 */
   static _Thread_local uint8_t stripped[UINT16_MAX];
@@ -2696,6 +2751,8 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
   tsig.res_limit = max_res_len;
   int ret = process_query_body(body_req, body_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
                                is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, &tsig, route);
+  t_qacl.local_valid = t_qacl.client_valid = false;
+  t_qacl.key = NULL;
   if (ret < DNS_HEADER_SIZE) return ret;
   size_t limit = tsig.res_limit;
   if (res_cap != 0 && limit > res_cap) limit = res_cap;
@@ -2722,6 +2779,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   zone_version_t *current_zone = NULL;
   zone_db_entry_t *db_entry = NULL;
   view_snapshot_t *view = NULL;
+  t_qacl.key = (tsig && tsig->status == TSIG_REQ_VALID && tsig->key) ? tsig->key->name : NULL;   /* `key <name>` in allow-query */
 
   if (snap && route) {
     /* E2: the caller looked up the same view and zone (query_route_t) */
@@ -2920,6 +2978,10 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
           if (!need || (tkey && tsig_key_names_equal(tkey->name, need))) auth = true;
         }
       }
+      /* allow-notify (BIND 9.20 ARM): "in addition to the zone primaries"; it applies to the secondary zones, from the zone, the view
+       * or options.  A `key` element is the TSIG key the NOTIFY was signed with. */
+      if (!auth && db_entry->is_secondary)
+        auth = zone_notify_acl_allows(cfg, zcfg, view->name, client_ip, tkey ? tkey->name : NULL);
     }
 
     uint8_t notify_rcode = 0;
@@ -2990,7 +3052,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         }
       }
       /* the address list, the named keys, update-acl-match and (DB zones) acl-ceiling: dns_tsig_acl.c */
-      if (zcfg) auth = zone_update_acl_allows(cfg, zcfg, client_ip, tkey ? tkey->name : NULL);
+      if (zcfg) auth = zone_update_acl_allows_in_view(cfg, zcfg, view->name, client_ip, tkey ? tkey->name : NULL);
     }
 
     int rcode = 5; // REFUSED
@@ -3094,6 +3156,14 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     // QTYPE/QCLASS が欠けている: 質問を区切れないので QDCOUNT=0 の FORMERR
     add_ede(&edns, send_ede, 0, NULL);
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, &edns, is_tcp, cfg);
+  }
+  /* allow-query / allow-query-on (BIND 9.20 ARM): the zone's statement, else the view's, else options'.  A client that may not ask
+   * gets REFUSED (RFC 1035 §4.1.1) with EDE 18 Prohibited (RFC 8914 §4.19), as for a transfer or an update that is not allowed.  This is
+   * the first thing done for a QUERY once the zone is known -- before the zone's expiry, the cached wire answers and every lookup --
+   * and the answers in the shared response cache do not depend on the client, so the cache never has to know who may ask. */
+  if (db_entry && view && cfg && cfg->acl_query_active && !zone_query_permitted(cfg, zone_cfg_any, view->name, client_ip)) {
+    add_ede(&edns, send_ede, 18, "Query refused due to access control");
+    return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
   }
     if (db_entry) {
         time_t deadline = zone_expire_deadline(db_entry);

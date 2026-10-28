@@ -5,6 +5,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
@@ -1723,6 +1726,121 @@ static void test_rcache_store_layout(void) {
     printf("  [PASS] variable-length store, wrap-around and eviction\n");
 }
 
+/* allow-query / allow-query-on (BIND 9.20 ARM): the check comes before the shared response cache, so an answer cached for a client that
+ * may ask is never given to one that may not, and the answers that lead into a zone the client may not ask are cut and not stored. */
+static void test_acl_before_response_cache(void) {
+    printf("[TEST] allow-query is checked before the shared response cache; CNAME into a closed zone...\n");
+    static char text_a[] =
+        "a.example. 3600 IN SOA ns.a.example. h.a.example. 1 7200 3600 1209600 3600\n"
+        "a.example. 3600 IN NS ns.a.example.\n"
+        "ns.a.example. 3600 IN A 192.0.2.1\n"
+        "www.a.example. 3600 IN CNAME x.b.example.\n"
+        "end.a.example. 3600 IN A 192.0.2.9\n";
+    static char text_b[] =
+        "b.example. 3600 IN SOA ns.b.example. h.b.example. 1 7200 3600 1209600 3600\n"
+        "b.example. 3600 IN NS ns.b.example.\n"
+        "ns.b.example. 3600 IN A 192.0.2.2\n"
+        "x.b.example. 3600 IN A 192.0.2.77\n";
+    zone_arena_t arena_a, arena_b;
+    zone_arena_init(&arena_a);
+    zone_arena_init(&arena_b);
+    parse_error_t err = {0};
+    parse_context_t ca = { .base_dir = ".", .default_origin = "a.example.", .is_standalone_mode = true, .err_out = &err };
+    parse_context_t cb = { .base_dir = ".", .default_origin = "b.example.", .is_standalone_mode = true, .err_out = &err };
+    assert(parse_zone_fast(text_a, strlen(text_a), &arena_a, &ca) >= 0);
+    assert(parse_zone_fast(text_b, strlen(text_b), &arena_b, &cb) >= 0);
+    assert(test_build_index(&arena_a, true) == 0 && test_build_index(&arena_b, true) == 0);
+    /* options: only 127.0.0.0/8 may ask; a.example: only 127.0.0.1; b.example: only a request signed with k (or on the local address 192.0.2.53) */
+    static const char conf[] =
+        "key \"k\" { algorithm hmac-sha256; secret \"c2VjcmV0LW9uZS1mb3ItdGVzdA==\"; };"
+        "options { allow-query { 127.0.0.0/8; }; };"
+        "zone \"a.example\" { type master; file \"a\"; allow-query { 127.0.0.1; }; allow-query-on { 192.0.2.53; any; }; };"
+        "zone \"b.example\" { type master; file \"b\"; allow-query { key k; }; };";
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    assert(parse_named_conf(conf, &cfg) == 0 && cfg.acl_query_active);
+    build_zone_response_cache(&arena_a.ver, &cfg, tst_entry(NULL, "a.example."));
+    build_zone_response_cache(&arena_b.ver, &cfg, tst_entry(NULL, "b.example."));
+    assert(arena_a.rcache_ok && arena_b.rcache_ok);
+
+    zone_db_entry_t ea, eb;
+    memset(&ea, 0, sizeof(ea));
+    memset(&eb, 0, sizeof(eb));
+    strncpy(ea.domain, "a.example.", sizeof(ea.domain) - 1);
+    strncpy(eb.domain, "b.example.", sizeof(eb.domain) - 1);
+    atomic_store_explicit(&ea.rcu.active, &arena_a.ver, memory_order_release);
+    atomic_store_explicit(&eb.rcu.active, &arena_b.ver, memory_order_release);
+    zone_db_entry_t *entries[2] = { &ea, &eb };
+    char *any_acl[1] = { (char *)"any" };
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "__default__";
+    view.entries = entries;
+    view.zone_count = 2;
+    view.match_clients = any_acl;
+    view.match_clients_count = 1;
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    struct sockaddr_in local;
+    memset(&local, 0, sizeof(local));
+    local.sin_family = AF_INET;
+    inet_pton(AF_INET, "192.0.2.99", &local.sin_addr);
+    uint8_t req[512], res[4096];
+    size_t req_len = 0;
+    compress_ctx_t cc = {0};
+    zone_db_entry_t *matched = NULL;
+#define ASK(ID, NAME, IP) \
+    (build_simple_query(req, &req_len, (ID), (NAME), 1), compress_ctx_init_packet(&cc), query_set_local_addr(&local), \
+     process_dns_query_impl(req, req_len, res, sizeof(res), (NAME), 1, (IP), &cc, false, NULL, &snap, &cfg, &matched))
+
+    /* the allowed client warms the cache (the second answer is a hit) ... */
+    int len = ASK(0x5001, "end.a.example.", "127.0.0.1");
+    assert(len > 12 && (res[3] & 0x0F) == 0 && ((res[6] << 8) | res[7]) == 1);
+    uint64_t hits0 = atomic_load(&ea.observatory.wirecache_hits);
+    len = ASK(0x5002, "end.a.example.", "127.0.0.1");
+    assert(len > 12 && (res[3] & 0x0F) == 0 && ((res[6] << 8) | res[7]) == 1);
+    assert(atomic_load(&ea.observatory.wirecache_hits) == hits0 + 1);
+    /* ... and a client that may not ask is refused: no answer, AA=0, the question only, and the cache is not even looked at */
+    uint64_t hits1 = atomic_load(&ea.observatory.wirecache_hits), miss1 = atomic_load(&ea.observatory.wirecache_misses);
+    for (int i = 0; i < 3; i++) {
+        len = ASK(0x5003 + i, "end.a.example.", "127.0.0.9");     /* inside options' 127.0.0.0/8 but not in a.example's list */
+        assert(len > 12 && (res[3] & 0x0F) == 5 && ((res[6] << 8) | res[7]) == 0 && (res[2] & 0x04) == 0 && ((res[4] << 8) | res[5]) == 1);
+        len = ASK(0x5010 + i, "end.a.example.", "198.51.100.1");
+        assert(len > 12 && (res[3] & 0x0F) == 5 && ((res[6] << 8) | res[7]) == 0);
+    }
+    assert(atomic_load(&ea.observatory.wirecache_hits) == hits1 && atomic_load(&ea.observatory.wirecache_misses) == miss1);
+    /* a refused response with EDNS carries EDE 18 and no stale bytes after the question + OPT */
+    {
+        build_edns_query(req, &req_len, 0x5020, "end.a.example.", 1, false);
+        compress_ctx_init_packet(&cc);
+        query_set_local_addr(&local);
+        len = process_dns_query_impl(req, req_len, res, sizeof(res), "end.a.example.", 1, "127.0.0.9", &cc, false, NULL, &snap, &cfg, &matched);
+        assert(len > 12 && (res[3] & 0x0F) == 5 && ((res[10] << 8) | res[11]) == 1);
+        bool ede18 = false;                                                              /* option code 15, length, info code 18 (Prohibited) */
+        for (int i = 12; i + 6 <= len; i++)
+            if (res[i] == 0x00 && res[i + 1] == 0x0F && res[i + 4] == 0x00 && res[i + 5] == 0x12) ede18 = true;
+        assert(ede18);
+    }
+    /* (allow-query-on { 192.0.2.53; any; } of a.example let the local address 192.0.2.99 in above)
+     * b.example is closed to an unsigned client; the CNAME of a.example that leads there stops at the CNAME and is not cached */
+    for (int round = 0; round < 3; round++) {
+        len = ASK(0x5030 + round, "www.a.example.", "127.0.0.1");
+        assert(len > 12 && (res[3] & 0x0F) == 0 && ((res[6] << 8) | res[7]) == 1 && (res[2] & 0x04) != 0);
+        assert(!bytes_contain(res, (size_t)len, (const uint8_t[]){ 192, 0, 2, 77 }, 4));
+    }
+    assert(atomic_load(&ea.observatory.wirecache_hits) == hits1);                      /* never a hit: the answer is not stored */
+    len = ASK(0x5040, "x.b.example.", "127.0.0.1");
+    assert(len > 12 && (res[3] & 0x0F) == 5);                                          /* b.example itself: unsigned is refused */
+    free_server_config_fields(&cfg);
+#undef ASK
+    zone_arena_destroy(&arena_a);
+    zone_arena_destroy(&arena_b);
+    printf("  [PASS] ACL before the cache, REFUSED shape, CNAME into a closed zone\n");
+}
+
 int main(void) {
     test_rcache_store_layout();
     assert(response_cache_init(1u << 20) > 0);
@@ -1736,6 +1854,7 @@ int main(void) {
     test_referral_tc_only_for_in_domain_glue();
     test_routed_query_equals_lookup();
     test_wire_cache_per_view_config();
+    test_acl_before_response_cache();
     return 0;
 }
 

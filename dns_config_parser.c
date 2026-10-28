@@ -375,10 +375,30 @@ zone_ext_t *zone_ext_mut(zone_config_t *z) {
 static void notify_targets_free(notify_target_t *l, int n);
 static void remote_lists_free(remote_list_t *r);
 
+static void acl_set_free(acl_set_t *s) {
+  aml_unref(s->query);
+  aml_unref(s->query_on);
+  aml_unref(s->transfer);
+  aml_unref(s->update);
+  aml_unref(s->notify);
+  aml_unref(s->match);
+  memset(s, 0, sizeof(*s));
+}
+
+static void acl_set_copy(acl_set_t *d, const acl_set_t *s) {
+  d->query = aml_ref(s->query);
+  d->query_on = aml_ref(s->query_on);
+  d->transfer = aml_ref(s->transfer);
+  d->update = aml_ref(s->update);
+  d->notify = aml_ref(s->notify);
+  d->match = aml_ref(s->match);
+}
+
 /* everything x points to (not x itself: a zone_ext_shared_t embeds it) */
 static void free_zone_ext_fields(zone_ext_t *x) {
   if (!x)
     return;
+  acl_set_free(&x->acl);
   notify_targets_free(x->masters, x->masters_count);
   if (x->masters_parsed) {
     free(x->masters_parsed);
@@ -595,6 +615,7 @@ static void free_partial_view(view_config_t *view) {
   zone_cfg_index_free(&view->zone_index);
   free_view_db_fields(view);
   if (view->name) free(view->name);
+  acl_set_free(&view->acl);
   notify_targets_free(view->also_notify, view->also_notify_count);
   for (int i = 0; i < view->match_clients_count; i++) free(view->match_clients[i]);
   if (view->match_clients) free(view->match_clients);
@@ -677,6 +698,31 @@ static int acl_expand_into(token_ctx_t *ctx, const server_config_t *cfg, const c
       APPEND_STR(*out, *out_count, v);
       continue;
     }
+    if (strcasecmp(t, "localhost") == 0 || strcasecmp(t, "localnets") == 0) {
+      /* the flat lists get the interface addresses (localhost) or their networks (localnets) of the start-up snapshot; allow-query,
+       * allow-transfer, allow-update and allow-notify evaluate the names at run time (dns_tsig_acl.c) */
+      const aml_iface_t *ifs;
+      size_t nif = aml_get_interfaces(&ifs);
+      bool nets = strcasecmp(t, "localnets") == 0;
+      for (size_t k = 0; k < nif; k++) {
+        char ip[INET6_ADDRSTRLEN];
+        if (!inet_ntop(ifs[k].family, ifs[k].addr, ip, sizeof(ip))) continue;
+        int prefix = ifs[k].family == AF_INET ? 32 : 128;
+        if (nets) {
+          prefix = 0;
+          for (int b = 0; b < (ifs[k].family == AF_INET ? 4 : 16); b++) {
+            uint8_t m = ifs[k].mask[b];
+            if (m == 0xff) { prefix += 8; continue; }
+            while (m & 0x80) { prefix++; m = (uint8_t)(m << 1); }
+            break;
+          }
+        }
+        char ent[INET6_ADDRSTRLEN + 8];
+        snprintf(ent, sizeof(ent), "%s%s/%d", neg ? "!" : "", ip, prefix);
+        APPEND_STR(*out, *out_count, strdup(ent));
+      }
+      continue;
+    }
     if (acl_name_is_builtin(t))
       return acl_reject(ctx, where, t, "is not supported (list the addresses instead)");
     const acl_def_t *acl = NULL;
@@ -716,6 +762,155 @@ static int acl_expand_field(token_ctx_t *ctx, const server_config_t *cfg, const 
   if (parsed) {
     free(*parsed);
     *parsed = acl_list_parse(*list, *count);
+  }
+  return 0;
+}
+
+/* ---- resolving the BIND address match lists once the whole file is read ---- */
+
+static void aml_report(token_ctx_t *ctx, const char *loc, const char *what, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+static void aml_report(token_ctx_t *ctx, const char *loc, const char *what, const char *fmt, ...) {
+  char msg[300];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  if (loc) {
+    syslog(LOG_ERR, "[Config] %s: %s: %s", loc, what, msg);
+    fprintf(stderr, "[ERROR] %s: %s: %s\n", loc, what, msg);
+  } else {   /* a problem of the configuration as a whole (an acl that contains itself, an option that does not go with a list) */
+    syslog(LOG_ERR, "[Config] %s: %s", what, msg);
+    fprintf(stderr, "[ERROR] %s: %s\n", what, msg);
+  }
+  if (ctx) ctx->error_occurred = true;
+}
+
+static int acl_def_resolve(token_ctx_t *ctx, server_config_t *cfg, acl_def_t *a, const char *loc);
+
+/* Names become their lists (an acl block, localhost / localnets were recognised when read), keys must exist, and the flags and the
+ * depth of every list are set.  bare_keys: a name that is no acl but a defined key means `key <name>` (what allow-update has always
+ * accepted).  A list that is already resolved (the list of an acl block) is not touched twice. */
+static int aml_resolve(token_ctx_t *ctx, server_config_t *cfg, aml_t *l, const char *what, bool bare_keys, int depth) {
+  if (depth > AML_MAX_DEPTH) {
+    aml_report(ctx, NULL, what, "address match lists are nested too deeply");
+    return -1;
+  }
+  l->has_addr = l->has_key = l->has_neg_key = false;
+  l->depth = 1;
+  for (int i = 0; i < l->count; i++) {
+    aml_elem_t *e = &l->elems[i];
+    if (e->kind == AML_E_NAME) {
+      acl_def_t *a = NULL;
+      for (acl_def_t *d = cfg->acls; d; d = d->next)
+        if (strcasecmp(d->name, e->text) == 0) { a = d; break; }
+      if (a) {
+        if (acl_def_resolve(ctx, cfg, a, e->loc) != 0) return -1;
+        e->kind = AML_E_LIST;
+        e->u.list = aml_ref(a->aml);
+      } else if (bare_keys && !e->neg && key_name_is_defined(cfg->keys, e->text)) {
+        e->kind = AML_E_KEY;
+      } else {
+        aml_report(ctx, e->loc, what, "entry '%.64s' is not an address, prefix, any, none, localhost, localnets or a defined acl%s", e->text,
+                   bare_keys ? " or key" : "");
+        return -1;
+      }
+    } else if (e->kind == AML_E_KEY) {
+      if (!key_name_is_defined(cfg->keys, e->text)) {
+        aml_report(ctx, e->loc, what, "key '%.64s' is not defined in any key {} block", e->text);
+        return -1;
+      }
+    } else if (e->kind == AML_E_LIST && e->u.list->depth == 0) {
+      if (aml_resolve(ctx, cfg, e->u.list, what, bare_keys, depth + 1) != 0) return -1;
+    }
+    free(e->loc);
+    e->loc = NULL;
+    switch (e->kind) {
+    case AML_E_KEY:
+      l->has_key = true;
+      if (e->neg) l->has_neg_key = true;
+      break;
+    case AML_E_LIST: {
+      const aml_t *c = e->u.list;
+      if (c->has_addr) l->has_addr = true;
+      if (c->has_key) l->has_key = true;
+      if (c->has_neg_key || (e->neg && c->has_key)) l->has_neg_key = true;
+      if (c->depth + 1 > l->depth) l->depth = (uint8_t)(c->depth + 1);
+      break;
+    }
+    default:
+      l->has_addr = true;
+      break;
+    }
+  }
+  if (l->depth > AML_MAX_DEPTH) {
+    aml_report(ctx, NULL, what, "address match lists are nested too deeply");
+    return -1;
+  }
+  return 0;
+}
+
+static int acl_def_resolve(token_ctx_t *ctx, server_config_t *cfg, acl_def_t *a, const char *loc) {
+  if (a->state == 2) return 0;
+  char what[DNS_NAME_TEXT_SIZE + 16];
+  snprintf(what, sizeof(what), "acl '%.255s'", a->name);
+  if (a->state == 1) {
+    aml_report(ctx, loc, what, "refers to itself (an acl cannot contain itself, directly or through other acl blocks)");
+    return -1;
+  }
+  a->state = 1;
+  int rc = a->aml ? aml_resolve(ctx, cfg, a->aml, what, true, 0) : 0;
+  a->state = 2;
+  return rc;
+}
+
+static int acl_set_resolve(token_ctx_t *ctx, server_config_t *cfg, acl_set_t *s, const char *label) {
+  static const char *const names[6] = { "allow-query", "allow-query-on", "allow-transfer", "allow-update", "allow-notify", "match-clients" };
+  aml_t *const lists[6] = { s->query, s->query_on, s->transfer, s->update, s->notify, s->match };
+  for (int i = 0; i < 6; i++) {
+    if (!lists[i]) continue;
+    char what[DNS_NAME_TEXT_SIZE + 64];
+    snprintf(what, sizeof(what), "%s %s", label, names[i]);
+    if (aml_resolve(ctx, cfg, lists[i], what, i == AML_ACL_UPDATE, 0) != 0) return -1;
+  }
+  return 0;
+}
+
+/* After the parse: every list resolved, acl_query_active set, and transfer-acl-match / update-acl-match any / all refused where the
+ * list that applies has a negated key (the flat evaluation of those settings cannot say "not signed with k"). */
+static int resolve_all_acl_lists(token_ctx_t *ctx, server_config_t *cfg) {
+  for (acl_def_t *a = cfg->acls; a; a = a->next)
+    if (acl_def_resolve(ctx, cfg, a, NULL) != 0) return -1;
+  if (acl_set_resolve(ctx, cfg, &cfg->acl, "options") != 0) return -1;
+  cfg->acl_query_active = cfg->acl.query || cfg->acl.query_on;
+  for (view_config_t *v = cfg->views; v; v = v->next) {
+    char label[KARIDNS_VIEW_NAME_MAX + 16];
+    snprintf(label, sizeof(label), "view '%s'", v->name);
+    if (acl_set_resolve(ctx, cfg, &v->acl, label) != 0) return -1;
+    if (v->acl.query || v->acl.query_on) cfg->acl_query_active = true;
+  }
+  for (view_config_t *v = cfg->views; v; v = v->next) {
+    for (zone_config_t *z = v->zones; z; z = z->next) {
+      zone_ext_t *zx = z->ext;
+      if (!zx) continue;
+      char label[DNS_NAME_TEXT_SIZE + 16];
+      snprintf(label, sizeof(label), "zone '%.255s'", z->domain);
+      if (acl_set_resolve(ctx, cfg, &zx->acl, label) != 0) return -1;
+      if (zx->acl.query || zx->acl.query_on) cfg->acl_query_active = true;
+      if (zx->transfer_acl_match != ACL_MATCH_DEFAULT) {
+        const aml_t *l = config_acl_for(cfg, z, v->name, AML_ACL_TRANSFER);
+        if (l && l->has_neg_key) {
+          aml_report(ctx, NULL, label, "transfer-acl-match any/all cannot be used with an allow-transfer that has a negated key");
+          return -1;
+        }
+      }
+      if (zx->update_acl_match != ACL_MATCH_DEFAULT) {
+        const aml_t *l = config_acl_for(cfg, z, v->name, AML_ACL_UPDATE);
+        if (l && l->has_neg_key) {
+          aml_report(ctx, NULL, label, "update-acl-match any/all cannot be used with an allow-update that has a negated key");
+          return -1;
+        }
+      }
+    }
   }
   return 0;
 }
@@ -762,6 +957,7 @@ void free_server_config_fields(server_config_t *cfg) {
     zone_cfg_index_free(&v->zone_index);
     free_view_db_fields(v);
     if (v->name) free(v->name);
+    acl_set_free(&v->acl);
     notify_targets_free(v->also_notify, v->also_notify_count);
     for (int i = 0; i < v->match_clients_count; i++) free(v->match_clients[i]);
     if (v->match_clients) free(v->match_clients);
@@ -793,11 +989,14 @@ void free_server_config_fields(server_config_t *cfg) {
     acl_def_t *next_a = a->next;
     for (int i = 0; i < a->count; i++) free(a->entries[i]);
     free(a->entries);
+    aml_unref(a->aml);
     free(a->name);
     free(a);
     a = next_a;
   }
   cfg->acls = NULL;
+  acl_set_free(&cfg->acl);
+  cfg->acl_query_active = false;
 
   if (cfg->control.socket_path) { free(cfg->control.socket_path); cfg->control.socket_path = NULL; }
   if (cfg->control.algorithm) { free(cfg->control.algorithm); cfg->control.algorithm = NULL; }
@@ -1274,6 +1473,275 @@ static void conf_error(token_ctx_t *ctx, const char *what, const char *fmt, ...)
   syslog(LOG_ERR, "[Config] %s: %s: %s", loc, what, msg);
   fprintf(stderr, "[ERROR] %s: %s: %s\n", loc, what, msg);
   ctx->error_occurred = true;
+}
+
+/* ---- BIND address match lists (BIND 9.20 ARM "Address Match Lists", dns_tsig_acl.h) ----
+ *   address_match_list = address_match_element; ...
+ *   address_match_element = [ ! ] ( <ip_address> | <ip_prefix> | key <key_id> | <acl_name> | { address_match_list } )
+ * `any`, `none`, `localhost` and `localnets` are predefined acl names.  The statements that take a list read it into an aml_t (names are
+ * resolved when the whole file has been read: an acl may be written after its first use), and allow-transfer / allow-update also
+ * keep the flat string lists the older code (settings sent to secondaries, database zones) works with. */
+#define AML_PARSE_DEPTH_MAX 8
+
+static bool aml_text_is(const char *t, const char *name) {
+  return strcasecmp(t, name) == 0;
+}
+
+/* `what`: for the messages.  The '{' has been read; reads up to and including the matching '}'.  NULL after reporting an error. */
+static aml_t *parse_aml_body(token_ctx_t *ctx, const char *what, int depth) {
+  aml_t *l = aml_new();
+  char db[96];
+  if (!l) {
+    if (ctx) ctx->error_occurred = true;
+    return NULL;
+  }
+  for (;;) {
+    conf_token_t tok = get_next_token(ctx);
+    if (tok.type == TOKEN_RBRACE) {
+      free_token(&tok);
+      return l;
+    }
+    aml_elem_t e;
+    memset(&e, 0, sizeof(e));
+    if (tok.type == TOKEN_STRING && tok.value && !tok.is_quoted && tok.value[0] == '!') {
+      e.neg = true;
+      if (tok.value[1] == '\0') {
+        free_token(&tok);
+        tok = get_next_token(ctx);
+      } else {
+        char *rest = strdup(tok.value + 1);
+        free(tok.value);
+        tok.value = rest;
+        if (!rest) {
+          if (ctx) ctx->error_occurred = true;
+          aml_unref(l);
+          return NULL;
+        }
+      }
+    }
+    char loc[300];
+    ctx_location(ctx, loc, sizeof(loc));
+    bool bad = false;
+    if (tok.type == TOKEN_LBRACE) {
+      free_token(&tok);
+      if (depth + 1 >= AML_PARSE_DEPTH_MAX) {
+        conf_error(ctx, what, "address match lists are nested more than %d deep", AML_PARSE_DEPTH_MAX);
+        aml_unref(l);
+        return NULL;
+      }
+      e.kind = AML_E_LIST;
+      e.u.list = parse_aml_body(ctx, what, depth + 1);
+      if (!e.u.list) {
+        aml_unref(l);
+        return NULL;
+      }
+    } else if (tok.type == TOKEN_STRING && tok.value && tok.value[0] != '\0') {
+      if (!tok.is_quoted && strcmp(tok.value, "key") == 0) {
+        free_token(&tok);
+        tok = get_next_token(ctx);
+        /* (the settings text of a database zone may carry an empty name: db_settings_parse() reports it with its own message) */
+        if (tok.type != TOKEN_STRING || !tok.value || (tok.value[0] == '\0' && !ctx->restricted)) {
+          conf_error(ctx, what, "expected a key name after 'key' but found %s", tok_desc(&tok, db, sizeof(db)));
+          free_token(&tok);
+          aml_unref(l);
+          return NULL;
+        }
+        e.kind = AML_E_KEY;
+      } else if (aml_text_is(tok.value, "any")) {
+        e.kind = AML_E_ANY;
+      } else if (aml_text_is(tok.value, "none")) {
+        e.kind = AML_E_NONE;
+      } else if (aml_text_is(tok.value, "localhost")) {
+        e.kind = AML_E_LOCALHOST;
+      } else if (aml_text_is(tok.value, "localnets")) {
+        e.kind = AML_E_LOCALNETS;
+      } else if (cidr_entry_parse(&e.u.net, tok.value)) {
+        e.kind = AML_E_NET;
+      } else {
+        e.kind = AML_E_NAME;
+      }
+      if (e.kind == AML_E_ANY || e.kind == AML_E_NONE || e.kind == AML_E_LOCALHOST || e.kind == AML_E_LOCALNETS) {
+        for (char *p = tok.value; *p; p++) *p = (char)tolower((unsigned char)*p);
+      }
+      e.text = tok.value;
+      tok.value = NULL;
+      free_token(&tok);
+      if (e.kind == AML_E_KEY || e.kind == AML_E_NAME) {
+        e.loc = strdup(loc);
+        if (!e.loc) bad = true;
+      }
+    } else {
+      conf_error(ctx, what, "expected an address, prefix, 'key <name>', an acl name or '{' but found %s", tok_desc(&tok, db, sizeof(db)));
+      free_token(&tok);
+      aml_unref(l);
+      return NULL;
+    }
+    if (!bad) {
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) {
+        conf_error(ctx, what, "expected ';' after the element but found %s", tok_desc(&tok, db, sizeof(db)));
+        free_token(&tok);
+        bad = true;
+      } else {
+        free_token(&tok);
+      }
+    }
+    if (bad || !aml_push(l, &e)) {
+      if (!bad && ctx) ctx->error_occurred = true;
+      free(e.text);
+      free(e.loc);
+      if (e.kind == AML_E_LIST) aml_unref(e.u.list);
+      aml_unref(l);
+      if (ctx) ctx->error_occurred = true;
+      return NULL;
+    }
+  }
+}
+
+/* `{ list };`  (a BIND 9.20 allow-transfer may also carry `port <n>` and `transport <name>` in front of the braces: they restrict the
+ * transfer to a port or a transport, which this server has no way to honour; refusing the statement is safer than ignoring them) */
+static aml_t *parse_aml_statement(token_ctx_t *ctx, const char *what) {
+  char db[96];
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type == TOKEN_STRING && tok.value && (strcmp(tok.value, "port") == 0 || strcmp(tok.value, "transport") == 0)) {
+    conf_error(ctx, what, "'%s' in front of the address list is not supported", tok.value);
+    free_token(&tok);
+    return NULL;
+  }
+  if (tok.type != TOKEN_LBRACE) {
+    conf_error(ctx, what, "expected '{' but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return NULL;
+  }
+  free_token(&tok);
+  aml_t *l = parse_aml_body(ctx, what, 0);
+  if (!l) return NULL;
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) {
+    conf_error(ctx, what, "expected ';' after '}' but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    aml_unref(l);
+    return NULL;
+  }
+  free_token(&tok);
+  return l;
+}
+
+/* The flat string list parse_acl_list() has always built from the same text: a nested { } list is spliced in (a negated one with every
+ * element negated, a double negation positive, `any` dropped inside a negated list), and `key` elements go to keys_out (allow-transfer),
+ * are listed by their name (allow-update) or carry ACL_KEY_MARK (acl blocks).  A negated key cannot be said that way: *inexact. */
+static int aml_flatten(token_ctx_t *ctx, const aml_t *l, bool negate, acl_key_mode_t km, char ***list, int *count,
+                       char ***keys_out, int *keys_count, bool *inexact, int depth) {
+  if (depth > AML_PARSE_DEPTH_MAX) return -1;
+  for (int i = 0; i < l->count; i++) {
+    const aml_elem_t *e = &l->elems[i];
+    bool neg = negate != e->neg;
+    if (e->kind == AML_E_LIST) {
+      if (aml_flatten(ctx, e->u.list, neg, km, list, count, keys_out, keys_count, inexact, depth + 1) != 0) return -1;
+      continue;
+    }
+    if (e->kind == AML_E_KEY) {
+      if (neg) {
+        *inexact = true;
+        continue;
+      }
+      if (km == ACL_KEY_AS_TSIG_FIELD && keys_out && keys_count) {
+        APPEND_STR(*keys_out, *keys_count, strdup(e->text));
+      } else if (km == ACL_KEY_MARKED) {
+        size_t n = strlen(e->text);
+        char *m = malloc(n + 2);
+        if (!m) {
+          if (ctx) ctx->error_occurred = true;
+          return -1;
+        }
+        m[0] = ACL_KEY_MARK;
+        memcpy(m + 1, e->text, n + 1);
+        APPEND_STR(*list, *count, m);
+      } else {
+        APPEND_STR(*list, *count, strdup(e->text));
+      }
+      continue;
+    }
+    if (e->kind == AML_E_ANY && negate) continue;   /* `any` inside a negated list is dropped */
+    size_t n = strlen(e->text);
+    char *v = malloc(n + 2);
+    if (!v) {
+      if (ctx) ctx->error_occurred = true;
+      return -1;
+    }
+    snprintf(v, n + 2, "%s%s", neg ? "!" : "", e->text);
+    APPEND_STR(*list, *count, v);
+  }
+  return 0;
+}
+
+static bool aml_tree_has_key(const aml_t *l, int depth) {
+  if (!l || depth > AML_PARSE_DEPTH_MAX) return false;
+  for (int i = 0; i < l->count; i++) {
+    if (l->elems[i].kind == AML_E_KEY) return true;
+    if (l->elems[i].kind == AML_E_LIST && aml_tree_has_key(l->elems[i].u.list, depth + 1)) return true;
+  }
+  return false;
+}
+
+/* allow-query, allow-query-on, allow-notify at any level, and the lists of options / view: one statement into *slot.  A second
+ * statement in the same block is an error, as in BIND. */
+static int parse_aml_slot(token_ctx_t *ctx, const char *what, aml_t **slot) {
+  if (*slot) {
+    conf_error(ctx, what, "is written twice in the same block");
+    return -1;
+  }
+  aml_t *l = parse_aml_statement(ctx, what);
+  if (!l) return -1;
+  *slot = l;
+  return 0;
+}
+
+/* allow-transfer / allow-update of a zone: the BIND list and the flat lists.  A later statement replaces the earlier one. */
+static int parse_zone_acl_stmt(token_ctx_t *ctx, zone_config_t *zone, zone_ext_t *x, bool transfer) {
+  char what[DNS_NAME_TEXT_SIZE + 32];
+  snprintf(what, sizeof(what), "zone '%.255s' %s", zone->domain ? zone->domain : "", transfer ? "allow-transfer" : "allow-update");
+  aml_t *l = parse_aml_statement(ctx, what);
+  if (!l) return -1;
+  char ***list = transfer ? &x->allow_transfer : &x->allow_update;
+  int *count = transfer ? &x->allow_transfer_count : &x->allow_update_count;
+  acl_entry_t **parsed = transfer ? &x->allow_transfer_parsed : &x->allow_update_parsed;
+  for (int i = 0; i < *count; i++) free((*list)[i]);
+  free(*list);
+  free(*parsed);
+  *list = NULL;
+  *parsed = NULL;
+  *count = 0;
+  if (transfer) {
+    for (int i = 0; i < x->tsig_keys_count; i++) free(x->tsig_keys[i]);
+    free(x->tsig_keys);
+    x->tsig_keys = NULL;
+    x->tsig_keys_count = 0;
+  }
+  bool inexact = false;
+  if (aml_flatten(ctx, l, false, transfer ? ACL_KEY_AS_TSIG_FIELD : ACL_KEY_AS_LIST_ENTRY, list, count,
+                  transfer ? &x->tsig_keys : NULL, transfer ? &x->tsig_keys_count : NULL, &inexact, 0) != 0) {
+    aml_unref(l);
+    return -1;
+  }
+  *parsed = acl_list_parse(*list, *count);
+  /* a negated key cannot be written in the flat lists: the list has_neg_key once resolved and zone_settings_render() then writes
+   * `none`; the settings text of a database zone has only the flat lists, so it is refused there */
+  if (inexact && ctx->restricted) {
+    conf_error(ctx, what, "a negated key is not allowed here");
+    aml_unref(l);
+    return -1;
+  }
+  aml_t **slot = transfer ? &x->acl.transfer : &x->acl.update;
+  aml_unref(*slot);
+  /* the settings text of a database zone is read without the rest of the configuration: it keeps the flat lists only */
+  if (ctx->restricted) {
+    aml_unref(l);
+    *slot = NULL;
+  } else {
+    *slot = l;
+  }
+  return 0;
 }
 
 /* port <n>: 1..65535 */
@@ -2311,18 +2779,19 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
         free_zone_config(zone);
         return -1;
       }
-    } else if (strcmp(key, "allow-transfer") == 0) {
-      if (parse_acl_list(ctx, &x->allow_transfer, &x->allow_transfer_count, ACL_KEY_AS_TSIG_FIELD, &x->tsig_keys, &x->tsig_keys_count) != 0) {
+    } else if (strcmp(key, "allow-transfer") == 0 || strcmp(key, "allow-update") == 0) {
+      if (parse_zone_acl_stmt(ctx, zone, x, key[6] == 't') != 0) {
         free(key); free_zone_config(zone); return -1;
       }
-      free(x->allow_transfer_parsed);
-      x->allow_transfer_parsed = acl_list_parse(x->allow_transfer, x->allow_transfer_count);
-    } else if (strcmp(key, "allow-update") == 0) {
-      if (parse_acl_list(ctx, &x->allow_update, &x->allow_update_count, ACL_KEY_AS_LIST_ENTRY, NULL, NULL) != 0) {
+    } else if (strcmp(key, "allow-query") == 0 || strcmp(key, "allow-query-on") == 0 || strcmp(key, "allow-notify") == 0) {
+      /* BIND 9.20 ARM: a zone's statement overrides the view's and options' */
+      char awhat[DNS_NAME_TEXT_SIZE + 32];
+      snprintf(awhat, sizeof(awhat), "zone '%.255s' %s", zone->domain ? zone->domain : "", key);
+      aml_t **slot = strcmp(key, "allow-query") == 0 ? &x->acl.query
+                     : strcmp(key, "allow-query-on") == 0 ? &x->acl.query_on : &x->acl.notify;
+      if (parse_aml_slot(ctx, awhat, slot) != 0) {
         free(key); free_zone_config(zone); return -1;
       }
-      free(x->allow_update_parsed);
-      x->allow_update_parsed = acl_list_parse(x->allow_update, x->allow_update_count);
     } else if (strcmp(key, "type") == 0 || strcmp(key, "file") == 0 ||
                strcmp(key, "file-format") == 0 ||
                strcmp(key, "tsig-key") == 0 ||
@@ -3987,6 +4456,19 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key);
             return -1;
           }
+        } else if (strcmp(key, "allow-query") == 0 || strcmp(key, "allow-query-on") == 0 || strcmp(key, "allow-transfer") == 0 ||
+                   strcmp(key, "allow-update") == 0 || strcmp(key, "allow-notify") == 0) {
+          /* BIND 9.20 ARM: the default of every zone (a view's or a zone's own statement overrides it) */
+          char owhat[48];
+          snprintf(owhat, sizeof(owhat), "options %s", key);
+          aml_t **slot = strcmp(key, "allow-query") == 0 ? &config->acl.query
+                         : strcmp(key, "allow-query-on") == 0 ? &config->acl.query_on
+                         : strcmp(key, "allow-transfer") == 0 ? &config->acl.transfer
+                         : strcmp(key, "allow-update") == 0 ? &config->acl.update : &config->acl.notify;
+          if (parse_aml_slot(ctx, owhat, slot) != 0) {
+            free(key);
+            return -1;
+          }
         } else if (strcmp(key, "control-channel") == 0) {
           /* D17-3: it used to be skipped like any unknown option, so the control socket silently did not exist.  It is a
            * top-level statement (like in the sample configuration); say so instead of ignoring it. */
@@ -4039,8 +4521,21 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         if (tok.type != TOKEN_STRING) { free_partial_view(view); free_token(&tok); return -1; }
         if (strcmp(tok.value, "match-clients") == 0) {
           free_token(&tok);
-          if (parse_acl_list(ctx, &view->match_clients, &view->match_clients_count,
-                             ACL_KEY_REJECT, NULL, NULL) != 0) {
+          char mwhat[KARIDNS_VIEW_NAME_MAX + 32];
+          snprintf(mwhat, sizeof(mwhat), "view '%s' match-clients", view->name);
+          if (parse_aml_slot(ctx, mwhat, &view->acl.match) != 0) {
+            free_partial_view(view);
+            return -1;
+          }
+          /* match-clients is evaluated on the client address alone: a `key` element would never match, which is a mistake to report */
+          if (aml_tree_has_key(view->acl.match, 0)) {
+            conf_error(ctx, mwhat, "'key' entries are not supported in match-clients (address match only)");
+            free_partial_view(view);
+            return -1;
+          }
+          bool mclients_inexact = false;
+          if (aml_flatten(ctx, view->acl.match, false, ACL_KEY_REJECT, &view->match_clients, &view->match_clients_count,
+                          NULL, NULL, &mclients_inexact, 0) != 0) {
             free_partial_view(view);
             return -1;
           }
@@ -4064,6 +4559,21 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           view->also_notify_count = 0;
           view->also_notify_set = true;
           if (parse_notify_targets(ctx, vwhat, &view->also_notify, &view->also_notify_count, false) != 0) {
+            free_partial_view(view);
+            return -1;
+          }
+        } else if (strcmp(tok.value, "allow-query") == 0 || strcmp(tok.value, "allow-query-on") == 0 ||
+                   strcmp(tok.value, "allow-transfer") == 0 || strcmp(tok.value, "allow-update") == 0 ||
+                   strcmp(tok.value, "allow-notify") == 0) {
+          /* overrides options' statement for the zones of this view that have none of their own (BIND 9.20 ARM) */
+          char vawhat[KARIDNS_VIEW_NAME_MAX + 48];
+          snprintf(vawhat, sizeof(vawhat), "view '%s' %s", view->name, tok.value);
+          aml_t **slot = strcmp(tok.value, "allow-query") == 0 ? &view->acl.query
+                         : strcmp(tok.value, "allow-query-on") == 0 ? &view->acl.query_on
+                         : strcmp(tok.value, "allow-transfer") == 0 ? &view->acl.transfer
+                         : strcmp(tok.value, "allow-update") == 0 ? &view->acl.update : &view->acl.notify;
+          free_token(&tok);
+          if (parse_aml_slot(ctx, vawhat, slot) != 0) {
             free_partial_view(view);
             return -1;
           }
@@ -4197,7 +4707,14 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         if (ctx) ctx->error_occurred = true;
         return -1;
       }
-      if (parse_acl_list(ctx, &acl->entries, &acl->count, ACL_KEY_MARKED, NULL, NULL) != 0) return -1;
+      {
+        char awhat[DNS_NAME_TEXT_SIZE + 16];
+        snprintf(awhat, sizeof(awhat), "acl '%.255s'", acl->name);
+        acl->aml = parse_aml_statement(ctx, awhat);
+        if (!acl->aml) return -1;
+        bool inexact = false;
+        if (aml_flatten(ctx, acl->aml, false, ACL_KEY_MARKED, &acl->entries, &acl->count, NULL, NULL, &inexact, 0) != 0) return -1;
+      }
     } else if (strcmp(tok.value, "key") == 0) {
       free_token(&tok);
       tok = get_next_token(ctx);
@@ -4875,6 +5392,9 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
     }
   }
 
+  /* BIND address match lists: names, keys and flags (before the flat lists below: its messages carry file:line) */
+  if (resolve_all_acl_lists(ctx, config) != 0) return -1;
+
   /* D-22: 名前付き ACL の参照を展開し、アドレスでも ACL 名でもない要素を設定エラーにする。
    */
   {
@@ -5129,7 +5649,7 @@ size_t zone_settings_render(const server_config_t *cfg, const zone_config_t *zcf
   /* allow-transfer: the addresses, the keys, and (file zone of type master) the zone's tsig-key, which also may transfer */
   const char *zone_key = (is_master && !ceil && x->tsig_key) ? x->tsig_key : NULL;
   if (x->allow_transfer_count > 0 || x->tsig_keys_count > 0 || zone_key) {
-    if (no_ceiling) {
+    if (no_ceiling || (x->acl.transfer && x->acl.transfer->has_neg_key)) {   /* a negated key cannot be written in the flat form: nobody */
       rs_add(&r, "allow-transfer { none; };\n");
     } else {
       rs_acl(&r, "allow-transfer", x->allow_transfer, x->allow_transfer_count, x->tsig_keys, x->tsig_keys_count, zone_key, ceil, cfg);
@@ -5265,6 +5785,7 @@ static zone_ext_t *zone_ext_clone(const zone_ext_t *s) {
   d->notify_source = NULL;
   d->allow_transfer = NULL; d->allow_transfer_count = 0; d->allow_transfer_parsed = NULL;
   d->allow_update = NULL; d->allow_update_count = 0; d->allow_update_parsed = NULL;
+  acl_set_copy(&d->acl, &s->acl);   /* the lists are immutable: shared by reference */
   d->rrl.exempt_clients = NULL; d->rrl.exempt_clients_count = 0; d->rrl.exempt_clients_parsed = NULL;
   d->program_path = NULL; d->program_args = NULL; d->program_args_count = 0; d->program_user = NULL;
   d->forwarders = NULL; d->forwarders_count = 0;
@@ -5359,7 +5880,8 @@ zone_config_t *zone_config_with_received(const char *domain, const zone_config_t
   const zone_ext_t *b = zext(base);
   /* precedence: a statement written in the secondary's own zone {} > the received one > options (the lookups fall back to options
    * where the zone has no value) */
-  if (rx && b->allow_transfer_count == 0 && b->tsig_keys_count == 0 && rx->allow_transfer_count + rx->tsig_keys_count > 0) {
+  if (rx && b->allow_transfer_count == 0 && b->tsig_keys_count == 0 && !b->acl.transfer &&
+      rx->allow_transfer_count + rx->tsig_keys_count > 0) {
     if (!zx_take_acl(x, rx, note, notelen, cfg)) {
       free_zone_config(c);
       return NULL;
