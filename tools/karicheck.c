@@ -788,6 +788,17 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
         return 1;
     }
 
+    /* what listen-on / listen-on-v6 / bind-address come to on this host (the interfaces of this machine, as karidns takes them at start-up) */
+    if (cfg->listen_count > 0) {
+        printf("[INFO] Listening (UDP and TCP) on:");
+        for (int li = 0; li < cfg->listen_count; li++)
+            if (cfg->listen[li].family == AF_INET6)
+                printf(" [%s]:%u", cfg->listen[li].text, (unsigned)cfg->listen[li].port);
+            else
+                printf(" %s:%u", cfg->listen[li].text, (unsigned)cfg->listen[li].port);
+        printf("\n");
+    }
+
     if (cfg->directory) {
         /* karidns opens options { directory } at start-up and refuses to start without it */
         struct stat dst;
@@ -908,12 +919,12 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
                 return 1;
             }
             // 自己ループ検知: forwarders のいずれかが自分自身の
-            // bind-address:port と一致していないか確認する
+            // listen address:port と一致していないか確認する
             for (int fi = 0; fi < zx->forwarders_count; fi++) {
-                if (cfg->bind_addresses) {
-                    for (int bi = 0; bi < cfg->bind_address_count; bi++) {
-                        if (strcmp(zx->forwarders[fi].ip, cfg->bind_addresses[bi]) == 0 &&
-                            (zx->forwarders[fi].port == cfg->port || zx->forwarders[fi].port == 0)) {
+                if (cfg->listen) {
+                    for (int bi = 0; bi < cfg->listen_count; bi++) {
+                        if (strcmp(zx->forwarders[fi].ip, cfg->listen[bi].text) == 0 &&
+                            (zx->forwarders[fi].port == cfg->listen[bi].port || zx->forwarders[fi].port == 0)) {
                             fprintf(stderr,
                                 "[WARNING] Zone '%s': forwarder '%s:%d' appears to point back "
                                 "at this server itself (self-loop risk).\n",

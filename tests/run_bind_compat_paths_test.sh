@@ -238,7 +238,8 @@ if [ $RC -eq 0 ] && ! echo "$OUT" | grep -q "\[ERROR\]"; then pass "karicheck co
 for t in hint mirror static-stub redirect; do
     echo "$OUT" | grep -q "type '$t' is a BIND zone type.*is not loaded" && pass "karicheck conf warns about type $t" || fail "no warning for type $t: $OUT"
 done
-echo "$OUT" | grep -q "'listen-on' is a BIND option that KariDNS does not implement" && pass "listen-on is a warning" || fail "no listen-on warning"
+echo "$OUT" | grep -q "listen-on' is a BIND option" && fail "listen-on is still reported as unimplemented: $OUT" || pass "listen-on is implemented (no warning)"
+(echo "$OUT" | grep -qF "Listening (UDP and TCP) on: 127.0.0.1:$P2 [::1]:$P2") && pass "karicheck conf shows the addresses listen-on and bind-address come to" || fail "no listen address line: $OUT"
 echo "$OUT" | grep -q "\[WARNING\]" && pass "the stock configuration passes with warnings only" || fail "no warnings at all?"
 "$KARIDNS" -f -c "$W/etc/s2.conf" > "$W/s2.log" 2>&1 &
 PIDS="$PIDS $!"

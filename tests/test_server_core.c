@@ -1410,6 +1410,20 @@ static void test_sendmmsg_skip_failed(void) {
     printf("  -> sendmmsg_skip_failed passed.\n");
 }
 
+/* a configuration built by hand: listen on one IPv4 address (what config_build_listen() would have computed) */
+static void test_set_listen(server_config_t *cfg, const char *ip, int port) {
+    static listen_addr_t entries[8];
+    static int next;
+    listen_addr_t *e = &entries[next++ % 8];
+    memset(e, 0, sizeof(*e));
+    e->family = AF_INET;
+    assert(inet_pton(AF_INET, ip, e->addr) == 1);
+    e->port = (uint16_t)port;
+    snprintf(e->text, sizeof(e->text), "%s", ip);
+    cfg->listen = e;
+    cfg->listen_count = 1;
+}
+
 static void test_open_router_udp_sockets_and_buffers(void) {
     printf("[TEST] Server Core: open_router_udp_sockets & setup_udp_socket_buffers...\n");
 
@@ -1421,9 +1435,7 @@ static void test_open_router_udp_sockets_and_buffers(void) {
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.port = 35353;
-    const char *binds[1] = {"127.0.0.1"};
-    cfg.bind_addresses = (char **)binds;
-    cfg.bind_address_count = 1;
+    test_set_listen(&cfg, "127.0.0.1", 35353);
     cfg.udp_recvbuf_size = 524288;
     cfg.udp_sndbuf_size = 524288;
 
@@ -2039,10 +2051,8 @@ static void nonroot_startup_checks(void) {
 
     /* 1024未満のポートは非rootでは bind できず、起動前検証で拒否される */
     memset(&cfg, 0, sizeof(cfg));
-    char *binds[1] = { "127.0.0.1" };
-    cfg.bind_addresses = binds;
-    cfg.bind_address_count = 1;
     cfg.port = 53;
+    test_set_listen(&cfg, "127.0.0.1", 53);
     assert(!preflight_listen_ports(&cfg));
 }
 
@@ -2115,10 +2125,8 @@ static void test_nonroot_startup_identity_and_preflight(void) {
 
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
-    char *binds[1] = { "127.0.0.1" };
-    cfg.bind_addresses = binds;
-    cfg.bind_address_count = 1;
     cfg.port = busy_port;
+    test_set_listen(&cfg, "127.0.0.1", busy_port);
     assert(!preflight_listen_ports(&cfg));
     close(busy);
 
@@ -2131,6 +2139,7 @@ static void test_nonroot_startup_identity_and_preflight(void) {
     assert(getsockname(probe, (struct sockaddr *)&sa, &salen) == 0);
     close(probe);
     cfg.port = ntohs(sa.sin_port);
+    test_set_listen(&cfg, "127.0.0.1", cfg.port);
     assert(preflight_listen_ports(&cfg));
 
     /* ログファイルを開けなければ init_logging_channels は false を返す */
