@@ -1735,6 +1735,158 @@ static int bind_address_check(token_ctx_t *ctx, server_config_t *cfg, int first_
   return 0;
 }
 
+/* "file:line" of the token read last, as the `loc` of conf_warn_loc() */
+static void conf_warn_here(const token_ctx_t *ctx, const char *what, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void conf_warn_here(const token_ctx_t *ctx, const char *what, const char *fmt, ...) {
+  char loc[300], msg[300];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  ctx_location(ctx, loc, sizeof(loc));
+  conf_warn_loc(loc, what, "%s", msg);
+}
+
+/* tcp-initial-timeout, tcp-idle-timeout, tcp-keepalive-timeout, tcp-advertised-timeout (BIND 9.20 lib/isccfg/namedconf.c: cfg_type_uint32;
+ * bin/named/server.c: the value * 100 is milliseconds, MIN_/MAX_*_TIMEOUT).  BIND's unit is 100 ms and a value outside [min, max] is
+ * raised / lowered with a warning (the same messages).  KariDNS's own earlier unit was the millisecond, so a number written with the suffix
+ * `ms` (`10000ms`) is still taken as milliseconds, unchanged (no clamping: the operator wrote the exact value).  The decision for the two
+ * options that existed before (2026-10-29, plan A): a bare number above BIND's maximum of 1200 (120 s) is almost certainly an old value
+ * in milliseconds, which BIND would lower to 120 s without a word of explanation; here it is an error that names the `ms` suffix.
+ * Reads the value and the semicolon.  *out_ms is the timeout in milliseconds. */
+static int parse_tcp_timeout(token_ctx_t *ctx, const char *key, uint32_t min_units, uint32_t max_units, bool over_is_error,
+                             uint32_t *out_ms) {
+  char what[48];
+  snprintf(what, sizeof(what), "options %s", key);
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+  const char *s = tok.value;
+  size_t nd = 0;
+  while (s[nd] >= '0' && s[nd] <= '9') nd++;
+  bool ms = (s[nd] != '\0' && strcasecmp(s + nd, "ms") == 0);
+  uint64_t v = 0;
+  if (nd == 0 || nd > 10 || (s[nd] != '\0' && !ms) || (v = strtoull(s, NULL, 10)) > UINT32_MAX) {
+    conf_error(ctx, what, "invalid value '%.64s' (expected a non-negative integer in units of 100 ms, or a number of milliseconds followed by \"ms\")", s);
+    free_token(&tok);
+    return -1;
+  }
+  uint32_t res;
+  if (ms) {
+    res = (uint32_t)v;
+  } else {
+    if (v > max_units) {
+      if (over_is_error) {
+        conf_error(ctx, what, "%llu is more than the maximum of %u (%u seconds): a number without a unit is in units of 100 ms, as in BIND; "
+                   "if %llu milliseconds were meant, write %llums", (unsigned long long)v, max_units, max_units / 10,
+                   (unsigned long long)v, (unsigned long long)v);
+        free_token(&tok);
+        return -1;
+      }
+      conf_warn_here(ctx, what, "value is out of range: lowering to %u", max_units);
+      v = max_units;
+    } else if (v < min_units) {
+      conf_warn_here(ctx, what, "value is out of range: raising to %u", min_units);
+      v = min_units;
+    }
+    res = (uint32_t)(v * 100);
+  }
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  free_token(&tok);
+  *out_ms = res;
+  return 0;
+}
+
+/* minimal-responses (BIND 9.20 lib/isccfg/namedconf.c: `( no-auth | no-auth-recursive | <boolean> )`, bin/named/server.c: the value of the
+ * boolean decides yes / no, the words select dns_minimal_noauth / dns_minimal_noauthrec).  Reads the value and the semicolon. */
+static int parse_minimal_responses(token_ctx_t *ctx, const char *what, uint8_t *out) {
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+  bool b;
+  if (strcasecmp(tok.value, "no-auth") == 0) {
+    *out = MINIMAL_NO_AUTH;
+  } else if (strcasecmp(tok.value, "no-auth-recursive") == 0) {
+    *out = MINIMAL_NO_AUTH_RECURSIVE;
+  } else if (parse_config_bool(tok.value, &b)) {
+    *out = b ? MINIMAL_YES : MINIMAL_NO;
+  } else {
+    conf_error(ctx, what, "minimal-responses: invalid value '%.64s' (expected yes, no, no-auth or no-auth-recursive)", tok.value);
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  free_token(&tok);
+  return 0;
+}
+
+/* version, hostname (`( <quoted_string> | none )`: a quoted "none" is the text none) and server-id (`( <quoted_string> | none | hostname )`);
+ * the key has been read.  The texts are cut at 255 octets, one TXT character-string (BIND puttxt()). */
+static int parse_chaos_statement(token_ctx_t *ctx, server_config_t *cfg, const char *key) {
+  char what[32];
+  snprintf(what, sizeof(what), "options %s", key);
+  chaos_cfg_t *c = &cfg->chaos;
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+  bool is_sid = strcmp(key, "server-id") == 0;
+  bool none = !tok.is_quoted && strcasecmp(tok.value, "none") == 0;
+  bool host = is_sid && !tok.is_quoted && strcasecmp(tok.value, "hostname") == 0;
+  char *text = is_sid ? c->server_id : key[0] == 'v' ? c->version : c->hostname;
+  text[0] = '\0';
+  if (!none && !host) {
+    size_t n = strlen(tok.value);
+    if (n > CHAOS_TXT_MAX) {
+      conf_warn_here(ctx, what, "the text is longer than %d octets: it is cut (a TXT character-string holds at most %d)", CHAOS_TXT_MAX, CHAOS_TXT_MAX);
+      n = CHAOS_TXT_MAX;
+    }
+    memcpy(text, tok.value, n);
+    text[n] = '\0';
+  }
+  if (is_sid) {
+    c->server_id_set = true;
+    c->server_id_none = none;
+    c->server_id_hostname = host;
+  } else if (key[0] == 'v') {
+    c->version_set = true;
+    c->version_none = none;
+  } else {
+    c->hostname_set = true;
+    c->hostname_none = none;
+  }
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  free_token(&tok);
+  return 0;
+}
+
+/* When the parse ends: the texts version.bind, hostname.bind and id.server serve (bin/named/builtin.c version_lookup(), hostname_lookup(),
+ * id_lookup(): not written = the product version, the host name, nothing; `none` = no TXT record).  server-id is also the NSID of the
+ * responses (lib/ns/client.c: server_id, else the host name when server-id is `hostname`), so a different `nsid` is a mistake. */
+static int chaos_finish(token_ctx_t *ctx, server_config_t *cfg) {
+  chaos_cfg_t *c = &cfg->chaos;
+  char hn[256];
+  bool have_hn = gethostname(hn, sizeof(hn)) == 0;
+  hn[sizeof(hn) - 1] = '\0';
+  c->has_version = !(c->version_set && c->version_none);
+  snprintf(c->r_version, sizeof(c->r_version), "%s", c->version_set ? c->version : KARIDNS_VERSION);
+  c->has_hostname = !(c->hostname_set && c->hostname_none) && (c->hostname_set || have_hn);
+  snprintf(c->r_hostname, sizeof(c->r_hostname), "%s", c->hostname_set ? c->hostname : hn);
+  c->has_id = c->server_id_set && !c->server_id_none && (!c->server_id_hostname || have_hn);
+  snprintf(c->r_id, sizeof(c->r_id), "%s", c->server_id_hostname ? hn : c->server_id);
+  if (c->has_id) {
+    if (cfg->nsid_string && strcmp(cfg->nsid_string, c->r_id) != 0) {
+      conf_error(ctx, "options server-id", "server-id '%.64s' is also the NSID of the responses, but nsid says '%.64s'; write one of them, or the same text in both",
+                 c->r_id, cfg->nsid_string);
+      return -1;
+    }
+    if (!cfg->nsid_string && (cfg->nsid_string = strdup(c->r_id)) == NULL) return -1;
+  }
+  return 0;
+}
+
 /* `listen-on [port n] [proxy x] [tls x] [http x] { list };`  The key has been read.  BIND 9.20 (lib/isccfg/namedconf.c, listenon_tuple_fields)
  * takes the four keywords in any order; `port` is an integer.  proxy (PROXYv2), tls (DoT) and http (DoH) need listeners this server does not
  * have: refusing the statement is safer than listening in plain DNS where the operator asked for an encrypted or proxied listener. */
@@ -2882,6 +3034,184 @@ static const struct { const char *name; uint32_t bit; int src; } k_xo_options[] 
   {"multi-master", XO_B_MULTI_MASTER, -1},
 };
 
+/* ---- Batch 7: max-records, max-records-per-type, max-types-per-name, max-zone-ttl, serial-update-method, masterfile-format and the check-* family
+ * in options { }, view { } and zone { }.  Grammar from BIND 9.20.4 lib/isccfg/namedconf.c (zone_clauses, view_clauses, checknames_fields,
+ * checkmode_enums, warn_enums, masterformat_enums, maxduration), defaults from bin/named/config.c. ---- */
+static const struct { const char *name; int chk; } k_zv_checks[] = {   /* chk >= 0: ZC_*; the kind of value is in parse_zv_option() */
+  {"check-dup-records", ZC_DUP_RECORDS}, {"check-integrity", ZC_INTEGRITY}, {"check-mx", ZC_MX}, {"check-mx-cname", ZC_MX_CNAME},
+  {"check-sibling", ZC_SIBLING}, {"check-spf", ZC_SPF}, {"check-srv-cname", ZC_SRV_CNAME}, {"check-svcb", ZC_SVCB}, {"check-wildcard", ZC_WILDCARD},
+};
+
+static bool zv_option_name(const char *key) {
+  static const char *const names[] = { "max-records", "max-records-per-type", "max-types-per-name", "max-zone-ttl", "serial-update-method",
+                                       "masterfile-format", "check-names", NULL };
+  for (size_t i = 0; names[i]; i++)
+    if (strcmp(names[i], key) == 0) return true;
+  for (size_t i = 0; i < sizeof(k_zv_checks) / sizeof(k_zv_checks[0]); i++)
+    if (strcmp(k_zv_checks[i].name, key) == 0) return true;
+  return false;
+}
+
+/* fail / warn / ignore (checkmode); allow_fail = false: warn / ignore only (warn_enums, check-spf) */
+static bool zv_parse_mode(const char *s, bool allow_fail, uint8_t *out) {
+  if (strcasecmp(s, "warn") == 0) { *out = CHK_WARN; return true; }
+  if (strcasecmp(s, "ignore") == 0) { *out = CHK_IGNORE; return true; }
+  if (allow_fail && strcasecmp(s, "fail") == 0) { *out = CHK_FAIL; return true; }
+  return false;
+}
+
+/* a non-negative integer of at most 10 digits that fits in 32 bits (cfg_type_uint32) */
+static bool zv_parse_u32(const char *s, uint32_t *out) {
+  size_t n = 0;
+  while (s[n] >= '0' && s[n] <= '9') n++;
+  if (n == 0 || n > 10 || s[n] != '\0') return false;
+  unsigned long long v = strtoull(s, NULL, 10);
+  if (v > UINT32_MAX) return false;
+  *out = (uint32_t)v;
+  return true;
+}
+
+/* One statement of this family: `key` has been read and zv_option_name(key) holds.  The value and the ';' are read here.  A later statement of
+ * the same name replaces the earlier one.  0 = done, -1 = error (reported).  zone_level: the zone { } form of check-names (a bare mode). */
+static int parse_zv_option(token_ctx_t *ctx, const char *what, const char *key, zone_vopts_t *zv, bool zone_level) {
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+  uint32_t u = 0;
+  uint8_t mode = 0;
+  if (strcmp(key, "max-records") == 0 || strcmp(key, "max-records-per-type") == 0 || strcmp(key, "max-types-per-name") == 0) {
+    if (!zv_parse_u32(tok.value, &u)) {
+      conf_error(ctx, what, "%s: invalid value '%.64s' (expected an integer from 0 to 4294967295; 0 is no limit)", key, tok.value);
+      free_token(&tok);
+      return -1;
+    }
+    if (strcmp(key, "max-records") == 0) { zv->max_records = u; zv->set |= ZV_MAX_RECORDS; }
+    else if (strcmp(key, "max-records-per-type") == 0) { zv->max_per_type = u; zv->set |= ZV_MAX_PER_TYPE; }
+    else { zv->max_types_per_name = u; zv->set |= ZV_MAX_TYPES_PER_NAME; }
+  } else if (strcmp(key, "max-zone-ttl") == 0) {
+    /* maxduration: `unlimited`, or a duration -- ISO 8601 (P1D) or a TTL value (1d, 3600).  Only the TTL form is read; an ISO 8601 value is
+     * refused rather than guessed. */
+    if (strcasecmp(tok.value, "unlimited") == 0) {
+      u = 0;
+    } else if (tok.value[0] == 'P' || tok.value[0] == 'p') {
+      conf_error(ctx, what, "max-zone-ttl: ISO 8601 durations (\"%.32s\") are not supported; write the value in seconds or with the units s, m, h, d, w (for example 1d)",
+                 tok.value);
+      free_token(&tok);
+      return -1;
+    } else if (!parse_ttl_strict(tok.value, UINT32_MAX, &u)) {
+      conf_error(ctx, what, "max-zone-ttl: invalid value '%.64s' (expected unlimited, a number of seconds, or a TTL with the units s, m, h, d, w)", tok.value);
+      free_token(&tok);
+      return -1;
+    }
+    zv->max_zone_ttl = u;
+    zv->set |= ZV_MAX_ZONE_TTL;
+  } else if (strcmp(key, "serial-update-method") == 0) {
+    if (strcasecmp(tok.value, "increment") == 0) zv->serial_method = SUM_INCREMENT;
+    else if (strcasecmp(tok.value, "unixtime") == 0) zv->serial_method = SUM_UNIXTIME;
+    else if (strcasecmp(tok.value, "date") == 0) zv->serial_method = SUM_DATE;
+    else {
+      conf_error(ctx, what, "serial-update-method: invalid value '%.64s' (expected increment, unixtime or date)", tok.value);
+      free_token(&tok);
+      return -1;
+    }
+    zv->set |= ZV_SERIAL_METHOD;
+  } else if (strcmp(key, "masterfile-format") == 0) {
+    /* masterformat_enums: raw, text.  KariDNS reads text zone files only; a raw file read as text would fail in a confusing way (or be
+     * taken for something else), so raw is refused here (decision 2026-10-29). */
+    if (strcasecmp(tok.value, "raw") == 0) {
+      conf_error(ctx, what, "masterfile-format raw is not supported: KariDNS reads zone files in text format only (masterfile-format text)");
+      free_token(&tok);
+      return -1;
+    }
+    if (strcasecmp(tok.value, "text") != 0) {
+      conf_error(ctx, what, "masterfile-format: invalid value '%.64s' (expected text or raw; only text is supported)", tok.value);
+      free_token(&tok);
+      return -1;
+    }
+  } else if (strcmp(key, "check-names") == 0) {
+    int ci = -1;
+    if (!zone_level) {   /* options / view: check-names (primary | master | secondary | slave | response) (fail | warn | ignore) */
+      if (strcasecmp(tok.value, "primary") == 0 || strcasecmp(tok.value, "master") == 0) ci = ZC_NAMES_PRIMARY;
+      else if (strcasecmp(tok.value, "secondary") == 0 || strcasecmp(tok.value, "slave") == 0) ci = ZC_NAMES_SECONDARY;
+      else if (strcasecmp(tok.value, "response") == 0) ci = ZC_NAMES_RESPONSE;
+      else {
+        conf_error(ctx, what, "check-names: invalid type '%.64s' (expected primary, master, secondary, slave or response)", tok.value);
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+    }
+    if (!zv_parse_mode(tok.value, true, &mode)) {
+      conf_error(ctx, what, "check-names: invalid mode '%.64s' (expected fail, warn or ignore)", tok.value);
+      free_token(&tok);
+      return -1;
+    }
+    if (zone_level) { zv->zone_check_names = mode; zv->set |= ZV_ZONE_CHECK_NAMES; }
+    else { zv->chk[ci] = mode; zv->set |= ZV_CHK(ci); }
+  } else {
+    int ci = -1;
+    for (size_t i = 0; i < sizeof(k_zv_checks) / sizeof(k_zv_checks[0]); i++)
+      if (strcmp(k_zv_checks[i].name, key) == 0) ci = k_zv_checks[i].chk;
+    bool boolean = ci == ZC_INTEGRITY || ci == ZC_SIBLING || ci == ZC_SVCB || ci == ZC_WILDCARD;   /* cfg_type_boolean */
+    bool b;
+    if (boolean ? parse_config_bool(tok.value, &b) : zv_parse_mode(tok.value, ci != ZC_SPF, &mode)) {
+      if (boolean) mode = b ? CHK_FAIL : CHK_IGNORE;
+      zv->chk[ci] = mode;
+      zv->set |= ZV_CHK(ci);
+    } else {
+      conf_error(ctx, what, "%s: invalid value '%.64s' (expected %s)", key, tok.value, boolean ? "yes or no" : ci == ZC_SPF ? "warn or ignore" : "fail, warn or ignore");
+      free_token(&tok);
+      return -1;
+    }
+    /* checks that KariDNS does not have: the value is read, and said to have no effect (nothing is checked, nothing is silently different) */
+    if (ci == ZC_SIBLING || ci == ZC_SVCB || ci == ZC_SPF)
+      conf_warn_here(ctx, what, "%s is accepted, no effect in KariDNS (zone_lint has no such check)", key);
+  }
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  free_token(&tok);
+  return 0;
+}
+
+static const zone_vopts_t *zv_of_view(const server_config_t *cfg, const char *view_name) {
+  if (!cfg || !view_name || !view_name[0]) return NULL;
+  for (const view_config_t *v = cfg->views; v; v = v->next)
+    if (strcasecmp(v->name, view_name) == 0) return &v->zv;
+  return NULL;
+}
+
+void zone_vopts_effective(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, zone_veff_t *out) {
+  memset(out, 0, sizeof(*out));
+  for (int i = 0; i < ZC_N; i++) out->chk[i] = CHK_DEFAULT;
+  out->serial_method = SUM_INCREMENT;
+  const zone_vopts_t *lv[3] = { zone ? &zext(zone)->zv : NULL, zv_of_view(cfg, view_name), cfg ? &cfg->zv : NULL };
+  uint32_t done = 0;
+  for (int i = 0; i < 3; i++) {
+    const zone_vopts_t *l = lv[i];
+    if (!l) continue;
+    uint32_t w = l->set & ~done;
+    if (w & ZV_MAX_RECORDS) out->max_records = l->max_records;
+    if (w & ZV_MAX_PER_TYPE) out->max_per_type = l->max_per_type;
+    if (w & ZV_MAX_TYPES_PER_NAME) out->max_types_per_name = l->max_types_per_name;
+    if (w & ZV_MAX_ZONE_TTL) out->max_zone_ttl = l->max_zone_ttl;
+    if (w & ZV_SERIAL_METHOD) out->serial_method = l->serial_method;
+    for (int c = 0; c < ZC_N; c++)
+      if (w & ZV_CHK(c)) out->chk[c] = l->chk[c];
+    done |= l->set;
+  }
+  /* check-names: the zone's own value, else the primary / secondary one of the view, else of options (bin/named/zoneconf.c checknames()) */
+  out->check_names = CHK_DEFAULT;
+  if (zone && (zext(zone)->zv.set & ZV_ZONE_CHECK_NAMES)) {
+    out->check_names = zext(zone)->zv.zone_check_names;
+  } else {
+    const char *type = zone && zone->type ? zone->type : "primary";
+    int ci = (strcasecmp(type, "secondary") == 0 || strcasecmp(type, "slave") == 0) ? ZC_NAMES_SECONDARY : ZC_NAMES_PRIMARY;
+    out->check_names = out->chk[ci];
+  }
+}
+
 static bool xo_option_name(const char *key) {
   for (size_t i = 0; i < sizeof(k_xo_options) / sizeof(k_xo_options[0]); i++)
     if (strcmp(k_xo_options[i].name, key) == 0) return true;
@@ -3123,6 +3453,17 @@ static const xfr_opts_t *xo_of_view(const server_config_t *cfg, const char *view
   for (const view_config_t *v = cfg->views; v; v = v->next)
     if (strcasecmp(v->name, view_name) == 0) return &v->xo;
   return NULL;
+}
+
+void zone_limits_effective(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, zone_limits_t *out) {
+  zone_veff_t v;
+  zone_vopts_effective(cfg, zone, view_name, &v);
+  out->max_records = v.max_records;
+  out->max_per_type = v.max_per_type;
+  out->max_types_per_name = v.max_types_per_name;
+  /* BIND: max-zone-ttl is a primary zone's option (zone_clauses: CFG_ZONE_PRIMARY) */
+  const char *type = zone && zone->type ? zone->type : "primary";
+  out->max_zone_ttl = (strcasecmp(type, "primary") == 0 || strcasecmp(type, "master") == 0) ? v.max_zone_ttl : 0;
 }
 
 void xfr_opts_effective(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, xfr_eff_t *out) {
@@ -4172,6 +4513,15 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
                      : strcmp(key, "allow-query-on") == 0 ? &x->acl.query_on : &x->acl.notify;
       if (parse_aml_slot(ctx, awhat, slot) != 0) {
         free(key); free_zone_config(zone); return -1;
+      }
+    } else if (zv_option_name(key)) {
+      /* batch 7: max-records, max-records-per-type, max-types-per-name, max-zone-ttl, serial-update-method, masterfile-format, check-* */
+      char zwhat[DNS_NAME_TEXT_SIZE + 48];
+      snprintf(zwhat, sizeof(zwhat), "zone '%.255s'", zone->domain ? zone->domain : "");
+      if (parse_zv_option(ctx, zwhat, key, &x->zv, true) != 0) {
+        free(key);
+        free_zone_config(zone);
+        return -1;
       }
     } else if (xo_option_name(key)) {
       /* batch 4: notify-source(-v6), transfer-source(-v6), min/max-refresh/retry-time, max-transfer-*, notify-delay, notify-to-soa,
@@ -6626,26 +6976,36 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
         } else if (strcmp(key, "tcp-idle-timeout") == 0 || strcmp(key, "tcp-initial-timeout") == 0) {
-          /* ミリ秒 (0 = 既定の 10000)。tcp-initial-timeout は最初のメッセージまで、
-           * tcp-idle-timeout はメッセージ間の待ち時間 (D-06、RFC 7766 §6.2.3) */
-          uint32_t *dst = (strcmp(key, "tcp-idle-timeout") == 0) ? &config->tcp_idle_timeout
-                                                                 : &config->tcp_initial_timeout;
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_STRING) { free(key); free_token(&tok); return -1; }
-          char *endptr;
-          errno = 0;
-          unsigned long v = strtoul(tok.value, &endptr, 10);
-          if (*endptr != '\0' || tok.value[0] == '-' || isspace((unsigned char)tok.value[0]) ||
-              errno == ERANGE || v > UINT32_MAX) {
-            syslog(LOG_ERR, "[Config] Invalid %s value '%s' (must be a non-negative integer of milliseconds)", key, tok.value);
-            fprintf(stderr, "[ERROR] Invalid %s value '%s' (must be a non-negative integer of milliseconds)\n", key, tok.value);
-            free(key); free_token(&tok); return -1;
+          /* BIND's unit (100 ms), or milliseconds with the suffix `ms` (parse_tcp_timeout()).  tcp-initial-timeout runs to the first
+           * message, tcp-idle-timeout between messages (D-06, RFC 7766 §6.2.3).  `0ms` = the default of 10000 ms. */
+          bool is_idle = strcmp(key, "tcp-idle-timeout") == 0;
+          if (parse_tcp_timeout(ctx, key, is_idle ? TCP_IDLE_MIN_UNITS : TCP_INITIAL_MIN_UNITS, TCP_IDLE_MAX_UNITS, true,
+                                is_idle ? &config->tcp_idle_timeout : &config->tcp_initial_timeout) != 0) {
+            free(key);
+            return -1;
           }
-          *dst = (uint32_t)v;
-          free_token(&tok);
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_SEMICOLON) { free(key); free_token(&tok); return -1; }
-          free_token(&tok);
+        } else if (strcmp(key, "version") == 0 || strcmp(key, "hostname") == 0 || strcmp(key, "server-id") == 0) {
+          if (parse_chaos_statement(ctx, config, key) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "tcp-advertised-timeout") == 0) {
+          /* RFC 7828 §3.3.2: the idle timeout the edns-tcp-keepalive option tells the client (BIND: advertised, in units of 100 ms, no minimum) */
+          uint32_t ms = 0;
+          if (parse_tcp_timeout(ctx, key, 0, TCP_ADVERTISED_MAX_UNITS, false, &ms) != 0) {
+            free(key);
+            return -1;
+          }
+          config->tcp_advertised_set = true;
+          config->tcp_advertised_units = (uint16_t)(ms / 100 > TCP_ADVERTISED_MAX_UNITS ? TCP_ADVERTISED_MAX_UNITS : ms / 100);
+        } else if (strcmp(key, "tcp-keepalive-timeout") == 0) {
+          /* BIND: the idle timeout of a connection whose client sent edns-tcp-keepalive.  KariDNS has one idle timeout for every connection */
+          uint32_t ms = 0;
+          if (parse_tcp_timeout(ctx, key, 1, TCP_ADVERTISED_MAX_UNITS, false, &ms) != 0) {
+            free(key);
+            return -1;
+          }
+          conf_warn_here(ctx, "options tcp-keepalive-timeout", "accepted, no effect in KariDNS: every connection uses tcp-idle-timeout");
         } else if (strcmp(key, "cookie-secret") == 0) {
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) { free(key); free_token(&tok); return -1; }
@@ -6702,7 +7062,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           if (tok.type != TOKEN_SEMICOLON) { free(key); free_token(&tok); return -1; }
           free_token(&tok);
         } else if (strcmp(key, "minimal-responses") == 0) {
-          if (parse_bool_statement(ctx, NULL, key, &config->minimal_responses) != 0) {
+          if (parse_minimal_responses(ctx, "options", &config->minimal_responses) != 0) {
             free(key);
             return -1;
           }
@@ -6948,6 +7308,12 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key);
             return -1;
           }
+        } else if (zv_option_name(key)) {
+          /* batch 7: max-records, max-zone-ttl, serial-update-method, masterfile-format, check-*: the default of every view and zone */
+          if (parse_zv_option(ctx, "options", key, &config->zv, false) != 0) {
+            free(key);
+            return -1;
+          }
         } else if (xo_option_name(key)) {
           /* batch 4: the default of every view and zone (BIND 9.20) */
           char owhat[64];
@@ -7155,6 +7521,16 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           *tail = vk;
+        } else if (zv_option_name(tok.value)) {
+          /* batch 7: the same options as options { }, for the zones of this view that have none of their own */
+          char *zkey = tok.value;
+          tok.value = NULL;
+          free_token(&tok);
+          char zwhat[KARIDNS_VIEW_NAME_MAX + 64];
+          snprintf(zwhat, sizeof(zwhat), "view '%s'", view->name);
+          int zrc = parse_zv_option(ctx, zwhat, zkey, &view->zv, false);
+          free(zkey);
+          if (zrc != 0) { free_partial_view(view); return -1; }
         } else if (xo_option_name(tok.value)) {
           /* batch 4: the transfer / NOTIFY options of the view replace options' for the zones of this view that have none of their own */
           char *xkey = tok.value;
@@ -7440,6 +7816,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
     }
   }
   if (config_apply_directory(ctx, config) != 0) return -1;
+  if (chaos_finish(ctx, config) != 0) return -1;
   logging_finish(config);
   if (controls_resolve(ctx, config) != 0) return -1;
   if (saw_view_block && saw_top_level_zone) {

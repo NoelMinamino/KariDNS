@@ -2864,6 +2864,78 @@ const dns_record_t *zone_arena_reference_soa(const zone_arena_t *arena, const ch
   return first;
 }
 
+static int zl_cmp_u16(const void *a, const void *b) {
+  uint16_t x = *(const uint16_t *)a, y = *(const uint16_t *)b;
+  return x < y ? -1 : x > y;
+}
+
+/* max-records, max-records-per-type, max-types-per-name, max-zone-ttl (BIND 9.20: lib/dns/zone.c, rbtdb.c overmaxtype(), dns_rdataslab_fromrdataset(),
+ * lib/dns/master.c DNS_MASTER_CHECKTTL).  Runs on the built zone (build_zone_index() done: the name hash chains are used to group the records of a
+ * name).  Ordinary process code: it allocates, so it is for the load, never for a query. */
+int zone_arena_check_limits(const zone_arena_t *arena, const zone_limits_t *lim, char *err, size_t errlen) {
+  if (!arena || !arena->records || !lim) return 0;
+  if (lim->max_records && arena->count > lim->max_records) {
+    snprintf(err, errlen, "the zone has %zu records, more than max-records %llu", arena->count, (unsigned long long)lim->max_records);
+    return -1;
+  }
+  if (lim->max_zone_ttl) {
+    for (size_t i = 0; i < arena->count; i++) {
+      const dns_record_t *r = &arena->records[i];
+      if (r->ttl_value > lim->max_zone_ttl) {
+        snprintf(err, errlen, "'%.200s' %.16s has TTL %u, which exceeds the configured max-zone-ttl %u", r->name ? r->name : "?",
+                 r->type ? r->type : "", r->ttl_value, lim->max_zone_ttl);
+        return -1;
+      }
+    }
+  }
+  if ((!lim->max_per_type && !lim->max_types_per_name) || !arena->hash_table || arena->hash_size == 0) return 0;
+  uint16_t *types = NULL;
+  size_t types_cap = 0;
+  int rc = 0;
+  for (size_t i = 0; i < arena->count && rc == 0; i++) {
+    const dns_record_t *r = &arena->records[i];
+    if (!r->name) continue;
+    size_t slot = calc_fnv1a_str(r->name) & (arena->hash_size - 1);
+    size_t n = 0;
+    bool first = true;
+    for (int j = arena->hash_table[slot]; j != -1; j = arena->records[j].next_record) {
+      const dns_record_t *o = &arena->records[j];
+      if (!o->name || !domain_names_match_ci(o->name, r->name)) continue;
+      if ((size_t)j < i) { first = false; break; }   /* this name was grouped when its first record was visited */
+      if (n == types_cap) {
+        size_t nc = types_cap ? types_cap * 2 : 64;
+        uint16_t *nt = realloc(types, nc * sizeof(*types));
+        if (!nt) { rc = -2; break; }
+        types = nt;
+        types_cap = nc;
+      }
+      types[n++] = o->type_code;
+    }
+    if (rc != 0) break;
+    if (!first) continue;
+    qsort(types, n, sizeof(*types), zl_cmp_u16);
+    size_t ntypes = 0;
+    for (size_t k = 0; k < n;) {
+      size_t e = k;
+      while (e < n && types[e] == types[k]) e++;
+      ntypes++;
+      if (lim->max_per_type && e - k > lim->max_per_type) {
+        snprintf(err, errlen, "'%.200s' has %zu records of type %u, more than max-records-per-type %u", r->name, e - k,
+                 (unsigned)types[k], lim->max_per_type);
+        rc = -1;
+      }
+      k = e;
+    }
+    if (rc == 0 && lim->max_types_per_name && ntypes > lim->max_types_per_name) {
+      snprintf(err, errlen, "'%.200s' has %zu record types, more than max-types-per-name %u", r->name, ntypes, lim->max_types_per_name);
+      rc = -1;
+    }
+  }
+  free(types);
+  if (rc == -2) snprintf(err, errlen, "out of memory checking the limits of the zone");
+  return rc == 0 ? 0 : -1;
+}
+
 int zone_arena_check_soa_set(const zone_arena_t *arena, const char *zone, char *err, size_t errlen) {
   if (!arena || !arena->records || !zone) return 0;
   size_t nsoa = 0;

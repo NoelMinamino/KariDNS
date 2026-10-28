@@ -852,7 +852,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
                          size_t max_res_len, uint16_t *offset,
                          compress_ctx_t *comp_ctx, uint16_t *ancount,
                          uint16_t *nscount, uint16_t *arcount,
-                         bool minimal_responses,
+                         int minimal_mode,
                          bool minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
                          view_snapshot_t *view, uint32_t *qtx_included_out,
                          const char *client_ip, server_config_t *cfg,
@@ -872,7 +872,9 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
   glue_list_t glue;
   const glue_sibling_ctx_t sib_ctx = { view, cfg, client_ip };
   glue.count = 0;
-  glue.minimal = minimal_responses;
+  /* lib/ns/query.c ns_query_start(): an NS question always gets the NS authority and the glue, whatever minimal-responses says */
+  if (num_qtypes >= 1 && qtypes[0] == 2) minimal_mode = MINIMAL_NO;
+  glue.minimal = (minimal_mode == MINIMAL_YES);
   /* R-04: RRSIG 自体が要求されたとき (QTYPE RRSIG、または MQTYPE に RRSIG) は、その名前の RRSIG が全部その
    * RRset に入るので、他の RRset には付けない (同じ RRSIG を 2 回書かない。RFC 2181 §5)。 */
   bool rrsig_requested = false;
@@ -1645,7 +1647,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     // ==== フェーズ9: Authority NS/Glue付加 ====
     bool needs_ns = false;
     if (qtypes[0] != 2 && qtypes[0] != 255) { needs_ns = true; }
-    if (type_matched && !minimal_responses && needs_ns) {
+    if (type_matched && minimal_mode == MINIMAL_NO && needs_ns) {
       /* R-03: 頂点の NS は署名された RRset。DO=1 なら RRSIG(NS) も付け、入りきらなければ TC (RFC 4035 §3.1.1) */
       /* Authority section: without ECS (RFC 7871 §7.3.1), as find_delegation() */
       rr_filter_t ns_flt = { client_loc, NULL, client_loc_tag, 0, NULL };
@@ -1658,7 +1660,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     }
 
     // ==== フェーズ10: Additional Glue付加 ====
-    if (!minimal_responses && glue.count > 0 && policy != ADDITIONAL_AUTH_NO) {
+    if (minimal_mode != MINIMAL_YES && glue.count > 0 && policy != ADDITIONAL_AUTH_NO) {
       for (int k = 0; k < glue.count; k++) {
         if (!append_glue_records(img, glue.targets[k], db_entry->domain,
                                  res, max_res_len, offset, comp_ctx, arcount,
@@ -1695,7 +1697,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                          size_t max_res_len, uint16_t *offset,
                          compress_ctx_t *comp_ctx, uint16_t *ancount,
                          uint16_t *nscount, uint16_t *arcount,
-                         bool minimal_responses,
+                         int minimal_mode,
                          bool minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
                          view_snapshot_t *view, uint32_t *qtx_included_out,
                          const char *client_ip, server_config_t *cfg,
@@ -1708,7 +1710,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
   uint16_t initial_ancount = *ancount;
   uint8_t answer_scope = 0;
   resolve_name_answer(qname, qclass, qtypes, num_qtypes, db_entry_ptr, current_zone_ptr, res,
-                      max_res_len, offset, comp_ctx, ancount, nscount, arcount, minimal_responses,
+                      max_res_len, offset, comp_ctx, ancount, nscount, arcount, minimal_mode,
                       minimal_any, minimal_any_ttl, dnssec_ok, view, qtx_included_out, client_ip, cfg,
                       ecs_trusted, ecs_addr, ecs_family, &answer_scope);
   /* RFC 7871 §7.4: 否定応答 (NXDOMAIN/NODATA) と委任は SCOPE 0 (SHOULD)。SERVFAIL なども 0。 */
@@ -2679,6 +2681,136 @@ static int add_opt_to_bare_passthrough(uint8_t *res, size_t max_res_len, int len
   return (int)offset;
 }
 
+/* RFC 7873 §5.2.3: the response to a query whose Server Cookie is wrong: BADCOOKIE (RCODE 7 with the extended bits), AA=0, a fresh Server Cookie in the
+ * OPT, nothing else.  The question is already copied to res[0..q_offset). */
+static int build_badcookie_response(uint8_t *res, size_t max_res_len, uint16_t q_offset, edns_info_t *edns, uint8_t ext_rcode_out, bool is_tcp,
+                                    server_config_t *cfg) {
+  uint16_t offset = q_offset, arcount = 0;
+  res[2] &= ~0x04; // RFC 7873 §5.2.3: AA MUST be 0
+  res[3] = (res[3] & 0xF0) | 0x07; // BADCOOKIE (Base RCODE 7)
+  if (edns->present) {
+    assemble_edns_opt(res, max_res_len, &offset, &arcount, edns, ext_rcode_out, is_tcp, cfg);
+  }
+  res[6] = 0; res[7] = 0;
+  res[8] = 0; res[9] = 0;
+  res[10] = (uint8_t)(arcount >> 8);
+  res[11] = (uint8_t)(arcount & 0xFF);
+  return offset;
+}
+
+/* ---- Built-in CHAOS zones: version.bind, hostname.bind, id.server (BIND 9.20: bin/named/config.c defines them in the "_bind" view of class
+ * CHAOS; bin/named/builtin.c answers them).  A zone has an SOA (MNAME = the zone, RNAME = hostmaster.<zone>, serial 0, 28800 7200 604800
+ * 86400, TTL 86400), an NS at the apex (the zone itself, TTL 0) and, at the apex, a TXT of TTL 0 with the text of the option (version_lookup(),
+ * hostname_lookup(), id_lookup()); no text (`none`, or server-id not written) leaves the apex without a TXT, so TXT is NODATA.  A name below
+ * the apex is NXDOMAIN.  authors.bind is not served (BIND lists its authors there).  RFC 4892 §2: the identity of a server is asked for with
+ * id.server / hostname.bind as TXT in class CHAOS.  The answers are built from the strings the parser resolved (chaos_finish()), into the
+ * caller's buffer: no allocation. ---- */
+static const char *const k_chaos_apex[3] = { "version.bind", "hostname.bind", "id.server" };
+
+/* the built-in zone a name belongs to (index in k_chaos_apex), -1 for none; *at_apex: the name is the zone's apex */
+static int chaos_zone_of(const char *qname, bool *at_apex) {
+  size_t ql = dns_name_len_no_root(qname, strlen(qname));
+  for (int i = 0; i < 3; i++) {
+    size_t al = strlen(k_chaos_apex[i]);
+    if (ql == al && strncasecmp(qname, k_chaos_apex[i], al) == 0) { *at_apex = true; return i; }
+    if (ql > al + 1 && qname[ql - al - 1] == '.' && !dns_char_is_escaped(qname, ql - al - 1) && strncasecmp(qname + ql - al, k_chaos_apex[i], al) == 0) {
+      *at_apex = false;
+      return i;
+    }
+  }
+  return -1;
+}
+
+/* append one RR (owner given as wire bytes, class CHAOS) to res; false when it does not fit below cap */
+static bool chaos_put_rr(uint8_t *res, size_t cap, size_t *off, const uint8_t *owner, size_t owner_len, uint16_t type, uint32_t ttl,
+                         const uint8_t *rdata, size_t rdlen) {
+  if (*off + owner_len + 10 + rdlen > cap) return false;
+  uint8_t *p = res + *off;
+  memcpy(p, owner, owner_len);
+  p += owner_len;
+  *p++ = (uint8_t)(type >> 8); *p++ = (uint8_t)type;
+  *p++ = 0; *p++ = 3;
+  *p++ = (uint8_t)(ttl >> 24); *p++ = (uint8_t)(ttl >> 16); *p++ = (uint8_t)(ttl >> 8); *p++ = (uint8_t)ttl;
+  *p++ = (uint8_t)(rdlen >> 8); *p++ = (uint8_t)rdlen;
+  memcpy(p, rdata, rdlen);
+  *off = (size_t)(p + rdlen - res);
+  return true;
+}
+
+/* The answer for a question in class CHAOS about the built-in zone `zi` (the question is already copied to res[0..q_offset) and the header
+ * flags are set, AA=1).  cap: room for the body (the OPT is reserved by the caller).  Returns the length of the whole response. */
+static int chaos_build_response(const server_config_t *cfg, uint8_t *res, size_t cap, size_t max_res_len, size_t q_offset, int zi, bool at_apex,
+                                uint16_t qtype, edns_info_t *edns, bool is_tcp, uint8_t ext_rcode_out, server_config_t *cfg_opt) {
+  const chaos_cfg_t *c = &cfg->chaos;
+  const bool has = zi == 0 ? c->has_version : zi == 1 ? c->has_hostname : c->has_id;
+  const char *txt = zi == 0 ? c->r_version : zi == 1 ? c->r_hostname : c->r_id;
+  uint8_t apex_w[32];
+  long aw = write_uncompressed_name(apex_w, 0, sizeof(apex_w), k_chaos_apex[zi]);
+  uint8_t soa[96];
+  size_t sl = 0;
+  if (aw > 0) {
+    memcpy(soa, apex_w, (size_t)aw);                 /* MNAME */
+    sl = (size_t)aw;
+    soa[sl++] = 10;                                  /* RNAME: hostmaster.<zone> */
+    memcpy(soa + sl, "hostmaster", 10);
+    sl += 10;
+    memcpy(soa + sl, apex_w, (size_t)aw);
+    sl += (size_t)aw;
+    static const uint32_t timers[5] = { 0, 28800, 7200, 604800, 86400 };   /* serial, refresh, retry, expire, minimum */
+    for (int i = 0; i < 5; i++) {
+      soa[sl++] = (uint8_t)(timers[i] >> 24); soa[sl++] = (uint8_t)(timers[i] >> 16);
+      soa[sl++] = (uint8_t)(timers[i] >> 8); soa[sl++] = (uint8_t)timers[i];
+    }
+  }
+  static const uint8_t qname_ptr[2] = { 0xC0, 0x0C };   /* the owner of an answer at the apex is the question's name */
+  size_t off = q_offset;
+  uint16_t an = 0, ns = 0;
+  bool ok = aw > 0;
+  if (ok && !at_apex) {
+    res[3] = (res[3] & 0xF0) | 3;   /* NXDOMAIN */
+    ok = chaos_put_rr(res, cap, &off, apex_w, (size_t)aw, 6, 86400, soa, sl);
+    ns = ok ? 1 : 0;
+  } else if (ok) {
+    const bool any = qtype == 255;
+    if ((any || qtype == 16) && has) {
+      uint8_t td[CHAOS_TXT_MAX + 1];
+      size_t tl = strlen(txt);
+      td[0] = (uint8_t)tl;
+      memcpy(td + 1, txt, tl);
+      ok = chaos_put_rr(res, cap, &off, qname_ptr, 2, 16, 0, td, tl + 1);
+      an += ok;
+    }
+    if (ok && (any || qtype == 6)) {
+      ok = chaos_put_rr(res, cap, &off, qname_ptr, 2, 6, 86400, soa, sl);
+      an += ok;
+    }
+    if (ok && (any || qtype == 2)) {
+      ok = chaos_put_rr(res, cap, &off, qname_ptr, 2, 2, 0, apex_w, (size_t)aw);
+      an += ok;
+    }
+    if (ok && an == 0) {   /* NODATA: the SOA tells the client how long to remember it */
+      ok = chaos_put_rr(res, cap, &off, apex_w, (size_t)aw, 6, 86400, soa, sl);
+      ns = ok ? 1 : 0;
+    }
+  }
+  if (!ok) {   /* does not fit: nothing but the question, TC=1 (RFC 1035 §4.1.1) */
+    off = q_offset;
+    an = ns = 0;
+    res[3] &= 0xF0;
+    res[2] |= 0x02;
+  }
+  res[6] = (uint8_t)(an >> 8); res[7] = (uint8_t)an;
+  res[8] = (uint8_t)(ns >> 8); res[9] = (uint8_t)ns;
+  res[10] = 0; res[11] = 0;
+  uint16_t offset16 = (uint16_t)off, arcount = 0;
+  if (edns->present) {
+    assemble_edns_opt(res, max_res_len, &offset16, &arcount, edns, ext_rcode_out, is_tcp, cfg_opt);
+    res[10] = (uint8_t)(arcount >> 8);
+    res[11] = (uint8_t)(arcount & 0xFF);
+  }
+  return offset16;
+}
+
 int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                             size_t max_res_len, const char *qname, uint16_t qtype,
                             const char *client_ip, compress_ctx_t *comp_ctx,
@@ -3220,6 +3352,21 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   /* R-05: RA/Z/AD/TC は問い合わせから写さない。AA=1 は権威データの応答の既定で、委任・REFUSED・
    * SERVFAIL・BADCOOKIE ではそれぞれの経路で落とす。 */
   dns_init_response_header(res, req, 0, true);
+  /* Built-in CHAOS zones (version.bind, hostname.bind, id.server).  BIND answers a CHAOS question from its "_bind" view whatever the zones of the
+   * other views are, so this comes before the zone of the IN view.  A zone of the same name in the configuration is served instead.  allow-query
+   * of options (or the view the client matches) applies, as BIND's configure_view_acl() gives the _bind view the options' ACLs. */
+  if (qclass == 3 && cfg) {
+    bool at_apex = false;
+    int zi = chaos_zone_of(current_qname_lc, &at_apex);
+    if (zi >= 0 && !(db_entry && domain_names_match_ci(db_entry->domain, k_chaos_apex[zi]))) {
+      if (!zone_query_permitted(cfg, NULL, view ? view->name : NULL, client_ip)) {
+        add_ede(&edns, send_ede, 18, "Query refused due to access control");
+        return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
+      }
+      if (is_badcookie) return build_badcookie_response(res, max_res_len, (uint16_t)q_offset, &edns, ext_rcode_out, is_tcp, cfg);
+      return chaos_build_response(cfg, res, body_max_len, max_res_len, q_offset, zi, at_apex, qtype, &edns, is_tcp, ext_rcode_out, cfg);
+    }
+  }
   if (db_entry && view) {
     const zone_config_t *zcfg = zone_cfg_any;
     if (zcfg && zcfg->type && strcasecmp(zcfg->type, "program") == 0) {
@@ -3336,18 +3483,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
   uint16_t offset = q_offset, ancount = 0, nscount = 0, arcount = 0;
 
-  if (is_badcookie) {
-    res[2] &= ~0x04; // RFC 7873 §5.2.3: AA MUST be 0
-    res[3] = (res[3] & 0xF0) | 0x07; // BADCOOKIE (Base RCODE 7)
-    if (edns.present) {
-      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
-    }
-    res[6] = 0; res[7] = 0;
-    res[8] = 0; res[9] = 0;
-    res[10] = (uint8_t)(arcount >> 8);
-    res[11] = (uint8_t)(arcount & 0xFF);
-    return offset;
-  }
+  if (is_badcookie) return build_badcookie_response(res, max_res_len, q_offset, &edns, ext_rcode_out, is_tcp, cfg);
 
   // UDP IXFR (RFC 1995 §4.2):
   // If client's SOA serial matches server's current serial (up-to-date), send single SOA response (NOERROR).
@@ -3450,7 +3586,9 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   if (g_rcache && edns_safe_for_cache && !is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 &&
       current_zone && current_zone->rcache_ok && max_res_len >= 512 && q_offset < body_max_len) {
     rc_gen = zone_arena_data_generation(current_zone);
-    rc_tag = rcache_tag(current_qname_lc, qtype, qclass, rc_gen, cfg ? cfg->generation : 0);
+    /* minimal-responses no-auth-recursive makes the body depend on the RD bit: it is part of the key */
+    rc_tag = rcache_tag(current_qname_lc, qtype, (uint16_t)(qclass | ((cfg && cfg->minimal_responses == MINIMAL_NO_AUTH_RECURSIVE && (req[2] & 0x01)) ? 0x8000 : 0)),
+                        rc_gen, cfg ? cfg->generation : 0);
     uint16_t c_an, c_ns, c_ar;
     int blen = rcache_lookup(rc_tag, rc_gen, qtype, res + q_offset, body_max_len - q_offset, &c_an, &c_ns, &c_ar);
     if (blen > 0) {
@@ -3506,9 +3644,12 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   t_resolve_sibling_glue = false;
   t_resolve_alias_expanded = false;
   t_resolve_alias_failed = false;
+  /* minimal-responses no-auth-recursive: no authority NS for a query with RD set (lib/ns/query.c ns_query_start()) */
+  int minimal_mode = cfg_for_ede ? cfg_for_ede->minimal_responses : MINIMAL_NO;
+  if (minimal_mode == MINIMAL_NO_AUTH_RECURSIVE) minimal_mode = (req[2] & 0x01) ? MINIMAL_NO_AUTH : MINIMAL_NO;
   resolve_name(current_qname, qclass, qtypes, num_qtypes, &db_entry, &current_zone, res, body_max_len,
                &offset, comp_ctx, &ancount, &nscount, &arcount,
-               cfg_for_ede ? cfg_for_ede->minimal_responses : false,
+               minimal_mode,
                cfg_for_ede ? cfg_for_ede->minimal_any : false,
                cfg_for_ede ? cfg_for_ede->minimal_any_ttl : 86400,
                edns.dnssec_ok, view, &qtx_included, client_ip,

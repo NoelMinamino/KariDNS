@@ -151,6 +151,12 @@ typedef struct {
 #define XO_B_MULTI_MASTER    (1u << 14)
 #define XO_LEGACY_NOTIFY6    (1u << 15)   /* the IPv6 notify source came from the KariDNS zone statement `notify-source <ipv6>`; notify-source-v6 replaces it */
 
+/* bin/named/server.c MIN_/MAX_INITIAL_TIMEOUT, MIN_/MAX_IDLE_TIMEOUT, MAX_ADVERTISED_TIMEOUT, in units of 100 ms */
+#define TCP_INITIAL_MIN_UNITS    25u
+#define TCP_IDLE_MIN_UNITS       1u
+#define TCP_IDLE_MAX_UNITS       1200u
+#define TCP_ADVERTISED_MAX_UNITS 65535u
+
 /* BIND 9.20 defaults (bin/named/config.c) and ranges (lib/isccfg/check.c) */
 #define XFR_MIN_REFRESH_DEFAULT   300u
 #define XFR_MAX_REFRESH_DEFAULT   2419200u   /* 4 weeks */
@@ -249,6 +255,42 @@ typedef struct {
   aml_t *match;   /* view { match-clients } as written: kept so that its names are checked with file:line; the view is chosen with the flat list */
 } acl_set_t;
 
+/* ---- Batch 7: options that take a value and are written in options { }, view { } and zone { } (BIND 9.20 lib/isccfg/namedconf.c zone clauses,
+ * bin/named/zoneconf.c).  Each level lists only what it wrote (`set`); zone_vopts_effective() gives the value of a zone: the zone's, else its
+ * view's, else options', else the default.  ZC_* are the check-* options (lib/isccfg/check.c, bin/named/zoneconf.c): the severity is fail, warn
+ * or ignore (a boolean check-* is fail = yes, ignore = no).  CHK_DEFAULT = not written anywhere: the check keeps the severity it always had in
+ * KariDNS (zone_lint). ---- */
+enum { CHK_FAIL = 0, CHK_WARN = 1, CHK_IGNORE = 2, CHK_DEFAULT = 3 };
+enum { SUM_INCREMENT = 0, SUM_UNIXTIME = 1, SUM_DATE = 2 };   /* serial-update-method (BIND dns_updatemethod_*) */
+enum {
+  ZC_NAMES_PRIMARY = 0, ZC_NAMES_SECONDARY, ZC_NAMES_RESPONSE, ZC_DUP_RECORDS, ZC_INTEGRITY, ZC_MX, ZC_MX_CNAME, ZC_SIBLING, ZC_SPF,
+  ZC_SRV_CNAME, ZC_SVCB, ZC_WILDCARD, ZC_N
+};
+#define ZV_MAX_RECORDS        (1u << 0)
+#define ZV_MAX_PER_TYPE       (1u << 1)
+#define ZV_MAX_TYPES_PER_NAME (1u << 2)
+#define ZV_MAX_ZONE_TTL       (1u << 3)
+#define ZV_SERIAL_METHOD      (1u << 4)
+#define ZV_CHK(c)             (1u << (8 + (c)))      /* the check-* option ZC_c is written at this level */
+typedef struct zone_vopts {
+  uint32_t set;                    /* ZV_* of what is written at this level */
+  uint32_t max_records;            /* RRs in the zone; 0 = no limit */
+  uint32_t max_per_type;           /* RRs in one RRset; 0 = no limit */
+  uint32_t max_types_per_name;     /* RR types at one name; 0 = no limit */
+  uint32_t max_zone_ttl;           /* seconds; 0 = no limit (`unlimited`) */
+  uint8_t serial_method;           /* SUM_* */
+  uint8_t chk[ZC_N];               /* CHK_FAIL / CHK_WARN / CHK_IGNORE */
+  uint8_t zone_check_names;        /* zone { check-names <mode>; }: applies to the zone's own type */
+} zone_vopts_t;
+#define ZV_ZONE_CHECK_NAMES   (1u << 30)
+/* The value that applies to a zone */
+typedef struct {
+  uint32_t max_records, max_per_type, max_types_per_name, max_zone_ttl;
+  uint8_t serial_method;
+  uint8_t chk[ZC_N];               /* ZC_NAMES_PRIMARY .. : the effective severity, CHK_DEFAULT when not written; check_names: for the zone's type */
+  uint8_t check_names;             /* the zone's check-names severity (primary or secondary one, or the zone's own) */
+} zone_veff_t;
+
 /* S6a: ゾーンごとの「まれに指定する」オプション。ほとんどのゾーン (domain/file/type だけの
  * 主ゾーン) では 1 つも指定しないので、zone_config_t は核だけを持ち、ここに挙げた値は
  * 1 つでも指定したゾーンに限って別のブロックに確保する (zone_config_t.ext)。
@@ -267,6 +309,7 @@ typedef struct zone_ext {
   bool also_notify_set;  /* the zone has an also-notify statement (even an empty one): it replaces the view's and options' list */
   char *notify_source;
   xfr_opts_t *xo;   /* batch 4 transfer / NOTIFY options written in this zone (NULL = none); `notify-source <address>` above is also entered here */
+  zone_vopts_t zv;  /* batch 7: max-records, max-zone-ttl, serial-update-method, check-*, written in this zone */
   char **allow_transfer;
   int allow_transfer_count;
   acl_entry_t *allow_transfer_parsed;
@@ -520,6 +563,7 @@ typedef struct view_config {
   acl_set_t acl;                /* view { allow-query ... }: overrides options' for the zones of this view that have none of their own */
   uint8_t notify_mode;          /* view { notify }: notify_mode_t, 0 = inherit options' */
   xfr_opts_t xo;                /* view { notify-source, transfer-source, min-refresh-time, ... }: replaces options' for the zones of this view that have none of their own */
+  zone_vopts_t zv;              /* view { max-records, max-zone-ttl, check-*, ... }: replaces options' for the zones of this view that have none of their own */
   tsig_key_t *keys;             /* view { key }: keys visible to this view only (BIND bin/named/tsigconf.c: the view's ring is the global keys plus these) */
   server_stmt_t *servers;       /* view { server }: when there is any, it replaces the whole list of the top-level server statements (named_config_get() finds the view's first) */
   /* beta design 7.1: DB zone source of this view. NULL/false = the global source of options { database { } } */
@@ -608,6 +652,22 @@ typedef struct {
   char loc[240];       /* "file:line" of the statement */
 } listen_stmt_t;
 
+/* options { version; hostname; server-id; } (BIND 9.20 lib/isccfg/namedconf.c: qstringornone, serverid): the CHAOS TXT answers of version.bind,
+ * hostname.bind and id.server (bin/named/builtin.c).  The *_set flags say that the file wrote the statement, *_none that it wrote the
+ * unquoted word `none`.  The texts are resolved when the parse ends (chaos_finish()): the Backend, in capability mode, never asks for the
+ * host name. */
+#define CHAOS_TXT_MAX 255   /* one character-string of the TXT RDATA (BIND puttxt() cuts longer texts) */
+typedef struct {
+  bool version_set, version_none, hostname_set, hostname_none, server_id_set, server_id_none, server_id_hostname;
+  char version[CHAOS_TXT_MAX + 1], hostname[CHAOS_TXT_MAX + 1], server_id[CHAOS_TXT_MAX + 1];   /* as written */
+  bool has_version, has_hostname, has_id;   /* resolved: is there a TXT RDATA to serve */
+  char r_version[CHAOS_TXT_MAX + 1], r_hostname[CHAOS_TXT_MAX + 1], r_id[CHAOS_TXT_MAX + 1];
+} chaos_cfg_t;
+
+/* options { minimal-responses } (bin/named/server.c dns_minimal_*; lib/ns/query.c ns_query_start()): MINIMAL_NO_AUTH_RECURSIVE is the
+ * written value, the query path turns it into MINIMAL_NO_AUTH (RD set) or MINIMAL_NO */
+enum { MINIMAL_NO = 0, MINIMAL_YES = 1, MINIMAL_NO_AUTH = 2, MINIMAL_NO_AUTH_RECURSIVE = 3 };
+
 typedef struct server_config_s {
   int port;
   char **bind_addresses;
@@ -638,6 +698,7 @@ typedef struct server_config_s {
   int also_notify_count;
   uint8_t notify_mode;          /* options { notify }: notify_mode_t, 0 = yes */
   xfr_opts_t xo;                /* options { notify-source, transfer-source, min-refresh-time, ... }: the default of every view and zone */
+  zone_vopts_t zv;              /* options { max-records, max-zone-ttl, check-*, ... }: the default of every view and zone */
   /* options-only limits of the transfer machinery (BIND 9.20 ARM "transfers-in" ...); the *_set flags say that the file wrote them */
   uint32_t transfers_in, transfers_out, transfers_per_ns;   /* concurrent inbound / outbound transfers, inbound per primary */
   uint32_t serial_query_rate, notify_rate, startup_notify_rate;   /* per second; 0 written = 1 */
@@ -655,7 +716,7 @@ typedef struct server_config_s {
   rate_limit_config_t rrl;
   bool serve_stale;
   bool send_extended_errors;
-  bool minimal_responses;
+  uint8_t minimal_responses;     /* MINIMAL_* */
   bool minimal_any;
   uint32_t minimal_any_ttl;
   uint32_t wire_cache_max_records;
@@ -667,9 +728,12 @@ typedef struct server_config_s {
   int max_mqtypes;
   bool rfc10029_mqtype_enable;
   bool tcp_connection_reuse;
-  uint32_t tcp_idle_timeout;
+  uint32_t tcp_idle_timeout;    /* ms (the file says units of 100 ms, or Nms; see parse_tcp_timeout()); 0 = 10000 */
   uint32_t tcp_initial_timeout; /* ms。最初のメッセージを受け取るまでの待ち時間 (D-06) */
+  bool tcp_advertised_set;      /* tcp-advertised-timeout written: the edns-tcp-keepalive value is tcp_advertised_units, not the idle timeout */
+  uint16_t tcp_advertised_units; /* units of 100 ms (RFC 7828 §3.3.2) */
   char *nsid_string;
+  chaos_cfg_t chaos;             /* version, hostname, server-id */
   /* RFC 9018 DNS Server Cookies. `cookie-secret "<32 hex>";` may be repeated: the first
    * secret generates new Server Cookies, all secrets are accepted for verification
    * (secret rollover). count == 0 -> a random per-process secret is used
@@ -821,6 +885,11 @@ notify_mode_t notify_mode_effective(const server_config_t *cfg, const zone_confi
  * options, else the BIND 9.20 default (see XFR_*_DEFAULT).  zone may be NULL (catalog member, zone without zone {}) and cfg may be NULL
  * (defaults only).  multi_master is the option as written (BIND only looks at it when a zone has more than one primary). */
 void xfr_opts_effective(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, xfr_eff_t *out);
+/* Batch 7: the value of the options of zone_vopts_t that apply to a zone: the zone's, else its view's (view_name; NULL or "" = none), else options',
+ * else the default (no limits, serial-update-method increment, every check CHK_DEFAULT).  zone and cfg may be NULL. */
+void zone_vopts_effective(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, zone_veff_t *out);
+/* The size limits of a zone (max-records, max-records-per-type, max-types-per-name; max-zone-ttl for primary zones only) */
+void zone_limits_effective(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, zone_limits_t *out);
 /* The source address of a request to a primary / NOTIFY target `family` (AF_INET / AF_INET6): the address of the list the primary is
  * written in (t may be NULL), else the effective transfer-source(-v6) (xfer = true) or notify-source(-v6).  false = the system chooses. */
 bool xfr_source_for(const xfr_eff_t *e, const notify_target_t *t, int family, bool xfer, uint8_t out[16]);

@@ -43,7 +43,7 @@ options {
     port ${PORT};
     user "nobody";
     group "nobody";
-    tcp-idle-timeout 1;
+    tcp-idle-timeout 1ms;
     minimal-responses yes;
 };
 zone "example.com" {

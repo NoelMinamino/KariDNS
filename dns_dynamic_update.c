@@ -29,7 +29,33 @@
 
 /* 頂点の SOA のシリアルを 1 増やし、新しいシリアルを返す。0 は失敗 (SOA が無い、arena の確保失敗)。
  * 増やした結果の 0 は 1 にするので、成功時に 0 は返らない。 */
+/* RFC 1982 serial arithmetic: a > b */
+static bool serial_gt(uint32_t a, uint32_t b) {
+  return (a < b && (b - a) > 0x80000000u) || (a > b && (a - b) < 0x80000000u);
+}
+
+/* The serial after an UPDATE that changed the zone (BIND 9.20 lib/dns/update.c dns_update_soaserial(), method = serial-update-method):
+ * increment adds 1 (RFC 1982; 0 is skipped), unixtime uses the clock, date uses YYYYMMDD00 of the local date.  A unixtime / date value that is
+ * not greater than the current serial falls back to increment, as BIND does. */
+uint32_t update_next_serial(uint32_t serial, int method, time_t now) {
+  uint32_t ns = serial + 1;
+  if (ns == 0) ns = 1;
+  if (method == SUM_INCREMENT) return ns;
+  uint32_t cand = 0;
+  if (method == SUM_UNIXTIME) {
+    cand = (uint32_t)now;
+  } else {
+    struct tm tmv, *tm = localtime_r(&now, &tmv);
+    if (tm) cand = (uint32_t)(((tm->tm_year + 1900) * 10000) + ((tm->tm_mon + 1) * 100) + tm->tm_mday) * 100;
+  }
+  return (cand != 0 && serial_gt(cand, serial)) ? cand : ns;
+}
+
 uint32_t bump_soa_serial_in_arena(zone_arena_t *arena, const char *zone_name) {
+  return bump_soa_serial_method(arena, zone_name, SUM_INCREMENT, 0);
+}
+
+uint32_t bump_soa_serial_method(zone_arena_t *arena, const char *zone_name, int method, time_t now) {
   if (!arena || !zone_name) return 0;
   uint32_t new_serial = 0;
   /* B8t-1: a zone can hold several apex SOA RRs (tinydns locations, tags), all with the one zone serial (RFC 2181 §6.1):
@@ -38,10 +64,7 @@ uint32_t bump_soa_serial_in_arena(zone_arena_t *arena, const char *zone_name) {
     if (arena->records[i].type_code == 6 && domain_names_match_ci(arena->records[i].name, zone_name) && arena->records[i].rdata_count >= 3) {
       if (arena->records[i].rdata[2]) {
         if (new_serial == 0) {
-          uint32_t serial = strtoul(arena->records[i].rdata[2], NULL, 10);
-          serial++;
-          if (serial == 0) serial = 1;
-          new_serial = serial;
+          new_serial = update_next_serial((uint32_t)strtoul(arena->records[i].rdata[2], NULL, 10), method, now);
         }
         char buf[32];
         snprintf(buf, sizeof(buf), "%u", new_serial);
@@ -95,6 +118,14 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
     return 2; // SERVFAIL
   }
 
+  /* batch 7: the zone's serial-update-method and size limits (max-records, max-records-per-type, max-types-per-name, max-zone-ttl) */
+  server_config_t *cfg_now = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+  const zone_config_t *zcfg_now = zone_entry_config(cfg_now, entry);
+  zone_veff_t veff;
+  zone_limits_t limits;
+  zone_vopts_effective(cfg_now, zcfg_now, entry->view_name, &veff);
+  zone_limits_effective(cfg_now, zcfg_now, entry->view_name, &limits);
+
   update_result_t result;
   int rcode = process_update_sections(req, req_len, entry->domain, z_standby, &result);
   if (rcode != 0 || !result.changed) {
@@ -111,8 +142,13 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
 
   /* RFC 2136 §3.6: UPDATE が SOA を新しいシリアルで置き換えたときはそのシリアルを使い、
    * それ以外はサーバーがシリアルを増やす。*/
+  /* max-zone-ttl: BIND reduces the TTL of an added RR to it (lib/ns/update.c, "reducing TTL to the configured max-zone-ttl") */
+  if (limits.max_zone_ttl) {
+    for (size_t i = 0; i < z_standby->count; i++)
+      if (z_standby->records[i].ttl_value > limits.max_zone_ttl) z_standby->records[i].ttl_value = limits.max_zone_ttl;
+  }
   uint32_t new_serial = result.soa_replaced ? soa_serial_in_arena(z_standby, entry->domain)
-                                            : bump_soa_serial_in_arena(z_standby, entry->domain);
+                                            : bump_soa_serial_method(z_standby, entry->domain, veff.serial_method, time(NULL));
   if (!result.soa_replaced && new_serial == 0) {
     /* X-17: シリアルを上げられなかった (arena の確保失敗、または頂点の SOA が無い)。変更したゾーンを
      * 同じシリアルで公開するとセカンダリが転送しない (RFC 2136 §3.6) ので、UPDATE 全体を捨てて
@@ -134,6 +170,16 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
     pthread_mutex_unlock(&entry->writer_lock);
     syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after Update for '%s'", entry->domain);
     return 2; // SERVFAIL
+  }
+  /* max-records, max-records-per-type, max-types-per-name: an UPDATE that would break one is not applied (BIND lib/ns/update.c: DNS_R_TOOMANYRECORDS) */
+  {
+    char lim_err[320];
+    if (zone_arena_check_limits(z_standby, &limits, lim_err, sizeof(lim_err)) < 0) {
+      zone_arena_destroy(z_standby);
+      pthread_mutex_unlock(&entry->writer_lock);
+      syslog(LOG_ERR, "[Update] client=%s zone='%s': update refused: %s", client_ip, entry->domain, lim_err);
+      return 2; // SERVFAIL
+    }
   }
 
   /* S5 B-1: 応答を作る側が読むイメージ。公開の直前に 1 回だけ作る。作れなければ索引を作れなかったときと同じく UPDATE を捨てる */

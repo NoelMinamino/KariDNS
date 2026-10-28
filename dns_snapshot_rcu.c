@@ -906,6 +906,8 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   } else {
       count = parse_zone_fast(buf, strlen(buf), z_standby, &ctx);
   }
+  zone_limits_t limits;   /* max-records, max-records-per-type, max-types-per-name, max-zone-ttl (batch 7) */
+  zone_limits_effective(active_cfg, zcfg, entry->view_name, &limits);
   release_config_snapshot(active_cfg);
   free((void*)ctx.base_dir);
   free(root_path);
@@ -967,6 +969,17 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
       syslog(LOG_ERR, "[Zone] Name length validation error reloading zone '%s' from '%s': %s",
              entry->domain, file, parse_err.error_message);
       return RELOAD_ERR_PARSE;
+  }
+  /* batch 7: max-records, max-records-per-type, max-types-per-name, max-zone-ttl.  BIND fails the load of a zone that breaks one of them
+   * (lib/dns/zone.c, master.c); the version in service stays. */
+  {
+      char lim_err[320];
+      if (zone_arena_check_limits(z_standby, &limits, lim_err, sizeof(lim_err)) < 0) {
+          zone_arena_destroy(z_standby);
+          pthread_mutex_unlock(&entry->writer_lock);
+          syslog(LOG_ERR, "[Zone] zone '%s' not loaded from '%s': %s", entry->domain, file, lim_err);
+          return RELOAD_ERR_PARSE;
+      }
   }
   /* B8t-1: the zone-wide values (serial, refresh, retry, expire) come from the reference SOA (the SOA without location, time stamp
    * or tag if there is one, else the first). All SOA RRs of the zone must have the same serial; a zone that breaks this is not

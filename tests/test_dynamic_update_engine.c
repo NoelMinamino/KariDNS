@@ -2445,8 +2445,117 @@ static void test_notify_tcp_busy(void) {
     printf("  -> NOTIFY over TCP busy passed.\n");
 }
 
+/* ---- BIND compatibility, batch 7: serial-update-method (BIND 9.20 lib/dns/update.c dns_update_soaserial()), and max-records,
+ * max-records-per-type, max-zone-ttl for an UPDATE (lib/ns/update.c: "reducing TTL to the configured max-zone-ttl", DNS_R_TOOMANYRECORDS) ---- */
+static void test_serial_update_methods(void) {
+    printf("[TEST] Dynamic Update: serial-update-method and the zone size limits...\n");
+    setenv("TZ", "UTC", 1);
+    tzset();
+    /* increment: +1, skipping 0 (RFC 1982) */
+    assert(update_next_serial(5, SUM_INCREMENT, 0) == 6);
+    assert(update_next_serial(0xFFFFFFFFu, SUM_INCREMENT, 0) == 1);
+    /* unixtime: the clock when it is ahead of the serial, else serial + 1 */
+    assert(update_next_serial(5, SUM_UNIXTIME, 1700000000) == 1700000000u);
+    assert(update_next_serial(1700000000u, SUM_UNIXTIME, 1700000000) == 1700000001u);
+    assert(update_next_serial(1700000500u, SUM_UNIXTIME, 1700000000) == 1700000501u);
+    assert(update_next_serial(0xFFFFFFFFu, SUM_UNIXTIME, 1700000000) == 1700000000u);   /* RFC 1982: 1.7e9 is "after" 0xFFFFFFFF */
+    /* date: YYYYMMDD00 of the local date when that is ahead, else serial + 1 (the 99 serials of a day) */
+    struct tm tmv;
+    memset(&tmv, 0, sizeof(tmv));
+    tmv.tm_year = 2026 - 1900; tmv.tm_mon = 9; tmv.tm_mday = 29; tmv.tm_hour = 12;
+    time_t now = timegm(&tmv);
+    assert(update_next_serial(2026102800u, SUM_DATE, now) == 2026102900u);
+    assert(update_next_serial(2026102900u, SUM_DATE, now) == 2026102901u);
+    assert(update_next_serial(2026102950u, SUM_DATE, now) == 2026102951u);
+    assert(update_next_serial(5, SUM_DATE, now) == 2026102900u);
+    assert(update_next_serial(2026110100u, SUM_DATE, now) == 2026110101u);   /* a serial already in the future */
+
+    /* the whole pipeline: a hand-built configuration whose options write the three limits and the method */
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strncpy(entry.domain, "example.com.", sizeof(entry.domain) - 1);
+    strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+    init_sample_zone_arena(test_zone_slot(&entry, 0), "example.com.", "1000");
+    atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
+    atomic_store_explicit(&entry.serial, 1000, memory_order_release);
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    view_config_t view_cfg;
+    memset(&view_cfg, 0, sizeof(view_cfg));
+    view_cfg.name = "default";
+    zone_config_t zcfg;
+    memset(&zcfg, 0, sizeof(zcfg));
+    zcfg.domain = "example.com.";
+    zcfg.type = "master";
+    view_cfg.zones = &zcfg;
+    cfg.views = &view_cfg;
+    cfg.zv.set = ZV_MAX_RECORDS | ZV_MAX_ZONE_TTL | ZV_SERIAL_METHOD;
+    cfg.zv.max_records = 2;
+    cfg.zv.max_zone_ttl = 100;
+    cfg.zv.serial_method = SUM_UNIXTIME;
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+
+    /* add <label>.example.com A 192.0.2.<last> with TTL ttl */
+    #define ADD_A_PKT(pkt, off, label, last, ttl) do { \
+        memset(pkt, 0, sizeof(pkt)); \
+        pkt[0] = 0x12; pkt[1] = 0x34; pkt[2] = 0x28; pkt[5] = 1; pkt[9] = 1; \
+        off = 12; \
+        pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7; pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3; pkt[off++] = 0; \
+        pkt[off++] = 0; pkt[off++] = 6; pkt[off++] = 0; pkt[off++] = 1; \
+        pkt[off++] = (uint8_t)strlen(label); memcpy(&pkt[off], label, strlen(label)); off += strlen(label); \
+        pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7; pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3; pkt[off++] = 0; \
+        pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0; pkt[off++] = 1; \
+        pkt[off++] = (uint8_t)((ttl) >> 24); pkt[off++] = (uint8_t)((ttl) >> 16); pkt[off++] = (uint8_t)((ttl) >> 8); pkt[off++] = (uint8_t)(ttl); \
+        pkt[off++] = 0; pkt[off++] = 4; pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = (last); \
+    } while (0)
+
+    uint8_t pkt[512];
+    size_t off;
+    /* 1. www A with TTL 300: the zone becomes 2 records, the TTL is cut to max-zone-ttl, the serial follows the clock (unixtime) */
+    ADD_A_PKT(pkt, off, "www", 1, 300u);
+    time_t before = time(NULL);
+    assert(handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "k") == 0);
+    uint32_t s = atomic_load_explicit(&entry.serial, memory_order_acquire);
+    assert(s >= (uint32_t)before && s <= (uint32_t)time(NULL));
+    zone_version_t *cur = atomic_load_explicit(&entry.rcu.active, memory_order_acquire);
+    assert(cur->image && cur->image->n_rrs == 2);
+    uint32_t id = zone_image_find_name(cur->image, "www.example.com.");
+    assert(id != ZONE_IMAGE_NONE);
+    uint32_t rr = zone_image_rrset_next(cur->image, id, 1, zone_image_name_first_rr(cur->image, id));
+    assert(rr != ZONE_IMAGE_NONE && zone_image_rr_ttl(cur->image, rr) == 100);
+
+    /* 2. a third record would break max-records 2: SERVFAIL, nothing applied */
+    ADD_A_PKT(pkt, off, "mail", 2, 60u);
+    assert(handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "k") == 2);
+    assert(atomic_load_explicit(&entry.serial, memory_order_acquire) == s);
+    assert(atomic_load_explicit(&entry.rcu.active, memory_order_acquire)->image->n_rrs == 2);
+
+    /* 3. max-records-per-type 1: a second A at www is refused; max-types-per-name 1: a name with two types is refused */
+    cfg.zv.set = ZV_MAX_PER_TYPE;
+    cfg.zv.max_per_type = 1;
+    cfg.zv.max_records = 0;
+    ADD_A_PKT(pkt, off, "www", 3, 60u);
+    assert(handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "k") == 2);
+    assert(atomic_load_explicit(&entry.rcu.active, memory_order_acquire)->image->n_rrs == 2);
+    cfg.zv.set = ZV_MAX_TYPES_PER_NAME;
+    cfg.zv.max_types_per_name = 1;
+    ADD_A_PKT(pkt, off, "ns1", 4, 60u);    /* a new name with one type: fine (the apex has SOA only in this sample zone) */
+    assert(handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "k") == 0);
+    #undef ADD_A_PKT
+
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
+    zone_arena_destroy(test_zone_slot(&entry, 0));
+    pthread_mutex_destroy(&entry.writer_lock);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    printf("  -> serial-update-method and the zone size limits passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Dynamic Update Engine Unit Tests ===\n");
+    test_serial_update_methods();
     test_bump_soa_serial();
     test_process_update_sections_records();
     test_process_update_sections_apex_ns_protection();

@@ -79,7 +79,7 @@ check "Rule 2: RFC 8624 algorithm 1 and DS digest 1 are warnings" 0 "${TMP_DIR}/
     "^\[WARNING\] DS 'example\.com\.': DS digest type 1 \(SHA-1\) is MUST NOT .*RFC 8624 §3\.3\)$" \
     "^\[RESULT\] Zone 'example\.com\.': 0 error\(s\), 2 warning\(s\)$"
 
-# Rule 3: tcp-idle-timeout must be a non-negative number of milliseconds (0 = default)
+# Rule 3: tcp-idle-timeout is a non-negative number of 100 ms units (BIND) or of milliseconds with the suffix ms (0ms = default)
 cat > "${TMP_DIR}/bad_options.conf" <<EOF
 options {
     directory "/tmp";
@@ -88,10 +88,19 @@ options {
 EOF
 run "${TMP_DIR}/r3" conf "${TMP_DIR}/bad_options.conf"
 check "Rule 3: negative tcp-idle-timeout is an error" 1 "${TMP_DIR}/r3" \
-    "^\[ERROR\] Invalid tcp-idle-timeout value '-5' \(must be a non-negative integer of milliseconds\)$"
+    "^\[ERROR\] .*options tcp-idle-timeout: invalid value '-5' \(expected a non-negative integer in units of 100 ms, or a number of milliseconds followed by \"ms\"\)$"
+# a bare number above BIND's maximum (1200 = 120 s) is an old millisecond value: the error names the ms suffix
+cat > "${TMP_DIR}/old_ms.conf" <<EOF
+options {
+    tcp-idle-timeout 10000;
+};
+EOF
+run "${TMP_DIR}/r3c" conf "${TMP_DIR}/old_ms.conf"
+check "Rule 3: tcp-idle-timeout 10000 (old milliseconds) is an error that suggests 10000ms" 1 "${TMP_DIR}/r3c" \
+    "^\[ERROR\] .*:3: options tcp-idle-timeout: 10000 is more than the maximum of 1200 \(120 seconds\).*write 10000ms$"
 cat > "${TMP_DIR}/zero_timeout.conf" <<EOF
 options {
-    tcp-idle-timeout 0;
+    tcp-idle-timeout 0ms;
 };
 zone "example.com" {
     type master;
@@ -99,7 +108,7 @@ zone "example.com" {
 };
 EOF
 run "${TMP_DIR}/r3b" conf "${TMP_DIR}/zero_timeout.conf"
-check "Rule 3: tcp-idle-timeout 0 (default) is accepted" 0 "${TMP_DIR}/r3b" "^\[OK\] Config file .* is valid\.$"
+check "Rule 3: tcp-idle-timeout 0ms (default) is accepted" 0 "${TMP_DIR}/r3b" "^\[OK\] Config file .* is valid\.$"
 
 # Rule 4: SSHFP fingerprint type outside the registry
 { zone_head; echo "host.example.com. IN SSHFP 1 99 123456789ABCDEF67890123456789ABCDEF67890"; } > "${TMP_DIR}/bad_sshfp_fptype.zone"

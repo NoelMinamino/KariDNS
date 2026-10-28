@@ -95,7 +95,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                   size_t max_res_len, uint16_t *offset,
                   compress_ctx_t *comp_ctx, uint16_t *ancount,
                   uint16_t *nscount, uint16_t *arcount,
-                  bool minimal_responses,
+                  int minimal_mode,
                   bool minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
                   view_snapshot_t *view, uint32_t *qtx_included_out,
                   const char *client_ip, server_config_t *cfg,

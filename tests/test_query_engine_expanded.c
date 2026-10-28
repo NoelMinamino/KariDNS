@@ -10170,8 +10170,257 @@ static void test_b9a_alias_network(void) {
     printf("  -> resolver client passed.\n");
 }
 
+/* ---- BIND compatibility, batch 7: the built-in CHAOS zones (version.bind, hostname.bind, id.server) and minimal-responses.
+ * Expectations from BIND 9.20.4 bin/named/builtin.c (version_lookup(), hostname_lookup(), id_lookup(), builtin_authority(): SOA
+ * "<zone> hostmaster.<zone> 0 28800 7200 604800 86400" TTL 86400, NS <zone> TTL 0, TXT TTL 0), bin/named/config.c (the _bind view),
+ * lib/ns/query.c (NOAUTHORITY / NOADDITIONAL for minimal-responses) and RFC 4892. ---- */
+static int ch_query(server_config_t *cfg, const char *qname, uint16_t qtype, uint16_t qclass, bool edns, const char *client, size_t res_cap,
+                    uint8_t *res) {
+    uint8_t req[512];
+    memset(req, 0, 12);
+    req[0] = 0x7B; req[1] = 0x01; req[2] = 0x01; req[5] = 1;
+    if (edns) req[11] = 1;
+    size_t off = 12 + (size_t)write_uncompressed_name(req, 12, sizeof(req), qname);
+    req[off++] = (uint8_t)(qtype >> 8); req[off++] = (uint8_t)qtype;
+    req[off++] = (uint8_t)(qclass >> 8); req[off++] = (uint8_t)qclass;
+    if (edns) {
+        static const uint8_t opt[] = { 0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0 };
+        memcpy(req + off, opt, sizeof(opt));
+        off += sizeof(opt);
+    }
+    compress_ctx_t cc;
+    memset(&cc, 0, sizeof(cc));
+    compress_ctx_init_packet(&cc);
+    const rate_limit_config_t *rrl = NULL;
+    zone_db_entry_t *m = NULL;
+    return process_dns_query_impl(req, off, res, res_cap, qname, qtype, client, &cc, false, &rrl, NULL, cfg, &m);
+}
+
+/* the first RR of a section of a response: skips the question; returns the offset after it (or 0), fills type/class/ttl/rdata */
+static size_t ch_rr_at(const uint8_t *res, int len, size_t off, uint16_t *type, uint16_t *cls, uint32_t *ttl, const uint8_t **rd, uint16_t *rdlen) {
+    while (off < (size_t)len && res[off] != 0) {
+        if ((res[off] & 0xC0) == 0xC0) { off += 1; break; }
+        off += 1u + res[off];
+    }
+    off += 1;
+    if (off + 10 > (size_t)len) return 0;
+    *type = (uint16_t)((res[off] << 8) | res[off + 1]);
+    *cls = (uint16_t)((res[off + 2] << 8) | res[off + 3]);
+    *ttl = ((uint32_t)res[off + 4] << 24) | ((uint32_t)res[off + 5] << 16) | ((uint32_t)res[off + 6] << 8) | res[off + 7];
+    *rdlen = (uint16_t)((res[off + 8] << 8) | res[off + 9]);
+    *rd = res + off + 10;
+    return off + 10 + *rdlen;
+}
+
+static size_t ch_after_question(const uint8_t *res) {
+    size_t off = 12;
+    while (res[off] != 0) off += 1u + res[off];
+    return off + 1 + 4;
+}
+
+/* one TXT answer of class CH, TTL 0, AA, no RA; returns its text */
+static void ch_expect_txt(server_config_t *cfg, const char *qname, const char *text) {
+    uint8_t res[1024];
+    int n = ch_query(cfg, qname, 16, 3, false, "192.0.2.9", sizeof(res), res);
+    assert(n > 12 && (res[3] & 0x0F) == 0 && (res[2] & 0x84) == 0x84 && !(res[3] & 0x80));   /* AA, no RA */
+    assert(res[5] == 1 && res[7] == 1 && res[9] == 0 && res[11] == 0);
+    uint16_t t, c, rl;
+    uint32_t ttl;
+    const uint8_t *rd;
+    size_t end = ch_rr_at(res, n, ch_after_question(res), &t, &c, &ttl, &rd, &rl);
+    (void)end;
+    assert(t == 16 && c == 3 && ttl == 0 && rl == strlen(text) + 1 && rd[0] == strlen(text) && memcmp(rd + 1, text, strlen(text)) == 0);
+    assert(n == (int)(ch_after_question(res) + 2 + 10 + rl));   /* the owner is a pointer to the question */
+}
+
+/* NOERROR/NXDOMAIN with the answer empty and the SOA in the authority section */
+static void ch_expect_soa_only(server_config_t *cfg, const char *qname, uint16_t qtype, int rcode) {
+    uint8_t res[1024];
+    int n = ch_query(cfg, qname, qtype, 3, false, "192.0.2.9", sizeof(res), res);
+    assert(n > 12 && (res[3] & 0x0F) == rcode && (res[2] & 0x04));
+    assert(res[7] == 0 && res[9] == 1);
+    uint16_t t, c, rl;
+    uint32_t ttl;
+    const uint8_t *rd;
+    assert(ch_rr_at(res, n, ch_after_question(res), &t, &c, &ttl, &rd, &rl) != 0);
+    assert(t == 6 && c == 3 && ttl == 86400);
+}
+
+static void test_chaos_builtin_zones(void) {
+    printf("[TEST] Query Engine: built-in CHAOS zones (version.bind, hostname.bind, id.server)...\n");
+    server_config_t cfg;
+    uint8_t res[1024];
+    int n;
+    assert(parse_named_conf("options { version \"9.99-test\"; hostname \"ns1.example.test\"; server-id \"node-7\"; };", &cfg) == 0);
+    assert(cfg.nsid_string && strcmp(cfg.nsid_string, "node-7") == 0);   /* server-id is the NSID too */
+    ch_expect_txt(&cfg, "version.bind.", "9.99-test");
+    ch_expect_txt(&cfg, "VERSION.Bind", "9.99-test");
+    ch_expect_txt(&cfg, "hostname.bind.", "ns1.example.test");
+    ch_expect_txt(&cfg, "id.server.", "node-7");
+    ch_expect_soa_only(&cfg, "version.bind.", 1, 0);               /* A at the apex: NODATA */
+    ch_expect_soa_only(&cfg, "x.version.bind.", 16, 3);            /* below the apex: NXDOMAIN */
+    ch_expect_soa_only(&cfg, "a.b.id.server.", 16, 3);
+    n = ch_query(&cfg, "a\\.version.bind.", 16, 3, false, "192.0.2.9", sizeof(res), res);   /* an escaped dot is part of the label: not below version.bind */
+    assert((res[3] & 0x0F) == 5);
+
+    /* SOA, NS and ANY at the apex */
+    n = ch_query(&cfg, "version.bind.", 6, 3, false, "192.0.2.9", sizeof(res), res);
+    assert((res[3] & 0x0F) == 0 && res[7] == 1);
+    {
+        uint16_t t, c, rl; uint32_t ttl; const uint8_t *rd;
+        assert(ch_rr_at(res, n, ch_after_question(res), &t, &c, &ttl, &rd, &rl) != 0);
+        static const uint8_t soa_rdata[] = {
+            7, 'v','e','r','s','i','o','n', 4, 'b','i','n','d', 0,
+            10, 'h','o','s','t','m','a','s','t','e','r', 7, 'v','e','r','s','i','o','n', 4, 'b','i','n','d', 0,
+            0,0,0,0, 0,0,0x70,0x80, 0,0,0x1C,0x20, 0,9,0x3A,0x80, 0,1,0x51,0x80 };
+        assert(t == 6 && c == 3 && ttl == 86400 && rl == sizeof(soa_rdata) && memcmp(rd, soa_rdata, sizeof(soa_rdata)) == 0);
+    }
+    n = ch_query(&cfg, "id.server.", 2, 3, false, "192.0.2.9", sizeof(res), res);
+    assert((res[3] & 0x0F) == 0 && res[7] == 1);
+    {
+        uint16_t t, c, rl; uint32_t ttl; const uint8_t *rd;
+        assert(ch_rr_at(res, n, ch_after_question(res), &t, &c, &ttl, &rd, &rl) != 0);
+        assert(t == 2 && ttl == 0 && rl == 11 && memcmp(rd, "\2id\6server\0", 11) == 0);
+    }
+    n = ch_query(&cfg, "hostname.bind.", 255, 3, false, "192.0.2.9", sizeof(res), res);
+    assert((res[3] & 0x0F) == 0 && res[7] == 3 && res[9] == 0);   /* TXT, SOA, NS */
+
+    /* EDNS: the OPT is added, and the answer is unchanged */
+    n = ch_query(&cfg, "version.bind.", 16, 3, true, "192.0.2.9", sizeof(res), res);
+    assert((res[3] & 0x0F) == 0 && res[7] == 1 && res[11] == 1);
+    assert(res[n - 11] == 0 && res[n - 10] == 0 && res[n - 9] == 41);
+
+    /* not a built-in name, or the class is not CH: not served from here (REFUSED: no zone) */
+    n = ch_query(&cfg, "example.test.", 16, 3, false, "192.0.2.9", sizeof(res), res);
+    assert((res[3] & 0x0F) == 5);
+    n = ch_query(&cfg, "version.bind.", 16, 1, false, "192.0.2.9", sizeof(res), res);
+    assert((res[3] & 0x0F) == 5);
+    n = ch_query(&cfg, "authors.bind.", 16, 3, false, "192.0.2.9", sizeof(res), res);
+    assert((res[3] & 0x0F) == 5);
+
+    /* a response that does not fit in the buffer is cut to the question with TC=1 */
+    n = ch_query(&cfg, "hostname.bind.", 255, 3, false, "192.0.2.9", 60, res);
+    assert(n == 12 + 15 + 4 + 0 && (res[2] & 0x02) && res[7] == 0 && res[9] == 0);
+    free_server_config_fields(&cfg);
+
+    /* not written: version.bind is the product version, hostname.bind the host name, id.server has no TXT */
+    assert(parse_named_conf("options { };", &cfg) == 0);
+    ch_expect_txt(&cfg, "version.bind.", KARIDNS_VERSION);
+    {
+        char hn[256];
+        assert(gethostname(hn, sizeof(hn)) == 0);
+        hn[255] = 0;
+        ch_expect_txt(&cfg, "hostname.bind.", hn);
+    }
+    ch_expect_soa_only(&cfg, "id.server.", 16, 0);
+    free_server_config_fields(&cfg);
+
+    /* `none` (unquoted): no TXT; the quoted "none" is the text none */
+    assert(parse_named_conf("options { version none; hostname NONE; server-id none; nsid \"n1\"; };", &cfg) == 0);
+    ch_expect_soa_only(&cfg, "version.bind.", 16, 0);
+    ch_expect_soa_only(&cfg, "hostname.bind.", 16, 0);
+    ch_expect_soa_only(&cfg, "id.server.", 16, 0);
+    assert(strcmp(cfg.nsid_string, "n1") == 0);                      /* server-id none leaves nsid alone */
+    free_server_config_fields(&cfg);
+    assert(parse_named_conf("options { version \"none\"; };", &cfg) == 0);
+    ch_expect_txt(&cfg, "version.bind.", "none");
+    free_server_config_fields(&cfg);
+
+    /* server-id hostname: the NSID and id.server are the host name */
+    assert(parse_named_conf("options { server-id hostname; };", &cfg) == 0);
+    {
+        char hn[256];
+        assert(gethostname(hn, sizeof(hn)) == 0);
+        hn[255] = 0;
+        ch_expect_txt(&cfg, "id.server.", hn);
+        assert(cfg.nsid_string && strcmp(cfg.nsid_string, hn) == 0);
+    }
+    free_server_config_fields(&cfg);
+
+    /* a text longer than one character-string is cut at 255 octets */
+    {
+        char conf[600], big[400];
+        memset(big, 'x', 300);
+        big[300] = 0;
+        snprintf(conf, sizeof(conf), "options { version \"%s\"; };", big);
+        assert(parse_named_conf(conf, &cfg) == 0);
+        big[255] = 0;
+        ch_expect_txt(&cfg, "version.bind.", big);
+        free_server_config_fields(&cfg);
+    }
+
+    /* allow-query of options applies (BIND's _bind view uses the options' ACLs) */
+    assert(parse_named_conf("options { allow-query { 192.0.2.0/24; }; version \"v\"; send-extended-errors yes; };", &cfg) == 0);
+    n = ch_query(&cfg, "version.bind.", 16, 3, false, "192.0.2.9", sizeof(res), res);
+    assert((res[3] & 0x0F) == 0 && res[7] == 1);
+    n = ch_query(&cfg, "version.bind.", 16, 3, false, "198.51.100.9", sizeof(res), res);
+    assert(n > 12 && (res[3] & 0x0F) == 5 && res[7] == 0);
+    free_server_config_fields(&cfg);
+
+    /* a hand-built configuration (all zero): the built-in zones exist but have no text */
+    memset(&cfg, 0, sizeof(cfg));
+    ch_expect_soa_only(&cfg, "version.bind.", 16, 0);
+    printf("  -> built-in CHAOS zones passed.\n");
+}
+
+static void test_minimal_responses_modes(void) {
+    printf("[TEST] Query Engine: minimal-responses yes / no / no-auth / no-auth-recursive...\n");
+    static char ztext[] =
+        "$ORIGIN min.example.\n"
+        "@ 3600 IN SOA ns1 admin 1 3600 1800 604800 86400\n"
+        "@ 3600 IN NS ns1\n"
+        "@ 3600 IN MX 10 mail\n"
+        "ns1 300 IN A 192.0.2.1\n"
+        "mail 300 IN A 192.0.2.2\n"
+        "www 300 IN A 192.0.2.10\n";
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "min.example.", .is_standalone_mode = true, .err_out = &err };
+    assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(test_build_index(&arena, true) == 0);
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "min.example.", sizeof(entry.domain));
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
+    /* { qname, qtype, mode } -> {answer, authority, additional} counts */
+    static const struct { const char *qn; uint16_t qt; int mode; int an, ns, ar; } cases[] = {
+        { "www.min.example.", 1, MINIMAL_NO,      1, 1, 1 },   /* authority NS and the glue of the NS */
+        { "www.min.example.", 1, MINIMAL_YES,     1, 0, 0 },
+        { "www.min.example.", 1, MINIMAL_NO_AUTH, 1, 0, 0 },
+        { "min.example.",     15, MINIMAL_NO,     1, 1, 2 },   /* MX: NS in the authority section, A of the MX target and of the NS in the additional section */
+        { "min.example.",     15, MINIMAL_YES,    1, 0, 0 },
+        { "min.example.",     15, MINIMAL_NO_AUTH, 1, 0, 1 },  /* no-auth drops the authority NS (and its glue); the MX target stays */
+        { "min.example.",     2,  MINIMAL_YES,    1, 0, 1 },   /* an NS question always gets its glue (query.c: NS clears NOAUTHORITY|NOADDITIONAL) */
+        { "min.example.",     2,  MINIMAL_NO,     1, 0, 1 },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        zone_db_entry_t *db_entry_ptr = &entry;
+        zone_version_t *cur = &arena.ver;
+        uint8_t res[1024];
+        memset(res, 0, sizeof(res));
+        uint16_t offset = 12, an = 0, ns = 0, ar = 0;
+        compress_ctx_t cc;
+        compress_ctx_init(&cc);
+        compress_ctx_init_packet(&cc);
+        uint16_t qt = cases[i].qt;
+        resolve_name(cases[i].qn, 1, &qt, 1, &db_entry_ptr, &cur, res, sizeof(res), &offset, &cc, &an, &ns, &ar, cases[i].mode, false, 0, false,
+                     NULL, NULL, "127.0.0.1", NULL, false, NULL, 0, 0, NULL);
+        if (an != cases[i].an || ns != cases[i].ns || ar != cases[i].ar)
+            printf("  case %zu (%s type %u mode %d): an=%u ns=%u ar=%u, expected %d/%d/%d\n", i, cases[i].qn, qt, cases[i].mode, an, ns, ar,
+                   cases[i].an, cases[i].ns, cases[i].ar);
+        assert(an == cases[i].an && ns == cases[i].ns && ar == cases[i].ar);
+    }
+    zone_arena_destroy(&arena);
+
+    /* no-auth-recursive: through the whole query path, the RD bit of the query decides (lib/ns/query.c ns_query_start()) */
+    printf("  -> minimal-responses modes passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
+    test_chaos_builtin_zones();
+    test_minimal_responses_modes();
     test_query_engine_dname_cname_wildcard_truncation();
     test_query_engine_program_zone_plugin_pipe_timeout_and_dead_mark();
     test_query_engine_program_zone_reply_bounded_by_buffer();

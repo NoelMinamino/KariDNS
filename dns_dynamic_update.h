@@ -9,6 +9,9 @@
 #include "dns_server_internal.h"
 
 uint32_t bump_soa_serial_in_arena(zone_arena_t *arena, const char *zone_name);
+/* The serial an UPDATE gives a zone (serial-update-method, BIND dns_update_soaserial()); method is SUM_* (dns_config_parser.h), now the clock */
+uint32_t update_next_serial(uint32_t serial, int method, time_t now);
+uint32_t bump_soa_serial_method(zone_arena_t *arena, const char *zone_name, int method, time_t now);
 int handle_dynamic_update(const uint8_t *req, size_t req_len,
                           zone_db_entry_t *entry,
                           const char *client_ip,

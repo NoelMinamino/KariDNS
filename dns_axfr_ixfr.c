@@ -917,6 +917,21 @@ int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const ch
     syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after %s for '%s'", what, entry->domain);
     return -1;
   }
+  /* batch 7: max-records, max-records-per-type, max-types-per-name (and max-zone-ttl of a primary zone) apply to a zone that arrives by
+   * transfer or from a database as they do to a zone file (BIND: xfrin.c and zone.c both fail on DNS_R_TOOMANYRECORDS) */
+  {
+    zone_limits_t lim;
+    rcu_aux_read_lock();
+    server_config_t *lim_cfg = acquire_config_snapshot();
+    zone_limits_effective(lim_cfg, zone_entry_config(lim_cfg, entry), entry->view_name, &lim);
+    release_config_snapshot(lim_cfg);
+    rcu_aux_read_unlock();
+    char lim_err[320];
+    if (zone_arena_check_limits(builder, &lim, lim_err, sizeof(lim_err)) < 0) {
+      syslog(LOG_ERR, "[Zone] zone '%s' not installed after %s: %s", entry->domain, what, lim_err);
+      return -1;
+    }
+  }
 
   /* S5 B-1: 応答を作る側が読むイメージ。公開の直前に 1 回だけ作る。作れなければ索引を作れなかったときと同じく捨てる */
   builder->image = zone_image_freeze(builder, entry->domain);

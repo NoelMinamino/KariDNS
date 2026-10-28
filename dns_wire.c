@@ -4226,9 +4226,14 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
     uint16_t keepalive_val = 0;
     bool include_keepalive = false;
     if (is_tcp && edns && edns->has_keepalive_query && cfg && cfg->tcp_connection_reuse) {
-        uint32_t ms = (cfg && cfg->tcp_idle_timeout > 0) ? cfg->tcp_idle_timeout : 10000;
-        keepalive_val = (uint16_t)(ms / 100);
-        if (keepalive_val == 0) keepalive_val = 1;
+        if (cfg->tcp_advertised_set) {
+            /* tcp-advertised-timeout (BIND): what the option says, whatever the idle timeout is; 0 is allowed (RFC 7828 §3.3.2: close at once) */
+            keepalive_val = cfg->tcp_advertised_units;
+        } else {
+            uint32_t ms = (cfg->tcp_idle_timeout > 0) ? cfg->tcp_idle_timeout : 10000;
+            keepalive_val = (uint16_t)(ms / 100 > 65535 ? 65535 : ms / 100);   /* the option field is 16 bits */
+            if (keepalive_val == 0) keepalive_val = 1;
+        }
         include_keepalive = true;
         rdlen += 4 + 2;
     }

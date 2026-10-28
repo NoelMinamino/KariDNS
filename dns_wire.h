@@ -107,6 +107,14 @@ typedef struct {
 // ============================================================================
 struct zone_arena_s;
 typedef struct zone_arena_s zone_arena_t;
+
+/* The size limits of a zone (BIND 9.20 max-records, max-records-per-type, max-types-per-name, max-zone-ttl); 0 = no limit.  See
+ * zone_limits_effective() (dns_config_parser.h) and zone_arena_check_limits() (dns_zone_parser.h). */
+typedef struct {
+  uint64_t max_records;
+  uint32_t max_per_type, max_types_per_name, max_zone_ttl;
+} zone_limits_t;
+
 void *arena_alloc(zone_arena_t *arena, size_t size);
 
 // ============================================================================
