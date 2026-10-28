@@ -236,6 +236,65 @@ static void test_dag_sig0_client_keys(void) {
     printf("  -> SIG(0) client key loader passed.\n");
 }
 
+/* ML-DSA-44 (algorithm 18, draft-westerbaan-dnssec-mldsa) in a BIND .private file: "PrivateKey:" is the 32-octet FIPS 204 seed or the
+ * 2560-octet expanded private key (FIPS 204 table 2); both rebuild the key that was generated, any other length is refused.  The
+ * keys come from the OpenSSL under test, so there is nothing to compare with a vector; SKIP (not a pass) before OpenSSL 3.5. */
+static void write_mldsa_private(const char *path, const uint8_t *raw, size_t raw_len) {
+    char b64[4096];
+    int n = EVP_EncodeBlock((unsigned char *)b64, raw, (int)raw_len);
+    assert(n > 0 && (size_t)n < sizeof(b64));
+    FILE *f = fopen(path, "w");
+    assert(f);
+    fprintf(f, "Private-key-format: v1.3\nAlgorithm: 18 (MLDSA44)\nPrivateKey: %s\n", b64);
+    fclose(f);
+}
+
+static void test_dag_sig0_client_mldsa44_private(void) {
+    printf("[TEST] DAG Tools: BIND .private ML-DSA-44 (seed and expanded key) for SIG(0)...\n");
+    EVP_PKEY *orig = EVP_PKEY_Q_keygen(NULL, NULL, "ML-DSA-44");
+    if (!orig) {
+        printf("  (SKIP: this OpenSSL has no ML-DSA-44; it needs OpenSSL 3.5 or later)\n");
+        return;
+    }
+    uint8_t seed[64], expanded[4096];
+    size_t seed_len = 0, expanded_len = 0;
+    assert(EVP_PKEY_get_octet_string_param(orig, "priv", expanded, sizeof(expanded), &expanded_len) == 1);
+    assert(expanded_len == 2560);
+    assert(EVP_PKEY_get_octet_string_param(orig, "seed", seed, sizeof(seed), &seed_len) == 1);
+    assert(seed_len == 32);
+
+    char path[] = "/tmp/Kmldsa.test.+018+23456.private";
+    int fd = open(path, O_CREAT | O_RDWR, 0600);
+    if (fd < 0) {
+        strcpy(path, "Kmldsa.test.+018+23456.private");
+        fd = open(path, O_CREAT | O_RDWR, 0600);
+    }
+    assert(fd >= 0);
+    close(fd);
+
+    const struct { const uint8_t *raw; size_t len; } good[] = { { seed, 32 }, { expanded, 2560 } };
+    for (size_t i = 0; i < 2; i++) {
+        write_mldsa_private(path, good[i].raw, good[i].len);
+        sig0_key_t key;
+        memset(&key, 0, sizeof(key));
+        assert(load_bind_sig0_private_key(path, &key) == true);
+        assert(key.algorithm == 18 && key.pkey != NULL && key.key_tag == 23456);
+        assert(EVP_PKEY_eq(orig, key.pkey) == 1);                       /* the same key pair as the one generated */
+        EVP_PKEY_free(key.pkey);
+        free((void *)key.signer_name);
+    }
+    write_mldsa_private(path, seed, 16);                                /* neither a seed nor an expanded key */
+    sig0_key_t bad;
+    memset(&bad, 0, sizeof(bad));
+    assert(load_bind_sig0_private_key(path, &bad) == false && bad.pkey == NULL);
+    write_mldsa_private(path, expanded, 2559);
+    memset(&bad, 0, sizeof(bad));
+    assert(load_bind_sig0_private_key(path, &bad) == false && bad.pkey == NULL);
+    unlink(path);
+    EVP_PKEY_free(orig);
+    printf("  -> ML-DSA-44 .private loader passed.\n");
+}
+
 static void test_dag_tsig_client_parser(void) {
     printf("[TEST] DAG Tools: parse_tsig_str & parse_tsig_keyfile...\n");
 
@@ -3841,6 +3900,7 @@ int main(void) {
     zone_arena_init(&g_dag_arena);
     test_tcp_reassembly_engine();
     test_dag_sig0_client_keys();
+    test_dag_sig0_client_mldsa44_private();
     test_dag_tsig_client_p384_and_curve_matching();
     test_dag_transport_proxyv2_exhaustive();
     test_dag_tsig_client_parser();

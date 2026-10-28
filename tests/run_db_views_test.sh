@@ -12,6 +12,8 @@
 #   - an edit of karidns_domain_views reaches the loader through the change log: `karictl reload` moves a zone between
 #     views (ZONE_DELETE in the old one), and so does `karictl reload <zone>` without a view, which asks every view that takes
 #     database zones and answers with one line (applied in view b, not in the database of view a ...);
+#   - `karictl reload <zone> <view>` for a view with "database none;" is refused by the Backend ("zone not found"), and for a view whose
+#     database file the loader cannot open the loader answers the request with ZONE_FAILED and the reason (failed: sqlite3: cannot open ...);
 #   - a database without karidns_domain_views behaves like D6 (every zone in every view of the global source);
 #   - karidns-dbloader --dump --map-view gives the same bytes with --loader-threads 1 and 4.
 #
@@ -217,6 +219,18 @@ printf '%s\n' "$OUT" | grep -q "^OK zone ab.test.: view a: applied, serial 40; v
 [ "$(q 127.0.0.2 www.ab.test)" = "192.0.2.41" ] && [ "$(q 127.0.0.3 www.ab.test)" = "192.0.2.41" ] && pass "both views answer the new address" || fail "ab.test answers"
 OUT=$($KCTL zonestatus ab.test 2>&1); RC=$?
 printf '%s\n' "$OUT" | grep -q "^ERROR zone exists in multiple views" && [ $RC -eq 3 ] && pass "zonestatus still asks for a view: $OUT" || fail "zonestatus ab.test: rc $RC '$OUT'"
+
+# ================================================================ reload <zone> that the loader cannot answer from the database (ZONE_FAILED)
+echo "== reload <zone> of a view that takes no zones from the database, and of a database the loader cannot read"
+OUT=$($KCTL reload ab.test n 2>&1); RC=$?
+printf '%s\n' "$OUT" | grep -q "^ERROR zone not found (view 'n' takes no zones from the database)$" && [ $RC -eq 3 ] && pass "a view with database none: $OUT" || fail "reload ab.test n: rc $RC '$OUT'"
+chmod 000 "$C" "$C"-wal "$C"-shm 2>/dev/null
+OUT=$($KCTL reload c1.test c 2>&1); RC=$?
+printf '%s\n' "$OUT" | grep -q "^ERROR zone c1.test. (view c): failed: sqlite3: cannot open the database file" && [ $RC -eq 3 ] && pass "a database the loader cannot read: the request fails with the reason: $OUT" || fail "reload c1.test c (unreadable): rc $RC '$OUT'"
+chmod 600 "$C" "$C"-wal "$C"-shm 2>/dev/null
+OUT=$($KCTL reload c1.test c 2>&1); RC=$?
+printf '%s\n' "$OUT" | grep -q "^OK zone c1.test. (view c): unchanged, serial 70$" && [ $RC -eq 0 ] && pass "the same request after the file is readable again: $OUT" || fail "reload c1.test c (readable): rc $RC '$OUT'"
+[ "$(q 127.0.0.4 www.c1.test)" = "192.0.2.70" ] && pass "view c kept serving its zone" || fail "view c answer after the failed request"
 
 echo "== stop, then a database without karidns_domain_views"
 kill -TERM "$SRV"

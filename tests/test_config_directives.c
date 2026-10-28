@@ -2064,6 +2064,22 @@ static void test_db_settings_and_acl_match(void) {
         z = db_zone_from("allow-update { none; };");
         CHECK(z && !zone_update_acl_allows(&cc, z, "192.0.2.5", NULL) && !zone_update_acl_allows(&cc, z, "192.0.2.5", "xfr"));
         free_zone_config(z);
+        /* zone_settings_render() (what a primary sends a secondary): of a database zone's allow-transfer only what lies inside the
+         * ceiling is written; a key counts when the ceiling lists it (ceiling_has_key); nothing left, or no ceiling, gives none */
+        {
+            char out[2048];
+            z = db_zone_from("allow-transfer { 192.0.2.0/24; 198.51.100.0/24; key \"xfr\"; key \"upd\"; };");
+            size_t rn = z ? zone_settings_render(&cc, z, false, out, sizeof(out)) : 0;
+            CHECK(rn > 0 && rn == strlen(out));
+            CHECK(strstr(out, "allow-transfer { 192.0.2.0/24; key \"xfr\"; };\n") != NULL);   /* 198.51.100.0/24 and key "upd" are cut */
+            rn = z ? zone_settings_render(&nc, z, false, out, sizeof(out)) : 0;
+            CHECK(rn > 0 && strstr(out, "allow-transfer { none; };\n") != NULL);
+            free_zone_config(z);
+            z = db_zone_from("allow-transfer { key \"upd\"; };");
+            rn = z ? zone_settings_render(&cc, z, false, out, sizeof(out)) : 0;
+            CHECK(rn > 0 && strstr(out, "allow-transfer { none; };\n") != NULL);
+            free_zone_config(z);
+        }
 
         /* file zones keep their meaning, and the ceiling does not apply to them */
         snprintf(txt, sizeof(txt), "key \"k1\" { algorithm hmac-sha256; secret \"%s\"; };"

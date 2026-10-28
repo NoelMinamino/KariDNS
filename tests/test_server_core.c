@@ -52,6 +52,7 @@ static pid_t quiet_fork(void) {
 // (perform_config_reload / perform_config_reload_ext / reload_all_zones come from dns_server_internal.h)
 void run_frontend_router(pid_t backend_pid, int router_id);
 void backend_sig_handler(int sig);
+void backend_sighup_noop(int sig);
 void daemonize(void);
 void supervisor_sig_handler(int sig);
 void cleanup_pid_file(void);
@@ -2602,6 +2603,41 @@ static void test_server_core_sighup_sigusr1_handlers(void) {
     atomic_store_explicit(&g_frontend_alive, true, memory_order_relaxed);
     assert(atomic_load_explicit(&g_frontend_alive, memory_order_relaxed) == true);
     printf("  -> Signal handler flags passed.\n");
+}
+
+/* P5: the Backend blocks SIGHUP in every thread and installs backend_sighup_noop() so that the signal stays pending (SIG_IGN would
+ * drop it on arrival and sighup_from_manager() could not read the sender with sigtimedwait()).  A forked child (single thread, so no
+ * other thread can take the signal) checks both halves: blocked, the SIGHUP stays pending with the sender's pid; unblocked, the
+ * handler takes it and the process lives on (SIG_DFL would end it). */
+static void test_backend_sighup_noop(void) {
+    printf("[TEST] Server Core: Backend SIGHUP handler keeps the signal pending and never ends the process...\n");
+    backend_sighup_noop(SIGHUP);                  /* does nothing (the handler is only run for a thread that does not block SIGHUP) */
+    pid_t pid = quiet_fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = backend_sighup_noop;
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(SIGHUP, &sa, NULL) != 0) _exit(10);
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGHUP);
+        if (sigprocmask(SIG_BLOCK, &set, NULL) != 0) _exit(11);
+        if (kill(getpid(), SIGHUP) != 0) _exit(12);
+        siginfo_t si;
+        const struct timespec wait_s = {5, 0};
+        if (sigtimedwait(&set, &si, &wait_s) != SIGHUP) _exit(13);   /* stayed pending, not discarded */
+        if (si.si_pid != getpid()) _exit(14);                         /* with the sender, which sighup_from_manager() compares */
+        if (kill(getpid(), SIGHUP) != 0) _exit(15);
+        if (sigprocmask(SIG_UNBLOCK, &set, NULL) != 0) _exit(16);     /* the pending signal is taken by the handler now */
+        if (kill(getpid(), SIGHUP) != 0) _exit(17);                   /* and so is one sent to a thread that does not block it */
+        _exit(0);
+    }
+    int st = 0;
+    assert(waitpid(pid, &st, 0) == pid);
+    assert(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    printf("  -> SIGHUP handler passed.\n");
 }
 
 static void test_control_zonestatus_empty_and_populated(void) {
@@ -5345,6 +5381,7 @@ int main(void) {
     test_setup_ipc_tables_edge_cases();
     test_acquire_release_config_snapshot_concurrency();
     test_server_core_sighup_sigusr1_handlers();
+    test_backend_sighup_noop();
     test_control_zonestatus_empty_and_populated();
     test_broker_connect_error_branches();
     test_control_socket_eof_handling();

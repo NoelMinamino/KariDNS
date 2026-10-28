@@ -217,10 +217,6 @@ int pdns_zone_add_tagdef(pdns_zone_t *z, const db_tagdef_row_t *row);
 /* Parse, check and index.  0 = ok (result fields valid); -1 = failed.  Call once. */
 int pdns_zone_finish(pdns_zone_t *z);
 
-/* Convenience for tests and tools: all rows at once. */
-int pdns_zone_convert(pdns_zone_t *z, const db_record_row_t *rows, size_t n_rows,
-                      const db_meta_row_t *meta, size_t n_meta);
-
 /* ------------------------------------------------------------------ helpers */
 /* Third field of an SOA content: strict decimal digits only, <= 2^32 - 1.  Fields are separated by blanks; the
  * content may have leading / trailing blanks.  false if there are fewer than 3 fields or the serial is not valid. */
