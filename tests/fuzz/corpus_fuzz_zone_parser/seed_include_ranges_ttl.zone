@@ -1,0 +1,23 @@
+$ORIGIN fuzz.local.
+$TTL 1h30m
+@ SOA ns.fuzz.local. hostmaster.fuzz.local. 1 2h 1h30m 1w 1d
+@ 2147483647 NS ns
+ns 0 A 192.0.2.1
+a 1w2d3h4m5s A 192.0.2.2
+$INCLUDE sub/a.inc
+$INCLUDE /z/a/sub/b.inc
+$INCLUDE sub/../sub/c.inc
+$INCLUDE ../d/c.inc
+$INCLUDE ../../../../../etc/passwd
+$INCLUDE /z/a/../a/x.inc other
+$INCLUDE /z/d/y.inc
+$INCLUDE ././/x.inc
+$INCLUDE /
+$INCLUDE ..
+$INCLUDE ...
+$GENERATE 1-2 g$ 3m A 192.0.2.$
+bad 1x A 192.0.2.3
+big 2147483648 A 192.0.2.4
+$TTL 1h30mm
+$TTL abc
+$TTL

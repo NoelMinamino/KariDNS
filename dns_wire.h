@@ -522,6 +522,11 @@ void dns_canonical_downcase_rdata(uint16_t type, uint8_t *rd, size_t len);
  * テキスト形式 (ゾーンファイル) とワイヤ形式 (転送、UPDATE) のレコードを同じ形で比べるのに使う。 */
 long dns_record_canonical_rdata(const dns_record_t *rec, uint8_t *buf, size_t cap);
 uint32_t parse_ttl_value(const char *ttl_str);
+/* The strict form of the same notation (BIND 9.20 ARM 3.5.3: seconds, or w/d/h/m/s units such as 1h30m): false when ttl_str is empty, has
+ * a character that is neither a digit nor a unit, a unit without a number in front of it, or a total above max.  *out is only set on
+ * success.  Zone files use this (max 2147483647 for a TTL: ARM 3.5.5.4 "0-2147483647"); parse_ttl_value() keeps its lenient
+ * contract (3600 for bad text, clamp to 2147483647) for the SOA fields of transferred and database zones and for dag. */
+bool parse_ttl_strict(const char *ttl_str, uint64_t max, uint32_t *out);
 
 /* S5 Phase B: where domain names sit in the RDATA of the types the server reads names from, and which of them
  * serialize_dns_record() compresses. This is the single table the zone image (dns_zone_image.c) uses to write

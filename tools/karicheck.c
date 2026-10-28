@@ -274,7 +274,28 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         free(root_path);
         return 1;
     }
-    
+    /* The server decides which $INCLUDE files are allowed on absolute paths (the directory of the zone file and options { directory });
+     * karicheck makes both absolute the same way (from the current directory, as karidns does from its startup directory), so that
+     * the verdicts and messages are the same. */
+    char cwd_buf[PATH_MAX], dir_abs[PATH_MAX];
+    cwd_buf[0] = '\0';
+    if (!getcwd(cwd_buf, sizeof(cwd_buf))) cwd_buf[0] = '\0';
+    if (base_dir[0] != '/' && cwd_buf[0]) {
+        size_t n = strlen(cwd_buf) + 1 + strlen(base_dir) + 1;
+        char *abs_base = malloc(n);
+        if (abs_base) {
+            snprintf(abs_base, n, "%s/%s", cwd_buf, base_dir);
+            free(base_dir);
+            base_dir = abs_base;
+        }
+    }
+    const char *directory = NULL;
+    if (cfg && cfg->directory) {
+        if (cfg->directory[0] == '/' || !cwd_buf[0]) snprintf(dir_abs, sizeof(dir_abs), "%s", cfg->directory);
+        else snprintf(dir_abs, sizeof(dir_abs), "%s/%s", cwd_buf, cfg->directory);
+        directory = dir_abs;
+    }
+
     dev_t root_dev = 0;
     ino_t root_ino = 0;
     struct stat root_st;
@@ -290,6 +311,7 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
 
     parse_context_t ctx = {
         .base_dir = base_dir,
+        .directory = directory,
         .default_origin = domain,
         .is_standalone_mode = is_standalone,
         .err_out = &err,
@@ -349,6 +371,11 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     }
 
     zone_lint_ttl(&arena, "zone file", &tally);
+    if (ctx.no_ttl_count > 0 && !(file_format && strcasecmp(file_format, "tinydns") == 0)) {
+        kc_warning(&tally, "Zone '%s': %zu record(s) have no TTL (no $TTL, no earlier TTL, no SOA to take one from; first: '%s') and are "
+                        "served with 3600; BIND rejects such a zone (\"no TTL specified\"). Add a $TTL line\n",
+                domain, ctx.no_ttl_count, ctx.first_no_ttl_owner ? ctx.first_no_ttl_owner : "");
+    }
 
     if (build_zone_index(&arena, true) != 0) {
         kc_error(&tally, "Memory allocation failed during index build for '%s'\n", domain);
@@ -761,6 +788,24 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
         return 1;
     }
 
+    if (cfg->directory) {
+        /* karidns opens options { directory } at start-up and refuses to start without it */
+        struct stat dst;
+        if (stat(cfg->directory, &dst) != 0) {
+            fprintf(stderr, "[ERROR] options: directory '%s' cannot be accessed: %s\n", cfg->directory, strerror(errno));
+            free(buf);
+            return 1;
+        }
+        if (!S_ISDIR(dst.st_mode)) {
+            fprintf(stderr, "[ERROR] options: directory '%s' is not a directory\n", cfg->directory);
+            free(buf);
+            return 1;
+        }
+        if (cfg->directory[0] != '/')
+            fprintf(stderr, "[WARNING] options: directory '%s' is a relative path (relative to the directory karidns is started in); "
+                            "BIND recommends an absolute path\n", cfg->directory);
+    }
+
     int program_zone_count = 0;
     const view_config_t *zv;
     zone_config_t *z;
@@ -853,6 +898,9 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
                 return 1;
             }
         } else if (z->type && strcasecmp(z->type, "forward") == 0) {
+            fprintf(stderr, "[INFO] Zone '%s': type 'forward' keeps its KariDNS meaning (this authoritative server relays the queries of the "
+                            "zone to its forwarders). In BIND it is a resolver-side zone type, so a BIND configuration that relies on it is "
+                            "not equivalent\n", z->domain);
             if (zx->forwarders_count == 0) {
                 fprintf(stderr, "[ERROR] Zone '%s' has type 'forward' but no 'forwarders' specified\n",
                         z->domain);

@@ -54,7 +54,7 @@ run_check_zone() {
 }
 
 # 1. Invalid TTL Suffixes & Overflow
-run_check_zone "Invalid TTL suffixes & overflow" "err-ttl.example." "tests/zones/test_err_ttl_invalid.zone" 0
+run_check_zone "Invalid TTL suffixes & overflow (an error since BIND compat batch 1: it used to be 3600)" "err-ttl.example." "tests/zones/test_err_ttl_invalid.zone" 1
 
 # 2. Bad Directives
 run_check_zone "Bad Directives (\$ORIGIN / \$GENERATE)" "example.com." "tests/zones/test_err_bad_directive.zone" 1

@@ -12,6 +12,13 @@ options {
     user "named";
     group "named";
 
+    // 作業ディレクトリ (BIND の directory)。設定すると、相対パスの zone の file、
+    // pid-file、ログの file、include、ゾーンファイルの $INCLUDE はすべてここからの
+    // 相対になる (絶対パスの指定を推奨)。未指定なら起動したディレクトリからの相対。
+    // 起動時に開くので、変更の反映には再起動が必要。$INCLUDE で読めるのは
+    // ゾーンファイルのディレクトリ以下と directory 以下だけ (Capsicum の制約)
+    // directory "/usr/local/etc/karidns";
+
     // PIDファイル ("none" で作成を無効化、未指定時は /var/run/karidns/karidns.pid)
     // 一般ユーザーで起動する場合は書き込み可能なディレクトリを指定する
     // pid-file "/var/run/karidns/karidns.pid";
@@ -82,7 +89,7 @@ control-channel {
 
 // 外部設定ファイルのインクルード (include ディレクティブ)
 // トップレベルだけでなく、ブロック内やリストの途中など任意の場所で使用できます。
-// 相対パスは当設定ファイルの配置ディレクトリを起点に解決されます。
+// 相対パスは options の directory があればそこから、無ければ当設定ファイルの配置ディレクトリを起点に解決されます。
 // include "/usr/local/etc/karidns/keys.conf";
 
 // ゾーン転送(AXFR)やNOTIFYで使用するTSIGキー

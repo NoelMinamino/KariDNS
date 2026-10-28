@@ -2753,6 +2753,7 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
   if (str_differs(o->user, n->user)) append_list_item(buf, sz, "user");
   if (str_differs(o->group, n->group)) append_list_item(buf, sz, "group");
   if (str_differs(o->pid_file, n->pid_file)) append_list_item(buf, sz, "pid-file");
+  if (n->directory_changed) append_list_item(buf, sz, "directory");
   if (o->udp_recvbuf_size != n->udp_recvbuf_size) append_list_item(buf, sz, "udp-recvbuf-size");
   if (o->udp_sndbuf_size != n->udp_sndbuf_size) append_list_item(buf, sz, "udp-sndbuf-size");
   if (o->tcp_window != n->tcp_window) append_list_item(buf, sz, "tcp-window");
@@ -5188,6 +5189,17 @@ int main(int argc, char **argv) {
     return 1;
   }
   free(config_str);
+  /* options { directory }: opened once, here, before any sandbox; a reload keeps using it (config_pin_directory) and reports a changed
+   * value as needing a restart.  Its sub-directories (zone files below it, $INCLUDE files) are reached through this fd afterwards. */
+  config_pin_directory(g_config_db.config_a.directory);
+  if (g_config_db.config_a.directory && !dir_fd_cache_add_root(g_config_db.config_a.directory)) {
+    syslog(LOG_ERR, "[Config] Refusing to start: options { directory \"%s\"; } cannot be opened: %s", g_config_db.config_a.directory,
+           strerror(errno));
+    fprintf(stderr, "[ERROR] Refusing to start: options { directory \"%s\"; } cannot be opened: %s\n", g_config_db.config_a.directory,
+            strerror(errno));
+    free_server_config_fields(&g_config_db.config_a);
+    return 1;
+  }
   g_config_db.config_a.generation = 1;
   /* 共有の応答キャッシュ: 起動時に 1 回だけ確保する (大きさの変更は再起動で反映) */
   if (g_config_db.config_a.response_cache_size > 0 &&

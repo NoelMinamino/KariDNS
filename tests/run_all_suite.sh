@@ -443,12 +443,13 @@ register_test "core" "sh" "tests/run_logging_channel_validation_test.sh" "Syslog
 register_test "core" "sh" "tests/run_mx_srv_glue_test.sh" "MX & SRV target additional glue inclusion"
 register_test "core" "sh" "tests/run_also_notify_test.sh" "also-notify as in BIND 9.20: options/view/zone, port before the list, remote-servers names, per-address TSIG key; karicheck errors with file:line" "par"
 register_test "core" "sh" "tests/run_bind_acl_test.sh" "BIND ACL batch: allow-query in options/view/zone (REFUSED + EDE 18 over UDP and TCP, warm response cache, CNAME into a closed zone, reload), allow-query-on, allow-transfer inheritance and first-match key evaluation, karicheck conf errors and the more-permissive warning (loopback alias when root)" "group:alias"   # loopback alias (ifconfig lo0 alias) as a second client / local address: one at a time
+register_test "core" "sh" "tests/run_bind_compat_paths_test.sh" "BIND compat batch 1: options { directory } as the base of zone file / include / \$INCLUDE / pid-file / log files (capability mode, started from another directory, reload into a new sub-directory, \$INCLUDE outside the opened directories refused with the reason, changed directory needs a restart), zone/view class IN, skipped hint/stub/static-stub/mirror/redirect zones, a FreeBSD style BIND named.conf (karicheck conf warnings only, served), karicheck \$INCLUDE verdicts, invalid class / port / TTL errors"
 register_test "core" "sh" "tests/run_notify_source_test.sh" "RFC 1996 notify-source address binding" "serial"   # fixed ports 10053/10054 and the loopback alias 127.0.0.2 (the control socket is the test's own)
 register_test "core" "sh" "tests/run_privilege_drop_root_test.sh" "FreeBSD setuid/setgid privilege drop"
 register_test "core" "sh" "tests/run_nonroot_startup_test.sh" "Non-root startup & fail-closed port/log/pid/control checks"
 register_test "core" "sh" "tests/run_response_cache_test.sh" "Response cache hit/miss functional verification"
 register_test "core" "sh" "tests/run_ttl_harmonization_test.sh" "RRset TTL harmonization on zone load"
-register_test "core" "sh" "tests/run_ttl_rfc2181_clamp_test.sh" "TTL high bit clamped to 2147483647 (RFC 8767 §4, O-14)"
+register_test "core" "sh" "tests/run_ttl_rfc2181_clamp_test.sh" "TTL range of zone files (BIND 9.20 ARM 3.5.5.4: above 2147483647 is rejected) and the clamp to 2147483647 on the wire (RFC 8767 §4, O-14)"
 register_test "core" "sh" "tests/run_zone_oom_partial_load_test.sh" "OOM fail-closed zone loading rollback"
 register_test "core" "sh" "tests/run_coverage_merge_test.sh" "Coverage report tolerates corrupt raw profiles (SIGKILL during profile write)"
 register_test "core" "sh" "tests/run_malformed_detection_default_test.sh" "Structural malformation detection in default mode (RFC 1035 §4.1.1)"

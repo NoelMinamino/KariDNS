@@ -357,8 +357,56 @@ static void test_priv_sandbox_path_errors(void) {
     printf("  -> Priv Sandbox refused paths passed.\n");
 }
 
+/* dir_fd_cache_add_root(): in capability mode a directory that nobody opened before can be opened below a registered root (read-only, a plain
+ * relative remainder, no ".."), and nowhere else.  The flag is set by hand; the process is not in capability mode, so the openat()
+ * itself always works and what is tested is the decision of the cache. */
+static void test_priv_sandbox_root_below(void) {
+    printf("[TEST] Priv Sandbox: directories below a registered root in capability mode...\n");
+    char root[] = "/tmp/karidns_sbroot_XXXXXX";
+    assert(mkdtemp(root));
+    char p[PATH_MAX], sibling[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/sub", root);               assert(mkdir(p, 0755) == 0);
+    snprintf(p, sizeof(p), "%s/sub/deeper", root);        assert(mkdir(p, 0755) == 0);
+    snprintf(p, sizeof(p), "%s/sub/deeper/f.txt", root);
+    int fd = open(p, O_CREAT | O_WRONLY, 0600);           assert(fd >= 0);
+    close(fd);
+    snprintf(sibling, sizeof(sibling), "%s_evil", root);  assert(mkdir(sibling, 0755) == 0);
+    char sp[PATH_MAX];
+    snprintf(sp, sizeof(sp), "%s/g.txt", sibling);
+    fd = open(sp, O_CREAT | O_WRONLY, 0600);              assert(fd >= 0);
+    close(fd);
+
+    errno = 0; assert(!dir_fd_cache_add_root("/karidns_no_such_dir_x") && errno == ENOENT);
+    errno = 0; assert(!dir_fd_cache_add_root("") && errno == EINVAL);
+    assert(dir_fd_cache_add_root(root));                  /* before the sandbox: opens and marks the root */
+
+    atomic_store_explicit(&g_capsicum_enabled, true, memory_order_release);
+    fd = open_via_dir_cache(p, O_RDONLY, 0, false);       /* two levels below the root, never opened before */
+    assert(fd >= 0);
+    close(fd);
+    char dd[PATH_MAX];
+    snprintf(dd, sizeof(dd), "%s/sub/deeper/f.txt", root);
+    fd = open_via_dir_cache(dd, O_RDONLY, 0, false);      /* now cached */
+    assert(fd >= 0);
+    close(fd);
+    snprintf(dd, sizeof(dd), "%s/sub/../sub/deeper/f.txt", root);          /* ".." in the remainder */
+    errno = 0; assert(open_via_dir_cache(dd, O_RDONLY, 0, false) == -1 && errno == ENOTCAPABLE);
+    errno = 0; assert(open_via_dir_cache(sp, O_RDONLY, 0, false) == -1 && errno == ENOTCAPABLE);     /* same prefix, other directory */
+    errno = 0; assert(open_via_dir_cache("/etc/hosts", O_RDONLY, 0, false) == -1 && errno == ENOTCAPABLE);
+    snprintf(dd, sizeof(dd), "%s/sub/new.txt", root);
+    errno = 0; assert(open_via_dir_cache(dd, O_CREAT | O_WRONLY, 0600, true) == -1 && errno == ENOTCAPABLE);   /* below a root: read only */
+    snprintf(dd, sizeof(dd), "%s/nosuchdir/f.txt", root);
+    errno = 0; assert(open_via_dir_cache(dd, O_RDONLY, 0, false) == -1);                                   /* missing directory */
+    atomic_store_explicit(&g_capsicum_enabled, false, memory_order_release);
+
+    snprintf(dd, sizeof(dd), "rm -rf %s %s", root, sibling);
+    assert(system(dd) == 0);
+    printf("  -> roots passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Sandbox & Snapshot RCU Engine Unit Tests ===\n");
+    test_priv_sandbox_root_below();
     test_priv_sandbox_directory_caching();
     test_priv_sandbox_path_errors();
     test_snapshot_rcu_lifecycle_and_suffix_lookup();

@@ -872,6 +872,19 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   ctx.source_mtime = root_st.st_mtime; // X-13: tinydns の SOA serial。パーサはパスを stat しない
 
   server_config_t *active_cfg = acquire_config_snapshot();
+  /* options { directory }: a relative $INCLUDE is read from it, and the tree below it is one of the two ranges an $INCLUDE may lie in
+   * (the other is the directory of the zone file).  Both were opened at startup; they are registered as roots so that a directory
+   * below them that a reload brings in can still be opened in capability mode. */
+  char dir_abs[PATH_MAX];
+  if (active_cfg && active_cfg->directory && active_cfg->directory[0]) {
+      if (active_cfg->directory[0] != '/' && g_startup_cwd[0] != '\0')
+          snprintf(dir_abs, sizeof(dir_abs), "%s/%s", g_startup_cwd, active_cfg->directory);
+      else
+          snprintf(dir_abs, sizeof(dir_abs), "%s", active_cfg->directory);
+      ctx.directory = dir_abs;
+      (void)dir_fd_cache_add_root(dir_abs);
+  }
+  (void)dir_fd_cache_add_root(ctx.base_dir);
   // 親子ゾーンの振り分けに使うのは、このゾーンと同じ view のゾーンだけ (R-26)。
   // 別の view にしか無い子ゾーンの名前で、この view のレコードを落とさない。
   view_config_t *own_view = NULL;
@@ -897,6 +910,10 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   free((void*)ctx.base_dir);
   free(root_path);
 
+  if (count >= 0 && ctx.no_ttl_count > 0)
+      syslog(LOG_WARNING, "[Zone] zone '%s' (%s): %zu record(s) have no TTL (no $TTL, no earlier TTL, no SOA to take one from; first: '%s') "
+             "and are served with 3600; BIND rejects such a zone", entry->domain, file, ctx.no_ttl_count,
+             ctx.first_no_ttl_owner ? ctx.first_no_ttl_owner : "");
   if (count < 0) {
       zone_arena_destroy(z_standby);
       pthread_mutex_unlock(&entry->writer_lock);

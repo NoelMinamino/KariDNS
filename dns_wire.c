@@ -2387,6 +2387,37 @@ uint32_t parse_ttl_value(const char *ttl_str) {
     return (uint32_t)total;
 }
 
+bool parse_ttl_strict(const char *ttl_str, uint64_t max, uint32_t *out) {
+    if (!ttl_str || !*ttl_str || max > 0xFFFFFFFFULL) return false;
+    uint64_t total = 0;
+    const char *p = ttl_str;
+    while (*p) {
+        if (!isdigit((unsigned char)*p)) return false;    /* no sign, no blank, no unit without a number */
+        uint64_t num = 0;
+        while (isdigit((unsigned char)*p)) {
+            num = num * 10 + (uint64_t)(*p - '0');
+            if (num > max) return false;                    /* also keeps num * multiplier below 2^64 */
+            p++;
+        }
+        uint64_t multiplier = 1;
+        if (*p) {
+            switch (tolower((unsigned char)*p)) {
+                case 's': multiplier = 1; break;
+                case 'm': multiplier = 60; break;
+                case 'h': multiplier = 3600; break;
+                case 'd': multiplier = 86400; break;
+                case 'w': multiplier = 604800; break;
+                default: return false;
+            }
+            p++;
+        }
+        total += num * multiplier;
+        if (total > max) return false;
+    }
+    *out = (uint32_t)total;
+    return true;
+}
+
 /* RFC 6742 2.3/2.4: the NID/L64 identifier is written like the low 64 bits of an IPv6 address - four
  * ':'-separated groups of 1-4 hex digits, no leading zeros required (both "14:4f01:0:1" and "0014:4f01:0000:0001"
  * denote the same 8 bytes). Returns true and fills node_id[8] on success. */
