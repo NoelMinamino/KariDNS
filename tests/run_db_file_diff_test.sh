@@ -211,6 +211,19 @@ while [ $k -le $R ]; do
     SC=$!
     if ! wait_log "$D/b.log" "\[DB\] initial load complete" 30; then fail "round $k: the database server did not finish its startup batch"; sed 's/^/         /' "$D/b.log" | tail -10; stop_servers; k=$((k + 1)); continue; fi
     sleep 0.5
+    # C must hold every zone of the round before any is compared: an answer from B can carry glue from another zone of the round in
+    # its additional section, and C transfers the zones a few at a time (transfers-per-ns 2 and transfers-in 10, the BIND defaults)
+    j=0
+    while IFS="$TAB" read -r apex f sqlf; do
+        printf '%s. SOA p\n' "$apex" > "$D/soa.list"
+        "$T/dbquery" -p "$PB" -t 3 "$D/soa.list" "$D/soa.b" > /dev/null 2>&1
+        rcode_of "$D/soa.b" | grep -q "^0 [1-9]" || continue   # not served from the database: skipped below
+        while [ $j -lt 600 ]; do
+            "$T/dbquery" -p "$PC" -t 2 "$D/soa.list" "$D/soa.c" > /dev/null 2>&1
+            rcode_of "$D/soa.c" | grep -q "^0 [1-9]" && break
+            sleep 0.1; j=$((j + 1))
+        done
+    done < "$T/round.$k.list"
     while IFS="$TAB" read -r apex f sqlf; do
         printf '%s. SOA p\n' "$apex" > "$D/soa.list"
         "$T/dbquery" -p "$PA" -t 3 "$D/soa.list" "$D/soa.a" > /dev/null 2>&1
