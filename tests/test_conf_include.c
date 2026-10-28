@@ -366,12 +366,12 @@ int main(void) {
         printf("  -> PASS (zone-level additional-from-auth correctly parsed)\n");
     }
 
-    // Test 11: Unknown blocks & unknown key properties (skip_unknown_block)
+    // Test 11: Unknown top-level blocks and BIND-only options (skip_unknown_block)
     {
         printf("[Test 11] Unknown blocks & properties (skip_unknown_block)...\n");
         create_file("tests_inc_tmp/unknown_blocks.conf",
                     "unknown-top-block { opt1 \"val\"; nested { opt2 \"val\"; }; };\n"
-                    "key \"test-key\" { unknown-prop \"val\"; algorithm \"hmac-sha256\"; secret \"k7e8vW8f0W4v9B+5Y8f0W4v9B+5Y8f0W4v9B+5Y8f0U=\"; };\n"
+                    "key \"test-key\" { algorithm \"hmac-sha256\"; secret \"k7e8vW8f0W4v9B+5Y8f0W4v9B+5Y8f0W4v9B+5Y8f0U=\"; };\n"
                     "zone \"example.com\" { type master; file \"example.com.zone\"; zone-statistics yes; inline-signing { a; }; };\n");
 
         char *buf = read_entire_file("tests_inc_tmp/unknown_blocks.conf", NULL, NULL);
@@ -389,13 +389,17 @@ int main(void) {
 
     // Test 11b (B6a, open item 2): a statement that neither KariDNS nor BIND knows inside zone { } / view { } is an error
     {
-        printf("[Test 11b] Unknown statements inside zone { } and view { } are configuration errors...\n");
+        printf("[Test 11b] Unknown statements inside options { }, key { }, zone { } and view { } are configuration errors...\n");
         static const char *const bad[] = {
             "zone \"example.com\" { type master; file \"example.com.zone\"; unknown-zone-prop \"ignore\"; };\n",
             "zone \"example.com\" { type master; file \"example.com.zone\"; alow-transfer { any; }; };\n",
             "zone \"example.com\" { type master; file \"example.com.zone\"; notify-retry-foo 3; };\n",
             "view \"v\" { match-clients { any; }; bogus-view-option yes; zone \"example.com\" { type master; file \"example.com.zone\"; }; };\n",
             "view \"v\" { zone \"example.com\" { type master; file \"example.com.zone\"; nonsense { a; b; }; }; };\n",
+            "options { bind-adress { 127.0.0.1; }; };\n",
+            "options { custom-option-foo-bar 123; port 5353; };\n",
+            "key \"k\" { unknown-prop \"val\"; algorithm hmac-sha256; secret \"k7e8vW8f0W4v9B+5Y8f0W4v9B+5Y8f0W4v9B+5Y8f0U=\"; };\n",
+            "key \"k\" { algorithm hmac-sha256; };\n",
         };
         for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
             server_config_t cfg;
@@ -410,6 +414,7 @@ int main(void) {
         static const char *const good[] = {
             "view \"v\" { match-clients { any; }; recursion no; allow-query { any; }; zone \"example.com\" { type master; file \"example.com.zone\"; notify no; }; };\n",
             "zone \"example.com\" { type master; file \"example.com.zone\"; allow-query { any; }; dnssec-policy default; max-journal-size 1M; };\n",
+            "options { listen-on { 127.0.0.1; }; recursion no; port 5353; };\n",
         };
         for (size_t i = 0; i < sizeof(good) / sizeof(good[0]); i++) {
             server_config_t cfg;
