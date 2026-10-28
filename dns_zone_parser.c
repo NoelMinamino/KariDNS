@@ -1594,6 +1594,19 @@ PROCESS_RECORD:
   /* The SOA fields refresh, retry, expire and minimum are written like TTLs (RFC 1035 §3.3.13; BIND parses them with
    * dns_ttl_fromtext): text that is not a number with optional units used to become 3600 in the SOA. */
   if (rec->type_code == 6 && rec->rdata_count == 7) {
+    /* the serial is a plain number up to 4294967295 (BIND soa_6.c fromtext_soa: a number token, then uint32_tobuffer); anything else rejects
+     * the zone in BIND, here it used to be read as 0 or truncated */
+    uint32_t serial_v;
+    int serial_err;
+    if (!parse_soa_serial_strict(rec->rdata[2], &serial_v, &serial_err)) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = serial_err == 2 ? "SOA serial out of range (expected 0-4294967295)"
+                                                      : "Invalid SOA serial (expected a number 0-4294967295)";
+        ctx->err_out->error_offset = (size_t)(rec->rdata[2] - buf);
+        ctx->err_out->token_length = strlen(rec->rdata[2]);
+      }
+      return -1;
+    }
     for (int sf = 3; sf <= 6; sf++) {
       uint32_t sv;
       if (!parse_ttl_strict(rec->rdata[sf], 0xFFFFFFFFu, &sv)) {

@@ -2388,8 +2388,11 @@ uint32_t parse_ttl_value(const char *ttl_str) {
 }
 
 bool parse_ttl_strict(const char *ttl_str, uint64_t max, uint32_t *out) {
-    if (!ttl_str || !*ttl_str || max > 0xFFFFFFFFULL) return false;
+    /* BIND 9.20 lib/dns/ttl.c bind_ttl(): at most 63 characters; w/d/h/m/s units in either case; a number without a unit is accepted only
+     * when nothing was read before it ("30", but not "1h30"); any other character is a syntax error; above 0xffffffff is a range error */
+    if (!ttl_str || !*ttl_str || max > 0xFFFFFFFFULL || strlen(ttl_str) > 63) return false;
     uint64_t total = 0;
+    bool seen_unit = false;
     const char *p = ttl_str;
     while (*p) {
         if (!isdigit((unsigned char)*p)) return false;    /* no sign, no blank, no unit without a number */
@@ -2410,11 +2413,38 @@ bool parse_ttl_strict(const char *ttl_str, uint64_t max, uint32_t *out) {
                 default: return false;
             }
             p++;
+            seen_unit = true;
+        } else if (seen_unit) {
+            return false;                                    /* "1h30": a plain number after a unit */
         }
         total += num * multiplier;
         if (total > max) return false;
     }
     *out = (uint32_t)total;
+    return true;
+}
+
+/* The serial of a SOA record as BIND 9.20 reads it from text (lib/dns/rdata/generic/soa_6.c fromtext_soa(): isc_lex_getmastertoken() with
+ * isc_tokentype_number, then uint32_tobuffer()).  The lexer returns a number token only for a run of decimal digits that ends at a delimiter
+ * (isc_lex_gettoken lexstate_number); a sign, a unit letter, a hex prefix or any other character makes it a string and the field is
+ * ISC_R_BADNUMBER; a value that does not fit 32 bits is ISC_R_RANGE (isc_parse_uint32); a missing field is ISC_R_UNEXPECTEDEND.  So: one or
+ * more digits (leading zeros allowed), 0..4294967295.  *err says which: 0 = ok, 1 = not a number (empty included), 2 = out of range. */
+bool parse_soa_serial_strict(const char *s, uint32_t *out, int *err) {
+    int dummy;
+    if (!err) err = &dummy;
+    *err = 1;
+    if (!s || !*s) return false;
+    uint64_t v = 0;
+    for (const char *p = s; *p; p++) {
+        if (!isdigit((unsigned char)*p)) return false;
+        if (v <= 0xFFFFFFFFULL) v = v * 10 + (uint64_t)(*p - '0');   /* stops growing once it is out of range: no overflow */
+    }
+    if (v > 0xFFFFFFFFULL) {
+        *err = 2;
+        return false;
+    }
+    *err = 0;
+    if (out) *out = (uint32_t)v;
     return true;
 }
 

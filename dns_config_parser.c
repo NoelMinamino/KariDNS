@@ -4039,18 +4039,58 @@ static bool dir_prefix_zones(zone_config_t *z, const char *dir) {
   return true;
 }
 
+/* The directory the server was started in (config_set_base_cwd), NULL in karicheck and the tests. */
+static char *g_conf_base_cwd = NULL;
+
+void config_set_base_cwd(const char *cwd) {
+  free(g_conf_base_cwd);
+  g_conf_base_cwd = (cwd && cwd[0] == '/') ? strdup(cwd) : NULL;
+}
+
+/* *path becomes "<startup directory>/<path>" when a startup directory is known and *path is relative; an absolute path, "" and NULL stay.
+ * The result must not be longer than maxlen bytes: a configuration error, never a truncated path.  -1 = error (reported, ctx marked). */
+static int path_absolutize(token_ctx_t *ctx, char **path, const char *what, size_t maxlen) {
+  if (!g_conf_base_cwd || !*path || (*path)[0] == '\0' || (*path)[0] == '/') return 0;
+  size_t n = strlen(g_conf_base_cwd) + 1 + strlen(*path);
+  if (n > maxlen) {
+    conf_error(ctx, "options", "%s: the relative path '%.64s' is %zu bytes long once it is made absolute against the directory karidns was "
+               "started in (at most %zu); use a shorter path", what, *path, n, maxlen);
+    return -1;
+  }
+  char *p = malloc(n + 1);
+  if (!p) {
+    ctx->error_occurred = true;
+    return -1;
+  }
+  snprintf(p, n + 1, "%s/%s", g_conf_base_cwd, *path);
+  free(*path);
+  *path = p;
+  return 0;
+}
+
 /* options { directory } (BIND 9.20 ARM): the base of every relative path.  Decides which directory applies (the one the running server was
  * started with when config_pin_directory() was called, else the one written), keeps it in config->directory and makes the relative paths
  * of the configuration absolute-or-startup-relative by putting it in front: zone `file`, `pid-file`, the files of logging channels,
  * the control and dnstap sockets and the database files (`include` statements were resolved against it while they were read).
  * Everything downstream (the directory fd cache, the zone loader, the logging code) then sees ordinary paths and opens the directory
  * once, before the sandbox, like any other.  Without a directory nothing changes: relative paths are relative to the directory the
- * server was started in. */
+ * server was started in.
+ * When the server told the parser where it was started (config_set_base_cwd), the paths that are used after daemonize() -- which chdir()s to
+ * "/" -- are made absolute here, once: the directory itself, pid-file, loader-path and the database files that karidns-dbloader (started
+ * from "/" too) opens.  UNIX socket paths and the files that go through the directory fd cache (which resolves relative names against the
+ * startup directory fd, not the current directory) are left as they are. */
 static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
-  const char *written = ctx->dir_written;
-  const char *eff;
+  char *written = ctx->dir_written ? strdup(ctx->dir_written) : NULL;
+  char *eff = NULL;
+  int rc = -1;
+  if (ctx->dir_written && !written) goto oom;
+  if (written && path_absolutize(ctx, &written, "options: directory", KARIDNS_DB_PATH_MAX) != 0) goto out;
   if (ctx->dir_pinned) {
-    eff = ctx->directory;
+    if (ctx->directory) {
+      eff = strdup(ctx->directory);
+      if (!eff) goto oom;
+      if (path_absolutize(ctx, &eff, "options: directory", KARIDNS_DB_PATH_MAX) != 0) goto out;
+    }
     bool same = written ? (eff && strcmp(written, eff) == 0) : eff == NULL;
     if (!same) {
       syslog(LOG_WARNING, "[Config] options: directory %s%s%s differs from the directory the server was started with (%s%s%s); "
@@ -4061,36 +4101,48 @@ static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
               written ? "'" : "", written ? written : "(not set)", written ? "'" : "", eff ? "'" : "", eff ? eff : "not set", eff ? "'" : "");
       config->directory_changed = true;
     }
+    free(written);
   } else {
-    eff = written;
-    bool seen_by_include = written && ctx->directory && strcmp(written, ctx->directory) == 0;
-    if (written && !seen_by_include && ctx->dir_rel_before > 0) {
+    bool seen_by_include = ctx->dir_written && ctx->directory && strcmp(ctx->dir_written, ctx->directory) == 0;
+    if (ctx->dir_written && !seen_by_include && ctx->dir_rel_before > 0) {
       conf_error(ctx, "options", "directory: relative 'include' statements were read before this statement, which is not in the main "
                  "configuration file; write 'directory' in the main file (BIND applies it to every include)");
-      return -1;
+      goto out;
     }
+    eff = written;
   }
-  if (!eff) return 0;
-  config->directory = strdup(eff);
-  if (!config->directory) {
-    ctx->error_occurred = true;
-    return -1;
+  written = NULL;
+  if (eff) {
+    config->directory = strdup(eff);
+    if (!config->directory) goto oom;
+    bool ok = true;
+    if (config->pid_file && strcmp(config->pid_file, "none") != 0) ok = ok && dir_prefix_path(&config->pid_file, eff);
+    ok = ok && dir_prefix_zones(config->zones, eff);
+    for (view_config_t *v = config->views; ok && v; v = v->next) {
+      ok = dir_prefix_zones(v->zones, eff) && dir_prefix_path(&v->database_file, eff);
+    }
+    for (log_channel_t *c = config->logging.channels; ok && c; c = c->next)
+      ok = dir_prefix_path(&c->file_path, eff);
+    ok = ok && dir_prefix_path(&config->control.socket_path, eff) && dir_prefix_path(&config->dnstap.socket_path, eff) &&
+         dir_prefix_path(&config->database.database_file, eff) && dir_prefix_path(&config->database.conninfo_file, eff);
+    if (!ok) goto oom;
   }
-  bool ok = true;
-  if (config->pid_file && strcmp(config->pid_file, "none") != 0) ok = ok && dir_prefix_path(&config->pid_file, eff);
-  ok = ok && dir_prefix_zones(config->zones, eff);
-  for (view_config_t *v = config->views; ok && v; v = v->next) {
-    ok = dir_prefix_zones(v->zones, eff) && dir_prefix_path(&v->database_file, eff);
-  }
-  for (log_channel_t *c = config->logging.channels; ok && c; c = c->next)
-    ok = dir_prefix_path(&c->file_path, eff);
-  ok = ok && dir_prefix_path(&config->control.socket_path, eff) && dir_prefix_path(&config->dnstap.socket_path, eff) &&
-       dir_prefix_path(&config->database.database_file, eff) && dir_prefix_path(&config->database.conninfo_file, eff);
-  if (!ok) {
-    ctx->error_occurred = true;
-    return -1;
-  }
-  return 0;
+  /* what is still relative (no directory, or a relative directory without a startup directory) and is opened after daemonize() */
+  if (config->pid_file && strcmp(config->pid_file, "none") != 0 &&
+      path_absolutize(ctx, &config->pid_file, "pid-file", KARIDNS_DB_PATH_MAX) != 0) goto out;
+  if (path_absolutize(ctx, &config->database.database_file, "database database-file", KARIDNS_DB_PATH_MAX) != 0 ||
+      path_absolutize(ctx, &config->database.conninfo_file, "database conninfo-file", KARIDNS_DB_PATH_MAX) != 0 ||
+      path_absolutize(ctx, &config->database.loader_path, "database loader-path", KARIDNS_DB_PATH_MAX) != 0) goto out;
+  for (view_config_t *v = config->views; v; v = v->next)
+    if (path_absolutize(ctx, &v->database_file, "view database-file", KARIDNS_DB_PATH_MAX) != 0) goto out;
+  rc = 0;
+  goto out;
+oom:
+  ctx->error_occurred = true;
+out:
+  free(written);
+  free(eff);
+  return rc;
 }
 
 static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) {

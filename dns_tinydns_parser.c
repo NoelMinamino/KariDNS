@@ -694,7 +694,31 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             }
 
             unsigned long ser = default_serial;
-            if (flen[3] > 0) ser = strtoul(f[3], NULL, 10);
+            if (flen[3] > 0) {
+                /* the serial is a plain number up to 4294967295, as in a BIND SOA (parse_soa_serial_strict); strtoul read "abc" as 0 and
+                 * let a value above 32 bits through.  Empty still means the data file's time stamp (tinydns-data). */
+                char sbuf[64];
+                uint32_t sv;
+                int serr;
+                bool ok = flen[3] < sizeof(sbuf);
+                if (ok) {
+                    memcpy(sbuf, f[3], flen[3]);
+                    sbuf[flen[3]] = '\0';
+                    ok = parse_soa_serial_strict(sbuf, &sv, &serr);
+                } else {
+                    serr = 2;
+                }
+                if (!ok) {
+                    if (ctx && ctx->err_out) {
+                        ctx->err_out->error_message = serr == 2 ? "SOA serial out of range (expected 0-4294967295)"
+                                                                : "Invalid SOA serial (expected a number 0-4294967295)";
+                        ctx->err_out->error_offset = (size_t)(f[3] - buf);
+                        ctx->err_out->token_length = flen[3];
+                    }
+                    return false;
+                }
+                ser = sv;
+            }
             unsigned long ref = DEFAULT_SOA_REFRESH;
             if (flen[4] > 0) ref = strtoul(f[4], NULL, 10);
             unsigned long ret = DEFAULT_SOA_RETRY;

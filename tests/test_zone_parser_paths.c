@@ -1898,7 +1898,14 @@ static void test_bind_compat_batch1(void) {
     assert(parse_ttl_strict("2147483647", 2147483647u, &v) && v == 2147483647u);
     assert(parse_ttl_strict("1w2d3h4m5s", 2147483647u, &v) && v == 788645u);
     assert(parse_ttl_strict("1H30M", 2147483647u, &v) && v == 5400u);
-    assert(parse_ttl_strict("1h30", 2147483647u, &v) && v == 3630u);        /* a trailing number is seconds */
+    assert(parse_ttl_strict("30", 2147483647u, &v) && v == 30u);            /* a plain number alone is seconds ... */
+    assert(!parse_ttl_strict("1h30", 2147483647u, &v));                     /* ... but not after a unit (BIND bind_ttl(): DNS_R_SYNTAX) */
+    assert(!parse_ttl_strict("1w2d30", 2147483647u, &v));
+    {   char long64[80];                                                    /* bind_ttl(): at most 63 characters */
+        memset(long64, '0', sizeof(long64)); long64[63] = '1'; long64[64] = '\0';
+        assert(!parse_ttl_strict(long64, 2147483647u, &v));
+        long64[63] = '\0';
+        assert(parse_ttl_strict(long64, 2147483647u, &v) && v == 0u);   }
     assert(parse_ttl_strict("035", 2147483647u, &v) && v == 35u);
     assert(parse_ttl_strict("4294967295", 0xFFFFFFFFu, &v) && v == 4294967295u);
     static const char *const bad_ttl[] = { "", "abc", "1x", "1hh", "h", "-1", "+1", " 1", "1 ", "1.5", "2147483648", "4294967296",
@@ -1940,6 +1947,50 @@ static void test_bind_compat_batch1(void) {
         assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "SOA"));
         zt_free(&z);
     }
+    /* the SOA serial (BIND 9.20 soa_6.c fromtext_soa: a number token, lexer: decimal digits up to a delimiter; isc_parse_uint32: > 32 bits is
+     * ISC_R_RANGE): digits only, 0..4294967295; anything else rejects the zone (it used to read as 0 or be cut to 32 bits) */
+    {
+        uint32_t sv = 77;
+        int se = -1;
+        assert(parse_soa_serial_strict("0", &sv, &se) && sv == 0 && se == 0);
+        assert(parse_soa_serial_strict("4294967295", &sv, &se) && sv == 4294967295u);
+        assert(parse_soa_serial_strict("000000000000000000000000000001", &sv, &se) && sv == 1u);
+        static const char *const bad_num[] = { "", "abc", "1x", "-1", "+1", " 1", "1 ", "1.5", "0x10", "1h", "1e3" };
+        for (size_t i = 0; i < N(bad_num); i++) {
+            sv = 77; se = -1;
+            if (parse_soa_serial_strict(bad_num[i], &sv, &se) || se != 1 || sv != 77) { fprintf(stderr, "serial '%s'\n", bad_num[i]); assert(0); }
+        }
+        static const char *const big[] = { "4294967296", "99999999999999999999999999", "18446744073709551616", "10000000000" };
+        for (size_t i = 0; i < N(big); i++) {
+            sv = 77; se = -1;
+            if (parse_soa_serial_strict(big[i], &sv, &se) || se != 2 || sv != 77) { fprintf(stderr, "serial '%s'\n", big[i]); assert(0); }
+        }
+        assert(!parse_soa_serial_strict(NULL, &sv, NULL));
+    }
+    zt_load(&z, "$ORIGIN example.\n$TTL 300\n@ SOA ns h 4294967295 2 3 4 5\n");
+    ASSERT_PARSED(&z);
+    zt_free(&z);
+    static const char *const bad_serial[] = {
+        "@ SOA ns h abc 2 3 4 5\n", "@ SOA ns h -1 2 3 4 5\n", "@ SOA ns h +1 2 3 4 5\n", "@ SOA ns h 1x 2 3 4 5\n", "@ SOA ns h 1h 2 3 4 5\n",
+        "@ SOA ns h 4294967296 2 3 4 5\n", "@ SOA ns h 99999999999999999999 2 3 4 5\n",
+        "@ SOA ns h 0x10 2 3 4 5\n", "@ SOA ns h 1.5 2 3 4 5\n",
+    };
+    for (size_t i = 0; i < N(bad_serial); i++) {
+        snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 300\n%s", bad_serial[i]);
+        zt_load(&z, text);
+        assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "SOA serial"));
+        assert(z.err.error_offset == strlen("$ORIGIN example.\n$TTL 300\n@ SOA ns h "));
+        zt_free(&z);
+    }
+    zt_load(&z, "$ORIGIN example.\n$TTL 300\n@ SOA ns h \"\" 2 3 4 5\n");        /* an empty (quoted) serial */
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "SOA serial"));
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$TTL 300\n@ SOA ns h 4294967296 2 3 4 5\n");
+    assert(z.rc < 0 && strstr(z.err.error_message, "out of range"));
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$TTL 300\n@ SOA ns h abc 2 3 4 5\n");
+    assert(z.rc < 0 && strstr(z.err.error_message, "Invalid SOA serial") && z.err.token_length == 3);
+    zt_free(&z);
     /* records that had no TTL at all are counted (BIND: "no TTL specified"); a SOA minimum, a $TTL or an earlier TTL is a source */
     zt_load(&z, "$ORIGIN example.\nw A 192.0.2.2\nx A 192.0.2.3\n@ SOA ns h 1 2 3 4 5\ny A 192.0.2.4\n");
     ASSERT_PARSED(&z);

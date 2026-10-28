@@ -5149,6 +5149,8 @@ int main(int argc, char **argv) {
   if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
     g_startup_cwd[0] = '\0';
   }
+  /* the parser makes the paths that are used after daemonize() absolute against this directory (or options { directory }) */
+  config_set_base_cwd(g_startup_cwd[0] == '/' ? g_startup_cwd : NULL);
   signal(SIGPIPE, SIG_IGN);
   /* SIGHUP/SIGUSR1/SIGUSR2 の既定動作はプロセス終了。fork する全子プロセス (ブローカー・
    * フロントエンドルーター・バックエンド) のために fork 前に無視にしておく。pkill -HUP karidns の
@@ -5218,6 +5220,31 @@ int main(int argc, char **argv) {
     effective_pid_file = g_config_db.config_a.pid_file;
   } else if (!foreground) {
     effective_pid_file = "/var/run/karidns/karidns.pid";
+  }
+  /* daemonize() chdir()s to "/", and the pid file is opened after it (and removed by the exit handler): a relative name from -P / -p is
+   * made absolute against the startup directory here, like the one from the configuration (config_set_base_cwd).  A name that does not
+   * fit g_pid_file_path is an error, never a truncated path. */
+  char cli_pid_abs[sizeof(g_pid_file_path)];
+  if (effective_pid_file && effective_pid_file == cli_pid_file && effective_pid_file[0] != '/' &&
+      strcmp(effective_pid_file, "none") != 0 && effective_pid_file[0] != '\0' && g_startup_cwd[0] == '/') {
+    int pn = snprintf(cli_pid_abs, sizeof(cli_pid_abs), "%s/%s", g_startup_cwd, effective_pid_file);
+    if (pn < 0 || (size_t)pn >= sizeof(cli_pid_abs)) {
+      syslog(LOG_ERR, "[Config] Refusing to start: the PID file '%.64s' is %d bytes long once it is made absolute against the directory "
+             "karidns was started in (at most %zu); use a shorter path or an absolute one", effective_pid_file, pn, sizeof(cli_pid_abs) - 1);
+      fprintf(stderr, "[ERROR] Refusing to start: the PID file '%.64s' is %d bytes long once it is made absolute against the directory "
+              "karidns was started in (at most %zu); use a shorter path or an absolute one\n", effective_pid_file, pn, sizeof(cli_pid_abs) - 1);
+      free_server_config_fields(&g_config_db.config_a);
+      return 1;
+    }
+    effective_pid_file = cli_pid_abs;
+  }
+  if (effective_pid_file && strlen(effective_pid_file) >= sizeof(g_pid_file_path)) {
+    syslog(LOG_ERR, "[Config] Refusing to start: the PID file path is %zu bytes long (at most %zu)", strlen(effective_pid_file),
+           sizeof(g_pid_file_path) - 1);
+    fprintf(stderr, "[ERROR] Refusing to start: the PID file path is %zu bytes long (at most %zu)\n", strlen(effective_pid_file),
+            sizeof(g_pid_file_path) - 1);
+    free_server_config_fields(&g_config_db.config_a);
+    return 1;
   }
 
   // ---- 起動前検証 ----------------------------------------------------------

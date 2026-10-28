@@ -142,6 +142,37 @@ check_generic "generic TXT longer than its RDATA" 'x IN TXT \# 2 0361' 6 "not va
 printf '$ORIGIN example.com.\n$TTL 300\n@ SOA ns host 1 2 3 4 5\n@ NS ns\nns A 192.0.2.1\nok1 PTR \\# 5 036e733100\nok2 TYPE65534 \\# 0\nok3 MX \\# 7 000a036e733100\n' > "${TMP_ZONE_DIR}/generic_ok.zone"
 run_check_zone "valid generic RDATA of known types and an empty unknown type" "example.com." "${TMP_ZONE_DIR}/generic_ok.zone" 0
 
+# 6f. SOA serial: BIND 9.20 (lib/dns/rdata/generic/soa_6.c fromtext_soa) reads it as a number token and rejects the zone for anything else;
+# the zone is refused with the reason, not read with serial 0 / a serial cut to 32 bits.  4294967295 is the largest valid serial.
+check_serial() { # check_serial DESCRIPTION SERIAL-TEXT EXPECTED-FAIL(1/0) [message fragment]
+    printf '$ORIGIN example.com.\n$TTL 300\n@ SOA ns host %s 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n' "$2" > "${TMP_ZONE_DIR}/serial.zone"
+    run_check_zone "SOA serial $1" "example.com." "${TMP_ZONE_DIR}/serial.zone" "$3"
+    if [ "$3" = "1" ] && [ -n "${4:-}" ]; then
+        _o=$(./karicheck zone example.com. "${TMP_ZONE_DIR}/serial.zone" 2>&1 || true)
+        case "${_o}" in
+            *"$4"*) echo "  PASS: the message says: $4" ;;
+            *) echo "  FAIL: expected '$4' in:"; echo "${_o}"; FAILED=1 ;;
+        esac
+    fi
+}
+check_serial "abc"                     abc                    1 "Invalid SOA serial"
+check_serial "-1"                      -1                     1 "Invalid SOA serial"
+check_serial "+1"                      +1                     1 "Invalid SOA serial"
+check_serial "1x (unit)"               1x                     1 "Invalid SOA serial"
+check_serial "1h (unit)"               1h                     1 "Invalid SOA serial"
+check_serial "0x10"                    0x10                   1 "Invalid SOA serial"
+check_serial "1.5"                     1.5                    1 "Invalid SOA serial"
+check_serial "4294967296 (> 32 bits)"  4294967296             1 "SOA serial out of range"
+check_serial "a very long number"      99999999999999999999   1 "SOA serial out of range"
+check_serial "4294967295"              4294967295             0
+check_serial "0"                       0                      0
+check_serial "leading zeros"           000000000042           0
+printf '$ORIGIN example.com.\n$TTL 300\n@ SOA ns host "" 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n' > "${TMP_ZONE_DIR}/serial_empty.zone"
+run_check_zone "SOA serial empty (quoted)" "example.com." "${TMP_ZONE_DIR}/serial_empty.zone" 1
+# and the TTL notation follows bind_ttl(): a plain number after a unit is a syntax error
+printf '$ORIGIN example.com.\n$TTL 1h30\n@ SOA ns host 1 2 3 4 5\n@ NS ns\n' > "${TMP_ZONE_DIR}/ttl_trailing.zone"
+run_check_zone "\$TTL 1h30 (a number after a unit)" "example.com." "${TMP_ZONE_DIR}/ttl_trailing.zone" 1
+
 if [ "${FAILED}" -ne 0 ]; then
     echo "=== Some Zone Parser Error Path Tests FAILED ==="
     exit 1

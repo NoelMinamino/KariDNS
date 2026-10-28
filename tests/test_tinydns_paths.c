@@ -269,8 +269,42 @@ static void test_mutations(void) {
     printf("  -> %zu mutated lines handled without crash.\n", runs);
 }
 
+/* The serial field of a Z line is a plain number up to 4294967295, like a BIND SOA serial (parse_soa_serial_strict); empty stays "the time
+ * stamp of the data file".  It used to be read by strtoul: "abc" became 0 and a value above 32 bits went through. */
+static void test_z_serial(void) {
+    printf("[TEST] tinydns: Z line serial is a number up to 4294967295...\n");
+    static const char *const good[] = { "0", "1", "4294967295", "0000000042", "" };
+    for (size_t i = 0; i < N(good); i++) {
+        char line[256];
+        snprintf(line, sizeof(line), "Zexample.com:ns1.example.com:hostmaster.example.com:%s:2:3:4:5:300", good[i]);
+        zone_arena_t a; parse_error_t e; size_t cnt;
+        int rc = run_line(line, CTX_FULL, &e, &a, &cnt);
+        assert(rc >= 0 && has_type(&a, 6));
+        zone_arena_destroy(&a);
+    }
+    static const struct { const char *ser; const char *msg; } bad[] = {
+        { "abc", "Invalid SOA serial" }, { "-1", "Invalid SOA serial" }, { "+1", "Invalid SOA serial" }, { "1x", "Invalid SOA serial" },
+        { "0x10", "Invalid SOA serial" }, { "1.5", "Invalid SOA serial" }, { "4294967296", "out of range" },
+        { "99999999999999999999999999999999999999999999999999999999999999999999", "out of range" },
+    };
+    for (size_t i = 0; i < N(bad); i++) {
+        char line[256];
+        snprintf(line, sizeof(line), "Zexample.com:ns1.example.com:hostmaster.example.com:%s:2:3:4:5:300", bad[i].ser);
+        zone_arena_t a; parse_error_t e; size_t cnt;
+        int rc = run_line(line, CTX_FULL, &e, &a, &cnt);
+        if (rc >= 0 || !e.error_message || !strstr(e.error_message, bad[i].msg)) { fprintf(stderr, "Z serial '%s' not refused\n", bad[i].ser); assert(0); }
+        zone_arena_destroy(&a);
+        /* without an error sink the line is refused all the same */
+        rc = run_line(line, CTX_NO_ERR_OUT, &e, &a, &cnt);
+        assert(rc < 0);
+        zone_arena_destroy(&a);
+    }
+    printf("  -> Z serial passed.\n");
+}
+
 int main(void) {
     printf("=== Starting tinydns Parser Path Coverage Tests ===\n");
+    test_z_serial();
     test_valid_lines();
     test_fqdn_error_paths();
     test_generic_and_unknown();

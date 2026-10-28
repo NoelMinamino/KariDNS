@@ -527,6 +527,8 @@ uint32_t parse_ttl_value(const char *ttl_str);
  * success.  Zone files use this (max 2147483647 for a TTL: ARM 3.5.5.4 "0-2147483647"); parse_ttl_value() keeps its lenient
  * contract (3600 for bad text, clamp to 2147483647) for the SOA fields of transferred and database zones and for dag. */
 bool parse_ttl_strict(const char *ttl_str, uint64_t max, uint32_t *out);
+/* SOA serial from text, as BIND 9.20 reads it (digits only, 0..4294967295); *err: 0 ok, 1 not a number or empty, 2 out of range (may be NULL) */
+bool parse_soa_serial_strict(const char *s, uint32_t *out, int *err);
 
 /* S5 Phase B: where domain names sit in the RDATA of the types the server reads names from, and which of them
  * serialize_dns_record() compresses. This is the single table the zone image (dns_zone_image.c) uses to write
