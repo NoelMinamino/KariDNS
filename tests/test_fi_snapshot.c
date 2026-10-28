@@ -9,6 +9,7 @@
 #include "fi/kari_fi.h"
 #include "../dns_config_parser.h"
 #include "test_zext.h"
+#include "test_tmpdir.h"
 #include "../dns_zone_parser.h"
 #include "../dns_snapshot_rcu.h"
 #include "../dns_epoch_rcu.h"
@@ -224,6 +225,7 @@ int main(void) {
     printf("[*] Running test_fi_snapshot...\n");
     test_fi_snapshot_rebuild();
     test_fi_catalog_membership();
+    tmpdir_remove(g_cdir);
     printf("[+] test_fi_snapshot passed successfully.\n");
     return 0;
 }

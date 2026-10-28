@@ -24,6 +24,7 @@
 #include <openssl/evp.h>
 
 #include "sweep_watchdog.h"
+#include "test_tmpdir.h"
 
 #define main karicheck_main
 #include "../tools/karicheck.c"
@@ -531,6 +532,7 @@ int main(void) {
     WD_PHASE("test_karicheck"); test_karicheck();
     WD_PHASE("test_lint_messages"); test_lint_messages();
     WD_PHASE("test_karictl"); test_karictl();
+    tmpdir_remove(g_tmp);
     printf("=== All Tools Coverage Sweep Tests PASSED (%d runs) ===\n", g_runs);
     return 0;
 }

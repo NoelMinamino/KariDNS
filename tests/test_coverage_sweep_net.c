@@ -38,6 +38,7 @@
 #define main dag_main
 #include "../tools/dag.c"
 #include "sweep_watchdog.h"
+#include "test_tmpdir.h"
 #undef main
 
 #include "dns_zone_parser.h"
@@ -1184,6 +1185,7 @@ int main(void) {
     WD_PHASE("test_replay"); test_replay(&s1, &s2);
     fs_stop(&s1);
     fs_stop(&s2);
+    tmpdir_remove(g_tmp);
     printf("=== All dag Network Coverage Sweep Tests PASSED ===\n");
     return 0;
 }
