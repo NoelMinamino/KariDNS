@@ -461,8 +461,8 @@ void notify_handle_response(const uint8_t *msg, size_t len, const struct sockadd
 }
 
 /* 宛先の一覧に重複なく加える */
-static void notify_add_target(struct sockaddr_storage *targets, int *count, int max, int family,
-                              const char *ip, uint16_t port) {
+static void notify_add_target(struct sockaddr_storage *targets, const tsig_key_t **tkeys, int *count, int max, int family,
+                              const char *ip, uint16_t port, const tsig_key_t *tkey) {
   struct sockaddr_storage d;
   memset(&d, 0, sizeof(d));
   if (family != AF_INET6 && inet_pton(AF_INET, ip, &((struct sockaddr_in *)&d)->sin_addr) == 1) {
@@ -477,12 +477,15 @@ static void notify_add_target(struct sockaddr_storage *targets, int *count, int 
   for (int i = 0; i < *count; i++) {
     if (sockaddr_equal(&targets[i], (const struct sockaddr *)&d)) return;
   }
-  if (*count < max) targets[(*count)++] = d;
+  if (*count < max) {
+    tkeys[*count] = tkey;
+    targets[(*count)++] = d;
+  }
 }
 
 /* arena の中の name のアドレス (A/AAAA) を宛先に加える。見つかれば true */
-static bool notify_add_glue(const zone_image_t *img, const char *name, struct sockaddr_storage *targets, int *count,
-                            int max) {
+static bool notify_add_glue(const zone_image_t *img, const char *name, struct sockaddr_storage *targets,
+                            const tsig_key_t **tkeys, int *count, int max, const tsig_key_t *tkey) {
   bool found = false;
   uint32_t id = zone_image_find_name(img, name);
   if (id == ZONE_IMAGE_NONE) return false;
@@ -493,7 +496,7 @@ static bool notify_add_glue(const zone_image_t *img, const char *name, struct so
     char ip[INET6_ADDRSTRLEN];
     if ((t != 1 || len != 4) && (t != 28 || len != 16)) continue;
     if (!inet_ntop(t == 1 ? AF_INET : AF_INET6, zone_image_rr_rdata(img, k), ip, sizeof(ip))) continue;
-    notify_add_target(targets, count, max, t == 1 ? AF_INET : AF_INET6, ip, 53);
+    notify_add_target(targets, tkeys, count, max, t == 1 ? AF_INET : AF_INET6, ip, 53, tkey);
     found = true;
   }
   return found;
@@ -515,6 +518,15 @@ void send_notify_to_all(zone_db_entry_t *entry) {
 
   /* DB のゾーンは dbcfg (DB のゾーンは active が無くても設定を持つ) */
   const zone_config_t *zone = zone_entry_config(active, entry);
+  /* notify (BIND 9.20 ARM): no = nothing is sent (also for `karictl notify`); primary-only = only for primary zones, so a secondary or
+   * catalog member does not pass a transfer on; explicit = only the also-notify list, not the NS hosts of the zone */
+  notify_mode_t mode = notify_mode_effective(active, zone, view_name);
+  if (mode == NOTIFY_MODE_NO || (mode == NOTIFY_MODE_PRIMARY_ONLY && zone_entry_ticks(entry))) {
+    if (snap) release_zone_snapshot(snap);
+    if (active) release_config_snapshot(active);
+    rcu_aux_read_unlock();
+    return;
+  }
   const char *notify_source = zone ? zext(zone)->notify_source : NULL;
   notify_retry_config_t nr = notify_retry_effective(active, zone);
   /* D-09: ゾーンに tsig-key があれば NOTIFY に署名する */
@@ -526,19 +538,27 @@ void send_notify_to_all(zone_db_entry_t *entry) {
   }
 
   struct sockaddr_storage targets[64];
+  const tsig_key_t *tkeys[64]; /* the key that signs the NOTIFY to targets[i] (NULL = unsigned) */
   int ntargets = 0;
 
-  // 1. also-notify servers
-  if (zone) {
-    for (int i = 0; i < zext(zone)->also_notify_count; i++)
-      notify_add_target(targets, &ntargets, 64, AF_UNSPEC, zext(zone)->also_notify[i].ip, zext(zone)->also_notify[i].port);
+  // 1. also-notify servers: the zone's list, else its view's, else options' (BIND 9.20 ARM).  An address with its own `key` is signed
+  // with that key; the others with the zone's tsig-key (as the NS-derived targets below).
+  const notify_target_t *an = NULL;
+  int an_count = also_notify_effective(active, zone, view_name, &an);
+  for (int i = 0; i < an_count; i++) {
+    const tsig_key_t *tk = key;
+    if (an[i].key) {
+      tk = find_tsig_key_by_name(active, an[i].key);
+      if (!tk) syslog(LOG_ERR, "[Notify] zone '%s': also-notify key '%s' is not defined; NOTIFY sent unsigned", domain, an[i].key);
+    }
+    notify_add_target(targets, tkeys, &ntargets, 64, AF_UNSPEC, an[i].ip, (uint16_t)an[i].port, tk);
   }
 
   // 2. Addresses of the apex NS hosts except the SOA MNAME host (RFC 1996 §3.2)
   // 同じゾーン名が別の view にもあり得るので、呼び出し元のエントリの view で引く (R-26)
   view_snapshot_t *view = snap ? snapshot_find_view(snap, view_name) : NULL;
   zone_version_t *arena = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-  const zone_image_t *img = arena ? arena->image : NULL;
+  const zone_image_t *img = arena && mode != NOTIFY_MODE_EXPLICIT ? arena->image : NULL;
   uint32_t apex_id = img ? zone_image_find_name(img, entry->domain) : ZONE_IMAGE_NONE;
   if (apex_id != ZONE_IMAGE_NONE) {
     char mname_buf[DNS_NAME_TEXT_SIZE];
@@ -553,16 +573,16 @@ void send_notify_to_all(zone_db_entry_t *entry) {
       if (zone_image_rr_target(img, i, ns_target, sizeof(ns_target)) != 0) continue;
       if (mname && domain_names_match_ci(ns_target, mname)) continue;
       // A. in-zone glue, B. otherwise the address in a sibling zone of the same view
-      if (notify_add_glue(img, ns_target, targets, &ntargets, 64)) continue;
+      if (notify_add_glue(img, ns_target, targets, tkeys, &ntargets, 64, key)) continue;
       zone_db_entry_t *sib_entry = find_zone_in_view(view, ns_target);
       if (!sib_entry || sib_entry == entry) continue;
       zone_version_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
       if (sib_arena && sib_arena->image)
-        notify_add_glue(sib_arena->image, ns_target, targets, &ntargets, 64);
+        notify_add_glue(sib_arena->image, ns_target, targets, tkeys, &ntargets, 64, key);
     }
   }
 
-  for (int i = 0; i < ntargets; i++) notify_send_to(domain, view_name, &targets[i], notify_source, key, &nr);
+  for (int i = 0; i < ntargets; i++) notify_send_to(domain, view_name, &targets[i], notify_source, tkeys[i], &nr);
 
   if (ntargets > 0) {
     atomic_fetch_add_explicit(&entry->observatory.notify_sent, ntargets, memory_order_relaxed);

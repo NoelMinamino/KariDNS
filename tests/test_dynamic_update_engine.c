@@ -428,7 +428,8 @@ static void test_send_notify_to_all_comprehensive(void) {
     zcfg1.domain = "example.com.";
     tzx(&zcfg1)->notify_source = "192.0.2.1";
     tzx(&zcfg1)->also_notify_count = 3;
-    ip_port_t notifys[3];
+    notify_target_t notifys[3];
+    memset(notifys, 0, sizeof(notifys));
     notifys[0].ip = "192.0.2.10";
     notifys[0].port = 53;
     notifys[1].ip = "2001:db8::10";
