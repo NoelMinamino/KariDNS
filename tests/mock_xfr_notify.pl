@@ -15,6 +15,8 @@
 #         badid        zone sent with a different message ID
 #         badqr        zone sent with QR=0
 #         badq         zone sent with another QNAME in the question
+#         stall        the first message of the zone (SOA, www A) and then nothing: the secondary has to give up (max-transfer-idle-in)
+#         drip         the first message and then one more A record a second, never the closing SOA (max-transfer-time-in)
 #       Logs "REQ qtype=<n>" per request.
 #   probe  --port P --name N --qtype T [--serial S] [--edns] [--udp] [--nosoa]
 #       Sends one query (TCP unless --udp) and prints one line per message:
@@ -90,6 +92,8 @@ sub read_tcp_msg {
 }
 
 sub send_tcp_msg { my ($s, $m) = @_; syswrite($s, pack('n', length $m) . $m); }
+sub send_tcp_msg_ok { my ($s, $m) = @_; return defined syswrite($s, pack('n', length $m) . $m); }
+$SIG{PIPE} = 'IGNORE';
 
 if ($cmd eq 'notify-sink') {
     my $s = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => $o{port}, Proto => 'udp', ReuseAddr => 1)
@@ -131,7 +135,7 @@ if ($cmd eq 'notify-sink') {
             last unless defined $qn;
             my $qtype = unpack 'n', substr($q, $qe, 2);
             my $question = substr($q, 12, $qe + 4 - 12);
-            logline("REQ qtype=$qtype");
+            logline("REQ qtype=$qtype expire=" . req_has_expire($q, $qe + 4));
             my $m = $o{mode};
             my $rcode = 0;
             $rcode = 5 if $m eq 'refused';
@@ -140,6 +144,18 @@ if ($cmd eq 'notify-sink') {
             if ($rcode) {
                 send_tcp_msg($c, pack('n6', $id, 0x8000 | $rcode, 1, 0, 0, 0) . $question);
                 next;
+            }
+            if ($m eq 'stall' || $m eq 'drip') {
+                # a transfer that never ends: the first message (SOA, www A) and then nothing (stall) or one more A every second (drip).
+                # The secondary has to give up on its own: max-transfer-idle-in (stall) or max-transfer-time-in (drip)
+                send_tcp_msg($c, pack('n6', $id, 0x8400, 1, 2, 0, 0) . $question . soa_rr($o{zone}, $serial) . a_rr("www.$o{zone}", '192.0.2.80'));
+                logline("STALL mode=$m t=" . time);
+                if ($m eq 'stall') { sleep 3600; last; }
+                for my $i (1 .. 3600) {
+                    sleep 1;
+                    last unless send_tcp_msg_ok($c, pack('n6', $id, 0x8400, 1, 1, 0, 0) . $question . a_rr("d$i.$o{zone}", '192.0.2.81'));
+                }
+                last;
             }
             my $rid = $m eq 'badid' ? ($id ^ 0x5a5a) : $id;
             my $flags = $m eq 'badqr' ? 0x0400 : 0x8400;
@@ -188,6 +204,26 @@ if ($cmd eq 'notify-sink') {
     print "NOMSG\n" unless @msgs;
 } else {
     die "usage: $0 notify-sink|xfr-primary|probe [options]\n";
+}
+
+# 1 when the OPT record of the request (after the question at offset $off, and its authority RRs) carries the EDNS EXPIRE option (RFC 7314), else 0
+sub req_has_expire {
+    my ($q, $off) = @_;
+    my ($id, $fl, $qd, $an, $ns, $ar) = unpack 'n6', $q;
+    for my $i (1 .. $an + $ns + $ar) {
+        my ($n, $e) = dec_name($q, $off); return 0 unless defined $n && $e + 10 <= length $q;
+        my ($t, $c, $ttl, $rl) = unpack 'nnNn', substr($q, $e, 10);
+        if ($t == 41) {
+            my $o = $e + 10; my $end = $o + $rl;
+            while ($o + 4 <= $end && $o + 4 <= length $q) {
+                my ($code, $len) = unpack 'nn', substr($q, $o, 4);
+                return 1 if $code == 9;
+                $o += 4 + $len;
+            }
+        }
+        $off = $e + 10 + $rl;
+    }
+    return 0;
 }
 
 # SOA serials in the answer section; sets $$optref when an OPT is in the additional section.

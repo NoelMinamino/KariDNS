@@ -200,7 +200,8 @@ typedef struct {
   socklen_t dest_len;
   char domain[DNS_NAME_TEXT_SIZE];
   char view[64];
-  char notify_source[INET6_ADDRSTRLEN];
+  bool has_src;          /* notify-source(-v6) / the `source` of the also-notify list: the local address the NOTIFY leaves from (the family of dest) */
+  uint8_t src[16];
   uint8_t pkt[NOTIFY_PKT_MAX];
   size_t pkt_len;
   size_t unsigned_len; /* TSIG を付ける前の長さ (再送のたびに署名し直す) */
@@ -221,10 +222,13 @@ typedef struct {
 } notify_pending_t;
 
 static notify_pending_t g_notify_pending[NOTIFY_PENDING_MAX];
+/* notify-rate (the control thread only): the budget of first NOTIFY messages in this second, and the rate of the configuration last used */
+static xfr_rl_t g_notify_rl;
+static uint32_t g_notify_rate = XFR_RATE_DEFAULT;
 
 static void send_single_notify(const uint8_t *req, size_t req_len,
                                const struct sockaddr *dest_addr, socklen_t addr_len,
-                               const char *notify_source) {
+                               bool has_src, const uint8_t src[16]) {
   udp_ipc_t msg;
   memset(&msg, 0, sizeof(msg));
   msg.sock_fd_idx = -1; // -1 = NOTIFY / Dynamic UDP
@@ -233,16 +237,15 @@ static void send_single_notify(const uint8_t *req, size_t req_len,
   msg.addr_len = (uint16_t)addr_len;
   msg.payload_len = (uint16_t)req_len;
 
+  /* the Router sends from a socket bound to this address (pre-bound at start-up from the same configuration) */
   int family = dest_addr->sa_family;
-  if (notify_source && *notify_source) {
-    if (family == AF_INET &&
-        inet_pton(AF_INET, notify_source,
-                  &msg.source_addr.sin.sin_addr) == 1) {
+  if (has_src) {
+    if (family == AF_INET) {
+      memcpy(&msg.source_addr.sin.sin_addr, src, sizeof(msg.source_addr.sin.sin_addr));
       msg.source_addr.ss_family = AF_INET;
       msg.has_source_addr = true;
-    } else if (family == AF_INET6 &&
-               inet_pton(AF_INET6, notify_source,
-                         &msg.source_addr.sin6.sin6_addr) == 1) {
+    } else if (family == AF_INET6) {
+      memcpy(&msg.source_addr.sin6.sin6_addr, src, sizeof(msg.source_addr.sin6.sin6_addr));
       msg.source_addr.ss_family = AF_INET6;
       msg.has_source_addr = true;
     }
@@ -325,7 +328,7 @@ static bool notify_sign(notify_pending_t *p) {
  * 照合は ID、QNAME、送信元アドレスとポート)、鍵があれば署名する (RFC 8945 §5.1)。
  * 同じゾーンの同じ宛先への古い NOTIFY が待っていれば置き換える (新しい版の通知で足りる)。 */
 static void notify_send_to(const char *domain, const char *view_name, const struct sockaddr_storage *dest,
-                           const char *notify_source, const tsig_key_t *key, const notify_retry_config_t *nr) {
+                           bool has_src, const uint8_t *src, const tsig_key_t *key, const notify_retry_config_t *nr, uint32_t rate) {
   socklen_t dlen = dest->ss_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
   notify_pending_t *slot = NULL;
   for (int i = 0; i < NOTIFY_PENDING_MAX; i++) {
@@ -370,14 +373,22 @@ static void notify_send_to(const char *domain, const char *view_name, const stru
   slot->dest = *dest;
   slot->dest_len = dlen;
   strlcpy(slot->view, view_name ? view_name : "", sizeof(slot->view));
-  if (notify_source) strlcpy(slot->notify_source, notify_source, sizeof(slot->notify_source));
-  slot->sends = 1;
+  slot->has_src = has_src;
+  if (has_src && src) memcpy(slot->src, src, sizeof(slot->src));
   slot->max_sends = 1 + nr->retries;
   slot->interval = nr->interval;
   slot->exponential = nr->backoff == NOTIFY_BACKOFF_EXPONENTIAL;
-  slot->next_time = time(NULL) + slot->interval;
-  send_single_notify(slot->pkt, slot->pkt_len, (const struct sockaddr *)&slot->dest, slot->dest_len,
-                     slot->notify_source);
+  time_t now = time(NULL);
+  /* notify-rate: at most that many NOTIFY messages a second.  One over the budget is sent by notify_retransmit_due() at a later tick, with
+   * sends == 0 ("not sent yet"); when the table of pending NOTIFYs is full (not tracked) it cannot wait and goes now. */
+  if (!tracked || xfr_rl_take(&g_notify_rl, rate, now)) {
+    slot->sends = 1;
+    slot->next_time = now + slot->interval;
+    send_single_notify(slot->pkt, slot->pkt_len, (const struct sockaddr *)&slot->dest, slot->dest_len, slot->has_src, slot->src);
+  } else {
+    slot->sends = 0;
+    slot->next_time = now + 1;
+  }
   if (tracked) {
     slot->used = true;
   } else {
@@ -392,6 +403,21 @@ void notify_retransmit_due(time_t now) {
   for (int i = 0; i < NOTIFY_PENDING_MAX; i++) {
     notify_pending_t *p = &g_notify_pending[i];
     if (!p->used || now < p->next_time) continue;
+    if (p->sends == 0) {
+      /* held back by notify-rate: this is its first message */
+      if (!xfr_rl_take(&g_notify_rl, g_notify_rate, now)) {
+        p->next_time = now + 1;
+        continue;
+      }
+      if (p->is_signed && !notify_sign(p)) {
+        p->used = false;
+        continue;
+      }
+      send_single_notify(p->pkt, p->pkt_len, (const struct sockaddr *)&p->dest, p->dest_len, p->has_src, p->src);
+      p->sends = 1;
+      p->next_time = now + p->interval;
+      continue;
+    }
     if (p->sends >= p->max_sends) {
       char a[INET6_ADDRSTRLEN + 16];
       sockaddr_to_text(&p->dest, a, sizeof(a));
@@ -405,7 +431,7 @@ void notify_retransmit_due(time_t now) {
       p->used = false;
       continue;
     }
-    send_single_notify(p->pkt, p->pkt_len, (const struct sockaddr *)&p->dest, p->dest_len, p->notify_source);
+    send_single_notify(p->pkt, p->pkt_len, (const struct sockaddr *)&p->dest, p->dest_len, p->has_src, p->src);
     p->sends++;
     if (p->exponential && p->interval < NOTIFY_RETRY_INTERVAL_MAX) {
       p->interval = p->interval * 2 > NOTIFY_RETRY_INTERVAL_MAX ? NOTIFY_RETRY_INTERVAL_MAX : p->interval * 2;
@@ -460,9 +486,17 @@ void notify_handle_response(const uint8_t *msg, size_t len, const struct sockadd
   }
 }
 
+/* One NOTIFY destination: the address, the key that signs the message (NULL = unsigned) and the also-notify element it came from (NULL for
+ * an NS host of the zone), which carries the `source` of its list */
+typedef struct {
+  struct sockaddr_storage addr;
+  const tsig_key_t *key;
+  const notify_target_t *tpl;
+} notify_dest_t;
+
 /* 宛先の一覧に重複なく加える */
-static void notify_add_target(struct sockaddr_storage *targets, const tsig_key_t **tkeys, int *count, int max, int family,
-                              const char *ip, uint16_t port, const tsig_key_t *tkey) {
+static void notify_add_target(notify_dest_t *targets, int *count, int max, int family, const char *ip, uint16_t port,
+                              const tsig_key_t *tkey, const notify_target_t *tpl) {
   struct sockaddr_storage d;
   memset(&d, 0, sizeof(d));
   if (family != AF_INET6 && inet_pton(AF_INET, ip, &((struct sockaddr_in *)&d)->sin_addr) == 1) {
@@ -475,17 +509,17 @@ static void notify_add_target(struct sockaddr_storage *targets, const tsig_key_t
     return;
   }
   for (int i = 0; i < *count; i++) {
-    if (sockaddr_equal(&targets[i], (const struct sockaddr *)&d)) return;
+    if (sockaddr_equal(&targets[i].addr, (const struct sockaddr *)&d)) return;
   }
   if (*count < max) {
-    tkeys[*count] = tkey;
-    targets[(*count)++] = d;
+    targets[*count].key = tkey;
+    targets[*count].tpl = tpl;
+    targets[(*count)++].addr = d;
   }
 }
 
 /* arena の中の name のアドレス (A/AAAA) を宛先に加える。見つかれば true */
-static bool notify_add_glue(const zone_image_t *img, const char *name, struct sockaddr_storage *targets,
-                            const tsig_key_t **tkeys, int *count, int max, const tsig_key_t *tkey) {
+static bool notify_add_glue(const zone_image_t *img, const char *name, notify_dest_t *targets, int *count, int max, const tsig_key_t *tkey) {
   bool found = false;
   uint32_t id = zone_image_find_name(img, name);
   if (id == ZONE_IMAGE_NONE) return false;
@@ -496,7 +530,7 @@ static bool notify_add_glue(const zone_image_t *img, const char *name, struct so
     char ip[INET6_ADDRSTRLEN];
     if ((t != 1 || len != 4) && (t != 28 || len != 16)) continue;
     if (!inet_ntop(t == 1 ? AF_INET : AF_INET6, zone_image_rr_rdata(img, k), ip, sizeof(ip))) continue;
-    notify_add_target(targets, tkeys, count, max, t == 1 ? AF_INET : AF_INET6, ip, 53, tkey);
+    notify_add_target(targets, count, max, t == 1 ? AF_INET : AF_INET6, ip, 53, tkey, NULL);
     found = true;
   }
   return found;
@@ -527,7 +561,10 @@ void send_notify_to_all(zone_db_entry_t *entry) {
     rcu_aux_read_unlock();
     return;
   }
-  const char *notify_source = zone ? zext(zone)->notify_source : NULL;
+  /* notify-source / notify-source-v6, notify-to-soa, notify-rate (BIND 9.20): zone, else view, else options */
+  xfr_eff_t eff;
+  xfr_opts_effective(active, zone, view_name, &eff);
+  g_notify_rate = xfr_cfg_limit(active, XL_NOTIFY_RATE);
   notify_retry_config_t nr = notify_retry_effective(active, zone);
   /* D-09: ゾーンに tsig-key があれば NOTIFY に署名する */
   const tsig_key_t *key = NULL;
@@ -537,8 +574,7 @@ void send_notify_to_all(zone_db_entry_t *entry) {
                      zext(zone)->tsig_key);
   }
 
-  struct sockaddr_storage targets[64];
-  const tsig_key_t *tkeys[64]; /* the key that signs the NOTIFY to targets[i] (NULL = unsigned) */
+  notify_dest_t targets[64];
   int ntargets = 0;
 
   // 1. also-notify servers: the zone's list, else its view's, else options' (BIND 9.20 ARM).  An address with its own `key` is signed
@@ -551,10 +587,11 @@ void send_notify_to_all(zone_db_entry_t *entry) {
       tk = find_tsig_key_by_name(active, an[i].key);
       if (!tk) syslog(LOG_ERR, "[Notify] zone '%s': also-notify key '%s' is not defined; NOTIFY sent unsigned", domain, an[i].key);
     }
-    notify_add_target(targets, tkeys, &ntargets, 64, AF_UNSPEC, an[i].ip, (uint16_t)an[i].port, tk);
+    notify_add_target(targets, &ntargets, 64, AF_UNSPEC, an[i].ip, (uint16_t)an[i].port, tk, &an[i]);
   }
 
-  // 2. Addresses of the apex NS hosts except the SOA MNAME host (RFC 1996 §3.2)
+  // 2. Addresses of the apex NS hosts except the SOA MNAME host (RFC 1996 §3.2) -- unless notify-to-soa yes (BIND 9.20 ARM: "do not check the
+  // name servers in the NS RRset against the SOA MNAME")
   // 同じゾーン名が別の view にもあり得るので、呼び出し元のエントリの view で引く (R-26)
   view_snapshot_t *view = snap ? snapshot_find_view(snap, view_name) : NULL;
   zone_version_t *arena = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
@@ -571,18 +608,33 @@ void send_notify_to_all(zone_db_entry_t *entry) {
       if (zone_image_rr_type(img, i) != 2) continue;
       char ns_target[DNS_NAME_TEXT_SIZE];
       if (zone_image_rr_target(img, i, ns_target, sizeof(ns_target)) != 0) continue;
-      if (mname && domain_names_match_ci(ns_target, mname)) continue;
+      if (mname && !eff.notify_to_soa && domain_names_match_ci(ns_target, mname)) continue;
       // A. in-zone glue, B. otherwise the address in a sibling zone of the same view
-      if (notify_add_glue(img, ns_target, targets, tkeys, &ntargets, 64, key)) continue;
+      if (notify_add_glue(img, ns_target, targets, &ntargets, 64, key)) continue;
       zone_db_entry_t *sib_entry = find_zone_in_view(view, ns_target);
       if (!sib_entry || sib_entry == entry) continue;
       zone_version_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
       if (sib_arena && sib_arena->image)
-        notify_add_glue(sib_arena->image, ns_target, targets, tkeys, &ntargets, 64, key);
+        notify_add_glue(sib_arena->image, ns_target, targets, &ntargets, 64, key);
     }
   }
 
-  for (int i = 0; i < ntargets; i++) notify_send_to(domain, view_name, &targets[i], notify_source, tkeys[i], &nr);
+  for (int i = 0; i < ntargets; i++) {
+    /* the local address of this NOTIFY: the `source` of the also-notify list the address is written in, else notify-source(-v6).  Only an
+     * address that was in the configuration at start-up has a pre-bound socket (config_xfr_source_allowed()); another one is ignored with a
+     * warning (a restart-only change) and the system chooses the source. */
+    int fam = targets[i].addr.ss_family;
+    uint8_t src[16];
+    bool has_src = xfr_source_for(&eff, targets[i].tpl, fam, false, src);
+    if (has_src && !config_xfr_source_allowed(fam, src, false)) {
+      char txt[INET6_ADDRSTRLEN];
+      inet_ntop(fam, src, txt, sizeof(txt));
+      syslog(LOG_WARNING, "[Notify] zone '%s': the NOTIFY source address %s was not in the configuration at start-up; it is used after a restart "
+                          "(until then the system chooses the source address)", domain, txt);
+      has_src = false;
+    }
+    notify_send_to(domain, view_name, &targets[i].addr, has_src, src, targets[i].key, &nr, g_notify_rate);
+  }
 
   if (ntargets > 0) {
     atomic_fetch_add_explicit(&entry->observatory.notify_sent, ntargets, memory_order_relaxed);

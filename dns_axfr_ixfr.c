@@ -31,6 +31,124 @@
 #include <time.h>
 #include <unistd.h>
 
+/* ---- batch 4: the policy of the secondary side (transfers-in / transfers-out / transfers-per-ns, the rate limiter, the order of the
+ * primaries, the time limits).  Plain functions of numbers: no socket is touched here. ---- */
+
+_Atomic int g_xfr_in_active = 0;
+_Atomic int g_xfr_out_active = 0;
+/* max-transfer-time-out / max-transfer-idle-out of the outbound transfer this thread serves (send_tcp_dns_message() reads them) */
+_Thread_local time_t g_tcp_send_deadline_secs = 0;
+_Thread_local uint32_t g_tcp_send_idle_secs = 0;
+
+bool xfr_counter_acquire(_Atomic int *c, uint32_t limit) {
+  int cur = atomic_load_explicit(c, memory_order_relaxed);
+  do {
+    if (cur < 0 || (uint32_t)cur >= limit) return false;
+  } while (!atomic_compare_exchange_weak_explicit(c, &cur, cur + 1, memory_order_acq_rel, memory_order_relaxed));
+  return true;
+}
+
+void xfr_counter_release(_Atomic int *c) { atomic_fetch_sub_explicit(c, 1, memory_order_acq_rel); }
+
+/* One slot per remote address that a transfer has been started from (the table never frees a slot: at most XFR_NS_SLOTS different
+ * primaries; beyond that the limit is not enforced for a new address, which is logged once).  The address is folded into 64 bits; two
+ * addresses that fold to the same number share a quota, which can only make the limit stricter. */
+#define XFR_NS_SLOTS 256
+static struct {
+  _Atomic uint64_t key;   /* 0 = free */
+  _Atomic int n;
+} g_ns_slots[XFR_NS_SLOTS];
+
+static uint64_t xfr_ns_key(const struct sockaddr_storage *a) {
+  uint64_t h = 1469598103934665603ULL ^ a->ss_family; /* FNV-1a over the address octets (the port does not matter: "a given remote name server") */
+  const uint8_t *p = NULL;
+  size_t n = 0;
+  if (a->ss_family == AF_INET) {
+    p = (const uint8_t *)&((const struct sockaddr_in *)a)->sin_addr;
+    n = 4;
+  } else if (a->ss_family == AF_INET6) {
+    p = (const uint8_t *)&((const struct sockaddr_in6 *)a)->sin6_addr;
+    n = 16;
+  }
+  for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 1099511628211ULL;
+  return h ? h : 1;
+}
+
+static _Atomic int *xfr_ns_slot(uint64_t key, bool create) {
+  for (size_t i = 0; i < XFR_NS_SLOTS; i++) {
+    size_t idx = (size_t)((key + i) % XFR_NS_SLOTS);
+    uint64_t cur = atomic_load_explicit(&g_ns_slots[idx].key, memory_order_acquire);
+    if (cur == key) return &g_ns_slots[idx].n;
+    if (cur == 0 && create) {
+      uint64_t expect = 0;
+      if (atomic_compare_exchange_strong_explicit(&g_ns_slots[idx].key, &expect, key, memory_order_acq_rel, memory_order_acquire) || expect == key)
+        return &g_ns_slots[idx].n;
+      i--; /* somebody else took the slot: look at it again */
+    }
+  }
+  return NULL;
+}
+
+bool xfr_ns_acquire(const struct sockaddr_storage *a, uint32_t limit) {
+  _Atomic int *n = xfr_ns_slot(xfr_ns_key(a), true);
+  if (!n) {
+    static _Atomic bool logged = false;
+    if (!atomic_exchange(&logged, true))
+      syslog(LOG_WARNING, "[XFR] more than %d different primaries: transfers-per-ns is not enforced for the others", XFR_NS_SLOTS);
+    return true;
+  }
+  return xfr_counter_acquire(n, limit);
+}
+
+void xfr_ns_release(const struct sockaddr_storage *a) {
+  _Atomic int *n = xfr_ns_slot(xfr_ns_key(a), false);
+  if (n) xfr_counter_release(n);
+}
+
+bool xfr_rl_take(xfr_rl_t *rl, uint32_t rate, time_t now) {
+  if (rate == 0) rate = 1;
+  if (rl->sec != now) {
+    rl->sec = now;
+    rl->used = 0;
+  }
+  if (rl->used >= rate) return false;
+  rl->used++;
+  return true;
+}
+
+uint32_t xfr_read_budget(time_t now, time_t deadline, uint32_t idle_secs, bool *expired) {
+  if (expired) *expired = false;
+  uint32_t b = idle_secs;
+  if (deadline) {
+    if (now >= deadline) {
+      if (expired) *expired = true;
+      return 0;
+    }
+    uint64_t left = (uint64_t)(deadline - now);
+    if (b == 0 || left < b) b = left > UINT32_MAX ? UINT32_MAX : (uint32_t)left;
+  }
+  return b;
+}
+
+bool xfr_serial_behind(uint32_t ours, uint32_t theirs) { return ours != theirs && !serial_is_newer(theirs, ours); }
+
+void xfr_run_primaries(int n, xfr_try_fn fn, void *arg, xfr_run_t *out) {
+  memset(out, 0, sizeof(*out));
+  out->transferred_idx = -1;
+  for (int i = 0; i < n; i++) {
+    int r = fn(arg, i);
+    if (r != XFR_R_DEFERRED) out->tried++;
+    switch (r) {
+      case XFR_R_TRANSFERRED: out->transferred_idx = i; break;
+      case XFR_R_UPTODATE: out->uptodate++; break;
+      case XFR_R_BEHIND: out->behind++; break;
+      case XFR_R_DEFERRED: out->deferred++; break;
+      default: out->failed++; break;
+    }
+    if (r == XFR_R_TRANSFERRED) break;
+  }
+}
+
 void free_ixfr_txn(ixfr_txn_t *txn) {
   if (!txn) return;
   zone_arena_destroy(&txn->arena);
@@ -680,10 +798,15 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
             return 0;
           }
           if (!serial_is_newer(current_serial, session->client_serial)) {
-            syslog(LOG_WARNING,
-                   "[AXFR] Rejecting transfer for zone '%s': received serial %u is not newer "
-                   "than current serial %u (possible rollback or spoofed master)",
-                   domain, current_serial, session->client_serial);
+            /* the primary is behind us (RFC 1982): not a transfer to accept.  A refresh from several primaries goes on to the next one
+             * (BIND zone.c refresh_callback(): "serial number received from primary < ours", quiet with multi-master); the caller
+             * that sets session->eff logs it that way, the others (the database loader's stream) keep the warning. */
+            session->serial_behind = true;
+            if (!session->eff)
+              syslog(LOG_WARNING,
+                     "[AXFR] Rejecting transfer for zone '%s': received serial %u is not newer "
+                     "than current serial %u (possible rollback or spoofed master)",
+                     domain, current_serial, session->client_serial);
             return -1;
           }
         }
@@ -826,6 +949,27 @@ int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const ch
   return 0;
 }
 
+/* The primary says the zone is up to date (an IXFR answered with the one SOA of our serial, or a SOA query with the same serial): the
+ * refresh timer and the expire timer start again (RFC 1034 §4.3.5, RFC 7314 §4 for the EXPIRE option).  The timers are held to the
+ * limits of the zone first (BIND zone_xfrdone(): the up-to-date answer clamps them too).  entry->writer_lock is held. */
+static void xfr_note_uptodate(zone_db_entry_t *entry, const axfr_session_t *session) {
+  if (session->eff) {
+    uint32_t r = 0, t = 0, x = 0;
+    xfr_clamp_timers(session->eff, atomic_load_explicit(&entry->refresh, memory_order_relaxed),
+                     atomic_load_explicit(&entry->retry, memory_order_relaxed),
+                     atomic_load_explicit(&entry->expire, memory_order_relaxed), &r, &t, &x);
+    atomic_store_explicit(&entry->refresh, r, memory_order_release);
+    atomic_store_explicit(&entry->retry, t, memory_order_release);
+    atomic_store_explicit(&entry->expire, x, memory_order_release);
+  }
+  time_t now = time(NULL);
+  atomic_store_explicit(&entry->next_check, now + entry->refresh, memory_order_release);
+  atomic_store_explicit(&entry->expire_at,
+                        xfr_expire_deadline(false, session->has_expire, session->expire, entry->expire, zone_expire_deadline(entry), now),
+                        memory_order_release);
+  atomic_store_explicit(&entry->last_successful_transfer, now, memory_order_release);
+}
+
 int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
                       tcp_stream_ctx_t *stream_ctx, axfr_session_t *session,
                       tsig_key_t *tsig_key,
@@ -857,9 +1001,28 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
   unsigned unsigned_run = 0;     /* I2: unsigned messages since the last signed one (RFC 8945 §5.3.1: at most 99) */
   uint64_t total_bytes = 0;      /* I2: octets of the messages read so far (session->max_bytes) */
 
+  uint32_t cur_rcvtimeo = 0;  /* max-transfer-time-in / max-transfer-idle-in: the SO_RCVTIMEO now set (0 = none set by this loop) */
   while (1) {
+    if (session->deadline || session->idle_secs) {
+      bool expired = false;
+      uint32_t budget = xfr_read_budget(time(NULL), session->deadline, session->idle_secs, &expired);
+      if (expired) {
+        syslog(LOG_ERR, "[AXFR] zone '%s': giving up the transfer: it took longer than max-transfer-time-in", entry->domain);
+        if (unsigned_msgs) free(unsigned_msgs);
+        zone_arena_destroy(&tmp_arena);
+        return -1;
+      }
+      if (budget != cur_rcvtimeo && budget > 0) {
+        struct timeval rtv = { .tv_sec = (time_t)budget, .tv_usec = 0 };
+        setsockopt(tcp_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&rtv, sizeof rtv);
+        cur_rcvtimeo = budget;
+      }
+    }
     int ret = read_dns_tcp_message(tcp_fd, stream_ctx, &msg, &msg_len);
     if (ret < 0 || ret == 0) {
+      if (session->idle_secs && ret == 0) /* the read timed out (SO_RCVTIMEO): read_dns_tcp_message() reports EAGAIN as 0 */
+        syslog(LOG_ERR, "[AXFR] zone '%s': giving up the transfer: no data for %u seconds (max-transfer-idle-in / max-transfer-time-in)",
+               entry->domain, cur_rcvtimeo);
       if (unsigned_msgs) free(unsigned_msgs);
       zone_arena_destroy(&tmp_arena);
       return -1;
@@ -1031,6 +1194,8 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
           syslog(LOG_WARNING, "[XFR] Inbound transfer swap for zone '%s' postponed: active AXFR in progress.", entry->domain);
           return -1;
         }
+        /* BIND zone_xfrdone(): refresh and retry are held to [min-*-time, max-*-time], expire to [refresh + retry, 24 weeks] */
+        if (has_soa && session->eff) xfr_clamp_timers(session->eff, refresh, retry, expire, &refresh, &retry, &expire);
         if (has_soa) {
           time_t now = time(NULL);
           entry->serial = serial;
@@ -1073,13 +1238,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         ret_code = 1;
       } else {
         pthread_mutex_lock(&entry->writer_lock);
-        time_t now = time(NULL);
-        atomic_store_explicit(&entry->next_check, now + entry->refresh, memory_order_release);
-        atomic_store_explicit(&entry->expire_at,
-                              xfr_expire_deadline(false, session->has_expire, session->expire, entry->expire,
-                                                  zone_expire_deadline(entry), now),
-                              memory_order_release);
-        atomic_store_explicit(&entry->last_successful_transfer, now, memory_order_release);
+        xfr_note_uptodate(entry, session);
         pthread_mutex_unlock(&entry->writer_lock);
         ret_code = 2;
       }
@@ -1106,27 +1265,29 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
 }
 
 /* 転送要求 (AXFR、serial が 0 でなければ IXFR) を TCP の長さ前置き付きで buf に組み立てる。
- * IXFR の Authority にはクライアントの版の SOA (RFC 1995 §3)、OPT には長さ 0 の EXPIRE (RFC 7314 §4) と
- * Extended AXFR を付け、鍵があれば署名する (req_mac に要求の MAC)。戻り値は全体の長さ、失敗は 0。 */
+ * IXFR の Authority にはクライアントの版の SOA (RFC 1995 §3)、OPT には長さ 0 の EXPIRE (RFC 7314 §4。request-expire no なら付けない) と
+ * Extended AXFR を付け、鍵があれば署名する (req_mac に要求の MAC)。soa_query なら AXFR/IXFR ではなく SOA の問い合わせ
+ * (request-ixfr no: BIND の "SOA before AXFR")。戻り値は全体の長さ、失敗は 0。 */
 static size_t build_xfr_request(uint8_t *buf, size_t cap, const char *domain, uint32_t serial, uint16_t id, uint8_t ext_ver,
-                                tsig_key_t *tsig_key, uint8_t *req_mac, size_t *req_mac_len) {
+                                bool request_expire, bool soa_query, tsig_key_t *tsig_key, uint8_t *req_mac, size_t *req_mac_len) {
   uint8_t *hdr = &buf[2];
   size_t len = 2;
+  bool ixfr = serial != 0 && !soa_query;
   if (cap < 2 + DNS_HEADER_SIZE + UDP_DEFAULT_MAX_RES_LEN) return 0;
   memset(hdr, 0, DNS_HEADER_SIZE);
   hdr[0] = id >> 8;
   hdr[1] = id & 0xFF;
   hdr[5] = 0x01;
-  hdr[9] = serial ? 0x01 : 0x00;
+  hdr[9] = ixfr ? 0x01 : 0x00;
   len += DNS_HEADER_SIZE;
   long w = write_uncompressed_name(buf, len, cap - UDP_DEFAULT_MAX_RES_LEN, domain);
   if (w <= 0) return 0;
   len += (size_t)w;
   buf[len++] = 0x00;
-  buf[len++] = serial ? 251 : 252;
+  buf[len++] = soa_query ? 6 : (ixfr ? 251 : 252);
   buf[len++] = 0x00;
   buf[len++] = 1;
-  if (serial) {
+  if (ixfr) {
     /* 所有者名は QNAME への圧縮ポインタ、MNAME と RNAME は root、SERIAL の後は 0 */
     static const uint8_t soa_head[] = {0xC0, 0x0C, 0x00, 6, 0x00, 1, 0, 0, 0, 0, 0x00, 22, 0, 0};
     memcpy(&buf[len], soa_head, sizeof(soa_head));
@@ -1139,17 +1300,28 @@ static size_t build_xfr_request(uint8_t *buf, size_t cap, const char *domain, ui
     len += 16;
   }
   uint32_t domain_hash = calc_fnv1a_str(domain);
-  const uint8_t opt[] = {
-      0, 0x00, 41, 0x10, 0x00, 0, 0, 0, 0,
-      0x00, 0x0D, /* RDLEN: 4 (EXPIRE) + 9 (Extended AXFR) */
-      0x00, EDNS_OPTION_EXPIRE, 0x00, 0x00,
-      (EDNS_OPTION_KARIDNS_EXT >> 8) & 0xFF, EDNS_OPTION_KARIDNS_EXT & 0xFF, 0x00, 0x05,
-      ext_ver, (domain_hash >> 24) & 0xFF, (domain_hash >> 16) & 0xFF, (domain_hash >> 8) & 0xFF,
-      domain_hash & 0xFF};
-  memcpy(&buf[len], opt, sizeof(opt));
-  len += sizeof(opt);
-  hdr[11] = 1;
+  uint16_t rdlen = (uint16_t)((request_expire ? 4 : 0) + (ext_ver ? 9 : 0));
   *req_mac_len = 0;
+  if (rdlen > 0) {
+    /* the root owner name, TYPE OPT, UDP size 4096, no extended RCODE / flags */
+    static const uint8_t opt_head[] = {0, 0x00, 41, 0x10, 0x00, 0, 0, 0, 0};
+    memcpy(&buf[len], opt_head, sizeof(opt_head));
+    len += sizeof(opt_head);
+    buf[len++] = (uint8_t)(rdlen >> 8);
+    buf[len++] = (uint8_t)(rdlen & 0xFF);
+    if (request_expire) {
+      static const uint8_t expire_opt[] = {0x00, EDNS_OPTION_EXPIRE, 0x00, 0x00};
+      memcpy(&buf[len], expire_opt, sizeof(expire_opt));
+      len += sizeof(expire_opt);
+    }
+    if (ext_ver) {
+      const uint8_t ext_opt[] = {(EDNS_OPTION_KARIDNS_EXT >> 8) & 0xFF, EDNS_OPTION_KARIDNS_EXT & 0xFF, 0x00, 0x05, ext_ver,
+                                 (domain_hash >> 24) & 0xFF, (domain_hash >> 16) & 0xFF, (domain_hash >> 8) & 0xFF, domain_hash & 0xFF};
+      memcpy(&buf[len], ext_opt, sizeof(ext_opt));
+      len += sizeof(ext_opt);
+    }
+    hdr[11] = 1;
+  }
   if (tsig_key) {
     size_t p_len = len - 2;
     if (tsig_sign_packet(hdr, &p_len, cap - 2, tsig_key, 0, req_mac, req_mac_len, NULL, 0, false) != 0)
@@ -1161,10 +1333,116 @@ static size_t build_xfr_request(uint8_t *buf, size_t cap, const char *domain, ui
   return len;
 }
 
+/* The TCP connection to a primary, from the local address of the primary (primaries source), else of transfer-source: the connect broker binds
+ * it (port 0) before connect().  -1 = no connection (logged). */
+static int xfr_connect(axfr_bg_ctx_t *ctx, const xfr_primary_t *p, struct sockaddr_storage *master_addr, int family) {
+  tcp_sockopts_t o = ctx->tcp_opts;
+  if (p->has_src) {
+    o.has_src = 1;
+    memcpy(o.src, p->src, sizeof(o.src));
+  }
+  size_t addr_len = (family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+  int tcp_fd = broker_connect_opts(family, SOCK_STREAM, (struct sockaddr *)master_addr, addr_len, &o);
+  if (tcp_fd < 0) {
+    syslog(LOG_ERR, "[AXFR] Failed to connect to %s for zone %s%s", p->ip, ctx->domain,
+           p->has_src ? " (from the configured transfer source address)" : "");
+    return -1;
+  }
+  limit_client_socket_rights(tcp_fd);
+  struct timeval tv;
+  tv.tv_sec = 30;
+  tv.tv_usec = 0;
+  setsockopt(tcp_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
+  setsockopt(tcp_fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof tv);
+  return tcp_fd;
+}
+
+/* The serial of the one apex SOA in the answer section of a SOA response (RFC 1035 §4.1.3).  false = not a usable SOA answer. */
+static bool xfr_soa_answer_serial(const uint8_t *m, size_t len, uint16_t id, uint32_t *serial) {
+  if (len < DNS_HEADER_SIZE || (((uint16_t)m[0] << 8) | m[1]) != id || (m[2] & 0x80) == 0 || ((m[2] >> 3) & 0x0F) != 0 || (m[3] & 0x0F) != 0)
+    return false;
+  uint16_t qd = (uint16_t)((m[4] << 8) | m[5]), an = (uint16_t)((m[6] << 8) | m[7]);
+  size_t off = DNS_HEADER_SIZE;
+  for (uint16_t i = 0; i < qd; i++) {
+    size_t next;
+    if (skip_wire_name(m, len, off, &next) != 0 || next + 4 > len) return false;
+    off = next + 4;
+  }
+  bool found = false;
+  uint32_t s = 0;
+  for (uint16_t i = 0; i < an; i++) {
+    size_t next;
+    if (skip_wire_name(m, len, off, &next) != 0 || next + 10 > len) return false;
+    uint16_t type = (uint16_t)((m[next] << 8) | m[next + 1]);
+    uint16_t cls = (uint16_t)((m[next + 2] << 8) | m[next + 3]);
+    uint16_t rdlen = (uint16_t)((m[next + 8] << 8) | m[next + 9]);
+    size_t rd = next + 10;
+    if (rd + rdlen > len) return false;
+    if (type == 6 && cls == 1) {
+      size_t o1, o2;
+      if (found || skip_wire_name(m, len, rd, &o1) != 0 || skip_wire_name(m, len, o1, &o2) != 0 || o2 + 4 > rd + rdlen) return false;
+      s = ((uint32_t)m[o2] << 24) | ((uint32_t)m[o2 + 1] << 16) | ((uint32_t)m[o2 + 2] << 8) | m[o2 + 3];
+      found = true;
+    }
+    off = rd + rdlen;
+  }
+  if (found) *serial = s;
+  return found;
+}
+
+/* request-ixfr no (BIND 9.20: "IXFR disabled, requesting SOA before AXFR"): ask for the SOA of the zone first, over its own TCP connection,
+ * and transfer only when the primary's serial is newer than ours.  Returns XFR_R_UPTODATE (same serial: the timers are restarted, with the
+ * EXPIRE option of the answer), XFR_R_BEHIND, XFR_R_TRANSFERRED (= newer: transfer now) or XFR_R_FAILED. */
+static int xfr_soa_probe(axfr_bg_ctx_t *ctx, const xfr_primary_t *p, struct sockaddr_storage *master_addr, int family, tsig_key_t *tsig_key,
+                         uint32_t our_serial, axfr_session_t *session) {
+  int fd = xfr_connect(ctx, p, master_addr, family);
+  if (fd < 0) return XFR_R_FAILED;
+  int result = XFR_R_FAILED;
+  tcp_stream_ctx_t *sctx = calloc(1, sizeof(tcp_stream_ctx_t));
+  uint8_t req[2048], req_mac[64], *msg = NULL;
+  size_t req_mac_len = 0;
+  uint16_t id = (uint16_t)(arc4random() & 0xFFFF), msg_len = 0;
+  size_t req_len = sctx ? build_xfr_request(req, sizeof(req), ctx->domain, 0, id, 0, ctx_request_expire(ctx), true, tsig_key, req_mac, &req_mac_len) : 0;
+  if (req_len == 0 || send(fd, req, req_len, 0) != (ssize_t)req_len) {
+    syslog(LOG_ERR, "[AXFR] zone %s: cannot send the SOA query to %s", ctx->domain, p->ip);
+  } else if (read_dns_tcp_message(fd, sctx, &msg, &msg_len) <= 0) {
+    syslog(LOG_ERR, "[AXFR] zone %s: no answer to the SOA query from %s", ctx->domain, p->ip);
+  } else {
+    uint32_t theirs = 0;
+    bool signed_ok = true;
+    if (tsig_key) {
+      uint8_t mac[64];
+      size_t mac_len = 0;
+      signed_ok = tsig_verify_packet(msg, msg_len, tsig_key, req_mac_len > 0 ? req_mac : NULL, req_mac_len, NULL, 0, false, mac, &mac_len) == 0;
+      if (!signed_ok) syslog(LOG_ERR, "[AXFR] zone %s: the SOA answer of %s is not signed correctly with key '%s'", ctx->domain, p->ip, tsig_key->name);
+    }
+    if (signed_ok && !xfr_soa_answer_serial(msg, msg_len, id, &theirs)) {
+      syslog(LOG_ERR, "[AXFR] zone %s: %s did not answer the SOA query with a SOA record", ctx->domain, p->ip);
+    } else if (signed_ok) {
+      if (msg_len >= DNS_HEADER_SIZE && ((msg[10] << 8) | msg[11]) > 0) {
+        edns_info_t edns = {0};
+        uint16_t qd = (uint16_t)((msg[4] << 8) | msg[5]), an = (uint16_t)((msg[6] << 8) | msg[7]), ns = (uint16_t)((msg[8] << 8) | msg[9]),
+                 ar = (uint16_t)((msg[10] << 8) | msg[11]);
+        if (parse_edns_opt(msg, msg_len, qd, an, ns, ar, &edns) == 0 && edns.has_expire_value) {
+          session->has_expire = true;
+          session->expire = edns.expire_value;
+        }
+      }
+      session->initial_soa_serial = theirs;
+      if (theirs == our_serial) result = XFR_R_UPTODATE;
+      else if (xfr_serial_behind(our_serial, theirs)) result = XFR_R_BEHIND;
+      else result = XFR_R_TRANSFERRED;
+    }
+  }
+  free(sctx);
+  close(fd);
+  return result;
+}
+
 /* 1回の転送: 接続し、要求を送り、応答を処理する。戻り値は handle_axfr_event() と同じ
  * (1 = 転送した、2 = 最新、-1 = 失敗。エラー応答なら session->rcode にその RCODE)。 */
-static int xfr_attempt(axfr_bg_ctx_t *ctx, struct sockaddr_storage *master_addr, int family, uint8_t ext_ver, bool ext_probe,
-                       tsig_key_t *tsig_key, uint32_t ixfr_serial, axfr_session_t *session) {
+static int xfr_attempt(axfr_bg_ctx_t *ctx, const xfr_primary_t *p, struct sockaddr_storage *master_addr, int family, uint8_t ext_ver,
+                       bool ext_probe, tsig_key_t *tsig_key, uint32_t ixfr_serial, axfr_session_t *session) {
   uint32_t active_serial = ctx->entry ? ctx->entry->serial : 0;
   memset(session, 0, sizeof(*session));
   session->query_id = (uint16_t)(arc4random() & 0xFFFF);
@@ -1174,20 +1452,12 @@ static int xfr_attempt(axfr_bg_ctx_t *ctx, struct sockaddr_storage *master_addr,
   session->client_serial = active_serial;
   session->max_records = ctx->max_records;         /* I2: the limits of the zone (max-zone-records / max-zone-bytes) */
   session->max_bytes = ctx->max_bytes;
+  session->eff = ctx->has_eff ? &ctx->eff : NULL;                        /* batch 4: the timers are held to min/max-refresh/retry-time */
+  session->idle_secs = ctx->has_eff ? ctx->eff.xfer_idle_in : 0;      /* max-transfer-idle-in (0 = no limit) */
+  session->deadline = ctx->has_eff && ctx->eff.xfer_time_in ? time(NULL) + (time_t)ctx->eff.xfer_time_in : 0; /* max-transfer-time-in */
 
-  size_t addr_len = (family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
-  int tcp_fd = broker_connect_opts(family, SOCK_STREAM, (struct sockaddr *)master_addr, addr_len,
-                                   &ctx->tcp_opts);
-  if (tcp_fd < 0) {
-    syslog(LOG_ERR, "[AXFR] Failed to connect to %s for zone %s", ctx->master_ip, ctx->domain);
-    return -1;
-  }
-  limit_client_socket_rights(tcp_fd);
-  struct timeval tv;
-  tv.tv_sec = 30;
-  tv.tv_usec = 0;
-  setsockopt(tcp_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
-  setsockopt(tcp_fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof tv);
+  int tcp_fd = xfr_connect(ctx, p, master_addr, family);
+  if (tcp_fd < 0) return -1;
   tcp_stream_ctx_t *stream_ctx = calloc(1, sizeof(tcp_stream_ctx_t));
   if (!stream_ctx) {
     close(tcp_fd);
@@ -1200,7 +1470,7 @@ static int xfr_attempt(axfr_bg_ctx_t *ctx, struct sockaddr_storage *master_addr,
   int axfr_res = -1;
   session->ext_probe = ext_probe;
   size_t req_len = build_xfr_request(axfr_req, sizeof(axfr_req), ctx->domain, ixfr_serial, session->query_id, ext_ver,
-                                     tsig_key, req_mac, &req_mac_len);
+                                     ctx_request_expire(ctx), false, tsig_key, req_mac, &req_mac_len);
   if (req_len == 0) {
     syslog(LOG_ERR, "[AXFR] Failed to build%s request for zone %s", tsig_key ? " TSIG-signed" : "", ctx->domain);
   } else if (send(tcp_fd, axfr_req, req_len, 0) == (ssize_t)req_len) {
@@ -1210,7 +1480,7 @@ static int xfr_attempt(axfr_bg_ctx_t *ctx, struct sockaddr_storage *master_addr,
                                  req_mac_len > 0 ? req_mac : NULL, req_mac_len);
     rcu_aux_thread_unpin();
   } else {
-    syslog(LOG_ERR, "[AXFR] Failed to send request for zone %s to %s", ctx->domain, ctx->master_ip);
+    syslog(LOG_ERR, "[AXFR] Failed to send request for zone %s to %s", ctx->domain, p->ip);
   }
   free(stream_ctx);
   close(tcp_fd);
@@ -1231,100 +1501,147 @@ uint8_t xfr_ext_learn(bool answered_extended, uint8_t answered_version) {
   return answered_version >= 3 ? XFR_EXT_V3 : XFR_EXT_V2;
 }
 
-void *axfr_bg_thread_func(void *arg) {
-  atomic_fetch_add_explicit(&g_xfers_running, 1, memory_order_relaxed);
+/* The refresh of one primary: everything the thread did for the single primary before batch 4.  Returns an XFR_R_* code. */
+static int xfr_try_primary(void *arg, int idx) {
   axfr_bg_ctx_t *ctx = (axfr_bg_ctx_t *)arg;
-  zone_db_snapshot_t *bg_snap = ctx->snap;
-
-  /* [H-4] ctx->has_tsig が真の場合は、ctx 内に値コピーされた TSIG 情報から
+  const xfr_primary_t *p = &ctx->prim[idx];
+  /* [H-4] p->has_tsig が真の場合は、p 内に値コピーされた TSIG 情報から
    * スタック上の tsig_key_t を組み立てて使用する (config ポインタを参照しない)。*/
   tsig_key_t local_tsig_key;
   tsig_key_t *tsig_key_ptr = NULL;
-  if (ctx->has_tsig) {
+  if (p->has_tsig) {
     memset(&local_tsig_key, 0, sizeof(local_tsig_key));
-    local_tsig_key.name = ctx->tsig_name;
-    local_tsig_key.algorithm = ctx->tsig_algorithm;
+    local_tsig_key.name = (char *)p->tsig_name;
+    local_tsig_key.algorithm = (char *)p->tsig_algorithm;
     local_tsig_key.secret = NULL; /* 使用しないので NULL 可 */
-    memcpy(local_tsig_key.secret_decoded, ctx->tsig_secret_decoded, ctx->tsig_secret_decoded_len);
-    local_tsig_key.secret_decoded_len = ctx->tsig_secret_decoded_len;
+    memcpy(local_tsig_key.secret_decoded, p->tsig_secret_decoded, p->tsig_secret_decoded_len);
+    local_tsig_key.secret_decoded_len = p->tsig_secret_decoded_len;
     local_tsig_key.next = NULL;
     tsig_key_ptr = &local_tsig_key;
   }
   struct sockaddr_storage master_addr;
   memset(&master_addr, 0, sizeof(master_addr));
   int domain_family = AF_INET;
-  if (inet_pton(AF_INET, ctx->master_ip,
-                &((struct sockaddr_in *)&master_addr)->sin_addr) == 1) {
+  if (inet_pton(AF_INET, p->ip, &((struct sockaddr_in *)&master_addr)->sin_addr) == 1) {
     domain_family = AF_INET;
     master_addr.ss_family = AF_INET;
-    ((struct sockaddr_in *)&master_addr)->sin_port =
-        htons(ctx->master_port > 0 ? ctx->master_port : 53);
-  } else if (inet_pton(AF_INET6, ctx->master_ip,
-                       &((struct sockaddr_in6 *)&master_addr)->sin6_addr) ==
-             1) {
+    ((struct sockaddr_in *)&master_addr)->sin_port = htons(p->port > 0 ? p->port : 53);
+  } else if (inet_pton(AF_INET6, p->ip, &((struct sockaddr_in6 *)&master_addr)->sin6_addr) == 1) {
     domain_family = AF_INET6;
     master_addr.ss_family = AF_INET6;
-    ((struct sockaddr_in6 *)&master_addr)->sin6_port =
-        htons(ctx->master_port > 0 ? ctx->master_port : 53);
+    ((struct sockaddr_in6 *)&master_addr)->sin6_port = htons(p->port > 0 ? p->port : 53);
   } else {
-    syslog(LOG_ERR, "[AXFR] Invalid master IP address format: '%s'", ctx->master_ip);
-    if (ctx->entry)
-      atomic_store_explicit(&ctx->entry->is_transferring, false, memory_order_release);
-    free(ctx);
-    if (bg_snap)
-      release_zone_snapshot(bg_snap);
-    atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
-    pthread_exit(NULL);
+    syslog(LOG_ERR, "[AXFR] Invalid master IP address format: '%s'", p->ip);
+    return XFR_R_FAILED;
+  }
+  /* transfers-per-ns: a primary that already serves that many transfers to us is asked later (BIND queues the zone) */
+  if (!xfr_ns_acquire(&master_addr, ctx->has_eff ? ctx->per_ns_limit : UINT32_MAX)) {
+    syslog(LOG_INFO, "[AXFR] zone %s: transfer from %s deferred due to quota (transfers-per-ns %u)", ctx->domain, p->ip, ctx->per_ns_limit);
+    return XFR_R_DEFERRED;
   }
 
   axfr_session_t session;
+  memset(&session, 0, sizeof(session));
+  session.eff = ctx->has_eff ? &ctx->eff : NULL;   /* the SOA probe's up-to-date answer holds the timers to the limits as well */
   uint32_t active_serial = ctx->entry ? ctx->entry->serial : 0;
+  int axfr_res;
+  bool probed_newer = false;
+  if (!ctx_request_ixfr(ctx) && active_serial != 0) {
+    /* request-ixfr no: SOA first, and the AXFR only when the primary is ahead */
+    int pr = xfr_soa_probe(ctx, p, &master_addr, domain_family, tsig_key_ptr, active_serial, &session);
+    if (pr == XFR_R_UPTODATE) {
+      pthread_mutex_lock(&ctx->entry->writer_lock);
+      xfr_note_uptodate(ctx->entry, &session);
+      pthread_mutex_unlock(&ctx->entry->writer_lock);
+      xfr_ns_release(&master_addr);
+      return XFR_R_UPTODATE;
+    }
+    if (pr == XFR_R_BEHIND) {
+      session.serial_behind = true;
+      if (!ctx_multi_master(ctx))
+        syslog(LOG_INFO, "[AXFR] zone %s: serial number (%u) received from primary %s < ours (%u)", ctx->domain, session.initial_soa_serial, p->ip,
+               active_serial);
+      xfr_ns_release(&master_addr);
+      return XFR_R_BEHIND;
+    }
+    if (pr == XFR_R_FAILED) {
+      xfr_ns_release(&master_addr);
+      return XFR_R_FAILED;
+    }
+    probed_newer = true;
+  }
   /* B8t-2: the Extended AXFR version this primary speaks (kept per zone, in memory): ask for version 3 first; when a standard transfer
    * comes back, ask once more with version 2 and remember what the primary did (xfr_ext_*) */
   time_t ext_now = time(NULL);
   uint8_t ext_state = ctx->entry ? xfr_ext_effective(ctx->entry->xfr_ext_state, ctx->entry->xfr_ext_set, ext_now) : XFR_EXT_UNKNOWN;
   uint8_t ext_ver = xfr_ext_request_version(ext_state);
-  int axfr_res = xfr_attempt(ctx, &master_addr, domain_family, ext_ver, xfr_ext_probe(ext_state), tsig_key_ptr, active_serial, &session);
+  uint32_t ixfr_serial = probed_newer ? 0 : active_serial;   /* the SOA said the primary is ahead: the whole zone (request-ixfr no) */
+  axfr_res = xfr_attempt(ctx, p, &master_addr, domain_family, ext_ver, xfr_ext_probe(ext_state), tsig_key_ptr, ixfr_serial, &session);
   if (axfr_res < 0 && session.no_ext_answer) {
-    syslog(LOG_NOTICE, "[AXFR] zone %s: %s answered a version 3 request with a standard transfer; asking with version 2", ctx->domain,
-           ctx->master_ip);
+    syslog(LOG_NOTICE, "[AXFR] zone %s: %s answered a version 3 request with a standard transfer; asking with version 2", ctx->domain, p->ip);
     ext_ver = 2;
-    axfr_res = xfr_attempt(ctx, &master_addr, domain_family, ext_ver, false, tsig_key_ptr, active_serial, &session);
+    axfr_res = xfr_attempt(ctx, p, &master_addr, domain_family, ext_ver, false, tsig_key_ptr, ixfr_serial, &session);
   }
   /* R-19, RFC 1995 §4: IXFR を扱えないプライマリ (FORMERR / NOTIMP) からは AXFR で1回だけ取り直す。
    * I1: 差分列が手元の版から始まらない (または連続しない) IXFR も同じ (RFC 1995 §4、parse_xfr_packet()) */
-  if (axfr_res < 0 && active_serial != 0 && (session.rcode == 1 || session.rcode == 4 || session.ixfr_bad_sequence)) {
-    syslog(LOG_NOTICE, "[AXFR] zone %s: %s %s, retrying with AXFR", ctx->domain, ctx->master_ip,
+  if (axfr_res < 0 && ixfr_serial != 0 && (session.rcode == 1 || session.rcode == 4 || session.ixfr_bad_sequence)) {
+    syslog(LOG_NOTICE, "[AXFR] zone %s: %s %s, retrying with AXFR", ctx->domain, p->ip,
            session.ixfr_bad_sequence ? "sent an IXFR whose difference sequences do not start from our serial" : "does not support IXFR");
-    axfr_res = xfr_attempt(ctx, &master_addr, domain_family, ext_ver, false, tsig_key_ptr, 0, &session);
+    axfr_res = xfr_attempt(ctx, p, &master_addr, domain_family, ext_ver, false, tsig_key_ptr, 0, &session);
   }
+  xfr_ns_release(&master_addr);
   if (axfr_res > 0 && ctx->entry) {
     uint8_t learned = xfr_ext_learn(session.is_extended_mode, session.ext_version);
     if (learned != ctx->entry->xfr_ext_state || ext_state != ctx->entry->xfr_ext_state) {
       if (learned == XFR_EXT_V2)
         syslog(LOG_NOTICE, "[AXFR] zone %s: the primary %s speaks Extended AXFR version 2 only; version 3 is tried again after %d hours",
-               ctx->domain, ctx->master_ip, XFR_EXT_REPROBE_SECS / 3600);
+               ctx->domain, p->ip, XFR_EXT_REPROBE_SECS / 3600);
       ctx->entry->xfr_ext_state = learned;
       ctx->entry->xfr_ext_set = ext_now;       /* the re-probe time counts from the change */
     }
   }
   if (session.out_of_zone_skipped > 0) {
-    syslog(LOG_WARNING, "[AXFR] zone %s: ignored %u out-of-zone record(s) sent by %s",
-           ctx->domain, session.out_of_zone_skipped, ctx->master_ip);
+    syslog(LOG_WARNING, "[AXFR] zone %s: ignored %u out-of-zone record(s) sent by %s", ctx->domain, session.out_of_zone_skipped, p->ip);
   }
   if (axfr_res == 1) {
-    syslog(LOG_NOTICE, "[AXFR] Successfully transferred zone %s from %s", ctx->domain, ctx->master_ip);
-  } else if (axfr_res == 2) {
-    // Zone is up to date. Do not log to avoid spam on short refresh intervals.
-  } else {
-    syslog(LOG_ERR, "[AXFR] Failed to transfer zone %s from %s", ctx->domain, ctx->master_ip);
+    syslog(LOG_NOTICE, "[AXFR] Successfully transferred zone %s from %s", ctx->domain, p->ip);
+    return XFR_R_TRANSFERRED;
   }
-  if (ctx->entry)
-    atomic_store_explicit(&ctx->entry->is_transferring, false,
-                          memory_order_release);
+  if (axfr_res == 2) {
+    // Zone is up to date. Do not log to avoid spam on short refresh intervals.
+    return XFR_R_UPTODATE;
+  }
+  if (session.serial_behind) {
+    /* BIND zone.c refresh_callback(): logged unless multi-master; either way the next primary is asked */
+    if (!ctx_multi_master(ctx))
+      syslog(LOG_INFO, "[AXFR] zone %s: serial number (%u) received from primary %s < ours (%u)", ctx->domain, session.initial_soa_serial, p->ip,
+             active_serial);
+    return XFR_R_BEHIND;
+  }
+  syslog(LOG_ERR, "[AXFR] Failed to transfer zone %s from %s", ctx->domain, p->ip);
+  return XFR_R_FAILED;
+}
+
+void *axfr_bg_thread_func(void *arg) {
+  atomic_fetch_add_explicit(&g_xfers_running, 1, memory_order_relaxed);
+  axfr_bg_ctx_t *ctx = (axfr_bg_ctx_t *)arg;
+  zone_db_snapshot_t *bg_snap = ctx->snap;
+  /* the primaries in order (BIND refresh_callback(): the next one is asked after a failure, an up-to-date answer or a primary that is behind;
+   * a transfer ends the refresh) */
+  xfr_run_t run;
+  xfr_run_primaries(ctx->nprim, xfr_try_primary, ctx, &run);
+  if (ctx->entry) {
+    if (run.tried == 0 && run.deferred > 0) {
+      /* every primary was at its transfers-per-ns quota: look again at the next tick instead of waiting for the retry time */
+      atomic_store_explicit(&ctx->entry->next_check, time(NULL) + 1, memory_order_release);
+    }
+    atomic_store_explicit(&ctx->entry->is_transferring, false, memory_order_release);
+  }
   free(ctx);
   if (bg_snap)
     release_zone_snapshot(bg_snap);
+  /* the scheduler (the control thread) took the slot before it started this thread; a caller that did not (a unit test) must not drive the count negative */
+  if (atomic_fetch_sub_explicit(&g_xfr_in_active, 1, memory_order_acq_rel) <= 0) atomic_store_explicit(&g_xfr_in_active, 0, memory_order_release);
   atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
   pthread_exit(NULL);
 }
@@ -1749,6 +2066,15 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   zone_arena_t zattr;
   zone_arena_init(&zattr);
 
+  /* provide-ixfr no (BIND 9.20 ARM: "only responds with a full zone transfer (AXFR)"): the zone is sent whole, also to a client that is up to
+   * date, as with ixfr-history 0 for a client that is behind (RFC 1995 §4 allows an AXFR-style answer to an IXFR request) */
+  if (is_ixfr) {
+    server_config_t *pcfg = acquire_config_snapshot();
+    xfr_eff_t pe;
+    xfr_opts_effective(pcfg, pcfg ? zone_entry_config(pcfg, entry) : NULL, entry->view_name, &pe);
+    if (pcfg) release_config_snapshot(pcfg);
+    if (!pe.provide_ixfr) is_ixfr = false;
+  }
   /* R-15, RFC 1995 §2: 同じか新しい版 (RFC 1982 の比較) を持つクライアントには現在の SOA 1件で答える。 */
   bool client_up_to_date = is_ixfr && (client_serial == current_serial ||
                                        serial_is_newer(client_serial, current_serial));
@@ -2012,14 +2338,24 @@ void *axfr_worker_thread(void *arg) {
     memcpy(key_val.secret_decoded, args->tsig_secret_decoded, args->tsig_secret_decoded_len);
     pkey = &key_val;
   }
+  /* max-transfer-time-out / max-transfer-idle-out (BIND 9.20; 0 = no limit): send_tcp_dns_message() gives the transfer up after the deadline,
+   * and after a send that waited the idle time for the client (the socket is blocking, so SO_SNDTIMEO makes the wait end) */
+  g_tcp_send_idle_secs = args->idle_out_secs;
+  g_tcp_send_deadline_secs = args->time_out_secs ? time(NULL) + (time_t)args->time_out_secs : 0;
+  if (args->idle_out_secs) {
+    struct timeval stv = { .tv_sec = (time_t)args->idle_out_secs, .tv_usec = 0 };
+    setsockopt(args->client_fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&stv, sizeof stv);
+  }
   send_axfr_response(args->client_fd, args->qname, args->req, args->req_len,
                      pkey, entry, args->tsig_mac, args->tsig_mac_len,
                      &args->client_addr, args->client_len,
                      args->has_server_addr ? &args->server_addr : NULL, args->has_server_addr);
-  
-  submit_response_log(LOG_ACT_SENT, args->client_ip, args->client_port, args->qname, 
+  g_tcp_send_idle_secs = 0;
+  g_tcp_send_deadline_secs = 0;
+
+  submit_response_log(LOG_ACT_SENT, args->client_ip, args->client_port, args->qname,
                       args->qclass, args->qtype, 0, args->has_edns, args->dnssec_ok);
-  
+
   close(args->client_fd);
   dec_tcp_clients();
   zone_db_snapshot_t *worker_snap = args->snap;
@@ -2028,6 +2364,8 @@ void *axfr_worker_thread(void *arg) {
     atomic_fetch_sub(&entry->active_axfr, 1);
   rcu_aux_read_unlock();
   release_zone_snapshot(worker_snap);
+  /* the slot taken when the thread was started (transfers-out); a caller that did not take one (a unit test) must not drive the count negative */
+  if (atomic_fetch_sub_explicit(&g_xfr_out_active, 1, memory_order_acq_rel) <= 0) atomic_store_explicit(&g_xfr_out_active, 0, memory_order_release);
   atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
   pthread_exit(NULL);
 }

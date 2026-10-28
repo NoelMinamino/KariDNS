@@ -43,6 +43,15 @@ options {
     // allow-query { localhost; localnets; };   // 問い合わせを受け付けるクライアント (未指定は全員)
     // allow-transfer { 192.0.2.10; };          // ゾーン転送 (AXFR/IXFR) を許可するクライアント (未指定は拒否)
 
+    // 転送と NOTIFY (BIND 9.20 と同じ名前・既定値。zone > view > options の順。詳細は docs/karidns.md の
+    // "Transfer and NOTIFY options"。送信元アドレスは起動時に bind できなければ起動しない。リロードで増やした
+    // アドレスは再起動後に有効)
+    // transfer-source 192.0.2.1;  notify-source 192.0.2.1;   // 転送 (TCP) と NOTIFY の送信元 (* = OS に任せる)
+    // min-refresh-time 300; max-refresh-time 2419200;        // SOA の REFRESH を挟む範囲 (秒)
+    // min-retry-time 500;   max-retry-time 1209600;          // SOA の RETRY を挟む範囲 (秒)
+    // max-transfer-time-in 120; max-transfer-idle-in 60;     // 入ってくる転送の上限 (分)
+    // transfers-in 10; transfers-out 10; transfers-per-ns 2; // 同時に行う転送の数
+
     // UDPソケットバッファサイズ (未指定時のデフォルト: 4M)
     // OSの上限値(kern.ipc.maxsockbuf sysctl)を超えると切り詰められます
     udp-recvbuf-size 4M;
@@ -130,6 +139,8 @@ zone "example.com" {
     };
     also-notify { 192.168.1.100 port 53; };
     notify-source "192.168.1.1";
+    // セカンダリ側 (type slave) では primaries を複数並べると先頭から順に問い合わせる:
+    //   primaries source 192.168.1.1 { 192.168.1.100; 192.168.1.101 key "tsig-key"; };  multi-master yes;
     // ゾーン単位の転送パラメータ (クエリ受信後に接続へ適用。MSS は下げる方向のみ)
     // zone-tcp-sndbuf 2M;       // AXFR など大きな応答の送信バッファ
     // zone-tcp-window 128K;

@@ -77,8 +77,25 @@ server_config_t *acquire_config_snapshot(void) {
 void release_config_snapshot(server_config_t *snap) { (void)snap; }
 
 static int g_mock_broker_fd = -1;
+/* batch 4: a queue of answers for successive connections (-1 = the connection fails) and a log of what was asked */
+static int g_mock_broker_queue[8];
+static int g_mock_broker_qn = 0, g_mock_broker_qi = 0;
+static struct { char ip[64]; int port; int has_src; uint8_t src[16]; } g_conn_log[8];
+static int g_conn_n = 0;
 int broker_connect(int family, int type, struct sockaddr *addr, size_t addr_len) {
-    (void)family; (void)type; (void)addr; (void)addr_len;
+    (void)type; (void)addr_len;
+    if (g_conn_n < 8) {
+        if (family == AF_INET) {
+            inet_ntop(AF_INET, &((struct sockaddr_in *)addr)->sin_addr, g_conn_log[g_conn_n].ip, sizeof(g_conn_log[g_conn_n].ip));
+            g_conn_log[g_conn_n].port = ntohs(((struct sockaddr_in *)addr)->sin_port);
+        } else {
+            inet_ntop(AF_INET6, &((struct sockaddr_in6 *)addr)->sin6_addr, g_conn_log[g_conn_n].ip, sizeof(g_conn_log[g_conn_n].ip));
+            g_conn_log[g_conn_n].port = ntohs(((struct sockaddr_in6 *)addr)->sin6_port);
+        }
+        g_conn_log[g_conn_n].has_src = 0;
+        g_conn_n++;
+    }
+    if (g_mock_broker_qi < g_mock_broker_qn) return g_mock_broker_queue[g_mock_broker_qi++];
     if (g_mock_broker_fd >= 0) {
         int fd = g_mock_broker_fd;
         g_mock_broker_fd = -1;
@@ -100,8 +117,22 @@ ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len) {
     return len;
 }
 
+/* batch 4: when set, the next message returned carries the ID of the request the code under test wrote to this peer socket (the SOA probe
+ * checks the ID of the answer) */
+static int g_mock_patch_id_peer = -1;
+
 int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out, uint16_t *msg_len_out) {
     (void)fd; (void)ctx;
+    if (g_mock_patch_id_peer >= 0 && g_mock_tcp_msg_idx < g_mock_tcp_msg_count) {
+        uint8_t lb[2], rq[2048];
+        if (read(g_mock_patch_id_peer, lb, 2) == 2) {
+            size_t n = (size_t)((lb[0] << 8) | lb[1]);
+            if (n <= sizeof(rq) && read(g_mock_patch_id_peer, rq, n) == (ssize_t)n && n >= 2) {
+                g_mock_tcp_msgs[g_mock_tcp_msg_idx][0] = rq[0];
+                g_mock_tcp_msgs[g_mock_tcp_msg_idx][1] = rq[1];
+            }
+        }
+    }
     if (g_mock_tcp_msg_idx < g_mock_tcp_msg_count) {
         *msg_out = g_mock_tcp_msgs[g_mock_tcp_msg_idx];
         *msg_len_out = g_mock_tcp_msg_lens[g_mock_tcp_msg_idx];
@@ -1222,8 +1253,9 @@ static void test_axfr_bg_thread_and_free_ixfr_txn(void) {
     free_ixfr_txn(NULL);
 
     axfr_bg_ctx_t *ctx_bad_ip = calloc(1, sizeof(axfr_bg_ctx_t));
-    strlcpy(ctx_bad_ip->master_ip, "999.999.999.999", sizeof(ctx_bad_ip->master_ip));
-    ctx_bad_ip->master_port = 53;
+    ctx_bad_ip->nprim = 1;
+    strlcpy(ctx_bad_ip->prim[0].ip, "999.999.999.999", sizeof(ctx_bad_ip->prim[0].ip));
+    ctx_bad_ip->prim[0].port = 53;
     strlcpy(ctx_bad_ip->domain, "test.example.", sizeof(ctx_bad_ip->domain));
 
     pthread_t th1;
@@ -1231,22 +1263,24 @@ static void test_axfr_bg_thread_and_free_ixfr_txn(void) {
     pthread_join(th1, NULL);
 
     axfr_bg_ctx_t *ctx_tsig = calloc(1, sizeof(axfr_bg_ctx_t));
-    strlcpy(ctx_tsig->master_ip, "127.0.0.1", sizeof(ctx_tsig->master_ip));
-    ctx_tsig->master_port = 5353;
+    ctx_tsig->nprim = 1;
+    strlcpy(ctx_tsig->prim[0].ip, "127.0.0.1", sizeof(ctx_tsig->prim[0].ip));
+    ctx_tsig->prim[0].port = 5353;
     strlcpy(ctx_tsig->domain, "tsig.example.", sizeof(ctx_tsig->domain));
-    ctx_tsig->has_tsig = true;
-    strlcpy(ctx_tsig->tsig_name, "test-key", sizeof(ctx_tsig->tsig_name));
-    strlcpy(ctx_tsig->tsig_algorithm, "hmac-sha256", sizeof(ctx_tsig->tsig_algorithm));
-    memcpy(ctx_tsig->tsig_secret_decoded, "secret1234567890", 16);
-    ctx_tsig->tsig_secret_decoded_len = 16;
+    ctx_tsig->prim[0].has_tsig = true;
+    strlcpy(ctx_tsig->prim[0].tsig_name, "test-key", sizeof(ctx_tsig->prim[0].tsig_name));
+    strlcpy(ctx_tsig->prim[0].tsig_algorithm, "hmac-sha256", sizeof(ctx_tsig->prim[0].tsig_algorithm));
+    memcpy(ctx_tsig->prim[0].tsig_secret_decoded, "secret1234567890", 16);
+    ctx_tsig->prim[0].tsig_secret_decoded_len = 16;
 
     pthread_t th2;
     assert(pthread_create(&th2, NULL, axfr_bg_thread_func, ctx_tsig) == 0);
     pthread_join(th2, NULL);
 
     axfr_bg_ctx_t *ctx_v6 = calloc(1, sizeof(axfr_bg_ctx_t));
-    strlcpy(ctx_v6->master_ip, "::1", sizeof(ctx_v6->master_ip));
-    ctx_v6->master_port = 5353;
+    ctx_v6->nprim = 1;
+    strlcpy(ctx_v6->prim[0].ip, "::1", sizeof(ctx_v6->prim[0].ip));
+    ctx_v6->prim[0].port = 5353;
     strlcpy(ctx_v6->domain, "ipv6.example.", sizeof(ctx_v6->domain));
 
     pthread_t th3;
@@ -2335,8 +2369,9 @@ static void test_compute_ixfr_diff_ttl_changes_only(void) {
 static void test_axfr_background_thread_error_cleanup(void) {
     printf("[TEST] AXFR/IXFR: axfr_bg_thread_func error exit and cleanup...\n");
     axfr_bg_ctx_t *ctx = calloc(1, sizeof(axfr_bg_ctx_t));
-    strlcpy(ctx->master_ip, "192.0.2.254", sizeof(ctx->master_ip));
-    ctx->master_port = 5353;
+    ctx->nprim = 1;
+    strlcpy(ctx->prim[0].ip, "192.0.2.254", sizeof(ctx->prim[0].ip));
+    ctx->prim[0].port = 5353;
     strlcpy(ctx->domain, "bgerr.example.", sizeof(ctx->domain));
 
     pthread_t th;
@@ -5349,10 +5384,11 @@ static void test_axfr_ixfr_feature_case_151(void) {
     axfr_bg_ctx_t *ctx = calloc(1, sizeof(axfr_bg_ctx_t));
     assert(ctx != NULL);
     strlcpy(ctx->domain, "example.com.", sizeof(ctx->domain));
-    strlcpy(ctx->master_ip, "127.0.0.1", sizeof(ctx->master_ip));
-    ctx->master_port = 5353;
+    ctx->nprim = 1;
+    strlcpy(ctx->prim[0].ip, "127.0.0.1", sizeof(ctx->prim[0].ip));
+    ctx->prim[0].port = 5353;
     ctx->entry = &entry;
-    ctx->has_tsig = false;
+
 
     pthread_t th;
     assert(pthread_create(&th, NULL, axfr_bg_thread_func, ctx) == 0);
@@ -5396,14 +5432,15 @@ static void test_axfr_ixfr_feature_case_152(void) {
     axfr_bg_ctx_t *ctx = calloc(1, sizeof(axfr_bg_ctx_t));
     assert(ctx != NULL);
     strlcpy(ctx->domain, "tsigzone.example.", sizeof(ctx->domain));
-    strlcpy(ctx->master_ip, "127.0.0.1", sizeof(ctx->master_ip));
-    ctx->master_port = 5354;
+    ctx->nprim = 1;
+    strlcpy(ctx->prim[0].ip, "127.0.0.1", sizeof(ctx->prim[0].ip));
+    ctx->prim[0].port = 5354;
     ctx->entry = &entry;
-    ctx->has_tsig = true;
-    strlcpy(ctx->tsig_name, "xfrkey.example.", sizeof(ctx->tsig_name));
-    strlcpy(ctx->tsig_algorithm, "hmac-sha256", sizeof(ctx->tsig_algorithm));
-    ctx->tsig_secret_decoded_len = 32;
-    memset(ctx->tsig_secret_decoded, 0xAB, 32);
+    ctx->prim[0].has_tsig = true;
+    strlcpy(ctx->prim[0].tsig_name, "xfrkey.example.", sizeof(ctx->prim[0].tsig_name));
+    strlcpy(ctx->prim[0].tsig_algorithm, "hmac-sha256", sizeof(ctx->prim[0].tsig_algorithm));
+    ctx->prim[0].tsig_secret_decoded_len = 32;
+    memset(ctx->prim[0].tsig_secret_decoded, 0xAB, 32);
 
     pthread_t th;
     assert(pthread_create(&th, NULL, axfr_bg_thread_func, ctx) == 0);
@@ -5430,12 +5467,13 @@ static void test_axfr_ixfr_feature_case_152(void) {
     axfr_bg_ctx_t *ctx_bad = calloc(1, sizeof(axfr_bg_ctx_t));
     assert(ctx_bad != NULL);
     strlcpy(ctx_bad->domain, "badtsig.example.", sizeof(ctx_bad->domain));
-    strlcpy(ctx_bad->master_ip, "127.0.0.1", sizeof(ctx_bad->master_ip));
+    ctx_bad->nprim = 1;
+    strlcpy(ctx_bad->prim[0].ip, "127.0.0.1", sizeof(ctx_bad->prim[0].ip));
     ctx_bad->entry = &entry;
-    ctx_bad->has_tsig = true;
-    strlcpy(ctx_bad->tsig_name, "badkey.example.", sizeof(ctx_bad->tsig_name));
-    strlcpy(ctx_bad->tsig_algorithm, "invalid-algo", sizeof(ctx_bad->tsig_algorithm));
-    ctx_bad->tsig_secret_decoded_len = 32;
+    ctx_bad->prim[0].has_tsig = true;
+    strlcpy(ctx_bad->prim[0].tsig_name, "badkey.example.", sizeof(ctx_bad->prim[0].tsig_name));
+    strlcpy(ctx_bad->prim[0].tsig_algorithm, "invalid-algo", sizeof(ctx_bad->prim[0].tsig_algorithm));
+    ctx_bad->prim[0].tsig_secret_decoded_len = 32;
 
     assert(pthread_create(&th, NULL, axfr_bg_thread_func, ctx_bad) == 0);
     pthread_join(th, NULL);
@@ -7493,8 +7531,281 @@ static void test_sr_i5_txt_many_strings(void) {
     printf("  -> I5 passed.\n");
 }
 
+/* ---- batch 4: the policy of the secondary side (BIND 9.20 zone.c refresh_callback(), zmgr_start_xfrin_ifquota(), setrl()) ---- */
+
+static int g_order_called[16];
+static int g_order_n;
+static int order_fn(void *arg, int idx) {
+    const int *seq = (const int *)arg;
+    g_order_called[g_order_n++] = idx;
+    return seq[idx];
+}
+
+static void test_batch4_policy(void) {
+    printf("[TEST] AXFR/IXFR: batch 4 policy (order of primaries, quotas, rate, read budget)...\n");
+    xfr_run_t r;
+    /* a failure goes on to the next primary, a transfer ends the refresh (the primaries after it are not asked) */
+    int a[] = {XFR_R_FAILED, XFR_R_TRANSFERRED, XFR_R_FAILED};
+    g_order_n = 0;
+    xfr_run_primaries(3, order_fn, a, &r);
+    assert(g_order_n == 2 && g_order_called[0] == 0 && g_order_called[1] == 1);
+    assert(r.transferred_idx == 1 && r.failed == 1 && r.tried == 2);
+    /* an up-to-date answer does not end it: a later primary may be ahead (BIND marks the primary and goes on) */
+    int b[] = {XFR_R_UPTODATE, XFR_R_FAILED, XFR_R_UPTODATE};
+    g_order_n = 0;
+    xfr_run_primaries(3, order_fn, b, &r);
+    assert(g_order_n == 3 && r.transferred_idx == -1 && r.uptodate == 2 && r.failed == 1 && r.tried == 3);
+    /* behind -> next, then the transfer from the one that is ahead */
+    int c[] = {XFR_R_BEHIND, XFR_R_UPTODATE, XFR_R_TRANSFERRED};
+    g_order_n = 0;
+    xfr_run_primaries(3, order_fn, c, &r);
+    assert(g_order_n == 3 && r.transferred_idx == 2 && r.behind == 1 && r.uptodate == 1);
+    /* every primary at its quota: nothing was asked */
+    int d[] = {XFR_R_DEFERRED, XFR_R_DEFERRED};
+    g_order_n = 0;
+    xfr_run_primaries(2, order_fn, d, &r);
+    assert(r.tried == 0 && r.deferred == 2 && r.transferred_idx == -1);
+    g_order_n = 0;
+    xfr_run_primaries(0, order_fn, d, &r);
+    assert(g_order_n == 0 && r.tried == 0 && r.transferred_idx == -1);
+
+    /* transfers-per-ns: per remote address, not per port; the quota frees again */
+    struct sockaddr_storage s1, s2, s6;
+    memset(&s1, 0, sizeof(s1)); memset(&s2, 0, sizeof(s2)); memset(&s6, 0, sizeof(s6));
+    s1.ss_family = AF_INET; inet_pton(AF_INET, "192.0.2.101", &((struct sockaddr_in *)&s1)->sin_addr); ((struct sockaddr_in *)&s1)->sin_port = htons(53);
+    s2.ss_family = AF_INET; inet_pton(AF_INET, "192.0.2.102", &((struct sockaddr_in *)&s2)->sin_addr);
+    s6.ss_family = AF_INET6; inet_pton(AF_INET6, "2001:db8::101", &((struct sockaddr_in6 *)&s6)->sin6_addr);
+    assert(xfr_ns_acquire(&s1, 2));
+    ((struct sockaddr_in *)&s1)->sin_port = htons(5353);
+    assert(xfr_ns_acquire(&s1, 2));
+    assert(!xfr_ns_acquire(&s1, 2));
+    assert(xfr_ns_acquire(&s2, 2));                 /* another primary has its own quota */
+    assert(xfr_ns_acquire(&s6, 1) && !xfr_ns_acquire(&s6, 1));
+    xfr_ns_release(&s1);
+    assert(xfr_ns_acquire(&s1, 2));
+    assert(!xfr_ns_acquire(&s2, 0));                /* a limit of 0 asks no primary */
+    xfr_ns_release(&s1); xfr_ns_release(&s1); xfr_ns_release(&s2); xfr_ns_release(&s6);
+    assert(xfr_ns_acquire(&s1, 1));
+    xfr_ns_release(&s1);
+
+    /* transfers-in / transfers-out */
+    _Atomic int cnt = 0;
+    assert(xfr_counter_acquire(&cnt, 2) && xfr_counter_acquire(&cnt, 2) && !xfr_counter_acquire(&cnt, 2) && cnt == 2);
+    xfr_counter_release(&cnt);
+    assert(xfr_counter_acquire(&cnt, 2));
+    xfr_counter_release(&cnt); xfr_counter_release(&cnt);
+    assert(!xfr_counter_acquire(&cnt, 0) && cnt == 0);
+
+    /* serial-query-rate / notify-rate: that many in a second, the budget returns with the next second; 0 is 1 */
+    xfr_rl_t rl;
+    memset(&rl, 0, sizeof(rl));
+    time_t t0 = 1000;
+    assert(xfr_rl_take(&rl, 3, t0) && xfr_rl_take(&rl, 3, t0) && xfr_rl_take(&rl, 3, t0) && !xfr_rl_take(&rl, 3, t0));
+    assert(xfr_rl_take(&rl, 3, t0 + 1));
+    assert(xfr_rl_take(&rl, 0, t0 + 2) && !xfr_rl_take(&rl, 0, t0 + 2));
+    assert(xfr_rl_take(&rl, 20, t0 + 3));
+
+    /* max-transfer-time-in / max-transfer-idle-in */
+    bool expired = true;
+    assert(xfr_read_budget(100, 0, 0, &expired) == 0 && !expired);              /* no limit at all */
+    assert(xfr_read_budget(100, 0, 30, &expired) == 30 && !expired);
+    assert(xfr_read_budget(100, 105, 30, &expired) == 5 && !expired);           /* the total time is closer than the idle time */
+    assert(xfr_read_budget(100, 200, 30, &expired) == 30);
+    assert(xfr_read_budget(100, 200, 0, &expired) == 100 && !expired);
+    assert(xfr_read_budget(100, 100, 30, &expired) == 0 && expired);
+    assert(xfr_read_budget(101, 100, 30, &expired) == 0 && expired);
+    assert(xfr_read_budget(100, 105, 30, NULL) == 5);
+
+    /* RFC 1982: the primary is behind when its serial is older than ours */
+    assert(xfr_serial_behind(10, 9) && !xfr_serial_behind(10, 10) && !xfr_serial_behind(10, 11));
+    assert(xfr_serial_behind(5, 0xFFFFFFF0u) && !xfr_serial_behind(0xFFFFFFF0u, 5));
+    printf("  -> batch 4 policy passed.\n");
+}
+
+static void test_batch4_failover_and_sources(void) {
+    printf("[TEST] AXFR/IXFR: batch 4 refresh asks the primaries in order, from the configured source, within the quota...\n");
+    reset_mock_tcp_stream();
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    g_mock_broker_queue[0] = -1;      /* the first primary does not answer the connection */
+    g_mock_broker_queue[1] = sv[0];   /* the second does, and closes after the request */
+    g_mock_broker_qn = 2;
+    g_mock_broker_qi = 0;
+    g_conn_n = 0;
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "fo.example.", sizeof(entry.domain));
+    atomic_init(&entry.is_transferring, true);
+    atomic_init(&entry.next_check, 0);
+    axfr_bg_ctx_t *ctx = calloc(1, sizeof(axfr_bg_ctx_t));
+    assert(ctx != NULL);
+    strlcpy(ctx->domain, "fo.example.", sizeof(ctx->domain));
+    ctx->entry = &entry;
+    ctx->nprim = 3;
+    strlcpy(ctx->prim[0].ip, "192.0.2.1", sizeof(ctx->prim[0].ip));
+    ctx->prim[0].port = 5301;
+    strlcpy(ctx->prim[1].ip, "2001:db8::2", sizeof(ctx->prim[1].ip));
+    ctx->prim[1].port = 5302;
+    ctx->prim[1].has_src = true;
+    inet_pton(AF_INET6, "2001:db8::77", ctx->prim[1].src);
+    strlcpy(ctx->prim[2].ip, "192.0.2.3", sizeof(ctx->prim[2].ip));
+    ctx->prim[2].port = 5303;
+    ctx->prim[2].has_src = true;
+    inet_pton(AF_INET, "192.0.2.78", ctx->prim[2].src);
+    pthread_t th;
+    assert(pthread_create(&th, NULL, axfr_bg_thread_func, ctx) == 0);
+    uint8_t len_buf[2], req[2048];
+    assert(read(sv[1], len_buf, 2) == 2);
+    uint16_t req_len = (len_buf[0] << 8) | len_buf[1];
+    assert(read(sv[1], req, req_len) == req_len);
+    close(sv[1]);                      /* the stream ends: the second primary failed too */
+    pthread_join(th, NULL);
+    /* all three were tried, in the order written; the ones that fail go on (the third connection fails: the queue is empty) */
+    assert(g_conn_n == 3);
+    assert(strcmp(g_conn_log[0].ip, "192.0.2.1") == 0 && g_conn_log[0].port == 5301 && !g_conn_log[0].has_src);
+    assert(strcmp(g_conn_log[1].ip, "2001:db8::2") == 0 && g_conn_log[1].port == 5302 && g_conn_log[1].has_src);
+    uint8_t want6[16], want4[16] = {0};
+    inet_pton(AF_INET6, "2001:db8::77", want6);
+    assert(memcmp(g_conn_log[1].src, want6, 16) == 0);
+    assert(strcmp(g_conn_log[2].ip, "192.0.2.3") == 0 && g_conn_log[2].has_src);
+    inet_pton(AF_INET, "192.0.2.78", want4);
+    assert(memcmp(g_conn_log[2].src, want4, 4) == 0);
+    assert(!atomic_load(&entry.is_transferring));
+
+    /* transfers-per-ns: a primary at its quota is not asked at all, and the zone is looked at again at the next tick */
+    g_mock_broker_qn = g_mock_broker_qi = 0;
+    g_conn_n = 0;
+    struct sockaddr_storage busy;
+    memset(&busy, 0, sizeof(busy));
+    busy.ss_family = AF_INET;
+    inet_pton(AF_INET, "192.0.2.9", &((struct sockaddr_in *)&busy)->sin_addr);
+    assert(xfr_ns_acquire(&busy, 1));
+    atomic_store(&entry.is_transferring, true);
+    atomic_store(&entry.next_check, 0);
+    ctx = calloc(1, sizeof(axfr_bg_ctx_t));
+    strlcpy(ctx->domain, "fo.example.", sizeof(ctx->domain));
+    ctx->entry = &entry;
+    ctx->has_eff = true;
+    ctx->per_ns_limit = 1;
+    ctx->nprim = 1;
+    strlcpy(ctx->prim[0].ip, "192.0.2.9", sizeof(ctx->prim[0].ip));
+    ctx->prim[0].port = 53;
+    time_t before = time(NULL);
+    assert(pthread_create(&th, NULL, axfr_bg_thread_func, ctx) == 0);
+    pthread_join(th, NULL);
+    assert(g_conn_n == 0);
+    assert(atomic_load(&entry.next_check) >= before + 1 && atomic_load(&entry.next_check) <= time(NULL) + 2);
+    xfr_ns_release(&busy);
+    printf("  -> batch 4 failover and sources passed.\n");
+}
+
+/* a SOA answer for zone `z` (labels written by hand) with the given serial; the ID is patched by the mock read */
+static uint16_t soa_answer_msg(uint8_t *m, const char *z, uint32_t serial, bool good) {
+    size_t o = 0;
+    memset(m, 0, 12);
+    m[2] = good ? 0x84 : 0x04;   /* QR (unless garbage) AA */
+    m[5] = 1;
+    m[7] = good ? 1 : 0;
+    o = 12;
+    size_t qstart = o;
+    for (const char *p = z; *p;) {
+        const char *dot = strchr(p, '.');
+        size_t l = dot ? (size_t)(dot - p) : strlen(p);
+        m[o++] = (uint8_t)l;
+        memcpy(&m[o], p, l);
+        o += l;
+        p += l + (dot ? 1 : 0);
+    }
+    m[o++] = 0;
+    m[o++] = 0; m[o++] = 6; m[o++] = 0; m[o++] = 1;
+    (void)qstart;
+    if (!good) return (uint16_t)o;
+    m[o++] = 0xC0; m[o++] = 12;            /* owner: pointer to the question name */
+    m[o++] = 0; m[o++] = 6; m[o++] = 0; m[o++] = 1;
+    m[o++] = 0; m[o++] = 0; m[o++] = 0; m[o++] = 60;
+    size_t rdl = o;
+    o += 2;
+    m[o++] = 0; m[o++] = 0;                /* MNAME root, RNAME root */
+    m[o++] = (uint8_t)(serial >> 24); m[o++] = (uint8_t)(serial >> 16); m[o++] = (uint8_t)(serial >> 8); m[o++] = (uint8_t)serial;
+    for (int i = 0; i < 4; i++) { m[o++] = 0; m[o++] = 0; m[o++] = 0; m[o++] = 60; }
+    m[rdl] = 0; m[rdl + 1] = (uint8_t)(o - rdl - 2);
+    return (uint16_t)o;
+}
+
+static void run_soa_probe_case(uint32_t ours, uint32_t theirs, bool good, int expect_connections, bool expect_axfr_request) {
+    reset_mock_tcp_stream();
+    int sv[2], sv2[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv2) == 0);
+    g_mock_broker_queue[0] = sv[0];
+    g_mock_broker_queue[1] = sv2[0];
+    g_mock_broker_qn = 2;
+    g_mock_broker_qi = 0;
+    g_conn_n = 0;
+    uint8_t m[512];
+    uint16_t ml = soa_answer_msg(m, "pr.example.", theirs, good);
+    push_mock_tcp_msg(m, ml);
+    g_mock_patch_id_peer = sv[1];
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "pr.example.", sizeof(entry.domain));
+    entry.serial = ours;
+    atomic_init(&entry.refresh, 2);
+    atomic_init(&entry.retry, 1);
+    atomic_init(&entry.expire, 3600);
+    atomic_init(&entry.is_transferring, true);
+    atomic_init(&entry.next_check, 0);
+    axfr_bg_ctx_t *ctx = calloc(1, sizeof(axfr_bg_ctx_t));
+    strlcpy(ctx->domain, "pr.example.", sizeof(ctx->domain));
+    ctx->entry = &entry;
+    ctx->nprim = 1;
+    strlcpy(ctx->prim[0].ip, "192.0.2.1", sizeof(ctx->prim[0].ip));
+    ctx->prim[0].port = 53;
+    ctx->has_eff = true;
+    ctx->per_ns_limit = 2;
+    ctx->eff.request_ixfr = false;           /* request-ixfr no: the SOA first */
+    ctx->eff.request_expire = true;
+    ctx->eff.min_refresh = 10; ctx->eff.max_refresh = 1000; ctx->eff.min_retry = 10; ctx->eff.max_retry = 1000;
+    pthread_t th;
+    assert(pthread_create(&th, NULL, axfr_bg_thread_func, ctx) == 0);
+    if (expect_connections >= 2) {
+        /* the answer said the primary is ahead: the AXFR request follows on a new connection (QTYPE AXFR, not IXFR) */
+        uint8_t lb[2], rq[2048];
+        assert(read(sv2[1], lb, 2) == 2);
+        size_t n = (size_t)((lb[0] << 8) | lb[1]);
+        assert(read(sv2[1], rq, n) == (ssize_t)n);
+        size_t q = 12;
+        while (rq[q]) q += 1 + rq[q];
+        uint16_t qt = (uint16_t)((rq[q + 1] << 8) | rq[q + 2]);
+        assert(expect_axfr_request ? qt == 252 : qt != 252);
+    }
+    close(sv2[1]);
+    pthread_join(th, NULL);
+    close(sv[1]);
+    g_mock_patch_id_peer = -1;
+    assert(g_conn_n == expect_connections);
+    if (ours == theirs && good) {
+        /* up to date: the refresh timer starts again, held to min-refresh-time (2 -> 10) */
+        assert(atomic_load(&entry.refresh) == 10 && atomic_load(&entry.retry) == 10);
+        assert(atomic_load(&entry.next_check) >= time(NULL) + 8);
+    }
+    assert(!atomic_load(&entry.is_transferring));
+}
+
+static void test_batch4_soa_probe(void) {
+    printf("[TEST] AXFR/IXFR: batch 4 request-ixfr no asks for the SOA first...\n");
+    run_soa_probe_case(100, 100, true, 1, false);    /* same serial: up to date, nothing transferred */
+    run_soa_probe_case(100, 50, true, 1, false);     /* the primary is behind */
+    run_soa_probe_case(100, 200, true, 2, true);     /* ahead: an AXFR on a new connection */
+    run_soa_probe_case(100, 200, false, 1, false);   /* an answer without a SOA is a failure */
+    printf("  -> batch 4 SOA probe passed.\n");
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
+    test_batch4_soa_probe();
+    test_batch4_policy();
+    test_batch4_failover_and_sources();
     test_edns_expire_rfc7314();
     printf("=== Starting AXFR/IXFR Engine Unit Tests ===\n");
     test_wait_for_active_axfr_branches();
@@ -7745,8 +8056,12 @@ int main(void) {
 /* broker_connect_opts(): the TCP socket options are applied by the real broker only; the mock ignores them. */
 int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr_len,
                         const tcp_sockopts_t *tcp_opts) {
-    (void)tcp_opts;
-    return broker_connect(family, type, addr, addr_len);
+    int fd = broker_connect(family, type, addr, addr_len);
+    if (g_conn_n > 0 && g_conn_n <= 8 && tcp_opts) {
+        g_conn_log[g_conn_n - 1].has_src = tcp_opts->has_src;
+        memcpy(g_conn_log[g_conn_n - 1].src, tcp_opts->src, 16);
+    }
+    return fd;
 }
 
 /* send_tcp_dns_message(): goes through the send_tcp_robust() mock above (length prefix, then message) */

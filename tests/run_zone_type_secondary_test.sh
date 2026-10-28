@@ -93,11 +93,11 @@ options { port $PPORT; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT }
 zone "sec.test" { type primary; file "$W/sec.zone"; allow-transfer { 127.0.0.1; }; };
 EOF
 cat > "$W/secondary.conf" <<EOF
-options { port $SPORT; bind-address { 127.0.0.1; }; pid-file "none"; serve-stale no; $USER_OPT };
+options { port $SPORT; bind-address { 127.0.0.1; }; pid-file "none"; serve-stale no; min-refresh-time 1; min-retry-time 1; $USER_OPT };
 zone "sec.test" { type secondary; masters { 127.0.0.1 port $PPORT; }; };
 EOF
 cat > "$W/stale.conf" <<EOF
-options { port $STALE_PORT; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT };
+options { port $STALE_PORT; bind-address { 127.0.0.1; }; pid-file "none"; min-refresh-time 1; min-retry-time 1; $USER_OPT };
 zone "sec.test" { type secondary; masters { 127.0.0.1 port $PPORT; }; };
 EOF
 for c in primary secondary stale; do
