@@ -75,7 +75,7 @@ zone "m.test" { type master; file "$W/m.zone"; allow-update { key "k1"; }; };
 zone "n.test" { type master; file "$W/n.zone"; };
 zone "p.test" { type master; file "$W/p.zone"; allow-update { 127.0.0.1; }; };
 zone "ax.test" { type master; file "$W/ax.zone"; allow-transfer { key "k1"; }; };
-zone "ay.test" { type master; file "$W/ay.zone"; allow-transfer { 192.0.2.99; key "k1"; }; };
+zone "ay.test" { type master; file "$W/ay.zone"; allow-transfer { 192.0.2.99; key "k1"; }; transfer-acl-match all; };
 zone "az.test" { type master; file "$W/az.zone"; allow-transfer { key "k2"; }; };
 zone "sec.test" { type slave; masters { 127.0.0.1 port 9; }; file "$W/sec.bak"; tsig-key "k1"; };
 EOF

@@ -42,17 +42,18 @@ check "a typo in a zone" "zone \"a.test\" { type primary; file \"$T/a.zone\"; al
 check "an unknown option with a value" "zone \"a.test\" { type primary; file \"$T/a.zone\"; frobnicate 3; };" error "unknown option 'frobnicate'"
 check "an unknown option with a block" "zone \"a.test\" { type primary; file \"$T/a.zone\"; frobnicate { a; b; }; };" error "unknown option 'frobnicate'"
 check "notify-retr... that is not an option" "zone \"a.test\" { type primary; file \"$T/a.zone\"; notify-retry-foo 3; };" error "unknown option 'notify-retry-foo'"
-for o in zone-statistics inline-signing key-directory dnssec-policy auto-dnssec max-journal-size allow-query check-names masterfile-format; do
+for o in zone-statistics inline-signing key-directory dnssec-policy auto-dnssec max-journal-size check-names masterfile-format; do
     check "BIND option $o" "zone \"a.test\" { type primary; file \"$T/a.zone\"; $o yes; };" warn "option '$o' is a BIND option that KariDNS does not implement"
 done
-check "BIND option with a block" "zone \"a.test\" { type primary; file \"$T/a.zone\"; update-policy { grant a.test zonesub any; }; };" warn "option 'update-policy' is a BIND option"
+check "allow-query in a zone is implemented (no warning)" "zone \"a.test\" { type primary; file \"$T/a.zone\"; allow-query { 192.0.2.0/24; }; allow-query-on { any; }; allow-notify { none; }; };" ok
+check "BIND option with a block""zone \"a.test\" { type primary; file \"$T/a.zone\"; update-policy { grant a.test zonesub any; }; };" warn "option 'update-policy' is a BIND option"
 check "BIND option and a known one together" "zone \"a.test\" { type primary; file \"$T/a.zone\"; also-notify { 192.0.2.9; }; notify-delay 5; };" warn "option 'notify-delay' is a BIND option"
 
 echo "== view { }"
 check "a plain view" "view \"v\" { match-clients { any; }; zone \"a.test\" { type primary; file \"$T/a.zone\"; }; };" ok
 check "a typo in a view" "view \"v\" { match-clients { any; }; mach-clients { any; }; zone \"a.test\" { type primary; file \"$T/a.zone\"; }; };" error "view 'v': unknown option 'mach-clients'"
 check "an unknown option in a zone of a view" "view \"v\" { zone \"a.test\" { type primary; file \"$T/a.zone\"; nonsense yes; }; };" error "zone 'a.test.': unknown option 'nonsense'"
-for o in recursion allow-query dnssec-validation max-cache-size zone-statistics minimal-responses; do
+for o in recursion dnssec-validation max-cache-size zone-statistics minimal-responses; do
     check "BIND option $o in a view" "view \"v\" { match-clients { any; }; $o yes; zone \"a.test\" { type primary; file \"$T/a.zone\"; }; };" warn "view 'v': option '$o' is a BIND option that KariDNS does not implement"
 done
 
@@ -64,7 +65,7 @@ echo "== options { }"
 check "a plain options" "options { port 5300; minimal-responses yes; }; $Z" ok
 check "a typo in options" "options {${NL} port 5300;${NL} bind-adress { 127.0.0.1; };${NL}}; $Z" error ":3: options: unknown option 'bind-adress'"
 check "an unknown option in options" "options { nonsense-option yes; };" error "options: unknown option 'nonsense-option'"
-for o in listen-on recursion directory version allow-transfer; do
+for o in listen-on recursion directory version allow-update-forwarding; do
     check "BIND option $o in options" "options {${NL} $o yes;${NL}};" warn ":2: options: '$o' is a BIND option that KariDNS does not implement"
 done
 

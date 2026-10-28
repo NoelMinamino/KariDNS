@@ -38,7 +38,7 @@ ns1     IN A    192.0.2.1
 www     IN A    192.0.2.100
 EOF
 
-# X-41: addresses and keys in one allow-transfer list: both are required (docs/karidns.md allow-transfer)
+# X-41: addresses and keys in one allow-transfer list with transfer-acl-match all: both are required (docs/karidns.md "Address match lists"; without the option the first matching element decides, tests/run_bind_acl_test.sh)
 for z in mixed other; do
     f="$DIR/axfr_multikey_$z.zone"
     sed -e "s/multikey\.test\./$z.multikey.test./g" "$ZONE_FILE" > "$f"
@@ -81,12 +81,14 @@ zone "mixed.multikey.test" {
     type master;
     file "$MIXED_ZONE";
     allow-transfer { key "keyA"; 127.0.0.1; };
+    transfer-acl-match all;
 };
 
 zone "other.multikey.test" {
     type master;
     file "$OTHER_ZONE";
     allow-transfer { key "keyA"; 192.0.2.99; };
+    transfer-acl-match all;
 };
 EOF
 

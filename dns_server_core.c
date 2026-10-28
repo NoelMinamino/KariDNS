@@ -1535,6 +1535,8 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
       uint8_t *res_buf = res_buf_full + sizeof(udp_ipc_t);
       const rate_limit_config_t *rrl_cfg = NULL;
       size_t max_res = task.has_edns ? BUFFER_SIZE : UDP_DEFAULT_MAX_RES_LEN;
+      query_set_client_addr(&task.client_addr);
+      query_set_local_addr(task.has_server_addr ? &task.server_addr : NULL);   /* allow-query-on */
       int res_len = process_dns_query_cap(task.req_buf, task.req_len, res_buf, max_res,
                                           UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t),
                                           task.qname, task.qtype, task.client_ip,
@@ -1588,6 +1590,8 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
       // TCP async resolution
       uint8_t *tcp_res = malloc(65535);
       if (tcp_res) {
+        query_set_client_addr(&task.client_addr);
+        query_set_local_addr(task.has_server_addr ? &task.server_addr : NULL);   /* allow-query-on */
         int res_len = process_dns_query(task.req_buf, task.req_len, tcp_res, 65535,
                                         task.qname, task.qtype, task.client_ip,
                                         &thread_compress_ctx, true, NULL, task.snap);
@@ -2103,6 +2107,8 @@ worker_startup_success:;
 
             uint8_t *res_buf = batch->tx_buffers[n_tx] + sizeof(udp_ipc_t);
             const rate_limit_config_t *rrl_cfg = NULL;
+            query_set_client_addr(client_addr);
+            query_set_local_addr(ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL);   /* allow-query-on */
             int res_len =
                 process_dns_query_cap_routed(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
                                              UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
@@ -2417,7 +2423,8 @@ process_tcp_client: ;
             if (zcfg && !badvers && tsig.status != TSIG_REQ_ERROR && tsig.status != TSIG_REQ_FORMERR) {
               /* allow-transfer のアドレスと鍵 (鍵名は DNS 名として比較 D-03)、zone の tsig-key、transfer-acl-match、
                * DB ゾーンの acl-ceiling は zone_transfer_acl_allows() が見る (dns_tsig_acl.c) */
-              allowed = zone_transfer_acl_allows(cfg, zcfg, ctx_tcp->client_ip, matched_key ? matched_key->name : NULL);
+              allowed = zone_transfer_acl_allows_in_view(cfg, zcfg, xfr_view ? xfr_view->name : NULL, ctx_tcp->client_ip,
+                                                         matched_key ? matched_key->name : NULL);
             }
             uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
             static_assert(sizeof(tsig_mac) >= sizeof(tsig.mac), "tsig_mac must hold the request MAC");
@@ -2595,6 +2602,8 @@ process_tcp_client: ;
               break;
             }
             /* D-04: 応答はワーカーごとのバッファ (起動時に確保) に組み立てる */
+            query_set_client_addr(&ctx_tcp->client_addr);
+            query_set_local_addr(ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL);   /* allow-query-on */
             int res_len = process_dns_query_cap_routed(msg, msg_len, tcp_res_buf, 65535, 0,
                                                        qname, qtype, ctx_tcp->client_ip,
                                                        &thread_compress_ctx, true, NULL, snap, &route);
@@ -5165,6 +5174,11 @@ int main(int argc, char **argv) {
   if (!crypto_prewarm_ok) {
     syslog(LOG_WARNING, "[Startup] OpenSSL HMAC pre-warm incomplete: some TSIG algorithms are unavailable in this OpenSSL build (e.g. FIPS mode)");
   }
+
+  /* localhost / localnets in address match lists (BIND 9.20 ARM acl): the interfaces of this host, once, here.  The Backend
+   * inherits the table through fork() and cannot ask again in capability mode; a reload keeps it (docs/karidns.md "localhost and
+   * localnets"). */
+  aml_init_interfaces();
 
   char *config_str = read_entire_file(g_config_path, NULL, NULL);
   if (!config_str)

@@ -1610,10 +1610,8 @@ static void test_named_acls(void) {
     expect_reject("match-clients with an undefined acl",
                   "view \"v\" { match-clients { nowhere; }; zone \"example.com\" { type master; file \"z\"; }; };");
     expect_reject("ecs-trusted-resolvers with a bad entry", "options { ecs-trusted-resolvers { resolver1; }; };");
-    expect_reject("localhost is not supported",
-                  "zone \"example.com\" { type master; file \"z\"; allow-transfer { localhost; }; };");
-    expect_reject("localnets is not supported",
-                  "zone \"example.com\" { type master; file \"z\"; allow-transfer { localnets; }; };");
+    /* localhost and localnets are built-in names now (tests/test_acl_match.c); an acl block cannot be named like them */
+    expect_reject("acl named localhost", "acl localhost { 192.0.2.1; };");
     expect_reject("acl with a bad entry",
                   "acl bad { 999.1.1.1; }; zone \"example.com\" { type master; file \"z\"; allow-transfer { bad; }; };");
     expect_reject("duplicate acl (case-insensitive)", "acl a { any; }; acl A { none; };");
@@ -2774,6 +2772,9 @@ static void test_strict_options_and_key(void) {
         {"dnstap", "dnstap { socket \"/x.sock\"; };"},
         {"database", "database { driver sqlite3; database-file \"/x.db\"; };"}, {"notify", "notify yes;"},
         {"also-notify", "also-notify { 192.0.2.1; };"}, {"notify-retries", "notify-retries 3;"},
+        {"allow-query", "allow-query { any; };"}, {"allow-query-on", "allow-query-on { any; };"},
+        {"allow-transfer", "allow-transfer { none; };"}, {"allow-update", "allow-update { none; };"},
+        {"allow-notify", "allow-notify { 192.0.2.1; };"},
         {"notify-retry-interval", "notify-retry-interval 5;"}, {"notify-retry-backoff", "notify-retry-backoff fixed;"},
     };
     for (size_t i = 0; i < sizeof(impl) / sizeof(impl[0]); i++) {
@@ -2796,7 +2797,7 @@ static void test_strict_options_and_key(void) {
     /* a BIND option KariDNS does not implement: warning, skipped, the rest of options { } still applies */
     static const char *const bind_only[] = {
         "listen-on { 127.0.0.1; };", "listen-on-v6 { any; };", "directory \"/var/db\";", "recursion no;",
-        "allow-transfer { none; };", "version none;", "dnssec-validation auto;", "forwarders { 192.0.2.1; };",
+        "transfer-source 192.0.2.1;", "version none;", "dnssec-validation auto;", "forwarders { 192.0.2.1; };",
         "max-cache-size 100m;", "allow-new-zones yes;", "dnssec-enable yes;" /* BIND 9.16 and older */,
         "allow-proxy { any; };" /* BIND 9.20 only */, "use-alt-transfer-source no;" /* BIND 9.18 only */,
         "check-names primary ignore;", "tkey-dhkey \"k\" 1;",

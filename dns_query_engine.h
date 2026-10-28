@@ -21,6 +21,13 @@ typedef struct {
 } query_rrl_info_t;
 extern _Thread_local query_rrl_info_t t_query_rrl_info;
 
+/* allow-query-on (BIND 9.20 ARM): the address the query came to.  A transport calls this right before every process_dns_query*()
+ * (sa: sockaddr_in / sockaddr_in6 / ipc_sockaddr_t of the local address, NULL when unknown).  The query path reads it and forgets it,
+ * so a caller that does not set it gives "unknown" (allow-query-on then matches only `any`). */
+void query_set_local_addr(const void *sa);
+/* The client's address in binary (the same client as client_ip), so that allow-query does not parse the text again; optional. */
+void query_set_client_addr(const void *sa);
+
 /* RRL の slip 応答: 直前の process_dns_query*() が作った応答 res[0..res_len) を TC=1 にして質問
  * と OPT だけに切り詰め、要求に TSIG があれば同じ鍵で署名し直す (X-20、RFC 8945 §5.3。BIND 9.20 の slip 応答も
  * 署名される)。同じスレッドで、同じ設定スナップショットの読み取り区間の中で呼ぶこと。戻り値は新しい長さ。 */

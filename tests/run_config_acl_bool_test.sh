@@ -79,8 +79,8 @@ karicheck_case "D-22 bad address" conf 1 "entry '192.0.2.300' is not an address"
     "zone \"acl.example\" { type master; file \"$TMP_DIR/acl.example.zone\"; allow-transfer { 192.0.2.300; }; };"
 karicheck_case "D-22 undefined acl" conf 1 "entry 'secondaries' is not an address" \
     "zone \"acl.example\" { type master; file \"$TMP_DIR/acl.example.zone\"; allow-transfer { secondaries; }; };"
-karicheck_case "D-22 localhost" conf 1 "entry 'localhost' is not supported" \
-    "zone \"acl.example\" { type master; file \"$TMP_DIR/acl.example.zone\"; allow-transfer { localhost; }; };"
+karicheck_case "D-22 localhost and localnets (built-in names since the ACL batch)" conf 0 "is valid" \
+    "zone \"acl.example\" { type master; file \"$TMP_DIR/acl.example.zone\"; allow-transfer { localhost; localnets; }; };"
 karicheck_case "D-22 acl accepted" conf 0 "is valid" \
     "acl \"xfr\" { 192.0.2.0/24; none; }; zone \"acl.example\" { type master; file \"$TMP_DIR/acl.example.zone\"; allow-transfer { xfr; }; };"
 karicheck_case "D-23 type Master checked" zones 0 "Checked 1 zones (1 skipped)" \

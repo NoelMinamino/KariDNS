@@ -5,7 +5,11 @@
 #include <stdbool.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include "../../dns_config_parser.h"
+#include "../../dns_tsig_acl.h"
 
 // Override syslog to prevent massive disk I/O and CPU usage during fuzzing
 void syslog(int priority, const char *format, ...) {
@@ -36,6 +40,24 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
      * and merging them into a zone block (zone_config_with_received) must not fail or leak */
     char err[200];
     if (prc == 0) {
+        /* BIND address match lists: every ACL decision the server makes for a zone, with and without a key, on both address families */
+        static const char *const ips[] = { "192.0.2.1", "10.0.0.1", "127.0.0.1", "2001:db8::1", "::1", "not an address" };
+        struct sockaddr_in loc4;
+        memset(&loc4, 0, sizeof(loc4));
+        loc4.sin_family = AF_INET;
+        loc4.sin_addr.s_addr = htonl(0xC0000201u);
+        for (view_config_t *v = config.views; v; v = v->next) {
+            for (zone_config_t *z = v->zones; z; z = z->next) {
+                for (size_t i = 0; i < sizeof(ips) / sizeof(ips[0]); i++) {
+                    const char *key = config.keys ? config.keys->name : NULL;
+                    (void)query_acl_permits(&config, z, v->name, ips[i], key, &loc4);
+                    (void)query_acl_permits(&config, z, v->name, ips[i], NULL, NULL);
+                    (void)zone_transfer_acl_allows_in_view(&config, z, v->name, ips[i], key);
+                    (void)zone_update_acl_allows_in_view(&config, z, v->name, ips[i], key);
+                    (void)zone_notify_acl_allows(&config, z, v->name, ips[i], key);
+                }
+            }
+        }
         char *out = malloc(KARIDNS_SETTINGS_MAX + 1);
         for (view_config_t *v = config.views; out && v; v = v->next) {
             for (zone_config_t *z = v->zones; z; z = z->next) {

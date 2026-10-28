@@ -114,6 +114,21 @@ typedef struct {
 #define IXFR_HISTORY_DEFAULT 4
 #define IXFR_HISTORY_MAX 32
 
+/* BIND address match list (BIND 9.20 ARM "Address Match Lists"), compiled: elements are evaluated in order and the first one that
+ * matches decides (dns_tsig_acl.h: aml_t, aml_match()).  The statements below are shared with the zone, view and options level. */
+typedef struct aml aml_t;
+
+/* allow-query, allow-query-on, allow-transfer, allow-update and allow-notify of one level (zone, view or options).  NULL = the
+ * statement is not written at this level (the next level up applies); an empty list `{ };` is written and matches nobody. */
+typedef struct {
+  aml_t *query;
+  aml_t *query_on;
+  aml_t *transfer;
+  aml_t *update;
+  aml_t *notify;
+  aml_t *match;   /* view { match-clients } as written: kept so that its names are checked with file:line; the view is chosen with the flat list */
+} acl_set_t;
+
 /* S6a: ゾーンごとの「まれに指定する」オプション。ほとんどのゾーン (domain/file/type だけの
  * 主ゾーン) では 1 つも指定しないので、zone_config_t は核だけを持ち、ここに挙げた値は
  * 1 つでも指定したゾーンに限って別のブロックに確保する (zone_config_t.ext)。
@@ -138,6 +153,9 @@ typedef struct zone_ext {
   int allow_update_count;
   acl_entry_t *allow_update_parsed;
   rate_limit_config_t rrl;
+  /* BIND address match lists of this zone.  transfer / update, when written in a configuration file, are also kept as the flat lists above
+   * (what the settings text sent to secondaries, and zone { } blocks built by hand, use); the zone's tsig-key is not in them. */
+  acl_set_t acl;
 
   /* --- ここから追加: type "program" 用 --- */
   char *program_path;          /* 実行ファイルへの絶対パス(argv[0]相当) */
@@ -334,6 +352,7 @@ typedef struct view_config {
   notify_target_t *also_notify; /* view { also-notify { } }: replaces the options list for the zones of this view that have none of their own */
   int also_notify_count;
   bool also_notify_set;
+  acl_set_t acl;                /* view { allow-query ... }: overrides options' for the zones of this view that have none of their own */
   uint8_t notify_mode;          /* view { notify }: notify_mode_t, 0 = inherit options' */
   /* beta design 7.1: DB zone source of this view. NULL/false = the global source of options { database { } } */
   char *database_file;         /* "database-file": sqlite3, this view's own file */
@@ -396,6 +415,8 @@ typedef struct acl_def {
   char *name;
   char **entries;
   int count;
+  aml_t *aml;          /* the list as written (nested lists, ! and key kept); names are resolved when the parse ends */
+  uint8_t state;       /* 0 = not resolved, 1 = being resolved (a loop), 2 = resolved */
   struct acl_def *next;
 } acl_def_t;
 
@@ -413,6 +434,8 @@ typedef struct server_config_s {
   zone_cfg_index_t top_zone_index; /* パース中のトップレベル zone の索引。既定の view に移す */
   tsig_key_t *keys;
   acl_def_t *acls;
+  acl_set_t acl;                /* options { allow-query ... }: the default of every view and zone */
+  bool acl_query_active;        /* set when the parse ends: allow-query or allow-query-on is written somewhere (options, a view or a zone); false = the query path does not look at ACLs */
   remote_list_t *remote_lists;  /* top-level remote-servers / primaries / masters lists (also-notify names are expanded after the parse; the lists are kept until the configuration is freed) */
   notify_target_t *also_notify; /* options { also-notify { } }: the default of every zone, view and catalog member */
   int also_notify_count;

@@ -6,12 +6,15 @@
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #endif
 
 bool check_acl(const char *client_ip, char **acl_list, int acl_count) {
@@ -301,4 +304,340 @@ int tsig_finish_response(uint8_t *res, size_t res_len, size_t max_len, const tsi
         res_len = q_end;
     }
     return -1;
+}
+
+/* ---- BIND address match lists (dns_tsig_acl.h) ---- */
+
+aml_t *aml_new(void) {
+    aml_t *l = calloc(1, sizeof(*l));
+    if (l) atomic_init(&l->refs, 1);
+    return l;
+}
+
+bool aml_push(aml_t *l, const aml_elem_t *e) {
+    if (l->count == l->cap) {
+        int ncap = l->cap ? l->cap * 2 : 4;
+        aml_elem_t *n = realloc(l->elems, (size_t)ncap * sizeof(*n));
+        if (!n) return false;
+        l->elems = n;
+        l->cap = ncap;
+    }
+    l->elems[l->count++] = *e;
+    return true;
+}
+
+aml_t *aml_ref(aml_t *l) {
+    if (l) atomic_fetch_add_explicit(&l->refs, 1, memory_order_relaxed);
+    return l;
+}
+
+void aml_unref(aml_t *l) {
+    if (!l) return;
+    if (atomic_fetch_sub_explicit(&l->refs, 1, memory_order_acq_rel) != 1) return;
+    for (int i = 0; i < l->count; i++) {
+        free(l->elems[i].text);
+        free(l->elems[i].loc);
+        if (l->elems[i].kind == AML_E_LIST) aml_unref(l->elems[i].u.list);
+    }
+    free(l->elems);
+    free(l);
+}
+
+bool aml_subject_from_ip(aml_subject_t *s, uint8_t buf[16], const char *ip, const char *key) {
+    s->key = key;
+    s->addr = NULL;
+    s->family = 0;
+    if (!ip) return false;
+    struct in_addr a4;
+    struct in6_addr a6;
+    if (inet_pton(AF_INET, ip, &a4) == 1) {
+        memcpy(buf, &a4, 4);
+        s->family = AF_INET;
+    } else if (inet_pton(AF_INET6, ip, &a6) == 1) {
+        memcpy(buf, &a6, 16);
+        s->family = AF_INET6;
+    } else {
+        return false;
+    }
+    s->addr = buf;
+    return true;
+}
+
+void aml_subject_from_sockaddr(aml_subject_t *s, const void *sa, const char *key) {
+    s->key = key;
+    s->addr = NULL;
+    s->family = 0;
+    if (!sa) return;
+    const struct sockaddr *p = (const struct sockaddr *)sa;
+    if (p->sa_family == AF_INET) {
+        s->family = AF_INET;
+        s->addr = (const uint8_t *)&((const struct sockaddr_in *)sa)->sin_addr;
+    } else if (p->sa_family == AF_INET6) {
+        s->family = AF_INET6;
+        s->addr = ((const struct sockaddr_in6 *)sa)->sin6_addr.s6_addr;
+    }
+}
+
+struct aml_iface_set {
+    size_t n;
+    aml_iface_t v[];
+};
+static _Atomic(const struct aml_iface_set *) g_aml_ifaces;
+
+size_t aml_collect_interfaces(aml_iface_t *out, size_t max) {
+    struct ifaddrs *ifa = NULL, *p;
+    size_t n = 0;
+    if (getifaddrs(&ifa) != 0) return 0;
+    for (p = ifa; p && n < max; p = p->ifa_next) {
+        if (!p->ifa_addr || !(p->ifa_flags & IFF_UP)) continue;
+        aml_iface_t *e = &out[n];
+        memset(e, 0, sizeof(*e));
+        if (p->ifa_addr->sa_family == AF_INET) {
+            e->family = AF_INET;
+            memcpy(e->addr, &((struct sockaddr_in *)(void *)p->ifa_addr)->sin_addr, 4);
+            memset(e->mask, 0xff, 4);
+            if (p->ifa_netmask) memcpy(e->mask, &((struct sockaddr_in *)(void *)p->ifa_netmask)->sin_addr, 4);
+        } else if (p->ifa_addr->sa_family == AF_INET6) {
+            e->family = AF_INET6;
+            memcpy(e->addr, ((struct sockaddr_in6 *)(void *)p->ifa_addr)->sin6_addr.s6_addr, 16);
+            memset(e->mask, 0xff, 16);
+            if (p->ifa_netmask) memcpy(e->mask, ((struct sockaddr_in6 *)(void *)p->ifa_netmask)->sin6_addr.s6_addr, 16);
+            /* KAME embeds the scope in bytes 2-3 of a link-local address; a client's address carries none */
+            if (e->addr[0] == 0xfe && (e->addr[1] & 0xc0) == 0x80) e->addr[2] = e->addr[3] = 0;
+        } else {
+            continue;
+        }
+        n++;
+    }
+    freeifaddrs(ifa);
+    return n;
+}
+
+void aml_set_interfaces(const aml_iface_t *v, size_t n) {
+    struct aml_iface_set *s = malloc(sizeof(*s) + n * sizeof(aml_iface_t));
+    if (!s) return;
+    s->n = n;
+    if (n) memcpy(s->v, v, n * sizeof(aml_iface_t));
+    atomic_store_explicit(&g_aml_ifaces, s, memory_order_release);   /* the previous table is not freed: readers may hold it */
+}
+
+size_t aml_get_interfaces(const aml_iface_t **v) {
+    const struct aml_iface_set *s = atomic_load_explicit(&g_aml_ifaces, memory_order_acquire);
+    if (!s) {
+        *v = NULL;
+        return 0;
+    }
+    *v = s->v;
+    return s->n;
+}
+
+void aml_init_interfaces(void) {
+    aml_iface_t tmp[256];
+    size_t n = aml_collect_interfaces(tmp, sizeof(tmp) / sizeof(tmp[0]));
+    aml_set_interfaces(tmp, n);
+}
+
+static bool aml_iface_match(const aml_subject_t *s, bool nets) {
+    const aml_iface_t *v;
+    size_t n = aml_get_interfaces(&v);
+    if (!s->addr) return false;
+    size_t len = s->family == AF_INET ? 4 : 16;
+    for (size_t i = 0; i < n; i++) {
+        if (v[i].family != s->family) continue;
+        bool eq = true;
+        for (size_t k = 0; k < len && eq; k++) {
+            uint8_t m = nets ? v[i].mask[k] : 0xff;
+            if ((s->addr[k] & m) != (v[i].addr[k] & m)) eq = false;
+        }
+        if (eq) return true;
+    }
+    return false;
+}
+
+static int aml_match_depth(const aml_t *l, const aml_subject_t *s, int depth) {
+    if (!l || depth > AML_MAX_DEPTH) return 0;
+    for (int i = 0; i < l->count; i++) {
+        const aml_elem_t *e = &l->elems[i];
+        bool m = false;
+        switch (e->kind) {
+        case AML_E_ANY:
+            m = true;
+            break;
+        case AML_E_NET:
+            m = s->addr && cidr_entry_match(&e->u.net, s->family, s->addr);
+            break;
+        case AML_E_KEY:
+            m = s->key && e->text && tsig_key_names_equal(s->key, e->text);
+            break;
+        case AML_E_LIST:
+            /* a negative match inside a nested list is "no match" (BIND, lib/dns/acl.c dns_aclelement_match()): `!{ !a; any; }` is not a surprise positive for a */
+            m = aml_match_depth(e->u.list, s, depth + 1) > 0;
+            break;
+        case AML_E_LOCALHOST:
+            m = aml_iface_match(s, false);
+            break;
+        case AML_E_LOCALNETS:
+            m = aml_iface_match(s, true);
+            break;
+        default:   /* none, and a name that was never resolved: nothing */
+            break;
+        }
+        if (m) return e->neg ? -1 : 1;
+    }
+    return 0;
+}
+
+int aml_match(const aml_t *l, const aml_subject_t *s) {
+    return aml_match_depth(l, s, 0);
+}
+
+bool aml_allows(const aml_t *l, const aml_subject_t *s) {
+    return aml_match_depth(l, s, 0) > 0;
+}
+
+bool aml_allows_addr(const aml_t *l, const aml_subject_t *s) {
+    aml_subject_t a = *s;
+    a.key = NULL;
+    return aml_match_depth(l, &a, 0) > 0;
+}
+
+static bool aml_key_listed_d(const aml_t *l, const char *key, bool neg, int depth) {
+    if (!l || depth > AML_MAX_DEPTH) return false;
+    for (int i = 0; i < l->count; i++) {
+        const aml_elem_t *e = &l->elems[i];
+        bool en = neg != e->neg;
+        if (e->kind == AML_E_KEY && !en && e->text && tsig_key_names_equal(key, e->text)) return true;
+        if (e->kind == AML_E_LIST && aml_key_listed_d(e->u.list, key, en, depth + 1)) return true;
+    }
+    return false;
+}
+
+bool aml_key_listed(const aml_t *l, const char *key_name) {
+    return key_name && aml_key_listed_d(l, key_name, false, 0);
+}
+
+static aml_t *acl_set_get(const acl_set_t *s, int which) {
+    switch (which) {
+    case AML_ACL_QUERY: return s->query;
+    case AML_ACL_QUERY_ON: return s->query_on;
+    case AML_ACL_TRANSFER: return s->transfer;
+    case AML_ACL_UPDATE: return s->update;
+    default: return s->notify;
+    }
+}
+
+static const acl_set_t *view_acl_set(const server_config_t *cfg, const char *view_name) {
+    if (!view_name || !view_name[0]) return NULL;
+    for (const view_config_t *v = cfg->views; v; v = v->next)
+        if (strcasecmp(v->name, view_name) == 0) return &v->acl;
+    return NULL;
+}
+
+/* zone, else view, else options (BIND 9.20 ARM: the lower level "overrides" the higher one) */
+static const aml_t *acl_pick(const server_config_t *cfg, const acl_set_t *zs, const acl_set_t *vs, int which) {
+    aml_t *a = acl_set_get(zs, which);
+    if (a) return a;
+    if (vs && (a = acl_set_get(vs, which)) != NULL) return a;
+    return cfg ? acl_set_get(&cfg->acl, which) : NULL;
+}
+
+const aml_t *config_acl_for(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, int which) {
+    const acl_set_t *zs = &zext(zone)->acl;
+    if (!cfg) return acl_set_get(zs, which);
+    return acl_pick(cfg, zs, view_acl_set(cfg, view_name), which);
+}
+
+bool query_acl_permits_sa(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, const char *client_ip,
+                          const void *client_sa, const char *key, const void *local) {
+    if (!cfg || !cfg->acl_query_active) return true;
+    const acl_set_t *zs = &zext(zone)->acl, *vs = view_acl_set(cfg, view_name);   /* one walk over the views for both statements */
+    const aml_t *q = acl_pick(cfg, zs, vs, AML_ACL_QUERY);
+    const aml_t *qo = acl_pick(cfg, zs, vs, AML_ACL_QUERY_ON);
+    if (!q && !qo) return true;
+    if (q) {
+        aml_subject_t s;
+        uint8_t b[16];
+        if (client_sa) {   /* the transport has the address in binary: no text to parse on the query path */
+            aml_subject_from_sockaddr(&s, client_sa, key);
+            if (!s.addr) return false;
+        } else if (!aml_subject_from_ip(&s, b, client_ip, key)) {
+            return false;
+        }
+        if (aml_match(q, &s) <= 0) return false;
+    }
+    if (qo) {
+        /* ARM allow-query-on: "A query must be allowed by both ACLs, or it is refused." */
+        aml_subject_t d;
+        aml_subject_from_sockaddr(&d, local, key);
+        if (aml_match(qo, &d) <= 0) return false;
+    }
+    return true;
+}
+
+bool query_acl_permits(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, const char *client_ip,
+                       const char *key, const void *local) {
+    return query_acl_permits_sa(cfg, zone, view_name, client_ip, NULL, key, local);
+}
+
+bool zone_notify_acl_allows(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, const char *client_ip,
+                            const char *key_name) {
+    const aml_t *l = config_acl_for(cfg, zone, view_name, AML_ACL_NOTIFY);
+    aml_subject_t s;
+    uint8_t b[16];
+    if (!l || !aml_subject_from_ip(&s, b, client_ip, key_name)) return false;
+    return aml_allows(l, &s);
+}
+
+bool zone_transfer_acl_allows_in_view(const server_config_t *cfg, const zone_config_t *zcfg, const char *view_name,
+                                      const char *client_ip, const char *key_name) {
+    if (!zcfg || !client_ip) return false;
+    const zone_ext_t *x = zext(zcfg);
+    /* the flat lists of a database zone, of settings received from a primary and of a zone built by hand are evaluated as before */
+    bool flat_own = (x->allow_transfer_count > 0 || x->tsig_keys_count > 0) && !x->acl.transfer;
+    if (x->db_acl_ceiling || flat_own) return zone_transfer_acl_allows(cfg, zcfg, client_ip, key_name);
+    const aml_t *l = config_acl_for(cfg, zcfg, view_name, AML_ACL_TRANSFER);
+    aml_subject_t s;
+    uint8_t b[16];
+    if (!aml_subject_from_ip(&s, b, client_ip, key_name)) return false;
+    /* the zone's tsig-key has always been a key that may transfer (a file zone), and with addresses in the list a request had to carry
+     * one of the keys as well (address AND key).  That is not something BIND's lists say, so it is left as it was: the order of the
+     * list decides who matches, and a zone that has a tsig-key and a list with addresses still needs a request signed with the
+     * tsig-key or a key of the list; without addresses in the list the tsig-key is one more way in. */
+    const char *zk = x->tsig_key;
+    bool zk_signed = zk && key_name && tsig_key_names_equal(key_name, zk);
+    if (x->transfer_acl_match == ACL_MATCH_DEFAULT) {
+        int m = l ? aml_match(l, &s) : 0;
+        if (!zk) return m > 0;
+        if (l && l->has_addr) return m > 0 && (zk_signed || aml_key_listed(l, key_name));
+        return m > 0 || zk_signed;
+    }
+    bool has_acl = l && l->has_addr;
+    bool has_keys = (l && l->has_key) || zk;
+    bool acl_ok = has_acl && aml_allows_addr(l, &s);
+    bool key_ok = zk_signed || (l && aml_key_listed(l, key_name));
+    if (has_acl && has_keys) return x->transfer_acl_match == ACL_MATCH_ANY ? (acl_ok || key_ok) : (acl_ok && key_ok);
+    if (has_acl) return acl_ok;
+    if (has_keys) return key_ok;
+    return false;
+}
+
+bool zone_update_acl_allows_in_view(const server_config_t *cfg, const zone_config_t *zcfg, const char *view_name,
+                                    const char *client_ip, const char *key_name) {
+    if (!zcfg || !client_ip) return false;
+    const zone_ext_t *x = zext(zcfg);
+    bool flat_own = x->allow_update_count > 0 && !x->acl.update;
+    if (x->db_acl_ceiling || flat_own) return zone_update_acl_allows(cfg, zcfg, client_ip, key_name);
+    const aml_t *l = config_acl_for(cfg, zcfg, view_name, AML_ACL_UPDATE);
+    if (!l) return false;
+    aml_subject_t s;
+    uint8_t b[16];
+    if (!aml_subject_from_ip(&s, b, client_ip, key_name)) return false;
+    if (x->update_acl_match == ACL_MATCH_DEFAULT) return aml_allows(l, &s);
+    bool addr_ok = aml_allows_addr(l, &s);
+    bool key_ok = aml_key_listed(l, key_name);
+    if (x->update_acl_match == ACL_MATCH_ALL) {   /* every kind of entry that is written must match */
+        if (l->has_addr && l->has_key) return addr_ok && key_ok;
+        return l->has_addr ? addr_ok : key_ok;
+    }
+    return addr_ok || key_ok;                     /* update-acl-match any: what allow-update always meant */
 }
