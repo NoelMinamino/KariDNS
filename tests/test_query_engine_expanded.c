@@ -10417,10 +10417,141 @@ static void test_minimal_responses_modes(void) {
     printf("  -> minimal-responses modes passed.\n");
 }
 
+/* ---- BIND compatibility, batch 7: require-server-cookie (BIND 9.20 lib/ns/query.c ns__query_start(), bin/named/server.c; RFC 7873 §5.2.3, §5.4) and
+ * max-udp-size of a view (bin/named/server.c: view->maxudp) ---- */
+static int cookie_query(zone_db_snapshot_t *snap, server_config_t *cfg, bool tcp, const uint8_t *cookie, size_t cookie_len, uint16_t udp_size,
+                        uint8_t *res, size_t res_cap) {
+    uint8_t req[512];
+    memset(req, 0, 12);
+    req[0] = 0x31; req[1] = 0x01; req[2] = 0x01; req[5] = 1; req[11] = 1;
+    size_t off = 12 + (size_t)write_uncompressed_name(req, 12, sizeof(req), "www.ck.example.");
+    req[off++] = 0; req[off++] = 1; req[off++] = 0; req[off++] = 1;
+    req[off++] = 0; req[off++] = 0; req[off++] = 41;                       /* OPT */
+    req[off++] = (uint8_t)(udp_size >> 8); req[off++] = (uint8_t)udp_size; /* the client's UDP size */
+    req[off++] = 0; req[off++] = 0; req[off++] = 0; req[off++] = 0;
+    uint16_t rdlen = cookie_len ? (uint16_t)(4 + cookie_len) : 0;
+    req[off++] = (uint8_t)(rdlen >> 8); req[off++] = (uint8_t)rdlen;
+    if (cookie_len) {
+        req[off++] = 0; req[off++] = 10; req[off++] = 0; req[off++] = (uint8_t)cookie_len;
+        memcpy(req + off, cookie, cookie_len);
+        off += cookie_len;
+    }
+    compress_ctx_t cc;
+    memset(&cc, 0, sizeof(cc));
+    compress_ctx_init_packet(&cc);
+    const rate_limit_config_t *rrl = NULL;
+    zone_db_entry_t *m = NULL;
+    return process_dns_query_impl(req, off, res, res_cap, "www.ck.example.", 1, "192.0.2.77", &cc, tcp, &rrl, snap, cfg, &m);
+}
+
+/* the cookie option of a response: returns its length (8 = client only, 16..40 with a server cookie), 0 when there is none; copies it to out */
+static size_t wire_skip_name(const uint8_t *r, size_t off) {
+    while (r[off]) {
+        if ((r[off] & 0xC0) == 0xC0) return off + 2;
+        off += 1u + r[off];
+    }
+    return off + 1;
+}
+
+static size_t cookie_of(const uint8_t *res, int n, uint8_t *out) {
+    if (((res[10] << 8) | res[11]) == 0) return 0;
+    size_t off = wire_skip_name(res, 12) + 4;
+    for (int rr = 0; rr < ((res[6] << 8) | res[7]) + ((res[8] << 8) | res[9]) + ((res[10] << 8) | res[11]) - 1; rr++) {   /* the OPT is the last RR */
+        off = wire_skip_name(res, off);
+        off += 10 + (((size_t)res[off + 8] << 8) | res[off + 9]);
+    }
+    if (res[off] != 0 || res[off + 2] != 41) return 0;
+    size_t rdl = ((size_t)res[off + 9] << 8) | res[off + 10];
+    size_t p = off + 11, end = p + rdl;
+    while (p + 4 <= end && end <= (size_t)n) {
+        uint16_t code = (uint16_t)((res[p] << 8) | res[p + 1]);
+        size_t len = ((size_t)res[p + 2] << 8) | res[p + 3];
+        if (code == 10) { memcpy(out, res + p + 4, len); return len; }
+        p += 4 + len;
+    }
+    return 0;
+}
+
+static void test_require_server_cookie_and_view_udp_size(void) {
+    printf("[TEST] Query Engine: require-server-cookie, and max-udp-size of a view...\n");
+    static char ztext[] =
+        "$ORIGIN ck.example.\n"
+        "@ 3600 IN SOA ns1 admin 1 3600 1800 604800 86400\n"
+        "@ 3600 IN NS ns1\n"
+        "ns1 300 IN A 192.0.2.1\n"
+        "www 300 IN A 192.0.2.10\n";
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err = {0};
+    parse_context_t pc = { .base_dir = ".", .default_origin = "ck.example.", .is_standalone_mode = true, .err_out = &err };
+    assert(parse_zone_fast(ztext, strlen(ztext), &arena, &pc) >= 0);
+    assert(test_build_index(&arena, true) == 0);
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "ck.example.", sizeof(entry.domain));
+    atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
+    zone_db_entry_t *entries[1] = { &entry };
+    char *any_acl[1] = { (char *)"any" };
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+    view.match_clients = any_acl;
+    view.match_clients_count = 1;
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    static const uint8_t client_cookie[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    uint8_t res[4096], got[64];
+    server_config_t cfg;
+    assert(parse_named_conf("options { require-server-cookie yes; };", &cfg) == 0);
+    assert(cfg.require_server_cookie);
+    /* a client cookie without a server cookie: BADCOOKIE (RCODE 7 + extended 1 = 23), AA clear, no answer, a server cookie to use */
+    int n = cookie_query(&snap, &cfg, false, client_cookie, 8, 1232, res, sizeof(res));
+    assert(n > 12 && (res[3] & 0x0F) == 7 && !(res[2] & 0x04) && res[7] == 0);
+    uint8_t server_cookie[64];
+    size_t cl = cookie_of(res, n, server_cookie);
+    assert(cl == 24 && memcmp(server_cookie, client_cookie, 8) == 0);   /* 8 octets of client cookie + a 16 octet server cookie (RFC 9018 §4.1) */
+    /* the query repeated with that server cookie is answered */
+    n = cookie_query(&snap, &cfg, false, server_cookie, cl, 1232, res, sizeof(res));
+    assert((res[3] & 0x0F) == 0 && res[7] == 1 && (res[2] & 0x04));
+    /* a query without a cookie option is answered as usual; so is a client cookie over TCP */
+    n = cookie_query(&snap, &cfg, false, NULL, 0, 1232, res, sizeof(res));
+    assert((res[3] & 0x0F) == 0 && res[7] == 1);
+    n = cookie_query(&snap, &cfg, true, client_cookie, 8, 1232, res, sizeof(res));
+    assert((res[3] & 0x0F) == 0 && res[7] == 1);
+    free_server_config_fields(&cfg);
+    /* not written (or no): a client-only cookie is answered, and gets a server cookie */
+    assert(parse_named_conf("options { };", &cfg) == 0);
+    n = cookie_query(&snap, &cfg, false, client_cookie, 8, 1232, res, sizeof(res));
+
+    assert((res[3] & 0x0F) == 0 && res[7] == 1 && cookie_of(res, n, got) == 24);
+    free_server_config_fields(&cfg);
+    /* a view's statement replaces options': yes in the view named "default", no in options */
+    assert(parse_named_conf("options { require-server-cookie no; }; view default { match-clients { any; }; require-server-cookie yes; max-udp-size 600; };", &cfg) == 0);
+    assert(cfg.any_view_cookie && cfg.any_view_max_udp && !cfg.require_server_cookie);
+    n = cookie_query(&snap, &cfg, false, client_cookie, 8, 1232, res, sizeof(res));
+    assert((res[3] & 0x0F) == 7);
+    /* max-udp-size of the view: the OPT of the response advertises 600, not the 1232 of the default */
+    n = cookie_query(&snap, &cfg, false, NULL, 0, 4096, res, sizeof(res));
+    assert(res[n - 11] == 0 && res[n - 10] == 0 && res[n - 9] == 41 && ((res[n - 8] << 8) | res[n - 7]) == 600);
+    free_server_config_fields(&cfg);
+    assert(parse_named_conf("options { max-udp-size 1400; };", &cfg) == 0);
+    n = cookie_query(&snap, &cfg, false, NULL, 0, 4096, res, sizeof(res));
+    assert(((res[n - 8] << 8) | res[n - 7]) == 1400);
+    free_server_config_fields(&cfg);
+    zone_arena_destroy(&arena);
+    printf("  -> require-server-cookie and max-udp-size of a view passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
     test_chaos_builtin_zones();
     test_minimal_responses_modes();
+    test_require_server_cookie_and_view_udp_size();
     test_query_engine_dname_cname_wildcard_truncation();
     test_query_engine_program_zone_plugin_pipe_timeout_and_dead_mark();
     test_query_engine_program_zone_reply_bounded_by_buffer();

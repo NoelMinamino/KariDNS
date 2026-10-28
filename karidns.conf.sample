@@ -52,6 +52,24 @@ options {
     // max-transfer-time-in 120; max-transfer-idle-in 60;     // 入ってくる転送の上限 (分)
     // transfers-in 10; transfers-out 10; transfers-per-ns 2; // 同時に行う転送の数
 
+    // BIND の値の書き方 (docs/karidns.md の "BIND option values")
+    // TCP のタイムアウトの単位は BIND と同じ 100 ms。ミリ秒で書くときは ms を付ける (10000 のような
+    // 1200 を超える数字だけの値は、昔のミリ秒の値かもしれないのでエラーになる)
+    // tcp-idle-timeout 100;       // 10 秒
+    // tcp-initial-timeout 10000ms;
+    // version.bind / hostname.bind / id.server (CH の TXT)。何も書かないと version は KariDNS の版、hostname は
+    // ホスト名で答える。答えたくなければ none。server-id は NSID にもなる
+    // version none;  hostname none;  server-id "ns1";
+    // minimal-responses no-auth;   // yes | no | no-auth | no-auth-recursive
+    // require-server-cookie yes;   // サーバー Cookie の無い UDP クエリに BADCOOKIE を返す (RFC 7873)
+    // max-udp-size 1232;           // udp-bufsize の別名。udp-receive-buffer / udp-send-buffer / tcp-receive-buffer / tcp-send-buffer も使える
+    // max-records 1000000;  max-records-per-type 100;  max-types-per-name 100;  max-zone-ttl 1d;   // 超えるゾーンは読み込まない
+    // serial-update-method unixtime;    // Dynamic Update の SOA シリアル: increment | unixtime | date
+    // check-mx-cname warn;  check-srv-cname ignore;  check-integrity yes;  check-names primary fail;   // karicheck の指摘の重さ (fail | warn | ignore)
+    // dnstap の BIND 形式 (dnstap-output は unix だけ):
+    // dnstap { auth; };  dnstap-output unix "/var/run/dnstap.sock";  dnstap-identity hostname;
+    // catalog-zones { zone "catalog.example"; };   // catalog-zone yes; と同じ
+
     // UDPソケットバッファサイズ (未指定時のデフォルト: 4M)
     // OSの上限値(kern.ipc.maxsockbuf sysctl)を超えると切り詰められます
     udp-recvbuf-size 4M;
@@ -157,6 +175,9 @@ zone "example.com" {
     };
     also-notify { 192.168.1.100 port 53; };
     notify-source "192.168.1.1";
+    // Dynamic Update を鍵ごとに許す BIND の update-policy (allow-update とは併用できない)。
+    // 先頭から最初に一致した規則で決まる。署名された UPDATE だけを受け付ける
+    // update-policy { grant tsig-key-example zonesub A AAAA TXT; };
     // セカンダリ側 (type slave) では primaries を複数並べると先頭から順に問い合わせる:
     //   primaries source 192.168.1.1 { 192.168.1.100; 192.168.1.101 key "tsig-key"; };  multi-master yes;
     // ゾーン単位の転送パラメータ (クエリ受信後に接続へ適用。MSS は下げる方向のみ)

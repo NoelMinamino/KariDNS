@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include "dns_zone_parser.h"
 #include "dns_wire.h"
+#include "dns_config_parser.h"   /* CHK_*, ZC_* */
 
 /* level: 'E' error, 'W' warning, 'I' info, 'O' ok, 'D' detail (a continuation line of the previous finding) */
 typedef void (*kc_sink_fn)(void *ud, char level, const char *text);
@@ -34,6 +35,13 @@ void kc_warning(kc_tally_t *t, const char *fmt, ...) __attribute__((format(print
 void kc_info(kc_tally_t *t, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void kc_ok(kc_tally_t *t, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void kc_detail(kc_tally_t *t, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+/* The check-* policy as text, "mx-cname=warn,integrity=fail,names=ignore" (names = check-names of a primary zone), to hand to karidns-dbloader
+ * --zone-checks.  _parse: 0, or -1 with the reason in err; chk[ZC_N] and *names are CHK_DEFAULT where the text says nothing.  _format: the
+ * checks that are not CHK_DEFAULT (the empty string when none); returns its length. */
+int zone_lint_policy_parse(const char *spec, uint8_t chk[ZC_N], uint8_t *names, char *err, size_t errlen);
+size_t zone_lint_policy_format(const uint8_t chk[ZC_N], uint8_t names, char *out, size_t cap);
+/* A finding whose severity a check-* option sets: sev = CHK_FAIL / CHK_WARN / CHK_IGNORE, or CHK_DEFAULT = dflt ('E', 'W', or 'N' for nothing) */
+void kc_finding(kc_tally_t *t, uint8_t sev, char dflt, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
 
 /* RFC 2181 5.2 (what: "zone file" or "database", for the message): RRs of one RRset with different TTLs, on the raw data of the source (call before the TTLs are harmonized:
  * before build_zone_index(arena, true); a zone the reader built (build_zone_index(false)) has its TTLs as written) */
@@ -51,6 +59,10 @@ typedef struct {
     int ecs_tag_count;
     const ecs_tag_def_t *loc_tags;
     int loc_tag_count;
+    /* the check-* options that apply to the zone (zone_veff_t.chk, ZC_N values of CHK_*, and the check-names value of the zone's type):
+     * NULL = every check keeps the severity it had before check-* existed (CHK_DEFAULT) */
+    const uint8_t *chk;
+    uint8_t chk_names;
 } zone_lint_in_t;
 
 /* Everything `karicheck zone` checks on a parsed and indexed zone after the parser and the zone-level validations (name lengths, DNAME,

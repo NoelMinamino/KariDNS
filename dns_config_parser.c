@@ -401,6 +401,7 @@ static void acl_set_copy(acl_set_t *d, const acl_set_t *s) {
 }
 
 static void xo_free_fields(xfr_opts_t *xo);
+static void catz_names_free(char **names, int count);
 
 /* everything x points to (not x itself: a zone_ext_shared_t embeds it) */
 static void free_zone_ext_fields(zone_ext_t *x) {
@@ -449,6 +450,7 @@ static void free_zone_ext_fields(zone_ext_t *x) {
     free(x->forwarders[i].ip);
   free(x->forwarders);
   free(x->file_format);
+  free(x->upd_policy);
   free_rate_limit_config(&x->rrl);
   if (x->ecs_tags) {
     for (int i = 0; i < x->ecs_tag_count; i++) {
@@ -649,6 +651,7 @@ static void free_partial_view(view_config_t *view) {
   if (!view) return;
   zone_cfg_index_free(&view->zone_index);
   free_view_db_fields(view);
+  catz_names_free(view->catz_names, view->catz_count);
   if (view->name) free(view->name);
   acl_set_free(&view->acl);
   xo_free_fields(&view->xo);
@@ -1037,6 +1040,7 @@ void free_server_config_fields(server_config_t *cfg) {
     view_config_t *next_v = v->next;
     zone_cfg_index_free(&v->zone_index);
     free_view_db_fields(v);
+    catz_names_free(v->catz_names, v->catz_count);
     if (v->name) free(v->name);
     acl_set_free(&v->acl);
     xo_free_fields(&v->xo);
@@ -1057,6 +1061,9 @@ void free_server_config_fields(server_config_t *cfg) {
   }
   cfg->views = NULL;
 
+  catz_names_free(cfg->catz_names, cfg->catz_count);
+  cfg->catz_names = NULL;
+  cfg->catz_count = 0;
   tsig_keys_free(cfg->keys);
   cfg->keys = NULL;
   server_stmts_free(cfg->servers);
@@ -1883,6 +1890,14 @@ static int chaos_finish(token_ctx_t *ctx, server_config_t *cfg) {
       return -1;
     }
     if (!cfg->nsid_string && (cfg->nsid_string = strdup(c->r_id)) == NULL) return -1;
+  }
+  if (cfg->dnstap.enabled && cfg->dnstap.bind_form && !cfg->dnstap.socket_path) {   /* BIND check_dnstap(): 'dnstap-output' must be set if 'dnstap' is set */
+    conf_error(ctx, "dnstap", "'dnstap-output' must be set if 'dnstap' is set (dnstap-output unix \"/path/to/socket\";)");
+    return -1;
+  }
+  for (const view_config_t *v = cfg->views; v; v = v->next) {
+    if (v->max_udp_size) cfg->any_view_max_udp = true;
+    if (v->require_cookie_set) cfg->any_view_cookie = true;
   }
   return 0;
 }
@@ -2944,6 +2959,64 @@ static int parse_transport_param(token_ctx_t *ctx, const char *zone_domain, cons
   return 0;
 }
 
+/* ---- Batch 7: BIND names for settings KariDNS already has, max-udp-size at the options / view level, require-server-cookie.
+ *   udp-receive-buffer / udp-send-buffer = udp-recvbuf-size / udp-sndbuf-size (the same value written under both names is fine, two values are
+ *   a mistake: which one would win?);  max-udp-size = udp-bufsize (BIND 9.20 bin/named/server.c: the value is held to 512..4096);
+ *   tcp-receive-buffer / tcp-send-buffer set the two directions that tcp-window sets together.  BIND holds a non-zero buffer size to at least 4096
+ *   (CAP_IF_NOT_ZERO in configure_server_options()); 0 is the system's size, which for UDP is KariDNS's own default here. ---- */
+static int alias_note(token_ctx_t *ctx, server_config_t *cfg, int slot, const char *key, long v) {
+  char loc[64], cur[300];
+  ctx_location(ctx, cur, sizeof(cur));
+  snprintf(loc, sizeof(loc), "%s", cur);
+  if (cfg->alias_note[slot].name[0] && strcmp(cfg->alias_note[slot].name, key) != 0 && cfg->alias_note[slot].v != v) {
+    conf_error(ctx, "options", "%s %ld and %s %ld (%s) are the same setting with two values; write one of them, or the same value in both", key, v,
+               cfg->alias_note[slot].name, cfg->alias_note[slot].v, cfg->alias_note[slot].loc);
+    return -1;
+  }
+  snprintf(cfg->alias_note[slot].name, sizeof(cfg->alias_note[slot].name), "%s", key);
+  cfg->alias_note[slot].v = v;
+  snprintf(cfg->alias_note[slot].loc, sizeof(cfg->alias_note[slot].loc), "%s", loc);
+  return 0;
+}
+
+/* A BIND buffer size: an integer (the K / M suffix of KariDNS is read too); 0 = the system's.  *out is the size, held to at least 4096 unless 0. */
+static int parse_bind_bufsize(token_ctx_t *ctx, const char *key, int *out) {
+  int v = 0;
+  if (parse_transport_param(ctx, NULL, key, true, 0, INT_MAX, &v) != 0) return -1;
+  if (v > 0 && v < 4096) v = 4096;
+  *out = v;
+  return 0;
+}
+
+static int parse_udp_size_option(token_ctx_t *ctx, server_config_t *cfg, const char *what, const char *key, uint16_t *out) {
+  int v = 0;
+  if (parse_transport_param(ctx, NULL, key, false, 0, INT_MAX, &v) != 0) return -1;
+  if (v < 512 || v > 4096) {   /* bin/named/server.c: the value is raised to 512 or lowered to 4096 */
+    int held = v < 512 ? 512 : 4096;
+    conf_warn_here(ctx, what, "%s %d is out of range (512..4096): %s %d", key, v, v < 512 ? "raising to" : "lowering to", held);
+    v = held;
+  }
+  if (cfg && alias_note(ctx, cfg, 0, key, v) != 0) return -1;
+  *out = (uint16_t)v;
+  return 0;
+}
+
+const view_config_t *config_find_view(const server_config_t *cfg, const char *name) {
+  if (!cfg || !name || !name[0]) return NULL;
+  for (const view_config_t *v = cfg->views; v; v = v->next)
+    if (strcasecmp(v->name, name) == 0) return v;
+  return NULL;
+}
+
+bool config_require_server_cookie(const server_config_t *cfg, const char *view_name) {
+  if (!cfg) return false;
+  if (cfg->any_view_cookie) {
+    const view_config_t *v = config_find_view(cfg, view_name);
+    if (v && v->require_cookie_set) return v->require_cookie;
+  }
+  return cfg->require_server_cookie;
+}
+
 /* notify-retries / notify-retry-interval / notify-retry-backoff。options (zone_domain NULL) と zone で共通。
  * 戻り値: 0 = このキーではない、1 = 読んで nr に設定した、-1 = 値が不正 (ログ済み)。 */
 static int parse_notify_retry_option(token_ctx_t *ctx, const char *zone_domain, const char *key,
@@ -3175,6 +3248,154 @@ static int parse_zv_option(token_ctx_t *ctx, const char *what, const char *key, 
   return 0;
 }
 
+static bool fstrm_option_name(const char *key) {
+  static const char *const names[] = { "fstrm-set-buffer-hint", "fstrm-set-flush-timeout", "fstrm-set-input-queue-size", "fstrm-set-output-notify-threshold",
+                                       "fstrm-set-output-queue-model", "fstrm-set-output-queue-size", "fstrm-set-reopen-interval", NULL };
+  for (size_t i = 0; names[i]; i++)
+    if (strcmp(names[i], key) == 0) return true;
+  return false;
+}
+
+/* fstrm-set-*: uint32, fstrm-set-output-queue-model is mpsc or spsc, fstrm-set-reopen-interval a duration (lib/isccfg/namedconf.c) */
+static int parse_fstrm_option(token_ctx_t *ctx, const char *key) {
+  char what[48];
+  snprintf(what, sizeof(what), "options %s", key);
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+  uint32_t u;
+  bool ok;
+  if (strcmp(key, "fstrm-set-output-queue-model") == 0) ok = strcasecmp(tok.value, "mpsc") == 0 || strcasecmp(tok.value, "spsc") == 0;
+  else if (strcmp(key, "fstrm-set-reopen-interval") == 0) ok = parse_ttl_strict(tok.value, UINT32_MAX, &u);
+  else ok = zv_parse_u32(tok.value, &u);
+  if (!ok) {
+    conf_error(ctx, what, "invalid value '%.64s'", tok.value);
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  free_token(&tok);
+  conf_warn_here(ctx, what, "accepted, no effect in KariDNS: the dnstap writer has its own settings (dnstap { queue-size })");
+  return 0;
+}
+
+/* ---- Batch 7: catalog-zones { zone "name" [default-primaries { .. }] [zone-directory "d"] [in-memory yes|no] [min-update-interval d]; ... }; in
+ * options and view (BIND 9.20 lib/isccfg/namedconf.c catz_zone_fields; check.c check_catz(): a name is listed once).  KariDNS treats a zone as a
+ * catalog zone with `catalog-zone yes;`; a listed name selects that zone (of every view for options, of the view for view) the same way.  The
+ * other parts of the statement are read and said to have no effect: members take the primaries of the catalog zone, the member zones are
+ * in memory, and the catalog zone is processed when it changes. ---- */
+static void catz_names_free(char **names, int count) {
+  for (int i = 0; i < count; i++) free(names[i]);
+  free(names);
+}
+
+static int parse_catalog_zones(token_ctx_t *ctx, const char *what, char ***names, int *count) {
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_LBRACE) { free_token(&tok); return -1; }
+  free_token(&tok);
+  for (;;) {
+    tok = get_next_token(ctx);
+    if (tok.type == TOKEN_RBRACE) { free_token(&tok); break; }
+    if (tok.type != TOKEN_STRING || !tok.value || strcmp(tok.value, "zone") != 0) {
+      conf_error(ctx, what, "catalog-zones: expected `zone \"name\"`, found '%.64s'", tok.type == TOKEN_STRING && tok.value ? tok.value : "(not a word)");
+      free_token(&tok);
+      return -1;
+    }
+    free_token(&tok);
+    tok = get_next_token(ctx);
+    if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+    char *name = tok.value;
+    tok.value = NULL;
+    free_token(&tok);
+    for (int i = 0; i < *count; i++)
+      if (domain_names_match_ci((*names)[i], name)) {
+        conf_error(ctx, what, "catalog zone '%.200s' is listed twice", name);   /* check.c: "catalog zone '%s': already added here" */
+        free(name);
+        return -1;
+      }
+    char **nn = realloc(*names, ((size_t)*count + 1) * sizeof(char *));
+    if (!nn) { free(name); if (ctx) ctx->error_occurred = true; return -1; }
+    *names = nn;
+    nn[(*count)++] = name;
+    bool primaries = false;
+    for (;;) {
+      tok = get_next_token(ctx);
+      if (tok.type == TOKEN_SEMICOLON) { free_token(&tok); break; }
+      if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+      char key[32];
+      snprintf(key, sizeof(key), "%.31s", tok.value);
+      free_token(&tok);
+      if (strcmp(key, "default-primaries") == 0 || strcmp(key, "default-masters") == 0) {
+        if (primaries) {   /* check.c: 'default-primaries' and 'default-masters' can not be both defined */
+          conf_error(ctx, what, "catalog zone '%.200s': 'default-primaries' and 'default-masters' can not be both defined", name);
+          return -1;
+        }
+        primaries = true;
+        tok = get_next_token(ctx);
+        if (tok.type != TOKEN_LBRACE) { free_token(&tok); return -1; }
+        free_token(&tok);
+        int depth = 1;
+        while (depth > 0) {
+          tok = get_next_token(ctx);
+          if (tok.type == TOKEN_EOF) { free_token(&tok); return -1; }
+          if (tok.type == TOKEN_LBRACE) depth++;
+          else if (tok.type == TOKEN_RBRACE) depth--;
+          free_token(&tok);
+        }
+        conf_warn_here(ctx, what, "catalog zone '%.200s': default-primaries is accepted, no effect in KariDNS: members are transferred from the primaries of the catalog zone", name);
+      } else if (strcmp(key, "zone-directory") == 0 || strcmp(key, "in-memory") == 0 || strcmp(key, "min-update-interval") == 0) {
+        tok = get_next_token(ctx);
+        if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+        bool bad = false;
+        if (key[0] == 'i') {
+          bool b;
+          if (!parse_config_bool(tok.value, &b)) bad = true;
+          else if (b) conf_warn_here(ctx, what, "catalog zone '%.200s': in-memory yes is how KariDNS always works (member zones are never written to files)", name);
+          else conf_warn_here(ctx, what, "catalog zone '%.200s': in-memory no is accepted, no effect in KariDNS (member zones are never written to files)", name);
+        } else if (key[0] == 'm') {
+          uint32_t u;
+          if (!parse_ttl_strict(tok.value, UINT32_MAX, &u)) bad = true;
+          else conf_warn_here(ctx, what, "catalog zone '%.200s': min-update-interval is accepted, no effect in KariDNS", name);
+        } else {
+          conf_warn_here(ctx, what, "catalog zone '%.200s': zone-directory is accepted, no effect in KariDNS (member zones are never written to files)", name);
+        }
+        if (bad) conf_error(ctx, what, "catalog zone '%.200s': invalid %s '%.64s'", name, key, tok.value);
+        free_token(&tok);
+        if (bad) return -1;
+      } else {
+        conf_error(ctx, what, "catalog zone '%.200s': unknown option '%.64s'", name, key);
+        return -1;
+      }
+    }
+  }
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  free_token(&tok);
+  return 0;
+}
+
+/* when the parse ends: the zones the lists name are catalog zones.  A name that is no zone of the scope is said (BIND would find no zone to
+ * process either); the options list covers every view. */
+static void catz_apply(token_ctx_t *ctx, server_config_t *cfg) {
+  char loc[300];
+  ctx_location(ctx, loc, sizeof(loc));
+  for (int i = 0; i < cfg->catz_count; i++) {
+    bool found = false;
+    for (view_config_t *v = cfg->views; v; v = v->next) {
+      zone_config_t *z = view_find_zone_config(v, cfg->catz_names[i]);
+      if (z) { z->is_catalog = true; found = true; }
+    }
+    if (!found) conf_warn_loc(loc, "options catalog-zones", "'%.200s' is not a zone of the configuration: nothing is processed as a catalog zone", cfg->catz_names[i]);
+  }
+  for (view_config_t *v = cfg->views; v; v = v->next)
+    for (int i = 0; i < v->catz_count; i++) {
+      zone_config_t *z = view_find_zone_config(v, v->catz_names[i]);
+      if (z) z->is_catalog = true;
+      else conf_warn_loc(loc, "view catalog-zones", "'%.200s' is not a zone of view '%.64s': nothing is processed as a catalog zone", v->catz_names[i], v->name);
+    }
+}
+
 static const zone_vopts_t *zv_of_view(const server_config_t *cfg, const char *view_name) {
   if (!cfg || !view_name || !view_name[0]) return NULL;
   for (const view_config_t *v = cfg->views; v; v = v->next)
@@ -3210,6 +3431,156 @@ void zone_vopts_effective(const server_config_t *cfg, const zone_config_t *zone,
     int ci = (strcasecmp(type, "secondary") == 0 || strcasecmp(type, "slave") == 0) ? ZC_NAMES_SECONDARY : ZC_NAMES_PRIMARY;
     out->check_names = out->chk[ci];
   }
+}
+
+/* ---- Batch 7: update-policy { grant | deny <identity> <matchtype> [<name>] <rrtypes>; ... } in a primary zone (BIND 9.20 lib/isccfg/namedconf.c
+ * grant_fields / matchtype_enums, bin/named/zoneconf.c configure_zone_ssutable(), lib/isccfg/check.c check_update_policy()).  The identity is the
+ * name of the TSIG key that signed the UPDATE.  A rule of a kind KariDNS cannot evaluate is never taken as one: a `grant` is dropped with a warning
+ * (the first matching rule decides, so dropping a grant can only refuse more than BIND does, never allow more), a `deny` is an error (dropping it
+ * would allow what the file forbids).  `update-policy local;` needs BIND's session key and is an error.  A type count, `A(3)`, limits the RRs a
+ * grant adds and is not enforced: an error rather than a grant wider than written. ---- */
+static int parse_update_policy(token_ctx_t *ctx, const char *what, const char *zone_domain, zone_ext_t *x) {
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type == TOKEN_STRING && tok.value && strcasecmp(tok.value, "local") == 0) {
+    conf_error(ctx, what, "update-policy local is not supported: it needs the session key of BIND's dynamic update (grant <key> zonesub ANY; with a key of the "
+               "configuration does the same for a key you hold)");
+    free_token(&tok);
+    return -1;
+  }
+  if (tok.type != TOKEN_LBRACE) { free_token(&tok); return -1; }
+  free_token(&tok);
+  update_policy_t *pol = calloc(1, sizeof(*pol));
+  if (!pol) { if (ctx) ctx->error_occurred = true; return -1; }
+  for (;;) {
+    tok = get_next_token(ctx);
+    if (tok.type == TOKEN_RBRACE) { free_token(&tok); break; }
+    if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); free(pol); return -1; }
+    bool grant;
+    if (strcasecmp(tok.value, "grant") == 0) grant = true;
+    else if (strcasecmp(tok.value, "deny") == 0) grant = false;
+    else {
+      conf_error(ctx, what, "update-policy: expected grant or deny, found '%.64s'", tok.value);
+      free_token(&tok);
+      free(pol);
+      return -1;
+    }
+    free_token(&tok);
+    update_rule_t rule;
+    memset(&rule, 0, sizeof(rule));
+    rule.grant = grant;
+    char mt[32] = "";
+    for (int field = 0; field < 3; field++) {   /* identity, matchtype, name (not for zonesub) */
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); free(pol); return -1; }
+      if (field == 0) {
+        if (strlen(tok.value) >= sizeof(rule.identity)) {
+          conf_error(ctx, what, "update-policy: the identity is too long");
+          free_token(&tok);
+          free(pol);
+          return -1;
+        }
+        snprintf(rule.identity, sizeof(rule.identity), "%s", tok.value);
+      } else if (field == 1) {
+        snprintf(mt, sizeof(mt), "%.31s", tok.value);
+      } else {
+        if (strlen(tok.value) >= sizeof(rule.name)) {
+          conf_error(ctx, what, "update-policy: the name is too long");
+          free_token(&tok);
+          free(pol);
+          return -1;
+        }
+        snprintf(rule.name, sizeof(rule.name), "%s", tok.value);
+      }
+      free_token(&tok);
+      if (field == 1 && strcasecmp(mt, "zonesub") == 0) {
+        snprintf(rule.name, sizeof(rule.name), "%s", zone_domain);
+        break;
+      }
+    }
+    static const struct { const char *name; int type; } k_mt[] = { {"name", UPD_NAME}, {"subdomain", UPD_SUBDOMAIN}, {"zonesub", UPD_SUBDOMAIN},
+        {"wildcard", UPD_WILDCARD}, {"self", UPD_SELF}, {"selfsub", UPD_SELFSUB}, {"selfwild", UPD_SELFWILD} };
+    int mtype = -1;
+    for (size_t i = 0; i < sizeof(k_mt) / sizeof(k_mt[0]); i++)
+      if (strcasecmp(k_mt[i].name, mt) == 0) mtype = k_mt[i].type;
+    static const char *const k_unsupported[] = { "6to4-self", "external", "krb5-self", "krb5-selfsub", "krb5-subdomain", "krb5-subdomain-self-rhs",
+                                                 "ms-self", "ms-selfsub", "ms-subdomain", "ms-subdomain-self-rhs", "tcp-self", NULL };
+    bool unsupported = false;
+    for (size_t i = 0; k_unsupported[i]; i++)
+      if (strcasecmp(k_unsupported[i], mt) == 0) unsupported = true;
+    if (mtype < 0 && !unsupported) {
+      conf_error(ctx, what, "update-policy: '%.31s' is not a match type", mt);
+      free(pol);
+      return -1;
+    }
+    rule.mtype = (uint8_t)(mtype < 0 ? 0 : mtype);
+    rule.ident_wild = rule.identity[0] == '*' && rule.identity[1] == '.' && rule.identity[2];
+    if (mtype == UPD_WILDCARD && !(rule.name[0] == '*' && rule.name[1] == '.' && rule.name[2])) {
+      conf_error(ctx, what, "update-policy: a wildcard rule needs a name of the form *.suffix, found '%.64s'", rule.name);
+      free(pol);
+      return -1;
+    }
+    /* the types, up to the ';' */
+    for (;;) {
+      tok = get_next_token(ctx);
+      if (tok.type == TOKEN_SEMICOLON) { free_token(&tok); break; }
+      if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); free(pol); return -1; }
+      uint16_t t = strcasecmp(tok.value, "ANY") == 0 ? 255 : get_type_code(tok.value);
+      if (strchr(tok.value, '(')) {
+        conf_error(ctx, what, "update-policy: the count limit of '%.64s' is not supported (a grant would be wider than written)", tok.value);
+        free_token(&tok);
+        free(pol);
+        return -1;
+      }
+      if (t == 0) {
+        conf_error(ctx, what, "update-policy: '%.64s' is not a record type", tok.value);
+        free_token(&tok);
+        free(pol);
+        return -1;
+      }
+      if (rule.ntypes >= UPD_TYPES_MAX) {
+        conf_error(ctx, what, "update-policy: more than %d types in one rule (at '%.64s')", UPD_TYPES_MAX, tok.value);
+        free_token(&tok);
+        free(pol);
+        return -1;
+      }
+      rule.types[rule.ntypes++] = t;
+      free_token(&tok);
+    }
+    if (unsupported) {
+      if (!grant) {
+        conf_error(ctx, what, "update-policy: deny %s cannot be evaluated by KariDNS; ignoring it would allow what the file forbids", mt);
+        free(pol);
+        return -1;
+      }
+      conf_warn_here(ctx, what, "update-policy: grant %s is not supported (it needs Kerberos, the transport address or a helper); the rule is ignored, which refuses more than BIND would, never less", mt);
+      continue;
+    }
+    if (pol->count >= UPD_RULES_MAX) {
+      conf_error(ctx, what, "update-policy: more than %d rules", UPD_RULES_MAX);
+      free(pol);
+      return -1;
+    }
+    pol->rules[pol->count++] = rule;
+  }
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); free(pol); return -1; }
+  free_token(&tok);
+  free(x->upd_policy);
+  x->upd_policy = pol;
+  return 0;
+}
+
+/* when the parse ends: BIND check.c: 'allow-update' is ignored when 'update-policy' is present (an error in the same zone) */
+static int upd_policy_check(token_ctx_t *ctx, server_config_t *cfg) {
+  for (const view_config_t *v = cfg->views; v; v = v->next)
+    for (const zone_config_t *z = v->zones; z; z = z->next) {
+      const zone_ext_t *x = zext(z);
+      if (x->upd_policy && (x->allow_update_count > 0 || x->acl.update)) {
+        conf_error(ctx, "zone", "zone '%.200s': 'allow-update' is ignored when 'update-policy' is present", z->domain);
+        return -1;
+      }
+    }
+  return 0;
 }
 
 static bool xo_option_name(const char *key) {
@@ -4514,6 +4885,14 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       if (parse_aml_slot(ctx, awhat, slot) != 0) {
         free(key); free_zone_config(zone); return -1;
       }
+    } else if (strcmp(key, "update-policy") == 0) {
+      char uwhat[DNS_NAME_TEXT_SIZE + 48];
+      snprintf(uwhat, sizeof(uwhat), "zone '%.255s'", zone->domain ? zone->domain : "");
+      if (parse_update_policy(ctx, uwhat, zone->domain ? zone->domain : "", x) != 0) {
+        free(key);
+        free_zone_config(zone);
+        return -1;
+      }
     } else if (zv_option_name(key)) {
       /* batch 7: max-records, max-records-per-type, max-types-per-name, max-zone-ttl, serial-update-method, masterfile-format, check-* */
       char zwhat[DNS_NAME_TEXT_SIZE + 48];
@@ -5124,6 +5503,153 @@ static int parse_buffer_size_value(const char *str) {
   return (int)val;
 }
 
+/* ---- Batch 7: dnstap in the BIND 9.20 grammar (lib/isccfg/namedconf.c cfg_type_dnstap: a list of `<type> [query | response];` with type all, auth,
+ * client, forwarder, resolver or update; dnstap-output, dnstap-identity, dnstap-version, fstrm-set-*; lib/isccfg/check.c: dnstap-output is
+ * required with dnstap).  The first word inside dnstap { } tells the two grammars apart; mixing them is an error.  KariDNS sends AUTH_QUERY and
+ * AUTH_RESPONSE only (to a UNIX socket), so `auth` and `all` select those and the other types are accepted with a note. ---- */
+static bool dnstap_is_bind_type(const char *w) {
+  static const char *const types[] = { "all", "auth", "client", "forwarder", "resolver", "update", NULL };
+  for (size_t i = 0; types[i]; i++)
+    if (strcasecmp(types[i], w) == 0) return true;
+  return false;
+}
+
+/* set a dnstap string from one of the two grammars; a value that differs from one the other grammar set is an error */
+static int dnstap_set_string(token_ctx_t *ctx, char **field, char *origin, char from, const char *what, const char *val) {
+  if (*field && *origin && *origin != from && strcmp(*field, val) != 0) {
+    conf_error(ctx, what, "'%.64s' differs from '%.64s', which the %s grammar of dnstap set; write one of them, or the same value in both", val, *field,
+               from == 'b' ? "dnstap { socket / identity / version }" : "dnstap-output / dnstap-identity / dnstap-version");
+    return -1;
+  }
+  char *copy = strdup(val);
+  if (!copy) { if (ctx) ctx->error_occurred = true; return -1; }
+  free(*field);
+  *field = copy;
+  *origin = from;
+  return 0;
+}
+
+/* the entries of dnstap { auth; auth query; ... }; `first` is the first word, already read.  Reads up to and including the '}' and the ';' */
+static int parse_dnstap_bind_entries(token_ctx_t *ctx, server_config_t *config, conf_token_t first) {
+  dnstap_config_t *d = &config->dnstap;
+  d->bind_form = true;
+  d->log_auth_query = d->log_auth_response = false;
+  conf_token_t tok = first;
+  for (;;) {
+    if (tok.type == TOKEN_RBRACE) { free_token(&tok); break; }
+    if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+    if (!dnstap_is_bind_type(tok.value)) {
+      conf_error(ctx, "dnstap", "'%.64s' is not a dnstap message type (all, auth, client, forwarder, resolver, update); the KariDNS statements (socket, identity, ...) "
+                 "cannot be mixed with the BIND list", tok.value);
+      free_token(&tok);
+      return -1;
+    }
+    char type[16];
+    snprintf(type, sizeof(type), "%s", tok.value);
+    free_token(&tok);
+    tok = get_next_token(ctx);
+    bool q = true, r = true;
+    if (tok.type == TOKEN_STRING && tok.value && (strcasecmp(tok.value, "query") == 0 || strcasecmp(tok.value, "response") == 0)) {
+      q = strcasecmp(tok.value, "query") == 0;
+      r = !q;
+      free_token(&tok);
+      tok = get_next_token(ctx);
+    }
+    if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+    free_token(&tok);
+    if (strcasecmp(type, "auth") == 0 || strcasecmp(type, "all") == 0) {
+      if (q) d->log_auth_query = true;
+      if (r) d->log_auth_response = true;
+      if (strcasecmp(type, "all") == 0)
+        conf_warn_here(ctx, "dnstap", "all: only the auth messages (AUTH_QUERY, AUTH_RESPONSE) are sent; KariDNS has no client, resolver, forwarder or update messages");
+    } else if (strcasecmp(type, "update") == 0) {
+      conf_warn_here(ctx, "dnstap", "update is accepted, no effect in KariDNS: the dnstap UPDATE_QUERY / UPDATE_RESPONSE messages are not sent");
+    } else {
+      conf_warn_here(ctx, "dnstap", "%s is accepted, no effect in KariDNS: it is an authoritative server and sends no %s messages", type, type);
+    }
+    tok = get_next_token(ctx);
+  }
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  free_token(&tok);
+  return 0;
+}
+
+/* options { dnstap-output ( file | unix ) "path" [size ..] [versions ..] [suffix ..]; }: a UNIX socket is what KariDNS writes to.  A file would be a new
+ * file opened by the Backend (CLAUDE.md rule 2), so it is refused; size, versions and suffix go with a file only (BIND check.c). */
+static int parse_dnstap_output(token_ctx_t *ctx, server_config_t *config) {
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+  bool is_unix = strcasecmp(tok.value, "unix") == 0;
+  if (!is_unix && strcasecmp(tok.value, "file") != 0) {
+    conf_error(ctx, "options dnstap-output", "invalid mode '%.64s' (expected file or unix)", tok.value);
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+  char *path = tok.value;
+  tok.value = NULL;
+  free_token(&tok);
+  bool extra = false;
+  for (;;) {
+    tok = get_next_token(ctx);
+    if (tok.type == TOKEN_SEMICOLON) { free_token(&tok); break; }
+    if (tok.type != TOKEN_STRING || !tok.value ||
+        (strcasecmp(tok.value, "size") != 0 && strcasecmp(tok.value, "versions") != 0 && strcasecmp(tok.value, "suffix") != 0)) {
+      free_token(&tok);
+      free(path);
+      return -1;
+    }
+    extra = true;
+    free_token(&tok);
+    tok = get_next_token(ctx);   /* the value of size / versions / suffix */
+    if (tok.type != TOKEN_STRING) { free_token(&tok); free(path); return -1; }
+    free_token(&tok);
+  }
+  int rc = 0;
+  if (!is_unix) {
+    conf_error(ctx, "options dnstap-output", "mode file is not supported: KariDNS sends dnstap messages to a UNIX socket (dnstap-output unix \"%.200s\")", path);
+    rc = -1;
+  } else if (extra) {
+    conf_error(ctx, "options dnstap-output", "size, versions and suffix cannot be set with mode unix");
+    rc = -1;
+  } else {
+    rc = dnstap_set_string(ctx, &config->dnstap.socket_path, &config->dnstap.origin_socket, 'b', "options dnstap-output", path);
+  }
+  free(path);
+  return rc;
+}
+
+/* options { dnstap-identity ( "text" | none | hostname ); dnstap-version ( "text" | none ); } */
+static int parse_dnstap_text(token_ctx_t *ctx, server_config_t *config, const char *key) {
+  bool is_id = strcmp(key, "dnstap-identity") == 0;
+  char what[32];
+  snprintf(what, sizeof(what), "options %s", key);
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+  bool none = !tok.is_quoted && strcasecmp(tok.value, "none") == 0;
+  bool host = is_id && !tok.is_quoted && strcasecmp(tok.value, "hostname") == 0;
+  char hn[256];
+  const char *val = tok.value;
+  if (host) {
+    if (gethostname(hn, sizeof(hn)) != 0) hn[0] = '\0';
+    hn[sizeof(hn) - 1] = '\0';
+    val = hn;
+  }
+  int rc = 0;
+  if (!none && !(host && !val[0]))
+    rc = is_id ? dnstap_set_string(ctx, &config->dnstap.identity, &config->dnstap.origin_identity, 'b', what, val)
+               : dnstap_set_string(ctx, &config->dnstap.version, &config->dnstap.origin_version, 'b', what, val);
+  free_token(&tok);
+  if (rc != 0) return -1;
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  free_token(&tok);
+  return 0;
+}
+
 static int parse_dnstap_block(token_ctx_t *ctx, server_config_t *config) {
   conf_token_t tok = get_next_token(ctx);
   if (tok.type != TOKEN_LBRACE) { free_token(&tok); return -1; }
@@ -5131,13 +5657,23 @@ static int parse_dnstap_block(token_ctx_t *ctx, server_config_t *config) {
   config->dnstap.enabled = true;
   config->dnstap.queue_size = 4096;
   bool msg_type_specified = false;
+  /* the first word tells the grammars apart: a message type is BIND's list, anything else a KariDNS statement */
+  conf_token_t first = get_next_token(ctx);
+  if (first.type == TOKEN_STRING && first.value && dnstap_is_bind_type(first.value)) return parse_dnstap_bind_entries(ctx, config, first);
+  bool have_first = true;
   while (1) {
-    tok = get_next_token(ctx);
+    if (have_first) { tok = first; have_first = false; }
+    else tok = get_next_token(ctx);
     if (tok.type == TOKEN_RBRACE) { free_token(&tok); break; }
     if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
     char *key_prop = tok.value;
     tok.value = NULL;
     free_token(&tok);
+    if (dnstap_is_bind_type(key_prop)) {
+      conf_error(ctx, "dnstap", "'%.64s' is a message type of the BIND list (dnstap { auth; }); it cannot be mixed with the KariDNS statements (socket, identity, ...)", key_prop);
+      free(key_prop);
+      return -1;
+    }
     tok = get_next_token(ctx);
     if (tok.type != TOKEN_STRING) { free(key_prop); free_token(&tok); return -1; }
     char *val = tok.value;
@@ -5147,15 +5683,13 @@ static int parse_dnstap_block(token_ctx_t *ctx, server_config_t *config) {
     if (tok.type != TOKEN_SEMICOLON) { free(key_prop); free(val); free_token(&tok); return -1; }
     free_token(&tok);
 
-    if (strcmp(key_prop, "socket") == 0 || strcmp(key_prop, "socket-path") == 0) {
-      if (config->dnstap.socket_path) free(config->dnstap.socket_path);
-      config->dnstap.socket_path = val;
-    } else if (strcmp(key_prop, "identity") == 0) {
-      if (config->dnstap.identity) free(config->dnstap.identity);
-      config->dnstap.identity = val;
-    } else if (strcmp(key_prop, "version") == 0) {
-      if (config->dnstap.version) free(config->dnstap.version);
-      config->dnstap.version = val;
+    if (strcmp(key_prop, "socket") == 0 || strcmp(key_prop, "socket-path") == 0 || strcmp(key_prop, "identity") == 0 || strcmp(key_prop, "version") == 0) {
+      bool is_sock = key_prop[0] == 's', is_id = key_prop[0] == 'i';
+      int src = dnstap_set_string(ctx, is_sock ? &config->dnstap.socket_path : is_id ? &config->dnstap.identity : &config->dnstap.version,
+                                  is_sock ? &config->dnstap.origin_socket : is_id ? &config->dnstap.origin_identity : &config->dnstap.origin_version, 'k',
+                                  "dnstap", val);
+      free(val);
+      if (src != 0) { free(key_prop); return -1; }
     } else if (strcmp(key_prop, "queue-size") == 0 || strcmp(key_prop, "queue_size") == 0) {
       config->dnstap.queue_size = (uint32_t)strtoul(val, NULL, 10);
       free(val);
@@ -7258,6 +7792,10 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key);
             return -1;
           }
+          if (alias_note(ctx, config, 0, key, v) != 0) {
+            free(key);
+            return -1;
+          }
           config->udp_bufsize = (uint16_t)v;
         } else if (strcmp(key, "udp-recvbuf-size") == 0) {
           tok = get_next_token(ctx);
@@ -7267,6 +7805,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           int sz = parse_buffer_size_value(tok.value);
+          if (sz > 0 && alias_note(ctx, config, 1, key, sz) != 0) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
           if (sz > 0) config->udp_recvbuf_size = sz;
           free_token(&tok);
           tok = get_next_token(ctx);
@@ -7291,6 +7834,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           int sz = parse_buffer_size_value(tok.value);
+          if (sz > 0 && alias_note(ctx, config, 2, key, sz) != 0) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
           if (sz > 0) config->udp_sndbuf_size = sz;
           free_token(&tok);
           tok = get_next_token(ctx);
@@ -7305,6 +7853,65 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
         } else if (strcmp(key, "database") == 0) {
           if (parse_database_block(ctx, config) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "udp-receive-buffer") == 0 || strcmp(key, "udp-send-buffer") == 0) {
+          bool rcv = key[4] == 'r';
+          int v = 0;
+          if (parse_bind_bufsize(ctx, key, &v) != 0 || alias_note(ctx, config, rcv ? 1 : 2, key, v) != 0) {
+            free(key);
+            return -1;
+          }
+          if (v > 0) {
+            if (rcv) config->udp_recvbuf_size = v;
+            else config->udp_sndbuf_size = v;
+          }
+        } else if (strcmp(key, "tcp-receive-buffer") == 0 || strcmp(key, "tcp-send-buffer") == 0) {
+          bool rcv = key[4] == 'r';
+          int v = 0;
+          if (parse_bind_bufsize(ctx, key, &v) != 0) {
+            free(key);
+            return -1;
+          }
+          if (rcv) { config->tcp_rcvbuf = v; config->tcp_rcvbuf_set = true; }
+          else { config->tcp_sndbuf = v; config->tcp_sndbuf_set = true; }
+        } else if (strcmp(key, "max-udp-size") == 0) {
+          if (parse_udp_size_option(ctx, config, "options max-udp-size", key, &config->udp_bufsize) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "edns-udp-size") == 0) {
+          /* BIND: the size advertised in the queries the server sends to other servers (a resolver's); an authoritative answer is limited by max-udp-size */
+          uint16_t ignored = 0;
+          if (parse_udp_size_option(ctx, NULL, "options edns-udp-size", key, &ignored) != 0) {
+            free(key);
+            return -1;
+          }
+          conf_warn_here(ctx, "options edns-udp-size", "accepted, no effect in KariDNS: it is the size of the queries a resolver sends; max-udp-size limits the responses");
+        } else if (strcmp(key, "catalog-zones") == 0) {
+          if (parse_catalog_zones(ctx, "options", &config->catz_names, &config->catz_count) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "dnstap-output") == 0) {
+          if (parse_dnstap_output(ctx, config) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "dnstap-identity") == 0 || strcmp(key, "dnstap-version") == 0) {
+          if (parse_dnstap_text(ctx, config, key) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strncmp(key, "fstrm-set-", 10) == 0 && fstrm_option_name(key)) {
+          /* the libfstrm writer settings of BIND: KariDNS has its own writer (dnstap { queue-size }) */
+          if (parse_fstrm_option(ctx, key) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "require-server-cookie") == 0) {
+          if (parse_bool_statement(ctx, NULL, key, &config->require_server_cookie) != 0) {
             free(key);
             return -1;
           }
@@ -7521,6 +8128,25 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           *tail = vk;
+        } else if (strcmp(tok.value, "catalog-zones") == 0) {
+          free_token(&tok);
+          char cwhat[KARIDNS_VIEW_NAME_MAX + 16];
+          snprintf(cwhat, sizeof(cwhat), "view '%s'", view->name);
+          if (parse_catalog_zones(ctx, cwhat, &view->catz_names, &view->catz_count) != 0) { free_partial_view(view); return -1; }
+        } else if (strcmp(tok.value, "max-udp-size") == 0 || strcmp(tok.value, "require-server-cookie") == 0) {
+          /* batch 7: replaces options' for the clients of this view */
+          bool is_udp = tok.value[0] == 'm';
+          free_token(&tok);
+          char vwhat[KARIDNS_VIEW_NAME_MAX + 16];
+          snprintf(vwhat, sizeof(vwhat), "view '%s'", view->name);
+          int vrc;
+          if (is_udp) {
+            vrc = parse_udp_size_option(ctx, NULL, vwhat, "max-udp-size", &view->max_udp_size);
+          } else {
+            vrc = parse_bool_statement(ctx, NULL, "require-server-cookie", &view->require_cookie);
+            view->require_cookie_set = vrc == 0;
+          }
+          if (vrc != 0) { free_partial_view(view); return -1; }
         } else if (zv_option_name(tok.value)) {
           /* batch 7: the same options as options { }, for the zones of this view that have none of their own */
           char *zkey = tok.value;
@@ -7857,6 +8483,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
     config->zones = NULL;
     config->views = default_view;
   }
+  catz_apply(ctx, config);   /* batch 7: catalog-zones { zone "x"; } marks the zones it names (a zone with `catalog-zone yes;` already is one) */
+  if (upd_policy_check(ctx, config) != 0) return -1;
 
   if (validate_database_config(ctx, config) != 0) return -1;
 
@@ -8368,6 +8996,7 @@ static zone_ext_t *zone_ext_clone(const zone_ext_t *s) {
   d->program_path = NULL; d->program_args = NULL; d->program_args_count = 0; d->program_user = NULL;
   d->forwarders = NULL; d->forwarders_count = 0;
   d->file_format = NULL;
+  d->upd_policy = NULL;
   d->alias_resolvers = NULL; d->alias_resolvers_count = 0;
   d->ecs_tags = NULL; d->ecs_tag_count = 0;
   d->location_tags = NULL; d->location_tag_count = 0;
@@ -8397,6 +9026,7 @@ static zone_ext_t *zone_ext_clone(const zone_ext_t *s) {
   if (ok && s->program_path && !(d->program_path = strdup(s->program_path))) ok = false;
   if (ok && s->program_user && !(d->program_user = strdup(s->program_user))) ok = false;
   if (ok && s->file_format && !(d->file_format = strdup(s->file_format))) ok = false;
+  if (ok && s->upd_policy && !(d->upd_policy = zx_memdup(s->upd_policy, sizeof(*s->upd_policy)))) ok = false;
   /* the parsed forms are plain arrays of structs without pointers */
   if (ok && s->masters_parsed && s->masters_count > 0 &&
       !(d->masters_parsed = zx_memdup(s->masters_parsed, (size_t)s->masters_count * sizeof(cidr_entry_t))))

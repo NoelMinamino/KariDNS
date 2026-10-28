@@ -310,6 +310,7 @@ typedef struct zone_ext {
   char *notify_source;
   xfr_opts_t *xo;   /* batch 4 transfer / NOTIFY options written in this zone (NULL = none); `notify-source <address>` above is also entered here */
   zone_vopts_t zv;  /* batch 7: max-records, max-zone-ttl, serial-update-method, check-*, written in this zone */
+  update_policy_t *upd_policy;   /* update-policy { grant | deny ... }: the rules, NULL = the zone has none (allow-update decides) */
   char **allow_transfer;
   int allow_transfer_count;
   acl_entry_t *allow_transfer_parsed;
@@ -539,6 +540,10 @@ typedef struct {
   bool log_auth_response;// log-responses / auth-response yes; (同上)
   bool require_connect;  // require-connect yes; (デフォルト false)
   uint32_t queue_size;   // queue-size 4096; (既定 4096)
+  /* batch 7 (BIND grammar): where a value came from -- 'b' options { dnstap-output / dnstap-identity / dnstap-version }, 'k' the dnstap { } block of KariDNS,
+   * 0 not written.  Two statements that set the same thing with different values are a mistake; bind_form: the block was written as `dnstap { auth; }`. */
+  char origin_socket, origin_identity, origin_version;
+  bool bind_form;
 } dnstap_config_t;
 
 /* view 内のゾーン設定のハッシュ索引 (オープンアドレス法)。キーは domain_names_match_ci()
@@ -564,6 +569,9 @@ typedef struct view_config {
   uint8_t notify_mode;          /* view { notify }: notify_mode_t, 0 = inherit options' */
   xfr_opts_t xo;                /* view { notify-source, transfer-source, min-refresh-time, ... }: replaces options' for the zones of this view that have none of their own */
   zone_vopts_t zv;              /* view { max-records, max-zone-ttl, check-*, ... }: replaces options' for the zones of this view that have none of their own */
+  uint16_t max_udp_size;        /* view { max-udp-size }: the UDP response size limit of this view's clients (512..4096), 0 = not written (zone, else options) */
+  bool require_cookie_set, require_cookie;   /* view { require-server-cookie }: replaces options' for this view */
+  char **catz_names; int catz_count;   /* view { catalog-zones { zone "name"; } }: the zones of this view that are catalog zones */
   tsig_key_t *keys;             /* view { key }: keys visible to this view only (BIND bin/named/tsigconf.c: the view's ring is the global keys plus these) */
   server_stmt_t *servers;       /* view { server }: when there is any, it replaces the whole list of the top-level server statements (named_config_get() finds the view's first) */
   /* beta design 7.1: DB zone source of this view. NULL/false = the global source of options { database { } } */
@@ -749,6 +757,14 @@ typedef struct server_config_s {
    * names and defaults as the database block, KARIDNS_DB_MAX_ZONE_*); a zone value replaces them */
   uint64_t max_zone_records;
   uint64_t max_zone_bytes;
+  /* batch 7: options { tcp-receive-buffer; tcp-send-buffer; } (BIND 9.20 uint32, 0 = the system's): a direction written here replaces tcp-window for it
+   * (cfg_tcp_rcvbuf() / cfg_tcp_sndbuf()).  Aliases of other options are checked against each other while they are read (alias_note). */
+  int tcp_rcvbuf, tcp_sndbuf;
+  bool tcp_rcvbuf_set, tcp_sndbuf_set;
+  struct { char name[24]; long v; char loc[64]; } alias_note[3];   /* udp-bufsize / max-udp-size, udp-recvbuf-size / udp-receive-buffer, udp-sndbuf-size / udp-send-buffer */
+  bool require_server_cookie;   /* options { require-server-cookie }: a UDP query with a client cookie but no valid server cookie gets BADCOOKIE (RFC 7873 §5.2.3) */
+  char **catz_names; int catz_count;   /* options { catalog-zones { zone "name"; } }: names of zones (of every view) that are catalog zones */
+  bool any_view_max_udp, any_view_cookie;   /* some view writes max-udp-size / require-server-cookie (set when the parse ends): the query path then looks the view up */
   int tcp_mss;              /* TCP_MAXSEG。accept 直後に各接続へ設定 (送信 MSS を下げる方向のみ) */
   int tcp_window;           /* SO_RCVBUF と SO_SNDBUF。listen() 前に設定し accept 済みソケットへ
                              * 継承させる。listen ソケットは reload で作り直さないため再起動が必要 */
@@ -768,6 +784,14 @@ typedef struct server_config_s {
   int alias_resolvers_count;
   _Atomic int reader_count;
 } server_config_t;
+
+/* The receive / send buffer of the TCP sockets: tcp-receive-buffer / tcp-send-buffer when written, else tcp-window (0 = the system's) */
+static inline int cfg_tcp_rcvbuf(const server_config_t *c) { return c->tcp_rcvbuf_set ? c->tcp_rcvbuf : c->tcp_window; }
+static inline int cfg_tcp_sndbuf(const server_config_t *c) { return c->tcp_sndbuf_set ? c->tcp_sndbuf : c->tcp_window; }
+/* The view of that name (NULL = none, or name NULL / empty) */
+const view_config_t *config_find_view(const server_config_t *cfg, const char *name);
+/* require-server-cookie for the clients of a view: the view's statement, else options' */
+bool config_require_server_cookie(const server_config_t *cfg, const char *view_name);
 
 /* B7a: the first TSIG key name that the settings x of a DB zone name (allow-transfer key, allow-update name, tsig-key) and
  * cfg does not define in a key {} block, or NULL when all exist */

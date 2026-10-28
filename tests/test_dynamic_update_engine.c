@@ -2553,9 +2553,102 @@ static void test_serial_update_methods(void) {
     printf("  -> serial-update-method and the zone size limits passed.\n");
 }
 
+/* ---- update-policy through handle_dynamic_update() (BIND 9.20 lib/ns/update.c: a change that no rule grants makes the whole UPDATE REFUSED;
+ * deleting every RRset of a name checks each type found there, ssu_checkall()) ---- */
+static size_t upd_rr_pkt(uint8_t *pkt, const char *label, uint16_t cls, uint16_t type, uint32_t ttl, const uint8_t *rdata, size_t rdlen) {
+    memset(pkt, 0, 512);
+    pkt[0] = 0x12; pkt[1] = 0x77; pkt[2] = 0x28; pkt[5] = 1; pkt[9] = 1;
+    size_t off = 12;
+    static const uint8_t zname[] = { 7, 'e','x','a','m','p','l','e', 3, 'c','o','m', 0 };
+    memcpy(&pkt[off], zname, sizeof(zname)); off += sizeof(zname);
+    pkt[off++] = 0; pkt[off++] = 6; pkt[off++] = 0; pkt[off++] = 1;
+    pkt[off++] = (uint8_t)strlen(label); memcpy(&pkt[off], label, strlen(label)); off += strlen(label);
+    memcpy(&pkt[off], zname, sizeof(zname)); off += sizeof(zname);
+    pkt[off++] = (uint8_t)(type >> 8); pkt[off++] = (uint8_t)type;
+    pkt[off++] = (uint8_t)(cls >> 8); pkt[off++] = (uint8_t)cls;
+    pkt[off++] = (uint8_t)(ttl >> 24); pkt[off++] = (uint8_t)(ttl >> 16); pkt[off++] = (uint8_t)(ttl >> 8); pkt[off++] = (uint8_t)ttl;
+    pkt[off++] = (uint8_t)(rdlen >> 8); pkt[off++] = (uint8_t)rdlen;
+    if (rdlen) { memcpy(&pkt[off], rdata, rdlen); off += rdlen; }
+    return off;
+}
+
+static void test_update_policy_pipeline(void) {
+    printf("[TEST] Dynamic Update: update-policy decides each change...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strncpy(entry.domain, "example.com.", sizeof(entry.domain) - 1);
+    strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+    init_sample_zone_arena(test_zone_slot(&entry, 0), "example.com.", "1000");
+    atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
+    atomic_store_explicit(&entry.serial, 1000, memory_order_release);
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    view_config_t view_cfg;
+    memset(&view_cfg, 0, sizeof(view_cfg));
+    view_cfg.name = "default";
+    zone_config_t zcfg;
+    memset(&zcfg, 0, sizeof(zcfg));
+    zcfg.domain = "example.com.";
+    zcfg.type = "master";
+    update_policy_t *pol = calloc(1, sizeof(*pol));
+    tzx(&zcfg)->upd_policy = pol;
+    view_cfg.zones = &zcfg;
+    cfg.views = &view_cfg;
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    /* grant upd zonesub A TXT; */
+    pol->count = 1;
+    pol->rules[0].grant = true;
+    pol->rules[0].mtype = UPD_SUBDOMAIN;
+    snprintf(pol->rules[0].identity, sizeof(pol->rules[0].identity), "upd");
+    snprintf(pol->rules[0].name, sizeof(pol->rules[0].name), "example.com.");
+    pol->rules[0].ntypes = 2;
+    pol->rules[0].types[0] = 1;
+    pol->rules[0].types[1] = 16;
+
+    uint8_t pkt[512];
+    static const uint8_t a_rdata[4] = { 192, 0, 2, 1 };
+    static const uint8_t txt_rdata[2] = { 1, 'x' };
+    size_t off = upd_rr_pkt(pkt, "www", 1, 1, 300, a_rdata, 4);
+    assert(handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "other") == 5);                 /* the key is not the identity of a rule */
+    assert(atomic_load_explicit(&entry.rcu.active, memory_order_acquire)->image->n_rrs == 1);
+    assert(handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "upd") == 0);
+    off = upd_rr_pkt(pkt, "www", 1, 16, 300, txt_rdata, 2);
+    assert(handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "upd") == 0);                   /* TXT is in the list */
+    assert(atomic_load_explicit(&entry.rcu.active, memory_order_acquire)->image->n_rrs == 3);
+    static const uint8_t mx_rdata[3] = { 0, 10, 0 };
+    off = upd_rr_pkt(pkt, "www", 1, 15, 300, mx_rdata, 3);
+    assert(handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "upd") == 5);                   /* MX is not */
+    /* delete every RRset of www: A and TXT are allowed -> done */
+    pol->rules[0].ntypes = 1;                                                                    /* now only A */
+    off = upd_rr_pkt(pkt, "www", 255, 255, 0, NULL, 0);
+    assert(handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "upd") == 5);                   /* TXT at www is not granted: nothing is deleted */
+    assert(atomic_load_explicit(&entry.rcu.active, memory_order_acquire)->image->n_rrs == 3);
+    pol->rules[0].ntypes = 2;
+    assert(handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "upd") == 0);
+    assert(atomic_load_explicit(&entry.rcu.active, memory_order_acquire)->image->n_rrs == 1);
+    /* deleting a name that has nothing: nothing to check */
+    off = upd_rr_pkt(pkt, "nothing", 255, 255, 0, NULL, 0);
+    assert(handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "upd") == 0);
+    /* an empty policy refuses everything */
+    pol->count = 0;
+    off = upd_rr_pkt(pkt, "www", 1, 1, 300, a_rdata, 4);
+    assert(handle_dynamic_update(pkt, off, &entry, "127.0.0.1", "upd") == 5);
+
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
+    free(pol);
+    zone_arena_destroy(test_zone_slot(&entry, 0));
+    pthread_mutex_destroy(&entry.writer_lock);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    printf("  -> update-policy passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Dynamic Update Engine Unit Tests ===\n");
     test_serial_update_methods();
+    test_update_policy_pipeline();
     test_bump_soa_serial();
     test_process_update_sections_records();
     test_process_update_sections_apex_ns_protection();

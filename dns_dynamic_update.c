@@ -127,7 +127,8 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   zone_limits_effective(cfg_now, zcfg_now, entry->view_name, &limits);
 
   update_result_t result;
-  int rcode = process_update_sections(req, req_len, entry->domain, z_standby, &result);
+  int rcode = process_update_sections_policy(req, req_len, entry->domain, z_standby, &result, zcfg_now ? zext(zcfg_now)->upd_policy : NULL,
+                                              matched_key_name);
   if (rcode != 0 || !result.changed) {
     /* エラーなら何も適用しない (RFC 2136 §3.4.2.1)。何も変わらなかった UPDATE (前提条件だけ、
      * 無視された RR や既存と同じ RR だけ) はシリアルを上げず、公開も NOTIFY もしない (§3.6)。*/

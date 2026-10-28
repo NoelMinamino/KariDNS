@@ -2972,8 +2972,12 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
    * 範囲はパーサで 512..4096 に制限済み (呼び出し側の UDP 応答バッファは >= 4096)。 */
   if (matched_zcfg && zext(matched_zcfg)->zone_udp_bufsize > 0)
     edns.server_udp_size = zext(matched_zcfg)->zone_udp_bufsize;
-  else if (cfg && cfg->udp_bufsize > 0)
-    edns.server_udp_size = cfg->udp_bufsize;
+  else {
+    /* view { max-udp-size } replaces options' for the clients of the view (only looked up when some view writes it) */
+    const view_config_t *vcfg = (cfg && cfg->any_view_max_udp && view) ? config_find_view(cfg, view->name) : NULL;
+    if (vcfg && vcfg->max_udp_size) edns.server_udp_size = vcfg->max_udp_size;
+    else if (cfg && cfg->udp_bufsize > 0) edns.server_udp_size = cfg->udp_bufsize;
+  }
 
   if (out_matched_entry) *out_matched_entry = db_entry;
   if (db_entry) {
@@ -3194,7 +3198,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         }
       }
       /* the address list, the named keys, update-acl-match and (DB zones) acl-ceiling: dns_tsig_acl.c */
-      if (zcfg) auth = zone_update_acl_allows_in_view(cfg, zcfg, view->name, client_ip, tkey ? tkey->name : NULL);
+      /* update-policy replaces allow-update: the UPDATE must be signed, and the rules decide each change (handle_dynamic_update()) */
+      if (zcfg) auth = zext(zcfg)->upd_policy ? tkey != NULL : zone_update_acl_allows_in_view(cfg, zcfg, view->name, client_ip, tkey ? tkey->name : NULL);
     }
 
     int rcode = 5; // REFUSED
@@ -3261,6 +3266,12 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       bool need_new_cookie = false;
       if (edns.server_cookie_len == 0) {
           need_new_cookie = true;               // client-only cookie: hand out a Server Cookie
+          /* require-server-cookie (BIND lib/ns/query.c ns__query_start()): a UDP query that carries a client cookie but no valid server cookie gets
+           * BADCOOKIE, with a new server cookie to repeat the query with (RFC 7873 §5.2.3); a query without a cookie option is answered as usual */
+          if (!is_tcp && config_require_server_cookie(cfg, view ? view->name : NULL)) {
+              is_badcookie = true;
+              ext_rcode_out = 1;
+          }
       } else {
           // RFC 9018 §4.2-4.4: SipHash-2-4, Reserved hashed as received, RFC 1982 timestamp window
           server_cookie_status_t cst = verify_server_cookie(cfg, client_ip, edns.client_cookie,
