@@ -356,6 +356,8 @@ void free_zone_db_snapshot(zone_db_snapshot_t *snap) {
         free(snap->views[v].match_clients_parsed);
         snap->views[v].match_clients_parsed = NULL;
       }
+      aml_unref(snap->views[v].match_aml);   /* NULL is fine */
+      snap->views[v].match_aml = NULL;
       if (snap->views[v].hash_table) {
         free(snap->views[v].hash_table);
         snap->views[v].hash_table = NULL;
@@ -1679,12 +1681,14 @@ static void view_incr_add(view_snapshot_t *vs, size_t *n, zone_db_entry_t *e) {
 }
 
 /* The match-clients of a view snapshot from a list of names (the view's configuration, or the view of the snapshot being
- * replaced): copies of the names and the parsed ACL.  false: out of memory (what was allocated stays for
- * free_zone_db_snapshot() to release). */
-static bool view_set_match_clients(view_snapshot_t *vs, char *const *names, int count) {
+ * replaced): copies of the names and the parsed ACL.  aml: the list as written; only one with a `key` element is kept (a reference,
+ * select_view_req() evaluates it with the TSIG key of the request; the names are empty for it).  false: out of memory (what was allocated
+ * stays for free_zone_db_snapshot() to release). */
+static bool view_set_match_clients(view_snapshot_t *vs, char *const *names, int count, aml_t *aml) {
     vs->match_clients_count = count;
     vs->match_clients = NULL;
     vs->match_clients_parsed = NULL;
+    vs->match_aml = (aml && aml->has_key) ? aml_ref(aml) : NULL;
     if (count <= 0) return true;
     vs->match_clients = calloc(count, sizeof(char *));
     if (!vs->match_clients) return false;
@@ -1722,7 +1726,7 @@ int snapshot_apply_db_delta(void) {
         view_snapshot_t *ov = &old_snap->views[v];
         view_snapshot_t *vs = &ns->views[v];
         vs->name = strdup(ov->name ? ov->name : "");
-        bool ok = vs->name != NULL && view_set_match_clients(vs, ov->match_clients, ov->match_clients_count);
+        bool ok = vs->name != NULL && view_set_match_clients(vs, ov->match_clients, ov->match_clients_count, ov->match_aml);
         vs->static_count = ov->static_count;
         vs->shared_count = ov->shared_count;
         dbreg_view_t *rv = ok ? dbreg_view_get(vs->name, false) : NULL;
@@ -2291,7 +2295,7 @@ static bool snapshot_views_reusable(zone_db_snapshot_t *old_snap, server_config_
 static bool view_copy_from_old(view_snapshot_t *vs, const view_config_t *v, const view_snapshot_t *ov, server_config_t *cfg,
                                bool depth_all) {
     vs->name = strdup(v->name ? v->name : "");
-    if (!vs->name || !view_set_match_clients(vs, v->match_clients, v->match_clients_count)) return false;
+    if (!vs->name || !view_set_match_clients(vs, v->match_clients, v->match_clients_count, v->acl.match)) return false;
     size_t n = ov->zone_count;
     vs->entries = malloc((n ? n : 1) * sizeof(*vs->entries));
     if (!vs->entries) return false;
@@ -2497,7 +2501,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 abort_rebuild_snapshot(new_snap, "vs->name");
                 return NULL;
             }
-            if (!view_set_match_clients(vs, v->match_clients, v->match_clients_count)) {
+            if (!view_set_match_clients(vs, v->match_clients, v->match_clients_count, v->acl.match)) {
                 { free(valid_members); free(vm_ht); free(vm_chain); }
                 abort_rebuild_snapshot(new_snap, "vs->match_clients");
                 return NULL;
@@ -2853,15 +2857,22 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 }
             }
             bool has_master = catalog_cfg && zext(catalog_cfg)->masters_count > 0 && zext(catalog_cfg)->masters[0].ip != NULL;
-            const char *cat_key = catalog_cfg ? zone_primary_key(zext(catalog_cfg), 0) : NULL; /* the primary's own key, else the zone's */
-            if (has_master || cat_key) {
+            /* the key written on the first primaries element and the zone's tsig-key are kept apart: xfr_build_primaries() ranks them with the key of
+             * the server statement that covers the primary (peer_key_name(): element, server statement, zone) */
+            const char *elem_key = has_master ? zext(catalog_cfg)->masters[0].key : NULL;
+            const char *zone_key = catalog_cfg ? zext(catalog_cfg)->tsig_key : NULL;
+            if (elem_key && !elem_key[0]) elem_key = NULL;
+            if (zone_key && !zone_key[0]) zone_key = NULL;
+            if (has_master || zone_key) {
                 entry->catalog_master = calloc(1, sizeof(*entry->catalog_master));
                 if (entry->catalog_master && has_master) {
                     strncpy(entry->catalog_master->ip, zext(catalog_cfg)->masters[0].ip, sizeof(entry->catalog_master->ip) - 1);
                     entry->catalog_master->port = zext(catalog_cfg)->masters[0].port;
                 }
-                if (entry->catalog_master && cat_key)
-                    strncpy(entry->catalog_master->tsig_key, cat_key, sizeof(entry->catalog_master->tsig_key) - 1);
+                if (entry->catalog_master && elem_key)
+                    strncpy(entry->catalog_master->key, elem_key, sizeof(entry->catalog_master->key) - 1);
+                if (entry->catalog_master && zone_key)
+                    strncpy(entry->catalog_master->zone_key, zone_key, sizeof(entry->catalog_master->zone_key) - 1);
             }
             atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
             new_entries[actual_added_count++] = entry;
@@ -2922,7 +2933,8 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     abort_rebuild_snapshot(new_snap, "catalog vs->name");
                     return NULL;
                 }
-                if (!view_set_match_clients(vs, old_snap->views[v].match_clients, old_snap->views[v].match_clients_count)) {
+                if (!view_set_match_clients(vs, old_snap->views[v].match_clients, old_snap->views[v].match_clients_count,
+                                            old_snap->views[v].match_aml)) {
                     if (del_hash_table) free(del_hash_table);
                     if (del_chain_next) free(del_chain_next);
                     for (int k = 0; k < actual_added_count; k++) {

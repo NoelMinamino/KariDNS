@@ -1013,6 +1013,7 @@ static int in_view_resolve(token_ctx_t *ctx, server_config_t *cfg) {
 
 /* After the parse: every list resolved, acl_query_active set, and transfer-acl-match / update-acl-match any / all refused where the
  * list that applies has a negated key (the flat evaluation of those settings cannot say "not signed with k"). */
+static void view_shadow_warn(const server_config_t *cfg);
 static int resolve_all_acl_lists(token_ctx_t *ctx, server_config_t *cfg) {
   for (acl_def_t *a = cfg->acls; a; a = a->next)
     if (acl_def_resolve(ctx, cfg, a, NULL) != 0) return -1;
@@ -1026,6 +1027,7 @@ static int resolve_all_acl_lists(token_ctx_t *ctx, server_config_t *cfg) {
     ctx->scope_keys = NULL;
     if (v->acl.query || v->acl.query_on) cfg->acl_query_active = true;
   }
+  view_shadow_warn(cfg);
   for (view_config_t *v = cfg->views; v; v = v->next) {
     ctx->scope_keys = v->keys;
     for (zone_config_t *z = v->zones; z; z = z->next) {
@@ -1471,7 +1473,7 @@ static int parse_string_list(token_ctx_t *ctx, char ***list, int *count) {
   return parse_string_list_inner(ctx, list, count);
 }
 
-typedef enum { ACL_KEY_AS_LIST_ENTRY, ACL_KEY_AS_TSIG_FIELD, ACL_KEY_REJECT, ACL_KEY_MARKED } acl_key_mode_t;
+typedef enum { ACL_KEY_AS_LIST_ENTRY, ACL_KEY_AS_TSIG_FIELD, ACL_KEY_MARKED } acl_key_mode_t;
 
 static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
                            acl_key_mode_t key_mode, char ***tsig_keys_out, int *tsig_keys_count_out) {
@@ -1504,14 +1506,6 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
 
         if (strcmp(tok.value, "key") == 0) {
             free_token(&tok);
-            if (key_mode == ACL_KEY_REJECT) {
-                /* match-clients はクライアントアドレスだけで評価する。key を受け付けると
-                 * 何にもマッチしないエントリーが黙って残るので、設定エラーにする。 */
-                syslog(LOG_ERR, "[Config] 'key' entries are not supported in match-clients (address match only)");
-                fprintf(stderr, "[ERROR] 'key' entries are not supported in match-clients (address match only)\n");
-                if (ctx) ctx->error_occurred = true;
-                return -1;
-            }
             tok = get_next_token(ctx);
             if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
             char *val = tok.value;
@@ -1819,6 +1813,11 @@ void config_set_port_override(int port) {
   g_port_override = (port > 0 && port <= 65535) ? port : 0;
 }
 
+int config_target_port(const server_config_t *cfg, int port) {
+  if (port > 0) return port;
+  return cfg && cfg->dst_port > 0 ? cfg->dst_port : 53;
+}
+
 static void conf_warn_loc(const char *loc, const char *what, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 static void conf_warn_loc(const char *loc, const char *what, const char *fmt, ...) {
   char msg[300];
@@ -1828,6 +1827,45 @@ static void conf_warn_loc(const char *loc, const char *what, const char *fmt, ..
   va_end(ap);
   syslog(LOG_WARNING, "[Config] %s: %s: %s", loc, what, msg);
   fprintf(stderr, "[WARNING] %s: %s: %s\n", loc, what, msg);
+}
+
+/* Does the list surely match every client, whatever its address and TSIG key?  Deliberately conservative: a non-negated `any`, a non-negated
+ * nested list or acl that does, or both 0.0.0.0/0 and ::/0, before any negated element.  Key, none, localhost and other prefixes are passed over
+ * (they cannot stop a later `any` from matching). */
+static bool aml_matches_all(const aml_t *l, int depth) {
+  if (!l || depth > AML_MAX_DEPTH) return false;
+  bool v4 = false, v6 = false;
+  for (int i = 0; i < l->count; i++) {
+    const aml_elem_t *e = &l->elems[i];
+    if (e->neg) return false;
+    if (e->kind == AML_E_ANY) return true;
+    if (e->kind == AML_E_LIST && aml_matches_all(e->u.list, depth + 1)) return true;
+    if (e->kind == AML_E_NET && e->u.net.valid && e->u.net.prefix == 0) {
+      if (e->u.net.is_any) return true;
+      if (e->u.net.family == AF_INET) v4 = true;
+      else if (e->u.net.family == AF_INET6) v6 = true;
+      if (v4 && v6) return true;
+    }
+  }
+  return false;
+}
+
+/* KariDNS warning (BIND says nothing): a view whose match-clients names a `key` is chosen only when no earlier view matched, so it can never be
+ * chosen for a client that an earlier view matches whatever it sends.  The views are tried in the order written (BIND get_matching_view_sync()).
+ * A view without match-clients matches every client. */
+static void view_shadow_warn(const server_config_t *cfg) {
+  const view_config_t *all = NULL;   /* the first view that matches every client */
+  for (const view_config_t *v = cfg->views; v; v = v->next) {
+    if (all && v->acl.match && v->acl.match->has_key) {
+      char what[KARIDNS_VIEW_NAME_MAX + 32];
+      snprintf(what, sizeof(what), "view '%s' match-clients", v->name);
+      conf_warn_loc(v->match_loc[0] ? v->match_loc : "karidns.conf", what,
+                    "KariDNS warning (BIND does not check this): this list names a key, but the view '%.64s' (%s) comes first and matches every "
+                    "client, so this view can never be chosen; write it before '%.64s'",
+                    all->name, all->acl.match ? all->match_loc : "no match-clients", all->name);
+    }
+    if (!all && ((!v->acl.match && v->match_clients_count == 0) || aml_matches_all(v->acl.match, 0))) all = v;
+  }
 }
 
 /* bind-address elements must be IPv4 or IPv6 addresses: a typo used to bind nothing, silently (bind_address_loc says where they were read). */
@@ -2643,8 +2681,10 @@ static int parse_notify_targets(token_ctx_t *ctx, const char *what, notify_targe
     notify_target_t *e = &(*list)[i];
     /* An address without a port takes the `port` of its list; when the list has none either, the port stays 0 until expand_targets() knows
      * the lists this one is named in (BIND getipandkeylist(): an element of a nested list without a port takes the outer list's port),
-     * and then 53.  A list name keeps the `port` of the statement it is written in for the same reason.  A database zone has no lists. */
-    if (e->ip && e->port == 0) e->port = defport ? defport : (ctx->restricted ? 53 : 0);
+     * and then options { port } (config_target_port(); the statement may be written before options).  A list name keeps the `port` of the
+     * statement it is written in for the same reason.  A database zone has no lists and no options: the port stays 0 and the users of the
+     * element call config_target_port(). */
+    if (e->ip && e->port == 0) e->port = defport;
     else if (e->list) e->port = defport;
     /* a list name keeps the sources of the list it names (expand_targets()); only the addresses written here get this statement's */
     if (e->ip) {
@@ -6333,7 +6373,7 @@ static int expand_targets(token_ctx_t *ctx, const server_config_t *cfg, const ch
     memset(t, 0, sizeof(*t));
     (*outn)++;
     t->ip = strdup(s->ip);
-    t->port = s->port ? s->port : (inherit_port ? inherit_port : 53);   /* the list's port, else the enclosing list's (BIND getipandkeylist()), else 53 */
+    t->port = s->port ? s->port : (inherit_port ? inherit_port : config_target_port(cfg, 0));   /* the list's port, else the enclosing list's (BIND getipandkeylist()), else options { port } */
     if (key) t->key = strdup(key);
     memcpy(t->src_set, s->src_set, sizeof(t->src_set));
     memcpy(t->src, s->src, sizeof(t->src));
@@ -7471,6 +7511,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   int nr_rc = 0;
   memset(config, 0, sizeof(server_config_t));
   config->port = 53;
+  config->dst_port = 53;
   config->bind_addresses = NULL;
   config->bind_address_count = 0;
   config->zones = NULL;
@@ -7574,6 +7615,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
               return -1;
             }
             config->port = (int)pval;
+            config->dst_port = (int)pval;   /* the default port of the lists (config_target_port()); -p changes config->port, not this */
             free(val);
           } else if (strcmp(key, "directory") == 0) {
             /* BIND 9.20 ARM: "This sets the working directory of the server"; every relative path of the configuration is relative to
@@ -8227,24 +8269,24 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           free_token(&tok);
           char mwhat[KARIDNS_VIEW_NAME_MAX + 32];
           snprintf(mwhat, sizeof(mwhat), "view '%s' match-clients", view->name);
+          ctx_location(ctx, view->match_loc, sizeof(view->match_loc));
           if (parse_aml_slot(ctx, mwhat, &view->acl.match) != 0) {
             free_partial_view(view);
             return -1;
           }
-          /* match-clients is evaluated on the client address alone: a `key` element would never match, which is a mistake to report */
-          if (aml_tree_has_key(view->acl.match, 0)) {
-            conf_error(ctx, mwhat, "'key' entries are not supported in match-clients (address match only)");
-            free_partial_view(view);
-            return -1;
+          /* A list with a `key` element (BIND 9.20 get_matching_view_sync(): dns_acl_allowed(srcaddr, tsig identity, matchclients)) is evaluated
+           * with the TSIG key of the request by aml_match() (select_view_req()): the flat address lists are not built for it.  A key that comes
+           * in through a named acl is found when the names are resolved (the end of the parse). */
+          if (!aml_tree_has_key(view->acl.match, 0)) {
+            bool mclients_inexact = false;
+            if (aml_flatten(ctx, view->acl.match, false, ACL_KEY_AS_LIST_ENTRY, &view->match_clients, &view->match_clients_count,
+                            NULL, NULL, &mclients_inexact, 0) != 0) {
+              free_partial_view(view);
+              return -1;
+            }
+            free(view->match_clients_parsed);
+            view->match_clients_parsed = acl_list_parse(view->match_clients, view->match_clients_count);
           }
-          bool mclients_inexact = false;
-          if (aml_flatten(ctx, view->acl.match, false, ACL_KEY_REJECT, &view->match_clients, &view->match_clients_count,
-                          NULL, NULL, &mclients_inexact, 0) != 0) {
-            free_partial_view(view);
-            return -1;
-          }
-          free(view->match_clients_parsed);
-          view->match_clients_parsed = acl_list_parse(view->match_clients, view->match_clients_count);
         } else if (strcmp(tok.value, "notify") == 0) {
           free_token(&tok);
           char nwhat[KARIDNS_VIEW_NAME_MAX + 32];
@@ -8771,9 +8813,18 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
     for (view_config_t *v = config->views; v; v = v->next) {
       ctx->scope_keys = v->keys;
       snprintf(where, sizeof(where), "view '%s' match-clients", v->name);
-      if (acl_expand_field(ctx, config, where, ACL_USE_ADDRESS, &v->match_clients, &v->match_clients_count,
-                           &v->match_clients_parsed, NULL, NULL) != 0)
+      if (v->acl.match && v->acl.match->has_key) {
+        /* chosen with the TSIG key of the request (aml_match()); a name that was kept in the flat list is not expanded */
+        for (int i = 0; i < v->match_clients_count; i++) free(v->match_clients[i]);
+        free(v->match_clients);
+        free(v->match_clients_parsed);
+        v->match_clients = NULL;
+        v->match_clients_parsed = NULL;
+        v->match_clients_count = 0;
+      } else if (acl_expand_field(ctx, config, where, ACL_USE_ADDRESS, &v->match_clients, &v->match_clients_count,
+                                  &v->match_clients_parsed, NULL, NULL) != 0) {
         return -1;
+      }
       for (zone_config_t *z = v->zones; z; z = z->next) {
         zone_ext_t *zx = z->ext; /* ext が無いゾーンは ACL を 1 つも持たない */
         if (!zx) continue;

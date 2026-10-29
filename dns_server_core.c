@@ -1814,8 +1814,8 @@ static void xfr_primary_setup(const server_config_t *active, const zone_config_t
  * and a database secondary list them in their zone settings; a catalog member takes the primaries of its catalog zone (all of them; the
  * single copy kept in the entry when the member was created is the fallback).  The options (timers, multi-master, request-ixfr, sources)
  * are those of the zone, else of the catalog zone for a member, then the view's and options'. */
-static void xfr_build_primaries(server_config_t *active, zone_db_snapshot_t *snap, const zone_db_entry_t *entry,
-                                const zone_config_t *zcfg, axfr_bg_ctx_t *ctx) {
+STATIC_TEST void xfr_build_primaries(server_config_t *active, zone_db_snapshot_t *snap, const zone_db_entry_t *entry,
+                                     const zone_config_t *zcfg, axfr_bg_ctx_t *ctx) {
   const zone_config_t *mcfg = zcfg;
   if (entry->is_catalog_member) {
     mcfg = NULL;
@@ -1836,7 +1836,7 @@ static void xfr_build_primaries(server_config_t *active, zone_db_snapshot_t *sna
       if (!x->masters[i].ip) continue;
       xfr_primary_t *p = &ctx->prim[n++];
       strlcpy(p->ip, x->masters[i].ip, sizeof(p->ip));
-      p->port = x->masters[i].port;
+      p->port = config_target_port(active, x->masters[i].port);   /* a database zone leaves 0 for an element without a port: options { port } */
       xfr_primary_setup(active, mcfg, entry->view_name, x->masters[i].key, x->tsig_key, &x->masters[i], p, ctx);
     }
     if (x->masters_count > XFR_PRIMARIES_MAX)
@@ -1844,8 +1844,9 @@ static void xfr_build_primaries(server_config_t *active, zone_db_snapshot_t *sna
   } else if (entry->catalog_master && entry->catalog_master->ip[0]) {
     xfr_primary_t *p = &ctx->prim[n++];
     strlcpy(p->ip, entry->catalog_master->ip, sizeof(p->ip));
-    p->port = entry->catalog_master->port;
-    xfr_primary_setup(active, NULL, entry->view_name, entry->catalog_master->tsig_key, NULL, NULL, p, ctx);
+    p->port = config_target_port(active, entry->catalog_master->port);
+    /* the same ranking as for a listed primary (peer_key_name()): the key of the primaries element, the key of the server statement, the catalog zone's tsig-key */
+    xfr_primary_setup(active, NULL, entry->view_name, entry->catalog_master->key, entry->catalog_master->zone_key, NULL, p, ctx);
   }
   ctx->nprim = n;
 }
@@ -2193,7 +2194,10 @@ worker_startup_success:;
             /* E2: the view and the zone are looked up here once; process_dns_query_cap_routed() takes them instead of looking
              * them up again. */
             query_route_t route;
-            route.view = select_view(snap, client_ip);
+            tsig_request_t route_tsig;   /* written only when a view with `match-clients { key ...; }` has checked the TSIG (select_view_req()) */
+            bool route_tsig_done;
+            route.view = select_view_req(snap, acquire_config_snapshot(), client_ip, req_buf, (size_t)payload_received, &route_tsig, &route_tsig_done);
+            route.tsig = route_tsig_done ? &route_tsig : NULL;
             route.entry = route.view ? find_zone_for_query(route.view, qname, ((req_buf[2] >> 3) & 0x0F) == 0 ? qtype : 0) : NULL;
             if (route.entry && (route.entry->kind == ZONE_KIND_PROGRAM || route.entry->kind == ZONE_KIND_FORWARD)) {
               uint8_t *heap_req = malloc((size_t)payload_received);
@@ -2518,8 +2522,12 @@ process_tcp_client: ;
                              ctx_tcp->has_server_addr, IPPROTO_TCP);
 
           zone_db_snapshot_t *snap = acquire_zone_snapshot();
-          view_snapshot_t *xfr_view = select_view(snap, ctx_tcp->client_ip);
           server_config_t *cfg = acquire_config_snapshot();
+          /* the view of the request (a view whose match-clients has a `key` is matched with the TSIG key, select_view_req()); xfr_tsig is the
+           * check of the TSIG against that view's key ring when it was made, so the transfer below does not verify the MAC twice */
+          tsig_request_t xfr_tsig;
+          bool xfr_tsig_done;
+          view_snapshot_t *xfr_view = select_view_req(snap, cfg, ctx_tcp->client_ip, msg, msg_len, &xfr_tsig, &xfr_tsig_done);
           const zone_config_t *zcfg = xfr_view
               ? find_zone_config_in_view(cfg, xfr_view->name, qname)
               : NULL;
@@ -2555,7 +2563,8 @@ process_tcp_client: ;
              * TSIG のエラーは NOTAUTH、解釈できない TSIG は FORMERR。その後に allow-transfer を調べ、
              * 拒否は REFUSED。応答は tsig_finish_response() で署名する (検証できた要求には同じ鍵で)。 */
             tsig_request_t tsig;
-            tsig_check_request(cfg, xfr_view ? xfr_view->name : NULL, msg, msg_len, ctx_tcp->client_ip, &tsig);
+            if (xfr_tsig_done) tsig = xfr_tsig;
+            else tsig_check_request(cfg, xfr_view ? xfr_view->name : NULL, msg, msg_len, ctx_tcp->client_ip, &tsig);
             tsig_key_t *matched_key = (tsig.status == TSIG_REQ_VALID) ? tsig.key : NULL;
             /* X-28, RFC 6891 §6.1.3: 実装していない EDNS VERSION は、クエリ経路と同じく TSIG の検証の後、
              * allow-transfer より前に BADVERS (TSIG が正しければ署名する) */
@@ -2700,7 +2709,10 @@ process_tcp_client: ;
           } else {
             /* E2: same as the UDP path above */
             query_route_t route;
-            route.view = select_view(snap, ctx_tcp->client_ip);
+            tsig_request_t route_tsig;   /* as in the UDP path above */
+            bool route_tsig_done;
+            route.view = select_view_req(snap, acquire_config_snapshot(), ctx_tcp->client_ip, msg, msg_len, &route_tsig, &route_tsig_done);
+            route.tsig = route_tsig_done ? &route_tsig : NULL;
             route.entry = route.view ? find_zone_for_query(route.view, qname, ((msg[2] >> 3) & 0x0F) == 0 ? qtype : 0) : NULL;
             if (route.entry && (route.entry->kind == ZONE_KIND_PROGRAM || route.entry->kind == ZONE_KIND_FORWARD)) {
               /* forward / program ゾーン: 非同期 I/O スレッドへ渡すために要求を複製する

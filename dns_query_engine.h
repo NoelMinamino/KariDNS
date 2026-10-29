@@ -12,6 +12,7 @@
 #include "dns_zone_parser.h"
 #include "dns_zone_image.h"
 #include "dns_server_internal.h"
+#include "dns_tsig_acl.h"
 
 /* D-05: 直前の process_dns_query*() が応答を作ったゾーンと、答えがワイルドカードから作られたか
  * (RRL のキー)。同じスレッドで、同じスナップショットを持っている間だけ有効。 */
@@ -63,10 +64,14 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
 /* E2: the client's view and the closest zone that holds QNAME (find_zone_for_query(): QTYPE 0 for a non-QUERY opcode), when the
  * caller has already looked them up (to decide program / forward zones).  The *_routed functions take them instead of
  * looking them up again; route NULL = look them up (what the functions above do).  Valid only for the same snap, client_ip,
- * qname, qtype and opcode, inside the same read-side section.  entry may be NULL (no zone); view NULL then too. */
+ * qname, qtype and opcode, inside the same read-side section.  entry may be NULL (no zone); view NULL then too.
+ * tsig: the check of the request's TSIG against the key ring of `view` when select_view_req() has already made it (it does for a view whose
+ * match-clients has a `key`), so that the engine does not verify the same MAC again; NULL = not made (the engine checks it).  A caller that
+ * does not use select_view_req() sets it to NULL. */
 typedef struct {
   view_snapshot_t *view;
   zone_db_entry_t *entry;
+  const tsig_request_t *tsig;
 } query_route_t;
 
 /* C2: a sibling zone of the view that holds a glue target (append_glue_records(), additional-from-auth yes), and what is needed to
@@ -83,7 +88,17 @@ int process_dns_query_cap_routed(const uint8_t *req, size_t req_len, uint8_t *re
                                  bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                                  zone_db_snapshot_t *snap, const query_route_t *route);
 
+/* The view of a client by its address alone: a view whose match-clients has a `key` element is evaluated as for an unsigned request. */
 view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip);
+/* The view of a request (BIND bin/named/server.c get_matching_view_sync()): the views are tried in order, and a view whose match-clients has a
+ * `key` element is matched with the TSIG key the request verifies with in THAT view's key ring (tsig_check_request_nolog(cfg, view name, ...)):
+ * a request signed with a key the view does not know or whose MAC fails does not match `key`, and an unsigned request never does; the address
+ * elements of such a list still match it.  Views without a `key` are matched by address as select_view() does and cost the same; the TSIG is
+ * parsed only when a view of that kind is reached and the message has an additional section.  When the view returned is one of the kind
+ * with a `key` and the request carried a TSIG, *tsig_done is true and *tsig holds the check against that view (logged when it failed);
+ * otherwise *tsig_done is false and *tsig is not meaningful.  cfg may be NULL (no key is known then); tsig and tsig_done may not be NULL. */
+view_snapshot_t *select_view_req(zone_db_snapshot_t *snap, const server_config_t *cfg, const char *client_ip, const uint8_t *req,
+                                 size_t req_len, tsig_request_t *tsig, bool *tsig_done);
 bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, program_plugin_t *out);
 void spawn_program_zone_plugins(server_config_t *cfg);
 void compute_program_zone_fingerprint(const zone_config_t *z, char *out, size_t out_cap);

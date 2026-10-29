@@ -369,11 +369,14 @@ static inline zone_kind_t zone_kind_from_type(const char *type) {
   return ZONE_KIND_OTHER;
 }
 
-/* B-3: the primary a catalog member zone is transferred from (copied from the catalog zone's config when the member is added) */
+/* B-3: the primary a catalog member zone is transferred from (copied from the catalog zone's config when the member is added).  The two keys are
+ * kept apart so that the precedence of batch 5 holds here too (peer_key_name()): `key` (written on the primaries element), then the key of the
+ * `server` statement that covers the primary, then `zone_key` (the catalog zone's tsig-key).  port 0 = options { port } (config_target_port()). */
 typedef struct {
   char ip[64];
   int port;
-  char tsig_key[64];
+  char key[64];
+  char zone_key[64];
 } catalog_master_t;
 
 /* ゾーンエントリの出どころ (zone_db_entry_t.source)。ZONE_SRC_DB はまだ使われない */
@@ -481,6 +484,9 @@ typedef struct {
   char **match_clients;
   int match_clients_count;
   acl_entry_t *match_clients_parsed;
+  /* Non-NULL when the view's match-clients has a `key` element (BIND get_matching_view_sync()): select_view_req() evaluates this list with the TSIG key
+   * the request was verified with (this view's key ring), and the flat lists above are empty.  A reference (aml_ref()); released with the snapshot. */
+  aml_t *match_aml;
   zone_db_entry_t **entries;
   size_t zone_count;
   int *hash_table;

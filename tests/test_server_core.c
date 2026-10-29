@@ -35,6 +35,7 @@
 #include "test_zext.h"
 #include "dns_utils.h"
 #include "dns_query_engine.h"
+#include "dns_axfr_ixfr.h"
 #include "dns_edns_ecs.h"
 #include "dns_priv_sandbox.h"
 #include "dns_log.h"
@@ -2931,6 +2932,65 @@ static void test_active_broker_connect_loop(void) {
         }
     }
     printf("  -> active start_connect_broker passed.\n");
+}
+
+/* The primary a catalog member is transferred from when its catalog zone is not found in the snapshot (the copy kept in the entry): the key is ranked
+ * as for a listed primary (batch 5, peer_key_name()): the key of the primaries element, then the `keys` of the `server` statement that covers the
+ * primary, then the catalog zone's tsig-key; and a port that is 0 is options { port } (batch 10). */
+static void test_catalog_member_primary_key_precedence_and_port(void) {
+    printf("[TEST] Server Core: xfr_build_primaries, catalog member fallback: key precedence and options port...\n");
+    static const char *conf =
+        "options { port 5300; };\n"
+        "key \"kz\" { algorithm hmac-sha256; secret \"dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl\"; };\n"
+        "key \"ks\" { algorithm hmac-sha256; secret \"c2VydmVyLXN0YXRlbWVudC1rZXktZm9yLXRoZS10ZXN0\"; };\n"
+        "key \"ke\" { algorithm hmac-sha256; secret \"ZWxlbWVudC1rZXktZm9yLXRoZS1wcmltYXJpZXMtdGVzdA==\"; };\n"
+        "server 192.0.2.1 { keys \"ks\"; };\n";
+    server_config_t cfg;
+    assert(parse_named_conf(conf, &cfg) == 0);
+    assert(cfg.dst_port == 5300);
+
+    zone_db_entry_t *e = create_new_zone_entry("m.example.", "__default__");
+    assert(e);
+    e->is_catalog_member = true;
+    e->is_secondary = true;
+    e->catalog_master = calloc(1, sizeof(*e->catalog_master));
+    assert(e->catalog_master);
+    axfr_bg_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    assert(ctx);
+    strlcpy(ctx->domain, "m.example.", sizeof(ctx->domain));
+
+    /* the catalog zone has a tsig-key, the server statement a key: the server statement wins; no port: options { port } */
+    strlcpy(e->catalog_master->ip, "192.0.2.1", sizeof(e->catalog_master->ip));
+    strlcpy(e->catalog_master->zone_key, "kz", sizeof(e->catalog_master->zone_key));
+    xfr_build_primaries(&cfg, NULL, e, NULL, ctx);
+    assert(ctx->nprim == 1 && ctx->prim[0].port == 5300);
+    assert(ctx->prim[0].has_tsig && strcmp(ctx->prim[0].tsig_name, "ks") == 0);
+
+    /* the key written on the primaries element is above the server statement */
+    memset(ctx->prim, 0, sizeof(ctx->prim));
+    strlcpy(e->catalog_master->key, "ke", sizeof(e->catalog_master->key));
+    e->catalog_master->port = 6000;
+    xfr_build_primaries(&cfg, NULL, e, NULL, ctx);
+    assert(ctx->nprim == 1 && ctx->prim[0].port == 6000);
+    assert(ctx->prim[0].has_tsig && strcmp(ctx->prim[0].tsig_name, "ke") == 0);
+
+    /* a primary no server statement covers: the catalog zone's tsig-key */
+    memset(ctx->prim, 0, sizeof(ctx->prim));
+    e->catalog_master->key[0] = '\0';
+    strlcpy(e->catalog_master->ip, "192.0.2.9", sizeof(e->catalog_master->ip));
+    xfr_build_primaries(&cfg, NULL, e, NULL, ctx);
+    assert(ctx->nprim == 1 && ctx->prim[0].has_tsig && strcmp(ctx->prim[0].tsig_name, "kz") == 0);
+
+    /* no key anywhere: an unsigned transfer */
+    memset(ctx->prim, 0, sizeof(ctx->prim));
+    e->catalog_master->zone_key[0] = '\0';
+    xfr_build_primaries(&cfg, NULL, e, NULL, ctx);
+    assert(ctx->nprim == 1 && !ctx->prim[0].has_tsig);
+
+    free(ctx);
+    free_zone_db_entry(e);
+    free_server_config_fields(&cfg);
+    printf("  -> catalog member primary key precedence passed.\n");
 }
 
 static void test_broker_connect_opts_and_xfr_tcp_sockopts(void) {
@@ -5963,6 +6023,7 @@ int main(void) {
     test_perform_config_reload_valid_and_diff();
     test_active_broker_connect_loop();
     test_broker_connect_opts_and_xfr_tcp_sockopts();
+    test_catalog_member_primary_key_precedence_and_port();
     test_server_core_process_lifecycle_and_signals();
     test_control_multiview_and_timeout_cases();
     test_control_status_and_stats_dump();

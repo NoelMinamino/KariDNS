@@ -1153,10 +1153,14 @@ static void test_structure_and_validation(void) {
                   "view \"v\" { match-clients { any; }; zone \"b.test\" { type master; file \"z\"; }; };");
     expect_reject("view first, then top-level zone", "view \"v\" { match-clients { any; }; };"
                   "zone \"b.test\" { type master; file \"z\"; };");
-    /* match-clients is an address match list only: a key entry would never match */
-    expect_reject("key in match-clients", "key \"k1\" { algorithm hmac-sha256; secret \"c2VjcmV0\"; };"
-                  "view \"v\" { match-clients { key \"k1\"; }; zone \"b.test\" { type master; file \"z\"; }; };");
-    expect_reject("key after an address in match-clients", "view \"v\" { match-clients { 192.0.2.0/24; key k1; }; };");
+    /* match-clients takes key elements since batch 10 (the view is chosen by the TSIG key; tests/test_acl_match.c, test_snapshot_rebuild.c):
+     * the key has to be defined */
+    if (parse_ok("key \"k1\" { algorithm hmac-sha256; secret \"c2VjcmV0\"; };"
+                 "view \"v\" { match-clients { key \"k1\"; }; zone \"b.test\" { type master; file \"z\"; }; };", &cfg)) {
+        CHECK(cfg.views && cfg.views->acl.match && cfg.views->acl.match->has_key);
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("undefined key after an address in match-clients", "view \"v\" { match-clients { 192.0.2.0/24; key k1; }; };");
 
     if (parse_ok("acl \"trusted\" { 192.0.2.0/24; }; statistics-channels { inet 127.0.0.1; };"
                  "options { port 5300; }; " ZONE_MIN, &cfg)) {
@@ -1650,9 +1654,15 @@ static void test_named_acls(void) {
     expect_reject("acl named like a built-in", "acl any { 192.0.2.1; };");
     expect_reject("acl loop", "acl a { b; }; acl b { a; };"
                   "zone \"example.com\" { type master; file \"z\"; allow-transfer { a; }; };");
-    expect_reject("acl with a key used in match-clients",
-                  "key \"k1\" { algorithm hmac-sha256; secret \"" SECRET_OK "\"; }; acl k { key k1; };"
-                  "view \"v\" { match-clients { k; }; zone \"example.com\" { type master; file \"z\"; }; };");
+    {
+        /* an acl with a key used in match-clients selects the view by key (batch 10) */
+        server_config_t kcfg;
+        if (parse_ok("key \"k1\" { algorithm hmac-sha256; secret \"" SECRET_OK "\"; }; acl k { key k1; };"
+                     "view \"v\" { match-clients { k; }; zone \"example.com\" { type master; file \"z\"; }; };", &kcfg)) {
+            CHECK(kcfg.views && kcfg.views->acl.match && kcfg.views->acl.match->has_key && kcfg.views->match_clients_count == 0);
+            free_server_config_fields(&kcfg);
+        }
+    }
     expect_reject("acl with an undefined key",
                   "acl k { key nokey; }; zone \"example.com\" { type master; file \"z\"; allow-transfer { k; }; };");
     expect_reject("negated key through an acl",
@@ -1933,7 +1943,7 @@ static void test_db_settings_and_acl_match(void) {
             const zone_ext_t *x = &sh->ext;
             CHECK(x->allow_transfer_count == 3 && x->tsig_keys_count == 1 && strcmp(x->tsig_keys[0], "xfr") == 0);
             CHECK(x->allow_transfer_parsed != NULL && x->allow_update_parsed != NULL && x->allow_update_count == 2);
-            CHECK(x->also_notify_count == 2 && x->also_notify[0].port == 5300 && x->also_notify[1].port == 53);
+            CHECK(x->also_notify_count == 2 && x->also_notify[0].port == 5300 && x->also_notify[1].port == 0);   /* a database zone: no port is left to config_target_port() */
             CHECK(x->tsig_key && strcmp(x->tsig_key, "m") == 0 && x->ixfr_history_set && x->ixfr_history == 8);
             CHECK(x->notify_retry.retries == 3 && x->notify_retry.interval == 30 && x->notify_retry.backoff == NOTIFY_BACKOFF_EXPONENTIAL &&
                   x->notify_retry.tcp_timeout_set && x->notify_retry.tcp_timeout == 25);
@@ -2228,7 +2238,7 @@ static void test_acl_ceiling_match_and_masters(void) {
     /* masters and primaries in the restricted settings text */
     char err[200];
     zone_ext_shared_t *sh = db_parse_quiet("masters { 192.0.2.1 port 5300; 2001:db8::1; }; tsig-key \"k\";", err, sizeof(err));
-    CHECK(sh && sh->ext.masters_count == 2 && sh->ext.masters[0].port == 5300 && sh->ext.masters[1].port == 53 && sh->ext.masters_parsed);
+    CHECK(sh && sh->ext.masters_count == 2 && sh->ext.masters[0].port == 5300 && sh->ext.masters[1].port == 0 && sh->ext.masters_parsed);   /* no port: 0, options { port } where it is used */
     if (sh) zone_ext_shared_unref(sh);
     sh = db_parse_quiet("primaries { 192.0.2.7; };", err, sizeof(err));
     CHECK(sh && sh->ext.masters_count == 1 && strcmp(sh->ext.masters[0].ip, "192.0.2.7") == 0);

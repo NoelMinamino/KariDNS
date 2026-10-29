@@ -2256,7 +2256,7 @@ static void secondary_status(status_ctx_t *c, const zone_db_entry_t *e, const zo
   const zone_ext_t *x = dc->ext;
   st_append(c, "  type: %s, masters", dc->is_catalog ? "catalog consumer (CONSUMER)" : "secondary (SLAVE)");
   for (int i = 0; x && i < x->masters_count && i < 8; i++)
-    st_append(c, "%s%.64s port %d", i ? ", " : " ", x->masters[i].ip ? x->masters[i].ip : "?", x->masters[i].port);
+    st_append(c, "%s%.64s port %d", i ? ", " : " ", x->masters[i].ip ? x->masters[i].ip : "?", config_target_port(c->cfg, x->masters[i].port));
   if (x && x->masters_count > 8) st_append(c, ", ... (%d entries; only the first is used for transfers)", x->masters_count);
   if (x && x->tsig_key) st_append(c, ", TSIG key '%.64s'", x->tsig_key);
   st_append(c, "\n");

@@ -68,6 +68,8 @@ int aml_match(const aml_t *l, const aml_subject_t *s);
 bool aml_allows(const aml_t *l, const aml_subject_t *s);   /* aml_match() > 0 */
 /* the address elements alone (key elements never match): what transfer-acl-match / update-acl-match any / all call "the addresses" */
 bool aml_allows_addr(const aml_t *l, const aml_subject_t *s);
+/* aml_allows() for the client address as text (NULL or not an address: no address) and the TSIG key it was verified with (NULL: not signed) */
+bool aml_allows_ip(const aml_t *l, const char *ip, const char *key);
 /* does the list name this TSIG key in a non-negated key element? */
 bool aml_key_listed(const aml_t *l, const char *key_name);
 
@@ -156,6 +158,10 @@ typedef struct {
  * client_ip はログ用 (NULL 可)。 */
 void tsig_check_request(const server_config_t *cfg, const char *view_name, const uint8_t *req, size_t req_len, const char *client_ip,
                         tsig_request_t *t);
+/* tsig_check_request() in two parts: the check alone (what view selection by `match-clients { key ...; }` tries once for each such view, and
+ * logs nothing for the views it does not choose), and the log line of a request that failed (TSIG_REQ_ERROR, TSIG_REQ_FORMERR; RFC 8945 §5.2). */
+void tsig_check_request_nolog(const server_config_t *cfg, const char *view_name, const uint8_t *req, size_t req_len, tsig_request_t *t);
+void tsig_log_request_error(const tsig_request_t *t, const char *client_ip);
 /* 応答に付ける TSIG RR の最大バイト数 (VALID と BADTIME/BADTRUNC のときに応答の上限から差し引く)。 */
 size_t tsig_response_reserve(const tsig_request_t *t);
 /* 応答 res[0..res_len) に t に従って TSIG を付ける。NONE と FORMERR はそのまま。

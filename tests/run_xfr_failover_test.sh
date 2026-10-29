@@ -7,7 +7,7 @@
 #      ahead; an up-to-date answer does not stop the search for a primary that is ahead (multi-master secondary ends at the newest serial)
 #   C  min/max-refresh-time and min/max-retry-time hold the SOA's values (zonestatus shows what the zone uses; the expire timer is
 #      raised to refresh + retry)
-#   I  request-ixfr no (SOA first, AXFR only when the primary is ahead), provide-ixfr no (an IXFR is answered with the whole zone),
+#   I  request-ixfr no (SOA first, AXFR only when the primary is ahead), provide-ixfr no (a client that is behind gets the whole zone, one that is up to date the one SOA),
 #      request-expire no (the transfer request has no EXPIRE option; a mock primary logs it)
 #   S  max-transfer-idle-in and max-transfer-time-in give up a stalled / endless transfer (KARIDNS_XFER_MINUTE_SECS makes a "minute" a
 #      few seconds), transfers-in 1 starts one inbound transfer at a time
@@ -172,12 +172,17 @@ start p3
 kari_wait_answer "$DAG" "$P3" r.test. || true
 n=$("$DAG" @127.0.0.1 -p "$P3" r.test IXFR=5 +nohexdump +short +tcp 2>/dev/null | wc -l | tr -d ' ')
 m=$("$DAG" @127.0.0.1 -p "$P3" pn.test IXFR=5 +nohexdump +short +tcp 2>/dev/null | wc -l | tr -d ' ')
-if [ "$n" -eq 1 ] && [ "$m" -ge 3 ]; then pass "I1: provide-ixfr: an IXFR from the serial the zone has gets the one SOA ($n line), with provide-ixfr no the whole zone ($m lines)"
-else fail "I1: IXFR answers: default $n line(s) (expected 1), provide-ixfr no $m line(s) (expected >= 3)"; fi
+mo=$("$DAG" @127.0.0.1 -p "$P3" pn.test IXFR=4 +nohexdump +short +tcp 2>/dev/null | wc -l | tr -d ' ')
+no=$("$DAG" @127.0.0.1 -p "$P3" r.test IXFR=4 +nohexdump +short +tcp 2>/dev/null | wc -l | tr -d ' ')
+# BIND ns_xfr_start(): the up-to-date test (DNS_SERIAL_GE, "IXFR poll") comes before provide-ixfr, so provide-ixfr no answers a client that already has
+# the serial with the one SOA too; only a client that is behind gets the whole zone (an AXFR-style IXFR, RFC 1995 §4)
+if [ "$n" -eq 1 ] && [ "$m" -eq 1 ] && [ "$mo" -ge 3 ] && [ "$no" -ge 3 ]; then pass "I1: provide-ixfr: an IXFR from the serial the zone has gets the one SOA ($n line; with provide-ixfr no $m line); a client that is behind gets the whole zone with provide-ixfr no ($mo lines) and with no history ($no lines)"
+else fail "I1: IXFR answers: current serial default $n / provide-ixfr no $m line(s) (expected 1 and 1), older serial provide-ixfr no $mo / default $no (expected >= 3)"; fi
 tcn=$("$DAG" @127.0.0.1 -p "$P3" r.test IXFR=5 +notcp +nohexdump 2>&1 | grep -c "Truncated, retrying in TCP mode")
 tcp=$("$DAG" @127.0.0.1 -p "$P3" pn.test IXFR=5 +notcp +nohexdump 2>&1 | grep -c "Truncated, retrying in TCP mode")
-if [ "$tcn" -eq 0 ] && [ "$tcp" -ge 1 ]; then pass "I1b: over UDP an up-to-date client gets the SOA, with provide-ixfr no it is sent to TCP (TC, dag retries in TCP)"
-else fail "I1b: UDP IXFR: TC retries default $tcn (expected 0), provide-ixfr no $tcp (expected >= 1)"; fi
+tco=$("$DAG" @127.0.0.1 -p "$P3" pn.test IXFR=4 +notcp +nohexdump 2>&1 | grep -c "Truncated, retrying in TCP mode")
+if [ "$tcn" -eq 0 ] && [ "$tcp" -eq 0 ] && [ "$tco" -ge 1 ]; then pass "I1b: over UDP a client that is up to date gets the SOA also with provide-ixfr no (no TC); one that is behind is sent to TCP (TC, dag retries in TCP)"
+else fail "I1b: UDP IXFR: TC retries default/current $tcn, provide-ixfr no/current $tcp (expected 0 and 0), provide-ixfr no/older $tco (expected >= 1)"; fi
 cat > "$W/sr.conf" <<EOF
 options { port $SR; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT min-refresh-time 1; min-retry-time 1; request-ixfr no; };
 control-channel { socket "$W/sr.sock"; algorithm hmac-sha256; secret "$SECRET"; };

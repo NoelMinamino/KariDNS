@@ -2446,19 +2446,55 @@ void spawn_program_zone_plugins(server_config_t *cfg) {
   g_program_plugins_count = idx;
 }
 
+/* One view, by the address alone (the flat match-clients lists; an empty list matches every client) */
+static bool view_match_addr(const view_snapshot_t *v, const char *client_ip) {
+  if (v->match_clients_parsed && v->match_clients_count > 0) return check_acl_bin(client_ip, v->match_clients_parsed, v->match_clients_count);
+  if (v->match_clients && v->match_clients_count > 0) return check_acl(client_ip, v->match_clients, v->match_clients_count);
+  return true;
+}
+
+/* A view whose match-clients has a `key` element: the list is evaluated with the address and the TSIG key the request verified with (NULL: not
+ * signed or not verified).  BIND dns_acl_allowed(): the first element that matches decides, a negated match denies, no match denies. */
+static bool view_match_aml(const view_snapshot_t *v, const char *client_ip, const char *key) {
+  return aml_allows_ip(v->match_aml, client_ip, key);
+}
+
 view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip) {
   if (!snap) return NULL;
   for (size_t i = 0; i < snap->view_count; i++) {
-    if (snap->views[i].match_clients_parsed && snap->views[i].match_clients_count > 0) {
-      if (check_acl_bin(client_ip, snap->views[i].match_clients_parsed, snap->views[i].match_clients_count)) {
-        return &snap->views[i];
+    view_snapshot_t *v = &snap->views[i];
+    if (v->match_aml ? view_match_aml(v, client_ip, NULL) : view_match_addr(v, client_ip)) return v;
+  }
+  return NULL;
+}
+
+view_snapshot_t *select_view_req(zone_db_snapshot_t *snap, const server_config_t *cfg, const char *client_ip, const uint8_t *req,
+                                 size_t req_len, tsig_request_t *tsig, bool *tsig_done) {
+  *tsig_done = false;
+  if (!snap) return NULL;
+  /* only a message with an additional section can carry a TSIG (RFC 8945 §5.1) */
+  const bool signed_possible = cfg && req && req_len >= DNS_HEADER_SIZE && (req[10] | req[11]) != 0;
+  for (size_t i = 0; i < snap->view_count; i++) {
+    view_snapshot_t *v = &snap->views[i];
+    if (!v->match_aml) {
+      if (view_match_addr(v, client_ip)) return v;
+      continue;
+    }
+    /* BIND get_matching_view_sync(): the signature is checked against the ring of this view, and the identity (the key name) is known only
+     * when that succeeds */
+    bool checked = false;
+    const char *key = NULL;
+    if (signed_possible) {
+      tsig_check_request_nolog(cfg, v->name, req, req_len, tsig);
+      checked = tsig->status != TSIG_REQ_NONE;
+      if (tsig->status == TSIG_REQ_VALID && tsig->key) key = tsig->key->name;
+    }
+    if (view_match_aml(v, client_ip, key)) {
+      if (checked) {
+        tsig_log_request_error(tsig, client_ip);
+        *tsig_done = true;
       }
-    } else if (snap->views[i].match_clients && snap->views[i].match_clients_count > 0) {
-      if (check_acl(client_ip, snap->views[i].match_clients, snap->views[i].match_clients_count)) {
-        return &snap->views[i];
-      }
-    } else {
-      return &snap->views[i];
+      return v;
     }
   }
   return NULL;
@@ -2864,12 +2900,24 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
     return 0; // 不正な短いパケットは無応答で破棄
   }
   tsig_request_t tsig;
-  /* the view is chosen first (by the client address), then the key is looked for among the global keys and that view's own (BIND
-   * get_matching_view_sync(): dns_message_checksig(message, view) with the view's ring).  Only a message that carries an additional
-   * section can be signed, so the others do not pay for the view lookup. */
-  const view_snapshot_t *tsig_view = NULL;
-  if ((req[10] | req[11]) != 0) tsig_view = route && route->view ? route->view : (snap ? select_view(snap, client_ip) : NULL);
-  tsig_check_request(cfg, tsig_view ? tsig_view->name : NULL, req, req_len, client_ip, &tsig);
+  /* The view is chosen first, once, here when the caller has not (select_view_req(): by the client address, and by the TSIG key for a view whose
+   * match-clients has a `key`, BIND get_matching_view_sync()); the body takes it with its zone.  Then the key of the request is looked for
+   * among the global keys and that view's own (dns_message_checksig(message, view) with the view's ring): not again when select_view_req()
+   * has made that very check (route->tsig).  Only a message that carries an additional section can be signed, so tsig_check_request()
+   * returns at once for the others. */
+  query_route_t own_route;
+  if (snap && !route) {
+    bool done = false;
+    own_route.view = select_view_req(snap, cfg, client_ip, req, req_len, &tsig, &done);
+    own_route.entry = own_route.view ? find_zone_for_query(own_route.view, qname, ((req[2] >> 3) & 0x0F) == 0 ? qtype : 0) : NULL;
+    own_route.tsig = done ? &tsig : NULL;
+    route = &own_route;
+  }
+  if (route && route->tsig) {
+    if (route->tsig != &tsig) tsig = *route->tsig;
+  } else {
+    tsig_check_request(cfg, route && route->view ? route->view->name : NULL, req, req_len, client_ip, &tsig);
+  }
   t_query_tsig.status = TSIG_REQ_NONE; /* X-20: slip 応答の署名用。署名のない要求では使わない */
   if (tsig.status == TSIG_REQ_NONE) {
     int plain = process_query_body(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
@@ -2924,15 +2972,10 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   t_qacl.key = (tsig && tsig->status == TSIG_REQ_VALID && tsig->key) ? tsig->key->name : NULL;   /* `key <name>` in allow-query */
 
   if (snap && route) {
-    /* E2: the caller looked up the same view and zone (query_route_t) */
+    /* E2: the view and the zone were looked up by the caller or by process_dns_query_impl_cap_routed() (query_route_t; with a snapshot there
+     * is always a route).  R-32: a DS for a child apex is answered by the parent zone (QUERY only): find_zone_for_query() knows. */
     view = route->view;
     db_entry = route->entry;
-  } else if (snap) {
-    view = select_view(snap, client_ip);
-    if (view) {
-      // R-32: 子ゾーン頂点への DS は親ゾーンで答える (QUERY のみ)。RRL、統計、wire キャッシュもこのゾーンを使う。
-      db_entry = find_zone_for_query(view, current_qname, ((req[2] >> 3) & 0x0F) == 0 ? qtype : 0);
-    }
   }
 
   /* E2: the zone's configuration, looked up once (it is a hash lookup by view and zone name).  The later users below see the same
@@ -3530,12 +3573,9 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
     /* R-15, RFC 1995 §2: 同じか新しい版 (RFC 1982) なら最新なので、TC を立てずに SOA 1件で答える */
     bool is_up_to_date = (client_serial == current_serial || serial_is_newer(client_serial, current_serial));
-    /* provide-ixfr no (batch 4): the client is always sent to TCP, where it gets the whole zone (as for the TCP IXFR in send_axfr_response()) */
-    {
-      xfr_eff_t pe;
-      xfr_opts_effective_peer(cfg, zcfg, db_entry->view_name, config_server_find_ip(cfg, db_entry->view_name, client_ip), &pe);   /* the requester's server statement first */
-      if (!pe.provide_ixfr) is_up_to_date = false;
-    }
+    /* provide-ixfr no does not change this answer: BIND 9.20 lib/ns/xfrout.c ns_xfr_start() answers an IXFR from a client that is up to date (and every
+     * IXFR over UDP) with the one SOA before it looks at provide-ixfr.  A client that is behind is sent to TCP (TC), where send_axfr_response() gives it
+     * the whole zone when provide-ixfr is no. */
     if (!is_up_to_date) {
       res[2] |= 0x02; // Set TC (Truncated) bit to prompt TCP retry
     }
@@ -3793,7 +3833,13 @@ void dnstap_fill_query_zone(dnstap_event_meta_t *meta, const uint8_t *wire, size
     bool found = false;
     rcu_aux_read_lock();
     zone_db_snapshot_t *snap = acquire_zone_snapshot();
-    view_snapshot_t *view = snap ? select_view(snap, client_ip) : NULL;
+    /* the view as the engine chose it, with the TSIG of a query for a view whose match-clients has a `key`; a response is matched as an unsigned
+     * message (its TSIG is checked against the query's MAC, which is not at hand) */
+    tsig_request_t dtsig;
+    bool dtsig_done;
+    server_config_t *dcfg = acquire_config_snapshot();
+    view_snapshot_t *view = snap ? select_view_req(snap, dcfg, client_ip, (wire[2] & 0x80) ? NULL : wire, wire_len, &dtsig, &dtsig_done) : NULL;
+    release_config_snapshot(dcfg);
     zone_db_entry_t *entry = view ? find_zone_in_view(view, qname) : NULL;
     if (entry) {
         strlcpy(zone, entry->domain, sizeof(zone));
