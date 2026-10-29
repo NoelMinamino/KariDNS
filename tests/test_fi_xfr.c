@@ -16,6 +16,7 @@
 #include "../dns_server_internal.h"
 #include "../dns_query_engine.h"
 #include "../dns_snapshot_rcu.h"
+#include "test_zone_slots.h"
 
 // Mock globals
 _Atomic int g_control_kq = -1;
@@ -46,8 +47,17 @@ ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len) {
     (void)fd; (void)buf; return len;
 }
 
+static uint8_t g_fi_msg[1024];       /* test_fi_axfr_install_failure_keeps_state(): the one message of the stream */
+static size_t g_fi_msg_len;
+static bool g_fi_msg_served;
+
 int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out, uint16_t *msg_len_out) {
-    (void)fd; (void)ctx; (void)msg_out; (void)msg_len_out; return -1;
+    (void)fd; (void)ctx;
+    if (g_fi_msg_len == 0 || g_fi_msg_served) return -1;
+    g_fi_msg_served = true;
+    *msg_out = g_fi_msg;
+    *msg_len_out = (uint16_t)g_fi_msg_len;
+    return 1;
 }
 
 void submit_response_log(log_action_t action, const char *client_ip, int client_port,
@@ -148,12 +158,89 @@ static void test_fi_axfr_send_and_recv(void) {
     zone_arena_destroy(&arena);
 }
 
+/* append one RR (owner, type, class IN, TTL 60, RDATA) to a message being built; returns the new offset */
+static size_t fi_put_rr(uint8_t *p, size_t cap, size_t off, const char *owner, uint16_t type, const uint8_t *rd, uint16_t rdlen) {
+    off += write_uncompressed_name(p, off, cap, owner);
+    p[off++] = type >> 8; p[off++] = type & 0xFF; p[off++] = 0; p[off++] = 1;
+    p[off++] = 0; p[off++] = 0; p[off++] = 0; p[off++] = 60;
+    p[off++] = rdlen >> 8; p[off++] = rdlen & 0xFF;
+    if (rdlen) memcpy(p + off, rd, rdlen);
+    return off + rdlen;
+}
+
+/* A transfer that cannot be installed (an allocation fails while the version is built or published) leaves the zone as it was: the serial, the
+ * SOA timers, next_check, expire_at and last_successful_transfer are the old ones.  Sweep every allocation of an AXFR-in: whenever handle_axfr_event()
+ * does not return 1 the state must be the initial one, and when it returns 1 it must be the new one. */
+static void test_fi_axfr_install_failure_keeps_state(void) {
+    uint8_t soa_rd[128];
+    size_t sl = 0;
+    sl += write_uncompressed_name(soa_rd, sl, sizeof(soa_rd), "ns1.fiinst.example.");
+    sl += write_uncompressed_name(soa_rd, sl, sizeof(soa_rd), "admin.fiinst.example.");
+    soa_rd[sl++] = 0; soa_rd[sl++] = 0; soa_rd[sl++] = 0; soa_rd[sl++] = 200;                  /* serial 200 */
+    static const uint32_t soa_t[4] = { 7200, 3600, 1209600, 300 };
+    for (int k = 0; k < 4; k++) {
+        soa_rd[sl++] = (uint8_t)(soa_t[k] >> 24); soa_rd[sl++] = (uint8_t)(soa_t[k] >> 16);
+        soa_rd[sl++] = (uint8_t)(soa_t[k] >> 8); soa_rd[sl++] = (uint8_t)soa_t[k];
+    }
+    static const uint8_t a_rd[4] = { 192, 0, 2, 1 };
+    memset(g_fi_msg, 0, sizeof(g_fi_msg));
+    g_fi_msg[0] = 0x11; g_fi_msg[1] = 0x23; g_fi_msg[2] = 0x84;
+    g_fi_msg[5] = 1; g_fi_msg[7] = 3;                                                          /* QDCOUNT 1, ANCOUNT 3: SOA, A, SOA */
+    size_t off = 12;
+    off += write_uncompressed_name(g_fi_msg, off, sizeof(g_fi_msg), "fiinst.example.");
+    g_fi_msg[off++] = 0; g_fi_msg[off++] = 252; g_fi_msg[off++] = 0; g_fi_msg[off++] = 1;
+    off = fi_put_rr(g_fi_msg, sizeof(g_fi_msg), off, "fiinst.example.", 6, soa_rd, (uint16_t)sl);
+    off = fi_put_rr(g_fi_msg, sizeof(g_fi_msg), off, "www.fiinst.example.", 1, a_rd, 4);
+    off = fi_put_rr(g_fi_msg, sizeof(g_fi_msg), off, "fiinst.example.", 6, soa_rd, (uint16_t)sl);
+    g_fi_msg_len = off;
+
+    unsigned failed = 0, installed = 0;
+    FI_SWEEP({
+        zone_db_entry_t entry;
+        memset(&entry, 0, sizeof(entry));
+        strlcpy(entry.domain, "fiinst.example.", sizeof(entry.domain));
+        strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+        pthread_mutex_init(&entry.writer_lock, NULL);
+        pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+        atomic_store_explicit(&entry.rcu.active, &zone_version_empty, memory_order_release);
+        entry.serial = 100; entry.refresh = 111; entry.retry = 222; entry.expire = 333;
+        atomic_store(&entry.next_check, 777);
+        atomic_store(&entry.expire_at, 888);
+        atomic_store(&entry.last_successful_transfer, 999);
+
+        g_fi_msg_served = false;
+        tcp_stream_ctx_t stream_ctx;
+        memset(&stream_ctx, 0, sizeof(stream_ctx));
+        axfr_session_t session;
+        memset(&session, 0, sizeof(session));
+        session.query_id = 0x1123; session.query_type = 252;
+        int rc = handle_axfr_event(-1, &entry, &stream_ctx, &session, NULL, NULL, 0);
+        if (rc == 1) {
+            installed++;
+            assert(entry.serial == 200 && entry.refresh == 7200 && entry.retry == 3600 && entry.expire == 1209600);
+            assert(atomic_load(&entry.last_successful_transfer) != 999);
+        } else {
+            failed++;
+            assert(entry.serial == 100 && entry.refresh == 111 && entry.retry == 222 && entry.expire == 333);
+            assert(atomic_load(&entry.next_check) == 777 && atomic_load(&entry.expire_at) == 888);
+            assert(atomic_load(&entry.last_successful_transfer) == 999);
+            assert(atomic_load(&entry.rcu.active) == &zone_version_empty);
+        }
+        test_entry_release(&entry);
+        pthread_mutex_destroy(&entry.writer_lock);
+        pthread_mutex_destroy(&entry.ixfr_history.lock);
+    });
+    g_fi_msg_len = 0;
+    assert(failed > 0 && installed > 0);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     printf("[*] Running test_fi_xfr...\n");
     test_fi_xfr_parsing();
     test_fi_soa_serial_bump();
     test_fi_axfr_send_and_recv();
+    test_fi_axfr_install_failure_keeps_state();
     printf("[+] test_fi_xfr passed successfully.\n");
     return 0;
 }

@@ -330,6 +330,7 @@ static void test_read_dns_tcp_message_and_send(void) {
 // ----------------------------------------------------------------------------
 // 6. Query Log Max QPS & Circuit Breaker Test
 // ----------------------------------------------------------------------------
+bool qlog_rate_admit(time_t now, time_t *sec, uint32_t *count, uint32_t limit);
 static void test_query_log_max_qps_and_circuit_breaker(void) {
     printf("[TEST] Server Core: get_effective_query_log_max_qps & write_query_log...\n");
 
@@ -341,12 +342,47 @@ static void test_query_log_max_qps_and_circuit_breaker(void) {
     cfg.query_log_max_qps = 2500;
     assert(get_effective_query_log_max_qps(&cfg) == 2500);
 
-    log_channel_t qch;
-    memset(&qch, 0, sizeof(qch));
-    qch.max_qps_specified = true;
-    qch.max_qps = 7500;
-    cfg.logging.queries_channel = &qch;
+    /* options { query-log-max-qps 0 } is 5000, as write_query_log() reads it */
+    cfg.query_log_max_qps = 0;
+    assert(get_effective_query_log_max_qps(&cfg) == 5000);
+    cfg.query_log_max_qps = 2500;
+
+    /* the rings feed every channel of `category queries`: they admit what the most generous channel allows (a channel's own max-qps when it is
+     * written and above 0, else query-log-max-qps), whatever the order of the channels */
+    log_channel_t qa, qb, qc;
+    memset(&qa, 0, sizeof(qa)); memset(&qb, 0, sizeof(qb)); memset(&qc, 0, sizeof(qc));
+    qa.name = "qa"; qa.max_qps_specified = true; qa.max_qps = 100;
+    qb.name = "qb"; qb.max_qps_specified = true; qb.max_qps = 7500;
+    qc.name = "qc"; qc.max_qps_specified = true; qc.max_qps = 0;   /* max-qps 0: the options value */
+    qa.next = &qb; qb.next = &qc;
+    cfg.logging.channels = &qa;
+    cfg.logging.cat[LOGC_QUERIES].n = 1;
+    cfg.logging.cat[LOGC_QUERIES].name[0] = "qa";
+    assert(get_effective_query_log_max_qps(&cfg) == 100);            /* a lone channel decides */
+    cfg.logging.cat[LOGC_QUERIES].n = 2;
+    cfg.logging.cat[LOGC_QUERIES].name[1] = "qb";
+    assert(get_effective_query_log_max_qps(&cfg) == 7500);           /* the channel after the first one counts */
+    cfg.logging.cat[LOGC_QUERIES].name[0] = "qb";
+    cfg.logging.cat[LOGC_QUERIES].name[1] = "qa";
+    assert(get_effective_query_log_max_qps(&cfg) == 7500);           /* and not by position */
+    cfg.logging.cat[LOGC_QUERIES].name[1] = "qc";
     assert(get_effective_query_log_max_qps(&cfg) == 7500);
+    cfg.logging.cat[LOGC_QUERIES].name[0] = "qa";
+    assert(get_effective_query_log_max_qps(&cfg) == 2500);           /* qa 100 and qc (max-qps 0 -> options 2500) */
+    cfg.logging.cat[LOGC_QUERIES].name[1] = "default_syslog";        /* a built-in channel has the options value */
+    assert(get_effective_query_log_max_qps(&cfg) == 2500);
+    cfg.logging.cat[LOGC_QUERIES].name[1] = "nosuch";                /* a name that is not a channel of the file: the options value */
+    assert(get_effective_query_log_max_qps(&cfg) == 2500);
+    cfg.logging.cat[LOGC_QUERIES].n = 0;                             /* querylog yes alone: the default channel */
+    assert(get_effective_query_log_max_qps(&cfg) == 2500);
+    memset(&cfg.logging, 0, sizeof(cfg.logging));
+
+    /* qlog_rate_admit(): the lines one channel writes in a second, a new second starts counting again */
+    time_t sec = 0;
+    uint32_t cnt = 0;
+    assert(qlog_rate_admit(1000, &sec, &cnt, 3) && qlog_rate_admit(1000, &sec, &cnt, 3) && qlog_rate_admit(1000, &sec, &cnt, 3));
+    assert(!qlog_rate_admit(1000, &sec, &cnt, 3) && cnt == 3);
+    assert(qlog_rate_admit(1001, &sec, &cnt, 3) && sec == 1001 && cnt == 1);
 
     // 2. write_query_log pushing to ring buffer and circuit breaker
     worker_ctx_t worker;

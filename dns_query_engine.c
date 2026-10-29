@@ -2847,6 +2847,36 @@ static int chaos_build_response(const server_config_t *cfg, uint8_t *res, size_t
   return offset16;
 }
 
+/* NOTIFY (RFC 1996; BIND lib/dns/zone.c dns_zone_notifyreceive(): the sender must be one of the
+ * zone's primaries or match allow-notify): is client_ip one of the primaries listed in x, and, when that primary needs a TSIG key (its own `key`,
+ * else the zone's tsig-key: zone_primary_key()), was the NOTIFY signed with it?  tkey = the key of a verified TSIG, or NULL. */
+static bool notify_from_zone_primaries(const zone_ext_t *x, const char *client_ip, const tsig_key_t *tkey) {
+  for (int k = 0; k < x->masters_count; k++) {
+    if (!(x->masters_parsed ? cidr_entry_match_str(&x->masters_parsed[k], client_ip) : match_cidr(client_ip, x->masters[k].ip)))
+      continue;
+    const char *need = zone_primary_key(x, k);
+    if (!need || (tkey && tsig_key_names_equal(tkey->name, need))) return true;
+  }
+  return false;
+}
+
+/* The same for a catalog member (RFC 9432: the member is a secondary of the catalog zone's
+ * primaries).  The member has no zone { }, so zone_entry_config() is NULL for it: the primaries are those of its catalog zone, as the transfer
+ * takes them (xfr_build_primaries()), and the single copy kept in the entry when the member was added is the fallback.  The TSIG rule is the
+ * one of a configured secondary: the key of the primaries element, else the catalog zone's tsig-key. */
+static bool notify_from_member_primaries(server_config_t *cfg, view_snapshot_t *view, const zone_db_entry_t *e, const char *client_ip,
+                                         const tsig_key_t *tkey) {
+  if (e->owning_catalog_domain) {
+    zone_db_entry_t *cat = find_zone_in_view(view, e->owning_catalog_domain);
+    const zone_config_t *cc = cat && domain_names_match_ci(cat->domain, e->owning_catalog_domain) ? zone_entry_config(cfg, cat) : NULL;
+    if (cc && zext(cc)->masters_count > 0) return notify_from_zone_primaries(zext(cc), client_ip, tkey);
+  }
+  const catalog_master_t *m = e->catalog_master;
+  if (!m || !m->ip[0] || !match_cidr(client_ip, m->ip)) return false;
+  const char *need = m->key[0] ? m->key : (m->zone_key[0] ? m->zone_key : NULL);
+  return !need || (tkey && tsig_key_names_equal(tkey->name, need));
+}
+
 int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                             size_t max_res_len, const char *qname, uint16_t qtype,
                             const char *client_ip, compress_ctx_t *comp_ctx,
@@ -3157,16 +3187,10 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     if (db_entry && view) {
       const zone_config_t *zcfg = zone_cfg_any;
       const zone_ext_t *zx = zext(zcfg);
-      if (zcfg && zx->masters_count > 0) {
-        /* from one of the primaries, signed with that primary's key (else the zone's tsig-key) when it has one */
-        for (int k = 0; k < zx->masters_count && !auth; k++) {
-          if (!(zx->masters_parsed ? cidr_entry_match_str(&zx->masters_parsed[k], client_ip)
-                                   : match_cidr(client_ip, zx->masters[k].ip)))
-            continue;
-          const char *need = zone_primary_key(zx, k);
-          if (!need || (tkey && tsig_key_names_equal(tkey->name, need))) auth = true;
-        }
-      }
+      /* from one of the primaries, signed with that primary's key (else the zone's tsig-key) when it has one */
+      if (zcfg && zx->masters_count > 0) auth = notify_from_zone_primaries(zx, client_ip, tkey);
+      /* a catalog member has no zone { } of its own (or none with primaries): the primaries of its catalog zone */
+      if (!auth && db_entry->is_catalog_member) auth = notify_from_member_primaries(cfg, view, db_entry, client_ip, tkey);
       /* allow-notify (BIND 9.20 ARM): "in addition to the zone primaries"; it applies to the secondary zones, from the zone, the view
        * or options.  A `key` element is the TSIG key the NOTIFY was signed with. */
       if (!auth && db_entry->is_secondary)

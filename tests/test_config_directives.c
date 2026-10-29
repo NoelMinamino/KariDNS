@@ -96,6 +96,7 @@ static void expect_reject(const char *label, const char *txt) {
 }
 
 static void expect_an_error(const char *label, const char *txt, const char *want); /* defined below, with parse_capture() */
+static const zone_config_t *zone_in_view(const server_config_t *cfg, const char *view, const char *domain); /* defined below */
 
 static const zone_config_t *first_zone(const server_config_t *cfg) {
     return (cfg->views && cfg->views->zones) ? cfg->views->zones : NULL;
@@ -249,7 +250,7 @@ static void test_numeric_directives_invalid(void) {
 }
 
 static void test_buffer_sizes(void) {
-    printf("[TEST] udp-recvbuf-size / udp-sndbuf-size unit suffixes...\n");
+    printf("[TEST] udp-recvbuf-size / udp-sndbuf-size unit suffixes and invalid values...\n");
     static const struct { const char *in; int expect; } t[] = {
         { "65536",  65536 },
         { "512k",   512 * 1024 },
@@ -257,10 +258,9 @@ static void test_buffer_sizes(void) {
         { "2m",     2 * 1024 * 1024 },
         { "2M",     2 * 1024 * 1024 },
         { "1g",     1024 * 1024 * 1024 },
-        { "4G",     INT_MAX },              /* clamped */
-        { "0",      4 * 1024 * 1024 },      /* non-positive: ignored, default kept */
-        { "-8k",    4 * 1024 * 1024 },
-        { "junk",   4 * 1024 * 1024 },
+        { "2047M",  2047 * 1024 * 1024 },
+        { "0",      4 * 1024 * 1024 },      /* 0 is the system's size in BIND: KariDNS keeps its own default */
+        { "1000",   4096 },                 /* a non-zero size is held to at least 4096 (BIND CAP_IF_NOT_ZERO), as under udp-receive-buffer */
     };
     for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
         char txt[128];
@@ -272,6 +272,16 @@ static void test_buffer_sizes(void) {
             free_server_config_fields(&cfg);
         }
     }
+    /* a value that is not a size is an error with the place (it used to be ignored and the default kept); the size is an int (SO_RCVBUF) */
+    static const char *const bad[] = { "4G", "2048M", "-8k", "junk", "1x", "2147483648", "k" };
+    static const char *const names[] = { "udp-recvbuf-size", "udp-sndbuf-size", "udp-receive-buffer", "udp-send-buffer" };
+    for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); n++)
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+            char txt[160], label[96];
+            snprintf(txt, sizeof(txt), "\noptions { %s %s; };", names[n], bad[i]);
+            snprintf(label, sizeof(label), "%s %s", names[n], bad[i]);
+            expect_an_error(label, txt, "line 2|Invalid");
+        }
 }
 
 static void test_transport_params(void) {
@@ -812,6 +822,30 @@ static void test_zone_program_and_forward(void) {
         CHECK(z && zext(z)->forward_timeout_ms == 1500);
         free_server_config_fields(&cfg);
     }
+    /* BIND 9.20 bin/named/server.c configure_forward(): an address without a port takes the `port` of its list, else options { port } (written
+     * before or after the zone), else 53; an address with its own port keeps it */
+    if (parse_ok("zone \"f.example\" { type forward; forwarders { 192.0.2.53; 198.51.100.53 port 5353; }; };\noptions { port 5300; };", &cfg)) {
+        const zone_config_t *z = first_zone(&cfg);
+        CHECK(z && zext(z)->forwarders_count == 2 && zext(z)->forwarders[0].port == 5300 && zext(z)->forwarders[1].port == 5353);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { port 5300; };\nview \"v\" { zone \"f.example\" { type forward; forwarders { 192.0.2.53; }; }; };", &cfg)) {
+        const zone_config_t *z = zone_in_view(&cfg, "v", "f.example");
+        CHECK(z && zext(z)->forwarders_count == 1 && zext(z)->forwarders[0].port == 5300);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { port 5300; };\nzone \"f.example\" { type forward; forwarders port 5400 { 192.0.2.53; 198.51.100.53 port 5401; }; };", &cfg)) {
+        const zone_config_t *z = first_zone(&cfg);
+        CHECK(z && zext(z)->forwarders_count == 2 && zext(z)->forwarders[0].port == 5400 && zext(z)->forwarders[1].port == 5401);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("zone \"f.example\" { type forward; forwarders { 192.0.2.53; }; };", &cfg)) {
+        const zone_config_t *z = first_zone(&cfg);
+        CHECK(z && zext(z)->forwarders_count == 1 && zext(z)->forwarders[0].port == 53);
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("forwarders list port 0", "zone \"f.test\" { type forward; forwarders port 0 { 192.0.2.53; }; };");
+    expect_reject("forwarders list port without braces", "zone \"f.test\" { type forward; forwarders port 5400 192.0.2.53; };");
     expect_reject("forwarders without braces", "zone \"f.test\" { type forward; forwarders 192.0.2.53; };");
     expect_reject("forward-timeout value missing", "zone \"f.test\" { type forward; forward-timeout; };");
     expect_reject("forward-timeout ';' missing", "zone \"f.test\" { type forward; forward-timeout 5 };");

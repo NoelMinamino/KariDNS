@@ -2701,9 +2701,14 @@ static int parse_notify_targets(token_ctx_t *ctx, const char *what, notify_targe
 
 /* `what` { <address> [port <n>]; ... };  for the statements that list plain addresses (masters, forwarders, exempt-clients, ...):
  * appends to *list.  -1 with a message that names the place on a syntax error. */
-static int parse_ip_port_list(token_ctx_t *ctx, const char *what, ip_port_t **list, int *count) {
+static int parse_ip_port_list(token_ctx_t *ctx, const char *what, ip_port_t **list, int *count, int defport, bool list_port) {
   char db[96];
   conf_token_t tok = get_next_token(ctx);
+  if (list_port && tok.type == TOKEN_STRING && strcmp(tok.value, "port") == 0) {   /* `forwarders port <n> { ... }` (BIND): the port of the elements that have none */
+    free_token(&tok);
+    if (read_port(ctx, what, &defport) != 0) return -1;
+    tok = get_next_token(ctx);
+  }
   if (tok.type != TOKEN_LBRACE) {
     conf_error(ctx, what, "expected '{' but found %s", tok_desc(&tok, db, sizeof(db)));
     free_token(&tok);
@@ -2733,7 +2738,7 @@ static int parse_ip_port_list(token_ctx_t *ctx, const char *what, ip_port_t **li
     }
     *list = _new_list;
     (*list)[*count].ip = ip_val;
-    (*list)[*count].port = 53;
+    (*list)[*count].port = defport;
     (*count)++;
     tok = get_next_token(ctx);
     if (tok.type == TOKEN_STRING && strcmp(tok.value, "port") == 0) {
@@ -2765,7 +2770,7 @@ static int parse_alias_resolvers(token_ctx_t *ctx, const char *where, ip_port_t 
   free(*list);
   *list = NULL;
   *count = 0;
-  if (parse_ip_port_list(ctx, "alias-resolver", list, count) != 0) return -1;
+  if (parse_ip_port_list(ctx, "alias-resolver", list, count, 53, false) != 0) return -1;
   const char *bad = NULL;
   if (*count > KARIDNS_ALIAS_RESOLVERS_MAX) {
     bad = "more than 8 entries";
@@ -2829,7 +2834,7 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
     free_token(&tok);
 
     if (strcmp(key, "exempt-clients") == 0) {
-      if (parse_ip_port_list(ctx, "rate-limit exempt-clients", &rrl->exempt_clients, &rrl->exempt_clients_count) != 0) {
+      if (parse_ip_port_list(ctx, "rate-limit exempt-clients", &rrl->exempt_clients, &rrl->exempt_clients_count, 53, false) != 0) {
         free(key);
         return -1;
       }
@@ -3070,8 +3075,8 @@ static int parse_ecs_tags_block(token_ctx_t *ctx, ecs_tag_def_t **out_tags, int 
 }
 
 /* tcp-mss / tcp-window / udp-bufsize / zone-tcp-* / zone-udp-bufsize の値を1つ読み、
- * 終端の ';' まで消費する。allow_suffix なら K/M 接尾辞 (1024 倍) を受け付ける。
- * parse_buffer_size_value() と違い、末尾のゴミや範囲外の値を丸めずに拒否する
+ * 終端の ';' まで消費する。allow_suffix なら K/M/G 接尾辞 (1024 倍) を受け付ける。
+ * 末尾のゴミや範囲外の値は丸めずに拒否する
  * (黙って OS 既定値のまま動くと、意図した性能設定が効いていないことに気付けない)。 */
 static int parse_transport_param(token_ctx_t *ctx, const char *zone_domain, const char *name,
                                  bool allow_suffix, long long lo, long long hi, int *out) {
@@ -3091,6 +3096,7 @@ static int parse_transport_param(token_ctx_t *ctx, const char *zone_domain, cons
       long long mult = 1;
       if (allow_suffix && (*end == 'k' || *end == 'K')) { mult = 1024LL; end++; }
       else if (allow_suffix && (*end == 'm' || *end == 'M')) { mult = 1024LL * 1024; end++; }
+      else if (allow_suffix && (*end == 'g' || *end == 'G')) { mult = 1024LL * 1024 * 1024; end++; }
       if (*end == '\0' && v <= hi / mult) {
         v *= mult;
         ok = (v >= lo && v <= hi);
@@ -3098,7 +3104,7 @@ static int parse_transport_param(token_ctx_t *ctx, const char *zone_domain, cons
     }
   }
   if (!ok) {
-    const char *suffix_hint = allow_suffix ? ", K/M suffix allowed" : "";
+    const char *suffix_hint = allow_suffix ? ", K/M/G suffix allowed" : "";
     char loc[300] = "";
     if (ctx) {
       ctx_location(ctx, loc, sizeof(loc) - 2);
@@ -3148,7 +3154,7 @@ static int alias_note(token_ctx_t *ctx, server_config_t *cfg, int slot, const ch
   return 0;
 }
 
-/* A BIND buffer size: an integer (the K / M suffix of KariDNS is read too); 0 = the system's.  *out is the size, held to at least 4096 unless 0. */
+/* A BIND buffer size: an integer (the K / M / G suffix of KariDNS is read too); 0 = the system's.  *out is the size, held to at least 4096 unless 0. */
 static int parse_bind_bufsize(token_ctx_t *ctx, const char *key, int *out) {
   int v = 0;
   if (parse_transport_param(ctx, NULL, key, true, 0, INT_MAX, &v) != 0) return -1;
@@ -5307,7 +5313,7 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
         free(key); free_zone_config(zone); return -1;
       }
     } else if (strcmp(key, "forwarders") == 0) {
-      if (parse_ip_port_list(ctx, "forwarders", &x->forwarders, &x->forwarders_count) != 0) {
+      if (parse_ip_port_list(ctx, "forwarders", &x->forwarders, &x->forwarders_count, 0, true) != 0) {
         free(key); free_zone_config(zone); return -1;
       }
     } else if (strcmp(key, "forward-timeout") == 0) {
@@ -5724,24 +5730,6 @@ const char *db_settings_missing_key(const zone_ext_t *x, const server_config_t *
 
 bool db_acl_ceiling_configured(const server_config_t *cfg) {
   return cfg && cfg->database.enabled && (cfg->database.acl_ceiling_count > 0 || cfg->database.acl_ceiling_keys_count > 0);
-}
-
-static int parse_buffer_size_value(const char *str) {
-  if (!str || !*str) return 0;
-  char *endptr = NULL;
-  long long val = strtoll(str, &endptr, 10);
-  if (val <= 0) return 0;
-  long long mult = 1;
-  if (endptr && *endptr) {
-    if (*endptr == 'k' || *endptr == 'K') mult = 1024LL;
-    else if (*endptr == 'm' || *endptr == 'M') mult = 1024LL * 1024;
-    else if (*endptr == 'g' || *endptr == 'G') mult = 1024LL * 1024 * 1024;
-  }
-  /* clamp before multiplying: "9999999999G" would overflow long long (UB) */
-  if (val > INT_MAX / mult) return INT_MAX;
-  val *= mult;
-  if (val > INT_MAX) val = INT_MAX;
-  return (int)val;
 }
 
 /* ---- Batch 7: dnstap in the BIND 9.20 grammar (lib/isccfg/namedconf.c cfg_type_dnstap: a list of `<type> [query | response];` with type all, auth,
@@ -6424,6 +6412,12 @@ static int resolve_all_notify_targets(token_ctx_t *ctx, server_config_t *config)
       if (!zx) continue;
       snprintf(what, sizeof(what), "zone '%.255s' also-notify", z->domain);
       if (resolve_notify_field(ctx, config, what, &zx->also_notify, &zx->also_notify_count) != 0) return -1;
+      /* forwarders: an address without a port takes the `port` of its list, else options { port }, else 53 (BIND 9.20 bin/named/server.c
+       * configure_forward(): named_config_getport(config, "port"), overridden by the list-level `port`, applied to an element whose port
+       * is 0).  The statement may be written before options, so the port is filled in here; the Backend (dispatch_forward_zone())
+       * only connects to what the configuration holds. */
+      for (int fi = 0; fi < zx->forwarders_count; fi++)
+        if (zx->forwarders[fi].port == 0) zx->forwarders[fi].port = config_target_port(config, 0);
       if (zx->masters_count > 0) {
         /* primaries / masters of the zone: the same lists, the same checks; masters_parsed is built from the expanded addresses */
         snprintf(what, sizeof(what), "zone '%.255s' primaries", z->domain);
@@ -8046,27 +8040,6 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           config->udp_bufsize = (uint16_t)v;
-        } else if (strcmp(key, "udp-recvbuf-size") == 0) {
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_STRING) {
-            free(key);
-            free_token(&tok);
-            return -1;
-          }
-          int sz = parse_buffer_size_value(tok.value);
-          if (sz > 0 && alias_note(ctx, config, 1, key, sz) != 0) {
-            free(key);
-            free_token(&tok);
-            return -1;
-          }
-          if (sz > 0) config->udp_recvbuf_size = sz;
-          free_token(&tok);
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_SEMICOLON) {
-            free(key);
-            return -1;
-          }
-          free_token(&tok);
         } else if (strcmp(key, "response-cache-size") == 0) {
           /* 0 = 使わない。それ以外は 4K/16M のような大きさ (上限 1024M)。書き損じは誤りにする */
           int sz = 0;
@@ -8075,26 +8048,6 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           config->response_cache_size = (size_t)sz;
-        } else if (strcmp(key, "udp-sndbuf-size") == 0) {
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_STRING) {
-            free(key);
-            free_token(&tok);
-            return -1;
-          }
-          int sz = parse_buffer_size_value(tok.value);
-          if (sz > 0 && alias_note(ctx, config, 2, key, sz) != 0) {
-            free(key);
-            free_token(&tok);
-            return -1;
-          }
-          if (sz > 0) config->udp_sndbuf_size = sz;
-          free_token(&tok);
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_SEMICOLON) {
-            free(key);
-            return -1;
-          }
         } else if (strcmp(key, "dnstap") == 0) {
           if (parse_dnstap_block(ctx, config) != 0) {
             free(key);
@@ -8105,7 +8058,10 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key);
             return -1;
           }
-        } else if (strcmp(key, "udp-receive-buffer") == 0 || strcmp(key, "udp-send-buffer") == 0) {
+        } else if (strcmp(key, "udp-receive-buffer") == 0 || strcmp(key, "udp-send-buffer") == 0 ||
+                   strcmp(key, "udp-recvbuf-size") == 0 || strcmp(key, "udp-sndbuf-size") == 0) {
+          /* the two KariDNS names and the two BIND names are one setting each (alias_note() slots 1 and 2): one parser, so that a bad value is an
+           * error with file:line under all four (it used to be ignored under the KariDNS names) */
           bool rcv = key[4] == 'r';
           int v = 0;
           if (parse_bind_bufsize(ctx, key, &v) != 0 || alias_note(ctx, config, rcv ? 1 : 2, key, v) != 0) {

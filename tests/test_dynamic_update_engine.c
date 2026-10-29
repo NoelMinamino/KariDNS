@@ -454,6 +454,7 @@ static void test_send_notify_to_all_comprehensive(void) {
     zcfg1.domain = "example.com.";
     tzx(&zcfg1)->notify_source = "192.0.2.1";
     tzx(&zcfg1)->also_notify_count = 3;
+    tzx(&zcfg1)->also_notify_set = true;   /* the zone's own list: without this the effective list is the view's and options' (both empty) */
     notify_target_t notifys[3];
     memset(notifys, 0, sizeof(notifys));
     notifys[0].ip = "192.0.2.10";
@@ -562,6 +563,7 @@ static void test_send_notify_to_all_comprehensive(void) {
 
     // Count received NOTIFY packets from IPC
     int pkt_count = 0;
+    bool got_v4_also = false, got_v6_also = false;
     while (1) {
         alignas(udp_ipc_t) uint8_t buf[2048];
         ssize_t n = recv(g_notify_ipc[0], buf, sizeof(buf), MSG_DONTWAIT);
@@ -569,12 +571,17 @@ static void test_send_notify_to_all_comprehensive(void) {
         pkt_count++;
         udp_ipc_t *ipc = (udp_ipc_t *)buf;
         assert(ipc->sock_fd_idx == -1);
+        if (ipc->client_addr.ss_family == AF_INET && ntohs(ipc->client_addr.sin.sin_port) == 53 &&
+            ipc->client_addr.sin.sin_addr.s_addr == htonl(0xC000020AU)) got_v4_also = true;   /* 192.0.2.10 */
+        if (ipc->client_addr.ss_family == AF_INET6 && ntohs(ipc->client_addr.sin6.sin6_port) == 5353) got_v6_also = true;   /* [2001:db8::10]:5353 */
         if (ipc->has_source_addr) {
             assert(ipc->source_addr.ss_family == AF_INET);
         }
     }
 
-    assert(pkt_count >= 4); // IPv4 also-notify, IPv6 also-notify, in-zone A/AAAA glue, sibling A/AAAA glue
+    /* the also-notify addresses (the invalid one is skipped: 2 of the 3) and the NS hosts' glue: in-zone A/AAAA of ns2, sibling A/AAAA of ns1.sibling.com */
+    assert(got_v4_also && got_v6_also);
+    assert(pkt_count == 6);
     assert(atomic_load_explicit(&z1->observatory.notify_sent, memory_order_acquire) > 0);
 
     close(g_notify_ipc[0]);

@@ -1228,6 +1228,12 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         }
         /* BIND zone_xfrdone(): refresh and retry are held to [min-*-time, max-*-time], expire to [refresh + retry, 24 weeks] */
         if (has_soa && session->eff) xfr_clamp_timers(session->eff, refresh, retry, expire, &refresh, &retry, &expire);
+        /* the serial and the timers come with the new version and are put back when it is not installed (like the database load,
+         * dns_db_install.c): a failed install leaves the zone as it was, the primary is asked again at the retry interval */
+        const uint32_t old_serial = entry->serial, old_refresh = entry->refresh, old_retry = entry->retry, old_expire = entry->expire;
+        const time_t old_next_check = atomic_load_explicit(&entry->next_check, memory_order_relaxed);
+        const time_t old_expire_at = atomic_load_explicit(&entry->expire_at, memory_order_relaxed);
+        const time_t old_last_ok = atomic_load_explicit(&entry->last_successful_transfer, memory_order_relaxed);
         if (has_soa) {
           time_t now = time(NULL);
           entry->serial = serial;
@@ -1248,6 +1254,13 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         if (rx_apply) rx_prev = zone_rx_settings_apply_locked(entry, zone_rx_settings_parse(entry->domain, rx_text, rx_len));
         if (zone_install_builder(entry, &tmp_arena, "XFR") != 0) {
           if (rx_apply) zone_ext_shared_unref(zone_rx_settings_apply_locked(entry, rx_prev));
+          entry->serial = old_serial;
+          entry->refresh = old_refresh;
+          entry->retry = old_retry;
+          entry->expire = old_expire;
+          atomic_store_explicit(&entry->next_check, old_next_check, memory_order_release);
+          atomic_store_explicit(&entry->expire_at, old_expire_at, memory_order_release);
+          atomic_store_explicit(&entry->last_successful_transfer, old_last_ok, memory_order_release);
           pthread_mutex_unlock(&entry->writer_lock);
           if (unsigned_msgs) free(unsigned_msgs);
           zone_arena_destroy(&tmp_arena);
