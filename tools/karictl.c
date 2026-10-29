@@ -547,7 +547,11 @@ int main(int argc, char **argv) {
                     strftime(transfer_time_str, sizeof(transfer_time_str), "%Y-%m-%d %H:%M:%S", tm_x);
                 }
 
-                printf("Zone: %s (view: %s)\n", snap.domain, snap.view_name[0] ? snap.view_name : "default");
+                if (snap.shared_views[0])   /* in-view: one entry for the zone, in its owner view, and the views it is shared to */
+                    printf("Zone: %s (view: %s, shared to views: %s)\n", snap.domain, snap.view_name[0] ? snap.view_name : "default",
+                           snap.shared_views);
+                else
+                    printf("Zone: %s (view: %s)\n", snap.domain, snap.view_name[0] ? snap.view_name : "default");
                 printf("  Role:                  %s\n", snap.is_secondary ? "secondary" : "primary");
                 printf("  SOA Serial:            %u\n", snap.soa_serial);
                 printf("  Queries Total:         %lu (TCP: %lu)\n", (unsigned long)snap.queries_total, (unsigned long)snap.tcp_queries);

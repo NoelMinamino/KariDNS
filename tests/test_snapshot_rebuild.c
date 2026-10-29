@@ -1138,6 +1138,131 @@ static void test_ixfr_history_reload(void) {
     printf("  -> ixfr-history on reload passed.\n");
 }
 
+/* batch 8: zone { in-view "a"; } -- the referencing view holds the entry of the owner view (BIND bin/named/server.c configure_zone() adds the zone
+ * object of the other view with dns_view_addzone()).  The snapshot has one zone_db_entry_t, in two views; it ticks and is listed once. */
+static void test_snapshot_in_view(void) {
+    printf("[TEST] Snapshot Rebuild: a zone shared with an earlier view (in-view)...\n");
+    wfile("iv.zone", "$ORIGIN iv.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.1\nwww IN A 192.0.2.11\n");
+    wfile("ivown.zone", "$ORIGIN own.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.1\n");
+    const char *conf1 =
+        "options { directory \"%s\"; };\n"
+        "view \"a\" { match-clients { 127.0.0.1; };\n"
+        "  zone \"iv.example\" { type master; file \"%s/iv.zone\"; };\n"
+        "  zone \"sec.example\" { type slave; masters { 192.0.2.53; }; }; };\n"
+        "view \"b\" { match-clients { 127.0.0.2; }; zone \"iv.example\" { in-view \"a\"; };\n"
+        "  zone \"sec.example\" { in-view \"a\"; }; zone \"own.example\" { type master; file \"%s/ivown.zone\"; }; };\n"
+        "view \"c\" { match-clients { any; }; zone \"iv.example\" { in-view \"a\"; }; };\n";
+    server_config_t *c1 = load_conf(conf1, g_dir, g_dir, g_dir);
+    zone_db_snapshot_t *s1 = build(c1, false);
+    view_snapshot_t *va = snapshot_find_view(s1, "a"), *vb = snapshot_find_view(s1, "b"), *vc = snapshot_find_view(s1, "c");
+    assert(va && vb && vc);
+    zone_db_entry_t *za = snapshot_get_zone_in_view(s1, "a", "iv.example."), *sa = snapshot_get_zone_in_view(s1, "a", "sec.example.");
+    zone_db_entry_t *zb = snapshot_get_zone_in_view(s1, "b", "iv.example."), *zc = snapshot_get_zone_in_view(s1, "c", "iv.example.");
+    zone_db_entry_t *sb = snapshot_get_zone_in_view(s1, "b", "sec.example."), *ob = snapshot_get_zone_in_view(s1, "b", "own.example.");
+    assert(za && sa && za == zb && za == zc && sa == sb && ob && ob != za);
+    assert(strcmp(za->view_name, "a") == 0 && strcmp(sb->view_name, "a") == 0 && strcmp(ob->view_name, "b") == 0);   /* the owner's name stays */
+    assert(va->zone_count == 2 && va->static_count == 2 && va->shared_count == 0);
+    assert(vb->zone_count == 3 && vb->static_count == 1 && vb->shared_count == 2);
+    assert(vc->zone_count == 1 && vc->static_count == 0 && vc->shared_count == 1);
+    assert(view_owns_entry(va, za) && !view_owns_entry(vb, zb) && view_owns_entry(vb, ob) && !view_owns_entry(vc, zc));
+    assert(atomic_load(&za->snapshot_refs) >= 3);                       /* a, b and c each count it */
+    /* the 1-second tick: the secondary is in the owner view's list only, never in the referencing view's */
+    assert(va->tick_count == 1 && va->tick_entries[0] == sa);
+    assert(vb->tick_count == 0 && vc->tick_count == 0);
+    /* the query path: the client's address selects the view, the view finds the shared entry, whose data are the owner's */
+    assert(find_zone_in_view(select_view(s1, "127.0.0.2"), "www.iv.example.") == za);
+    assert(find_zone_in_view(select_view(s1, "192.0.2.200"), "www.iv.example.") == za);
+    assert(find_zone_in_view(select_view(s1, "127.0.0.1"), "www.iv.example.") == za);
+    assert(find_zone_for_query(select_view(s1, "127.0.0.2"), "iv.example.", 43) == za);
+    zone_version_t *ver = atomic_load_explicit(&za->rcu.active, memory_order_acquire);
+    assert(ver && ver->image && ver->image->n_rrs >= 3);                /* loaded once, by the owner's zone { } */
+    /* configuration lookups: the owner's zone { } for the entry, and for the name in the referencing view */
+    zone_config_t *oc = view_find_zone_config(config_find_view(c1, "a"), "iv.example.");
+    assert(oc && zone_entry_config(c1, zb) == oc && find_zone_config_in_view(c1, "b", "iv.example.") == oc);
+    assert(find_zone_config_in_view(c1, "c", "iv.example.") == oc && find_zone_config_in_view(c1, "c", "own.example.") == NULL);
+    zone_lookup_result_t lr;
+    memset(&lr, 0, sizeof(lr));
+    assert(lookup_zone_across_views(s1, c1, "iv.example.", NULL, &lr) == 1);       /* karictl notify <zone>: one zone, not three */
+    assert(lr.entry == za && strcmp(lr.view_name, "a") == 0);
+    memset(&lr, 0, sizeof(lr));
+    assert(lookup_zone_across_views(s1, c1, "iv.example.", "c", &lr) == 1);        /* naming the referencing view reaches the owner's zone */
+    assert(lr.entry == za && lr.zcfg == oc && strcmp(lr.view_name, "a") == 0);
+    assert(lookup_zone_across_views(s1, c1, "own.example.", "a", &lr) == 0);
+    /* a reload that changes nothing keeps the entries and the sharing (the fast path copies the views) */
+    server_config_t *c2 = load_conf(conf1, g_dir, g_dir, g_dir);
+    zone_db_snapshot_t *s2 = build(c2, false);
+    assert(snapshot_get_zone_in_view(s2, "a", "iv.example.") == za && snapshot_get_zone_in_view(s2, "c", "iv.example.") == za);
+    assert(snapshot_find_view(s2, "b")->shared_count == 2 && snapshot_find_view(s2, "b")->zone_count == 3);
+    assert(snapshot_find_view(s2, "a")->tick_count == 1 && snapshot_find_view(s2, "b")->tick_count == 0);
+    /* the in-view of view c is dropped: c no longer has the zone; view b keeps it */
+    server_config_t *c3 = load_conf(
+        "options { directory \"%s\"; };\n"
+        "view \"a\" { match-clients { 127.0.0.1; };\n"
+        "  zone \"iv.example\" { type master; file \"%s/iv.zone\"; };\n"
+        "  zone \"sec.example\" { type slave; masters { 192.0.2.53; }; }; };\n"
+        "view \"b\" { match-clients { 127.0.0.2; }; zone \"iv.example\" { in-view \"a\"; };\n"
+        "  zone \"sec.example\" { in-view \"a\"; }; zone \"own.example\" { type master; file \"%s/ivown.zone\"; }; };\n"
+        "view \"c\" { match-clients { any; }; zone \"own.example\" { type master; file \"%s/ivown.zone\"; }; };\n", g_dir, g_dir, g_dir, g_dir);
+    zone_db_snapshot_t *s3 = build(c3, false);
+    assert(snapshot_get_zone_in_view(s3, "c", "iv.example.") == NULL && snapshot_find_view(s3, "c")->shared_count == 0);
+    assert(snapshot_get_zone_in_view(s3, "b", "iv.example.") == za && snapshot_find_view(s3, "b")->shared_count == 2);
+    assert(snapshot_find_view(s3, "a")->tick_count == 1 && snapshot_find_view(s3, "b")->tick_count == 0);
+    /* retargeted: c shares iv.example from view b's... b only shares it, so the zone moves: a real zone { } in b replaces the in-view there */
+    server_config_t *c4 = load_conf(
+        "options { directory \"%s\"; };\n"
+        "view \"a\" { match-clients { 127.0.0.1; };\n"
+        "  zone \"iv.example\" { type master; file \"%s/iv.zone\"; };\n"
+        "  zone \"sec.example\" { type slave; masters { 192.0.2.53; }; }; };\n"
+        "view \"b\" { match-clients { 127.0.0.2; }; zone \"iv.example\" { type master; file \"%s/iv.zone\"; };\n"
+        "  zone \"sec.example\" { in-view \"a\"; }; zone \"own.example\" { type master; file \"%s/ivown.zone\"; }; };\n"
+        "view \"c\" { match-clients { any; }; zone \"iv.example\" { in-view \"b\"; }; };\n", g_dir, g_dir, g_dir, g_dir);
+    zone_db_snapshot_t *s4 = build(c4, false);
+    zone_db_entry_t *zb4 = snapshot_get_zone_in_view(s4, "b", "iv.example."), *zc4 = snapshot_get_zone_in_view(s4, "c", "iv.example.");
+    assert(zb4 && zb4 != za && strcmp(zb4->view_name, "b") == 0);       /* it was a shared entry of a: the zone { } of b is a new entry */
+    assert(zc4 == zb4 && snapshot_find_view(s4, "b")->shared_count == 1 && snapshot_find_view(s4, "c")->shared_count == 1);
+    assert(view_owns_entry(snapshot_find_view(s4, "b"), zb4) && !view_owns_entry(snapshot_find_view(s4, "c"), zc4));
+    assert(snapshot_get_zone_in_view(s4, "a", "iv.example.") == za);
+    assert(snapshot_find_view(s4, "a")->tick_count == 1 && snapshot_find_view(s4, "b")->tick_count == 0);
+    /* a reload of the same retargeted configuration also keeps the sharing; a different target of the same name is noticed */
+    server_config_t *c5 = load_conf(
+        "options { directory \"%s\"; };\n"
+        "view \"a\" { match-clients { 127.0.0.1; };\n"
+        "  zone \"iv.example\" { type master; file \"%s/iv.zone\"; };\n"
+        "  zone \"sec.example\" { type slave; masters { 192.0.2.53; }; }; };\n"
+        "view \"b\" { match-clients { 127.0.0.2; }; zone \"iv.example\" { type master; file \"%s/iv.zone\"; };\n"
+        "  zone \"sec.example\" { in-view \"a\"; }; zone \"own.example\" { type master; file \"%s/ivown.zone\"; }; };\n"
+        "view \"c\" { match-clients { any; }; zone \"iv.example\" { in-view \"a\"; }; };\n", g_dir, g_dir, g_dir, g_dir);
+    zone_db_snapshot_t *s5 = build(c5, false);
+    assert(snapshot_get_zone_in_view(s5, "c", "iv.example.") == za && snapshot_get_zone_in_view(s5, "b", "iv.example.") == zb4);
+    /* a catalog update (delta mode) copies the views and keeps the sharing; a shared secondary does not tick in the referencing view */
+    wfile("ivcat.zone", "$ORIGIN ivcat.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.1\nversion IN TXT \"2\"\n");
+    server_config_t *c6 = load_conf(
+        "options { directory \"%s\"; };\n"
+        "view \"a\" { match-clients { 127.0.0.1; };\n"
+        "  zone \"ivcat.example\" { type master; file \"%s/ivcat.zone\"; catalog-zone yes; };\n"
+        "  zone \"iv.example\" { type master; file \"%s/iv.zone\"; };\n"
+        "  zone \"sec.example\" { type slave; masters { 192.0.2.53; }; }; };\n"
+        "view \"b\" { match-clients { 127.0.0.2; }; zone \"iv.example\" { in-view \"a\"; }; zone \"sec.example\" { in-view \"a\"; }; };\n"
+        "view \"c\" { match-clients { any; }; zone \"sec.example\" { in-view \"a\"; }; };\n", g_dir, g_dir, g_dir);
+    zone_db_snapshot_t *s6 = build(c6, false);
+    zone_db_entry_t *cat6 = snapshot_get_zone_in_view(s6, "a", "ivcat.example.");
+    zone_db_entry_t *sec6 = snapshot_get_zone_in_view(s6, "a", "sec.example.");
+    assert(cat6 && sec6 && snapshot_get_zone_in_view(s6, "c", "sec.example.") == sec6);
+    catalog_member_id_t *none = calloc(1, sizeof(*none));
+    assert(none != NULL);
+    zone_db_snapshot_t *s7 = rebuild_zone_db_snapshot(NULL, "a", cat6, NULL, none, 0);
+    assert(s7 != NULL);
+    assert(snapshot_get_zone_in_view(s7, "b", "sec.example.") == sec6 && snapshot_get_zone_in_view(s7, "c", "sec.example.") == sec6);
+    assert(snapshot_find_view(s7, "b")->shared_count == 2 && snapshot_find_view(s7, "c")->shared_count == 1);
+    assert(snapshot_find_view(s7, "a")->tick_count == 1 && snapshot_find_view(s7, "b")->tick_count == 0 && snapshot_find_view(s7, "c")->tick_count == 0);
+    assert(snapshot_find_view(s7, "a")->shared_count == 0);
+    release_zone_snapshot(s1);
+    release_zone_snapshot(s2);
+    release_zone_snapshot(s3);
+    release_zone_snapshot(s4);
+    release_zone_snapshot(s5);
+}
+
 int main(void) {
     /* Line-buffered progress + a hang watchdog (exit 124 with the phase) so a
      * stalled run fails fast in CI instead of blocking the job. */
@@ -1183,6 +1308,7 @@ int main(void) {
     test_snapshot_rebuild_case_33();
     test_snapshot_rebuild_case_35();
     test_retire_object_and_entry_config();
+    test_snapshot_in_view();
     /* Remove the scratch directory in-process: detached snapshot GC threads may
      * still be running here, and fork()/exec from a multi-threaded process (as
      * system("rm -rf") did) can deadlock the child under ASan. */

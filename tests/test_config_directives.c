@@ -3147,14 +3147,14 @@ static void test_bind_compat_paths(void) {
     /* the rest of a skipped block is skipped as a whole, braces and all; an unterminated one is an error */
     expect_an_error("unterminated skipped zone", "zone \".\" { type hint; file \"r\"; ", "");
     expect_reject("skipped zone without ';'", "zone \".\" { type hint; } zone \"x\" { type primary; };");
-    /* forward keeps its KariDNS meaning; in-view is a clear error (not an empty zone) */
+    /* forward keeps its KariDNS meaning; in-view is a zone of an earlier view (batch 8: test_in_view()), and an error where there is none */
     if (parse_ok("zone \"f.example\" { type forward; forwarders { 192.0.2.53; }; };", &cfg)) {
         const zone_config_t *z = first_zone(&cfg);
         CHECK(z && z->type && strcmp(z->type, "forward") == 0);
         free_server_config_fields(&cfg);
     }
-    expect_an_error("in-view", "view \"a\" { zone \"x\" { type primary; file \"x.db\"; }; };\nview \"b\" { zone \"x\" { in-view \"a\"; }; };",
-                    "zone 'x.'|in-view|not supported");
+    expect_an_error("in-view of a missing view", "view \"b\" { zone \"x\" { in-view \"a\"; }; };",
+                    "zone 'x.'|'in-view' zone 'x.' does not exist in view 'a', or view 'a' is not yet defined");
     expect_an_error("unknown type", "zone \"x\" { type frobnicate; };", "Unknown zone type 'frobnicate'");
 
     /* options { port }: only 1..65535 digits */
@@ -4078,8 +4078,289 @@ static void test_bind_option_values_update_policy(void) {
     }
 }
 
+/* ---- BIND compatibility, batch 8: zone { in-view }, in-view-settings, minimal-responses in view { }, the >100 warning ----
+ * lib/isccfg/check.c check_zoneconf() (the target must exist in a view defined earlier; only in-view, forward and forwarders may be written with it),
+ * bin/named/server.c configure_zone() (the zone object of the other view is added to this view), lib/ns/query.c (client->view->minimalresponses). */
+#define IV_OWN "view \"a\" { match-clients { 127.0.0.2; }; zone \"x.test\" { type primary; file \"x.db\"; }; };\n"
+#define IV_B(body) "view \"b\" { match-clients { any; }; zone \"x.test\" { " body " }; };"
+static void test_in_view(void) {
+    server_config_t cfg;
+    char msg[4096];
+    /* the plain case: b shares the primary zone of a */
+    if (ok_with("in-view", IV_OWN IV_B("in-view \"a\";"), "", &cfg)) {
+        const view_config_t *a = config_find_view(&cfg, "a"), *b = config_find_view(&cfg, "b");
+        CHECK(a && b && cfg.any_in_view);
+        CHECK(b && !b->zones && b->in_view_zones && !b->in_view_zones->next);                  /* the stub is not in the list of zone { } blocks */
+        CHECK(b && view_find_zone_config(b, "x.test") == NULL);                                 /* ... nor found as one ... */
+        zone_config_t *s = b ? view_find_in_view(b, "x.test.") : NULL;                          /* ... but found as a stub (a trailing dot is the same name) */
+        CHECK(s && s->type == NULL && zext(s)->iv && strcmp(zext(s)->iv->view, "a") == 0);
+        CHECK(s && zext(s)->iv->target == view_find_zone_config(a, "x.test"));
+        CHECK(s && config_in_view_mode(&cfg, b, zext(s)->iv) == IVS_OWNER);                     /* the default is BIND's behaviour */
+        char sh[64];
+        CHECK(config_in_view_sharers(&cfg, "a", "x.test.", sh, sizeof(sh)) == 1 && strcmp(sh, "b") == 0);
+        CHECK(config_in_view_sharers(&cfg, "b", "x.test.", sh, sizeof(sh)) == 0 && sh[0] == '\0');
+        CHECK(config_in_view_sharers(&cfg, "a", "y.test.", sh, sizeof(sh)) == 0);
+        free_server_config_fields(&cfg);
+    }
+    /* a secondary zone can be shared; several views can share the zone; forward / forwarders are allowed next to in-view */
+    if (ok_with("secondary, three views, forwarders",
+                "view \"a\" { match-clients { 127.0.0.2; }; zone \"x.test\" { type secondary; primaries { 192.0.2.1; }; }; };\n"
+                "view \"b\" { match-clients { 127.0.0.3; }; zone \"x.test\" { in-view \"a\"; forward only; forwarders { 192.0.2.53; }; }; };\n"
+                "view \"c\" { match-clients { any; }; zone \"x.test\" { in-view \"A\"; }; };", "", &cfg)) {
+        char sh[64];
+        CHECK(config_in_view_sharers(&cfg, "a", "x.test", sh, sizeof(sh)) == 2 && strcmp(sh, "b, c") == 0);
+        free_server_config_fields(&cfg);
+    }
+    /* the sharers list ends with "..." when it does not fit */
+    if (ok_with("sharers truncated",
+                IV_OWN "view \"bbbbbbbbbb\" { match-clients { any; }; zone \"x.test\" { in-view \"a\"; }; };"
+                "view \"cccccccccc\" { match-clients { any; }; zone \"x.test\" { in-view \"a\"; }; };", "", &cfg)) {
+        char sh[16];
+        CHECK(config_in_view_sharers(&cfg, "a", "x.test", sh, sizeof(sh)) == 2 && strlen(sh) < sizeof(sh) && strcmp(sh + strlen(sh) - 3, "...") == 0);
+        CHECK(config_in_view_sharers(&cfg, "a", "x.test", NULL, 0) == 2);
+        free_server_config_fields(&cfg);
+    }
+
+    /* the BIND errors, with the text of lib/isccfg/check.c */
+    expect_an_error("no such view", "view \"b\" { match-clients { any; }; zone \"x.test\" { in-view \"nope\"; }; };",
+                    "line 1|zone 'x.test.'|'in-view' zone 'x.test.' does not exist in view 'nope', or view 'nope' is not yet defined");
+    expect_an_error("no such zone", IV_OWN "view \"b\" { match-clients { any; }; zone \"y.test\" { in-view \"a\"; }; };",
+                    "'in-view' zone 'y.test.' does not exist in view 'a', or view 'a' is not yet defined");
+    expect_an_error("target view defined later", IV_B("in-view \"a\";") "\n" IV_OWN,
+                    "'in-view' zone 'x.test.' does not exist in view 'a', or view 'a' is not yet defined");
+    expect_an_error("target is the view itself",
+                    "view \"a\" { match-clients { any; }; zone \"x.test\" { type primary; file \"x.db\"; }; zone \"y.test\" { in-view \"a\"; }; };",
+                    "does not exist in view 'a', or view 'a' is not yet defined");
+    expect_an_error("outside every view", "zone \"x.test\" { in-view \"a\"; };", "'in-view' zone 'x.test.' does not exist in view 'a'");
+    expect_an_error("type with in-view", IV_OWN IV_B("type primary; in-view \"a\";"),
+                    "zone 'x.test.': 'in-view' used with incompatible zone options");
+    expect_an_error("skipped type after in-view", IV_OWN IV_B("in-view \"a\"; type hint;"),
+                    "zone 'x.test.': 'in-view' used with incompatible zone options");
+    expect_an_error("file with in-view", IV_OWN IV_B("in-view \"a\"; file \"x.db\";"),
+                    "zone 'x.test.': 'in-view' used with incompatible zone options");
+    expect_an_error("also-notify with in-view", IV_OWN IV_B("in-view \"a\"; also-notify { 192.0.2.9; };"),
+                    "'in-view' used with incompatible zone options");
+    expect_an_error("in-view twice in one view", IV_OWN "view \"b\" { match-clients { any; }; zone \"x.test\" { in-view \"a\"; }; zone \"x.test\" { in-view \"a\"; }; };",
+                    "Duplicate zone 'x.test.' defined in view 'b'");
+    expect_an_error("zone, then in-view of one name in a view",
+                    IV_OWN "view \"b\" { match-clients { any; }; zone \"x.test\" { type primary; file \"y.db\"; }; zone \"x.test\" { in-view \"a\"; }; };",
+                    "Duplicate zone 'x.test.' defined in view 'b'");
+    expect_an_error("in-view, then zone of one name in a view",
+                    IV_OWN "view \"b\" { match-clients { any; }; zone \"x.test\" { in-view \"a\"; }; zone \"x.test\" { type primary; file \"y.db\"; }; };",
+                    "Duplicate zone 'x.test.' defined in view 'b'");
+    expect_an_error("in-view needs a name", IV_OWN IV_B("in-view;"), "");
+    expect_an_error("in-view needs a semicolon", IV_OWN IV_B("in-view \"a\""), "");
+    /* what cannot be shared in phase 1 */
+    expect_an_error("program zone",
+                    "options { allow-program-zones yes; };\nview \"a\" { match-clients { 127.0.0.2; }; zone \"x.test\" { type program; program \"/bin/true\"; }; };\n"
+                    IV_B("in-view \"a\";"), "is not a primary or secondary zone");
+    expect_an_error("forward zone",
+                    "view \"a\" { match-clients { 127.0.0.2; }; zone \"x.test\" { type forward; forwarders { 192.0.2.53; }; }; };\n" IV_B("in-view \"a\";"),
+                    "is not a primary or secondary zone");
+    expect_an_error("catalog zone",
+                    "view \"a\" { match-clients { 127.0.0.2; }; zone \"x.test\" { type primary; file \"x.db\"; catalog-zone yes; }; };\n" IV_B("in-view \"a\";"),
+                    "is not a primary or secondary zone");
+    expect_an_error("a skipped zone type is not a target",
+                    "view \"a\" { match-clients { 127.0.0.2; }; zone \"x.test\" { type hint; file \"h\"; }; };\n" IV_B("in-view \"a\";"),
+                    "does not exist in view 'a'");
+
+    /* in-view-settings: values and places */
+    static const struct { const char *text; int mode; } ivs[] = { { "owner", IVS_OWNER }, { "view", IVS_VIEW }, { "VIEW", IVS_VIEW }, { "Owner", IVS_OWNER } };
+    for (size_t i = 0; i < sizeof(ivs) / sizeof(ivs[0]); i++) {
+        char txt[512];
+        snprintf(txt, sizeof(txt), "options { in-view-settings %s; };\n" IV_OWN IV_B("in-view \"a\";"), ivs[i].text);
+        if (ok_with(ivs[i].text, txt, "", &cfg)) {
+            const view_config_t *b = config_find_view(&cfg, "b");
+            CHECK_MSG(cfg.in_view_settings == ivs[i].mode && b && config_in_view_mode(&cfg, b, zext(b->in_view_zones)->iv) == ivs[i].mode,
+                      "options in-view-settings %s", ivs[i].text);
+            free_server_config_fields(&cfg);
+        }
+    }
+    /* the zone's value wins over the view's, which wins over options' */
+    if (ok_with("in-view-settings levels",
+                "options { in-view-settings view; };\n" IV_OWN
+                "view \"b\" { match-clients { 127.0.0.3; }; in-view-settings owner; zone \"x.test\" { in-view \"a\"; }; };\n"
+                "view \"c\" { match-clients { 127.0.0.4; }; in-view-settings owner; zone \"x.test\" { in-view \"a\"; in-view-settings view; }; };\n"
+                "view \"d\" { match-clients { any; }; zone \"x.test\" { in-view \"a\"; }; };", "", &cfg)) {
+        CHECK(config_in_view_mode(&cfg, config_find_view(&cfg, "b"), zext(config_find_view(&cfg, "b")->in_view_zones)->iv) == IVS_OWNER);
+        CHECK(config_in_view_mode(&cfg, config_find_view(&cfg, "c"), zext(config_find_view(&cfg, "c")->in_view_zones)->iv) == IVS_VIEW);
+        CHECK(config_in_view_mode(&cfg, config_find_view(&cfg, "d"), zext(config_find_view(&cfg, "d")->in_view_zones)->iv) == IVS_VIEW);
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("in-view-settings value (options)", "options { in-view-settings both; };", "line 1|options|in-view-settings: invalid value 'both'|owner or view");
+    expect_an_error("in-view-settings value (view)", "view \"v\" { match-clients { any; }; in-view-settings x; };", "view 'v'|in-view-settings: invalid value 'x'");
+    expect_an_error("in-view-settings value (zone)", IV_OWN IV_B("in-view \"a\"; in-view-settings x;"), "invalid in-view-settings value 'x'|owner or view");
+    expect_an_error("in-view-settings semicolon", "options { in-view-settings view };", "");
+    expect_an_error("in-view-settings without in-view", "zone \"x.test\" { type primary; file \"x\"; in-view-settings view; };",
+                    "'in-view-settings' is only valid in a zone with 'in-view'");
+    if (ok_with("in-view-settings alone in options and view", "options { in-view-settings view; };\nview \"v\" { match-clients { any; }; in-view-settings owner; };", "", &cfg))
+        free_server_config_fields(&cfg);
+
+    /* owner: the ACLs are refused in an in-view zone (BIND's error); view: they are accepted, and are the stub's own */
+    static const char *const acls[] = { "allow-query { 127.0.0.3; };", "allow-query-on { any; };", "allow-transfer { 127.0.0.3; };", "allow-update { 127.0.0.3; };",
+                                        "allow-notify { 127.0.0.3; };" };
+    for (size_t i = 0; i < sizeof(acls) / sizeof(acls[0]); i++) {
+        char txt[640];
+        snprintf(txt, sizeof(txt), IV_OWN IV_B("in-view \"a\"; %s"), acls[i]);
+        expect_an_error(acls[i], txt, "zone 'x.test.'|'in-view' used with incompatible zone options|in-view-settings view");
+        snprintf(txt, sizeof(txt), IV_OWN IV_B("in-view \"a\"; in-view-settings view; %s"), acls[i]);
+        if (ok_with(acls[i], txt, "", &cfg)) {
+            const view_config_t *b = config_find_view(&cfg, "b");
+            const zone_config_t *s = b ? b->in_view_zones : NULL;
+            CHECK_MSG(s && (zext(s)->acl.query || zext(s)->acl.query_on || zext(s)->acl.transfer || zext(s)->acl.update || zext(s)->acl.notify), "%s", acls[i]);
+            free_server_config_fields(&cfg);
+        }
+        snprintf(txt, sizeof(txt), "options { in-view-settings view; };\n" IV_OWN IV_B("in-view \"a\"; %s"), acls[i]);
+        if (ok_with(acls[i], txt, "", &cfg)) free_server_config_fields(&cfg);
+        snprintf(txt, sizeof(txt), IV_OWN "view \"b\" { match-clients { any; }; in-view-settings view; zone \"x.test\" { in-view \"a\"; %s }; };", acls[i]);
+        if (ok_with(acls[i], txt, "", &cfg)) free_server_config_fields(&cfg);
+        /* the zone's own `owner` wins over the options' `view` */
+        snprintf(txt, sizeof(txt), "options { in-view-settings view; };\n" IV_OWN IV_B("in-view \"a\"; in-view-settings owner; %s"), acls[i]);
+        expect_an_error("owner in the zone", txt, "'in-view' used with incompatible zone options");
+    }
+    /* named ACLs and keys in the stub's lists are resolved like those of any zone; a query ACL of the stub turns the query path's ACL check on */
+    if (ok_with("stub ACL names and keys",
+                "key \"k1\" { algorithm hmac-sha256; secret \"" SECRET_OK "\"; };\nacl \"friends\" { 127.0.0.3; };\n" IV_OWN
+                "view \"b\" { match-clients { any; }; in-view-settings view; zone \"x.test\" { in-view \"a\"; allow-query { friends; }; allow-transfer { key \"k1\"; }; }; };",
+                "", &cfg)) {
+        const view_config_t *b = config_find_view(&cfg, "b");
+        const zone_config_t *s = b ? b->in_view_zones : NULL;
+        CHECK(cfg.acl_query_active && s && zext(s)->acl.query && zext(s)->acl.transfer);
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("stub ACL with an undefined name",
+                    IV_OWN "view \"b\" { match-clients { any; }; in-view-settings view; zone \"x.test\" { in-view \"a\"; allow-query { nobody; }; }; };",
+                    "zone 'x.test.' allow-query");
+
+    /* the ACL chain (dns_tsig_acl.c): stub, zone, view, options in view mode; zone, owner view, options in owner mode */
+    {
+        const char *txt =
+            "options { allow-query { 127.0.0.9; }; allow-transfer { 127.0.0.9; }; };\n"
+            "view \"a\" { match-clients { 127.0.0.2; }; allow-query { 127.0.0.10; }; allow-transfer { 127.0.0.10; };\n"
+            "  zone \"x.test\" { type primary; file \"x.db\"; allow-update { 127.0.0.11; }; }; };\n"
+            "view \"b\" { match-clients { 127.0.0.3; }; allow-query { 127.0.0.12; }; allow-transfer { 127.0.0.12; }; allow-notify { 127.0.0.12; };\n"
+            "  zone \"x.test\" { in-view \"a\"; }; };\n"
+            "view \"c\" { match-clients { 127.0.0.4; }; allow-query { 127.0.0.13; }; allow-transfer { 127.0.0.13; }; in-view-settings view;\n"
+            "  zone \"x.test\" { in-view \"a\"; allow-query { 127.0.0.14; }; }; };\n";
+        if (ok_with("chain config", txt, "", &cfg)) {
+            const zone_config_t *own = view_find_zone_config(config_find_view(&cfg, "a"), "x.test");
+            const aml_t *l;
+            /* through the owner view: zone (update), then the view a, then options */
+            l = config_acl_for(&cfg, own, "a", AML_ACL_QUERY);
+            CHECK(l && l == config_find_view(&cfg, "a")->acl.query);
+            l = config_acl_for(&cfg, own, "a", AML_ACL_UPDATE);
+            CHECK(l && l == zext(own)->acl.update);
+            /* through b, owner mode: the owner view's lists, not b's */
+            l = config_acl_for(&cfg, own, "b", AML_ACL_QUERY);
+            CHECK(l && l == config_find_view(&cfg, "a")->acl.query);
+            l = config_acl_for(&cfg, own, "b", AML_ACL_TRANSFER);
+            CHECK(l && l == config_find_view(&cfg, "a")->acl.transfer);
+            l = config_acl_for(&cfg, own, "b", AML_ACL_UPDATE);
+            CHECK(l && l == zext(own)->acl.update);
+            l = config_acl_for(&cfg, own, "b", AML_ACL_NOTIFY);              /* b's allow-notify is not the owner's: a and options have none */
+            CHECK(l == NULL);
+            /* through c, view mode: the stub's own allow-query, else the owner zone's, else c's, else options' */
+            l = config_acl_for(&cfg, own, "c", AML_ACL_QUERY);
+            CHECK(l && l == zext(config_find_view(&cfg, "c")->in_view_zones)->acl.query);
+            l = config_acl_for(&cfg, own, "c", AML_ACL_UPDATE);              /* c writes none: the owner zone's */
+            CHECK(l && l == zext(own)->acl.update);
+            l = config_acl_for(&cfg, own, "c", AML_ACL_TRANSFER);            /* neither the stub nor the zone: the referencing view's */
+            CHECK(l && l == config_find_view(&cfg, "c")->acl.transfer);
+            l = config_acl_for(&cfg, own, "c", AML_ACL_NOTIFY);              /* nowhere */
+            CHECK(l == NULL);
+            /* an unknown view name falls back to the zone and options */
+            l = config_acl_for(&cfg, own, "nope", AML_ACL_QUERY);
+            CHECK(l && l == cfg.acl.query);
+            /* the evaluation functions use the same chain */
+            CHECK(query_acl_permits(&cfg, own, "a", "127.0.0.10", NULL, NULL));
+            CHECK(query_acl_permits(&cfg, own, "b", "127.0.0.10", NULL, NULL));          /* b -> owner view a's allow-query */
+            CHECK(!query_acl_permits(&cfg, own, "b", "127.0.0.12", NULL, NULL));         /* b's own allow-query does not apply in owner mode */
+            CHECK(query_acl_permits(&cfg, own, "c", "127.0.0.14", NULL, NULL));          /* c: the stub's allow-query */
+            CHECK(!query_acl_permits(&cfg, own, "c", "127.0.0.13", NULL, NULL));         /* c's view allow-query is overridden by the stub's */
+            CHECK(zone_transfer_acl_allows_in_view(&cfg, own, "a", "127.0.0.10", NULL));
+            CHECK(zone_transfer_acl_allows_in_view(&cfg, own, "b", "127.0.0.10", NULL));
+            CHECK(!zone_transfer_acl_allows_in_view(&cfg, own, "b", "127.0.0.12", NULL));
+            CHECK(zone_transfer_acl_allows_in_view(&cfg, own, "c", "127.0.0.13", NULL)); /* c: no stub / zone list, c's view list */
+            CHECK(!zone_transfer_acl_allows_in_view(&cfg, own, "c", "127.0.0.10", NULL));
+            CHECK(zone_update_acl_allows_in_view(&cfg, own, "b", "127.0.0.11", NULL));
+            CHECK(zone_update_acl_allows_in_view(&cfg, own, "c", "127.0.0.11", NULL));
+            CHECK(!zone_notify_acl_allows(&cfg, own, "b", "127.0.0.12", NULL));
+            free_server_config_fields(&cfg);
+        }
+    }
+    /* the stub's own transfer / update list decides in view mode, over the owner's flat lists (allow-transfer of the zone as written) */
+    if (ok_with("stub transfer over owner flat list",
+                "view \"a\" { match-clients { 127.0.0.2; };\n  zone \"x.test\" { type primary; file \"x.db\"; allow-transfer { 127.0.0.20; }; allow-update { 127.0.0.20; }; }; };\n"
+                "view \"b\" { match-clients { any; }; in-view-settings view; zone \"x.test\" { in-view \"a\"; allow-transfer { 127.0.0.21; }; allow-update { 127.0.0.21; }; }; };",
+                "", &cfg)) {
+        const zone_config_t *own = view_find_zone_config(config_find_view(&cfg, "a"), "x.test");
+        CHECK(zone_transfer_acl_allows_in_view(&cfg, own, "a", "127.0.0.20", NULL) && !zone_transfer_acl_allows_in_view(&cfg, own, "a", "127.0.0.21", NULL));
+        CHECK(zone_transfer_acl_allows_in_view(&cfg, own, "b", "127.0.0.21", NULL) && !zone_transfer_acl_allows_in_view(&cfg, own, "b", "127.0.0.20", NULL));
+        CHECK(zone_update_acl_allows_in_view(&cfg, own, "a", "127.0.0.20", NULL) && !zone_update_acl_allows_in_view(&cfg, own, "a", "127.0.0.21", NULL));
+        CHECK(zone_update_acl_allows_in_view(&cfg, own, "b", "127.0.0.21", NULL) && !zone_update_acl_allows_in_view(&cfg, own, "b", "127.0.0.20", NULL));
+        free_server_config_fields(&cfg);
+    }
+    /* owner mode through b: the owner's lists */
+    if (ok_with("owner mode keeps the owner's flat lists",
+                "view \"a\" { match-clients { 127.0.0.2; };\n  zone \"x.test\" { type primary; file \"x.db\"; allow-transfer { 127.0.0.20; }; }; };\n" IV_B("in-view \"a\";"),
+                "", &cfg)) {
+        const zone_config_t *own = view_find_zone_config(config_find_view(&cfg, "a"), "x.test");
+        CHECK(zone_transfer_acl_allows_in_view(&cfg, own, "b", "127.0.0.20", NULL) && !zone_transfer_acl_allows_in_view(&cfg, own, "b", "127.0.0.21", NULL));
+        free_server_config_fields(&cfg);
+    }
+
+    /* the file:line of the in-view statement is in the target error (karicheck prints the same text) */
+    expect_an_error("line of the error", IV_OWN "\n\nview \"b\" { match-clients { any; };\n  zone \"y.test\" { in-view \"a\"; }; };", "line 5|zone 'y.test.'");
+    /* a configuration with an in-view stub is freed whole, also when a later statement fails */
+    expect_an_error("freed on a later error", IV_OWN "view \"b\" { match-clients { any; }; zone \"x.test\" { in-view \"a\"; }; bogus-option 1; };", "bogus-option");
+
+    /* view { minimal-responses } is a real per-view value (it was ignored with a warning) */
+    if (ok_with("view minimal-responses",
+                "options { minimal-responses no-auth; };\n"
+                "view \"a\" { match-clients { 127.0.0.2; }; minimal-responses yes; };\n"
+                "view \"b\" { match-clients { 127.0.0.3; }; minimal-responses no-auth-recursive; };\n"
+                "view \"c\" { match-clients { 127.0.0.4; }; minimal-responses no; };\n"
+                "view \"d\" { match-clients { any; }; };", "", &cfg)) {
+        CHECK(cfg.any_view_minimal);
+        CHECK(config_minimal_responses(&cfg, config_find_view(&cfg, "a")) == MINIMAL_YES);
+        CHECK(config_minimal_responses(&cfg, config_find_view(&cfg, "b")) == MINIMAL_NO_AUTH_RECURSIVE);
+        CHECK(config_minimal_responses(&cfg, config_find_view(&cfg, "c")) == MINIMAL_NO);                  /* an explicit no beats options' */
+        CHECK(config_minimal_responses(&cfg, config_find_view(&cfg, "d")) == MINIMAL_NO_AUTH);             /* not written: options' */
+        CHECK(config_minimal_responses(&cfg, NULL) == MINIMAL_NO_AUTH);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("no view minimal-responses", "options { minimal-responses yes; };\nview \"a\" { match-clients { any; }; };", "", &cfg)) {
+        CHECK(!cfg.any_view_minimal);
+        CHECK(config_minimal_responses(&cfg, config_find_view(&cfg, "a")) == MINIMAL_YES);
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("view minimal-responses value", "view \"a\" { match-clients { any; }; minimal-responses maybe; };", "view 'a'|minimal-responses: invalid value 'maybe'");
+    expect_an_error("view minimal-responses semicolon", "view \"a\" { match-clients { any; }; minimal-responses yes };", "");
+
+    /* max-records-per-type / max-types-per-name above BIND's default of 100: a warning (the value is applied as written); max-records has none */
+    static const char *const lvl[] = {
+        "options { %s 101; };", "view \"v\" { match-clients { any; }; %s 101; };", "zone \"x.test\" { type primary; file \"x\"; %s 101; };" };
+    static const char *const opts[] = { "max-records-per-type", "max-types-per-name" };
+    for (size_t l = 0; l < 3; l++) {
+        for (size_t o = 0; o < 2; o++) {
+            char txt[256];
+            snprintf(txt, sizeof(txt), lvl[l], opts[o]);
+            if (ok_with(txt, txt, "line 1|above BIND's default of 100", &cfg)) free_server_config_fields(&cfg);
+        }
+    }
+    {
+        int rc = parse_capture("options { max-records-per-type 100; max-types-per-name 100; max-records 5000; };", &cfg, msg, sizeof(msg));
+        CHECK(rc == 0 && strstr(msg, "above BIND") == NULL);
+        if (rc == 0) free_server_config_fields(&cfg);
+        rc = parse_capture("options { max-records-per-type 500; };", &cfg, msg, sizeof(msg));
+        CHECK(rc == 0 && strstr(msg, "above BIND's default of 100") != NULL && cfg.zv.max_per_type == 500);
+        if (rc == 0) free_server_config_fields(&cfg);
+    }
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
+    test_in_view();
     test_bind_option_values_update_policy();
     test_bind_option_values_catalog_zones();
     test_bind_option_values_dnstap();

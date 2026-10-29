@@ -3593,13 +3593,30 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
   /* 共有の応答キャッシュ (response_cache_init)。鍵の版 (rc_gen) は名前解決の前に読む:
    * 解決中に版が上がっても、古い版の鍵で入れた応答は二度と引かれない。 */
+  /* minimal-responses of the client's view (lib/ns/query.c: client->view->minimalresponses), else options'; no-auth-recursive is no-auth for a
+   * query with RD set and no for the others (ns_query_start()), so mr_mode is what the body is built with */
+  int mr_mode = MINIMAL_NO;
+  if (cfg_for_ede) {
+    const view_config_t *mr_view = (cfg_for_ede->any_view_minimal && view) ? config_find_view(cfg_for_ede, view->name) : NULL;
+    mr_mode = config_minimal_responses(cfg_for_ede, mr_view);
+    if (mr_mode == MINIMAL_NO_AUTH_RECURSIVE) mr_mode = (req[2] & 0x01) ? MINIMAL_NO_AUTH : MINIMAL_NO;
+  }
+  /* A zone shared with in-view, reached through a view that does not own it, and with NS / MX / SRV targets (current_zone->glue): the sibling
+   * zones whose addresses go into the Additional section are looked up in the CLIENT's view (append_glue_records() 3., as BIND's query_getzonedb()
+   * uses client->view), while the version, and so the cache entries and the sibling tracking of zone_glue_track_build(), belong to the owner view.
+   * What this view's siblings would give is not in the key and nothing bumps the version when they change, so such answers are neither looked up
+   * in nor stored into the cache (an entry stored for the owner view's clients would also lack, or carry, the other view's glue). */
+  bool rc_view_dependent = current_zone && current_zone->glue && db_entry && view && !view_owns_entry(view, db_entry);
   uint64_t rc_tag = 0, rc_gen = 0;
-  if (g_rcache && edns_safe_for_cache && !is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 &&
+  if (g_rcache && edns_safe_for_cache && !is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 && !rc_view_dependent &&
       current_zone && current_zone->rcache_ok && max_res_len >= 512 && q_offset < body_max_len) {
     rc_gen = zone_arena_data_generation(current_zone);
-    /* minimal-responses no-auth-recursive makes the body depend on the RD bit: it is part of the key */
-    rc_tag = rcache_tag(current_qname_lc, qtype, (uint16_t)(qclass | ((cfg && cfg->minimal_responses == MINIMAL_NO_AUTH_RECURSIVE && (req[2] & 0x01)) ? 0x8000 : 0)),
-                        rc_gen, cfg ? cfg->generation : 0);
+    /* The key has no view in it: the cache is shared by every view (a zone that two views share, in-view, has one set of entries) and the
+     * client's ACLs were checked above, so a hit is only ever served to a client that may ask.  What can make the same question to the same zone
+     * data answer differently is the response variant: here the minimal-responses mode the client's view and its RD bit select (the high bits of
+     * the class slot, which is 1 here).  Two views with the same mode share entries; the generation of the configuration covers every other
+     * setting. */
+    rc_tag = rcache_tag(current_qname_lc, qtype, (uint16_t)(qclass | (mr_mode << 12)), rc_gen, cfg ? cfg->generation : 0);
     uint16_t c_an, c_ns, c_ar;
     int blen = rcache_lookup(rc_tag, rc_gen, qtype, res + q_offset, body_max_len - q_offset, &c_an, &c_ns, &c_ar);
     if (blen > 0) {
@@ -3655,9 +3672,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   t_resolve_sibling_glue = false;
   t_resolve_alias_expanded = false;
   t_resolve_alias_failed = false;
-  /* minimal-responses no-auth-recursive: no authority NS for a query with RD set (lib/ns/query.c ns_query_start()) */
-  int minimal_mode = cfg_for_ede ? cfg_for_ede->minimal_responses : MINIMAL_NO;
-  if (minimal_mode == MINIMAL_NO_AUTH_RECURSIVE) minimal_mode = (req[2] & 0x01) ? MINIMAL_NO_AUTH : MINIMAL_NO;
+  int minimal_mode = mr_mode;   /* minimal-responses of the client's view, no-auth-recursive resolved by the RD bit (above) */
   resolve_name(current_qname, qclass, qtypes, num_qtypes, &db_entry, &current_zone, res, body_max_len,
                &offset, comp_ctx, &ancount, &nscount, &arcount,
                minimal_mode,

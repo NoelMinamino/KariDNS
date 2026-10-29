@@ -80,6 +80,10 @@ zone_config_t *find_zone_config_in_view(server_config_t *cfg,
       if (view_name && view_name[0] != '\0' && strcasecmp(v->name, view_name) != 0) continue;
       zone_config_t *z = view_find_zone_config(v, domain);
       if (z) return z;
+      /* a zone this view shares with an earlier one (zone { in-view }): the zone that holds the data, the owner's.  The ACLs of the shared
+       * zone are looked up with the view's name (dns_tsig_acl.c), so the caller gets the data settings here. */
+      zone_config_t *stub = view_find_in_view(v, domain);
+      if (stub) return stub->ext->iv->target;
       if (view_name && view_name[0] != '\0') return NULL;
     }
   } else {
@@ -148,14 +152,24 @@ int lookup_zone_across_views(zone_db_snapshot_t *snap, server_config_t *cfg,
   for (view_config_t *v = cfg->views; v; v = v->next) {
     if (view_name && v->name && strcasecmp(v->name, view_name) != 0) continue;
     zone_config_t *zcfg = view_find_zone_config(v, domain);
+    const char *ename = v->name;
+    if (!zcfg && view_name) {
+      /* a view that was named and shares the zone with an earlier one (zone { in-view }): the command is for the zone of the owner view.
+       * Without a view name the owner view alone counts, so a shared zone is one match. */
+      zone_config_t *stub = view_find_in_view(v, domain);
+      if (stub) {
+        zcfg = stub->ext->iv->target;
+        ename = stub->ext->iv->view;
+      }
+    }
     if (!zcfg) continue;
 
-    zone_db_entry_t *entry = v->name ? snapshot_get_zone_in_view(snap, v->name, domain) : NULL;
+    zone_db_entry_t *entry = ename ? snapshot_get_zone_in_view(snap, ename, domain) : NULL;
     matches++;
     if (matches == 1) {
       result->entry = entry;
       result->zcfg = zcfg;
-      result->view_name = v->name;
+      result->view_name = ename;
     }
   }
   return matches;
@@ -697,7 +711,7 @@ void zone_glue_refresh_dependents(bool force) {
     rcu_aux_read_lock();
     for (size_t i = 0; i < view->zone_count; i++) {
       zone_db_entry_t *e = view->entries[i];
-      if (!e) continue;
+      if (!e || !view_owns_entry(view, e)) continue;   /* a zone shared from another view is looked at in its own view */
       burst_yield(&by);
       zone_version_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
       zone_glue_t *g = a ? a->glue : NULL;
@@ -780,9 +794,14 @@ size_t zone_drop_unencodable_logged(zone_arena_t *a, const char *zone, const cha
   return bad_count;
 }
 
+/* Does the configuration of the view have a zone of this name: a zone { } block, or a zone it shares with an earlier view (zone { in-view }) */
+static bool view_cfg_has(const view_config_t *v, const char *name) {
+  return view_find_zone_config(v, name) != NULL || view_find_in_view(v, name) != NULL;
+}
+
 /* parse_context_t.zone_exists: name が view (ud) のゾーンの頂点か */
 static bool view_has_zone(const void *ud, const char *name) {
-  return view_find_zone_config((const view_config_t *)ud, name) != NULL;
+  return view_cfg_has((const view_config_t *)ud, name);
 }
 
 reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) {
@@ -1520,7 +1539,7 @@ static size_t dbreg_collect_view_locked(const view_config_t *vc, view_snapshot_t
         for (dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
             if (!z->entry) continue;
             burst_yield(&by);
-            bool by_cfg = view_find_zone_config(vc, z->name) != NULL;
+            bool by_cfg = view_cfg_has(vc, z->name);
             bool by_cat = false;
             if (!by_cfg && old_view) {
                 zone_db_entry_t *o = find_zone_exact_in_view(old_view, z->name);
@@ -1582,7 +1601,7 @@ static bool view_build_tick_list(view_snapshot_t *vs, const view_snapshot_t *ov,
             if (zone_entry_ticks(add[i])) list[n++] = add[i];
     } else {
         for (size_t i = 0; i < vs->zone_count; i++)
-            if (vs->entries[i] && zone_entry_ticks(vs->entries[i])) list[n++] = vs->entries[i];
+            if (vs->entries[i] && zone_entry_ticks(vs->entries[i]) && view_owns_entry(vs, vs->entries[i])) list[n++] = vs->entries[i];
     }
     vs->tick_entries = list;
     vs->tick_count = n;
@@ -1705,6 +1724,7 @@ int snapshot_apply_db_delta(void) {
         vs->name = strdup(ov->name ? ov->name : "");
         bool ok = vs->name != NULL && view_set_match_clients(vs, ov->match_clients, ov->match_clients_count);
         vs->static_count = ov->static_count;
+        vs->shared_count = ov->shared_count;
         dbreg_view_t *rv = ok ? dbreg_view_get(vs->name, false) : NULL;
         /* removals that are in this view, and additions that are still wanted and not in it yet */
         size_t nrem = 0, nadd = 0;
@@ -2234,21 +2254,32 @@ static bool g_rebuild_sets_changed = true;
  * shadows a DB zone of its name, a catalog member hides one as well), every catalog member stays valid, and the entries,
  * the hash tables and the tick list of the old view are what the new view would be built to.  A reload at 1,000,000 DB
  * zones used to walk them four times (the registry, the ixfr depth, both hash tables, the glue): 2.3 s; this is 30 ms. */
-static bool view_reusable(const view_config_t *v, view_snapshot_t *old_view) {
+static bool view_reusable(const view_config_t *v, view_snapshot_t *old_view, zone_db_snapshot_t *old_snap) {
     if (!old_view || !old_view->entries) return false;
     size_t n = 0;
     for (zone_config_t *z = v->zones; z; z = z->next, n++) {
         zone_db_entry_t *old = z->domain ? find_zone_exact_in_view(old_view, z->domain) : NULL;
-        if (!old || old->source == ZONE_SRC_DB || old->is_catalog_member || old->kind != zone_kind_from_type(z->type)) return false;
+        /* (an entry shared from another view is not this zone { }'s: the name was an in-view zone before) */
+        if (!old || !view_owns_entry(old_view, old) || old->source == ZONE_SRC_DB || old->is_catalog_member ||
+            old->kind != zone_kind_from_type(z->type)) return false;
         if (old->catalog_member_count > 0 && !z->is_catalog) return false;
     }
-    return n == old_view->static_count;
+    if (n != old_view->static_count) return false;
+    /* the zones shared with earlier views (zone { in-view }) must be the same entries of the same owner views, and no other */
+    size_t ns = 0;
+    for (zone_config_t *s = v->in_view_zones; s; s = s->next, ns++) {
+        const zone_inview_t *iv = s->ext->iv;
+        zone_db_entry_t *old = find_zone_exact_in_view(old_view, s->domain);
+        if (!old || view_owns_entry(old_view, old) || strcasecmp(old->view_name, iv->view) != 0) return false;
+        if (find_zone_exact_in_view(snapshot_find_view(old_snap, iv->view), s->domain) != old) return false;
+    }
+    return ns == old_view->shared_count;
 }
 
 static bool snapshot_views_reusable(zone_db_snapshot_t *old_snap, server_config_t *cfg) {
     if (g_dbreg_force_full || !old_snap || !old_snap->views) return false;
     for (view_config_t *v = cfg->views; v; v = v->next) {
-        if (!v->name || !view_reusable(v, snapshot_find_view(old_snap, v->name))) return false;
+        if (!v->name || !view_reusable(v, snapshot_find_view(old_snap, v->name), old_snap)) return false;
     }
     return true;
 }
@@ -2291,6 +2322,7 @@ static bool view_copy_from_old(view_snapshot_t *vs, const view_config_t *v, cons
     }
     vs->zone_count = n;
     vs->static_count = ov->static_count;
+    vs->shared_count = ov->shared_count;
     if (!tables && !view_build_hashes(vs)) return false;
     rcu_aux_read_lock();       /* B7a: a DB zone's settings block can be replaced (and freed after a grace period) meanwhile */
     for (zone_config_t *z = v->zones; z; z = z->next) {                 /* as the full rebuild sets it for a reused entry */
@@ -2310,8 +2342,33 @@ static bool view_copy_from_old(view_snapshot_t *vs, const view_config_t *v, cons
     return true;
 }
 
+/* The zones view cv shares with earlier views (zone { in-view "owner"; }, BIND bin/named/server.c configure_zone() dns_view_addzone()): the entry of
+ * the owner view is put into vs as well, with a reference of its own (the snapshot releases one per view it is in).  entry->view_name stays the
+ * owner's, so zone_entry_config() finds the owner's zone { }.  Called before the view's hash tables are built, after the owner's.  A zone whose
+ * owner entry does not exist (it could not be allocated) is left out.  false: out of memory. */
+static bool view_append_shared(zone_db_snapshot_t *snap, view_snapshot_t *vs, const view_config_t *cv) {
+    size_t ns = 0;
+    for (const zone_config_t *s = cv->in_view_zones; s; s = s->next) ns++;
+    zone_db_entry_t **ne = realloc(vs->entries, (vs->zone_count + ns) * sizeof(*ne));
+    if (!ne) return false;
+    vs->entries = ne;
+    for (const zone_config_t *s = cv->in_view_zones; s; s = s->next) {
+        view_snapshot_t *tvs = snapshot_find_view(snap, s->ext->iv->view);
+        zone_db_entry_t *e = tvs ? find_zone_exact_in_view(tvs, s->domain) : NULL;
+        if (!e) {
+            syslog(LOG_ERR, "[Core] zone '%s' of view '%s' is shared from view '%s', which has no such zone entry; it is not served in this view",
+                   s->domain, vs->name, s->ext->iv->view);
+            continue;
+        }
+        atomic_fetch_add_explicit(&e->snapshot_refs, 1, memory_order_release);
+        ne[vs->zone_count++] = e;
+        vs->shared_count++;
+    }
+    return true;
+}
+
 zone_db_snapshot_t *rebuild_zone_db_snapshot(
-    server_config_t *active_config, 
+    server_config_t *active_config,
     const char *catalog_view_name,
     zone_db_entry_t *catalog_entry_to_update,
     const zone_config_t *catalog_cfg,
@@ -2461,7 +2518,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     if (entry && entry->is_catalog_member &&
                         catalog_member_index(valid_members, valid_member_count, vm_ht, vm_chain, vm_hsize,
                                              entry->domain, zone_entry_catalog_uid(entry)) >= 0 &&
-                        !view_find_zone_config(v, entry->domain)) {
+                        !view_cfg_has(v, entry->domain)) {
                         dynamic_count++;
                     }
                 }
@@ -2491,6 +2548,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             for (zone_config_t *z = v->zones; z; z = z->next) {
                 zone_db_entry_t *entry = NULL;
                 zone_db_entry_t *old = (old_view && z->domain) ? find_zone_exact_in_view(old_view, z->domain) : NULL;
+                if (old && !view_owns_entry(old_view, old)) old = NULL;   /* it was a zone shared from another view (zone { in-view }): this one is new */
                 if (old) {
                     /* O-13: type が変わったゾーンと、静的ゾーンで上書きされたカタログ
                      * メンバーは再利用しない。is_secondary や EXPIRE、転送の状態は
@@ -2535,7 +2593,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     if (entry && entry->is_catalog_member &&
                         catalog_member_index(valid_members, valid_member_count, vm_ht, vm_chain, vm_hsize,
                                              entry->domain, zone_entry_catalog_uid(entry)) >= 0 &&
-                        !view_find_zone_config(v, entry->domain)) {
+                        !view_cfg_has(v, entry->domain)) {
                         atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
                         ixfr_history_set_depth(entry, ixfr_history_effective(active_config, NULL));
                         vs->entries[zidx++] = entry;
@@ -2875,6 +2933,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     return NULL;
                 }
                 vs->static_count = old_snap->views[v].static_count;
+                vs->shared_count = old_snap->views[v].shared_count;
 
                 if (catalog_view_name && strcasecmp(vs->name, catalog_view_name) == 0) {
                     size_t max_zones = old_snap->views[v].zone_count + added_count + (size_t)total_deleted;
@@ -2969,6 +3028,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                         abort_rebuild_snapshot(new_snap, "catalog other vs->entries");
                         return NULL;
                     }
+                    vs->shared_count = old_snap->views[v].shared_count;     /* the tick list built below skips the zones shared from other views */
                     for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
                         zone_db_entry_t *entry = old_snap->views[v].entries[i];
                         if (entry) {
@@ -2995,8 +3055,14 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         }
     }
 
-    for (size_t v = 0; !reused && v < new_snap->view_count; v++) {
+    /* in view order, so that a view that shares a zone finds the owner's entry in an earlier view whose hash tables are done */
+    const view_config_t *cv = active_config ? active_config->views : NULL;
+    for (size_t v = 0; !reused && v < new_snap->view_count; v++, cv = cv ? cv->next : NULL) {
         view_snapshot_t *vs = &new_snap->views[v];
+        if (cv && cv->in_view_zones && !view_append_shared(new_snap, vs, cv)) {
+            abort_rebuild_snapshot(new_snap, "shared entries");
+            return NULL;
+        }
         if (!view_build_hashes(vs)) {
             syslog(LOG_ERR, "[Core] Hash table allocation failed for view '%s', aborting snapshot rebuild", vs->name ? vs->name : "unknown");
             abort_rebuild_snapshot(new_snap, "hash_tables");

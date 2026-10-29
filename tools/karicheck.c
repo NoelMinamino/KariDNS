@@ -221,7 +221,7 @@ static void karicheck_report_out_of_zone(const dns_record_t *rec, void *ud) {
 
 /* parse_context_t.zone_exists: name が view (ud) のゾーンの頂点か */
 static bool kc_view_has_zone(const void *ud, const char *name) {
-    return view_find_zone_config((const view_config_t *)ud, name) != NULL;
+    return view_find_zone_config((const view_config_t *)ud, name) != NULL || view_find_in_view((const view_config_t *)ud, name) != NULL;
 }
 
 KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bool is_standalone, bool is_catalog, const char *file_format, const zone_config_t *zcfg, const server_config_t *cfg, const view_config_t *view) {
@@ -1253,6 +1253,7 @@ KARIDNS_TOOL_FN void kc_db_zone(kc_dbrun_t *r, char **f, int n) {
     for (size_t i = 0; i < nserved; i++) {
         if (r->only && served[i]->v != r->only) continue;                    /* karicheck db VIEW: the views of the other zones are not asked about */
         const zone_config_t *zc = view_find_zone_config(served[i]->v, name);
+        if (!zc) zc = view_find_in_view(served[i]->v, name);   /* a zone shared with an earlier view (in-view) hides it as well */
         if (!zc) continue;
         const char *vn = served[i]->v->name ? served[i]->v->name : "";
         if (zc->type && (strcasecmp(zc->type, "program") == 0 || strcasecmp(zc->type, "forward") == 0))

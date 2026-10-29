@@ -498,7 +498,16 @@ typedef struct {
   /* entries that come from zone { } blocks of karidns.conf (neither DB zones nor catalog members).  A reload whose
    * zone { } blocks all map to these entries (name and kind) reuses the view (snapshot_views_reusable()). */
   size_t static_count;
+  /* entries of `entries` that belong to another view: the zones this view shares with an earlier view through zone { in-view } (the same
+   * zone_db_entry_t as in the owner view, snapshot_refs counts both; entry->view_name is the owner's).  They are appended
+   * when the view is built (a delta may move them).  Anything that walks the entries of every view once per zone must skip them (view_owns_entry()). */
+  size_t shared_count;
 } view_snapshot_t;
+
+/* Is the entry a zone of this view, rather than a zone shared from an earlier one (zone { in-view })? */
+static inline bool view_owns_entry(const view_snapshot_t *vs, const zone_db_entry_t *e) {
+  return vs->shared_count == 0 || strcasecmp(e->view_name, vs->name) == 0;
+}
 
 typedef struct {
   view_snapshot_t *views;

@@ -546,33 +546,69 @@ static aml_t *acl_set_get(const acl_set_t *s, int which) {
     }
 }
 
-static const acl_set_t *view_acl_set(const server_config_t *cfg, const char *view_name) {
-    if (!view_name || !view_name[0]) return NULL;
-    for (const view_config_t *v = cfg->views; v; v = v->next)
-        if (strcasecmp(v->name, view_name) == 0) return &v->acl;
-    return NULL;
+/* The levels whose statements apply to a zone reached through the view view_name, in the order they are looked at:
+ *   ss  the in-view zone's own (in-view-settings view; the zone is shared with this view from an earlier one), else NULL
+ *   zs  the zone's
+ *   vs  the view's: the view the request came through; for a shared zone with in-view-settings owner, the view that owns the zone
+ *       (BIND: the zone object of the owner view carries its settings)
+ *   options' follow.
+ * `zone` is the configuration of the zone that holds the data (the owner's); view_name is the view the client was matched to. */
+typedef struct {
+    const acl_set_t *ss, *zs, *vs;
+} acl_chain_t;
+
+static void acl_chain_of(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, acl_chain_t *ch) {
+    ch->ss = NULL;
+    ch->zs = &zext(zone)->acl;
+    ch->vs = NULL;
+    if (!cfg || !view_name || !view_name[0]) return;
+    const view_config_t *v = NULL;
+    for (v = cfg->views; v; v = v->next)
+        if (strcasecmp(v->name, view_name) == 0) break;
+    if (!v) return;
+    ch->vs = &v->acl;
+    if (!v->in_view_zones || !zone || !zone->domain) return;     /* most views share nothing */
+    const zone_config_t *stub = view_find_in_view(v, zone->domain);
+    if (!stub || !stub->ext || !stub->ext->iv) return;
+    if (config_in_view_mode(cfg, v, stub->ext->iv) == IVS_VIEW) {
+        ch->ss = &stub->ext->acl;
+    } else {
+        ch->vs = NULL;
+        for (const view_config_t *ov = cfg->views; ov; ov = ov->next)
+            if (stub->ext->iv->view && strcasecmp(ov->name, stub->ext->iv->view) == 0) { ch->vs = &ov->acl; break; }
+    }
 }
 
-/* zone, else view, else options (BIND 9.20 ARM: the lower level "overrides" the higher one) */
-static const aml_t *acl_pick(const server_config_t *cfg, const acl_set_t *zs, const acl_set_t *vs, int which) {
-    aml_t *a = acl_set_get(zs, which);
-    if (a) return a;
-    if (vs && (a = acl_set_get(vs, which)) != NULL) return a;
+/* stub, else zone, else view, else options (BIND 9.20 ARM: the lower level "overrides" the higher one) */
+static const aml_t *acl_pick(const server_config_t *cfg, const acl_chain_t *ch, int which) {
+    aml_t *a;
+    if (ch->ss && (a = acl_set_get(ch->ss, which)) != NULL) return a;
+    if ((a = acl_set_get(ch->zs, which)) != NULL) return a;
+    if (ch->vs && (a = acl_set_get(ch->vs, which)) != NULL) return a;
     return cfg ? acl_set_get(&cfg->acl, which) : NULL;
 }
 
 const aml_t *config_acl_for(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, int which) {
-    const acl_set_t *zs = &zext(zone)->acl;
-    if (!cfg) return acl_set_get(zs, which);
-    return acl_pick(cfg, zs, view_acl_set(cfg, view_name), which);
+    acl_chain_t ch;
+    acl_chain_of(cfg, zone, view_name, &ch);
+    return acl_pick(cfg, &ch, which);
+}
+
+/* Does the in-view zone's own statement `which` apply (the zone is shared with view_name and in-view-settings view is in force, and the
+ * stub writes the statement)?  Then a flat list of the owner zone does not decide. */
+static bool acl_in_view_own(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, int which) {
+    acl_chain_t ch;
+    acl_chain_of(cfg, zone, view_name, &ch);
+    return ch.ss && acl_set_get(ch.ss, which) != NULL;
 }
 
 bool query_acl_permits_sa(const server_config_t *cfg, const zone_config_t *zone, const char *view_name, const char *client_ip,
                           const void *client_sa, const char *key, const void *local) {
     if (!cfg || !cfg->acl_query_active) return true;
-    const acl_set_t *zs = &zext(zone)->acl, *vs = view_acl_set(cfg, view_name);   /* one walk over the views for both statements */
-    const aml_t *q = acl_pick(cfg, zs, vs, AML_ACL_QUERY);
-    const aml_t *qo = acl_pick(cfg, zs, vs, AML_ACL_QUERY_ON);
+    acl_chain_t ch;
+    acl_chain_of(cfg, zone, view_name, &ch);                                   /* one walk over the views for both statements */
+    const aml_t *q = acl_pick(cfg, &ch, AML_ACL_QUERY);
+    const aml_t *qo = acl_pick(cfg, &ch, AML_ACL_QUERY_ON);
     if (!q && !qo) return true;
     if (q) {
         aml_subject_t s;
@@ -613,8 +649,9 @@ bool zone_transfer_acl_allows_in_view(const server_config_t *cfg, const zone_con
     if (!zcfg || !client_ip) return false;
     const zone_ext_t *x = zext(zcfg);
     /* the flat lists of a database zone, of settings received from a primary and of a zone built by hand are evaluated as before */
+    /* (a list of the in-view zone itself, in-view-settings view, decides before any of them) */
     bool flat_own = (x->allow_transfer_count > 0 || x->tsig_keys_count > 0) && !x->acl.transfer;
-    if (x->db_acl_ceiling || flat_own) return zone_transfer_acl_allows(cfg, zcfg, client_ip, key_name);
+    if (!acl_in_view_own(cfg, zcfg, view_name, AML_ACL_TRANSFER) && (x->db_acl_ceiling || flat_own)) return zone_transfer_acl_allows(cfg, zcfg, client_ip, key_name);
     const aml_t *l = config_acl_for(cfg, zcfg, view_name, AML_ACL_TRANSFER);
     aml_subject_t s;
     uint8_t b[16];
@@ -646,7 +683,7 @@ bool zone_update_acl_allows_in_view(const server_config_t *cfg, const zone_confi
     if (!zcfg || !client_ip) return false;
     const zone_ext_t *x = zext(zcfg);
     bool flat_own = x->allow_update_count > 0 && !x->acl.update;
-    if (x->db_acl_ceiling || flat_own) return zone_update_acl_allows(cfg, zcfg, client_ip, key_name);
+    if (!acl_in_view_own(cfg, zcfg, view_name, AML_ACL_UPDATE) && (x->db_acl_ceiling || flat_own)) return zone_update_acl_allows(cfg, zcfg, client_ip, key_name);
     const aml_t *l = config_acl_for(cfg, zcfg, view_name, AML_ACL_UPDATE);
     if (!l) return false;
     aml_subject_t s;

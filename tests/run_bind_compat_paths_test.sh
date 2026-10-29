@@ -7,7 +7,7 @@
 #   - zone "x" IN { }, view "v" IN { }; another class is an error with file:line
 #   - a FreeBSD style BIND named.conf (root hint zone, localhost, empty zones, listen-on, forwarders, ...) is accepted by karicheck conf
 #     with warnings only and served by karidns
-#   - zone types hint / stub / static-stub / mirror / redirect are skipped with a warning; in-view is an error
+#   - zone types hint / stub / static-stub / mirror / redirect are skipped with a warning; in-view with no view before it is an error (the rest of in-view: tests/run_in_view_test.sh)
 #   - karicheck: the same $INCLUDE verdicts and messages as the server (standalone and from a configuration), invalid TTLs and ports are
 #     errors, a zone without any TTL is a warning
 # Runs as a normal user on 127.0.0.1 (as root the server drops to nobody); needs no root.
@@ -300,7 +300,7 @@ view "v" HS { match-clients { any; }; };' 'bad.conf:2: view .v.: class .HS. is n
 expect_conf_error "port 0" 'options { port 0; };' 'bad.conf:1: options: port: invalid port .0. \(expected 1-65535\)'
 expect_conf_error "port 65536" 'options { port 65536; };' 'invalid port .65536.'
 expect_conf_error "port abc" 'options { port abc; };' 'invalid port .abc.'
-expect_conf_error "in-view" 'zone "x.test" { in-view "a"; };' "in-view.*not supported"
+expect_conf_error "in-view with no view before it" 'zone "x.test" { in-view "a"; };' "bad.conf:1: zone .x.test..: .in-view. zone .x.test.. does not exist in view .a., or view .a. is not yet defined"
 expect_conf_error "directory that does not exist" "options { directory \"$W/nonexistent\"; };" "directory '$W/nonexistent' cannot be accessed"
 expect_conf_error "directory that is a file" "options { directory \"$W/ctl.conf\"; };" "is not a directory"
 
