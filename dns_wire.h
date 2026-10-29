@@ -241,7 +241,7 @@ typedef struct {
         struct {
             uint8_t *wire_data;
             uint16_t wire_len;
-        } txt; // TXT, SPF, AVC
+        } txt; // TXT, SPF, AVC, NINFO, RESINFO, WALLET
         struct {
             uint8_t *wire_name;
             uint16_t wire_name_len;

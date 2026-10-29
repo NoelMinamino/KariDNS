@@ -881,6 +881,16 @@ const char *dns_generic_rdata_check(uint16_t type, const uint8_t *rd, size_t len
             }
         }
     }
+    if (type == 56 || type == 99 || type == 258 || type == 261 || type == 262) {
+        /* TXT-like (NINFO, SPF, AVC, RESINFO, WALLET): BIND generic_fromwire_txt() takes one or more <character-string>s
+         * that fill the RDATA exactly (TXT, 16, gets the same test from the decoder below) */
+        if (len == 0) return "RDATA must hold at least one <character-string> (RFC 1035 3.3.14)";
+        for (size_t p = 0; p < len;) {
+            size_t l = rd[p++];
+            if (len - p < l) return "<character-string> runs past the end of the RDATA (RFC 1035 3.3.14)";
+            p += l;
+        }
+    }
     uint8_t *pkt = malloc(11 + len);
     uint8_t *back = malloc(65535);
     uint8_t *want = malloc(len ? len : 1);
@@ -2854,6 +2864,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 break;
             }
             case 56: // NINFO — wire format identical to TXT
+            case 261: case 262: // RESINFO (RFC 9606 section 4), WALLET: one or more <character-string>s, as TXT
             case 16: case 99: case 258: { // TXT, SPF, AVC
                 if (rec->is_cached && rec->cache.txt.wire_data) {
                     if ((size_t)offset + rec->cache.txt.wire_len > max_res_len) return -1;
@@ -4816,6 +4827,7 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
             break;
         }
         case 56: // NINFO — cache identical to TXT
+        case 261: case 262: // RESINFO, WALLET — cache identical to TXT
         case 16: case 99: case 258: { // TXT, SPF, AVC
             if (rec->rdata_count > 0 && arena) {
                 size_t required = 0;

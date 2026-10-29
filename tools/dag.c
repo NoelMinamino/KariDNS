@@ -991,6 +991,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
             return;
         }
         case 56: // NINFO — display identical to TXT
+        case 261: case 262: // RESINFO (RFC 9606), WALLET — display identical to TXT (BIND generic_totext_txt)
         case 16: case 99: case 258: { // TXT, SPF, AVC
             size_t p = abs_offset, end = abs_offset + rdlen;
             bool first = true;
@@ -2547,7 +2548,7 @@ static int dag_check_rdata(const uint8_t *pkt, size_t len, uint16_t type, uint16
         case 33:
             if (rend - p < 6) return -1;
             DAG_NAME_AT(p + 6); break;
-        case 16: case 99:
+        case 16: case 99: case 56: case 258: case 261: case 262: /* TXT-like: BIND generic_fromwire_txt() (txt_fromwire) */
             if (p == rend) return -1;
             while (p < rend) {
                 if (p + 1 + pkt[p] > rend) return -1;

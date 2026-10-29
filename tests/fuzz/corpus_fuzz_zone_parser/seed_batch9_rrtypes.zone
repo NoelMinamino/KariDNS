@@ -1,0 +1,20 @@
+$ORIGIN example.
+$TTL 300
+@ IN SOA ns.example. h.example. 1 7200 3600 1209600 300
+@ IN NS ns.example.
+ns IN A 192.0.2.1
+ri IN RESINFO "qnamemin" "exterr=15-17"
+wa IN WALLET "btc" "bc1qexample" ""
+e1 IN EID 0102 0304 05
+e2 IN NIMLOC 0A0b0c
+e3 IN EID \# 3 010203
+n1 IN NULL \# 2 dead
+ui IN UINFO \# 5 616c696365
+u2 IN UID \# 4 000003E8
+g1 IN GID \# 4 000003E9
+un IN UNSPEC \# 2 0102
+bad1 IN EID 010
+bad2 IN NULL abc
+bad3 IN UID 1000
+bad4 IN RESINFO
+bad5 IN WALLET \# 3 056162

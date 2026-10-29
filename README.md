@@ -72,7 +72,7 @@ KariDNS implements specifications according to official IETF RFC standards. For 
 ### Supported Resource Record (RR) Types
 KariDNS natively parses, validates, and serializes the following standard and experimental DNS record types, as well as RFC 3597 unknown record syntax (`TYPE<n>` / `\#`):
 
-- **Core & Routing:** `A`, `AAAA`, `NS`, `CNAME`, `DNAME`, `PTR`, `MX`, `SOA`, `TXT`, `SPF`, `SRV`, `LOC`, `APL`, `CAA`, `URI`, `HINFO`, `MINFO`, `RP`, `AFSDB`, `RT`, `KX`, `LP`, `PX`, `WKS`, `X25`, `ISDN`, `NSAP`, `NSAP-PTR`, `GPOS`, `NULL`, `MD`, `MF`, `MB`, `MG`, `MR`, `NXT`, `EID`, `NIMLOC`, `ATMA`, `A6`, `SINK`, `NINFO`
+- **Core & Routing:** `A`, `AAAA`, `NS`, `CNAME`, `DNAME`, `PTR`, `MX`, `SOA`, `TXT`, `SPF`, `SRV`, `LOC`, `APL`, `CAA`, `URI`, `HINFO`, `MINFO`, `RP`, `AFSDB`, `RT`, `KX`, `LP`, `PX`, `WKS`, `X25`, `ISDN`, `NSAP`, `NSAP-PTR`, `GPOS`, `NULL`, `MD`, `MF`, `MB`, `MG`, `MR`, `NXT`, `EID`, `NIMLOC`, `ATMA`, `A6`, `SINK`, `NINFO`, `RESINFO`, `WALLET`, `UINFO`, `UID`, `GID`, `UNSPEC` (the last four, like `NULL`, only in the `\#` form)
 - **DNSSEC & Cryptographic Identities:** `DS`, `CDS`, `DNSKEY`, `CDNSKEY`, `RRSIG`, `NSEC`, `NSEC3`, `NSEC3PARAM`, `SSHFP`, `TLSA`, `SMIMEA`, `CERT`, `OPENPGPKEY`, `IPSECKEY`, `HIP`, `TA`, `DLV`, `SIG`, `KEY`, `RKEY`, `TALINK`
 - **Modern Web, Discovery & Service Bindings:** `HTTPS`, `SVCB`, `NAPTR`, `DSYNC`, `ZONEMD`, `CSYNC`, `DHCID`, `EUI48`, `EUI64`, `NID`, `L32`, `L64`, `AVC`, `DOA`, `AMTRELAY`, `HHIT`, `BRID`
 - **Pseudo & Meta Types:** `OPT` (EDNS0), `TSIG`, `TKEY`, `AXFR`, `IXFR`, `ANY` (RFC 8482), `MAILB`, `MAILA`, `NXNAME` (RFC 9824; synthesized only, not accepted as zone data), `TYPE<n>` (RFC 3597)

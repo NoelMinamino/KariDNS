@@ -104,7 +104,7 @@ dag [global-queryopt...] [query...]
 : Do not read options from `${HOME}/.digrc`.
 
 `-t type`
-: Explicitly specify the resource record type. Supports standard mnemonics (`A`, `AAAA`, `NS`, `SOA`, `MX`, `TXT`, `SRV`, `HTTPS`, `SVCB`, `DS`, `DNSKEY`, `ANY`, `AXFR`, `IXFR=serial`, etc.) as well as generic `TYPEnn` syntax (RFC 3597).
+: Explicitly specify the resource record type. Supports standard mnemonics (`A`, `AAAA`, `NS`, `SOA`, `MX`, `TXT`, `SRV`, `HTTPS`, `SVCB`, `DS`, `DNSKEY`, `ANY`, `AXFR`, `IXFR=serial`, etc.) as well as generic `TYPEnn` syntax (RFC 3597). `RESINFO` (RFC 9606) and `WALLET` are printed like `TXT` (quoted character-strings), `EID` and `NIMLOC` as one hex string, and `NULL`, `UINFO`, `UID`, `GID` and `UNSPEC` in the RFC 3597 `\# <length> <hex>` form, as dig 9.20 does.
 
 `-u`
 : Display query elapsed times in microseconds (µs) instead of milliseconds (ms).

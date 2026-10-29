@@ -296,7 +296,7 @@ static bool is_name_field(const dns_record_t *r, int j) {
 
 static bool is_string_field(uint16_t type, int j) {
     switch (type) {
-    case 16: case 99: case 258: case 56: case 261: case 13: case 20: case 19:
+    case 16: case 99: case 258: case 56: case 261: case 262: case 13: case 20: case 19:
         return true;
     case 35:
         return j >= 2 && j <= 4;

@@ -1037,6 +1037,7 @@ static int trailing_blob_lead_fields(uint16_t type_code) {
   case 52: case 53:                 // TLSA, SMIMEA: 関連データ (16 進)
     return 3;
   case 49: case 61:                 // DHCID, OPENPGPKEY: RDATA 全体が base64
+  case 31: case 32:                 // EID, NIMLOC: RDATA 全体が 16 進 (BIND eid_31.c / nimloc_32.c は 1 個以上のトークンを連結する)
     return 0;
   default:
     return -1;
@@ -1499,10 +1500,12 @@ PROCESS_RECORD:
   if (field_idx - i > MAX_RDATA && rec->type) {
     uint16_t tc = get_type_code(rec->type);
     int lead = trailing_blob_lead_fields(tc);
+    /* "\# <len> <hex>" (RFC 3597 §5) of a whole-RDATA blob type: its tokens are the length and the hex, not one value to join */
+    if (lead == 0 && (strcmp(fields[i], "\\#") == 0 || strcmp(fields[i], "#") == 0)) lead = -1;
     if (lead >= 0 && i + lead < field_idx)
       field_idx = join_trailing_fields(fields, i + lead, field_idx);
-    else if ((tc == 16 || tc == 99 || tc == 56 || tc == 258) && strcmp(fields[i], "\\#") != 0 && strcmp(fields[i], "#") != 0) {
-      /* I5, RFC 1035 §3.3.14: TXT (and SPF, NINFO, AVC, the same wire form) is "one or more <character-string>s" with no
+    else if ((tc == 16 || tc == 99 || tc == 56 || tc == 258 || tc == 261 || tc == 262) && strcmp(fields[i], "\\#") != 0 && strcmp(fields[i], "#") != 0) {
+      /* I5, RFC 1035 §3.3.14: TXT (and SPF, NINFO, AVC, RESINFO, WALLET, the same wire form) is "one or more <character-string>s" with no
        * count; more strings than the text fields hold are encoded straight into the wire form below (the RR is served and
        * transferred as it is, like one with a NUL octet from a transfer), not refused */
       txt_wire_from = i;
@@ -1733,25 +1736,55 @@ PROCESS_RECORD:
     rec->generic_len = (uint16_t)glen;
     rec->rdata_count = 0;
   }
-  /* EID (31) / NIMLOC (32) have no dedicated wire encoder; the server always serves them via the RFC 3597
-   * generic form. dig's presentation for these undocumented types is a single bare hex token with no "\# len"
-   * prefix, so accept that shape too by rewriting it into an equivalent "\# <len> <hex>" generic record. */
-  if ((rec->type_code == 31 || rec->type_code == 32) && rec->rdata_count == 1 &&
-      strcmp(rec->rdata[0], "\\#") != 0 && strcmp(rec->rdata[0], "#") != 0) {
-    char hex_copy[512];
-    /* snprintf rather than strlcpy: MinGW (Windows dag build) has no strlcpy */
-    snprintf(hex_copy, sizeof(hex_copy), "%s", rec->rdata[0]);
-    size_t hexlen = strlen(hex_copy);
-    if (hexlen > 0 && (hexlen % 2) == 0 && hexlen < sizeof(hex_copy) &&
-        strspn(hex_copy, "0123456789abcdefABCDEF") == hexlen && MAX_RDATA >= 3) {
-      char lenbuf[16];
-      snprintf(lenbuf, sizeof(lenbuf), "%zu", hexlen / 2);
-      if (!arena_record_alloc_rdata(arena, rec, 3)) return -1;
-      rec->rdata[0] = arena_strdup(arena, "\\#");
-      rec->rdata[1] = arena_strdup(arena, lenbuf);
-      rec->rdata[2] = arena_strdup(arena, hex_copy);
-      rec->rdata_count = 3;
+  /* Types BIND takes only in the RFC 3597 "\# <len> <hex>" form.  NULL (10): null_10.c fromtext_null() always returns
+   * DNS_R_SYNTAX.  UINFO/UID/GID/UNSPEC (100-103): BIND 9.18/9.20 gen.c registers only the names (no rdata module), so
+   * dns_rdata_fromtext() gives DNS_R_UNKNOWN for anything but "\#".  Text fields could not be encoded for them (the lint
+   * pass would only report "cannot be serialized"), so the line is refused here, as BIND refuses the zone. */
+  bool generic_form = rec->rdata_count >= 1 && (strcmp(rec->rdata[0], "\\#") == 0 || strcmp(rec->rdata[0], "#") == 0);
+  if (!generic_form && (rec->type_code == 10 || (rec->type_code >= 100 && rec->type_code <= 103))) {
+    zone_generic_rdata_error(ctx, rec->type, buf, "This record type has no text form; write the RDATA in the RFC 3597 \\# form");
+    return -1;
+  }
+  /* EID (31) / NIMLOC (32) have no dedicated wire encoder; the server always serves them via the RFC 3597 generic form.
+   * Their text form (BIND in_1/eid_31.c, nimloc_32.c fromtext: isc_hex_tobuffer(lexer, target, isc_one_or_more)) is hex
+   * digits in one or more tokens with no "\# len" prefix: the tokens are concatenated, an odd number of digits or a
+   * non-hex character is refused, and the result is rewritten into an equivalent "\# <len> <hex>" generic record. */
+  if ((rec->type_code == 31 || rec->type_code == 32) && !generic_form) {
+    size_t hexlen = 0;
+    const char *bad = NULL;
+    for (int j = 0; j < rec->rdata_count; j++) {
+      size_t l = strlen(rec->rdata[j]);
+      if (strspn(rec->rdata[j], "0123456789abcdefABCDEF") != l) bad = "EID/NIMLOC RDATA contains a non-hexadecimal character";
+      hexlen += l;
     }
+    if (!bad && hexlen == 0) bad = "EID/NIMLOC RDATA is empty";
+    else if (!bad && (hexlen % 2) != 0) bad = "EID/NIMLOC RDATA has an odd number of hex digits";
+    else if (!bad && hexlen / 2 > 65535) bad = "EID/NIMLOC RDATA is longer than 65535 octets";
+    if (bad) {
+      zone_generic_rdata_error(ctx, rec->type, buf, bad);
+      return -1;
+    }
+    char lenbuf[16];
+    snprintf(lenbuf, sizeof(lenbuf), "%zu", hexlen / 2);
+    char *joined = (char *)arena_alloc(arena, hexlen + 1);
+    char *lenstr = arena_strdup(arena, lenbuf);
+    char *marker = arena_strdup(arena, "\\#");
+    if (!joined || !lenstr || !marker) {
+      zone_generic_rdata_error(ctx, rec->type, buf, "Out of memory");
+      return -1;
+    }
+    size_t w = 0;
+    for (int j = 0; j < rec->rdata_count; j++) {
+      size_t l = strlen(rec->rdata[j]);
+      memcpy(joined + w, rec->rdata[j], l);
+      w += l;
+    }
+    joined[w] = '\0';
+    if (!arena_record_alloc_rdata(arena, rec, 3)) return -1;
+    rec->rdata[0] = marker;
+    rec->rdata[1] = lenstr;
+    rec->rdata[2] = joined;
+    rec->rdata_count = 3;
   }
   if (rec->rdata_count >= 2 && (strcmp(rec->rdata[0], "\\#") == 0 || strcmp(rec->rdata[0], "#") == 0)) {
     /* RFC 3597 section 5: "\# <length> <hex rdata>". The declared length is a decimal number, the rdata is an
