@@ -2024,7 +2024,7 @@ static void rx_merge_locked(zone_db_entry_t *entry, server_config_t *cfg) {
     zone_config_t *nc = NULL;
     entry->rx_note[0] = '\0';
     if (entry->rx_sh && !(base && zext(base)->primary_settings_off)) {
-        nc = zone_config_with_received(entry->domain, base, &entry->rx_sh->ext, cfg, entry->rx_note, sizeof(entry->rx_note));
+        nc = zone_config_with_received_in_view(entry->domain, entry->view_name, base, &entry->rx_sh->ext, cfg, entry->rx_note, sizeof(entry->rx_note));
         if (!nc) syslog(LOG_ERR, "[AXFR] zone '%s': out of memory applying the settings received from the primary; they are not in force", entry->domain);
     }
     entry->rx_base = base;

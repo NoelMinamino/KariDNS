@@ -20,4 +20,12 @@ void notify_request_send(zone_db_entry_t *entry);
 void notify_retransmit_due(time_t now);
 void notify_handle_response(const uint8_t *msg, size_t len, const struct sockaddr *from);
 
+/* NOTIFY over TCP (`tcp-only yes` in a `server` statement, and the retry after the UDP attempts; BIND 9.20 notify_send_toaddr() /
+ * notify_done()): the exchange runs in a thread of its own over a connection of the connect broker.  notify_tcp_roundtrip() is the exchange on
+ * a connected socket (RFC 1035 §4.2.2: a two-octet length before each message): it sends msg and reads the one message that answers it into
+ * resp (at least a DNS header, at most cap octets) within timeout_ms.  notify_tcp_in_flight() is the number of threads running. */
+enum { NOTIFY_TCP_OK = 0, NOTIFY_TCP_TIMEOUT, NOTIFY_TCP_IO, NOTIFY_TCP_CLOSED, NOTIFY_TCP_BAD_LENGTH };
+int notify_tcp_roundtrip(int fd, const uint8_t *msg, size_t len, uint8_t *resp, size_t cap, size_t *resp_len, int timeout_ms);
+int notify_tcp_in_flight(void);
+
 #endif /* DNS_DYNAMIC_UPDATE_H */

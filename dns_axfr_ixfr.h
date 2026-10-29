@@ -24,8 +24,17 @@ typedef struct {
   char tsig_algorithm[64];
   uint8_t tsig_secret_decoded[256];
   size_t tsig_secret_decoded_len;
-  bool has_src;      /* the local address of the connection (primaries source, else transfer-source), allowed at start-up only */
+  bool has_src;      /* the local address of the connection (the server statement's transfer-source, else the primaries source, else transfer-source), allowed at start-up only */
   uint8_t src[16];
+  /* batch 5: what the `server` statement that covers this primary says about the requests to it.  Only what the statement wrote is set; a
+   * zeroed primary (a unit test, a primary with no statement) asks as the zone says: IXFR, EXPIRE and EDNS. */
+  uint8_t srv_request_ixfr, srv_request_expire;   /* request-ixfr / request-expire of the server statement: 0 = not written (the zone's eff applies), 1 = yes, 2 = no */
+  bool per_ns_set;           /* `transfers` of the server statement (BIND dns_peer_gettransfers()) replaces transfers-per-ns for this primary */
+  uint32_t per_ns;
+  bool no_edns;              /* `edns no`: the requests carry no OPT (so neither EXPIRE nor the Extended AXFR option) */
+  bool request_nsid;         /* `request-nsid yes`: an empty NSID option (RFC 5001) in the OPT */
+  uint8_t edns_version;      /* `edns-version` */
+  uint16_t edns_udp_size;    /* `edns-udp-size` (0 = the default 4096) */
 } xfr_primary_t;
 
 typedef struct {
@@ -45,8 +54,12 @@ typedef struct {
   uint32_t per_ns_limit;      /* transfers-per-ns */
 } axfr_bg_ctx_t;
 
-static inline bool ctx_request_ixfr(const axfr_bg_ctx_t *c) { return !c->has_eff || c->eff.request_ixfr; }
-static inline bool ctx_request_expire(const axfr_bg_ctx_t *c) { return !c->has_eff || c->eff.request_expire; }
+static inline bool ctx_request_ixfr(const axfr_bg_ctx_t *c, const xfr_primary_t *p) {
+  return !c->has_eff || (p->srv_request_ixfr ? p->srv_request_ixfr == 1 : c->eff.request_ixfr);
+}
+static inline bool ctx_request_expire(const axfr_bg_ctx_t *c, const xfr_primary_t *p) {
+  return !p->no_edns && (!c->has_eff || (p->srv_request_expire ? p->srv_request_expire == 1 : c->eff.request_expire));
+}
 /* BIND (zoneconf.c) looks at multi-master only when the zone has more than one primary */
 static inline bool ctx_multi_master(const axfr_bg_ctx_t *c) { return c->has_eff && c->eff.multi_master && c->nprim > 1; }
 

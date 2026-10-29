@@ -178,6 +178,21 @@ tsig_key_t *find_tsig_key_by_name(const server_config_t *cfg, const char *key_na
     return NULL;
 }
 
+/* the keys only the view view_name has (NULL: none) */
+static tsig_key_t *view_own_keys(const server_config_t *cfg, const char *view_name) {
+    if (!cfg || !view_name || !*view_name) return NULL;
+    for (const view_config_t *v = cfg->views; v; v = v->next)
+        if (v->name && strcasecmp(v->name, view_name) == 0) return v->keys;
+    return NULL;
+}
+
+tsig_key_t *find_tsig_key_in_view(const server_config_t *cfg, const char *view_name, const char *key_name) {
+    if (!cfg || !key_name || !*key_name) return NULL;
+    for (tsig_key_t *k = view_own_keys(cfg, view_name); k; k = k->next)
+        if (k->name && tsig_key_names_equal(k->name, key_name)) return k;
+    return find_tsig_key_by_name(cfg, key_name);
+}
+
 bool tsig_key_names_equal(const char *a, const char *b) {
     return domain_names_match_ci(a, b);
 }
@@ -192,7 +207,7 @@ static const char *tsig_error_name(uint16_t error) {
     }
 }
 
-void tsig_check_request(const server_config_t *cfg, const uint8_t *req, size_t req_len, const char *client_ip,
+void tsig_check_request(const server_config_t *cfg, const char *view_name, const uint8_t *req, size_t req_len, const char *client_ip,
                         tsig_request_t *t) {
     t->status = TSIG_REQ_NONE;
     t->error = 0;
@@ -215,11 +230,15 @@ void tsig_check_request(const server_config_t *cfg, const uint8_t *req, size_t r
         /* RFC 8945 §5.2.1: 要求が名乗る鍵名とアルゴリズムで鍵を決める。知らなければ BADKEY */
         const struct evp_md_st *md = tsig_algorithm_evp_md(rr.alg_name);
         tsig_key_t *k = NULL;
-        for (tsig_key_t *c = cfg ? cfg->keys : NULL; c && md; c = c->next) {
-            if (tsig_key_names_equal(c->name, rr.key_name) &&
-                tsig_algorithm_evp_md(c->algorithm ? c->algorithm : "hmac-sha256") == md) {
-                k = c;
-                break;
+        /* the view's own keys, then the global ones (a name is in one of them only: the configuration refuses a second key of a name) */
+        tsig_key_t *lists[2] = { view_own_keys(cfg, view_name), cfg ? cfg->keys : NULL };
+        for (int li = 0; li < 2 && !k && md; li++) {
+            for (tsig_key_t *c = lists[li]; c; c = c->next) {
+                if (tsig_key_names_equal(c->name, rr.key_name) &&
+                    tsig_algorithm_evp_md(c->algorithm ? c->algorithm : "hmac-sha256") == md) {
+                    k = c;
+                    break;
+                }
             }
         }
         if (!k) {

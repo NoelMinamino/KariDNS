@@ -1,4 +1,5 @@
 #define OPENSSL_SUPPRESS_DEPRECATED 1
+#include <stdarg.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -39,7 +40,13 @@ char g_startup_cwd[PATH_MAX] = "";
 
 void syslog(int priority, const char *format, ...) {
     (void)priority;
-    (void)format;
+    if (getenv("NT_DEBUG")) { /* NT_DEBUG=1 ./test_dynamic_update_engine shows what the server would have logged */
+        va_list ap;
+        va_start(ap, format);
+        vfprintf(stderr, format, ap);
+        fputc('\n', stderr);
+        va_end(ap);
+    }
 }
 
 server_config_t *acquire_config_snapshot(void) {
@@ -47,8 +54,27 @@ server_config_t *acquire_config_snapshot(void) {
 }
 void release_config_snapshot(server_config_t *snap) { (void)snap; }
 
+/* NOTIFY over TCP: the broker mock hands out one end of a socketpair (when g_broker_on) and keeps the other for the test, which plays the peer */
+#define PEERS_MAX 600
+static _Atomic int g_peer_fd[PEERS_MAX];   /* -1 until the thread's connection exists */
+static _Atomic int g_peer_n;               /* connections made so far */
+static _Atomic int g_broker_on;
+static tcp_sockopts_t g_peer_opts[PEERS_MAX];
+
+static int mock_broker(int type, const tcp_sockopts_t *opts) {
+    if (!atomic_load(&g_broker_on) || type != SOCK_STREAM) return -1;
+    int idx = atomic_fetch_add(&g_peer_n, 1);
+    int sv[2];
+    if (idx >= PEERS_MAX || socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+    if (opts) g_peer_opts[idx] = *opts;
+    else memset(&g_peer_opts[idx], 0, sizeof(g_peer_opts[idx]));
+    atomic_store(&g_peer_fd[idx], sv[1]);
+    return sv[0];
+}
+
 int broker_connect(int family, int type, struct sockaddr *addr, size_t addr_len) {
-    (void)family; (void)type; (void)addr; (void)addr_len; return -1;
+    (void)family; (void)addr; (void)addr_len;
+    return mock_broker(type, NULL);
 }
 
 ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len) {
@@ -1899,6 +1925,526 @@ static void test_update_tsig_matrix(void) {
     printf("  -> TSIG matrix passed.\n");
 }
 
+/* ---- NOTIFY over TCP (dns_dynamic_update.c): the exchange on a socketpair, and the whole path from send_notify_to_all() through the
+ * (mock) connect broker.  The mock broker hands out one end of a socketpair and keeps the other for the test, which plays the peer. ---- */
+#include <poll.h>
+
+enum { PB_OK, PB_OK_SIGNED, PB_UNSIGNED, PB_BADSIG, PB_BADID, PB_CLOSE, PB_GARBLE, PB_SHORT, PB_BIGLEN, PB_HOLD };
+
+static void peers_reset(void) {
+    for (int i = 0; i < PEERS_MAX; i++) atomic_store(&g_peer_fd[i], -1);
+    atomic_store(&g_peer_n, 0);
+}
+
+/* the connection number idx (waits for the thread to make it), or -1 */
+static int peer_wait(int idx) {
+    for (int i = 0; i < 3000; i++) {
+        int fd = atomic_load(&g_peer_fd[idx]);
+        if (fd >= 0) return fd;
+        usleep(1000);
+    }
+    return -1;
+}
+
+static bool peer_read_exact(int fd, uint8_t *buf, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        struct pollfd p = {.fd = fd, .events = POLLIN};
+        if (poll(&p, 1, 3000) <= 0) return false;
+        ssize_t k = recv(fd, buf + got, n - got, 0);
+        if (k <= 0) return false;
+        got += (size_t)k;
+    }
+    return true;
+}
+
+/* the answer to the NOTIFY req: QR set, no additional records; signed with key (the request MAC goes into the digest) when beh asks */
+static size_t make_answer(const uint8_t *req, size_t rlen, int beh, tsig_key_t *key, tsig_key_t *wrong, uint8_t *out, size_t cap) {
+    size_t q = DNS_HEADER_SIZE;
+    while (q < rlen && req[q] != 0) q += 1 + req[q];
+    q += 5;
+    assert(q <= rlen && q <= cap);
+    memcpy(out, req, q);
+    out[2] |= 0x80;
+    out[10] = out[11] = 0;
+    if (beh == PB_BADID) out[1] ^= 1;
+    if (beh == PB_OK_SIGNED || beh == PB_BADSIG) {
+        uint8_t rmac[64];
+        size_t rmac_len = 0;
+        assert(tsig_verify_packet(req, rlen, key, NULL, 0, NULL, 0, false, rmac, &rmac_len) == 0);
+        size_t olen = q;
+        assert(tsig_sign_packet(out, &olen, cap, beh == PB_BADSIG ? wrong : key, 0, rmac, &rmac_len, NULL, 0, false) == 0);
+        return olen;
+    }
+    return q;
+}
+
+/* play the peer of connection idx: read the framed NOTIFY, check it, answer by beh.  Returns the NOTIFY (without the prefix) in req. */
+static size_t peer_serve(int idx, int beh, tsig_key_t *key, tsig_key_t *wrong, uint8_t *req, size_t req_cap) {
+    int fd = peer_wait(idx);
+    assert(fd >= 0);
+    uint8_t lp[2];
+    assert(peer_read_exact(fd, lp, 2));
+    size_t rlen = ((size_t)lp[0] << 8) | lp[1];
+    assert(rlen >= DNS_HEADER_SIZE && rlen <= req_cap);
+    assert(peer_read_exact(fd, req, rlen));
+    assert(((req[2] >> 3) & 0x0F) == 4 && req[5] == 1); /* opcode NOTIFY, one question */
+    uint8_t out[2 + 1024];
+    size_t alen = 0;
+    switch (beh) {
+    case PB_OK: case PB_OK_SIGNED: case PB_UNSIGNED: case PB_BADSIG: case PB_BADID:
+        alen = make_answer(req, rlen, beh == PB_UNSIGNED ? PB_OK : beh, key, wrong, out + 2, sizeof(out) - 2);
+        break;
+    case PB_GARBLE: alen = 20; for (size_t i = 0; i < alen; i++) out[2 + i] = (uint8_t)(0x5A ^ i); break;
+    case PB_SHORT: alen = 5; memset(out + 2, 'x', alen); break;
+    case PB_BIGLEN: out[0] = 0xFF; out[1] = 0xFF; assert(send(fd, out, 2, MSG_NOSIGNAL) == 2); close(fd); return rlen;
+    case PB_HOLD: return rlen; /* keep the connection open and say nothing: the caller closes it */
+    default: break; /* PB_CLOSE */
+    }
+    if (alen) {
+        out[0] = (uint8_t)(alen >> 8);
+        out[1] = (uint8_t)(alen & 0xFF);
+        assert(send(fd, out, 2 + alen, MSG_NOSIGNAL) == (ssize_t)(2 + alen));
+    }
+    close(fd);
+    return rlen;
+}
+
+static void wait_idle(void) {
+    for (int i = 0; i < 6000 && notify_tcp_in_flight() != 0; i++) usleep(1000);
+    assert(notify_tcp_in_flight() == 0);
+}
+
+/* close the connections that threads have made and left unanswered, until no thread runs any more */
+static void peers_close_until_idle(int *next) {
+    for (int i = 0; i < 6000 && (notify_tcp_in_flight() != 0 || *next < atomic_load(&g_peer_n)); i++) {
+        while (*next < atomic_load(&g_peer_n)) {
+            int fd = atomic_load(&g_peer_fd[*next]);
+            if (fd < 0) break;
+            close(fd);
+            atomic_store(&g_peer_fd[*next], -2);
+            (*next)++;
+        }
+        usleep(1000);
+    }
+    assert(notify_tcp_in_flight() == 0);
+}
+
+typedef struct { int fd; uint8_t part[16]; size_t n; } rt_peer_t;
+/* read the 42 octets of the request, send the first n octets of part, close */
+static void *rt_peer_close(void *arg) {
+    rt_peer_t *p = arg;
+    uint8_t in[2 + 40];
+    if (peer_read_exact(p->fd, in, sizeof(in)) && p->n) (void)!send(p->fd, p->part, p->n, MSG_NOSIGNAL);
+    close(p->fd);
+    return NULL;
+}
+
+static void test_notify_tcp_roundtrip(void) {
+    printf("[TEST] NOTIFY over TCP: notify_tcp_roundtrip() on a socketpair (answer, short/huge length, close, stall)...\n");
+    uint8_t msg[40];
+    memset(msg, 0, sizeof(msg));
+    for (size_t i = 0; i < sizeof(msg); i++) msg[i] = (uint8_t)i;
+    uint8_t resp[64];
+    size_t rl = 0;
+    int sv[2];
+
+    /* an answer of 30 octets: the request leaves with its length prefix */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    uint8_t ans[2 + 30];
+    ans[0] = 0; ans[1] = 30;
+    for (int i = 0; i < 30; i++) ans[2 + i] = (uint8_t)(0x80 + i);
+    assert(send(sv[1], ans, sizeof(ans), 0) == (ssize_t)sizeof(ans));
+    assert(notify_tcp_roundtrip(sv[0], msg, sizeof(msg), resp, sizeof(resp), &rl, 2000) == NOTIFY_TCP_OK);
+    assert(rl == 30 && resp[0] == 0x80 && resp[29] == 0x80 + 29);
+    uint8_t got[2 + 40];
+    assert(peer_read_exact(sv[1], got, sizeof(got)));
+    assert(got[0] == 0 && got[1] == 40 && memcmp(got + 2, msg, 40) == 0);
+    close(sv[0]); close(sv[1]);
+
+    /* a length below a DNS header, one above the room we give it (a peer's number is not trusted), and the exact fit */
+    static const uint16_t lens[3] = {5, 65, 0xFFFF};
+    for (int k = 0; k < 3; k++) {
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        uint8_t lp[2] = {(uint8_t)(lens[k] >> 8), (uint8_t)(lens[k] & 0xFF)};
+        assert(send(sv[1], lp, 2, 0) == 2);
+        assert(notify_tcp_roundtrip(sv[0], msg, sizeof(msg), resp, sizeof(resp), &rl, 2000) == NOTIFY_TCP_BAD_LENGTH);
+        close(sv[0]); close(sv[1]);
+    }
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    uint8_t fit[2 + 64];
+    memset(fit, 7, sizeof(fit));
+    fit[0] = 0; fit[1] = 64;
+    assert(send(sv[1], fit, sizeof(fit), 0) == (ssize_t)sizeof(fit));
+    assert(notify_tcp_roundtrip(sv[0], msg, sizeof(msg), resp, sizeof(resp), &rl, 2000) == NOTIFY_TCP_OK && rl == 64);
+    close(sv[0]); close(sv[1]);
+
+    /* the peer reads the request and closes: before the length, in the middle of the length, in the middle of the message */
+    for (int k = 0; k < 3; k++) {
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        rt_peer_t rp = {.fd = sv[1], .n = k == 0 ? 0 : k == 1 ? 1 : 12};
+        rp.part[0] = 0; rp.part[1] = 30;
+        pthread_t th;
+        assert(pthread_create(&th, NULL, rt_peer_close, &rp) == 0);
+        assert(notify_tcp_roundtrip(sv[0], msg, sizeof(msg), resp, sizeof(resp), &rl, 2000) == NOTIFY_TCP_CLOSED);
+        pthread_join(th, NULL);
+        close(sv[0]);
+    }
+
+    /* the peer is gone before we write: EPIPE is an error, not a signal */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    close(sv[1]);
+    assert(notify_tcp_roundtrip(sv[0], msg, sizeof(msg), resp, sizeof(resp), &rl, 2000) == NOTIFY_TCP_IO);
+    close(sv[0]);
+
+    /* silence, and a message that does not fit the frame, are bounded */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    time_t t0 = time(NULL);
+    assert(notify_tcp_roundtrip(sv[0], msg, sizeof(msg), resp, sizeof(resp), &rl, 150) == NOTIFY_TCP_TIMEOUT);
+    assert(time(NULL) - t0 <= 2);
+    uint8_t big[2000];
+    memset(big, 0, sizeof(big));
+    assert(notify_tcp_roundtrip(sv[0], big, sizeof(big), resp, sizeof(resp), &rl, 150) == NOTIFY_TCP_IO);
+    /* a peer that sends the length and then one octet a time is held to the whole timeout, not to each octet */
+    uint8_t slow[2] = {0, 30};
+    assert(send(sv[1], slow, 2, 0) == 2);
+    t0 = time(NULL);
+    assert(notify_tcp_roundtrip(sv[0], msg, sizeof(msg), resp, sizeof(resp), &rl, 200) == NOTIFY_TCP_TIMEOUT);
+    assert(time(NULL) - t0 <= 2);
+    close(sv[0]); close(sv[1]);
+    printf("  -> notify_tcp_roundtrip passed.\n");
+}
+
+/* One zone with also-notify addresses, a `server 192.0.2.0/24 { tcp-only yes; }` statement and a TSIG key, published as the active
+ * configuration and snapshot.  The notify mode is explicit (only the also-notify list), the rate is high so that notify-rate does not
+ * hold anything back. */
+#define NT_TARGETS 8
+static server_config_t nt_cfg;
+static view_config_t nt_view;
+static zone_config_t nt_zone;
+static notify_target_t nt_an[NT_TARGETS];
+static server_stmt_t nt_srv;
+static tsig_key_t nt_key, nt_wrong;
+static xfr_source_t nt_xs[1];
+
+static zone_db_entry_t *nt_setup(const char *const *targets, int n, bool tcp_only, bool signed_zone, int retries) {
+    memset(&nt_cfg, 0, sizeof(nt_cfg));
+    memset(&nt_view, 0, sizeof(nt_view));
+    memset(&nt_zone, 0, sizeof(nt_zone));
+    memset(nt_an, 0, sizeof(nt_an));
+    memset(&nt_srv, 0, sizeof(nt_srv));
+    memset(&nt_key, 0, sizeof(nt_key));
+    memset(&nt_wrong, 0, sizeof(nt_wrong));
+    nt_key.name = "tcpkey.example.";
+    nt_key.algorithm = "hmac-sha256";
+    nt_key.secret_decoded_len = 32;
+    memset(nt_key.secret_decoded, 0x5C, 32);
+    nt_wrong = nt_key;
+    memset(nt_wrong.secret_decoded, 0x3D, 32);
+    nt_cfg.keys = &nt_key;
+    nt_cfg.notify_rate = 100000;
+    nt_cfg.notify_rate_set = true;
+    nt_cfg.notify_retry.retries = retries;
+    nt_cfg.notify_retry.interval = 1;
+    nt_cfg.notify_retry.backoff = NOTIFY_BACKOFF_FIXED;
+    nt_view.name = "default";
+    nt_zone.domain = "tcp.example.";
+    tzx(&nt_zone)->notify_mode = NOTIFY_MODE_EXPLICIT;
+    if (signed_zone) tzx(&nt_zone)->tsig_key = "tcpkey.example.";
+    for (int i = 0; i < n; i++) {
+        nt_an[i].ip = (char *)(uintptr_t)targets[i];
+        nt_an[i].port = 53;
+    }
+    /* the first target has the `source` of its list (a NOTIFY source the server had at start-up) */
+    nt_an[0].src_set[0] = 1;
+    inet_pton(AF_INET, "192.0.2.77", nt_an[0].src[0]);
+    memset(nt_xs, 0, sizeof(nt_xs));
+    nt_xs[0].family = AF_INET;
+    inet_pton(AF_INET, "192.0.2.77", nt_xs[0].addr);
+    nt_xs[0].notify = true;
+    nt_cfg.xfr_sources = nt_xs;
+    nt_cfg.xfr_source_count = 1;
+    config_set_startup_xfr_sources(&nt_cfg);
+    tzx(&nt_zone)->also_notify = nt_an;
+    tzx(&nt_zone)->also_notify_count = n;
+    tzx(&nt_zone)->also_notify_set = true;
+    if (tcp_only) {
+        nt_srv.family = AF_INET;
+        nt_srv.plen = 24;
+        inet_pton(AF_INET, "192.0.2.0", nt_srv.addr);
+        nt_srv.set = SV_B_TCP_ONLY;
+        nt_srv.bools = SV_B_TCP_ONLY;
+        nt_cfg.servers = &nt_srv;
+    }
+    nt_view.zones = &nt_zone;
+    nt_cfg.views = &nt_view;
+    atomic_store_explicit(&g_config_db.active, &nt_cfg, memory_order_release);
+    zone_db_snapshot_t *snap = rebuild_zone_db_snapshot(&nt_cfg, NULL, NULL, NULL, NULL, 0);
+    assert(snap != NULL);
+    zone_db_entry_t *z = snapshot_get_zone(snap, "tcp.example.");
+    assert(z);
+    return z;
+}
+
+static void nt_teardown(void) { atomic_store_explicit(&g_config_db.active, NULL, memory_order_release); }
+
+/* the datagrams that send_notify_to_all() put on the NOTIFY IPC (the UDP ones); each is stored in dg[] */
+typedef struct { alignas(udp_ipc_t) uint8_t b[1200]; } nt_dgram_t;
+static int nt_drain_ipc(nt_dgram_t *dg, size_t *lens, int max) {
+    int n = 0;
+    while (n < max) {
+        ssize_t k = recv(g_notify_ipc[0], dg[n].b, sizeof(dg[n].b), MSG_DONTWAIT);
+        if (k <= 0) break;
+        lens[n++] = (size_t)k;
+    }
+    return n;
+}
+
+/* an earlier test may have left NOTIFYs in the pending table: send them all over TCP with a broker that cannot connect (the threads end at once) */
+static void nt_drain_pending(void) {
+    atomic_store(&g_broker_on, 0);
+    for (int k = 1; k <= 20; k++) notify_retransmit_due(time(NULL) + 1000 * k);
+    wait_idle();
+    atomic_store(&g_broker_on, 1);
+    peers_reset();
+}
+
+static void nt_ipc_open(void) { assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, g_notify_ipc) == 0); }
+static void nt_ipc_close(void) { close(g_notify_ipc[0]); close(g_notify_ipc[1]); g_notify_ipc[0] = g_notify_ipc[1] = -1; }
+
+static void test_notify_tcp_flow(void) {
+    printf("[TEST] NOTIFY over TCP: tcp-only server statement, source address, TSIG, UDP for the other targets...\n");
+    nt_ipc_open();
+    peers_reset();
+    nt_drain_pending();
+
+    /* 192.0.2.10 is covered by the tcp-only statement (TCP, signed by the zone's key, from the list's source 192.0.2.77); 198.51.100.7 is
+     * not (one UDP datagram) */
+    const char *t1[] = {"192.0.2.10", "198.51.100.7"};
+    zone_db_entry_t *z = nt_setup(t1, 2, true, true, 0);
+    send_notify_to_all(z);
+    nt_dgram_t dg[4];
+    size_t dl[4];
+    assert(nt_drain_ipc(dg, dl, 4) == 1);                  /* only the uncovered target goes over UDP */
+    uint8_t req[1024];
+    size_t rl = peer_serve(0, PB_OK_SIGNED, &nt_key, &nt_wrong, req, sizeof(req));
+    assert(req[11] == 1);                                  /* ARCOUNT 1: the TSIG */
+    assert(tsig_verify_packet(req, rl, &nt_key, NULL, 0, NULL, 0, false, (uint8_t[64]){0}, &(size_t){0}) == 0);
+    wait_idle();
+    assert(atomic_load(&g_peer_n) == 1);                   /* one connection, no second attempt after an answer that verifies */
+    assert(g_peer_opts[0].has_src == 1 && memcmp(g_peer_opts[0].src, nt_an[0].src[0], 4) == 0);
+    assert(g_peer_opts[0].connect_timeout_ms > 0);
+    notify_retransmit_due(time(NULL) + 100000);            /* the UDP target has no retries left: over TCP; the TCP one is gone from the table */
+    assert(nt_drain_ipc(dg, dl, 4) == 0);
+    peer_serve(1, PB_OK_SIGNED, &nt_key, &nt_wrong, req, sizeof(req));
+    wait_idle();
+    assert(atomic_load(&g_peer_n) == 2);
+    nt_teardown();
+
+    /* tcp-only without a key: unsigned over TCP, an unsigned answer is fine; an answer with rcode REFUSED is logged and ends it */
+    peers_reset();
+    const char *t2[] = {"192.0.2.20"};
+    z = nt_setup(t2, 1, true, false, 0);
+    send_notify_to_all(z);
+    assert(nt_drain_ipc(dg, dl, 4) == 0);
+    rl = peer_serve(0, PB_OK, &nt_key, &nt_wrong, req, sizeof(req));
+    assert(req[11] == 0 && rl > DNS_HEADER_SIZE);
+    wait_idle();
+    nt_teardown();
+
+    /* an NS host of the zone is reached the same way (the statement is looked up for every target); here: explicit mode keeps this test to
+     * the list, so this checks that a second call to the same target replaces nothing and starts a new exchange */
+    peers_reset();
+    z = nt_setup(t2, 1, true, false, 0);
+    send_notify_to_all(z);
+    send_notify_to_all(z);
+    peer_serve(0, PB_OK, &nt_key, &nt_wrong, req, sizeof(req));
+    peer_serve(1, PB_OK, &nt_key, &nt_wrong, req, sizeof(req));
+    wait_idle();
+    nt_teardown();
+    nt_ipc_close();
+    printf("  -> NOTIFY over TCP flow passed.\n");
+}
+
+static void test_notify_tcp_failures(void) {
+    printf("[TEST] NOTIFY over TCP: a peer that closes, garbles, answers wrongly or stalls (two attempts, then the end)...\n");
+    nt_ipc_open();
+    nt_drain_pending();
+    static const int beh[] = {PB_CLOSE, PB_GARBLE, PB_SHORT, PB_BIGLEN, PB_BADID, PB_UNSIGNED, PB_BADSIG};
+    for (size_t b = 0; b < sizeof(beh) / sizeof(beh[0]); b++) {
+        peers_reset();
+        const char *t[] = {"192.0.2.30"};
+        zone_db_entry_t *z = nt_setup(t, 1, true, beh[b] == PB_UNSIGNED || beh[b] == PB_BADSIG, 0);
+        send_notify_to_all(z);
+        uint8_t req[1024];
+        /* tcp-only: a failed attempt is made a second time (BIND notify_done() finds DNS_NOTIFY_TCP clear) */
+        peer_serve(0, beh[b], &nt_key, &nt_wrong, req, sizeof(req));
+        peer_serve(1, beh[b], &nt_key, &nt_wrong, req, sizeof(req));
+        wait_idle();
+        assert(atomic_load(&g_peer_n) == 2);
+        nt_teardown();
+    }
+    /* a stalled peer holds its thread, not the control thread; closing the connection ends the attempt */
+    peers_reset();
+    const char *t[] = {"192.0.2.31"};
+    zone_db_entry_t *z = nt_setup(t, 1, true, false, 0);
+    send_notify_to_all(z);
+    uint8_t req[1024];
+    peer_serve(0, PB_HOLD, &nt_key, &nt_wrong, req, sizeof(req));
+    assert(notify_tcp_in_flight() == 1);
+    int next = 0;
+    peers_close_until_idle(&next);
+    nt_teardown();
+
+    /* the broker cannot connect: both attempts fail without a connection */
+    peers_reset();
+    atomic_store(&g_broker_on, 0);
+    z = nt_setup(t, 1, true, false, 0);
+    send_notify_to_all(z);
+    wait_idle();
+    assert(atomic_load(&g_peer_n) == 0);
+    atomic_store(&g_broker_on, 1);
+    nt_teardown();
+    nt_ipc_close();
+    printf("  -> NOTIFY over TCP failures passed.\n");
+}
+
+/* the answer to a UDP datagram taken from the IPC (udp_ipc_t + NOTIFY), signed or not, from the address it was sent to */
+static void nt_udp_answer(const uint8_t *dgram, size_t dlen, int beh) {
+    const udp_ipc_t *ipc = (const udp_ipc_t *)dgram;
+    const uint8_t *pkt = dgram + sizeof(udp_ipc_t);
+    size_t plen = dlen - sizeof(udp_ipc_t);
+    uint8_t out[1024];
+    size_t alen = make_answer(pkt, plen, beh, &nt_key, &nt_wrong, out, sizeof(out));
+    notify_handle_response(out, alen, (const struct sockaddr *)&ipc->client_addr);
+}
+
+static void test_notify_tcp_after_udp(void) {
+    printf("[TEST] NOTIFY over TCP: after the UDP attempts, and after a UDP answer that fails TSIG verification...\n");
+    nt_ipc_open();
+    atomic_store(&g_broker_on, 1);
+    nt_dgram_t dg[8];
+    size_t dl[8];
+    uint8_t req[1024];
+
+    /* notify-retries 1: two datagrams, then one attempt over TCP (the UDP attempts are the operator's schedule) */
+    nt_drain_pending();
+    const char *t[] = {"198.51.100.40"};
+    zone_db_entry_t *z = nt_setup(t, 1, false, false, 1);
+    send_notify_to_all(z);
+    assert(nt_drain_ipc(dg, dl, 8) == 1);
+    notify_retransmit_due(time(NULL) + 2);                 /* the retransmission */
+    assert(nt_drain_ipc(dg, dl, 8) == 1);
+    assert(atomic_load(&g_peer_n) == 0);
+    notify_retransmit_due(time(NULL) + 4);                 /* no answer after 2 messages: TCP */
+    assert(nt_drain_ipc(dg, dl, 8) == 0);
+    peer_serve(0, PB_OK, &nt_key, &nt_wrong, req, sizeof(req));
+    wait_idle();
+    notify_retransmit_due(time(NULL) + 100000);            /* nothing is left to send */
+    assert(atomic_load(&g_peer_n) == 1 && notify_tcp_in_flight() == 0);
+    nt_teardown();
+
+    /* the TCP attempt after UDP is one attempt (not tcp-only's two) */
+    peers_reset();
+    z = nt_setup(t, 1, false, false, 0);
+    send_notify_to_all(z);
+    assert(nt_drain_ipc(dg, dl, 8) == 1);
+    notify_retransmit_due(time(NULL) + 2);
+    peer_serve(0, PB_CLOSE, &nt_key, &nt_wrong, req, sizeof(req));
+    wait_idle();
+    assert(atomic_load(&g_peer_n) == 1);
+    nt_teardown();
+
+    /* a UDP answer with a good TSIG ends it (nothing over TCP, nothing retransmitted); an answer with an error rcode too */
+    peers_reset();
+    z = nt_setup(t, 1, false, true, 3);
+    send_notify_to_all(z);
+    assert(nt_drain_ipc(dg, dl, 8) == 1);
+    nt_udp_answer(dg[0].b, dl[0], PB_OK_SIGNED);
+    notify_retransmit_due(time(NULL) + 100000);
+    assert(nt_drain_ipc(dg, dl, 8) == 0 && atomic_load(&g_peer_n) == 0);
+    nt_teardown();
+    z = nt_setup(t, 1, false, false, 3);
+    send_notify_to_all(z);
+    assert(nt_drain_ipc(dg, dl, 8) == 1);
+    {
+        const udp_ipc_t *ipc = (const udp_ipc_t *)dg[0].b;
+        uint8_t out[1024];
+        size_t alen = make_answer(dg[0].b + sizeof(udp_ipc_t), dl[0] - sizeof(udp_ipc_t), PB_OK, NULL, NULL, out, sizeof(out));
+        out[3] = 5; /* REFUSED */
+        notify_handle_response(out, alen, (const struct sockaddr *)&ipc->client_addr);
+        notify_handle_response(out, alen, (const struct sockaddr *)&ipc->client_addr); /* the entry is gone: ignored */
+        notify_handle_response(out, 5, (const struct sockaddr *)&ipc->client_addr);     /* not a message */
+    }
+    notify_retransmit_due(time(NULL) + 100000);
+    assert(nt_drain_ipc(dg, dl, 8) == 0 && atomic_load(&g_peer_n) == 0);
+    nt_teardown();
+
+    /* an unsigned or wrongly signed UDP answer to a signed NOTIFY: ignored, and the NOTIFY follows over TCP at once (BIND notify_done()) */
+    static const int bad[] = {PB_UNSIGNED, PB_BADSIG};
+    for (int b = 0; b < 2; b++) {
+        peers_reset();
+        z = nt_setup(t, 1, false, true, 5);
+        send_notify_to_all(z);
+        assert(nt_drain_ipc(dg, dl, 8) == 1);
+        nt_udp_answer(dg[0].b, dl[0], bad[b]);
+        notify_retransmit_due(time(NULL));                 /* the retry interval (60 s) is not waited for */
+        assert(nt_drain_ipc(dg, dl, 8) == 0);              /* and no further datagram */
+        peer_serve(0, PB_OK_SIGNED, &nt_key, &nt_wrong, req, sizeof(req));
+        wait_idle();
+        assert(atomic_load(&g_peer_n) == 1);
+        /* a second bad answer to the same NOTIFY (late, over UDP) does not start another exchange */
+        nt_udp_answer(dg[0].b, dl[0], bad[b]);
+        notify_retransmit_due(time(NULL) + 100000);
+        assert(atomic_load(&g_peer_n) == 1);
+        nt_teardown();
+    }
+    nt_ipc_close();
+    printf("  -> NOTIFY over TCP after UDP passed.\n");
+}
+
+static void test_notify_tcp_busy(void) {
+    printf("[TEST] NOTIFY over TCP: a full set of exchanges in flight holds the next one back...\n");
+    nt_ipc_open();
+    nt_drain_pending();
+    /* 64 targets of tcp-only whose peers say nothing, then one more */
+    static char names[64][24];
+    const char *many[64];
+    for (int i = 0; i < 64; i++) {
+        snprintf(names[i], sizeof(names[i]), "192.0.2.%d", 100 + i);
+        many[i] = names[i];
+    }
+    /* nt_an has NT_TARGETS entries: use a larger list of our own */
+    static notify_target_t big[64];
+    memset(big, 0, sizeof(big));
+    zone_db_entry_t *z = nt_setup(many, 2, true, false, 0);
+    for (int i = 0; i < 64; i++) { big[i].ip = names[i]; big[i].port = 53; }
+    tzx(&nt_zone)->also_notify = big;
+    tzx(&nt_zone)->also_notify_count = 64;
+    send_notify_to_all(z);
+    for (int i = 0; i < 6000 && notify_tcp_in_flight() < 64; i++) usleep(1000);
+    assert(notify_tcp_in_flight() == 64);
+    tzx(&nt_zone)->also_notify = nt_an;
+    tzx(&nt_zone)->also_notify_count = 1;
+    nt_an[0].ip = (char *)(uintptr_t)"192.0.2.200";
+    nt_an[0].port = 53;
+    send_notify_to_all(z);                                 /* no room: held in the table */
+    assert(notify_tcp_in_flight() == 64);
+    int next = 0;
+    for (int i = 0; i < 64; i++) assert(peer_wait(i) >= 0);
+    notify_retransmit_due(time(NULL) + 1);                 /* still no room: held again */
+    assert(notify_tcp_in_flight() == 64);
+    peers_close_until_idle(&next);                         /* every exchange ends (two attempts each) */
+    int before = atomic_load(&g_peer_n);
+    notify_retransmit_due(time(NULL) + 2);                 /* the held one starts now */
+    for (int i = 0; i < 3000 && atomic_load(&g_peer_n) == before; i++) usleep(1000);
+    assert(atomic_load(&g_peer_n) > before);
+    peers_close_until_idle(&next);
+    nt_teardown();
+    nt_ipc_close();
+    printf("  -> NOTIFY over TCP busy passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Dynamic Update Engine Unit Tests ===\n");
     test_bump_soa_serial();
@@ -1918,6 +2464,11 @@ int main(void) {
     test_update_dispatch_zone_section();
     test_update_tsig_matrix();
     test_send_notify_to_all_comprehensive();
+    test_notify_tcp_roundtrip();
+    test_notify_tcp_flow();
+    test_notify_tcp_failures();
+    test_notify_tcp_after_udp();
+    test_notify_tcp_busy();
     printf("=== All Dynamic Update Engine Unit Tests PASSED ===\n");
     return 0;
 }
@@ -1926,8 +2477,8 @@ int main(void) {
 /* broker_connect_opts(): the TCP socket options are applied by the real broker only; the mock ignores them. */
 int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr_len,
                         const tcp_sockopts_t *tcp_opts) {
-    (void)tcp_opts;
-    return broker_connect(family, type, addr, addr_len);
+    (void)family; (void)addr; (void)addr_len;
+    return mock_broker(type, tcp_opts);
 }
 
 /* send_tcp_dns_message(): goes through the send_tcp_robust() mock above (length prefix, then message) */

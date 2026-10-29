@@ -8,10 +8,12 @@
 #include "dns_snapshot_rcu.h"
 #include "dns_tsig_acl.h"
 #include "dns_config_parser.h"
+#include "dns_priv_sandbox.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -214,6 +216,8 @@ typedef struct {
   size_t req_mac_len;
   uint8_t prev_mac[64];  /* その前の送信の MAC (遅れて届いた前回への応答も検証できるように) */
   size_t prev_mac_len;
+  bool tcp_stage;     /* NOTIFY over TCP: the message goes out over a TCP connection (tcp-only, or the UDP attempts are used up), see notify_tcp_start() */
+  int tcp_tries;      /* TCP attempts the stage makes: 2 for tcp-only, 1 after UDP (BIND notify_done(), see the comment above notify_tcp_start()) */
   int sends;          /* 送信した回数 (最初の1回を含む) */
   int max_sends;      /* 1 + notify-retries */
   int interval;       /* 次の再送までの秒数 */
@@ -324,11 +328,266 @@ static bool notify_sign(notify_pending_t *p) {
   return true;
 }
 
+/* The header and the question of an answer to a NOTIFY (RFC 1996 §3.6): QR set, opcode NOTIFY, a question.  The caller compares the ID
+ * and the QNAME with the NOTIFY it sent (and, over UDP, the address and port it came from).  false = not an answer to a NOTIFY. */
+static bool notify_parse_answer(const uint8_t *msg, size_t len, uint16_t *id, char *qname, size_t qsz, unsigned *rcode) {
+  if (len < DNS_HEADER_SIZE || (msg[2] & 0x80) == 0 || ((msg[2] >> 3) & 0x0F) != 4) return false;
+  uint16_t qdcount = (uint16_t)((msg[4] << 8) | msg[5]);
+  size_t q_end;
+  if (qdcount < 1 || expand_wire_name_to_buffer(msg, len, DNS_HEADER_SIZE, &q_end, qname, qsz) < 0) return false;
+  *id = (uint16_t)((msg[0] << 8) | msg[1]);
+  *rcode = msg[3] & 0x0F;
+  return true;
+}
+
+/* RFC 8945 §5.4: the answer to a signed NOTIFY counts only when its TSIG verifies, against the MAC of the message last sent or (a late
+ * answer to the one before) the previous one.  0 = verified; else the tsig_verify_packet() result (-1 unsigned, 16 BADSIG, 17 BADKEY,
+ * 18 BADTIME, other: malformed). */
+static int notify_answer_tsig(const notify_pending_t *p, const uint8_t *msg, size_t len) {
+  tsig_key_t key;
+  notify_pending_tsig_key(p, &key);
+  uint8_t mac[64];
+  size_t mac_len = 0;
+  int tv = tsig_verify_packet(msg, len, &key, p->req_mac, p->req_mac_len, NULL, 0, false, mac, &mac_len);
+  if (tv != 0 && p->prev_mac_len > 0) {
+    int tv_prev = tsig_verify_packet(msg, len, &key, p->prev_mac, p->prev_mac_len, NULL, 0, false, mac, &mac_len);
+    if (tv_prev == 0) tv = 0;
+  }
+  return tv;
+}
+
+static const char *notify_tsig_why(int tv) {
+  return tv == -1 ? "unsigned" : tv == 16 ? "BADSIG" : tv == 17 ? "BADKEY" : tv == 18 ? "BADTIME" : "malformed TSIG";
+}
+
+/* An answer that was accepted: log it (the same words over UDP and TCP) */
+static void notify_log_answer(const notify_pending_t *p, const char *a, unsigned rcode, const char *via) {
+  if (rcode != 0) syslog(LOG_WARNING, "[Notify] zone '%s': %s answered NOTIFY%s with rcode %u", p->domain, a, via, rcode);
+  else syslog(LOG_DEBUG, "[Notify] zone '%s': NOTIFY acknowledged by %s%s", p->domain, a, via);
+}
+
+/* ---- NOTIFY over TCP ----
+ * BIND 9.20 (lib/dns/zone.c notify_send_toaddr() and notify_done(), lib/dns/request.c):
+ *  - the `tcp-only yes` option of the `server` statement that covers the target (bin/named/server.c configure_peer() dns_peer_setforcetcp(),
+ *    read by dns_peer_getforcetcp(); the option bit is DNS_REQUESTOPT_TCP) sends the NOTIFY over TCP from the start;
+ *  - otherwise the NOTIFY goes out over UDP (udptimeout 5 s, 2 retransmissions), and a request that fails (no answer, an answer that cannot be
+ *    parsed or whose TSIG does not verify) is made once more over TCP (DNS_NOTIFY_TCP, "notify to %s failed: %s: retrying over TCP"); the UDP
+ *    attempts here are the operator's notify-retries / notify-retry-interval / notify-retry-backoff, and the TCP attempt follows the last;
+ *  - a TCP request has a timeout of 15 s for the connection and the answer together, one message each way (RFC 1035 §4.2.2: two octets of
+ *    length first), signed like the UDP one (RFC 8945 §5.1) with the answer verified against the request MAC (§5.3);
+ *  - with tcp-only the DNS_NOTIFY_TCP flag is not set, so notify_done() finds a failed TCP request "not yet retried over TCP" and makes it a
+ *    second time: two TCP attempts in all (a BIND quirk, kept so that the two servers retry alike);
+ *  - the retry goes through the notify rate limiter again (notify-rate); here the first TCP attempt takes a token like a first UDP message
+ *    and the second TCP attempt of tcp-only follows at once.
+ * The local address is the same as the UDP message's (notify-source(-v6), the `source` of the list, the server statement's: the connect broker
+ * binds it before connect(), config_xfr_source_allowed()).  The Backend may not connect() itself (Capsicum): the connection comes from the
+ * broker (broker_connect_opts()) like the SOA check and the transfers of a secondary, and the exchange runs in a detached thread of its own
+ * (as the refresh of a secondary does, axfr_bg_thread_func()) because it waits up to 15 s for a peer that is not under our control: the
+ * thread works on a copy of the pending entry and logs the outcome, nothing else is shared with the control thread except the counter of
+ * the threads in flight (g_notify_tcp_active), so no lock is needed. */
+#define NOTIFY_TCP_TIMEOUT_MS 15000
+#define NOTIFY_TCP_MAX 64         /* threads in flight; one more waits in the pending table for a free place */
+#define NOTIFY_TCP_RESP_MAX 4096  /* an answer to a NOTIFY is a header, the question and perhaps a TSIG: a longer one is not an answer */
+static _Atomic int g_notify_tcp_active;
+
+typedef struct {
+  notify_pending_t p; /* a copy: the table slot may be reused while the thread runs */
+  int tries;
+} notify_tcp_job_t;
+
+int notify_tcp_in_flight(void) { return atomic_load_explicit(&g_notify_tcp_active, memory_order_acquire); }
+
+static int64_t notify_now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Wait until fd is ready for ev or deadline_ms (CLOCK_MONOTONIC) has passed */
+static int notify_tcp_wait(int fd, short ev, int64_t deadline_ms) {
+  for (;;) {
+    int64_t left = deadline_ms - notify_now_ms();
+    if (left <= 0) return NOTIFY_TCP_TIMEOUT;
+    struct pollfd pfd = {.fd = fd, .events = ev};
+    int r = poll(&pfd, 1, left > 60000 ? 60000 : (int)left);
+    if (r > 0) return NOTIFY_TCP_OK; /* ready, or HUP / ERR: the next send() / recv() says which */
+    if (r < 0 && errno != EINTR) return NOTIFY_TCP_IO;
+  }
+}
+
+/* send (wr) or receive exactly n octets; the whole transfer is held to deadline_ms (a peer that sends one octet a second does not hold the thread) */
+static int notify_tcp_io(int fd, uint8_t *buf, size_t n, bool wr, int64_t deadline_ms) {
+  size_t done = 0;
+  while (done < n) {
+    int w = notify_tcp_wait(fd, wr ? POLLOUT : POLLIN, deadline_ms);
+    if (w != NOTIFY_TCP_OK) return w;
+    ssize_t k = wr ? send(fd, buf + done, n - done, MSG_NOSIGNAL | MSG_DONTWAIT) : recv(fd, buf + done, n - done, MSG_DONTWAIT);
+    if (k < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+      return NOTIFY_TCP_IO;
+    }
+    if (k == 0) return wr ? NOTIFY_TCP_IO : NOTIFY_TCP_CLOSED;
+    done += (size_t)k;
+  }
+  return NOTIFY_TCP_OK;
+}
+
+/* Send one DNS message over the connected TCP socket fd (RFC 1035 §4.2.2: a two-octet length first) and read the one message that answers it.
+ * The answer is the peer's: its length is checked against the header size and cap before anything is read into resp.  timeout_ms covers the
+ * whole exchange. */
+int notify_tcp_roundtrip(int fd, const uint8_t *msg, size_t len, uint8_t *resp, size_t cap, size_t *resp_len, int timeout_ms) {
+  uint8_t frame[2 + NOTIFY_PKT_MAX];
+  if (len > NOTIFY_PKT_MAX) return NOTIFY_TCP_IO;
+  frame[0] = (uint8_t)(len >> 8);
+  frame[1] = (uint8_t)(len & 0xFF);
+  memcpy(frame + 2, msg, len);
+  int64_t deadline = notify_now_ms() + (timeout_ms > 0 ? timeout_ms : 1);
+  int rc = notify_tcp_io(fd, frame, 2 + len, true, deadline);
+  if (rc != NOTIFY_TCP_OK) return rc;
+  uint8_t lp[2];
+  if ((rc = notify_tcp_io(fd, lp, 2, false, deadline)) != NOTIFY_TCP_OK) return rc;
+  size_t rl = ((size_t)lp[0] << 8) | lp[1];
+  if (rl < DNS_HEADER_SIZE || rl > cap) return NOTIFY_TCP_BAD_LENGTH;
+  if ((rc = notify_tcp_io(fd, resp, rl, false, deadline)) != NOTIFY_TCP_OK) return rc;
+  *resp_len = rl;
+  return NOTIFY_TCP_OK;
+}
+
+/* One TCP attempt for the NOTIFY of p (a private copy): a new ID and signature, a connection from the source address of p, the exchange, the
+ * checks of the answer.  true = answered (rcode set); false = failed, why says how. */
+static bool notify_tcp_attempt(notify_pending_t *p, unsigned *rcode, char *why, size_t whysz) {
+  p->id = (uint16_t)(arc4random() & 0xFFFF);
+  p->pkt[0] = (uint8_t)(p->id >> 8);
+  p->pkt[1] = (uint8_t)(p->id & 0xFF);
+  p->pkt_len = p->unsigned_len;
+  if (p->is_signed && !notify_sign(p)) {
+    snprintf(why, whysz, "cannot sign the message");
+    return false;
+  }
+  tcp_sockopts_t o;
+  memset(&o, 0, sizeof(o));
+  o.connect_timeout_ms = NOTIFY_TCP_TIMEOUT_MS;
+  if (p->has_src) {
+    o.has_src = 1;
+    memcpy(o.src, p->src, sizeof(o.src));
+  }
+  int64_t deadline = notify_now_ms() + NOTIFY_TCP_TIMEOUT_MS;
+  int fd = broker_connect_opts(p->dest.ss_family, SOCK_STREAM, (struct sockaddr *)&p->dest, p->dest_len, &o);
+  if (fd < 0) {
+    snprintf(why, whysz, "cannot connect%s", p->has_src ? " (from the configured notify source address)" : "");
+    return false;
+  }
+  limit_client_socket_rights(fd);
+  uint8_t resp[NOTIFY_TCP_RESP_MAX];
+  size_t rlen = 0;
+  int64_t left = deadline - notify_now_ms();
+  int rc = notify_tcp_roundtrip(fd, p->pkt, p->pkt_len, resp, sizeof(resp), &rlen, left > 0 ? (int)left : 1);
+  close(fd);
+  if (rc != NOTIFY_TCP_OK) {
+    snprintf(why, whysz, "%s", rc == NOTIFY_TCP_TIMEOUT ? "timed out" : rc == NOTIFY_TCP_CLOSED ? "the connection was closed before the answer"
+                              : rc == NOTIFY_TCP_BAD_LENGTH ? "the answer has an impossible length" : "connection error");
+    return false;
+  }
+  uint16_t rid = 0;
+  char qname[DNS_NAME_TEXT_SIZE];
+  /* RFC 1996 §3.6: the ID and the QNAME of the NOTIFY (the connection itself fixes the address and port) */
+  if (!notify_parse_answer(resp, rlen, &rid, qname, sizeof(qname), rcode) || rid != p->id || !domain_names_match_ci(p->domain, qname)) {
+    snprintf(why, whysz, "the reply is not an answer to this NOTIFY");
+    return false;
+  }
+  if (p->is_signed) {
+    int tv = notify_answer_tsig(p, resp, rlen);
+    if (tv != 0) {
+      snprintf(why, whysz, "the answer fails TSIG verification with key '%s' (%s, rcode %u)", p->key_name, notify_tsig_why(tv), *rcode);
+      return false;
+    }
+  }
+  return true;
+}
+
+static void *notify_tcp_thread(void *arg) {
+  notify_tcp_job_t *job = arg;
+  notify_pending_t *p = &job->p;
+  char a[INET6_ADDRSTRLEN + 16];
+  sockaddr_to_text(&p->dest, a, sizeof(a));
+  for (int attempt = 1; attempt <= job->tries; attempt++) {
+    char why[192];
+    unsigned rcode = 0;
+    if (notify_tcp_attempt(p, &rcode, why, sizeof(why))) {
+      notify_log_answer(p, a, rcode, " over TCP");
+      break;
+    }
+    if (attempt < job->tries) syslog(LOG_NOTICE, "[Notify] zone '%s': NOTIFY to %s over TCP failed: %s: retrying over TCP", p->domain, a, why);
+    else syslog(LOG_WARNING, "[Notify] zone '%s': NOTIFY to %s over TCP failed: %s", p->domain, a, why);
+  }
+  free(job);
+  atomic_fetch_sub_explicit(&g_notify_tcp_active, 1, memory_order_acq_rel);
+  return NULL;
+}
+
+/* Room for one more TCP exchange (only the control thread adds to the count, so a true answer holds until it calls notify_tcp_start()) */
+static bool notify_tcp_room(void) { return atomic_load_explicit(&g_notify_tcp_active, memory_order_acquire) < NOTIFY_TCP_MAX; }
+
+/* Start the TCP exchange for the NOTIFY in p.  1 = started (the thread logs the outcome); 0 = no room, try again later; -1 = could not start (logged). */
+static int notify_tcp_start(const notify_pending_t *p) {
+  if (!xfr_counter_acquire(&g_notify_tcp_active, NOTIFY_TCP_MAX)) return 0;
+  notify_tcp_job_t *job = malloc(sizeof(*job));
+  if (!job) {
+    atomic_fetch_sub_explicit(&g_notify_tcp_active, 1, memory_order_acq_rel);
+    syslog(LOG_ERR, "[Notify] zone '%s': out of memory; NOTIFY over TCP not sent", p->domain);
+    return -1;
+  }
+  job->p = *p;
+  job->tries = p->tcp_tries > 0 ? p->tcp_tries : 1;
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  pthread_attr_setstacksize(&attr, 256 * 1024);
+  pthread_t tid;
+  int rc = pthread_create(&tid, &attr, notify_tcp_thread, job);
+  pthread_attr_destroy(&attr);
+  if (rc != 0) {
+    free(job);
+    atomic_fetch_sub_explicit(&g_notify_tcp_active, 1, memory_order_acq_rel);
+    syslog(LOG_ERR, "[Notify] zone '%s': cannot start a thread; NOTIFY over TCP not sent", p->domain);
+    return -1;
+  }
+  return 1;
+}
+
+/* The NOTIFY of p goes out now: a UDP datagram, or the TCP exchange (p leaves the table: the thread has a copy).  The caller has taken the
+ * notify-rate token and, for TCP, checked notify_tcp_room(). */
+static void notify_xmit(notify_pending_t *p, time_t now) {
+  if (!p->tcp_stage) {
+    send_single_notify(p->pkt, p->pkt_len, (const struct sockaddr *)&p->dest, p->dest_len, p->has_src, p->src);
+    return;
+  }
+  if (notify_tcp_start(p) == 0) { /* cannot happen after notify_tcp_room(); held for the next tick */
+    p->sends = 0;
+    p->next_time = now + 1;
+    return;
+  }
+  p->used = false;
+}
+
+/* The UDP attempts did not get the NOTIFY answered (or the answer was no good): the message is made over TCP once (BIND notify_done()) */
+static void notify_to_tcp(notify_pending_t *p, time_t now, bool bad_answer) {
+  char a[INET6_ADDRSTRLEN + 16];
+  sockaddr_to_text(&p->dest, a, sizeof(a));
+  if (bad_answer) syslog(LOG_NOTICE, "[Notify] zone '%s': the answer from %s was no good; retrying over TCP", p->domain, a);
+  else syslog(LOG_NOTICE, "[Notify] zone '%s': no answer from %s after %d NOTIFY message(s); retrying over TCP", p->domain, a, p->sends);
+  p->tcp_stage = true;
+  p->tcp_tries = 1;
+  p->sends = 0; /* "not sent yet": notify_retransmit_due() sends it with the notify-rate budget */
+  p->next_time = now;
+}
+
 /* 1つの宛先へ NOTIFY を組み立てて送り、応答待ちに登録する。宛先ごとに ID を変え (RFC 1996 §3.6 の
  * 照合は ID、QNAME、送信元アドレスとポート)、鍵があれば署名する (RFC 8945 §5.1)。
  * 同じゾーンの同じ宛先への古い NOTIFY が待っていれば置き換える (新しい版の通知で足りる)。 */
 static void notify_send_to(const char *domain, const char *view_name, const struct sockaddr_storage *dest,
-                           bool has_src, const uint8_t *src, const tsig_key_t *key, const notify_retry_config_t *nr, uint32_t rate) {
+                           bool has_src, const uint8_t *src, const tsig_key_t *key, const notify_retry_config_t *nr, uint32_t rate,
+                           bool tcp_only) {
   socklen_t dlen = dest->ss_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
   notify_pending_t *slot = NULL;
   for (int i = 0; i < NOTIFY_PENDING_MAX; i++) {
@@ -379,19 +638,29 @@ static void notify_send_to(const char *domain, const char *view_name, const stru
   slot->interval = nr->interval;
   slot->exponential = nr->backoff == NOTIFY_BACKOFF_EXPONENTIAL;
   time_t now = time(NULL);
+  /* tcp-only (the `server` statement): the NOTIFY goes over TCP from the start, two attempts (see the comment above notify_tcp_start()) */
+  slot->tcp_stage = tcp_only;
+  slot->tcp_tries = tcp_only ? 2 : 1;
   /* notify-rate: at most that many NOTIFY messages a second.  One over the budget is sent by notify_retransmit_due() at a later tick, with
-   * sends == 0 ("not sent yet"); when the table of pending NOTIFYs is full (not tracked) it cannot wait and goes now. */
-  if (!tracked || xfr_rl_take(&g_notify_rl, rate, now)) {
+   * sends == 0 ("not sent yet"); when the table of pending NOTIFYs is full (not tracked) it cannot wait and goes now.  A TCP exchange also
+   * waits for a free place among the threads in flight. */
+  bool room = !slot->tcp_stage || notify_tcp_room();
+  if (!tracked && !room) {
+    char a[INET6_ADDRSTRLEN + 16];
+    sockaddr_to_text(dest, a, sizeof(a));
+    syslog(LOG_WARNING, "[Notify] zone '%s': too many NOTIFYs awaiting an answer; NOTIFY to %s over TCP is not sent", domain, a);
+    return;
+  }
+  slot->used = tracked;
+  if (!tracked || (room && xfr_rl_take(&g_notify_rl, rate, now))) {
     slot->sends = 1;
     slot->next_time = now + slot->interval;
-    send_single_notify(slot->pkt, slot->pkt_len, (const struct sockaddr *)&slot->dest, slot->dest_len, slot->has_src, slot->src);
+    notify_xmit(slot, now);
   } else {
     slot->sends = 0;
     slot->next_time = now + 1;
   }
-  if (tracked) {
-    slot->used = true;
-  } else {
+  if (!tracked) {
     char a[INET6_ADDRSTRLEN + 16];
     sockaddr_to_text(dest, a, sizeof(a));
     syslog(LOG_WARNING, "[Notify] zone '%s': too many NOTIFYs awaiting an answer; NOTIFY to %s is not retransmitted",
@@ -403,27 +672,24 @@ void notify_retransmit_due(time_t now) {
   for (int i = 0; i < NOTIFY_PENDING_MAX; i++) {
     notify_pending_t *p = &g_notify_pending[i];
     if (!p->used || now < p->next_time) continue;
+    if (p->sends > 0 && p->sends >= p->max_sends) {
+      /* BIND notify_done(): a NOTIFY that got no answer over UDP is made once more over TCP; one that was over TCP already is gone with its
+       * thread (notify_xmit()), so this is the end of the UDP attempts */
+      notify_to_tcp(p, now, false);
+    }
     if (p->sends == 0) {
-      /* held back by notify-rate: this is its first message */
-      if (!xfr_rl_take(&g_notify_rl, g_notify_rate, now)) {
+      /* held back by notify-rate (or, over TCP, by the number of exchanges in flight): this is its first message */
+      if ((p->tcp_stage && !notify_tcp_room()) || !xfr_rl_take(&g_notify_rl, g_notify_rate, now)) {
         p->next_time = now + 1;
         continue;
       }
-      if (p->is_signed && !notify_sign(p)) {
+      if (!p->tcp_stage && p->is_signed && !notify_sign(p)) {
         p->used = false;
         continue;
       }
-      send_single_notify(p->pkt, p->pkt_len, (const struct sockaddr *)&p->dest, p->dest_len, p->has_src, p->src);
       p->sends = 1;
       p->next_time = now + p->interval;
-      continue;
-    }
-    if (p->sends >= p->max_sends) {
-      char a[INET6_ADDRSTRLEN + 16];
-      sockaddr_to_text(&p->dest, a, sizeof(a));
-      syslog(LOG_WARNING, "[Notify] zone '%s': no answer from %s after %d NOTIFY message(s), giving up",
-             p->domain, a, p->sends);
-      p->used = false;
+      notify_xmit(p, now);
       continue;
     }
     /* 同じ ID で送り直す (RFC 1996 §3.6 の照合は ID で行う)。署名は今の時刻で付け直す */
@@ -441,46 +707,30 @@ void notify_retransmit_due(time_t now) {
 }
 
 void notify_handle_response(const uint8_t *msg, size_t len, const struct sockaddr *from) {
-  if (len < DNS_HEADER_SIZE || (msg[2] & 0x80) == 0 || ((msg[2] >> 3) & 0x0F) != 4) return;
-  uint16_t id = (uint16_t)((msg[0] << 8) | msg[1]);
-  uint16_t qdcount = (uint16_t)((msg[4] << 8) | msg[5]);
+  uint16_t id;
+  unsigned rcode;
   char qname[DNS_NAME_TEXT_SIZE];
-  size_t q_end;
   /* RFC 1996 §3.6: ID、QNAME、送信元アドレスとポートの一致した応答だけを NOTIFY の応答とする */
-  if (qdcount < 1 || expand_wire_name_to_buffer(msg, len, DNS_HEADER_SIZE, &q_end, qname, sizeof(qname)) < 0)
-    return;
+  if (!notify_parse_answer(msg, len, &id, qname, sizeof(qname), &rcode)) return;
   for (int i = 0; i < NOTIFY_PENDING_MAX; i++) {
     notify_pending_t *p = &g_notify_pending[i];
     if (!p->used || p->id != id || !sockaddr_equal(&p->dest, from) || !domain_names_match_ci(p->domain, qname))
       continue;
     char a[INET6_ADDRSTRLEN + 16];
     sockaddr_to_text(&p->dest, a, sizeof(a));
-    unsigned rcode = msg[3] & 0x0F;
     if (p->is_signed) {
       /* RFC 8945 §5.4: 署名した要求への応答は検証できたものだけを受け付ける。無署名、検証できない、
-       * MAC の無いエラー (BADKEY/BADSIG) はログに出して捨て、再送を続ける。 */
-      tsig_key_t key;
-      notify_pending_tsig_key(p, &key);
-      uint8_t mac[64];
-      size_t mac_len = 0;
-      int tv = tsig_verify_packet(msg, len, &key, p->req_mac, p->req_mac_len, NULL, 0, false, mac, &mac_len);
-      if (tv != 0 && p->prev_mac_len > 0) {
-        int tv_prev = tsig_verify_packet(msg, len, &key, p->prev_mac, p->prev_mac_len, NULL, 0, false, mac, &mac_len);
-        if (tv_prev == 0) tv = 0;
-      }
+       * MAC の無いエラー (BADKEY/BADSIG) はログに出して捨てる。BIND (notify_done()) は応答が使えなかった要求を TCP でもう一度送る
+       * ので、UDP の段階ならここから TCP に移る (再送の残りは待たない)。 */
+      int tv = notify_answer_tsig(p, msg, len);
       if (tv != 0) {
-        const char *why = tv == -1 ? "unsigned" : tv == 16 ? "BADSIG" : tv == 17 ? "BADKEY" : tv == 18 ? "BADTIME"
-                                                                                                  : "malformed TSIG";
         syslog(LOG_WARNING, "[Notify] zone '%s': ignoring NOTIFY answer from %s that fails TSIG verification "
-               "with key '%s' (%s, rcode %u)", p->domain, a, p->key_name, why, rcode);
+               "with key '%s' (%s, rcode %u)", p->domain, a, p->key_name, notify_tsig_why(tv), rcode);
+        if (!p->tcp_stage) notify_to_tcp(p, time(NULL), true);
         return;
       }
     }
-    if (rcode != 0) {
-      syslog(LOG_WARNING, "[Notify] zone '%s': %s answered NOTIFY with rcode %u", p->domain, a, rcode);
-    } else {
-      syslog(LOG_DEBUG, "[Notify] zone '%s': NOTIFY acknowledged by %s", p->domain, a);
-    }
+    notify_log_answer(p, a, rcode, "");
     p->used = false;
     return;
   }
@@ -540,7 +790,7 @@ void send_notify_to_all(zone_db_entry_t *entry) {
   const char *domain = entry->domain;
   const char *view_name = entry->view_name;
   /* 制御スレッドだけが呼ぶ (応答待ちの表を持つため。他のスレッドは notify_request_send())。
-   * 設定・スナップショット・arena を読むので、全体を読み取り区間に入れる (UDP の送信だけで、待ちは無い)。*/
+   * 設定・スナップショット・arena を読むので、全体を読み取り区間に入れる (UDP の送信と TCP の交換を始めるだけで、待ちは無い)。*/
   rcu_aux_read_lock();
   server_config_t *active = acquire_config_snapshot();
   zone_db_snapshot_t *snap = acquire_zone_snapshot();
@@ -569,7 +819,7 @@ void send_notify_to_all(zone_db_entry_t *entry) {
   /* D-09: ゾーンに tsig-key があれば NOTIFY に署名する */
   const tsig_key_t *key = NULL;
   if (zone && zext(zone)->tsig_key && zext(zone)->tsig_key[0]) {
-    key = find_tsig_key_by_name(active, zext(zone)->tsig_key);
+    key = find_tsig_key_in_view(active, view_name, zext(zone)->tsig_key);
     if (!key) syslog(LOG_ERR, "[Notify] zone '%s': tsig-key '%s' is not defined; NOTIFY sent unsigned", domain,
                      zext(zone)->tsig_key);
   }
@@ -584,7 +834,7 @@ void send_notify_to_all(zone_db_entry_t *entry) {
   for (int i = 0; i < an_count; i++) {
     const tsig_key_t *tk = key;
     if (an[i].key) {
-      tk = find_tsig_key_by_name(active, an[i].key);
+      tk = find_tsig_key_in_view(active, view_name, an[i].key);
       if (!tk) syslog(LOG_ERR, "[Notify] zone '%s': also-notify key '%s' is not defined; NOTIFY sent unsigned", domain, an[i].key);
     }
     notify_add_target(targets, &ntargets, 64, AF_UNSPEC, an[i].ip, (uint16_t)an[i].port, tk, &an[i]);
@@ -625,7 +875,22 @@ void send_notify_to_all(zone_db_entry_t *entry) {
      * warning (a restart-only change) and the system chooses the source. */
     int fam = targets[i].addr.ss_family;
     uint8_t src[16];
-    bool has_src = xfr_source_for(&eff, targets[i].tpl, fam, false, src);
+    /* the server statement that covers the address (batch 5; the view's, else the top-level ones): its notify-source(-v6) is above the
+     * list's `source` (BIND notify_send_toaddr()), and its `keys` signs the NOTIFY unless the also-notify element has a key of its own
+     * (BIND: notify->key, else dns_view_getpeertsig()); the zone's tsig-key comes after both (KariDNS) */
+    const uint8_t *dst_bytes = fam == AF_INET ? (const uint8_t *)&((const struct sockaddr_in *)&targets[i].addr)->sin_addr
+                                              : (const uint8_t *)&((const struct sockaddr_in6 *)&targets[i].addr)->sin6_addr;
+    const server_stmt_t *srv = config_server_find(active, view_name, fam, dst_bytes);
+    const tsig_key_t *tkey = targets[i].key;
+    if (srv && (srv->set & SV_KEYS) && !(targets[i].tpl && targets[i].tpl->key)) {
+      const tsig_key_t *sk = find_tsig_key_in_view(active, view_name, srv->key);
+      if (sk) tkey = sk;
+      else syslog(LOG_ERR, "[Notify] zone '%s': the key '%s' of the server statement for %s is not defined; NOTIFY sent with the zone's key or unsigned",
+                  domain, srv->key, targets[i].tpl ? targets[i].tpl->ip : "an NS host");
+    }
+    xfr_eff_t peff;
+    xfr_opts_effective_peer(active, zone, view_name, srv, &peff);
+    bool has_src = xfr_source_for(&peff, targets[i].tpl, fam, false, src);
     if (has_src && !config_xfr_source_allowed(fam, src, false)) {
       char txt[INET6_ADDRSTRLEN];
       inet_ntop(fam, src, txt, sizeof(txt));
@@ -633,7 +898,9 @@ void send_notify_to_all(zone_db_entry_t *entry) {
                           "(until then the system chooses the source address)", domain, txt);
       has_src = false;
     }
-    notify_send_to(domain, view_name, &targets[i].addr, has_src, src, targets[i].key, &nr, g_notify_rate);
+    /* tcp-only yes in that server statement: the NOTIFY goes over TCP (BIND notify_send_toaddr(): dns_peer_getforcetcp()) */
+    bool tcp_only = srv && (srv->set & SV_B_TCP_ONLY) && (srv->bools & SV_B_TCP_ONLY);
+    notify_send_to(domain, view_name, &targets[i].addr, has_src, src, tkey, &nr, g_notify_rate, tcp_only);
   }
 
   if (ntargets > 0) {

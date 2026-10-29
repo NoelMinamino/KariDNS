@@ -7,6 +7,11 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <limits.h>
+#include <stdalign.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 #include "../../dns_wire.h"
 #include "../../dns_zone_parser.h"
@@ -17,6 +22,8 @@
 #include "../../dns_epoch_rcu.h"
 #include "../../dns_server_internal.h"
 #include "../test_zone_slots.h"
+#include "../test_zext.h"
+#include "../../dns_config_parser.h"
 
 // Mock globals
 _Atomic int g_control_kq = -1;
@@ -65,7 +72,103 @@ size_t resolve_ip_port_to_sockaddr(const char *ip, int port, struct sockaddr_sto
     (void)ip; (void)port; (void)out; return 0;
 }
 
+/* ---- the answer to a NOTIFY (dns_dynamic_update.c): the bytes of a peer, as a UDP datagram and as the reply on a TCP connection ----
+ * An input that starts with 0x7E is such an answer.  A signed NOTIFY to 192.0.2.10 is pending (sent again for every input), so that the ID
+ * and the source address can be right: notify_handle_response() then gets as far as the TSIG checks.  The TCP side goes through the framing
+ * of notify_tcp_roundtrip() on a socketpair. */
+static bool nf_ready;
+static server_config_t nf_cfg;
+static view_config_t nf_view;
+static zone_config_t nf_zone;
+static notify_target_t nf_an[1];
+static tsig_key_t nf_key;
+static zone_db_entry_t *nf_entry;
+
+static void nf_setup(void) {
+    nf_key.name = "tcpkey.example.";
+    nf_key.algorithm = "hmac-sha256";
+    nf_key.secret_decoded_len = 32;
+    memset(nf_key.secret_decoded, 0x5C, 32);
+    nf_cfg.keys = &nf_key;
+    nf_cfg.notify_rate = 1000000;
+    nf_cfg.notify_rate_set = true;
+    nf_cfg.notify_retry.retries = 3;
+    nf_cfg.notify_retry.interval = 60;
+    nf_view.name = "default";
+    nf_zone.domain = "nf.example.";
+    tzx(&nf_zone)->notify_mode = NOTIFY_MODE_EXPLICIT;
+    tzx(&nf_zone)->tsig_key = "tcpkey.example.";
+    nf_an[0].ip = "192.0.2.10";
+    nf_an[0].port = 53;
+    tzx(&nf_zone)->also_notify = nf_an;
+    tzx(&nf_zone)->also_notify_count = 1;
+    tzx(&nf_zone)->also_notify_set = true;
+    nf_view.zones = &nf_zone;
+    nf_cfg.views = &nf_view;
+    atomic_store_explicit(&g_config_db.active, &nf_cfg, memory_order_release);
+    zone_db_snapshot_t *snap = rebuild_zone_db_snapshot(&nf_cfg, NULL, NULL, NULL, NULL, 0);
+    assert(snap != NULL);
+    nf_entry = snapshot_get_zone(snap, "nf.example.");
+    assert(nf_entry);
+    assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, g_notify_ipc) == 0);
+    nf_ready = true;
+}
+
+typedef struct { alignas(udp_ipc_t) uint8_t b[2048]; } nf_dg_t;
+
+/* send the NOTIFY (it replaces the pending one of the same target) and take its datagram: the ID and the address it went to */
+static bool nf_notify(nf_dg_t *dg, uint8_t *id0, uint8_t *id1) {
+    send_notify_to_all(nf_entry);
+    ssize_t n = recv(g_notify_ipc[0], dg->b, sizeof(dg->b), MSG_DONTWAIT);
+    if (n < (ssize_t)(sizeof(udp_ipc_t) + 12)) return false;
+    *id0 = dg->b[sizeof(udp_ipc_t)];
+    *id1 = dg->b[sizeof(udp_ipc_t) + 1];
+    uint8_t junk[2048];
+    while (recv(g_notify_ipc[0], junk, sizeof(junk), MSG_DONTWAIT) > 0) {}
+    return true;
+}
+
+static void fuzz_notify_answer(const uint8_t *data, size_t size) {
+    if (!nf_ready) nf_setup();
+    if (size < 1) return;
+    bool tcp = data[0] & 1; /* the next octet of the input says which way the answer comes */
+    data++;
+    size--;
+    if (size > 4096) size = 4096;
+    nf_dg_t dg;
+    uint8_t id0, id1;
+    uint8_t buf[4096];
+    if (!nf_notify(&dg, &id0, &id1)) return;
+
+    if (!tcp) {
+        /* as a datagram from the address the NOTIFY went to, with its ID */
+        memcpy(buf, data, size);
+        if (size >= 2) { buf[0] = id0; buf[1] = id1; }
+        notify_handle_response(buf, size, (const struct sockaddr *)&((const udp_ipc_t *)dg.b)->client_addr);
+        return;
+    }
+    /* as the reply on a connection: the length prefix and the message come from the input; the peer says nothing more */
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return;
+    (void)!send(sv[1], data, size, MSG_NOSIGNAL | MSG_DONTWAIT);
+    shutdown(sv[1], SHUT_WR);
+    uint8_t req[40] = {0};
+    size_t rl = 0;
+    if (notify_tcp_roundtrip(sv[0], req, sizeof(req), buf, sizeof(buf), &rl, 20) == NOTIFY_TCP_OK) {
+        assert(rl >= 12 && rl <= sizeof(buf));
+        buf[0] = id0;
+        buf[1] = id1;
+        notify_handle_response(buf, rl, (const struct sockaddr *)&((const udp_ipc_t *)dg.b)->client_addr);
+    }
+    close(sv[0]);
+    close(sv[1]);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (size >= 1 && data[0] == 0x7E) {
+        fuzz_notify_answer(data + 1, size - 1);
+        return 0;
+    }
     if (size < 12) return 0;
 
     zone_db_entry_t entry;

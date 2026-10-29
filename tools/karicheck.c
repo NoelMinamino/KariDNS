@@ -792,6 +792,12 @@ static void kc_xfr_notes(const server_config_t *cfg) {
         }
         printf("\n");
     }
+    /* batch 5: a view that has server statements of its own does not use the top-level ones (BIND takes the first list that exists) */
+    if (cfg->servers)
+        for (const view_config_t *sv = cfg->views; sv; sv = sv->next)
+            if (sv->servers)
+                fprintf(stderr, "[NOTE] View '%s': it has server statements of its own, so the top-level server statements do not apply in this view "
+                                "(BIND uses the view's list, not both)\n", sv->name);
     const view_config_t *zv;
     const zone_config_t *z;
     CONFIG_FOR_EACH_ZONE(cfg, zv, z) {

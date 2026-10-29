@@ -319,7 +319,8 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
          * that fails fails the connection (the transfer is not made from another address than the operator asked for). */
         bool src_ok = true;
         if (req.type == SOCK_STREAM && req.family != AF_UNIX && req.tcp_opts.has_src) {
-          if (!config_xfr_source_allowed(req.family, req.tcp_opts.src, true)) {
+          /* a transfer source, or a NOTIFY source (a NOTIFY over TCP leaves from the address of the UDP one) */
+          if (!config_xfr_source_allowed(req.family, req.tcp_opts.src, true) && !config_xfr_source_allowed(req.family, req.tcp_opts.src, false)) {
             src_ok = false;
           } else if (req.family == AF_INET) {
             struct sockaddr_in sin;
@@ -1731,20 +1732,35 @@ static xfr_rl_t g_serial_query_rl;
 /* where the walk of the secondaries starts in this tick (the control thread only); see the loop */
 static size_t g_tick_rotor;
 
-/* Copies the TSIG key `name` of the configuration into p by value ([H-4]: the thread must not point into the configuration) */
-static void xfr_primary_copy_key(const server_config_t *active, const char *name, xfr_primary_t *p) {
+/* Copies the TSIG key `name` as the view sees it (the view's own keys, then the global ones) into p by value ([H-4]: the thread must not
+ * point into the configuration) */
+static void xfr_primary_copy_key(const server_config_t *active, const char *view_name, const char *name, xfr_primary_t *p) {
   if (!name || !name[0] || !active) return;
-  for (const tsig_key_t *k = active->keys; k; k = k->next) {
-    if (!tsig_key_names_equal(k->name, name)) continue;
-    p->has_tsig = true;
-    strlcpy(p->tsig_name, k->name, sizeof(p->tsig_name));
-    strlcpy(p->tsig_algorithm, k->algorithm ? k->algorithm : "hmac-sha256", sizeof(p->tsig_algorithm));
-    size_t copy_len = k->secret_decoded_len;
-    if (copy_len > sizeof(p->tsig_secret_decoded)) copy_len = sizeof(p->tsig_secret_decoded);
-    memcpy(p->tsig_secret_decoded, k->secret_decoded, copy_len);
-    p->tsig_secret_decoded_len = copy_len;
-    return;
+  const tsig_key_t *k = find_tsig_key_in_view(active, view_name, name);
+  if (!k) return;
+  p->has_tsig = true;
+  strlcpy(p->tsig_name, k->name, sizeof(p->tsig_name));
+  strlcpy(p->tsig_algorithm, k->algorithm ? k->algorithm : "hmac-sha256", sizeof(p->tsig_algorithm));
+  size_t copy_len = k->secret_decoded_len;
+  if (copy_len > sizeof(p->tsig_secret_decoded)) copy_len = sizeof(p->tsig_secret_decoded);
+  memcpy(p->tsig_secret_decoded, k->secret_decoded, copy_len);
+  p->tsig_secret_decoded_len = copy_len;
+}
+
+/* What the `server` statement that covers primary p (NULL: none) says about the requests to it (batch 5): its request-ixfr, request-expire,
+ * transfers, edns, edns-udp-size, edns-version and request-nsid (BIND lib/dns/zone.c soa_query(), xfrin.c, zmgr_start_xfrin_ifquota()). */
+static void xfr_primary_apply_server(const server_stmt_t *srv, xfr_primary_t *p) {
+  if (!srv) return;
+  if (srv->xo.set & XO_B_REQUEST_IXFR) p->srv_request_ixfr = (srv->xo.bools & XO_B_REQUEST_IXFR) ? 1 : 2;
+  if (srv->xo.set & XO_B_REQUEST_EXPIRE) p->srv_request_expire = (srv->xo.bools & XO_B_REQUEST_EXPIRE) ? 1 : 2;
+  if (srv->set & SV_TRANSFERS) {
+    p->per_ns_set = true;
+    p->per_ns = srv->transfers;
   }
+  if ((srv->set & SV_B_EDNS) && !(srv->bools & SV_B_EDNS)) p->no_edns = true;
+  if ((srv->set & SV_B_REQUEST_NSID) && (srv->bools & SV_B_REQUEST_NSID)) p->request_nsid = true;
+  if (srv->set & SV_EDNS_VERSION) p->edns_version = (uint8_t)srv->edns_version;
+  if (srv->set & SV_EDNS_UDP_SIZE) p->edns_udp_size = (uint16_t)srv->edns_udp_size;
 }
 
 /* The local address of the connection to p: the `source` of the primaries list it is written in, else transfer-source(-v6) (BIND zone.c
@@ -1767,6 +1783,20 @@ static void xfr_primary_set_source(const xfr_eff_t *eff, const notify_target_t *
     syslog(LOG_WARNING, "[AXFR] zone %s: the transfer source address %s was not in the configuration at start-up; it is used after a restart "
                         "(until then the system chooses the source address)", domain, txt);
   }
+}
+
+/* Everything that depends on who the primary is (batch 5): the `server` statement that covers its address (the view's, else the top-level ones)
+ * gives the TSIG key unless the primaries element has one of its own (BIND soa_query(): the element's key, then dns_view_getpeertsig(); the
+ * zone's tsig-key after both, KariDNS), the source address (above the list's `source`), request-ixfr / request-expire, transfers and the
+ * EDNS options of the requests.  element_key is the key written on the primaries element, zone_key the zone's tsig-key. */
+static void xfr_primary_setup(const server_config_t *active, const zone_config_t *zone, const char *view_name, const char *element_key,
+                              const char *zone_key, const notify_target_t *t, xfr_primary_t *p, axfr_bg_ctx_t *ctx) {
+  const server_stmt_t *srv = config_server_find_ip(active, view_name, p->ip);
+  xfr_primary_copy_key(active, view_name, peer_key_name(element_key, srv, zone_key), p);
+  xfr_primary_apply_server(srv, p);
+  xfr_eff_t peff;
+  xfr_opts_effective_peer(active, zone, view_name, srv, &peff);
+  xfr_primary_set_source(&peff, t, p, ctx->domain);
 }
 
 /* The primaries a secondary zone is refreshed from, in order, and the options that govern the refresh (batch 4).  A configured secondary
@@ -1796,8 +1826,7 @@ static void xfr_build_primaries(server_config_t *active, zone_db_snapshot_t *sna
       xfr_primary_t *p = &ctx->prim[n++];
       strlcpy(p->ip, x->masters[i].ip, sizeof(p->ip));
       p->port = x->masters[i].port;
-      xfr_primary_copy_key(active, zone_primary_key(x, i), p);
-      xfr_primary_set_source(&ctx->eff, &x->masters[i], p, ctx->domain);
+      xfr_primary_setup(active, mcfg, entry->view_name, x->masters[i].key, x->tsig_key, &x->masters[i], p, ctx);
     }
     if (x->masters_count > XFR_PRIMARIES_MAX)
       syslog(LOG_WARNING, "[AXFR] zone %s: %d primaries are listed; only the first %d are used", ctx->domain, x->masters_count, XFR_PRIMARIES_MAX);
@@ -1805,8 +1834,7 @@ static void xfr_build_primaries(server_config_t *active, zone_db_snapshot_t *sna
     xfr_primary_t *p = &ctx->prim[n++];
     strlcpy(p->ip, entry->catalog_master->ip, sizeof(p->ip));
     p->port = entry->catalog_master->port;
-    xfr_primary_copy_key(active, entry->catalog_master->tsig_key, p);
-    xfr_primary_set_source(&ctx->eff, NULL, p, ctx->domain);
+    xfr_primary_setup(active, NULL, entry->view_name, entry->catalog_master->tsig_key, NULL, NULL, p, ctx);
   }
   ctx->nprim = n;
 }
@@ -2515,7 +2543,7 @@ process_tcp_client: ;
              * TSIG のエラーは NOTAUTH、解釈できない TSIG は FORMERR。その後に allow-transfer を調べ、
              * 拒否は REFUSED。応答は tsig_finish_response() で署名する (検証できた要求には同じ鍵で)。 */
             tsig_request_t tsig;
-            tsig_check_request(cfg, msg, msg_len, ctx_tcp->client_ip, &tsig);
+            tsig_check_request(cfg, xfr_view ? xfr_view->name : NULL, msg, msg_len, ctx_tcp->client_ip, &tsig);
             tsig_key_t *matched_key = (tsig.status == TSIG_REQ_VALID) ? tsig.key : NULL;
             /* X-28, RFC 6891 §6.1.3: 実装していない EDNS VERSION は、クエリ経路と同じく TSIG の検証の後、
              * allow-transfer より前に BADVERS (TSIG が正しければ署名する) */
