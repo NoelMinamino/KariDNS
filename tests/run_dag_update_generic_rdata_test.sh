@@ -58,6 +58,32 @@ check "yxrrset prerequisite generic form: CLASS ANY... RDLENGTH 2" "$OUT" "00 02
 OUT=$(run --update-add 'x.example.test 300 IN TXT "plain text"')
 check "a record in the presentation format still works" "$OUT" "70 6c 61 69 6e"
 
+# batch 13: the operand tokenizer used to drop token 33 and later silently (char *tokens[32]).  The hex of a
+# "\# <length> <hex>" RDATA split into one token per octet is far beyond 32 tokens.
+HEX=$(awk 'BEGIN { for (i = 0; i < 100; i++) printf "%02x ", i }')
+OUT=$(run --update-add "x.example.test 300 IN TYPE65534 \\# 100 $HEX")
+check "update-add: 100 hex tokens (> 32) are all kept: RDLENGTH 100, first and last octet" "$OUT" "00 64 00 01 02"
+check "update-add: the last of 100 tokens (octet 0x63) is present" "$OUT" "5e 5f 60 61 62 63"
+OUT=$(run --update-del-exact "x.example.test IN TYPE65534 \\# 100 $HEX")
+check "update-del-exact: 100 hex tokens are all kept" "$OUT" "00 64 00 01 02"
+OUT=$(run --prereq-yxrrset "x.example.test TYPE65534 \\# 100 $HEX")
+check "yxrrset prerequisite: 100 hex tokens are all kept" "$OUT" "00 64 00 01 02"
+HEX=$(awk 'BEGIN { for (i = 0; i < 1500; i++) printf "%02x ", i % 256 }')
+OUT=$(run --update-add "x.example.test 300 IN TYPE65534 \\# 1500 $HEX")
+absent "update-add: 1500 octets as 1500 tokens: no error" "$OUT" "error:"
+check "update-add: 1500 octets: RDLENGTH 1500 (05dc)" "$OUT" "05 dc 00 01 02"
+OUT=$(run --prereq-yxrrset "x.example.test TYPE65534 \# 1500 $HEX")
+absent "yxrrset prerequisite: 1500 octets (3000+ chars, was cut at 511): no error" "$OUT" "error:"
+check "yxrrset prerequisite: 1500 octets: RDLENGTH 1500 (05dc)" "$OUT" "05 dc 00 01 02"
+# overflow is an explicit error, nothing is truncated or sent
+HEX=$(awk 'BEGIN { for (i = 0; i < 70000; i++) printf "0 " }')
+OUT=$(run --update-add "x.example.test 300 IN TYPE65534 \\# 70000 $HEX")
+check "update-add: more tokens than the limit is an explicit error" "$OUT" "too many tokens in the update-add operand"
+OUT=$(run --update-del-exact "x.example.test IN TYPE65534 \\# 70000 $HEX")
+check "update-del-exact: more tokens than the limit is an explicit error" "$OUT" "too many tokens in the update-del-exact operand"
+OUT=$(run --prereq-yxrrset "x.example.test TYPE65534 \\# 70000 $HEX")
+check "yxrrset prerequisite: more tokens than the limit is an explicit error" "$OUT" "too many tokens in the yxrrset prerequisite operand"
+
 if [ "$FAILS" -eq 0 ]; then echo "PASS: run_dag_update_generic_rdata_test"; exit 0; fi
 echo "FAIL: $FAILS check(s)"
 exit 1

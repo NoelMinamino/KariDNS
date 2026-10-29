@@ -366,6 +366,57 @@ static bool update_generic_rdata(dns_record_t *rec, uint8_t **blob, const char *
     return true;
 }
 
+/* Upper bound on the tokens of one UPDATE operand: "name ttl class type \# <len> <hex...>" where the hex of a
+ * RDATA of the 65535-octet maximum may be split into one token per octet (RFC 3597 5 allows blanks in the hex). */
+#define DAG_OPERAND_MAX_TOKENS (65535 + 8)
+
+/* Split an UPDATE operand (--update-add, --update-del-exact, the yxrrset prerequisite) into blank-separated tokens
+ * in place; double quotes group, \" is a literal quote.  Returns a malloc'ed pointer array (into buf, caller
+ * frees the array and buf) and the count in *count, or NULL with an error on stderr when the operand has more than
+ * DAG_OPERAND_MAX_TOKENS tokens (or on out of memory): the operand must not be silently truncated. */
+static char **split_update_operand(char *buf, int *count, const char *what) {
+    size_t cap = strlen(buf) / 2 + 2;          /* every token takes at least one octet plus a separator */
+    if (cap > (size_t)DAG_OPERAND_MAX_TOKENS + 1) cap = (size_t)DAG_OPERAND_MAX_TOKENS + 1;
+    char **tokens = malloc(cap * sizeof(char *));
+    if (!tokens) {
+        fprintf(stderr, "error: out of memory in the %s operand\n", what);
+        return NULL;
+    }
+    int n = 0;
+    bool in_quote = false;
+    char *p = buf, *tok_start = NULL, *out = buf;
+    for (;;) {
+        bool end = (*p == '\0');
+        if (!end && *p == '"') {
+            in_quote = !in_quote;
+            if (!tok_start) tok_start = out;
+            p++;
+            continue;
+        }
+        if (end || (*p == ' ' && !in_quote)) {
+            if (tok_start) {
+                if ((size_t)n >= cap || n >= DAG_OPERAND_MAX_TOKENS) {
+                    fprintf(stderr, "error: too many tokens in the %s operand (limit %d), skipping\n",
+                            what, DAG_OPERAND_MAX_TOKENS);
+                    free(tokens);
+                    return NULL;
+                }
+                *out++ = '\0';
+                tokens[n++] = tok_start;
+                tok_start = NULL;
+            }
+            if (end) break;
+            p++;
+            continue;
+        }
+        if (!tok_start) tok_start = out;
+        if (*p == '\\' && p[1] == '"') p++;
+        *out++ = *p++;
+    }
+    *count = n;
+    return tokens;
+}
+
 /* ========================================================================
  * 5. Packet construction (normal path + structural --break variants)
  * ==================================================================== */
@@ -483,45 +534,19 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
             const char *name = qo->prereqs[pi].name;
             uint16_t type, class_val;
 
-            if (qo->prereqs[pi].kind == PREREQ_YXRRSET && qo->prereqs[pi].rdata[0] != '\0') {
+            if (qo->prereqs[pi].kind == PREREQ_YXRRSET && qo->prereqs[pi].rdata && qo->prereqs[pi].rdata[0] != '\0') {
                 // RFC 2136 Section 2.4.2: RRset Exists (Value Dependent)
                 char *buf = strdup(qo->prereqs[pi].rdata);
-                char *tokens[32];
                 int token_count = 0;
-                bool in_quote = false;
-                char *p = buf;
-                char *tok_start = NULL;
-                char *out = buf;
-
-                while (*p && token_count < 32) {
-                    if (*p == '"') {
-                        in_quote = !in_quote;
-                        if (!tok_start) tok_start = out;
-                        p++;
-                    } else if (*p == ' ' && !in_quote) {
-                        if (tok_start) {
-                            *out++ = '\0';
-                            tokens[token_count++] = tok_start;
-                            tok_start = NULL;
-                        }
-                        p++;
-                    } else {
-                        if (!tok_start) tok_start = out;
-                        if (*p == '\\' && *(p+1) == '"') {
-                            p++;
-                            *out++ = *p++;
-                        } else {
-                            *out++ = *p++;
-                        }
-                    }
-                }
-                if (tok_start && token_count < 32) {
-                    *out = '\0';
-                    tokens[token_count++] = tok_start;
+                char **tokens = split_update_operand(buf, &token_count, "yxrrset prerequisite");
+                if (!tokens) {
+                    free(buf);
+                    continue;
                 }
 
                 if (!resolve_qtype(qo->prereqs[pi].type_str, &type)) {
                     fprintf(stderr, "warning: unknown record type '%s' in prereq yxrrset, skipping\n", qo->prereqs[pi].type_str);
+                    free(tokens);
                     free(buf);
                     continue;
                 }
@@ -538,6 +563,7 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                 uint8_t *gblob = NULL;
                 uint16_t out_offset = offset;
                 if (!update_generic_rdata(&rec, &gblob, "yxrrset prerequisite", qo->prereqs[pi].rdata)) {
+                    free(tokens);
                     free(buf);
                     continue;
                 }
@@ -550,6 +576,7 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                     fprintf(stderr, "warning: failed to serialize yxrrset prereq rdata: %s\n", qo->prereqs[pi].rdata);
                 }
                 free(gblob);
+                free(tokens);
                 free(buf);
                 continue;
             }
@@ -600,38 +627,11 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
 
             if (qo->update_ops[oi].kind == UPDATE_OP_ADD) {
                 char *buf = strdup(raw);
-                char *tokens[32];
                 int token_count = 0;
-                bool in_quote = false;
-                char *p = buf;
-                char *tok_start = NULL;
-                char *out = buf;
-
-                while (*p && token_count < 32) {
-                    if (*p == '"') {
-                        in_quote = !in_quote;
-                        if (!tok_start) tok_start = out;
-                        p++;
-                    } else if (*p == ' ' && !in_quote) {
-                        if (tok_start) {
-                            *out++ = '\0';
-                            tokens[token_count++] = tok_start;
-                            tok_start = NULL;
-                        }
-                        p++;
-                    } else {
-                        if (!tok_start) tok_start = out;
-                        if (*p == '\\' && *(p+1) == '"') {
-                            p++;
-                            *out++ = *p++;
-                        } else {
-                            *out++ = *p++;
-                        }
-                    }
-                }
-                if (tok_start && token_count < 32) {
-                    *out = '\0';
-                    tokens[token_count++] = tok_start;
+                char **tokens = split_update_operand(buf, &token_count, "update-add");
+                if (!tokens) {
+                    free(buf);
+                    continue;
                 }
 
                 if (token_count >= 3) {
@@ -647,6 +647,7 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                         uint16_t type_code;
                         if (!resolve_qtype(tokens[type_idx], &type_code)) {
                             fprintf(stderr, "warning: unknown record type '%s' in update-add operation, skipping: %s\n", tokens[type_idx], raw);
+                            free(tokens);
                             free(buf);
                             continue;
                         }
@@ -664,6 +665,7 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                         uint8_t *gblob = NULL;
                         uint16_t out_offset = offset;
                         if (!update_generic_rdata(&rec, &gblob, "update-add", raw)) {
+                            free(tokens);
                             free(buf);
                             continue;
                         }
@@ -682,6 +684,7 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                 } else {
                     fprintf(stderr, "Invalid update-add string format: %s\n", raw);
                 }
+                free(tokens);
                 free(buf);
 
             } else if (qo->update_ops[oi].kind == UPDATE_OP_DEL) { // UPDATE_OP_DEL
@@ -719,38 +722,11 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                 free(buf);
             } else if (qo->update_ops[oi].kind == UPDATE_OP_DEL_EXACT) {
                 char *buf = strdup(raw);
-                char *tokens[32];
                 int token_count = 0;
-                bool in_quote = false;
-                char *p = buf;
-                char *tok_start = NULL;
-                char *out = buf;
-
-                while (*p && token_count < 32) {
-                    if (*p == '"') {
-                        in_quote = !in_quote;
-                        if (!tok_start) tok_start = out;
-                        p++;
-                    } else if (*p == ' ' && !in_quote) {
-                        if (tok_start) {
-                            *out++ = '\0';
-                            tokens[token_count++] = tok_start;
-                            tok_start = NULL;
-                        }
-                        p++;
-                    } else {
-                        if (!tok_start) tok_start = out;
-                        if (*p == '\\' && *(p+1) == '"') {
-                            p++;
-                            *out++ = *p++;
-                        } else {
-                            *out++ = *p++;
-                        }
-                    }
-                }
-                if (tok_start && token_count < 32) {
-                    *out = '\0';
-                    tokens[token_count++] = tok_start;
+                char **tokens = split_update_operand(buf, &token_count, "update-del-exact");
+                if (!tokens) {
+                    free(buf);
+                    continue;
                 }
 
                 if (token_count >= 3) {
@@ -772,6 +748,7 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                         uint16_t type_code;
                         if (!resolve_qtype(tokens[type_idx], &type_code)) {
                             fprintf(stderr, "warning: unknown record type '%s' in update-del-exact operation, skipping: %s\n", tokens[type_idx], raw);
+                            free(tokens);
                             free(buf);
                             continue;
                         }
@@ -788,6 +765,7 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                         uint8_t *gblob = NULL;
                         uint16_t out_offset = offset;
                         if (!update_generic_rdata(&rec, &gblob, "update-del-exact", raw)) {
+                            free(tokens);
                             free(buf);
                             continue;
                         }
@@ -806,6 +784,7 @@ size_t build_query_packet(uint8_t *pkt, size_t max_len,
                 } else {
                     fprintf(stderr, "Invalid update-del-exact string format: %s\n", raw);
                 }
+                free(tokens);
                 free(buf);
             }
         }

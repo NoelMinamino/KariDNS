@@ -30,8 +30,8 @@ UPDATES=${UPDATES:-15}
 
 echo "=== R-25 RCU TSan test ==="
 
-# Build as the invoking user (running make as root leaves root-owned objects).
-if ! make karidns karidns-tsan dag test_epoch_rcu-tsan >/dev/null 2>&1; then
+# Build as the invoking user (kari_make: running make as root leaves root-owned objects).
+if ! kari_make karidns karidns-tsan dag test_epoch_rcu-tsan >/dev/null 2>&1; then
     echo "FAIL: could not build karidns / karidns-tsan / dag / test_epoch_rcu-tsan"
     exit 1
 fi

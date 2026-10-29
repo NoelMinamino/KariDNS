@@ -72,10 +72,10 @@ skip() { echo "SKIP: $*"; SKIPS=$((SKIPS + 1)); }
 cleanup() {
     set +e
     kari_kill_tree $PIDS
-    for n in pp s1 s2 s3 pv sv pn1 pn2 pn3 st1 st2 pf1 pf2 po so snp pc1 pc2 pc3 pc4 pcm pcsec; do kari_kill_conf "$W/$n.conf"; done
+    for n in pp s1 s2 s3 pv sv pn1 pn2 pn3 st1 st2 pf1 pf2 po so snp pc1 pc2 pc3 pc4 pcm pcsec pi; do kari_kill_conf "$W/$n.conf"; done
     for a in $ALIASES; do ifconfig lo0 inet "$a" -alias 2>/dev/null; done
     if [ "$FAILS" -ne 0 ]; then
-        for f in pp s1 s2 s3 pv sv pn1 pn2 pn3 st1 st2 pf1 pf2 po so snp pc1 pc2 pc3 pc4 pcm pcsec; do echo "--- $f.log (tail)"; tail -15 "$W/$f.log" 2>/dev/null; done
+        for f in pp s1 s2 s3 pv sv pn1 pn2 pn3 st1 st2 pf1 pf2 po so snp pc1 pc2 pc3 pc4 pcm pcsec pi; do echo "--- $f.log (tail)"; tail -15 "$W/$f.log" 2>/dev/null; done
         for f in sink1 sink3 sink4 sinkc sinkd sinke; do echo "--- $f.log"; cat "$W/$f.log" 2>/dev/null; done
     fi
     rm -rf "$W"
@@ -683,6 +683,38 @@ if wait_serial "$(cp_of 51)" m.test 1 25; then
     else fail "C14: the secondary did not refresh after the NOTIFY over TCP"; grep -i notify "$W/pcm.log" | tail -5; fi
     grep -q "over TCP failed" "$W/pcm.log" && fail "C14: the primary logged a failed NOTIFY over TCP" || pass "C14: the primary logged no failure"
 else fail "C14: the secondary did not load m.test"; fi
+
+# ------------------------------------------------------------------------------------------------ I: incoming NOTIFY, key by the server statement
+# Batch 13: the NOTIFY a secondary accepts must be signed with the key of the primary by the same precedence as the transfers: the primaries element's
+# key, the `keys` of the server statement that covers the sender, the zone's tsig-key.  No primary answers (a dead port): only the NOTIFY is judged.
+PI=$(kari_port 36) DEADP=$(kari_port 37)
+zone "$W/i1.zone" i1.test 1 3600 3600 86400
+zone "$W/i2.zone" i2.test 1 3600 3600 86400
+zone "$W/i3.zone" i3.test 1 3600 3600 86400
+{
+    echo "options { port $PI; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT };"
+    keydef xk "$XK"
+    keydef gk "$GK"
+    keydef zk "$ZK"
+    echo "server 127.0.0.1 { keys xk; };"
+    echo "zone \"i1.test\" { type slave; file \"$W/i1.zone\"; masters { 127.0.0.1 port $DEADP; }; };"
+    echo "zone \"i2.test\" { type slave; file \"$W/i2.zone\"; masters { 127.0.0.1 port $DEADP key gk; }; };"
+    echo "zone \"i3.test\" { type slave; file \"$W/i3.zone\"; masters { 127.0.0.1 port $DEADP; }; tsig-key zk; };"
+} > "$W/pi.conf"
+start pi
+if kari_wait_answer "$DAG" "$PI" i1.test. ; then
+    nq() { # nq ZONE KEYNAME SECRET : the status of a NOTIFY (signed when KEYNAME is not empty)
+        if [ -n "$2" ]; then "$DAG" @127.0.0.1 -p "$PI" "$1" SOA +opcode=NOTIFY +nohexdump +time=2 +tries=1 -y "hmac-sha256:$2:$3" 2>&1 | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -1
+        else "$DAG" @127.0.0.1 -p "$PI" "$1" SOA +opcode=NOTIFY +nohexdump +time=2 +tries=1 2>&1 | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -1; fi
+    }
+    [ "$(nq i1.test "" "")" = REFUSED ] && pass "I1: the server statement's key is required: an unsigned NOTIFY from its primary is REFUSED" || fail "I1: unsigned NOTIFY: '$(nq i1.test "" "")' (expected REFUSED)"
+    [ "$(nq i1.test xk "$XK")" = NOERROR ] && pass "I2: a NOTIFY signed with the server statement's key is accepted" || fail "I2: signed NOTIFY: '$(nq i1.test xk "$XK")'"
+    [ "$(nq i1.test zk "$ZK")" = REFUSED ] && pass "I3: another known key is REFUSED" || fail "I3: other key"
+    [ "$(nq i2.test gk "$GK")" = NOERROR ] && pass "I4: the key of the primaries element is above the server statement's" || fail "I4: element key"
+    [ "$(nq i2.test xk "$XK")" = REFUSED ] && pass "I5: the server statement's key is refused when the primaries element has its own" || fail "I5: server key on an element key"
+    [ "$(nq i3.test xk "$XK")" = NOERROR ] && pass "I6: the server statement's key is above the zone's tsig-key" || fail "I6: server key above tsig-key"
+    [ "$(nq i3.test zk "$ZK")" = REFUSED ] && pass "I7: the zone's tsig-key is refused when a server statement covers the primary" || fail "I7: zone key"
+else fail "I: the server did not start"; fi
 
 echo ""
 echo "server statement test: $PASSES passed, $FAILS failed, $SKIPS skipped"

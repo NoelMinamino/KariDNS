@@ -1150,8 +1150,8 @@ static void test_logging_channels(void) {
         if (g) CHECK(g->size_limit == 2ULL * 1024 * 1024 * 1024);
         if (b) CHECK(b->size_limit == 3ULL * 1024 * 1024);   /* trailing 'B' is accepted after a unit */
         if (n) CHECK(n->size_limit == 4096);
-        CHECK(cfg.logging.queries_channel == q);
-        CHECK(cfg.logging.responses_channel == r);
+        CHECK(cfg.logging.cat[LOGC_QUERIES].n == 1 && strcmp(cfg.logging.cat[LOGC_QUERIES].name[0], "q") == 0);
+        CHECK(cfg.logging.cat[LOGC_RESPONSES].n == 1 && strcmp(cfg.logging.cat[LOGC_RESPONSES].name[0], "r") == 0);
         free_server_config_fields(&cfg);
     }
     /* invalid size / versions / max-qps values are errors (they used to be reported and ignored); so are unknown statements and a channel
@@ -1556,9 +1556,9 @@ static void test_logging_category_lists(void) {
     server_config_t cfg;
     if (parse_ok("logging { channel a { file \"/tmp/a.log\"; }; channel b { file \"/tmp/b.log\"; };"
                  "  category queries { a; b; }; category responses { b; a; }; };", &cfg)) {
-        CHECK_STR(cfg.logging.queries_channel_name, "a");
-        CHECK(cfg.logging.queries_channel && strcmp(cfg.logging.queries_channel->name, "a") == 0);
-        CHECK_STR(cfg.logging.responses_channel_name, "b");
+        CHECK_STR(cfg.logging.cat[LOGC_QUERIES].name[0], "a");
+        CHECK(find_channel(&cfg, "a") != NULL);
+        CHECK_STR(cfg.logging.cat[LOGC_RESPONSES].name[0], "b");
         CHECK(cfg.logging.cat[LOGC_QUERIES].n == 2 && strcmp(cfg.logging.cat[LOGC_QUERIES].name[1], "b") == 0);
         CHECK(cfg.logging.queries_enabled && cfg.logging.responses_enabled);
         free_server_config_fields(&cfg);
@@ -1567,12 +1567,12 @@ static void test_logging_category_lists(void) {
     if (parse_ok("logging { channel a { file \"/tmp/a.log\"; }; channel b { file \"/tmp/b.log\"; };"
                  "category queries { a; }; category queries { b; }; category queries { }; };", &cfg)) {
         CHECK(cfg.logging.cat[LOGC_QUERIES].n == 2);
-        CHECK_STR(cfg.logging.queries_channel_name, "a");
+        CHECK_STR(cfg.logging.cat[LOGC_QUERIES].name[0], "a");
         free_server_config_fields(&cfg);
     }
     /* only an empty list: the category is not configured, the query log stays off */
     if (parse_ok("logging { category queries { }; };", &cfg)) {
-        CHECK(cfg.logging.queries_channel_name == NULL && cfg.logging.queries_channel == NULL);
+        CHECK(cfg.logging.cat[LOGC_QUERIES].n == 0);
         CHECK(!cfg.logging.queries_enabled);
         free_server_config_fields(&cfg);
     }
@@ -3495,14 +3495,14 @@ static void test_bind_logging(void) {
     CHECK(cfg.querylog_set && cfg.querylog && cfg.logging.queries_enabled && !cfg.logging.responses_enabled);
     free_server_config_fields(&cfg);
     expect_silent("querylog no with a category", "options { querylog no; }; logging { channel q { file \"/tmp/q\"; }; category queries { q; }; };", &cfg);
-    CHECK(cfg.querylog_set && !cfg.querylog && !cfg.logging.queries_enabled && cfg.logging.queries_channel);   /* querylog decides on / off only */
+    CHECK(cfg.querylog_set && !cfg.querylog && !cfg.logging.queries_enabled && cfg.logging.cat[LOGC_QUERIES].n == 1);   /* querylog decides on / off only */
     free_server_config_fields(&cfg);
     expect_silent("category queries alone", "logging { channel q { file \"/tmp/q\"; }; category queries { q; }; };", &cfg);
     CHECK(!cfg.querylog_set && cfg.logging.queries_enabled);                        /* as KariDNS always did */
     free_server_config_fields(&cfg);
     expect_silent("a built-in channel for queries", "options { querylog yes; }; logging { category queries { default_stderr; }; };", &cfg);
-    CHECK(cfg.logging.queries_enabled && cfg.logging.queries_channel == NULL && cfg.logging.queries_channel_name &&
-          strcmp(cfg.logging.queries_channel_name, "default_stderr") == 0);
+    CHECK(cfg.logging.queries_enabled && find_channel(&cfg, "default_stderr") == NULL && cfg.logging.cat[LOGC_QUERIES].n == 1 &&
+          strcmp(cfg.logging.cat[LOGC_QUERIES].name[0], "default_stderr") == 0);
     free_server_config_fields(&cfg);
     expect_silent("nothing", "options { };", &cfg);
     CHECK(!cfg.querylog_set && !cfg.logging.queries_enabled && !cfg.logging.responses_enabled);

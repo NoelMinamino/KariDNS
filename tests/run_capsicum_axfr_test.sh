@@ -2,8 +2,11 @@
 set -e
 . "$(dirname "$0")/lib_proc.sh"
 
+# Put the saved zone file back by writing into the file that is there: a rename would leave the root-owned copy made by this test (run as root by sudo) in the tree
+restore_zone() { cat tests/zones/example.com.zone.bak > tests/zones/example.com.zone && rm -f tests/zones/example.com.zone.bak; }
+
 # 1. 本番ビルドでサーバーとdagを構築 (Capsicumを有効にするため)
-[ -f tests/zones/example.com.zone.bak ] && mv tests/zones/example.com.zone.bak tests/zones/example.com.zone 2>/dev/null || true
+[ -f tests/zones/example.com.zone.bak ] && restore_zone 2>/dev/null || true
 rm -rf tests/zones/capsicum_include_test || true
 [ -x karidns ] && [ -x dag ] && [ -x karictl ] || make karidns dag karictl
 
@@ -24,7 +27,7 @@ cleanup() {
         sleep 0.5 2>/dev/null || true
         kari_kill_tree "$SERVER_PID"
     fi
-    [ -f tests/zones/example.com.zone.bak ] && mv tests/zones/example.com.zone.bak tests/zones/example.com.zone 2>/dev/null || true
+    [ -f tests/zones/example.com.zone.bak ] && restore_zone 2>/dev/null || true
     rm -rf tests/zones/capsicum_include_test 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
@@ -118,6 +121,6 @@ fi
 echo "[OK] Circular \$INCLUDE correctly detected."
 
 # 後始末
-mv tests/zones/example.com.zone.bak tests/zones/example.com.zone
+restore_zone
 rm -rf tests/zones/capsicum_include_test
 

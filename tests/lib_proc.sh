@@ -94,3 +94,15 @@ kari_wait_answer() {
     done
     return 1
 }
+
+# kari_make TARGET... : make as the user who ran sudo.  A test run as root (sudo sh tests/run_all_suite.sh) that runs a plain make leaves
+# root-owned objects and binaries in the tree, which the next build as the normal user cannot replace.  Without sudo it is a plain make.
+kari_make() {
+    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+        _km_args=""
+        for _km_a in "$@"; do _km_args="$_km_args '$_km_a'"; done
+        su -m "${SUDO_USER}" -c "make $_km_args"
+    else
+        make "$@"
+    fi
+}

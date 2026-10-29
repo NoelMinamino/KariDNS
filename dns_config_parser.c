@@ -1075,8 +1075,6 @@ static void logging_config_free(logging_config_t *lc) {
   }
   for (int c = 0; c < LOGC_COUNT; c++)
     for (int i = 0; i < lc->cat[c].n; i++) free(lc->cat[c].name[i]);
-  free(lc->queries_channel_name);
-  free(lc->responses_channel_name);
   memset(lc, 0, sizeof(*lc));
 }
 
@@ -7176,16 +7174,6 @@ static log_channel_t *log_find_channel(logging_config_t *lc, const char *name) {
   return NULL;
 }
 
-static void logging_set_first_channel(logging_config_t *lc, int cat, char **name_slot, log_channel_t **chan_slot) {
-  free(*name_slot);
-  *name_slot = NULL;
-  *chan_slot = NULL;
-  if (lc->cat[cat].n > 0) {
-    *name_slot = strdup(lc->cat[cat].name[0]);
-    *chan_slot = log_find_channel(lc, lc->cat[cat].name[0]);
-  }
-}
-
 /* After the block: bind the names (check_logging(): "undefined channel"), append them to their categories (BIND appends: two statements for
  * a category write to the channels of both) */
 static int logging_bind_categories(token_ctx_t *ctx, server_config_t *config, log_pend_t *pend, int npend) {
@@ -7212,8 +7200,6 @@ static int logging_bind_categories(token_ctx_t *ctx, server_config_t *config, lo
     p->name = NULL;
     c->n++;
   }
-  logging_set_first_channel(lc, LOGC_QUERIES, &lc->queries_channel_name, &lc->queries_channel);
-  logging_set_first_channel(lc, LOGC_RESPONSES, &lc->responses_channel_name, &lc->responses_channel);
   return 0;
 }
 

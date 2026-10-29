@@ -1104,7 +1104,7 @@ static void test_client_helpers(void) {
         qo.prereqs[qo.prereq_count].kind = pre[i].k;
         snprintf(qo.prereqs[qo.prereq_count].name, sizeof(qo.prereqs[0].name), "%s", pre[i].n);
         snprintf(qo.prereqs[qo.prereq_count].type_str, sizeof(qo.prereqs[0].type_str), "%s", pre[i].t);
-        snprintf(qo.prereqs[qo.prereq_count].rdata, sizeof(qo.prereqs[0].rdata), "%s", pre[i].rd);
+        qo.prereqs[qo.prereq_count].rdata = strdup(pre[i].rd);   /* a heap string since batch 13 (no size limit) */
         qo.prereq_count++;
     }
     uint8_t pkt[4096], mac[64]; size_t ml;
@@ -1116,6 +1116,7 @@ static void test_client_helpers(void) {
     qo.tsig_key.algorithm = NULL; qo.tsig_key.name = NULL; (void)build_query_packet(pkt, sizeof(pkt), "upd.test.", 6, &qo);
     (void)build_query_packet(pkt, sizeof(pkt), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test.", 1, &qo);
     for (int i = 0; i < qo.update_op_count; i++) free(qo.update_ops[i].raw);
+    for (int i = 0; i < qo.prereq_count; i++) free(qo.prereqs[i].rdata);
     /* EDNS option display for every option code with truncated bodies */
     display_opts_t d; memset(&d, 0, sizeof(d));
     uint8_t ob[64]; for (int i = 0; i < 64; i++) ob[i] = (uint8_t)(i * 37);

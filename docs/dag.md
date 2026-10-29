@@ -411,7 +411,7 @@ Queries carry an EDNS0 OPT record and a client cookie by default (like `dig`). U
   dag example.com @127.0.0.1 -k update.key --update-del-exact "web.example.com 0 IN A 192.0.2.10"
   ```
 
-The RDATA of `--update-add`, `--update-del-exact` and `--prereq-yxrrset` may be written in the generic form of RFC 3597 §5, `\# <length> <hex>`, for unknown types and for known ones (the length must equal the number of octets, and for a known type the octets must be valid RDATA for it). This is how a record that the presentation format cannot show is sent, for example a zero-length unknown-type RR or a `TXT` string with a NUL octet:
+The RDATA of `--update-add`, `--update-del-exact` and `--prereq-yxrrset` may be written in the generic form of RFC 3597 §5, `\# <length> <hex>`, for unknown types and for known ones (the length must equal the number of octets, and for a known type the octets must be valid RDATA for it). The hex digits may be split into blank-separated tokens; an operand may have up to 65543 tokens, and a larger one is an error (nothing is truncated silently). This is how a record that the presentation format cannot show is sent, for example a zero-length unknown-type RR or a `TXT` string with a NUL octet:
 ```sh
 dag example.com @127.0.0.1 -k update.key --update-add 'x.example.com 300 IN TYPE65534 \# 0'
 dag example.com @127.0.0.1 -k update.key --update-add 'x.example.com 300 IN TXT \# 4 03610062'
