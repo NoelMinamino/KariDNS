@@ -958,16 +958,18 @@ static void test_metadata(void) {
     {
         db_meta_row_t m[] = { M("X-KARIDNS-IXFR-HISTORY", "8"), M("X-KARIDNS-NOTIFY-RETRIES", "3"), M("X-KARIDNS-ADDITIONAL-FROM-AUTH", "in-domain"),
                               M("X-KARIDNS-ZONE-UDP-BUFSIZE", "1232"), M("X-KARIDNS-NOTIFY-RETRY-BACKOFF", "exponential"),
-                              M("X-KARIDNS-DISABLE-AUTO-TC-FLAG", "yes"), M("X-KARIDNS-ZONE-TCP-WINDOW", "64k") };
-        expect_settings("options", m, 7,
-                        "notify-retries 3; notify-retry-backoff exponential; ixfr-history 8; additional-from-auth in-domain; "
+                              M("X-KARIDNS-DISABLE-AUTO-TC-FLAG", "yes"), M("X-KARIDNS-ZONE-TCP-WINDOW", "64k"),
+                              M("X-KARIDNS-NOTIFY-TCP-TIMEOUT", "25") };
+        expect_settings("options", m, 8,
+                        "notify-retries 3; notify-retry-backoff exponential; notify-tcp-timeout 25; ixfr-history 8; additional-from-auth in-domain; "
                         "disable-auto-tc-flag yes; zone-udp-bufsize 1232; zone-tcp-window 64k;", 0);
     }
     {   /* invalid option values and unknown options are dropped with a warning, never passed on */
         db_meta_row_t m[] = { M("X-KARIDNS-IXFR-HISTORY", "999"), M("X-KARIDNS-IXFR-HISTORY", "4"), M("X-KARIDNS-NOTIFY-RETRIES", "3; allow-update { any; }"),
                               M("X-KARIDNS-FILE", "/etc/passwd"), M("X-KARIDNS-ZONE-UDP-BUFSIZE", "511"), M("X-KARIDNS-ZONE-TCP-MSS", "65496"),
-                              M("X-KARIDNS-ADDITIONAL-FROM-AUTH", "maybe") };
-        expect_settings("bad options", m, 7, "", 7);
+                              M("X-KARIDNS-ADDITIONAL-FROM-AUTH", "maybe"),
+                              M("X-KARIDNS-NOTIFY-TCP-TIMEOUT", "0"), M("X-KARIDNS-NOTIFY-TCP-TIMEOUT", "301") };
+        expect_settings("bad options", m, 9, "", 9);
     }
     {   /* a key name cannot carry quotes or semicolons */
         db_meta_row_t m[] = { M("TSIG-ALLOW-AXFR", "k\"; allow-transfer { any; }; x \""), M("AXFR-MASTER-TSIG", "a b") };
@@ -1035,7 +1037,7 @@ static void test_metadata(void) {
                               M("ALSO-NOTIFY", "192.0.2.53"), M("ALSO-NOTIFY", "[2001:db8::54]:5301"), M("TSIG-ALLOW-DNSUPDATE", "upd"),
                               M("AXFR-MASTER-TSIG", "master-key"), M("X-KARIDNS-IXFR-HISTORY", "8"), M("X-KARIDNS-NOTIFY-RETRIES", "3"),
                               M("X-KARIDNS-NOTIFY-RETRY-INTERVAL", "30"), M("X-KARIDNS-NOTIFY-RETRY-BACKOFF", "exponential"),
-                              M("X-KARIDNS-ADDITIONAL-FROM-AUTH", "in-zone"), M("X-KARIDNS-DISABLE-AUTO-TC-FLAG", "true"),
+                              M("X-KARIDNS-NOTIFY-TCP-TIMEOUT", "25"), M("X-KARIDNS-ADDITIONAL-FROM-AUTH", "in-zone"), M("X-KARIDNS-DISABLE-AUTO-TC-FLAG", "true"),
                               M("X-KARIDNS-ZONE-UDP-BUFSIZE", "1232"), M("X-KARIDNS-ZONE-TCP-MSS", "1400"), M("X-KARIDNS-ZONE-TCP-WINDOW", "1m"),
                               M("X-KARIDNS-ZONE-TCP-SNDBUF", "65536") };
         pdns_zone_t *z = build(NULL, 0, m, sizeof(m) / sizeof(m[0]), NULL);
@@ -1051,7 +1053,8 @@ static void test_metadata(void) {
             CHECK(x->allow_update_count == 1);
             CHECK(x->tsig_key && strcmp(x->tsig_key, "master-key") == 0);
             CHECK(x->ixfr_history_set && x->ixfr_history == 8);
-            CHECK(x->notify_retry.retries_set && x->notify_retry.retries == 3 && x->notify_retry.interval == 30);
+            CHECK(x->notify_retry.retries_set && x->notify_retry.retries == 3 && x->notify_retry.interval == 30 &&
+                  x->notify_retry.tcp_timeout_set && x->notify_retry.tcp_timeout == 25);
             CHECK(x->disable_auto_tc_flag && x->additional_from_auth_specified);
             CHECK(x->zone_udp_bufsize == 1232 && x->zone_tcp_mss == 1400 && x->zone_tcp_window == 1024 * 1024 &&
                   x->zone_tcp_sndbuf == 65536);
@@ -1630,7 +1633,7 @@ static int gen_corpus(const char *dir) {
         "ALSO-NOTIFY" FS "192.0.2.53" RS "ALSO-NOTIFY" FS "[2001:db8::54]:5301" RS "TSIG-ALLOW-DNSUPDATE" FS "upd" RS
         "AXFR-MASTER-TSIG" FS "master-key" RS "X-KARIDNS-IXFR-HISTORY" FS "8" RS "X-KARIDNS-NOTIFY-RETRIES" FS "3" RS
         "X-KARIDNS-NOTIFY-RETRY-INTERVAL" FS "30" RS "X-KARIDNS-NOTIFY-RETRY-BACKOFF" FS "exponential" RS
-        "X-KARIDNS-ADDITIONAL-FROM-AUTH" FS "in-zone" RS "X-KARIDNS-DISABLE-AUTO-TC-FLAG" FS "true" RS
+        "X-KARIDNS-NOTIFY-TCP-TIMEOUT" FS "25" RS "X-KARIDNS-ADDITIONAL-FROM-AUTH" FS "in-zone" RS "X-KARIDNS-DISABLE-AUTO-TC-FLAG" FS "true" RS
         "X-KARIDNS-ZONE-UDP-BUFSIZE" FS "1232" RS "X-KARIDNS-ZONE-TCP-MSS" FS "1400" RS "X-KARIDNS-ZONE-TCP-WINDOW" FS "1m" RS
         "X-KARIDNS-ZONE-TCP-SNDBUF" FS "65536" RS "X-KARIDNS-PROFILE" FS "web" RS "PRESIGNED" FS "1" RS "SOA-EDIT" FS "EPOCH";
     write_file(dir, "metadata_all.bin", meta, strlen(meta));

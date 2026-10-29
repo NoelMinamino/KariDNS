@@ -2935,14 +2935,19 @@ static int parse_transport_param(token_ctx_t *ctx, const char *zone_domain, cons
   }
   if (!ok) {
     const char *suffix_hint = allow_suffix ? ", K/M suffix allowed" : "";
+    char loc[300] = "";
+    if (ctx) {
+      ctx_location(ctx, loc, sizeof(loc) - 2);
+      strlcat(loc, ": ", sizeof(loc));
+    }
     if (zone_domain) {
-      syslog(LOG_ERR, "[Config] zone '%s': invalid %s value '%s' (expected %lld..%lld%s)",
-             zone_domain, name, s, lo, hi, suffix_hint);
-      fprintf(stderr, "[ERROR] zone '%s': invalid %s value '%s' (expected %lld..%lld%s)\n",
-              zone_domain, name, s, lo, hi, suffix_hint);
+      syslog(LOG_ERR, "[Config] %szone '%s': invalid %s value '%s' (expected %lld..%lld%s)",
+             loc, zone_domain, name, s, lo, hi, suffix_hint);
+      fprintf(stderr, "[ERROR] %szone '%s': invalid %s value '%s' (expected %lld..%lld%s)\n",
+              loc, zone_domain, name, s, lo, hi, suffix_hint);
     } else {
-      syslog(LOG_ERR, "[Config] Invalid %s value '%s' (expected %lld..%lld%s)", name, s, lo, hi, suffix_hint);
-      fprintf(stderr, "[ERROR] Invalid %s value '%s' (expected %lld..%lld%s)\n", name, s, lo, hi, suffix_hint);
+      syslog(LOG_ERR, "[Config] %sInvalid %s value '%s' (expected %lld..%lld%s)", loc, name, s, lo, hi, suffix_hint);
+      fprintf(stderr, "[ERROR] %sInvalid %s value '%s' (expected %lld..%lld%s)\n", loc, name, s, lo, hi, suffix_hint);
     }
     free_token(&tok);
     if (ctx) ctx->error_occurred = true;
@@ -3017,7 +3022,7 @@ bool config_require_server_cookie(const server_config_t *cfg, const char *view_n
   return cfg->require_server_cookie;
 }
 
-/* notify-retries / notify-retry-interval / notify-retry-backoff。options (zone_domain NULL) と zone で共通。
+/* notify-retries / notify-retry-interval / notify-retry-backoff / notify-tcp-timeout。options (zone_domain NULL) と zone で共通。
  * 戻り値: 0 = このキーではない、1 = 読んで nr に設定した、-1 = 値が不正 (ログ済み)。 */
 static int parse_notify_retry_option(token_ctx_t *ctx, const char *zone_domain, const char *key,
                                      notify_retry_config_t *nr) {
@@ -3030,6 +3035,11 @@ static int parse_notify_retry_option(token_ctx_t *ctx, const char *zone_domain, 
     if (parse_transport_param(ctx, zone_domain, key, false, 1, NOTIFY_RETRY_INTERVAL_MAX, &nr->interval) != 0)
       return -1;
     nr->interval_set = true;
+    return 1;
+  }
+  if (strcmp(key, "notify-tcp-timeout") == 0) {
+    if (parse_transport_param(ctx, zone_domain, key, false, 1, NOTIFY_TCP_TIMEOUT_MAX, &nr->tcp_timeout) != 0) return -1;
+    nr->tcp_timeout_set = true;
     return 1;
   }
   if (strcmp(key, "notify-retry-backoff") != 0) return 0;
@@ -3062,17 +3072,19 @@ static int parse_notify_retry_option(token_ctx_t *ctx, const char *zone_domain, 
 
 notify_retry_config_t notify_retry_effective(const server_config_t *cfg, const zone_config_t *zone) {
   notify_retry_config_t r = {NOTIFY_RETRIES_DEFAULT, NOTIFY_RETRY_INTERVAL_DEFAULT, NOTIFY_BACKOFF_FIXED,
-                             true, true, true};
+                             NOTIFY_TCP_TIMEOUT_DEFAULT, true, true, true, true};
   if (cfg) {
     r.retries = cfg->notify_retry.retries;
     r.interval = cfg->notify_retry.interval;
     r.backoff = cfg->notify_retry.backoff;
+    r.tcp_timeout = cfg->notify_retry.tcp_timeout;
   }
   if (zone) {
     const zone_ext_t *x = zext(zone);
     if (x->notify_retry.retries_set) r.retries = x->notify_retry.retries;
     if (x->notify_retry.interval_set) r.interval = x->notify_retry.interval;
     if (x->notify_retry.backoff_set) r.backoff = x->notify_retry.backoff;
+    if (x->notify_retry.tcp_timeout_set) r.tcp_timeout = x->notify_retry.tcp_timeout;
   }
   return r;
 }
@@ -4617,7 +4629,7 @@ fail:
  * of build_settings() in dns_pdns_reader.c) and the profile texts of karidns_profiles are made of these. */
 static const char *const k_db_zone_statements[] = {
   "allow-transfer", "allow-update", "also-notify", "tsig-key", "notify-retries", "notify-retry-interval",
-  "notify-retry-backoff", "ixfr-history", "additional-from-auth", "disable-auto-tc-flag", "zone-udp-bufsize",
+  "notify-retry-backoff", "notify-tcp-timeout", "ixfr-history", "additional-from-auth", "disable-auto-tc-flag", "zone-udp-bufsize",
   "zone-tcp-mss", "zone-tcp-window", "zone-tcp-sndbuf", "transfer-acl-match", "update-acl-match", "masters", "primaries",
   "ecs-trusted-resolvers", "alias-resolver", NULL
 };
@@ -5185,7 +5197,7 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
         free_zone_config(zone);
         return -1;
       }
-    } else if (strncmp(key, "notify-retr", 11) == 0 &&
+    } else if ((strncmp(key, "notify-retr", 11) == 0 || strcmp(key, "notify-tcp-timeout") == 0) &&
                (nr_rc = parse_notify_retry_option(ctx, zone->domain, key, &x->notify_retry)) != 0) {
       if (nr_rc < 0) {
         free(key);
@@ -7294,6 +7306,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->notify_retry.retries = NOTIFY_RETRIES_DEFAULT;
   config->notify_retry.interval = NOTIFY_RETRY_INTERVAL_DEFAULT;
   config->notify_retry.backoff = NOTIFY_BACKOFF_FIXED;
+  config->notify_retry.tcp_timeout = NOTIFY_TCP_TIMEOUT_DEFAULT;
   config->ixfr_history = IXFR_HISTORY_DEFAULT;
   config->max_zone_records = KARIDNS_DB_MAX_ZONE_RECORDS_DEFAULT;
   config->max_zone_bytes = KARIDNS_DB_MAX_ZONE_BYTES_DEFAULT;
@@ -7767,7 +7780,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key);
             return -1;
           }
-        } else if (strncmp(key, "notify-retr", 11) == 0 &&
+        } else if ((strncmp(key, "notify-retr", 11) == 0 || strcmp(key, "notify-tcp-timeout") == 0) &&
                    (nr_rc = parse_notify_retry_option(ctx, NULL, key, &config->notify_retry)) != 0) {
           if (nr_rc < 0) {
             free(key);

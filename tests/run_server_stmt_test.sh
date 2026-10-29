@@ -17,7 +17,8 @@
 #      cut at the peer's limit)
 #   E  start-up refuses a server transfer-source it cannot bind, with file:line
 #   C  NOTIFY over TCP: tcp-only yes sends it over TCP (signed, the answer verified), the retry over TCP after the UDP attempts or an unusable UDP
-#      answer, peers that close / garble / stall do not hang the server, the local address is the one of the UDP NOTIFY (aliases, root)
+#      answer, peers that close / garble / stall do not hang the server, the local address is the one of the UDP NOTIFY (aliases, root);
+#      notify-tcp-timeout bounds an attempt; with nothing configured a silent peer gets BIND's schedule (3 datagrams 5 s apart, then TCP at 15 s)
 # The loopback aliases 127.0.0.2 .. 127.0.0.5 are added when run as root and removed on exit; without them S, V and C11-C13 are SKIPped.
 set -u
 
@@ -71,10 +72,10 @@ skip() { echo "SKIP: $*"; SKIPS=$((SKIPS + 1)); }
 cleanup() {
     set +e
     kari_kill_tree $PIDS
-    for n in pp s1 s2 s3 pv sv pn1 pn2 pn3 st1 st2 pf1 pf2 po so snp pc1 pc2 pc3 pcm pcsec; do kari_kill_conf "$W/$n.conf"; done
+    for n in pp s1 s2 s3 pv sv pn1 pn2 pn3 st1 st2 pf1 pf2 po so snp pc1 pc2 pc3 pc4 pcm pcsec; do kari_kill_conf "$W/$n.conf"; done
     for a in $ALIASES; do ifconfig lo0 inet "$a" -alias 2>/dev/null; done
     if [ "$FAILS" -ne 0 ]; then
-        for f in pp s1 s2 s3 pv sv pn1 pn2 pn3 st1 st2 pf1 pf2 po so snp pc1 pc2 pc3 pcm pcsec; do echo "--- $f.log (tail)"; tail -15 "$W/$f.log" 2>/dev/null; done
+        for f in pp s1 s2 s3 pv sv pn1 pn2 pn3 st1 st2 pf1 pf2 po so snp pc1 pc2 pc3 pc4 pcm pcsec; do echo "--- $f.log (tail)"; tail -15 "$W/$f.log" 2>/dev/null; done
         for f in sink1 sink3 sink4 sinkc sinkd sinke; do echo "--- $f.log"; cat "$W/$f.log" 2>/dev/null; done
     fi
     rm -rf "$W"
@@ -164,6 +165,13 @@ kc_err e5 "server 192.0.2.1/24 { };" "e5.conf:1: server '192.0.2.1/24': '192.0.2
 kc_err e6 "server 192.0.2.1 { transfer-source-v6 2001:db8::1; };" "e6.conf:1: server '192.0.2.1': transfer-source-v6 is not legal for an IPv4 server"
 kc_err e7 "server 192.0.2.1 { };
 server 192.0.2.1 { };" "e7.conf:2: server '192.0.2.1': already exists, previous definition: $W/e7.conf:1"
+kc_err e9 "options {
+  notify-tcp-timeout 301;
+};" "e9.conf:2: Invalid notify-tcp-timeout value '301' (expected 1..300)"
+kc_err e10 "zone \"a.test\" { type master; file \"$W/k1.zone\";
+  notify-tcp-timeout 0; };" "e10.conf:2: zone 'a.test.': invalid notify-tcp-timeout value '0' (expected 1..300)"
+printf 'options { notify-retries 2; notify-retry-interval 5; notify-retry-backoff fixed; notify-tcp-timeout 300; };\nzone "a.test" { type master; file "%s/k1.zone"; notify-tcp-timeout 1; };\n' "$W" > "$W/k2.conf"
+"$KARICHECK" conf "$W/k2.conf" > "$W/kc.out" 2>&1 && pass "K: notify-tcp-timeout 1..300 in options and zone is accepted by karicheck conf" || { fail "K: karicheck conf refused notify-tcp-timeout 300 / 1"; cat "$W/kc.out"; }
 kc_err e8 "view v1 { key k { algorithm hmac-sha256; secret \"$XK\"; }; key k { algorithm hmac-sha256; secret \"$VKA\"; }; };" "view 'v1': duplicate TSIG key 'k' defined"
 
 # ------------------------------------------------------------------------------------------------ E: start-up refusal
@@ -489,18 +497,22 @@ else fail "F3: max-udp-size: truncated with the statement=$c1 (expected 1), with
 # `tcp-only yes` in a server statement sends the NOTIFY over TCP; otherwise it is UDP, and a NOTIFY that got no usable answer is made once
 # over TCP (BIND 9.20 zone.c notify_send_toaddr() / notify_done()).  A mock receiver (tests/mock_notify_sink.pl) listens on UDP and TCP of the
 # same port and logs how each NOTIFY came (via=udp / via=tcp) and whether its TSIG is right; its TCP side answers by mode.
-for z in c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 d1 d2 d3; do zone "$W/$z.zone" "$z.test" 1; done
+for z in c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 d1 d2 d3 f1; do zone "$W/$z.zone" "$z.test" 1; done
 CPORT=$(kari_port 40)       # 40 .. 59: one port per target, UDP and TCP on it
 cp_of() { echo $((CPORT + $1)); }
 # sink A (UDP answers; TCP by mode): c1 answer | c2 close | c3 garble | c4 short | c5 bigprefix | c6 badid | c7 unsigned | c8 badsig | c9 stall | c10 partial
 # d1: UDP answered, d3: UDP answered without a TSIG although the NOTIFY is signed; both TCP answer
+# c11: stall like c9, but the zone has notify-tcp-timeout 3 (both attempts are over after about 6 s, not 30 s)
 perl "$DIR/mock_notify_sink.pl" --log "$W/sinkc.log" --key "xk:$XK" --answer \
     --ports "$(cp_of 1),$(cp_of 2),$(cp_of 3),$(cp_of 4),$(cp_of 5),$(cp_of 6),$(cp_of 7),$(cp_of 8),$(cp_of 9),$(cp_of 10),$(cp_of 11),$(cp_of 13)" \
-    --tcp-ports "$(cp_of 1):answer,$(cp_of 2):close,$(cp_of 3):garble,$(cp_of 4):short,$(cp_of 5):bigprefix,$(cp_of 6):badid,$(cp_of 7):unsigned,$(cp_of 8):badsig,$(cp_of 9):stall,$(cp_of 10):partial,$(cp_of 11):answer,$(cp_of 13):answer" \
+    --tcp-ports "$(cp_of 1):answer,$(cp_of 2):close,$(cp_of 3):garble,$(cp_of 4):short,$(cp_of 5):bigprefix,$(cp_of 6):badid,$(cp_of 7):unsigned,$(cp_of 8):badsig,$(cp_of 9):stall,$(cp_of 10):partial,$(cp_of 11):answer,$(cp_of 13):answer,$(cp_of 14):stall" \
     2>/dev/null &
 PIDS="$PIDS $!"
 # sink B: UDP is silent (no --answer), TCP answers: d2
 perl "$DIR/mock_notify_sink.pl" --log "$W/sinkd.log" --ports "$(cp_of 12)" --tcp-ports "$(cp_of 12):answer" 2>/dev/null &
+PIDS="$PIDS $!"
+# sink F: UDP is silent, TCP answers: f1, which runs with no notify-retry-* and no notify-tcp-timeout anywhere (the defaults are BIND's)
+perl "$DIR/mock_notify_sink.pl" --log "$W/sinkf.log" --ports "$(cp_of 15)" --tcp-ports "$(cp_of 15):answer" 2>/dev/null &
 PIDS="$PIDS $!"
 {
     echo "options { port $(cp_of 30); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; };"
@@ -512,6 +524,7 @@ PIDS="$PIDS $!"
         echo "zone \"$z.test\" { type master; file \"$W/$z.zone\"; also-notify { 127.0.0.1 port $(cp_of $n); }; };"
         n=$((n + 1))
     done
+    echo "zone \"c11.test\" { type master; file \"$W/c11.zone\"; notify-tcp-timeout 3; also-notify { 127.0.0.1 port $(cp_of 14); }; };"
 } > "$W/pc1.conf"
 {
     echo "options { port $(cp_of 31); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; notify-retries 1; notify-retry-interval 1; };"
@@ -521,13 +534,21 @@ PIDS="$PIDS $!"
     echo "zone \"d2.test\" { type master; file \"$W/d2.zone\"; also-notify { 127.0.0.1 port $(cp_of 12); }; };"
     echo "zone \"d3.test\" { type master; file \"$W/d3.zone\"; tsig-key xk; notify-retries 5; notify-retry-interval 60; also-notify { 127.0.0.1 port $(cp_of 13); }; };"
 } > "$W/pc2.conf"
+# pc4: nothing about notify-retry-* or notify-tcp-timeout in the file
+{
+    echo "options { port $(cp_of 33); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; };"
+    ctlblock pc4
+    echo "zone \"f1.test\" { type master; file \"$W/f1.zone\"; also-notify { 127.0.0.1 port $(cp_of 15); }; };"
+} > "$W/pc4.conf"
 sleep 1
-start pc1; start pc2
+start pc1; start pc2; start pc4
 kari_wait_answer "$DAG" "$(cp_of 30)" c1.test. || true
 kari_wait_answer "$DAG" "$(cp_of 31)" d1.test. || true
-: > "$W/sinkc.log"; : > "$W/sinkd.log"
-for z in c1 c2 c3 c4 c5 c6 c7 c8 c9 c10; do ctl pc1 notify $z.test > /dev/null; done
+kari_wait_answer "$DAG" "$(cp_of 33)" f1.test. || true
+: > "$W/sinkc.log"; : > "$W/sinkd.log"; : > "$W/sinkf.log"
+for z in c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11; do ctl pc1 notify $z.test > /dev/null; done
 for z in d1 d2 d3; do ctl pc2 notify $z.test > /dev/null; done
+ctl pc4 notify f1.test > /dev/null
 sleep 5
 cnt() { grep -c "NOTIFY port=$2 .* via=$3 " "$1"; }
 # C1: tcp-only: over TCP only, signed with the server statement's key, from a TCP answer that carries a good TSIG
@@ -568,6 +589,13 @@ chk_tcp_fail c5 5 bigprefix "the answer has an impossible length"
 chk_tcp_fail c6 6 badid "the reply is not an answer to this NOTIFY"
 chk_tcp_fail c7 7 unsigned "the answer fails TSIG verification with key 'xk' (unsigned, rcode 0)"
 chk_tcp_fail c8 8 badsig "the answer fails TSIG verification with key 'xk' (BADSIG, rcode 0)"
+# C8b: notify-tcp-timeout 3 on the zone: the stalled attempt is given up after 3 s, and the second attempt (tcp-only) follows at once (the two
+# NOTIFYs are 3 s apart in the receiver's log; with the default timeout they would be 15 s apart)
+c11=$(sed -n "s/^NOTIFY port=$(cp_of 14) .* via=tcp t=\\([0-9.]*\\)\$/\\1/p" "$W/sinkc.log" | tr '\n' ' ')
+if [ "$(echo $c11 | wc -w | tr -d ' ')" -eq 2 ] && perl -e 'my @t = @ARGV; exit(($t[1] - $t[0] >= 2.5 && $t[1] - $t[0] <= 4.5) ? 0 : 1)' $c11 \
+    && grep -q "zone 'c11.test.': NOTIFY to 127.0.0.1 port $(cp_of 14) over TCP failed: timed out: retrying over TCP" "$W/pc1.log"; then
+    pass "C8b: notify-tcp-timeout 3 in the zone: the attempt that gets no answer is given up after 3 s and repeated (receiver times: $c11)"
+else fail "C8b: c11.test: TCP NOTIFY times '$c11' (expected two, 2.5-4.5 s apart) or no 'timed out: retrying over TCP' line"; grep c11.test "$W/pc1.log"; fi
 # C9: stalling peers hold one thread each, not the server: it still answers and sends other NOTIFYs; they give up after 15 s (two attempts)
 if [ "$(cnt "$W/sinkc.log" "$(cp_of 9)" tcp)" -ge 1 ] && [ "$(cnt "$W/sinkc.log" "$(cp_of 10)" tcp)" -ge 1 ]; then
     : > "$W/sinkc.log"
@@ -583,6 +611,17 @@ while [ $i -lt 45 ] && ! { grep -q "zone 'c9.test.': NOTIFY to 127.0.0.1 port $(
                             grep -q "zone 'c10.test.': NOTIFY to 127.0.0.1 port $(cp_of 10) over TCP failed: timed out\$" "$W/pc1.log"; }; do sleep 1; i=$((i + 1)); done
 if [ "$i" -lt 45 ] && [ "$i" -ge 5 ]; then pass "C10: a peer that never answers, and one that sends 3 octets of its answer, are given up after the 15 s of BIND's TCP timeout (both attempts, ~$i s more)"
 else fail "C10: the stalled exchanges ended after $i more seconds (expected 5..44) or not at all"; grep -E "c9.test|c10.test" "$W/pc1.log"; fi
+
+# C15: with no notify-retry-* configured, a silent UDP peer gets BIND's schedule (notify_send_toaddr(): udptimeout 5, udpretries 2): three
+# datagrams 5 s apart, then one NOTIFY over TCP when the last 5 s wait is over (15 s after the first datagram; request.c req_response())
+f_udp=$(sed -n "s/^NOTIFY port=$(cp_of 15) .* via=udp t=\\([0-9.]*\\)\$/\\1/p" "$W/sinkf.log" | tr '\n' ' ')
+f_tcp=$(sed -n "s/^NOTIFY port=$(cp_of 15) .* via=tcp t=\\([0-9.]*\\)\$/\\1/p" "$W/sinkf.log" | tr '\n' ' ')
+if [ "$(echo $f_udp | wc -w | tr -d ' ')" -eq 3 ] && [ "$(echo $f_tcp | wc -w | tr -d ' ')" -eq 1 ] \
+    && perl -e 'my ($a, $b, $c, $t) = @ARGV; exit(($b - $a >= 4.0 && $b - $a <= 7.0 && $c - $b >= 4.0 && $c - $b <= 7.0 && $t - $a >= 13.5 && $t - $a <= 19.0) ? 0 : 1)' $f_udp $f_tcp; then
+    pass "C15: no notify-retry-* configured: three datagrams 5 s apart, then one NOTIFY over TCP 15 s after the first (BIND's schedule; times: $f_udp/ $f_tcp)"
+else fail "C15: f1.test: UDP times '$f_udp' (expected 3, about 5 s apart), TCP times '$f_tcp' (expected 1, about 15 s after the first)"; cat "$W/sinkf.log"; fi
+grep -q "zone 'f1.test.': no answer from 127.0.0.1 port $(cp_of 15) after 3 NOTIFY message(s); retrying over TCP" "$W/pc4.log" \
+    && pass "C15: the log says 'no answer ... after 3 NOTIFY message(s); retrying over TCP'" || { fail "C15: no 'after 3 NOTIFY message(s)' line for f1.test"; grep f1.test "$W/pc4.log"; }
 
 # C11: the source address of a NOTIFY over TCP is the one of the UDP NOTIFY: the server statement's, else the list's, else options' (root: loopback aliases)
 if [ "$HAVE_ALIAS" -ne 1 ]; then

@@ -51,6 +51,8 @@ options {
     // min-retry-time 500;   max-retry-time 1209600;          // SOA の RETRY を挟む範囲 (秒)
     // max-transfer-time-in 120; max-transfer-idle-in 60;     // 入ってくる転送の上限 (分)
     // transfers-in 10; transfers-out 10; transfers-per-ns 2; // 同時に行う転送の数
+    // notify-retries 2; notify-retry-interval 5;             // NOTIFY の UDP 再送の回数と間隔 (秒)。既定は BIND 9.20 と同じ
+    // notify-retry-backoff fixed; notify-tcp-timeout 15;     // 再送間隔の増やし方、TCP での 1 回の試みの秒数 (zone でも指定できる)
 
     // BIND の値の書き方 (docs/karidns.md の "BIND option values")
     // TCP のタイムアウトの単位は BIND と同じ 100 ms。ミリ秒で書くときは ms を付ける (10000 のような

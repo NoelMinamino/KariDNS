@@ -265,6 +265,7 @@ typedef struct {
   size_t prev_mac_len;
   bool tcp_stage;     /* NOTIFY over TCP: the message goes out over a TCP connection (tcp-only, or the UDP attempts are used up), see notify_tcp_start() */
   int tcp_tries;      /* TCP attempts the stage makes: 2 for tcp-only, 1 after UDP (BIND notify_done(), see the comment above notify_tcp_start()) */
+  int tcp_timeout_ms; /* notify-tcp-timeout: the time one TCP attempt (connection and answer together) may take */
   int sends;          /* 送信した回数 (最初の1回を含む) */
   int max_sends;      /* 1 + notify-retries */
   int interval;       /* 次の再送までの秒数 */
@@ -417,11 +418,13 @@ static void notify_log_answer(const notify_pending_t *p, const char *a, unsigned
  * BIND 9.20 (lib/dns/zone.c notify_send_toaddr() and notify_done(), lib/dns/request.c):
  *  - the `tcp-only yes` option of the `server` statement that covers the target (bin/named/server.c configure_peer() dns_peer_setforcetcp(),
  *    read by dns_peer_getforcetcp(); the option bit is DNS_REQUESTOPT_TCP) sends the NOTIFY over TCP from the start;
- *  - otherwise the NOTIFY goes out over UDP (udptimeout 5 s, 2 retransmissions), and a request that fails (no answer, an answer that cannot be
- *    parsed or whose TSIG does not verify) is made once more over TCP (DNS_NOTIFY_TCP, "notify to %s failed: %s: retrying over TCP"); the UDP
- *    attempts here are the operator's notify-retries / notify-retry-interval / notify-retry-backoff, and the TCP attempt follows the last;
- *  - a TCP request has a timeout of 15 s for the connection and the answer together, one message each way (RFC 1035 §4.2.2: two octets of
- *    length first), signed like the UDP one (RFC 8945 §5.1) with the answer verified against the request MAC (§5.3);
+ *  - otherwise the NOTIFY goes out over UDP (udptimeout 5 s, udpretries 2: dns_request_create() sends three datagrams, at 0, 5 and 10 s, and
+ *    req_response() gives up at 15 s), and a request that fails (no answer, an answer that cannot be parsed or whose TSIG does not verify) is
+ *    made once more over TCP (DNS_NOTIFY_TCP, "notify to %s failed: %s: retrying over TCP"); the UDP attempts here are notify-retries /
+ *    notify-retry-interval / notify-retry-backoff (the defaults 2 and 5 s, fixed, are BIND's schedule: dns_config_parser.h), and the TCP attempt
+ *    follows the last;
+ *  - a TCP request has a timeout of 15 s for the connection and the answer together (notify-tcp-timeout, default 15), one message each way
+ *    (RFC 1035 §4.2.2: two octets of length first), signed like the UDP one (RFC 8945 §5.1) with the answer verified against the request MAC (§5.3);
  *  - with tcp-only the DNS_NOTIFY_TCP flag is not set, so notify_done() finds a failed TCP request "not yet retried over TCP" and makes it a
  *    second time: two TCP attempts in all (a BIND quirk, kept so that the two servers retry alike);
  *  - the retry goes through the notify rate limiter again (notify-rate); here the first TCP attempt takes a token like a first UDP message
@@ -429,10 +432,9 @@ static void notify_log_answer(const notify_pending_t *p, const char *a, unsigned
  * The local address is the same as the UDP message's (notify-source(-v6), the `source` of the list, the server statement's: the connect broker
  * binds it before connect(), config_xfr_source_allowed()).  The Backend may not connect() itself (Capsicum): the connection comes from the
  * broker (broker_connect_opts()) like the SOA check and the transfers of a secondary, and the exchange runs in a detached thread of its own
- * (as the refresh of a secondary does, axfr_bg_thread_func()) because it waits up to 15 s for a peer that is not under our control: the
+ * (as the refresh of a secondary does, axfr_bg_thread_func()) because it waits up to notify-tcp-timeout (15 s) for a peer that is not under our control: the
  * thread works on a copy of the pending entry and logs the outcome, nothing else is shared with the control thread except the counter of
  * the threads in flight (g_notify_tcp_active), so no lock is needed. */
-#define NOTIFY_TCP_TIMEOUT_MS 15000
 #define NOTIFY_TCP_MAX 64         /* threads in flight; one more waits in the pending table for a free place */
 #define NOTIFY_TCP_RESP_MAX 4096  /* an answer to a NOTIFY is a header, the question and perhaps a TSIG: a longer one is not an answer */
 static _Atomic int g_notify_tcp_active;
@@ -513,12 +515,12 @@ static bool notify_tcp_attempt(notify_pending_t *p, unsigned *rcode, char *why, 
   }
   tcp_sockopts_t o;
   memset(&o, 0, sizeof(o));
-  o.connect_timeout_ms = NOTIFY_TCP_TIMEOUT_MS;
+  o.connect_timeout_ms = p->tcp_timeout_ms;
   if (p->has_src) {
     o.has_src = 1;
     memcpy(o.src, p->src, sizeof(o.src));
   }
-  int64_t deadline = notify_now_ms() + NOTIFY_TCP_TIMEOUT_MS;
+  int64_t deadline = notify_now_ms() + p->tcp_timeout_ms;
   int fd = broker_connect_opts(p->dest.ss_family, SOCK_STREAM, (struct sockaddr *)&p->dest, p->dest_len, &o);
   if (fd < 0) {
     snprintf(why, whysz, "cannot connect%s", p->has_src ? " (from the configured notify source address)" : "");
@@ -688,6 +690,7 @@ static void notify_send_to(const char *domain, const char *view_name, const stru
   /* tcp-only (the `server` statement): the NOTIFY goes over TCP from the start, two attempts (see the comment above notify_tcp_start()) */
   slot->tcp_stage = tcp_only;
   slot->tcp_tries = tcp_only ? 2 : 1;
+  slot->tcp_timeout_ms = (nr->tcp_timeout > 0 ? nr->tcp_timeout : NOTIFY_TCP_TIMEOUT_DEFAULT) * 1000;
   /* notify-rate: at most that many NOTIFY messages a second.  One over the budget is sent by notify_retransmit_due() at a later tick, with
    * sends == 0 ("not sent yet"); when the table of pending NOTIFYs is full (not tracked) it cannot wait and goes now.  A TCP exchange also
    * waits for a free place among the threads in flight. */

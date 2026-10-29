@@ -2127,6 +2127,7 @@ static server_stmt_t nt_srv;
 static tsig_key_t nt_key, nt_wrong;
 static xfr_source_t nt_xs[1];
 
+static int nt_tcp_timeout; /* notify-tcp-timeout of the configuration nt_setup() builds (0 = not configured: the built-in 15 s) */
 static zone_db_entry_t *nt_setup(const char *const *targets, int n, bool tcp_only, bool signed_zone, int retries) {
     memset(&nt_cfg, 0, sizeof(nt_cfg));
     memset(&nt_view, 0, sizeof(nt_view));
@@ -2147,6 +2148,7 @@ static zone_db_entry_t *nt_setup(const char *const *targets, int n, bool tcp_onl
     nt_cfg.notify_retry.retries = retries;
     nt_cfg.notify_retry.interval = 1;
     nt_cfg.notify_retry.backoff = NOTIFY_BACKOFF_FIXED;
+    nt_cfg.notify_retry.tcp_timeout = nt_tcp_timeout;
     nt_view.name = "default";
     nt_zone.domain = "tcp.example.";
     tzx(&nt_zone)->notify_mode = NOTIFY_MODE_EXPLICIT;
@@ -2233,7 +2235,7 @@ static void test_notify_tcp_flow(void) {
     wait_idle();
     assert(atomic_load(&g_peer_n) == 1);                   /* one connection, no second attempt after an answer that verifies */
     assert(g_peer_opts[0].has_src == 1 && memcmp(g_peer_opts[0].src, nt_an[0].src[0], 4) == 0);
-    assert(g_peer_opts[0].connect_timeout_ms > 0);
+    assert(g_peer_opts[0].connect_timeout_ms == 15000);    /* notify-tcp-timeout not configured: BIND's 15 s (notify_send_toaddr() timeout) */
     notify_retransmit_due(time(NULL) + 100000);            /* the UDP target has no retries left: over TCP; the TCP one is gone from the table */
     assert(nt_drain_ipc(dg, dl, 4) == 0);
     peer_serve(1, PB_OK_SIGNED, &nt_key, &nt_wrong, req, sizeof(req));
@@ -2401,6 +2403,51 @@ static void test_notify_tcp_after_udp(void) {
     }
     nt_ipc_close();
     printf("  -> NOTIFY over TCP after UDP passed.\n");
+}
+
+/* notify-tcp-timeout reaches the connect broker and bounds the exchange: a peer that reads the NOTIFY and says nothing ends it in that time */
+static void test_notify_tcp_timeout_config(void) {
+    printf("[TEST] NOTIFY over TCP: notify-tcp-timeout from the configuration bounds the attempt...\n");
+    nt_ipc_open();
+    atomic_store(&g_broker_on, 1);
+    nt_drain_pending();
+    nt_dgram_t dg[4];
+    size_t dl[4];
+    uint8_t req[1024];
+    const char *t[] = {"198.51.100.41"};
+
+    nt_tcp_timeout = 2;
+    peers_reset();
+    zone_db_entry_t *z = nt_setup(t, 1, false, false, 0);
+    send_notify_to_all(z);
+    assert(nt_drain_ipc(dg, dl, 4) == 1);
+    notify_retransmit_due(time(NULL) + 2);                 /* the one UDP datagram got no answer: TCP, one attempt */
+    peer_serve(0, PB_HOLD, &nt_key, &nt_wrong, req, sizeof(req));
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    wait_idle();                                           /* the peer holds the connection and says nothing: the attempt ends by itself */
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    long ms = (long)(b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000;
+    assert(atomic_load(&g_peer_n) == 1);
+    assert(g_peer_opts[0].connect_timeout_ms == 2000);
+    assert(ms >= 1000 && ms <= 4500);                      /* about 2 s, not 15 */
+    int next = 0;
+    peers_close_until_idle(&next);
+    nt_teardown();
+
+    /* the largest value is handed to the broker as it is (the exchange is not waited for) */
+    nt_tcp_timeout = 300;
+    const char *t2[] = {"192.0.2.41"};   /* covered by the tcp-only server statement of nt_setup() */
+    peers_reset();
+    z = nt_setup(t2, 1, true, false, 0);
+    send_notify_to_all(z);
+    peer_serve(0, PB_OK, &nt_key, &nt_wrong, req, sizeof(req));
+    wait_idle();
+    assert(g_peer_opts[0].connect_timeout_ms == 300000);
+    nt_teardown();
+    nt_tcp_timeout = 0;
+    nt_ipc_close();
+    printf("  -> NOTIFY over TCP timeout from the configuration passed.\n");
 }
 
 static void test_notify_tcp_busy(void) {
@@ -2670,6 +2717,7 @@ int main(void) {
     test_notify_tcp_flow();
     test_notify_tcp_failures();
     test_notify_tcp_after_udp();
+    test_notify_tcp_timeout_config();
     test_notify_tcp_busy();
     printf("=== All Dynamic Update Engine Unit Tests PASSED ===\n");
     return 0;

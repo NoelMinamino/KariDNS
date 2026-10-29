@@ -65,6 +65,7 @@
 "notify-retries"
 "notify-retry-interval"
 "notify-retry-backoff"
+"notify-tcp-timeout"
 "ixfr-history"
 "exponential"
 "fixed"
