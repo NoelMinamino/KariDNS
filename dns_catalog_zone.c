@@ -2,6 +2,7 @@
 #define STATIC_TEST
 #include "dns_catalog_zone.h"
 #include "dns_zone_image.h"
+#include "dns_log.h"
 
 uint32_t calc_catalog_member_hash(const char *domain, const char *unique_id) {
   uint32_t hash = calc_fnv1a_str(domain);

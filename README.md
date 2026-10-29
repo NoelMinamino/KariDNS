@@ -51,7 +51,7 @@ KariDNS is an authoritative DNS server designed for FreeBSD, developed in collab
   - **tinydns `%` Location Steering:** Native djbdns-compatible IPv4 longest-prefix matching and record steering.
   - **KariDNS Extended AXFR:** Primary-to-Secondary zone replication preserving location and ECS directives via EDNS Option 65153 negotiation, with automatic fallback (Plan B) to standard AXFR for non-KariDNS secondaries.
   - For detailed configuration, usage, and examples, see **[KariDNS: Client Geolocation & Subnet Steering Guide](docs/KariDNS_How_to_use_ECS_and_location.md)**.
-- **Logging:** Query and response logs written through per-worker ring buffers by a separate logger thread (rate-limited with `query-log-max-qps`), with size- and date-based rotation. **dnstap** output (Frame Streams over a UNIX socket) is also available.
+- **Logging:** BIND 9.20 `logging { channel ...; category ...; }`: the operational messages (transfers, NOTIFY, updates, TSIG errors, configuration, ...) go to the categories of BIND and from there to files, syslog, stderr or nowhere, with severities and `print-time` formats; `querylog` switches the query log. Query and response logs are written through per-worker ring buffers by a separate logger thread (rate-limited with `query-log-max-qps`), with size- and date-based rotation. **dnstap** output (Frame Streams over a UNIX socket) is also available.
 - **Catalog Zones (RFC 9432):** Member zones listed in a catalog zone are served as secondary zones automatically.
 
 ---

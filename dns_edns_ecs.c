@@ -14,7 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <syslog.h>
+#include "dns_log.h"
 
 _Atomic uint64_t g_ede_prohibited_total = 0;
 _Atomic uint64_t g_ede_not_authoritative_total = 0;

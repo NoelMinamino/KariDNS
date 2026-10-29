@@ -3481,14 +3481,11 @@ int main() {
 
         memset(&cfg_num, 0, sizeof(cfg_num));
         const char *conf_log_neg = "logging { channel ch2 { file \"/tmp/ch2.log\" size -1M; }; };\n";
-        if (parse_named_conf(conf_log_neg, &cfg_num) != 0 || !cfg_num.logging.channels ||
-            cfg_num.logging.channels->size_limit != 0) {
-            printf("FAIL: negative log size should not set non-zero size_limit (got %llu)\n",
-                   (unsigned long long)(cfg_num.logging.channels ? cfg_num.logging.channels->size_limit : 0));
+        if (parse_named_conf(conf_log_neg, &cfg_num) == 0) {
+            printf("FAIL: a negative log size should be rejected\n");
             free_server_config_fields(&cfg_num);
             return 1;
         }
-        free_server_config_fields(&cfg_num);
 
         printf("PASS: Numerical config option validation\n");
     }

@@ -40,7 +40,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <syslog.h>
+#include "dns_log.h"
 #include <time.h>
 #include <unistd.h>
 #include <sys/un.h>
@@ -152,7 +152,7 @@ _Atomic int g_xfers_running = ATOMIC_VAR_INIT(0);
 _Atomic int g_tcp_clients = ATOMIC_VAR_INIT(0);
 _Atomic int g_tcp_high_water = ATOMIC_VAR_INIT(0);
 
-#define response_log_enabled(cfg) ((cfg) && (cfg)->logging.responses_channel != NULL)
+#define response_log_enabled(cfg) ((cfg) && (cfg)->logging.responses_enabled)
 
 resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
 _Atomic uint64_t g_resp_log_tail = ATOMIC_VAR_INIT(0);
@@ -270,6 +270,7 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
     return;
   }
   if (pid == 0) {
+    klog_set_role(KLOG_ROLE_AUX);
     close(sv[0]);
     if (need_drop) {
       char id_err[256];
@@ -280,7 +281,7 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
         _exit(1);
       }
     }
-    logging_drop_fchown(&g_config_db.config_a);
+    logging_drop_fchown();
     /* AF_UNIX で connect してよいのは起動時に設定された dnstap ソケットだけ (再接続用)。
      * それ以外のローカルソケットへ実行ユーザーとして接続させる口にはしない。 */
     char allowed_unix_path[sizeof(((struct sockaddr_un *)0)->sun_path)] = "";
@@ -613,9 +614,8 @@ static void prepare_log_dir(const char *file_path, uid_t target_uid, gid_t targe
   }
 }
 
-/* file 指定のあるログチャンネルをすべて open する。1つでも open できなければ
- * false を返す (起動時は起動中止、reload時は reload 拒否)。
- * hand_off=false の場合はディレクトリ/ファイルの所有者変更を行わない。
+/* log_open_channels() (below) opens every channel of the runtime that has a file.  Start-up: a file that cannot be opened stops the
+ * start, a reload that cannot open one is refused.  hand_off=false: the owner of directories and files is not changed.
  * 起動時は daemonize() 前にこれで open だけを済ませ、所有者の引き渡しは
  * pid file / 制御ソケットのディレクトリ検証 (ensure_priv_dir_safe) の後に
  * hand_off_logging_channels() で行う (ログと pid file が同じディレクトリの
@@ -648,8 +648,8 @@ static off_t log_file_accept(int fd, const char *path, uid_t target_uid) {
   return st.st_size;
 }
 
-bool init_logging_channels_ex(server_config_t *cfg, bool hand_off) {
-  bool ok = true;
+int log_open_channels(log_channel_t *list, bool hand_off) {
+  bool hard = false, restart = false;
   uid_t target_uid = (uid_t)-1;
   gid_t target_gid = (gid_t)-1;
   uid_t run_uid, run_gid;
@@ -659,59 +659,62 @@ bool init_logging_channels_ex(server_config_t *cfg, bool hand_off) {
     target_gid = run_gid;
   }
 
-  log_channel_t *ch = cfg->logging.channels;
-  while (ch) {
-    if (ch->file_path) {
-      prepare_log_dir(ch->file_path, target_uid, target_gid);
+  for (log_channel_t *ch = list; ch; ch = ch->next) {
+    if (ch->dest != LOGDEST_FILE || !ch->file_path)
+      continue;
+    prepare_log_dir(ch->file_path, target_uid, target_gid);
 
-      ch->fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_CREAT | O_APPEND,
-                                  0644, true);
-      if (ch->fd >= 0) {
-        off_t size = log_file_accept(ch->fd, ch->file_path, run_uid);
-        if (size < 0) {
-          close(ch->fd);
-          ch->fd = -1;
-          ok = false;
-        } else {
-          if (geteuid() == 0 && target_uid != (uid_t)-1) {
-            fchown(ch->fd, target_uid, target_gid);
-          }
-          ch->current_size = size;
-        }
+    ch->fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_CREAT | O_APPEND, 0644, true);
+    if (ch->fd >= 0) {
+      off_t size = log_file_accept(ch->fd, ch->file_path, run_uid);
+      if (size < 0) {
+        close(ch->fd);
+        ch->fd = -1;
+        hard = true;
       } else {
-        int open_errno = errno;
-        const char *hint = (open_errno == EACCES || open_errno == EPERM || open_errno == EROFS)
-            ? " (not writable by the user karidns runs as; choose a log path in a directory that user can write to)"
-            : "";
-        syslog(LOG_ERR, "[Logging] Failed to open log file '%s': %s%s",
-               ch->file_path, strerror(open_errno), hint);
-        fprintf(stderr, "[ERROR] [Logging] Failed to open log file '%s': %s%s\n",
-                ch->file_path, strerror(open_errno), hint);
-        ok = false;
+        if (geteuid() == 0 && target_uid != (uid_t)-1) {
+          fchown(ch->fd, target_uid, target_gid);
+        }
+        ch->current_size = size;
       }
-      time_t now = time(NULL);
-      struct tm tm_info;
-      localtime_r(&now, &tm_info);
-      ch->current_date = (tm_info.tm_year + 1900) * 10000 +
-                         (tm_info.tm_mon + 1) * 100 + tm_info.tm_mday;
+    } else {
+      int open_errno = errno;
+#ifdef ENOTCAPABLE
+      /* a reload names a directory that was not opened before the sandbox: nothing can open it now, a restart can */
+      if (open_errno == ENOTCAPABLE && atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
+        syslog(LOG_WARNING, "[Logging] Log file '%s' is in a directory that was not opened at start-up; it is used after a restart "
+                            "(until then the logging configuration in use stays as it is)", ch->file_path);
+        restart = true;
+        continue;
+      }
+#endif
+      const char *hint = (open_errno == EACCES || open_errno == EPERM || open_errno == EROFS)
+          ? " (not writable by the user karidns runs as; choose a log path in a directory that user can write to)"
+          : "";
+      syslog(LOG_ERR, "[Logging] Failed to open log file '%s': %s%s",
+             ch->file_path, strerror(open_errno), hint);
+      fprintf(stderr, "[ERROR] [Logging] Failed to open log file '%s': %s%s\n",
+              ch->file_path, strerror(open_errno), hint);
+      hard = true;
     }
-    ch = ch->next;
+    time_t now = time(NULL);
+    struct tm tm_info;
+    localtime_r(&now, &tm_info);
+    ch->current_date = (tm_info.tm_year + 1900) * 10000 +
+                       (tm_info.tm_mon + 1) * 100 + tm_info.tm_mday;
   }
-  return ok;
+  return hard ? -1 : restart ? 1 : 0;
 }
 
-bool init_logging_channels(server_config_t *cfg) {
-  return init_logging_channels_ex(cfg, true);
-}
-
-/* init_logging_channels_ex(cfg, false) で開いたログのディレクトリとファイルを
- * 実行ユーザーへ引き渡す (root起動かつ user 指定時のみ)。 */
-void hand_off_logging_channels(server_config_t *cfg) {
+/* The files of the runtime installed at start-up (log_runtime_install()) are handed to the run user (root start-up with `user`); the
+ * directory and the files were opened before, by log_open_channels(hand_off = false), so that the pid file / control socket checks
+ * (ensure_priv_dir_safe) see the directories as root owned. */
+void hand_off_logging_channels(void) {
   uid_t target_uid;
   gid_t target_gid;
   resolve_log_owner(&target_uid, &target_gid);
-  for (log_channel_t *ch = cfg->logging.channels; ch; ch = ch->next) {
-    if (!ch->file_path || ch->fd < 0)
+  for (log_channel_t *ch = log_runtime_current_channels(); ch; ch = ch->next) {
+    if (ch->dest != LOGDEST_FILE || !ch->file_path || ch->fd < 0)
       continue;
     if (target_uid != (uid_t)-1) {
       prepare_log_dir(ch->file_path, target_uid, target_gid);
@@ -720,24 +723,23 @@ void hand_off_logging_channels(server_config_t *cfg) {
         syslog(LOG_WARNING, "[Logging] Could not hand log file '%s' to the run user: %s", ch->file_path, strerror(errno));
     }
   }
-  logging_drop_fchown(cfg);
+  logging_drop_fchown();
 }
 
 /* The log files and the writable directory fds keep CAP_FCHOWN only until the hand-off above (also called by a child
  * forked before it). */
-void logging_drop_fchown(server_config_t *cfg) {
-  for (log_channel_t *ch = cfg->logging.channels; ch; ch = ch->next)
+void logging_drop_fchown(void) {
+  for (log_channel_t *ch = log_runtime_current_channels(); ch; ch = ch->next)
     fd_drop_fchown(ch->fd);
   dir_fd_cache_drop_fchown();
 }
-
 
 void submit_response_log(log_action_t action, const char *client_ip, int client_port, const char *qname, 
                                 uint16_t qclass, uint16_t qtype, uint8_t rcode, 
                                 bool has_edns, bool dnssec_ok) {
     server_config_t *cfg = acquire_config_snapshot();
     if (!cfg) return;
-    bool enabled = (cfg->logging.responses_channel != NULL);
+    bool enabled = cfg->logging.responses_enabled;
     release_config_snapshot(cfg);
     if (!enabled) return;
 
@@ -881,11 +883,48 @@ static void prune_timestamped_logs(const char *file_path, int versions) {
     free(s.keys);
 }
 
+/* BIND ISC_LOG_ROLLNEVER with a size (lib/isc/log.c isc_log_open(), isc_log_doit() FILE_MAXREACHED): a file with `size` but no `versions`
+ * (and the default increment suffix) is never rolled.  When the next line does not fit, nothing more is written until the file is removed
+ * or shorter than the limit -- BIND looks at every message, this looks about once a second.  Returns whether the line may be written.
+ * ch->lock is held. */
+static bool log_size_gate(log_channel_t *ch, int len) {
+    if (ch->size_reached) {
+        time_t now = time(NULL);
+        if (now == ch->size_recheck) return false;
+        ch->size_recheck = now;
+        struct stat st;
+        if (stat_via_dir_cache(ch->file_path, &st) == 0 && (uint64_t)st.st_size >= ch->size_limit) return false;
+        if (ch->fd >= 0) close(ch->fd);
+        ch->fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_CREAT | O_APPEND, 0644, true);
+        off_t size = ch->fd >= 0 ? log_file_accept(ch->fd, ch->file_path, (uid_t)-1) : -1;   /* P3 */
+        if (ch->fd >= 0 && size < 0) {
+            close(ch->fd);
+            ch->fd = -1;
+        }
+        if (ch->fd < 0) return false;
+        ch->current_size = size;
+        ch->size_reached = false;
+    }
+    if (ch->current_size + (size_t)len <= ch->size_limit) return true;
+    ch->size_reached = true;
+    ch->size_recheck = time(NULL);
+    syslog(LOG_WARNING, "[Logging] Log file '%s' reached its size limit of %zu bytes and has no 'versions': no more lines are written to it "
+                        "until it is removed or shorter (add 'versions <n>' to keep old files)", ch->file_path, ch->size_limit);
+    return false;
+}
+
 void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct tm *tm_info) {
     int today = (tm_info->tm_year + 1900) * 10000 + (tm_info->tm_mon + 1) * 100 + tm_info->tm_mday;
+    bool guard = klog_guard_enter();   /* what is logged below must not come back to this channel (its lock is held) */
     pthread_mutex_lock(&ch->lock);
     bool rotate = false;
-    if (ch->size_limit > 0 && ch->current_size + len > ch->size_limit)
+    if (ch->size_limit > 0 && ch->versions == LOG_VERSIONS_UNSET && !ch->suffix_timestamp) {
+        if (!log_size_gate(ch, len)) {
+            pthread_mutex_unlock(&ch->lock);
+            klog_guard_leave(guard);
+            return;
+        }
+    } else if (ch->size_limit > 0 && ch->current_size + len > ch->size_limit)
         rotate = true;
     else if (ch->suffix_timestamp && ch->current_date != today)
         rotate = true;
@@ -913,8 +952,19 @@ void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct t
             } else if (ch->versions > 0) {
                 prune_timestamped_logs(ch->file_path, ch->versions);
             }
-        } else if (ch->versions > 0) {
-            for (int i = ch->versions - 1; i >= 0; i--) {
+        } else if (ch->versions > 0 || ch->versions == LOG_VERSIONS_UNLIMITED) {
+            /* .0 .. .(top-1) are kept (`versions <n>`: top = n - 1; unlimited: as many as exist) and shifted up by one; the files above the
+             * first one that is missing do not move (BIND greatest_version() looks for the largest one instead) */
+            int top = ch->versions > 0 ? ch->versions - 1 : INT_MAX;
+            int m = 0;
+            for (; m < top; m++) {
+                char probe[600];
+                struct stat ex;
+                if (snprintf(probe, sizeof(probe), "%s.%d", ch->file_path, m) >= (int)sizeof(probe) ||
+                    stat_via_dir_cache(probe, &ex) != 0)
+                    break;
+            }
+            for (int i = m; i >= 0; i--) {
                 char old_name[600], new_name[600];
                 int r1 = (i == 0)
                              ? snprintf(old_name, sizeof(old_name), "%s", ch->file_path)
@@ -972,6 +1022,17 @@ void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct t
             ch->current_size += w;
     }
     pthread_mutex_unlock(&ch->lock);
+    klog_guard_leave(guard);
+}
+
+/* class and type of a logged query in the text BIND prints: IN / CH / ANY / CLASSn, and the type mnemonic */
+static void query_log_class_type(uint16_t qclass, uint16_t qtype, char *class_str, size_t class_sz, char *type_buf, size_t type_sz,
+                                 const char **type_str) {
+    if (qclass == 1) snprintf(class_str, class_sz, "IN");
+    else if (qclass == 255) snprintf(class_str, class_sz, "ANY");
+    else if (qclass == 3) snprintf(class_str, class_sz, "CH");
+    else snprintf(class_str, class_sz, "CLASS%d", qclass);
+    *type_str = format_type_name(qtype, type_buf, type_sz);
 }
 
 void *response_logger_thread_func(void *arg) {
@@ -979,43 +1040,32 @@ void *response_logger_thread_func(void *arg) {
     while (1) {
         uint64_t h = atomic_load_explicit(&g_resp_log_head, memory_order_relaxed);
         uint32_t idx = h & (RESP_LOG_RING_SIZE - 1);
-        
+
         if (atomic_load_explicit(&g_resp_log_ring[idx].ready, memory_order_acquire)) {
             resp_log_entry_t *entry = &g_resp_log_ring[idx];
             rcu_slot_reader_enter(&g_resp_logger_rcu_ctx);
             server_config_t *cfg = acquire_config_snapshot();
-            
-            if (cfg && cfg->logging.responses_channel) {
-                log_channel_t *ch = cfg->logging.responses_channel;
-                
-                // 1. 時刻のフォーマット (ミリ秒対応)
-                struct tm tm_info;
-                localtime_r(&entry->ts.tv_sec, &tm_info);
-                char time_str[64] = "";
-                if (ch->print_time) {
-                    char buf[32];
-                    strftime(buf, sizeof(buf), "%d-%b-%Y %H:%M:%S", &tm_info);
-                    snprintf(time_str, sizeof(time_str), "%s.%03ld ", buf, entry->ts.tv_nsec / 1000000);
-                }
+            bool enabled = cfg && cfg->logging.responses_enabled;
+            release_config_snapshot(cfg);
+            rcu_slot_reader_exit(&g_resp_logger_rcu_ctx);
+            /* the unit tests stop this thread with pthread_cancel(): not while it holds the runtime (it would never be put back) */
+            int cancel_state;
+            pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+            log_runtime_t *rt = enabled ? log_runtime_acquire() : NULL;
 
-                // 2. クラスとタイプの文字列化
+            if (rt) {
                 char class_str[16];
-                if (entry->qclass == 1) snprintf(class_str, sizeof(class_str), "IN");
-                else if (entry->qclass == 255) snprintf(class_str, sizeof(class_str), "ANY");
-                else if (entry->qclass == 3) snprintf(class_str, sizeof(class_str), "CH");
-                else snprintf(class_str, sizeof(class_str), "CLASS%d", entry->qclass);
-                
                 char type_str[32];
-                const char *type_str_tmp = format_type_name(entry->qtype, type_str, sizeof(type_str));
+                const char *type_str_tmp;
+                query_log_class_type(entry->qclass, entry->qtype, class_str, sizeof(class_str), type_str, sizeof(type_str), &type_str_tmp);
 
-                // 3. EDNSとRCODEの文字列化
+                // EDNSとRCODEの文字列化
                 char edns_str[16] = "";
                 if (entry->has_edns) snprintf(edns_str, sizeof(edns_str), "+E(0)%s", entry->dnssec_ok ? "D" : "K");
-                
+
                 const char *rcode_strs[] = {"NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED", "YXDOMAIN", "YXRRSET", "NXRRSET", "NOTAUTH", "NOTZONE"};
                 const char *rcode_str = (entry->rcode <= 10) ? rcode_strs[entry->rcode] : "UNKNOWN";
-                
-                // 4. BIND互換フォーマットへの組み立てと書き込み
+
                 const char *action_str = "";
                 if (entry->action == LOG_ACT_DROP_RRL) action_str = " [DROP:RRL]";
                 else if (entry->action == LOG_ACT_DROP_MALFORMED) action_str = " [DROP:MALFORMED]";
@@ -1023,23 +1073,16 @@ void *response_logger_thread_func(void *arg) {
                 char safe_qname[512];
                 escape_qname_for_log(entry->qname, safe_qname, sizeof(safe_qname));
 
-                char log_buf[1024];
-                int len = snprintf(log_buf, sizeof(log_buf), 
-                                   "%s%s%sclient %s#%d (%s): response: %s %s %s %s -> %s%s\n", 
-                                   time_str,
-                                   ch->print_category ? "responses: " : "",
-                                   ch->print_severity ? "info: " : "", 
-                                   entry->client_ip, entry->client_port,
-                                   safe_qname, safe_qname, class_str, type_str_tmp, edns_str, rcode_str, action_str);
-                
-                if (len > 0) {
-                    if (len >= (int)sizeof(log_buf)) len = sizeof(log_buf) - 1;
-                    log_write_rotated(ch, log_buf, len, &tm_info);
-                }
+                /* the text after "<time> responses: info: "; the channels add their own prefix (klog_record()) */
+                char msg[1024];
+                snprintf(msg, sizeof(msg), "client %s#%d (%s): response: %s %s %s %s -> %s%s",
+                         entry->client_ip, entry->client_port,
+                         safe_qname, safe_qname, class_str, type_str_tmp, edns_str, rcode_str, action_str);
+                klog_record(rt, LOGC_RESPONSES, LOG_LVL_INFO, &entry->ts, msg);
             }
-            release_config_snapshot(cfg);
-            rcu_slot_reader_exit(&g_resp_logger_rcu_ctx);
-            
+            log_runtime_release(rt);
+            pthread_setcancelstate(cancel_state, NULL);
+
             // Consumerのポインタを進める
             atomic_store_explicit(&entry->ready, false, memory_order_release);
             atomic_fetch_add_explicit(&g_resp_log_head, 1, memory_order_release);
@@ -1131,29 +1174,28 @@ void write_query_log(worker_ctx_t *ctx,
 
 void *query_logger_thread_func(void *arg) {
     (void)arg;
-    static char batch_buf[65536];
-    size_t batch_len = 0;
-    struct tm batch_tm;
-    memset(&batch_tm, 0, sizeof(batch_tm));
-
-    time_t cached_sec = 0;
-    char cached_time_prefix[64] = "";
-    struct tm cached_tm;
-    memset(&cached_tm, 0, sizeof(cached_tm));
-
+    static klog_batch_t batches[LOG_ROUTE_MAX];   /* one per channel of the category: the lines of a drain of the rings, written at once */
     time_t last_drop_report_time = time(NULL);
     uint64_t last_reported_dropped = 0;
 
     while (1) {
         rcu_slot_reader_enter(&g_query_logger_rcu_ctx);
         server_config_t *cfg = acquire_config_snapshot();
-        log_channel_t *ch = (cfg && cfg->logging.queries_channel) ? cfg->logging.queries_channel : NULL;
+        bool enabled = cfg && cfg->logging.queries_enabled;
+        release_config_snapshot(cfg);
+        rcu_slot_reader_exit(&g_query_logger_rcu_ctx);
+
+        int cancel_state;   /* as in the response logger: no cancellation while the runtime is held */
+        pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+        log_runtime_t *rt = enabled ? log_runtime_acquire() : NULL;
+        int nch = 0;
+        log_channel_t *const *route = rt ? log_runtime_route(rt, LOGC_QUERIES, &nch) : NULL;
 
         int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
         worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
         bool any_work = false;
 
-        if (ch && num_workers > 0 && workers) {
+        if (rt && num_workers > 0 && workers) {
             for (int w = 0; w < num_workers; w++) {
                 qlog_ring_t *ring = &workers[w].qlog_ring;
                 if (!ring->events) continue;
@@ -1165,32 +1207,10 @@ void *query_logger_thread_func(void *arg) {
                     qlog_event_t *ev = &ring->events[t & ring->mask];
                     any_work = true;
 
-                    // 時刻キャッシュ (秒単位でフォーマットし、ミリ秒のみ追記)
-                    if (ev->ts.tv_sec != cached_sec) {
-                        cached_sec = ev->ts.tv_sec;
-                        localtime_r(&cached_sec, &cached_tm);
-                        strftime(cached_time_prefix, sizeof(cached_time_prefix), "%d-%b-%Y %H:%M:%S", &cached_tm);
-                        batch_tm = cached_tm;
-                    }
-
-                    char time_str[64] = "";
-                    if (ch->print_time) {
-                        snprintf(time_str, sizeof(time_str), "%s.%03ld ", cached_time_prefix,
-                                 ev->ts.tv_nsec / 1000000);
-                    }
-
                     char class_str[16];
-                    if (ev->qclass == 1)
-                        snprintf(class_str, sizeof(class_str), "IN");
-                    else if (ev->qclass == 255)
-                        snprintf(class_str, sizeof(class_str), "ANY");
-                    else if (ev->qclass == 3)
-                        snprintf(class_str, sizeof(class_str), "CH");
-                    else
-                        snprintf(class_str, sizeof(class_str), "CLASS%d", ev->qclass);
-
-                    char type_str[32];
-                    const char *type_str_tmp = format_type_name(ev->qtype, type_str, sizeof(type_str));
+                    char type_buf[32];
+                    const char *type_str;
+                    query_log_class_type(ev->qclass, ev->qtype, class_str, sizeof(class_str), type_buf, sizeof(type_buf), &type_str);
 
                     char edns_str[16] = "";
                     if (ev->has_edns)
@@ -1211,22 +1231,13 @@ void *query_logger_thread_func(void *arg) {
                         client_port = ntohs(sin6->sin6_port);
                     }
 
-                    char line_buf[1024];
-                    int len = snprintf(line_buf, sizeof(line_buf),
-                                       "%s%s%sclient %s#%d (%s): query: %s %s %s %s\n", time_str,
-                                       ch->print_category ? "queries: " : "",
-                                       ch->print_severity ? "info: " : "", client_ip, client_port,
-                                       safe_qname, safe_qname, class_str, type_str_tmp, edns_str);
-
-                    if (len > 0) {
-                        if (len >= (int)sizeof(line_buf)) len = sizeof(line_buf) - 1;
-                        if (batch_len + len > sizeof(batch_buf)) {
-                            log_write_rotated(ch, batch_buf, (int)batch_len, &batch_tm);
-                            batch_len = 0;
-                        }
-                        memcpy(batch_buf + batch_len, line_buf, len);
-                        batch_len += len;
-                    }
+                    /* the text after "<time> queries: info: "; each channel adds its own prefix (klog_build_line()) */
+                    char msg[1024];
+                    snprintf(msg, sizeof(msg), "client %s#%d (%s): query: %s %s %s %s", client_ip, client_port,
+                             safe_qname, safe_qname, class_str, type_str, edns_str);
+                    for (int i = 0; i < nch; i++)
+                        if (klog_level_passes(route[i]->level, LOG_LVL_INFO))
+                            klog_batch_add(&batches[i], route[i], LOGC_QUERIES, LOG_LVL_INFO, &ev->ts, msg);
 
                     t++;
                 }
@@ -1234,10 +1245,8 @@ void *query_logger_thread_func(void *arg) {
                 atomic_store_explicit(&ring->tail, t, memory_order_release);
             }
 
-            if (batch_len > 0) {
-                log_write_rotated(ch, batch_buf, (int)batch_len, &batch_tm);
-                batch_len = 0;
-            }
+            for (int i = 0; i < nch; i++)
+                klog_batch_flush(&batches[i], route[i]);
 
             // サーキットブレーカー自動復帰判定 (リングバッファ滞留率10%未満)
             bool all_empty = true;
@@ -1277,8 +1286,8 @@ void *query_logger_thread_func(void *arg) {
             }
         }
 
-        if (cfg) release_config_snapshot(cfg);
-        rcu_slot_reader_exit(&g_query_logger_rcu_ctx);
+        log_runtime_release(rt);
+        pthread_setcancelstate(cancel_state, NULL);
 
         // 常に数ミリ秒休止してワーカースレッドにCPUを完全に明け渡す
         usleep(any_work ? 1000 : 10000);
@@ -2046,7 +2055,7 @@ worker_startup_success:;
 
     rcu_reader_enter(ctx);
     server_config_t *active = acquire_config_snapshot();
-    bool qlog_enabled = (active && active->logging.queries_channel != NULL);
+    bool qlog_enabled = (active && active->logging.queries_enabled);
     uint32_t eff_max_qps = qlog_enabled ? get_effective_query_log_max_qps(active) : 0;
     bool rlog_enabled = response_log_enabled(active);
     bool blackhole_on = (active && active->blackhole);   /* options { blackhole }: read from the snapshot per packet, below */
@@ -2986,7 +2995,12 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
    * database and trap).  user / group, loader-user / loader-group and the program-user of a program zone take effect only
    * after a restart (the plugins are started at startup, the identities are resolved then); the start refuses a root one
    * (resolve_run_identity(), validate_program_zone_users()) and karicheck conf shows it before. */
-  if (!init_logging_channels(standby)) {
+  /* The new logging runtime (channels, files, the table of categories) is built before the configuration is published, so a file that
+   * cannot be opened rejects the reload.  A file in a directory that was not opened before the sandbox cannot be opened by anyone now:
+   * the logging in use stays as it is and a restart brings the new one (not a failure of the reload). */
+  logrt_status_t log_status;
+  log_runtime_t *new_rt = log_runtime_build(&standby->logging, true, &log_status);
+  if (!new_rt && log_status != LOGRT_RESTART) {
     syslog(LOG_ERR, "[Config] Reload rejected: one or more log files could not be opened; "
                     "keeping the current configuration.");
     fprintf(stderr, "[ERROR] Reload rejected: one or more log files could not be opened; "
@@ -2997,6 +3011,10 @@ STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged
     return res;
   }
   if (active) collect_restart_only_changes(active, standby, res.restart_needed, sizeof(res.restart_needed));
+  if (!new_rt || !log_runtime_install(new_rt)) {
+    if (new_rt) log_runtime_free(new_rt);
+    append_list_item(res.restart_needed, sizeof(res.restart_needed), "logging (a log file in a directory not opened at start-up)");
+  }
   /* 応答キャッシュの鍵に入る: 設定が変われば以前の応答 (minimal-responses 等に依存) は引かれない */
   standby->generation = (active ? active->generation : 0) + 1;
   g_config_db.retire_epoch = rcu_writer_publish(&g_config_db.active, standby);
@@ -3646,8 +3664,8 @@ void *control_thread_func(void *arg) {
               st.frontend_alive = atomic_load(&g_frontend_alive);
               
               server_config_t *active_cfg = acquire_config_snapshot();
-              st.query_logging = (active_cfg && active_cfg->logging.queries_channel != NULL);
-              st.response_logging = (active_cfg && active_cfg->logging.responses_channel != NULL);
+              st.query_logging = (active_cfg && active_cfg->logging.queries_enabled);
+              st.response_logging = (active_cfg && active_cfg->logging.responses_enabled);
               release_config_snapshot(active_cfg);
               
               st.rrl_dropped = atomic_load_explicit(&g_rrl_dropped_total, memory_order_relaxed);
@@ -3939,9 +3957,9 @@ void *control_thread_func(void *arg) {
                             time_t last_log = atomic_load_explicit(&entry->last_stale_log_time, memory_order_acquire);
                             if (now - last_log > 900) {
                                 if (active && active->serve_stale) {
-                                    syslog(LOG_WARNING, "[Zone] Zone %s is expired (master unreachable), serving stale data", entry->domain);
+                                    kdns_logc(LOGC_GENERAL, LOG_WARNING, "[Zone] Zone %s is expired (master unreachable), serving stale data", entry->domain);
                                 } else {
-                                    syslog(LOG_ERR, "[Zone] Zone %s is expired (master unreachable), returning SERVFAIL", entry->domain);
+                                    kdns_logc(LOGC_GENERAL, LOG_ERR, "[Zone] Zone %s is expired (master unreachable), returning SERVFAIL", entry->domain);
                                 }
                                 atomic_store_explicit(&entry->last_stale_log_time, now, memory_order_release);
                             }
@@ -5369,11 +5387,17 @@ int main(int argc, char **argv) {
   // ログファイルを開く (開けなければ起動しない)。fd は daemonize() 後も引き継がれる。
   // 実行ユーザーへの所有者の引き渡しは pid file / 制御ソケットのディレクトリ検証の
   // 後 (hand_off_logging_channels) に行う。
-  if (!init_logging_channels_ex(&g_config_db.config_a, false)) {
-    syslog(LOG_ERR, "[Startup] Refusing to start: one or more log files could not be opened.");
-    fprintf(stderr, "[ERROR] Refusing to start: one or more log files could not be opened.\n");
-    free_server_config_fields(&g_config_db.config_a);
-    return 1;
+  // From here on the messages of the server follow the logging statement (categories and channels, dns_log.c).
+  {
+    logrt_status_t log_status;
+    log_runtime_t *start_rt = log_runtime_build(&g_config_db.config_a.logging, false, &log_status);
+    if (!start_rt || !log_runtime_install(start_rt)) {
+      if (start_rt) log_runtime_free(start_rt);
+      syslog(LOG_ERR, "[Startup] Refusing to start: one or more log files could not be opened.");
+      fprintf(stderr, "[ERROR] Refusing to start: one or more log files could not be opened.\n");
+      free_server_config_fields(&g_config_db.config_a);
+      return 1;
+    }
   }
 
   // 待受ポートを実際に bind できるか確認する (実際の bind は子プロセスで行う)。
@@ -5578,7 +5602,7 @@ int main(int argc, char **argv) {
   // pid file / 制御ソケットのディレクトリを ensure_priv_dir_safe() で検証し終えた
   // 後で、ログのディレクトリとファイルを実行ユーザーへ引き渡す。先に chown すると、
   // ログと同じディレクトリに置いた pid file 等の検証が「root所有でない」として失敗する。
-  hand_off_logging_channels(&g_config_db.config_a);
+  hand_off_logging_channels();
 
   // beta design 1.2 step 2: the loader sockets exist before the Backend is forked
   {
@@ -5602,6 +5626,7 @@ int main(int argc, char **argv) {
 
   if (backend_pid > 0) {
     // === Parent Process (Process Manager / Supervisor) ===
+    klog_set_role(KLOG_ROLE_AUX);   // the Backend rolls the log files; this process appends to them by name
     db_sup_after_fork_supervisor(&dbsup); // the Backend's ends of the loader sockets belong to the Backend
     sigset_t unblock_set;
     sigemptyset(&unblock_set);
@@ -5643,6 +5668,7 @@ int main(int argc, char **argv) {
       }
       if (rpid == 0) {
         // Frontend Router Process
+        klog_set_role(KLOG_ROLE_AUX);
         signal(SIGTERM, SIG_DFL);
         signal(SIGINT, SIG_DFL);
         signal(SIGHUP, SIG_IGN);

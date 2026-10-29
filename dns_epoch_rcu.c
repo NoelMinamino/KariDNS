@@ -1,7 +1,7 @@
 #include "dns_epoch_rcu.h"
 #include "dns_server_internal.h"
 #include <sched.h>
-#include <syslog.h>
+#include "dns_log.h"
 #include <time.h>
 #include <unistd.h>
 #include <inttypes.h>

@@ -2122,12 +2122,16 @@ static void test_wire_config_logging_channels(void) {
 
 static void test_wire_config_control_channel(void) {
     printf("[TEST] Config Parser: controls channel unix domain socket...\n");
-    const char *cfg_txt = "controls { inet * port 953 allow { 127.0.0.1; } keys { \"admin-key\"; }; };";
+    /* BIND 9.20 check_controls(): a key of controls { } must be defined; the entry is read and then ignored */
+    const char *cfg_txt = "key \"admin-key\" { algorithm hmac-sha256; secret \"c2VjcmV0\"; };\n"
+                          "controls { inet * port 953 allow { 127.0.0.1; } keys { \"admin-key\"; }; };";
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     int res = parse_named_conf(cfg_txt, &cfg);
-    CHECK(res == 0 || cfg.port == 0);
+    CHECK(res == 0 && cfg.controls_count == 1);
     free_server_config_fields(&cfg);
+    memset(&cfg, 0, sizeof(cfg));
+    CHECK(parse_named_conf("controls { inet * port 953 allow { 127.0.0.1; } keys { \"admin-key\"; }; };", &cfg) == -1);   /* unknown key */
 }
 
 static void test_wire_zone_parser_aaaa_and_ptr_records(void) {

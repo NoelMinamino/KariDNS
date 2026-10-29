@@ -52,7 +52,7 @@ static void unescape_string_in_place(char *str) {
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <syslog.h>
+#include "dns_log.h"
 #include <strings.h>
 #endif
 #include "dns_utils.h"

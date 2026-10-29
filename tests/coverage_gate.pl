@@ -49,7 +49,7 @@ my %tier_a_files = map { $_ => 1 } (
 
 my %tier_b_files = map { $_ => 1 } (
     "dns_server_core.c", "dns_snapshot_rcu.c", "dns_dnstap.c",
-    "dns_priv_sandbox.c", "dns_epoch_rcu.c"
+    "dns_priv_sandbox.c", "dns_epoch_rcu.c", "dns_log.c"
 );
 
 my %tier_c_files = map { $_ => 1 } (

@@ -9,7 +9,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/stat.h>
-#include <syslog.h>
+#include "dns_log.h"
 #include <time.h>
 #include <math.h>
 #include <sys/socket.h>
