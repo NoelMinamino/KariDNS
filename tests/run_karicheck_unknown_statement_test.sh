@@ -42,11 +42,11 @@ check "a typo in a zone" "zone \"a.test\" { type primary; file \"$T/a.zone\"; al
 check "an unknown option with a value" "zone \"a.test\" { type primary; file \"$T/a.zone\"; frobnicate 3; };" error "unknown option 'frobnicate'"
 check "an unknown option with a block" "zone \"a.test\" { type primary; file \"$T/a.zone\"; frobnicate { a; b; }; };" error "unknown option 'frobnicate'"
 check "notify-retr... that is not an option" "zone \"a.test\" { type primary; file \"$T/a.zone\"; notify-retry-foo 3; };" error "unknown option 'notify-retry-foo'"
-for o in zone-statistics inline-signing key-directory dnssec-policy auto-dnssec max-journal-size check-names masterfile-format; do
+for o in zone-statistics inline-signing key-directory dnssec-policy auto-dnssec max-journal-size zero-no-soa-ttl dialup; do   # check-names and masterfile-format are implemented (tests/run_bind_option_values_test.sh)
     check "BIND option $o" "zone \"a.test\" { type primary; file \"$T/a.zone\"; $o yes; };" warn "option '$o' is a BIND option that KariDNS does not implement"
 done
 check "allow-query in a zone is implemented (no warning)" "zone \"a.test\" { type primary; file \"$T/a.zone\"; allow-query { 192.0.2.0/24; }; allow-query-on { any; }; allow-notify { none; }; };" ok
-check "BIND option with a block""zone \"a.test\" { type primary; file \"$T/a.zone\"; update-policy { grant a.test zonesub any; }; };" warn "option 'update-policy' is a BIND option"
+check "BIND option with a block""zone \"a.test\" { type primary; file \"$T/a.zone\"; server-addresses { 192.0.2.7; }; };" warn "option 'server-addresses' is a BIND option"
 check "BIND option and a known one together" "zone \"a.test\" { type primary; file \"$T/a.zone\"; also-notify { 192.0.2.9; }; zone-statistics yes; };" warn "option 'zone-statistics' is a BIND option"
 
 echo "== view { }"
@@ -65,7 +65,7 @@ echo "== options { }"
 check "a plain options" "options { port 5300; minimal-responses yes; }; $Z" ok
 check "a typo in options" "options {${NL} port 5300;${NL} bind-adress { 127.0.0.1; };${NL}}; $Z" error ":3: options: unknown option 'bind-adress'"
 check "an unknown option in options" "options { nonsense-option yes; };" error "options: unknown option 'nonsense-option'"
-for o in recursion version allow-update-forwarding; do   # directory is implemented (tests/run_bind_compat_paths_test.sh)
+for o in recursion zero-no-soa-ttl allow-update-forwarding; do   # directory is implemented (tests/run_bind_compat_paths_test.sh)
     check "BIND option $o in options" "options {${NL} $o yes;${NL}};" warn ":2: options: '$o' is a BIND option that KariDNS does not implement"
 done
 

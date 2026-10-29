@@ -97,7 +97,7 @@ options {
 EOF
 run "${TMP_DIR}/r3c" conf "${TMP_DIR}/old_ms.conf"
 check "Rule 3: tcp-idle-timeout 10000 (old milliseconds) is an error that suggests 10000ms" 1 "${TMP_DIR}/r3c" \
-    "^\[ERROR\] .*:3: options tcp-idle-timeout: 10000 is more than the maximum of 1200 \(120 seconds\).*write 10000ms$"
+    "^\[ERROR\] .*:2: options tcp-idle-timeout: 10000 is more than the maximum of 1200 \(120 seconds\).*write 10000ms$"
 cat > "${TMP_DIR}/zero_timeout.conf" <<EOF
 options {
     tcp-idle-timeout 0ms;

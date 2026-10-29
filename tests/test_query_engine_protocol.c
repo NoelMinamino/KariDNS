@@ -368,9 +368,13 @@ static void test_protocol_anomalies(void) {
         CHECK(&r, r.rcode == 4 && r.counts[0] == 0);
     }
 
-    /* Foreign classes are not served: CH / HS -> REFUSED; QCLASS=ANY (*) is answered from the IN data */
+    /* Foreign classes are not served: CH / HS -> REFUSED, except the built-in CHAOS zones (version.bind, hostname.bind, id.server: batch 7, BIND's _bind
+     * view; this configuration has no text for them, so version.bind is NODATA with the SOA); QCLASS=ANY (*) is answered from the IN data */
     put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 0); put_question(&q, "version.bind.", 16, 3);
     ask(&q, "version.bind.", 16, "192.0.2.100", false, &r);
+    CHECK(&r, r.rcode == 0 && r.counts[0] == 0 && r.counts[1] == 1);
+    put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 0); put_question(&q, "nozone.test.", 16, 3);
+    ask(&q, "nozone.test.", 16, "192.0.2.100", false, &r);
     CHECK(&r, r.rcode == 5 && r.counts[0] == 0);
     put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 0); put_question(&q, "www.example.", 1, 4);
     ask(&q, "www.example.", 1, "192.0.2.100", false, &r);

@@ -319,6 +319,20 @@ sql "$(zone 24 srvbad.test)
 $(rec 24 _sip._udp.srvbad.test SRV '5 70000 srv.srvbad.test.' 3600)"
 conf; run
 has "an SRV record the zone checks refuse" "srvbad.test.' (domains.id 24):"
+echo "-- the check-* options of karidns.conf reach the database check (karidns-dbloader --check --zone-checks)"
+db_reset
+sql "$(zone 26 mxc.test)
+$(rec 26 mxc.test MX mail.mxc.test 3600 10)
+$(rec 26 mail.mxc.test CNAME ok.test)
+$(rec 26 bad_name.mxc.test A 192.0.2.9)"
+conf; run
+err "an MX that points to a CNAME is an error without check-mx-cname" "mxc.test.' (domains.id 26): MX record 'mxc.test.' points to CNAME target"
+nowarn "no check-names: a name that is not a host name is not looked at" "valid host name"
+conf "" 'options { check-mx-cname ignore; };'; run
+clean "check-mx-cname ignore silences the MX finding"
+conf "" 'options { check-mx-cname warn; check-names primary fail; };'; run
+err "check-names primary fail: an owner that is not a host name" "mxc.test.' (domains.id 26): A record owner 'bad_name.mxc.test.' is not a valid host name"
+has "check-mx-cname warn: the MX finding is a warning" "\[WARNING\].*mxc.test.' (domains.id 26): MX record 'mxc.test.' points to CNAME target"
 echo "-- ALIAS and LUA (design 3.6b)"
 db_reset
 sql "$(zone 25 alias.test)

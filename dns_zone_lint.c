@@ -761,7 +761,7 @@ static bool lint_is_hostname(const char *name, bool wildcard_ok) {
 }
 
 static void lint_check_names(const zone_lint_in_t *in, zone_arena_t *arena, kc_tally_t *t) {
-    uint8_t sev = in ? in->chk_names : (uint8_t)CHK_DEFAULT;
+    uint8_t sev = (in && in->chk) ? in->chk_names : (uint8_t)CHK_DEFAULT;   /* a caller without a policy (chk == NULL) leaves chk_names at 0, which is fail */
     if (sev == CHK_DEFAULT || sev == CHK_IGNORE) return;
     for (size_t i = 0; i < arena->count; i++) {
         const dns_record_t *r = &arena->records[i];

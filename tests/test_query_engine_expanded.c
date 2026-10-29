@@ -10453,7 +10453,7 @@ static size_t wire_skip_name(const uint8_t *r, size_t off) {
     return off + 1;
 }
 
-static size_t cookie_of(const uint8_t *res, int n, uint8_t *out) {
+static size_t edns_opt_of(const uint8_t *res, int n, uint16_t want, uint8_t *out) {
     if (((res[10] << 8) | res[11]) == 0) return 0;
     size_t off = wire_skip_name(res, 12) + 4;
     for (int rr = 0; rr < ((res[6] << 8) | res[7]) + ((res[8] << 8) | res[9]) + ((res[10] << 8) | res[11]) - 1; rr++) {   /* the OPT is the last RR */
@@ -10466,10 +10466,31 @@ static size_t cookie_of(const uint8_t *res, int n, uint8_t *out) {
     while (p + 4 <= end && end <= (size_t)n) {
         uint16_t code = (uint16_t)((res[p] << 8) | res[p + 1]);
         size_t len = ((size_t)res[p + 2] << 8) | res[p + 3];
-        if (code == 10) { memcpy(out, res + p + 4, len); return len; }
+        if (code == want) { memcpy(out, res + p + 4, len); return len; }
         p += 4 + len;
     }
     return 0;
+}
+
+static size_t cookie_of(const uint8_t *res, int n, uint8_t *out) { return edns_opt_of(res, n, 10, out); }
+
+/* a TCP query with an empty edns-tcp-keepalive option (RFC 7828 §3.2.1); returns the value of the option in the response, -1 when it has none */
+static int keepalive_value(zone_db_snapshot_t *snap, server_config_t *cfg) {
+    uint8_t req[512], res[1024], v[8];
+    memset(req, 0, 12);
+    req[0] = 0x31; req[1] = 0x02; req[2] = 0x01; req[5] = 1; req[11] = 1;
+    size_t off = 12 + (size_t)write_uncompressed_name(req, 12, sizeof(req), "www.ck.example.");
+    req[off++] = 0; req[off++] = 1; req[off++] = 0; req[off++] = 1;
+    req[off++] = 0; req[off++] = 0; req[off++] = 41; req[off++] = 4; req[off++] = 0; req[off++] = 0; req[off++] = 0; req[off++] = 0; req[off++] = 0;
+    req[off++] = 0; req[off++] = 4;
+    req[off++] = 0; req[off++] = 11; req[off++] = 0; req[off++] = 0;
+    compress_ctx_t cc;
+    memset(&cc, 0, sizeof(cc));
+    compress_ctx_init_packet(&cc);
+    const rate_limit_config_t *rrl = NULL;
+    zone_db_entry_t *m = NULL;
+    int n = process_dns_query_impl(req, off, res, sizeof(res), "www.ck.example.", 1, "192.0.2.77", &cc, true, &rrl, snap, cfg, &m);
+    return edns_opt_of(res, n, 11, v) == 2 ? (v[0] << 8) | v[1] : -1;
 }
 
 static void test_require_server_cookie_and_view_udp_size(void) {
@@ -10542,6 +10563,27 @@ static void test_require_server_cookie_and_view_udp_size(void) {
     assert(parse_named_conf("options { max-udp-size 1400; };", &cfg) == 0);
     n = cookie_query(&snap, &cfg, false, NULL, 0, 4096, res, sizeof(res));
     assert(((res[n - 8] << 8) | res[n - 7]) == 1400);
+    free_server_config_fields(&cfg);
+
+    /* the value of edns-tcp-keepalive (RFC 7828 §3.3.2): the idle timeout in units of 100 ms, or tcp-advertised-timeout (which may be 0); it is only
+     * sent when connections are reused */
+    assert(parse_named_conf("options { tcp-connection-reuse no; tcp-idle-timeout 300; };", &cfg) == 0);
+    assert(keepalive_value(&snap, &cfg) == -1);
+    free_server_config_fields(&cfg);
+    assert(parse_named_conf("options { tcp-connection-reuse yes; tcp-idle-timeout 300; };", &cfg) == 0);
+    assert(keepalive_value(&snap, &cfg) == 300);
+    free_server_config_fields(&cfg);
+    assert(parse_named_conf("options { tcp-connection-reuse yes; tcp-idle-timeout 7000ms; tcp-advertised-timeout 50; };", &cfg) == 0);
+    assert(keepalive_value(&snap, &cfg) == 50);
+    free_server_config_fields(&cfg);
+    assert(parse_named_conf("options { tcp-connection-reuse yes; tcp-advertised-timeout 0; };", &cfg) == 0);
+    assert(keepalive_value(&snap, &cfg) == 0);
+    free_server_config_fields(&cfg);
+    assert(parse_named_conf("options { tcp-connection-reuse yes; tcp-idle-timeout 4000000000ms; };", &cfg) == 0);
+    assert(keepalive_value(&snap, &cfg) == 65535);                  /* the option field is 16 bits: held to the largest value */
+    free_server_config_fields(&cfg);
+    assert(parse_named_conf("options { tcp-connection-reuse yes; tcp-idle-timeout 50ms; };", &cfg) == 0);
+    assert(keepalive_value(&snap, &cfg) == 1);                      /* 50 ms is below one unit: 1 */
     free_server_config_fields(&cfg);
     zone_arena_destroy(&arena);
     printf("  -> require-server-cookie and max-udp-size of a view passed.\n");

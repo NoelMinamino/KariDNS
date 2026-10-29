@@ -290,6 +290,54 @@ if ! wait_up $P5; then fail "server 5 did not start"; tail -20 "$W/s5.log"; else
     [ "$(d $P5 u1.ex.test A +nocookie +short)" = "192.0.2.201" ] && pass "the granted A is served" || fail "u1 not served"
 fi
 
+kari_kill_tree $PIDS; PIDS=""
+
+# servers 6 and 7: a secondary refuses a transfer that breaks max-records / max-records-per-type, and takes it when the limit is wide enough
+P6=$(kari_port 6 15906)
+P7=$(kari_port 7 15907)
+cat > "$W/s6.conf" <<EOF
+options { port $P6; pid-file "none"; bind-address { 127.0.0.1; }; $USER_OPT };
+zone "ex.test" { type master; file "$W/s.zone"; allow-transfer { 127.0.0.1; }; };
+EOF
+start s6
+if ! wait_up $P6; then fail "server 6 did not start"; tail -20 "$W/s6.log"; else
+    # the zone has 6 records and 3 types at the apex (SOA, NS, MX)
+    for lim in "max-records 5;" "max-types-per-name 2;" "max-records 6; max-records-per-type 1; max-types-per-name 3;"; do
+        cat > "$W/s7.conf" <<EOF
+options { port $P7; pid-file "none"; bind-address { 127.0.0.1; }; $USER_OPT };
+zone "ex.test" { type secondary; primaries { 127.0.0.1 port $P6; }; $lim };
+EOF
+        "$KARIDNS" -f -c "$W/s7.conf" > "$W/s7.log" 2>&1 &
+        S7=$!
+        PIDS="$PIDS $S7"
+        _i=0
+        while [ $_i -lt 40 ] && ! grep -q "not installed after XFR\|Transfer.*complete\|AXFR.*success" "$W/s7.log" && [ -z "$(d $P7 www.ex.test A +nocookie +short 2>/dev/null | grep 192)" ]; do sleep 0.5; _i=$((_i + 1)); done
+        case "$lim" in
+        "max-records 6;"*)
+            [ "$(d $P7 www.ex.test A +nocookie +short)" = "192.0.2.80" ] && pass "a limit that the zone fits ('$lim'): the transfer is installed" || fail "secondary with room: www not served: $(tail -5 "$W/s7.log")" ;;
+        *)
+            d $P7 ex.test SOA | grep -q "status: SERVFAIL\|status: REFUSED" && pass "secondary with '$lim': the transfer is refused, the zone is not served" || fail "secondary '$lim' serves the zone"
+            grep -q "not installed after XFR" "$W/s7.log" && pass "the refusal is logged (zone not installed after XFR)" || fail "secondary '$lim': no log line: $(tail -5 "$W/s7.log")" ;;
+        esac
+        kari_kill_tree $S7
+    done
+fi
+
+# karidns-dbloader --check --zone-checks: the policy text is read before the database is opened (karicheck db passes the check-* options this way)
+LOADER="${LOADER:-$ROOT/karidns-dbloader}"
+if [ -x "$LOADER" ] && "$LOADER" --drivers 2>/dev/null | grep -qx sqlite3; then
+    out=$("$LOADER" --check --driver sqlite3 --database-file "$W/none.db" --zone-checks "mx-cname=sometimes" 2>&1); rc=$?
+    [ "$rc" -eq 2 ] && echo "$out" | grep -q "zone-checks: invalid check policy 'mx-cname=sometimes'" && pass "dbloader --zone-checks: an invalid severity is a usage error" || fail "dbloader --zone-checks bad value: rc=$rc $out"
+    out=$("$LOADER" --check --driver sqlite3 --database-file "$W/none.db" --zone-checks "nonsense=warn" 2>&1); rc=$?
+    [ "$rc" -eq 2 ] && echo "$out" | grep -q "invalid check policy 'nonsense=warn'" && pass "dbloader --zone-checks: an unknown check is a usage error" || fail "dbloader --zone-checks unknown name: rc=$rc $out"
+    out=$("$LOADER" --check --driver sqlite3 --database-file "$W/none.db" --zone-checks "names=fail,mx-cname=warn,integrity=ignore,wildcard=warn" 2>&1); rc=$?
+    echo "$out" | grep -q "invalid check policy" && fail "dbloader --zone-checks: a valid policy was refused: $out" || pass "dbloader --zone-checks: a valid policy is read (the missing database is then the only complaint)"
+    out=$("$LOADER" --zone-checks "mx=warn" --driver sqlite3 --database-file "$W/none.db" 2>&1); rc=$?
+    [ "$rc" -eq 2 ] && echo "$out" | grep -q "are for --check" && pass "dbloader --zone-checks without --check is a usage error" || fail "dbloader --zone-checks without --check: rc=$rc $out"
+else
+    echo "SKIP: karidns-dbloader (SQLite3 driver) is not built: --zone-checks not tested"
+fi
+
 if [ "$FAILS" -eq 0 ]; then echo "PASS: BIND option values (batch 7)"; exit 0; fi
 echo "FAILED: $FAILS check(s)"
 exit 1
