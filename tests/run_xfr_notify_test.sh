@@ -90,7 +90,7 @@ zone "n1.test" { type master; file "$W/n1.test.zone"; also-notify { 127.0.0.1 po
 zone "n2.test" { type master; file "$W/n2.test.zone"; also-notify { 127.0.0.1 port $SINK2; };
                  notify-retries 2; notify-retry-interval 1; };
 zone "n3.test" { type master; file "$W/n3.test.zone"; also-notify { 127.0.0.1 port $SINK3; };
-                 allow-transfer { 127.0.0.1; }; };
+                 allow-transfer { 127.0.0.1; }; notify-retries 0; };
 zone "s.test" { type master; file "$W/s.test.zone"; tsig-key "nk"; allow-transfer { key "nk"; };
                 also-notify { 127.0.0.1 port $PS; 127.0.0.1 port $PW; 127.0.0.1 port $SINK4; };
                 notify-retries 3; notify-retry-interval 1; };
@@ -159,8 +159,8 @@ if [ "$n" -eq 3 ] && grep -q "zone 'n2.test.': no answer from 127.0.0.1 port $SI
     pass "R-17: notify-retries 2 -> 3 NOTIFYs to a silent receiver, then logged as unanswered"
 else fail "R-17: silent receiver got $n NOTIFY(s) (expected 3) or no 'no answer' log line"; fi
 n=$(count NOTIFY "$W/sink3.log")
-if [ "$n" -eq 1 ]; then pass "R-17: default schedule (60 s) sends no retransmission within 9 s"
-else fail "R-17: default schedule: $n NOTIFYs within 9 s (expected 1)"; fi
+if [ "$n" -eq 1 ]; then pass "R-17: notify-retries 0 sends no retransmission (the default schedule, 2 retransmissions 5 s apart, is run_server_stmt_test.sh C15)"
+else fail "R-17: notify-retries 0: $n NOTIFYs within 9 s (expected 1)"; fi
 
 if grep -q "tsig=1" "$W/sink4.log" && ! grep -q "tsig=0" "$W/sink4.log"; then pass "D-09: NOTIFY of a zone with tsig-key is signed"
 else fail "D-09: NOTIFY to the receiver is not signed"; cat "$W/sink4.log"; fi

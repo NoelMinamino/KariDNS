@@ -1061,6 +1061,7 @@ static const struct { const char *name; opt_kind_t kind; long long lo, hi; } k_o
     { "notify-retries", OPT_INT, 0, NOTIFY_RETRIES_MAX },
     { "notify-retry-interval", OPT_INT, 1, NOTIFY_RETRY_INTERVAL_MAX },
     { "notify-retry-backoff", OPT_BACKOFF, 0, 0 },
+    { "notify-tcp-timeout", OPT_INT, 1, NOTIFY_TCP_TIMEOUT_MAX },
     { "ixfr-history", OPT_INT, 0, IXFR_HISTORY_MAX },
     { "additional-from-auth", OPT_AFA, 0, 0 },
     { "disable-auto-tc-flag", OPT_BOOL, 0, 0 },
