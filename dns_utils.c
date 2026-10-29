@@ -134,6 +134,8 @@ static uint16_t type_code_upper(const char *type_str) {
   case 'G':
     if (strcmp(type_str, "GPOS") == 0)
       return 27;
+    if (strcmp(type_str, "GID") == 0)
+      return 102;
     break;
   case 'H':
     if (strcmp(type_str, "HINFO") == 0)
@@ -238,6 +240,8 @@ static uint16_t type_code_upper(const char *type_str) {
       return 57;
     if (strcmp(type_str, "RRSIG") == 0)
       return 46;
+    if (strcmp(type_str, "RESINFO") == 0)
+      return 261;
     break;
   case 'S':
     if (strcmp(type_str, "SOA") == 0)
@@ -282,10 +286,18 @@ static uint16_t type_code_upper(const char *type_str) {
   case 'U':
     if (strcmp(type_str, "URI") == 0)
       return 256;
+    if (strcmp(type_str, "UINFO") == 0)
+      return 100;
+    if (strcmp(type_str, "UID") == 0)
+      return 101;
+    if (strcmp(type_str, "UNSPEC") == 0)
+      return 103;
     break;
   case 'W':
     if (strcmp(type_str, "WKS") == 0)
       return 11;
+    if (strcmp(type_str, "WALLET") == 0)
+      return 262;
     break;
   case 'X':
     if (strcmp(type_str, "X25") == 0)
@@ -397,6 +409,10 @@ static const type_name_entry_t TYPE_NAMES[] = {
     {67, "HHIT"},
     {68, "BRID"},
     {99, "SPF"},
+    {100, "UINFO"},
+    {101, "UID"},
+    {102, "GID"},
+    {103, "UNSPEC"},
     {104, "NID"},
     {105, "L32"},
     {106, "L64"},
@@ -416,6 +432,8 @@ static const type_name_entry_t TYPE_NAMES[] = {
     {258, "AVC"},
     {259, "DOA"},
     {260, "AMTRELAY"},
+    {261, "RESINFO"},
+    {262, "WALLET"},
     {32768, "TA"},
     {32769, "DLV"},
 };

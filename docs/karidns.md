@@ -1235,6 +1235,13 @@ The default `file-format` is the master file format of RFC 1035 §5 as BIND read
   that is valid for that type (RFC 3597 §5): `PTR \# 0`, `NS \# 3 010203` or a compressed name in the hex are
   zone file errors, reported by `karicheck zone` at the record's line. Zero-length RDATA is legal for a type
   without a defined format (`TYPE65534 \# 0`) and is transferred (AXFR/IXFR) and served like any other record.
+- **Types with an unusual text form** (as BIND 9.20 reads them; no name compression in any of them, RFC 3597 §4):
+  `RESINFO` (261, RFC 9606) and `WALLET` (262, IANA registry) are one or more `<character-string>`s, written and
+  displayed like `TXT` (BIND `generic_fromtext_txt()`); `EID` (31) and `NIMLOC` (32) are hex digits in one or more
+  tokens (`EID 0102 0304`), an odd number of digits or a non-hex character is a zone file error, and they are
+  displayed as one hex string. `NULL` (10) and the obsolete `UINFO` (100), `UID` (101), `GID` (102) and `UNSPEC` (103)
+  have a name but no text form in BIND 9.18/9.20 (`gen.c` only registers the names): they are accepted only as
+  `\# <length> <hex>` (a text form is a zone file error) and `dag` shows them in that form.
 - **Case of names**: owner names and the domain names inside RDATA are answered and transferred with the letters as
   written (RFC 4343 §4.1), for every type, from a zone file and from a database alike. The only exception is name
   compression (types NS, CNAME, PTR, MX, SOA, MINFO and the owner): a name that is compressed against an earlier name of the

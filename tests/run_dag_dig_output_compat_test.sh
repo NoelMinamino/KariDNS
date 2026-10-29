@@ -45,6 +45,21 @@ $TTL 300
 ns1 A 192.0.2.1
 www A 192.0.2.10
 EOF
+cat > "$TMP_DIR/rr9.zone" <<'EOF'
+$TTL 300
+@ SOA ns1 h 1 2 3 4 5
+@ NS ns1
+ns1 A 192.0.2.1
+ri RESINFO "qnamemin" "exterr=15-17"
+wa WALLET "btc" "bc1qexample"
+e1 EID 0102 0304
+nl NIMLOC 0a0b0c
+ui UINFO \# 5 616c696365
+u2 UID \# 4 000003e8
+g2 GID \# 4 000003e9
+un UNSPEC \# 2 0102
+nu NULL \# 2 dead
+EOF
 cp "$SCRIPT_DIR/zones/example.com.zone" "$SCRIPT_DIR/zones/example.com.dnskey" "$SCRIPT_DIR/zones/example.com.hosts" "$TMP_DIR/"
 SECRET="cGhhc2UxNS14MzYtdGVzdC1rZXktMDEyMzQ1Njc4OQ=="
 USER_OPT=""
@@ -56,6 +71,7 @@ options { port $PORT; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT
 key "k1" { algorithm hmac-sha256; secret "$SECRET"; };
 zone "esc.test" { type master; file "$TMP_DIR/esc.zone"; };
 zone "ax.test" { type master; file "$TMP_DIR/ax.zone"; allow-transfer { key "k1"; }; };
+zone "rr9.test" { type master; file "$TMP_DIR/rr9.zone"; };
 zone "example.com" { type master; file "$TMP_DIR/example.com.zone"; };
 EOF
 "$KARIDNS" -f "$TMP_DIR/k.conf" > "$TMP_DIR/karidns.log" 2>&1 &
@@ -132,6 +148,19 @@ echo "=== names (X-14) ==="
 run 'c\(p.esc.test' A;                       has ";c\(p.esc.test. IN A" && has "c\(p.esc.test. 300 IN A 192.0.2.4" && ok
 run 'q\"x.esc.test' A +noall +answer;        has 'q\"x.esc.test. 300 IN A 192.0.2.5' && ok
 run 'dl\$r.esc.test' A +yaml;                has "- 'dl\\\$r.esc.test. IN A'" && ok
+
+echo "=== zone file RR types, batch 9 (BIND 9.20 generic_totext_txt, eid_31.c, unknown_totext) ==="
+run ri.rr9.test RESINFO +noall +answer;    has "ri.rr9.test. 300 IN RESINFO \"qnamemin\" \"exterr=15-17\"" && ok
+run ri.rr9.test RESINFO +short;            has "\"qnamemin\" \"exterr=15-17\"" && hasnt "RESINFO" && ok
+run wa.rr9.test WALLET +noall +answer;     has "wa.rr9.test. 300 IN WALLET \"btc\" \"bc1qexample\"" && ok
+run e1.rr9.test EID +noall +answer;        has "e1.rr9.test. 300 IN EID 01020304" && ok
+run nl.rr9.test NIMLOC +multiline +noall +answer; has "NIMLOC ( 0A0B0C )" && ok
+run ui.rr9.test UINFO +noall +answer;      has "ui.rr9.test. 300 IN UINFO \# 5 616C696365" && ok
+run u2.rr9.test UID +noall +answer;        has "u2.rr9.test. 300 IN UID \# 4 000003E8" && ok
+run g2.rr9.test GID +noall +answer;        has "g2.rr9.test. 300 IN GID \# 4 000003E9" && ok
+run un.rr9.test UNSPEC +noall +answer;     has "un.rr9.test. 300 IN UNSPEC \# 2 0102" && ok
+run nu.rr9.test NULL +noall +answer;       has "nu.rr9.test. 300 IN NULL \# 2 DEAD" && ok
+run ri.rr9.test TYPE261 +noall +answer;    has "IN RESINFO \"qnamemin\"" && ok
 
 echo "=== search list (D-14) ==="
 run nx A +search +domain=esc.test;         has "status: REFUSED" && hasnt "status: NXDOMAIN" && hasnt "MULTI-SERVER" && ok
@@ -237,6 +266,19 @@ example.com SOA +multiline +norrcomments
 -f $TMP_DIR/batch_lineopts.txt
 -f $TMP_DIR/batch_comments.txt
 +noall +question x.test TYPE65536 CLASS70000 TYPE65535
+ri.rr9.test RESINFO
+ri.rr9.test RESINFO +short
+ri.rr9.test TYPE261
+wa.rr9.test WALLET
+e1.rr9.test EID
+e1.rr9.test EID +multiline
+nl.rr9.test NIMLOC +multiline
+ui.rr9.test UINFO
+u2.rr9.test UID
+g2.rr9.test GID
+un.rr9.test UNSPEC
+nu.rr9.test NULL
+ri.rr9.test RESINFO +yaml
 EOF
     # several queries on the command line: +nohexdump must precede the first query to be global for dag
     c="esc.test SOA ns1.esc.test A ax.test SOA +tcp"

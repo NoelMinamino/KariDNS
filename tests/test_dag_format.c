@@ -120,6 +120,15 @@ static const char *ROUNDTRIP_LINES[] = {
     "IN BRID \\# 2 0102",
     "IN HHIT \\# 2 0102",
     "IN NULL \\# 2 0102",
+    /* batch 9 */
+    "IN RESINFO \"qnamemin\" \"exterr=15-17\"",
+    "IN WALLET \"btc\" \"bc1qexample\" \"\"",
+    "IN EID 0102 0304",
+    "IN NIMLOC 0a0b0c",
+    "IN UINFO \\# 3 414243",
+    "IN UID \\# 4 000003E8",
+    "IN GID \\# 4 000003E9",
+    "IN UNSPEC \\# 2 0102",
 };
 
 static void show(uint16_t type, const uint8_t *rd, size_t len, char *out, size_t cap, bool multiline) {
@@ -149,6 +158,12 @@ static void test_character_string_escaping(void) {
     assert(strcmp(out, "\"a\" \"\" \"bc\"") == 0);
     show(56, txt2, sizeof(txt2), out, sizeof(out), false);
     assert(strcmp(out, "\"a\" \"\" \"bc\"") == 0);
+    show(261, txt2, sizeof(txt2), out, sizeof(out), false);       /* RESINFO (RFC 9606), WALLET: BIND generic_totext_txt() */
+    assert(strcmp(out, "\"a\" \"\" \"bc\"") == 0);
+    show(262, txt2, sizeof(txt2), out, sizeof(out), false);
+    assert(strcmp(out, "\"a\" \"\" \"bc\"") == 0);
+    show(261, txt1, sizeof(txt1), out, sizeof(out), false);       /* the same \DDD escaping as TXT */
+    assert(strcmp(out, "\"\\\"\\\\\\127\\008\\000\\255A ~\"") == 0);
 
     /* CAA: value escaped the same way, tag verbatim */
     static const uint8_t caa[] = { 0, 5, 'i', 's', 's', 'u', 'e', 'a', '"', 0x01, '\\' };
@@ -412,6 +427,13 @@ static void test_dig_compat_formatting(void) {
     assert(strcmp(out, "01020304") == 0);
     show(32, raw4, sizeof(raw4), out, sizeof(out), false);
     assert(strcmp(out, "01020304") == 0);
+    /* batch 9: NULL, UINFO, UID, GID, UNSPEC have no text form in BIND 9.20 (null_10.c totext_null() is unknown_totext(); gen.c knows the
+     * others by name only): the RFC 3597 generic form, as dig prints them */
+    static const uint16_t generic_only[] = { 10, 100, 101, 102, 103 };
+    for (size_t g = 0; g < N(generic_only); g++) {
+        show(generic_only[g], raw4, sizeof(raw4), out, sizeof(out), false);
+        assert(strcmp(out, "\\# 4 01020304") == 0);
+    }
     printf("  -> dig-compatible formatting passed.\n");
 }
 
@@ -883,9 +905,45 @@ static void test_dag_format_case_30(void) {
     free_query_opts(&spec.qo);
 }
 
+/* dig (BIND generic_fromwire_txt / txt_fromwire) refuses TXT-like RDATA that is empty or has a <character-string> running past the RDATA;
+ * dag_parse_message() must call such a message malformed for TXT, SPF, NINFO, AVC, RESINFO and WALLET alike. */
+static void test_txt_like_wire_check(void) {
+    printf("[TEST] dag: TXT-like RDATA (TXT, SPF, NINFO, AVC, RESINFO, WALLET) is checked on the wire...\n");
+    static const uint16_t types[] = { 16, 99, 56, 258, 261, 262 };
+    static const struct { const uint8_t rd[8]; uint16_t len; bool ok; } cases[] = {
+        { { 3, 'a', 'b', 'c' }, 4, true },
+        { { 1, 'a', 0, 2, 'b', 'c' }, 6, true },
+        { { 0 }, 0, false },                       /* no <character-string> at all */
+        { { 4, 'a', 'b', 'c' }, 4, false },        /* the string is longer than the RDATA */
+        { { 1, 'a', 2, 'b' }, 4, false },          /* the second one is */
+    };
+    for (size_t t = 0; t < N(types); t++) {
+        for (size_t c = 0; c < N(cases); c++) {
+            uint8_t pkt[64];
+            size_t off = 0;
+            memset(pkt, 0, sizeof(pkt));
+            pkt[2] = 0x84;                          /* QR AA */
+            pkt[7] = 1;                             /* ANCOUNT 1 */
+            off = 12;
+            pkt[off++] = 0;                         /* owner: the root */
+            pkt[off++] = (uint8_t)(types[t] >> 8); pkt[off++] = (uint8_t)types[t];
+            pkt[off++] = 0; pkt[off++] = 1;         /* IN */
+            off += 4;                               /* TTL */
+            pkt[off++] = 0; pkt[off++] = (uint8_t)cases[c].len;
+            memcpy(pkt + off, cases[c].rd, cases[c].len);
+            off += cases[c].len;
+            dag_parse_t ps;
+            dag_parse_message(pkt, off, &ps);
+            assert(ps.malformed == !cases[c].ok);
+        }
+    }
+    printf("  -> TXT-like wire check passed.\n");
+}
+
 int main(void) {
     printf("=== Starting dag RDATA Display Tests ===\n");
     test_character_string_escaping();
+    test_txt_like_wire_check();
     test_amtrelay_layout();
     test_dig_compat_formatting();
     test_rrsig_cache_signature();

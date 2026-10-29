@@ -1,14 +1,15 @@
 /*
  * test_zone_parser_paths.c - path coverage and golden-wire verification for the zone parser.
  *
- *   1. Every zone-legal RR type (91 presentation forms) must parse and serialize.
- *   2. For 44 types the serialized RDATA is compared byte-for-byte with the RFC wire format that was computed
+ *   1. Every zone-legal RR type (118 presentation forms) must parse and serialize.
+ *   2. For 52 types the serialized RDATA is compared byte-for-byte with the RFC wire format that was computed
  *      independently of KariDNS (Python reference, RFC 1035/3596/4034/5155/6698/7477/8659/8777/9460 layouts).
  *   3. Rejection tables: parse-time errors, serialize-time errors (the stage karicheck's dry-run relies on).
  *   4. Directives: $ORIGIN, $TTL, $INCLUDE (relative/circular/missing/nested), $GENERATE, tags, escapes, parentheses.
  *   5. Robustness: RR line field-truncation and corruption must never crash or corrupt memory (run under ASan).
  */
 #include <assert.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -114,6 +115,15 @@ static const char *const OK_LINES[] = {
     "IN BRID \\# 2 0102",
     "IN HHIT \\# 2 0102",
     "IN NULL \\# 2 0102",
+    /* batch 9: RESINFO / WALLET are TXT-like, EID / NIMLOC are hex in one or more tokens, UINFO / UID / GID / UNSPEC only as \# */
+    "IN RESINFO \"qnamemin\" \"exterr=15-17\"",
+    "IN WALLET \"btc\" \"bc1qexample\"",
+    "IN EID 0102 0304",
+    "IN NIMLOC 0A0b0c",
+    "IN UINFO \\# 3 414243",
+    "IN UID \\# 4 000003E8",
+    "IN GID \\# 4 000003E9",
+    "IN UNSPEC \\# 2 0102",
     "CH TXT \"chaos\"",
     "3600 IN A 192.0.2.9",
     "IN 3600 A 192.0.2.9",
@@ -157,7 +167,14 @@ static const char *const PARSE_FAIL_LINES[] = {
     "IN AXFR 1.2.3.4",
     "IN MAILB x.",
     "XX A 1.2.3.4",
-    "IN BOGUSTYPE 1 2 3"
+    "IN BOGUSTYPE 1 2 3",
+    /* batch 9: BIND null_10.c fromtext_null() is DNS_R_SYNTAX; UINFO / UID / GID / UNSPEC have no text form in BIND 9.20 */
+    "IN NULL not-generic", "IN NULL", "IN UINFO \"x\"", "IN UID 5", "IN GID 5", "IN UNSPEC 0102",
+    /* batch 9: EID / NIMLOC (BIND isc_hex_tobuffer, one or more tokens): odd digits, non-hex, none */
+    "IN EID 010", "IN EID 01 0", "IN EID zz", "IN NIMLOC 0g", "IN EID", "IN NIMLOC",
+    "IN EID \\# 3 0102", "IN NIMLOC \\# 1 0102", "IN UID \\# 4 0102",
+    /* the \# form of a TXT-like type must be <character-string>s that fill the RDATA (BIND generic_fromwire_txt) */
+    "IN WALLET \\# 3 056162", "IN RESINFO \\# 0", "IN RESINFO \\# 3 036162", "IN SPF \\# 2 0561", "IN AVC \\# 1 02", "IN NINFO \\# 0"
 };
 static const char *const SERIALIZE_FAIL_LINES[] = {
     /* ATMA: one token (BIND atma_34.c); the old "format address" two-token form is rejected */
@@ -206,7 +223,6 @@ static const char *const SERIALIZE_FAIL_LINES[] = {
     "IN CERT 1 12345 8 !!!",
     "IN CERT BOGUSCERT 12345 8 AAAA",
     "IN OPENPGPKEY !!!",
-    "IN NULL not-generic",
     "IN NS",
     "IN PTR",
     "IN SOA ns.example. h.example. 1 2 3 4"
@@ -259,6 +275,10 @@ static const struct { const char *type; const char *rdata_hex; } EXPECTED_WIRE[]
     { "RP", "046d626f78076578616d706c650003747874076578616d706c6500" }, { "RT", "000a027274076578616d706c6500" },
     { "PX", "000a0161076578616d706c65000162076578616d706c6500" }, { "SPF", "0b763d73706631202d616c6c" },
     { "NINFO", "0474657874" },
+    { "RESINFO", "08716e616d656d696e0c6578746572723d31352d3137" },     /* RFC 9606 section 4: <character-string>s as TXT */
+    { "WALLET", "036274630b626331716578616d706c65" },
+    { "EID", "01020304" }, { "NIMLOC", "0a0b0c" },                     /* BIND eid_31.c / nimloc_32.c: the hex digits */
+    { "UINFO", "414243" }, { "UID", "000003e8" }, { "GID", "000003e9" }, { "UNSPEC", "0102" },
     { "DHCID", "000201636fc0b8271c82825bb1ac5c41cf5351aa69b4febd94e8f17cdb95000da48c40" },
     { "CERT", "0001303908010203040506" }, { "OPENPGPKEY", "010203040506" },
 };
@@ -1415,7 +1435,7 @@ static void test_mldsa44_large_blobs(void) {
 
 static void test_i5_txt_many_strings(void) {
     printf("[TEST] I5: TXT / SPF / AVC with more character-strings than MAX_RDATA are kept as they are...\n");
-    static const struct { const char *type; uint16_t code; } kinds[] = { { "TXT", 16 }, { "SPF", 99 }, { "AVC", 258 }, { "NINFO", 56 } };
+    static const struct { const char *type; uint16_t code; } kinds[] = { { "TXT", 16 }, { "SPF", 99 }, { "AVC", 258 }, { "NINFO", 56 }, { "RESINFO", 261 }, { "WALLET", 262 } };
     static const int counts[] = { MAX_RDATA, MAX_RDATA + 1, 60, 200 };
     for (size_t t = 0; t < N(kinds); t++) {
         for (size_t c = 0; c < N(counts); c++) {
@@ -2007,6 +2027,113 @@ static void test_bind_compat_batch1(void) {
     printf("  -> batch 1 passed.\n");
 }
 
+/* BIND compatibility, batch 9: zone file RR types.  Sources read for it (BIND 9.20 branch): lib/dns/rdata/generic/resinfo_261.c and wallet_262.c
+ * (generic_fromtext_txt / generic_totext_txt / generic_fromwire_txt: one or more <character-string>s, RFC 9606 section 4 for RESINFO),
+ * lib/dns/rdata/in_1/eid_31.c and nimloc_32.c (fromtext: isc_hex_tobuffer(lexer, target, isc_one_or_more); totext: hex), generic/null_10.c
+ * (fromtext_null() returns DNS_R_SYNTAX: only "\#" is read) and lib/dns/gen.c (UINFO 100, UID 101, GID 102 and UNSPEC 103 are registered
+ * as names only: no rdata module, so dns_rdata_fromtext() gives DNS_R_UNKNOWN for anything but "\#").  No name compression in any of
+ * them (RFC 3597 section 4: none of them holds a domain name). */
+static void test_bind_rr_types_batch9(void) {
+    printf("[TEST] BIND compatibility batch 9: RESINFO, WALLET, EID, NIMLOC, NULL, UINFO / UID / GID / UNSPEC...\n");
+    /* mnemonics, both directions, any letter case */
+    static const struct { const char *name; uint16_t code; } names[] = {
+        { "UINFO", 100 }, { "UID", 101 }, { "GID", 102 }, { "UNSPEC", 103 }, { "RESINFO", 261 }, { "WALLET", 262 }, { "EID", 31 }, { "NIMLOC", 32 }, { "NULL", 10 } };
+    for (size_t i = 0; i < N(names); i++) {
+        char lower[16], tmp[32];
+        size_t k = 0;
+        for (; names[i].name[k]; k++) lower[k] = (char)tolower((unsigned char)names[i].name[k]);
+        lower[k] = '\0';
+        assert(get_type_code(names[i].name) == names[i].code && get_type_code(lower) == names[i].code);
+        assert(strcmp(dns_type_to_string(names[i].code), names[i].name) == 0);
+        assert(strcmp(format_type_name(names[i].code, tmp, sizeof(tmp)), names[i].name) == 0);
+    }
+    assert(get_type_code("UINFOX") == 0 && get_type_code("RESINF") == 0 && get_type_code("WALLETS") == 0);
+
+    /* RESINFO / WALLET: escapes, an empty string, the 255-octet rule of TXT (a longer string is cut in pieces, as for TXT) */
+    static const uint8_t ri[] = { 3, 'a', '"', 'b', 0, 1, ' ' };
+    expect_rdata("IN RESINFO \"a\\\"b\" \"\" \"\\032\"", ri, sizeof(ri));
+    expect_rdata("in wallet \"a\\\"b\" \"\" \"\\032\"", ri, sizeof(ri));
+    {
+        char text[1200], want[600];
+        static uint8_t exp[600];
+        memset(want, 'x', 300);
+        want[300] = '\0';
+        snprintf(text, sizeof(text), "IN RESINFO \"%s\"", want);
+        exp[0] = 255; memset(exp + 1, 'x', 255); exp[256] = 45; memset(exp + 257, 'x', 45);
+        expect_rdata(text, exp, 302);
+    }
+    /* RESINFO is "one or more" strings: none is refused when the record is written out (the lint pass, like TXT) */
+    {
+        zt_t z;
+        zt_load_line(&z, "IN RESINFO");
+        ASSERT_PARSED(&z);
+        uint8_t wire[512];
+        const uint8_t *rd;
+        size_t rdlen;
+        assert(ser_rdata(&z.arena.records[z.arena.count - 1], wire, sizeof(wire), &rd, &rdlen) != 0);
+        zt_free(&z);
+    }
+
+    /* EID / NIMLOC: tokens are concatenated (also more than MAX_RDATA of them), digits of either case */
+    {
+        char text[4096];
+        static uint8_t exp[400];
+        size_t o = (size_t)snprintf(text, sizeof(text), "IN EID");
+        for (int i = 0; i < 200; i++) {
+            o += (size_t)snprintf(text + o, sizeof(text) - o, " %02X", i & 0xFF);
+            exp[i] = (uint8_t)i;
+        }
+        expect_rdata(text, exp, 200);
+        o = (size_t)snprintf(text, sizeof(text), "IN NIMLOC");
+        for (int i = 0; i < 100; i++) o += (size_t)snprintf(text + o, sizeof(text) - o, " %02x%02x", i & 0xFF, (i + 1) & 0xFF);
+        for (int i = 0; i < 100; i++) { exp[2 * i] = (uint8_t)i; exp[2 * i + 1] = (uint8_t)(i + 1); }
+        expect_rdata(text, exp, 200);
+    }
+    /* a hex RDATA of more than 65535 octets is refused (RDLENGTH), exactly 65535 is read */
+    {
+        size_t hexn = 65536 * 2;
+        char *text = malloc(hexn + 512);
+        assert(text);
+        size_t o = (size_t)snprintf(text, 512, "%st1 EID ", SOA_HEAD);
+        assert(o < 512);
+        memset(text + o, '0', hexn);
+        text[o + hexn] = '\0';
+        zt_t z;
+        zt_load(&z, text);
+        assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "65535"));
+        zt_free(&z);
+        text[o + hexn - 2] = '\0';
+        zt_load(&z, text);
+        ASSERT_PARSED(&z);
+        dns_record_t *r = zt_find(&z, "t1.example.", 31);
+        assert(r && r->generic_data && r->generic_len == 65535);
+        zt_free(&z);
+        free(text);
+    }
+    /* the error text says what is wrong */
+    {
+        static const struct { const char *line; const char *msg; } bad[] = {
+            { "IN EID 010", "odd number" }, { "IN EID 0x01", "non-hexadecimal" }, { "IN EID", "empty" },
+            { "IN NULL abc", "no text form" }, { "IN UINFO \"x\"", "no text form" }, { "IN GID 5", "no text form" },
+        };
+        for (size_t i = 0; i < N(bad); i++) {
+            zt_t z;
+            zt_load_line(&z, bad[i].line);
+            assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, bad[i].msg));
+            zt_free(&z);
+        }
+    }
+    /* the \# form: NULL takes any RDATA (also none), UINFO ... UNSPEC too, the hex may be split over tokens */
+    {
+        static const uint8_t b3[] = { 1, 2, 3 };
+        expect_rdata("IN NULL \\# 3 010203", b3, sizeof(b3));
+        expect_rdata("IN NULL \\# 0", b3, 0);
+        expect_rdata("IN UNSPEC \\# 3 01 02 03", b3, sizeof(b3));
+        expect_rdata("IN EID \\# 3 01 02 03", b3, sizeof(b3));
+    }
+    printf("  -> batch 9 passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Zone Parser Path Coverage Tests ===\n");
     test_x37_rdata_name_case();
@@ -2037,6 +2164,7 @@ int main(void) {
     test_extended_negative_paths();
     test_b9a_alias_lua();
     test_bind_compat_batch1();
+    test_bind_rr_types_batch9();
     printf("=== All Zone Parser Path Coverage Tests PASSED ===\n");
     return 0;
 }
