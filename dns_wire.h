@@ -678,6 +678,7 @@ typedef struct {
     bool wirecache_enabled;
     uint64_t wirecache_entries;
     uint64_t wirecache_bytes;
+    char shared_views[128];   /* zone { in-view }: the views that share this zone with its owner view, "a, b" (""  = none) */
 } zone_observatory_snapshot_t;
 
 /* ---- Extended AXFR records (KariDNS extension): the one encoder, shared by Extended AXFR out (dns_axfr_ixfr.c, from the

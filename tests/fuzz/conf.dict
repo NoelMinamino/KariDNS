@@ -143,6 +143,7 @@
 "redirect"
 "delegation-only"
 "in-view"
+"in-view-settings"
 "blackhole"
 "proxy"
 "tls"

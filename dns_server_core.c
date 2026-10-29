@@ -1337,6 +1337,8 @@ void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, z
     out->wirecache_enabled = active_arena && active_arena->rcache_ok;
     out->wirecache_entries = 0;
     out->wirecache_bytes = 0;
+    out->shared_views[0] = '\0';
+    if (cfg && cfg->any_in_view) (void)config_in_view_sharers(cfg, e->view_name, e->domain, out->shared_views, sizeof(out->shared_views));
 }
 
 // ============================================================================
@@ -2575,7 +2577,8 @@ process_tcp_client: ;
               /* transfers-out and max-transfer-time-out / max-transfer-idle-out (BIND 9.20), read before the configuration is released */
               uint32_t out_limit = xfr_cfg_limit(cfg, XL_TRANSFERS_OUT);
               xfr_eff_t out_eff;
-              xfr_opts_effective(cfg, zcfg, xfr_view ? xfr_view->name : NULL, &out_eff);
+              /* the settings of the view that owns the zone, not of the view the client came through (a zone shared with in-view is one object) */
+              xfr_opts_effective(cfg, zcfg, entry->view_name, &out_eff);
               release_config_snapshot(cfg);
               if (!xfr_counter_acquire(&g_xfr_out_active, out_limit)) {
                 allowed = false; /* "Zone transfer requests in excess of the limit are refused" (ARM transfers-out) */
@@ -3650,7 +3653,7 @@ void *control_thread_func(void *arg) {
               zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
               if (snap) {
                 for (size_t v = 0; v < snap->view_count; v++) {
-                  st.num_zones += snap->views[v].zone_count;
+                  st.num_zones += snap->views[v].zone_count - snap->views[v].shared_count;   /* a zone shared with another view (in-view) is one zone */
                 }
                 release_zone_snapshot(snap);
               }
@@ -3738,7 +3741,7 @@ void *control_thread_func(void *arg) {
                   if (view_arg && strcasecmp(snap->views[v].name, view_arg) != 0) continue;
                   for (size_t z = 0; z < snap->views[v].zone_count; z++) {
                     zone_db_entry_t *e = snap->views[v].entries[z];
-                    if (!e) continue;
+                    if (!e || !view_owns_entry(&snap->views[v], e)) continue;   /* a shared zone is listed once, in its owner view */
                     if (canon_arg && !domain_names_match_ci(e->domain, canon_arg)) continue;
                     match_count++;
                   }
@@ -3754,7 +3757,7 @@ void *control_thread_func(void *arg) {
                   if (view_arg && strcasecmp(snap->views[v].name, view_arg) != 0) continue;
                   for (size_t z = 0; z < snap->views[v].zone_count; z++) {
                     zone_db_entry_t *e = snap->views[v].entries[z];
-                    if (!e) continue;
+                    if (!e || !view_owns_entry(&snap->views[v], e)) continue;   /* a shared zone is listed once, in its owner view */
                     if (canon_arg && !domain_names_match_ci(e->domain, canon_arg)) continue;
                     zone_observatory_snapshot_t snap_item;
                     memset(&snap_item, 0, sizeof(snap_item));
@@ -3917,7 +3920,7 @@ void *control_thread_func(void *arg) {
                 for (size_t kk = 0; kk < count; kk++) {
                     size_t i = (kk + rot) % count;
                     zone_db_entry_t *entry = list[i];
-                    if (!entry) continue;
+                    if (!entry || !view_owns_entry(&snap->views[v], entry)) continue;   /* a zone shared with another view (in-view) is looked at in its owner view, once */
 
                     /* B8t-2: settings received from the primary follow a changed karidns.conf (a secondary's own statements win) */
                     if (atomic_load_explicit(&entry->rx_present, memory_order_relaxed)) zone_rx_settings_refresh(entry, active);

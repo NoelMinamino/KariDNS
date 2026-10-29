@@ -407,6 +407,12 @@ static void catz_names_free(char **names, int count);
 static void free_zone_ext_fields(zone_ext_t *x) {
   if (!x)
     return;
+  if (x->iv) {
+    free(x->iv->view);
+    free(x->iv->loc);
+    free(x->iv);
+    x->iv = NULL;
+  }
   acl_set_free(&x->acl);
   notify_targets_free(x->masters, x->masters_count);
   if (x->masters_parsed) {
@@ -582,6 +588,43 @@ zone_config_t *view_find_zone_config(const view_config_t *v, const char *domain)
   return NULL;
 }
 
+zone_config_t *view_find_in_view(const view_config_t *v, const char *domain) {
+  if (!v || !v->in_view_zones || !domain) return NULL;
+  if (v->in_view_index.slots) return zone_cfg_index_find(&v->in_view_index, domain);
+  for (zone_config_t *z = v->in_view_zones; z; z = z->next) {
+    if (domain_names_match_ci(z->domain, domain)) return z;
+  }
+  return NULL;
+}
+
+uint8_t config_in_view_mode(const server_config_t *cfg, const view_config_t *refv, const zone_inview_t *iv) {
+  if (iv && iv->settings) return iv->settings;
+  if (refv && refv->in_view_settings) return refv->in_view_settings;
+  if (cfg && cfg->in_view_settings) return cfg->in_view_settings;
+  return IVS_OWNER;
+}
+
+int config_in_view_sharers(const server_config_t *cfg, const char *owner, const char *domain, char *buf, size_t cap) {
+  int n = 0;
+  size_t used = 0;
+  if (cap) buf[0] = '\0';
+  if (!cfg || !owner || !domain) return 0;
+  for (const view_config_t *v = cfg->views; v; v = v->next) {
+    const zone_config_t *s = view_find_in_view(v, domain);
+    if (!s || !s->ext || !s->ext->iv || !s->ext->iv->view || strcasecmp(s->ext->iv->view, owner) != 0) continue;
+    n++;
+    if (!cap) continue;
+    int w = snprintf(buf + used, cap - used, "%s%s", used ? ", " : "", v->name);
+    if (w < 0 || (size_t)w >= cap - used) {            /* it does not fit: end with "..." */
+      if (cap >= 4) memcpy(buf + cap - 4, "...", 4);
+      cap = 0;
+    } else {
+      used += (size_t)w;
+    }
+  }
+  return n;
+}
+
 zone_config_t *config_find_zone_any_view(const server_config_t *cfg, const char *domain) {
   if (!cfg || !domain) return NULL;
   if (cfg->views) {
@@ -665,6 +708,13 @@ static void free_partial_view(view_config_t *view) {
     view->match_clients_parsed = NULL;
   }
   zone_config_t *z = view->zones;
+  while (z) {
+    zone_config_t *next = z->next;
+    free_zone_config(z);
+    z = next;
+  }
+  zone_cfg_index_free(&view->in_view_index);
+  z = view->in_view_zones;
   while (z) {
     zone_config_t *next = z->next;
     free_zone_config(z);
@@ -922,6 +972,45 @@ static int acl_set_resolve(token_ctx_t *ctx, server_config_t *cfg, acl_set_t *s,
   return 0;
 }
 
+/* After the parse: every zone { in-view "v"; } finds the zone it shares.  BIND (lib/isccfg/check.c, bin/named/server.c configure_zone()): the zone must be a
+ * zone of a view that is defined earlier; a view cannot name itself.  Phase 1 of KariDNS shares the primary and secondary zone { } blocks of the
+ * configuration (not catalog zones, program zones, catalog members or database zones).  The ACLs an in-view zone may write are the KariDNS
+ * in-view-settings view; with owner they are the same error BIND gives for any other option. */
+static int in_view_resolve(token_ctx_t *ctx, server_config_t *cfg) {
+  for (view_config_t *v = cfg->views; v; v = v->next) {
+    for (zone_config_t *s = v->in_view_zones; s; s = s->next) {
+      zone_inview_t *iv = s->ext->iv;
+      char what[DNS_NAME_TEXT_SIZE + 16];
+      snprintf(what, sizeof(what), "zone '%.255s'", s->domain);
+      zone_config_t *t = NULL;
+      for (view_config_t *tv = cfg->views; tv && tv != v; tv = tv->next) {
+        if (strcasecmp(tv->name, iv->view) == 0) {
+          t = view_find_zone_config(tv, s->domain);
+          break;
+        }
+      }
+      if (!t) {
+        aml_report(ctx, iv->loc, what, "'in-view' zone '%.255s' does not exist in view '%.64s', or view '%.64s' is not yet defined",
+                   s->domain, iv->view, iv->view);
+        return -1;
+      }
+      if (t->is_catalog || !t->type || (strcmp(t->type, "master") != 0 && strcmp(t->type, "slave") != 0)) {
+        aml_report(ctx, iv->loc, what, "'in-view' zone '%.255s' of view '%.64s' is not a primary or secondary zone (a catalog zone, a program zone "
+                   "and a forward zone cannot be shared with another view)", s->domain, iv->view);
+        return -1;
+      }
+      if (iv->acl_written && config_in_view_mode(cfg, v, iv) != IVS_VIEW) {
+        aml_report(ctx, iv->loc, what, "'in-view' used with incompatible zone options (allow-query, allow-query-on, allow-transfer, allow-update and "
+                   "allow-notify in an in-view zone need 'in-view-settings view')");
+        return -1;
+      }
+      iv->target = t;
+      cfg->any_in_view = true;
+    }
+  }
+  return 0;
+}
+
 /* After the parse: every list resolved, acl_query_active set, and transfer-acl-match / update-acl-match any / all refused where the
  * list that applies has a negated key (the flat evaluation of those settings cannot say "not signed with k"). */
 static int resolve_all_acl_lists(token_ctx_t *ctx, server_config_t *cfg) {
@@ -960,6 +1049,12 @@ static int resolve_all_acl_lists(token_ctx_t *ctx, server_config_t *cfg) {
           return -1;
         }
       }
+    }
+    for (zone_config_t *z = v->in_view_zones; z; z = z->next) {   /* the ACLs of an in-view zone (in-view-settings view) */
+      char label[DNS_NAME_TEXT_SIZE + 16];
+      snprintf(label, sizeof(label), "zone '%.255s'", z->domain);
+      if (acl_set_resolve(ctx, cfg, &z->ext->acl, label) != 0) return -1;
+      if (z->ext->acl.query || z->ext->acl.query_on) cfg->acl_query_active = true;
     }
     ctx->scope_keys = NULL;
   }
@@ -1051,6 +1146,13 @@ void free_server_config_fields(server_config_t *cfg) {
     if (v->match_clients) free(v->match_clients);
     if (v->match_clients_parsed) free(v->match_clients_parsed);
     zone_config_t *curr = v->zones;
+    while (curr) {
+      zone_config_t *next = curr->next;
+      free_zone_config(curr);
+      curr = next;
+    }
+    zone_cfg_index_free(&v->in_view_index);
+    curr = v->in_view_zones;
     while (curr) {
       zone_config_t *next = curr->next;
       free_zone_config(curr);
@@ -1805,6 +1907,27 @@ static int parse_tcp_timeout(token_ctx_t *ctx, const char *key, uint32_t min_uni
   return 0;
 }
 
+/* in-view-settings owner | view;  (KariDNS; options, view and zone): which ACLs apply to the requests that come through a view for a zone
+ * that the view shares with an earlier view (zone_inview_t).  Reads the value and the semicolon. */
+static int parse_in_view_settings(token_ctx_t *ctx, const char *what, uint8_t *out) {
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) { free_token(&tok); return -1; }
+  if (strcasecmp(tok.value, "owner") == 0) {
+    *out = IVS_OWNER;
+  } else if (strcasecmp(tok.value, "view") == 0) {
+    *out = IVS_VIEW;
+  } else {
+    conf_error(ctx, what, "in-view-settings: invalid value '%.64s' (expected owner or view)", tok.value);
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  free_token(&tok);
+  return 0;
+}
+
 /* minimal-responses (BIND 9.20 lib/isccfg/namedconf.c: `( no-auth | no-auth-recursive | <boolean> )`, bin/named/server.c: the value of the
  * boolean decides yes / no, the words select dns_minimal_noauth / dns_minimal_noauthrec).  Reads the value and the semicolon. */
 static int parse_minimal_responses(token_ctx_t *ctx, const char *what, uint8_t *out) {
@@ -1898,6 +2021,7 @@ static int chaos_finish(token_ctx_t *ctx, server_config_t *cfg) {
   for (const view_config_t *v = cfg->views; v; v = v->next) {
     if (v->max_udp_size) cfg->any_view_max_udp = true;
     if (v->require_cookie_set) cfg->any_view_cookie = true;
+    if (v->minimal_set) cfg->any_view_minimal = true;
   }
   return 0;
 }
@@ -3172,6 +3296,13 @@ static int parse_zv_option(token_ctx_t *ctx, const char *what, const char *key, 
     if (strcmp(key, "max-records") == 0) { zv->max_records = u; zv->set |= ZV_MAX_RECORDS; }
     else if (strcmp(key, "max-records-per-type") == 0) { zv->max_per_type = u; zv->set |= ZV_MAX_PER_TYPE; }
     else { zv->max_types_per_name = u; zv->set |= ZV_MAX_TYPES_PER_NAME; }
+    if (u > 100 && strcmp(key, "max-records") != 0) {
+      /* BIND's default for these two is 100 (bin/named/config.c); here no limit applies unless the option is written, and a value above 100
+       * is applied as written -- the warning says that it is looser than what a BIND server with no setting enforces */
+      char loc[300];
+      ctx_location(ctx, loc, sizeof(loc));
+      conf_warn_loc(loc, what, "%s %u is above BIND's default of 100; the limit is applied as written", key, (unsigned)u);
+    }
   } else if (strcmp(key, "max-zone-ttl") == 0) {
     /* maxduration: `unlimited`, or a duration -- ISO 8601 (P1D) or a TTL value (1d, 3600).  Only the TTL form is read; an ISO 8601 value is
      * refused rather than guessed. */
@@ -4353,7 +4484,7 @@ static const char *const k_bind_zone_options[] = {
   "allow-notify", "allow-query", "allow-query-on", "allow-update-forwarding", "auto-dnssec", "check-dup-records",
   "check-integrity", "check-mx", "check-mx-cname", "check-names", "check-sibling", "check-spf", "check-srv-cname",
   "check-wildcard", "database", "delegation-only", "dialup", "dlz", "dnssec-dnskey-kskonly", "dnssec-loadkeys-interval",
-  "dnssec-policy", "dnssec-secure-to-insecure", "dnssec-update-mode", "forward", "in-view", "inline-signing",
+  "dnssec-policy", "dnssec-secure-to-insecure", "dnssec-update-mode", "forward", "inline-signing",
   "ixfr-from-differences", "journal", "key-directory", "masterfile-format", "masterfile-style", "max-ixfr-ratio",
   "max-journal-size", "max-records", "max-refresh-time", "max-retry-time", "max-transfer-idle-in", "max-transfer-idle-out",
   "max-transfer-time-in", "max-transfer-time-out", "max-zone-ttl", "min-refresh-time", "min-retry-time", "min-transfer-rate-in", "multi-master",
@@ -4815,6 +4946,7 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
   zone_ext_t *x = zone->ext;
   int nr_rc = 0;
   conf_token_t tok;
+  bool iv_other = false, iv_acl = false;   /* statements other than forward / forwarders (and the ACLs), for the in-view check below */
   {
     char zw[DNS_NAME_TEXT_SIZE + 16];
     snprintf(zw, sizeof(zw), "zone '%.255s'", zone->domain ? zone->domain : "");
@@ -4841,6 +4973,45 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       free(key);
       free_zone_config(zone);
       return -1;
+    }
+    if (strcmp(key, "in-view") == 0 || strcmp(key, "in-view-settings") == 0) {
+      /* in-view "view";  and  in-view-settings owner | view;  (see zone_inview_t).  Both are kept in x->iv, which the zone owns. */
+      bool is_iv = key[7] == '\0';
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_STRING || !tok.value) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+      if (!x->iv) x->iv = calloc(1, sizeof(*x->iv));
+      if (!x->iv) { free(key); free_zone_config(zone); free_token(&tok); if (ctx) ctx->error_occurred = true; return -1; }
+      if (is_iv) {
+        char loc[300];
+        ctx_location(ctx, loc, sizeof(loc));
+        free(x->iv->view);
+        free(x->iv->loc);
+        x->iv->view = tok.value;
+        x->iv->loc = strdup(loc);
+        tok.value = NULL;
+      } else if (strcasecmp(tok.value, "owner") == 0) {
+        x->iv->settings = IVS_OWNER;
+      } else if (strcasecmp(tok.value, "view") == 0) {
+        x->iv->settings = IVS_VIEW;
+      } else {
+        report_bad_value(ctx, zone->domain, key, tok.value, "owner or view");
+        free(key); free_zone_config(zone); free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+      free_token(&tok);
+      free(key);
+      continue;
+    }
+    /* BIND (lib/isccfg/check.c) lets an in-view zone carry nothing but in-view, forward and forwarders; the ACLs are KariDNS's in-view-settings view */
+    if (strcmp(key, "forward") != 0 && strcmp(key, "forwarders") != 0) {
+      if (strcmp(key, "allow-query") == 0 || strcmp(key, "allow-query-on") == 0 || strcmp(key, "allow-transfer") == 0 ||
+          strcmp(key, "allow-update") == 0 || strcmp(key, "allow-notify") == 0)
+        iv_acl = true;
+      else
+        iv_other = true;
     }
     if (strcmp(key, "masters") == 0 || strcmp(key, "primaries") == 0) {
       /* BIND 9.20 ARM "primaries": [ port <n> ] { ( <list> | <ip> [ port <n> ] ) [ key <name> ]; ... };  A later statement replaces the
@@ -4967,6 +5138,15 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
           canon = "program";
         else if (strcasecmp(val, "forward") == 0)
           canon = "forward";
+        if (x->iv && x->iv->view) {      /* in-view was written before: a type is one of the options BIND refuses with it, skipped types included */
+          char iw[DNS_NAME_TEXT_SIZE + 16];
+          snprintf(iw, sizeof(iw), "zone '%.255s'", zone->domain);
+          conf_error(ctx, iw, "'in-view' used with incompatible zone options");
+          free(key);
+          free(val);
+          free_zone_config(zone);
+          return -1;
+        }
         if (!canon && zone_type_is_skipped(val)) {
           /* a BIND zone type that only a caching / resolving server uses (hint, stub, static-stub, mirror, redirect): the zone is not
            * loaded, the rest of its block is skipped, and the configuration is accepted so that a stock BIND named.conf can be checked
@@ -5270,15 +5450,6 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       free_token(&tok);
       if (key[0] == 't') x->transfer_acl_match = m;
       else x->update_acl_match = m;
-    } else if (strcmp(key, "in-view") == 0) {
-      /* BIND: the zone is the one of another view.  Skipping the statement would leave an empty primary zone, so it is an error until
-       * zones can be shared between views */
-      char iw[DNS_NAME_TEXT_SIZE + 16];
-      snprintf(iw, sizeof(iw), "zone '%.255s'", zone->domain);
-      conf_error(ctx, iw, "'in-view' (a zone shared with another view) is not supported");
-      free(key);
-      free_zone_config(zone);
-      return -1;
     } else if (unknown_statement(ctx, "zone", zone->domain, key, false) != 0) {
       free(key);
       free_zone_config(zone);
@@ -5293,6 +5464,24 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
     return -1;
   }
   free_token(&tok);
+  if (x->iv) {
+    /* a zone of another view (the target is looked up when the whole file has been read): no type, no data of its own */
+    char iw[DNS_NAME_TEXT_SIZE + 16];
+    snprintf(iw, sizeof(iw), "zone '%.255s'", zone->domain);
+    if (!x->iv->view) {
+      conf_error(ctx, iw, "'in-view-settings' is only valid in a zone with 'in-view'");
+      free_zone_config(zone);
+      return -1;
+    }
+    if (iv_other) {
+      conf_error(ctx, iw, "'in-view' used with incompatible zone options");
+      free_zone_config(zone);
+      return -1;
+    }
+    x->iv->acl_written = iv_acl;
+    *zone_out = zone;
+    return 0;
+  }
   if (!zone->type) {
     zone->type = strdup("master");
     if (!zone->type) { free_zone_config(zone); if (ctx) ctx->error_occurred = true; return -1; }
@@ -7613,6 +7802,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key);
             return -1;
           }
+        } else if (strcmp(key, "in-view-settings") == 0) {
+          if (parse_in_view_settings(ctx, "options", &config->in_view_settings) != 0) {
+            free(key);
+            return -1;
+          }
         } else if (strcmp(key, "minimal-any") == 0) {
           if (parse_bool_statement(ctx, NULL, key, &config->minimal_any) != 0) {
             free(key);
@@ -8024,7 +8218,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         snprintf(vw, sizeof(vw), "view '%s'", view->name);
         if (read_block_open(ctx, vw) != 0) { free(view->name); free(view); return -1; }
       }
-      zone_config_t *last_view_zone = NULL;
+      zone_config_t *last_view_zone = NULL, *last_view_stub = NULL;
       while (1) {
         tok = get_next_token(ctx);
         if (tok.type == TOKEN_RBRACE) { free_token(&tok); break; }
@@ -8096,7 +8290,9 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
           if (!z) continue; /* a zone type that is not loaded (zone_type_is_skipped) */
           /* 重複は検索と同じ規則で判定する ("example.test" と "example.test." は同じゾーン) */
-          int ins = zone_cfg_index_insert(&view->zone_index, z, NULL);
+          bool is_stub = z->ext && z->ext->iv;       /* zone { in-view }: a stub in its own list, but one name per view all the same */
+          int ins = (is_stub ? view_find_zone_config(view, z->domain) : view_find_in_view(view, z->domain)) ? 1
+                    : zone_cfg_index_insert(is_stub ? &view->in_view_index : &view->zone_index, z, NULL);
           if (ins != 0) {
             if (ins > 0) {
               syslog(LOG_ERR, "[Config] Duplicate zone '%s' defined in view '%s'; rejecting configuration", z->domain, view->name);
@@ -8108,8 +8304,26 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free_partial_view(view);
             return -1;
           }
+          if (is_stub) {
+            if (!view->in_view_zones) view->in_view_zones = z; else last_view_stub->next = z;
+            last_view_stub = z;
+            continue;
+          }
           if (!view->zones) view->zones = z; else last_view_zone->next = z;
           last_view_zone = z;
+        } else if (strcmp(tok.value, "in-view-settings") == 0) {
+          /* KariDNS: whose ACLs apply to the requests that come through this view for its in-view zones (zone_inview_t) */
+          free_token(&tok);
+          char ivwhat[KARIDNS_VIEW_NAME_MAX + 16];
+          snprintf(ivwhat, sizeof(ivwhat), "view '%s'", view->name);
+          if (parse_in_view_settings(ctx, ivwhat, &view->in_view_settings) != 0) { free_partial_view(view); return -1; }
+        } else if (strcmp(tok.value, "minimal-responses") == 0) {
+          /* batch 8: the clients of a view get the view's value (BIND lib/ns/query.c: client->view->minimalresponses) */
+          free_token(&tok);
+          char mrwhat[KARIDNS_VIEW_NAME_MAX + 16];
+          snprintf(mrwhat, sizeof(mrwhat), "view '%s'", view->name);
+          if (parse_minimal_responses(ctx, mrwhat, &view->minimal_responses) != 0) { free_partial_view(view); return -1; }
+          view->minimal_set = true;
         } else if (strcmp(tok.value, "server") == 0) {
           /* batch 5: the view's own server statements replace the top-level ones as a whole (BIND named_config_get(cfgmaps, "server")) */
           free_token(&tok);
@@ -8216,6 +8430,15 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       zone_config_t *zone = NULL;
       if (parse_zone_block(ctx, &zone) != 0) return -1;
       if (!zone) continue; /* a zone type that is not loaded (zone_type_is_skipped); it does not make the configuration a "top-level zone" one */
+      if (zone->ext && zone->ext->iv) {
+        /* no view is defined before a zone outside every view (BIND keys these zones as "_default") */
+        char iw[DNS_NAME_TEXT_SIZE + 16];
+        snprintf(iw, sizeof(iw), "zone '%.255s'", zone->domain);
+        aml_report(ctx, zone->ext->iv->loc, iw, "'in-view' zone '%.255s' does not exist in view '%.64s', or view '%.64s' is not yet defined",
+                   zone->domain, zone->ext->iv->view, zone->ext->iv->view);
+        free_zone_config(zone);
+        return -1;
+      }
       int ins = zone_cfg_index_insert(&config->top_zone_index, zone, NULL);
       if (ins != 0) {
         if (ins > 0) {
@@ -8496,6 +8719,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
     config->zones = NULL;
     config->views = default_view;
   }
+  if (in_view_resolve(ctx, config) != 0) return -1;
   catz_apply(ctx, config);   /* batch 7: catalog-zones { zone "x"; } marks the zones it names (a zone with `catalog-zone yes;` already is one) */
   if (upd_policy_check(ctx, config) != 0) return -1;
 
@@ -9010,6 +9234,7 @@ static zone_ext_t *zone_ext_clone(const zone_ext_t *s) {
   d->forwarders = NULL; d->forwarders_count = 0;
   d->file_format = NULL;
   d->upd_policy = NULL;
+  d->iv = NULL;   /* only the stub of an in-view zone has one; the clone is of a zone that has data */
   d->alias_resolvers = NULL; d->alias_resolvers_count = 0;
   d->ecs_tags = NULL; d->ecs_tag_count = 0;
   d->location_tags = NULL; d->location_tag_count = 0;

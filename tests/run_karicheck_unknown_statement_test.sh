@@ -53,9 +53,10 @@ echo "== view { }"
 check "a plain view" "view \"v\" { match-clients { any; }; zone \"a.test\" { type primary; file \"$T/a.zone\"; }; };" ok
 check "a typo in a view" "view \"v\" { match-clients { any; }; mach-clients { any; }; zone \"a.test\" { type primary; file \"$T/a.zone\"; }; };" error "view 'v': unknown option 'mach-clients'"
 check "an unknown option in a zone of a view" "view \"v\" { zone \"a.test\" { type primary; file \"$T/a.zone\"; nonsense yes; }; };" error "zone 'a.test.': unknown option 'nonsense'"
-for o in recursion dnssec-validation max-cache-size zone-statistics minimal-responses; do
+for o in recursion dnssec-validation max-cache-size zone-statistics; do
     check "BIND option $o in a view" "view \"v\" { match-clients { any; }; $o yes; zone \"a.test\" { type primary; file \"$T/a.zone\"; }; };" warn "view 'v': option '$o' is a BIND option that KariDNS does not implement"
 done
+check "minimal-responses in a view is read (batch 8)" "view \"v\" { match-clients { any; }; minimal-responses yes; zone \"a.test\" { type primary; file \"$T/a.zone\"; }; };" ok
 
 NL=$(printf '\n_'); NL=${NL%_}
 SEC=k7e8vW8f0W4v9B+5Y8f0W4v9B+5Y8f0W4v9B+5Y8f0U=

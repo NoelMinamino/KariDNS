@@ -303,6 +303,20 @@ typedef struct {
   uint8_t check_names;             /* the zone's check-names severity (primary or secondary one, or the zone's own) */
 } zone_veff_t;
 
+/* zone "x" { in-view "v"; };  (BIND 9.20 ARM "zone Statement Grammar"; lib/isccfg/check.c, bin/named/server.c configure_zone()): the zone is the zone
+ * x of the view v, which must be defined earlier.  The statement makes a stub that lives in view_config_t.in_view_zones (not in .zones, so the
+ * code that walks the zone { } blocks never sees it); zone_ext_t.iv hangs off it.  `in-view-settings` (KariDNS) says whose ACLs apply to the
+ * requests that come through the referencing view: IVS_OWNER (BIND) = the owner zone's and the owner view's, IVS_VIEW = the stub's own, the
+ * owner zone's, the referencing view's.  Zone data, DNSSEC, transfers and NOTIFY are the owner zone's in both. */
+enum { IVS_UNSET = 0, IVS_OWNER = 1, IVS_VIEW = 2 };
+typedef struct zone_inview {
+  char *view;                   /* the view that holds the zone (in-view "v"); NULL when only in-view-settings was written */
+  struct zone_config *target;   /* the owner's zone { }, set when the parse ends (not owned) */
+  char *loc;                    /* "file:line" of the in-view statement (messages after the parse) */
+  uint8_t settings;             /* IVS_* written in this zone */
+  bool acl_written;             /* an allow-query / allow-query-on / allow-transfer / allow-update / allow-notify was written (needs IVS_VIEW) */
+} zone_inview_t;
+
 /* S6a: ゾーンごとの「まれに指定する」オプション。ほとんどのゾーン (domain/file/type だけの
  * 主ゾーン) では 1 つも指定しないので、zone_config_t は核だけを持ち、ここに挙げた値は
  * 1 つでも指定したゾーンに限って別のブロックに確保する (zone_config_t.ext)。
@@ -406,6 +420,8 @@ typedef struct zone_ext {
    * of this server's own network). --- */
   ip_port_t *alias_resolvers;
   int alias_resolvers_count;
+  /* zone { in-view "v"; }: the stub of a zone shared with an earlier view (view_config_t.in_view_zones); NULL for every ordinary zone */
+  zone_inview_t *iv;
 } zone_ext_t;
 
 /* transfer-acl-match / update-acl-match values (zone_ext_t) */
@@ -582,6 +598,11 @@ typedef struct view_config {
   xfr_opts_t xo;                /* view { notify-source, transfer-source, min-refresh-time, ... }: replaces options' for the zones of this view that have none of their own */
   zone_vopts_t zv;              /* view { max-records, max-zone-ttl, check-*, ... }: replaces options' for the zones of this view that have none of their own */
   uint16_t max_udp_size;        /* view { max-udp-size }: the UDP response size limit of this view's clients (512..4096), 0 = not written (zone, else options) */
+  uint8_t minimal_responses;    /* view { minimal-responses }: MINIMAL_*, valid when minimal_set (the clients of a view get their view's value: lib/ns/query.c uses client->view->minimalresponses) */
+  bool minimal_set;
+  uint8_t in_view_settings;     /* view { in-view-settings }: IVS_*, 0 = not written (options', else IVS_OWNER) */
+  zone_config_t *in_view_zones; /* the zone { in-view "v"; } stubs of this view, in the order written (not in zones nor zone_index) */
+  zone_cfg_index_t in_view_index;
   bool require_cookie_set, require_cookie;   /* view { require-server-cookie }: replaces options' for this view */
   char **catz_names; int catz_count;   /* view { catalog-zones { zone "name"; } }: the zones of this view that are catalog zones */
   tsig_key_t *keys;             /* view { key }: keys visible to this view only (BIND bin/named/tsigconf.c: the view's ring is the global keys plus these) */
@@ -737,6 +758,9 @@ typedef struct server_config_s {
   bool serve_stale;
   bool send_extended_errors;
   uint8_t minimal_responses;     /* MINIMAL_* */
+  uint8_t in_view_settings;     /* options { in-view-settings }: IVS_*, 0 = not written (IVS_OWNER) */
+  bool any_in_view;             /* some view has a zone { in-view } stub */
+  bool any_view_minimal;        /* some view writes minimal-responses (the query path then looks the view up) */
   bool minimal_any;
   uint32_t minimal_any_ttl;
   uint32_t wire_cache_max_records;
@@ -902,6 +926,17 @@ int zone_cfg_index_insert(zone_cfg_index_t *ix, zone_config_t *z, zone_config_t 
 void zone_cfg_index_free(zone_cfg_index_t *ix);
 /* view 内で domain (末尾ドットの有無、大文字小文字は問わない) のゾーン設定。索引が無ければ線形探索 */
 zone_config_t *view_find_zone_config(const view_config_t *v, const char *domain);
+/* The zone { in-view } stub of that name in the view (NULL = none; the stubs are not found by view_find_zone_config()) */
+zone_config_t *view_find_in_view(const view_config_t *v, const char *domain);
+/* in-view-settings in force for a stub of the view refv: the stub's, else the view's, else options', else IVS_OWNER */
+uint8_t config_in_view_mode(const server_config_t *cfg, const view_config_t *refv, const zone_inview_t *iv);
+/* minimal-responses for the clients of a view: the view's statement, else options' (v may be NULL) */
+static inline uint8_t config_minimal_responses(const server_config_t *cfg, const view_config_t *v) {
+  return v && v->minimal_set ? v->minimal_responses : cfg->minimal_responses;
+}
+/* The names of the views that share the zone `domain` of the view `owner` through a zone { in-view } stub, ", "-separated, written to buf
+ * (truncated with "..." when it does not fit).  Returns the number of such views. */
+int config_in_view_sharers(const server_config_t *cfg, const char *owner, const char *domain, char *buf, size_t cap);
 /* 全ビューのゾーンを、ビューの並び順・ビュー内の並び順で辿る。内側のループだけを抜ける break は使えない */
 #define CONFIG_FOR_EACH_ZONE(cfg, v, z) \
   for ((v) = (cfg)->views; (v); (v) = (v)->next) \
