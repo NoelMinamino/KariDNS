@@ -277,6 +277,20 @@ $DAG r11d-sub.dynupdate.com. A @127.0.0.1 -p $PORT +short +nohexdump > res.txt
 [ ! -s res.txt ] || { echo "[FAIL] R-11 d: update applied after a subset prerequisite"; exit 1; }
 # R-11 f: zone section naming a name below the zone apex -> NOTAUTH
 upd NOTAUTH sub.dynupdate.com --update-add 'x.sub.dynupdate.com 300 IN A 192.0.2.9'
+# batch 11: RESINFO is a singleton type (RFC 9606 section 3; BIND lib/dns/rdataslab.c DNS_R_SINGLETON): an UPDATE that would give a name a
+# second, different RESINFO fails as a whole (BIND lib/ns/update.c replaces_p() does not name RESINFO, so it is not replaced); the same RR
+# again changes nothing
+upd NOERROR dynupdate.com --update-add 'ri.dynupdate.com 300 IN RESINFO "qnamemin"'
+upd NOERROR dynupdate.com --update-add 'ri.dynupdate.com 300 IN RESINFO "qnamemin"'
+upd SERVFAIL dynupdate.com --update-add 'ri.dynupdate.com 300 IN RESINFO "exterr=15-17"' --update-add 'ri2.dynupdate.com 300 IN A 192.0.2.41'
+$DAG ri.dynupdate.com. RESINFO @127.0.0.1 -p $PORT +short +nohexdump > res.txt
+grep -q qnamemin res.txt && ! grep -q exterr res.txt || { echo "[FAIL] RESINFO singleton: the refused UPDATE changed the zone"; cat res.txt; exit 1; }
+$DAG ri2.dynupdate.com. A @127.0.0.1 -p $PORT +short +nohexdump > res.txt
+[ ! -s res.txt ] || { echo "[FAIL] RESINFO singleton: the other record of the refused UPDATE was applied"; exit 1; }
+upd NOERROR dynupdate.com --update-del 'ri.dynupdate.com RESINFO' --update-add 'ri.dynupdate.com 300 IN RESINFO "exterr=15-17"'
+$DAG ri.dynupdate.com. RESINFO @127.0.0.1 -p $PORT +short +nohexdump > res.txt
+grep -q exterr res.txt && ! grep -q qnamemin res.txt || { echo "[FAIL] RESINFO singleton: delete and add in one UPDATE"; cat res.txt; exit 1; }
+echo "[+] RESINFO singleton checked."
 echo "[+] RFC 2136 §3 semantics checked."
 check_asan_log
 

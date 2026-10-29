@@ -1,0 +1,5 @@
+$ORIGIN example.
+$TTL 1h2
+w 1x A 192.0.2.1
+x 99999999999 A 192.0.2.2
+@ SOA ns h 1 2x 3 4 5

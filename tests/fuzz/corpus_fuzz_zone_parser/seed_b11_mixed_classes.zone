@@ -1,0 +1,7 @@
+$ORIGIN example.
+$TTL 60
+@ IN SOA ns h 1 2 3 4 5
+w A 192.0.2.1
+x CH TXT "x"
+y CLASS42 TYPE65280 \# 0
+z hs TXT "z"

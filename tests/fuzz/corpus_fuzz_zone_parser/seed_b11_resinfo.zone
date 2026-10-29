@@ -1,0 +1,7 @@
+$ORIGIN example.
+$TTL 60
+@ IN SOA ns h 1 2 3 4 5
+r RESINFO "qnamemin"
+R resinfo "exterr=15-17"
+r RESINFO "qnamemin"
+r2 RESINFO a b
