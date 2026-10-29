@@ -231,6 +231,7 @@ logging {
 	category default { default_log; };
 };
 
+key "rndc-key" { algorithm hmac-sha256; secret "c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0MTIzNDU2"; };   // the key the controls statement names (BIND check_controls() refuses an undefined one)
 controls { inet 127.0.0.1 port 953 allow { 127.0.0.1; } keys { "rndc-key"; }; };
 EOF
 OUT=$("$KARICHECK" conf "$W/etc/s2.conf" 2>&1); RC=$?

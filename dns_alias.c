@@ -11,7 +11,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
-#include <syslog.h>
+#include "dns_log.h"
 #include <time.h>
 #include <unistd.h>
 

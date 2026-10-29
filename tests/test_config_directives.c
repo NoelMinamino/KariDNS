@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/types.h>
+#include <syslog.h>
 
 #include "../dns_config_parser.h"
 #include "test_zext.h"
@@ -1102,12 +1103,12 @@ static void test_logging_channels(void) {
             CHECK(q->versions == 5);
             CHECK(q->size_limit == 10ULL * 1024 * 1024);
             CHECK(q->suffix_timestamp == true);
-            CHECK(q->print_time == true && q->print_category == true && q->print_severity == false);
+            CHECK(q->time_fmt == LOGTIME_LOCAL && q->print_category == true && q->print_severity == false);
             CHECK(q->max_qps == 100 && q->max_qps_specified == true);
         }
         if (r) {
             CHECK(r->size_limit == 512ULL * 1024);
-            CHECK(r->print_severity == true && r->print_time == false);
+            CHECK(r->print_severity == true && r->time_fmt == LOGTIME_NONE);
             CHECK(r->max_qps_specified == false);
             CHECK(r->max_qps == 300);                 /* inherits options { query-log-max-qps } */
         }
@@ -1118,23 +1119,15 @@ static void test_logging_channels(void) {
         CHECK(cfg.logging.responses_channel == r);
         free_server_config_fields(&cfg);
     }
-    /* invalid size / versions / max-qps values are reported and ignored; the config is still accepted */
-    if (parse_ok("logging { channel \"x\" { file \"/x\" size -5; }; channel \"y\" { file \"/y\" size abc; }; "
-                 "channel \"z\" { file \"/z\" versions -2 size k; }; "
-                 "channel \"m\" { file \"/m\"; max-qps abc; }; };", &cfg)) {
-        const log_channel_t *x = find_channel(&cfg, "x"), *y = find_channel(&cfg, "y");
-        const log_channel_t *z = find_channel(&cfg, "z"), *m = find_channel(&cfg, "m");
-        CHECK(x && x->size_limit == 0);
-        CHECK(y && y->size_limit == 0);
-        CHECK(z && z->size_limit == 0 && z->versions == 0);
-        CHECK(m && m->max_qps_specified == false);
-        free_server_config_fields(&cfg);
-    }
-    /* unknown statements inside logging / channel are skipped */
-    if (parse_ok("logging { severity dynamic; channel \"c\" { syslog daemon; file \"/c\"; }; };", &cfg)) {
-        CHECK(find_channel(&cfg, "c") != NULL);
-        free_server_config_fields(&cfg);
-    }
+    /* invalid size / versions / max-qps values are errors (they used to be reported and ignored); so are unknown statements and a channel
+     * with two destinations (BIND: "exactly one of file, syslog, null, and stderr must be present") */
+    expect_reject("negative size", "logging { channel \"x\" { file \"/x\" size -5; }; };");
+    expect_reject("size is text", "logging { channel \"y\" { file \"/y\" size abc; }; };");
+    expect_reject("size is a unit only", "logging { channel \"z\" { file \"/z\" size k; }; };");
+    expect_reject("negative versions", "logging { channel \"z\" { file \"/z\" versions -2; }; };");
+    expect_reject("max-qps is text", "logging { channel \"m\" { file \"/m\"; max-qps abc; }; };");
+    expect_reject("unknown statement in logging", "logging { severity dynamic; channel \"c\" { file \"/c\"; }; };");
+    expect_reject("two destinations", "logging { channel \"c\" { syslog daemon; file \"/c\"; }; };");
 
     expect_reject("queries category -> undefined channel",
                   "logging { channel \"a\" { file \"/a\"; }; category queries { nope; }; };");
@@ -1513,32 +1506,38 @@ static void test_boolean_statements_everywhere(void) {
     /* print-time true used to be read as "no" (only the word yes was accepted) */
     if (parse_ok("logging { channel q { file \"/tmp/q.log\"; print-time true; print-category 1; print-severity YES; }; };", &cfg)) {
         const log_channel_t *c = cfg.logging.channels;
-        CHECK(c && c->print_time == true && c->print_category == true && c->print_severity == true);
+        CHECK(c && c->time_fmt == LOGTIME_LOCAL && c->print_category == true && c->print_severity == true);
         free_server_config_fields(&cfg);
     }
     expect_reject("print-time maybe", "logging { channel q { file \"/tmp/q.log\"; print-time maybe; }; };");
 }
 
 static void test_logging_category_lists(void) {
-    printf("[TEST] D-01: category with several channels uses the first one...\n");
+    printf("[TEST] category with several channels (BIND writes to all of them)...\n");
     server_config_t cfg;
     if (parse_ok("logging { channel a { file \"/tmp/a.log\"; }; channel b { file \"/tmp/b.log\"; };"
                  "  category queries { a; b; }; category responses { b; a; }; };", &cfg)) {
         CHECK_STR(cfg.logging.queries_channel_name, "a");
         CHECK(cfg.logging.queries_channel && strcmp(cfg.logging.queries_channel->name, "a") == 0);
         CHECK_STR(cfg.logging.responses_channel_name, "b");
+        CHECK(cfg.logging.cat[LOGC_QUERIES].n == 2 && strcmp(cfg.logging.cat[LOGC_QUERIES].name[1], "b") == 0);
+        CHECK(cfg.logging.queries_enabled && cfg.logging.responses_enabled);
         free_server_config_fields(&cfg);
     }
-    /* an empty list turns the category off; a later definition replaces an earlier one */
-    if (parse_ok("logging { channel a { file \"/tmp/a.log\"; }; category queries { a; }; category queries { }; };", &cfg)) {
-        CHECK(cfg.logging.queries_channel_name == NULL && cfg.logging.queries_channel == NULL);
-        free_server_config_fields(&cfg);
-    }
-    /* only the first channel is used; the others are ignored (with a warning), even undefined ones */
-    if (parse_ok("logging { channel a { file \"/tmp/a.log\"; }; category queries { a; undefined_b; }; };", &cfg)) {
+    /* a second statement for a category adds channels (isc_log_usechannel() appends); an empty list adds none */
+    if (parse_ok("logging { channel a { file \"/tmp/a.log\"; }; channel b { file \"/tmp/b.log\"; };"
+                 "category queries { a; }; category queries { b; }; category queries { }; };", &cfg)) {
+        CHECK(cfg.logging.cat[LOGC_QUERIES].n == 2);
         CHECK_STR(cfg.logging.queries_channel_name, "a");
         free_server_config_fields(&cfg);
     }
+    /* only an empty list: the category is not configured, the query log stays off */
+    if (parse_ok("logging { category queries { }; };", &cfg)) {
+        CHECK(cfg.logging.queries_channel_name == NULL && cfg.logging.queries_channel == NULL);
+        CHECK(!cfg.logging.queries_enabled);
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("a channel that is not defined", "logging { channel a { file \"/tmp/a.log\"; }; category queries { a; undefined_b; }; };");
     expect_reject("category list without ';'", "logging { channel a { file \"/tmp/a.log\"; }; category queries { a b; }; };");
     expect_reject("category without braces", "logging { channel a { file \"/tmp/a.log\"; }; category queries a; };");
     expect_reject("unterminated channel (no leak of the channel)", "logging { channel a { file \"/tmp/a.log\"; print-time maybe; ");
@@ -2817,7 +2816,7 @@ static void test_strict_options_and_key(void) {
         {"minimal-responses", "minimal-responses yes;"}, {"minimal-any", "minimal-any yes;"},
         {"additional-from-auth", "additional-from-auth yes;"}, {"query-log-max-qps", "query-log-max-qps 10;"},
         {"query-log-buffer-size", "query-log-buffer-size 4096;"}, {"allow-program-zones", "allow-program-zones yes;"},
-        {"max-mqtypes", "max-mqtypes 3;"}, {"minimal-any-ttl", "minimal-any-ttl 300;"},
+        {"max-mqtypes", "max-mqtypes 3;"}, {"querylog", "querylog yes;"}, {"minimal-any-ttl", "minimal-any-ttl 300;"},
         {"wire-cache-max-records", "wire-cache-max-records 100;"}, {"alias-resolver", "alias-resolver { 192.0.2.53; };"},
         {"ixfr-history", "ixfr-history 10;"}, {"max-zone-records", "max-zone-records 100000;"},
         {"max-zone-bytes", "max-zone-bytes 1m;"}, {"tcp-mss", "tcp-mss 1220;"}, {"tcp-window", "tcp-window 65536;"},
@@ -2901,8 +2900,9 @@ static void test_strict_options_and_key(void) {
     snprintf(txt, sizeof(txt), "key \"k\" { algorithm hmac-sha256; secret \"%s\"; secret \"%s\"; };", SECRET_OK, SECRET_OK);
     expect_an_error("secret twice", txt, "'secret' is given twice");
 
-    /* logging { } and unknown top-level statements still skip unknowns (out of scope) */
-    if (parse_ok("logging { frobnicate yes; }; frobnicate-block { a; };", &cfg)) free_server_config_fields(&cfg);
+    /* logging { } is strict since batch 6; unknown top-level statements still skip unknowns (out of scope) */
+    expect_an_error("unknown statement in logging", "logging {\n frobnicate yes;\n};", "line 2|logging|unknown statement 'frobnicate'");
+    if (parse_ok("frobnicate-block { a; };", &cfg)) free_server_config_fields(&cfg);
 }
 
 /* ---- BIND compatibility, batch 1: directory, class after zone / view names, zone types that are not loaded, port errors ----
@@ -3173,6 +3173,352 @@ static void test_bind_compat_paths(void) {
     expect_an_error("masters port", "zone \"s\" { type secondary; primaries { 192.0.2.1 port 65536; }; };", "port|1-65535");
 }
 
+/* ---- BIND compatibility, batch 6: logging { }, querylog, controls { }, statistics-channels ----
+ * Expectations from the BIND 9.20.4 source: lib/isccfg/namedconf.c (channel_clauses, logfile_fields / parse_logfile(), parse_logseverity() with
+ * loglevel_enums, printtime_enums, logsuffix_enums, logversions_enums, size_enums, cfg_type_controls / inetcontrol_fields /
+ * controls_sockaddr_flags), lib/isccfg/check.c (check_logging(): one destination, "undefined category", "undefined channel"; check_controls():
+ * "unknown key", "already defined", "unix control ... not supported"), bin/named/logconf.c (channel_fromconf(): defaults, facility, print flags,
+ * debug N as the level, versions / size / suffix), lib/isc/syslog.c (the facility names). */
+
+/* parse; `want` fragments (separated by '|') must all be in the messages of a parse that worked */
+static bool ok_with(const char *label, const char *txt, const char *want, server_config_t *cfg) {
+    char msg[4096];
+    int rc = parse_capture(txt, cfg, msg, sizeof(msg));
+    g_checks++;
+    if (rc != 0) {
+        g_failed++;
+        printf("  [FAIL] %s: rejected: %s\n         %s\n", label, txt, msg);
+        return false;
+    }
+    char frag[256];
+    const char *p = want;
+    while (p && *p) {
+        const char *bar = strchr(p, '|');
+        size_t n = bar ? (size_t)(bar - p) : strlen(p);
+        snprintf(frag, sizeof(frag), "%.*s", (int)n, p);
+        g_checks++;
+        if (!strstr(msg, frag)) {
+            g_failed++;
+            printf("  [FAIL] %s: message lacks '%s'; it is: %s\n", label, frag, msg);
+        }
+        p = bar ? bar + 1 : NULL;
+    }
+    return true;
+}
+
+static void expect_silent(const char *label, const char *txt, server_config_t *cfg) {
+    char msg[4096];
+    int rc = parse_capture(txt, cfg, msg, sizeof(msg));
+    g_checks += 2;
+    if (rc != 0) { g_failed++; printf("  [FAIL] %s: rejected: %s\n", label, msg); return; }
+    if (msg[0]) { g_failed++; printf("  [FAIL] %s: not silent: %s\n", label, msg); }
+}
+
+static void test_bind_logging(void) {
+    printf("[*] logging { } (BIND 9.20), querylog, controls { }...\n");
+    server_config_t cfg;
+
+    /* a configuration that uses every clause, in the shapes the ARM shows */
+    if (ok_with("full logging statement",
+                "logging {\n"
+                "  channel simple_log { file \"/var/log/named/some_file\" versions 3 size 20m; severity warning; print-time yes; print-severity yes; print-category yes; };\n"
+                "  channel audit_log { file \"/var/log/named/audit.log\" size 5m suffix timestamp versions unlimited; severity info; print-time iso8601-utc; };\n"
+                "  channel syslog_ch { syslog LOCAL5; severity notice; };\n"
+                "  channel err { stderr; severity debug 3; print-time local; buffered no; };\n"
+                "  channel off { null; };\n"
+                "  channel dbg { stderr; severity debug; };\n"
+                "  channel dyn { stderr; severity dynamic; print-time iso8601; };\n"
+                "  channel crit { syslog; severity critical; };\n"
+                "  category default { simple_log; default_syslog; };\n"
+                "  category xfer-in { audit_log; };\n"
+                "  category queries { err; off; };\n"
+                "  category security { syslog_ch; default_stderr; default_debug; null; };\n"
+                "};\n", "", &cfg)) {
+        const log_channel_t *s = find_channel(&cfg, "simple_log"), *a = find_channel(&cfg, "audit_log");
+        const log_channel_t *y = find_channel(&cfg, "syslog_ch"), *e = find_channel(&cfg, "err"), *o = find_channel(&cfg, "off");
+        const log_channel_t *d = find_channel(&cfg, "dbg"), *dy = find_channel(&cfg, "dyn"), *cr = find_channel(&cfg, "crit");
+        CHECK(s && s->dest == LOGDEST_FILE && s->versions == 3 && s->size_limit == 20ULL * 1024 * 1024 && !s->suffix_timestamp);
+        CHECK(s && s->level == LOG_LVL_WARNING && s->time_fmt == LOGTIME_LOCAL && s->print_severity && s->print_category);
+        CHECK(a && a->versions == LOG_VERSIONS_UNLIMITED && a->suffix_timestamp && a->time_fmt == LOGTIME_ISO8601_UTC);
+        CHECK(a && a->level == LOG_LVL_INFO && !a->print_category && !a->print_severity);
+        CHECK(y && y->dest == LOGDEST_SYSLOG && y->syslog_facility == LOG_LOCAL5 && y->level == LOG_LVL_NOTICE && y->time_fmt == LOGTIME_NONE);
+        CHECK(e && e->dest == LOGDEST_STDERR && e->level == 3 && e->time_fmt == LOGTIME_LOCAL && !e->buffered);
+        CHECK(o && o->dest == LOGDEST_NULL && o->level == LOG_LVL_INFO);            /* BIND: info when severity is not written */
+        CHECK(d && d->level == 1);                                                  /* `debug` alone is debug 1 */
+        CHECK(dy && dy->level == LOG_LVL_DYNAMIC && dy->time_fmt == LOGTIME_ISO8601);
+        CHECK(cr && cr->dest == LOGDEST_SYSLOG && cr->syslog_facility == LOG_DAEMON && cr->level == LOG_LVL_CRITICAL);
+        CHECK(cfg.logging.cat[LOGC_DEFAULT].n == 2 && strcmp(cfg.logging.cat[LOGC_DEFAULT].name[1], "default_syslog") == 0);
+        CHECK(cfg.logging.cat[LOGC_XFER_IN].n == 1 && cfg.logging.cat[LOGC_SECURITY].n == 4);
+        CHECK(cfg.logging.queries_enabled && !cfg.logging.responses_enabled);
+        free_server_config_fields(&cfg);
+    }
+    /* the defaults of a channel: a file with nothing else (ROLLNEVER, no size), info, no prefixes */
+    if (ok_with("channel defaults", "logging { channel c { file \"/tmp/c.log\"; }; };", "", &cfg)) {
+        const log_channel_t *c = find_channel(&cfg, "c");
+        CHECK(c && c->versions == LOG_VERSIONS_UNSET && c->size_limit == 0 && !c->suffix_timestamp && c->level == LOG_LVL_INFO);
+        CHECK(c && c->time_fmt == LOGTIME_NONE && !c->print_category && !c->print_severity && !c->buffered);
+        free_server_config_fields(&cfg);
+    }
+
+    /* every severity word, in any case; debug with and without a level; debug 0 is dynamic */
+    static const struct { const char *text; int level; } sev[] = {
+        { "critical", LOG_LVL_CRITICAL }, { "ERROR", LOG_LVL_ERROR }, { "Warning", LOG_LVL_WARNING }, { "notice", LOG_LVL_NOTICE },
+        { "info", LOG_LVL_INFO }, { "dynamic", LOG_LVL_DYNAMIC }, { "debug", 1 }, { "debug 1", 1 }, { "debug 99", 99 }, { "debug 0", 0 },
+    };
+    for (size_t i = 0; i < sizeof(sev) / sizeof(sev[0]); i++) {
+        char txt[200];
+        snprintf(txt, sizeof(txt), "logging { channel c { null; severity %s; }; };", sev[i].text);
+        if (ok_with(sev[i].text, txt, "", &cfg)) {
+            const log_channel_t *c = find_channel(&cfg, "c");
+            CHECK_MSG(c && c->level == sev[i].level, "severity %s", sev[i].text);
+            free_server_config_fields(&cfg);
+        }
+    }
+    expect_an_error("severity word", "logging { channel c { null; severity loud; }; };", "line 1|severity: invalid severity 'loud'");
+    expect_an_error("debug level", "logging { channel c { null; severity debug x; }; };", "invalid debug level");
+    expect_an_error("negative debug level", "logging { channel c { null; severity debug -1; }; };", "invalid debug level");
+
+    /* print-time: booleans in every spelling, local, iso8601, iso8601-utc */
+    static const struct { const char *text; log_time_t fmt; } pt[] = {
+        { "yes", LOGTIME_LOCAL }, { "true", LOGTIME_LOCAL }, { "1", LOGTIME_LOCAL }, { "no", LOGTIME_NONE }, { "false", LOGTIME_NONE },
+        { "0", LOGTIME_NONE }, { "local", LOGTIME_LOCAL }, { "iso8601", LOGTIME_ISO8601 }, { "iso8601-utc", LOGTIME_ISO8601_UTC },
+        { "ISO8601-UTC", LOGTIME_ISO8601_UTC },
+    };
+    for (size_t i = 0; i < sizeof(pt) / sizeof(pt[0]); i++) {
+        char txt[200];
+        snprintf(txt, sizeof(txt), "logging { channel c { null; print-time %s; }; };", pt[i].text);
+        if (ok_with(pt[i].text, txt, "", &cfg)) {
+            const log_channel_t *c = find_channel(&cfg, "c");
+            CHECK_MSG(c && c->time_fmt == pt[i].fmt, "print-time %s", pt[i].text);
+            free_server_config_fields(&cfg);
+        }
+    }
+    expect_an_error("print-time value", "logging {\n channel c {\n  null;\n  print-time utc;\n };\n};", "line 4|print-time: invalid value 'utc'");
+
+    /* syslog facilities: all names of lib/isc/syslog.c, case-insensitive; an unknown one is BIND's daemon, with a warning here */
+    static const struct { const char *name; int fac; } facs[] = {
+        { "kern", LOG_KERN }, { "user", LOG_USER }, { "mail", LOG_MAIL }, { "daemon", LOG_DAEMON }, { "auth", LOG_AUTH }, { "syslog", LOG_SYSLOG },
+        { "lpr", LOG_LPR }, { "news", LOG_NEWS }, { "uucp", LOG_UUCP }, { "cron", LOG_CRON }, { "authpriv", LOG_AUTHPRIV }, { "ftp", LOG_FTP },
+        { "local0", LOG_LOCAL0 }, { "local1", LOG_LOCAL1 }, { "local2", LOG_LOCAL2 }, { "local3", LOG_LOCAL3 }, { "local4", LOG_LOCAL4 },
+        { "LOCAL5", LOG_LOCAL5 }, { "local6", LOG_LOCAL6 }, { "local7", LOG_LOCAL7 },
+    };
+    for (size_t i = 0; i < sizeof(facs) / sizeof(facs[0]); i++) {
+        char txt[200];
+        snprintf(txt, sizeof(txt), "logging { channel c { syslog %s; }; };", facs[i].name);
+        if (ok_with(facs[i].name, txt, "", &cfg)) {
+            const log_channel_t *c = find_channel(&cfg, "c");
+            CHECK_MSG(c && c->syslog_facility == facs[i].fac, "facility %s", facs[i].name);
+            free_server_config_fields(&cfg);
+        }
+    }
+    if (ok_with("unknown facility", "logging {\n channel c { syslog nosuch; };\n};", "[WARNING]|line 2|unknown facility 'nosuch'; daemon is used", &cfg)) {
+        const log_channel_t *c = find_channel(&cfg, "c");
+        CHECK(c && c->syslog_facility == LOG_DAEMON);
+        free_server_config_fields(&cfg);
+    }
+
+    /* file clauses: any order, "unlimited" / "default" sizes, the old "MB" spelling, versions 0 */
+    if (ok_with("file clause order", "logging { channel c { file \"/tmp/c\" suffix increment size 1g versions 0; }; };", "", &cfg)) {
+        const log_channel_t *c = find_channel(&cfg, "c");
+        CHECK(c && c->versions == 0 && c->size_limit == 1024ULL * 1024 * 1024 && !c->suffix_timestamp);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("size unlimited", "logging { channel c { file \"/tmp/c\" size unlimited; }; channel d { file \"/tmp/d\" size default; }; };", "", &cfg)) {
+        const log_channel_t *c = find_channel(&cfg, "c"), *d = find_channel(&cfg, "d");
+        CHECK(c && c->size_limit == 0 && d && d->size_limit == 0);
+        free_server_config_fields(&cfg);
+    }
+    /* a size BIND does not take */
+    expect_an_error("size 0x10", "logging { channel c { file \"/tmp/c\" size 0x10; }; };", "invalid size value '0x10'");
+    expect_an_error("size 1t", "logging { channel c { file \"/tmp/c\" size 1t; }; };", "invalid size value '1t'");
+    expect_an_error("size B only", "logging { channel c { file \"/tmp/c\" size 10B; }; };", "invalid size value '10B'");
+    expect_an_error("size too big", "logging { channel c { file \"/tmp/c\" size 99999999999999999999; }; };", "invalid size value");
+    expect_an_error("versions text", "logging { channel c { file \"/tmp/c\" versions many; }; };", "invalid versions value 'many'");
+    expect_an_error("suffix text", "logging { channel c { file \"/tmp/c\" suffix serial; }; };", "invalid suffix 'serial'");
+    expect_an_error("file option twice", "logging { channel c { file \"/tmp/c\" size 1m size 2m; }; };", "'size' is given twice");
+    expect_an_error("file option unknown", "logging { channel c { file \"/tmp/c\" rotate 3; }; };", "file: unknown option 'rotate'");
+    expect_an_error("file path missing", "logging { channel c { file; }; };", "expected a file name");
+    expect_an_error("file path empty", "logging { channel c { file \"\"; }; };", "the file name is empty");
+    expect_an_error("file ';' missing", "logging { channel c { file \"/tmp/c\" versions 3 }; };", "file: expected versions, size, suffix or ';'");
+
+    /* the shape of a channel */
+    expect_an_error("no destination", "logging {\n channel c { severity info; };\n};", "line 2|channel 'c'|exactly one of file, syslog, null, and stderr must be present");
+    expect_an_error("file and null", "logging { channel c { file \"/tmp/c\"; null; }; };", "exactly one of file, syslog, null, and stderr must be present");
+    expect_an_error("stderr and stderr", "logging { channel c { stderr; stderr; }; };", "exactly one of");
+    expect_an_error("clause twice", "logging { channel c { null; severity info; severity error; }; };", "'severity' is given twice");
+    expect_an_error("print-time twice", "logging { channel c { null; print-time yes; print-time no; }; };", "'print-time' is given twice");
+    expect_an_error("print-severity twice", "logging { channel c { null; print-severity yes; print-severity no; }; };", "'print-severity' is given twice");
+    expect_an_error("print-category twice", "logging { channel c { null; print-category yes; print-category no; }; };", "'print-category' is given twice");
+    expect_an_error("buffered twice", "logging { channel c { null; buffered yes; buffered no; }; };", "'buffered' is given twice");
+    expect_an_error("print-severity value", "logging { channel c { null; print-severity maybe; }; };", "print-severity: invalid value 'maybe'");
+    expect_an_error("unknown channel option", "logging {\n channel c {\n null;\n rotate yes;\n };\n};", "line 4|channel 'c'|unknown option 'rotate'");
+    expect_an_error("channel without name", "logging { channel { null; }; };", "expected a channel name");
+    expect_an_error("channel without '{'", "logging { channel c null; };", "expected '{' but found 'null'");
+    expect_an_error("channel ';' missing", "logging { channel c { null; } };", "expected ';' after '}' but found '}'");
+    expect_an_error("clause ';' missing", "logging { channel c { null } };", "expected ';' after null but found '}'");
+    expect_an_error("channel end of file", "logging { channel c { null; ", "expected a channel option or '}' but found end of file");
+    expect_an_error("severity ';' missing", "logging { channel c { null; severity info }; };", "expected ';' after the severity");
+    expect_an_error("statement is a number", "logging { 1 };", "unknown statement '1'");
+    expect_an_error("statement is a block", "logging { { }; };", "expected 'channel', 'category' or '}' but found '{'");
+    expect_an_error("logging ';' missing", "logging { }", "expected ';' after '}' but found end of file");
+    expect_an_error("logging without '{'", "logging;", "logging: expected '{' but found ';'");
+    expect_an_error("max-qps negative", "logging { channel c { null; max-qps -1; }; };", "max-qps: invalid value '-1'");
+
+    /* categories: the names of BIND 9.20.4, nothing else; channels must exist (built-in ones included) */
+    {
+        static const char *const cats[] = {
+            "default", "general", "sslkeylog", "notify", "database", "security", "dnssec", "resolver", "xfer-in", "xfer-out", "dispatch",
+            "lame-servers", "edns-disabled", "rpz", "rate-limit", "cname", "spill", "dnstap", "zoneload", "nsid", "rpz-passthru", "client",
+            "network", "update", "queries", "update-security", "query-errors", "trust-anchor-telemetry", "serve-stale", "responses", "config",
+            "unmatched",
+        };
+        CHECK(sizeof(cats) / sizeof(cats[0]) == LOGC_COUNT);
+        for (size_t i = 0; i < sizeof(cats) / sizeof(cats[0]); i++) {
+            char txt[200];
+            snprintf(txt, sizeof(txt), "logging { category %s { null; }; };", cats[i]);
+            if (ok_with(cats[i], txt, "", &cfg)) {
+                int c = log_category_from_name(cats[i]);
+                CHECK_MSG(c >= 0 && strcmp(log_category_names[c], cats[i]) == 0 && cfg.logging.cat[c].n == 1, "category %s", cats[i]);
+                free_server_config_fields(&cfg);
+            }
+        }
+    }
+    CHECK(log_category_from_name("_placeholder") < 0 && log_category_from_name("Queries") < 0 && log_category_from_name(NULL) < 0);
+    expect_an_error("undefined category", "logging {\n category delegation-only { null; };\n};", "line 2|undefined category: 'delegation-only'");
+    expect_an_error("undefined channel", "logging {\n channel a { null; };\n category queries {\n a;\n nosuch;\n };\n};", "line 5|undefined channel: 'nosuch'");
+    expect_an_error("undefined channel in an empty logging statement", "logging { category default { default_syslog; nosuch_one; }; };", "undefined channel: 'nosuch_one'");
+    expect_an_error("category name missing", "logging { category { null; }; };", "expected a category name");
+    expect_an_error("category without '{'", "logging { category queries null; };", "expected '{' but found 'null'");
+    expect_an_error("category channel ';' missing", "logging { category queries { null }; };", "expected ';' after the channel name but found '}'");
+    expect_an_error("category end ';' missing", "logging { category queries { null; } };", "expected ';' after '}' but found '}'");
+    expect_an_error("category list is a block", "logging { category queries { { }; }; };", "expected a channel name or '}' but found '{'");
+    {
+        /* LOG_ROUTE_MAX channels are the most a category can write to */
+        char txt[1024] = "logging { ";
+        for (int i = 0; i < LOG_ROUTE_MAX + 1; i++) {
+            char one[64];
+            snprintf(one, sizeof(one), "channel n%d { null; }; ", i);
+            strcat(txt, one);
+        }
+        strcat(txt, "category default { ");
+        for (int i = 0; i < LOG_ROUTE_MAX; i++) {
+            char one[32];
+            snprintf(one, sizeof(one), "n%d; ", i);
+            strcat(txt, one);
+        }
+        strcat(txt, "}; };");
+        if (ok_with("the most channels", txt, "", &cfg)) {
+            CHECK(cfg.logging.cat[LOGC_DEFAULT].n == LOG_ROUTE_MAX);
+            free_server_config_fields(&cfg);
+        }
+        txt[strlen(txt) - 5] = '\0';
+        strcat(txt, "n8; }; };");
+        expect_an_error("one channel too many", txt, "more than 8 channels");
+    }
+
+    /* warnings: accepted, with the place */
+    if (ok_with("buffered yes", "logging {\n channel c { null; buffered yes; };\n};", "[WARNING]|line 2|buffered is accepted but has no effect", &cfg))
+        free_server_config_fields(&cfg);
+    if (ok_with("size without versions", "logging {\n channel c { file \"/tmp/c\" size 1m; };\n};",
+                "[WARNING]|line 2|channel 'c'|size without versions: when the file is full no more lines are written", &cfg))
+        free_server_config_fields(&cfg);
+    expect_silent("size with versions", "logging { channel c { file \"/tmp/c\" size 1m versions 2; }; };", &cfg);
+    free_server_config_fields(&cfg);
+    expect_silent("size with a timestamp suffix", "logging { channel c { file \"/tmp/c\" size 1m suffix timestamp; }; };", &cfg);
+    free_server_config_fields(&cfg);
+    if (ok_with("channel defined twice", "logging {\n channel c { null; };\n channel c { stderr; };\n category default { c; };\n};",
+                "[WARNING]|line 3|the channel is defined twice; the later definition is used", &cfg)) {
+        CHECK(find_channel(&cfg, "c") && find_channel(&cfg, "c")->dest == LOGDEST_STDERR);   /* the newest is found first (BIND prepends) */
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("built-in channel replaced", "logging {\n channel default_syslog { syslog local3; };\n};", "[WARNING]|line 2|replaces the built-in channel", &cfg))
+        free_server_config_fields(&cfg);
+    if (ok_with("second logging statement", "logging { channel a { null; }; };\nlogging { channel b { null; }; category default { a; b; }; };",
+                "[WARNING]|line 2|a second logging statement", &cfg)) {
+        CHECK(find_channel(&cfg, "a") && find_channel(&cfg, "b") && cfg.logging.cat[LOGC_DEFAULT].n == 2);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("channel listed twice", "logging { channel a { null; }; category default { a; a; }; };", "[WARNING]|channel 'a' is listed twice", &cfg)) {
+        CHECK(cfg.logging.cat[LOGC_DEFAULT].n == 1);
+        free_server_config_fields(&cfg);
+    }
+    expect_silent("empty logging", "logging { };", &cfg);
+    free_server_config_fields(&cfg);
+
+    /* querylog and the switches the query path reads */
+    expect_silent("querylog yes", "options { querylog yes; };", &cfg);
+    CHECK(cfg.querylog_set && cfg.querylog && cfg.logging.queries_enabled && !cfg.logging.responses_enabled);
+    free_server_config_fields(&cfg);
+    expect_silent("querylog no with a category", "options { querylog no; }; logging { channel q { file \"/tmp/q\"; }; category queries { q; }; };", &cfg);
+    CHECK(cfg.querylog_set && !cfg.querylog && !cfg.logging.queries_enabled && cfg.logging.queries_channel);   /* querylog decides on / off only */
+    free_server_config_fields(&cfg);
+    expect_silent("category queries alone", "logging { channel q { file \"/tmp/q\"; }; category queries { q; }; };", &cfg);
+    CHECK(!cfg.querylog_set && cfg.logging.queries_enabled);                        /* as KariDNS always did */
+    free_server_config_fields(&cfg);
+    expect_silent("a built-in channel for queries", "options { querylog yes; }; logging { category queries { default_stderr; }; };", &cfg);
+    CHECK(cfg.logging.queries_enabled && cfg.logging.queries_channel == NULL && cfg.logging.queries_channel_name &&
+          strcmp(cfg.logging.queries_channel_name, "default_stderr") == 0);
+    free_server_config_fields(&cfg);
+    expect_silent("nothing", "options { };", &cfg);
+    CHECK(!cfg.querylog_set && !cfg.logging.queries_enabled && !cfg.logging.responses_enabled);
+    free_server_config_fields(&cfg);
+    expect_silent("a reload into the same struct forgets the querylog", "options { querylog yes; };", &cfg);
+    free_server_config_fields(&cfg);
+    expect_silent("second parse", "options { };", &cfg);
+    CHECK(!cfg.querylog_set && !cfg.logging.queries_enabled);
+    free_server_config_fields(&cfg);
+    expect_an_error("querylog value", "options { querylog maybe; };", "querylog");
+
+    /* controls { }: BIND's rndc channel.  Checked, then ignored with a warning (karictl has control-channel) */
+    expect_silent("empty controls", "controls { };", &cfg);
+    CHECK(cfg.controls_count == 0);
+    free_server_config_fields(&cfg);
+    if (ok_with("the controls BIND ships",
+                "key \"rndc-key\" { algorithm hmac-sha256; secret \"c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0MTIzNDU2\"; };\n"
+                "controls {\n inet 127.0.0.1 allow { localhost; } keys { rndc-key; };\n};\n",
+                "[WARNING]|line 3|inet 127.0.0.1 port 953: rndc is not supported|has no effect", &cfg)) {
+        CHECK(cfg.controls_count == 1 && cfg.controls[0].nkeys == 1 && strcmp(cfg.controls[0].keys[0], "rndc-key") == 0 && cfg.controls[0].port == 0);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("all the options of an entry",
+                "key k { algorithm hmac-sha256; secret \"c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0MTIzNDU2\"; };\nacl trusted { 192.0.2.0/24; };\n"
+                "controls { inet * port 9953 allow { trusted; !192.0.2.9; 2001:db8::/32; } keys { k; K; } read-only yes;\n"
+                "           inet ::1 port * allow { none; } read-only no;\n"
+                "           inet 192.0.2.1 allow { any; } keys { }; };\n"
+                "controls { inet 192.0.2.2 port 953 allow { any; }; };",
+                "[WARNING]|inet 0.0.0.0 port 9953|inet ::1 port 953|inet 192.0.2.2 port 953", &cfg)) {
+        CHECK(cfg.controls_count == 4 && cfg.controls[0].port == 9953 && cfg.controls[0].nkeys == 2 && strcmp(cfg.controls[0].addr, "0.0.0.0") == 0);
+        CHECK(cfg.controls[1].port == 0 && strcmp(cfg.controls[1].addr, "::1") == 0 && cfg.controls[2].nkeys == 0);
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("unix control", "controls {\n unix \"/var/run/named.sock\" perm 0600 owner 0 group 0;\n};", "line 2|controls|unix control '/var/run/named.sock': not supported");
+    expect_an_error("controls address", "controls { inet nosuchhost allow { any; }; };", "inet: 'nosuchhost' is not an IPv4 or IPv6 address");
+    expect_an_error("controls allow missing", "controls { inet 127.0.0.1; };", "inet 127.0.0.1: expected 'allow' but found ';'");
+    expect_an_error("controls port", "controls { inet 127.0.0.1 port 70000 allow { any; }; };", "invalid port '70000'");
+    expect_an_error("controls port text", "controls { inet 127.0.0.1 port ssh allow { any; }; };", "invalid port 'ssh'");
+    expect_an_error("controls allow list", "controls { inet 127.0.0.1 allow any; };", "expected '{' after allow but found 'any'");
+    expect_an_error("controls allow acl", "controls {\n inet 127.0.0.1 allow { nosuchacl; };\n};", "line 2|nosuchacl");
+    expect_an_error("controls keys order", "controls { inet 127.0.0.1 allow { any; } read-only yes keys { k; }; };", "inet 127.0.0.1: expected ';' but found 'keys'");
+    expect_an_error("controls keys twice", "controls { inet 127.0.0.1 allow { any; } keys { } keys { }; };", "inet 127.0.0.1: expected 'read-only' or ';' but found 'keys'");
+    expect_an_error("controls read-only value", "controls { inet 127.0.0.1 allow { any; } read-only perhaps; };", "read-only: invalid value 'perhaps'");
+    expect_an_error("controls keys block", "controls { inet 127.0.0.1 allow { any; } keys k; };", "expected '{' after keys but found 'k'");
+    expect_an_error("controls key ';' missing", "controls { inet 127.0.0.1 allow { any; } keys { k }; };", "expected ';' after the key name");
+    expect_an_error("controls unknown key", "controls {\n inet 127.0.0.1 allow { any; } keys {\n  nosuchkey;\n };\n};", "line 3|controls|unknown key 'nosuchkey'");
+    expect_an_error("controls duplicate", "controls {\n inet 127.0.0.1 allow { any; };\n inet 127.0.0.1 port 953 allow { none; };\n};", "line 3|inet control socket '127.0.0.1#953': already defined, previous definition: line 2");
+    expect_an_error("controls statement", "controls { snail 1; };", "unknown statement 'snail' (expected inet or unix)");
+    expect_an_error("controls list is a block", "controls { { }; };", "expected 'inet' or '}' but found '{'");
+    expect_an_error("controls without '{'", "controls;", "controls: expected '{' but found ';'");
+    expect_an_error("controls ';' missing", "controls { }", "expected ';' after '}'");
+    expect_an_error("controls entry ';' missing", "controls { inet 127.0.0.1 allow { any; } }", "inet 127.0.0.1: expected 'keys', 'read-only' or ';' but found '}'");
+
+    /* statistics-channels: not implemented, accepted with a warning, whatever it holds */
+    if (ok_with("statistics-channels", "statistics-channels {\n inet 127.0.0.1 port 8053 allow { 127.0.0.1; };\n};\noptions { port 5300; };",
+                "[WARNING]|line 1|statistics-channels|no statistics channel", &cfg)) {
+        CHECK(cfg.port == 5300);
+        free_server_config_fields(&cfg);
+    }
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
     test_defaults();
@@ -3217,6 +3563,7 @@ int main(void) {
     test_primaries_and_notify_mode();
     test_strict_options_and_key();
     test_bind_compat_paths();
+    test_bind_logging();
 
     printf("[*] %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) {

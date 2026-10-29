@@ -183,8 +183,8 @@ zone "example.com" {
 - An unknown statement inside `zone { }` or `view { }` is a configuration error (reload and startup fail, `karicheck conf` shows it): it used to be skipped silently, so a typo such as `alow-transfer` left a zone open or closed. Options that BIND 9 documents for those statements but KariDNS does not implement (`allow-query`, `inline-signing`, `dnssec-policy`, `auto-dnssec`, `key-directory`, `max-journal-size`, `zone-statistics`, `check-names`, `recursion`, ...) are skipped with a warning. An unknown key in `control-channel { }` is a configuration error as well. So is an unknown statement in `options { }` and in `key { }`, with the file and line (`[ERROR] karidns.conf:12: options: unknown option 'bind-adress' ...`): a misspelt `bind-address`, `user`, `pid-file`, `secret` or `algorithm` used to have no effect. The options that BIND 9.18 or 9.20 documents for `options { }` but KariDNS does not implement (`recursion`, `allow-transfer`, `version`, `forwarders`, ...; the list is the union of the two ARMs plus the options of older BIND versions) are skipped with a warning (`[WARNING] karidns.conf:3: options: 'recursion' is a BIND option that KariDNS does not implement; it is ignored`). `key { }` takes `algorithm` and `secret`, each once, and both are required (BIND does too): a key that lacks one, or has any other statement, is an error. Unknown statements in `logging` and in unknown top-level blocks are still skipped without a message.
 - Zone names are normalized to their fully qualified form (a trailing `.` is added), so `"example.com"` and `"example.com."` are the same zone. A class after the zone or view name is accepted as in BIND 9.20 (`zone "example.com" IN { ... };`, `view "v" IN { ... };`): `IN` in any letter case is ignored, any other class (`CH`, `HS`, `CLASSnn`, ...) is a configuration error with the file and line (`zone 'example.com.': class 'CH' is not supported (only IN)`).
 - Relative file paths (zone `file`, log `file`, `pid-file`, the `control-channel` and `dnstap` sockets, `database-file`, `conninfo-file`, `include`, `$INCLUDE`) are resolved against `options { directory "<dir>"; }` when it is written (BIND 9.20: "all relative paths use this directory as a base"; see the option below), otherwise against the working directory `karidns` was started from, including paths that contain `../`. **Working directory.** As BIND does, `karidns` changes into `options { directory }` once, when it starts (a missing or unreadable directory is a start-up error), and `daemonize()` does not change directory (it used to `chdir("/")`): the daemon keeps the directory it was started in, or `directory`, so that a relative name means the same before and after it daemonizes. This is what the UNIX socket paths of `control-channel` and `dnstap` rely on: they are used as written, not made absolute (a UNIX socket path holds only 103 bytes, `sun_path`), so a relative `socket "karidns.sock";` is created in, and connected from, that directory; a path longer than 103 bytes is a start-up error with a message (before the daemon forks, so it reaches the terminal). The cost is the one BIND has: that directory's file system stays busy (it cannot be unmounted while `karidns` runs), and a core dump is written there. A reload never changes directory. The paths handed to something that does not share the working directory are made absolute at start-up (against `directory`, else the starting directory): `pid-file` (also `-P`), and `loader-path`, `database-file` and `conninfo-file` of `options { database }` (`karidns-dbloader` runs as `loader-user` and is started from `/`; so are the `type program` plugins). Exceptions: `program` stays absolute-only, and a path given on the command line (`-c`, `-P`) is relative to the directory `karidns` was started from, even when `options { directory }` is set. The server opens the directories of zone and log files when it starts, before it enters the Capsicum sandbox; a zone or log file that a reload adds in a directory the server has not used before cannot be opened unless it lies below `directory` or below the directory of a zone file that was loaded at start-up (those trees are reached through the directory file descriptors opened then, with `openat()`) (the zone answers SERVFAIL and `karictl reload` / `reconfig` report it) until the next restart.
-- Unknown statements and options in `logging` and in unknown top-level blocks are skipped silently (up to the next `;` at the same block level; not in `options`, `key`, `zone`, `view` and `control-channel`, see above), so a misspelled option has no effect. Use [`karicheck conf`](karicheck.md) to validate a configuration.
-- Settings that are fixed when the server starts (`port`, `bind-address`, `listen-on`, `listen-on-v6`, `user`, `group`, `pid-file`, `udp-recvbuf-size`, `udp-sndbuf-size`, `tcp-window`, the `control-channel` socket path, `dnstap`, the `type program` zone processes, and the interface snapshot that `localhost` / `localnets` in address match lists are evaluated against) need a restart; a reload (`SIGHUP`, `karictl reload` / `reconfig`) applies everything else. When a reload changes one of them, the server logs a warning that names it, and `karictl` shows it as `OK (restart needed for: ...)`.
+- Unknown top-level blocks are skipped silently (up to the next `;` at the same block level), so a misspelled statement name has no effect; `options`, `key`, `zone`, `view`, `control-channel`, `logging` and `controls` are strict, see above. Use [`karicheck conf`](karicheck.md) to validate a configuration.
+- Settings that are fixed when the server starts (`port`, `bind-address`, `listen-on`, `listen-on-v6`, `user`, `group`, `pid-file`, `udp-recvbuf-size`, `udp-sndbuf-size`, `tcp-window`, the `control-channel` socket path, `dnstap`, the `type program` zone processes, a log file in a directory that was not open at start-up (see `logging`), and the interface snapshot that `localhost` / `localnets` in address match lists are evaluated against) need a restart; a reload (`SIGHUP`, `karictl reload` / `reconfig`) applies everything else. When a reload changes one of them, the server logs a warning that names it, and `karictl` shows it as `OK (restart needed for: ...)`.
 - A reload that cannot be applied (the file cannot be read, a configuration error, a log file that cannot be opened) keeps the running configuration. A reload whose zone files fail to load applies the configuration and serves SERVFAIL for those zones; the failed zones are logged. If readers of the previous configuration are still active after 10 seconds, the reload is postponed and retried every second until it runs. `SIGHUP` signals that arrive while a reload is running are merged into one reload.
 
 ### Top-level statements
@@ -198,7 +198,9 @@ zone "example.com" {
 | `server <prefix> { ... };` | Settings for the remote servers an address or prefix covers: the TSIG key, source addresses and other options of the requests to them (BIND `server` statement; see `server`). Also allowed inside `view`. |
 | `remote-servers "<name>" [ port <n> ] { ... };` | A named list of servers for `also-notify` (also written `primaries` or `masters`). See `also-notify` and `remote-servers` below. |
 | `control-channel { ... };` | Enables the [`karictl(8)`](karictl.md) control socket. |
-| `logging { ... };` | Log channels and categories. |
+| `logging { ... };` | Log channels and categories (BIND syntax; see `logging`). |
+| `controls { ... };` | BIND's rndc channel: read, checked and ignored (see `controls`). |
+| `statistics-channels { ... };` | BIND's HTTP statistics server: not implemented, skipped with a warning. |
 | `dnstap { ... };` | dnstap output (same block as inside `options`). |
 | `acl "<name>" { ... };` | A named address match list (see Address match lists). |
 | `include "<file>";` | Includes another file. |
@@ -258,6 +260,7 @@ Duplicate zones (in the same view or at top level), duplicate views, duplicate k
 | `allow-program-zones yes\|no;` | `no` | Must be `yes` for `type program` zones to be loaded. |
 | `response-cache-size <size>;` | `32M` | Size of the response cache shared by all worker threads (allocated once at startup; suffixes `K` and `M`, at most `1024M`; an invalid value is a configuration error). Answers are added when they are first asked for: NOERROR authoritative answers of plain queries (no DO bit, ECS, MQTYPE or other options that change the answer) that fit in 512 octets. Every reload, transfer, UPDATE or glue change of a zone, and every configuration reload, gives the zone a new key, so a stale answer is never returned. An answer whose Additional section holds glue taken from another zone of the view (additional-from-auth) is not cached, because the other zone can change without changing the key. Each cached answer takes about 160 octets (the answer itself plus a 32-octet index entry), so `32M` holds about 200,000 answers. `0` disables the cache. Changing it needs a restart. |
 | `wire-cache-max-records <n>;` | `0` (no limit) | Answers of zones with more records than this are not put into the response cache. Answers of tinydns zones and of zones using location/ECS steering are never cached. |
+| `querylog <bool>;` | not set | BIND 9.20: switches the query log on or off (see `logging`). Not set: on when `category queries` lists a channel. |
 | `query-log-max-qps <n>;` | `5000` | Maximum number of query log lines per second, shared by all worker threads (`0` means 5000). Queries over the limit are not logged. |
 | `query-log-buffer-size <n>;` | `32768` | Entries in each worker's query log ring buffer; a power of two between 1024 and 1048576. When a ring is 80 % full, query logging is suspended to protect query processing. |
 | `rate-limit { ... };` | not set (no RRL) | Response Rate Limiting (below). |
@@ -346,31 +349,91 @@ The same syntax is used for `location-tags`. The blocks can be placed in `option
 
 ### `logging { ... }`
 
+The BIND 9.20 `logging` statement (ARM "logging Block Grammar"), with the same meaning: **channels** say where a line goes and how it looks, **categories** say which messages go to which channels.
+
 ```
 logging {
     channel <name> {
-        file "<path>" [versions <n>] [size <n>[K|M|G]] [suffix timestamp];
-        print-time yes|no;
-        print-category yes|no;
-        print-severity yes|no;
-        max-qps <n>;
+        ( file "<path>" [ versions ( <n> | unlimited ) ] [ size <size> ] [ suffix ( increment | timestamp ) ]
+        | syslog [ <facility> ]
+        | stderr
+        | null );
+        severity ( critical | error | warning | notice | info | dynamic | debug [ <n> ] );
+        print-time ( yes | no | local | iso8601 | iso8601-utc );
+        print-category <yes|no>;
+        print-severity <yes|no>;
+        buffered <yes|no>;
+        max-qps <n>;                       // KariDNS: the limit of the query log lines per second through this channel
     };
-    category queries   { <channel>; };
-    category responses { <channel>; };
+    category <name> { <channel>; ... };
 };
 ```
 
-| Item | Description |
+Every channel has exactly one destination (`file`, `syslog`, `stderr` or `null`); `file` takes its options in any order, each once. `severity` defaults to `info`. A line is `<time> <category>: <severity>: <text>`, each part when the channel asks for it (`print-time` `yes` or `local`: `28-Oct-2026 12:34:56.789`; `iso8601`: `2026-10-28T12:34:56.789` in local time without a zone, as BIND writes it; `iso8601-utc`: `2026-10-28T03:34:56.789Z`). Control characters in a message (text that came from the network, such as a key name) are written as `?`, so a message cannot start a line of its own. A statement that is not `channel` or `category`, an option a channel does not have, a value that is not valid, a channel with no or two destinations, a category name that BIND 9.20 does not have and a channel name that is not defined (or built in) are configuration errors with the file and line, in `karidns` (start and reload) and in `karicheck conf`.
+
+**Built-in channels** (usable in a `category` without being defined, as in BIND): `default_syslog` (syslog, facility `daemon`, `info`), `default_stderr` (standard error, `info`, with the time), `default_debug` (BIND writes `named.run` with the debug level in force; KariDNS has no debug level, so nothing is written) and `null`. A channel of the file with the name of a built-in channel replaces it (a warning says so). A channel defined twice: the later definition is used (a warning).
+
+**Categories.** The names are those of BIND 9.20.4 (`default`, `general`, `config`, `xfer-in`, `xfer-out`, `notify`, `update`, `update-security`, `security`, `network`, `queries`, `responses`, `query-errors`, `client`, `dispatch`, `dnssec`, `lame-servers`, `rate-limit`, `zoneload`, `database`, `dnstap`, `nsid`, `rpz`, `rpz-passthru`, `cname`, `spill`, `serve-stale`, `edns-disabled`, `resolver`, `trust-anchor-telemetry`, `sslkeylog`, `unmatched`). A category with no `category` statement (or only an empty list) writes to the channels of `category default`; with no `default` category either, to `default_syslog`: that is what a configuration without `logging` does, and it is what KariDNS always did (syslog, facility `daemon`). Several statements for one category add their channels (BIND appends), a category may list up to 8 channels, and a line goes to every channel whose severity admits it.
+
+The messages of the server carry a `[Prefix]` (the part of the program they come from); the prefix selects the category:
+
+| Category | Messages |
 |---|---|
-| `file` | Log file. With `size`, the file is rotated when it would exceed the size: with `versions <n>` the old files are kept as `<path>.0` … `<path>.<n-1>`, without `versions` the file is truncated. With `suffix timestamp`, the file is also rotated daily, and every rotation (daily or by size) renames it to `<path>.YYYYMMDD`; a second rotation on the same day uses `<path>.YYYYMMDD.1`, then `.2`, … (up to `.9999`), so no rotated file is overwritten. With `suffix timestamp` and `versions <n>`, only the `n` newest `<path>.YYYYMMDD[.N]` files are kept and older ones are deleted after each rotation, as BIND does; without `versions` (or with `versions unlimited`) none are deleted. Other files in the directory are never removed. |
-| `print-time`, `print-category`, `print-severity` | Add the timestamp, category and severity to each line (default `no`). |
-| `max-qps` | Per-channel override of `query-log-max-qps` for the `queries` category. |
-| `category queries` | Query log. |
-| `category responses` | Response log. |
+| `config` | Reading and reloading the configuration (`[Config]`). |
+| `xfer-in` | Inbound AXFR / IXFR and the SOA checks of a secondary zone (`[AXFR]`, `[IXFR]`, `[XFR]`). |
+| `xfer-out` | Outbound transfers: a record that does not fit a message, settings that cannot be sent, Extended AXFR that is refused. |
+| `notify` | NOTIFY sent, answered, retried, failed (`[Notify]`). |
+| `update` | Dynamic updates applied or aborted (`[Update]`). |
+| `security` | TSIG errors (`[TSIG]`), DNS cookie problems (`[Cookie]`). |
+| `network` | Socket options and buffer sizes (`[Network]`). |
+| `zoneload` | Loading zone files and building zone images (`[Zone]`, `[ZoneLoader]`, `[Image]`, `[tinydns]`). |
+| `database` | The database zones (`[DB]`). |
+| `rate-limit` | Response rate limiting (`[RRL]`). |
+| `dnstap` | The dnstap output (`[dnstap]`). |
+| `queries` | The query log, one line per query. |
+| `responses` | The response log (KariDNS; BIND 9.20 has a category of that name too). |
+| `general` | Everything else: start-up and shut-down, the processes (`[Manager]`, `[Backend]`, `[Frontend]`, `[Broker]`, `[IPC]`), `karictl` commands (`[Control]`), catalog zones, ALIAS, forwarding, program zones, an expired zone, the log files themselves (`[Logging]`). |
+
+Severities are those of BIND: critical, error, warning, notice, info, and `debug <n>`. KariDNS has no debug level (BIND's `-d`), so nothing is logged at a debug level: the two messages that were `debug` in earlier versions (a NOTIFY that was answered, a zone file left alone by `reconfig` because its mtime is unchanged) are `info` now, which is what `default_syslog` passes. `severity dynamic` therefore passes everything from critical to info.
+
+The other categories are accepted (a configuration written for BIND works) but this authoritative server has nothing to write to them: `client`, `dispatch`, `dnssec`, `lame-servers`, `query-errors`, `update-security`, `nsid`, `rpz`, `rpz-passthru`, `cname`, `spill`, `serve-stale`, `edns-disabled`, `resolver`, `trust-anchor-telemetry`, `sslkeylog`, `unmatched`. `karidns-dbloader` (the database loader process) logs to syslog on its own.
+
+**Query log and response log.** `options { querylog yes; }` switches the query log on and `querylog no;` off; the lines go to the channels of `category queries` (to the `default` category's when there are none, so `querylog yes;` alone logs the queries to syslog). With `querylog` not written, the query log is on when `category queries` lists a channel (BIND leaves it off until `rndc querylog`; KariDNS has always logged queries as soon as the category was configured). The response log is on when `category responses` lists a channel. A line is `client <address>#<port> (<name>): query: <name> <class> <type> <flags>` (`response: ... -> <rcode>` for responses). The rate limit is `query-log-max-qps`, or `max-qps` of the first channel of the category.
+
+**Files.** The log files are opened when the server starts, before it drops its privileges and enters the Capsicum sandbox; the sandboxed process then writes to the descriptors it holds and rolls the files through the directory descriptors it holds, so a log directory is fixed by the start.
+- `versions <n>`: when the file reaches `size`, `<path>.0` ... `<path>.<n-1>` are shifted up and the file becomes `<path>.0`; `versions unlimited` keeps every old file; `versions 0` empties the file instead (BIND removes it). With `suffix timestamp` the old file is renamed `<path>.YYYYMMDD` (`.1`, `.2`, ... for a second roll on the same day; the file is also rolled when the day changes, which BIND does not do), and `versions <n>` keeps the `n` newest. Other files in the directory are never removed.
+- `size` without `versions` (BIND `ISC_LOG_ROLLNEVER`): when the next line does not fit, **no more lines are written to the file** until it is removed or shorter than `size`; the file is looked at again about once a second. (Earlier KariDNS versions truncated the file; write `versions 0` for that. A warning is given when the configuration is read.) `size` unlimited / absent: the file grows.
+- A file never exceeds `size` (BIND lets the last line pass it).
+- Messages written before the channels exist (the first lines of a start: the version, the warnings and errors found while the configuration is read) go to syslog, like BIND's messages before its `logging` statement is applied; a reload reports what it finds in the configuration through the channels in use.
+- The supervisor, the UDP routers and the connect broker are separate processes: they open the file by name for each line and never roll it, so their lines follow a roll done by the sandboxed process.
+- **Reload.** A reload builds the channels again. A file in a directory that was already open when the server started can be opened; a file in a directory the sandbox cannot reach (a new directory) cannot, and `karictl reload` / `SIGHUP` then keeps the logging in use and reports `restart needed for: logging (a log file in a directory not opened at start-up)`; everything else of the reload is applied. A file that cannot be opened for another reason rejects the reload (the running configuration is kept).
+- Not honoured, accepted with a warning: `buffered yes` (every line is written at once); a `syslog` facility name that does not exist (BIND silently uses `daemon`; so does KariDNS).
 
 **Directories and files (root start).** karidns creates the directory of a log file when it is missing and hands over only a directory it created itself to `user`/`group`; an existing directory keeps its owner and mode (as BIND does): prepare it so that the run user can write to it (and, for a rotation, create files in it). A log file is accepted only when it is a regular file with one link whose owner is root, the user karidns runs as, or the run user; a hard link, another type of file or a file of a third user makes the start (or the reload) fail with `Refusing to use log file`, so that a planted link cannot make karidns append to, or hand over, another file.
 
-Only the `queries` and `responses` categories exist; other categories are ignored with a warning. A category may list several channels (`category queries { a; b; };`), but only the first one is used and the others are ignored with a warning; an empty list (`{ };`) turns the category off. A category that names an undefined channel is an error. Other channel options (such as BIND's `severity`) are ignored. Operational messages go to syslog (facility `daemon`).
+Example: transfers and NOTIFY to a rotated file with the time in UTC, TSIG errors to syslog `auth`, the query log to a file, everything else to syslog:
+
+```
+logging {
+    channel xfers    { file "/var/log/named/xfer.log" versions 5 size 10m; severity info; print-time iso8601-utc; print-category yes; print-severity yes; };
+    channel security { syslog auth; severity notice; };
+    channel qlog     { file "/var/log/named/queries.log" versions 3 size 50m; print-time yes; };
+    category xfer-in  { xfers; };
+    category xfer-out { xfers; };
+    category notify   { xfers; };
+    category security { security; };
+    category queries  { qlog; };
+};
+options { querylog yes; };
+```
+
+### `controls { ... }`
+
+BIND's `rndc` control channel (`controls { inet 127.0.0.1 allow { localhost; } keys { rndc-key; }; };`). KariDNS is controlled by [`karictl`](karictl.md) over [`control-channel`](#control-channel--), whose protocol is not rndc's, so a `controls` statement is **read, checked and ignored**: each `inet` entry gets a warning (`inet 127.0.0.1 port 953: rndc is not supported ... accepted and has no effect`); `controls { };` is silent. The grammar is BIND's: `inet ( <address> | * ) [ port ( <n> | * ) ] allow { <address match list> } [ keys { <name>; ... } ] [ read-only <bool> ];`, in that order; the `allow` list must name defined acls, every key must be a defined top-level `key`, and two entries with the same address and port are an error (BIND `check_controls()`). `unix "<path>" ...;` is an error, as in BIND 9.20 ("unix control ... not supported"). When both `controls` and `control-channel` are written, only `control-channel` has an effect.
+
+### `statistics-channels { ... }`
+
+BIND's HTTP statistics server. KariDNS has none: the statement is accepted and skipped with a warning.
 
 ### `key "<name>" { ... }`
 

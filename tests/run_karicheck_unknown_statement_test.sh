@@ -6,7 +6,7 @@
 # left a zone open or closed.  Now: a statement BIND 9 documents for a zone / view statement but KariDNS does not implement
 # is skipped with a warning; anything else is a configuration error that names the zone or view and the statement, in
 # `karicheck conf` and in `karidns` (startup and reload).  options { } and key { } are strict in the same way since
-# 2026-10-28 (with file:line); unknown statements in logging { } and unknown top-level blocks are still skipped.
+# 2026-10-28 (with file:line); unknown top-level blocks are still skipped (logging { } is strict since batch 6).
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
@@ -76,7 +76,7 @@ check "a key without a secret" "key \"k\" { algorithm hmac-sha256; };" error "ke
 check "a key without an algorithm" "key \"k\" { secret \"$SEC\"; };" error "key 'k': 'algorithm' is missing"
 
 echo "== elsewhere nothing changes"
-check "an unknown option in logging { }" "logging { frobnicate yes; };" ok
+check "an unknown statement in logging { }" "logging {${NL} frobnicate yes;${NL}};" error ":2: logging: unknown statement 'frobnicate'"
 check "an unknown top-level block" "frobnicate-block { a; }; zone \"a.test\" { type primary; file \"$T/a.zone\"; };" ok
 
 echo "== karidns refuses the same configuration"

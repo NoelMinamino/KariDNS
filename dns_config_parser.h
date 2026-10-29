@@ -28,6 +28,7 @@
 #include <sys/types.h>
 #include "dns_wire.h"
 #include "dns_cidr.h"
+#include "dns_logcat.h"
 
 typedef struct {
   char *ip;
@@ -419,31 +420,75 @@ static inline const zone_ext_t *zext(const zone_config_t *z) {
 zone_ext_t *zone_ext_mut(zone_config_t *z);
 
 
+/* `logging { channel <name> { ... }; }` (BIND 9.20 ARM "logging Block Grammar", lib/isccfg/namedconf.c channel_clauses).  The parse fills in
+ * everything but fd / current_size / current_date; the server copies the channels into its own runtime (dns_log.c) and opens the files
+ * there, so the parsed channels never hold a descriptor. */
+typedef enum { LOGDEST_FILE = 0, LOGDEST_SYSLOG, LOGDEST_STDERR, LOGDEST_NULL } log_dest_t;
+typedef enum { LOGTIME_NONE = 0, LOGTIME_LOCAL, LOGTIME_ISO8601, LOGTIME_ISO8601_UTC } log_time_t;
+
+/* `versions` of a file: not written (BIND ISC_LOG_ROLLNEVER), `versions unlimited` (ISC_LOG_ROLLINFINITE), else the number (0 = the file
+ * is not kept when it is rolled).  A zeroed channel therefore means "versions 0". */
+#define LOG_VERSIONS_UNSET (-1)
+#define LOG_VERSIONS_UNLIMITED (-2)
+
 typedef struct log_channel {
   char *name;
+  log_dest_t dest;
+  int syslog_facility;        /* LOG_DAEMON etc.: the facility of `syslog <facility>` (0 = LOG_KERN, which is a facility like any other) */
+  int level;                  /* the `severity`: LOG_LVL_CRITICAL .. LOG_LVL_INFO, LOG_LVL_DYNAMIC, or N > 0 for `debug N` */
   char *file_path;
   int versions;
-  size_t size_limit;
+  size_t size_limit;          /* 0 = unlimited */
   bool suffix_timestamp;
-  bool print_time;
+  log_time_t time_fmt;        /* print-time */
   bool print_category;
   bool print_severity;
+  bool buffered;              /* accepted; no effect (every line is written at once) */
   uint32_t max_qps;
   bool max_qps_specified;
+  int line;                   /* where the channel was defined (messages of the runtime) */
   int fd;
   size_t current_size;
   int current_date;
+  bool size_reached;          /* a file with a size limit and no versions is full: nothing is written until it is shorter (BIND FILE_MAXREACHED) */
+  time_t size_recheck;        /* when the file was last looked at while it was full */
   pthread_mutex_t lock;
   struct log_channel *next;
 } log_channel_t;
 
+/* the channels one category writes to (names, so that the runtime can bind them to its own copies); n == 0: no statement */
+#define LOG_ROUTE_MAX 8
+typedef struct {
+  int n;
+  char *name[LOG_ROUTE_MAX];
+} log_cat_cfg_t;
+
 typedef struct {
   log_channel_t *channels;
+  log_cat_cfg_t cat[LOGC_COUNT];   /* every `category` statement of the name, in the order written (BIND appends) */
+  bool seen;                       /* a logging statement was read */
+  /* the first channel of `category queries` / `category responses` when it is a channel of the file (NULL: a built-in channel, or none) */
   char *queries_channel_name;
   log_channel_t *queries_channel;
   char *responses_channel_name;
   log_channel_t *responses_channel;
+  /* the query log is on: `querylog yes`, or (querylog not written) a `category queries` that lists a channel; the response log is on
+   * when `category responses` lists one.  The query path reads only these two. */
+  bool queries_enabled;
+  bool responses_enabled;
 } logging_config_t;
+
+/* One `controls { inet ...; }` entry as written (BIND 9.20 lib/isccfg/namedconf.c inetcontrol_fields).  karictl uses control-channel; these
+ * are only checked and then ignored. */
+typedef struct {
+  char loc[240];       /* "file:line" of the entry */
+  char addr[48];       /* the address as written ("*" kept) */
+  int port;            /* 0 = not written (rndc: 953) */
+  aml_t *allow;        /* the allow list; names are resolved when the parse ends */
+  char **keys;         /* keys { } */
+  int nkeys;
+  char **key_loc;      /* "file:line" of each key name */
+} controls_inet_t;
 
 typedef struct {
   bool enabled;
@@ -612,6 +657,10 @@ typedef struct server_config_s {
   xfr_source_t *xfr_sources;    /* every distinct source address the configuration names, computed when the parse ends (config_collect_xfr_sources()) */
   int xfr_source_count;
   logging_config_t logging;
+  bool querylog_set;            /* options { querylog }: written */
+  bool querylog;                /* its value (BIND: when not written, the query log is off until rndc querylog; KariDNS: on when category queries lists a channel) */
+  controls_inet_t *controls;    /* controls { inet ...; } entries (checked, then ignored: karictl has its own control channel) */
+  int controls_count;
   control_channel_config_t control;
   dnstap_config_t dnstap;
   database_config_t database;  /* options { database { } }; .enabled == false when absent */

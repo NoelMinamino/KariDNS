@@ -1,6 +1,7 @@
 #define OPENSSL_SUPPRESS_DEPRECATED 1
 #include "dns_tsig_acl.h"
 #include "dns_server_internal.h"
+#include "dns_log.h"
 #include "dns_utils.h"
 
 #include <string.h>

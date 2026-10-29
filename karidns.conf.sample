@@ -97,7 +97,19 @@ logging {
         print-severity yes;
     };
     category queries { queries_log; };
+
+    // BIND と同じ書き方で運用メッセージも振り分けられます (docs/karidns.md "logging")。
+    // 何も書かなければ、運用メッセージはこれまでどおり syslog (facility daemon) に出ます。
+    // channel xfers { file "/var/log/named/xfer.log" versions 5 size 10m; severity info; print-time iso8601-utc; print-category yes; print-severity yes; };
+    // channel auth  { syslog auth; severity notice; };
+    // category xfer-in { xfers; };  category xfer-out { xfers; };  category notify { xfers; };
+    // category security { auth; };
 };
+
+// options { querylog yes; };   // クエリログの入切 (BIND と同じ)。書かなければ category queries があるときだけ有効
+
+// BIND の rndc 用 controls は読み込んで検査しますが、効果はありません (制御は karictl と control-channel)。
+// controls { inet 127.0.0.1 allow { localhost; } keys { rndc-key; }; };
 
 // karictl コントロールチャネルの設定
 // karictlコマンドによる動的リロードやステータス確認を許可する場合に設定します

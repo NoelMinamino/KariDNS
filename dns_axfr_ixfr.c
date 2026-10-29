@@ -27,7 +27,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-#include <syslog.h>
+#include "dns_log.h"
 #include <time.h>
 #include <unistd.h>
 
@@ -1742,7 +1742,7 @@ static int axfr_emit_item(axfr_emit_ctx_t *ec, const dns_record_t *rec, const zo
     register_wire_name_for_compression(ec->res, DNS_HEADER_SIZE, &ec->comp_ctx);
 
     if (axfr_write_item(ec, rec, img, rr) < 0) {
-      syslog(LOG_ERR, "[AXFR] Record too large to fit in any TCP message (name=%s type=%u), aborting transfer",
+      kdns_logc(LOGC_XFER_OUT, LOG_ERR, "[AXFR] Record too large to fit in any TCP message (name=%s type=%u), aborting transfer",
              img ? zone_image_name_text(img, zone_image_rr_name(img, rr)) : (rec->name ? rec->name : "(null)"),
              img ? zone_image_rr_type(img, rr) : rec->type_code);
       return -1;
@@ -1877,7 +1877,7 @@ static int axfr_emit_settings(axfr_emit_ctx_t *ec, const zone_db_entry_t *entry,
   rcu_aux_read_unlock();
   int rc = 0;
   if (len == (size_t)-1)
-    syslog(LOG_WARNING, "[AXFR] zone '%s': the settings of the zone are longer than %u octets and are not sent", entry->domain, KARIDNS_SETTINGS_MAX);
+    kdns_logc(LOGC_XFER_OUT, LOG_WARNING, "[AXFR] zone '%s': the settings of the zone are longer than %u octets and are not sent", entry->domain, KARIDNS_SETTINGS_MAX);
   else if (len > 0)
     rc = xext_emit_settings(&ec->xe, text, len);
   free(text);
@@ -2032,7 +2032,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
    * standard AXFR is unaffected. */
   const bool soa_multi = zone_has_multiple_or_restricted_soa(current_zone);
   if (is_extended_axfr && !v3 && soa_multi) {
-    syslog(LOG_WARNING, "[AXFR] zone '%s': Extended AXFR refused: the zone has several or restricted SOA records "
+    kdns_logc(LOGC_XFER_OUT, LOG_WARNING, "[AXFR] zone '%s': Extended AXFR refused: the zone has several or restricted SOA records "
            "(location, time stamp, tag) and the requester speaks version 2 of the extended format, which cannot carry them "
            "(upgrade the secondary)", entry->domain);
     free(res);
