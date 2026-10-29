@@ -34,6 +34,7 @@
 #include "test_zext.h"
 #include "../dns_utils.h"
 #include "../dns_tsig_acl.h"
+#include "../dns_zone_parser.h"
 
 /* dns_config_parser.c calls this through the privileged-directory cache in the real server. */
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) {
@@ -188,12 +189,12 @@ static void test_numeric_directives(void) {
     printf("[TEST] numeric options directives: valid values and boundaries...\n");
     server_config_t cfg;
 
-    if (parse_ok("options { tcp-initial-timeout 1500; tcp-idle-timeout 4294967295; };", &cfg)) {
+    if (parse_ok("options { tcp-initial-timeout 1500ms; tcp-idle-timeout 4294967295ms; };", &cfg)) {
         CHECK(cfg.tcp_initial_timeout == 1500);
         CHECK(cfg.tcp_idle_timeout == 4294967295u);
         free_server_config_fields(&cfg);
     }
-    if (parse_ok("options { port 5353; tcp-idle-timeout 0; query-log-max-qps 250; "
+    if (parse_ok("options { port 5353; tcp-idle-timeout 0ms; query-log-max-qps 250; "
                  "minimal-any-ttl 300; wire-cache-max-records 12345; };", &cfg)) {
         CHECK(cfg.port == 5353);
         CHECK(cfg.tcp_idle_timeout == 0);
@@ -2810,7 +2811,7 @@ static void test_strict_options_and_key(void) {
         {"location-tags", "location-tags { tag \"a\" { 192.0.2.0/24; }; };"},
         {"send-extended-errors", "send-extended-errors yes;"}, {"serve-stale", "serve-stale yes;"},
         {"rfc10029-mqtype", "rfc10029-mqtype yes;"}, {"tcp-connection-reuse", "tcp-connection-reuse yes;"},
-        {"tcp-idle-timeout", "tcp-idle-timeout 5000;"}, {"tcp-initial-timeout", "tcp-initial-timeout 5000;"},
+        {"tcp-idle-timeout", "tcp-idle-timeout 5000ms;"}, {"tcp-initial-timeout", "tcp-initial-timeout 5000ms;"},
         {"cookie-secret", "cookie-secret \"00112233445566778899aabbccddeeff\";"},
         {"cookie-algorithm", "cookie-algorithm siphash24;"}, {"nsid", "nsid \"ns1.example\";"},
         {"minimal-responses", "minimal-responses yes;"}, {"minimal-any", "minimal-any yes;"},
@@ -2851,10 +2852,10 @@ static void test_strict_options_and_key(void) {
     /* a BIND option KariDNS does not implement: warning, skipped, the rest of options { } still applies */
     static const char *const bind_only[] = {
         "recursion no;",
-        "min-transfer-rate-in 10240 5;" /* BIND 9.20 only; not implemented */, "version none;", "dnssec-validation auto;", "forwarders { 192.0.2.1; };",
+        "min-transfer-rate-in 10240 5;" /* BIND 9.20 only; not implemented */, "zero-no-soa-ttl yes;", "dnssec-validation auto;", "forwarders { 192.0.2.1; };",
         "max-cache-size 100m;", "allow-new-zones yes;", "dnssec-enable yes;" /* BIND 9.16 and older */,
         "allow-proxy { any; };" /* BIND 9.20 only */, "use-alt-transfer-source no;" /* BIND 9.18 only */,
-        "check-names primary ignore;", "tkey-dhkey \"k\" 1;",
+        "reuseport yes;", "tkey-dhkey \"k\" 1;",
     };
     for (size_t i = 0; i < sizeof(bind_only) / sizeof(bind_only[0]); i++) {
         snprintf(txt, sizeof(txt), "options {\n %s\n port 5300;\n};", bind_only[i]);
@@ -3519,8 +3520,574 @@ static void test_bind_logging(void) {
     }
 }
 
+/* ---- BIND compatibility, batch 7: option values.  Expectations from the BIND 9.20.4 source (bin/named/server.c, lib/isccfg/namedconf.c,
+ * lib/isccfg/check.c, bin/named/zoneconf.c) as quoted at each block; the decisions on KariDNS's own units are in the docs. ---- */
+static void test_bind_option_values_tcp(void) {
+    server_config_t cfg;
+    /* bin/named/server.c: tcp-initial-timeout / tcp-idle-timeout / tcp-keepalive-timeout / tcp-advertised-timeout are in units of 100 ms */
+    if (ok_with("bare units", "options { tcp-initial-timeout 100; tcp-idle-timeout 300; };", "", &cfg)) {
+        CHECK(cfg.tcp_initial_timeout == 10000 && cfg.tcp_idle_timeout == 30000);
+        free_server_config_fields(&cfg);
+    }
+    /* the KariDNS spelling in milliseconds, unchanged; 0ms is "the default" (the server uses 10000) */
+    if (ok_with("ms suffix", "options { tcp-initial-timeout 1500ms; tcp-idle-timeout 2MS; };", "", &cfg)) {
+        CHECK(cfg.tcp_initial_timeout == 1500 && cfg.tcp_idle_timeout == 2);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("0ms", "options { tcp-idle-timeout 0ms; };", "", &cfg)) {
+        CHECK(cfg.tcp_idle_timeout == 0);
+        free_server_config_fields(&cfg);
+    }
+    /* the largest bare value BIND takes (MAX_*_TIMEOUT 120000 ms) */
+    if (ok_with("max", "options { tcp-initial-timeout 1200; tcp-idle-timeout 1200; };", "", &cfg)) {
+        CHECK(cfg.tcp_initial_timeout == 120000 && cfg.tcp_idle_timeout == 120000);
+        free_server_config_fields(&cfg);
+    }
+    /* BIND raises a value below the minimum (MIN_INITIAL_TIMEOUT 2500 ms, MIN_IDLE_TIMEOUT 100 ms) with a warning */
+    if (ok_with("raised", "options { tcp-initial-timeout 10; tcp-idle-timeout 0; };",
+                "line 1|tcp-initial-timeout: value is out of range: raising to 25|tcp-idle-timeout: value is out of range: raising to 1", &cfg)) {
+        CHECK(cfg.tcp_initial_timeout == 2500 && cfg.tcp_idle_timeout == 100);
+        free_server_config_fields(&cfg);
+    }
+    /* a bare value above 1200 is an old millisecond value: an error that names the suffix (decision plan A) */
+    expect_an_error("idle 10000", "options { tcp-idle-timeout 10000; };", "line 1|tcp-idle-timeout|10000 is more than the maximum of 1200|write 10000ms");
+    expect_an_error("initial 1201", "options {\n tcp-initial-timeout 1201;\n};", "line 2|tcp-initial-timeout|write 1201ms");
+    expect_an_error("not a number", "options { tcp-idle-timeout 12x; };", "invalid value '12x'");
+    expect_an_error("negative", "options { tcp-idle-timeout -1; };", "invalid value '-1'");
+    expect_an_error("too big", "options { tcp-idle-timeout 4294967296ms; };", "invalid value");
+    expect_an_error("empty ms", "options { tcp-idle-timeout ms; };", "invalid value 'ms'");
+    expect_an_error("no semicolon", "options { tcp-idle-timeout 5 };", "");
+    /* tcp-advertised-timeout: no minimum; above 65535 BIND lowers it; tcp-keepalive-timeout is accepted with a note */
+    if (ok_with("advertised", "options { tcp-advertised-timeout 300; };", "", &cfg)) {
+        CHECK(cfg.tcp_advertised_set && cfg.tcp_advertised_units == 300);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("advertised 0", "options { tcp-advertised-timeout 0; };", "", &cfg)) {
+        CHECK(cfg.tcp_advertised_set && cfg.tcp_advertised_units == 0);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("advertised max", "options { tcp-advertised-timeout 70000; tcp-keepalive-timeout 0; };",
+                "tcp-advertised-timeout: value is out of range: lowering to 65535|tcp-keepalive-timeout: value is out of range: raising to 1|"
+                "tcp-keepalive-timeout: accepted, no effect", &cfg)) {
+        CHECK(cfg.tcp_advertised_units == 65535);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("advertised ms", "options { tcp-advertised-timeout 5000ms; };", "", &cfg)) {
+        CHECK(cfg.tcp_advertised_units == 50);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("advertised ms big", "options { tcp-advertised-timeout 4294967295ms; };", "", &cfg)) {
+        CHECK(cfg.tcp_advertised_units == 65535);
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("keepalive junk", "options { tcp-keepalive-timeout x; };", "invalid value 'x'");
+}
+
+/* minimal-responses (namedconf.c: ( no-auth | no-auth-recursive | <boolean> )), version / hostname / server-id (qstringornone, serverid) */
+static void test_bind_option_values_minimal_chaos(void) {
+    server_config_t cfg;
+    static const struct { const char *text; int mode; } mr[] = {
+        { "yes", MINIMAL_YES }, { "no", MINIMAL_NO }, { "true", MINIMAL_YES }, { "false", MINIMAL_NO }, { "1", MINIMAL_YES }, { "0", MINIMAL_NO },
+        { "no-auth", MINIMAL_NO_AUTH }, { "NO-AUTH", MINIMAL_NO_AUTH }, { "no-auth-recursive", MINIMAL_NO_AUTH_RECURSIVE },
+        { "No-Auth-Recursive", MINIMAL_NO_AUTH_RECURSIVE },
+    };
+    for (size_t i = 0; i < sizeof(mr) / sizeof(mr[0]); i++) {
+        char txt[128];
+        snprintf(txt, sizeof(txt), "options { minimal-responses %s; };", mr[i].text);
+        if (ok_with(mr[i].text, txt, "", &cfg)) {
+            CHECK_MSG(cfg.minimal_responses == mr[i].mode, "minimal-responses %s", mr[i].text);
+            free_server_config_fields(&cfg);
+        }
+    }
+    expect_an_error("minimal-responses word", "options { minimal-responses auth; };", "line 1|minimal-responses: invalid value 'auth'|no-auth-recursive");
+    expect_an_error("minimal-responses semicolon", "options { minimal-responses no-auth };", "");
+
+    /* version / hostname / server-id */
+    if (ok_with("chaos texts", "options { version \"v1\"; hostname \"h1\"; server-id \"s1\"; };", "", &cfg)) {
+        CHECK(cfg.chaos.version_set && !cfg.chaos.version_none && strcmp(cfg.chaos.r_version, "v1") == 0 && cfg.chaos.has_version);
+        CHECK(cfg.chaos.hostname_set && strcmp(cfg.chaos.r_hostname, "h1") == 0 && cfg.chaos.has_hostname);
+        CHECK(cfg.chaos.server_id_set && !cfg.chaos.server_id_hostname && strcmp(cfg.chaos.r_id, "s1") == 0 && cfg.chaos.has_id);
+        CHECK(cfg.nsid_string && strcmp(cfg.nsid_string, "s1") == 0);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("chaos none", "options { version none; hostname none; server-id none; };", "", &cfg)) {
+        CHECK(cfg.chaos.version_none && !cfg.chaos.has_version && cfg.chaos.hostname_none && !cfg.chaos.has_hostname);
+        CHECK(cfg.chaos.server_id_none && !cfg.chaos.has_id && cfg.nsid_string == NULL);
+        free_server_config_fields(&cfg);
+    }
+    /* a quoted "none" / "hostname" is the text, not the keyword (the BIND lexer returns a quoted string as a different token) */
+    if (ok_with("quoted keywords", "options { version \"none\"; server-id \"hostname\"; };", "", &cfg)) {
+        CHECK(!cfg.chaos.version_none && strcmp(cfg.chaos.r_version, "none") == 0);
+        CHECK(!cfg.chaos.server_id_hostname && strcmp(cfg.chaos.r_id, "hostname") == 0);
+        free_server_config_fields(&cfg);
+    }
+    /* the same text for nsid and server-id is fine; a different one is a mistake (server-id is the NSID) */
+    if (ok_with("nsid and server-id agree", "options { nsid \"n\"; server-id \"n\"; };", "", &cfg)) free_server_config_fields(&cfg);
+    expect_an_error("nsid differs", "options { server-id \"a\"; nsid \"b\"; };", "server-id 'a'|nsid says 'b'");
+    expect_an_error("hostname needs a value", "options { version; };", "");
+    expect_an_error("server-id semicolon", "options { server-id hostname };", "");
+    expect_an_error("version semicolon", "options { version none };", "");
+}
+
+/* max-records, max-records-per-type, max-types-per-name, max-zone-ttl, serial-update-method, masterfile-format, check-*: grammar from BIND 9.20.4
+ * lib/isccfg/namedconf.c (cfg_type_uint32, cfg_type_maxduration, cfg_type_updatemethod, masterformat_enums, checkmode_enums, warn_enums,
+ * checknames_fields); the zone > view > options precedence of named_config_get() maps; defaults of bin/named/config.c. */
+static void test_bind_option_values_zone(void) {
+    server_config_t cfg;
+    zone_veff_t v;
+    zone_limits_t lim;
+    /* nothing written: no limits, increment, every check CHK_DEFAULT */
+    if (ok_with("none", "options { }; zone \"z.test\" { type master; file \"z\"; };", "", &cfg)) {
+        zone_vopts_effective(&cfg, first_zone(&cfg), "__default__", &v);
+        CHECK(v.max_records == 0 && v.max_per_type == 0 && v.max_types_per_name == 0 && v.max_zone_ttl == 0 && v.serial_method == SUM_INCREMENT);
+        for (int i = 0; i < ZC_N; i++) CHECK(v.chk[i] == CHK_DEFAULT);
+        CHECK(v.check_names == CHK_DEFAULT);
+        free_server_config_fields(&cfg);
+    }
+    /* options < view < zone, statement by statement */
+    if (ok_with("levels",
+                "options { max-records 100; max-records-per-type 10; max-types-per-name 20; max-zone-ttl 1d; serial-update-method date; };\n"
+                "view v1 { match-clients { any; }; max-records 50; max-zone-ttl unlimited; serial-update-method unixtime;\n"
+                "  zone \"a.test\" { type master; file \"a\"; max-records 7; max-records-per-type 3; };\n"
+                "  zone \"b.test\" { type master; file \"b\"; }; };", "", &cfg)) {
+        const view_config_t *vw = cfg.views;
+        zone_config_t *za = view_find_zone_config(vw, "a.test"), *zb = view_find_zone_config(vw, "b.test");
+        CHECK(za && zb);
+        zone_vopts_effective(&cfg, za, "v1", &v);
+        CHECK(v.max_records == 7 && v.max_per_type == 3 && v.max_types_per_name == 20 && v.max_zone_ttl == 0 && v.serial_method == SUM_UNIXTIME);
+        zone_vopts_effective(&cfg, zb, "v1", &v);
+        CHECK(v.max_records == 50 && v.max_per_type == 10 && v.max_zone_ttl == 0);
+        zone_vopts_effective(&cfg, zb, "other", &v);   /* a view that does not exist: options only */
+        CHECK(v.max_records == 100 && v.max_zone_ttl == 86400 && v.serial_method == SUM_DATE);
+        zone_limits_effective(&cfg, za, "v1", &lim);
+        CHECK(lim.max_records == 7 && lim.max_per_type == 3 && lim.max_types_per_name == 20 && lim.max_zone_ttl == 0);
+        zone_limits_effective(&cfg, NULL, NULL, &lim);
+        CHECK(lim.max_records == 100 && lim.max_zone_ttl == 86400);
+        free_server_config_fields(&cfg);
+    }
+    /* max-zone-ttl is a primary zone's option: a secondary zone is not held to it */
+    if (ok_with("ttl by type", "options { max-zone-ttl 3600; }; zone \"s.test\" { type secondary; primaries { 192.0.2.1; }; };", "", &cfg)) {
+        zone_limits_effective(&cfg, first_zone(&cfg), "__default__", &lim);
+        CHECK(lim.max_zone_ttl == 0);
+        free_server_config_fields(&cfg);
+    }
+    /* max-zone-ttl values: seconds, units, unlimited; ISO 8601 and junk are refused with the reason */
+    static const struct { const char *text; uint32_t secs; } ttls[] = { {"0", 0}, {"3600", 3600}, {"1h", 3600}, {"1w", 604800}, {"1h30m", 5400}, {"unlimited", 0}, {"UNLIMITED", 0} };
+    for (size_t i = 0; i < sizeof(ttls) / sizeof(ttls[0]); i++) {
+        char txt[128];
+        snprintf(txt, sizeof(txt), "options { max-zone-ttl %s; };", ttls[i].text);
+        if (ok_with(ttls[i].text, txt, "", &cfg)) {
+            CHECK_MSG(cfg.zv.max_zone_ttl == ttls[i].secs && (cfg.zv.set & ZV_MAX_ZONE_TTL), "max-zone-ttl %s", ttls[i].text);
+            free_server_config_fields(&cfg);
+        }
+    }
+    expect_an_error("iso8601", "options { max-zone-ttl P1D; };", "line 1|max-zone-ttl: ISO 8601 durations|not supported");
+    expect_an_error("ttl junk", "options { max-zone-ttl 1x; };", "max-zone-ttl: invalid value '1x'");
+    /* the counts: 0 .. 4294967295 */
+    if (ok_with("counts max", "options { max-records 4294967295; max-records-per-type 0; max-types-per-name 1; };", "", &cfg)) {
+        CHECK(cfg.zv.max_records == 4294967295u && cfg.zv.max_per_type == 0 && cfg.zv.max_types_per_name == 1);
+        CHECK((cfg.zv.set & (ZV_MAX_RECORDS | ZV_MAX_PER_TYPE | ZV_MAX_TYPES_PER_NAME)) == (ZV_MAX_RECORDS | ZV_MAX_PER_TYPE | ZV_MAX_TYPES_PER_NAME));
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("count too big", "options { max-records 4294967296; };", "max-records: invalid value");
+    expect_an_error("count negative", "options { max-records-per-type -1; };", "max-records-per-type: invalid value");
+    expect_an_error("count text", "options { max-types-per-name many; };", "max-types-per-name: invalid value");
+    expect_an_error("zone count", "zone \"z.test\" { type master; file \"z\"; max-records x; };", "zone 'z.test.'|max-records: invalid value");
+    expect_an_error("view count", "view v { match-clients { any; }; max-records x; };", "view 'v'|max-records: invalid value");
+    /* serial-update-method */
+    static const struct { const char *text; int m; } sums[] = { {"increment", SUM_INCREMENT}, {"unixtime", SUM_UNIXTIME}, {"date", SUM_DATE}, {"DATE", SUM_DATE} };
+    for (size_t i = 0; i < sizeof(sums) / sizeof(sums[0]); i++) {
+        char txt[128];
+        snprintf(txt, sizeof(txt), "options { serial-update-method %s; };", sums[i].text);
+        if (ok_with(sums[i].text, txt, "", &cfg)) {
+            CHECK_MSG(cfg.zv.serial_method == sums[i].m, "serial-update-method %s", sums[i].text);
+            free_server_config_fields(&cfg);
+        }
+    }
+    expect_an_error("serial method", "zone \"z.test\" { type master; file \"z\"; serial-update-method epoch; };", "serial-update-method: invalid value 'epoch'|increment, unixtime or date");
+    /* masterfile-format: text is read, raw is refused clearly (no silent text read of a raw file) */
+    if (ok_with("masterfile text", "options { masterfile-format text; }; zone \"z.test\" { type master; file \"z\"; masterfile-format TEXT; };", "", &cfg))
+        free_server_config_fields(&cfg);
+    expect_an_error("masterfile raw", "options { masterfile-format raw; };", "line 1|masterfile-format raw is not supported|text format only");
+    expect_an_error("masterfile raw zone", "zone \"z.test\" { type secondary; primaries { 192.0.2.1; }; file \"z\"; masterfile-format raw; };", "zone 'z.test.'|masterfile-format raw is not supported");
+    expect_an_error("masterfile map", "view v { match-clients { any; }; masterfile-format map; };", "masterfile-format: invalid value 'map'");
+    /* the check-* family */
+    if (ok_with("checks",
+                "options { check-names primary ignore; check-names slave warn; check-names response fail; check-dup-records fail; check-mx ignore;\n"
+                "  check-mx-cname warn; check-srv-cname ignore; check-integrity no; check-wildcard yes; check-sibling no; check-svcb no; check-spf ignore; };\n"
+                "zone \"z.test\" { type master; file \"z\"; };\n", "check-sibling is accepted, no effect|check-svcb is accepted|check-spf is accepted", &cfg)) {
+        zone_vopts_effective(&cfg, first_zone(&cfg), "__default__", &v);
+        CHECK(v.chk[ZC_NAMES_PRIMARY] == CHK_IGNORE && v.chk[ZC_NAMES_SECONDARY] == CHK_WARN && v.chk[ZC_NAMES_RESPONSE] == CHK_FAIL);
+        CHECK(v.chk[ZC_DUP_RECORDS] == CHK_FAIL && v.chk[ZC_MX] == CHK_IGNORE && v.chk[ZC_MX_CNAME] == CHK_WARN && v.chk[ZC_SRV_CNAME] == CHK_IGNORE);
+        CHECK(v.chk[ZC_INTEGRITY] == CHK_IGNORE && v.chk[ZC_WILDCARD] == CHK_FAIL && v.chk[ZC_SIBLING] == CHK_IGNORE && v.chk[ZC_SVCB] == CHK_IGNORE);
+        CHECK(v.chk[ZC_SPF] == CHK_IGNORE);
+        CHECK(v.check_names == CHK_IGNORE);                 /* a primary zone takes check-names primary */
+        free_server_config_fields(&cfg);
+    }
+    /* zone: check-names <mode> is the zone's own and wins; a secondary zone takes the secondary value of options */
+    if (ok_with("zone check-names",
+                "options { check-names primary fail; check-names secondary warn; };\n"
+                "zone \"p.test\" { type master; file \"p\"; check-names ignore; };\n"
+                "zone \"q.test\" { type master; file \"q\"; };\n"
+                "zone \"s.test\" { type slave; primaries { 192.0.2.1; }; };\n", "", &cfg)) {
+        zone_vopts_effective(&cfg, view_find_zone_config(cfg.views, "p.test"), "__default__", &v);
+        CHECK(v.check_names == CHK_IGNORE);
+        zone_vopts_effective(&cfg, view_find_zone_config(cfg.views, "q.test"), "__default__", &v);
+        CHECK(v.check_names == CHK_FAIL);
+        zone_vopts_effective(&cfg, view_find_zone_config(cfg.views, "s.test"), "__default__", &v);
+        CHECK(v.check_names == CHK_WARN);
+        free_server_config_fields(&cfg);
+    }
+    /* view-level check-* replace options' for its zones */
+    if (ok_with("view checks", "options { check-mx fail; };\nview w { match-clients { any; }; check-mx ignore; check-names master warn; zone \"z.test\" { type master; file \"z\"; }; };", "", &cfg)) {
+        zone_vopts_effective(&cfg, view_find_zone_config(cfg.views, "z.test"), "w", &v);
+        CHECK(v.chk[ZC_MX] == CHK_IGNORE && v.check_names == CHK_WARN);
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("check mode", "options { check-mx maybe; };", "check-mx: invalid value 'maybe'|fail, warn or ignore");
+    expect_an_error("check bool", "options { check-integrity warn; };", "check-integrity: invalid value 'warn'|yes or no");
+    expect_an_error("check spf", "options { check-spf fail; };", "check-spf: invalid value 'fail'|warn or ignore");
+    expect_an_error("check-names type", "options { check-names nobody fail; };", "check-names: invalid type 'nobody'");
+    expect_an_error("check-names mode", "options { check-names primary maybe; };", "check-names: invalid mode 'maybe'");
+    expect_an_error("zone check-names", "zone \"z.test\" { type master; file \"z\"; check-names primary; };", "check-names: invalid mode 'primary'");
+    expect_an_error("check semicolon", "options { check-mx warn };", "");
+}
+
+/* zone_arena_check_limits(): max-records, max-records-per-type, max-types-per-name and max-zone-ttl on a parsed and indexed zone */
+static void test_bind_option_values_limits(void) {
+    static char ztext[] =
+        "$ORIGIN lim.test.\n$TTL 3600\n"
+        "@ IN SOA ns1 admin 1 3600 1800 604800 86400\n"
+        "@ IN NS ns1\n"
+        "ns1 IN A 192.0.2.1\n"
+        "www 300 IN A 192.0.2.10\n"
+        "www 300 IN A 192.0.2.11\n"
+        "www 300 IN A 192.0.2.12\n"
+        "www IN TXT \"x\"\n"
+        "www IN MX 10 ns1\n"
+        "long 7200 IN A 192.0.2.20\n";
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err = {0};
+    parse_context_t pc = { .base_dir = ".", .default_origin = "lim.test.", .is_standalone_mode = true, .err_out = &err };
+    CHECK(parse_zone_fast(ztext, strlen(ztext), &arena, &pc) >= 0);
+    CHECK(build_zone_index(&arena, true) == 0);
+    char e[320];
+    zone_limits_t l = {0};
+    CHECK(zone_arena_check_limits(&arena, &l, e, sizeof(e)) == 0);                  /* no limits */
+    CHECK(zone_arena_check_limits(NULL, &l, e, sizeof(e)) == 0 && zone_arena_check_limits(&arena, NULL, e, sizeof(e)) == 0);
+    l.max_records = 9;                                                              /* 9 RRs: SOA NS A A A A TXT MX A = 9 */
+    CHECK(zone_arena_check_limits(&arena, &l, e, sizeof(e)) == 0);
+    l.max_records = 8;
+    CHECK(zone_arena_check_limits(&arena, &l, e, sizeof(e)) == -1 && strstr(e, "9 records") && strstr(e, "max-records 8"));
+    memset(&l, 0, sizeof(l));
+    l.max_per_type = 3;
+    CHECK(zone_arena_check_limits(&arena, &l, e, sizeof(e)) == 0);
+    l.max_per_type = 2;
+    CHECK(zone_arena_check_limits(&arena, &l, e, sizeof(e)) == -1 && strstr(e, "www.lim.test.") && strstr(e, "3 records of type 1") && strstr(e, "max-records-per-type 2"));
+    memset(&l, 0, sizeof(l));
+    l.max_types_per_name = 3;                                                       /* www has A, TXT, MX */
+    CHECK(zone_arena_check_limits(&arena, &l, e, sizeof(e)) == 0);
+    l.max_types_per_name = 2;
+    CHECK(zone_arena_check_limits(&arena, &l, e, sizeof(e)) == -1 && strstr(e, "www.lim.test.") && strstr(e, "3 record types") && strstr(e, "max-types-per-name 2"));
+    memset(&l, 0, sizeof(l));
+    l.max_zone_ttl = 7200;
+    CHECK(zone_arena_check_limits(&arena, &l, e, sizeof(e)) == 0);
+    l.max_zone_ttl = 3600;
+    CHECK(zone_arena_check_limits(&arena, &l, e, sizeof(e)) == -1 && strstr(e, "long.lim.test.") && strstr(e, "TTL 7200") && strstr(e, "max-zone-ttl 3600"));
+    zone_arena_destroy(&arena);
+    /* an arena without an index (no hash table): the per-name limits cannot be checked and are skipped; the counts still are */
+    zone_arena_t bare;
+    memset(&bare, 0, sizeof(bare));
+    zone_arena_init(&bare);
+    memset(&l, 0, sizeof(l));
+    l.max_per_type = 1;
+    CHECK(zone_arena_check_limits(&bare, &l, e, sizeof(e)) == 0);
+    zone_arena_destroy(&bare);
+}
+
+/* BIND names of settings KariDNS has (udp-receive-buffer, udp-send-buffer, tcp-receive-buffer, tcp-send-buffer, max-udp-size), edns-udp-size,
+ * require-server-cookie; BIND 9.20.4 bin/named/server.c (CAP_IF_NOT_ZERO(v, 4096, INT32_MAX); max-udp-size held to 512..4096) */
+static void test_bind_option_values_aliases(void) {
+    server_config_t cfg;
+    if (ok_with("udp buffers", "options { udp-receive-buffer 65536; udp-send-buffer 32768; };", "", &cfg)) {
+        CHECK(cfg.udp_recvbuf_size == 65536 && cfg.udp_sndbuf_size == 32768);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("udp buffer floor", "options { udp-receive-buffer 100; udp-send-buffer 0; };", "", &cfg)) {
+        CHECK(cfg.udp_recvbuf_size == 4096);                    /* BIND raises a non-zero size to 4096 */
+        CHECK(cfg.udp_sndbuf_size == 4 * 1024 * 1024);          /* 0 is the system's size: KariDNS keeps its own default */
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("both names, one value", "options { udp-recvbuf-size 65536; udp-receive-buffer 65536; udp-sndbuf-size 8k; udp-send-buffer 8192; };", "", &cfg)) {
+        CHECK(cfg.udp_recvbuf_size == 65536 && cfg.udp_sndbuf_size == 8192);
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("recv conflict", "options {\n udp-recvbuf-size 65536;\n udp-receive-buffer 131072;\n};", "line 3|udp-receive-buffer 131072 and udp-recvbuf-size 65536|line 2|same setting");
+    expect_an_error("send conflict", "options { udp-send-buffer 8192; udp-sndbuf-size 16384; };", "udp-sndbuf-size 16384 and udp-send-buffer 8192");
+    if (ok_with("same name twice", "options { udp-receive-buffer 8192; udp-receive-buffer 16384; };", "", &cfg)) {
+        CHECK(cfg.udp_recvbuf_size == 16384);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("tcp buffers", "options { tcp-window 65536; tcp-receive-buffer 131072; };", "", &cfg)) {
+        CHECK(cfg_tcp_rcvbuf(&cfg) == 131072 && cfg_tcp_sndbuf(&cfg) == 65536);   /* a direction written replaces tcp-window for it */
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("tcp send", "options { tcp-send-buffer 20000; };", "", &cfg)) {
+        CHECK(cfg_tcp_rcvbuf(&cfg) == 0 && cfg_tcp_sndbuf(&cfg) == 20000);
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("tcp buffer junk", "options { tcp-receive-buffer big; };", "tcp-receive-buffer");
+    /* max-udp-size = udp-bufsize; BIND holds the value to 512..4096 */
+    if (ok_with("max-udp-size", "options { max-udp-size 1400; };", "", &cfg)) {
+        CHECK(cfg.udp_bufsize == 1400);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("max-udp-size clamp", "options { max-udp-size 100; };", "max-udp-size 100 is out of range (512..4096): raising to 512", &cfg)) {
+        CHECK(cfg.udp_bufsize == 512);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("max-udp-size clamp up", "options { max-udp-size 9000; };", "max-udp-size 9000 is out of range (512..4096): lowering to 4096", &cfg)) {
+        CHECK(cfg.udp_bufsize == 4096);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("udp-bufsize and max-udp-size agree", "options { udp-bufsize 1400; max-udp-size 1400; };", "", &cfg)) free_server_config_fields(&cfg);
+    expect_an_error("udp size conflict", "options { udp-bufsize 1400; max-udp-size 1500; };", "max-udp-size 1500 and udp-bufsize 1400|same setting");
+    expect_an_error("max-udp-size junk", "options { max-udp-size big; };", "max-udp-size");
+    if (ok_with("edns-udp-size", "options { edns-udp-size 1232; };", "edns-udp-size: accepted, no effect", &cfg)) {
+        CHECK(cfg.udp_bufsize == 0);                                         /* it is not the size of the responses */
+        free_server_config_fields(&cfg);
+    }
+    /* view { max-udp-size; require-server-cookie; } */
+    if (ok_with("view", "options { require-server-cookie yes; };\nview v { match-clients { any; }; max-udp-size 900; require-server-cookie no; };", "", &cfg)) {
+        const view_config_t *vw = config_find_view(&cfg, "V");
+        CHECK(vw && vw->max_udp_size == 900 && vw->require_cookie_set && !vw->require_cookie);
+        CHECK(cfg.any_view_max_udp && cfg.any_view_cookie && cfg.require_server_cookie);
+        CHECK(!config_require_server_cookie(&cfg, "v") && config_require_server_cookie(&cfg, "other") && config_require_server_cookie(&cfg, NULL));
+        CHECK(config_find_view(&cfg, "") == NULL && config_find_view(&cfg, NULL) == NULL && config_find_view(NULL, "v") == NULL);
+        CHECK(!config_require_server_cookie(NULL, "v"));
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("view cookie value", "view v { match-clients { any; }; require-server-cookie maybe; };", "require-server-cookie");
+    expect_an_error("view max-udp-size", "view v { match-clients { any; }; max-udp-size x; };", "max-udp-size");
+    expect_an_error("cookie value", "options { require-server-cookie maybe; };", "require-server-cookie");
+}
+
+/* dnstap in the BIND 9.20 grammar (lib/isccfg/namedconf.c cfg_type_dnstap, dtout_fields; lib/isccfg/check.c check_dnstap(), the dnstap-output checks) */
+static void test_bind_option_values_dnstap(void) {
+    server_config_t cfg;
+    if (ok_with("bind list", "options { dnstap { auth; }; dnstap-output unix \"/var/run/dnstap.sock\"; dnstap-identity \"id-1\"; dnstap-version \"v-1\"; };", "", &cfg)) {
+        CHECK(cfg.dnstap.enabled && cfg.dnstap.bind_form && cfg.dnstap.log_auth_query && cfg.dnstap.log_auth_response);
+        CHECK_STR(cfg.dnstap.socket_path, "/var/run/dnstap.sock");
+        CHECK_STR(cfg.dnstap.identity, "id-1");
+        CHECK_STR(cfg.dnstap.version, "v-1");
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("auth query only", "options { dnstap { auth query; }; dnstap-output unix \"/s\"; };", "", &cfg)) {
+        CHECK(cfg.dnstap.log_auth_query && !cfg.dnstap.log_auth_response);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("auth response, again", "options { dnstap { auth response; client query; }; dnstap-output unix \"/s\"; };", "client is accepted, no effect", &cfg)) {
+        CHECK(!cfg.dnstap.log_auth_query && cfg.dnstap.log_auth_response);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("all and update", "options { dnstap { all response; update; resolver; forwarder; }; dnstap-output unix \"/s\"; };",
+                "all: only the auth messages|update is accepted, no effect|resolver is accepted|forwarder is accepted", &cfg)) {
+        CHECK(!cfg.dnstap.log_auth_query && cfg.dnstap.log_auth_response);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("only types KariDNS does not send", "options { dnstap { client; }; dnstap-output unix \"/s\"; };", "", &cfg)) {
+        CHECK(cfg.dnstap.enabled && !cfg.dnstap.log_auth_query && !cfg.dnstap.log_auth_response);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("any order and case", "options { dnstap-output UNIX \"/s\"; dnstap { AUTH Query; }; dnstap-identity none; dnstap-version none; };", "", &cfg)) {
+        CHECK(cfg.dnstap.log_auth_query && !cfg.dnstap.log_auth_response && cfg.dnstap.identity == NULL && cfg.dnstap.version == NULL);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("identity hostname", "options { dnstap-identity hostname; };", "", &cfg)) {
+        char hn[256];
+        CHECK(gethostname(hn, sizeof(hn)) == 0);
+        hn[255] = 0;
+        CHECK(cfg.dnstap.identity && strcmp(cfg.dnstap.identity, hn) == 0);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("quoted none", "options { dnstap-identity \"none\"; dnstap-version \"none\"; };", "", &cfg)) {
+        CHECK_STR(cfg.dnstap.identity, "none");
+        CHECK_STR(cfg.dnstap.version, "none");
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("fstrm", "options { fstrm-set-buffer-hint 8192; fstrm-set-flush-timeout 1; fstrm-set-input-queue-size 512; fstrm-set-output-notify-threshold 32;\n"
+                "  fstrm-set-output-queue-model mpsc; fstrm-set-output-queue-size 1024; fstrm-set-reopen-interval 5s; };", "fstrm-set-buffer-hint: accepted, no effect|fstrm-set-reopen-interval: accepted", &cfg))
+        free_server_config_fields(&cfg);
+    /* the KariDNS grammar keeps working, and its values agree with the BIND ones or the file is refused */
+    if (ok_with("kariDNS form", "options { dnstap { socket \"/k\"; identity \"i\"; version \"v\"; queue-size 100; auth-query yes; auth-response no; }; };", "", &cfg)) {
+        CHECK(!cfg.dnstap.bind_form && cfg.dnstap.log_auth_query && !cfg.dnstap.log_auth_response && cfg.dnstap.queue_size == 100);
+        CHECK_STR(cfg.dnstap.socket_path, "/k");
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("both forms, same values", "options { dnstap-output unix \"/k\"; dnstap { socket \"/k\"; }; dnstap-identity \"i\"; };", "", &cfg)) free_server_config_fields(&cfg);
+    expect_an_error("socket differs", "options {\n dnstap-output unix \"/a\";\n dnstap { socket \"/b\"; };\n};", "line 3|dnstap: '/b' differs from '/a'|dnstap-output / dnstap-identity / dnstap-version");
+    expect_an_error("identity differs", "options { dnstap { identity \"x\"; }; dnstap-identity \"y\"; };", "options dnstap-identity|'y' differs from 'x'");
+    expect_an_error("version differs", "options { dnstap-version \"y\"; dnstap { version \"x\"; }; };", "dnstap: 'x' differs from 'y'");
+    expect_an_error("mixed, bind first", "options { dnstap { auth; socket \"/s\"; }; dnstap-output unix \"/s\"; };", "'socket' is not a dnstap message type");
+    expect_an_error("mixed, kariDNS first", "options { dnstap { socket \"/s\"; auth; }; };", "'auth' is a message type of the BIND list");
+    expect_an_error("output required", "options { dnstap { auth; }; };", "'dnstap-output' must be set if 'dnstap' is set");
+    expect_an_error("file output", "options { dnstap { auth; }; dnstap-output file \"/var/log/dnstap\" size 10m versions 3; };", "mode file is not supported|dnstap-output unix");
+    expect_an_error("unix with size", "options { dnstap-output unix \"/s\" size 10m; };", "size, versions and suffix cannot be set with mode unix");
+    expect_an_error("output mode", "options { dnstap-output tcp \"/s\"; };", "dnstap-output: invalid mode 'tcp'");
+    expect_an_error("output junk", "options { dnstap-output unix \"/s\" nothing 1; };", "");
+    expect_an_error("fstrm model", "options { fstrm-set-output-queue-model fifo; };", "fstrm-set-output-queue-model: invalid value 'fifo'");
+    expect_an_error("fstrm number", "options { fstrm-set-buffer-hint -1; };", "fstrm-set-buffer-hint: invalid value");
+    expect_an_error("fstrm interval", "options { fstrm-set-reopen-interval soon; };", "fstrm-set-reopen-interval: invalid value 'soon'");
+    expect_an_error("type word", "options { dnstap { auth sometimes; }; dnstap-output unix \"/s\"; };", "");
+    expect_an_error("identity semicolon", "options { dnstap-identity \"x\" };", "");
+}
+
+/* catalog-zones (BIND 9.20 lib/isccfg/namedconf.c catz_zone_fields; check.c check_catz(): each name once, default-primaries and default-masters not both) */
+static void test_bind_option_values_catalog_zones(void) {
+    server_config_t cfg;
+    if (ok_with("options list",
+                "options { catalog-zones { zone \"cat.test\" default-primaries { 192.0.2.1 port 5353 key k; 192.0.2.2; } zone-directory \"/x\" in-memory no min-update-interval 5m;\n"
+                "  zone cat2.test; }; };\n"
+                "zone \"cat.test\" { type secondary; primaries { 192.0.2.1; }; };\n"
+                "zone \"cat2.test\" { type secondary; primaries { 192.0.2.1; }; };\n"
+                "zone \"plain.test\" { type master; file \"p\"; };\n",
+                "default-primaries is accepted, no effect|zone-directory is accepted|in-memory no is accepted|min-update-interval is accepted", &cfg)) {
+        CHECK(view_find_zone_config(cfg.views, "cat.test")->is_catalog && view_find_zone_config(cfg.views, "cat2.test")->is_catalog);
+        CHECK(!view_find_zone_config(cfg.views, "plain.test")->is_catalog);
+        free_server_config_fields(&cfg);
+    }
+    /* the statement of a view marks the zones of that view only; in-memory yes is what KariDNS does anyway */
+    if (ok_with("view list",
+                "view a { match-clients { 192.0.2.0/24; }; catalog-zones { zone \"c.test\" in-memory yes; }; zone \"c.test\" { type secondary; primaries { 192.0.2.1; }; }; };\n"
+                "view b { match-clients { any; }; zone \"c.test\" { type secondary; primaries { 192.0.2.1; }; }; };\n",
+                "in-memory yes is how KariDNS always works", &cfg)) {
+        CHECK(view_find_zone_config(cfg.views, "c.test")->is_catalog);
+        CHECK(!view_find_zone_config(cfg.views->next, "c.test")->is_catalog);
+        free_server_config_fields(&cfg);
+    }
+    /* a name that is no zone: said, not fatal */
+    if (ok_with("no such zone", "options { catalog-zones { zone \"nothing.test\"; }; };\nview v { match-clients { any; }; catalog-zones { zone \"nope.test\"; }; };\n",
+                "options catalog-zones: 'nothing.test' is not a zone|view catalog-zones: 'nope.test' is not a zone of view 'v'", &cfg))
+        free_server_config_fields(&cfg);
+    expect_an_error("twice", "options { catalog-zones { zone \"cat.test\"; zone \"CAT.test.\"; }; };", "catalog zone 'CAT.test.' is listed twice");
+    expect_an_error("primaries and masters", "options { catalog-zones { zone \"c.test\" default-primaries { 192.0.2.1; } default-masters { 192.0.2.2; }; }; };",
+                    "'default-primaries' and 'default-masters' can not be both defined");
+    expect_an_error("not zone", "options { catalog-zones { member \"c.test\"; }; };", "expected `zone \"name\"`, found 'member'");
+    expect_an_error("unknown option", "options { catalog-zones { zone \"c.test\" frobnicate yes; }; };", "unknown option 'frobnicate'");
+    expect_an_error("bad bool", "options { catalog-zones { zone \"c.test\" in-memory sometimes; }; };", "invalid in-memory 'sometimes'");
+    expect_an_error("bad interval", "options { catalog-zones { zone \"c.test\" min-update-interval soon; }; };", "invalid min-update-interval 'soon'");
+    expect_an_error("unclosed list", "options { catalog-zones { zone \"c.test\" default-primaries { 192.0.2.1;", "");
+    expect_an_error("no brace", "options { catalog-zones zone \"c.test\"; };", "");
+    expect_an_error("name missing", "options { catalog-zones { zone ; }; };", "");
+    expect_an_error("semicolon", "options { catalog-zones { zone \"c.test\" } };", "");
+    expect_an_error("view bad", "view v { match-clients { any; }; catalog-zones { zone \"c.test\" default-primaries { 192.0.2.1; } default-masters { 192.0.2.1; }; }; };",
+                    "view 'v'|can not be both defined");
+}
+
+/* update-policy: grammar from BIND 9.20.4 lib/isccfg/namedconf.c (grant_fields, matchtype_enums), evaluation from lib/dns/ssu.c
+ * dns_ssutable_checkrules(): the first rule that matches decides; the identity is the signer's name or *.suffix (a proper subdomain); no rrtype list
+ * is every type but NS, SOA and RRSIG; ANY in the list is every type. */
+static void test_bind_option_values_update_policy(void) {
+    server_config_t cfg;
+    if (ok_with("rules",
+                "zone \"up.test\" { type master; file \"u\"; update-policy {\n"
+                "  deny k1 name bad.up.test. A;\n"
+                "  grant k1 zonesub A AAAA;\n"
+                "  grant *.dyn.test. self x A;\n"
+                "  grant host.up.test. name www.up.test. ANY;\n"
+                "  grant k2 selfsub k2 CNAME;\n"
+                "  grant k3 selfwild k3 TXT;\n"
+                "  grant k5 wildcard *.w.up.test. TXT;\n"
+                "  grant k6 subdomain sub.up.test.;\n"
+                "  grant k7 krb5-self k7 A;\n"
+                "}; };\n", "update-policy: grant krb5-self is not supported", &cfg)) {
+        const update_policy_t *p = zext(first_zone(&cfg))->upd_policy;
+        CHECK(p && p->count == 8);                              /* the krb5-self grant is dropped */
+        CHECK(p && p->rules[1].mtype == UPD_SUBDOMAIN && strcmp(p->rules[1].name, "up.test.") == 0);   /* zonesub: the zone */
+        CHECK(p && !update_policy_allows(p, "k1", "bad.up.test.", 1));                     /* the deny comes first */
+        CHECK(p && update_policy_allows(p, "k1", "bad.up.test.", 28));                     /* ... only for A */
+        CHECK(p && update_policy_allows(p, "k1", "www.up.test.", 1) && update_policy_allows(p, "K1.", "www.up.test.", 28));
+        CHECK(p && !update_policy_allows(p, "k1", "www.up.test.", 16) && !update_policy_allows(p, "k1", "www.up.test.", 15));   /* not in the list */
+        CHECK(p && !update_policy_allows(p, "k1", "www.other.test.", 1));                  /* outside the zone */
+        CHECK(p && !update_policy_allows(p, NULL, "www.up.test.", 1) && !update_policy_allows(NULL, "k1", "www.up.test.", 1));
+        CHECK(p && !update_policy_allows(p, "k1", NULL, 1));
+        CHECK(p && update_policy_allows(p, "h1.dyn.test.", "h1.dyn.test.", 1));            /* *.suffix identity, self */
+        CHECK(p && !update_policy_allows(p, "h1.dyn.test.", "h2.dyn.test.", 1) && !update_policy_allows(p, "dyn.test.", "dyn.test.", 1));
+        CHECK(p && update_policy_allows(p, "host.up.test.", "www.up.test.", 2));          /* ANY includes NS */
+        CHECK(p && !update_policy_allows(p, "host.up.test.", "mail.up.test.", 1));
+        CHECK(p && update_policy_allows(p, "k2", "k2", 5) && update_policy_allows(p, "k2", "a.k2", 5) && !update_policy_allows(p, "k2", "other", 5));
+        CHECK(p && update_policy_allows(p, "k3", "a.k3", 16) && !update_policy_allows(p, "k3", "k3", 16));   /* selfwild: a proper subdomain */
+        CHECK(p && update_policy_allows(p, "k5", "a.w.up.test.", 16) && !update_policy_allows(p, "k5", "w.up.test.", 16));
+        CHECK(p && update_policy_allows(p, "k6", "x.sub.up.test.", 1) && update_policy_allows(p, "k6", "sub.up.test.", 16));
+        CHECK(p && !update_policy_allows(p, "k6", "x.sub.up.test.", 2) && !update_policy_allows(p, "k6", "x.sub.up.test.", 6) &&
+              !update_policy_allows(p, "k6", "x.sub.up.test.", 46));   /* no type list: not NS, SOA, RRSIG */
+        CHECK(p && !update_policy_allows(p, "k6", "up.test.", 1));
+        CHECK(p && !update_policy_allows(p, "k7", "k7", 1));       /* the dropped grant allows nothing */
+        free_server_config_fields(&cfg);
+    }
+    /* an empty policy refuses everything; a zone without one has none */
+    if (ok_with("empty", "zone \"up.test\" { type master; file \"u\"; update-policy { }; };\nzone \"none.test\" { type master; file \"n\"; };", "", &cfg)) {
+        const update_policy_t *p = zext(view_find_zone_config(cfg.views, "up.test"))->upd_policy;
+        CHECK(p && p->count == 0 && !update_policy_allows(p, "k", "a.up.test.", 1));
+        CHECK(zext(view_find_zone_config(cfg.views, "none.test"))->upd_policy == NULL);
+        free_server_config_fields(&cfg);
+    }
+    /* what KariDNS cannot evaluate: a deny is an error (it would allow what the file forbids), BIND's local needs its session key, a count limit is not enforced */
+    expect_an_error("deny tcp-self", "zone \"z.test\" { type master; file \"z\"; update-policy { deny k tcp-self x A; }; };", "update-policy: deny tcp-self cannot be evaluated");
+    expect_an_error("local", "zone \"z.test\" { type master; file \"z\"; update-policy local; };", "update-policy local is not supported");
+    expect_an_error("count", "zone \"z.test\" { type master; file \"z\"; update-policy { grant k zonesub A(3); }; };", "the count limit of 'A(3)' is not supported");
+    expect_an_error("allow-update", "zone \"z.test\" { type master; file \"z\"; allow-update { any; }; update-policy { grant k zonesub ANY; }; };",
+                    "zone 'z.test.': 'allow-update' is ignored when 'update-policy' is present");
+    expect_an_error("allow-update first", "zone \"z.test\" { type master; file \"z\"; update-policy { grant k zonesub ANY; }; allow-update { key k; }; };", "'allow-update' is ignored when");
+    expect_an_error("mode", "zone \"z.test\" { type master; file \"z\"; update-policy { allow k zonesub ANY; }; };", "expected grant or deny, found 'allow'");
+    expect_an_error("match type", "zone \"z.test\" { type master; file \"z\"; update-policy { grant k everything x A; }; };", "'everything' is not a match type");
+    expect_an_error("record type", "zone \"z.test\" { type master; file \"z\"; update-policy { grant k zonesub NOSUCH; }; };", "'NOSUCH' is not a record type");
+    expect_an_error("wildcard name", "zone \"z.test\" { type master; file \"z\"; update-policy { grant k wildcard w.z.test. A; }; };", "a wildcard rule needs a name of the form *.suffix");
+    expect_an_error("too many types", "zone \"z.test\" { type master; file \"z\"; update-policy { grant k zonesub A AAAA TXT MX NS SRV PTR CNAME DS TLSA CAA SSHFP NAPTR LOC HINFO RP SPF; }; };",
+                    "more than 16 types in one rule");
+    {
+        char big[4096];
+        size_t n = (size_t)snprintf(big, sizeof(big), "zone \"z.test\" { type master; file \"z\"; update-policy {\n");
+        for (int i = 0; i < 65; i++) n += (size_t)snprintf(big + n, sizeof(big) - n, "grant k zonesub A;\n");
+        snprintf(big + n, sizeof(big) - n, "}; };");
+        expect_an_error("too many rules", big, "more than 64 rules");
+    }
+    expect_an_error("no brace", "zone \"z.test\" { type master; file \"z\"; update-policy grant; };", "");
+    expect_an_error("truncated", "zone \"z.test\" { type master; file \"z\"; update-policy { grant k self", "");
+    expect_an_error("no semicolon", "zone \"z.test\" { type master; file \"z\"; update-policy { grant k zonesub A } };", "");
+    expect_an_error("after rules", "zone \"z.test\" { type master; file \"z\"; update-policy { grant k zonesub A; } };", "");
+    {
+        char longname[400];
+        memset(longname, 'a', 300);
+        longname[300] = 0;
+        char txt[1200];
+        snprintf(txt, sizeof(txt), "zone \"z.test\" { type master; file \"z\"; update-policy { grant %s zonesub A; }; };", longname);
+        expect_an_error("identity too long", txt, "the identity is too long");
+        snprintf(txt, sizeof(txt), "zone \"z.test\" { type master; file \"z\"; update-policy { grant k name %s A; }; };", longname);
+        expect_an_error("name too long", txt, "the name is too long");
+    }
+    /* the copy of a zone's configuration made for settings received from a primary keeps the policy (zone_ext_clone) */
+    if (ok_with("clone", "zone \"c.test\" { type master; file \"c\"; update-policy { grant k zonesub A; }; };", "", &cfg)) {
+        char note[200];
+        zone_config_t *base = first_zone(&cfg) ? view_find_zone_config(cfg.views, "c.test") : NULL;
+        zone_config_t *copy = base ? zone_config_with_received("c.test.", base, NULL, &cfg, note, sizeof(note)) : NULL;
+        CHECK(copy && zext(copy)->upd_policy && zext(copy)->upd_policy != zext(base)->upd_policy && zext(copy)->upd_policy->count == 1);
+        if (copy) free_zone_config(copy);
+        free_server_config_fields(&cfg);
+    }
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
+    test_bind_option_values_update_policy();
+    test_bind_option_values_catalog_zones();
+    test_bind_option_values_dnstap();
+    test_bind_option_values_aliases();
+    test_bind_option_values_tcp();
+    test_bind_option_values_minimal_chaos();
+    test_bind_option_values_zone();
+    test_bind_option_values_limits();
     test_defaults();
     test_boolean_directives();
     test_numeric_directives();

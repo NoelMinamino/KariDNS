@@ -65,6 +65,65 @@ void kc_ok(kc_tally_t *t, const char *fmt, ...) {
     va_end(ap);
 }
 
+/* ---- The check-* policy as text, for karidns-dbloader --check (--zone-checks): "mx-cname=warn,integrity=fail,names=ignore".  `names` is check-names
+ * of a primary zone (the zone type of a database zone). ---- */
+static const struct { const char *name; int chk; } k_lint_policy_names[] = {
+    {"names", ZC_NAMES_PRIMARY}, {"dup-records", ZC_DUP_RECORDS}, {"integrity", ZC_INTEGRITY}, {"mx", ZC_MX}, {"mx-cname", ZC_MX_CNAME},
+    {"sibling", ZC_SIBLING}, {"spf", ZC_SPF}, {"srv-cname", ZC_SRV_CNAME}, {"svcb", ZC_SVCB}, {"wildcard", ZC_WILDCARD},
+};
+static const char *const k_lint_sev_names[] = { "fail", "warn", "ignore" };
+
+int zone_lint_policy_parse(const char *spec, uint8_t chk[ZC_N], uint8_t *names, char *err, size_t errlen) {
+    for (int i = 0; i < ZC_N; i++) chk[i] = CHK_DEFAULT;
+    *names = CHK_DEFAULT;
+    const char *p = spec;
+    while (p && *p) {
+        const char *comma = strchr(p, ',');
+        size_t n = comma ? (size_t)(comma - p) : strlen(p);
+        const char *eq = memchr(p, '=', n);
+        int ci = -1, sev = -1;
+        if (eq) {
+            for (size_t i = 0; i < sizeof(k_lint_policy_names) / sizeof(k_lint_policy_names[0]); i++)
+                if (strlen(k_lint_policy_names[i].name) == (size_t)(eq - p) && strncmp(k_lint_policy_names[i].name, p, (size_t)(eq - p)) == 0) ci = k_lint_policy_names[i].chk;
+            for (int i = 0; i < 3; i++)
+                if (strlen(k_lint_sev_names[i]) == n - (size_t)(eq - p) - 1 && strncmp(k_lint_sev_names[i], eq + 1, n - (size_t)(eq - p) - 1) == 0) sev = i;
+        }
+        if (ci < 0 || sev < 0) {
+            snprintf(err, errlen, "invalid check policy '%.*s' (expected name=fail|warn|ignore)", (int)n, p);
+            return -1;
+        }
+        if (ci == ZC_NAMES_PRIMARY) *names = (uint8_t)sev;
+        else chk[ci] = (uint8_t)sev;
+        p = comma ? comma + 1 : NULL;
+    }
+    return 0;
+}
+
+size_t zone_lint_policy_format(const uint8_t chk[ZC_N], uint8_t names, char *out, size_t cap) {
+    size_t len = 0;
+    if (cap) out[0] = '\0';
+    for (size_t i = 0; i < sizeof(k_lint_policy_names) / sizeof(k_lint_policy_names[0]); i++) {
+        uint8_t sev = k_lint_policy_names[i].chk == ZC_NAMES_PRIMARY ? names : chk[k_lint_policy_names[i].chk];
+        if (sev > CHK_IGNORE) continue;   /* CHK_DEFAULT: nothing written */
+        int w = snprintf(out + len, cap - len, "%s%s=%s", len ? "," : "", k_lint_policy_names[i].name, k_lint_sev_names[sev]);
+        if (w < 0 || (size_t)w >= cap - len) break;
+        len += (size_t)w;
+    }
+    return len;
+}
+
+/* A finding of a check whose severity the configuration may set (check-* options, batch 7): sev is CHK_FAIL (an error), CHK_WARN (a warning),
+ * CHK_IGNORE (nothing), or CHK_DEFAULT, which keeps the severity KariDNS always gave the finding: dflt = 'E', 'W' or 'N' (nothing). */
+void kc_finding(kc_tally_t *t, uint8_t sev, char dflt, const char *fmt, ...) {
+    char lvl = sev == CHK_FAIL ? 'E' : sev == CHK_WARN ? 'W' : sev == CHK_IGNORE ? 'N' : dflt;
+    if (lvl == 'N') return;
+    va_list ap;
+    va_start(ap, fmt);
+    if (lvl == 'E') kc_vreport(t, t ? &t->errors : NULL, 'E', stderr, "ERROR", fmt, ap);
+    else kc_vreport(t, t ? &t->warnings : NULL, 'W', stderr, "WARNING", fmt, ap);
+    va_end(ap);
+}
+
 /* a continuation line of the finding before it (stderr, no tag; the text carries its own indent) */
 void kc_detail(kc_tally_t *t, const char *fmt, ...) {
     va_list ap;
@@ -434,7 +493,10 @@ static bool is_strict_subdomain_of(const char *name, const char *parent) {
 /* NS のターゲットに名前があり、そのアドレスがこのゾーンに無ければ委任/ゾーンが引けない (ERROR、RFC 9471 は委任の
  * グルー)。MX/SRV のターゲットにアドレスを求める RFC はないので警告にとどめる (K-02、RFC 8976 Appendix A.2)。
  * 重複の検査は NS と MX/SRV で分ける (同じ名前の MX が先にあっても NS のエラーを隠さない)。 */
-static void lint_glue_consistency(const char *domain, zone_arena_t *arena, kc_tally_t *t) {
+static uint8_t lint_sev(const zone_lint_in_t *in, int c) { return (in && in->chk) ? in->chk[c] : CHK_DEFAULT; }
+
+static void lint_glue_consistency(const zone_lint_in_t *in, const char *domain, zone_arena_t *arena, kc_tally_t *t) {
+    if (lint_sev(in, ZC_INTEGRITY) == CHK_IGNORE) return;   /* check-integrity no: neither the NS glue nor the MX / SRV addresses are looked for */
     char checked_targets[2][64][256];
     int checked_count[2] = {0, 0};
 
@@ -547,7 +609,7 @@ static void lint_delegation_occlusion(const char *domain, zone_arena_t *arena, k
     }
 }
 
-static void lint_cname_targets(const char *domain, zone_arena_t *arena, kc_tally_t *t) {
+static void lint_cname_targets(const zone_lint_in_t *in, const char *domain, zone_arena_t *arena, kc_tally_t *t) {
     (void)domain;
     // 1. RFC 2181 section 10.3: NS and MX targets must not point to CNAME (ERROR)
     for (size_t i = 0; i < arena->count; i++) {
@@ -566,8 +628,9 @@ static void lint_cname_targets(const char *domain, zone_arena_t *arena, kc_tally
         for (size_t j = 0; j < arena->count; j++) {
             dns_record_t *c = &arena->records[j];
             if (c->type_code == 5 && domain_names_match_ci(c->name, target)) {
-                kc_error(t, "%s record '%s' points to CNAME target '%s' (RFC 2181 section 10.3)\n",
-                        type_name, rec->name, target);
+                /* an NS target that is an alias always fails; check-mx-cname sets the severity of an MX target (BIND default warn, here error) */
+                kc_finding(t, rec->type_code == 15 ? lint_sev(in, ZC_MX_CNAME) : (uint8_t)CHK_DEFAULT, 'E',
+                           "%s record '%s' points to CNAME target '%s' (RFC 2181 section 10.3)\n", type_name, rec->name, target);
                 break;
             }
         }
@@ -581,7 +644,7 @@ static void lint_cname_targets(const char *domain, zone_arena_t *arena, kc_tally
         for (size_t j = 0; j < arena->count; j++) {
             dns_record_t *c = &arena->records[j];
             if (c->type_code == 5 && domain_names_match_ci(c->name, rec->rdata[3])) {
-                kc_warning(t, "SRV record '%s' points to CNAME target '%s' (RFC 2782)\n", rec->name, rec->rdata[3]);
+                kc_finding(t, lint_sev(in, ZC_SRV_CNAME), 'W', "SRV record '%s' points to CNAME target '%s' (RFC 2782)\n", rec->name, rec->rdata[3]);
                 break;
             }
         }
@@ -608,6 +671,111 @@ static void lint_cname_targets(const char *domain, zone_arena_t *arena, kc_tally
                 break;
             }
         }
+    }
+}
+
+/* ---- Batch 7: checks selected by check-wildcard, check-dup-records, check-mx and check-names (BIND 9.20 bin/named/zoneconf.c, lib/dns/master.c,
+ * lib/dns/zone.c).  Their default (check-* not written) is "no finding": KariDNS has never reported these, so a zone that karicheck passed
+ * yesterday still passes; BIND's own defaults (warn, warn, warn, fail) apply only to what the configuration writes. ---- */
+
+/* an owner name with a `*` label that is not the leftmost one: BIND dns_name_internalwildcard() ("ownername '%s' contains a non-terminal wildcard") */
+static bool lint_internal_wildcard(const char *name) {
+    size_t n = dns_name_len_no_root(name, strlen(name));
+    for (size_t i = 0; i < n; i++) {
+        if (name[i] == '\\') { i++; continue; }
+        if (name[i] != '*') continue;
+        bool lstart = i == 0 || name[i - 1] == '.';
+        bool lend = i + 1 == n || name[i + 1] == '.';
+        if (lstart && lend && i != 0) return true;   /* a whole label `*` that is not the first label */
+    }
+    return false;
+}
+
+static void lint_wildcard(const zone_lint_in_t *in, zone_arena_t *arena, kc_tally_t *t) {
+    uint8_t sev = lint_sev(in, ZC_WILDCARD);
+    if (sev == CHK_DEFAULT || sev == CHK_IGNORE) return;
+    for (size_t i = 0; i < arena->count; i++) {
+        const dns_record_t *r = &arena->records[i];
+        if (!r->name || !lint_internal_wildcard(r->name)) continue;
+        bool seen = false;   /* once per name */
+        for (size_t j = 0; j < i && !seen; j++) seen = arena->records[j].name && domain_names_match_ci(arena->records[j].name, r->name);
+        if (!seen) kc_finding(t, CHK_WARN, 'W', "ownername '%s' contains a non-terminal wildcard (check-wildcard)\n", r->name);
+    }
+}
+
+/* the same RR twice in one RRset (BIND check-dup-records: "<name>: <type>/<class> has duplicate rdata" at load) */
+static void lint_dup_records(const zone_lint_in_t *in, zone_arena_t *arena, kc_tally_t *t) {
+    uint8_t sev = lint_sev(in, ZC_DUP_RECORDS);
+    if (sev == CHK_DEFAULT || sev == CHK_IGNORE || !arena->hash_table || arena->hash_size == 0) return;
+    for (size_t i = 0; i < arena->count; i++) {
+        const dns_record_t *a = &arena->records[i];
+        if (!a->name) continue;
+        size_t slot = calc_fnv1a_str(a->name) & (arena->hash_size - 1);
+        for (int j = arena->hash_table[slot]; j != -1; j = arena->records[j].next_record) {
+            const dns_record_t *b = &arena->records[j];
+            if ((size_t)j <= i || !b->name || b->type_code != a->type_code || !domain_names_match_ci(a->name, b->name)) continue;
+            if (!compare_records(a, b, true)) continue;
+            kc_finding(t, sev, 'W', "'%s' %s has duplicate rdata (check-dup-records)\n", a->name, a->type ? a->type : "(type)");
+            break;   /* one finding per record that has a later twin */
+        }
+    }
+}
+
+/* an MX whose target is an IP address: the target must be a host name (RFC 1035 §3.3.9, RFC 5321 §5.1; BIND check-mx: "MX is an address") */
+static void lint_mx_address(const zone_lint_in_t *in, zone_arena_t *arena, kc_tally_t *t) {
+    uint8_t sev = lint_sev(in, ZC_MX);
+    if (sev == CHK_DEFAULT || sev == CHK_IGNORE) return;
+    for (size_t i = 0; i < arena->count; i++) {
+        const dns_record_t *r = &arena->records[i];
+        if (r->type_code != 15 || r->rdata_count < 2 || !r->rdata[1]) continue;
+        uint8_t b[16];
+        size_t tl = dns_name_len_no_root(r->rdata[1], strlen(r->rdata[1]));
+        char tmp[64];
+        if (tl == 0 || tl >= sizeof(tmp)) continue;
+        memcpy(tmp, r->rdata[1], tl);
+        tmp[tl] = '\0';
+        if (inet_pton(AF_INET, tmp, b) == 1 || inet_pton(AF_INET6, tmp, b) == 1)
+            kc_finding(t, sev, 'W', "MX record '%s' has the IP address '%s' as its target (check-mx)\n", r->name, tmp);
+    }
+}
+
+/* check-names: a host name is letters, digits and hyphens, no label starting or ending with a hyphen (RFC 952, RFC 1123 §2.1; BIND
+ * dns_name_ishostname()).  A leading `*` label is allowed in an owner name.  `\` escapes make a name something else than a host name. */
+static bool lint_is_hostname(const char *name, bool wildcard_ok) {
+    size_t n = dns_name_len_no_root(name, strlen(name));
+    if (n == 0) return true;   /* the root */
+    size_t label_start = 0;
+    for (size_t i = 0; i <= n; i++) {
+        if (i < n && name[i] != '.') {
+            char c = name[i];
+            bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' ||
+                      (c == '*' && wildcard_ok && i == 0 && (n == 1 || name[1] == '.'));
+            if (!ok) return false;
+            continue;
+        }
+        if (i == label_start) return false;   /* an empty label */
+        if (name[label_start] == '-' || name[i - 1] == '-') return false;
+        label_start = i + 1;
+    }
+    return true;
+}
+
+static void lint_check_names(const zone_lint_in_t *in, zone_arena_t *arena, kc_tally_t *t) {
+    uint8_t sev = (in && in->chk) ? in->chk_names : (uint8_t)CHK_DEFAULT;   /* a caller without a policy (chk == NULL) leaves chk_names at 0, which is fail */
+    if (sev == CHK_DEFAULT || sev == CHK_IGNORE) return;
+    for (size_t i = 0; i < arena->count; i++) {
+        const dns_record_t *r = &arena->records[i];
+        if (!r->name) continue;
+        const char *target = NULL;
+        bool owner = r->type_code == 1 || r->type_code == 28 || r->type_code == 15;   /* A, AAAA, MX: the owner is a host */
+        if (r->type_code == 2 && r->rdata_count >= 1) target = r->rdata[0];
+        else if (r->type_code == 15 && r->rdata_count >= 2) target = r->rdata[1];
+        else if (r->type_code == 33 && r->rdata_count >= 4) target = r->rdata[3];
+        else if (r->type_code == 6 && r->rdata_count >= 1) target = r->rdata[0];
+        if (owner && !lint_is_hostname(r->name, true))
+            kc_finding(t, sev, 'E', "%s record owner '%s' is not a valid host name (check-names)\n", r->type ? r->type : "?", r->name);
+        if (target && strcmp(target, ".") != 0 && !lint_is_hostname(target, false))
+            kc_finding(t, sev, 'E', "%s record '%s': the name '%s' is not a valid host name (check-names)\n", r->type ? r->type : "?", r->name, target);
     }
 }
 
@@ -1457,10 +1625,14 @@ void zone_lint_records(zone_arena_t *arena, const zone_lint_in_t *in, kc_tally_t
         }
     }
 
-    lint_glue_consistency(domain, arena, t);
+    lint_glue_consistency(in, domain, arena, t);
     lint_cname_coexistence(domain, arena, t);
     lint_delegation_occlusion(domain, arena, t);
-    lint_cname_targets(domain, arena, t);
+    lint_cname_targets(in, domain, arena, t);
+    lint_wildcard(in, arena, t);
+    lint_dup_records(in, arena, t);
+    lint_mx_address(in, arena, t);
+    lint_check_names(in, arena, t);
     lint_nsec3(domain, arena, t);
     /* K-02: 他のエラーがあっても ZONEMD は検証する (結果は件数に入る) */
     verify_zonemd(domain, arena, t);

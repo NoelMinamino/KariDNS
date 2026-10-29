@@ -358,7 +358,7 @@ options {
 
     allow-program-zones yes; # Required if using type program zones
     tcp-connection-reuse yes;
-    tcp-idle-timeout 10000; # milliseconds
+    tcp-idle-timeout 100; # units of 100 ms, as in BIND (10 s); "10000ms" is also accepted
     minimal-any yes;
     nsid "karidns-node-01";
 

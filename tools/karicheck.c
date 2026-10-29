@@ -398,6 +398,22 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         free(root_path);
         return 1;
     }
+    /* batch 7: the check-* severities and the size limits (max-records, max-records-per-type, max-types-per-name, max-zone-ttl) that apply to the zone;
+     * the server refuses a zone that breaks a limit (reload_master_zone()), so this is an error here too */
+    zone_veff_t veff;
+    zone_vopts_effective(cfg, zcfg, view ? view->name : NULL, &veff);
+    {
+        zone_limits_t lim;
+        zone_limits_effective(cfg, zcfg, view ? view->name : NULL, &lim);
+        char lim_err[320];
+        if (zone_arena_check_limits(&arena, &lim, lim_err, sizeof(lim_err)) < 0) {
+            kc_error(&tally, "Zone '%s': %s (the server does not load this zone)\n", domain, lim_err);
+            free((void*)ctx.base_dir);
+            zone_arena_destroy(&arena);
+            free(root_path);
+            return 1;
+        }
+    }
     {   /* B9a (design 3.6b): PowerDNS ALIAS / LUA records.  The same rules the server applies when it publishes the zone. */
         char pdns_why[400];
         if (validate_zone_pdns_types(&arena, &err, pdns_why, sizeof(pdns_why)) < 0) {
@@ -422,6 +438,8 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         lin.ecs_tag_count = (zcfg && zext(zcfg)->ecs_tags) ? zext(zcfg)->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0);
         lin.loc_tags = (zcfg && zext(zcfg)->location_tags) ? zext(zcfg)->location_tags : (cfg ? cfg->location_tags : NULL);
         lin.loc_tag_count = (zcfg && zext(zcfg)->location_tags) ? zext(zcfg)->location_tag_count : (cfg ? cfg->location_tag_count : 0);
+        lin.chk = veff.chk;
+        lin.chk_names = veff.check_names;
         zone_lint_records(&arena, &lin, &tally);
     }
 
@@ -1563,6 +1581,16 @@ KARIDNS_TOOL_FN int kc_db_run_source(const server_config_t *cfg, const kc_dbsrc_
     for (int i = 0; i < cfg->location_tag_count && i < 256; i++) {
         argv[a++] = "--location-tag";
         argv[a++] = cfg->location_tags[i].tag;
+    }
+    /* batch 7: the check-* severities of the configuration (a database zone is a primary zone; the first view that takes the source decides) */
+    char zchecks[400];
+    {
+        zone_veff_t veff;
+        zone_vopts_effective(cfg, NULL, src->nmem ? src->mem[0].v->name : NULL, &veff);
+        if (zone_lint_policy_format(veff.chk, veff.chk[ZC_NAMES_PRIMARY], zchecks, sizeof(zchecks)) > 0) {
+            argv[a++] = "--zone-checks";
+            argv[a++] = zchecks;
+        }
     }
     argv[a] = NULL;
 

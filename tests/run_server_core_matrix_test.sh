@@ -199,7 +199,7 @@ options {
     user "nobody";
     group "nobody";
     pid-file "$TMP/a/a.pid";
-    tcp-idle-timeout 2;
+    tcp-idle-timeout 2ms;
     tcp-connection-reuse yes;
     allow-program-zones yes;
     query-log-buffer-size 1024;

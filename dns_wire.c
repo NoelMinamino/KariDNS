@@ -4226,9 +4226,14 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
     uint16_t keepalive_val = 0;
     bool include_keepalive = false;
     if (is_tcp && edns && edns->has_keepalive_query && cfg && cfg->tcp_connection_reuse) {
-        uint32_t ms = (cfg && cfg->tcp_idle_timeout > 0) ? cfg->tcp_idle_timeout : 10000;
-        keepalive_val = (uint16_t)(ms / 100);
-        if (keepalive_val == 0) keepalive_val = 1;
+        if (cfg->tcp_advertised_set) {
+            /* tcp-advertised-timeout (BIND): what the option says, whatever the idle timeout is; 0 is allowed (RFC 7828 §3.3.2: close at once) */
+            keepalive_val = cfg->tcp_advertised_units;
+        } else {
+            uint32_t ms = (cfg->tcp_idle_timeout > 0) ? cfg->tcp_idle_timeout : 10000;
+            keepalive_val = (uint16_t)(ms / 100 > 65535 ? 65535 : ms / 100);   /* the option field is 16 bits */
+            if (keepalive_val == 0) keepalive_val = 1;
+        }
         include_keepalive = true;
         rdlen += 4 + 2;
     }
@@ -4486,6 +4491,47 @@ int process_update_sections(const uint8_t *req, size_t req_len,
                              const char *zone_name,
                              zone_arena_t *standby,
                              update_result_t *out) {
+    return process_update_sections_policy(req, req_len, zone_name, standby, out, NULL, NULL);
+}
+
+/* update-policy (lib/dns/ssu.c dns_ssutable_checkrules()): see dns_wire.h.  A name is a subdomain of another when it is at or below it. */
+static bool upd_below(const char *name, const char *parent) { return domain_name_is_at_or_below(name, parent); }
+static bool upd_proper_below(const char *name, const char *parent) { return upd_below(name, parent) && !domain_names_match_ci(name, parent); }
+
+bool update_policy_allows(const update_policy_t *pol, const char *signer, const char *name, uint16_t type) {
+    if (!pol || !signer || !name) return false;
+    for (int i = 0; i < pol->count; i++) {
+        const update_rule_t *r = &pol->rules[i];
+        /* the identity: the signer's name, or *.suffix for a signer below suffix (dns_name_matcheswildcard() is a proper subdomain) */
+        if (r->ident_wild ? !upd_proper_below(signer, r->identity + 2) : !domain_names_match_ci(signer, r->identity)) continue;
+        bool m = false;
+        switch (r->mtype) {
+            case UPD_NAME: m = domain_names_match_ci(name, r->name); break;
+            case UPD_SUBDOMAIN: m = upd_below(name, r->name); break;
+            case UPD_WILDCARD: m = upd_proper_below(name, r->name + 2); break;
+            case UPD_SELF: m = domain_names_match_ci(name, signer); break;
+            case UPD_SELFSUB: m = upd_below(name, signer); break;
+            case UPD_SELFWILD: m = upd_proper_below(name, signer); break;
+            default: break;
+        }
+        if (!m) continue;
+        if (r->ntypes == 0) {
+            if (type == 2 || type == 6 || type == 46) continue;   /* isusertype(): not NS, SOA, RRSIG */
+        } else {
+            bool t = false;
+            for (int k = 0; k < r->ntypes && !t; k++) t = r->types[k] == 255 || r->types[k] == type;
+            if (!t) continue;
+        }
+        return r->grant;
+    }
+    return false;
+}
+
+int process_update_sections_policy(const uint8_t *req, size_t req_len,
+                             const char *zone_name,
+                             zone_arena_t *standby,
+                             update_result_t *out,
+                             const update_policy_t *pol, const char *signer) {
     update_result_t result;
     memset(&result, 0, sizeof(result));
     if (out) *out = result;
@@ -4595,6 +4641,18 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             if (ttl != 0 || update_type_is_meta(type)) return 1;
         } else {
             return 1; // FORMERR
+        }
+        /* update-policy: nothing has been changed yet, so a refusal leaves the zone as it is (lib/ns/update.c: "denied by update-policy" is REFUSED) */
+        if (pol) {
+            if (class_val == 255 && type == 255) {
+                /* every RRset of the name goes: each type that is there must be allowed (ssu_checkall()) */
+                for (int k = update_bucket_head(standby, name); k != -1; k = standby->records[k].next_record) {
+                    if (!update_rec_is_at(&standby->records[k], name)) continue;
+                    if (!update_policy_allows(pol, signer, name, standby->records[k].type_code)) return 5; // REFUSED
+                }
+            } else if (!update_policy_allows(pol, signer, name, type)) {
+                return 5; // REFUSED
+            }
         }
     }
 

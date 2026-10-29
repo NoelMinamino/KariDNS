@@ -408,6 +408,9 @@ typedef struct {
     size_t chk_nmap, chk_cmap;
     ecs_tag_def_t *chk_ecs, *chk_loc; /* names of the tag definitions of the server configuration (--ecs-tag / --location-tag): only .tag is set */
     int chk_necs, chk_nloc;
+    uint8_t chk_pol[ZC_N];            /* --zone-checks: the check-* severities of the configuration (CHK_DEFAULT where nothing is written) */
+    uint8_t chk_names;
+    bool chk_have_pol;
 } ctx_t;
 
 static int stream_write(ctx_t *x, const uint8_t *msg, size_t len);
@@ -1192,6 +1195,8 @@ static void chk_zone_report(ctx_t *x, const zinfo_t *zi, pdns_zone_t *z, const s
         in.ecs_tag_count = x->chk_necs;
         in.loc_tags = x->chk_loc;
         in.loc_tag_count = x->chk_nloc;
+        in.chk = x->chk_have_pol ? x->chk_pol : NULL;
+        in.chk_names = x->chk_names;
         zone_lint_records(&z->arena, &in, &t);
         if (z->serial == 0)
             chk_linef('W', "the SOA serial is 0; PowerDNS may compute the served serial (SOA-EDIT, auto-serial), but KariDNS uses the stored value as it is, "
@@ -3993,6 +3998,8 @@ static void usage(FILE *fp) {
         "  --ecs-tag NAME      with --check: a tag of options { ecs-tags }; repeatable (records may name it)\n"
         "  --location-tag NAME with --check: a tag of options { location-tags }; repeatable\n"
         "  --max-zone-records N, --max-zone-bytes N   with --check: the limits of the database block\n"
+        "  --zone-checks LIST  with --check: the check-* severities, name=fail|warn|ignore,... (names, dup-records, integrity, mx, mx-cname, sibling,\n"
+        "                      spf, srv-cname, svcb, wildcard)\n"
         "  --version           print the version\n"
         "  -h, --help          this text\n"
         "\n"
@@ -4033,13 +4040,14 @@ int main(int argc, char **argv) {
         { "server-id", required_argument, NULL, 1003 },    { "ecs-tag", required_argument, NULL, 1004 },
         { "location-tag", required_argument, NULL, 1005 }, { "max-zone-records", required_argument, NULL, 1006 },
         { "max-zone-bytes", required_argument, NULL, 1007 },
+        { "zone-checks", required_argument, NULL, 1008 },
         { "help", no_argument, NULL, 'h' },                { NULL, 0, NULL, 0 }
     };
     const char *dump = NULL, *driver = NULL, *dbfile = NULL, *conninfo = NULL, *schema = NULL, *zone = NULL, *map_view = NULL;
     const char *stream_fd = NULL;
     unsigned long view = 0, ttl = 0, threads = 1, v, max_records = 0, max_bytes = 0;
     bool check = false, chk_auto = false;                 // B12
-    const char *chk_server_id = NULL;
+    const char *chk_server_id = NULL, *chk_zone_checks = NULL;
     const char *chk_ecs[256], *chk_loc[256];
     int n_chk_ecs = 0, n_chk_loc = 0;
     int ch;
@@ -4083,6 +4091,7 @@ int main(int argc, char **argv) {
             if (ch == 1004) chk_ecs[n_chk_ecs++] = optarg;
             else chk_loc[n_chk_loc++] = optarg;
             break;
+        case 1008: chk_zone_checks = optarg; break;
         case 1006:
             if (!parse_uint(optarg, 2, 4294967295ul, &max_records)) {
                 fprintf(stderr, "karidns-dbloader: --max-zone-records must be 2..4294967295\n");
@@ -4123,8 +4132,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "karidns-dbloader: --check cannot be combined with --dump, --zone or --map-view\n");
         return EXIT_USAGE;
     }
-    if (!check && (chk_auto || chk_server_id || n_chk_ecs || n_chk_loc || max_records || max_bytes)) {
-        fprintf(stderr, "karidns-dbloader: --auto-reload, --server-id, --ecs-tag, --location-tag, --max-zone-records and --max-zone-bytes are for --check\n");
+    if (!check && (chk_auto || chk_server_id || chk_zone_checks || n_chk_ecs || n_chk_loc || max_records || max_bytes)) {
+        fprintf(stderr, "karidns-dbloader: --auto-reload, --server-id, --ecs-tag, --location-tag, --max-zone-records, --max-zone-bytes and --zone-checks are for --check\n");
         return EXIT_USAGE;
     }
     if ((!dump && !check) || !driver) {
@@ -4187,6 +4196,15 @@ int main(int argc, char **argv) {
         x.chk_necs = n_chk_ecs;
         x.chk_loc = tags + n_chk_ecs;
         x.chk_nloc = n_chk_loc;
+        if (chk_zone_checks) {
+            char perr[200];
+            if (zone_lint_policy_parse(chk_zone_checks, x.chk_pol, &x.chk_names, perr, sizeof(perr)) != 0) {
+                fprintf(stderr, "karidns-dbloader: --zone-checks: %s\n", perr);
+                free(tags);
+                return EXIT_USAGE;
+            }
+            x.chk_have_pol = true;
+        }
         g_chk_out = stdout;
         setvbuf(stdout, NULL, _IOLBF, 0);
         db_source_t csrc = { drv->name, dbfile, conninfo, schema, 0 };

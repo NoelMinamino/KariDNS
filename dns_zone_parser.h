@@ -233,6 +233,10 @@ const dns_record_t *zone_arena_reference_soa(const zone_arena_t *arena, const ch
  * per-client SOA RRs): all apex SOA RRs have the same serial, and none is restricted or accompanied by another SOA in a
  * zone that holds DNSSEC records (RRSIG, DNSKEY, NSEC, NSEC3). 0 = ok, -1 = the zone must not be loaded (reason in err). */
 int zone_arena_check_soa_set(const zone_arena_t *arena, const char *zone, char *err, size_t errlen);
+/* The size limits of a zone (BIND 9.20 max-records, max-records-per-type, max-types-per-name, max-zone-ttl); 0 = no limit.  max_zone_ttl is for
+ * primary zones (a TTL above it fails the load).  zone_arena_check_limits(): 0 = ok, -1 = the zone must not be loaded (reason in err).  The arena
+ * must be indexed (build_zone_index()).  Allocates: load path only. */
+int zone_arena_check_limits(const zone_arena_t *arena, const zone_limits_t *lim, char *err, size_t errlen);
 bool compare_records(const dns_record_t *a, const dns_record_t *b, bool ignore_ttl);
 bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target);
 uint32_t calc_fnv1a_str(const char *str);

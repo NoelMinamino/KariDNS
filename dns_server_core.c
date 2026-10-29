@@ -1725,8 +1725,8 @@ STATIC_TEST tcp_sockopts_t xfr_tcp_sockopts(const server_config_t *cfg, const zo
   tcp_sockopts_t o = {0};
   if (cfg) {
     o.mss = cfg->tcp_mss;
-    o.rcvbuf = cfg->tcp_window;
-    o.sndbuf = cfg->tcp_window;
+    o.rcvbuf = cfg_tcp_rcvbuf(cfg);
+    o.sndbuf = cfg_tcp_sndbuf(cfg);
   }
   if (zcfg) {
     if (zext(zcfg)->zone_tcp_mss > 0) o.mss = zext(zcfg)->zone_tcp_mss;
@@ -1857,11 +1857,12 @@ static void xfr_build_primaries(server_config_t *active, zone_db_snapshot_t *sna
  * accept 直後に apply_tcp_mss() で各接続へ当てる。)
  * ワーカーごとに listen ソケットを作るので、ログは verbose なワーカーだけが出す。 */
 STATIC_TEST void apply_tcp_listen_opts(int fd, const server_config_t *cfg, bool verbose) {
-  if (!cfg || cfg->tcp_window <= 0) return;
+  if (!cfg || (cfg_tcp_rcvbuf(cfg) <= 0 && cfg_tcp_sndbuf(cfg) <= 0)) return;
   static const int opts[2] = { SO_RCVBUF, SO_SNDBUF };
   static const char *const names[2] = { "SO_RCVBUF", "SO_SNDBUF" };
   for (int k = 0; k < 2; k++) {
-    int want = cfg->tcp_window;
+    int want = k == 0 ? cfg_tcp_rcvbuf(cfg) : cfg_tcp_sndbuf(cfg);   /* tcp-window, or tcp-receive-buffer / tcp-send-buffer */
+    if (want <= 0) continue;
     if (setsockopt(fd, SOL_SOCKET, opts[k], &want, sizeof(want)) != 0) {
       if (verbose)
         syslog(LOG_WARNING, "[Network] Failed to set TCP %s to %d (tcp-window): %m", names[k], want);
@@ -2922,6 +2923,7 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
   if (o->udp_recvbuf_size != n->udp_recvbuf_size) append_list_item(buf, sz, "udp-recvbuf-size");
   if (o->udp_sndbuf_size != n->udp_sndbuf_size) append_list_item(buf, sz, "udp-sndbuf-size");
   if (o->tcp_window != n->tcp_window) append_list_item(buf, sz, "tcp-window");
+  if (cfg_tcp_rcvbuf(o) != cfg_tcp_rcvbuf(n) || cfg_tcp_sndbuf(o) != cfg_tcp_sndbuf(n)) append_list_item(buf, sz, "tcp-receive-buffer / tcp-send-buffer");
   if (o->response_cache_size != n->response_cache_size) append_list_item(buf, sz, "response-cache-size");
   if (o->control.enabled != n->control.enabled || str_differs(o->control.socket_path, n->control.socket_path))
     append_list_item(buf, sz, "control-channel socket");

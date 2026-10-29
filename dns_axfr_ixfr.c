@@ -909,6 +909,30 @@ time_t xfr_expire_deadline(bool transferred, bool has_expire, uint32_t expire_op
  * 戻り値 0: builder の image は公開した版に移り (builder に残るのはレコード等の解放済みの殻)、entry の公開が済んでいる。
  * 戻り値 -1: 何も公開していない (ログ済み。what は "after %s" に入る)。image はここで解放しないので builder に残る。
  * どちらの場合も builder は呼ぶ側が zone_arena_destroy() する (二重に呼んでも安全)。*/
+/* batch 7: max-records, max-records-per-type, max-types-per-name (and max-zone-ttl of a primary zone) apply to a zone that arrives by transfer or
+ * from a database as they do to a zone file (BIND: xfrin.c and zone.c both fail on DNS_R_TOOMANYRECORDS).  The transfer calls it before it records
+ * the new serial and timers of the zone, so a refused zone leaves the old version, its serial and its refresh schedule as they were (the primary is
+ * asked again at the retry interval).  0 = within the limits, -1 = refused (logged) or out of memory. */
+int zone_limits_gate(zone_db_entry_t *entry, zone_arena_t *builder, const char *what) {
+  zone_limits_t lim;
+  rcu_aux_read_lock();
+  server_config_t *lim_cfg = acquire_config_snapshot();
+  zone_limits_effective(lim_cfg, zone_entry_config(lim_cfg, entry), entry->view_name, &lim);
+  release_config_snapshot(lim_cfg);
+  rcu_aux_read_unlock();
+  if (!lim.max_records && !lim.max_per_type && !lim.max_types_per_name && !lim.max_zone_ttl) return 0;
+  if ((lim.max_per_type || lim.max_types_per_name) && !builder->hash_table && build_zone_index(builder, true) != 0) {
+    syslog(LOG_ERR, "[Zone] Memory allocation failed while checking the limits of '%s' after %s", entry->domain, what);
+    return -1;
+  }
+  char lim_err[320];
+  if (zone_arena_check_limits(builder, &lim, lim_err, sizeof(lim_err)) < 0) {
+    syslog(LOG_ERR, "[Zone] zone '%s' not installed after %s: %s", entry->domain, what, lim_err);
+    return -1;
+  }
+  return 0;
+}
+
 int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const char *what) {
   zone_version_t *cur_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
 
@@ -917,6 +941,7 @@ int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const ch
     syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after %s for '%s'", what, entry->domain);
     return -1;
   }
+  if (zone_limits_gate(entry, builder, what) != 0) return -1;
 
   /* S5 B-1: 応答を作る側が読むイメージ。公開の直前に 1 回だけ作る。作れなければ索引を作れなかったときと同じく捨てる */
   builder->image = zone_image_freeze(builder, entry->domain);
@@ -1171,6 +1196,13 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
             has_soa = true;
             break;
           }
+        }
+
+        /* batch 7: a zone over max-records & co. is refused here, before the serial and the timers of the zone are replaced (zone_limits_gate()) */
+        if (zone_limits_gate(entry, &tmp_arena, "XFR") != 0) {
+          if (unsigned_msgs) free(unsigned_msgs);
+          zone_arena_destroy(&tmp_arena);
+          return -1;
         }
 
         /* B8t-2: the settings of the primary (v3), kept past the install; a v3 transfer without them clears the earlier ones */

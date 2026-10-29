@@ -3419,7 +3419,7 @@ int main() {
 
         // 1. tcp-idle-timeout valid & invalid
         memset(&cfg_num, 0, sizeof(cfg_num));
-        const char *conf_timeout_ok = "options { tcp-idle-timeout 30000; };\n";
+        const char *conf_timeout_ok = "options { tcp-idle-timeout 30000ms; };\n";
         if (parse_named_conf(conf_timeout_ok, &cfg_num) != 0 || cfg_num.tcp_idle_timeout != 30000) {
             printf("FAIL: valid tcp-idle-timeout 30000 not accepted (got %d)\n", cfg_num.tcp_idle_timeout);
             return 1;

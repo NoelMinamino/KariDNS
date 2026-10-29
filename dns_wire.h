@@ -107,6 +107,14 @@ typedef struct {
 // ============================================================================
 struct zone_arena_s;
 typedef struct zone_arena_s zone_arena_t;
+
+/* The size limits of a zone (BIND 9.20 max-records, max-records-per-type, max-types-per-name, max-zone-ttl); 0 = no limit.  See
+ * zone_limits_effective() (dns_config_parser.h) and zone_arena_check_limits() (dns_zone_parser.h). */
+typedef struct {
+  uint64_t max_records;
+  uint32_t max_per_type, max_types_per_name, max_zone_ttl;
+} zone_limits_t;
+
 void *arena_alloc(zone_arena_t *arena, size_t size);
 
 // ============================================================================
@@ -595,6 +603,33 @@ int process_update_sections(const uint8_t *req, size_t req_len,
                              const char *zone_name,
                              zone_arena_t *standby,
                              update_result_t *out);
+
+/* ---- update-policy (BIND 9.20 lib/dns/ssu.c dns_ssutable_checkrules(), bin/named/zoneconf.c configure_zone_ssutable()).  The rules are read by the
+ * configuration parser; the signer is the name of the TSIG key that signed the UPDATE.  Rule types: name, subdomain (zonesub is a subdomain rule
+ * for the zone), wildcard, self, selfsub, selfwild; the others (krb5-*, ms-*, tcp-self, 6to4-self, external) need Kerberos, the transport
+ * address or a helper program and are not read as rules (a grant is dropped, which can only deny more, a deny is an error). ---- */
+enum { UPD_NAME = 0, UPD_SUBDOMAIN, UPD_WILDCARD, UPD_SELF, UPD_SELFSUB, UPD_SELFWILD };
+#define UPD_RULES_MAX 64
+#define UPD_TYPES_MAX 16
+typedef struct {
+    bool grant;
+    uint8_t mtype;                  /* UPD_* */
+    bool ident_wild;                /* the identity is *.suffix: any signer below suffix */
+    char identity[256];
+    char name[256];                 /* the name a rule applies to (the zone for zonesub); for wildcard the *.suffix pattern */
+    uint8_t ntypes;                 /* 0 = every type except NS, SOA and RRSIG; 255 in types = ANY */
+    uint16_t types[UPD_TYPES_MAX];
+} update_rule_t;
+typedef struct {
+    int count;
+    update_rule_t rules[UPD_RULES_MAX];
+} update_policy_t;
+/* The first rule that matches decides: true = grant.  signer == NULL (unsigned) never matches. */
+bool update_policy_allows(const update_policy_t *pol, const char *signer, const char *name, uint16_t type);
+/* process_update_sections() with an update-policy: before anything is changed, every add / delete of the UPDATE is checked (a delete of every RRset
+ * of a name checks each type found there); one that is not granted makes the whole UPDATE REFUSED (5). pol == NULL: no policy. */
+int process_update_sections_policy(const uint8_t *req, size_t req_len, const char *zone_name, zone_arena_t *standby, update_result_t *out,
+                                   const update_policy_t *pol, const char *signer);
 
 // ============================================================================
 // Protocol Buffers Encoder (Minimal, Dependency-Free)

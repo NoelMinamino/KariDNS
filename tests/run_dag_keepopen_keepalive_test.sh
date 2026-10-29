@@ -95,7 +95,7 @@ options {
     user "nobody";
     group "nobody";
     tcp-connection-reuse yes;
-    tcp-idle-timeout 10000;
+    tcp-idle-timeout 10000ms;
 };
 
 zone "example.com" {

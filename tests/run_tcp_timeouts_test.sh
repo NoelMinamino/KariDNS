@@ -55,8 +55,8 @@ cat > "$TMP_DIR/karidns.conf" <<EOF
 options {
     port $PORT; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT
     tcp-connection-reuse yes;
-    tcp-initial-timeout 1500;
-    tcp-idle-timeout 1200;
+    tcp-initial-timeout 1500ms;
+    tcp-idle-timeout 1200ms;
 };
 zone "example.test" { type primary; file "$TMP_DIR/example.test.zone"; };
 EOF

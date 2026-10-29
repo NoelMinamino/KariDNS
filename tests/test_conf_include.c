@@ -446,7 +446,7 @@ int main(void) {
                     "    max-mqtypes 8;\n"
                     "    allow-program-zones yes;\n"
                     "    nsid \"karidns-tokyo\";\n"
-                    "    tcp-idle-timeout 15000;\n"
+                    "    tcp-idle-timeout 15000ms;\n"
                     "    bind-address 127.0.0.1;\n"
                     "};\n"
                     "dnstap {\n"
