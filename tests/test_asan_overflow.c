@@ -3222,15 +3222,20 @@ int main() {
             printf("FAIL: Valid logging config failed to parse\n");
             return 1;
         }
-        if (!cfg1.logging.queries_channel || strcmp(cfg1.logging.queries_channel->name, "query_log") != 0 ||
-            !cfg1.logging.responses_channel || strcmp(cfg1.logging.responses_channel->name, "resp_log") != 0) {
+        log_channel_t *qch = NULL, *rch = NULL;
+        for (log_channel_t *c = cfg1.logging.channels; c; c = c->next) {
+            if (strcmp(c->name, "query_log") == 0) qch = c;
+            if (strcmp(c->name, "resp_log") == 0) rch = c;
+        }
+        if (!qch || !rch || cfg1.logging.cat[LOGC_QUERIES].n != 1 || strcmp(cfg1.logging.cat[LOGC_QUERIES].name[0], "query_log") != 0 ||
+            cfg1.logging.cat[LOGC_RESPONSES].n != 1 || strcmp(cfg1.logging.cat[LOGC_RESPONSES].name[0], "resp_log") != 0) {
             printf("FAIL: logging channel pointer resolution mismatch\n");
             free_server_config_fields(&cfg1);
             return 1;
         }
-        if (cfg1.query_log_max_qps != 5000 || cfg1.logging.queries_channel->max_qps != 5000) {
+        if (cfg1.query_log_max_qps != 5000 || qch->max_qps != 5000) {
             printf("FAIL: default query_log_max_qps should be 5000 (got cfg=%u, ch=%u)\n",
-                   cfg1.query_log_max_qps, cfg1.logging.queries_channel->max_qps);
+                   cfg1.query_log_max_qps, qch->max_qps);
             free_server_config_fields(&cfg1);
             return 1;
         }

@@ -628,7 +628,15 @@ const char *strchr_unescaped(const char *s, char c) {
  * with TSan, so the synchronization inside it (OpenSSL's run-once initialization and its atomics) is invisible, and an
  * interceptor it calls (bcmp, memcpy, ...) may be reported as a race; one such report came from two loader workers that
  * started SHA-256 at the same time.  called_from_lib silences only interceptors called from libcrypto: races in KariDNS's
- * own code are still reported. */
+ * own code are still reported.
+ * FreeBSD's libthr is not instrumented either: it recycles the per-thread blocks of finished threads under its own lock, and
+ * the memset that clears such a block for a new thread (an interceptor called from libthr.so.3, reached through HMAC() in
+ * tsig_sign_packet() and tsig_check_request() the first time a thread uses OpenSSL) is reported as a write/write race with
+ * the finished thread.  A plain OpenSSL program that runs HMAC() in 20 short-lived threads gets the same report, so it is
+ * not a race on KariDNS data.  It has to be `race:` here: called_from_lib:libthr makes TSan ignore the pthread_mutex_*
+ * calls that libc makes through libthr, and it then reports "double lock of a mutex" in syslog() and flockfile().  A
+ * `race:` suppression hides only a report that has a libthr.so frame in one of its stacks, i.e. an access made by libthr
+ * itself. */
 #if defined(__has_feature)
 #if __has_feature(thread_sanitizer)
 #define KARIDNS_TSAN_BUILD 1
@@ -640,7 +648,8 @@ const char *strchr_unescaped(const char *s, char c) {
 #ifdef KARIDNS_TSAN_BUILD
 const char *__tsan_default_suppressions(void);
 const char *__tsan_default_suppressions(void) {
-    return "called_from_lib:libcrypto.so\n";
+    return "called_from_lib:libcrypto.so\n"
+           "race:libthr.so\n";
 }
 #endif
 

@@ -527,11 +527,6 @@ typedef struct {
   log_channel_t *channels;
   log_cat_cfg_t cat[LOGC_COUNT];   /* every `category` statement of the name, in the order written (BIND appends) */
   bool seen;                       /* a logging statement was read */
-  /* the first channel of `category queries` / `category responses` when it is a channel of the file (NULL: a built-in channel, or none) */
-  char *queries_channel_name;
-  log_channel_t *queries_channel;
-  char *responses_channel_name;
-  log_channel_t *responses_channel;
   /* the query log is on: `querylog yes`, or (querylog not written) a `category queries` that lists a channel; the response log is on
    * when `category responses` lists one.  The query path reads only these two. */
   bool queries_enabled;

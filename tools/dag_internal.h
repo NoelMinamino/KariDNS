@@ -310,7 +310,7 @@ typedef struct {
         prereq_kind_t kind;
         char name[256];
         char type_str[32];
-        char rdata[512];
+        char *rdata;  /* strdup'ed, NULL: none; freed by free_query_opts.  Not size limited: RFC 3597 generic RDATA can be 128 KiB */
     } prereqs[MAX_PREREQS];
     int prereq_count;
     uint16_t query_id;

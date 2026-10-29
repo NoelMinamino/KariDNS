@@ -4794,7 +4794,7 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
             spec->qo.prereqs[p].kind = kind;
             snprintf(spec->qo.prereqs[p].name, sizeof(spec->qo.prereqs[p].name), "%s", name);
             snprintf(spec->qo.prereqs[p].type_str, sizeof(spec->qo.prereqs[p].type_str), "%s", needs_type ? type_str : "");
-            snprintf(spec->qo.prereqs[p].rdata, sizeof(spec->qo.prereqs[p].rdata), "%s", rdata ? rdata : "");
+            spec->qo.prereqs[p].rdata = strdup(rdata ? rdata : "");
             free(spec_str);
         }
         return 1;
@@ -4804,7 +4804,7 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
             spec->qo.prereqs[spec->qo.prereq_count].kind = PREREQ_NXDOMAIN;
             snprintf(spec->qo.prereqs[spec->qo.prereq_count].name, sizeof(spec->qo.prereqs[0].name), "%s", argv[i + 1]);
             spec->qo.prereqs[spec->qo.prereq_count].type_str[0] = '\0';
-            spec->qo.prereqs[spec->qo.prereq_count].rdata[0] = '\0';
+            spec->qo.prereqs[spec->qo.prereq_count].rdata = NULL;
             spec->qo.prereq_count++;
         }
         return 2;
@@ -4814,7 +4814,7 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
             spec->qo.prereqs[spec->qo.prereq_count].kind = PREREQ_YXDOMAIN;
             snprintf(spec->qo.prereqs[spec->qo.prereq_count].name, sizeof(spec->qo.prereqs[0].name), "%s", argv[i + 1]);
             spec->qo.prereqs[spec->qo.prereq_count].type_str[0] = '\0';
-            spec->qo.prereqs[spec->qo.prereq_count].rdata[0] = '\0';
+            spec->qo.prereqs[spec->qo.prereq_count].rdata = NULL;
             spec->qo.prereq_count++;
         }
         return 2;
@@ -4823,7 +4823,7 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
         if (spec->qo.prereq_count < MAX_PREREQS) {
             int p = spec->qo.prereq_count;
             spec->qo.prereqs[p].kind = PREREQ_NXRRSET;
-            spec->qo.prereqs[p].rdata[0] = '\0';
+            spec->qo.prereqs[p].rdata = NULL;
             if (strchr(argv[i + 1], ' ') != NULL) {
                 char *buf = strdup(argv[i + 1]);
                 char *name = strtok(buf, " ");
@@ -4851,7 +4851,7 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
         if (spec->qo.prereq_count < MAX_PREREQS) {
             int p = spec->qo.prereq_count;
             spec->qo.prereqs[p].kind = PREREQ_YXRRSET;
-            spec->qo.prereqs[p].rdata[0] = '\0';
+            spec->qo.prereqs[p].rdata = NULL;
             if (strchr(argv[i + 1], ' ') != NULL) {
                 char *buf = strdup(argv[i + 1]);
                 char *name = strtok(buf, " ");
@@ -4862,7 +4862,7 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
                     snprintf(spec->qo.prereqs[p].type_str, sizeof(spec->qo.prereqs[p].type_str), "%s", type_str);
                     if (rdata) {
                         while (*rdata == ' ') rdata++;
-                        snprintf(spec->qo.prereqs[p].rdata, sizeof(spec->qo.prereqs[p].rdata), "%s", rdata);
+                        spec->qo.prereqs[p].rdata = strdup(rdata);
                     }
                     spec->qo.prereq_count++;
                 }
@@ -4873,7 +4873,7 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
                 snprintf(spec->qo.prereqs[p].type_str, sizeof(spec->qo.prereqs[p].type_str), "%s", argv[i + 2]);
                 int consumed = 3;
                 if (i + 3 < argc && argv[i + 3][0] != '-' && argv[i + 3][0] != '+' && argv[i + 3][0] != '@') {
-                    snprintf(spec->qo.prereqs[p].rdata, sizeof(spec->qo.prereqs[p].rdata), "%s", argv[i + 3]);
+                    spec->qo.prereqs[p].rdata = strdup(argv[i + 3]);
                     consumed = 4;
                 }
                 spec->qo.prereq_count++;
@@ -5572,6 +5572,9 @@ void deep_copy_query_opts(query_opts_t *dst, const query_opts_t *src) {
             dst->update_ops[i].raw = strdup(src->update_ops[i].raw);
         }
     }
+    for (int i = 0; i < src->prereq_count; i++) {
+        if (src->prereqs[i].rdata) dst->prereqs[i].rdata = strdup(src->prereqs[i].rdata);
+    }
 }
 
 void free_query_opts(query_opts_t *qo) {
@@ -5592,6 +5595,11 @@ void free_query_opts(query_opts_t *qo) {
             qo->update_ops[i].raw = NULL;
         }
     }
+    for (int i = 0; i < qo->prereq_count; i++) {
+        free(qo->prereqs[i].rdata);
+        qo->prereqs[i].rdata = NULL;
+    }
+    qo->prereq_count = 0;
     qo->update_op_count = 0;
 }
 

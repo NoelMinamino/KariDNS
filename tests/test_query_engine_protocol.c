@@ -721,6 +721,124 @@ static void test_notify_catalog_member(void) {
     printf("  -> NOTIFY for catalog members passed.\n");
 }
 
+/* Batch 13: the key a NOTIFY must carry follows the precedence of the transfers (peer_key_name()): the primaries element's key, the `keys` of the
+ * `server` statement that covers the sender, the zone's tsig-key.  Configured secondaries and catalog members (the catalog zone's primaries and the
+ * copy kept in the member). */
+static void notify_expect(req_t *q, const char *zone, tsig_key_t *key, const char *from, int rcode, const char *what) {
+    gr_resp_t r;
+    atomic_store(&g_gr.entry.refresh_now, false);
+    build_notify(q, zone, key);
+    ask(q, zone, 6, from, false, &r);
+    if (!(r.rcode == rcode && atomic_load(&g_gr.entry.refresh_now) == (rcode == 0))) {
+        fprintf(stderr, "NOTIFY server-statement key: %s: rcode %d (expected %d)\n", what, r.rcode, rcode);
+        abort();
+    }
+}
+
+static void test_notify_server_stmt_key(void) {
+    printf("[TEST] Query engine: NOTIFY key precedence: element, server statement, zone tsig-key...\n");
+    static const char *MASTER = "192.0.2.100";
+    static const char *STRANGER = "203.0.113.9";
+    req_t q;
+
+    /* configured secondary: the server statement's key is above the zone's tsig-key */
+    server_config_t *cfg = notify_cfg("server 192.0.2.100 { keys \"k2\"; };\n"
+                                      "zone \"example.\" { type slave; file \"x\"; masters { 192.0.2.100; }; tsig-key \"k1\"; };");
+    tsig_key_t *k1 = cfg_key(cfg, "k1"), *k2 = cfg_key(cfg, "k2");
+    assert(k1 && k2);
+    gr_setup("example.", ZONE_TXT);
+    g_gr.cfg = *cfg;
+    g_gr.view.name = "__default__";
+    notify_expect(&q, "example.", k2, MASTER, 0, "server key accepted");
+    notify_expect(&q, "example.", k1, MASTER, 5, "zone tsig-key refused when a server key covers the primary");
+    notify_expect(&q, "example.", NULL, MASTER, 5, "unsigned refused");
+    notify_expect(&q, "example.", k2, STRANGER, 5, "server key from a stranger refused");
+    free_server_config_fields(cfg); free(cfg);
+    zone_arena_destroy(&g_gr.arena);
+
+    /* no tsig-key anywhere else: the server statement alone requires the key (an unsigned NOTIFY used to be accepted) */
+    cfg = notify_cfg("server 192.0.2.0/24 { keys \"k2\"; };\n"
+                     "zone \"example.\" { type slave; file \"x\"; masters { 192.0.2.100; }; };");
+    k1 = cfg_key(cfg, "k1"); k2 = cfg_key(cfg, "k2");
+    gr_setup("example.", ZONE_TXT);
+    g_gr.cfg = *cfg;
+    g_gr.view.name = "__default__";
+    notify_expect(&q, "example.", NULL, MASTER, 5, "server statement only: unsigned refused");
+    notify_expect(&q, "example.", k1, MASTER, 5, "server statement only: another key refused");
+    notify_expect(&q, "example.", k2, MASTER, 0, "server statement only: its key accepted");
+    free_server_config_fields(cfg); free(cfg);
+    zone_arena_destroy(&g_gr.arena);
+
+    /* the primaries element's key is above the server statement's */
+    cfg = notify_cfg("server 192.0.2.100 { keys \"k2\"; };\n"
+                     "zone \"example.\" { type slave; file \"x\"; masters { 192.0.2.100 key \"k1\"; }; };");
+    k1 = cfg_key(cfg, "k1"); k2 = cfg_key(cfg, "k2");
+    gr_setup("example.", ZONE_TXT);
+    g_gr.cfg = *cfg;
+    g_gr.view.name = "__default__";
+    notify_expect(&q, "example.", k1, MASTER, 0, "element key above the server key");
+    notify_expect(&q, "example.", k2, MASTER, 5, "server key refused when the element has one");
+    free_server_config_fields(cfg); free(cfg);
+    zone_arena_destroy(&g_gr.arena);
+
+    /* a server statement that sets no keys does not change the zone's rule; one for another address does not apply */
+    cfg = notify_cfg("server 192.0.2.100 { bogus no; };\nserver 198.51.100.0/24 { keys \"k2\"; };\n"
+                     "zone \"example.\" { type slave; file \"x\"; masters { 192.0.2.100; }; tsig-key \"k1\"; };");
+    k1 = cfg_key(cfg, "k1"); k2 = cfg_key(cfg, "k2");
+    gr_setup("example.", ZONE_TXT);
+    g_gr.cfg = *cfg;
+    g_gr.view.name = "__default__";
+    notify_expect(&q, "example.", k1, MASTER, 0, "no keys in the covering server statement: the zone's tsig-key");
+    notify_expect(&q, "example.", k2, MASTER, 5, "a server statement for another prefix does not apply");
+    free_server_config_fields(cfg); free(cfg);
+    zone_arena_destroy(&g_gr.arena);
+
+    /* catalog member, primaries of the catalog zone: server key above the catalog zone's tsig-key */
+    cfg = notify_cfg("server 192.0.2.100 { keys \"k2\"; };\n"
+                     "zone \"catalog.example.\" { type slave; file \"x\"; masters { 192.0.2.100; }; tsig-key \"k1\"; catalog-zone yes; };");
+    k1 = cfg_key(cfg, "k1"); k2 = cfg_key(cfg, "k2");
+    gr_setup("member.example.", ZONE_TXT);
+    g_gr.cfg = *cfg;
+    g_gr.view.name = "__default__";
+    strncpy(g_gr.cat_entry.domain, "catalog.example.", sizeof(g_gr.cat_entry.domain) - 1);
+    g_gr.cat_entry.is_secondary = true;
+    g_gr.entries[1] = &g_gr.cat_entry;
+    g_gr.view.zone_count = 2;
+    g_gr.entry.is_catalog_member = true;
+    g_gr.entry.is_secondary = true;
+    g_gr.entry.source = ZONE_SRC_CATALOG;
+    g_gr.entry.owning_catalog_domain = (char *)"catalog.example.";
+    notify_expect(&q, "member.example.", k2, MASTER, 0, "member: server key accepted");
+    notify_expect(&q, "member.example.", k1, MASTER, 5, "member: catalog zone tsig-key refused when a server key covers the primary");
+    notify_expect(&q, "member.example.", NULL, MASTER, 5, "member: unsigned refused");
+    free_server_config_fields(cfg); free(cfg);
+    zone_arena_destroy(&g_gr.arena);
+
+    /* catalog member, the copy of the primary kept in the entry (the catalog zone is not in the view) */
+    cfg = notify_cfg("server 192.0.2.100 { keys \"k2\"; };\noptions { allow-notify { 198.51.100.7; }; };");
+    k1 = cfg_key(cfg, "k1"); k2 = cfg_key(cfg, "k2");
+    gr_setup("member.example.", ZONE_TXT);
+    g_gr.cfg = *cfg;
+    g_gr.view.name = "__default__";
+    g_gr.entry.is_catalog_member = true;
+    g_gr.entry.is_secondary = true;
+    g_gr.entry.source = ZONE_SRC_CATALOG;
+    g_gr.entry.owning_catalog_domain = (char *)"catalog.example.";
+    g_gr.entry.catalog_master = calloc(1, sizeof(*g_gr.entry.catalog_master));
+    assert(g_gr.entry.catalog_master);
+    strncpy(g_gr.entry.catalog_master->ip, MASTER, sizeof(g_gr.entry.catalog_master->ip) - 1);
+    strncpy(g_gr.entry.catalog_master->zone_key, "k1", sizeof(g_gr.entry.catalog_master->zone_key) - 1);
+    notify_expect(&q, "member.example.", k2, MASTER, 0, "member copy: server key accepted");
+    notify_expect(&q, "member.example.", k1, MASTER, 5, "member copy: zone key refused when a server key covers the primary");
+    notify_expect(&q, "member.example.", NULL, MASTER, 5, "member copy: unsigned refused");
+    strncpy(g_gr.entry.catalog_master->key, "k1", sizeof(g_gr.entry.catalog_master->key) - 1);
+    notify_expect(&q, "member.example.", k1, MASTER, 0, "member copy: element key above the server key");
+    notify_expect(&q, "member.example.", k2, MASTER, 5, "member copy: server key refused when the element has one");
+    free_server_config_fields(cfg); free(cfg);
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> NOTIFY key precedence passed.\n");
+}
+
 /* RFC 8945 5.2, 5.3: every response to a signed request carries a TSIG, also for a plain QUERY */
 static void test_signed_query(void) {
     printf("[TEST] Query engine: responses to TSIG-signed queries (RFC 8945 5.2, 5.3)...\n");
@@ -1236,6 +1354,7 @@ int main(void) {
     test_expired_secondary_zone();
     test_notify_authorization();
     test_notify_catalog_member();
+    test_notify_server_stmt_key();
     test_signed_query();
     test_rfc8482_minimal_any_synthesis();
     test_sibling_zone_additional_glue_and_limits();

@@ -62,6 +62,35 @@ cd "${ROOT_DIR}" || exit 1
 LOG_DIR="${ROOT_DIR}/tests/.test_logs"
 mkdir -p "${LOG_DIR}"
 
+# Run with sudo, the suite and its tests run as root, but nothing they leave in the tree may belong to root (the next build, the next
+# git operation, a run as the normal user would fail on it).  as_user runs a command line as the user who ran sudo (like root, without sudo);
+# fix_tree_owner gives the files the suite writes itself (tests/.test_logs) back to that user, and, as a safety net, whatever else a test left
+# in the tree as root (the output files that tests write to the working directory: karidns.trace, *.log).  The tests themselves restore
+# or remove what they touch (run_capsicum_axfr_test.sh), build through kari_make (tests/lib_proc.sh) or use a directory under TMPDIR.
+as_user() {
+    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+        su -m "${SUDO_USER}" -c "$1"
+    else
+        sh -c "$1"
+    fi
+}
+fix_tree_owner() {
+    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+        _fo_grp=$(id -g "${SUDO_USER}")
+        chown -R "${SUDO_USER}:${_fo_grp}" "${LOG_DIR}" 2>/dev/null || true
+        # $1 = warn: first list every root-owned file (a test that starts creating them must stay visible) into $2, one path per line
+        [ "${1:-}" = "start" ] && return 0   # at the start only the log directory (files left by an earlier run are not this run's)
+        if [ "${1:-}" = "warn" ]; then
+            find "${ROOT_DIR}" -xdev -name .git -prune -o -user 0 -print 2>/dev/null > "$2" || true
+            while IFS= read -r _fo_f; do
+                echo "${C_YELLOW}WARN: root-owned file left in the tree by a test: ${_fo_f}${C_RESET}"
+            done < "$2"
+        fi
+        find "${ROOT_DIR}" -xdev -name .git -prune -o -user 0 -exec chown -h "${SUDO_USER}:${_fo_grp}" {} + 2>/dev/null || true
+    fi
+}
+fix_tree_owner start
+
 SELECTED_CATEGORIES=""
 NAME_FILTER=""
 EXCLUDE_LIST=""
@@ -694,6 +723,7 @@ kill_running_groups() {
 on_exit() {
     kill_running_groups
     rm -rf "${SUITE_TMP}" 2>/dev/null || true
+    fix_tree_owner
 }
 on_signal() {
     echo ""
@@ -711,7 +741,7 @@ cleanup_stale_processes
 # Build binaries if missing
 if [ ! -x "./karidns" ] || [ ! -x "./dag" ] || [ ! -x "./karicheck" ] || [ ! -x "./karictl" ]; then
     echo "${C_CYAN}==> Building core binaries (make all)...${C_RESET}"
-    make all >/dev/null 2>&1 || {
+    as_user "make all" >/dev/null 2>&1 || {
         echo "${C_RED}ERROR: 'make all' failed to build binaries.${C_RESET}" >&2
         exit 1
     }
@@ -734,7 +764,7 @@ if is_category_selected "unit"; then
     echo "${C_CYAN}==> Ensuring unit test binaries are built...${C_RESET}"
     for _b in test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_epoch_rcu test_cidr test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_db_pgsql test_db_sqlite3 test_db_stream test_db_registry test_pdns_reader test_presigned test_db_supervisor test_dag_iter; do
         if [ ! -x "./${_b}" ]; then
-            make "${_b}" >/dev/null 2>&1 || true
+            as_user "make ${_b}" >/dev/null 2>&1 || true
         fi
     done
 fi
@@ -744,11 +774,7 @@ fi
 # (as the user who ran sudo, like run_db_dump_test.sh)
 for _h in zone2sql zone2kdb; do
     [ -x "tests/db/${_h}" ] && continue
-    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
-        su -m "${SUDO_USER}" -c "make ${_h}" >/dev/null 2>&1 || true
-    else
-        make "${_h}" >/dev/null 2>&1 || true
-    fi
+    as_user "make ${_h}" >/dev/null 2>&1 || true
 done
 
 SUMMARY_FILE="${LOG_DIR}/summary.tsv"
@@ -1053,6 +1079,10 @@ while IFS='|' read -r _s _c _cat _t _code _d _skip_r; do
     esac
 done < "${SUMMARY_FILE}"
 
+ROOT_FILES_LIST="${SUITE_TMP}/root_files.txt"
+: > "${ROOT_FILES_LIST}"
+fix_tree_owner warn "${ROOT_FILES_LIST}"
+
 END_TIME=$(date +%s 2>/dev/null || perl -e 'print time')
 TOTAL_DURATION=$((END_TIME - START_TIME))
 
@@ -1072,6 +1102,10 @@ if [ "${SKIPPED_COUNT}" -gt 0 ]; then
 fi
 printf "  Total Execution Time : %ds (jobs: %d)\n" "${TOTAL_DURATION}" "${JOBS}"
 echo "${C_BOLD}======================================================================${C_RESET}"
+if [ -s "${ROOT_FILES_LIST}" ]; then
+    echo "${C_YELLOW}WARN: $(wc -l < "${ROOT_FILES_LIST}" | tr -d ' ') root-owned file(s) were left in the tree by the tests (chowned back to ${SUDO_USER}; the suite result is not affected):${C_RESET}"
+    sed 's/^/  - /' "${ROOT_FILES_LIST}"
+fi
 
 if [ "${SKIPPED_COUNT}" -gt 0 ]; then
     echo ""

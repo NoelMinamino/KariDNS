@@ -104,7 +104,7 @@ echo "=========================================="
 if [ -x test_asan_overflow ]; then
     ./test_asan_overflow > unit_asan.log 2>&1
 else
-    make asan_test > unit_asan.log 2>&1
+    kari_make asan_test > unit_asan.log 2>&1
 fi
 if [ $? -ne 0 ] || grep -qE "ERROR: (AddressSanitizer|UndefinedBehaviorSanitizer)" unit_asan.log; then
     log_fail "make asan_test (see unit_asan.log)"
