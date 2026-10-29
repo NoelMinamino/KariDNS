@@ -60,6 +60,22 @@ typedef struct parse_context_s {
      * (arena-owned owner name of the first one) so that the caller can warn.  Not counted for tinydns data. */
     size_t no_ttl_count;
     const char *first_no_ttl_owner;
+    /* where the first of them is: the file (NULL = the file the caller parsed; otherwise the path of an $INCLUDE file, arena-owned) and
+     * the line the record starts on, so that the warning can say file:line */
+    const char *first_no_ttl_file;
+    size_t first_no_ttl_line;
+    /* A character-string of more than 255 octets in a TXT-like record (TXT, SPF, AVC, NINFO, RESINFO, WALLET).  This parser cuts it into
+     * 255-octet strings (RFC 1035 section 3.3.14 allows several <character-string>s); BIND 9.20 rejects the zone (its txt_fromtext() refuses
+     * a <character-string> longer than 255 octets).  Counted here so that karicheck can warn; the server does not log it. */
+    size_t long_txt_count;
+    const char *first_long_txt_owner;
+    const char *first_long_txt_file;
+    size_t first_long_txt_line;
+    /* parser-internal: the file being parsed (NULL = the root one) and the line the current record starts on; in_generate keeps the line of
+     * a $GENERATE statement for the records it generates */
+    const char *cur_file;
+    size_t cur_line;
+    bool in_generate;
 } parse_context_t;
 
 typedef struct {

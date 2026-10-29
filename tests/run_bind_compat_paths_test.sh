@@ -315,7 +315,49 @@ OUT=$("$KARICHECK" zone ttl.test "$W/z/okttl.zone" 2>&1); RC=$?
 [ $RC -eq 0 ] && pass "karicheck zone: units and 2147483647 are accepted" || fail "okttl (rc=$RC): $OUT"
 printf 'ns1 IN A 192.0.2.1\n@ IN SOA ns1 hostmaster 1 3600 600 86400 60\n@ IN NS ns1\n' > "$W/z/nottl.zone"
 OUT=$("$KARICHECK" zone ttl.test "$W/z/nottl.zone" 2>&1); RC=$?
-if [ $RC -eq 0 ] && echo "$OUT" | grep -q "1 record(s) have no TTL" && echo "$OUT" | grep -q "BIND rejects such a zone"; then pass "karicheck zone: a record without any TTL is a warning"; else fail "nottl (rc=$RC): $OUT"; fi
+if [ $RC -eq 0 ] && echo "$OUT" | grep -q "nottl.zone:1: no TTL specified for 'ns1.ttl.test.'" && echo "$OUT" | grep -q "1 record(s) are served with 3600" && echo "$OUT" | grep -q "BIND rejects such a zone"; then pass "karicheck zone: a record without any TTL is a warning with file:line"; else fail "nottl (rc=$RC): $OUT"; fi
+
+# batch 11: where the first record without a TTL is (a later line, a record over several lines, an $INCLUDE file)
+printf '; comment\n\n$ORIGIN ttl.test.\nw A (\n 192.0.2.2 )\n@ IN SOA ns1 hostmaster 1 3600 600 86400 60\n@ IN NS ns1\nns1 IN A 192.0.2.1\n' > "$W/z/nottl2.zone"
+OUT=$("$KARICHECK" zone ttl.test "$W/z/nottl2.zone" 2>&1); RC=$?
+[ $RC -eq 0 ] && echo "$OUT" | grep -q "nottl2.zone:4: no TTL specified for 'w.ttl.test.'" && pass "karicheck zone: no-TTL warning names the line a record starts on" || fail "nottl2 (rc=$RC): $OUT"
+printf '; inc\nq A 192.0.2.7\n' > "$W/z/nottl_inc.zone"
+printf '$ORIGIN ttl.test.\n$INCLUDE %s/z/nottl_inc.zone\n@ IN SOA ns1 hostmaster 1 3600 600 86400 60\n@ IN NS ns1\nns1 60 IN A 192.0.2.1\n' "$W" > "$W/z/nottl3.zone"
+OUT=$("$KARICHECK" zone ttl.test "$W/z/nottl3.zone" 2>&1); RC=$?
+[ $RC -eq 0 ] && echo "$OUT" | grep -q "nottl_inc.zone:2: no TTL specified for 'q.ttl.test.'" && pass "karicheck zone: no-TTL warning names the \$INCLUDE file and line" || fail "nottl3 (rc=$RC): $OUT"
+
+# batch 11: invalid TTL notation is an error with the line
+printf '$ORIGIN ttl.test.\n$TTL 60\n@ IN SOA ns1 hostmaster 1 3600 600 86400 60\n@ IN NS ns1\nwww 1h2 IN A 192.0.2.1\n' > "$W/z/badttl2.zone"
+OUT=$("$KARICHECK" zone ttl.test "$W/z/badttl2.zone" 2>&1); RC=$?
+[ $RC -ne 0 ] && echo "$OUT" | grep -q "badttl2.zone at line 5" && echo "$OUT" | grep -q "Invalid TTL" && pass "karicheck zone: a TTL like 1h2 is an error with file and line" || fail "badttl2 (rc=$RC): $OUT"
+
+# batch 11: classes of one zone
+printf '$ORIGIN ttl.test.\n$TTL 60\n@ IN SOA ns1 hostmaster 1 3600 600 86400 60\n@ IN NS ns1\nns1 IN A 192.0.2.1\nx CH TXT "x"\n' > "$W/z/mixclass.zone"
+OUT=$("$KARICHECK" zone ttl.test "$W/z/mixclass.zone" 2>&1); RC=$?
+[ $RC -ne 0 ] && echo "$OUT" | grep -q "mixclass.zone at line 6" && echo "$OUT" | grep -q "class 'CH' != zone class 'IN'" && pass "karicheck zone: a record of another class is an error with file and line" || fail "mixclass (rc=$RC): $OUT"
+
+# batch 11: RESINFO is a singleton type (RFC 9606 section 3; BIND DNS_R_SINGLETON)
+printf '$ORIGIN ttl.test.\n$TTL 60\n@ IN SOA ns1 hostmaster 1 3600 600 86400 60\n@ IN NS ns1\nns1 IN A 192.0.2.1\nr RESINFO qnamemin\nr RESINFO exterr=15-17\n' > "$W/z/resinfo2.zone"
+OUT=$("$KARICHECK" zone ttl.test "$W/z/resinfo2.zone" 2>&1); RC=$?
+[ $RC -ne 0 ] && echo "$OUT" | grep -q "multiple RRs of singleton type: 'r.ttl.test.' has more than one RESINFO" && pass "karicheck zone: two different RESINFO records at a name are an error" || fail "resinfo2 (rc=$RC): $OUT"
+printf '$ORIGIN ttl.test.\n$TTL 60\n@ IN SOA ns1 hostmaster 1 3600 600 86400 60\n@ IN NS ns1\nns1 IN A 192.0.2.1\nr RESINFO qnamemin\nr RESINFO qnamemin\nr2 RESINFO qnamemin\n' > "$W/z/resinfo1.zone"
+OUT=$("$KARICHECK" zone ttl.test "$W/z/resinfo1.zone" 2>&1); RC=$?
+[ $RC -eq 0 ] && pass "karicheck zone: the same RESINFO twice, or one at each name, is accepted" || fail "resinfo1 (rc=$RC): $OUT"
+
+# batch 11: a character-string over 255 octets: served split, but BIND refuses it
+LONG=$(awk 'BEGIN { for (i = 0; i < 300; i++) printf "x" }')
+printf '$ORIGIN ttl.test.\n$TTL 60\n@ IN SOA ns1 hostmaster 1 3600 600 86400 60\n@ IN NS ns1\nns1 IN A 192.0.2.1\nlong IN TXT "%s"\nlong2 IN SPF "ok" "%s"\n' "$LONG" "$LONG" > "$W/z/longtxt.zone"
+OUT=$("$KARICHECK" zone ttl.test "$W/z/longtxt.zone" 2>&1); RC=$?
+[ $RC -eq 0 ] && echo "$OUT" | grep -q "longtxt.zone:6: a character-string of more than 255 octets in 'long.ttl.test.' (2 record(s) in all); BIND rejects this" && pass "karicheck zone: a string over 255 octets is a warning with file:line" || fail "longtxt (rc=$RC): $OUT"
+printf '$ORIGIN ttl.test.\n$TTL 60\n@ IN SOA ns1 hostmaster 1 3600 600 86400 60\n@ IN NS ns1\nns1 IN A 192.0.2.1\nok IN TXT "short"\n' > "$W/z/shorttxt.zone"
+OUT=$("$KARICHECK" zone ttl.test "$W/z/shorttxt.zone" 2>&1); RC=$?
+[ $RC -eq 0 ] && ! echo "$OUT" | grep -q "255 octets" && pass "karicheck zone: no warning for short strings" || fail "shorttxt (rc=$RC): $OUT"
+
+# batch 11: \# RDATA split over more than 48 tokens, for any type (RFC 3597 section 5)
+HEX=$(awk 'BEGIN { for (i = 0; i < 100; i++) printf " %02x", (i == 0 ? 99 : i + 1) }')
+printf '$ORIGIN ttl.test.\n$TTL 60\n@ IN SOA ns1 hostmaster 1 3600 600 86400 60\n@ IN NS ns1\nns1 IN A 192.0.2.1\ng IN TXT \\# 100%s\nh TYPE65280 \\# 100%s\n' "$HEX" "$HEX" > "$W/z/genhex.zone"
+OUT=$("$KARICHECK" zone ttl.test "$W/z/genhex.zone" 2>&1); RC=$?
+[ $RC -eq 0 ] && pass "karicheck zone: \\# RDATA in 100 tokens is accepted for TXT and an unknown type" || fail "genhex (rc=$RC): $OUT"
 
 if [ "$FAILS" -eq 0 ]; then echo "ALL TESTS PASSED"; exit 0; fi
 echo "$FAILS FAILURE(S)"

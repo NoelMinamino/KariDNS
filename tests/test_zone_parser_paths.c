@@ -290,6 +290,11 @@ typedef struct {
     parse_error_t err;
     int rc;
     size_t no_ttl;   /* records that got the built-in 3600 (parse_context_t.no_ttl_count) */
+    const char *no_ttl_file;      /* where the first of them is (NULL = the root text) */
+    size_t no_ttl_line;
+    size_t long_txt;              /* records with a character-string over 255 octets */
+    const char *long_txt_file;
+    size_t long_txt_line;
 } zt_t;
 
 static const char *SOA_HEAD =
@@ -330,6 +335,11 @@ static void zt_load_dir(zt_t *z, const char *text, const char *origin, const cha
     assert(buf);
     z->rc = parse_zone_fast(buf, strlen(buf), &z->arena, &ctx);
     z->no_ttl = ctx.no_ttl_count;
+    z->no_ttl_file = ctx.first_no_ttl_file;
+    z->no_ttl_line = ctx.first_no_ttl_line;
+    z->long_txt = ctx.long_txt_count;
+    z->long_txt_file = ctx.first_long_txt_file;
+    z->long_txt_line = ctx.first_long_txt_line;
 }
 static void zt_load_in(zt_t *z, const char *text, const char *origin, const char *base_dir) {
     zt_load_dir(z, text, origin, base_dir, NULL);
@@ -377,9 +387,20 @@ static int ser_rdata(dns_record_t *r, uint8_t *wire, size_t cap, const uint8_t *
     return 0;
 }
 
+/* A zone has one class (batch 11): a line in CH, HS or CLASSnn (not CLASS1 = IN) gets a header without the IN records of SOA_HEAD. */
+static bool line_has_non_in_class(const char *line) {
+    const char *p = line;
+    if (*p >= '0' && *p <= '9') {
+        while (*p && *p != ' ') p++;
+        while (*p == ' ') p++;
+    }
+    if (strncasecmp(p, "CH ", 3) == 0 || strncasecmp(p, "HS ", 3) == 0) return true;
+    return strncasecmp(p, "CLASS", 5) == 0 && !(p[5] == '1' && p[6] == ' ');
+}
+
 static void zt_load_line(zt_t *z, const char *line) {
     char text[4096];
-    snprintf(text, sizeof(text), "%st1 %s\n", SOA_HEAD, line);
+    snprintf(text, sizeof(text), "%st1 %s\n", line_has_non_in_class(line) ? "$ORIGIN example.\n$TTL 300\n" : SOA_HEAD, line);
     zt_load(z, text);
 }
 
@@ -1132,9 +1153,6 @@ static void test_r22_mnemonics_and_classes(void) {
                 "s rrsig a 13 2 300 20300101000000 20200101000000 12345 example. AAAAAAAA\n"
                 "n nsec n2.example. a rrsig Nsec\n"
                 "c1 CLASS1 A 192.0.2.2\n"
-                "c3 class3 TXT x\n"
-                "h hs TXT x\n"
-                "c42 300 CLASS42 TYPE65280 \\# 2 0102\n"
                 "t 300 CH 400 TYPE65281 \\# 0\n");          /* class once, then TTL once: 400 is the type here */
     assert(z.rc < 0);                                        /* "400" is not a type: second TTL is rejected */
     zt_free(&z);
@@ -1144,9 +1162,7 @@ static void test_r22_mnemonics_and_classes(void) {
                 "s rrsig a 13 2 300 20300101000000 20200101000000 12345 example. AAAAAAAA\n"
                 "n nsec n2.example. a rrsig Nsec\n"
                 "c1 CLASS1 A 192.0.2.2\n"
-                "c3 class3 TXT x\n"
-                "h hs TXT x\n"
-                "c42 300 CLASS42 TYPE65280 \\# 2 0102\n");
+                "");
     ASSERT_PARSED(&z);
     dns_record_t *w = zt_find(&z, "w.example.", 1);
     assert(w && w->class_val == 1 && strcmp(w->type, "A") == 0 && strcmp(w->class_str, "IN") == 0);
@@ -1165,8 +1181,18 @@ static void test_r22_mnemonics_and_classes(void) {
     static const uint8_t nsec_want[] = { 2, 'n', '2', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0, 0, 6, 0x40, 0, 0, 0, 0, 3 };
     assert(rdlen == sizeof(nsec_want) && memcmp(rd, nsec_want, rdlen) == 0);
     assert(zt_find(&z, "c1.example.", 1)->class_val == 1);
-    assert(zt_find(&z, "c3.example.", 16)->class_val == 3);
+    zt_free(&z);
+    /* a zone has one class (batch 11): CH, HS and CLASSnn each in a zone of their own */
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\nc3 class3 TXT x\nc3b TXT y\nc3c CH TXT z\n");
+    ASSERT_PARSED(&z);
+    assert(zt_find(&z, "c3.example.", 16)->class_val == 3 && zt_find(&z, "c3b.example.", 16)->class_val == 3);   /* no class: the zone's */
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\nh hs TXT x\n");
+    ASSERT_PARSED(&z);
     assert(zt_find(&z, "h.example.", 16)->class_val == 4);
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\nc42 300 CLASS42 TYPE65280 \\# 2 0102\n");
+    ASSERT_PARSED(&z);
     dns_record_t *c42 = zt_find(&z, "c42.example.", 65280);
     assert(c42 && c42->class_val == 42 && c42->ttl_value == 300);
     uint16_t off = 0;
@@ -1266,7 +1292,6 @@ static void test_r22_generate_bind(void) {
                 "$GENERATE 1-1 ${0,7,n}.r PTR h$\n"
                 "$GENERATE 255-255 ${0,3,n}.r PTR h$\n"
                 "$GENERATE 255-255 ${0,3,N}.u PTR h$\n"
-                "$GENERATE 1-1 c$ CH TXT x\n"
                 "$GENERATE 1-1 a\\$b$ A 192.0.2.$\n"
                 "$ECS-SUBNET-TAG eu 198.51.100.0/24\n$ECS-SUBNET eu\n"
                 "$GENERATE 1-1 e$ A 192.0.2.$\n"
@@ -1283,8 +1308,6 @@ static void test_r22_generate_bind(void) {
     assert(zt_find(&z, "f.f.r.example.", 12));
     dns_record_t *u = zt_find(&z, "F.F.u.example.", 12);
     assert(u && strncmp(u->name, "F.F.", 4) == 0);            /* N = upper-case hex digits */
-    dns_record_t *c = zt_find(&z, "c1.example.", 16);
-    assert(c && c->class_val == 3);
     assert(zt_find(&z, "a$b1.example.", 1) || zt_find(&z, "a\\$b1.example.", 1));   /* "\$" is a literal '$' */
     dns_record_t *e = zt_find(&z, "e1.example.", 1);
     assert(e && e->ecs_subnet_tag && strcmp(e->ecs_subnet_tag, "eu") == 0);
@@ -1294,6 +1317,10 @@ static void test_r22_generate_bind(void) {
     const uint8_t *rd;
     size_t rdlen;
     assert(ser_rdata(mx, wire, sizeof(wire), &rd, &rdlen) == 0 && rd[0] == 0 && rd[1] == 10);
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\n$GENERATE 1-1 c$ CH TXT x\n");        /* a class in $GENERATE; the zone has this class */
+    ASSERT_PARSED(&z);
+    assert(zt_find(&z, "c1.example.", 16)->class_val == 3);
     zt_free(&z);
 
     static const char *const bad[] = {
@@ -2134,6 +2161,237 @@ static void test_bind_rr_types_batch9(void) {
     printf("  -> batch 9 passed.\n");
 }
 
+/* BIND compatibility, batch 11: zone file leftovers.  Sources read (BIND 9.20 branch): lib/dns/master.c load_text() ("%s:%lu: class '%s' != zone
+ * class '%s'", DNS_R_BADCLASS; "no TTL specified"), lib/dns/ttl.c dns_ttl_fromtext(), lib/dns/rdata/generic/resinfo_261.c
+ * (RRTYPE_RESINFO_ATTRIBUTES = DNS_RDATATYPEATTR_SINGLETON), lib/dns/rdataslab.c (DNS_R_SINGLETON), lib/ns/update.c replaces_p(), RFC 3597
+ * section 5, RFC 2308 section 4, RFC 9606. */
+static size_t b11_line_of(const char *text, size_t off) {
+    size_t line = 1;
+    for (size_t i = 0; i < off && text[i]; i++)
+        if (text[i] == '\n') line++;
+    return line;
+}
+
+static void test_bind_zonefile_batch11(void) {
+    printf("[TEST] Zone parser: BIND compatibility batch 11 (TTL errors, no-TTL position, classes, RESINFO, long TXT, \\# tokens)...\n");
+    zt_t z;
+    char text[4096];
+
+    /* 1. a TTL that is not a TTL is an error that names its line (it used to become 3600) */
+    static const struct { const char *zone; const char *msg; size_t line; } bad_ttl[] = {
+        { "$ORIGIN example.\n$TTL 1h2\n", "Invalid $TTL", 2 },
+        { "$ORIGIN example.\n\n$TTL abc\n", "Invalid $TTL", 3 },
+        { "$ORIGIN example.\n$TTL 2147483648\n", "Invalid $TTL", 2 },
+        { "$ORIGIN example.\n$TTL 1x\n", "Invalid $TTL", 2 },
+        { "$ORIGIN example.\n$TTL 60\n; a comment\nw 1x A 192.0.2.1\n", "Invalid TTL", 4 },
+        { "$ORIGIN example.\n$TTL 60\nw 1h2 A 192.0.2.1\n", "Invalid TTL", 3 },
+        { "$ORIGIN example.\n$TTL 60\nw 99999999999 A 192.0.2.1\n", "Invalid TTL", 3 },
+        { "$ORIGIN example.\n$TTL 60\nw 3y A 192.0.2.1\n", "Invalid TTL", 3 },
+        { "$ORIGIN example.\n$TTL 60\n@ SOA ns h (\n 1 2 3\n 4 5x )\n", "Invalid SOA refresh", 5 },
+        { "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 abc\n", "Invalid SOA refresh", 3 },
+    };
+    for (size_t i = 0; i < N(bad_ttl); i++) {
+        zt_load(&z, bad_ttl[i].zone);
+        if (z.rc >= 0 || !z.err.error_message || !strstr(z.err.error_message, bad_ttl[i].msg) ||
+            b11_line_of(bad_ttl[i].zone, z.err.error_offset) != bad_ttl[i].line) {
+            fprintf(stderr, "TTL case %zu: rc=%d msg=%s line=%zu\n", i, z.rc, z.err.error_message ? z.err.error_message : "-",
+                    b11_line_of(bad_ttl[i].zone, z.err.error_offset));
+            assert(0);
+        }
+        zt_free(&z);
+    }
+
+    /* 2. no TTL at all: the first such record is reported with its file and line (a record is on the line it starts on) */
+    zt_load(&z, "$ORIGIN example.\n\nw A 192.0.2.2\nx A 192.0.2.3\n@ SOA ns h 1 2 3 4 5\ny A 192.0.2.4\n");
+    ASSERT_PARSED(&z);
+    assert(z.no_ttl == 2 && z.no_ttl_file == NULL && z.no_ttl_line == 3);
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n; one\n; two\nw A (\n 192.0.2.2 )\n");           /* a record over two lines: where it starts */
+    ASSERT_PARSED(&z);
+    assert(z.no_ttl == 1 && z.no_ttl_line == 4);
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\r\n\r\nw A 192.0.2.2\r\n");                       /* CRLF counts once */
+    ASSERT_PARSED(&z);
+    assert(z.no_ttl == 1 && z.no_ttl_line == 3);
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$GENERATE 1-2 g$ A 192.0.2.$\n");                /* generated records: the line of the $GENERATE */
+    ASSERT_PARSED(&z);
+    assert(z.no_ttl == 2 && z.no_ttl_line == 2);
+    zt_free(&z);
+    {
+        char dir[] = "/tmp/karidns_zb11_XXXXXX";
+        assert(mkdtemp(dir));
+        char p[512];
+        snprintf(p, sizeof(p), "%s/n.inc", dir);
+        write_file(p, "; header\n\nq A 192.0.2.5\n");
+        zt_load_in(&z, "$ORIGIN example.\n$INCLUDE n.inc\n", "example.", dir);
+        ASSERT_PARSED(&z);
+        assert(z.no_ttl == 1 && z.no_ttl_line == 3 && z.no_ttl_file && strstr(z.no_ttl_file, "n.inc"));
+        zt_free(&z);
+        zt_load_in(&z, "$ORIGIN example.\nr A 192.0.2.1\n$INCLUDE n.inc\n", "example.", dir);   /* the first one stays the first */
+        ASSERT_PARSED(&z);
+        assert(z.no_ttl == 2 && z.no_ttl_line == 2 && z.no_ttl_file == NULL);
+        zt_free(&z);
+        /* 3. the class of an included record is checked against the zone's */
+        snprintf(p, sizeof(p), "%s/c.inc", dir);
+        write_file(p, "$TTL 60\nq CH TXT x\n");
+        zt_load_in(&z, "$ORIGIN example.\n$TTL 60\nw A 192.0.2.1\n$INCLUDE c.inc\n", "example.", dir);
+        assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "class 'CH' != zone class 'IN'"));
+        zt_free(&z);
+        /* 5. a long string in an included file */
+        snprintf(p, sizeof(p), "%s/l.inc", dir);
+        char big[301];
+        memset(big, 'x', 300);
+        big[300] = '\0';
+        snprintf(text, sizeof(text), "\n\nt TXT \"%s\"\n", big);
+        write_file(p, text);
+        zt_load_in(&z, "$ORIGIN example.\n$TTL 60\n$INCLUDE l.inc\n", "example.", dir);
+        ASSERT_PARSED(&z);
+        assert(z.long_txt == 1 && z.long_txt_line == 3 && z.long_txt_file && strstr(z.long_txt_file, "l.inc"));
+        zt_free(&z);
+        snprintf(p, sizeof(p), "rm -rf %s", dir);
+        assert(system(p) == 0);
+    }
+
+    /* 3. mixed classes: BIND 9.20 master.c "class '%s' != zone class '%s'" (the zone's class is the first record's) */
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\nw A 192.0.2.1\nx CH TXT x\n");
+    assert(z.rc < 0 && z.err.error_message && strcmp(z.err.error_message, "class 'CH' != zone class 'IN'") == 0);
+    assert(b11_line_of("$ORIGIN example.\n$TTL 60\nw A 192.0.2.1\nx CH TXT x\n", z.err.error_offset) == 4 && z.err.token_length == 2);
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\nx CH TXT x\nw IN A 192.0.2.1\n");
+    assert(z.rc < 0 && z.err.error_message && strcmp(z.err.error_message, "class 'IN' != zone class 'CH'") == 0);
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\nx CH TXT x\nw hs TXT y\n");
+    assert(z.rc < 0 && z.err.error_message && strcmp(z.err.error_message, "class 'HS' != zone class 'CH'") == 0);
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\nx CLASS42 TYPE65280 \\# 0\nw CLASS43 TYPE65280 \\# 0\n");
+    assert(z.rc < 0 && z.err.error_message && strcmp(z.err.error_message, "class 'CLASS43' != zone class 'CLASS42'") == 0);
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\nw A 192.0.2.1\n$GENERATE 1-2 g$ CH TXT x\n");        /* $GENERATE: the same rule, at the statement */
+    assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "zone class 'IN'"));
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\nw IN A 192.0.2.1\nx CLASS1 A 192.0.2.2\ny A 192.0.2.3\n");   /* IN, CLASS1 and no class are one class */
+    ASSERT_PARSED(&z);
+    zt_free(&z);
+
+    /* 4. RESINFO is a singleton type (RFC 9606 section 3): two different ones at a name refuse the zone at publish time */
+    {
+        parse_error_t pe = {0};
+        char why[400];
+        zt_load(&z, "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ NS ns\nr RESINFO qnamemin\nr RESINFO exterr=15-17\nr2 RESINFO a\n");
+        ASSERT_PARSED(&z);
+        assert(build_zone_index(&z.arena, true) == 0);
+        assert(validate_zone_pdns_types(&z.arena, &pe, why, sizeof(why)) == -1);
+        assert(strstr(why, "multiple RRs of singleton type") && strstr(why, "'r.example.'") && pe.error_message == why);
+        zt_free(&z);
+        zt_load(&z, "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\nr RESINFO qnamemin\nR resinfo qnamemin\nr2 RESINFO a\nr3 RESINFO a b\n");
+        ASSERT_PARSED(&z);                                                 /* the same RDATA twice is one RR (BIND drops duplicates first) */
+        assert(build_zone_index(&z.arena, true) == 0);
+        assert(validate_zone_pdns_types(&z.arena, &pe, why, sizeof(why)) == 0);
+        zt_free(&z);
+        zt_load(&z, "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\nr RESINFO a\nR resinfo b\n");              /* owner names compare without case */
+        ASSERT_PARSED(&z);
+        assert(build_zone_index(&z.arena, true) == 0);
+        assert(validate_zone_pdns_types(&z.arena, &pe, why, sizeof(why)) == -1);
+        zt_free(&z);
+        zt_load(&z, "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\nr TXT a\nr TXT b\nr RESINFO a\n");           /* TXT is not a singleton */
+        ASSERT_PARSED(&z);
+        assert(build_zone_index(&z.arena, true) == 0);
+        assert(validate_zone_pdns_types(&z.arena, &pe, why, sizeof(why)) == 0);
+        zt_free(&z);
+    }
+
+    /* 5. a character-string of more than 255 octets is counted (karicheck warns); 255 octets are fine */
+    {
+        char s255[256], s256[257];
+        memset(s255, 'a', 255);
+        s255[255] = '\0';
+        memset(s256, 'b', 256);
+        s256[256] = '\0';
+        snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\nok TXT \"%s\" \"%s\"\n", s255, s255);
+        zt_load(&z, text);
+        ASSERT_PARSED(&z);
+        assert(z.long_txt == 0);
+        zt_free(&z);
+        snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\nok TXT \"short\"\n\nlong1 TXT \"x\" \"%s\"\nlong2 SPF \"%s\"\nlong3 RESINFO \"%s\"\n",
+                 s256, s256, s256);
+        zt_load(&z, text);
+        ASSERT_PARSED(&z);
+        assert(z.long_txt == 3 && z.long_txt_line == 5 && z.long_txt_file == NULL);
+        dns_record_t *l1 = zt_find(&z, "long1.example.", 16);                 /* the server behaviour is unchanged: 255 + 1 octets */
+        uint8_t wire[4096];
+        const uint8_t *rd;
+        size_t rdlen;
+        assert(l1 && ser_rdata(l1, wire, sizeof(wire), &rd, &rdlen) == 0);
+        assert(rdlen == 2 + 1 + 255 + 1 + 1 && rd[0] == 1 && rd[2] == 255 && rd[3 + 255] == 1);
+        zt_free(&z);
+        /* more strings than MAX_RDATA (the wire form is built at once): the long one is still found */
+        size_t n = (size_t)snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\nmany TXT");
+        for (int i = 0; i < 60; i++) n += (size_t)snprintf(text + n, sizeof(text) - n, " \"s%d\"", i);
+        snprintf(text + n, sizeof(text) - n, " \"%s\"\n", s256);
+        zt_load(&z, text);
+        ASSERT_PARSED(&z);
+        assert(z.long_txt == 1 && z.long_txt_line == 3);
+        zt_free(&z);
+        zt_load(&z, "$ORIGIN example.\n$TTL 60\ng TXT \\# 2 0161\n");               /* the generic form has no strings to measure */
+        ASSERT_PARSED(&z);
+        assert(z.long_txt == 0);
+        zt_free(&z);
+    }
+
+    /* 6. RFC 3597 section 5: "\# <length> <hex>" with the hex in more than MAX_RDATA tokens, for every type */
+    {
+        static const char *const types[] = { "TYPE65280", "TXT", "DHCID", "OPENPGPKEY", "DS", "DNSKEY", "TLSA", "NULL", "SPF", "RESINFO", "SSHFP" };
+        for (size_t t = 0; t < N(types); t++) {
+            size_t n = (size_t)snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\ng %s \\# 100", types[t]);
+            for (int i = 0; i < 100; i++) n += (size_t)snprintf(text + n, sizeof(text) - n, " %02x", i == 0 ? 99 : i + 1);
+            snprintf(text + n, sizeof(text) - n, "\n");
+            zt_load(&z, text);
+            if (z.rc < 0 && t >= 4) {                 /* DS, DNSKEY, TLSA, NULL, SPF, RESINFO, SSHFP may refuse the octets as RDATA of their type: not a token limit */
+                assert(!strstr(z.err.error_message, "Too many") && !strstr(z.err.error_message, "MAX_RDATA"));
+                zt_free(&z);
+                continue;
+            }
+            if (z.rc < 0) fprintf(stderr, "%s: %s\n", types[t], z.err.error_message ? z.err.error_message : "?");
+            ASSERT_PARSED(&z);
+            dns_record_t *g = zt_find(&z, "g.example.", get_type_code(types[t]));
+            assert(g && g->generic_data && g->generic_len == 100 && g->generic_data[0] == 99 && g->generic_data[1] == 2 && g->generic_data[99] == 100);
+            zt_free(&z);
+        }
+        /* split in odd places, uppercase digits, a length that does not match, still an error */
+        size_t n = (size_t)snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\ng TYPE65280 \\# 60");
+        for (int i = 0; i < 60; i++) n += (size_t)snprintf(text + n, sizeof(text) - n, " %s", (i & 1) ? "aB" : "Cd");
+        snprintf(text + n, sizeof(text) - n, "\n");
+        zt_load(&z, text);
+        ASSERT_PARSED(&z);
+        assert(zt_find(&z, "g.example.", 65280)->generic_len == 60);
+        zt_free(&z);
+        n = (size_t)snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\ng TYPE65280 \\# 61");
+        for (int i = 0; i < 60; i++) n += (size_t)snprintf(text + n, sizeof(text) - n, " ab");
+        snprintf(text + n, sizeof(text) - n, "\n");
+        zt_load(&z, text);
+        assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "length does not match"));
+        zt_free(&z);
+        n = (size_t)snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\ng TYPE65280 \\# 60");
+        for (int i = 0; i < 59; i++) n += (size_t)snprintf(text + n, sizeof(text) - n, " ab");
+        snprintf(text + n, sizeof(text) - n, " zz\n");
+        zt_load(&z, text);
+        assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "non-hexadecimal"));
+        zt_free(&z);
+        /* the field limit of a line (MAX_FIELDS) stays */
+        char *huge = malloc(16384);
+        assert(huge);
+        n = (size_t)snprintf(huge, 16384, "$ORIGIN example.\n$TTL 60\ng TYPE65280 \\# 600");
+        for (int i = 0; i < 600; i++) n += (size_t)snprintf(huge + n, 16384 - n, " ab");
+        snprintf(huge + n, 16384 - n, "\n");
+        zt_load(&z, huge);
+        assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "Too many fields"));
+        zt_free(&z);
+        free(huge);
+    }
+    printf("  -> batch 11 passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Zone Parser Path Coverage Tests ===\n");
     test_x37_rdata_name_case();
@@ -2165,6 +2423,7 @@ int main(void) {
     test_b9a_alias_lua();
     test_bind_compat_batch1();
     test_bind_rr_types_batch9();
+    test_bind_zonefile_batch11();
     printf("=== All Zone Parser Path Coverage Tests PASSED ===\n");
     return 0;
 }

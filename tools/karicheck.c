@@ -372,9 +372,15 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
 
     zone_lint_ttl(&arena, "zone file", &tally);
     if (ctx.no_ttl_count > 0 && !(file_format && strcasecmp(file_format, "tinydns") == 0)) {
-        kc_warning(&tally, "Zone '%s': %zu record(s) have no TTL (no $TTL, no earlier TTL, no SOA to take one from; first: '%s') and are "
+        kc_warning(&tally, "Zone '%s': %s:%zu: no TTL specified for '%s' (no $TTL, no earlier TTL, no SOA to take one from); %zu record(s) are "
                         "served with 3600; BIND rejects such a zone (\"no TTL specified\"). Add a $TTL line\n",
-                domain, ctx.no_ttl_count, ctx.first_no_ttl_owner ? ctx.first_no_ttl_owner : "");
+                domain, ctx.first_no_ttl_file ? ctx.first_no_ttl_file : file_path, ctx.first_no_ttl_line,
+                ctx.first_no_ttl_owner ? ctx.first_no_ttl_owner : "", ctx.no_ttl_count);
+    }
+    if (ctx.long_txt_count > 0 && !(file_format && strcasecmp(file_format, "tinydns") == 0)) {
+        kc_warning(&tally, "Zone '%s': %s:%zu: a character-string of more than 255 octets in '%s' (%zu record(s) in all); BIND rejects this. It is served as 255-octet strings\n",
+                domain, ctx.first_long_txt_file ? ctx.first_long_txt_file : file_path, ctx.first_long_txt_line,
+                ctx.first_long_txt_owner ? ctx.first_long_txt_owner : "", ctx.long_txt_count);
     }
 
     if (build_zone_index(&arena, true) != 0) {

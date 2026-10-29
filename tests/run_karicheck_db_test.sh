@@ -352,6 +352,18 @@ sql "$(meta 26 ENABLE-LUA-RECORDS 1)"
 conf; run
 has "ENABLE-LUA-RECORDS=1 is reported" "lua.test.' (domains.id 26)"
 
+echo "-- RESINFO is a singleton type (RFC 9606 section 3, BIND DNS_R_SINGLETON; batch 11)"
+db_reset
+sql "$(zone 27 ri.test)
+$(rec 27 r.ri.test RESINFO '"qnamemin"')
+$(rec 27 r.ri.test RESINFO '"qnamemin"')
+$(rec 27 s.ri.test RESINFO '"exterr=15-17"')"
+conf; run
+status "the same RESINFO twice, and one at another name, is fine" 0
+sql "$(rec 27 r.ri.test RESINFO '"exterr=15-17"')"
+conf; run
+err "two different RESINFO records at a name" "ri.test.' (domains.id 27):.*multiple RRs of singleton type"
+
 echo "== $BACKEND: secondaries and catalogs"
 db_reset
 sql "INSERT INTO domains (id, name, type, master) VALUES (30, 'sec.test', 'SLAVE', NULL)"

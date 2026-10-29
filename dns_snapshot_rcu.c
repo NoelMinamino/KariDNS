@@ -934,9 +934,10 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   free(root_path);
 
   if (count >= 0 && ctx.no_ttl_count > 0)
-      syslog(LOG_WARNING, "[Zone] zone '%s' (%s): %zu record(s) have no TTL (no $TTL, no earlier TTL, no SOA to take one from; first: '%s') "
-             "and are served with 3600; BIND rejects such a zone", entry->domain, file, ctx.no_ttl_count,
-             ctx.first_no_ttl_owner ? ctx.first_no_ttl_owner : "");
+      syslog(LOG_WARNING, "[Zone] zone '%s' (%s): %s:%zu: no TTL specified for '%s' (no $TTL, no earlier TTL, no SOA to take one from); "
+             "%zu record(s) are served with 3600; BIND rejects such a zone", entry->domain, file,
+             ctx.first_no_ttl_file ? ctx.first_no_ttl_file : file, ctx.first_no_ttl_line,
+             ctx.first_no_ttl_owner ? ctx.first_no_ttl_owner : "", ctx.no_ttl_count);
   if (count < 0) {
       zone_arena_destroy(z_standby);
       pthread_mutex_unlock(&entry->writer_lock);

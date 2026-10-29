@@ -1244,6 +1244,21 @@ The default `file-format` is the master file format of RFC 1035 §5 as BIND read
   that is valid for that type (RFC 3597 §5): `PTR \# 0`, `NS \# 3 010203` or a compressed name in the hex are
   zone file errors, reported by `karicheck zone` at the record's line. Zero-length RDATA is legal for a type
   without a defined format (`TYPE65534 \# 0`) and is transferred (AXFR/IXFR) and served like any other record.
+- **`\# <length> <hex>`** (RFC 3597 §5): the hex digits may be split over any number of tokens, for every type, as far as the
+  limit of a record line allows (512 fields; a line with more is a zone file error, use `( )` and fewer, longer tokens).
+  The tokens are the RDATA octets whatever the type's own text form is, so the same record with 3 tokens or with 100 is
+  the same record.
+- **Long strings**: a `<character-string>` of a TXT-like type (`TXT`, `SPF`, `AVC`, `NINFO`, `RESINFO`, `WALLET`) over 255 octets
+  is cut into 255-octet strings (RFC 1035 §3.3.14 allows several strings), which BIND 9.20 does not do: it refuses the zone.
+  `karidns` serves and transfers the split form without a message; `karicheck zone` warns with the file and line
+  (`a character-string of more than 255 octets ... BIND rejects this`).
+- **Singleton types**: `RESINFO` (RFC 9606 §3; BIND marks it `DNS_RDATATYPEATTR_SINGLETON`) may have only one record at a name.
+  Two records with different RDATA at one name refuse the zone (BIND: `multiple RRs of singleton type`, `DNS_R_SINGLETON`
+  from `lib/dns/rdataslab.c`) in a zone file, in a transfer (AXFR/IXFR: the zone keeps its old data and the error is logged), in a
+  database zone and in `karicheck zone` / `karidns-dbloader --check`; the same RDATA twice is one record. A dynamic update that
+  adds a second, different one to a name fails with SERVFAIL and changes nothing (BIND `lib/ns/update.c` `replaces_p()` replaces only
+  CNAME, DNAME, SOA, NSEC, RRSIG, WKS and NSEC3PARAM, so RESINFO is not replaced: delete the old record in the same update to
+  replace it).
 - **Types with an unusual text form** (as BIND 9.20 reads them; no name compression in any of them, RFC 3597 §4):
   `RESINFO` (261, RFC 9606) and `WALLET` (262, IANA registry) are one or more `<character-string>`s, written and
   displayed like `TXT` (BIND `generic_fromtext_txt()`); `EID` (31) and `NIMLOC` (32) are hex digits in one or more
@@ -1260,9 +1275,13 @@ The default `file-format` is the master file format of RFC 1035 §5 as BIND read
 - **Classes**: `IN` (the default when the class is omitted), `CH`, `HS` and `CLASSnn` are kept with the record. The
   server answers queries of class IN and CH; records of other classes are loaded but not answered (queries of
   those classes are REFUSED). `NONE`, `ANY`, `CLASS0` and class 65302 (used internally by KariDNS) are errors.
+  **A zone has one class**, the class of its first record (a record without a class has it): a later record of
+  another class is a zone file error at its line, with BIND's text (`lib/dns/master.c`) `class 'CH' != zone class 'IN'`
+  (`class 'IN' != zone class 'CH'` when the first record is a CH one). The same holds for the records of `$INCLUDE`
+  files and `$GENERATE`.
 - **Omitted TTL** (same order as BIND): the TTL on the record; else `$TTL` (RFC 2308 §4); else the last TTL
   written explicitly on a record (RFC 1035 §5.1, also across `$INCLUDE`); else, for an SOA record, its MINIMUM
-  field, which then acts like `$TTL`; else 3600. BIND rejects such a zone ("no TTL specified"); here the zone loads, the server logs a warning with the number of records that got 3600, and `karicheck zone` / `karicheck conf` warn.
+  field, which then acts like `$TTL`; else 3600. BIND rejects such a zone ("no TTL specified"); here the zone loads, the server logs a warning with the file and line of the first such record and the number of records that got 3600 (`<file>:<line>: no TTL specified for '<owner>' ...`; an `$INCLUDE` file is named by its own path), and `karicheck zone` / `karicheck conf` warn in the same words.
 - **TTL notation** (BIND 9.20 ARM 3.5.3 and 3.5.5.4: "Valid TTLs are of the range 0-2147483647 seconds"): digits with `s`, `m`, `h`, `d`, `w` units in any letter case, e.g. `3600`, `1h30m`, `1w2d`; as in BIND (lib/dns/ttl.c `bind_ttl()`) a number without a unit is accepted only on its own (`30`), not after a unit (`1h30` is an error), and the text may be at most 63 characters long. A `$TTL` or record TTL that is not in that notation (`1x`, `abc`, a sign, `1h-5`) or above 2147483647 is a zone file error at that position, as is a `$TTL` without a value. It used to be read as 3600 without a word. The SOA refresh, retry, expire and minimum fields use the same notation (up to 4294967295) and are errors when malformed. **The SOA serial** must be a plain decimal number 0-4294967295 (leading zeros allowed): BIND 9.20 reads it as a number token (lib/dns/rdata/generic/soa_6.c `fromtext_soa()`, lib/isc/lex.c, lib/isc/parseint.c) and rejects the zone for a sign, a unit, a hex prefix, an empty value or a value above 32 bits; here such a serial is a zone file error (`Invalid SOA serial ...` / `SOA serial out of range ...`) at its position, also in the `Z` line of a tinydns data file (an empty tinydns serial still means the time stamp of the data file). It used to be read as 0 or cut to 32 bits. A TTL above 2147483647 in a transferred or database record is still served as 2147483647 (RFC 8767 §4).
 - **`$ORIGIN <name>`** and the origin argument of **`$INCLUDE <file> [<origin>]`**: a name without a trailing dot
   is relative to the current origin (RFC 1035 §5.1). `$INCLUDE` does not change the origin of the including file.

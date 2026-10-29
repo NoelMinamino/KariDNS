@@ -50,7 +50,6 @@ ns1 IN A 192.0.2.1
 w1 300 IN a 192.0.2.2
 w2 300 in A 192.0.2.3
 w3 300 CLASS1 A 192.0.2.4
-h 300 hs TXT "hesiod"
 $ORIGIN sub
 x A 192.0.2.5
 $ORIGIN o.test.
@@ -134,11 +133,21 @@ expect "D-08: SINK" k.o.test SINK '300\t1 2 3 AQIDBAUG'
 expect "D-08: ATMA E.164" a.o.test ATMA '300\t+358400123456'
 expect "D-08: IPSECKEY gateway type 0" i.o.test IPSECKEY '300\t10 0 1 . AQNR'
 
-# HS-class data is kept with its class: an IN query does not see it
-if [ -z "$(answer h.o.test TXT)" ]; then
-    pass "R-22 b: HS record is not answered for class IN"
+# A zone has one class (batch 11, BIND lib/dns/master.c): an HS record in an IN zone is refused with BIND's text, an HS zone (a first
+# record of class HS, the rest without a class) is accepted
+printf '$ORIGIN hs.test.\n@ 300 IN SOA ns1.hs.test. hm.hs.test. 1 3600 600 86400 60\nh 300 hs TXT "hesiod"\n' > "$TMP_DIR/hs_mixed.zone"
+OUT=$("$KARICHECK" zone hs.test "$TMP_DIR/hs_mixed.zone" 2>&1)
+if [ $? -ne 0 ] && echo "$OUT" | grep -q "at line 3" && echo "$OUT" | grep -q "class 'HS' != zone class 'IN'"; then
+    pass "R-22 b: an HS record in an IN zone is an error with its line"
 else
-    fail "R-22 b: HS record answered for class IN"
+    fail "R-22 b: HS record in an IN zone: $OUT"
+fi
+printf '$ORIGIN hs.test.\n$TTL 300\n@ HS SOA ns1.hs.test. hm.hs.test. 1 3600 600 86400 60\n@ NS ns1.hs.test.\nns1 A 192.0.2.1\nh TXT "hesiod"\n' > "$TMP_DIR/hs_only.zone"
+OUT=$("$KARICHECK" zone hs.test "$TMP_DIR/hs_only.zone" 2>&1)
+if [ $? -eq 0 ]; then
+    pass "R-22 b: a zone of class HS is accepted"
+else
+    fail "R-22 b: HS zone: $OUT"
 fi
 
 echo "[*] O-11: 301 zones in the view, tinydns data shared by p.test and c300.p.test"

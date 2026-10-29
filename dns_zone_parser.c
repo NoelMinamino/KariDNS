@@ -634,12 +634,19 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
     parse_context_t child_ctx = *ctx;
     child_ctx.default_origin = child_origin;
     child_ctx.current_depth = ctx->current_depth + 1;
+    child_ctx.cur_file = resolved;
     zone_parse_state_t child_st = *st;
     child_st.origin_io = &child_origin;
 
     int rc = parse_zone_buffer(file_content, strlen(file_content), arena, &child_ctx, &child_st, false);
     ctx->no_ttl_count = child_ctx.no_ttl_count;               /* the child worked on a copy */
     ctx->first_no_ttl_owner = child_ctx.first_no_ttl_owner;
+    ctx->first_no_ttl_file = child_ctx.first_no_ttl_file;
+    ctx->first_no_ttl_line = child_ctx.first_no_ttl_line;
+    ctx->long_txt_count = child_ctx.long_txt_count;
+    ctx->first_long_txt_owner = child_ctx.first_long_txt_owner;
+    ctx->first_long_txt_file = child_ctx.first_long_txt_file;
+    ctx->first_long_txt_line = child_ctx.first_long_txt_line;
 
     if (rc < 0 && ctx && ctx->err_out && !ctx->err_out->file_path) {
         ctx->err_out->file_path = resolved;
@@ -714,6 +721,30 @@ static bool class_allowed_in_zone_data(uint16_t cls) {
 
 static void upcase_in_place(char *s) {
     for (; *s; s++) *s = (char)toupper((unsigned char)*s);
+}
+
+/* The class of a record as BIND 9.20 prints it in "class '%s' != zone class '%s'" (lib/dns/master.c load_text(), DNS_R_BADCLASS). */
+static void zone_class_name(uint16_t cls, char out[16]) {
+    if (cls == 1) strcpy(out, "IN");
+    else if (cls == 3) strcpy(out, "CH");
+    else if (cls == 4) strcpy(out, "HS");
+    else snprintf(out, 16, "CLASS%u", (unsigned)cls);
+}
+
+/* TXT-like types: one or more <character-string>s (RFC 1035 section 3.3.14; SPF 99, NINFO 56, AVC 258, RESINFO 261, WALLET 262 have the same form) */
+static bool zone_txt_like(uint16_t t) {
+    return t == 16 || t == 99 || t == 56 || t == 258 || t == 261 || t == 262;
+}
+
+/* A record with a character-string over 255 octets (split below / by the encoder): counted so that karicheck can warn that BIND refuses it */
+static void note_long_txt(parse_context_t *ctx, const char *owner) {
+    if (!ctx) return;
+    if (ctx->long_txt_count == 0) {
+        ctx->first_long_txt_owner = owner;
+        ctx->first_long_txt_file = ctx->cur_file;
+        ctx->first_long_txt_line = ctx->cur_line;
+    }
+    ctx->long_txt_count++;
 }
 
 #define MAX_GENERATE_COUNT 100000
@@ -997,7 +1028,11 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
         char *gen_origin = *st->origin_io;
         zone_parse_state_t gen_st = *st;
         gen_st.origin_io = &gen_origin;
-        if (parse_zone_buffer(line, (size_t)line_len, arena, ctx, &gen_st, false) < 0) {
+        bool was_gen = ctx && ctx->in_generate;
+        if (ctx) ctx->in_generate = true;           /* the generated records are on the line of the $GENERATE statement */
+        int grc = parse_zone_buffer(line, (size_t)line_len, arena, ctx, &gen_st, false);
+        if (ctx) ctx->in_generate = was_gen;
+        if (grc < 0) {
             /* エラー位置は生成した行ではなく、$GENERATE の行を指す */
             generate_error(ctx, NULL, fields[0], cur_buf);
             return -1;
@@ -1073,10 +1108,12 @@ static int parse_zone_buffer(char *buf, size_t size, zone_arena_t *arena, parse_
   int in_parens = 0, in_quotes = 0, field_idx = 0;
   bool is_tag_def_line = false;
   char *fields[MAX_FIELDS], *token_start = NULL;
+  size_t line_no = 1, rec_line = 1;   /* line of p, and the line the record being read starts on (only '\n' counts: the buffer is cut in place) */
 
 STATE_START_LINE:
   if (p >= end)
     goto DONE;
+  rec_line = line_no;
   field_idx = 0;
   in_quotes = 0;
   is_tag_def_line = false;
@@ -1112,6 +1149,7 @@ STATE_FIND_TOKEN:
   if (IS_SPACE(*p))
     goto SKIP_WHITESPACE;
   if (IS_NEWLINE(*p)) {
+    if (*p == '\n') line_no++;
     *p++ = '\0';
     if (in_parens)
       goto STATE_FIND_TOKEN;
@@ -1156,8 +1194,10 @@ STATE_FIND_TOKEN:
   while (p < end) {
     if (*p == '\\') {
       p++;
-      if (p < end)
+      if (p < end) {
+        if (*p == '\n') line_no++;
         p++;
+      }
       continue;
     }
     if (*p == '"') {
@@ -1223,6 +1263,7 @@ STATE_FIND_TOKEN:
             goto PROCESS_RECORD;
           }
   char delimiter = *p;
+  if (delimiter == '\n') line_no++;
   *p++ = '\0';
   if (field_idx > 0) {
       if (fields[field_idx - 1][0] == '"') {
@@ -1286,6 +1327,7 @@ PROCESS_RECORD:
       goto STATE_START_LINE;
     goto DONE;
   }
+  if (ctx && !ctx->in_generate) ctx->cur_line = rec_line;
   if (fields[0][0] == '$' && strcasecmp(fields[0], "$ORIGIN") == 0) {
     if (field_idx > 1) {
       /* RFC 1035 §5.1: 相対名の $ORIGIN は現在の origin を補って絶対名にする (R-22 d) */
@@ -1492,6 +1534,26 @@ PROCESS_RECORD:
     }
     i++;
   }
+  {
+    /* The zone has one class: the class of its first record.  BIND takes it from the configuration and refuses a record of another class
+     * ("class 'CH' != zone class 'IN'", lib/dns/master.c load_text(), DNS_R_BADCLASS); a record without a class has the zone's. */
+    uint16_t zclass = arena->count > 1 ? arena->records[0].class_val : 0;
+    if (zclass != 0) {
+      if (rec->class_str && class_val != zclass) {
+        if (ctx && ctx->err_out) {
+          char a[16], b[16];
+          zone_class_name(class_val, a);
+          zone_class_name(zclass, b);
+          snprintf(ctx->err_out->detail, sizeof(ctx->err_out->detail), "class '%s' != zone class '%s'", a, b);
+          ctx->err_out->error_message = ctx->err_out->detail;
+          ctx->err_out->error_offset = (size_t)(rec->class_str - buf);
+          ctx->err_out->token_length = strlen(rec->class_str);
+        }
+        return -1;
+      }
+      class_val = zclass;
+    }
+  }
   /* 末尾が base64 / 16 進の 1 フィールド (鍵・署名・ダイジェスト) の型は、その値を空白で区切って何行にも分けて
    * 書ける (RFC 4034 §2.2/§3.2 等)。ML-DSA-44 (algorithm 18) の RRSIG 署名は base64 で 3228 文字あり、
    * dnssec-signzone などの出力では MAX_RDATA を超える数の断片に分かれるので、超えるときは末尾の断片を
@@ -1501,10 +1563,14 @@ PROCESS_RECORD:
     uint16_t tc = get_type_code(rec->type);
     int lead = trailing_blob_lead_fields(tc);
     /* "\# <len> <hex>" (RFC 3597 §5) of a whole-RDATA blob type: its tokens are the length and the hex, not one value to join */
-    if (lead == 0 && (strcmp(fields[i], "\\#") == 0 || strcmp(fields[i], "#") == 0)) lead = -1;
-    if (lead >= 0 && i + lead < field_idx)
+    bool generic_tok = strcmp(fields[i], "\\#") == 0 || strcmp(fields[i], "#") == 0;
+    if (generic_tok) {
+      /* RFC 3597 section 5: "\# <length> <hex>", the hex digits in any number of tokens, for every type: they are the RDATA octets, whatever
+       * the type's own text form is, so the tokens after the length are joined into one (dns_generic_rdata_parse() reads them as one) */
+      if (i + 2 < field_idx) field_idx = join_trailing_fields(fields, i + 2, field_idx);
+    } else if (lead >= 0 && i + lead < field_idx)
       field_idx = join_trailing_fields(fields, i + lead, field_idx);
-    else if ((tc == 16 || tc == 99 || tc == 56 || tc == 258 || tc == 261 || tc == 262) && strcmp(fields[i], "\\#") != 0 && strcmp(fields[i], "#") != 0) {
+    else if (zone_txt_like(tc) && !generic_tok) {
       /* I5, RFC 1035 §3.3.14: TXT (and SPF, NINFO, AVC, RESINFO, WALLET, the same wire form) is "one or more <character-string>s" with no
        * count; more strings than the text fields hold are encoded straight into the wire form below (the RR is served and
        * transferred as it is, like one with a NUL octet from a transfer), not refused */
@@ -1642,7 +1708,11 @@ PROCESS_RECORD:
   } else {
     rec->ttl_value = 3600;
     if (ctx) {
-      if (ctx->no_ttl_count == 0) ctx->first_no_ttl_owner = rec->name;
+      if (ctx->no_ttl_count == 0) {
+        ctx->first_no_ttl_owner = rec->name;
+        ctx->first_no_ttl_file = ctx->cur_file;
+        ctx->first_no_ttl_line = ctx->cur_line;
+      }
       ctx->no_ttl_count++;
     }
   }
@@ -1695,6 +1765,15 @@ PROCESS_RECORD:
       }
   }
 
+  if (zone_txt_like(rec->type_code) && !(rec->rdata_count >= 1 && (strcmp(rec->rdata[0], "\\#") == 0 || strcmp(rec->rdata[0], "#") == 0))) {
+    for (int j = 0; j < rec->rdata_count; j++) {
+      if (strlen(rec->rdata[j]) > 255) {
+        note_long_txt(ctx, rec->name);
+        break;
+      }
+    }
+  }
+
   rec->generic_len = 0;
   rec->generic_data = NULL;
   if (txt_wire_from >= 0) {
@@ -1702,6 +1781,7 @@ PROCESS_RECORD:
      * does for the text fields, kept as the RDATA octets (RFC 3597 §5 form; the whole RDATA fits a 16-bit RDLENGTH) */
     uint8_t *blob = (uint8_t *)malloc(65535);
     size_t glen = 0;
+    bool long_noted = false;
     if (!blob) {
       zone_generic_rdata_error(ctx, rec->type, buf, "Out of memory");
       return -1;
@@ -1709,6 +1789,10 @@ PROCESS_RECORD:
     for (int j = txt_wire_from; j < txt_wire_to; j++) {
       unescape_string_in_place(fields[j]);
       size_t len = strlen(fields[j]);
+      if (len > 255 && !long_noted) {
+        note_long_txt(ctx, rec->name);
+        long_noted = true;
+      }
       const char *s = fields[j];
       do {
         size_t piece = len > 255 ? 255 : len;
@@ -2680,11 +2764,51 @@ static bool pdns_lua_rdata_ok(const uint8_t *rd, size_t len) {
   return true;
 }
 
+/* Singleton types: an owner name has at most one RR of them (BIND 9.20: DNS_RDATATYPEATTR_SINGLETON, enforced by dns_rdataslab_fromrdataset()
+ * and dns_rdataslab_merge() with DNS_R_SINGLETON "multiple RRs of singleton type" after duplicates were dropped, so a zone file, a transfer
+ * and an UPDATE that would give a name two different ones are all refused; lib/ns/update.c replaces_p() names only CNAME, DNAME, SOA, NSEC,
+ * RRSIG, WKS and NSEC3PARAM as replaced, so an UPDATE adding a second one fails instead of replacing).  RESINFO (RFC 9606 section 3) is the
+ * one this server knows that BIND marks so (resinfo_261.c RRTYPE_RESINFO_ATTRIBUTES); CNAME, DNAME and SOA have their own rules.  Two RRs
+ * with the same RDATA are one RR.  The index must exist (build_zone_index()).  0 = ok, -1 with `detail` filled. */
+static int validate_zone_singletons(const zone_arena_t *arena, char *detail, size_t detail_cap) {
+  if (!arena->hash_table) return 0;
+  uint8_t *ba = NULL, *bb = NULL;
+  int rc = 0;
+  for (size_t i = 0; i < arena->count && rc == 0; i++) {
+    const dns_record_t *a = &arena->records[i];
+    if (a->type_code != 261 || !a->name) continue;
+    size_t idx = calc_fnv1a_str(a->name) & (arena->hash_size - 1);
+    for (int j = arena->hash_table[idx]; j != -1; j = arena->records[j].next_record) {
+      const dns_record_t *b = &arena->records[j];
+      if ((size_t)j <= i || b->type_code != 261 || !b->name || b->class_val != a->class_val || !domain_names_match_ci(a->name, b->name))
+        continue;
+      if (!ba) {
+        ba = (uint8_t *)malloc(65535);
+        bb = (uint8_t *)malloc(65535);
+        if (!ba || !bb) {
+          snprintf(detail, detail_cap, "out of memory checking the RESINFO records");
+          rc = -1;
+          break;
+        }
+      }
+      long la = dns_record_canonical_rdata(a, ba, 65535), lb = dns_record_canonical_rdata(b, bb, 65535);
+      if (la >= 0 && lb >= 0 && la == lb && memcmp(ba, bb, (size_t)la) == 0) continue;   /* the same RR twice */
+      snprintf(detail, detail_cap, "multiple RRs of singleton type: '%.200s' has more than one RESINFO record (RFC 9606 section 3)", a->name);
+      rc = -1;
+      break;
+    }
+  }
+  free(ba);
+  free(bb);
+  return rc;
+}
+
 int validate_zone_pdns_types(const zone_arena_t *arena, parse_error_t *err, char *detail, size_t detail_cap) {
   if (!arena || !arena->records || arena->count == 0) return 0;
   size_t n_alias = 0;
   bool dnssec = false;
   const char *dnssec_owner = NULL;
+  if (validate_zone_singletons(arena, detail, detail_cap) != 0) goto fail;   /* every publish path calls this function (freeze, database reader, karicheck) */
   for (size_t i = 0; i < arena->count; i++) {
     const dns_record_t *r = &arena->records[i];
     if (r->class_val != 1 && r->class_val != 0) continue;
