@@ -588,6 +588,7 @@ typedef struct view_config {
   char **match_clients;
   int match_clients_count;
   acl_entry_t *match_clients_parsed;
+  char match_loc[240];          /* "file:line" of match-clients ("" = not written): for the warning about a view that an earlier one hides */
   zone_config_t *zones;
   zone_cfg_index_t zone_index; /* zones の索引。手で組んだ設定 (テスト) では空で、線形探索になる */
   notify_target_t *also_notify; /* view { also-notify { } }: replaces the options list for the zones of this view that have none of their own */
@@ -711,6 +712,8 @@ enum { MINIMAL_NO = 0, MINIMAL_YES = 1, MINIMAL_NO_AUTH = 2, MINIMAL_NO_AUTH_REC
 
 typedef struct server_config_s {
   int port;
+  int dst_port;                 /* options { port } as written (53 when not; -p does not change it): the port of a primaries / masters / also-notify /
+                                 * remote-servers element that has none, and of a NOTIFY to an NS host of the zone (BIND named_config_getport("port")) */
   char **bind_addresses;
   int bind_address_count;
   char bind_address_loc[240];   /* "file:line" of the last bind-address statement ("" = none) */
@@ -914,6 +917,12 @@ void config_set_base_cwd(const char *cwd);
 /* The port of the command line (-p): when set (> 0) it replaces options { port } and the port of every listen-on / listen-on-v6 statement,
  * as -p replaced the only port the configuration had before listen-on existed.  Given before the first parse; 0 = none (karicheck, tests). */
 void config_set_port_override(int port);
+/* The port of a primaries / masters / also-notify / remote-servers element: `port` when it is written (non-zero), else options { port } (BIND 9.20
+ * bin/named/config.c named_config_getipandkeylist() starts from named_config_getport(config, "port"); lib/dns/zone.c notify_find_address() sends to the
+ * NS hosts at view->dstport, which bin/named/server.c sets from the same option), 53 when options writes none.  The elements of a configuration file
+ * all have a port after the parse; the settings text of a database zone leaves 0 for an element without one, because it is read without the
+ * configuration, and the users call this. */
+int config_target_port(const server_config_t *cfg, int port);
 void config_pin_directory(const char *dir);
 void config_unpin_directory(void);
 int parse_named_conf(const char *config_str, server_config_t *config);

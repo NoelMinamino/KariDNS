@@ -1299,13 +1299,13 @@ static void sec_digest(const pdns_zone_t *z, uint8_t out[KDB_DIGEST_LEN], uint32
 static void test_secondary(void) {
     printf("SLAVE / CONSUMER zones (B7b): domains.master, settings, KDB1 without data, digest\n");
     struct { const char *master, *want; } ok[] = {
-        { "192.0.2.1", "masters { 192.0.2.1; };" },
+        { "192.0.2.1", "masters { 192.0.2.1 port 53; };" },
         { "192.0.2.1:5353", "masters { 192.0.2.1 port 5353; };" },
         { "[2001:db8::1]:5353", "masters { 2001:db8::1 port 5353; };" },
-        { "2001:db8::1", "masters { 2001:db8::1; };" },
-        { "[2001:db8::1]", "masters { 2001:db8::1; };" },
-        { "192.0.2.1,192.0.2.2:53", "masters { 192.0.2.1; 192.0.2.2 port 53; };" },
-        { " 192.0.2.1 , 2001:db8::2 \t192.0.2.1 ", "masters { 192.0.2.1; 2001:db8::2; };" },     /* blanks tolerated, a repeated address once */
+        { "2001:db8::1", "masters { 2001:db8::1 port 53; };" },
+        { "[2001:db8::1]", "masters { 2001:db8::1 port 53; };" },
+        { "192.0.2.1,192.0.2.2:53", "masters { 192.0.2.1 port 53; 192.0.2.2 port 53; };" },
+        { " 192.0.2.1 , 2001:db8::2 \t192.0.2.1 ", "masters { 192.0.2.1 port 53; 2001:db8::2 port 53; };" },     /* blanks tolerated, a repeated address once */
     };
     for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
         pdns_zone_t *z = build_sec(KDB_ZK_SECONDARY, ok[i].master, NULL, 0);
@@ -1336,7 +1336,7 @@ static void test_secondary(void) {
         }
         pdns_zone_t *z = build_sec(KDB_ZK_SECONDARY, many, NULL, 0);
         CHECK(!z->failed && z->n_warnings == 1);
-        CHECK_HAS(z->settings, "192.0.2.16;");
+        CHECK_HAS(z->settings, "192.0.2.16 port 53;");
         CHECK(strstr(z->settings, "192.0.2.17") == NULL);
         pdns_zone_free(z);
     }
@@ -1345,7 +1345,7 @@ static void test_secondary(void) {
                               M("X-KARIDNS-PROFILE", "p1"), M("PRESIGNED", "1") };
         pdns_zone_t *z = build_sec(KDB_ZK_CATALOG, "192.0.2.1", m, 5);
         CHECK_MSG(!z->failed, "%s", z->error);
-        CHECK_STR(z->settings, "masters { 192.0.2.1; }; tsig-key \"k1\"; allow-transfer { 192.0.2.9; }; also-notify { 192.0.2.50 port 5353; };");
+        CHECK_STR(z->settings, "masters { 192.0.2.1 port 53; }; tsig-key \"k1\"; allow-transfer { 192.0.2.9; }; also-notify { 192.0.2.50 port 5353; };");
         CHECK(z->profile[0] == 'p' && z->serial == 0);
         char err[200];
         zone_ext_shared_t *sh = db_settings_parse(z->settings, strlen(z->settings), err, sizeof(err));

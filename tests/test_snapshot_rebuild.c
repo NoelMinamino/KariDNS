@@ -1263,6 +1263,144 @@ static void test_snapshot_in_view(void) {
     release_zone_snapshot(s5);
 }
 
+/* ---- Batch 10: match-clients { key ...; } (BIND 9.20 bin/named/server.c get_matching_view_sync(): for each view in order, dns_message_checksig(message,
+ * view) with the view's key ring, then dns_acl_allowed(srcaddr, tsig identity, view->matchclients)) ---- */
+#define VK_KEY_A "dmlldy1tYXRjaC1rZXktYS1zZWNyZXQtMDEyMzQ1Njc4OQ=="
+#define VK_KEY_B "dmlldy1tYXRjaC1rZXktYi1zZWNyZXQtMDEyMzQ1Njc4OQ=="
+#define VK_KEY_C "dmlldy1tYXRjaC1rZXktYy1zZWNyZXQtMDEyMzQ1Njc4OQ=="
+
+/* A query for www.a.example. A, signed with key (RFC 8945 §4.2); key NULL: unsigned; corrupt: a byte of the QNAME is changed after signing (BADSIG) */
+static size_t vk_query(uint8_t *buf, size_t cap, tsig_key_t *key, bool corrupt) {
+    static const uint8_t q[] = {0x43, 0x21, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                3, 'w', 'w', 'w', 1, 'a', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0, 0, 1, 0, 1};
+    memcpy(buf, q, sizeof(q));
+    size_t len = sizeof(q);
+    if (!key) return len;
+    uint8_t mac[64];
+    size_t mac_len = 0;
+    if (tsig_sign_packet(buf, &len, cap, key, 0, mac, &mac_len, NULL, 0, false) != 0) return 0;
+    if (corrupt) buf[13] = 'x';
+    return len;
+}
+
+/* the view name select_view_req() gives, and what it says about the TSIG check */
+static const char *vk_select(zone_db_snapshot_t *snap, const server_config_t *cfg, const char *ip, tsig_key_t *key, bool corrupt, bool *done,
+                             tsig_request_t *t) {
+    uint8_t pkt[1024];
+    size_t n = vk_query(pkt, sizeof(pkt), key, corrupt);
+    assert(n > 0);
+    view_snapshot_t *v = select_view_req(snap, cfg, ip, pkt, n, t, done);
+    return v ? v->name : NULL;
+}
+
+/* the answer of the engine to the query of vk_query(), as the server core makes it: the route (view, zone, the TSIG check) from select_view_req();
+ * and, for the other callers (no route), the engine's own selection; both must agree */
+static int vk_answer(zone_db_snapshot_t *snap, const char *ip, tsig_key_t *key, bool corrupt, uint8_t *res, size_t cap) {
+    uint8_t pkt[1024];
+    size_t n = vk_query(pkt, sizeof(pkt), key, corrupt);
+    assert(n > 0);
+    compress_ctx_t cc;
+    memset(&cc, 0, sizeof(cc));   /* compress_ctx_init_packet() counts up the generation it finds: start from zero */
+    compress_ctx_init_packet(&cc);
+    query_route_t route;
+    tsig_request_t t;
+    bool done = false;
+    server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+    route.view = select_view_req(snap, cfg, ip, pkt, n, &t, &done);
+    route.tsig = done ? &t : NULL;
+    route.entry = route.view ? find_zone_for_query(route.view, "www.a.example.", 1) : NULL;
+    int len = process_dns_query_cap_routed(pkt, n, res, 4096, cap, "www.a.example.", 1, ip, &cc, false, NULL, snap, &route);
+    uint8_t res2[4096];
+    compress_ctx_init_packet(&cc);
+    int len2 = process_dns_query_cap(pkt, n, res2, 4096, sizeof(res2), "www.a.example.", 1, ip, &cc, false, NULL, snap);
+    assert(len > 12 && len2 > 12);
+    assert((res2[3] & 0x0F) == (res[3] & 0x0F) && res2[6] == res[6] && res2[7] == res[7] && res2[11] == res[11]);
+    return len;
+}
+
+static void test_snapshot_view_match_key(void) {
+    printf("[TEST] Snapshot rebuild: views chosen by the TSIG key of the request (match-clients { key ...; })...\n");
+    wfile("vk_a.zone", "$ORIGIN a.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.1\nwww IN A 192.0.2.11\n");
+    server_config_t *cfg = load_conf(
+        "options { directory \"%s\"; };\n"
+        "key \"ka\" { algorithm hmac-sha256; secret \"" VK_KEY_A "\"; };\n"
+        "key \"kb\" { algorithm hmac-sha256; secret \"" VK_KEY_B "\"; };\n"
+        "key \"kc\" { algorithm hmac-sha256; secret \"" VK_KEY_C "\"; };\n"
+        "acl \"signers\" { key kb; };\n"
+        "view \"va\" { match-clients { key ka; }; zone \"a.example\" { type master; file \"%s/vk_a.zone\"; }; };\n"
+        "view \"vb\" { match-clients { signers; }; };\n"
+        "view \"vn\" { match-clients { !key ka; !key kb; 192.0.2.0/24; }; };\n"
+        "view \"vd\" { match-clients { 127.0.0.1; }; };\n"
+        "view \"ve\" { match-clients { any; }; };\n",
+        g_dir, g_dir);
+    tsig_key_t *ka = find_tsig_key_by_name(cfg, "ka"), *kb = find_tsig_key_by_name(cfg, "kb"), *kc = find_tsig_key_by_name(cfg, "kc");
+    assert(ka && kb && kc);
+    for (int round = 0; round < 3; round++) {
+        /* round 0: start-up, round 1: reload of every zone, round 2: reload with skip_unchanged (the views are copied from the old snapshot) */
+        zone_db_snapshot_t *snap = build(cfg, round == 2);
+        assert(snap && snap->view_count == 5);
+        assert(snap->views[0].match_aml && snap->views[1].match_aml && snap->views[2].match_aml);          /* va, vb (through the acl), vn (negated keys) */
+        assert(!snap->views[3].match_aml && !snap->views[4].match_aml);                                      /* vd, ve: addresses only, the flat lists */
+        assert(snap->views[3].match_clients_count == 1 && snap->views[0].match_clients_count == 0);
+        bool done;
+        tsig_request_t t;
+        /* signed with ka: the first view; the check is the one of that view and is handed on */
+        assert(strcmp(vk_select(snap, cfg, "127.0.0.1", ka, false, &done, &t), "va") == 0 && done);
+        assert(t.status == TSIG_REQ_VALID && t.key == ka);
+        /* signed with kb: va verifies it (a global key) and its identity is not ka; vb names it through the acl */
+        assert(strcmp(vk_select(snap, cfg, "127.0.0.1", kb, false, &done, &t), "vb") == 0 && done);
+        assert(t.status == TSIG_REQ_VALID && t.key == kb);
+        /* unsigned: no key element matches (a negated one does not either), the address decides */
+        assert(strcmp(vk_select(snap, cfg, "127.0.0.1", NULL, false, &done, &t), "vd") == 0 && !done);
+        assert(strcmp(vk_select(snap, cfg, "192.0.2.9", NULL, false, &done, &t), "vn") == 0 && !done);
+        assert(strcmp(vk_select(snap, cfg, "203.0.113.9", NULL, false, &done, &t), "ve") == 0);
+        /* signed with a key that no list names: the address elements still match; vn was checked, and the result is handed on */
+        assert(strcmp(vk_select(snap, cfg, "192.0.2.9", kc, false, &done, &t), "vn") == 0 && done);
+        assert(t.status == TSIG_REQ_VALID && t.key == kc);
+        assert(strcmp(vk_select(snap, cfg, "127.0.0.1", kc, false, &done, &t), "vd") == 0 && !done);
+        /* a signature that does not verify identifies nobody: not the view of that key, and the address elements still match */
+        assert(strcmp(vk_select(snap, cfg, "127.0.0.1", ka, true, &done, &t), "vd") == 0 && !done);
+        assert(strcmp(vk_select(snap, cfg, "192.0.2.9", ka, true, &done, &t), "vn") == 0 && done);
+        assert(t.status == TSIG_REQ_ERROR && t.error == 16);
+        /* no configuration: no key is known, the request counts as unsigned */
+        assert(strcmp(vk_select(snap, NULL, "127.0.0.1", ka, false, &done, &t), "vd") == 0 && !done);
+        /* select_view() has the address alone: a view with key elements is evaluated as for an unsigned request */
+        assert(strcmp(select_view(snap, "127.0.0.1")->name, "vd") == 0 && strcmp(select_view(snap, "192.0.2.9")->name, "vn") == 0);
+        /* a client address that does not parse matches no address element (and no flat list), but a key element needs no address */
+        assert(strcmp(vk_select(snap, cfg, "not-an-address", ka, false, &done, &t), "va") == 0 && done);
+        assert(vk_select(snap, cfg, "not-an-address", NULL, false, &done, &t) == NULL && !done);
+
+        /* the engine: the zone a.example is served in view va only */
+        uint8_t res[4096];
+        int len = vk_answer(snap, "127.0.0.1", ka, false, res, sizeof(res));
+        assert((res[3] & 0x0F) == 0 && res[7] == 1 && res[11] >= 1 && len > 12);        /* NOERROR, one answer, the TSIG RR of the signed answer */
+        (void)vk_answer(snap, "127.0.0.1", NULL, false, res, sizeof(res));
+        assert((res[3] & 0x0F) == 5);                                                    /* vd has no such zone: REFUSED */
+        (void)vk_answer(snap, "127.0.0.1", kb, false, res, sizeof(res));
+        assert((res[3] & 0x0F) == 5);                                                    /* view vb: no zone */
+        (void)vk_answer(snap, "127.0.0.1", ka, true, res, sizeof(res));
+        assert((res[3] & 0x0F) == 9);                                                    /* vd by address, the MAC is wrong in its ring: NOTAUTH (BADSIG) */
+        release_zone_snapshot(snap);
+    }
+
+    /* the key ring of a view: two views with a key of one name and different secrets */
+    server_config_t *c2 = load_conf(
+        "options { directory \"%s\"; };\n"
+        "view \"v1\" { key \"k\" { algorithm hmac-sha256; secret \"" VK_KEY_A "\"; }; match-clients { key k; }; };\n"
+        "view \"v2\" { key \"k\" { algorithm hmac-sha256; secret \"" VK_KEY_B "\"; }; match-clients { key k; }; };\n"
+        "view \"v3\" { match-clients { any; }; };\n",
+        g_dir);
+    tsig_key_t *k1 = find_tsig_key_in_view(c2, "v1", "k"), *k2 = find_tsig_key_in_view(c2, "v2", "k");
+    assert(k1 && k2 && k1 != k2);
+    zone_db_snapshot_t *s2 = build(c2, false);
+    bool done;
+    tsig_request_t t;
+    assert(strcmp(vk_select(s2, c2, "192.0.2.50", k1, false, &done, &t), "v1") == 0 && done && t.key == k1);
+    assert(strcmp(vk_select(s2, c2, "192.0.2.50", k2, false, &done, &t), "v2") == 0 && done && t.key == k2);   /* BADSIG in v1's ring, valid in v2's */
+    assert(strcmp(vk_select(s2, c2, "192.0.2.50", NULL, false, &done, &t), "v3") == 0 && !done);
+    release_zone_snapshot(s2);
+}
+
 int main(void) {
     /* Line-buffered progress + a hang watchdog (exit 124 with the phase) so a
      * stalled run fails fast in CI instead of blocking the job. */
@@ -1303,6 +1441,7 @@ int main(void) {
     test_snapshot_rebuild_case_28();
     test_snapshot_rebuild_case_29();
     test_snapshot_rebuild_case_30();
+    test_snapshot_view_match_key();
     test_snapshot_rebuild_type_change();
     test_snapshot_rebuild_case_32();
     test_snapshot_rebuild_case_33();

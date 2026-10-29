@@ -238,9 +238,33 @@ static void test_errors(void) {
         CHECK(parse_cfg("options { allow-query { { { { any; }; }; }; }; };", &cfg));
         free_server_config_fields(&cfg);
     }
-    /* match-clients: the same grammar, address only */
-    CHECK(rejects(KEYS "view \"v\" { match-clients { key k1; }; };"));
-    CHECK(rejects(KEYS "view \"v\" { match-clients { 192.0.2.1; { key k1; }; }; };"));
+    /* match-clients: the same grammar.  A list with a key element is chosen by the TSIG key of the request (batch 10, BIND get_matching_view_sync()):
+     * it keeps the list as written (has_key) and no flat address list; a list without one keeps the flat list as before */
+    {
+        server_config_t cfg;
+        CHECK(parse_cfg(KEYS "view \"v\" { match-clients { key k1; }; };", &cfg));
+        const view_config_t *v = cfg.views;
+        CHECK(v && v->acl.match && v->acl.match->has_key && v->match_clients_count == 0 && v->match_clients == NULL && v->match_clients_parsed == NULL);
+        free_server_config_fields(&cfg);
+        CHECK(parse_cfg(KEYS "view \"v\" { match-clients { 192.0.2.1; { key k1; }; }; };", &cfg));
+        v = cfg.views;
+        CHECK(v && v->acl.match && v->acl.match->has_key && v->match_clients_count == 0);
+        free_server_config_fields(&cfg);
+        CHECK(parse_cfg(KEYS "acl s { !key k2; 192.0.2.0/24; }; view \"v\" { match-clients { s; }; };", &cfg));   /* a key inside a named acl, negated */
+        v = cfg.views;
+        CHECK(v && v->acl.match && v->acl.match->has_key && v->acl.match->has_neg_key && v->match_clients_count == 0);
+        free_server_config_fields(&cfg);
+        CHECK(parse_cfg(KEYS "view \"v\" { match-clients { 192.0.2.1; }; };", &cfg));
+        v = cfg.views;
+        CHECK(v && v->acl.match && !v->acl.match->has_key && v->match_clients_count == 1 && v->match_clients_parsed != NULL);
+        free_server_config_fields(&cfg);
+        /* a view's own key counts as defined for its match-clients; another view's does not */
+        CHECK(parse_cfg("view \"v\" { key \"vk\" { algorithm hmac-sha256; secret \"c2VjcmV0LW9uZS1mb3ItdGVzdA==\"; }; match-clients { key vk; }; };", &cfg));
+        free_server_config_fields(&cfg);
+        CHECK(rejects("view \"a\" { key \"vk\" { algorithm hmac-sha256; secret \"c2VjcmV0LW9uZS1mb3ItdGVzdA==\"; }; };"
+                      "view \"b\" { match-clients { key vk; }; };"));
+    }
+    CHECK(rejects("view \"v\" { match-clients { key nokey; }; };"));                    /* an undefined key is an error */
     CHECK(rejects("view \"v\" { match-clients { nosuch; }; };"));
     CHECK(rejects("view \"v\" { match-clients { any; }; match-clients { none; }; };"));
     {

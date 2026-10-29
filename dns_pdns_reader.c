@@ -1141,7 +1141,9 @@ static bool build_masters(pdns_zone_t *z, sbuf_t *sb) {
         } else if (l.n >= PDNS_MAX_MASTERS) {
             zwarn(z, false, 0, "domains.master has more than %d entries, the rest is ignored", PDNS_MAX_MASTERS);
             break;
-        } else if (!strlist_add(&l, ent, &dup)) {
+        } else if (/* PowerDNS sends to port 53 when domains.master has none; KariDNS would take options { port } for a masters entry without a
+                    * port (BIND, batch 10), so the PowerDNS meaning is written out (an entry is at most 75 octets: the suffix fits in ent) */
+                   (strstr(ent, " port ") == NULL && strlcat(ent, " port 53", sizeof(ent)) >= sizeof(ent)) || !strlist_add(&l, ent, &dup)) {
             zfail(z, false, 0, "out of memory");
             ok = false;
         }

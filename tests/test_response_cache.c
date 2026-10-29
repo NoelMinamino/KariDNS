@@ -1495,6 +1495,7 @@ static void test_routed_query_equals_lookup(void) {
         int l1 = process_dns_query_cap(req, req_len, r1, 4096, 0, cases[i].qname, cases[i].qtype, "127.0.0.1", &cc, false, NULL, &w->snap);
         query_route_t route;
         route.view = select_view(&w->snap, "127.0.0.1");
+        route.tsig = NULL;
         route.entry = route.view ? find_zone_for_query(route.view, cases[i].qname, cases[i].qtype) : NULL;
         compress_ctx_init_packet(&cc);
         int l2 = process_dns_query_cap_routed(req, req_len, r2, 4096, 0, cases[i].qname, cases[i].qtype, "127.0.0.1", &cc, false,

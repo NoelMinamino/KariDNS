@@ -2111,11 +2111,10 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   zone_arena_t zattr;
   zone_arena_init(&zattr);
 
-  /* provide-ixfr no (BIND 9.20 ARM: "only responds with a full zone transfer (AXFR)"): the zone is sent whole, also to a client that is up to
-   * date, as with ixfr-history 0 for a client that is behind (RFC 1995 §4 allows an AXFR-style answer to an IXFR request) */
   /* The `server` statement that covers the requester (batch 5; the view's, else the top-level ones) can say provide-ixfr (it replaces the
    * zone's, view's and options' value for this client: BIND xfrout.c) and transfer-format one-answer. */
   bool one_answer = false;
+  bool provide_ixfr = true;
   {
     server_config_t *pcfg = acquire_config_snapshot();
     const server_stmt_t *srv = config_server_find_sa(pcfg, entry->view_name, (const struct sockaddr *)client_addr);
@@ -2123,13 +2122,19 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     if (is_ixfr) {
       xfr_eff_t pe;
       xfr_opts_effective_peer(pcfg, pcfg ? zone_entry_config(pcfg, entry) : NULL, entry->view_name, srv, &pe);
-      if (!pe.provide_ixfr) is_ixfr = false;
+      provide_ixfr = pe.provide_ixfr;
     }
     if (pcfg) release_config_snapshot(pcfg);
   }
-  /* R-15, RFC 1995 §2: 同じか新しい版 (RFC 1982 の比較) を持つクライアントには現在の SOA 1件で答える。 */
+  /* R-15, RFC 1995 §2: 同じか新しい版 (RFC 1982 の比較) を持つクライアントには現在の SOA 1件で答える。BIND 9.20 lib/ns/xfrout.c ns_xfr_start():
+   * this test (DNS_SERIAL_GE, "is_poll") comes before the provide-ixfr check, so provide-ixfr no does not change the answer to a client that is
+   * up to date. */
   bool client_up_to_date = is_ixfr && (client_serial == current_serial ||
                                        serial_is_newer(client_serial, current_serial));
+  /* provide-ixfr no (BIND 9.20 ARM: "only responds with a full zone transfer (AXFR)"; xfrout.c "IXFR delta response disabled due to
+   * 'provide-ixfr no;' being set", mnemonic "AXFR-style IXFR"): a client that is behind gets the whole zone, as with ixfr-history 0 (RFC 1995 §4
+   * allows an AXFR-style answer to an IXFR request) */
+  if (!provide_ixfr && !client_up_to_date) is_ixfr = false;
   /* X-24: 拡張を求める KariDNS セカンダリの IXFR は、拡張でしか運べないデータがあるときだけ
    * Extended AXFR にする。それ以外は通常の IXFR (差分が無ければ下で AXFR) で答える。 */
   if (is_extended_axfr && is_ixfr && !client_up_to_date && zone_needs_extended_axfr(current_zone, entry, ext_ver)) {

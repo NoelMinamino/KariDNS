@@ -567,6 +567,115 @@ static void test_nested_ports(void) {
     free_server_config_fields(&c);
 }
 
+/* Batch 10: the port of a primaries / masters / also-notify / remote-servers element that has none is options { port } (BIND 9.20 bin/named/config.c
+ * named_config_getipandkeylist(): named_config_getport(config, "port", &def_port); lib/dns/zone.c notify_find_address() sends to the NS hosts at
+ * view->dstport, set from the same option in bin/named/server.c), wherever options is written; 53 when it writes none; -p does not change it. */
+static void test_default_port(void) {
+    printf("[TEST] the default port of the lists is options { port }...\n");
+    server_config_t c;
+    char err[4096];
+    /* options after the zones: the port is read when the whole file has been read */
+    const char *conf =
+        "remote-servers rs { 192.0.2.3; 192.0.2.4 port 1000; };\n"
+        "zone \"a.test\" { type slave; primaries { 192.0.2.1; 192.0.2.2 port 1234; rs; }; };\n"
+        "zone \"b.test\" { type master; also-notify { 192.0.2.5; rs; }; };\n"
+        "zone \"c.test\" { type slave; primaries port 6000 { 192.0.2.6; rs; }; };\n"
+        "options { also-notify { 192.0.2.7; }; port 5300; };\n";
+    CHECK(parse_cap(conf, &c, err, sizeof(err)));
+    CHECK(c.dst_port == 5300 && c.port == 5300);
+    CHECK(c.also_notify_count == 1 && c.also_notify[0].port == 5300);                      /* options { also-notify } itself */
+    const zone_config_t *z = config_find_zone_any_view(&c, "a.test.");
+    CHECK(z && zext(z)->masters_count == 4);
+    if (z && zext(z)->masters_count == 4) {
+        const notify_target_t *m = zext(z)->masters;
+        CHECK(m[0].port == 5300 && m[1].port == 1234 && m[2].port == 5300 && m[3].port == 1000);   /* a list name: its elements without a port get it too */
+    }
+    z = config_find_zone_any_view(&c, "b.test.");
+    CHECK(z && zext(z)->also_notify_count == 3 && zext(z)->also_notify[0].port == 5300 && zext(z)->also_notify[1].port == 5300 &&
+          zext(z)->also_notify[2].port == 1000);
+    z = config_find_zone_any_view(&c, "c.test.");
+    CHECK(z && zext(z)->masters_count == 3 && zext(z)->masters[0].port == 6000 && zext(z)->masters[1].port == 6000 &&
+          zext(z)->masters[2].port == 1000);                                                        /* a `port` before the braces is still above options */
+    CHECK(config_target_port(&c, 0) == 5300 && config_target_port(&c, 77) == 77 && config_target_port(NULL, 0) == 53);
+    free_server_config_fields(&c);
+
+    /* -p replaces the listening ports and not this default (BIND: named_g_port is the listen port only) */
+    config_set_port_override(5400);
+    CHECK(parse_cap("options { port 5300; also-notify { 192.0.2.7; }; };", &c, err, sizeof(err)));
+    CHECK(c.port == 5400 && c.dst_port == 5300 && c.also_notify_count == 1 && c.also_notify[0].port == 5300);
+    free_server_config_fields(&c);
+    config_set_port_override(0);
+    CHECK(parse_cap("zone \"a.test\" { type master; also-notify { 192.0.2.7; }; };", &c, err, sizeof(err)));
+    z = config_find_zone_any_view(&c, "a.test.");
+    CHECK(c.dst_port == 53 && z && zext(z)->also_notify_count == 1 && zext(z)->also_notify[0].port == 53);   /* no options { port }: 53 */
+    free_server_config_fields(&c);
+
+    /* The settings text of a database zone is read without the configuration: an element without a port keeps 0, the users call
+     * config_target_port(); a port written there stays */
+    char derr[256];
+    static const char dtext[] = "masters { 192.0.2.1; 192.0.2.2 port 7000; }; also-notify { 192.0.2.3; };";
+    zone_ext_shared_t *sh = db_settings_parse(dtext, sizeof(dtext) - 1, derr, sizeof(derr));
+    CHECK(sh != NULL);
+    if (sh) {
+        CHECK(sh->ext.masters_count == 2 && sh->ext.masters[0].port == 0 && sh->ext.masters[1].port == 7000);
+        CHECK(sh->ext.also_notify_count == 1 && sh->ext.also_notify[0].port == 0);
+        server_config_t o;
+        memset(&o, 0, sizeof(o));
+        o.dst_port = 5300;
+        CHECK(config_target_port(&o, sh->ext.masters[0].port) == 5300 && config_target_port(&o, sh->ext.masters[1].port) == 7000);
+        zone_ext_shared_unref(sh);
+    }
+}
+
+/* Batch 10: a view whose match-clients names a key, after a view that surely matches every client, is reported (a KariDNS warning, not an error;
+ * BIND says nothing).  Only a view that surely matches everything counts: `any`, 0.0.0.0/0 together with ::/0, a view without match-clients, or an
+ * acl / nested list that is one of these, before any negated element. */
+static int shadow_warnings(const char *text) {
+    server_config_t c;
+    char err[4096];
+    if (!parse_cap(text, &c, err, sizeof(err))) {
+        printf("  [info] does not parse: %s\n%s", text, err);
+        return -1;
+    }
+    free_server_config_fields(&c);
+    int n = 0;
+    for (const char *p = err; (p = strstr(p, "can never be chosen")) != NULL; p++) n++;
+    return n;
+}
+
+static void test_view_shadow_warning(void) {
+    printf("[TEST] a keyed view after a view that matches every client is warned about...\n");
+#define K1 "key \"k1\" { algorithm hmac-sha256; secret \"" KEYA "\"; };\n"
+#define KEYED "view \"b\" { match-clients { key k1; }; };\n"
+    CHECK(shadow_warnings(K1 "view \"a\" { match-clients { any; }; };\n" KEYED) == 1);
+    CHECK(shadow_warnings(K1 "view \"a\" { match-clients { 0.0.0.0/0; ::/0; }; };\n" KEYED) == 1);
+    CHECK(shadow_warnings(K1 "view \"a\" { };\n" KEYED) == 1);                                            /* no match-clients matches every client */
+    CHECK(shadow_warnings(K1 "acl everyone { any; };\nview \"a\" { match-clients { everyone; }; };\n" KEYED) == 1);   /* through an acl */
+    CHECK(shadow_warnings(K1 "view \"a\" { match-clients { { any; }; }; };\n" KEYED) == 1);               /* a nested list */
+    CHECK(shadow_warnings(K1 "view \"a\" { match-clients { key k1; 192.0.2.0/24; any; }; };\n" KEYED) == 1);   /* key and prefix before `any` do not matter */
+    CHECK(shadow_warnings(K1 "view \"a\" { match-clients { any; }; };\nview \"c\" { match-clients { any; }; };\n" KEYED) == 1);   /* one warning, for the keyed view */
+    CHECK(shadow_warnings(K1 "view \"a\" { match-clients { any; }; };\n" KEYED "view \"d\" { match-clients { key k1; }; };\n") == 2);
+    /* nothing to say */
+    CHECK(shadow_warnings(K1 KEYED "view \"a\" { match-clients { any; }; };\n") == 0);                     /* the keyed view is first */
+    CHECK(shadow_warnings(K1 "view \"a\" { match-clients { 0.0.0.0/0; }; };\n" KEYED) == 0);              /* IPv6 clients are not matched: conservative */
+    CHECK(shadow_warnings(K1 "view \"a\" { match-clients { 192.0.2.0/24; }; };\n" KEYED) == 0);
+    CHECK(shadow_warnings(K1 "view \"a\" { match-clients { !192.0.2.0/24; any; }; };\n" KEYED) == 0);   /* a negated element: not sure */
+    CHECK(shadow_warnings(K1 "view \"a\" { match-clients { none; }; };\n" KEYED) == 0);
+    CHECK(shadow_warnings(K1 "view \"a\" { match-clients { any; }; };\nview \"b\" { match-clients { 192.0.2.1; }; };\n") == 0);   /* not keyed */
+    /* the warning names the keyed view's match-clients place and the earlier view */
+    server_config_t c;
+    char err[4096];
+    CHECK(parse_cap(K1 "view \"a\" { match-clients { any; }; };\nview \"b\" {\n  match-clients { key k1; };\n};\n", &c, err, sizeof(err)));
+    free_server_config_fields(&c);
+    if (!(strstr(err, "[WARNING]") != NULL && strstr(err, "line 4: view 'b' match-clients: KariDNS warning") != NULL &&
+          strstr(err, "view 'a' (") != NULL && strstr(err, "(line 2)") != NULL))
+        printf("  [info] warning text: %s\n", err);
+    CHECK(strstr(err, "[WARNING]") != NULL && strstr(err, "line 4: view 'b' match-clients: KariDNS warning") != NULL &&
+          strstr(err, "view 'a' (") != NULL && strstr(err, "(line 2)") != NULL);
+#undef KEYED
+#undef K1
+}
+
 int main(void) {
     test_parse_options();
     test_clamps();
@@ -578,6 +687,8 @@ int main(void) {
     test_view_keys();
     test_tsig_check_view();
     test_nested_ports();
+    test_default_port();
+    test_view_shadow_warning();
     printf("%d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) {
         printf("test_server_stmt: FAILED\n");

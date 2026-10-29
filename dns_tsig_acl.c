@@ -208,8 +208,7 @@ static const char *tsig_error_name(uint16_t error) {
     }
 }
 
-void tsig_check_request(const server_config_t *cfg, const char *view_name, const uint8_t *req, size_t req_len, const char *client_ip,
-                        tsig_request_t *t) {
+void tsig_check_request_nolog(const server_config_t *cfg, const char *view_name, const uint8_t *req, size_t req_len, tsig_request_t *t) {
     t->status = TSIG_REQ_NONE;
     t->error = 0;
     t->key = NULL;
@@ -270,12 +269,20 @@ void tsig_check_request(const server_config_t *cfg, const char *view_name, const
             }
         }
     }
-    if (t->status != TSIG_REQ_VALID) {
-        /* RFC 8945 §5.2.1-§5.2.4: the server SHOULD log the error */
-        syslog(LOG_INFO, "[TSIG] request from %s with key '%s': %s",
-               client_ip ? client_ip : "?", t->status == TSIG_REQ_FORMERR ? "?" : t->key_name,
-               tsig_error_name(t->status == TSIG_REQ_FORMERR ? 0 : t->error));
-    }
+}
+
+void tsig_log_request_error(const tsig_request_t *t, const char *client_ip) {
+    if (t->status != TSIG_REQ_ERROR && t->status != TSIG_REQ_FORMERR) return;
+    /* RFC 8945 §5.2.1-§5.2.4: the server SHOULD log the error */
+    syslog(LOG_INFO, "[TSIG] request from %s with key '%s': %s",
+           client_ip ? client_ip : "?", t->status == TSIG_REQ_FORMERR ? "?" : t->key_name,
+           tsig_error_name(t->status == TSIG_REQ_FORMERR ? 0 : t->error));
+}
+
+void tsig_check_request(const server_config_t *cfg, const char *view_name, const uint8_t *req, size_t req_len, const char *client_ip,
+                        tsig_request_t *t) {
+    tsig_check_request_nolog(cfg, view_name, req, req_len, t);
+    tsig_log_request_error(t, client_ip);
 }
 
 size_t tsig_response_reserve(const tsig_request_t *t) {
@@ -519,6 +526,13 @@ bool aml_allows_addr(const aml_t *l, const aml_subject_t *s) {
     aml_subject_t a = *s;
     a.key = NULL;
     return aml_match_depth(l, &a, 0) > 0;
+}
+
+bool aml_allows_ip(const aml_t *l, const char *ip, const char *key) {
+    aml_subject_t s;
+    uint8_t b[16];
+    (void)aml_subject_from_ip(&s, b, ip, key);   /* an address that does not parse leaves the subject without one: only `any` and key elements match */
+    return aml_match_depth(l, &s, 0) > 0;
 }
 
 static bool aml_key_listed_d(const aml_t *l, const char *key, bool neg, int depth) {

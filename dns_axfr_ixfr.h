@@ -62,6 +62,11 @@ static inline bool ctx_request_expire(const axfr_bg_ctx_t *c, const xfr_primary_
 }
 /* BIND (zoneconf.c) looks at multi-master only when the zone has more than one primary */
 static inline bool ctx_multi_master(const axfr_bg_ctx_t *c) { return c->has_eff && c->eff.multi_master && c->nprim > 1; }
+/* The primaries a secondary zone is refreshed from (dns_server_core.c; declared here so that a unit test can look at what it builds: the order, the
+ * port, the key by the precedence of peer_key_name()).  entry: the zone's entry, zcfg: its configuration (NULL for a catalog member), snap: the
+ * snapshot that holds the catalog zone of a member (may be NULL: the primary copied into the member is used). */
+void xfr_build_primaries(server_config_t *active, zone_db_snapshot_t *snap, const zone_db_entry_t *entry, const zone_config_t *zcfg,
+                         axfr_bg_ctx_t *ctx);
 
 /* ---- batch 4: the policy of the secondary side, kept free of sockets so that it can be tested ---- */
 

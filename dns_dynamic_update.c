@@ -819,7 +819,7 @@ static void notify_add_target(notify_dest_t *targets, int *count, int max, int f
 }
 
 /* arena の中の name のアドレス (A/AAAA) を宛先に加える。見つかれば true */
-static bool notify_add_glue(const zone_image_t *img, const char *name, notify_dest_t *targets, int *count, int max, const tsig_key_t *tkey) {
+static bool notify_add_glue(const zone_image_t *img, const char *name, notify_dest_t *targets, int *count, int max, const tsig_key_t *tkey, uint16_t port) {
   bool found = false;
   uint32_t id = zone_image_find_name(img, name);
   if (id == ZONE_IMAGE_NONE) return false;
@@ -830,7 +830,7 @@ static bool notify_add_glue(const zone_image_t *img, const char *name, notify_de
     char ip[INET6_ADDRSTRLEN];
     if ((t != 1 || len != 4) && (t != 28 || len != 16)) continue;
     if (!inet_ntop(t == 1 ? AF_INET : AF_INET6, zone_image_rr_rdata(img, k), ip, sizeof(ip))) continue;
-    notify_add_target(targets, count, max, t == 1 ? AF_INET : AF_INET6, ip, 53, tkey, NULL);
+    notify_add_target(targets, count, max, t == 1 ? AF_INET : AF_INET6, ip, port, tkey, NULL);
     found = true;
   }
   return found;
@@ -887,13 +887,15 @@ void send_notify_to_all(zone_db_entry_t *entry) {
       tk = find_tsig_key_in_view(active, view_name, an[i].key);
       if (!tk) syslog(LOG_ERR, "[Notify] zone '%s': also-notify key '%s' is not defined; NOTIFY sent unsigned", domain, an[i].key);
     }
-    notify_add_target(targets, &ntargets, 64, AF_UNSPEC, an[i].ip, (uint16_t)an[i].port, tk, &an[i]);
+    notify_add_target(targets, &ntargets, 64, AF_UNSPEC, an[i].ip, (uint16_t)config_target_port(active, an[i].port), tk, &an[i]);
   }
 
   // 2. Addresses of the apex NS hosts except the SOA MNAME host (RFC 1996 §3.2) -- unless notify-to-soa yes (BIND 9.20 ARM: "do not check the
   // name servers in the NS RRset against the SOA MNAME")
   // 同じゾーン名が別の view にもあり得るので、呼び出し元のエントリの view で引く (R-26)
   view_snapshot_t *view = snap ? snapshot_find_view(snap, view_name) : NULL;
+  /* the NS hosts are sent to at options { port } (BIND zone.c notify_find_address(): dns_adb_createfind(..., view->dstport, ...)) */
+  const uint16_t ns_port = (uint16_t)config_target_port(active, 0);
   zone_version_t *arena = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   const zone_image_t *img = arena && mode != NOTIFY_MODE_EXPLICIT ? arena->image : NULL;
   uint32_t apex_id = img ? zone_image_find_name(img, entry->domain) : ZONE_IMAGE_NONE;
@@ -910,12 +912,12 @@ void send_notify_to_all(zone_db_entry_t *entry) {
       if (zone_image_rr_target(img, i, ns_target, sizeof(ns_target)) != 0) continue;
       if (mname && !eff.notify_to_soa && domain_names_match_ci(ns_target, mname)) continue;
       // A. in-zone glue, B. otherwise the address in a sibling zone of the same view
-      if (notify_add_glue(img, ns_target, targets, &ntargets, 64, key)) continue;
+      if (notify_add_glue(img, ns_target, targets, &ntargets, 64, key, ns_port)) continue;
       zone_db_entry_t *sib_entry = find_zone_in_view(view, ns_target);
       if (!sib_entry || sib_entry == entry) continue;
       zone_version_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
       if (sib_arena && sib_arena->image)
-        notify_add_glue(sib_arena->image, ns_target, targets, &ntargets, 64, key);
+        notify_add_glue(sib_arena->image, ns_target, targets, &ntargets, 64, key, ns_port);
     }
   }
 

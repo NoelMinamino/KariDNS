@@ -986,7 +986,7 @@ static void test_secondary_entries(void) {
     char err[200];
     const char *txt = "masters { 192.0.2.1 port 5300; 2001:db8::1; }; tsig-key \"k1\";";
     zone_ext_shared_t *sh = db_settings_parse(txt, strlen(txt), err, sizeof(err));
-    CHECK(sh != NULL && sh->ext.masters_count == 2 && sh->ext.masters[0].port == 5300 && sh->ext.masters[1].port == 53);
+    CHECK(sh != NULL && sh->ext.masters_count == 2 && sh->ext.masters[0].port == 5300 && sh->ext.masters[1].port == 0);   /* no port: 0 here, options { port } when it is used (config_target_port()) */
     CHECK(sh && strcmp(sh->ext.masters[0].ip, "192.0.2.1") == 0 && sh->ext.tsig_key && strcmp(sh->ext.tsig_key, "k1") == 0);
     CHECK(sh && sh->ext.masters_parsed != NULL);
 
@@ -1052,7 +1052,7 @@ static void test_secondary_entries(void) {
     CHECK(mem2 && mem2->is_catalog_member && mem2->is_secondary && mem2->catalog_master != NULL);
     CHECK(tick_list("default", mem2, &in_tick) == 3 && in_tick);                  /* the consumer and its two members */
     CHECK(mem2 && strcmp(mem2->catalog_master->ip, "192.0.2.1") == 0 && mem2->catalog_master->port == 5300 &&
-          strcmp(mem2->catalog_master->tsig_key, "k1") == 0);                              /* the masters and the key of the consumer */
+          strcmp(mem2->catalog_master->zone_key, "k1") == 0 && mem2->catalog_master->key[0] == '\0');   /* the masters and the tsig-key of the consumer (a database zone's primaries have no key of their own) */
     CHECK(mem1 && mem1 != hid && mem1->is_catalog_member);                                  /* D17-1: the member wins */
     CHECK(!in_snapshot("default", hid) && dbreg_find_info("default", "m1.test.", info, 1) == 1 && info[0].shadowed);
 
