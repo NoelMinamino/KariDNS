@@ -78,9 +78,9 @@ EOF
 cleanup() {
     set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)
     echo "[*] Cleaning up test processes and temp files..."
-    kari_kill_tree "${PID_LIMITED:-}" "${PID_UNLIMITED:-}"
+    kari_kill_tree "${PID_LIMITED:-}" "${PID_UNLIMITED:-}" "${PID_TWO:-}"
     rm -f "$CONF_LIMITED" "$CONF_UNLIMITED" "$LOG_LIMITED" "$LOG_UNLIMITED" "$ZONE_FILE"
-    rm -f "$DIR"/server_limited.log "$DIR"/server_unlimited.log
+    rm -f "$DIR"/server_limited.log "$DIR"/server_unlimited.log "$DIR"/server_two.log "$DIR"/query_log_rate_limit_two.conf /tmp/karidns_queries_slow.log /tmp/karidns_queries_fast.log
 }
 trap cleanup EXIT INT TERM
 
@@ -180,4 +180,64 @@ if [ "$LINE_COUNT2" -ne 60 ]; then
 fi
 
 echo "[OK] Unlimited query logging logged all $LINE_COUNT2 queries."
+# -------------------------------------------------------------
+# Test 3: two channels in `category queries`, each with its own max-qps.  The workers admit what the most generous channel allows and the
+# logger holds each channel to its own limit, whatever the order of the channels in the category (the first channel alone used to decide for all).
+# -------------------------------------------------------------
+for ORDER in "slow; fast;" "fast; slow;"; do
+    case "$ORDER" in "slow; fast;") TPORT=10057 ;; *) TPORT=10058 ;; esac
+    CONF_TWO="$DIR/query_log_rate_limit_two.conf"
+    LOG_SLOW="/tmp/karidns_queries_slow.log"
+    LOG_FAST="/tmp/karidns_queries_fast.log"
+    rm -f "$LOG_SLOW" "$LOG_FAST"
+    cat << EOF > "$CONF_TWO"
+options {
+    port $TPORT;
+    bind-address { 127.0.0.1; };
+    user "nobody";
+    group "nobody";
+};
+logging {
+    channel slow { file "$LOG_SLOW"; max-qps 20; };
+    channel fast { file "$LOG_FAST"; max-qps 2000; };
+    category queries { $ORDER };
+};
+zone "example.jp" {
+    type master;
+    file "$ZONE_FILE";
+};
+EOF
+    echo "[*] Starting KariDNS with channels slow (max-qps 20) and fast (max-qps 2000), category queries { $ORDER } on port $TPORT..."
+    "$BIN" -f -c "$CONF_TWO" > "$DIR/server_two.log" 2>&1 &
+    PID_TWO=$!
+    sleep 2
+    SUCCESS_COUNT3=0
+    for i in $(seq 1 150); do
+        "$DAG" www.example.jp a @127.0.0.1 -p $TPORT > /dev/null 2>&1 && SUCCESS_COUNT3=$((SUCCESS_COUNT3 + 1))
+    done
+    sleep 2
+    kari_kill_tree "$PID_TWO"
+    wait "$PID_TWO" 2>/dev/null || true
+    SLOW_LINES=$(wc -l < "$LOG_SLOW" 2>/dev/null | tr -d ' ')
+    FAST_LINES=$(wc -l < "$LOG_FAST" 2>/dev/null | tr -d ' ')
+    echo "[*] $SUCCESS_COUNT3 / 150 queries answered; slow channel: ${SLOW_LINES:-0} lines, fast channel: ${FAST_LINES:-0} lines"
+    if [ "$SUCCESS_COUNT3" -ne 150 ]; then
+        echo "[FAIL] Expected 150 successful DNS queries, but got $SUCCESS_COUNT3"
+        cat "$DIR/server_two.log"
+        exit 1
+    fi
+    # the slow channel is held to 20 lines a second (up to three seconds' worth if the 150 queries span them); the fast one gets (nearly) all
+    if [ "${SLOW_LINES:-0}" -eq 0 ] || [ "${SLOW_LINES:-0}" -gt 60 ]; then
+        echo "[FAIL] category queries { $ORDER }: the slow channel (max-qps 20) has ${SLOW_LINES:-0} lines (expected 1..60)"
+        exit 1
+    fi
+    if [ "${FAST_LINES:-0}" -lt 120 ]; then
+        echo "[FAIL] category queries { $ORDER }: the fast channel (max-qps 2000) has ${FAST_LINES:-0} lines (expected at least 120 of 150)"
+        exit 1
+    fi
+    echo "[OK] category queries { $ORDER }: each channel was held to its own limit (slow ${SLOW_LINES}, fast ${FAST_LINES})."
+    rm -f "$LOG_SLOW" "$LOG_FAST" "$CONF_TWO" "$DIR/server_two.log"
+done
+
+
 echo "[ALL TESTS PASSED]"

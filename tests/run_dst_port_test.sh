@@ -9,6 +9,9 @@
 #   D6  primaries { 127.0.0.1; } with no port: the secondary transfers from options { port } (a primary on that port)
 #   D7  a primaries element with its own port wins over options { port }
 #   D8  karicheck conf accepts the configuration (the same parser)
+#   D9  forwarders { 127.0.0.1; } of a forward zone with no port: the query goes to options { port } (bin/named/server.c configure_forward())
+#   D10 forwarders port N { ... }: the port of the list is the default of its elements        D11 an element's own port wins
+#   D12 karicheck conf accepts the forward zones
 #
 # The server under test listens somewhere else than options { port } (-p, or listen-on port), so that options { port } can be the port of the mock
 # NOTIFY receivers (tests/mock_also_notify.pl, 127.0.0.1) and of a second KariDNS (the primary).  Normal user, 127.0.0.1 only.
@@ -35,6 +38,10 @@ PL=$(kari_port 2 15803)      # where the notifier listens (-p)
 PP=$(kari_port 3 15804)      # options { port } of the secondary and port of the primary
 PS=$(kari_port 4 15805)      # where the secondary listens (listen-on port)
 PQ=$(kari_port 5 15806)      # where a primary listens whose port is written in an element
+PF=$(kari_port 6 15807)      # options { port } of the forwarding server: the upstream of the zone with no port
+PF2=$(kari_port 7 15808)     # the port of a forwarders list
+PF3=$(kari_port 8 15809)     # the port of a forwarders element
+PG=$(kari_port 9 15810)      # where the forwarding server listens
 CS="Y29udHJvbC1zZWNyZXQtZm9yLWRzdC1wb3J0LXRlc3Q="
 
 PIDS=""
@@ -44,16 +51,16 @@ fail() { echo "FAIL: $*"; FAILS=$((FAILS + 1)); }
 cleanup() {
     set +e
     kari_kill_tree $PIDS
-    kari_kill_conf "$W/n.conf" "$W/p.conf" "$W/s.conf" "$W/q.conf"
+    kari_kill_conf "$W/n.conf" "$W/p.conf" "$W/s.conf" "$W/q.conf" "$W/f.conf"
     if [ "$FAILS" -ne 0 ]; then
-        for f in n p s q; do echo "--- $f.log (tail)"; tail -15 "$W/$f.log" 2>/dev/null; done
+        for f in n p s q f; do echo "--- $f.log (tail)"; tail -15 "$W/$f.log" 2>/dev/null; done
         echo "--- recv.log"; cat "$W/recv.log" 2>/dev/null
     fi
     rm -rf "$W"
 }
 trap cleanup EXIT INT TERM
 
-for p in $PD $PE $PL $PP $PS $PQ; do
+for p in $PD $PE $PL $PP $PS $PQ $PF $PF2 $PF3 $PG; do
     if sockstat -4 -l -p "$p" 2>/dev/null | grep -q ":$p "; then echo "SKIP: port $p is in use"; exit 0; fi
 done
 
@@ -132,6 +139,30 @@ soa() { "$DAG" @127.0.0.1 -p "$PS" "$1" SOA +short +nohexdump +time=1 +tries=1 2
 i=0; while [ $i -lt 25 ] && { [ "$(soa s.test)" != 7 ] || [ "$(soa t.test)" != 9 ]; }; do sleep 1; i=$((i + 1)); done
 [ "$(soa s.test)" = 7 ] && pass "D6: primaries { 127.0.0.1; } with no port: s.test was transferred from options { port } ($PP)" || fail "D6: s.test serial '$(soa s.test)' (expected 7)"
 [ "$(soa t.test)" = 9 ] && pass "D7: primaries { 127.0.0.1 port $PQ; }: the element's own port wins; t.test was transferred from $PQ" || fail "D7: t.test serial '$(soa t.test)' (expected 9)"
+
+# ---- forward zones (D9-D11): the upstreams are mock servers (tests/mock_dns_server.pl answers every name under ttl.test) on PF, PF2 and PF3.  They are
+# started one after the other: a zone whose forwarder port is wrong has nothing to talk to (or talks to the wrong mock) and answers SERVFAIL.
+cat > "$W/f.conf" <<EOF
+zone "a.ttl.test" { type forward; forwarders { 127.0.0.1; }; forward-timeout 1500; };
+zone "b.ttl.test" { type forward; forwarders port $PF2 { 127.0.0.1; }; forward-timeout 1500; };
+zone "c.ttl.test" { type forward; forwarders { 127.0.0.1 port $PF3; }; forward-timeout 1500; };
+options { port $PF; listen-on port $PG { 127.0.0.1; }; listen-on-v6 { none; }; pid-file "none"; $USER_OPT };
+EOF
+out=$("$KARICHECK" conf "$W/f.conf" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && pass "D12: karicheck conf accepts the forward zones (forwarders port N { ... })" || { fail "D12: karicheck conf rc=$rc"; echo "$out"; }
+
+perl "$DIR/mock_dns_server.pl" --port "$PF" --host 127.0.0.1 > "$W/mockf1.log" 2>&1 & PIDS="$PIDS $!"
+"$KARIDNS" -f "$W/f.conf" > "$W/f.log" 2>&1 & PIDS="$PIDS $!"
+i=0; while [ $i -lt 30 ] && ! "$DAG" @127.0.0.1 -p "$PG" x.a.ttl.test A +nohexdump +time=1 +tries=1 2>/dev/null | grep -q "status: NOERROR"; do sleep 1; i=$((i + 1)); done
+fq() { "$DAG" @127.0.0.1 -p "$PG" "$1" A +nohexdump +time=3 +tries=1 2>/dev/null | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -1; }
+[ "$(fq x.a.ttl.test)" = NOERROR ] && pass "D9: forwarders { 127.0.0.1; } with no port: the query went to options { port } ($PF), not to 53" || fail "D9: x.a.ttl.test got '$(fq x.a.ttl.test)'"
+[ "$(fq x.b.ttl.test)" = SERVFAIL ] && [ "$(fq x.c.ttl.test)" = SERVFAIL ] && pass "D10/D11: the other two zones do not use options { port } (nothing listens on $PF2 and $PF3 yet)" || fail "D10/D11: b='$(fq x.b.ttl.test)' c='$(fq x.c.ttl.test)' before their upstreams are up (expected SERVFAIL)"
+perl "$DIR/mock_dns_server.pl" --port "$PF2" --host 127.0.0.1 > "$W/mockf2.log" 2>&1 & PIDS="$PIDS $!"
+sleep 1
+[ "$(fq x.b.ttl.test)" = NOERROR ] && [ "$(fq x.c.ttl.test)" = SERVFAIL ] && pass "D10: forwarders port $PF2 { 127.0.0.1; }: the port of the list is the default of its elements" || fail "D10: b='$(fq x.b.ttl.test)' c='$(fq x.c.ttl.test)'"
+perl "$DIR/mock_dns_server.pl" --port "$PF3" --host 127.0.0.1 > "$W/mockf3.log" 2>&1 & PIDS="$PIDS $!"
+sleep 1
+[ "$(fq x.c.ttl.test)" = NOERROR ] && pass "D11: forwarders { 127.0.0.1 port $PF3; }: the element's own port wins over options { port }" || fail "D11: c='$(fq x.c.ttl.test)'"
 
 echo "---"
 if [ "$FAILS" -eq 0 ]; then echo "ALL PASSED"; exit 0; fi

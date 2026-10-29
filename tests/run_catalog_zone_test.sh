@@ -8,16 +8,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PORT=$(kari_port 0 53530)
 BIN_DIR="$SCRIPT_DIR/.."
 ZONES_DIR="$SCRIPT_DIR/zones"
-TEST_DIR="catalog_test_dir"
+# the workspace is under TMPDIR, not in the tree: karidns runs as root in the suite and its files would be left behind root-owned
 
 echo "[*] Building required binaries (karidns, karictl, dag, karicheck)..."
 [ -x "$BIN_DIR/karidns" ] && [ -x "$BIN_DIR/karictl" ] && [ -x "$BIN_DIR/dag" ] && [ -x "$BIN_DIR/karicheck" ] || make -C "$BIN_DIR" karidns karictl dag karicheck
 
-# Setup workspace
-rm -rf "$SCRIPT_DIR/$TEST_DIR"
-mkdir -p "$SCRIPT_DIR/$TEST_DIR"
-cd "$SCRIPT_DIR/$TEST_DIR"
-TEST_DIR_ABS=$(pwd)
+# Setup workspace (readable by "nobody", which the server drops to)
+TEST_DIR_ABS=$(mktemp -d "${TMPDIR:-/tmp}/karidns-catalog.XXXXXX")
+chmod 755 "$TEST_DIR_ABS"
+cd "$TEST_DIR_ABS"
 
 # Trap for cleanup and automatic kdump on failure
 cleanup() {
@@ -37,6 +36,8 @@ cleanup() {
             echo "====================================="
         fi
     fi
+    cd "$SCRIPT_DIR"
+    rm -rf "$TEST_DIR_ABS"
 }
 trap cleanup EXIT INT TERM
 

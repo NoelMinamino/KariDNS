@@ -831,7 +831,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   zone_arena_init(z_standby);
   /* R-21: 読み込み済みのゾーンの版が変わったら NOTIFY を送る (起動時の最初の読み込みでは送らない) */
   bool was_loaded = z_active->image && z_active->image->n_rrs > 0;
-  uint32_t old_serial = entry->serial;
+  uint32_t old_serial = entry->serial, old_refresh = entry->refresh, old_retry = entry->retry, old_expire = entry->expire;
 
   /* S4: 小さいゾーンに 64 KiB の最初のプールを持たせない。プールの使用量 (レコードのワイヤー形式の
    * 前処理など) はゾーンファイルの 0.6-1.2 倍ほど。足りなければ半分の大きさで足す (arena_alloc) */
@@ -1033,6 +1033,8 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   /* S5 B-1: 応答を作る側が読むイメージ。公開の直前に 1 回だけ作る (クエリの経路では作らない) */
   z_standby->image = zone_image_freeze(z_standby, entry->domain);
   if (!z_standby->image) {
+      /* a zone that is not published keeps its serial and timers (the values above were taken from the new file) */
+      entry->serial = old_serial; entry->refresh = old_refresh; entry->retry = old_retry; entry->expire = old_expire;
       zone_arena_destroy(z_standby);
       pthread_mutex_unlock(&entry->writer_lock);
       syslog(LOG_ERR, "[Zone] Failed to build the zone image after reload for '%s'", entry->domain);
@@ -1045,6 +1047,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   zone_version_t *z_next = zone_version_new(z_standby);
   zone_arena_destroy(z_standby);
   if (!z_next) {
+      entry->serial = old_serial; entry->refresh = old_refresh; entry->retry = old_retry; entry->expire = old_expire;
       pthread_mutex_unlock(&entry->writer_lock);
       syslog(LOG_ERR, "[Zone] Out of memory publishing the reloaded zone '%s'", entry->domain);
       return RELOAD_ERR_PARSE;

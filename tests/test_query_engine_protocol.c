@@ -211,7 +211,8 @@ static const gr_rr_t *gr_first(const gr_resp_t *r, int sect, int type) {
 static struct {
     zone_arena_t arena;
     zone_db_entry_t entry;
-    zone_db_entry_t *entries[1];
+    zone_db_entry_t *entries[2];
+    zone_db_entry_t cat_entry;      /* a second zone of the view (test_notify_catalog_member()) */
     char *acl[1];
     view_snapshot_t view;
     zone_db_snapshot_t snap;
@@ -578,6 +579,146 @@ static void test_notify_authorization(void) {
         zone_arena_destroy(&g_gr.arena);
     }
     printf("  -> NOTIFY authorization matrix passed.\n");
+}
+
+/* Incoming NOTIFY for a catalog member.  The member has no zone { }, so zone_entry_config() is NULL for it: it is a secondary of the primaries
+ * of its catalog zone (BIND lib/dns/zone.c dns_zone_notifyreceive(): the sender must be a primary of the zone or match allow-notify), with the TSIG
+ * rule of a configured secondary (the primaries element's key, else the catalog zone's tsig-key).  The copy of the primary kept in the member is the
+ * fallback when the catalog zone is not in the view. */
+static void test_notify_catalog_member(void) {
+    printf("[TEST] Query engine: NOTIFY for a catalog member is accepted from the primaries of its catalog zone...\n");
+    static const char *MASTER = "192.0.2.100";
+    static const char *STRANGER = "203.0.113.9";
+    gr_resp_t r;
+    req_t q;
+
+    /* --- the catalog zone lists the primary; no key --- */
+    server_config_t *cfg = notify_cfg("zone \"catalog.example.\" { type slave; file \"x\"; masters { 192.0.2.100; }; catalog-zone yes; };");
+    tsig_key_t *k1 = cfg_key(cfg, "k1"), *k2 = cfg_key(cfg, "k2");
+    assert(k1 && k2);
+    gr_setup("member.example.", ZONE_TXT);
+    g_gr.cfg = *cfg;
+    g_gr.view.name = "__default__";
+    strncpy(g_gr.cat_entry.domain, "catalog.example.", sizeof(g_gr.cat_entry.domain) - 1);
+    g_gr.cat_entry.is_secondary = true;
+    g_gr.entries[1] = &g_gr.cat_entry;
+    g_gr.view.zone_count = 2;
+    g_gr.entry.is_catalog_member = true;
+    g_gr.entry.is_secondary = true;
+    g_gr.entry.source = ZONE_SRC_CATALOG;
+    g_gr.entry.owning_catalog_domain = (char *)"catalog.example.";
+
+    atomic_store(&g_gr.entry.refresh_now, false);
+    build_notify(&q, "member.example.", NULL);
+    ask(&q, "member.example.", 6, MASTER, false, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && atomic_load(&g_gr.entry.refresh_now));
+    atomic_store(&g_gr.entry.refresh_now, false);
+    ask(&q, "member.example.", 6, STRANGER, false, &r);
+    CHECK(&r, r.rcode == 5 && !r.aa && !atomic_load(&g_gr.entry.refresh_now));
+    free_server_config_fields(cfg); free(cfg);
+    zone_arena_destroy(&g_gr.arena);
+
+    /* --- the catalog zone has a tsig-key: the NOTIFY must be signed with it --- */
+    cfg = notify_cfg("zone \"catalog.example.\" { type slave; file \"x\"; masters { 192.0.2.100; }; tsig-key \"k1\"; catalog-zone yes; };");
+    k1 = cfg_key(cfg, "k1"); k2 = cfg_key(cfg, "k2");
+    gr_setup("member.example.", ZONE_TXT);
+    g_gr.cfg = *cfg;
+    g_gr.view.name = "__default__";
+    strncpy(g_gr.cat_entry.domain, "catalog.example.", sizeof(g_gr.cat_entry.domain) - 1);
+    g_gr.entries[1] = &g_gr.cat_entry;
+    g_gr.view.zone_count = 2;
+    g_gr.entry.is_catalog_member = true;
+    g_gr.entry.is_secondary = true;
+    g_gr.entry.source = ZONE_SRC_CATALOG;
+    g_gr.entry.owning_catalog_domain = (char *)"catalog.example.";
+    atomic_store(&g_gr.entry.refresh_now, false);
+    build_notify(&q, "member.example.", k1);
+    ask(&q, "member.example.", 6, MASTER, false, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && atomic_load(&g_gr.entry.refresh_now));
+    atomic_store(&g_gr.entry.refresh_now, false);
+    build_notify(&q, "member.example.", NULL);                    /* the right address, no TSIG */
+    ask(&q, "member.example.", 6, MASTER, false, &r);
+    CHECK(&r, r.rcode == 5 && !atomic_load(&g_gr.entry.refresh_now));
+    build_notify(&q, "member.example.", k2);                      /* a known key that is not the catalog zone's */
+    ask(&q, "member.example.", 6, MASTER, false, &r);
+    CHECK(&r, r.rcode == 5 && !atomic_load(&g_gr.entry.refresh_now));
+    build_notify(&q, "member.example.", k1);                      /* the key from an address that is no primary */
+    ask(&q, "member.example.", 6, STRANGER, false, &r);
+    CHECK(&r, r.rcode == 5 && !atomic_load(&g_gr.entry.refresh_now));
+    free_server_config_fields(cfg); free(cfg);
+    zone_arena_destroy(&g_gr.arena);
+
+    /* --- the key of the primaries element is above the catalog zone's tsig-key --- */
+    cfg = notify_cfg("zone \"catalog.example.\" { type slave; file \"x\"; masters { 192.0.2.100 key \"k2\"; }; tsig-key \"k1\"; catalog-zone yes; };");
+    k1 = cfg_key(cfg, "k1"); k2 = cfg_key(cfg, "k2");
+    gr_setup("member.example.", ZONE_TXT);
+    g_gr.cfg = *cfg;
+    g_gr.view.name = "__default__";
+    strncpy(g_gr.cat_entry.domain, "catalog.example.", sizeof(g_gr.cat_entry.domain) - 1);
+    g_gr.entries[1] = &g_gr.cat_entry;
+    g_gr.view.zone_count = 2;
+    g_gr.entry.is_catalog_member = true;
+    g_gr.entry.is_secondary = true;
+    g_gr.entry.source = ZONE_SRC_CATALOG;
+    g_gr.entry.owning_catalog_domain = (char *)"catalog.example.";
+    atomic_store(&g_gr.entry.refresh_now, false);
+    build_notify(&q, "member.example.", k2);
+    ask(&q, "member.example.", 6, MASTER, false, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && atomic_load(&g_gr.entry.refresh_now));
+    atomic_store(&g_gr.entry.refresh_now, false);
+    build_notify(&q, "member.example.", k1);
+    ask(&q, "member.example.", 6, MASTER, false, &r);
+    CHECK(&r, r.rcode == 5 && !atomic_load(&g_gr.entry.refresh_now));
+    free_server_config_fields(cfg); free(cfg);
+    zone_arena_destroy(&g_gr.arena);
+
+    /* --- the catalog zone is not in the view (any more): the copy of the primary in the member --- */
+    cfg = notify_cfg("options { allow-notify { 198.51.100.7; }; };");
+    k1 = cfg_key(cfg, "k1");
+    gr_setup("member.example.", ZONE_TXT);
+    g_gr.cfg = *cfg;
+    g_gr.view.name = "__default__";
+    g_gr.entry.is_catalog_member = true;
+    g_gr.entry.is_secondary = true;
+    g_gr.entry.source = ZONE_SRC_CATALOG;
+    g_gr.entry.owning_catalog_domain = (char *)"catalog.example.";
+    g_gr.entry.catalog_master = calloc(1, sizeof(*g_gr.entry.catalog_master));
+    assert(g_gr.entry.catalog_master);
+    strncpy(g_gr.entry.catalog_master->ip, MASTER, sizeof(g_gr.entry.catalog_master->ip) - 1);
+    atomic_store(&g_gr.entry.refresh_now, false);
+    build_notify(&q, "member.example.", NULL);
+    ask(&q, "member.example.", 6, MASTER, false, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && atomic_load(&g_gr.entry.refresh_now));
+    atomic_store(&g_gr.entry.refresh_now, false);
+    ask(&q, "member.example.", 6, STRANGER, false, &r);
+    CHECK(&r, r.rcode == 5 && !atomic_load(&g_gr.entry.refresh_now));
+    /* allow-notify lets another address in, as for any secondary */
+    ask(&q, "member.example.", 6, "198.51.100.7", false, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && atomic_load(&g_gr.entry.refresh_now));
+    /* the copy carries the catalog zone's tsig-key (zone_key): signed with it, or refused; the element's key (key) is above it */
+    strncpy(g_gr.entry.catalog_master->zone_key, "k1", sizeof(g_gr.entry.catalog_master->zone_key) - 1);
+    atomic_store(&g_gr.entry.refresh_now, false);
+    build_notify(&q, "member.example.", NULL);
+    ask(&q, "member.example.", 6, MASTER, false, &r);
+    CHECK(&r, r.rcode == 5 && !atomic_load(&g_gr.entry.refresh_now));
+    build_notify(&q, "member.example.", k1);
+    ask(&q, "member.example.", 6, MASTER, false, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && atomic_load(&g_gr.entry.refresh_now));
+    strncpy(g_gr.entry.catalog_master->key, "k2", sizeof(g_gr.entry.catalog_master->key) - 1);
+    atomic_store(&g_gr.entry.refresh_now, false);
+    build_notify(&q, "member.example.", k1);
+    ask(&q, "member.example.", 6, MASTER, false, &r);
+    CHECK(&r, r.rcode == 5 && !atomic_load(&g_gr.entry.refresh_now));
+    /* a member whose owner is unknown and that has no copy of a primary: only allow-notify */
+    free(g_gr.entry.catalog_master);
+    g_gr.entry.catalog_master = NULL;
+    g_gr.entry.owning_catalog_domain = NULL;
+    build_notify(&q, "member.example.", NULL);
+    ask(&q, "member.example.", 6, MASTER, false, &r);
+    CHECK(&r, r.rcode == 5 && !atomic_load(&g_gr.entry.refresh_now));
+    free_server_config_fields(cfg); free(cfg);
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> NOTIFY for catalog members passed.\n");
 }
 
 /* RFC 8945 5.2, 5.3: every response to a signed request carries a TSIG, also for a plain QUERY */
@@ -1094,6 +1235,7 @@ int main(void) {
     test_protocol_anomalies();
     test_expired_secondary_zone();
     test_notify_authorization();
+    test_notify_catalog_member();
     test_signed_query();
     test_rfc8482_minimal_any_synthesis();
     test_sibling_zone_additional_glue_and_limits();

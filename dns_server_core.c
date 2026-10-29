@@ -162,16 +162,44 @@ _Atomic bool g_qlog_circuit_broken = ATOMIC_VAR_INIT(false);
 _Atomic(worker_ctx_t *) g_worker_ctxs = ATOMIC_VAR_INIT(NULL);
 _Atomic int g_worker_count = ATOMIC_VAR_INIT(0);
 
+/* The limit of the query log lines per second through one channel: its own `max-qps` when it was written and is above 0, else options
+ * query-log-max-qps (0 there: 5000, as write_query_log() has always read it).  own_set / own = max_qps_specified / max_qps of a channel
+ * (false / 0 for a built-in channel or none). */
+static uint32_t qlog_channel_limit(uint32_t opt_qps, bool own_set, uint32_t own) {
+    if (own_set && own > 0) return own;
+    return opt_qps > 0 ? opt_qps : 5000;
+}
+
+/* The rate at which the workers put query log lines into the rings.  The rings feed every channel of `category queries`, and each channel has
+ * its own limit (`max-qps` of the channel, else query-log-max-qps), so the rings must admit what the most generous channel allows -- the first
+ * channel alone (this used to be the rule) would throttle the others below their own limit, or let a channel with a lower limit decide for all;
+ * query_logger_thread_func() then holds each channel to its own limit (qlog_rate_admit()).  Without a configuration: 0. */
 uint32_t get_effective_query_log_max_qps(const server_config_t *cfg) {
     if (!cfg) return 0;
-    // チャンネル側に 0 より大きい値が明示されている場合のみそれを採用
-    if (cfg->logging.queries_channel && 
-        cfg->logging.queries_channel->max_qps_specified && 
-        cfg->logging.queries_channel->max_qps > 0) {
-        return cfg->logging.queries_channel->max_qps;
+    const log_cat_cfg_t *cat = &cfg->logging.cat[LOGC_QUERIES];
+    /* a built-in channel (or the default channel of `querylog yes` alone) has no max-qps of its own: the options value */
+    uint32_t best = qlog_channel_limit(cfg->query_log_max_qps, false, 0);
+    if (cat->n > 0) best = 0;
+    for (int k = 0; k < cat->n; k++) {
+        const log_channel_t *ch = NULL;
+        for (const log_channel_t *c = cfg->logging.channels; c; c = c->next)
+            if (c->name && strcmp(c->name, cat->name[k]) == 0) { ch = c; break; }   /* the newest definition, as the parser binds the name */
+        uint32_t lim = qlog_channel_limit(cfg->query_log_max_qps, ch && ch->max_qps_specified, ch ? ch->max_qps : 0);
+        if (lim > best) best = lim;
     }
-    // それ以外は options の query_log_max_qps を採用
-    return cfg->query_log_max_qps;
+    return best;
+}
+
+/* One line for a channel whose limit is `limit` per second: true = write it.  *sec / *count are the channel's second and the lines it has
+ * written in it (the logger thread, which is the only caller, keeps one pair for each channel of the route). */
+STATIC_TEST bool qlog_rate_admit(time_t now, time_t *sec, uint32_t *count, uint32_t limit) {
+    if (*sec != now) {
+        *sec = now;
+        *count = 0;
+    }
+    if (*count >= limit) return false;
+    (*count)++;
+    return true;
 }
 
 void inc_tcp_clients(void) {
@@ -1175,6 +1203,8 @@ void write_query_log(worker_ctx_t *ctx,
 void *query_logger_thread_func(void *arg) {
     (void)arg;
     static klog_batch_t batches[LOG_ROUTE_MAX];   /* one per channel of the category: the lines of a drain of the rings, written at once */
+    time_t chan_sec[LOG_ROUTE_MAX] = { 0 };       /* per channel: the second being counted and the lines written in it (qlog_rate_admit()) */
+    uint32_t chan_count[LOG_ROUTE_MAX] = { 0 };
     time_t last_drop_report_time = time(NULL);
     uint64_t last_reported_dropped = 0;
 
@@ -1182,6 +1212,7 @@ void *query_logger_thread_func(void *arg) {
         rcu_slot_reader_enter(&g_query_logger_rcu_ctx);
         server_config_t *cfg = acquire_config_snapshot();
         bool enabled = cfg && cfg->logging.queries_enabled;
+        const uint32_t opt_qps = cfg ? cfg->query_log_max_qps : 0;
         release_config_snapshot(cfg);
         rcu_slot_reader_exit(&g_query_logger_rcu_ctx);
 
@@ -1190,6 +1221,10 @@ void *query_logger_thread_func(void *arg) {
         log_runtime_t *rt = enabled ? log_runtime_acquire() : NULL;
         int nch = 0;
         log_channel_t *const *route = rt ? log_runtime_route(rt, LOGC_QUERIES, &nch) : NULL;
+        /* each channel is held to its own limit (the rings admit what the most generous channel allows: get_effective_query_log_max_qps()) */
+        uint32_t chan_limit[LOG_ROUTE_MAX];
+        for (int i = 0; i < nch; i++) chan_limit[i] = qlog_channel_limit(opt_qps, route[i]->max_qps_specified, route[i]->max_qps);
+        const time_t drain_sec = time(NULL);
 
         int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
         worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
@@ -1236,7 +1271,8 @@ void *query_logger_thread_func(void *arg) {
                     snprintf(msg, sizeof(msg), "client %s#%d (%s): query: %s %s %s %s", client_ip, client_port,
                              safe_qname, safe_qname, class_str, type_str, edns_str);
                     for (int i = 0; i < nch; i++)
-                        if (klog_level_passes(route[i]->level, LOG_LVL_INFO))
+                        if (klog_level_passes(route[i]->level, LOG_LVL_INFO) &&
+                            qlog_rate_admit(drain_sec, &chan_sec[i], &chan_count[i], chan_limit[i]))
                             klog_batch_add(&batches[i], route[i], LOGC_QUERIES, LOG_LVL_INFO, &ev->ts, msg);
 
                     t++;

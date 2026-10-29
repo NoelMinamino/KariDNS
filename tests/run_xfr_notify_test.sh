@@ -97,7 +97,8 @@ zone "s.test" { type master; file "$W/s.test.zone"; tsig-key "nk"; allow-transfe
 zone "k.test" { type master; file "$W/k.test.zone"; allow-transfer { 127.0.0.1; }; allow-update { 127.0.0.1; };
                 also-notify { 127.0.0.1 port $PK; }; notify-retry-interval 1; };
 zone "cat.test" { type master; file "$W/cat.test.zone"; allow-transfer { 127.0.0.1; }; };
-zone "m1.test" { type master; file "$W/m1.test.zone"; allow-transfer { 127.0.0.1; }; };
+zone "m1.test" { type master; file "$W/m1.test.zone"; allow-transfer { 127.0.0.1; }; also-notify { 127.0.0.1 port $PK; };
+                 notify-retry-interval 1; };
 zone "d.test" { type master; file "$W/d.test.zone"; allow-transfer { 127.0.0.1; }; also-notify { 127.0.0.1 port $PK; };
                 notify-retry-interval 1; };
 EOF
@@ -246,6 +247,20 @@ if wait_grep "Added new member 'm1.test.'" "$W/k.log" 5 &&
         pass "R-28: group change updates the member in place (not re-added, still answering)"
     else fail "R-28: group change re-added the member or broke it"; grep -E "Catalog|m1.test" "$W/k.log" | tail -6; fi
 else fail "R-28: the catalog member was not created on the secondary"; fi
+
+# ---------------------------------------------------------------- NOTIFY for a catalog member (RFC 1996; BIND dns_zone_notifyreceive())
+# The member m1.test has no zone { } on the secondary; its primary is the one of the catalog zone.  The member's refresh time is 3600 s, so the
+# new record can only arrive through the NOTIFY the primary sends for m1.test: a member that REFUSED it would not have it within the wait.
+if "$DAG" @127.0.0.1 -p $PK www.m1.test A +short +nohexdump | grep -qx 192.0.2.10; then
+    zone "$W/m1.test.zone" m1.test 2 'late IN A 192.0.2.77
+'
+    $CP reload m1.test >/dev/null
+    i=0; while [ $i -lt 12 ]; do
+        "$DAG" @127.0.0.1 -p $PK late.m1.test A +short +nohexdump | grep -qx 192.0.2.77 && break; sleep 1; i=$((i + 1)); done
+    if "$DAG" @127.0.0.1 -p $PK late.m1.test A +short +nohexdump | grep -qx 192.0.2.77; then
+        pass "NOTIFY: the catalog member m1.test was refreshed at the NOTIFY of its primary (the primary of the catalog zone)"
+    else fail "NOTIFY: the catalog member m1.test did not follow the primary's NOTIFY (refused?)"; grep -E "m1.test|Notify|NOTIFY" "$W/k.log" | tail -6; fi
+else fail "NOTIFY: the catalog member m1.test is not served by the secondary"; fi
 
 # ---------------------------------------------------------------- X-24: KariDNS primary -> secondary IXFR
 transfers() { $CK observatory k.test 2>/dev/null | sed -n 's/.*Transfers (In): *\(AXFR=[0-9]* IXFR=[0-9]*\).*/\1/p'; }
