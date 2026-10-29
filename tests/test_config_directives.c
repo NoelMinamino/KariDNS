@@ -93,6 +93,8 @@ static void expect_reject(const char *label, const char *txt) {
     }
 }
 
+static void expect_an_error(const char *label, const char *txt, const char *want); /* defined below, with parse_capture() */
+
 static const zone_config_t *first_zone(const server_config_t *cfg) {
     return (cfg->views && cfg->views->zones) ? cfg->views->zones : NULL;
 }
@@ -1351,19 +1353,20 @@ static void test_config_negative_patterns(void) {
     printf("  -> config parser error & warning branches verified.\n");
 }
 
-/* notify-retries / notify-retry-interval / notify-retry-backoff (RFC 1996 §3.6: operator parameters,
- * defaults 60 s and 5 retransmissions). docs/karidns.md: options and zone, zone overrides options. */
+/* notify-retries / notify-retry-interval / notify-retry-backoff / notify-tcp-timeout (RFC 1996 §3.6: operator parameters; the defaults are
+ * BIND 9.20's: 2 retransmissions 5 s apart, a TCP attempt of 15 s). docs/karidns.md: options and zone, zone overrides options. */
 static void test_notify_retry(void) {
-    printf("[TEST] notify-retries / notify-retry-interval / notify-retry-backoff...\n");
+    printf("[TEST] notify-retries / notify-retry-interval / notify-retry-backoff / notify-tcp-timeout...\n");
     server_config_t cfg;
     if (parse_ok("options { };", &cfg)) {
         notify_retry_config_t r = notify_retry_effective(&cfg, NULL);
-        CHECK(r.retries == 5 && r.interval == 60 && r.backoff == NOTIFY_BACKOFF_FIXED);
+        CHECK(r.retries == 2 && r.interval == 5 && r.backoff == NOTIFY_BACKOFF_FIXED && r.tcp_timeout == 15);
         free_server_config_fields(&cfg);
     }
     /* no configuration at all: the built-in defaults */
     notify_retry_config_t d = notify_retry_effective(NULL, NULL);
-    CHECK(d.retries == 5 && d.interval == 60 && d.backoff == NOTIFY_BACKOFF_FIXED);
+    CHECK(d.retries == 2 && d.interval == 5 && d.backoff == NOTIFY_BACKOFF_FIXED && d.tcp_timeout == 15);
+    CHECK(NOTIFY_RETRIES_DEFAULT == 2 && NOTIFY_RETRY_INTERVAL_DEFAULT == 5 && NOTIFY_TCP_TIMEOUT_DEFAULT == 15);
 
     if (parse_ok("options { notify-retries 3; notify-retry-interval 3; notify-retry-backoff exponential; };"
                  "zone \"a.example\" { type master; file \"a.zone\"; notify-retry-interval 10; };"
@@ -1403,6 +1406,35 @@ static void test_notify_retry(void) {
                   "zone \"a.example\" { type master; file \"a.zone\"; notify-retries 99; };");
     expect_reject("zone notify-retry-backoff unknown",
                   "zone \"a.example\" { type master; file \"a.zone\"; notify-retry-backoff 2; };");
+
+    /* notify-tcp-timeout (KariDNS own; BIND 9.20 has a fixed 15 s): 1..300, options and zone, the zone overrides options */
+    if (parse_ok("options { notify-tcp-timeout 40; };"
+                 "zone \"a.example\" { type master; file \"a.zone\"; notify-tcp-timeout 7; };"
+                 "zone \"b.example\" { type master; file \"b.zone\"; notify-retries 1; };", &cfg)) {
+        const zone_config_t *a = first_zone(&cfg);
+        const zone_config_t *b = a ? a->next : NULL;
+        CHECK(cfg.notify_retry.tcp_timeout == 40);
+        CHECK(a && zext(a)->notify_retry.tcp_timeout_set && notify_retry_effective(&cfg, a).tcp_timeout == 7);
+        CHECK(b && !zext(b)->notify_retry.tcp_timeout_set && notify_retry_effective(&cfg, b).tcp_timeout == 40);
+        CHECK(b && notify_retry_effective(&cfg, b).retries == 1 && notify_retry_effective(&cfg, b).interval == 5);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { notify-tcp-timeout 1; };", &cfg)) {
+        CHECK(cfg.notify_retry.tcp_timeout == 1);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { notify-tcp-timeout 300; };", &cfg)) {
+        CHECK(cfg.notify_retry.tcp_timeout == 300);
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("notify-tcp-timeout 0", "options { notify-tcp-timeout 0; };", "line 1: Invalid notify-tcp-timeout value '0'|expected 1..300");
+    expect_an_error("notify-tcp-timeout above 300", "options { notify-tcp-timeout 301; };", "line 1: Invalid notify-tcp-timeout value '301'|expected 1..300");
+    expect_an_error("notify-tcp-timeout negative", "options { notify-tcp-timeout -5; };", "Invalid notify-tcp-timeout value '-5'");
+    expect_an_error("zone notify-tcp-timeout above 300", "zone \"a.example\" { type master; file \"a.zone\"; notify-tcp-timeout 9999; };",
+                    "line 1: zone 'a.example.': invalid notify-tcp-timeout value '9999'|expected 1..300");
+    expect_reject("notify-tcp-timeout junk", "options { notify-tcp-timeout 15s; };");
+    expect_reject("notify-tcp-timeout missing semicolon", "options { notify-tcp-timeout 15 };");
+    expect_reject("zone notify-tcp-timeout missing semicolon", "zone \"a.example\" { type master; file \"a.zone\"; notify-tcp-timeout 15 };");
 }
 
 /* ixfr-history <n>: how many past versions are kept as IXFR diffs (RFC 1995 §4), 0..32, default 4; options and
@@ -1893,7 +1925,7 @@ static void test_db_settings_and_acl_match(void) {
         zone_ext_shared_t *sh = db_parse_quiet(
             "allow-transfer { 192.0.2.1; 2001:db8::/32; !198.51.100.0/24; key \"xfr\"; }; also-notify { 192.0.2.53 port 5300; 2001:db8::53; }; "
             "allow-update { 192.0.2.9; key \"upd\"; }; tsig-key \"m\"; notify-retries 3; notify-retry-interval 30; "
-            "notify-retry-backoff exponential; ixfr-history 8; additional-from-auth in-domain; disable-auto-tc-flag yes; "
+            "notify-retry-backoff exponential; notify-tcp-timeout 25; ixfr-history 8; additional-from-auth in-domain; disable-auto-tc-flag yes; "
             "zone-udp-bufsize 1232; zone-tcp-mss 1400; zone-tcp-window 64k; zone-tcp-sndbuf 65536; transfer-acl-match any; "
             "update-acl-match all; # trailing comment", err, sizeof(err));
         CHECK(sh != NULL);
@@ -1903,7 +1935,8 @@ static void test_db_settings_and_acl_match(void) {
             CHECK(x->allow_transfer_parsed != NULL && x->allow_update_parsed != NULL && x->allow_update_count == 2);
             CHECK(x->also_notify_count == 2 && x->also_notify[0].port == 5300 && x->also_notify[1].port == 53);
             CHECK(x->tsig_key && strcmp(x->tsig_key, "m") == 0 && x->ixfr_history_set && x->ixfr_history == 8);
-            CHECK(x->notify_retry.retries == 3 && x->notify_retry.interval == 30 && x->notify_retry.backoff == NOTIFY_BACKOFF_EXPONENTIAL);
+            CHECK(x->notify_retry.retries == 3 && x->notify_retry.interval == 30 && x->notify_retry.backoff == NOTIFY_BACKOFF_EXPONENTIAL &&
+                  x->notify_retry.tcp_timeout_set && x->notify_retry.tcp_timeout == 25);
             CHECK(x->disable_auto_tc_flag && x->additional_from_auth_specified && x->additional_from_auth == ADDITIONAL_AUTH_IN_DOMAIN);
             CHECK(x->zone_udp_bufsize == 1232 && x->zone_tcp_mss == 1400 && x->zone_tcp_window == 65536 && x->zone_tcp_sndbuf == 65536);
             CHECK(x->transfer_acl_match == ACL_MATCH_ANY && x->update_acl_match == ACL_MATCH_ALL && x->db_acl_ceiling);
@@ -1958,6 +1991,8 @@ static void test_db_settings_and_acl_match(void) {
     expect_db_reject("ixfr-history 99;", NULL);
     expect_db_reject("zone-udp-bufsize 100;", NULL);
     expect_db_reject("notify-retry-backoff sometimes;", NULL);
+    expect_db_reject("notify-tcp-timeout 0;", NULL);
+    expect_db_reject("notify-tcp-timeout 301;", NULL);
     expect_db_reject("transfer-acl-match maybe;", NULL);
     expect_db_reject("allow-transfer { 192.0.2.1; }", NULL);                /* no semicolon */
     expect_db_reject("allow-transfer { 192.0.2.1; ", NULL);                 /* unbalanced */
@@ -2336,6 +2371,7 @@ static void test_statements_need_a_semicolon(void) {
         "options { tcp-connection-reuse yes };",
         "options { notify-retries 3 };",
         "options { notify-retry-interval 10 };",
+        "options { notify-tcp-timeout 10 };",
         "options { notify-source 192.0.2.1 };",
         "options { query-log-buffer-size 1000 };",
         "options { query-log-max-qps 5 };",
@@ -2388,6 +2424,7 @@ static void test_statements_need_a_semicolon(void) {
         "zone \"z.test\" { type master; file \"z\"; ixfr-history 5 };",
         "zone \"z.test\" { type master; file \"z\"; notify-retries 3 };",
         "zone \"z.test\" { type master; file \"z\"; notify-retry-interval 10 };",
+        "zone \"z.test\" { type master; file \"z\"; notify-tcp-timeout 10 };",
         "zone \"z.test\" { type master; file \"z\"; masters { 192.0.2.1 } };",
         "zone \"z.test\" { type master; file \"z\"; allow-update { 192.0.2.1 } };",
         "zone \"z.test\" { type master; file \"z\"; allow-transfer { 192.0.2.1 } };",
@@ -2793,7 +2830,7 @@ static void test_strict_options_and_key(void) {
         {"allow-transfer", "allow-transfer { none; };"}, {"allow-update", "allow-update { none; };"},
         {"allow-notify", "allow-notify { 192.0.2.1; };"},
         {"listen-on", "listen-on port 5353 { 127.0.0.1; };"}, {"listen-on-v6", "listen-on-v6 { none; };"},
-        {"blackhole", "blackhole { 192.0.2.0/24; };"}, {"notify-retry-interval", "notify-retry-interval 5;"}, {"notify-retry-backoff", "notify-retry-backoff fixed;"},
+        {"blackhole", "blackhole { 192.0.2.0/24; };"}, {"notify-retry-interval", "notify-retry-interval 5;"}, {"notify-retry-backoff", "notify-retry-backoff fixed;"}, {"notify-tcp-timeout", "notify-tcp-timeout 30;"},
     };
     for (size_t i = 0; i < sizeof(impl) / sizeof(impl[0]); i++) {
         snprintf(txt, sizeof(txt), "options { %s };", impl[i].sample);

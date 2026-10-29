@@ -102,19 +102,31 @@ typedef enum {
 } additional_from_auth_t;
 
 /* 送信する NOTIFY の再送 (RFC 1996 §3.6: 間隔と回数は運用者が決める値)。
- * options の値は常に有効。zone の値は *_set のものだけが options を上書きする。 */
-#define NOTIFY_RETRIES_DEFAULT 5
+ * options の値は常に有効。zone の値は *_set のものだけが options を上書きする。
+ * 既定値は何も設定しないときの BIND 9.20 と同じ:
+ *  - lib/dns/zone.c notify_send_toaddr() が dns_request_create() に udptimeout 5 秒、udpretries 2 を渡す。lib/dns/request.c は
+ *    new_request() で udpcount = udpretries + 1 = 3 通とし、req_response() が ISC_R_TIMEDOUT のたびに (udptimeout ごとに) 同じ要求を
+ *    送り直すので、データグラムは 0、5、10 秒の 3 通で、最後の 5 秒の待ちが切れた 15 秒後に notify_done() が TCP でもう一度送る。
+ *    これが notify-retries 2 (再送 2 回)、notify-retry-interval 5、fixed。
+ *  - TCP の要求は同じ関数で timeout = 15 (秒)、接続と応答を合わせた時間。notify-tcp-timeout は KariDNS 独自のオプション (BIND 9.20 の
+ *    namedconf.c に同名は無い)。範囲は 1..300: 1 秒未満は無意味で、上限は応答の無い相手が NOTIFY_TCP_MAX 本のスレッドを占める時間の
+ *    目安 (BIND は 15 固定。遅い回線のために 15 の 20 倍まで許す)。 */
+#define NOTIFY_RETRIES_DEFAULT 2
 #define NOTIFY_RETRIES_MAX 10
-#define NOTIFY_RETRY_INTERVAL_DEFAULT 60
+#define NOTIFY_RETRY_INTERVAL_DEFAULT 5
 #define NOTIFY_RETRY_INTERVAL_MAX 3600
+#define NOTIFY_TCP_TIMEOUT_DEFAULT 15
+#define NOTIFY_TCP_TIMEOUT_MAX 300
 typedef enum { NOTIFY_BACKOFF_FIXED = 0, NOTIFY_BACKOFF_EXPONENTIAL = 1 } notify_backoff_t;
 typedef struct {
   int retries;        /* notify-retries: 最初の送信の後に再送する回数 */
   int interval;       /* notify-retry-interval: 最初の再送までの秒数 */
   notify_backoff_t backoff; /* notify-retry-backoff: fixed は同じ間隔、exponential は再送ごとに倍 */
+  int tcp_timeout;    /* notify-tcp-timeout: TCP での 1 回の試みの秒数 (接続と応答を合わせて) */
   bool retries_set;
   bool interval_set;
   bool backoff_set;
+  bool tcp_timeout_set;
 } notify_retry_config_t;
 
 /* ixfr-history <n>: how many past versions of a zone are kept as IXFR diffs (RFC 1995 §4). options and zone; a zone overrides options. */
@@ -382,7 +394,7 @@ void zone_ext_shared_unref(zone_ext_shared_t *s);
 
 /* Restricted parse of the settings text of a DB zone (beta design 1.3, 3.5).  The text is hostile: only the statements the
  * loader can write are accepted (allow-transfer, allow-update, also-notify, tsig-key, notify-retries, notify-retry-interval,
- * notify-retry-backoff, ixfr-history, additional-from-auth, disable-auto-tc-flag, zone-udp-bufsize, zone-tcp-mss,
+ * notify-retry-backoff, notify-tcp-timeout, ixfr-history, additional-from-auth, disable-auto-tc-flag, zone-udp-bufsize, zone-tcp-mss,
  * zone-tcp-window, zone-tcp-sndbuf, transfer-acl-match, update-acl-match, and (B7b) masters / primaries: IP addresses with an optional
  * port, at most 32, for a database secondary zone); everything else (file, type, program*,
  * include, unknown) is an error.  A statement that is written twice replaces the first (so the text of a profile followed by
