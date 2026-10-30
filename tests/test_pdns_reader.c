@@ -791,6 +791,17 @@ static void test_zone_level(void) {
         CHECK(!pdns_soa_timers("a b 1 2 x 4", &r, &t, &e) && !pdns_soa_timers("a b 1 -2 3 4", &r, &t, &e));
         CHECK(!pdns_soa_timers("a b 1 4294967296 3 4", &r, &t, &e));                                   /* above 32 bits */
     }
+    {   /* D1a step 6: the names and the minimum of an SOA content (RFC 1035 3.3.13), canonical absolute */
+        char mn[DNS_NAME_TEXT_SIZE], rn[DNS_NAME_TEXT_SIZE], nm[DNS_NAME_TEXT_SIZE];
+        uint32_t mi = 0;
+        CHECK(pdns_soa_apex("ns1.z.test hostmaster.z.test 2024 3600 600 86400 300", mn, rn, &mi) && strcmp(mn, "ns1.z.test.") == 0 && strcmp(rn, "hostmaster.z.test.") == 0 && mi == 300);
+        CHECK(pdns_soa_apex("  NS1.Z.TEST.\thost\\.master.z.test.  1 2 3 4  4294967295 ", mn, rn, &mi) && strcmp(mn, "NS1.Z.TEST.") == 0 && strcmp(rn, "host\\.master.z.test.") == 0 && mi == 4294967295u);   /* (the case is the zone data's, RFC 4343) */
+        CHECK(pdns_soa_apex("a b 1 2 3 4 5", mn, rn, NULL));
+        CHECK(!pdns_soa_apex(NULL, mn, rn, &mi) && !pdns_soa_apex("", mn, rn, &mi) && !pdns_soa_apex("a b 1 2 3 4", mn, rn, &mi));       /* the minimum is missing */
+        CHECK(!pdns_soa_apex("a b 1 2 3 4 x", mn, rn, &mi) && !pdns_soa_apex("a b 1 2 3 4 4294967296", mn, rn, &mi) && !pdns_soa_apex("a..b c 1 2 3 4 5", mn, rn, &mi));
+        CHECK(pdns_apex_name("ns1.z.test", nm) && strcmp(nm, "ns1.z.test.") == 0 && pdns_apex_name("NS2.Z.test.", nm) && strcmp(nm, "NS2.Z.test.") == 0);
+        CHECK(!pdns_apex_name(NULL, nm) && !pdns_apex_name("", nm) && !pdns_apex_name(".", nm) && !pdns_apex_name("a..b", nm));
+    }
     {   /* the zone's only SOA has a serial the DB column could not hold in a 32-bit field */
         z = pdns_zone_new("z.test", NULL);
         db_record_row_t bad = R(50, "z.test", "SOA", "ns1.z.test hostmaster.z.test 4294967296 1 2 3 4", 3600, 0);
@@ -2082,6 +2093,45 @@ static void test_summary(void) {
     }
 }
 
+/* D1a step 6: the apex in the summary's ZONE_BEGIN (tags 15..20): names, minimum, TTLs rounded to 2^31 - 1, the NS names as sent; only with the timers */
+static void test_summary_apex(void) {
+    printf("summary of a primary zone (D1a step 6): the apex, tags 15 to 20\n");
+    pdns_zone_t *z = pdns_zone_new("s.test", NULL);
+    pdns_zone_set_summary(z, 4711, true, 7200, 3600, 1209600);
+    CHECK(pdns_zone_set_apex(z, "ns1.hosting.example.", "host.hosting.example.", 4000000000u, 900, 4294967295u, "ns1.hosting.example.\nns2.hosting.example.") == 0);
+    CHECK(pdns_zone_set_apex(z, "ns1.hosting.example.", "host.hosting.example.", 4000000000u, 900, 4294967295u, "ns1.hosting.example.\nns2.hosting.example.") == 0);   /* (again: the first copy is freed) */
+    CHECK(pdns_zone_finish(z) == 0);
+    pdns_kdb_params_t p = { 2, 99, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 };
+    rt_buf_t b = {0};
+    char err[200], why[200];
+    CHECK(pdns_zone_encode_kdb(z, &p, rt_emit, &b, err, sizeof(err)) == 0);
+    static uint8_t fb[KDB_MAX_BODY];
+    kdb_framer_t f;
+    kdb_frame_t fr;
+    kdb_msg_t msg;
+    kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
+    CHECK(kdb_framer_feed(&f, b.buf, b.len) == KDB_OK && kdb_framer_next(&f, &fr) == KDB_OK);
+    CHECK(kdb_decode(&fr, KDB_VIEWS_ANY, &msg, why, sizeof(why)) == KDB_OK);
+    const kdb_zone_begin_t *zb = &msg.u.zone_begin;
+    CHECK(zb->has_apex && strcmp(zb->soa_mname, "ns1.hosting.example.") == 0 && strcmp(zb->soa_rname, "host.hosting.example.") == 0);
+    CHECK(zb->soa_minimum == 2147483647u && zb->soa_ttl == 900 && zb->ns_ttl == 2147483647u && zb->ns_count == 2);
+    CHECK(zb->ns_names_len == strlen("ns1.hosting.example.\nns2.hosting.example.") && memcmp(zb->ns_names, "ns1.hosting.example.\nns2.hosting.example.", zb->ns_names_len) == 0);
+    free(b.buf);
+    pdns_zone_free(z);
+    {   /* without the timers there is no apex on the wire (the Backend takes tags 15..20 with the timers only) */
+        pdns_zone_t *z2 = pdns_zone_new("t.test", NULL);
+        pdns_zone_set_summary(z2, 5, false, 0, 0, 0);
+        CHECK(pdns_zone_set_apex(z2, "a.example.", "b.example.", 1, 2, 3, "c.example.") == 0 && pdns_zone_finish(z2) == 0);
+        rt_buf_t b2 = {0};
+        CHECK(pdns_zone_encode_kdb(z2, &p, rt_emit, &b2, err, sizeof(err)) == 0);
+        kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
+        CHECK(kdb_framer_feed(&f, b2.buf, b2.len) == KDB_OK && kdb_framer_next(&f, &fr) == KDB_OK);
+        CHECK(kdb_decode(&fr, KDB_VIEWS_ANY, &msg, why, sizeof(why)) == KDB_OK && !msg.u.zone_begin.has_apex);
+        free(b2.buf);
+        pdns_zone_free(z2);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--gen-corpus") == 0) return gen_corpus(argv[2]);
     if (argc == 2) g_zones_dir = argv[1];
@@ -2101,6 +2151,7 @@ int main(int argc, char **argv) {
     test_kdb();
     test_secondary();
     test_summary();
+    test_summary_apex();
     test_kdb_name_case();
     test_zone2sql();
     test_zone_files();

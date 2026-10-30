@@ -2127,6 +2127,68 @@ static void test_profiles_and_views(void) {
     unlink(path);
 }
 
+/* D1a step 6: scan_apex - the enabled SOA and NS rows whose name is the domain's, ORDER BY domain_id, id; one zone or all */
+typedef struct { int64_t dom[16]; bool soa[16]; char content[16][40]; bool ttl_null[16]; int64_t ttl[16]; size_t n, stop_at; } ap_t;
+static int ap_collect(void *ud, const db_apex_row_t *r) {
+    ap_t *a = ud;
+    if (a->n < 16) {
+        a->dom[a->n] = r->domain_id;
+        a->soa[a->n] = r->is_soa;
+        snprintf(a->content[a->n], sizeof(a->content[0]), "%s", r->content ? r->content : "(null)");
+        a->ttl_null[a->n] = r->ttl_null;
+        a->ttl[a->n] = r->ttl;
+        a->n++;
+    }
+    return a->stop_at && a->n >= a->stop_at;
+}
+static void test_scan_apex(void) {
+    printf("scan_apex: the apex SOA and NS rows\n");
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("apex.db", path, sizeof(path));
+    CHECK(db != NULL);
+    if (!db) return;
+    add_zone(db, 1, "p1.test", "NATIVE");
+    add_zone(db, 2, "p2.test", "NATIVE");
+    add_zone(db, 3, "p3.test", "NATIVE");
+    add_rec(db, 20, 1, "p1.test", "NS", "ns2.example", 600, -1, 0, NULL);       /* (written first, a higher id than the SOA: the order is by id) */
+    add_rec(db, 10, 1, "p1.test", "SOA", "soa-p1", 900, -1, 0, NULL);
+    add_rec(db, 11, 1, "P1.TEST", "NS", "ns1.example", -1, -1, 0, NULL);        /* the owner in capitals is the apex (NOCASE); no TTL */
+    add_rec(db, 12, 1, "p1.test", "NS", "ns-off.example", 600, -1, 1, NULL);     /* disabled */
+    add_rec(db, 13, 1, "sub.p1.test", "NS", "ns-sub.example", 600, -1, 0, NULL); /* a delegation, not the apex */
+    add_rec(db, 14, 1, "p1.test", "A", "192.0.2.1", 600, -1, 0, NULL);           /* not SOA or NS */
+    add_rec(db, 30, 2, "p2.test", "SOA", "soa-p2", 300, -1, 0, NULL);
+    add_rec(db, 31, 2, "p3.test", "NS", "ns-other-zone.example", 600, -1, 0, NULL);      /* (zone 2's row with zone 3's name) */
+    add_rec(db, 40, 3, "p3.test", "NS", "ns3.example", 60, -1, 0, NULL);
+    sqlite3_close(db);
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (!c) return;
+    ap_t a;
+    memset(&a, 0, sizeof(a));
+    CHECK(db_driver_sqlite3.scan_apex != NULL && db_driver_sqlite3.scan_apex(c, NULL, ap_collect, &a) == 0 && a.n == 5);      // (zone 2's row that carries zone 3's name is nobody's apex)
+    if (a.n == 5) {
+        CHECK(a.dom[0] == 1 && a.soa[0] && strcmp(a.content[0], "soa-p1") == 0 && !a.ttl_null[0] && a.ttl[0] == 900);
+        CHECK(a.dom[1] == 1 && !a.soa[1] && strcmp(a.content[1], "ns1.example") == 0 && a.ttl_null[1]);
+        CHECK(a.dom[2] == 1 && !a.soa[2] && strcmp(a.content[2], "ns2.example") == 0 && a.ttl[2] == 600);
+        CHECK(a.dom[3] == 2 && a.soa[3] && strcmp(a.content[3], "soa-p2") == 0 && a.ttl[3] == 300);
+        CHECK(a.dom[4] == 3 && !a.soa[4] && strcmp(a.content[4], "ns3.example") == 0 && a.ttl[4] == 60);
+    }
+    memset(&a, 0, sizeof(a));
+    int64_t one = 1;
+    CHECK(db_driver_sqlite3.scan_apex(c, &one, ap_collect, &a) == 0 && a.n == 3 && a.dom[0] == 1 && a.dom[2] == 1);
+    memset(&a, 0, sizeof(a));
+    one = 3;
+    CHECK(db_driver_sqlite3.scan_apex(c, &one, ap_collect, &a) == 0 && a.n == 1 && a.dom[0] == 3);
+    memset(&a, 0, sizeof(a));
+    one = 99;
+    CHECK(db_driver_sqlite3.scan_apex(c, &one, ap_collect, &a) == 0 && a.n == 0);
+    memset(&a, 0, sizeof(a));
+    a.stop_at = 2;
+    CHECK(db_driver_sqlite3.scan_apex(c, NULL, ap_collect, &a) == DB_STOPPED && a.n == 2);
+    db_driver_sqlite3.close(c);
+    unlink(path);
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/db";
     snprintf(g_schema, sizeof(g_schema), "%s/pdns_schema.sqlite3.sql", dir);
@@ -2149,6 +2211,7 @@ int main(int argc, char **argv) {
     test_nul();
     test_scans();
     test_find_zone_index();
+    test_scan_apex();
     test_zone_soa_rows();
     test_snapshot();
     test_busy();

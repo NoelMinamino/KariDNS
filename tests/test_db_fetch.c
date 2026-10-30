@@ -216,6 +216,8 @@ static void send_dir_zone(int fd, kdb_enc_t *e, uint16_t view, const char *zone,
     kdb_enc_u32(e, 5, serial); kdb_enc_u32(e, 6, KDB_ZF_SUMMARY); kdb_enc_u64(e, 7, 0); kdb_enc_bytes(e, 8, dig, sizeof(dig));
     if (settings) kdb_enc_str(e, 9, settings);
     kdb_enc_u32(e, 12, 4444); kdb_enc_u32(e, 13, 555); kdb_enc_u32(e, 14, 66666);
+    kdb_enc_name(e, 15, "ns1.hosting.example."); kdb_enc_name(e, 16, "host.hosting.example."); kdb_enc_u32(e, 17, 300); kdb_enc_u32(e, 18, 900); kdb_enc_u32(e, 19, 3600);
+    kdb_enc_bytes(e, 20, (const uint8_t *)"ns1.hosting.example.\nns2.hosting.example.", 41);
     kdb_enc_end(e);
     kdb_enc_begin(e, KDB_T_ZONE_END);
     kdb_enc_u64(e, 1, 0);
@@ -569,9 +571,15 @@ int main(void) {
             zdir_elem_t *d1 = elem_of("default", "dir1.test.");
             CHECK(d1 != NULL && zdir_entry(d1) == NULL && atomic_load(&d1->state) == ZDIR_ST_ABSENT && d1->serial == 7);
             CHECK(d1 && d1->refresh == 4444 && d1->retry == 555 && d1->expire == 66666);
+            /* D1a step 6: the apex of the summary is kept with the element (wire names, the TTLs, the serial it describes); the zone that has its data keeps none */
+            const zdir_apex_t *dap = d1 ? atomic_load(&d1->apex) : NULL;
+            CHECK(dap && dap->serial == 7 && dap->soa_ttl == 900 && dap->minimum == 300 && dap->ns_ttl == 3600 && dap->refresh == 4444 && dap->retry == 555 && dap->expire == 66666);
+            CHECK(dap && dap->n_ns == 2 && dap->mname_len == 21 && dap->rname_len == 22 && dap->ns_len == 42);
+            CHECK(dap && memcmp(dap->data, "\3ns1\7hosting\7example\0\4host\7hosting\7example\0\3ns1\7hosting\7example\0\3ns2\7hosting\7example\0", 21 + 22 + 42) == 0);
             CHECK(d1 && atomic_load(&d1->sh) != NULL && atomic_load(&d1->sh)->ext.allow_transfer_count == 1);
             zdir_elem_t *pe2 = elem_of("default", "pin.test.");
             CHECK(pe2 != NULL && zdir_entry(pe2) != NULL && pe2->serial != 9);   /* (still the zone with its data) */
+            CHECK(pe2 && atomic_load(&pe2->apex) == NULL);                        /* (the summary of a zone that has its data brought none to keep) */
             /* the pinned one: a warm-up request follows by itself */
             CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "dirp.test.") == 0 &&
                   m.u.fetch_req.priority == KDB_FETCH_PRIO_WARM && m.u.fetch_req.mode == KDB_FETCH_FULL);

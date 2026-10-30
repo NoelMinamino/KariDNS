@@ -174,6 +174,9 @@ typedef struct pdns_zone_s {
     bool summary;                   /* D1a milestone 4: only the directory entry of a primary zone (serial, SOA timers, settings, flags): no rows */
     uint32_t sum_serial, sum_refresh, sum_retry, sum_expire;
     bool sum_timers;
+    char *sum_apex;                 /* D1a step 6: the apex of the summary, one block: mname NUL rname NUL the NS names separated by LF NUL (pdns_zone_set_apex()) */
+    const char *sum_mname, *sum_rname, *sum_ns;
+    uint32_t sum_minimum, sum_soa_ttl, sum_ns_ttl;
     char *nsec3param;               /* NSEC3PARAM metadata (first row), NULL if none */
     presigned_mode_t presigned_mode;   /* PS_NSEC3 / PS_NSEC: the chain was rebuilt; PS_NONE: served as stored */
     size_t n_synth;                 /* records presigned_rebuild() added at the end of arena.records */
@@ -233,6 +236,13 @@ int pdns_zone_finish(pdns_zone_t *z);
 bool pdns_soa_serial(const char *content, uint32_t *serial);
 /* The refresh, retry and expire (fields 4..6) of an SOA content, with the same rules.  false if a field is missing or not a number. */
 bool pdns_soa_timers(const char *content, uint32_t *refresh, uint32_t *retry, uint32_t *expire);
+/* D1a step 6: the two names (canonical absolute) and the minimum (field 7) of an SOA content.  false if one is missing or not valid. */
+bool pdns_soa_apex(const char *content, char mname[DNS_NAME_TEXT_SIZE], char rname[DNS_NAME_TEXT_SIZE], uint32_t *minimum);
+/* D1a step 6: the target of an NS record as the Backend gets it: a canonical absolute name.  false if it is not a name. */
+bool pdns_apex_name(const char *raw, char out[DNS_NAME_TEXT_SIZE]);
+/* D1a step 6: give a summary (pdns_zone_set_summary()) the apex of the zone: the SOA's names and minimum, the TTLs (RFC 2181 8: at most 2^31 - 1, larger values are
+ * rounded down), and the NS targets, canonical absolute names separated by LF (1..KDB_APEX_NS_MAX of them).  The names are copied.  -1: out of memory. */
+int pdns_zone_set_apex(pdns_zone_t *z, const char *mname, const char *rname, uint32_t minimum, uint32_t soa_ttl, uint32_t ns_ttl, const char *ns_lf);
 
 /* The line-safety rules above on s[0..len).  is_owner: the stricter owner rules.  Returns NULL if safe, else a
  * static reason text.  s may contain NUL (it is rejected). */

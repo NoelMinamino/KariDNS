@@ -105,6 +105,15 @@ static inline void db_list_add(char *list, size_t cap, unsigned *n, const char *
 }
 
 typedef int (*db_zone_cb)(void *ud, const db_zone_row_t *row);
+/* D1a step 6: the enabled SOA and NS records at the apex of a zone (the name of the record is the name of the domain), for the summary of a zone */
+typedef struct {
+    int64_t domain_id;
+    bool is_soa;                                /* else NS */
+    const char *content;
+    bool ttl_null;
+    int64_t ttl;
+} db_apex_row_t;
+typedef int (*db_apex_cb)(void *ud, const db_apex_row_t *row);
 typedef int (*db_record_cb)(void *ud, int64_t domain_id, const db_record_row_t *row);
 typedef int (*db_meta_cb)(void *ud, const db_meta_row_t *row);
 typedef int (*db_key_cb)(void *ud, int64_t domain_id);
@@ -210,6 +219,9 @@ typedef struct db_driver {
     int (*scan_records_in)(db_conn_t *c, const int64_t *ids, size_t n, db_record_cb cb, void *ud);
     int (*scan_metadata_in)(db_conn_t *c, const int64_t *ids, size_t n, db_meta_cb cb, void *ud);
     int (*scan_ext_in)(db_conn_t *c, const int64_t *ids, size_t n, const db_ext_sink_t *sink);
+    /* D1a step 6: the apex SOA and NS rows (db_apex_row_t) of one zone (domain_id) or of all, ORDER BY domain_id, id; as scan_records in a snapshot.
+     * NULL = the driver cannot tell: no apex goes with the summaries. */
+    int (*scan_apex)(db_conn_t *c, const int64_t *domain_id, db_apex_cb cb, void *ud);
 } db_driver_t;
 
 #define DB_IN_MAX 128u        /* the most zones of one scan_*_in call */

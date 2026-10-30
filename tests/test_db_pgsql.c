@@ -153,6 +153,20 @@ static db_conn_t *open_drv(const char *schema) {
 
 /* ---- callbacks that collect ---- */
 typedef struct { int n; int64_t id[4000]; char name[8][64]; char type[8][16]; char master[8][32]; char soa[8][80]; bool soa_null[8]; bool master_null[8]; int stop_after; } zacc_t;
+/* D1a step 6: scan_apex rows */
+typedef struct { size_t n, nsoa, stop_after; int64_t first_dom; bool first_is_soa; char first_content[40]; } apx_t;
+static int cb_apex(void *ud, const db_apex_row_t *r) {
+    apx_t *a = ud;
+    if (a->n == 0) {
+        a->first_dom = r->domain_id;
+        a->first_is_soa = r->is_soa;
+        snprintf(a->first_content, sizeof(a->first_content), "%s", r->content ? r->content : "");
+    }
+    a->n++;
+    a->nsoa += r->is_soa ? 1 : 0;
+    return a->stop_after && a->n >= a->stop_after;
+}
+
 static int cb_zone(void *ud, const db_zone_row_t *z) {
     zacc_t *a = ud;
     if (a->n < 8) {
@@ -493,6 +507,20 @@ static void test_rows(void) {
     memset(z, 0, sizeof(*z));
     z->stop_after = 2;
     CHECK(D->list_zones(c, cb_zone, z) == DB_STOPPED && z->n == 2);    /* stopped scan, then another query works */
+
+    /* D1a step 6 scan_apex: the enabled SOA and NS rows at the apex, in domain id order (a.test has two enabled SOA rows, the one with the smaller id first) */
+    {
+        apx_t ap;
+        memset(&ap, 0, sizeof(ap));
+        CHECK(D->scan_apex != NULL && D->scan_apex(c, NULL, cb_apex, &ap) == 0 && ap.n >= 1);
+        CHECK(ap.first_dom == 1 && ap.first_is_soa && !strncmp(ap.first_content, "ns.a.test ", 10));
+        memset(&ap, 0, sizeof(ap));
+        int64_t one = 3;
+        CHECK(D->scan_apex(c, &one, cb_apex, &ap) == 0 && ap.nsoa == 0);        /* (the only SOA of zone 3 is disabled) */
+        memset(&ap, 0, sizeof(ap));
+        ap.stop_after = 1;
+        CHECK(D->scan_apex(c, NULL, cb_apex, &ap) == DB_STOPPED && ap.n == 1);
+    }
 
     /* B13 find_zone: the same row as the list, by name: exact spelling by index, other capitals / trailing dot by the lower() fallback */
     memset(z, 0, sizeof(*z));

@@ -1500,6 +1500,17 @@ static void test_dir_fetch_state(void) {
         ea->flags |= ZDIR_F_DELETED;
         CHECK(!dbreg_warm_take("default", "a.test.") && !dbreg_warm_mark("default", "a.test."));
         ea->flags &= (uint16_t)~(ZDIR_F_DELETED | ZDIR_F_PIN);
+        /* the apex a summary brings (D1a step 6): into an element without data and with the same source id, the old block goes with the garbage; a zone
+         * that has its data takes none, and the data clears it */
+        zdir_apex_t *ap1 = calloc(1, sizeof(*ap1)), *ap2 = calloc(1, sizeof(*ap2)), *ap3 = calloc(1, sizeof(*ap3));
+        CHECK(ap1 && ap2 && ap3);
+        CHECK(!dbreg_set_apex("default", "a.test.", 999, 151, ap1) && atomic_load(&ea->apex) == NULL);       /* (another source id) */
+        CHECK(!dbreg_set_apex("default", "nope.test.", 301, 151, ap1) && !dbreg_set_apex("nosuchview", "a.test.", 301, 151, ap1));
+        CHECK(dbreg_set_apex("default", "a.test.", 301, 151, ap1) && atomic_load(&ea->apex) == ap1 && ap1->serial == 151);
+        CHECK(dbreg_set_apex("default", "a.test.", 301, 152, ap2) && atomic_load(&ea->apex) == ap2 && ap2->serial == 152);        /* (ap1 is in the garbage now) */
+        CHECK(!dbreg_set_apex("default", "a.test.", 301, 153, NULL) && atomic_load(&ea->apex) == NULL);         /* none: the old one goes */
+        CHECK(!dbreg_set_apex("default", "b.test.", 303, 5, ap3));                                              /* b.test has its data */
+        CHECK(dbreg_set_apex("default", "a.test.", 301, 154, ap3) && atomic_load(&ea->apex) == ap3);        /* (freed with the element: dbreg_reset() below) */
     }
 
     /* the lookup for a query: NULL and the element for a zone that has no data (the worker parks), the entry when it has */

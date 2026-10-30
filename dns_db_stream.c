@@ -30,7 +30,7 @@ enum { KT_U8, KT_U16, KT_U32, KT_U64, KT_I64, KT_STR, KT_TEXT, KT_BYTES, KT_NAME
 #define KS_MUL8 16u    /* bytes: length a multiple of 8 */
 #define KS_VIEW 32u    /* u16: view index, < view count */
 
-#define KDB_MAX_TAGS 16
+#define KDB_MAX_TAGS 24
 
 typedef struct kdb_tdef kdb_tdef_t;
 typedef struct { uint8_t type; uint8_t flags; uint32_t max; const kdb_tdef_t *sub; } kdb_tspec_t;
@@ -46,7 +46,9 @@ static const kdb_tspec_t sp_zone_begin[] = {
     S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 2),
     S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ | KS_MAXV, KDB_ZF_PRESIGNED | KDB_ZF_EXTENDED | KDB_ZF_TINYDNS | KDB_ZF_SUMMARY), S(KT_U64, KS_REQ, 0),
     S(KT_BYTES, KS_REQ | KS_EXACT, KDB_DIGEST_LEN), S(KT_TEXT, 0, 65535), S(KT_STR, KS_NE, 255), S(KT_U64, 0, 0),
-    S(KT_U32, 0, 0), S(KT_U32, 0, 0), S(KT_U32, 0, 0) };
+    S(KT_U32, 0, 0), S(KT_U32, 0, 0), S(KT_U32, 0, 0),
+    S(KT_NAME, 0, 0), S(KT_NAME, 0, 0), S(KT_U32, KS_MAXV, 2147483647u), S(KT_U32, KS_MAXV, 2147483647u), S(KT_U32, KS_MAXV, 2147483647u),
+    S(KT_BYTES, 0, KDB_APEX_NS_BYTES) };
 static const kdb_tspec_t sp_zone_end[] = { S(KT_U64, KS_REQ, 0) };
 static const kdb_tspec_t sp_zone_abort[] = { S(KT_STR, KS_REQ, 255) };
 static const kdb_tspec_t sp_zone_failed[] = { S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0), S(KT_STR, KS_REQ, 255), S(KT_U64, 0, 0) };
@@ -358,6 +360,35 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
             z->soa_refresh = (uint32_t)V(12).u;
             z->soa_retry = (uint32_t)V(13).u;
             z->soa_expire = (uint32_t)V(14).u;
+        }
+        z->has_apex = false;
+        {
+            unsigned np = 0;
+            for (unsigned t = 15; t <= 20; t++) np += V(t).present ? 1u : 0u;
+            if (np != 0 && np != 6) FAIL(why, wl, KDB_E_TLV_MISSING, "ZONE_BEGIN: the apex (tags 15 to 20) comes all together or not at all");
+            if (np == 6) {
+                if (!(z->flags & KDB_ZF_SUMMARY) || !V(12).present)
+                    FAIL(why, wl, KDB_E_RANGE, "ZONE_BEGIN: the apex of a zone is for a summary with the SOA timers only");
+                /* the NS names: 1..KDB_APEX_NS_MAX canonical absolute names, one LF between two (RFC 1035 3.1: a name is at most 255 octets on the wire) */
+                const uint8_t *p = V(20).p;
+                uint32_t len = V(20).len, start = 0, cnt = 0;
+                for (uint32_t i = 0; i <= len; i++) {
+                    if (i < len && p[i] != '\n') continue;
+                    if (cnt == KDB_APEX_NS_MAX || !name_ok(p + start, i - start))
+                        FAIL(why, wl, KDB_E_TLV_NAME, "ZONE_BEGIN: tag 20 is not a list of 1 to %u canonical absolute names", (unsigned)KDB_APEX_NS_MAX);
+                    cnt++;
+                    start = i + 1;
+                }
+                z->has_apex = true;
+                gname(z->soa_mname, &V(15));
+                gname(z->soa_rname, &V(16));
+                z->soa_minimum = (uint32_t)V(17).u;
+                z->soa_ttl = (uint32_t)V(18).u;
+                z->ns_ttl = (uint32_t)V(19).u;
+                z->ns_names = (const char *)p;
+                z->ns_names_len = (uint16_t)len;
+                z->ns_count = (uint8_t)cnt;
+            }
         }
         break;
 

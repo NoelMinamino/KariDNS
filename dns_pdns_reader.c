@@ -222,6 +222,37 @@ bool pdns_soa_timers(const char *content, uint32_t *refresh, uint32_t *retry, ui
 /* names                                                                                                          */
 /* ------------------------------------------------------------------------------------------------------------- */
 
+static bool name_to_absolute(const char *raw, size_t len, char *out, size_t cap);
+
+bool pdns_apex_name(const char *raw, char out[DNS_NAME_TEXT_SIZE]) {
+    return raw && name_to_absolute(raw, strlen(raw), out, DNS_NAME_TEXT_SIZE);
+}
+
+/* Fields 1, 2 and 7 of an SOA content (RFC 1035 3.3.13: MNAME, RNAME, ..., MINIMUM). */
+bool pdns_soa_apex(const char *content, char mname[DNS_NAME_TEXT_SIZE], char rname[DNS_NAME_TEXT_SIZE], uint32_t *minimum) {
+    if (!content) return false;
+    const char *p = content;
+    for (int field = 0; field < 7; field++) {
+        while (*p == ' ' || *p == '\t') p++;
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        size_t len = (size_t)(p - start);
+        if (len == 0) return false;
+        if (field < 2) {
+            if (!name_to_absolute(start, len, field == 0 ? mname : rname, DNS_NAME_TEXT_SIZE)) return false;
+        } else if (field == 6) {
+            uint64_t n = 0;
+            for (const char *d = start; d < p; d++) {
+                if (*d < '0' || *d > '9') return false;
+                n = n * 10 + (uint64_t)(*d - '0');
+                if (n > 0xFFFFFFFFull) return false;
+            }
+            if (minimum) *minimum = (uint32_t)n;
+        }
+    }
+    return true;
+}
+
 /* raw (as stored, usually without the trailing dot) -> canonical absolute name.  false: not a name. */
 static bool name_to_absolute(const char *raw, size_t len, char *out, size_t cap) {
     if (len == 0 || len > PDNS_MAX_NAME_TEXT) return false;
@@ -290,6 +321,24 @@ int pdns_zone_set_secondary(pdns_zone_t *z, uint8_t kind, const char *master) {
     return 0;
 }
 
+int pdns_zone_set_apex(pdns_zone_t *z, const char *mname, const char *rname, uint32_t minimum, uint32_t soa_ttl, uint32_t ns_ttl, const char *ns_lf) {
+    size_t lm = strlen(mname), lr = strlen(rname), ln = strlen(ns_lf);
+    char *b = malloc(lm + lr + ln + 3);
+    if (!b) return -1;
+    memcpy(b, mname, lm + 1);
+    memcpy(b + lm + 1, rname, lr + 1);
+    memcpy(b + lm + lr + 2, ns_lf, ln + 1);
+    free(z->sum_apex);
+    z->sum_apex = b;
+    z->sum_mname = b;
+    z->sum_rname = b + lm + 1;
+    z->sum_ns = b + lm + lr + 2;
+    z->sum_minimum = minimum > PDNS_MAX_TTL ? PDNS_MAX_TTL : minimum;       /* (the zone parser rounds a value with the top bit set down, RFC 8767 4) */
+    z->sum_soa_ttl = soa_ttl > PDNS_MAX_TTL ? PDNS_MAX_TTL : soa_ttl;
+    z->sum_ns_ttl = ns_ttl > PDNS_MAX_TTL ? PDNS_MAX_TTL : ns_ttl;
+    return 0;
+}
+
 void pdns_zone_set_summary(pdns_zone_t *z, uint32_t serial, bool has_timers, uint32_t refresh, uint32_t retry, uint32_t expire) {
     z->summary = true;
     z->sum_serial = serial;
@@ -311,6 +360,7 @@ bool pdns_canonical_zone_name(const char *dbname, char out[DNS_NAME_TEXT_SIZE]) 
 void pdns_zone_free(pdns_zone_t *z) {
     if (!z) return;
     if (z->arena_ready) zone_arena_destroy(&z->arena);
+    free(z->sum_apex);
     free(z->text);
     free(z->line_off);
     free(z->line_id);
@@ -1973,6 +2023,10 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
         (p->request_id && kdb_enc_u64(&enc, 11, p->request_id) != 0) ||
         (sum && z->sum_timers && (kdb_enc_u32(&enc, 12, z->sum_refresh) != 0 || kdb_enc_u32(&enc, 13, z->sum_retry) != 0 ||
                                   kdb_enc_u32(&enc, 14, z->sum_expire) != 0)) ||
+        (sum && z->sum_timers && z->sum_apex &&                       /* D1a step 6: the apex, for the answer to an SOA question while the zone is out of memory */
+         (kdb_enc_name(&enc, 15, z->sum_mname) != 0 || kdb_enc_name(&enc, 16, z->sum_rname) != 0 || kdb_enc_u32(&enc, 17, z->sum_minimum) != 0 ||
+          kdb_enc_u32(&enc, 18, z->sum_soa_ttl) != 0 || kdb_enc_u32(&enc, 19, z->sum_ns_ttl) != 0 ||
+          kdb_enc_bytes(&enc, 20, (const uint8_t *)z->sum_ns, strlen(z->sum_ns)) != 0)) ||
         kdb_enc_end(&enc) != 0 ||
         emit_msg(&eu) != 0) {
         snprintf(err, errlen, "zone '%s': ZONE_BEGIN could not be encoded or sent", z->name);

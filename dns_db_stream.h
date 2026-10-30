@@ -53,6 +53,9 @@
  *                     on the batch stream).  flags bit3 = summary: the zone's serial, kind and settings without its data (primary: rr_count 0, no
  *                     ZONE_DATA, digest all zero); on the fetch stream, and (milestone 4) in a batch when CONFIG said dir_only.  12 soa_refresh u32 | 13 soa_retry u32 | 14 soa_expire u32 (all
  *                     three or none: the timers of the zone's SOA, which the zone directory keeps without the zone).
+ *                     D1a step 6, a summary only, tags 12..14 required, all of 15..20 or none: the apex of the zone, for the answer to an SOA question when the
+ *                     zone is not in memory.  15 soa_mname name | 16 soa_rname name | 17 soa_minimum u32 | 18 soa_ttl u32 | 19 ns_ttl u32 (the three
+ *                     TTLs <= 2147483647, RFC 2181 8) | 20 ns_names bytes<=2047: 1..8 canonical absolute names of the apex NS RRset, separated by one LF.
  *   ZONE_DATA (5)     raw DNS message (<= 65,535 bytes), no TLV
  *   ZONE_END (6)      1 rr_count u64 R
  *   ZONE_ABORT (7)    1 reason str<=255 R
@@ -138,6 +141,8 @@ enum { KDB_ZK_PRIMARY = 0, KDB_ZK_SECONDARY, KDB_ZK_CATALOG };
 #define KDB_ZF_PRESIGNED 0x1u
 #define KDB_ZF_EXTENDED 0x2u    /* ZONE_DATA carries Extended AXFR records (dns_wire.h, xext_*): location / ECS tags, tinydns time stamps and locations */
 #define KDB_ZF_TINYDNS 0x4u     /* B8: the zone is a tinydns zone (ZONE_IMAGE_F_TINYDNS: time-dependent TTLs, never cached), also without any time stamp or location */
+#define KDB_APEX_NS_MAX 8        /* D1a step 6: NS names of a summary's apex */
+#define KDB_APEX_NS_BYTES 2047   /* ... and the bytes of their list (8 names of 253 characters and the separators) */
 #define KDB_ZF_SUMMARY 0x8u     /* D1a, fetch stream: the zone's summary (serial, kind, settings), no ZONE_DATA, rr_count 0, zero digest */
 enum { KDB_ST_APPLIED = 0, KDB_ST_UNCHANGED, KDB_ST_REJECTED, KDB_ST_SHADOWED, KDB_ST_DELETED,
        KDB_ST_SEND_BODY };   /* D1a: SEND_BODY, to a summary: the zone is in the Backend's memory in another version than the summary says, send it whole */
@@ -222,6 +227,12 @@ typedef struct {
     uint64_t request_id;        /* D1a: 0 = tag absent */
     bool has_soa_timers;        /* D1a: tags 12..14, the SOA refresh / retry / expire of the zone (a summary carries them for the directory) */
     uint32_t soa_refresh, soa_retry, soa_expire;
+    bool has_apex;              /* D1a step 6: tags 15..20 */
+    char soa_mname[DNS_NAME_TEXT_SIZE], soa_rname[DNS_NAME_TEXT_SIZE];
+    uint32_t soa_minimum, soa_ttl, ns_ttl;
+    const char *ns_names;       /* the names separated by LF; points into the frame, valid until the next frame is read */
+    uint16_t ns_names_len;
+    uint8_t ns_count;
 } kdb_zone_begin_t;
 typedef struct {
     const uint8_t *body; uint32_t len;   /* the DNS message */

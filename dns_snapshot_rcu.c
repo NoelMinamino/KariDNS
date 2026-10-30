@@ -169,6 +169,7 @@ static void zdir_elem_release(zdir_elem_t *e) {
   if (en && !(e->kind & ZDIR_K_BORROWED)) zdir_entry_unref(en);
   free(e->error);
   free(e->digest);
+  free(atomic_load_explicit(&e->apex, memory_order_relaxed));
   zone_ext_shared_unref(atomic_load_explicit(&e->sh, memory_order_relaxed));
   free(e);
 }
@@ -223,6 +224,7 @@ static void garb_free(zdir_garbage_t *g) {
     nx = n->next;
     if (n->entry) zdir_entry_unref(n->entry);
     zone_ext_shared_unref(n->sh_old);
+    free(n->apex_old);
     free(n);
   }
   memset(g, 0, sizeof(*g));
@@ -1807,6 +1809,8 @@ static void zdir_elem_sync(zdir_elem_t *z, zone_db_entry_t *entry) {
     z->expire = atomic_load_explicit(&entry->expire, memory_order_relaxed);
 }
 
+static bool apex_replace_locked(dbreg_zone_t *z, zdir_apex_t *apex);
+
 int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, bool created, int64_t source_id,
                  uint32_t serial, const uint8_t digest[32], bool *shadowed) {
     bool sh_cfg = dbreg_config_shadows(view, name);
@@ -1854,6 +1858,7 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
          * that is replaced takes its members with it). */
         gent->entry = cur;
         gent->sh_old = NULL;
+        gent->apex_old = NULL;
         gent->served = in_index;
         gent->next = rv->repl;
         rv->repl = gent;
@@ -1880,6 +1885,7 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
         z->t_load = (uint32_t)cache_mono_ms();
     }
     zdir_elem_sync(z, entry);
+    if (atomic_load_explicit(&z->apex, memory_order_relaxed)) (void)apex_replace_locked(z, NULL);       /* the data is here now: the apex of the summary is not used any more (and the engine compares the serial, should this fail) */
     if (z->flags & ZDIR_F_EVICT_NEXT) cache_note_next();
     if (created && !fresh && !cur && !(z->flags & (ZDIR_F_PIN | ZDIR_F_NOCACHE)) && dbreg_cache_over_high(0) &&
         atomic_load_explicit(&z->freq, memory_order_relaxed) < atomic_load_explicit(&g_victim_freq, memory_order_relaxed)) {
@@ -1941,6 +1947,7 @@ int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uin
         atomic_store_explicit(&z->sh, shared, memory_order_release);
         gent->entry = NULL;
         gent->sh_old = osh;
+        gent->apex_old = NULL;
         gent->served = false;
         gent->next = g_garb.ents;                 /* a reader may hold the old settings: given back with the garbage of the next retired snapshot */
         g_garb.ents = gent;
@@ -2109,6 +2116,37 @@ int dbreg_summary_check(const char *view, const char *zone, int64_t source_id, u
     return rc;
 }
 
+/* The element's apex block is replaced by `apex` (may be NULL); the old one goes with the garbage of the next retired snapshot.  The lock is held.
+ * false: no memory for the garbage entry, nothing was changed. */
+static bool apex_replace_locked(dbreg_zone_t *z, zdir_apex_t *apex) {
+    zdir_apex_t *old = atomic_load_explicit(&z->apex, memory_order_relaxed);
+    zdir_gent_t *gent = old ? malloc(sizeof(*gent)) : NULL;
+    if (old && !gent) return false;
+    atomic_store_explicit(&z->apex, apex, memory_order_release);
+    if (old) {
+        gent->entry = NULL;
+        gent->sh_old = NULL;
+        gent->apex_old = old;
+        gent->served = false;
+        gent->next = g_garb.ents;
+        g_garb.ents = gent;
+    }
+    return true;
+}
+
+bool dbreg_set_apex(const char *view, const char *zone, int64_t source_id, uint32_t serial, zdir_apex_t *apex) {
+    bool taken = false;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    if (z && !(z->flags & ZDIR_F_DELETED) && !zdir_entry(z) && z->source_id == source_id) {
+        if (apex) apex->serial = serial;
+        taken = apex_replace_locked(z, apex) && apex != NULL;
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return taken;
+}
+
 bool dbreg_warm_mark(const char *view, const char *zone) {
     bool added = false;
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
@@ -2176,10 +2214,12 @@ static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
     zone_ext_shared_t *nsh = (dc && dc->ext_shared) ? (zone_ext_shared_t *)dc->ext : NULL;
     zone_ext_shared_t *osh = atomic_load_explicit(&z->sh, memory_order_relaxed);
     gent->sh_old = NULL;
+    gent->apex_old = NULL;
     if (nsh != osh) {
         if (nsh) zone_ext_shared_ref(nsh);
         atomic_store_explicit(&z->sh, nsh, memory_order_release);
         gent->sh_old = osh;
+        gent->apex_old = NULL;
     }
     atomic_store_explicit(&z->entry, NULL, memory_order_release);
     atomic_store_explicit(&z->state, ZDIR_ST_ABSENT, memory_order_release);

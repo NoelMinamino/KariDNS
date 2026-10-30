@@ -2885,6 +2885,116 @@ static bool notify_from_member_primaries(server_config_t *cfg, view_snapshot_t *
 /* SERVFAIL with Extended DNS Error 14 "Not Ready" (RFC 8914 4.15), keeping the question: the answer for a query whose zone is in the directory
  * and cannot be had in time (D1a design 4.4).  The request's own EDE options are not echoed.  Signing is the caller's (the TSIG handling around
  * process_query_body()). */
+/* minimal-responses of the client's view (lib/ns/query.c: client->view->minimalresponses), else options'; no-auth-recursive is no-auth for a query with RD set and
+ * no for the others (ns_query_start()), so the mode returned is the one an answer is built with */
+static int query_minimal_mode(const server_config_t *cfg, const view_snapshot_t *view, const uint8_t *req) {
+  int mode = MINIMAL_NO;
+  if (cfg) {
+    const view_config_t *mr_view = (cfg->any_view_minimal && view) ? config_find_view(cfg, view->name) : NULL;
+    mode = config_minimal_responses(cfg, mr_view);
+    if (mode == MINIMAL_NO_AUTH_RECURSIVE) mode = (req[2] & 0x01) ? MINIMAL_NO_AUTH : MINIMAL_NO;
+  }
+  return mode;
+}
+
+/* The wire name at p (uncompressed, from the apex block) as text, for the directory lookup of an NS target. */
+static bool apex_name_text(const uint8_t *p, size_t len, char *out, size_t cap) {
+  size_t next;
+  return extract_wire_name_to_buffer(p, len, 0, &next, out, cap) >= 0;
+}
+
+/* D1a step 6 (design 12-12): the answer to an SOA question at the apex of a zone that is not in memory, from the apex its summary brought.  It is what the
+ * zone in memory gives, byte for byte: the SOA RR in Answer (RFC 1035 3.3.13, the names compressed as the zone image's serializer does, RFC 1035 4.1.4)
+ * and, unless minimal-responses leaves it out, the NS RRset in Authority (RFC 1034 4.3.2 step 3a); the TTLs are the RRs' own (RFC 2181 5.2: the
+ * NS RRset has the lowest of them).  A zone in memory also adds the addresses of the NS targets it serves to Additional (glue, RFC 2181 9 allows it,
+ * and BIND does), and those are not in the summary: an NS target that a zone of this view contains (this zone, or a sibling) makes the summary
+ * insufficient, and so does everything else the body of a query does that the summary cannot (a cookie, ECS, DO = 1: RRSIGs, MQTYPE ...): the query
+ * then waits for the zone as before.  Returns the length of the response, or -1: not answered from the summary (nothing was written that matters). */
+static int build_apex_soa_answer(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len, const zdir_elem_t *elem, const zdir_apex_t *ap,
+                                 edns_info_t *edns, bool is_tcp, int minimal_mode, view_snapshot_t *view, compress_ctx_t *comp_ctx,
+                                 const tsig_request_t *tsig, server_config_t *cfg) {
+  if (ap->serial != elem->serial || ap->n_ns == 0) return -1;
+  if (edns->present && (edns->version != 0 || edns->dnssec_ok || edns->compact_answers_ok || edns->has_mqtype_query || edns->has_ecs || edns->has_malformed_ecs ||
+                        edns->has_karidns_ext || edns->has_cookie || edns->has_malformed_cookie || edns->ede_count != 0 || edns->has_expire_query || edns->has_expire_value))
+    return -1;
+  size_t q_end;
+  if (skip_wire_name(req, req_len, DNS_HEADER_SIZE, &q_end) != 0 || q_end + 4 > req_len) return -1;
+  if (((req[q_end + 2] << 8) | req[q_end + 3]) != 1) return -1;                  // (class IN)
+  size_t q_offset = q_end + 4;
+  const uint8_t *mn = ap->data, *rn = ap->data + ap->mname_len, *ns = rn + ap->rname_len;
+  const bool with_ns = minimal_mode == MINIMAL_NO;
+  if (with_ns) {           /* the glue the zone in memory would add */
+    char nm[DNS_NAME_TEXT_SIZE];
+    for (size_t off = 0, k = 0; k < ap->n_ns; k++) {
+      size_t nl = 0;
+      while (off + nl < ap->ns_len && ns[off + nl] != 0) nl += (size_t)ns[off + nl] + 1;
+      nl++;
+      zdir_elem_t *pe = NULL;
+      if (off + nl > ap->ns_len || !apex_name_text(ns + off, nl, nm, sizeof(nm))) return -1;
+      if (find_zone_for_query_ex(view, nm, 1, &pe) != NULL || pe != NULL) return -1;
+      off += nl;
+    }
+  }
+  size_t limit = max_res_len;                               /* what the body may use: the room for the OPT (RFC 6891 7) and for the TSIG (RFC 8945 5.3) is kept back */
+  if (tsig) {
+    size_t reserve = tsig_response_reserve(tsig);
+    if (reserve > 0 && limit > reserve + DNS_HEADER_SIZE) limit -= reserve;
+  }
+  size_t body_max = limit;
+  if (edns->present) {
+    size_t opt_reserve = edns_opt_reserve_len(edns, is_tcp, cfg);
+    if (limit > opt_reserve + DNS_HEADER_SIZE) body_max = limit - opt_reserve;
+  }
+  if (q_offset > body_max || body_max > UINT16_MAX) return -1;
+  memcpy(res, req, q_offset);
+  compress_ctx_init_packet(comp_ctx);
+  register_wire_name_for_compression(res, DNS_HEADER_SIZE, comp_ctx);
+  dns_init_response_header(res, req, 0, true);
+  uint16_t offset = (uint16_t)q_offset, ancount = 0, nscount = 0, arcount = 0;
+  /* SOA */
+  if (write_dns_name_str(res, &offset, elem->name, comp_ctx, body_max) != 0 || (size_t)offset + 10 > body_max) return -1;
+  res[offset++] = 0; res[offset++] = 6; res[offset++] = 0; res[offset++] = 1;
+  uint32_t v = ap->soa_ttl;
+  res[offset++] = (uint8_t)(v >> 24); res[offset++] = (uint8_t)(v >> 16); res[offset++] = (uint8_t)(v >> 8); res[offset++] = (uint8_t)v;
+  uint16_t rdl_at = offset;
+  offset += 2;
+  if (compress_name(res, &offset, mn, comp_ctx, body_max) != 0 || compress_name(res, &offset, rn, comp_ctx, body_max) != 0 || (size_t)offset + 20 > body_max)
+    return -1;
+  const uint32_t nums[5] = { ap->serial, ap->refresh, ap->retry, ap->expire, ap->minimum };
+  for (int i = 0; i < 5; i++) {
+    res[offset++] = (uint8_t)(nums[i] >> 24); res[offset++] = (uint8_t)(nums[i] >> 16); res[offset++] = (uint8_t)(nums[i] >> 8); res[offset++] = (uint8_t)nums[i];
+  }
+  res[rdl_at] = (uint8_t)((offset - rdl_at - 2) >> 8);
+  res[rdl_at + 1] = (uint8_t)(offset - rdl_at - 2);
+  ancount = 1;
+  /* NS */
+  if (with_ns) {
+    const uint8_t *t = ns;
+    for (unsigned k = 0; k < ap->n_ns; k++) {
+      size_t nl = 0;
+      while (t[nl] != 0) nl += (size_t)t[nl] + 1;
+      nl++;
+      if (write_dns_name_str(res, &offset, elem->name, comp_ctx, body_max) != 0 || (size_t)offset + 10 > body_max) return -1;
+      res[offset++] = 0; res[offset++] = 2; res[offset++] = 0; res[offset++] = 1;
+      v = ap->ns_ttl;
+      res[offset++] = (uint8_t)(v >> 24); res[offset++] = (uint8_t)(v >> 16); res[offset++] = (uint8_t)(v >> 8); res[offset++] = (uint8_t)v;
+      rdl_at = offset;
+      offset += 2;
+      if (compress_name(res, &offset, t, comp_ctx, body_max) != 0) return -1;
+      res[rdl_at] = (uint8_t)((offset - rdl_at - 2) >> 8);
+      res[rdl_at + 1] = (uint8_t)(offset - rdl_at - 2);
+      nscount++;
+      t += nl;
+    }
+  }
+  if (edns->present) assemble_edns_opt(res, limit, &offset, &arcount, edns, 0, is_tcp, cfg);
+  res[4] = 0; res[5] = 1;
+  res[6] = (uint8_t)(ancount >> 8); res[7] = (uint8_t)ancount;
+  res[8] = (uint8_t)(nscount >> 8); res[9] = (uint8_t)nscount;
+  res[10] = (uint8_t)(arcount >> 8); res[11] = (uint8_t)arcount;
+  return offset;
+}
+
 static int build_not_ready_response(const uint8_t *req, size_t req_len, uint8_t *res, size_t cap, bool is_tcp, server_config_t *cfg) {
   if (req_len < DNS_HEADER_SIZE) return 0;
   edns_info_t edns;
@@ -3211,6 +3321,14 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     if (opcode == 0 && view && cfg && cfg->acl_query_active && !zone_query_permitted(cfg, &zc, view->name, client_ip)) {
       add_ede(&edns, send_ede, 18, "Query refused due to access control");
       return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
+    }
+    if (opcode == 0 && qtype == 6 && qdcount == 1 && view && domain_names_match_ci(not_ready_zone->name, current_qname)) {
+      const zdir_apex_t *ap = atomic_load_explicit(&not_ready_zone->apex, memory_order_acquire);
+      if (ap) {
+        int alen = build_apex_soa_answer(req, req_len, res, max_res_len, not_ready_zone, ap, &edns, is_tcp, query_minimal_mode(cfg, view, req), view,
+                                         comp_ctx, tsig, cfg);
+        if (alen >= DNS_HEADER_SIZE) return alen;
+      }
     }
     if (t_nr_probe && opcode == 0) return DNS_NR_PERMITTED;
     return build_not_ready_response(req, req_len, res, max_res_len, is_tcp, cfg);
@@ -3745,12 +3863,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
    * 解決中に版が上がっても、古い版の鍵で入れた応答は二度と引かれない。 */
   /* minimal-responses of the client's view (lib/ns/query.c: client->view->minimalresponses), else options'; no-auth-recursive is no-auth for a
    * query with RD set and no for the others (ns_query_start()), so mr_mode is what the body is built with */
-  int mr_mode = MINIMAL_NO;
-  if (cfg_for_ede) {
-    const view_config_t *mr_view = (cfg_for_ede->any_view_minimal && view) ? config_find_view(cfg_for_ede, view->name) : NULL;
-    mr_mode = config_minimal_responses(cfg_for_ede, mr_view);
-    if (mr_mode == MINIMAL_NO_AUTH_RECURSIVE) mr_mode = (req[2] & 0x01) ? MINIMAL_NO_AUTH : MINIMAL_NO;
-  }
+  int mr_mode = query_minimal_mode(cfg_for_ede, view, req);
   /* A zone shared with in-view, reached through a view that does not own it, and with NS / MX / SRV targets (current_zone->glue): the sibling
    * zones whose addresses go into the Additional section are looked up in the CLIENT's view (append_glue_records() 3., as BIND's query_getzonedb()
    * uses client->view), while the version, and so the cache entries and the sibling tracking of zone_glue_track_build(), belong to the owner view.

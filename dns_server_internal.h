@@ -557,6 +557,16 @@ enum { ZDIR_ST_ABSENT = 0, ZDIR_ST_RESIDENT, ZDIR_ST_LOADING, ZDIR_ST_ERROR };
 #define ZDIR_K_SHARED    0x04u     /* a zone shared from another view by `in-view`: the entry is the owner view's */
 #define ZDIR_K_BORROWED  0x08u     /* the element holds no reference of its entry (unit tests, fuzzers) */
 
+/* D1a step 6 (design 12-12): the apex of a zone that is not in memory, from its summary: what the answer to an SOA question at the apex is made of
+ * (RFC 1035 3.3.13, 3.3.11).  Names are wire names without compression (RFC 3597 4 does not apply: SOA and NS are well-known types).  data: MNAME,
+ * RNAME, then n_ns NS targets one after the other.  `serial` is the serial of the version it describes; the block is not used for another one. */
+typedef struct zdir_apex {
+  uint32_t serial, soa_ttl, refresh, retry, expire, minimum, ns_ttl;
+  uint16_t mname_len, rname_len, ns_len;
+  uint8_t n_ns;
+  uint8_t data[];
+} zdir_apex_t;
+#define ZDIR_APEX_MAX (sizeof(zdir_apex_t) + 2 * 255 + KDB_APEX_NS_MAX * 255)
 struct zdir_elem {
   struct zdir_elem *next;      /* the registry's hash chain; once the element is on a garbage list, that list */
   _Atomic(zone_db_entry_t *) entry;   /* the entry that answers for the name (RCU-published); the element holds a reference */
@@ -576,6 +586,7 @@ struct zdir_elem {
   uint8_t klen;                /* the name without the trailing dot */
   uint8_t kind;                /* ZDIR_K_* (never changes) */
   uint8_t *digest;             /* DB: the 32-byte digest the loader sent, in a block of its own that only a zone with data in memory has (malloc, freed with the element; NULL = none) */
+  _Atomic(zdir_apex_t *) apex;       /* D1a step 6: the apex of the zone, from a summary (NULL: none).  Replaced under g_zone_db_rebuild_lock; the old block is given back with the garbage of the retired snapshot (a worker may be reading it). */
   _Atomic(zone_ext_shared_t *) sh;   /* DB: the interned settings of the zone (one reference), set when its data leaves memory: a query for the zone while it is out of memory
                                       * is checked against the zone's allow-query from it, before it parks (a zone in memory has its settings in the entry, dbcfg).  Replaced
                                       * by the next eviction; the old one is given back with the garbage of the retired snapshot, as a reader may hold it. */
@@ -622,6 +633,7 @@ typedef struct zdir_gent {
   zone_db_entry_t *entry;      /* one reference to give back (NULL: none) */
   bool served;                 /* (a replaced entry) it was the one in the index when it was replaced */
   zone_ext_shared_t *sh_old;   /* one reference of settings to give back (an eviction replaced the element's), NULL = none */
+  zdir_apex_t *apex_old;       /* an apex block that was replaced (free() it), NULL = none */
 } zdir_gent_t;
 typedef struct {
   zdir_elem_t *elems;          /* chained through ->next */
@@ -1005,6 +1017,9 @@ void dbreg_fetch_end(const char *view, const char *zone);
 bool dbreg_apply_summary(const char *view, const char *zone, int64_t source_id, uint32_t serial, bool has_timers, uint32_t refresh,
                          uint32_t retry, uint32_t expire);
 enum { DBREG_SUM_NONE = 0, DBREG_SUM_SAME, DBREG_SUM_DIFFERS };
+/* D1a step 6: give the element of a zone that has no data (same source id) the apex a summary brought (NULL: it brought none, the old one goes).  true: the
+ * element took the block (the caller must not free it); false: the block is the caller's. */
+bool dbreg_set_apex(const char *view, const char *zone, int64_t source_id, uint32_t serial, zdir_apex_t *apex);
 /* The list of zones to read before a query asks (ingest thread): dbreg_warm_mark() puts a zone in it (false: it is there already, or the zone is not a registry zone),
  * dbreg_warm_take() takes it out again: true when it is still worth a read (pinned, no data, not deleted). */
 bool dbreg_warm_mark(const char *view, const char *zone);

@@ -150,11 +150,18 @@ static void drivers_list(char *out, size_t cap) {
 /* loader state                                                                                                   */
 /* ------------------------------------------------------------------------------------------------------------- */
 
+/* D1a step 6: the apex of a zone whose summary is sent: what the Backend answers an SOA question from while the zone is out of memory.  data: the SOA's
+ * MNAME NUL RNAME NUL the NS targets separated by LF NUL (canonical absolute names) */
+typedef struct lapex { uint32_t minimum, soa_ttl, ns_ttl; char data[]; } lapex_t;
+static const char *lapex_rname(const lapex_t *a) { return a->data + strlen(a->data) + 1; }
+static const char *lapex_ns(const lapex_t *a) { const char *r = lapex_rname(a); return r + strlen(r) + 1; }
+
 typedef struct {
     int64_t id;
     char *name;
     char *type;
     char *master;                     /* domains.master (SLAVE / CONSUMER: the masters), NULL if NULL */
+    lapex_t *apex;                    /* D1a step 6: NULL = none (not read, not usable, or the zone has location / time attributes) */
     char *canon;                      /* stream mode: the canonical absolute name, NULL if the name is unusable */
     uint32_t serial;                  /* serial of the enabled apex SOA */
     bool has_serial;
@@ -1333,7 +1340,12 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
     const uint8_t skind = zone_sec_kind(zi->type);
     if (x->check) chk_zone_begin(x, zi, tr ? "other" : skind == KDB_ZK_SECONDARY ? "secondary" : skind == KDB_ZK_CATALOG ? "catalog" : "primary");
     if (z && skind != KDB_ZK_PRIMARY && pdns_zone_set_secondary(z, skind, zi->master) != 0) w->oom = true;
-    if (z && skind == KDB_ZK_PRIMARY && zi->summary) pdns_zone_set_summary(z, zi->serial, zi->has_timers, zi->t_refresh, zi->t_retry, zi->t_expire);
+    if (z && skind == KDB_ZK_PRIMARY && zi->summary) {
+        pdns_zone_set_summary(z, zi->serial, zi->has_timers, zi->t_refresh, zi->t_retry, zi->t_expire);
+        if (zi->apex && zi->has_timers) {
+            if (pdns_zone_set_apex(z, zi->apex->data, lapex_rname(zi->apex), zi->apex->minimum, zi->apex->soa_ttl, zi->apex->ns_ttl, lapex_ns(zi->apex)) != 0) w->oom = true;
+        }
+    }
     if (w->oom) {
         r->kind = ZR_FATAL;
     } else if (!zi->name) {
@@ -1913,12 +1925,152 @@ static int db_err(ctx_t *x, int rc, const char *what) {
 
 /* Forget the lists of the previous view (zones, metadata, keys).  The context keeps them after a run so that the owner
  * (main(), a test) can look at them; the next run starts empty. */
+/* ---- D1a step 6: the apex of the zones whose summary is sent ---- */
+typedef struct {
+    ctx_t *x;
+    zinfo_t *z;                       /* the zone being read (NULL: a zone whose summary is not sent) */
+    int64_t cur;
+    bool have, soa, ns_ok, oom;
+    char mname[DNS_NAME_TEXT_SIZE], rname[DNS_NAME_TEXT_SIZE];
+    uint32_t minimum, soa_ttl, ns_ttl;
+    unsigned n_ns;
+    size_t ns_len;
+    char ns_lf[KDB_APEX_NS_BYTES + 1];
+} apex_acc_t;
+
+static zinfo_t *zinfo_by_id(ctx_t *x, int64_t id) {         /* x->zones is in domains.id order */
+    size_t lo = 0, hi = x->nz;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (x->zones[mid].id < id) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < x->nz && x->zones[lo].id == id ? &x->zones[lo] : NULL;
+}
+
+static void apex_flush(apex_acc_t *a) {
+    zinfo_t *z = a->z;
+    a->z = NULL;
+    if (!a->have || !z || z->apex || !a->soa || !a->ns_ok || a->n_ns == 0) return;
+    size_t lm = strlen(a->mname), lr = strlen(a->rname);
+    lapex_t *p = malloc(sizeof(*p) + lm + lr + a->ns_len + 3);
+    if (!p) {
+        a->oom = true;
+        return;
+    }
+    p->minimum = a->minimum;
+    p->soa_ttl = a->soa_ttl;
+    p->ns_ttl = a->ns_ttl;
+    memcpy(p->data, a->mname, lm + 1);
+    memcpy(p->data + lm + 1, a->rname, lr + 1);
+    memcpy(p->data + lm + lr + 2, a->ns_lf, a->ns_len + 1);
+    z->apex = p;
+}
+
+static int apex_cb(void *ud, const db_apex_row_t *row) {
+    apex_acc_t *a = ud;
+    if (!a->have || row->domain_id != a->cur) {
+        apex_flush(a);
+        a->have = true;
+        a->cur = row->domain_id;
+        a->z = zinfo_by_id(a->x, row->domain_id);
+        if (a->z && !(a->z->summary && a->z->want && !a->z->apex)) a->z = NULL;
+        a->soa = false;
+        a->ns_ok = true;
+        a->n_ns = 0;
+        a->ns_len = 0;
+        a->ns_lf[0] = '\0';
+        a->ns_ttl = 0;
+    }
+    if (!a->z || a->oom) return a->oom ? 1 : 0;
+    uint32_t deft = a->x->opts.default_ttl ? a->x->opts.default_ttl : PDNS_DEFAULT_TTL;
+    uint32_t ttl = row->ttl_null ? deft : (row->ttl < 0 ? 0 : row->ttl > PDNS_MAX_TTL ? PDNS_MAX_TTL : (uint32_t)row->ttl);
+    if (row->is_soa) {
+        if (a->soa || !row->content) return 0;                  /* (the first enabled SOA is the zone's, as in the zone list) */
+        a->soa = pdns_soa_apex(row->content, a->mname, a->rname, &a->minimum);
+        a->soa_ttl = ttl;
+        return 0;
+    }
+    char nm[DNS_NAME_TEXT_SIZE];
+    if (!row->content || !pdns_apex_name(row->content, nm)) {
+        a->ns_ok = false;                                       /* an NS record that is not a name: the zone image would not have it */
+        return 0;
+    }
+    size_t l = strlen(nm);
+    for (const char *q = a->ns_lf; *q;) {                        /* the same target twice is one RR */
+        const char *e = strchr(q, '\n');
+        size_t ql = e ? (size_t)(e - q) : strlen(q);
+        if (ql == l && strncasecmp(q, nm, l) == 0) return 0;
+        if (!e) break;
+        q = e + 1;
+    }
+    if (a->n_ns == KDB_APEX_NS_MAX || a->ns_len + (a->n_ns ? 1 : 0) + l > KDB_APEX_NS_BYTES) {
+        a->ns_ok = false;                                       /* more than the summary can carry: the answer would miss NS records */
+        return 0;
+    }
+    if (a->n_ns) a->ns_lf[a->ns_len++] = '\n';
+    memcpy(a->ns_lf + a->ns_len, nm, l + 1);
+    a->ns_len += l;
+    a->ns_ttl = a->n_ns == 0 || ttl < a->ns_ttl ? ttl : a->ns_ttl;          /* RFC 2181 5.2: the RRset has the lowest TTL of its RRs (the zone image harmonizes the same way) */
+    a->n_ns++;
+    return 0;
+}
+
+/* The apex of the zones in zones[] that are sent as summaries and have none yet.  Zones with location tags or tinydns attributes (the extension
+ * tables, B8) can answer differently for different clients: they get none (the Backend then reads the zone to answer an SOA question).
+ * 0, or a db_err() status. */
+static int apex_gather(ctx_t *x) {
+    if (!x->drv->scan_apex) return 0;
+    size_t nsum = 0;
+    for (size_t i = 0; i < x->nz; i++) nsum += x->zones[i].summary && x->zones[i].want && !x->zones[i].apex ? 1 : 0;
+    if (nsum == 0) return 0;
+    apex_acc_t a;
+    memset(&a, 0, sizeof(a));
+    a.x = x;
+    int rc = 0;
+    if (nsum * 4 >= x->nz) {                                     /* many zones: one scan of the table */
+        rc = x->drv->scan_apex(x->conn, NULL, apex_cb, &a);
+        if (rc == 0) apex_flush(&a);
+    } else {
+        for (size_t i = 0; i < x->nz && rc == 0 && !a.oom; i++) {
+            if (!(x->zones[i].summary && x->zones[i].want && !x->zones[i].apex)) continue;
+            a.have = false;
+            rc = x->drv->scan_apex(x->conn, &x->zones[i].id, apex_cb, &a);
+            if (rc == 0) apex_flush(&a);
+        }
+    }
+    if (a.oom) return x->oom = true, EXIT_ERROR;
+    if (rc != 0) return db_err(x, rc, "reading the apex of the zones");
+    if (x->has_ext) {
+        eset_t ex;
+        memset(&ex, 0, sizeof(ex));
+        rc = eset_load(x->drv, x->conn, NULL, &ex);
+        if (rc != 0) {
+            bool oom = ex.oom;
+            eset_free(&ex);
+            return oom ? (x->oom = true, EXIT_ERROR) : db_err(x, rc, "reading the tags and tinydns attributes");
+        }
+        for (size_t i = 0; i < x->nz; i++) {
+            zinfo_t *z = &x->zones[i];
+            if (!z->apex) continue;
+            size_t t = eset_lower_tags(ex.tags, ex.nt, z->id), d = eset_lower_td(ex.td, ex.nd, z->id), g = eset_lower_defs(ex.defs, ex.ng, z->id);
+            if ((t < ex.nt && ex.tags[t].domain_id == z->id) || (d < ex.nd && ex.td[d].domain_id == z->id) || (g < ex.ng && ex.defs[g].domain_id == z->id)) {
+                free(z->apex);
+                z->apex = NULL;
+            }
+        }
+        eset_free(&ex);
+    }
+    return 0;
+}
+
 static void ctx_view_reset(ctx_t *x) {
     for (size_t i = 0; i < x->nz; i++) {
         free(x->zones[i].name);
         free(x->zones[i].type);
         free(x->zones[i].master);
         free(x->zones[i].canon);
+        free(x->zones[i].apex);
     }
     free(x->zones);
     x->zones = NULL;
@@ -2216,6 +2368,9 @@ static int fetch_summary(ctx_t *x) {
         snprintf(x->errtext, sizeof(x->errtext), "the SOA of the zone is missing or has no valid serial");
         return EXIT_ERROR;
     }
+    x->zones[0].summary = true;                           /* (what apex_gather() looks for) */
+    int arc = apex_gather(x);
+    if (arc != 0) return arc;
     mset_t m;
     memset(&m, 0, sizeof(m));
     int rc = x->drv->scan_metadata(x->conn, &zi->id, meta_cb, &m);
@@ -2236,6 +2391,10 @@ static int fetch_summary(ctx_t *x) {
         kdb_enc_bytes(&x->enc, 8, zero, sizeof(zero)) != 0 || kdb_enc_u64(&x->enc, 11, x->fetch_req) != 0 ||
         (zi->has_timers && (kdb_enc_u32(&x->enc, 12, zi->t_refresh) != 0 || kdb_enc_u32(&x->enc, 13, zi->t_retry) != 0 ||
                             kdb_enc_u32(&x->enc, 14, zi->t_expire) != 0)) ||
+        (zi->has_timers && zi->apex &&
+         (kdb_enc_name(&x->enc, 15, zi->apex->data) != 0 || kdb_enc_name(&x->enc, 16, lapex_rname(zi->apex)) != 0 ||
+          kdb_enc_u32(&x->enc, 17, zi->apex->minimum) != 0 || kdb_enc_u32(&x->enc, 18, zi->apex->soa_ttl) != 0 || kdb_enc_u32(&x->enc, 19, zi->apex->ns_ttl) != 0 ||
+          kdb_enc_bytes(&x->enc, 20, (const uint8_t *)lapex_ns(zi->apex), strlen(lapex_ns(zi->apex))) != 0)) ||
         kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
         goto write_failed;
     if (kdb_enc_begin(&x->enc, KDB_T_ZONE_END) != 0 || kdb_enc_u64(&x->enc, 1, 0) != 0 || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
@@ -2340,6 +2499,10 @@ static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, boo
                 if (x->prof_oom) lg(LOG_ERR, "out of memory");
                 goto out_snap;
             }
+        }
+        if (x->dir_only && n_want > 0 && (rc = apex_gather(x)) != 0) {            /* D1a step 6: the apex of the summaries */
+            status = rc;
+            goto out_snap;
         }
         if (bulk && n_want > 0) {
             if ((rc = x->drv->scan_metadata(x->conn, NULL, meta_cb, &x->meta)) != 0) {

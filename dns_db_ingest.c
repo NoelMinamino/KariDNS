@@ -106,6 +106,7 @@ typedef struct ing_job {
   bool dir_entry;                        /* D1a milestone 4: the zone came as a summary in a batch (cold, no data was sent); timers are applied after the commit */
   bool cold;                             /* D1a step 5: a zone of a batch that is not kept in memory (the limit is reached): serial, digest and settings go into the directory, the data is discarded */
   uint32_t t_refresh, t_retry, t_expire;
+  zdir_apex_t *apex;                     /* D1a step 6: the apex of a summary that is kept (see apex_from_begin()); the job owns it until dbreg_set_apex() takes it */
 } ing_job_t;
 
 /* a fetch in flight: sent to the loader on the fetch stream, not answered yet */
@@ -623,6 +624,7 @@ static void job_free(ing_job_t *j) {
   if (!j) return;
   db_zone_build_free(j->build);
   zone_ext_shared_unref(j->shared);
+  free(j->apex);
   free(j->buf);
   free(j);
 }
@@ -908,9 +910,9 @@ static void job_execute(ing_job_t *j) {
     return;
   }
   if (j->summary) {                                      /* D1a: serial and SOA timers for the directory; nothing to install */
-    j->status = dbreg_apply_summary(j->view_name, j->zone, j->source_id, j->serial, j->has_timers, j->t_refresh, j->t_retry, j->t_expire)
-                    ? KDB_ST_APPLIED
-                    : KDB_ST_UNCHANGED;
+    bool ap = dbreg_apply_summary(j->view_name, j->zone, j->source_id, j->serial, j->has_timers, j->t_refresh, j->t_retry, j->t_expire);
+    if (ap && dbreg_set_apex(j->view_name, j->zone, j->source_id, j->serial, j->apex)) j->apex = NULL;       /* (the old apex goes when this summary has none) */
+    j->status = ap ? KDB_ST_APPLIED : KDB_ST_UNCHANGED;
     return;
   }
   if (j->cold) {                                         /* D1a step 5: the directory learns the zone; the data is fetched when a query needs it */
@@ -925,8 +927,10 @@ static void job_execute(ing_job_t *j) {
       }
     }
     if (dbreg_commit_cold(j->view_name, j->zone, j->source_id, j->serial, j->digest, j->shared) == 0) {
-      if (j->dir_entry && j->has_timers)
+      if (j->dir_entry && j->has_timers) {
         (void)dbreg_apply_summary(j->view_name, j->zone, j->source_id, j->serial, true, j->t_refresh, j->t_retry, j->t_expire);
+        if (dbreg_set_apex(j->view_name, j->zone, j->source_id, j->serial, j->apex)) j->apex = NULL;
+      }
       j->status = KDB_ST_APPLIED;
     } else {
       job_reject(j, "out of memory registering the zone");
@@ -1491,6 +1495,63 @@ static bool cache_wants_cold(const ing_job_t *j) {
   return dbreg_cache_over_high((uint64_t)j->rr_count * 160u);
 }
 
+/* D1a step 6 (design 12-12): which zones keep the apex of their summary: the zones that send NOTIFY or have secondaries (an SOA question comes from
+ * a secondary that polls, or from a tool that checks one).  A zone with `notify no` and no allow-transfer has none, and its SOA question reads the zone.
+ * view: the view's name (the effective `notify` can come from the view or from options). */
+static bool apex_wanted(const char *view, const char *zone, const zone_ext_shared_t *sh) {
+  server_config_t *cfg = acquire_config_snapshot();
+  zone_config_t zc;
+  memset(&zc, 0, sizeof(zc));
+  zc.domain = (char *)zone;
+  zc.ext = sh ? (zone_ext_t *)&sh->ext : NULL;
+  bool wanted = !cfg || notify_mode_effective(cfg, &zc, view) != NOTIFY_MODE_NO || (sh && sh->ext.allow_transfer_count > 0);
+  release_config_snapshot(cfg);
+  return wanted;
+}
+
+/* The apex block of a summary: the names as wire names (RFC 1035 3.1), the TTLs as they are.  The loader is not trusted: the stream layer has checked the
+ * names and the TTLs (dns_db_stream.c), the conversion checks them again (a label over 63 octets or a name over 255 fails).  NULL: none, or out of memory
+ * (then the SOA question reads the zone). */
+static zdir_apex_t *apex_from_begin(const kdb_zone_begin_t *zb) {
+  if (!zb->has_apex || zb->ns_count == 0 || zb->ns_count > KDB_APEX_NS_MAX) return NULL;
+  uint8_t tmp[2 * 256 + KDB_APEX_NS_MAX * 256];
+  uint16_t off = 0;
+  uint16_t ml, rl;
+  if (write_dns_name_str(tmp, &off, zb->soa_mname, NULL, sizeof(tmp)) != 0) return NULL;
+  ml = off;
+  if (write_dns_name_str(tmp, &off, zb->soa_rname, NULL, sizeof(tmp)) != 0) return NULL;
+  rl = (uint16_t)(off - ml);
+  uint16_t ns_start = off;
+  unsigned n = 0;
+  char nm[DNS_NAME_TEXT_SIZE];
+  for (const char *p = zb->ns_names, *end = zb->ns_names + zb->ns_names_len; p <= end && n < zb->ns_count;) {
+    const char *e = memchr(p, '\n', (size_t)(end - p));
+    size_t l = e ? (size_t)(e - p) : (size_t)(end - p);
+    if (l == 0 || l >= sizeof(nm)) return NULL;
+    memcpy(nm, p, l);
+    nm[l] = '\0';
+    if (write_dns_name_str(tmp, &off, nm, NULL, sizeof(tmp)) != 0) return NULL;
+    n++;
+    p += l + 1;
+  }
+  if (n != zb->ns_count) return NULL;
+  zdir_apex_t *a = malloc(sizeof(*a) + off);
+  if (!a) return NULL;
+  a->serial = zb->serial;
+  a->soa_ttl = zb->soa_ttl;
+  a->refresh = zb->soa_refresh > 2147483647u ? 2147483647u : zb->soa_refresh;      /* (as dbreg_apply_summary() keeps them: the zone parser rounds a value with the top bit set down) */
+  a->retry = zb->soa_retry > 2147483647u ? 2147483647u : zb->soa_retry;
+  a->expire = zb->soa_expire > 2147483647u ? 2147483647u : zb->soa_expire;
+  a->minimum = zb->soa_minimum;
+  a->ns_ttl = zb->ns_ttl;
+  a->mname_len = ml;
+  a->rname_len = rl;
+  a->ns_len = (uint16_t)(off - ns_start);
+  a->n_ns = (uint8_t)n;
+  memcpy(a->data, tmp, off);
+  return a;
+}
+
 /* the job of a ZONE_BEGIN (either stream), with its settings resolved; NULL: out of memory */
 static ing_job_t *job_from_begin(ing_t *g, const kdb_zone_begin_t *zb) {
   ing_job_t *j = calloc(1, sizeof(*j));
@@ -1512,6 +1573,7 @@ static ing_job_t *job_from_begin(ing_t *g, const kdb_zone_begin_t *zb) {
     j->t_refresh = zb->soa_refresh;
     j->t_retry = zb->soa_retry;
     j->t_expire = zb->soa_expire;
+    if (zb->has_apex && apex_wanted(j->view_name, j->zone, NULL)) j->apex = apex_from_begin(zb);
   } else if (zb->flags & KDB_ZF_SUMMARY) {
     /* D1a milestone 4 (design 3.3, 6.3): the directory entry of a zone in a batch: the loader sends the summary instead of the data for a zone that is
      * not in memory (CONFIG dir_only, which is memory-limit).  The loader is not trusted: a summary without memory-limit, or for a zone that has
@@ -1531,6 +1593,7 @@ static ing_job_t *job_from_begin(ing_t *g, const kdb_zone_begin_t *zb) {
     } else {
       j->cold = true;
       j->dir_entry = true;
+      if (zb->has_apex && apex_wanted(j->view_name, j->zone, j->shared)) j->apex = apex_from_begin(zb);
     }
   } else if (zb->zone_kind != KDB_ZK_PRIMARY && zb->flags != 0) {
     j->skip = true;                                      /* a SLAVE / CONSUMER has no data to describe */

@@ -1740,6 +1740,53 @@ static void test_fetch_stream_machine(void) {
             free(ts);
         }
     }
+    /* D1a step 6, the apex of a summary (tags 15..20): all together, with the SOA timers, the TTLs at most 2^31 - 1, 1 to 8 canonical NS names */
+    {
+        uint8_t zd[KDB_DIGEST_LEN] = { 0 };
+        static const struct { const char *what; unsigned skip; uint32_t soa_ttl; const char *ns; uint32_t flags; bool timers; kdb_rc_t want; } ac[] = {
+            { "apex", 0, 900, "ns1.hosting.example.\nns2.hosting.example.", KDB_ZF_SUMMARY, true, KDB_OK },
+            { "apex, one NS", 0, 0, "ns1.hosting.example.", KDB_ZF_SUMMARY, true, KDB_OK },
+            { "apex without tag 15", 15, 900, "ns1.hosting.example.", KDB_ZF_SUMMARY, true, KDB_E_TLV_MISSING },
+            { "apex without tag 20", 20, 900, "ns1.hosting.example.", KDB_ZF_SUMMARY, true, KDB_E_TLV_MISSING },
+            { "apex, TTL over 2^31 - 1", 0, 0x80000000u, "ns1.hosting.example.", KDB_ZF_SUMMARY, true, KDB_E_RANGE },
+            { "apex without the SOA timers", 0, 900, "ns1.hosting.example.", KDB_ZF_SUMMARY, false, KDB_E_RANGE },
+            { "apex without the summary flag", 0, 900, "ns1.hosting.example.", 0, true, KDB_E_RANGE },
+            { "apex, an NS name that is not absolute", 0, 900, "ns1.hosting.example", KDB_ZF_SUMMARY, true, KDB_E_TLV_NAME },
+            { "apex, an empty NS name", 0, 900, "ns1.hosting.example.\n\nns2.hosting.example.", KDB_ZF_SUMMARY, true, KDB_E_TLV_NAME },
+            { "apex, a trailing LF", 0, 900, "ns1.hosting.example.\n", KDB_ZF_SUMMARY, true, KDB_E_TLV_NAME },
+            { "apex, nine NS names", 0, 900, "a.example.\nb.example.\nc.example.\nd.example.\ne.example.\nf.example.\ng.example.\nh.example.\ni.example.", KDB_ZF_SUMMARY, true, KDB_E_TLV_NAME },
+        };
+        for (size_t i = 0; i < sizeof(ac) / sizeof(ac[0]); i++) {
+            kdb_enc_reset(&e);
+            kdb_enc_begin(&e, KDB_T_ZONE_BEGIN);
+            kdb_enc_u16(&e, 1, 1); kdb_enc_name(&e, 2, ZN); kdb_enc_i64(&e, 3, 5); kdb_enc_u8(&e, 4, KDB_ZK_PRIMARY); kdb_enc_u32(&e, 5, 9);
+            kdb_enc_u32(&e, 6, ac[i].flags); kdb_enc_u64(&e, 7, 0); kdb_enc_bytes(&e, 8, zd, sizeof(zd)); kdb_enc_u64(&e, 11, 5);
+            if (ac[i].timers) { kdb_enc_u32(&e, 12, 3600); kdb_enc_u32(&e, 13, 600); kdb_enc_u32(&e, 14, 1209600); }
+            if (ac[i].skip != 15) kdb_enc_name(&e, 15, "ns1.hosting.example.");
+            kdb_enc_name(&e, 16, "host.hosting.example.");
+            kdb_enc_u32(&e, 17, 300); kdb_enc_u32(&e, 18, ac[i].soa_ttl); kdb_enc_u32(&e, 19, 3600);
+            if (ac[i].skip != 20) kdb_enc_bytes(&e, 20, (const uint8_t *)ac[i].ns, strlen(ac[i].ns));
+            kdb_enc_end(&e);
+            sess_t *ts = malloc(sizeof(*ts));
+            sess_init_fetch(ts, NULL);
+            kdb_rc_t trc = sess_feed(ts, e.buf, e.len, 0);
+            CHECK_RC(ac[i].what, trc, ac[i].want);
+            if (ac[i].want == KDB_OK) {
+                const kdb_zone_begin_t *zb = &ts->m.u.zone_begin;
+                CHECK(zb->has_apex && strcmp(zb->soa_mname, "ns1.hosting.example.") == 0 && strcmp(zb->soa_rname, "host.hosting.example.") == 0);
+                CHECK(zb->soa_minimum == 300 && zb->soa_ttl == ac[i].soa_ttl && zb->ns_ttl == 3600 && zb->ns_names_len == strlen(ac[i].ns));
+                CHECK(zb->ns_count == (i == 0 ? 2 : 1) && memcmp(zb->ns_names, ac[i].ns, zb->ns_names_len) == 0);
+            }
+            free(ts);
+        }
+        /* a zone without the tags has no apex */
+        kdb_enc_reset(&e); fz_begin(&e, 1, ZN, 0, KDB_ZF_SUMMARY, KDB_ZK_PRIMARY, 5);
+        sess_t *ts = malloc(sizeof(*ts));
+        sess_init_fetch(ts, NULL);
+        CHECK_RC("summary without an apex", sess_feed(ts, e.buf, e.len, 0), KDB_OK);
+        CHECK(!ts->m.u.zone_begin.has_apex);
+        free(ts);
+    }
     /* summaries: rr_count 0, only a primary, no data afterwards */
     kdb_enc_reset(&e); fz_begin(&e, 1, ZN, 3, KDB_ZF_SUMMARY, KDB_ZK_PRIMARY, 5);
     CHECK_RC("summary with records", fetch_send(KDB_S_READY, &e, why), KDB_E_COUNT);
@@ -1785,6 +1832,17 @@ static int gen_corpus_fetch(const char *dir) {
     fz_begin(&e, 0, "sum.test.", 0, KDB_ZF_SUMMARY | KDB_ZF_PRESIGNED, KDB_ZK_PRIMARY, 12); m_zone_end(&e, 0);
     fz_begin(&e, 2, "sec.test.", 0, 0, KDB_ZK_SECONDARY, 13); m_zone_end(&e, 0);
     fz_failed(&e, 14);
+    {   /* D1a step 6: a summary with its apex (tags 12..20) */
+        uint8_t zd[KDB_DIGEST_LEN] = { 0 };
+        kdb_enc_begin(&e, KDB_T_ZONE_BEGIN);
+        kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "apx.test."); kdb_enc_i64(&e, 3, 7); kdb_enc_u8(&e, 4, KDB_ZK_PRIMARY); kdb_enc_u32(&e, 5, 9);
+        kdb_enc_u32(&e, 6, KDB_ZF_SUMMARY); kdb_enc_u64(&e, 7, 0); kdb_enc_bytes(&e, 8, zd, sizeof(zd)); kdb_enc_u64(&e, 11, 16);
+        kdb_enc_u32(&e, 12, 3600); kdb_enc_u32(&e, 13, 600); kdb_enc_u32(&e, 14, 1209600);
+        kdb_enc_name(&e, 15, "ns1.hosting.example."); kdb_enc_name(&e, 16, "host.hosting.example."); kdb_enc_u32(&e, 17, 300); kdb_enc_u32(&e, 18, 900); kdb_enc_u32(&e, 19, 3600);
+        kdb_enc_bytes(&e, 20, (const uint8_t *)"ns1.hosting.example.\nns2.hosting.example.", 41);
+        kdb_enc_end(&e);
+        m_zone_end(&e, 0);
+    }
     fz_begin(&e, 0, "ab.test.", 3, 0, KDB_ZK_PRIMARY, 15); m_zone_data(&e, 1, 0, 9); m_zone_abort(&e);
     rc |= write_seed(dir, "seed_fetch_stream.bin", 0x88, &e);
     rc |= write_seed(dir, "seed_fetch_stream_install.bin", 0x08, &e);        /* (also through the install run) */
