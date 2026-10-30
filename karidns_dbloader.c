@@ -705,8 +705,10 @@ static void fev_push(const char *view, const char *canon, int64_t source_id, uin
     pthread_mutex_unlock(&g_fev_lock);
 }
 
-/* main thread: what the fetch thread served goes into the inventory (the Backend has these zones in memory, in these versions) */
-static void fev_drain(struct lio *io) {
+/* main thread: what the fetch thread served goes into the inventory (the Backend has these zones in memory, in these versions).  kick: when a zone was served in
+ * another version than the inventory last offered (the database changed while the fetch was on its way, and the Backend took the summary of the newer version
+ * meanwhile), a diff follows, which sends the newer version whole to the zone that is in memory now.  (A diff does not kick itself: it compares anyway.) */
+static void fev_drain(struct lio *io, bool kick) {
     if (atomic_load_explicit(&g_fev_n, memory_order_acquire) == 0) return;
     pthread_mutex_lock(&g_fev_lock);
     fev_t *f = g_fev_head;
@@ -718,6 +720,7 @@ static void fev_drain(struct lio *io) {
         int slot = vslot_find(io, f->view);              /* (a view the CONFIG never named gets no slot from a fetch result) */
         inv_ent_t *ie = slot >= 0 ? inv_get(&io->inv, (uint16_t)slot, f->name) : NULL;
         if (ie) {
+            if (kick && ie->known && !ie->has_pend && (ie->source_id != f->source_id || ie->serial != f->serial)) io->again = true;
             ie->known = true;
             ie->resident = true;
             ie->dirty = false;
@@ -2247,7 +2250,7 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
         if (x->nchg > 1) qsort(x->chg, x->nchg, sizeof(int64_t), cmp_i64);
     }
     uint32_t gen = ++io->gen;
-    fev_drain(io);
+    fev_drain(io, false);
     for (size_t i = 0; i < x->nz; i++) {
         zinfo_t *z = &x->zones[i];
         z->want = false;
@@ -3087,7 +3090,7 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
     case KDB_T_ZONE_RESULT: {
         io->n_results++;
         int zslot = io->idx_slot ? io->idx_slot[m.u.zone_result.view] : -1;
-        fev_drain(io);                               /* (the zones the fetch thread served before this result) */
+        fev_drain(io, true);                         /* (the zones the fetch thread served before this result) */
         inv_ent_t *ie = zslot >= 0 ? inv_find(&io->inv, (uint16_t)zslot, m.u.zone_result.name) : NULL;
         if (ie && ie->has_pend && ie->fev != ie->p_fev && m.u.zone_result.status != KDB_ST_REJECTED && m.u.zone_result.status != KDB_ST_DELETED) {
             /* a fetch of the zone was served while this version was on its way: the Backend has that version, or this one, in an order nobody
@@ -4494,6 +4497,7 @@ static int run_stream(int fd) {
             }
         }
         uint64_t load_req = 0;
+        fev_drain(io, true);                   /* the zones the fetch thread served since the last turn (at most a second ago: the poll below times out) */
         if (io->again) {                       /* D1a: zones the Backend wants whole (SEND_BODY) */
             io->again = false;
             need_load = true;

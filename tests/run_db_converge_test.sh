@@ -8,7 +8,8 @@
 #     are above the high mark of memory-limit: the loader sends its body (it thinks the zone is in memory), the Backend leaves the data out and says so
 #     (NOT_RESIDENT), the loader then sends the summary with the apex, and the SOA question is answered from it without reading the zone.  The apex
 #     that the zone had when it left memory (built from its image) answers the SOA question before that.
-#   - a reload that makes a zone keep an apex (notify no -> notify yes) gives the zones that are out of memory their apex (summary fetch)
+#   - a reload that makes a zone keep an apex (notify no -> notify yes) gives the zones that are out of memory their apex (summary fetch), also while the database
+#     zones are over the hard limit of memory-limit (a summary brings no zone data); a zone that cannot have an apex (nine NS names) is not asked again by the next reload
 #   - the summary answer for an NS RRset that fits the EDNS size of the client and not 512 bytes is the answer of the zone in memory (UDP + EDNS, TCP)
 # Needs root (the loader runs as nobody).  SKIP without karidns, dag, karictl, karidns-dbloader (SQLite3), sqlite3 or perl.
 . "$(dirname "$0")/lib_proc.sh"
@@ -49,20 +50,22 @@ SECRET="dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"
 mkdir "$T/db"
 sqlite3 "$T/db/z.db" < tests/db/pdns_schema.sqlite3.sql > /dev/null
 # e: the zone that is fetched, taken out and changed.  n: no allow-transfer (notify no keeps no apex for it).  l: eight NS targets with long names.
-# big: pinned, about as large as memory-limit 1m, so that the database zones stay above the high mark.  z0000..: fillers.
+# big: pinned, about as large as memory-limit 1m, so that the database zones stay above the high mark.  x: nine NS names, which a summary cannot carry.
+# z0000..: fillers.
 LONGNS=""
 for k in 1 2 3 4 5 6 7 8; do
     lab=$(printf '%055d' 0 | tr 0 "$k")
     LONGNS="$LONGNS INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns$k.$lab.hosting.example', 3600, 0, 0 FROM domains WHERE name = 'l.test';"
 done
 sqlite3 "$T/db/z.db" <<SQL
-INSERT INTO domains (name, type) VALUES ('e.test', 'NATIVE'), ('n.test', 'NATIVE'), ('l.test', 'NATIVE'), ('big.test', 'NATIVE');
+INSERT INTO domains (name, type) VALUES ('e.test', 'NATIVE'), ('n.test', 'NATIVE'), ('l.test', 'NATIVE'), ('big.test', 'NATIVE'), ('x.test', 'NATIVE');
 WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < $((NZ - 1)))
 INSERT INTO domains (name, type) SELECT printf('z%04d.test', i), 'NATIVE' FROM n;
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
   SELECT id, name, 'SOA', 'ns1.hosting.example host.hosting.example 7 3600 600 86400 300', 900, 0, 0 FROM domains;
-INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.hosting.example', 3600, 0, 0 FROM domains WHERE name NOT IN ('l.test', 'e.test');
-INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns2.hosting.example', 3600, 0, 0 FROM domains WHERE name <> 'l.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.hosting.example', 3600, 0, 0 FROM domains WHERE name NOT IN ('l.test', 'e.test', 'x.test');
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns2.hosting.example', 3600, 0, 0 FROM domains WHERE name NOT IN ('l.test', 'x.test');
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT d.id, d.name, 'NS', 'nsx' || k.i || '.hosting.example', 3600, 0, 0 FROM domains d, (SELECT 1 AS i UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) k WHERE d.name = 'x.test';
 -- e: one NS target inside the zone, with an AAAA and an A record (the AAAA first), and one outside every zone
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.e.test', 3600, 0, 0 FROM domains WHERE name = 'e.test';
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns1.e.test', 'AAAA', '2001:db8::5', 600, 0, 0 FROM domains WHERE name = 'e.test';
@@ -87,7 +90,7 @@ conf() {   # conf OPTIONS-LINES DATABASE-LINES
     cat > "$T/k.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT; $1
-    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; fetch-rate 5000; park-timeout 4000; $2 };
+    database { driver sqlite3; database-file "${DBF:-$T/db/z.db}"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; fetch-rate 5000; park-timeout 4000; acl-ceiling { 127.0.0.1; }; $2 };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
 EOF
@@ -105,6 +108,17 @@ oom() { $KCTL dbstatus "$1" 2>/dev/null | grep -q "out of memory"; }       # oom
 q() { ./dag @127.0.0.1 -p "$PORT" "$1" A +short +nohexdump +time=5 +tries=1 2>/dev/null | head -1; }
 probe() { perl tests/db/dns_soa_probe.pl 127.0.0.1 "$PORT" "$@"; }       # probe PROTO NAME QTYPE EDNS DO
 soa_serial() { ./dag @127.0.0.1 -p "$PORT" "$1" SOA +short +noedns +nohexdump +time=5 +tries=1 2>/dev/null | head -1 | awk '{print $3}'; }
+wait_walk() {   # wait_walk WALKS-BEFORE: the walk after a reload ran and is done, and every summary it asked for is answered (sets AS, the number asked for)
+    i=0
+    while [ $i -lt 600 ]; do
+        A=$($KCTL dbstatus 2>/dev/null | grep "^apex:")
+        AS=$(echo "$A" | sed -n 's/.*asked=\([0-9]*\).*/\1/p'); AN=$(echo "$A" | sed -n 's/.*answered=\([0-9]*\).*/\1/p'); AW=$(echo "$A" | sed -n 's/.*walking=\([0-9]*\).*/\1/p'); AK=$(echo "$A" | sed -n 's/.*walks=\([0-9]*\).*/\1/p')
+        [ "${AK:-0}" -gt "$1" ] && [ "$AS" = "${AN:-x}" ] && [ "${AW:-1}" = "0" ] && break
+        sleep 0.2; i=$((i + 1))
+    done
+    echo "  $A"
+}
+walks_now() { $KCTL dbstatus 2>/dev/null | grep "^apex:" | sed -n 's/.*walks=\([0-9]*\).*/\1/p'; }
 wait_oom() {   # wait_oom ZONE SECONDS: the zone's data leaves memory (the cache manager)
     i=0; while [ $i -lt $(($2 * 10)) ] && ! oom "$1"; do sleep 0.1; i=$((i + 1)); done
     oom "$1"
@@ -159,19 +173,59 @@ stop_srv
 echo "== a reload that makes the zones keep an apex gives the zones out of memory theirs"
 conf "notify no;" "memory-limit 64m;"
 start_srv
+W0=$(walks_now)
 conf "" "memory-limit 64m;"
 $KCTL reconfig > /dev/null 2>&1
-i=0
-while [ $i -lt 300 ]; do      # (every zone of the database asks for its summary: wait until the walk is done and every request is answered)
-    A=$($KCTL dbstatus 2>/dev/null | grep "^apex:")
-    AS=$(echo "$A" | sed -n 's/.*asked=\([0-9]*\).*/\1/p'); AN=$(echo "$A" | sed -n 's/.*answered=\([0-9]*\).*/\1/p'); AW=$(echo "$A" | sed -n 's/.*walking=\([0-9]*\).*/\1/p')
-    [ "${AS:-0}" -gt 0 ] && [ "$AS" = "${AN:-x}" ] && [ "${AW:-1}" = "0" ] && break
-    sleep 0.2; i=$((i + 1))
-done
-echo "  $A"
+wait_walk "${W0:-0}"     # (every zone of the database asks for its summary)
+AS1=$AS
+[ "${AS1:-0}" -gt 1000 ] && pass "the walk asked for the summaries of the zones out of memory that have no apex ($AS1)" || fail "the walk asked for $AS1 summaries"
+W1=$(walks_now)
+conf "minimal-responses no;" "memory-limit 64m;"
+$KCTL reconfig > /dev/null 2>&1
+wait_walk "${W1:-0}"
+[ "$AS" = "$AS1" ] && pass "a zone that cannot have an apex (x.test: nine NS names) is not asked again by the next reload (asked $AS1 -> $AS)" || fail "the second walk asked for $((AS - AS1)) more summaries"
 oom n.test && pass "n.test is out of memory" || fail "n.test is not out of memory"
 [ "$(soa_serial n.test)" = "7" ] && oom n.test && pass "n.test (no allow-transfer) was given an apex by the reload (summary fetch): its SOA question does not read it" || fail "n.test SOA: $(soa_serial n.test); out of memory: $(oom n.test && echo yes || echo no)"
 stop_srv
+
+echo "== the same while the database zones are over the hard limit of memory-limit"
+# two big zones that a dynamic UPDATE has changed stay in memory (an UPDATE-pinned zone is never taken out until the database replaces it) and are not counted among the
+# pinned zones, so the database zones are over 110% of the limit for good: the fetches for queries are shed, a summary is not held back
+cp "$T/db/z.db" "$T/db/z2.db"
+sqlite3 "$T/db/z2.db" <<SQL
+INSERT INTO domains (name, type) VALUES ('big2.test', 'NATIVE');
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'SOA', 'ns1.hosting.example host.hosting.example 7 3600 600 86400 300', 900, 0, 0 FROM domains WHERE name = 'big2.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.hosting.example', 3600, 0, 0 FROM domains WHERE name = 'big2.test';
+WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 3999)
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
+  SELECT d.id, printf('h%05d.big2.test', n.i), 'A', '192.0.2.' || (1 + n.i % 250), 300, 0, 0 FROM n, domains d WHERE d.name = 'big2.test';
+DELETE FROM domainmetadata WHERE kind = 'X-KARIDNS-CACHE';
+INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'ALLOW-DNSUPDATE-FROM', '127.0.0.1' FROM domains WHERE name IN ('big.test', 'big2.test');
+SQL
+chown nobody "$T/db/z2.db"*; chmod 600 "$T/db/z2.db"*
+DBF="$T/db/z2.db"
+conf "notify no;" "memory-limit 1m;"
+start_srv
+for z in big.test big2.test; do
+    # (the version the first UPDATE replaced is retired, not freed yet, and counts: a fetch for the second zone is shed with SERVFAIL until it is gone)
+    n=0; got=""
+    while [ $n -lt 30 ]; do
+        got=$(perl tests/db/dns_tcp_probe.pl 127.0.0.1 "$PORT" udp-update $z 2>&1)
+        echo "$got" | grep -q 'rcode=0$' && break
+        sleep 1; n=$((n + 1))
+    done
+    echo "$got" | grep -q 'rcode=0$' || fail "UPDATE of $z: $got"
+done
+LIM=$(stat limit); RES=$(stat resident)
+[ "$RES" -gt $((LIM / 10 * 11)) ] && pass "the zones changed by an UPDATE are over the hard limit ($RES > 110% of $LIM)" || fail "resident $RES is not over 110% of $LIM"
+W0=$(walks_now)
+conf "" "memory-limit 1m;"
+$KCTL reconfig > /dev/null 2>&1
+wait_walk "${W0:-0}"
+[ "${AS:-0}" -gt 1000 ] && pass "the walk finished (walking=0) with $AS summaries asked for and answered, over the hard limit" || fail "the walk asked for $AS summaries"
+[ "$(soa_serial n.test)" = "7" ] && oom n.test && pass "n.test has its apex: the SOA question does not read it" || fail "n.test SOA: $(soa_serial n.test); out of memory: $(oom n.test && echo yes || echo no)"
+stop_srv
+DBF=""
 
 echo "== a summary answer that fits the EDNS size and not 512 bytes"
 conf "" "memory-limit 64m;"

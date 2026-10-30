@@ -545,6 +545,7 @@ enum { ZDIR_ST_ABSENT = 0, ZDIR_ST_RESIDENT, ZDIR_ST_LOADING, ZDIR_ST_ERROR };
 #define ZDIR_F_PARTIAL   0x0020u   /* only part of the zone is resident (reserved for D1b) */
 #define ZDIR_F_EVICT_NEXT 0x0040u  /* take out of memory first (as soon as the queries it was loaded for are answered): a zone that was admitted against the frequency order, or a no-cache zone */
 #define ZDIR_F_WARM      0x0100u   /* the zone is in the ingest thread's list of zones to read before a query asks (pins): once, whatever the number of summaries */
+#define ZDIR_F_NOAPEX    0x0200u   /* D1a step 6: a summary of this version came without an apex (the loader cannot give one: more than 8 NS names, more than 8 addresses for a name, location tags ...): the walk after a reload does not ask again; cleared when the serial changes */
 #define ZDIR_F_BUSY      0x0080u   /* the ingest thread is installing a new version into the zone's entry (dbreg_lookup_entry_busy() .. dbreg_commit() / dbreg_reject()): it is not taken out of memory meanwhile */
 #define ZDIR_F_QUEUED    0x1000u   /* a registry element waiting in the queue of additions */
 #define ZDIR_F_DELETED   0x2000u   /* a registry element that left the registry (waiting to leave the index) */
@@ -956,8 +957,13 @@ int dbreg_delete(const char *view, const char *name, int64_t source_id);
 int snapshot_apply_db_delta(void);
 /* Number of queued changes (cheap, no lock) */
 size_t dbreg_pending_count(void);
+/* The garbage entries of summaries passed their bound (dbreg_pending_count() counts it as one): the publication that drains them is due now, whatever the delta interval says */
+bool dbreg_garbage_due(void);
 
-typedef struct { size_t view, bucket, skip; } dbreg_cursor_t;
+/* A walk over the registry in steps (zero the cursor to start).  The position is an ordinal in a chain, so a zone that left a chain, or a rehash of the tables, since
+ * the last step would make it skip a zone: the cursor remembers the generations and, when one moved, goes back to the start of the chain (a leave) or of the view (a
+ * rehash).  A zone may then be seen twice; a zone that exists all along is seen. */
+typedef struct { size_t view, bucket, skip; uint64_t unlink_gen, grow_gen; bool started; } dbreg_cursor_t;
 /* Walk the registry from *cur; cb returns false to stop (the cursor then points at the zone that was refused).
  * Returns true when the end was reached. */
 typedef bool (*dbreg_walk_cb)(void *ud, const char *view, const dbreg_zone_t *z);
@@ -1028,6 +1034,8 @@ enum { DBREG_SUM_NONE = 0, DBREG_SUM_SAME, DBREG_SUM_DIFFERS };
 /* D1a step 6: give the element of a zone that has no data (same source id) the apex a summary brought (NULL: it brought none, the old one goes).  true: the
  * element took the block (the caller must not free it); false: the block is the caller's. */
 bool dbreg_set_apex(const char *view, const char *zone, int64_t source_id, uint32_t serial, zdir_apex_t *apex);
+/* ... and for a summary that brought no apex tags at all (the loader cannot give one for this version): the walk after a reload does not ask for it again (until the serial changes) */
+void dbreg_note_no_apex(const char *view, const char *zone, int64_t source_id);
 /* The list of zones to read before a query asks (ingest thread): dbreg_warm_mark() puts a zone in it (false: it is there already, or the zone is not a registry zone),
  * dbreg_warm_take() takes it out again: true when it is still worth a read (no data, not deleted, and pinned or without an apex); *whole: the zone is pinned and is
  * read whole, else only its summary (for the apex) is asked for. */

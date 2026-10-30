@@ -539,19 +539,115 @@ int main(void) {
         CHECK(n_notres == (int)cs.cold && n_applied == NY - n_notres);
         CHECK(cs.cold > 0 && cs.cold < NY);                                      /* the first ones fitted under the high mark, the rest came cold */
         int ncold = 0, nin = 0;
-        char coldzone[40] = "";
+        char coldzone[40] = "", firstcold[40] = "", coldz[8][40];
         for (int i = 0; i < NY; i++) {
             snprintf(nm, sizeof(nm), "y%04d.test.", i);
             zdir_elem_t *ye = elem_of("default", nm);
             if (!ye) continue;
             nin++;
             if (!zdir_entry(ye)) {
+                if (ncold < 8) snprintf(coldz[ncold], sizeof(coldz[0]), "%s", nm);
                 ncold++;
                 CHECK(atomic_load(&ye->state) == ZDIR_ST_ABSENT && ye->serial == 1 && ye->digest != NULL);
                 snprintf(coldzone, sizeof(coldzone), "%s", nm);
+                if (!firstcold[0]) snprintf(firstcold, sizeof(firstcold), "%s", nm);
             }
         }
         CHECK(nin == NY && ncold == (int)cs.cold && coldzone[0]);                /* (every zone is in the index, the cold ones without data) */
+
+        /* D1a review 6C: a zone out of memory whose fetch is on its way (LOADING) while the database changes.  The body is left out (NOT_RESIDENT); the summary of the
+         * version the directory has now is applied, with its apex (APPLIED), and no SEND_BODY follows, which sent the body again, left out again, and so on until the
+         * fetch ended (a full zone read and a diff for every turn).  The summary of another version is told to come whole, once. */
+        CHECK(ncold >= 2 && strcmp(firstcold, coldzone) != 0);
+        {
+            /* (the zones the test took out meanwhile are freed by now: the limit is set to what is used, so that a body is left out again) */
+            dbreg_cache_stats(&cs);
+            static server_config_t cfgL;
+            CHECK(parse_named_conf("options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; }; };\n"
+                                   "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", &cfgL) == 0);
+            cfgL.database.memory_limit = cs.resident + cs.retired + 1;
+            atomic_store_explicit(&g_config_db.active, &cfgL, memory_order_release);
+            usleep(1500000);
+            int yi0 = 0;
+            CHECK(sscanf(firstcold, "y%d", &yi0) == 1);
+            CHECK(park_fetch_request(0, "default", firstcold, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, firstcold) == 0);
+            const uint64_t ldreq = m.u.fetch_req.request_id;
+            zdir_elem_t *le = elem_of("default", firstcold);
+            CHECK(le && atomic_load(&le->state) == ZDIR_ST_LOADING && zdir_entry(le) == NULL);
+            kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+            kdb_enc_u64(&e, 1, 9); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
+            kdb_enc_end(&e);
+            ch_send(a[0], &e);
+            send_zone(a[0], &e, 0, firstcold, 2, 0, 50000 + yi0);                  /* the body of the version 2 (the loader thought the zone was in memory) */
+            send_dir_zone(a[0], &e, 0, firstcold, 2, 50000 + yi0, NULL);           /* ... its summary, the version the directory has now */
+            send_dir_zone(a[0], &e, 0, firstcold, 3, 50000 + yi0, NULL);           /* ... and the summary of a version the directory does not have */
+            kdb_enc_begin(&e, KDB_T_BATCH_END);
+            kdb_enc_u64(&e, 1, 9); kdb_enc_u32(&e, 2, 3); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+            kdb_enc_end(&e);
+            ch_send(a[0], &e);
+            int ldst[4] = { -1, -1, -1, -1 }, ldn = 0;
+            while (ch_next(&mainc, &m, 10000) && m.type != KDB_T_BATCH_RESULT)
+                if (m.type == KDB_T_ZONE_RESULT && ldn < 4) ldst[ldn++] = m.u.zone_result.status;
+            printf("  (results: %d: %d %d %d; state %d)\n", ldn, ldst[0], ldst[1], ldst[2], (int)atomic_load(&le->state));
+            CHECK(ldn == 3 && ldst[0] == KDB_ST_NOT_RESIDENT && ldst[1] == KDB_ST_APPLIED && ldst[2] == KDB_ST_SEND_BODY);
+            CHECK(atomic_load(&le->state) == ZDIR_ST_LOADING && le->serial == 2);   /* (the fetch is still on its way; the directory has the version 2) */
+            const zdir_apex_t *lap = atomic_load(&le->apex);
+            CHECK(lap && lap->serial == 2 && lap->n_ns == 2);                       /* (the apex of the summary that was applied) */
+            send_failed(f[0], &e, 0, firstcold, ldreq);                            /* the fetch ends */
+            CHECK(wake_next(&k, 5000) && strcmp(k.zone, firstcold) == 0 && k.failed);
+            CHECK(atomic_load(&le->state) == ZDIR_ST_ABSENT);
+        }
+
+        /* D1a review 6C: a request for the zone and a request for its summary do not stand in for each other.  A summary in flight, then a query for the zone: the
+         * zone is asked for as well; the zone in flight, then a summary for it: no second request (the apex of a zone that leaves memory is made from its image) */
+        CHECK(ncold >= 4);
+        {
+            const char *zs = coldz[1], *zf = coldz[2];
+            int ys = 0, yf = 0;
+            CHECK(sscanf(zs, "y%d", &ys) == 1 && sscanf(zf, "y%d", &yf) == 1);
+            CHECK(park_fetch_request(0, "default", zs, KDB_FETCH_PRIO_QUERY, KDB_FETCH_SUMMARY));
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, zs) == 0 && m.u.fetch_req.mode == KDB_FETCH_SUMMARY);
+            const uint64_t rs = m.u.fetch_req.request_id;
+            CHECK(park_fetch_request(0, "default", zs, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, zs) == 0 && m.u.fetch_req.mode == KDB_FETCH_FULL);
+            const uint64_t rf = m.u.fetch_req.request_id;
+            CHECK(rf != rs);
+            send_summary(f[0], &e, 0, zs, 1, rs, 50000 + ys);
+            CHECK(wake_next(&k, 5000) && strcmp(k.zone, zs) == 0 && !k.failed);   /* (the query that asked for the summary) */
+            send_zone(f[0], &e, 0, zs, 1, rf, 50000 + ys);
+            CHECK(wake_next(&k, 5000) && strcmp(k.zone, zs) == 0 && !k.failed);
+            CHECK(park_fetch_request(0, "default", zf, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, zf) == 0 && m.u.fetch_req.mode == KDB_FETCH_FULL);
+            const uint64_t rf2 = m.u.fetch_req.request_id;
+            CHECK(park_fetch_request(0, "default", zf, KDB_FETCH_PRIO_QUERY, KDB_FETCH_SUMMARY));
+            CHECK(!ch_next(&fetchc, &m, 500));                                     /* (no second request) */
+            send_zone(f[0], &e, 0, zf, 1, rf2, 50000 + yf);
+            CHECK(wake_next(&k, 5000) && strcmp(k.zone, zf) == 0 && !k.failed);
+        }
+
+        /* D1a review 6C: a loader that sends nothing but summaries with a new serial (each replaces the apex block of the zone, and the old one is garbage) makes the
+         * ingest thread publish when the bound is passed, not only when some other change comes: the pending count is back to 0 and no garbage is due */
+        {
+            const char *zg = coldz[3];
+            int yg = 0;
+            CHECK(sscanf(zg, "y%d", &yg) == 1);
+            kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+            kdb_enc_u64(&e, 1, 10); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
+            kdb_enc_end(&e);
+            ch_send(a[0], &e);
+            for (int i = 0; i < 1300; i++) send_dir_zone(a[0], &e, 0, zg, 100 + (uint32_t)i, 50000 + yg, NULL);
+            kdb_enc_begin(&e, KDB_T_BATCH_END);
+            kdb_enc_u64(&e, 1, 10); kdb_enc_u32(&e, 2, 1300); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+            kdb_enc_end(&e);
+            ch_send(a[0], &e);
+            int ngr = 0;
+            while (ch_next(&mainc, &m, 20000) && m.type != KDB_T_BATCH_RESULT) ngr++;
+            CHECK(ngr == 1300 && m.type == KDB_T_BATCH_RESULT);
+            for (int i = 0; i < 60 && (dbreg_pending_count() != 0 || dbreg_garbage_due()); i++) usleep(50000);
+            CHECK(dbreg_pending_count() == 0 && !dbreg_garbage_due());
+            CHECK(elem_of("default", zg) != NULL && elem_of("default", zg)->serial == 100 + 1299);
+        }
 
         /* a cold zone is fetched when a query needs it; loaded while the database zones are at the limit and asked for less than what the manager
          * took out last, it answers the waiting queries and is marked to go first */

@@ -1480,7 +1480,9 @@ static void test_dir_fetch_state(void) {
         CHECK(dbreg_commit_cold("default", "a.test.", 301, 150, dgc, NULL) == 0);
         CHECK(ea->serial == 150 && ea->digest && ea->digest[0] == 2 && atomic_load(&ea->state) == ZDIR_ST_LOADING);
         CHECK(dbreg_fetch_begin("default", "a.test.") == DBREG_FETCH_BUSY);
-        CHECK(dbreg_summary_check("default", "a.test.", 301, 150) == DBREG_SUM_DIFFERS);       /* (the fetch brings a version of its own) */
+        /* (the fetch brings a version of its own: the summary of the version the directory has is applied as it is, another one is told to come whole) */
+        CHECK(dbreg_summary_check("default", "a.test.", 301, 150) == DBREG_SUM_NONE);
+        CHECK(dbreg_summary_check("default", "a.test.", 301, 151) == DBREG_SUM_DIFFERS && dbreg_summary_check("default", "a.test.", 999, 150) == DBREG_SUM_DIFFERS);
         dbreg_fetch_end("default", "a.test.");
         CHECK(atomic_load(&ea->state) == ZDIR_ST_ABSENT && dbreg_summary_check("default", "a.test.", 301, 150) == DBREG_SUM_NONE);
         CHECK(dbreg_commit_cold("default", "a.test.", 301, 151, dgc, NULL) == 0 && ea->serial == 151 && atomic_load(&ea->state) == ZDIR_ST_ABSENT);
@@ -1521,9 +1523,9 @@ static void test_dir_fetch_state(void) {
             zdir_apex_t *ax = calloc(1, sizeof(*ax));
             CHECK(ax && dbreg_set_apex("default", "a.test.", 301, 155 + (uint32_t)i, ax));
         }
-        CHECK(dbreg_pending_count() == 1);                                          /* nothing queued, only the garbage asks for a publication */
+        CHECK(dbreg_pending_count() == 1 && dbreg_garbage_due());                   /* nothing queued, only the garbage asks for a publication, and it is due now */
         zone_db_snapshot_t *gs0 = acquire_retained_zone_snapshot();
-        CHECK(snapshot_apply_db_delta() == 0 && dbreg_pending_count() == 0);
+        CHECK(snapshot_apply_db_delta() == 0 && dbreg_pending_count() == 0 && !dbreg_garbage_due());
         zone_db_snapshot_t *gs1 = acquire_retained_zone_snapshot();
         CHECK(gs1 != gs0);
         release_zone_snapshot(gs0);
@@ -1552,8 +1554,87 @@ static void test_dir_fetch_state(void) {
     dbreg_reset();
 }
 
+/* D1a review 6C: a walk over the registry in steps (dbreg_walk()) does not skip a zone that is there all along, when a zone leaves its chain or the tables are
+ * rehashed between two steps (the position is an ordinal in a chain; the cursor remembers the generations of the registry and goes back). */
+typedef struct { size_t n, taken, stop_after; char name[512][24]; uint32_t hash[512]; } walk_t;
+static bool walk_cb(void *ud, const char *view, const dbreg_zone_t *z) {
+    walk_t *w = ud;
+    (void)view;
+    if (w->taken >= w->stop_after) return false;               /* refuse this zone: the next step starts at it */
+    w->taken++;
+    if (w->n < 512) {
+        snprintf(w->name[w->n], sizeof(w->name[0]), "%s", z->name);
+        w->hash[w->n++] = z->hash;
+    }
+    return true;
+}
+static bool walk_seen(const walk_t *w, const char *name) {
+    for (size_t i = 0; i < w->n; i++)
+        if (strcmp(w->name[i], name) == 0) return true;
+    return false;
+}
+static void test_walk_robust(void) {
+    printf("[TEST] registry walk in steps: a zone that leaves a chain or a rehash between two steps skips no zone...\n");
+    server_config_t *cfg = load_conf("view \"default\" { match-clients { any; }; };\n");
+    rebuild(cfg);
+    char nm[24];
+    for (int i = 0; i < 100; i++) {
+        snprintf(nm, sizeof(nm), "w%03d.test.", i);
+        CHECK(add_zone("default", nm, 1, 1, 7000 + i) != NULL);
+    }
+    walk_t *all = calloc(1, sizeof(*all));
+    dbreg_cursor_t cur;
+    memset(&cur, 0, sizeof(cur));
+    all->stop_after = 100000;
+    CHECK(dbreg_walk(&cur, walk_cb, all) && all->n == 100);
+    /* two zones in a row of one chain (100 zones in 128 chains: there are some), in the order of the chain */
+    size_t b0 = (size_t)-1;
+    for (size_t i = 0; i + 1 < all->n && b0 == (size_t)-1; i++)
+        if ((all->hash[i] & 127) == (all->hash[i + 1] & 127)) b0 = i;
+    CHECK(b0 != (size_t)-1);
+    if (b0 != (size_t)-1) {
+        char c0[24], c1[24];
+        snprintf(c0, sizeof(c0), "%s", all->name[b0]);
+        snprintf(c1, sizeof(c1), "%s", all->name[b0 + 1]);
+        const size_t bucket = all->hash[b0] & 127;
+        /* a zone leaves the chain after the step that visited it: the next step starts at the zone that follows, not at the one after it */
+        walk_t *w = calloc(1, sizeof(*w));
+        memset(&cur, 0, sizeof(cur));
+        cur.bucket = bucket;                                    /* (a walk that is at the start of this chain) */
+        w->stop_after = 1;
+        CHECK(!dbreg_walk(&cur, walk_cb, w) && w->n == 1 && strcmp(w->name[0], c0) == 0);
+        CHECK(dbreg_delete("default", c0, 7000 + atoi(c0 + 1)) == 1);
+        w->taken = 0;
+        CHECK(!dbreg_walk(&cur, walk_cb, w) && w->n == 2 && strcmp(w->name[1], c1) == 0);      /* (not the zone of the next chain: the position was an ordinal) */
+        /* the tables are rehashed after a step: everything is seen by the end */
+        memset(&cur, 0, sizeof(cur));
+        memset(w, 0, sizeof(*w));
+        cur.bucket = bucket;
+        w->stop_after = 1;
+        CHECK(!dbreg_walk(&cur, walk_cb, w) && w->n == 1);
+        for (int i = 100; i < 230; i++) {                        /* 99 + 130 zones: the tables double (128 -> 256) */
+            snprintf(nm, sizeof(nm), "w%03d.test.", i);
+            CHECK(add_zone("default", nm, 1, 1, 7000 + i) != NULL);
+        }
+        w->stop_after = 100000;
+        w->taken = 0;
+        CHECK(dbreg_walk(&cur, walk_cb, w));
+        bool every = true;
+        for (int i = 0; i < 230; i++) {
+            snprintf(nm, sizeof(nm), "w%03d.test.", i);
+            if (i < 100 && strcmp(nm, c0) == 0) continue;        /* (the one that was deleted) */
+            if (!walk_seen(w, nm)) every = false;
+        }
+        CHECK(every);
+        free(w);
+    }
+    free(all);
+    dbreg_reset();
+}
+
 /* A delta changes the directory in place: the new snapshot lists the same directory, and the index is copied only when it has to grow. */
 static void test_dir_delta_in_place(void) {
+
     printf("[TEST] zone directory: a delta changes the directory in place (no copy of the index unless it grows), tombstones are reused...\n");
     server_config_t *cfg = load_conf("view \"default\" { match-clients { any; }; };\n");
     rebuild(cfg);
@@ -1856,6 +1937,7 @@ int main(void) {
     test_glue_dirty_on_delete();
     test_dir_elements();
     test_dir_fetch_state();
+    test_walk_robust();
     test_dir_delta_in_place();
     test_dir_garbage_order();
     test_dir_hidden_and_shared();

@@ -200,10 +200,14 @@ static zdir_garbage_t g_garb;
 
 /* D1a: the garbage entries (zdir_gent_t) that a summary, a cold commit or an apex replacement adds make no delta of their own, so a loader that sends nothing
  * but summaries with a new serial would pile them up until some other change publishes a snapshot (which hands them to it, gc_retire_locked()).  They are
- * counted; at GARB_ENTS_MAX dbreg_pending_count() says "publish", and the publication drains them.  (Entries are small: an apex block is at most ZDIR_APEX_MAX.) */
+ * counted; at GARB_ENTS_MAX dbreg_pending_count() says "publish" and dbreg_garbage_due() says it is due now: the ingest thread publishes after the job that crossed the
+ * bound, not at the pace of the delta interval, and the publication hands the entries to the snapshot it retires.  What can be pending is the bound plus what the jobs
+ * in flight add before the thread looks (a few); entries are small (an apex block is at most ZDIR_APEX_MAX). */
 #define GARB_ENTS_MAX 1024
 static size_t g_garb_n;                        /* under g_zone_db_rebuild_lock */
 static _Atomic bool g_garb_force;
+
+bool dbreg_garbage_due(void) { return atomic_load_explicit(&g_garb_force, memory_order_acquire); }
 
 static void garb_ent_push_locked(zdir_gent_t *gent) {
   gent->next = g_garb.ents;
@@ -1715,6 +1719,9 @@ static dbreg_zone_t *dbreg_find(const dbreg_view_t *rv, const char *name, uint32
     return NULL;
 }
 
+/* The generations of the registry that a walk (dbreg_walk()) looks at: a zone left a chain / the tables were rehashed since the cursor was set. */
+static _Atomic uint64_t g_walk_unlink_gen, g_walk_grow_gen;
+
 static dbreg_zone_t *dbreg_add(dbreg_view_t *rv, const char *name, uint32_t h) {
     if (rv->count >= rv->nb) {
         size_t nnb = rv->nb ? rv->nb * 2 : 64;
@@ -1733,6 +1740,7 @@ static dbreg_zone_t *dbreg_add(dbreg_view_t *rv, const char *name, uint32_t h) {
         free(rv->tab);
         rv->tab = nt;
         rv->nb = nnb;
+        atomic_fetch_add_explicit(&g_walk_grow_gen, 1, memory_order_relaxed);
     }
     size_t l = strlen(name);
     if (l > 255) return NULL;                   /* (klen is a byte; a name has at most 255 characters in text form) */
@@ -1749,7 +1757,14 @@ static dbreg_zone_t *dbreg_add(dbreg_view_t *rv, const char *name, uint32_t h) {
     return z;
 }
 
+/* the serial of the version the element describes changes (the lock is held): what was learnt about the summary of the old one (no apex) is not true of the new one */
+static void zdir_set_serial_locked(dbreg_zone_t *z, uint32_t serial) {
+    if (atomic_load_explicit(&z->serial, memory_order_relaxed) != serial) z->flags &= (uint16_t)~ZDIR_F_NOAPEX;
+    atomic_store_explicit(&z->serial, serial, memory_order_relaxed);
+}
+
 static void dbreg_unlink(dbreg_view_t *rv, dbreg_zone_t *z) {
+    atomic_fetch_add_explicit(&g_walk_unlink_gen, 1, memory_order_relaxed);
     dbreg_zone_t **pp = &rv->tab[z->hash & (rv->nb - 1)];
     while (*pp && *pp != z) pp = &(*pp)->next;
     if (*pp) *pp = z->next;
@@ -1889,7 +1904,8 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
         atomic_fetch_add_explicit(&g_dbreg_pending, 1, memory_order_relaxed);
     }
     z->source_id = source_id;
-    atomic_store_explicit(&z->serial, serial, memory_order_relaxed);
+    zdir_set_serial_locked(z, serial);
+    z->flags &= (uint16_t)~ZDIR_F_NOAPEX;                           /* (the data is here: what was learnt about the summary is no question) */
     memcpy(z->digest, digest, 32);
     z->last_result = DBREG_APPLIED;
     z->shadowed = sh;
@@ -1975,7 +1991,7 @@ int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uin
     uint8_t cm = shared ? shared->ext.cache_mode : 0;
     z->flags = (uint16_t)((z->flags & ~(ZDIR_F_PIN | ZDIR_F_NOCACHE)) | (cm == 1 ? ZDIR_F_PIN : cm == 2 ? ZDIR_F_NOCACHE : 0));
     z->source_id = source_id;
-    atomic_store_explicit(&z->serial, serial, memory_order_relaxed);
+    zdir_set_serial_locked(z, serial);
     memcpy(z->digest, digest, 32);
     z->last_result = DBREG_APPLIED;
     z->shadowed = sh;
@@ -2098,7 +2114,7 @@ bool dbreg_apply_summary(const char *view, const char *zone, int64_t source_id, 
     dbreg_view_t *rv = dbreg_view_get(view, false);
     dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
     if (z && !(z->flags & ZDIR_F_DELETED) && !zdir_entry(z) && z->source_id == source_id) {     /* (a zone in memory is the newer truth) */
-        atomic_store_explicit(&z->serial, serial, memory_order_relaxed);
+        zdir_set_serial_locked(z, serial);
         if (has_timers) {
             /* the same values a zone in memory has: the zone parser takes 0..4294967295 for these fields and parse_ttl_value() (what the
              * install of the data stores) rounds a value with the top bit set down to 2147483647 (RFC 8767 4) */
@@ -2125,7 +2141,10 @@ int dbreg_summary_check(const char *view, const char *zone, int64_t source_id, u
         if (zdir_entry(z))
             rc = (z->source_id == source_id && zdir_serial(z) == serial) ? DBREG_SUM_SAME : DBREG_SUM_DIFFERS;
         else if (atomic_load_explicit(&z->state, memory_order_relaxed) == ZDIR_ST_LOADING)
-            rc = DBREG_SUM_DIFFERS;          /* a fetch is on its way and brings a version nobody can name yet: the loader sends the zone whole */
+            /* A fetch is on its way and brings a version nobody can name yet.  A summary of the version the directory has is applied as it is (it brings the apex;
+             * answering SEND_BODY to it had the body sent, which is left out again - NOT_RESIDENT - and so a summary again, round after round until the fetch ended).
+             * Another version: the loader sends the zone whole, as for a zone that has its data. */
+            rc = (z->source_id == source_id && zdir_serial(z) == serial) ? DBREG_SUM_NONE : DBREG_SUM_DIFFERS;
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     return rc;
@@ -2156,9 +2175,20 @@ bool dbreg_set_apex(const char *view, const char *zone, int64_t source_id, uint3
     if (z && !(z->flags & ZDIR_F_DELETED) && !zdir_entry(z) && z->source_id == source_id) {
         if (apex) apex->serial = serial;
         taken = apex_replace_locked(z, apex) && apex != NULL;
+        if (taken) z->flags &= (uint16_t)~ZDIR_F_NOAPEX;
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     return taken;
+}
+
+/* A summary of this version came without any apex: the loader cannot give one (more than 8 NS names or more than 8 addresses for a name, location tags or tinydns
+ * attributes, no usable SOA, no apex in the driver).  The walk after a reload does not ask for it again until the serial changes. */
+void dbreg_note_no_apex(const char *view, const char *zone, int64_t source_id) {
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    if (z && !(z->flags & ZDIR_F_DELETED) && !zdir_entry(z) && z->source_id == source_id) z->flags |= ZDIR_F_NOAPEX;
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 }
 
 /* ---- D1a step 6 (design 12-12): which zones keep an apex, and the apex of a zone that leaves memory ---- */
@@ -3075,6 +3105,17 @@ int snapshot_apply_db_delta(void) {
 bool dbreg_walk(dbreg_cursor_t *cur, dbreg_walk_cb cb, void *ud) {
     bool done = true;
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    const uint64_t ug = atomic_load_explicit(&g_walk_unlink_gen, memory_order_relaxed), gg = atomic_load_explicit(&g_walk_grow_gen, memory_order_relaxed);
+    if (!cur->started) {
+        cur->started = true;
+    } else if (cur->grow_gen != gg) {            /* the tables were rehashed: the chains are not the ones the position was taken in; the view starts again */
+        cur->bucket = 0;
+        cur->skip = 0;
+    } else if (cur->unlink_gen != ug) {          /* a zone left a chain: the ordinal may be one too far; the chain starts again */
+        cur->skip = 0;
+    }
+    cur->unlink_gen = ug;
+    cur->grow_gen = gg;
     while (done && cur->view < g_dbreg_nviews) {
         const dbreg_view_t *rv = &g_dbreg_views[cur->view];
         while (done && cur->bucket < rv->nb) {
