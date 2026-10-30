@@ -7104,6 +7104,16 @@ static void test_b8t2_settings(void) {
     assert(db_settings_parse("file \"/etc/passwd\";", 19, err, sizeof(err)) == NULL);
     assert(db_settings_parse("include \"/etc/passwd\";", 22, err, sizeof(err)) == NULL);
     assert(db_settings_parse("masters { 192.0.2.1; }; allow-transfer { any; };", 48, err, sizeof(err)) != NULL);   /* parsed, then ignored */
+    {   /* D1a step 5: the `cache` setting (pin / no-cache / auto; the later statement wins; anything else is an error) */
+        static const struct { const char *text; int mode; } k[] = { { "cache pin;", 1 }, { "cache no-cache;", 2 }, { "cache pin; cache auto;", 0 }, { "cache AUTO;", 0 } };
+        for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
+            zone_ext_shared_t *c = db_settings_parse(k[i].text, strlen(k[i].text), err, sizeof(err));
+            assert(c && c->ext.cache_mode == k[i].mode);
+            zone_ext_shared_unref(c);
+        }
+        assert(db_settings_parse("cache forever;", 14, err, sizeof(err)) == NULL);
+        assert(db_settings_parse("cache pin", 9, err, sizeof(err)) == NULL);
+    }
 
     zone_ext_shared_unref(rx);
     free_server_config_fields(&pcfg);

@@ -176,6 +176,24 @@ static void send_zone(int fd, kdb_enc_t *e, uint16_t view, const char *zone, uin
     ch_send(fd, e);
 }
 
+/* a zone of a batch that names a profile (the PROFILE message is the caller's) */
+static void send_zone_p(int fd, kdb_enc_t *e, uint16_t view, const char *zone, uint32_t serial, int64_t sid, const char *profile) {
+    uint8_t dig[KDB_DIGEST_LEN];
+    memset(dig, (int)serial, sizeof(dig));
+    kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
+    kdb_enc_u16(e, 1, view); kdb_enc_name(e, 2, zone); kdb_enc_i64(e, 3, sid); kdb_enc_u8(e, 4, KDB_ZK_PRIMARY);
+    kdb_enc_u32(e, 5, serial); kdb_enc_u32(e, 6, 0); kdb_enc_u64(e, 7, 4); kdb_enc_bytes(e, 8, dig, sizeof(dig));
+    if (profile) kdb_enc_str(e, 10, profile);
+    kdb_enc_end(e);
+    uint8_t msg[2048];
+    size_t n = zone_message(msg, zone, serial);
+    kdb_enc_raw_msg(e, KDB_T_ZONE_DATA, msg, n);
+    kdb_enc_begin(e, KDB_T_ZONE_END);
+    kdb_enc_u64(e, 1, 4);
+    kdb_enc_end(e);
+    ch_send(fd, e);
+}
+
 static void send_summary(int fd, kdb_enc_t *e, uint16_t view, const char *zone, uint32_t serial, uint64_t req, int64_t sid) {
     uint8_t dig[KDB_DIGEST_LEN] = { 0 };
     kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
@@ -302,6 +320,171 @@ int main(void) {
     CHECK(dbreg_lookup_entry("default", "r.test.") != NULL && dbreg_lookup_entry("default", "s.test.") != NULL);
     for (int i = 0; i < 100 && !elem_of("default", "r.test."); i++) usleep(50000);            /* (the view delta runs within a second) */
     CHECK(elem_of("default", "r.test.") != NULL && zdir_entry(elem_of("default", "r.test.")) != NULL);
+
+    /* ======================================================================================================================================
+     * the cache manager (D1a step 5, design 8): memory-limit, GDSF, pins, cold zones, admission.  A second batch brings many zones; the limit is
+     * then set (a configuration with memory-limit, which the manager's thread reads) and the manager takes zones out of memory.
+     * ====================================================================================================================================== */
+    {
+        enum { NZ = 2500, NY = 400 };
+        char nm[40];
+        zone_bytes_t zb0, zb1;
+        zone_bytes_get(ZBYTES_DB, &zb0);
+        kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+        kdb_enc_u64(&e, 1, 2); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
+        kdb_enc_end(&e);
+        ch_send(a[0], &e);
+        kdb_enc_begin(&e, KDB_T_PROFILE);
+        kdb_enc_str(&e, 1, "pinp"); kdb_enc_str(&e, 2, "cache pin;");
+        kdb_enc_end(&e);
+        ch_send(a[0], &e);
+        kdb_enc_begin(&e, KDB_T_PROFILE);
+        kdb_enc_str(&e, 1, "ncp"); kdb_enc_str(&e, 2, "cache no-cache;");
+        kdb_enc_end(&e);
+        ch_send(a[0], &e);
+        send_zone_p(a[0], &e, 0, "pin.test.", 1, 900001, "pinp");
+        send_zone_p(a[0], &e, 0, "nc.test.", 1, 900002, "ncp");
+        for (int i = 0; i < NZ; i++) {
+            snprintf(nm, sizeof(nm), "z%04d.test.", i);
+            send_zone(a[0], &e, 0, nm, 1, 0, 1000 + i);
+        }
+        kdb_enc_begin(&e, KDB_T_BATCH_END);
+        kdb_enc_u64(&e, 1, 2); kdb_enc_u32(&e, 2, NZ + 2); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+        kdb_enc_end(&e);
+        ch_send(a[0], &e);
+        int nres = 0;
+        while (ch_next(&mainc, &m, 10000) && m.type != KDB_T_BATCH_RESULT) nres++;
+        CHECK(nres == NZ + 2 && m.type == KDB_T_BATCH_RESULT);
+        for (int i = 0; i < 100 && !elem_of("default", "z2499.test."); i++) usleep(50000);
+        zone_bytes_get(ZBYTES_DB, &zb1);
+        uint64_t added = zb1.resident - zb0.resident;
+        CHECK(added > 1000000 && dbreg_lookup_entry("default", "z0000.test.") != NULL && dbreg_lookup_entry("default", "pin.test.") != NULL &&
+              dbreg_lookup_entry("default", "nc.test.") != NULL);              /* (no limit: every zone is in memory) */
+        printf("  (%d zones add %llu bytes: %llu per zone)\n", NZ + 2, (unsigned long long)added, (unsigned long long)(added / (NZ + 2)));
+        dbreg_cache_stats_t cs;
+        dbreg_cache_stats(&cs);
+        CHECK(cs.limit == 0 && cs.evictions == 0 && cs.cold == 0);
+
+        /* some zones are asked for (the counters of the entries, as the queries make them): the first ten very often, the next hundred a little */
+        for (int i = 0; i < 110; i++) {
+            snprintf(nm, sizeof(nm), "z%04d.test.", i);
+            zone_db_entry_t *en = dbreg_lookup_entry("default", nm);
+            CHECK(en != NULL);
+            if (en) atomic_store(&en->observatory.queries_total, i < 10 ? 100000 : 40);
+        }
+        /* the limit: 60% of what is in memory.  The manager takes zones out until it is at 90% of the limit */
+        static server_config_t cfgL;
+        CHECK(parse_named_conf("options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; }; };\n"
+                               "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", &cfgL) == 0);
+        uint64_t limit = (zb1.resident + zb1.retired) / 10 * 6;
+        cfgL.database.memory_limit = limit;
+        atomic_store_explicit(&g_config_db.active, &cfgL, memory_order_release);
+        bool settled = false;
+        for (int i = 0; i < 400 && !settled; i++) {
+            usleep(50000);
+            dbreg_cache_stats(&cs);
+            settled = cs.limit == limit && cs.evictions > 0 && cs.inflight == 0 && cs.resident + cs.retired <= limit;
+        }
+        CHECK(settled);
+        dbreg_cache_stats(&cs);
+        printf("  (limit %llu: resident %llu + retired %llu, %llu zones taken out in %llu rounds)\n", (unsigned long long)limit,
+               (unsigned long long)cs.resident, (unsigned long long)cs.retired, (unsigned long long)cs.evictions, (unsigned long long)cs.rounds);
+        CHECK(cs.evictions >= NZ / 4 && cs.resident + cs.retired <= limit && cs.resident + cs.retired >= limit / 10 * 8);   /* (not much more than needed) */
+        int hot_in = 0, mid_in = 0, cold_in = 0;
+        for (int i = 0; i < 10; i++) { snprintf(nm, sizeof(nm), "z%04d.test.", i); hot_in += dbreg_lookup_entry("default", nm) != NULL; }
+        for (int i = 10; i < 110; i++) { snprintf(nm, sizeof(nm), "z%04d.test.", i); mid_in += dbreg_lookup_entry("default", nm) != NULL; }
+        for (int i = 110; i < NZ; i++) { snprintf(nm, sizeof(nm), "z%04d.test.", i); cold_in += dbreg_lookup_entry("default", nm) != NULL; }
+        printf("  (still in memory: %d of 10 hot, %d of 100 mid, %d of %d others)\n", hot_in, mid_in, cold_in, NZ - 110);
+        CHECK(hot_in == 10 && mid_in == 100 && cold_in < NZ - 110);            /* the zones that are asked for stay; the others go first */
+        CHECK(dbreg_lookup_entry("default", "pin.test.") != NULL);              /* pinned: never taken out */
+        CHECK(dbreg_lookup_entry("default", "nc.test.") == NULL);               /* no-cache: out as soon as it is old enough */
+        zdir_elem_t *ne = elem_of("default", "nc.test.");
+        CHECK(ne != NULL && atomic_load(&ne->state) == ZDIR_ST_ABSENT && ne->serial == 1 && ne->digest != NULL);
+        if (dbreg_lookup_entry("default", "r.test.")) CHECK(dbreg_test_evict("default", "r.test."));       /* (the test hook goes through the same eviction) */
+
+        /* zones of a batch while the database zones are above the high mark are not built: cold (the directory has the serial and the digest) */
+        dbreg_cache_test_pause(true);                                           /* (the manager does not run while the zones come) */
+        kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+        kdb_enc_u64(&e, 1, 3); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
+        kdb_enc_end(&e);
+        ch_send(a[0], &e);
+        for (int i = 0; i < NY; i++) {
+            snprintf(nm, sizeof(nm), "y%04d.test.", i);
+            send_zone(a[0], &e, 0, nm, 1, 0, 50000 + i);
+        }
+        kdb_enc_begin(&e, KDB_T_BATCH_END);
+        kdb_enc_u64(&e, 1, 3); kdb_enc_u32(&e, 2, NY); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+        kdb_enc_end(&e);
+        ch_send(a[0], &e);
+        nres = 0;
+        while (ch_next(&mainc, &m, 10000) && m.type != KDB_T_BATCH_RESULT) nres++;
+        CHECK(nres == NY && m.type == KDB_T_BATCH_RESULT);
+        for (int i = 0; i < 100 && !elem_of("default", "y0399.test."); i++) usleep(50000);
+        dbreg_cache_stats(&cs);
+        CHECK(cs.cold > 0 && cs.cold < NY);                                      /* the first ones fitted under the high mark, the rest came cold */
+        int ncold = 0, nin = 0;
+        char coldzone[40] = "";
+        for (int i = 0; i < NY; i++) {
+            snprintf(nm, sizeof(nm), "y%04d.test.", i);
+            zdir_elem_t *ye = elem_of("default", nm);
+            if (!ye) continue;
+            nin++;
+            if (!zdir_entry(ye)) {
+                ncold++;
+                CHECK(atomic_load(&ye->state) == ZDIR_ST_ABSENT && ye->serial == 1 && ye->digest != NULL);
+                snprintf(coldzone, sizeof(coldzone), "%s", nm);
+            }
+        }
+        CHECK(nin == NY && ncold == (int)cs.cold && coldzone[0]);                /* (every zone is in the index, the cold ones without data) */
+
+        /* a cold zone is fetched when a query needs it; loaded while the database zones are at the limit and asked for less than what the manager
+         * took out last, it answers the waiting queries and is marked to go first */
+        dbreg_cache_stats(&cs);
+        limit = cs.resident + cs.retired + 1;
+        static server_config_t cfgM;                                              /* (a configuration of its own: the manager's thread reads the active one) */
+        CHECK(parse_named_conf("options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; }; };\n"
+                               "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", &cfgM) == 0);
+        cfgM.database.memory_limit = limit;                                       /* (0.95 limit < used <= limit: above the high mark, not over the limit) */
+        atomic_store_explicit(&g_config_db.active, &cfgM, memory_order_release);
+        usleep(1500000);                                                          /* (the manager's thread takes the new limit; it is paused) */
+        dbreg_cache_test_set_victim_freq(1000);
+        CHECK(park_fetch_request(0, "default", coldzone, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+        CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, coldzone) == 0);
+        int yi = 0;
+        CHECK(sscanf(coldzone, "y%d", &yi) == 1);
+        send_zone(f[0], &e, 0, coldzone, 1, m.u.fetch_req.request_id, 50000 + yi);
+        CHECK(wake_next(&k, 5000) && strcmp(k.zone, coldzone) == 0 && !k.failed);
+        dbreg_cache_stats_t cs2;
+        dbreg_cache_stats(&cs2);
+        zdir_elem_t *fe = elem_of("default", coldzone);
+        CHECK(zdir_entry(fe) != NULL && (fe->flags & ZDIR_F_EVICT_NEXT) && cs2.marked == cs.marked + 1);
+        dbreg_cache_test_pause(false);
+        bool gone = false;
+        for (int i = 0; i < 300 && !gone; i++) { usleep(50000); gone = zdir_entry(fe) == NULL; }
+        CHECK(gone);                                                              /* (after CACHE_MIN_RESIDENT_MS, whatever the pressure) */
+
+        /* the limit is taken away: everything is as before (nothing is taken out, nothing comes cold) */
+        atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+        for (int i = 0; i < 60 && dbreg_cache_limit() != 0; i++) usleep(50000);
+        for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(50000);
+        CHECK(dbreg_cache_limit() == 0 && dbreg_evict_inflight() == 0);
+        usleep(300000);
+        dbreg_cache_stats(&cs);
+        uint64_t ev_before = cs.evictions;
+        usleep(500000);
+        dbreg_cache_stats(&cs);
+        CHECK(cs.evictions == ev_before);
+        /* r.test. (the hook) and s.test. (asked for least) may be out of memory: the tests that follow start from the two being in memory */
+        static const struct { const char *name; uint32_t serial; int64_t sid; } back[] = { { "r.test.", 5, 11 }, { "s.test.", 6, 12 } };
+        for (int b = 0; b < 2; b++) {
+            if (dbreg_lookup_entry("default", back[b].name)) continue;
+            CHECK(park_fetch_request(0, "default", back[b].name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ);
+            send_zone(f[0], &e, 0, back[b].name, back[b].serial, m.u.fetch_req.request_id, back[b].sid);
+            CHECK(wake_next(&k, 5000) && strcmp(k.zone, back[b].name) == 0 && !k.failed);
+        }
+        CHECK(dbreg_lookup_entry("default", "r.test.") != NULL && dbreg_lookup_entry("default", "s.test.") != NULL);
+    }
 
     /* -- answered at once: a view that takes no database zones, a zone the registry does not know, a zone that is in memory */
     CHECK(park_fetch_request(0, "nosuchview", "z.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));

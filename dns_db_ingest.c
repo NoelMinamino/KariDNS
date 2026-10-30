@@ -52,12 +52,14 @@ _Static_assert(KARIDNS_DB_MAX_VIEWS == KDB_MAX_CONFIG_VIEWS, "the configuration 
 #define RQ_RING 64                /* both rings: more than ING_REQ_MAX, so a ring never fills while the bound holds */
 #define ING_RETIRE_EVERY 1024     /* design 4.3: a blocking grace period every this many published zones */
 #define ING_DELTA_MS 1000         /* design 4.4: new zones become visible at least this often */
+#define ING_DELTA_LIMITED_MS 100  /* with memory-limit: zones taken out of memory are given back once the snapshot that could show them is retired, so the delta is published sooner */
 #define ING_INV_CHUNK 400         /* INVENTORY entries per message */
 #define ING_INV_QUEUE_LOW (256u << 10)
 #define ING_MAX_BUILDERS 16
 #define ING_RBUF 65536
 #define ING_FLUSH_AT 16384        /* queued bytes that are written at once; the rest goes out after the event round */
 #define ING_FETCH_MAX 256         /* fetches in flight (D1a): more is refused, the queries then wait for their own deadline */
+#define ING_FETCH_LIMITED 16      /* fetches in flight while memory-limit is set: each adds to what the cache manager has to take out again */
 /* a fetch the loader has not answered by then is given up (the queries have timed out long before); a variable for the unit test */
 #define STATIC_TEST
 STATIC_TEST int64_t g_ing_fetch_timeout_ms = 30000;
@@ -68,6 +70,7 @@ typedef struct {
   char driver[40];
   uint32_t nviews;
   uint64_t max_zone_records, max_zone_bytes;
+  uint64_t memory_limit;
   uint32_t ingest_threads;
   bool auto_reload;
   uint32_t poll_interval, coalesce_ms;
@@ -98,6 +101,7 @@ typedef struct ing_job {
    * nobody asked for (discarded; the loader may answer a request that was given up) */
   uint64_t fetch_id;
   bool summary, unsolicited, has_timers;
+  bool cold;                             /* D1a step 5: a zone of a batch that is not kept in memory (the limit is reached): serial, digest and settings go into the directory, the data is discarded */
   uint32_t t_refresh, t_retry, t_expire;
 } ing_job_t;
 
@@ -448,6 +452,7 @@ static void fill_snap(const server_config_t *cfg, ing_cfg_t *c) {
     for (const view_config_t *v = cfg->views; v; v = v->next) c->nviews++;
     c->max_zone_records = cfg->database.max_zone_records;
     c->max_zone_bytes = cfg->database.max_zone_bytes;
+    c->memory_limit = cfg->database.memory_limit;
     c->ingest_threads = cfg->database.ingest_threads;
     c->auto_reload = cfg->database.auto_reload;
     c->poll_interval = cfg->database.poll_interval;
@@ -899,6 +904,15 @@ static void job_execute(ing_job_t *j) {
                     : KDB_ST_UNCHANGED;
     return;
   }
+  if (j->cold) {                                         /* D1a step 5: the directory learns the zone; the data is fetched when a query needs it */
+    if (dbreg_commit_cold(j->view_name, j->zone, j->source_id, j->serial, j->digest, j->shared) == 0) {
+      j->status = KDB_ST_APPLIED;
+    } else {
+      job_reject(j, "out of memory registering the zone");
+      (void)dbreg_reject(j->view_name, j->zone, j->source_id, j->reason);
+    }
+    return;
+  }
   if (j->zkind != KDB_ZK_PRIMARY) {
     job_execute_secondary(j);
     return;
@@ -1088,8 +1102,11 @@ static void ing_kick(void) {
   (void)kevent(kq, &t, 1, NULL, 0, NULL);
 }
 
+static _Atomic uint64_t g_fetch_shed;   /* fetch requests not made because of memory-limit */
+static int64_t delta_interval_ms(void) { return dbreg_cache_limit() ? ING_DELTA_LIMITED_MS : ING_DELTA_MS; }
+
 static void maybe_apply_delta(ing_t *g) {
-  if (dbreg_pending_count() > 0 && now_ms() - g->last_delta_ms >= ING_DELTA_MS) apply_delta(g);
+  if (dbreg_pending_count() > 0 && now_ms() - g->last_delta_ms >= delta_interval_ms()) apply_delta(g);
 }
 
 static void drain_results(ing_t *g) {
@@ -1338,7 +1355,8 @@ typedef struct {
 static bool inv_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   inv_ctx_t *c = ud;
   ing_t *g = c->g;
-  if (!zdir_entry(z) || !z->digest) return true;              /* never applied: nothing the loader could skip */
+  bool resident = zdir_entry(z) != NULL;
+  if (!z->digest || (!resident && (z->shadowed || z->source_id == 0))) return true;     /* never applied: nothing the loader could skip */
   /* B6a: a zone whose last version was refused (or could not be read) is offered again by a loader that starts now: it
    * must not find the old version "up to date" and leave the error standing when the data are fixed */
   if (z->last_result == DBREG_REJECTED) return true;
@@ -1355,7 +1373,8 @@ static bool inv_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   if (c->n >= ING_INV_CHUNK) return false;
   if (kdb_enc_nest_begin(&g->enc, 1) != 0 || kdb_enc_u16(&g->enc, 1, idx) != 0 || kdb_enc_name(&g->enc, 2, z->name) != 0 ||
       kdb_enc_i64(&g->enc, 3, z->source_id) != 0 || kdb_enc_u32(&g->enc, 4, z->serial) != 0 ||
-      kdb_enc_bytes(&g->enc, 5, z->digest, KDB_DIGEST_LEN) != 0 || kdb_enc_u8(&g->enc, 6, 1) != 0 || kdb_enc_nest_end(&g->enc) != 0) {
+      (resident && kdb_enc_bytes(&g->enc, 5, z->digest, KDB_DIGEST_LEN) != 0) || kdb_enc_u8(&g->enc, 6, resident ? 1 : 0) != 0 ||
+      kdb_enc_nest_end(&g->enc) != 0) {
     c->bad = true;
     return false;
   }
@@ -1435,6 +1454,15 @@ static void on_batch_begin(ing_t *g, const kdb_msg_t *m) {
   g->last_delta_ms = now_ms();
 }
 
+/* D1a step 5 (design 3.3, 8.3): is this zone of a batch left out of memory?  Only with memory-limit, only when the database zones are above the
+ * high mark of the limit with this zone counted (about 160 bytes a record, what the declared record count says), and not for a zone that was asked
+ * for (a fetch), one that is in memory (its update is installed), one that is pinned, or one in a view that does not take database zones. */
+static bool cache_wants_cold(const ing_job_t *j) {
+  if (!dbreg_cache_limit() || j->fetch_id || (j->shared && j->shared->ext.cache_mode == 1)) return false;
+  if (dbreg_lookup_entry(j->view_name, j->zone)) return false;
+  return dbreg_cache_over_high((uint64_t)j->rr_count * 160u);
+}
+
 /* the job of a ZONE_BEGIN (either stream), with its settings resolved; NULL: out of memory */
 static ing_job_t *job_from_begin(ing_t *g, const kdb_zone_begin_t *zb) {
   ing_job_t *j = calloc(1, sizeof(*j));
@@ -1471,6 +1499,8 @@ static ing_job_t *job_from_begin(ing_t *g, const kdb_zone_begin_t *zb) {
     job_reject(j, "the settings of a primary zone name masters (masters / primaries belong to SLAVE and CONSUMER zones)");
   } else if (zb->zone_kind != KDB_ZK_PRIMARY) {
     j->zkind = zb->zone_kind;                            /* no ZONE_DATA follows (the stream rules, dns_db_stream.c): ZONE_END runs it */
+  } else if (cache_wants_cold(j)) {
+    j->cold = true;                                      /* nothing is built; the data that follows is discarded (job_feed()) */
   } else {
     j->build = db_zone_build_new(j->zone, j->rr_count, zb->flags);
     if (j->build) db_zone_build_set_serial(j->build, zb->serial);
@@ -1494,7 +1524,7 @@ static void on_zone_begin(ing_t *g, const kdb_msg_t *m) {
 
 /* ZONE_DATA of the zone j (either stream) */
 static void job_feed(ing_t *g, ing_job_t *j, const kdb_msg_t *m) {
-  if (!j || j->skip || j->failed) return;
+  if (!j || j->skip || j->failed || j->cold) return;
   if (!j->build) {
     /* I6: ZONE_DATA for a job without a builder (a secondary zone, whose ZONE_BEGIN starts none, or an earlier failure):
      * the stream rules (dns_db_stream.c) refuse it before this point; fail the job rather than feed a NULL builder */
@@ -2271,6 +2301,16 @@ static void fetch_issue(ing_t *g) {
     }
     ing_freq_t *r = fetch_find_zone(g, (uint16_t)vi, q.zone);
     if (r) continue;                                     /* in flight: its answer wakes this worker too */
+    {
+      /* memory-limit (design 8.5): the zones that are fetched add to what the cache manager has to take out again, so with the database zones
+       * above the limit, or too many fetches in flight, the request is not made: the queries get "not ready" now instead of at their deadline */
+      uint64_t lim = dbreg_cache_limit();
+      if (lim && (g->nfreq >= ING_FETCH_LIMITED || dbreg_cache_over_limit())) {
+        atomic_fetch_add_explicit(&g_fetch_shed, 1, memory_order_relaxed);
+        park_wake_broadcast(q.view, q.zone, true);
+        continue;
+      }
+    }
     int st = dbreg_fetch_begin(g->view_names[vi], q.zone);
     if (st == DBREG_FETCH_BUSY) continue;
     if (st != DBREG_FETCH_STARTED) {                     /* in memory already (woken), or not a zone of the registry (answered at once) */
@@ -2475,6 +2515,31 @@ static void fetch_adopt(ing_t *g, int fd) {
   if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);
 }
 
+/* The cache manager (D1a step 5, design 8.2): every 100 ms it reads memory-limit (a reload changes it at once) and, with a limit, runs a round: the
+ * zones with the lowest frequency per byte are taken out of memory when the database zones are above the high mark.  Without a limit it only
+ * looks at the configuration once a second. */
+static void *cache_thread(void *arg) {
+  (void)arg;
+  rcu_aux_thread_pin();
+  for (;;) {
+    ing_cfg_t c;
+    snapshot_cfg(&c);
+    uint64_t lim = c.enabled ? c.memory_limit : 0;
+    dbreg_cache_set_limit(lim);
+    struct timespec ts = { 0, lim ? 50 * 1000000L : 0 };
+    if (!lim) {
+      ts.tv_sec = 1;
+    } else {
+      int64_t t0 = now_ms();
+      uint32_t n = dbreg_cache_round();
+      int64_t dt = now_ms() - t0;
+      if (n || dt > 50) syslog(LOG_DEBUG, "[DB] cache round: %u zone(s) taken out in %lld ms", n, (long long)dt);
+    }
+    nanosleep(&ts, NULL);
+  }
+  return NULL;
+}
+
 static void *ingest_thread(void *arg) {
   ing_t *g = arg;
   rcu_aux_thread_pin();
@@ -2483,7 +2548,7 @@ static void *ingest_thread(void *arg) {
     struct timespec ts, *tp = NULL;
     int64_t wait_ms = -1;
     if (dbreg_pending_count() > 0) {                     /* new zones are waiting to become visible */
-      wait_ms = g->last_delta_ms + ING_DELTA_MS - now_ms();
+      wait_ms = g->last_delta_ms + delta_interval_ms() - now_ms();
       if (wait_ms < 0) wait_ms = 0;
     }
     if (g->nfreq > 0) {                                  /* fetches in flight: look at their deadlines */
@@ -2595,12 +2660,16 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
   if (stream_fd >= 0) adopt_stream(g, stream_fd);
   if (fetch_fd >= 0) fetch_adopt(g, fetch_fd);
   park_fetch_set_notify(g->kq);
+  dbreg_cache_set_limit(snap.memory_limit);              /* before the first batch: the startup load already keeps within it */
   pthread_t t;
   if (pthread_create(&t, NULL, ingest_thread, g) != 0) {
     syslog(LOG_ERR, "[DB] cannot create the ingest thread");
     return false;
   }
   pthread_detach(t);
+  pthread_t ct;
+  if (pthread_create(&ct, NULL, cache_thread, g) != 0) syslog(LOG_ERR, "[DB] cannot create the cache manager thread; memory-limit is not enforced");
+  else pthread_detach(ct);
   atomic_store_explicit(&g_ing_kq, g->kq, memory_order_release);
   return true;
 }
@@ -2867,6 +2936,17 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     st_append(&c, "zone versions and IXFR deltas: database zones %llu bytes resident + %llu retired; other zones %llu resident + %llu retired\n",
               (unsigned long long)zdb.resident, (unsigned long long)zdb.retired, (unsigned long long)zot.resident,
               (unsigned long long)zot.retired);
+    dbreg_cache_stats_t cs;
+    dbreg_cache_stats(&cs);
+    if (cs.limit)
+      st_append(&c, "cache: limit=%llu resident=%llu retired=%llu inflight=%llu evictions=%llu rounds=%llu cold=%llu marked=%llu misses=%llu "
+                    "shed=%llu pinned=%llu peak=%llu victim_freq=%u\n",
+                (unsigned long long)cs.limit, (unsigned long long)cs.resident, (unsigned long long)cs.retired, (unsigned long long)cs.inflight,
+                (unsigned long long)cs.evictions, (unsigned long long)cs.rounds, (unsigned long long)cs.cold, (unsigned long long)cs.marked,
+                (unsigned long long)cs.misses, (unsigned long long)atomic_load_explicit(&g_fetch_shed, memory_order_relaxed),
+                (unsigned long long)cs.pinned_bytes, (unsigned long long)cs.peak, (unsigned)cs.victim_freq);
+    else
+      st_append(&c, "cache: no memory-limit (every database zone stays in memory)\n");
     size_t nel, rbytes, ibytes;
     dbreg_dir_bytes(&nel, &rbytes, &ibytes);
     st_append(&c, "zone directory: %zu elements, %zu bytes in the registry + %zu bytes in the indexes of the views (%zu bytes per zone)\n",

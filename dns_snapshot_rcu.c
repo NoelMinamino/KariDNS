@@ -1639,6 +1639,15 @@ static _Atomic size_t g_dbreg_pending;
 /* the registry was dropped under the snapshot (dbreg_reset(), unit tests): the next full rebuild must read the registry */
 static bool g_dbreg_force_full;
 
+/* D1a step 5 (the cache manager is below): the limit, the admission state, the counters */
+static _Atomic uint64_t g_cache_limit;
+static _Atomic uint32_t g_victim_freq;      /* the highest frequency among the zones the last round took out: a zone that is loaded with a lower one is not kept */
+static _Atomic uint32_t g_evict_next_hint;  /* some element has ZDIR_F_EVICT_NEXT (a scan will find it) */
+static _Atomic uint64_t g_cache_rounds, g_cache_cold, g_cache_marked, g_cache_misses;
+static int64_t cache_mono_ms(void);
+static _Atomic uint64_t g_cache_peak;       /* the most the database zones held (resident + retired) when a zone was installed or a round ran, with a limit set */
+static void cache_peak_note(void);
+
 static dbreg_view_t *dbreg_view_get(const char *name, bool create) {
     size_t n = g_dbreg_nviews;
     if (n && g_dbreg_hint < n && strcasecmp(g_dbreg_views[g_dbreg_hint].name, name) == 0)
@@ -1757,7 +1766,11 @@ static bool dbreg_catalog_member_locked(const char *view, const char *name) {
 static void zdir_elem_sync(zdir_elem_t *z, zone_db_entry_t *entry) {
     zone_version_t *v = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
     const zone_image_t *img = v ? v->image : NULL;
-    uint16_t f = (uint16_t)(z->flags & ~(ZDIR_F_PRESIGNED | ZDIR_F_ALIAS | ZDIR_F_WILDCARD | ZDIR_F_TICK));
+    uint16_t f = (uint16_t)(z->flags & ~(ZDIR_F_PRESIGNED | ZDIR_F_ALIAS | ZDIR_F_WILDCARD | ZDIR_F_TICK | ZDIR_F_PIN | ZDIR_F_NOCACHE));
+    const zone_config_t *dc = entry->source == ZONE_SRC_DB ? atomic_load_explicit(&entry->dbcfg, memory_order_acquire) : NULL;
+    uint8_t cm = dc ? zext(dc)->cache_mode : 0;                    /* the `cache` setting: 1 pin, 2 no-cache (database { memory-limit }) */
+    if (cm == 1) f |= ZDIR_F_PIN;
+    else if (cm == 2) f |= ZDIR_F_NOCACHE | ZDIR_F_EVICT_NEXT;
     if (img) {
         if (img->flags & ZONE_IMAGE_F_ALIAS) f |= ZDIR_F_ALIAS;
         if (img->flags & ZONE_IMAGE_F_WILDCARD) f |= ZDIR_F_WILDCARD;
@@ -1828,13 +1841,96 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
     z->last_result = DBREG_APPLIED;
     z->shadowed = sh;
     z->shadow_by = sh_cfg ? DBREG_SH_CONFIG : sh_cat ? DBREG_SH_CATALOG : DBREG_SH_NONE;
+    if (created) {                                                  /* new data in memory: the cache manager starts counting from here */
+        z->flags &= (uint16_t)~ZDIR_F_EVICT_NEXT;
+        z->qseen = 0;
+        z->t_load = (uint32_t)cache_mono_ms();
+    }
     zdir_elem_sync(z, entry);
+    if (z->flags & ZDIR_F_EVICT_NEXT) atomic_store_explicit(&g_evict_next_hint, 1, memory_order_relaxed);
+    if (created && !fresh && !cur && !(z->flags & (ZDIR_F_PIN | ZDIR_F_NOCACHE)) && dbreg_cache_over_high(0) &&
+        atomic_load_explicit(&z->freq, memory_order_relaxed) < atomic_load_explicit(&g_victim_freq, memory_order_relaxed)) {
+        /* admission (design 8.3): the zone came into memory for the queries that wait for it, but it is asked for less often than the zones that
+         * the cache manager took out last: it answers them, and is the first to go */
+        z->flags |= ZDIR_F_EVICT_NEXT;
+        atomic_store_explicit(&g_evict_next_hint, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_cache_marked, 1, memory_order_relaxed);
+    }
     dbreg_set_error(z, NULL);
     rc = 0;
 out:
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     free(gent);
     if (shadowed) *shadowed = sh;
+    if (created && atomic_load_explicit(&g_cache_limit, memory_order_relaxed)) cache_peak_note();
+    return rc;
+}
+
+/* A zone of a batch that is not kept in memory because the limit is reached (design 3.3, 8.3): the directory element with the serial, the digest and
+ * the settings the loader sent and no data.  The element is queued for the index if it is not in it; the next query for the zone fetches the data.
+ * A zone that has data in memory is left as it is (an element that is resident keeps serving: the caller decided on a stale view). */
+int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uint32_t serial, const uint8_t digest[32], zone_ext_shared_t *shared) {
+    bool sh_cfg = dbreg_config_shadows(view, name);
+    int rc = -1;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    bool sh_cat = !sh_cfg && dbreg_catalog_member_locked(view, name);
+    bool sh = sh_cfg || sh_cat;
+    dbreg_view_t *rv = dbreg_view_get(view, true);
+    if (!rv) goto out;
+    uint32_t h = zdir_name_hash(name);
+    dbreg_zone_t *z = dbreg_find(rv, name, h);
+    bool fresh = false;
+    if (!z) {
+        if (!(z = dbreg_add(rv, name, h))) goto out;
+        fresh = true;
+    }
+    if (zdir_entry(z)) {
+        rc = 0;
+        goto out;
+    }
+    bool in_index = !fresh && zdir_lookup(dbreg_active_dir_locked(view), z->name) == z;
+    bool queue_add = !sh && !in_index && !(z->flags & ZDIR_F_QUEUED);
+    zdir_gent_t *gent = NULL;
+    zone_ext_shared_t *osh = atomic_load_explicit(&z->sh, memory_order_relaxed);
+    uint8_t *new_digest = NULL;
+    if ((osh != shared && !(gent = malloc(sizeof(*gent)))) || (queue_add && !dbreg_queue_reserve(&rv->adds, rv->n_adds, &rv->cap_adds)) ||
+        (!z->digest && !(new_digest = malloc(32)))) {
+        free(gent);
+        if (fresh) {
+            dbreg_unlink(rv, z);
+            free(z);
+        }
+        goto out;
+    }
+    if (new_digest) z->digest = new_digest;
+    if (osh != shared) {                       /* the settings of the zone (its allow-query and `cache` setting are read from them while it is out of memory) */
+        if (shared) zone_ext_shared_ref(shared);
+        atomic_store_explicit(&z->sh, shared, memory_order_release);
+        gent->entry = NULL;
+        gent->sh_old = osh;
+        gent->served = false;
+        gent->next = g_garb.ents;                 /* a reader may hold the old settings: given back with the garbage of the next retired snapshot */
+        g_garb.ents = gent;
+    }
+    if (queue_add) {
+        rv->adds[rv->n_adds++] = z;
+        z->flags |= ZDIR_F_QUEUED;
+        atomic_fetch_add_explicit(&g_dbreg_pending, 1, memory_order_relaxed);
+    }
+    uint8_t cm = shared ? shared->ext.cache_mode : 0;
+    z->flags = (uint16_t)((z->flags & ~(ZDIR_F_PIN | ZDIR_F_NOCACHE)) | (cm == 1 ? ZDIR_F_PIN : cm == 2 ? ZDIR_F_NOCACHE : 0));
+    z->source_id = source_id;
+    z->serial = serial;
+    memcpy(z->digest, digest, 32);
+    z->last_result = DBREG_APPLIED;
+    z->shadowed = sh;
+    z->shadow_by = sh_cfg ? DBREG_SH_CONFIG : sh_cat ? DBREG_SH_CATALOG : DBREG_SH_NONE;
+    atomic_store_explicit(&z->state, ZDIR_ST_ABSENT, memory_order_release);
+    dbreg_set_error(z, NULL);
+    atomic_fetch_add_explicit(&g_cache_cold, 1, memory_order_relaxed);
+    rc = 0;
+out:
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     return rc;
 }
 
@@ -1952,7 +2048,7 @@ void dbreg_set_pending_notify(void (*cb)(void)) { atomic_store_explicit(&g_pendi
  * The entry is not freed here: a reader of the index may hold it, and so may a control command with a retained snapshot.  Its reference goes
  * with the replaced-entry list (rv->repl) to the garbage of the snapshot that the next delta retires, and is given back when that snapshot is
  * drained, exactly as a replaced entry's is.  Until then the version's bytes are in the retired total (not the resident one), and in g_evict_inflight. */
-static __attribute__((unused)) uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {   /* (the cache manager of the next commit uses it; so does the test hook) */
+static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
     zone_db_entry_t *e = zdir_entry(z);
     if (!e || e->source != ZONE_SRC_DB || e->is_secondary || e->is_catalog_member || e->catalog_member_count > 0 || z->shadowed ||
         (z->kind & (ZDIR_K_SHARED | ZDIR_K_STATIC | ZDIR_K_BORROWED)) || (z->flags & (ZDIR_F_PIN | ZDIR_F_DELETED | ZDIR_F_GARB)) ||
@@ -2003,6 +2099,209 @@ static __attribute__((unused)) uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbr
     void (*notify)(void) = atomic_load_explicit(&g_pending_notify, memory_order_acquire);
     if (notify) notify();                              /* the ingest thread publishes the delta (and so retires the entry) */
     return bytes ? bytes : 1;
+}
+
+/* ---- the cache manager's side (design 8.1 - 8.3): the limit, GDSF, admission ---- */
+#define CACHE_MIN_RESIDENT_MS 100    /* a zone is not taken out before the queries it was loaded for have been answered (the worker looks at its wake-ups at every turn of its loop) */
+#define CACHE_HARD_DIV 10            /* no zone is fetched while the database zones are above the limit plus 1/10 of it: the slack that fetches can use */
+#define CACHE_AGE_MS 10000          /* the frequency counters are halved at most this often */
+#define CACHE_HIGH_PCT 95            /* above this many percent of the limit the manager starts to take zones out ... */
+#define CACHE_LOW_PCT 90             /* ... until it is at this many */
+static int64_t g_cache_last_age_ms;
+static int64_t g_cache_last_warn_ms;
+static _Atomic uint64_t g_cache_pinned_bytes;
+
+static int64_t cache_mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void cache_peak_note(void) {
+    zone_bytes_t zb;
+    zone_bytes_get(ZBYTES_DB, &zb);
+    uint64_t u = zb.resident + zb.retired;
+    uint64_t p = atomic_load_explicit(&g_cache_peak, memory_order_relaxed);
+    while (u > p && !atomic_compare_exchange_weak_explicit(&g_cache_peak, &p, u, memory_order_relaxed, memory_order_relaxed)) {}
+}
+
+void dbreg_cache_set_limit(uint64_t limit) { atomic_store_explicit(&g_cache_limit, limit, memory_order_relaxed); }
+uint64_t dbreg_cache_limit(void) { return atomic_load_explicit(&g_cache_limit, memory_order_relaxed); }
+void dbreg_cache_note_miss(void) { atomic_fetch_add_explicit(&g_cache_misses, 1, memory_order_relaxed); }
+
+/* is the memory of the database zones above the point where a zone that is loaded now should not be kept (limit set, used above the high mark)? */
+bool dbreg_cache_over_high(uint64_t extra) {
+    uint64_t lim = atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
+    if (!lim) return false;
+    zone_bytes_t zb;
+    zone_bytes_get(ZBYTES_DB, &zb);
+    return zb.resident + zb.retired + extra > lim / 100 * CACHE_HIGH_PCT;
+}
+
+bool dbreg_cache_over_limit(void) {
+    uint64_t lim = atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
+    if (!lim) return false;
+    zone_bytes_t zb;
+    zone_bytes_get(ZBYTES_DB, &zb);
+    uint64_t pinned_now = atomic_load_explicit(&g_cache_pinned_bytes, memory_order_relaxed);
+    if (pinned_now > lim / 10 * 9) lim = pinned_now + lim / 10;     /* the pinned zones alone fill it: leave room for the others */
+    return zb.resident + zb.retired > lim + lim / CACHE_HARD_DIV;
+}
+
+void dbreg_cache_stats(dbreg_cache_stats_t *o) {
+    zone_bytes_t zb;
+    zone_bytes_get(ZBYTES_DB, &zb);
+    o->limit = atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
+    o->resident = zb.resident;
+    o->retired = zb.retired;
+    o->inflight = dbreg_evict_inflight();
+    o->evictions = atomic_load_explicit(&g_evictions, memory_order_relaxed);
+    o->rounds = atomic_load_explicit(&g_cache_rounds, memory_order_relaxed);
+    o->cold = atomic_load_explicit(&g_cache_cold, memory_order_relaxed);
+    o->marked = atomic_load_explicit(&g_cache_marked, memory_order_relaxed);
+    o->misses = atomic_load_explicit(&g_cache_misses, memory_order_relaxed);
+    o->victim_freq = atomic_load_explicit(&g_victim_freq, memory_order_relaxed);
+    o->pinned_bytes = atomic_load_explicit(&g_cache_pinned_bytes, memory_order_relaxed);
+    o->peak = atomic_load_explicit(&g_cache_peak, memory_order_relaxed);
+}
+
+typedef struct {
+    dbreg_view_t *rv;
+    dbreg_zone_t *z;
+    double prio;                  /* GDSF: the lowest goes first; negative: take out first */
+    uint64_t bytes;
+    uint32_t freq;
+    bool young;                   /* in memory for less than CACHE_MIN_RESIDENT_MS: it is not taken out yet */
+} cache_cand_t;
+
+static int cache_cand_cmp(const void *a, const void *b) {
+    const cache_cand_t *x = a, *y = b;
+    return x->prio < y->prio ? -1 : x->prio > y->prio ? 1 : 0;
+}
+
+/* One round of the cache manager (design 8.2).  Above CACHE_HIGH_PCT of the limit (resident and retired, not yet freed, bytes of the database zones)
+ * it takes zones out of memory until the zones taken out so far would bring it to CACHE_LOW_PCT: the ones whose frequency per byte is lowest
+ * (GDSF: priority = frequency * (read cost) / size, the cost being a fixed part plus a part per byte; the frequency counters are halved every
+ * CACHE_AGE_MS, which is the ageing), the zones marked ZDIR_F_EVICT_NEXT first.  Pinned zones stay; so do zones that came into memory less than
+ * CACHE_MIN_RESIDENT_MS ago.  Bytes of zones that were taken out but whose entries are not freed yet are in the retired total, and are
+ * discounted from what is still to take out.  Returns how many zones were taken out. */
+#ifdef KARIDNS_UNIT_TEST
+static _Atomic bool g_cache_paused;                       /* a test freezes the manager to look at the state between two rounds */
+void dbreg_cache_test_pause(bool on) { atomic_store_explicit(&g_cache_paused, on, memory_order_relaxed); }
+void dbreg_cache_test_set_victim_freq(uint32_t f) { atomic_store_explicit(&g_victim_freq, f, memory_order_relaxed); }
+#endif
+uint32_t dbreg_cache_round(void) {
+    uint64_t limit = atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
+    if (!limit) return 0;
+#ifdef KARIDNS_UNIT_TEST
+    if (atomic_load_explicit(&g_cache_paused, memory_order_relaxed)) return 0;
+#endif
+    zone_bytes_t zb;
+    zone_bytes_get(ZBYTES_DB, &zb);
+    uint64_t used = zb.resident + zb.retired;
+    cache_peak_note();
+    uint64_t inflight = dbreg_evict_inflight();
+    bool pressure = used > limit / 100 * CACHE_HIGH_PCT;
+    uint64_t need = 0;
+    if (pressure) {
+        uint64_t low = limit / 100 * CACHE_LOW_PCT;
+        need = used > low ? used - low : 0;
+        need = need > inflight ? need - inflight : 0;
+    }
+    bool next_pending = atomic_load_explicit(&g_evict_next_hint, memory_order_relaxed) != 0;
+    if (need == 0 && !next_pending) return 0;
+    atomic_fetch_add_explicit(&g_cache_rounds, 1, memory_order_relaxed);
+
+    int64_t now = cache_mono_ms();
+    uint32_t now32 = (uint32_t)now;
+    bool age = now - g_cache_last_age_ms >= CACHE_AGE_MS;
+    cache_cand_t *c = NULL;
+    size_t nc = 0, cap = 0;
+    uint64_t pinned = 0;
+    bool seen_next = false;
+    uint32_t evicted = 0;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    for (size_t v = 0; v < g_dbreg_nviews; v++) {
+        dbreg_view_t *rv = &g_dbreg_views[v];
+        burst_yield_t by = BURST_YIELD_INIT;
+        for (size_t b = 0; b < rv->nb; b++) {
+            for (dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
+                zone_db_entry_t *e = zdir_entry(z);
+                if (!e || e->source != ZONE_SRC_DB || e->evicted_bytes) continue;
+                burst_yield(&by);
+                zone_version_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
+                uint64_t bytes = (a && a->counted) ? a->bytes : 0;
+                /* the frequency: the queries since the last time, plus the halved history (the misses of the time it was out of memory are in it) */
+                uint32_t q32 = (uint32_t)atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed);
+                uint32_t f = atomic_load_explicit(&z->freq, memory_order_relaxed);
+                if (age) f >>= 1;
+                uint32_t dq = q32 - z->qseen;
+                z->qseen = q32;
+                f = f > UINT32_MAX - dq ? UINT32_MAX : f + dq;
+                atomic_store_explicit(&z->freq, f, memory_order_relaxed);
+                if (z->flags & ZDIR_F_PIN) {
+                    pinned += bytes;
+                    continue;
+                }
+                if (z->flags & ZDIR_F_EVICT_NEXT) seen_next = true;
+                if (bytes == 0) continue;
+                if (nc == cap) {
+                    size_t ncap = cap ? cap * 2 : 1024;
+                    cache_cand_t *n = realloc(c, ncap * sizeof(*n));
+                    if (!n) goto scan_done;               /* out of memory: take out what has been found */
+                    c = n;
+                    cap = ncap;
+                }
+                c[nc].rv = rv;
+                c[nc].z = z;
+                c[nc].bytes = bytes;
+                c[nc].freq = f;
+                c[nc].young = now32 - z->t_load < CACHE_MIN_RESIDENT_MS;
+                c[nc].prio = (z->flags & (ZDIR_F_EVICT_NEXT | ZDIR_F_NOCACHE)) ? -1.0
+                                                                                 : ((double)f + 1.0) * (4096.0 + (double)bytes / 4.0) / (double)bytes;
+                nc++;
+            }
+        }
+    }
+scan_done:
+    if (age) g_cache_last_age_ms = now;
+    atomic_store_explicit(&g_cache_pinned_bytes, pinned, memory_order_relaxed);
+    if (nc > 1) qsort(c, nc, sizeof(*c), cache_cand_cmp);
+    uint64_t freed = 0;
+    uint32_t boundary = 0;
+    bool took_unflagged = false;
+    uint64_t young_bytes = 0;              /* the bytes of the unflagged zones seen so far that are only too young to go (they would be taken out before the ones that follow) */
+    for (size_t i = 0; i < nc; i++) {
+        bool flagged = c[i].prio < 0;
+        if (c[i].young) {
+            if (!flagged) young_bytes += c[i].bytes;
+            continue;
+        }
+        if (!flagged && freed >= need) break;
+        /* a zone that is worth more is not taken out while cheaper ones that are only too young to go would cover what is still to be freed: the
+         * round ends here and the next one, when they are old enough, decides (CACHE_MIN_RESIDENT_MS at most).  With few young zones, as under a
+         * steady load, this never holds the round back. */
+        if (!flagged && young_bytes >= need - freed) break;
+        uint64_t got = dbreg_evict_locked(c[i].rv, c[i].z);
+        if (!got) continue;
+        freed += c[i].bytes;
+        evicted++;
+        if (!flagged) {
+            took_unflagged = true;
+            if (c[i].freq > boundary) boundary = c[i].freq;
+        }
+    }
+    if (took_unflagged) atomic_store_explicit(&g_victim_freq, boundary, memory_order_relaxed);
+    if (!seen_next) atomic_store_explicit(&g_evict_next_hint, 0, memory_order_relaxed);
+    bool over_pinned = pinned >= limit && pressure;
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    free(c);
+    if (over_pinned && now - g_cache_last_warn_ms > 60000) {
+        g_cache_last_warn_ms = now;
+        syslog(LOG_WARNING, "[DB] the pinned database zones (%llu bytes) alone exceed memory-limit (%llu); every zone that is not pinned is taken out of memory",
+               (unsigned long long)pinned, (unsigned long long)limit);
+    }
+    return evicted;
 }
 
 uint64_t dbreg_evictions(void) { return atomic_load_explicit(&g_evictions, memory_order_relaxed); }
@@ -2351,7 +2650,7 @@ static bool dplan_db(dplan_t *p, dbreg_view_t *rv, const char *vname) {
     /* additions that are still wanted and not in the index yet */
     for (size_t i = 0; ok && i < rv->n_adds; i++) {
         zdir_elem_t *a = rv->adds[i];
-        if ((a->flags & ZDIR_F_DELETED) || !zdir_entry(a) || a->shadowed || dbreg_find(rv, a->name, a->hash) != a) continue;
+        if ((a->flags & ZDIR_F_DELETED) || (!zdir_entry(a) && atomic_load_explicit(&a->state, memory_order_relaxed) == ZDIR_ST_ERROR) || a->shadowed || dbreg_find(rv, a->name, a->hash) != a) continue;
         zdir_elem_t *ex = zdir_lookup(d, a->name);
         if (ex == a) continue;
         if (ex && !(p->nrem && ptr_in_sorted(p->rem, p->nrem, ex))) {

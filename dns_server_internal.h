@@ -541,6 +541,7 @@ enum { ZDIR_ST_ABSENT = 0, ZDIR_ST_RESIDENT, ZDIR_ST_LOADING, ZDIR_ST_ERROR };
 #define ZDIR_F_PIN       0x0008u   /* never evicted (reserved: set by a later milestone) */
 #define ZDIR_F_NOCACHE   0x0010u   /* never kept resident after an answer (reserved) */
 #define ZDIR_F_PARTIAL   0x0020u   /* only part of the zone is resident (reserved for D1b) */
+#define ZDIR_F_EVICT_NEXT 0x0040u  /* take out of memory first (as soon as the queries it was loaded for are answered): a zone that was admitted against the frequency order, or a no-cache zone */
 #define ZDIR_F_QUEUED    0x1000u   /* a registry element waiting in the queue of additions */
 #define ZDIR_F_DELETED   0x2000u   /* a registry element that left the registry (waiting to leave the index) */
 #define ZDIR_F_TICK      0x4000u   /* the control thread's tick looks at the zone (secondary, catalog member) */
@@ -561,7 +562,8 @@ struct zdir_elem {
   uint32_t refresh, retry, expire;   /* the SOA timers of the version served */
   uint32_t hash;               /* calc_fnv1a_strn(name, klen): the index hash */
   _Atomic uint32_t freq;       /* D1a step 5: how often the zone is asked for (GDSF, cache admission).  Non-resident zone: +1 per query that parks; the cache manager folds the queries of a resident zone in (observatory counter) and halves it at each round */
-  uint32_t gen;                /* generation of the state (reserved: parked queries, a later milestone) */
+  uint32_t qseen;              /* D1a step 5: the zone entry's query counter (low 32 bits) when the cache manager last folded it into freq */
+  uint32_t t_load;             /* D1a step 5: when the data came into memory (ms of a monotonic clock, 32 bits): a zone is not taken out again before its queries are answered */
   _Atomic uint8_t state;       /* ZDIR_ST_*: written under g_zone_db_rebuild_lock, read without it (a worker looks at it before it parks a query) */
   uint8_t last_result;         /* DBREG_APPLIED or DBREG_REJECTED (the last version offered) */
   bool shadowed;               /* a zone of karidns.conf (D-PRIO) or a catalog member (D17-1) with this name hides it: hidden elements are not in the index */
@@ -956,6 +958,28 @@ typedef struct {
 /* The registry records of the zone `name` (any case, with or without the trailing dot) in the view `view` (NULL: every
  * view), at most max of them copied to out.  Returns how many there are. */
 int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int max);
+/* D1a step 5: the cache manager (memory-limit of database { }).  dbreg_cache_round() takes zones out of memory when the database zones hold more
+ * than the high mark of the limit; the ingest thread's cache thread calls it every 100 ms. */
+typedef struct {
+  uint64_t limit, resident, retired, inflight;   /* bytes: the limit (0 = none), the version bytes in memory, replaced / evicted but not freed, evicted but not freed */
+  uint64_t evictions, rounds, cold, marked, misses;
+  uint64_t pinned_bytes, peak;
+  uint32_t victim_freq;
+} dbreg_cache_stats_t;
+void dbreg_cache_set_limit(uint64_t limit);
+uint64_t dbreg_cache_limit(void);
+uint32_t dbreg_cache_round(void);
+void dbreg_cache_stats(dbreg_cache_stats_t *out);
+#ifdef KARIDNS_UNIT_TEST
+void dbreg_cache_test_pause(bool on);                              /* TEST ONLY: the manager does nothing while paused */
+void dbreg_cache_test_set_victim_freq(uint32_t f);                 /* TEST ONLY: the frequency a zone that is loaded now is compared with */
+#endif
+void dbreg_cache_note_miss(void);                                 /* a query had to wait for a zone (the worker) */
+bool dbreg_cache_over_high(uint64_t extra);                        /* would the zone databases be above the high mark with `extra` more bytes? (false without a limit) */
+bool dbreg_cache_over_limit(void);                                 /* are the database zones above the limit itself? */
+/* A zone of a batch that is not kept in memory because the limit is reached: the directory element with the serial and the digest the loader sent,
+ * no data (the next query for it fetches it).  0 on success. */
+int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uint32_t serial, const uint8_t digest[32], zone_ext_shared_t *shared);
 void dbreg_set_pending_notify(void (*cb)(void));                  /* called (lock held) when a change is queued without the ingest thread: it wakes the thread */
 uint64_t dbreg_evictions(void);                                   /* zones evicted since the start */
 uint64_t dbreg_evict_inflight(void);                              /* bytes of evicted zones whose entries are not freed yet (in the retired total) */

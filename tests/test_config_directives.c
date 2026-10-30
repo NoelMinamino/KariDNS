@@ -525,7 +525,7 @@ static void test_database_block(void) {
         "loader-group \"karidns-db\"; loader-path \"/usr/local/libexec/karidns-dbloader\"; "
         "acl-ceiling { 192.0.2.0/24; }; auto-reload yes; poll-interval 5; coalesce 250; default-ttl 600; "
         "bulk-threshold 40; max-zone-records 5000; max-zone-bytes 64M; db-reload-timeout 45; ingest-threads 4; "
-        "loader-threads 8; park-max 2048; park-timeout 800; server-id \"ns1\"; alias-resolver { 192.0.2.53; 2001:db8::53; }; }; };";
+        "loader-threads 8; park-max 2048; park-timeout 800; memory-limit 3g; server-id \"ns1\"; alias-resolver { 192.0.2.53; 2001:db8::53; }; }; };";
     if (parse_ok(full, &cfg)) {
         const database_config_t *d = &cfg.database;
         CHECK(d->enabled);
@@ -539,6 +539,7 @@ static void test_database_block(void) {
         CHECK(d->bulk_threshold == 40 && d->max_zone_records == 5000 && d->max_zone_bytes == 64ull << 20);
         CHECK(d->db_reload_timeout == 45 && d->ingest_threads == 4 && d->loader_threads == 8);
         CHECK(d->park_max == 2048 && d->park_timeout_ms == 800);                      /* D1a milestone 2 */
+        CHECK(d->memory_limit == 3ull << 30);                                         /* D1a step 5 */
         CHECK_STR(d->server_id, "ns1");
         CHECK(d->alias_resolver_count == 2);
         free_server_config_fields(&cfg);
@@ -550,6 +551,7 @@ static void test_database_block(void) {
         CHECK(d->bulk_threshold == 25 && d->max_zone_records == 10000000ull && d->max_zone_bytes == 1ull << 30);
         CHECK(d->db_reload_timeout == 30 && d->ingest_threads == 1 && d->loader_threads == 1);
         CHECK(d->park_max == 0 && d->park_timeout_ms == 0);                          /* (0: the worker's defaults, 1024 and 1500 ms) */
+        CHECK(d->memory_limit == 0);                                                  /* (0: no limit, every database zone stays in memory) */
         CHECK_STR(db_loader_path(&cfg), KARIDNS_DB_DEFAULT_LOADER_PATH);
         free_server_config_fields(&cfg);
     }
@@ -566,6 +568,10 @@ static void test_database_block(void) {
     expect_reject("park-max 65537", DBP "park-max 65537; }; };");
     expect_reject("park-timeout 9", DBP "park-timeout 9; }; };");
     expect_reject("park-timeout 60001", DBP "park-timeout 60001; }; };");
+    expect_reject("memory-limit 0", DBP "memory-limit 0; }; };");
+    expect_reject("memory-limit 512k", DBP "memory-limit 512k; }; };");
+    expect_reject("memory-limit 2t", DBP "memory-limit 2t; }; };");
+    expect_reject("memory-limit abc", DBP "memory-limit abc; }; };");
     expect_reject("max-zone-records 1", DBP "max-zone-records 1; }; };");
     expect_reject("max-zone-bytes 100", DBP "max-zone-bytes 100; }; };");
     expect_reject("max-zone-bytes junk", DBP "max-zone-bytes 1X; }; };");

@@ -410,6 +410,9 @@ typedef struct zone_ext {
    * is what PowerDNS does. --- */
   uint8_t transfer_acl_match;
   uint8_t update_acl_match;
+  /* --- cache (D1a step 5): what the memory limit may do with a database zone: 0 auto (frequency decides), 1 pin (never taken out of memory),
+   * 2 no-cache (taken out of memory as soon as the queries it was loaded for are answered).  The loader writes it from the metadata X-KARIDNS-CACHE. --- */
+  uint8_t cache_mode;
   /* --- set by the code that installs the settings of a DB zone, never by text: the ACLs of this zone also have to pass
    * options { database { acl-ceiling } } (dns_tsig_acl.c) --- */
   bool db_acl_ceiling;
@@ -641,6 +644,7 @@ typedef struct {
   uint32_t loader_threads;     /* 1..16 */
   uint32_t park_max;           /* D1a: queries one worker parks for a zone that is not in memory, 1..65536 (0 = the default, 1024); restart-only */
   uint32_t park_timeout_ms;    /* D1a: how long a parked query waits for the zone, 10..60000 ms (0 = the default, 1500) */
+  uint64_t memory_limit;       /* D1a step 5: bytes the database zones may hold in memory (resident + retired, not freed yet); 0 = no limit, every zone stays resident. 1M..1T */
   char *server_id;             /* postgresql only (B11) */
   char **alias_resolver;       /* stored only (B9a): IP address literals */
   int alias_resolver_count;
@@ -653,6 +657,8 @@ typedef struct {
 #define KARIDNS_DB_RELOAD_TIMEOUT_MAX 3600
 #define KARIDNS_DB_THREADS_MAX 16
 #define KARIDNS_DB_PARK_MAX_MAX 65536
+#define KARIDNS_DB_MEMORY_LIMIT_MIN (1ull << 20)
+#define KARIDNS_DB_MEMORY_LIMIT_MAX (1ull << 40)
 #define KARIDNS_DB_PARK_TIMEOUT_MIN 10
 #define KARIDNS_DB_PARK_TIMEOUT_MAX 60000
 #define KARIDNS_DB_MAX_VIEWS 1024   /* views that take DB zones: the CONFIG message of the loader link lists at most this many (KDB_MAX_CONFIG_VIEWS) */

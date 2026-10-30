@@ -975,6 +975,14 @@ static void test_metadata(void) {
                         "notify-retries 3; notify-retry-backoff exponential; notify-tcp-timeout 25; ixfr-history 8; additional-from-auth in-domain; "
                         "disable-auto-tc-flag yes; zone-udp-bufsize 1232; zone-tcp-window 64k;", 0);
     }
+    {   /* D1a step 5: what the memory limit may do with the zone */
+        db_meta_row_t m1[] = { M("X-KARIDNS-CACHE", "pin") };
+        expect_settings("cache pin", m1, 1, "cache pin;", 0);
+        db_meta_row_t m2[] = { M("X-KARIDNS-CACHE", "No-Cache") };
+        expect_settings("cache no-cache", m2, 1, "cache No-Cache;", 0);
+        db_meta_row_t m3[] = { M("X-KARIDNS-CACHE", "forever") };
+        expect_settings("cache invalid", m3, 1, "", 1);
+    }
     {   /* invalid option values and unknown options are dropped with a warning, never passed on */
         db_meta_row_t m[] = { M("X-KARIDNS-IXFR-HISTORY", "999"), M("X-KARIDNS-IXFR-HISTORY", "4"), M("X-KARIDNS-NOTIFY-RETRIES", "3; allow-update { any; }"),
                               M("X-KARIDNS-FILE", "/etc/passwd"), M("X-KARIDNS-ZONE-UDP-BUFSIZE", "511"), M("X-KARIDNS-ZONE-TCP-MSS", "65496"),

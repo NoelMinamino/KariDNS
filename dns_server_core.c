@@ -2010,6 +2010,7 @@ static bool udp_park(udp_pass_t *w, const view_snapshot_t *view, const zdir_elem
     park_release(w->park, &w->park->e[pi]);            /* the request could not be handed over (ring full): nobody would ever wake it */
     return false;
   }
+  if (!w->woken) dbreg_cache_note_miss();            /* a query that had to wait for its zone (the cache manager counts misses) */
   return true;
 }
 
@@ -2987,6 +2988,7 @@ process_tcp_client: ;
                   pi = -1;
                 }
                 if (pi >= 0) {
+                  if (ctx_tcp->park_deadline_ms == 0) dbreg_cache_note_miss();
                   ctx_tcp->park_deadline_ms = pnow + left;
                   ctx_tcp->resume_len = msg_len;
                   ctx_tcp->parked = true;

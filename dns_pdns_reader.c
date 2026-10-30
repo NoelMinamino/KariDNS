@@ -1081,7 +1081,7 @@ static bool notify_entry(const char *s, char *out, size_t cap) {
 }
 
 /* value of an X-KARIDNS-<option>; on success *out is the text to emit */
-typedef enum { OPT_INT, OPT_INT_SUFFIX, OPT_BACKOFF, OPT_AFA, OPT_BOOL } opt_kind_t;
+typedef enum { OPT_INT, OPT_INT_SUFFIX, OPT_BACKOFF, OPT_AFA, OPT_BOOL, OPT_CACHE } opt_kind_t;
 static const struct { const char *name; opt_kind_t kind; long long lo, hi; } k_options[] = {
     { "notify-retries", OPT_INT, 0, NOTIFY_RETRIES_MAX },
     { "notify-retry-interval", OPT_INT, 1, NOTIFY_RETRY_INTERVAL_MAX },
@@ -1094,6 +1094,7 @@ static const struct { const char *name; opt_kind_t kind; long long lo, hi; } k_o
     { "zone-tcp-mss", OPT_INT, KARIDNS_TCP_MSS_MIN, KARIDNS_TCP_MSS_MAX },
     { "zone-tcp-window", OPT_INT_SUFFIX, KARIDNS_TCP_BUF_MIN, KARIDNS_TCP_BUF_MAX },
     { "zone-tcp-sndbuf", OPT_INT_SUFFIX, KARIDNS_TCP_BUF_MIN, KARIDNS_TCP_BUF_MAX },
+    { "cache", OPT_CACHE, 0, 0 },                      /* D1a step 5: pin | no-cache | auto (the memory limit of database { }) */
 };
 #define N_OPTIONS (sizeof(k_options) / sizeof(k_options[0]))
 
@@ -1123,6 +1124,8 @@ static bool option_value_ok(size_t oi, const char *v) {
     }
     case OPT_BACKOFF:
         return strcasecmp(v, "fixed") == 0 || strcasecmp(v, "exponential") == 0;
+    case OPT_CACHE:
+        return strcasecmp(v, "pin") == 0 || strcasecmp(v, "no-cache") == 0 || strcasecmp(v, "auto") == 0;
     case OPT_AFA:
         if (strcasecmp(v, "in-domain") == 0 || strcasecmp(v, "in-zone") == 0) return true;
         /* fallthrough */

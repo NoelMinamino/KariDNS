@@ -4806,7 +4806,7 @@ static const char *const k_db_zone_statements[] = {
   "allow-transfer", "allow-update", "also-notify", "tsig-key", "notify-retries", "notify-retry-interval",
   "notify-retry-backoff", "notify-tcp-timeout", "ixfr-history", "additional-from-auth", "disable-auto-tc-flag", "zone-udp-bufsize",
   "zone-tcp-mss", "zone-tcp-window", "zone-tcp-sndbuf", "transfer-acl-match", "update-acl-match", "masters", "primaries",
-  "ecs-trusted-resolvers", "alias-resolver", NULL
+  "ecs-trusted-resolvers", "alias-resolver", "cache", NULL
 };
 
 /* The statement `key` is about to be read in restricted mode: refuse it unless it is on the list, and forget what an
@@ -5468,6 +5468,32 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       }
       free_token(&tok);
       x->primary_settings_off = !v;
+    } else if (strcmp(key, "cache") == 0) {
+      /* D1a step 5: pin | no-cache | auto (docs/karidns.md, database { memory-limit }); a zone of karidns.conf is always in memory, so it has no effect there */
+      tok = get_next_token(ctx);
+      int cm = -1;
+      if (tok.type == TOKEN_STRING && tok.value) {
+        if (strcasecmp(tok.value, "auto") == 0) cm = 0;
+        else if (strcasecmp(tok.value, "pin") == 0) cm = 1;
+        else if (strcasecmp(tok.value, "no-cache") == 0) cm = 2;
+      }
+      if (cm < 0) {
+        report_bad_value(ctx, zone->domain, key, tok.type == TOKEN_STRING ? tok.value : "", "auto, pin or no-cache");
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) {
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+      x->cache_mode = (uint8_t)cm;
     } else if (strcmp(key, "transfer-acl-match") == 0 || strcmp(key, "update-acl-match") == 0) {
       /* D14: which kinds of entry of allow-transfer / allow-update have to match (docs/karidns.md) */
       tok = get_next_token(ctx);
@@ -6101,6 +6127,8 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     db->park_timeout_ms = (uint32_t)u;
     return 0;
   }
+  if (strcmp(key, "memory-limit") == 0)       /* K, M, G, T suffixes; unset = no limit (every database zone stays in memory) */
+    return db_take_uint(ctx, key, true, KARIDNS_DB_MEMORY_LIMIT_MIN, KARIDNS_DB_MEMORY_LIMIT_MAX, &db->memory_limit);
   if (strcmp(key, "acl-ceiling") == 0) {
     /* addresses and "key" entries like allow-transfer (see zone_transfer_acl_allows(), dns_tsig_acl.c) */
     free_str_list(db->acl_ceiling, db->acl_ceiling_count);
