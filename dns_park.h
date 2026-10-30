@@ -174,6 +174,8 @@ void park_fetch_set_notify(int kq);
 bool park_fetch_request(int w, const char *view, const char *zone, uint8_t prio, uint8_t mode);
 /* The same for a thread that is not a worker (a transfer thread; any number of them, 16 requests wait at most).  false: no free slot or the names do not fit. */
 bool park_fetch_request_any(const char *view, const char *zone, uint8_t prio, uint8_t mode);
+/* D1a step 8: the query path asks for a zone in the background (g_query_bg_fetch of dns_query_engine.h): one request for a zone in 5 s, priority background. */
+void park_bg_fetch(const char *view, const char *zone);
 /* ingest side: the next request from any worker or from park_fetch_request_any() (round robin), false when there is none */
 bool park_fetch_next(park_fetch_req_t *out);
 

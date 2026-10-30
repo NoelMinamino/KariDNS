@@ -10,6 +10,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
+
+#include "dns_db_stream.h"
 
 #ifdef __FreeBSD__
 #include <sys/types.h>
@@ -391,6 +394,31 @@ bool park_fetch_request_any(const char *view, const char *zone, uint8_t prio, ui
     return true;
   }
   return false;
+}
+
+/* The requests the query path makes in the background (a CNAME or the glue of an NS host leads into a zone that is not in memory): one request for a zone in
+ * PARK_BG_MS, remembered in a small table of hashes (a collision lets a request through or holds one back for a while: no harm), through the slots above.
+ * The ingest thread still decides: no request while the fetch of the zone is on its way, none above the memory limit, the rate of fetches with the half of the
+ * bucket kept for the queries (dns_db_ingest.c). */
+#define PARK_BG_SLOTS 4096
+#define PARK_BG_MS 5000
+static _Atomic uint64_t g_bg_key[PARK_BG_SLOTS];
+static _Atomic int64_t g_bg_at[PARK_BG_SLOTS];
+
+void park_bg_fetch(const char *view, const char *zone) {
+  uint64_t h = 1469598103934665603ULL;
+  for (const char *p = view; *p; p++) h = (h ^ (uint8_t)*p) * 1099511628211ULL;
+  h = (h ^ 0xFF) * 1099511628211ULL;
+  for (const char *p = zone; *p; p++) h = (h ^ (uint8_t)(*p | 0x20)) * 1099511628211ULL;
+  h |= 1;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  int64_t now = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+  size_t i = (size_t)(h % PARK_BG_SLOTS);
+  if (atomic_load_explicit(&g_bg_key[i], memory_order_relaxed) == h && now - atomic_load_explicit(&g_bg_at[i], memory_order_relaxed) < PARK_BG_MS) return;
+  atomic_store_explicit(&g_bg_at[i], now, memory_order_relaxed);
+  atomic_store_explicit(&g_bg_key[i], h, memory_order_relaxed);
+  (void)park_fetch_request_any(view, zone, KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_FULL);
 }
 
 bool park_fetch_next(park_fetch_req_t *out) {

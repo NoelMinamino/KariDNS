@@ -36,6 +36,19 @@ static _Thread_local bool t_resolve_sibling_glue;
 static _Thread_local bool t_resolve_alias_expanded;
 static _Thread_local bool t_resolve_alias_failed;
 
+/* D1a step 8 (design 5): a CNAME / DNAME chain or the glue of an NS / MX / SRV target leads into a zone of the view that is in the directory and whose data
+ * is not in memory.  The answer is what it is without it -- the chain stops there (RFC 1034 4.3.2: the resolver follows it itself) and the sibling's glue is left
+ * out (RFC 9471 3.2: glue is a SHOULD, and "not at hand" is a good reason) -- and is not stored in the response cache; the zone is asked for in the background so
+ * that the next query finds it: the hook hands (view, zone) to the ingest thread (dns_park.c, park_bg_fetch(): the slots of the requests of threads that are not
+ * workers, priority background, one request for a zone in a few seconds, and nothing while a fetch of it is on its way), no I/O and no waiting here.  NULL: no hook
+ * (the engine on its own, a tool). */
+void (*g_query_bg_fetch)(const char *view_name, const char *zone) = NULL;
+static void bg_fetch_nonresident(const view_snapshot_t *view, const zdir_elem_t *pel) {
+  if (!pel || !view || !view->name || !g_query_bg_fetch || zdir_entry(pel)) return;
+  if (atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) != ZDIR_ST_ABSENT) return;     /* (LOADING: on its way; ERROR: nothing to read) */
+  g_query_bg_fetch(view->name, pel->name);
+}
+
 /* allow-query / allow-query-on (BIND 9.20 ARM): what the ACL check needs besides the client address.  The transport sets the address
  * the query came to (query_set_local_addr()) right before it calls process_dns_query*(); the call reads it and clears it, so a caller
  * that does not set it (unit tests, fuzzers) gives "unknown".  t_qacl.key is the TSIG key the request was verified with. */
@@ -385,7 +398,13 @@ STATIC_TEST bool append_glue_records(const zone_image_t *img, const char *target
 
   // 3. Fallback: Search sibling authoritative zones in view dynamically if policy == ADDITIONAL_AUTH_YES
   if (policy == ADDITIONAL_AUTH_YES && sib_ctx && sib_ctx->view) {
-    zone_db_entry_t *sib_entry = find_zone_in_view(sib_ctx->view, target);
+    zdir_elem_t *sib_pel = NULL;
+    zone_db_entry_t *sib_entry = find_zone_for_query_ex(sib_ctx->view, target, 0, &sib_pel);
+    if (!sib_entry && sib_pel) {
+      /* a sibling zone that is in the directory and not in memory (D1a): no glue from it now, the answer is not stored, the zone is asked for in the background */
+      t_resolve_sibling_glue = true;
+      bg_fetch_nonresident(sib_ctx->view, sib_pel);
+    }
     if (sib_entry) {
       zone_version_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
       const zone_image_t *sib = sib_arena ? sib_arena->image : NULL;
@@ -1274,10 +1293,18 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
        * 「QNAME に最も近い祖先のゾーン」を選ぶので、対象が今のゾーンの下でも、同じビューに子ゾーンが
        * あればそちらで答える (以前は親ゾーンに留まり、子への委任を返していた)。DS は R-32 の規則で
        * find_zone_for_query() が親ゾーンを選ぶ。forward/program ゾーンのデータは持たないので CNAME で止める。 */
-      zone_db_entry_t *new_db_entry = find_zone_for_query(view, current_qname, qtypes[0]);
+      zdir_elem_t *new_pel = NULL;
+      zone_db_entry_t *new_db_entry = view ? find_zone_for_query_ex(view, current_qname, qtypes[0], &new_pel) : find_zone_for_query(view, current_qname, qtypes[0]);
       if (!view && domain_name_is_at_or_below(current_qname, db_entry->domain) &&
           !(qtypes[0] == 43 && domain_names_match_ci(current_qname, db_entry->domain)))
         new_db_entry = db_entry; // ビューの無い呼び出し (応答キャッシュの構築など) はこのゾーンだけで続ける
+      if (!new_db_entry && new_pel) {
+        /* the zone the chain leads into is in the directory and not in memory (D1a): the chain stops here, the answer is not stored (the zone may be
+         * resident the next time), and the zone is asked for in the background */
+        t_resolve_crossed_zone = true;
+        bg_fetch_nonresident(view, new_pel);
+        return;
+      }
       if (!new_db_entry || new_db_entry->kind == ZONE_KIND_FORWARD || new_db_entry->kind == ZONE_KIND_PROGRAM)
         return;
       if (new_db_entry != db_entry) {

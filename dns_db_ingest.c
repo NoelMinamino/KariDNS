@@ -2652,7 +2652,8 @@ static void fetch_issue(ing_t *g) {
     g->ftok_ms = tnow;
     /* the queries come first: a summary for the apex (the walk after a reload) takes a token only from a bucket that is more than half full, so that the walk
      * cannot leave the queries without one */
-    if (g->ftokens < 1.0 || (warm && q.mode == KDB_FETCH_SUMMARY && g->ftokens < frate / 2.0)) {
+    /* ... and so does a whole zone that the query path asks for in the background (a CNAME or glue leads into it, D1a step 8): the queries come first */
+    if (g->ftokens < 1.0 || (((warm && q.mode == KDB_FETCH_SUMMARY) || (q.prio == KDB_FETCH_PRIO_BACKGROUND && q.mode == KDB_FETCH_FULL)) && g->ftokens < frate / 2.0)) {
       if (warm) {
         warm_add(g, q.view, q.zone);
         break;

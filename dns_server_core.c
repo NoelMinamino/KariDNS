@@ -1983,6 +1983,9 @@ static bool blackhole_drops(worker_ctx_t *ctx, const void *sa) {
   return drop;
 }
 
+/* D1a step 8: the engine asks for a zone in the background (a CNAME or the glue of an NS host leads into a zone that is not in memory) */
+static void __attribute__((constructor)) bg_fetch_hook_init(void) { g_query_bg_fetch = park_bg_fetch; }
+
 /* ---- D1a milestone 2: parked queries (dns_park.h) ----
  * A query whose zone is in the directory without its data is parked, not answered: the worker asks the db ingest thread to fetch the zone,
  * and answers when the zone is there (a wake-up), or with SERVFAIL + EDE 14 when the time is up or the fetch failed.  Today every zone is in

@@ -103,6 +103,10 @@ int process_dns_not_ready_routed(const uint8_t *req, size_t req_len, uint8_t *re
                                  const rate_limit_config_t **out_rrl_cfg, zone_db_snapshot_t *snap, const query_route_t *route,
                                  const struct zdir_elem *elem, bool probe);
 
+/* D1a step 8: the hook the engine calls (view name, zone name) for a zone that a CNAME chain or the glue of a name server leads into and that is in the directory
+ * without its data: it asks for the zone in the background.  Set by the server (dns_server_core.c); NULL = none. */
+extern void (*g_query_bg_fetch)(const char *view_name, const char *zone);
+
 /* The view of a client by its address alone: a view whose match-clients has a `key` element is evaluated as for an unsigned request. */
 view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip);
 /* The view of a request (BIND bin/named/server.c get_matching_view_sync()): the views are tried in order, and a view whose match-clients has a

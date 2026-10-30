@@ -125,6 +125,58 @@ static size_t build_ixfr(uint8_t *b, uint16_t id, uint32_t serial, bool no_soa) 
     return o;
 }
 
+/* a query for `name` and `qtype` (no EDNS) */
+static size_t build_q(uint8_t *b, uint16_t id, const char *name, uint16_t qtype) {
+    memset(b, 0, 12);
+    b[0] = (uint8_t)(id >> 8); b[1] = (uint8_t)id;
+    b[2] = 0x01;
+    b[5] = 1;
+    size_t o = 12;
+    while (*name) {
+        const char *dot = strchr(name, '.');
+        size_t l = dot ? (size_t)(dot - name) : strlen(name);
+        b[o++] = (uint8_t)l;
+        memcpy(b + o, name, l);
+        o += l;
+        name += l + (dot ? 1 : 0);
+    }
+    b[o++] = 0;
+    b[o++] = (uint8_t)(qtype >> 8); b[o++] = (uint8_t)qtype; b[o++] = 0; b[o++] = 1;
+    return o;
+}
+
+/* the types of the RRs of a response, section by section (answer, authority, additional); returns how many */
+static int rr_types(const uint8_t *m, size_t len, uint16_t t[3][8], int cnt[3]) {
+    cnt[0] = cnt[1] = cnt[2] = 0;
+    size_t o = 12;
+    for (int q = (m[4] << 8) | m[5]; q > 0 && o < len; q--) {
+        while (o < len && m[o] != 0) o += 1 + m[o];
+        o += 5;
+    }
+    int counts[3] = { (m[6] << 8) | m[7], (m[8] << 8) | m[9], (m[10] << 8) | m[11] };
+    for (int s = 0; s < 3; s++) {
+        for (int r = 0; r < counts[s] && o + 11 <= len; r++) {
+            size_t nl = 0;
+            if (m[o] == 0) nl = 1;
+            else if ((m[o] & 0xC0) == 0xC0) nl = 2;
+            else { while (o + nl < len && m[o + nl] != 0) nl += 1 + m[o + nl]; nl++; }
+            uint16_t type = (uint16_t)((m[o + nl] << 8) | m[o + nl + 1]);
+            size_t rdlen = (size_t)((m[o + nl + 8] << 8) | m[o + nl + 9]);
+            if (cnt[s] < 8) t[s][cnt[s]++] = type;
+            o += nl + 10 + rdlen;
+        }
+    }
+    return cnt[0] + cnt[1] + cnt[2];
+}
+
+static int g_bg_calls;
+static char g_bg_view[64], g_bg_zone[256];
+static void test_bg_hook(const char *view, const char *zone) {
+    g_bg_calls++;
+    snprintf(g_bg_view, sizeof(g_bg_view), "%s", view);
+    snprintf(g_bg_zone, sizeof(g_bg_zone), "%s", zone);
+}
+
 static void mk_ipc(udp_ipc_t *i, int tag, size_t len) {
     memset(i, 0, sizeof(*i));
     i->sock_fd_idx = tag;
@@ -708,6 +760,100 @@ int main(void) {
         atomic_store(&el->entry, NULL);
         atomic_store(&el->state, ZDIR_ST_ABSENT);
         #undef IXQ
+    }
+
+    /* -- D1a step 8 (design 5): a CNAME chain and the glue of a name server lead into a zone of the view that is in the directory and not in memory.  The answer
+     *    is what it is without it (the chain stops at the CNAME: RFC 1034 4.3.2; no glue: RFC 9471 3.2) and the zone is asked for in the background once, through
+     *    the hook of the engine (no waiting, no I/O); a zone that is in memory (or not in the directory) asks for nothing; the chain is whole when the zone is back */
+    {
+        char xz[300], oz[300], confb[1800];
+        snprintf(xz, sizeof(xz), "%s/x.test.zone", dir);
+        snprintf(oz, sizeof(oz), "%s/other.test.zone", dir);
+        FILE *fx = fopen(xz, "w");
+        CHECK(fx != NULL);
+        fputs("$ORIGIN x.test.\n$TTL 300\n@ IN SOA ns.x.test. h.x.test. 1 7200 3600 1209600 300\n@ IN NS ns1.other.test.\ncn IN CNAME h.other.test.\next IN CNAME h.unknown.example.\n", fx);
+        fclose(fx);
+        FILE *fo = fopen(oz, "w");
+        CHECK(fo != NULL);
+        fputs("$ORIGIN other.test.\n$TTL 300\n@ IN SOA ns1.other.test. h.other.test. 1 7200 3600 1209600 300\n@ IN NS ns1.other.test.\nns1 IN A 192.0.2.53\nh IN A 192.0.2.99\n", fo);
+        fclose(fo);
+        snprintf(confb, sizeof(confb), "options { directory \"%s\"; };\nview \"default\" { match-clients { any; }; zone \"x.test\" { type master; file \"%s\"; }; "
+                 "zone \"other.test\" { type master; file \"%s\"; }; };\n", dir, xz, oz);
+        static server_config_t cfgB;
+        CHECK(parse_named_conf(confb, &cfgB) == 0);
+        cfgB.send_extended_errors = true;
+        atomic_store_explicit(&g_config_db.active, &cfgB, memory_order_release);
+        rebuild_zone_db_from_config(&cfgB, false);
+        zone_db_snapshot_t *snb = acquire_retained_zone_snapshot();
+        zdir_elem_t *oel = zdir_find_exact(snapshot_find_view(snb, "default"), "other.test.");
+        release_zone_snapshot(snb);
+        CHECK(oel != NULL && zdir_entry(oel) != NULL);
+        zone_db_entry_t *oentry = zdir_entry(oel);
+        void (*old_hook)(const char *, const char *) = g_query_bg_fetch;
+        g_query_bg_fetch = test_bg_hook;
+        #define ASK(name, qt, out, outlen) do { uint8_t qb_[512]; size_t ql_ = build_q(qb_, 0x7901, (name), (qt)); \
+            rcu_reader_enter(&wctx); zone_db_snapshot_t *sn_ = acquire_zone_snapshot(); \
+            (outlen) = process_dns_query_cap(qb_, ql_, (out), 1232, 0, (name), (qt), "127.0.0.1", &cc, false, NULL, sn_); \
+            rcu_reader_exit(&wctx); } while (0)
+        uint8_t rb[4096];
+        int rl;
+        uint16_t ty[3][8];
+        int cn[3];
+        /* the zone is in memory: the whole chain, nothing asked for */
+        g_bg_calls = 0;
+        ASK("cn.x.test", 1, rb, rl);
+        rr_types(rb, (size_t)rl, ty, cn);
+        CHECK(rl > 12 && cn[0] == 2 && ty[0][0] == 5 && ty[0][1] == 1 && g_bg_calls == 0);
+        ASK("x.test", 2, rb, rl);
+        rr_types(rb, (size_t)rl, ty, cn);
+        CHECK(cn[0] == 1 && ty[0][0] == 2 && cn[2] == 1 && ty[2][0] == 1 && g_bg_calls == 0);            /* (the NS with its glue from the sibling) */
+        /* the zone is out of memory */
+        atomic_store(&oel->entry, NULL);
+        atomic_store(&oel->state, ZDIR_ST_ABSENT);
+        ASK("cn.x.test", 1, rb, rl);
+        rr_types(rb, (size_t)rl, ty, cn);
+        CHECK(rl > 12 && (rb[3] & 0x0F) == 0 && cn[0] == 1 && ty[0][0] == 5);                            /* the CNAME alone */
+        CHECK(g_bg_calls == 1 && strcmp(g_bg_view, "default") == 0 && strcmp(g_bg_zone, "other.test.") == 0);
+        ASK("x.test", 2, rb, rl);
+        rr_types(rb, (size_t)rl, ty, cn);
+        CHECK(cn[0] == 1 && ty[0][0] == 2 && cn[2] == 0 && g_bg_calls == 2);                             /* the NS without its glue */
+        ASK("ext.x.test", 1, rb, rl);
+        rr_types(rb, (size_t)rl, ty, cn);
+        CHECK(cn[0] == 1 && ty[0][0] == 5 && g_bg_calls == 2);                                            /* (a chain out of every zone of the view asks for nothing) */
+        /* a fetch is on its way (LOADING) or the zone has no usable version (ERROR): not asked for */
+        atomic_store(&oel->state, ZDIR_ST_LOADING);
+        ASK("cn.x.test", 1, rb, rl);
+        atomic_store(&oel->state, ZDIR_ST_ERROR);
+        ASK("cn.x.test", 1, rb, rl);
+        CHECK(g_bg_calls == 2);
+        /* the zone is back: the whole chain, the glue */
+        atomic_store(&oel->state, ZDIR_ST_RESIDENT);
+        atomic_store(&oel->entry, oentry);
+        ASK("cn.x.test", 1, rb, rl);
+        rr_types(rb, (size_t)rl, ty, cn);
+        CHECK(cn[0] == 2 && ty[0][0] == 5 && ty[0][1] == 1 && g_bg_calls == 2);
+        ASK("x.test", 2, rb, rl);
+        rr_types(rb, (size_t)rl, ty, cn);
+        CHECK(cn[0] == 1 && cn[2] == 1 && g_bg_calls == 2);
+        /* without a hook (the engine on its own) the partial answer is the same and nothing is asked */
+        atomic_store(&oel->entry, NULL);
+        atomic_store(&oel->state, ZDIR_ST_ABSENT);
+        g_query_bg_fetch = NULL;
+        ASK("cn.x.test", 1, rb, rl);
+        rr_types(rb, (size_t)rl, ty, cn);
+        CHECK(cn[0] == 1 && g_bg_calls == 2);
+        atomic_store(&oel->state, ZDIR_ST_RESIDENT);
+        atomic_store(&oel->entry, oentry);
+        g_query_bg_fetch = old_hook;
+        #undef ASK
+        atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+        rebuild_zone_db_from_config(&cfg, false);
+        el = the_elem();
+        entry = zdir_entry(el);
+        atomic_store(&el->entry, NULL);
+        atomic_store(&el->state, ZDIR_ST_ABSENT);
+        unlink(xz);
+        unlink(oz);
     }
 
     /* -- nothing is parked and nobody said anything: park_service() returns at once (and with a key in the ring it does look) */
