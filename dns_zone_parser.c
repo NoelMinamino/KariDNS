@@ -1,4 +1,5 @@
 #include "dns_zone_parser.h"
+#include "dns_zone_image.h"
 #include "dns_utils.h"
 #include <ctype.h>
 
@@ -102,6 +103,7 @@ void *arena_alloc(zone_arena_t *arena, size_t size) {
     arena->data_pools[arena->data_pool_count] = malloc(arena->current_pool_cap);
     if (!arena->data_pools[arena->data_pool_count])
       return NULL;
+    arena->pool_bytes += arena->current_pool_cap;
     aligned_idx = 0;
     arena->data_pool_count++;
   }
@@ -2213,6 +2215,7 @@ void zone_arena_free_builder(zone_arena_t *arena) {
   arena->data_pools = NULL;
   arena->data_pool_count = 0;
   arena->data_pool_cap = 0;
+  arena->pool_bytes = 0;
   arena->current_pool_cap = 0;
   arena->current_pool_idx = 0;
   free(arena->hash_table);
@@ -2260,6 +2263,7 @@ zone_version_t *zone_version_new(zone_arena_t *builder) {
   if (!v) return NULL;
   v->image = builder->image;
   v->heap = true;
+  v->bytes = sizeof(*v) + (v->image ? v->image->total_size : 0);   /* D1a (8.1): recorded when the image is frozen into a version */
   builder->image = NULL;
   return v;
 }

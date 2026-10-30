@@ -301,6 +301,8 @@ typedef struct {
   dns_record_t *added;
   int added_count;
   _Atomic int ref_count;
+  size_t bytes;       /* D1a (8.1): what the difference holds; counted in the zone memory totals while it is in a history (acct) */
+  int8_t acct;        /* 0 = not counted, else 1 + the ZBYTES_* class it was counted in */
   zone_arena_t arena;
 } ixfr_txn_t;
 
@@ -479,6 +481,112 @@ static inline uint32_t zone_expire_option_value(zone_db_entry_t *e, time_t now) 
   return (left > (time_t)expire && expire > 0) ? expire : (uint32_t)left;
 }
 
+/* ---- The zone directory (D1a, design 3.1, 3.2) ----
+ * Every view has one directory: the list of the zones it can answer for, one element per zone name.  An element is the
+ * DB zone registry's record of a zone (dbreg_zone_t is the same type), and the zones that do not come from the database
+ * (zone { } blocks, catalog members, zones shared with another view by `in-view`) have elements too, as directory-owned,
+ * always resident ones, so one index serves all of them.  The index of a view (find_zone_in_view() and its relatives) is an
+ * open-addressing table of element pointers (zdir_tab_t); it is looked at without a lock, in an RCU read section or on a
+ * retained snapshot, and changed in place by the writers (the ingest threads, a rebuild of the snapshot), who hold
+ * g_zone_db_rebuild_lock and publish a new snapshot (a thin copy: names, match-clients and a reference of each directory)
+ * after every change.  A directory is shared by the snapshots that follow each other until the configuration changes the
+ * set of zones; a rebuild of that kind builds new directories.
+ *
+ * What a reader may rely on: a pointer it got from a lookup (an element, an entry) stays valid until it leaves its read
+ * section or releases its retained snapshot.  What a writer takes out of an index (an element, a table that was replaced by a
+ * bigger one, a tick list, a reference of an entry) goes on the garbage list of the snapshot that is retired by the next
+ * publish, and is released when that snapshot and every older one are drained (see gc_snapshot_thread()).
+ *
+ * The entry of an element is read with zdir_entry().  In this milestone every element is resident, so it is never NULL
+ * for an element a lookup returned; a later milestone returns elements whose zone is not in memory, and then NULL. */
+typedef struct zdir_elem zdir_elem_t;
+typedef struct zdir_tab zdir_tab_t;
+typedef struct zdir_tick zdir_tick_t;
+typedef struct zdir zdir_t;
+
+/* zdir_elem_t.state */
+enum { ZDIR_ST_ABSENT = 0, ZDIR_ST_RESIDENT, ZDIR_ST_LOADING, ZDIR_ST_ERROR };
+/* zdir_elem_t.flags */
+#define ZDIR_F_PRESIGNED 0x0001u   /* the image holds a DNSSEC chain (NSEC / NSEC3): a presigned zone */
+#define ZDIR_F_ALIAS     0x0002u   /* the image has an ALIAS RRset */
+#define ZDIR_F_WILDCARD  0x0004u   /* the image has a wildcard owner */
+#define ZDIR_F_PIN       0x0008u   /* never evicted (reserved: set by a later milestone) */
+#define ZDIR_F_NOCACHE   0x0010u   /* never kept resident after an answer (reserved) */
+#define ZDIR_F_PARTIAL   0x0020u   /* only part of the zone is resident (reserved for D1b) */
+#define ZDIR_F_QUEUED    0x1000u   /* a registry element waiting in the queue of additions */
+#define ZDIR_F_DELETED   0x2000u   /* a registry element that left the registry (waiting to leave the index) */
+#define ZDIR_F_TICK      0x4000u   /* the control thread's tick looks at the zone (secondary, catalog member) */
+/* (flags are changed under g_zone_db_rebuild_lock; a reader that needs one while a writer may change it reads it with an atomic load of
+ * the whole word, a later milestone's job.  What a reader looks at today is in `kind`, which never changes.) */
+/* zdir_elem_t.kind: what the element is, fixed when it is made (readers look at it without a lock) */
+#define ZDIR_K_OWNED     0x01u     /* owned by the directory it is in (not by the registry): released with it */
+#define ZDIR_K_STATIC    0x02u     /* the zone of a zone { } block of karidns.conf */
+#define ZDIR_K_SHARED    0x04u     /* a zone shared from another view by `in-view`: the entry is the owner view's */
+#define ZDIR_K_BORROWED  0x08u     /* the element holds no reference of its entry (unit tests, fuzzers) */
+
+struct zdir_elem {
+  struct zdir_elem *next;      /* the registry's hash chain; once the element is on a garbage list, that list */
+  _Atomic(zone_db_entry_t *) entry;   /* the entry that answers for the name (RCU-published); the element holds a reference */
+  char *error;                 /* last rejection / loader error, malloc; NULL = none */
+  int64_t source_id;           /* DB: the domain id of the zone; directory-owned elements: the listing order */
+  uint32_t serial;             /* DB: the serial of the version offered last (the SOA of the entry for a secondary) */
+  uint32_t refresh, retry, expire;   /* the SOA timers of the version served */
+  uint32_t hash;               /* calc_fnv1a_strn(name, klen): the index hash */
+  uint32_t freq;               /* frequency counter (reserved: cache admission, a later milestone) */
+  uint32_t gen;                /* generation of the state (reserved: parked queries, a later milestone) */
+  uint8_t state;               /* ZDIR_ST_* */
+  uint8_t last_result;         /* DBREG_APPLIED or DBREG_REJECTED (the last version offered) */
+  bool shadowed;               /* a zone of karidns.conf (D-PRIO) or a catalog member (D17-1) with this name hides it: hidden elements are not in the index */
+  uint8_t shadow_by;           /* DBREG_SH_*, meaningful while shadowed */
+  uint16_t flags;              /* ZDIR_F_* (changed under g_zone_db_rebuild_lock) */
+  uint8_t klen;                /* the name without the trailing dot */
+  uint8_t kind;                /* ZDIR_K_* (never changes) */
+  uint8_t digest[32];          /* DB: the digest the loader sent (resident zones only, a later milestone) */
+  char name[];                 /* canonical absolute name, lower case, with the trailing dot */
+};
+typedef zdir_elem_t dbreg_zone_t;
+enum { DBREG_APPLIED = 0, DBREG_REJECTED = 1 };
+enum { DBREG_SH_NONE = 0, DBREG_SH_CONFIG = 1, DBREG_SH_CATALOG = 2 };
+
+/* the open-addressing index of a directory: a power-of-two array of element pointers, NULL = empty, ZDIR_TOMB = removed */
+struct zdir_tab {
+  zdir_tab_t *gnext;           /* garbage list */
+  size_t cap, mask;
+  _Atomic(zdir_elem_t *) slot[];
+};
+/* the elements the control thread's one-second tick must look at (zone_entry_ticks(): secondaries and catalog members, for their
+ * refresh / expire timers and the settings received from the primary); replaced as a whole when the set changes.  The tick walks
+ * every element only for a pending NOTIFY request (g_zone_notify_pending), so a million primary zones from the database cost
+ * the tick nothing. */
+struct zdir_tick {
+  zdir_tick_t *gnext;
+  size_t n;
+  zdir_elem_t *e[];
+};
+struct zdir {
+  _Atomic(zdir_tab_t *) tab;   /* NULL until the first element */
+  _Atomic(zdir_tick_t *) tick;
+  _Atomic int refs;            /* the views (snapshots) that point to the directory */
+  /* the writers' counters (under g_zone_db_rebuild_lock; relaxed atomics for the readers who print them) */
+  size_t used;                 /* slots that are not empty, tombstones included */
+  _Atomic size_t live;         /* elements in the index (the shared ones included) */
+  _Atomic size_t n_static;     /* of them the zones of zone { } blocks: a reload whose zone { } blocks all map to these reuses the directory (snapshot_views_reusable()) */
+  _Atomic size_t n_shared;     /* of them the zones shared from another view (view_owns_elem() tells) */
+};
+
+/* what a retired snapshot keeps alive until it and every older snapshot are drained */
+typedef struct zdir_gent {
+  struct zdir_gent *next;
+  zone_db_entry_t *entry;      /* one reference to give back */
+  bool served;                 /* (a replaced entry) it was the one in the index when it was replaced */
+} zdir_gent_t;
+typedef struct {
+  zdir_elem_t *elems;          /* chained through ->next */
+  zdir_tab_t *tabs;            /* chained through ->gnext */
+  zdir_tick_t *ticks;
+  zdir_gent_t *ents;
+} zdir_garbage_t;
+
 typedef struct {
   char *name;
   char **match_clients;
@@ -487,40 +595,27 @@ typedef struct {
   /* Non-NULL when the view's match-clients has a `key` element (BIND get_matching_view_sync()): select_view_req() evaluates this list with the TSIG key
    * the request was verified with (this view's key ring), and the flat lists above are empty.  A reference (aml_ref()); released with the snapshot. */
   aml_t *match_aml;
-  zone_db_entry_t **entries;
-  size_t zone_count;
-  int *hash_table;
-  int *chain_next;
-  size_t hash_size;
-  int *suffix_hash_table;
-  int *suffix_chain_next;
-  size_t suffix_hash_size;
-  /* the entries of this view the control thread's one-second tick must look at (zone_entry_ticks(): secondaries and
-   * catalog members, for their refresh / expire timers and the settings received from the primary).  Built with the
-   * hash tables, inherited by the incremental delta; the tick walks every entry only for a pending NOTIFY request
-   * (g_zone_notify_pending), so a million primary zones from the database cost the tick nothing. */
-  zone_db_entry_t **tick_entries;
-  size_t tick_count;
-  /* entries that come from zone { } blocks of karidns.conf (neither DB zones nor catalog members).  A reload whose
-   * zone { } blocks all map to these entries (name and kind) reuses the view (snapshot_views_reusable()). */
-  size_t static_count;
-  /* entries of `entries` that belong to another view: the zones this view shares with an earlier view through zone { in-view } (the same
-   * zone_db_entry_t as in the owner view, snapshot_refs counts both; entry->view_name is the owner's).  They are appended
-   * when the view is built (a delta may move them).  Anything that walks the entries of every view once per zone must skip them (view_owns_entry()). */
-  size_t shared_count;
+  /* the zones of the view (one reference of the directory per snapshot that lists the view).  NULL: a view without zones */
+  zdir_t *dir;
 } view_snapshot_t;
 
-/* Is the entry a zone of this view, rather than a zone shared from an earlier one (zone { in-view })? */
-static inline bool view_owns_entry(const view_snapshot_t *vs, const zone_db_entry_t *e) {
-  return vs->shared_count == 0 || strcasecmp(e->view_name, vs->name) == 0;
-}
+/* Is the element a zone of this view, rather than a zone shared with an earlier view through zone { in-view } (the same
+ * zone_db_entry_t as in the owner view; entry->view_name is the owner's)?  Anything that walks the zones of every view once per
+ * zone must skip the shared ones. */
+static inline bool view_owns_elem(const zdir_elem_t *e) { return !(e->kind & ZDIR_K_SHARED); }
 
-typedef struct {
+typedef struct zone_db_snapshot {
   view_snapshot_t *views;
   size_t view_count;
   _Atomic(int) reader_count;
   uint64_t retire_epoch;
   int ixfr_history;   /* options { ixfr-history } the entries' depth was set with (a reused view redoes it when it changed) */
+  /* removed from the directories while this snapshot was the current one (see the top of this section) */
+  zdir_garbage_t garb;
+  struct zone_db_snapshot *gc_next;   /* the retired snapshots that are not drained yet, oldest first (g_gc_lock) */
+  bool gc_queued;
+  bool gc_started;                    /* its cleanup thread was started (or is being started); false = a start failed and is tried again (g_gc_lock) */
+  bool gc_drained;
 } zone_db_snapshot_t;
 
 /* A long walk over every zone (a rebuild at a million zones, the glue refresh, the registry walks of the ingest thread)
@@ -699,30 +794,77 @@ void build_zone_response_cache(zone_version_t *ver, server_config_t *cfg, const 
 void zone_glue_refresh_dependents(bool force);
 uint64_t zone_entry_next_id(void);
 
+/* ---- zone memory accounting (D1a, design 8.1; dns_snapshot_rcu.c) ----
+ * The bytes of the zone versions that zones serve (the version, its image, its glue block) and of the IXFR differences they keep, and of
+ * the versions that were replaced and are not freed yet (still on the retire stack: a reader or a transfer may hold them), per kind of
+ * zone: those that come from the database, and the others (zone { } blocks, catalog members).  Read only: nothing limits them yet.
+ * A version's size is recorded when it is frozen (zone_version_new(), zone_glue_track_build()); zone_publish() moves it from resident to
+ * retired when a newer one replaces it, and the retire stack gives it back when it is freed.  An entry that goes takes its resident
+ * bytes with it.  Scope: the version structure, its image and its glue block, and the data pools of an IXFR delta (its records, its arena);
+ * not the zone entry, its observatory counters, the response cache or the settings blocks.  A delta that left the history is still counted
+ * (resident) until the last transfer that reads it releases it (free_ixfr_txn()). */
+enum { ZBYTES_DB = 0, ZBYTES_OTHER = 1, ZBYTES_CLASSES = 2 };
+typedef struct {
+  uint64_t resident;   /* what the zones serve now, IXFR differences included */
+  uint64_t retired;    /* replaced versions that are not freed yet */
+} zone_bytes_t;
+void zone_bytes_get(int cls, zone_bytes_t *out);
+int zone_bytes_class(const zone_db_entry_t *e);
+/* for the IXFR history (dns_axfr_ixfr.c): a difference was stored in / left the history of a zone of class cls */
+void zone_bytes_resident_add(int cls, int64_t delta);
+
 /* ---- DB zone registry and view delta (beta design 4.2, 4.4; implemented in dns_snapshot_rcu.c) ----
- * The registry is the source of truth for which DB zones exist.  Per view (by name) it maps a zone name to
- * {entry, source id, serial, digest, last result, shadowed}.  Everything below takes g_zone_db_rebuild_lock itself
- * (the "_locked" ones expect it to be held); the ingest threads and the full-configuration rebuild are the only
- * writers, queries never touch it.  The registry holds one snapshot_refs reference of each entry it knows; every
- * snapshot that lists the entry holds another.  Callers on aux threads must rcu_aux_thread_pin() first (the
- * commit reads the configuration inside the lock). */
+ * The registry is the source of truth for which DB zones exist: per view (by name) the zone directory's elements of the
+ * database zones (zdir_elem_t, above), found by name.  Everything below takes g_zone_db_rebuild_lock itself (the "_locked" ones
+ * expect it to be held); the ingest threads and the full-configuration rebuild are the only writers, queries never touch the
+ * registry.  The registry's element holds one snapshot_refs reference of its entry; a directory-owned element holds one of
+ * its own.  Callers on aux threads must rcu_aux_thread_pin() first (the commit reads the configuration inside the lock). */
 extern pthread_mutex_t g_zone_db_rebuild_lock;
 
-typedef struct dbreg_zone {
-  struct dbreg_zone *next;     /* hash chain */
-  zone_db_entry_t *entry;      /* NULL: the zone has never been applied (only a rejection is recorded) */
-  char *error;                 /* last rejection / loader error, malloc; NULL = none */
-  int64_t source_id;
-  uint32_t serial;
-  uint32_t hash;
-  uint8_t digest[32];
-  uint8_t last_result;         /* DBREG_APPLIED or DBREG_REJECTED (the last version offered) */
-  bool shadowed;               /* a zone of karidns.conf (D-PRIO) or a catalog member (D17-1) with this name hides it */
-  uint8_t shadow_by;           /* DBREG_SH_*, meaningful while shadowed */
-  char name[];                 /* canonical absolute name, lower case, with the trailing dot */
-} dbreg_zone_t;
-enum { DBREG_APPLIED = 0, DBREG_REJECTED = 1 };
-enum { DBREG_SH_NONE = 0, DBREG_SH_CONFIG = 1, DBREG_SH_CATALOG = 2 };
+/* The entry of an element: the one that answers for the name (RCU-published; NULL when the zone is not resident, which no
+ * element of a directory is in this milestone).  Valid as long as the element is. */
+static inline zone_db_entry_t *zdir_entry(const zdir_elem_t *e) {
+  return e ? atomic_load_explicit((_Atomic(zone_db_entry_t *) *)&e->entry, memory_order_acquire) : NULL;
+}
+/* the longest-suffix match of qname (the zone that holds the name), and the zone named exactly domain, in the directory of the
+ * view: the element, which a later milestone may return for a zone that is not in memory (then zdir_entry() is NULL).
+ * find_zone_in_view() / find_zone_exact_in_view() / find_zone_for_query() return the entry of that element. */
+zdir_elem_t *zdir_find_suffix(const view_snapshot_t *view, const char *qname);
+zdir_elem_t *zdir_find_exact(const view_snapshot_t *view, const char *domain);
+/* Walk the index of a view (slot order; the shared zones too).  An element that is inserted or removed meanwhile may or may not
+ * be seen; one that is in the index for the whole walk is seen once. */
+typedef struct { const zdir_tab_t *tab; size_t i; } zdir_iter_t;
+void zdir_iter_init(zdir_iter_t *it, const view_snapshot_t *view);
+zdir_elem_t *zdir_iter_next(zdir_iter_t *it);
+/* the same, by slot number (a walk that does not start at the first slot, the control thread's tick): the number of slots of the table
+ * the iterator holds, and the element in slot i (NULL: none, or i is beyond the table) */
+int zdir_listing_cmp(const void *a, const void *b);   /* qsort() order of a list of zdir_elem_t *: the zones of zone { } blocks and the catalog members in the order of the configuration, then the rest */
+size_t zdir_iter_slots(const zdir_iter_t *it);
+zdir_elem_t *zdir_iter_at(const zdir_iter_t *it, size_t i);
+/* the number of elements of the index, of those the zones that belong to the view (the shared ones left out), the zone { } blocks
+ * among them, and the zones shared with another view (zdir_count() = owned + shared) */
+static inline size_t zdir_count(const view_snapshot_t *view) {
+  return (view && view->dir) ? atomic_load_explicit(&view->dir->live, memory_order_relaxed) : 0;
+}
+static inline size_t zdir_count_shared(const view_snapshot_t *view) {
+  return (view && view->dir) ? atomic_load_explicit(&view->dir->n_shared, memory_order_relaxed) : 0;
+}
+static inline size_t zdir_count_static(const view_snapshot_t *view) {
+  return (view && view->dir) ? atomic_load_explicit(&view->dir->n_static, memory_order_relaxed) : 0;
+}
+static inline size_t zdir_count_owned(const view_snapshot_t *view) { return zdir_count(view) - zdir_count_shared(view); }
+/* Is the entry a zone of this view, rather than one shared from an earlier view (the owner view's name is in entry->view_name)? */
+static inline bool view_owns_entry(const view_snapshot_t *vs, const zone_db_entry_t *e) {
+  return zdir_count_shared(vs) == 0 || strcasecmp(e->view_name, vs->name) == 0;
+}
+/* the ticking zones of the view (zone_entry_ticks()): *n of them; valid while the caller is in a read section or holds the snapshot */
+zdir_elem_t *const *zdir_tick_list(const view_snapshot_t *view, size_t *n);
+/* unit tests and fuzzers: make the directory of `view` list the given entries (no reference is taken of them and they are not freed
+ * with the view); directory-owned elements named after entries[i]->domain.  false: out of memory. */
+bool view_set_entries(view_snapshot_t *view, zone_db_entry_t *const *entries, size_t n);
+/* free the directory of a view built by view_set_entries() (and any other); the entries stay */
+void view_clear_dir(view_snapshot_t *view);
+
 
 /* Commit an installed zone.  entry is either a new entry (created = true, the registry takes over its initial
  * reference and the entry is queued to enter the view snapshot, unless a configured zone shadows it) or the entry
@@ -739,10 +881,10 @@ bool dbreg_reject(const char *view, const char *name, int64_t source_id, const c
 /* ZONE_DELETE: forget the zone; its entry leaves the view snapshot with the next snapshot_apply_db_delta().  1:
  * removed, 0: not registered or registered with another source id (nothing done). */
 int dbreg_delete(const char *view, const char *name, int64_t source_id);
-/* Publish the queued additions and removals as one new snapshot (beta design 4.4): per view the entry array is
- * copied without the removed and with the added entries and its hash tables are rebuilt.  The other views are copied
- * too (view_snapshot_t has no reference count to share them by).  Returns the number of entries added plus removed,
- * or -1 (out of memory, the queue is kept). */
+/* Publish the queued additions and removals (beta design 4.4, D1a): the directory of each view is changed in place, element by
+ * element (no copy of the index unless it has to grow), and a new snapshot that shares the directories is published; what left
+ * the index is freed once the readers that can still see it are gone.  Returns the number of elements added plus removed,
+ * or -1 (out of memory, the queue is kept and nothing was changed). */
 int snapshot_apply_db_delta(void);
 /* Number of queued changes (cheap, no lock) */
 size_t dbreg_pending_count(void);
@@ -752,6 +894,9 @@ typedef struct { size_t view, bucket, skip; } dbreg_cursor_t;
  * Returns true when the end was reached. */
 typedef bool (*dbreg_walk_cb)(void *ud, const char *view, const dbreg_zone_t *z);
 bool dbreg_walk(dbreg_cursor_t *cur, dbreg_walk_cb cb, void *ud);
+/* What the directory costs (D1a, design 3.1), in bytes as requested from malloc: the registry's elements and hash tables (*registry_bytes,
+ * *elements of them), and the index tables of the active snapshot's views with their tick lists (*index_bytes).  The entries and images are not in it. */
+void dbreg_dir_bytes(size_t *elements, size_t *registry_bytes, size_t *index_bytes);
 /* counts: zones with an entry (applied+shadowed), rejected-only records and shadowed ones */
 void dbreg_counts(size_t *total, size_t *rejected, size_t *shadowed);
 /* the same, with the shadowed zones told apart: by a zone of karidns.conf, by a catalog member (D17-1) */

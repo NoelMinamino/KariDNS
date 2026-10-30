@@ -237,8 +237,7 @@ static void gr_setup(const char *origin, const char *zone_text) {
     g_gr.entries[0] = &g_gr.entry;
     g_gr.acl[0] = (char *)"any";
     g_gr.view.name = "default";
-    g_gr.view.entries = g_gr.entries;
-    g_gr.view.zone_count = 1;
+    view_set_entries(&g_gr.view, g_gr.entries, 1);
     g_gr.view.match_clients = g_gr.acl;
     g_gr.view.match_clients_count = 1;
     g_gr.snap.views = &g_gr.view;
@@ -602,7 +601,7 @@ static void test_notify_catalog_member(void) {
     strncpy(g_gr.cat_entry.domain, "catalog.example.", sizeof(g_gr.cat_entry.domain) - 1);
     g_gr.cat_entry.is_secondary = true;
     g_gr.entries[1] = &g_gr.cat_entry;
-    g_gr.view.zone_count = 2;
+    view_set_entries(&g_gr.view, g_gr.entries, 2);
     g_gr.entry.is_catalog_member = true;
     g_gr.entry.is_secondary = true;
     g_gr.entry.source = ZONE_SRC_CATALOG;
@@ -626,7 +625,7 @@ static void test_notify_catalog_member(void) {
     g_gr.view.name = "__default__";
     strncpy(g_gr.cat_entry.domain, "catalog.example.", sizeof(g_gr.cat_entry.domain) - 1);
     g_gr.entries[1] = &g_gr.cat_entry;
-    g_gr.view.zone_count = 2;
+    view_set_entries(&g_gr.view, g_gr.entries, 2);
     g_gr.entry.is_catalog_member = true;
     g_gr.entry.is_secondary = true;
     g_gr.entry.source = ZONE_SRC_CATALOG;
@@ -656,7 +655,7 @@ static void test_notify_catalog_member(void) {
     g_gr.view.name = "__default__";
     strncpy(g_gr.cat_entry.domain, "catalog.example.", sizeof(g_gr.cat_entry.domain) - 1);
     g_gr.entries[1] = &g_gr.cat_entry;
-    g_gr.view.zone_count = 2;
+    view_set_entries(&g_gr.view, g_gr.entries, 2);
     g_gr.entry.is_catalog_member = true;
     g_gr.entry.is_secondary = true;
     g_gr.entry.source = ZONE_SRC_CATALOG;
@@ -803,7 +802,7 @@ static void test_notify_server_stmt_key(void) {
     strncpy(g_gr.cat_entry.domain, "catalog.example.", sizeof(g_gr.cat_entry.domain) - 1);
     g_gr.cat_entry.is_secondary = true;
     g_gr.entries[1] = &g_gr.cat_entry;
-    g_gr.view.zone_count = 2;
+    view_set_entries(&g_gr.view, g_gr.entries, 2);
     g_gr.entry.is_catalog_member = true;
     g_gr.entry.is_secondary = true;
     g_gr.entry.source = ZONE_SRC_CATALOG;
@@ -984,8 +983,7 @@ static void test_sibling_zone_additional_glue_and_limits(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 2;
+    view_set_entries(&view, entries, 2);
     view.match_clients = acl_any;
     view.match_clients_count = 1;
 

@@ -6,17 +6,21 @@
  *  1. install: a zone built from AXFR-format messages is published into an entry (serial, SOA timers, image, NOTIFY
  *     only when a loaded zone changes its serial); every rejection rule leaves the entry as it was.
  *  2. registry and delta: commit / apply / delete, idempotence, source id check, rejected-only records, walk.
- *  2b. the view delta patches copies of the hash tables (and rebuilds them when they would get too full).
+ *  2b. the view delta changes the zone directory's index in place (and moves it to a bigger table when it would get too full).
  *  3. D-PRIO: a configured zone hides a DB zone, the DB zone comes back when the configured zone is removed.
  *  4. dbcfg: zone_entry_config() returns it for DB zones, a replaced block is retired and freed.
  *  5. concurrent readers while zones are added and removed: a reader never sees a DB zone without its image.
  *  6. (B6a) D17-1: a catalog member with the name of a DB zone hides it (catalog delta), the DB zone returns when the
  *     member leaves, a DB zone committed behind an existing member is hidden; dbreg_find_info(), dbreg_counts2(),
  *     dbreg_snapshot_entry().
- *  7. the reload fast path: an unchanged zone set takes the old view over (same arrays and tables, the pending queue
+ *  7. the reload fast path: an unchanged zone set takes the old view over (the same zone directory, the pending queue
  *     survives, match-clients and options { ixfr-history } still apply); a zone { } added, removed or retyped, or a view
  *     added, rebuilds from the registry; the queue of a view that left is dropped.
  *  8. a DB zone that leaves marks the glue dirty: the zones whose glue came from it are looked at again by the tick.
+ *  9. (D1a) the zone directory: elements (state, flags, SOA values, counters, walk, longest suffix), a delta in place (no copy of the
+ *     index unless it grows, tombstones reused), what a reader holds stays valid until the older snapshots are drained (ordered
+ *     release of the garbage), hidden elements and zones shared with another view, a replaced entry and the tick list, the bytes per
+ *     zone, and the zone memory accounting (design 8.1: resident, retired, IXFR differences, entries that go).
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -40,9 +44,40 @@
 #include "../dns_utils.h"
 #include "db/xfr_mocks.h"
 
+/* the cleanup threads log the zone entries they free: the directory tests look at when that happens ("[GC] Freeing deleted zone 'x'") */
+static pthread_mutex_t g_gc_log_lock = PTHREAD_MUTEX_INITIALIZER;
+static char g_gc_log[4096][64];
+static int g_gc_logn;
+
 void syslog(int priority, const char *format, ...) {
     (void)priority;
-    (void)format;
+    /* (the code logs through kdns_syslog(), which formats the message and passes it here as "%s") */
+    if (strcmp(format, "%s") == 0) {
+        va_list ap;
+        va_start(ap, format);
+        const char *msg = va_arg(ap, const char *);
+        va_end(ap);
+        const char *key = "[GC] Freeing deleted zone '";
+        if (strncmp(msg, key, strlen(key)) == 0) {
+            pthread_mutex_lock(&g_gc_log_lock);
+            if (g_gc_logn < 4096) {
+                snprintf(g_gc_log[g_gc_logn], sizeof(g_gc_log[0]), "%s", msg + strlen(key));
+                char *q = strrchr(g_gc_log[g_gc_logn], '\'');
+                if (q) *q = '\0';
+                g_gc_logn++;
+            }
+            pthread_mutex_unlock(&g_gc_log_lock);
+        }
+    }
+}
+
+static int gc_freed(const char *domain) {
+    int n = 0;
+    pthread_mutex_lock(&g_gc_log_lock);
+    for (int i = 0; i < g_gc_logn; i++)
+        if (strcmp(g_gc_log[i], domain) == 0) n++;
+    pthread_mutex_unlock(&g_gc_log_lock);
+    return n;
 }
 
 static int g_checks = 0, g_failed = 0;
@@ -517,8 +552,11 @@ static void inc_verify(const char *view, zone_db_entry_t **ent, const bool *aliv
     }
     CHECK(v && find_zone_exact_in_view(v, "file.test.") != NULL);        /* the configured zone is untouched */
     size_t counted = 0;
-    for (size_t k = 0; v && k < v->zone_count; k++) if (v->entries[k]) counted++;
+    zdir_iter_t cit;
+    zdir_iter_init(&cit, v);
+    while (v && zdir_iter_next(&cit)) counted++;
     CHECK(counted == (size_t)live + 1);                                  /* no entry twice, none lost, no stale pointer */
+    CHECK(zdir_count(v) == counted);                                     /* the counter agrees with the slots */
     release_zone_snapshot(s);
 }
 
@@ -849,10 +887,13 @@ static void test_concurrent(void) {
     size_t total, rej, shd;
     dbreg_counts(&total, &rej, &shd);
     size_t db_in_view = 0;
-    for (size_t i = 0; i < v->zone_count; i++) {
-        if (v->entries[i] && v->entries[i]->source == ZONE_SRC_DB) {
+    zdir_iter_t dit;
+    zdir_iter_init(&dit, v);
+    for (zdir_elem_t *el; (el = zdir_iter_next(&dit));) {
+        zone_db_entry_t *de = zdir_entry(el);
+        if (de && de->source == ZONE_SRC_DB) {
             db_in_view++;
-            CHECK(dbreg_lookup_entry("default", v->entries[i]->domain) == v->entries[i]);
+            CHECK(dbreg_lookup_entry("default", de->domain) == de);
         }
     }
     CHECK(db_in_view == total);
@@ -957,10 +998,12 @@ static bool name_in_snapshot_is(const char *view, const char *name, const zone_d
 static int tick_list(const char *view, const zone_db_entry_t *e, bool *in_list) {
     zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
     view_snapshot_t *v = snapshot_find_view(s, view);
-    int n = v ? (int)v->tick_count : -1;
+    size_t tn = 0;
+    zdir_elem_t *const *tl = zdir_tick_list(v, &tn);
+    int n = v ? (int)tn : -1;
     *in_list = false;
-    for (size_t i = 0; v && i < v->tick_count; i++)
-        if (v->tick_entries[i] == e) *in_list = true;
+    for (size_t i = 0; v && i < tn; i++)
+        if (zdir_entry(tl[i]) == e) *in_list = true;
     release_zone_snapshot(s);
     return n;
 }
@@ -1072,51 +1115,48 @@ static void test_secondary_entries(void) {
 }
 
 /* ---------------------------------------------------------------- 7. the reload fast path */
-/* A reload whose zone { } blocks did not change takes the old view over (entries, hash tables, tick list: the same
- * contents), keeps the registry's pending queue, and applies what changed in the view's own settings (match-clients,
+/* A reload whose zone { } blocks did not change takes the old view over (D1a: the new snapshot lists the same zone directory),
+ * keeps the registry's pending queue, and applies what changed in the view's own settings (match-clients,
  * options { ixfr-history }).  A zone { } added, removed or of another type, or a view added, rebuilds from the registry
- * (observable: the pending queue is dropped, since the registry already has what it queued). */
+ * (observable: the pending queue is dropped, since the registry already has what it queued, and the view has a new directory). */
 typedef struct {
-    zone_db_entry_t **entries, **tick;
-    int *ht, *chain, *sht, *schain;
-    size_t n, hs, tn, sc;
+    zdir_t *dir;
+    zdir_elem_t **els;
+    zone_db_entry_t **tick;
+    size_t n, tn, sc;
 } view_copy_t;
 
 static void copy_view(const char *view, view_copy_t *c) {
     memset(c, 0, sizeof(*c));
     zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
     view_snapshot_t *v = snapshot_find_view(s, view);
-    CHECK(v != NULL && v->suffix_hash_size == v->hash_size);
+    CHECK(v != NULL);
     if (v) {
-        c->n = v->zone_count;
-        c->hs = v->hash_size;
-        c->tn = v->tick_count;
-        c->sc = v->static_count;
-        c->entries = malloc((c->n + 1) * sizeof(*c->entries));
-        c->tick = malloc((c->tn + 1) * sizeof(*c->tick));
-        c->ht = malloc((c->hs + 1) * sizeof(int));
-        c->sht = malloc((c->hs + 1) * sizeof(int));
-        c->chain = malloc((c->n + 1) * sizeof(int));
-        c->schain = malloc((c->n + 1) * sizeof(int));
-        memcpy(c->entries, v->entries, c->n * sizeof(*c->entries));
-        memcpy(c->tick, v->tick_entries, c->tn * sizeof(*c->tick));
-        memcpy(c->ht, v->hash_table, c->hs * sizeof(int));
-        memcpy(c->sht, v->suffix_hash_table, c->hs * sizeof(int));
-        memcpy(c->chain, v->chain_next, c->n * sizeof(int));
-        memcpy(c->schain, v->suffix_chain_next, c->n * sizeof(int));
+        c->dir = v->dir;
+        c->n = zdir_count(v);
+        c->sc = zdir_count_static(v);
+        c->els = malloc((c->n + 1) * sizeof(*c->els));
+        size_t k = 0;
+        zdir_iter_t it;
+        zdir_iter_init(&it, v);
+        for (zdir_elem_t *el; (el = zdir_iter_next(&it)) && k < c->n;) c->els[k++] = el;
+        CHECK(k == c->n);
+        size_t tn = 0;
+        zdir_elem_t *const *tl = zdir_tick_list(v, &tn);
+        c->tn = tn;
+        c->tick = malloc((tn + 1) * sizeof(*c->tick));
+        for (size_t i = 0; i < tn; i++) c->tick[i] = zdir_entry(tl[i]);
     }
     release_zone_snapshot(s);
 }
 
 static bool same_view(const view_copy_t *a, const view_copy_t *b) {
-    return a->n == b->n && a->hs == b->hs && a->tn == b->tn && a->sc == b->sc &&
-           memcmp(a->entries, b->entries, a->n * sizeof(*a->entries)) == 0 && memcmp(a->tick, b->tick, a->tn * sizeof(*a->tick)) == 0 &&
-           memcmp(a->ht, b->ht, a->hs * sizeof(int)) == 0 && memcmp(a->sht, b->sht, a->hs * sizeof(int)) == 0 &&
-           memcmp(a->chain, b->chain, a->n * sizeof(int)) == 0 && memcmp(a->schain, b->schain, a->n * sizeof(int)) == 0;
+    return a->dir == b->dir && a->n == b->n && a->tn == b->tn && a->sc == b->sc &&
+           memcmp(a->els, b->els, a->n * sizeof(*a->els)) == 0 && memcmp(a->tick, b->tick, a->tn * sizeof(*a->tick)) == 0;
 }
 
 static void free_copy(view_copy_t *c) {
-    free(c->entries); free(c->tick); free(c->ht); free(c->sht); free(c->chain); free(c->schain);
+    free(c->els); free(c->tick);
 }
 
 static zone_db_snapshot_t *current_snapshot(void) {
@@ -1279,6 +1319,408 @@ static void test_glue_dirty_on_delete(void) {
     dbreg_reset();
 }
 
+/* ---------------------------------------------------------------- 9. D1a: the zone directory */
+static zdir_t *current_dir(const char *view) {
+    zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+    view_snapshot_t *v = snapshot_find_view(s, view);
+    zdir_t *d = v ? v->dir : NULL;
+    release_zone_snapshot(s);
+    return d;
+}
+
+static size_t iter_count(const view_snapshot_t *v, const char *name_filter) {
+    size_t n = 0;
+    zdir_iter_t it;
+    zdir_iter_init(&it, v);
+    for (zdir_elem_t *e; (e = zdir_iter_next(&it));)
+        if (!name_filter || domain_names_match_ci(e->name, name_filter)) n++;
+    return n;
+}
+
+static void write_zone_file(const char *file, const char *origin, const char *ns_addr) {
+    char path[300];
+    snprintf(path, sizeof(path), "%s/%s", g_dir, file);
+    FILE *f = fopen(path, "w");
+    fprintf(f, "$ORIGIN %s\n$TTL 300\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A %s\n", origin, ns_addr);
+    fclose(f);
+}
+
+/* The elements of the directory: what a lookup finds, what an element records of its zone, the counters, the walk, the longest match. */
+static void test_dir_elements(void) {
+    printf("[TEST] zone directory: elements (exact, suffix, state, flags, SOA values), counters, walk, tick list...\n");
+    write_zone_file("de.zone", "de.test.", "192.0.2.1");
+    char conf[1024];
+    snprintf(conf, sizeof(conf), "%s/de.zone", g_dir);
+    server_config_t *cfg = load_conf("view \"default\" { match-clients { any; };\n  zone \"de.test\" { type master; file \"%s\"; }; };\n", conf);
+    rebuild(cfg);
+    zone_db_entry_t *a = add_zone("default", "a.test.", 7, 2, 301);
+    zone_db_entry_t *sub = add_zone("default", "sub.a.test.", 8, 1, 302);
+    CHECK(a && sub && snapshot_apply_db_delta() == 2);
+
+    zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+    view_snapshot_t *v = snapshot_find_view(s, "default");
+    CHECK(v && v->dir);
+    zdir_elem_t *ea = zdir_find_exact(v, "a.test."), *es = zdir_find_exact(v, "SUB.a.test"), *ef = zdir_find_exact(v, "de.test.");
+    CHECK(ea && es && ef && ea != es);
+    CHECK(zdir_entry(ea) == a && zdir_entry(es) == sub);
+    CHECK(ea->state == ZDIR_ST_RESIDENT && ea->source_id == 301 && ea->serial == 7 && ea->klen == 6);
+    CHECK(ea->refresh == 7200 && ea->retry == 3600 && ea->expire == 1209600);       /* the SOA values of the version served */
+    CHECK(!(ea->kind & (ZDIR_K_OWNED | ZDIR_K_STATIC | ZDIR_K_SHARED)) && !ea->shadowed);
+    CHECK(ea->gen == 0 && ea->freq == 0 && !(ea->flags & (ZDIR_F_PIN | ZDIR_F_NOCACHE | ZDIR_F_PARTIAL)));   /* (reserved) */
+    CHECK((ef->kind & (ZDIR_K_OWNED | ZDIR_K_STATIC)) == (ZDIR_K_OWNED | ZDIR_K_STATIC) && zdir_entry(ef)->source == ZONE_SRC_CONFIG);
+    CHECK(ef->source_id == 0);                                                       /* the position in the listing */
+    CHECK(zdir_find_exact(v, "nope.test.") == NULL && zdir_find_exact(v, NULL) == NULL && zdir_find_exact(NULL, "a.test.") == NULL);
+    /* the longest suffix wins; the root zone is last; the label boundary is an unescaped dot */
+    CHECK(zdir_find_suffix(v, "x.y.sub.a.test.") == es && zdir_find_suffix(v, "x.a.test.") == ea && zdir_find_suffix(v, "a.test") == ea);
+    CHECK(zdir_find_suffix(v, "a\\.test.") == NULL && zdir_find_suffix(v, "other.org.") == NULL && zdir_find_suffix(v, NULL) == NULL);
+    CHECK(find_zone_in_view(v, "www.de.test.") == zdir_entry(ef) && find_zone_exact_in_view(v, "a.test.") == a);
+    /* the counters, the walk (each element once), the listing order (zone { } blocks first) */
+    CHECK(zdir_count(v) == 3 && zdir_count_static(v) == 1 && zdir_count_shared(v) == 0 && zdir_count_owned(v) == 3);
+    CHECK(iter_count(v, NULL) == 3 && iter_count(v, "a.test.") == 1);
+    zdir_elem_t *els[3] = { ea, es, ef };
+    qsort(els, 3, sizeof(els[0]), zdir_listing_cmp);
+    CHECK(els[0] == ef && ((els[1] == ea && els[2] == es) || (els[1] == es && els[2] == ea)));
+    zdir_iter_t it;
+    zdir_iter_init(&it, v);
+    size_t slots = zdir_iter_slots(&it), seen = 0;
+    CHECK(slots >= 64 && zdir_iter_at(&it, slots) == NULL);
+    for (size_t i = 0; i < slots; i++)
+        if (zdir_iter_at(&it, i)) seen++;
+    CHECK(seen == 3);
+    /* nobody ticks: primaries only */
+    size_t tn = 99;
+    CHECK(zdir_tick_list(v, &tn) == NULL || tn == 0);
+    CHECK(zdir_tick_list(NULL, &tn) == NULL && tn == 0);
+    /* a view without a directory */
+    view_snapshot_t empty;
+    memset(&empty, 0, sizeof(empty));
+    zdir_iter_init(&it, &empty);
+    CHECK(zdir_iter_next(&it) == NULL && zdir_iter_slots(&it) == 0 && zdir_count(&empty) == 0 && zdir_find_suffix(&empty, "a.test.") == NULL);
+    release_zone_snapshot(s);
+
+    /* the elements of view_set_entries() borrow their entries (unit tests, fuzzers) */
+    zone_db_entry_t *t1 = create_new_zone_entry("one.test.", "x"), *t2 = create_new_zone_entry("two.test.", "x");
+    t2->is_secondary = true;
+    zone_db_entry_t *ents[3] = { t1, NULL, t2 };
+    view_snapshot_t bv;
+    memset(&bv, 0, sizeof(bv));
+    CHECK(view_set_entries(&bv, ents, 3) && zdir_count(&bv) == 2);
+    CHECK(find_zone_in_view(&bv, "a.two.test.") == t2 && find_zone_exact_in_view(&bv, "one.test") == t1);
+    size_t btn = 0;
+    zdir_elem_t *const *btl = zdir_tick_list(&bv, &btn);
+    CHECK(btn == 1 && zdir_entry(btl[0]) == t2);                                     /* the secondary ticks */
+    {   /* the tick list is in the order of the listing, not of the hashes: refreshes start in that order (transfers-per-ns) */
+        zone_db_entry_t *sec[12];
+        for (int i = 0; i < 12; i++) {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "sec%d.test.", (i * 7) % 12);
+            sec[i] = create_new_zone_entry(nm, "x");
+            sec[i]->is_secondary = true;
+        }
+        CHECK(view_set_entries(&bv, sec, 12));
+        size_t sn = 0;
+        zdir_elem_t *const *sl = zdir_tick_list(&bv, &sn);
+        CHECK(sn == 12);
+        for (size_t i = 0; i < sn && i < 12; i++) CHECK(zdir_entry(sl[i]) == sec[i]);
+        for (int i = 0; i < 12; i++) free_zone_db_entry(sec[i]);
+    }
+    CHECK(view_set_entries(&bv, ents, 1) && zdir_count(&bv) == 1);                   /* replaces the directory */
+    view_clear_dir(&bv);
+    CHECK(bv.dir == NULL && zdir_count(&bv) == 0);
+    free_zone_db_entry(t1);
+    free_zone_db_entry(t2);
+    dbreg_reset();
+}
+
+/* A delta changes the directory in place: the new snapshot lists the same directory, and the index is copied only when it has to grow. */
+static void test_dir_delta_in_place(void) {
+    printf("[TEST] zone directory: a delta changes the directory in place (no copy of the index unless it grows), tombstones are reused...\n");
+    server_config_t *cfg = load_conf("view \"default\" { match-clients { any; }; };\n");
+    rebuild(cfg);
+    zdir_t *d0 = current_dir("default");
+    CHECK(d0 != NULL);
+    zone_db_entry_t *ent[400];
+    int64_t base_pending = (int64_t)dbreg_pending_count();
+    CHECK(base_pending == 0);
+    for (int i = 0; i < 8; i++) {
+        char nm[64];
+        snprintf(nm, sizeof(nm), "p%d.test.", i);
+        ent[i] = add_zone("default", nm, 1, 1, 900 + i);
+        CHECK(ent[i] != NULL);
+    }
+    CHECK(dbreg_pending_count() == 8 && snapshot_apply_db_delta() == 8);
+    zone_db_snapshot_t *s1 = acquire_retained_zone_snapshot();
+    CHECK(snapshot_find_view(s1, "default")->dir == d0);                             /* the same directory */
+    zdir_tab_t *t1 = atomic_load(&d0->tab);
+    CHECK(t1 != NULL && zdir_count(snapshot_find_view(s1, "default")) == 8);
+    /* one more zone: the snapshot is new, the directory and its table are the ones before */
+    ent[8] = add_zone("default", "p8.test.", 1, 1, 908);
+    CHECK(ent[8] && snapshot_apply_db_delta() == 1);
+    zone_db_snapshot_t *s2 = acquire_retained_zone_snapshot();
+    CHECK(s2 != s1 && snapshot_find_view(s2, "default")->dir == d0 && atomic_load(&d0->tab) == t1);
+    /* the reader that holds the older snapshot sees the zone too: it is one directory */
+    CHECK(find_zone_exact_in_view(snapshot_find_view(s1, "default"), "p8.test.") == ent[8]);
+    release_zone_snapshot(s2);
+    release_zone_snapshot(s1);
+    /* many zones: the index outgrows its table; the elements move to a bigger one (the old table is garbage) */
+    for (int i = 9; i < 400; i++) {
+        char nm[64];
+        snprintf(nm, sizeof(nm), "p%d.test.", i);
+        ent[i] = add_zone("default", nm, 1, 1, 900 + i);
+        CHECK(ent[i] != NULL);
+    }
+    CHECK(snapshot_apply_db_delta() == 391);
+    zdir_tab_t *t2 = atomic_load(&d0->tab);
+    CHECK(t2 != t1 && t2->cap >= 800 && atomic_load(&d0->live) == 400);
+    for (int i = 0; i < 400; i += 37) {
+        char nm[64];
+        snprintf(nm, sizeof(nm), "www.p%d.test.", i);
+        zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+        CHECK(find_zone_in_view(snapshot_find_view(s, "default"), nm) == ent[i]);
+        release_zone_snapshot(s);
+    }
+    /* removals leave tombstones; zones that come back use them, and the table is not rebuilt for it */
+    size_t used_full = d0->used;
+    for (int i = 0; i < 200; i++) {
+        char nm[64];
+        snprintf(nm, sizeof(nm), "p%d.test.", i);
+        CHECK(dbreg_delete("default", nm, 900 + i) == 1);
+    }
+    CHECK(snapshot_apply_db_delta() == 200 && atomic_load(&d0->live) == 200 && d0->used == used_full && atomic_load(&d0->tab) == t2);
+    for (int i = 0; i < 100; i++) {
+        char nm[64];
+        snprintf(nm, sizeof(nm), "p%d.test.", i);
+        ent[i] = add_zone("default", nm, 2, 1, 900 + i);
+        CHECK(ent[i] != NULL);
+    }
+    CHECK(snapshot_apply_db_delta() == 100 && atomic_load(&d0->live) == 300);
+    CHECK(d0->used <= used_full + 100 && atomic_load(&d0->tab) == t2);
+    /* names that are not (any more) zones are not found, the others are, and the walk sees each once */
+    zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+    view_snapshot_t *v = snapshot_find_view(s, "default");
+    CHECK(find_zone_exact_in_view(v, "p150.test.") == NULL && find_zone_exact_in_view(v, "p50.test.") == ent[50]);
+    CHECK(find_zone_exact_in_view(v, "p250.test.") == ent[250] && iter_count(v, NULL) == 300 && zdir_count(v) == 300);
+    release_zone_snapshot(s);
+    /* a queue that is applied in one delta: an element deleted while it waits to be added never enters the index */
+    zone_db_entry_t *q = add_zone("default", "queued.test.", 1, 1, 7001);
+    CHECK(q && dbreg_pending_count() == 1);
+    CHECK(dbreg_delete("default", "queued.test.", 7001) == 1 && snapshot_apply_db_delta() >= 0);
+    CHECK(!name_in_snapshot("default", "queued.test.") && dbreg_pending_count() == 0);
+    gc_snapshot_wait_idle();
+    dbreg_reset();
+    zone_retire_process(true);
+}
+
+/* What a reader got from a lookup stays valid until the snapshot it holds is released, and what was taken out of the directory is freed
+ * only when that snapshot, and every older one, is drained (the garbage of a snapshot waits for the older ones). */
+static void test_dir_garbage_order(void) {
+    printf("[TEST] zone directory: removed zones are freed after the older snapshots are gone...\n");
+    server_config_t *cfg = load_conf("view \"default\" { match-clients { any; }; };\n");
+    rebuild(cfg);
+    zone_db_entry_t *y = add_zone("default", "gcy.test.", 1, 2, 8001);
+    CHECK(y && snapshot_apply_db_delta() == 1);
+    zone_db_snapshot_t *held = acquire_retained_zone_snapshot();             /* an old snapshot a transfer or a command holds */
+    zone_db_entry_t *seen = find_zone_exact_in_view(snapshot_find_view(held, "default"), "gcy.test.");
+    CHECK(seen == y);
+    zone_db_entry_t *z = add_zone("default", "gcz.test.", 1, 2, 8002);
+    CHECK(z && snapshot_apply_db_delta() == 1);                              /* `held` is retired: its cleanup thread waits for the reader */
+    CHECK(dbreg_delete("default", "gcy.test.", 8001) == 1);
+    CHECK(snapshot_apply_db_delta() == 1);                                   /* the snapshot before this one has the garbage; it is drained at once ... */
+    usleep(200000);
+    CHECK(gc_freed("gcy.test.") == 0);                                       /* ... but an older one (held) is not: nothing is freed */
+    CHECK(find_zone_exact_in_view(snapshot_find_view(held, "default"), "gcy.test.") == NULL);   /* the index no longer lists it */
+    CHECK(strcmp(seen->domain, "gcy.test.") == 0 && atomic_load(&seen->serial) == 1);          /* the entry the reader has is intact */
+    release_zone_snapshot(held);
+    gc_snapshot_wait_idle();
+    CHECK(gc_freed("gcy.test.") == 1);                                       /* now it is freed, once */
+    CHECK(gc_freed("gcz.test.") == 0);
+    /* a zone that is replaced by a new entry: the old entry waits for the readers of the older snapshots as well */
+    zone_db_snapshot_t *held2 = acquire_retained_zone_snapshot();
+    zone_db_entry_t *z2 = new_entry("default", "gcz.test.");
+    msg_t m;
+    zone_msg(&m, "gcz.test.", 2, 1);
+    char why[128];
+    CHECK(install_msgs(z2, "gcz.test.", 4, &m, 1, why, sizeof(why), NULL) == 0);
+    uint8_t dg[32] = { 2 };
+    CHECK(dbreg_commit("default", "gcz.test.", z2, true, 8002, 2, dg, NULL) == 0);
+    CHECK(find_zone_exact_in_view(snapshot_find_view(held2, "default"), "gcz.test.") == z2);   /* served at once: the element points to the new entry */
+    CHECK(dbreg_pending_count() == 2 && snapshot_apply_db_delta() == 2);                         /* (a removal and an addition, as ever; the delta gives the old entry back) */
+    usleep(200000);
+    CHECK(gc_freed("gcz.test.") == 0 && strcmp(z->domain, "gcz.test.") == 0);
+    release_zone_snapshot(held2);
+    gc_snapshot_wait_idle();
+    CHECK(gc_freed("gcz.test.") == 1);
+    dbreg_reset();
+    zone_retire_process(true);
+}
+
+/* A hidden DB zone is an element that is not in the index: the zone of karidns.conf is; and a zone shared with another view (in-view) has an element of
+ * its own that holds the owner's entry. */
+static void test_dir_hidden_and_shared(void) {
+    printf("[TEST] zone directory: hidden elements, zones shared with another view...\n");
+    write_zone_file("dh.zone", "dh.test.", "192.0.2.3");
+    char zf[300];
+    snprintf(zf, sizeof(zf), "%s/dh.zone", g_dir);
+    zone_db_entry_t *dbz = NULL;
+    server_config_t *cfg0 = load_conf("view \"default\" { match-clients { any; }; };\n");
+    rebuild(cfg0);
+    dbz = add_zone("default", "dh.test.", 5, 1, 9001);
+    CHECK(dbz && snapshot_apply_db_delta() == 1);
+    server_config_t *cfg1 = load_conf("view \"default\" { match-clients { any; }; zone \"dh.test\" { type master; file \"%s\"; }; };\n", zf);
+    rebuild(cfg1);
+    {
+        zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+        view_snapshot_t *v = snapshot_find_view(s, "default");
+        zdir_elem_t *e = zdir_find_exact(v, "dh.test.");
+        CHECK(e && (e->kind & ZDIR_K_STATIC) && zdir_entry(e) != dbz && zdir_entry(e)->source == ZONE_SRC_CONFIG);   /* the winner is the zone of karidns.conf */
+        CHECK(iter_count(v, "dh.test.") == 1 && zdir_count(v) == 1);                                                 /* one element for the name */
+        dbreg_info_t info[1];
+        CHECK(dbreg_find_info("default", "dh.test.", info, 1) == 1 && info[0].shadowed && info[0].shadow_by == DBREG_SH_CONFIG);
+        CHECK(dbreg_snapshot_entry(s, "default", "dh.test.") == NULL);
+        release_zone_snapshot(s);
+    }
+    rebuild(cfg0);                                                                       /* the zone { } goes: the hidden element comes back */
+    {
+        zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+        view_snapshot_t *v = snapshot_find_view(s, "default");
+        zdir_elem_t *e = zdir_find_exact(v, "dh.test.");
+        CHECK(e && !(e->kind & ZDIR_K_OWNED) && zdir_entry(e) == dbz && !e->shadowed && zdir_count_static(v) == 0);
+        CHECK(dbreg_snapshot_entry(s, "default", "dh.test.") == dbz);
+        release_zone_snapshot(s);
+    }
+    /* a zone shared with an earlier view */
+    write_zone_file("sh.zone", "sh.test.", "192.0.2.4");
+    char sf[300];
+    snprintf(sf, sizeof(sf), "%s/sh.zone", g_dir);
+    server_config_t *cfg2 = load_conf("view \"a\" { match-clients { 127.0.0.1; }; zone \"sh.test\" { type master; file \"%s\"; }; };\n"
+                                      "view \"b\" { match-clients { any; }; zone \"sh.test\" { in-view \"a\"; }; };\n", sf);
+    rebuild(cfg2);
+    {
+        zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+        view_snapshot_t *va = snapshot_find_view(s, "a"), *vb = snapshot_find_view(s, "b");
+        zdir_elem_t *ea = zdir_find_exact(va, "sh.test."), *eb = zdir_find_exact(vb, "sh.test.");
+        CHECK(ea && eb && ea != eb && zdir_entry(ea) == zdir_entry(eb));                     /* one entry, an element in each view */
+        CHECK((ea->kind & ZDIR_K_STATIC) && !(ea->kind & ZDIR_K_SHARED) && (eb->kind & ZDIR_K_SHARED) && !(eb->kind & ZDIR_K_STATIC));
+        CHECK(zdir_count(va) == 1 && zdir_count_static(va) == 1 && zdir_count_shared(va) == 0 && zdir_count_owned(va) == 1);
+        CHECK(zdir_count(vb) == 1 && zdir_count_static(vb) == 0 && zdir_count_shared(vb) == 1 && zdir_count_owned(vb) == 0);
+        CHECK(view_owns_elem(ea) && !view_owns_elem(eb) && view_owns_entry(va, zdir_entry(ea)) && !view_owns_entry(vb, zdir_entry(eb)));
+        /* a DB zone in the owner view does not change the shared one */
+        release_zone_snapshot(s);
+    }
+    dbreg_reset();
+    zone_retire_process(true);
+}
+
+/* The replaced entry of an element in the index (a DB zone that becomes another kind of zone): the tick list follows it. */
+static void test_dir_replaced_entry_ticks(void) {
+    printf("[TEST] zone directory: an element whose entry is replaced (the tick list is rebuilt)...\n");
+    server_config_t *cfg = load_conf("view \"default\" { match-clients { any; }; };\n");
+    rebuild(cfg);
+    zone_db_entry_t *p = add_zone("default", "rk.test.", 1, 1, 9101);
+    CHECK(p && snapshot_apply_db_delta() == 1);
+    bool in_tick = true;
+    CHECK(tick_list("default", p, &in_tick) == 0 && !in_tick);
+    /* the zone becomes a secondary: a new entry replaces the primary's under the same element */
+    zone_ext_shared_t *sh = NULL;
+    zone_db_entry_t *sec = new_secondary_entry("default", "rk.test.", sh, 1);
+    uint8_t dg[32] = { 3 };
+    CHECK(dbreg_commit("default", "rk.test.", sec, true, 9101, 0, dg, NULL) == 0);
+    CHECK(snapshot_apply_db_delta() == 2);
+    CHECK(tick_list("default", sec, &in_tick) == 1 && in_tick);
+    CHECK(name_in_snapshot_is("default", "rk.test.", sec));
+    CHECK(dbreg_delete("default", "rk.test.", 9101) == 1 && snapshot_apply_db_delta() == 1);
+    CHECK(tick_list("default", sec, &in_tick) == 0 && !in_tick);
+    gc_snapshot_wait_idle();
+    dbreg_reset();
+    zone_retire_process(true);
+}
+
+/* Design 3.1: what the directory costs per zone (the entries and images are not in it).  The target is 130-160 bytes; the elements carry the
+ * 32-byte digest today (it will go to the resident zones only), the index is a table of 8-byte slots at a load of at most one half. */
+static void test_dir_bytes_per_zone(void) {
+    printf("[TEST] zone directory: bytes per zone (registry element + hash table + index table)...\n");
+    server_config_t *cfg = load_conf("view \"default\" { match-clients { any; }; };\n");
+    rebuild(cfg);
+    enum { N = 20000 };
+    uint8_t dg[32] = { 7 };
+    for (int i = 0; i < N; i++) {
+        char nm[64];
+        snprintf(nm, sizeof(nm), "z%d.test.", 100000 + i);
+        zone_db_entry_t *e = new_entry("default", nm);
+        CHECK(e && dbreg_commit("default", nm, e, true, 20000 + i, 1, dg, NULL) == 0);
+    }
+    CHECK(snapshot_apply_db_delta() == N);
+    size_t nel, rb, ib;
+    dbreg_dir_bytes(&nel, &rb, &ib);
+    CHECK(nel == N && rb > 0 && ib > 0);
+    double per = (double)(rb + ib) / (double)nel;
+    printf("  -> %zu zones: sizeof(element) = %zu, %.1f bytes per zone requested (registry %.1f + index %.1f)\n", nel, sizeof(zdir_elem_t), per,
+           (double)rb / (double)nel, (double)ib / (double)nel);
+    CHECK(per >= 100.0 && per <= 190.0);
+    gc_snapshot_wait_idle();
+    dbreg_reset();
+    zone_retire_process(true);
+}
+
+/* Design 8.1: the bytes a published version holds are recorded when it is frozen and counted while it is resident; a replaced one is
+ * "retired" until the retire stack frees it; an IXFR difference counts while the history has it; an entry that goes takes its bytes. */
+static void test_zone_bytes(void) {
+    printf("[TEST] zone memory accounting: resident, retired, IXFR differences, entries that go...\n");
+    zone_bytes_t db0, ot0, db, ot;
+    gc_snapshot_wait_idle();                                   /* what the earlier tests left is gone */
+    zone_retire_process(true);
+    zone_bytes_get(ZBYTES_DB, &db0);
+    zone_bytes_get(ZBYTES_OTHER, &ot0);
+    write_zone_file("zb.zone", "zb.test.", "192.0.2.7");
+    char zf[300];
+    snprintf(zf, sizeof(zf), "%s/zb.zone", g_dir);
+    server_config_t *cfg = load_conf("view \"default\" { match-clients { any; }; zone \"zb.test\" { type master; file \"%s\"; }; };\n", zf);
+    rebuild(cfg);
+    zone_bytes_get(ZBYTES_OTHER, &ot);
+    zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+    zone_db_entry_t *fz = find_zone_exact_in_view(snapshot_find_view(s, "default"), "zb.test.");
+    release_zone_snapshot(s);
+    zone_version_t *fv = fz ? atomic_load(&fz->rcu.active) : NULL;
+    CHECK(fv && fv->heap && fv->counted && fv->bytes >= sizeof(zone_version_t) + fv->image->total_size);
+    CHECK(fv && ot.resident >= ot0.resident + fv->bytes);                               /* a zone { } block counts as "other" */
+    zone_bytes_get(ZBYTES_DB, &db);
+    CHECK(db.resident == db0.resident && db.retired == db0.retired);
+
+    /* a DB zone: its first version */
+    zone_db_entry_t *z = add_zone("default", "zb2.test.", 1, 3, 9201);
+    CHECK(z != NULL && snapshot_apply_db_delta() == 1);
+    zone_version_t *v1 = atomic_load(&z->rcu.active);
+    size_t b1 = v1->bytes;
+    CHECK(v1->counted && b1 > sizeof(zone_version_t) + v1->image->total_size - 1);
+    zone_bytes_get(ZBYTES_DB, &db);
+    CHECK(db.resident == db0.resident + b1 && db.retired == db0.retired);               /* (no IXFR difference for the first load) */
+    /* a new version: the old one is retired until it is freed */
+    zone_db_entry_t *z_again = add_zone("default", "zb2.test.", 2, 6, 9201);
+    CHECK(z_again == z);
+    zone_version_t *v2 = atomic_load(&z->rcu.active);
+    CHECK(v2 != v1 && v2->bytes > b1);
+    ixfr_txn_t *txn = z->ixfr_history.count > 0 ? z->ixfr_history.entries[(z->ixfr_history.head + z->ixfr_history.cap - 1) % z->ixfr_history.cap] : NULL;
+    CHECK(txn && txn->acct == 1 + ZBYTES_DB && txn->bytes >= sizeof(*txn) && txn->old_serial == 1 && txn->new_serial == 2);
+    zone_bytes_get(ZBYTES_DB, &db);
+    CHECK(txn && db.resident == db0.resident + v2->bytes + txn->bytes);
+    CHECK(db.retired == db0.retired + b1 || db.retired == db0.retired);                 /* (b1 is still counted unless the stack was run) */
+    zone_retire_process(true);
+    zone_bytes_get(ZBYTES_DB, &db);
+    CHECK(db.retired == db0.retired && db.resident == db0.resident + v2->bytes + txn->bytes);
+    /* the zone leaves: its versions and its history go with the entry */
+    CHECK(dbreg_delete("default", "zb2.test.", 9201) == 1 && snapshot_apply_db_delta() == 1);
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    zone_bytes_get(ZBYTES_DB, &db);
+    CHECK(db.resident == db0.resident && db.retired == db0.retired);
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    zone_bytes_get(ZBYTES_OTHER, &ot);
+    CHECK(ot.resident <= ot0.resident + 1 && ot.retired == ot0.retired);                 /* the file zone left with its snapshot */
+}
+
 int main(void) {
     snprintf(g_dir, sizeof(g_dir), "/tmp/karidns_dbreg.XXXXXX");
     if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
@@ -1292,6 +1734,13 @@ int main(void) {
     test_secondary_entries();
     test_reuse_fast_path();
     test_glue_dirty_on_delete();
+    test_dir_elements();
+    test_dir_delta_in_place();
+    test_dir_garbage_order();
+    test_dir_hidden_and_shared();
+    test_dir_replaced_entry_ticks();
+    test_dir_bytes_per_zone();
+    test_zone_bytes();
     test_concurrent();
     /* Remove the scratch directory in-process: the detached snapshot GC threads of test_concurrent may still be starting
      * or exiting here, and fork() from a multi-threaded process (as system("rm -rf") did) deadlocks under ASan on FreeBSD:

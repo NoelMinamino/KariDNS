@@ -763,8 +763,7 @@ static void test_update_multi_tsig_keys(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
 
@@ -1669,8 +1668,7 @@ static void test_update_dispatch_zone_section(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 2;
+    view_set_entries(&view, entries, 2);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
     zone_db_snapshot_t snap;
@@ -1795,8 +1793,7 @@ static void test_update_tsig_matrix(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
     zone_db_snapshot_t snap;

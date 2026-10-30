@@ -460,6 +460,11 @@ int main(int argc, char **argv) {
             printf("query logging is %s\n", st.query_logging ? "ON" : "OFF");
             printf("response logging is %s\n", st.response_logging ? "ON" : "OFF");
             printf("tcp clients: %d (High-water: %d)\n", st.tcp_clients, st.tcp_high_water);
+            /* D1a: what the zone versions hold (image, glue, IXFR differences); "retired" = replaced, not freed yet (a reader may hold it) */
+            printf("zone versions and IXFR deltas, database zones: %llu bytes resident, %llu bytes retired\n",
+                   (unsigned long long)st.db_bytes_resident, (unsigned long long)st.db_bytes_retired);
+            printf("zone versions and IXFR deltas, other zones: %llu bytes resident, %llu bytes retired\n",
+                   (unsigned long long)st.other_bytes_resident, (unsigned long long)st.other_bytes_retired);
             printf("server is up and running%s\n", st.frontend_alive ? "" : " (Frontend is down)");
             
             printf("\n--- Security & Rate Limit Stats ---\n");

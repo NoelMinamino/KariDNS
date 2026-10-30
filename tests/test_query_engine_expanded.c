@@ -170,8 +170,7 @@ static void test_all_rr_types_and_resolution(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
 
@@ -309,8 +308,7 @@ static void test_dnssec_negative_and_delegation_proofs(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
 
@@ -448,8 +446,7 @@ static void test_tinydns_timestamp_countdown(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
     zone_db_snapshot_t snap;
@@ -561,8 +558,7 @@ static void test_soa_set_per_client(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
     zone_db_snapshot_t snap;
@@ -669,8 +665,7 @@ static void test_mqtype_truncation(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
 
@@ -1020,17 +1015,14 @@ static void test_cname_loop_and_max_depth(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
+
+
 
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
-    view.hash_table = hash_tbl;
-    view.hash_size = 2;
-    view.chain_next = chain_nxt;
+    view_set_entries(&view, entries, 1);
+
 
     zone_db_snapshot_t snap;
     memset(&snap, 0, sizeof(snap));
@@ -1163,17 +1155,14 @@ static void test_prelink_zone_additional_glue_policies(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
+
+
 
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
-    view.hash_table = hash_tbl;
-    view.hash_size = 2;
-    view.chain_next = chain_nxt;
+    view_set_entries(&view, entries, 1);
+
 
     zone_db_snapshot_t snap;
     memset(&snap, 0, sizeof(snap));
@@ -1491,8 +1480,7 @@ static void gr_setup(const char *origin, const char *zone_text) {
     g_gr.entries[0] = &g_gr.entry;
     g_gr.acl[0] = (char *)"any";
     g_gr.view.name = "default";
-    g_gr.view.entries = g_gr.entries;
-    g_gr.view.zone_count = 1;
+    view_set_entries(&g_gr.view, g_gr.entries, 1);
     g_gr.view.match_clients = g_gr.acl;
     g_gr.view.match_clients_count = 1;
     g_gr.snap.views = &g_gr.view;
@@ -1958,17 +1946,14 @@ static void test_delegation_referral_and_ds_handling(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
+
+
 
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
-    view.hash_table = hash_tbl;
-    view.hash_size = 2;
-    view.chain_next = chain_nxt;
+    view_set_entries(&view, entries, 1);
+
 
     // 1. Regular query under delegated zone: www.child.example.com. -> Returns referral (delegation)
     uint8_t res[512] = {0};
@@ -2551,17 +2536,14 @@ static void test_dname_synthesis_and_wildcard_proofs(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
+
+
 
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
-    view.hash_table = hash_tbl;
-    view.hash_size = 2;
-    view.chain_next = chain_nxt;
+    view_set_entries(&view, entries, 1);
+
 
     zone_db_snapshot_t snap;
     memset(&snap, 0, sizeof(snap));
@@ -2632,17 +2614,14 @@ static void test_query_engine_protocol_qclass_and_edns_branches(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
+
+
 
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
-    view.hash_table = hash_tbl;
-    view.hash_size = 2;
-    view.chain_next = chain_nxt;
+    view_set_entries(&view, entries, 1);
+
 
     zone_db_snapshot_t snap;
     memset(&snap, 0, sizeof(snap));
@@ -2734,16 +2713,10 @@ static void test_cname_target_overflow_and_tsig_query_paths(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = {
-        .name = "default",
-        .entries = entries,
-        .zone_count = 1,
-        .hash_table = hash_tbl,
-        .hash_size = 2,
-        .chain_next = chain_nxt,
-    };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = {
         .views = &view,
         .view_count = 1,
@@ -2798,16 +2771,10 @@ static void test_non_data_rrtypes_and_special_qtypes(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = {
-        .name = "default",
-        .entries = entries,
-        .zone_count = 1,
-        .hash_table = hash_tbl,
-        .hash_size = 2,
-        .chain_next = chain_nxt,
-    };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = {
         .views = &view,
         .view_count = 1,
@@ -2879,16 +2846,10 @@ static void test_covering_rrsig_and_buffer_exhaustion_branches(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = {
-        .name = "default",
-        .entries = entries,
-        .zone_count = 1,
-        .hash_table = hash_tbl,
-        .hash_size = 2,
-        .chain_next = chain_nxt,
-    };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = {
         .views = &view,
         .view_count = 1,
@@ -2944,9 +2905,10 @@ static void test_dname_loop_and_depth_limit(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -2989,9 +2951,10 @@ static void test_wildcard_cname_and_dname_synthesis(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -3041,9 +3004,10 @@ static void test_nsec3_wildcard_nodata_and_optout(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -3087,9 +3051,10 @@ static void test_nsec_apex_and_delegation_proofs(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -3165,9 +3130,10 @@ static void test_edns_client_subnet_cache_matching(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -3230,9 +3196,10 @@ static void test_dns_cookie_badcookie_and_timestamp_drift(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -3337,8 +3304,7 @@ static void test_udp_bufsize_global_and_zone(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "__default__";   /* the parser's implicit view for top-level zone{} blocks */
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap;
     memset(&snap, 0, sizeof(snap));
     snap.views = &view;
@@ -3439,8 +3405,7 @@ static void test_truncated_response_keeps_opt(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap;
     memset(&snap, 0, sizeof(snap));
     snap.views = &view;
@@ -3513,9 +3478,10 @@ static void test_rrl_slip_and_tc_response(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     const rate_limit_config_t *rrl_cfg = NULL;
@@ -3577,9 +3543,10 @@ static void test_proxy_v2_header_parsing(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -3622,9 +3589,10 @@ static void test_catalog_zone_queries_and_member_zones(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -3667,9 +3635,10 @@ static void test_any_query_with_dnssec_rrsigs(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -3711,9 +3680,10 @@ static void test_cname_pointing_to_delegation_referral(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -3803,9 +3773,10 @@ static void test_program_zone_dynamic_scripts(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -3846,9 +3817,10 @@ static void test_prelinked_glue_records_ordering(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -3889,9 +3861,10 @@ static void test_nsec3_salt_and_iteration_limits(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -3983,8 +3956,7 @@ static void test_tinydns_timestamp_decay_and_expiry(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
@@ -4047,9 +4019,10 @@ static void test_tsig_badkey_badsig_badtime_responses(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     tsig_key_t key;
@@ -4106,9 +4079,10 @@ static void test_dynamic_update_prerequisites_and_actions(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     // Construct Update query (Opcode = 5)
@@ -4159,9 +4133,10 @@ static void test_udp_truncation_with_edns_buffer_size(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1, .hash_table = hash_tbl, .hash_size = 2, .chain_next = chain_nxt };
+
+
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -4219,9 +4194,6 @@ static void test_multiple_views_acls_and_fallback(void) {
 
     zone_db_entry_t *entries_int[1] = {&entry_int};
     zone_db_entry_t *entries_ext[1] = {&entry_ext};
-    int hash_tbl1[2] = {0, -1}, hash_tbl2[2] = {0, -1};
-    int chain_nxt1[1] = {-1}, chain_nxt2[1] = {-1};
-
     acl_entry_t acl_int;
     memset(&acl_int, 0, sizeof(acl_int));
     cidr_entry_parse(&acl_int.cidr, "10.0.0.0/8");
@@ -4230,24 +4202,16 @@ static void test_multiple_views_acls_and_fallback(void) {
     view_snapshot_t views[2];
     views[0] = (view_snapshot_t){
         .name = "internal",
-        .entries = entries_int,
-        .zone_count = 1,
-        .hash_table = hash_tbl1,
-        .hash_size = 2,
-        .chain_next = chain_nxt1,
         .match_clients_parsed = &acl_int,
         .match_clients_count = 1,
     };
+    view_set_entries(&views[0], entries_int, 1);
     views[1] = (view_snapshot_t){
         .name = "external",
-        .entries = entries_ext,
-        .zone_count = 1,
-        .hash_table = hash_tbl2,
-        .hash_size = 2,
-        .chain_next = chain_nxt2,
         .match_clients_parsed = NULL,
         .match_clients_count = 0,
     };
+    view_set_entries(&views[1], entries_ext, 1);
 
     zone_db_snapshot_t snap = { .views = views, .view_count = 2 };
 
@@ -7664,7 +7628,8 @@ static void test_query_engine_feature_case_201(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -7717,7 +7682,8 @@ static void test_query_engine_feature_case_202(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -7768,7 +7734,8 @@ static void test_query_engine_feature_case_203(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -7817,7 +7784,8 @@ static void test_query_engine_feature_case_204(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -7866,7 +7834,8 @@ static void test_query_engine_feature_case_205(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -7916,7 +7885,8 @@ static void test_query_engine_feature_case_206(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -7965,7 +7935,8 @@ static void test_query_engine_feature_case_207(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -8078,11 +8049,9 @@ static void test_query_engine_feature_case_211(void) {
     view_snapshot_t views[2];
     memset(views, 0, sizeof(views));
     views[0].name = "internal";
-    views[0].entries = int_entries;
-    views[0].zone_count = 1;
+    view_set_entries(&views[0], int_entries, 1);
     views[1].name = "default";
-    views[1].entries = ext_entries;
-    views[1].zone_count = 1;
+    view_set_entries(&views[1], ext_entries, 1);
 
     zone_db_snapshot_t snap = { .views = views, .view_count = 2 };
 
@@ -8510,7 +8479,8 @@ static void test_query_engine_feature_case_225(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -8553,7 +8523,8 @@ static void test_query_engine_feature_case_226(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -8589,7 +8560,8 @@ static void test_query_engine_feature_case_227(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -8625,7 +8597,8 @@ static void test_query_engine_feature_case_228(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -8663,7 +8636,8 @@ static void test_query_engine_feature_case_229(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -8701,7 +8675,8 @@ static void test_query_engine_feature_case_230(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -8739,7 +8714,8 @@ static void test_query_engine_feature_case_231(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -8777,7 +8753,8 @@ static void test_query_engine_feature_case_232(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -8815,7 +8792,8 @@ static void test_query_engine_feature_case_233(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -8852,7 +8830,8 @@ static void test_query_engine_feature_case_234(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -8889,7 +8868,8 @@ static void test_query_engine_feature_case_235(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -8926,7 +8906,8 @@ static void test_query_engine_feature_case_236(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -8963,7 +8944,8 @@ static void test_query_engine_feature_case_237(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -9000,7 +8982,8 @@ static void test_query_engine_feature_case_238(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -9037,7 +9020,8 @@ static void test_query_engine_feature_case_239(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -9074,7 +9058,8 @@ static void test_query_engine_feature_case_240(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -9139,7 +9124,8 @@ static void test_query_engine_feature_case_243(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
-    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    view_snapshot_t view = { .name = "default" };
+    view_set_entries(&view, entries, 1);
     zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
 
     compress_ctx_t comp_ctx;
@@ -9416,8 +9402,7 @@ static void test_query_engine_opcode_header_validations(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
 
     zone_db_snapshot_t snap;
     memset(&snap, 0, sizeof(snap));
@@ -9503,8 +9488,7 @@ static void test_query_engine_dname_cname_wildcard_truncation(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
 
     zone_db_snapshot_t snap;
     memset(&snap, 0, sizeof(snap));
@@ -9657,8 +9641,7 @@ static void b9_zone_load(b9_zone_t *z, const char *apex, const char *text) {
     z->entries[0] = &z->entry;
     z->acl[0] = (char *)"any";
     z->view.name = "default";
-    z->view.entries = z->entries;
-    z->view.zone_count = 1;
+    view_set_entries(&z->view, z->entries, 1);
     z->view.match_clients = z->acl;
     z->view.match_clients_count = 1;
     z->snap.views = &z->view;
@@ -10516,8 +10499,7 @@ static void test_require_server_cookie_and_view_udp_size(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
     zone_db_snapshot_t snap;

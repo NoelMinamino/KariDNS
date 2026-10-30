@@ -1,7 +1,7 @@
 #!/bin/sh
 # R-25 regression: epoch-RCU publish ordering under ThreadSanitizer.
 #
-# Part 1: test_epoch_rcu-tsan (publish order, grace period, reuse stress).
+# Part 1: test_epoch_rcu-tsan (publish order, grace period, reuse stress); part 1b: test_zone_dir-tsan (the zone directory, D1a).
 # Part 2: karidns-tsan as a primary. Concurrently:
 #   - UDP and TCP (tcp-connection-reuse) queries from several clients,
 #   - SIGHUP reloads with a touched zone file (config swap + reload_master_zone
@@ -31,8 +31,8 @@ UPDATES=${UPDATES:-15}
 echo "=== R-25 RCU TSan test ==="
 
 # Build as the invoking user (kari_make: running make as root leaves root-owned objects).
-if ! kari_make karidns karidns-tsan dag test_epoch_rcu-tsan >/dev/null 2>&1; then
-    echo "FAIL: could not build karidns / karidns-tsan / dag / test_epoch_rcu-tsan"
+if ! kari_make karidns karidns-tsan dag test_epoch_rcu-tsan test_zone_dir-tsan >/dev/null 2>&1; then
+    echo "FAIL: could not build karidns / karidns-tsan / dag / test_epoch_rcu-tsan / test_zone_dir-tsan"
     exit 1
 fi
 
@@ -97,6 +97,19 @@ if grep -q "WARNING: ThreadSanitizer" "$WORK/unit.log"; then
     exit 1
 fi
 grep "reads=" "$WORK/unit.log"
+
+echo "--- part 1b: test_zone_dir-tsan (the zone directory under concurrent readers, D1a)"
+if ! TSAN_OPTIONS="halt_on_error=0" ./test_zone_dir-tsan >"$WORK/zdir.log" 2>&1; then
+    echo "FAIL: test_zone_dir-tsan exited with an error"
+    cat "$WORK/zdir.log"
+    exit 1
+fi
+if grep -q "WARNING: ThreadSanitizer" "$WORK/zdir.log"; then
+    echo "FAIL: ThreadSanitizer reports in test_zone_dir-tsan"
+    cat "$WORK/zdir.log"
+    exit 1
+fi
+grep "inconsistencies" "$WORK/zdir.log"
 
 cp tests/zones/example.com.zone tests/zones/example.com.dnskey tests/zones/example.com.hosts "$WORK/"
 

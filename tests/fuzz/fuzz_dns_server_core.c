@@ -60,8 +60,7 @@ static void init_fuzz_environment(void) {
 
     memset(&g_fuzz_view, 0, sizeof(g_fuzz_view));
     g_fuzz_view.name = "default";
-    g_fuzz_view.entries = g_fuzz_entries;
-    g_fuzz_view.zone_count = 1;
+    view_set_entries(&g_fuzz_view, g_fuzz_entries, 1);
     g_fuzz_view.match_clients = g_fuzz_any_acl;
     g_fuzz_view.match_clients_count = 1;
 

@@ -3701,7 +3701,7 @@ void *control_thread_func(void *arg) {
               zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
               if (snap) {
                 for (size_t v = 0; v < snap->view_count; v++) {
-                  st.num_zones += snap->views[v].zone_count - snap->views[v].shared_count;   /* a zone shared with another view (in-view) is one zone */
+                  st.num_zones += zdir_count_owned(&snap->views[v]);   /* a zone shared with another view (in-view) is one zone */
                 }
                 release_zone_snapshot(snap);
               }
@@ -3734,7 +3734,16 @@ void *control_thread_func(void *arg) {
               snprintf(st.os_release, sizeof(st.os_release), "%s", g_host_status_info.un.release);
               snprintf(st.machine, sizeof(st.machine), "%s", g_host_status_info.un.machine);
               st.ncpus = g_host_status_info.ncpus;
-              
+              {
+                zone_bytes_t zb_db, zb_other;
+                zone_bytes_get(ZBYTES_DB, &zb_db);
+                zone_bytes_get(ZBYTES_OTHER, &zb_other);
+                st.db_bytes_resident = zb_db.resident;
+                st.db_bytes_retired = zb_db.retired;
+                st.other_bytes_resident = zb_other.resident;
+                st.other_bytes_retired = zb_other.retired;
+              }
+
               struct iovec iov[2];
               iov[0].iov_base = "OK ";
               iov[0].iov_len = 3;
@@ -3783,40 +3792,62 @@ void *control_thread_func(void *arg) {
               char canon_buf[256];
               const char *canon_arg = (arg && strlen(arg) > 0) ? find_configured_domain(arg, canon_buf, sizeof(canon_buf)) : NULL;
 
+              /* The zones are collected first: the directories change under a snapshot (zone_db_snapshot_t), so the count sent in the
+               * first line and the zones sent after it must come from one pass.  The entries stay valid while the snapshot is held. */
               uint32_t match_count = 0;
+              zone_db_entry_t **obs = NULL;
+              bool obs_oom = false;
               if (snap) {
-                for (size_t v = 0; v < snap->view_count; v++) {
+                size_t cap = 0, n = 0;
+                for (size_t v = 0; v < snap->view_count && !obs_oom; v++) {
                   if (view_arg && strcasecmp(snap->views[v].name, view_arg) != 0) continue;
-                  for (size_t z = 0; z < snap->views[v].zone_count; z++) {
-                    zone_db_entry_t *e = snap->views[v].entries[z];
-                    if (!e || !view_owns_entry(&snap->views[v], e)) continue;   /* a shared zone is listed once, in its owner view */
+                  zdir_elem_t **els = NULL;
+                  size_t en = 0, ecap = 0;
+                  zdir_iter_t it;
+                  zdir_iter_init(&it, &snap->views[v]);
+                  for (zdir_elem_t *el; (el = zdir_iter_next(&it));) {
+                    zone_db_entry_t *e = zdir_entry(el);
+                    if (!e || !view_owns_elem(el)) continue;   /* a shared zone is listed once, in its owner view */
                     if (canon_arg && !domain_names_match_ci(e->domain, canon_arg)) continue;
-                    match_count++;
+                    if (en == ecap) {
+                      zdir_elem_t **ne = realloc(els, (ecap ? ecap * 2 : 64) * sizeof(*ne));
+                      if (!ne) { obs_oom = true; break; }
+                      els = ne;
+                      ecap = ecap ? ecap * 2 : 64;
+                    }
+                    els[en++] = el;
                   }
+                  /* the zones of zone { } blocks and the catalog members first, in the order of the configuration, then the database zones */
+                  if (en > 1) qsort(els, en, sizeof(*els), zdir_listing_cmp);
+                  if (!obs_oom && n + en > cap) {
+                    zone_db_entry_t **no = realloc(obs, (n + en) * sizeof(*no));
+                    if (!no) obs_oom = true;
+                    else { obs = no; cap = n + en; }
+                  }
+                  for (size_t k = 0; !obs_oom && k < en; k++) obs[n++] = zdir_entry(els[k]);
+                  free(els);
                 }
+                match_count = (uint32_t)n;
               }
 
-              char resp_hdr[64];
-              int hlen = snprintf(resp_hdr, sizeof(resp_hdr), "OK %u\n", match_count);
-              send(cfd, resp_hdr, hlen, 0);
+              if (obs_oom) {
+                send(cfd, "ERROR out of memory\n", 20, 0);
+              } else {
+                char resp_hdr[64];
+                int hlen = snprintf(resp_hdr, sizeof(resp_hdr), "OK %u\n", match_count);
+                send(cfd, resp_hdr, hlen, 0);
 
-              if (snap && match_count > 0) {
-                for (size_t v = 0; v < snap->view_count; v++) {
-                  if (view_arg && strcasecmp(snap->views[v].name, view_arg) != 0) continue;
-                  for (size_t z = 0; z < snap->views[v].zone_count; z++) {
-                    zone_db_entry_t *e = snap->views[v].entries[z];
-                    if (!e || !view_owns_entry(&snap->views[v], e)) continue;   /* a shared zone is listed once, in its owner view */
-                    if (canon_arg && !domain_names_match_ci(e->domain, canon_arg)) continue;
-                    zone_observatory_snapshot_t snap_item;
-                    memset(&snap_item, 0, sizeof(snap_item));
-                    // active arena を読むので読み取り区間に入れる (send は区間の外)
-                    rcu_aux_read_lock();
-                    fill_observatory_snapshot(e, active_cfg, &snap_item);
-                    rcu_aux_read_unlock();
-                    send(cfd, &snap_item, sizeof(snap_item), 0);
-                  }
+                for (uint32_t k = 0; k < match_count; k++) {
+                  zone_observatory_snapshot_t snap_item;
+                  memset(&snap_item, 0, sizeof(snap_item));
+                  // active arena を読むので読み取り区間に入れる (send は区間の外)
+                  rcu_aux_read_lock();
+                  fill_observatory_snapshot(obs[k], active_cfg, &snap_item);
+                  rcu_aux_read_unlock();
+                  send(cfd, &snap_item, sizeof(snap_item), 0);
                 }
               }
+              free(obs);
               if (active_cfg) release_config_snapshot(active_cfg);
               if (snap) release_zone_snapshot(snap);
             } else if (strcmp(cmd, "notify") == 0 && arg) {
@@ -3947,6 +3978,7 @@ void *control_thread_func(void *arg) {
         control_park_timeouts(now);
         notify_retransmit_due(now); /* RFC 1996 §3.6: 応答の無い NOTIFY の再送 */
 
+        if (gc_has_unstarted()) gc_start_pending();       /* a snapshot cleanup thread that could not be started is tried again */
         server_config_t *active = acquire_config_snapshot();
         zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
         if (snap) {
@@ -3960,15 +3992,27 @@ void *control_thread_func(void *arg) {
             bool walk_all = atomic_exchange_explicit(&g_zone_notify_pending, 0, memory_order_acq_rel) != 0;
             rcu_aux_read_lock();
             for (size_t v = 0; v < snap->view_count; v++) {
-                zone_db_entry_t **list = walk_all ? snap->views[v].entries : snap->views[v].tick_entries;
-                size_t count = walk_all ? snap->views[v].zone_count : snap->views[v].tick_count;
+                /* The zones to look at: the view's tick list (the secondaries and catalog members, in the order of the configuration and then
+                 * the database zones: the order in which refreshes start matters, transfers-per-ns lets only some of them run), and, for a
+                 * walk of every zone, then every other slot of its directory.  The walk of the slots holds the table it started with:
+                 * an element that is in the directory for the whole walk is seen. */
+                zdir_iter_t dit;
+                zdir_iter_init(&dit, &snap->views[v]);
+                for (int phase = 0; phase < (walk_all ? 2 : 1); phase++) {
+                zdir_elem_t *const *list = NULL;
+                size_t count;
+                bool slots = phase == 1;
+                if (slots) count = zdir_iter_slots(&dit);
+                else list = zdir_tick_list(&snap->views[v], &count);
                 /* transfers-in and serial-query-rate leave a refresh that is over the limit for a later tick; the walk starts one entry
                  * further each tick so that the zones at the end of the list are not always the ones that wait (BIND queues them in order) */
                 size_t rot = count ? g_tick_rotor % count : 0;
                 for (size_t kk = 0; kk < count; kk++) {
                     size_t i = (kk + rot) % count;
-                    zone_db_entry_t *entry = list[i];
-                    if (!entry || !view_owns_entry(&snap->views[v], entry)) continue;   /* a zone shared with another view (in-view) is looked at in its owner view, once */
+                    zdir_elem_t *el = slots ? zdir_iter_at(&dit, i) : list[i];
+                    zone_db_entry_t *entry = zdir_entry(el);
+                    if (!entry || !view_owns_elem(el)) continue;   /* a zone shared with another view (in-view) is looked at in its owner view, once */
+                    if (slots && zone_entry_ticks(entry)) continue;   /* (the tick list had it) */
 
                     /* B8t-2: settings received from the primary follow a changed karidns.conf (a secondary's own statements win) */
                     if (atomic_load_explicit(&entry->rx_present, memory_order_relaxed)) zone_rx_settings_refresh(entry, active);
@@ -4070,6 +4114,7 @@ void *control_thread_func(void *arg) {
                             }
                         }
                     }
+                }
                 }
             }
             g_tick_rotor++;

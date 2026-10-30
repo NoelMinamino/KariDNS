@@ -1268,7 +1268,7 @@ typedef struct {
 static bool inv_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   inv_ctx_t *c = ud;
   ing_t *g = c->g;
-  if (!z->entry) return true;                            /* never applied: nothing the loader could skip */
+  if (!zdir_entry(z)) return true;                            /* never applied: nothing the loader could skip */
   /* B6a: a zone whose last version was refused (or could not be read) is offered again by a loader that starts now: it
    * must not find the old version "up to date" and leave the error standing when the data are fixed */
   if (z->last_result == DBREG_REJECTED) return true;
@@ -1733,8 +1733,8 @@ static bool reeval_cb(void *ud, const char *view, const dbreg_zone_t *z) {
     c->chunk = 0;
     return false;
   }
-  if (!z->entry) return true;
-  const zone_config_t *dc = atomic_load_explicit(&z->entry->dbcfg, memory_order_acquire);
+  if (!zdir_entry(z)) return true;
+  const zone_config_t *dc = atomic_load_explicit(&zdir_entry(z)->dbcfg, memory_order_acquire);
   if (!dc || !dc->ext_shared) return true;
   c->zones++;
   const zone_ext_t *x = dc->ext;
@@ -2315,13 +2315,13 @@ static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   c->matches++;
   const char *st = z->shadowed ? "shadowed" : (z->last_result == DBREG_REJECTED ? "rejected" : "applied");
   st_append(c, "zone %s view %s: source id %lld, serial %u, status %s", z->name, view, (long long)z->source_id,
-            z->entry ? (z->entry->is_secondary ? atomic_load_explicit(&z->entry->serial, memory_order_relaxed) : z->serial) : 0u, st);
+            zdir_entry(z) ? (zdir_entry(z)->is_secondary ? atomic_load_explicit(&zdir_entry(z)->serial, memory_order_relaxed) : z->serial) : 0u, st);
   if (z->shadowed) st_append(c, z->shadow_by == DBREG_SH_CATALOG ? " (hidden by a catalog member)" : " (hidden by a zone in karidns.conf)");
-  if (z->last_result == DBREG_REJECTED && z->entry) st_append(c, " (serving the last good version, serial %u)", z->serial);
-  if (!z->entry) st_append(c, " (no version loaded)");
+  if (z->last_result == DBREG_REJECTED && zdir_entry(z)) st_append(c, " (serving the last good version, serial %u)", z->serial);
+  if (!zdir_entry(z)) st_append(c, " (no version loaded)");
   if (z->error) st_append(c, ", last error: %s", z->error);
   st_append(c, "\n");
-  if (z->entry) settings_status(c, z->entry);
+  if (zdir_entry(z)) settings_status(c, zdir_entry(z));
   return true;
 }
 
@@ -2360,6 +2360,19 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
   else
     st_append(&c, "zones: %zu in the registry (%zu served, %zu shadowed by karidns.conf, %zu hidden by catalog members), "
                   "%zu with a rejected version\n", total, total - sh_cfg - sh_cat, sh_cfg, sh_cat, rejected);
+  {
+    /* D1a (design 8.1): what the zone versions hold; "retired" = replaced, not freed yet (a reader or a transfer may still hold it) */
+    zone_bytes_t zdb, zot;
+    zone_bytes_get(ZBYTES_DB, &zdb);
+    zone_bytes_get(ZBYTES_OTHER, &zot);
+    st_append(&c, "zone versions and IXFR deltas: database zones %llu bytes resident + %llu retired; other zones %llu resident + %llu retired\n",
+              (unsigned long long)zdb.resident, (unsigned long long)zdb.retired, (unsigned long long)zot.resident,
+              (unsigned long long)zot.retired);
+    size_t nel, rbytes, ibytes;
+    dbreg_dir_bytes(&nel, &rbytes, &ibytes);
+    st_append(&c, "zone directory: %zu elements, %zu bytes in the registry + %zu bytes in the indexes of the views (%zu bytes per zone)\n",
+              nel, rbytes, ibytes, nel ? (rbytes + ibytes) / nel : (size_t)0);
+  }
   fmt_time(atomic_load(&g_st.batch_time), t2, sizeof(t2));
   if (atomic_load(&g_st.batch_id) == 0)
     st_append(&c, "last batch: none yet\n");

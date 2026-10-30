@@ -151,6 +151,7 @@ void xfr_run_primaries(int n, xfr_try_fn fn, void *arg, xfr_run_t *out) {
 
 void free_ixfr_txn(ixfr_txn_t *txn) {
   if (!txn) return;
+  if (txn->acct) zone_bytes_resident_add(txn->acct - 1, -(int64_t)txn->bytes);
   zone_arena_destroy(&txn->arena);
   if (txn->deleted) free(txn->deleted);
   if (txn->added) free(txn->added);
@@ -382,6 +383,10 @@ void compute_ixfr_diff(zone_db_entry_t *entry, const zone_version_t *old_ver, co
   }
   h->entries[h->head] = txn;
   h->head = (uint8_t)((h->head + 1) % h->cap);
+  /* D1a (8.1): what the history holds counts as resident while the difference is in it (free_ixfr_txn() gives it back) */
+  txn->bytes = sizeof(*txn) + ((size_t)del_count + add_count) * sizeof(dns_record_t) + txn->arena.pool_bytes;
+  txn->acct = (int8_t)(1 + zone_bytes_class(entry));
+  zone_bytes_resident_add(txn->acct - 1, (int64_t)txn->bytes);
   pthread_mutex_unlock(&h->lock);
 out:
   free(del_rr);

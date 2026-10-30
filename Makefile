@@ -273,6 +273,7 @@ tools/karictl.o: tools/karictl.c
 TEST_CIDR_SRCS = tests/test_cidr.c dns_cidr.c dns_tsig_acl.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c
 TEST_DBSTREAM_SRCS = tests/test_db_stream.c dns_db_stream.c dns_db_checkproto.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 TEST_DB_REGISTRY_SRCS = tests/test_db_registry.c dns_db_install.c dns_db_stream.c $(PDNS_XFR_DEPS)
+TEST_ZONE_DIR_SRCS = tests/test_zone_dir.c $(PDNS_XFR_DEPS)
 TEST_PRESIGNED_SRCS = tests/test_presigned.c tests/db/zone2sql_lib.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c $(PDNS_XFR_DEPS)
 TEST_DB_SUPERVISOR_SRCS = tests/test_db_supervisor.c dns_db_supervisor.c dns_priv_sandbox.c dns_utils.c
 TEST_PDNS_READER_SRCS = tests/test_pdns_reader.c tests/db/zone2sql_lib.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c $(PDNS_XFR_DEPS)
@@ -345,6 +346,16 @@ test_db_registry: $(TEST_DB_REGISTRY_SRCS)
 
 db_registry_test: test_db_registry
 	./test_db_registry
+
+test_zone_dir: $(TEST_ZONE_DIR_SRCS)
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_ZONE_DIR_SRCS) -o test_zone_dir $(LDFLAGS) -lcrypto -lpthread -lm
+
+zone_dir_test: test_zone_dir
+	./test_zone_dir
+
+# D1a: the concurrent directory test is also run under ThreadSanitizer (tests/run_rcu_tsan_test.sh)
+test_zone_dir-tsan: $(TEST_ZONE_DIR_SRCS)
+	$(CC) $(TSAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_ZONE_DIR_SRCS) -o $@ $(TSAN_LDFLAGS) -lcrypto -lpthread -lm
 
 test_pdns_reader: $(TEST_PDNS_READER_SRCS)
 	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_PDNS_READER_SRCS) -o test_pdns_reader $(LDFLAGS) -lcrypto -lpthread -lm
@@ -730,7 +741,7 @@ fi_dag_test: test_fi_dag
 
 # Binaries behind unit-tests, so they can be built in parallel first
 # (`make -j$(nproc) unit-test-bins`); the tests themselves then run one by one.
-UT_BINS = test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_db_stream test_pdns_reader test_presigned test_db_supervisor test_db_sqlite3 test_db_registry test_db_pgsql
+UT_BINS = test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_db_stream test_pdns_reader test_presigned test_db_supervisor test_db_sqlite3 test_db_registry test_zone_dir test_db_pgsql
 
 unit-test-bins: $(UT_BINS)
 
@@ -739,7 +750,7 @@ unit-test-bins: $(UT_BINS)
 # `make sweep-tests` runs them on their own. They are not part of unit-tests.
 sweep-tests: coverage_sweep_test coverage_sweep_dag_test coverage_sweep_net_test coverage_sweep_tools_test
 
-unit-tests: cidr_test tinydns_test asan_test include_test config_directives_test xfr_opts_test server_stmt_test wire_helpers_test zone_image_test zone_parser_paths_test tinydns_paths_test sig0_sign_test snapshot_rebuild_test dnssec_proofs_test qe_protocol_test dag_format_test dag_iter_test dag_reassembly_test hash_test epoch_rcu_test dnstap_test edns_ecs_test rfc_vectors_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test response_cache_test vulnerability_test catalog_zone_test snapshot_sandbox_test dag_tools_test server_core_test fi_parsers_test fi_wire_test fi_snapshot_test fi_xfr_test fi_misc_test fi_dag_test db_stream_test pdns_reader_test presigned_test db_supervisor_test db_sqlite3_test db_registry_test db_pgsql_test
+unit-tests: cidr_test tinydns_test asan_test include_test config_directives_test xfr_opts_test server_stmt_test wire_helpers_test zone_image_test zone_parser_paths_test tinydns_paths_test sig0_sign_test snapshot_rebuild_test dnssec_proofs_test qe_protocol_test dag_format_test dag_iter_test dag_reassembly_test hash_test epoch_rcu_test dnstap_test edns_ecs_test rfc_vectors_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test response_cache_test vulnerability_test catalog_zone_test snapshot_sandbox_test dag_tools_test server_core_test fi_parsers_test fi_wire_test fi_snapshot_test fi_xfr_test fi_misc_test fi_dag_test db_stream_test pdns_reader_test presigned_test db_supervisor_test db_sqlite3_test db_registry_test zone_dir_test db_pgsql_test
 
 # --- Unit tests under ASan + UBSan --------------------------------------------
 # The plain test_* targets above are built with the production CFLAGS (-O3 -flto),
@@ -774,6 +785,9 @@ test_db_stream-asan: $(TEST_DBSTREAM_SRCS:.c=.uta.o)
 
 test_db_registry-asan: $(TEST_DB_REGISTRY_SRCS:.c=.uta.o)
 	$(CC) $(TEST_DB_REGISTRY_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto -lpthread -lm
+
+test_zone_dir-asan: $(TEST_ZONE_DIR_SRCS:.c=.uta.o)
+	$(CC) $(TEST_ZONE_DIR_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto -lpthread -lm
 
 test_pdns_reader-asan: $(TEST_PDNS_READER_SRCS:.c=.uta.o)
 	$(CC) $(TEST_PDNS_READER_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto -lpthread -lm
@@ -912,7 +926,7 @@ test_dag_reassembly-asan: $(TEST_DAGREASM_SRCS:.c=.utn.o)
 test_server_core-asan: $(TEST_SERVER_CORE_SRCS:.c=.uta.o)
 	$(CC) $(TEST_SERVER_CORE_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-UT_ASAN_BINS = test_cidr-asan test_tinydns_parser-asan test_asan_overflow-asan test_conf_include-asan test_config_directives-asan test_acl_match-asan test_listen_on-asan test_xfr_opts-asan test_server_stmt-asan test_wire_helpers-asan test_zone_image-asan test_zone_parser_paths-asan test_tinydns_paths-asan test_sig0_sign-asan test_snapshot_rebuild-asan test_dnssec_proofs-asan test_query_engine_protocol-asan test_dag_format-asan test_dag_iter-asan test_dag_reassembly-asan test_hash_table-asan test_epoch_rcu-asan test_dnstap_engine-asan test_edns_ecs_engine-asan test_rfc_vectors-asan test_dynamic_update_engine-asan test_axfr_ixfr_engine-asan test_rrl_engine-asan test_query_engine_expanded-asan test_response_cache-asan test_vulnerability_fixes-asan test_catalog_zone_engine-asan test_snapshot_sandbox_engine-asan test_dag_tools-asan test_coverage_sweep_net-asan test_server_core-asan test_db_stream-asan test_pdns_reader-asan test_presigned-asan test_db_supervisor-asan test_db_sqlite3-asan test_db_registry-asan test_db_pgsql-asan
+UT_ASAN_BINS = test_cidr-asan test_tinydns_parser-asan test_asan_overflow-asan test_conf_include-asan test_config_directives-asan test_acl_match-asan test_listen_on-asan test_xfr_opts-asan test_server_stmt-asan test_wire_helpers-asan test_zone_image-asan test_zone_parser_paths-asan test_tinydns_paths-asan test_sig0_sign-asan test_snapshot_rebuild-asan test_dnssec_proofs-asan test_query_engine_protocol-asan test_dag_format-asan test_dag_iter-asan test_dag_reassembly-asan test_hash_table-asan test_epoch_rcu-asan test_dnstap_engine-asan test_edns_ecs_engine-asan test_rfc_vectors-asan test_dynamic_update_engine-asan test_axfr_ixfr_engine-asan test_rrl_engine-asan test_query_engine_expanded-asan test_response_cache-asan test_vulnerability_fixes-asan test_catalog_zone_engine-asan test_snapshot_sandbox_engine-asan test_dag_tools-asan test_coverage_sweep_net-asan test_server_core-asan test_db_stream-asan test_pdns_reader-asan test_presigned-asan test_db_supervisor-asan test_db_sqlite3-asan test_db_registry-asan test_zone_dir-asan test_db_pgsql-asan
 
 unit-tests-asan: $(UT_ASAN_BINS)
 	@rc=0; for t in $(UT_ASAN_BINS); do \
@@ -1141,7 +1155,7 @@ COV_BIN_OBJS += -object=test_rrl_engine -object=test_query_engine_expanded -obje
 COV_BIN_OBJS += -object=test_catalog_zone_engine -object=test_snapshot_sandbox_engine -object=test_dag_tools -object=test_server_core
 COV_BIN_OBJS += -object=test_fi_parsers -object=test_fi_wire -object=test_fi_snapshot -object=test_fi_xfr -object=test_fi_misc -object=test_fi_dag
 COV_BIN_OBJS += -object=test_coverage_sweep -object=test_coverage_sweep_dag -object=test_coverage_sweep_net -object=test_coverage_sweep_tools
-COV_BIN_OBJS += -object=test_db_stream -object=test_db_registry -object=test_pdns_reader -object=test_presigned -object=test_db_supervisor
+COV_BIN_OBJS += -object=test_db_stream -object=test_db_registry -object=test_zone_dir -object=test_pdns_reader -object=test_presigned -object=test_db_supervisor
 COV_PG_OBJ != [ -n "$(DBPG_HAVE)" ] && printf -- '-object=test_db_pgsql' || true
 COV_BIN_OBJS += $(COV_PG_OBJ)
 # B11c: the loader itself (karidns_dbloader.c, with the drivers the build host has) and the SQLite3 driver / loader unit test
@@ -1156,7 +1170,7 @@ coverage-build:
 	@echo "=== Building KariDNS & Test Suite with Profile Coverage ==="
 	$(MAKE) clean
 	$(MAKE) -j$(COV_JOBS) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" all karicheck
-	$(MAKE) -j$(COV_JOBS) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_pgsql test_db_sqlite3 test_db_stream test_db_registry test_pdns_reader test_presigned test_db_supervisor
+	$(MAKE) -j$(COV_JOBS) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_pgsql test_db_sqlite3 test_db_stream test_db_registry test_zone_dir test_pdns_reader test_presigned test_db_supervisor
 	@# B11c: the loader the integration tests start, instrumented, with the sqlite3 and (when libpq is there) the postgresql driver
 	$(MAKE) -j$(COV_JOBS) CC="clang" CFLAGS="$(COV_CFLAGS) -fprofile-instr-generate=$$(pwd)/$(COV_DIR)/$(COV_DBL_PAT_$(COV_CONTINUOUS))" LDFLAGS="$(COV_LDFLAGS) -fprofile-instr-generate=$$(pwd)/$(COV_DIR)/$(COV_DBL_PAT_$(COV_CONTINUOUS))" DB_DRIVERS="$(COV_DB_DRIVERS)" karidns-dbloader
 	$(MAKE) -j$(COV_JOBS) coverage-fuzz-build
@@ -1198,7 +1212,7 @@ clean: clean-fuzz coverage-clean
 	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck bench_serialize bench_rrl $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
 	@# karicheck's objects outside $(OBJS): an uninstrumented copy left here would be linked into the coverage build
 	rm -f dns_zone_lint.o dns_db_checkproto.o
-	rm -f karidns-asan karidns-tsan test_epoch_rcu-tsan *.asan.o *.tsan.o test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_stream test_pdns_reader test_presigned test_db_supervisor test_db_sqlite3 test_db_registry test_db_pgsql karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan tests/db/zone2sql tests/db/zone2kdb
+	rm -f karidns-asan karidns-tsan test_epoch_rcu-tsan test_zone_dir-tsan test_zone_dir *.asan.o *.tsan.o test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_stream test_pdns_reader test_presigned test_db_supervisor test_db_sqlite3 test_db_registry test_db_pgsql karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan tests/db/zone2sql tests/db/zone2kdb
 	rm -f $(UT_ASAN_BINS)
 	rm -f *.uta.o *.utn.o tests/*.uta.o tests/*.utn.o tools/*.uta.o tools/*.utn.o
 	rm -f tests/fi/kari_fi_preload.so
