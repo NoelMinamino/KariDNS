@@ -2964,7 +2964,7 @@ static int build_apex_soa_answer(const uint8_t *req, size_t req_len, uint8_t *re
   if (skip_wire_name(req, req_len, DNS_HEADER_SIZE, &q_end) != 0 || q_end + 4 > req_len) return -1;
   if (((req[q_end + 2] << 8) | req[q_end + 3]) != 1) return -1;                  // (class IN)
   size_t q_offset = q_end + 4;
-  const uint8_t *mn = ap->data, *rn = ap->data + ap->mname_len, *ns = rn + ap->rname_len;
+  const uint8_t *ns = ap->data + ap->mname_len + ap->rname_len;
   const bool with_ns = minimal_mode == MINIMAL_NO;
   /* the glue the zone in memory adds (append_glue_records()): the addresses of the NS targets, from the zone itself and, when the target is in another zone of
    * the view, from that zone.  The summary has the addresses of the targets inside this zone; a target that another zone of the view holds (a sibling, or this
@@ -3003,20 +3003,9 @@ static int build_apex_soa_answer(const uint8_t *req, size_t req_len, uint8_t *re
   dns_init_response_header(res, req, 0, true);
   uint16_t offset = (uint16_t)q_offset, ancount = 0, nscount = 0, arcount = 0;
   /* SOA */
-  if (write_dns_name_str(res, &offset, elem->name, comp_ctx, body_max) != 0 || (size_t)offset + 10 > body_max) return -1;
-  res[offset++] = 0; res[offset++] = 6; res[offset++] = 0; res[offset++] = 1;
-  uint32_t v = ap->soa_ttl;
-  res[offset++] = (uint8_t)(v >> 24); res[offset++] = (uint8_t)(v >> 16); res[offset++] = (uint8_t)(v >> 8); res[offset++] = (uint8_t)v;
-  uint16_t rdl_at = offset;
-  offset += 2;
-  if (compress_name(res, &offset, mn, comp_ctx, body_max) != 0 || compress_name(res, &offset, rn, comp_ctx, body_max) != 0 || (size_t)offset + 20 > body_max)
-    return -1;
-  const uint32_t nums[5] = { ap->serial, ap->refresh, ap->retry, ap->expire, ap->minimum };
-  for (int i = 0; i < 5; i++) {
-    res[offset++] = (uint8_t)(nums[i] >> 24); res[offset++] = (uint8_t)(nums[i] >> 16); res[offset++] = (uint8_t)(nums[i] >> 8); res[offset++] = (uint8_t)nums[i];
-  }
-  res[rdl_at] = (uint8_t)((offset - rdl_at - 2) >> 8);
-  res[rdl_at + 1] = (uint8_t)(offset - rdl_at - 2);
+  if (apex_write_soa_rr(res, &offset, body_max, elem->name, ap, comp_ctx) != 0) return -1;
+  uint32_t v;
+  uint16_t rdl_at;
   ancount = 1;
   /* NS */
   if (with_ns) {

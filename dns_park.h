@@ -172,7 +172,9 @@ void park_wake_broadcast(const char *view, const char *zone, bool failed);
 void park_fetch_set_notify(int kq);
 /* The worker side of the above: push the request and trigger the ingest thread.  false: the ring is full. */
 bool park_fetch_request(int w, const char *view, const char *zone, uint8_t prio, uint8_t mode);
-/* ingest side: the next request from any worker (round robin), false when there is none */
+/* The same for a thread that is not a worker (a transfer thread; any number of them, 16 requests wait at most).  false: no free slot or the names do not fit. */
+bool park_fetch_request_any(const char *view, const char *zone, uint8_t prio, uint8_t mode);
+/* ingest side: the next request from any worker or from park_fetch_request_any() (round robin), false when there is none */
 bool park_fetch_next(park_fetch_req_t *out);
 
 #endif /* DNS_PARK_H */

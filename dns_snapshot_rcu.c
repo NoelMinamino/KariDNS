@@ -1682,7 +1682,8 @@ static void cache_note_next(void) {
     atomic_store_explicit(&g_evict_next_hint, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_next_flags, 1, memory_order_relaxed);
 }
-static _Atomic uint64_t g_cache_rounds, g_cache_cold, g_cache_marked, g_cache_misses;
+static _Atomic uint64_t g_cache_rounds, g_cache_cold, g_cache_marked, g_cache_misses, g_xfr_marked;
+static _Atomic uint64_t g_xfr_count[4];
 static int64_t cache_mono_ms(void);
 static _Atomic uint64_t g_cache_peak;       /* the most the database zones held (resident + retired) when a zone was installed or a round ran, with a limit set */
 static void cache_peak_note(void);
@@ -1913,7 +1914,7 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
     z->shadowed = sh;
     z->shadow_by = sh_cfg ? DBREG_SH_CONFIG : sh_cat ? DBREG_SH_CATALOG : DBREG_SH_NONE;
     if (created) {                                                  /* new data in memory: the cache manager starts counting from here */
-        z->flags &= (uint16_t)~ZDIR_F_EVICT_NEXT;
+        z->flags &= (uint16_t)~(ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD);
         z->qseen = 0;
         z->t_load = (uint32_t)cache_mono_ms();
     }
@@ -2452,7 +2453,38 @@ static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
     return bytes ? bytes : 1;
 }
 
+/* ---- D1a step 7: transfers of zones that are out of memory (design 7, 12-6) ---- */
+zone_db_entry_t *dbreg_xfr_acquire(zdir_elem_t *z) {
+    zone_db_entry_t *e;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    e = zdir_entry(z);
+    if (e) atomic_fetch_add_explicit(&e->active_axfr, 1, memory_order_acq_rel);     /* (dbreg_evict_locked() reads it under this lock) */
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return e;
+}
+
+void dbreg_xfr_loaded(const char *view, const char *zone) {
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    zone_db_entry_t *e = z ? zdir_entry(z) : NULL;
+    /* a pinned zone and one a dynamic UPDATE changed are never taken out; a zone that queries asked for more often than the zones the manager took out
+     * last is worth its memory whoever loaded it; one that is marked already (admission) needs nothing */
+    if (e && !(z->flags & (ZDIR_F_PIN | ZDIR_F_NOCACHE | ZDIR_F_EVICT_NEXT | ZDIR_F_DELETED)) && !atomic_load_explicit(&e->updated, memory_order_relaxed) &&
+        atomic_load_explicit(&z->freq, memory_order_relaxed) <= atomic_load_explicit(&g_victim_freq, memory_order_relaxed)) {
+        z->flags |= ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD;
+        cache_note_next();
+        atomic_fetch_add_explicit(&g_xfr_marked, 1, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+}
+
+void dbreg_xfr_note(int kind) {
+    if (kind >= 0 && kind < 4) atomic_fetch_add_explicit(&g_xfr_count[kind], 1, memory_order_relaxed);
+}
+
 /* ---- the cache manager's side (design 8.1 - 8.3): the limit, GDSF, admission ---- */
+
 #define CACHE_MIN_RESIDENT_MS 100    /* a zone is not taken out before the queries it was loaded for have been answered (the worker looks at its wake-ups at every turn of its loop) */
 #define CACHE_HARD_DIV 10            /* no zone is fetched while the database zones are above the limit plus 1/10 of it: the slack that fetches can use */
 #define CACHE_AGE_MS 10000          /* the frequency counters are halved at most this often */
@@ -2523,6 +2555,8 @@ void dbreg_cache_stats(dbreg_cache_stats_t *o) {
     o->rounds = atomic_load_explicit(&g_cache_rounds, memory_order_relaxed);
     o->cold = atomic_load_explicit(&g_cache_cold, memory_order_relaxed);
     o->marked = atomic_load_explicit(&g_cache_marked, memory_order_relaxed);
+    o->xfr_marked = atomic_load_explicit(&g_xfr_marked, memory_order_relaxed);
+    for (int i = 0; i < 4; i++) o->xfr[i] = atomic_load_explicit(&g_xfr_count[i], memory_order_relaxed);
     o->misses = atomic_load_explicit(&g_cache_misses, memory_order_relaxed);
     o->victim_freq = atomic_load_explicit(&g_victim_freq, memory_order_relaxed);
     o->pinned_bytes = atomic_load_explicit(&g_cache_pinned_bytes, memory_order_relaxed);
@@ -2656,6 +2690,8 @@ uint32_t dbreg_cache_round(void) {
                 pinned_now += bytes;
                 continue;
             }
+            if ((z->flags & ZDIR_F_XFRLOAD) && dq > 0)         /* queries use the zone that a transfer brought: it is no transfer-only read, GDSF decides (design 7) */
+                z->flags &= (uint16_t)~(ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD);
             if (z->flags & ZDIR_F_EVICT_NEXT) g_cycle_seen_next = true;
             if (bytes == 0) continue;
             if (nc == s_cand_cap) {
@@ -3289,6 +3325,7 @@ int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int m
             o->shadowed = z->shadowed;
             o->shadow_by = z->shadow_by;
             o->last_result = z->last_result;
+            o->flags = z->flags;
             if (z->error) snprintf(o->error, sizeof(o->error), "%s", z->error);
         }
         n++;

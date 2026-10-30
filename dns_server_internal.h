@@ -544,6 +544,7 @@ enum { ZDIR_ST_ABSENT = 0, ZDIR_ST_RESIDENT, ZDIR_ST_LOADING, ZDIR_ST_ERROR };
 #define ZDIR_F_NOCACHE   0x0010u   /* never kept resident after an answer (reserved) */
 #define ZDIR_F_PARTIAL   0x0020u   /* only part of the zone is resident (reserved for D1b) */
 #define ZDIR_F_EVICT_NEXT 0x0040u  /* take out of memory first (as soon as the queries it was loaded for are answered): a zone that was admitted against the frequency order, or a no-cache zone */
+#define ZDIR_F_XFRLOAD   0x0400u   /* D1a step 7: together with EVICT_NEXT: a transfer (AXFR / IXFR) brought the zone into memory and nobody else needs it; the mark is dropped when queries ask for the zone (the cache manager's scan) */
 #define ZDIR_F_WARM      0x0100u   /* the zone is in the ingest thread's list of zones to read before a query asks (pins): once, whatever the number of summaries */
 #define ZDIR_F_NOAPEX    0x0200u   /* D1a step 6: a summary of this version came without an apex (the loader cannot give one: more than 8 NS names, more than 8 addresses for a name, location tags ...): the walk after a reload does not ask again; cleared when the serial changes */
 #define ZDIR_F_BUSY      0x0080u   /* the ingest thread is installing a new version into the zone's entry (dbreg_lookup_entry_busy() .. dbreg_commit() / dbreg_reject()): it is not taken out of memory meanwhile */
@@ -573,6 +574,29 @@ typedef struct zdir_apex {
 #define ZDIR_APEX_GLUE_PER_NS 8   /* addresses of one NS target (= KDB_APEX_GLUE_PER_NS) */
 #define ZDIR_APEX_GLUE_MAX (ZDIR_APEX_NS_MAX * ZDIR_APEX_GLUE_PER_NS * 22)   /* (= KDB_APEX_GLUE_BYTES with room to spare) */
 #define ZDIR_APEX_MAX (sizeof(zdir_apex_t) + 2 * 255 + ZDIR_APEX_NS_MAX * 255 + ZDIR_APEX_GLUE_MAX)
+/* The SOA RR of an apex block, written at *offset_ptr of res (RFC 1035 3.3.13; the owner and the names of the RDATA are compressed with ctx, which is what the
+ * zone image's serializer does for SOA, RFC 1035 4.1.4).  0 on success; -1 when it does not fit in max_len octets.  (Shared by the SOA answer of a zone out of
+ * memory, dns_query_engine.c, and the IXFR answer of dns_axfr_ixfr.c.) */
+static inline int apex_write_soa_rr(uint8_t *res, uint16_t *offset_ptr, size_t max_len, const char *zone_name, const zdir_apex_t *ap, compress_ctx_t *ctx) {
+  uint16_t offset = *offset_ptr;
+  if (write_dns_name_str(res, &offset, zone_name, ctx, max_len) != 0 || (size_t)offset + 10 > max_len) return -1;
+  res[offset++] = 0; res[offset++] = 6; res[offset++] = 0; res[offset++] = 1;
+  uint32_t v = ap->soa_ttl;
+  res[offset++] = (uint8_t)(v >> 24); res[offset++] = (uint8_t)(v >> 16); res[offset++] = (uint8_t)(v >> 8); res[offset++] = (uint8_t)v;
+  uint16_t rdl_at = offset;
+  offset += 2;
+  if (compress_name(res, &offset, ap->data, ctx, max_len) != 0 || compress_name(res, &offset, ap->data + ap->mname_len, ctx, max_len) != 0 ||
+      (size_t)offset + 20 > max_len)
+    return -1;
+  const uint32_t nums[5] = { ap->serial, ap->refresh, ap->retry, ap->expire, ap->minimum };
+  for (int i = 0; i < 5; i++) {
+    res[offset++] = (uint8_t)(nums[i] >> 24); res[offset++] = (uint8_t)(nums[i] >> 16); res[offset++] = (uint8_t)(nums[i] >> 8); res[offset++] = (uint8_t)nums[i];
+  }
+  res[rdl_at] = (uint8_t)((offset - rdl_at - 2) >> 8);
+  res[rdl_at + 1] = (uint8_t)(offset - rdl_at - 2);
+  *offset_ptr = offset;
+  return 0;
+}
 struct zdir_elem {
   struct zdir_elem *next;      /* the registry's hash chain; once the element is on a garbage list, that list */
   _Atomic(zone_db_entry_t *) entry;   /* the entry that answers for the name (RCU-published); the element holds a reference */
@@ -989,6 +1013,7 @@ typedef struct {
   bool shadowed;
   uint8_t shadow_by;           /* DBREG_SH_* */
   uint8_t last_result;         /* DBREG_APPLIED / DBREG_REJECTED: the last version offered */
+  uint16_t flags;              /* ZDIR_F_* of the element (unit tests) */
   char error[160];             /* last rejection / loader error, "" = none */
 } dbreg_info_t;
 /* The registry records of the zone `name` (any case, with or without the trailing dot) in the view `view` (NULL: every
@@ -999,6 +1024,8 @@ int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int m
 typedef struct {
   uint64_t limit, resident, retired, inflight;   /* bytes: the limit (0 = none), the version bytes in memory, replaced / evicted but not freed, evicted but not freed */
   uint64_t evictions, rounds, cold, marked, misses;
+  uint64_t xfr_marked;                           /* zones a transfer brought into memory that were marked evict-next (dbreg_xfr_loaded()) */
+  uint64_t xfr[4];                               /* transfers of zones that were out of memory, by DBREG_XFR_* */
   uint64_t pinned_bytes, peak;
   uint32_t victim_freq;
 } dbreg_cache_stats_t;
@@ -1010,6 +1037,16 @@ void dbreg_cache_stats(dbreg_cache_stats_t *out);
 void dbreg_cache_test_pause(bool on);                              /* TEST ONLY: the manager does nothing while paused */
 void dbreg_cache_test_set_victim_freq(uint32_t f);                 /* TEST ONLY: the frequency a zone that is loaded now is compared with */
 #endif
+/* D1a step 7 (design 7): AXFR / IXFR of a zone that is in the directory and not in memory.  The transfer thread waits for the zone (a fetch it asks for), then
+ * holds it with dbreg_xfr_acquire(): under the registry lock it reads the element's entry and counts the transfer in the entry's active_axfr, so that the
+ * cache manager's eviction (same lock) cannot take the zone out between the two.  NULL: no data in memory now.  dbreg_xfr_loaded(): the zone is in memory
+ * because a transfer asked for it: it is marked evict-next (and XFRLOAD) unless it is pinned, was changed by an UPDATE, or is asked for more often than the zones
+ * the manager took out last (frequency); the first query that arrives drops the mark (the scan of the manager).  dbreg_xfr_note(): the counters of
+ * karictl dbstatus. */
+zone_db_entry_t *dbreg_xfr_acquire(zdir_elem_t *z);
+void dbreg_xfr_loaded(const char *view, const char *zone);
+enum { DBREG_XFR_WAITED = 0, DBREG_XFR_LOADED, DBREG_XFR_FAILED, DBREG_XFR_SUMMARY };   /* waited for a fetch; got the zone; gave up (SERVFAIL); answered an IXFR from the summary */
+void dbreg_xfr_note(int kind);
 void dbreg_cache_note_miss(void);                                 /* a query had to wait for a zone (the worker) */
 bool dbreg_cache_over_high(uint64_t extra);                        /* would the zone databases be above the high mark with `extra` more bytes? (false without a limit) */
 bool dbreg_cache_over_limit(void);                                 /* are the database zones above the limit itself? */

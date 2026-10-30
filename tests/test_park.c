@@ -345,11 +345,81 @@ static void test_concurrent(void) {
   CHECK(w > 0 && to > 0);
 }
 
+/* D1a step 7: the requests of threads that are not workers (the transfer threads): 16 slots, any number of producers, one consumer */
+#define AW 4
+#define AN 3000
+static _Atomic uint64_t g_any_taken;
+static void *any_producer(void *arg) {
+  long id = (long)(intptr_t)arg;
+  char zn[64];
+  for (int i = 0; i < AN; i++) {
+    snprintf(zn, sizeof(zn), "z%ld-%d.test.", id, i);
+    while (!park_fetch_request_any("v1", zn, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL)) usleep(20);      /* (a full table: the caller asks again later) */
+  }
+  return NULL;
+}
+static void *any_consumer(void *arg) {
+  (void)arg;
+  park_fetch_req_t q;
+  uint64_t seen = 0;
+  while (seen < (uint64_t)AW * AN) {
+    if (park_fetch_next(&q)) {
+      long id = -1;
+      int i = -1;
+      if (strcmp(q.view, "v1") == 0 && sscanf(q.zone, "z%ld-%d.test.", &id, &i) == 2 && id >= 0 && id < AW && i >= 0 && i < AN && q.zlen == strlen(q.zone))
+        seen++;
+      else
+        CHECK(false);                                  /* (a request that is not whole) */
+    } else {
+      usleep(50);
+    }
+  }
+  atomic_store(&g_any_taken, seen);
+  return NULL;
+}
+
+static void test_any(void) {
+  printf("[requests of threads that are not workers]\n");
+  park_fetch_req_t q;
+  CHECK(!park_fetch_next(&q));
+  /* the names must fit */
+  char longz[PARK_ZONE_MAX + 10];
+  memset(longz, 'a', sizeof(longz));
+  longz[sizeof(longz) - 1] = '\0';
+  CHECK(!park_fetch_request_any("v1", longz, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+  CHECK(!park_fetch_request_any("", "a.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+  /* 16 slots: the 17th request finds none; taking one frees one */
+  char zn[40];
+  int ok = 0;
+  for (int i = 0; i < 17; i++) {
+    snprintf(zn, sizeof(zn), "s%d.test.", i);
+    ok += park_fetch_request_any("v1", zn, i % 2 ? KDB_FETCH_PRIO_WARM : KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL);
+  }
+  CHECK(ok == 16);
+  CHECK(park_fetch_next(&q) && strcmp(q.view, "v1") == 0 && strncmp(q.zone, "s", 1) == 0 && q.mode == KDB_FETCH_FULL);
+  CHECK(park_fetch_request_any("v1", "again.test.", KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_SUMMARY));
+  int got = 1, summary = 0;
+  while (park_fetch_next(&q)) {
+    got++;
+    summary += q.mode == KDB_FETCH_SUMMARY && strcmp(q.zone, "again.test.") == 0 && q.prio == KDB_FETCH_PRIO_BACKGROUND;
+  }
+  CHECK(got == 17 && summary == 1);
+  CHECK(!park_fetch_next(&q));
+  /* four producers, one consumer: every request arrives once, whole */
+  pthread_t th[AW], cons;
+  pthread_create(&cons, NULL, any_consumer, NULL);
+  for (long i = 0; i < AW; i++) pthread_create(&th[i], NULL, any_producer, (void *)(intptr_t)i);
+  for (int i = 0; i < AW; i++) pthread_join(th[i], NULL);
+  pthread_join(cons, NULL);
+  CHECK(atomic_load(&g_any_taken) == (uint64_t)AW * AN);
+}
+
 int main(void) {
   test_table();
   test_tcp();
   test_rings();
   test_concurrent();
+  test_any();
   printf("\n%d checks, %d failed\n", g_checks, g_failed);
   if (g_failed) return 1;
   printf("=== test_park: all checks passed ===\n");

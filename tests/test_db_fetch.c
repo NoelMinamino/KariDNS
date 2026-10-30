@@ -21,6 +21,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -307,6 +309,29 @@ static void hand_over(int ctrl, int main_fd, int fetch_fd) {
     memcpy(CMSG_DATA(ch), fds, sizeof(int) * (size_t)n);
     CHECK(sendmsg(ctrl, &mh, 0) == 1);
     for (int i = 0; i < n; i++) close(fds[i]);
+}
+
+/* a zone transfer thread waiting for a zone (D1a step 7) */
+typedef struct {
+    zdir_elem_t *el;
+    zone_db_entry_t *res;
+    int64_t t0, t1;
+} await_t;
+static int64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+static void *await_thread(void *arg) {
+    await_t *a = arg;
+    a->t0 = mono_ms();
+    a->res = db_ingest_xfr_await(a->el, "default");
+    a->t1 = mono_ms();
+    return NULL;
+}
+static uint16_t elem_flags(const char *zone) {
+    dbreg_info_t inf;
+    return dbreg_find_info("default", zone, &inf, 1) == 1 ? inf.flags : 0xFFFF;
 }
 
 void syslog(int priority, const char *format, ...) {
@@ -1033,6 +1058,148 @@ int main(void) {
     CHECK(wake_next(&k, 5000) && !k.failed);
     CHECK(dbreg_find_info("default", "r.test.", &inf, 1) == 1 && !inf.has_entry && inf.serial == 12 && inf.refresh == 2147483647u);
     CHECK(elem_of("default", "r.test.")->retry == 2147483647u && elem_of("default", "r.test.")->expire == 7);
+
+    /* -- zone transfers of zones that are out of memory (D1a step 7, design 7, 12-6): db_ingest_xfr_await() asks for the zone through the slots of
+     *    park_fetch_request_any() and returns the entry with the transfer counted in active_axfr.  A zone it brought is marked evict-next (and XFRLOAD)
+     *    unless it is pinned, was changed by an UPDATE or is asked for more often than the zones the manager took out; queries drop the mark.  The
+     *    manager (a limit far above the zones in memory: no pressure) takes a marked zone out as soon as the transfer has ended. */
+    {
+        static server_config_t cfgX;
+        CHECK(parse_named_conf("options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; "
+                               "transfer-fetch-timeout 1500; }; };\n"
+                               "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", &cfgX) == 0);
+        CHECK(cfgX.database.transfer_fetch_timeout_ms == 1500);
+        cfgX.database.memory_limit = 1ull << 40;
+        atomic_store_explicit(&g_config_db.active, &cfgX, memory_order_release);
+        usleep(1400000);                                                       /* (the manager's thread takes the limit and the timeout) */
+        zdir_elem_t *xe = elem_of("default", "r.test.");
+        CHECK(xe != NULL && zdir_entry(xe) == NULL);
+        dbreg_cache_stats_t cs0, cs1;
+        dbreg_cache_stats(&cs0);
+        char st[4096];
+        size_t sl = db_ingest_status(NULL, NULL, st, sizeof(st));
+        CHECK(sl > 0 && strstr(st, "issued=") != NULL && strstr(st, "transfers of zones out of memory: waited=") != NULL && strstr(st, "timeout=1500ms") != NULL);
+
+        /* a zone that is in memory: the transfer is counted at once and nothing is asked for */
+        {
+            zone_db_entry_t *sen = dbreg_lookup_entry("default", "s.test.");
+            await_t A = { elem_of("default", "s.test."), NULL, 0, 0 };
+            CHECK(sen != NULL && A.el != NULL);
+            await_thread(&A);
+            CHECK(A.res == sen && atomic_load(&sen->active_axfr) == 1 && A.t1 - A.t0 < 100);
+            atomic_fetch_sub(&sen->active_axfr, 1);
+            CHECK(!ch_next(&fetchc, &m, 100));
+        }
+
+        /* the zone is read, marked, held by the transfer, and taken out when the transfer ends */
+        await_t A = { xe, NULL, 0, 0 };
+        pthread_t th;
+        CHECK(pthread_create(&th, NULL, await_thread, &A) == 0);
+        CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "r.test.") == 0 && m.u.fetch_req.mode == KDB_FETCH_FULL &&
+              m.u.fetch_req.priority == KDB_FETCH_PRIO_QUERY);
+        send_zone(f[0], &e, 0, "r.test.", 12, m.u.fetch_req.request_id, 11);
+        pthread_join(th, NULL);
+        CHECK(wake_next(&k, 5000) && strcmp(k.zone, "r.test.") == 0 && !k.failed);
+        CHECK(A.res != NULL && A.res == zdir_entry(xe) && atomic_load(&A.res->active_axfr) == 1 && atomic_load(&A.res->serial) == 12);
+        CHECK((elem_flags("r.test.") & (ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD)) == (ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD));
+        dbreg_cache_stats(&cs1);
+        CHECK(cs1.xfr[DBREG_XFR_WAITED] == cs0.xfr[DBREG_XFR_WAITED] + 1 && cs1.xfr[DBREG_XFR_LOADED] == cs0.xfr[DBREG_XFR_LOADED] + 1 &&
+              cs1.xfr_marked == cs0.xfr_marked + 1 && cs1.xfr[DBREG_XFR_FAILED] == cs0.xfr[DBREG_XFR_FAILED]);
+        usleep(600000);                                                        /* (the manager sees the mark and a transfer that holds the zone) */
+        CHECK(zdir_entry(xe) == A.res && !dbreg_test_evict("default", "r.test."));
+        uint64_t ev0 = dbreg_evictions();
+        atomic_fetch_sub(&A.res->active_axfr, 1);
+        for (int i = 0; i < 100 && zdir_entry(xe) != NULL; i++) usleep(30000);
+        CHECK(zdir_entry(xe) == NULL && dbreg_evictions() == ev0 + 1);         /* (taken out first: no pressure, nothing else to compare with) */
+        CHECK(atomic_load(&xe->state) == ZDIR_ST_ABSENT);
+        for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(50000);
+
+        /* a zone that queries ask for more often than the zones taken out last is not marked */
+        atomic_store(&xe->freq, 50);
+        A.res = NULL;
+        CHECK(pthread_create(&th, NULL, await_thread, &A) == 0);
+        CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ);
+        send_zone(f[0], &e, 0, "r.test.", 12, m.u.fetch_req.request_id, 11);
+        pthread_join(th, NULL);
+        CHECK(wake_next(&k, 5000) && !k.failed);
+        CHECK(A.res != NULL && (elem_flags("r.test.") & (ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD)) == 0);
+        dbreg_cache_stats(&cs1);
+        CHECK(cs1.xfr_marked == cs0.xfr_marked + 1 && cs1.xfr[DBREG_XFR_LOADED] == cs0.xfr[DBREG_XFR_LOADED] + 2);
+        atomic_fetch_sub(&A.res->active_axfr, 1);
+        usleep(600000);
+        CHECK(zdir_entry(xe) == A.res);                                         /* (it stays: GDSF only) */
+        CHECK(dbreg_test_evict("default", "r.test."));
+        atomic_store(&xe->freq, 0);
+        for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(50000);
+
+        /* queries that ask for the zone while the transfer runs drop the mark (the entry's query counter, as the cache manager sees it) */
+        A.res = NULL;
+        CHECK(pthread_create(&th, NULL, await_thread, &A) == 0);
+        CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ);
+        send_zone(f[0], &e, 0, "r.test.", 12, m.u.fetch_req.request_id, 11);
+        pthread_join(th, NULL);
+        CHECK(wake_next(&k, 5000) && !k.failed);
+        CHECK(A.res != NULL && (elem_flags("r.test.") & ZDIR_F_XFRLOAD));
+        atomic_store(&A.res->observatory.queries_total, 7);
+        for (int i = 0; i < 100 && (elem_flags("r.test.") & (ZDIR_F_XFRLOAD | ZDIR_F_EVICT_NEXT)); i++) usleep(30000);
+        CHECK((elem_flags("r.test.") & (ZDIR_F_XFRLOAD | ZDIR_F_EVICT_NEXT)) == 0);
+        atomic_fetch_sub(&A.res->active_axfr, 1);
+        usleep(700000);
+        CHECK(zdir_entry(xe) == A.res);                                         /* (a zone the queries use is not taken out because a transfer read it) */
+        CHECK(dbreg_test_evict("default", "r.test."));
+        for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(50000);
+
+        /* pinned, changed by an UPDATE: never marked */
+        {
+            zone_db_entry_t *pe = dbreg_lookup_entry("default", "pin.test.");
+            CHECK(pe != NULL && (elem_flags("pin.test.") & ZDIR_F_PIN));
+            dbreg_cache_stats(&cs1);
+            uint64_t m0 = cs1.xfr_marked;
+            dbreg_xfr_loaded("default", "pin.test.");
+            zone_db_entry_t *se = dbreg_lookup_entry("default", "s.test.");
+            CHECK(se != NULL);
+            atomic_store(&se->updated, true);
+            dbreg_xfr_loaded("default", "s.test.");
+            atomic_store(&se->updated, false);
+            dbreg_xfr_loaded("default", "ghost.test.");                         /* (no such zone) */
+            dbreg_xfr_loaded("nosuchview", "s.test.");
+            dbreg_cache_stats(&cs1);
+            CHECK(cs1.xfr_marked == m0 && (elem_flags("pin.test.") & (ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD)) == 0 &&
+                  (elem_flags("s.test.") & (ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD)) == 0);
+        }
+
+        /* the fetch fails (the loader cannot read the zone) and is asked for again until the time is up: nothing is left counted in active_axfr */
+        {
+            dbreg_cache_stats(&cs0);
+            A.res = (zone_db_entry_t *)1;
+            CHECK(pthread_create(&th, NULL, await_thread, &A) == 0);
+            int asked = 0;
+            while (ch_next(&fetchc, &m, 400) && m.type == KDB_T_FETCH_REQ) {
+                asked++;
+                send_failed(f[0], &e, 0, "r.test.", m.u.fetch_req.request_id);
+            }
+            pthread_join(th, NULL);
+            while (wake_next(&k, 100)) CHECK(k.failed);
+            printf("  (a transfer whose fetch fails: %d requests in %lld ms)\n", asked, (long long)(A.t1 - A.t0));
+            CHECK(A.res == NULL && A.t1 - A.t0 >= 1400 && A.t1 - A.t0 < 3500 && asked >= 3);   /* (it asks again every 100 ms while nothing is on its way) */
+            dbreg_cache_stats(&cs1);
+            CHECK(cs1.xfr[DBREG_XFR_FAILED] == cs0.xfr[DBREG_XFR_FAILED] + 1 && cs1.xfr[DBREG_XFR_LOADED] == cs0.xfr[DBREG_XFR_LOADED]);
+            CHECK(zdir_entry(xe) == NULL && atomic_load(&xe->state) == ZDIR_ST_ABSENT);
+            /* a zone with no usable version (state ERROR): no time spent and no request */
+            atomic_store(&xe->state, ZDIR_ST_ERROR);
+            await_thread(&A);
+            CHECK(A.res == NULL && A.t1 - A.t0 < 300 && !ch_next(&fetchc, &m, 200));
+            atomic_store(&xe->state, ZDIR_ST_ABSENT);
+        }
+        {
+            sl = db_ingest_status(NULL, NULL, st, sizeof(st));
+            const char *p = sl ? strstr(st, "issued=") : NULL;
+            CHECK(p != NULL && strtoull(p + 7, NULL, 10) > 0);
+        }
+        /* back to the configuration the tests that follow expect */
+        atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+        usleep(1300000);
+    }
 
     /* -- a fetch the loader never answers is given up (the test shortens the 30 s): the workers are told it failed, the zone can be asked for
      *    again, and the answer that comes too late is thrown away */

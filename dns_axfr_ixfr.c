@@ -1986,6 +1986,68 @@ static int axfr_emit_config_tags(axfr_emit_ctx_t *ec, const zone_image_t *img, c
   return rc;
 }
 
+/* The message under construction: the header and question of the request, QR=1 AA=1 (R-05), no RRs yet.  The caller sets what is particular to it (the
+ * view, the extension encoder, one-answer ...) after the call. */
+static void axfr_ec_start(axfr_emit_ctx_t *ec, uint8_t *res, const uint8_t *req, size_t q_offset, int client_fd, bool is_extended_axfr,
+                          tsig_key_t *tsig_key, const uint8_t *req_mac, size_t req_mac_len, const edns_info_t *resp_edns,
+                          const struct sockaddr_storage *client_addr, socklen_t client_len, const struct sockaddr_storage *server_addr,
+                          bool has_server_addr, const char *domain) {
+  memset(ec, 0, sizeof(*ec));
+  ec->res = res;
+  ec->offset = (uint16_t)q_offset;
+  ec->q_offset = (uint16_t)q_offset;
+  ec->answers = 0;
+  ec->req = req;
+  ec->client_fd = client_fd;
+  ec->is_extended_axfr = is_extended_axfr;
+  ec->send_opt = resp_edns->present;
+  ec->opt_sent = false;
+  ec->is_subsequent = false;
+  ec->tsig_key = tsig_key;
+  if (req_mac_len > 0) {
+    memcpy(ec->tsig_mac, req_mac, req_mac_len);
+    ec->tsig_mac_len = req_mac_len;
+  }
+  ec->resp_edns = *resp_edns;
+  ec->client_addr = client_addr;
+  ec->client_len = client_len;
+  ec->server_addr = server_addr;
+  ec->has_server_addr = has_server_addr;
+  ec->domain = domain;
+  memset(res, 0, 65535);
+  memcpy(res, req, q_offset);
+  dns_init_response_header(res, req, 0, true); /* QR=1 AA=1、RA/Z/AD/TC は写さない (R-05) */
+  res[8] = 0;
+  res[9] = 0;
+  res[10] = 0;
+  res[11] = 0;
+  compress_ctx_init_packet(&ec->comp_ctx);
+  register_wire_name_for_compression(res, DNS_HEADER_SIZE, &ec->comp_ctx);
+}
+
+/* The last message of the transfer (the RRs not sent yet), with the OPT of the first message when none went out, signed and sent.  0, or -1: a failure. */
+static int axfr_ec_finish(axfr_emit_ctx_t *ec) {
+  if (ec->answers == 0) return 0;
+  ec->res[6] = (uint8_t)(ec->answers >> 8);
+  ec->res[7] = (uint8_t)(ec->answers & 0xFF);
+  if (ec->send_opt && !ec->opt_sent) {
+    uint16_t arcount = 0;
+    assemble_edns_opt(ec->res, 65535, &ec->offset, &arcount, &ec->resp_edns, 0, true, NULL);
+    ec->res[10] = (arcount >> 8) & 0xFF;
+    ec->res[11] = arcount & 0xFF;
+    ec->opt_sent = true;
+  }
+  if (ec->tsig_key) {
+    size_t sign_len = ec->offset;
+    if (tsig_sign_packet(ec->res, &sign_len, 65535, ec->tsig_key, 0, ec->tsig_mac, &ec->tsig_mac_len, NULL, 0, ec->is_subsequent) != 0) return -1;
+    ec->offset = (uint16_t)sign_len;
+  }
+  write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, ec->res, ec->offset, (const struct sockaddr *)ec->client_addr, ec->client_len,
+                     ec->has_server_addr ? (const struct sockaddr *)ec->server_addr : NULL, ec->has_server_addr, IPPROTO_TCP);
+  return send_tcp_dns_message(ec->client_fd, ec->res, ec->offset) < 0 ? -1 : 0; /* RFC 7766 §8 */
+}
+
+
 void send_axfr_response(int client_fd, const char *qname __attribute__((unused)), uint8_t *req,
                         uint16_t req_len, tsig_key_t *tsig_key, zone_db_entry_t *entry,
                         uint8_t *req_mac, size_t req_mac_len,
@@ -2227,42 +2289,12 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   }
 
   axfr_emit_ctx_t ec;
-  memset(&ec, 0, sizeof(ec));
-  ec.res = res;
-  ec.offset = (uint16_t)q_offset;
-  ec.q_offset = (uint16_t)q_offset;
-  ec.answers = 0;
-  ec.req = req;
-  ec.client_fd = client_fd;
-  ec.is_extended_axfr = is_extended_axfr;
-  ec.send_opt = resp_edns.present;
-  ec.opt_sent = false;
-  ec.is_subsequent = false;
-  ec.tsig_key = tsig_key;
-  if (req_mac_len > 0) {
-    memcpy(ec.tsig_mac, req_mac, req_mac_len);
-    ec.tsig_mac_len = req_mac_len;
-  }
-  ec.resp_edns = resp_edns;
-  ec.client_addr = client_addr;
-  ec.client_len = client_len;
-  ec.server_addr = server_addr;
-  ec.has_server_addr = has_server_addr;
-  ec.domain = entry->domain;
+  axfr_ec_start(&ec, res, req, q_offset, client_fd, is_extended_axfr, tsig_key, req_mac, req_mac_len, &resp_edns, client_addr, client_len,
+                server_addr, has_server_addr, entry->domain);
   ec.view = (!is_extended_axfr && (current_zone->flags & ZONE_IMAGE_F_VIEW)) ? &xview : NULL;
   xext_init(&ec.xe, entry->domain, axfr_xext_emit, &ec);
   ec.wrap_apex_soa = v3 && soa_multi && !send_ixfr;
   ec.one_answer = one_answer;
-
-  memset(res, 0, 65535);
-  memcpy(res, req, q_offset);
-  dns_init_response_header(res, req, 0, true); /* QR=1 AA=1、RA/Z/AD/TC は写さない (R-05) */
-  res[8] = 0;
-  res[9] = 0;
-  res[10] = 0;
-  res[11] = 0;
-  compress_ctx_init_packet(&ec.comp_ctx);
-  register_wire_name_for_compression(res, DNS_HEADER_SIZE, &ec.comp_ctx);
 
   if (!send_ixfr && is_extended_axfr && zone_image_zattr_load(current_zone, &zattr) != 0) goto axfr_error;
   if (send_ixfr) {
@@ -2348,31 +2380,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     // 3. Trailing SOA
     if (axfr_emit_item(&ec, NULL, current_zone, frame_rr) < 0) goto axfr_error;
   }
-  if (ec.answers > 0) {
-    ec.res[6] = (uint8_t)(ec.answers >> 8);
-    ec.res[7] = (uint8_t)(ec.answers & 0xFF);
-    if (ec.send_opt && !ec.opt_sent) {
-      uint16_t arcount = 0;
-      assemble_edns_opt(ec.res, 65535, &ec.offset, &arcount, &ec.resp_edns, 0, true, NULL);
-      ec.res[10] = (arcount >> 8) & 0xFF;
-      ec.res[11] = arcount & 0xFF;
-      ec.opt_sent = true;
-    }
-    if (ec.tsig_key) {
-      size_t sign_len = ec.offset;
-      if (tsig_sign_packet(ec.res, &sign_len, 65535, ec.tsig_key, 0, ec.tsig_mac,
-                           &ec.tsig_mac_len, NULL, 0, ec.is_subsequent) != 0) {
-        goto axfr_error;
-      }
-      ec.offset = (uint16_t)sign_len;
-    }
-    write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, ec.res, ec.offset,
-                       (const struct sockaddr *)client_addr, client_len,
-                       has_server_addr ? (const struct sockaddr *)server_addr : NULL,
-                       has_server_addr, IPPROTO_TCP);
-    if (send_tcp_dns_message(client_fd, ec.res, ec.offset) < 0) /* RFC 7766 §8 */
-      goto axfr_error;
-  }
+  if (axfr_ec_finish(&ec) < 0) goto axfr_error;
 
   for (int t = 0; t < txn_count; t++) {
     if (atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_acq_rel) == 1) {
@@ -2395,14 +2403,67 @@ axfr_error:
   if (res) free(res);
 }
 
+/* D1a step 7 (design 7, 12-6): an IXFR for a zone that is in the directory and not in memory, from a client that has the serial the directory has (or a
+ * newer one, RFC 1982): the answer is the one current SOA (RFC 1995 §2: the server's version is not newer), and the zone is not read.  It is made from the
+ * apex of the summary (the SOA, with the serial it describes), which the zone in memory would give with the same bytes: the same opening SOA, the OPT of
+ * the first message (RFC 5936 §2.2.5, as send_axfr_response()), the RFC 7314 EXPIRE value, the KariDNS extension echo, and the TSIG of the request
+ * (RFC 8945 §5.3).  A request without the client's SOA is a FORMERR (RFC 1995 §3), as for a zone in memory.  false: the answer needs the zone (not an IXFR,
+ * no apex for the version the directory has, the client is behind): the caller waits for the zone. */
+static bool axfr_send_up_to_date_from_apex(const axfr_worker_args_t *a, tsig_key_t *tsig_key) {
+  if (a->qtype != 251 || !a->elem) return false;
+  const zdir_apex_t *ap = atomic_load_explicit(&a->elem->apex, memory_order_acquire);
+  if (!ap || ap->serial != zdir_serial(a->elem)) return false;
+  size_t q_offset;
+  if (skip_wire_name(a->req, a->req_len, DNS_HEADER_SIZE, &q_offset) != 0 || q_offset + 4 > a->req_len) return false;
+  q_offset += 4;
+  uint32_t client_serial = 0;
+  if (!ixfr_request_client_serial(a->req, a->req_len, q_offset, &client_serial)) {
+    axfr_send_error(a->client_fd, a->req, a->req_len, 1, false, 0xFFFF, NULL, tsig_key, a->tsig_mac, a->tsig_mac_len, &a->client_addr, a->client_len,
+                    &a->server_addr, a->has_server_addr);
+    return true;
+  }
+  if (!(client_serial == ap->serial || serial_is_newer(client_serial, ap->serial))) return false;
+  edns_info_t req_edns = {0};
+  edns_info_t resp_edns = {0};
+  bool ext = false;
+  if (parse_edns_opt(a->req, a->req_len, (uint16_t)((a->req[4] << 8) | a->req[5]), (uint16_t)((a->req[6] << 8) | a->req[7]),
+                     (uint16_t)((a->req[8] << 8) | a->req[9]), (uint16_t)((a->req[10] << 8) | a->req[11]), &req_edns) == 0) {
+    resp_edns.present = req_edns.present;
+    if (req_edns.has_karidns_ext && KARIDNS_EXT_VERSION_OK(req_edns.karidns_ext_version) && req_edns.karidns_ext_hash == calc_fnv1a_str(a->elem->name)) {
+      ext = true;
+      resp_edns.present = true;
+      resp_edns.has_karidns_ext = true;
+      resp_edns.karidns_ext_version = req_edns.karidns_ext_version;
+      resp_edns.karidns_ext_hash = req_edns.karidns_ext_hash;
+    }
+    if (req_edns.has_expire_query) {
+      resp_edns.present = true;
+      resp_edns.send_expire = true;
+      resp_edns.send_expire_value = ap->expire;      /* a primary zone: the SOA's EXPIRE (RFC 7314 §3) */
+    }
+  }
+  uint8_t *res = malloc(65535);
+  if (!res) return false;
+  axfr_emit_ctx_t ec;
+  axfr_ec_start(&ec, res, a->req, q_offset, a->client_fd, ext, tsig_key, a->tsig_mac, a->tsig_mac_len, &resp_edns, &a->client_addr, a->client_len,
+                a->has_server_addr ? &a->server_addr : NULL, a->has_server_addr, a->elem->name);
+  uint16_t off = ec.offset;
+  bool done = apex_write_soa_rr(res, &off, KARIDNS_AXFR_MSG_LIMIT, a->elem->name, ap, &ec.comp_ctx) == 0;
+  if (done) {
+    ec.offset = off;
+    ec.answers = 1;
+    (void)axfr_ec_finish(&ec);       /* (a failed send: the client is gone, the connection is closed below) */
+    dbreg_xfr_note(DBREG_XFR_SUMMARY);
+  }
+  free(res);
+  return done;
+}
+
 void *axfr_worker_thread(void *arg) {
+
   atomic_fetch_add_explicit(&g_xfers_running, 1, memory_order_relaxed);
   axfr_worker_args_t *args = (axfr_worker_args_t *)arg;
   zone_db_entry_t *entry = args->entry;
-  /* 転送の間、arena を読み取り区間で守る。スロットはスレッドごとに確保する
-   * (以前は通し番号の剰余で割り当てており、同時に動くスレッドが同じスロットを
-   * 共有すると、先に終わった側が区間を閉じてしまった)。*/
-  rcu_aux_read_lock();
 
   tsig_key_t key_val;
   tsig_key_t *pkey = NULL;
@@ -2414,6 +2475,26 @@ void *axfr_worker_thread(void *arg) {
     memcpy(key_val.secret_decoded, args->tsig_secret_decoded, args->tsig_secret_decoded_len);
     pkey = &key_val;
   }
+  /* D1a step 7: the zone is not in memory.  An IXFR from a client that is up to date is answered from the summary; for anything else the thread waits
+   * (not a worker, not holding the read section below) until the zone is read, and counts itself in the entry's active_axfr (db_ingest_xfr_await()).
+   * No zone in time: the one error message of RFC 5936 2.2 (SERVFAIL, EDE 14 Not Ready, RFC 8914 4.15; the connection is not just dropped, 4.1.2). */
+  bool answered = false;
+  uint8_t log_rcode = 0;
+  if (!entry && args->elem) {
+    if (axfr_send_up_to_date_from_apex(args, pkey)) {
+      answered = true;
+    } else if (args->await && (entry = args->await(args->elem, args->view_name)) == NULL) {
+      axfr_send_error(args->client_fd, args->req, args->req_len, 2, false, 14, "Not Ready", pkey, args->tsig_mac, args->tsig_mac_len, &args->client_addr,
+                      args->client_len, &args->server_addr, args->has_server_addr);
+      answered = true;
+      log_rcode = 2;
+    }
+  }
+  /* 転送の間、arena を読み取り区間で守る。スロットはスレッドごとに確保する
+   * (以前は通し番号の剰余で割り当てており、同時に動くスレッドが同じスロットを
+   * 共有すると、先に終わった側が区間を閉じてしまった)。*/
+  rcu_aux_read_lock();
+
   /* max-transfer-time-out / max-transfer-idle-out (BIND 9.20; 0 = no limit): send_tcp_dns_message() gives the transfer up after the deadline,
    * and after a send that waited the idle time for the client (the socket is blocking, so SO_SNDTIMEO makes the wait end) */
   g_tcp_send_idle_secs = args->idle_out_secs;
@@ -2422,15 +2503,16 @@ void *axfr_worker_thread(void *arg) {
     struct timeval stv = { .tv_sec = (time_t)args->idle_out_secs, .tv_usec = 0 };
     setsockopt(args->client_fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&stv, sizeof stv);
   }
-  send_axfr_response(args->client_fd, args->qname, args->req, args->req_len,
-                     pkey, entry, args->tsig_mac, args->tsig_mac_len,
-                     &args->client_addr, args->client_len,
-                     args->has_server_addr ? &args->server_addr : NULL, args->has_server_addr);
+  if (!answered)
+    send_axfr_response(args->client_fd, args->qname, args->req, args->req_len,
+                       pkey, entry, args->tsig_mac, args->tsig_mac_len,
+                       &args->client_addr, args->client_len,
+                       args->has_server_addr ? &args->server_addr : NULL, args->has_server_addr);
   g_tcp_send_idle_secs = 0;
   g_tcp_send_deadline_secs = 0;
 
   submit_response_log(LOG_ACT_SENT, args->client_ip, args->client_port, args->qname,
-                      args->qclass, args->qtype, 0, args->has_edns, args->dnssec_ok);
+                      args->qclass, args->qtype, log_rcode, args->has_edns, args->dnssec_ok);
 
   close(args->client_fd);
   dec_tcp_clients();

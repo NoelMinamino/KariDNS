@@ -12,6 +12,8 @@
 #   primary (NOTIFY -> IXFR on the secondary's transfer threads), catalog
 #   membership changes (catalog rebuild from a transfer thread) and SIGHUP
 #   reloads of the secondary (Pass 2 while transfers run).
+# Part 4: tests/run_db_cache_test.sh with karidns-tsan (D1a step 5).  Part 5: tests/run_db_xfer_test.sh with karidns-tsan: AXFR and IXFR of zones that are
+#   out of memory (the transfer threads wait for the fetch stream) concurrent with queries and with the cache manager taking zones out (D1a step 7).
 # Any ThreadSanitizer report fails the test.
 
 . "$(dirname "$0")/lib_proc.sh"
@@ -374,6 +376,19 @@ if [ "$(id -u)" = "0" ] && kari_make karictl karidns-dbloader >/dev/null 2>&1; t
     echo "$out" | tail -5
     if [ $cr -ne 0 ] || echo "$out" | grep -q "ThreadSanitizer"; then
         echo "FAIL: run_db_cache_test.sh with karidns-tsan"
+        rc=1
+    fi
+else
+    echo "SKIP: needs root and karictl / karidns-dbloader"
+fi
+
+echo "--- part 5: karidns-tsan with zone transfers of zones that are out of memory (D1a step 7): AXFR / IXFR clients and queries while the cache manager takes zones out (tests/run_db_xfer_test.sh; root, SQLite3)"
+if [ "$(id -u)" = "0" ] && kari_make karictl karidns-dbloader >/dev/null 2>&1; then
+    out=$(env KARIDNS=./karidns-tsan XFER_TEST_SECONDS=10 XFER_TEST_DELAY_MS=10 XFER_TEST_QUERIES=600 sh tests/run_db_xfer_test.sh 2>&1)
+    cr=$?
+    echo "$out" | tail -5
+    if [ $cr -ne 0 ] || echo "$out" | grep -q "ThreadSanitizer"; then
+        echo "FAIL: run_db_xfer_test.sh with karidns-tsan"
         rc=1
     fi
 else

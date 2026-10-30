@@ -2781,6 +2781,8 @@ process_tcp_client: ;
           const zone_config_t *zcfg = xfr_view
               ? find_zone_config_in_view(cfg, xfr_view->name, qname)
               : NULL;
+          zdir_elem_t *xfr_el = NULL;         /* D1a step 7: the database zone of the transfer when its data is not in memory (the thread waits for it) */
+          zone_config_t xfr_nr_zc;            /* ... and its settings as the directory element keeps them (the ACL levels read them) */
           if (xfr_view && (qtype == 252 || qtype == 251)) {
             /* a DB zone has settings of its own (dbcfg), and a secondary may have settings received from its primary (B8t-2: rxcfg,
              * the zone's own statements first): the transfer checks below read them like a configured zone's */
@@ -2788,6 +2790,19 @@ process_tcp_client: ;
             if (xfr_entry && (!zcfg || xfr_entry->source == ZONE_SRC_DB || atomic_load_explicit(&xfr_entry->rxcfg, memory_order_acquire))) {
               const zone_config_t *ec = zone_entry_config(cfg, xfr_entry);
               if (ec) zcfg = ec;
+            } else if (!xfr_entry && !zcfg) {
+              /* a zone of the database that is in the directory without its data (memory-limit): the allow-transfer / TSIG checks below are made with the
+               * settings the element kept, before anything is read for the transfer (the same order as allow-query for a parked query: a client that is
+               * refused costs no fetch) */
+              zdir_elem_t *nel = zdir_find_exact(xfr_view, qname);
+              if (nel && !zdir_entry(nel)) {
+                zone_ext_shared_t *nsh = atomic_load_explicit(&nel->sh, memory_order_acquire);
+                memset(&xfr_nr_zc, 0, sizeof(xfr_nr_zc));
+                xfr_nr_zc.domain = (char *)nel->name;
+                xfr_nr_zc.ext = nsh ? &nsh->ext : NULL;
+                zcfg = &xfr_nr_zc;
+                xfr_el = nel;
+              }
             }
           }
           bool is_synthetic_zone = (zcfg && zcfg->type &&
@@ -2832,17 +2847,18 @@ process_tcp_client: ;
             size_t tsig_mac_len = matched_key ? tsig.mac_len : 0;
             if (tsig_mac_len > 0) memcpy(tsig_mac, tsig.mac, tsig_mac_len);
             zone_db_entry_t *entry = xfr_view ? find_zone_in_view(xfr_view, qname) : NULL;
-            if (allowed && entry) {
+            if (entry) xfr_el = NULL;          /* (it came into memory meanwhile: the usual transfer) */
+            if (allowed && (entry || xfr_el)) {
               /* transfers-out and max-transfer-time-out / max-transfer-idle-out (BIND 9.20), read before the configuration is released */
               uint32_t out_limit = xfr_cfg_limit(cfg, XL_TRANSFERS_OUT);
               xfr_eff_t out_eff;
               /* the settings of the view that owns the zone, not of the view the client came through (a zone shared with in-view is one object) */
-              xfr_opts_effective(cfg, zcfg, entry->view_name, &out_eff);
+              xfr_opts_effective(cfg, zcfg, entry ? entry->view_name : xfr_view->name, &out_eff);
               release_config_snapshot(cfg);
               if (!xfr_counter_acquire(&g_xfr_out_active, out_limit)) {
                 allowed = false; /* "Zone transfer requests in excess of the limit are refused" (ARM transfers-out) */
               } else {
-                atomic_fetch_add(&entry->active_axfr, 1);
+                if (entry) atomic_fetch_add(&entry->active_axfr, 1);
                 axfr_worker_args_t *args = malloc(sizeof(axfr_worker_args_t));
                 if (args) {
                   args->client_fd = client_fd;
@@ -2878,6 +2894,9 @@ process_tcp_client: ;
                   args->tsig_mac_len = tsig_mac_len;
                   if (tsig_mac_len > 0) memcpy(args->tsig_mac, tsig_mac, tsig_mac_len);
                   args->entry = entry;
+                  args->elem = entry ? NULL : xfr_el;
+                  args->await = entry ? NULL : db_ingest_xfr_await;
+                  if (xfr_el) snprintf(args->view_name, sizeof(args->view_name), "%s", xfr_view->name);
                   args->idle_out_secs = out_eff.xfer_idle_out;
                   args->time_out_secs = out_eff.xfer_time_out;
                   args->snap = snap;
@@ -2895,7 +2914,7 @@ process_tcp_client: ;
                   if (pthread_create(&t, NULL, axfr_worker_thread, args) != 0) {
                     release_zone_snapshot(args->snap);
                     free(args);
-                    atomic_fetch_sub(&entry->active_axfr, 1);
+                    if (entry) atomic_fetch_sub(&entry->active_axfr, 1);
                     xfr_counter_release(&g_xfr_out_active);
                     allowed = false;
                   } else {
@@ -2907,13 +2926,13 @@ process_tcp_client: ;
                     break;
                   }
                 } else {
-                  atomic_fetch_sub(&entry->active_axfr, 1);
+                  if (entry) atomic_fetch_sub(&entry->active_axfr, 1);
                   xfr_counter_release(&g_xfr_out_active);
                   allowed = false;
                 }
               }
             }
-            if (!allowed || !entry) {
+            if (!allowed || (!entry && !xfr_el)) {
               uint8_t res_buf[1024];
               uint8_t rcode = 5; /* REFUSED: 方針による拒否 (RFC 1035 §4.1.1、RFC 5936 §5)。AA=0 (R-06) */
               int built;

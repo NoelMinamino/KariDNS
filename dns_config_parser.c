@@ -6127,6 +6127,11 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     db->park_timeout_ms = (uint32_t)u;
     return 0;
   }
+  if (strcmp(key, "transfer-fetch-timeout") == 0) {     /* how long a zone transfer waits for a zone that is out of memory to be read (ms) */
+    if (db_take_uint(ctx, key, false, KARIDNS_DB_XFR_FETCH_TIMEOUT_MIN, KARIDNS_DB_XFR_FETCH_TIMEOUT_MAX, &u) != 0) return -1;
+    db->transfer_fetch_timeout_ms = (uint32_t)u;
+    return 0;
+  }
   if (strcmp(key, "fetch-rate") == 0) {       /* zones read for queries per second (token bucket, burst = one second): scattered queries for zones out of memory */
     if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_FETCH_RATE_MAX, &u) != 0) return -1;
     db->fetch_rate = (uint32_t)u;

@@ -367,11 +367,43 @@ bool park_fetch_request(int w, const char *view, const char *zone, uint8_t prio,
   return true;
 }
 
+/* The requests of threads that are not workers (the transfer threads): a few slots that any number of threads may fill.  A slot is free (0), being
+ * filled by the thread that took it with a compare-and-swap (1) or ready for the ingest thread (2); the ingest thread empties ready slots.  No lock. */
+#define PARK_XFR_SLOTS 16
+static park_fetch_req_t g_xfr_q[PARK_XFR_SLOTS];
+static _Atomic uint8_t g_xfr_st[PARK_XFR_SLOTS];
+
+bool park_fetch_request_any(const char *view, const char *zone, uint8_t prio, uint8_t mode) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) return false;
+  for (int i = 0; i < PARK_XFR_SLOTS; i++) {
+    uint8_t free_st = 0;
+    if (!atomic_compare_exchange_strong_explicit(&g_xfr_st[i], &free_st, 1, memory_order_acquire, memory_order_relaxed)) continue;
+    park_fetch_req_t *q = &g_xfr_q[i];
+    q->prio = prio;
+    q->mode = mode;
+    q->vlen = (uint8_t)vl;
+    q->zlen = (uint8_t)zl;
+    memcpy(q->view, view, vl + 1);
+    memcpy(q->zone, zone, zl + 1);
+    atomic_store_explicit(&g_xfr_st[i], 2, memory_order_release);
+    trigger(atomic_load_explicit(&g_ingest_kq, memory_order_relaxed), PARK_FETCH_IDENT);
+    return true;
+  }
+  return false;
+}
+
 bool park_fetch_next(park_fetch_req_t *out) {
   uint32_t start = atomic_fetch_add_explicit(&g_fetch_rr, 1, memory_order_relaxed);
   for (int i = 0; i < PARK_MAX_WORKERS; i++) {
     int w = (int)((start + (uint32_t)i) % PARK_MAX_WORKERS);
     if (park_fetch_pop(&g_fetch[w], out)) return true;
+  }
+  for (int i = 0; i < PARK_XFR_SLOTS; i++) {
+    if (atomic_load_explicit(&g_xfr_st[i], memory_order_acquire) != 2) continue;
+    *out = g_xfr_q[i];
+    atomic_store_explicit(&g_xfr_st[i], 0, memory_order_release);
+    return true;
   }
   return false;
 }

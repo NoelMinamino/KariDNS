@@ -76,6 +76,7 @@ typedef struct {
   uint64_t max_zone_records, max_zone_bytes;
   uint64_t memory_limit;
   uint32_t fetch_rate;
+  uint32_t xfr_timeout_ms;
   uint32_t ingest_threads;
   bool auto_reload;
   uint32_t poll_interval, coalesce_ms;
@@ -479,6 +480,7 @@ static void fill_snap(const server_config_t *cfg, ing_cfg_t *c) {
     c->max_zone_bytes = cfg->database.max_zone_bytes;
     c->memory_limit = cfg->database.memory_limit;
     c->fetch_rate = cfg->database.fetch_rate;
+    c->xfr_timeout_ms = cfg->database.transfer_fetch_timeout_ms;
     c->ingest_threads = cfg->database.ingest_threads;
     c->auto_reload = cfg->database.auto_reload;
     c->poll_interval = cfg->database.poll_interval;
@@ -1179,6 +1181,8 @@ static void ing_kick(void) {
 static _Atomic uint64_t g_fetch_shed;   /* fetch requests not made because of memory-limit */
 static _Atomic uint32_t g_fetch_rate = KARIDNS_DB_FETCH_RATE_DEFAULT;   /* database { fetch-rate }: zones read for queries per second */
 static _Atomic uint64_t g_fetch_limited;  /* fetch requests not made because the rate was used up */
+static _Atomic uint64_t g_fetch_issued;   /* fetches of a whole zone sent to the loader (queries, transfers, the warm-up) */
+static _Atomic uint32_t g_xfr_timeout_ms = KARIDNS_DB_XFR_FETCH_TIMEOUT_DEFAULT;   /* database { transfer-fetch-timeout } */
 static _Atomic uint64_t g_apex_asked, g_apex_answered, g_apex_walks;   /* D1a step 6: summaries asked for (for the apex of a zone out of memory, after a reload) / their fetches that ended */
 static _Atomic uint32_t g_warm_n;                         /* the length of the list of zones to read (g->nwarm, for dbstatus) */
 static _Atomic bool g_apex_walking;                       /* ... and the walk over the registry that finds the zones is still going */
@@ -2651,6 +2655,8 @@ static void fetch_issue(ing_t *g) {
     if (q.mode == KDB_FETCH_SUMMARY) {
       g->nsum++;
       atomic_fetch_add_explicit(&g_apex_asked, 1, memory_order_relaxed);
+    } else {
+      atomic_fetch_add_explicit(&g_fetch_issued, 1, memory_order_relaxed);
     }
     memset(r, 0, sizeof(*r));
     if (q.mode != KDB_FETCH_SUMMARY) r->v_valid = dbreg_zone_version(g->view_names[vi], q.zone, &r->v_sid, &r->v_serial);
@@ -2862,6 +2868,7 @@ static void *cache_thread(void *arg) {
     uint64_t lim = c.enabled ? c.memory_limit : 0;
     dbreg_cache_set_limit(lim);
     atomic_store_explicit(&g_fetch_rate, c.fetch_rate ? c.fetch_rate : KARIDNS_DB_FETCH_RATE_DEFAULT, memory_order_relaxed);
+    atomic_store_explicit(&g_xfr_timeout_ms, c.xfr_timeout_ms ? c.xfr_timeout_ms : KARIDNS_DB_XFR_FETCH_TIMEOUT_DEFAULT, memory_order_relaxed);
     struct timespec ts = { 0, lim ? 50 * 1000000L : 0 };
     if (!lim) {
       ts.tv_sec = 1;
@@ -3001,6 +3008,7 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
   park_fetch_set_notify(g->kq);
   dbreg_cache_set_limit(snap.memory_limit);              /* before the first batch: the startup load already keeps within it */
   atomic_store_explicit(&g_fetch_rate, snap.fetch_rate ? snap.fetch_rate : KARIDNS_DB_FETCH_RATE_DEFAULT, memory_order_relaxed);
+  atomic_store_explicit(&g_xfr_timeout_ms, snap.xfr_timeout_ms ? snap.xfr_timeout_ms : KARIDNS_DB_XFR_FETCH_TIMEOUT_DEFAULT, memory_order_relaxed);
   pthread_t t;
   if (pthread_create(&t, NULL, ingest_thread, g) != 0) {
     syslog(LOG_ERR, "[DB] cannot create the ingest thread");
@@ -3012,6 +3020,41 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
   else pthread_detach(ct);
   atomic_store_explicit(&g_ing_kq, g->kq, memory_order_release);
   return true;
+}
+
+#define XFR_POLL_NS 5000000L        /* a transfer thread looks at the zone every 5 ms while it waits for it */
+#define XFR_REREQUEST_MS 100        /* ... and asks again this often while nothing is on its way (a request that was shed, or lost with a restarted loader) */
+
+zone_db_entry_t *db_ingest_xfr_await(zdir_elem_t *el, const char *view) {
+  const int64_t end = now_ms() + (int64_t)atomic_load_explicit(&g_xfr_timeout_ms, memory_order_relaxed);
+  int64_t next_ask = 0;
+  bool waited = false;
+  for (;;) {
+    zone_db_entry_t *e = dbreg_xfr_acquire(el);
+    if (e) {
+      if (waited) {
+        dbreg_xfr_note(DBREG_XFR_LOADED);
+        dbreg_xfr_loaded(view, el->name);      /* the zone is here for this transfer: the first to go when memory is needed (design 7) */
+      }
+      return e;
+    }
+    if (!waited) {
+      waited = true;
+      dbreg_xfr_note(DBREG_XFR_WAITED);
+    }
+    const uint8_t st = atomic_load_explicit(&el->state, memory_order_acquire);
+    const int64_t now = now_ms();
+    if (st == ZDIR_ST_ERROR || now >= end) break;       /* no usable version in the registry (a rejected zone), or the time is up */
+    if (st == ZDIR_ST_ABSENT && now >= next_ask) {
+      /* (the ingest thread sheds the request while the database zones are above the hard limit and when the fetch-rate bucket is empty, as it does for a query;
+       * the transfer asks again until its time is up) */
+      next_ask = now + (park_fetch_request_any(view, el->name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL) ? XFR_REREQUEST_MS : XFR_REREQUEST_MS / 5);
+    }
+    struct timespec ts = { 0, XFR_POLL_NS };
+    nanosleep(&ts, NULL);
+  }
+  dbreg_xfr_note(DBREG_XFR_FAILED);
+  return NULL;
 }
 
 bool db_ingest_enabled(void) {
@@ -3278,10 +3321,13 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     st_append(&c, "zone versions and IXFR deltas: database zones %llu bytes resident + %llu retired; other zones %llu resident + %llu retired\n",
               (unsigned long long)zdb.resident, (unsigned long long)zdb.retired, (unsigned long long)zot.resident,
               (unsigned long long)zot.retired);
-    st_append(&c, "fetch: rate=%u/s refused_by_rate=%llu\n", (unsigned)atomic_load_explicit(&g_fetch_rate, memory_order_relaxed),
-              (unsigned long long)atomic_load_explicit(&g_fetch_limited, memory_order_relaxed));
+    st_append(&c, "fetch: rate=%u/s refused_by_rate=%llu issued=%llu\n", (unsigned)atomic_load_explicit(&g_fetch_rate, memory_order_relaxed),
+              (unsigned long long)atomic_load_explicit(&g_fetch_limited, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_fetch_issued, memory_order_relaxed));
     dbreg_cache_stats_t cs;
     dbreg_cache_stats(&cs);
+    st_append(&c, "transfers of zones out of memory: waited=%llu loaded=%llu failed=%llu summary_answers=%llu marked=%llu timeout=%ums\n",
+              (unsigned long long)cs.xfr[DBREG_XFR_WAITED], (unsigned long long)cs.xfr[DBREG_XFR_LOADED], (unsigned long long)cs.xfr[DBREG_XFR_FAILED],
+              (unsigned long long)cs.xfr[DBREG_XFR_SUMMARY], (unsigned long long)cs.xfr_marked, (unsigned)atomic_load_explicit(&g_xfr_timeout_ms, memory_order_relaxed));
     if (cs.limit)
       st_append(&c, "cache: limit=%llu resident=%llu retired=%llu inflight=%llu evictions=%llu rounds=%llu cold=%llu marked=%llu misses=%llu "
                     "shed=%llu pinned=%llu peak=%llu victim_freq=%u\n",
