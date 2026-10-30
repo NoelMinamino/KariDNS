@@ -394,16 +394,21 @@ bool park_fetch_request_any(const char *view, const char *zone, uint8_t prio, ui
 }
 
 bool park_fetch_next(park_fetch_req_t *out) {
+  /* the workers' rings and the slots of the transfer threads take turns: the slots are one more source in the round robin, so that workers whose rings are always
+   * full do not starve a transfer (which would run into its time-out) */
   uint32_t start = atomic_fetch_add_explicit(&g_fetch_rr, 1, memory_order_relaxed);
-  for (int i = 0; i < PARK_MAX_WORKERS; i++) {
-    int w = (int)((start + (uint32_t)i) % PARK_MAX_WORKERS);
-    if (park_fetch_pop(&g_fetch[w], out)) return true;
-  }
-  for (int i = 0; i < PARK_XFR_SLOTS; i++) {
-    if (atomic_load_explicit(&g_xfr_st[i], memory_order_acquire) != 2) continue;
-    *out = g_xfr_q[i];
-    atomic_store_explicit(&g_xfr_st[i], 0, memory_order_release);
-    return true;
+  for (int i = 0; i <= PARK_MAX_WORKERS; i++) {
+    int w = (int)((start + (uint32_t)i) % (PARK_MAX_WORKERS + 1));
+    if (w == PARK_MAX_WORKERS) {
+      for (int k = 0; k < PARK_XFR_SLOTS; k++) {
+        if (atomic_load_explicit(&g_xfr_st[k], memory_order_acquire) != 2) continue;
+        *out = g_xfr_q[k];
+        atomic_store_explicit(&g_xfr_st[k], 0, memory_order_release);
+        return true;
+      }
+    } else if (park_fetch_pop(&g_fetch[w], out)) {
+      return true;
+    }
   }
   return false;
 }

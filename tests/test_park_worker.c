@@ -95,6 +95,36 @@ static size_t build_op(uint8_t *b, uint16_t id, int opcode, const char *name) {
     return o;
 }
 
+/* an IXFR question for park.test over UDP (RFC 1995 4.2) with the client's SOA (serial `serial`) in Authority; no_soa: leave it out (RFC 1995 3: FORMERR) */
+static size_t build_ixfr(uint8_t *b, uint16_t id, uint32_t serial, bool no_soa) {
+    memset(b, 0, 12);
+    b[0] = (uint8_t)(id >> 8); b[1] = (uint8_t)id;
+    b[5] = 1;
+    b[9] = no_soa ? 0 : 1;
+    b[11] = 1;                                     // an OPT record, so that an error carries the EDE
+    size_t o = 12;
+    static const uint8_t qn[] = { 4, 'p', 'a', 'r', 'k', 4, 't', 'e', 's', 't', 0 };
+    memcpy(b + o, qn, sizeof(qn));
+    o += sizeof(qn);
+    b[o++] = 0; b[o++] = 251; b[o++] = 0; b[o++] = 1;
+    if (!no_soa) {
+    b[o++] = 0xC0; b[o++] = 12;
+    b[o++] = 0; b[o++] = 6; b[o++] = 0; b[o++] = 1; b[o++] = 0; b[o++] = 0; b[o++] = 0; b[o++] = 0;
+    static const uint8_t rd[] = { 2, 'n', 's', 0xC0, 12, 1, 'h', 0xC0, 12 };
+    size_t rl = sizeof(rd) + 20;
+    b[o++] = (uint8_t)(rl >> 8); b[o++] = (uint8_t)rl;
+    memcpy(b + o, rd, sizeof(rd));
+    o += sizeof(rd);
+    b[o++] = (uint8_t)(serial >> 24); b[o++] = (uint8_t)(serial >> 16); b[o++] = (uint8_t)(serial >> 8); b[o++] = (uint8_t)serial;
+    memset(b + o, 0, 16);
+    o += 16;
+    }
+    static const uint8_t opt[] = { 0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 0 };
+    memcpy(b + o, opt, sizeof(opt));
+    o += sizeof(opt);
+    return o;
+}
+
 static void mk_ipc(udp_ipc_t *i, int tag, size_t len) {
     memset(i, 0, sizeof(*i));
     i->sock_fd_idx = tag;
@@ -118,6 +148,9 @@ typedef struct {
     size_t len;
 } ans_t;
 
+static uint8_t g_raw[4096];                       /* the last answer read, as it came */
+static size_t g_raw_len;
+
 static ans_t read_answer(int fd) {
     ans_t a;
     memset(&a, 0, sizeof(a));
@@ -133,6 +166,8 @@ static ans_t read_answer(int fd) {
     a.got = true;
     a.sock_idx = ipc->sock_fd_idx;
     a.len = len;
+    g_raw_len = len < sizeof(g_raw) ? len : sizeof(g_raw);
+    memcpy(g_raw, m, g_raw_len);
     a.id = (uint16_t)((m[0] << 8) | m[1]);
     a.rcode = m[3] & 0x0F;
     a.ancount = (m[6] << 8) | m[7];
@@ -572,6 +607,109 @@ int main(void) {
         CHECK(atomic_load(&el->freq) == f1 && table.nwait == 0 && !park_fetch_pop(park_fetch_ring(0), &q));
     }
 
+    /* -- D1a review 7c: an IXFR over UDP (RFC 1995 4.2) is a zone transfer question.  allow-transfer decides, for a zone in memory and for one that is out of memory:
+     *    a client that may not transfer is REFUSED (EDE 18) without a fetch, a parked query or a count for the zone's frequency; one that may gets the one SOA from the
+     *    summary (TC when it is behind) without the zone being read, byte for byte what the zone in memory answers; without a usable apex it waits for the zone like
+     *    any query; a request without the client's SOA is FORMERR */
+    {
+        w.park = &table;
+        uint32_t f2 = atomic_load(&el->freq);
+        #define IXQ(id, serial, nosoa) do { size_t ql_ = build_ixfr(rx + sizeof(udp_ipc_t), (id), (serial), (nosoa)); mk_ipc((udp_ipc_t *)rx, 7, ql_); \
+            w.n_tx = 0; udp_one(&w, (udp_ipc_t *)rx, rx + sizeof(udp_ipc_t), (ssize_t)ql_); } while (0)
+        static server_config_t cfgD, cfgA;
+        char confx[1600];
+        snprintf(confx, sizeof(confx), "options { directory \"%s\"; };\nview \"default\" { match-clients { any; }; zone \"park.test\" { type master; file \"%s\"; }; };\n", dir, zf);
+        CHECK(parse_named_conf(confx, &cfgD) == 0);
+        snprintf(confx, sizeof(confx), "options { directory \"%s\"; };\nview \"default\" { match-clients { any; }; zone \"park.test\" { type master; file \"%s\"; allow-transfer { 127.0.0.1; }; }; };\n", dir, zf);
+        CHECK(parse_named_conf(confx, &cfgA) == 0);
+        cfgD.send_extended_errors = cfgA.send_extended_errors = true;
+        /* the zone in memory, with and without allow-transfer: the answers to compare with */
+        atomic_store(&el->entry, entry);
+        atomic_store(&el->state, ZDIR_ST_RESIDENT);
+        uint8_t res_up[4096], res_tc[4096];
+        size_t res_up_len = 0, res_tc_len = 0;
+        atomic_store_explicit(&g_config_db.active, &cfgD, memory_order_release);
+        rebuild_zone_db_from_config(&cfgD, false);
+        el = the_elem();
+        entry = zdir_entry(el);
+        IXQ(0x7801, 1, false); FLUSH(); a = read_answer(sk[1]);
+        CHECK(a.got && a.id == 0x7801 && a.rcode == 5 && a.ede == 18 && a.ancount == 0);          /* (a zone in memory: REFUSED without allow-transfer) */
+        atomic_store_explicit(&g_config_db.active, &cfgA, memory_order_release);
+        rebuild_zone_db_from_config(&cfgA, false);
+        el = the_elem();
+        entry = zdir_entry(el);
+        IXQ(0x7802, 1, false); FLUSH(); a = read_answer(sk[1]);
+        CHECK(a.got && a.rcode == 0 && a.ancount == 1 && !(g_raw[2] & 0x02));                   /* up to date: the one SOA, no TC */
+        memcpy(res_up, g_raw, g_raw_len); res_up_len = g_raw_len;
+        IXQ(0x7803, 0, false); FLUSH(); a = read_answer(sk[1]);
+        CHECK(a.got && a.rcode == 0 && a.ancount == 1 && (g_raw[2] & 0x02));                    /* behind: the one SOA and TC */
+        memcpy(res_tc, g_raw, g_raw_len); res_tc_len = g_raw_len;
+        IXQ(0x7804, 0, true); FLUSH(); a = read_answer(sk[1]);
+        CHECK(a.got && a.rcode == 1);                                                            /* (no SOA of the client: FORMERR) */
+        /* the zone out of memory: the same, from the apex of its summary */
+        uint8_t nm_wire[] = { 2, 'n', 's', 4, 'p', 'a', 'r', 'k', 4, 't', 'e', 's', 't', 0, 1, 'h', 4, 'p', 'a', 'r', 'k', 4, 't', 'e', 's', 't', 0 };
+        zdir_apex_t *iap = calloc(1, sizeof(*iap) + sizeof(nm_wire) + 20);
+        iap->serial = 1; iap->soa_ttl = 300; iap->refresh = 7200; iap->retry = 3600; iap->expire = 1209600; iap->minimum = 300; iap->ns_ttl = 300;
+        iap->mname_len = 14; iap->rname_len = 13; iap->ns_len = 14; iap->n_ns = 1;
+        memcpy(iap->data, nm_wire, 14 + 13);
+        memcpy(iap->data + 27, nm_wire, 14);
+        atomic_store(&el->serial, 1);
+        atomic_store(&el->apex, iap);
+        atomic_store(&el->entry, NULL);
+        atomic_store(&el->state, ZDIR_ST_ABSENT);
+        atomic_store_explicit(&g_config_db.active, &cfgD, memory_order_release);
+        static const char tst[] = "";
+        (void)tst;
+        f2 = atomic_load(&el->freq);
+        IXQ(0x7811, 1, false);
+        CHECK(w.n_tx == 1 && table.nwait == 0 && !park_fetch_pop(park_fetch_ring(0), &q));
+        FLUSH(); a = read_answer(sk[1]);
+        CHECK(a.got && a.id == 0x7811 && a.rcode == 5 && a.ede == 18 && a.ancount == 0 && atomic_load(&el->freq) == f2);   /* (REFUSED: no allow-transfer, nothing parked or asked for) */
+        /* allowed: the settings kept in the element (a database zone's allow-transfer needs the ceiling of the database block as well) */
+        static const char ast[] = "allow-transfer { 127.0.0.1; };";
+        zone_ext_shared_t *ash = db_settings_parse(ast, strlen(ast), NULL, 0);
+        CHECK(ash != NULL);
+        atomic_store(&el->sh, ash);
+        static server_config_t cfgC;
+        snprintf(confx, sizeof(confx), "options { directory \"%s\"; database { driver sqlite3; database-file \"/x.db\"; acl-ceiling { 127.0.0.1; }; }; };\n"
+                 "view \"default\" { match-clients { any; }; zone \"park.test\" { type master; file \"%s\"; }; };\n", dir, zf);
+        CHECK(parse_named_conf(confx, &cfgC) == 0);
+        cfgC.send_extended_errors = true;
+        atomic_store_explicit(&g_config_db.active, &cfgC, memory_order_release);
+        IXQ(0x7802, 1, false);
+        CHECK(w.n_tx == 1 && table.nwait == 0 && !park_fetch_pop(park_fetch_ring(0), &q));
+        FLUSH(); a = read_answer(sk[1]);
+        CHECK(a.got && a.rcode == 0 && a.ancount == 1 && g_raw_len == res_up_len && memcmp(g_raw, res_up, res_up_len) == 0);        /* (the bytes of the zone in memory) */
+        IXQ(0x7803, 0, false);
+        CHECK(w.n_tx == 1 && table.nwait == 0 && !park_fetch_pop(park_fetch_ring(0), &q));
+        FLUSH(); a = read_answer(sk[1]);
+        CHECK(a.got && a.rcode == 0 && a.ancount == 1 && (g_raw[2] & 0x02) && g_raw_len == res_tc_len && memcmp(g_raw, res_tc, res_tc_len) == 0);
+        IXQ(0x7812, 9, false); FLUSH(); a = read_answer(sk[1]);
+        CHECK(a.got && a.rcode == 0 && a.ancount == 1 && !(g_raw[2] & 0x02) && table.nwait == 0);          /* (a client that is ahead: up to date) */
+        IXQ(0x7804, 0, true); FLUSH(); a = read_answer(sk[1]);
+        CHECK(a.got && a.rcode == 1 && table.nwait == 0 && !park_fetch_pop(park_fetch_ring(0), &q));        /* (no SOA of the client: FORMERR, nothing asked for) */
+        /* the apex describes another version than the directory has: the zone is waited for (an allowed client) */
+        atomic_store(&el->serial, 5);
+        IXQ(0x7813, 1, false);
+        CHECK(w.n_tx == 0 && table.nwait == 1 && park_fetch_pop(park_fetch_ring(0), &q));
+        CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", true));
+        park_service(&w, -1);
+        FLUSH(); a = read_answer(sk[1]);
+        CHECK(a.got && a.id == 0x7813 && a.rcode == 2 && table.nwait == 0);
+        atomic_store(&el->serial, 1);
+        atomic_store(&el->apex, NULL);
+        free(iap);
+        atomic_store(&el->sh, NULL);
+        zone_ext_shared_unref(ash);
+        atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+        rebuild_zone_db_from_config(&cfg, false);
+        el = the_elem();
+        entry = zdir_entry(el);
+        atomic_store(&el->entry, NULL);
+        atomic_store(&el->state, ZDIR_ST_ABSENT);
+        #undef IXQ
+    }
+
     /* -- nothing is parked and nobody said anything: park_service() returns at once (and with a key in the ring it does look) */
     w.park = &table;
     CHECK(table.nwait == 0 && table.nready == 0);
@@ -585,6 +723,7 @@ int main(void) {
     atomic_store(&el->entry, entry);
     unlink(zf);
     rmdir(dir);
+    gc_snapshot_wait_idle();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) return 1;
     printf("=== test_park_worker: all checks passed ===\n");

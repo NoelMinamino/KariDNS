@@ -621,11 +621,19 @@ static void test_soa_set_per_client(void) {
         compress_ctx_init_packet(&cc);
         const rate_limit_config_t *rrl = NULL;
         zone_db_entry_t *m = NULL;
-        n = process_dns_query_impl(req, off, res, sizeof(res), "soa.example.", 251, "198.51.100.5", &cc, false, &rrl, &snap, &cfg, &m);
+        /* allow-transfer is checked for an IXFR over UDP too (BIND ns_xfr_start()): only 198.51.100.5 may transfer the zone */
+        server_config_t xcfg;
+        memset(&xcfg, 0, sizeof(xcfg));
+        assert(parse_named_conf("zone \"soa.example\" { type master; file \"x\"; allow-transfer { 198.51.100.5; }; };", &xcfg) == 0);
+        xcfg.send_extended_errors = true;
+        view.name = "__default__";
+        n = process_dns_query_impl(req, off, res, sizeof(res), "soa.example.", 251, "198.51.100.5", &cc, false, &rrl, &snap, &xcfg, &m);
         assert(n >= DNS_HEADER_SIZE && (res[3] & 0x0F) == 0 && ((res[6] << 8) | res[7]) == 1 && soa_set_has(res, n, "\3ns1\2ex"));
         compress_ctx_init_packet(&cc);
-        n = process_dns_query_impl(req, off, res, sizeof(res), "soa.example.", 251, "203.0.113.200", &cc, false, &rrl, &snap, &cfg, &m);
+        n = process_dns_query_impl(req, off, res, sizeof(res), "soa.example.", 251, "203.0.113.200", &cc, false, &rrl, &snap, &xcfg, &m);
         assert(n >= DNS_HEADER_SIZE && (res[3] & 0x0F) == 5);
+        free_server_config_fields(&xcfg);
+        view.name = "default";
     }
     zone_arena_destroy(&arena);
     printf("  -> several restricted SOA records passed.\n");

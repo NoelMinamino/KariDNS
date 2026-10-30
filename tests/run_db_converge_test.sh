@@ -101,6 +101,7 @@ control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
 EOF
 }
 start_srv() {
+    : > "$T/srv.log"          # (the background job below truncates it later: a "initial load complete" of the previous server must not be taken for this one's)
     "$KARIDNS" -c "$T/k.conf" -f > "$T/srv.log" 2>&1 &
     SRV=$!
     i=0

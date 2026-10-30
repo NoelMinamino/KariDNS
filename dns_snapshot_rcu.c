@@ -1685,22 +1685,39 @@ static void cache_note_next(void) {
 static _Atomic uint64_t g_cache_rounds, g_cache_cold, g_cache_marked, g_cache_misses, g_xfr_marked;
 static _Atomic uint64_t g_xfr_count[4];
 /* D1a step 7: NOTIFY of zones whose data is out of memory (design 7).  The ingest thread queues (view, zone) under g_zone_db_rebuild_lock; the control thread,
- * which owns the table of NOTIFYs awaiting an answer, takes them: a ring with one consumer.  A full ring drops the request (counted): NOTIFY is advisory
- * (RFC 1996 2), a secondary asks again at its refresh time. */
+ * which owns the table of NOTIFYs awaiting an answer, takes them: a ring with one consumer.  A full ring does not lose the request: the element gets
+ * ZDIR_F_NOTIFY_DEFER and the control thread's sweep (dbreg_notify_sweep()) queues it when there is room again, so a bulk change of more zones than the ring
+ * holds is notified in full, a slice at a time. */
 #define NRN_RING 1024
 static struct { char view[KARIDNS_VIEW_NAME_MAX]; char zone[256]; } g_nrn[NRN_RING];
 static _Atomic uint32_t g_nrn_head, g_nrn_tail;
 static _Atomic uint64_t g_nrn_queued, g_nrn_dropped;
-static void nrn_push_locked(const char *view, const char *zone) {
+static _Atomic bool g_nrn_overflow;          /* some element has ZDIR_F_NOTIFY_DEFER (a sweep will find it) */
+static bool nrn_room(void) { return atomic_load_explicit(&g_nrn_head, memory_order_relaxed) - atomic_load_explicit(&g_nrn_tail, memory_order_acquire) < NRN_RING; }
+/* Queue (view, zone) for the control thread; the lock is held.  true: queued, the element's marks (DUE, DEFER) are gone.  false: no room (or a name that does not
+ * fit, which no zone has): the element is marked DEFER and the sweep takes it up. */
+static bool nrn_queue_locked(dbreg_zone_t *z, const char *view) {
     uint32_t head = atomic_load_explicit(&g_nrn_head, memory_order_relaxed);
-    if (head - atomic_load_explicit(&g_nrn_tail, memory_order_acquire) >= NRN_RING || strlen(view) >= sizeof(g_nrn[0].view) || strlen(zone) >= sizeof(g_nrn[0].zone)) {
+    if (!nrn_room() || strlen(view) >= sizeof(g_nrn[0].view) || strlen(z->name) >= sizeof(g_nrn[0].zone)) {
         atomic_fetch_add_explicit(&g_nrn_dropped, 1, memory_order_relaxed);
-        return;
+        z->flags = (uint16_t)((z->flags & ~ZDIR_F_NOTIFY_DUE) | ZDIR_F_NOTIFY_DEFER);
+        atomic_store_explicit(&g_nrn_overflow, true, memory_order_relaxed);
+        return false;
     }
     strcpy(g_nrn[head % NRN_RING].view, view);
-    strcpy(g_nrn[head % NRN_RING].zone, zone);
+    strcpy(g_nrn[head % NRN_RING].zone, z->name);
     atomic_store_explicit(&g_nrn_head, head + 1, memory_order_release);
     atomic_fetch_add_explicit(&g_nrn_queued, 1, memory_order_relaxed);
+    z->flags &= (uint16_t)~(ZDIR_F_NOTIFY_DUE | ZDIR_F_NOTIFY_DEFER);
+    return true;
+}
+/* Is a NOTIFY for the zone waiting in the ring?  (The lock is held; the ring is empty almost always.)  The cache manager does not take such a zone out of
+ * memory: the apex that an eviction makes from the image has no addresses of NS hosts outside the zone. */
+static bool nrn_pending_locked(const char *view, const char *zone) {
+    uint32_t tail = atomic_load_explicit(&g_nrn_tail, memory_order_acquire), head = atomic_load_explicit(&g_nrn_head, memory_order_relaxed);
+    for (uint32_t k = tail; k != head; k++)
+        if (strcmp(g_nrn[k % NRN_RING].zone, zone) == 0 && strcmp(g_nrn[k % NRN_RING].view, view) == 0) return true;
+    return false;
 }
 bool dbreg_notify_pop(char *view, size_t vcap, char *zone, size_t zcap) {
     uint32_t tail = atomic_load_explicit(&g_nrn_tail, memory_order_relaxed);
@@ -1709,6 +1726,48 @@ bool dbreg_notify_pop(char *view, size_t vcap, char *zone, size_t zcap) {
     snprintf(zone, zcap, "%s", g_nrn[tail % NRN_RING].zone);
     atomic_store_explicit(&g_nrn_tail, tail + 1, memory_order_release);
     return true;
+}
+/* The control thread, every tick: queue the zones that could not be queued when their serial changed (ZDIR_F_NOTIFY_DEFER), as many as the ring has room for.  The
+ * registry is walked in slices (the lock is not held for a whole pass of a million zones) from where the last call stopped; it is done with a pass that saw no
+ * deferred zone and no new overflow.  Rate-limited by the ring (a tick takes 256 out) and by the slice. */
+#define NRN_SWEEP_SLICE 20000
+void dbreg_notify_sweep(void) {
+    static size_t sv, sb;                                  /* the cursor (the control thread alone) */
+    static bool seen;                                      /* a deferred zone was seen in this pass */
+    static uint64_t drops0;                                /* the number of overflows when the pass began */
+    if (!atomic_load_explicit(&g_nrn_overflow, memory_order_relaxed)) return;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    if (sv == 0 && sb == 0) {
+        seen = false;
+        drops0 = atomic_load_explicit(&g_nrn_dropped, memory_order_relaxed);
+    }
+    size_t visited = 0;
+    bool stalled = false;
+    while (visited < NRN_SWEEP_SLICE && !stalled) {
+        if (sv >= g_dbreg_nviews) {                        /* the end of a pass */
+            if (!seen && atomic_load_explicit(&g_nrn_dropped, memory_order_relaxed) == drops0) atomic_store_explicit(&g_nrn_overflow, false, memory_order_relaxed);
+            sv = sb = 0;
+            break;
+        }
+        dbreg_view_t *rv = &g_dbreg_views[sv];
+        if (sb >= rv->nb) {
+            sv++;
+            sb = 0;
+            continue;
+        }
+        for (dbreg_zone_t *z = rv->tab[sb]; z; z = z->next) {
+            visited++;
+            if (!(z->flags & ZDIR_F_NOTIFY_DEFER) || (z->flags & ZDIR_F_DELETED)) continue;
+            seen = true;
+            if (!nrn_room()) {                             /* the ring is full again: the rest waits for the next tick */
+                stalled = true;
+                break;
+            }
+            (void)nrn_queue_locked(z, rv->name);
+        }
+        if (!stalled) sb++;
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 }
 void dbreg_notify_stats(uint64_t *queued, uint64_t *dropped) {
     *queued = atomic_load_explicit(&g_nrn_queued, memory_order_relaxed);
@@ -1955,11 +2014,14 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
     /* D1a step 7: data for a zone that was out of memory brings another serial than the directory had (the body of a changed zone that the loader sent because
      * it thought the zone was here, or a fetch that is newer than the summary): the install of an entry is a first load for dns_db_install.c, which sends no
      * NOTIFY then, so the control thread is asked, as for a summary; it finds the zone in memory and sends from it.  A summary that waited for its apex (DUE) too. */
-    if ((z->flags & ZDIR_F_NOTIFY_DUE) || (created && !cur && had_version && old_serial != serial && !sh)) {
-        z->flags &= (uint16_t)~ZDIR_F_NOTIFY_DUE;
-        nrn_push_locked(rv->name, z->name);
+    if ((z->flags & ZDIR_F_NOTIFY_DUE) || (created && !cur && had_version && old_serial != serial && !sh)) (void)nrn_queue_locked(z, rv->name);
+    {
+        /* the apex of the summary is not used while the data is here (and the engine compares the serial, should this fail).  One with the addresses of NS hosts
+         * outside the zone, of the version that is installed, stays: they cannot be made from the image, and the NOTIFY of a zone that is taken out of memory
+         * again before it is sent needs them */
+        zdir_apex_t *oap = atomic_load_explicit(&z->apex, memory_order_relaxed);
+        if (oap && !(oap->naddr_len > 0 && oap->serial == serial)) (void)apex_replace_locked(z, NULL);
     }
-    if (atomic_load_explicit(&z->apex, memory_order_relaxed)) (void)apex_replace_locked(z, NULL);       /* the data is here now: the apex of the summary is not used any more (and the engine compares the serial, should this fail) */
     if (z->flags & ZDIR_F_EVICT_NEXT) cache_note_next();
     if (created && !fresh && !cur && !(z->flags & (ZDIR_F_PIN | ZDIR_F_NOCACHE)) && dbreg_cache_over_high(0) &&
         atomic_load_explicit(&z->freq, memory_order_relaxed) < atomic_load_explicit(&g_victim_freq, memory_order_relaxed)) {
@@ -2240,10 +2302,7 @@ bool dbreg_set_apex(const char *view, const char *zone, int64_t source_id, uint3
         if (apex) apex->serial = serial;
         taken = apex_replace_locked(z, apex) && apex != NULL;
         if (taken) z->flags &= (uint16_t)~ZDIR_F_NOAPEX;
-        if (z->flags & ZDIR_F_NOTIFY_DUE) {        /* the serial changed and this is the summary of the new version, with its apex (or without one: also-notify still applies) */
-            z->flags &= (uint16_t)~ZDIR_F_NOTIFY_DUE;
-            nrn_push_locked(rv->name, z->name);
-        }
+        if (z->flags & ZDIR_F_NOTIFY_DUE) (void)nrn_queue_locked(z, rv->name);       /* the serial changed and this is the summary of the new version, with its apex (or without one: also-notify still applies) */
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     return taken;
@@ -2453,6 +2512,7 @@ static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
         atomic_load_explicit(&z->state, memory_order_relaxed) != ZDIR_ST_RESIDENT || e->evicted_bytes)
         return 0;
     if (zdir_lookup(dbreg_active_dir_locked(rv->name), z->name) != z) return 0;
+    if (nrn_pending_locked(rv->name, z->name)) return 0;       /* its NOTIFY is queued: sent from the apex it has, not from one made out of the image */
     if (atomic_load_explicit(&e->active_axfr, memory_order_acquire) > 0 || atomic_load_explicit(&e->is_transferring, memory_order_acquire)) return 0;
     /* more than the registry's reference: a zone { in-view } of another view shares the entry (it would go on serving it), or an object of the entry
      * waits on the retire stack; not now */
@@ -2528,6 +2588,9 @@ void dbreg_xfr_loaded(const char *view, const char *zone) {
     dbreg_view_t *rv = dbreg_view_get(view, false);
     dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
     zone_db_entry_t *e = z ? zdir_entry(z) : NULL;
+    /* a zone that queries have been answered from since it came into memory (a query woke it up: the fetch was shared, or it arrived first) is no transfer-only read;
+     * qseen is the entry's query counter when the manager last folded it into freq (0 for a new entry) */
+    if (e && (uint32_t)atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed) != z->qseen) e = NULL;
     /* a pinned zone and one a dynamic UPDATE changed are never taken out; a zone that queries asked for more often than the zones the manager took out
      * last is worth its memory whoever loaded it; one that is marked already (admission) needs nothing */
     if (e && !(z->flags & (ZDIR_F_PIN | ZDIR_F_NOCACHE | ZDIR_F_EVICT_NEXT | ZDIR_F_DELETED)) && !atomic_load_explicit(&e->updated, memory_order_relaxed) &&

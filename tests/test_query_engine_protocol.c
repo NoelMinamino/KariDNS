@@ -325,6 +325,8 @@ static void put_soa_rr(req_t *q, const char *owner, uint32_t serial) {
     q->b[rl] = (uint8_t)((q->n - rs) >> 8); q->b[rl + 1] = (uint8_t)(q->n - rs);
 }
 
+static server_config_t *notify_cfg(const char *zone_stmt);
+
 static const char *ZONE_TXT =
     "$ORIGIN example.\n$TTL 60\n@ SOA ns h 5 2 3 4 5\n@ NS ns\nns A 192.0.2.1\nwww A 192.0.2.10\n";
 
@@ -383,16 +385,27 @@ static void test_protocol_anomalies(void) {
     ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
     CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 1) == 1);
 
-    /* RFC 1995 2: IXFR over UDP. Client already current -> the single SOA; older client -> SOA + TC so it retries via TCP */
-    put_hdr(&q, 0x4592, 0x0000, 1, 0, 1, 0); put_question(&q, "example.", 251, 1); put_soa_rr(&q, "example.", 5);
-    ask(&q, "example.", 251, "192.0.2.100", false, &r);
-    CHECK(&r, r.rcode == 0 && r.aa && r.counts[0] == 1 && gr_count(&r, 1, 6) == 1 && (r.msg[2] & 0x02) == 0);
-    put_hdr(&q, 0x4592, 0x0000, 1, 0, 1, 0); put_question(&q, "example.", 251, 1); put_soa_rr(&q, "example.", 1);
-    ask(&q, "example.", 251, "192.0.2.100", false, &r);
-    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 6) == 1 && (r.msg[2] & 0x02) != 0);
-    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0); put_question(&q, "example.", 251, 1);      /* IXFR without a client SOA */
-    ask(&q, "example.", 251, "192.0.2.100", false, &r);
-    CHECK(&r, r.rcode == 0 || r.rcode == 1);
+    /* RFC 1995 2: IXFR over UDP. Client already current -> the single SOA; older client -> SOA + TC so it retries via TCP.
+     * allow-transfer is checked first (BIND ns_xfr_start()): a client that may not transfer is REFUSED + EDE 18 */
+    {
+        server_config_t *icfg = notify_cfg("zone \"example.\" { type master; file \"x\"; allow-transfer { 192.0.2.100; }; };");
+        g_gr.cfg = *icfg;
+        g_gr.cfg.send_extended_errors = true;
+        g_gr.view.name = "__default__";
+        put_hdr(&q, 0x4592, 0x0000, 1, 0, 1, 0); put_question(&q, "example.", 251, 1); put_soa_rr(&q, "example.", 5);
+        ask(&q, "example.", 251, "192.0.2.100", false, &r);
+        CHECK(&r, r.rcode == 0 && r.aa && r.counts[0] == 1 && gr_count(&r, 1, 6) == 1 && (r.msg[2] & 0x02) == 0);
+        put_hdr(&q, 0x4592, 0x0000, 1, 0, 1, 0); put_question(&q, "example.", 251, 1); put_soa_rr(&q, "example.", 1);
+        ask(&q, "example.", 251, "192.0.2.100", false, &r);
+        CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 6) == 1 && (r.msg[2] & 0x02) != 0);
+        put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0); put_question(&q, "example.", 251, 1);      /* IXFR without a client SOA */
+        ask(&q, "example.", 251, "192.0.2.100", false, &r);
+        CHECK(&r, r.rcode == 0 || r.rcode == 1);
+        ask(&q, "example.", 251, "203.0.113.9", false, &r);                            /* not allowed to transfer */
+        CHECK(&r, r.rcode == 5 && r.counts[0] == 0 && gr_count(&r, 1, 6) == 0);
+        g_gr.cfg = (server_config_t){0};
+        free_server_config_fields(icfg); free(icfg);
+    }
 
     /* RFC 7873: a COOKIE that cannot be bound to a (parsable) client address is not answered with a server cookie */
     uint8_t opt_ck[12] = { 0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8 };

@@ -1366,7 +1366,7 @@ static void test_dir_elements(void) {
     CHECK(ea->state == ZDIR_ST_RESIDENT && ea->source_id == 301 && ea->serial == 7 && ea->klen == 6);
     CHECK(ea->refresh == 7200 && ea->retry == 3600 && ea->expire == 1209600);       /* the SOA values of the version served */
     CHECK(!(ea->kind & (ZDIR_K_OWNED | ZDIR_K_STATIC | ZDIR_K_SHARED)) && !ea->shadowed);
-    CHECK(ea->qseen == 0 && ea->freq == 0 && !(ea->flags & (ZDIR_F_PIN | ZDIR_F_NOCACHE | ZDIR_F_PARTIAL)));   /* (reserved) */
+    CHECK(ea->qseen == 0 && ea->freq == 0 && !(ea->flags & (ZDIR_F_PIN | ZDIR_F_NOCACHE | ZDIR_F_NOTIFY_DEFER | ZDIR_F_NOTIFY_DUE)));
     CHECK((ef->kind & (ZDIR_K_OWNED | ZDIR_K_STATIC)) == (ZDIR_K_OWNED | ZDIR_K_STATIC) && zdir_entry(ef)->source == ZONE_SRC_CONFIG);
     CHECK(ef->source_id == 0);                                                       /* the position in the listing */
     CHECK(zdir_find_exact(v, "nope.test.") == NULL && zdir_find_exact(v, NULL) == NULL && zdir_find_exact(NULL, "a.test.") == NULL);

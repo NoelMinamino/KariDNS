@@ -183,6 +183,21 @@ cmp -s "$T/c3.nr" "$T/c3.res" && pass "the IXFR from memory (no history: the who
 ixfr c.test 5 > "$T/c5.res"
 cmp -s "$T/c5.out" "$T/c5.res" && pass "the IXFR from the current serial from memory is the same one SOA" || fail "IXFR=5 from memory: $(cat "$T/c5.res")"
 
+echo "== IXFR over UDP (RFC 1995 4.2): allow-transfer decides, nothing is read"
+uix() { perl tests/db/udp_ixfr_probe.pl 127.0.0.1 "$PORT" "$1" "$2"; }       # uix ZONE SERIAL: rcode, TC, AA, the counts and the EDE of the answer
+I5=$(issued)
+[ "$(uix b.test 1)" = "rcode=5 tc=0 aa=0 an=0 ns=0 ar=1 ede=18" ] && [ "$(issued)" = "$I5" ] && oom b.test && pass "a UDP IXFR the client may not make (allow-transfer) is REFUSED with EDE 18, the zone is not read" || fail "UDP IXFR of b.test: $(uix b.test 1); issued $(issued) (was $I5)"
+oom z0007.test && pass "z0007.test is out of memory" || fail "z0007.test is in memory"
+UP=$(uix z0007.test 7); TC=$(uix z0007.test 3); NW=$(uix z0007.test 9)
+[ "$UP" = "rcode=0 tc=0 aa=1 an=1 ns=0 ar=1 ede=-" ] && pass "up to date: the one SOA, no TC" || fail "UDP IXFR=7: $UP (the SOA serial of the zone: $(serial_of z0007.test))"
+[ "$TC" = "rcode=0 tc=1 aa=1 an=1 ns=0 ar=1 ede=-" ] && pass "behind: the one SOA and TC (retry over TCP)" || fail "UDP IXFR=3: $TC"
+[ "$NW" = "$UP" ] && pass "a client that is ahead (serial 9, RFC 1982) is up to date" || fail "UDP IXFR=9: $NW"
+[ "$(issued)" = "$I5" ] && oom z0007.test && pass "... all from the summary: nothing was read" || fail "issued $(issued) (was $I5)"
+q www.z0007.test > /dev/null
+[ "$(uix z0007.test 7)" = "$UP" ] && [ "$(uix z0007.test 3)" = "$TC" ] && pass "the zone in memory answers the same" || fail "in memory: $(uix z0007.test 7) / $(uix z0007.test 3)"
+q www.b.test > /dev/null
+[ "$(uix b.test 1)" = "rcode=5 tc=0 aa=0 an=0 ns=0 ar=1 ede=18" ] && pass "a zone in memory refuses a UDP IXFR the client may not make as well" || fail "b.test in memory: $(uix b.test 1)"
+
 echo "== a change in the database: a summary with a new serial"
 oom d.test && pass "d.test is out of memory" || fail "d.test is in memory"
 sqlite3 "$T/db/z.db" "UPDATE records SET content = 'ns1.d.test host.d.test 6 3600 600 86400 300' WHERE type = 'SOA' AND name = 'd.test'; INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'new.d.test', 'A', '192.0.2.99', 300, 0, 0 FROM domains WHERE name = 'd.test';"

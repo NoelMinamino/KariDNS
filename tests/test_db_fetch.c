@@ -1192,6 +1192,29 @@ int main(void) {
                   (elem_flags("s.test.") & (ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD)) == 0);
         }
 
+        /* D1a review 7c: a zone that a query loaded (the woken query was answered: the entry has counted it) is no transfer-only read, even when the transfer asked
+         * for it as well: a transfer that finds the zone in memory marks nothing (the wait of a transfer is shared with the parked queries) */
+        {
+            CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ);
+            send_zone(f[0], &e, 0, "r.test.", 12, m.u.fetch_req.request_id, 11);
+            CHECK(wake_next(&k, 5000) && !k.failed);
+            zone_db_entry_t *qe = zdir_entry(xe);
+            CHECK(qe != NULL);
+            if (qe) atomic_store(&qe->observatory.queries_total, 3);                      /* (the query that woke it was answered) */
+            dbreg_cache_stats(&cs1);
+            uint64_t mk0 = cs1.xfr_marked;
+            zone_db_entry_t *ae = dbreg_xfr_acquire(xe);                                   /* (the transfer finds the zone in memory) */
+            dbreg_xfr_loaded("default", "r.test.");
+            dbreg_cache_stats(&cs1);
+            CHECK(ae == qe && cs1.xfr_marked == mk0 && (elem_flags("r.test.") & (ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD)) == 0);
+            if (ae) atomic_fetch_sub(&ae->active_axfr, 1);
+            usleep(500000);
+            CHECK(zdir_entry(xe) == qe);                                                  /* (and the manager leaves it) */
+            CHECK(dbreg_test_evict("default", "r.test."));
+            for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(50000);
+        }
+
         /* the fetch fails (the loader cannot read the zone) and is asked for again until the time is up: nothing is left counted in active_axfr */
         {
             dbreg_cache_stats(&cs0);
@@ -1302,6 +1325,87 @@ int main(void) {
             CHECK(zdir_entry(xe) != NULL && nq1 == nq0 + 1 && dbreg_notify_pop(qv, sizeof(qv), qz, sizeof(qz)) && strcmp(qz, "r.test.") == 0);
             CHECK(dbreg_test_evict("default", "r.test."));
             for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(50000);
+            /* D1a review 7c: the apex that has the addresses of NS hosts outside the zone stays when the data of its version is installed (they cannot be made from the
+             * image), so a zone taken out of memory again keeps them; the apex of another version goes; a zone whose NOTIFY waits in the ring is not taken out of memory
+             * (the apex made from the image has no such addresses) */
+            {
+                kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+                kdb_enc_u64(&e, 1, 60); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
+                kdb_enc_end(&e);
+                ch_send(a[0], &e);
+                send_notify_zone(a[0], &e, 0, "nk.test.", 3, 7002, 1);
+                kdb_enc_begin(&e, KDB_T_BATCH_END);
+                kdb_enc_u64(&e, 1, 60); kdb_enc_u32(&e, 2, 1); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+                kdb_enc_end(&e);
+                ch_send(a[0], &e);
+                while (ch_next(&mainc, &m, 10000) && m.type != KDB_T_BATCH_RESULT) {}
+                zdir_elem_t *ke = elem_of("default", "nk.test.");
+                const zdir_apex_t *kap0 = ke ? atomic_load(&ke->apex) : NULL;
+                CHECK(kap0 != NULL && kap0->serial == 3 && kap0->naddr_len == 24);
+                CHECK(park_fetch_request(0, "default", "nk.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+                CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ);
+                send_zone(f[0], &e, 0, "nk.test.", 3, m.u.fetch_req.request_id, 7002);
+                CHECK(wake_next(&k, 5000) && !k.failed);
+                CHECK(ke && zdir_entry(ke) != NULL && atomic_load(&ke->apex) == kap0);                 /* (the data of the version is here: the block stays) */
+                CHECK(dbreg_test_evict("default", "nk.test."));
+                for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(50000);
+                CHECK(ke && zdir_entry(ke) == NULL && atomic_load(&ke->apex) == kap0 && kap0->naddr_len == 24);   /* (taken out again: the addresses are still there) */
+                while (dbreg_notify_pop(qv, sizeof(qv), qz, sizeof(qz))) {}
+                CHECK(park_fetch_request(0, "default", "nk.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+                CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ);
+                send_zone(f[0], &e, 0, "nk.test.", 4, m.u.fetch_req.request_id, 7002);                 /* (the loader has a newer version than the directory) */
+                CHECK(wake_next(&k, 5000) && !k.failed);
+                CHECK(ke && zdir_entry(ke) != NULL && atomic_load(&ke->apex) == NULL);                  /* (another version: the block went) */
+                CHECK(!dbreg_test_evict("default", "nk.test."));                                        /* (its NOTIFY is in the ring) */
+                CHECK(dbreg_notify_pop(qv, sizeof(qv), qz, sizeof(qz)) && strcmp(qz, "nk.test.") == 0);
+                CHECK(dbreg_test_evict("default", "nk.test."));
+                for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(50000);
+                const zdir_apex_t *kap1 = ke ? atomic_load(&ke->apex) : NULL;
+                CHECK(kap1 != NULL && kap1->serial == 4 && kap1->naddr_len == 0);                       /* (made from the image) */
+            }
+            /* D1a review 7c: more zones change than the ring holds (1024): none is lost.  The ones that did not fit are marked and the control thread's sweep
+             * queues them as the ring is emptied; every zone is queued once */
+            {
+                enum { NB = 1300 };
+                static unsigned char got_z[NB];
+                char onm[40];
+                uint64_t oq0, od0, oq1, od1;
+                while (dbreg_notify_pop(qv, sizeof(qv), qz, sizeof(qz))) {}
+                dbreg_notify_stats(&oq0, &od0);
+                for (int pass = 1; pass <= 2; pass++) {
+                    kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+                    kdb_enc_u64(&e, 1, 70 + pass); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
+                    kdb_enc_end(&e);
+                    ch_send(a[0], &e);
+                    for (int i = 0; i < NB; i++) {
+                        snprintf(onm, sizeof(onm), "ov%04d.test.", i);
+                        send_notify_zone(a[0], &e, 0, onm, (uint32_t)pass, 8000 + i, 1);
+                    }
+                    kdb_enc_begin(&e, KDB_T_BATCH_END);
+                    kdb_enc_u64(&e, 1, 70 + pass); kdb_enc_u32(&e, 2, NB); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+                    kdb_enc_end(&e);
+                    ch_send(a[0], &e);
+                    int nr = 0;
+                    while (ch_next(&mainc, &m, 20000) && m.type != KDB_T_BATCH_RESULT) nr++;
+                    CHECK(nr == NB);
+                }
+                dbreg_notify_stats(&oq1, &od1);
+                CHECK(oq1 - oq0 == 1024 && od1 - od0 == NB - 1024);                    /* (1024 queued, the others deferred: marked, not forgotten) */
+                int popped = 0, dup = 0;
+                for (int round = 0; round < 30 && popped < NB; round++) {
+                    if (round > 0) dbreg_notify_sweep();                                 /* (the control thread, every tick) */
+                    while (dbreg_notify_pop(qv, sizeof(qv), qz, sizeof(qz))) {
+                        int idx = -1;
+                        if (sscanf(qz, "ov%d.test.", &idx) == 1 && idx >= 0 && idx < NB) {
+                            if (got_z[idx]++) dup++;
+                            popped++;
+                        }
+                    }
+                }
+                CHECK(popped == NB && dup == 0);
+                dbreg_notify_sweep(); dbreg_notify_sweep();
+                CHECK(!dbreg_notify_pop(qv, sizeof(qv), qz, sizeof(qz)));              /* (and nothing more: the sweep is idle again) */
+            }
         }
         /* back to the configuration the tests that follow expect */
         atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);

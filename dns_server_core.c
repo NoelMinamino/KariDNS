@@ -3529,6 +3529,7 @@ static void control_db_results(void) {
  * that.  The control thread, which owns the table of NOTIFYs awaiting an answer. */
 static void control_zone_notify_queue(void) {
   char view[KARIDNS_VIEW_NAME_MAX], zone[256];
+  dbreg_notify_sweep();
   for (int n = 0; n < 256 && dbreg_notify_pop(view, sizeof(view), zone, sizeof(zone)); n++) {
     rcu_aux_read_lock();
     zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();

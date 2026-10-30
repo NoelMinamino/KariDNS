@@ -2946,6 +2946,12 @@ static size_t edns_udp_limit(edns_info_t *edns, bool is_tcp, const server_config
   return max_res_len;
 }
 
+/* May this client transfer the zone (allow-transfer, the TSIG key, the zone's tsig-key, transfer-acl-match, acl-ceiling of a database zone)?  The question of an IXFR
+ * over UDP, which the zone transfer thread never sees.  False when there is no view, configuration or zone settings to say yes. */
+static bool udp_ixfr_allowed(const server_config_t *cfg, const zone_config_t *zcfg, const view_snapshot_t *view, const char *client_ip, const tsig_key_t *key) {
+  return cfg && zcfg && view && client_ip && zone_transfer_acl_allows_in_view(cfg, zcfg, view->name, client_ip, key ? key->name : NULL);
+}
+
 /* D1a step 6 (design 12-12): the answer to an SOA question at the apex of a zone that is not in memory, from the apex its summary brought.  It is what the
  * zone in memory gives, byte for byte: the SOA RR in Answer (RFC 1035 3.3.13, the names compressed as the zone image's serializer does, RFC 1035 4.1.4)
  * and, unless minimal-responses leaves it out, the NS RRset in Authority (RFC 1034 4.3.2 step 3a); the TTLs are the RRs' own (RFC 2181 5.2: the
@@ -2955,17 +2961,18 @@ static size_t edns_udp_limit(edns_info_t *edns, bool is_tcp, const server_config
  * then waits for the zone as before.  Returns the length of the response, or -1: not answered from the summary (nothing was written that matters). */
 static int build_apex_soa_answer(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len, const zdir_elem_t *elem, const zdir_apex_t *ap,
                                  edns_info_t *edns, bool is_tcp, int minimal_mode, additional_from_auth_t policy, view_snapshot_t *view, compress_ctx_t *comp_ctx,
-                                 const tsig_request_t *tsig, server_config_t *cfg) {
+                                 const tsig_request_t *tsig, server_config_t *cfg, const uint32_t *ixfr_serial) {
   if (ap->serial != zdir_serial(elem) || ap->n_ns == 0) return -1;
   if (edns->present && (edns->version != 0 || edns->dnssec_ok || edns->compact_answers_ok || edns->has_mqtype_query || edns->has_ecs || edns->has_malformed_ecs ||
-                        edns->has_karidns_ext || edns->has_cookie || edns->has_malformed_cookie || edns->ede_count != 0 || edns->has_expire_query || edns->has_expire_value))
+                        edns->has_karidns_ext || edns->has_cookie || edns->has_malformed_cookie || edns->ede_count != 0 || (edns->has_expire_query && !ixfr_serial) ||
+                        edns->has_expire_value))
     return -1;
   size_t q_end;
   if (skip_wire_name(req, req_len, DNS_HEADER_SIZE, &q_end) != 0 || q_end + 4 > req_len) return -1;
   if (((req[q_end + 2] << 8) | req[q_end + 3]) != 1) return -1;                  // (class IN)
   size_t q_offset = q_end + 4;
   const uint8_t *ns = ap->data + ap->mname_len + ap->rname_len;
-  const bool with_ns = minimal_mode == MINIMAL_NO;
+  const bool with_ns = minimal_mode == MINIMAL_NO && !ixfr_serial;           /* (an IXFR answer is the one SOA) */
   /* the glue the zone in memory adds (append_glue_records()): the addresses of the NS targets, from the zone itself and, when the target is in another zone of
    * the view, from that zone.  The summary has the addresses of the targets inside this zone; a target that another zone of the view holds (a sibling, or this
    * zone's own name below a zone cut that is a zone of the view) makes the summary insufficient.  additional-from-auth: no = none at all, in-domain = only
@@ -3001,8 +3008,18 @@ static int build_apex_soa_answer(const uint8_t *req, size_t req_len, uint8_t *re
   compress_ctx_init_packet(comp_ctx);
   register_wire_name_for_compression(res, DNS_HEADER_SIZE, comp_ctx);
   dns_init_response_header(res, req, 0, true);
+  if (ixfr_serial) {
+    /* UDP IXFR (RFC 1995 4, as the zone in memory answers it below): the one SOA of the current version; TC when the client is behind, so that it asks again over
+     * TCP; the RFC 7314 EXPIRE value of a primary is the SOA's */
+    if (!(*ixfr_serial == ap->serial || serial_is_newer(*ixfr_serial, ap->serial))) res[2] |= 0x02;
+    if (edns->present && edns->has_expire_query) {
+      edns->send_expire = true;
+      edns->send_expire_value = ap->expire;
+    }
+  }
   uint16_t offset = (uint16_t)q_offset, ancount = 0, nscount = 0, arcount = 0;
   /* SOA */
+
   if (apex_write_soa_rr(res, &offset, body_max, elem->name, ap, comp_ctx) != 0) return -1;
   uint32_t v;
   uint16_t rdl_at;
@@ -3418,12 +3435,35 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         const additional_from_auth_t apolicy = zext(&zc)->additional_from_auth_specified ? zext(&zc)->additional_from_auth
                                                                                          : (cfg ? cfg->additional_from_auth : ADDITIONAL_AUTH_YES);
         int alen = build_apex_soa_answer(req, req_len, res, alimit, not_ready_zone, ap, &edns, is_tcp, query_minimal_mode(cfg, view, req), apolicy, view,
-                                         comp_ctx, tsig, cfg);
+                                         comp_ctx, tsig, cfg, NULL);
         if (alen >= DNS_HEADER_SIZE) return alen;
         if (tsig) tsig->res_limit = tsig_limit;
       }
     }
+    /* A UDP IXFR (RFC 1995 4.2) is a zone transfer question: allow-transfer decides, as for a zone in memory and as BIND's ns_xfr_start() does before it looks at
+     * the transport -- a client that may not transfer is REFUSED here, without the zone being read.  One that may gets the answer from the summary (the one SOA,
+     * TC when it is behind) when the apex describes the version the directory has, else it waits for the zone like any other query. */
+    if (opcode == 0 && qtype == 251 && !is_tcp && qdcount == 1 && domain_names_match_ci(not_ready_zone->name, current_qname)) {
+      if (!udp_ixfr_allowed(cfg, &zc, view, client_ip, nr_tkey)) {
+        add_ede(&edns, send_ede, 18, "Query refused due to access control");
+        return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
+      }
+      const zdir_apex_t *iap = atomic_load_explicit(&not_ready_zone->apex, memory_order_acquire);
+      size_t iq;
+      uint32_t cs = 0;
+      if (iap && skip_wire_name(req, req_len, DNS_HEADER_SIZE, &iq) == 0 && iq + 4 <= req_len) {
+        if (!ixfr_request_client_serial(req, req_len, iq + 4, &cs))         /* RFC 1995 3, as the zone in memory */
+          return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
+        const size_t alimit = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
+        const size_t tsig_limit = tsig ? tsig->res_limit : 0;
+        if (tsig) tsig->res_limit = alimit;
+        int ilen = build_apex_soa_answer(req, req_len, res, alimit, not_ready_zone, iap, &edns, is_tcp, MINIMAL_YES, ADDITIONAL_AUTH_YES, view, comp_ctx, tsig, cfg, &cs);
+        if (ilen >= DNS_HEADER_SIZE) return ilen;
+        if (tsig) tsig->res_limit = tsig_limit;
+      }
+    }
     if (t_nr_probe && opcode == 0) return DNS_NR_PERMITTED;
+
     return build_not_ready_response(req, req_len, res, max_res_len, is_tcp, cfg);
   }
 
@@ -3841,7 +3881,14 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   // If client's SOA serial matches server's current serial (up-to-date), send single SOA response (NOERROR).
   // If update is needed (or diff required), set TC=1 and send current SOA to prompt client to retry over TCP.
   if (!is_tcp && qtype == 251) {
+    /* allow-transfer applies to an IXFR over UDP as well (BIND xfrout.c ns_xfr_start() checks the transfer ACL first, whatever the transport): the one SOA of a
+     * zone that is up to date, or the TC answer, are not for a client that may not transfer.  It used to be answered to anybody who may ask (allow-query). */
+    if (!udp_ixfr_allowed(cfg, zone_cfg_any, view, client_ip, tsig && tsig->status == TSIG_REQ_VALID ? tsig->key : NULL)) {
+      add_ede(&edns, send_ede, 18, "Query refused due to access control");
+      return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
+    }
     uint32_t client_serial = 0;
+
     /* RFC 1995 §3: クライアントの版の SOA が Authority に無ければ FORMERR (TCP と同じ) */
     if (!ixfr_request_client_serial(req, req_len, q_offset, &client_serial))
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);

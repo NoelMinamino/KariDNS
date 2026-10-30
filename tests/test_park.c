@@ -414,12 +414,34 @@ static void test_any(void) {
   CHECK(atomic_load(&g_any_taken) == (uint64_t)AW * AN);
 }
 
+/* D1a review 7c: the slots of the transfer threads take turns with the workers' rings: a ring that is never empty does not starve them */
+static void test_slots_not_starved(void) {
+  printf("[the slots of the transfer threads are not starved by a busy worker ring]\n");
+  park_register_worker(0, -1);
+  park_fetch_ring_t *r0 = park_fetch_ring(0);
+  for (int i = 0; i < PARK_FETCH_RING - 1; i++) CHECK(park_fetch_push(r0, "v1", "busy.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+  CHECK(park_fetch_request_any("v1", "xfer.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+  park_fetch_req_t q;
+  int calls = 0;
+  bool seen = false;
+  while (calls < 130 && !seen) {                       /* one turn of the round robin is 129 sources; the ring is refilled after every request */
+    CHECK(park_fetch_next(&q));
+    seen = strcmp(q.zone, "xfer.test.") == 0;
+    if (!seen) CHECK(park_fetch_push(r0, "v1", "busy.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+    calls++;
+  }
+  CHECK(seen);
+  while (park_fetch_next(&q)) {}
+  park_unregister_worker(0);
+}
+
 int main(void) {
   test_table();
   test_tcp();
   test_rings();
   test_concurrent();
   test_any();
+  test_slots_not_starved();
   printf("\n%d checks, %d failed\n", g_checks, g_failed);
   if (g_failed) return 1;
   printf("=== test_park: all checks passed ===\n");

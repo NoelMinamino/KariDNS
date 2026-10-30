@@ -542,7 +542,7 @@ enum { ZDIR_ST_ABSENT = 0, ZDIR_ST_RESIDENT, ZDIR_ST_LOADING, ZDIR_ST_ERROR };
 #define ZDIR_F_WILDCARD  0x0004u   /* the image has a wildcard owner */
 #define ZDIR_F_PIN       0x0008u   /* never evicted (reserved: set by a later milestone) */
 #define ZDIR_F_NOCACHE   0x0010u   /* never kept resident after an answer (reserved) */
-#define ZDIR_F_PARTIAL   0x0020u   /* only part of the zone is resident (reserved for D1b) */
+#define ZDIR_F_NOTIFY_DEFER 0x0020u /* D1a step 7: the NOTIFY of this zone could not be queued (the ring was full): the control thread's sweep queues it later.  (D1b's "partly resident" bit, never used, gave the place; D1b takes another when it comes) */
 #define ZDIR_F_EVICT_NEXT 0x0040u  /* take out of memory first (as soon as the queries it was loaded for are answered): a zone that was admitted against the frequency order, or a no-cache zone */
 #define ZDIR_F_XFRLOAD   0x0400u   /* D1a step 7: together with EVICT_NEXT: a transfer (AXFR / IXFR) brought the zone into memory and nobody else needs it; the mark is dropped when queries ask for the zone (the cache manager's scan) */
 #define ZDIR_F_NOTIFY_DUE 0x0800u  /* D1a step 7: the serial of the zone changed while its data is out of memory and the NOTIFY waits for the apex of the new version (dbreg_set_apex() queues it) */
@@ -1098,6 +1098,7 @@ bool dbreg_apex_notify_ns_wanted(const char *view, const char *zone, const zone_
 /* D1a step 7: the NOTIFY of a zone whose data is out of memory.  dbreg_set_apex() queues (view, zone) when the serial changed (summary or a body that was left out)
  * and the apex of the new version is here; the control thread takes them with dbreg_notify_pop() (one consumer), looks the zone up and sends. */
 bool dbreg_notify_pop(char *view, size_t vcap, char *zone, size_t zcap);
+void dbreg_notify_sweep(void);          /* the control thread, every tick: queue the zones whose NOTIFY did not fit in the ring (ZDIR_F_NOTIFY_DEFER) */
 void dbreg_notify_stats(uint64_t *queued, uint64_t *dropped);
 zone_ext_shared_t *dbreg_settings_ref(const char *view, const char *zone);
 int dbreg_summary_check(const char *view, const char *zone, int64_t source_id, uint32_t serial);

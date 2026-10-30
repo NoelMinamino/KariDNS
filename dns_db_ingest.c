@@ -3356,7 +3356,7 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     {
       uint64_t nq, nd;
       dbreg_notify_stats(&nq, &nd);
-      st_append(&c, "notify of zones out of memory: queued=%llu dropped=%llu (a serial that changed while the data was out of memory; the NS addresses come with the summary)\n", (unsigned long long)nq, (unsigned long long)nd);
+      st_append(&c, "notify of zones out of memory: queued=%llu deferred=%llu (a serial that changed while the data was out of memory; the NS addresses come with the summary; deferred: the ring was full, the zone is queued later)\n", (unsigned long long)nq, (unsigned long long)nd);
     }
     st_append(&c, "transfers of zones out of memory: waited=%llu loaded=%llu failed=%llu summary_answers=%llu marked=%llu timeout=%ums\n",
               (unsigned long long)cs.xfr[DBREG_XFR_WAITED], (unsigned long long)cs.xfr[DBREG_XFR_LOADED], (unsigned long long)cs.xfr[DBREG_XFR_FAILED],
