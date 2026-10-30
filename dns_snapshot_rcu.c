@@ -198,6 +198,19 @@ static void zdir_unref(zdir_t *d) {
  * publication hands it to the snapshot it retires (gc_retire_locked()). ---- */
 static zdir_garbage_t g_garb;
 
+/* D1a: the garbage entries (zdir_gent_t) that a summary, a cold commit or an apex replacement adds make no delta of their own, so a loader that sends nothing
+ * but summaries with a new serial would pile them up until some other change publishes a snapshot (which hands them to it, gc_retire_locked()).  They are
+ * counted; at GARB_ENTS_MAX dbreg_pending_count() says "publish", and the publication drains them.  (Entries are small: an apex block is at most ZDIR_APEX_MAX.) */
+#define GARB_ENTS_MAX 1024
+static size_t g_garb_n;                        /* under g_zone_db_rebuild_lock */
+static _Atomic bool g_garb_force;
+
+static void garb_ent_push_locked(zdir_gent_t *gent) {
+  gent->next = g_garb.ents;
+  g_garb.ents = gent;
+  if (++g_garb_n >= GARB_ENTS_MAX) atomic_store_explicit(&g_garb_force, true, memory_order_release);
+}
+
 static void garb_elem(zdir_garbage_t *g, zdir_elem_t *e) {
   if (e->flags & ZDIR_F_GARB) return;
   e->flags |= ZDIR_F_GARB;
@@ -241,6 +254,8 @@ static _Atomic unsigned g_gc_unstarted;       /* queued snapshots that have no c
 static void gc_retire_locked(zone_db_snapshot_t *old) {
   old->garb = g_garb;
   memset(&g_garb, 0, sizeof(g_garb));
+  g_garb_n = 0;
+  atomic_store_explicit(&g_garb_force, false, memory_order_release);
   old->gc_next = NULL;
   pthread_mutex_lock(&g_gc_lock);
   old->gc_queued = true;
@@ -1874,7 +1889,7 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
         atomic_fetch_add_explicit(&g_dbreg_pending, 1, memory_order_relaxed);
     }
     z->source_id = source_id;
-    z->serial = serial;
+    atomic_store_explicit(&z->serial, serial, memory_order_relaxed);
     memcpy(z->digest, digest, 32);
     z->last_result = DBREG_APPLIED;
     z->shadowed = sh;
@@ -1907,7 +1922,8 @@ out:
 
 /* A zone of a batch that is not kept in memory because the limit is reached (design 3.3, 8.3): the directory element with the serial, the digest and
  * the settings the loader sent and no data.  The element is queued for the index if it is not in it; the next query for the zone fetches the data.
- * A zone that has data in memory is left as it is (an element that is resident keeps serving: the caller decided on a stale view). */
+ * A zone that has data in memory is left as it is (an element that is resident keeps serving: the caller decided on a stale view) and the result is
+ * DBREG_COLD_RESIDENT: the version that was offered is not what the Backend has, so the caller has the loader send it again.  0: recorded; -1: out of memory. */
 int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uint32_t serial, const uint8_t digest[32], zone_ext_shared_t *shared) {
     bool sh_cfg = dbreg_config_shadows(view, name);
     int rc = -1;
@@ -1924,7 +1940,7 @@ int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uin
         fresh = true;
     }
     if (zdir_entry(z)) {
-        rc = 0;
+        rc = DBREG_COLD_RESIDENT;                 /* the data is here (a fetch brought it while the body was on its way): nothing is recorded, the caller has the loader send the body again */
         goto out;
     }
     bool in_index = !fresh && zdir_lookup(dbreg_active_dir_locked(view), z->name) == z;
@@ -1949,8 +1965,7 @@ int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uin
         gent->sh_old = osh;
         gent->apex_old = NULL;
         gent->served = false;
-        gent->next = g_garb.ents;                 /* a reader may hold the old settings: given back with the garbage of the next retired snapshot */
-        g_garb.ents = gent;
+        garb_ent_push_locked(gent);               /* a reader may hold the old settings: given back with the garbage of the next retired snapshot */
     }
     if (queue_add) {
         rv->adds[rv->n_adds++] = z;
@@ -1960,7 +1975,7 @@ int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uin
     uint8_t cm = shared ? shared->ext.cache_mode : 0;
     z->flags = (uint16_t)((z->flags & ~(ZDIR_F_PIN | ZDIR_F_NOCACHE)) | (cm == 1 ? ZDIR_F_PIN : cm == 2 ? ZDIR_F_NOCACHE : 0));
     z->source_id = source_id;
-    z->serial = serial;
+    atomic_store_explicit(&z->serial, serial, memory_order_relaxed);
     memcpy(z->digest, digest, 32);
     z->last_result = DBREG_APPLIED;
     z->shadowed = sh;
@@ -2083,7 +2098,7 @@ bool dbreg_apply_summary(const char *view, const char *zone, int64_t source_id, 
     dbreg_view_t *rv = dbreg_view_get(view, false);
     dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
     if (z && !(z->flags & ZDIR_F_DELETED) && !zdir_entry(z) && z->source_id == source_id) {     /* (a zone in memory is the newer truth) */
-        z->serial = serial;
+        atomic_store_explicit(&z->serial, serial, memory_order_relaxed);
         if (has_timers) {
             /* the same values a zone in memory has: the zone parser takes 0..4294967295 for these fields and parse_ttl_value() (what the
              * install of the data stores) rounds a value with the top bit set down to 2147483647 (RFC 8767 4) */
@@ -2108,7 +2123,7 @@ int dbreg_summary_check(const char *view, const char *zone, int64_t source_id, u
     dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
     if (z && !(z->flags & ZDIR_F_DELETED)) {
         if (zdir_entry(z))
-            rc = (z->source_id == source_id && z->serial == serial) ? DBREG_SUM_SAME : DBREG_SUM_DIFFERS;
+            rc = (z->source_id == source_id && zdir_serial(z) == serial) ? DBREG_SUM_SAME : DBREG_SUM_DIFFERS;
         else if (atomic_load_explicit(&z->state, memory_order_relaxed) == ZDIR_ST_LOADING)
             rc = DBREG_SUM_DIFFERS;          /* a fetch is on its way and brings a version nobody can name yet: the loader sends the zone whole */
     }
@@ -2128,8 +2143,7 @@ static bool apex_replace_locked(dbreg_zone_t *z, zdir_apex_t *apex) {
         gent->sh_old = NULL;
         gent->apex_old = old;
         gent->served = false;
-        gent->next = g_garb.ents;
-        g_garb.ents = gent;
+        garb_ent_push_locked(gent);
     }
     return true;
 }
@@ -2147,6 +2161,103 @@ bool dbreg_set_apex(const char *view, const char *zone, int64_t source_id, uint3
     return taken;
 }
 
+/* ---- D1a step 6 (design 12-12): which zones keep an apex, and the apex of a zone that leaves memory ---- */
+
+/* Does a zone keep the apex of its summary: it sends NOTIFY or has secondaries (an SOA question comes from a secondary that polls, or from a tool that
+ * checks one).  A zone with `notify no` and no allow-transfer has none, and its SOA question reads the zone.  sh: the zone's settings (NULL: none).  One
+ * predicate for the summary of a batch, the summary of a fetch, the zone that leaves memory and the walk after a reload. */
+bool dbreg_apex_wanted_cfg(const server_config_t *cfg, const char *view, const char *zone, const zone_ext_shared_t *sh) {
+    zone_config_t zc;
+    memset(&zc, 0, sizeof(zc));
+    zc.domain = (char *)zone;
+    zc.ext = sh ? (zone_ext_t *)&sh->ext : NULL;
+    return !cfg || notify_mode_effective(cfg, &zc, view) != NOTIFY_MODE_NO || (sh && sh->ext.allow_transfer_count > 0);
+}
+
+bool dbreg_apex_wanted(const char *view, const char *zone, const zone_ext_shared_t *sh) {
+    rcu_aux_read_lock();
+    server_config_t *cfg = acquire_config_snapshot();
+    bool wanted = dbreg_apex_wanted_cfg(cfg, view, zone, sh);
+    release_config_snapshot(cfg);
+    rcu_aux_read_unlock();
+    return wanted;
+}
+
+/* The settings the registry kept for a zone that has no data in memory, one reference to give back (zone_ext_shared_unref()); NULL: none, or no such zone. */
+zone_ext_shared_t *dbreg_settings_ref(const char *view, const char *zone) {
+    zone_ext_shared_t *sh = NULL;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    if (z) sh = zone_ext_shared_ref(atomic_load_explicit(&z->sh, memory_order_relaxed));
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return sh;
+}
+
+/* the length of the wire name at p (RFC 1035 3.1) without compression, 0 if it is not one (a pointer, a label over 63 octets, over 255 octets in all, cut) */
+static size_t apex_wire_name_len(const uint8_t *p, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        uint8_t l = p[i];
+        if (l == 0) return i + 1;
+        if (l > 63 || i + 1 + l >= len || i + 1 + l >= 255) return 0;
+        i += 1 + (size_t)l;
+    }
+    return 0;
+}
+
+/* The apex block from the image of a zone that leaves memory: the same SOA and NS RRs the zone answers with, so the SOA question that comes next is
+ * answered from them and the zone is not fetched for it.  NULL: the zone cannot be described this way (several SOA RRs, a restricted or raw RR,
+ * tinydns time stamps or locations, more than ZDIR_APEX_NS_MAX NS RRs), or out of memory. */
+static zdir_apex_t *apex_from_image(const zone_image_t *img) {
+    if (!img || img->apex_name == ZONE_IMAGE_NONE || (img->flags & (ZONE_IMAGE_F_TINYDNS | ZONE_IMAGE_F_VIEW | ZONE_IMAGE_F_SOA_ATTR))) return NULL;
+    const uint32_t aid = img->apex_name;
+    uint32_t soa = zone_image_rrset_next(img, aid, 6, zone_image_name_first_rr(img, aid));
+    if (soa == ZONE_IMAGE_NONE || zone_image_rrset_next(img, aid, 6, soa + 1) != ZONE_IMAGE_NONE) return NULL;
+    if (zone_image_rr_class(img, soa) != 1 || (zone_image_rrs(img)[soa].flags & ZONE_IMAGE_RR_RAW) || zone_image_rr_ext(img, soa)) return NULL;
+    const uint8_t *rd = zone_image_rr_rdata(img, soa);
+    size_t rl = zone_image_rr_rdlen(img, soa);
+    size_t ml = rd ? apex_wire_name_len(rd, rl) : 0, rnl = ml ? apex_wire_name_len(rd + ml, rl - ml) : 0;
+    if (!rnl || rl != ml + rnl + 20) return NULL;
+    const uint8_t *nm = rd + ml + rnl;
+    uint32_t nums[5];
+    for (int i = 0; i < 5; i++) nums[i] = ((uint32_t)nm[4 * i] << 24) | ((uint32_t)nm[4 * i + 1] << 16) | ((uint32_t)nm[4 * i + 2] << 8) | nm[4 * i + 3];
+    uint32_t ns_rr[ZDIR_APEX_NS_MAX], ns_ttl = 0;
+    size_t ns_len = 0, n = 0;
+    for (uint32_t k = zone_image_rrset_next(img, aid, 2, zone_image_name_first_rr(img, aid)); k != ZONE_IMAGE_NONE;
+         k = zone_image_rrset_next(img, aid, 2, k + 1)) {
+        const uint8_t *t = zone_image_rr_rdata(img, k);
+        size_t tl = zone_image_rr_rdlen(img, k);
+        if (n == ZDIR_APEX_NS_MAX || zone_image_rr_class(img, k) != 1 || (zone_image_rrs(img)[k].flags & ZONE_IMAGE_RR_RAW) || zone_image_rr_ext(img, k) || !t ||
+            apex_wire_name_len(t, tl) != tl)
+            return NULL;
+        ns_ttl = n == 0 || zone_image_rr_ttl(img, k) < ns_ttl ? zone_image_rr_ttl(img, k) : ns_ttl;      /* (RFC 2181 5.2: the RRset has the lowest TTL; the image harmonizes it too) */
+        ns_rr[n++] = k;
+        ns_len += tl;
+    }
+    if (n == 0) return NULL;
+    zdir_apex_t *a = malloc(sizeof(*a) + ml + rnl + ns_len);
+    if (!a) return NULL;
+    a->serial = nums[0];
+    a->soa_ttl = zone_image_rr_ttl(img, soa);
+    a->refresh = nums[1];
+    a->retry = nums[2];
+    a->expire = nums[3];
+    a->minimum = nums[4];
+    a->ns_ttl = ns_ttl;
+    a->mname_len = (uint16_t)ml;
+    a->rname_len = (uint16_t)rnl;
+    a->ns_len = (uint16_t)ns_len;
+    a->n_ns = (uint8_t)n;
+    memcpy(a->data, rd, ml + rnl);
+    uint8_t *w = a->data + ml + rnl;
+    for (size_t i = 0; i < n; i++) {
+        memcpy(w, zone_image_rr_rdata(img, ns_rr[i]), zone_image_rr_rdlen(img, ns_rr[i]));
+        w += zone_image_rr_rdlen(img, ns_rr[i]);
+    }
+    return a;
+}
+
 bool dbreg_warm_mark(const char *view, const char *zone) {
     bool added = false;
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
@@ -2160,14 +2271,17 @@ bool dbreg_warm_mark(const char *view, const char *zone) {
     return added;
 }
 
-bool dbreg_warm_take(const char *view, const char *zone) {
+bool dbreg_warm_take(const char *view, const char *zone, bool *whole) {
     bool wanted = false;
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     dbreg_view_t *rv = dbreg_view_get(view, false);
     dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
     if (z) {
         z->flags &= (uint16_t)~ZDIR_F_WARM;
-        wanted = !(z->flags & ZDIR_F_DELETED) && (z->flags & ZDIR_F_PIN) && !zdir_entry(z);
+        /* a pinned zone is read whole; any other zone in the list is there for its apex (the summary): it is asked for if it has none */
+        const bool pin = (z->flags & ZDIR_F_PIN) != 0;
+        wanted = !(z->flags & ZDIR_F_DELETED) && !zdir_entry(z) && (pin || !atomic_load_explicit(&z->apex, memory_order_relaxed));
+        if (whole) *whole = pin;
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     return wanted;
@@ -2220,6 +2334,12 @@ static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
         atomic_store_explicit(&z->sh, nsh, memory_order_release);
         gent->sh_old = osh;
         gent->apex_old = NULL;
+    }
+    /* the apex of the zone (design 12-12), from the image that leaves: the SOA question that comes next is answered from it and the zone is not fetched */
+    if (a && a->image && !atomic_load_explicit(&z->apex, memory_order_relaxed) && dbreg_apex_wanted(rv->name, z->name, nsh)) {
+        zdir_apex_t *ap = apex_from_image(a->image);
+        if (ap && ap->serial == zdir_serial(z) && apex_replace_locked(z, ap)) ap = NULL;
+        free(ap);
     }
     atomic_store_explicit(&z->entry, NULL, memory_order_release);
     atomic_store_explicit(&z->state, ZDIR_ST_ABSENT, memory_order_release);
@@ -2547,7 +2667,7 @@ int dbreg_delete(const char *view, const char *name, int64_t source_id) {
 }
 
 size_t dbreg_pending_count(void) {
-    return atomic_load_explicit(&g_dbreg_pending, memory_order_relaxed);
+    return atomic_load_explicit(&g_dbreg_pending, memory_order_relaxed) + (atomic_load_explicit(&g_garb_force, memory_order_acquire) ? 1u : 0u);
 }
 
 /* the queues of a view are done with (applied to the index, or no longer needed because a rebuild read the registry): the deleted
@@ -2859,7 +2979,7 @@ static bool dplan_db(dplan_t *p, dbreg_view_t *rv, const char *vname) {
 
 int snapshot_apply_db_delta(void) {
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
-    if (atomic_load_explicit(&g_dbreg_pending, memory_order_relaxed) == 0) {
+    if (atomic_load_explicit(&g_dbreg_pending, memory_order_relaxed) == 0 && !atomic_load_explicit(&g_garb_force, memory_order_relaxed)) {
         pthread_mutex_unlock(&g_zone_db_rebuild_lock);
         return 0;
     }
@@ -3052,7 +3172,7 @@ int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int m
                 o->serial = atomic_load_explicit(&zdir_entry(z)->serial, memory_order_relaxed);
                 o->refresh = atomic_load_explicit(&zdir_entry(z)->refresh, memory_order_relaxed);
             } else if (z->last_result == DBREG_APPLIED) {     /* no data in memory: what the directory kept (a summary, D1a) */
-                o->serial = z->serial;
+                o->serial = zdir_serial(z);
                 o->refresh = z->refresh;
             }
             o->shadowed = z->shadowed;

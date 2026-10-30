@@ -95,7 +95,7 @@ TDEF(td_inventory, "INVENTORY", sp_inventory);
 static const kdb_tspec_t sp_inventory_end[] = { S(KT_U64, KS_REQ, 0), S(KT_U64, KS_REQ, 0) };
 TDEF(td_inventory_end, "INVENTORY_END", sp_inventory_end);
 static const kdb_tspec_t sp_zone_result[] = {
-    S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_ST_SEND_BODY), S(KT_STR, 0, 255) };
+    S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_ST_NOT_RESIDENT), S(KT_STR, 0, 255) };
 TDEF(td_zone_result, "ZONE_RESULT", sp_zone_result);
 static const kdb_tspec_t sp_batch_result[] = {
     S(KT_U64, KS_REQ, 0), S(KT_BYTES, KS_MUL8, 2048), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0),

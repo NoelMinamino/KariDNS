@@ -3453,26 +3453,35 @@ const char *find_configured_domain(const char *arg, char *out_buf, size_t out_si
 
 /* The whole reply to a control client.  The client's descriptor is non-blocking: a plain send() takes what fits the socket buffer (net.local.stream.sendspace,
  * 64 KiB by default) and the rest of a long reply (karictl observatory: 664 bytes a zone) was lost, which desynchronised the stream the client reads.
- * Wait for the client to read (poll), but not for ever: a client that does not read for CTL_SEND_WAIT_MS is dropped by the caller (false). */
+ * Wait for the client to read (poll), but not for ever: a client that does not read for CTL_SEND_WAIT_MS is dropped by the caller (false), and so is
+ * one that reads a byte at a time: the whole reply has CTL_REPLY_MS (a reply made of several calls shares one deadline, ctl_send_until()). */
 #define CTL_SEND_WAIT_MS 3000
-static bool ctl_send_all(int fd, const void *buf, size_t len) {
+#define CTL_REPLY_MS 10000
+static bool ctl_send_until(int fd, const void *buf, size_t len, int64_t deadline_ms) {
   const uint8_t *p = buf;
   size_t sent = 0;
   while (sent < len) {
     ssize_t n = send(fd, p + sent, len - sent, 0);
     if (n > 0) {
       sent += (size_t)n;
+      if (sent < len && park_now_ms() >= deadline_ms) return false;
       continue;
     }
     if (n < 0 && errno == EINTR) continue;
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      int64_t left = deadline_ms - park_now_ms();
+      if (left <= 0) return false;
       struct pollfd pfd = {.fd = fd, .events = POLLOUT};
-      int pr = poll(&pfd, 1, CTL_SEND_WAIT_MS);
+      int pr = poll(&pfd, 1, left < CTL_SEND_WAIT_MS ? (int)left : CTL_SEND_WAIT_MS);
       if (pr > 0 || (pr < 0 && errno == EINTR)) continue;
     }
     return false;
   }
   return true;
+}
+
+static bool ctl_send_all(int fd, const void *buf, size_t len) {
+  return ctl_send_until(fd, buf, len, park_now_ms() + CTL_REPLY_MS);
 }
 
 /* B6a: an answer of the database loader for a parked `reload <zone>` client (control thread) */
@@ -4033,17 +4042,11 @@ void *control_thread_func(void *arg) {
                 st.other_bytes_retired = zb_other.retired;
               }
 
-              struct iovec iov[2];
-              iov[0].iov_base = "OK ";
-              iov[0].iov_len = 3;
-              iov[1].iov_base = &st;
-              iov[1].iov_len = sizeof(st);
-              
-              struct msghdr msg;
-              memset(&msg, 0, sizeof(msg));
-              msg.msg_iov = iov;
-              msg.msg_iovlen = 2;
-              sendmsg(cfd, &msg, 0);
+              /* "OK " and the structure in one buffer, written whole (the descriptor is non-blocking; no SCM_RIGHTS goes with it) */
+              uint8_t st_reply[3 + sizeof(st)];
+              memcpy(st_reply, "OK ", 3);
+              memcpy(st_reply + 3, &st, sizeof(st));
+              (void)ctl_send_all(cfd, st_reply, sizeof(st_reply));
             } else if (strcmp(cmd, "zonestatus") == 0 && arg) {
               char canon_buf[256];
               const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
@@ -4124,7 +4127,8 @@ void *control_thread_func(void *arg) {
               } else {
                 char resp_hdr[64];
                 int hlen = snprintf(resp_hdr, sizeof(resp_hdr), "OK %u\n", match_count);
-                bool obs_ok = ctl_send_all(cfd, resp_hdr, (size_t)hlen);
+                const int64_t obs_deadline = park_now_ms() + CTL_REPLY_MS;   // (one deadline for the header and every item)
+                bool obs_ok = ctl_send_until(cfd, resp_hdr, (size_t)hlen, obs_deadline);
 
                 for (uint32_t k = 0; obs_ok && k < match_count; k++) {
                   zone_observatory_snapshot_t snap_item;
@@ -4133,7 +4137,7 @@ void *control_thread_func(void *arg) {
                   rcu_aux_read_lock();
                   fill_observatory_snapshot(obs[k], active_cfg, &snap_item);
                   rcu_aux_read_unlock();
-                  obs_ok = ctl_send_all(cfd, &snap_item, sizeof(snap_item));   // (a client that does not read: the reply is cut here and the connection closed below)
+                  obs_ok = ctl_send_until(cfd, &snap_item, sizeof(snap_item), obs_deadline);   // (a client that does not read: the reply is cut here and the connection closed below)
                 }
               }
               free(obs);

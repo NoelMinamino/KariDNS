@@ -1492,13 +1492,14 @@ static void test_dir_fetch_state(void) {
         /* the list of zones to read before a query asks: a zone is in it once; taking it out says whether it is still worth a read */
         CHECK(!dbreg_warm_mark("default", "nope.test.") && !dbreg_warm_mark("nosuchview", "a.test."));
         CHECK(dbreg_warm_mark("default", "a.test.") && (ea->flags & ZDIR_F_WARM) && !dbreg_warm_mark("default", "a.test."));
-        CHECK(!dbreg_warm_take("default", "a.test.") && !(ea->flags & ZDIR_F_WARM));          /* (not pinned any more: nothing to read) */
+        bool whole = true;
+        CHECK(dbreg_warm_take("default", "a.test.", &whole) && !whole && !(ea->flags & ZDIR_F_WARM));       /* (not pinned, no apex: its summary is asked for) */
         ea->flags |= ZDIR_F_PIN;
-        CHECK(dbreg_warm_mark("default", "a.test.") && dbreg_warm_take("default", "a.test."));  /* pinned, no data */
-        CHECK(!dbreg_warm_take("default", "b.test.") && !dbreg_warm_take("default", "nope.test."));     /* (b.test has its data; nope is not a zone) */
+        CHECK(dbreg_warm_mark("default", "a.test.") && dbreg_warm_take("default", "a.test.", &whole) && whole);  /* pinned, no data: read whole */
+        CHECK(!dbreg_warm_take("default", "b.test.", NULL) && !dbreg_warm_take("default", "nope.test.", NULL));     /* (b.test has its data; nope is not a zone) */
         CHECK(dbreg_warm_mark("default", "a.test."));
         ea->flags |= ZDIR_F_DELETED;
-        CHECK(!dbreg_warm_take("default", "a.test.") && !dbreg_warm_mark("default", "a.test."));
+        CHECK(!dbreg_warm_take("default", "a.test.", NULL) && !dbreg_warm_mark("default", "a.test."));
         ea->flags &= (uint16_t)~(ZDIR_F_DELETED | ZDIR_F_PIN);
         /* the apex a summary brings (D1a step 6): into an element without data and with the same source id, the old block goes with the garbage; a zone
          * that has its data takes none, and the data clears it */
@@ -1511,6 +1512,22 @@ static void test_dir_fetch_state(void) {
         CHECK(!dbreg_set_apex("default", "a.test.", 301, 153, NULL) && atomic_load(&ea->apex) == NULL);         /* none: the old one goes */
         CHECK(!dbreg_set_apex("default", "b.test.", 303, 5, ap3));                                              /* b.test has its data */
         CHECK(dbreg_set_apex("default", "a.test.", 301, 154, ap3) && atomic_load(&ea->apex) == ap3);        /* (freed with the element: dbreg_reset() below) */
+        CHECK(dbreg_warm_mark("default", "a.test.") && !dbreg_warm_take("default", "a.test.", NULL));      /* (it has an apex and is not pinned: nothing to ask for) */
+        /* a body that was left out of memory for a zone that has its data (a fetch brought it meanwhile) is not recorded: the caller has the loader send it again */
+        CHECK(dbreg_commit_cold("default", "b.test.", 303, 9, dgc, NULL) == DBREG_COLD_RESIDENT && dbreg_find_info("default", "b.test.", &inf, 1) == 1 && inf.serial == 5);
+        /* the garbage a loader that sends nothing but summaries makes is bounded: past GARB_ENTS_MAX entries a publication is due, and it drains them */
+        CHECK(snapshot_apply_db_delta() >= 0 && dbreg_pending_count() == 0);
+        for (int i = 0; i < 1100 && dbreg_pending_count() == 0; i++) {
+            zdir_apex_t *ax = calloc(1, sizeof(*ax));
+            CHECK(ax && dbreg_set_apex("default", "a.test.", 301, 155 + (uint32_t)i, ax));
+        }
+        CHECK(dbreg_pending_count() == 1);                                          /* nothing queued, only the garbage asks for a publication */
+        zone_db_snapshot_t *gs0 = acquire_retained_zone_snapshot();
+        CHECK(snapshot_apply_db_delta() == 0 && dbreg_pending_count() == 0);
+        zone_db_snapshot_t *gs1 = acquire_retained_zone_snapshot();
+        CHECK(gs1 != gs0);
+        release_zone_snapshot(gs0);
+        release_zone_snapshot(gs1);
     }
 
     /* the lookup for a query: NULL and the element for a zone that has no data (the worker parks), the entry when it has */

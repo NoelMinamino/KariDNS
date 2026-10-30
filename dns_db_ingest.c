@@ -40,6 +40,7 @@
 #include "dns_snapshot_rcu.h"
 
 _Static_assert(KARIDNS_DB_MAX_VIEWS == KDB_MAX_CONFIG_VIEWS, "the configuration check and the CONFIG message must agree");
+_Static_assert(ZDIR_APEX_NS_MAX == KDB_APEX_NS_MAX, "the apex block and the ZONE_BEGIN apex agree on the number of NS names");
 
 #define ING_MAX_OUT (32u << 20)  /* queued answers the loader has not read: above this the loader is dropped */
 #define ING_ZONES_LOGGED 16       /* zones logged one by one per connection */
@@ -217,6 +218,8 @@ typedef struct {
   ing_freq_t freq[ING_FETCH_MAX];
   struct ing_warm { char view[PARK_VIEW_MAX + 1]; char zone[PARK_ZONE_MAX + 1]; } *warm;     /* D1a milestone 4: zones to read before a query asks (pins) */
   size_t nwarm, cwarm;
+  bool apex_walk;                        /* D1a step 6: after a reload, the zones out of memory that now keep an apex but have none are asked for (their summary) ... */
+  dbreg_cursor_t apex_cur;               /* ... a few at a time, from here */
   uint32_t funsolicited;       /* zones nobody asked for, discarded (logged the first few) */
   double ftokens;              /* the fetch-rate bucket (ingest thread only): tokens, and when it was filled */
   int64_t ftok_ms;
@@ -926,12 +929,19 @@ static void job_execute(ing_job_t *j) {
         return;
       }
     }
-    if (dbreg_commit_cold(j->view_name, j->zone, j->source_id, j->serial, j->digest, j->shared) == 0) {
+    int cc = dbreg_commit_cold(j->view_name, j->zone, j->source_id, j->serial, j->digest, j->shared);
+    if (cc == DBREG_COLD_RESIDENT) {
+      /* the zone came into memory (a fetch) after this was offered: what is here is not what the loader sent.  The loader sends the body again; the zone is
+       * in memory, so that is installed (cache_wants_cold()).  APPLIED here would have the loader believe that its version is the one served. */
+      j->status = KDB_ST_SEND_BODY;
+    } else if (cc == 0) {
       if (j->dir_entry && j->has_timers) {
         (void)dbreg_apply_summary(j->view_name, j->zone, j->source_id, j->serial, true, j->t_refresh, j->t_retry, j->t_expire);
         if (dbreg_set_apex(j->view_name, j->zone, j->source_id, j->serial, j->apex)) j->apex = NULL;
       }
-      j->status = KDB_ST_APPLIED;
+      /* a summary is the directory entry the loader asked for; a body that was left out (memory-limit) tells the loader that the Backend has no data of the
+       * zone, so that its inventory stops saying so (the next change is a summary, with the apex that a body cannot give) */
+      j->status = j->dir_entry ? KDB_ST_APPLIED : KDB_ST_NOT_RESIDENT;
     } else {
       job_reject(j, "out of memory registering the zone");
       (void)dbreg_reject(j->view_name, j->zone, j->source_id, j->reason);
@@ -1057,6 +1067,7 @@ static void send_zone_result(ing_t *g, uint16_t view, const char *zone, uint8_t 
 
 static void fetch_job_finish(ing_t *g, ing_job_t *j);
 static void warm_add(ing_t *g, const char *view, const char *zone);
+static void fetch_issue(ing_t *g);
 
 /* the answer of a finished job; the job is freed */
 static void job_finish(ing_t *g, ing_job_t *j) {
@@ -1065,12 +1076,13 @@ static void job_finish(ing_t *g, ing_job_t *j) {
     return;
   }
   switch (j->status) {
+  case KDB_ST_NOT_RESIDENT:                              /* a body that was left out of memory: the directory has the version (counted as applied) */
   case KDB_ST_APPLIED:
     g->b_applied++;
     atomic_fetch_add_explicit(&g_st.tot_applied, 1, memory_order_relaxed);
     g->since_retire++;
     if (j->dir_entry && j->shared && j->shared->ext.cache_mode == 1) warm_add(g, j->view_name, j->zone);     /* a pinned zone is read after its summary */
-    if (g->zones_logged < ING_ZONES_LOGGED) {
+    if (j->status == KDB_ST_APPLIED && g->zones_logged < ING_ZONES_LOGGED) {
       g->zones_logged++;
       syslog(LOG_INFO, "[DB] zone '%s' (view '%s'): installed, serial %u", j->zone, j->view_name, j->serial);
     }
@@ -1135,6 +1147,8 @@ static void ing_kick(void) {
 static _Atomic uint64_t g_fetch_shed;   /* fetch requests not made because of memory-limit */
 static _Atomic uint32_t g_fetch_rate = KARIDNS_DB_FETCH_RATE_DEFAULT;   /* database { fetch-rate }: zones read for queries per second */
 static _Atomic uint64_t g_fetch_limited;  /* fetch requests not made because the rate was used up */
+static _Atomic uint64_t g_apex_asked, g_apex_answered;   /* D1a step 6: summaries asked for (for the apex of a zone out of memory, after a reload) / their fetches that ended */
+static _Atomic bool g_apex_walking;                       /* ... and the walk over the registry that finds the zones is still going */
 static int64_t delta_interval_ms(void) { return dbreg_cache_limit() ? ING_DELTA_LIMITED_MS : ING_DELTA_MS; }
 
 static void maybe_apply_delta(ing_t *g) {
@@ -1404,7 +1418,7 @@ static bool inv_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   if (!found) return true;                               /* a view that left the configuration */
   if (c->n >= ING_INV_CHUNK) return false;
   if (kdb_enc_nest_begin(&g->enc, 1) != 0 || kdb_enc_u16(&g->enc, 1, idx) != 0 || kdb_enc_name(&g->enc, 2, z->name) != 0 ||
-      kdb_enc_i64(&g->enc, 3, z->source_id) != 0 || kdb_enc_u32(&g->enc, 4, z->serial) != 0 ||
+      kdb_enc_i64(&g->enc, 3, z->source_id) != 0 || kdb_enc_u32(&g->enc, 4, zdir_serial(z)) != 0 ||
       (resident && kdb_enc_bytes(&g->enc, 5, z->digest, KDB_DIGEST_LEN) != 0) || kdb_enc_u8(&g->enc, 6, resident ? 1 : 0) != 0 ||
       kdb_enc_nest_end(&g->enc) != 0) {
     c->bad = true;
@@ -1495,17 +1509,12 @@ static bool cache_wants_cold(const ing_job_t *j) {
   return dbreg_cache_over_high((uint64_t)j->rr_count * 160u);
 }
 
-/* D1a step 6 (design 12-12): which zones keep the apex of their summary: the zones that send NOTIFY or have secondaries (an SOA question comes from
- * a secondary that polls, or from a tool that checks one).  A zone with `notify no` and no allow-transfer has none, and its SOA question reads the zone.
- * view: the view's name (the effective `notify` can come from the view or from options). */
-static bool apex_wanted(const char *view, const char *zone, const zone_ext_shared_t *sh) {
-  server_config_t *cfg = acquire_config_snapshot();
-  zone_config_t zc;
-  memset(&zc, 0, sizeof(zc));
-  zc.domain = (char *)zone;
-  zc.ext = sh ? (zone_ext_t *)&sh->ext : NULL;
-  bool wanted = !cfg || notify_mode_effective(cfg, &zc, view) != NOTIFY_MODE_NO || (sh && sh->ext.allow_transfer_count > 0);
-  release_config_snapshot(cfg);
+/* D1a step 6 (design 12-12): does the summary of a fetch keep its apex?  The same predicate as for the summary of a batch (dbreg_apex_wanted()), with the
+ * settings the registry kept for the zone: the summary of a fetch carries none. */
+static bool apex_wanted_registry(const char *view, const char *zone) {
+  zone_ext_shared_t *sh = dbreg_settings_ref(view, zone);
+  bool wanted = dbreg_apex_wanted(view, zone, sh);
+  zone_ext_shared_unref(sh);
   return wanted;
 }
 
@@ -1573,7 +1582,7 @@ static ing_job_t *job_from_begin(ing_t *g, const kdb_zone_begin_t *zb) {
     j->t_refresh = zb->soa_refresh;
     j->t_retry = zb->soa_retry;
     j->t_expire = zb->soa_expire;
-    if (zb->has_apex && apex_wanted(j->view_name, j->zone, NULL)) j->apex = apex_from_begin(zb);
+    if (zb->has_apex && apex_wanted_registry(j->view_name, j->zone)) j->apex = apex_from_begin(zb);
   } else if (zb->flags & KDB_ZF_SUMMARY) {
     /* D1a milestone 4 (design 3.3, 6.3): the directory entry of a zone in a batch: the loader sends the summary instead of the data for a zone that is
      * not in memory (CONFIG dir_only, which is memory-limit).  The loader is not trusted: a summary without memory-limit, or for a zone that has
@@ -1593,7 +1602,7 @@ static ing_job_t *job_from_begin(ing_t *g, const kdb_zone_begin_t *zb) {
     } else {
       j->cold = true;
       j->dir_entry = true;
-      if (zb->has_apex && apex_wanted(j->view_name, j->zone, j->shared)) j->apex = apex_from_begin(zb);
+      if (zb->has_apex && dbreg_apex_wanted(j->view_name, j->zone, j->shared)) j->apex = apex_from_begin(zb);
     }
   } else if (zb->zone_kind != KDB_ZK_PRIMARY && zb->flags != 0) {
     j->skip = true;                                      /* a SLAVE / CONSUMER has no data to describe */
@@ -1994,6 +2003,45 @@ static bool reeval_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   return true;
 }
 
+/* D1a step 6 (design 12-12): a reload can make a zone that is out of memory keep an apex (notify, allow-transfer).  The zones that have none are asked for
+ * their summary (the fetch stream, the list of zones to read before a query asks), a few at a time, from the ingest loop: no list of a million zones. */
+#define APEXW_BATCH 16
+typedef struct {
+  const server_config_t *cfg;
+  uint32_t chunk, n;
+  struct { char view[PARK_VIEW_MAX + 1]; char zone[PARK_ZONE_MAX + 1]; } item[APEXW_BATCH];
+} apexw_t;
+
+static bool apexw_cb(void *ud, const char *view, const dbreg_zone_t *z) {
+  apexw_t *c = ud;
+  if (++c->chunk > REEVAL_CHUNK || c->n >= APEXW_BATCH) return false;      /* stop before this zone: the next step starts at it */
+  if (zdir_entry(z) || atomic_load_explicit((_Atomic(zdir_apex_t *) *)&z->apex, memory_order_relaxed) || (z->flags & (ZDIR_F_DELETED | ZDIR_F_WARM)) || !z->digest || z->shadowed ||
+      atomic_load_explicit((_Atomic uint8_t *)&z->state, memory_order_relaxed) == ZDIR_ST_ERROR || strlen(z->name) > PARK_ZONE_MAX || strlen(view) > PARK_VIEW_MAX)
+    return true;
+  if (!dbreg_apex_wanted_cfg(c->cfg, view, z->name, atomic_load_explicit((_Atomic(zone_ext_shared_t *) *)&z->sh, memory_order_acquire))) return true;
+  snprintf(c->item[c->n].view, sizeof(c->item[0].view), "%s", view);
+  snprintf(c->item[c->n].zone, sizeof(c->item[0].zone), "%s", z->name);
+  c->n++;
+  return true;
+}
+
+static void apex_walk_step(ing_t *g) {
+  if (!g->apex_walk || g->nwarm > 0 || g->fetch_fd < 0) return;
+  apexw_t *c = calloc(1, sizeof(*c));
+  if (!c) return;
+  rcu_aux_read_lock();
+  c->cfg = acquire_config_snapshot();
+  bool done = dbreg_walk(&g->apex_cur, apexw_cb, c);
+  rcu_aux_read_unlock();
+  if (done) {
+    g->apex_walk = false;
+    atomic_store_explicit(&g_apex_walking, false, memory_order_relaxed);
+  }
+  for (uint32_t i = 0; i < c->n; i++) warm_add(g, c->item[i].view, c->item[i].zone);
+  free(c);
+  if (g->nwarm > 0) fetch_issue(g);
+}
+
 static void reeval_settings(ing_t *g) {
   (void)g;
   reeval_ctx_t c = { NULL, 0, 0, 0, 0, 0 };
@@ -2020,6 +2068,9 @@ static void reeval_settings(ing_t *g) {
 static void on_config_event(ing_t *g) {
   if (!atomic_exchange_explicit(&g_cfg_dirty, false, memory_order_acq_rel)) return;
   reeval_settings(g);
+  g->apex_walk = true;                                 /* the zones out of memory that keep an apex now are asked for it */
+  atomic_store_explicit(&g_apex_walking, true, memory_order_relaxed);
+  memset(&g->apex_cur, 0, sizeof(g->apex_cur));
   if (g->stream_fd >= 0 && g->hello_done) send_config(g, "configuration reloaded");
   /* otherwise the CONFIG of the handshake reads the new configuration */
 }
@@ -2370,7 +2421,8 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
   ing_freq_t done = *r;
   r->active = false;
   g->nfreq--;
-  dbreg_fetch_end(done.view_name, done.zone);
+  if (done.mode != KDB_FETCH_SUMMARY) dbreg_fetch_end(done.view_name, done.zone);      /* (a summary is not a fetch of the data: it took no LOADING state) */
+  else atomic_fetch_add_explicit(&g_apex_answered, 1, memory_order_relaxed);
   if (!ok)
     syslog(LOG_WARNING, "[DB] fetch of zone '%s' (view '%s') failed: %s", done.zone, done.view_name, why && why[0] ? why : "no reason given");
   if (dbreg_pending_count() > 0) apply_delta(g);         /* a zone that was new to the index becomes visible before its queries are woken */
@@ -2411,7 +2463,7 @@ static void warm_add(ing_t *g, const char *view, const char *zone) {
     size_t nc = g->cwarm ? g->cwarm * 2 : 64;
     struct ing_warm *n = realloc(g->warm, nc * sizeof(*n));
     if (!n) {
-      (void)dbreg_warm_take(view, zone);
+      (void)dbreg_warm_take(view, zone, NULL);
       return;                                            /* out of memory: the zone is read when a query asks for it */
     }
     g->warm = n;
@@ -2436,10 +2488,11 @@ static void fetch_issue(ing_t *g) {
       snprintf(q.view, sizeof(q.view), "%s", g->warm[0].view);
       snprintf(q.zone, sizeof(q.zone), "%s", g->warm[0].zone);
       q.prio = KDB_FETCH_PRIO_WARM;
-      q.mode = KDB_FETCH_FULL;
       memmove(g->warm, g->warm + 1, (g->nwarm - 1) * sizeof(*g->warm));
       g->nwarm--;
-      if (!dbreg_warm_take(q.view, q.zone)) continue;    /* it came into memory meanwhile, was deleted, or is not pinned any more: nothing to read */
+      bool whole = false;
+      if (!dbreg_warm_take(q.view, q.zone, &whole)) continue;      /* it came into memory meanwhile, was deleted, or has nothing to read for (not pinned, has an apex) */
+      q.mode = whole ? KDB_FETCH_FULL : KDB_FETCH_SUMMARY;         /* a pinned zone whole; any other zone in the list is there for its apex */
     } else {
       break;
     }
@@ -2491,7 +2544,7 @@ static void fetch_issue(ing_t *g) {
       park_wake_broadcast(q.view, q.zone, true);
       continue;
     }
-    int st = dbreg_fetch_begin(g->view_names[vi], q.zone);
+    int st = q.mode == KDB_FETCH_SUMMARY ? DBREG_FETCH_STARTED : dbreg_fetch_begin(g->view_names[vi], q.zone);       /* (a summary leaves the zone's state alone: queries are not held for it) */
     if (st == DBREG_FETCH_BUSY) continue;
     if (st != DBREG_FETCH_STARTED) {                     /* in memory already (woken), or not a zone of the registry (answered at once) */
       park_wake_broadcast(q.view, q.zone, st == DBREG_FETCH_NONE);
@@ -2501,7 +2554,7 @@ static void fetch_issue(ing_t *g) {
     for (uint32_t i = 0; i < ING_FETCH_MAX && !r; i++)
       if (!g->freq[i].active) r = &g->freq[i];
     if (!r) {                                            /* too many in flight: the queries run into their deadlines */
-      dbreg_fetch_end(g->view_names[vi], q.zone);
+      if (q.mode != KDB_FETCH_SUMMARY) dbreg_fetch_end(g->view_names[vi], q.zone);
       if (warm) {
         g->ftokens += 1.0;
         warm_add(g, q.view, q.zone);
@@ -2510,6 +2563,7 @@ static void fetch_issue(ing_t *g) {
       park_wake_broadcast(q.view, q.zone, true);
       continue;
     }
+    if (q.mode == KDB_FETCH_SUMMARY) atomic_fetch_add_explicit(&g_apex_asked, 1, memory_order_relaxed);
     memset(r, 0, sizeof(*r));
     r->active = true;
     r->id = ++g->fseq;
@@ -2744,7 +2798,7 @@ static void *ingest_thread(void *arg) {
       if (tick < 10) tick = 10;
       if (wait_ms < 0 || wait_ms > tick) wait_ms = tick;
     }
-    if (g->nwarm > 0 && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;      /* zones to read before a query asks: try again soon */
+    if ((g->nwarm > 0 || (g->apex_walk && g->fetch_fd >= 0)) && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;      /* zones to read before a query asks, or the walk for apexes (while there is a fetch stream): try again soon */
     if (wait_ms >= 0) {
       ts.tv_sec = wait_ms / 1000;
       ts.tv_nsec = (wait_ms % 1000) * 1000000;
@@ -2781,6 +2835,7 @@ static void *ingest_thread(void *arg) {
     if (g->need_cleanup) cleanup_stream_state(g);
     maybe_apply_delta(g);
     if (g->nwarm > 0) fetch_issue(g);
+    apex_walk_step(g);
     fetch_expire(g);
     if (g->stream_fd >= 0 && g->out_off < g->out_len) out_flush(g);
     if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);
@@ -3073,9 +3128,9 @@ static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   c->matches++;
   const char *st = z->shadowed ? "shadowed" : (z->last_result == DBREG_REJECTED ? "rejected" : "applied");
   st_append(c, "zone %s view %s: source id %lld, serial %u, status %s", z->name, view, (long long)z->source_id,
-            zdir_entry(z) ? (zdir_entry(z)->is_secondary ? atomic_load_explicit(&zdir_entry(z)->serial, memory_order_relaxed) : z->serial) : z->serial, st);
+            zdir_entry(z) ? (zdir_entry(z)->is_secondary ? atomic_load_explicit(&zdir_entry(z)->serial, memory_order_relaxed) : zdir_serial(z)) : zdir_serial(z), st);
   if (z->shadowed) st_append(c, z->shadow_by == DBREG_SH_CATALOG ? " (hidden by a catalog member)" : " (hidden by a zone in karidns.conf)");
-  if (z->last_result == DBREG_REJECTED && zdir_entry(z)) st_append(c, " (serving the last good version, serial %u)", z->serial);
+  if (z->last_result == DBREG_REJECTED && zdir_entry(z)) st_append(c, " (serving the last good version, serial %u)", zdir_serial(z));
   if (!zdir_entry(z)) st_append(c, z->digest && atomic_load_explicit(&z->state, memory_order_relaxed) != ZDIR_ST_ERROR
                                        ? " (the data is out of memory: it is read when a query needs it)" : " (no version loaded)");
   if (z->error) st_append(c, ", last error: %s", z->error);
@@ -3141,6 +3196,9 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
                 (unsigned long long)cs.pinned_bytes, (unsigned long long)cs.peak, (unsigned)cs.victim_freq);
     else
       st_append(&c, "cache: no memory-limit (every database zone stays in memory)\n");
+    st_append(&c, "apex: asked=%llu answered=%llu walking=%d (summaries asked for after a reload, for the apex of zones out of memory)\n",
+              (unsigned long long)atomic_load_explicit(&g_apex_asked, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_apex_answered, memory_order_relaxed),
+              atomic_load_explicit(&g_apex_walking, memory_order_relaxed) ? 1 : 0);
     st_append(&c, "updated: %zu zone(s) changed by a dynamic UPDATE are pinned in memory until the next load from the database replaces them\n",
               dbreg_count_updated());
     size_t nel, rbytes, ibytes;

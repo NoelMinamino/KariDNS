@@ -786,8 +786,11 @@ static void test_backend_direction_rejects(void) {
     kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, ZN); kdb_enc_u8(&e, 3, KDB_ST_SEND_BODY); kdb_enc_end(&e);
     CHECK_RC("status SEND_BODY", decode_backend(&e, 2), KDB_OK);
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_ZONE_RESULT);
-    kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, ZN); kdb_enc_u8(&e, 3, KDB_ST_SEND_BODY + 1); kdb_enc_end(&e);
-    CHECK_RC("status 6", decode_backend(&e, 2), KDB_E_RANGE);
+    kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, ZN); kdb_enc_u8(&e, 3, KDB_ST_NOT_RESIDENT); kdb_enc_end(&e);
+    CHECK_RC("status NOT_RESIDENT", decode_backend(&e, 2), KDB_OK);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_ZONE_RESULT);
+    kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, ZN); kdb_enc_u8(&e, 3, KDB_ST_NOT_RESIDENT + 1); kdb_enc_end(&e);
+    CHECK_RC("status 7", decode_backend(&e, 2), KDB_E_RANGE);
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_BATCH_RESULT);
     { uint8_t ids[12] = { 0 };
       kdb_enc_u64(&e, 1, 1); kdb_enc_bytes(&e, 2, ids, 12); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0); kdb_enc_u32(&e, 5, 0); kdb_enc_u32(&e, 6, 0); }

@@ -145,7 +145,8 @@ enum { KDB_ZK_PRIMARY = 0, KDB_ZK_SECONDARY, KDB_ZK_CATALOG };
 #define KDB_APEX_NS_BYTES 2047   /* ... and the bytes of their list (8 names of 253 characters and the separators) */
 #define KDB_ZF_SUMMARY 0x8u     /* D1a, fetch stream: the zone's summary (serial, kind, settings), no ZONE_DATA, rr_count 0, zero digest */
 enum { KDB_ST_APPLIED = 0, KDB_ST_UNCHANGED, KDB_ST_REJECTED, KDB_ST_SHADOWED, KDB_ST_DELETED,
-       KDB_ST_SEND_BODY };   /* D1a: SEND_BODY, to a summary: the zone is in the Backend's memory in another version than the summary says, send it whole */
+       KDB_ST_SEND_BODY,       /* D1a: SEND_BODY, to a summary (or to a zone body that was left out): the zone is in the Backend's memory in another version than the loader says, send it whole */
+       KDB_ST_NOT_RESIDENT };  /* D1a: NOT_RESIDENT, to a zone body: the Backend took the version into its directory and left the data out (memory-limit), so it has no data of the zone */
 
 typedef enum {
     KDB_OK = 0,

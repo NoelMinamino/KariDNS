@@ -566,13 +566,14 @@ typedef struct zdir_apex {
   uint8_t n_ns;
   uint8_t data[];
 } zdir_apex_t;
-#define ZDIR_APEX_MAX (sizeof(zdir_apex_t) + 2 * 255 + KDB_APEX_NS_MAX * 255)
+#define ZDIR_APEX_NS_MAX 8        /* NS targets of an apex (= KDB_APEX_NS_MAX, dns_db_stream.h; dns_db_ingest.c checks) */
+#define ZDIR_APEX_MAX (sizeof(zdir_apex_t) + 2 * 255 + ZDIR_APEX_NS_MAX * 255)
 struct zdir_elem {
   struct zdir_elem *next;      /* the registry's hash chain; once the element is on a garbage list, that list */
   _Atomic(zone_db_entry_t *) entry;   /* the entry that answers for the name (RCU-published); the element holds a reference */
   char *error;                 /* last rejection / loader error, malloc; NULL = none */
   int64_t source_id;           /* DB: the domain id of the zone; directory-owned elements: the listing order */
-  uint32_t serial;             /* DB: the serial of the version offered last (the SOA of the entry for a secondary) */
+  _Atomic uint32_t serial;     /* DB: the serial of the version offered last (the SOA of the entry for a secondary).  Written under g_zone_db_rebuild_lock; a worker reads it (build_apex_soa_answer()): zdir_serial() */
   uint32_t refresh, retry, expire;   /* the SOA timers of the version served */
   uint32_t hash;               /* calc_fnv1a_strn(name, klen): the index hash */
   _Atomic uint32_t freq;       /* D1a step 5: how often the zone is asked for (GDSF, cache admission).  Non-resident zone: +1 per query that parks; the cache manager folds the queries of a resident zone in (observatory counter) and halves it at each round */
@@ -884,6 +885,8 @@ extern pthread_mutex_t g_zone_db_rebuild_lock;
 static inline zone_db_entry_t *zdir_entry(const zdir_elem_t *e) {
   return e ? atomic_load_explicit((_Atomic(zone_db_entry_t *) *)&e->entry, memory_order_acquire) : NULL;
 }
+/* the serial of the version the element describes (relaxed: a reader compares it with the serial of the apex block it loaded with acquire; the writer stores the serial before the block) */
+static inline uint32_t zdir_serial(const zdir_elem_t *e) { return atomic_load_explicit(&((zdir_elem_t *)e)->serial, memory_order_relaxed); }
 /* the longest-suffix match of qname (the zone that holds the name), and the zone named exactly domain, in the directory of the
  * view: the element, which a later milestone may return for a zone that is not in memory (then zdir_entry() is NULL).
  * find_zone_in_view() / find_zone_exact_in_view() / find_zone_for_query() return the entry of that element. */
@@ -999,6 +1002,7 @@ bool dbreg_cache_over_limit(void);                                 /* are the da
 /* A zone of a batch that is not kept in memory because the limit is reached: the directory element with the serial and the digest the loader sent,
  * no data (the next query for it fetches it).  0 on success. */
 int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uint32_t serial, const uint8_t digest[32], zone_ext_shared_t *shared);
+#define DBREG_COLD_RESIDENT 1     /* dbreg_commit_cold(): the zone has its data in memory (a fetch brought it), nothing was recorded */
 void dbreg_set_pending_notify(void (*cb)(void));                  /* called (lock held) when a change is queued without the ingest thread: it wakes the thread */
 size_t dbreg_count_updated(void);                                 /* zones changed by a dynamic UPDATE: pinned in memory until the next load from the database */
 uint64_t dbreg_evictions(void);                                  /* zones evicted since the start */
@@ -1021,9 +1025,15 @@ enum { DBREG_SUM_NONE = 0, DBREG_SUM_SAME, DBREG_SUM_DIFFERS };
  * element took the block (the caller must not free it); false: the block is the caller's. */
 bool dbreg_set_apex(const char *view, const char *zone, int64_t source_id, uint32_t serial, zdir_apex_t *apex);
 /* The list of zones to read before a query asks (ingest thread): dbreg_warm_mark() puts a zone in it (false: it is there already, or the zone is not a registry zone),
- * dbreg_warm_take() takes it out again: true when it is still worth a read (pinned, no data, not deleted). */
+ * dbreg_warm_take() takes it out again: true when it is still worth a read (no data, not deleted, and pinned or without an apex); *whole: the zone is pinned and is
+ * read whole, else only its summary (for the apex) is asked for. */
 bool dbreg_warm_mark(const char *view, const char *zone);
-bool dbreg_warm_take(const char *view, const char *zone);
+bool dbreg_warm_take(const char *view, const char *zone, bool *whole);
+/* D1a step 6 (design 12-12): does the zone keep the apex of its summary (notify or allow-transfer)?  The _cfg form takes the configuration the caller holds in a
+ * read section.  dbreg_settings_ref(): the settings the registry kept for a zone out of memory, one reference (zone_ext_shared_unref()). */
+bool dbreg_apex_wanted(const char *view, const char *zone, const zone_ext_shared_t *sh);
+bool dbreg_apex_wanted_cfg(const server_config_t *cfg, const char *view, const char *zone, const zone_ext_shared_t *sh);
+zone_ext_shared_t *dbreg_settings_ref(const char *view, const char *zone);
 int dbreg_summary_check(const char *view, const char *zone, int64_t source_id, uint32_t serial);
 /* The entry of the DB zone (view, name) when it is in the active snapshot, i.e. served (not shadowed), else NULL.  Valid
  * while the caller holds the snapshot (acquire_retained_zone_snapshot()). */

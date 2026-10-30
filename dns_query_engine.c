@@ -2882,9 +2882,6 @@ static bool notify_from_member_primaries(server_config_t *cfg, view_snapshot_t *
   return !need || (tkey && tsig_key_names_equal(tkey->name, need));
 }
 
-/* SERVFAIL with Extended DNS Error 14 "Not Ready" (RFC 8914 4.15), keeping the question: the answer for a query whose zone is in the directory
- * and cannot be had in time (D1a design 4.4).  The request's own EDE options are not echoed.  Signing is the caller's (the TSIG handling around
- * process_query_body()). */
 /* minimal-responses of the client's view (lib/ns/query.c: client->view->minimalresponses), else options'; no-auth-recursive is no-auth for a query with RD set and
  * no for the others (ns_query_start()), so the mode returned is the one an answer is built with */
 static int query_minimal_mode(const server_config_t *cfg, const view_snapshot_t *view, const uint8_t *req) {
@@ -2903,6 +2900,35 @@ static bool apex_name_text(const uint8_t *p, size_t len, char *out, size_t cap) 
   return extract_wire_name_to_buffer(p, len, 0, &next, out, cap) >= 0;
 }
 
+/* The size an answer may have on UDP when the query has EDNS: the size the client announced (512 at least) and no more than the server's limit (udp-bufsize,
+ * zone-udp-bufsize, view max-udp-size, the `server` statement of the client: RFC 6891 6.2.3, 6.2.5), the capacity of res when it is known.  Clamps edns->udp_payload_size
+ * too.  The limit the caller passed stays when the query has no EDNS, comes by TCP, or the caller's own buffer is smaller than a plain UDP answer (res[] must not be
+ * written past its end).  One function for the answer of a zone in memory and for the answer from a summary: the two give the same bytes. */
+static size_t edns_udp_limit(edns_info_t *edns, bool is_tcp, const server_config_t *cfg, const view_snapshot_t *view, const char *client_ip, size_t max_res_len,
+                             size_t res_cap) {
+  if (!edns->present) return max_res_len;
+  if (edns->udp_payload_size < 512) edns->udp_payload_size = 512;
+  if (is_tcp) return max_res_len;
+  uint16_t server_udp_size = edns->server_udp_size ? edns->server_udp_size : KARIDNS_UDP_BUFSIZE_DEFAULT;
+  /* the server statement of the client can set the limit (batch 5; BIND ns client.c: max-udp-size of the peer replaces the view's
+   * for this client, 512..4096).  Only looked for when some statement writes it; no allocation (inet_pton on the text address). */
+  if (cfg && cfg->any_server_max_udp) {
+    const server_stmt_t *psrv = config_server_find_ip(cfg, view ? view->name : NULL, client_ip);
+    if (psrv && (psrv->set & SV_MAX_UDP_SIZE)) server_udp_size = (uint16_t)psrv->max_udp_size;
+  }
+  if (edns->udp_payload_size > server_udp_size) edns->udp_payload_size = server_udp_size;
+  /* UDP 応答の上限はクライアントが OPT で通知したサイズ (512 以上に丸め、サーバーの
+   * udp-bufsize 以下。RFC 6891 §6.2.3、§6.2.5)。呼び出し側の max_res_len が大きくても小さくても
+   * 置き換える (以前は 512 ちょうどのとき呼び出し側の値のままで、非同期経路では 4096 まで
+   * 返しえた)。呼び出し側が 512 未満の小さなバッファを渡したときは広げない (res[] の範囲外へ
+   * 書き込むため)。res_cap が分かっていればそれを超えない。 */
+  if (max_res_len >= UDP_DEFAULT_MAX_RES_LEN) {
+    max_res_len = edns->udp_payload_size;
+    if (res_cap != 0 && max_res_len > res_cap) max_res_len = res_cap;
+  }
+  return max_res_len;
+}
+
 /* D1a step 6 (design 12-12): the answer to an SOA question at the apex of a zone that is not in memory, from the apex its summary brought.  It is what the
  * zone in memory gives, byte for byte: the SOA RR in Answer (RFC 1035 3.3.13, the names compressed as the zone image's serializer does, RFC 1035 4.1.4)
  * and, unless minimal-responses leaves it out, the NS RRset in Authority (RFC 1034 4.3.2 step 3a); the TTLs are the RRs' own (RFC 2181 5.2: the
@@ -2913,7 +2939,7 @@ static bool apex_name_text(const uint8_t *p, size_t len, char *out, size_t cap) 
 static int build_apex_soa_answer(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len, const zdir_elem_t *elem, const zdir_apex_t *ap,
                                  edns_info_t *edns, bool is_tcp, int minimal_mode, view_snapshot_t *view, compress_ctx_t *comp_ctx,
                                  const tsig_request_t *tsig, server_config_t *cfg) {
-  if (ap->serial != elem->serial || ap->n_ns == 0) return -1;
+  if (ap->serial != zdir_serial(elem) || ap->n_ns == 0) return -1;
   if (edns->present && (edns->version != 0 || edns->dnssec_ok || edns->compact_answers_ok || edns->has_mqtype_query || edns->has_ecs || edns->has_malformed_ecs ||
                         edns->has_karidns_ext || edns->has_cookie || edns->has_malformed_cookie || edns->ede_count != 0 || edns->has_expire_query || edns->has_expire_value))
     return -1;
@@ -2995,6 +3021,9 @@ static int build_apex_soa_answer(const uint8_t *req, size_t req_len, uint8_t *re
   return offset;
 }
 
+/* SERVFAIL with Extended DNS Error 14 "Not Ready" (RFC 8914 4.15), keeping the question: the answer for a query whose zone is in the directory
+ * and cannot be had in time (D1a design 4.4).  The request's own EDE options are not echoed.  Signing is the caller's (the TSIG handling around
+ * process_query_body()). */
 static int build_not_ready_response(const uint8_t *req, size_t req_len, uint8_t *res, size_t cap, bool is_tcp, server_config_t *cfg) {
   if (req_len < DNS_HEADER_SIZE) return 0;
   edns_info_t edns;
@@ -3325,9 +3354,14 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     if (opcode == 0 && qtype == 6 && qdcount == 1 && view && domain_names_match_ci(not_ready_zone->name, current_qname)) {
       const zdir_apex_t *ap = atomic_load_explicit(&not_ready_zone->apex, memory_order_acquire);
       if (ap) {
-        int alen = build_apex_soa_answer(req, req_len, res, max_res_len, not_ready_zone, ap, &edns, is_tcp, query_minimal_mode(cfg, view, req), view,
+        /* the size the zone in memory would answer with (the EDNS size of the client on UDP), and the TSIG signing needs the same limit */
+        const size_t alimit = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
+        const size_t tsig_limit = tsig ? tsig->res_limit : 0;
+        if (tsig) tsig->res_limit = alimit;
+        int alen = build_apex_soa_answer(req, req_len, res, alimit, not_ready_zone, ap, &edns, is_tcp, query_minimal_mode(cfg, view, req), view,
                                          comp_ctx, tsig, cfg);
         if (alen >= DNS_HEADER_SIZE) return alen;
+        if (tsig) tsig->res_limit = tsig_limit;
       }
     }
     if (t_nr_probe && opcode == 0) return DNS_NR_PERMITTED;
@@ -3499,30 +3533,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   compress_ctx_init_packet(comp_ctx);
 
-  if (edns.present) {
-    if (edns.udp_payload_size < 512)
-      edns.udp_payload_size = 512;
-    if (!is_tcp) {
-      uint16_t server_udp_size = edns.server_udp_size ? edns.server_udp_size : KARIDNS_UDP_BUFSIZE_DEFAULT;
-      /* the server statement of the client can set the limit (batch 5; BIND ns client.c: max-udp-size of the peer replaces the view's
-       * for this client, 512..4096).  Only looked for when some statement writes it; no allocation (inet_pton on the text address). */
-      if (cfg && cfg->any_server_max_udp) {
-        const server_stmt_t *psrv = config_server_find_ip(cfg, view ? view->name : NULL, client_ip);
-        if (psrv && (psrv->set & SV_MAX_UDP_SIZE)) server_udp_size = (uint16_t)psrv->max_udp_size;
-      }
-      if (edns.udp_payload_size > server_udp_size)
-        edns.udp_payload_size = server_udp_size;
-      /* UDP 応答の上限はクライアントが OPT で通知したサイズ (512 以上に丸め、サーバーの
-       * udp-bufsize 以下。RFC 6891 §6.2.3、§6.2.5)。呼び出し側の max_res_len が大きくても小さくても
-       * 置き換える (以前は 512 ちょうどのとき呼び出し側の値のままで、非同期経路では 4096 まで
-       * 返しえた)。呼び出し側が 512 未満の小さなバッファを渡したときは広げない (res[] の範囲外へ
-       * 書き込むため)。res_cap が分かっていればそれを超えない。 */
-      if (max_res_len >= UDP_DEFAULT_MAX_RES_LEN) {
-        max_res_len = edns.udp_payload_size;
-        if (res_cap != 0 && max_res_len > res_cap) max_res_len = res_cap;
-      }
-    }
-  }
+  max_res_len = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
   /* RFC 8945 §5.3: 署名する応答は、上限から TSIG RR の分を空けて組み立てる (切り詰めは TC=1 で表す) */
   if (tsig) {
     tsig->res_limit = max_res_len;

@@ -632,6 +632,13 @@ static void inv_free(inv_t *t) {
     memset(t, 0, sizeof(*t));
 }
 
+/* slot of a view name that is in lio.vnames already, -1 if the loader has never been told of it */
+static int vslot_find(const struct lio *io, const char *name) {
+    for (size_t i = 0; i < io->nvn; i++)
+        if (strcasecmp(io->vnames[i], name) == 0) return (int)i;
+    return -1;
+}
+
 /* slot of a view name in lio.vnames (appended when new); (uint16_t)-1 on out of memory.  The slot is stable for the
  * life of the process, so the inventory and the change log positions survive a CONFIG that renumbers the views. */
 static int vslot_get(struct lio *io, const char *name) {
@@ -706,7 +713,7 @@ static void fev_drain(struct lio *io) {
     pthread_mutex_unlock(&g_fev_lock);
     while (f) {
         fev_t *nx = f->next;
-        int slot = vslot_get(io, f->view);
+        int slot = vslot_find(io, f->view);              /* (a view the CONFIG never named gets no slot from a fetch result) */
         inv_ent_t *ie = slot >= 0 ? inv_get(&io->inv, (uint16_t)slot, f->name) : NULL;
         if (ie) {
             ie->known = true;
@@ -1442,7 +1449,7 @@ static int commit_zone(ctx_t *x, const zinfo_t *zi, zres_t *r) {
         if (r->profile[0] && send_profile_for(x, r->profile) != 0) return -1;   /* B7a: the profile text comes first */
         if (emit_file(x, r->buf, r->len) != 0) return -1;
         x->n_zones++;
-        if (x->fetch && x->fetch_vname) fev_push(x->fetch_vname, zi->canon, zi->id, r->serial, r->digest);     /* (a fetch has no inventory of its own: the main thread keeps it) */
+        if (x->fetch && x->fetch_vname && !zi->summary) fev_push(x->fetch_vname, zi->canon, zi->id, r->serial, r->digest);     /* (a fetch has no inventory of its own: the main thread keeps it; the summary of a fetch is no data in memory) */
         if (x->io && !x->fetch) {              /* sent: what the Backend will have once it says "applied" */
             inv_ent_t *ie = inv_get(&x->io->inv, x->vslot, zi->canon);
             if (!ie) {
@@ -3035,6 +3042,20 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
                     ie->dirty = true;
                     io->again = true;
                 }
+                break;
+            case KDB_ST_NOT_RESIDENT:                /* the answer to a body: the Backend has the version in its directory and left the data out (memory-limit).  The
+                                                      * inventory says so (a zone it served by a fetch is resident only until it is taken out again, and no message tells
+                                                      * of that), and the zone is offered again at once, as a summary: that is what carries the apex */
+                if (ie->has_pend) {
+                    ie->source_id = ie->p_source_id;
+                    ie->serial = ie->p_serial;
+                    memcpy(ie->digest, ie->p_digest, KDB_DIGEST_LEN);
+                    ie->known = true;
+                    ie->has_pend = false;
+                }
+                ie->resident = false;
+                ie->dirty = true;
+                io->again = true;
                 break;
             case KDB_ST_APPLIED:
             case KDB_ST_SHADOWED:                    /* the Backend has the version that was sent */

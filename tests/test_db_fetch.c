@@ -349,6 +349,11 @@ int main(void) {
         rebuild_zone_db_from_config(&cfgX, false);
         zdir_elem_t *se = elem_of("default", "s.test.");
         CHECK(se != NULL && zdir_entry(se) == NULL && atomic_load(&se->state) == ZDIR_ST_ABSENT);
+        /* D1a step 6: the zone that left memory has the apex of its image (the SOA question that comes next is answered from it, no fetch) */
+        const zdir_apex_t *eap = se ? atomic_load(&se->apex) : NULL;
+        CHECK(eap && eap->serial == 6 && eap->soa_ttl == 300 && eap->ns_ttl == 300 && eap->minimum == 300 && eap->refresh == 3600 && eap->retry == 600 && eap->expire == 86400);
+        CHECK(eap && eap->n_ns == 1 && eap->mname_len == 12 && eap->rname_len == 13 && eap->ns_len == 12);
+        CHECK(eap && memcmp(eap->data, "\3ns1\1s\4test\0\4host\1s\4test\0\3ns1\1s\4test\0", 12 + 13 + 12) == 0);
         CHECK(elem_of("default", "r.test.") != NULL && zdir_entry(elem_of("default", "r.test.")) != NULL);
         CHECK(park_fetch_request(0, "default", "s.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
         CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "s.test.") == 0);
@@ -496,10 +501,19 @@ int main(void) {
         kdb_enc_end(&e);
         ch_send(a[0], &e);
         nres = 0;
-        while (ch_next(&mainc, &m, 10000) && m.type != KDB_T_BATCH_RESULT) nres++;
+        int n_notres = 0, n_applied = 0;
+        while (ch_next(&mainc, &m, 10000) && m.type != KDB_T_BATCH_RESULT) {
+            nres++;
+            if (m.type == KDB_T_ZONE_RESULT) {
+                n_notres += m.u.zone_result.status == KDB_ST_NOT_RESIDENT;
+                n_applied += m.u.zone_result.status == KDB_ST_APPLIED;
+            }
+        }
         CHECK(nres == NY && m.type == KDB_T_BATCH_RESULT);
         for (int i = 0; i < 100 && !elem_of("default", "y0399.test."); i++) usleep(50000);
         dbreg_cache_stats(&cs);
+        /* a body that was left out of memory is answered NOT_RESIDENT (the loader then knows the Backend has no data of the zone), the others APPLIED */
+        CHECK(n_notres == (int)cs.cold && n_applied == NY - n_notres);
         CHECK(cs.cold > 0 && cs.cold < NY);                                      /* the first ones fitted under the high mark, the rest came cold */
         int ncold = 0, nin = 0;
         char coldzone[40] = "";
