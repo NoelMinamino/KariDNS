@@ -42,6 +42,7 @@
 _Static_assert(KARIDNS_DB_MAX_VIEWS == KDB_MAX_CONFIG_VIEWS, "the configuration check and the CONFIG message must agree");
 _Static_assert(ZDIR_APEX_NS_MAX == KDB_APEX_NS_MAX, "the apex block and the ZONE_BEGIN apex agree on the number of NS names");
 _Static_assert(ZDIR_APEX_GLUE_PER_NS == KDB_APEX_GLUE_PER_NS && ZDIR_APEX_GLUE_MAX <= KDB_APEX_GLUE_BYTES, "... and on the glue");
+_Static_assert(ZDIR_APEX_GLUE_PER_NS == KDB_NOTIFY_ADDR_PER_NS && ZDIR_APEX_NADDR_MAX == KDB_NOTIFY_ADDR_BYTES, "... and on the NOTIFY addresses");
 
 #define ING_MAX_OUT (32u << 20)  /* queued answers the loader has not read: above this the loader is dropped */
 #define ING_ZONES_LOGGED 16       /* zones logged one by one per connection */
@@ -1549,9 +1550,10 @@ static bool cache_wants_cold(const ing_job_t *j) {
 
 /* D1a step 6 (design 12-12): does the summary of a fetch keep its apex?  The same predicate as for the summary of a batch (dbreg_apex_wanted()), with the
  * settings the registry kept for the zone: the summary of a fetch carries none. */
-static bool apex_wanted_registry(const char *view, const char *zone) {
+static bool apex_wanted_registry(const char *view, const char *zone, bool *naddr) {
   zone_ext_shared_t *sh = dbreg_settings_ref(view, zone);
   bool wanted = dbreg_apex_wanted(view, zone, sh);
+  *naddr = wanted && dbreg_apex_notify_ns_wanted(view, zone, sh);
   zone_ext_shared_unref(sh);
   return wanted;
 }
@@ -1559,9 +1561,9 @@ static bool apex_wanted_registry(const char *view, const char *zone) {
 /* The apex block of a summary: the names as wire names (RFC 1035 3.1), the TTLs as they are.  The loader is not trusted: the stream layer has checked the
  * names and the TTLs (dns_db_stream.c), the conversion checks them again (a label over 63 octets or a name over 255 fails).  NULL: none, or out of memory
  * (then the SOA question reads the zone). */
-static zdir_apex_t *apex_from_begin(const kdb_zone_begin_t *zb) {
+static zdir_apex_t *apex_from_begin(const kdb_zone_begin_t *zb, bool want_naddr) {
   if (!zb->has_apex || zb->ns_count == 0 || zb->ns_count > KDB_APEX_NS_MAX) return NULL;
-  uint8_t tmp[2 * 256 + KDB_APEX_NS_MAX * 256 + KDB_APEX_GLUE_BYTES];
+  uint8_t tmp[2 * 256 + KDB_APEX_NS_MAX * 256 + KDB_APEX_GLUE_BYTES + KDB_NOTIFY_ADDR_BYTES];
   uint16_t off = 0;
   uint16_t ml, rl;
   if (write_dns_name_str(tmp, &off, zb->soa_mname, NULL, sizeof(tmp)) != 0) return NULL;
@@ -1602,6 +1604,30 @@ static zdir_apex_t *apex_from_begin(const kdb_zone_begin_t *zb) {
     memcpy(tmp + off, zb->glue, zb->glue_len);
     off = (uint16_t)(off + zb->glue_len);
   }
+  /* D1a step 7: the addresses of the NS targets outside the zone, found by the loader (tag 22), for the NOTIFY of the zone while its data is out of memory: kept
+   * only for a zone that sends NOTIFY to its NS hosts.  The decoder has checked the format; the loader is not trusted, so every index must also name a target that
+   * is NOT inside the zone (an address of an in-zone name is the glue's), else the list is left out (the zone still has its apex). */
+  uint16_t naddr = 0;
+  if (want_naddr && zb->naddrs_len > 0 && zb->naddrs_len <= KDB_NOTIFY_ADDR_BYTES && kdb_notify_addrs_valid(zb->naddrs, zb->naddrs_len, n)) {
+    unsigned used = 0;
+    for (size_t i = 0; i < zb->naddrs_len; i += 2 + (zb->naddrs[i + 1] == 1 ? 4u : 16u)) used |= 1u << zb->naddrs[i];
+    bool ok = true;
+    unsigned k = 0;
+    for (const char *p = zb->ns_names, *end = zb->ns_names + zb->ns_names_len; ok && p <= end && k < n; k++) {
+      const char *e = memchr(p, '\n', (size_t)(end - p));
+      size_t l = e ? (size_t)(e - p) : (size_t)(end - p);
+      if (l >= sizeof(nm)) return NULL;
+      memcpy(nm, p, l);
+      nm[l] = '\0';
+      if ((used & (1u << k)) && domain_name_is_at_or_below(nm, zb->name)) ok = false;
+      p += l + 1;
+    }
+    if (ok) {
+      memcpy(tmp + off, zb->naddrs, zb->naddrs_len);
+      off = (uint16_t)(off + zb->naddrs_len);
+      naddr = zb->naddrs_len;
+    }
+  }
   zdir_apex_t *a = malloc(sizeof(*a) + off);
   if (!a) return NULL;
   a->serial = zb->serial;
@@ -1615,6 +1641,7 @@ static zdir_apex_t *apex_from_begin(const kdb_zone_begin_t *zb) {
   a->rname_len = rl;
   a->ns_len = (uint16_t)(ns_end - ns_start);
   a->glue_len = zb->glue_len;
+  a->naddr_len = naddr;
   a->n_ns = (uint8_t)n;
   memcpy(a->data, tmp, off);
   return a;
@@ -1641,7 +1668,8 @@ static ing_job_t *job_from_begin(ing_t *g, const kdb_zone_begin_t *zb) {
     j->t_refresh = zb->soa_refresh;
     j->t_retry = zb->soa_retry;
     j->t_expire = zb->soa_expire;
-    if (zb->has_apex && apex_wanted_registry(j->view_name, j->zone)) j->apex = apex_from_begin(zb);
+    bool want_naddr = false;
+    if (zb->has_apex && apex_wanted_registry(j->view_name, j->zone, &want_naddr)) j->apex = apex_from_begin(zb, want_naddr);
     j->no_apex = !zb->has_apex;                          /* (an apex that was not wanted is no inability: a reload can make it wanted) */
   } else if (zb->flags & KDB_ZF_SUMMARY) {
     /* D1a milestone 4 (design 3.3, 6.3): the directory entry of a zone in a batch: the loader sends the summary instead of the data for a zone that is
@@ -1662,7 +1690,7 @@ static ing_job_t *job_from_begin(ing_t *g, const kdb_zone_begin_t *zb) {
     } else {
       j->cold = true;
       j->dir_entry = true;
-      if (zb->has_apex && dbreg_apex_wanted(j->view_name, j->zone, j->shared)) j->apex = apex_from_begin(zb);
+      if (zb->has_apex && dbreg_apex_wanted(j->view_name, j->zone, j->shared)) j->apex = apex_from_begin(zb, dbreg_apex_notify_ns_wanted(j->view_name, j->zone, j->shared));
       j->no_apex = !zb->has_apex;
     }
   } else if (zb->zone_kind != KDB_ZK_PRIMARY && zb->flags != 0) {
@@ -3325,6 +3353,11 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
               (unsigned long long)atomic_load_explicit(&g_fetch_limited, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_fetch_issued, memory_order_relaxed));
     dbreg_cache_stats_t cs;
     dbreg_cache_stats(&cs);
+    {
+      uint64_t nq, nd;
+      dbreg_notify_stats(&nq, &nd);
+      st_append(&c, "notify of zones out of memory: queued=%llu dropped=%llu (a serial that changed while the data was out of memory; the NS addresses come with the summary)\n", (unsigned long long)nq, (unsigned long long)nd);
+    }
     st_append(&c, "transfers of zones out of memory: waited=%llu loaded=%llu failed=%llu summary_answers=%llu marked=%llu timeout=%ums\n",
               (unsigned long long)cs.xfr[DBREG_XFR_WAITED], (unsigned long long)cs.xfr[DBREG_XFR_LOADED], (unsigned long long)cs.xfr[DBREG_XFR_FAILED],
               (unsigned long long)cs.xfr[DBREG_XFR_SUMMARY], (unsigned long long)cs.xfr_marked, (unsigned)atomic_load_explicit(&g_xfr_timeout_ms, memory_order_relaxed));

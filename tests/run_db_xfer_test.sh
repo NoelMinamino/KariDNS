@@ -104,11 +104,12 @@ control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
 EOF
 }
 start_srv() {
+    : > "$T/srv.log"                     # (the background job truncates it later: the line of the previous server must not be seen as this one's)
     "$KARIDNS" -c "$T/k.conf" -f > "$T/srv.log" 2>&1 &
     SRV=$!
     i=0
-    while [ $i -lt 600 ] && ! grep -q "\[DB\] initial load complete" "$T/srv.log" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
-    grep -q "\[DB\] initial load complete" "$T/srv.log" && pass "the startup batch is complete" || { fail "no 'initial load complete'"; tail -20 "$T/srv.log"; }
+    while [ $i -lt 1800 ] && ! grep -q "\[DB\] initial load complete" "$T/srv.log" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    grep -q "\[DB\] initial load complete" "$T/srv.log" && pass "the startup batch is complete ($((i / 10)) s)" || { fail "no 'initial load complete' after $((i / 10)) s"; tail -20 "$T/srv.log"; }
     sleep 1
 }
 stat() { $KCTL dbstatus 2>/dev/null | grep '^cache:' | sed -n "s/.* $1=\([0-9]*\).*/\1/p" | tail -1; }

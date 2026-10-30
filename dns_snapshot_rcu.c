@@ -1684,6 +1684,37 @@ static void cache_note_next(void) {
 }
 static _Atomic uint64_t g_cache_rounds, g_cache_cold, g_cache_marked, g_cache_misses, g_xfr_marked;
 static _Atomic uint64_t g_xfr_count[4];
+/* D1a step 7: NOTIFY of zones whose data is out of memory (design 7).  The ingest thread queues (view, zone) under g_zone_db_rebuild_lock; the control thread,
+ * which owns the table of NOTIFYs awaiting an answer, takes them: a ring with one consumer.  A full ring drops the request (counted): NOTIFY is advisory
+ * (RFC 1996 2), a secondary asks again at its refresh time. */
+#define NRN_RING 1024
+static struct { char view[KARIDNS_VIEW_NAME_MAX]; char zone[256]; } g_nrn[NRN_RING];
+static _Atomic uint32_t g_nrn_head, g_nrn_tail;
+static _Atomic uint64_t g_nrn_queued, g_nrn_dropped;
+static void nrn_push_locked(const char *view, const char *zone) {
+    uint32_t head = atomic_load_explicit(&g_nrn_head, memory_order_relaxed);
+    if (head - atomic_load_explicit(&g_nrn_tail, memory_order_acquire) >= NRN_RING || strlen(view) >= sizeof(g_nrn[0].view) || strlen(zone) >= sizeof(g_nrn[0].zone)) {
+        atomic_fetch_add_explicit(&g_nrn_dropped, 1, memory_order_relaxed);
+        return;
+    }
+    strcpy(g_nrn[head % NRN_RING].view, view);
+    strcpy(g_nrn[head % NRN_RING].zone, zone);
+    atomic_store_explicit(&g_nrn_head, head + 1, memory_order_release);
+    atomic_fetch_add_explicit(&g_nrn_queued, 1, memory_order_relaxed);
+}
+bool dbreg_notify_pop(char *view, size_t vcap, char *zone, size_t zcap) {
+    uint32_t tail = atomic_load_explicit(&g_nrn_tail, memory_order_relaxed);
+    if (tail == atomic_load_explicit(&g_nrn_head, memory_order_acquire)) return false;
+    snprintf(view, vcap, "%s", g_nrn[tail % NRN_RING].view);
+    snprintf(zone, zcap, "%s", g_nrn[tail % NRN_RING].zone);
+    atomic_store_explicit(&g_nrn_tail, tail + 1, memory_order_release);
+    return true;
+}
+void dbreg_notify_stats(uint64_t *queued, uint64_t *dropped) {
+    *queued = atomic_load_explicit(&g_nrn_queued, memory_order_relaxed);
+    *dropped = atomic_load_explicit(&g_nrn_dropped, memory_order_relaxed);
+}
+
 static int64_t cache_mono_ms(void);
 static _Atomic uint64_t g_cache_peak;       /* the most the database zones held (resident + retired) when a zone was installed or a round ran, with a limit set */
 static void cache_peak_note(void);
@@ -1884,6 +1915,8 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
         }
         goto out;
     }
+    const bool had_version = !fresh && z->digest != NULL && z->last_result == DBREG_APPLIED;        /* (the directory knew a version of the zone) */
+    const uint32_t old_serial = zdir_serial(z);
     if (new_digest) z->digest = new_digest;
     if (replace) {
         /* The element stays in the index and now points to the new entry (one store: a reader sees the old or the new one); the old
@@ -1919,6 +1952,13 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
         z->t_load = (uint32_t)cache_mono_ms();
     }
     zdir_elem_sync(z, entry);
+    /* D1a step 7: data for a zone that was out of memory brings another serial than the directory had (the body of a changed zone that the loader sent because
+     * it thought the zone was here, or a fetch that is newer than the summary): the install of an entry is a first load for dns_db_install.c, which sends no
+     * NOTIFY then, so the control thread is asked, as for a summary; it finds the zone in memory and sends from it.  A summary that waited for its apex (DUE) too. */
+    if ((z->flags & ZDIR_F_NOTIFY_DUE) || (created && !cur && had_version && old_serial != serial && !sh)) {
+        z->flags &= (uint16_t)~ZDIR_F_NOTIFY_DUE;
+        nrn_push_locked(rv->name, z->name);
+    }
     if (atomic_load_explicit(&z->apex, memory_order_relaxed)) (void)apex_replace_locked(z, NULL);       /* the data is here now: the apex of the summary is not used any more (and the engine compares the serial, should this fail) */
     if (z->flags & ZDIR_F_EVICT_NEXT) cache_note_next();
     if (created && !fresh && !cur && !(z->flags & (ZDIR_F_PIN | ZDIR_F_NOCACHE)) && dbreg_cache_over_high(0) &&
@@ -1978,6 +2018,7 @@ int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uin
         }
         goto out;
     }
+    const bool had_version = !fresh && z->digest != NULL && z->last_result == DBREG_APPLIED;        /* (a version the directory knew: a new serial is a change, not a first sight) */
     if (new_digest) z->digest = new_digest;
     if (osh != shared) {                       /* the settings of the zone (its allow-query and `cache` setting are read from them while it is out of memory) */
         if (shared) zone_ext_shared_ref(shared);
@@ -1998,6 +2039,7 @@ int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uin
     uint8_t cm = shared ? shared->ext.cache_mode : 0;
     z->flags = (uint16_t)((z->flags & ~(ZDIR_F_PIN | ZDIR_F_NOCACHE)) | (cm == 1 ? ZDIR_F_PIN : cm == 2 ? ZDIR_F_NOCACHE : 0));
     z->source_id = source_id;
+    if (had_version && zdir_serial(z) != serial && !sh) z->flags |= ZDIR_F_NOTIFY_DUE;       /* the NOTIFY goes out when the apex of this version is here (dbreg_set_apex()) */
     zdir_set_serial_locked(z, serial);
     memcpy(z->digest, digest, 32);
     z->last_result = DBREG_APPLIED;
@@ -2121,6 +2163,7 @@ bool dbreg_apply_summary(const char *view, const char *zone, int64_t source_id, 
     dbreg_view_t *rv = dbreg_view_get(view, false);
     dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
     if (z && !(z->flags & ZDIR_F_DELETED) && !zdir_entry(z) && z->source_id == source_id) {     /* (a zone in memory is the newer truth) */
+        if (z->digest && z->last_result == DBREG_APPLIED && zdir_serial(z) != serial && !z->shadowed) z->flags |= ZDIR_F_NOTIFY_DUE;      /* (as in dbreg_commit_cold()) */
         zdir_set_serial_locked(z, serial);
         if (has_timers) {
             /* the same values a zone in memory has: the zone parser takes 0..4294967295 for these fields and parse_ttl_value() (what the
@@ -2197,6 +2240,10 @@ bool dbreg_set_apex(const char *view, const char *zone, int64_t source_id, uint3
         if (apex) apex->serial = serial;
         taken = apex_replace_locked(z, apex) && apex != NULL;
         if (taken) z->flags &= (uint16_t)~ZDIR_F_NOAPEX;
+        if (z->flags & ZDIR_F_NOTIFY_DUE) {        /* the serial changed and this is the summary of the new version, with its apex (or without one: also-notify still applies) */
+            z->flags &= (uint16_t)~ZDIR_F_NOTIFY_DUE;
+            nrn_push_locked(rv->name, z->name);
+        }
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     return taken;
@@ -2225,6 +2272,18 @@ bool dbreg_apex_wanted_cfg(const server_config_t *cfg, const char *view, const c
     return !cfg || notify_mode_effective(cfg, &zc, view) != NOTIFY_MODE_NO || (sh && sh->ext.allow_transfer_count > 0);
 }
 
+bool dbreg_apex_notify_ns_wanted(const char *view, const char *zone, const zone_ext_shared_t *sh) {
+    zone_config_t zc;
+    memset(&zc, 0, sizeof(zc));
+    zc.domain = (char *)zone;
+    zc.ext = sh ? (zone_ext_t *)&sh->ext : NULL;
+    rcu_aux_read_lock();
+    server_config_t *cfg = acquire_config_snapshot();
+    notify_mode_t m = cfg ? notify_mode_effective(cfg, &zc, view) : NOTIFY_MODE_YES;
+    release_config_snapshot(cfg);
+    rcu_aux_read_unlock();
+    return m == NOTIFY_MODE_YES || m == NOTIFY_MODE_PRIMARY_ONLY;
+}
 bool dbreg_apex_wanted(const char *view, const char *zone, const zone_ext_shared_t *sh) {
     rcu_aux_read_lock();
     server_config_t *cfg = acquire_config_snapshot();
@@ -2335,6 +2394,7 @@ static zdir_apex_t *apex_from_image(const zone_image_t *img) {
     a->rname_len = (uint16_t)rnl;
     a->ns_len = (uint16_t)ns_len;
     a->glue_len = (uint16_t)gl_len;
+    a->naddr_len = 0;                    /* (an image holds no address of a name outside the zone; the next summary brings them) */
     a->n_ns = (uint8_t)n;
     memcpy(a->data, rd, ml + rnl);
     uint8_t *w = a->data + ml + rnl;

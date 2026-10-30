@@ -637,8 +637,14 @@ static int sq_scan_apex(db_conn_t *c, const int64_t *domain_id, db_apex_cb cb, v
                   "CROSS JOIN records g ON g.domain_id = n.domain_id AND g.type IN ('A', 'AAAA') AND g.disabled = 0 AND g.name = rtrim(n.content, '.') COLLATE NOCASE " \
                   "WHERE n.type = 'NS' AND n.disabled = 0 "
 #define AX_IN_ZONE "AND (lower(rtrim(n.content, '.')) = lower(d.name) OR substr(lower(rtrim(n.content, '.')), -(length(d.name) + 1)) = '.' || lower(d.name)) "
-    int ret = prep(c, slot, domain_id ? AX_SOA_NS "AND r.domain_id = ?1 UNION ALL " AX_GLUE_1 "AND n.domain_id = ?1 " AX_IN_ZONE "ORDER BY 1, 5"
-                                      : AX_SOA_NS "UNION ALL " AX_GLUE_1 AX_IN_ZONE "ORDER BY 1, 5");
+    /* D1a step 7: the address rows of the NS targets that are NOT inside the zone, from any zone of the source (the NOTIFY the Backend sends while the zone is out of memory
+     * needs them): the row is the zone's (n.domain_id) and the name is the target's.  g.name = lower(...) is an equality on records(name, type) (PowerDNS stores names in lower
+     * case; a name stored with upper case letters is not found), one lookup per NS row. */
+#define AX_XADDR "SELECT n.domain_id, g.type, g.content, g.ttl, g.id, g.name FROM records n CROSS JOIN domains d ON d.id = n.domain_id AND n.name = d.name COLLATE NOCASE " \
+                 "CROSS JOIN records g ON g.name = lower(rtrim(n.content, '.')) AND g.type IN ('A', 'AAAA') AND g.disabled = 0 " \
+                 "WHERE n.type = 'NS' AND n.disabled = 0 AND NOT (lower(rtrim(n.content, '.')) = lower(d.name) OR substr(lower(rtrim(n.content, '.')), -(length(d.name) + 1)) = '.' || lower(d.name)) "
+    int ret = prep(c, slot, domain_id ? AX_SOA_NS "AND r.domain_id = ?1 UNION ALL " AX_GLUE_1 "AND n.domain_id = ?1 " AX_IN_ZONE "UNION ALL " AX_XADDR "AND n.domain_id = ?1 " "ORDER BY 1, 5"
+                                      : AX_SOA_NS "UNION ALL " AX_GLUE_1 AX_IN_ZONE "UNION ALL " AX_XADDR "ORDER BY 1, 5");
     if (ret != 0) return ret;
     sqlite3_stmt *st = *slot;
     rearm(st);

@@ -326,6 +326,18 @@ size_t pdns_apex_addr(uint16_t type, const char *content, uint8_t out[16]) {
     return inet_pton(type == 1 ? AF_INET : AF_INET6, content, out) == 1 ? (type == 1 ? 4u : 16u) : 0;
 }
 
+int pdns_zone_set_notify_addrs(pdns_zone_t *z, const uint8_t *naddrs, size_t len) {
+    free(z->sum_naddr);
+    z->sum_naddr = NULL;
+    z->sum_naddr_len = 0;
+    if (len == 0) return 0;
+    z->sum_naddr = malloc(len);
+    if (!z->sum_naddr) return -1;
+    memcpy(z->sum_naddr, naddrs, len);
+    z->sum_naddr_len = len;
+    return 0;
+}
+
 int pdns_zone_set_apex(pdns_zone_t *z, const char *mname, const char *rname, uint32_t minimum, uint32_t soa_ttl, uint32_t ns_ttl, const char *ns_lf,
                        const uint8_t *glue, size_t glue_len) {
     size_t lm = strlen(mname), lr = strlen(rname), ln = strlen(ns_lf);
@@ -370,6 +382,7 @@ void pdns_zone_free(pdns_zone_t *z) {
     if (!z) return;
     if (z->arena_ready) zone_arena_destroy(&z->arena);
     free(z->sum_apex);
+    free(z->sum_naddr);
     free(z->text);
     free(z->line_off);
     free(z->line_id);
@@ -2036,7 +2049,8 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
          (kdb_enc_name(&enc, 15, z->sum_mname) != 0 || kdb_enc_name(&enc, 16, z->sum_rname) != 0 || kdb_enc_u32(&enc, 17, z->sum_minimum) != 0 ||
           kdb_enc_u32(&enc, 18, z->sum_soa_ttl) != 0 || kdb_enc_u32(&enc, 19, z->sum_ns_ttl) != 0 ||
           kdb_enc_bytes(&enc, 20, (const uint8_t *)z->sum_ns, strlen(z->sum_ns)) != 0 ||
-          (z->sum_glue_len > 0 && kdb_enc_bytes(&enc, 21, z->sum_glue, z->sum_glue_len) != 0))) ||
+          (z->sum_glue_len > 0 && kdb_enc_bytes(&enc, 21, z->sum_glue, z->sum_glue_len) != 0) ||
+          (z->sum_naddr_len > 0 && kdb_enc_bytes(&enc, 22, z->sum_naddr, z->sum_naddr_len) != 0))) ||
         kdb_enc_end(&enc) != 0 ||
         emit_msg(&eu) != 0) {
         snprintf(err, errlen, "zone '%s': ZONE_BEGIN could not be encoded or sent", z->name);

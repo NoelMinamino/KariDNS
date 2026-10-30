@@ -107,7 +107,9 @@ static inline void db_list_add(char *list, size_t cap, unsigned *n, const char *
 typedef int (*db_zone_cb)(void *ud, const db_zone_row_t *row);
 /* D1a step 6: the enabled SOA and NS records at the apex of a zone (the name of the record is the name of the domain), for the summary of a zone; and
  * the enabled A and AAAA records of the zone whose name is the target of one of its apex NS records, when that target is at or below the apex (the
- * glue, RFC 2181 9; the comparison of the names ignores case and a trailing dot of the NS target).  ORDER BY domain_id, id. */
+ * glue, RFC 2181 9; the comparison of the names ignores case and a trailing dot of the NS target), and (D1a step 7) the enabled A and AAAA records, in any zone of the
+ * source, whose name is the target of one of its apex NS records when that target is NOT inside the zone (the row's domain_id is the zone with the NS record, name
+ * is the target's; the Backend sends NOTIFY to these addresses while the zone is out of memory; names are matched in lower case).  ORDER BY domain_id, id. */
 typedef struct {
     int64_t domain_id;
     bool is_soa;                                /* SOA (else NS, or an address: addr_type != 0) */

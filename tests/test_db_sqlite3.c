@@ -2223,22 +2223,82 @@ static void test_scan_apex_glue(void) {
     if (!c) return;
     ap_t a;
     memset(&a, 0, sizeof(a));
-    CHECK(db_driver_sqlite3.scan_apex(c, NULL, ap_collect, &a) == 0 && a.n == 9);
-    if (a.n == 9) {
+    CHECK(db_driver_sqlite3.scan_apex(c, NULL, ap_collect, &a) == 0 && a.n == 13);
+    if (a.n == 13) {
         CHECK(a.dom[0] == 1 && a.soa[0] && a.at[0] == 0 && strcmp(a.name[0], "g1.test") == 0);
         CHECK(a.dom[1] == 1 && !a.soa[1] && a.at[1] == 0 && strcmp(a.content[1], "ns1.g1.test.") == 0);
         CHECK(a.dom[2] == 1 && a.at[2] == 0 && strcmp(a.content[2], "NS2.G1.TEST") == 0 && a.at[3] == 0 && strcmp(a.content[3], "ns3.other.example") == 0);
         CHECK(a.at[4] == 28 && strcmp(a.name[4], "ns1.g1.test") == 0 && strcmp(a.content[4], "2001:db8::1") == 0 && a.ttl[4] == 600);
         CHECK(a.at[5] == 1 && strcmp(a.name[5], "ns1.g1.test") == 0 && strcmp(a.content[5], "192.0.2.1") == 0 && a.ttl[5] == 300);
         CHECK(a.at[6] == 1 && strcmp(a.name[6], "ns2.g1.test") == 0 && strcmp(a.content[6], "192.0.2.2") == 0 && a.ttl_null[6]);
-        CHECK(a.dom[7] == 2 && a.soa[7] && a.dom[8] == 2 && !a.soa[8] && a.at[8] == 0);       /* (zone 2: its SOA and its apex NS row, no address: the target is not inside zone 2) */
+        /* (D1a step 7: the address of an NS target outside the zone, wherever it is, comes with the zone that has the NS row, in id order) */
+        CHECK(a.dom[7] == 1 && a.at[7] == 1 && strcmp(a.name[7], "ns3.other.example") == 0 && strcmp(a.content[7], "192.0.2.3") == 0);
+        CHECK(a.dom[8] == 2 && a.at[8] == 28 && strcmp(a.name[8], "ns1.g1.test") == 0 && a.dom[9] == 2 && a.at[9] == 1 && strcmp(a.content[9], "192.0.2.1") == 0);
+        CHECK(a.dom[10] == 2 && a.soa[10] && a.dom[11] == 2 && !a.soa[11] && a.at[11] == 0);       /* (zone 2: its SOA and its apex NS row) */
+        CHECK(a.dom[12] == 2 && a.at[12] == 1 && strcmp(a.content[12], "192.0.2.77") == 0);          /* (the target is not inside zone 2: all three addresses of the name, also the one in zone 2) */
     }
     memset(&a, 0, sizeof(a));
     int64_t one = 1;
-    CHECK(db_driver_sqlite3.scan_apex(c, &one, ap_collect, &a) == 0 && a.n == 7 && a.dom[6] == 1 && a.at[6] == 1);
+    CHECK(db_driver_sqlite3.scan_apex(c, &one, ap_collect, &a) == 0 && a.n == 8 && a.dom[6] == 1 && a.at[6] == 1 && a.at[7] == 1);
     memset(&a, 0, sizeof(a));
     one = 2;
-    CHECK(db_driver_sqlite3.scan_apex(c, &one, ap_collect, &a) == 0 && a.n == 2 && a.dom[0] == 2 && a.dom[1] == 2);
+    CHECK(db_driver_sqlite3.scan_apex(c, &one, ap_collect, &a) == 0 && a.n == 5 && a.dom[0] == 2 && a.dom[4] == 2);
+    db_driver_sqlite3.close(c);
+    unlink(path);
+}
+
+/* D1a step 7: the addresses of the NS targets that are outside the zone, from any zone of the source (the NOTIFY the Backend sends while the zone is out of memory):
+ * the A and AAAA rows whose name is the target (lower case, a trailing dot of the NS content and its capitals ignored), enabled, with the domain_id of the zone that has
+ * the NS row; a target with no address gives no row; an in-zone target is not repeated (it is the glue's) */
+static void test_scan_apex_cross(void) {
+    printf("scan_apex: the addresses of the NS targets outside the zone\n");
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("apexcross.db", path, sizeof(path));
+    CHECK(db != NULL);
+    if (!db) return;
+    add_zone(db, 1, "c1.test", "NATIVE");
+    add_zone(db, 2, "prov.test", "NATIVE");
+    add_zone(db, 3, "c3.test", "NATIVE");
+    add_rec(db, 10, 1, "c1.test", "NS", "ns1.prov.test.", 3600, -1, 0, NULL);        /* (outside, a trailing dot) */
+    add_rec(db, 11, 1, "c1.test", "NS", "NS2.Prov.Test", 3600, -1, 0, NULL);         /* (capitals in the NS content) */
+    add_rec(db, 12, 1, "c1.test", "NS", "ns.c1.test", 3600, -1, 0, NULL);            /* (inside: the glue's, no cross row) */
+    add_rec(db, 13, 1, "c1.test", "NS", "ns-none.prov.test", 3600, -1, 0, NULL);     /* (outside, no address anywhere) */
+    add_rec(db, 14, 1, "c1.test", "NS", "ns-off.prov.test", 3600, -1, 1, NULL);      /* (a disabled NS row) */
+    add_rec(db, 20, 2, "ns1.prov.test", "A", "192.0.2.51", 300, -1, 0, NULL);
+    add_rec(db, 21, 2, "ns1.prov.test", "AAAA", "2001:db8::51", 600, -1, 0, NULL);
+    add_rec(db, 22, 2, "ns2.prov.test", "A", "192.0.2.52", -1, -1, 0, NULL);
+    add_rec(db, 23, 2, "ns1.prov.test", "A", "192.0.2.99", 300, -1, 1, NULL);        /* (disabled address) */
+    add_rec(db, 24, 2, "ns1.prov.test", "TXT", "not an address", 300, -1, 0, NULL);
+    add_rec(db, 25, 2, "ns-off.prov.test", "A", "192.0.2.4", 300, -1, 0, NULL);      /* (the NS row is disabled) */
+    add_rec(db, 26, 2, "www.prov.test", "A", "192.0.2.80", 300, -1, 0, NULL);        /* (not an NS target) */
+    add_rec(db, 27, 3, "ns1.prov.test", "A", "192.0.2.53", 300, -1, 0, NULL);        /* (a second zone with the same name: any zone of the source counts) */
+    add_rec(db, 28, 1, "ns.c1.test", "A", "192.0.2.5", 300, -1, 0, NULL);            /* (the glue) */
+    sqlite3_close(db);
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (!c) return;
+    ap_t a;
+    memset(&a, 0, sizeof(a));
+    int64_t one = 1;
+    CHECK(db_driver_sqlite3.scan_apex(c, &one, ap_collect, &a) == 0);
+    int cross = 0, glue = 0, ns = 0;
+    bool a51 = false, a6 = false, a52 = false, a53 = false;
+    for (size_t i = 0; i < a.n; i++) {
+        if (a.at[i] == 0) { ns += !a.soa[i]; continue; }
+        if (strcmp(a.name[i], "ns.c1.test") == 0) { glue++; continue; }
+        cross++;
+        CHECK(a.dom[i] == 1);                                                           /* (the zone that has the NS row) */
+        a51 |= strcmp(a.content[i], "192.0.2.51") == 0 && a.at[i] == 1 && a.ttl[i] == 300;
+        a6 |= strcmp(a.content[i], "2001:db8::51") == 0 && a.at[i] == 28;
+        a52 |= strcmp(a.content[i], "192.0.2.52") == 0 && a.ttl_null[i];
+        a53 |= strcmp(a.content[i], "192.0.2.53") == 0;
+    }
+    CHECK(ns == 4 && glue == 1 && cross == 4 && a51 && a6 && a52 && a53);           /* (not the disabled address, the TXT, the name of the disabled NS or the unrelated name) */
+    memset(&a, 0, sizeof(a));
+    CHECK(db_driver_sqlite3.scan_apex(c, NULL, ap_collect, &a) == 0);
+    size_t n_c = 0;
+    for (size_t i = 0; i < a.n; i++) n_c += a.dom[i] == 1 && a.at[i] != 0 && strcmp(a.name[i], "ns.c1.test") != 0;
+    CHECK(n_c == 4);
     db_driver_sqlite3.close(c);
     unlink(path);
 }
@@ -2267,6 +2327,7 @@ int main(int argc, char **argv) {
     test_find_zone_index();
     test_scan_apex();
     test_scan_apex_glue();
+    test_scan_apex_cross();
     test_zone_soa_rows();
     test_snapshot();
     test_busy();

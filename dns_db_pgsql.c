@@ -898,6 +898,11 @@ static int al_row(db_conn_t *c, PGresult *r, int i, void *ud) {
                   "JOIN records g ON g.domain_id = n.domain_id AND g.type IN ('A', 'AAAA') AND g.disabled = false AND lower(g.name) = lower(rtrim(n.content, '.')) " \
                   "WHERE n.type = 'NS' AND n.disabled = false "
 #define APEX_IN_ZONE "AND (lower(rtrim(n.content, '.')) = lower(d.name) OR right(lower(rtrim(n.content, '.')), length(d.name) + 1) = '.' || lower(d.name)) "
+/* D1a step 7: the address rows of the NS targets that are NOT inside the zone, from any zone of the source, for the NOTIFY the Backend sends while the zone is out of memory:
+ * the row is the zone's (n.domain_id), the name the target's.  g.name = lower(...) uses the index on records(name) (PowerDNS stores names in lower case). */
+#define APEX_XADDR "SELECT n.domain_id, g.type, g.content, g.ttl, g.id, g.name FROM records n JOIN domains d ON d.id = n.domain_id AND lower(n.name) = lower(d.name) " \
+                   "JOIN records g ON g.name = lower(rtrim(n.content, '.')) AND g.type IN ('A', 'AAAA') AND g.disabled = false " \
+                   "WHERE n.type = 'NS' AND n.disabled = false AND NOT (lower(rtrim(n.content, '.')) = lower(d.name) OR right(lower(rtrim(n.content, '.')), length(d.name) + 1) = '.' || lower(d.name)) "
 
 static int pg_scan_apex(db_conn_t *c, const int64_t *domain_id, db_apex_cb cb, void *ud) {
     al_t l = { cb, ud };
@@ -905,9 +910,9 @@ static int pg_scan_apex(db_conn_t *c, const int64_t *domain_id, db_apex_cb cb, v
         char p[32];
         snprintf(p, sizeof(p), "%lld", (long long)*domain_id);
         const char *pv[1] = { p };
-        return pg_scan(c, "scan_apex", APEX_COLS "AND r.domain_id = $1::bigint UNION ALL " APEX_GLUE "AND n.domain_id = $1::bigint " APEX_IN_ZONE "ORDER BY 1, 5", 1, pv, al_row, &l);
+        return pg_scan(c, "scan_apex", APEX_COLS "AND r.domain_id = $1::bigint UNION ALL " APEX_GLUE "AND n.domain_id = $1::bigint " APEX_IN_ZONE "UNION ALL " APEX_XADDR "AND n.domain_id = $1::bigint " "ORDER BY 1, 5", 1, pv, al_row, &l);
     }
-    return pg_scan(c, "scan_apex", APEX_COLS "UNION ALL " APEX_GLUE APEX_IN_ZONE "ORDER BY 1, 5", 0, NULL, al_row, &l);
+    return pg_scan(c, "scan_apex", APEX_COLS "UNION ALL " APEX_GLUE APEX_IN_ZONE "UNION ALL " APEX_XADDR "ORDER BY 1, 5", 0, NULL, al_row, &l);
 }
 
 static int pg_scan_records_range(db_conn_t *c, int64_t lo, int64_t hi, db_record_cb cb, void *ud) {

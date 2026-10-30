@@ -250,6 +250,30 @@ static void send_glue_zone(int fd, kdb_enc_t *e, uint16_t view, const char *zone
     ch_send(fd, e);
 }
 
+/* D1a step 7: the summary of a zone in a batch whose apex has an NS name inside the zone (ns1.ZONE, index 0) and one outside it (ns1.prov.test., index 1), the
+ * glue of the first and (nidx != 0xFF) the NOTIFY addresses of tag 22 for the index nidx: an A record 192.0.2.77 and an AAAA record 2001:db8::77 */
+static void send_notify_zone(int fd, kdb_enc_t *e, uint16_t view, const char *zone, uint32_t serial, int64_t sid, uint8_t nidx) {
+    uint8_t dig[KDB_DIGEST_LEN] = { 0 };
+    char ns[300], mn[300];
+    snprintf(ns, sizeof(ns), "ns1.%s\nns1.prov.test.", zone);
+    snprintf(mn, sizeof(mn), "ns1.%s", zone);
+    const uint8_t gl[] = { 0, 1, 0, 0, 0x0e, 0x10, 192, 0, 2, 53 };
+    const uint8_t na[] = { nidx, 1, 192, 0, 2, 77, nidx, 28, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x77 };
+    kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
+    kdb_enc_u16(e, 1, view); kdb_enc_name(e, 2, zone); kdb_enc_i64(e, 3, sid); kdb_enc_u8(e, 4, KDB_ZK_PRIMARY);
+    kdb_enc_u32(e, 5, serial); kdb_enc_u32(e, 6, KDB_ZF_SUMMARY); kdb_enc_u64(e, 7, 0); kdb_enc_bytes(e, 8, dig, sizeof(dig));
+    kdb_enc_u32(e, 12, 4444); kdb_enc_u32(e, 13, 555); kdb_enc_u32(e, 14, 66666);
+    kdb_enc_name(e, 15, mn); kdb_enc_name(e, 16, "host.hosting.example."); kdb_enc_u32(e, 17, 300); kdb_enc_u32(e, 18, 900); kdb_enc_u32(e, 19, 3600);
+    kdb_enc_bytes(e, 20, (const uint8_t *)ns, strlen(ns));
+    kdb_enc_bytes(e, 21, gl, sizeof(gl));
+    if (nidx != 0xFF) kdb_enc_bytes(e, 22, na, sizeof(na));
+    kdb_enc_end(e);
+    kdb_enc_begin(e, KDB_T_ZONE_END);
+    kdb_enc_u64(e, 1, 0);
+    kdb_enc_end(e);
+    ch_send(fd, e);
+}
+
 static void send_failed(int fd, kdb_enc_t *e, uint16_t view, const char *zone, uint64_t req) {
     kdb_enc_begin(e, KDB_T_ZONE_FAILED);
     kdb_enc_u16(e, 1, view); kdb_enc_name(e, 2, zone); kdb_enc_i64(e, 3, 0); kdb_enc_str(e, 4, "no such zone in the database"); kdb_enc_u64(e, 5, req);
@@ -1195,6 +1219,89 @@ int main(void) {
             sl = db_ingest_status(NULL, NULL, st, sizeof(st));
             const char *p = sl ? strstr(st, "issued=") : NULL;
             CHECK(p != NULL && strtoull(p + 7, NULL, 10) > 0);
+        }
+        /* -- D1a step 7: the NOTIFY of a zone whose data is out of memory.  A summary of a zone the directory knew with another serial queues (view, zone) for
+         *    the control thread once the apex of the new version is here (the loader's addresses of the NS hosts outside the zone are kept with the apex when the
+         *    zone sends NOTIFY to its NS hosts); a zone seen for the first time, or the same serial again, queues nothing; the body of a zone that was out of memory
+         *    with another serial than the directory had queues it too (dns_db_install.c sends no NOTIFY for an entry that is new) */
+        {
+            char qv[KARIDNS_VIEW_NAME_MAX], qz[256];
+            uint64_t nq0, nd0, nq1, nd1;
+            while (dbreg_notify_pop(qv, sizeof(qv), qz, sizeof(qz))) {}                 /* (what the earlier parts of this test queued: summaries with new serials) */
+            dbreg_notify_stats(&nq0, &nd0);
+            static const struct { uint32_t serial; uint8_t nidx; const char *notify; int want_queue; int want_naddr; const char *what; } steps[] = {
+                { 5, 1, "", 0, 24, "a zone seen for the first time: no NOTIFY, the addresses are kept (24 octets: an A and an AAAA record)" },
+                { 6, 1, "", 1, 24, "a new serial: queued once the apex of the new version is here" },
+                { 6, 1, "", 0, 24, "the same serial again: nothing" },
+                { 7, 0, "", 1, 0, "an address list for a name inside the zone (the glue's): the list is left out, the apex stays" },
+                { 8, 1, "notify explicit;", 1, 0, "notify explicit: no NS addresses are kept (the NS hosts are not notified)" },
+                { 9, 1, "notify no;", 1, -1, "notify no: no apex (the control thread sends nothing)" },
+            };
+            for (size_t si = 0; si < sizeof(steps) / sizeof(steps[0]); si++) {
+                static server_config_t cfgN;
+                char txt[600];
+                snprintf(txt, sizeof(txt), "options { %s database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; }; };\n"
+                         "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", steps[si].notify);
+                CHECK(parse_named_conf(txt, &cfgN) == 0);
+                cfgN.database.memory_limit = 1ull << 40;
+                cfgN.database.transfer_fetch_timeout_ms = 1500;
+                atomic_store_explicit(&g_config_db.active, &cfgN, memory_order_release);
+                kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+                kdb_enc_u64(&e, 1, 40 + si); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
+                kdb_enc_end(&e);
+                ch_send(a[0], &e);
+                send_notify_zone(a[0], &e, 0, "nt.test.", steps[si].serial, 7001, steps[si].nidx);
+                kdb_enc_begin(&e, KDB_T_BATCH_END);
+                kdb_enc_u64(&e, 1, 40 + si); kdb_enc_u32(&e, 2, 1); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+                kdb_enc_end(&e);
+                ch_send(a[0], &e);
+                int rst = -1;
+                while (ch_next(&mainc, &m, 10000) && m.type != KDB_T_BATCH_RESULT)
+                    if (m.type == KDB_T_ZONE_RESULT) rst = m.u.zone_result.status;
+                CHECK(rst == KDB_ST_APPLIED);
+                dbreg_notify_stats(&nq1, &nd1);
+                CHECK(nq1 == nq0 + (uint64_t)steps[si].want_queue && nd1 == nd0);
+                nq0 = nq1;
+                if (steps[si].want_queue) {
+                    CHECK(dbreg_notify_pop(qv, sizeof(qv), qz, sizeof(qz)) && strcmp(qv, "default") == 0 && strcmp(qz, "nt.test.") == 0);
+                }
+                CHECK(!dbreg_notify_pop(qv, sizeof(qv), qz, sizeof(qz)));
+                zdir_elem_t *ne = elem_of("default", "nt.test.");
+                const zdir_apex_t *nap = ne ? atomic_load(&ne->apex) : NULL;
+                CHECK(ne != NULL && zdir_entry(ne) == NULL && ne->serial == steps[si].serial);
+                if (steps[si].want_naddr < 0) {
+                    CHECK(nap == NULL);
+                } else {
+                    CHECK(nap != NULL && nap->serial == steps[si].serial && nap->n_ns == 2 && nap->glue_len == 10 && nap->naddr_len == steps[si].want_naddr);
+                    if (nap && steps[si].want_naddr == 24) {
+                        const uint8_t *np = nap->data + nap->mname_len + nap->rname_len + nap->ns_len + nap->glue_len;
+                        static const uint8_t want[24] = { 1, 1, 192, 0, 2, 77, 1, 28, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x77 };
+                        CHECK(memcmp(np, want, 24) == 0);
+                    }
+                }
+                printf("  (%s)\n", steps[si].what);
+            }
+            /* the body of a zone that is out of memory, with another serial than the directory had: the entry that is installed is new (no NOTIFY from the install),
+             * so the registry queues the zone; the same serial queues nothing */
+            atomic_store_explicit(&g_config_db.active, &cfgX, memory_order_release);
+            usleep(300000);
+            CHECK(zdir_entry(xe) == NULL && xe->serial == 12);
+            CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ);
+            send_zone(f[0], &e, 0, "r.test.", 12, m.u.fetch_req.request_id, 11);
+            CHECK(wake_next(&k, 5000) && !k.failed);
+            dbreg_notify_stats(&nq1, &nd1);
+            CHECK(zdir_entry(xe) != NULL && nq1 == nq0 && !dbreg_notify_pop(qv, sizeof(qv), qz, sizeof(qz)));
+            CHECK(dbreg_test_evict("default", "r.test."));
+            for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(50000);
+            CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ);
+            send_zone(f[0], &e, 0, "r.test.", 13, m.u.fetch_req.request_id, 11);              /* (the loader has a newer version than the directory) */
+            CHECK(wake_next(&k, 5000) && !k.failed);
+            dbreg_notify_stats(&nq1, &nd1);
+            CHECK(zdir_entry(xe) != NULL && nq1 == nq0 + 1 && dbreg_notify_pop(qv, sizeof(qv), qz, sizeof(qz)) && strcmp(qz, "r.test.") == 0);
+            CHECK(dbreg_test_evict("default", "r.test."));
+            for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(50000);
         }
         /* back to the configuration the tests that follow expect */
         atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);

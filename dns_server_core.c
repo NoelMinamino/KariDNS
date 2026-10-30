@@ -3523,6 +3523,27 @@ static void control_db_results(void) {
   }
 }
 
+/* D1a step 7 (design 7): the zones the ingest thread queued for a NOTIFY (dbreg_notify_pop()): a zone whose serial changed while its data is out of memory (the
+ * apex of the new summary is here), or whose data came into memory with another serial.  The zone is looked up in the current snapshot; one that is in memory is
+ * sent from its entry, as a reload does, one that is not from its apex (notify_send_nonresident()).  At most 256 a tick; the NOTIFY rate decides the pace after
+ * that.  The control thread, which owns the table of NOTIFYs awaiting an answer. */
+static void control_zone_notify_queue(void) {
+  char view[KARIDNS_VIEW_NAME_MAX], zone[256];
+  for (int n = 0; n < 256 && dbreg_notify_pop(view, sizeof(view), zone, sizeof(zone)); n++) {
+    rcu_aux_read_lock();
+    zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
+    if (snap) {
+      view_snapshot_t *v = snapshot_find_view(snap, view);
+      zdir_elem_t *el = v ? zdir_find_exact(v, zone) : NULL;
+      zone_db_entry_t *e = el ? zdir_entry(el) : NULL;
+      if (e) send_notify_to_all(e);
+      else if (el) notify_send_nonresident(el, v->name);
+      release_zone_snapshot(snap);
+    }
+    rcu_aux_read_unlock();
+  }
+}
+
 /* B6a: parked clients whose db-reload-timeout has passed get an error; the request is forgotten */
 static void control_park_timeouts(time_t now) {
   ctrl_client_t *c = g_ctrl_clients;
@@ -4299,6 +4320,7 @@ void *control_thread_func(void *arg) {
 
         control_db_results(); /* an answer whose wake-up was missed */
         control_park_timeouts(now);
+        control_zone_notify_queue(); /* D1a step 7: NOTIFY of zones whose data is out of memory */
         notify_retransmit_due(now); /* RFC 1996 §3.6: 応答の無い NOTIFY の再送 */
 
         if (gc_has_unstarted()) gc_start_pending();       /* a snapshot cleanup thread that could not be started is tried again */

@@ -179,6 +179,8 @@ typedef struct pdns_zone_s {
     uint32_t sum_minimum, sum_soa_ttl, sum_ns_ttl;
     const uint8_t *sum_glue;        /* the glue of the apex (tag 21 of ZONE_BEGIN), inside sum_apex; NULL / 0: none */
     size_t sum_glue_len;
+    uint8_t *sum_naddr;             /* D1a step 7: the addresses of the NS targets outside the zone (tag 22 of ZONE_BEGIN), malloc; NULL / 0: none (pdns_zone_set_notify_addrs()) */
+    size_t sum_naddr_len;
     char *nsec3param;               /* NSEC3PARAM metadata (first row), NULL if none */
     presigned_mode_t presigned_mode;   /* PS_NSEC3 / PS_NSEC: the chain was rebuilt; PS_NONE: served as stored */
     size_t n_synth;                 /* records presigned_rebuild() added at the end of arena.records */
@@ -247,6 +249,9 @@ bool pdns_apex_name(const char *raw, char out[DNS_NAME_TEXT_SIZE]);
  * ZONE_BEGIN; none when 0).  Everything is copied.  -1: out of memory. */
 int pdns_zone_set_apex(pdns_zone_t *z, const char *mname, const char *rname, uint32_t minimum, uint32_t soa_ttl, uint32_t ns_ttl, const char *ns_lf,
                        const uint8_t *glue, size_t glue_len);
+/* D1a step 7: give the summary the addresses of its NS targets that are outside the zone (records of tag 22 of ZONE_BEGIN: ns index u8 | type u8 | address; sent only
+ * with an apex).  Copied; len 0 drops them.  -1: out of memory. */
+int pdns_zone_set_notify_addrs(pdns_zone_t *z, const uint8_t *naddrs, size_t len);
 /* D1a step 6 (in-zone glue): the address of an A (type 1) or AAAA (type 28) record as the octets of its RDATA (RFC 1035 3.4.1, RFC 3596 2.2): 4 or 16, 0 if the
  * text is not an address of that kind. */
 size_t pdns_apex_addr(uint16_t type, const char *content, uint8_t out[16]);

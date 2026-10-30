@@ -48,7 +48,7 @@ static const kdb_tspec_t sp_zone_begin[] = {
     S(KT_BYTES, KS_REQ | KS_EXACT, KDB_DIGEST_LEN), S(KT_TEXT, 0, 65535), S(KT_STR, KS_NE, 255), S(KT_U64, 0, 0),
     S(KT_U32, 0, 0), S(KT_U32, 0, 0), S(KT_U32, 0, 0),
     S(KT_NAME, 0, 0), S(KT_NAME, 0, 0), S(KT_U32, KS_MAXV, 2147483647u), S(KT_U32, KS_MAXV, 2147483647u), S(KT_U32, KS_MAXV, 2147483647u),
-    S(KT_BYTES, 0, KDB_APEX_NS_BYTES), S(KT_BYTES, 0, KDB_APEX_GLUE_BYTES) };
+    S(KT_BYTES, 0, KDB_APEX_NS_BYTES), S(KT_BYTES, 0, KDB_APEX_GLUE_BYTES), S(KT_BYTES, 0, KDB_NOTIFY_ADDR_BYTES) };
 static const kdb_tspec_t sp_zone_end[] = { S(KT_U64, KS_REQ, 0) };
 static const kdb_tspec_t sp_zone_abort[] = { S(KT_STR, KS_REQ, 255) };
 static const kdb_tspec_t sp_zone_failed[] = { S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0), S(KT_STR, KS_REQ, 255), S(KT_U64, 0, 0) };
@@ -198,6 +198,24 @@ bool kdb_apex_glue_valid(const uint8_t *p, size_t len, unsigned ns_count) {
         if (per > KDB_APEX_GLUE_PER_NS) return false;
         last = idx;
         i += 6 + al;
+    }
+    return true;
+}
+
+/* The NOTIFY address list of a summary (tag 22): records ns index u8 | type u8 | address, the indexes (< ns_count) not decreasing, at most
+ * KDB_NOTIFY_ADDR_PER_NS records for one index, each address as long as its type says (RFC 1035 3.4.1, RFC 3596 2.2).  The bytes come from a loader that
+ * is not trusted. */
+bool kdb_notify_addrs_valid(const uint8_t *p, size_t len, unsigned ns_count) {
+    unsigned last = 0, per = 0;
+    for (size_t i = 0; i < len;) {
+        if (len - i < 2) return false;
+        unsigned idx = p[i], type = p[i + 1];
+        size_t al = type == 1 ? 4 : type == 28 ? 16 : 0;
+        if (al == 0 || len - i - 2 < al || idx >= ns_count || idx < last) return false;
+        per = idx == last && i != 0 ? per + 1 : 1;
+        if (per > KDB_NOTIFY_ADDR_PER_NS) return false;
+        last = idx;
+        i += 2 + al;
     }
     return true;
 }
@@ -381,11 +399,14 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
             z->soa_expire = (uint32_t)V(14).u;
         }
         z->has_apex = false;
+        z->naddrs = NULL;
+        z->naddrs_len = 0;
         {
             unsigned np = 0;
             for (unsigned t = 15; t <= 20; t++) np += V(t).present ? 1u : 0u;
             if (np != 0 && np != 6) FAIL(why, wl, KDB_E_TLV_MISSING, "ZONE_BEGIN: the apex (tags 15 to 20) comes all together or not at all");
             if (V(21).present && np != 6) FAIL(why, wl, KDB_E_TLV_MISSING, "ZONE_BEGIN: the glue (tag 21) is part of the apex (tags 15 to 20)");
+            if (V(22).present && np != 6) FAIL(why, wl, KDB_E_TLV_MISSING, "ZONE_BEGIN: the NOTIFY addresses (tag 22) are part of the apex (tags 15 to 20)");
             if (np == 6) {
                 if (!(z->flags & KDB_ZF_SUMMARY) || !V(12).present)
                     FAIL(why, wl, KDB_E_RANGE, "ZONE_BEGIN: the apex of a zone is for a summary with the SOA timers only");
@@ -406,6 +427,12 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
                         FAIL(why, wl, KDB_E_RANGE, "ZONE_BEGIN: tag 21 is not a list of address records of the names of tag 20");
                     z->glue = V(21).p;
                     z->glue_len = (uint16_t)V(21).len;
+                }
+                if (V(22).present && V(22).len > 0) {
+                    if (!kdb_notify_addrs_valid(V(22).p, V(22).len, cnt))
+                        FAIL(why, wl, KDB_E_RANGE, "ZONE_BEGIN: tag 22 is not a list of address records of the names of tag 20");
+                    z->naddrs = V(22).p;
+                    z->naddrs_len = (uint16_t)V(22).len;
                 }
                 z->has_apex = true;
                 gname(z->soa_mname, &V(15));

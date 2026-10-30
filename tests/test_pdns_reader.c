@@ -2141,6 +2141,23 @@ static void test_summary_apex(void) {
         CHECK(pdns_apex_addr(1, "2001:db8::53", ad) == 0 && pdns_apex_addr(28, "192.0.2.53", ad) == 0 && pdns_apex_addr(1, "192.0.2.256", ad) == 0);
         CHECK(pdns_apex_addr(1, "", ad) == 0 && pdns_apex_addr(1, NULL, ad) == 0 && pdns_apex_addr(2, "192.0.2.53", ad) == 0);
     }
+    {   /* the NOTIFY addresses (tag 22, D1a step 7): copied, on the wire as given, replaced (len 0 drops them) by the next call */
+        static const uint8_t na[] = { 1, 1, 192, 0, 2, 77 };
+        pdns_zone_t *zn = pdns_zone_new("n.test", NULL);
+        pdns_zone_set_summary(zn, 4712, true, 7200, 3600, 1209600);
+        CHECK(pdns_zone_set_apex(zn, "ns1.n.test.", "host.n.test.", 300, 900, 3600, "ns1.n.test.\nns1.prov.test.", NULL, 0) == 0);
+        CHECK(pdns_zone_set_notify_addrs(zn, na, sizeof(na)) == 0 && zn->sum_naddr_len == sizeof(na));
+        CHECK(pdns_zone_finish(zn) == 0);
+        rt_buf_t bn = {0};
+        CHECK(pdns_zone_encode_kdb(zn, &p, rt_emit, &bn, err, sizeof(err)) == 0);
+        kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
+        CHECK(kdb_framer_feed(&f, bn.buf, bn.len) == KDB_OK && kdb_framer_next(&f, &fr) == KDB_OK);
+        CHECK(kdb_decode(&fr, KDB_VIEWS_ANY, &msg, why, sizeof(why)) == KDB_OK);
+        CHECK(msg.u.zone_begin.has_apex && msg.u.zone_begin.naddrs_len == sizeof(na) && memcmp(msg.u.zone_begin.naddrs, na, sizeof(na)) == 0);
+        CHECK(pdns_zone_set_notify_addrs(zn, NULL, 0) == 0 && zn->sum_naddr == NULL && zn->sum_naddr_len == 0);
+        free(bn.buf);
+        pdns_zone_free(zn);
+    }
     {   /* without the timers there is no apex on the wire (the Backend takes tags 15..20 with the timers only) */
         pdns_zone_t *z2 = pdns_zone_new("t.test", NULL);
         pdns_zone_set_summary(z2, 5, false, 0, 0, 0);

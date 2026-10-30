@@ -1837,6 +1837,65 @@ static void test_fetch_stream_machine(void) {
             }
             CHECK(kdb_apex_glue_valid(two, sizeof(two), 1) && !kdb_apex_glue_valid(ns1, sizeof(ns1), 1) && kdb_apex_glue_valid(NULL, 0, 1));
         }
+        /* the NOTIFY addresses (tag 22, D1a step 7): records ns index | type | address, the indexes below the number of names and not decreasing, at most 8 for one
+         * index, the address as long as its type says; part of the apex, with or without the glue */
+        {
+            static const uint8_t a1[] = { 1, 1, 192, 0, 2, 53 };                                                       /* ns 1: A 192.0.2.53 */
+            static const uint8_t a6[] = { 1, 28, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 };          /* ns 1: AAAA 2001:db8::53 */
+            uint8_t two[sizeof(a1) + sizeof(a6)], big[9 * sizeof(a1)], bad_type[sizeof(a1)], cut[sizeof(a1) - 1], ns0[sizeof(a1)], ns2[sizeof(a1)], back[2 * sizeof(a1)];
+            memcpy(two, a1, sizeof(a1)); memcpy(two + sizeof(a1), a6, sizeof(a6));
+            for (int k = 0; k < 9; k++) memcpy(big + k * sizeof(a1), a1, sizeof(a1));
+            memcpy(bad_type, a1, sizeof(a1)); bad_type[1] = 2;
+            memcpy(cut, a1, sizeof(cut));
+            memcpy(ns0, a1, sizeof(a1)); ns0[0] = 0;
+            memcpy(ns2, a1, sizeof(a1)); ns2[0] = 2;
+            memcpy(back, a1, sizeof(a1)); memcpy(back + sizeof(a1), ns0, sizeof(a1));
+            const struct { const char *what; const uint8_t *g; size_t gl; bool tag22; bool apex; bool glue; kdb_rc_t want; } nc[] = {
+                { "naddrs, an A record", a1, sizeof(a1), true, true, false, KDB_OK },
+                { "naddrs, A and AAAA", two, sizeof(two), true, true, false, KDB_OK },
+                { "naddrs next to the glue", a1, sizeof(a1), true, true, true, KDB_OK },
+                { "naddrs, empty", a1, 0, true, true, false, KDB_OK },
+                { "naddrs, nine records for one name", big, sizeof(big), true, true, false, KDB_E_RANGE },
+                { "naddrs, a type that is not an address", bad_type, sizeof(bad_type), true, true, false, KDB_E_RANGE },
+                { "naddrs, a record cut short", cut, sizeof(cut), true, true, false, KDB_E_RANGE },
+                { "naddrs, the indexes go back", back, sizeof(back), true, true, false, KDB_E_RANGE },
+                { "naddrs, an index that names no NS name", ns2, sizeof(ns2), true, true, false, KDB_E_RANGE },
+                { "naddrs without the apex", a1, sizeof(a1), true, false, false, KDB_E_TLV_MISSING },
+            };
+            static const uint8_t glue0[] = { 0, 1, 0, 0, 0x0e, 0x10, 192, 0, 2, 54 };
+            for (size_t i = 0; i < sizeof(nc) / sizeof(nc[0]); i++) {
+                kdb_enc_reset(&e);
+                kdb_enc_begin(&e, KDB_T_ZONE_BEGIN);
+                kdb_enc_u16(&e, 1, 1); kdb_enc_name(&e, 2, ZN); kdb_enc_i64(&e, 3, 5); kdb_enc_u8(&e, 4, KDB_ZK_PRIMARY); kdb_enc_u32(&e, 5, 9);
+                kdb_enc_u32(&e, 6, KDB_ZF_SUMMARY); kdb_enc_u64(&e, 7, 0); kdb_enc_bytes(&e, 8, zd, sizeof(zd)); kdb_enc_u64(&e, 11, 5);
+                kdb_enc_u32(&e, 12, 3600); kdb_enc_u32(&e, 13, 600); kdb_enc_u32(&e, 14, 1209600);
+                if (nc[i].apex) {
+                    kdb_enc_name(&e, 15, "ns1.hosting.example."); kdb_enc_name(&e, 16, "host.hosting.example.");
+                    kdb_enc_u32(&e, 17, 300); kdb_enc_u32(&e, 18, 900); kdb_enc_u32(&e, 19, 3600);
+                    kdb_enc_bytes(&e, 20, (const uint8_t *)"ns1.hosting.example.\nns2.hosting.example.", 41);
+                }
+                if (nc[i].glue) kdb_enc_bytes(&e, 21, glue0, sizeof(glue0));
+                if (nc[i].tag22) kdb_enc_bytes(&e, 22, nc[i].g, nc[i].gl);
+                kdb_enc_end(&e);
+                sess_t *ts = malloc(sizeof(*ts));
+                sess_init_fetch(ts, NULL);
+                CHECK_RC(nc[i].what, sess_feed(ts, e.buf, e.len, 0), nc[i].want);
+                if (nc[i].want == KDB_OK) {
+                    const kdb_zone_begin_t *zb = &ts->m.u.zone_begin;
+                    CHECK(zb->has_apex && zb->naddrs_len == nc[i].gl && (nc[i].gl == 0 ? zb->naddrs == NULL : memcmp(zb->naddrs, nc[i].g, nc[i].gl) == 0));
+                    CHECK(nc[i].glue ? zb->glue_len == sizeof(glue0) : zb->glue_len == 0);
+                }
+                free(ts);
+            }
+            CHECK(kdb_notify_addrs_valid(two, sizeof(two), 2) && !kdb_notify_addrs_valid(two, sizeof(two), 1) && kdb_notify_addrs_valid(NULL, 0, 1));
+            /* a zone without the tag has none */
+            kdb_enc_reset(&e); fz_begin(&e, 1, ZN, 0, KDB_ZF_SUMMARY, KDB_ZK_PRIMARY, 5);
+            sess_t *tn = malloc(sizeof(*tn));
+            sess_init_fetch(tn, NULL);
+            CHECK_RC("summary without the tags", sess_feed(tn, e.buf, e.len, 0), KDB_OK);
+            CHECK(tn->m.u.zone_begin.naddrs == NULL && tn->m.u.zone_begin.naddrs_len == 0);
+            free(tn);
+        }
         /* a zone without the tags has no apex */
         kdb_enc_reset(&e); fz_begin(&e, 1, ZN, 0, KDB_ZF_SUMMARY, KDB_ZK_PRIMARY, 5);
         sess_t *ts = malloc(sizeof(*ts));
@@ -1901,6 +1960,10 @@ static int gen_corpus_fetch(const char *dir) {
         {   /* (the glue of tag 21: an A and an AAAA record of the first name) */
             static const uint8_t gl[] = { 0, 1, 0, 0, 0x0e, 0x10, 192, 0, 2, 53, 0, 28, 0, 0, 0x0e, 0x10, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 };
             kdb_enc_bytes(&e, 21, gl, sizeof(gl));
+        }
+        {   /* (D1a step 7, the NOTIFY addresses of tag 22: an A and an AAAA record of the second name) */
+            static const uint8_t na[] = { 1, 1, 192, 0, 2, 77, 1, 28, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x77 };
+            kdb_enc_bytes(&e, 22, na, sizeof(na));
         }
         kdb_enc_end(&e);
         m_zone_end(&e, 0);

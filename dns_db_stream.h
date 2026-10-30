@@ -59,6 +59,10 @@
  *                     21 glue bytes<=2048 O (with 15..20): the addresses of the NS targets that are inside the zone, which the answer carries in Additional
  *                     (RFC 2181 9).  Records of  index u8 (the position of the name in tag 20) | type u8 (1 A, 28 AAAA) | ttl u32 (<= 2147483647) |
  *                     address (4 or 16 octets, RFC 1035 3.4.1, RFC 3596 2.2); the indexes do not decrease, at most 8 records for one index.
+ *                     22 naddrs bytes<=1152 O (with 15..20): the addresses of the NS targets that are NOT inside the zone, which the loader found in the database
+ *                     by name (the A and AAAA records of that name in any zone of the same source), for the NOTIFY the Backend sends (RFC 1996 3.2) when
+ *                     the zone changes while its data is out of memory.  Records of  index u8 (the position of the name in tag 20) | type u8 (1 A, 28 AAAA) |
+ *                     address (4 or 16 octets); the indexes do not decrease, at most 8 records for one index.  The Backend keeps them with the apex block.
  *   ZONE_DATA (5)     raw DNS message (<= 65,535 bytes), no TLV
  *   ZONE_END (6)      1 rr_count u64 R
  *   ZONE_ABORT (7)    1 reason str<=255 R
@@ -148,6 +152,8 @@ enum { KDB_ZK_PRIMARY = 0, KDB_ZK_SECONDARY, KDB_ZK_CATALOG };
 #define KDB_APEX_NS_BYTES 2047   /* ... and the bytes of their list (8 names of 253 characters and the separators) */
 #define KDB_APEX_GLUE_PER_NS 8   /* addresses of one NS target in the glue list */
 #define KDB_APEX_GLUE_BYTES 2048 /* ... and the bytes of the list (8 names, 8 AAAA records of 22 octets each: 1408) */
+#define KDB_NOTIFY_ADDR_PER_NS 8 /* D1a step 7: addresses of one NS target in the NOTIFY address list (tag 22) */
+#define KDB_NOTIFY_ADDR_BYTES 1152 /* ... and the bytes of the list (8 targets, 8 AAAA records of 18 octets each) */
 #define KDB_ZF_SUMMARY 0x8u     /* D1a, fetch stream: the zone's summary (serial, kind, settings), no ZONE_DATA, rr_count 0, zero digest */
 enum { KDB_ST_APPLIED = 0, KDB_ST_UNCHANGED, KDB_ST_REJECTED, KDB_ST_SHADOWED, KDB_ST_DELETED,
        KDB_ST_SEND_BODY,       /* D1a: SEND_BODY, to a summary (or to a zone body that was left out): the zone is in the Backend's memory in another version than the loader says, send it whole */
@@ -241,6 +247,8 @@ typedef struct {
     uint8_t ns_count;
     const uint8_t *glue;        /* tag 21 (validated by the decoder), NULL when there is none; points into the frame like ns_names */
     uint16_t glue_len;
+    const uint8_t *naddrs;      /* tag 22 (validated by the decoder), NULL when there is none; points into the frame */
+    uint16_t naddrs_len;
 } kdb_zone_begin_t;
 typedef struct {
     const uint8_t *body; uint32_t len;   /* the DNS message */
@@ -296,6 +304,8 @@ typedef struct {
 kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t view_count, kdb_msg_t *msg, char *why, size_t whylen);
 /* D1a step 6: is p a glue list as tag 21 of ZONE_BEGIN describes it, for an apex with ns_count NS names? */
 bool kdb_apex_glue_valid(const uint8_t *p, size_t len, unsigned ns_count);
+/* D1a step 7: is p a NOTIFY address list as tag 22 of ZONE_BEGIN describes it, for an apex with ns_count NS names? */
+bool kdb_notify_addrs_valid(const uint8_t *p, size_t len, unsigned ns_count);
 
 /* Repeated nested entries of CONFIG and INVENTORY.  The entries were validated by kdb_decode(); the iterator
  * checks again and simply ends on anything unexpected. */

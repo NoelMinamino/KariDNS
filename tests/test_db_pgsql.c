@@ -717,8 +717,15 @@ static void test_zone_soa(void) {
     Q("INSERT INTO domains (id, name, type) SELECT g, 'b' || g || '.test', 'NATIVE' FROM generate_series(1000, 3499) g");
     Q("INSERT INTO records (domain_id, name, type, content, ttl, disabled) SELECT g, 'b' || g || '.test', 'SOA', 'soa-b' || g, 60, false FROM generate_series(1100, 3499) g");
     Q("INSERT INTO records (domain_id, name, type, content, ttl, disabled) SELECT g, h || '.b' || g || '.test', 'A', '192.0.2.1', 60, false FROM generate_series(1000, 3499) g, generate_series(1, 4) h");
+    /* D1a step 7: the addresses of an NS target outside the zone, from any zone: b1000.test has the NS row ns.out.test, whose A and AAAA rows are in b1001.test
+     * (lower case, found); b1002.test has an NS row whose address row is stored with capitals (not found: names are matched in lower case, as PowerDNS stores them),
+     * a disabled address and a TXT row do not count */
+    Q("INSERT INTO records (domain_id, name, type, content, ttl, disabled) VALUES (1000, 'b1000.test', 'NS', 'ns.out.test.', 60, false), "
+      "(1001, 'ns.out.test', 'A', '192.0.2.61', 300, false), (1001, 'ns.out.test', 'AAAA', '2001:db8::61', 300, false), (1001, 'ns.out.test', 'A', '192.0.2.69', 300, true), "
+      "(1001, 'ns.out.test', 'TXT', 'text', 300, false), (1002, 'b1002.test', 'NS', 'ns.cap.test', 60, false), (1001, 'NS.CAP.test', 'A', '192.0.2.62', 300, false)");
     for (int pass = 0; pass < 2; pass++) {
         if (pass == 1) Q("ANALYZE domains; ANALYZE records");
+
         CHECK(D->begin_snapshot(c) == 0);
         memset(z, 0, sizeof(*z));
         CHECK(D->list_zones(c, cb_szone, z) == 0);
@@ -739,7 +746,17 @@ static void test_zone_soa(void) {
         CHECK(D->find_zone(c, "b2000.test", cb_szone, z) == 0 && z->n == 1 && z->id[0] == 2000 && !strcmp(z->soa[0], "soa-b2000"));
         memset(z, 0, sizeof(*z));
         CHECK(D->find_zone(c, "b1050.test", cb_szone, z) == 0 && z->n == 1 && z->id[0] == 1050 && z->soa_null[0]);
+        {
+            apx_t ap;
+            memset(&ap, 0, sizeof(ap));
+            int64_t k1000 = 1000, k1002 = 1002;
+            CHECK_MSG(D->scan_apex(c, &k1000, cb_apex, &ap) == 0 && ap.n == 3 && ap.naddr == 2, "pass %d: cross rows of b1000.test: %zu rows, %zu addresses", pass, ap.n, ap.naddr);
+            CHECK(ap.addr_at[0] == 1 && ap.addr_at[1] == 28 && !strcmp(ap.addr_name[0], "ns.out.test") && !strcmp(ap.addr_name[1], "ns.out.test"));
+            memset(&ap, 0, sizeof(ap));
+            CHECK_MSG(D->scan_apex(c, &k1002, cb_apex, &ap) == 0 && ap.n == 1 && ap.naddr == 0, "pass %d: cross rows of b1002.test: %zu rows", pass, ap.n);
+        }
         CHECK(D->end_snapshot(c) == 0);
+
     }
     D->close(c);
     free(z);

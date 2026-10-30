@@ -845,9 +845,94 @@ static bool notify_add_glue(const zone_image_t *img, const char *name, notify_de
   return found;
 }
 
-void send_notify_to_all(zone_db_entry_t *entry) {
-  const char *domain = entry->domain;
-  const char *view_name = entry->view_name;
+/* A zone in memory whose NS host is in another zone of the view that is out of memory (a provider's zone): the address is not in any image.  When the host is also
+ * one of the NS hosts of that zone and lies inside it, its address is in the glue of that zone's apex (D1a step 6), which is kept for a zone that notifies or
+ * transfers; the apex of the version the directory has is used.  A host that is not an NS host of its own zone has no address here (the loader's addresses come with the
+ * summary of the zone that has the NS record, not with the body).  true if an address was added. */
+static bool notify_add_sibling_apex(view_snapshot_t *view, const char *name, notify_dest_t *targets, int *count, int max, const tsig_key_t *tkey, uint16_t port) {
+  zdir_elem_t *pel = NULL;
+  (void)find_zone_for_query_ex(view, name, 0, &pel);
+  if (!pel || zdir_entry(pel)) return false;
+  const zdir_apex_t *ap = atomic_load_explicit(&pel->apex, memory_order_acquire);
+  if (!ap || ap->glue_len == 0 || ap->serial != zdir_serial(pel)) return false;
+  const uint8_t *ns = ap->data + ap->mname_len + ap->rname_len, *glue = ns + ap->ns_len;
+  bool found = false;
+  size_t off = 0;
+  for (unsigned k = 0; k < ap->n_ns && off < ap->ns_len; k++) {
+    size_t nl = 0;
+    while (off + nl < ap->ns_len && ns[off + nl] != 0) nl += (size_t)ns[off + nl] + 1;
+    nl++;
+    char tg[DNS_NAME_TEXT_SIZE];
+    size_t next;
+    bool ok = off + nl <= ap->ns_len && extract_wire_name_to_buffer(ns + off, nl, 0, &next, tg, sizeof(tg)) >= 0;
+    off += nl;
+    if (!ok || !domain_names_match_ci(tg, name)) continue;
+    for (size_t g = 0; g + 6 <= ap->glue_len;) {
+      size_t al = glue[g + 1] == 1 ? 4 : 16;
+      if (g + 6 + al > ap->glue_len) break;
+      char ip[INET6_ADDRSTRLEN];
+      if (glue[g] == k && inet_ntop(glue[g + 1] == 1 ? AF_INET : AF_INET6, glue + g + 6, ip, sizeof(ip))) {
+        notify_add_target(targets, count, max, glue[g + 1] == 1 ? AF_INET : AF_INET6, ip, port, tkey, NULL);
+        found = true;
+      }
+      g += 6 + al;
+    }
+  }
+  return found;
+}
+
+/* D1a step 7 (design 7): the NS hosts of a zone whose data is out of memory, from the apex block of its summary (zdir_apex_t), in the order send_notify_to_all() looks
+ * for the addresses of a host of the zone in memory: the glue of the apex (hosts inside the zone), the address in a zone of the view that is in memory (a sibling),
+ * and then the addresses the loader found in the database by name (hosts outside the zone, in a zone that may be out of memory too).  The apex must describe the
+ * version the directory has (a block of another version is not used: its NS set may be another). */
+static void notify_apex_targets(const zdir_elem_t *el, const zdir_apex_t *ap, view_snapshot_t *view, bool notify_to_soa, const tsig_key_t *key, uint16_t ns_port,
+                                notify_dest_t *targets, int *count, int max) {
+  if (ap->serial != zdir_serial(el) || ap->n_ns == 0) return;
+  char mname[DNS_NAME_TEXT_SIZE];
+  size_t next;
+  const bool have_m = extract_wire_name_to_buffer(ap->data, ap->mname_len, 0, &next, mname, sizeof(mname)) >= 0;
+  const uint8_t *ns = ap->data + ap->mname_len + ap->rname_len;
+  const uint8_t *glue = ns + ap->ns_len, *na = glue + ap->glue_len;
+  size_t off = 0;
+  for (unsigned k = 0; k < ap->n_ns && off < ap->ns_len; k++) {
+    size_t nl = 0;
+    while (off + nl < ap->ns_len && ns[off + nl] != 0) nl += (size_t)ns[off + nl] + 1;
+    nl++;
+    char tg[DNS_NAME_TEXT_SIZE];
+    bool ok = off + nl <= ap->ns_len && extract_wire_name_to_buffer(ns + off, nl, 0, &next, tg, sizeof(tg)) >= 0;
+    off += nl;
+    if (!ok || (have_m && !notify_to_soa && domain_names_match_ci(tg, mname))) continue;
+    bool found = false;
+    char ip[INET6_ADDRSTRLEN];
+    for (size_t g = 0; g + 6 <= ap->glue_len;) {              /* A. the glue: records of ns index u8 | type u8 | ttl u32 | address */
+      size_t al = glue[g + 1] == 1 ? 4 : 16;
+      if (g + 6 + al > ap->glue_len) break;
+      if (glue[g] == k && inet_ntop(glue[g + 1] == 1 ? AF_INET : AF_INET6, glue + g + 6, ip, sizeof(ip))) {
+        notify_add_target(targets, count, max, glue[g + 1] == 1 ? AF_INET : AF_INET6, ip, ns_port, key, NULL);
+        found = true;
+      }
+      g += 6 + al;
+    }
+    if (found) continue;
+    zone_db_entry_t *sib = view ? find_zone_in_view(view, tg) : NULL;      /* B. a sibling zone that is in memory */
+    if (sib) {
+      zone_version_t *sa = atomic_load_explicit(&sib->rcu.active, memory_order_acquire);
+      if (sa && sa->image && notify_add_glue(sa->image, tg, targets, count, max, key, ns_port)) continue;
+    }
+    for (size_t g = 0; g + 2 <= ap->naddr_len;) {              /* C. the loader's addresses: records of ns index u8 | type u8 | address */
+      size_t al = na[g + 1] == 1 ? 4 : 16;
+      if (g + 2 + al > ap->naddr_len) break;
+      if (na[g] == k && inet_ntop(na[g + 1] == 1 ? AF_INET : AF_INET6, na + g + 2, ip, sizeof(ip)))
+        notify_add_target(targets, count, max, na[g + 1] == 1 ? AF_INET : AF_INET6, ip, ns_port, key, NULL);
+      g += 2 + al;
+    }
+  }
+}
+
+/* The NOTIFY messages of a zone: entry is the zone in memory, or NULL and el is its directory element (the data is out of memory: the NS hosts come from the apex
+ * of its summary, the settings from the element).  The control thread only. */
+static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, const char *view_name) {
+  const char *domain = entry ? entry->domain : el->name;
   /* 制御スレッドだけが呼ぶ (応答待ちの表を持つため。他のスレッドは notify_request_send())。
    * 設定・スナップショット・arena を読むので、全体を読み取り区間に入れる (UDP の送信と TCP の交換を始めるだけで、待ちは無い)。*/
   rcu_aux_read_lock();
@@ -860,11 +945,21 @@ void send_notify_to_all(zone_db_entry_t *entry) {
   }
 
   /* DB のゾーンは dbcfg (DB のゾーンは active が無くても設定を持つ) */
-  const zone_config_t *zone = zone_entry_config(active, entry);
+  zone_config_t el_zc;                    /* a zone out of memory has its settings in the element (interned), as the query path reads them */
+  const zone_config_t *zone;
+  if (entry) {
+    zone = zone_entry_config(active, entry);
+  } else {
+    memset(&el_zc, 0, sizeof(el_zc));
+    el_zc.domain = (char *)el->name;
+    zone_ext_shared_t *esh = atomic_load_explicit(&((zdir_elem_t *)el)->sh, memory_order_acquire);
+    el_zc.ext = esh ? &esh->ext : NULL;
+    zone = &el_zc;
+  }
   /* notify (BIND 9.20 ARM): no = nothing is sent (also for `karictl notify`); primary-only = only for primary zones, so a secondary or
    * catalog member does not pass a transfer on; explicit = only the also-notify list, not the NS hosts of the zone */
   notify_mode_t mode = notify_mode_effective(active, zone, view_name);
-  if (mode == NOTIFY_MODE_NO || (mode == NOTIFY_MODE_PRIMARY_ONLY && zone_entry_ticks(entry))) {
+  if (mode == NOTIFY_MODE_NO || (mode == NOTIFY_MODE_PRIMARY_ONLY && entry && zone_entry_ticks(entry))) {
     if (snap) release_zone_snapshot(snap);
     if (active) release_config_snapshot(active);
     rcu_aux_read_unlock();
@@ -905,9 +1000,9 @@ void send_notify_to_all(zone_db_entry_t *entry) {
   view_snapshot_t *view = snap ? snapshot_find_view(snap, view_name) : NULL;
   /* the NS hosts are sent to at options { port } (BIND zone.c notify_find_address(): dns_adb_createfind(..., view->dstport, ...)) */
   const uint16_t ns_port = (uint16_t)config_target_port(active, 0);
-  zone_version_t *arena = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  zone_version_t *arena = entry ? atomic_load_explicit(&entry->rcu.active, memory_order_acquire) : NULL;
   const zone_image_t *img = arena && mode != NOTIFY_MODE_EXPLICIT ? arena->image : NULL;
-  uint32_t apex_id = img ? zone_image_find_name(img, entry->domain) : ZONE_IMAGE_NONE;
+  uint32_t apex_id = img ? zone_image_find_name(img, domain) : ZONE_IMAGE_NONE;
   if (apex_id != ZONE_IMAGE_NONE) {
     char mname_buf[DNS_NAME_TEXT_SIZE];
     const char *mname = NULL;
@@ -923,11 +1018,19 @@ void send_notify_to_all(zone_db_entry_t *entry) {
       // A. in-zone glue, B. otherwise the address in a sibling zone of the same view
       if (notify_add_glue(img, ns_target, targets, &ntargets, 64, key, ns_port)) continue;
       zone_db_entry_t *sib_entry = find_zone_in_view(view, ns_target);
-      if (!sib_entry || sib_entry == entry) continue;
+      if (!sib_entry) {                                    /* (a zone of the view that is out of memory: the glue of its apex, D1a step 7) */
+        if (entry && view) (void)notify_add_sibling_apex(view, ns_target, targets, &ntargets, 64, key, ns_port);
+        continue;
+      }
+      if (sib_entry == entry) continue;
       zone_version_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
       if (sib_arena && sib_arena->image)
         notify_add_glue(sib_arena->image, ns_target, targets, &ntargets, 64, key, ns_port);
     }
+  }
+  if (!entry && mode != NOTIFY_MODE_EXPLICIT) {
+    const zdir_apex_t *ap = atomic_load_explicit(&((zdir_elem_t *)el)->apex, memory_order_acquire);
+    if (ap) notify_apex_targets(el, ap, view, eff.notify_to_soa, key, ns_port, targets, &ntargets, 64);
   }
 
   for (int i = 0; i < ntargets; i++) {
@@ -964,12 +1067,17 @@ void send_notify_to_all(zone_db_entry_t *entry) {
     notify_send_to(domain, view_name, &targets[i].addr, has_src, src, tkey, &nr, g_notify_rate, tcp_only);
   }
 
-  if (ntargets > 0) {
+  if (entry && ntargets > 0) {
     atomic_fetch_add_explicit(&entry->observatory.notify_sent, ntargets, memory_order_relaxed);
     atomic_store_explicit(&entry->observatory.last_notify_time, (uint64_t)time(NULL), memory_order_relaxed);
   }
+  if (!entry) syslog(LOG_INFO, "[Notify] zone '%s' (data out of memory): NOTIFY to %d address(es)", domain, ntargets);
 
   if (snap) release_zone_snapshot(snap);
   if (active) release_config_snapshot(active);
   rcu_aux_read_unlock();
 }
+
+void send_notify_to_all(zone_db_entry_t *entry) { notify_send_zone(entry, NULL, entry->view_name); }
+
+void notify_send_nonresident(const zdir_elem_t *el, const char *view_name) { notify_send_zone(NULL, el, view_name); }

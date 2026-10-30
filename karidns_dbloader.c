@@ -152,11 +152,13 @@ static void drivers_list(char *out, size_t cap) {
 
 /* D1a step 6: the apex of a zone whose summary is sent: what the Backend answers an SOA question from while the zone is out of memory.  data: the SOA's
  * MNAME NUL RNAME NUL the NS targets separated by LF NUL (canonical absolute names), then glue_len octets of glue (the records of tag 21 of ZONE_BEGIN:
- * the addresses of the NS targets inside the zone) */
-typedef struct lapex { uint32_t minimum, soa_ttl, ns_ttl; uint16_t glue_len; char data[]; } lapex_t;
+ * the addresses of the NS targets inside the zone), then naddr_len octets of the addresses of the NS targets outside the zone (tag 22: records of ns index u8 |
+ * type u8 | address, found in the database by name, for the NOTIFY the Backend sends while the zone is out of memory) */
+typedef struct lapex { uint32_t minimum, soa_ttl, ns_ttl; uint16_t glue_len, naddr_len; char data[]; } lapex_t;
 static const char *lapex_rname(const lapex_t *a) { return a->data + strlen(a->data) + 1; }
 static const char *lapex_ns(const lapex_t *a) { const char *r = lapex_rname(a); return r + strlen(r) + 1; }
 static const uint8_t *lapex_glue(const lapex_t *a) { const char *n = lapex_ns(a); return (const uint8_t *)n + strlen(n) + 1; }
+static const uint8_t *lapex_naddr(const lapex_t *a) { return lapex_glue(a) + a->glue_len; }
 
 typedef struct {
     int64_t id;
@@ -1356,7 +1358,8 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
         pdns_zone_set_summary(z, zi->serial, zi->has_timers, zi->t_refresh, zi->t_retry, zi->t_expire);
         if (zi->apex && zi->has_timers) {
             if (pdns_zone_set_apex(z, zi->apex->data, lapex_rname(zi->apex), zi->apex->minimum, zi->apex->soa_ttl, zi->apex->ns_ttl, lapex_ns(zi->apex),
-                                   lapex_glue(zi->apex), zi->apex->glue_len) != 0)
+                                   lapex_glue(zi->apex), zi->apex->glue_len) != 0 ||
+                pdns_zone_set_notify_addrs(z, lapex_naddr(zi->apex), zi->apex->naddr_len) != 0)
                 w->oom = true;
         }
     }
@@ -1941,6 +1944,7 @@ static int db_err(ctx_t *x, int rc, const char *what) {
  * (main(), a test) can look at them; the next run starts empty. */
 /* ---- D1a step 6: the apex of the zones whose summary is sent ---- */
 #define APEX_ADR_MAX 128      /* address rows of one zone kept (8 targets of 8 addresses, twice for an NS target that is listed twice) */
+#define APEX_XADR_MAX 64      /* ... and of the addresses of NS targets outside the zone (8 targets of 8 addresses; more are not read) */
 typedef struct {
     ctx_t *x;
     zinfo_t *z;                       /* the zone being read (NULL: a zone whose summary is not sent) */
@@ -1954,6 +1958,8 @@ typedef struct {
     /* the addresses of the zone whose owner is an NS target, as the rows come (id order); matched with the targets when the zone is done (the NS rows can follow them) */
     unsigned n_adr;
     struct { uint8_t type, alen; uint32_t ttl; uint8_t addr[16]; char name[DNS_NAME_TEXT_SIZE]; } adr[APEX_ADR_MAX];
+    unsigned n_xadr;        /* the addresses of NS targets outside the zone (any zone of the source), as the rows come */
+    struct { uint8_t type, alen; uint8_t addr[16]; char name[DNS_NAME_TEXT_SIZE]; } xadr[APEX_XADR_MAX];
 } apex_acc_t;
 
 static zinfo_t *zinfo_by_id(ctx_t *x, int64_t id) {         /* x->zones is in domains.id order */
@@ -2006,15 +2012,47 @@ static int apex_glue_build(const apex_acc_t *a, const char *apex_name, uint8_t o
     return (int)len;
 }
 
+/* The addresses of the NS targets that are outside the zone, for the NOTIFY the Backend sends while the zone is out of memory (tag 22): for each such target (in
+ * the order of tag 20) its A and AAAA rows in id order, without a repeated address, at most KDB_NOTIFY_ADDR_PER_NS for one target (a NOTIFY to the first
+ * eight is enough; unlike the glue, more addresses do not take the apex away).  Returns the length written. */
+static size_t apex_naddr_build(const apex_acc_t *a, const char *apex_name, uint8_t out[KDB_NOTIFY_ADDR_BYTES]) {
+    size_t len = 0;
+    unsigned idx = 0;
+    for (const char *q = a->ns_lf; *q; idx++) {
+        const char *e = strchr(q, '\n');
+        size_t ql = e ? (size_t)(e - q) : strlen(q);
+        char target[DNS_NAME_TEXT_SIZE];
+        memcpy(target, q, ql);
+        target[ql] = '\0';
+        q = e ? e + 1 : q + ql;
+        if (domain_name_is_at_or_below(target, apex_name)) continue;
+        unsigned per = 0;
+        for (unsigned k = 0; k < a->n_xadr && per < KDB_NOTIFY_ADDR_PER_NS; k++) {
+            if (strcasecmp(a->xadr[k].name, target) != 0) continue;
+            bool dup = false;
+            for (unsigned j = 0; j < k && !dup; j++)
+                dup = strcasecmp(a->xadr[j].name, target) == 0 && a->xadr[j].type == a->xadr[k].type && memcmp(a->xadr[j].addr, a->xadr[k].addr, a->xadr[k].alen) == 0;
+            if (dup || len + 2 + a->xadr[k].alen > KDB_NOTIFY_ADDR_BYTES) continue;
+            out[len++] = (uint8_t)idx;
+            out[len++] = a->xadr[k].type;
+            memcpy(out + len, a->xadr[k].addr, a->xadr[k].alen);
+            len += a->xadr[k].alen;
+            per++;
+        }
+    }
+    return len;
+}
+
 static void apex_flush(apex_acc_t *a) {
     zinfo_t *z = a->z;
     a->z = NULL;
     if (!a->have || !z || z->apex || !a->soa || !a->ns_ok || a->n_ns == 0) return;
-    uint8_t glue[KDB_APEX_GLUE_BYTES];
+    uint8_t glue[KDB_APEX_GLUE_BYTES], naddr[KDB_NOTIFY_ADDR_BYTES];
     int gl = apex_glue_build(a, z->canon, glue);
     if (gl < 0) return;                                          /* more addresses than the summary carries: the zone is read for its SOA question */
+    size_t nal = apex_naddr_build(a, z->canon, naddr);
     size_t lm = strlen(a->mname), lr = strlen(a->rname);
-    lapex_t *p = malloc(sizeof(*p) + lm + lr + a->ns_len + 3 + (size_t)gl);
+    lapex_t *p = malloc(sizeof(*p) + lm + lr + a->ns_len + 3 + (size_t)gl + nal);
     if (!p) {
         a->oom = true;
         return;
@@ -2023,10 +2061,12 @@ static void apex_flush(apex_acc_t *a) {
     p->soa_ttl = a->soa_ttl;
     p->ns_ttl = a->ns_ttl;
     p->glue_len = (uint16_t)gl;
+    p->naddr_len = (uint16_t)nal;
     memcpy(p->data, a->mname, lm + 1);
     memcpy(p->data + lm + 1, a->rname, lr + 1);
     memcpy(p->data + lm + lr + 2, a->ns_lf, a->ns_len + 1);
     if (gl) memcpy(p->data + lm + lr + 3 + a->ns_len, glue, (size_t)gl);
+    if (nal) memcpy(p->data + lm + lr + 3 + a->ns_len + gl, naddr, nal);
     z->apex = p;
 }
 
@@ -2045,10 +2085,26 @@ static int apex_cb(void *ud, const db_apex_row_t *row) {
         a->ns_lf[0] = '\0';
         a->ns_ttl = 0;
         a->n_adr = 0;
+        a->n_xadr = 0;
     }
     if (!a->z || a->oom) return a->oom ? 1 : 0;
     uint32_t deft = a->x->opts.default_ttl ? a->x->opts.default_ttl : PDNS_DEFAULT_TTL;
     uint32_t ttl = row->ttl_null ? deft : (row->ttl < 0 ? 0 : row->ttl > PDNS_MAX_TTL ? PDNS_MAX_TTL : (uint32_t)row->ttl);
+    if (row->addr_type && row->name && a->z->canon) {           /* an address of a name outside the zone (the third part of the scan): for the NOTIFY the Backend sends */
+        char xn[DNS_NAME_TEXT_SIZE];
+        if (pdns_apex_name(row->name, xn) && !domain_name_is_at_or_below(xn, a->z->canon)) {
+            if (a->n_xadr < APEX_XADR_MAX) {
+                size_t xl = pdns_apex_addr(row->addr_type, row->content, a->xadr[a->n_xadr].addr);
+                if (xl != 0) {                                  /* (a row that is no address is of no use to a NOTIFY; the zone's own apex does not depend on it) */
+                    a->xadr[a->n_xadr].type = (uint8_t)row->addr_type;
+                    a->xadr[a->n_xadr].alen = (uint8_t)xl;
+                    snprintf(a->xadr[a->n_xadr].name, sizeof(a->xadr[0].name), "%s", xn);
+                    a->n_xadr++;
+                }
+            }
+            return 0;
+        }
+    }
     if (row->addr_type) {                                       /* an A or AAAA row of a name that is the target of an NS record of the zone */
         char on[DNS_NAME_TEXT_SIZE];
         if (a->n_adr == APEX_ADR_MAX || !row->name || !pdns_apex_name(row->name, on)) {
