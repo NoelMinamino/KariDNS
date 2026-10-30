@@ -974,8 +974,19 @@ static int acl_set_resolve(token_ctx_t *ctx, server_config_t *cfg, acl_set_t *s,
 
 /* After the parse: every zone { in-view "v"; } finds the zone it shares.  BIND (lib/isccfg/check.c, bin/named/server.c configure_zone()): the zone must be a
  * zone of a view that is defined earlier; a view cannot name itself.  Phase 1 of KariDNS shares the primary and secondary zone { } blocks of the
- * configuration (not catalog zones, program zones, catalog members or database zones).  The ACLs an in-view zone may write are the KariDNS
+ * configuration; phase 2 (D1a, design 9) also the zones of the database and the members of a catalog zone of the owner view, which are found in its directory
+ * at run time (zone_inview_t.db_target).  A catalog zone, a program zone and a forward zone themselves cannot be shared.  The ACLs an in-view zone may write are the KariDNS
  * in-view-settings view; with owner they are the same error BIND gives for any other option. */
+/* Can the view hold a zone that is not a zone { } block of the configuration: a zone of the database (the view takes the shared source or has its own, and has not
+ * said `database none`), or a member of a catalog zone */
+static bool view_may_have_dynamic_zones(const server_config_t *cfg, const view_config_t *v) {
+  if (v->catz_count > 0) return true;
+  for (const zone_config_t *z = v->zones; z; z = z->next)
+    if (z->is_catalog) return true;
+  if (v->database_none) return false;
+  return cfg->database.enabled;                 /* (a view's own database-file / database-schema needs the database block as well) */
+}
+
 static int in_view_resolve(token_ctx_t *ctx, server_config_t *cfg) {
   for (view_config_t *v = cfg->views; v; v = v->next) {
     for (zone_config_t *s = v->in_view_zones; s; s = s->next) {
@@ -990,6 +1001,17 @@ static int in_view_resolve(token_ctx_t *ctx, server_config_t *cfg) {
         }
       }
       if (!t) {
+        /* D1a phase 2 (design 9): the owner view is defined earlier and takes zones from the database, or has a catalog zone, so the zone may be one of those: it is
+         * looked up in the owner's directory when a query asks (a zone of the database comes and goes, so it cannot be checked here) */
+        const view_config_t *ov = NULL;
+        for (const view_config_t *tv = cfg->views; tv && tv != v; tv = tv->next)
+          if (strcasecmp(tv->name, iv->view) == 0) { ov = tv; break; }
+        if (ov && view_may_have_dynamic_zones(cfg, ov)) {
+          iv->target = NULL;
+          iv->db_target = true;
+          cfg->any_in_view = true;
+          continue;
+        }
         aml_report(ctx, iv->loc, what, "'in-view' zone '%.255s' does not exist in view '%.64s', or view '%.64s' is not yet defined",
                    s->domain, iv->view, iv->view);
         return -1;

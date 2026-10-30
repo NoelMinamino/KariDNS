@@ -2008,10 +2008,12 @@ static bool udp_park(udp_pass_t *w, const view_snapshot_t *view, const zdir_elem
   if (left <= 0) return false;
   /* the first query for the zone asks for it.  One that was woken and finds the zone out of memory again (taken out by the cache manager before the request could use
    * it) asks again: nothing is on its way (the state would be LOADING), and nobody else would wake it before its time is up. */
-  bool ask = (!w->woken || atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) == ZDIR_ST_ABSENT) && !park_has_wait(w->park, view->name, pel->name);
-  int32_t pi = park_udp(w->park, now, (uint32_t)left, view->name, pel->name, w->active_fd, ipc, req, len);
+  /* a zone that the view shares by in-view from the database of another view (D1a phase 2) is asked for, and woken, in the name of the view that holds it */
+  const char *hv = zdir_holder_view(view, pel);
+  bool ask = (!w->woken || atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) == ZDIR_ST_ABSENT) && !park_has_wait(w->park, hv, pel->name);
+  int32_t pi = park_udp(w->park, now, (uint32_t)left, hv, pel->name, w->active_fd, ipc, req, len);
   if (pi < 0) return false;
-  if (ask && !park_fetch_request(w->worker_idx, view->name, pel->name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL)) {
+  if (ask && !park_fetch_request(w->worker_idx, hv, pel->name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL)) {
     park_release(w->park, &w->park->e[pi]);            /* the request could not be handed over (ring full): nobody would ever wake it */
     return false;
   }
@@ -2856,7 +2858,7 @@ process_tcp_client: ;
               uint32_t out_limit = xfr_cfg_limit(cfg, XL_TRANSFERS_OUT);
               xfr_eff_t out_eff;
               /* the settings of the view that owns the zone, not of the view the client came through (a zone shared with in-view is one object) */
-              xfr_opts_effective(cfg, zcfg, entry ? entry->view_name : xfr_view->name, &out_eff);
+              xfr_opts_effective(cfg, zcfg, entry ? entry->view_name : zdir_holder_view(xfr_view, xfr_el), &out_eff);
               release_config_snapshot(cfg);
               if (!xfr_counter_acquire(&g_xfr_out_active, out_limit)) {
                 allowed = false; /* "Zone transfer requests in excess of the limit are refused" (ARM transfers-out) */
@@ -2899,7 +2901,7 @@ process_tcp_client: ;
                   args->entry = entry;
                   args->elem = entry ? NULL : xfr_el;
                   args->await = entry ? NULL : db_ingest_xfr_await;
-                  if (xfr_el) snprintf(args->view_name, sizeof(args->view_name), "%s", xfr_view->name);
+                  if (xfr_el) snprintf(args->view_name, sizeof(args->view_name), "%s", zdir_holder_view(xfr_view, xfr_el));
                   args->idle_out_secs = out_eff.xfer_idle_out;
                   args->time_out_secs = out_eff.xfer_time_out;
                   args->snap = snap;
@@ -3004,11 +3006,12 @@ process_tcp_client: ;
               int64_t pnow = park_now_ms();
               int64_t left = ctx_tcp->park_deadline_ms ? ctx_tcp->park_deadline_ms - pnow : (int64_t)park_timeout_ms;
               if (park_on && !ctx_tcp->not_ready_now && left > 0) {
+                const char *hv = zdir_holder_view(route.view, pel);          /* (the view that holds the zone: a zone shared by in-view from the database of another view is the owner's) */
                 bool ask = (ctx_tcp->park_deadline_ms == 0 || atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) == ZDIR_ST_ABSENT) &&
-                           !park_has_wait(&park, route.view->name, pel->name);       /* (as in udp_park(): a request that comes back and finds the zone out of memory again asks again) */
+                           !park_has_wait(&park, hv, pel->name);       /* (as in udp_park(): a request that comes back and finds the zone out of memory again asks again) */
                 uint32_t cidx = (uint32_t)(ctx_tcp - g_tcp_pool);
-                int32_t pi = park_tcp(&park, pnow, (uint32_t)left, route.view->name, pel->name, client_fd, cidx, ctx_tcp->gen);
-                if (pi >= 0 && ask && !park_fetch_request(ctx->thread_id, route.view->name, pel->name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL)) {
+                int32_t pi = park_tcp(&park, pnow, (uint32_t)left, hv, pel->name, client_fd, cidx, ctx_tcp->gen);
+                if (pi >= 0 && ask && !park_fetch_request(ctx->thread_id, hv, pel->name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL)) {
                   park_release(&park, &park.e[pi]);          /* the request could not be handed over (ring full): nobody would wake it */
                   pi = -1;
                 }

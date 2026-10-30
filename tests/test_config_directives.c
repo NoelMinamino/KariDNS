@@ -4230,6 +4230,39 @@ static void test_in_view(void) {
                     "view \"a\" { match-clients { 127.0.0.2; }; zone \"x.test\" { type hint; file \"h\"; }; };\n" IV_B("in-view \"a\";"),
                     "does not exist in view 'a'");
 
+    /* D1a phase 2 (design 9): a name that is no zone { } of the owner is accepted when the owner can hold zones from the database or a catalog zone's members: it is found in
+     * the owner's directory at run time (zone_inview_t.db_target, target stays NULL) */
+    #define IV_DB "options { database { driver sqlite3; database-file \"/x.db\"; }; };\n"
+    if (ok_with("in-view of a zone of the database", IV_DB "view \"a\" { match-clients { 127.0.0.2; }; };\n" IV_B("in-view \"a\";"), "", &cfg)) {
+        const view_config_t *b = config_find_view(&cfg, "b");
+        const zone_inview_t *iv = (b && b->in_view_zones) ? zext(b->in_view_zones)->iv : NULL;
+        CHECK_MSG(iv && iv->db_target && iv->target == NULL && cfg.any_in_view && strcmp(iv->view, "a") == 0, "the stub of a zone of the database");
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("in-view of a zone of the database of a view's own file", IV_DB "view \"a\" { match-clients { 127.0.0.2; }; database-file \"/y.db\"; };\n" IV_B("in-view \"a\";"), "", &cfg)) {
+        const view_config_t *b = config_find_view(&cfg, "b");
+        CHECK_MSG(b && b->in_view_zones && zext(b->in_view_zones)->iv->db_target, "the stub of a zone of the view's own database");
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("in-view of a member of a catalog zone", "view \"a\" { match-clients { 127.0.0.2; }; zone \"cat.test\" { type primary; file \"c.db\"; catalog-zone yes; }; };\n" IV_B("in-view \"a\";"), "", &cfg)) {
+        const view_config_t *b = config_find_view(&cfg, "b");
+        CHECK_MSG(b && b->in_view_zones && zext(b->in_view_zones)->iv->db_target, "the stub of a catalog member");
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("a zone { } of the owner is still the target", IV_DB IV_OWN IV_B("in-view \"a\";"), "", &cfg)) {
+        const view_config_t *b = config_find_view(&cfg, "b");
+        const zone_inview_t *iv = (b && b->in_view_zones) ? zext(b->in_view_zones)->iv : NULL;
+        CHECK_MSG(iv && !iv->db_target && iv->target != NULL, "a zone { } block wins over the database");
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("the owner takes no database", IV_DB "view \"a\" { match-clients { 127.0.0.2; }; database none; };\n" IV_B("in-view \"a\";"),
+                    "does not exist in view 'a'");
+    expect_an_error("the owner has neither a database nor a catalog zone", "view \"a\" { match-clients { 127.0.0.2; }; };\n" IV_B("in-view \"a\";"),
+                    "does not exist in view 'a'");
+    expect_an_error("a database does not make a view defined later a target", IV_DB IV_B("in-view \"c\";") "\nview \"c\" { match-clients { 127.0.0.4; }; };",
+                    "does not exist in view 'c'");
+    #undef IV_DB
+
     /* in-view-settings: values and places */
     static const struct { const char *text; int mode; } ivs[] = { { "owner", IVS_OWNER }, { "view", IVS_VIEW }, { "VIEW", IVS_VIEW }, { "Owner", IVS_OWNER } };
     for (size_t i = 0; i < sizeof(ivs) / sizeof(ivs[0]); i++) {

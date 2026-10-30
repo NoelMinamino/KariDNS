@@ -1359,9 +1359,81 @@ static void test_udp_limit_follows_edns_size(void) {
     printf("  -> UDP limit passed.\n");
 }
 
+/* D1a phase 2 (design 9): zone "x" { in-view "v1"; } where x is a zone of the database of v1.  The directory of the sharing view has no element for it: the view lists the
+ * name (its ivdb) and the lookup goes on in the directory of v1 of the same snapshot.  The lookup is the longest-suffix one over both, the case does not matter, a name that
+ * is not in v1 (the zone left the database) falls through to the zone above, and the view that holds the zone is v1's. */
+static void test_in_view_db_names(void) {
+    printf("[TEST] Zone directory: names shared by in-view from the directory of another view (D1a phase 2)...\n");
+    gr_setup("example.", ZONE_TXT);
+    view_snapshot_t views[3];
+    memset(views, 0, sizeof(views));
+    views[0].name = "v2";
+    views[0].match_clients = g_gr.acl;
+    views[0].match_clients_count = 1;
+    views[1] = g_gr.view;                                     /* v1: holds example. */
+    views[1].name = "v1";
+    views[2].name = "v3";
+    views[2].match_clients = g_gr.acl;
+    views[2].match_clients_count = 1;
+    assert(view_ivdb_alloc(&views[0], 3));
+    assert(view_ivdb_add(&views[0], "example.", &views[1]));
+    assert(view_ivdb_add(&views[0], "ghost.example.", &views[1]));            /* (not a zone of v1 now) */
+    assert(view_ivdb_add(&views[0], "EXAMPLE.", &views[1]));                   /* (written twice: the first stays) */
+    assert(views[0].ivdb_n == 2);
+    zdir_elem_t *e1 = zdir_find_suffix(&views[1], "www.example.");
+    assert(e1 && zdir_entry(e1) == &g_gr.entry);
+    assert(zdir_find_suffix(&views[0], "www.example.") == e1 && zdir_find_exact(&views[0], "Example.") == e1);
+    assert(find_zone_in_view(&views[0], "a.b.example.") == &g_gr.entry && find_zone_for_query(&views[0], "www.example.", 1) == &g_gr.entry);
+    assert(find_zone_in_view(&views[0], "x.ghost.example.") == &g_gr.entry);          /* ghost.example. is no zone of v1: the zone above answers */
+    assert(zdir_find_exact(&views[0], "ghost.example.") == NULL);
+    assert(find_zone_in_view(&views[0], "www.other.test.") == NULL && find_zone_in_view(&views[2], "www.example.") == NULL);
+    assert(strcmp(zdir_holder_view(&views[0], e1), "v1") == 0 && strcmp(zdir_holder_view(&views[1], e1), "v1") == 0 && strcmp(zdir_holder_view(&views[2], e1), "v3") == 0);
+    /* a name of the view's own directory wins and is the view's own */
+    zone_db_entry_t *other[1] = { &g_gr.cat_entry };
+    memset(&g_gr.cat_entry, 0, sizeof(g_gr.cat_entry));
+    strncpy(g_gr.cat_entry.domain, "sub.example.", sizeof(g_gr.cat_entry.domain) - 1);
+    atomic_store_explicit(&g_gr.cat_entry.rcu.active, &g_gr.arena.ver, memory_order_release);
+    assert(view_set_entries(&views[0], other, 1));
+    zdir_elem_t *own = zdir_find_suffix(&views[0], "www.sub.example.");
+    assert(own && zdir_entry(own) == &g_gr.cat_entry && strcmp(zdir_holder_view(&views[0], own), "v2") == 0);
+    assert(find_zone_in_view(&views[0], "www.example.") == &g_gr.entry);
+    /* many names: the table grows to its size */
+    view_snapshot_t big;
+    memset(&big, 0, sizeof(big));
+    assert(view_ivdb_alloc(&big, 301));
+    char nm[64];
+    for (int i = 0; i < 300; i++) {
+        snprintf(nm, sizeof(nm), "n%03d.example.", i);
+        assert(view_ivdb_add(&big, nm, &views[1]));
+    }
+    assert(view_ivdb_add(&big, "example.", &views[1]));
+    assert(big.ivdb_n == 301);
+    assert(find_zone_in_view(&big, "www.n123.example.") == &g_gr.entry);          /* (n123.example. is not in v1: the zone above answers) */
+    assert(zdir_find_exact(&big, "n123.example.") == NULL && zdir_find_exact(&big, "example.") == e1);
+    view_ivdb_free(&big);
+    /* a query through the sharing view is answered from v1's zone; one through a view that does not name it is REFUSED */
+    g_gr.snap.views = views;
+    g_gr.snap.view_count = 3;
+    req_t q;
+    gr_resp_t r;
+    put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 0); put_question(&q, "www.example.", 1, 1);
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);                         /* (the first view whose match-clients matches is v2) */
+    CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, 1) == 1);
+    views[0].name = "v2";
+    view_ivdb_free(&views[0]);                                                      /* v2 shares nothing now: its own directory has sub.example. only */
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+    CHECK(&r, r.rcode == 5);
+    view_clear_dir(&views[0]);
+    g_gr.snap.views = &g_gr.view;
+    g_gr.snap.view_count = 1;
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> shared names passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Query Engine Protocol Tests ===\n");
     test_protocol_anomalies();
+    test_in_view_db_names();
     test_expired_secondary_zone();
     test_notify_authorization();
     test_notify_catalog_member();

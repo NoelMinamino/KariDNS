@@ -313,6 +313,8 @@ typedef struct zone_inview {
   char *view;                   /* the view that holds the zone (in-view "v"); NULL when only in-view-settings was written */
   struct zone_config *target;   /* the owner's zone { }, set when the parse ends (not owned) */
   char *loc;                    /* "file:line" of the in-view statement (messages after the parse) */
+  bool db_target;               /* D1a phase 2 (design 9): the owner view has no zone { } of this name but takes zones from the database or has a catalog zone: the zone is found at
+                                 * run time in the owner's directory (target stays NULL).  The zone may or may not exist there at any moment; the stub only names it */
   uint8_t settings;             /* IVS_* written in this zone */
   bool acl_written;             /* an allow-query / allow-query-on / allow-transfer / allow-update / allow-notify was written (needs IVS_VIEW) */
 } zone_inview_t;

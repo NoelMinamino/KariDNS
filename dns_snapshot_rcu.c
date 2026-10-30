@@ -549,12 +549,101 @@ void view_clear_dir(view_snapshot_t *view) {
   view->dir = NULL;
 }
 
+/* ---- D1a phase 2 (design 9): zones shared by in-view from the database of another view ----
+ * The element of a name the view lists in its ivdb is the one the owner view's directory has for it, or none (the zone is not in the owner's database now, so the name
+ * is no zone of this view at this moment; a lookup of a name below it goes on to the zones above).  The owner's element is returned as it is: the Backend asks for its
+ * data in the owner's name (zdir_holder_view()), and an entry that is resident is the owner's entry, as for a zone shared by phase 1. */
+static zdir_elem_t *zdir_ivdb_find(const view_snapshot_t *view, uint32_t hash, const char *key, size_t klen) {
+  if (!view->ivdb_cap) return NULL;
+  size_t i = hash & (view->ivdb_cap - 1);
+  for (;;) {
+    const zdir_ivdb_t *l = &view->ivdb[i];
+    if (!l->name) return NULL;
+    if (l->hash == hash && l->klen == klen && strncasecmp(l->name, key, klen) == 0) {
+      const zdir_tab_t *st = zdir_tab_of(l->src);
+      return st ? zdir_tab_find(st, hash, key, klen) : NULL;
+    }
+    i = (i + 1) & (view->ivdb_cap - 1);
+  }
+}
+
+/* put name into a table made by ivdb_alloc(); false: out of memory */
+bool view_ivdb_add(view_snapshot_t *view, const char *name, const view_snapshot_t *src) {
+  size_t klen = zone_key_len(name);
+  if (klen > 255) return false;
+  char *copy = malloc(klen + 2);
+  if (!copy) return false;
+  memcpy(copy, name, klen);
+  copy[klen] = '.';
+  copy[klen + 1] = '\0';
+  for (size_t i = 0; i < klen; i++) copy[i] = (char)tolower((unsigned char)copy[i]);
+  uint32_t h = calc_fnv1a_strn(copy, klen);
+  size_t i = h & (view->ivdb_cap - 1);
+  while (view->ivdb[i].name) {
+    if (view->ivdb[i].hash == h && view->ivdb[i].klen == klen && strncasecmp(view->ivdb[i].name, copy, klen) == 0) {     /* (a name written twice: the first stays) */
+      free(copy);
+      return true;
+    }
+    i = (i + 1) & (view->ivdb_cap - 1);
+  }
+  view->ivdb[i] = (zdir_ivdb_t){ copy, h, (uint8_t)klen, src };
+  view->ivdb_n++;
+  return true;
+}
+
+bool view_ivdb_alloc(view_snapshot_t *view, size_t names) {
+  size_t cap = 8;
+  while (cap < names * 2) cap <<= 1;
+  view->ivdb = calloc(cap, sizeof(zdir_ivdb_t));
+  if (!view->ivdb) return false;
+  view->ivdb_cap = cap;
+  view->ivdb_n = 0;
+  return true;
+}
+
+void view_ivdb_free(view_snapshot_t *view) {
+  for (size_t i = 0; i < view->ivdb_cap; i++) free(view->ivdb[i].name);
+  free(view->ivdb);
+  view->ivdb = NULL;
+  view->ivdb_cap = view->ivdb_n = 0;
+}
+
+/* the name of the owner view of a name in the view's ivdb; NULL: it is not there */
+static const char *zdir_ivdb_owner(const view_snapshot_t *view, const char *name) {
+  if (!view->ivdb_cap) return NULL;
+  size_t klen = zone_key_len(name);
+  uint32_t h = calc_fnv1a_strn(name, klen);
+  size_t i = h & (view->ivdb_cap - 1);
+  for (;;) {
+    const zdir_ivdb_t *l = &view->ivdb[i];
+    if (!l->name) return NULL;
+    if (l->hash == h && l->klen == klen && strncasecmp(l->name, name, klen) == 0) return l->src->name;
+    i = (i + 1) & (view->ivdb_cap - 1);
+  }
+}
+
+const char *zdir_holder_view(const view_snapshot_t *view, const zdir_elem_t *el) {
+  if (!view->ivdb_n || !el) return view->name;
+  const zdir_tab_t *t = zdir_tab_of(view);
+  if (t && zdir_tab_find(t, el->hash, el->name, el->klen) == el) return view->name;      /* the view's own zone */
+  if (!view->ivdb_cap) return view->name;
+  size_t i = el->hash & (view->ivdb_cap - 1);
+  for (;;) {
+    const zdir_ivdb_t *l = &view->ivdb[i];
+    if (!l->name) return view->name;
+    if (l->hash == el->hash && l->klen == el->klen && strncasecmp(l->name, el->name, el->klen) == 0) return l->src->name ? l->src->name : view->name;
+    i = (i + 1) & (view->ivdb_cap - 1);
+  }
+}
+
 // view 内で apex が domain と一致するゾーンを返す (最長一致ではなく完全一致)。
 zdir_elem_t *zdir_find_exact(const view_snapshot_t *view, const char *domain) {
   const zdir_tab_t *t = domain ? zdir_tab_of(view) : NULL;
-  if (!t) return NULL;
+  if (!domain || (!t && !(view && view->ivdb_n))) return NULL;
   size_t klen = zone_key_len(domain);
-  return zdir_tab_find(t, calc_fnv1a_strn(domain, klen), domain, klen);
+  uint32_t h = calc_fnv1a_strn(domain, klen);
+  zdir_elem_t *hit = t ? zdir_tab_find(t, h, domain, klen) : NULL;
+  return (hit || !view->ivdb_n) ? hit : zdir_ivdb_find(view, h, domain, klen);
 }
 
 zone_db_entry_t *find_zone_exact_in_view(view_snapshot_t *view, const char *domain) {
@@ -627,12 +716,15 @@ zone_db_entry_t *snapshot_get_zone(zone_db_snapshot_t *snap, const char *domain)
  * comparison with a zone name ignores the case. */
 zdir_elem_t *zdir_find_suffix(const view_snapshot_t *view, const char *qname) {
   const zdir_tab_t *t = qname ? zdir_tab_of(view) : NULL;
-  if (!t) return NULL;
+  if (!t && !(qname && view && view->ivdb_n)) return NULL;
+  const bool iv = view->ivdb_n != 0;           /* some zones of the view are shared from the database of another view (D1a phase 2) */
   size_t q_len = zone_key_len(qname);
   const char *cursor = qname;
   size_t remaining = q_len;
   while (remaining > 0) {
-    zdir_elem_t *hit = zdir_tab_find(t, calc_fnv1a_strn(cursor, remaining), cursor, remaining);
+    uint32_t h = calc_fnv1a_strn(cursor, remaining);
+    zdir_elem_t *hit = t ? zdir_tab_find(t, h, cursor, remaining) : NULL;
+    if (!hit && iv) hit = zdir_ivdb_find(view, h, cursor, remaining);
     if (hit) return hit;
     // 次のラベル境界まで進める (末尾のルートの '.' は remaining の外)
     const char *dot = strchr_unescaped(cursor, '.');
@@ -641,7 +733,8 @@ zdir_elem_t *zdir_find_suffix(const view_snapshot_t *view, const char *qname) {
     cursor = dot + 1;
   }
   // ルートゾーン（"." または空文字列）へのフォールバック
-  return zdir_tab_find(t, calc_fnv1a_strn("", 0), "", 0);
+  zdir_elem_t *root = t ? zdir_tab_find(t, calc_fnv1a_strn("", 0), "", 0) : NULL;
+  return (root || !iv) ? root : zdir_ivdb_find(view, calc_fnv1a_strn("", 0), "", 0);
 }
 
 zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
@@ -759,6 +852,7 @@ void free_zone_db_snapshot(zone_db_snapshot_t *snap) {
       vs->match_aml = NULL;
       zdir_unref(vs->dir);
       vs->dir = NULL;
+      view_ivdb_free(vs);
     }
     free(snap->views);
     snap->views = NULL;
@@ -1874,12 +1968,23 @@ static bool dbreg_queue_reserve(zdir_elem_t ***arr, size_t n, size_t *cap) {
     return true;
 }
 
+/* does the view write `zone "name" { in-view ... }` for a zone of the database of another view (D1a phase 2)?  Like a zone { } block it hides a zone of this name in the
+ * view's own source (D-PRIO) */
+static bool config_view_names_in_view(const server_config_t *cfg, const char *view, const char *name) {
+    for (const view_config_t *v = cfg->views; v; v = v->next) {
+        if (view && view[0] != '\0' && strcasecmp(v->name, view) != 0) continue;
+        const zone_config_t *stub = view_find_in_view(v, name);
+        if (stub && stub->ext->iv->db_target) return true;
+    }
+    return false;
+}
+
 /* does a zone of the configuration hide a DB zone of this name in this view? (D-PRIO: file, program, forward and
  * secondary zones all come from zone {} statements) */
 static bool dbreg_config_shadows(const char *view, const char *name) {
     rcu_aux_read_lock();
     server_config_t *cfg = acquire_config_snapshot();
-    bool sh = cfg && find_zone_config_in_view(cfg, view, name) != NULL;
+    bool sh = cfg && (find_zone_config_in_view(cfg, view, name) != NULL || config_view_names_in_view(cfg, view, name));
     release_config_snapshot(cfg);
     rcu_aux_read_unlock();
     return sh;
@@ -3054,6 +3159,13 @@ static zone_db_snapshot_t *snap_clone_locked(const zone_db_snapshot_t *old) {
             zdir_ref(ov->dir);
             vs->dir = ov->dir;
         }
+        if (ok && ov->ivdb_n) {            /* the names shared from the database of another view (D1a phase 2): the owner views are the new snapshot's */
+            ok = view_ivdb_alloc(vs, ov->ivdb_n);
+            for (size_t i = 0; ok && i < ov->ivdb_cap; i++) {
+                const zdir_ivdb_t *l = &ov->ivdb[i];
+                if (l->name) ok = view_ivdb_add(vs, l->name, &ns->views[l->src - old->views]);
+            }
+        }
     }
     if (!ok) {
         free_zone_db_snapshot(ns);
@@ -3770,14 +3882,27 @@ static bool view_reusable(const view_config_t *v, view_snapshot_t *old_view, zon
     if (n != zdir_count_static(old_view)) return false;
     /* the zones shared with earlier views (zone { in-view }) must be the same entries of the same owner views, and no other */
     size_t ns = 0;
-    for (zone_config_t *s = v->in_view_zones; s; s = s->next, ns++) {
+    for (zone_config_t *s = v->in_view_zones; s; s = s->next) {
         const zone_inview_t *iv = s->ext->iv;
+        if (iv->db_target) continue;               /* (names in the view's ivdb, rebuilt for every snapshot: snapshot_build_ivdb()) */
+        ns++;
         zdir_elem_t *oe = zdir_find_exact(old_view, s->domain);
         zone_db_entry_t *old = zdir_entry(oe);
         if (!old || view_owns_elem(oe) || strcasecmp(old->view_name, iv->view) != 0) return false;
         if (find_zone_exact_in_view(snapshot_find_view(old_snap, iv->view), s->domain) != old) return false;
     }
-    return ns == zdir_count_shared(old_view);
+    if (ns != zdir_count_shared(old_view)) return false;
+    /* the names shared from the database of another view (D1a phase 2) must be the same, from the same views: a new one hides a zone of the view's own source (D-PRIO), which only a
+     * rebuild of the registry's index sees */
+    size_t nd = 0;
+    for (zone_config_t *s = v->in_view_zones; s; s = s->next) {
+        const zone_inview_t *iv = s->ext->iv;
+        if (!iv->db_target) continue;
+        nd++;
+        const char *own = zdir_ivdb_owner(old_view, s->domain);
+        if (!own || strcasecmp(own, iv->view) != 0) return false;
+    }
+    return nd == old_view->ivdb_n;
 }
 
 static bool snapshot_views_reusable(zone_db_snapshot_t *old_snap, server_config_t *cfg) {
@@ -3819,16 +3944,40 @@ static bool view_copy_from_old(view_snapshot_t *vs, const view_config_t *v, cons
     return true;
 }
 
+/* D1a phase 2 (design 9): the stubs zone "x" { in-view "v1"; } whose x is not a zone { } block of v1 (zone_inview_t.db_target).  The view's directory gets no element
+ * for them: the names go to the view's ivdb and the lookup goes on in the directory of v1 of the same snapshot (zdir_find_exact(), zdir_find_suffix()).  false: out
+ * of memory. */
+static bool snapshot_build_ivdb(zone_db_snapshot_t *snap, const server_config_t *cfg) {
+    for (const view_config_t *cv = cfg->views; cv; cv = cv->next) {
+        if (!cv->in_view_zones || !cv->name) continue;
+        view_snapshot_t *vs = snapshot_find_view(snap, cv->name);
+        if (!vs) continue;
+        size_t n = 0;
+        for (const zone_config_t *s = cv->in_view_zones; s; s = s->next)
+            if (s->ext->iv->db_target) n++;
+        if (n == 0) continue;
+        view_ivdb_free(vs);
+        if (!view_ivdb_alloc(vs, n)) return false;
+        for (const zone_config_t *s = cv->in_view_zones; s; s = s->next) {
+            if (!s->ext->iv->db_target) continue;
+            const view_snapshot_t *src = snapshot_find_view(snap, s->ext->iv->view);
+            if (src && src != vs && !view_ivdb_add(vs, s->domain, src)) return false;
+        }
+    }
+    return true;
+}
+
 /* The zones view cv shares with earlier views (zone { in-view "owner"; }, BIND bin/named/server.c configure_zone() dns_view_addzone()): the entry of
  * the owner view is put into vs as well, in an element of its own that holds a reference of the entry (the directory releases one per view it is
  * in).  entry->view_name stays the owner's, so zone_entry_config() finds the owner's zone { }.  Called after the owner's directory is built.  A zone
  * whose owner entry does not exist (it could not be allocated) is left out.  false: out of memory. */
 static bool view_append_shared(zone_db_snapshot_t *snap, view_snapshot_t *vs, const view_config_t *cv) {
     size_t ns = 0;
-    for (const zone_config_t *s = cv->in_view_zones; s; s = s->next) ns++;
+    for (const zone_config_t *s = cv->in_view_zones; s; s = s->next) ns += s->ext->iv->db_target ? 0 : 1;      /* (a stub of a zone of the database has no element: snapshot_build_ivdb()) */
     if (!zdir_reserve(vs->dir, ns)) return false;
     int64_t order = (int64_t)atomic_load_explicit(&vs->dir->live, memory_order_relaxed);
     for (const zone_config_t *s = cv->in_view_zones; s; s = s->next) {
+        if (s->ext->iv->db_target) continue;
         view_snapshot_t *tvs = snapshot_find_view(snap, s->ext->iv->view);
         zone_db_entry_t *e = tvs ? find_zone_exact_in_view(tvs, s->domain) : NULL;
         if (!e) {
@@ -4574,6 +4723,12 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             abort_rebuild_snapshot(new_snap, "tick list");
             return NULL;
         }
+    }
+
+    /* the zones that views share by in-view from the database (or a catalog) of an earlier view (D1a phase 2): names only, the lookup goes on in the owner's directory */
+    if (active_config && !snapshot_build_ivdb(new_snap, active_config)) {
+        abort_rebuild_snapshot(new_snap, "in-view names");
+        return NULL;
     }
 
     /* the registry is the source of truth: what the ingest threads queued for the old snapshot is in (or out of) this

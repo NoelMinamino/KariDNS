@@ -678,7 +678,19 @@ typedef struct {
   zdir_gent_t *ents;
 } zdir_garbage_t;
 
+/* D1a phase 2 (design 9): a zone of this view that is `zone "x" { in-view "v1"; }` where x is a zone of the database (or a member of a catalog zone) of v1.  The view's
+ * directory has no element for it: the name is here and the lookup goes on in the directory of the owner view (src, a view of the same snapshot) when the name is not
+ * found in the view's own.  So a zone that comes into the database of v1 or leaves it changes nothing here; only the names the configuration wrote are shared.
+ * An open-addressing table (name == NULL: empty) of a power-of-two size. */
+struct view_snapshot;
 typedef struct {
+  char *name;                    /* canonical absolute name, lower case, with the trailing dot (malloc) */
+  uint32_t hash;                 /* zdir_name_hash(name) */
+  uint8_t klen;                  /* the name without the trailing dot */
+  const struct view_snapshot *src;   /* the owner view of the snapshot this view belongs to */
+} zdir_ivdb_t;
+
+typedef struct view_snapshot {
   char *name;
   char **match_clients;
   int match_clients_count;
@@ -688,7 +700,20 @@ typedef struct {
   aml_t *match_aml;
   /* the zones of the view (one reference of the directory per snapshot that lists the view).  NULL: a view without zones */
   zdir_t *dir;
+  /* the zones shared by in-view from the database of another view (D1a phase 2): see zdir_ivdb_t.  NULL: none (most views) */
+  zdir_ivdb_t *ivdb;
+  size_t ivdb_cap;               /* slots of the table (a power of two); 0 with ivdb == NULL */
+  size_t ivdb_n;                 /* names in it */
 } view_snapshot_t;
+
+/* The view that holds the zone of an element a lookup in `view` returned: the view's own name, or -- for a zone shared by in-view from the database of another view -- the owner
+ * view's.  It is the name the registry knows the zone by (a request to read a zone, a wake-up, a NOTIFY, the table of transfers). */
+const char *zdir_holder_view(const view_snapshot_t *view, const zdir_elem_t *el);
+/* The view's ivdb: view_ivdb_alloc() makes the table for `names` names (any earlier one is not freed), view_ivdb_add() puts a zone name in it (src: the owner view, of the
+ * same snapshot; a name that is there already stays as it was), view_ivdb_free() frees it.  false: out of memory. */
+bool view_ivdb_alloc(view_snapshot_t *view, size_t names);
+bool view_ivdb_add(view_snapshot_t *view, const char *name, const view_snapshot_t *src);
+void view_ivdb_free(view_snapshot_t *view);
 
 /* Is the element a zone of this view, rather than a zone shared with an earlier view through zone { in-view } (the same
  * zone_db_entry_t as in the owner view; entry->view_name is the owner's)?  Anything that walks the zones of every view once per

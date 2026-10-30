@@ -46,7 +46,7 @@ void (*g_query_bg_fetch)(const char *view_name, const char *zone) = NULL;
 static void bg_fetch_nonresident(const view_snapshot_t *view, const zdir_elem_t *pel) {
   if (!pel || !view || !view->name || !g_query_bg_fetch || zdir_entry(pel)) return;
   if (atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) != ZDIR_ST_ABSENT) return;     /* (LOADING: on its way; ERROR: nothing to read) */
-  g_query_bg_fetch(view->name, pel->name);
+  g_query_bg_fetch(zdir_holder_view(view, pel), pel->name);
 }
 
 /* allow-query / allow-query-on (BIND 9.20 ARM): what the ACL check needs besides the client address.  The transport sets the address
