@@ -39,7 +39,12 @@ stop_srv() {
     [ -n "$SRV" ] && kill -KILL "$SRV" 2>/dev/null
     SRV=""
 }
-cleanup() { stop_srv; rm -rf "$T"; }
+H1=""; H2=""
+cleanup() {
+    [ -n "$H1$H2" ] && kill $H1 $H2 2>/dev/null   # (the held transfers of the hard limit part, when the run fails before it kills them)
+    [ -n "$H1$H2" ] && wait $H1 $H2 2>/dev/null
+    stop_srv; rm -rf "$T"
+}
 trap cleanup EXIT INT TERM
 PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
@@ -240,10 +245,10 @@ echo "== zones in memory above the hard limit of memory-limit (two big zones tha
 # when the transfers end
 conf "notify no;" "memory-limit 1m;"
 start_srv
-perl tests/db/hold_axfr.pl 127.0.0.1 "$PORT" big.test 120 > "$T/hold1.out" 2>&1 &
+perl tests/db/hold_axfr.pl 127.0.0.1 "$PORT" big.test 120 30 > "$T/hold1.out" 2>&1 &
 H1=$!
 i=0; while [ $i -lt 300 ] && ! grep -q held "$T/hold1.out" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
-perl tests/db/hold_axfr.pl 127.0.0.1 "$PORT" big2.test 120 > "$T/hold2.out" 2>&1 &
+perl tests/db/hold_axfr.pl 127.0.0.1 "$PORT" big2.test 120 30 > "$T/hold2.out" 2>&1 &
 H2=$!
 i=0; while [ $i -lt 300 ] && ! grep -q held "$T/hold2.out" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
 grep -q held "$T/hold1.out" && grep -q held "$T/hold2.out" && pass "two big zones are held by transfers that the client does not read" || fail "the transfers: $(cat "$T/hold1.out" "$T/hold2.out" 2>&1 | tr '\n' ' ')"
@@ -259,6 +264,7 @@ wait_walk "${W0:-0}"
 [ "$(soa_serial n.test)" = "7" ] && oom n.test && pass "n.test has its apex: the SOA question does not read it" || fail "n.test SOA: $(soa_serial n.test); out of memory: $(oom n.test && echo yes || echo no)"
 kill "$H1" "$H2" 2>/dev/null
 wait "$H1" "$H2" 2>/dev/null
+H1=""; H2=""
 i=0; while [ $i -lt 300 ] && [ "$(stat resident)" -gt $((LIM / 100 * 95)) ]; do sleep 0.1; i=$((i + 1)); done
 RES=$(stat resident)
 [ "$RES" -le $((LIM / 100 * 95)) ] && pass "when the transfers end the cache manager takes the zones out of memory again ($RES bytes)" || fail "resident is still $RES (limit $LIM)"
