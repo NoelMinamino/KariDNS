@@ -959,6 +959,10 @@ int snapshot_apply_db_delta(void);
 size_t dbreg_pending_count(void);
 /* The garbage entries of summaries passed their bound (dbreg_pending_count() counts it as one): the publication that drains them is due now, whatever the delta interval says */
 bool dbreg_garbage_due(void);
+uint64_t dbreg_garbage_forced(void);
+void dbreg_touch_loaded(const char *view, const char *zone);       /* a fetch brought the zone: the time it is kept starts now (before its waiters are woken) */
+/* the (source id, serial) the registry has for the zone (the version the directory knows); false: no such zone */
+bool dbreg_zone_version(const char *view, const char *zone, int64_t *source_id, uint32_t *serial);                                /* how many times the bound was passed since the start */
 
 /* A walk over the registry in steps (zero the cursor to start).  The position is an ordinal in a chain, so a zone that left a chain, or a rehash of the tables, since
  * the last step would make it skip a zone: the cursor remembers the generations and, when one moved, goes back to the start of the chain (a leave) or of the view (a

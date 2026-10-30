@@ -630,6 +630,7 @@ int main(void) {
          * ingest thread publish when the bound is passed, not only when some other change comes: the pending count is back to 0 and no garbage is due */
         {
             const char *zg = coldz[3];
+            const uint64_t gf0 = dbreg_garbage_forced();
             int yg = 0;
             CHECK(sscanf(zg, "y%d", &yg) == 1);
             kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
@@ -644,9 +645,62 @@ int main(void) {
             int ngr = 0;
             while (ch_next(&mainc, &m, 20000) && m.type != KDB_T_BATCH_RESULT) ngr++;
             CHECK(ngr == 1300 && m.type == KDB_T_BATCH_RESULT);
+            CHECK(dbreg_garbage_forced() > gf0);                                   /* (the bound was passed: a publication was due) */
             for (int i = 0; i < 60 && (dbreg_pending_count() != 0 || dbreg_garbage_due()); i++) usleep(50000);
             CHECK(dbreg_pending_count() == 0 && !dbreg_garbage_due());
             CHECK(elem_of("default", zg) != NULL && elem_of("default", zg)->serial == 100 + 1299);
+        }
+
+        /* D1a review 6D: a fetch brings the version the loader read when the request was made.  The directory learns of a newer version meanwhile (the body of it
+         * is left out of memory here): what the fetch brings is the older one, and is dropped, not installed; the requests that wait for it are woken (not failed)
+         * and ask again */
+        CHECK(ncold >= 8);
+        {
+            const char *zl = coldz[4];
+            int yl = 0;
+            CHECK(sscanf(zl, "y%d", &yl) == 1);
+            CHECK(park_fetch_request(0, "default", zl, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, zl) == 0);
+            const uint64_t rl = m.u.fetch_req.request_id;
+            kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+            kdb_enc_u64(&e, 1, 11); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
+            kdb_enc_end(&e);
+            ch_send(a[0], &e);
+            send_zone(a[0], &e, 0, zl, 50, 0, 50000 + yl);                         /* the newer version (the loader says: NOT_RESIDENT) */
+            kdb_enc_begin(&e, KDB_T_BATCH_END);
+            kdb_enc_u64(&e, 1, 11); kdb_enc_u32(&e, 2, 1); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+            kdb_enc_end(&e);
+            ch_send(a[0], &e);
+            int stl = -1;
+            while (ch_next(&mainc, &m, 10000) && m.type != KDB_T_BATCH_RESULT)
+                if (m.type == KDB_T_ZONE_RESULT) stl = m.u.zone_result.status;
+            CHECK(stl == KDB_ST_NOT_RESIDENT);
+            zdir_elem_t *le2 = elem_of("default", zl);
+            CHECK(le2 && le2->serial == 50 && atomic_load(&le2->state) == ZDIR_ST_LOADING);
+            send_zone(f[0], &e, 0, zl, 1, rl, 50000 + yl);                         /* the fetch brings the version 1 */
+            CHECK(wake_next(&k, 5000) && strcmp(k.zone, zl) == 0 && !k.failed);
+            CHECK(zdir_entry(le2) == NULL && le2->serial == 50 && atomic_load(&le2->state) == ZDIR_ST_ABSENT);       /* (not installed: the newer version stays) */
+        }
+
+        /* D1a review 6D: with the zones in memory above the hard limit a request for a zone is shed ("not ready") and a request for a summary is not (it brings no data) */
+        {
+            dbreg_cache_stats(&cs);
+            static server_config_t cfgH;
+            CHECK(parse_named_conf("options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; }; };\n"
+                                   "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", &cfgH) == 0);
+            cfgH.database.memory_limit = cs.resident / 4;                             /* (the zones in memory are far above 110% of it) */
+            atomic_store_explicit(&g_config_db.active, &cfgH, memory_order_release);
+            usleep(1500000);
+            const char *zx = coldz[5], *zy = coldz[6];
+            int yy = 0;
+            CHECK(sscanf(zy, "y%d", &yy) == 1);
+            CHECK(park_fetch_request(0, "default", zx, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+            CHECK(wake_next(&k, 5000) && strcmp(k.zone, zx) == 0 && k.failed);          /* shed: the query gets "not ready" now */
+            CHECK(!ch_next(&fetchc, &m, 300));
+            CHECK(park_fetch_request(0, "default", zy, KDB_FETCH_PRIO_QUERY, KDB_FETCH_SUMMARY));
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, zy) == 0 && m.u.fetch_req.mode == KDB_FETCH_SUMMARY);
+            send_summary(f[0], &e, 0, zy, 1, m.u.fetch_req.request_id, 50000 + yy);
+            CHECK(wake_next(&k, 5000) && strcmp(k.zone, zy) == 0 && !k.failed);
         }
 
         /* a cold zone is fetched when a query needs it; loaded while the database zones are at the limit and asked for less than what the manager

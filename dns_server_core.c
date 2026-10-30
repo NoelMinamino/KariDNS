@@ -2003,7 +2003,9 @@ static bool udp_park(udp_pass_t *w, const view_snapshot_t *view, const zdir_elem
   int64_t now = park_now_ms();
   int64_t left = w->woken ? w->woken_deadline_ms - now : (int64_t)w->park_timeout_ms;
   if (left <= 0) return false;
-  bool ask = !w->woken && !park_has_wait(w->park, view->name, pel->name);       /* the first query for the zone asks for it */
+  /* the first query for the zone asks for it.  One that was woken and finds the zone out of memory again (taken out by the cache manager before the request could use
+   * it) asks again: nothing is on its way (the state would be LOADING), and nobody else would wake it before its time is up. */
+  bool ask = (!w->woken || atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) == ZDIR_ST_ABSENT) && !park_has_wait(w->park, view->name, pel->name);
   int32_t pi = park_udp(w->park, now, (uint32_t)left, view->name, pel->name, w->active_fd, ipc, req, len);
   if (pi < 0) return false;
   if (ask && !park_fetch_request(w->worker_idx, view->name, pel->name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL)) {
@@ -2980,7 +2982,8 @@ process_tcp_client: ;
               int64_t pnow = park_now_ms();
               int64_t left = ctx_tcp->park_deadline_ms ? ctx_tcp->park_deadline_ms - pnow : (int64_t)park_timeout_ms;
               if (park_on && !ctx_tcp->not_ready_now && left > 0) {
-                bool ask = ctx_tcp->park_deadline_ms == 0 && !park_has_wait(&park, route.view->name, pel->name);
+                bool ask = (ctx_tcp->park_deadline_ms == 0 || atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) == ZDIR_ST_ABSENT) &&
+                           !park_has_wait(&park, route.view->name, pel->name);       /* (as in udp_park(): a request that comes back and finds the zone out of memory again asks again) */
                 uint32_t cidx = (uint32_t)(ctx_tcp - g_tcp_pool);
                 int32_t pi = park_tcp(&park, pnow, (uint32_t)left, route.view->name, pel->name, client_fd, cidx, ctx_tcp->gen);
                 if (pi >= 0 && ask && !park_fetch_request(ctx->thread_id, route.view->name, pel->name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL)) {

@@ -90,7 +90,7 @@ conf() {   # conf OPTIONS-LINES DATABASE-LINES
     cat > "$T/k.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT; $1
-    database { driver sqlite3; database-file "${DBF:-$T/db/z.db}"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; fetch-rate 5000; park-timeout 4000; acl-ceiling { 127.0.0.1; }; $2 };
+    database { driver sqlite3; database-file "${DBF:-$T/db/z.db}"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; fetch-rate ${FR:-5000}; park-timeout 4000; acl-ceiling { 127.0.0.1; }; $2 };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
 EOF
@@ -112,8 +112,8 @@ wait_walk() {   # wait_walk WALKS-BEFORE: the walk after a reload ran and is don
     i=0
     while [ $i -lt 600 ]; do
         A=$($KCTL dbstatus 2>/dev/null | grep "^apex:")
-        AS=$(echo "$A" | sed -n 's/.*asked=\([0-9]*\).*/\1/p'); AN=$(echo "$A" | sed -n 's/.*answered=\([0-9]*\).*/\1/p'); AW=$(echo "$A" | sed -n 's/.*walking=\([0-9]*\).*/\1/p'); AK=$(echo "$A" | sed -n 's/.*walks=\([0-9]*\).*/\1/p')
-        [ "${AK:-0}" -gt "$1" ] && [ "$AS" = "${AN:-x}" ] && [ "${AW:-1}" = "0" ] && break
+        AS=$(echo "$A" | sed -n 's/.*asked=\([0-9]*\).*/\1/p'); AN=$(echo "$A" | sed -n 's/.*answered=\([0-9]*\).*/\1/p'); AW=$(echo "$A" | sed -n 's/.*walking=\([0-9]*\).*/\1/p'); AK=$(echo "$A" | sed -n 's/.*walks=\([0-9]*\).*/\1/p'); AQ=$(echo "$A" | sed -n 's/.*queued=\([0-9]*\).*/\1/p')
+        [ "${AK:-0}" -gt "$1" ] && [ "$AS" = "${AN:-x}" ] && [ "${AW:-1}" = "0" ] && [ "${AQ:-1}" = "0" ] && break
         sleep 0.2; i=$((i + 1))
     done
     echo "  $A"
@@ -171,12 +171,24 @@ grep -q "AddressSanitizer\|runtime error:\|ThreadSanitizer" "$T/srv.log" 2>/dev/
 stop_srv
 
 echo "== a reload that makes the zones keep an apex gives the zones out of memory theirs"
+# fetch-rate 100: the walk (1100 summaries) needs about ten seconds, and the queries must not be left without a token meanwhile
+FR=100
 conf "notify no;" "memory-limit 64m;"
 start_srv
 W0=$(walks_now)
 conf "" "memory-limit 64m;"
 $KCTL reconfig > /dev/null 2>&1
+i=0; while [ $i -lt 100 ] && ! $KCTL dbstatus 2>/dev/null | grep -q "^apex: .*walking=1"; do sleep 0.05; i=$((i + 1)); done
+# (a query for a zone out of memory, once the walk has used the burst and goes at the pace of the rate: it takes a token only from a bucket that is more than half full)
+sleep 2
+WQ=0
+for z in e.test l.test z0100.test z0101.test z0102.test; do
+    sleep 1
+    $KCTL dbstatus 2>/dev/null | grep -q "^apex: .*walking=1" && [ "$(q www.$z)" = "192.0.2.80" ] && WQ=$((WQ + 1))
+done
+[ "$WQ" -eq 5 ] && pass "queries for zones out of memory are answered during the walk ($WQ of 5, each while it was running)" || fail "only $WQ of 5 queries were answered while the walk was running"
 wait_walk "${W0:-0}"     # (every zone of the database asks for its summary)
+FR=
 AS1=$AS
 [ "${AS1:-0}" -gt 1000 ] && pass "the walk asked for the summaries of the zones out of memory that have no apex ($AS1)" || fail "the walk asked for $AS1 summaries"
 W1=$(walks_now)
@@ -188,9 +200,8 @@ oom n.test && pass "n.test is out of memory" || fail "n.test is not out of memor
 [ "$(soa_serial n.test)" = "7" ] && oom n.test && pass "n.test (no allow-transfer) was given an apex by the reload (summary fetch): its SOA question does not read it" || fail "n.test SOA: $(soa_serial n.test); out of memory: $(oom n.test && echo yes || echo no)"
 stop_srv
 
-echo "== the same while the database zones are over the hard limit of memory-limit"
-# two big zones that a dynamic UPDATE has changed stay in memory (an UPDATE-pinned zone is never taken out until the database replaces it) and are not counted among the
-# pinned zones, so the database zones are over 110% of the limit for good: the fetches for queries are shed, a summary is not held back
+echo "== two UPDATEs of big zones back to back, then a reload walk with zones that an UPDATE keeps in memory"
+# two big zones that a dynamic UPDATE has changed stay in memory (an UPDATE-pinned zone is never taken out until the database replaces it) and count as pinned
 cp "$T/db/z.db" "$T/db/z2.db"
 sqlite3 "$T/db/z2.db" <<SQL
 INSERT INTO domains (name, type) VALUES ('big2.test', 'NATIVE');
@@ -206,23 +217,19 @@ chown nobody "$T/db/z2.db"*; chmod 600 "$T/db/z2.db"*
 DBF="$T/db/z2.db"
 conf "notify no;" "memory-limit 1m;"
 start_srv
+# two UPDATEs of big zones back to back, each at the first try: the version the first one replaced is retired, not freed yet (it is at the next tick of one second),
+# and that must not make the fetch for the second zone "not ready"
 for z in big.test big2.test; do
-    # (the version the first UPDATE replaced is retired, not freed yet, and counts: a fetch for the second zone is shed with SERVFAIL until it is gone)
-    n=0; got=""
-    while [ $n -lt 30 ]; do
-        got=$(perl tests/db/dns_tcp_probe.pl 127.0.0.1 "$PORT" udp-update $z 2>&1)
-        echo "$got" | grep -q 'rcode=0$' && break
-        sleep 1; n=$((n + 1))
-    done
-    echo "$got" | grep -q 'rcode=0$' || fail "UPDATE of $z: $got"
+    got=$(perl tests/db/dns_tcp_probe.pl 127.0.0.1 "$PORT" udp-update $z 2>&1)
+    echo "$got" | grep -q 'rcode=0$' && pass "the UPDATE of $z (a zone out of memory) is applied at the first try" || fail "UPDATE of $z: $got"
 done
 LIM=$(stat limit); RES=$(stat resident)
-[ "$RES" -gt $((LIM / 10 * 11)) ] && pass "the zones changed by an UPDATE are over the hard limit ($RES > 110% of $LIM)" || fail "resident $RES is not over 110% of $LIM"
+[ "$RES" -gt $((LIM / 10 * 11)) ] && pass "the zones changed by an UPDATE stay in memory, above 110% of the limit ($RES > $LIM)" || fail "resident $RES is not over 110% of $LIM"
 W0=$(walks_now)
 conf "" "memory-limit 1m;"
 $KCTL reconfig > /dev/null 2>&1
 wait_walk "${W0:-0}"
-[ "${AS:-0}" -gt 1000 ] && pass "the walk finished (walking=0) with $AS summaries asked for and answered, over the hard limit" || fail "the walk asked for $AS summaries"
+[ "${AS:-0}" -gt 1000 ] && pass "the walk finished (walking=0) with $AS summaries asked for and answered" || fail "the walk asked for $AS summaries"
 [ "$(soa_serial n.test)" = "7" ] && oom n.test && pass "n.test has its apex: the SOA question does not read it" || fail "n.test SOA: $(soa_serial n.test); out of memory: $(oom n.test && echo yes || echo no)"
 stop_srv
 DBF=""

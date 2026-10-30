@@ -3094,9 +3094,10 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
         inv_ent_t *ie = zslot >= 0 ? inv_find(&io->inv, (uint16_t)zslot, m.u.zone_result.name) : NULL;
         if (ie && ie->has_pend && ie->fev != ie->p_fev && m.u.zone_result.status != KDB_ST_REJECTED && m.u.zone_result.status != KDB_ST_DELETED) {
             /* a fetch of the zone was served while this version was on its way: the Backend has that version, or this one, in an order nobody
-             * knows.  The inventory keeps what the fetch served; the next diff compares it with the database and sends the zone whole if it differs. */
+             * knows.  The inventory keeps what the fetch served; a diff follows at once when that is not the version that was sent (whatever the answer says: the
+             * Backend may keep the older one), and it sends the zone whole if the database has another. */
             ie->has_pend = false;
-            if (m.u.zone_result.status == KDB_ST_SEND_BODY) io->again = true;
+            if (m.u.zone_result.status == KDB_ST_SEND_BODY || ie->source_id != ie->p_source_id || ie->serial != ie->p_serial) io->again = true;
         } else if (ie) {
             switch (m.u.zone_result.status) {
             case KDB_ST_UNCHANGED:

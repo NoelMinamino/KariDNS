@@ -263,14 +263,21 @@ int main(void) {
     CHECK(a1.rcode == 0 && a1.ancount == 1 && a2.rcode == 0 && a2.ancount == 1);
     CHECK(!read_answer(sk[1]).got);                                    /* once */
 
-    /* -- woken while the zone is still not there: parked again, with the deadline it had; nothing asked again */
+    /* -- woken while the zone is still not there: parked again, with the deadline it had; nothing asked again while a fetch is on its way (LOADING) ... */
     atomic_store(&el->entry, NULL);
     SEND_QUERY(0x3001, true, 0);
     CHECK(table.nwait == 1 && park_fetch_pop(park_fetch_ring(0), &q));
     int64_t d0 = park_next_deadline_ms(&table, 0);
+    atomic_store(&el->state, ZDIR_ST_LOADING);
     CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", false));
     park_service(&w, -1);
     CHECK(table.nwait == 1 && !park_fetch_pop(park_fetch_ring(0), &q) && !read_answer(sk[1]).got);
+    CHECK(park_next_deadline_ms(&table, 0) == d0);
+    /* ... and asked again when nothing is on its way: the zone was taken out of memory again before the request could use it (the cache manager) */
+    atomic_store(&el->state, ZDIR_ST_ABSENT);
+    CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", false));
+    park_service(&w, -1);
+    CHECK(table.nwait == 1 && park_fetch_pop(park_fetch_ring(0), &q) && !park_fetch_pop(park_fetch_ring(0), &q) && !read_answer(sk[1]).got);
     CHECK(park_next_deadline_ms(&table, 0) == d0);
     atomic_store(&el->entry, entry);
     CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", false));

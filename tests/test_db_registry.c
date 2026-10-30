@@ -1573,6 +1573,33 @@ static bool walk_seen(const walk_t *w, const char *name) {
         if (strcmp(w->name[i], name) == 0) return true;
     return false;
 }
+/* D1a review 6D: the first settings a cold zone gets leave nothing to give back, so they make no garbage entry (a start of a million zones would otherwise force a
+ * publication a thousand times); replacing settings does */
+static void test_cold_no_garbage(void) {
+    printf("[TEST] registry: a cold commit with settings for a new zone makes no garbage entry...\n");
+    server_config_t *cfg = load_conf("view \"default\" { match-clients { any; }; };\n");
+    rebuild(cfg);
+    zone_ext_shared_t *s1 = mk_shared("p", "allow-transfer { 192.0.2.1; };"), *s2 = mk_shared("q", "allow-transfer { 192.0.2.2; };");
+    CHECK(s1 && s2);
+    uint8_t dg[32] = { 1 };
+    const uint64_t f0 = dbreg_garbage_forced();
+    char nm[24];
+    for (int i = 0; i < 1200; i++) {
+        snprintf(nm, sizeof(nm), "cg%04d.test.", i);
+        CHECK(dbreg_commit_cold("default", nm, 9000 + i, 1, dg, s1) == 0);
+    }
+    CHECK(dbreg_garbage_forced() == f0 && !dbreg_garbage_due());
+    for (int i = 0; i < 1200; i++) {                           /* other settings: the old ones are given back through the garbage, and that is counted */
+        snprintf(nm, sizeof(nm), "cg%04d.test.", i);
+        CHECK(dbreg_commit_cold("default", nm, 9000 + i, 1, dg, s2) == 0);
+    }
+    CHECK(dbreg_garbage_forced() == f0 + 1 && dbreg_garbage_due());
+    CHECK(snapshot_apply_db_delta() >= 0 && !dbreg_garbage_due());
+    zone_ext_shared_unref(s1);
+    zone_ext_shared_unref(s2);
+    dbreg_reset();
+}
+
 static void test_walk_robust(void) {
     printf("[TEST] registry walk in steps: a zone that leaves a chain or a rehash between two steps skips no zone...\n");
     server_config_t *cfg = load_conf("view \"default\" { match-clients { any; }; };\n");
@@ -1937,6 +1964,7 @@ int main(void) {
     test_glue_dirty_on_delete();
     test_dir_elements();
     test_dir_fetch_state();
+    test_cold_no_garbage();
     test_walk_robust();
     test_dir_delta_in_place();
     test_dir_garbage_order();

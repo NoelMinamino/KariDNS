@@ -208,11 +208,13 @@ static size_t g_garb_n;                        /* under g_zone_db_rebuild_lock *
 static _Atomic bool g_garb_force;
 
 bool dbreg_garbage_due(void) { return atomic_load_explicit(&g_garb_force, memory_order_acquire); }
+static _Atomic uint64_t g_garb_forced;          /* how many times the bound was passed (a publication was due) */
+uint64_t dbreg_garbage_forced(void) { return atomic_load_explicit(&g_garb_forced, memory_order_relaxed); }
 
 static void garb_ent_push_locked(zdir_gent_t *gent) {
   gent->next = g_garb.ents;
   g_garb.ents = gent;
-  if (++g_garb_n >= GARB_ENTS_MAX) atomic_store_explicit(&g_garb_force, true, memory_order_release);
+  if (++g_garb_n >= GARB_ENTS_MAX && !atomic_exchange_explicit(&g_garb_force, true, memory_order_acq_rel)) atomic_fetch_add_explicit(&g_garb_forced, 1, memory_order_relaxed);
 }
 
 static void garb_elem(zdir_garbage_t *g, zdir_elem_t *e) {
@@ -1964,7 +1966,9 @@ int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uin
     zdir_gent_t *gent = NULL;
     zone_ext_shared_t *osh = atomic_load_explicit(&z->sh, memory_order_relaxed);
     uint8_t *new_digest = NULL;
-    if ((osh != shared && !(gent = malloc(sizeof(*gent)))) || (queue_add && !dbreg_queue_reserve(&rv->adds, rv->n_adds, &rv->cap_adds)) ||
+    /* the old settings are given back through the garbage (a reader may hold them); a zone that had none leaves nothing to give back, and no entry is made: an entry
+     * that frees nothing would count against the bound of the garbage (a start of a million zones would publish a thousand times) */
+    if ((osh && osh != shared && !(gent = malloc(sizeof(*gent)))) || (queue_add && !dbreg_queue_reserve(&rv->adds, rv->n_adds, &rv->cap_adds)) ||
         (!z->digest && !(new_digest = malloc(32)))) {
         free(gent);
         if (fresh) {
@@ -1977,11 +1981,13 @@ int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uin
     if (osh != shared) {                       /* the settings of the zone (its allow-query and `cache` setting are read from them while it is out of memory) */
         if (shared) zone_ext_shared_ref(shared);
         atomic_store_explicit(&z->sh, shared, memory_order_release);
-        gent->entry = NULL;
-        gent->sh_old = osh;
-        gent->apex_old = NULL;
-        gent->served = false;
-        garb_ent_push_locked(gent);               /* a reader may hold the old settings: given back with the garbage of the next retired snapshot */
+        if (gent) {
+            gent->entry = NULL;
+            gent->sh_old = osh;
+            gent->apex_old = NULL;
+            gent->served = false;
+            garb_ent_push_locked(gent);           /* a reader may hold the old settings: given back with the garbage of the next retired snapshot */
+        }
     }
     if (queue_add) {
         rv->adds[rv->n_adds++] = z;
@@ -2127,6 +2133,20 @@ bool dbreg_apply_summary(const char *view, const char *zone, int64_t source_id, 
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     return applied;
+}
+
+bool dbreg_zone_version(const char *view, const char *zone, int64_t *source_id, uint32_t *serial) {
+    bool found = false;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    if (z && !(z->flags & ZDIR_F_DELETED)) {
+        *source_id = z->source_id;
+        *serial = zdir_serial(z);
+        found = true;
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return found;
 }
 
 /* What a batch summary (the loader thinks the Backend has no data of the zone) means for a zone that has its data here: DBREG_SUM_NONE (no data: the
@@ -2456,6 +2476,16 @@ static void cache_peak_note(void) {
     while (u > p && !atomic_compare_exchange_weak_explicit(&g_cache_peak, &p, u, memory_order_relaxed, memory_order_relaxed)) {}
 }
 
+/* The zone a fetch brought is about to wake the requests that wait for it (a query, an UPDATE): the time it may not be taken out of memory (CACHE_MIN_RESIDENT_MS)
+ * starts now, not when the data was installed (the delta that shows the zone to the workers can come between the two), so that the woken request finds it. */
+void dbreg_touch_loaded(const char *view, const char *zone) {
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    if (z && zdir_entry(z)) z->t_load = (uint32_t)cache_mono_ms();
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+}
+
 void dbreg_cache_set_limit(uint64_t limit) { atomic_store_explicit(&g_cache_limit, limit, memory_order_relaxed); }
 uint64_t dbreg_cache_limit(void) { return atomic_load_explicit(&g_cache_limit, memory_order_relaxed); }
 void dbreg_cache_note_miss(void) { atomic_fetch_add_explicit(&g_cache_misses, 1, memory_order_relaxed); }
@@ -2469,6 +2499,9 @@ bool dbreg_cache_over_high(uint64_t extra) {
     return zb.resident + zb.retired + extra > lim / 100 * CACHE_HIGH_PCT;
 }
 
+/* The zones in memory are above the hard limit: no zone is fetched for a query meanwhile.  The retired bytes are not counted: they belong to versions that were
+ * replaced or taken out and are freed within a second (the control tick, the end of a batch), and a fetch that was shed for them answered its query with "not
+ * ready" although the memory in use was within the limit (two UPDATEs of big zones, one after the other). */
 bool dbreg_cache_over_limit(void) {
     uint64_t lim = atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
     if (!lim) return false;
@@ -2476,7 +2509,7 @@ bool dbreg_cache_over_limit(void) {
     zone_bytes_get(ZBYTES_DB, &zb);
     uint64_t pinned_now = atomic_load_explicit(&g_cache_pinned_bytes, memory_order_relaxed);
     if (pinned_now > lim / 10 * 9) lim = pinned_now + lim / 10;     /* the pinned zones alone fill it: leave room for the others */
-    return zb.resident + zb.retired > lim + lim / CACHE_HARD_DIV;
+    return zb.resident > lim + lim / CACHE_HARD_DIV;
 }
 
 void dbreg_cache_stats(dbreg_cache_stats_t *o) {
@@ -2618,7 +2651,7 @@ uint32_t dbreg_cache_round(void) {
             z->qseen = q32;
             f = f > UINT32_MAX - dq ? UINT32_MAX : f + dq;
             atomic_store_explicit(&z->freq, f, memory_order_relaxed);
-            if (z->flags & ZDIR_F_PIN) {
+            if ((z->flags & ZDIR_F_PIN) || e->updated) {        /* (a zone that a dynamic UPDATE changed is never taken out until the database replaces it: it is as good as pinned) */
                 g_cycle_pinned += bytes;
                 pinned_now += bytes;
                 continue;
