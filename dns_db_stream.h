@@ -51,7 +51,7 @@
  *                     9 settings text<=65535 O | 10 profile str ne <=255 O |
  *                     D1a (fetch stream only): 11 request_id u64 O (the FETCH_REQ this zone answers; required on the fetch stream, forbidden
  *                     on the batch stream).  flags bit3 = summary: the zone's serial, kind and settings without its data (primary: rr_count 0, no
- *                     ZONE_DATA, digest all zero); only on the fetch stream.  12 soa_refresh u32 | 13 soa_retry u32 | 14 soa_expire u32 (all
+ *                     ZONE_DATA, digest all zero); on the fetch stream, and (milestone 4) in a batch when CONFIG said dir_only.  12 soa_refresh u32 | 13 soa_retry u32 | 14 soa_expire u32 (all
  *                     three or none: the timers of the zone's SOA, which the zone directory keeps without the zone).
  *   ZONE_DATA (5)     raw DNS message (<= 65,535 bytes), no TLV
  *   ZONE_END (6)      1 rr_count u64 R
@@ -77,7 +77,9 @@
  *                         4 conninfo_file path ne<=1023 O | 5 auto_reload u8 R (0/1) | 6 poll_interval u32 R (s) |
  *                         7 coalesce_ms u32 R | 8 max_zone_records u64 R | 9 max_zone_bytes u64 R |
  *                         10 shared_source u8 O (0/1; B6b: the source is the global one, so karidns_domain_views maps zones to this view)
- *                     5 default_ttl u32 O (<= 2147483647; B4a) | 6 bulk_threshold u8 O (<= 100) | 7 loader_threads u32 O (<= 16)
+ *                     5 default_ttl u32 O (<= 2147483647; B4a) | 6 bulk_threshold u8 O (<= 100) | 7 loader_threads u32 O (<= 16) |
+ *                     8 dir_only u8 O (0/1; D1a milestone 4: memory-limit is set, so a zone the Backend does not have in memory is sent as a
+ *                         summary (ZONE_BEGIN with the summary flag, settings and SOA timers, no ZONE_DATA) also in a batch)
  *   RELOAD_REQ (0x8002) 1 request_id u64 R | 2 scope u8 R (0 all, 1 one zone) | 3 view view O | 4 zone name O |
  *                     5 force u8 R (0/1); scope 1 needs tags 3 and 4, scope 0 forbids them
  *   INVENTORY (0x8003) 1 ENTRY nested, repeatable: 1 view view R | 2 zone name R | 3 source_id i64 R |
@@ -237,6 +239,7 @@ typedef struct {
     uint32_t default_ttl;       /* 0 = tag absent */
     int bulk_threshold;         /* percent; -1 = tag absent */
     uint32_t loader_threads;    /* 0 = tag absent */
+    bool dir_only;              /* tag 8 (D1a milestone 4): memory-limit is set; the loader sends the summary only (no ZONE_DATA) for a zone the Backend does not have in memory */
     uint32_t n_views;
     const uint8_t *body; uint32_t body_len;       /* for kdb_config_views() */
 } kdb_config_t;

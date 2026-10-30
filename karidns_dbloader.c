@@ -161,7 +161,8 @@ typedef struct {
     bool has_timers;                  /* D1a: the refresh / retry / expire of that SOA (for the summary of a fetch) */
     uint32_t t_refresh, t_retry, t_expire;
     bool want;                        /* stream mode: read and convert this zone in this load */
-    bool g_ok;                        /* stream mode: the Backend has a version of the zone it did not reject (digest gate) ... */
+    bool summary;                     /* D1a milestone 4: send the summary (settings, serial, SOA timers) instead of the zone: the Backend does not keep its data */
+    bool g_ok;                       /* stream mode: the Backend has a version of the zone it did not reject (digest gate) ... */
     int64_t g_source;                 /* ... with this source id, serial and digest (copied from the inventory by plan_diff(), */
     uint32_t g_serial;                /* so that the conversion threads never read the inventory) */
     uint8_t g_digest[KDB_DIGEST_LEN];
@@ -320,6 +321,7 @@ typedef struct inv_ent {
     bool resident;                    /* D1a: the Backend has the data of the zone in memory (false: only its entry in the directory; the digest is then zero) */
     bool dirty;                       /* the last version offered was rejected / unreadable: offer the zone again */
     bool has_pend;
+    bool p_resident;                  /* what was sent is the zone with its data (false: a summary) */
     uint32_t mark;                    /* generation of the diff that saw the zone in the database */
     int64_t source_id, p_source_id;
     uint32_t serial, p_serial;
@@ -384,6 +386,7 @@ typedef struct {
      * carries the request id; with fetch_summary the zone is not read, only its summary is sent. */
     bool fetch;
     bool fetch_summary;
+    bool dir_only;                    /* D1a milestone 4: CONFIG dir_only (memory-limit): zones the Backend has no data of are sent as summaries */
     uint64_t fetch_req;
     uint64_t batch_id;
     uint8_t batch_kind;
@@ -442,6 +445,7 @@ typedef struct {
     uint64_t generation;
     char driver[40], server_id[72];
     uint32_t default_ttl, loader_threads;
+    bool dir_only;
     int bulk_threshold;
     lview_t *views;
     size_t nviews;
@@ -935,6 +939,11 @@ static uint8_t zone_sec_kind(const char *type) {
     return KDB_ZK_PRIMARY;
 }
 
+/* no rows of `records` (and no extension rows) are read for this zone: a secondary zone, or a zone that is sent as a summary (D1a milestone 4) */
+static bool zinfo_no_rows(const zinfo_t *zi) {
+    return zone_sec_kind(zi->type) != KDB_ZK_PRIMARY || zi->summary;
+}
+
 static const char *zone_type_reason(const char *type) {
     if (!type) return "domains.type is NULL";
     if (strcasecmp(type, "NATIVE") == 0 || strcasecmp(type, "MASTER") == 0) return NULL;
@@ -1253,6 +1262,7 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
     const uint8_t skind = zone_sec_kind(zi->type);
     if (x->check) chk_zone_begin(x, zi, tr ? "other" : skind == KDB_ZK_SECONDARY ? "secondary" : skind == KDB_ZK_CATALOG ? "catalog" : "primary");
     if (z && skind != KDB_ZK_PRIMARY && pdns_zone_set_secondary(z, skind, zi->master) != 0) w->oom = true;
+    if (z && skind == KDB_ZK_PRIMARY && zi->summary) pdns_zone_set_summary(z, zi->serial, zi->has_timers, zi->t_refresh, zi->t_retry, zi->t_expire);
     if (w->oom) {
         r->kind = ZR_FATAL;
     } else if (!zi->name) {
@@ -1266,7 +1276,7 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
             db_meta_row_t row = { zi->id, m->v[mi].kind, m->v[mi].content };
             pdns_zone_add_meta(z, &row);
         }
-        if (skind == KDB_ZK_PRIMARY && x->has_ext) eset_feed(w->bulk_meta ? &x->ext : &w->zext, zi->id, z);      // B8: tags, tinydns attributes, tag definitions
+        if (skind == KDB_ZK_PRIMARY && !zi->summary && x->has_ext) eset_feed(w->bulk_meta ? &x->ext : &w->zext, zi->id, z);      // B8: tags, tinydns attributes, tag definitions
         const char *why = NULL;
         if (pdns_zone_finish(z) != 0) {
             why = z->error;
@@ -1356,6 +1366,7 @@ static int commit_zone(ctx_t *x, const zinfo_t *zi, zres_t *r) {
                 return -1;
             }
             ie->has_pend = true;
+            ie->p_resident = !zi->summary;
             ie->p_source_id = zi->id;
             ie->p_serial = r->serial;
             memcpy(ie->p_digest, r->digest, KDB_DIGEST_LEN);
@@ -1398,7 +1409,7 @@ static int rec_cb(void *ud, int64_t did, const db_record_row_t *row) {
         w->stop = true;
         return 1;
     }
-    if (w->cur && !w->cur->failed && !zone_sec_kind(WZ(w, w->wi)->type)) pdns_zone_add_record(w->cur, row);   /* B7b: a SLAVE's rows are PowerDNS's copy of the transfer */
+    if (w->cur && !w->cur->failed && !zinfo_no_rows(WZ(w, w->wi))) pdns_zone_add_record(w->cur, row);   /* B7b: a SLAVE's rows are PowerDNS's copy of the transfer */
     return 0;
 }
 
@@ -1425,7 +1436,7 @@ static int run_group(wk_t *w, size_t a, size_t b) {
         size_t nr = 0;
         for (size_t i = pos; i < e; i++) {
             ids[i - pos] = WZ(w, i)->id;
-            if (zone_sec_kind(WZ(w, i)->type) == KDB_ZK_PRIMARY) rids[nr++] = WZ(w, i)->id;        /* B7b: no records for a secondary zone */
+            if (!zinfo_no_rows(WZ(w, i))) rids[nr++] = WZ(w, i)->id;       /* B7b: no records for a secondary zone */
         }
         mset_reset(&w->zmeta);
         eset_reset(&w->zext);
@@ -1462,7 +1473,10 @@ static int run_task(wk_t *w, size_t a, size_t b, bool bulk, bool all) {
     w->wi = a;
     w->wend = b;
     if (bulk) {
-        if (all) rc = drv->scan_records(w->conn, NULL, rec_cb, w);
+        bool rows = false;                                  /* D1a milestone 4: a task of summaries only reads no records (the metadata are in x->meta) */
+        for (size_t pos = a; pos < b && !rows; pos++) rows = !zinfo_no_rows(WZ(w, pos));
+        if (!rows) rc = 0;
+        else if (all) rc = drv->scan_records(w->conn, NULL, rec_cb, w);
         else rc = drv->scan_records_range(w->conn, WZ(w, a)->id, WZ(w, b - 1)->id, rec_cb, w);
         if (rc != 0 && rc != DB_STOPPED) return db_err_c(drv, w->conn, w->errtext, sizeof(w->errtext), rc, "reading records");
         if (rc == DB_STOPPED) {
@@ -1482,7 +1496,7 @@ static int run_task(wk_t *w, size_t a, size_t b, bool bulk, bool all) {
         int64_t id = WZ(w, pos)->id;
         w->wi = pos;
         mset_reset(&w->zmeta);
-        bool sec = zone_sec_kind(WZ(w, pos)->type) != KDB_ZK_PRIMARY;      /* B7b: no records are read for a secondary zone */
+        bool sec = zinfo_no_rows(WZ(w, pos));     /* B7b: no records are read for a secondary zone */
         eset_reset(&w->zext);
         if ((rc = drv->scan_metadata(w->conn, &id, meta_cb, &w->zmeta)) != 0 || (!sec && (rc = drv->scan_records(w->conn, &id, rec_cb, w)) != 0) ||
             (!sec && w->x->has_ext && (rc = eset_load(drv, w->conn, &id, &w->zext)) != 0)) {
@@ -1932,6 +1946,7 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
     for (size_t i = 0; i < x->nz; i++) {
         zinfo_t *z = &x->zones[i];
         z->want = false;
+        z->summary = false;
         if (!z->canon) {
             z->want = compare_all;                 /* an unusable name is reported when everything is compared */
             continue;
@@ -1956,6 +1971,11 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
             z->want = (compare_all && !cold) || changed || !e || !e->known || e->dirty || e->source_id != z->id ||
                       (!zone_sec_kind(z->type) && (!z->has_serial || z->serial != e->serial));
         }
+        /* D1a milestone 4 (design 3.3, 6.3): with memory-limit the Backend keeps the data of the zones that are asked for, not of all of them.  A zone it
+         * has no data of (new to it, or in its directory only) is sent as a summary: settings, serial, SOA timers.  The data comes when a query, a transfer
+         * or the warm-up asks for it (the fetch stream).  A zone it has in memory is sent whole, as before. */
+        z->summary = x->dir_only && z->want && z->canon && z->has_serial && !zone_type_reason(z->type) && zone_sec_kind(z->type) == KDB_ZK_PRIMARY &&
+                     !(e && e->known && e->resident);
     }
     /* what the Backend has and the database no longer lists */
     gone_t *gone = NULL;
@@ -2253,7 +2273,9 @@ static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, boo
                 if (x->meta.oom) lg(LOG_ERR, "out of memory");
                 goto out_snap;
             }
-            if (x->has_ext && (rc = eset_load(x->drv, x->conn, NULL, &x->ext)) != 0) {
+            bool any_rows = false;                            /* D1a milestone 4: nothing but summaries to send: no tags to read */
+            for (size_t i = 0; i < x->nwl && !any_rows; i++) any_rows = !zinfo_no_rows(&x->zones[x->wl[i]]);
+            if (x->has_ext && any_rows && (rc = eset_load(x->drv, x->conn, NULL, &x->ext)) != 0) {
                 status = x->ext.oom ? EXIT_ERROR : db_err(x, rc, "reading the tags and tinydns attributes");
                 if (x->ext.oom) lg(LOG_ERR, "out of memory");
                 goto out_snap;
@@ -2632,6 +2654,7 @@ static int cfg_from_msg(const kdb_msg_t *m, lcfg_t *c) {
         snprintf(c->server_id, sizeof(c->server_id), "%.*s", (int)m->u.config.server_id.len, m->u.config.server_id.p);
     c->default_ttl = m->u.config.default_ttl;
     c->loader_threads = m->u.config.loader_threads;
+    c->dir_only = m->u.config.dir_only;
     c->bulk_threshold = m->u.config.bulk_threshold;
     c->views = calloc(m->u.config.n_views ? m->u.config.n_views : 1, sizeof(lview_t));
     if (!c->views) return -1;
@@ -2757,7 +2780,7 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
                     ie->serial = ie->p_serial;
                     memcpy(ie->digest, ie->p_digest, KDB_DIGEST_LEN);
                     ie->known = true;
-                    ie->resident = true;               /* (what was sent is in memory) */
+                    ie->resident = ie->p_resident;     /* (what was sent is in memory, unless it was a summary) */
                     ie->has_pend = false;
                 }
                 ie->dirty = false;
@@ -2985,6 +3008,7 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
     x->reconcile = reconcile;
     x->bulk_threshold = c->bulk_threshold;
     x->nthreads = c->loader_threads >= 1 && c->loader_threads <= 16 ? c->loader_threads : 1;
+    x->dir_only = c->dir_only;
     x->map_logged = false;
     x->n_zones = x->n_failed = x->n_unwritten = 0;
     x->n_unchanged = x->n_deleted = x->n_read = 0;

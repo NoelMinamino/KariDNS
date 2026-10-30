@@ -290,6 +290,15 @@ int pdns_zone_set_secondary(pdns_zone_t *z, uint8_t kind, const char *master) {
     return 0;
 }
 
+void pdns_zone_set_summary(pdns_zone_t *z, uint32_t serial, bool has_timers, uint32_t refresh, uint32_t retry, uint32_t expire) {
+    z->summary = true;
+    z->sum_serial = serial;
+    z->sum_timers = has_timers;
+    z->sum_refresh = refresh;
+    z->sum_retry = retry;
+    z->sum_expire = expire;
+}
+
 /* The canonical absolute name pdns_zone_new() would give a zone called dbname; false when it would be a failed zone. */
 bool pdns_canonical_zone_name(const char *dbname, char out[DNS_NAME_TEXT_SIZE]) {
     if (!dbname) return false;
@@ -1595,6 +1604,10 @@ int pdns_zone_finish(pdns_zone_t *z) {
         z->serial = 0;
         return 0;
     }
+    if (z->summary) {                      /* D1a: the directory entry only; the rows (and what they could say against the zone) come with the data */
+        z->serial = z->sum_serial;
+        return 0;
+    }
     if (z->n_null_ttl)
         zwarn(z, true, z->first_null_ttl_id, "%llu record(s) have a NULL ttl; default-ttl %u used (first shown)",
               (unsigned long long)z->n_null_ttl, z->opts.default_ttl);
@@ -1888,7 +1901,9 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
     char dummy[8];
     if (!err || errlen == 0) { err = dummy; errlen = sizeof(dummy); }
     const bool sec = z->zkind != KDB_ZK_PRIMARY;         /* B7b: no rows, the settings text is the zone */
-    if (z->failed || !z->finished || (!z->arena_ready && !sec)) {
+    const bool sum = z->summary && !sec;                 /* D1a: the directory entry of a primary zone: no rows, a zero digest, no gate */
+    const bool norows = sec || sum;
+    if (z->failed || !z->finished || (!z->arena_ready && !norows)) {
         snprintf(err, errlen, "zone '%s': not converted", z->name);
         return -1;
     }
@@ -1904,21 +1919,21 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
         return -1;
     }
     const char *profile = p->profile ? p->profile : z->profile;
-    int rc = sec ? 0 : gen_bodies(z, digest_sink, &dd, &rr_count, err, errlen);
+    int rc = norows ? 0 : gen_bodies(z, digest_sink, &dd, &rr_count, err, errlen);
     if (rc == 0 && rr_count > z->opts.max_records) {
         snprintf(err, errlen, "zone '%s': %llu records exceed max-zone-records", z->name, (unsigned long long)rr_count);
         rc = -1;
     }
     /* B8: the tinydns flag is part of what the Backend serves (time-dependent TTLs, no response cache) also when no RR carries a time
      * stamp or a location; the attributes themselves are in the bodies */
-    if (rc == 0 && !sec && (z->flags & PDNS_F_TINYDNS)) {
+    if (rc == 0 && !norows && (z->flags & PDNS_F_TINYDNS)) {
         static const uint8_t ftag[] = "KDB1-TINYDNS";
         if (EVP_DigestUpdate(dd.md, ftag, sizeof(ftag)) != 1) rc = -1;
     }
     /* B7a: a metadata-only edit (the settings text, the profile that is named, the text of that profile) must change the
      * digest, or the diff would find the zone up to date.  Zones without settings and profile keep the digest of the data
      * alone.  Every field is length-prefixed, so two different splits cannot give the same input. */
-    if (rc == 0 && ((z->settings && *z->settings) || (profile && *profile))) {
+    if (rc == 0 && !sum && ((z->settings && *z->settings) || (profile && *profile))) {
         const char *parts[3] = { z->settings ? z->settings : "", profile ? profile : "", p->profile_text ? p->profile_text : "" };
         static const uint8_t tag[] = "KDB1-SETTINGS";
         if (EVP_DigestUpdate(dd.md, tag, sizeof(tag)) != 1) rc = -1;
@@ -1931,13 +1946,15 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
         }
         if (rc != 0) snprintf(err, errlen, "zone '%s': digest failed", z->name);
     }
-    if (rc == 0 && (EVP_DigestFinal_ex(dd.md, digest, &dlen) != 1 || dlen != KDB_DIGEST_LEN)) {
+    if (sum) {
+        memset(digest, 0, KDB_DIGEST_LEN);                  /* a zone that is not in memory has no digest (INVENTORY says the same) */
+    } else if (rc == 0 && (EVP_DigestFinal_ex(dd.md, digest, &dlen) != 1 || dlen != KDB_DIGEST_LEN)) {
         snprintf(err, errlen, "zone '%s': digest failed", z->name);
         rc = -1;
     }
     EVP_MD_CTX_free(dd.md);
     if (rc != 0) return -1;
-    if (p->gate && p->gate(p->gate_ud, z->serial, digest) != 0) return 1;        /* the loader has this version already */
+    if (!sum && p->gate && p->gate(p->gate_ud, z->serial, digest) != 0) return 1;        /* the loader has this version already */
 
     /* pass 2: the messages */
     kdb_enc_t enc;
@@ -1949,16 +1966,19 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
         kdb_enc_i64(&enc, 3, p->source_id) != 0 || kdb_enc_u8(&enc, 4, sec ? z->zkind : p->zone_kind) != 0 ||
         kdb_enc_u32(&enc, 5, sec ? 0 : z->serial) != 0 ||
         kdb_enc_u32(&enc, 6, sec ? 0 : ((z->flags & PDNS_F_PRESIGNED ? KDB_ZF_PRESIGNED : 0) | (z->has_ext ? KDB_ZF_EXTENDED : 0) |
-                                  (z->flags & PDNS_F_TINYDNS ? KDB_ZF_TINYDNS : 0))) != 0 ||
+                                  (z->flags & PDNS_F_TINYDNS ? KDB_ZF_TINYDNS : 0) | (sum ? KDB_ZF_SUMMARY : 0))) != 0 ||
         kdb_enc_u64(&enc, 7, rr_count) != 0 || kdb_enc_bytes(&enc, 8, digest, KDB_DIGEST_LEN) != 0 ||
         (z->settings && *z->settings && kdb_enc_str(&enc, 9, z->settings) != 0) ||
         (profile && *profile && kdb_enc_str(&enc, 10, profile) != 0) ||
-        (p->request_id && kdb_enc_u64(&enc, 11, p->request_id) != 0) || kdb_enc_end(&enc) != 0 ||
+        (p->request_id && kdb_enc_u64(&enc, 11, p->request_id) != 0) ||
+        (sum && z->sum_timers && (kdb_enc_u32(&enc, 12, z->sum_refresh) != 0 || kdb_enc_u32(&enc, 13, z->sum_retry) != 0 ||
+                                  kdb_enc_u32(&enc, 14, z->sum_expire) != 0)) ||
+        kdb_enc_end(&enc) != 0 ||
         emit_msg(&eu) != 0) {
         snprintf(err, errlen, "zone '%s': ZONE_BEGIN could not be encoded or sent", z->name);
         goto out;
     }
-    if (!sec) {
+    if (!norows) {
         uint64_t again = 0;
         if (gen_bodies(z, data_sink, &eu, &again, err, errlen) != 0) goto out;
         if (again != rr_count) {

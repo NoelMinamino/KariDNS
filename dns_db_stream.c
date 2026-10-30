@@ -79,7 +79,7 @@ TDEF(td_cfg_view, "CONFIG.VIEW", sp_cfg_view);
 static const kdb_tspec_t sp_config[] = {
     S(KT_U64, KS_REQ, 0), S(KT_STR, KS_REQ | KS_NE, 32), S(KT_STR, 0, 64),
     { KT_NEST, 0, KDB_MAX_CONFIG_VIEWS, &td_cfg_view },
-    S(KT_U32, KS_MAXV, 2147483647u), S(KT_U8, KS_MAXV, 100), S(KT_U32, KS_MAXV, 16) };
+    S(KT_U32, KS_MAXV, 2147483647u), S(KT_U8, KS_MAXV, 100), S(KT_U32, KS_MAXV, 16), S(KT_U8, KS_MAXV, 1) };
 TDEF(td_config, "CONFIG", sp_config);
 static const kdb_tspec_t sp_reload_req[] = {
     S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 1), S(KT_U16, KS_VIEW, 0), S(KT_NAME, 0, 0), S(KT_U8, KS_REQ | KS_MAXV, 1) };
@@ -404,6 +404,7 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         m->u.config.default_ttl = V(5).present ? (uint32_t)V(5).u : 0;
         m->u.config.bulk_threshold = V(6).present ? (int)V(6).u : -1;
         m->u.config.loader_threads = V(7).present ? (uint32_t)V(7).u : 0;
+        m->u.config.dir_only = V(8).present && V(8).u != 0;
         m->u.config.n_views = nrep;
         m->u.config.body = fr->body;
         m->u.config.body_len = fr->len;
@@ -812,7 +813,6 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         bool summary = (m->u.zone_begin.flags & KDB_ZF_SUMMARY) != 0;
         if (sm->fetch != (m->u.zone_begin.request_id != 0))
             SMFAIL(sm, KDB_E_STATE, sm->fetch ? "ZONE_BEGIN: the fetch stream needs the request id" : "ZONE_BEGIN: a request id belongs to the fetch stream");
-        if (summary && !sm->fetch) SMFAIL(sm, KDB_E_STATE, "ZONE_BEGIN: a summary belongs to the fetch stream");
         sm->zone_req_id = m->u.zone_begin.request_id;
         if (zk == KDB_ZK_PRIMARY && summary) {
             if (n != 0) SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: a summary has rr_count 0, not %llu", (unsigned long long)n);

@@ -171,6 +171,9 @@ typedef struct pdns_zone_s {
     char profile[256];              /* X-KARIDNS-PROFILE, "" if none */
     uint8_t zkind;                  /* B7b: KDB_ZK_PRIMARY (0, rows), KDB_ZK_SECONDARY (SLAVE) or KDB_ZK_CATALOG (CONSUMER): no rows */
     char *master;                   /* B7b: domains.master of such a zone (private copy) */
+    bool summary;                   /* D1a milestone 4: only the directory entry of a primary zone (serial, SOA timers, settings, flags): no rows */
+    uint32_t sum_serial, sum_refresh, sum_retry, sum_expire;
+    bool sum_timers;
     char *nsec3param;               /* NSEC3PARAM metadata (first row), NULL if none */
     presigned_mode_t presigned_mode;   /* PS_NSEC3 / PS_NSEC: the chain was rebuilt; PS_NONE: served as stored */
     size_t n_synth;                 /* records presigned_rebuild() added at the end of arena.records */
@@ -201,6 +204,13 @@ bool pdns_canonical_zone_name(const char *dbname, char out[DNS_NAME_TEXT_SIZE]);
  * PowerDNS syntax ip, ip:port, [ip]:port, comma separated) in front of the settings text, and fails a zone without a usable
  * master.  Returns -1 on out of memory. */
 int pdns_zone_set_secondary(pdns_zone_t *z, uint8_t kind, const char *master);
+
+/* D1a milestone 4 (design 3.3, 6.3): make a primary zone a summary before pdns_zone_finish(): the part of it the Backend keeps in its zone
+ * directory when the data is not in memory.  No rows are needed (pdns_zone_add_record() is not called); pdns_zone_finish() converts the
+ * metadata into the settings text and the flags, and pdns_zone_encode_kdb() writes ZONE_BEGIN (KDB_ZF_SUMMARY, rr_count 0, a zero digest,
+ * the serial and the SOA timers given here) and ZONE_END, no ZONE_DATA, and never calls the digest gate.  serial and timers are those of the
+ * zone's SOA as the loader read them from the zone list. */
+void pdns_zone_set_summary(pdns_zone_t *z, uint32_t serial, bool has_timers, uint32_t refresh, uint32_t retry, uint32_t expire);
 
 /* One row of `records` (the driver passes them in records.id order).  0 = accepted or skipped; -1 = the zone has
  * failed (z->error says why; later calls return -1 at once, so a driver callback can stop its scan). */

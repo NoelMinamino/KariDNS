@@ -94,7 +94,7 @@ $KCTL dbstatus 2>/dev/null | grep '^cache:' > "$T/after_start"
 read_stat() { sed -n "s/.* $1=\([0-9]*\).*/\1/p" "$2" | tail -1; }
 RES0=$(read_stat resident "$T/after_start"); RET0=$(read_stat retired "$T/after_start"); COLD0=$(read_stat cold "$T/after_start")
 [ -n "$RES0" ] && [ $((RES0 + RET0)) -le $LIMIT ] && pass "after the start the database zones hold $((RES0 + RET0)) bytes (limit $LIMIT)" || fail "after the start: resident ${RES0:-?} retired ${RET0:-?}, limit $LIMIT"
-[ "${COLD0:-0}" -gt 0 ] && pass "$COLD0 of $NZ zones came cold at the start (the limit was reached)" || fail "no zone came cold at the start"
+[ "${COLD0:-0}" -gt 0 ] && pass "$COLD0 of $NZ zones came without data at the start (the loader sent their summaries)" || fail "no zone came without data at the start"
 
 echo "== Zipf load: $NCLIENT clients, $NQ queries each"
 pids=""

@@ -208,6 +208,21 @@ static void send_summary(int fd, kdb_enc_t *e, uint16_t view, const char *zone, 
     ch_send(fd, e);
 }
 
+/* D1a milestone 4: the summary of a zone of a batch (the directory entry: settings, serial, SOA timers; no data) */
+static void send_dir_zone(int fd, kdb_enc_t *e, uint16_t view, const char *zone, uint32_t serial, int64_t sid, const char *settings) {
+    uint8_t dig[KDB_DIGEST_LEN] = { 0 };
+    kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
+    kdb_enc_u16(e, 1, view); kdb_enc_name(e, 2, zone); kdb_enc_i64(e, 3, sid); kdb_enc_u8(e, 4, KDB_ZK_PRIMARY);
+    kdb_enc_u32(e, 5, serial); kdb_enc_u32(e, 6, KDB_ZF_SUMMARY); kdb_enc_u64(e, 7, 0); kdb_enc_bytes(e, 8, dig, sizeof(dig));
+    if (settings) kdb_enc_str(e, 9, settings);
+    kdb_enc_u32(e, 12, 4444); kdb_enc_u32(e, 13, 555); kdb_enc_u32(e, 14, 66666);
+    kdb_enc_end(e);
+    kdb_enc_begin(e, KDB_T_ZONE_END);
+    kdb_enc_u64(e, 1, 0);
+    kdb_enc_end(e);
+    ch_send(fd, e);
+}
+
 static void send_failed(int fd, kdb_enc_t *e, uint16_t view, const char *zone, uint64_t req) {
     kdb_enc_begin(e, KDB_T_ZONE_FAILED);
     kdb_enc_u16(e, 1, view); kdb_enc_name(e, 2, zone); kdb_enc_i64(e, 3, 0); kdb_enc_str(e, 4, "no such zone in the database"); kdb_enc_u64(e, 5, req);
@@ -525,6 +540,46 @@ int main(void) {
         for (int i = 0; i < 300 && !gone; i++) { usleep(50000); gone = zdir_entry(fe) == NULL; }
         CHECK(gone);                                                              /* (after CACHE_MIN_RESIDENT_MS, whatever the pressure) */
 
+        /* D1a milestone 4 (design 3.3, 6.3): with memory-limit the loader sends the summary of a zone it does not see in memory, also in a batch: the
+         * directory learns the zone (serial, SOA timers, settings), no data is built.  A summary for a zone that has its data here changes nothing
+         * (UNCHANGED); a pinned zone is read right after its summary (warm-up, priority "warm"). */
+        {
+            kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+            kdb_enc_u64(&e, 1, 4); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
+            kdb_enc_end(&e);
+            ch_send(a[0], &e);
+            send_dir_zone(a[0], &e, 0, "dir1.test.", 7, 60001, "allow-transfer { 192.0.2.1; };");
+            send_dir_zone(a[0], &e, 0, "dirp.test.", 8, 60002, "cache pin;");
+            CHECK(dbreg_lookup_entry("default", "pin.test.") != NULL);
+            send_dir_zone(a[0], &e, 0, "pin.test.", 9, 900001, NULL);            /* (it has its data here) */
+            kdb_enc_begin(&e, KDB_T_BATCH_END);
+            kdb_enc_u64(&e, 1, 4); kdb_enc_u32(&e, 2, 3); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+            kdb_enc_end(&e);
+            ch_send(a[0], &e);
+            int st_dir1 = -1, st_dirp = -1, st_pin = -1;
+            while (ch_next(&mainc, &m, 10000) && m.type != KDB_T_BATCH_RESULT) {
+                if (m.type != KDB_T_ZONE_RESULT) continue;
+                if (strcmp(m.u.zone_result.name, "dir1.test.") == 0) st_dir1 = m.u.zone_result.status;
+                else if (strcmp(m.u.zone_result.name, "dirp.test.") == 0) st_dirp = m.u.zone_result.status;
+                else if (strcmp(m.u.zone_result.name, "pin.test.") == 0) st_pin = m.u.zone_result.status;
+            }
+            CHECK(st_dir1 == KDB_ST_APPLIED && st_dirp == KDB_ST_APPLIED && st_pin == KDB_ST_UNCHANGED);
+            for (int i = 0; i < 100 && !elem_of("default", "dirp.test."); i++) usleep(50000);
+            zdir_elem_t *d1 = elem_of("default", "dir1.test.");
+            CHECK(d1 != NULL && zdir_entry(d1) == NULL && atomic_load(&d1->state) == ZDIR_ST_ABSENT && d1->serial == 7);
+            CHECK(d1 && d1->refresh == 4444 && d1->retry == 555 && d1->expire == 66666);
+            CHECK(d1 && atomic_load(&d1->sh) != NULL && atomic_load(&d1->sh)->ext.allow_transfer_count == 1);
+            zdir_elem_t *pe2 = elem_of("default", "pin.test.");
+            CHECK(pe2 != NULL && zdir_entry(pe2) != NULL && pe2->serial != 9);   /* (still the zone with its data) */
+            /* the pinned one: a warm-up request follows by itself */
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "dirp.test.") == 0 &&
+                  m.u.fetch_req.priority == KDB_FETCH_PRIO_WARM && m.u.fetch_req.mode == KDB_FETCH_FULL);
+            send_zone(f[0], &e, 0, "dirp.test.", 8, m.u.fetch_req.request_id, 60002);
+            bool got = false;
+            for (int i = 0; i < 100 && !got; i++) { usleep(50000); got = dbreg_lookup_entry("default", "dirp.test.") != NULL; }
+            CHECK(got);
+        }
+
         /* the limit is taken away: everything is as before (nothing is taken out, nothing comes cold) */
         atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
         for (int i = 0; i < 60 && dbreg_cache_limit() != 0; i++) usleep(50000);
@@ -536,6 +591,22 @@ int main(void) {
         usleep(500000);
         dbreg_cache_stats(&cs);
         CHECK(cs.evictions == ev_before);
+
+        /* without memory-limit the Backend does not take a summary in a batch (the loader sends one only after CONFIG dir_only; a loader that does it
+         * anyway is told the zone was rejected, and nothing is installed) */
+        kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+        kdb_enc_u64(&e, 1, 5); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
+        kdb_enc_end(&e);
+        ch_send(a[0], &e);
+        send_dir_zone(a[0], &e, 0, "dir2.test.", 3, 60003, NULL);
+        kdb_enc_begin(&e, KDB_T_BATCH_END);
+        kdb_enc_u64(&e, 1, 5); kdb_enc_u32(&e, 2, 1); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+        kdb_enc_end(&e);
+        ch_send(a[0], &e);
+        int st_dir2 = -1;
+        while (ch_next(&mainc, &m, 10000) && m.type != KDB_T_BATCH_RESULT)
+            if (m.type == KDB_T_ZONE_RESULT && strcmp(m.u.zone_result.name, "dir2.test.") == 0) st_dir2 = m.u.zone_result.status;
+        CHECK(st_dir2 == KDB_ST_REJECTED && elem_of("default", "dir2.test.") == NULL);
 
         /* fetch-rate: queries scattered over many zones that are out of memory make the loader read zones at most as fast as the bucket fills
          * (burst = one second of the rate); the others are told "not ready" at once, and the status says how many */

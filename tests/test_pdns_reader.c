@@ -2030,6 +2030,58 @@ static void test_limits(void) {
     }
 }
 
+/* ------------------------------------------------------------------ D1a milestone 4: the summary of a primary zone */
+static void test_summary(void) {
+    printf("summary of a primary zone (D1a milestone 4): settings, serial, SOA timers, flags; no rows, no digest, no gate\n");
+    db_meta_row_t m[] = { M("ALLOW-AXFR-FROM", "192.0.2.1"), M("PRESIGNED", "1"), M("X-KARIDNS-CACHE", "pin") };
+    pdns_zone_t *z = pdns_zone_new("s.test", NULL);
+    CHECK(z != NULL);
+    pdns_zone_set_summary(z, 4711, true, 7200, 3600, 1209600);
+    for (size_t i = 0; i < 3; i++) pdns_zone_add_meta(z, &m[i]);
+    CHECK(pdns_zone_finish(z) == 0);                         /* no SOA row: a summary needs none */
+    CHECK_MSG(!z->failed, "%s", z->error);
+    CHECK(z->serial == 4711);
+    CHECK_HAS(z->settings, "allow-transfer { 192.0.2.1; };");
+    CHECK_HAS(z->settings, "cache pin;");
+    gate_seen_t g = { 0, 0, { 0 }, 0 };
+    pdns_kdb_params_t p = { 2, 99, KDB_ZK_PRIMARY, NULL, test_gate, &g, NULL, 0 };
+    rt_buf_t b = {0};
+    char err[200];
+    CHECK(pdns_zone_encode_kdb(z, &p, rt_emit, &b, err, sizeof(err)) == 0 && g.calls == 0);     /* the digest gate is not asked */
+    CHECK(b.n_msgs == 2);                                    /* ZONE_BEGIN and ZONE_END */
+    static uint8_t fb[KDB_MAX_BODY];
+    kdb_framer_t f;
+    kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
+    CHECK(kdb_framer_feed(&f, b.buf, b.len) == KDB_OK);
+    kdb_frame_t fr;
+    kdb_msg_t msg;
+    char why[200];
+    CHECK(kdb_framer_next(&f, &fr) == KDB_OK && fr.type == KDB_T_ZONE_BEGIN);
+    CHECK(kdb_decode(&fr, KDB_VIEWS_ANY, &msg, why, sizeof(why)) == KDB_OK);
+    const kdb_zone_begin_t *zb = &msg.u.zone_begin;
+    CHECK(zb->view == 2 && zb->source_id == 99 && zb->zone_kind == KDB_ZK_PRIMARY && zb->serial == 4711 && zb->rr_count == 0);
+    CHECK((zb->flags & KDB_ZF_SUMMARY) && (zb->flags & KDB_ZF_PRESIGNED));
+    CHECK(zb->has_soa_timers && zb->soa_refresh == 7200 && zb->soa_retry == 3600 && zb->soa_expire == 1209600);
+    uint8_t zero[KDB_DIGEST_LEN] = { 0 };
+    CHECK(memcmp(zb->digest, zero, KDB_DIGEST_LEN) == 0);
+    CHECK(zb->settings.p && zb->settings.len == strlen(z->settings) && memcmp(zb->settings.p, z->settings, zb->settings.len) == 0);
+    CHECK(kdb_framer_next(&f, &fr) == KDB_OK && fr.type == KDB_T_ZONE_END);
+    free(b.buf);
+    pdns_zone_free(z);
+    {   /* without timers: tags 12..14 are absent */
+        pdns_zone_t *z2 = pdns_zone_new("t.test", NULL);
+        pdns_zone_set_summary(z2, 5, false, 0, 0, 0);
+        CHECK(pdns_zone_finish(z2) == 0);
+        rt_buf_t b2 = {0};
+        CHECK(pdns_zone_encode_kdb(z2, &p, rt_emit, &b2, err, sizeof(err)) == 0);
+        kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
+        CHECK(kdb_framer_feed(&f, b2.buf, b2.len) == KDB_OK && kdb_framer_next(&f, &fr) == KDB_OK);
+        CHECK(kdb_decode(&fr, KDB_VIEWS_ANY, &msg, why, sizeof(why)) == KDB_OK && !msg.u.zone_begin.has_soa_timers);
+        free(b2.buf);
+        pdns_zone_free(z2);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--gen-corpus") == 0) return gen_corpus(argv[2]);
     if (argc == 2) g_zones_dir = argv[1];
@@ -2048,6 +2100,7 @@ int main(int argc, char **argv) {
     test_limits();
     test_kdb();
     test_secondary();
+    test_summary();
     test_kdb_name_case();
     test_zone2sql();
     test_zone_files();

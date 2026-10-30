@@ -59,7 +59,8 @@ _Static_assert(KARIDNS_DB_MAX_VIEWS == KDB_MAX_CONFIG_VIEWS, "the configuration 
 #define ING_RBUF 65536
 #define ING_FLUSH_AT 16384        /* queued bytes that are written at once; the rest goes out after the event round */
 #define ING_FETCH_MAX 256         /* fetches in flight (D1a): more is refused, the queries then wait for their own deadline */
-#define ING_FETCH_LIMITED 16      /* fetches in flight while memory-limit is set: each adds to what the cache manager has to take out again */
+#define ING_WARM_NFREQ 8          /* fetches in flight below which the zones nobody asked for yet (pins) are read */
+#define ING_FETCH_LIMITED 16     /* fetches in flight while memory-limit is set: each adds to what the cache manager has to take out again */
 /* a fetch the loader has not answered by then is given up (the queries have timed out long before); a variable for the unit test */
 #define STATIC_TEST
 STATIC_TEST int64_t g_ing_fetch_timeout_ms = 30000;
@@ -102,6 +103,7 @@ typedef struct ing_job {
    * nobody asked for (discarded; the loader may answer a request that was given up) */
   uint64_t fetch_id;
   bool summary, unsolicited, has_timers;
+  bool dir_entry;                        /* D1a milestone 4: the zone came as a summary in a batch (cold, no data was sent); timers are applied after the commit */
   bool cold;                             /* D1a step 5: a zone of a batch that is not kept in memory (the limit is reached): serial, digest and settings go into the directory, the data is discarded */
   uint32_t t_refresh, t_retry, t_expire;
 } ing_job_t;
@@ -212,6 +214,8 @@ typedef struct {
   uint64_t fseq;               /* request ids */
   uint32_t nfreq;
   ing_freq_t freq[ING_FETCH_MAX];
+  struct ing_warm { char view[PARK_VIEW_MAX + 1]; char zone[PARK_ZONE_MAX + 1]; } *warm;     /* D1a milestone 4: zones to read before a query asks (pins) */
+  size_t nwarm, cwarm;
   uint32_t funsolicited;       /* zones nobody asked for, discarded (logged the first few) */
   double ftokens;              /* the fetch-rate bucket (ingest thread only): tokens, and when it was filled */
   int64_t ftok_ms;
@@ -534,7 +538,8 @@ static bool build_config(ing_t *g, ing_cfg_t *snap) {
     kdb_enc_u32(&g->enc, 5, db->default_ttl);
     kdb_enc_u8(&g->enc, 6, (uint8_t)db->bulk_threshold);
     kdb_enc_u32(&g->enc, 7, db->loader_threads);
-    ok = kdb_enc_end(&g->enc) == 0 && idx <= 0xFFFF && (snap->nviews == 0 || (g->view_names && g->view_db));
+    if (db->memory_limit) kdb_enc_u8(&g->enc, 8, 1);       /* D1a milestone 4: the directory only for the zones that are not in memory (design 3.3) */
+    ok =kdb_enc_end(&g->enc) == 0 && idx <= 0xFFFF && (snap->nviews == 0 || (g->view_names && g->view_db));
   }
   rcu_aux_read_unlock();
   return ok;
@@ -909,7 +914,13 @@ static void job_execute(ing_job_t *j) {
     return;
   }
   if (j->cold) {                                         /* D1a step 5: the directory learns the zone; the data is fetched when a query needs it */
+    if (j->dir_entry && dbreg_lookup_entry(j->view_name, j->zone)) {      /* it has its data here (a fetch came in between): nothing to learn */
+      j->status = KDB_ST_UNCHANGED;
+      return;
+    }
     if (dbreg_commit_cold(j->view_name, j->zone, j->source_id, j->serial, j->digest, j->shared) == 0) {
+      if (j->dir_entry && j->has_timers)
+        (void)dbreg_apply_summary(j->view_name, j->zone, j->source_id, j->serial, true, j->t_refresh, j->t_retry, j->t_expire);
       j->status = KDB_ST_APPLIED;
     } else {
       job_reject(j, "out of memory registering the zone");
@@ -1035,6 +1046,7 @@ static void send_zone_result(ing_t *g, uint16_t view, const char *zone, uint8_t 
 }
 
 static void fetch_job_finish(ing_t *g, ing_job_t *j);
+static void warm_add(ing_t *g, const char *view, const char *zone);
 
 /* the answer of a finished job; the job is freed */
 static void job_finish(ing_t *g, ing_job_t *j) {
@@ -1047,6 +1059,7 @@ static void job_finish(ing_t *g, ing_job_t *j) {
     g->b_applied++;
     atomic_fetch_add_explicit(&g_st.tot_applied, 1, memory_order_relaxed);
     g->since_retire++;
+    if (j->dir_entry && j->shared && j->shared->ext.cache_mode == 1) warm_add(g, j->view_name, j->zone);     /* a pinned zone is read after its summary */
     if (g->zones_logged < ING_ZONES_LOGGED) {
       g->zones_logged++;
       syslog(LOG_INFO, "[DB] zone '%s' (view '%s'): installed, serial %u", j->zone, j->view_name, j->serial);
@@ -1484,12 +1497,32 @@ static ing_job_t *job_from_begin(ing_t *g, const kdb_zone_begin_t *zb) {
   if (j->view_name[0] == '\0') {
     j->skip = true;
     job_reject(j, "the view is not in the configuration");
-  } else if (zb->flags & KDB_ZF_SUMMARY) {
+  } else if ((zb->flags & KDB_ZF_SUMMARY) && j->fetch_id) {
     j->summary = true;                                   /* D1a: a primary's summary: no settings, no data (the state machine checked) */
     j->has_timers = zb->has_soa_timers;
     j->t_refresh = zb->soa_refresh;
     j->t_retry = zb->soa_retry;
     j->t_expire = zb->soa_expire;
+  } else if (zb->flags & KDB_ZF_SUMMARY) {
+    /* D1a milestone 4 (design 3.3, 6.3): the directory entry of a zone in a batch: the loader sends the summary instead of the data for a zone that is
+     * not in memory (CONFIG dir_only, which is memory-limit).  The loader is not trusted: a summary without memory-limit, or for a zone that has
+     * its data here, installs nothing (job_execute()). */
+    j->has_timers = zb->has_soa_timers;
+    j->t_refresh = zb->soa_refresh;
+    j->t_retry = zb->soa_retry;
+    j->t_expire = zb->soa_expire;
+    if (!dbreg_cache_limit()) {
+      j->skip = true;
+      job_reject(j, "a summary was sent, but memory-limit is not set");
+    } else if (!resolve_zone_settings(g, j, zb)) {
+      j->skip = true;
+    } else if (j->shared && j->shared->ext.masters_count > 0) {
+      j->skip = true;
+      job_reject(j, "the settings of a primary zone name masters (masters / primaries belong to SLAVE and CONSUMER zones)");
+    } else {
+      j->cold = true;
+      j->dir_entry = true;
+    }
   } else if (zb->zone_kind != KDB_ZK_PRIMARY && zb->flags != 0) {
     j->skip = true;                                      /* a SLAVE / CONSUMER has no data to describe */
     job_reject(j, "a secondary zone from the database carries no zone flags");
@@ -2297,9 +2330,42 @@ static void fetch_expire(ing_t *g) {
 }
 
 /* the requests the workers have pushed since the last time */
+/* D1a milestone 4: the zones to read although no query asked for them yet (a pinned zone that came as a summary; the warm-up of step 7 will use the
+ * same list).  They go after the requests of the queries, at most ING_WARM_NFREQ in flight, and a zone that cannot be asked for now (the rate, the
+ * limit) waits at the end of the list. */
+static void warm_add(ing_t *g, const char *view, const char *zone) {
+  if (g->nwarm == g->cwarm) {
+    size_t nc = g->cwarm ? g->cwarm * 2 : 64;
+    struct ing_warm *n = realloc(g->warm, nc * sizeof(*n));
+    if (!n) return;                                      /* out of memory: the zone is read when a query asks for it */
+    g->warm = n;
+    g->cwarm = nc;
+  }
+  snprintf(g->warm[g->nwarm].view, sizeof(g->warm[0].view), "%s", view);
+  snprintf(g->warm[g->nwarm].zone, sizeof(g->warm[0].zone), "%s", zone);
+  g->nwarm++;
+}
+
 static void fetch_issue(ing_t *g) {
   park_fetch_req_t q;
-  while (park_fetch_next(&q)) {
+  bool warm = false;
+  size_t warm_left = g->nwarm;                           /* the zones that were in the list when the pass started (those put back wait for the next pass) */
+  for (;;) {
+    if (park_fetch_next(&q)) {
+      warm = false;
+    } else if (g->nwarm > 0 && warm_left > 0 && g->nfreq < ING_WARM_NFREQ) {
+      warm = true;
+      warm_left--;
+      memset(&q, 0, sizeof(q));
+      snprintf(q.view, sizeof(q.view), "%s", g->warm[0].view);
+      snprintf(q.zone, sizeof(q.zone), "%s", g->warm[0].zone);
+      q.prio = KDB_FETCH_PRIO_WARM;
+      q.mode = KDB_FETCH_FULL;
+      memmove(g->warm, g->warm + 1, (g->nwarm - 1) * sizeof(*g->warm));
+      g->nwarm--;
+    } else {
+      break;
+    }
     int vi = -1;
     for (uint32_t i = 0; i < g->nview_names; i++) {
       if (g->view_db && g->view_db[i] && strcasecmp(g->view_names[i], q.view) == 0) {
@@ -2318,6 +2384,10 @@ static void fetch_issue(ing_t *g) {
        * above the limit, or too many fetches in flight, the request is not made: the queries get "not ready" now instead of at their deadline */
       uint64_t lim = dbreg_cache_limit();
       if (lim && (g->nfreq >= ING_FETCH_LIMITED || dbreg_cache_over_limit())) {
+        if (warm) {
+          warm_add(g, q.view, q.zone);
+          break;
+        }
         atomic_fetch_add_explicit(&g_fetch_shed, 1, memory_order_relaxed);
         park_wake_broadcast(q.view, q.zone, true);
         continue;
@@ -2336,6 +2406,10 @@ static void fetch_issue(ing_t *g) {
     }
     g->ftok_ms = tnow;
     if (g->ftokens < 1.0) {
+      if (warm) {
+        warm_add(g, q.view, q.zone);
+        break;
+      }
       atomic_fetch_add_explicit(&g_fetch_limited, 1, memory_order_relaxed);
       park_wake_broadcast(q.view, q.zone, true);
       continue;
@@ -2351,6 +2425,11 @@ static void fetch_issue(ing_t *g) {
       if (!g->freq[i].active) r = &g->freq[i];
     if (!r) {                                            /* too many in flight: the queries run into their deadlines */
       dbreg_fetch_end(g->view_names[vi], q.zone);
+      if (warm) {
+        g->ftokens += 1.0;
+        warm_add(g, q.view, q.zone);
+        break;
+      }
       park_wake_broadcast(q.view, q.zone, true);
       continue;
     }
@@ -2588,6 +2667,7 @@ static void *ingest_thread(void *arg) {
       if (tick < 10) tick = 10;
       if (wait_ms < 0 || wait_ms > tick) wait_ms = tick;
     }
+    if (g->nwarm > 0 && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;      /* zones to read before a query asks: try again soon */
     if (wait_ms >= 0) {
       ts.tv_sec = wait_ms / 1000;
       ts.tv_nsec = (wait_ms % 1000) * 1000000;
@@ -2623,6 +2703,7 @@ static void *ingest_thread(void *arg) {
     if (g->inv_active) pump_inventory(g);
     if (g->need_cleanup) cleanup_stream_state(g);
     maybe_apply_delta(g);
+    if (g->nwarm > 0) fetch_issue(g);
     fetch_expire(g);
     if (g->stream_fd >= 0 && g->out_off < g->out_len) out_flush(g);
     if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);

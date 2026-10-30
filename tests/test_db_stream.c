@@ -1711,7 +1711,7 @@ static void test_fetch_stream_machine(void) {
     kdb_enc_reset(&e); fz_failed(&e, 5);
     CHECK_RC("batch stream: ZONE_FAILED with a request id", send_enc(KDB_S_IN_BATCH, &e), KDB_E_STATE);
     kdb_enc_reset(&e); fz_begin(&e, 1, ZN, 0, KDB_ZF_SUMMARY, KDB_ZK_PRIMARY, 0);
-    CHECK_RC("batch stream: a summary", send_enc(KDB_S_IN_BATCH, &e), KDB_E_STATE);
+    CHECK_RC("batch stream: a summary (D1a milestone 4: allowed, the Backend decides by CONFIG dir_only)", send_enc(KDB_S_IN_BATCH, &e), KDB_OK);
     /* the SOA timers of a summary: all three or none */
     {
         uint8_t zd[KDB_DIGEST_LEN] = { 0 };
