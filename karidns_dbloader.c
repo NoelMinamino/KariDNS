@@ -72,7 +72,7 @@ enum { EXIT_OK = 0, EXIT_ZONES_FAILED = 1, EXIT_USAGE = 2, EXIT_ERROR = 3, EXIT_
 /* Messages.  Dump mode: stderr with the program prefix (the lines the dump tests expect).  Stream mode: syslog
  * (openlog() has LOG_PERROR, so a foreground server still shows them on stderr). */
 static bool g_stream_mode;
-static volatile sig_atomic_t g_stop;      /* SIGTERM / SIGINT in stream mode */
+static _Atomic sig_atomic_t g_stop;      /* SIGTERM / SIGINT in stream mode (atomic: the fetch thread reads it too; a handler may store to a lock-free atomic) */
 static _Atomic bool g_fetch_stop;          /* D1a: the main thread ends the fetch thread */
 static _Atomic bool g_fetch_died;          /* D1a: the fetch thread ended by itself (the Backend closed or broke the fetch stream, or an error): the main thread exits so that the supervisor starts a loader with a new pair of streams */
 
@@ -320,6 +320,7 @@ typedef struct inv_ent {
     bool known;                       /* the Backend has a version (source_id, serial, digest) */
     bool resident;                    /* D1a: the Backend has the data of the zone in memory (false: only its entry in the directory; the digest is then zero) */
     bool dirty;                       /* the last version offered was rejected / unreadable: offer the zone again */
+    uint32_t fev, p_fev;              /* D1a: fetches of the zone seen by the inventory; the count when the pending version was sent (a fetch that landed meanwhile decides) */
     bool has_pend;
     bool p_resident;                  /* what was sent is the zone with its data (false: a summary) */
     uint32_t mark;                    /* generation of the diff that saw the zone in the database */
@@ -386,6 +387,7 @@ typedef struct {
      * carries the request id; with fetch_summary the zone is not read, only its summary is sent. */
     bool fetch;
     bool fetch_summary;
+    const char *fetch_vname;          /* D1a: the view of the request being served (the fetch thread tells the inventory what it served) */
     bool dir_only;                    /* D1a milestone 4: CONFIG dir_only (memory-limit): zones the Backend has no data of are sent as summaries */
     uint64_t fetch_req;
     uint64_t batch_id;
@@ -526,6 +528,7 @@ struct lio {
     freq_t fbusy[8];                         /* ... the first few, to be answered "busy" */
     size_t nfbusy;
     bool reload_all;                        /* a RELOAD_REQ scope all arrived (or the queue overflowed) */
+    bool again;                             /* D1a: the Backend answered SEND_BODY to a summary: another diff soon, to send the zones whole */
     uint64_t all_req_id;                     /* the request id of the last scope all request, 0 = none */
     uint64_t batch_seq;
     uint64_t batches_ended, batch_results;   /* BATCH_ENDs sent / BATCH_RESULTs received: a load waits for the difference */
@@ -642,6 +645,74 @@ static int vslot_get(struct lio *io, const char *name) {
     io->vnames[io->nvn] = d;
     memset(&io->vst[io->nvn], 0, sizeof(vstate_t));
     return (int)io->nvn++;
+}
+
+/* D1a: the zones the fetch thread served.  The fetch thread has no inventory (the main thread owns it), so it queues what it sent and the main thread
+ * applies the queue to the inventory before it reads it (fev_drain()): a zone that came into the Backend's memory by a fetch is resident there, and a
+ * later change of it is sent whole instead of as a summary.  A queue that is full drops the event; the Backend then answers SEND_BODY to the summary
+ * (dns_db_ingest.c), so a lost event costs one more round, not a stale zone. */
+#define FEV_MAX 65536
+typedef struct fev {
+    struct fev *next;
+    int64_t source_id;
+    uint32_t serial;
+    uint8_t digest[KDB_DIGEST_LEN];
+    char view[DNS_NAME_TEXT_SIZE];
+    char name[DNS_NAME_TEXT_SIZE];
+} fev_t;
+static pthread_mutex_t g_fev_lock = PTHREAD_MUTEX_INITIALIZER;
+static fev_t *g_fev_head, *g_fev_tail;
+static _Atomic size_t g_fev_n;
+static _Atomic uint64_t g_fev_dropped;
+
+static void fev_push(const char *view, const char *canon, int64_t source_id, uint32_t serial, const uint8_t digest[KDB_DIGEST_LEN]) {
+    if (!view || atomic_load_explicit(&g_fev_n, memory_order_relaxed) >= FEV_MAX) {
+        atomic_fetch_add_explicit(&g_fev_dropped, 1, memory_order_relaxed);
+        return;
+    }
+    fev_t *f = malloc(sizeof(*f));
+    if (!f) {
+        atomic_fetch_add_explicit(&g_fev_dropped, 1, memory_order_relaxed);
+        return;
+    }
+    f->next = NULL;
+    f->source_id = source_id;
+    f->serial = serial;
+    memcpy(f->digest, digest, KDB_DIGEST_LEN);
+    snprintf(f->view, sizeof(f->view), "%s", view);
+    snprintf(f->name, sizeof(f->name), "%s", canon);
+    pthread_mutex_lock(&g_fev_lock);
+    if (g_fev_tail) g_fev_tail->next = f;
+    else g_fev_head = f;
+    g_fev_tail = f;
+    atomic_fetch_add_explicit(&g_fev_n, 1, memory_order_release);
+    pthread_mutex_unlock(&g_fev_lock);
+}
+
+/* main thread: what the fetch thread served goes into the inventory (the Backend has these zones in memory, in these versions) */
+static void fev_drain(struct lio *io) {
+    if (atomic_load_explicit(&g_fev_n, memory_order_acquire) == 0) return;
+    pthread_mutex_lock(&g_fev_lock);
+    fev_t *f = g_fev_head;
+    g_fev_head = g_fev_tail = NULL;
+    atomic_store_explicit(&g_fev_n, 0, memory_order_release);
+    pthread_mutex_unlock(&g_fev_lock);
+    while (f) {
+        fev_t *nx = f->next;
+        int slot = vslot_get(io, f->view);
+        inv_ent_t *ie = slot >= 0 ? inv_get(&io->inv, (uint16_t)slot, f->name) : NULL;
+        if (ie) {
+            ie->known = true;
+            ie->resident = true;
+            ie->dirty = false;
+            ie->fev++;
+            ie->source_id = f->source_id;
+            ie->serial = f->serial;
+            memcpy(ie->digest, f->digest, KDB_DIGEST_LEN);
+        }
+        free(f);
+        f = nx;
+    }
 }
 
 static void io_free_views(struct lio *io) {
@@ -1359,13 +1430,15 @@ static int commit_zone(ctx_t *x, const zinfo_t *zi, zres_t *r) {
         if (r->profile[0] && send_profile_for(x, r->profile) != 0) return -1;   /* B7a: the profile text comes first */
         if (emit_file(x, r->buf, r->len) != 0) return -1;
         x->n_zones++;
-        if (x->io && !x->fetch) {              /* sent: what the Backend will have once it says "applied" (a fetch has no inventory to keep) */
+        if (x->fetch && x->fetch_vname) fev_push(x->fetch_vname, zi->canon, zi->id, r->serial, r->digest);     /* (a fetch has no inventory of its own: the main thread keeps it) */
+        if (x->io && !x->fetch) {              /* sent: what the Backend will have once it says "applied" */
             inv_ent_t *ie = inv_get(&x->io->inv, x->vslot, zi->canon);
             if (!ie) {
                 x->oom = true;
                 return -1;
             }
             ie->has_pend = true;
+            ie->p_fev = ie->fev;
             ie->p_resident = !zi->summary;
             ie->p_source_id = zi->id;
             ie->p_serial = r->serial;
@@ -1943,6 +2016,7 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
         if (x->nchg > 1) qsort(x->chg, x->nchg, sizeof(int64_t), cmp_i64);
     }
     uint32_t gen = ++io->gen;
+    fev_drain(io);
     for (size_t i = 0; i < x->nz; i++) {
         zinfo_t *z = &x->zones[i];
         z->want = false;
@@ -2770,9 +2844,35 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
     case KDB_T_ZONE_RESULT: {
         io->n_results++;
         int zslot = io->idx_slot ? io->idx_slot[m.u.zone_result.view] : -1;
+        fev_drain(io);                               /* (the zones the fetch thread served before this result) */
         inv_ent_t *ie = zslot >= 0 ? inv_find(&io->inv, (uint16_t)zslot, m.u.zone_result.name) : NULL;
-        if (ie) {
+        if (ie && ie->has_pend && ie->fev != ie->p_fev && m.u.zone_result.status != KDB_ST_REJECTED && m.u.zone_result.status != KDB_ST_DELETED) {
+            /* a fetch of the zone was served while this version was on its way: the Backend has that version, or this one, in an order nobody
+             * knows.  The inventory keeps what the fetch served; the next diff compares it with the database and sends the zone whole if it differs. */
+            ie->has_pend = false;
+            if (m.u.zone_result.status == KDB_ST_SEND_BODY) io->again = true;
+        } else if (ie) {
             switch (m.u.zone_result.status) {
+            case KDB_ST_UNCHANGED:
+            case KDB_ST_SEND_BODY:
+                if (!ie->has_pend) {                 /* the answer to a deletion: nothing to remember */
+                    inv_del(&io->inv, ie);
+                    break;
+                }
+                /* the answer to a summary (the inventory said: no data in memory).  UNCHANGED: the Backend has the version the summary describes
+                 * in memory.  SEND_BODY: it has another version in memory; the zone is sent whole by the diff that follows at once. */
+                ie->known = true;
+                ie->resident = true;
+                ie->has_pend = false;
+                if (m.u.zone_result.status == KDB_ST_UNCHANGED) {
+                    ie->source_id = ie->p_source_id;
+                    ie->serial = ie->p_serial;
+                    ie->dirty = false;
+                } else {
+                    ie->dirty = true;
+                    io->again = true;
+                }
+                break;
             case KDB_ST_APPLIED:
             case KDB_ST_SHADOWED:                    /* the Backend has the version that was sent */
                 if (ie->has_pend) {
@@ -3144,6 +3244,7 @@ static int fetch_one(ctx_t *x, const lcfg_t *lc, const freq_t *r) {
     if (!drv) return fetch_fail(x, r, "the loader has no usable configuration yet");
     if (!v) return fetch_fail(x, r, "the view is not in the configuration");
     x->fetch_req = r->id;
+    x->fetch_vname = v->name;
     x->fetch_summary = r->mode == KDB_FETCH_SUMMARY;
     x->drv = drv;
     x->view = r->view;
@@ -3164,6 +3265,7 @@ static int fetch_one(ctx_t *x, const lcfg_t *lc, const freq_t *r) {
     (void)run_view(x, &src, r->zone, false);
     ctx_view_reset(x);
     x->map_view = NULL;
+    x->fetch_vname = NULL;
     if (x->io_error || x->oom || g_stop || atomic_load(&g_fetch_stop)) return -1;
     if (x->n_zones == 0 && x->n_failed == 0)                  /* nothing was sent: the Backend is waiting for an answer */
         return fetch_fail(x, r, x->errtext[0] ? x->errtext : "the zone could not be read");
@@ -4135,6 +4237,10 @@ static int run_stream(int fd) {
             }
         }
         uint64_t load_req = 0;
+        if (io->again) {                       /* D1a: zones the Backend wants whole (SEND_BODY) */
+            io->again = false;
+            need_load = true;
+        }
         if (io->reload_all) {                  /* karictl reload: a diff of every source (one-zone requests stay queued) */
             io->reload_all = false;
             load_req = io->all_req_id;

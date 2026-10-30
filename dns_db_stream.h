@@ -139,7 +139,8 @@ enum { KDB_ZK_PRIMARY = 0, KDB_ZK_SECONDARY, KDB_ZK_CATALOG };
 #define KDB_ZF_EXTENDED 0x2u    /* ZONE_DATA carries Extended AXFR records (dns_wire.h, xext_*): location / ECS tags, tinydns time stamps and locations */
 #define KDB_ZF_TINYDNS 0x4u     /* B8: the zone is a tinydns zone (ZONE_IMAGE_F_TINYDNS: time-dependent TTLs, never cached), also without any time stamp or location */
 #define KDB_ZF_SUMMARY 0x8u     /* D1a, fetch stream: the zone's summary (serial, kind, settings), no ZONE_DATA, rr_count 0, zero digest */
-enum { KDB_ST_APPLIED = 0, KDB_ST_UNCHANGED, KDB_ST_REJECTED, KDB_ST_SHADOWED, KDB_ST_DELETED };
+enum { KDB_ST_APPLIED = 0, KDB_ST_UNCHANGED, KDB_ST_REJECTED, KDB_ST_SHADOWED, KDB_ST_DELETED,
+       KDB_ST_SEND_BODY };   /* D1a: SEND_BODY, to a summary: the zone is in the Backend's memory in another version than the summary says, send it whole */
 
 typedef enum {
     KDB_OK = 0,

@@ -783,8 +783,11 @@ static void test_backend_direction_rejects(void) {
     CHECK_RC("empty inventory chunk", decode_backend(&e, 2), KDB_OK);
     /* ZONE_RESULT status, BATCH_RESULT request ids */
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_ZONE_RESULT);
-    kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, ZN); kdb_enc_u8(&e, 3, 5); kdb_enc_end(&e);
-    CHECK_RC("status 5", decode_backend(&e, 2), KDB_E_RANGE);
+    kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, ZN); kdb_enc_u8(&e, 3, KDB_ST_SEND_BODY); kdb_enc_end(&e);
+    CHECK_RC("status SEND_BODY", decode_backend(&e, 2), KDB_OK);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_ZONE_RESULT);
+    kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, ZN); kdb_enc_u8(&e, 3, KDB_ST_SEND_BODY + 1); kdb_enc_end(&e);
+    CHECK_RC("status 6", decode_backend(&e, 2), KDB_E_RANGE);
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_BATCH_RESULT);
     { uint8_t ids[12] = { 0 };
       kdb_enc_u64(&e, 1, 1); kdb_enc_bytes(&e, 2, ids, 12); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0); kdb_enc_u32(&e, 5, 0); kdb_enc_u32(&e, 6, 0); }
@@ -1794,6 +1797,9 @@ static int gen_corpus_fetch(const char *dir) {
     kdb_enc_bytes(&e, 5, dig, sizeof(dig)); kdb_enc_u8(&e, 6, 1); kdb_enc_nest_end(&e);
     kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 1); kdb_enc_name(&e, 2, "cold.test."); kdb_enc_i64(&e, 3, 2); kdb_enc_u32(&e, 4, 20);
     kdb_enc_u8(&e, 6, 0); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    kdb_enc_begin(&e, KDB_T_ZONE_RESULT);                       /* D1a: SEND_BODY, the answer to a summary of a zone that has its data */
+    kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "res.test."); kdb_enc_u8(&e, 3, KDB_ST_SEND_BODY);
     kdb_enc_end(&e);
     rc |= write_seed(dir, "seed_backend_fetch.bin", 0x80, &e);
     kdb_enc_free(&e);

@@ -544,6 +544,7 @@ enum { ZDIR_ST_ABSENT = 0, ZDIR_ST_RESIDENT, ZDIR_ST_LOADING, ZDIR_ST_ERROR };
 #define ZDIR_F_NOCACHE   0x0010u   /* never kept resident after an answer (reserved) */
 #define ZDIR_F_PARTIAL   0x0020u   /* only part of the zone is resident (reserved for D1b) */
 #define ZDIR_F_EVICT_NEXT 0x0040u  /* take out of memory first (as soon as the queries it was loaded for are answered): a zone that was admitted against the frequency order, or a no-cache zone */
+#define ZDIR_F_WARM      0x0100u   /* the zone is in the ingest thread's list of zones to read before a query asks (pins): once, whatever the number of summaries */
 #define ZDIR_F_BUSY      0x0080u   /* the ingest thread is installing a new version into the zone's entry (dbreg_lookup_entry_busy() .. dbreg_commit() / dbreg_reject()): it is not taken out of memory meanwhile */
 #define ZDIR_F_QUEUED    0x1000u   /* a registry element waiting in the queue of additions */
 #define ZDIR_F_DELETED   0x2000u   /* a registry element that left the registry (waiting to leave the index) */
@@ -1003,6 +1004,12 @@ int dbreg_fetch_begin(const char *view, const char *zone);
 void dbreg_fetch_end(const char *view, const char *zone);
 bool dbreg_apply_summary(const char *view, const char *zone, int64_t source_id, uint32_t serial, bool has_timers, uint32_t refresh,
                          uint32_t retry, uint32_t expire);
+enum { DBREG_SUM_NONE = 0, DBREG_SUM_SAME, DBREG_SUM_DIFFERS };
+/* The list of zones to read before a query asks (ingest thread): dbreg_warm_mark() puts a zone in it (false: it is there already, or the zone is not a registry zone),
+ * dbreg_warm_take() takes it out again: true when it is still worth a read (pinned, no data, not deleted). */
+bool dbreg_warm_mark(const char *view, const char *zone);
+bool dbreg_warm_take(const char *view, const char *zone);
+int dbreg_summary_check(const char *view, const char *zone, int64_t source_id, uint32_t serial);
 /* The entry of the DB zone (view, name) when it is in the active snapshot, i.e. served (not shadowed), else NULL.  Valid
  * while the caller holds the snapshot (acquire_retained_zone_snapshot()). */
 zone_db_entry_t *dbreg_snapshot_entry(zone_db_snapshot_t *snap, const char *view, const char *name);

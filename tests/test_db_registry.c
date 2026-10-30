@@ -1472,6 +1472,36 @@ static void test_dir_fetch_state(void) {
     CHECK(dbreg_find_info("default", "a.test.", &inf, 1) == 1 && !inf.has_entry && inf.serial == 100 && inf.refresh == 11);
     CHECK(!dbreg_apply_summary("default", "fs.test.", 0, 5, true, 1, 2, 3));        /* a zone { } is not a registry zone */
 
+    /* a cold commit (the summary of a batch, or a body that is not kept) while a fetch of the zone is on its way takes the serial and the settings,
+     * and leaves the state alone: the state is the fetch's, and a second fetch must not be asked for */
+    {
+        uint8_t dgc[32] = { 2 };
+        CHECK(dbreg_fetch_begin("default", "a.test.") == DBREG_FETCH_STARTED);
+        CHECK(dbreg_commit_cold("default", "a.test.", 301, 150, dgc, NULL) == 0);
+        CHECK(ea->serial == 150 && ea->digest && ea->digest[0] == 2 && atomic_load(&ea->state) == ZDIR_ST_LOADING);
+        CHECK(dbreg_fetch_begin("default", "a.test.") == DBREG_FETCH_BUSY);
+        CHECK(dbreg_summary_check("default", "a.test.", 301, 150) == DBREG_SUM_DIFFERS);       /* (the fetch brings a version of its own) */
+        dbreg_fetch_end("default", "a.test.");
+        CHECK(atomic_load(&ea->state) == ZDIR_ST_ABSENT && dbreg_summary_check("default", "a.test.", 301, 150) == DBREG_SUM_NONE);
+        CHECK(dbreg_commit_cold("default", "a.test.", 301, 151, dgc, NULL) == 0 && ea->serial == 151 && atomic_load(&ea->state) == ZDIR_ST_ABSENT);
+        /* what a batch summary means for a zone that has its data: the same version, another one, or no data to compare */
+        CHECK(add_zone("default", "b.test.", 5, 1, 303) != NULL);
+        CHECK(dbreg_summary_check("default", "b.test.", 303, 5) == DBREG_SUM_SAME);
+        CHECK(dbreg_summary_check("default", "b.test.", 303, 6) == DBREG_SUM_DIFFERS && dbreg_summary_check("default", "b.test.", 999, 5) == DBREG_SUM_DIFFERS);
+        CHECK(dbreg_summary_check("default", "nope.test.", 303, 5) == DBREG_SUM_NONE && dbreg_summary_check("nosuchview", "b.test.", 303, 5) == DBREG_SUM_NONE);
+        /* the list of zones to read before a query asks: a zone is in it once; taking it out says whether it is still worth a read */
+        CHECK(!dbreg_warm_mark("default", "nope.test.") && !dbreg_warm_mark("nosuchview", "a.test."));
+        CHECK(dbreg_warm_mark("default", "a.test.") && (ea->flags & ZDIR_F_WARM) && !dbreg_warm_mark("default", "a.test."));
+        CHECK(!dbreg_warm_take("default", "a.test.") && !(ea->flags & ZDIR_F_WARM));          /* (not pinned any more: nothing to read) */
+        ea->flags |= ZDIR_F_PIN;
+        CHECK(dbreg_warm_mark("default", "a.test.") && dbreg_warm_take("default", "a.test."));  /* pinned, no data */
+        CHECK(!dbreg_warm_take("default", "b.test.") && !dbreg_warm_take("default", "nope.test."));     /* (b.test has its data; nope is not a zone) */
+        CHECK(dbreg_warm_mark("default", "a.test."));
+        ea->flags |= ZDIR_F_DELETED;
+        CHECK(!dbreg_warm_take("default", "a.test.") && !dbreg_warm_mark("default", "a.test."));
+        ea->flags &= (uint16_t)~(ZDIR_F_DELETED | ZDIR_F_PIN);
+    }
+
     /* the lookup for a query: NULL and the element for a zone that has no data (the worker parks), the entry when it has */
     zdir_elem_t *pel = (zdir_elem_t *)0x1;
     CHECK(find_zone_for_query_ex(v, "www.a.test.", 1, &pel) == NULL && pel == ea);

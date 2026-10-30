@@ -914,9 +914,15 @@ static void job_execute(ing_job_t *j) {
     return;
   }
   if (j->cold) {                                         /* D1a step 5: the directory learns the zone; the data is fetched when a query needs it */
-    if (j->dir_entry && dbreg_lookup_entry(j->view_name, j->zone)) {      /* it has its data here (a fetch came in between): nothing to learn */
-      j->status = KDB_ST_UNCHANGED;
-      return;
+    if (j->dir_entry) {
+      /* The loader sent a summary because its inventory says the zone has no data here.  If it has (a fetch or an UPDATE brought it), the summary
+       * is not applied: the same version is UNCHANGED, another one is answered SEND_BODY, and the loader sends the zone whole.  Answering
+       * UNCHANGED for both made a changed zone serve its old data for ever. */
+      int sc = dbreg_summary_check(j->view_name, j->zone, j->source_id, j->serial);
+      if (sc != DBREG_SUM_NONE) {
+        j->status = sc == DBREG_SUM_SAME ? KDB_ST_UNCHANGED : KDB_ST_SEND_BODY;
+        return;
+      }
     }
     if (dbreg_commit_cold(j->view_name, j->zone, j->source_id, j->serial, j->digest, j->shared) == 0) {
       if (j->dir_entry && j->has_timers)
@@ -1076,6 +1082,9 @@ static void job_finish(ing_t *g, ing_job_t *j) {
              cat ? "a catalog member of the same name" : "the zone in karidns.conf");
     }
     break;
+  case KDB_ST_UNCHANGED:                                 /* a summary that was not applied (the zone has its data here in the same version) */
+  case KDB_ST_SEND_BODY:                                 /* ... or in another one: the loader sends it whole; neither is a rejection */
+    break;
   default:
     g->b_rejected++;
     atomic_fetch_add_explicit(&g_st.tot_rejected, 1, memory_order_relaxed);
@@ -1087,7 +1096,7 @@ static void job_finish(ing_t *g, ing_job_t *j) {
     break;
   }
   if (g->cur_req >= 0 && g->reqs[g->cur_req].view == j->view && domain_names_match_ci(g->reqs[g->cur_req].zone, j->zone)) {
-    g->req_outcome = j->status == KDB_ST_APPLIED ? ROUT_APPLIED : j->status == KDB_ST_SHADOWED ? ROUT_SHADOWED : ROUT_REJECTED;
+    g->req_outcome = j->status == KDB_ST_SHADOWED ? ROUT_SHADOWED : j->status == KDB_ST_REJECTED ? ROUT_REJECTED : ROUT_APPLIED;
     g->req_serial = j->serial;
     snprintf(g->req_reason, sizeof(g->req_reason), "%s", j->status == KDB_ST_REJECTED ? j->reason : "");
   }
@@ -2334,10 +2343,14 @@ static void fetch_expire(ing_t *g) {
  * same list).  They go after the requests of the queries, at most ING_WARM_NFREQ in flight, and a zone that cannot be asked for now (the rate, the
  * limit) waits at the end of the list. */
 static void warm_add(ing_t *g, const char *view, const char *zone) {
+  if (!dbreg_warm_mark(view, zone)) return;              /* in the list already (a summary for the same pinned zone again), or not a zone of the registry */
   if (g->nwarm == g->cwarm) {
     size_t nc = g->cwarm ? g->cwarm * 2 : 64;
     struct ing_warm *n = realloc(g->warm, nc * sizeof(*n));
-    if (!n) return;                                      /* out of memory: the zone is read when a query asks for it */
+    if (!n) {
+      (void)dbreg_warm_take(view, zone);
+      return;                                            /* out of memory: the zone is read when a query asks for it */
+    }
     g->warm = n;
     g->cwarm = nc;
   }
@@ -2363,6 +2376,7 @@ static void fetch_issue(ing_t *g) {
       q.mode = KDB_FETCH_FULL;
       memmove(g->warm, g->warm + 1, (g->nwarm - 1) * sizeof(*g->warm));
       g->nwarm--;
+      if (!dbreg_warm_take(q.view, q.zone)) continue;    /* it came into memory meanwhile, was deleted, or is not pinned any more: nothing to read */
     } else {
       break;
     }

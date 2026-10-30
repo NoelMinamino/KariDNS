@@ -551,19 +551,20 @@ int main(void) {
             send_dir_zone(a[0], &e, 0, "dir1.test.", 7, 60001, "allow-transfer { 192.0.2.1; };");
             send_dir_zone(a[0], &e, 0, "dirp.test.", 8, 60002, "cache pin;");
             CHECK(dbreg_lookup_entry("default", "pin.test.") != NULL);
-            send_dir_zone(a[0], &e, 0, "pin.test.", 9, 900001, NULL);            /* (it has its data here) */
+            send_dir_zone(a[0], &e, 0, "pin.test.", 9, 900001, NULL);            /* (it has its data here, in another version: the loader is asked to send it whole) */
+            send_dir_zone(a[0], &e, 0, "pin.test.", 1, 900001, NULL);            /* (... and in this version: nothing to do) */
             kdb_enc_begin(&e, KDB_T_BATCH_END);
-            kdb_enc_u64(&e, 1, 4); kdb_enc_u32(&e, 2, 3); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+            kdb_enc_u64(&e, 1, 4); kdb_enc_u32(&e, 2, 4); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
             kdb_enc_end(&e);
             ch_send(a[0], &e);
-            int st_dir1 = -1, st_dirp = -1, st_pin = -1;
+            int st_dir1 = -1, st_dirp = -1, st_pin = -1, st_pin2 = -1;
             while (ch_next(&mainc, &m, 10000) && m.type != KDB_T_BATCH_RESULT) {
                 if (m.type != KDB_T_ZONE_RESULT) continue;
                 if (strcmp(m.u.zone_result.name, "dir1.test.") == 0) st_dir1 = m.u.zone_result.status;
                 else if (strcmp(m.u.zone_result.name, "dirp.test.") == 0) st_dirp = m.u.zone_result.status;
-                else if (strcmp(m.u.zone_result.name, "pin.test.") == 0) st_pin = m.u.zone_result.status;
+                else if (strcmp(m.u.zone_result.name, "pin.test.") == 0) { if (st_pin < 0) st_pin = m.u.zone_result.status; else st_pin2 = m.u.zone_result.status; }
             }
-            CHECK(st_dir1 == KDB_ST_APPLIED && st_dirp == KDB_ST_APPLIED && st_pin == KDB_ST_UNCHANGED);
+            CHECK(st_dir1 == KDB_ST_APPLIED && st_dirp == KDB_ST_APPLIED && st_pin == KDB_ST_SEND_BODY && st_pin2 == KDB_ST_UNCHANGED);
             for (int i = 0; i < 100 && !elem_of("default", "dirp.test."); i++) usleep(50000);
             zdir_elem_t *d1 = elem_of("default", "dir1.test.");
             CHECK(d1 != NULL && zdir_entry(d1) == NULL && atomic_load(&d1->state) == ZDIR_ST_ABSENT && d1->serial == 7);

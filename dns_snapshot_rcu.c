@@ -1958,9 +1958,13 @@ int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uin
     z->last_result = DBREG_APPLIED;
     z->shadowed = sh;
     z->shadow_by = sh_cfg ? DBREG_SH_CONFIG : sh_cat ? DBREG_SH_CATALOG : DBREG_SH_NONE;
-    atomic_store_explicit(&z->state, ZDIR_ST_ABSENT, memory_order_release);
+    /* a fetch of the zone is on its way (LOADING): the serial, the settings and the digest above are the newer truth, but the state is the fetch's -
+     * putting ABSENT here made the next query ask the loader a second time, and a loader that sends summaries could double every fetch */
+    if (atomic_load_explicit(&z->state, memory_order_relaxed) != ZDIR_ST_LOADING) {
+        atomic_store_explicit(&z->state, ZDIR_ST_ABSENT, memory_order_release);
+        atomic_fetch_add_explicit(&g_cache_cold, 1, memory_order_relaxed);
+    }
     dbreg_set_error(z, NULL);
-    atomic_fetch_add_explicit(&g_cache_cold, 1, memory_order_relaxed);
     rc = 0;
 out:
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
@@ -2085,6 +2089,50 @@ bool dbreg_apply_summary(const char *view, const char *zone, int64_t source_id, 
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     return applied;
+}
+
+/* What a batch summary (the loader thinks the Backend has no data of the zone) means for a zone that has its data here: DBREG_SUM_NONE (no data: the
+ * summary is applied as it is), DBREG_SUM_SAME (the data is the version the summary describes: same source id and serial) or DBREG_SUM_DIFFERS (the data
+ * is another version: the loader is told to send the zone whole, and what is here keeps serving until the new version is installed). */
+int dbreg_summary_check(const char *view, const char *zone, int64_t source_id, uint32_t serial) {
+    int rc = DBREG_SUM_NONE;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    if (z && !(z->flags & ZDIR_F_DELETED)) {
+        if (zdir_entry(z))
+            rc = (z->source_id == source_id && z->serial == serial) ? DBREG_SUM_SAME : DBREG_SUM_DIFFERS;
+        else if (atomic_load_explicit(&z->state, memory_order_relaxed) == ZDIR_ST_LOADING)
+            rc = DBREG_SUM_DIFFERS;          /* a fetch is on its way and brings a version nobody can name yet: the loader sends the zone whole */
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return rc;
+}
+
+bool dbreg_warm_mark(const char *view, const char *zone) {
+    bool added = false;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    if (z && !(z->flags & (ZDIR_F_DELETED | ZDIR_F_WARM))) {
+        z->flags |= ZDIR_F_WARM;
+        added = true;
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return added;
+}
+
+bool dbreg_warm_take(const char *view, const char *zone) {
+    bool wanted = false;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    if (z) {
+        z->flags &= (uint16_t)~ZDIR_F_WARM;
+        wanted = !(z->flags & ZDIR_F_DELETED) && (z->flags & ZDIR_F_PIN) && !zdir_entry(z);
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return wanted;
 }
 
 /* ---- D1a step 5: the data of a DB zone leaves memory (design 8.2) ---- */

@@ -26,7 +26,7 @@ command -v perl >/dev/null 2>&1 || { echo "SKIP: perl is not installed"; exit 0;
 "$LOADER" --drivers | grep -qx sqlite3 || { echo "SKIP: $LOADER has no SQLite3 driver"; exit 0; }
 id nobody >/dev/null 2>&1 || { echo "SKIP: no user nobody"; exit 0; }
 
-NZ=300
+NZ=1500          # (the observatory reply is 664 bytes a zone: more than net.local.stream.sendspace, 64 KiB, so the reply needs several sends)
 T=$(mktemp -d "${TMPDIR:-/tmp}/karidns_dironly.XXXXXX") || exit 1
 chmod 755 "$T"
 SRV=""
@@ -54,6 +54,7 @@ INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.' || name, 300, 0, 0 FROM domains;
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'www.' || name, 'A', '192.0.2.80', 300, 0, 0 FROM domains;
 INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'X-KARIDNS-CACHE', 'pin' FROM domains WHERE name = 'z0200.test';
+INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'ALLOW-DNSUPDATE-FROM', '127.0.0.1' FROM domains WHERE name = 'z0010.test';
 SQL
 chown -R nobody "$T/db"; chmod 600 "$T/db/z.db"*
 install -o root -g wheel -m 755 "$LOADER" "$T/karidns-dbloader" 2>/dev/null || { cp "$LOADER" "$T/karidns-dbloader"; chown 0:0 "$T/karidns-dbloader"; chmod 755 "$T/karidns-dbloader"; }
@@ -67,7 +68,7 @@ conf() {   # conf LIMIT-LINE
     cat > "$T/k.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT;
-    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; $1 park-timeout 4000; };
+    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; acl-ceiling { 127.0.0.1; }; $1 park-timeout 4000; };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
 EOF
@@ -126,13 +127,66 @@ RES4=$(stat resident)
 [ "$(q www.z0100.test)" = "192.0.2.99" ] && pass "a query loads the new version" || fail "z0100 does not give the new data"
 stop_srv
 
+wait_ans() {   # wait_ans NAME EXPECTED SECONDS: the answer for NAME becomes EXPECTED
+    i=0
+    while [ $i -lt $(($3 * 10)) ]; do [ "$(q "$1")" = "$2" ] && return 0; sleep 0.1; i=$((i + 1)); done
+    return 1
+}
+batches() { grep -c '\[DB\] batch [0-9]* complete: [1-9]' "$T/srv.log"; }     # batches in which the loader sent zones
+db_rejected() { $KCTL dbstatus 2>/dev/null | sed -n 's/^since start: [0-9]* applied, \([0-9]*\) rejected.*/\1/p'; }
+sqlite3_serial() {   # sqlite3_serial ZONE SERIAL: the zone's SOA gets that serial
+    sqlite3 "$T/db/z.db" "UPDATE records SET content = 'ns1.$1 host.$1 $2 3600 600 86400 300' WHERE type = 'SOA' AND name = '$1';"
+}
+
+echo "== a zone that a query loaded is replaced when the database changes (the inventory knows it is in memory)"
+conf "memory-limit 64m; fetch-rate 5000; auto-reload yes; poll-interval 1;"
+start_srv
+[ "$(q www.z0007.test)" = "192.0.2.80" ] && pass "z0007 is loaded by a query" || fail "z0007 does not answer"
+[ "$(q www.z0200.test)" = "192.0.2.80" ] && pass "the pinned z0200 answers (read by the warm-up)" || fail "z0200 does not answer"
+sqlite3 "$T/db/z.db" "UPDATE records SET content = '192.0.2.77' WHERE name = 'www.z0007.test'; UPDATE records SET content = '192.0.2.78' WHERE name = 'www.z0200.test';"
+sqlite3_serial z0007.test 2
+sqlite3_serial z0200.test 2
+wait_ans www.z0007.test 192.0.2.77 15 && pass "the new data of the zone that was loaded by a query is served" || fail "z0007 still gives $(q www.z0007.test) after the database changed"
+wait_ans www.z0200.test 192.0.2.78 15 && pass "the new data of the warmed, pinned zone is served" || fail "z0200 still gives $(q www.z0200.test)"
+sleep 1
+B1=$(batches); R1=$(db_rejected)
+sleep 6
+B2=$(batches); R2=$(db_rejected)
+[ "$B1" = "$B2" ] && pass "no zone is sent again in the polls that follow (batches with zones: $B1 -> $B2)" || fail "the loader sends zones in every poll ($B1 -> $B2 batches with zones)"
+[ "${R1:-x}" = "${R2:-y}" ] && [ "${R2:-1}" = "0" ] && pass "and none is counted as rejected ($R2)" || fail "rejected $R1 -> $R2"
+
+echo "== an UPDATE-pinned zone is replaced by the next load from the database"
+got=$(perl tests/db/dns_tcp_probe.pl 127.0.0.1 "$PORT" udp-update z0010.test 2>&1)
+echo "$got" | grep -q 'rcode=0$' && pass "the UPDATE of a zone that was out of memory is applied ($got)" || fail "UPDATE: $got"
+[ "$(q new.z0010.test)" = "192.0.2.99" ] && pass "the added name is served" || fail "new.z0010.test: $(q new.z0010.test)"
+$KCTL dbstatus 2>/dev/null | grep -q '^updated: 1 zone' && pass "dbstatus shows the zone as pinned by the UPDATE" || fail "dbstatus: $($KCTL dbstatus 2>&1 | grep updated)"
+sqlite3 "$T/db/z.db" "UPDATE records SET content = '192.0.2.55' WHERE name = 'www.z0010.test';"
+sqlite3_serial z0010.test 2
+wait_ans www.z0010.test 192.0.2.55 15 && pass "the database's version replaces the zone" || fail "z0010 still gives $(q www.z0010.test)"
+[ -z "$(q new.z0010.test)" ] && pass "what the UPDATE added is gone" || fail "new.z0010.test is still served: $(q new.z0010.test)"
+$KCTL dbstatus 2>/dev/null | grep -q '^updated: [1-9]' && fail "dbstatus still shows an UPDATE-pinned zone" || pass "the zone is no longer pinned by the UPDATE"
+sleep 1
+B1=$(batches)
+sleep 5
+B2=$(batches)
+[ "$B1" = "$B2" ] && pass "no zone is sent again afterwards ($B1 -> $B2)" || fail "zones are sent again ($B1 -> $B2)"
+stop_srv
+
 echo "== without memory-limit nothing changes"
 conf ""
 start_srv
 RESU=$($KCTL dbstatus 2>/dev/null | sed -n 's/^zone versions and IXFR deltas: database zones \([0-9]*\) bytes resident.*/\1/p')
 $KCTL dbstatus 2>/dev/null | grep -q '^cache: no memory-limit' && pass "dbstatus says: no memory-limit" || fail "dbstatus shows a limit"
 [ "${RESU:-0}" -gt 100000 ] && pass "every zone is loaded at the start ($RESU bytes)" || fail "resident ${RESU:-?} bytes; the zones were not loaded"
-[ "$(q www.z0007.test)" = "192.0.2.80" ] && pass "and answers" || fail "no answer without a limit"
+[ "$(q www.z0007.test)" = "192.0.2.77" ] && pass "and answers (with the data of the database change above)" || fail "no answer without a limit"
+# every zone is in memory: the observatory reply is one record of 664 bytes a zone, many times the socket buffer (net.local.stream.sendspace, 64 KiB)
+$KCTL observatory > "$T/obs2.out" 2> "$T/obs2.err"; rc=$?
+NOBS=$(grep -c '^Zone: ' "$T/obs2.out")
+SS=$(sysctl -n net.local.stream.sendspace 2>/dev/null || echo 0)
+echo "  observatory lists $NOBS zone(s); the reply is about $((NOBS * 664)) bytes, net.local.stream.sendspace is $SS"
+[ "$rc" -eq 0 ] && kill -0 "$SRV" 2>/dev/null && pass "karictl observatory with every zone in memory (rc $rc)" || fail "karictl observatory: rc $rc: $(head -3 "$T/obs2.err")"
+[ "$NOBS" -ge $((NZ - 2)) ] && pass "every zone is in the reply, however long ($NOBS of $NZ)" || fail "the reply lists only $NOBS of $NZ zones"
+[ "$((NOBS * 664))" -gt "${SS:-0}" ] && pass "the reply is longer than the socket buffer, so it took several sends" || fail "the reply fits the socket buffer: the test proves nothing"
 stop_srv
 
 grep -q "AddressSanitizer\|runtime error:\|ThreadSanitizer" "$T/srv.log" 2>/dev/null && fail "sanitizer report in the server log" || pass "no sanitizer report in the server log"
