@@ -93,7 +93,7 @@ KCTL="./karictl -c $T/karictl.conf"
 conf() {   # conf NOTIFY-MODE
     cat > "$T/k.conf" <<EOF
 options {
-    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT; notify $1; notify-rate 100;
+    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT; notify $1; notify-rate 100; minimal-responses yes;
     database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; fetch-rate 5000; acl-ceiling { 127.0.0.1; }; memory-limit 64m; };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
@@ -175,6 +175,8 @@ bump inz.test 2
 wait_got 4 inz.test 10 && pass "inz.test: NOTIFY to ns1.inz.test (127.0.0.4)" || fail "inz.test: 127.0.0.4 got $(got 4 inz.test)"
 oom inz.test && pass "inz.test is still out of memory" || fail "inz.test was read"
 
+# (minimal-responses: an answer of res2.test would carry its NS with the glue of ns1.prov.test, and the glue of a sibling that is out of memory is asked for in the
+# background since D1a step 8: prov.test must stay out of memory here to show the apex path)
 echo "== a zone in memory is notified as before"
 [ "$(q www.res.test)" = "192.0.2.80" ] && ! oom res.test && pass "a query loads res.test" || fail "res.test was not loaded"
 bump res.test 2
