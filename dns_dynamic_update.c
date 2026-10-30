@@ -224,7 +224,7 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   atomic_store_explicit(&entry->serial, new_serial, memory_order_release);
 
   zone_publish(entry, z_next);
-  if (entry->source == ZONE_SRC_DB) entry->updated = true;      /* D1a: the cache manager does not take the zone out of memory: the UPDATE lives only there */
+  if (entry->source == ZONE_SRC_DB) atomic_store_explicit(&entry->updated, true, memory_order_release);      /* D1a: the cache manager does not take the zone out of memory: the UPDATE lives only there */
   pthread_mutex_unlock(&entry->writer_lock);
 
   notify_request_send(entry);

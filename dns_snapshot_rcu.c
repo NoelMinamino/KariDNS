@@ -2402,7 +2402,7 @@ static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
         free(gent);
         return 0;
     }
-    if (e->updated) {                                  /* a dynamic UPDATE changed it: only the memory has the change (design 7: pinned until the database's version replaces it) */
+    if (atomic_load_explicit(&e->updated, memory_order_relaxed)) {      /* a dynamic UPDATE changed it: only the memory has the change (design 7: pinned until the database's version replaces it) */
         pthread_mutex_unlock(&e->writer_lock);
         free(gent);
         return 0;
@@ -2651,7 +2651,7 @@ uint32_t dbreg_cache_round(void) {
             z->qseen = q32;
             f = f > UINT32_MAX - dq ? UINT32_MAX : f + dq;
             atomic_store_explicit(&z->freq, f, memory_order_relaxed);
-            if ((z->flags & ZDIR_F_PIN) || e->updated) {        /* (a zone that a dynamic UPDATE changed is never taken out until the database replaces it: it is as good as pinned) */
+            if ((z->flags & ZDIR_F_PIN) || atomic_load_explicit(&e->updated, memory_order_relaxed)) {        /* (a zone that a dynamic UPDATE changed is never taken out until the database replaces it: it is as good as pinned) */
                 g_cycle_pinned += bytes;
                 pinned_now += bytes;
                 continue;
@@ -3234,7 +3234,7 @@ size_t dbreg_count_updated(void) {
         for (size_t b = 0; b < rv->nb; b++) {
             for (const dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
                 const zone_db_entry_t *e = zdir_entry(z);
-                if (e && e->updated) n++;
+                if (e && atomic_load_explicit(&e->updated, memory_order_relaxed)) n++;
             }
         }
     }

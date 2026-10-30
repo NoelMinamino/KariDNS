@@ -404,9 +404,9 @@ int main(void) {
         CHECK(dbreg_reject("default", "s.test.", 12, "install failed"));
         CHECK(!(elem_of("default", "s.test.")->flags & ZDIR_F_BUSY) && dbreg_lookup_entry("default", "s.test.") == se);
         CHECK(se && dbreg_commit("default", "s.test.", se, false, 12, atomic_load(&se->serial), dgs, &shd) == 0);   /* (clears the error) */
-        if (se) se->updated = true;                                    /* (what an UPDATE leaves) */
+        if (se) atomic_store(&se->updated, true);                                    /* (what an UPDATE leaves) */
         CHECK(!dbreg_test_evict("default", "s.test."));
-        if (se) se->updated = false;
+        if (se) atomic_store(&se->updated, false);
         /* UPDATE against an entry that was taken out while it waited for the lock: the snapshot keeps the entry alive meanwhile */
         zone_db_snapshot_t *hold = acquire_retained_zone_snapshot();
         zone_db_entry_t *ue = dbreg_lookup_entry("default", "r.test.");
@@ -680,6 +680,33 @@ int main(void) {
             send_zone(f[0], &e, 0, zl, 1, rl, 50000 + yl);                         /* the fetch brings the version 1 */
             CHECK(wake_next(&k, 5000) && strcmp(k.zone, zl) == 0 && !k.failed);
             CHECK(zdir_entry(le2) == NULL && le2->serial == 50 && atomic_load(&le2->state) == ZDIR_ST_ABSENT);       /* (not installed: the newer version stays) */
+        }
+
+        /* D1a review 6E: the body of the version 60 came first and was left out of memory (the directory has the version 60 now); the fetch that was on its way brings
+         * that version: it is installed at the first try and nothing is asked for again */
+        {
+            const char *zc = coldz[7];
+            int yc = 0;
+            CHECK(sscanf(zc, "y%d", &yc) == 1);
+            CHECK(park_fetch_request(0, "default", zc, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, zc) == 0);
+            const uint64_t rc7 = m.u.fetch_req.request_id;
+            kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+            kdb_enc_u64(&e, 1, 12); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
+            kdb_enc_end(&e);
+            ch_send(a[0], &e);
+            send_zone(a[0], &e, 0, zc, 60, 0, 50000 + yc);
+            kdb_enc_begin(&e, KDB_T_BATCH_END);
+            kdb_enc_u64(&e, 1, 12); kdb_enc_u32(&e, 2, 1); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+            kdb_enc_end(&e);
+            ch_send(a[0], &e);
+            while (ch_next(&mainc, &m, 10000) && m.type != KDB_T_BATCH_RESULT) {}
+            zdir_elem_t *le3 = elem_of("default", zc);
+            CHECK(le3 && le3->serial == 60 && zdir_entry(le3) == NULL);
+            send_zone(f[0], &e, 0, zc, 60, rc7, 50000 + yc);
+            CHECK(wake_next(&k, 5000) && strcmp(k.zone, zc) == 0 && !k.failed);
+            CHECK(zdir_entry(le3) != NULL && le3->serial == 60);
+            CHECK(!ch_next(&fetchc, &m, 300));                                      /* (no second request) */
         }
 
         /* D1a review 6D: with the zones in memory above the hard limit a request for a zone is shed ("not ready") and a request for a summary is not (it brings no data) */

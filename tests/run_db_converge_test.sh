@@ -207,11 +207,12 @@ sqlite3 "$T/db/z2.db" <<SQL
 INSERT INTO domains (name, type) VALUES ('big2.test', 'NATIVE');
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'SOA', 'ns1.hosting.example host.hosting.example 7 3600 600 86400 300', 900, 0, 0 FROM domains WHERE name = 'big2.test';
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.hosting.example', 3600, 0, 0 FROM domains WHERE name = 'big2.test';
-WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 3999)
+WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 7999)
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
   SELECT d.id, printf('h%05d.big2.test', n.i), 'A', '192.0.2.' || (1 + n.i % 250), 300, 0, 0 FROM n, domains d WHERE d.name = 'big2.test';
 DELETE FROM domainmetadata WHERE kind = 'X-KARIDNS-CACHE';
 INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'ALLOW-DNSUPDATE-FROM', '127.0.0.1' FROM domains WHERE name IN ('big.test', 'big2.test');
+INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'ALLOW-AXFR-FROM', '127.0.0.1' FROM domains WHERE name IN ('big.test', 'big2.test');
 SQL
 chown nobody "$T/db/z2.db"*; chmod 600 "$T/db/z2.db"*
 DBF="$T/db/z2.db"
@@ -231,6 +232,37 @@ $KCTL reconfig > /dev/null 2>&1
 wait_walk "${W0:-0}"
 [ "${AS:-0}" -gt 1000 ] && pass "the walk finished (walking=0) with $AS summaries asked for and answered" || fail "the walk asked for $AS summaries"
 [ "$(soa_serial n.test)" = "7" ] && oom n.test && pass "n.test has its apex: the SOA question does not read it" || fail "n.test SOA: $(soa_serial n.test); out of memory: $(oom n.test && echo yes || echo no)"
+stop_srv
+
+echo "== zones in memory above the hard limit of memory-limit (two big zones that a transfer holds)"
+# a zone that is being transferred is not taken out of memory and is not counted among the pinned zones, so the zones in memory stay above 110% of the limit
+# for as long as the transfers last: the fetches for queries are shed, the walk for the apex (summaries) is not held back, and the manager brings the memory down
+# when the transfers end
+conf "notify no;" "memory-limit 1m;"
+start_srv
+perl tests/db/hold_axfr.pl 127.0.0.1 "$PORT" big.test 120 > "$T/hold1.out" 2>&1 &
+H1=$!
+i=0; while [ $i -lt 300 ] && ! grep -q held "$T/hold1.out" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+perl tests/db/hold_axfr.pl 127.0.0.1 "$PORT" big2.test 120 > "$T/hold2.out" 2>&1 &
+H2=$!
+i=0; while [ $i -lt 300 ] && ! grep -q held "$T/hold2.out" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+grep -q held "$T/hold1.out" && grep -q held "$T/hold2.out" && pass "two big zones are held by transfers that the client does not read" || fail "the transfers: $(cat "$T/hold1.out" "$T/hold2.out" 2>&1 | tr '\n' ' ')"
+sleep 1
+LIM=$(stat limit); RES=$(stat resident)
+[ "$RES" -gt $((LIM / 10 * 11)) ] && pass "the zones in memory are above 110% of the limit and stay there ($RES > $LIM)" || fail "resident $RES is not over 110% of $LIM"
+[ -z "$(q www.e.test)" ] && oom e.test && pass "a query for a zone out of memory is answered not ready: its fetch is shed" || fail "www.e.test: $(q www.e.test)"
+W0=$(walks_now)
+conf "" "memory-limit 1m;"
+$KCTL reconfig > /dev/null 2>&1
+wait_walk "${W0:-0}"
+[ "${AS:-0}" -gt 1000 ] && pass "the walk finished (walking=0) with $AS summaries asked for and answered, above the hard limit" || fail "the walk asked for $AS summaries"
+[ "$(soa_serial n.test)" = "7" ] && oom n.test && pass "n.test has its apex: the SOA question does not read it" || fail "n.test SOA: $(soa_serial n.test); out of memory: $(oom n.test && echo yes || echo no)"
+kill "$H1" "$H2" 2>/dev/null
+wait "$H1" "$H2" 2>/dev/null
+i=0; while [ $i -lt 300 ] && [ "$(stat resident)" -gt $((LIM / 100 * 95)) ]; do sleep 0.1; i=$((i + 1)); done
+RES=$(stat resident)
+[ "$RES" -le $((LIM / 100 * 95)) ] && pass "when the transfers end the cache manager takes the zones out of memory again ($RES bytes)" || fail "resident is still $RES (limit $LIM)"
+[ "$(q www.e.test)" = "192.0.2.80" ] && pass "a query for a zone out of memory is answered again" || fail "www.e.test: $(q www.e.test)"
 stop_srv
 DBF=""
 

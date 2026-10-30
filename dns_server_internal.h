@@ -435,7 +435,7 @@ typedef struct {
   ixfr_history_t ixfr_history;
   size_t evicted_bytes;           /* D1a step 5: the bytes of the version served that were moved to the retired total when the zone was evicted (0: not evicted) */
   bool evicted;                   /* the zone was taken out of memory (set under writer_lock): a writer that waited for the lock must not change this entry, the change would be lost */
-  bool updated;                   /* a dynamic UPDATE changed this DB zone since it was read from the database (set under writer_lock): it is not taken out of memory, the change would be lost; the next install from the database clears it */
+  _Atomic bool updated;           /* (written under writer_lock; the cache manager's scan and dbstatus read it without: relaxed loads) a dynamic UPDATE changed this DB zone since it was read from the database (set under writer_lock): it is not taken out of memory, the change would be lost; the next install from the database clears it */
   zone_observatory_t observatory;
   catalog_member_id_t *catalog_members;
   int catalog_member_count;

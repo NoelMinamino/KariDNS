@@ -125,7 +125,8 @@ typedef struct {
   bool v_valid;                          /* a request for the whole zone: the version the directory had when it was made (see ing_job_t.iv_valid) */
   int64_t v_sid;
   uint32_t v_serial;
-  bool want_summary;                     /* a summary for the zone was not asked for because this request was on its way: if it fails, the zone goes back to the list */
+  bool want_summary;                     /* a summary for the zone was not asked for because this request was on its way: if it fails or is dropped, the zone goes back to the list */
+  bool dropped;                          /* the zone it brought was dropped (an older version than the directory's) */
   bool quiet;                            /* asked for by the list of zones to read (the apex after a reload), not by a query: nobody waits for it, so it wakes nobody */
   int64_t sent_ms;
   char view_name[KARIDNS_VIEW_NAME_MAX];
@@ -982,13 +983,15 @@ static void job_execute(ing_job_t *j) {
     goto rejected;
   }
   /* A fetch brings the version the loader read when the request was made.  If the directory has another version by now (a summary or a body of a newer one came
-   * meanwhile), what the fetch brings is the older one and must not replace it: it is dropped (not a rejection: the zone is still asked for by the requests that
-   * wait for it, and the loader reads the version it has now).  The jobs of one zone do not run at the same time (name_in_flight()), so the check and the install
-   * see the same registry. */
+   * meanwhile), what the fetch brings may be the older one and must not replace it: it is dropped (not a rejection: the zone is still asked for by the requests that
+   * wait for it, and the loader reads the version it has now) - unless it is the version the directory has now (the body of that version came first and was left
+   * out of memory, and this is the data of it).  A directory that did not change since the request takes what the fetch brings: it may be newer than the directory
+   * (the loader has not announced it yet), and dropping it would repeat the request until the loader does.  The jobs of one zone do not run at the same time
+   * (name_in_flight()), so the check and the install see the same registry. */
   if (j->fetch_id && j->iv_valid) {
     int64_t sid;
     uint32_t sr;
-    if (!dbreg_zone_version(j->view_name, j->zone, &sid, &sr) || sid != j->iv_sid || sr != j->iv_serial) {
+    if (!dbreg_zone_version(j->view_name, j->zone, &sid, &sr) || ((sid != j->iv_sid || sr != j->iv_serial) && (sid != j->source_id || sr != j->serial))) {
       j->status = KDB_ST_UNCHANGED;
       db_zone_build_free(j->build);
       j->build = NULL;
@@ -2487,7 +2490,7 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
     syslog(LOG_WARNING, "[DB] fetch of zone '%s' (view '%s') failed: %s", done.zone, done.view_name, why && why[0] ? why : "no reason given");
   if (dbreg_pending_count() > 0) apply_delta(g);         /* a zone that was new to the index becomes visible before its queries are woken */
   if (ok && !done.quiet && done.mode == KDB_FETCH_FULL) dbreg_touch_loaded(done.view_name, done.zone);
-  if (!ok && done.want_summary) warm_add(g, done.view_name, done.zone);     /* (the summary that was not asked for because this request was on its way) */
+  if ((!ok || done.dropped) && done.want_summary) warm_add(g, done.view_name, done.zone);     /* (the summary that was not asked for because this request was on its way) */
   if (!done.quiet) park_wake_broadcast(done.view_name, done.zone, !ok);      /* (the summary for the apex wakes nobody: no query waits for it, and the queries that wait for the data are not woken for nothing) */
 }
 
@@ -2496,7 +2499,10 @@ static void fetch_job_finish(ing_t *g, ing_job_t *j) {
     ing_freq_t *r = fetch_find(g, j->fetch_id);
     bool ok = j->status != KDB_ST_REJECTED;
     if (ok && !j->summary) g->since_retire++;
-    if (r) fetch_complete(g, r, ok, j->reason);
+    if (r) {
+      r->dropped = ok && !j->summary && j->status == KDB_ST_UNCHANGED;
+      fetch_complete(g, r, ok, j->reason);
+    }
   }
   job_free(j);
 }
@@ -2582,7 +2588,7 @@ static void fetch_issue(ing_t *g) {
     if (q.mode == KDB_FETCH_SUMMARY) {
       ing_freq_t *full = fetch_find_zone(g, (uint16_t)vi, q.zone, KDB_FETCH_FULL);
       if (full) {
-        full->want_summary = warm;
+        full->want_summary |= warm;                       /* (a query's summary does not take back what the walk asked for) */
         continue;
       }
     }
@@ -3223,7 +3229,7 @@ static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   if (!zdir_entry(z)) st_append(c, z->digest && atomic_load_explicit(&z->state, memory_order_relaxed) != ZDIR_ST_ERROR
                                        ? " (the data is out of memory: it is read when a query needs it)" : " (no version loaded)");
   if (z->error) st_append(c, ", last error: %s", z->error);
-  if (zdir_entry(z) && zdir_entry(z)->updated) st_append(c, " (changed by a dynamic UPDATE: pinned in memory until the next load from the database)");
+  if (zdir_entry(z) && atomic_load_explicit(&zdir_entry(z)->updated, memory_order_relaxed)) st_append(c, " (changed by a dynamic UPDATE: pinned in memory until the next load from the database)");
   st_append(c, "\n");
   if (zdir_entry(z)) settings_status(c, zdir_entry(z));
   return true;
