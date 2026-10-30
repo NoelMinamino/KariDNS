@@ -6127,7 +6127,12 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     db->park_timeout_ms = (uint32_t)u;
     return 0;
   }
-  if (strcmp(key, "memory-limit") == 0)       /* K, M, G, T suffixes; unset = no limit (every database zone stays in memory) */
+  if (strcmp(key, "fetch-rate") == 0) {       /* zones read for queries per second (token bucket, burst = one second): scattered queries for zones out of memory */
+    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_FETCH_RATE_MAX, &u) != 0) return -1;
+    db->fetch_rate = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "memory-limit") == 0)       /* K, M, G suffixes (up to 1024G); unset = no limit (every database zone stays in memory) */
     return db_take_uint(ctx, key, true, KARIDNS_DB_MEMORY_LIMIT_MIN, KARIDNS_DB_MEMORY_LIMIT_MAX, &db->memory_limit);
   if (strcmp(key, "acl-ceiling") == 0) {
     /* addresses and "key" entries like allow-transfer (see zone_transfer_acl_allows(), dns_tsig_acl.c) */

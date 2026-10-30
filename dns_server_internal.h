@@ -434,6 +434,8 @@ typedef struct {
   _Atomic int snapshot_refs;
   ixfr_history_t ixfr_history;
   size_t evicted_bytes;           /* D1a step 5: the bytes of the version served that were moved to the retired total when the zone was evicted (0: not evicted) */
+  bool evicted;                   /* the zone was taken out of memory (set under writer_lock): a writer that waited for the lock must not change this entry, the change would be lost */
+  bool updated;                   /* a dynamic UPDATE changed this DB zone since it was read from the database (set under writer_lock): it is not taken out of memory, the change would be lost; the next install from the database clears it */
   zone_observatory_t observatory;
   catalog_member_id_t *catalog_members;
   int catalog_member_count;
@@ -542,6 +544,7 @@ enum { ZDIR_ST_ABSENT = 0, ZDIR_ST_RESIDENT, ZDIR_ST_LOADING, ZDIR_ST_ERROR };
 #define ZDIR_F_NOCACHE   0x0010u   /* never kept resident after an answer (reserved) */
 #define ZDIR_F_PARTIAL   0x0020u   /* only part of the zone is resident (reserved for D1b) */
 #define ZDIR_F_EVICT_NEXT 0x0040u  /* take out of memory first (as soon as the queries it was loaded for are answered): a zone that was admitted against the frequency order, or a no-cache zone */
+#define ZDIR_F_BUSY      0x0080u   /* the ingest thread is installing a new version into the zone's entry (dbreg_lookup_entry_busy() .. dbreg_commit() / dbreg_reject()): it is not taken out of memory meanwhile */
 #define ZDIR_F_QUEUED    0x1000u   /* a registry element waiting in the queue of additions */
 #define ZDIR_F_DELETED   0x2000u   /* a registry element that left the registry (waiting to leave the index) */
 #define ZDIR_F_TICK      0x4000u   /* the control thread's tick looks at the zone (secondary, catalog member) */
@@ -917,6 +920,9 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
 /* The entry registered for (view, name) or NULL.  Valid while the caller is the only ingest thread working on that
  * name (the ingest thread serializes zones of the same name). */
 zone_db_entry_t *dbreg_lookup_entry(const char *view, const char *name);
+/* the same for the ingest thread that is about to install a new version into the entry: the zone is marked busy (ZDIR_F_BUSY) until dbreg_commit() or dbreg_reject() for it, and is not taken out of memory meanwhile */
+zone_db_entry_t *dbreg_lookup_entry_busy(const char *view, const char *name);
+uint64_t zone_bytes_underflows(void);                             /* times a byte total would have gone below zero (a bug; 0) */
 /* Record that the version offered for (view, name) was rejected (an existing entry keeps serving its last good
  * version; without one only the error is recorded).  false: out of memory. */
 bool dbreg_reject(const char *view, const char *name, int64_t source_id, const char *reason);

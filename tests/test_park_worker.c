@@ -75,6 +75,26 @@ static size_t build_query(uint8_t *b, uint16_t id, bool edns, size_t padding) {
     return o;
 }
 
+/* a NOTIFY (opcode 4) or an UPDATE (opcode 5) for `name`: the zone / question section is "name SOA IN" (RFC 1996, RFC 2136 2.3) */
+static size_t build_op(uint8_t *b, uint16_t id, int opcode, const char *name) {
+    memset(b, 0, 12);
+    b[0] = (uint8_t)(id >> 8); b[1] = (uint8_t)id;
+    b[2] = (uint8_t)(opcode << 3);
+    b[5] = 1;
+    size_t o = 12;
+    while (*name) {
+        const char *dot = strchr(name, '.');
+        size_t l = dot ? (size_t)(dot - name) : strlen(name);
+        b[o++] = (uint8_t)l;
+        memcpy(b + o, name, l);
+        o += l;
+        name += l + (dot ? 1 : 0);
+    }
+    b[o++] = 0;
+    b[o++] = 0; b[o++] = 6; b[o++] = 0; b[o++] = 1;                       /* SOA IN */
+    return o;
+}
+
 static void mk_ipc(udp_ipc_t *i, int tag, size_t len) {
     memset(i, 0, sizeof(*i));
     i->sock_fd_idx = tag;
@@ -494,6 +514,51 @@ int main(void) {
         a = read_answer(sk[1]);
         CHECK(a.got && a.id == 0x7503 && a.rcode == 2 && a.ede == 14 && table.nwait == 0);
         atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    }
+
+    /* -- NOTIFY and UPDATE for a zone that is out of memory (until the transfer / UPDATE step of D1 they neither park nor ask for the zone nor count
+     *    for its frequency): NOTIFY is REFUSED as for a primary zone; UPDATE is checked (SOA question, the apex, allow-update from the settings
+     *    kept in the element): REFUSED without allow-update, NOTAUTH for a name that is not the apex, SERVFAIL + EDE 14 where it may be made */
+    {
+        w.park = &table;
+        uint32_t f1 = atomic_load(&el->freq);
+        #define OPQ(id, opcode, name) do { size_t ql_ = build_op(rx + sizeof(udp_ipc_t), (id), (opcode), (name)); mk_ipc((udp_ipc_t *)rx, 7, ql_); \
+            w.n_tx = 0; udp_one(&w, (udp_ipc_t *)rx, rx + sizeof(udp_ipc_t), (ssize_t)ql_); } while (0)
+        OPQ(0x7601, 4, "park.test");
+        CHECK(w.n_tx == 1 && table.nwait == 0 && !park_fetch_pop(park_fetch_ring(0), &q));
+        FLUSH();
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.id == 0x7601 && a.rcode == 5);
+        OPQ(0x7602, 5, "park.test");
+        CHECK(w.n_tx == 1 && table.nwait == 0 && !park_fetch_pop(park_fetch_ring(0), &q));
+        FLUSH();
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.id == 0x7602 && a.rcode == 5);                  /* (no allow-update: REFUSED) */
+        static const char ust[] = "allow-update { 127.0.0.1; };";
+        zone_ext_shared_t *ush = db_settings_parse(ust, strlen(ust), NULL, 0);
+        CHECK(ush != NULL);
+        atomic_store(&el->sh, ush);
+        /* (a database zone's allow-update also needs the database's acl-ceiling to let the client in, dns_tsig_acl.c) */
+        static server_config_t cfg5;
+        char conf5[1600];
+        snprintf(conf5, sizeof(conf5), "options { directory \"%s\"; database { driver sqlite3; database-file \"/x.db\"; acl-ceiling { 127.0.0.1; }; }; };\n"
+                 "view \"default\" { match-clients { any; }; zone \"park.test\" { type master; file \"%s\"; }; };\n", dir, zf);
+        CHECK(parse_named_conf(conf5, &cfg5) == 0);
+        cfg5.send_extended_errors = true;
+        atomic_store_explicit(&g_config_db.active, &cfg5, memory_order_release);
+        OPQ(0x7603, 5, "park.test");
+        CHECK(w.n_tx == 1 && table.nwait == 0 && !park_fetch_pop(park_fetch_ring(0), &q));
+        FLUSH();
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.id == 0x7603 && a.rcode == 2);                  /* (allowed: SERVFAIL, nothing read; the query has no OPT, so no EDE) */
+        OPQ(0x7604, 5, "x.park.test");
+        FLUSH();
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.id == 0x7604 && a.rcode == 9);                  /* (not the apex: NOTAUTH) */
+        atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+        atomic_store(&el->sh, NULL);
+        zone_ext_shared_unref(ush);
+        CHECK(atomic_load(&el->freq) == f1 && table.nwait == 0 && !park_fetch_pop(park_fetch_ring(0), &q));
     }
 
     /* -- nothing is parked and nobody said anything: park_service() returns at once (and with a key in the ring it does look) */

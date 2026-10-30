@@ -99,6 +99,14 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
                           const char *client_ip,
                           const char *matched_key_name) {
   pthread_mutex_lock(&entry->writer_lock);
+  if (entry->evicted) {
+    /* D1a: the zone was taken out of memory between the lookup of the query and now (the cache manager takes it under this lock): this entry is
+     * going to the garbage and a change made to it would be lost while the client was told NOERROR.  Until a later step pins an updated zone, the
+     * client is told to try again (the zone is read when a query needs it). */
+    pthread_mutex_unlock(&entry->writer_lock);
+    syslog(LOG_WARNING, "[Update] Dynamic update on zone '%s' not applied: the zone was taken out of memory meanwhile (try again).", entry->domain);
+    return 2; // SERVFAIL
+  }
   if (!wait_for_active_axfr(entry, 5000)) {
     pthread_mutex_unlock(&entry->writer_lock);
     syslog(LOG_WARNING, "[Update] Dynamic update on zone '%s' rejected: active AXFR in progress.", entry->domain);
@@ -216,6 +224,7 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   atomic_store_explicit(&entry->serial, new_serial, memory_order_release);
 
   zone_publish(entry, z_next);
+  if (entry->source == ZONE_SRC_DB) entry->updated = true;      /* D1a: the cache manager does not take the zone out of memory: the UPDATE lives only there */
   pthread_mutex_unlock(&entry->writer_lock);
 
   notify_request_send(entry);

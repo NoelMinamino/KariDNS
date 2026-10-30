@@ -7,6 +7,8 @@
 # in the state of an evicted one: in the directory, no data in memory.  `evict` answers OK only for a zone that is in memory, so a second
 # `evict` after a query shows that the query brought the zone back through the fetch stream.  Checked:
 #   - a UDP query and a TCP query for an evicted zone are answered with the data of the database (parked, fetched, woken)
+#   - NOTIFY and UPDATE (UDP and TCP) for an evicted zone are answered at once (REFUSED) and do not fetch the zone
+#   - a karictl reconfig that adds a zone does not drop the zone that is out of memory (it still parks, fetches and answers)
 #   - TCP: three queries in one write (the first one for the evicted zone) are answered in order; a client that closes while its request
 #     is parked does not hurt the server; after a parked query the connection ends by tcp-idle-timeout
 #   - the loader does not answer (stopped): the answer after park-timeout is SERVFAIL + Extended DNS Error 14 (Not Ready), UDP and TCP;
@@ -85,7 +87,7 @@ chmod 600 "$T/karictl.conf"
 KCTL="./karictl -c $T/karictl.conf"
 cat > "$T/k.conf" <<EOF
 options {
-    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT; tcp-idle-timeout 3000ms; tcp-connection-reuse yes; allow-query { 127.0.0.1; };
+    user "nobody"; pid-file "none"; directory "$T/z"; listen-on { 127.0.0.1; }; port $PORT; tcp-idle-timeout 3000ms; tcp-connection-reuse yes; allow-query { 127.0.0.1; };
     database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; db-reload-timeout 1; park-timeout 1000; };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
@@ -139,6 +141,37 @@ else
     evict a.test. | grep -q '^ERROR' && pass "... and the zone was not fetched for them" || fail "the zone was fetched for a client that may not ask"
     [ "$(q www.a.test)" = "192.0.2.80" ] && pass "a client that may ask still waits for the zone and gets the answer" || fail "the allowed client got no answer"
 fi
+
+echo "== NOTIFY and UPDATE for an evicted zone neither park nor fetch"
+evicted a.test. "a.test is out of memory"
+for tr in udp tcp; do
+    got=$(perl tests/db/dns_tcp_probe.pl 127.0.0.1 "$PORT" "$tr-op" 4 a.test 2>&1)
+    echo "$got" | grep -q 'rcode=5$' && pass "$tr: NOTIFY is REFUSED at once ($got)" || fail "$tr: NOTIFY: $got"
+    got=$(perl tests/db/dns_tcp_probe.pl 127.0.0.1 "$PORT" "$tr-op" 5 a.test 2>&1)
+    echo "$got" | grep -q 'rcode=5$' && pass "$tr: UPDATE without allow-update is REFUSED at once ($got)" || fail "$tr: UPDATE: $got"
+done
+evict a.test. | grep -q '^ERROR' && pass "... and the zone was not fetched for them" || fail "NOTIFY/UPDATE fetched the zone"
+[ "$(q www.a.test)" = "192.0.2.80" ] && pass "a query still brings the zone back" || fail "a.test does not answer after the NOTIFY/UPDATE probes"
+
+echo "== a reconfig that adds a zone keeps the zone that is out of memory"
+cat > "$T/z/extra.test.zone" <<EOF
+\$ORIGIN extra.test.
+\$TTL 300
+@ SOA ns1.extra.test. host.extra.test. 1 3600 600 86400 300
+@ NS ns1
+ns1 A 192.0.2.1
+www A 192.0.2.81
+EOF
+chmod 644 "$T/z/extra.test.zone"
+evicted a.test. "a.test is out of memory"
+echo "zone \"extra.test\" { type master; file \"extra.test.zone\"; };" >> "$T/k.conf"      # (the zone directory is opened at the start)
+out=$($KCTL reconfig 2>&1)
+echo "$out" | grep -qi 'error\|fail' && fail "reconfig: $out"
+sleep 1
+[ "$(q www.extra.test)" = "192.0.2.81" ] && pass "the new zone answers" || fail "the zone added by the reconfig does not answer"
+evict a.test. | grep -q '^ERROR' && pass "a.test is still out of memory after the reconfig (not dropped)" || fail "the reconfig brought a.test back or lost it: $(evict a.test. | head -1)"
+[ "$(q www.a.test)" = "192.0.2.80" ] && pass "a query for a.test still parks, fetches and is answered" || fail "a.test does not answer after the reconfig"
+resident_again a.test. "... and it came through the fetch stream"
 
 echo "== TCP: pipelining, EOF while parked, idle timeout after a parked query"
 evicted a.test. "a.test is out of memory"

@@ -34,6 +34,7 @@
 #include "../dns_config_parser.h"
 #include "../dns_db_ingest.h"
 #include "../dns_db_stream.h"
+#include "../dns_dynamic_update.h"
 #include "../dns_park.h"
 #include "../dns_server_internal.h"
 #include "../dns_snapshot_rcu.h"
@@ -321,6 +322,64 @@ int main(void) {
     for (int i = 0; i < 100 && !elem_of("default", "r.test."); i++) usleep(50000);            /* (the view delta runs within a second) */
     CHECK(elem_of("default", "r.test.") != NULL && zdir_entry(elem_of("default", "r.test.")) != NULL);
 
+    /* -- a full rebuild of the zone directory (a zone { } block is added to the configuration) keeps a zone that is out of memory in the index: it
+     *    still parks, is fetched and answers (it used to leave the index, and so was REFUSED for good) */
+    {
+        CHECK(dbreg_test_evict("default", "s.test."));
+        static server_config_t cfgX;
+        CHECK(parse_named_conf("options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; }; };\n"
+                               "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; zone \"added.test\" { type master; }; };\n", &cfgX) == 0);
+        rebuild_zone_db_from_config(&cfgX, false);
+        zdir_elem_t *se = elem_of("default", "s.test.");
+        CHECK(se != NULL && zdir_entry(se) == NULL && atomic_load(&se->state) == ZDIR_ST_ABSENT);
+        CHECK(elem_of("default", "r.test.") != NULL && zdir_entry(elem_of("default", "r.test.")) != NULL);
+        CHECK(park_fetch_request(0, "default", "s.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+        CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "s.test.") == 0);
+        send_zone(f[0], &e, 0, "s.test.", 6, m.u.fetch_req.request_id, 12);
+        CHECK(wake_next(&k, 5000) && strcmp(k.zone, "s.test.") == 0 && !k.failed);
+        CHECK(zdir_entry(elem_of("default", "s.test.")) != NULL);
+    }
+
+    /* -- an eviction cannot overtake an install: from dbreg_lookup_entry_busy() to dbreg_commit() the zone is not taken out (the new version would
+     *    be published into an entry that goes to the garbage); an UPDATE that waited for the lock of an entry that was taken out meanwhile does not
+     *    change it (SERVFAIL); a zone changed by an UPDATE is not taken out; the byte totals never went below zero */
+    {
+        zone_db_entry_t *be = dbreg_lookup_entry_busy("default", "r.test.");
+        CHECK(be != NULL && (elem_of("default", "r.test.")->flags & ZDIR_F_BUSY));
+        CHECK(!dbreg_test_evict("default", "r.test."));
+        bool shd = false;
+        uint8_t dgr[32], dgs[32];                           /* (a copy: the element's own digest would be copied onto itself) */
+        memcpy(dgr, elem_of("default", "r.test.")->digest, 32);
+        memcpy(dgs, elem_of("default", "s.test.")->digest, 32);
+        CHECK(dbreg_commit("default", "r.test.", be, false, 11, atomic_load(&be->serial), dgr, &shd) == 0);
+        CHECK(!(elem_of("default", "r.test.")->flags & ZDIR_F_BUSY) && zdir_entry(elem_of("default", "r.test.")) == be);
+        /* an install that fails (dbreg_reject) clears the mark as well; the zone keeps serving its last good version */
+        zone_db_entry_t *se = dbreg_lookup_entry_busy("default", "s.test.");
+        CHECK(se != NULL && (elem_of("default", "s.test.")->flags & ZDIR_F_BUSY));
+        CHECK(dbreg_reject("default", "s.test.", 12, "install failed"));
+        CHECK(!(elem_of("default", "s.test.")->flags & ZDIR_F_BUSY) && dbreg_lookup_entry("default", "s.test.") == se);
+        CHECK(se && dbreg_commit("default", "s.test.", se, false, 12, atomic_load(&se->serial), dgs, &shd) == 0);   /* (clears the error) */
+        if (se) se->updated = true;                                    /* (what an UPDATE leaves) */
+        CHECK(!dbreg_test_evict("default", "s.test."));
+        if (se) se->updated = false;
+        /* UPDATE against an entry that was taken out while it waited for the lock: the snapshot keeps the entry alive meanwhile */
+        zone_db_snapshot_t *hold = acquire_retained_zone_snapshot();
+        zone_db_entry_t *ue = dbreg_lookup_entry("default", "r.test.");
+        CHECK(ue != NULL && dbreg_test_evict("default", "r.test."));
+        uint8_t upd[12];
+        memset(upd, 0, sizeof(upd));
+        upd[2] = 0x28;                                                 /* opcode UPDATE */
+        CHECK(ue && handle_dynamic_update(upd, sizeof(upd), ue, "127.0.0.1", "<none>") == 2);
+        release_zone_snapshot(hold);
+        for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(50000);
+        /* the zone comes back through the fetch stream as before */
+        CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+        CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "r.test.") == 0);
+        send_zone(f[0], &e, 0, "r.test.", 5, m.u.fetch_req.request_id, 11);
+        CHECK(wake_next(&k, 5000) && strcmp(k.zone, "r.test.") == 0 && !k.failed);
+        CHECK(zone_bytes_underflows() == 0);
+    }
+
     /* ======================================================================================================================================
      * the cache manager (D1a step 5, design 8): memory-limit, GDSF, pins, cold zones, admission.  A second batch brings many zones; the limit is
      * then set (a configuration with memory-limit, which the manager's thread reads) and the manager takes zones out of memory.
@@ -330,6 +389,9 @@ int main(void) {
         char nm[40];
         zone_bytes_t zb0, zb1;
         zone_bytes_get(ZBYTES_DB, &zb0);
+        dbreg_cache_stats_t cs0;
+        dbreg_cache_stats(&cs0);
+        uint64_t ev_base = cs0.evictions;
         kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
         kdb_enc_u64(&e, 1, 2); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
         kdb_enc_end(&e);
@@ -363,7 +425,7 @@ int main(void) {
         printf("  (%d zones add %llu bytes: %llu per zone)\n", NZ + 2, (unsigned long long)added, (unsigned long long)(added / (NZ + 2)));
         dbreg_cache_stats_t cs;
         dbreg_cache_stats(&cs);
-        CHECK(cs.limit == 0 && cs.evictions == 0 && cs.cold == 0);
+        CHECK(cs.limit == 0 && cs.evictions == ev_base && cs.cold == 0);       /* (the hook evictions of the earlier blocks are not counted) */
 
         /* some zones are asked for (the counters of the entries, as the queries make them): the first ten very often, the next hundred a little */
         for (int i = 0; i < 110; i++) {
@@ -474,6 +536,40 @@ int main(void) {
         usleep(500000);
         dbreg_cache_stats(&cs);
         CHECK(cs.evictions == ev_before);
+
+        /* fetch-rate: queries scattered over many zones that are out of memory make the loader read zones at most as fast as the bucket fills
+         * (burst = one second of the rate); the others are told "not ready" at once, and the status says how many */
+        static server_config_t cfgR;
+        CHECK(parse_named_conf("options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; fetch-rate 10; }; };\n"
+                               "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", &cfgR) == 0);
+        CHECK(cfgR.database.fetch_rate == 10);
+        atomic_store_explicit(&g_config_db.active, &cfgR, memory_order_release);
+        usleep(2500000);                                                          /* (the manager's thread takes the rate; the bucket fills to its burst) */
+        int asked = 0, got = 0, refused = 0;
+        for (int i = 300; i < 2500 && asked < 60; i++) {
+            snprintf(nm, sizeof(nm), "z%04d.test.", i);
+            if (dbreg_lookup_entry("default", nm)) continue;                      /* (a zone out of memory) */
+            CHECK(park_fetch_request(0, "default", nm, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+            asked++;
+        }
+        CHECK(asked == 60);
+        while (ch_next(&fetchc, &m, 700) && m.type == KDB_T_FETCH_REQ) {
+            got++;
+            send_failed(f[0], &e, 0, m.u.fetch_req.name, m.u.fetch_req.request_id);       /* (the loader cannot read it: nothing stays in flight) */
+        }
+        while (wake_next(&k, 300)) refused += k.failed ? 1 : 0;
+        printf("  (fetch-rate 10: %d of %d requests reached the loader, %d queries woken with a failure)\n", got, asked, refused);
+        CHECK(got >= 8 && got <= 16);                                             /* (10 in the bucket, and what fills it meanwhile) */
+        CHECK(refused >= asked - 16);
+        {
+            char st[4096];
+            size_t sl = db_ingest_status(NULL, NULL, st, sizeof(st));
+            const char *p = sl ? strstr(st, "refused_by_rate=") : NULL;
+            CHECK(p != NULL && strtoull(p + 16, NULL, 10) >= (unsigned long long)(asked - 16));
+            CHECK(strstr(st, "fetch: rate=10/s") != NULL);
+        }
+        atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+        usleep(1300000);                                                          /* (back to the default rate before the fetches that follow) */
         /* r.test. (the hook) and s.test. (asked for least) may be out of memory: the tests that follow start from the two being in memory */
         static const struct { const char *name; uint32_t serial; int64_t sid; } back[] = { { "r.test.", 5, 11 }, { "s.test.", 6, 12 } };
         for (int b = 0; b < 2; b++) {

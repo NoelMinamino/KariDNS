@@ -3160,21 +3160,55 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
      * zone for rate limiting (the global limits), and goes through the TSIG handling of the caller like every other answer: signed with the
      * key of a verified request, RFC 8945 5.3 (the request given here has the TSIG record taken off, 5.2). */
     t_query_rrl_info.zone = not_ready_zone->name;
+    /* the zone's own settings come from the interned block the element kept when its data left memory (zdir_elem_t.sh); only the ACL levels read them */
+    zone_config_t zc;
+    memset(&zc, 0, sizeof(zc));
+    zc.domain = (char *)not_ready_zone->name;
+    zone_ext_shared_t *nrsh = atomic_load_explicit(&not_ready_zone->sh, memory_order_acquire);
+    zc.ext = nrsh ? &nrsh->ext : NULL;
+    tsig_key_t *nr_tkey = (tsig && tsig->status == TSIG_REQ_VALID) ? tsig->key : NULL;
+    if (opcode == 4) {
+      /* NOTIFY: a primary zone accepts none (the same REFUSED as a zone in memory gives, RFC 1996 4.7; AA=0, RD=0).  Nothing is read for it and
+       * nothing is counted: only a query (below) waits for a zone.  A zone that is a secondary is never taken out of memory. */
+      add_ede(&edns, send_ede, 18, "Query refused due to access control");
+      int len = dns_build_error_response(req, req_len, res, max_res_len, 5, 0, qdcount, &edns, is_tcp, cfg);
+      if (len >= DNS_HEADER_SIZE) res[2] &= ~0x01;
+      return len;
+    }
+    if (opcode == 5) {
+      /* UPDATE (RFC 2136): the zone is checked as for a zone in memory (3.1.1, 3.1.2: SOA question, the apex of this zone), then allow-update from the
+       * settings kept in the element.  An UPDATE that may be made is answered SERVFAIL + EDE 14 now: it is applied to the zone in memory, which a
+       * later step reads for it (design 7); nothing waits and nothing is read for it here. */
+      size_t zone_end = get_question_end_offset(req, req_len, 1);
+      uint16_t zclass = (zone_end >= DNS_HEADER_SIZE + 5) ? (uint16_t)((req[zone_end - 2] << 8) | req[zone_end - 1]) : 0;
+      int urc;
+      if (qtype != 6) {
+        urc = 1;                                        // FORMERR
+      } else if (!view || zclass != 1 || !domain_names_match_ci(not_ready_zone->name, current_qname)) {
+        urc = 9;                                        // NOTAUTH
+      } else {
+        bool uauth = zext(&zc)->upd_policy ? nr_tkey != NULL
+                                           : (cfg && zone_update_acl_allows_in_view(cfg, &zc, view->name, client_ip, nr_tkey ? nr_tkey->name : NULL));
+        if (uauth) {
+          urc = 2;                                      // SERVFAIL, Not Ready
+          add_ede(&edns, send_ede, 14, "Not Ready");
+        } else {
+          urc = 5;                                      // REFUSED
+          add_ede(&edns, send_ede, 18, "Query refused due to access control");
+        }
+      }
+      int len = dns_build_error_response(req, req_len, res, max_res_len, (uint8_t)urc, 0, qdcount, &edns, is_tcp, cfg);
+      if (len >= DNS_HEADER_SIZE) res[2] &= ~0x01;
+      return len;
+    }
     /* allow-query first, exactly as for a zone in memory (below: once the zone is known, before anything else is done for the query): a client
      * that may not ask is refused, does not wait for the zone, does not make the server read it, and does not learn that the zone is in the
-     * database.  The zone's own statement comes from the interned settings the element kept when its data left memory (zdir_elem_t.sh). */
-    if (opcode == 0 && view && cfg && cfg->acl_query_active) {
-      zone_config_t zc;
-      memset(&zc, 0, sizeof(zc));
-      zc.domain = (char *)not_ready_zone->name;
-      zone_ext_shared_t *sh = atomic_load_explicit(&not_ready_zone->sh, memory_order_acquire);
-      zc.ext = sh ? &sh->ext : NULL;
-      if (!zone_query_permitted(cfg, &zc, view->name, client_ip)) {
-        add_ede(&edns, send_ede, 18, "Query refused due to access control");
-        return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
-      }
+     * database. */
+    if (opcode == 0 && view && cfg && cfg->acl_query_active && !zone_query_permitted(cfg, &zc, view->name, client_ip)) {
+      add_ede(&edns, send_ede, 18, "Query refused due to access control");
+      return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
     }
-    if (t_nr_probe) return DNS_NR_PERMITTED;
+    if (t_nr_probe && opcode == 0) return DNS_NR_PERMITTED;
     return build_not_ready_response(req, req_len, res, max_res_len, is_tcp, cfg);
   }
 

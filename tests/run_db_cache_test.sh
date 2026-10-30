@@ -74,7 +74,7 @@ KCTL="./karictl -c $T/karictl.conf"
 cat > "$T/k.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT;
-    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; memory-limit ${LIMIT_MB}m; park-timeout 4000; };
+    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; memory-limit ${LIMIT_MB}m; fetch-rate 5000; park-timeout 4000; };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
 EOF
@@ -149,7 +149,7 @@ rm -f "$T/sampling"
 wait "$SAMPLER" 2>/dev/null
 MAXUSED=$(sed -n 's/.* resident=\([0-9]*\) retired=\([0-9]*\).*/\1 \2/p' "$T/samples" | awk '{ u = $1 + $2; if (u > m) m = u } END { print m + 0 }')
 NS=$(wc -l < "$T/samples" | tr -d ' ')
-SLACK=$((LIMIT / 5 + 256 * 1024))
+SLACK=$((LIMIT / 100 * 15 + 256 * 1024))                  # the tolerance the user decided: 15% of the limit + 256 KB (docs/karidns.md, "Memory limit")
 echo "  largest resident + retired in $NS samples: $MAXUSED (limit $LIMIT, slack $SLACK)"
 PEAK=$(read_stat peak "$T/final")
 echo "  the server's own peak (at every zone it installed and every round of the cache manager): ${PEAK:-?}"

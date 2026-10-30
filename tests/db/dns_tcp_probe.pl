@@ -7,6 +7,8 @@
 #   dns_tcp_probe.pl HOST PORT eof NAME           sends the query and closes at once; prints "closed"
 #   dns_tcp_probe.pl HOST PORT idle NAME          sends the query, reads the answer, then waits for the server to close; prints
 #                                                 "id=N rcode=R an=A" and "closed after S seconds" (at most 30)
+#   dns_tcp_probe.pl HOST PORT udp-op OPCODE NAME  one message with that opcode (4 NOTIFY, 5 UPDATE) and a SOA question for NAME (the zone
+#   dns_tcp_probe.pl HOST PORT tcp-op OPCODE NAME  section of an UPDATE), over UDP or TCP; prints "id=N rcode=R" or "no answer"
 use strict;
 use warnings;
 use IO::Socket::INET;
@@ -50,10 +52,41 @@ sub read_answer {
     return sprintf("id=%d rcode=%d an=%d", $id, $fl & 0xF, $an);
 }
 
+if ($mode eq 'udp-op') {
+    my ($opcode, $name) = @names;
+    my $q = pack('nnnnnn', 401, ($opcode << 11), 1, 0, 0, 0);
+    for my $l (split /\./, $name) { $q .= pack('C', length $l) . $l; }
+    $q .= pack('Cnn', 0, 6, 1);                      # SOA IN
+    my $u = IO::Socket::INET->new(PeerAddr => $host, PeerPort => $port, Proto => 'udp') or die "udp: $!\n";
+    syswrite($u, $q);
+    my $sel = IO::Select->new($u);
+    if ($sel->can_read(10) && sysread($u, my $m, 4096)) {
+        my ($id, $fl) = unpack('nn', $m);
+        printf("id=%d rcode=%d\n", $id, $fl & 0xF);
+    } else {
+        print "no answer\n";
+    }
+    exit 0;
+}
+
 my $s = IO::Socket::INET->new(PeerAddr => $host, PeerPort => $port, Proto => 'tcp', Timeout => 5) or die "connect: $!\n";
 $s->autoflush(1);
 
-if ($mode eq 'pipeline') {
+if ($mode eq 'tcp-op') {
+    my ($opcode, $name) = @names;
+    my $q = pack('nnnnnn', 402, ($opcode << 11), 1, 0, 0, 0);
+    for my $l (split /\./, $name) { $q .= pack('C', length $l) . $l; }
+    $q .= pack('Cnn', 0, 6, 1);
+    syswrite($s, pack('n', length $q) . $q);
+    my $lb = read_exact($s, 2, time() + 10);
+    my $m = defined $lb ? read_exact($s, unpack('n', $lb), time() + 10) : undef;
+    if (defined $m) {
+        my ($id, $fl) = unpack('nn', $m);
+        printf("id=%d rcode=%d\n", $id, $fl & 0xF);
+    } else {
+        print "no answer\n";
+    }
+} elsif ($mode eq 'pipeline') {
     my $id = 100;
     my $all = '';
     $all .= query(++$id, $_) for @names;

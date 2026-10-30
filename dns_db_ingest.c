@@ -71,6 +71,7 @@ typedef struct {
   uint32_t nviews;
   uint64_t max_zone_records, max_zone_bytes;
   uint64_t memory_limit;
+  uint32_t fetch_rate;
   uint32_t ingest_threads;
   bool auto_reload;
   uint32_t poll_interval, coalesce_ms;
@@ -212,6 +213,8 @@ typedef struct {
   uint32_t nfreq;
   ing_freq_t freq[ING_FETCH_MAX];
   uint32_t funsolicited;       /* zones nobody asked for, discarded (logged the first few) */
+  double ftokens;              /* the fetch-rate bucket (ingest thread only): tokens, and when it was filled */
+  int64_t ftok_ms;
 } ing_t;
 
 enum { ROUT_NONE = 0, ROUT_APPLIED, ROUT_SHADOWED, ROUT_REJECTED, ROUT_FAILED, ROUT_DELETED };
@@ -453,6 +456,7 @@ static void fill_snap(const server_config_t *cfg, ing_cfg_t *c) {
     c->max_zone_records = cfg->database.max_zone_records;
     c->max_zone_bytes = cfg->database.max_zone_bytes;
     c->memory_limit = cfg->database.memory_limit;
+    c->fetch_rate = cfg->database.fetch_rate;
     c->ingest_threads = cfg->database.ingest_threads;
     c->auto_reload = cfg->database.auto_reload;
     c->poll_interval = cfg->database.poll_interval;
@@ -931,7 +935,7 @@ static void job_execute(ing_job_t *j) {
     j->status = KDB_ST_REJECTED;
     goto rejected;
   }
-  zone_db_entry_t *entry = dbreg_lookup_entry(j->view_name, j->zone);
+  zone_db_entry_t *entry = dbreg_lookup_entry_busy(j->view_name, j->zone);
   bool created = false;
   if (entry && entry->is_secondary) entry = NULL;          /* B7b: the zone was a SLAVE / CONSUMER; a new primary entry replaces it */
   if (!entry) {
@@ -1103,6 +1107,8 @@ static void ing_kick(void) {
 }
 
 static _Atomic uint64_t g_fetch_shed;   /* fetch requests not made because of memory-limit */
+static _Atomic uint32_t g_fetch_rate = KARIDNS_DB_FETCH_RATE_DEFAULT;   /* database { fetch-rate }: zones read for queries per second */
+static _Atomic uint64_t g_fetch_limited;  /* fetch requests not made because the rate was used up */
 static int64_t delta_interval_ms(void) { return dbreg_cache_limit() ? ING_DELTA_LIMITED_MS : ING_DELTA_MS; }
 
 static void maybe_apply_delta(ing_t *g) {
@@ -1857,11 +1863,17 @@ static bool reeval_cb(void *ud, const char *view, const dbreg_zone_t *z) {
     c->chunk = 0;
     return false;
   }
-  if (!zdir_entry(z)) return true;
-  const zone_config_t *dc = atomic_load_explicit(&zdir_entry(z)->dbcfg, memory_order_acquire);
-  if (!dc || !dc->ext_shared) return true;
+  /* a zone out of memory has its settings in the element (zdir_elem_t.sh), one in memory in its entry */
+  const zone_ext_t *x = NULL;
+  if (zdir_entry(z)) {
+    const zone_config_t *dc = atomic_load_explicit(&zdir_entry(z)->dbcfg, memory_order_acquire);
+    if (dc && dc->ext_shared) x = dc->ext;
+  } else {
+    zone_ext_shared_t *sh = atomic_load_explicit(&((dbreg_zone_t *)z)->sh, memory_order_acquire);
+    if (sh) x = &sh->ext;
+  }
+  if (!x) return true;
   c->zones++;
-  const zone_ext_t *x = dc->ext;
   if (x->allow_transfer_count > 0 || x->tsig_keys_count > 0 || x->allow_update_count > 0) c->with_acl++;
   const char *missing = db_settings_missing_key(x, c->cfg);
   if (missing) {
@@ -2311,12 +2323,30 @@ static void fetch_issue(ing_t *g) {
         continue;
       }
     }
+    /* fetch-rate (design 8.5): scattered queries for many zones that are out of memory must not make the loader read zones faster than this; a token
+     * bucket (burst = one second of the rate) of zones read for queries.  Only a read that is really made takes a token (below); the queries
+     * of a zone with no token get "not ready" at once. */
+    uint32_t frate = atomic_load_explicit(&g_fetch_rate, memory_order_relaxed);
+    int64_t tnow = now_ms();
+    if (g->ftok_ms == 0) {
+      g->ftokens = frate;
+    } else if (tnow > g->ftok_ms) {
+      g->ftokens += (double)(tnow - g->ftok_ms) * frate / 1000.0;
+      if (g->ftokens > frate) g->ftokens = frate;
+    }
+    g->ftok_ms = tnow;
+    if (g->ftokens < 1.0) {
+      atomic_fetch_add_explicit(&g_fetch_limited, 1, memory_order_relaxed);
+      park_wake_broadcast(q.view, q.zone, true);
+      continue;
+    }
     int st = dbreg_fetch_begin(g->view_names[vi], q.zone);
     if (st == DBREG_FETCH_BUSY) continue;
     if (st != DBREG_FETCH_STARTED) {                     /* in memory already (woken), or not a zone of the registry (answered at once) */
       park_wake_broadcast(q.view, q.zone, st == DBREG_FETCH_NONE);
       continue;
     }
+    g->ftokens -= 1.0;
     for (uint32_t i = 0; i < ING_FETCH_MAX && !r; i++)
       if (!g->freq[i].active) r = &g->freq[i];
     if (!r) {                                            /* too many in flight: the queries run into their deadlines */
@@ -2526,6 +2556,7 @@ static void *cache_thread(void *arg) {
     snapshot_cfg(&c);
     uint64_t lim = c.enabled ? c.memory_limit : 0;
     dbreg_cache_set_limit(lim);
+    atomic_store_explicit(&g_fetch_rate, c.fetch_rate ? c.fetch_rate : KARIDNS_DB_FETCH_RATE_DEFAULT, memory_order_relaxed);
     struct timespec ts = { 0, lim ? 50 * 1000000L : 0 };
     if (!lim) {
       ts.tv_sec = 1;
@@ -2661,6 +2692,7 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
   if (fetch_fd >= 0) fetch_adopt(g, fetch_fd);
   park_fetch_set_notify(g->kq);
   dbreg_cache_set_limit(snap.memory_limit);              /* before the first batch: the startup load already keeps within it */
+  atomic_store_explicit(&g_fetch_rate, snap.fetch_rate ? snap.fetch_rate : KARIDNS_DB_FETCH_RATE_DEFAULT, memory_order_relaxed);
   pthread_t t;
   if (pthread_create(&t, NULL, ingest_thread, g) != 0) {
     syslog(LOG_ERR, "[DB] cannot create the ingest thread");
@@ -2883,10 +2915,11 @@ static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   c->matches++;
   const char *st = z->shadowed ? "shadowed" : (z->last_result == DBREG_REJECTED ? "rejected" : "applied");
   st_append(c, "zone %s view %s: source id %lld, serial %u, status %s", z->name, view, (long long)z->source_id,
-            zdir_entry(z) ? (zdir_entry(z)->is_secondary ? atomic_load_explicit(&zdir_entry(z)->serial, memory_order_relaxed) : z->serial) : 0u, st);
+            zdir_entry(z) ? (zdir_entry(z)->is_secondary ? atomic_load_explicit(&zdir_entry(z)->serial, memory_order_relaxed) : z->serial) : z->serial, st);
   if (z->shadowed) st_append(c, z->shadow_by == DBREG_SH_CATALOG ? " (hidden by a catalog member)" : " (hidden by a zone in karidns.conf)");
   if (z->last_result == DBREG_REJECTED && zdir_entry(z)) st_append(c, " (serving the last good version, serial %u)", z->serial);
-  if (!zdir_entry(z)) st_append(c, " (no version loaded)");
+  if (!zdir_entry(z)) st_append(c, z->digest && atomic_load_explicit(&z->state, memory_order_relaxed) != ZDIR_ST_ERROR
+                                       ? " (the data is out of memory: it is read when a query needs it)" : " (no version loaded)");
   if (z->error) st_append(c, ", last error: %s", z->error);
   st_append(c, "\n");
   if (zdir_entry(z)) settings_status(c, zdir_entry(z));
@@ -2936,6 +2969,8 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     st_append(&c, "zone versions and IXFR deltas: database zones %llu bytes resident + %llu retired; other zones %llu resident + %llu retired\n",
               (unsigned long long)zdb.resident, (unsigned long long)zdb.retired, (unsigned long long)zot.resident,
               (unsigned long long)zot.retired);
+    st_append(&c, "fetch: rate=%u/s refused_by_rate=%llu\n", (unsigned)atomic_load_explicit(&g_fetch_rate, memory_order_relaxed),
+              (unsigned long long)atomic_load_explicit(&g_fetch_limited, memory_order_relaxed));
     dbreg_cache_stats_t cs;
     dbreg_cache_stats(&cs);
     if (cs.limit)

@@ -367,6 +367,19 @@ reloads=$(grep -c "reloaded successfully" "$WORK/secondary.log")
 echo "secondary: transfers logged: $xfrs, catalog passes: $members, reloads: $reloads"
 check_tsan "$WORK/secondary.log" "secondary"
 
+echo "--- part 4: karidns-tsan with a memory limit (D1a step 5): the cache manager, the fetch stream and the workers (tests/run_db_cache_test.sh; root, SQLite3)"
+if [ "$(id -u)" = "0" ] && kari_make karictl karidns-dbloader >/dev/null 2>&1; then
+    out=$(env KARIDNS=./karidns-tsan CACHE_TEST_DELAY_MS=10 CACHE_TEST_QUERIES=800 sh tests/run_db_cache_test.sh 2>&1)
+    cr=$?
+    echo "$out" | tail -5
+    if [ $cr -ne 0 ] || echo "$out" | grep -q "ThreadSanitizer"; then
+        echo "FAIL: run_db_cache_test.sh with karidns-tsan"
+        rc=1
+    fi
+else
+    echo "SKIP: needs root and karictl / karidns-dbloader"
+fi
+
 if [ $rc -eq 0 ]; then
     echo "PASS: no ThreadSanitizer report"
 fi
