@@ -90,11 +90,23 @@ make karidns-dbloader DB_DRIVERS="sqlite3 postgresql"
 `--map-view NAME`
 : Keep only the zones that `karidns_domain_views` maps to the view `NAME` (a domain without a row is kept): what a view that uses the shared source of a server gets.
 
+`-s FD`, `--fetch-fd FD`
+: Stream mode, what `karidns` runs: `FD` is the socket to the Backend (descriptor 3). `--fetch-fd FD` (descriptor 4) is the second stream, for fetches (below); without it the loader works as before.
+
 `--auto-reload`, `--server-id ID`, `--ecs-tag NAME`, `--location-tag NAME`, `--max-zone-records N`, `--max-zone-bytes N`
 : With `--check` only: the values of the configuration that change what is an error (change log triggers are required with auto reload; `server-id` of a PostgreSQL view; the tags of `options { ecs-tags }` / `location-tags` records may name; the limits of the database block). `karicheck db` passes them from `karidns.conf`.
 
 `--version`, `-h`, `--help`
 : Print the version, or the usage text.
+
+## THE FETCH STREAM
+
+D1a (milestone 2). `karidns` starts the loader with a second socket, descriptor 4, next to the stream on descriptor 3 (`-s 3 --fetch-fd 4`); a restart makes a new pair of each and hands the Backend's two ends over together. It is a second KDB1 stream (see `dns_db_stream.h`) for the one thing that must not wait behind a batch: the Backend asks for one zone because a parked query waits for it.
+
+- **Requests.** `FETCH_REQ` (request id, view, zone, priority 0 query / 1 warm-up / 2 background, mode 0 the zone / 1 its summary; an optional range, which this loader refuses). A thread of the loader reads them into a queue of 256, takes the most urgent first (the oldest within a priority) and reads the zone through the same code as a one-zone reload: its own connection and snapshot, no batch, no inventory, no results. A request beyond the queue is answered `ZONE_FAILED` "busy" (the first eight; more are dropped and the Backend's own time-out ends them).
+- **Answers.** `ZONE_BEGIN` .. `ZONE_DATA` .. `ZONE_END` with the request id in `ZONE_BEGIN` (a secondary or catalog zone has no data, as in a batch); or the **summary** (mode 1, primary zones): `ZONE_BEGIN` with the summary flag and `ZONE_END`, carrying the serial, the SOA refresh / retry / expire and whether the zone is presigned (metadata `PRESIGNED=1`), no records, a zero digest. Or `ZONE_FAILED` with the request id and the reason (the zone is not in the database, its type is not supported, no SOA, the database could not be read, busy). Never silence. The Backend's state machine for this stream (`kdb_sm_init_fetch()`) accepts nothing else, and discards a zone it did not ask for.
+- **Inventory.** The Backend's `INVENTORY` entries have a `resident` flag (always 1 until zones can leave memory). A zone that is not resident is not sent by a full comparison (no digest to compare); a zone that changed still is.
+- **Not in this milestone.** The settings text and the name servers' addresses in the summary (design 7), and a request for a range of a zone.
 
 ## EXIT STATUS
 

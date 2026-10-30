@@ -639,6 +639,8 @@ typedef struct {
   uint32_t db_reload_timeout;  /* seconds, 1..3600 */
   uint32_t ingest_threads;     /* 1..16 */
   uint32_t loader_threads;     /* 1..16 */
+  uint32_t park_max;           /* D1a: queries one worker parks for a zone that is not in memory, 1..65536 (0 = the default, 1024); restart-only */
+  uint32_t park_timeout_ms;    /* D1a: how long a parked query waits for the zone, 10..60000 ms (0 = the default, 1500) */
   char *server_id;             /* postgresql only (B11) */
   char **alias_resolver;       /* stored only (B9a): IP address literals */
   int alias_resolver_count;
@@ -650,6 +652,9 @@ typedef struct {
 #define KARIDNS_DB_TTL_MAX 2147483647u
 #define KARIDNS_DB_RELOAD_TIMEOUT_MAX 3600
 #define KARIDNS_DB_THREADS_MAX 16
+#define KARIDNS_DB_PARK_MAX_MAX 65536
+#define KARIDNS_DB_PARK_TIMEOUT_MIN 10
+#define KARIDNS_DB_PARK_TIMEOUT_MAX 60000
 #define KARIDNS_DB_MAX_VIEWS 1024   /* views that take DB zones: the CONFIG message of the loader link lists at most this many (KDB_MAX_CONFIG_VIEWS) */
 #define KARIDNS_DB_MAX_ZONE_RECORDS_DEFAULT 10000000ull   /* the database block and options { max-zone-records } (I2) */
 #define KARIDNS_DB_MAX_ZONE_BYTES_DEFAULT (1ull << 30)     /* the database block and options { max-zone-bytes } (I2) */

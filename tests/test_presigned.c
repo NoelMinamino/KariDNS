@@ -329,7 +329,7 @@ static void test_nsec3(const char *z, const char *label, bool optout) {
     pdns_zone_t *a = rs_build_default(&f, &s), *b = rs_build_default(&f, &s);
     rt_buf_t ba = {0}, bb = {0};
     char err[300];
-    pdns_kdb_params_t kp = { 0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL };
+    pdns_kdb_params_t kp = { 0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 };
     CHECK(pdns_zone_encode_kdb(a, &kp, rt_emit, &ba, err, sizeof(err)) == 0);
     CHECK(pdns_zone_encode_kdb(b, &kp, rt_emit, &bb, err, sizeof(err)) == 0);
     CHECK(ba.len == bb.len && ba.len > 0 && memcmp(ba.buf, bb.buf, ba.len) == 0);

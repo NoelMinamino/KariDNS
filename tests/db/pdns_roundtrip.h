@@ -154,7 +154,7 @@ static bool pdns_roundtrip(const pdns_zone_t *z, rt_info_t *info, char *why, siz
     if (!fbuf || !md || EVP_DigestInit_ex(md, EVP_sha256(), NULL) != 1) RT_FAIL("out of memory");
 
     char err[300] = "";
-    pdns_kdb_params_t kp = { 3, 4711, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL };
+    pdns_kdb_params_t kp = { 3, 4711, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 };
     if (pdns_zone_encode_kdb(z, &kp, rt_emit, &out, err, sizeof(err)) != 0) RT_FAIL("encode: %s", err);
     inf.stream_len = out.len;
 

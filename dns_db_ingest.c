@@ -35,6 +35,7 @@
 #include "dns_db_install.h"
 #include "dns_db_stream.h"
 #include "dns_epoch_rcu.h"
+#include "dns_park.h"
 #include "dns_server_internal.h"
 #include "dns_snapshot_rcu.h"
 
@@ -56,6 +57,9 @@ _Static_assert(KARIDNS_DB_MAX_VIEWS == KDB_MAX_CONFIG_VIEWS, "the configuration 
 #define ING_MAX_BUILDERS 16
 #define ING_RBUF 65536
 #define ING_FLUSH_AT 16384        /* queued bytes that are written at once; the rest goes out after the event round */
+#define ING_FETCH_MAX 256         /* fetches in flight (D1a): more is refused, the queries then wait for their own deadline */
+#define ING_FETCH_TIMEOUT_MS 30000 /* a fetch the loader has not answered by then is given up (the queries have timed out long before) */
+#define ING_FETCH_OUT_MAX (1u << 20)
 
 typedef struct {
   uint64_t generation;
@@ -88,7 +92,23 @@ typedef struct ing_job {
   uint8_t status;                        /* KDB_ST_* */
   int builder;                           /* index of the builder it was handed to */
   char reason[KDB_REASON_LEN];
+  /* D1a, the fetch stream: the request the zone answers (0 = a zone of a batch), a summary (no data: what the directory keeps), a zone
+   * nobody asked for (discarded; the loader may answer a request that was given up) */
+  uint64_t fetch_id;
+  bool summary, unsolicited, has_timers;
+  uint32_t t_refresh, t_retry, t_expire;
 } ing_job_t;
+
+/* a fetch in flight: sent to the loader on the fetch stream, not answered yet */
+typedef struct {
+  bool active;
+  uint64_t id;
+  uint16_t view;                         /* the index in the CONFIG of the loader */
+  uint8_t prio, mode;
+  int64_t sent_ms;
+  char view_name[KARIDNS_VIEW_NAME_MAX];
+  char zone[DNS_NAME_TEXT_SIZE];
+} ing_freq_t;
 
 typedef struct {
   pthread_t tid;
@@ -169,10 +189,30 @@ typedef struct {
   int req_outcome;             /* what the batch did to the requested zone: ROUT_* */
   uint32_t req_serial;
   char req_reason[KDB_REASON_LEN];
+  /* D1a: the fetch stream, the second KDB1 stream (design 6.1).  Its own framer, state machine and output queue; the zones that come on it go
+   * through the same jobs as the batch zones (job_execute()), with their own profile table (prof_swap()) and no ZONE_RESULT. */
+  int fetch_fd;
+  bool fwrite_armed;
+  uint8_t *fbody;              /* KDB_MAX_BODY */
+  kdb_framer_t ffr;
+  kdb_sm_t fsm;
+  kdb_enc_t fenc;
+  uint8_t *fout;               /* FETCH_REQ messages not written yet */
+  size_t fout_len, fout_off, fout_cap;
+  ing_job_t *fcur;             /* the zone being received on the fetch stream */
+  ing_profile_t *fprofiles;
+  size_t fnprof, fcprof, fprof_bytes;
+  uint64_t fseq;               /* request ids */
+  uint32_t nfreq;
+  ing_freq_t freq[ING_FETCH_MAX];
+  uint32_t funsolicited;       /* zones nobody asked for, discarded (logged the first few) */
 } ing_t;
 
 enum { ROUT_NONE = 0, ROUT_APPLIED, ROUT_SHADOWED, ROUT_REJECTED, ROUT_FAILED, ROUT_DELETED };
 static void answer_request(ing_t *g);
+static void fetch_adopt(ing_t *g, int fd);
+static void fetch_drop(ing_t *g);
+static void fetch_fail_all(ing_t *g, const char *why);
 
 static ing_t g_ing;
 static _Atomic bool g_cfg_dirty;
@@ -847,7 +887,14 @@ rejected:
  * image into the entry, enter the zone in the registry.  Sets j->status / j->reason; the reply is the caller's. */
 static void job_execute(ing_job_t *j) {
   if (j->skip) {                                         /* status and reason were set at ZONE_BEGIN */
-    if (j->view_name[0]) (void)dbreg_reject(j->view_name, j->zone, j->source_id, j->reason);
+    /* (a zone nobody asked for, or a fetch that was refused, is not a rejection of the zone: its last good version, if any, keeps serving) */
+    if (j->view_name[0] && !j->unsolicited && !j->fetch_id) (void)dbreg_reject(j->view_name, j->zone, j->source_id, j->reason);
+    return;
+  }
+  if (j->summary) {                                      /* D1a: serial and SOA timers for the directory; nothing to install */
+    j->status = dbreg_apply_summary(j->view_name, j->zone, j->source_id, j->serial, j->has_timers, j->t_refresh, j->t_retry, j->t_expire)
+                    ? KDB_ST_APPLIED
+                    : KDB_ST_UNCHANGED;
     return;
   }
   if (j->zkind != KDB_ZK_PRIMARY) {
@@ -967,8 +1014,14 @@ static void send_zone_result(ing_t *g, uint16_t view, const char *zone, uint8_t 
   send_enc(g);
 }
 
+static void fetch_job_finish(ing_t *g, ing_job_t *j);
+
 /* the answer of a finished job; the job is freed */
 static void job_finish(ing_t *g, ing_job_t *j) {
+  if (j->fetch_id) {                                     /* D1a: a zone of the fetch stream has no ZONE_RESULT, it wakes the queries that wait for it */
+    fetch_job_finish(g, j);
+    return;
+  }
   switch (j->status) {
   case KDB_ST_APPLIED:
     g->b_applied++;
@@ -1116,22 +1169,17 @@ static void clear_profiles(ing_t *g) {
 
 /* PROFILE (design 1.4): name and settings text, valid for the zones that follow in this batch.  The state machine has
  * checked the characters and the lengths; the Backend bounds what it holds (a hostile loader cannot make it keep more). */
-static void on_profile(ing_t *g, const kdb_msg_t *m) {
+enum { PROF_OK = 0, PROF_LIMIT, PROF_OOM };
+
+static int profile_store(ing_t *g, const kdb_msg_t *m) {
   const kdb_profile_t *p = &m->u.profile;
   size_t i;
   for (i = 0; i < g->nprof; i++)
     if (strlen(g->profiles[i].name) == p->name.len && memcmp(g->profiles[i].name, p->name.p, p->name.len) == 0) break;
   size_t old = i < g->nprof ? g->profiles[i].len : 0;
-  if (g->prof_bytes - old + p->settings.len > ING_PROFILE_BYTES || (i == g->nprof && g->nprof >= ING_MAX_PROFILES)) {
-    protocol_error(g, "PROFILE: more profile data in a batch than the Backend accepts");
-    return;
-  }
+  if (g->prof_bytes - old + p->settings.len > ING_PROFILE_BYTES || (i == g->nprof && g->nprof >= ING_MAX_PROFILES)) return PROF_LIMIT;
   char *copy = malloc(p->settings.len + 1);
-  if (!copy) {
-    syslog(LOG_ERR, "[DB] out of memory; closing the stream");
-    drop_stream(g);
-    return;
-  }
+  if (!copy) return PROF_OOM;
   memcpy(copy, p->settings.p, p->settings.len);
   copy[p->settings.len] = '\0';
   if (i == g->nprof) {
@@ -1140,9 +1188,7 @@ static void on_profile(ing_t *g, const kdb_msg_t *m) {
       ing_profile_t *np = realloc(g->profiles, nc * sizeof(*np));
       if (!np) {
         free(copy);
-        syslog(LOG_ERR, "[DB] out of memory; closing the stream");
-        drop_stream(g);
-        return;
+        return PROF_OOM;
       }
       g->profiles = np;
       g->cprof = nc;
@@ -1157,6 +1203,17 @@ static void on_profile(ing_t *g, const kdb_msg_t *m) {
   g->profiles[i].text = copy;
   g->profiles[i].len = p->settings.len;
   g->prof_bytes += p->settings.len;
+  return PROF_OK;
+}
+
+static void on_profile(ing_t *g, const kdb_msg_t *m) {
+  int rc = profile_store(g, m);
+  if (rc == PROF_LIMIT) {
+    protocol_error(g, "PROFILE: more profile data in a batch than the Backend accepts");
+  } else if (rc == PROF_OOM) {
+    syslog(LOG_ERR, "[DB] out of memory; closing the stream");
+    drop_stream(g);
+  }
 }
 
 static void fail_requests(ing_t *g, const char *why) {
@@ -1212,6 +1269,7 @@ static void send_config(ing_t *g, const char *why) {
   g->sm.lim.view_count = snap.nviews;
   g->sm.lim.max_zone_records = snap.max_zone_records;
   g->sm.lim.max_zone_bytes = snap.max_zone_bytes;
+  g->fsm.lim = g->sm.lim;                  /* the fetch stream's machine checks against the same configuration */
   syslog(LOG_INFO, "[DB] sent CONFIG generation %llu to the loader (%s): driver %s, %u view(s)",
          (unsigned long long)snap.generation, why, snap.driver, snap.nviews);
   send_enc(g);
@@ -1268,7 +1326,7 @@ typedef struct {
 static bool inv_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   inv_ctx_t *c = ud;
   ing_t *g = c->g;
-  if (!zdir_entry(z)) return true;                            /* never applied: nothing the loader could skip */
+  if (!zdir_entry(z) || !z->digest) return true;              /* never applied: nothing the loader could skip */
   /* B6a: a zone whose last version was refused (or could not be read) is offered again by a loader that starts now: it
    * must not find the old version "up to date" and leave the error standing when the data are fixed */
   if (z->last_result == DBREG_REJECTED) return true;
@@ -1285,7 +1343,7 @@ static bool inv_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   if (c->n >= ING_INV_CHUNK) return false;
   if (kdb_enc_nest_begin(&g->enc, 1) != 0 || kdb_enc_u16(&g->enc, 1, idx) != 0 || kdb_enc_name(&g->enc, 2, z->name) != 0 ||
       kdb_enc_i64(&g->enc, 3, z->source_id) != 0 || kdb_enc_u32(&g->enc, 4, z->serial) != 0 ||
-      kdb_enc_bytes(&g->enc, 5, z->digest, KDB_DIGEST_LEN) != 0 || kdb_enc_nest_end(&g->enc) != 0) {
+      kdb_enc_bytes(&g->enc, 5, z->digest, KDB_DIGEST_LEN) != 0 || kdb_enc_u8(&g->enc, 6, 1) != 0 || kdb_enc_nest_end(&g->enc) != 0) {
     c->bad = true;
     return false;
   }
@@ -1365,24 +1423,27 @@ static void on_batch_begin(ing_t *g, const kdb_msg_t *m) {
   g->last_delta_ms = now_ms();
 }
 
-static void on_zone_begin(ing_t *g, const kdb_msg_t *m) {
-  const kdb_zone_begin_t *zb = &m->u.zone_begin;
+/* the job of a ZONE_BEGIN (either stream), with its settings resolved; NULL: out of memory */
+static ing_job_t *job_from_begin(ing_t *g, const kdb_zone_begin_t *zb) {
   ing_job_t *j = calloc(1, sizeof(*j));
-  if (!j) {
-    syslog(LOG_ERR, "[DB] out of memory; closing the stream");
-    drop_stream(g);
-    return;
-  }
+  if (!j) return NULL;
   j->view = zb->view;
   snprintf(j->zone, sizeof(j->zone), "%s", zb->name);
   j->source_id = zb->source_id;
   j->serial = zb->serial;
   j->rr_count = zb->rr_count;
+  j->fetch_id = zb->request_id;
   memcpy(j->digest, zb->digest, KDB_DIGEST_LEN);
   if (zb->view < g->nview_names) snprintf(j->view_name, sizeof(j->view_name), "%s", g->view_names[zb->view]);
   if (j->view_name[0] == '\0') {
     j->skip = true;
     job_reject(j, "the view is not in the configuration");
+  } else if (zb->flags & KDB_ZF_SUMMARY) {
+    j->summary = true;                                   /* D1a: a primary's summary: no settings, no data (the state machine checked) */
+    j->has_timers = zb->has_soa_timers;
+    j->t_refresh = zb->soa_refresh;
+    j->t_retry = zb->soa_retry;
+    j->t_expire = zb->soa_expire;
   } else if (zb->zone_kind != KDB_ZK_PRIMARY && zb->flags != 0) {
     j->skip = true;                                      /* a SLAVE / CONSUMER has no data to describe */
     job_reject(j, "a secondary zone from the database carries no zone flags");
@@ -1406,11 +1467,21 @@ static void on_zone_begin(ing_t *g, const kdb_msg_t *m) {
       job_reject(j, "out of memory");
     }
   }
+  return j;
+}
+
+static void on_zone_begin(ing_t *g, const kdb_msg_t *m) {
+  ing_job_t *j = job_from_begin(g, &m->u.zone_begin);
+  if (!j) {
+    syslog(LOG_ERR, "[DB] out of memory; closing the stream");
+    drop_stream(g);
+    return;
+  }
   g->cur = j;
 }
 
-static void on_zone_data(ing_t *g, const kdb_msg_t *m) {
-  ing_job_t *j = g->cur;
+/* ZONE_DATA of the zone j (either stream) */
+static void job_feed(ing_t *g, ing_job_t *j, const kdb_msg_t *m) {
   if (!j || j->skip || j->failed) return;
   if (!j->build) {
     /* I6: ZONE_DATA for a job without a builder (a secondary zone, whose ZONE_BEGIN starts none, or an earlier failure):
@@ -1442,6 +1513,8 @@ static void on_zone_data(ing_t *g, const kdb_msg_t *m) {
   memcpy(j->buf + j->buf_len + 4, zd->body, zd->len);
   j->buf_len = need;
 }
+
+static void on_zone_data(ing_t *g, const kdb_msg_t *m) { job_feed(g, g->cur, m); }
 
 static void on_zone_end(ing_t *g) {
   ing_job_t *j = g->cur;
@@ -1697,19 +1770,28 @@ static void on_ctrl_readable(ing_t *g) {
       g->ctrl_fd = -1;
       return;
     }
-    int got = -1;
+    int got = -1, got_fetch = -1;
     for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c)) {
       if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
       size_t cnt = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
       for (size_t i = 0; i < cnt; i++) {
         int fd;
         memcpy(&fd, CMSG_DATA(c) + i * sizeof(int), sizeof(int));
-        if (got < 0) got = fd;
-        else close(fd); /* one stream per message */
+        if (got < 0) got = fd;                  /* the first descriptor is the stream, the second (D1a) the fetch stream */
+        else if (got_fetch < 0) got_fetch = fd;
+        else close(fd);
       }
     }
     if (m.msg_flags & MSG_CTRUNC) syslog(LOG_ERR, "[DB] the loader control message was truncated");
-    if (got >= 0) adopt_stream(g, got);
+    if (got >= 0) {
+      adopt_stream(g, got);
+      if (got_fetch >= 0) {
+        fetch_adopt(g, got_fetch);
+      } else {                                  /* a loader without the fetch stream: the old one is gone with the old loader */
+        fetch_drop(g);
+        fetch_fail_all(g, "the loader has no fetch stream");
+      }
+    }
   }
 }
 
@@ -2000,17 +2082,402 @@ static void answer_request(ing_t *g) {
     post_result(g->grps[grp].ctl_id, g->grps[grp].any_ok, "zone %s: %s", g->grps[grp].zone, g->grps[grp].text);
 }
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* the fetch stream (D1a, design 6.1)                                                                             */
+/* ------------------------------------------------------------------------------------------------------------- */
+/* A worker that has parked a query for a zone whose data is not in memory pushes the request on its ring (dns_park.h) and triggers EVFILT_USER
+ * PARK_FETCH_IDENT.  This thread turns the requests into FETCH_REQ messages on the second stream (one per zone in flight, the table below keeps
+ * them), reads the loader's answers there (the state machine of the fetch stream, dns_db_stream.c), installs each zone through the same jobs as a
+ * batch zone, and then tells every worker (park_wake_broadcast()): woken when the zone is in memory, answered at once when the fetch failed.
+ * A zone nobody asked for is discarded as it is read: it takes no memory and counts against nothing.  The loader's answers are not ZONE_RESULTs:
+ * the first stream's inventory is the batch's business. */
+
+static void prof_swap(ing_t *g) {
+  ing_profile_t *p = g->profiles;
+  g->profiles = g->fprofiles;
+  g->fprofiles = p;
+  size_t t = g->nprof;
+  g->nprof = g->fnprof;
+  g->fnprof = t;
+  t = g->cprof;
+  g->cprof = g->fcprof;
+  g->fcprof = t;
+  t = g->prof_bytes;
+  g->prof_bytes = g->fprof_bytes;
+  g->fprof_bytes = t;
+}
+
+static void farm_write(ing_t *g, bool on) {
+  if (g->fwrite_armed == on || g->fetch_fd < 0) return;
+  struct kevent ev;
+  EV_SET(&ev, g->fetch_fd, EVFILT_WRITE, on ? EV_ENABLE : EV_DISABLE, 0, 0, NULL);
+  if (kevent(g->kq, &ev, 1, NULL, 0, NULL) == 0) g->fwrite_armed = on;
+}
+
+static void fetch_drop(ing_t *g) {
+  if (g->fetch_fd >= 0) close(g->fetch_fd);              /* the kqueue forgets the descriptor */
+  g->fetch_fd = -1;
+  g->fwrite_armed = false;
+  g->fout_len = g->fout_off = 0;
+  job_free(g->fcur);
+  g->fcur = NULL;
+  prof_swap(g);
+  clear_profiles(g);
+  prof_swap(g);
+  kdb_enc_reset(&g->fenc);
+}
+
+static void fetch_flush(ing_t *g) {
+  while (g->fetch_fd >= 0 && g->fout_off < g->fout_len) {
+    ssize_t n = write(g->fetch_fd, g->fout + g->fout_off, g->fout_len - g->fout_off);
+    if (n > 0) {
+      g->fout_off += (size_t)n;
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      farm_write(g, true);
+      return;
+    }
+    syslog(LOG_NOTICE, "[DB] loader fetch stream disconnected (write: %s)", n < 0 ? strerror(errno) : "closed");
+    fetch_drop(g);
+    return;
+  }
+  if (g->fetch_fd >= 0) {
+    g->fout_len = g->fout_off = 0;
+    farm_write(g, false);
+  }
+}
+
+/* queue the message built in g->fenc.  false: nothing was queued (no stream, or the stream was dropped) */
+static bool fetch_queue(ing_t *g) {
+  if (g->fenc.err) {
+    kdb_enc_reset(&g->fenc);
+    return false;
+  }
+  if (g->fetch_fd < 0) {
+    kdb_enc_reset(&g->fenc);
+    return false;
+  }
+  if (g->fout_len - g->fout_off + g->fenc.len > ING_FETCH_OUT_MAX) {
+    syslog(LOG_ERR, "[DB] the loader does not read its fetch requests; closing the fetch stream");
+    fetch_drop(g);
+    return false;
+  }
+  if (g->fout_off > 0 && g->fout_off == g->fout_len) g->fout_len = g->fout_off = 0;
+  if (g->fout_len + g->fenc.len > g->fout_cap) {
+    size_t nc = g->fout_cap ? g->fout_cap : 4096;
+    while (nc < g->fout_len + g->fenc.len) nc *= 2;
+    uint8_t *nb = realloc(g->fout, nc);
+    if (!nb) {
+      syslog(LOG_ERR, "[DB] out of memory queueing a fetch request; closing the fetch stream");
+      fetch_drop(g);
+      return false;
+    }
+    g->fout = nb;
+    g->fout_cap = nc;
+  }
+  memcpy(g->fout + g->fout_len, g->fenc.buf, g->fenc.len);
+  g->fout_len += g->fenc.len;
+  kdb_enc_reset(&g->fenc);
+  return true;
+}
+
+static bool fetch_send_req(ing_t *g, const ing_freq_t *r) {
+  kdb_enc_reset(&g->fenc);
+  if (kdb_enc_begin(&g->fenc, KDB_T_FETCH_REQ) != 0 || kdb_enc_u64(&g->fenc, 1, r->id) != 0 || kdb_enc_u16(&g->fenc, 2, r->view) != 0 ||
+      kdb_enc_name(&g->fenc, 3, r->zone) != 0 || kdb_enc_u8(&g->fenc, 4, r->prio) != 0 || kdb_enc_u8(&g->fenc, 5, r->mode) != 0 ||
+      kdb_enc_end(&g->fenc) != 0)
+    g->fenc.err = true;
+  return fetch_queue(g);
+}
+
+static ing_freq_t *fetch_find(ing_t *g, uint64_t id) {
+  if (g->nfreq == 0 || id == 0) return NULL;
+  for (uint32_t i = 0; i < ING_FETCH_MAX; i++)
+    if (g->freq[i].active && g->freq[i].id == id) return &g->freq[i];
+  return NULL;
+}
+
+static ing_freq_t *fetch_find_zone(ing_t *g, uint16_t view, const char *zone) {
+  if (g->nfreq == 0) return NULL;
+  for (uint32_t i = 0; i < ING_FETCH_MAX; i++)
+    if (g->freq[i].active && g->freq[i].view == view && domain_names_match_ci(g->freq[i].zone, zone)) return &g->freq[i];
+  return NULL;
+}
+
+/* the request is over.  ok: the zone (or its summary) was received and installed; else the queries that wait for it are answered at once. */
+static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
+  ing_freq_t done = *r;
+  r->active = false;
+  g->nfreq--;
+  dbreg_fetch_end(done.view_name, done.zone);
+  if (!ok)
+    syslog(LOG_WARNING, "[DB] fetch of zone '%s' (view '%s') failed: %s", done.zone, done.view_name, why && why[0] ? why : "no reason given");
+  if (dbreg_pending_count() > 0) apply_delta(g);         /* a zone that was new to the index becomes visible before its queries are woken */
+  park_wake_broadcast(done.view_name, done.zone, !ok);
+}
+
+static void fetch_job_finish(ing_t *g, ing_job_t *j) {
+  if (!j->unsolicited) {
+    ing_freq_t *r = fetch_find(g, j->fetch_id);
+    bool ok = j->status != KDB_ST_REJECTED;
+    if (ok && !j->summary) g->since_retire++;
+    if (r) fetch_complete(g, r, ok, j->reason);
+  }
+  job_free(j);
+}
+
+static void fetch_fail_all(ing_t *g, const char *why) {
+  if (g->nfreq == 0) return;
+  for (uint32_t i = 0; i < ING_FETCH_MAX && g->nfreq > 0; i++)
+    if (g->freq[i].active) fetch_complete(g, &g->freq[i], false, why);
+}
+
+static void fetch_expire(ing_t *g) {
+  if (g->nfreq == 0) return;
+  int64_t now = now_ms();
+  for (uint32_t i = 0; i < ING_FETCH_MAX; i++)
+    if (g->freq[i].active && now - g->freq[i].sent_ms >= ING_FETCH_TIMEOUT_MS)
+      fetch_complete(g, &g->freq[i], false, "the loader did not answer in time");
+}
+
+/* the requests the workers have pushed since the last time */
+static void fetch_issue(ing_t *g) {
+  park_fetch_req_t q;
+  while (park_fetch_next(&q)) {
+    int vi = -1;
+    for (uint32_t i = 0; i < g->nview_names; i++) {
+      if (g->view_db && g->view_db[i] && strcasecmp(g->view_names[i], q.view) == 0) {
+        vi = (int)i;
+        break;
+      }
+    }
+    if (vi < 0) {                                        /* a view that takes no zones from the database (or left): nothing to fetch */
+      park_wake_broadcast(q.view, q.zone, true);
+      continue;
+    }
+    ing_freq_t *r = fetch_find_zone(g, (uint16_t)vi, q.zone);
+    if (r) continue;                                     /* in flight: its answer wakes this worker too */
+    int st = dbreg_fetch_begin(g->view_names[vi], q.zone);
+    if (st == DBREG_FETCH_BUSY) continue;
+    if (st != DBREG_FETCH_STARTED) {                     /* in memory already (woken), or not a zone of the registry (answered at once) */
+      park_wake_broadcast(q.view, q.zone, st == DBREG_FETCH_NONE);
+      continue;
+    }
+    for (uint32_t i = 0; i < ING_FETCH_MAX && !r; i++)
+      if (!g->freq[i].active) r = &g->freq[i];
+    if (!r) {                                            /* too many in flight: the queries run into their deadlines */
+      dbreg_fetch_end(g->view_names[vi], q.zone);
+      park_wake_broadcast(q.view, q.zone, true);
+      continue;
+    }
+    memset(r, 0, sizeof(*r));
+    r->active = true;
+    r->id = ++g->fseq;
+    r->view = (uint16_t)vi;
+    r->prio = q.prio < KDB_FETCH_PRIO_N ? q.prio : KDB_FETCH_PRIO_QUERY;
+    r->mode = q.mode <= KDB_FETCH_SUMMARY ? q.mode : KDB_FETCH_FULL;
+    r->sent_ms = now_ms();
+    snprintf(r->view_name, sizeof(r->view_name), "%s", g->view_names[vi]);
+    snprintf(r->zone, sizeof(r->zone), "%s", q.zone);
+    g->nfreq++;
+    if (!fetch_send_req(g, r)) fetch_complete(g, r, false, "the loader's fetch stream is not connected");
+  }
+  if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);
+}
+
+static void fetch_protocol_error(ing_t *g, const char *reason) {
+  syslog(LOG_ERR, "[DB] protocol error from the loader on the fetch stream: %s; closing it", reason);
+  fetch_drop(g);
+}
+
+static void fetch_discard(ing_t *g, const kdb_zone_begin_t *zb, const char *why) {
+  g->funsolicited++;
+  if (g->funsolicited <= 8)
+    syslog(LOG_WARNING, "[DB] the loader sent a zone on the fetch stream that was not asked for (%s); discarded", why);
+  (void)zb;
+}
+
+static void on_fetch_begin(ing_t *g, const kdb_zone_begin_t *zb) {
+  ing_freq_t *r = fetch_find(g, zb->request_id);
+  bool wanted = r && r->view == zb->view && domain_names_match_ci(r->zone, zb->name);
+  if (wanted) {
+    bool summary = (zb->flags & KDB_ZF_SUMMARY) != 0;
+    /* a summary request is answered with a summary (a secondary zone has no data to leave out); a full request with the zone */
+    wanted = r->mode == KDB_FETCH_SUMMARY ? (summary || zb->zone_kind != KDB_ZK_PRIMARY) : !summary;
+  }
+  if (!wanted) {                                         /* nobody asked: read it through the state machine and throw it away */
+    ing_job_t *j = calloc(1, sizeof(*j));
+    if (!j) {
+      syslog(LOG_ERR, "[DB] out of memory; closing the fetch stream");
+      fetch_drop(g);
+      return;
+    }
+    j->skip = j->unsolicited = true;
+    j->fetch_id = zb->request_id;
+    fetch_discard(g, zb, r ? "it is not what the request wants" : "no such request");
+    job_free(g->fcur);
+    g->fcur = j;
+    return;
+  }
+  prof_swap(g);
+  ing_job_t *j = job_from_begin(g, zb);
+  prof_swap(g);
+  if (!j) {
+    syslog(LOG_ERR, "[DB] out of memory; closing the fetch stream");
+    fetch_drop(g);
+    return;
+  }
+  job_free(g->fcur);
+  g->fcur = j;
+}
+
+static void on_fetch_end(ing_t *g) {
+  ing_job_t *j = g->fcur;
+  g->fcur = NULL;
+  if (!j) return;
+  if (j->unsolicited) {
+    job_free(j);
+    return;
+  }
+  job_submit(g, j);                                      /* (job_finish() -> fetch_job_finish()) */
+}
+
+static void on_fetch_failed(ing_t *g, const kdb_zone_failed_t *zf) {
+  ing_freq_t *r = fetch_find(g, zf->request_id);
+  if (!r || r->view != zf->view || !domain_names_match_ci(r->zone, zf->name)) {
+    fetch_discard(g, NULL, "a failure of no request");
+    return;
+  }
+  char reason[KDB_REASON_LEN];
+  sane_copy(reason, sizeof(reason), zf->reason.p, zf->reason.len);
+  fetch_complete(g, r, false, reason);
+}
+
+static void handle_fetch_msg(ing_t *g, const kdb_msg_t *m) {
+  switch (m->type) {
+  case KDB_T_PROFILE: {
+    prof_swap(g);
+    int rc = profile_store(g, m);
+    prof_swap(g);
+    if (rc == PROF_LIMIT) fetch_protocol_error(g, "PROFILE: more profile data than the Backend accepts");
+    else if (rc == PROF_OOM) {
+      syslog(LOG_ERR, "[DB] out of memory; closing the fetch stream");
+      fetch_drop(g);
+    }
+    break;
+  }
+  case KDB_T_ZONE_BEGIN:
+    on_fetch_begin(g, &m->u.zone_begin);
+    break;
+  case KDB_T_ZONE_DATA:
+    job_feed(g, g->fcur, m);
+    break;
+  case KDB_T_ZONE_END:
+    on_fetch_end(g);
+    break;
+  case KDB_T_ZONE_ABORT: {
+    ing_job_t *j = g->fcur;
+    g->fcur = NULL;
+    if (j && !j->unsolicited) {
+      ing_freq_t *r = fetch_find(g, j->fetch_id);
+      if (r) fetch_complete(g, r, false, "the loader gave the zone up");
+    }
+    job_free(j);
+    break;
+  }
+  case KDB_T_ZONE_FAILED:
+    on_fetch_failed(g, &m->u.zone_failed);
+    break;
+  default:
+    break;
+  }
+}
+
+static void on_fetch_readable(ing_t *g) {
+  for (int round = 0; round < ING_READ_ROUNDS && g->fetch_fd >= 0; round++) {
+    ssize_t n = read(g->fetch_fd, g->rbuf, ING_RBUF);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+      syslog(LOG_NOTICE, "[DB] loader fetch stream disconnected (read: %s)", strerror(errno));
+      fetch_drop(g);
+      return;
+    }
+    if (n == 0) {
+      syslog(LOG_NOTICE, "[DB] loader fetch stream disconnected");
+      fetch_drop(g);
+      return;
+    }
+    if (kdb_framer_feed(&g->ffr, g->rbuf, (size_t)n) != KDB_OK) {
+      fetch_protocol_error(g, g->ffr.reason);
+      return;
+    }
+    kdb_frame_t fr;
+    for (;;) {
+      kdb_rc_t rc = kdb_framer_next(&g->ffr, &fr);
+      if (rc == KDB_MORE) break;
+      if (rc != KDB_OK) {
+        fetch_protocol_error(g, g->ffr.reason);
+        return;
+      }
+      kdb_msg_t msg;
+      rc = kdb_sm_accept(&g->fsm, &fr, &msg);
+      if (rc != KDB_OK) {
+        fetch_protocol_error(g, g->fsm.reason);            /* (the reason names the rule, never bytes of the stream) */
+        return;
+      }
+      handle_fetch_msg(g, &msg);
+      if (g->fetch_fd < 0) return;
+    }
+  }
+}
+
+static void fetch_adopt(ing_t *g, int fd) {
+  limit_stream_rights(fd);
+  if (g->fetch_fd >= 0) fetch_drop(g);
+  g->fetch_fd = fd;
+  struct kevent ev[2];
+  EV_SET(&ev[0], fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+  EV_SET(&ev[1], fd, EVFILT_WRITE, EV_ADD | EV_DISABLE, 0, 0, NULL);
+  if (kevent(g->kq, ev, 2, NULL, 0, NULL) != 0) {
+    syslog(LOG_ERR, "[DB] cannot watch the loader fetch stream: %s", strerror(errno));
+    fetch_drop(g);
+    return;
+  }
+  ing_cfg_t snap;
+  snapshot_cfg(&snap);
+  kdb_limits_t lim = { snap.max_zone_records ? snap.max_zone_records : KDB_DEFAULT_MAX_ZONE_RECORDS,
+                       snap.max_zone_bytes ? snap.max_zone_bytes : KDB_DEFAULT_MAX_ZONE_BYTES, snap.nviews ? snap.nviews : KDB_VIEWS_ANY };
+  kdb_framer_init(&g->ffr, KDB_FROM_LOADER, g->fbody, KDB_MAX_BODY);
+  kdb_sm_init_fetch(&g->fsm, &lim);
+  kdb_enc_reset(&g->fenc);
+  g->fout_len = g->fout_off = 0;
+  syslog(LOG_INFO, "[DB] loader fetch stream connected");
+  for (uint32_t i = 0; i < ING_FETCH_MAX && g->fetch_fd >= 0; i++)      /* what a restarted loader has not answered is asked again */
+    if (g->freq[i].active) {
+      g->freq[i].sent_ms = now_ms();
+      (void)fetch_send_req(g, &g->freq[i]);
+    }
+  if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);
+}
+
 static void *ingest_thread(void *arg) {
   ing_t *g = arg;
   rcu_aux_thread_pin();
   struct kevent evs[8];
   for (;;) {
     struct timespec ts, *tp = NULL;
+    int64_t wait_ms = -1;
     if (dbreg_pending_count() > 0) {                     /* new zones are waiting to become visible */
-      int64_t left = g->last_delta_ms + ING_DELTA_MS - now_ms();
-      if (left < 0) left = 0;
-      ts.tv_sec = left / 1000;
-      ts.tv_nsec = (left % 1000) * 1000000;
+      wait_ms = g->last_delta_ms + ING_DELTA_MS - now_ms();
+      if (wait_ms < 0) wait_ms = 0;
+    }
+    if (g->nfreq > 0 && (wait_ms < 0 || wait_ms > 1000)) wait_ms = 1000;          /* fetches in flight: look at their deadlines */
+    if (wait_ms >= 0) {
+      ts.tv_sec = wait_ms / 1000;
+      ts.tv_nsec = (wait_ms % 1000) * 1000000;
       tp = &ts;
     }
     int n = kevent(g->kq, NULL, 0, evs, 8, tp);
@@ -2025,10 +2492,15 @@ static void *ingest_thread(void *arg) {
         drain_results(g);
       } else if (e->filter == EVFILT_USER && e->ident == ING_EVT_REQ) {
         process_requests(g);
+      } else if (e->filter == EVFILT_USER && e->ident == PARK_FETCH_IDENT) {
+        fetch_issue(g);                                  /* D1a: a worker parked a query for a zone that is not in memory */
       } else if (e->filter == EVFILT_USER) {
         on_config_event(g);
       } else if (g->ctrl_fd >= 0 && e->ident == (uintptr_t)g->ctrl_fd) {
         on_ctrl_readable(g);
+      } else if (g->fetch_fd >= 0 && e->ident == (uintptr_t)g->fetch_fd) {
+        if (e->filter == EVFILT_WRITE) fetch_flush(g);
+        else on_fetch_readable(g);
       } else if (g->stream_fd >= 0 && e->ident == (uintptr_t)g->stream_fd) {
         if (e->filter == EVFILT_WRITE) out_flush(g);
         else on_stream_readable(g);
@@ -2038,32 +2510,38 @@ static void *ingest_thread(void *arg) {
     if (g->inv_active) pump_inventory(g);
     if (g->need_cleanup) cleanup_stream_state(g);
     maybe_apply_delta(g);
+    fetch_expire(g);
     if (g->stream_fd >= 0 && g->out_off < g->out_len) out_flush(g);
+    if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);
   }
 }
 
-bool db_ingest_start(int stream_fd, int ctrl_fd) {
+bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
   ing_t *g = &g_ing;
   memset(g, 0, sizeof(*g));
   g->stream_fd = -1;
+  g->fetch_fd = -1;
   g->cur_req = -1;
   g->ctrl_fd = ctrl_fd;
   g->body = malloc(KDB_MAX_BODY);
+  g->fbody = malloc(KDB_MAX_BODY);
   g->rbuf = malloc(ING_RBUF);
   kdb_enc_init(&g->enc);
+  kdb_enc_init(&g->fenc);
   g->kq = kqueue();
   g->wait_kq = kqueue();
-  if (!g->body || !g->rbuf || g->kq < 0 || g->wait_kq < 0 || ctrl_fd < 0) {
+  if (!g->body || !g->fbody || !g->rbuf || g->kq < 0 || g->wait_kq < 0 || ctrl_fd < 0) {
     syslog(LOG_ERR, "[DB] cannot start the ingest thread: %s", g->kq < 0 ? strerror(errno) : "no control socket or memory");
     return false;
   }
   limit_ctrl_rights(ctrl_fd);
-  struct kevent ev[4];
+  struct kevent ev[5];
   EV_SET(&ev[0], ctrl_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
   EV_SET(&ev[1], ING_EVT_CONFIG, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev[2], ING_EVT_RESULT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev[3], ING_EVT_REQ, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
-  if (kevent(g->kq, ev, 4, NULL, 0, NULL) != 0) {
+  EV_SET(&ev[4], PARK_FETCH_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);      /* D1a: a worker asks for a zone */
+  if (kevent(g->kq, ev, 5, NULL, 0, NULL) != 0) {
     syslog(LOG_ERR, "[DB] cannot watch the loader control socket: %s", strerror(errno));
     return false;
   }
@@ -2096,6 +2574,8 @@ bool db_ingest_start(int stream_fd, int ctrl_fd) {
     syslog(LOG_INFO, "[DB] %u builder thread(s) for the zones of the database", g->nbuilders);
   }
   if (stream_fd >= 0) adopt_stream(g, stream_fd);
+  if (fetch_fd >= 0) fetch_adopt(g, fetch_fd);
+  park_fetch_set_notify(g->kq);
   pthread_t t;
   if (pthread_create(&t, NULL, ingest_thread, g) != 0) {
     syslog(LOG_ERR, "[DB] cannot create the ingest thread");

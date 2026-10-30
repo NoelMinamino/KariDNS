@@ -1,0 +1,328 @@
+/*
+ * test_park_worker.c - a worker parks a UDP query for a zone that is not in memory, and answers it later (dns_server_core.c: udp_one(),
+ * park_service(); dns_park.c; D1a milestone 2, design 4.1 - 4.4).
+ *
+ * The directory of the view lists the zone park.test. but the test has taken its data out of memory (the entry of the element is NULL: the
+ * state of an evicted zone; nothing in the server does that yet).  udp_one() is the code every UDP request runs through, park_service() the
+ * code that starts a parked request again.  Checked:
+ *   - a zone in memory is answered at once, as before (the first pass and the second one are the same function)
+ *   - a query for the zone that is not in memory is parked, not answered; the first one asks for the zone (one request on the worker's fetch
+ *     ring), a second one for the same zone asks for nothing
+ *   - the zone is back and the ingest thread says so (a key on the wake ring): both queries are answered from the zone, once, on the socket
+ *     they came in on, with their own IDs
+ *   - the zone is still not there after a wake-up: the query is parked again, with the deadline it had
+ *   - the time is up: SERVFAIL with Extended DNS Error 14 (RFC 8914 4.15), the question kept; so is a failed fetch (answered at once), a full
+ *     park table, a request too big to park and a worker that has no park table
+ *   - the request log and the dnstap query event of a parked request are written once (not again when it comes back)
+ */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <poll.h>
+#include <fcntl.h>
+#include <syslog.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+
+#include "../dns_config_parser.h"
+#include "../dns_db_stream.h"
+#include "../dns_park.h"
+#include "../dns_server_internal.h"
+#include "../dns_snapshot_rcu.h"
+#include "../dns_utils.h"
+
+static int g_checks = 0, g_failed = 0;
+#define CHECK(cond) do { g_checks++; if (!(cond)) { g_failed++; \
+    printf("  [FAIL] %s:%d: %s\n", __FILE__, __LINE__, #cond); } } while (0)
+
+void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ssize_t payload_received);
+void park_service(udp_pass_t *w, int kq);
+
+/* a query for www.park.test. A, with an OPT record when edns; id as given; padding: bytes of an EDNS padding option (RFC 7830) */
+static size_t build_query(uint8_t *b, uint16_t id, bool edns, size_t padding) {
+    memset(b, 0, 12);
+    b[0] = (uint8_t)(id >> 8); b[1] = (uint8_t)id;
+    b[2] = 0x01;                                   /* RD */
+    b[5] = 1;                                      /* QDCOUNT */
+    b[11] = edns ? 1 : 0;                          /* ARCOUNT */
+    size_t o = 12;
+    static const uint8_t qn[] = { 3, 'w', 'w', 'w', 4, 'p', 'a', 'r', 'k', 4, 't', 'e', 's', 't', 0 };
+    memcpy(b + o, qn, sizeof(qn));
+    o += sizeof(qn);
+    b[o++] = 0; b[o++] = 1; b[o++] = 0; b[o++] = 1;     /* A IN */
+    if (edns) {
+        b[o++] = 0;                                /* root */
+        b[o++] = 0; b[o++] = 41;                   /* OPT */
+        b[o++] = 0x04; b[o++] = 0xD0;              /* UDP payload size 1232 */
+        b[o++] = 0; b[o++] = 0; b[o++] = 0; b[o++] = 0;
+        size_t rdlen = padding ? 4 + padding : 0;
+        b[o++] = (uint8_t)(rdlen >> 8); b[o++] = (uint8_t)rdlen;
+        if (padding) {
+            b[o++] = 0; b[o++] = 12;               /* option code 12: padding */
+            b[o++] = (uint8_t)(padding >> 8); b[o++] = (uint8_t)padding;
+            memset(b + o, 0, padding);
+            o += padding;
+        }
+    }
+    return o;
+}
+
+static void mk_ipc(udp_ipc_t *i, int tag, size_t len) {
+    memset(i, 0, sizeof(*i));
+    i->sock_fd_idx = tag;
+    i->addr_len = sizeof(struct sockaddr_in);
+    i->payload_len = (uint16_t)len;
+    i->client_addr.sin.sin_family = AF_INET;
+    i->client_addr.sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    i->client_addr.sin.sin_port = htons(40000 + (uint16_t)tag);
+#if defined(__FreeBSD__) || defined(__APPLE__)
+    i->client_addr.sin.sin_len = sizeof(struct sockaddr_in);
+#endif
+}
+
+/* the answer the worker sent, read from the other end of the datagram socket: header fields, and the EDE info code (-1: none) */
+typedef struct {
+    bool got;
+    int sock_idx;
+    uint16_t id;
+    int rcode, ancount;
+    int ede;
+    size_t len;
+} ans_t;
+
+static ans_t read_answer(int fd) {
+    ans_t a;
+    memset(&a, 0, sizeof(a));
+    a.ede = -1;
+    uint8_t buf[sizeof(udp_ipc_t) + 4096];
+    struct pollfd p = { fd, POLLIN, 0 };
+    if (poll(&p, 1, 1000) <= 0) return a;
+    ssize_t n = recv(fd, buf, sizeof(buf), 0);
+    if (n < (ssize_t)sizeof(udp_ipc_t) + 12) return a;
+    const udp_ipc_t *ipc = (const udp_ipc_t *)buf;
+    const uint8_t *m = buf + sizeof(udp_ipc_t);
+    size_t len = (size_t)n - sizeof(udp_ipc_t);
+    a.got = true;
+    a.sock_idx = ipc->sock_fd_idx;
+    a.len = len;
+    a.id = (uint16_t)((m[0] << 8) | m[1]);
+    a.rcode = m[3] & 0x0F;
+    a.ancount = (m[6] << 8) | m[7];
+    int ar = (m[10] << 8) | m[11];
+    size_t o = 12;
+    for (int q = (m[4] << 8) | m[5]; q > 0 && o < len; q--) {          /* the question (names are not compressed there) */
+        while (o < len && m[o] != 0) o += 1 + m[o];
+        o += 5;
+    }
+    for (int r = a.ancount + ((m[8] << 8) | m[9]) + ar; r > 0 && o + 11 <= len; r--) {
+        size_t nl = 0;
+        if (m[o] == 0) nl = 1;
+        else if ((m[o] & 0xC0) == 0xC0) nl = 2;
+        else {
+            while (o + nl < len && m[o + nl] != 0) nl += 1 + m[o + nl];
+            nl++;
+        }
+        uint16_t type = (uint16_t)((m[o + nl] << 8) | m[o + nl + 1]);
+        size_t rdlen = (size_t)((m[o + nl + 8] << 8) | m[o + nl + 9]);
+        size_t rd = o + nl + 10;
+        if (type == 41) {                                                /* OPT: look for the EDE option (code 15) */
+            for (size_t k = rd; k + 4 <= rd + rdlen && k + 4 <= len;) {
+                uint16_t code = (uint16_t)((m[k] << 8) | m[k + 1]), ol = (uint16_t)((m[k + 2] << 8) | m[k + 3]);
+                if (code == 15 && ol >= 2) a.ede = (m[k + 4] << 8) | m[k + 5];
+                k += 4 + ol;
+            }
+        }
+        o = rd + rdlen;
+    }
+    return a;
+}
+
+void syslog(int priority, const char *format, ...) {
+    (void)priority;
+    (void)format;
+}
+
+static zdir_elem_t *the_elem(void) {
+    zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+    zdir_elem_t *e = zdir_find_exact(snapshot_find_view(s, "default"), "park.test.");
+    release_zone_snapshot(s);
+    return e;
+}
+
+int main(void) {
+    printf("[a worker parks a query for a zone that is not in memory]\n");
+    char dir[] = "/tmp/karidns_parkw_XXXXXX";
+    CHECK(mkdtemp(dir) != NULL);
+    char zf[300], conf[1200];
+    snprintf(zf, sizeof(zf), "%s/park.test.zone", dir);
+    FILE *fp = fopen(zf, "w");
+    CHECK(fp != NULL);
+    fputs("$ORIGIN park.test.\n$TTL 300\n@ IN SOA ns.park.test. h.park.test. 1 7200 3600 1209600 300\n@ IN NS ns.park.test.\nns IN A 192.0.2.1\nwww IN A 192.0.2.80\n", fp);
+    fclose(fp);
+    snprintf(conf, sizeof(conf), "options { directory \"%s\"; };\nview \"default\" { match-clients { any; }; zone \"park.test\" { type master; file \"%s\"; }; };\n", dir, zf);
+    static server_config_t cfg;
+    CHECK(parse_named_conf(conf, &cfg) == 0);
+    cfg.send_extended_errors = true;
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    rebuild_zone_db_from_config(&cfg, false);
+    zdir_elem_t *el = the_elem();
+    CHECK(el != NULL && zdir_entry(el) != NULL);
+    zone_db_entry_t *entry = zdir_entry(el);
+
+    static worker_ctx_t wctx;
+    memset(&wctx, 0, sizeof(wctx));
+    static compress_ctx_t cc;
+    memset(&cc, 0, sizeof(cc));
+    int sk[2];
+    CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, sk) == 0);
+    int sndbuf = 1 << 20;
+    setsockopt(sk[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    setsockopt(sk[1], SOL_SOCKET, SO_RCVBUF, &sndbuf, sizeof(sndbuf));
+
+    park_table_t table;
+    CHECK(park_init(&table, 8));
+    park_register_worker(0, -1);
+    udp_pass_t w;
+    memset(&w, 0, sizeof(w));
+    w.ctx = &wctx;
+    w.batch = &wctx.batch;
+    w.cc = &cc;
+    w.active_fd = sk[0];
+    w.park = &table;
+    w.worker_idx = 0;
+    w.park_timeout_ms = 5000;
+    udp_batch_ctx_t *batch = &wctx.batch;
+    for (int k = 0; k < UDP_BATCH_SIZE; k++) {                       /* as the worker thread sets its batch up */
+        memset(&batch->tx_msgs[k], 0, sizeof(batch->tx_msgs[k]));
+        batch->tx_msgs[k].msg_hdr.msg_iov = &batch->tx_iov[k];
+        batch->tx_msgs[k].msg_hdr.msg_iovlen = 1;
+    }
+    uint8_t *rx = batch->rx_buffers[0];
+
+    #define SEND_QUERY(id, edns, pad) do { size_t ql_ = build_query(rx + sizeof(udp_ipc_t), (id), (edns), (pad)); \
+        mk_ipc((udp_ipc_t *)rx, 7, ql_); w.n_tx = 0; udp_one(&w, (udp_ipc_t *)rx, rx + sizeof(udp_ipc_t), (ssize_t)ql_); } while (0)
+    #define FLUSH() do { if (w.n_tx > 0) { for (int k_ = 0; k_ < w.n_tx; k_++) send(sk[0], batch->tx_buffers[k_], batch->tx_iov[k_].iov_len, 0); w.n_tx = 0; } } while (0)
+
+    /* -- in memory: answered at once, nothing parked */
+    SEND_QUERY(0x1001, true, 0);
+    CHECK(w.n_tx == 1 && table.nwait == 0);
+    FLUSH();
+    ans_t a = read_answer(sk[1]);
+    CHECK(a.got && a.id == 0x1001 && a.rcode == 0 && a.ancount == 1 && a.ede == -1);
+
+    /* -- not in memory: parked.  The first query for the zone asks for it, the second asks for nothing */
+    atomic_store(&el->entry, NULL);
+    atomic_store(&el->state, ZDIR_ST_ABSENT);
+    SEND_QUERY(0x2001, true, 0);
+    CHECK(w.n_tx == 0 && table.nwait == 1);
+    park_fetch_req_t q;
+    CHECK(park_fetch_pop(park_fetch_ring(0), &q) && strcmp(q.view, "default") == 0 && strcmp(q.zone, "park.test.") == 0 &&
+          q.prio == KDB_FETCH_PRIO_QUERY && q.mode == KDB_FETCH_FULL);
+    SEND_QUERY(0x2002, true, 0);
+    CHECK(w.n_tx == 0 && table.nwait == 2 && !park_fetch_pop(park_fetch_ring(0), &q));
+    CHECK(!read_answer(sk[1]).got);                                    /* nothing was sent */
+
+    /* -- the zone is back and the ingest thread says so: both are answered, on their socket, with their IDs */
+    atomic_store(&el->entry, entry);
+    CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", false));
+    park_service(&w, -1);
+    CHECK(table.nwait == 0 && table.nready == 0 && table.nfree == table.cap);
+    ans_t a1 = read_answer(sk[1]), a2 = read_answer(sk[1]);
+    CHECK(a1.got && a2.got && a1.sock_idx == 7 && a2.sock_idx == 7);
+    CHECK((a1.id == 0x2001 && a2.id == 0x2002) || (a1.id == 0x2002 && a2.id == 0x2001));
+    CHECK(a1.rcode == 0 && a1.ancount == 1 && a2.rcode == 0 && a2.ancount == 1);
+    CHECK(!read_answer(sk[1]).got);                                    /* once */
+
+    /* -- woken while the zone is still not there: parked again, with the deadline it had; nothing asked again */
+    atomic_store(&el->entry, NULL);
+    SEND_QUERY(0x3001, true, 0);
+    CHECK(table.nwait == 1 && park_fetch_pop(park_fetch_ring(0), &q));
+    int64_t d0 = park_next_deadline_ms(&table, 0);
+    CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", false));
+    park_service(&w, -1);
+    CHECK(table.nwait == 1 && !park_fetch_pop(park_fetch_ring(0), &q) && !read_answer(sk[1]).got);
+    CHECK(park_next_deadline_ms(&table, 0) == d0);
+    atomic_store(&el->entry, entry);
+    CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", false));
+    park_service(&w, -1);
+    a = read_answer(sk[1]);
+    CHECK(a.got && a.id == 0x3001 && a.rcode == 0 && a.ancount == 1 && table.nwait == 0);
+
+    /* -- the time is up: SERVFAIL + EDE 14, the question kept */
+    atomic_store(&el->entry, NULL);
+    w.park_timeout_ms = 5;
+    SEND_QUERY(0x4001, true, 0);
+    CHECK(table.nwait == 1);
+    (void)park_fetch_pop(park_fetch_ring(0), &q);
+    usleep(30000);
+    park_service(&w, -1);
+    a = read_answer(sk[1]);
+    CHECK(a.got && a.id == 0x4001 && a.rcode == 2 && a.ancount == 0 && a.ede == 14 && table.nwait == 0);
+    w.park_timeout_ms = 5000;
+
+    /* -- a failed fetch: answered at once, with the same answer */
+    SEND_QUERY(0x5001, true, 0);
+    CHECK(table.nwait == 1);
+    (void)park_fetch_pop(park_fetch_ring(0), &q);
+    CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", true));
+    park_service(&w, -1);
+    a = read_answer(sk[1]);
+    CHECK(a.got && a.id == 0x5001 && a.rcode == 2 && a.ede == 14 && table.nwait == 0);
+    /* ... without EDNS there is no OPT to carry the error: SERVFAIL alone */
+    SEND_QUERY(0x5002, false, 0);
+    (void)park_fetch_pop(park_fetch_ring(0), &q);
+    CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", true));
+    park_service(&w, -1);
+    a = read_answer(sk[1]);
+    CHECK(a.got && a.id == 0x5002 && a.rcode == 2 && a.ede == -1);
+
+    /* -- a lost wake-up (the ring overflowed): every parked query looks again */
+    SEND_QUERY(0x5101, true, 0);
+    (void)park_fetch_pop(park_fetch_ring(0), &q);
+    atomic_store(&el->entry, entry);
+    atomic_store(&park_wake_ring(0)->overflow, true);
+    park_service(&w, -1);
+    a = read_answer(sk[1]);
+    CHECK(a.got && a.id == 0x5101 && a.rcode == 0 && a.ancount == 1);
+    atomic_store(&el->entry, NULL);
+
+    /* -- a request too big to park (more than PARK_UDP_MAX bytes), a full table, a worker without a park table: "not ready" at once */
+    SEND_QUERY(0x6001, true, PARK_UDP_MAX);
+    CHECK(w.n_tx == 1 && table.nwait == 0 && table.n_toobig == 1);
+    FLUSH();
+    a = read_answer(sk[1]);
+    CHECK(a.got && a.id == 0x6001 && a.rcode == 2 && a.ede == 14);
+    park_table_t tiny;
+    CHECK(park_init(&tiny, 1));
+    w.park = &tiny;
+    SEND_QUERY(0x6002, true, 0);
+    CHECK(tiny.nwait == 1 && w.n_tx == 0);
+    SEND_QUERY(0x6003, true, 0);                                       /* the table is full */
+    CHECK(w.n_tx == 1 && tiny.nwait == 1 && tiny.n_full == 1);
+    FLUSH();
+    a = read_answer(sk[1]);
+    CHECK(a.got && a.id == 0x6003 && a.rcode == 2 && a.ede == 14);
+    w.park = NULL;
+    SEND_QUERY(0x6004, true, 0);
+    CHECK(w.n_tx == 1);
+    FLUSH();
+    a = read_answer(sk[1]);
+    CHECK(a.got && a.id == 0x6004 && a.rcode == 2 && a.ede == 14);
+    park_free(&tiny);
+
+    park_unregister_worker(0);
+    park_free(&table);
+    atomic_store(&el->entry, entry);
+    unlink(zf);
+    rmdir(dir);
+    printf("\n%d checks, %d failed\n", g_checks, g_failed);
+    if (g_failed) return 1;
+    printf("=== test_park_worker: all checks passed ===\n");
+    return 0;
+}

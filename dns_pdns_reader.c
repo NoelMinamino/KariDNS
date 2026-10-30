@@ -193,6 +193,31 @@ bool pdns_soa_serial(const char *content, uint32_t *serial) {
     return false;
 }
 
+/* Fields 4, 5 and 6 of an SOA content (refresh, retry, expire), the same strict decimal rules as the serial. */
+bool pdns_soa_timers(const char *content, uint32_t *refresh, uint32_t *retry, uint32_t *expire) {
+    if (!content) return false;
+    const char *p = content;
+    uint32_t v[3] = { 0, 0, 0 };
+    for (int field = 0; field < 6; field++) {
+        while (*p == ' ' || *p == '\t') p++;
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (p == start) return false;
+        if (field < 3) continue;
+        uint64_t n = 0;
+        for (const char *d = start; d < p; d++) {
+            if (*d < '0' || *d > '9') return false;
+            n = n * 10 + (uint64_t)(*d - '0');
+            if (n > 0xFFFFFFFFull) return false;
+        }
+        v[field - 3] = (uint32_t)n;
+    }
+    if (refresh) *refresh = v[0];
+    if (retry) *retry = v[1];
+    if (expire) *expire = v[2];
+    return true;
+}
+
 /* ------------------------------------------------------------------------------------------------------------- */
 /* names                                                                                                          */
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -1924,7 +1949,8 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
                                   (z->flags & PDNS_F_TINYDNS ? KDB_ZF_TINYDNS : 0))) != 0 ||
         kdb_enc_u64(&enc, 7, rr_count) != 0 || kdb_enc_bytes(&enc, 8, digest, KDB_DIGEST_LEN) != 0 ||
         (z->settings && *z->settings && kdb_enc_str(&enc, 9, z->settings) != 0) ||
-        (profile && *profile && kdb_enc_str(&enc, 10, profile) != 0) || kdb_enc_end(&enc) != 0 ||
+        (profile && *profile && kdb_enc_str(&enc, 10, profile) != 0) ||
+        (p->request_id && kdb_enc_u64(&enc, 11, p->request_id) != 0) || kdb_enc_end(&enc) != 0 ||
         emit_msg(&eu) != 0) {
         snprintf(err, errlen, "zone '%s': ZONE_BEGIN could not be encoded or sent", z->name);
         goto out;

@@ -168,6 +168,7 @@ static void zdir_elem_release(zdir_elem_t *e) {
   zone_db_entry_t *en = atomic_load_explicit(&e->entry, memory_order_relaxed);
   if (en && !(e->kind & ZDIR_K_BORROWED)) zdir_entry_unref(en);
   free(e->error);
+  free(e->digest);
   free(e);
 }
 
@@ -481,7 +482,7 @@ static zdir_elem_t *zdir_elem_new_owned(zone_db_entry_t *entry, uint8_t kind, in
   e->klen = (uint8_t)zone_key_len(e->name);
   e->hash = zdir_name_hash(e->name);
   e->source_id = order;
-  e->state = ZDIR_ST_RESIDENT;
+  atomic_init(&e->state, ZDIR_ST_RESIDENT);
   e->kind = (uint8_t)(kind | ZDIR_K_OWNED);
   e->flags = (uint16_t)(zone_entry_ticks(entry) ? ZDIR_F_TICK : 0);
   atomic_init(&e->entry, entry);
@@ -627,16 +628,28 @@ zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
  * ルート) で探し直し、あればそのゾーンから答える (DS、または親の SOA と NSEC/NSEC3 による NODATA。親がさらに
  * 上で委任していれば参照応答)。親を持たないとき、または親が forward ゾーン (権威データを持たない) のときは
  * 子の頂点から権威のある NODATA を返す (§3.1.4.1 がこの場合に定める応答)。QUERY 以外は qtype に 0 を渡す。 */
-zone_db_entry_t *find_zone_for_query(view_snapshot_t *view, const char *qname, uint16_t qtype) {
-  zone_db_entry_t *entry = find_zone_in_view(view, qname);
+zone_db_entry_t *find_zone_for_query_ex(view_snapshot_t *view, const char *qname, uint16_t qtype, zdir_elem_t **elem_out) {
+  zdir_elem_t *el = zdir_find_suffix(view, qname);
+  zone_db_entry_t *entry = zdir_entry(el);
+  if (elem_out) *elem_out = el;
   if (qtype != 43 || !entry || !domain_names_match_ci(entry->domain, qname)) return entry;
   size_t q_len = zone_key_len(qname);
   if (q_len == 0) return entry; // ルート自身の DS は親を持たない
   const char *dot = strchr_unescaped(qname, '.');
   const char *parent = (dot && (size_t)(dot - qname) < q_len) ? dot + 1 : ".";
-  zone_db_entry_t *p = find_zone_in_view(view, parent);
+  zdir_elem_t *pel = zdir_find_suffix(view, parent);
+  zone_db_entry_t *p = zdir_entry(pel);
+  if (pel && !p) {                       /* the parent is in the directory and not in memory: the answer comes from it, so it is the zone to wait for */
+    if (elem_out) *elem_out = pel;
+    return NULL;
+  }
   if (!p || p == entry || p->kind == ZONE_KIND_FORWARD) return entry;
+  if (elem_out) *elem_out = pel;
   return p;
+}
+
+zone_db_entry_t *find_zone_for_query(view_snapshot_t *view, const char *qname, uint16_t qtype) {
+  return find_zone_for_query_ex(view, qname, qtype, NULL);
 }
 
 zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name) {
@@ -1676,7 +1689,7 @@ static dbreg_zone_t *dbreg_add(dbreg_view_t *rv, const char *name, uint32_t h) {
     memcpy(z->name, name, l + 1);
     z->hash = h;
     z->klen = (uint8_t)zone_key_len(name);
-    z->state = ZDIR_ST_ABSENT;
+    atomic_init(&z->state, ZDIR_ST_ABSENT);
     size_t b = h & (rv->nb - 1);
     z->next = rv->tab[b];
     rv->tab[b] = z;
@@ -1742,7 +1755,7 @@ static void zdir_elem_sync(zdir_elem_t *z, zone_db_entry_t *entry) {
     }
     if (zone_entry_ticks(entry)) f |= ZDIR_F_TICK;
     z->flags = f;
-    z->state = ZDIR_ST_RESIDENT;
+    atomic_store_explicit(&z->state, ZDIR_ST_RESIDENT, memory_order_release);
     z->refresh = atomic_load_explicit(&entry->refresh, memory_order_relaxed);
     z->retry = atomic_load_explicit(&entry->retry, memory_order_relaxed);
     z->expire = atomic_load_explicit(&entry->expire, memory_order_relaxed);
@@ -1769,13 +1782,16 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
     bool replace = created && cur && cur != entry;                  /* a new entry replaces the one registered earlier */
     bool in_index = created && !fresh && cur && zdir_lookup(dbreg_active_dir_locked(view), z->name) == z;
     bool queue_add = created && !sh && !in_index && !(z->flags & ZDIR_F_QUEUED);
-    if ((replace && !(gent = malloc(sizeof(*gent)))) || (queue_add && !dbreg_queue_reserve(&rv->adds, rv->n_adds, &rv->cap_adds))) {
+    uint8_t *new_digest = NULL;                                     /* the block of the digest: a zone that has none gets one */
+    if ((replace && !(gent = malloc(sizeof(*gent)))) || (queue_add && !dbreg_queue_reserve(&rv->adds, rv->n_adds, &rv->cap_adds)) ||
+        (!z->digest && !(new_digest = malloc(32)))) {
         if (fresh) {
             dbreg_unlink(rv, z);
             free(z);
         }
         goto out;
     }
+    if (new_digest) z->digest = new_digest;
     if (replace) {
         /* The element stays in the index and now points to the new entry (one store: a reader sees the old or the new one); the old
          * entry's reference is given back when the readers that may have it are gone, and the delta looks at it (a catalog consumer
@@ -1852,7 +1868,7 @@ bool dbreg_reject(const char *view, const char *name, int64_t source_id, const c
         if (z) {
             if (!zdir_entry(z)) {
                 z->source_id = source_id;
-                z->state = ZDIR_ST_ERROR;
+                atomic_store_explicit(&z->state, ZDIR_ST_ERROR, memory_order_release);
             }
             z->last_result = DBREG_REJECTED;
             dbreg_set_error(z, reason);
@@ -1861,6 +1877,55 @@ bool dbreg_reject(const char *view, const char *name, int64_t source_id, const c
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     return ok;
+}
+
+/* ---- D1a milestone 2: a fetch of a zone that is in the directory and not in memory (the ingest thread asks the loader for it) ---- */
+int dbreg_fetch_begin(const char *view, const char *zone) {
+    int rc = DBREG_FETCH_NONE;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    if (z && !(z->flags & ZDIR_F_DELETED)) {
+        if (zdir_entry(z)) {
+            rc = DBREG_FETCH_RESIDENT;
+        } else if (atomic_load_explicit(&z->state, memory_order_relaxed) == ZDIR_ST_LOADING) {
+            rc = DBREG_FETCH_BUSY;
+        } else {
+            atomic_store_explicit(&z->state, ZDIR_ST_LOADING, memory_order_release);
+            rc = DBREG_FETCH_STARTED;
+        }
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return rc;
+}
+
+void dbreg_fetch_end(const char *view, const char *zone) {
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    if (z && !zdir_entry(z) && atomic_load_explicit(&z->state, memory_order_relaxed) == ZDIR_ST_LOADING)
+        atomic_store_explicit(&z->state, ZDIR_ST_ABSENT, memory_order_release);
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+}
+
+bool dbreg_apply_summary(const char *view, const char *zone, int64_t source_id, uint32_t serial, bool has_timers, uint32_t refresh,
+                         uint32_t retry, uint32_t expire) {
+    bool applied = false;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    if (z && !(z->flags & ZDIR_F_DELETED) && !zdir_entry(z) && z->source_id == source_id) {     /* (a zone in memory is the newer truth) */
+        z->serial = serial;
+        if (has_timers) {
+            z->refresh = refresh;
+            z->retry = retry;
+            z->expire = expire;
+        }
+        z->last_result = DBREG_APPLIED;
+        applied = true;
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return applied;
 }
 
 int dbreg_delete(const char *view, const char *name, int64_t source_id) {
@@ -2302,7 +2367,7 @@ void dbreg_dir_bytes(size_t *elements, size_t *registry_bytes, size_t *index_byt
         for (size_t b = 0; b < rv->nb; b++) {
             for (const dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
                 n++;
-                rb += sizeof(*z) + strlen(z->name) + 1 + (z->error ? strlen(z->error) + 1 : 0);
+                rb += sizeof(*z) + strlen(z->name) + 1 + (z->error ? strlen(z->error) + 1 : 0) + (z->digest ? 32 : 0);
             }
         }
     }
@@ -2379,6 +2444,9 @@ int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int m
             if (zdir_entry(z)) {
                 o->serial = atomic_load_explicit(&zdir_entry(z)->serial, memory_order_relaxed);
                 o->refresh = atomic_load_explicit(&zdir_entry(z)->refresh, memory_order_relaxed);
+            } else if (z->last_result == DBREG_APPLIED) {     /* no data in memory: what the directory kept (a summary, D1a) */
+                o->serial = z->serial;
+                o->refresh = z->refresh;
             }
             o->shadowed = z->shadowed;
             o->shadow_by = z->shadow_by;

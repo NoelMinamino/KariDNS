@@ -48,11 +48,15 @@
  *   ZONE_BEGIN (4)    1 view view R | 2 zone name R | 3 source_id i64 R | 4 zone_kind u8 R (0 primary,1 secondary,
  *                     2 catalog) | 5 serial u32 R | 6 flags u32 R (bit0 presigned, bit1 extended, bit2 tinydns; others 0) |
  *                     7 rr_count u64 R (primary: both SOAs and, with bit1, the Extended AXFR marker and definition RRs counted, >= 2; secondary and catalog: 0, no ZONE_DATA, B7b) | 8 digest bytes R (exactly 32) |
- *                     9 settings text<=65535 O | 10 profile str ne <=255 O
+ *                     9 settings text<=65535 O | 10 profile str ne <=255 O |
+ *                     D1a (fetch stream only): 11 request_id u64 O (the FETCH_REQ this zone answers; required on the fetch stream, forbidden
+ *                     on the batch stream).  flags bit3 = summary: the zone's serial, kind and settings without its data (primary: rr_count 0, no
+ *                     ZONE_DATA, digest all zero); only on the fetch stream.  12 soa_refresh u32 | 13 soa_retry u32 | 14 soa_expire u32 (all
+ *                     three or none: the timers of the zone's SOA, which the zone directory keeps without the zone).
  *   ZONE_DATA (5)     raw DNS message (<= 65,535 bytes), no TLV
  *   ZONE_END (6)      1 rr_count u64 R
  *   ZONE_ABORT (7)    1 reason str<=255 R
- *   ZONE_FAILED (8)   1 view view R | 2 zone name R | 3 source_id i64 R | 4 reason str<=255 R
+ *   ZONE_FAILED (8)   1 view view R | 2 zone name R | 3 source_id i64 R | 4 reason str<=255 R | 5 request_id u64 O (D1a: fetch stream only, required there)
  *   ZONE_DELETE (9)   1 view view R | 2 zone name R | 3 source_id i64 R
  *   PROFILE (10)      1 name str ne <=255 R | 2 settings text<=65535 R
  *   BATCH_END (11)    1 batch_id u64 R | 2 n_zones u32 R | 3 n_failed u32 R | 4 n_deleted u32 R
@@ -77,12 +81,22 @@
  *   RELOAD_REQ (0x8002) 1 request_id u64 R | 2 scope u8 R (0 all, 1 one zone) | 3 view view O | 4 zone name O |
  *                     5 force u8 R (0/1); scope 1 needs tags 3 and 4, scope 0 forbids them
  *   INVENTORY (0x8003) 1 ENTRY nested, repeatable: 1 view view R | 2 zone name R | 3 source_id i64 R |
- *                         4 serial u32 R | 5 digest bytes R (exactly 32)
+ *                         4 serial u32 R | 5 digest bytes (exactly 32; required unless the zone is not resident) |
+ *                         6 resident u8 O (D1a: 0/1, absent = 1; 0 = the Backend has only the directory entry of the zone, no data and
+ *                         no digest)
  *   INVENTORY_END (0x8004) 1 last_change_seq u64 R | 2 n_zones u64 R
  *   ZONE_RESULT (0x8005) 1 view view R | 2 zone name R | 3 status u8 R (0 applied,1 unchanged,2 rejected,
  *                     3 shadowed,4 deleted) | 4 reason str<=255 O
  *   BATCH_RESULT (0x8006) 1 batch_id u64 R | 2 request_ids bytes O (n * u64, <= 2048 bytes) | 3 n_applied u32 R |
  *                     4 n_unchanged u32 R | 5 n_rejected u32 R | 6 n_deleted u32 R
+ *   FETCH_REQ (0x8007) D1a, fetch stream only: 1 request_id u64 R (> 0) | 2 view view R | 3 zone name R |
+ *                     4 priority u8 R (0 a query waits for it, 1 warm-up, 2 background) | 5 mode u8 R (0 the zone, 1 its summary) |
+ *                     6 range_lo name O | 7 range_hi name O (D1b: both or none; a loader that does not read ranges answers ZONE_FAILED)
+ *
+ * The fetch stream (D1a, design 6.1) is a second KDB1 stream, made by the supervisor with the first.  It carries only what a
+ * parked query waits for: FETCH_REQ from the Backend; from the loader, ZONE_BEGIN .. ZONE_DATA .. ZONE_END / ZONE_ABORT (PROFILE
+ * before ZONE_BEGIN) or ZONE_FAILED for each request, every one with the request id.  No HELLO, no batches, no results: the
+ * state machine starts in READY (kdb_sm_init_fetch()) and the Backend discards a zone it did not ask for.
  */
 
 #include <stdint.h>
@@ -110,14 +124,19 @@ enum {
     KDB_T_BATCH_END = 11, KDB_T_AUTO_STATUS = 12,
     /* Backend -> loader: high bit set */
     KDB_T_CONFIG = 0x8001, KDB_T_RELOAD_REQ = 0x8002, KDB_T_INVENTORY = 0x8003, KDB_T_INVENTORY_END = 0x8004,
-    KDB_T_ZONE_RESULT = 0x8005, KDB_T_BATCH_RESULT = 0x8006
+    KDB_T_ZONE_RESULT = 0x8005, KDB_T_BATCH_RESULT = 0x8006,
+    KDB_T_FETCH_REQ = 0x8007            /* D1a: fetch stream */
 };
+
+enum { KDB_FETCH_PRIO_QUERY = 0, KDB_FETCH_PRIO_WARM, KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_PRIO_N };
+enum { KDB_FETCH_FULL = 0, KDB_FETCH_SUMMARY };
 
 enum { KDB_BATCH_STARTUP = 0, KDB_BATCH_FULL, KDB_BATCH_DIFF, KDB_BATCH_ZONE, KDB_BATCH_AUTO };
 enum { KDB_ZK_PRIMARY = 0, KDB_ZK_SECONDARY, KDB_ZK_CATALOG };
 #define KDB_ZF_PRESIGNED 0x1u
 #define KDB_ZF_EXTENDED 0x2u    /* ZONE_DATA carries Extended AXFR records (dns_wire.h, xext_*): location / ECS tags, tinydns time stamps and locations */
 #define KDB_ZF_TINYDNS 0x4u     /* B8: the zone is a tinydns zone (ZONE_IMAGE_F_TINYDNS: time-dependent TTLs, never cached), also without any time stamp or location */
+#define KDB_ZF_SUMMARY 0x8u     /* D1a, fetch stream: the zone's summary (serial, kind, settings), no ZONE_DATA, rr_count 0, zero digest */
 enum { KDB_ST_APPLIED = 0, KDB_ST_UNCHANGED, KDB_ST_REJECTED, KDB_ST_SHADOWED, KDB_ST_DELETED };
 
 typedef enum {
@@ -197,6 +216,9 @@ typedef struct { uint64_t batch_id; uint8_t kind; uint64_t change_seq; uint64_t 
 typedef struct {
     uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; uint8_t zone_kind; uint32_t serial;
     uint32_t flags; uint64_t rr_count; uint8_t digest[KDB_DIGEST_LEN]; kdb_str_t settings, profile;
+    uint64_t request_id;        /* D1a: 0 = tag absent */
+    bool has_soa_timers;        /* D1a: tags 12..14, the SOA refresh / retry / expire of the zone (a summary carries them for the directory) */
+    uint32_t soa_refresh, soa_retry, soa_expire;
 } kdb_zone_begin_t;
 typedef struct {
     const uint8_t *body; uint32_t len;   /* the DNS message */
@@ -204,7 +226,7 @@ typedef struct {
 } kdb_zone_data_t;
 typedef struct { uint64_t rr_count; } kdb_zone_end_t;
 typedef struct { kdb_str_t reason; } kdb_zone_abort_t;
-typedef struct { uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; kdb_str_t reason; } kdb_zone_failed_t;
+typedef struct { uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; kdb_str_t reason; uint64_t request_id; /* 0 = absent */ } kdb_zone_failed_t;
 typedef struct { uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; } kdb_zone_delete_t;
 typedef struct { kdb_str_t name, settings; } kdb_profile_t;
 typedef struct { uint64_t batch_id; uint32_t n_zones, n_failed, n_deleted; } kdb_batch_end_t;
@@ -228,6 +250,10 @@ typedef struct {
     uint64_t batch_id; const uint8_t *request_ids; uint32_t n_request_ids;   /* big-endian u64 each */
     uint32_t n_applied, n_unchanged, n_rejected, n_deleted;
 } kdb_batch_result_t;
+typedef struct {
+    uint64_t request_id; uint16_t view; char name[DNS_NAME_TEXT_SIZE]; uint8_t priority, mode;
+    bool has_range; char range_lo[DNS_NAME_TEXT_SIZE], range_hi[DNS_NAME_TEXT_SIZE];
+} kdb_fetch_req_t;
 
 typedef struct {
     uint16_t type;
@@ -238,6 +264,7 @@ typedef struct {
         kdb_zone_delete_t zone_delete; kdb_profile_t profile; kdb_batch_end_t batch_end; kdb_auto_status_t auto_status;
         kdb_config_t config; kdb_reload_req_t reload_req; kdb_inventory_t inventory;
         kdb_inventory_end_t inventory_end; kdb_zone_result_t zone_result; kdb_batch_result_t batch_result;
+        kdb_fetch_req_t fetch_req;
     } u;
 } kdb_msg_t;
 
@@ -255,6 +282,7 @@ typedef struct {
 } kdb_config_view_t;
 typedef struct {
     uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; uint32_t serial; uint8_t digest[KDB_DIGEST_LEN];
+    bool resident;              /* D1a: false = the Backend has no data of the zone, and `digest` is all zero */
 } kdb_inventory_entry_t;
 #define KDB_AS_AUTO 1u      /* AUTO_STATUS entry flags: the auto reload fields are real */
 #define KDB_AS_REQ 2u       /* the reload request fields are real (B11) */
@@ -290,11 +318,17 @@ typedef struct {
     uint64_t zone_rr_sum;                      /* sum of ANCOUNT so far; at ZONE_END equal to the declared count */
     uint64_t zone_bytes;                       /* sum of ZONE_DATA bodies so far */
     uint32_t zone_data_msgs;
+    bool fetch;                                /* D1a: the fetch stream (kdb_sm_init_fetch()) */
+    uint64_t zone_req_id;                      /* fetch stream: the request id of the zone being received (ZONE_BEGIN tag 11) */
     kdb_rc_t fail;
     char reason[KDB_REASON_LEN];
 } kdb_sm_t;
 
 void kdb_sm_init(kdb_sm_t *sm, const kdb_limits_t *lim);   /* lim == NULL: defaults, KDB_VIEWS_ANY */
+/* The state machine of the fetch stream (D1a): starts in READY, accepts PROFILE / ZONE_BEGIN / ZONE_FAILED there and ZONE_DATA /
+ * ZONE_END / ZONE_ABORT in a zone; every ZONE_BEGIN and ZONE_FAILED carries a request id; summaries are allowed.  After ZONE_END,
+ * ZONE_ABORT and ZONE_FAILED the machine is READY again and the profile count starts again. */
+void kdb_sm_init_fetch(kdb_sm_t *sm, const kdb_limits_t *lim);
 /* Validate one frame from the loader against the current state, decode it, apply the semantic checks.  KDB_OK:
  * *msg is valid and the state advanced.  KDB_E_*: protocol error; the state is KDB_S_ERROR (sticky) and
  * sm->reason says why.  An error leaves any partial zone to be discarded by the caller. */

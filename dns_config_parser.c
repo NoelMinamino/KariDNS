@@ -6091,6 +6091,16 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     db->loader_threads = (uint32_t)u;
     return 0;
   }
+  if (strcmp(key, "park-max") == 0) {
+    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_PARK_MAX_MAX, &u) != 0) return -1;
+    db->park_max = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "park-timeout") == 0) {
+    if (db_take_uint(ctx, key, false, KARIDNS_DB_PARK_TIMEOUT_MIN, KARIDNS_DB_PARK_TIMEOUT_MAX, &u) != 0) return -1;
+    db->park_timeout_ms = (uint32_t)u;
+    return 0;
+  }
   if (strcmp(key, "acl-ceiling") == 0) {
     /* addresses and "key" entries like allow-transfer (see zone_transfer_acl_allows(), dns_tsig_acl.c) */
     free_str_list(db->acl_ceiling, db->acl_ceiling_count);

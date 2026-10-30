@@ -171,8 +171,15 @@ typedef struct {
    * tcp-initial-timeout、メッセージを1つ受け取り終えるたびに tcp-idle-timeout で決め、
    * メッセージの一部を受け取っても延ばさない (RFC 7766 §6.2.3)。 */
   int64_t idle_deadline_ms;
+  /* D1a milestone 2, a request parked for a zone that is not in memory (dns_park.h): the request stays in buf; the connection's read events are
+   * ignored while it waits (parked); a wake-up sets resume_pending and starts a short timer, whose event runs the request again from the
+   * top of the connection loop, where resume_len says "the message in buf is the one to answer" */
+  bool parked, resume_pending, not_ready_now;
+  uint16_t resume_len;
+  int64_t park_deadline_ms;         /* of the request that was parked first (0: none); a second park of the same request keeps it */
   /* buf は最後に置く: プールから払い出すときはこの手前までだけを 0 にする (D-04) */
   uint8_t buf[65536 + 2];
+  uint32_t gen;                     /* changes every time the context is given out (after buf: not cleared); a parked entry names (slot, gen) */
 } tcp_stream_ctx_t;
 
 /* D-04: 平文 TCP の接続コンテキストは Backend 起動時に MAX_TCP_CLIENTS 個を確保し、
@@ -289,6 +296,26 @@ struct worker_ctx {
 };
 
 #include "dns_epoch_rcu.h"
+
+/* D1a milestone 2: what one pass over a batch of UDP requests needs besides the request (udp_one() in dns_server_core.c): the worker's state, and
+ * how a request that was parked comes back (the park table is dns_park.h's) */
+struct park_table;
+typedef struct {
+  worker_ctx_t *ctx;
+  udp_batch_ctx_t *batch;
+  compress_ctx_t *cc;
+  int active_fd;
+  int n_tx;                          /* answers in the batch of datagrams to send */
+  bool qlog_enabled, rlog_enabled, blackhole_on;
+  uint32_t eff_max_qps;
+  /* parking (park == NULL: this worker never parks) */
+  struct park_table *park;
+  int worker_idx;
+  uint32_t park_timeout_ms;
+  bool woken;                        /* this request was parked before: its deadline is the old one, and it asks no fetch again */
+  int64_t woken_deadline_ms;
+  bool not_ready;                    /* answer SERVFAIL + EDE 14 (the time is up, or the fetch failed) */
+} udp_pass_t;
 
 extern _Atomic(worker_ctx_t *) g_worker_ctxs;
 extern _Atomic int g_worker_count;
@@ -534,16 +561,21 @@ struct zdir_elem {
   uint32_t hash;               /* calc_fnv1a_strn(name, klen): the index hash */
   uint32_t freq;               /* frequency counter (reserved: cache admission, a later milestone) */
   uint32_t gen;                /* generation of the state (reserved: parked queries, a later milestone) */
-  uint8_t state;               /* ZDIR_ST_* */
+  _Atomic uint8_t state;       /* ZDIR_ST_*: written under g_zone_db_rebuild_lock, read without it (a worker looks at it before it parks a query) */
   uint8_t last_result;         /* DBREG_APPLIED or DBREG_REJECTED (the last version offered) */
   bool shadowed;               /* a zone of karidns.conf (D-PRIO) or a catalog member (D17-1) with this name hides it: hidden elements are not in the index */
   uint8_t shadow_by;           /* DBREG_SH_*, meaningful while shadowed */
   uint16_t flags;              /* ZDIR_F_* (changed under g_zone_db_rebuild_lock) */
   uint8_t klen;                /* the name without the trailing dot */
   uint8_t kind;                /* ZDIR_K_* (never changes) */
-  uint8_t digest[32];          /* DB: the digest the loader sent (resident zones only, a later milestone) */
+  uint8_t *digest;             /* DB: the 32-byte digest the loader sent, in a block of its own that only a zone with data in memory has (malloc, freed with the element; NULL = none) */
   char name[];                 /* canonical absolute name, lower case, with the trailing dot */
 };
+/* Where a zone's settings (dbcfg) live when its data is not in memory (D1a, decision of milestone 2): the zone_config_t of an entry (169 bytes of
+ * per-zone fields) is made again from the zone name and the interned settings when the entry is made, so what has to outlive the entry is the
+ * interned zone_ext_shared_t (db_settings_intern(): one object for every zone with the same settings text, 8 bytes per zone for the pointer).
+ * A later milestone adds that pointer to this element, next to the digest block; until then every element is resident and dbcfg stays in the
+ * entry (zone_entry_config()). */
 typedef zdir_elem_t dbreg_zone_t;
 enum { DBREG_APPLIED = 0, DBREG_REJECTED = 1 };
 enum { DBREG_SH_NONE = 0, DBREG_SH_CONFIG = 1, DBREG_SH_CATALOG = 2 };
@@ -774,6 +806,9 @@ void ixfr_history_set_depth(zone_db_entry_t *entry, int depth);
 void ixfr_history_clear(ixfr_history_t *h);
 zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname);
 zone_db_entry_t *find_zone_for_query(view_snapshot_t *view, const char *qname, uint16_t qtype);
+/* The same, and the directory element of the zone the answer comes from in *elem_out (NULL: no zone).  When the element has no data in memory
+ * (zdir_entry() == NULL) the return value is NULL and *elem_out is that element: the worker parks the query (dns_park.h). */
+zone_db_entry_t *find_zone_for_query_ex(view_snapshot_t *view, const char *qname, uint16_t qtype, zdir_elem_t **elem_out);
 zone_db_entry_t *find_zone_exact_in_view(view_snapshot_t *view, const char *domain);
 view_snapshot_t *snapshot_find_view(zone_db_snapshot_t *snap, const char *view_name);
 zone_db_entry_t *snapshot_get_zone_in_view(zone_db_snapshot_t *snap, const char *view_name, const char *domain);
@@ -916,6 +951,16 @@ typedef struct {
 /* The registry records of the zone `name` (any case, with or without the trailing dot) in the view `view` (NULL: every
  * view), at most max of them copied to out.  Returns how many there are. */
 int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int max);
+/* D1a milestone 2: the fetch of a zone whose element is in the directory without its data.  dbreg_fetch_begin(): ABSENT -> LOADING under the
+ * registry lock (DBREG_FETCH_STARTED: the caller asks the loader), or why not: the zone is in memory, a fetch is on its way, it is not in the
+ * registry.  dbreg_fetch_end(): LOADING -> ABSENT again for an element that still has no data (the fetch failed or brought a summary; a fetch
+ * that brought the data has made it resident through dbreg_commit()).  dbreg_apply_summary(): what a summary tells (serial, SOA timers) goes into
+ * an element that has no data and the same source id; false when there is none such. */
+enum { DBREG_FETCH_STARTED = 0, DBREG_FETCH_RESIDENT, DBREG_FETCH_BUSY, DBREG_FETCH_NONE };
+int dbreg_fetch_begin(const char *view, const char *zone);
+void dbreg_fetch_end(const char *view, const char *zone);
+bool dbreg_apply_summary(const char *view, const char *zone, int64_t source_id, uint32_t serial, bool has_timers, uint32_t refresh,
+                         uint32_t retry, uint32_t expire);
 /* The entry of the DB zone (view, name) when it is in the active snapshot, i.e. served (not shadowed), else NULL.  Valid
  * while the caller holds the snapshot (acquire_retained_zone_snapshot()). */
 zone_db_entry_t *dbreg_snapshot_entry(zone_db_snapshot_t *snap, const char *view, const char *name);

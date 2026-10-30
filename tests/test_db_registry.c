@@ -1432,6 +1432,68 @@ static void test_dir_elements(void) {
     dbreg_reset();
 }
 
+/* D1a milestone 2: the digest block, the fetch state of an element that has no data, the summary, the lookup that tells a worker to park. */
+static void test_dir_fetch_state(void) {
+    printf("[TEST] zone directory: digest block, fetch state, summary, the lookup for a query (find_zone_for_query_ex)...\n");
+    write_zone_file("fs.zone", "fs.test.", "192.0.2.1");
+    char conf[1024];
+    snprintf(conf, sizeof(conf), "%s/fs.zone", g_dir);
+    server_config_t *cfg = load_conf("view \"default\" { match-clients { any; };\n  zone \"fs.test\" { type master; file \"%s\"; }; };\n", conf);
+    rebuild(cfg);
+    zone_db_entry_t *a = add_zone("default", "a.test.", 7, 2, 301);
+    CHECK(a && snapshot_apply_db_delta() == 1);
+    zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+    view_snapshot_t *v = snapshot_find_view(s, "default");
+    zdir_elem_t *ea = zdir_find_exact(v, "a.test."), *ef = zdir_find_exact(v, "fs.test.");
+    CHECK(ea && ef);
+    /* the digest is a block of its own that only a zone with data from the database has */
+    CHECK(ea->digest != NULL && ef->digest == NULL);
+    CHECK(sizeof(zdir_elem_t) <= 80);                              /* (104 before the digest left the element) */
+
+    /* the fetch state: a zone in memory is not fetched, one that is not in the registry is not a zone, one that has no data is begun once */
+    CHECK(dbreg_fetch_begin("default", "nope.test.") == DBREG_FETCH_NONE && dbreg_fetch_begin("nosuchview", "a.test.") == DBREG_FETCH_NONE);
+    CHECK(dbreg_fetch_begin("default", "a.test.") == DBREG_FETCH_RESIDENT && atomic_load(&ea->state) == ZDIR_ST_RESIDENT);
+    atomic_store(&ea->entry, NULL);                                /* the state of an evicted zone */
+    atomic_store(&ea->state, ZDIR_ST_ABSENT);
+    CHECK(dbreg_fetch_begin("default", "a.test.") == DBREG_FETCH_STARTED && atomic_load(&ea->state) == ZDIR_ST_LOADING);
+    CHECK(dbreg_fetch_begin("default", "a.test.") == DBREG_FETCH_BUSY);
+    dbreg_fetch_end("default", "a.test.");                         /* the fetch failed: the zone can be asked for again */
+    CHECK(atomic_load(&ea->state) == ZDIR_ST_ABSENT && dbreg_fetch_begin("default", "a.test.") == DBREG_FETCH_STARTED);
+    dbreg_fetch_end("default", "a.test.");
+    dbreg_fetch_end("default", "nope.test.");                      /* (nothing to end) */
+
+    /* a summary goes into an element without data, for the same source id only; a zone in memory keeps its own values */
+    CHECK(dbreg_apply_summary("default", "a.test.", 301, 99, true, 11, 22, 33));
+    CHECK(ea->serial == 99 && ea->refresh == 11 && ea->retry == 22 && ea->expire == 33);
+    CHECK(dbreg_apply_summary("default", "a.test.", 301, 100, false, 0, 0, 0) && ea->serial == 100 && ea->refresh == 11);
+    CHECK(!dbreg_apply_summary("default", "a.test.", 999, 5, true, 1, 2, 3) && ea->serial == 100);
+    CHECK(!dbreg_apply_summary("default", "nope.test.", 301, 5, true, 1, 2, 3) && !dbreg_apply_summary("nosuchview", "a.test.", 301, 5, true, 1, 2, 3));
+    dbreg_info_t inf;
+    CHECK(dbreg_find_info("default", "a.test.", &inf, 1) == 1 && !inf.has_entry && inf.serial == 100 && inf.refresh == 11);
+    CHECK(!dbreg_apply_summary("default", "fs.test.", 0, 5, true, 1, 2, 3));        /* a zone { } is not a registry zone */
+
+    /* the lookup for a query: NULL and the element for a zone that has no data (the worker parks), the entry when it has */
+    zdir_elem_t *pel = (zdir_elem_t *)0x1;
+    CHECK(find_zone_for_query_ex(v, "www.a.test.", 1, &pel) == NULL && pel == ea);
+    CHECK(find_zone_for_query(v, "www.a.test.", 1) == NULL);
+    CHECK(find_zone_for_query_ex(v, "www.fs.test.", 1, &pel) == zdir_entry(ef) && pel == ef);
+    CHECK(find_zone_for_query_ex(v, "other.org.", 1, &pel) == NULL && pel == NULL);
+    CHECK(find_zone_for_query_ex(v, "www.a.test.", 1, NULL) == NULL);
+    /* DS (RFC 4035 3.1.4.1): the query for the DS of a child apex is answered from the parent; when the parent has no data the parent is the zone to wait for */
+    zone_db_entry_t *child = add_zone("default", "c.a.test.", 3, 1, 302);
+    CHECK(child && snapshot_apply_db_delta() >= 1);
+    release_zone_snapshot(s);
+    s = acquire_retained_zone_snapshot();
+    v = snapshot_find_view(s, "default");
+    CHECK(find_zone_for_query_ex(v, "c.a.test.", 43, &pel) == NULL && pel == ea);
+    CHECK(find_zone_for_query_ex(v, "c.a.test.", 1, &pel) == child && pel == zdir_find_exact(v, "c.a.test."));
+    atomic_store(&ea->entry, a);                                   /* the data is back */
+    CHECK(find_zone_for_query_ex(v, "c.a.test.", 43, &pel) == a && pel == ea);
+    CHECK(find_zone_for_query_ex(v, "www.a.test.", 1, &pel) == a && pel == ea);
+    release_zone_snapshot(s);
+    dbreg_reset();
+}
+
 /* A delta changes the directory in place: the new snapshot lists the same directory, and the index is copied only when it has to grow. */
 static void test_dir_delta_in_place(void) {
     printf("[TEST] zone directory: a delta changes the directory in place (no copy of the index unless it grows), tombstones are reused...\n");
@@ -1735,6 +1797,7 @@ int main(void) {
     test_reuse_fast_path();
     test_glue_dirty_on_delete();
     test_dir_elements();
+    test_dir_fetch_state();
     test_dir_delta_in_place();
     test_dir_garbage_order();
     test_dir_hidden_and_shared();

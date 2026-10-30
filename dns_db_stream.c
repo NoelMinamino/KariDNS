@@ -44,11 +44,12 @@ static const kdb_tspec_t sp_hello[] = { S(KT_U16, KS_REQ, 0), S(KT_STR, KS_REQ, 
 static const kdb_tspec_t sp_batch_begin[] = { S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 4), S(KT_U64, KS_REQ, 0), S(KT_U64, 0, 0) };
 static const kdb_tspec_t sp_zone_begin[] = {
     S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 2),
-    S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ | KS_MAXV, KDB_ZF_PRESIGNED | KDB_ZF_EXTENDED | KDB_ZF_TINYDNS), S(KT_U64, KS_REQ, 0),
-    S(KT_BYTES, KS_REQ | KS_EXACT, KDB_DIGEST_LEN), S(KT_TEXT, 0, 65535), S(KT_STR, KS_NE, 255) };
+    S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ | KS_MAXV, KDB_ZF_PRESIGNED | KDB_ZF_EXTENDED | KDB_ZF_TINYDNS | KDB_ZF_SUMMARY), S(KT_U64, KS_REQ, 0),
+    S(KT_BYTES, KS_REQ | KS_EXACT, KDB_DIGEST_LEN), S(KT_TEXT, 0, 65535), S(KT_STR, KS_NE, 255), S(KT_U64, 0, 0),
+    S(KT_U32, 0, 0), S(KT_U32, 0, 0), S(KT_U32, 0, 0) };
 static const kdb_tspec_t sp_zone_end[] = { S(KT_U64, KS_REQ, 0) };
 static const kdb_tspec_t sp_zone_abort[] = { S(KT_STR, KS_REQ, 255) };
-static const kdb_tspec_t sp_zone_failed[] = { S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0), S(KT_STR, KS_REQ, 255) };
+static const kdb_tspec_t sp_zone_failed[] = { S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0), S(KT_STR, KS_REQ, 255), S(KT_U64, 0, 0) };
 static const kdb_tspec_t sp_zone_delete[] = { S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0) };
 static const kdb_tspec_t sp_profile[] = { S(KT_STR, KS_REQ | KS_NE, 255), S(KT_TEXT, KS_REQ, 65535) };
 static const kdb_tspec_t sp_batch_end[] = { S(KT_U64, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0) };
@@ -85,7 +86,7 @@ static const kdb_tspec_t sp_reload_req[] = {
 TDEF(td_reload_req, "RELOAD_REQ", sp_reload_req);
 static const kdb_tspec_t sp_inv_entry[] = {
     S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0), S(KT_U32, KS_REQ, 0),
-    S(KT_BYTES, KS_REQ | KS_EXACT, KDB_DIGEST_LEN) };
+    S(KT_BYTES, KS_EXACT, KDB_DIGEST_LEN), S(KT_U8, KS_MAXV, 1) };
 TDEF(td_inv_entry, "INVENTORY.ENTRY", sp_inv_entry);
 static const kdb_tspec_t sp_inventory[] = { { KT_NEST, 0, 65535, &td_inv_entry } };
 TDEF(td_inventory, "INVENTORY", sp_inventory);
@@ -98,6 +99,10 @@ static const kdb_tspec_t sp_batch_result[] = {
     S(KT_U64, KS_REQ, 0), S(KT_BYTES, KS_MUL8, 2048), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0),
     S(KT_U32, KS_REQ, 0) };
 TDEF(td_batch_result, "BATCH_RESULT", sp_batch_result);
+static const kdb_tspec_t sp_fetch_req[] = {
+    S(KT_U64, KS_REQ, 0), S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_FETCH_PRIO_N - 1),
+    S(KT_U8, KS_REQ | KS_MAXV, KDB_FETCH_SUMMARY), S(KT_NAME, 0, 0), S(KT_NAME, 0, 0) };
+TDEF(td_fetch_req, "FETCH_REQ", sp_fetch_req);
 
 _Static_assert(sizeof(sp_zone_begin) / sizeof(sp_zone_begin[0]) <= KDB_MAX_TAGS, "kdb_val_t arrays are KDB_MAX_TAGS long");
 _Static_assert(sizeof(sp_cfg_view) / sizeof(sp_cfg_view[0]) <= KDB_MAX_TAGS, "kdb_val_t arrays are KDB_MAX_TAGS long");
@@ -128,6 +133,7 @@ static const kdb_mdef_t mdefs[] = {
     { KDB_T_INVENTORY_END, "INVENTORY_END", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_inventory_end },
     { KDB_T_ZONE_RESULT, "ZONE_RESULT", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_zone_result },
     { KDB_T_BATCH_RESULT, "BATCH_RESULT", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_batch_result },
+    { KDB_T_FETCH_REQ, "FETCH_REQ", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_fetch_req },
 };
 #define NMDEFS (sizeof(mdefs) / sizeof(mdefs[0]))
 
@@ -339,6 +345,20 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         memcpy(z->digest, V(8).p, KDB_DIGEST_LEN);
         z->settings = gstr(&V(9));
         z->profile = gstr(&V(10));
+        if (V(11).present) {
+            if (V(11).u == 0) FAIL(why, wl, KDB_E_RANGE, "ZONE_BEGIN: request id 0");
+            z->request_id = V(11).u;
+        }
+        if ((z->flags & KDB_ZF_SUMMARY) && z->zone_kind != KDB_ZK_PRIMARY)
+            FAIL(why, wl, KDB_E_RANGE, "ZONE_BEGIN: the summary flag on a zone that is not a primary");
+        if (V(12).present != V(13).present || V(12).present != V(14).present)
+            FAIL(why, wl, KDB_E_TLV_MISSING, "ZONE_BEGIN: the SOA timers (tags 12, 13, 14) come all together or not at all");
+        if (V(12).present) {
+            z->has_soa_timers = true;
+            z->soa_refresh = (uint32_t)V(12).u;
+            z->soa_retry = (uint32_t)V(13).u;
+            z->soa_expire = (uint32_t)V(14).u;
+        }
         break;
     }
     case KDB_T_ZONE_END:
@@ -352,6 +372,10 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         gname(m->u.zone_failed.name, &V(2));
         m->u.zone_failed.source_id = (int64_t)V(3).u;
         m->u.zone_failed.reason = gstr(&V(4));
+        if (V(5).present) {
+            if (V(5).u == 0) FAIL(why, wl, KDB_E_RANGE, "ZONE_FAILED: request id 0");
+            m->u.zone_failed.request_id = V(5).u;
+        }
         break;
     case KDB_T_ZONE_DELETE:
         m->u.zone_delete.view = (uint16_t)V(1).u;
@@ -396,11 +420,35 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         if (hz) { gname(r->zone, &V(4)); r->has_zone = true; }
         break;
     }
-    case KDB_T_INVENTORY:
+    case KDB_T_INVENTORY: {
         m->u.inventory.n_entries = nrep;
         m->u.inventory.body = fr->body;
         m->u.inventory.body_len = fr->len;
+        /* the one rule the tag table cannot say: a resident zone has its digest (the iterator ends at an entry that does not) */
+        kdb_iter_t it;
+        kdb_inventory_entry_t en;
+        uint32_t k = 0;
+        kdb_inventory_entries(m, &it);
+        while (kdb_inventory_entries_next(&it, &en)) k++;
+        if (k != nrep) FAIL(why, wl, KDB_E_TLV_MISSING, "INVENTORY.ENTRY: a resident zone needs its digest (tag 5)");
         break;
+    }
+    case KDB_T_FETCH_REQ: {
+        kdb_fetch_req_t *r = &m->u.fetch_req;
+        r->request_id = V(1).u;
+        if (r->request_id == 0) FAIL(why, wl, KDB_E_RANGE, "FETCH_REQ: request id 0");
+        r->view = (uint16_t)V(2).u;
+        gname(r->name, &V(3));
+        r->priority = (uint8_t)V(4).u;
+        r->mode = (uint8_t)V(5).u;
+        if (V(6).present != V(7).present) FAIL(why, wl, KDB_E_TLV_MISSING, "FETCH_REQ: a range needs both range_lo and range_hi");
+        if (V(6).present) {
+            r->has_range = true;
+            gname(r->range_lo, &V(6));
+            gname(r->range_hi, &V(7));
+        }
+        break;
+    }
     case KDB_T_INVENTORY_END:
         m->u.inventory_end.last_change_seq = V(1).u;
         m->u.inventory_end.n_zones = V(2).u;
@@ -506,7 +554,13 @@ bool kdb_inventory_entries_next(kdb_iter_t *it, kdb_inventory_entry_t *o) {
     gname(o->name, &V(2));
     o->source_id = (int64_t)V(3).u;
     o->serial = (uint32_t)V(4).u;
-    memcpy(o->digest, V(5).p, KDB_DIGEST_LEN);
+    o->resident = !V(6).present || V(6).u != 0;
+    if (o->resident && !V(5).present) {          /* tlv_parse() cannot say "required unless tag 6 is 0" */
+        it->left = 0;
+        return false;
+    }
+    if (V(5).present) memcpy(o->digest, V(5).p, KDB_DIGEST_LEN);
+    else memset(o->digest, 0, KDB_DIGEST_LEN);
     return true;
 }
 
@@ -541,10 +595,12 @@ kdb_rc_t kdb_framer_next(kdb_framer_t *f, kdb_frame_t *out) {
     if (f->phase == PH_HDR) {
         size_t take = KDB_HEADER_LEN - f->hdr_have;
         if (take > f->in_len) take = f->in_len;
-        if (take) memcpy(f->hdr + f->hdr_have, f->in, take);
+        if (take) {                                   /* (no pointer arithmetic on an input that was never offered: next() may be called first) */
+            memcpy(f->hdr + f->hdr_have, f->in, take);
+            f->in += take;
+            f->in_len -= take;
+        }
         f->hdr_have += take;
-        f->in += take;
-        f->in_len -= take;
         if (f->hdr_have < KDB_HEADER_LEN) return KDB_MORE;
         if (memcmp(f->hdr, KDB_MAGIC, 4) != 0) FRFAIL(f, KDB_E_MAGIC, "bad magic");
         uint16_t type = be16(f->hdr + 4), flags = be16(f->hdr + 6);
@@ -562,10 +618,12 @@ kdb_rc_t kdb_framer_next(kdb_framer_t *f, kdb_frame_t *out) {
     /* PH_BODY */
     size_t take = f->body_len - f->body_have;
     if (take > f->in_len) take = f->in_len;
-    if (take) memcpy(f->buf + f->body_have, f->in, take);
+    if (take) {
+        memcpy(f->buf + f->body_have, f->in, take);
+        f->in += take;
+        f->in_len -= take;
+    }
     f->body_have += (uint32_t)take;
-    f->in += take;
-    f->in_len -= take;
     if (f->body_have < f->body_len) return KDB_MORE;
     f->phase = PH_DONE;
     out->type = f->type;
@@ -681,7 +739,20 @@ void kdb_sm_init(kdb_sm_t *sm, const kdb_limits_t *lim) {
     sm->state = KDB_S_AWAIT_HELLO;
 }
 
+void kdb_sm_init_fetch(kdb_sm_t *sm, const kdb_limits_t *lim) {
+    kdb_sm_init(sm, lim);
+    sm->fetch = true;
+    sm->state = KDB_S_READY;         /* no HELLO: the first stream has said who the loader is */
+}
+
 static bool sm_legal(const kdb_sm_t *sm, uint16_t t) {
+    if (sm->fetch) {
+        switch (sm->state) {
+        case KDB_S_READY: return t == KDB_T_ZONE_BEGIN || t == KDB_T_ZONE_FAILED || t == KDB_T_PROFILE;
+        case KDB_S_IN_ZONE: return t == KDB_T_ZONE_DATA || t == KDB_T_ZONE_END || t == KDB_T_ZONE_ABORT;
+        default: return false;
+        }
+    }
     switch (sm->state) {
     case KDB_S_AWAIT_HELLO: return t == KDB_T_HELLO;
     case KDB_S_READY:
@@ -727,7 +798,10 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         sm->n_profiles++;
         break;
     case KDB_T_ZONE_FAILED:
+        if (sm->fetch != (m->u.zone_failed.request_id != 0))
+            SMFAIL(sm, KDB_E_STATE, sm->fetch ? "ZONE_FAILED: the fetch stream needs the request id" : "ZONE_FAILED: a request id belongs to the fetch stream");
         sm->n_failed++;
+        if (sm->fetch) sm->n_profiles = 0;       /* (the profiles were for this zone) */
         break;
     case KDB_T_ZONE_DELETE:
         sm->n_deleted++;
@@ -735,7 +809,14 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
     case KDB_T_ZONE_BEGIN: {
         uint64_t n = m->u.zone_begin.rr_count;
         uint8_t zk = m->u.zone_begin.zone_kind;
-        if (zk == KDB_ZK_PRIMARY) {
+        bool summary = (m->u.zone_begin.flags & KDB_ZF_SUMMARY) != 0;
+        if (sm->fetch != (m->u.zone_begin.request_id != 0))
+            SMFAIL(sm, KDB_E_STATE, sm->fetch ? "ZONE_BEGIN: the fetch stream needs the request id" : "ZONE_BEGIN: a request id belongs to the fetch stream");
+        if (summary && !sm->fetch) SMFAIL(sm, KDB_E_STATE, "ZONE_BEGIN: a summary belongs to the fetch stream");
+        sm->zone_req_id = m->u.zone_begin.request_id;
+        if (zk == KDB_ZK_PRIMARY && summary) {
+            if (n != 0) SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: a summary has rr_count 0, not %llu", (unsigned long long)n);
+        } else if (zk == KDB_ZK_PRIMARY) {
             if (n < 2) SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: rr_count %llu, an AXFR has at least two SOAs (RFC 5936 2.2)", (unsigned long long)n);
         } else if (n != 0) {
             /* B7b: a secondary / catalog consumer zone carries no data (the Backend transfers it from the masters in the settings) */
@@ -766,10 +847,12 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         if (m->u.zone_end.rr_count != sm->zone_rr_declared) SMFAIL(sm, KDB_E_COUNT, "ZONE_END: count differs from ZONE_BEGIN");
         if (sm->zone_rr_sum != sm->zone_rr_declared) SMFAIL(sm, KDB_E_COUNT, "ZONE_END: ANCOUNT sum differs from the declared count");
         sm->n_zones++;
-        sm->state = KDB_S_IN_BATCH;
+        if (sm->fetch) sm->n_profiles = 0;
+        sm->state = sm->fetch ? KDB_S_READY : KDB_S_IN_BATCH;
         break;
     case KDB_T_ZONE_ABORT:
-        sm->state = KDB_S_IN_BATCH;
+        if (sm->fetch) sm->n_profiles = 0;
+        sm->state = sm->fetch ? KDB_S_READY : KDB_S_IN_BATCH;
         break;
     case KDB_T_BATCH_END: {
         const kdb_batch_end_t *b = &m->u.batch_end;

@@ -24,7 +24,9 @@
 /* Limit the rights of the two descriptors and start the thread (and the builder threads).  Call before
  * enter_capsicum_sandbox().  stream_fd may be -1 (the loader is not connected yet); ctrl_fd is the Backend end of
  * pair C.  false: could not start. */
-bool db_ingest_start(int stream_fd, int ctrl_fd);
+bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd);
+/* D1a: fetch_fd is the Backend end of the second stream (design 6.1), -1 without one.  The thread also reads the fetch requests the workers push
+ * (dns_park.h) and sends them to the loader on it; what comes back wakes the parked queries. */
 
 /* A new configuration was published: tell the loader (CONFIG with the new generation).  No-op while the thread is
  * not running.  Called by the control thread; never blocks. */

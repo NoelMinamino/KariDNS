@@ -780,6 +780,17 @@ static void test_zone_level(void) {
         CHECK(pdns_soa_serial("a b 4294967295", &s) && s == 4294967295u);
         CHECK(!pdns_soa_serial(NULL, &s) && !pdns_soa_serial("", &s));
     }
+    {   /* D1a: refresh, retry and expire, with the rules of the serial (strict decimal, 32 bits, blanks around) */
+        uint32_t r = 0, t = 0, e = 0;
+        CHECK(pdns_soa_timers("ns1.z.test hostmaster.z.test 2024 3600 600 86400 300", &r, &t, &e) && r == 3600 && t == 600 && e == 86400);
+        CHECK(pdns_soa_timers("  a\tb  1  7200\t3600  1209600  ", &r, &t, &e) && r == 7200 && t == 3600 && e == 1209600);
+        CHECK(pdns_soa_timers("a b 1 4294967295 0 4294967295", &r, &t, &e) && r == 4294967295u && t == 0 && e == 4294967295u);
+        CHECK(pdns_soa_timers("a b 1 2 3 4", NULL, NULL, NULL));                                       /* (only the check) */
+        CHECK(!pdns_soa_timers(NULL, &r, &t, &e) && !pdns_soa_timers("", &r, &t, &e));
+        CHECK(!pdns_soa_timers("a b 1 2 3", &r, &t, &e));                                              /* the expire is missing */
+        CHECK(!pdns_soa_timers("a b 1 2 x 4", &r, &t, &e) && !pdns_soa_timers("a b 1 -2 3 4", &r, &t, &e));
+        CHECK(!pdns_soa_timers("a b 1 4294967296 3 4", &r, &t, &e));                                   /* above 32 bits */
+    }
     {   /* the zone's only SOA has a serial the DB column could not hold in a 32-bit field */
         z = pdns_zone_new("z.test", NULL);
         db_record_row_t bad = R(50, "z.test", "SOA", "ns1.z.test hostmaster.z.test 4294967296 1 2 3 4", 3600, 0);
@@ -1112,7 +1123,7 @@ static void test_kdb(void) {
 
         /* determinism: the same rows give the same bytes */
         rt_buf_t b1 = {0}, b2 = {0};
-        pdns_kdb_params_t kp = { 1, 9, KDB_ZK_PRIMARY, "prof", NULL, NULL, NULL };
+        pdns_kdb_params_t kp = { 1, 9, KDB_ZK_PRIMARY, "prof", NULL, NULL, NULL, 0 };
         char err[200];
         CHECK(pdns_zone_encode_kdb(z, &kp, rt_emit, &b1, err, sizeof(err)) == 0);
         pdns_zone_t *z2 = build(rows, n, NULL, 0, NULL);
@@ -1132,7 +1143,7 @@ static void test_kdb(void) {
         /* B6a: the gate sees the serial and the digest ZONE_BEGIN carries, and can keep the zone back (returns 1, emits nothing) */
         {
             gate_seen_t gs = { 0, 0, { 0 }, 0 };
-            pdns_kdb_params_t gp = { 1, 9, KDB_ZK_PRIMARY, "prof", test_gate, &gs, NULL };
+            pdns_kdb_params_t gp = { 1, 9, KDB_ZK_PRIMARY, "prof", test_gate, &gs, NULL, 0 };
             rt_buf_t b4 = {0};
             gs.answer = 1;
             CHECK(pdns_zone_encode_kdb(z, &gp, rt_emit, &b4, err, sizeof(err)) == 1);
@@ -1141,11 +1152,11 @@ static void test_kdb(void) {
             CHECK(memcmp(gs.digest, info.digest, KDB_DIGEST_LEN) != 0);
             uint8_t with_prof[KDB_DIGEST_LEN];
             memcpy(with_prof, gs.digest, KDB_DIGEST_LEN);
-            pdns_kdb_params_t gn = { 1, 9, KDB_ZK_PRIMARY, "", test_gate, &gs, NULL };
+            pdns_kdb_params_t gn = { 1, 9, KDB_ZK_PRIMARY, "", test_gate, &gs, NULL, 0 };
             CHECK(pdns_zone_encode_kdb(z, &gn, rt_emit, &b4, err, sizeof(err)) == 1);
             CHECK(memcmp(gs.digest, info.digest, KDB_DIGEST_LEN) == 0);
             /* ... and so is the text of the profile: editing a profile makes every zone that names it new */
-            pdns_kdb_params_t gt = { 1, 9, KDB_ZK_PRIMARY, "prof", test_gate, &gs, "allow-transfer { 192.0.2.1; };" };
+            pdns_kdb_params_t gt = { 1, 9, KDB_ZK_PRIMARY, "prof", test_gate, &gs, "allow-transfer { 192.0.2.1; };", 0 };
             CHECK(pdns_zone_encode_kdb(z, &gt, rt_emit, &b4, err, sizeof(err)) == 1);
             CHECK(memcmp(gs.digest, with_prof, KDB_DIGEST_LEN) != 0 && memcmp(gs.digest, info.digest, KDB_DIGEST_LEN) != 0);
             uint8_t with_text[KDB_DIGEST_LEN];
@@ -1168,7 +1179,7 @@ static void test_kdb(void) {
         pdns_zone_t *za = build(NULL, 0, NULL, 0, NULL), *zb = build(NULL, 0, m1, 1, NULL), *zc = build(NULL, 0, m2, 1, NULL),
                     *zd = build(NULL, 0, m1, 1, NULL);
         gate_seen_t ga = { 0, 0, { 0 }, 1 }, gb = ga, gc = ga, gd = ga;
-        pdns_kdb_params_t pa = { 0, 1, KDB_ZK_PRIMARY, NULL, test_gate, &ga, NULL }, pb = pa, pc = pa, pd = pa;
+        pdns_kdb_params_t pa = { 0, 1, KDB_ZK_PRIMARY, NULL, test_gate, &ga, NULL, 0 }, pb = pa, pc = pa, pd = pa;
         pb.gate_ud = &gb; pc.gate_ud = &gc; pd.gate_ud = &gd;
         char err[200];
         rt_buf_t nb = {0};
@@ -1228,7 +1239,7 @@ static void test_kdb(void) {
         z = build(NULL, 0, m2, 2, NULL);                              /* B5: NSEC3PARAM without any RRSIG(NSEC3) cannot be rebuilt */
         CHECK(z->failed);
         CHECK_HAS(z->error, "no RRSIG(NSEC3) rows");
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL }, rt_emit, &b, err, sizeof(err)) != 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 }, rt_emit, &b, err, sizeof(err)) != 0);
         pdns_zone_free(z);
         db_meta_row_t m3[] = { M("PRESIGNED", "1") };               /* presigned without NSEC3PARAM: encoded, flag set */
         z = build(NULL, 0, m3, 1, NULL);
@@ -1240,13 +1251,13 @@ static void test_kdb(void) {
         /* a failed zone is not encoded */
         db_record_row_t bad[1] = { R(2, "x.z.test", "A", "nope", 300, 0) };
         z = build(bad, 1, NULL, 0, NULL);
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL }, rt_emit, &b, err, sizeof(err)) != 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 }, rt_emit, &b, err, sizeof(err)) != 0);
         pdns_zone_free(z);
         /* size limit */
         pdns_opts_t o = { 0, 0, 0, 100 };
         z = build(NULL, 0, NULL, 0, &o);
         CHECK(!z->failed);
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL }, rt_emit, &b, err, sizeof(err)) != 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 }, rt_emit, &b, err, sizeof(err)) != 0);
         CHECK_HAS(err, "limit");
         pdns_zone_free(z);
         free(b.buf);
@@ -1257,7 +1268,7 @@ static void test_kdb(void) {
         pdns_zone_t *z = build(NULL, 0, m, 2, NULL);
         rt_buf_t b = {0};
         char err[200];
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){5, 42, KDB_ZK_SECONDARY, NULL, NULL, NULL, NULL }, rt_emit, &b, err, sizeof(err)) == 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){5, 42, KDB_ZK_SECONDARY, NULL, NULL, NULL, NULL, 0 }, rt_emit, &b, err, sizeof(err)) == 0);
         static uint8_t fb[KDB_MAX_BODY];
         kdb_framer_t f;
         kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
@@ -1288,7 +1299,7 @@ static pdns_zone_t *build_sec(uint8_t kind, const char *master, const db_meta_ro
 
 static void sec_digest(const pdns_zone_t *z, uint8_t out[KDB_DIGEST_LEN], uint32_t *serial) {
     gate_seen_t g = { 0, 0, { 0 }, 1 };
-    pdns_kdb_params_t p = { 0, 7, KDB_ZK_PRIMARY, NULL, test_gate, &g, NULL };
+    pdns_kdb_params_t p = { 0, 7, KDB_ZK_PRIMARY, NULL, test_gate, &g, NULL, 0 };
     char err[200];
     rt_buf_t nb = {0};
     CHECK(pdns_zone_encode_kdb(z, &p, rt_emit, &nb, err, sizeof(err)) == 1 && g.calls == 1);
@@ -1356,7 +1367,7 @@ static void test_secondary(void) {
         }
         /* KDB1: ZONE_BEGIN (catalog kind, serial 0, flags 0, rr_count 0, the settings, the profile) and ZONE_END, nothing between */
         rt_buf_t b = {0};
-        pdns_kdb_params_t kp = { 3, 77, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL };       /* the zone's own kind wins */
+        pdns_kdb_params_t kp = { 3, 77, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 };       /* the zone's own kind wins */
         CHECK(pdns_zone_encode_kdb(z, &kp, rt_emit, &b, err, sizeof(err)) == 0 && b.n_msgs == 2);
         static uint8_t fb[KDB_MAX_BODY];
         kdb_framer_t f;
@@ -1459,7 +1470,7 @@ static void test_kdb_name_case(void) {
     CHECK(fa.count == N);
     rt_buf_t b = {0};
     char err[200];
-    if (!z->failed) CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL }, rt_emit, &b, err, sizeof(err)) == 0);
+    if (!z->failed) CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 }, rt_emit, &b, err, sizeof(err)) == 0);
     for (size_t i = 0; i < N && !z->failed && i < fa.count; i++) {
         const dns_record_t *dbrec = NULL;
         for (size_t k = 0; k < z->arena.count; k++)

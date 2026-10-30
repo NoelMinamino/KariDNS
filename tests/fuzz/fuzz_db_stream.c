@@ -6,6 +6,7 @@
  *   bit 6      start the state machine in READY (skips the HELLO the fuzzer would have to find)
  *   bit 5      tiny zone limits (6 records, 200 bytes) so the limit paths are reachable
  *   bit 4      (install run only) start inside a batch, so a stream of ZONE_BEGIN .. ZONE_END is a valid input
+ *   bit 3      D1a: the state machine of the fetch stream (kdb_sm_init_fetch(): request ids, summaries, no batches)
  * The stream is run twice against the loader -> Backend side (whole buffer and the chosen chunking) and must
  * give the same result; once against the Backend -> loader side with the decoder and the entry iterators; and once
  * more through the install path of the Backend (beta design 8.5, milestone B4b): every ZONE_BEGIN / ZONE_DATA /
@@ -47,7 +48,8 @@ static void run_loader(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, ru
     kdb_limits_t lim = { KDB_DEFAULT_MAX_ZONE_RECORDS, KDB_DEFAULT_MAX_ZONE_BYTES, 3 };
     if (sel & 0x20) { lim.max_zone_records = 6; lim.max_zone_bytes = 200; }
     kdb_framer_init(&f, KDB_FROM_LOADER, g_buf, sizeof(g_buf));
-    kdb_sm_init(&sm, &lim);
+    if (sel & 0x08) kdb_sm_init_fetch(&sm, &lim);         /* D1a: the fetch stream (starts in READY) */
+    else kdb_sm_init(&sm, &lim);
     if (sel & 0x40) sm.state = KDB_S_READY;
     memset(r, 0, sizeof(*r));
     r->sum = 1469598103934665603ull;
@@ -66,7 +68,16 @@ static void run_loader(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, ru
             r->nframes++;
             mix(&r->sum, fr.type);
             mix(&r->sum, fr.len);
-            if (fr.type == KDB_T_ZONE_BEGIN) mix(&r->sum, m.u.zone_begin.rr_count + strlen(m.u.zone_begin.name));
+            if (fr.type == KDB_T_ZONE_BEGIN) {
+                mix(&r->sum, m.u.zone_begin.rr_count + strlen(m.u.zone_begin.name) + m.u.zone_begin.request_id);
+                /* D1a: what the machine promised about the fetch stream */
+                if ((sm.fetch != (m.u.zone_begin.request_id != 0))) abort();
+                if ((m.u.zone_begin.flags & KDB_ZF_SUMMARY) && (!sm.fetch || m.u.zone_begin.rr_count != 0 || m.u.zone_begin.zone_kind != KDB_ZK_PRIMARY)) abort();
+            }
+            if (fr.type == KDB_T_ZONE_FAILED) {
+                mix(&r->sum, m.u.zone_failed.request_id);
+                if (sm.fetch != (m.u.zone_failed.request_id != 0)) abort();
+            }
             if (fr.type == KDB_T_ZONE_DATA) mix(&r->sum, m.u.zone_data.ancount);
             if (fr.type == KDB_T_PROFILE) mix(&r->sum, m.u.profile.settings.len);
             if (fr.type == KDB_T_AUTO_STATUS) {            /* B9: the iterator sees exactly the validated entries */
@@ -121,6 +132,10 @@ static void run_backend(const uint8_t *p, size_t n) {
                 k++;
             }
             if (k != m.u.inventory.n_entries) abort();
+        } else if (fr.type == KDB_T_FETCH_REQ) {         /* D1a */
+            const kdb_fetch_req_t *q = &m.u.fetch_req;
+            if (q->request_id == 0 || q->view >= 3 || strlen(q->name) == 0 || q->priority >= KDB_FETCH_PRIO_N || q->mode > KDB_FETCH_SUMMARY) abort();
+            if (q->has_range && (strlen(q->range_lo) == 0 || strlen(q->range_hi) == 0)) abort();
         }
     }
 }
@@ -177,14 +192,18 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
     kdb_limits_t lim = { KDB_DEFAULT_MAX_ZONE_RECORDS, KDB_DEFAULT_MAX_ZONE_BYTES, 3 };
     if (sel & 0x20) { lim.max_zone_records = 6; lim.max_zone_bytes = 200; }
     kdb_framer_init(&f, KDB_FROM_LOADER, g_buf, sizeof(g_buf));
-    kdb_sm_init(&sm, &lim);
-    sm.state = (sel & 0x10) ? KDB_S_IN_BATCH : KDB_S_READY;   /* bit 4: start inside a batch (zones right away) */
+    if (sel & 0x08) {
+        kdb_sm_init_fetch(&sm, &lim);                          /* D1a: the fetch stream: zones from READY */
+    } else {
+        kdb_sm_init(&sm, &lim);
+        sm.state = (sel & 0x10) ? KDB_S_IN_BATCH : KDB_S_READY;   /* bit 4: start inside a batch (zones right away) */
+    }
     if (kdb_framer_feed(&f, p, n) != KDB_OK) return;
     db_zone_build_t *b = NULL;
     char zone[DNS_NAME_TEXT_SIZE] = "";
     char view[8] = "default";
     int64_t source_id = 0;
-    bool failed = false;
+    bool failed = false, summary = false;
     char why[KDB_REASON_LEN];
     zone_ext_shared_t *zsh = NULL;
     uint8_t skind = KDB_ZK_PRIMARY;
@@ -203,10 +222,12 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
             zone_ext_shared_unref(zsh);
             zsh = fuzz_settings(&m.u.zone_begin);
             skind = m.u.zone_begin.zone_kind;
-            b = (skind == KDB_ZK_PRIMARY) ? db_zone_build_new(zone, m.u.zone_begin.rr_count, m.u.zone_begin.flags) : NULL;
+            summary = (m.u.zone_begin.flags & KDB_ZF_SUMMARY) != 0;           /* D1a: a summary has no data and installs nothing here */
+            b = (skind == KDB_ZK_PRIMARY && !summary) ? db_zone_build_new(zone, m.u.zone_begin.rr_count, m.u.zone_begin.flags) : NULL;
             if (b) db_zone_build_set_serial(b, m.u.zone_begin.serial);       /* as the ingest thread does (B8t-2) */
             /* B7b: a secondary zone needs masters in its settings and has no data (job_execute_secondary()) */
-            if (skind == KDB_ZK_PRIMARY ? !b : !(zsh && zsh->ext.masters_count > 0)) failed = true;
+            if (summary) failed = false;
+            else if (skind == KDB_ZK_PRIMARY ? !b : !(zsh && zsh->ext.masters_count > 0)) failed = true;
             break;
         case KDB_T_PROFILE:
             g_prof_len = m.u.profile.settings.len < sizeof(g_prof) ? m.u.profile.settings.len : sizeof(g_prof);
@@ -261,6 +282,7 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
             } else if (failed) {
                 (void)dbreg_reject(view, zone, source_id, "rejected");
             }
+            summary = false;
             db_zone_build_free(b);
             b = NULL;
             break;

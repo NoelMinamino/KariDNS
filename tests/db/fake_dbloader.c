@@ -33,7 +33,7 @@
  *   ext-bad-locdef   a malformed TINYDNS_LOCDEF                                          -> zone rejected
  *   ext-bad-wrap     a TINYDNS_WRAP shorter than its fixed part                          -> zone rejected
  *   ext-long-tag     a LOC_STATE tag of 70 octets                                        -> zone rejected
- *   ext-flag-bit     a reserved zone flag bit                                            -> protocol error
+ *   ext-flag-bit     a reserved zone flag bit (16: bit 3 is the fetch summary since D1a)                                          -> protocol error
  *   ext-ok           state records and the extended + tinydns flags                      -> applied
  *   non-in-class     an RR of class CH                                                  -> zone rejected
  *   again            ok1.test twice in one batch (the second replaces the first)       -> both applied
@@ -339,7 +339,7 @@ static void bad_zone(int fd, const char *mode) {
         } else if (strcmp(mode, "ext-long-tag") == 0) {
             dm_rr(&m, z, 65401, 65302, longtag, sizeof(longtag));
         } else if (strcmp(mode, "ext-flag-bit") == 0) {           /* a reserved zone flag: protocol error */
-            flags = 8; declared = 2;
+            flags = 16; declared = 2;
         } else {                                                  /* ext-ok: the state records and the tinydns flag are accepted */
             dm_rr(&m, z, 65401, 65302, lan, 3); dm_a(&m, "www.bad.test", 1);
             dm_rr(&m, z, 65401, 65302, (const uint8_t *)"", 0);

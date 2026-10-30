@@ -681,10 +681,10 @@ static void test_tlv_rejects(void) {
     {   /* reserved zone flag bit */
         uint8_t dig[KDB_DIGEST_LEN] = { 0 };
         kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, ZN); kdb_enc_i64(&e, 3, 1); kdb_enc_u8(&e, 4, 0); kdb_enc_u32(&e, 5, 1);
-        kdb_enc_u32(&e, 6, 8); kdb_enc_u64(&e, 7, 4); kdb_enc_bytes(&e, 8, dig, sizeof(dig));
+        kdb_enc_u32(&e, 6, 16); kdb_enc_u64(&e, 7, 4); kdb_enc_bytes(&e, 8, dig, sizeof(dig));
     }
     kdb_enc_end(&e);
-    CHECK_RC("reserved zone flag (bit 3; bit 2 is the tinydns flag since B8)", send_enc(KDB_S_IN_BATCH, &e), KDB_E_RANGE);
+    CHECK_RC("reserved zone flag (bit 4; bit 2 is the tinydns flag since B8, bit 3 the fetch summary of D1a)", send_enc(KDB_S_IN_BATCH, &e), KDB_E_RANGE);
     kdb_enc_free(&e);
 }
 
@@ -1240,6 +1240,8 @@ static int write_seed(const char *dir, const char *name, uint8_t selector, const
     return 0;
 }
 
+static int gen_corpus_fetch(const char *dir);
+
 static int gen_corpus(const char *dir) {
     kdb_enc_t e;
     kdb_enc_init(&e);
@@ -1283,7 +1285,7 @@ static int gen_corpus(const char *dir) {
     m_batch_begin(&e, 2); m_batch_end(&e, 2, 0, 0, 0); m_auto_status(&e, 3); m_batch_begin(&e, 3); m_batch_end(&e, 3, 0, 0, 0);
     rc |= write_seed(dir, "seed_loader_auto_status.bin", 0xC0, &e);
     kdb_enc_free(&e);
-    return rc;
+    return rc | gen_corpus_fetch(dir);
 }
 
 /* B6a: BATCH_BEGIN tag 4 request_id (optional u64): the batch answers that RELOAD_REQ */
@@ -1498,6 +1500,306 @@ static void test_checkproto(void) {
     CHECK_STR(p, "ok??[31m??z");
 }
 
+/* ---------------------------------------------------------------- the fetch stream (D1a, design 6.1) */
+static void fz_begin(kdb_enc_t *e, uint16_t view, const char *name, uint64_t rr, uint32_t flags, uint8_t kind, uint64_t req) {
+    uint8_t dig[KDB_DIGEST_LEN];
+    memset(dig, (flags & KDB_ZF_SUMMARY) ? 0 : 0x6B, sizeof(dig));
+    kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
+    kdb_enc_u16(e, 1, view); kdb_enc_name(e, 2, name); kdb_enc_i64(e, 3, 5); kdb_enc_u8(e, 4, kind);
+    kdb_enc_u32(e, 5, 77); kdb_enc_u32(e, 6, flags); kdb_enc_u64(e, 7, rr); kdb_enc_bytes(e, 8, dig, sizeof(dig));
+    if (kind != KDB_ZK_PRIMARY) kdb_enc_str(e, 9, "masters { 192.0.2.1; };");
+    if (req) kdb_enc_u64(e, 11, req);
+    kdb_enc_end(e);
+}
+static void fz_failed(kdb_enc_t *e, uint64_t req) {
+    kdb_enc_begin(e, KDB_T_ZONE_FAILED);
+    kdb_enc_u16(e, 1, 2); kdb_enc_name(e, 2, "failed.test."); kdb_enc_i64(e, 3, 7); kdb_enc_str(e, 4, "busy");
+    if (req) kdb_enc_u64(e, 5, req);
+    kdb_enc_end(e);
+}
+static void fz_fetch_req(kdb_enc_t *e, uint64_t id, uint16_t view, const char *name, uint8_t prio, uint8_t mode) {
+    kdb_enc_begin(e, KDB_T_FETCH_REQ);
+    kdb_enc_u64(e, 1, id); kdb_enc_u16(e, 2, view); kdb_enc_name(e, 3, name); kdb_enc_u8(e, 4, prio); kdb_enc_u8(e, 5, mode);
+}
+static void sess_init_fetch(sess_t *s, const kdb_limits_t *lim) {
+    memset(s, 0, sizeof(*s));
+    kdb_framer_init(&s->f, KDB_FROM_LOADER, g_rbuf, sizeof(g_rbuf));
+    kdb_sm_init_fetch(&s->sm, lim ? lim : &LIM);
+}
+/* the bytes of e into a fresh fetch session that has been brought to `st` (READY, or IN_ZONE after a primary ZONE_BEGIN) */
+static kdb_rc_t fetch_send(kdb_state_t st, const kdb_enc_t *e, char *reason) {
+    CHECK(!e->err);
+    sess_t *s = malloc(sizeof(*s));
+    sess_init_fetch(s, NULL);
+    if (st == KDB_S_IN_ZONE) {
+        kdb_enc_t p;
+        kdb_enc_init(&p);
+        fz_begin(&p, 1, ZN, 10, 0, KDB_ZK_PRIMARY, 9);
+        CHECK_RC("prefix", sess_feed(s, p.buf, p.len, 0), KDB_OK);
+        kdb_enc_free(&p);
+    }
+    CHECK(s->sm.state == st);
+    kdb_rc_t rc = sess_feed(s, e->buf, e->len, 0);
+    if (reason) snprintf(reason, KDB_REASON_LEN, "%s", s->reason);
+    free(s);
+    return rc;
+}
+/* decode one Backend -> loader frame */
+static kdb_rc_t dec_backend(const kdb_enc_t *e, kdb_msg_t *m, char *why) {
+    kdb_framer_t f;
+    kdb_frame_t fr;
+    kdb_framer_init(&f, KDB_FROM_BACKEND, g_rbuf, sizeof(g_rbuf));
+    kdb_rc_t rc = kdb_framer_feed(&f, e->buf, e->len);
+    if (rc == KDB_OK) rc = kdb_framer_next(&f, &fr);
+    if (rc != KDB_OK) { snprintf(why, KDB_REASON_LEN, "%s", f.reason); return rc; }
+    return kdb_decode(&fr, NVIEWS, m, why, KDB_REASON_LEN);
+}
+
+static void test_fetch_req_and_inventory(void) {
+    printf("[FETCH_REQ and the INVENTORY resident flag]\n");
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_msg_t m;
+    char why[KDB_REASON_LEN];
+    /* FETCH_REQ: every field comes back */
+    fz_fetch_req(&e, 0x0102030405060708ull, 2, "fetch.test.", KDB_FETCH_PRIO_WARM, KDB_FETCH_SUMMARY);
+    kdb_enc_end(&e);
+    CHECK_RC("FETCH_REQ", dec_backend(&e, &m, why), KDB_OK);
+    CHECK(m.type == KDB_T_FETCH_REQ && m.u.fetch_req.request_id == 0x0102030405060708ull && m.u.fetch_req.view == 2 &&
+          strcmp(m.u.fetch_req.name, "fetch.test.") == 0 && m.u.fetch_req.priority == KDB_FETCH_PRIO_WARM &&
+          m.u.fetch_req.mode == KDB_FETCH_SUMMARY && !m.u.fetch_req.has_range);
+    CHECK_STR(kdb_type_name(KDB_T_FETCH_REQ), "FETCH_REQ");
+    /* with a range (both ends) */
+    kdb_enc_reset(&e); fz_fetch_req(&e, 3, 0, ZN, 0, 0); kdb_enc_name(&e, 6, "a.example.test."); kdb_enc_name(&e, 7, "m.example.test."); kdb_enc_end(&e);
+    CHECK_RC("FETCH_REQ with a range", dec_backend(&e, &m, why), KDB_OK);
+    CHECK(m.u.fetch_req.has_range && strcmp(m.u.fetch_req.range_lo, "a.example.test.") == 0 && strcmp(m.u.fetch_req.range_hi, "m.example.test.") == 0);
+    /* rejected: one end of a range, request id 0, priority 3, mode 2, view out of range, unknown tag 8, a missing field, a bad name, a duplicate */
+    kdb_enc_reset(&e); fz_fetch_req(&e, 3, 0, ZN, 0, 0); kdb_enc_name(&e, 6, "a.test."); kdb_enc_end(&e);
+    CHECK_RC("range_lo alone", dec_backend(&e, &m, why), KDB_E_TLV_MISSING);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 3, 0, ZN, 0, 0); kdb_enc_name(&e, 7, "a.test."); kdb_enc_end(&e);
+    CHECK_RC("range_hi alone", dec_backend(&e, &m, why), KDB_E_TLV_MISSING);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 0, 0, ZN, 0, 0); kdb_enc_end(&e);
+    CHECK_RC("request id 0", dec_backend(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, ZN, KDB_FETCH_PRIO_N, 0); kdb_enc_end(&e);
+    CHECK_RC("priority 3", dec_backend(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, ZN, 0, 2); kdb_enc_end(&e);
+    CHECK_RC("mode 2", dec_backend(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 1, NVIEWS, ZN, 0, 0); kdb_enc_end(&e);
+    CHECK_RC("view out of range", dec_backend(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, ZN, 0, 0); kdb_enc_u8(&e, 8, 1); kdb_enc_end(&e);
+    CHECK_RC("unknown tag 8", dec_backend(&e, &m, why), KDB_E_TLV_UNKNOWN);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, ZN, 0, 0); kdb_enc_u8(&e, 5, 1); kdb_enc_end(&e);
+    CHECK_RC("duplicate tag", dec_backend(&e, &m, why), KDB_E_TLV_DUP);
+    kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, "not canonical", 0, 0); kdb_enc_end(&e);
+    CHECK_RC("bad name", dec_backend(&e, &m, why), KDB_E_TLV_NAME);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_FETCH_REQ); kdb_enc_u64(&e, 1, 1); kdb_enc_u16(&e, 2, 0); kdb_enc_name(&e, 3, ZN); kdb_enc_u8(&e, 4, 0); kdb_enc_end(&e);
+    CHECK_RC("mode missing", dec_backend(&e, &m, why), KDB_E_TLV_MISSING);
+    /* the loader cannot send it, and the Backend cannot receive a loader message on this direction */
+    kdb_enc_reset(&e); fz_fetch_req(&e, 1, 0, ZN, 0, 0); kdb_enc_end(&e);
+    CHECK_RC("FETCH_REQ from the loader", send_in(KDB_S_READY, e.buf, e.len, NULL, NULL), KDB_E_TYPE);
+
+    /* INVENTORY: resident (explicit or by default) needs its digest, a non-resident entry has none */
+    uint8_t dig[KDB_DIGEST_LEN];
+    memset(dig, 0x33, sizeof(dig));
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_INVENTORY);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "res.test."); kdb_enc_i64(&e, 3, 1); kdb_enc_u32(&e, 4, 10);
+    kdb_enc_bytes(&e, 5, dig, sizeof(dig)); kdb_enc_u8(&e, 6, 1); kdb_enc_nest_end(&e);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 1); kdb_enc_name(&e, 2, "cold.test."); kdb_enc_i64(&e, 3, 2); kdb_enc_u32(&e, 4, 20);
+    kdb_enc_u8(&e, 6, 0); kdb_enc_nest_end(&e);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 2); kdb_enc_name(&e, 2, "dflt.test."); kdb_enc_i64(&e, 3, 3); kdb_enc_u32(&e, 4, 30);
+    kdb_enc_bytes(&e, 5, dig, sizeof(dig)); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("INVENTORY with a cold entry", dec_backend(&e, &m, why), KDB_OK);
+    CHECK(m.u.inventory.n_entries == 3);
+    kdb_iter_t it;
+    kdb_inventory_entry_t en;
+    kdb_inventory_entries(&m, &it);
+    CHECK(kdb_inventory_entries_next(&it, &en) && en.resident && strcmp(en.name, "res.test.") == 0 && en.digest[0] == 0x33);
+    CHECK(kdb_inventory_entries_next(&it, &en) && !en.resident && strcmp(en.name, "cold.test.") == 0 && en.digest[0] == 0 && en.serial == 20);
+    CHECK(kdb_inventory_entries_next(&it, &en) && en.resident && strcmp(en.name, "dflt.test.") == 0 && en.digest[31] == 0x33);
+    CHECK(!kdb_inventory_entries_next(&it, &en));
+    /* a cold entry may carry a digest anyway; a resident entry without one is refused, by default too */
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_INVENTORY);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "x.test."); kdb_enc_i64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_bytes(&e, 5, dig, sizeof(dig)); kdb_enc_u8(&e, 6, 0); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("cold entry with a digest", dec_backend(&e, &m, why), KDB_OK);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_INVENTORY);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "x.test."); kdb_enc_i64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_u8(&e, 6, 1); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("resident without a digest", dec_backend(&e, &m, why), KDB_E_TLV_MISSING);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_INVENTORY);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "x.test."); kdb_enc_i64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("no flag and no digest", dec_backend(&e, &m, why), KDB_E_TLV_MISSING);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_INVENTORY);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "x.test."); kdb_enc_i64(&e, 3, 1); kdb_enc_u32(&e, 4, 1);
+    kdb_enc_u8(&e, 6, 2); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    CHECK_RC("resident 2", dec_backend(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_free(&e);
+}
+
+static void test_fetch_stream_machine(void) {
+    printf("[the fetch stream state machine]\n");
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    char why[KDB_REASON_LEN];
+    /* a whole conversation: a profile and a primary with data, a summary, a secondary, a failure, an aborted zone; byte at a time too */
+    m_profile(&e);
+    fz_begin(&e, 1, ZN, 4, 0, KDB_ZK_PRIMARY, 11);
+    m_zone_data(&e, 3, 1, 20); m_zone_data(&e, 1, 0, 9); m_zone_end(&e, 4);
+    fz_begin(&e, 0, "sum.test.", 0, KDB_ZF_SUMMARY | KDB_ZF_PRESIGNED, KDB_ZK_PRIMARY, 12); m_zone_end(&e, 0);
+    fz_begin(&e, 2, "sec.test.", 0, 0, KDB_ZK_SECONDARY, 13); m_zone_end(&e, 0);
+    fz_failed(&e, 14);
+    fz_begin(&e, 0, "ab.test.", 3, 0, KDB_ZK_PRIMARY, 15); m_zone_data(&e, 1, 0, 9); m_zone_abort(&e);
+    CHECK(!e.err);
+    for (int chunk = 0; chunk <= 7; chunk += 7) {
+        sess_t *s = malloc(sizeof(*s));
+        sess_init_fetch(s, NULL);
+        CHECK(s->sm.state == KDB_S_READY && s->sm.fetch);
+        CHECK_RC("conversation", sess_feed(s, e.buf, e.len, (size_t)chunk), KDB_OK);
+        CHECK(s->nframes == 13 && s->sm.state == KDB_S_READY && s->sm.n_profiles == 0);
+        free(s);
+    }
+    sess_t *s = malloc(sizeof(*s));
+    sess_init_fetch(s, NULL);
+    kdb_enc_t p;
+    kdb_enc_init(&p);
+    fz_begin(&p, 1, ZN, 4, 0, KDB_ZK_PRIMARY, 77);
+    CHECK_RC("begin", sess_feed(s, p.buf, p.len, 0), KDB_OK);
+    CHECK(s->sm.state == KDB_S_IN_ZONE && s->sm.zone_req_id == 77 && s->m.u.zone_begin.request_id == 77);
+    free(s);
+    kdb_enc_free(&p);
+
+    /* what the fetch stream does not take, in READY: everything but PROFILE, ZONE_BEGIN and ZONE_FAILED */
+    static const uint16_t no_ready[] = { KDB_T_HELLO, KDB_T_INVENTORY_REQ, KDB_T_BATCH_BEGIN, KDB_T_ZONE_DATA, KDB_T_ZONE_END, KDB_T_ZONE_ABORT,
+                                         KDB_T_ZONE_DELETE, KDB_T_BATCH_END, KDB_T_AUTO_STATUS };
+    for (size_t i = 0; i < sizeof(no_ready) / sizeof(no_ready[0]); i++) {
+        kdb_enc_reset(&e);
+        m_valid(&e, no_ready[i]);
+        CHECK_RC(kdb_type_name(no_ready[i]), fetch_send(KDB_S_READY, &e, why), KDB_E_STATE);
+    }
+    /* ... and in a zone: only the data, the end and the abort */
+    static const uint16_t no_zone[] = { KDB_T_HELLO, KDB_T_INVENTORY_REQ, KDB_T_BATCH_BEGIN, KDB_T_ZONE_BEGIN, KDB_T_ZONE_FAILED, KDB_T_PROFILE,
+                                        KDB_T_ZONE_DELETE, KDB_T_BATCH_END, KDB_T_AUTO_STATUS };
+    for (size_t i = 0; i < sizeof(no_zone) / sizeof(no_zone[0]); i++) {
+        kdb_enc_reset(&e);
+        if (no_zone[i] == KDB_T_ZONE_BEGIN) fz_begin(&e, 1, ZN, 10, 0, KDB_ZK_PRIMARY, 8);
+        else if (no_zone[i] == KDB_T_ZONE_FAILED) fz_failed(&e, 8);
+        else m_valid(&e, no_zone[i]);
+        CHECK_RC(kdb_type_name(no_zone[i]), fetch_send(KDB_S_IN_ZONE, &e, why), KDB_E_STATE);
+    }
+    /* the request id: required on the fetch stream, forbidden on the batch stream, never 0 */
+    kdb_enc_reset(&e); fz_begin(&e, 1, ZN, 10, 0, KDB_ZK_PRIMARY, 0);
+    CHECK_RC("ZONE_BEGIN without a request id", fetch_send(KDB_S_READY, &e, why), KDB_E_STATE);
+    kdb_enc_reset(&e); fz_begin(&e, 1, ZN, 10, 0, KDB_ZK_PRIMARY, 0); { /* request id 0 written out */
+        kdb_enc_t z; kdb_enc_init(&z);
+        uint8_t dig[KDB_DIGEST_LEN] = { 0 };
+        kdb_enc_begin(&z, KDB_T_ZONE_BEGIN);
+        kdb_enc_u16(&z, 1, 1); kdb_enc_name(&z, 2, ZN); kdb_enc_i64(&z, 3, 5); kdb_enc_u8(&z, 4, KDB_ZK_PRIMARY); kdb_enc_u32(&z, 5, 1); kdb_enc_u32(&z, 6, 0);
+        kdb_enc_u64(&z, 7, 10); kdb_enc_bytes(&z, 8, dig, sizeof(dig)); kdb_enc_u64(&z, 11, 0); kdb_enc_end(&z);
+        CHECK_RC("ZONE_BEGIN request id 0", fetch_send(KDB_S_READY, &z, why), KDB_E_RANGE);
+        kdb_enc_free(&z);
+    }
+    kdb_enc_reset(&e); fz_failed(&e, 0);
+    CHECK_RC("ZONE_FAILED without a request id", fetch_send(KDB_S_READY, &e, why), KDB_E_STATE);
+    kdb_enc_reset(&e); fz_begin(&e, 1, ZN, 10, 0, KDB_ZK_PRIMARY, 5);
+    CHECK_RC("batch stream: ZONE_BEGIN with a request id", send_enc(KDB_S_IN_BATCH, &e), KDB_E_STATE);
+    kdb_enc_reset(&e); fz_failed(&e, 5);
+    CHECK_RC("batch stream: ZONE_FAILED with a request id", send_enc(KDB_S_IN_BATCH, &e), KDB_E_STATE);
+    kdb_enc_reset(&e); fz_begin(&e, 1, ZN, 0, KDB_ZF_SUMMARY, KDB_ZK_PRIMARY, 0);
+    CHECK_RC("batch stream: a summary", send_enc(KDB_S_IN_BATCH, &e), KDB_E_STATE);
+    /* the SOA timers of a summary: all three or none */
+    {
+        uint8_t zd[KDB_DIGEST_LEN] = { 0 };
+        for (int nt = 0; nt <= 3; nt++) {
+            kdb_enc_reset(&e);
+            kdb_enc_begin(&e, KDB_T_ZONE_BEGIN);
+            kdb_enc_u16(&e, 1, 1); kdb_enc_name(&e, 2, ZN); kdb_enc_i64(&e, 3, 5); kdb_enc_u8(&e, 4, KDB_ZK_PRIMARY); kdb_enc_u32(&e, 5, 9);
+            kdb_enc_u32(&e, 6, KDB_ZF_SUMMARY); kdb_enc_u64(&e, 7, 0); kdb_enc_bytes(&e, 8, zd, sizeof(zd)); kdb_enc_u64(&e, 11, 5);
+            if (nt >= 1) kdb_enc_u32(&e, 12, 3600);
+            if (nt >= 2) kdb_enc_u32(&e, 13, 600);
+            if (nt >= 3) kdb_enc_u32(&e, 14, 1209600);
+            kdb_enc_end(&e);
+            sess_t *ts = malloc(sizeof(*ts));
+            sess_init_fetch(ts, NULL);
+            kdb_rc_t trc = sess_feed(ts, e.buf, e.len, 0);
+            if (nt == 0 || nt == 3) {
+                CHECK_RC("SOA timers", trc, KDB_OK);
+                CHECK(ts->m.u.zone_begin.has_soa_timers == (nt == 3));
+                if (nt == 3) CHECK(ts->m.u.zone_begin.soa_refresh == 3600 && ts->m.u.zone_begin.soa_retry == 600 && ts->m.u.zone_begin.soa_expire == 1209600);
+            } else {
+                CHECK_RC("SOA timers, not all three", trc, KDB_E_TLV_MISSING);
+            }
+            free(ts);
+        }
+    }
+    /* summaries: rr_count 0, only a primary, no data afterwards */
+    kdb_enc_reset(&e); fz_begin(&e, 1, ZN, 3, KDB_ZF_SUMMARY, KDB_ZK_PRIMARY, 5);
+    CHECK_RC("summary with records", fetch_send(KDB_S_READY, &e, why), KDB_E_COUNT);
+    kdb_enc_reset(&e); fz_begin(&e, 1, ZN, 0, KDB_ZF_SUMMARY, KDB_ZK_SECONDARY, 5);
+    CHECK_RC("summary of a secondary", fetch_send(KDB_S_READY, &e, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); fz_begin(&e, 1, ZN, 0, KDB_ZF_SUMMARY, KDB_ZK_PRIMARY, 5); m_zone_data(&e, 1, 0, 9);
+    CHECK_RC("data after a summary", fetch_send(KDB_S_READY, &e, why), KDB_E_COUNT);
+    kdb_enc_reset(&e); fz_begin(&e, 1, ZN, 1, 0, KDB_ZK_PRIMARY, 5);
+    CHECK_RC("a full zone needs two SOAs", fetch_send(KDB_S_READY, &e, why), KDB_E_COUNT);
+    /* the usual limits still hold: a zone above the byte limit, an END with the wrong count, a view out of range */
+    kdb_limits_t tiny = { 1000, 100, NVIEWS };
+    s = malloc(sizeof(*s));
+    sess_init_fetch(s, &tiny);
+    kdb_enc_reset(&e); fz_begin(&e, 1, ZN, 4, 0, KDB_ZK_PRIMARY, 6); m_zone_data(&e, 4, 0, 400);
+    CHECK_RC("zone above max-zone-bytes", sess_feed(s, e.buf, e.len, 0), KDB_E_LIMIT_BYTES);
+    CHECK_RC("sticky", sess_feed(s, e.buf, e.len, 0), KDB_E_LIMIT_BYTES);
+    free(s);
+    kdb_enc_reset(&e); fz_begin(&e, 1, ZN, 4, 0, KDB_ZK_PRIMARY, 6); m_zone_end(&e, 4);
+    CHECK_RC("END without the data", fetch_send(KDB_S_READY, &e, why), KDB_E_COUNT);
+    kdb_enc_reset(&e); fz_begin(&e, NVIEWS, ZN, 4, 0, KDB_ZK_PRIMARY, 6);
+    CHECK_RC("view out of range", fetch_send(KDB_S_READY, &e, why), KDB_E_RANGE);
+    /* the profile count of a zone starts again after it (65,535 PROFILEs are allowed between two zones) */
+    s = malloc(sizeof(*s));
+    sess_init_fetch(s, NULL);
+    kdb_enc_reset(&e); m_profile(&e); m_profile(&e);
+    CHECK_RC("profiles", sess_feed(s, e.buf, e.len, 0), KDB_OK);
+    CHECK(s->sm.n_profiles == 2);
+    kdb_enc_reset(&e); fz_failed(&e, 9);
+    CHECK_RC("failed", sess_feed(s, e.buf, e.len, 0), KDB_OK);
+    CHECK(s->sm.n_profiles == 0 && s->sm.state == KDB_S_READY);
+    free(s);
+    kdb_enc_free(&e);
+}
+
+/* the seeds of the fetch stream (selector bit 3) and of the Backend side messages of D1a */
+static int gen_corpus_fetch(const char *dir) {
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    int rc = 0;
+    m_profile(&e);
+    fz_begin(&e, 1, ZN, 4, 0, KDB_ZK_PRIMARY, 11);
+    m_zone_data(&e, 3, 1, 20); m_zone_data(&e, 1, 0, 9); m_zone_end(&e, 4);
+    fz_begin(&e, 0, "sum.test.", 0, KDB_ZF_SUMMARY | KDB_ZF_PRESIGNED, KDB_ZK_PRIMARY, 12); m_zone_end(&e, 0);
+    fz_begin(&e, 2, "sec.test.", 0, 0, KDB_ZK_SECONDARY, 13); m_zone_end(&e, 0);
+    fz_failed(&e, 14);
+    fz_begin(&e, 0, "ab.test.", 3, 0, KDB_ZK_PRIMARY, 15); m_zone_data(&e, 1, 0, 9); m_zone_abort(&e);
+    rc |= write_seed(dir, "seed_fetch_stream.bin", 0x88, &e);
+    rc |= write_seed(dir, "seed_fetch_stream_install.bin", 0x08, &e);        /* (also through the install run) */
+    kdb_enc_reset(&e);
+    fz_fetch_req(&e, 1, 0, ZN, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL); kdb_enc_end(&e);
+    fz_fetch_req(&e, 2, 1, "w.test.", KDB_FETCH_PRIO_WARM, KDB_FETCH_SUMMARY); kdb_enc_name(&e, 6, "a.w.test."); kdb_enc_name(&e, 7, "m.w.test."); kdb_enc_end(&e);
+    kdb_enc_begin(&e, KDB_T_INVENTORY);
+    uint8_t dig[KDB_DIGEST_LEN] = { 7 };
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "res.test."); kdb_enc_i64(&e, 3, 1); kdb_enc_u32(&e, 4, 10);
+    kdb_enc_bytes(&e, 5, dig, sizeof(dig)); kdb_enc_u8(&e, 6, 1); kdb_enc_nest_end(&e);
+    kdb_enc_nest_begin(&e, 1); kdb_enc_u16(&e, 1, 1); kdb_enc_name(&e, 2, "cold.test."); kdb_enc_i64(&e, 3, 2); kdb_enc_u32(&e, 4, 20);
+    kdb_enc_u8(&e, 6, 0); kdb_enc_nest_end(&e);
+    kdb_enc_end(&e);
+    rc |= write_seed(dir, "seed_backend_fetch.bin", 0x80, &e);
+    kdb_enc_free(&e);
+    return rc;
+}
+
 /* the names the loader and the Backend log for a result code and a message type: one each, none empty, "?" for the unknown */
 static void test_names(void) {
     printf("result code and message type names\n");
@@ -1535,6 +1837,8 @@ int main(int argc, char **argv) {
     test_batch_request_id();
     test_auto_status();
     test_checkproto();
+    test_fetch_req_and_inventory();
+    test_fetch_stream_machine();
     test_names();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;

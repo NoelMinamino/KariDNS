@@ -525,7 +525,7 @@ static void test_database_block(void) {
         "loader-group \"karidns-db\"; loader-path \"/usr/local/libexec/karidns-dbloader\"; "
         "acl-ceiling { 192.0.2.0/24; }; auto-reload yes; poll-interval 5; coalesce 250; default-ttl 600; "
         "bulk-threshold 40; max-zone-records 5000; max-zone-bytes 64M; db-reload-timeout 45; ingest-threads 4; "
-        "loader-threads 8; server-id \"ns1\"; alias-resolver { 192.0.2.53; 2001:db8::53; }; }; };";
+        "loader-threads 8; park-max 2048; park-timeout 800; server-id \"ns1\"; alias-resolver { 192.0.2.53; 2001:db8::53; }; }; };";
     if (parse_ok(full, &cfg)) {
         const database_config_t *d = &cfg.database;
         CHECK(d->enabled);
@@ -538,6 +538,7 @@ static void test_database_block(void) {
         CHECK(d->auto_reload && d->poll_interval == 5 && d->coalesce_ms == 250 && d->default_ttl == 600);
         CHECK(d->bulk_threshold == 40 && d->max_zone_records == 5000 && d->max_zone_bytes == 64ull << 20);
         CHECK(d->db_reload_timeout == 45 && d->ingest_threads == 4 && d->loader_threads == 8);
+        CHECK(d->park_max == 2048 && d->park_timeout_ms == 800);                      /* D1a milestone 2 */
         CHECK_STR(d->server_id, "ns1");
         CHECK(d->alias_resolver_count == 2);
         free_server_config_fields(&cfg);
@@ -548,6 +549,7 @@ static void test_database_block(void) {
         CHECK(!d->auto_reload && d->poll_interval == 2 && d->coalesce_ms == 1000 && d->default_ttl == 3600);
         CHECK(d->bulk_threshold == 25 && d->max_zone_records == 10000000ull && d->max_zone_bytes == 1ull << 30);
         CHECK(d->db_reload_timeout == 30 && d->ingest_threads == 1 && d->loader_threads == 1);
+        CHECK(d->park_max == 0 && d->park_timeout_ms == 0);                          /* (0: the worker's defaults, 1024 and 1500 ms) */
         CHECK_STR(db_loader_path(&cfg), KARIDNS_DB_DEFAULT_LOADER_PATH);
         free_server_config_fields(&cfg);
     }
@@ -560,6 +562,10 @@ static void test_database_block(void) {
     expect_reject("bulk-threshold 101", DBP "bulk-threshold 101; }; };");
     expect_reject("ingest-threads 17", DBP "ingest-threads 17; }; };");
     expect_reject("loader-threads 0", DBP "loader-threads 0; }; };");
+    expect_reject("park-max 0", DBP "park-max 0; }; };");
+    expect_reject("park-max 65537", DBP "park-max 65537; }; };");
+    expect_reject("park-timeout 9", DBP "park-timeout 9; }; };");
+    expect_reject("park-timeout 60001", DBP "park-timeout 60001; }; };");
     expect_reject("max-zone-records 1", DBP "max-zone-records 1; }; };");
     expect_reject("max-zone-bytes 100", DBP "max-zone-bytes 100; }; };");
     expect_reject("max-zone-bytes junk", DBP "max-zone-bytes 1X; }; };");

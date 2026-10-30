@@ -221,6 +221,8 @@ int pdns_zone_finish(pdns_zone_t *z);
 /* Third field of an SOA content: strict decimal digits only, <= 2^32 - 1.  Fields are separated by blanks; the
  * content may have leading / trailing blanks.  false if there are fewer than 3 fields or the serial is not valid. */
 bool pdns_soa_serial(const char *content, uint32_t *serial);
+/* The refresh, retry and expire (fields 4..6) of an SOA content, with the same rules.  false if a field is missing or not a number. */
+bool pdns_soa_timers(const char *content, uint32_t *refresh, uint32_t *retry, uint32_t *expire);
 
 /* The line-safety rules above on s[0..len).  is_owner: the stricter owner rules.  Returns NULL if safe, else a
  * static reason text.  s may contain NUL (it is rejected). */
@@ -240,6 +242,8 @@ typedef struct {
      * (with the settings text and the profile name), so that editing the profile makes every zone that uses it new to a
      * loader that has the old version; the loader sends it itself as a PROFILE message. */
     const char *profile_text;
+    /* D1a, fetch stream: the FETCH_REQ the zone answers (ZONE_BEGIN tag 11); 0 = none (the batch stream) */
+    uint64_t request_id;
 } pdns_kdb_params_t;
 
 /* Called once per complete KDB1 message (12-byte header + body); the memory is valid during the call only.
