@@ -52,6 +52,31 @@ sub read_answer {
     return sprintf("id=%d rcode=%d an=%d", $id, $fl & 0xF, $an);
 }
 
+# an UPDATE (RFC 2136) that adds "new.ZONE. 300 IN A 192.0.2.99" to ZONE (no prerequisites)
+sub update_msg {
+    my ($id, $zone) = @_;
+    my $q = pack('nnnnnn', $id, (5 << 11), 1, 0, 1, 0);
+    for my $l (split /\./, $zone) { $q .= pack('C', length $l) . $l; }
+    $q .= pack('Cnn', 0, 6, 1);                      # zone section: SOA IN
+    $q .= pack('C', 3) . 'new';                      # update section: new.ZONE. A IN, TTL 300
+    for my $l (split /\./, $zone) { $q .= pack('C', length $l) . $l; }
+    $q .= pack('CnnNn', 0, 1, 1, 300, 4) . pack('C4', 192, 0, 2, 99);
+    return $q;
+}
+
+if ($mode eq 'udp-update') {
+    my $u = IO::Socket::INET->new(PeerAddr => $host, PeerPort => $port, Proto => 'udp') or die "udp: $!\n";
+    syswrite($u, update_msg(501, $names[0]));
+    my $sel = IO::Select->new($u);
+    if ($sel->can_read(15) && sysread($u, my $m, 4096)) {
+        my ($id, $fl) = unpack('nn', $m);
+        printf("id=%d rcode=%d\n", $id, $fl & 0xF);
+    } else {
+        print "no answer\n";
+    }
+    exit 0;
+}
+
 if ($mode eq 'udp-op') {
     my ($opcode, $name) = @names;
     my $q = pack('nnnnnn', 401, ($opcode << 11), 1, 0, 0, 0);
@@ -72,7 +97,18 @@ if ($mode eq 'udp-op') {
 my $s = IO::Socket::INET->new(PeerAddr => $host, PeerPort => $port, Proto => 'tcp', Timeout => 5) or die "connect: $!\n";
 $s->autoflush(1);
 
-if ($mode eq 'tcp-op') {
+if ($mode eq 'tcp-update') {
+    my $q = update_msg(502, $names[0]);
+    syswrite($s, pack('n', length $q) . $q);
+    my $lb = read_exact($s, 2, time() + 15);
+    my $m = defined $lb ? read_exact($s, unpack('n', $lb), time() + 15) : undef;
+    if (defined $m) {
+        my ($id, $fl) = unpack('nn', $m);
+        printf("id=%d rcode=%d\n", $id, $fl & 0xF);
+    } else {
+        print "no answer\n";
+    }
+} elsif ($mode eq 'tcp-op') {
     my ($opcode, $name) = @names;
     my $q = pack('nnnnnn', 402, ($opcode << 11), 1, 0, 0, 0);
     for my $l (split /\./, $name) { $q .= pack('C', length $l) . $l; }

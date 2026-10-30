@@ -2131,7 +2131,7 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
               if (res_len != DNS_NR_PERMITTED) {
                 answered = true;
               } else {
-                if (!w->woken) atomic_fetch_add_explicit(&pel->freq, 1, memory_order_relaxed);        /* the zone is asked for, once per query (a query that comes back after a wake-up or a time-out is not counted again) */
+                if (!w->woken && ((req_buf[2] >> 3) & 0x0F) == 0) atomic_fetch_add_explicit(&pel->freq, 1, memory_order_relaxed);        /* the zone is asked for (an UPDATE does not count), once per query (a query that comes back after a wake-up or a time-out is not counted again) */
                 if (!w->not_ready && udp_park(w, route.view, pel, ipc_msg, req_buf, (size_t)payload_received)) {
                   rcu_reader_exit(ctx);
                   return;                                 /* parked: it is answered when the zone is there, or its time is up */
@@ -2976,7 +2976,7 @@ process_tcp_client: ;
               if (res_len != DNS_NR_PERMITTED) answered = true;
             }
             if (__builtin_expect(!route.entry && pel != NULL && !answered, 0)) {
-              if (ctx_tcp->park_deadline_ms == 0) atomic_fetch_add_explicit(&pel->freq, 1, memory_order_relaxed);   /* once per query */
+              if (ctx_tcp->park_deadline_ms == 0 && ((msg[2] >> 3) & 0x0F) == 0) atomic_fetch_add_explicit(&pel->freq, 1, memory_order_relaxed);   /* once per query (an UPDATE does not count) */
               int64_t pnow = park_now_ms();
               int64_t left = ctx_tcp->park_deadline_ms ? ctx_tcp->park_deadline_ms - pnow : (int64_t)park_timeout_ms;
               if (park_on && !ctx_tcp->not_ready_now && left > 0) {

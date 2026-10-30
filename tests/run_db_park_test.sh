@@ -8,6 +8,7 @@
 # `evict` after a query shows that the query brought the zone back through the fetch stream.  Checked:
 #   - a UDP query and a TCP query for an evicted zone are answered with the data of the database (parked, fetched, woken)
 #   - NOTIFY and UPDATE (UDP and TCP) for an evicted zone are answered at once (REFUSED) and do not fetch the zone
+#   - an UPDATE (UDP and TCP) for an evicted zone parks, the zone is read, the UPDATE is applied and the zone stays in memory (pinned, dbstatus)
 #   - a karictl reconfig that adds a zone does not drop the zone that is out of memory (it still parks, fetches and answers)
 #   - TCP: three queries in one write (the first one for the evicted zone) are answered in order; a client that closes while its request
 #     is parked does not hurt the server; after a parked query the connection ends by tcp-idle-timeout
@@ -66,7 +67,7 @@ export ASAN_OPTIONS="detect_leaks=0:abort_on_error=0"      # (the evict command 
 mkdir "$T/db" "$T/z"
 chown nobody "$T/db"; chmod 777 "$T/db"
 sqlite3 "$T/db/z.db" < tests/db/pdns_schema.sqlite3.sql > /dev/null
-for n in a b; do
+for n in a b c d; do
     cat > "$T/z/$n.test.zone" <<EOF
 \$ORIGIN $n.test.
 \$TTL 300
@@ -77,6 +78,7 @@ www A 192.0.2.80
 EOF
     ./tests/db/zone2sql --dialect sqlite3 "$T/z/$n.test.zone" 2>/dev/null | sqlite3 "$T/db/z.db"
 done
+sqlite3 "$T/db/z.db" "INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'ALLOW-DNSUPDATE-FROM', '127.0.0.1' FROM domains WHERE name IN ('b.test', 'c.test');"
 chmod 666 "$T/db/z.db"*
 install -o root -g wheel -m 755 "$LOADER" "$T/karidns-dbloader" 2>/dev/null || { cp "$LOADER" "$T/karidns-dbloader"; chown 0:0 "$T/karidns-dbloader"; chmod 755 "$T/karidns-dbloader"; }
 cat > "$T/karictl.conf" <<EOF
@@ -88,7 +90,7 @@ KCTL="./karictl -c $T/karictl.conf"
 cat > "$T/k.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; directory "$T/z"; listen-on { 127.0.0.1; }; port $PORT; tcp-idle-timeout 3000ms; tcp-connection-reuse yes; allow-query { 127.0.0.1; };
-    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; db-reload-timeout 1; park-timeout 1000; };
+    database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; db-reload-timeout 1; park-timeout 1000; acl-ceiling { 127.0.0.1; }; };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
 EOF
@@ -153,6 +155,18 @@ done
 evict a.test. | grep -q '^ERROR' && pass "... and the zone was not fetched for them" || fail "NOTIFY/UPDATE fetched the zone"
 [ "$(q www.a.test)" = "192.0.2.80" ] && pass "a query still brings the zone back" || fail "a.test does not answer after the NOTIFY/UPDATE probes"
 
+echo "== UPDATE for an evicted zone: the zone is read, the UPDATE is applied, the zone is kept in memory"
+evicted b.test. "b.test is out of memory"
+got=$(perl tests/db/dns_tcp_probe.pl 127.0.0.1 "$PORT" udp-update b.test 2>&1)
+echo "$got" | grep -q 'rcode=0$' && pass "udp: the UPDATE of an evicted zone is applied (NOERROR: $got)" || fail "udp UPDATE: $got"
+[ "$(q new.b.test)" = "192.0.2.99" ] && pass "the added record is served" || fail "new.b.test: '$(q new.b.test)'"
+evict b.test. | grep -q '^ERROR' && pass "the zone with the UPDATE is not taken out of memory (design 12-8)" || fail "b.test was taken out of memory after an UPDATE"
+$KCTL dbstatus 2>/dev/null | grep -q '^updated: 1 zone' && pass "karictl dbstatus shows the pinned zone" || fail "dbstatus: $($KCTL dbstatus 2>&1 | grep updated)"
+evicted c.test. "c.test is out of memory"
+got=$(perl tests/db/dns_tcp_probe.pl 127.0.0.1 "$PORT" tcp-update c.test 2>&1)
+echo "$got" | grep -q 'rcode=0$' && pass "tcp: the UPDATE of an evicted zone is applied (NOERROR: $got)" || fail "tcp UPDATE: $got"
+[ "$(q new.c.test +tcp)" = "192.0.2.99" ] && pass "the added record is served (TCP)" || fail "new.c.test: '$(q new.c.test +tcp)'"
+
 echo "== a reconfig that adds a zone keeps the zone that is out of memory"
 cat > "$T/z/extra.test.zone" <<EOF
 \$ORIGIN extra.test.
@@ -215,9 +229,9 @@ wait_log "$T/srv.log" "\[DB\] batch 1 complete" 30 2 && pass "the supervisor sta
 sleep 1
 # the startup batch of the new loader compares digests: a zone without data in memory is sent again or fetched; either way it answers
 [ "$(q www.a.test)" = "192.0.2.80" ] && pass "a query for the zone that was out of memory is answered by the new loader" || fail "a.test does not answer after the loader restart"
-evicted b.test. "b.test is out of memory"
-[ "$(q www.b.test)" = "192.0.2.80" ] && pass "a fetch on the new fetch stream works" || fail "b.test does not answer"
-resident_again b.test. "... and it came through the new fetch stream"
+evicted d.test. "d.test is out of memory"
+[ "$(q www.d.test)" = "192.0.2.80" ] && pass "a fetch on the new fetch stream works" || fail "d.test does not answer"
+resident_again d.test. "... and it came through the new fetch stream"
 
 if grep -q "AddressSanitizer\|runtime error:\|ThreadSanitizer" "$T/srv.log" 2>/dev/null; then fail "sanitizer report in the server log"; grep -m3 "AddressSanitizer\|runtime error:" "$T/srv.log"; else pass "no sanitizer report in the server log"; fi
 echo

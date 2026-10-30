@@ -547,10 +547,14 @@ int main(void) {
         cfg5.send_extended_errors = true;
         atomic_store_explicit(&g_config_db.active, &cfg5, memory_order_release);
         OPQ(0x7603, 5, "park.test");
-        CHECK(w.n_tx == 1 && table.nwait == 0 && !park_fetch_pop(park_fetch_ring(0), &q));
+        /* D1a milestone 4: an UPDATE that may be made waits for the zone like a query (parked, the zone is asked for) and is applied when it is there;
+         * it does not count for the zone's frequency.  When the read fails it is answered SERVFAIL (the query has no OPT, so no EDE) */
+        CHECK(w.n_tx == 0 && table.nwait == 1 && park_fetch_pop(park_fetch_ring(0), &q) && atomic_load(&el->freq) == f1);
+        CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", true));
+        park_service(&w, -1);
         FLUSH();
         a = read_answer(sk[1]);
-        CHECK(a.got && a.id == 0x7603 && a.rcode == 2);                  /* (allowed: SERVFAIL, nothing read; the query has no OPT, so no EDE) */
+        CHECK(a.got && a.id == 0x7603 && a.rcode == 2 && table.nwait == 0);
         OPQ(0x7604, 5, "x.park.test");
         FLUSH();
         a = read_answer(sk[1]);

@@ -3002,6 +3002,7 @@ static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   if (!zdir_entry(z)) st_append(c, z->digest && atomic_load_explicit(&z->state, memory_order_relaxed) != ZDIR_ST_ERROR
                                        ? " (the data is out of memory: it is read when a query needs it)" : " (no version loaded)");
   if (z->error) st_append(c, ", last error: %s", z->error);
+  if (zdir_entry(z) && zdir_entry(z)->updated) st_append(c, " (changed by a dynamic UPDATE: pinned in memory until the next load from the database)");
   st_append(c, "\n");
   if (zdir_entry(z)) settings_status(c, zdir_entry(z));
   return true;
@@ -3063,6 +3064,8 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
                 (unsigned long long)cs.pinned_bytes, (unsigned long long)cs.peak, (unsigned)cs.victim_freq);
     else
       st_append(&c, "cache: no memory-limit (every database zone stays in memory)\n");
+    st_append(&c, "updated: %zu zone(s) changed by a dynamic UPDATE are pinned in memory until the next load from the database replaces them\n",
+              dbreg_count_updated());
     size_t nel, rbytes, ibytes;
     dbreg_dir_bytes(&nel, &rbytes, &ibytes);
     st_append(&c, "zone directory: %zu elements, %zu bytes in the registry + %zu bytes in the indexes of the views (%zu bytes per zone)\n",

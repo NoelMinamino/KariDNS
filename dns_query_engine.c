@@ -3190,6 +3190,10 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         bool uauth = zext(&zc)->upd_policy ? nr_tkey != NULL
                                            : (cfg && zone_update_acl_allows_in_view(cfg, &zc, view->name, client_ip, nr_tkey ? nr_tkey->name : NULL));
         if (uauth) {
+          /* D1a milestone 4 (design 7, 12-8): an UPDATE that may be made waits for the zone like a query (parked, the zone is read), and is applied
+           * to it when it is there; the zone then stays in memory (pinned) until the next load from the database.  Where nothing can wait (TLS, DoH,
+           * a table that is full, the time is up) the client is told to try again. */
+          if (t_nr_probe) return DNS_NR_PERMITTED;
           urc = 2;                                      // SERVFAIL, Not Ready
           add_ede(&edns, send_ede, 14, "Not Ready");
         } else {

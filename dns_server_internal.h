@@ -987,7 +987,8 @@ bool dbreg_cache_over_limit(void);                                 /* are the da
  * no data (the next query for it fetches it).  0 on success. */
 int dbreg_commit_cold(const char *view, const char *name, int64_t source_id, uint32_t serial, const uint8_t digest[32], zone_ext_shared_t *shared);
 void dbreg_set_pending_notify(void (*cb)(void));                  /* called (lock held) when a change is queued without the ingest thread: it wakes the thread */
-uint64_t dbreg_evictions(void);                                   /* zones evicted since the start */
+size_t dbreg_count_updated(void);                                 /* zones changed by a dynamic UPDATE: pinned in memory until the next load from the database */
+uint64_t dbreg_evictions(void);                                  /* zones evicted since the start */
 uint64_t dbreg_evict_inflight(void);                              /* bytes of evicted zones whose entries are not freed yet (in the retired total) */
 #if defined(KARIDNS_TEST_EVICT) || defined(KARIDNS_UNIT_TEST)
 bool dbreg_test_evict(const char *view, const char *name);        /* TEST ONLY, see dns_snapshot_rcu.c */

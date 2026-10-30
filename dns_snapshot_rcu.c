@@ -2905,6 +2905,24 @@ void dbreg_counts(size_t *total, size_t *rejected, size_t *shadowed) {
     if (shadowed) *shadowed = s;
 }
 
+/* D1a milestone 4 (design 12-8): the zones that a dynamic UPDATE changed.  They are kept in memory (never taken out) until the next load from the
+ * database replaces them, because the changes exist nowhere else. */
+size_t dbreg_count_updated(void) {
+    size_t n = 0;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    for (size_t v = 0; v < g_dbreg_nviews; v++) {
+        const dbreg_view_t *rv = &g_dbreg_views[v];
+        for (size_t b = 0; b < rv->nb; b++) {
+            for (const dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
+                const zone_db_entry_t *e = zdir_entry(z);
+                if (e && e->updated) n++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return n;
+}
+
 void dbreg_counts2(size_t *total, size_t *rejected, size_t *shadowed_config, size_t *shadowed_catalog) {
     size_t t = 0, r = 0, sc = 0, sk = 0;
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
