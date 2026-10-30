@@ -154,9 +154,14 @@ static db_conn_t *open_drv(const char *schema) {
 /* ---- callbacks that collect ---- */
 typedef struct { int n; int64_t id[4000]; char name[8][64]; char type[8][16]; char master[8][32]; char soa[8][80]; bool soa_null[8]; bool master_null[8]; int stop_after; } zacc_t;
 /* D1a step 6: scan_apex rows */
-typedef struct { size_t n, nsoa, stop_after; int64_t first_dom; bool first_is_soa; char first_content[40]; } apx_t;
+typedef struct { size_t n, nsoa, naddr, stop_after; int64_t first_dom; bool first_is_soa; char first_content[40]; uint16_t addr_at[8]; char addr_name[8][24]; } apx_t;
 static int cb_apex(void *ud, const db_apex_row_t *r) {
     apx_t *a = ud;
+    if (r->addr_type && a->naddr < 8) {
+        a->addr_at[a->naddr] = r->addr_type;
+        snprintf(a->addr_name[a->naddr], sizeof(a->addr_name[0]), "%s", r->name ? r->name : "");
+    }
+    a->naddr += r->addr_type ? 1 : 0;
     if (a->n == 0) {
         a->first_dom = r->domain_id;
         a->first_is_soa = r->is_soa;
@@ -661,7 +666,10 @@ static void test_zone_soa(void) {
       "(8, 'E8.test', 'SOA', 'soa-e8-ci', 60, false), (8, 'e8.test', 'SOA', 'soa-e8-exact', 60, false),"          /* two spellings: the exact one wins */
       "(9, 'e9.test', 'SOA', 'soa-e9-off', 60, true), (9, 'E9.TEST', 'SOA', 'soa-e9-ci', 60, false),"             /* exact disabled: the other spelling */
       "(10, 'e10.test', 'SOA', 'soa-e10', 60, false),"                                                            /* the domain is in capitals */
-      "(11, 'e11.test', 'SOA', NULL, 60, false)");                                                                /* an enabled SOA without content */
+      "(11, 'e11.test', 'SOA', NULL, 60, false),"                                                                 /* an enabled SOA without content */
+      "(1, 'ns.e1.test', 'AAAA', '2001:db8::1', 600, false), (1, 'NS.E1.test', 'A', '192.0.2.1', 300, false),"  /* D1a step 6: the addresses of the NS target inside the zone (names in capitals too) */
+      "(1, 'ns.e1.test', 'A', '192.0.2.9', 300, true), (1, 'www.e1.test', 'A', '192.0.2.80', 300, false),"       /* (disabled; not an NS target) */
+      "(2, 'ns.e1.test', 'A', '192.0.2.77', 300, false)");                                                     /* (another zone's row) */
     db_conn_t *c = open_drv("karidns_test_s2");
     if (!c) return;
     db_schema_info_t si;
@@ -688,6 +696,19 @@ static void test_zone_soa(void) {
             const char *w = want[fz[k].id - 1];
             CHECK_MSG(w ? (!z->soa_null[0] && !strcmp(z->soa[0], w)) : z->soa_null[0], "find_zone %s: SOA '%s' (null %d)", fz[k].ask, z->soa[0], z->soa_null[0]);
         }
+    }
+    /* D1a step 6 (in-zone glue) scan_apex: the A and AAAA rows of the zone whose owner is the target of its apex NS row (e1.test: ns.e1.test), enabled, in id order */
+    {
+        apx_t ap;
+        memset(&ap, 0, sizeof(ap));
+        int64_t one = 1;
+        CHECK(D->scan_apex(c, &one, cb_apex, &ap) == 0 && ap.nsoa == 2 && ap.naddr == 2);
+        CHECK(ap.addr_at[0] == 28 && !strcmp(ap.addr_name[0], "ns.e1.test") && ap.addr_at[1] == 1 && !strcmp(ap.addr_name[1], "NS.E1.test"));
+        memset(&ap, 0, sizeof(ap));
+        CHECK(D->scan_apex(c, NULL, cb_apex, &ap) == 0 && ap.naddr == 2);
+        memset(&ap, 0, sizeof(ap));
+        one = 2;
+        CHECK(D->scan_apex(c, &one, cb_apex, &ap) == 0 && ap.naddr == 0);                 /* (zone 2 has no NS row of its own) */
     }
     CHECK(D->end_snapshot(c) == 0);
 

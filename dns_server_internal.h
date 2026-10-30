@@ -559,15 +559,19 @@ enum { ZDIR_ST_ABSENT = 0, ZDIR_ST_RESIDENT, ZDIR_ST_LOADING, ZDIR_ST_ERROR };
 
 /* D1a step 6 (design 12-12): the apex of a zone that is not in memory, from its summary: what the answer to an SOA question at the apex is made of
  * (RFC 1035 3.3.13, 3.3.11).  Names are wire names without compression (RFC 3597 4 does not apply: SOA and NS are well-known types).  data: MNAME,
- * RNAME, then n_ns NS targets one after the other.  `serial` is the serial of the version it describes; the block is not used for another one. */
+ * RNAME, then n_ns NS targets one after the other, then glue_len octets of glue: the addresses of NS targets that are inside the zone, records of
+ * ns index u8 | type u8 (1 A, 28 AAAA) | ttl u32 | address (4 or 16 octets), the indexes not decreasing, at most ZDIR_APEX_GLUE_PER_NS records for one (the
+ * Additional section of the answer, RFC 2181 9).  `serial` is the serial of the version it describes; the block is not used for another one. */
 typedef struct zdir_apex {
   uint32_t serial, soa_ttl, refresh, retry, expire, minimum, ns_ttl;
-  uint16_t mname_len, rname_len, ns_len;
+  uint16_t mname_len, rname_len, ns_len, glue_len;
   uint8_t n_ns;
   uint8_t data[];
 } zdir_apex_t;
 #define ZDIR_APEX_NS_MAX 8        /* NS targets of an apex (= KDB_APEX_NS_MAX, dns_db_stream.h; dns_db_ingest.c checks) */
-#define ZDIR_APEX_MAX (sizeof(zdir_apex_t) + 2 * 255 + ZDIR_APEX_NS_MAX * 255)
+#define ZDIR_APEX_GLUE_PER_NS 8   /* addresses of one NS target (= KDB_APEX_GLUE_PER_NS) */
+#define ZDIR_APEX_GLUE_MAX (ZDIR_APEX_NS_MAX * ZDIR_APEX_GLUE_PER_NS * 22)   /* (= KDB_APEX_GLUE_BYTES with room to spare) */
+#define ZDIR_APEX_MAX (sizeof(zdir_apex_t) + 2 * 255 + ZDIR_APEX_NS_MAX * 255 + ZDIR_APEX_GLUE_MAX)
 struct zdir_elem {
   struct zdir_elem *next;      /* the registry's hash chain; once the element is on a garbage list, that list */
   _Atomic(zone_db_entry_t *) entry;   /* the entry that answers for the name (RCU-published); the element holds a reference */

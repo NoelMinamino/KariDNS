@@ -1782,6 +1782,61 @@ static void test_fetch_stream_machine(void) {
             }
             free(ts);
         }
+        /* the glue (tag 21): records ns index | type | ttl | address, the indexes below the number of names and not decreasing, at most 8 for one index, the
+         * address as long as its type says, the TTL at most 2^31 - 1; it is part of the apex */
+        {
+            static const uint8_t a1[] = { 0, 1, 0, 0, 0x0e, 0x10, 192, 0, 2, 53 };                                            /* ns 0: A 192.0.2.53, TTL 3600 */
+            static const uint8_t a6[] = { 0, 28, 0, 0, 0x0e, 0x10, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 };   /* ns 0: AAAA 2001:db8::53 */
+            uint8_t two[sizeof(a1) + sizeof(a6)], rev[sizeof(a1) + sizeof(a6)], big[9 * sizeof(a1)], bad_ttl[sizeof(a1)], bad_type[sizeof(a1)], cut[sizeof(a1) - 1], ns1[sizeof(a1)];
+            memcpy(two, a1, sizeof(a1)); memcpy(two + sizeof(a1), a6, sizeof(a6));
+            memcpy(rev, a6, sizeof(a6)); memcpy(rev + sizeof(a6), a1, sizeof(a1));         /* (zone order: the AAAA first) */
+            for (int k = 0; k < 9; k++) memcpy(big + k * sizeof(a1), a1, sizeof(a1));
+            memcpy(bad_ttl, a1, sizeof(a1)); bad_ttl[2] = 0x80;
+            memcpy(bad_type, a1, sizeof(a1)); bad_type[1] = 2;
+            memcpy(cut, a1, sizeof(cut));
+            memcpy(ns1, a1, sizeof(a1)); ns1[0] = 1;
+            uint8_t back[2 * sizeof(a1)];
+            memcpy(back, ns1, sizeof(a1)); memcpy(back + sizeof(a1), a1, sizeof(a1));        /* (the index goes back) */
+            uint8_t ns2[sizeof(a1)];
+            memcpy(ns2, a1, sizeof(a1)); ns2[0] = 2;                                           /* (two names only) */
+            const struct { const char *what; const uint8_t *g; size_t gl; bool tag21; bool apex; kdb_rc_t want; } gc[] = {
+                { "glue, an A record", a1, sizeof(a1), true, true, KDB_OK },
+                { "glue, A and AAAA", two, sizeof(two), true, true, KDB_OK },
+                { "glue, AAAA before A (the order of the zone)", rev, sizeof(rev), true, true, KDB_OK },
+                { "glue, the second name", ns1, sizeof(ns1), true, true, KDB_OK },
+                { "glue, empty", a1, 0, true, true, KDB_OK },
+                { "glue, nine records for one name", big, sizeof(big), true, true, KDB_E_RANGE },
+                { "glue, TTL over 2^31 - 1", bad_ttl, sizeof(bad_ttl), true, true, KDB_E_RANGE },
+                { "glue, a type that is not an address", bad_type, sizeof(bad_type), true, true, KDB_E_RANGE },
+                { "glue, a record cut short", cut, sizeof(cut), true, true, KDB_E_RANGE },
+                { "glue, the indexes go back", back, sizeof(back), true, true, KDB_E_RANGE },
+                { "glue, an index that names no NS name", ns2, sizeof(ns2), true, true, KDB_E_RANGE },
+                { "glue without the apex", a1, sizeof(a1), true, false, KDB_E_TLV_MISSING },
+            };
+            for (size_t i = 0; i < sizeof(gc) / sizeof(gc[0]); i++) {
+                kdb_enc_reset(&e);
+                kdb_enc_begin(&e, KDB_T_ZONE_BEGIN);
+                kdb_enc_u16(&e, 1, 1); kdb_enc_name(&e, 2, ZN); kdb_enc_i64(&e, 3, 5); kdb_enc_u8(&e, 4, KDB_ZK_PRIMARY); kdb_enc_u32(&e, 5, 9);
+                kdb_enc_u32(&e, 6, KDB_ZF_SUMMARY); kdb_enc_u64(&e, 7, 0); kdb_enc_bytes(&e, 8, zd, sizeof(zd)); kdb_enc_u64(&e, 11, 5);
+                kdb_enc_u32(&e, 12, 3600); kdb_enc_u32(&e, 13, 600); kdb_enc_u32(&e, 14, 1209600);
+                if (gc[i].apex) {
+                    kdb_enc_name(&e, 15, "ns1.hosting.example."); kdb_enc_name(&e, 16, "host.hosting.example.");
+                    kdb_enc_u32(&e, 17, 300); kdb_enc_u32(&e, 18, 900); kdb_enc_u32(&e, 19, 3600);
+                    kdb_enc_bytes(&e, 20, (const uint8_t *)"ns1.hosting.example.\nns2.hosting.example.", 41);
+                }
+                if (gc[i].tag21) kdb_enc_bytes(&e, 21, gc[i].g, gc[i].gl);
+                kdb_enc_end(&e);
+                sess_t *ts = malloc(sizeof(*ts));
+                sess_init_fetch(ts, NULL);
+                CHECK_RC(gc[i].what, sess_feed(ts, e.buf, e.len, 0), gc[i].want);
+                if (gc[i].want == KDB_OK) {
+                    const kdb_zone_begin_t *zb = &ts->m.u.zone_begin;
+                    CHECK(zb->has_apex && zb->glue_len == gc[i].gl && (gc[i].gl == 0 ? zb->glue == NULL : memcmp(zb->glue, gc[i].g, gc[i].gl) == 0));
+                }
+                free(ts);
+            }
+            CHECK(kdb_apex_glue_valid(two, sizeof(two), 1) && !kdb_apex_glue_valid(ns1, sizeof(ns1), 1) && kdb_apex_glue_valid(NULL, 0, 1));
+        }
         /* a zone without the tags has no apex */
         kdb_enc_reset(&e); fz_begin(&e, 1, ZN, 0, KDB_ZF_SUMMARY, KDB_ZK_PRIMARY, 5);
         sess_t *ts = malloc(sizeof(*ts));
@@ -1843,6 +1898,10 @@ static int gen_corpus_fetch(const char *dir) {
         kdb_enc_u32(&e, 12, 3600); kdb_enc_u32(&e, 13, 600); kdb_enc_u32(&e, 14, 1209600);
         kdb_enc_name(&e, 15, "ns1.hosting.example."); kdb_enc_name(&e, 16, "host.hosting.example."); kdb_enc_u32(&e, 17, 300); kdb_enc_u32(&e, 18, 900); kdb_enc_u32(&e, 19, 3600);
         kdb_enc_bytes(&e, 20, (const uint8_t *)"ns1.hosting.example.\nns2.hosting.example.", 41);
+        {   /* (the glue of tag 21: an A and an AAAA record of the first name) */
+            static const uint8_t gl[] = { 0, 1, 0, 0, 0x0e, 0x10, 192, 0, 2, 53, 0, 28, 0, 0, 0x0e, 0x10, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 };
+            kdb_enc_bytes(&e, 21, gl, sizeof(gl));
+        }
         kdb_enc_end(&e);
         m_zone_end(&e, 0);
     }
@@ -1861,6 +1920,9 @@ static int gen_corpus_fetch(const char *dir) {
     kdb_enc_end(&e);
     kdb_enc_begin(&e, KDB_T_ZONE_RESULT);                       /* D1a: SEND_BODY, the answer to a summary of a zone that has its data */
     kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "res.test."); kdb_enc_u8(&e, 3, KDB_ST_SEND_BODY);
+    kdb_enc_end(&e);
+    kdb_enc_begin(&e, KDB_T_ZONE_RESULT);                       /* D1a: NOT_RESIDENT, the answer to a body the Backend left out of memory */
+    kdb_enc_u16(&e, 1, 1); kdb_enc_name(&e, 2, "cold.test."); kdb_enc_u8(&e, 3, KDB_ST_NOT_RESIDENT);
     kdb_enc_end(&e);
     rc |= write_seed(dir, "seed_backend_fetch.bin", 0x80, &e);
     kdb_enc_free(&e);

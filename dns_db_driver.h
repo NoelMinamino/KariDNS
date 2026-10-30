@@ -105,10 +105,14 @@ static inline void db_list_add(char *list, size_t cap, unsigned *n, const char *
 }
 
 typedef int (*db_zone_cb)(void *ud, const db_zone_row_t *row);
-/* D1a step 6: the enabled SOA and NS records at the apex of a zone (the name of the record is the name of the domain), for the summary of a zone */
+/* D1a step 6: the enabled SOA and NS records at the apex of a zone (the name of the record is the name of the domain), for the summary of a zone; and
+ * the enabled A and AAAA records of the zone whose name is the target of one of its apex NS records, when that target is at or below the apex (the
+ * glue, RFC 2181 9; the comparison of the names ignores case and a trailing dot of the NS target).  ORDER BY domain_id, id. */
 typedef struct {
     int64_t domain_id;
-    bool is_soa;                                /* else NS */
+    bool is_soa;                                /* SOA (else NS, or an address: addr_type != 0) */
+    uint16_t addr_type;                         /* 0: an SOA or NS record; 1: an A record; 28: an AAAA record (content is the address as text) */
+    const char *name;                           /* the owner of the record (the zone's name for SOA and NS) */
     const char *content;
     bool ttl_null;
     int64_t ttl;

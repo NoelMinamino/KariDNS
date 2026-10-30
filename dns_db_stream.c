@@ -48,7 +48,7 @@ static const kdb_tspec_t sp_zone_begin[] = {
     S(KT_BYTES, KS_REQ | KS_EXACT, KDB_DIGEST_LEN), S(KT_TEXT, 0, 65535), S(KT_STR, KS_NE, 255), S(KT_U64, 0, 0),
     S(KT_U32, 0, 0), S(KT_U32, 0, 0), S(KT_U32, 0, 0),
     S(KT_NAME, 0, 0), S(KT_NAME, 0, 0), S(KT_U32, KS_MAXV, 2147483647u), S(KT_U32, KS_MAXV, 2147483647u), S(KT_U32, KS_MAXV, 2147483647u),
-    S(KT_BYTES, 0, KDB_APEX_NS_BYTES) };
+    S(KT_BYTES, 0, KDB_APEX_NS_BYTES), S(KT_BYTES, 0, KDB_APEX_GLUE_BYTES) };
 static const kdb_tspec_t sp_zone_end[] = { S(KT_U64, KS_REQ, 0) };
 static const kdb_tspec_t sp_zone_abort[] = { S(KT_STR, KS_REQ, 255) };
 static const kdb_tspec_t sp_zone_failed[] = { S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0), S(KT_STR, KS_REQ, 255), S(KT_U64, 0, 0) };
@@ -183,6 +183,25 @@ const char *kdb_rc_name(kdb_rc_t rc) {
 typedef struct { bool present; uint64_t u; const uint8_t *p; uint32_t len; } kdb_val_t;
 
 /* A canonical absolute presentation-format name: dns_name_normalize() returns it unchanged. */
+/* The glue list of a summary's apex: records ns index u8 | type u8 | ttl u32 | address, the indexes (< ns_count) not decreasing, at most KDB_APEX_GLUE_PER_NS
+ * records for one index, each address as long as its type says (RFC 1035 3.4.1: an A record is 4 octets, RFC 3596 2.2: AAAA is 16), the TTL at most 2^31 - 1
+ * (RFC 2181 8).  The bytes come from a loader that is not trusted. */
+bool kdb_apex_glue_valid(const uint8_t *p, size_t len, unsigned ns_count) {
+    unsigned last = 0, per = 0;
+    for (size_t i = 0; i < len;) {
+        if (len - i < 6) return false;
+        unsigned idx = p[i], type = p[i + 1];
+        uint32_t ttl = ((uint32_t)p[i + 2] << 24) | ((uint32_t)p[i + 3] << 16) | ((uint32_t)p[i + 4] << 8) | p[i + 5];
+        size_t al = type == 1 ? 4 : type == 28 ? 16 : 0;
+        if (al == 0 || len - i - 6 < al || idx >= ns_count || idx < last || ttl > 2147483647u) return false;
+        per = idx == last && i != 0 ? per + 1 : 1;
+        if (per > KDB_APEX_GLUE_PER_NS) return false;
+        last = idx;
+        i += 6 + al;
+    }
+    return true;
+}
+
 static bool name_ok(const uint8_t *p, size_t n) {
     if (n == 0 || n > DNS_NAME_TEXT_SIZE - 1) return false;
     for (size_t i = 0; i < n; i++)   /* canonical text is graphic ASCII only (space, controls, >= 0x7F are \DDD) */
@@ -366,6 +385,7 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
             unsigned np = 0;
             for (unsigned t = 15; t <= 20; t++) np += V(t).present ? 1u : 0u;
             if (np != 0 && np != 6) FAIL(why, wl, KDB_E_TLV_MISSING, "ZONE_BEGIN: the apex (tags 15 to 20) comes all together or not at all");
+            if (V(21).present && np != 6) FAIL(why, wl, KDB_E_TLV_MISSING, "ZONE_BEGIN: the glue (tag 21) is part of the apex (tags 15 to 20)");
             if (np == 6) {
                 if (!(z->flags & KDB_ZF_SUMMARY) || !V(12).present)
                     FAIL(why, wl, KDB_E_RANGE, "ZONE_BEGIN: the apex of a zone is for a summary with the SOA timers only");
@@ -378,6 +398,14 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
                         FAIL(why, wl, KDB_E_TLV_NAME, "ZONE_BEGIN: tag 20 is not a list of 1 to %u canonical absolute names", (unsigned)KDB_APEX_NS_MAX);
                     cnt++;
                     start = i + 1;
+                }
+                z->glue = NULL;
+                z->glue_len = 0;
+                if (V(21).present && V(21).len > 0) {
+                    if (!kdb_apex_glue_valid(V(21).p, V(21).len, cnt))
+                        FAIL(why, wl, KDB_E_RANGE, "ZONE_BEGIN: tag 21 is not a list of address records of the names of tag 20");
+                    z->glue = V(21).p;
+                    z->glue_len = (uint16_t)V(21).len;
                 }
                 z->has_apex = true;
                 gname(z->soa_mname, &V(15));

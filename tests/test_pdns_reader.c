@@ -2098,8 +2098,8 @@ static void test_summary_apex(void) {
     printf("summary of a primary zone (D1a step 6): the apex, tags 15 to 20\n");
     pdns_zone_t *z = pdns_zone_new("s.test", NULL);
     pdns_zone_set_summary(z, 4711, true, 7200, 3600, 1209600);
-    CHECK(pdns_zone_set_apex(z, "ns1.hosting.example.", "host.hosting.example.", 4000000000u, 900, 4294967295u, "ns1.hosting.example.\nns2.hosting.example.") == 0);
-    CHECK(pdns_zone_set_apex(z, "ns1.hosting.example.", "host.hosting.example.", 4000000000u, 900, 4294967295u, "ns1.hosting.example.\nns2.hosting.example.") == 0);   /* (again: the first copy is freed) */
+    CHECK(pdns_zone_set_apex(z, "ns1.hosting.example.", "host.hosting.example.", 4000000000u, 900, 4294967295u, "ns1.hosting.example.\nns2.hosting.example.", NULL, 0) == 0);
+    CHECK(pdns_zone_set_apex(z, "ns1.hosting.example.", "host.hosting.example.", 4000000000u, 900, 4294967295u, "ns1.hosting.example.\nns2.hosting.example.", NULL, 0) == 0);   /* (again: the first copy is freed) */
     CHECK(pdns_zone_finish(z) == 0);
     pdns_kdb_params_t p = { 2, 99, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 };
     rt_buf_t b = {0};
@@ -2116,12 +2116,35 @@ static void test_summary_apex(void) {
     CHECK(zb->has_apex && strcmp(zb->soa_mname, "ns1.hosting.example.") == 0 && strcmp(zb->soa_rname, "host.hosting.example.") == 0);
     CHECK(zb->soa_minimum == 2147483647u && zb->soa_ttl == 900 && zb->ns_ttl == 2147483647u && zb->ns_count == 2);
     CHECK(zb->ns_names_len == strlen("ns1.hosting.example.\nns2.hosting.example.") && memcmp(zb->ns_names, "ns1.hosting.example.\nns2.hosting.example.", zb->ns_names_len) == 0);
+    CHECK(zb->glue == NULL && zb->glue_len == 0);                      /* (no glue was given) */
     free(b.buf);
     pdns_zone_free(z);
+    {   /* the glue (tag 21): copied with the apex, on the wire as given, replaced by the next call */
+        static const uint8_t gl[] = { 0, 1, 0, 0, 0x0e, 0x10, 192, 0, 2, 53 };
+        pdns_zone_t *zg = pdns_zone_new("g.test", NULL);
+        pdns_zone_set_summary(zg, 4711, true, 7200, 3600, 1209600);
+        CHECK(pdns_zone_set_apex(zg, "ns1.g.test.", "host.g.test.", 300, 900, 3600, "ns1.g.test.", gl, sizeof(gl)) == 0);
+        CHECK(pdns_zone_set_apex(zg, "ns1.g.test.", "host.g.test.", 300, 900, 3600, "ns1.g.test.", gl, sizeof(gl)) == 0);
+        CHECK(pdns_zone_finish(zg) == 0);
+        rt_buf_t bg = {0};
+        CHECK(pdns_zone_encode_kdb(zg, &p, rt_emit, &bg, err, sizeof(err)) == 0);
+        kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
+        CHECK(kdb_framer_feed(&f, bg.buf, bg.len) == KDB_OK && kdb_framer_next(&f, &fr) == KDB_OK);
+        CHECK(kdb_decode(&fr, KDB_VIEWS_ANY, &msg, why, sizeof(why)) == KDB_OK);
+        CHECK(msg.u.zone_begin.has_apex && msg.u.zone_begin.glue_len == sizeof(gl) && memcmp(msg.u.zone_begin.glue, gl, sizeof(gl)) == 0);
+        free(bg.buf);
+        pdns_zone_free(zg);
+        /* the addresses: the octets of the RDATA of an A / AAAA record, 0 for anything else */
+        uint8_t ad[16];
+        CHECK(pdns_apex_addr(1, "192.0.2.53", ad) == 4 && ad[0] == 192 && ad[3] == 53);
+        CHECK(pdns_apex_addr(28, "2001:db8::53", ad) == 16 && ad[0] == 0x20 && ad[15] == 0x53);
+        CHECK(pdns_apex_addr(1, "2001:db8::53", ad) == 0 && pdns_apex_addr(28, "192.0.2.53", ad) == 0 && pdns_apex_addr(1, "192.0.2.256", ad) == 0);
+        CHECK(pdns_apex_addr(1, "", ad) == 0 && pdns_apex_addr(1, NULL, ad) == 0 && pdns_apex_addr(2, "192.0.2.53", ad) == 0);
+    }
     {   /* without the timers there is no apex on the wire (the Backend takes tags 15..20 with the timers only) */
         pdns_zone_t *z2 = pdns_zone_new("t.test", NULL);
         pdns_zone_set_summary(z2, 5, false, 0, 0, 0);
-        CHECK(pdns_zone_set_apex(z2, "a.example.", "b.example.", 1, 2, 3, "c.example.") == 0 && pdns_zone_finish(z2) == 0);
+        CHECK(pdns_zone_set_apex(z2, "a.example.", "b.example.", 1, 2, 3, "c.example.", NULL, 0) == 0 && pdns_zone_finish(z2) == 0);
         rt_buf_t b2 = {0};
         CHECK(pdns_zone_encode_kdb(z2, &p, rt_emit, &b2, err, sizeof(err)) == 0);
         kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));

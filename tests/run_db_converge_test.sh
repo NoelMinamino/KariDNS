@@ -61,8 +61,12 @@ WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < $((NZ -
 INSERT INTO domains (name, type) SELECT printf('z%04d.test', i), 'NATIVE' FROM n;
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
   SELECT id, name, 'SOA', 'ns1.hosting.example host.hosting.example 7 3600 600 86400 300', 900, 0, 0 FROM domains;
-INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.hosting.example', 3600, 0, 0 FROM domains WHERE name <> 'l.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.hosting.example', 3600, 0, 0 FROM domains WHERE name NOT IN ('l.test', 'e.test');
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns2.hosting.example', 3600, 0, 0 FROM domains WHERE name <> 'l.test';
+-- e: one NS target inside the zone, with an AAAA and an A record (the AAAA first), and one outside every zone
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.e.test', 3600, 0, 0 FROM domains WHERE name = 'e.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns1.e.test', 'AAAA', '2001:db8::5', 600, 0, 0 FROM domains WHERE name = 'e.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns1.e.test', 'A', '192.0.2.5', 300, 0, 0 FROM domains WHERE name = 'e.test';
 $LONGNS
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'www.' || name, 'A', '192.0.2.80', 300, 0, 0 FROM domains;
 WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < $((BIGN - 1)))
@@ -128,10 +132,14 @@ echo "  limit $LIM, resident $RES (the pinned zone)"
 [ "$RES" -ge $((LIM / 100 * 96)) ] && [ "$RES" -le $((LIM / 10 * 11)) ] && pass "the database zones are above the high mark and below the hard limit (BIGN=$BIGN)" || fail "resident $RES is not between 96% and 110% of $LIM: set BIGN"
 oom e.test && pass "e.test starts out of memory (a summary)" || fail "e.test is not out of memory"
 [ "$(soa_serial e.test)" = "7" ] && oom e.test && pass "its SOA question is answered from the summary (the zone stays out of memory)" || fail "e.test SOA / out of memory: $(soa_serial e.test)"
+UE0=$(probe udp e.test SOA 1232 0)
+[ "$(echo "$UE0" | cut -c21-24)" = "0003" ] && pass "the summary answer has the glue of ns1.e.test: AAAA and A (and the OPT record) in Additional" || fail "e.test: ARCOUNT $(echo "$UE0" | cut -c21-24)"
 q www.e.test > /dev/null
 oom e.test && fail "e.test was not fetched" || pass "e.test is fetched for a query"
 wait_oom e.test 20 && pass "the cache manager takes it out again (the loader is not told)" || fail "e.test stays in memory"
+UE1=$(probe udp e.test SOA 1232 0)
 [ "$(soa_serial e.test)" = "7" ] && oom e.test && pass "the SOA question is answered from the apex built from the image that left (no second fetch)" || fail "e.test was read again for its SOA question"
+[ -n "$UE0" ] && [ "$UE0" = "$UE1" ] && pass "... and it is the answer of the summary, glue included, byte for byte (zone order, TTLs)" || fail "e.test: summary $UE0 / image $UE1"
 C0=$(stat cold)
 sqlite3 "$T/db/z.db" "UPDATE records SET content = 'ns1.hosting.example host.hosting.example 8 3600 600 86400 300' WHERE type = 'SOA' AND name = 'e.test'; INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'new.e.test', 'A', '192.0.2.99', 300, 0, 0 FROM domains WHERE name = 'e.test';"
 $KCTL reload e.test > /dev/null 2>&1

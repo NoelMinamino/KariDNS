@@ -177,6 +177,8 @@ typedef struct pdns_zone_s {
     char *sum_apex;                 /* D1a step 6: the apex of the summary, one block: mname NUL rname NUL the NS names separated by LF NUL (pdns_zone_set_apex()) */
     const char *sum_mname, *sum_rname, *sum_ns;
     uint32_t sum_minimum, sum_soa_ttl, sum_ns_ttl;
+    const uint8_t *sum_glue;        /* the glue of the apex (tag 21 of ZONE_BEGIN), inside sum_apex; NULL / 0: none */
+    size_t sum_glue_len;
     char *nsec3param;               /* NSEC3PARAM metadata (first row), NULL if none */
     presigned_mode_t presigned_mode;   /* PS_NSEC3 / PS_NSEC: the chain was rebuilt; PS_NONE: served as stored */
     size_t n_synth;                 /* records presigned_rebuild() added at the end of arena.records */
@@ -241,8 +243,13 @@ bool pdns_soa_apex(const char *content, char mname[DNS_NAME_TEXT_SIZE], char rna
 /* D1a step 6: the target of an NS record as the Backend gets it: a canonical absolute name.  false if it is not a name. */
 bool pdns_apex_name(const char *raw, char out[DNS_NAME_TEXT_SIZE]);
 /* D1a step 6: give a summary (pdns_zone_set_summary()) the apex of the zone: the SOA's names and minimum, the TTLs (RFC 2181 8: at most 2^31 - 1, larger values are
- * rounded down), and the NS targets, canonical absolute names separated by LF (1..KDB_APEX_NS_MAX of them).  The names are copied.  -1: out of memory. */
-int pdns_zone_set_apex(pdns_zone_t *z, const char *mname, const char *rname, uint32_t minimum, uint32_t soa_ttl, uint32_t ns_ttl, const char *ns_lf);
+ * rounded down), the NS targets, canonical absolute names separated by LF (1..KDB_APEX_NS_MAX of them), and the glue (glue_len octets, the records of tag 21 of
+ * ZONE_BEGIN; none when 0).  Everything is copied.  -1: out of memory. */
+int pdns_zone_set_apex(pdns_zone_t *z, const char *mname, const char *rname, uint32_t minimum, uint32_t soa_ttl, uint32_t ns_ttl, const char *ns_lf,
+                       const uint8_t *glue, size_t glue_len);
+/* D1a step 6 (in-zone glue): the address of an A (type 1) or AAAA (type 28) record as the octets of its RDATA (RFC 1035 3.4.1, RFC 3596 2.2): 4 or 16, 0 if the
+ * text is not an address of that kind. */
+size_t pdns_apex_addr(uint16_t type, const char *content, uint8_t out[16]);
 
 /* The line-safety rules above on s[0..len).  is_owner: the stricter owner rules.  Returns NULL if safe, else a
  * static reason text.  s may contain NUL (it is rejected). */

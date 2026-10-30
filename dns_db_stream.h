@@ -56,6 +56,9 @@
  *                     D1a step 6, a summary only, tags 12..14 required, all of 15..20 or none: the apex of the zone, for the answer to an SOA question when the
  *                     zone is not in memory.  15 soa_mname name | 16 soa_rname name | 17 soa_minimum u32 | 18 soa_ttl u32 | 19 ns_ttl u32 (the three
  *                     TTLs <= 2147483647, RFC 2181 8) | 20 ns_names bytes<=2047: 1..8 canonical absolute names of the apex NS RRset, separated by one LF.
+ *                     21 glue bytes<=2048 O (with 15..20): the addresses of the NS targets that are inside the zone, which the answer carries in Additional
+ *                     (RFC 2181 9).  Records of  index u8 (the position of the name in tag 20) | type u8 (1 A, 28 AAAA) | ttl u32 (<= 2147483647) |
+ *                     address (4 or 16 octets, RFC 1035 3.4.1, RFC 3596 2.2); the indexes do not decrease, at most 8 records for one index.
  *   ZONE_DATA (5)     raw DNS message (<= 65,535 bytes), no TLV
  *   ZONE_END (6)      1 rr_count u64 R
  *   ZONE_ABORT (7)    1 reason str<=255 R
@@ -143,6 +146,8 @@ enum { KDB_ZK_PRIMARY = 0, KDB_ZK_SECONDARY, KDB_ZK_CATALOG };
 #define KDB_ZF_TINYDNS 0x4u     /* B8: the zone is a tinydns zone (ZONE_IMAGE_F_TINYDNS: time-dependent TTLs, never cached), also without any time stamp or location */
 #define KDB_APEX_NS_MAX 8        /* D1a step 6: NS names of a summary's apex */
 #define KDB_APEX_NS_BYTES 2047   /* ... and the bytes of their list (8 names of 253 characters and the separators) */
+#define KDB_APEX_GLUE_PER_NS 8   /* addresses of one NS target in the glue list */
+#define KDB_APEX_GLUE_BYTES 2048 /* ... and the bytes of the list (8 names, 8 AAAA records of 22 octets each: 1408) */
 #define KDB_ZF_SUMMARY 0x8u     /* D1a, fetch stream: the zone's summary (serial, kind, settings), no ZONE_DATA, rr_count 0, zero digest */
 enum { KDB_ST_APPLIED = 0, KDB_ST_UNCHANGED, KDB_ST_REJECTED, KDB_ST_SHADOWED, KDB_ST_DELETED,
        KDB_ST_SEND_BODY,       /* D1a: SEND_BODY, to a summary (or to a zone body that was left out): the zone is in the Backend's memory in another version than the loader says, send it whole */
@@ -234,6 +239,8 @@ typedef struct {
     const char *ns_names;       /* the names separated by LF; points into the frame, valid until the next frame is read */
     uint16_t ns_names_len;
     uint8_t ns_count;
+    const uint8_t *glue;        /* tag 21 (validated by the decoder), NULL when there is none; points into the frame like ns_names */
+    uint16_t glue_len;
 } kdb_zone_begin_t;
 typedef struct {
     const uint8_t *body; uint32_t len;   /* the DNS message */
@@ -287,6 +294,8 @@ typedef struct {
 /* Decode one frame of either direction (the type says which).  view_count: number of configured views, or
  * KDB_VIEWS_ANY.  why (>= KDB_REASON_LEN bytes) receives the reason on error. */
 kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t view_count, kdb_msg_t *msg, char *why, size_t whylen);
+/* D1a step 6: is p a glue list as tag 21 of ZONE_BEGIN describes it, for an apex with ns_count NS names? */
+bool kdb_apex_glue_valid(const uint8_t *p, size_t len, unsigned ns_count);
 
 /* Repeated nested entries of CONFIG and INVENTORY.  The entries were validated by kdb_decode(); the iterator
  * checks again and simply ends on anything unexpected. */

@@ -6,7 +6,10 @@
 # that polls the SOA of a zone then does not make the server read the zone.  Checked:
 #   - the answer to an SOA question at the apex of a zone that is out of memory (UDP, UDP with EDNS, TCP) leaves the zone out of memory, and is the
 #     same bytes as the answer of the zone once it is in memory (RFC 1035 3.3.13 SOA, RFC 2181 5.2 the NS RRset has the lowest TTL, NS in Authority)
-#   - a question that the summary cannot answer as the zone would (DO=1, a zone whose NS target has glue in the zone, another qtype) reads the zone
+#   - the addresses of the NS targets that are inside the zone (the glue of the Additional section, RFC 2181 9) are in the summary too: an NS target with an A and an
+#     AAAA record (the order of the zone, the lowest TTL of the A records), a target in capitals, one without any address, an NS RRset of targets inside the zone and outside
+#     every zone: the answer (UDP, UDP + EDNS, TCP) is the answer of the zone in memory, byte for byte; additional-from-auth no / in-domain follow
+#   - a question that the summary cannot answer as the zone would (DO=1, a zone whose NS target is in another zone of the view, another qtype) reads the zone
 #   - minimal-responses yes: the same answer without the NS RRset
 #   - `notify no` and no allow-transfer: the zone keeps no apex (its SOA question reads the zone); with allow-transfer it keeps it
 #   - the apex follows the database: a changed SOA and NS RRset reach the next summary
@@ -49,11 +52,31 @@ sqlite3 "$T/db/z.db" < tests/db/pdns_schema.sqlite3.sql > /dev/null
 # a e f: NS targets that no zone of this server contains; b: an NS target inside the zone, with an address; c: TTLs and the case of its own, the NS
 # RRset has two TTLs (the lower one is the RRset's); d: allow-transfer
 sqlite3 "$T/db/z.db" <<SQL
-INSERT INTO domains (name, type) VALUES ('a.test', 'NATIVE'), ('b.test', 'NATIVE'), ('c.test', 'NATIVE'), ('d.test', 'NATIVE'), ('e.test', 'NATIVE'), ('f.test', 'NATIVE');
+INSERT INTO domains (name, type) VALUES ('a.test', 'NATIVE'), ('b.test', 'NATIVE'), ('c.test', 'NATIVE'), ('d.test', 'NATIVE'), ('e.test', 'NATIVE'), ('f.test', 'NATIVE'),
+  ('g.test', 'NATIVE'), ('m.test', 'NATIVE'), ('s.test', 'NATIVE'), ('sub.s.test', 'NATIVE'), ('t.test', 'NATIVE'), ('h.test', 'NATIVE');
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'SOA', 'ns1.hosting.example host.hosting.example 7 3600 600 86400 300', 900, 0, 0 FROM domains WHERE name <> 'c.test';
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'SOA', 'NS1.Hosting.Example hostmaster.c.test 2024010101 7200 1200 1209600 120', 7200, 0, 0 FROM domains WHERE name = 'c.test';
-INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.hosting.example', 3600, 0, 0 FROM domains WHERE name NOT IN ('b.test', 'c.test');
-INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns2.hosting.example', 3600, 0, 0 FROM domains WHERE name NOT IN ('b.test', 'c.test');
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.hosting.example', 3600, 0, 0 FROM domains WHERE name NOT IN ('b.test', 'c.test', 'g.test', 'm.test', 's.test', 'h.test');
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns2.hosting.example', 3600, 0, 0 FROM domains WHERE name NOT IN ('b.test', 'c.test', 'g.test', 'm.test', 's.test', 't.test', 'h.test');
+-- g: three targets inside the zone (one in capitals); the AAAA of ns1 comes first in the zone, its A records have two TTLs; m: one inside, one outside every zone;
+-- s: the target is in the zone sub.s.test, which is a zone of the view too; t: a target inside the zone without an address; h: the A record of the target has the NS in capitals
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.g.test', 3600, 0, 0 FROM domains WHERE name = 'g.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns2.g.test.', 3600, 0, 0 FROM domains WHERE name = 'g.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'NS3.G.TEST', 3600, 0, 0 FROM domains WHERE name = 'g.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns1.g.test', 'AAAA', '2001:db8::10', 600, 0, 0 FROM domains WHERE name = 'g.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns1.g.test', 'A', '192.0.2.10', 300, 0, 0 FROM domains WHERE name = 'g.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns1.g.test', 'A', '192.0.2.11', 120, 0, 0 FROM domains WHERE name = 'g.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns2.g.test', 'A', '192.0.2.20', 3600, 0, 0 FROM domains WHERE name = 'g.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns2.g.test', 'AAAA', '2001:db8::20', 3600, 0, 0 FROM domains WHERE name = 'g.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns3.g.test', 'A', '192.0.2.30', 300, 0, 0 FROM domains WHERE name = 'g.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.m.test', 3600, 0, 0 FROM domains WHERE name = 'm.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns2.hosting.example', 3600, 0, 0 FROM domains WHERE name = 'm.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns1.m.test', 'A', '192.0.2.40', 3600, 0, 0 FROM domains WHERE name = 'm.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.sub.s.test', 3600, 0, 0 FROM domains WHERE name = 's.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns1.sub.s.test', 'A', '192.0.2.50', 3600, 0, 0 FROM domains WHERE name = 'sub.s.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns9.t.test', 3600, 0, 0 FROM domains WHERE name = 't.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'NS1.H.TEST', 3600, 0, 0 FROM domains WHERE name = 'h.test';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns1.h.test', 'A', '192.0.2.60', 3600, 0, 0 FROM domains WHERE name = 'h.test';
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.hosting.example', 600, 0, 0 FROM domains WHERE name = 'c.test';
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'Ns3.Hosting.example', 300, 0, 0 FROM domains WHERE name = 'c.test';
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.b.test', 3600, 0, 0 FROM domains WHERE name = 'b.test';
@@ -87,6 +110,7 @@ start_srv() {
     sleep 1
 }
 stat() { $KCTL dbstatus 2>/dev/null | grep '^cache:' | sed -n "s/.* $1=\([0-9]*\).*/\1/p" | tail -1; }
+oom() { $KCTL dbstatus "$1" 2>/dev/null | grep -q "out of memory"; }       # oom ZONE: its data is out of memory
 q() { ./dag @127.0.0.1 -p "$PORT" "$1" A +short +nohexdump +time=5 +tries=1 2>/dev/null | head -1; }
 probe() { perl tests/db/dns_soa_probe.pl 127.0.0.1 "$PORT" "$@"; }       # probe PROTO NAME QTYPE EDNS DO
 
@@ -121,9 +145,43 @@ R=$(stat resident)
 probe udp e.test SOA 1232 1 > /dev/null
 [ "$(stat resident)" -gt "$R" ] && pass "e.test: DO=1 reads the zone (the RRSIGs are not in the summary)" || fail "e.test: DO=1 was answered without the zone"
 R=$(stat resident)
-probe udp b.test SOA 0 0 > /dev/null
-[ "$(stat resident)" -gt "$R" ] && pass "b.test: an NS target inside the zone (glue) reads the zone" || fail "b.test was answered without the zone"
-./dag @127.0.0.1 -p "$PORT" b.test SOA +nohexdump +noall +additional +time=5 +tries=1 2>&1 | grep -q '192.0.2.53' && pass "b.test: the answer has the glue" || fail "b.test: no glue in the answer"
+probe udp s.test SOA 0 0 > /dev/null
+[ "$(stat resident)" -gt "$R" ] && pass "s.test: an NS target in another zone of the view (sub.s.test) reads the zone" || fail "s.test was answered without the zone"
+stop_srv
+
+glue_case() {   # glue_case ZONE ADDRESSES: the answer from the summary (UDP, UDP + EDNS, TCP) is the answer of the zone in memory, which has ADDRESSES address records in Additional
+    gz=$1
+    su=$(probe udp $gz SOA 0 0); se=$(probe udp $gz SOA 1232 0); st=$(probe tcp $gz SOA 0 0)
+    oom $gz && pass "$gz: the SOA questions (UDP, UDP + EDNS, TCP) are answered from the summary: the zone stays out of memory" || fail "$gz was read for its SOA question"
+    q www.$gz > /dev/null
+    ru=$(probe udp $gz SOA 0 0); re=$(probe udp $gz SOA 1232 0); rt=$(probe tcp $gz SOA 0 0)
+    [ -n "$su" ] && [ "$su" = "$ru" ] && pass "$gz: the answer from the summary is the answer of the zone in memory, byte for byte (UDP)" || fail "$gz UDP: summary $su / zone $ru"
+    [ -n "$se" ] && [ "$se" = "$re" ] && pass "$gz: ... with EDNS" || fail "$gz EDNS: summary $se / zone $re"
+    [ -n "$st" ] && [ "$st" = "$rt" ] && pass "$gz: ... over TCP" || fail "$gz TCP: summary $st / zone $rt"
+    gn=$(./dag @127.0.0.1 -p "$PORT" $gz SOA +nohexdump +noall +additional +time=5 +tries=1 2>&1 | grep -cE 'IN[[:space:]]+(A|AAAA)[[:space:]]')
+    [ "$gn" = "$2" ] && pass "$gz: $gn address record(s) in Additional" || fail "$gz: $gn address record(s) in Additional, expected $2"
+}
+
+echo "== the addresses of the NS targets inside the zone"
+conf ""
+start_srv
+glue_case b.test 1          # one A record
+glue_case g.test 6          # AAAA, A, A of ns1 (zone order, A TTLs 120), A and AAAA of ns2, A of ns3 (in capitals in the NS)
+glue_case m.test 1          # ns1.m.test inside the zone; ns2.hosting.example in no zone: no address
+glue_case t.test 0          # a target inside the zone without an address
+glue_case h.test 1          # the NS target in capitals, the A record in lower case
+./dag @127.0.0.1 -p "$PORT" g.test SOA +nohexdump +noall +additional +time=5 +tries=1 2>&1 | grep -E 'ns1.g.test.[[:space:]]+[0-9]+[[:space:]]+IN[[:space:]]+A[[:space:]]' | awk '{print $2}' | sort -u | tr '\n' ' ' > "$T/ttl.out"
+[ "$(cat "$T/ttl.out")" = "120 " ] && pass "g.test: the A records of ns1 have the lowest TTL of their RRset (120)" || fail "g.test: A TTLs: $(cat "$T/ttl.out")"
+stop_srv
+
+echo "== additional-from-auth"
+conf "additional-from-auth no;"
+start_srv
+glue_case g.test 0
+stop_srv
+conf "additional-from-auth in-domain;"
+start_srv
+glue_case m.test 1
 stop_srv
 
 echo "== minimal-responses yes"
@@ -137,6 +195,10 @@ MR=$(probe udp a.test SOA 0 0)
 [ -n "$MU" ] && [ "$MU" = "$MR" ] && pass "and it is what the zone in memory gives (with minimal-responses)" || fail "minimal-responses: summary $MU / zone $MR"
 ./dag @127.0.0.1 -p "$PORT" a.test SOA +nohexdump +noall +authority +time=5 +tries=1 > "$T/m.out" 2>&1
 [ ! -s "$T/m.out" ] && pass "... without the NS RRset" || fail "authority section: $(cat "$T/m.out")"
+GU=$(probe udp g.test SOA 0 0)
+oom g.test && pass "g.test (addresses of its NS targets in the summary) is answered from it" || fail "g.test was read"
+q www.g.test > /dev/null
+[ -n "$GU" ] && [ "$GU" = "$(probe udp g.test SOA 0 0)" ] && pass "and it is what the zone in memory gives with minimal-responses: no NS, no glue" || fail "g.test minimal-responses differ"
 stop_srv
 
 echo "== notify no: only a zone with allow-transfer keeps its apex"

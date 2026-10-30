@@ -41,6 +41,7 @@
 
 _Static_assert(KARIDNS_DB_MAX_VIEWS == KDB_MAX_CONFIG_VIEWS, "the configuration check and the CONFIG message must agree");
 _Static_assert(ZDIR_APEX_NS_MAX == KDB_APEX_NS_MAX, "the apex block and the ZONE_BEGIN apex agree on the number of NS names");
+_Static_assert(ZDIR_APEX_GLUE_PER_NS == KDB_APEX_GLUE_PER_NS && ZDIR_APEX_GLUE_MAX <= KDB_APEX_GLUE_BYTES, "... and on the glue");
 
 #define ING_MAX_OUT (32u << 20)  /* queued answers the loader has not read: above this the loader is dropped */
 #define ING_ZONES_LOGGED 16       /* zones logged one by one per connection */
@@ -1523,7 +1524,7 @@ static bool apex_wanted_registry(const char *view, const char *zone) {
  * (then the SOA question reads the zone). */
 static zdir_apex_t *apex_from_begin(const kdb_zone_begin_t *zb) {
   if (!zb->has_apex || zb->ns_count == 0 || zb->ns_count > KDB_APEX_NS_MAX) return NULL;
-  uint8_t tmp[2 * 256 + KDB_APEX_NS_MAX * 256];
+  uint8_t tmp[2 * 256 + KDB_APEX_NS_MAX * 256 + KDB_APEX_GLUE_BYTES];
   uint16_t off = 0;
   uint16_t ml, rl;
   if (write_dns_name_str(tmp, &off, zb->soa_mname, NULL, sizeof(tmp)) != 0) return NULL;
@@ -1544,6 +1545,26 @@ static zdir_apex_t *apex_from_begin(const kdb_zone_begin_t *zb) {
     p += l + 1;
   }
   if (n != zb->ns_count) return NULL;
+  /* the glue: the decoder has checked it (kdb_apex_glue_valid()); the copy is bounded again, and a list longer than the block takes is no apex */
+  if (zb->glue_len > KDB_APEX_GLUE_BYTES || (zb->glue_len > 0 && !kdb_apex_glue_valid(zb->glue, zb->glue_len, n))) return NULL;
+  uint16_t ns_end = off;
+  if (zb->glue_len) {
+    /* the addresses belong to NS names that are inside the zone: the zone in memory adds nothing else to Additional from its own data.  Which names have records */
+    unsigned used = 0;
+    for (size_t i = 0; i < zb->glue_len; i += 6 + (zb->glue[i + 1] == 1 ? 4u : 16u)) used |= 1u << zb->glue[i];
+    unsigned k = 0;
+    for (const char *p = zb->ns_names, *end = zb->ns_names + zb->ns_names_len; p <= end && k < n; k++) {
+      const char *e = memchr(p, '\n', (size_t)(end - p));
+      size_t l = e ? (size_t)(e - p) : (size_t)(end - p);
+      if (l >= sizeof(nm)) return NULL;
+      memcpy(nm, p, l);
+      nm[l] = '\0';
+      if ((used & (1u << k)) && !domain_name_is_at_or_below(nm, zb->name)) return NULL;
+      p += l + 1;
+    }
+    memcpy(tmp + off, zb->glue, zb->glue_len);
+    off = (uint16_t)(off + zb->glue_len);
+  }
   zdir_apex_t *a = malloc(sizeof(*a) + off);
   if (!a) return NULL;
   a->serial = zb->serial;
@@ -1555,7 +1576,8 @@ static zdir_apex_t *apex_from_begin(const kdb_zone_begin_t *zb) {
   a->ns_ttl = zb->ns_ttl;
   a->mname_len = ml;
   a->rname_len = rl;
-  a->ns_len = (uint16_t)(off - ns_start);
+  a->ns_len = (uint16_t)(ns_end - ns_start);
+  a->glue_len = zb->glue_len;
   a->n_ns = (uint8_t)n;
   memcpy(a->data, tmp, off);
   return a;

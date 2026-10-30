@@ -225,6 +225,29 @@ static void send_dir_zone(int fd, kdb_enc_t *e, uint16_t view, const char *zone,
     ch_send(fd, e);
 }
 
+/* D1a step 6: the summary of a zone in a batch whose apex has an NS name inside the zone and one outside it, and glue for the name with the index `gidx` (0: inside the
+ * zone, 1: outside, which the Backend does not accept: no apex).  The glue: an A record and an AAAA record. */
+static void send_glue_zone(int fd, kdb_enc_t *e, uint16_t view, const char *zone, uint32_t serial, int64_t sid, uint8_t gidx) {
+    uint8_t dig[KDB_DIGEST_LEN] = { 0 };
+    char ns[300];
+    snprintf(ns, sizeof(ns), "ns1.%s\nns2.hosting.example.", zone);
+    uint8_t gl[32] = { gidx, 1, 0, 0, 0x0e, 0x10, 192, 0, 2, 53, gidx, 28, 0, 0, 0x02, 0x58, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 };
+    kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
+    kdb_enc_u16(e, 1, view); kdb_enc_name(e, 2, zone); kdb_enc_i64(e, 3, sid); kdb_enc_u8(e, 4, KDB_ZK_PRIMARY);
+    kdb_enc_u32(e, 5, serial); kdb_enc_u32(e, 6, KDB_ZF_SUMMARY); kdb_enc_u64(e, 7, 0); kdb_enc_bytes(e, 8, dig, sizeof(dig));
+    kdb_enc_u32(e, 12, 4444); kdb_enc_u32(e, 13, 555); kdb_enc_u32(e, 14, 66666);
+    char mn[300];
+    snprintf(mn, sizeof(mn), "ns1.%s", zone);
+    kdb_enc_name(e, 15, mn); kdb_enc_name(e, 16, "host.hosting.example."); kdb_enc_u32(e, 17, 300); kdb_enc_u32(e, 18, 900); kdb_enc_u32(e, 19, 3600);
+    kdb_enc_bytes(e, 20, (const uint8_t *)ns, strlen(ns));
+    kdb_enc_bytes(e, 21, gl, sizeof(gl));
+    kdb_enc_end(e);
+    kdb_enc_begin(e, KDB_T_ZONE_END);
+    kdb_enc_u64(e, 1, 0);
+    kdb_enc_end(e);
+    ch_send(fd, e);
+}
+
 static void send_failed(int fd, kdb_enc_t *e, uint16_t view, const char *zone, uint64_t req) {
     kdb_enc_begin(e, KDB_T_ZONE_FAILED);
     kdb_enc_u16(e, 1, view); kdb_enc_name(e, 2, zone); kdb_enc_i64(e, 3, 0); kdb_enc_str(e, 4, "no such zone in the database"); kdb_enc_u64(e, 5, req);
@@ -569,8 +592,10 @@ int main(void) {
             CHECK(dbreg_lookup_entry("default", "pin.test.") != NULL);
             send_dir_zone(a[0], &e, 0, "pin.test.", 9, 900001, NULL);            /* (it has its data here, in another version: the loader is asked to send it whole) */
             send_dir_zone(a[0], &e, 0, "pin.test.", 1, 900001, NULL);            /* (... and in this version: nothing to do) */
+            send_glue_zone(a[0], &e, 0, "glu.test.", 5, 60003, 0);                /* (the addresses of ns1.glu.test, inside the zone) */
+            send_glue_zone(a[0], &e, 0, "glubad.test.", 5, 60004, 1);             /* (addresses for ns2.hosting.example: not accepted, no apex) */
             kdb_enc_begin(&e, KDB_T_BATCH_END);
-            kdb_enc_u64(&e, 1, 4); kdb_enc_u32(&e, 2, 4); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+            kdb_enc_u64(&e, 1, 4); kdb_enc_u32(&e, 2, 6); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
             kdb_enc_end(&e);
             ch_send(a[0], &e);
             int st_dir1 = -1, st_dirp = -1, st_pin = -1, st_pin2 = -1;
@@ -591,6 +616,13 @@ int main(void) {
             CHECK(dap && dap->n_ns == 2 && dap->mname_len == 21 && dap->rname_len == 22 && dap->ns_len == 42);
             CHECK(dap && memcmp(dap->data, "\3ns1\7hosting\7example\0\4host\7hosting\7example\0\3ns1\7hosting\7example\0\3ns2\7hosting\7example\0", 21 + 22 + 42) == 0);
             CHECK(d1 && atomic_load(&d1->sh) != NULL && atomic_load(&d1->sh)->ext.allow_transfer_count == 1);
+            CHECK(dap && dap->glue_len == 0);                                      /* (no glue was sent for dir1) */
+            /* in-zone glue (tag 21): kept after the NS names, as sent (index, type, TTL, address); glue for a name outside the zone is no apex at all */
+            for (int i = 0; i < 100 && !elem_of("default", "glubad.test."); i++) usleep(50000);
+            const zdir_apex_t *gap = elem_of("default", "glu.test.") ? atomic_load(&elem_of("default", "glu.test.")->apex) : NULL;
+            CHECK(gap && gap->n_ns == 2 && gap->glue_len == 10 + 22);
+            CHECK(gap && memcmp(gap->data + gap->mname_len + gap->rname_len + gap->ns_len, (const uint8_t[]){ 0, 1, 0, 0, 0x0e, 0x10, 192, 0, 2, 53, 0, 28, 0, 0, 0x02, 0x58 }, 16) == 0);
+            CHECK(elem_of("default", "glubad.test.") != NULL && atomic_load(&elem_of("default", "glubad.test.")->apex) == NULL);
             zdir_elem_t *pe2 = elem_of("default", "pin.test.");
             CHECK(pe2 != NULL && zdir_entry(pe2) != NULL && pe2->serial != 9);   /* (still the zone with its data) */
             CHECK(pe2 && atomic_load(&pe2->apex) == NULL);                        /* (the summary of a zone that has its data brought none to keep) */

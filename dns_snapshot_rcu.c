@@ -2236,7 +2236,42 @@ static zdir_apex_t *apex_from_image(const zone_image_t *img) {
         ns_len += tl;
     }
     if (n == 0) return NULL;
-    zdir_apex_t *a = malloc(sizeof(*a) + ml + rnl + ns_len);
+    /* the glue: the addresses the zone adds to Additional for an NS target inside the zone (append_glue_records()): a target that carries the prelinked-glue flag
+     * gets its A and AAAA RRs in the order of the zone, any other the A RRset and then the AAAA RRset; more than ZDIR_APEX_GLUE_PER_NS of them is no apex */
+    uint8_t gl[ZDIR_APEX_GLUE_MAX];
+    size_t gl_len = 0;
+    const char *apex_text = zone_image_name_text(img, aid);
+    for (size_t i = 0; i < n && apex_text; i++) {
+        char tg[DNS_NAME_TEXT_SIZE];
+        if (zone_image_rr_target(img, ns_rr[i], tg, sizeof(tg)) != 0) return NULL;
+        if (!domain_name_is_at_or_below(tg, apex_text)) continue;
+        uint32_t tid = zone_image_find_name(img, tg);
+        if (tid == ZONE_IMAGE_NONE) continue;
+        const bool prelinked = (zone_image_name_flags(img, tid) & ZONE_IMAGE_NAME_GLUE) != 0;
+        size_t per = 0;
+        for (int pass = 0; pass < (prelinked ? 1 : 2); pass++) {
+            const uint32_t first = zone_image_name_first_rr(img, tid), end = first + zone_image_name_rr_count(img, tid);
+            for (uint32_t k = first; k < end; k++) {
+                const uint16_t ty = zone_image_rr_type(img, k);
+                if (ty != 1 && ty != 28) continue;
+                if (!prelinked && ty != (pass == 0 ? 1 : 28)) continue;
+                const size_t al = ty == 1 ? 4 : 16;
+                if (zone_image_rr_class(img, k) != 1 || (zone_image_rrs(img)[k].flags & ZONE_IMAGE_RR_RAW) || zone_image_rr_rdlen(img, k) != al ||
+                    !zone_image_rr_rdata(img, k) || zone_image_rr_ext(img, k) || ++per > ZDIR_APEX_GLUE_PER_NS || gl_len + 6 + al > sizeof(gl))
+                    return NULL;
+                const uint32_t ttl = zone_image_rr_ttl(img, k);
+                gl[gl_len++] = (uint8_t)i;
+                gl[gl_len++] = (uint8_t)ty;
+                gl[gl_len++] = (uint8_t)(ttl >> 24);
+                gl[gl_len++] = (uint8_t)(ttl >> 16);
+                gl[gl_len++] = (uint8_t)(ttl >> 8);
+                gl[gl_len++] = (uint8_t)ttl;
+                memcpy(gl + gl_len, zone_image_rr_rdata(img, k), al);
+                gl_len += al;
+            }
+        }
+    }
+    zdir_apex_t *a = malloc(sizeof(*a) + ml + rnl + ns_len + gl_len);
     if (!a) return NULL;
     a->serial = nums[0];
     a->soa_ttl = zone_image_rr_ttl(img, soa);
@@ -2248,6 +2283,7 @@ static zdir_apex_t *apex_from_image(const zone_image_t *img) {
     a->mname_len = (uint16_t)ml;
     a->rname_len = (uint16_t)rnl;
     a->ns_len = (uint16_t)ns_len;
+    a->glue_len = (uint16_t)gl_len;
     a->n_ns = (uint8_t)n;
     memcpy(a->data, rd, ml + rnl);
     uint8_t *w = a->data + ml + rnl;
@@ -2255,6 +2291,7 @@ static zdir_apex_t *apex_from_image(const zone_image_t *img) {
         memcpy(w, zone_image_rr_rdata(img, ns_rr[i]), zone_image_rr_rdlen(img, ns_rr[i]));
         w += zone_image_rr_rdlen(img, ns_rr[i]);
     }
+    if (gl_len) memcpy(w, gl, gl_len);
     return a;
 }
 

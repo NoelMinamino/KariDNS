@@ -151,10 +151,12 @@ static void drivers_list(char *out, size_t cap) {
 /* ------------------------------------------------------------------------------------------------------------- */
 
 /* D1a step 6: the apex of a zone whose summary is sent: what the Backend answers an SOA question from while the zone is out of memory.  data: the SOA's
- * MNAME NUL RNAME NUL the NS targets separated by LF NUL (canonical absolute names) */
-typedef struct lapex { uint32_t minimum, soa_ttl, ns_ttl; char data[]; } lapex_t;
+ * MNAME NUL RNAME NUL the NS targets separated by LF NUL (canonical absolute names), then glue_len octets of glue (the records of tag 21 of ZONE_BEGIN:
+ * the addresses of the NS targets inside the zone) */
+typedef struct lapex { uint32_t minimum, soa_ttl, ns_ttl; uint16_t glue_len; char data[]; } lapex_t;
 static const char *lapex_rname(const lapex_t *a) { return a->data + strlen(a->data) + 1; }
 static const char *lapex_ns(const lapex_t *a) { const char *r = lapex_rname(a); return r + strlen(r) + 1; }
+static const uint8_t *lapex_glue(const lapex_t *a) { const char *n = lapex_ns(a); return (const uint8_t *)n + strlen(n) + 1; }
 
 typedef struct {
     int64_t id;
@@ -1350,7 +1352,9 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
     if (z && skind == KDB_ZK_PRIMARY && zi->summary) {
         pdns_zone_set_summary(z, zi->serial, zi->has_timers, zi->t_refresh, zi->t_retry, zi->t_expire);
         if (zi->apex && zi->has_timers) {
-            if (pdns_zone_set_apex(z, zi->apex->data, lapex_rname(zi->apex), zi->apex->minimum, zi->apex->soa_ttl, zi->apex->ns_ttl, lapex_ns(zi->apex)) != 0) w->oom = true;
+            if (pdns_zone_set_apex(z, zi->apex->data, lapex_rname(zi->apex), zi->apex->minimum, zi->apex->soa_ttl, zi->apex->ns_ttl, lapex_ns(zi->apex),
+                                   lapex_glue(zi->apex), zi->apex->glue_len) != 0)
+                w->oom = true;
         }
     }
     if (w->oom) {
@@ -1933,6 +1937,7 @@ static int db_err(ctx_t *x, int rc, const char *what) {
 /* Forget the lists of the previous view (zones, metadata, keys).  The context keeps them after a run so that the owner
  * (main(), a test) can look at them; the next run starts empty. */
 /* ---- D1a step 6: the apex of the zones whose summary is sent ---- */
+#define APEX_ADR_MAX 128      /* address rows of one zone kept (8 targets of 8 addresses, twice for an NS target that is listed twice) */
 typedef struct {
     ctx_t *x;
     zinfo_t *z;                       /* the zone being read (NULL: a zone whose summary is not sent) */
@@ -1943,6 +1948,9 @@ typedef struct {
     unsigned n_ns;
     size_t ns_len;
     char ns_lf[KDB_APEX_NS_BYTES + 1];
+    /* the addresses of the zone whose owner is an NS target, as the rows come (id order); matched with the targets when the zone is done (the NS rows can follow them) */
+    unsigned n_adr;
+    struct { uint8_t type, alen; uint32_t ttl; uint8_t addr[16]; char name[DNS_NAME_TEXT_SIZE]; } adr[APEX_ADR_MAX];
 } apex_acc_t;
 
 static zinfo_t *zinfo_by_id(ctx_t *x, int64_t id) {         /* x->zones is in domains.id order */
@@ -1955,12 +1963,55 @@ static zinfo_t *zinfo_by_id(ctx_t *x, int64_t id) {         /* x->zones is in do
     return lo < x->nz && x->zones[lo].id == id ? &x->zones[lo] : NULL;
 }
 
+/* The glue of the zone: for each NS target (in the order of tag 20) that is at or below the apex, its A and AAAA rows in id order (the order of the zone: the
+ * zone in memory answers a target with the RRs it has, in file order), without a row that repeats an address, with the lowest TTL of the rows of one type
+ * (RFC 2181 5.2: an RRset has one TTL; the zone image harmonizes it).  More than KDB_APEX_GLUE_PER_NS addresses for one target make the zone keep no apex (the
+ * answer of the zone in memory has at most 32, and the summary would differ).  Returns the length of the glue, -1 if there is no usable apex. */
+static int apex_glue_build(const apex_acc_t *a, const char *apex_name, uint8_t out[KDB_APEX_GLUE_BYTES]) {
+    size_t len = 0;
+    unsigned idx = 0;
+    for (const char *q = a->ns_lf; *q; idx++) {
+        const char *e = strchr(q, '\n');
+        size_t ql = e ? (size_t)(e - q) : strlen(q);
+        char target[DNS_NAME_TEXT_SIZE];
+        memcpy(target, q, ql);
+        target[ql] = '\0';
+        q = e ? e + 1 : q + ql;
+        if (!domain_name_is_at_or_below(target, apex_name)) continue;
+        uint32_t tmin[2] = { 0xFFFFFFFFu, 0xFFFFFFFFu };
+        for (unsigned k = 0; k < a->n_adr; k++)
+            if (strcasecmp(a->adr[k].name, target) == 0 && a->adr[k].ttl < tmin[a->adr[k].type == 28]) tmin[a->adr[k].type == 28] = a->adr[k].ttl;
+        unsigned per = 0;
+        for (unsigned k = 0; k < a->n_adr; k++) {
+            if (strcasecmp(a->adr[k].name, target) != 0) continue;
+            bool dup = false;
+            for (unsigned j = 0; j < k && !dup; j++)
+                dup = strcasecmp(a->adr[j].name, target) == 0 && a->adr[j].type == a->adr[k].type && memcmp(a->adr[j].addr, a->adr[k].addr, a->adr[k].alen) == 0;
+            if (dup) continue;
+            if (++per > KDB_APEX_GLUE_PER_NS || len + 6 + a->adr[k].alen > KDB_APEX_GLUE_BYTES) return -1;
+            uint32_t ttl = tmin[a->adr[k].type == 28];
+            out[len++] = (uint8_t)idx;
+            out[len++] = (uint8_t)a->adr[k].type;
+            out[len++] = (uint8_t)(ttl >> 24);
+            out[len++] = (uint8_t)(ttl >> 16);
+            out[len++] = (uint8_t)(ttl >> 8);
+            out[len++] = (uint8_t)ttl;
+            memcpy(out + len, a->adr[k].addr, a->adr[k].alen);
+            len += a->adr[k].alen;
+        }
+    }
+    return (int)len;
+}
+
 static void apex_flush(apex_acc_t *a) {
     zinfo_t *z = a->z;
     a->z = NULL;
     if (!a->have || !z || z->apex || !a->soa || !a->ns_ok || a->n_ns == 0) return;
+    uint8_t glue[KDB_APEX_GLUE_BYTES];
+    int gl = apex_glue_build(a, z->canon, glue);
+    if (gl < 0) return;                                          /* more addresses than the summary carries: the zone is read for its SOA question */
     size_t lm = strlen(a->mname), lr = strlen(a->rname);
-    lapex_t *p = malloc(sizeof(*p) + lm + lr + a->ns_len + 3);
+    lapex_t *p = malloc(sizeof(*p) + lm + lr + a->ns_len + 3 + (size_t)gl);
     if (!p) {
         a->oom = true;
         return;
@@ -1968,9 +2019,11 @@ static void apex_flush(apex_acc_t *a) {
     p->minimum = a->minimum;
     p->soa_ttl = a->soa_ttl;
     p->ns_ttl = a->ns_ttl;
+    p->glue_len = (uint16_t)gl;
     memcpy(p->data, a->mname, lm + 1);
     memcpy(p->data + lm + 1, a->rname, lr + 1);
     memcpy(p->data + lm + lr + 2, a->ns_lf, a->ns_len + 1);
+    if (gl) memcpy(p->data + lm + lr + 3 + a->ns_len, glue, (size_t)gl);
     z->apex = p;
 }
 
@@ -1988,10 +2041,29 @@ static int apex_cb(void *ud, const db_apex_row_t *row) {
         a->ns_len = 0;
         a->ns_lf[0] = '\0';
         a->ns_ttl = 0;
+        a->n_adr = 0;
     }
     if (!a->z || a->oom) return a->oom ? 1 : 0;
     uint32_t deft = a->x->opts.default_ttl ? a->x->opts.default_ttl : PDNS_DEFAULT_TTL;
     uint32_t ttl = row->ttl_null ? deft : (row->ttl < 0 ? 0 : row->ttl > PDNS_MAX_TTL ? PDNS_MAX_TTL : (uint32_t)row->ttl);
+    if (row->addr_type) {                                       /* an A or AAAA row of a name that is the target of an NS record of the zone */
+        char on[DNS_NAME_TEXT_SIZE];
+        if (a->n_adr == APEX_ADR_MAX || !row->name || !pdns_apex_name(row->name, on)) {
+            a->ns_ok = false;
+            return 0;
+        }
+        size_t al = pdns_apex_addr(row->addr_type, row->content, a->adr[a->n_adr].addr);
+        if (al == 0) {
+            a->ns_ok = false;                                   /* not an address: the zone would be rejected, it has no apex */
+            return 0;
+        }
+        a->adr[a->n_adr].type = (uint8_t)row->addr_type;
+        a->adr[a->n_adr].alen = (uint8_t)al;
+        a->adr[a->n_adr].ttl = ttl;
+        snprintf(a->adr[a->n_adr].name, sizeof(a->adr[0].name), "%s", on);
+        a->n_adr++;
+        return 0;
+    }
     if (row->is_soa) {
         if (a->soa || !row->content) return 0;                  /* (the first enabled SOA is the zone's, as in the zone list) */
         a->soa = pdns_soa_apex(row->content, a->mname, a->rname, &a->minimum);
@@ -2401,7 +2473,8 @@ static int fetch_summary(ctx_t *x) {
         (zi->has_timers && zi->apex &&
          (kdb_enc_name(&x->enc, 15, zi->apex->data) != 0 || kdb_enc_name(&x->enc, 16, lapex_rname(zi->apex)) != 0 ||
           kdb_enc_u32(&x->enc, 17, zi->apex->minimum) != 0 || kdb_enc_u32(&x->enc, 18, zi->apex->soa_ttl) != 0 || kdb_enc_u32(&x->enc, 19, zi->apex->ns_ttl) != 0 ||
-          kdb_enc_bytes(&x->enc, 20, (const uint8_t *)lapex_ns(zi->apex), strlen(lapex_ns(zi->apex))) != 0)) ||
+          kdb_enc_bytes(&x->enc, 20, (const uint8_t *)lapex_ns(zi->apex), strlen(lapex_ns(zi->apex))) != 0 ||
+          (zi->apex->glue_len > 0 && kdb_enc_bytes(&x->enc, 21, lapex_glue(zi->apex), zi->apex->glue_len) != 0))) ||
         kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
         goto write_failed;
     if (kdb_enc_begin(&x->enc, KDB_T_ZONE_END) != 0 || kdb_enc_u64(&x->enc, 1, 0) != 0 || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)

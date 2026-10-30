@@ -628,10 +628,17 @@ static int sq_scan_records(db_conn_t *c, const int64_t *domain_id, db_record_cb 
 /* D1a step 6: the enabled SOA and NS records at the apex (the record's name is the domain's name), one zone or all */
 static int sq_scan_apex(db_conn_t *c, const int64_t *domain_id, db_apex_cb cb, void *ud) {
     sqlite3_stmt **slot = domain_id ? &c->st_apex_one : &c->st_apex_all;
-    int ret = prep(c, slot, domain_id ? "SELECT r.domain_id, r.type, r.content, r.ttl, r.id FROM records r JOIN domains d ON d.id = r.domain_id "
-                                        "AND r.name = d.name COLLATE NOCASE WHERE r.domain_id = ?1 AND r.type IN ('SOA', 'NS') AND r.disabled = 0 ORDER BY r.id"
-                                      : "SELECT r.domain_id, r.type, r.content, r.ttl, r.id FROM records r JOIN domains d ON d.id = r.domain_id "
-                                        "AND r.name = d.name COLLATE NOCASE WHERE r.type IN ('SOA', 'NS') AND r.disabled = 0 ORDER BY r.domain_id, r.id");
+    /* the SOA and NS rows of the apex, and the address rows of the zone whose owner is an NS target inside the zone (g: the NS row n gives the target).  CROSS JOIN keeps
+     * the order n, d, g: left to itself the planner scans g and looks the NS rows of its zone up for every row (quadratic in the size of a big zone: 10 s for 10,000
+     * records); the NS rows are few, and g is looked up by domain_id for each of them. */
+#define AX_SOA_NS "SELECT r.domain_id, r.type, r.content, r.ttl, r.id, r.name FROM records r JOIN domains d ON d.id = r.domain_id AND r.name = d.name COLLATE NOCASE " \
+                  "WHERE r.type IN ('SOA', 'NS') AND r.disabled = 0 "
+#define AX_GLUE_1 "SELECT g.domain_id, g.type, g.content, g.ttl, g.id, g.name FROM records n CROSS JOIN domains d ON d.id = n.domain_id AND n.name = d.name COLLATE NOCASE " \
+                  "CROSS JOIN records g ON g.domain_id = n.domain_id AND g.type IN ('A', 'AAAA') AND g.disabled = 0 AND g.name = rtrim(n.content, '.') COLLATE NOCASE " \
+                  "WHERE n.type = 'NS' AND n.disabled = 0 "
+#define AX_IN_ZONE "AND (lower(rtrim(n.content, '.')) = lower(d.name) OR substr(lower(rtrim(n.content, '.')), -(length(d.name) + 1)) = '.' || lower(d.name)) "
+    int ret = prep(c, slot, domain_id ? AX_SOA_NS "AND r.domain_id = ?1 UNION ALL " AX_GLUE_1 "AND n.domain_id = ?1 " AX_IN_ZONE "ORDER BY 1, 5"
+                                      : AX_SOA_NS "UNION ALL " AX_GLUE_1 AX_IN_ZONE "ORDER BY 1, 5");
     if (ret != 0) return ret;
     sqlite3_stmt *st = *slot;
     rearm(st);
@@ -648,6 +655,8 @@ static int sq_scan_apex(db_conn_t *c, const int64_t *domain_id, db_apex_cb cb, v
         r.domain_id = sqlite3_column_int64(st, 0);
         const char *type = col_text(c, st, 1, "records", sqlite3_column_int64(st, 4), "type", &bad);
         r.is_soa = type && strcasecmp(type, "SOA") == 0;
+        r.addr_type = type && strcasecmp(type, "A") == 0 ? 1 : type && strcasecmp(type, "AAAA") == 0 ? 28 : 0;
+        r.name = col_text(c, st, 5, "records", sqlite3_column_int64(st, 4), "name", &bad);
         r.content = col_text(c, st, 2, "records", sqlite3_column_int64(st, 4), "content", &bad);
         r.ttl_null = sqlite3_column_type(st, 3) == SQLITE_NULL;
         r.ttl = r.ttl_null ? 0 : sqlite3_column_int64(st, 3);

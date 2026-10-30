@@ -2900,6 +2900,23 @@ static bool apex_name_text(const uint8_t *p, size_t len, char *out, size_t cap) 
   return extract_wire_name_to_buffer(p, len, 0, &next, out, cap) >= 0;
 }
 
+/* Two uncompressed wire names (RFC 1035 3.1) are the same name: labels compared without regard to case (RFC 4343 2.1). */
+static bool wire_names_equal_ci(const uint8_t *a, const uint8_t *b) {
+  for (;;) {
+    uint8_t l = *a;
+    if (l != *b) return false;
+    if (l == 0) return true;
+    for (uint8_t i = 1; i <= l; i++) {
+      uint8_t x = a[i], y = b[i];
+      if (x >= 'A' && x <= 'Z') x = (uint8_t)(x + 32);
+      if (y >= 'A' && y <= 'Z') y = (uint8_t)(y + 32);
+      if (x != y) return false;
+    }
+    a += (size_t)l + 1;
+    b += (size_t)l + 1;
+  }
+}
+
 /* The size an answer may have on UDP when the query has EDNS: the size the client announced (512 at least) and no more than the server's limit (udp-bufsize,
  * zone-udp-bufsize, view max-udp-size, the `server` statement of the client: RFC 6891 6.2.3, 6.2.5), the capacity of res when it is known.  Clamps edns->udp_payload_size
  * too.  The limit the caller passed stays when the query has no EDNS, comes by TCP, or the caller's own buffer is smaller than a plain UDP answer (res[] must not be
@@ -2937,7 +2954,7 @@ static size_t edns_udp_limit(edns_info_t *edns, bool is_tcp, const server_config
  * insufficient, and so does everything else the body of a query does that the summary cannot (a cookie, ECS, DO = 1: RRSIGs, MQTYPE ...): the query
  * then waits for the zone as before.  Returns the length of the response, or -1: not answered from the summary (nothing was written that matters). */
 static int build_apex_soa_answer(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len, const zdir_elem_t *elem, const zdir_apex_t *ap,
-                                 edns_info_t *edns, bool is_tcp, int minimal_mode, view_snapshot_t *view, compress_ctx_t *comp_ctx,
+                                 edns_info_t *edns, bool is_tcp, int minimal_mode, additional_from_auth_t policy, view_snapshot_t *view, compress_ctx_t *comp_ctx,
                                  const tsig_request_t *tsig, server_config_t *cfg) {
   if (ap->serial != zdir_serial(elem) || ap->n_ns == 0) return -1;
   if (edns->present && (edns->version != 0 || edns->dnssec_ok || edns->compact_answers_ok || edns->has_mqtype_query || edns->has_ecs || edns->has_malformed_ecs ||
@@ -2949,16 +2966,24 @@ static int build_apex_soa_answer(const uint8_t *req, size_t req_len, uint8_t *re
   size_t q_offset = q_end + 4;
   const uint8_t *mn = ap->data, *rn = ap->data + ap->mname_len, *ns = rn + ap->rname_len;
   const bool with_ns = minimal_mode == MINIMAL_NO;
-  if (with_ns) {           /* the glue the zone in memory would add */
+  /* the glue the zone in memory adds (append_glue_records()): the addresses of the NS targets, from the zone itself and, when the target is in another zone of
+   * the view, from that zone.  The summary has the addresses of the targets inside this zone; a target that another zone of the view holds (a sibling, or this
+   * zone's own name below a zone cut that is a zone of the view) makes the summary insufficient.  additional-from-auth: no = none at all, in-domain = only
+   * the targets at or below the apex. */
+  const bool with_glue = with_ns && policy != ADDITIONAL_AUTH_NO;
+  if (with_glue) {
     char nm[DNS_NAME_TEXT_SIZE];
     for (size_t off = 0, k = 0; k < ap->n_ns; k++) {
       size_t nl = 0;
       while (off + nl < ap->ns_len && ns[off + nl] != 0) nl += (size_t)ns[off + nl] + 1;
       nl++;
-      zdir_elem_t *pe = NULL;
       if (off + nl > ap->ns_len || !apex_name_text(ns + off, nl, nm, sizeof(nm))) return -1;
-      if (find_zone_for_query_ex(view, nm, 1, &pe) != NULL || pe != NULL) return -1;
       off += nl;
+      const bool in_zone = domain_name_is_at_or_below(nm, elem->name);
+      if (policy == ADDITIONAL_AUTH_IN_DOMAIN && !in_zone) continue;
+      zdir_elem_t *pe = NULL;
+      zone_db_entry_t *ze = find_zone_for_query_ex(view, nm, 1, &pe);
+      if (ze != NULL || (pe != NULL && pe != elem) || (in_zone && pe != elem)) return -1;
     }
   }
   size_t limit = max_res_len;                               /* what the body may use: the room for the OPT (RFC 6891 7) and for the TSIG (RFC 8945 5.3) is kept back */
@@ -3010,6 +3035,49 @@ static int build_apex_soa_answer(const uint8_t *req, size_t req_len, uint8_t *re
       res[rdl_at] = (uint8_t)((offset - rdl_at - 2) >> 8);
       res[rdl_at + 1] = (uint8_t)(offset - rdl_at - 2);
       nscount++;
+      t += nl;
+    }
+  }
+  /* the addresses of the NS targets inside the zone, in the order of the NS RRs and, for one target, of the zone (RFC 2181 9: the addresses of a name are all
+   * there or none; the first target whose addresses do not fit ends the glue, without TC) */
+  if (with_glue && ap->glue_len > 0) {
+    const uint8_t *g = ns + ap->ns_len, *gend = g + ap->glue_len, *t = ns;
+    for (unsigned k = 0; k < ap->n_ns && g < gend; k++) {
+      size_t nl = 0;
+      while (t[nl] != 0) nl += (size_t)t[nl] + 1;
+      nl++;
+      bool dup = false;                                      /* (the same target twice: one set of addresses) */
+      for (const uint8_t *u = ns; u < t && !dup; ) {
+        size_t ul = 0;
+        while (u[ul] != 0) ul += (size_t)u[ul] + 1;
+        ul++;
+        dup = ul == nl && wire_names_equal_ci(u, t);
+        u += ul;
+      }
+      const uint16_t so = offset, sa = arcount;
+      bool fits = true;
+      while (g < gend && g[0] == k) {
+        const size_t al = g[1] == 1 ? 4 : 16;
+        if (!dup) {
+          if (compress_name(res, &offset, t, comp_ctx, body_max) != 0 || (size_t)offset + 10 + al > body_max) {
+            fits = false;
+            break;
+          }
+          res[offset++] = 0; res[offset++] = g[1]; res[offset++] = 0; res[offset++] = 1;
+          memcpy(res + offset, g + 2, 4);
+          offset += 4;
+          res[offset++] = 0; res[offset++] = (uint8_t)al;
+          memcpy(res + offset, g + 6, al);
+          offset += (uint16_t)al;
+          arcount++;
+        }
+        g += 6 + al;
+      }
+      if (!fits) {
+        offset = so;
+        arcount = sa;
+        break;
+      }
       t += nl;
     }
   }
@@ -3358,7 +3426,9 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         const size_t alimit = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
         const size_t tsig_limit = tsig ? tsig->res_limit : 0;
         if (tsig) tsig->res_limit = alimit;
-        int alen = build_apex_soa_answer(req, req_len, res, alimit, not_ready_zone, ap, &edns, is_tcp, query_minimal_mode(cfg, view, req), view,
+        const additional_from_auth_t apolicy = zext(&zc)->additional_from_auth_specified ? zext(&zc)->additional_from_auth
+                                                                                         : (cfg ? cfg->additional_from_auth : ADDITIONAL_AUTH_YES);
+        int alen = build_apex_soa_answer(req, req_len, res, alimit, not_ready_zone, ap, &edns, is_tcp, query_minimal_mode(cfg, view, req), apolicy, view,
                                          comp_ctx, tsig, cfg);
         if (alen >= DNS_HEADER_SIZE) return alen;
         if (tsig) tsig->res_limit = tsig_limit;

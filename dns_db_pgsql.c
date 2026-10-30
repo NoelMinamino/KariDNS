@@ -882,6 +882,8 @@ static int al_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     a.domain_id = cell_i64(r, i, 0);
     const char *type = cell_text(c, r, i, 1, "records", rid, "type", &bad);
     a.is_soa = type && strcasecmp(type, "SOA") == 0;
+    a.addr_type = type && strcasecmp(type, "A") == 0 ? 1 : type && strcasecmp(type, "AAAA") == 0 ? 28 : 0;
+    a.name = cell_text(c, r, i, 5, "records", rid, "name", &bad);
     a.content = cell_text(c, r, i, 2, "records", rid, "content", &bad);
     a.ttl_null = PQgetisnull(r, i, 3);
     a.ttl = cell_i64(r, i, 3);
@@ -889,8 +891,13 @@ static int al_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     return l->cb(l->ud, &a) != 0 ? DB_STOPPED : 0;
 }
 
-#define APEX_COLS "SELECT r.domain_id, r.type, r.content, r.ttl, r.id FROM records r JOIN domains d ON d.id = r.domain_id AND lower(r.name) = lower(d.name) " \
+/* the SOA and NS rows of the apex, and the address rows of the zone whose owner is an NS target inside the zone (g: the NS row n gives the target) */
+#define APEX_COLS "SELECT r.domain_id, r.type, r.content, r.ttl, r.id, r.name FROM records r JOIN domains d ON d.id = r.domain_id AND lower(r.name) = lower(d.name) " \
                   "WHERE r.type IN ('SOA', 'NS') AND r.disabled = false "
+#define APEX_GLUE "SELECT g.domain_id, g.type, g.content, g.ttl, g.id, g.name FROM records n JOIN domains d ON d.id = n.domain_id AND lower(n.name) = lower(d.name) " \
+                  "JOIN records g ON g.domain_id = n.domain_id AND g.type IN ('A', 'AAAA') AND g.disabled = false AND lower(g.name) = lower(rtrim(n.content, '.')) " \
+                  "WHERE n.type = 'NS' AND n.disabled = false "
+#define APEX_IN_ZONE "AND (lower(rtrim(n.content, '.')) = lower(d.name) OR right(lower(rtrim(n.content, '.')), length(d.name) + 1) = '.' || lower(d.name)) "
 
 static int pg_scan_apex(db_conn_t *c, const int64_t *domain_id, db_apex_cb cb, void *ud) {
     al_t l = { cb, ud };
@@ -898,9 +905,9 @@ static int pg_scan_apex(db_conn_t *c, const int64_t *domain_id, db_apex_cb cb, v
         char p[32];
         snprintf(p, sizeof(p), "%lld", (long long)*domain_id);
         const char *pv[1] = { p };
-        return pg_scan(c, "scan_apex", APEX_COLS "AND r.domain_id = $1::bigint ORDER BY r.id", 1, pv, al_row, &l);
+        return pg_scan(c, "scan_apex", APEX_COLS "AND r.domain_id = $1::bigint UNION ALL " APEX_GLUE "AND n.domain_id = $1::bigint " APEX_IN_ZONE "ORDER BY 1, 5", 1, pv, al_row, &l);
     }
-    return pg_scan(c, "scan_apex", APEX_COLS "ORDER BY r.domain_id, r.id", 0, NULL, al_row, &l);
+    return pg_scan(c, "scan_apex", APEX_COLS "UNION ALL " APEX_GLUE APEX_IN_ZONE "ORDER BY 1, 5", 0, NULL, al_row, &l);
 }
 
 static int pg_scan_records_range(db_conn_t *c, int64_t lo, int64_t hi, db_record_cb cb, void *ud) {
