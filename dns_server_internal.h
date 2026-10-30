@@ -951,6 +951,9 @@ typedef struct {
 /* The registry records of the zone `name` (any case, with or without the trailing dot) in the view `view` (NULL: every
  * view), at most max of them copied to out.  Returns how many there are. */
 int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int max);
+#if defined(KARIDNS_TEST_EVICT) || defined(KARIDNS_UNIT_TEST)
+bool dbreg_test_evict(const char *view, const char *name);        /* TEST ONLY, see dns_snapshot_rcu.c */
+#endif
 /* D1a milestone 2: the fetch of a zone whose element is in the directory without its data.  dbreg_fetch_begin(): ABSENT -> LOADING under the
  * registry lock (DBREG_FETCH_STARTED: the caller asks the loader), or why not: the zone is in memory, a fetch is on its way, it is not in the
  * registry.  dbreg_fetch_end(): LOADING -> ABSENT again for an element that still has no data (the fetch failed or brought a summary; a fetch

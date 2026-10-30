@@ -47,7 +47,7 @@ static void test_table(void) {
 
   int32_t a = park_udp(&t, 1000, 1500, "v2", "a.test.", 3, &ipc, pay, 40);
   CHECK(a == 0 && t.nwait == 1 && t.nfree == 3);
-  park_entry_t *ea = park_get(&t, a, park_gen(&t, a));
+  park_entry_t *ea = park_get(&t, a, t.e[a].gen);
   CHECK(ea && ea->state == PARK_WAIT && ea->kind == PARK_UDP && strcmp(ea->view, "v2") == 0 && strcmp(ea->zone, "a.test.") == 0 && ea->zlen == 7);
   CHECK(ea->deadline_ms == 2500 && ea->udp_len == 40 && ea->u.udp.ipc.sock_fd_idx == 7 && ea->u.udp.payload[39] == 0xA5);
   CHECK(park_next_deadline_ms(&t, 1000) == 1500 && park_next_deadline_ms(&t, 3000) == 0);
@@ -96,7 +96,7 @@ static void test_table(void) {
   int32_t again = park_udp(&t, 1000, 1500, "v0", "f.test.", 3, &ipc, pay, 20);
   CHECK(again == idx_b);
   CHECK(park_get(&t, again, gen_b) == NULL);                                     /* generation mismatch */
-  CHECK(park_get(&t, again, park_gen(&t, again)) != NULL && park_gen(&t, again) != gen_b);
+  CHECK(park_get(&t, again, t.e[again].gen) != NULL && t.e[again].gen != gen_b);
   CHECK(park_get(&t, -1, 1) == NULL && park_get(&t, 99, 1) == NULL);
 
   /* timeouts: c.test. had 100 ms; a deadline in the past is "timed out", the others keep waiting */
@@ -142,7 +142,7 @@ static void test_table(void) {
   /* the generation is never 0, also after the counter wraps */
   t.next_gen = UINT32_MAX;
   int32_t w1 = park_udp(&t, 0, 10, "v0", "w.test.", 3, &ipc, pay, 20), w2 = park_udp(&t, 0, 10, "v0", "w.test.", 3, &ipc, pay, 20);
-  CHECK(w1 >= 0 && w2 >= 0 && park_gen(&t, w1) == UINT32_MAX && park_gen(&t, w2) == 1);
+  CHECK(w1 >= 0 && w2 >= 0 && t.e[w1].gen == UINT32_MAX && t.e[w2].gen == 1);
   park_free(&t);
   CHECK(t.e == NULL && t.cap == 0);
 }
@@ -154,7 +154,7 @@ static void test_tcp(void) {
   int32_t a = park_tcp(&t, 0, 1500, "v1", "t.test.", 17, 5, 100);
   int32_t b = park_tcp(&t, 0, 1500, "v1", "t.test.", 18, 6, 200);
   CHECK(a >= 0 && b >= 0 && t.nwait == 2);
-  park_entry_t *ea = park_get(&t, a, park_gen(&t, a));
+  park_entry_t *ea = park_get(&t, a, t.e[a].gen);
   CHECK(ea && ea->kind == PARK_TCP && ea->u.tcp.fd == 17 && ea->u.tcp.ctx_idx == 5 && ea->u.tcp.ctx_gen == 100);
   /* the connection context 5 was reused for another connection (generation 101): the entry of generation 100 is not the new one's */
   CHECK(!park_cancel_tcp(&t, 5, 101));
@@ -179,6 +179,11 @@ static void test_rings(void) {
   park_wake_ring_t *wr = park_wake_ring(PARK_MAX_WORKERS - 1);
   park_key_t k;
   CHECK(wr && !park_wake_pop(wr, &k));
+  CHECK(!park_wake_pending(wr));                                                             /* nothing: the worker's loop does not go on */
+  CHECK(park_wake_push(wr, "v3", "one.test.", false) && park_wake_pending(wr));
+  CHECK(park_wake_pop(wr, &k) && !park_wake_pending(wr));
+  atomic_store(&wr->overflow, true);
+  CHECK(park_wake_pending(wr) && park_wake_take_overflow(wr) && !park_wake_pending(wr));    /* a dropped wake is something too */
   CHECK(park_wake_push(wr, "v3", "one.test.", false) && park_wake_push(wr, "v4", "two.test.", false));
   CHECK(park_wake_pop(wr, &k) && strcmp(k.view, "v3") == 0 && strcmp(k.zone, "one.test.") == 0 && k.zlen == 9);
   CHECK(park_wake_pop(wr, &k) && strcmp(k.view, "v4") == 0 && strcmp(k.zone, "two.test.") == 0);

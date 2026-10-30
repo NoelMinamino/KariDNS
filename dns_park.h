@@ -90,7 +90,7 @@ bool park_init(park_table_t *t, uint32_t cap);
 void park_free(park_table_t *t);
 
 /* Park a UDP request.  Returns the index of the entry, or -1: the table is full, the request is longer than PARK_UDP_MAX, or a name
- * is empty or does not fit.  The entry's generation is park_gen(). */
+ * is empty or does not fit.  The entry's generation is t->e[idx].gen. */
 int32_t park_udp(park_table_t *t, int64_t now_ms, uint32_t timeout_ms, const char *view, const char *zone, int fd, const udp_ipc_t *ipc,
                  const uint8_t *payload, size_t len);
 /* Park a TCP connection (one request per connection: the request stays in the connection's receive buffer). */
@@ -100,7 +100,6 @@ int32_t park_tcp(park_table_t *t, int64_t now_ms, uint32_t timeout_ms, const cha
 bool park_has_wait(const park_table_t *t, const char *view, const char *zone);
 /* The entry for a handle: NULL when the entry is free or has been given out again since (generation mismatch). */
 park_entry_t *park_get(park_table_t *t, int32_t idx, uint32_t gen);
-static inline uint32_t park_gen(const park_table_t *t, int32_t idx) { return t->e[idx].gen; }
 
 /* WAIT -> READY for every query that waits for (view, zone).  Returns how many. */
 uint32_t park_wake(park_table_t *t, const char *view, const char *zone);
@@ -136,6 +135,8 @@ typedef struct {
 bool park_wake_push(park_wake_ring_t *r, const char *view, const char *zone, bool failed);
 bool park_wake_pop(park_wake_ring_t *r, park_key_t *out);
 bool park_wake_take_overflow(park_wake_ring_t *r);
+/* Is there anything for the consumer: a key in the ring, or a dropped wake?  Two loads, no clock; the worker asks before it does the rest. */
+bool park_wake_pending(const park_wake_ring_t *r);
 
 /* ---- worker -> ingest: please fetch ---- */
 typedef struct {

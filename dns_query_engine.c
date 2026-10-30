@@ -2880,6 +2880,21 @@ static bool notify_from_member_primaries(server_config_t *cfg, view_snapshot_t *
   return !need || (tkey && tsig_key_names_equal(tkey->name, need));
 }
 
+/* SERVFAIL with Extended DNS Error 14 "Not Ready" (RFC 8914 4.15), keeping the question: the answer for a query whose zone is in the directory
+ * and cannot be had in time (D1a design 4.4).  The request's own EDE options are not echoed.  Signing is the caller's (the TSIG handling around
+ * process_query_body()). */
+static int build_not_ready_response(const uint8_t *req, size_t req_len, uint8_t *res, size_t cap, bool is_tcp, server_config_t *cfg) {
+  if (req_len < DNS_HEADER_SIZE) return 0;
+  edns_info_t edns;
+  edns_info_reset(&edns);
+  edns.present = false;
+  uint16_t qd = (uint16_t)((req[4] << 8) | req[5]), an = (uint16_t)((req[6] << 8) | req[7]);
+  uint16_t ns = (uint16_t)((req[8] << 8) | req[9]), ar = (uint16_t)((req[10] << 8) | req[11]);
+  if (parse_edns_opt(req, req_len, qd, an, ns, ar, &edns) == 0) edns.ede_count = 0;      /* (reflection: the request's own EDE is not echoed) */
+  add_ede(&edns, cfg ? cfg->send_extended_errors : false, 14, "Not Ready");
+  return dns_build_error_response(req, req_len, res, cap, 2 /* SERVFAIL */, 0, 1, &edns, is_tcp, cfg);
+}
+
 int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                             size_t max_res_len, const char *qname, uint16_t qtype,
                             const char *client_ip, compress_ctx_t *comp_ctx,
@@ -2896,14 +2911,15 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
                               bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                               zone_db_snapshot_t *snap, server_config_t *cfg,
                               zone_db_entry_t **out_matched_entry, tsig_request_t *tsig,
-                              const query_route_t *route);
+                              const query_route_t *route, const char *not_ready_zone);
 
 static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len, uint8_t *res,
                                              size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
                                              const char *client_ip, compress_ctx_t *comp_ctx,
                                              bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                                              zone_db_snapshot_t *snap, server_config_t *cfg,
-                                             zone_db_entry_t **out_matched_entry, const query_route_t *route);
+                                             zone_db_entry_t **out_matched_entry, const query_route_t *route,
+                                             const char *not_ready_zone);
 
 int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
                                size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
@@ -2912,7 +2928,7 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
                                zone_db_snapshot_t *snap, server_config_t *cfg,
                                zone_db_entry_t **out_matched_entry) {
   return process_dns_query_impl_cap_routed(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
-                                           is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL);
+                                           is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL, NULL);
 }
 
 /* res_cap: res の実際の容量 (バイト)。0 なら不明で、従来どおり max_res_len (UDP では EDNS の
@@ -2925,7 +2941,8 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
                                              const char *client_ip, compress_ctx_t *comp_ctx,
                                              bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                                              zone_db_snapshot_t *snap, server_config_t *cfg,
-                                             zone_db_entry_t **out_matched_entry, const query_route_t *route) {
+                                             zone_db_entry_t **out_matched_entry, const query_route_t *route,
+                                             const char *not_ready_zone) {
   t_query_rrl_info.zone = NULL; /* D-05: 早い段階で返す応答 (エラー) のために先に消す */
   t_query_rrl_info.wildcard = false;
   if (req_len < DNS_HEADER_SIZE) {
@@ -2942,7 +2959,10 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
   if (snap && !route) {
     bool done = false;
     own_route.view = select_view_req(snap, cfg, client_ip, req, req_len, &tsig, &done);
-    own_route.entry = own_route.view ? find_zone_for_query(own_route.view, qname, ((req[2] >> 3) & 0x0F) == 0 ? qtype : 0) : NULL;
+    zdir_elem_t *own_pel = NULL;
+    own_route.entry = own_route.view ? find_zone_for_query_ex(own_route.view, qname, ((req[2] >> 3) & 0x0F) == 0 ? qtype : 0, &own_pel) : NULL;
+    /* D1a: a zone that is in the directory and not in memory (TLS, DoH and the other callers that do not park): "not ready", not REFUSED */
+    if (!own_route.entry && own_pel && !not_ready_zone) not_ready_zone = own_pel->name;
     own_route.tsig = done ? &tsig : NULL;
     route = &own_route;
   }
@@ -2954,7 +2974,7 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
   t_query_tsig.status = TSIG_REQ_NONE; /* X-20: slip 応答の署名用。署名のない要求では使わない */
   if (tsig.status == TSIG_REQ_NONE) {
     int plain = process_query_body(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
-                                   is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL, route);
+                                   is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL, route, not_ready_zone);
     t_qacl.local_valid = t_qacl.client_valid = false;   /* the address of the next query is set by its transport */
     t_qacl.key = NULL;
     return plain;
@@ -2973,7 +2993,7 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
   }
   tsig.res_limit = max_res_len;
   int ret = process_query_body(body_req, body_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
-                               is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, &tsig, route);
+                               is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, &tsig, route, not_ready_zone);
   t_qacl.local_valid = t_qacl.client_valid = false;
   t_qacl.key = NULL;
   if (ret < DNS_HEADER_SIZE) return ret;
@@ -2989,7 +3009,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
                               bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                               zone_db_snapshot_t *snap, server_config_t *cfg,
                               zone_db_entry_t **out_matched_entry, tsig_request_t *tsig,
-                              const query_route_t *route) {
+                              const query_route_t *route, const char *not_ready_zone) {
   char current_qname[DNS_NAME_TEXT_SIZE];
   strlcpy(current_qname, qname, sizeof(current_qname));
   char current_qname_lc[DNS_NAME_TEXT_SIZE];
@@ -3024,7 +3044,6 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       *out_rrl_cfg = &zext(matched_zcfg)->rrl;
     }
   }
-  
   uint16_t qdcount = (req[4] << 8) | req[5],
            ancount_req = (req[6] << 8) | req[7],
            nscount_req = (req[8] << 8) | req[9],
@@ -3131,6 +3150,15 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   if (qdcount == 1 && wire_question_name_compressed(req, req_len)) {
     add_ede(&edns, send_ede, 0, NULL);
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, &edns, is_tcp, cfg); // FORMERR
+  }
+
+  if (not_ready_zone && qdcount == 1) {
+    /* D1a: the zone is in the directory and its data is not in memory, and the caller cannot wait for it (or has waited in vain).  After the
+     * checks of the message above (a malformed request is still a FORMERR), before any work on the zone.  The answer is an error answer of that
+     * zone for rate limiting (the global limits), and goes through the TSIG handling of the caller like every other answer: signed with the
+     * key of a verified request, RFC 8945 5.3 (the request given here has the TSIG record taken off, 5.2). */
+    t_query_rrl_info.zone = not_ready_zone;
+    return build_not_ready_response(req, req_len, res, max_res_len, is_tcp, cfg);
   }
 
   // RFC 9619: QDCOUNT=0 QUERY – no question section, return minimal response.
@@ -3829,13 +3857,28 @@ int process_dns_query_cap_routed(const uint8_t *req, size_t req_len, uint8_t *re
   zone_db_entry_t *matched_entry = NULL;
   int ret = process_dns_query_impl_cap_routed(req, req_len, res, max_res_len, res_cap, qname, qtype,
                                               client_ip, comp_ctx, is_tcp, out_rrl_cfg, snap, cfg, &matched_entry,
-                                              route);
+                                              route, NULL);
   release_config_snapshot(cfg);
   if (ret >= DNS_HEADER_SIZE && matched_entry) {
     uint8_t rcode = res[3] & 0x0F;
     uint16_t ancount = ((uint16_t)res[6] << 8) | (uint16_t)res[7];
     record_observatory_response(matched_entry, rcode, ancount);
   }
+  return ret;
+}
+
+/* D1a: the answer of the worker for a query whose zone is in the directory and not in memory, when it cannot wait for it: the same view, TSIG
+ * (RFC 8945 5.3) and rate limit handling as an answer from a zone, with SERVFAIL + EDE 14 as the content (route as for
+ * process_dns_query_cap_routed(); zone: the name of the directory element). */
+int process_dns_not_ready_routed(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len, size_t res_cap, const char *qname,
+                                 uint16_t qtype, const char *client_ip, compress_ctx_t *comp_ctx, bool is_tcp,
+                                 const rate_limit_config_t **out_rrl_cfg, zone_db_snapshot_t *snap, const query_route_t *route,
+                                 const char *zone) {
+  server_config_t *cfg = acquire_config_snapshot();
+  zone_db_entry_t *matched_entry = NULL;
+  int ret = process_dns_query_impl_cap_routed(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx, is_tcp, out_rrl_cfg,
+                                              snap, cfg, &matched_entry, route, zone);
+  release_config_snapshot(cfg);
   return ret;
 }
 

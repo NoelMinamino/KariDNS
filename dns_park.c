@@ -280,6 +280,11 @@ bool park_wake_pop(park_wake_ring_t *r, park_key_t *out) {
   return true;
 }
 
+bool park_wake_pending(const park_wake_ring_t *r) {
+  return atomic_load_explicit(&r->head, memory_order_acquire) != atomic_load_explicit(&r->tail, memory_order_relaxed) ||
+         atomic_load_explicit(&r->overflow, memory_order_relaxed);
+}
+
 bool park_wake_take_overflow(park_wake_ring_t *r) {
   return atomic_exchange_explicit(&r->overflow, false, memory_order_acq_rel);
 }

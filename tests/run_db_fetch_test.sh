@@ -11,8 +11,9 @@
 #     ZONE_FAILED and the reason, never with silence
 #   - the queue serves priority 0 before 1 before 2 (a big zone keeps the thread busy while three requests wait)
 #   - more requests than the queue holds: the surplus is answered "busy", the loader stays healthy and serves the next request
-#   - bytes that are not KDB1 on the fetch stream close that stream (the loader goes on with the first one); a FETCH_REQ on the first stream
-#     is a protocol error there (the loader ends with an error)
+#   - bytes that are not KDB1 on the fetch stream close that stream, and a loader without its fetch stream ends with an error (the supervisor
+#     starts one with a new pair); the same when the Backend just closes the fetch stream; a FETCH_REQ on the first stream is a protocol error
+#     there (the loader ends with an error)
 # No root needed (the loader runs as the current user).  SKIP when the sqlite3 command line tool, a compiler or a binary is missing.
 . "$(dirname "$0")/lib_proc.sh"
 set -u
@@ -93,7 +94,12 @@ echo "== hostile bytes"
 run garbage:fetch req:1:small.test.:0:0 sleep:500
 has "bytes that are not KDB1 close the fetch stream" '^FETCH closed$'
 hasnt "no answer after the close" '^ANS'
-has "the first stream goes on: the loader ends well when the Backend closes it" '^DONE answers=0 loader=0$'
+has "a loader that has lost its fetch stream ends (the supervisor starts one with a new pair of streams)" '^LOADER ended$'
+has "... with an error status" '^DONE answers=0 loader=3$'
+echo "== the Backend drops the fetch stream (a protocol error of the loader, a full send buffer, memory)"
+run closefetch
+has "the loader ends when the fetch stream is closed" '^LOADER ended$'
+has "... with an error status, the restart is the supervisor's" '^DONE answers=0 loader=3$'
 run badmain
 has "a FETCH_REQ on the first stream ends the loader" '^LOADER ended$'
 has "... with an error status" '^DONE answers=0 loader=3$'

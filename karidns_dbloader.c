@@ -74,6 +74,7 @@ enum { EXIT_OK = 0, EXIT_ZONES_FAILED = 1, EXIT_USAGE = 2, EXIT_ERROR = 3, EXIT_
 static bool g_stream_mode;
 static volatile sig_atomic_t g_stop;      /* SIGTERM / SIGINT in stream mode */
 static _Atomic bool g_fetch_stop;          /* D1a: the main thread ends the fetch thread */
+static _Atomic bool g_fetch_died;          /* D1a: the fetch thread ended by itself (the Backend closed or broke the fetch stream, or an error): the main thread exits so that the supervisor starts a loader with a new pair of streams */
 
 /* B12, --check: every message of the run is a line of the check protocol (dns_db_checkproto.h) on g_chk_out; g_chk_zone / g_chk_id say
  * which zone the findings are about ("" / 0: the source).  The run is single threaded. */
@@ -3151,6 +3152,7 @@ static void *fetch_main(void *arg) {
     uint8_t *body = malloc(KDB_MAX_BODY);
     if (!io || !body) {
         lg(LOG_ERR, "out of memory (the fetch thread)");
+        atomic_store(&g_fetch_died, true);
         free(io);
         free(body);
         return NULL;
@@ -3195,10 +3197,11 @@ static void *fetch_main(void *arg) {
 out:
     if (io->failed) lg(LOG_ERR, "the fetch stream is closed (protocol error)");
     else if (io->eof) lg(LOG_NOTICE, "the Backend closed the fetch stream");
+    if (!g_stop && !atomic_load(&g_fetch_stop)) atomic_store(&g_fetch_died, true);     /* (not asked to end: this process does not serve the fetch stream again) */
     cfg_free(&lc);
     ctx_view_reset(&x);
     kdb_enc_free(&x.enc);
-    close(fd);                                                /* (the Backend sees the end of the stream) */
+    close(fd);                                              /* (the Backend sees the end of the stream) */
     free(body);
     free(io);
     return NULL;
@@ -4079,6 +4082,11 @@ static int run_stream(int fd) {
     bool reconcile = true;                     /* the first load compares every zone with the inventory (digest) */
     while (!g_stop) {
         if (io->failed) {
+            status = EXIT_ERROR;
+            goto done;
+        }
+        if (atomic_load(&g_fetch_died)) {          /* D1a: the fetch stream is gone for good; the supervisor starts a loader with a new pair of streams */
+            lg(LOG_ERR, "the fetch stream is gone; exiting so that the supervisor restarts the loader");
             status = EXIT_ERROR;
             goto done;
         }

@@ -1521,11 +1521,19 @@ static void tcp_client_forget(int client_fd, tcp_stream_ctx_t *ctx_tcp,
   tcp_ctx_free(ctx_tcp);
 }
 
+/* D1a: the park table of this worker thread (NULL: none).  tcp_client_close() takes the entry of a connection that is closed while it is
+ * parked, so that no entry names a context that went back to the pool. */
+static _Thread_local park_table_t *t_park_tbl;
+
 /* TCP クライアントの接続を閉じる共通処理 (D-04: 以前は約10か所に複製され、後続イベントを
  * 無効にしない箇所があった)。 */
 static void tcp_client_close(int kq, int client_fd, tcp_stream_ctx_t *ctx_tcp,
                              struct kevent *ev_list, int from, int n_events) {
   struct kevent ev_del[2];
+  if (ctx_tcp->parked) {
+    if (t_park_tbl) (void)park_cancel_tcp(t_park_tbl, (uint32_t)(ctx_tcp - g_tcp_pool), ctx_tcp->gen);
+    ctx_tcp->parked = false;
+  }
   /* READ を先に: 期限切れで消えた ONESHOT タイマーの削除が失敗しても READ は外れる */
   EV_SET(&ev_del[0], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
   EV_SET(&ev_del[1], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
@@ -1988,24 +1996,6 @@ static int64_t park_now_ms(void) {
   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* SERVFAIL with Extended DNS Error 14 "Not Ready" (RFC 8914 §4.15), keeping the question: the answer for a query whose zone cannot be
- * had in time (design 4.4).  Not signed, even when the request was (a TSIG on such an answer is a later job).  0: the request is not
- * a query that can be answered. */
-static int build_not_ready_response(const uint8_t *req, size_t req_len, uint8_t *res, size_t cap, bool is_tcp) {
-  if (req_len < DNS_HEADER_SIZE) return 0;
-  edns_info_t edns;
-  edns_info_reset(&edns);
-  edns.present = false;
-  uint16_t qd = (uint16_t)((req[4] << 8) | req[5]), an = (uint16_t)((req[6] << 8) | req[7]);
-  uint16_t ns = (uint16_t)((req[8] << 8) | req[9]), ar = (uint16_t)((req[10] << 8) | req[11]);
-  if (parse_edns_opt(req, req_len, qd, an, ns, ar, &edns) == 0) edns.ede_count = 0;      /* (reflection: the request's own EDE is not echoed) */
-  server_config_t *cfg = acquire_config_snapshot();
-  add_ede(&edns, cfg ? cfg->send_extended_errors : false, 14, "Not Ready");
-  int n = dns_build_error_response(req, req_len, res, cap, 2 /* SERVFAIL */, 0, 1, &edns, is_tcp, cfg);
-  release_config_snapshot(cfg);
-  return n;
-}
-
 /* Park the UDP request for the zone of `pel`.  true: parked (the caller answers nothing now). false: not parked (no park table, the time is
  * up, the table is full, the request too big): the caller answers "not ready". */
 static bool udp_park(udp_pass_t *w, const view_snapshot_t *view, const zdir_elem_t *pel, const udp_ipc_t *ipc, const uint8_t *req, size_t len) {
@@ -2014,8 +2004,12 @@ static bool udp_park(udp_pass_t *w, const view_snapshot_t *view, const zdir_elem
   int64_t left = w->woken ? w->woken_deadline_ms - now : (int64_t)w->park_timeout_ms;
   if (left <= 0) return false;
   bool ask = !w->woken && !park_has_wait(w->park, view->name, pel->name);       /* the first query for the zone asks for it */
-  if (park_udp(w->park, now, (uint32_t)left, view->name, pel->name, w->active_fd, ipc, req, len) < 0) return false;
-  if (ask) (void)park_fetch_request(w->worker_idx, view->name, pel->name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL);
+  int32_t pi = park_udp(w->park, now, (uint32_t)left, view->name, pel->name, w->active_fd, ipc, req, len);
+  if (pi < 0) return false;
+  if (ask && !park_fetch_request(w->worker_idx, view->name, pel->name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL)) {
+    park_release(w->park, &w->park->e[pi]);            /* the request could not be handed over (ring full): nobody would ever wake it */
+    return false;
+  }
   return true;
 }
 
@@ -2119,10 +2113,11 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
             route.tsig = route_tsig_done ? &route_tsig : NULL;
             zdir_elem_t *pel = NULL;
             route.entry = route.view ? find_zone_for_query_ex(route.view, qname, ((req_buf[2] >> 3) & 0x0F) == 0 ? qtype : 0, &pel) : NULL;
-            bool not_ready = w->not_ready;
+            bool not_ready = false;
             if (__builtin_expect(!route.entry && pel != NULL, 0)) {
-              /* D1a: the zone is in the directory and its data is not in memory (never, until a later milestone evicts zones) */
-              if (!not_ready && udp_park(w, route.view, pel, ipc_msg, req_buf, (size_t)payload_received)) {
+              /* D1a: the zone is in the directory and its data is not in memory (never, until a later milestone evicts zones).  A request whose
+               * time was up (w->not_ready) is answered "not ready" only if the zone is still not there: one that arrived is answered. */
+              if (!w->not_ready && udp_park(w, route.view, pel, ipc_msg, req_buf, (size_t)payload_received)) {
                 rcu_reader_exit(ctx);
                 return;                                   /* parked: it is answered when the zone is there, or its time is up */
               }
@@ -2176,11 +2171,14 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
             uint8_t *res_buf = batch->tx_buffers[w->n_tx] + sizeof(udp_ipc_t);
             const rate_limit_config_t *rrl_cfg = NULL;
             int res_len;
+            query_set_client_addr(client_addr);
+            query_set_local_addr(ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL);   /* allow-query-on */
             if (__builtin_expect(not_ready, 0)) {
-              res_len = build_not_ready_response(req_buf, (size_t)payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN, false);
+              /* D1a: the same view, TSIG and rate limit handling as an answer from the zone, with "not ready" as the content */
+              res_len = process_dns_not_ready_routed(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
+                                                     UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
+                                                     qtype, client_ip, &(*w->cc), false, &rrl_cfg, snap, &route, pel->name);
             } else {
-              query_set_client_addr(client_addr);
-              query_set_local_addr(ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL);   /* allow-query-on */
               res_len = process_dns_query_cap_routed(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
                                                      UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
                                                      qtype, client_ip, &(*w->cc), false, &rrl_cfg, snap, &route);
@@ -2277,6 +2275,7 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
 STATIC_TEST void park_service(udp_pass_t *w, int kq) {
   park_table_t *t = w->park;
   park_wake_ring_t *ring = park_wake_ring(w->worker_idx);
+  if (t->nwait == 0 && t->nready == 0 && !(ring && park_wake_pending(ring))) return;     /* nothing is parked and nobody said anything: no clock, no exchange */
   park_key_t k;
   while (ring && park_wake_pop(ring, &k)) {
     if (k.failed) (void)park_fail(t, k.view, k.zone);
@@ -2367,7 +2366,10 @@ void *worker_thread_func(void *arg) {
       struct kevent ev_park;
       EV_SET(&ev_park, PARK_WAKE_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
       park_on = kevent(kq, &ev_park, 1, NULL, 0, NULL) == 0;
-      if (park_on) park_register_worker(ctx->thread_id, kq);
+      if (park_on) {
+        park_register_worker(ctx->thread_id, kq);
+        t_park_tbl = &park;
+      }
     }
     if (!park_on) syslog(LOG_ERR, "[Backend] worker %d: no park table; a query for a zone that is not in memory is answered \"not ready\" at once", ctx->thread_id);
   }
@@ -2510,6 +2512,17 @@ worker_startup_success:;
           ctx_tcp->quota_yield = false;
           ctx_tcp->resume_pending = false;   /* (a parked request that was woken: it is read from buf at the top of the loop) */
           goto process_tcp_client;
+        }
+        {
+          /* D1a: a 1 ms resume timer of a parked request that a READ event already ran is not the idle timeout: the connection is looked at
+           * again when its real deadline comes (a timer that fired early is the same case) */
+          int64_t tnow = park_now_ms();
+          if (tnow + 2 < ctx_tcp->idle_deadline_ms) {
+            struct kevent ev_t;
+            EV_SET(&ev_t, client_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0, tcp_ms_until(ctx_tcp->idle_deadline_ms, tnow), ctx_tcp);
+            kevent(kq, &ev_t, 1, NULL, 0, NULL);
+            continue;
+          }
         }
         // RFC 7766 §6.2.3: 次のメッセージの期限が過ぎた。接続を閉じる
         tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
@@ -2944,8 +2957,12 @@ process_tcp_client: ;
               if (park_on && !ctx_tcp->not_ready_now && left > 0) {
                 bool ask = ctx_tcp->park_deadline_ms == 0 && !park_has_wait(&park, route.view->name, pel->name);
                 uint32_t cidx = (uint32_t)(ctx_tcp - g_tcp_pool);
-                if (park_tcp(&park, pnow, (uint32_t)left, route.view->name, pel->name, client_fd, cidx, ctx_tcp->gen) >= 0) {
-                  if (ask) (void)park_fetch_request(ctx->thread_id, route.view->name, pel->name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL);
+                int32_t pi = park_tcp(&park, pnow, (uint32_t)left, route.view->name, pel->name, client_fd, cidx, ctx_tcp->gen);
+                if (pi >= 0 && ask && !park_fetch_request(ctx->thread_id, route.view->name, pel->name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL)) {
+                  park_release(&park, &park.e[pi]);          /* the request could not be handed over (ring full): nobody would wake it */
+                  pi = -1;
+                }
+                if (pi >= 0) {
                   ctx_tcp->park_deadline_ms = pnow + left;
                   ctx_tcp->resume_len = msg_len;
                   ctx_tcp->parked = true;
@@ -3010,11 +3027,13 @@ process_tcp_client: ;
             }
             /* D-04: 応答はワーカーごとのバッファ (起動時に確保) に組み立てる */
             int res_len;
+            query_set_client_addr(&ctx_tcp->client_addr);
+            query_set_local_addr(ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL);   /* allow-query-on */
             if (__builtin_expect(not_ready, 0)) {
-              res_len = build_not_ready_response(msg, msg_len, tcp_res_buf, 65535, true);
+              res_len = process_dns_not_ready_routed(msg, msg_len, tcp_res_buf, 65535, 0,
+                                                     qname, qtype, ctx_tcp->client_ip,
+                                                     &thread_compress_ctx, true, NULL, snap, &route, pel->name);
             } else {
-              query_set_client_addr(&ctx_tcp->client_addr);
-              query_set_local_addr(ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL);   /* allow-query-on */
               res_len = process_dns_query_cap_routed(msg, msg_len, tcp_res_buf, 65535, 0,
                                                      qname, qtype, ctx_tcp->client_ip,
                                                      &thread_compress_ctx, true, NULL, snap, &route);
@@ -3062,6 +3081,7 @@ process_tcp_client: ;
           struct kevent evs[2];
           uint32_t to_ms = (processed_queries >= 16) ? 1 : tcp_ms_until(ctx_tcp->idle_deadline_ms, now_ms);
           ctx_tcp->quota_yield = (processed_queries >= 16);
+          ctx_tcp->resume_pending = false;       /* D1a: the timer below replaces the 1 ms resume timer (a pipelined READ may have run the parked request first); its expiry is the idle timeout */
           EV_SET(&evs[0], client_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0,
                  to_ms, ctx_tcp);
           int nev = 1;
@@ -4120,6 +4140,14 @@ void *control_thread_func(void *arg) {
               }
               release_config_snapshot(active_cfg);
               release_zone_snapshot(snap);
+#ifdef KARIDNS_TEST_EVICT
+            } else if (strcmp(cmd, "evict") == 0 && arg) {
+              /* TEST ONLY (karidns-evict, never a production build): take the data of a DB zone out of memory, as eviction will (D1a) */
+              char ev_view[KARIDNS_VIEW_NAME_MAX], ev_why[200];
+              if (db_ingest_pick_view(view_arg, ev_view, sizeof(ev_view), ev_why, sizeof(ev_why)) && ev_view[0] && dbreg_test_evict(ev_view, arg))
+                send(cfd, "OK\n", 3, 0);
+              else send(cfd, "ERROR no such zone in memory\n", 29, 0);
+#endif
             } else if (strcmp(cmd, "dbstatus") == 0) {
               /* beta design 5.2: the loader, the batches and the DB zones of the registry */
               char dbbuf[4096];

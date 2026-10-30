@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -33,6 +34,7 @@
 #include "../dns_config_parser.h"
 #include "../dns_db_stream.h"
 #include "../dns_park.h"
+#include "../dns_query_engine.h"
 #include "../dns_server_internal.h"
 #include "../dns_snapshot_rcu.h"
 #include "../dns_utils.h"
@@ -165,7 +167,9 @@ int main(void) {
     CHECK(fp != NULL);
     fputs("$ORIGIN park.test.\n$TTL 300\n@ IN SOA ns.park.test. h.park.test. 1 7200 3600 1209600 300\n@ IN NS ns.park.test.\nns IN A 192.0.2.1\nwww IN A 192.0.2.80\n", fp);
     fclose(fp);
-    snprintf(conf, sizeof(conf), "options { directory \"%s\"; };\nview \"default\" { match-clients { any; }; zone \"park.test\" { type master; file \"%s\"; }; };\n", dir, zf);
+    snprintf(conf, sizeof(conf), "options { directory \"%s\"; };\n"
+             "key \"k1\" { algorithm hmac-sha256; secret \"c2VjcmV0LWtleS1vbmUtMTIzNDU2Nzg5MDEyMzQ1Ng==\"; };\n"
+             "view \"default\" { match-clients { any; }; zone \"park.test\" { type master; file \"%s\"; }; };\n", dir, zf);
     static server_config_t cfg;
     CHECK(parse_named_conf(conf, &cfg) == 0);
     cfg.send_extended_errors = true;
@@ -315,6 +319,115 @@ int main(void) {
     a = read_answer(sk[1]);
     CHECK(a.got && a.id == 0x6004 && a.rcode == 2 && a.ede == 14);
     park_free(&tiny);
+
+    /* -- the time is up, but the zone is there when the request is looked at again: it is answered from the zone, not "not ready" (the TCP
+     *    path does the same) */
+    w.park = &table;
+    w.park_timeout_ms = 5;
+    SEND_QUERY(0x7001, true, 0);
+    CHECK(table.nwait == 1);
+    (void)park_fetch_pop(park_fetch_ring(0), &q);
+    usleep(30000);
+    atomic_store(&el->entry, entry);                                   /* (no wake-up message: the deadline alone runs the request again) */
+    park_service(&w, -1);
+    a = read_answer(sk[1]);
+    CHECK(a.got && a.id == 0x7001 && a.rcode == 0 && a.ancount == 1 && a.ede == -1 && table.nwait == 0);
+    atomic_store(&el->entry, NULL);
+    w.park_timeout_ms = 5000;
+
+    /* -- a caller that does not park (DoT, DoH: the engine looks the zone up itself): "not ready", not REFUSED */
+    {
+        uint8_t qb2[512], rb2[4096];
+        size_t ql2 = build_query(qb2, 0x7401, true, 0);
+        rcu_reader_enter(&wctx);
+        zone_db_snapshot_t *sn = acquire_zone_snapshot();
+        int rl2 = process_dns_query_cap(qb2, ql2, rb2, 1232, 0, "www.park.test.", 1, "127.0.0.1", &cc, false, NULL, sn);
+        rcu_reader_exit(&wctx);
+        CHECK(rl2 > 12 && rb2[0] == 0x74 && rb2[1] == 0x01 && (rb2[3] & 0x0F) == 2);
+        bool found = false;                                                     /* the EDE option: code 15, a length, info code 14 */
+        for (int i = 12; i + 6 <= rl2; i++) if (rb2[i] == 0 && rb2[i + 1] == 15 && rb2[i + 4] == 0 && rb2[i + 5] == 14) found = true;
+        CHECK(found);
+    }
+
+    /* -- the request to fetch cannot be handed over (the ring is full): "not ready" at once, nothing stays parked that nobody would wake */
+    while (park_fetch_push(park_fetch_ring(0), "default", "other.test.", KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_SUMMARY)) {}
+    SEND_QUERY(0x7101, true, 0);
+    CHECK(w.n_tx == 1 && table.nwait == 0 && table.nfree == table.cap);
+    FLUSH();
+    a = read_answer(sk[1]);
+    CHECK(a.got && a.id == 0x7101 && a.rcode == 2 && a.ede == 14);
+    while (park_fetch_pop(park_fetch_ring(0), &q)) {}
+
+    /* -- a TSIG-signed request gets a signed "not ready" answer (RFC 8945 5.3: the key of the verified request, the request's MAC): the same
+     *    handling as every other answer of the engine */
+    {
+        tsig_key_t *k1 = NULL;
+        for (tsig_key_t *k = cfg.keys; k; k = k->next) if (strcmp(k->name, "k1") == 0) k1 = k;
+        CHECK(k1 != NULL);
+        w.park = NULL;
+        uint8_t *qb = rx + sizeof(udp_ipc_t);
+        size_t ql = build_query(qb, 0x7201, true, 0), sl = ql;
+        CHECK(k1 && tsig_sign_packet(qb, &sl, 2000, k1, 0, NULL, NULL, NULL, 0, false) == 0);
+        uint8_t req_copy[2048], req_mac[64], resp_mac[64];
+        size_t req_mac_len = 0, resp_mac_len = 0;
+        memcpy(req_copy, qb, sl);
+        CHECK(k1 && tsig_verify_packet(req_copy, sl, k1, NULL, 0, NULL, 0, false, req_mac, &req_mac_len) == 0);
+        mk_ipc((udp_ipc_t *)rx, 7, sl);
+        w.n_tx = 0;
+        udp_one(&w, (udp_ipc_t *)rx, qb, (ssize_t)sl);
+        CHECK(w.n_tx == 1);
+        FLUSH();
+        uint8_t raw[sizeof(udp_ipc_t) + 4096];
+        struct pollfd pf = { sk[1], POLLIN, 0 };
+        ssize_t rn = poll(&pf, 1, 1000) > 0 ? recv(sk[1], raw, sizeof(raw), MSG_PEEK) : -1;
+        CHECK(rn > (ssize_t)sizeof(udp_ipc_t) + 12);
+        tsig_rr_t trr;
+        const uint8_t *rm = raw + sizeof(udp_ipc_t);
+        size_t rml = rn > (ssize_t)sizeof(udp_ipc_t) ? (size_t)rn - sizeof(udp_ipc_t) : 0;
+        CHECK(rml > 0 && tsig_parse_rr(rm, rml, &trr) == 1 && strcasecmp(trr.key_name, "k1.") == 0);
+        CHECK(rml > 0 && k1 && tsig_verify_packet(rm, rml, k1, req_mac, req_mac_len, NULL, 0, false, resp_mac, &resp_mac_len) == 0);
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.id == 0x7201 && a.rcode == 2 && a.ede == 14);
+        /* a request with a wrong MAC is NOTAUTH, not "not ready" (the TSIG is checked first, RFC 8945 5.2) */
+        sl = build_query(qb, 0x7202, true, 0);
+        CHECK(k1 && tsig_sign_packet(qb, &sl, 2000, k1, 0, NULL, NULL, NULL, 0, false) == 0);
+        qb[sl - 10] ^= 0x55;                                           /* (inside the MAC) */
+        mk_ipc((udp_ipc_t *)rx, 7, sl);
+        w.n_tx = 0;
+        udp_one(&w, (udp_ipc_t *)rx, qb, (ssize_t)sl);
+        FLUSH();
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.id == 0x7202 && a.rcode == 9);
+    }
+
+    /* -- the answer is counted by response rate limiting like any error answer: the same request again and again from one address is cut
+     *    off (slip 0: dropped) */
+    {
+        static server_config_t cfg2;
+        char conf2[1400];
+        snprintf(conf2, sizeof(conf2), "options { directory \"%s\"; rate-limit { responses-per-second 1; errors-per-second 1; window 1; slip 0; }; };\n"
+                 "view \"default\" { match-clients { any; }; zone \"park.test\" { type master; file \"%s\"; }; };\n", dir, zf);
+        CHECK(parse_named_conf(conf2, &cfg2) == 0);
+        cfg2.send_extended_errors = true;
+        atomic_store_explicit(&g_config_db.active, &cfg2, memory_order_release);
+        int answered = 0;
+        for (int i = 0; i < 12; i++) {
+            SEND_QUERY(0x7300 + i, true, 0);
+            answered += w.n_tx;
+            FLUSH();
+        }
+        CHECK(answered >= 1 && answered < 12);
+        while (read_answer(sk[1]).got) {}
+        atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    }
+
+    /* -- nothing is parked and nobody said anything: park_service() returns at once (and with a key in the ring it does look) */
+    w.park = &table;
+    CHECK(table.nwait == 0 && table.nready == 0);
+    park_service(&w, -1);
+    CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", false) && park_wake_pending(park_wake_ring(0)));
+    park_service(&w, -1);
+    CHECK(!park_wake_pending(park_wake_ring(0)));
 
     park_unregister_worker(0);
     park_free(&table);

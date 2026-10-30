@@ -197,6 +197,8 @@ static void send_failed(int fd, kdb_enc_t *e, uint16_t view, const char *zone, u
 }
 
 /* ---------------------------------------------------------------- the worker's side */
+extern int64_t g_ing_fetch_timeout_ms;                                 /* dns_db_ingest.c: 30 s, shortened here */
+
 static bool wake_next(park_key_t *k, int ms) {
     park_wake_ring_t *r = park_wake_ring(0);
     for (int i = 0; i < ms / 2; i++) {
@@ -321,8 +323,14 @@ int main(void) {
     CHECK(atomic_load(&elem_of("default", "r.test.")->state) == ZDIR_ST_LOADING);
     CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
     CHECK(!ch_next(&fetchc, &m, 300));                                     /* (in flight: no second message) */
+    for (int i = 0; i < 100 && dbreg_pending_count() != 0; i++) usleep(50000);
+    zone_db_snapshot_t *snap_before = atomic_load(&g_zone_db_active);
+    CHECK(dbreg_pending_count() == 0);
     send_zone(f[0], &e, 0, "r.test.", 7, id1, 11);
     CHECK(wake_next(&k, 5000) && strcmp(k.zone, "r.test.") == 0 && !k.failed);
+    /* the element is in the index already (only its data was out of memory): the install queues nothing and publishes no snapshot */
+    usleep(300000);
+    CHECK(dbreg_pending_count() == 0 && atomic_load(&g_zone_db_active) == snap_before);
     zone_db_entry_t *new_r = zdir_entry(elem_of("default", "r.test."));
     CHECK(new_r != NULL && new_r != old_r && atomic_load(&new_r->serial) == 7);
     CHECK(atomic_load(&elem_of("default", "r.test.")->state) == ZDIR_ST_RESIDENT);
@@ -410,6 +418,42 @@ int main(void) {
     CHECK(zdir_entry(elem_of("default", "r.test.")) == NULL);
     send_summary(f[0], &e, 0, "r.test.", 10, id_sum, 11);
     CHECK(wake_next(&k, 5000) && !k.failed);
+
+    /* -- a summary whose timers are above 2147483647 stores the value a zone in memory has (parse_ttl_value rounds it down, RFC 8767 4) */
+    CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_SUMMARY));
+    CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ);
+    {
+        uint8_t dig0[KDB_DIGEST_LEN] = { 0 };
+        kdb_enc_begin(&e, KDB_T_ZONE_BEGIN);
+        kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "r.test."); kdb_enc_i64(&e, 3, 11); kdb_enc_u8(&e, 4, KDB_ZK_PRIMARY);
+        kdb_enc_u32(&e, 5, 12); kdb_enc_u32(&e, 6, KDB_ZF_SUMMARY); kdb_enc_u64(&e, 7, 0); kdb_enc_bytes(&e, 8, dig0, sizeof(dig0));
+        kdb_enc_u64(&e, 11, m.u.fetch_req.request_id); kdb_enc_u32(&e, 12, 4000000000u); kdb_enc_u32(&e, 13, 3000000000u); kdb_enc_u32(&e, 14, 7);
+        kdb_enc_end(&e);
+        kdb_enc_begin(&e, KDB_T_ZONE_END);
+        kdb_enc_u64(&e, 1, 0);
+        kdb_enc_end(&e);
+        ch_send(f[0], &e);
+    }
+    CHECK(wake_next(&k, 5000) && !k.failed);
+    CHECK(dbreg_find_info("default", "r.test.", &inf, 1) == 1 && !inf.has_entry && inf.serial == 12 && inf.refresh == 2147483647u);
+    CHECK(elem_of("default", "r.test.")->retry == 2147483647u && elem_of("default", "r.test.")->expire == 7);
+
+    /* -- a fetch the loader never answers is given up (the test shortens the 30 s): the workers are told it failed, the zone can be asked for
+     *    again, and the answer that comes too late is thrown away */
+    g_ing_fetch_timeout_ms = 150;
+    CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+    CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ);
+    uint64_t id_late = m.u.fetch_req.request_id;
+    CHECK(wake_next(&k, 5000) && strcmp(k.zone, "r.test.") == 0 && k.failed);
+    g_ing_fetch_timeout_ms = 30000;
+    CHECK(atomic_load(&elem_of("default", "r.test.")->state) == ZDIR_ST_ABSENT);
+    send_zone(f[0], &e, 0, "r.test.", 13, id_late, 11);
+    CHECK(!wake_next(&k, 300));
+    CHECK(zdir_entry(elem_of("default", "r.test.")) == NULL);
+    CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+    CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && m.u.fetch_req.request_id != id_late);
+    send_failed(f[0], &e, 0, "r.test.", m.u.fetch_req.request_id);
+    CHECK(wake_next(&k, 5000) && k.failed);
 
     /* -- a restarted loader: the supervisor hands over a new pair of streams; what was not answered is asked again */
     CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));

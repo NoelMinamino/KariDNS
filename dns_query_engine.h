@@ -88,6 +88,14 @@ int process_dns_query_cap_routed(const uint8_t *req, size_t req_len, uint8_t *re
                                  bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                                  zone_db_snapshot_t *snap, const query_route_t *route);
 
+/* D1a: the answer for a query whose zone is in the directory and not in memory when the caller cannot wait for it: SERVFAIL + Extended DNS Error 14
+ * "Not Ready" (RFC 8914 4.15), through the same view, TSIG (RFC 8945 5.3) and rate limit handling as an answer from a zone.  zone: the name of the
+ * directory element (the key of rate limiting).  The arguments are those of process_dns_query_cap_routed(). */
+int process_dns_not_ready_routed(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len, size_t res_cap, const char *qname,
+                                 uint16_t qtype, const char *client_ip, compress_ctx_t *comp_ctx, bool is_tcp,
+                                 const rate_limit_config_t **out_rrl_cfg, zone_db_snapshot_t *snap, const query_route_t *route,
+                                 const char *zone);
+
 /* The view of a client by its address alone: a view whose match-clients has a `key` element is evaluated as for an unsigned request. */
 view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip);
 /* The view of a request (BIND bin/named/server.c get_matching_view_sync()): the views are tried in order, and a view whose match-clients has a

@@ -368,6 +368,13 @@ int main(int argc, char **argv) {
             write_all(g_fetch.fd, junk, sizeof(junk));
             service(10000, fetch_eof, NULL);
             printf("FETCH %s\n", g_fetch.eof ? "closed" : "still open");
+            service(10000, child_gone, NULL);                   /* (a loader whose fetch stream is gone ends, for the supervisor to start another) */
+            printf("LOADER %s\n", g_child_gone ? "ended" : "still running");
+        } else if (strcmp(it, "closefetch") == 0) {
+            close(g_fetch.fd);                                  /* the Backend drops the fetch stream (loader protocol error, send buffer overflow, memory) */
+            g_fetch.fd = -1;
+            service(10000, child_gone, NULL);
+            printf("LOADER %s\n", g_child_gone ? "ended" : "still running");
         } else if (strcmp(it, "badmain") == 0) {
             kdb_enc_reset(&g_enc);
             kdb_enc_begin(&g_enc, KDB_T_FETCH_REQ);

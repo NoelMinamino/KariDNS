@@ -1780,7 +1780,7 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
     }
     zone_db_entry_t *cur = zdir_entry(z);
     bool replace = created && cur && cur != entry;                  /* a new entry replaces the one registered earlier */
-    bool in_index = created && !fresh && cur && zdir_lookup(dbreg_active_dir_locked(view), z->name) == z;
+    bool in_index = created && !fresh && zdir_lookup(dbreg_active_dir_locked(view), z->name) == z;
     bool queue_add = created && !sh && !in_index && !(z->flags & ZDIR_F_QUEUED);
     uint8_t *new_digest = NULL;                                     /* the block of the digest: a zone that has none gets one */
     if ((replace && !(gent = malloc(sizeof(*gent)))) || (queue_add && !dbreg_queue_reserve(&rv->adds, rv->n_adds, &rv->cap_adds)) ||
@@ -1917,9 +1917,11 @@ bool dbreg_apply_summary(const char *view, const char *zone, int64_t source_id, 
     if (z && !(z->flags & ZDIR_F_DELETED) && !zdir_entry(z) && z->source_id == source_id) {     /* (a zone in memory is the newer truth) */
         z->serial = serial;
         if (has_timers) {
-            z->refresh = refresh;
-            z->retry = retry;
-            z->expire = expire;
+            /* the same values a zone in memory has: the zone parser takes 0..4294967295 for these fields and parse_ttl_value() (what the
+             * install of the data stores) rounds a value with the top bit set down to 2147483647 (RFC 8767 4) */
+            z->refresh = refresh > 2147483647u ? 2147483647u : refresh;
+            z->retry = retry > 2147483647u ? 2147483647u : retry;
+            z->expire = expire > 2147483647u ? 2147483647u : expire;
         }
         z->last_result = DBREG_APPLIED;
         applied = true;
@@ -1927,6 +1929,25 @@ bool dbreg_apply_summary(const char *view, const char *zone, int64_t source_id, 
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     return applied;
 }
+
+#if defined(KARIDNS_TEST_EVICT) || defined(KARIDNS_UNIT_TEST)
+/* TEST ONLY (not in a production build): put a DB zone in the state of an evicted one: still in the directory, no data in memory.  The entry
+ * is not freed (the readers of older snapshots may hold it), so a test that uses it leaks one entry per zone.  The next load of the zone from the
+ * database brings the data back as any fetch does.  Milestone 3 (eviction) will reuse it. */
+bool dbreg_test_evict(const char *view, const char *name) {
+    bool ok = false;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, name, zdir_name_hash(name)) : NULL;
+    if (z && zdir_entry(z) && zdir_lookup(dbreg_active_dir_locked(view), z->name) == z) {
+        atomic_store_explicit(&z->entry, NULL, memory_order_release);
+        atomic_store_explicit(&z->state, ZDIR_ST_ABSENT, memory_order_release);
+        ok = true;
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return ok;
+}
+#endif
 
 int dbreg_delete(const char *view, const char *name, int64_t source_id) {
     int rc = 0;

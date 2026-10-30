@@ -58,7 +58,9 @@ _Static_assert(KARIDNS_DB_MAX_VIEWS == KDB_MAX_CONFIG_VIEWS, "the configuration 
 #define ING_RBUF 65536
 #define ING_FLUSH_AT 16384        /* queued bytes that are written at once; the rest goes out after the event round */
 #define ING_FETCH_MAX 256         /* fetches in flight (D1a): more is refused, the queries then wait for their own deadline */
-#define ING_FETCH_TIMEOUT_MS 30000 /* a fetch the loader has not answered by then is given up (the queries have timed out long before) */
+/* a fetch the loader has not answered by then is given up (the queries have timed out long before); a variable for the unit test */
+#define STATIC_TEST
+STATIC_TEST int64_t g_ing_fetch_timeout_ms = 30000;
 #define ING_FETCH_OUT_MAX (1u << 20)
 
 typedef struct {
@@ -2238,7 +2240,7 @@ static void fetch_expire(ing_t *g) {
   if (g->nfreq == 0) return;
   int64_t now = now_ms();
   for (uint32_t i = 0; i < ING_FETCH_MAX; i++)
-    if (g->freq[i].active && now - g->freq[i].sent_ms >= ING_FETCH_TIMEOUT_MS)
+    if (g->freq[i].active && now - g->freq[i].sent_ms >= g_ing_fetch_timeout_ms)
       fetch_complete(g, &g->freq[i], false, "the loader did not answer in time");
 }
 
@@ -2474,7 +2476,12 @@ static void *ingest_thread(void *arg) {
       wait_ms = g->last_delta_ms + ING_DELTA_MS - now_ms();
       if (wait_ms < 0) wait_ms = 0;
     }
-    if (g->nfreq > 0 && (wait_ms < 0 || wait_ms > 1000)) wait_ms = 1000;          /* fetches in flight: look at their deadlines */
+    if (g->nfreq > 0) {                                  /* fetches in flight: look at their deadlines */
+      int64_t tick = g_ing_fetch_timeout_ms / 10;
+      if (tick > 1000) tick = 1000;
+      if (tick < 10) tick = 10;
+      if (wait_ms < 0 || wait_ms > tick) wait_ms = tick;
+    }
     if (wait_ms >= 0) {
       ts.tv_sec = wait_ms / 1000;
       ts.tv_nsec = (wait_ms % 1000) * 1000000;
