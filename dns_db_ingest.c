@@ -1078,6 +1078,16 @@ static void apply_delta(ing_t *g) {
 }
 
 /* publish new zones when a second has passed since the last time (design 4.4: the first DB zones appear early) */
+/* wake the ingest thread: something it should look at without an event of its own (an eviction queued a change of the index) */
+static _Atomic int g_ing_kick_kq = -1;
+static void ing_kick(void) {
+  int kq = atomic_load_explicit(&g_ing_kick_kq, memory_order_relaxed);
+  if (kq < 0) return;
+  struct kevent t;
+  EV_SET(&t, ING_EVT_RESULT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+  (void)kevent(kq, &t, 1, NULL, 0, NULL);
+}
+
 static void maybe_apply_delta(ing_t *g) {
   if (dbreg_pending_count() > 0 && now_ms() - g->last_delta_ms >= ING_DELTA_MS) apply_delta(g);
 }
@@ -2554,6 +2564,8 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
   }
   EV_SET(&ev[0], 1, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   if (kevent(g->wait_kq, ev, 1, NULL, 0, NULL) != 0) return false;
+  atomic_store_explicit(&g_ing_kick_kq, g->kq, memory_order_relaxed);
+  dbreg_set_pending_notify(ing_kick);                /* D1a step 5: an eviction leaves a delta to publish; the thread may be asleep without a timeout */
   /* builder threads (design 1.5, D10): ingest-threads 1 = the stream thread builds */
   ing_cfg_t snap;
   snapshot_cfg(&snap);

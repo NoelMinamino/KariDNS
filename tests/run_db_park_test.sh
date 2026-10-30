@@ -45,9 +45,14 @@ cleanup() {
     [ -n "$SRV" ] && kill -TERM "$SRV" 2>/dev/null
     i=0; while [ -n "$SRV" ] && [ $i -lt 150 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     [ -n "$SRV" ] && kill -KILL "$SRV" 2>/dev/null
+    for ip in $ADDED; do ifconfig lo0 inet "$ip" -alias 2>/dev/null || ifconfig lo inet "$ip" -alias 2>/dev/null || true; done
     rm -rf "$T"
 }
 trap cleanup EXIT INT TERM
+ADDED=""
+ALIAS=""
+if ifconfig lo0 2>/dev/null | grep -q "inet 127.0.0.2 " || [ "$(uname -s)" = "Linux" ]; then ALIAS=127.0.0.2
+elif ifconfig lo0 inet 127.0.0.2/32 alias 2>/dev/null; then ALIAS=127.0.0.2; ADDED=127.0.0.2; fi
 
 PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
@@ -80,7 +85,7 @@ chmod 600 "$T/karictl.conf"
 KCTL="./karictl -c $T/karictl.conf"
 cat > "$T/k.conf" <<EOF
 options {
-    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT; tcp-idle-timeout 3000ms; tcp-connection-reuse yes;
+    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT; tcp-idle-timeout 3000ms; tcp-connection-reuse yes; allow-query { 127.0.0.1; };
     database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; db-reload-timeout 1; park-timeout 1000; };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
@@ -119,6 +124,21 @@ resident_again a.test. "... and the zone is in memory again (it came through the
 evicted a.test. "a.test is out of memory again"
 [ "$(q www.a.test +tcp)" = "192.0.2.80" ] && pass "the TCP query is answered with the data of the database" || fail "TCP: '$(q www.a.test +tcp)'"
 resident_again a.test. "... and the zone is in memory again"
+
+echo "== allow-query is evaluated before the query parks"
+if [ -z "$ALIAS" ]; then
+    echo "  [SKIP] no loopback alias 127.0.0.2 for a client that may not ask"
+else
+    evicted a.test. "a.test is out of memory"
+    for tr in "" "+tcp"; do
+        out=$(./dag @127.0.0.1 -b "$ALIAS" -p "$PORT" www.a.test A $tr +nohexdump +time=5 +tries=1 2>&1)
+        echo "$out" | grep -q 'REFUSED' && pass "${tr:-UDP}: a client that may not ask is REFUSED" || fail "${tr:-UDP}: not REFUSED: $(echo "$out" | head -4)"
+        echo "$out" | grep -qi 'not ready' && fail "${tr:-UDP}: the refused client learned that the zone is in the database"
+    done
+    # the zone is still out of memory: nothing was fetched for the refused clients (evict says OK only for a zone in memory)
+    evict a.test. | grep -q '^ERROR' && pass "... and the zone was not fetched for them" || fail "the zone was fetched for a client that may not ask"
+    [ "$(q www.a.test)" = "192.0.2.80" ] && pass "a client that may ask still waits for the zone and gets the answer" || fail "the allowed client got no answer"
+fi
 
 echo "== TCP: pipelining, EOF while parked, idle timeout after a parked query"
 evicted a.test. "a.test is out of memory"

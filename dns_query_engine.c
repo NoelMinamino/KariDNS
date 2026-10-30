@@ -2096,6 +2096,8 @@ STATIC_TEST ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss
 }
 
 _Thread_local query_rrl_info_t t_query_rrl_info;
+/* D1a: process_dns_not_ready_routed() is asked whether the query may be parked (see there) */
+static _Thread_local bool t_nr_probe;
 /* X-20: 直前の要求の TSIG の状態 (鍵は設定スナップショット内)。RRL の slip 応答の署名に使う */
 static _Thread_local tsig_request_t t_query_tsig;
 
@@ -2911,7 +2913,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
                               bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                               zone_db_snapshot_t *snap, server_config_t *cfg,
                               zone_db_entry_t **out_matched_entry, tsig_request_t *tsig,
-                              const query_route_t *route, const char *not_ready_zone);
+                              const query_route_t *route, const zdir_elem_t *not_ready_zone);
 
 static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len, uint8_t *res,
                                              size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
@@ -2919,7 +2921,7 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
                                              bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                                              zone_db_snapshot_t *snap, server_config_t *cfg,
                                              zone_db_entry_t **out_matched_entry, const query_route_t *route,
-                                             const char *not_ready_zone);
+                                             const zdir_elem_t *not_ready_zone);
 
 int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
                                size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
@@ -2942,7 +2944,7 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
                                              bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                                              zone_db_snapshot_t *snap, server_config_t *cfg,
                                              zone_db_entry_t **out_matched_entry, const query_route_t *route,
-                                             const char *not_ready_zone) {
+                                             const zdir_elem_t *not_ready_zone) {
   t_query_rrl_info.zone = NULL; /* D-05: 早い段階で返す応答 (エラー) のために先に消す */
   t_query_rrl_info.wildcard = false;
   if (req_len < DNS_HEADER_SIZE) {
@@ -2962,7 +2964,7 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
     zdir_elem_t *own_pel = NULL;
     own_route.entry = own_route.view ? find_zone_for_query_ex(own_route.view, qname, ((req[2] >> 3) & 0x0F) == 0 ? qtype : 0, &own_pel) : NULL;
     /* D1a: a zone that is in the directory and not in memory (TLS, DoH and the other callers that do not park): "not ready", not REFUSED */
-    if (!own_route.entry && own_pel && !not_ready_zone) not_ready_zone = own_pel->name;
+    if (!own_route.entry && own_pel && !not_ready_zone) not_ready_zone = own_pel;
     own_route.tsig = done ? &tsig : NULL;
     route = &own_route;
   }
@@ -3009,7 +3011,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
                               bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                               zone_db_snapshot_t *snap, server_config_t *cfg,
                               zone_db_entry_t **out_matched_entry, tsig_request_t *tsig,
-                              const query_route_t *route, const char *not_ready_zone) {
+                              const query_route_t *route, const zdir_elem_t *not_ready_zone) {
   char current_qname[DNS_NAME_TEXT_SIZE];
   strlcpy(current_qname, qname, sizeof(current_qname));
   char current_qname_lc[DNS_NAME_TEXT_SIZE];
@@ -3157,7 +3159,22 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
      * checks of the message above (a malformed request is still a FORMERR), before any work on the zone.  The answer is an error answer of that
      * zone for rate limiting (the global limits), and goes through the TSIG handling of the caller like every other answer: signed with the
      * key of a verified request, RFC 8945 5.3 (the request given here has the TSIG record taken off, 5.2). */
-    t_query_rrl_info.zone = not_ready_zone;
+    t_query_rrl_info.zone = not_ready_zone->name;
+    /* allow-query first, exactly as for a zone in memory (below: once the zone is known, before anything else is done for the query): a client
+     * that may not ask is refused, does not wait for the zone, does not make the server read it, and does not learn that the zone is in the
+     * database.  The zone's own statement comes from the interned settings the element kept when its data left memory (zdir_elem_t.sh). */
+    if (opcode == 0 && view && cfg && cfg->acl_query_active) {
+      zone_config_t zc;
+      memset(&zc, 0, sizeof(zc));
+      zc.domain = (char *)not_ready_zone->name;
+      zone_ext_shared_t *sh = atomic_load_explicit(&not_ready_zone->sh, memory_order_acquire);
+      zc.ext = sh ? &sh->ext : NULL;
+      if (!zone_query_permitted(cfg, &zc, view->name, client_ip)) {
+        add_ede(&edns, send_ede, 18, "Query refused due to access control");
+        return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
+      }
+    }
+    if (t_nr_probe) return DNS_NR_PERMITTED;
     return build_not_ready_response(req, req_len, res, max_res_len, is_tcp, cfg);
   }
 
@@ -3867,17 +3884,23 @@ int process_dns_query_cap_routed(const uint8_t *req, size_t req_len, uint8_t *re
   return ret;
 }
 
-/* D1a: the answer of the worker for a query whose zone is in the directory and not in memory, when it cannot wait for it: the same view, TSIG
- * (RFC 8945 5.3) and rate limit handling as an answer from a zone, with SERVFAIL + EDE 14 as the content (route as for
- * process_dns_query_cap_routed(); zone: the name of the directory element). */
+/* D1a: the answer of the worker for a query whose zone is in the directory and not in memory, when it cannot wait for it: the same view, ACL,
+ * TSIG (RFC 8945 5.3) and rate limit handling as an answer from a zone, with SERVFAIL + EDE 14 as the content (route as for
+ * process_dns_query_cap_routed(); elem: the directory element of the zone).
+ * probe: the worker asks whether the query may be parked.  A query that the zone's allow-query (the full chain of the normal path: the zone's
+ * own statement, the view's, options', allow-query-on, a TSIG key) refuses gets REFUSED + EDE 18 exactly as for a zone in memory, and so does
+ * every other answer that is final (a malformed request, a TSIG error: FORMERR, NOTAUTH); the return value is that answer's length, and the
+ * query neither parks nor asks for the zone.  DNS_NR_PERMITTED is returned (nothing written) for a query that may wait for the zone. */
 int process_dns_not_ready_routed(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len, size_t res_cap, const char *qname,
                                  uint16_t qtype, const char *client_ip, compress_ctx_t *comp_ctx, bool is_tcp,
                                  const rate_limit_config_t **out_rrl_cfg, zone_db_snapshot_t *snap, const query_route_t *route,
-                                 const char *zone) {
+                                 const zdir_elem_t *elem, bool probe) {
   server_config_t *cfg = acquire_config_snapshot();
   zone_db_entry_t *matched_entry = NULL;
+  t_nr_probe = probe;
   int ret = process_dns_query_impl_cap_routed(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx, is_tcp, out_rrl_cfg,
-                                              snap, cfg, &matched_entry, route, zone);
+                                              snap, cfg, &matched_entry, route, elem);
+  t_nr_probe = false;
   release_config_snapshot(cfg);
   return ret;
 }

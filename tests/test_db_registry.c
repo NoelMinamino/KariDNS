@@ -1448,7 +1448,7 @@ static void test_dir_fetch_state(void) {
     CHECK(ea && ef);
     /* the digest is a block of its own that only a zone with data from the database has */
     CHECK(ea->digest != NULL && ef->digest == NULL);
-    CHECK(sizeof(zdir_elem_t) <= 80);                              /* (104 before the digest left the element) */
+    CHECK(sizeof(zdir_elem_t) <= 96);                              /* (104 before the digest left the element; the settings pointer and the cache manager's counters came back for it) */
 
     /* the fetch state: a zone in memory is not fetched, one that is not in the registry is not a zone, one that has no data is begun once */
     CHECK(dbreg_fetch_begin("default", "nope.test.") == DBREG_FETCH_NONE && dbreg_fetch_begin("nosuchview", "a.test.") == DBREG_FETCH_NONE);

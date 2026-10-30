@@ -2113,15 +2113,30 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
             route.tsig = route_tsig_done ? &route_tsig : NULL;
             zdir_elem_t *pel = NULL;
             route.entry = route.view ? find_zone_for_query_ex(route.view, qname, ((req_buf[2] >> 3) & 0x0F) == 0 ? qtype : 0, &pel) : NULL;
-            bool not_ready = false;
+            uint8_t *res_buf = batch->tx_buffers[w->n_tx] + sizeof(udp_ipc_t);
+            const rate_limit_config_t *rrl_cfg = NULL;
+            int res_len = 0;
+            bool not_ready = false, answered = false;
             if (__builtin_expect(!route.entry && pel != NULL, 0)) {
-              /* D1a: the zone is in the directory and its data is not in memory (never, until a later milestone evicts zones).  A request whose
-               * time was up (w->not_ready) is answered "not ready" only if the zone is still not there: one that arrived is answered. */
-              if (!w->not_ready && udp_park(w, route.view, pel, ipc_msg, req_buf, (size_t)payload_received)) {
-                rcu_reader_exit(ctx);
-                return;                                   /* parked: it is answered when the zone is there, or its time is up */
+              /* D1a: the zone is in the directory and its data is not in memory.  First the question whether this client may ask at all (the
+               * allow-query chain of the normal path, TSIG): if not, or if the request is wrong, the answer is final (REFUSED, FORMERR,
+               * NOTAUTH ...) and nothing parks and nothing is fetched.  A request whose time was up (w->not_ready) is answered "not ready" only
+               * if the zone is still not there: one that arrived is answered. */
+              query_set_client_addr(client_addr);
+              query_set_local_addr(ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL);   /* allow-query-on */
+              res_len = process_dns_not_ready_routed(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
+                                                     UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname, qtype, client_ip, &(*w->cc), false,
+                                                     &rrl_cfg, snap, &route, pel, true);
+              if (res_len != DNS_NR_PERMITTED) {
+                answered = true;
+              } else {
+                atomic_fetch_add_explicit(&pel->freq, 1, memory_order_relaxed);        /* the zone is asked for (cache admission) */
+                if (!w->not_ready && udp_park(w, route.view, pel, ipc_msg, req_buf, (size_t)payload_received)) {
+                  rcu_reader_exit(ctx);
+                  return;                                 /* parked: it is answered when the zone is there, or its time is up */
+                }
+                not_ready = true;
               }
-              not_ready = true;
             }
             if (route.entry && (route.entry->kind == ZONE_KIND_PROGRAM || route.entry->kind == ZONE_KIND_FORWARD)) {
               uint8_t *heap_req = malloc((size_t)payload_received);
@@ -2168,16 +2183,15 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
               return;
             }
 
-            uint8_t *res_buf = batch->tx_buffers[w->n_tx] + sizeof(udp_ipc_t);
-            const rate_limit_config_t *rrl_cfg = NULL;
-            int res_len;
             query_set_client_addr(client_addr);
             query_set_local_addr(ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL);   /* allow-query-on */
-            if (__builtin_expect(not_ready, 0)) {
+            if (answered) {
+              /* the answer was built by the check above (REFUSED, FORMERR, NOTAUTH ...) */
+            } else if (__builtin_expect(not_ready, 0)) {
               /* D1a: the same view, TSIG and rate limit handling as an answer from the zone, with "not ready" as the content */
               res_len = process_dns_not_ready_routed(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
                                                      UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
-                                                     qtype, client_ip, &(*w->cc), false, &rrl_cfg, snap, &route, pel->name);
+                                                     qtype, client_ip, &(*w->cc), false, &rrl_cfg, snap, &route, pel, false);
             } else {
               res_len = process_dns_query_cap_routed(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
                                                      UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
@@ -2948,10 +2962,20 @@ process_tcp_client: ;
             route.tsig = route_tsig_done ? &route_tsig : NULL;
             zdir_elem_t *pel = NULL;
             route.entry = route.view ? find_zone_for_query_ex(route.view, qname, ((msg[2] >> 3) & 0x0F) == 0 ? qtype : 0, &pel) : NULL;
-            bool not_ready = false;
+            bool not_ready = false, answered = false;
+            int res_len = 0;
             if (__builtin_expect(!route.entry && pel != NULL, 0)) {
-              /* D1a: the zone is in the directory and its data is not in memory (never, until a later milestone evicts zones).  The connection
-               * is parked: one request per connection, kept in buf, read events ignored until park_service() starts it again */
+              /* D1a: the zone is in the directory and its data is not in memory.  The client is checked first (allow-query as for a zone in
+               * memory, TSIG, a wrong request): a final answer (REFUSED ...) is sent and nothing parks.  Otherwise the connection is parked:
+               * one request per connection, kept in buf, read events ignored until park_service() starts it again */
+              query_set_client_addr(&ctx_tcp->client_addr);
+              query_set_local_addr(ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL);   /* allow-query-on */
+              res_len = process_dns_not_ready_routed(msg, msg_len, tcp_res_buf, 65535, 0, qname, qtype, ctx_tcp->client_ip,
+                                                     &thread_compress_ctx, true, NULL, snap, &route, pel, true);
+              if (res_len != DNS_NR_PERMITTED) answered = true;
+            }
+            if (__builtin_expect(!route.entry && pel != NULL && !answered, 0)) {
+              atomic_fetch_add_explicit(&pel->freq, 1, memory_order_relaxed);                 /* the zone is asked for (cache admission) */
               int64_t pnow = park_now_ms();
               int64_t left = ctx_tcp->park_deadline_ms ? ctx_tcp->park_deadline_ms - pnow : (int64_t)park_timeout_ms;
               if (park_on && !ctx_tcp->not_ready_now && left > 0) {
@@ -3026,13 +3050,14 @@ process_tcp_client: ;
               break;
             }
             /* D-04: 応答はワーカーごとのバッファ (起動時に確保) に組み立てる */
-            int res_len;
             query_set_client_addr(&ctx_tcp->client_addr);
             query_set_local_addr(ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL);   /* allow-query-on */
-            if (__builtin_expect(not_ready, 0)) {
+            if (answered) {
+              /* the answer was built by the check above (REFUSED, FORMERR, NOTAUTH ...) */
+            } else if (__builtin_expect(not_ready, 0)) {
               res_len = process_dns_not_ready_routed(msg, msg_len, tcp_res_buf, 65535, 0,
                                                      qname, qtype, ctx_tcp->client_ip,
-                                                     &thread_compress_ctx, true, NULL, snap, &route, pel->name);
+                                                     &thread_compress_ctx, true, NULL, snap, &route, pel, false);
             } else {
               res_len = process_dns_query_cap_routed(msg, msg_len, tcp_res_buf, 65535, 0,
                                                      qname, qtype, ctx_tcp->client_ip,

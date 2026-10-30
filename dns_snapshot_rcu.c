@@ -169,6 +169,7 @@ static void zdir_elem_release(zdir_elem_t *e) {
   if (en && !(e->kind & ZDIR_K_BORROWED)) zdir_entry_unref(en);
   free(e->error);
   free(e->digest);
+  zone_ext_shared_unref(atomic_load_explicit(&e->sh, memory_order_relaxed));
   free(e);
 }
 
@@ -220,7 +221,8 @@ static void garb_free(zdir_garbage_t *g) {
   }
   for (zdir_gent_t *n = g->ents, *nx; n; n = nx) {
     nx = n->next;
-    zdir_entry_unref(n->entry);
+    if (n->entry) zdir_entry_unref(n->entry);
+    zone_ext_shared_unref(n->sh_old);
     free(n);
   }
   memset(g, 0, sizeof(*g));
@@ -676,6 +678,10 @@ zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name
   return z;
 }
 
+static void zone_bytes_retired_add(int cls, int64_t delta);
+/* D1a step 5: bytes of zones that were evicted and whose entries are not freed yet (they are in the retired total until then) */
+static _Atomic int64_t g_evict_inflight;
+
 void free_zone_db_entry(zone_db_entry_t *entry) {
   if (!entry) return;
   if (entry->groups) {
@@ -690,6 +696,10 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
   ixfr_history_clear(&entry->ixfr_history);
   zone_version_t *active = atomic_load_explicit(&entry->rcu.active, memory_order_relaxed);
   if (active && active->counted) zone_bytes_resident_add(zone_bytes_class(entry), -(int64_t)active->bytes);   /* (8.1) */
+  if (entry->evicted_bytes) {                       /* evicted: the active version was moved to the retired total when it left memory */
+    zone_bytes_retired_add(zone_bytes_class(entry), -(int64_t)entry->evicted_bytes);
+    atomic_fetch_sub_explicit(&g_evict_inflight, (int64_t)entry->evicted_bytes, memory_order_relaxed);
+  }
   zone_version_free(active);
   /* a DB zone's settings (the entry owns the current block; replaced ones go through zone_retire_object()) */
   free_zone_config((zone_config_t *)atomic_load_explicit(&entry->dbcfg, memory_order_relaxed));
@@ -1797,6 +1807,7 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
          * entry's reference is given back when the readers that may have it are gone, and the delta looks at it (a catalog consumer
          * that is replaced takes its members with it). */
         gent->entry = cur;
+        gent->sh_old = NULL;
         gent->served = in_index;
         gent->next = rv->repl;
         rv->repl = gent;
@@ -1930,20 +1941,85 @@ bool dbreg_apply_summary(const char *view, const char *zone, int64_t source_id, 
     return applied;
 }
 
+/* ---- D1a step 5: the data of a DB zone leaves memory (design 8.2) ---- */
+static _Atomic uint64_t g_evictions;
+static _Atomic(void (*)(void)) g_pending_notify;
+void dbreg_set_pending_notify(void (*cb)(void)) { atomic_store_explicit(&g_pending_notify, cb, memory_order_release); }
+
+/* Take the data of z out of memory; the element stays in the directory (state ABSENT, entry NULL), its digest, serial and SOA timers stay.  The
+ * lock is held.  Returns the bytes the zone's version held (at least 1), or 0: the zone cannot be evicted now (not a primary DB zone of its own
+ * view, pinned, not in the index yet, a transfer is reading it, its writer lock is busy).
+ * The entry is not freed here: a reader of the index may hold it, and so may a control command with a retained snapshot.  Its reference goes
+ * with the replaced-entry list (rv->repl) to the garbage of the snapshot that the next delta retires, and is given back when that snapshot is
+ * drained, exactly as a replaced entry's is.  Until then the version's bytes are in the retired total (not the resident one), and in g_evict_inflight. */
+static __attribute__((unused)) uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {   /* (the cache manager of the next commit uses it; so does the test hook) */
+    zone_db_entry_t *e = zdir_entry(z);
+    if (!e || e->source != ZONE_SRC_DB || e->is_secondary || e->is_catalog_member || e->catalog_member_count > 0 || z->shadowed ||
+        (z->kind & (ZDIR_K_SHARED | ZDIR_K_STATIC | ZDIR_K_BORROWED)) || (z->flags & (ZDIR_F_PIN | ZDIR_F_DELETED | ZDIR_F_GARB)) ||
+        atomic_load_explicit(&z->state, memory_order_relaxed) != ZDIR_ST_RESIDENT || e->evicted_bytes)
+        return 0;
+    if (zdir_lookup(dbreg_active_dir_locked(rv->name), z->name) != z) return 0;
+    if (atomic_load_explicit(&e->active_axfr, memory_order_acquire) > 0 || atomic_load_explicit(&e->is_transferring, memory_order_acquire)) return 0;
+    /* more than the registry's reference: a zone { in-view } of another view shares the entry (it would go on serving it), or an object of the entry
+     * waits on the retire stack; not now */
+    if (atomic_load_explicit(&e->snapshot_refs, memory_order_acquire) != 1) return 0;
+    zdir_gent_t *gent = malloc(sizeof(*gent));
+    if (!gent) return 0;
+    if (pthread_mutex_trylock(&e->writer_lock) != 0) {         /* an UPDATE, a transfer or a settings change is working on it */
+        free(gent);
+        return 0;
+    }
+    zone_version_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
+    uint64_t bytes = (a && a->counted) ? a->bytes : 0;
+    /* the settings the zone's allow-query is read from while its data is out (zdir_elem_t.sh) */
+    const zone_config_t *dc = atomic_load_explicit(&e->dbcfg, memory_order_acquire);
+    zone_ext_shared_t *nsh = (dc && dc->ext_shared) ? (zone_ext_shared_t *)dc->ext : NULL;
+    zone_ext_shared_t *osh = atomic_load_explicit(&z->sh, memory_order_relaxed);
+    gent->sh_old = NULL;
+    if (nsh != osh) {
+        if (nsh) zone_ext_shared_ref(nsh);
+        atomic_store_explicit(&z->sh, nsh, memory_order_release);
+        gent->sh_old = osh;
+    }
+    atomic_store_explicit(&z->entry, NULL, memory_order_release);
+    atomic_store_explicit(&z->state, ZDIR_ST_ABSENT, memory_order_release);
+    if (bytes) {
+        a->counted = false;
+        zone_bytes_resident_add(ZBYTES_DB, -(int64_t)bytes);
+        zone_bytes_retired_add(ZBYTES_DB, (int64_t)bytes);
+        e->evicted_bytes = bytes;
+        atomic_fetch_add_explicit(&g_evict_inflight, (int64_t)bytes, memory_order_relaxed);
+    } else {
+        e->evicted_bytes = 0;
+    }
+    gent->entry = e;
+    gent->served = false;
+    gent->next = rv->repl;
+    rv->repl = gent;
+    rv->n_repl++;
+    atomic_fetch_add_explicit(&g_dbreg_pending, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_evictions, 1, memory_order_relaxed);
+    pthread_mutex_unlock(&e->writer_lock);
+    void (*notify)(void) = atomic_load_explicit(&g_pending_notify, memory_order_acquire);
+    if (notify) notify();                              /* the ingest thread publishes the delta (and so retires the entry) */
+    return bytes ? bytes : 1;
+}
+
+uint64_t dbreg_evictions(void) { return atomic_load_explicit(&g_evictions, memory_order_relaxed); }
+uint64_t dbreg_evict_inflight(void) {
+    int64_t v = atomic_load_explicit(&g_evict_inflight, memory_order_relaxed);
+    return v > 0 ? (uint64_t)v : 0;
+}
+
 #if defined(KARIDNS_TEST_EVICT) || defined(KARIDNS_UNIT_TEST)
-/* TEST ONLY (not in a production build): put a DB zone in the state of an evicted one: still in the directory, no data in memory.  The entry
- * is not freed (the readers of older snapshots may hold it), so a test that uses it leaks one entry per zone.  The next load of the zone from the
- * database brings the data back as any fetch does.  Milestone 3 (eviction) will reuse it. */
+/* TEST ONLY (not in a production build): evict one DB zone by name, as the cache manager does, whatever the memory limit says.  Deterministic tests
+ * use it to put a zone out of memory (the state of an evicted zone: in the directory, no data); the data comes back through the fetch stream. */
 bool dbreg_test_evict(const char *view, const char *name) {
     bool ok = false;
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     dbreg_view_t *rv = dbreg_view_get(view, false);
     dbreg_zone_t *z = rv ? dbreg_find(rv, name, zdir_name_hash(name)) : NULL;
-    if (z && zdir_entry(z) && zdir_lookup(dbreg_active_dir_locked(view), z->name) == z) {
-        atomic_store_explicit(&z->entry, NULL, memory_order_release);
-        atomic_store_explicit(&z->state, ZDIR_ST_ABSENT, memory_order_release);
-        ok = true;
-    }
+    if (z && dbreg_evict_locked(rv, z)) ok = true;
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     return ok;
 }

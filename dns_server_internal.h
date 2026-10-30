@@ -433,6 +433,7 @@ typedef struct {
   _Atomic(int) active_axfr;
   _Atomic int snapshot_refs;
   ixfr_history_t ixfr_history;
+  size_t evicted_bytes;           /* D1a step 5: the bytes of the version served that were moved to the retired total when the zone was evicted (0: not evicted) */
   zone_observatory_t observatory;
   catalog_member_id_t *catalog_members;
   int catalog_member_count;
@@ -559,7 +560,7 @@ struct zdir_elem {
   uint32_t serial;             /* DB: the serial of the version offered last (the SOA of the entry for a secondary) */
   uint32_t refresh, retry, expire;   /* the SOA timers of the version served */
   uint32_t hash;               /* calc_fnv1a_strn(name, klen): the index hash */
-  uint32_t freq;               /* frequency counter (reserved: cache admission, a later milestone) */
+  _Atomic uint32_t freq;       /* D1a step 5: how often the zone is asked for (GDSF, cache admission).  Non-resident zone: +1 per query that parks; the cache manager folds the queries of a resident zone in (observatory counter) and halves it at each round */
   uint32_t gen;                /* generation of the state (reserved: parked queries, a later milestone) */
   _Atomic uint8_t state;       /* ZDIR_ST_*: written under g_zone_db_rebuild_lock, read without it (a worker looks at it before it parks a query) */
   uint8_t last_result;         /* DBREG_APPLIED or DBREG_REJECTED (the last version offered) */
@@ -569,6 +570,9 @@ struct zdir_elem {
   uint8_t klen;                /* the name without the trailing dot */
   uint8_t kind;                /* ZDIR_K_* (never changes) */
   uint8_t *digest;             /* DB: the 32-byte digest the loader sent, in a block of its own that only a zone with data in memory has (malloc, freed with the element; NULL = none) */
+  _Atomic(zone_ext_shared_t *) sh;   /* DB: the interned settings of the zone (one reference), set when its data leaves memory: a query for the zone while it is out of memory
+                                      * is checked against the zone's allow-query from it, before it parks (a zone in memory has its settings in the entry, dbcfg).  Replaced
+                                      * by the next eviction; the old one is given back with the garbage of the retired snapshot, as a reader may hold it. */
   char name[];                 /* canonical absolute name, lower case, with the trailing dot */
 };
 /* Where a zone's settings (dbcfg) live when its data is not in memory (D1a, decision of milestone 2): the zone_config_t of an entry (169 bytes of
@@ -609,8 +613,9 @@ struct zdir {
 /* what a retired snapshot keeps alive until it and every older snapshot are drained */
 typedef struct zdir_gent {
   struct zdir_gent *next;
-  zone_db_entry_t *entry;      /* one reference to give back */
+  zone_db_entry_t *entry;      /* one reference to give back (NULL: none) */
   bool served;                 /* (a replaced entry) it was the one in the index when it was replaced */
+  zone_ext_shared_t *sh_old;   /* one reference of settings to give back (an eviction replaced the element's), NULL = none */
 } zdir_gent_t;
 typedef struct {
   zdir_elem_t *elems;          /* chained through ->next */
@@ -951,6 +956,9 @@ typedef struct {
 /* The registry records of the zone `name` (any case, with or without the trailing dot) in the view `view` (NULL: every
  * view), at most max of them copied to out.  Returns how many there are. */
 int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int max);
+void dbreg_set_pending_notify(void (*cb)(void));                  /* called (lock held) when a change is queued without the ingest thread: it wakes the thread */
+uint64_t dbreg_evictions(void);                                   /* zones evicted since the start */
+uint64_t dbreg_evict_inflight(void);                              /* bytes of evicted zones whose entries are not freed yet (in the retired total) */
 #if defined(KARIDNS_TEST_EVICT) || defined(KARIDNS_UNIT_TEST)
 bool dbreg_test_evict(const char *view, const char *name);        /* TEST ONLY, see dns_snapshot_rcu.c */
 #endif

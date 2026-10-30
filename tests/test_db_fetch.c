@@ -313,8 +313,22 @@ int main(void) {
     CHECK(!ch_next(&fetchc, &m, 200));                                    /* nothing was asked of the loader */
 
     /* -- a zone that is not in memory: one FETCH_REQ, a second request for it sends nothing, the answer installs it and wakes */
-    zone_db_entry_t *old_r = evict("r.test.");
-    CHECK(zdir_entry(elem_of("default", "r.test.")) == NULL);
+    /* (evicted as the cache manager does it: the entry goes to the garbage of the snapshot the next delta retires, and is freed when that is drained;
+     * its bytes are in the retired total and in "in flight" until then) */
+    uint64_t ev0 = dbreg_evictions();
+    zone_bytes_t zb0;
+    zone_bytes_get(ZBYTES_DB, &zb0);
+    CHECK(dbreg_test_evict("default", "r.test."));
+    CHECK(dbreg_evictions() == ev0 + 1 && zdir_entry(elem_of("default", "r.test.")) == NULL &&
+          atomic_load(&elem_of("default", "r.test.")->state) == ZDIR_ST_ABSENT);
+    CHECK(!dbreg_test_evict("default", "r.test."));                       /* (nothing in memory to take out) */
+    for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(50000);
+    CHECK(dbreg_evict_inflight() == 0);                                   /* the delta was published, the snapshot drained, the entry freed */
+    {
+        zone_bytes_t zb1;
+        zone_bytes_get(ZBYTES_DB, &zb1);
+        CHECK(zb1.resident + zb1.retired <= zb0.resident + zb0.retired && zb1.resident < zb0.resident);   /* its bytes are gone from both totals */
+    }
     CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_WARM, KDB_FETCH_FULL));
     CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ);
     uint64_t id1 = m.u.fetch_req.request_id;
@@ -332,7 +346,7 @@ int main(void) {
     usleep(300000);
     CHECK(dbreg_pending_count() == 0 && atomic_load(&g_zone_db_active) == snap_before);
     zone_db_entry_t *new_r = zdir_entry(elem_of("default", "r.test."));
-    CHECK(new_r != NULL && new_r != old_r && atomic_load(&new_r->serial) == 7);
+    CHECK(new_r != NULL && atomic_load(&new_r->serial) == 7);
     CHECK(atomic_load(&elem_of("default", "r.test.")->state) == ZDIR_ST_RESIDENT);
 
     /* -- the loader says it cannot read the zone: the worker is told at once, the zone stays out of memory */

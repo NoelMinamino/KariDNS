@@ -398,6 +398,41 @@ int main(void) {
         FLUSH();
         a = read_answer(sk[1]);
         CHECK(a.got && a.id == 0x7202 && a.rcode == 9);
+        /* RFC 8945 5.3.2: BADTIME is answered NOTAUTH with a TSIG that IS signed (the server's time in Other Data); BADKEY is unsigned (MAC size
+         * 0).  The same engine path decides for the "not ready" answer as for every other. */
+        {
+            tsig_sign_times_t tt = { (uint64_t)time(NULL) - 7200, 300 };      /* two hours ago: outside the fudge */
+            sl = build_query(qb, 0x7203, true, 0);
+            CHECK(k1 && tsig_sign_packet_ex(qb, &sl, 2000, k1, 0, NULL, NULL, NULL, 0, false, &tt) == 0);
+            mk_ipc((udp_ipc_t *)rx, 7, sl);
+            w.n_tx = 0;
+            udp_one(&w, (udp_ipc_t *)rx, qb, (ssize_t)sl);
+            FLUSH();
+            struct pollfd pf2 = { sk[1], POLLIN, 0 };
+            rn = poll(&pf2, 1, 1000) > 0 ? recv(sk[1], raw, sizeof(raw), MSG_PEEK) : -1;
+            rm = raw + sizeof(udp_ipc_t);
+            rml = rn > (ssize_t)sizeof(udp_ipc_t) ? (size_t)rn - sizeof(udp_ipc_t) : 0;
+            CHECK(rml > 0 && tsig_parse_rr(rm, rml, &trr) == 1 && trr.error == 18 && trr.mac_size > 0 && trr.other_len == 6);
+            a = read_answer(sk[1]);
+            CHECK(a.got && a.id == 0x7203 && a.rcode == 9);
+            /* BADKEY: a key the server does not have */
+            tsig_key_t bad;
+            memcpy(&bad, k1, sizeof(bad));
+            bad.name = (char *)"nokey.";
+            sl = build_query(qb, 0x7204, true, 0);
+            CHECK(tsig_sign_packet(qb, &sl, 2000, &bad, 0, NULL, NULL, NULL, 0, false) == 0);
+            mk_ipc((udp_ipc_t *)rx, 7, sl);
+            w.n_tx = 0;
+            udp_one(&w, (udp_ipc_t *)rx, qb, (ssize_t)sl);
+            FLUSH();
+            struct pollfd pf3 = { sk[1], POLLIN, 0 };
+            rn = poll(&pf3, 1, 1000) > 0 ? recv(sk[1], raw, sizeof(raw), MSG_PEEK) : -1;
+            rm = raw + sizeof(udp_ipc_t);
+            rml = rn > (ssize_t)sizeof(udp_ipc_t) ? (size_t)rn - sizeof(udp_ipc_t) : 0;
+            CHECK(rml > 0 && tsig_parse_rr(rm, rml, &trr) == 1 && trr.error == 17 && trr.mac_size == 0);
+            a = read_answer(sk[1]);
+            CHECK(a.got && a.id == 0x7204 && a.rcode == 9);
+        }
     }
 
     /* -- the answer is counted by response rate limiting like any error answer: the same request again and again from one address is cut
@@ -418,6 +453,46 @@ int main(void) {
         }
         CHECK(answered >= 1 && answered < 12);
         while (read_answer(sk[1]).got) {}
+        atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    }
+
+    /* -- allow-query is evaluated BEFORE the query parks or the zone is asked for: a client that may not ask gets REFUSED + EDE 18 as for a zone
+     *    in memory, occupies no entry of the park table, makes no fetch request and does not count for the zone's frequency; the same on the path
+     *    that does not park (DoT, DoH: the engine looks the zone up itself); a client that may ask still parks */
+    {
+        static server_config_t cfg3, cfg4;
+        char conf3[1600];
+        w.park = &table;
+        for (int k = 0; k < 2; k++) {
+            snprintf(conf3, sizeof(conf3), "options { directory \"%s\"; allow-query { %s; }; };\n"
+                     "view \"default\" { match-clients { any; }; zone \"park.test\" { type master; file \"%s\"; }; };\n", dir,
+                     k == 0 ? "192.0.2.99" : "127.0.0.1", zf);
+            server_config_t *c = k == 0 ? &cfg3 : &cfg4;
+            CHECK(parse_named_conf(conf3, c) == 0);
+            c->send_extended_errors = true;
+        }
+        atomic_store_explicit(&g_config_db.active, &cfg3, memory_order_release);
+        uint32_t f0 = atomic_load(&el->freq);
+        SEND_QUERY(0x7501, true, 0);
+        CHECK(w.n_tx == 1 && table.nwait == 0 && !park_fetch_pop(park_fetch_ring(0), &q));
+        FLUSH();
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.id == 0x7501 && a.rcode == 5 && a.ede == 18);
+        CHECK(atomic_load(&el->freq) == f0);
+        uint8_t qb3[512], rb3[4096];
+        size_t ql3 = build_query(qb3, 0x7502, true, 0);
+        rcu_reader_enter(&wctx);
+        zone_db_snapshot_t *sn3 = acquire_zone_snapshot();
+        int rl3 = process_dns_query_cap(qb3, ql3, rb3, 1232, 0, "www.park.test.", 1, "127.0.0.1", &cc, false, NULL, sn3);
+        rcu_reader_exit(&wctx);
+        CHECK(rl3 > 12 && (rb3[3] & 0x0F) == 5);
+        atomic_store_explicit(&g_config_db.active, &cfg4, memory_order_release);
+        SEND_QUERY(0x7503, true, 0);
+        CHECK(w.n_tx == 0 && table.nwait == 1 && park_fetch_pop(park_fetch_ring(0), &q) && atomic_load(&el->freq) == f0 + 1);
+        CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", true));
+        park_service(&w, -1);
+        a = read_answer(sk[1]);
+        CHECK(a.got && a.id == 0x7503 && a.rcode == 2 && a.ede == 14 && table.nwait == 0);
         atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
     }
 
