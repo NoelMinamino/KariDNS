@@ -1176,13 +1176,20 @@ bool kdb_hotl_parse(const char *buf, size_t len, kdb_hotl_t *out, char *why, siz
             if (ll < 5 || ll >= sizeof(tmp) || memcmp(p, "END ", 4) != 0) PFAIL("line %u is neither an entry nor the END line", line);
             memcpy(tmp, p, ll);
             tmp[ll] = '\0';
-            char *e1, *e2;
-            unsigned long cnt = strtoul(tmp + 4, &e1, 10);
-            if (e1 == tmp + 4 || *e1 != ' ') PFAIL("the END line is not \"END <count> <checksum>\"");
-            unsigned long want = strtoul(e1 + 1, &e2, 16);
-            if (e2 != e1 + 9 || *e2 != '\0' || want > 0xFFFFFFFFul) PFAIL("the END line is not \"END <count> <checksum>\"");
-            if (cnt != out->n) PFAIL("the END line counts %lu entries, the file has %u", cnt, (unsigned)out->n);
-            if ((uint32_t)want != sum) PFAIL("the checksum does not match");
+            /* exactly "END ", 1 to 10 decimal digits, a space, 8 lower case hex digits: no sign, no blank, no other digit (strtoul takes "+5" and leading blanks) */
+            const char *q = tmp + 4;
+            uint64_t cnt = 0;
+            size_t nd = 0;
+            for (; q[nd] >= '0' && q[nd] <= '9' && nd < 10; nd++) cnt = cnt * 10 + (uint64_t)(q[nd] - '0');
+            if (nd == 0 || q[nd] != ' ') PFAIL("the END line is not \"END <count> <checksum>\"");
+            q += nd + 1;
+            uint32_t want = 0;
+            size_t nh = 0;
+            for (; nh < 8 && ((q[nh] >= '0' && q[nh] <= '9') || (q[nh] >= 'a' && q[nh] <= 'f')); nh++)
+                want = (want << 4) | (uint32_t)(q[nh] <= '9' ? q[nh] - '0' : q[nh] - 'a' + 10);
+            if (nh != 8 || q[8] != '\0') PFAIL("the END line is not \"END <count> <checksum>\"");
+            if (cnt != out->n) PFAIL("the END line counts %llu entries, the file has %u", (unsigned long long)cnt, (unsigned)out->n);
+            if (want != sum) PFAIL("the checksum does not match");
             if (off + ll + 1 != len) PFAIL("bytes after the END line");
             return true;
         }

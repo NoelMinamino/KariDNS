@@ -1568,6 +1568,20 @@ static void test_dir_fetch_state(void) {
             dbreg_residency_t rs;
             dbreg_residency(&rs);
             CHECK(rs.total >= 2 && rs.resident >= 1 && rs.absent >= 1 && rs.total == rs.resident + rs.absent);
+            /* a zone of the hot list that the warm-up read starts with the frequency of its rank: never lowered, and a zone without data keeps its count */
+            atomic_store(&ea->freq, 50);
+            dbreg_warm_freq("default", "a.test.", 900);                        /* (a.test has no data here: nothing) */
+            CHECK(atomic_load(&ea->freq) == 50);
+            dbreg_warm_freq("nosuchview", "b.test.", 9);
+            dbreg_warm_freq("default", "nope.test.", 9);
+            dbreg_warm_freq("default", "b.test.", 60);                         /* (b.test has its data: it is hotter than a.test now) */
+            for (int pass = 0; pass < 2; pass++) {
+                h = dbreg_hot_begin(1);
+                memset(&got, 0, sizeof(got));
+                CHECK(h && dbreg_hot_step(h) && dbreg_hot_emit(h, hot_collect, &got) == 1 && strcmp(got.zone[0], "b.test.") == 0);
+                dbreg_warm_freq("default", "b.test.", 3);                      /* (never lowered: b.test is still the hottest) */
+            }
+            atomic_store(&ea->freq, 0);
         }
         /* the apex a summary brings (D1a step 6): into an element without data and with the same source id, the old block goes with the garbage; a zone
          * that has its data takes none, and the data clears it */

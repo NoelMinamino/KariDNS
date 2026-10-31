@@ -2256,6 +2256,8 @@ static void test_hot_list(void) {
             BAD("a zone that is not canonical", { char *z = strstr(bad, "b.test."); *z = 'B'; });
             BAD("a NUL in an entry", { char *z = strstr(bad, "b.test."); *z = '\0'; });
             BAD("a CR before the newline", { char *z = strstr(bad, "b.test.\n"); z[7] = '\r'; });
+            BAD("a sign in the count of END", { char *e2 = strstr(bad, "END 4 "); memmove(e2 + 5, e2 + 4, len - (size_t)(e2 + 4 - bad)); e2[4] = '+'; bl = len + 1; });
+            BAD("a blank in END", { char *e2 = strstr(bad, "END 4 "); memmove(e2 + 5, e2 + 4, len - (size_t)(e2 + 4 - bad)); e2[4] = ' '; bl = len + 1; });
             BAD("garbage END", { char *e2 = strstr(bad, "END "); memcpy(e2, "END x ", 6); });
             BAD("a short checksum", { char *e2 = strstr(bad, "END "); e2[strlen(e2) - 2] = '\0'; bl = (size_t)(e2 + strlen(e2) - bad); bad[bl++] = '\n'; });
 #undef BAD

@@ -1196,6 +1196,14 @@ int main(void) {
         zdir_elem_t *xe = elem_of("default", "r.test.");
         CHECK(xe != NULL && zdir_entry(xe) == NULL);
         dbreg_cache_stats_t cs0, cs1;
+        {                                                                       /* the NOTIFYs the earlier parts queued are taken, and the zones whose NOTIFY did not fit are queued (the control thread's sweep): a zone that waits for the sweep is not taken out of memory */
+            char dqv[KARIDNS_VIEW_NAME_MAX], dqz[256];
+            for (int i = 0; i < 4; i++) {
+                while (dbreg_notify_pop(dqv, sizeof(dqv), dqz, sizeof(dqz))) {}
+                dbreg_notify_sweep();
+            }
+            while (dbreg_notify_pop(dqv, sizeof(dqv), dqz, sizeof(dqz))) {}
+        }
         dbreg_cache_stats(&cs0);
         char st[4096];
         size_t sl = db_ingest_status(NULL, NULL, st, sizeof(st));
@@ -1455,6 +1463,11 @@ int main(void) {
                 CHECK(ke && zdir_entry(ke) != NULL && atomic_load(&ke->apex) == NULL);                  /* (another version: the block went) */
                 CHECK(!dbreg_test_evict("default", "nk.test."));                                        /* (its NOTIFY is in the ring) */
                 CHECK(dbreg_notify_pop(qv, sizeof(qv), qz, sizeof(qz)) && strcmp(qz, "nk.test.") == 0);
+                /* a zone whose NOTIFY waits for the sweep (NOTIFY_DEFER, not in the ring) is not taken out of memory meanwhile: the apex made from the image would lack the
+                 * addresses of the NS hosts that only the loader's summary has */
+                ke->flags |= ZDIR_F_NOTIFY_DEFER;
+                CHECK(!dbreg_test_evict("default", "nk.test."));
+                ke->flags &= (uint16_t)~ZDIR_F_NOTIFY_DEFER;
                 CHECK(dbreg_test_evict("default", "nk.test."));
                 for (int i = 0; i < 200 && dbreg_evict_inflight() != 0; i++) usleep(50000);
                 const zdir_apex_t *kap1 = ke ? atomic_load(&ke->apex) : NULL;

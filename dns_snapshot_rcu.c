@@ -1770,6 +1770,7 @@ static bool g_dbreg_force_full;
 /* D1a step 5 (the cache manager is below): the limit, the admission state, the counters */
 static _Atomic uint64_t g_cache_limit;
 static _Atomic uint32_t g_victim_freq;      /* the highest frequency among the zones the last round took out: a zone that is loaded with a lower one is not kept */
+static _Atomic uint64_t g_gone_queries;       /* D1a step 7: the queries the entries answered that were taken out of memory or replaced by a new version (dbstatus' hit rate adds the entries still in memory) */
 static _Atomic uint32_t g_evict_next_hint;  /* some element has ZDIR_F_EVICT_NEXT (a scan will find it) */
 static _Atomic uint64_t g_next_flags;       /* how many times an element was marked evict-next (a cycle of the manager that saw none since it began may drop the hint) */
 static void cache_note_next(void) {
@@ -2090,6 +2091,7 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
         gent->sh_old = NULL;
         gent->apex_old = NULL;
         gent->served = in_index;
+        if (cur->source == ZONE_SRC_DB) atomic_fetch_add_explicit(&g_gone_queries, atomic_load_explicit(&cur->observatory.queries_total, memory_order_relaxed), memory_order_relaxed);       /* (the new entry counts from 0: the hit rate keeps what the old one answered) */
         gent->next = rv->repl;
         rv->repl = gent;
         size_t w = in_index ? 2 : 1;                       /* (counted as the removal of the old entry and the addition of the new one, as in the queues before D1a) */
@@ -2617,7 +2619,7 @@ bool dbreg_warm_take_hot(const char *view, const char *zone) {
 
 /* ---- D1a step 5: the data of a DB zone leaves memory (design 8.2) ---- */
 static _Atomic uint64_t g_evictions;
-static _Atomic uint64_t g_gone_queries;       /* D1a step 7: the queries the entries answered that were taken out of memory (dbstatus' hit rate adds the entries still in memory) */
+
 static _Atomic(void (*)(void)) g_pending_notify;
 void dbreg_set_pending_notify(void (*cb)(void)) { atomic_store_explicit(&g_pending_notify, cb, memory_order_release); }
 
@@ -2630,7 +2632,7 @@ void dbreg_set_pending_notify(void (*cb)(void)) { atomic_store_explicit(&g_pendi
 static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
     zone_db_entry_t *e = zdir_entry(z);
     if (!e || e->source != ZONE_SRC_DB || e->is_secondary || e->is_catalog_member || e->catalog_member_count > 0 || z->shadowed ||
-        (z->kind & (ZDIR_K_SHARED | ZDIR_K_STATIC | ZDIR_K_BORROWED)) || (z->flags & (ZDIR_F_PIN | ZDIR_F_DELETED | ZDIR_F_GARB | ZDIR_F_BUSY)) ||
+        (z->kind & (ZDIR_K_SHARED | ZDIR_K_STATIC | ZDIR_K_BORROWED)) || (z->flags & (ZDIR_F_PIN | ZDIR_F_DELETED | ZDIR_F_GARB | ZDIR_F_BUSY | ZDIR_F_NOTIFY_DEFER)) ||      /* (NOTIFY_DEFER: the ring was full, the sweep has not queued its NOTIFY yet; the apex made from the image would lack the NS addresses of the loader) */
         atomic_load_explicit(&z->state, memory_order_relaxed) != ZDIR_ST_RESIDENT || e->evicted_bytes)
         return 0;
     if (zdir_lookup(dbreg_active_dir_locked(rv->name), z->name) != z) return 0;
@@ -2756,6 +2758,14 @@ static void cache_peak_note(void) {
 
 /* The zone a fetch brought is about to wake the requests that wait for it (a query, an UPDATE): the time it may not be taken out of memory (CACHE_MIN_RESIDENT_MS)
  * starts now, not when the data was installed (the delta that shows the zone to the workers can come between the two), so that the woken request finds it. */
+void dbreg_warm_freq(const char *view, const char *zone, uint32_t freq) {
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    if (z && zdir_entry(z) && atomic_load_explicit(&z->freq, memory_order_relaxed) < freq) atomic_store_explicit(&z->freq, freq, memory_order_relaxed);
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+}
+
 void dbreg_touch_loaded(const char *view, const char *zone) {
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     dbreg_view_t *rv = dbreg_view_get(view, false);
@@ -3004,10 +3014,13 @@ uint32_t dbreg_cache_round(void) {
  * grow with the number of zones.  The frequency is the cache manager's (z->freq: the misses of a zone out of memory, the queries of a zone in memory folded in
  * from its observatory counter, here too, so that it is right when there is no memory pressure and the rounds do not scan); the counters are not halved here.
  * The candidates are copies (a zone may be deleted between two slices); the n_max with the highest frequency are kept in a heap. */
-typedef struct { uint32_t freq; char *name; } hot_cand_t;      /* name: "view\0zone\0" */
+typedef struct { uint32_t freq; char *name; } hot_cand_t;      /* name: "view\0zone\0", a slot of the pool */
+#define HOT_NAME_SLOT 160                                      /* bytes of a slot: view, zone and the two NULs.  The pool is allocated before the lock is taken: no malloc under it */
 struct dbreg_hot {
     uint32_t n_max, n;
     hot_cand_t *heap;                                          /* a min-heap on freq */
+    char *pool;                                                /* n_max slots; the heap's names point into them (a replaced candidate gives its slot to the new one) */
+    uint32_t too_long;                                         /* zones left out because view + zone did not fit a slot */
     size_t v, b;                                               /* the cursor */
 };
 
@@ -3016,7 +3029,10 @@ dbreg_hot_t *dbreg_hot_begin(uint32_t n_max) {
     dbreg_hot_t *h = calloc(1, sizeof(*h));
     if (!h) return NULL;
     h->heap = malloc((size_t)n_max * sizeof(*h->heap));
-    if (!h->heap) {
+    h->pool = malloc((size_t)n_max * HOT_NAME_SLOT);
+    if (!h->heap || !h->pool) {
+        free(h->heap);
+        free(h->pool);
         free(h);
         return NULL;
     }
@@ -3077,14 +3093,15 @@ bool dbreg_hot_step(dbreg_hot_t *h) {
             }
             if (f == 0 || (h->n == h->n_max && f <= h->heap[0].freq)) continue;
             size_t vn = strlen(rv->name), zn = strlen(z->name);
-            char *nm = malloc(vn + 1 + zn + 1);
-            if (!nm) continue;                                                 /* out of memory: the zone is left out of this list */
+            if (vn + 1 + zn + 1 > HOT_NAME_SLOT) {                             /* (a name this long is not a hot zone worth a larger pool) */
+                h->too_long++;
+                continue;
+            }
+            char *nm = h->n == h->n_max ? h->heap[0].name : h->pool + (size_t)h->n * HOT_NAME_SLOT;       /* (the slot of the candidate that leaves) */
             memcpy(nm, rv->name, vn + 1);
             memcpy(nm + vn + 1, z->name, zn + 1);
             if (h->n == h->n_max) {
-                free(h->heap[0].name);
                 h->heap[0].freq = f;
-                h->heap[0].name = nm;
                 hot_sift_down(h->heap, h->n, 0);
             } else {
                 h->heap[h->n].freq = f;
@@ -3107,6 +3124,11 @@ static int hot_cand_cmp(const void *a, const void *b) {         /* the highest f
 
 uint32_t dbreg_hot_emit(dbreg_hot_t *h, void (*add)(void *ud, const char *view, const char *zone), void *ud) {
     uint32_t n = h->n;
+    static bool s_long_logged;
+    if (h->too_long && !s_long_logged) {
+        s_long_logged = true;
+        syslog(LOG_NOTICE, "[DB] hot list: %u zone(s) left out because the view and zone names together are longer than %d bytes (said once)", (unsigned)h->too_long, HOT_NAME_SLOT - 2);
+    }
     qsort(h->heap, n, sizeof(*h->heap), hot_cand_cmp);
     for (uint32_t i = 0; i < n; i++) {
         const char *view = h->heap[i].name;
@@ -3118,7 +3140,7 @@ uint32_t dbreg_hot_emit(dbreg_hot_t *h, void (*add)(void *ud, const char *view, 
 
 void dbreg_hot_free(dbreg_hot_t *h) {
     if (!h) return;
-    for (uint32_t i = 0; i < h->n; i++) free(h->heap[i].name);
+    free(h->pool);
     free(h->heap);
     free(h);
 }

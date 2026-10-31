@@ -151,6 +151,15 @@ R2=$(ans 127.0.0.2 www.a.test)
 [ "$(ans 127.0.0.3 www.a.test)" = "" ] && [ "$(rcode 127.0.0.3 www.a.test A)" = "REFUSED" ] && pass "v3 does not name a.test: REFUSED" || fail "v3: www.a.test is served ($(rcode 127.0.0.3 www.a.test A))"
 [ "$(rcode 127.0.0.2 www.ghost.test A)" = "REFUSED" ] && pass "v2: a name that is no zone of v1 (ghost.test) is REFUSED" || fail "v2: ghost.test: $(rcode 127.0.0.2 www.ghost.test A)"
 
+echo "== karictl zonestatus / reload name the sharing view"
+ZS=$($KCTL zonestatus a.test v2 2>&1)
+echo "$ZS" | grep -q "^OK .*source=database view=v1 " && pass "zonestatus a.test v2: the zone of the owner view v1 (the sharing view's name is accepted)" || fail "zonestatus a.test v2: $ZS"
+ZS=$($KCTL zonestatus ghost.test v2 2>&1)
+echo "$ZS" | grep -q "^OK" && fail "zonestatus ghost.test v2 is answered: $ZS" || pass "zonestatus ghost.test v2: no such zone"
+RL=$($KCTL reload a.test v2 2>&1 | head -1)
+echo "$RL" | grep -q "^ERROR" && fail "reload a.test v2: $RL" || pass "reload a.test v2: accepted and done in the owner view ($RL)"
+grep -q "Received reload command for database zone: a.test (view v1)" "$T/srv.log" && pass "the log says the reload went to view v1" || fail "no 'reload ... (view v1)' line in the log"
+
 echo "== AXFR and NOTIFY through the sharing view"
 wait_oom a.test 15 > /dev/null
 axfr 127.0.0.1 a.test > "$T/a.v1"

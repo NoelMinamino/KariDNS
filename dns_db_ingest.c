@@ -135,6 +135,7 @@ typedef struct {
   bool dropped;                          /* the zone it brought was dropped (an older version than the directory's) */
   bool quiet;                            /* asked for by the list of zones to read (the apex after a reload), not by a query: nobody waits for it, so it wakes nobody */
   bool hot;                              /* a zone of the hot list (D1a step 7): counted in the warm-up progress */
+  uint32_t hrank;                        /* of the hot list: how many zones of the list were asked for before this one (the list is read in its order) */
   int64_t sent_ms;
   char view_name[KARIDNS_VIEW_NAME_MAX];
   char zone[DNS_NAME_TEXT_SIZE];
@@ -239,6 +240,7 @@ typedef struct {
   ing_freq_t freq[ING_FETCH_MAX];
   struct ing_warm { char view[PARK_VIEW_MAX + 1]; char zone[PARK_ZONE_MAX + 1]; bool hot; } *warm;     /* D1a milestone 4: zones to read before a query asks (pins) */
   size_t nwarm, cwarm;
+  uint32_t hot_issued;                     /* the zones of the hot list asked for so far (their rank, see fetch_complete()) */
   uint32_t nhot, nhot_flight;           /* D1a step 7: of the list, the zones of the hot list; of the fetches in flight, the ones for the hot list */
   uint64_t warm_l0;                       /* g_wl_loaded when the hot list came (the counter is cumulative over loader sessions; the estimate divides by the zones read since) */
   uint64_t warm_r0;                       /* the bytes of the database zones in memory when the hot list came: what the zones of the list added is estimated from it (warm_hot_gate) */
@@ -1932,6 +1934,7 @@ static void on_warm_list(ing_t *g, const kdb_msg_t *m) {
     g->wl_open = true;
     g->wl_id = h->list_id;
     g->wl_count = 0;
+    g->hot_issued = 0;
     zone_bytes_t zb;
     zone_bytes_get(ZBYTES_DB, &zb);
     g->warm_r0 = zb.resident;
@@ -2638,6 +2641,13 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
     syslog(LOG_WARNING, "[DB] fetch of zone '%s' (view '%s') failed: %s", done.zone, done.view_name, why && why[0] ? why : "no reason given");
   if (dbreg_pending_count() > 0) apply_delta(g);         /* a zone that was new to the index becomes visible before its queries are woken */
   if (ok && !done.quiet && done.mode == KDB_FETCH_FULL) dbreg_touch_loaded(done.view_name, done.zone);
+  /* a zone that only a background fetch (a CNAME or glue that leads into it, step 8) brought is the first to go, as one that a transfer brought (design 7): N cold name
+   * servers behind the glue of one zone must not push the zones the queries use out of memory.  The mark is dropped by the cache manager when a query is answered from the zone. */
+  /* a zone of the hot list starts with a frequency of its rank (the list is read hottest first: the first has the number of zones in the list, the last 1), not 0: a zone
+   * with no queries yet is the cache manager's first victim, and the warm-up must not read the zones that matter most only to lose them first.  The queries that follow
+   * add to it. */
+  if (ok && done.hot && !done.dropped && done.mode == KDB_FETCH_FULL) dbreg_warm_freq(done.view_name, done.zone, g->wl_count > done.hrank ? g->wl_count - done.hrank : 1);
+  if (ok && !done.dropped && !done.quiet && done.mode == KDB_FETCH_FULL && done.prio == KDB_FETCH_PRIO_BACKGROUND) dbreg_xfr_loaded(done.view_name, done.zone);
   if ((!ok || done.dropped) && done.want_summary) warm_add(g, done.view_name, done.zone);     /* (the summary that was not asked for because this request was on its way) */
   if (!done.quiet) park_wake_broadcast(done.view_name, done.zone, !ok);      /* (the summary for the apex wakes nobody: no query waits for it, and the queries that wait for the data are not woken for nothing) */
 }
@@ -2751,6 +2761,8 @@ static int warm_hot_gate(ing_t *g) {
     zone_bytes_get(ZBYTES_DB, &zb);
     if (loaded > g->warm_l0 && zb.resident > g->warm_r0) est = (zb.resident - g->warm_r0) / (loaded - g->warm_l0);
     if (est == 0 && g->nhot_flight > 0) return 0;
+    /* (the zones in flight differ from the average: with one or more in flight the room for them is counted twice, so that the overshoot past the mark stays about one zone) */
+    if (g->nhot_flight > 0 && dbreg_cache_over_high(est * 2 * ((uint64_t)g->nhot_flight + 1))) return 0;
     if (dbreg_cache_over_high(est * ((uint64_t)g->nhot_flight + 1))) {
       syslog(LOG_INFO, "[DB] warm-up: the database zones reached the high water mark of memory-limit; %u zone(s) of the hot list are not read", g->nhot);
       warm_drop_hot(g);
@@ -2898,6 +2910,7 @@ static void fetch_issue(ing_t *g) {
     r->quiet = warm && r->mode == KDB_FETCH_SUMMARY;
     if (hot) {
       r->hot = true;
+      r->hrank = g->hot_issued++;
       g->nhot_flight++;
       atomic_store_explicit(&g_wl_flight, g->nhot_flight, memory_order_relaxed);
     }
@@ -3144,7 +3157,11 @@ static void fetch_adopt(ing_t *g, int fd) {
 
 /* D1a step 7: the cache thread makes the hot list (design 8.4), a slice at a time, every hot-list-interval; only with memory-limit (the frequencies are kept then)
  * and loader-state-file.  The list is handed to the ingest thread (one slot); an empty one is not sent: the state file keeps what it has. */
-static void hot_add_cb(void *ud, const char *view, const char *zone) { (void)kdb_hotl_add((kdb_hotl_t *)ud, view, zone); }
+typedef struct { kdb_hotl_t *l; uint32_t left_out; } hot_add_t;
+static void hot_add_cb(void *ud, const char *view, const char *zone) {
+  hot_add_t *a = ud;
+  if (!kdb_hotl_add(a->l, view, zone)) a->left_out++;
+}
 
 static void hot_tick(const ing_cfg_t *c) {
   static dbreg_hot_t *s_hot;
@@ -3169,7 +3186,15 @@ static void hot_tick(const ing_cfg_t *c) {
     return;
   }
   kdb_hotl_init(l);
-  (void)dbreg_hot_emit(h, hot_add_cb, l);
+  hot_add_t ha = { l, 0 };
+  (void)dbreg_hot_emit(h, hot_add_cb, &ha);
+  if (ha.left_out) {                                     /* a name the list cannot carry (a view name with a byte that is not printable, a name that is not a valid name), or out of memory */
+    static bool s_logged;
+    if (!s_logged) {
+      s_logged = true;
+      syslog(LOG_WARNING, "[DB] hot list: %u zone(s) left out of the list: a view or zone name that the hot list cannot carry (a byte that is not printable) (said once)", (unsigned)ha.left_out);
+    }
+  }
   if (l->n == 0) {
     free(l);
     return;
@@ -3622,6 +3647,25 @@ static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   return true;
 }
 
+/* karictl dbstatus is polled by scripts and operators; the count of the zones in memory walks the whole registry under its lock (O(N)), so it is done at most once
+ * a second and the lines of the second between show that figure.  A caller that finds the cache in use by another thread counts for itself. */
+static void residency_cached(dbreg_residency_t *rs) {
+  static atomic_flag busy = ATOMIC_FLAG_INIT;
+  static dbreg_residency_t cache;
+  static int64_t at;
+  if (atomic_flag_test_and_set_explicit(&busy, memory_order_acquire)) {
+    dbreg_residency(rs);
+    return;
+  }
+  int64_t now = now_ms();
+  if (at == 0 || now - at >= 1000) {
+    dbreg_residency(&cache);
+    at = now;
+  }
+  *rs = cache;
+  atomic_flag_clear_explicit(&busy, memory_order_release);
+}
+
 size_t db_ingest_status(const char *zone, const char *view, char *out, size_t cap) {
   if (cap == 0) return 0;
   out[0] = '\0';
@@ -3699,12 +3743,12 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     {
       /* D1a step 7: what is in memory, how the queries fare, the warm-up and the state file.  The lines above keep their form. */
       dbreg_residency_t rs;
-      dbreg_residency(&rs);
+      residency_cached(&rs);
       uint64_t parked = cs.misses;
       st_append(&c, "residency: directory=%zu resident=%zu out_of_memory=%zu evictions=%llu\n", rs.total, rs.resident, rs.absent,
                 (unsigned long long)cs.evictions);
       if (rs.queries > 0)
-        st_append(&c, "queries: answered=%llu parked=%llu hit_rate=%.1f%% (answered from a zone already in memory / all; the counts are the zones' own)\n",
+        st_append(&c, "queries: answered=%llu parked=%llu hit_rate=%.1f%% (answered from a zone already in memory / all; answered: the zones' own counts, including those of versions that were replaced or taken out; parked: the queries that had to wait for a zone, since the start)\n",
                   (unsigned long long)rs.queries, (unsigned long long)parked,
                   100.0 * (double)(rs.queries > parked ? rs.queries - parked : 0) / (double)rs.queries);
       else

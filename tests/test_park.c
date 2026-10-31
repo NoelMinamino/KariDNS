@@ -405,6 +405,22 @@ static void test_any(void) {
   }
   CHECK(got == 17 && summary == 1);
   CHECK(!park_fetch_next(&q));
+  /* park_bg_fetch(): a request that finds no free slot is neither made nor remembered as made (the next call makes it); one that was queued is made once in PARK_BG_MS */
+  for (int i = 0; i < 16; i++) {
+    snprintf(zn, sizeof(zn), "f%d.test.", i);
+    CHECK(park_fetch_request_any("v1", zn, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+  }
+  park_bg_fetch("v1", "bg.test.");                        /* (no slot) */
+  CHECK(park_fetch_next(&q));                             /* (one is free now) */
+  park_bg_fetch("v1", "bg.test.");                        /* (the first call was not remembered: this one is queued) */
+  park_bg_fetch("v1", "bg.test.");                        /* (and now it was: not again) */
+  int bg_n = 0, bg_got = 0;
+  while (park_fetch_next(&q)) {
+    bg_n++;
+    bg_got += strcmp(q.zone, "bg.test.") == 0 && q.prio == KDB_FETCH_PRIO_BACKGROUND && q.mode == KDB_FETCH_FULL;
+  }
+  CHECK(bg_n == 15 + 1 && bg_got == 1);
+  CHECK(!park_fetch_next(&q));
   /* four producers, one consumer: every request arrives once, whole */
   pthread_t th[AW], cons;
   pthread_create(&cons, NULL, any_consumer, NULL);

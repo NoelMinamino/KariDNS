@@ -110,6 +110,8 @@ oom target.test && oom prov2.test && pass "target.test and prov2.test start out 
 A1=$(ans www.a.test A)
 [ "$A1" = "CNAME " ] && pass "www.a.test: the answer is the CNAME alone (the chain stops at the zone that is not in memory)" || fail "www.a.test: '$A1'"
 wait_res target.test 10 && pass "target.test was fetched in the background" || fail "target.test is still out of memory"
+MK=$($KCTL dbstatus 2>/dev/null | sed -n 's/^transfers of zones out of memory:.* marked=\([0-9]*\).*/\1/p' | tail -1)
+[ "${MK:-0}" -ge 1 ] && pass "the zone that only the background fetch brought is marked to be taken out first (marked=$MK)" || fail "no mark after the background fetch: marked='$MK'"
 A2=$(ans www.a.test A)
 [ "$A2" = "CNAME A " ] && pass "the next query gets the whole chain (the partial answer was not stored in the response cache)" || fail "www.a.test: '$A2'"
 [ "$(ans ext.a.test A)" = "CNAME " ] && pass "a CNAME out of every zone of the view is as before (and asks for nothing)" || fail "ext.a.test: $(ans ext.a.test A)"

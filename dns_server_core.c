@@ -3577,6 +3577,19 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
   int cfd = c->fd;
   server_config_t *cfg = acquire_config_snapshot();
   bool enabled = cfg && cfg->database.enabled;
+  /* D1a phase 2: the view named is one that shares the zone with `zone "x" { in-view "owner"; }` and has no zone of that name itself: the zone is the owner's */
+  char owner[KARIDNS_VIEW_NAME_MAX];
+  if (cfg && view_arg && cfg->any_in_view) {
+    for (const view_config_t *v = cfg->views; v; v = v->next) {
+      if (!v->name || strcasecmp(v->name, view_arg) != 0) continue;
+      const zone_config_t *stub = view_find_in_view(v, zone);
+      if (stub && stub->ext->iv->db_target && stub->ext->iv->view && !view_find_zone_config(v, zone)) {
+        snprintf(owner, sizeof(owner), "%s", stub->ext->iv->view);
+        view_arg = owner;
+      }
+      break;
+    }
+  }
   uint32_t tmo = cfg && cfg->database.db_reload_timeout ? cfg->database.db_reload_timeout : 30;
   release_config_snapshot(cfg);
   if (!enabled || !db_ingest_enabled()) return false;

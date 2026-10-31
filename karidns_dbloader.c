@@ -574,6 +574,7 @@ struct lio {
      * is a message between batches, so nothing is sent from the reader); hot_cur is the list the state file holds (read at the start). */
     kdb_hotl_t hot_asm, hot_fresh, hot_cur;
     bool hot_open, hot_ready, hot_on_disk, warm_sent;
+    char hot_why[200];                       /* why the state file could not be read (KDB_HF_UNREADABLE): the file is then not replaced */
     uint64_t hot_id, hot_fresh_id, warm_seq;
     uint32_t hot_next, hot_limit, hot_fresh_limit, hot_dropped, hot_fzones;
     int hot_fstate;                          /* KDB_HF_* of the state file at the start */
@@ -3160,7 +3161,7 @@ static void hot_part(struct lio *io, const kdb_msg_t *m) {
         return;
     }
     io->hot_next = h->part + 1;
-    if (h->limit) io->hot_limit = h->limit;
+    if (h->part == 0 && h->limit) io->hot_limit = h->limit;       /* (the limit is a property of the list: part 0 says it, a later part does not change it) */
     kdb_iter_t it;
     char view[256], zone[DNS_NAME_TEXT_SIZE];
     bool last_ok = false;
@@ -3193,6 +3194,7 @@ static int hot_emit(void *ud) { return send_enc((ctx_t *)ud); }
 static void hot_file_load(struct lio *io) {
     char why[200] = "";
     io->hot_fstate = KDB_HF_NONE;
+    io->hot_why[0] = 0;
     io->hot_on_disk = false;
     if (!g_state_file) return;
     io->hot_fstate = kdb_hotl_file_read(g_state_file, &io->hot_cur, why, sizeof(why));
@@ -3208,7 +3210,9 @@ static void hot_file_load(struct lio *io) {
         lg(LOG_WARNING, "state file %s is ignored: %s; it is replaced by the next hot list", g_state_file, why);
         break;
     default:
-        lg(LOG_WARNING, "state file %s cannot be read: %s; it is ignored", g_state_file, why);
+        /* a file that is there and cannot be read (permissions, a link, not a regular file) is not replaced: the next hot list would rename over somebody's file */
+        snprintf(io->hot_why, sizeof(io->hot_why), "%s", why);
+        lg(LOG_ERR, "state file %s cannot be read: %s; it is ignored and NOT replaced (fix it or remove it)", g_state_file, why);
         break;
     }
     io->hot_fzones = io->hot_cur.n;
@@ -3240,7 +3244,10 @@ static int hot_run(ctx_t *x, struct lio *io) {
     uint8_t status = KDB_HA_NOFILE;
     char err[200] = "";
     if (io->hot_dropped) lg(LOG_NOTICE, "HOT_LIST: %u entries dropped (a view that is not configured, or the list is too long)", (unsigned)io->hot_dropped);
-    if (g_state_file) {
+    if (g_state_file && io->hot_fstate == KDB_HF_UNREADABLE) {
+        status = KDB_HA_FAILED;
+        snprintf(err, sizeof(err), "the state file exists and cannot be read (%s): not replaced", io->hot_why);
+    } else if (g_state_file) {
         kdb_hotl_t merged;
         kdb_hotl_init(&merged);
         if (!kdb_hotl_merge(&io->hot_fresh, &io->hot_cur, io->hot_fresh_limit, &merged)) {

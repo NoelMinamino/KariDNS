@@ -141,8 +141,11 @@ head -1 "$ST" | grep -q '^KARIDNS-HOT-LIST 1$' && tail -1 "$ST" | grep -q "^END 
 ls "$T/st" | grep -q 'tmp' && fail "a temporary file is left in the state directory: $(ls "$T/st")" || pass "no temporary file is left behind"
 W=$(field state-file written); [ "${W:-0}" -ge 1 ] && pass "dbstatus: the loader acknowledged $W write(s) of the state file" || fail "dbstatus shows no written acknowledgement"
 cp "$ST" "$T/good.state"
-RES=$(field residency resident)
+res_ok() { RES=$(field residency resident); [ "${RES:-0}" -ge "$NZ" ]; }       # (the residency line is counted at most once a second)
+waitfor 5 res_ok
 [ "${RES:-0}" -ge "$NZ" ] && pass "all $NZ zones are in memory (residency line: $RES)" || fail "residency line: resident=$RES"
+queries_ok() { dbs | grep -q '^queries: answered=[1-9][0-9]* parked=[0-9]* hit_rate=[0-9.]*%'; }
+waitfor 5 queries_ok
 dbs | grep -q '^queries: answered=[1-9][0-9]* parked=[0-9]* hit_rate=[0-9.]*%' && pass "dbstatus shows answered / parked / hit_rate" || fail "queries line: $(dbs | grep '^queries')"
 stop_srv
 

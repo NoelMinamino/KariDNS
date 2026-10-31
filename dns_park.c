@@ -397,7 +397,7 @@ bool park_fetch_request_any(const char *view, const char *zone, uint8_t prio, ui
 }
 
 /* The requests the query path makes in the background (a CNAME or the glue of an NS host leads into a zone that is not in memory): one request for a zone in
- * PARK_BG_MS, remembered in a small table of hashes (a collision lets a request through or holds one back for a while: no harm), through the slots above.
+ * PARK_BG_MS, remembered in a small table of hashes (a collision lets a request through; a request that could not be queued is not remembered), through the slots above.
  * The ingest thread still decides: no request while the fetch of the zone is on its way, none above the memory limit, the rate of fetches with the half of the
  * bucket kept for the queries (dns_db_ingest.c). */
 #define PARK_BG_SLOTS 4096
@@ -416,9 +416,11 @@ void park_bg_fetch(const char *view, const char *zone) {
   int64_t now = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
   size_t i = (size_t)(h % PARK_BG_SLOTS);
   if (atomic_load_explicit(&g_bg_key[i], memory_order_relaxed) == h && now - atomic_load_explicit(&g_bg_at[i], memory_order_relaxed) < PARK_BG_MS) return;
+  /* the slot is stamped after the request is queued: a request that found no free slot of the transfer threads is not remembered as made (the next query for the
+   * zone makes it again), and a different zone that hashed to the same slot is asked for, not held back */
+  if (!park_fetch_request_any(view, zone, KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_FULL)) return;
   atomic_store_explicit(&g_bg_at[i], now, memory_order_relaxed);
   atomic_store_explicit(&g_bg_key[i], h, memory_order_relaxed);
-  (void)park_fetch_request_any(view, zone, KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_FULL);
 }
 
 bool park_fetch_next(park_fetch_req_t *out) {
