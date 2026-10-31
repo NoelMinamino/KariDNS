@@ -159,6 +159,11 @@ echo "$ZS" | grep -q "^OK" && fail "zonestatus ghost.test v2 is answered: $ZS" |
 RL=$($KCTL reload a.test v2 2>&1 | head -1)
 echo "$RL" | grep -q "^ERROR" && fail "reload a.test v2: $RL" || pass "reload a.test v2: accepted and done in the owner view ($RL)"
 grep -q "Received reload command for database zone: a.test (view v1)" "$T/srv.log" && pass "the log says the reload went to view v1" || fail "no 'reload ... (view v1)' line in the log"
+# a zone that is out of memory and has not changed is not "not found" (request_clause() took has_entry = false for it)
+oom b.test && pass "b.test is out of memory" || fail "b.test is in memory"
+RL=$($KCTL reload b.test v2 2>&1 | head -1)
+echo "$RL" | grep -q "^OK.*unchanged, serial 5 (not in memory)" && pass "reload b.test v2 (out of memory, unchanged): $RL" || fail "reload b.test v2: $RL"
+oom b.test && pass "... and the reload did not read the zone" || fail "b.test was read by the reload"
 
 echo "== AXFR and NOTIFY through the sharing view"
 wait_oom a.test 15 > /dev/null

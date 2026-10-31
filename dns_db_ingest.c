@@ -2452,8 +2452,9 @@ static void request_clause(ing_t *g, int i, char *out, size_t cap, bool *ok, boo
     snprintf(out, cap, "deleted (it is no longer in the database)");
     break;
   default: /* nothing was sent for the zone: the loader found it unchanged, or the database does not have it */
-    if (n > 0 && info.has_entry) {
-      snprintf(out, cap, "unchanged, serial %u%s", info.serial, info.shadowed ? " (hidden by another zone of the same name)" : "");
+    /* (a zone out of memory is a zone of the database too: the directory knows its version, a summary; only a zone the registry has no usable version of, or that is deleted, is not) */
+    if (n > 0 && !(info.flags & ZDIR_F_DELETED) && (info.has_entry || info.last_result == DBREG_APPLIED)) {
+      snprintf(out, cap, "unchanged, serial %u%s%s", info.serial, info.has_entry ? "" : " (not in memory)", info.shadowed ? " (hidden by another zone of the same name)" : "");
     } else {
       *ok = false;
       *notfound = true;
