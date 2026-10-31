@@ -1202,7 +1202,8 @@ bool kdb_hotl_parse(const char *buf, size_t len, kdb_hotl_t *out, char *why, siz
 
 int kdb_hotl_file_read(const char *path, kdb_hotl_t *out, char *why, size_t wl) {
     kdb_hotl_clear(out);
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    /* never through a link, and never blocking on a fifo or a device that somebody put in its place (it is then not a regular file: UNREADABLE) */
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) {
         if (errno == ENOENT) {
             snprintf(why, wl, "no such file");
@@ -1269,7 +1270,22 @@ int kdb_hotl_file_write(const char *path, const kdb_hotl_t *l, char *err, size_t
         snprintf(err, el, "out of memory");
         return -1;
     }
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    /* A temporary file that an earlier run left is ours to remove if it is a regular file of this user; anything else (a link, a file of another user, a directory)
+     * is somebody's doing in the loader's directory, and the write fails rather than follow it.  The new file is created with O_EXCL. */
+    struct stat ls;
+    if (lstat(tmp, &ls) == 0) {
+        if (!S_ISREG(ls.st_mode) || ls.st_uid != geteuid()) {
+            snprintf(err, el, "cannot create %s: it exists and is not a regular file of this user", tmp);
+            free(data);
+            return -1;
+        }
+        if (unlink(tmp) != 0) {
+            snprintf(err, el, "cannot create %s: the old file cannot be removed: %s", tmp, strerror(errno));
+            free(data);
+            return -1;
+        }
+    }
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) {
         snprintf(err, el, "cannot create %s: %s", tmp, strerror(errno));
         free(data);
@@ -1294,6 +1310,17 @@ int kdb_hotl_file_write(const char *path, const kdb_hotl_t *l, char *err, size_t
         snprintf(err, el, "cannot write %s: %s", path, strerror(bad));
         (void)unlink(tmp);
         return -1;
+    }
+    /* the rename is in the directory: make it durable too (best effort: the file itself is complete either way) */
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *sl = strrchr(dir, '/');
+    if (sl) *(sl == dir ? sl + 1 : sl) = '\0';
+    else snprintf(dir, sizeof(dir), ".");
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd >= 0) {
+        (void)fsync(dfd);
+        close(dfd);
     }
     return 0;
 }

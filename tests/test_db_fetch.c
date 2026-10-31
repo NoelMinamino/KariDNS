@@ -293,6 +293,13 @@ static bool wake_next(park_key_t *k, int ms) {
     return false;
 }
 
+typedef struct { int fd; kdb_enc_t *e; } hot_sink_t;
+static int hot_sink_emit(void *ud) {                 /* a finished WARM_LIST part: to the stream */
+    hot_sink_t *h = ud;
+    ch_send(h->fd, h->e);
+    return 0;
+}
+
 static zdir_elem_t *elem_of(const char *view, const char *zone) {
     zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
     zdir_elem_t *e = zdir_find_exact(snapshot_find_view(s, view), zone);
@@ -872,6 +879,96 @@ int main(void) {
         usleep(500000);
         dbreg_cache_stats(&cs);
         CHECK(cs.evictions == ev_before);
+
+        /* D1a step 7 (design 8.4): the zones of the loader's hot list (WARM_LIST) are read whole with the priority "warm", one at a time until the size of a zone is known
+         * (so the others wait on the gate), and a zone that is pinned does not wait behind them and is not lost when the hot items are dropped at the high water mark:
+         * wh1, wh2, wh3 are the hot list; wh2 becomes pinned while it waits (the pin could not be added to the list: the hot item holds the place), and whp is a pinned zone
+         * of its own that comes while the hot items wait */
+        {
+            static server_config_t cfgH, cfgT;
+            static const char *const hconf = "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; memory-limit 1024g; }; };\n"
+                                             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n";
+            CHECK(parse_named_conf(hconf, &cfgH) == 0 && parse_named_conf(hconf, &cfgT) == 0);
+            atomic_store_explicit(&g_config_db.active, &cfgH, memory_order_release);
+            for (int i = 0; i < 100 && dbreg_cache_limit() == 0; i++) usleep(50000);
+            CHECK(dbreg_cache_limit() != 0);
+            kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+            kdb_enc_u64(&e, 1, 6); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
+            kdb_enc_end(&e);
+            ch_send(a[0], &e);
+            send_dir_zone(a[0], &e, 0, "wh1.test.", 3, 70001, NULL);
+            send_dir_zone(a[0], &e, 0, "wh2.test.", 3, 70002, NULL);
+            send_dir_zone(a[0], &e, 0, "wh3.test.", 3, 70003, NULL);
+            kdb_enc_begin(&e, KDB_T_BATCH_END);
+            kdb_enc_u64(&e, 1, 6); kdb_enc_u32(&e, 2, 3); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+            kdb_enc_end(&e);
+            ch_send(a[0], &e);
+            while (ch_next(&mainc, &m, 10000) && m.type != KDB_T_BATCH_RESULT) {}
+            for (int i = 0; i < 100 && !elem_of("default", "wh3.test."); i++) usleep(50000);
+            CHECK(elem_of("default", "wh1.test.") && elem_of("default", "wh2.test.") && elem_of("default", "wh3.test."));
+
+            kdb_hotl_t hl;
+            kdb_hotl_init(&hl);
+            CHECK(kdb_hotl_add(&hl, "default", "wh1.test.") && kdb_hotl_add(&hl, "default", "wh2.test.") && kdb_hotl_add(&hl, "default", "wh3.test.") &&
+                  kdb_hotl_add(&hl, "default", "nosuch.test.") && kdb_hotl_add(&hl, "nosuchview", "wh1.test."));     /* (the last two are not zones of the directory: ignored) */
+            hot_sink_t hs = { a[0], &e };
+            CHECK(kdb_hot_encode(&hl, &e, KDB_T_WARM_LIST, 1, 0, KDB_HF_LOADED, 5, hot_sink_emit, &hs) == 0);
+            kdb_hotl_free(&hl);
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "wh1.test.") == 0 &&
+                  m.u.fetch_req.priority == KDB_FETCH_PRIO_WARM && m.u.fetch_req.mode == KDB_FETCH_FULL);
+            uint64_t rid1 = m.u.fetch_req.request_id;
+            CHECK(!ch_next(&fetchc, &m, 500));                                          /* (the others wait: the size of a zone of the list is not known yet) */
+
+            kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+            kdb_enc_u64(&e, 1, 7); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
+            kdb_enc_end(&e);
+            ch_send(a[0], &e);
+            send_dir_zone(a[0], &e, 0, "wh2.test.", 4, 70002, "cache pin;");
+            send_dir_zone(a[0], &e, 0, "whp.test.", 3, 70004, "cache pin;");
+            kdb_enc_begin(&e, KDB_T_BATCH_END);
+            kdb_enc_u64(&e, 1, 7); kdb_enc_u32(&e, 2, 2); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+            kdb_enc_end(&e);
+            ch_send(a[0], &e);
+            while (ch_next(&mainc, &m, 10000) && m.type != KDB_T_BATCH_RESULT) {}
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "whp.test.") == 0 &&
+                  m.u.fetch_req.priority == KDB_FETCH_PRIO_WARM && m.u.fetch_req.mode == KDB_FETCH_FULL);   /* (a pinned zone does not wait for the hot items) */
+            uint64_t ridp = m.u.fetch_req.request_id;
+            zdir_elem_t *w2 = elem_of("default", "wh2.test.");
+            CHECK(w2 && (w2->flags & ZDIR_F_PIN) && (w2->flags & ZDIR_F_WARM));        /* (pinned, and in the list only as the hot item) */
+            send_zone(f[0], &e, 0, "whp.test.", 3, ridp, 70004);
+            for (int i = 0; i < 100 && !dbreg_lookup_entry("default", "whp.test."); i++) usleep(50000);
+            CHECK(dbreg_lookup_entry("default", "whp.test.") != NULL);
+            CHECK(!ch_next(&fetchc, &m, 300));                                          /* (the first hot zone is still on its way) */
+
+            /* the memory is at the high water mark when the first zone of the list is in: the rest of the hot list is dropped, the pinned wh2 is kept */
+            dbreg_cache_test_pause(true);                                              /* (the manager would take zones out under this limit and make room) */
+            dbreg_cache_stats_t hcs;
+            dbreg_cache_stats(&hcs);
+            cfgT.database.memory_limit = hcs.resident + hcs.retired + 1;
+            atomic_store_explicit(&g_config_db.active, &cfgT, memory_order_release);
+            for (int i = 0; i < 100 && dbreg_cache_limit() != cfgT.database.memory_limit; i++) usleep(50000);
+            CHECK(dbreg_cache_limit() == cfgT.database.memory_limit);
+            send_zone(f[0], &e, 0, "wh1.test.", 3, rid1, 70001);
+            for (int i = 0; i < 100 && !dbreg_lookup_entry("default", "wh1.test."); i++) usleep(50000);
+            CHECK(dbreg_lookup_entry("default", "wh1.test.") != NULL);
+            char sbuf[8192];
+            for (int i = 0; i < 100; i++) {
+                (void)db_ingest_status(NULL, NULL, sbuf, sizeof(sbuf));
+                if (strstr(sbuf, "(memory limit 1,")) break;
+                usleep(50000);
+            }
+            CHECK(strstr(sbuf, "loaded=1 ") && strstr(sbuf, "(memory limit 1,"));          /* wh3 was dropped; wh2 was not counted as dropped */
+            CHECK(!(elem_of("default", "wh3.test.")->flags & ZDIR_F_WARM));
+            atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);     /* room again: the pinned zone is read, the dropped one is not asked for */
+            for (int i = 0; i < 100 && dbreg_cache_limit() != 0; i++) usleep(50000);
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "wh2.test.") == 0 && m.u.fetch_req.mode == KDB_FETCH_FULL);
+            send_zone(f[0], &e, 0, "wh2.test.", 4, m.u.fetch_req.request_id, 70002);
+            for (int i = 0; i < 100 && !dbreg_lookup_entry("default", "wh2.test."); i++) usleep(50000);
+            CHECK(dbreg_lookup_entry("default", "wh2.test.") != NULL);
+            CHECK(!ch_next(&fetchc, &m, 500));
+            dbreg_cache_test_pause(false);
+            while (wake_next(&k, 100)) {}                                              /* (the reads woke nobody: the keys are for the tests that follow) */
+        }
 
         /* without memory-limit the Backend does not take a summary in a batch (the loader sends one only after CONFIG dir_only; a loader that does it
          * anyway is told the zone was rejected, and nothing is installed) */

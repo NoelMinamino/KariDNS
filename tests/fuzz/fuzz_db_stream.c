@@ -73,7 +73,7 @@ static void run_loader(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, ru
                 mix(&r->sum, m.u.zone_begin.rr_count + strlen(m.u.zone_begin.name) + m.u.zone_begin.request_id);
                 /* D1a: what the machine promised about the fetch stream */
                 if ((sm.fetch != (m.u.zone_begin.request_id != 0))) abort();
-                if ((m.u.zone_begin.flags & KDB_ZF_SUMMARY) && m.u.zone_begin.rr_count != 0) abort();      /* (a summary has no data; since milestone 4 a batch may carry one too, and a secondary zone is no exception) */
+                if ((m.u.zone_begin.flags & KDB_ZF_SUMMARY) && m.u.zone_begin.rr_count != 0) abort();      /* (a summary has no data; since milestone 4 a batch may carry one too; the decoder refuses a summary of a zone that is not a primary) */
             }
             if (fr.type == KDB_T_ZONE_FAILED) {
                 mix(&r->sum, m.u.zone_failed.request_id);

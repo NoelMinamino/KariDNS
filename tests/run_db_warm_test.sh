@@ -225,6 +225,37 @@ if [ -n "$HOOKBIN" ]; then
         fail "no loader process"
     fi
     stop_srv
+
+    echo "== the warm-up after a restart of the loader stops at the high water mark as the first one did (the estimate of the size of a zone is per session)"
+    cp "$T/good.state" "$ST"; fix_state
+    conf 1m "fetch-rate 5000;"
+    KSAVE=$KARIDNS; KARIDNS=$HOOKBIN
+    start_srv
+    KARIDNS=$KSAVE
+    warm_over() { dbs | grep '^warm:' | grep -q 'received=1 .* pending=0 in_flight=0'; }
+    waitfor 30 warm_over && pass "the first warm-up is over" || fail "warm line: $(dbs | grep '^warm:')"
+    sleep 1
+    R1=$(resident_zones); K1=$(echo $R1 | wc -w | tr -d ' ')
+    L0=$(field warm loaded)
+    echo "  first warm-up: $K1 zones in memory ($R1)"
+    for n in $R1; do $KCTL evict "$(zn $n).test." > /dev/null 2>&1; done
+    sleep 3
+    EV0=$(field cache evictions)
+    LP=$(pgrep -P "$SRV" -f 'karidns-dbloader -s 3' | head -1)
+    if [ -n "$LP" ]; then
+        kill -9 "$LP"
+        waitfor 30 sh -c "[ \"\$(./karictl -c $T/karictl.conf dbstatus 2>/dev/null | grep '^warm:' | sed -n 's/.* loaded=\([0-9]*\).*/\1/p')\" -gt $L0 ]" && pass "the second warm-up has started" || fail "warm line: $(dbs | grep '^warm:')"
+        waitfor 30 warm_over && pass "the second warm-up is over" || fail "warm line: $(dbs | grep '^warm:')"
+        sleep 1
+        R2=$(resident_zones); K2=$(echo $R2 | wc -w | tr -d ' ')
+        EV1=$(field cache evictions)
+        echo "  second warm-up: $K2 zones in memory ($R2)"
+        [ "$K2" -ge 2 ] && [ "$K2" -lt "$NZ" ] && [ "$K2" -le $((K1 + 1)) ] && pass "it read about as many zones as the first one ($K2, then $K1) and not all of them" || fail "$K2 zones in memory after the second warm-up, $K1 after the first"
+        [ "$EV0" = "$EV1" ] && pass "no zone was taken out of memory by the second warm-up (evictions $EV0 -> $EV1)" || fail "evictions $EV0 -> $EV1: the second warm-up went over the high water mark"
+    else
+        fail "no loader process"
+    fi
+    stop_srv
 else
     echo "  [SKIP] the restart of the loader needs karidns-evict (the test hook)"
 fi

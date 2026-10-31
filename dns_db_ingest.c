@@ -238,6 +238,7 @@ typedef struct {
   struct ing_warm { char view[PARK_VIEW_MAX + 1]; char zone[PARK_ZONE_MAX + 1]; bool hot; } *warm;     /* D1a milestone 4: zones to read before a query asks (pins) */
   size_t nwarm, cwarm;
   uint32_t nhot, nhot_flight;           /* D1a step 7: of the list, the zones of the hot list; of the fetches in flight, the ones for the hot list */
+  uint64_t warm_l0;                       /* g_wl_loaded when the hot list came (the counter is cumulative over loader sessions; the estimate divides by the zones read since) */
   uint64_t warm_r0;                       /* the bytes of the database zones in memory when the hot list came: what the zones of the list added is estimated from it (warm_hot_gate) */
   bool wl_open;                          /* the parts of a WARM_LIST are coming in: the list id and the next part */
   uint64_t wl_id, hot_seq;
@@ -1910,6 +1911,7 @@ static void on_warm_list(ing_t *g, const kdb_msg_t *m) {
     zone_bytes_t zb;
     zone_bytes_get(ZBYTES_DB, &zb);
     g->warm_r0 = zb.resident;
+    g->warm_l0 = atomic_load_explicit(&g_wl_loaded, memory_order_relaxed);
   } else if (!g->wl_open || h->list_id != g->wl_id || h->part != g->wl_next) {
     g->wl_open = false;
     syslog(LOG_WARNING, "[DB] a WARM_LIST part does not follow the one before; the list is ignored");
@@ -2200,7 +2202,7 @@ static bool apexw_cb(void *ud, const char *view, const dbreg_zone_t *z) {
 }
 
 static void apex_walk_step(ing_t *g) {
-  if (!g->apex_walk || g->nwarm > 0 || g->fetch_fd < 0) return;
+  if (!g->apex_walk || g->nwarm > g->nhot || g->fetch_fd < 0) return;      /* (the zones of the hot list wait for room and do not hold the walk back) */
   apexw_t *c = calloc(1, sizeof(*c));
   if (!c) return;
   rcu_aux_read_lock();
@@ -2696,9 +2698,16 @@ static uint32_t fetch_refill(ing_t *g);
 static void warm_drop_hot(ing_t *g) {
   size_t k = 0;
   for (size_t i = 0; i < g->nwarm; i++) {
+    bool whole = false;
     if (g->warm[i].hot) {
-      (void)dbreg_warm_take_hot(g->warm[i].view, g->warm[i].zone);
-      atomic_fetch_add_explicit(&g_wl_dropmem, 1, memory_order_relaxed);
+      /* a pinned zone is never dropped: it is read whole whatever the memory says (dbreg_warm_take() says it is pinned), so it stays as a zone of the list that is
+       * not hot (the flag is set again: it was the hot item that had put it in the list, and a pin summary for it was refused as a duplicate) */
+      if (dbreg_warm_take(g->warm[i].view, g->warm[i].zone, &whole) && whole && dbreg_warm_mark(g->warm[i].view, g->warm[i].zone)) {
+        g->warm[k] = g->warm[i];
+        g->warm[k++].hot = false;
+      } else {
+        atomic_fetch_add_explicit(&g_wl_dropmem, 1, memory_order_relaxed);
+      }
     } else {
       g->warm[k++] = g->warm[i];
     }
@@ -2716,7 +2725,7 @@ static int warm_hot_gate(ing_t *g) {
     uint64_t loaded = atomic_load_explicit(&g_wl_loaded, memory_order_relaxed), est = 0;
     zone_bytes_t zb;
     zone_bytes_get(ZBYTES_DB, &zb);
-    if (loaded > 0 && zb.resident > g->warm_r0) est = (zb.resident - g->warm_r0) / loaded;
+    if (loaded > g->warm_l0 && zb.resident > g->warm_r0) est = (zb.resident - g->warm_r0) / (loaded - g->warm_l0);
     if (est == 0 && g->nhot_flight > 0) return 0;
     if (dbreg_cache_over_high(est * ((uint64_t)g->nhot_flight + 1))) {
       syslog(LOG_INFO, "[DB] warm-up: the database zones reached the high water mark of memory-limit; %u zone(s) of the hot list are not read", g->nhot);
@@ -2738,22 +2747,26 @@ static void fetch_issue(ing_t *g) {
     if (park_fetch_next(&q)) {
       warm = false;
     } else if (g->nwarm > 0 && warm_left > 0) {
-      if (g->warm[0].hot) {                              /* (not taken out of the list until it can be read) */
+      size_t wi = 0;                                     /* the item to take: the head, or (hot items that cannot be read now) the first that is not hot */
+      if (g->warm[0].hot) {                              /* (a hot item is not taken out of the list until it can be read, so that the order of the list holds) */
         int gate = warm_hot_gate(g);
         if (gate < 0) {
           warm_left = g->nwarm < warm_left ? g->nwarm : warm_left;
           continue;
         }
-        if (gate == 0) break;
+        if (gate == 0) {                                 /* a pinned zone or an apex behind the hot items does not wait for them */
+          while (wi < g->nwarm && g->warm[wi].hot) wi++;
+          if (wi == g->nwarm) break;
+        }
       }
       warm = true;
       warm_left--;
       memset(&q, 0, sizeof(q));
-      snprintf(q.view, sizeof(q.view), "%s", g->warm[0].view);
-      snprintf(q.zone, sizeof(q.zone), "%s", g->warm[0].zone);
+      snprintf(q.view, sizeof(q.view), "%s", g->warm[wi].view);
+      snprintf(q.zone, sizeof(q.zone), "%s", g->warm[wi].zone);
       q.prio = KDB_FETCH_PRIO_WARM;
-      hot = g->warm[0].hot;
-      memmove(g->warm, g->warm + 1, (g->nwarm - 1) * sizeof(*g->warm));
+      hot = g->warm[wi].hot;
+      memmove(g->warm + wi, g->warm + wi + 1, (g->nwarm - wi - 1) * sizeof(*g->warm));
       g->nwarm--;
       if (hot) {
         g->nhot--;
@@ -3056,7 +3069,7 @@ static void hot_send(ing_t *g) {
 static void hold_check(ing_t *g) {
   if (!g->hold) return;
   int64_t now = now_ms();
-  bool done = atomic_load_explicit(&g_wl_received, memory_order_acquire) && g->nwarm == 0 && g->nhot_flight == 0;
+  bool done = atomic_load_explicit(&g_wl_received, memory_order_acquire) && g->nhot == 0 && g->nhot_flight == 0;     /* (zones of the list only: a pinned zone that waits for room must not hold the queries back) */
   if (!done && now < atomic_load_explicit(&g_hold_deadline_ms, memory_order_relaxed)) return;
   g->hold = false;
   atomic_store_explicit(&g_warm_done_ms, now - g->hold_start_ms, memory_order_relaxed);

@@ -2324,6 +2324,27 @@ static void test_hot_list(void) {
             CHECK(symlink("/nonexistent/target", tmpf) == 0);
             CHECK(kdb_hotl_file_write(path, &l2, why, sizeof(why)) == -1 && strstr(why, "cannot create"));
             CHECK(unlink(tmpf) == 0);
+            fp = fopen(tmpf, "wb");                                                                      /* a temporary file an earlier run left: removed, the write goes on */
+            if (fp) { fputs("stale", fp); fclose(fp); }
+            CHECK(kdb_hotl_file_write(path, &l2, why, sizeof(why)) == 0 && stat(tmpf, &st) != 0 && kdb_hotl_file_read(path, &l3, why, sizeof(why)) == KDB_HF_LOADED);
+            CHECK(mkdir(tmpf, 0700) == 0);                                                               /* ... but not a directory, or anything that is not a regular file */
+            CHECK(kdb_hotl_file_write(path, &l2, why, sizeof(why)) == -1 && strstr(why, "not a regular file"));
+            CHECK(rmdir(tmpf) == 0);
+            CHECK(symlink("hot.state", tmpf) == 0);                                                      /* a link to the file itself would be followed by a write that truncates */
+            CHECK(kdb_hotl_file_write(path, &l2, why, sizeof(why)) == -1);
+            CHECK(unlink(tmpf) == 0);
+            {   /* the file is not read through a link, nor from a fifo */
+                char lnk[330];
+                snprintf(lnk, sizeof(lnk), "%s/hot.link", dir);
+                CHECK(symlink("hot.state", lnk) == 0);
+                CHECK(kdb_hotl_file_read(lnk, &l3, why, sizeof(why)) == KDB_HF_UNREADABLE && l3.n == 0);
+                CHECK(unlink(lnk) == 0);
+                char fifo[330];
+                snprintf(fifo, sizeof(fifo), "%s/hot.fifo", dir);
+                CHECK(mkfifo(fifo, 0600) == 0);
+                CHECK(kdb_hotl_file_read(fifo, &l3, why, sizeof(why)) == KDB_HF_UNREADABLE && strstr(why, "regular"));
+                CHECK(unlink(fifo) == 0);
+            }
             char longp[PATH_MAX + 8];
             memset(longp, 'p', sizeof(longp));
             longp[sizeof(longp) - 1] = '\0';
