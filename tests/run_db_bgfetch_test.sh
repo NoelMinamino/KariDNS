@@ -122,7 +122,7 @@ N2=$(addl ns.test NS)
 [ "$N2" = "A " ] && pass "the next query has the glue (the answer without it was not stored)" || fail "ns.test: Additional '$N2'"
 
 echo "== one request for a zone, however often the query comes"
-oom dt.test && oom dup.test && pass "dup.test and dt.test start out of memory"
+oom dt.test && oom dup.test && pass "dup.test and dt.test start out of memory" || fail "dup.test or dt.test did not start out of memory"
 D x.dup.test A +short +nohexdump > /dev/null     # (dup.test is read for the query; dt.test is the target)
 I0=$(issued)
 k=0; while [ $k -lt 60 ]; do D x.dup.test A +short +nohexdump +time=1 +tries=1 > /dev/null; k=$((k + 1)); done
