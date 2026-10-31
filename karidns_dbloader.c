@@ -518,6 +518,8 @@ typedef struct {
     char perr[RW_ERRLEN], rerr[RW_ERRLEN];   /* the last error reading requests / loading, and writing the status row ("" = none) */
 } rw_t;
 
+static const char *g_state_file;             /* --state-file (D1a step 7): where the hot list is kept; NULL = nowhere */
+
 struct lio {
     int fd;
     kdb_framer_t fr;
@@ -561,6 +563,13 @@ struct lio {
     char sid[72], sid_why[100];              /* the server id the loader reports under; why it has none */
     bool sid_ok, sid_warned;
     bool status_dirty;                       /* an AUTO_STATUS is due (auto reload or reload request state changed) */
+    /* D1a step 7 (design 8.4): the hot list.  hot_asm collects the parts of a HOT_LIST; the complete list waits in hot_fresh for the main loop (a HOT_ACK
+     * is a message between batches, so nothing is sent from the reader); hot_cur is the list the state file holds (read at the start). */
+    kdb_hotl_t hot_asm, hot_fresh, hot_cur;
+    bool hot_open, hot_ready, hot_on_disk, warm_sent;
+    uint64_t hot_id, hot_fresh_id, warm_seq;
+    uint32_t hot_next, hot_limit, hot_fresh_limit, hot_dropped, hot_fzones;
+    int hot_fstate;                          /* KDB_HF_* of the state file at the start */
 };
 
 static uint32_t name_hash(uint16_t vslot, const char *s) {
@@ -2899,6 +2908,36 @@ static void chk_case_duplicates(ctx_t *x) {
     free(ix);
 }
 
+/* --state-file with --check (D1a step 7): the loader writes PATH.tmp in the directory of PATH and renames it, and reads PATH at its start */
+static void chk_state_file(const char *path) {
+    char dir[PATH_MAX], me[160], why[200];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *sl = strrchr(dir, '/');
+    if (sl) *(sl == dir ? sl + 1 : sl) = '\0';
+    else snprintf(dir, sizeof(dir), ".");
+    struct stat st;
+    if (stat(dir, &st) != 0) {
+        chk_linef('E', "state file '%s': the directory '%s': %s", path, dir, strerror(errno));
+        return;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        chk_linef('E', "state file '%s': '%s' is not a directory", path, dir);
+        return;
+    }
+    if (access(dir, W_OK | X_OK) != 0)
+        chk_linef('E', "state file '%s': the user %s cannot write in the directory '%s' (mode %04o, owner uid %u): the loader writes '%s.tmp' there and renames it",
+                  path, chk_me(me, sizeof(me)), dir, (unsigned)(st.st_mode & 07777), (unsigned)st.st_uid, path);
+    else if ((st.st_mode & S_IWOTH) && !(st.st_mode & S_ISVTX))
+        chk_linef('W', "state file '%s': the directory '%s' is writable by everyone; anybody could replace the hot list the Backend warms from", path, dir);
+    kdb_hotl_t l;
+    kdb_hotl_init(&l);
+    int rc = kdb_hotl_file_read(path, &l, why, sizeof(why));
+    if (rc == KDB_HF_CORRUPT) chk_linef('W', "state file '%s' is not valid and will be ignored (the next hot list replaces it): %s", path, why);
+    else if (rc == KDB_HF_UNREADABLE) chk_linef('E', "state file '%s' cannot be read by the user %s: %s", path, chk_me(me, sizeof(me)), why);
+    else if (rc == KDB_HF_LOADED) chk_linef('I', "state file '%s': %u zone(s) of the hot list", path, (unsigned)l.n);
+    kdb_hotl_free(&l);
+}
+
 /* One source.  Returns an exit status: 0 nothing wrong, EXIT_ZONES_FAILED errors were found, EXIT_ERROR / EXIT_RETRY the source could not be read. */
 static int run_check(ctx_t *x, const db_source_t *src) {
     char err[DB_ERRLEN];
@@ -2908,6 +2947,7 @@ static int run_check(ctx_t *x, const db_source_t *src) {
     bool sqlite = strcmp(x->drv->name, "sqlite3") == 0;
     const char *file = sqlite ? src->database_file : src->conninfo_file;
     if (file && !chk_path_access(sqlite ? "database file" : "conninfo-file", file, sqlite)) return EXIT_ERROR;
+    if (g_state_file) chk_state_file(g_state_file);
     int rc = x->drv->open(&x->conn, src, err, sizeof(err));
     if (rc != 0) {
         chk_linef('E', "%s", err);
@@ -3069,6 +3109,139 @@ static bool cfg_load_equal(const lcfg_t *a, const lcfg_t *b) {
     return true;
 }
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* D1a step 7 (design 8.4): the hot list and the state file                                                       */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* One part of a HOT_LIST.  The Backend is not trusted: the entries are bounded (KDB_HOT_MAX, the parts in order, at most 1024 of them) and a view that the
+ * current CONFIG does not have is dropped.  The complete list waits in hot_fresh for hot_run(). */
+static void hot_part(struct lio *io, const kdb_msg_t *m) {
+    const kdb_hot_list_t *h = &m->u.hot_list;
+    if (h->part == 0) {
+        kdb_hotl_clear(&io->hot_asm);                    /* a list that starts again (or a new one) replaces what was collected */
+        io->hot_open = true;
+        io->hot_id = h->list_id;
+        io->hot_limit = 0;
+        io->hot_dropped = 0;
+    } else if (!io->hot_open || h->list_id != io->hot_id || h->part != io->hot_next || h->part > 1024) {
+        io->hot_open = false;                            /* a part that does not follow: the list is lost, not the stream */
+        kdb_hotl_clear(&io->hot_asm);
+        lg(LOG_WARNING, "a HOT_LIST part %u does not follow the one before; the list is dropped", (unsigned)h->part);
+        return;
+    }
+    io->hot_next = h->part + 1;
+    if (h->limit) io->hot_limit = h->limit;
+    kdb_iter_t it;
+    char view[256], zone[DNS_NAME_TEXT_SIZE];
+    bool last_ok = false;
+    char last_view[256] = "";
+    kdb_hot_entries(m, &it);
+    while (kdb_hot_entries_next(&it, view, zone)) {
+        bool known = last_ok && strcmp(view, last_view) == 0;
+        for (size_t i = 0; !known && i < io->cfg.nviews; i++) known = io->cfg.views[i].name && strcmp(io->cfg.views[i].name, view) == 0;
+        if (known) {
+            snprintf(last_view, sizeof(last_view), "%s", view);
+            last_ok = true;
+        }
+        if (!known || !kdb_hotl_add(&io->hot_asm, view, zone)) io->hot_dropped++;       /* (a view that is not configured, or beyond KDB_HOT_MAX / out of memory) */
+    }
+    if (h->last) {
+        kdb_hotl_t t = io->hot_fresh;
+        io->hot_fresh = io->hot_asm;
+        io->hot_asm = t;
+        kdb_hotl_clear(&io->hot_asm);
+        io->hot_fresh_id = io->hot_id;
+        io->hot_fresh_limit = io->hot_limit;
+        io->hot_ready = true;
+        io->hot_open = false;
+    }
+}
+
+static int hot_emit(void *ud) { return send_enc((ctx_t *)ud); }
+
+/* the state file at the start: read, and say what it was (the Backend shows it in dbstatus) */
+static void hot_file_load(struct lio *io) {
+    char why[200] = "";
+    io->hot_fstate = KDB_HF_NONE;
+    io->hot_on_disk = false;
+    if (!g_state_file) return;
+    io->hot_fstate = kdb_hotl_file_read(g_state_file, &io->hot_cur, why, sizeof(why));
+    switch (io->hot_fstate) {
+    case KDB_HF_LOADED:
+        io->hot_on_disk = true;
+        lg(LOG_INFO, "state file %s: %u zone(s) of the hot list", g_state_file, (unsigned)io->hot_cur.n);
+        break;
+    case KDB_HF_MISSING:
+        lg(LOG_NOTICE, "state file %s does not exist yet; it is written when the Backend sends the hot list", g_state_file);
+        break;
+    case KDB_HF_CORRUPT:
+        lg(LOG_WARNING, "state file %s is ignored: %s; it is replaced by the next hot list", g_state_file, why);
+        break;
+    default:
+        lg(LOG_WARNING, "state file %s cannot be read: %s; it is ignored", g_state_file, why);
+        break;
+    }
+    io->hot_fzones = io->hot_cur.n;
+}
+
+/* After the startup load: the zones of the state file, hottest first, for the Backend to read (WARM_LIST; an empty one when there is none, so that the
+ * Backend knows the warm-up has nothing more to wait for).  Only the views the CONFIG has are sent. */
+static int warm_send(ctx_t *x, struct lio *io) {
+    kdb_hotl_t keep;
+    kdb_hotl_init(&keep);
+    size_t pos = 0;
+    const char *v, *z;
+    while (kdb_hotl_next(&io->hot_cur, &pos, &v, &z)) {
+        bool known = false;
+        for (size_t i = 0; !known && i < io->cfg.nviews; i++) known = io->cfg.views[i].name && strcmp(io->cfg.views[i].name, v) == 0;
+        if (known && !kdb_hotl_add(&keep, v, z)) break;
+    }
+    int rc = kdb_hot_encode(&keep, &x->enc, KDB_T_WARM_LIST, ++io->warm_seq, 0, io->hot_fstate, io->hot_fzones, hot_emit, x);
+    if (rc == 0) lg(LOG_INFO, "WARM_LIST: %u zone(s) of the hot list sent to the Backend", (unsigned)keep.n);
+    kdb_hotl_free(&keep);
+    return rc;
+}
+
+/* A complete HOT_LIST: merge it into the list of the state file (what nobody asked for since stays after the new zones), write the file when it differs, tell the
+ * Backend.  A failure to write is reported, not fatal: the next list tries again. */
+static int hot_run(ctx_t *x, struct lio *io) {
+    if (!io->hot_ready) return 0;
+    io->hot_ready = false;
+    uint8_t status = KDB_HA_NOFILE;
+    char err[200] = "";
+    if (io->hot_dropped) lg(LOG_NOTICE, "HOT_LIST: %u entries dropped (a view that is not configured, or the list is too long)", (unsigned)io->hot_dropped);
+    if (g_state_file) {
+        kdb_hotl_t merged;
+        kdb_hotl_init(&merged);
+        if (!kdb_hotl_merge(&io->hot_fresh, &io->hot_cur, io->hot_fresh_limit, &merged)) {
+            status = KDB_HA_FAILED;
+            snprintf(err, sizeof(err), "out of memory");
+        } else if (io->hot_on_disk && kdb_hotl_equal(&merged, &io->hot_cur)) {
+            status = KDB_HA_UNCHANGED;
+        } else {
+            kdb_hotl_t t = io->hot_cur;                       /* the merged list is the list now, written or not (a failed write is tried again with the next list) */
+            io->hot_cur = merged;
+            merged = t;
+            if (kdb_hotl_file_write(g_state_file, &io->hot_cur, err, sizeof(err)) == 0) {
+                status = KDB_HA_WRITTEN;
+                io->hot_on_disk = true;
+            } else {
+                status = KDB_HA_FAILED;
+                io->hot_on_disk = false;
+                lg(LOG_ERR, "state file: %s", err);
+            }
+        }
+        kdb_hotl_free(&merged);
+    }
+    char clean[256];
+    clean_reason(err, clean, sizeof(clean));
+    if (kdb_enc_begin(&x->enc, KDB_T_HOT_ACK) != 0 || kdb_enc_u64(&x->enc, 1, io->hot_fresh_id) != 0 || kdb_enc_u8(&x->enc, 2, status) != 0 ||
+        kdb_enc_u32(&x->enc, 3, g_state_file ? io->hot_cur.n : 0) != 0 || (clean[0] && kdb_enc_str(&x->enc, 4, clean) != 0) ||
+        kdb_enc_end(&x->enc) != 0)
+        return -1;
+    return send_enc(x);
+}
+
 static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
     kdb_msg_t m;
     char why[KDB_REASON_LEN];
@@ -3100,6 +3273,9 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
         }
         break;
     }
+    case KDB_T_HOT_LIST:
+        hot_part(io, &m);
+        break;
     case KDB_T_CONFIG: {
         lcfg_t nc;
         if (cfg_from_msg(&m, &nc) != 0) {
@@ -4486,6 +4662,10 @@ static int run_stream(int fd) {
     memset(&x, 0, sizeof(x));
     x.io = io;
     kdb_enc_init(&x.enc);
+    kdb_hotl_init(&io->hot_asm);
+    kdb_hotl_init(&io->hot_fresh);
+    kdb_hotl_init(&io->hot_cur);
+    hot_file_load(io);                         /* D1a step 7: the hot list of the last run */
     int status = EXIT_OK;
     char drvs[128];
     drivers_csv(drvs, sizeof(drvs));
@@ -4593,6 +4773,14 @@ static int run_stream(int fd) {
                 if (backoff < 30) backoff *= 2;
             }
         }
+        if (startup_done && !io->warm_sent && !io->have_newcfg) {          /* D1a step 7: the zones of the state file, once, between batches */
+            io->warm_sent = true;
+            if (warm_send(&x, io) != 0) {
+                if (g_stop) goto stopped;
+                status = EXIT_ERROR;
+                goto done;
+            }
+        }
         for (size_t i = 0; i < io->nreq && !g_stop; i++) {
             lreq_t r = io->req[i];
             if (do_load(&x, io, KDB_BATCH_ZONE, r.view, r.zone, r.id, r.force, false) < 0) {
@@ -4603,6 +4791,11 @@ static int run_stream(int fd) {
         }
         io->nreq = 0;
         if (startup_done && auto_run(&x, io) != 0) {
+            if (g_stop) goto stopped;
+            status = EXIT_ERROR;
+            goto done;
+        }
+        if (startup_done && hot_run(&x, io) != 0) {
             if (g_stop) goto stopped;
             status = EXIT_ERROR;
             goto done;
@@ -4646,6 +4839,9 @@ stopped:
     else if (io->failed) status = EXIT_ERROR;
 done:
     fetch_thread_stop();
+    kdb_hotl_free(&io->hot_asm);
+    kdb_hotl_free(&io->hot_fresh);
+    kdb_hotl_free(&io->hot_cur);
     ctx_view_reset(&x);
     kdb_enc_free(&x.enc);
     for (size_t i = 0; i < io->nrw; i++) rw_free(&io->rw[i]);
@@ -4763,6 +4959,7 @@ static void usage(FILE *fp) {
         "  --ecs-tag NAME      with --check: a tag of options { ecs-tags }; repeatable (records may name it)\n"
         "  --location-tag NAME with --check: a tag of options { location-tags }; repeatable\n"
         "  --max-zone-records N, --max-zone-bytes N   with --check: the limits of the database block\n"
+        "  --state-file PATH   with -s: the file the hot list is kept in (D1a: database { loader-state-file }); with --check: check that the loader can use it\n"
         "  --zone-checks LIST  with --check: the check-* severities, name=fail|warn|ignore,... (names, dup-records, integrity, mx, mx-cname, sibling,\n"
         "                      spf, srv-cname, svcb, wildcard)\n"
         "  --version           print the version\n"
@@ -4807,10 +5004,12 @@ int main(int argc, char **argv) {
         { "max-zone-bytes", required_argument, NULL, 1007 },
         { "zone-checks", required_argument, NULL, 1008 },
         { "fetch-fd", required_argument, NULL, 1009 },
+        { "state-file", required_argument, NULL, 1010 },
         { "help", no_argument, NULL, 'h' },                { NULL, 0, NULL, 0 }
     };
     const char *dump = NULL, *driver = NULL, *dbfile = NULL, *conninfo = NULL, *schema = NULL, *zone = NULL, *map_view = NULL;
     const char *stream_fd = NULL, *fetch_fd_arg = NULL;
+    const char *state_file_arg = NULL;
     unsigned long view = 0, ttl = 0, threads = 1, v, max_records = 0, max_bytes = 0;
     bool check = false, chk_auto = false;                 // B12
     const char *chk_server_id = NULL, *chk_zone_checks = NULL;
@@ -4859,6 +5058,7 @@ int main(int argc, char **argv) {
             break;
         case 1008: chk_zone_checks = optarg; break;
         case 1009: fetch_fd_arg = optarg; break;
+        case 1010: state_file_arg = optarg; break;
         case 1006:
             if (!parse_uint(optarg, 2, 4294967295ul, &max_records)) {
                 fprintf(stderr, "karidns-dbloader: --max-zone-records must be 2..4294967295\n");
@@ -4901,12 +5101,18 @@ int main(int argc, char **argv) {
             }
             g_fetch_fd = (int)fv;
         }
+        g_state_file = state_file_arg;
         return stream_main((int)v);
     }
     if (fetch_fd_arg) {
         fprintf(stderr, "karidns-dbloader: --fetch-fd is for -s\n");
         return EXIT_USAGE;
     }
+    if (state_file_arg && !check) {
+        fprintf(stderr, "karidns-dbloader: --state-file is for -s and --check\n");
+        return EXIT_USAGE;
+    }
+    g_state_file = state_file_arg;                       // --check looks at it (chk_state_file)
     if (check && (dump || zone || map_view)) {
         fprintf(stderr, "karidns-dbloader: --check cannot be combined with --dump, --zone or --map-view\n");
         return EXIT_USAGE;

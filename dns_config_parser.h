@@ -649,6 +649,10 @@ typedef struct {
   uint64_t memory_limit;       /* D1a step 5: bytes the database zones may hold in memory (resident + retired, not freed yet); 0 = no limit, every zone stays resident. 1M..1T */
   uint32_t fetch_rate;         /* D1a: zones read from the database for queries per second, 1..100000 (0 = the default, 200); a token bucket with a burst of one second */
   uint32_t transfer_fetch_timeout_ms;   /* D1a step 7: how long an AXFR / IXFR of a zone that is not in memory waits for the zone, 100..600000 ms (0 = the default, 10000) */
+  char *loader_state_file;     /* D1a step 7 (design 8.4): the file the loader keeps the hot list in (restart-only); NULL = none */
+  uint32_t warm_before_serve;  /* D1a step 7: seconds the queries wait for the zones of the hot list to be read, 0..3600 (0 = do not wait, the default) */
+  uint32_t hot_list_size;      /* D1a step 7: the zones most asked for that the hot list keeps, 1..100000 (0 = the default, 10000) */
+  uint32_t hot_list_interval;  /* D1a step 7: seconds between two hot lists, 1..86400 (0 = the default, 60) */
   char *server_id;             /* postgresql only (B11) */
   char **alias_resolver;       /* stored only (B9a): IP address literals */
   int alias_resolver_count;
@@ -668,6 +672,11 @@ typedef struct {
 #define KARIDNS_DB_XFR_FETCH_TIMEOUT_MIN 100
 #define KARIDNS_DB_XFR_FETCH_TIMEOUT_MAX 600000
 #define KARIDNS_DB_XFR_FETCH_TIMEOUT_DEFAULT 10000
+#define KARIDNS_DB_WARM_WAIT_MAX 3600
+#define KARIDNS_DB_HOT_LIST_MAX 100000
+#define KARIDNS_DB_HOT_LIST_DEFAULT 10000
+#define KARIDNS_DB_HOT_INTERVAL_MAX 86400
+#define KARIDNS_DB_HOT_INTERVAL_DEFAULT 60
 #define KARIDNS_DB_PARK_TIMEOUT_MIN 10
 #define KARIDNS_DB_PARK_TIMEOUT_MAX 60000
 #define KARIDNS_DB_MAX_VIEWS 1024   /* views that take DB zones: the CONFIG message of the loader link lists at most this many (KDB_MAX_CONFIG_VIEWS) */

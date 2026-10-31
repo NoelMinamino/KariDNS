@@ -33,6 +33,7 @@ typedef struct {
   int first_fetch_fd;       /* the same for the fetch stream (D1a), -1 = the loader has none */
   run_identity_t id;        /* loader-user / loader-group, resolved once */
   char path[PATH_MAX];      /* loader-path */
+  char state_file[PATH_MAX]; /* loader-state-file (D1a step 7): the loader keeps the hot list there; "" = none */
   int64_t started_ms;       /* CLOCK_MONOTONIC */
   int64_t restart_at_ms;
   unsigned backoff_s;       /* the wait after the next exit */

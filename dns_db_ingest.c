@@ -81,6 +81,8 @@ typedef struct {
   uint32_t ingest_threads;
   bool auto_reload;
   uint32_t poll_interval, coalesce_ms;
+  bool state_file;             /* D1a step 7: loader-state-file is set (the hot list is kept) */
+  uint32_t hot_size, hot_interval, warm_wait;   /* hot-list-size, hot-list-interval (s), warm-before-serve (s) */
   bool enabled;
 } ing_cfg_t;
 
@@ -130,6 +132,7 @@ typedef struct {
   bool want_summary;                     /* a summary for the zone was not asked for because this request was on its way: if it fails or is dropped, the zone goes back to the list */
   bool dropped;                          /* the zone it brought was dropped (an older version than the directory's) */
   bool quiet;                            /* asked for by the list of zones to read (the apex after a reload), not by a query: nobody waits for it, so it wakes nobody */
+  bool hot;                              /* a zone of the hot list (D1a step 7): counted in the warm-up progress */
   int64_t sent_ms;
   char view_name[KARIDNS_VIEW_NAME_MAX];
   char zone[DNS_NAME_TEXT_SIZE];
@@ -232,8 +235,15 @@ typedef struct {
   uint32_t nsum;                         /* ... of which summary fetches (D1a step 6) */
   bool delta_failed;                     /* the last publication failed (out of memory): the delta interval paces the next try, whatever the garbage says */
   ing_freq_t freq[ING_FETCH_MAX];
-  struct ing_warm { char view[PARK_VIEW_MAX + 1]; char zone[PARK_ZONE_MAX + 1]; } *warm;     /* D1a milestone 4: zones to read before a query asks (pins) */
+  struct ing_warm { char view[PARK_VIEW_MAX + 1]; char zone[PARK_ZONE_MAX + 1]; bool hot; } *warm;     /* D1a milestone 4: zones to read before a query asks (pins) */
   size_t nwarm, cwarm;
+  uint32_t nhot, nhot_flight;           /* D1a step 7: of the list, the zones of the hot list; of the fetches in flight, the ones for the hot list */
+  uint64_t warm_r0;                       /* the bytes of the database zones in memory when the hot list came: what the zones of the list added is estimated from it (warm_hot_gate) */
+  bool wl_open;                          /* the parts of a WARM_LIST are coming in: the list id and the next part */
+  uint64_t wl_id, hot_seq;
+  uint32_t wl_next, wl_count;
+  bool hold;                             /* warm-before-serve: the workers wait; the thread logs how it ended */
+  int64_t hold_start_ms;
   bool apex_walk;                        /* D1a step 6: after a reload, the zones out of memory that now keep an apex but have none are asked for (their summary) ... */
   dbreg_cursor_t apex_cur;               /* ... a few at a time, from here */
   uint32_t funsolicited;       /* zones nobody asked for, discarded (logged the first few) */
@@ -486,6 +496,10 @@ static void fill_snap(const server_config_t *cfg, ing_cfg_t *c) {
     c->auto_reload = cfg->database.auto_reload;
     c->poll_interval = cfg->database.poll_interval;
     c->coalesce_ms = cfg->database.coalesce_ms;
+    c->state_file = cfg->database.loader_state_file != NULL;
+    c->hot_size = cfg->database.hot_list_size ? cfg->database.hot_list_size : KARIDNS_DB_HOT_LIST_DEFAULT;
+    c->hot_interval = cfg->database.hot_list_interval ? cfg->database.hot_list_interval : KARIDNS_DB_HOT_INTERVAL_DEFAULT;
+    c->warm_wait = cfg->database.warm_before_serve;
   }
 }
 
@@ -1102,6 +1116,7 @@ static void send_zone_result(ing_t *g, uint16_t view, const char *zone, uint8_t 
 
 static void fetch_job_finish(ing_t *g, ing_job_t *j);
 static void warm_add(ing_t *g, const char *view, const char *zone);
+static void warm_add_ex(ing_t *g, const char *view, const char *zone, bool hot, bool fresh);
 static void fetch_issue(ing_t *g);
 
 /* the answer of a finished job; the job is freed */
@@ -1187,6 +1202,24 @@ static _Atomic uint32_t g_xfr_timeout_ms = KARIDNS_DB_XFR_FETCH_TIMEOUT_DEFAULT;
 static _Atomic uint64_t g_apex_asked, g_apex_answered, g_apex_walks;   /* D1a step 6: summaries asked for (for the apex of a zone out of memory, after a reload) / their fetches that ended */
 static _Atomic uint32_t g_warm_n;                         /* the length of the list of zones to read (g->nwarm, for dbstatus) */
 static _Atomic bool g_apex_walking;                       /* ... and the walk over the registry that finds the zones is still going */
+
+/* D1a step 7 (design 8.4): the warm-up from the hot list and the state file, as dbstatus shows them */
+#define ING_EVT_HOT 4                                   /* EVFILT_USER ident: the cache thread has a hot list for the ingest thread to send */
+static _Atomic(kdb_hotl_t *) g_hot_out;                 /* the hot list the cache thread made, for the ingest thread (one slot; a newer list replaces it) */
+static _Atomic uint64_t g_wl_queued, g_wl_loaded, g_wl_failed, g_wl_dropmem;     /* hot-list zones put in the warm list / read / not read (fetch failed) / dropped at the high water mark */
+static _Atomic uint32_t g_wl_pending, g_wl_flight;      /* ... in the warm list now / being read now */
+static _Atomic bool g_wl_received;                      /* this loader session's WARM_LIST is complete */
+static _Atomic int g_sf_fstate = -1;                    /* what the loader found in its state file at its start (KDB_HF_*), -1 = it has not said */
+static _Atomic uint32_t g_sf_fzones;
+static _Atomic uint64_t g_hot_sent, g_hot_acks[KDB_HA_N];
+static _Atomic uint32_t g_hot_last_n, g_hot_last_zones;
+static _Atomic int g_hot_last_status = -1;
+static _Atomic int64_t g_hot_last_sent;
+/* warm-before-serve: the workers do not read their sockets before this time (CLOCK_MONOTONIC ms; 0 = no wait) unless the warm-up is done */
+static _Atomic int64_t g_hold_deadline_ms;
+static _Atomic bool g_warm_done;
+static _Atomic int64_t g_warm_done_ms;                  /* how long the wait took (ms), for dbstatus */
+
 static int64_t delta_interval_ms(void) { return dbreg_cache_limit() ? ING_DELTA_LIMITED_MS : ING_DELTA_MS; }
 
 static void maybe_apply_delta(ing_t *g) {
@@ -1865,6 +1898,50 @@ static void on_auto_status(const kdb_msg_t *m) {
   }
 }
 
+/* D1a step 7: the zones of the loader's state file, hottest first (WARM_LIST, design 8.4).  The loader is not trusted: the parts must follow one another, at most
+ * KDB_HOT_MAX entries in all, and a zone that is not in the directory of its view is ignored by warm_add_ex().  The zones are put in the warm list in the order
+ * they come; fetch_issue() reads them with the priority "warm". */
+static void on_warm_list(ing_t *g, const kdb_msg_t *m) {
+  const kdb_hot_list_t *h = &m->u.hot_list;
+  if (h->part == 0) {
+    g->wl_open = true;
+    g->wl_id = h->list_id;
+    g->wl_count = 0;
+    zone_bytes_t zb;
+    zone_bytes_get(ZBYTES_DB, &zb);
+    g->warm_r0 = zb.resident;
+  } else if (!g->wl_open || h->list_id != g->wl_id || h->part != g->wl_next) {
+    g->wl_open = false;
+    syslog(LOG_WARNING, "[DB] a WARM_LIST part does not follow the one before; the list is ignored");
+    return;
+  }
+  g->wl_next = h->part + 1;
+  if (h->file_state >= 0) {
+    atomic_store_explicit(&g_sf_fstate, h->file_state, memory_order_relaxed);
+    atomic_store_explicit(&g_sf_fzones, h->file_zones, memory_order_relaxed);
+  }
+  kdb_iter_t it;
+  char view[256], zone[DNS_NAME_TEXT_SIZE];
+  kdb_hot_entries(m, &it);
+  while (kdb_hot_entries_next(&it, view, zone) && g->wl_count < KDB_HOT_MAX) {
+    g->wl_count++;
+    warm_add_ex(g, view, zone, true, true);
+  }
+  if (h->last) {
+    g->wl_open = false;
+    atomic_store_explicit(&g_wl_received, true, memory_order_release);
+    syslog(LOG_INFO, "[DB] warm-up: %u zone(s) of the hot list received from the loader, %u queued to read", g->wl_count, g->nhot);
+  }
+}
+
+static void on_hot_ack(const kdb_msg_t *m) {
+  const kdb_hot_ack_t *a = &m->u.hot_ack;
+  atomic_fetch_add_explicit(&g_hot_acks[a->status < KDB_HA_N ? a->status : KDB_HA_FAILED], 1, memory_order_relaxed);
+  atomic_store_explicit(&g_hot_last_status, a->status, memory_order_relaxed);
+  atomic_store_explicit(&g_hot_last_zones, a->zones, memory_order_relaxed);
+  if (a->status == KDB_HA_FAILED) syslog(LOG_WARNING, "[DB] the loader could not write its state file: %.*s", (int)a->error.len, a->error.p ? a->error.p : "");
+}
+
 static void handle_msg(ing_t *g, const kdb_msg_t *m) {
   switch (m->type) {
   case KDB_T_HELLO:
@@ -1903,6 +1980,12 @@ static void handle_msg(ing_t *g, const kdb_msg_t *m) {
     break;
   case KDB_T_AUTO_STATUS:
     on_auto_status(m);
+    break;
+  case KDB_T_WARM_LIST:
+    on_warm_list(g, m);
+    break;
+  case KDB_T_HOT_ACK:
+    on_hot_ack(m);
     break;
   default:
     break;
@@ -1982,6 +2065,8 @@ static void adopt_stream(ing_t *g, int fd) {
   g->hello_done = false;
   g->zones_logged = 0;
   g->rejects_logged = 0;
+  g->wl_open = false;                                    /* a new loader: its WARM_LIST is still to come */
+  atomic_store_explicit(&g_wl_received, false, memory_order_release);
   g->inv_active = false;
   ing_cfg_t snap;
   snapshot_cfg(&snap);
@@ -2518,6 +2603,11 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
     g->nsum--;
     atomic_fetch_add_explicit(&g_apex_answered, 1, memory_order_relaxed);
   }
+  if (done.hot) {
+    g->nhot_flight--;
+    atomic_store_explicit(&g_wl_flight, g->nhot_flight, memory_order_relaxed);
+    atomic_fetch_add_explicit(ok ? &g_wl_loaded : &g_wl_failed, 1, memory_order_relaxed);
+  }
   if (!ok)
     syslog(LOG_WARNING, "[DB] fetch of zone '%s' (view '%s') failed: %s", done.zone, done.view_name, why && why[0] ? why : "no reason given");
   if (dbreg_pending_count() > 0) apply_delta(g);         /* a zone that was new to the index becomes visible before its queries are woken */
@@ -2557,7 +2647,8 @@ static void fetch_expire(ing_t *g) {
 /* D1a milestone 4: the zones to read although no query asked for them yet (a pinned zone that came as a summary; the warm-up of step 7 will use the
  * same list).  They go after the requests of the queries, at most ING_WARM_NFREQ in flight, and a zone that cannot be asked for now (the rate, the
  * limit) waits at the end of the list. */
-static void warm_add(ing_t *g, const char *view, const char *zone) {
+/* hot: a zone of the hot list (read whole, in the order of the list); fresh: it comes from the list now (counted), not a zone that goes back for a free place */
+static void warm_add_ex(ing_t *g, const char *view, const char *zone, bool hot, bool fresh) {
   if (!dbreg_warm_mark(view, zone)) return;              /* in the list already (a summary for the same pinned zone again), or not a zone of the registry */
   if (g->nwarm == g->cwarm) {
     size_t nc = g->cwarm ? g->cwarm * 2 : 64;
@@ -2571,32 +2662,113 @@ static void warm_add(ing_t *g, const char *view, const char *zone) {
   }
   snprintf(g->warm[g->nwarm].view, sizeof(g->warm[0].view), "%s", view);
   snprintf(g->warm[g->nwarm].zone, sizeof(g->warm[0].zone), "%s", zone);
+  g->warm[g->nwarm].hot = hot;
   g->nwarm++;
+  if (hot) {
+    g->nhot++;
+    atomic_store_explicit(&g_wl_pending, g->nhot, memory_order_relaxed);
+    if (fresh) atomic_fetch_add_explicit(&g_wl_queued, 1, memory_order_relaxed);
+  }
   atomic_store_explicit(&g_warm_n, (uint32_t)g->nwarm, memory_order_relaxed);
+}
+
+/* the fetch-rate bucket (ingest thread only): fill it for the time that has passed; returns the rate */
+static uint32_t fetch_refill(ing_t *g) {
+  uint32_t frate = atomic_load_explicit(&g_fetch_rate, memory_order_relaxed);
+  int64_t tnow = now_ms();
+  if (g->ftok_ms == 0) {
+    g->ftokens = frate;
+  } else if (tnow > g->ftok_ms) {
+    g->ftokens += (double)(tnow - g->ftok_ms) * frate / 1000.0;
+    if (g->ftokens > frate) g->ftokens = frate;
+  }
+  g->ftok_ms = tnow;
+  return frate;
+}
+
+static void warm_add(ing_t *g, const char *view, const char *zone) { warm_add_ex(g, view, zone, false, false); }
+
+/* The hot items of the warm list are taken from its head only when there is room for them (so that the order of the list holds): the queries come first (fewer than
+ * ING_WARM_NFREQ fetches in flight, the rate bucket at least half full), the limit is respected, and at the high water mark of memory-limit the rest of the hot
+ * list is dropped (design 8.4: warming never takes memory from the zones that are in use).  1: read the head now; 0: not now (it stays); -1: the hot items were
+ * dropped, look at the list again. */
+static uint32_t fetch_refill(ing_t *g);
+static void warm_drop_hot(ing_t *g) {
+  size_t k = 0;
+  for (size_t i = 0; i < g->nwarm; i++) {
+    if (g->warm[i].hot) {
+      (void)dbreg_warm_take_hot(g->warm[i].view, g->warm[i].zone);
+      atomic_fetch_add_explicit(&g_wl_dropmem, 1, memory_order_relaxed);
+    } else {
+      g->warm[k++] = g->warm[i];
+    }
+  }
+  g->nwarm = k;
+  g->nhot = 0;
+  atomic_store_explicit(&g_wl_pending, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_warm_n, (uint32_t)g->nwarm, memory_order_relaxed);
+}
+static int warm_hot_gate(ing_t *g) {
+  if (g->nfreq >= ING_WARM_NFREQ) return 0;
+  if (dbreg_cache_limit()) {
+    /* the zones in flight are not in the resident bytes yet: estimate them from what the zones of the list added so far (a zone of the list is about that big);
+     * until one is in, one at a time.  The mark is the cache manager's high water mark: no zone is taken out of memory to make room for the warm-up. */
+    uint64_t loaded = atomic_load_explicit(&g_wl_loaded, memory_order_relaxed), est = 0;
+    zone_bytes_t zb;
+    zone_bytes_get(ZBYTES_DB, &zb);
+    if (loaded > 0 && zb.resident > g->warm_r0) est = (zb.resident - g->warm_r0) / loaded;
+    if (est == 0 && g->nhot_flight > 0) return 0;
+    if (dbreg_cache_over_high(est * ((uint64_t)g->nhot_flight + 1))) {
+      syslog(LOG_INFO, "[DB] warm-up: the database zones reached the high water mark of memory-limit; %u zone(s) of the hot list are not read", g->nhot);
+      warm_drop_hot(g);
+      return -1;
+    }
+    if (g->nfreq >= ING_FETCH_LIMITED || dbreg_cache_over_limit()) return 0;
+  }
+  uint32_t frate = fetch_refill(g);
+  return g->ftokens >= (frate / 2.0 > 1.0 ? frate / 2.0 : 1.0) ? 1 : 0;
 }
 
 static void fetch_issue(ing_t *g) {
   park_fetch_req_t q;
   bool warm = false;
   size_t warm_left = g->nwarm;                           /* the zones that were in the list when the pass started (those put back wait for the next pass) */
+  bool hot = false;
   for (;;) {
     if (park_fetch_next(&q)) {
       warm = false;
     } else if (g->nwarm > 0 && warm_left > 0) {
+      if (g->warm[0].hot) {                              /* (not taken out of the list until it can be read) */
+        int gate = warm_hot_gate(g);
+        if (gate < 0) {
+          warm_left = g->nwarm < warm_left ? g->nwarm : warm_left;
+          continue;
+        }
+        if (gate == 0) break;
+      }
       warm = true;
       warm_left--;
       memset(&q, 0, sizeof(q));
       snprintf(q.view, sizeof(q.view), "%s", g->warm[0].view);
       snprintf(q.zone, sizeof(q.zone), "%s", g->warm[0].zone);
       q.prio = KDB_FETCH_PRIO_WARM;
+      hot = g->warm[0].hot;
       memmove(g->warm, g->warm + 1, (g->nwarm - 1) * sizeof(*g->warm));
       g->nwarm--;
+      if (hot) {
+        g->nhot--;
+        atomic_store_explicit(&g_wl_pending, g->nhot, memory_order_relaxed);
+      }
       atomic_store_explicit(&g_warm_n, (uint32_t)g->nwarm, memory_order_relaxed);
       bool whole = false;
-      if (!dbreg_warm_take(q.view, q.zone, &whole)) continue;      /* it came into memory meanwhile, was deleted, or has nothing to read for (not pinned, has an apex) */
+      if (hot) {
+        if (!dbreg_warm_take_hot(q.view, q.zone)) continue;        /* in memory by now (a query read it), or gone: nothing to read */
+        whole = true;
+      } else if (!dbreg_warm_take(q.view, q.zone, &whole)) continue;
+      /* it came into memory meanwhile, was deleted, or has nothing to read for (not pinned, has an apex) */
       q.mode = whole ? KDB_FETCH_FULL : KDB_FETCH_SUMMARY;         /* a pinned zone whole; any other zone in the list is there for its apex */
       if ((whole && g->nfreq >= ING_WARM_NFREQ) || (!whole && g->nsum >= ING_SUMMARY_NFREQ)) {      /* the zones nobody asked for yet wait for a free place */
-        warm_add(g, q.view, q.zone);
+        warm_add_ex(g, q.view, q.zone, hot, false);
         break;
       }
     } else {
@@ -2630,7 +2802,7 @@ static void fetch_issue(ing_t *g) {
       uint64_t lim = dbreg_cache_limit();      /* (a summary brings no zone data: the limit does not hold it back, ING_SUMMARY_NFREQ bounds it) */
       if (lim && (g->nfreq >= ING_FETCH_LIMITED || dbreg_cache_over_limit())) {
         if (warm) {
-          warm_add(g, q.view, q.zone);
+          warm_add_ex(g, q.view, q.zone, hot, false);
           break;
         }
         atomic_fetch_add_explicit(&g_fetch_shed, 1, memory_order_relaxed);
@@ -2641,21 +2813,13 @@ static void fetch_issue(ing_t *g) {
     /* fetch-rate (design 8.5): scattered queries for many zones that are out of memory must not make the loader read zones faster than this; a token
      * bucket (burst = one second of the rate) of zones read for queries.  Only a read that is really made takes a token (below); the queries
      * of a zone with no token get "not ready" at once. */
-    uint32_t frate = atomic_load_explicit(&g_fetch_rate, memory_order_relaxed);
-    int64_t tnow = now_ms();
-    if (g->ftok_ms == 0) {
-      g->ftokens = frate;
-    } else if (tnow > g->ftok_ms) {
-      g->ftokens += (double)(tnow - g->ftok_ms) * frate / 1000.0;
-      if (g->ftokens > frate) g->ftokens = frate;
-    }
-    g->ftok_ms = tnow;
+    uint32_t frate = fetch_refill(g);
     /* the queries come first: a summary for the apex (the walk after a reload) takes a token only from a bucket that is more than half full, so that the walk
      * cannot leave the queries without one */
     /* ... and so does a whole zone that the query path asks for in the background (a CNAME or glue leads into it, D1a step 8): the queries come first */
     if (g->ftokens < 1.0 || (((warm && q.mode == KDB_FETCH_SUMMARY) || (q.prio == KDB_FETCH_PRIO_BACKGROUND && q.mode == KDB_FETCH_FULL)) && g->ftokens < frate / 2.0)) {
       if (warm) {
-        warm_add(g, q.view, q.zone);
+        warm_add_ex(g, q.view, q.zone, hot, false);
         break;
       }
       atomic_fetch_add_explicit(&g_fetch_limited, 1, memory_order_relaxed);
@@ -2675,7 +2839,7 @@ static void fetch_issue(ing_t *g) {
       if (q.mode != KDB_FETCH_SUMMARY) dbreg_fetch_end(g->view_names[vi], q.zone);
       if (warm) {
         g->ftokens += 1.0;
-        warm_add(g, q.view, q.zone);
+        warm_add_ex(g, q.view, q.zone, hot, false);
         break;
       }
       park_wake_broadcast(q.view, q.zone, true);
@@ -2695,6 +2859,11 @@ static void fetch_issue(ing_t *g) {
     r->prio = q.prio < KDB_FETCH_PRIO_N ? q.prio : KDB_FETCH_PRIO_QUERY;
     r->mode = q.mode <= KDB_FETCH_SUMMARY ? q.mode : KDB_FETCH_FULL;
     r->quiet = warm && r->mode == KDB_FETCH_SUMMARY;
+    if (hot) {
+      r->hot = true;
+      g->nhot_flight++;
+      atomic_store_explicit(&g_wl_flight, g->nhot_flight, memory_order_relaxed);
+    }
     r->sent_ms = now_ms();
     snprintf(r->view_name, sizeof(r->view_name), "%s", g->view_names[vi]);
     snprintf(r->zone, sizeof(r->zone), "%s", q.zone);
@@ -2856,6 +3025,57 @@ static void on_fetch_readable(ing_t *g) {
   }
 }
 
+static int hot_emit(void *ud) {
+  ing_t *g = ud;
+  if (g->enc.err) return -1;
+  send_enc(g);
+  return g->stream_fd < 0 ? -1 : 0;
+}
+
+/* The hot list the cache thread made goes to the loader (HOT_LIST, in parts); the loader merges it into its state file and answers with HOT_ACK.  A loader that
+ * is not connected, or does not read, gets nothing: the next list is made after hot-list-interval. */
+static void hot_send(ing_t *g) {
+  kdb_hotl_t *l = atomic_exchange_explicit(&g_hot_out, NULL, memory_order_acquire);
+  if (!l) return;
+  if (g->stream_fd >= 0 && g->hello_done && g->out_len - g->out_off < ING_MAX_OUT / 2) {
+    ing_cfg_t snap;
+    snapshot_cfg(&snap);
+    if (kdb_hot_encode(l, &g->enc, KDB_T_HOT_LIST, ++g->hot_seq, snap.hot_size, -1, 0, hot_emit, g) == 0) {
+      atomic_fetch_add_explicit(&g_hot_sent, 1, memory_order_relaxed);
+      atomic_store_explicit(&g_hot_last_n, l->n, memory_order_relaxed);
+      atomic_store_explicit(&g_hot_last_sent, (int64_t)time(NULL), memory_order_relaxed);
+    } else {
+      kdb_enc_reset(&g->enc);
+    }
+  }
+  kdb_hotl_free(l);
+  free(l);
+}
+
+/* warm-before-serve: the workers wait (db_ingest_hold_queries) until the loader's hot list is received and read, or the time is up; this says how it ended */
+static void hold_check(ing_t *g) {
+  if (!g->hold) return;
+  int64_t now = now_ms();
+  bool done = atomic_load_explicit(&g_wl_received, memory_order_acquire) && g->nwarm == 0 && g->nhot_flight == 0;
+  if (!done && now < atomic_load_explicit(&g_hold_deadline_ms, memory_order_relaxed)) return;
+  g->hold = false;
+  atomic_store_explicit(&g_warm_done_ms, now - g->hold_start_ms, memory_order_relaxed);
+  atomic_store_explicit(&g_warm_done, true, memory_order_release);
+  if (done)
+    syslog(LOG_INFO, "[DB] warm-before-serve: the hot list is read (%llu zone(s) loaded, %llu failed); accepting queries after %lld ms",
+           (unsigned long long)atomic_load_explicit(&g_wl_loaded, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_wl_failed, memory_order_relaxed),
+           (long long)(now - g->hold_start_ms));
+  else
+    syslog(LOG_WARNING, "[DB] warm-before-serve: the time is up after %lld ms with the hot list not read (%u queued, %u in flight, list received: %s); accepting queries",
+           (long long)(now - g->hold_start_ms), g->nhot, g->nhot_flight, atomic_load_explicit(&g_wl_received, memory_order_relaxed) ? "yes" : "no");
+}
+
+bool db_ingest_hold_queries(void) {
+  int64_t dl = atomic_load_explicit(&g_hold_deadline_ms, memory_order_relaxed);
+  if (dl == 0 || atomic_load_explicit(&g_warm_done, memory_order_acquire)) return false;
+  return now_ms() < dl;
+}
+
 static void fetch_adopt(ing_t *g, int fd) {
   limit_stream_rights(fd);
   if (g->fetch_fd >= 0) fetch_drop(g);
@@ -2885,6 +3105,51 @@ static void fetch_adopt(ing_t *g, int fd) {
   if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);
 }
 
+/* D1a step 7: the cache thread makes the hot list (design 8.4), a slice at a time, every hot-list-interval; only with memory-limit (the frequencies are kept then)
+ * and loader-state-file.  The list is handed to the ingest thread (one slot); an empty one is not sent: the state file keeps what it has. */
+static void hot_add_cb(void *ud, const char *view, const char *zone) { (void)kdb_hotl_add((kdb_hotl_t *)ud, view, zone); }
+
+static void hot_tick(const ing_cfg_t *c) {
+  static dbreg_hot_t *s_hot;
+  static int64_t s_due;
+  int64_t now = now_ms();
+  if (!s_hot) {
+    if (s_due == 0) s_due = now + (int64_t)c->hot_interval * 1000;
+    if (now < s_due) return;
+    s_hot = dbreg_hot_begin(c->hot_size);
+    if (!s_hot) {
+      s_due = now + 1000;
+      return;
+    }
+  }
+  if (!dbreg_hot_step(s_hot)) return;
+  dbreg_hot_t *h = s_hot;
+  s_hot = NULL;
+  s_due = now + (int64_t)c->hot_interval * 1000;
+  kdb_hotl_t *l = malloc(sizeof(*l));
+  if (!l) {
+    dbreg_hot_free(h);
+    return;
+  }
+  kdb_hotl_init(l);
+  (void)dbreg_hot_emit(h, hot_add_cb, l);
+  if (l->n == 0) {
+    free(l);
+    return;
+  }
+  kdb_hotl_t *old = atomic_exchange_explicit(&g_hot_out, l, memory_order_acq_rel);
+  if (old) {
+    kdb_hotl_free(old);
+    free(old);
+  }
+  int kq = atomic_load_explicit(&g_ing_kick_kq, memory_order_relaxed);
+  if (kq >= 0) {
+    struct kevent t;
+    EV_SET(&t, ING_EVT_HOT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+    (void)kevent(kq, &t, 1, NULL, 0, NULL);
+  }
+}
+
 /* The cache manager (D1a step 5, design 8.2): every 100 ms it reads memory-limit (a reload changes it at once) and, with a limit, runs a round: the
  * zones with the lowest frequency per byte are taken out of memory when the database zones are above the high mark.  Without a limit it only
  * looks at the configuration once a second. */
@@ -2906,6 +3171,7 @@ static void *cache_thread(void *arg) {
       uint32_t n = dbreg_cache_round();
       int64_t dt = now_ms() - t0;
       if (n || dt > 50) syslog(LOG_DEBUG, "[DB] cache round: %u zone(s) taken out in %lld ms", n, (long long)dt);
+      if (c.state_file) hot_tick(&c);
     }
     nanosleep(&ts, NULL);
   }
@@ -2930,6 +3196,7 @@ static void *ingest_thread(void *arg) {
       if (wait_ms < 0 || wait_ms > tick) wait_ms = tick;
     }
     if ((g->nwarm > 0 || (g->apex_walk && g->fetch_fd >= 0)) && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;      /* zones to read before a query asks, or the walk for apexes (while there is a fetch stream): try again soon */
+    if (g->hold && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;           /* warm-before-serve: look at the warm-up and the time often */
     if (wait_ms >= 0) {
       ts.tv_sec = wait_ms / 1000;
       ts.tv_nsec = (wait_ms % 1000) * 1000000;
@@ -2947,6 +3214,8 @@ static void *ingest_thread(void *arg) {
         drain_results(g);
       } else if (e->filter == EVFILT_USER && e->ident == ING_EVT_REQ) {
         process_requests(g);
+      } else if (e->filter == EVFILT_USER && e->ident == ING_EVT_HOT) {
+        hot_send(g);                                     /* D1a step 7: the cache thread made a hot list */
       } else if (e->filter == EVFILT_USER && e->ident == PARK_FETCH_IDENT) {
         fetch_issue(g);                                  /* D1a: a worker parked a query for a zone that is not in memory */
       } else if (e->filter == EVFILT_USER) {
@@ -2968,6 +3237,7 @@ static void *ingest_thread(void *arg) {
     if (g->nwarm > 0) fetch_issue(g);
     apex_walk_step(g);
     fetch_expire(g);
+    hold_check(g);
     if (g->stream_fd >= 0 && g->out_off < g->out_len) out_flush(g);
     if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);
   }
@@ -2992,13 +3262,14 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
     return false;
   }
   limit_ctrl_rights(ctrl_fd);
-  struct kevent ev[5];
+  struct kevent ev[6];
   EV_SET(&ev[0], ctrl_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
   EV_SET(&ev[1], ING_EVT_CONFIG, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev[2], ING_EVT_RESULT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev[3], ING_EVT_REQ, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev[4], PARK_FETCH_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);      /* D1a: a worker asks for a zone */
-  if (kevent(g->kq, ev, 5, NULL, 0, NULL) != 0) {
+  EV_SET(&ev[5], ING_EVT_HOT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);      /* D1a step 7: a hot list to send */
+  if (kevent(g->kq, ev, 6, NULL, 0, NULL) != 0) {
     syslog(LOG_ERR, "[DB] cannot watch the loader control socket: %s", strerror(errno));
     return false;
   }
@@ -3036,6 +3307,11 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
   if (fetch_fd >= 0) fetch_adopt(g, fetch_fd);
   park_fetch_set_notify(g->kq);
   dbreg_cache_set_limit(snap.memory_limit);              /* before the first batch: the startup load already keeps within it */
+  if (snap.warm_wait) {                              /* warm-before-serve: the workers wait for the hot list to be read, at most this long (db_ingest_hold_queries) */
+    g->hold = true;
+    g->hold_start_ms = now_ms();
+    atomic_store_explicit(&g_hold_deadline_ms, g->hold_start_ms + (int64_t)snap.warm_wait * 1000, memory_order_relaxed);
+  }
   atomic_store_explicit(&g_fetch_rate, snap.fetch_rate ? snap.fetch_rate : KARIDNS_DB_FETCH_RATE_DEFAULT, memory_order_relaxed);
   atomic_store_explicit(&g_xfr_timeout_ms, snap.xfr_timeout_ms ? snap.xfr_timeout_ms : KARIDNS_DB_XFR_FETCH_TIMEOUT_DEFAULT, memory_order_relaxed);
   pthread_t t;
@@ -3380,6 +3656,57 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     dbreg_dir_bytes(&nel, &rbytes, &ibytes);
     st_append(&c, "zone directory: %zu elements, %zu bytes in the registry + %zu bytes in the indexes of the views (%zu bytes per zone)\n",
               nel, rbytes, ibytes, nel ? (rbytes + ibytes) / nel : (size_t)0);
+    {
+      /* D1a step 7: what is in memory, how the queries fare, the warm-up and the state file.  The lines above keep their form. */
+      dbreg_residency_t rs;
+      dbreg_residency(&rs);
+      uint64_t parked = cs.misses;
+      st_append(&c, "residency: directory=%zu resident=%zu out_of_memory=%zu evictions=%llu\n", rs.total, rs.resident, rs.absent,
+                (unsigned long long)cs.evictions);
+      if (rs.queries > 0)
+        st_append(&c, "queries: answered=%llu parked=%llu hit_rate=%.1f%% (answered from a zone already in memory / all; the counts are the zones' own)\n",
+                  (unsigned long long)rs.queries, (unsigned long long)parked,
+                  100.0 * (double)(rs.queries > parked ? rs.queries - parked : 0) / (double)rs.queries);
+      else
+        st_append(&c, "queries: answered=0 parked=%llu hit_rate=n/a\n", (unsigned long long)parked);
+      uint64_t wq = atomic_load_explicit(&g_wl_queued, memory_order_relaxed), wl = atomic_load_explicit(&g_wl_loaded, memory_order_relaxed);
+      uint64_t wf = atomic_load_explicit(&g_wl_failed, memory_order_relaxed), wm = atomic_load_explicit(&g_wl_dropmem, memory_order_relaxed);
+      uint32_t wp = atomic_load_explicit(&g_wl_pending, memory_order_relaxed), wi = atomic_load_explicit(&g_wl_flight, memory_order_relaxed);
+      uint64_t gone = wl + wf + wm + wp + wi;
+      uint64_t wskip = wq > gone ? wq - gone : 0;            /* in memory by the time its turn came, or no longer a zone */
+      st_append(&c, "warm: received=%d queued=%llu loaded=%llu skipped=%llu (memory limit %llu, already in memory or gone %llu) failed=%llu pending=%u in_flight=%u\n",
+                atomic_load_explicit(&g_wl_received, memory_order_relaxed) ? 1 : 0, (unsigned long long)wq, (unsigned long long)wl,
+                (unsigned long long)(wskip + wm), (unsigned long long)wm, (unsigned long long)wskip, (unsigned long long)wf, wp, wi);
+      int64_t hold_dl = atomic_load_explicit(&g_hold_deadline_ms, memory_order_relaxed);
+      if (!hold_dl)
+        st_append(&c, "warm-before-serve: off\n");
+      else if (atomic_load_explicit(&g_warm_done, memory_order_acquire))
+        st_append(&c, "warm-before-serve: queries accepted after %lld ms\n", (long long)atomic_load_explicit(&g_warm_done_ms, memory_order_relaxed));
+      else
+        st_append(&c, "warm-before-serve: holding the queries (%lld ms left)\n", (long long)(hold_dl - now_ms() > 0 ? hold_dl - now_ms() : 0));
+      char sfp[1100] = "";
+      rcu_aux_read_lock();
+      const server_config_t *scfg = acquire_config_snapshot();
+      if (scfg && scfg->database.loader_state_file) snprintf(sfp, sizeof(sfp), "%s", scfg->database.loader_state_file);
+      rcu_aux_read_unlock();
+      if (!sfp[0]) {
+        st_append(&c, "state-file: none (loader-state-file is not set)\n");
+      } else {
+        static const char *const fs[KDB_HF_N] = { "none", "loaded", "missing (first start)", "corrupt, ignored", "unreadable, ignored" };
+        int fst = atomic_load_explicit(&g_sf_fstate, memory_order_relaxed);
+        int ls = atomic_load_explicit(&g_hot_last_status, memory_order_relaxed);
+        static const char *const as[KDB_HA_N] = { "written", "unchanged", "failed", "no state file", "list not valid" };
+        char t4[40];
+        fmt_time(atomic_load_explicit(&g_hot_last_sent, memory_order_relaxed), t4, sizeof(t4));
+        st_append(&c, "state-file: %s at_start=%s (%u zones) hot_lists_sent=%llu last_sent=%s (%u zones) acks: written=%llu unchanged=%llu failed=%llu last_ack=%s (%u zones in the file)%s\n",
+                  sfp, fst >= 0 && fst < KDB_HF_N ? fs[fst] : "not reported yet", atomic_load_explicit(&g_sf_fzones, memory_order_relaxed),
+                  (unsigned long long)atomic_load_explicit(&g_hot_sent, memory_order_relaxed), atomic_load_explicit(&g_hot_last_sent, memory_order_relaxed) ? t4 : "never",
+                  atomic_load_explicit(&g_hot_last_n, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_hot_acks[KDB_HA_WRITTEN], memory_order_relaxed),
+                  (unsigned long long)atomic_load_explicit(&g_hot_acks[KDB_HA_UNCHANGED], memory_order_relaxed),
+                  (unsigned long long)atomic_load_explicit(&g_hot_acks[KDB_HA_FAILED], memory_order_relaxed), ls >= 0 && ls < KDB_HA_N ? as[ls] : "none yet",
+                  atomic_load_explicit(&g_hot_last_zones, memory_order_relaxed), dbreg_cache_limit() ? "" : " [no memory-limit: no hot list is made]");
+      }
+    }
   }
   fmt_time(atomic_load(&g_st.batch_time), t2, sizeof(t2));
   if (atomic_load(&g_st.batch_id) == 0)

@@ -653,6 +653,7 @@ static void free_database_config(database_config_t *db) {
   free(db->loader_user);
   free(db->loader_group);
   free(db->loader_path);
+  free(db->loader_state_file);
   free_str_list(db->acl_ceiling, db->acl_ceiling_count);
   free(db->acl_ceiling_parsed);
   free_str_list(db->acl_ceiling_keys, db->acl_ceiling_keys_count);
@@ -6159,6 +6160,22 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     db->fetch_rate = (uint32_t)u;
     return 0;
   }
+  if (strcmp(key, "loader-state-file") == 0) return db_take_string(ctx, "database", key, KARIDNS_DB_PATH_MAX, &db->loader_state_file);     /* the hot list (design 8.4): restart-only, the loader writes it */
+  if (strcmp(key, "warm-before-serve") == 0) {        /* seconds to hold back the queries until the zones of the hot list are read (0 = do not wait) */
+    if (db_take_uint(ctx, key, false, 0, KARIDNS_DB_WARM_WAIT_MAX, &u) != 0) return -1;
+    db->warm_before_serve = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "hot-list-size") == 0) {            /* the zones most asked for that the hot list keeps */
+    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_HOT_LIST_MAX, &u) != 0) return -1;
+    db->hot_list_size = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "hot-list-interval") == 0) {        /* seconds between two hot lists */
+    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_HOT_INTERVAL_MAX, &u) != 0) return -1;
+    db->hot_list_interval = (uint32_t)u;
+    return 0;
+  }
   if (strcmp(key, "memory-limit") == 0)       /* K, M, G suffixes (up to 1024G); unset = no limit (every database zone stays in memory) */
     return db_take_uint(ctx, key, true, KARIDNS_DB_MEMORY_LIMIT_MIN, KARIDNS_DB_MEMORY_LIMIT_MAX, &db->memory_limit);
   if (strcmp(key, "acl-ceiling") == 0) {
@@ -6750,6 +6767,7 @@ static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
     /* the control-channel and dnstap sockets are NOT prefixed: a UNIX socket path holds 103 bytes (sun_path), a deep directory would overflow
      * it, and the server chdir()s to the directory at start-up (and daemonize() no longer leaves it), so the relative name resolves there */
     ok = ok && dir_prefix_path(&config->database.database_file, eff) && dir_prefix_path(&config->database.conninfo_file, eff);
+    ok = ok && dir_prefix_path(&config->database.loader_state_file, eff);
     if (!ok) goto oom;
   }
   /* what is still relative (no directory, or a relative directory without a startup directory) and is opened after daemonize() */
@@ -6758,6 +6776,7 @@ static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
   if (path_absolutize(ctx, &config->database.database_file, "database database-file", KARIDNS_DB_PATH_MAX) != 0 ||
       path_absolutize(ctx, &config->database.conninfo_file, "database conninfo-file", KARIDNS_DB_PATH_MAX) != 0 ||
       path_absolutize(ctx, &config->database.loader_path, "database loader-path", KARIDNS_DB_PATH_MAX) != 0) goto out;
+  if (path_absolutize(ctx, &config->database.loader_state_file, "database loader-state-file", KARIDNS_DB_PATH_MAX) != 0) goto out;
   for (view_config_t *v = config->views; v; v = v->next)
     if (path_absolutize(ctx, &v->database_file, "view database-file", KARIDNS_DB_PATH_MAX) != 0) goto out;
   rc = 0;

@@ -1064,6 +1064,16 @@ void dbreg_cache_set_limit(uint64_t limit);
 uint64_t dbreg_cache_limit(void);
 uint32_t dbreg_cache_round(void);
 void dbreg_cache_stats(dbreg_cache_stats_t *out);
+/* D1a step 7 (design 8.4): the zones most asked for.  dbreg_hot_begin() starts a pass, dbreg_hot_step() does one slice of it (true: the pass is over), and
+ * dbreg_hot_emit() hands the n_max with the highest frequency to add(), hottest first, and frees the pass.  Called by the ingest thread's cache thread only. */
+typedef struct dbreg_hot dbreg_hot_t;
+dbreg_hot_t *dbreg_hot_begin(uint32_t n_max);          /* NULL: out of memory, or n_max 0 */
+bool dbreg_hot_step(dbreg_hot_t *h);
+uint32_t dbreg_hot_emit(dbreg_hot_t *h, void (*add)(void *ud, const char *view, const char *zone), void *ud);
+void dbreg_hot_free(dbreg_hot_t *h);                   /* a pass that is given up */
+/* what the directory holds (karictl dbstatus): zones with data in memory, without, and the queries the database zones in memory answered (and those of the entries taken out) */
+typedef struct { size_t total, resident, absent; uint64_t queries; } dbreg_residency_t;
+void dbreg_residency(dbreg_residency_t *out);
 #ifdef KARIDNS_UNIT_TEST
 void dbreg_cache_test_pause(bool on);                              /* TEST ONLY: the manager does nothing while paused */
 void dbreg_cache_test_set_victim_freq(uint32_t f);                 /* TEST ONLY: the frequency a zone that is loaded now is compared with */
@@ -1113,6 +1123,7 @@ void dbreg_note_no_apex(const char *view, const char *zone, int64_t source_id);
  * read whole, else only its summary (for the apex) is asked for. */
 bool dbreg_warm_mark(const char *view, const char *zone);
 bool dbreg_warm_take(const char *view, const char *zone, bool *whole);
+bool dbreg_warm_take_hot(const char *view, const char *zone);       /* D1a step 7: a zone of the hot list; true when it is to be read whole */
 /* D1a step 6 (design 12-12): does the zone keep the apex of its summary (notify or allow-transfer)?  The _cfg form takes the configuration the caller holds in a
  * read section.  dbreg_settings_ref(): the settings the registry kept for a zone out of memory, one reference (zone_ext_shared_unref()). */
 bool dbreg_apex_wanted(const char *view, const char *zone, const zone_ext_shared_t *sh);

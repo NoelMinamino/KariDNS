@@ -57,6 +57,9 @@ make karidns-dbloader DB_DRIVERS="sqlite3 postgresql"
 `--check`
 : Check mode, what `karicheck db` runs. It reads the same tables through the same code as the production load, sends nothing, writes nothing to the database, and prints what is wrong or odd as lines of the check protocol on standard output (the schema, every zone with the checks of `karicheck zone`, the settings texts, the views a zone is mapped to). Run it as the user the loader runs as; its output is meant to be read by `karicheck`. No `--dump`.
 
+`--state-file PATH`
+: With `-s` (started by `karidns` when `loader-state-file` is set): the file the loader keeps the hot list in (D1a step 7). The loader reads it at its start, sends its zones to the Backend as `WARM_LIST` after the startup load, and writes it again (`PATH.tmp`, mode 0600, `fsync`, `rename`) when the Backend sends a `HOT_LIST`, merged with what it had. A file that is missing is the first start; one that is empty, truncated, damaged (the last line is `END <count> <checksum>`) or larger than 64 MiB is ignored with a log line and replaced by the next list. The loader user needs write permission on the **directory** of the file. The Backend never names this path to the loader (it comes from the command line the supervisor builds from `karidns.conf`), so a compromised Backend cannot make the loader write anywhere. With `--check`: check that the loader can use it (the directory exists and can be written, the file can be read and is valid); `karicheck db` passes it.
+
 `--drivers`
 : Print the compiled-in drivers, one per line, and exit.
 
@@ -108,6 +111,15 @@ D1a (milestone 2). `karidns` starts the loader with a second socket, descriptor 
 - **The end of the stream.** The fetch stream is as vital as the first one: when the Backend closes it (it does after a protocol error of the loader, a full send buffer or an out-of-memory) or it breaks, the loader ends with status 3 and the supervisor starts another one with a new pair of streams (after the usual 1, 2, 4 ... 60 s). A loader that went on without a fetch stream would fail every later fetch "not connected" until it died for some other reason.
 - **Inventory.** The Backend's `INVENTORY` entries have a `resident` flag (0 for a zone whose data was taken out of memory or left out because of `memory-limit`: the entry then carries the serial and no digest). A zone that is not resident is not sent by a full comparison (no digest to compare); a zone that changed still is.
 - **Not in this milestone.** The settings text and the addresses of name servers outside the zone in the summary (design 7), and a request for a range of a zone.
+
+## THE HOT LIST AND THE STATE FILE
+
+D1a step 7. With `--state-file` the loader keeps, for the Backend, the list of the zones that are asked for most (see `karidns.conf`, `loader-state-file`, `hot-list-size`, `hot-list-interval` and `warm-before-serve`). Two messages on the first stream carry it, both in parts (at most 16384 zones and 1 MiB each; the zones are named by view name and zone name, because the file outlives a reconfiguration):
+
+- **`HOT_LIST`** (Backend to loader): the zones most asked for, hottest first, with the size the file may have. The loader checks it as it checks everything the Backend sends: at most 100000 zones, the parts in order (a part that does not follow drops the list, not the stream), a view that its CONFIG does not have is dropped, the names are canonical (the stream decoder refuses anything else). When the last part has come the loader merges it into the list of the file (the new zones first, then the zones of the old list that are not in the new one, up to the size), writes the file if the list changed, and answers **`HOT_ACK`** (written, unchanged, failed with the reason, or no file configured). A HOT_ACK is sent between two batches, never inside one.
+- **`WARM_LIST`** (loader to Backend): once, after the startup load, the zones of the file in order (an empty list when the file is missing or damaged), with what the loader found in the file at its start (`loaded`, `missing`, `corrupt`, `unreadable`) for `karictl dbstatus`.
+
+The file is text: `KARIDNS-HOT-LIST 1`, one line `view<TAB>zone` for each zone, hottest first, and `END <count> <checksum>` (FNV-1a over the entry lines, eight hex digits). **Permissions.** The loader runs as `loader-user` and writes in the directory of the file: give it a directory of its own, owned by `loader-user`, mode 0700 (`install -d -o karidns-db -m 0700 /var/db/karidns/state`). The file is created with mode 0600. The Backend, in capability mode, never opens it. The file is not trusted when it is read: it may be damaged, or written by somebody who could write in the directory; whatever its contents, the Backend reads only zones it has in its directory, at most 100000 of them, at the rate of `fetch-rate`.
 
 ## EXIT STATUS
 
@@ -360,6 +372,9 @@ R	0	0	1
 
 `/usr/local/share/karidns/db/`
 : The SQL files above (database packages; `db/` in a source tree).
+
+the file of `loader-state-file` (default: none)
+: The hot list (above), text, mode 0600, written by the loader in its own directory.
 
 `tests/db/gen_sqlite3_zones.sh`
 : The generator of the measurement databases (source tree).

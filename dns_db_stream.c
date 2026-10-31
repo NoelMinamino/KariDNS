@@ -1,12 +1,18 @@
 /*
  * dns_db_stream.c - KDB1 stream codec and Backend-side state machine (see dns_db_stream.h).
  *
- * No I/O.  The decoder and the state machine never allocate; only the encoder (malloc) does.
+ * No I/O, except the hot list's state file at the end (kdb_hotl_file_read / write: the loader's, never called by the Backend).  The decoder and the
+ * state machine never allocate; only the encoder and the hot list (malloc) do.
  * All counts and sums that depend on the stream are 64-bit and compared against limits by subtraction.
  */
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include "dns_db_stream.h"
 #include "dns_utils.h"
 
@@ -105,6 +111,16 @@ static const kdb_tspec_t sp_fetch_req[] = {
     S(KT_U64, KS_REQ, 0), S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_FETCH_PRIO_N - 1),
     S(KT_U8, KS_REQ | KS_MAXV, KDB_FETCH_SUMMARY), S(KT_NAME, 0, 0), S(KT_NAME, 0, 0) };
 TDEF(td_fetch_req, "FETCH_REQ", sp_fetch_req);
+/* D1a step 7: HOT_LIST (Backend -> loader) and WARM_LIST (loader -> Backend) have one layout; tag 5 is for the first, 6 and 7 for the second */
+static const kdb_tspec_t sp_hot_entry[] = { S(KT_STR, KS_REQ | KS_NE, 255), S(KT_NAME, KS_REQ, 0) };
+TDEF(td_hot_entry, "HOT_LIST.ENTRY", sp_hot_entry);
+static const kdb_tspec_t sp_hot_list[] = {
+    S(KT_U64, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 1), { KT_NEST, 0, KDB_HOT_PART_MAX, &td_hot_entry },
+    S(KT_U32, KS_MAXV, KDB_HOT_MAX), S(KT_U8, KS_MAXV, KDB_HF_N - 1), S(KT_U32, KS_MAXV, KDB_HOT_MAX) };
+TDEF(td_hot_list, "HOT_LIST", sp_hot_list);
+TDEF(td_warm_list, "WARM_LIST", sp_hot_list);
+static const kdb_tspec_t sp_hot_ack[] = { S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_HA_N - 1), S(KT_U32, KS_REQ, 0), S(KT_STR, 0, 255) };
+TDEF(td_hot_ack, "HOT_ACK", sp_hot_ack);
 
 _Static_assert(sizeof(sp_zone_begin) / sizeof(sp_zone_begin[0]) <= KDB_MAX_TAGS, "kdb_val_t arrays are KDB_MAX_TAGS long");
 _Static_assert(sizeof(sp_cfg_view) / sizeof(sp_cfg_view[0]) <= KDB_MAX_TAGS, "kdb_val_t arrays are KDB_MAX_TAGS long");
@@ -129,6 +145,8 @@ static const kdb_mdef_t mdefs[] = {
     { KDB_T_PROFILE, "PROFILE", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_profile },
     { KDB_T_BATCH_END, "BATCH_END", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_batch_end },
     { KDB_T_AUTO_STATUS, "AUTO_STATUS", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_auto_status },
+    { KDB_T_WARM_LIST, "WARM_LIST", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_warm_list },
+    { KDB_T_HOT_ACK, "HOT_ACK", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_hot_ack },
     { KDB_T_CONFIG, "CONFIG", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_config },
     { KDB_T_RELOAD_REQ, "RELOAD_REQ", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_reload_req },
     { KDB_T_INVENTORY, "INVENTORY", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_inventory },
@@ -136,6 +154,7 @@ static const kdb_mdef_t mdefs[] = {
     { KDB_T_ZONE_RESULT, "ZONE_RESULT", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_zone_result },
     { KDB_T_BATCH_RESULT, "BATCH_RESULT", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_batch_result },
     { KDB_T_FETCH_REQ, "FETCH_REQ", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_fetch_req },
+    { KDB_T_HOT_LIST, "HOT_LIST", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_hot_list },
 };
 #define NMDEFS (sizeof(mdefs) / sizeof(mdefs[0]))
 
@@ -483,6 +502,26 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         m->u.auto_status.n_entries = nrep;
         m->u.auto_status.body = fr->body;
         m->u.auto_status.body_len = fr->len;
+        break;
+    case KDB_T_HOT_LIST:
+    case KDB_T_WARM_LIST: {
+        kdb_hot_list_t *h = &m->u.hot_list;
+        h->list_id = V(1).u;
+        h->part = (uint32_t)V(2).u;
+        h->last = V(3).u != 0;
+        h->n_entries = nrep;
+        h->limit = V(5).present ? (uint32_t)V(5).u : 0;
+        h->file_state = V(6).present ? (int)V(6).u : -1;
+        h->file_zones = V(7).present ? (uint32_t)V(7).u : 0;
+        h->body = fr->body;
+        h->body_len = fr->len;
+        break;
+    }
+    case KDB_T_HOT_ACK:
+        m->u.hot_ack.list_id = V(1).u;
+        m->u.hot_ack.status = (uint8_t)V(2).u;
+        m->u.hot_ack.zones = (uint32_t)V(3).u;
+        m->u.hot_ack.error = gstr(&V(4));
         break;
     case KDB_T_CONFIG:
         m->u.config.generation = V(1).u;
@@ -845,7 +884,7 @@ static bool sm_legal(const kdb_sm_t *sm, uint16_t t) {
     case KDB_S_AWAIT_HELLO: return t == KDB_T_HELLO;
     case KDB_S_READY:
         return (t == KDB_T_INVENTORY_REQ && !sm->inventory_req_seen && !sm->batch_seen) || t == KDB_T_BATCH_BEGIN ||
-               t == KDB_T_AUTO_STATUS;
+               t == KDB_T_AUTO_STATUS || t == KDB_T_WARM_LIST || t == KDB_T_HOT_ACK;
     case KDB_S_IN_BATCH:
         return t == KDB_T_ZONE_BEGIN || t == KDB_T_ZONE_FAILED || t == KDB_T_ZONE_DELETE || t == KDB_T_PROFILE ||
                t == KDB_T_BATCH_END;
@@ -873,7 +912,9 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         sm->inventory_req_seen = true;
         break;
     case KDB_T_AUTO_STATUS:
-        break;                                   /* B9: informational, no state change */
+    case KDB_T_WARM_LIST:
+    case KDB_T_HOT_ACK:
+        break;                                   /* B9, D1a step 7: informational, no state change */
     case KDB_T_BATCH_BEGIN:
         sm->batch_seen = true;
         sm->batch_id = m->u.batch_begin.batch_id;
@@ -953,4 +994,306 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         SMFAIL(sm, KDB_E_STATE, "%s not allowed from the loader", kdb_type_name(fr->type));
     }
     return KDB_OK;
+}
+
+/* ------------------------------------------------------------------ hot list (D1a step 7, design 8.4) */
+void kdb_hotl_init(kdb_hotl_t *l) { memset(l, 0, sizeof(*l)); }
+void kdb_hotl_free(kdb_hotl_t *l) { free(l->buf); memset(l, 0, sizeof(*l)); }
+void kdb_hotl_clear(kdb_hotl_t *l) { l->len = 0; l->n = 0; }
+
+static bool hot_view_ok(const char *v, size_t n) {
+    return n >= 1 && n <= 255 && str_ok((const uint8_t *)v, n, false);
+}
+
+bool kdb_hotl_add(kdb_hotl_t *l, const char *view, const char *zone) {
+    size_t vn = strlen(view), zn = strlen(zone);
+    if (l->n >= KDB_HOT_MAX || !hot_view_ok(view, vn) || !name_ok((const uint8_t *)zone, zn)) return false;
+    size_t need = vn + 1 + zn + 1;
+    if (need > SIZE_MAX - l->len) return false;
+    if (l->len + need > l->cap) {
+        size_t nc = l->cap ? l->cap : 1024;
+        while (nc < l->len + need) {
+            if (nc > SIZE_MAX / 2) return false;
+            nc *= 2;
+        }
+        char *nb = realloc(l->buf, nc);
+        if (!nb) return false;
+        l->buf = nb;
+        l->cap = nc;
+    }
+    memcpy(l->buf + l->len, view, vn + 1);
+    memcpy(l->buf + l->len + vn + 1, zone, zn + 1);
+    l->len += need;
+    l->n++;
+    return true;
+}
+
+bool kdb_hotl_next(const kdb_hotl_t *l, size_t *pos, const char **view, const char **zone) {
+    if (*pos >= l->len) return false;
+    const char *v = l->buf + *pos;
+    size_t vn = strlen(v);
+    const char *z = v + vn + 1;
+    *view = v;
+    *zone = z;
+    *pos += vn + 1 + strlen(z) + 1;
+    return true;
+}
+
+bool kdb_hotl_equal(const kdb_hotl_t *a, const kdb_hotl_t *b) {
+    return a->n == b->n && a->len == b->len && (a->len == 0 || memcmp(a->buf, b->buf, a->len) == 0);
+}
+
+static uint32_t hot_fnv(uint32_t h, const void *p, size_t n) {
+    const uint8_t *b = p;
+    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 16777619u;
+    return h;
+}
+
+bool kdb_hotl_merge(const kdb_hotl_t *fresh, const kdb_hotl_t *old, uint32_t limit, kdb_hotl_t *out) {
+    kdb_hotl_clear(out);
+    if (limit == 0 || limit > KDB_HOT_MAX) limit = KDB_HOT_MAX;
+    size_t cap = 16;
+    while (cap < ((size_t)fresh->n + old->n) * 2) cap *= 2;
+    const char **tab = calloc(cap, sizeof(*tab));            /* the start of a pair ("view\0zone\0") in fresh or old */
+    if (!tab) return false;
+    const kdb_hotl_t *src[2] = { fresh, old };
+    bool ok = true;
+    for (int s = 0; s < 2 && ok; s++) {
+        size_t pos = 0;
+        const char *v, *z;
+        while (out->n < limit && kdb_hotl_next(src[s], &pos, &v, &z)) {
+            uint32_t h = hot_fnv(hot_fnv(2166136261u, v, strlen(v) + 1), z, strlen(z));
+            size_t i = h & (cap - 1);
+            bool dup = false;
+            while (tab[i]) {
+                const char *tv = tab[i], *tz = tv + strlen(tv) + 1;
+                if (strcmp(tv, v) == 0 && strcmp(tz, z) == 0) {
+                    dup = true;
+                    break;
+                }
+                i = (i + 1) & (cap - 1);
+            }
+            if (dup) continue;
+            tab[i] = v;
+            if (!kdb_hotl_add(out, v, z)) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    free(tab);
+    return ok;
+}
+
+int kdb_hot_encode(const kdb_hotl_t *l, kdb_enc_t *e, uint16_t type, uint64_t list_id, uint32_t limit, int file_state, uint32_t file_zones,
+                   int (*emit)(void *ud), void *ud) {
+    size_t pos = 0;
+    uint32_t part = 0;
+    const char *v = NULL, *z = NULL;
+    bool more = kdb_hotl_next(l, &pos, &v, &z);
+    for (;;) {
+        if (kdb_enc_begin(e, type) != 0 || kdb_enc_u64(e, 1, list_id) != 0 || kdb_enc_u32(e, 2, part) != 0) return -1;
+        uint32_t n = 0;
+        while (more && n < KDB_HOT_PART_MAX) {
+            size_t need = 4 + (4 + strlen(v)) + (4 + strlen(z));
+            size_t body = e->len - e->msg_start - KDB_HEADER_LEN;
+            if (n > 0 && body + need + 64 > KDB_MAX_BODY) break;        /* (64: the tags that follow the entries) */
+            if (kdb_enc_nest_begin(e, 4) != 0 || kdb_enc_str(e, 1, v) != 0 || kdb_enc_name(e, 2, z) != 0 || kdb_enc_nest_end(e) != 0) return -1;
+            n++;
+            more = kdb_hotl_next(l, &pos, &v, &z);
+        }
+        if (kdb_enc_u8(e, 3, more ? 0 : 1) != 0) return -1;
+        if (limit && kdb_enc_u32(e, 5, limit) != 0) return -1;
+        if (file_state >= 0 && (kdb_enc_u8(e, 6, (uint8_t)file_state) != 0 || kdb_enc_u32(e, 7, file_zones) != 0)) return -1;
+        if (kdb_enc_end(e) != 0) return -1;
+        if (emit(ud) != 0) return -1;
+        kdb_enc_reset(e);
+        if (!more) return 0;
+        part++;
+    }
+}
+
+void kdb_hot_entries(const kdb_msg_t *m, kdb_iter_t *it) {
+    bool ok = m->type == KDB_T_HOT_LIST || m->type == KDB_T_WARM_LIST;
+    it->p = ok ? m->u.hot_list.body : NULL;
+    it->left = ok ? m->u.hot_list.body_len : 0;
+    it->view_count = KDB_VIEWS_ANY;
+}
+
+bool kdb_hot_entries_next(kdb_iter_t *it, char view[256], char zone[DNS_NAME_TEXT_SIZE]) {
+    kdb_val_t vals[KDB_MAX_TAGS];
+    if (!nest_next(it, 4, &td_hot_entry, vals)) return false;
+    memcpy(view, V(1).p, V(1).len);
+    view[V(1).len] = '\0';
+    gname(zone, &V(2));
+    return true;
+}
+
+/* ---- the state file */
+#define HOT_HDR "KARIDNS-HOT-LIST 1\n"
+
+char *kdb_hotl_serialize(const kdb_hotl_t *l, size_t *len) {
+    size_t cap = sizeof(HOT_HDR) + l->len + l->n + 64;      /* each pair gains a TAB and a newline in place of two NULs; the END line */
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    size_t o = sizeof(HOT_HDR) - 1;
+    memcpy(out, HOT_HDR, o);
+    uint32_t sum = 2166136261u;
+    size_t pos = 0;
+    const char *v, *z;
+    while (kdb_hotl_next(l, &pos, &v, &z)) {
+        size_t start = o;
+        size_t vn = strlen(v), zn = strlen(z);
+        memcpy(out + o, v, vn);
+        o += vn;
+        out[o++] = '\t';
+        memcpy(out + o, z, zn);
+        o += zn;
+        out[o++] = '\n';
+        sum = hot_fnv(sum, out + start, o - start);
+    }
+    int n = snprintf(out + o, cap - o, "END %u %08x\n", (unsigned)l->n, (unsigned)sum);
+    *len = o + (size_t)n;
+    return out;
+}
+
+bool kdb_hotl_parse(const char *buf, size_t len, kdb_hotl_t *out, char *why, size_t wl) {
+#define PFAIL(...) do { snprintf(why, wl, __VA_ARGS__); kdb_hotl_clear(out); return false; } while (0)
+    kdb_hotl_clear(out);
+    if (len == 0) PFAIL("the file is empty");
+    if (len < sizeof(HOT_HDR) - 1 || memcmp(buf, HOT_HDR, sizeof(HOT_HDR) - 1) != 0) PFAIL("no \"KARIDNS-HOT-LIST 1\" header");
+    size_t off = sizeof(HOT_HDR) - 1;
+    uint32_t sum = 2166136261u;
+    for (unsigned line = 2;; line++) {
+        if (off >= len) PFAIL("truncated: no END line");
+        const char *p = buf + off;
+        const char *nl = memchr(p, '\n', len - off);
+        if (!nl) PFAIL("truncated: line %u has no end", line);
+        size_t ll = (size_t)(nl - p);
+        const char *tab = memchr(p, '\t', ll);
+        if (!tab) {                                            /* the END line, or garbage */
+            char tmp[48];
+            if (ll < 5 || ll >= sizeof(tmp) || memcmp(p, "END ", 4) != 0) PFAIL("line %u is neither an entry nor the END line", line);
+            memcpy(tmp, p, ll);
+            tmp[ll] = '\0';
+            char *e1, *e2;
+            unsigned long cnt = strtoul(tmp + 4, &e1, 10);
+            if (e1 == tmp + 4 || *e1 != ' ') PFAIL("the END line is not \"END <count> <checksum>\"");
+            unsigned long want = strtoul(e1 + 1, &e2, 16);
+            if (e2 != e1 + 9 || *e2 != '\0' || want > 0xFFFFFFFFul) PFAIL("the END line is not \"END <count> <checksum>\"");
+            if (cnt != out->n) PFAIL("the END line counts %lu entries, the file has %u", cnt, (unsigned)out->n);
+            if ((uint32_t)want != sum) PFAIL("the checksum does not match");
+            if (off + ll + 1 != len) PFAIL("bytes after the END line");
+            return true;
+        }
+        size_t vn = (size_t)(tab - p), zn = ll - vn - 1;
+        char v[256], z[DNS_NAME_TEXT_SIZE];
+        if (vn == 0 || vn >= sizeof(v) || zn == 0 || zn >= sizeof(z)) PFAIL("line %u: view or zone name length", line);
+        memcpy(v, p, vn);
+        v[vn] = '\0';
+        memcpy(z, tab + 1, zn);
+        z[zn] = '\0';
+        if (!kdb_hotl_add(out, v, z)) PFAIL("line %u is not a valid entry, or the list is too long", line);
+        sum = hot_fnv(sum, p, ll + 1);
+        off += ll + 1;
+    }
+#undef PFAIL
+}
+
+int kdb_hotl_file_read(const char *path, kdb_hotl_t *out, char *why, size_t wl) {
+    kdb_hotl_clear(out);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) {
+            snprintf(why, wl, "no such file");
+            return KDB_HF_MISSING;
+        }
+        snprintf(why, wl, "%s", strerror(errno));
+        return KDB_HF_UNREADABLE;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        snprintf(why, wl, "%s", strerror(errno));
+        close(fd);
+        return KDB_HF_UNREADABLE;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        snprintf(why, wl, "not a regular file");
+        close(fd);
+        return KDB_HF_UNREADABLE;
+    }
+    if (st.st_size < 0 || (uint64_t)st.st_size > KDB_HOT_FILE_MAX) {
+        snprintf(why, wl, "the file is larger than %u bytes", (unsigned)KDB_HOT_FILE_MAX);
+        close(fd);
+        return KDB_HF_CORRUPT;
+    }
+    size_t cap = (size_t)st.st_size + 1, n = 0;
+    char *b = malloc(cap);
+    if (!b) {
+        snprintf(why, wl, "out of memory");
+        close(fd);
+        return KDB_HF_UNREADABLE;
+    }
+    int rc = KDB_HF_LOADED;
+    for (;;) {
+        ssize_t r = read(fd, b + n, cap - n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) {
+            snprintf(why, wl, "%s", strerror(errno));
+            rc = KDB_HF_UNREADABLE;
+            break;
+        }
+        if (r == 0) break;
+        n += (size_t)r;
+        if (n == cap) {                                        /* it grew while we read it */
+            snprintf(why, wl, "the file changed while it was read");
+            rc = KDB_HF_CORRUPT;
+            break;
+        }
+    }
+    close(fd);
+    if (rc == KDB_HF_LOADED && !kdb_hotl_parse(b, n, out, why, wl)) rc = KDB_HF_CORRUPT;
+    free(b);
+    return rc;
+}
+
+int kdb_hotl_file_write(const char *path, const kdb_hotl_t *l, char *err, size_t el) {
+    char tmp[PATH_MAX];
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) {
+        snprintf(err, el, "the path is too long");
+        return -1;
+    }
+    size_t len = 0;
+    char *data = kdb_hotl_serialize(l, &len);
+    if (!data) {
+        snprintf(err, el, "out of memory");
+        return -1;
+    }
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        snprintf(err, el, "cannot create %s: %s", tmp, strerror(errno));
+        free(data);
+        return -1;
+    }
+    size_t done = 0;
+    int bad = 0;
+    while (done < len) {
+        ssize_t w = write(fd, data + done, len - done);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) {
+            bad = errno ? errno : EIO;
+            break;
+        }
+        done += (size_t)w;
+    }
+    free(data);
+    if (!bad && fsync(fd) != 0) bad = errno;
+    if (close(fd) != 0 && !bad) bad = errno;
+    if (!bad && rename(tmp, path) != 0) bad = errno;
+    if (bad) {
+        snprintf(err, el, "cannot write %s: %s", path, strerror(bad));
+        (void)unlink(tmp);
+        return -1;
+    }
+    return 0;
 }

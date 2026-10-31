@@ -7,6 +7,7 @@
  *   bit 5      tiny zone limits (6 records, 200 bytes) so the limit paths are reachable
  *   bit 4      (install run only) start inside a batch, so a stream of ZONE_BEGIN .. ZONE_END is a valid input
  *   bit 3      D1a: the state machine of the fetch stream (kdb_sm_init_fetch(): request ids, summaries, no batches)
+ *   bit 2      D1a step 7: the rest is not a stream but a hot list state file (kdb_hotl_parse(), the merge, the serializer, the parts encoder)
  * The stream is run twice against the loader -> Backend side (whole buffer and the chosen chunking) and must
  * give the same result; once against the Backend -> loader side with the decoder and the entry iterators; and once
  * more through the install path of the Backend (beta design 8.5, milestone B4b): every ZONE_BEGIN / ZONE_DATA /
@@ -72,7 +73,7 @@ static void run_loader(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, ru
                 mix(&r->sum, m.u.zone_begin.rr_count + strlen(m.u.zone_begin.name) + m.u.zone_begin.request_id);
                 /* D1a: what the machine promised about the fetch stream */
                 if ((sm.fetch != (m.u.zone_begin.request_id != 0))) abort();
-                if ((m.u.zone_begin.flags & KDB_ZF_SUMMARY) && (!sm.fetch || m.u.zone_begin.rr_count != 0 || m.u.zone_begin.zone_kind != KDB_ZK_PRIMARY)) abort();
+                if ((m.u.zone_begin.flags & KDB_ZF_SUMMARY) && m.u.zone_begin.rr_count != 0) abort();      /* (a summary has no data; since milestone 4 a batch may carry one too, and a secondary zone is no exception) */
             }
             if (fr.type == KDB_T_ZONE_FAILED) {
                 mix(&r->sum, m.u.zone_failed.request_id);
@@ -80,6 +81,24 @@ static void run_loader(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, ru
             }
             if (fr.type == KDB_T_ZONE_DATA) mix(&r->sum, m.u.zone_data.ancount);
             if (fr.type == KDB_T_PROFILE) mix(&r->sum, m.u.profile.settings.len);
+            if (fr.type == KDB_T_WARM_LIST) {               /* D1a step 7: the entries the decoder validated, a view name and a canonical zone name each */
+                kdb_iter_t it;
+                char hv[256], hz[DNS_NAME_TEXT_SIZE];
+                uint32_t k = 0;
+                kdb_hot_entries(&m, &it);
+                while (kdb_hot_entries_next(&it, hv, hz)) {
+                    if (hv[0] == '\0' || hz[0] == '\0' || hz[strlen(hz) - 1] != '.') abort();
+                    mix(&r->sum, strlen(hv) + strlen(hz));
+                    k++;
+                }
+                if (k != m.u.hot_list.n_entries || m.u.hot_list.n_entries > KDB_HOT_PART_MAX) abort();
+                if (m.u.hot_list.file_state >= KDB_HF_N) abort();
+                mix(&r->sum, m.u.hot_list.list_id + m.u.hot_list.part + (m.u.hot_list.last ? 1u : 0u));
+            }
+            if (fr.type == KDB_T_HOT_ACK) {
+                if (m.u.hot_ack.status >= KDB_HA_N) abort();
+                mix(&r->sum, m.u.hot_ack.list_id + m.u.hot_ack.zones + m.u.hot_ack.error.len);
+            }
             if (fr.type == KDB_T_AUTO_STATUS) {            /* B9: the iterator sees exactly the validated entries */
                 kdb_iter_t it;
                 kdb_auto_status_entry_t en;
@@ -132,6 +151,16 @@ static void run_backend(const uint8_t *p, size_t n) {
                 k++;
             }
             if (k != m.u.inventory.n_entries) abort();
+        } else if (fr.type == KDB_T_HOT_LIST) {          /* D1a step 7 */
+            kdb_iter_t it;
+            char hv[256], hz[DNS_NAME_TEXT_SIZE];
+            uint32_t k = 0;
+            kdb_hot_entries(&m, &it);
+            while (kdb_hot_entries_next(&it, hv, hz)) {
+                if (hv[0] == '\0' || hz[0] == '\0') abort();
+                k++;
+            }
+            if (k != m.u.hot_list.n_entries || m.u.hot_list.limit > KDB_HOT_MAX) abort();
         } else if (fr.type == KDB_T_FETCH_REQ) {         /* D1a */
             const kdb_fetch_req_t *q = &m.u.fetch_req;
             if (q->request_id == 0 || q->view >= 3 || strlen(q->name) == 0 || q->priority >= KDB_FETCH_PRIO_N || q->mode > KDB_FETCH_SUMMARY) abort();
@@ -304,11 +333,46 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
     db_settings_reset();
 }
 
+static int hot_emit_count(void *ud) { (*(int *)ud)++; return 0; }
+
+/* D1a step 7: the state file.  Whatever the bytes, the parser either refuses them or yields a list that serializes to a file it accepts again, equal to the first,
+ * that merges with itself into itself, and that the parts encoder turns into messages the decoder takes. */
+static void run_state_file(const uint8_t *p, size_t n) {
+    kdb_hotl_t a, b, m;
+    char why[200];
+    kdb_hotl_init(&a);
+    kdb_hotl_init(&b);
+    kdb_hotl_init(&m);
+    if (kdb_hotl_parse((const char *)p, n, &a, why, sizeof(why))) {
+        size_t len = 0;
+        char *txt = kdb_hotl_serialize(&a, &len);
+        if (!txt) abort();
+        if (!kdb_hotl_parse(txt, len, &b, why, sizeof(why)) || !kdb_hotl_equal(&a, &b)) abort();
+        free(txt);
+        if (!kdb_hotl_merge(&a, &b, 0, &m)) abort();
+        if (m.n > a.n) abort();
+        kdb_enc_t e;
+        kdb_enc_init(&e);
+        int parts = 0;
+        if (kdb_hot_encode(&a, &e, KDB_T_HOT_LIST, 1, 5, -1, 0, hot_emit_count, &parts) != 0 || parts < 1) abort();
+        kdb_enc_free(&e);
+    } else if (a.n != 0) {
+        abort();                                           /* a refused file leaves nothing behind */
+    }
+    kdb_hotl_free(&a);
+    kdb_hotl_free(&b);
+    kdb_hotl_free(&m);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size < 1) return 0;
     uint8_t sel = data[0];
     const uint8_t *p = data + 1;
     size_t n = size - 1;
+    if (sel & 0x04) {                       // D1a step 7: the state file
+        run_state_file(p, n);
+        return 0;
+    }
     size_t chunk = (sel & 0x80) ? 0 : (size_t)(1 + sel % 61);
     run_t a, b;
     run_loader(p, n, 0, sel, &a);

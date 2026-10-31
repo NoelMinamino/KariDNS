@@ -2599,8 +2599,25 @@ bool dbreg_warm_take(const char *view, const char *zone, bool *whole) {
     return wanted;
 }
 
+/* A zone of the hot list (design 8.4) leaves the warm list: true when it is worth reading whole (no data in memory, a version the loader has, not hidden by a
+ * zone of karidns.conf or a catalog member, not deleted).  False: nothing to read (it was read meanwhile by a query, or it is gone). */
+bool dbreg_warm_take_hot(const char *view, const char *zone) {
+    bool wanted = false;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    if (z) {
+        z->flags &= (uint16_t)~ZDIR_F_WARM;
+        wanted = !(z->flags & ZDIR_F_DELETED) && !z->shadowed && !zdir_entry(z) && z->digest != NULL &&
+                 atomic_load_explicit(&z->state, memory_order_relaxed) == ZDIR_ST_ABSENT;
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return wanted;
+}
+
 /* ---- D1a step 5: the data of a DB zone leaves memory (design 8.2) ---- */
 static _Atomic uint64_t g_evictions;
+static _Atomic uint64_t g_gone_queries;       /* D1a step 7: the queries the entries answered that were taken out of memory (dbstatus' hit rate adds the entries still in memory) */
 static _Atomic(void (*)(void)) g_pending_notify;
 void dbreg_set_pending_notify(void (*cb)(void)) { atomic_store_explicit(&g_pending_notify, cb, memory_order_release); }
 
@@ -2634,6 +2651,7 @@ static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
         return 0;
     }
     e->evicted = true;                                 /* (writer_lock is held) an UPDATE that waited for the lock sees it and does not change this entry */
+    atomic_fetch_add_explicit(&g_gone_queries, atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed), memory_order_relaxed);
     zone_version_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
     uint64_t bytes = (a && a->counted) ? a->bytes : 0;
     /* the settings the zone's allow-query is read from while its data is out (zdir_elem_t.sh) */
@@ -2979,6 +2997,130 @@ uint32_t dbreg_cache_round(void) {
                (unsigned long long)pinned_all, (unsigned long long)limit);
     }
     return evicted;
+}
+
+/* ---- D1a step 7: the zones most asked for (design 8.4) ----
+ * The same slices as the cache round (CACHE_SCAN_MAX elements under the lock, from where the last call stopped), so the lock is held for a time that does not
+ * grow with the number of zones.  The frequency is the cache manager's (z->freq: the misses of a zone out of memory, the queries of a zone in memory folded in
+ * from its observatory counter, here too, so that it is right when there is no memory pressure and the rounds do not scan); the counters are not halved here.
+ * The candidates are copies (a zone may be deleted between two slices); the n_max with the highest frequency are kept in a heap. */
+typedef struct { uint32_t freq; char *name; } hot_cand_t;      /* name: "view\0zone\0" */
+struct dbreg_hot {
+    uint32_t n_max, n;
+    hot_cand_t *heap;                                          /* a min-heap on freq */
+    size_t v, b;                                               /* the cursor */
+};
+
+dbreg_hot_t *dbreg_hot_begin(uint32_t n_max) {
+    if (n_max == 0) return NULL;
+    dbreg_hot_t *h = calloc(1, sizeof(*h));
+    if (!h) return NULL;
+    h->heap = malloc((size_t)n_max * sizeof(*h->heap));
+    if (!h->heap) {
+        free(h);
+        return NULL;
+    }
+    h->n_max = n_max;
+    return h;
+}
+
+static void hot_sift_down(hot_cand_t *a, uint32_t n, uint32_t i) {
+    for (;;) {
+        uint32_t l = 2 * i + 1, r = l + 1, m = i;
+        if (l < n && a[l].freq < a[m].freq) m = l;
+        if (r < n && a[r].freq < a[m].freq) m = r;
+        if (m == i) return;
+        hot_cand_t t = a[i];
+        a[i] = a[m];
+        a[m] = t;
+        i = m;
+    }
+}
+
+static void hot_sift_up(hot_cand_t *a, uint32_t i) {
+    while (i > 0) {
+        uint32_t p = (i - 1) / 2;
+        if (a[p].freq <= a[i].freq) return;
+        hot_cand_t t = a[i];
+        a[i] = a[p];
+        a[p] = t;
+        i = p;
+    }
+}
+
+bool dbreg_hot_step(dbreg_hot_t *h) {
+    bool done = false;
+    size_t visited = 0;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    while (visited < CACHE_SCAN_MAX) {
+        if (h->v >= g_dbreg_nviews) {
+            done = true;
+            break;
+        }
+        const dbreg_view_t *rv = &g_dbreg_views[h->v];
+        if (h->b >= rv->nb) {
+            h->v++;
+            h->b = 0;
+            continue;
+        }
+        for (dbreg_zone_t *z = rv->tab[h->b]; z; z = z->next) {
+            visited++;
+            if (z->shadowed || (z->flags & ZDIR_F_DELETED) || !dbreg_zone_known(z)) continue;
+            uint32_t f = atomic_load_explicit(&z->freq, memory_order_relaxed);
+            zone_db_entry_t *e = zdir_entry(z);
+            if (e && e->source == ZONE_SRC_DB && !e->evicted_bytes) {         /* (as the cache round folds it) */
+                uint32_t q32 = (uint32_t)atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed);
+                uint32_t dq = q32 - z->qseen;
+                z->qseen = q32;
+                f = f > UINT32_MAX - dq ? UINT32_MAX : f + dq;
+                atomic_store_explicit(&z->freq, f, memory_order_relaxed);
+            }
+            if (f == 0 || (h->n == h->n_max && f <= h->heap[0].freq)) continue;
+            size_t vn = strlen(rv->name), zn = strlen(z->name);
+            char *nm = malloc(vn + 1 + zn + 1);
+            if (!nm) continue;                                                 /* out of memory: the zone is left out of this list */
+            memcpy(nm, rv->name, vn + 1);
+            memcpy(nm + vn + 1, z->name, zn + 1);
+            if (h->n == h->n_max) {
+                free(h->heap[0].name);
+                h->heap[0].freq = f;
+                h->heap[0].name = nm;
+                hot_sift_down(h->heap, h->n, 0);
+            } else {
+                h->heap[h->n].freq = f;
+                h->heap[h->n].name = nm;
+                hot_sift_up(h->heap, h->n);
+                h->n++;
+            }
+        }
+        h->b++;
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return done;
+}
+
+static int hot_cand_cmp(const void *a, const void *b) {         /* the highest frequency first; the name decides between equals, so that the list is the same when the counts are */
+    const hot_cand_t *x = a, *y = b;
+    if (x->freq != y->freq) return x->freq > y->freq ? -1 : 1;
+    return strcmp(x->name, y->name);
+}
+
+uint32_t dbreg_hot_emit(dbreg_hot_t *h, void (*add)(void *ud, const char *view, const char *zone), void *ud) {
+    uint32_t n = h->n;
+    qsort(h->heap, n, sizeof(*h->heap), hot_cand_cmp);
+    for (uint32_t i = 0; i < n; i++) {
+        const char *view = h->heap[i].name;
+        add(ud, view, view + strlen(view) + 1);
+    }
+    dbreg_hot_free(h);
+    return n;
+}
+
+void dbreg_hot_free(dbreg_hot_t *h) {
+    if (!h) return;
+    for (uint32_t i = 0; i < h->n; i++) free(h->heap[i].name);
+    free(h->heap);
+    free(h);
 }
 
 uint64_t dbreg_evictions(void) { return atomic_load_explicit(&g_evictions, memory_order_relaxed); }
@@ -3511,6 +3653,31 @@ size_t dbreg_count_updated(void) {
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     return n;
+}
+
+/* D1a step 7: what the directory holds (karictl dbstatus): zones with and without data, and the queries the zones in memory have answered (plus those of the
+ * entries taken out of memory since the start; an entry that a newer version replaced starts its count again) */
+void dbreg_residency(dbreg_residency_t *o) {
+    memset(o, 0, sizeof(*o));
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    for (size_t v = 0; v < g_dbreg_nviews; v++) {
+        const dbreg_view_t *rv = &g_dbreg_views[v];
+        for (size_t b = 0; b < rv->nb; b++) {
+            for (const dbreg_zone_t *z = rv->tab[b]; z; z = z->next) {
+                if (!dbreg_zone_known(z) || z->shadowed || (z->flags & ZDIR_F_DELETED)) continue;
+                const zone_db_entry_t *e = zdir_entry(z);
+                o->total++;
+                if (e) {
+                    o->resident++;
+                    if (e->source == ZONE_SRC_DB) o->queries += atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed);
+                } else {
+                    o->absent++;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    o->queries += atomic_load_explicit(&g_gone_queries, memory_order_relaxed);
 }
 
 void dbreg_counts2(size_t *total, size_t *rejected, size_t *shadowed_config, size_t *shadowed_catalog) {

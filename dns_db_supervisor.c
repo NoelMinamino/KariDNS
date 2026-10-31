@@ -65,6 +65,7 @@ bool db_sup_init(db_sup_t *s, const server_config_t *cfg, char *err, size_t errl
     return false;
   }
   snprintf(s->path, sizeof(s->path), "%s", db_loader_path(cfg));
+  snprintf(s->state_file, sizeof(s->state_file), "%s", cfg->database.loader_state_file ? cfg->database.loader_state_file : "");
   if (!check_loader_path(s->path, err, errlen)) return false;
   s->enabled = true;
   return true;
@@ -224,8 +225,17 @@ static void child_exec(const db_sup_t *s, int stream_fd, int fetch_fd) {
   if (chdir("/") != 0) _exit(127);
   clearenv();
   if (tz) setenv("TZ", tzbuf, 1);
-  char *argv[] = { (char *)"karidns-dbloader", (char *)"-s", (char *)"3", (char *)"--fetch-fd", (char *)"4", NULL };
-  if (hf < 0) argv[3] = NULL;
+  char *argv[8] = { (char *)"karidns-dbloader", (char *)"-s", (char *)"3", NULL };
+  int ac = 3;
+  if (hf >= 0) {
+    argv[ac++] = (char *)"--fetch-fd";
+    argv[ac++] = (char *)"4";
+  }
+  if (s->state_file[0]) {                              /* D1a step 7: the loader keeps the hot list there (the Backend never names a path to it) */
+    argv[ac++] = (char *)"--state-file";
+    argv[ac++] = (char *)s->state_file;
+  }
+  argv[ac] = NULL;
   extern char **environ;
   exec_file_exec_fd(xfd, s->path, argv, environ);
   int n = snprintf(msg, sizeof(msg), "[Manager] cannot execute '%s': %s\n", s->path, strerror(errno));

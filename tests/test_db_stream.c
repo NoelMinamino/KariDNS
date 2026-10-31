@@ -16,6 +16,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <syslog.h>
+#include <unistd.h>
+#include <limits.h>
+#include <sys/stat.h>
 
 #include "../dns_db_stream.h"
 #include "../dns_db_checkproto.h"
@@ -1286,7 +1289,7 @@ static int gen_corpus(const char *dir) {
     rc |= write_seed(dir, "seed_install_secondary.bin", 0xD0, &e);
     kdb_enc_reset(&e);
     m_hello(&e, 1); m_batch_begin(&e, 1);
-    rc |= write_seed(dir, "seed_hello_batch_chunked.bin", 0x05, &e);
+    rc |= write_seed(dir, "seed_hello_batch_chunked.bin", 0x03, &e);
     kdb_enc_reset(&e);        /* B9: the auto reload report between two batches */
     m_batch_begin(&e, 2); m_batch_end(&e, 2, 0, 0, 0); m_auto_status(&e, 3); m_batch_begin(&e, 3); m_batch_end(&e, 3, 0, 0, 0);
     rc |= write_seed(dir, "seed_loader_auto_status.bin", 0xC0, &e);
@@ -1939,6 +1942,406 @@ static void test_fetch_stream_machine(void) {
 }
 
 /* the seeds of the fetch stream (selector bit 3) and of the Backend side messages of D1a */
+/* ---------------------------------------------------------------- D1a step 7: the hot list, its messages and its state file */
+typedef struct { uint8_t *p; size_t len; kdb_enc_t *enc; int n; uint32_t max_body; } sink_t;
+static int sink_emit(void *ud) {              /* a finished message is in sink->enc: keep its bytes */
+    sink_t *s = ud;
+    if (s->enc->len - KDB_HEADER_LEN > s->max_body) s->max_body = (uint32_t)(s->enc->len - KDB_HEADER_LEN);
+    uint8_t *np = realloc(s->p, s->len + s->enc->len);
+    if (!np) return -1;
+    s->p = np;
+    memcpy(s->p + s->len, s->enc->buf, s->enc->len);
+    s->len += s->enc->len;
+    s->n++;
+    return 0;
+}
+static int sink_fail(void *ud) { (void)ud; return -1; }
+
+/* decode the messages in s (all of one direction) one by one with the framer; calls f(msg, ud) */
+static int sink_walk(const sink_t *s, kdb_dir_t dir, uint32_t views, int (*f)(const kdb_msg_t *, void *), void *ud) {
+    kdb_framer_t fr;
+    kdb_frame_t frame;
+    kdb_framer_init(&fr, dir, g_rbuf, sizeof(g_rbuf));
+    if (kdb_framer_feed(&fr, s->p, s->len) != KDB_OK) return -1;
+    int n = 0;
+    while (kdb_framer_next(&fr, &frame) == KDB_OK) {
+        kdb_msg_t m;
+        char why[KDB_REASON_LEN];
+        if (kdb_decode(&frame, views, &m, why, sizeof(why)) != KDB_OK) return -1;
+        if (f && f(&m, ud) != 0) return -1;
+        n++;
+    }
+    return n;
+}
+
+typedef struct { uint64_t id; uint32_t next_part, entries; bool last_seen, bad; uint32_t limit; int file_state; } hotwalk_t;
+static int hot_walk_cb(const kdb_msg_t *m, void *ud) {
+    hotwalk_t *w = ud;
+    const kdb_hot_list_t *h = &m->u.hot_list;
+    if (w->next_part == 0) w->id = h->list_id;
+    if (h->list_id != w->id || h->part != w->next_part || w->last_seen) w->bad = true;
+    w->next_part = h->part + 1;
+    w->last_seen = h->last;
+    w->limit = h->limit;
+    w->file_state = h->file_state;
+    kdb_iter_t it;
+    char v[256], z[DNS_NAME_TEXT_SIZE];
+    uint32_t k = 0;
+    kdb_hot_entries(m, &it);
+    while (kdb_hot_entries_next(&it, v, z)) {
+        if (!v[0] || !z[0]) w->bad = true;
+        k++;
+    }
+    if (k != h->n_entries) w->bad = true;
+    w->entries += k;
+    return 0;
+}
+
+static void hot_fill(kdb_hotl_t *l, unsigned n, size_t zone_len) {
+    for (unsigned i = 0; i < n; i++) {
+        char z[400];
+        size_t used = 0;
+        used += (size_t)snprintf(z, sizeof(z), "z%07u", i);
+        /* labels of 60 characters up to about zone_len, then the suffix */
+        while (used + 62 < zone_len) {
+            z[used++] = '.';
+            memset(z + used, 'a', 60);
+            used += 60;
+        }
+        snprintf(z + used, sizeof(z) - used, ".test.");
+        CHECK(kdb_hotl_add(l, i % 2 ? "default" : "v2", z));
+    }
+}
+
+static void test_hot_list(void) {
+    printf("[the hot list: messages, parts, state file]\n");
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_hotl_t l, l2, l3;
+    kdb_hotl_init(&l);
+    kdb_hotl_init(&l2);
+    kdb_hotl_init(&l3);
+
+    /* the list: only valid pairs go in */
+    CHECK(kdb_hotl_add(&l, "default", "a.test.") && kdb_hotl_add(&l, "v 2", "b.test.") && l.n == 2);
+    CHECK(!kdb_hotl_add(&l, "", "c.test.") && !kdb_hotl_add(&l, "default", "") && !kdb_hotl_add(&l, "default", "c.test") && !kdb_hotl_add(&l, "default", "a b.test."));
+    CHECK(!kdb_hotl_add(&l, "tab\tview", "c.test.") && !kdb_hotl_add(&l, "nl\nview", "c.test.") && !kdb_hotl_add(&l, "\xc3\xa9", "c.test.") && l.n == 2);
+    {
+        char longview[300];
+        memset(longview, 'v', sizeof(longview));
+        longview[256] = '\0';
+        CHECK(!kdb_hotl_add(&l, longview, "c.test."));
+        longview[255] = '\0';
+        CHECK(kdb_hotl_add(&l, longview, "c.test.") && l.n == 3);
+    }
+    {
+        size_t pos = 0;
+        const char *v, *z;
+        CHECK(kdb_hotl_next(&l, &pos, &v, &z) && strcmp(v, "default") == 0 && strcmp(z, "a.test.") == 0);
+        CHECK(kdb_hotl_next(&l, &pos, &v, &z) && strcmp(v, "v 2") == 0 && strcmp(z, "b.test.") == 0);
+        CHECK(kdb_hotl_next(&l, &pos, &v, &z) && strlen(v) == 255 && kdb_hotl_next(&l, &pos, &v, &z) == false);
+    }
+    kdb_hotl_clear(&l);
+    CHECK(l.n == 0 && l.len == 0);
+
+    /* an empty list is one part, the last */
+    {
+        sink_t s = { NULL, 0, &e, 0, 0 };
+        hotwalk_t w;
+        memset(&w, 0, sizeof(w));
+        CHECK(kdb_hot_encode(&l, &e, KDB_T_HOT_LIST, 5, 0, -1, 0, sink_emit, &s) == 0 && s.n == 1);
+        CHECK(sink_walk(&s, KDB_FROM_BACKEND, KDB_VIEWS_ANY, hot_walk_cb, &w) == 1 && !w.bad && w.last_seen && w.entries == 0 && w.limit == 0 && w.file_state == -1);
+        free(s.p);
+    }
+
+    /* a short list: limit (tag 5) for the loader, file state (tags 6 and 7) for the Backend */
+    CHECK(kdb_hotl_add(&l, "default", "hot1.test.") && kdb_hotl_add(&l, "default", "hot2.test.") && kdb_hotl_add(&l, "v2", "hot3.test."));
+    {
+        sink_t s = { NULL, 0, &e, 0, 0 };
+        hotwalk_t w;
+        memset(&w, 0, sizeof(w));
+        CHECK(kdb_hot_encode(&l, &e, KDB_T_HOT_LIST, 6, 777, -1, 0, sink_emit, &s) == 0 && s.n == 1);
+        CHECK(sink_walk(&s, KDB_FROM_BACKEND, KDB_VIEWS_ANY, hot_walk_cb, &w) == 1 && !w.bad && w.entries == 3 && w.limit == 777 && w.id == 6);
+        free(s.p);
+        memset(&s, 0, sizeof(s));
+        s.enc = &e;
+        memset(&w, 0, sizeof(w));
+        CHECK(kdb_hot_encode(&l, &e, KDB_T_WARM_LIST, 8, 0, KDB_HF_CORRUPT, 41, sink_emit, &s) == 0 && s.n == 1);
+        CHECK(sink_walk(&s, KDB_FROM_LOADER, KDB_VIEWS_ANY, hot_walk_cb, &w) == 1 && !w.bad && w.entries == 3 && w.file_state == KDB_HF_CORRUPT);
+        /* the state machine: allowed between batches only, not on the fetch stream */
+        kdb_sm_t sm;
+        kdb_framer_t fr;
+        kdb_frame_t frame;
+        kdb_msg_t m;
+        kdb_sm_init(&sm, NULL);
+        sm.state = KDB_S_READY;
+        kdb_framer_init(&fr, KDB_FROM_LOADER, g_rbuf, sizeof(g_rbuf));
+        CHECK(kdb_framer_feed(&fr, s.p, s.len) == KDB_OK && kdb_framer_next(&fr, &frame) == KDB_OK);
+        CHECK_RC("WARM_LIST in READY", kdb_sm_accept(&sm, &frame, &m), KDB_OK);
+        CHECK(m.u.hot_list.file_state == KDB_HF_CORRUPT && m.u.hot_list.file_zones == 41 && m.u.hot_list.last && m.u.hot_list.part == 0);
+        CHECK_STR(kdb_type_name(KDB_T_WARM_LIST), "WARM_LIST");
+        CHECK_STR(kdb_type_name(KDB_T_HOT_LIST), "HOT_LIST");
+        CHECK_STR(kdb_type_name(KDB_T_HOT_ACK), "HOT_ACK");
+        kdb_sm_init(&sm, NULL);
+        sm.state = KDB_S_IN_BATCH;
+        kdb_framer_init(&fr, KDB_FROM_LOADER, g_rbuf, sizeof(g_rbuf));
+        CHECK(kdb_framer_feed(&fr, s.p, s.len) == KDB_OK && kdb_framer_next(&fr, &frame) == KDB_OK);
+        CHECK_RC("WARM_LIST in a batch", kdb_sm_accept(&sm, &frame, &m), KDB_E_STATE);
+        kdb_sm_init_fetch(&sm, NULL);
+        kdb_framer_init(&fr, KDB_FROM_LOADER, g_rbuf, sizeof(g_rbuf));
+        CHECK(kdb_framer_feed(&fr, s.p, s.len) == KDB_OK && kdb_framer_next(&fr, &frame) == KDB_OK);
+        CHECK_RC("WARM_LIST on the fetch stream", kdb_sm_accept(&sm, &frame, &m), KDB_E_STATE);
+        /* ... and the direction: a HOT_LIST from the loader and a WARM_LIST from the Backend are unknown types */
+        free(s.p);
+        memset(&s, 0, sizeof(s));
+        s.enc = &e;
+        CHECK(kdb_hot_encode(&l, &e, KDB_T_HOT_LIST, 8, 0, -1, 0, sink_emit, &s) == 0);
+        kdb_framer_init(&fr, KDB_FROM_LOADER, g_rbuf, sizeof(g_rbuf));
+        CHECK(kdb_framer_feed(&fr, s.p, s.len) == KDB_OK);
+        CHECK_RC("HOT_LIST from the loader", kdb_framer_next(&fr, &frame), KDB_E_TYPE);
+        free(s.p);
+        memset(&s, 0, sizeof(s));
+        s.enc = &e;
+        CHECK(kdb_hot_encode(&l, &e, KDB_T_WARM_LIST, 8, 0, -1, 0, sink_emit, &s) == 0);
+        kdb_framer_init(&fr, KDB_FROM_BACKEND, g_rbuf, sizeof(g_rbuf));
+        CHECK(kdb_framer_feed(&fr, s.p, s.len) == KDB_OK);
+        CHECK_RC("WARM_LIST from the Backend", kdb_framer_next(&fr, &frame), KDB_E_TYPE);
+        free(s.p);
+    }
+
+    /* the parts: more than KDB_HOT_PART_MAX entries, and more bytes than a message may hold */
+    {
+        kdb_hotl_t big;
+        kdb_hotl_init(&big);
+        hot_fill(&big, KDB_HOT_PART_MAX * 2 + 5, 0);
+        sink_t s = { NULL, 0, &e, 0, 0 };
+        hotwalk_t w;
+        memset(&w, 0, sizeof(w));
+        CHECK(kdb_hot_encode(&big, &e, KDB_T_HOT_LIST, 9, 100000, -1, 0, sink_emit, &s) == 0 && s.n == 3);
+        CHECK(sink_walk(&s, KDB_FROM_BACKEND, KDB_VIEWS_ANY, hot_walk_cb, &w) == 3 && !w.bad && w.last_seen && w.entries == big.n && w.limit == 100000);
+        free(s.p);
+        kdb_hotl_free(&big);
+        kdb_hotl_init(&big);
+        hot_fill(&big, 6000, 240);                      /* 6000 names of about 250 bytes: more than the 1 MiB of a message */
+        memset(&s, 0, sizeof(s));
+        s.enc = &e;
+        memset(&w, 0, sizeof(w));
+        CHECK(kdb_hot_encode(&big, &e, KDB_T_WARM_LIST, 10, 0, KDB_HF_LOADED, 6000, sink_emit, &s) == 0 && s.n >= 2);
+        CHECK(s.max_body <= KDB_MAX_BODY);
+        CHECK(sink_walk(&s, KDB_FROM_LOADER, KDB_VIEWS_ANY, hot_walk_cb, &w) == s.n && !w.bad && w.last_seen && w.entries == 6000);
+        free(s.p);
+        /* the encoder gives up when the sink fails */
+        memset(&s, 0, sizeof(s));
+        s.enc = &e;
+        CHECK(kdb_hot_encode(&big, &e, KDB_T_WARM_LIST, 10, 0, -1, 0, sink_fail, &s) == -1);
+        kdb_enc_reset(&e);
+        kdb_hotl_free(&big);
+        /* the list holds KDB_HOT_MAX pairs and no more */
+        kdb_hotl_init(&big);
+        hot_fill(&big, KDB_HOT_MAX, 0);
+        CHECK(big.n == KDB_HOT_MAX && !kdb_hotl_add(&big, "default", "one-too-many.test."));
+        kdb_hotl_free(&big);
+    }
+
+    /* hostile messages */
+    {
+        kdb_msg_t m;
+        char why[KDB_REASON_LEN];
+        /* a good one to start from: list_id, part, last, one entry */
+#define HOT_HEAD(type) kdb_enc_reset(&e); kdb_enc_begin(&e, type); kdb_enc_u64(&e, 1, 1); kdb_enc_u32(&e, 2, 0); kdb_enc_u8(&e, 3, 1)
+#define HOT_ENTRY(v, z) kdb_enc_nest_begin(&e, 4); kdb_enc_str(&e, 1, v); kdb_enc_name(&e, 2, z); kdb_enc_nest_end(&e)
+        HOT_HEAD(KDB_T_HOT_LIST); HOT_ENTRY("default", "x.test."); kdb_enc_end(&e);
+        CHECK_RC("a good HOT_LIST", dec_backend(&e, &m, why), KDB_OK);
+        HOT_HEAD(KDB_T_HOT_LIST); HOT_ENTRY("default", "a b.test."); kdb_enc_end(&e);
+        CHECK_RC("zone not canonical", dec_backend(&e, &m, why), KDB_E_TLV_NAME);
+        HOT_HEAD(KDB_T_HOT_LIST); HOT_ENTRY("default", "relative"); kdb_enc_end(&e);
+        CHECK_RC("zone not absolute", dec_backend(&e, &m, why), KDB_E_TLV_NAME);
+        HOT_HEAD(KDB_T_HOT_LIST); HOT_ENTRY("", "x.test."); kdb_enc_end(&e);
+        CHECK_RC("empty view", dec_backend(&e, &m, why), KDB_E_TLV_STR);
+        HOT_HEAD(KDB_T_HOT_LIST); HOT_ENTRY("bad\tview", "x.test."); kdb_enc_end(&e);
+        CHECK_RC("view with a tab", dec_backend(&e, &m, why), KDB_E_TLV_STR);
+        HOT_HEAD(KDB_T_HOT_LIST); kdb_enc_nest_begin(&e, 4); kdb_enc_str(&e, 1, "default"); kdb_enc_nest_end(&e); kdb_enc_end(&e);
+        CHECK_RC("entry without a zone", dec_backend(&e, &m, why), KDB_E_TLV_MISSING);
+        HOT_HEAD(KDB_T_HOT_LIST); kdb_enc_nest_begin(&e, 4); kdb_enc_str(&e, 1, "default"); kdb_enc_name(&e, 2, "x.test."); kdb_enc_u8(&e, 3, 1); kdb_enc_nest_end(&e); kdb_enc_end(&e);
+        CHECK_RC("unknown tag in an entry", dec_backend(&e, &m, why), KDB_E_TLV_UNKNOWN);
+        HOT_HEAD(KDB_T_HOT_LIST); kdb_enc_u8(&e, 3, 0); kdb_enc_end(&e);
+        CHECK_RC("duplicate last", dec_backend(&e, &m, why), KDB_E_TLV_DUP);
+        kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_HOT_LIST); kdb_enc_u32(&e, 2, 0); kdb_enc_u8(&e, 3, 1); kdb_enc_end(&e);
+        CHECK_RC("no list id", dec_backend(&e, &m, why), KDB_E_TLV_MISSING);
+        kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_HOT_LIST); kdb_enc_u64(&e, 1, 1); kdb_enc_u32(&e, 2, 0); kdb_enc_u8(&e, 3, 2); kdb_enc_end(&e);
+        CHECK_RC("last = 2", dec_backend(&e, &m, why), KDB_E_RANGE);
+        HOT_HEAD(KDB_T_HOT_LIST); kdb_enc_u32(&e, 5, KDB_HOT_MAX + 1); kdb_enc_end(&e);
+        CHECK_RC("limit above KDB_HOT_MAX", dec_backend(&e, &m, why), KDB_E_RANGE);
+        HOT_HEAD(KDB_T_HOT_LIST); kdb_enc_u8(&e, 6, KDB_HF_N); kdb_enc_end(&e);
+        CHECK_RC("file state out of range", dec_backend(&e, &m, why), KDB_E_RANGE);
+        HOT_HEAD(KDB_T_HOT_LIST); kdb_enc_u8(&e, 8, 1); kdb_enc_end(&e);
+        CHECK_RC("unknown tag 8", dec_backend(&e, &m, why), KDB_E_TLV_UNKNOWN);
+        HOT_HEAD(KDB_T_HOT_LIST);
+        for (unsigned i = 0; i <= KDB_HOT_PART_MAX; i++) { HOT_ENTRY("v", "x.test."); }
+        kdb_enc_end(&e);
+        CHECK_RC("more entries than a part may hold", dec_backend(&e, &m, why), KDB_E_RANGE);
+        /* HOT_ACK */
+        kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_HOT_ACK); kdb_enc_u64(&e, 1, 4); kdb_enc_u8(&e, 2, KDB_HA_FAILED); kdb_enc_u32(&e, 3, 12); kdb_enc_str(&e, 4, "disk full"); kdb_enc_end(&e);
+        kdb_framer_t fr;
+        kdb_frame_t frame;
+        kdb_framer_init(&fr, KDB_FROM_LOADER, g_rbuf, sizeof(g_rbuf));
+        CHECK(kdb_framer_feed(&fr, e.buf, e.len) == KDB_OK && kdb_framer_next(&fr, &frame) == KDB_OK);
+        CHECK_RC("HOT_ACK", kdb_decode(&frame, NVIEWS, &m, why, sizeof(why)), KDB_OK);
+        CHECK(m.u.hot_ack.list_id == 4 && m.u.hot_ack.status == KDB_HA_FAILED && m.u.hot_ack.zones == 12 && m.u.hot_ack.error.len == 9);
+        kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_HOT_ACK); kdb_enc_u64(&e, 1, 4); kdb_enc_u8(&e, 2, KDB_HA_N); kdb_enc_u32(&e, 3, 12); kdb_enc_end(&e);
+        kdb_framer_init(&fr, KDB_FROM_LOADER, g_rbuf, sizeof(g_rbuf));
+        CHECK(kdb_framer_feed(&fr, e.buf, e.len) == KDB_OK && kdb_framer_next(&fr, &frame) == KDB_OK);
+        CHECK_RC("HOT_ACK with an unknown status", kdb_decode(&frame, NVIEWS, &m, why, sizeof(why)), KDB_E_RANGE);
+        /* the iterators end at once on a message of another type */
+        kdb_iter_t it;
+        char v[256], z[DNS_NAME_TEXT_SIZE];
+        kdb_hot_entries(&m, &it);
+        CHECK(!kdb_hot_entries_next(&it, v, z));
+#undef HOT_HEAD
+#undef HOT_ENTRY
+    }
+
+    /* merge: the new zones first, then the old ones nobody asked for, each once, up to the limit */
+    kdb_hotl_clear(&l);
+    CHECK(kdb_hotl_add(&l, "d", "a.test.") && kdb_hotl_add(&l, "d", "b.test.") && kdb_hotl_add(&l, "d", "a.test."));
+    CHECK(kdb_hotl_add(&l2, "d", "b.test.") && kdb_hotl_add(&l2, "d", "c.test.") && kdb_hotl_add(&l2, "e", "b.test.") && kdb_hotl_add(&l2, "d", "d.test."));
+    CHECK(kdb_hotl_merge(&l, &l2, 0, &l3) && l3.n == 5);
+    {
+        size_t pos = 0;
+        const char *v, *z;
+        const char *want[5][2] = { { "d", "a.test." }, { "d", "b.test." }, { "d", "c.test." }, { "e", "b.test." }, { "d", "d.test." } };
+        for (int i = 0; i < 5; i++) CHECK(kdb_hotl_next(&l3, &pos, &v, &z) && strcmp(v, want[i][0]) == 0 && strcmp(z, want[i][1]) == 0);
+        CHECK(!kdb_hotl_next(&l3, &pos, &v, &z));
+    }
+    CHECK(kdb_hotl_merge(&l, &l2, 3, &l3) && l3.n == 3);                    /* the limit */
+    CHECK(kdb_hotl_merge(&l, &l2, 1, &l3) && l3.n == 1);
+    CHECK(kdb_hotl_merge(&l, &l2, KDB_HOT_MAX + 5, &l3) && l3.n == 5);       /* (above the most: the most) */
+    kdb_hotl_clear(&l3);
+    CHECK(kdb_hotl_merge(&l3, &l2, 0, &l) && l.n == 4);                      /* an empty list in front */
+    CHECK(kdb_hotl_merge(&l2, &l3, 0, &l) && l.n == 4 && kdb_hotl_equal(&l, &l2));                   /* nothing behind */
+    kdb_hotl_clear(&l3);
+    CHECK(kdb_hotl_merge(&l3, &l3, 0, &l) && l.n == 0);
+    CHECK(kdb_hotl_equal(&l, &l3) && !kdb_hotl_equal(&l2, &l3));
+    CHECK(kdb_hotl_add(&l3, "d", "b.test.") && !kdb_hotl_equal(&l2, &l3));     /* (same length is not equal) */
+
+    /* the state file text: serialize, parse, and every way a file can be wrong */
+    {
+        size_t len = 0;
+        char why[200];
+        char *txt = kdb_hotl_serialize(&l2, &len);
+        CHECK(txt && len > 20 && strncmp(txt, "KARIDNS-HOT-LIST 1\n", 19) == 0 && strstr(txt, "\nEND 4 ") != NULL && strstr(txt, "d\tb.test.\n") != NULL);
+        kdb_hotl_clear(&l3);
+        CHECK(kdb_hotl_parse(txt, len, &l3, why, sizeof(why)) && kdb_hotl_equal(&l2, &l3));
+        char *bad = malloc(len + 16);
+        CHECK(bad != NULL);
+        if (bad) {
+#define BAD(label, expr) do { memcpy(bad, txt, len); bad[len] = 0; size_t bl = len; expr; kdb_hotl_clear(&l3); \
+            CHECK(!kdb_hotl_parse(bad, bl, &l3, why, sizeof(why)) && l3.n == 0 && why[0]); printf("    (%s: %s)\n", label, why); } while (0)
+            BAD("empty", bl = 0);
+            BAD("header only", bl = 19);
+            BAD("no newline after the header", bl = 18);
+            BAD("truncated in the middle of an entry", bl = 19 + 5);
+            BAD("truncated before END", bl = (size_t)(strstr(txt, "END") - txt));
+            BAD("truncated in the END line", bl = len - 4);
+            BAD("END without its newline", bl = len - 1);
+            BAD("wrong version", bad[17] = '2');
+            BAD("wrong magic", bad[0] = 'X');
+            BAD("a wrong count", bad[strstr(txt, "END ") - txt + 4] = '9');
+            BAD("a wrong checksum", bad[len - 2] = bad[len - 2] == '0' ? '1' : '0');
+            BAD("a changed entry", bad[19] = 'e');
+            BAD("a deleted entry", { char *p = bad + 19; char *nl = memchr(p, '\n', len - 19); memmove(p, nl + 1, len - (size_t)(nl + 1 - bad)); bl = len - (size_t)(nl + 1 - p); });
+            BAD("bytes after END", { memcpy(bad + len, "x\n", 2); bl = len + 2; });
+            BAD("a second END", { memcpy(bad + len, "END 0 00000000\n", 15); bl = len + 15; });
+            BAD("an entry without a tab", { char *tab = memchr(bad, '\t', len); *tab = ' '; });
+            BAD("a zone that is not canonical", { char *z = strstr(bad, "b.test."); *z = 'B'; });
+            BAD("a NUL in an entry", { char *z = strstr(bad, "b.test."); *z = '\0'; });
+            BAD("a CR before the newline", { char *z = strstr(bad, "b.test.\n"); z[7] = '\r'; });
+            BAD("garbage END", { char *e2 = strstr(bad, "END "); memcpy(e2, "END x ", 6); });
+            BAD("a short checksum", { char *e2 = strstr(bad, "END "); e2[strlen(e2) - 2] = '\0'; bl = (size_t)(e2 + strlen(e2) - bad); bad[bl++] = '\n'; });
+#undef BAD
+            free(bad);
+        }
+        free(txt);
+        /* the largest list, written and read: counts and checksum hold */
+        kdb_hotl_t big;
+        kdb_hotl_init(&big);
+        hot_fill(&big, 5000, 100);
+        txt = kdb_hotl_serialize(&big, &len);
+        kdb_hotl_clear(&l3);
+        CHECK(txt && kdb_hotl_parse(txt, len, &l3, why, sizeof(why)) && l3.n == 5000 && kdb_hotl_equal(&big, &l3));
+        free(txt);
+        kdb_hotl_free(&big);
+    }
+
+    /* the file: atomic write, read, and the ways it can fail */
+    {
+        char dir[256];
+        const char *tmp = getenv("TMPDIR");
+        snprintf(dir, sizeof(dir), "%s/kdb_hot_test.XXXXXX", tmp && *tmp ? tmp : "/tmp");
+        if (!mkdtemp(dir)) {
+            printf("  (no temporary directory: the file checks are skipped)\n");
+        } else {
+            char path[300], tmpf[320], why[200], cmd[700];
+            snprintf(path, sizeof(path), "%s/hot.state", dir);
+            snprintf(tmpf, sizeof(tmpf), "%s.tmp", path);
+            kdb_hotl_clear(&l3);
+            CHECK(kdb_hotl_file_read(path, &l3, why, sizeof(why)) == KDB_HF_MISSING && l3.n == 0);
+            CHECK(kdb_hotl_file_write(path, &l2, why, sizeof(why)) == 0);
+            struct stat st;
+            CHECK(stat(path, &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & 0777) == 0600 && stat(tmpf, &st) != 0);
+            CHECK(kdb_hotl_file_read(path, &l3, why, sizeof(why)) == KDB_HF_LOADED && kdb_hotl_equal(&l2, &l3));
+            kdb_hotl_clear(&l);
+            CHECK(kdb_hotl_add(&l, "d", "only.test.") && kdb_hotl_file_write(path, &l, why, sizeof(why)) == 0);       /* replaces it */
+            CHECK(kdb_hotl_file_read(path, &l3, why, sizeof(why)) == KDB_HF_LOADED && l3.n == 1 && kdb_hotl_equal(&l, &l3));
+            kdb_hotl_clear(&l);
+            CHECK(kdb_hotl_file_write(path, &l, why, sizeof(why)) == 0 && kdb_hotl_file_read(path, &l3, why, sizeof(why)) == KDB_HF_LOADED && l3.n == 0);      /* an empty list is a valid file */
+            /* a file that is empty, truncated, garbage, a directory, too large */
+            FILE *fp = fopen(path, "wb");
+            CHECK(fp != NULL);
+            if (fp) fclose(fp);
+            CHECK(kdb_hotl_file_read(path, &l3, why, sizeof(why)) == KDB_HF_CORRUPT && l3.n == 0 && strstr(why, "empty"));
+            fp = fopen(path, "wb");
+            if (fp) { fputs("KARIDNS-HOT-LIST 1\nd\tabc.test.\nd\tdef.te", fp); fclose(fp); }
+            CHECK(kdb_hotl_file_read(path, &l3, why, sizeof(why)) == KDB_HF_CORRUPT && l3.n == 0);
+            fp = fopen(path, "wb");
+            if (fp) { fputs("this is not a state file\n", fp); fclose(fp); }
+            CHECK(kdb_hotl_file_read(path, &l3, why, sizeof(why)) == KDB_HF_CORRUPT);
+            CHECK(kdb_hotl_file_read(dir, &l3, why, sizeof(why)) == KDB_HF_UNREADABLE && strstr(why, "regular"));
+            fp = fopen(path, "wb");
+            if (fp) { CHECK(ftruncate(fileno(fp), (off_t)KDB_HOT_FILE_MAX + 1) == 0); fclose(fp); }
+            CHECK(kdb_hotl_file_read(path, &l3, why, sizeof(why)) == KDB_HF_CORRUPT && strstr(why, "larger"));
+            /* a file nobody may read */
+            if (geteuid() != 0) {
+                fp = fopen(path, "wb");
+                if (fp) { fputs("x", fp); fclose(fp); }
+                CHECK(chmod(path, 0) == 0 && kdb_hotl_file_read(path, &l3, why, sizeof(why)) == KDB_HF_UNREADABLE);
+                CHECK(chmod(path, 0600) == 0);
+            }
+            /* writes that fail say why and leave nothing behind: a directory that is not there, a link in the place of the temporary file, a path too long */
+            char gone[320];
+            snprintf(gone, sizeof(gone), "%s/nodir/hot.state", dir);
+            CHECK(kdb_hotl_file_write(gone, &l2, why, sizeof(why)) == -1 && strstr(why, "cannot create"));
+            CHECK(symlink("/nonexistent/target", tmpf) == 0);
+            CHECK(kdb_hotl_file_write(path, &l2, why, sizeof(why)) == -1 && strstr(why, "cannot create"));
+            CHECK(unlink(tmpf) == 0);
+            char longp[PATH_MAX + 8];
+            memset(longp, 'p', sizeof(longp));
+            longp[sizeof(longp) - 1] = '\0';
+            CHECK(kdb_hotl_file_write(longp, &l2, why, sizeof(why)) == -1 && strstr(why, "too long"));
+            CHECK(mkdir(path, 0700) != 0);                                                             /* (path is a file) */
+            CHECK(unlink(path) == 0);
+            CHECK(mkdir(path, 0700) == 0);                                                              /* a directory where the file goes: the rename fails */
+            CHECK(kdb_hotl_file_write(path, &l2, why, sizeof(why)) == -1 && strstr(why, "cannot write") && stat(tmpf, &st) != 0);
+            snprintf(cmd, sizeof(cmd), "rm -rf '%s'", dir);
+            if (system(cmd) != 0) printf("  (could not remove %s)\n", dir);
+        }
+    }
+    kdb_hotl_free(&l);
+    kdb_hotl_free(&l2);
+    kdb_hotl_free(&l3);
+    kdb_enc_free(&e);
+}
+
 static int gen_corpus_fetch(const char *dir) {
     kdb_enc_t e;
     kdb_enc_init(&e);
@@ -1988,6 +2391,50 @@ static int gen_corpus_fetch(const char *dir) {
     kdb_enc_u16(&e, 1, 1); kdb_enc_name(&e, 2, "cold.test."); kdb_enc_u8(&e, 3, KDB_ST_NOT_RESIDENT);
     kdb_enc_end(&e);
     rc |= write_seed(dir, "seed_backend_fetch.bin", 0x80, &e);
+    {   /* D1a step 7: the loader's WARM_LIST and HOT_ACK between two batches, the Backend's HOT_LIST, and a state file (selector bit 2) */
+        kdb_hotl_t hl;
+        kdb_hotl_init(&hl);
+        (void)kdb_hotl_add(&hl, "default", "hot1.test.");
+        (void)kdb_hotl_add(&hl, "default", "hot2.test.");
+        (void)kdb_hotl_add(&hl, "v2", "hot3.test.");
+        kdb_enc_t t;
+        kdb_enc_init(&t);
+        kdb_enc_reset(&e);
+        m_batch_begin(&e, 5); m_batch_end(&e, 5, 0, 0, 0);
+        sink_t s = { malloc(e.len), e.len, &t, 0, 0 };
+        if (s.p) {
+            memcpy(s.p, e.buf, e.len);
+            (void)kdb_hot_encode(&hl, &t, KDB_T_WARM_LIST, 1, 0, KDB_HF_LOADED, 3, sink_emit, &s);
+            kdb_enc_reset(&e);
+            kdb_enc_begin(&e, KDB_T_HOT_ACK); kdb_enc_u64(&e, 1, 1); kdb_enc_u8(&e, 2, KDB_HA_WRITTEN); kdb_enc_u32(&e, 3, 3); kdb_enc_str(&e, 4, "none"); kdb_enc_end(&e);
+            uint8_t *np = realloc(s.p, s.len + e.len);
+            if (np) {
+                s.p = np;
+                memcpy(s.p + s.len, e.buf, e.len);
+                s.len += e.len;
+                kdb_enc_t fake = { .buf = s.p, .len = s.len };
+                rc |= write_seed(dir, "seed_loader_warm_list.bin", 0xC0, &fake);
+            }
+            free(s.p);
+        }
+        sink_t b = { NULL, 0, &t, 0, 0 };
+        (void)kdb_hot_encode(&hl, &t, KDB_T_HOT_LIST, 7, 10000, -1, 0, sink_emit, &b);
+        if (b.p) {
+            kdb_enc_t fake = { .buf = b.p, .len = b.len };
+            rc |= write_seed(dir, "seed_backend_hot_list.bin", 0x80, &fake);
+            free(b.p);
+        }
+        size_t tl = 0;
+        char *txt = kdb_hotl_serialize(&hl, &tl);
+        if (txt) {
+            kdb_enc_t fake = { .buf = (uint8_t *)txt, .len = tl };
+            rc |= write_seed(dir, "seed_hot_state_file.bin", 0x84, &fake);
+            free(txt);
+        }
+        kdb_enc_free(&t);
+        kdb_hotl_free(&hl);
+        kdb_enc_reset(&e);
+    }
     kdb_enc_free(&e);
     return rc;
 }
@@ -2031,6 +2478,7 @@ int main(int argc, char **argv) {
     test_checkproto();
     test_fetch_req_and_inventory();
     test_fetch_stream_machine();
+    test_hot_list();
     test_names();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;

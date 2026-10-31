@@ -34,6 +34,12 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd);
  * not running.  Called by the control thread; never blocks. */
 void db_ingest_config_changed(void);
 
+/* D1a step 7 (database { warm-before-serve }): should the workers still wait before they read their sockets?  True from the start until the loader's hot
+ * list has been read, or the configured time is up, whichever comes first (always false without the option).  The query sockets stay unread meanwhile, so the
+ * kernel queues the UDP datagrams and the TCP connections wait in the listen queue (a client retries as it does for any slow server; no SERVFAIL is sent, a
+ * resolver would hold that against the server); the control channel is not held.  Any thread; no lock. */
+bool db_ingest_hold_queries(void);
+
 /* `karictl dbstatus [zone [view]]`: text for the control channel (design 5.2).  Returns the length written to out
  * (always NUL terminated), or 0 when the configuration has no database block.  Control thread. */
 size_t db_ingest_status(const char *zone, const char *view, char *out, size_t cap);

@@ -174,6 +174,8 @@ Every database gets a line `[RESULT] Database ...: N zone(s) read, E error(s), W
 | the settings text of a zone or of its profile (`karidns_profiles`) does not parse in restricted mode, the profile is not defined | error |
 | the settings name a TSIG key that `karidns.conf` does not define | error |
 | an `allow-transfer` / `allow-update` / `ecs-trusted-resolvers` entry that lies outside `acl-ceiling`, a key that `acl-ceiling` does not list, or ACLs while no `acl-ceiling` is configured (a database ACL refuses every client then) | warning |
+| `loader-state-file` (D1a step 7): the directory does not exist or cannot be written by the loader user (the loader writes `<file>.tmp` there and renames it), the file cannot be read by it | error |
+| `loader-state-file` that is not a valid hot list (empty, truncated, a bad count or checksum: the loader ignores it and the next list replaces it); a directory that everybody can write in; `loader-state-file` or `warm-before-serve` without `memory-limit` (`karicheck conf`) | warning |
 | **Zones of `karidns.conf` and views** | |
 | a zone of the same name in the view of the configuration hides the database zone: with `file` / `type master` (D-PRIO), `type program` / `type forward` (D-PROG) | warning |
 | a `karidns_domain_views` row names a view that is not defined, or one that does not read the database through the shared source | warning |

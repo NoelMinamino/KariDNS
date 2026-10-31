@@ -4,7 +4,7 @@
 /*
  * dns_db_stream.h - KDB1: the byte stream between karidns-dbloader and the Backend (design: beta design 1.4).
  *
- * Pure functions, no I/O.  Shared by the loader (encoder, decoder of Backend messages) and the Backend
+ * Pure functions, no I/O (but the hot list's state file, kdb_hotl_file_*, which only the loader calls).  Shared by the loader (encoder, decoder of Backend messages) and the Backend
  * (decoder of loader messages + state machine).  The Backend treats every byte as hostile.
  *
  *   encoder  kdb_enc_*       growable buffer (malloc), TLV appenders.                     (encoder side only)
@@ -80,6 +80,14 @@
  *                     that reload loaded) | 10 req_error str<=255 (why the last read of the requests or write of the status
  *                     row failed, absent = none) | 11 req_time u64 (unix seconds of the last status row written, 0 = never).
  *                     An entry is sent for a view that has auto reload on or whose source has the multi-server tables.
+ *   WARM_LIST (13)    D1a step 7 (design 8.4); only between batches (state READY), no state change.  The zones the loader's state file lists, in the
+ *                     order the Backend should read them, sent once after the startup load (an empty list when there is none), in parts:
+ *                     1 list_id u64 R | 2 part u32 R (0, 1, ... in order) | 3 last u8 R (0/1) | 4 ENTRY nested, repeatable (<= KDB_HOT_PART_MAX):
+ *                     1 view str ne <=255 R (the NAME of the view, not an index: the file outlives a reconfiguration) | 2 zone name R |
+ *                     6 file_state u8 O (KDB_HF_*: what the loader found in its state file at its start) | 7 file_zones u32 O (the zones the file held).
+ *                     Tag 5 is not used by this message.  The Backend treats the entries as untrusted: a name that is not a zone of its directory is ignored.
+ *   HOT_ACK (14)      D1a step 7; only between batches, no state change.  The loader's answer to the last part of a HOT_LIST:
+ *                     1 list_id u64 R | 2 status u8 R (KDB_HA_*) | 3 zones u32 R (the zones the state file holds now) | 4 error str<=255 O
  * Backend -> loader (type | 0x8000)
  *   CONFIG (0x8001)   1 generation u64 R | 2 driver str ne <=32 R | 3 server_id str<=64 O |
  *                     4 VIEW nested, repeatable (<= 1024):
@@ -104,6 +112,11 @@
  *   FETCH_REQ (0x8007) D1a, fetch stream only: 1 request_id u64 R (> 0) | 2 view view R | 3 zone name R |
  *                     4 priority u8 R (0 a query waits for it, 1 warm-up, 2 background) | 5 mode u8 R (0 the zone, 1 its summary) |
  *                     6 range_lo name O | 7 range_hi name O (D1b: both or none; a loader that does not read ranges answers ZONE_FAILED)
+ *   HOT_LIST (0x8008) D1a step 7 (design 8.4), first stream only: the zones most asked for, hottest first, in parts as WARM_LIST (tags 1..4 the same;
+ *                     5 limit u32 O: the most entries the loader keeps in its state file, <= KDB_HOT_MAX, absent = KDB_HOT_MAX).  Several parts carry
+ *                     one list_id; a part that does not follow the one before (or a new list_id) starts the list again.  The loader merges the list
+ *                     with what it has (the zones of the old list that nobody asked for since stay after the new ones), writes the state file when
+ *                     the last part has come, and answers with HOT_ACK.  The entries are untrusted input of the loader: counts, names and views are checked.
  *
  * The fetch stream (D1a, design 6.1) is a second KDB1 stream, made by the supervisor with the first.  It carries only what a
  * parked query waits for: FETCH_REQ from the Backend; from the loader, ZONE_BEGIN .. ZONE_DATA .. ZONE_END / ZONE_ABORT (PROFILE
@@ -126,6 +139,13 @@
 #define KDB_VIEWS_ANY 0xFFFFFFFFu    /* view_count: do not check view indexes */
 #define KDB_MAX_CONFIG_VIEWS 1024
 #define KDB_MAX_PROFILES 65535u      /* PROFILE messages per batch */
+#define KDB_HOT_PART_MAX 16384        /* D1a step 7: entries of one HOT_LIST / WARM_LIST message (a part) */
+#define KDB_HOT_MAX 100000            /* ... and of the whole list (database { hot-list-size } is at most this) */
+#define KDB_HOT_FILE_MAX (64u << 20)  /* a state file above this many bytes is not read */
+/* the state file at the loader's start: none configured, read, not there, ignored (corrupt), cannot be read */
+enum { KDB_HF_NONE = 0, KDB_HF_LOADED, KDB_HF_MISSING, KDB_HF_CORRUPT, KDB_HF_UNREADABLE, KDB_HF_N };
+/* HOT_ACK: written, same as the file (not written again), could not be written, no state file configured, the list was not valid */
+enum { KDB_HA_WRITTEN = 0, KDB_HA_UNCHANGED, KDB_HA_FAILED, KDB_HA_NOFILE, KDB_HA_IGNORED, KDB_HA_N };
 #define KDB_DEFAULT_MAX_ZONE_RECORDS 10000000ull
 #define KDB_DEFAULT_MAX_ZONE_BYTES (1ull << 30)
 
@@ -133,11 +153,12 @@ enum {
     /* loader -> Backend */
     KDB_T_HELLO = 1, KDB_T_INVENTORY_REQ = 2, KDB_T_BATCH_BEGIN = 3, KDB_T_ZONE_BEGIN = 4, KDB_T_ZONE_DATA = 5,
     KDB_T_ZONE_END = 6, KDB_T_ZONE_ABORT = 7, KDB_T_ZONE_FAILED = 8, KDB_T_ZONE_DELETE = 9, KDB_T_PROFILE = 10,
-    KDB_T_BATCH_END = 11, KDB_T_AUTO_STATUS = 12,
+    KDB_T_BATCH_END = 11, KDB_T_AUTO_STATUS = 12, KDB_T_WARM_LIST = 13, KDB_T_HOT_ACK = 14,
     /* Backend -> loader: high bit set */
     KDB_T_CONFIG = 0x8001, KDB_T_RELOAD_REQ = 0x8002, KDB_T_INVENTORY = 0x8003, KDB_T_INVENTORY_END = 0x8004,
     KDB_T_ZONE_RESULT = 0x8005, KDB_T_BATCH_RESULT = 0x8006,
-    KDB_T_FETCH_REQ = 0x8007            /* D1a: fetch stream */
+    KDB_T_FETCH_REQ = 0x8007,           /* D1a: fetch stream */
+    KDB_T_HOT_LIST = 0x8008             /* D1a step 7: the zones most asked for (first stream) */
 };
 
 enum { KDB_FETCH_PRIO_QUERY = 0, KDB_FETCH_PRIO_WARM, KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_PRIO_N };
@@ -282,6 +303,14 @@ typedef struct {
     uint32_t n_applied, n_unchanged, n_rejected, n_deleted;
 } kdb_batch_result_t;
 typedef struct {
+    uint64_t list_id; uint32_t part; bool last; uint32_t n_entries;
+    uint32_t limit;             /* HOT_LIST tag 5, 0 = absent */
+    int file_state;             /* WARM_LIST tag 6 (KDB_HF_*), -1 = absent */
+    uint32_t file_zones;        /* WARM_LIST tag 7 */
+    const uint8_t *body; uint32_t body_len;       /* for kdb_hot_entries() */
+} kdb_hot_list_t;
+typedef struct { uint64_t list_id; uint8_t status; uint32_t zones; kdb_str_t error; } kdb_hot_ack_t;
+typedef struct {
     uint64_t request_id; uint16_t view; char name[DNS_NAME_TEXT_SIZE]; uint8_t priority, mode;
     bool has_range; char range_lo[DNS_NAME_TEXT_SIZE], range_hi[DNS_NAME_TEXT_SIZE];
 } kdb_fetch_req_t;
@@ -295,7 +324,7 @@ typedef struct {
         kdb_zone_delete_t zone_delete; kdb_profile_t profile; kdb_batch_end_t batch_end; kdb_auto_status_t auto_status;
         kdb_config_t config; kdb_reload_req_t reload_req; kdb_inventory_t inventory;
         kdb_inventory_end_t inventory_end; kdb_zone_result_t zone_result; kdb_batch_result_t batch_result;
-        kdb_fetch_req_t fetch_req;
+        kdb_fetch_req_t fetch_req; kdb_hot_list_t hot_list; kdb_hot_ack_t hot_ack;
     } u;
 } kdb_msg_t;
 
@@ -331,6 +360,36 @@ void kdb_config_views(const kdb_msg_t *m, kdb_iter_t *it);
 bool kdb_config_views_next(kdb_iter_t *it, kdb_config_view_t *out);
 void kdb_inventory_entries(const kdb_msg_t *m, kdb_iter_t *it);
 bool kdb_inventory_entries_next(kdb_iter_t *it, kdb_inventory_entry_t *out);
+
+/* ---------------------------------------------------------------- hot list (D1a step 7, design 8.4) */
+/* The zones most asked for, hottest first: (view name, zone name) pairs in a malloc'd buffer, "view\0zone\0" each.  Used by the Backend (HOT_LIST out, WARM_LIST in),
+ * the loader (the state file, the merge) and the state file's reader.  Every pair is validated when it is added: the view is 1..255 printable ASCII bytes, the
+ * zone a canonical absolute name, the list at most KDB_HOT_MAX pairs. */
+typedef struct { char *buf; size_t len, cap; uint32_t n; } kdb_hotl_t;
+void kdb_hotl_init(kdb_hotl_t *l);
+void kdb_hotl_free(kdb_hotl_t *l);
+void kdb_hotl_clear(kdb_hotl_t *l);
+bool kdb_hotl_add(kdb_hotl_t *l, const char *view, const char *zone);     /* false: not valid, the list is full, or out of memory (the list is unchanged) */
+bool kdb_hotl_next(const kdb_hotl_t *l, size_t *pos, const char **view, const char **zone);   /* *pos starts at 0 */
+bool kdb_hotl_equal(const kdb_hotl_t *a, const kdb_hotl_t *b);
+/* out = the entries of fresh, then those of old that fresh does not have, at most limit (a pair twice in fresh counts once).  false: out of memory. */
+bool kdb_hotl_merge(const kdb_hotl_t *fresh, const kdb_hotl_t *old, uint32_t limit, kdb_hotl_t *out);
+/* Encode l as messages of type (KDB_T_HOT_LIST or KDB_T_WARM_LIST) into e, one part at a time: emit(ud) is called with each finished message in e (it sends it and
+ * resets e).  limit 0 = no tag 5; file_state < 0 = no tags 6 and 7.  0, or -1 (an emit failed, or the encoder is out of memory). */
+int kdb_hot_encode(const kdb_hotl_t *l, kdb_enc_t *e, uint16_t type, uint64_t list_id, uint32_t limit, int file_state, uint32_t file_zones,
+                   int (*emit)(void *ud), void *ud);
+void kdb_hot_entries(const kdb_msg_t *m, kdb_iter_t *it);
+bool kdb_hot_entries_next(kdb_iter_t *it, char view[256], char zone[DNS_NAME_TEXT_SIZE]);
+
+/* The state file (design 8.4, decision 10).  Text: a first line "KARIDNS-HOT-LIST 1", one line "view TAB zone" per entry, hottest first, and a last line
+ * "END <count> <checksum>" (FNV-1a of the entry lines, 8 hex digits); anything else (a truncated file, a bad line, a wrong count or checksum, bytes after END,
+ * an empty file) is refused.  The reader never trusts the file: it may be damaged or written by somebody else. */
+bool kdb_hotl_parse(const char *buf, size_t len, kdb_hotl_t *out, char *why, size_t whylen);   /* why: a reason without bytes of the file */
+char *kdb_hotl_serialize(const kdb_hotl_t *l, size_t *len);                                    /* malloc'd, NULL: out of memory */
+/* Read: KDB_HF_LOADED (out holds the list), KDB_HF_MISSING, KDB_HF_CORRUPT (ignored; why says what) or KDB_HF_UNREADABLE (why = strerror) */
+int kdb_hotl_file_read(const char *path, kdb_hotl_t *out, char *why, size_t whylen);
+/* Write l to path atomically: path.tmp (new, mode 0600, never follows a link), fsync, rename.  0, or -1 with err set. */
+int kdb_hotl_file_write(const char *path, const kdb_hotl_t *l, char *err, size_t errlen);
 
 /* ---------------------------------------------------------------- Backend state machine */
 typedef struct {

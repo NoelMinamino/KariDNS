@@ -2463,6 +2463,8 @@ worker_startup_success:;
   // イベントループ(=信頼できないネットワーク入力の処理)を開始しない。
   while (!atomic_load_explicit(&g_privilege_drop_complete, memory_order_acquire))
     sched_yield();
+  while (db_ingest_hold_queries())                       // database { warm-before-serve }: the sockets stay unread (the kernel queues what comes) until the hot list is read or the time is up
+    usleep(1000);
   if (getppid() != parent_pid)
     backend_shutdown(0); /* O-15: スレッドが動いているので exit() は使わない */
   compress_ctx_t thread_compress_ctx = {0};
@@ -3274,7 +3276,7 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
   if (o->dnstap.enabled != n->dnstap.enabled || str_differs(o->dnstap.socket_path, n->dnstap.socket_path))
     append_list_item(buf, sz, "dnstap socket");
   /* beta design 7.1: the loader is started once by the supervisor, so adding or removing the database block and
-   * these four options take effect only after a restart (everything else in the block reloads) */
+   * these options (driver, loader-user, loader-group, loader-path, loader-state-file) take effect only after a restart (everything else in the block reloads) */
   if (o->database.enabled != n->database.enabled) {
     append_list_item(buf, sz, "database block");
   } else if (o->database.enabled) {
@@ -3282,6 +3284,7 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
     if (str_differs(o->database.loader_user, n->database.loader_user)) append_list_item(buf, sz, "database loader-user");
     if (str_differs(o->database.loader_group, n->database.loader_group)) append_list_item(buf, sz, "database loader-group");
     if (str_differs(db_loader_path(o), db_loader_path(n))) append_list_item(buf, sz, "database loader-path");
+    if (str_differs(o->database.loader_state_file, n->database.loader_state_file)) append_list_item(buf, sz, "database loader-state-file");
   }
 }
 
@@ -4255,7 +4258,7 @@ void *control_thread_func(void *arg) {
 #endif
             } else if (strcmp(cmd, "dbstatus") == 0) {
               /* beta design 5.2: the loader, the batches and the DB zones of the registry */
-              char dbbuf[4096];
+              char dbbuf[8192];
               size_t dblen = db_ingest_status(arg, view_arg, dbbuf, sizeof(dbbuf));
               if (dblen == 0) (void)ctl_send_all(cfd, "ERROR no database block is configured\n", 38);
               else (void)ctl_send_all(cfd, dbbuf, dblen);

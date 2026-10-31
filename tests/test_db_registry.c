@@ -1433,6 +1433,22 @@ static void test_dir_elements(void) {
 }
 
 /* D1a milestone 2: the digest block, the fetch state of an element that has no data, the summary, the lookup that tells a worker to park. */
+struct hot_got { char view[8][64], zone[8][64]; int n; };
+struct hot_all { char zone[64][16]; int n; };
+static void hot_collect_all(void *ud, const char *view, const char *zone) {
+    struct hot_all *g = ud;
+    (void)view;
+    if (g->n < 64) snprintf(g->zone[g->n++], 16, "%s", zone);
+}
+static void hot_collect(void *ud, const char *view, const char *zone) {
+    struct hot_got *g = ud;
+    if (g->n < 8) {
+        snprintf(g->view[g->n], 64, "%s", view);
+        snprintf(g->zone[g->n], 64, "%s", zone);
+        g->n++;
+    }
+}
+
 static void test_dir_fetch_state(void) {
     printf("[TEST] zone directory: digest block, fetch state, summary, the lookup for a query (find_zone_for_query_ex)...\n");
     write_zone_file("fs.zone", "fs.test.", "192.0.2.1");
@@ -1503,6 +1519,56 @@ static void test_dir_fetch_state(void) {
         ea->flags |= ZDIR_F_DELETED;
         CHECK(!dbreg_warm_take("default", "a.test.", NULL) && !dbreg_warm_mark("default", "a.test."));
         ea->flags &= (uint16_t)~(ZDIR_F_DELETED | ZDIR_F_PIN);
+        /* D1a step 7: a zone of the hot list is read whole when it has no data and a version; the list is left in any case */
+        CHECK(!dbreg_warm_take_hot("default", "nope.test.") && !dbreg_warm_take_hot("nosuchview", "a.test."));
+        CHECK(dbreg_warm_mark("default", "a.test.") && dbreg_warm_take_hot("default", "a.test.") && !(ea->flags & ZDIR_F_WARM));
+        CHECK(!dbreg_warm_take_hot("default", "b.test."));                    /* (it has its data) */
+        ea->shadowed = true;
+        CHECK(!dbreg_warm_take_hot("default", "a.test."));                    /* hidden by a zone of karidns.conf */
+        ea->shadowed = false;
+        atomic_store(&ea->state, ZDIR_ST_ERROR);
+        CHECK(!dbreg_warm_take_hot("default", "a.test."));                    /* no usable version */
+        atomic_store(&ea->state, ZDIR_ST_LOADING);
+        CHECK(!dbreg_warm_take_hot("default", "a.test."));                    /* on its way already */
+        atomic_store(&ea->state, ZDIR_ST_ABSENT);
+        ea->flags |= ZDIR_F_DELETED;
+        CHECK(!dbreg_warm_take_hot("default", "a.test."));
+        ea->flags &= (uint16_t)~ZDIR_F_DELETED;
+        CHECK(dbreg_warm_take_hot("default", "a.test."));
+        /* the scan for the hot list: the highest frequency first, the queries of a zone in memory folded in, a slice at a time */
+        {
+            struct hot_got got;
+            memset(&got, 0, sizeof(got));
+            zone_db_entry_t *eb = dbreg_lookup_entry("default", "b.test.");
+            CHECK(eb != NULL);
+            atomic_store(&ea->freq, 50);
+            if (eb) atomic_store(&eb->observatory.queries_total, 5);
+            dbreg_hot_t *h = dbreg_hot_begin(8);
+            CHECK(h != NULL && dbreg_hot_step(h));                             /* (a registry of a few zones: one slice) */
+            CHECK(dbreg_hot_emit(h, hot_collect, &got) == 2 && got.n == 2);
+            CHECK(strcmp(got.zone[0], "a.test.") == 0 && strcmp(got.zone[1], "b.test.") == 0 && strcmp(got.view[0], "default") == 0);
+            CHECK(atomic_load(&ea->freq) == 50);                               /* (a zone out of memory keeps its count) */
+            h = dbreg_hot_begin(1);                                            /* only the hottest */
+            memset(&got, 0, sizeof(got));
+            CHECK(h && dbreg_hot_step(h) && dbreg_hot_emit(h, hot_collect, &got) == 1 && strcmp(got.zone[0], "a.test.") == 0);
+            CHECK(dbreg_hot_begin(0) == NULL);
+            h = dbreg_hot_begin(4);                                            /* a pass that is given up */
+            CHECK(h != NULL);
+            dbreg_hot_free(h);
+            dbreg_hot_free(NULL);
+            ea->flags |= ZDIR_F_DELETED;                                       /* a deleted or hidden zone is not on the list */
+            h = dbreg_hot_begin(4);
+            memset(&got, 0, sizeof(got));
+            CHECK(h && dbreg_hot_step(h) && dbreg_hot_emit(h, hot_collect, &got) == 1 && strcmp(got.zone[0], "b.test.") == 0);
+            ea->flags &= (uint16_t)~ZDIR_F_DELETED;
+            atomic_store(&ea->freq, 0);
+            h = dbreg_hot_begin(4);                                            /* a zone nobody asked for is not on the list */
+            memset(&got, 0, sizeof(got));
+            CHECK(h && dbreg_hot_step(h) && dbreg_hot_emit(h, hot_collect, &got) == 1 && strcmp(got.zone[0], "b.test.") == 0);
+            dbreg_residency_t rs;
+            dbreg_residency(&rs);
+            CHECK(rs.total >= 2 && rs.resident >= 1 && rs.absent >= 1 && rs.total == rs.resident + rs.absent);
+        }
         /* the apex a summary brings (D1a step 6): into an element without data and with the same source id, the old block goes with the garbage; a zone
          * that has its data takes none, and the data clears it */
         zdir_apex_t *ap1 = calloc(1, sizeof(*ap1)), *ap2 = calloc(1, sizeof(*ap2)), *ap3 = calloc(1, sizeof(*ap3));
@@ -1551,6 +1617,46 @@ static void test_dir_fetch_state(void) {
     CHECK(find_zone_for_query_ex(v, "c.a.test.", 43, &pel) == a && pel == ea);
     CHECK(find_zone_for_query_ex(v, "www.a.test.", 1, &pel) == a && pel == ea);
     release_zone_snapshot(s);
+    dbreg_reset();
+}
+
+/* D1a step 7: the scan for the hot list over more zones than the list holds, whatever the order of the registry: the n_max with the highest counts, hottest first
+ * (the min-heap replaces its lowest), a zone without a count is left out, and a pass that is given up frees what it holds */
+static void test_hot_scan_order(void) {
+    printf("[TEST] zone directory: the hot list keeps the zones asked for most, hottest first...\n");
+    write_zone_file("hs.zone", "hs.test.", "192.0.2.1");
+    char conf[1024];
+    snprintf(conf, sizeof(conf), "%s/hs.zone", g_dir);
+    server_config_t *cfg = load_conf("view \"default\" { match-clients { any; };\n  zone \"hs.test\" { type master; file \"%s\"; }; };\n", conf);
+    rebuild(cfg);
+    for (int i = 0; i < 40; i++) {
+        char zname[32];
+        snprintf(zname, sizeof(zname), "h%02d.test.", i);
+        zone_db_entry_t *ez = add_zone("default", zname, 5, 1, 500 + i);
+        CHECK(ez != NULL);
+        if (ez && i != 7) atomic_store(&ez->observatory.queries_total, (uint64_t)(i + 1));          /* (h07 is asked for by nobody) */
+    }
+    struct hot_got got;
+    for (uint32_t n_max = 1; n_max <= 8; n_max += 7) {
+        memset(&got, 0, sizeof(got));
+        dbreg_hot_t *h = dbreg_hot_begin(n_max);
+        CHECK(h && dbreg_hot_step(h) && dbreg_hot_emit(h, hot_collect, &got) == n_max && (uint32_t)got.n == n_max);
+        for (uint32_t i = 0; i < n_max; i++) {
+            char want[32];
+            snprintf(want, sizeof(want), "h%02u.test.", 39 - i);
+            CHECK(strcmp(got.zone[i], want) == 0 && strcmp(got.view[i], "default") == 0);
+        }
+    }
+    memset(&got, 0, sizeof(got));
+    dbreg_hot_t *h = dbreg_hot_begin(100);                                 /* more room than zones: every zone with a count, 39 of 40 */
+    CHECK(h && dbreg_hot_step(h));
+    struct hot_all all;
+    memset(&all, 0, sizeof(all));
+    CHECK(dbreg_hot_emit(h, hot_collect_all, &all) == 39 && all.n == 39);
+    for (int i = 0; i < all.n; i++) CHECK(strcmp(all.zone[i], "h07.test.") != 0);
+    h = dbreg_hot_begin(8);                                               /* a pass given up half way holds candidates: freed */
+    CHECK(h != NULL);
+    dbreg_hot_free(h);
     dbreg_reset();
 }
 
@@ -1964,6 +2070,7 @@ int main(void) {
     test_glue_dirty_on_delete();
     test_dir_elements();
     test_dir_fetch_state();
+    test_hot_scan_order();
     test_cold_no_garbage();
     test_walk_robust();
     test_dir_delta_in_place();
