@@ -64,7 +64,8 @@ _Static_assert(ZDIR_APEX_GLUE_PER_NS == KDB_NOTIFY_ADDR_PER_NS && ZDIR_APEX_NADD
 #define ING_FETCH_MAX 256         /* fetches in flight (D1a): more is refused, the queries then wait for their own deadline */
 #define ING_WARM_NFREQ 8          /* fetches in flight below which the zones nobody asked for yet (pins) are read */
 #define ING_SUMMARY_NFREQ 8       /* summary fetches (the apex of a zone out of memory, after a reload) in flight: they bring no zone data, so memory-limit does not hold them back, this does */
-#define ING_FETCH_LIMITED 16     /* fetches in flight while memory-limit is set: each adds to what the cache manager has to take out again */
+/* ING_FETCH_LIMITED (16 in flight, fixed) held the reads of the whole server to what one fetch thread of the loader did (about 500 a second) and shed the rest, whatever
+ * fetch-rate said.  The limit is database { fetch-concurrency } now (default loader-threads x 16): the loader reads that many zones in parallel, so fetch-rate is what limits the reads. */
 /* a fetch the loader has not answered by then is given up (the queries have timed out long before); a variable for the unit test */
 #define STATIC_TEST
 STATIC_TEST int64_t g_ing_fetch_timeout_ms = 30000;
@@ -77,6 +78,7 @@ typedef struct {
   uint64_t max_zone_records, max_zone_bytes;
   uint64_t memory_limit;
   uint32_t fetch_rate;
+  uint32_t fetch_concurrency, loader_threads;
   uint32_t xfr_timeout_ms;
   uint32_t ingest_threads;
   bool auto_reload;
@@ -492,6 +494,8 @@ static void fill_snap(const server_config_t *cfg, ing_cfg_t *c) {
     c->max_zone_bytes = cfg->database.max_zone_bytes;
     c->memory_limit = cfg->database.memory_limit;
     c->fetch_rate = cfg->database.fetch_rate;
+    c->fetch_concurrency = cfg->database.fetch_concurrency;
+    c->loader_threads = cfg->database.loader_threads;
     c->xfr_timeout_ms = cfg->database.transfer_fetch_timeout_ms;
     c->ingest_threads = cfg->database.ingest_threads;
     c->auto_reload = cfg->database.auto_reload;
@@ -1198,6 +1202,26 @@ static void ing_kick(void) {
 static _Atomic uint64_t g_fetch_shed;   /* fetch requests not made because of memory-limit */
 static _Atomic uint32_t g_fetch_rate = KARIDNS_DB_FETCH_RATE_DEFAULT;   /* database { fetch-rate }: zones read for queries per second */
 static _Atomic uint64_t g_fetch_limited;  /* fetch requests not made because the rate was used up */
+static _Atomic uint32_t g_fetch_conc = KARIDNS_DB_FETCH_CONC_PER_THREAD;   /* fetches in flight while memory-limit is set (database { fetch-concurrency }) */
+
+/* the limit of fetches in flight: fetch-concurrency, or loader-threads x KARIDNS_DB_FETCH_CONC_PER_THREAD (at least 16) when it is not set; never more than the table holds */
+static uint32_t fetch_conc_eff(uint32_t conc, uint32_t loader_threads) {
+  if (conc == 0) {
+    conc = loader_threads * KARIDNS_DB_FETCH_CONC_PER_THREAD;
+    if (conc < 16) conc = 16;
+  }
+  if (conc < KARIDNS_DB_FETCH_CONC_MIN) conc = KARIDNS_DB_FETCH_CONC_MIN;
+  if (conc > ING_FETCH_MAX) conc = ING_FETCH_MAX;
+  return conc;
+}
+static void set_fetch_limits(const ing_cfg_t *c) {
+  atomic_store_explicit(&g_fetch_conc, fetch_conc_eff(c->fetch_concurrency, c->loader_threads), memory_order_relaxed);
+}
+/* the zones nobody asked for yet (the warm-up, the walk for apexes) use at most this many places of the limit or `cap`, half the limit at the most, so that the queries have the rest */
+static uint32_t fetch_sub_limit(uint32_t cap) {
+  uint32_t half = atomic_load_explicit(&g_fetch_conc, memory_order_relaxed) / 2;
+  return half < cap ? half : cap;
+}
 static _Atomic uint64_t g_fetch_issued;   /* fetches of a whole zone sent to the loader (queries, transfers, the warm-up) */
 static _Atomic uint32_t g_xfr_timeout_ms = KARIDNS_DB_XFR_FETCH_TIMEOUT_DEFAULT;   /* database { transfer-fetch-timeout } */
 static _Atomic uint64_t g_apex_asked, g_apex_answered, g_apex_walks;   /* D1a step 6: summaries asked for (for the apex of a zone out of memory, after a reload) / their fetches that ended */
@@ -2718,7 +2742,7 @@ static void warm_drop_hot(ing_t *g) {
   atomic_store_explicit(&g_warm_n, (uint32_t)g->nwarm, memory_order_relaxed);
 }
 static int warm_hot_gate(ing_t *g) {
-  if (g->nfreq >= ING_WARM_NFREQ) return 0;
+  if (g->nfreq >= fetch_sub_limit(ING_WARM_NFREQ)) return 0;
   if (dbreg_cache_limit()) {
     /* the zones in flight are not in the resident bytes yet: estimate them from what the zones of the list added so far (a zone of the list is about that big);
      * until one is in, one at a time.  The mark is the cache manager's high water mark: no zone is taken out of memory to make room for the warm-up. */
@@ -2732,7 +2756,7 @@ static int warm_hot_gate(ing_t *g) {
       warm_drop_hot(g);
       return -1;
     }
-    if (g->nfreq >= ING_FETCH_LIMITED || dbreg_cache_over_limit()) return 0;
+    if (g->nfreq >= atomic_load_explicit(&g_fetch_conc, memory_order_relaxed) || dbreg_cache_over_limit()) return 0;
   }
   uint32_t frate = fetch_refill(g);
   return g->ftokens >= (frate / 2.0 > 1.0 ? frate / 2.0 : 1.0) ? 1 : 0;
@@ -2780,7 +2804,7 @@ static void fetch_issue(ing_t *g) {
       } else if (!dbreg_warm_take(q.view, q.zone, &whole)) continue;
       /* it came into memory meanwhile, was deleted, or has nothing to read for (not pinned, has an apex) */
       q.mode = whole ? KDB_FETCH_FULL : KDB_FETCH_SUMMARY;         /* a pinned zone whole; any other zone in the list is there for its apex */
-      if ((whole && g->nfreq >= ING_WARM_NFREQ) || (!whole && g->nsum >= ING_SUMMARY_NFREQ)) {      /* the zones nobody asked for yet wait for a free place */
+      if ((whole && g->nfreq >= fetch_sub_limit(ING_WARM_NFREQ)) || (!whole && g->nsum >= fetch_sub_limit(ING_SUMMARY_NFREQ))) {      /* the zones nobody asked for yet wait for a free place */
         warm_add_ex(g, q.view, q.zone, hot, false);
         break;
       }
@@ -2813,7 +2837,7 @@ static void fetch_issue(ing_t *g) {
       /* memory-limit (design 8.5): the zones that are fetched add to what the cache manager has to take out again, so with the database zones
        * above the limit, or too many fetches in flight, the request is not made: the queries get "not ready" now instead of at their deadline */
       uint64_t lim = dbreg_cache_limit();      /* (a summary brings no zone data: the limit does not hold it back, ING_SUMMARY_NFREQ bounds it) */
-      if (lim && (g->nfreq >= ING_FETCH_LIMITED || dbreg_cache_over_limit())) {
+      if (lim && (g->nfreq >= atomic_load_explicit(&g_fetch_conc, memory_order_relaxed) || dbreg_cache_over_limit())) {
         if (warm) {
           warm_add_ex(g, q.view, q.zone, hot, false);
           break;
@@ -3175,6 +3199,7 @@ static void *cache_thread(void *arg) {
     uint64_t lim = c.enabled ? c.memory_limit : 0;
     dbreg_cache_set_limit(lim);
     atomic_store_explicit(&g_fetch_rate, c.fetch_rate ? c.fetch_rate : KARIDNS_DB_FETCH_RATE_DEFAULT, memory_order_relaxed);
+    set_fetch_limits(&c);
     atomic_store_explicit(&g_xfr_timeout_ms, c.xfr_timeout_ms ? c.xfr_timeout_ms : KARIDNS_DB_XFR_FETCH_TIMEOUT_DEFAULT, memory_order_relaxed);
     struct timespec ts = { 0, lim ? 50 * 1000000L : 0 };
     if (!lim) {
@@ -3326,6 +3351,7 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
     atomic_store_explicit(&g_hold_deadline_ms, g->hold_start_ms + (int64_t)snap.warm_wait * 1000, memory_order_relaxed);
   }
   atomic_store_explicit(&g_fetch_rate, snap.fetch_rate ? snap.fetch_rate : KARIDNS_DB_FETCH_RATE_DEFAULT, memory_order_relaxed);
+  set_fetch_limits(&snap);
   atomic_store_explicit(&g_xfr_timeout_ms, snap.xfr_timeout_ms ? snap.xfr_timeout_ms : KARIDNS_DB_XFR_FETCH_TIMEOUT_DEFAULT, memory_order_relaxed);
   pthread_t t;
   if (pthread_create(&t, NULL, ingest_thread, g) != 0) {
@@ -3639,8 +3665,9 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     st_append(&c, "zone versions and IXFR deltas: database zones %llu bytes resident + %llu retired; other zones %llu resident + %llu retired\n",
               (unsigned long long)zdb.resident, (unsigned long long)zdb.retired, (unsigned long long)zot.resident,
               (unsigned long long)zot.retired);
-    st_append(&c, "fetch: rate=%u/s refused_by_rate=%llu issued=%llu\n", (unsigned)atomic_load_explicit(&g_fetch_rate, memory_order_relaxed),
-              (unsigned long long)atomic_load_explicit(&g_fetch_limited, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_fetch_issued, memory_order_relaxed));
+    st_append(&c, "fetch: rate=%u/s refused_by_rate=%llu issued=%llu concurrency=%u\n", (unsigned)atomic_load_explicit(&g_fetch_rate, memory_order_relaxed),
+              (unsigned long long)atomic_load_explicit(&g_fetch_limited, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_fetch_issued, memory_order_relaxed),
+              (unsigned)atomic_load_explicit(&g_fetch_conc, memory_order_relaxed));
     dbreg_cache_stats_t cs;
     dbreg_cache_stats(&cs);
     {

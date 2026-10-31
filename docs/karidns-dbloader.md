@@ -88,7 +88,7 @@ make karidns-dbloader DB_DRIVERS="sqlite3 postgresql"
 : TTL for a `records.ttl` that is NULL, 1..2147483647, default 3600.
 
 `--loader-threads N`
-: 1..16, default 1. N workers, each with its own database connection, read and convert disjoint sets of zones (consecutive zones in `domains.id` order); the output is written in `domains.id` order whatever N is. In stream mode the number comes from the configuration (`loader-threads`).
+: 1..16, default 1. N workers, each with its own database connection, read and convert disjoint sets of zones (consecutive zones in `domains.id` order); the output is written in `domains.id` order whatever N is. In stream mode the number comes from the configuration (`loader-threads`). The fetch stream (the zones the Backend asks for) is served by a pool of the same size: one thread reads the requests, and up to N workers (started when a request finds none idle) read one zone each on a connection of their own; the messages of one zone go out together, so zones of two workers never mix. Before, one thread read the zones one at a time (about 500 a second at 11 records a zone in SQLite3).
 
 `--map-view NAME`
 : Keep only the zones that `karidns_domain_views` maps to the view `NAME` (a domain without a row is kept): what a view that uses the shared source of a server gets.

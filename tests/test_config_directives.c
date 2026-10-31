@@ -525,7 +525,7 @@ static void test_database_block(void) {
         "loader-group \"karidns-db\"; loader-path \"/usr/local/libexec/karidns-dbloader\"; "
         "acl-ceiling { 192.0.2.0/24; }; auto-reload yes; poll-interval 5; coalesce 250; default-ttl 600; "
         "bulk-threshold 40; max-zone-records 5000; max-zone-bytes 64M; db-reload-timeout 45; ingest-threads 4; "
-        "loader-threads 8; park-max 2048; park-timeout 800; memory-limit 3g; fetch-rate 500; transfer-fetch-timeout 2500; server-id \"ns1\"; alias-resolver { 192.0.2.53; 2001:db8::53; }; }; };";
+        "loader-threads 8; park-max 2048; park-timeout 800; memory-limit 3g; fetch-rate 500; fetch-concurrency 40; transfer-fetch-timeout 2500; server-id \"ns1\"; alias-resolver { 192.0.2.53; 2001:db8::53; }; }; };";
     if (parse_ok(full, &cfg)) {
         const database_config_t *d = &cfg.database;
         CHECK(d->enabled);
@@ -541,6 +541,7 @@ static void test_database_block(void) {
         CHECK(d->park_max == 2048 && d->park_timeout_ms == 800);                      /* D1a milestone 2 */
         CHECK(d->memory_limit == 3ull << 30);                                         /* D1a step 5 */
         CHECK(d->fetch_rate == 500);                                                  /* D1a: fetch-rate */
+        CHECK(d->fetch_concurrency == 40);                                            /* D1a: fetch-concurrency */
         CHECK(d->transfer_fetch_timeout_ms == 2500);                                  /* D1a step 7: transfer-fetch-timeout */
         CHECK_STR(d->server_id, "ns1");
         CHECK(d->alias_resolver_count == 2);
@@ -582,6 +583,9 @@ static void test_database_block(void) {
     expect_reject("fetch-rate 0", DBP "fetch-rate 0; }; };");
     expect_reject("fetch-rate 100001", DBP "fetch-rate 100001; }; };");
     expect_reject("fetch-rate abc", DBP "fetch-rate abc; }; };");
+    expect_reject("fetch-concurrency 1", DBP "fetch-concurrency 1; }; };");
+    expect_reject("fetch-concurrency 257", DBP "fetch-concurrency 257; }; };");
+    expect_reject("fetch-concurrency abc", DBP "fetch-concurrency abc; }; };");
     expect_reject("max-zone-records 1", DBP "max-zone-records 1; }; };");
     expect_reject("max-zone-bytes 100", DBP "max-zone-bytes 100; }; };");
     expect_reject("max-zone-bytes junk", DBP "max-zone-bytes 1X; }; };");

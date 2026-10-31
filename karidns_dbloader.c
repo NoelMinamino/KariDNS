@@ -537,6 +537,13 @@ struct lio {
     bool is_fetch;                           /* D1a: the fetch stream: the only message of the Backend is FETCH_REQ, queued in fq */
     freq_t fq[FQ_MAX];
     size_t nfq;
+    /* D1a: the fetch stream is served by a pool of workers (loader-threads of them) and read by the thread that owns the stream.  fq, nfq, fq_idle and
+     * fq_allowed are guarded by fq_lock (fq_cond: a request came, the pool size changed, wstop); wlock makes the messages of one zone (or one ZONE_FAILED)
+     * go out together, so that the zones of two workers do not mix on the stream.  wstop ends the workers (the stream is gone, or a worker failed). */
+    pthread_mutex_t fq_lock, wlock;
+    pthread_cond_t fq_cond;
+    size_t fq_idle, fq_allowed;
+    _Atomic bool wstop;
     uint64_t fq_busy;                        /* requests turned away because fq was full (the thread answers them) */
     freq_t fbusy[8];                         /* ... the first few, to be answered "busy" */
     size_t nfbusy;
@@ -785,6 +792,14 @@ static int send_enc(ctx_t *x) {
     return rc;
 }
 
+/* D1a: the fetch stream is written by several workers (and its reader): the messages of one zone, or one ZONE_FAILED, are written between these two calls */
+static void fw_lock(ctx_t *x) {
+    if (x->fetch) pthread_mutex_lock(&x->io->wlock);
+}
+static void fw_unlock(ctx_t *x) {
+    if (x->fetch) pthread_mutex_unlock(&x->io->wlock);
+}
+
 /* reasons go into a TLV `str`: printable ASCII, at most 255 bytes */
 static void clean_reason(const char *in, char *out, size_t cap) {
     size_t k = 0;
@@ -1027,7 +1042,10 @@ static int send_failed(ctx_t *x, const zinfo_t *zi, const char *reason) {
         kdb_enc_name(&x->enc, 2, name) != 0 || kdb_enc_i64(&x->enc, 3, zi->id) != 0 || kdb_enc_str(&x->enc, 4, why) != 0 ||
         (x->fetch && kdb_enc_u64(&x->enc, 5, x->fetch_req) != 0) || kdb_enc_end(&x->enc) != 0)
         return -1;
-    return send_enc(x);
+    fw_lock(x);
+    int rc = send_enc(x);
+    fw_unlock(x);
+    return rc;
 }
 
 /* B7b: a SLAVE zone is a secondary (its masters are domains.master, its data comes by zone transfer, never from `records`); a
@@ -1465,8 +1483,12 @@ static int commit_zone(ctx_t *x, const zinfo_t *zi, zres_t *r) {
     case ZR_FAILED:
         return send_failed(x, zi, r->reason);
     default:                                   /* ZR_SENT */
-        if (r->profile[0] && send_profile_for(x, r->profile) != 0) return -1;   /* B7a: the profile text comes first */
-        if (emit_file(x, r->buf, r->len) != 0) return -1;
+        fw_lock(x);                            /* (D1a: the profile and the zone go out together) */
+        if ((r->profile[0] && send_profile_for(x, r->profile) != 0) || emit_file(x, r->buf, r->len) != 0) {       /* B7a: the profile text comes first */
+            fw_unlock(x);
+            return -1;
+        }
+        fw_unlock(x);
         x->n_zones++;
         if (x->fetch && x->fetch_vname && !zi->summary) fev_push(x->fetch_vname, zi->canon, zi->id, r->serial, r->digest);     /* (a fetch has no inventory of its own: the main thread keeps it; the summary of a fetch is no data in memory) */
         if (x->io && !x->fetch) {              /* sent: what the Backend will have once it says "applied" */
@@ -2543,10 +2565,18 @@ static int fetch_summary(ctx_t *x) {
           kdb_enc_u32(&x->enc, 17, zi->apex->minimum) != 0 || kdb_enc_u32(&x->enc, 18, zi->apex->soa_ttl) != 0 || kdb_enc_u32(&x->enc, 19, zi->apex->ns_ttl) != 0 ||
           kdb_enc_bytes(&x->enc, 20, (const uint8_t *)lapex_ns(zi->apex), strlen(lapex_ns(zi->apex))) != 0 ||
           (zi->apex->glue_len > 0 && kdb_enc_bytes(&x->enc, 21, lapex_glue(zi->apex), zi->apex->glue_len) != 0))) ||
-        kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
+        kdb_enc_end(&x->enc) != 0)
         goto write_failed;
-    if (kdb_enc_begin(&x->enc, KDB_T_ZONE_END) != 0 || kdb_enc_u64(&x->enc, 1, 0) != 0 || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
+    fw_lock(x);                                           /* (D1a: ZONE_BEGIN and ZONE_END go out together) */
+    if (send_enc(x) != 0) {
+        fw_unlock(x);
         goto write_failed;
+    }
+    if (kdb_enc_begin(&x->enc, KDB_T_ZONE_END) != 0 || kdb_enc_u64(&x->enc, 1, 0) != 0 || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0) {
+        fw_unlock(x);
+        goto write_failed;
+    }
+    fw_unlock(x);
     x->n_zones++;
     return 0;
 write_failed:
@@ -2872,7 +2902,7 @@ static void chk_catalogs(ctx_t *x) {
  * case, so this is not supported: the pgsql find_zone (one-zone reads: reload requests, auto reload) matches the indexed name exactly
  * first and falls back to lower() only when that finds nothing, so it can pick another row than the full read does.  Warn instead of
  * making find_zone slower (the finding is about the source, not one zone: it is shown for every view).  The names are compared as names_equal() does (one trailing dot ignored). */
-static const zinfo_t *g_dup_zones;
+static _Thread_local const zinfo_t *g_dup_zones;       /* (thread local: a fetch worker may check too) */
 static int dup_name_cmp(const void *pa, const void *pb) {
     const char *a = g_dup_zones[*(const size_t *)pa].name, *b = g_dup_zones[*(const size_t *)pb].name;
     if (!a) a = "";                                     /* domains.name is NOT NULL; a total order all the same */
@@ -3260,6 +3290,7 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
     case KDB_T_FETCH_REQ: {
         const kdb_fetch_req_t *q = &m.u.fetch_req;
         freq_t *f = NULL;
+        pthread_mutex_lock(&io->fq_lock);                      /* (only the fetch stream gets a FETCH_REQ, and its lock is initialised) */
         if (io->nfq < FQ_MAX) f = &io->fq[io->nfq++];
         else if (io->nfbusy < sizeof(io->fbusy) / sizeof(io->fbusy[0])) f = &io->fbusy[io->nfbusy++];
         else io->fq_busy++;                                    /* beyond even that: the Backend's request times out */
@@ -3270,7 +3301,9 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
             f->mode = q->mode;
             f->range = q->has_range;
             snprintf(f->zone, sizeof(f->zone), "%s", q->name);
+            pthread_cond_broadcast(&io->fq_cond);          /* (broadcast: a worker above fq_allowed would take the wake-up) */
         }
+        pthread_mutex_unlock(&io->fq_lock);
         break;
     }
     case KDB_T_HOT_LIST:
@@ -3473,7 +3506,7 @@ static void io_pump(struct lio *io) {
 static int stream_write(ctx_t *x, const uint8_t *msg, size_t len) {
     struct lio *io = x->io;
     while (len > 0) {
-        if (g_stop || (x->fetch && atomic_load_explicit(&g_fetch_stop, memory_order_relaxed))) {
+        if (g_stop || (x->fetch && (atomic_load_explicit(&g_fetch_stop, memory_order_relaxed) || atomic_load_explicit(&io->wstop, memory_order_relaxed)))) {
             errno = EINTR;
             return -1;
         }
@@ -3485,10 +3518,14 @@ static int stream_write(ctx_t *x, const uint8_t *msg, size_t len) {
         }
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            struct pollfd p = { io->fd, POLLIN | POLLOUT, 0 };
+            struct pollfd p = { io->fd, (short)(x->fetch ? POLLOUT : POLLIN | POLLOUT), 0 };      /* (the fetch stream: its reader thread reads the requests) */
             int r = poll(&p, 1, 1000);
             if (r < 0 && errno != EINTR) return -1;
-            if (r > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR))) {
+            if (r > 0 && x->fetch && (p.revents & (POLLHUP | POLLERR))) {
+                errno = EPIPE;
+                return -1;
+            }
+            if (r > 0 && !x->fetch && (p.revents & (POLLIN | POLLHUP | POLLERR))) {
                 io_pump(io);
                 if (io->eof || io->failed) {
                     errno = EPIPE;
@@ -3682,6 +3719,8 @@ static int g_fetch_fd = -1;
 static pthread_mutex_t g_fcfg_lock = PTHREAD_MUTEX_INITIALIZER;
 static lcfg_t g_fcfg;
 static uint64_t g_fcfg_seq;
+#define FW_MAX 16                                   /* workers of the pool: the most loader-threads can be */
+typedef struct { struct lio *io; unsigned idx; } fw_arg_t;
 static pthread_t g_fetch_tid;
 static bool g_fetch_started;
 
@@ -3724,7 +3763,10 @@ static int fetch_fail(ctx_t *x, const freq_t *r, const char *reason) {
     if (kdb_enc_begin(&x->enc, KDB_T_ZONE_FAILED) != 0 || kdb_enc_u16(&x->enc, 1, r->view) != 0 || kdb_enc_name(&x->enc, 2, r->zone) != 0 ||
         kdb_enc_i64(&x->enc, 3, 0) != 0 || kdb_enc_str(&x->enc, 4, why) != 0 || kdb_enc_u64(&x->enc, 5, r->id) != 0 || kdb_enc_end(&x->enc) != 0)
         return -1;
-    return send_enc(x);
+    fw_lock(x);
+    int rc = send_enc(x);
+    fw_unlock(x);
+    return rc;
 }
 
 /* one request.  0, or -1 when the stream is gone / the loader is told to stop / out of memory */
@@ -3765,6 +3807,67 @@ static int fetch_one(ctx_t *x, const lcfg_t *lc, const freq_t *r) {
     return 0;
 }
 
+/* Ends the workers of the pool (the stream is gone, a worker failed, or the loader stops).  Under fq_lock, so that a worker that is about to wait sees it. */
+static void fetch_workers_stop(struct lio *io) {
+    pthread_mutex_lock(&io->fq_lock);
+    atomic_store(&io->wstop, true);
+    pthread_cond_broadcast(&io->fq_cond);
+    pthread_mutex_unlock(&io->fq_lock);
+}
+
+/* a worker of the pool: takes the most urgent request (priority 0 before 1 before 2, the oldest first) and runs it through the same reader as a one-zone
+ * reload, on a database connection of its own.  Worker n works only while loader-threads is more than n (a smaller loader-threads after a reconfiguration
+ * lets the workers above it rest; they are not ended). */
+static void *fetch_worker(void *arg) {
+    fw_arg_t *a = arg;
+    struct lio *io = a->io;
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    x.io = io;
+    x.fetch = true;
+    kdb_enc_init(&x.enc);
+    lcfg_t lc;
+    memset(&lc, 0, sizeof(lc));
+    uint64_t seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&io->fq_lock);
+        while (!atomic_load(&io->wstop) && !(io->nfq > 0 && a->idx < io->fq_allowed)) {
+            io->fq_idle++;
+            pthread_cond_wait(&io->fq_cond, &io->fq_lock);
+            io->fq_idle--;
+        }
+        if (atomic_load(&io->wstop)) {
+            pthread_mutex_unlock(&io->fq_lock);
+            break;
+        }
+        size_t best = 0;
+        for (size_t i = 1; i < io->nfq; i++)
+            if (io->fq[i].prio < io->fq[best].prio) best = i;
+        freq_t r = io->fq[best];
+        memmove(&io->fq[best], &io->fq[best + 1], (io->nfq - best - 1) * sizeof(io->fq[0]));
+        io->nfq--;
+        pthread_mutex_unlock(&io->fq_lock);
+        pthread_mutex_lock(&g_fcfg_lock);
+        if (g_fcfg_seq != seen) {
+            cfg_free(&lc);
+            if (cfg_dup(&g_fcfg, &lc) != 0) cfg_free(&lc);       /* (out of memory: the request below says there is no configuration) */
+            seen = g_fcfg_seq;
+        }
+        pthread_mutex_unlock(&g_fcfg_lock);
+        if (fetch_one(&x, &lc, &r) != 0) {
+            atomic_store(&g_fetch_died, true);                    /* (the stream or the memory is gone: this process does not serve the fetch stream again) */
+            fetch_workers_stop(io);
+            break;
+        }
+    }
+    cfg_free(&lc);
+    ctx_view_reset(&x);
+    kdb_enc_free(&x.enc);
+    return NULL;
+}
+
+/* the thread that owns the fetch stream: reads the requests into the queue (a request beyond FQ_MAX is answered "busy"), keeps the pool at loader-threads
+ * workers (started when a request finds none idle) and ends them when the stream is gone */
 static void *fetch_main(void *arg) {
     int fd = (int)(intptr_t)arg;
     struct lio *io = calloc(1, sizeof(*io));
@@ -3779,48 +3882,61 @@ static void *fetch_main(void *arg) {
     io->fd = fd;
     io->body = body;
     io->is_fetch = true;
+    pthread_mutex_init(&io->fq_lock, NULL);
+    pthread_mutex_init(&io->wlock, NULL);
+    pthread_cond_init(&io->fq_cond, NULL);
+    io->fq_allowed = 1;
     kdb_framer_init(&io->fr, KDB_FROM_BACKEND, body, KDB_MAX_BODY);
     ctx_t x;
     memset(&x, 0, sizeof(x));
     x.io = io;
     x.fetch = true;
     kdb_enc_init(&x.enc);
-    lcfg_t lc;
-    memset(&lc, 0, sizeof(lc));
-    uint64_t seen = 0;
-    while (!g_stop && !atomic_load(&g_fetch_stop) && !io->eof && !io->failed) {
-        while (io->nfbusy > 0) {                              /* the requests that did not fit the queue */
+    fw_arg_t warg[FW_MAX];
+    pthread_t wtid[FW_MAX];
+    unsigned nw = 0;
+    while (!g_stop && !atomic_load(&g_fetch_stop) && !atomic_load(&io->wstop) && !io->eof && !io->failed) {
+        while (io->nfbusy > 0) {                              /* the requests that did not fit the queue (only this thread uses them) */
             freq_t *b = &io->fbusy[--io->nfbusy];
             if (fetch_fail(&x, b, "busy: too many fetch requests are waiting") != 0) goto out;
         }
         struct pollfd p = { fd, POLLIN, 0 };
-        int pr = poll(&p, 1, io->nfq ? 0 : 200);              /* (with work waiting, only look for more requests) */
+        int pr = poll(&p, 1, 200);
         if (pr < 0 && errno != EINTR) break;
         if (pr > 0) io_pump(io);
-        if (io->nfq == 0) continue;
-        size_t best = 0;                                      /* the lowest priority number, the oldest first */
-        for (size_t i = 1; i < io->nfq; i++)
-            if (io->fq[i].prio < io->fq[best].prio) best = i;
-        freq_t r = io->fq[best];
-        memmove(&io->fq[best], &io->fq[best + 1], (io->nfq - best - 1) * sizeof(io->fq[0]));
-        io->nfq--;
         pthread_mutex_lock(&g_fcfg_lock);
-        if (g_fcfg_seq != seen) {
-            cfg_free(&lc);
-            if (cfg_dup(&g_fcfg, &lc) != 0) cfg_free(&lc);       /* (out of memory: the request below says there is no configuration) */
-            seen = g_fcfg_seq;
-        }
+        unsigned want = g_fcfg.loader_threads >= 1 && g_fcfg.loader_threads <= FW_MAX ? g_fcfg.loader_threads : 1;
         pthread_mutex_unlock(&g_fcfg_lock);
-        if (fetch_one(&x, &lc, &r) != 0) break;
+        for (;;) {
+            pthread_mutex_lock(&io->fq_lock);
+            if (io->fq_allowed != want) {
+                io->fq_allowed = want;
+                pthread_cond_broadcast(&io->fq_cond);
+            }
+            bool need = io->nfq > io->fq_idle && nw < want;
+            pthread_mutex_unlock(&io->fq_lock);
+            if (!need) break;
+            warg[nw].io = io;
+            warg[nw].idx = nw;
+            if (pthread_create(&wtid[nw], NULL, fetch_worker, &warg[nw]) != 0) {
+                lg(LOG_ERR, "cannot start a fetch worker");
+                if (nw == 0) goto out;                        /* (none at all: nobody would serve the stream) */
+                break;
+            }
+            nw++;
+        }
     }
 out:
     if (io->failed) lg(LOG_ERR, "the fetch stream is closed (protocol error)");
     else if (io->eof) lg(LOG_NOTICE, "the Backend closed the fetch stream");
     if (!g_stop && !atomic_load(&g_fetch_stop)) atomic_store(&g_fetch_died, true);     /* (not asked to end: this process does not serve the fetch stream again) */
-    cfg_free(&lc);
-    ctx_view_reset(&x);
+    fetch_workers_stop(io);
+    for (unsigned i = 0; i < nw; i++) pthread_join(wtid[i], NULL);
     kdb_enc_free(&x.enc);
     close(fd);                                              /* (the Backend sees the end of the stream) */
+    pthread_cond_destroy(&io->fq_cond);
+    pthread_mutex_destroy(&io->fq_lock);
+    pthread_mutex_destroy(&io->wlock);
     free(body);
     free(io);
     return NULL;

@@ -6160,6 +6160,11 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     db->fetch_rate = (uint32_t)u;
     return 0;
   }
+  if (strcmp(key, "fetch-concurrency") == 0) {   /* fetches in flight to the loader while memory-limit is set (the loader reads that many zones at once, loader-threads of them in parallel) */
+    if (db_take_uint(ctx, key, false, KARIDNS_DB_FETCH_CONC_MIN, KARIDNS_DB_FETCH_CONC_MAX, &u) != 0) return -1;
+    db->fetch_concurrency = (uint32_t)u;
+    return 0;
+  }
   if (strcmp(key, "loader-state-file") == 0) return db_take_string(ctx, "database", key, KARIDNS_DB_PATH_MAX, &db->loader_state_file);     /* the hot list (design 8.4): restart-only, the loader writes it */
   if (strcmp(key, "warm-before-serve") == 0) {        /* seconds to hold back the queries until the zones of the hot list are read (0 = do not wait) */
     if (db_take_uint(ctx, key, false, 0, KARIDNS_DB_WARM_WAIT_MAX, &u) != 0) return -1;
