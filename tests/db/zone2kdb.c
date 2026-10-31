@@ -150,7 +150,7 @@ static int cmd_ref(const char *out_path, const char *list_path, uint32_t default
         buf_t zb = {0};
         char why[400] = "";
         if (rc == 0) {
-            pdns_kdb_params_t p = { 0, (int64_t)n_seen + 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL };
+            pdns_kdb_params_t p = { 0, (int64_t)n_seen + 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 };
             rc = pdns_zone_encode_kdb(z, &p, buf_add, &zb, why, sizeof(why));
         } else if (z) {
             snprintf(why, sizeof(why), "%s", z->error);

@@ -190,8 +190,7 @@ static void init_rich_fuzz_engine(void) {
     // Snapshot View
     memset(&g_fuzz_views[0], 0, sizeof(g_fuzz_views[0]));
     g_fuzz_views[0].name = "default";
-    g_fuzz_views[0].entries = g_fuzz_entry_ptrs;
-    g_fuzz_views[0].zone_count = 3;
+    view_set_entries(&g_fuzz_views[0], g_fuzz_entry_ptrs, 3);
     g_fuzz_views[0].match_clients = g_fuzz_any_acl;
     g_fuzz_views[0].match_clients_count = 1;
 

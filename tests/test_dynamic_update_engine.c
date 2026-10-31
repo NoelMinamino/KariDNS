@@ -593,6 +593,115 @@ static void test_send_notify_to_all_comprehensive(void) {
     printf("  -> send_notify_to_all comprehensive passed.\n");
 }
 
+/* D1a step 7: the NOTIFY of a zone whose data is out of memory (notify_send_nonresident()): the NS hosts come from the apex of its summary -- the glue of the hosts
+ * inside the zone, the addresses of a sibling zone that is in memory, then the addresses the loader found (hosts outside the zone) -- and the also-notify list
+ * of the effective configuration is used as for a zone in memory */
+static void test_notify_zone_out_of_memory(void) {
+    printf("[TEST] Dynamic Update: NOTIFY of a zone that is not in memory (apex block, sibling in memory, loader's addresses)...\n");
+    assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, g_notify_ipc) == 0);
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    view_config_t view_cfg;
+    memset(&view_cfg, 0, sizeof(view_cfg));
+    view_cfg.name = "default";
+    zone_config_t zsib;
+    memset(&zsib, 0, sizeof(zsib));
+    zsib.domain = "sibling.com.";
+    view_cfg.zones = &zsib;
+    cfg.views = &view_cfg;
+    notify_target_t also[1];
+    memset(also, 0, sizeof(also));
+    also[0].ip = "192.0.2.10";
+    also[0].port = 53;
+    cfg.also_notify = also;
+    cfg.also_notify_count = 1;
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    zone_db_snapshot_t *snap = rebuild_zone_db_snapshot(&cfg, NULL, NULL, NULL, NULL, 0);
+    assert(snap != NULL);
+    zone_db_entry_t *zs = snapshot_get_zone(snap, "sibling.com.");
+    assert(zs);
+    init_sample_zone_arena(test_zone_slot(zs, 0), "sibling.com.", "100");
+    zone_arena_t *as = test_zone_slot(zs, 0);
+    dns_record_t *nr = realloc(as->records, sizeof(dns_record_t) * 16);
+    assert(nr);
+    as->records = nr;
+    as->records_cap = 16;
+    dns_record_t r4; memset(&r4, 0, sizeof(r4));
+    DNS_RECORD_BIND_RDATA(r4);
+    r4.name = arena_strdup(as, "ns1.sibling.com.");
+    r4.type_code = 1; r4.rdata_count = 1;
+    r4.rdata[0] = arena_strdup(as, "198.51.100.30");
+    as->records[as->count++] = r4;
+    assert(test_build_index(as, true) == 0);
+    atomic_store_explicit(&zs->rcu.active, &as->ver, memory_order_release);
+
+    /* the apex of nr.example.: MNAME ns0.nr.example. (not an NS host), NS: ns1.sibling.com. (outside, a sibling in memory), ns2.nr.example. (inside, glue 192.0.2.22),
+     * ns9.provider.example. (outside, the loader's addresses: A 198.51.100.9 and AAAA 2001:db8::9), ns0.nr.example. (the MNAME: left out unless notify-to-soa) */
+    static const uint8_t names[] = "\3ns0\2nr\7example\0" "\5admin\2nr\7example\0"
+                                   "\3ns1\7sibling\3com\0" "\3ns2\2nr\7example\0" "\3ns9\10provider\7example\0" "\3ns0\2nr\7example\0";
+    const size_t ml = 16, rl = 18, nsl = 17 + 16 + 22 + 16;
+    static const uint8_t glue[] = { 1, 1, 0, 0, 1, 0x2c, 192, 0, 2, 22 };       /* ns index 1?  the NS list below is 0 ns1.sibling, 1 ns2.nr, 2 ns9.provider, 3 ns0.nr */
+    static const uint8_t naddr[] = { 2, 1, 198, 51, 100, 9, 2, 28, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9 };
+    zdir_apex_t *ap = calloc(1, sizeof(*ap) + ml + rl + nsl + sizeof(glue) + sizeof(naddr));
+    assert(ap);
+    ap->serial = 77; ap->soa_ttl = 3600; ap->refresh = 7200; ap->retry = 600; ap->expire = 86400; ap->minimum = 300; ap->ns_ttl = 3600;
+    ap->mname_len = (uint16_t)ml; ap->rname_len = (uint16_t)rl; ap->ns_len = (uint16_t)nsl; ap->glue_len = sizeof(glue); ap->naddr_len = sizeof(naddr); ap->n_ns = 4;
+    memcpy(ap->data, names, ml + rl + nsl);
+    memcpy(ap->data + ml + rl + nsl, glue, sizeof(glue));
+    memcpy(ap->data + ml + rl + nsl + sizeof(glue), naddr, sizeof(naddr));
+    zdir_elem_t *el = calloc(1, sizeof(*el) + 16);
+    assert(el);
+    strcpy(el->name, "nr.example.");
+    el->klen = 10;
+    atomic_store(&el->serial, 77);
+    atomic_store(&el->apex, ap);
+
+    int ports_ok = 0;
+    for (int round = 0; round < 5; round++) {
+        /* round 0: everything; 1: the apex describes another version (the NS hosts are not used, the also-notify address is); 2: notify explicit (the same);
+         * 3: notify no (nothing); 4: no apex (the also-notify address) */
+        if (round == 1) atomic_store(&el->serial, 78);
+        if (round == 2) { atomic_store(&el->serial, 77); cfg.notify_mode = NOTIFY_MODE_EXPLICIT; }
+        if (round == 3) cfg.notify_mode = NOTIFY_MODE_NO;
+        if (round == 4) { cfg.notify_mode = NOTIFY_MODE_YES; atomic_store(&el->apex, NULL); }
+        notify_send_nonresident(el, "default");
+        int got = 0;
+        bool also_seen = false, sib = false, glue_seen = false, v4 = false, v6 = false, mn = false;
+        for (;;) {
+            alignas(udp_ipc_t) uint8_t buf[2048];
+            ssize_t n = recv(g_notify_ipc[0], buf, sizeof(buf), MSG_DONTWAIT);
+            if (n <= 0) break;
+            got++;
+            udp_ipc_t *ipc = (udp_ipc_t *)buf;
+            if (ipc->client_addr.ss_family == AF_INET) {
+                uint32_t a = ntohl(ipc->client_addr.sin.sin_addr.s_addr);
+                also_seen |= a == 0xC000020AU;   /* 192.0.2.10 */
+                sib |= a == 0xC633641EU;         /* 198.51.100.30 */
+                glue_seen |= a == 0xC0000216U;   /* 192.0.2.22 */
+                v4 |= a == 0xC6336409U;          /* 198.51.100.9 */
+            } else if (ipc->client_addr.ss_family == AF_INET6) {
+                v6 = true;                       /* 2001:db8::9 */
+            }
+            (void)mn;
+        }
+        if (round == 0) assert(got == 5 && also_seen && sib && glue_seen && v4 && v6);       /* also-notify, sibling, glue, the loader's A and AAAA */
+        if (round == 1) assert(got == 1 && also_seen);
+        if (round == 2) assert(got == 1 && also_seen);
+        if (round == 3) assert(got == 0);
+        if (round == 4) assert(got == 1 && also_seen);
+        ports_ok++;
+    }
+    assert(ports_ok == 5);
+    close(g_notify_ipc[0]);
+    close(g_notify_ipc[1]);
+    g_notify_ipc[0] = -1;
+    g_notify_ipc[1] = -1;
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
+    free(ap);
+    free(el);
+    printf("  -> NOTIFY of a zone that is not in memory passed.\n");
+}
+
 static void test_process_update_sections_apex_ns_protection(void) {
     printf("[TEST] Dynamic Update: RFC 2136 §3.4.2.4 apex NS deletion protection via Class NONE...\n");
     zone_arena_t arena;
@@ -763,8 +872,7 @@ static void test_update_multi_tsig_keys(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
 
@@ -1669,8 +1777,7 @@ static void test_update_dispatch_zone_section(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 2;
+    view_set_entries(&view, entries, 2);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
     zone_db_snapshot_t snap;
@@ -1795,8 +1902,7 @@ static void test_update_tsig_matrix(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
     zone_db_snapshot_t snap;
@@ -2720,6 +2826,7 @@ int main(void) {
     test_update_dispatch_zone_section();
     test_update_tsig_matrix();
     test_send_notify_to_all_comprehensive();
+    test_notify_zone_out_of_memory();
     test_notify_tcp_roundtrip();
     test_notify_tcp_flow();
     test_notify_tcp_failures();

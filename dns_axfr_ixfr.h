@@ -128,7 +128,15 @@ typedef struct {
   zone_db_snapshot_t *snap;
   uint32_t idle_out_secs;   /* max-transfer-idle-out: the longest a send may wait for the client (0 = no limit) */
   uint32_t time_out_secs;   /* max-transfer-time-out: the longest the whole transfer may take (0 = no limit) */
+  /* D1a step 7 (design 7, 12-6): the zone is in the directory and its data is not in memory: entry is NULL and elem is the zone's directory element, kept
+   * valid by snap.  The thread answers an IXFR from the summary's apex when the client has the serial it describes, else calls await(elem, view_name),
+   * which returns the zone's entry with the transfer counted in active_axfr (db_ingest_xfr_await()), or NULL (then the client gets SERVFAIL +
+   * EDE 14, RFC 5936 2.2, 4.1.2).  A caller that has the entry sets neither. */
+  zdir_elem_t *elem;
+  char view_name[KARIDNS_VIEW_NAME_MAX];
+  zone_db_entry_t *(*await)(zdir_elem_t *elem, const char *view_name);
 } axfr_worker_args_t;
+
 
 int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
                      zone_arena_t *standby, const zone_version_t *active,

@@ -72,7 +72,9 @@ enum { EXIT_OK = 0, EXIT_ZONES_FAILED = 1, EXIT_USAGE = 2, EXIT_ERROR = 3, EXIT_
 /* Messages.  Dump mode: stderr with the program prefix (the lines the dump tests expect).  Stream mode: syslog
  * (openlog() has LOG_PERROR, so a foreground server still shows them on stderr). */
 static bool g_stream_mode;
-static volatile sig_atomic_t g_stop;      /* SIGTERM / SIGINT in stream mode */
+static _Atomic sig_atomic_t g_stop;      /* SIGTERM / SIGINT in stream mode (atomic: the fetch thread reads it too; a handler may store to a lock-free atomic) */
+static _Atomic bool g_fetch_stop;          /* D1a: the main thread ends the fetch thread */
+static _Atomic bool g_fetch_died;          /* D1a: the fetch thread ended by itself (the Backend closed or broke the fetch stream, or an error): the main thread exits so that the supervisor starts a loader with a new pair of streams */
 
 /* B12, --check: every message of the run is a line of the check protocol (dns_db_checkproto.h) on g_chk_out; g_chk_zone / g_chk_id say
  * which zone the findings are about ("" / 0: the source).  The run is single threaded. */
@@ -148,16 +150,30 @@ static void drivers_list(char *out, size_t cap) {
 /* loader state                                                                                                   */
 /* ------------------------------------------------------------------------------------------------------------- */
 
+/* D1a step 6: the apex of a zone whose summary is sent: what the Backend answers an SOA question from while the zone is out of memory.  data: the SOA's
+ * MNAME NUL RNAME NUL the NS targets separated by LF NUL (canonical absolute names), then glue_len octets of glue (the records of tag 21 of ZONE_BEGIN:
+ * the addresses of the NS targets inside the zone), then naddr_len octets of the addresses of the NS targets outside the zone (tag 22: records of ns index u8 |
+ * type u8 | address, found in the database by name, for the NOTIFY the Backend sends while the zone is out of memory) */
+typedef struct lapex { uint32_t minimum, soa_ttl, ns_ttl; uint16_t glue_len, naddr_len; char data[]; } lapex_t;
+static const char *lapex_rname(const lapex_t *a) { return a->data + strlen(a->data) + 1; }
+static const char *lapex_ns(const lapex_t *a) { const char *r = lapex_rname(a); return r + strlen(r) + 1; }
+static const uint8_t *lapex_glue(const lapex_t *a) { const char *n = lapex_ns(a); return (const uint8_t *)n + strlen(n) + 1; }
+static const uint8_t *lapex_naddr(const lapex_t *a) { return lapex_glue(a) + a->glue_len; }
+
 typedef struct {
     int64_t id;
     char *name;
     char *type;
     char *master;                     /* domains.master (SLAVE / CONSUMER: the masters), NULL if NULL */
+    lapex_t *apex;                    /* D1a step 6: NULL = none (not read, not usable, or the zone has location / time attributes) */
     char *canon;                      /* stream mode: the canonical absolute name, NULL if the name is unusable */
     uint32_t serial;                  /* serial of the enabled apex SOA */
     bool has_serial;
+    bool has_timers;                  /* D1a: the refresh / retry / expire of that SOA (for the summary of a fetch) */
+    uint32_t t_refresh, t_retry, t_expire;
     bool want;                        /* stream mode: read and convert this zone in this load */
-    bool g_ok;                        /* stream mode: the Backend has a version of the zone it did not reject (digest gate) ... */
+    bool summary;                     /* D1a milestone 4: send the summary (settings, serial, SOA timers) instead of the zone: the Backend does not keep its data */
+    bool g_ok;                       /* stream mode: the Backend has a version of the zone it did not reject (digest gate) ... */
     int64_t g_source;                 /* ... with this source id, serial and digest (copied from the inventory by plan_diff(), */
     uint32_t g_serial;                /* so that the conversion threads never read the inventory) */
     uint8_t g_digest[KDB_DIGEST_LEN];
@@ -313,8 +329,11 @@ typedef struct inv_ent {
     uint32_t hash;
     uint16_t vslot;                   /* index into lio.vnames: the view, by name (view indexes move when the views change) */
     bool known;                       /* the Backend has a version (source_id, serial, digest) */
+    bool resident;                    /* D1a: the Backend has the data of the zone in memory (false: only its entry in the directory; the digest is then zero) */
     bool dirty;                       /* the last version offered was rejected / unreadable: offer the zone again */
+    uint32_t fev, p_fev;              /* D1a: fetches of the zone seen by the inventory; the count when the pending version was sent (a fetch that landed meanwhile decides) */
     bool has_pend;
+    bool p_resident;                  /* what was sent is the zone with its data (false: a summary) */
     uint32_t mark;                    /* generation of the diff that saw the zone in the database */
     int64_t source_id, p_source_id;
     uint32_t serial, p_serial;
@@ -375,6 +394,13 @@ typedef struct {
     kdb_enc_t enc;
     /* stream mode (-s FD, B4a); all zero in dump mode, so a ctx_t made by memset() is a dump context */
     struct lio *io;                   /* non-NULL: write to the socket (io->fd) instead of x->out */
+    /* D1a, the fetch thread (second stream): one zone for one FETCH_REQ, no batch, no inventory, no results.  Every ZONE_BEGIN and ZONE_FAILED
+     * carries the request id; with fetch_summary the zone is not read, only its summary is sent. */
+    bool fetch;
+    bool fetch_summary;
+    const char *fetch_vname;          /* D1a: the view of the request being served (the fetch thread tells the inventory what it served) */
+    bool dir_only;                    /* D1a milestone 4: CONFIG dir_only (memory-limit): zones the Backend has no data of are sent as summaries */
+    uint64_t fetch_req;
     uint64_t batch_id;
     uint8_t batch_kind;
     uint64_t change_seq;
@@ -432,12 +458,17 @@ typedef struct {
     uint64_t generation;
     char driver[40], server_id[72];
     uint32_t default_ttl, loader_threads;
+    bool dir_only;
     int bulk_threshold;
     lview_t *views;
     size_t nviews;
 } lcfg_t;
 
 typedef struct { uint64_t id; uint16_t view; bool force; char zone[DNS_NAME_TEXT_SIZE]; } lreq_t;
+
+/* D1a: a FETCH_REQ waiting for the fetch thread (priority 0 = a parked query waits, 1 = warm-up, 2 = background) */
+typedef struct { uint64_t id; uint16_t view; uint8_t prio, mode; bool range; char zone[DNS_NAME_TEXT_SIZE]; } freq_t;
+#define FQ_MAX 256                           /* more than this is answered "busy" (design 6.1) */
 
 #define LREQ_MAX 64
 #define IDX_SLOTS 65536                      /* view indexes are u16 */
@@ -487,6 +518,8 @@ typedef struct {
     char perr[RW_ERRLEN], rerr[RW_ERRLEN];   /* the last error reading requests / loading, and writing the status row ("" = none) */
 } rw_t;
 
+static const char *g_state_file;             /* --state-file (D1a step 7): where the hot list is kept; NULL = nowhere */
+
 struct lio {
     int fd;
     kdb_framer_t fr;
@@ -501,7 +534,21 @@ struct lio {
     uint64_t inv_entries, inv_seq;
     lreq_t req[LREQ_MAX];
     size_t nreq;
-    bool reload_all;                         /* a RELOAD_REQ scope all arrived (or the queue overflowed) */
+    bool is_fetch;                           /* D1a: the fetch stream: the only message of the Backend is FETCH_REQ, queued in fq */
+    freq_t fq[FQ_MAX];
+    size_t nfq;
+    /* D1a: the fetch stream is served by a pool of workers (loader-threads of them) and read by the thread that owns the stream.  fq, nfq, fq_idle and
+     * fq_allowed are guarded by fq_lock (fq_cond: a request came, the pool size changed, wstop); wlock makes the messages of one zone (or one ZONE_FAILED)
+     * go out together, so that the zones of two workers do not mix on the stream.  wstop ends the workers (the stream is gone, or a worker failed). */
+    pthread_mutex_t fq_lock, wlock;
+    pthread_cond_t fq_cond;
+    size_t fq_idle, fq_allowed;
+    _Atomic bool wstop;
+    uint64_t fq_busy;                        /* requests turned away because fq was full (the thread answers them) */
+    freq_t fbusy[8];                         /* ... the first few, to be answered "busy" */
+    size_t nfbusy;
+    bool reload_all;                        /* a RELOAD_REQ scope all arrived (or the queue overflowed) */
+    bool again;                             /* D1a: the Backend answered SEND_BODY to a summary: another diff soon, to send the zones whole */
     uint64_t all_req_id;                     /* the request id of the last scope all request, 0 = none */
     uint64_t batch_seq;
     uint64_t batches_ended, batch_results;   /* BATCH_ENDs sent / BATCH_RESULTs received: a load waits for the difference */
@@ -523,6 +570,14 @@ struct lio {
     char sid[72], sid_why[100];              /* the server id the loader reports under; why it has none */
     bool sid_ok, sid_warned;
     bool status_dirty;                       /* an AUTO_STATUS is due (auto reload or reload request state changed) */
+    /* D1a step 7 (design 8.4): the hot list.  hot_asm collects the parts of a HOT_LIST; the complete list waits in hot_fresh for the main loop (a HOT_ACK
+     * is a message between batches, so nothing is sent from the reader); hot_cur is the list the state file holds (read at the start). */
+    kdb_hotl_t hot_asm, hot_fresh, hot_cur;
+    bool hot_open, hot_ready, hot_on_disk, warm_sent;
+    char hot_why[200];                       /* why the state file could not be read (KDB_HF_UNREADABLE): the file is then not replaced */
+    uint64_t hot_id, hot_fresh_id, warm_seq;
+    uint32_t hot_next, hot_limit, hot_fresh_limit, hot_dropped, hot_fzones;
+    int hot_fstate;                          /* KDB_HF_* of the state file at the start */
 };
 
 static uint32_t name_hash(uint16_t vslot, const char *s) {
@@ -598,6 +653,13 @@ static void inv_free(inv_t *t) {
     memset(t, 0, sizeof(*t));
 }
 
+/* slot of a view name that is in lio.vnames already, -1 if the loader has never been told of it */
+static int vslot_find(const struct lio *io, const char *name) {
+    for (size_t i = 0; i < io->nvn; i++)
+        if (strcasecmp(io->vnames[i], name) == 0) return (int)i;
+    return -1;
+}
+
 /* slot of a view name in lio.vnames (appended when new); (uint16_t)-1 on out of memory.  The slot is stable for the
  * life of the process, so the inventory and the change log positions survive a CONFIG that renumbers the views. */
 static int vslot_get(struct lio *io, const char *name) {
@@ -618,6 +680,77 @@ static int vslot_get(struct lio *io, const char *name) {
     io->vnames[io->nvn] = d;
     memset(&io->vst[io->nvn], 0, sizeof(vstate_t));
     return (int)io->nvn++;
+}
+
+/* D1a: the zones the fetch thread served.  The fetch thread has no inventory (the main thread owns it), so it queues what it sent and the main thread
+ * applies the queue to the inventory before it reads it (fev_drain()): a zone that came into the Backend's memory by a fetch is resident there, and a
+ * later change of it is sent whole instead of as a summary.  A queue that is full drops the event; the Backend then answers SEND_BODY to the summary
+ * (dns_db_ingest.c), so a lost event costs one more round, not a stale zone. */
+#define FEV_MAX 65536
+typedef struct fev {
+    struct fev *next;
+    int64_t source_id;
+    uint32_t serial;
+    uint8_t digest[KDB_DIGEST_LEN];
+    char view[DNS_NAME_TEXT_SIZE];
+    char name[DNS_NAME_TEXT_SIZE];
+} fev_t;
+static pthread_mutex_t g_fev_lock = PTHREAD_MUTEX_INITIALIZER;
+static fev_t *g_fev_head, *g_fev_tail;
+static _Atomic size_t g_fev_n;
+static _Atomic uint64_t g_fev_dropped;
+
+static void fev_push(const char *view, const char *canon, int64_t source_id, uint32_t serial, const uint8_t digest[KDB_DIGEST_LEN]) {
+    if (!view || atomic_load_explicit(&g_fev_n, memory_order_relaxed) >= FEV_MAX) {
+        atomic_fetch_add_explicit(&g_fev_dropped, 1, memory_order_relaxed);
+        return;
+    }
+    fev_t *f = malloc(sizeof(*f));
+    if (!f) {
+        atomic_fetch_add_explicit(&g_fev_dropped, 1, memory_order_relaxed);
+        return;
+    }
+    f->next = NULL;
+    f->source_id = source_id;
+    f->serial = serial;
+    memcpy(f->digest, digest, KDB_DIGEST_LEN);
+    snprintf(f->view, sizeof(f->view), "%s", view);
+    snprintf(f->name, sizeof(f->name), "%s", canon);
+    pthread_mutex_lock(&g_fev_lock);
+    if (g_fev_tail) g_fev_tail->next = f;
+    else g_fev_head = f;
+    g_fev_tail = f;
+    atomic_fetch_add_explicit(&g_fev_n, 1, memory_order_release);
+    pthread_mutex_unlock(&g_fev_lock);
+}
+
+/* main thread: what the fetch thread served goes into the inventory (the Backend has these zones in memory, in these versions).  kick: when a zone was served in
+ * another version than the inventory last offered (the database changed while the fetch was on its way, and the Backend took the summary of the newer version
+ * meanwhile), a diff follows, which sends the newer version whole to the zone that is in memory now.  (A diff does not kick itself: it compares anyway.) */
+static void fev_drain(struct lio *io, bool kick) {
+    if (atomic_load_explicit(&g_fev_n, memory_order_acquire) == 0) return;
+    pthread_mutex_lock(&g_fev_lock);
+    fev_t *f = g_fev_head;
+    g_fev_head = g_fev_tail = NULL;
+    atomic_store_explicit(&g_fev_n, 0, memory_order_release);
+    pthread_mutex_unlock(&g_fev_lock);
+    while (f) {
+        fev_t *nx = f->next;
+        int slot = vslot_find(io, f->view);              /* (a view the CONFIG never named gets no slot from a fetch result) */
+        inv_ent_t *ie = slot >= 0 ? inv_get(&io->inv, (uint16_t)slot, f->name) : NULL;
+        if (ie) {
+            if (kick && ie->known && !ie->has_pend && (ie->source_id != f->source_id || ie->serial != f->serial)) io->again = true;
+            ie->known = true;
+            ie->resident = true;
+            ie->dirty = false;
+            ie->fev++;
+            ie->source_id = f->source_id;
+            ie->serial = f->serial;
+            memcpy(ie->digest, f->digest, KDB_DIGEST_LEN);
+        }
+        free(f);
+        f = nx;
+    }
 }
 
 static void io_free_views(struct lio *io) {
@@ -658,6 +791,14 @@ static int send_enc(ctx_t *x) {
     int rc = emit_file(x, x->enc.buf, x->enc.len);
     kdb_enc_reset(&x->enc);
     return rc;
+}
+
+/* D1a: the fetch stream is written by several workers (and its reader): the messages of one zone, or one ZONE_FAILED, are written between these two calls */
+static void fw_lock(ctx_t *x) {
+    if (x->fetch) pthread_mutex_lock(&x->io->wlock);
+}
+static void fw_unlock(ctx_t *x) {
+    if (x->fetch) pthread_mutex_unlock(&x->io->wlock);
 }
 
 /* reasons go into a TLV `str`: printable ASCII, at most 255 bytes */
@@ -779,6 +920,7 @@ static int zone_cb(void *ud, const db_zone_row_t *r) {
             }
         }
         z->has_serial = r->soa_content && pdns_soa_serial(r->soa_content, &z->serial);
+        z->has_timers = r->soa_content && pdns_soa_timers(r->soa_content, &z->t_refresh, &z->t_retry, &z->t_expire);
     }
     if (x->check) {                                  /* B12: domains.catalog, in step with zones[] */
         if (x->chk_ncat >= x->chk_ccat) {
@@ -885,13 +1027,13 @@ static int send_failed(ctx_t *x, const zinfo_t *zi, const char *reason) {
     char name[DNS_NAME_TEXT_SIZE], why[260], shown[210];
     clean_reason(zi->name ? zi->name : "(NULL)", shown, sizeof(shown));
     lg(LOG_ERR, "zone '%s' (domains.id %lld): %s", shown, (long long)zi->id, reason);
-    if (x->io) fz_add(&x->io->fz, x->view, zi->name, reason, reason ? strlen(reason) : 0);       /* B11: failed_zones (also a name the stream cannot carry) */
+    if (x->io && !x->fetch) fz_add(&x->io->fz, x->view, zi->name, reason, reason ? strlen(reason) : 0);       /* B11: failed_zones (also a name the stream cannot carry) */
     if (!pdns_canonical_zone_name(zi->name, name)) {
         lg(LOG_ERR, "the zone name is not a valid domain name; not written to the stream");
         x->n_unwritten++;
         return 0;
     }
-    if (x->io) {                    /* the Backend keeps its last good version; offer the zone again at the next load */
+    if (x->io && !x->fetch) {       /* the Backend keeps its last good version; offer the zone again at the next load */
         inv_ent_t *e = inv_find(&x->io->inv, x->vslot, name);
         if (e && e->known) e->dirty = true;
     }
@@ -899,9 +1041,12 @@ static int send_failed(ctx_t *x, const zinfo_t *zi, const char *reason) {
     clean_reason(reason, why, sizeof(why));
     if (kdb_enc_begin(&x->enc, KDB_T_ZONE_FAILED) != 0 || kdb_enc_u16(&x->enc, 1, x->view) != 0 ||
         kdb_enc_name(&x->enc, 2, name) != 0 || kdb_enc_i64(&x->enc, 3, zi->id) != 0 || kdb_enc_str(&x->enc, 4, why) != 0 ||
-        kdb_enc_end(&x->enc) != 0)
+        (x->fetch && kdb_enc_u64(&x->enc, 5, x->fetch_req) != 0) || kdb_enc_end(&x->enc) != 0)
         return -1;
-    return send_enc(x);
+    fw_lock(x);
+    int rc = send_enc(x);
+    fw_unlock(x);
+    return rc;
 }
 
 /* B7b: a SLAVE zone is a secondary (its masters are domains.master, its data comes by zone transfer, never from `records`); a
@@ -912,6 +1057,11 @@ static uint8_t zone_sec_kind(const char *type) {
     if (type && strcasecmp(type, "SLAVE") == 0) return KDB_ZK_SECONDARY;
     if (type && strcasecmp(type, "CONSUMER") == 0) return KDB_ZK_CATALOG;
     return KDB_ZK_PRIMARY;
+}
+
+/* no rows of `records` (and no extension rows) are read for this zone: a secondary zone, or a zone that is sent as a summary (D1a milestone 4) */
+static bool zinfo_no_rows(const zinfo_t *zi) {
+    return zone_sec_kind(zi->type) != KDB_ZK_PRIMARY || zi->summary;
 }
 
 static const char *zone_type_reason(const char *type) {
@@ -1232,6 +1382,15 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
     const uint8_t skind = zone_sec_kind(zi->type);
     if (x->check) chk_zone_begin(x, zi, tr ? "other" : skind == KDB_ZK_SECONDARY ? "secondary" : skind == KDB_ZK_CATALOG ? "catalog" : "primary");
     if (z && skind != KDB_ZK_PRIMARY && pdns_zone_set_secondary(z, skind, zi->master) != 0) w->oom = true;
+    if (z && skind == KDB_ZK_PRIMARY && zi->summary) {
+        pdns_zone_set_summary(z, zi->serial, zi->has_timers, zi->t_refresh, zi->t_retry, zi->t_expire);
+        if (zi->apex && zi->has_timers) {
+            if (pdns_zone_set_apex(z, zi->apex->data, lapex_rname(zi->apex), zi->apex->minimum, zi->apex->soa_ttl, zi->apex->ns_ttl, lapex_ns(zi->apex),
+                                   lapex_glue(zi->apex), zi->apex->glue_len) != 0 ||
+                pdns_zone_set_notify_addrs(z, lapex_naddr(zi->apex), zi->apex->naddr_len) != 0)
+                w->oom = true;
+        }
+    }
     if (w->oom) {
         r->kind = ZR_FATAL;
     } else if (!zi->name) {
@@ -1245,7 +1404,7 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
             db_meta_row_t row = { zi->id, m->v[mi].kind, m->v[mi].content };
             pdns_zone_add_meta(z, &row);
         }
-        if (skind == KDB_ZK_PRIMARY && x->has_ext) eset_feed(w->bulk_meta ? &x->ext : &w->zext, zi->id, z);      // B8: tags, tinydns attributes, tag definitions
+        if (skind == KDB_ZK_PRIMARY && !zi->summary && x->has_ext) eset_feed(w->bulk_meta ? &x->ext : &w->zext, zi->id, z);      // B8: tags, tinydns attributes, tag definitions
         const char *why = NULL;
         if (pdns_zone_finish(z) != 0) {
             why = z->error;
@@ -1277,7 +1436,7 @@ static void convert_zone(wk_t *w, const zinfo_t *zi) {
             memset(&g, 0, sizeof(g));
             g.x = x;
             g.zi = zi;
-            pdns_kdb_params_t p = { x->view, zi->id, KDB_ZK_PRIMARY, NULL, gate_cb, &g, pf ? pf->text : NULL };
+            pdns_kdb_params_t p = { x->view, zi->id, KDB_ZK_PRIMARY, NULL, gate_cb, &g, pf ? pf->text : NULL, x->fetch ? x->fetch_req : 0 };
             char msg[PDNS_ERR_LEN + 100];
             int er = pdns_zone_encode_kdb(z, &p, zres_emit, r, msg, sizeof(msg));
             if (er == 0) {
@@ -1325,16 +1484,23 @@ static int commit_zone(ctx_t *x, const zinfo_t *zi, zres_t *r) {
     case ZR_FAILED:
         return send_failed(x, zi, r->reason);
     default:                                   /* ZR_SENT */
-        if (r->profile[0] && send_profile_for(x, r->profile) != 0) return -1;   /* B7a: the profile text comes first */
-        if (emit_file(x, r->buf, r->len) != 0) return -1;
+        fw_lock(x);                            /* (D1a: the profile and the zone go out together) */
+        if ((r->profile[0] && send_profile_for(x, r->profile) != 0) || emit_file(x, r->buf, r->len) != 0) {       /* B7a: the profile text comes first */
+            fw_unlock(x);
+            return -1;
+        }
+        fw_unlock(x);
         x->n_zones++;
-        if (x->io) {                           /* sent: what the Backend will have once it says "applied" */
+        if (x->fetch && x->fetch_vname && !zi->summary) fev_push(x->fetch_vname, zi->canon, zi->id, r->serial, r->digest);     /* (a fetch has no inventory of its own: the main thread keeps it; the summary of a fetch is no data in memory) */
+        if (x->io && !x->fetch) {              /* sent: what the Backend will have once it says "applied" */
             inv_ent_t *ie = inv_get(&x->io->inv, x->vslot, zi->canon);
             if (!ie) {
                 x->oom = true;
                 return -1;
             }
             ie->has_pend = true;
+            ie->p_fev = ie->fev;
+            ie->p_resident = !zi->summary;
             ie->p_source_id = zi->id;
             ie->p_serial = r->serial;
             memcpy(ie->p_digest, r->digest, KDB_DIGEST_LEN);
@@ -1349,7 +1515,7 @@ static int commit_zone(ctx_t *x, const zinfo_t *zi, zres_t *r) {
 
 /* convert and hand over the zone at w->wi; nonzero when the load must stop */
 static int finish_pos(wk_t *w) {
-    if (g_stop) {                                      /* B13: SIGTERM / SIGINT: stop reading and converting at the next zone (the main thread sees g_stop and ends the load) */
+    if (g_stop || (w->x->fetch && atomic_load_explicit(&g_fetch_stop, memory_order_relaxed))) {      /* B13: SIGTERM / SIGINT: stop reading and converting at the next zone (the main thread sees g_stop and ends the load); D1a: the fetch thread is told to end */
         w->stop = true;
         return 1;
     }
@@ -1377,7 +1543,7 @@ static int rec_cb(void *ud, int64_t did, const db_record_row_t *row) {
         w->stop = true;
         return 1;
     }
-    if (w->cur && !w->cur->failed && !zone_sec_kind(WZ(w, w->wi)->type)) pdns_zone_add_record(w->cur, row);   /* B7b: a SLAVE's rows are PowerDNS's copy of the transfer */
+    if (w->cur && !w->cur->failed && !zinfo_no_rows(WZ(w, w->wi))) pdns_zone_add_record(w->cur, row);   /* B7b: a SLAVE's rows are PowerDNS's copy of the transfer */
     return 0;
 }
 
@@ -1404,7 +1570,7 @@ static int run_group(wk_t *w, size_t a, size_t b) {
         size_t nr = 0;
         for (size_t i = pos; i < e; i++) {
             ids[i - pos] = WZ(w, i)->id;
-            if (zone_sec_kind(WZ(w, i)->type) == KDB_ZK_PRIMARY) rids[nr++] = WZ(w, i)->id;        /* B7b: no records for a secondary zone */
+            if (!zinfo_no_rows(WZ(w, i))) rids[nr++] = WZ(w, i)->id;       /* B7b: no records for a secondary zone */
         }
         mset_reset(&w->zmeta);
         eset_reset(&w->zext);
@@ -1441,7 +1607,10 @@ static int run_task(wk_t *w, size_t a, size_t b, bool bulk, bool all) {
     w->wi = a;
     w->wend = b;
     if (bulk) {
-        if (all) rc = drv->scan_records(w->conn, NULL, rec_cb, w);
+        bool rows = false;                                  /* D1a milestone 4: a task of summaries only reads no records (the metadata are in x->meta) */
+        for (size_t pos = a; pos < b && !rows; pos++) rows = !zinfo_no_rows(WZ(w, pos));
+        if (!rows) rc = 0;
+        else if (all) rc = drv->scan_records(w->conn, NULL, rec_cb, w);
         else rc = drv->scan_records_range(w->conn, WZ(w, a)->id, WZ(w, b - 1)->id, rec_cb, w);
         if (rc != 0 && rc != DB_STOPPED) return db_err_c(drv, w->conn, w->errtext, sizeof(w->errtext), rc, "reading records");
         if (rc == DB_STOPPED) {
@@ -1461,7 +1630,7 @@ static int run_task(wk_t *w, size_t a, size_t b, bool bulk, bool all) {
         int64_t id = WZ(w, pos)->id;
         w->wi = pos;
         mset_reset(&w->zmeta);
-        bool sec = zone_sec_kind(WZ(w, pos)->type) != KDB_ZK_PRIMARY;      /* B7b: no records are read for a secondary zone */
+        bool sec = zinfo_no_rows(WZ(w, pos));     /* B7b: no records are read for a secondary zone */
         eset_reset(&w->zext);
         if ((rc = drv->scan_metadata(w->conn, &id, meta_cb, &w->zmeta)) != 0 || (!sec && (rc = drv->scan_records(w->conn, &id, rec_cb, w)) != 0) ||
             (!sec && w->x->has_ext && (rc = eset_load(drv, w->conn, &id, &w->zext)) != 0)) {
@@ -1761,6 +1930,7 @@ static int send_batch_begin(ctx_t *x, uint64_t id, uint8_t kind, uint64_t change
 /* dump mode: HELLO and the one startup batch.  Stream mode: HELLO went out at the handshake; BATCH_BEGIN goes out
  * once, just before the first thing of the batch is sent (an error before that leaves nothing half sent). */
 static int send_simple_header(ctx_t *x) {
+    if (x->fetch) return 0;                    /* D1a: the fetch stream has no batches */
     if (x->io) {
         if (x->batch_open) return 0;
         x->batch_open = true;
@@ -1804,12 +1974,273 @@ static int db_err(ctx_t *x, int rc, const char *what) {
 
 /* Forget the lists of the previous view (zones, metadata, keys).  The context keeps them after a run so that the owner
  * (main(), a test) can look at them; the next run starts empty. */
+/* ---- D1a step 6: the apex of the zones whose summary is sent ---- */
+#define APEX_ADR_MAX 128      /* address rows of one zone kept (8 targets of 8 addresses, twice for an NS target that is listed twice) */
+#define APEX_XADR_MAX 64      /* ... and of the addresses of NS targets outside the zone (8 targets of 8 addresses; more are not read) */
+typedef struct {
+    ctx_t *x;
+    zinfo_t *z;                       /* the zone being read (NULL: a zone whose summary is not sent) */
+    int64_t cur;
+    bool have, soa, ns_ok, oom;
+    char mname[DNS_NAME_TEXT_SIZE], rname[DNS_NAME_TEXT_SIZE];
+    uint32_t minimum, soa_ttl, ns_ttl;
+    unsigned n_ns;
+    size_t ns_len;
+    char ns_lf[KDB_APEX_NS_BYTES + 1];
+    /* the addresses of the zone whose owner is an NS target, as the rows come (id order); matched with the targets when the zone is done (the NS rows can follow them) */
+    unsigned n_adr;
+    struct { uint8_t type, alen; uint32_t ttl; uint8_t addr[16]; char name[DNS_NAME_TEXT_SIZE]; } adr[APEX_ADR_MAX];
+    unsigned n_xadr;        /* the addresses of NS targets outside the zone (any zone of the source), as the rows come */
+    struct { uint8_t type, alen; uint8_t addr[16]; char name[DNS_NAME_TEXT_SIZE]; } xadr[APEX_XADR_MAX];
+} apex_acc_t;
+
+static zinfo_t *zinfo_by_id(ctx_t *x, int64_t id) {         /* x->zones is in domains.id order */
+    size_t lo = 0, hi = x->nz;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (x->zones[mid].id < id) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < x->nz && x->zones[lo].id == id ? &x->zones[lo] : NULL;
+}
+
+/* The glue of the zone: for each NS target (in the order of tag 20) that is at or below the apex, its A and AAAA rows in id order (the order of the zone: the
+ * zone in memory answers a target with the RRs it has, in file order), without a row that repeats an address, with the lowest TTL of the rows of one type
+ * (RFC 2181 5.2: an RRset has one TTL; the zone image harmonizes it).  More than KDB_APEX_GLUE_PER_NS addresses for one target make the zone keep no apex (the
+ * answer of the zone in memory has at most 32, and the summary would differ).  Returns the length of the glue, -1 if there is no usable apex. */
+static int apex_glue_build(const apex_acc_t *a, const char *apex_name, uint8_t out[KDB_APEX_GLUE_BYTES]) {
+    size_t len = 0;
+    unsigned idx = 0;
+    for (const char *q = a->ns_lf; *q; idx++) {
+        const char *e = strchr(q, '\n');
+        size_t ql = e ? (size_t)(e - q) : strlen(q);
+        char target[DNS_NAME_TEXT_SIZE];
+        memcpy(target, q, ql);
+        target[ql] = '\0';
+        q = e ? e + 1 : q + ql;
+        if (!domain_name_is_at_or_below(target, apex_name)) continue;
+        uint32_t tmin[2] = { 0xFFFFFFFFu, 0xFFFFFFFFu };
+        for (unsigned k = 0; k < a->n_adr; k++)
+            if (strcasecmp(a->adr[k].name, target) == 0 && a->adr[k].ttl < tmin[a->adr[k].type == 28]) tmin[a->adr[k].type == 28] = a->adr[k].ttl;
+        unsigned per = 0;
+        for (unsigned k = 0; k < a->n_adr; k++) {
+            if (strcasecmp(a->adr[k].name, target) != 0) continue;
+            bool dup = false;
+            for (unsigned j = 0; j < k && !dup; j++)
+                dup = strcasecmp(a->adr[j].name, target) == 0 && a->adr[j].type == a->adr[k].type && memcmp(a->adr[j].addr, a->adr[k].addr, a->adr[k].alen) == 0;
+            if (dup) continue;
+            if (++per > KDB_APEX_GLUE_PER_NS || len + 6 + a->adr[k].alen > KDB_APEX_GLUE_BYTES) return -1;
+            uint32_t ttl = tmin[a->adr[k].type == 28];
+            out[len++] = (uint8_t)idx;
+            out[len++] = (uint8_t)a->adr[k].type;
+            out[len++] = (uint8_t)(ttl >> 24);
+            out[len++] = (uint8_t)(ttl >> 16);
+            out[len++] = (uint8_t)(ttl >> 8);
+            out[len++] = (uint8_t)ttl;
+            memcpy(out + len, a->adr[k].addr, a->adr[k].alen);
+            len += a->adr[k].alen;
+        }
+    }
+    return (int)len;
+}
+
+/* The addresses of the NS targets that are outside the zone, for the NOTIFY the Backend sends while the zone is out of memory (tag 22): for each such target (in
+ * the order of tag 20) its A and AAAA rows in id order, without a repeated address, at most KDB_NOTIFY_ADDR_PER_NS for one target (a NOTIFY to the first
+ * eight is enough; unlike the glue, more addresses do not take the apex away).  Returns the length written. */
+static size_t apex_naddr_build(const apex_acc_t *a, const char *apex_name, uint8_t out[KDB_NOTIFY_ADDR_BYTES]) {
+    size_t len = 0;
+    unsigned idx = 0;
+    for (const char *q = a->ns_lf; *q; idx++) {
+        const char *e = strchr(q, '\n');
+        size_t ql = e ? (size_t)(e - q) : strlen(q);
+        char target[DNS_NAME_TEXT_SIZE];
+        memcpy(target, q, ql);
+        target[ql] = '\0';
+        q = e ? e + 1 : q + ql;
+        if (domain_name_is_at_or_below(target, apex_name)) continue;
+        unsigned per = 0;
+        for (unsigned k = 0; k < a->n_xadr && per < KDB_NOTIFY_ADDR_PER_NS; k++) {
+            if (strcasecmp(a->xadr[k].name, target) != 0) continue;
+            bool dup = false;
+            for (unsigned j = 0; j < k && !dup; j++)
+                dup = strcasecmp(a->xadr[j].name, target) == 0 && a->xadr[j].type == a->xadr[k].type && memcmp(a->xadr[j].addr, a->xadr[k].addr, a->xadr[k].alen) == 0;
+            if (dup || len + 2 + a->xadr[k].alen > KDB_NOTIFY_ADDR_BYTES) continue;
+            out[len++] = (uint8_t)idx;
+            out[len++] = a->xadr[k].type;
+            memcpy(out + len, a->xadr[k].addr, a->xadr[k].alen);
+            len += a->xadr[k].alen;
+            per++;
+        }
+    }
+    return len;
+}
+
+static void apex_flush(apex_acc_t *a) {
+    zinfo_t *z = a->z;
+    a->z = NULL;
+    if (!a->have || !z || z->apex || !a->soa || !a->ns_ok || a->n_ns == 0) return;
+    uint8_t glue[KDB_APEX_GLUE_BYTES], naddr[KDB_NOTIFY_ADDR_BYTES];
+    int gl = apex_glue_build(a, z->canon, glue);
+    if (gl < 0) return;                                          /* more addresses than the summary carries: the zone is read for its SOA question */
+    size_t nal = apex_naddr_build(a, z->canon, naddr);
+    size_t lm = strlen(a->mname), lr = strlen(a->rname);
+    lapex_t *p = malloc(sizeof(*p) + lm + lr + a->ns_len + 3 + (size_t)gl + nal);
+    if (!p) {
+        a->oom = true;
+        return;
+    }
+    p->minimum = a->minimum;
+    p->soa_ttl = a->soa_ttl;
+    p->ns_ttl = a->ns_ttl;
+    p->glue_len = (uint16_t)gl;
+    p->naddr_len = (uint16_t)nal;
+    memcpy(p->data, a->mname, lm + 1);
+    memcpy(p->data + lm + 1, a->rname, lr + 1);
+    memcpy(p->data + lm + lr + 2, a->ns_lf, a->ns_len + 1);
+    if (gl) memcpy(p->data + lm + lr + 3 + a->ns_len, glue, (size_t)gl);
+    if (nal) memcpy(p->data + lm + lr + 3 + a->ns_len + gl, naddr, nal);
+    z->apex = p;
+}
+
+static int apex_cb(void *ud, const db_apex_row_t *row) {
+    apex_acc_t *a = ud;
+    if (!a->have || row->domain_id != a->cur) {
+        apex_flush(a);
+        a->have = true;
+        a->cur = row->domain_id;
+        a->z = zinfo_by_id(a->x, row->domain_id);
+        if (a->z && !(a->z->summary && a->z->want && !a->z->apex)) a->z = NULL;
+        a->soa = false;
+        a->ns_ok = true;
+        a->n_ns = 0;
+        a->ns_len = 0;
+        a->ns_lf[0] = '\0';
+        a->ns_ttl = 0;
+        a->n_adr = 0;
+        a->n_xadr = 0;
+    }
+    if (!a->z || a->oom) return a->oom ? 1 : 0;
+    uint32_t deft = a->x->opts.default_ttl ? a->x->opts.default_ttl : PDNS_DEFAULT_TTL;
+    uint32_t ttl = row->ttl_null ? deft : (row->ttl < 0 ? 0 : row->ttl > PDNS_MAX_TTL ? PDNS_MAX_TTL : (uint32_t)row->ttl);
+    if (row->addr_type && row->name && a->z->canon) {           /* an address of a name outside the zone (the third part of the scan): for the NOTIFY the Backend sends */
+        char xn[DNS_NAME_TEXT_SIZE];
+        if (pdns_apex_name(row->name, xn) && !domain_name_is_at_or_below(xn, a->z->canon)) {
+            if (a->n_xadr < APEX_XADR_MAX) {
+                size_t xl = pdns_apex_addr(row->addr_type, row->content, a->xadr[a->n_xadr].addr);
+                if (xl != 0) {                                  /* (a row that is no address is of no use to a NOTIFY; the zone's own apex does not depend on it) */
+                    a->xadr[a->n_xadr].type = (uint8_t)row->addr_type;
+                    a->xadr[a->n_xadr].alen = (uint8_t)xl;
+                    snprintf(a->xadr[a->n_xadr].name, sizeof(a->xadr[0].name), "%s", xn);
+                    a->n_xadr++;
+                }
+            }
+            return 0;
+        }
+    }
+    if (row->addr_type) {                                       /* an A or AAAA row of a name that is the target of an NS record of the zone */
+        char on[DNS_NAME_TEXT_SIZE];
+        if (a->n_adr == APEX_ADR_MAX || !row->name || !pdns_apex_name(row->name, on)) {
+            a->ns_ok = false;
+            return 0;
+        }
+        size_t al = pdns_apex_addr(row->addr_type, row->content, a->adr[a->n_adr].addr);
+        if (al == 0) {
+            a->ns_ok = false;                                   /* not an address: the zone would be rejected, it has no apex */
+            return 0;
+        }
+        a->adr[a->n_adr].type = (uint8_t)row->addr_type;
+        a->adr[a->n_adr].alen = (uint8_t)al;
+        a->adr[a->n_adr].ttl = ttl;
+        snprintf(a->adr[a->n_adr].name, sizeof(a->adr[0].name), "%s", on);
+        a->n_adr++;
+        return 0;
+    }
+    if (row->is_soa) {
+        if (a->soa || !row->content) return 0;                  /* (the first enabled SOA is the zone's, as in the zone list) */
+        a->soa = pdns_soa_apex(row->content, a->mname, a->rname, &a->minimum);
+        a->soa_ttl = ttl;
+        return 0;
+    }
+    char nm[DNS_NAME_TEXT_SIZE];
+    if (!row->content || !pdns_apex_name(row->content, nm)) {
+        a->ns_ok = false;                                       /* an NS record that is not a name: the zone image would not have it */
+        return 0;
+    }
+    size_t l = strlen(nm);
+    for (const char *q = a->ns_lf; *q;) {                        /* the same target twice is one RR */
+        const char *e = strchr(q, '\n');
+        size_t ql = e ? (size_t)(e - q) : strlen(q);
+        if (ql == l && strncasecmp(q, nm, l) == 0) return 0;
+        if (!e) break;
+        q = e + 1;
+    }
+    if (a->n_ns == KDB_APEX_NS_MAX || a->ns_len + (a->n_ns ? 1 : 0) + l > KDB_APEX_NS_BYTES) {
+        a->ns_ok = false;                                       /* more than the summary can carry: the answer would miss NS records */
+        return 0;
+    }
+    if (a->n_ns) a->ns_lf[a->ns_len++] = '\n';
+    memcpy(a->ns_lf + a->ns_len, nm, l + 1);
+    a->ns_len += l;
+    a->ns_ttl = a->n_ns == 0 || ttl < a->ns_ttl ? ttl : a->ns_ttl;          /* RFC 2181 5.2: the RRset has the lowest TTL of its RRs (the zone image harmonizes the same way) */
+    a->n_ns++;
+    return 0;
+}
+
+/* The apex of the zones in zones[] that are sent as summaries and have none yet.  Zones with location tags or tinydns attributes (the extension
+ * tables, B8) can answer differently for different clients: they get none (the Backend then reads the zone to answer an SOA question).
+ * 0, or a db_err() status. */
+static int apex_gather(ctx_t *x) {
+    if (!x->drv->scan_apex) return 0;
+    size_t nsum = 0;
+    for (size_t i = 0; i < x->nz; i++) nsum += x->zones[i].summary && x->zones[i].want && !x->zones[i].apex ? 1 : 0;
+    if (nsum == 0) return 0;
+    apex_acc_t a;
+    memset(&a, 0, sizeof(a));
+    a.x = x;
+    int rc = 0;
+    if (nsum * 4 >= x->nz) {                                     /* many zones: one scan of the table */
+        rc = x->drv->scan_apex(x->conn, NULL, apex_cb, &a);
+        if (rc == 0) apex_flush(&a);
+    } else {
+        for (size_t i = 0; i < x->nz && rc == 0 && !a.oom; i++) {
+            if (!(x->zones[i].summary && x->zones[i].want && !x->zones[i].apex)) continue;
+            a.have = false;
+            rc = x->drv->scan_apex(x->conn, &x->zones[i].id, apex_cb, &a);
+            if (rc == 0) apex_flush(&a);
+        }
+    }
+    if (a.oom) return x->oom = true, EXIT_ERROR;
+    if (rc != 0) return db_err(x, rc, "reading the apex of the zones");
+    if (x->has_ext) {
+        eset_t ex;
+        memset(&ex, 0, sizeof(ex));
+        rc = eset_load(x->drv, x->conn, NULL, &ex);
+        if (rc != 0) {
+            bool oom = ex.oom;
+            eset_free(&ex);
+            return oom ? (x->oom = true, EXIT_ERROR) : db_err(x, rc, "reading the tags and tinydns attributes");
+        }
+        for (size_t i = 0; i < x->nz; i++) {
+            zinfo_t *z = &x->zones[i];
+            if (!z->apex) continue;
+            size_t t = eset_lower_tags(ex.tags, ex.nt, z->id), d = eset_lower_td(ex.td, ex.nd, z->id), g = eset_lower_defs(ex.defs, ex.ng, z->id);
+            if ((t < ex.nt && ex.tags[t].domain_id == z->id) || (d < ex.nd && ex.td[d].domain_id == z->id) || (g < ex.ng && ex.defs[g].domain_id == z->id)) {
+                free(z->apex);
+                z->apex = NULL;
+            }
+        }
+        eset_free(&ex);
+    }
+    return 0;
+}
+
 static void ctx_view_reset(ctx_t *x) {
     for (size_t i = 0; i < x->nz; i++) {
         free(x->zones[i].name);
         free(x->zones[i].type);
         free(x->zones[i].master);
         free(x->zones[i].canon);
+        free(x->zones[i].apex);
     }
     free(x->zones);
     x->zones = NULL;
@@ -1907,15 +2338,20 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
         if (x->nchg > 1) qsort(x->chg, x->nchg, sizeof(int64_t), cmp_i64);
     }
     uint32_t gen = ++io->gen;
+    fev_drain(io, false);
     for (size_t i = 0; i < x->nz; i++) {
         zinfo_t *z = &x->zones[i];
         z->want = false;
+        z->summary = false;
         if (!z->canon) {
             z->want = compare_all;                 /* an unusable name is reported when everything is compared */
             continue;
         }
         inv_ent_t *e = inv_find(&io->inv, x->vslot, z->canon);
         if (e) e->mark = gen;
+        /* D1a: a zone that is not in the Backend's memory (INVENTORY resident 0) is not sent by a full comparison: the Backend fetches it
+         * when it needs it (the second stream).  A zone that changed (serial, change log) is still sent, as before. */
+        bool cold = e && e->known && !e->resident;
         z->g_ok = e && e->known && !e->dirty;
         if (z->g_ok) {
             z->g_source = e->source_id;
@@ -1928,9 +2364,14 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
         } else {
             /* B7b: a secondary zone has no SOA of its own to compare (what the Backend transferred is its business, and its inventory
              * serial is the 0 it was sent with); the change log, the digest and the source id decide */
-            z->want = compare_all || changed || !e || !e->known || e->dirty || e->source_id != z->id ||
+            z->want = (compare_all && !cold) || changed || !e || !e->known || e->dirty || e->source_id != z->id ||
                       (!zone_sec_kind(z->type) && (!z->has_serial || z->serial != e->serial));
         }
+        /* D1a milestone 4 (design 3.3, 6.3): with memory-limit the Backend keeps the data of the zones that are asked for, not of all of them.  A zone it
+         * has no data of (new to it, or in its directory only) is sent as a summary: settings, serial, SOA timers.  The data comes when a query, a transfer
+         * or the warm-up asks for it (the fetch stream).  A zone it has in memory is sent whole, as before. */
+        z->summary = x->dir_only && z->want && z->canon && z->has_serial && !zone_type_reason(z->type) && zone_sec_kind(z->type) == KDB_ZK_PRIMARY &&
+                     !(e && e->known && e->resident);
     }
     /* what the Backend has and the database no longer lists */
     gone_t *gone = NULL;
@@ -2078,6 +2519,72 @@ static int apply_mapping(ctx_t *x, const db_schema_info_t *si) {
 /* One source (one view): open, read the lists, then the records, writing the zones.  whole: the dump of a file,
  * with HELLO / BATCH_BEGIN before the first zone and BATCH_END after the last; otherwise (stream mode) the caller
  * owns the batch and calls this once per view.  Returns an exit status. */
+/* D1a, a summary fetch (FETCH_REQ mode 1): what the Backend's zone directory keeps of a zone that is not in memory, without reading its
+ * records: the serial and the SOA timers from the domains row, the kind, and whether the zone is presigned (metadata PRESIGNED=1).  Sent as
+ * ZONE_BEGIN with the summary flag (rr_count 0, a zero digest) and ZONE_END.  The settings text and the addresses of the name servers
+ * (design 7, NOTIFY) come with the later milestones.  0, or an EXIT_* status with the reason in x->errtext. */
+static int fetch_summary(ctx_t *x) {
+    const zinfo_t *zi = &x->zones[0];
+    if (!zi->canon) {
+        snprintf(x->errtext, sizeof(x->errtext), "the zone name cannot be written as a canonical name");
+        return EXIT_ERROR;
+    }
+    const char *tr = zone_type_reason(zi->type);
+    if (tr) {
+        snprintf(x->errtext, sizeof(x->errtext), "%s", tr);
+        return EXIT_ERROR;
+    }
+    if (!zi->has_serial) {
+        snprintf(x->errtext, sizeof(x->errtext), "the SOA of the zone is missing or has no valid serial");
+        return EXIT_ERROR;
+    }
+    x->zones[0].summary = true;                           /* (what apex_gather() looks for) */
+    int arc = apex_gather(x);
+    if (arc != 0) return arc;
+    mset_t m;
+    memset(&m, 0, sizeof(m));
+    int rc = x->drv->scan_metadata(x->conn, &zi->id, meta_cb, &m);
+    if (rc != 0) {
+        bool oom = m.oom;
+        mset_free(&m);
+        return oom ? (x->oom = true, EXIT_ERROR) : db_err(x, rc, "reading metadata");
+    }
+    bool presigned = false;
+    for (size_t i = 0; i < m.n; i++)
+        if (m.v[i].kind && m.v[i].content && strcasecmp(m.v[i].kind, "PRESIGNED") == 0 && strcmp(m.v[i].content, "1") == 0) presigned = true;
+    mset_free(&m);
+    uint8_t zero[KDB_DIGEST_LEN];
+    memset(zero, 0, sizeof(zero));
+    if (kdb_enc_begin(&x->enc, KDB_T_ZONE_BEGIN) != 0 || kdb_enc_u16(&x->enc, 1, x->view) != 0 || kdb_enc_name(&x->enc, 2, zi->canon) != 0 ||
+        kdb_enc_i64(&x->enc, 3, zi->id) != 0 || kdb_enc_u8(&x->enc, 4, KDB_ZK_PRIMARY) != 0 || kdb_enc_u32(&x->enc, 5, zi->serial) != 0 ||
+        kdb_enc_u32(&x->enc, 6, KDB_ZF_SUMMARY | (presigned ? KDB_ZF_PRESIGNED : 0)) != 0 || kdb_enc_u64(&x->enc, 7, 0) != 0 ||
+        kdb_enc_bytes(&x->enc, 8, zero, sizeof(zero)) != 0 || kdb_enc_u64(&x->enc, 11, x->fetch_req) != 0 ||
+        (zi->has_timers && (kdb_enc_u32(&x->enc, 12, zi->t_refresh) != 0 || kdb_enc_u32(&x->enc, 13, zi->t_retry) != 0 ||
+                            kdb_enc_u32(&x->enc, 14, zi->t_expire) != 0)) ||
+        (zi->has_timers && zi->apex &&
+         (kdb_enc_name(&x->enc, 15, zi->apex->data) != 0 || kdb_enc_name(&x->enc, 16, lapex_rname(zi->apex)) != 0 ||
+          kdb_enc_u32(&x->enc, 17, zi->apex->minimum) != 0 || kdb_enc_u32(&x->enc, 18, zi->apex->soa_ttl) != 0 || kdb_enc_u32(&x->enc, 19, zi->apex->ns_ttl) != 0 ||
+          kdb_enc_bytes(&x->enc, 20, (const uint8_t *)lapex_ns(zi->apex), strlen(lapex_ns(zi->apex))) != 0 ||
+          (zi->apex->glue_len > 0 && kdb_enc_bytes(&x->enc, 21, lapex_glue(zi->apex), zi->apex->glue_len) != 0))) ||
+        kdb_enc_end(&x->enc) != 0)
+        goto write_failed;
+    fw_lock(x);                                           /* (D1a: ZONE_BEGIN and ZONE_END go out together) */
+    if (send_enc(x) != 0) {
+        fw_unlock(x);
+        goto write_failed;
+    }
+    if (kdb_enc_begin(&x->enc, KDB_T_ZONE_END) != 0 || kdb_enc_u64(&x->enc, 1, 0) != 0 || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0) {
+        fw_unlock(x);
+        goto write_failed;
+    }
+    fw_unlock(x);
+    x->n_zones++;
+    return 0;
+write_failed:
+    x->io_error = true;
+    return EXIT_ERROR;
+}
+
 static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, bool whole) {
     char err[DB_ERRLEN];
     ctx_view_reset(x);
@@ -2122,7 +2629,19 @@ static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, boo
         status = EXIT_ERROR;
         goto out_snap;
     }
-    if (x->io) {
+    if (x->fetch) {                                       /* D1a: the one zone that was asked for, whatever the Backend has */
+        if (x->nz == 0) {
+            snprintf(x->errtext, sizeof(x->errtext), "the zone is not in the database%s", x->map_view ? " (or not mapped to this view)" : "");
+            status = EXIT_ERROR;
+            goto out_snap;
+        }
+        x->zones[0].want = true;
+        if (x->fetch_summary && zone_sec_kind(x->zones[0].type) == KDB_ZK_PRIMARY) {      /* no records: serial, SOA timers, presigned (a secondary has no records anyway) */
+            status = fetch_summary(x);
+            goto out_snap;
+        }
+    }
+    if (x->io && !x->fetch) {
         if (plan_diff(x, &si, only_zone, &gone, &ngone, &have_seq, &new_seq) != 0) {
             lg(LOG_ERR, "out of memory");
             status = EXIT_ERROR;
@@ -2160,13 +2679,19 @@ static int run_view(ctx_t *x, const db_source_t *src, const char *only_zone, boo
                 goto out_snap;
             }
         }
+        if (x->dir_only && n_want > 0 && (rc = apex_gather(x)) != 0) {            /* D1a step 6: the apex of the summaries */
+            status = rc;
+            goto out_snap;
+        }
         if (bulk && n_want > 0) {
             if ((rc = x->drv->scan_metadata(x->conn, NULL, meta_cb, &x->meta)) != 0) {
                 status = x->meta.oom ? EXIT_ERROR : db_err(x, rc, "reading metadata");
                 if (x->meta.oom) lg(LOG_ERR, "out of memory");
                 goto out_snap;
             }
-            if (x->has_ext && (rc = eset_load(x->drv, x->conn, NULL, &x->ext)) != 0) {
+            bool any_rows = false;                            /* D1a milestone 4: nothing but summaries to send: no tags to read */
+            for (size_t i = 0; i < x->nwl && !any_rows; i++) any_rows = !zinfo_no_rows(&x->zones[x->wl[i]]);
+            if (x->has_ext && any_rows && (rc = eset_load(x->drv, x->conn, NULL, &x->ext)) != 0) {
                 status = x->ext.oom ? EXIT_ERROR : db_err(x, rc, "reading the tags and tinydns attributes");
                 if (x->ext.oom) lg(LOG_ERR, "out of memory");
                 goto out_snap;
@@ -2378,7 +2903,7 @@ static void chk_catalogs(ctx_t *x) {
  * case, so this is not supported: the pgsql find_zone (one-zone reads: reload requests, auto reload) matches the indexed name exactly
  * first and falls back to lower() only when that finds nothing, so it can pick another row than the full read does.  Warn instead of
  * making find_zone slower (the finding is about the source, not one zone: it is shown for every view).  The names are compared as names_equal() does (one trailing dot ignored). */
-static const zinfo_t *g_dup_zones;
+static _Thread_local const zinfo_t *g_dup_zones;       /* (thread local: a fetch worker may check too) */
 static int dup_name_cmp(const void *pa, const void *pb) {
     const char *a = g_dup_zones[*(const size_t *)pa].name, *b = g_dup_zones[*(const size_t *)pb].name;
     if (!a) a = "";                                     /* domains.name is NOT NULL; a total order all the same */
@@ -2414,6 +2939,36 @@ static void chk_case_duplicates(ctx_t *x) {
     free(ix);
 }
 
+/* --state-file with --check (D1a step 7): the loader writes PATH.tmp in the directory of PATH and renames it, and reads PATH at its start */
+static void chk_state_file(const char *path) {
+    char dir[PATH_MAX], me[160], why[200];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *sl = strrchr(dir, '/');
+    if (sl) *(sl == dir ? sl + 1 : sl) = '\0';
+    else snprintf(dir, sizeof(dir), ".");
+    struct stat st;
+    if (stat(dir, &st) != 0) {
+        chk_linef('E', "state file '%s': the directory '%s': %s", path, dir, strerror(errno));
+        return;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        chk_linef('E', "state file '%s': '%s' is not a directory", path, dir);
+        return;
+    }
+    if (access(dir, W_OK | X_OK) != 0)
+        chk_linef('E', "state file '%s': the user %s cannot write in the directory '%s' (mode %04o, owner uid %u): the loader writes '%s.tmp' there and renames it",
+                  path, chk_me(me, sizeof(me)), dir, (unsigned)(st.st_mode & 07777), (unsigned)st.st_uid, path);
+    else if ((st.st_mode & S_IWOTH) && !(st.st_mode & S_ISVTX))
+        chk_linef('W', "state file '%s': the directory '%s' is writable by everyone; anybody could replace the hot list the Backend warms from", path, dir);
+    kdb_hotl_t l;
+    kdb_hotl_init(&l);
+    int rc = kdb_hotl_file_read(path, &l, why, sizeof(why));
+    if (rc == KDB_HF_CORRUPT) chk_linef('W', "state file '%s' is not valid and will be ignored (the next hot list replaces it): %s", path, why);
+    else if (rc == KDB_HF_UNREADABLE) chk_linef('E', "state file '%s' cannot be read by the user %s: %s", path, chk_me(me, sizeof(me)), why);
+    else if (rc == KDB_HF_LOADED) chk_linef('I', "state file '%s': %u zone(s) of the hot list", path, (unsigned)l.n);
+    kdb_hotl_free(&l);
+}
+
 /* One source.  Returns an exit status: 0 nothing wrong, EXIT_ZONES_FAILED errors were found, EXIT_ERROR / EXIT_RETRY the source could not be read. */
 static int run_check(ctx_t *x, const db_source_t *src) {
     char err[DB_ERRLEN];
@@ -2423,6 +2978,7 @@ static int run_check(ctx_t *x, const db_source_t *src) {
     bool sqlite = strcmp(x->drv->name, "sqlite3") == 0;
     const char *file = sqlite ? src->database_file : src->conninfo_file;
     if (file && !chk_path_access(sqlite ? "database file" : "conninfo-file", file, sqlite)) return EXIT_ERROR;
+    if (g_state_file) chk_state_file(g_state_file);
     int rc = x->drv->open(&x->conn, src, err, sizeof(err));
     if (rc != 0) {
         chk_linef('E', "%s", err);
@@ -2545,6 +3101,7 @@ static int cfg_from_msg(const kdb_msg_t *m, lcfg_t *c) {
         snprintf(c->server_id, sizeof(c->server_id), "%.*s", (int)m->u.config.server_id.len, m->u.config.server_id.p);
     c->default_ttl = m->u.config.default_ttl;
     c->loader_threads = m->u.config.loader_threads;
+    c->dir_only = m->u.config.dir_only;
     c->bulk_threshold = m->u.config.bulk_threshold;
     c->views = calloc(m->u.config.n_views ? m->u.config.n_views : 1, sizeof(lview_t));
     if (!c->views) return -1;
@@ -2583,6 +3140,145 @@ static bool cfg_load_equal(const lcfg_t *a, const lcfg_t *b) {
     return true;
 }
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* D1a step 7 (design 8.4): the hot list and the state file                                                       */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* One part of a HOT_LIST.  The Backend is not trusted: the entries are bounded (KDB_HOT_MAX, the parts in order, at most 1024 of them) and a view that the
+ * current CONFIG does not have is dropped.  The complete list waits in hot_fresh for hot_run(). */
+static void hot_part(struct lio *io, const kdb_msg_t *m) {
+    const kdb_hot_list_t *h = &m->u.hot_list;
+    if (h->part == 0) {
+        kdb_hotl_clear(&io->hot_asm);                    /* a list that starts again (or a new one) replaces what was collected */
+        io->hot_open = true;
+        io->hot_id = h->list_id;
+        io->hot_limit = 0;
+        io->hot_dropped = 0;
+    } else if (!io->hot_open || h->list_id != io->hot_id || h->part != io->hot_next || h->part > 1024) {
+        io->hot_open = false;                            /* a part that does not follow: the list is lost, not the stream */
+        kdb_hotl_clear(&io->hot_asm);
+        lg(LOG_WARNING, "a HOT_LIST part %u does not follow the one before; the list is dropped", (unsigned)h->part);
+        return;
+    }
+    io->hot_next = h->part + 1;
+    if (h->part == 0 && h->limit) io->hot_limit = h->limit;       /* (the limit is a property of the list: part 0 says it, a later part does not change it) */
+    kdb_iter_t it;
+    char view[256], zone[DNS_NAME_TEXT_SIZE];
+    bool last_ok = false;
+    char last_view[256] = "";
+    kdb_hot_entries(m, &it);
+    while (kdb_hot_entries_next(&it, view, zone)) {
+        bool known = last_ok && strcmp(view, last_view) == 0;
+        for (size_t i = 0; !known && i < io->cfg.nviews; i++) known = io->cfg.views[i].name && strcmp(io->cfg.views[i].name, view) == 0;
+        if (known) {
+            snprintf(last_view, sizeof(last_view), "%s", view);
+            last_ok = true;
+        }
+        if (!known || !kdb_hotl_add(&io->hot_asm, view, zone)) io->hot_dropped++;       /* (a view that is not configured, or beyond KDB_HOT_MAX / out of memory) */
+    }
+    if (h->last) {
+        kdb_hotl_t t = io->hot_fresh;
+        io->hot_fresh = io->hot_asm;
+        io->hot_asm = t;
+        kdb_hotl_clear(&io->hot_asm);
+        io->hot_fresh_id = io->hot_id;
+        io->hot_fresh_limit = io->hot_limit;
+        io->hot_ready = true;
+        io->hot_open = false;
+    }
+}
+
+static int hot_emit(void *ud) { return send_enc((ctx_t *)ud); }
+
+/* the state file at the start: read, and say what it was (the Backend shows it in dbstatus) */
+static void hot_file_load(struct lio *io) {
+    char why[200] = "";
+    io->hot_fstate = KDB_HF_NONE;
+    io->hot_why[0] = 0;
+    io->hot_on_disk = false;
+    if (!g_state_file) return;
+    io->hot_fstate = kdb_hotl_file_read(g_state_file, &io->hot_cur, why, sizeof(why));
+    switch (io->hot_fstate) {
+    case KDB_HF_LOADED:
+        io->hot_on_disk = true;
+        lg(LOG_INFO, "state file %s: %u zone(s) of the hot list", g_state_file, (unsigned)io->hot_cur.n);
+        break;
+    case KDB_HF_MISSING:
+        lg(LOG_NOTICE, "state file %s does not exist yet; it is written when the Backend sends the hot list", g_state_file);
+        break;
+    case KDB_HF_CORRUPT:
+        lg(LOG_WARNING, "state file %s is ignored: %s; it is replaced by the next hot list", g_state_file, why);
+        break;
+    default:
+        /* a file that is there and cannot be read (permissions, a link, not a regular file) is not replaced: the next hot list would rename over somebody's file */
+        snprintf(io->hot_why, sizeof(io->hot_why), "%s", why);
+        lg(LOG_ERR, "state file %s cannot be read: %s; it is ignored and NOT replaced (fix it or remove it)", g_state_file, why);
+        break;
+    }
+    io->hot_fzones = io->hot_cur.n;
+}
+
+/* After the startup load: the zones of the state file, hottest first, for the Backend to read (WARM_LIST; an empty one when there is none, so that the
+ * Backend knows the warm-up has nothing more to wait for).  Only the views the CONFIG has are sent. */
+static int warm_send(ctx_t *x, struct lio *io) {
+    kdb_hotl_t keep;
+    kdb_hotl_init(&keep);
+    size_t pos = 0;
+    const char *v, *z;
+    while (kdb_hotl_next(&io->hot_cur, &pos, &v, &z)) {
+        bool known = false;
+        for (size_t i = 0; !known && i < io->cfg.nviews; i++) known = io->cfg.views[i].name && strcmp(io->cfg.views[i].name, v) == 0;
+        if (known && !kdb_hotl_add(&keep, v, z)) break;
+    }
+    int rc = kdb_hot_encode(&keep, &x->enc, KDB_T_WARM_LIST, ++io->warm_seq, 0, io->hot_fstate, io->hot_fzones, hot_emit, x);
+    if (rc == 0) lg(LOG_INFO, "WARM_LIST: %u zone(s) of the hot list sent to the Backend", (unsigned)keep.n);
+    kdb_hotl_free(&keep);
+    return rc;
+}
+
+/* A complete HOT_LIST: merge it into the list of the state file (what nobody asked for since stays after the new zones), write the file when it differs, tell the
+ * Backend.  A failure to write is reported, not fatal: the next list tries again. */
+static int hot_run(ctx_t *x, struct lio *io) {
+    if (!io->hot_ready) return 0;
+    io->hot_ready = false;
+    uint8_t status = KDB_HA_NOFILE;
+    char err[200] = "";
+    if (io->hot_dropped) lg(LOG_NOTICE, "HOT_LIST: %u entries dropped (a view that is not configured, or the list is too long)", (unsigned)io->hot_dropped);
+    if (g_state_file && io->hot_fstate == KDB_HF_UNREADABLE) {
+        status = KDB_HA_FAILED;
+        snprintf(err, sizeof(err), "the state file exists and cannot be read (%s): not replaced", io->hot_why);
+    } else if (g_state_file) {
+        kdb_hotl_t merged;
+        kdb_hotl_init(&merged);
+        if (!kdb_hotl_merge(&io->hot_fresh, &io->hot_cur, io->hot_fresh_limit, &merged)) {
+            status = KDB_HA_FAILED;
+            snprintf(err, sizeof(err), "out of memory");
+        } else if (io->hot_on_disk && kdb_hotl_equal(&merged, &io->hot_cur)) {
+            status = KDB_HA_UNCHANGED;
+        } else {
+            kdb_hotl_t t = io->hot_cur;                       /* the merged list is the list now, written or not (a failed write is tried again with the next list) */
+            io->hot_cur = merged;
+            merged = t;
+            if (kdb_hotl_file_write(g_state_file, &io->hot_cur, err, sizeof(err)) == 0) {
+                status = KDB_HA_WRITTEN;
+                io->hot_on_disk = true;
+            } else {
+                status = KDB_HA_FAILED;
+                io->hot_on_disk = false;
+                lg(LOG_ERR, "state file: %s", err);
+            }
+        }
+        kdb_hotl_free(&merged);
+    }
+    char clean[256];
+    clean_reason(err, clean, sizeof(clean));
+    if (kdb_enc_begin(&x->enc, KDB_T_HOT_ACK) != 0 || kdb_enc_u64(&x->enc, 1, io->hot_fresh_id) != 0 || kdb_enc_u8(&x->enc, 2, status) != 0 ||
+        kdb_enc_u32(&x->enc, 3, g_state_file ? io->hot_cur.n : 0) != 0 || (clean[0] && kdb_enc_str(&x->enc, 4, clean) != 0) ||
+        kdb_enc_end(&x->enc) != 0)
+        return -1;
+    return send_enc(x);
+}
+
 static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
     kdb_msg_t m;
     char why[KDB_REASON_LEN];
@@ -2592,7 +3288,34 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
         io->failed = true;
         return;
     }
+    if (io->is_fetch != (m.type == KDB_T_FETCH_REQ)) {         /* D1a: the fetch stream carries FETCH_REQ and nothing else, the first stream never */
+        lg(LOG_ERR, "protocol error from the Backend: %s on the %s stream", kdb_type_name(m.type), io->is_fetch ? "fetch" : "first");
+        io->failed = true;
+        return;
+    }
     switch (m.type) {
+    case KDB_T_FETCH_REQ: {
+        const kdb_fetch_req_t *q = &m.u.fetch_req;
+        freq_t *f = NULL;
+        pthread_mutex_lock(&io->fq_lock);                      /* (only the fetch stream gets a FETCH_REQ, and its lock is initialised) */
+        if (io->nfq < FQ_MAX) f = &io->fq[io->nfq++];
+        else if (io->nfbusy < sizeof(io->fbusy) / sizeof(io->fbusy[0])) f = &io->fbusy[io->nfbusy++];
+        else io->fq_busy++;                                    /* beyond even that: the Backend's request times out */
+        if (f) {
+            f->id = q->request_id;
+            f->view = q->view;
+            f->prio = q->priority;
+            f->mode = q->mode;
+            f->range = q->has_range;
+            snprintf(f->zone, sizeof(f->zone), "%s", q->name);
+            pthread_cond_broadcast(&io->fq_cond);          /* (broadcast: a worker above fq_allowed would take the wake-up) */
+        }
+        pthread_mutex_unlock(&io->fq_lock);
+        break;
+    }
+    case KDB_T_HOT_LIST:
+        hot_part(io, &m);
+        break;
     case KDB_T_CONFIG: {
         lcfg_t nc;
         if (cfg_from_msg(&m, &nc) != 0) {
@@ -2623,6 +3346,7 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
                 return;
             }
             ie->known = true;
+            ie->resident = e.resident;
             ie->dirty = false;
             ie->has_pend = false;
             ie->source_id = e.source_id;
@@ -2638,9 +3362,50 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
     case KDB_T_ZONE_RESULT: {
         io->n_results++;
         int zslot = io->idx_slot ? io->idx_slot[m.u.zone_result.view] : -1;
+        fev_drain(io, true);                         /* (the zones the fetch thread served before this result) */
         inv_ent_t *ie = zslot >= 0 ? inv_find(&io->inv, (uint16_t)zslot, m.u.zone_result.name) : NULL;
-        if (ie) {
+        if (ie && ie->has_pend && ie->fev != ie->p_fev && m.u.zone_result.status != KDB_ST_REJECTED && m.u.zone_result.status != KDB_ST_DELETED) {
+            /* a fetch of the zone was served while this version was on its way: the Backend has that version, or this one, in an order nobody
+             * knows.  The inventory keeps what the fetch served; a diff follows at once when that is not the version that was sent (whatever the answer says: the
+             * Backend may keep the older one), and it sends the zone whole if the database has another. */
+            ie->has_pend = false;
+            if (m.u.zone_result.status == KDB_ST_SEND_BODY || ie->source_id != ie->p_source_id || ie->serial != ie->p_serial) io->again = true;
+        } else if (ie) {
             switch (m.u.zone_result.status) {
+            case KDB_ST_UNCHANGED:
+            case KDB_ST_SEND_BODY:
+                if (!ie->has_pend) {                 /* the answer to a deletion: nothing to remember */
+                    inv_del(&io->inv, ie);
+                    break;
+                }
+                /* the answer to a summary (the inventory said: no data in memory).  UNCHANGED: the Backend has the version the summary describes
+                 * in memory.  SEND_BODY: it has another version in memory; the zone is sent whole by the diff that follows at once. */
+                ie->known = true;
+                ie->resident = true;
+                ie->has_pend = false;
+                if (m.u.zone_result.status == KDB_ST_UNCHANGED) {
+                    ie->source_id = ie->p_source_id;
+                    ie->serial = ie->p_serial;
+                    ie->dirty = false;
+                } else {
+                    ie->dirty = true;
+                    io->again = true;
+                }
+                break;
+            case KDB_ST_NOT_RESIDENT:                /* the answer to a body: the Backend has the version in its directory and left the data out (memory-limit).  The
+                                                      * inventory says so (a zone it served by a fetch is resident only until it is taken out again, and no message tells
+                                                      * of that), and the zone is offered again at once, as a summary: that is what carries the apex */
+                if (ie->has_pend) {
+                    ie->source_id = ie->p_source_id;
+                    ie->serial = ie->p_serial;
+                    memcpy(ie->digest, ie->p_digest, KDB_DIGEST_LEN);
+                    ie->known = true;
+                    ie->has_pend = false;
+                }
+                ie->resident = false;
+                ie->dirty = true;
+                io->again = true;
+                break;
             case KDB_ST_APPLIED:
             case KDB_ST_SHADOWED:                    /* the Backend has the version that was sent */
                 if (ie->has_pend) {
@@ -2648,6 +3413,7 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
                     ie->serial = ie->p_serial;
                     memcpy(ie->digest, ie->p_digest, KDB_DIGEST_LEN);
                     ie->known = true;
+                    ie->resident = ie->p_resident;     /* (what was sent is in memory, unless it was a summary) */
                     ie->has_pend = false;
                 }
                 ie->dirty = false;
@@ -2747,7 +3513,7 @@ static void io_pump(struct lio *io) {
 static int stream_write(ctx_t *x, const uint8_t *msg, size_t len) {
     struct lio *io = x->io;
     while (len > 0) {
-        if (g_stop) {
+        if (g_stop || (x->fetch && (atomic_load_explicit(&g_fetch_stop, memory_order_relaxed) || atomic_load_explicit(&io->wstop, memory_order_relaxed)))) {
             errno = EINTR;
             return -1;
         }
@@ -2759,10 +3525,14 @@ static int stream_write(ctx_t *x, const uint8_t *msg, size_t len) {
         }
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            struct pollfd p = { io->fd, POLLIN | POLLOUT, 0 };
+            struct pollfd p = { io->fd, (short)(x->fetch ? POLLOUT : POLLIN | POLLOUT), 0 };      /* (the fetch stream: its reader thread reads the requests) */
             int r = poll(&p, 1, 1000);
             if (r < 0 && errno != EINTR) return -1;
-            if (r > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR))) {
+            if (r > 0 && x->fetch && (p.revents & (POLLHUP | POLLERR))) {
+                errno = EPIPE;
+                return -1;
+            }
+            if (r > 0 && !x->fetch && (p.revents & (POLLIN | POLLHUP | POLLERR))) {
                 io_pump(io);
                 if (io->eof || io->failed) {
                     errno = EPIPE;
@@ -2875,6 +3645,7 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
     x->reconcile = reconcile;
     x->bulk_threshold = c->bulk_threshold;
     x->nthreads = c->loader_threads >= 1 && c->loader_threads <= 16 ? c->loader_threads : 1;
+    x->dir_only = c->dir_only;
     x->map_logged = false;
     x->n_zones = x->n_failed = x->n_unwritten = 0;
     x->n_unchanged = x->n_deleted = x->n_read = 0;
@@ -2939,6 +3710,269 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
         if (io_wait_results(io) != 0) return -1;
     }
     return errs ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* the fetch thread (D1a, design 6.1): the second stream                                                          */
+/* ------------------------------------------------------------------------------------------------------------- */
+/* The Backend asks for one zone at a time (FETCH_REQ) on a stream of its own, because a parked query waits for the answer and the first
+ * stream is busy with batches (a batch holds the stream from BATCH_BEGIN to BATCH_END, and the Backend answers each zone).  One thread owns the
+ * fetch stream: it reads the requests into a queue of FQ_MAX (a request beyond that is answered ZONE_FAILED "busy", so the Backend does not
+ * wait for it), takes the most urgent one (priority 0 before 1 before 2, the oldest first) and runs it through the same reader as a one-zone
+ * reload (run_view() in fetch mode): its own database connection and snapshot, no batch, no inventory, no results.  The answer is ZONE_BEGIN ..
+ * ZONE_DATA .. ZONE_END, a summary (mode 1: ZONE_BEGIN and ZONE_END with the summary flag) or ZONE_FAILED with the reason, each with the request
+ * id.  The thread reads the configuration from a copy the main thread publishes whenever it takes a CONFIG into use. */
+static int g_fetch_fd = -1;
+static pthread_mutex_t g_fcfg_lock = PTHREAD_MUTEX_INITIALIZER;
+static lcfg_t g_fcfg;
+static uint64_t g_fcfg_seq;
+#define FW_MAX 16                                   /* workers of the pool: the most loader-threads can be */
+typedef struct { struct lio *io; unsigned idx; } fw_arg_t;
+static pthread_t g_fetch_tid;
+static bool g_fetch_started;
+
+static int cfg_dup(const lcfg_t *s, lcfg_t *d) {
+    *d = *s;
+    d->views = calloc(s->nviews ? s->nviews : 1, sizeof(lview_t));
+    d->nviews = 0;
+    if (!d->views) return -1;
+    for (size_t i = 0; i < s->nviews; i++) {
+        lview_t *v = &d->views[d->nviews++];
+        *v = s->views[i];
+        v->name = s->views[i].name ? strdup(s->views[i].name) : NULL;
+        v->source = s->views[i].source ? strdup(s->views[i].source) : NULL;
+        v->conninfo = s->views[i].conninfo ? strdup(s->views[i].conninfo) : NULL;
+        if ((s->views[i].name && !v->name) || (s->views[i].source && !v->source) || (s->views[i].conninfo && !v->conninfo)) return -1;
+    }
+    return 0;
+}
+
+static void fetch_publish_cfg(const lcfg_t *c) {
+    if (g_fetch_fd < 0) return;
+    lcfg_t n;
+    if (cfg_dup(c, &n) != 0) {
+        cfg_free(&n);
+        lg(LOG_ERR, "out of memory (the configuration for the fetch thread)");
+        return;
+    }
+    pthread_mutex_lock(&g_fcfg_lock);
+    cfg_free(&g_fcfg);
+    g_fcfg = n;
+    g_fcfg_seq++;
+    pthread_mutex_unlock(&g_fcfg_lock);
+}
+
+/* ZONE_FAILED for a request: the name of the request (canonical: the decoder checked it), source id 0, the reason */
+static int fetch_fail(ctx_t *x, const freq_t *r, const char *reason) {
+    char why[260];
+    clean_reason(reason, why, sizeof(why));
+    x->n_failed++;
+    if (kdb_enc_begin(&x->enc, KDB_T_ZONE_FAILED) != 0 || kdb_enc_u16(&x->enc, 1, r->view) != 0 || kdb_enc_name(&x->enc, 2, r->zone) != 0 ||
+        kdb_enc_i64(&x->enc, 3, 0) != 0 || kdb_enc_str(&x->enc, 4, why) != 0 || kdb_enc_u64(&x->enc, 5, r->id) != 0 || kdb_enc_end(&x->enc) != 0)
+        return -1;
+    fw_lock(x);
+    int rc = send_enc(x);
+    fw_unlock(x);
+    return rc;
+}
+
+/* one request.  0, or -1 when the stream is gone / the loader is told to stop / out of memory */
+static int fetch_one(ctx_t *x, const lcfg_t *lc, const freq_t *r) {
+    const db_driver_t *drv = lc->driver[0] ? driver_find(lc->driver) : NULL;
+    const lview_t *v = NULL;
+    for (size_t i = 0; i < lc->nviews; i++)
+        if (lc->views[i].index == r->view) v = &lc->views[i];
+    if (r->range) return fetch_fail(x, r, "this loader does not read a range of a zone");
+    if (!drv) return fetch_fail(x, r, "the loader has no usable configuration yet");
+    if (!v) return fetch_fail(x, r, "the view is not in the configuration");
+    x->fetch_req = r->id;
+    x->fetch_vname = v->name;
+    x->fetch_summary = r->mode == KDB_FETCH_SUMMARY;
+    x->drv = drv;
+    x->view = r->view;
+    x->nthreads = 1;
+    x->force = true;                                          /* (no digest gate: the Backend asked for the data) */
+    x->bulk_threshold = lc->bulk_threshold;
+    x->map_logged = false;
+    x->n_zones = x->n_failed = x->n_unwritten = x->n_unchanged = x->n_read = 0;
+    x->npsent = 0;                                            /* a profile goes out before every zone of this stream */
+    x->errtext[0] = '\0';
+    memset(&x->opts, 0, sizeof(x->opts));
+    x->opts.default_ttl = lc->default_ttl;
+    x->opts.max_records = v->max_records;
+    x->opts.max_zone_bytes = v->max_bytes;
+    x->map_view = v->shared ? v->name : NULL;
+    db_source_t src;
+    view_source(drv, v, &src);
+    (void)run_view(x, &src, r->zone, false);
+    ctx_view_reset(x);
+    x->map_view = NULL;
+    x->fetch_vname = NULL;
+    if (x->io_error || x->oom || g_stop || atomic_load(&g_fetch_stop)) return -1;
+    if (x->n_zones == 0 && x->n_failed == 0)                  /* nothing was sent: the Backend is waiting for an answer */
+        return fetch_fail(x, r, x->errtext[0] ? x->errtext : "the zone could not be read");
+    return 0;
+}
+
+/* Ends the workers of the pool (the stream is gone, a worker failed, or the loader stops).  Under fq_lock, so that a worker that is about to wait sees it. */
+static void fetch_workers_stop(struct lio *io) {
+    pthread_mutex_lock(&io->fq_lock);
+    atomic_store(&io->wstop, true);
+    pthread_cond_broadcast(&io->fq_cond);
+    pthread_mutex_unlock(&io->fq_lock);
+}
+
+/* a worker of the pool: takes the most urgent request (priority 0 before 1 before 2, the oldest first) and runs it through the same reader as a one-zone
+ * reload, on a database connection of its own.  Worker n works only while loader-threads is more than n (a smaller loader-threads after a reconfiguration
+ * lets the workers above it rest; they are not ended). */
+static void *fetch_worker(void *arg) {
+    fw_arg_t *a = arg;
+    struct lio *io = a->io;
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    x.io = io;
+    x.fetch = true;
+    kdb_enc_init(&x.enc);
+    lcfg_t lc;
+    memset(&lc, 0, sizeof(lc));
+    uint64_t seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&io->fq_lock);
+        while (!atomic_load(&io->wstop) && !(io->nfq > 0 && a->idx < io->fq_allowed)) {
+            io->fq_idle++;
+            pthread_cond_wait(&io->fq_cond, &io->fq_lock);
+            io->fq_idle--;
+        }
+        if (atomic_load(&io->wstop)) {
+            pthread_mutex_unlock(&io->fq_lock);
+            break;
+        }
+        size_t best = 0;
+        for (size_t i = 1; i < io->nfq; i++)
+            if (io->fq[i].prio < io->fq[best].prio) best = i;
+        freq_t r = io->fq[best];
+        memmove(&io->fq[best], &io->fq[best + 1], (io->nfq - best - 1) * sizeof(io->fq[0]));
+        io->nfq--;
+        pthread_mutex_unlock(&io->fq_lock);
+        pthread_mutex_lock(&g_fcfg_lock);
+        if (g_fcfg_seq != seen) {
+            cfg_free(&lc);
+            if (cfg_dup(&g_fcfg, &lc) != 0) cfg_free(&lc);       /* (out of memory: the request below says there is no configuration) */
+            seen = g_fcfg_seq;
+        }
+        pthread_mutex_unlock(&g_fcfg_lock);
+        if (fetch_one(&x, &lc, &r) != 0) {
+            atomic_store(&g_fetch_died, true);                    /* (the stream or the memory is gone: this process does not serve the fetch stream again) */
+            fetch_workers_stop(io);
+            break;
+        }
+    }
+    cfg_free(&lc);
+    ctx_view_reset(&x);
+    kdb_enc_free(&x.enc);
+    return NULL;
+}
+
+/* the thread that owns the fetch stream: reads the requests into the queue (a request beyond FQ_MAX is answered "busy"), keeps the pool at loader-threads
+ * workers (started when a request finds none idle) and ends them when the stream is gone */
+static void *fetch_main(void *arg) {
+    int fd = (int)(intptr_t)arg;
+    struct lio *io = calloc(1, sizeof(*io));
+    uint8_t *body = malloc(KDB_MAX_BODY);
+    if (!io || !body) {
+        lg(LOG_ERR, "out of memory (the fetch thread)");
+        atomic_store(&g_fetch_died, true);
+        free(io);
+        free(body);
+        return NULL;
+    }
+    io->fd = fd;
+    io->body = body;
+    io->is_fetch = true;
+    pthread_mutex_init(&io->fq_lock, NULL);
+    pthread_mutex_init(&io->wlock, NULL);
+    pthread_cond_init(&io->fq_cond, NULL);
+    io->fq_allowed = 1;
+    kdb_framer_init(&io->fr, KDB_FROM_BACKEND, body, KDB_MAX_BODY);
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    x.io = io;
+    x.fetch = true;
+    kdb_enc_init(&x.enc);
+    fw_arg_t warg[FW_MAX];
+    pthread_t wtid[FW_MAX];
+    unsigned nw = 0;
+    while (!g_stop && !atomic_load(&g_fetch_stop) && !atomic_load(&io->wstop) && !io->eof && !io->failed) {
+        while (io->nfbusy > 0) {                              /* the requests that did not fit the queue (only this thread uses them) */
+            freq_t *b = &io->fbusy[--io->nfbusy];
+            if (fetch_fail(&x, b, "busy: too many fetch requests are waiting") != 0) goto out;
+        }
+        struct pollfd p = { fd, POLLIN, 0 };
+        int pr = poll(&p, 1, 200);
+        if (pr < 0 && errno != EINTR) break;
+        if (pr > 0) io_pump(io);
+        pthread_mutex_lock(&g_fcfg_lock);
+        unsigned want = g_fcfg.loader_threads >= 1 && g_fcfg.loader_threads <= FW_MAX ? g_fcfg.loader_threads : 1;
+        pthread_mutex_unlock(&g_fcfg_lock);
+        for (;;) {
+            pthread_mutex_lock(&io->fq_lock);
+            if (io->fq_allowed != want) {
+                io->fq_allowed = want;
+                pthread_cond_broadcast(&io->fq_cond);
+            }
+            bool need = io->nfq > io->fq_idle && nw < want;
+            pthread_mutex_unlock(&io->fq_lock);
+            if (!need) break;
+            warg[nw].io = io;
+            warg[nw].idx = nw;
+            if (pthread_create(&wtid[nw], NULL, fetch_worker, &warg[nw]) != 0) {
+                lg(LOG_ERR, "cannot start a fetch worker");
+                if (nw == 0) goto out;                        /* (none at all: nobody would serve the stream) */
+                break;
+            }
+            nw++;
+        }
+    }
+out:
+    if (io->failed) lg(LOG_ERR, "the fetch stream is closed (protocol error)");
+    else if (io->eof) lg(LOG_NOTICE, "the Backend closed the fetch stream");
+    if (!g_stop && !atomic_load(&g_fetch_stop)) atomic_store(&g_fetch_died, true);     /* (not asked to end: this process does not serve the fetch stream again) */
+    fetch_workers_stop(io);
+    for (unsigned i = 0; i < nw; i++) pthread_join(wtid[i], NULL);
+    kdb_enc_free(&x.enc);
+    close(fd);                                              /* (the Backend sees the end of the stream) */
+    pthread_cond_destroy(&io->fq_cond);
+    pthread_mutex_destroy(&io->fq_lock);
+    pthread_mutex_destroy(&io->wlock);
+    free(body);
+    free(io);
+    return NULL;
+}
+
+/* start the thread (once, when the first CONFIG is in use); a stream that is not a stream socket is refused */
+static void fetch_thread_start(void) {
+    if (g_fetch_fd < 0 || g_fetch_started) return;
+    sigset_t all, old;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, &old);                   /* signals are for the main thread */
+    int rc = pthread_create(&g_fetch_tid, NULL, fetch_main, (void *)(intptr_t)g_fetch_fd);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    if (rc != 0) {
+        lg(LOG_ERR, "cannot start the fetch thread: %s", strerror(rc));
+        return;
+    }
+    g_fetch_started = true;
+    lg(LOG_INFO, "fetch stream on descriptor %d: the fetch thread is running", g_fetch_fd);
+}
+
+static void fetch_thread_stop(void) {
+    if (!g_fetch_started) return;
+    atomic_store(&g_fetch_stop, true);
+    pthread_join(g_fetch_tid, NULL);
+    g_fetch_started = false;
+    pthread_mutex_lock(&g_fcfg_lock);
+    cfg_free(&g_fcfg);
+    pthread_mutex_unlock(&g_fcfg_lock);
 }
 
 static int64_t now_ms(void) {
@@ -3751,6 +4785,10 @@ static int run_stream(int fd) {
     memset(&x, 0, sizeof(x));
     x.io = io;
     kdb_enc_init(&x.enc);
+    kdb_hotl_init(&io->hot_asm);
+    kdb_hotl_init(&io->hot_fresh);
+    kdb_hotl_init(&io->hot_cur);
+    hot_file_load(io);                         /* D1a step 7: the hot list of the last run */
     int status = EXIT_OK;
     char drvs[128];
     drivers_csv(drvs, sizeof(drvs));
@@ -3777,6 +4815,8 @@ static int run_stream(int fd) {
         status = EXIT_ERROR;
         goto done;
     }
+    fetch_publish_cfg(&io->cfg);                 /* D1a: the fetch thread (second stream) reads the sources from this copy */
+    fetch_thread_start();
     if (kdb_enc_begin(&x.enc, KDB_T_INVENTORY_REQ) != 0 || kdb_enc_end(&x.enc) != 0 || send_enc(&x) != 0) goto stopped;
     if (io_wait_for(io, &io->inv_end) != 0) goto stopped;
     lg(LOG_INFO, "inventory received: %llu zone(s) at the Backend", (unsigned long long)io->inv_entries);
@@ -3788,6 +4828,11 @@ static int run_stream(int fd) {
     bool reconcile = true;                     /* the first load compares every zone with the inventory (digest) */
     while (!g_stop) {
         if (io->failed) {
+            status = EXIT_ERROR;
+            goto done;
+        }
+        if (atomic_load(&g_fetch_died)) {          /* D1a: the fetch stream is gone for good; the supervisor starts a loader with a new pair of streams */
+            lg(LOG_ERR, "the fetch stream is gone; exiting so that the supervisor restarts the loader");
             status = EXIT_ERROR;
             goto done;
         }
@@ -3803,6 +4848,7 @@ static int run_stream(int fd) {
                 status = EXIT_ERROR;
                 goto done;
             }
+            fetch_publish_cfg(&io->cfg);
             if (diff) {
                 lg(LOG_NOTICE, "the database sources changed; comparing every zone with the Backend's");
                 need_load = true;
@@ -3811,6 +4857,11 @@ static int run_stream(int fd) {
             }
         }
         uint64_t load_req = 0;
+        fev_drain(io, true);                   /* the zones the fetch thread served since the last turn (at most a second ago: the poll below times out) */
+        if (io->again) {                       /* D1a: zones the Backend wants whole (SEND_BODY) */
+            io->again = false;
+            need_load = true;
+        }
         if (io->reload_all) {                  /* karictl reload: a diff of every source (one-zone requests stay queued) */
             io->reload_all = false;
             load_req = io->all_req_id;
@@ -3845,6 +4896,14 @@ static int run_stream(int fd) {
                 if (backoff < 30) backoff *= 2;
             }
         }
+        if (startup_done && !io->warm_sent && !io->have_newcfg) {          /* D1a step 7: the zones of the state file, once, between batches */
+            io->warm_sent = true;
+            if (warm_send(&x, io) != 0) {
+                if (g_stop) goto stopped;
+                status = EXIT_ERROR;
+                goto done;
+            }
+        }
         for (size_t i = 0; i < io->nreq && !g_stop; i++) {
             lreq_t r = io->req[i];
             if (do_load(&x, io, KDB_BATCH_ZONE, r.view, r.zone, r.id, r.force, false) < 0) {
@@ -3855,6 +4914,11 @@ static int run_stream(int fd) {
         }
         io->nreq = 0;
         if (startup_done && auto_run(&x, io) != 0) {
+            if (g_stop) goto stopped;
+            status = EXIT_ERROR;
+            goto done;
+        }
+        if (startup_done && hot_run(&x, io) != 0) {
             if (g_stop) goto stopped;
             status = EXIT_ERROR;
             goto done;
@@ -3897,6 +4961,10 @@ stopped:
     else if (io->eof) lg(LOG_NOTICE, "the Backend closed the stream; exiting");
     else if (io->failed) status = EXIT_ERROR;
 done:
+    fetch_thread_stop();
+    kdb_hotl_free(&io->hot_asm);
+    kdb_hotl_free(&io->hot_fresh);
+    kdb_hotl_free(&io->hot_cur);
     ctx_view_reset(&x);
     kdb_enc_free(&x.enc);
     for (size_t i = 0; i < io->nrw; i++) rw_free(&io->rw[i]);
@@ -3920,6 +4988,15 @@ static int stream_main(int fd) {
         fprintf(stderr, "karidns-dbloader: file descriptor %d is not a stream socket\n", fd);
         return EXIT_USAGE;
     }
+    if (g_fetch_fd >= 0) {                  /* D1a: the same for the fetch stream; without a usable one the loader runs without it */
+        stype = 0;
+        slen = sizeof(stype);
+        if (fstat(g_fetch_fd, &st) != 0 || !S_ISSOCK(st.st_mode) || getsockopt(g_fetch_fd, SOL_SOCKET, SO_TYPE, &stype, &slen) != 0 ||
+            stype != SOCK_STREAM) {
+            fprintf(stderr, "karidns-dbloader: file descriptor %d (--fetch-fd) is not a stream socket; running without the fetch stream\n", g_fetch_fd);
+            g_fetch_fd = -1;
+        }
+    }
     g_stream_mode = true;
     openlog("karidns-dbloader", LOG_PID | LOG_NDELAY | LOG_PERROR, LOG_DAEMON);
     struct sigaction sa;
@@ -3938,6 +5015,13 @@ static int stream_main(int fd) {
     if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) != 0) {
         lg(LOG_ERR, "cannot set the stream non-blocking: %s", strerror(errno));
         return EXIT_ERROR;
+    }
+    if (g_fetch_fd >= 0) {
+        int ff = fcntl(g_fetch_fd, F_GETFL, 0);
+        if (ff < 0 || fcntl(g_fetch_fd, F_SETFL, ff | O_NONBLOCK) != 0) {
+            lg(LOG_ERR, "cannot set the fetch stream non-blocking: %s; running without it", strerror(errno));
+            g_fetch_fd = -1;
+        }
     }
     return run_stream(fd);
 }
@@ -3998,6 +5082,7 @@ static void usage(FILE *fp) {
         "  --ecs-tag NAME      with --check: a tag of options { ecs-tags }; repeatable (records may name it)\n"
         "  --location-tag NAME with --check: a tag of options { location-tags }; repeatable\n"
         "  --max-zone-records N, --max-zone-bytes N   with --check: the limits of the database block\n"
+        "  --state-file PATH   with -s: the file the hot list is kept in (D1a: database { loader-state-file }); with --check: check that the loader can use it\n"
         "  --zone-checks LIST  with --check: the check-* severities, name=fail|warn|ignore,... (names, dup-records, integrity, mx, mx-cname, sibling,\n"
         "                      spf, srv-cname, svcb, wildcard)\n"
         "  --version           print the version\n"
@@ -4041,10 +5126,13 @@ int main(int argc, char **argv) {
         { "location-tag", required_argument, NULL, 1005 }, { "max-zone-records", required_argument, NULL, 1006 },
         { "max-zone-bytes", required_argument, NULL, 1007 },
         { "zone-checks", required_argument, NULL, 1008 },
+        { "fetch-fd", required_argument, NULL, 1009 },
+        { "state-file", required_argument, NULL, 1010 },
         { "help", no_argument, NULL, 'h' },                { NULL, 0, NULL, 0 }
     };
     const char *dump = NULL, *driver = NULL, *dbfile = NULL, *conninfo = NULL, *schema = NULL, *zone = NULL, *map_view = NULL;
-    const char *stream_fd = NULL;
+    const char *stream_fd = NULL, *fetch_fd_arg = NULL;
+    const char *state_file_arg = NULL;
     unsigned long view = 0, ttl = 0, threads = 1, v, max_records = 0, max_bytes = 0;
     bool check = false, chk_auto = false;                 // B12
     const char *chk_server_id = NULL, *chk_zone_checks = NULL;
@@ -4092,6 +5180,8 @@ int main(int argc, char **argv) {
             else chk_loc[n_chk_loc++] = optarg;
             break;
         case 1008: chk_zone_checks = optarg; break;
+        case 1009: fetch_fd_arg = optarg; break;
+        case 1010: state_file_arg = optarg; break;
         case 1006:
             if (!parse_uint(optarg, 2, 4294967295ul, &max_records)) {
                 fprintf(stderr, "karidns-dbloader: --max-zone-records must be 2..4294967295\n");
@@ -4126,8 +5216,26 @@ int main(int argc, char **argv) {
             fprintf(stderr, "karidns-dbloader: -s cannot be combined with the dump options\n");
             return EXIT_USAGE;
         }
+        if (fetch_fd_arg) {
+            unsigned long fv;
+            if (!parse_uint(fetch_fd_arg, 0, 1u << 20, &fv) || fv == v) {
+                fprintf(stderr, "karidns-dbloader: --fetch-fd needs a file descriptor number other than the one of -s\n");
+                return EXIT_USAGE;
+            }
+            g_fetch_fd = (int)fv;
+        }
+        g_state_file = state_file_arg;
         return stream_main((int)v);
     }
+    if (fetch_fd_arg) {
+        fprintf(stderr, "karidns-dbloader: --fetch-fd is for -s\n");
+        return EXIT_USAGE;
+    }
+    if (state_file_arg && !check) {
+        fprintf(stderr, "karidns-dbloader: --state-file is for -s and --check\n");
+        return EXIT_USAGE;
+    }
+    g_state_file = state_file_arg;                       // --check looks at it (chk_state_file)
     if (check && (dump || zone || map_view)) {
         fprintf(stderr, "karidns-dbloader: --check cannot be combined with --dump, --zone or --map-view\n");
         return EXIT_USAGE;

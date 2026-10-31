@@ -90,10 +90,11 @@ if [ -n "$LP" ]; then
     U=$(ps -o user= -p "$LP" | tr -d ' ')
     A=$(ps -o command= -p "$LP")
     [ "$U" = "nobody" ] && pass "the loader runs as nobody" || fail "the loader runs as '$U'"
-    [ "$A" = "karidns-dbloader -s 3" ] && pass "started as 'karidns-dbloader -s 3'" || fail "command line is '$A'"
+    [ "$A" = "karidns-dbloader -s 3 --fetch-fd 4" ] && pass "started as 'karidns-dbloader -s 3 --fetch-fd 4'" || fail "command line is '$A'"
     if procstat -f "$LP" 2>/dev/null | awk '$3 == "3" && $4 == "s" { f = 1 } END { exit !f }'; then pass "fd 3 of the loader is a socket"; else fail "fd 3 of the loader is not a socket"; procstat -f "$LP" | head; fi
-    NFD=$(procstat -f "$LP" 2>/dev/null | awk '$3 ~ /^[0-9]+$/ && $3 >= 4 && $0 !~ /run.log/' | wc -l | tr -d ' ')
-    [ "$NFD" -eq 0 ] && pass "the loader has no descriptor above 3 except the syslog socket (closefrom)" || fail "the loader holds $NFD descriptor(s) above 3"
+    if procstat -f "$LP" 2>/dev/null | awk '$3 == "4" && $4 == "s" { f = 1 } END { exit !f }'; then pass "fd 4 of the loader (the fetch stream) is a socket"; else fail "fd 4 of the loader is not a socket"; procstat -f "$LP" | head; fi
+    NFD=$(procstat -f "$LP" 2>/dev/null | awk '$3 ~ /^[0-9]+$/ && $3 >= 5 && $0 !~ /run.log/' | wc -l | tr -d ' ')
+    [ "$NFD" -eq 0 ] && pass "the loader has no descriptor above 4 (the fetch stream) except the syslog socket (closefrom)" || fail "the loader holds $NFD descriptor(s) above 4"
 else
     fail "no loader process"
 fi

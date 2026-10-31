@@ -171,6 +171,16 @@ typedef struct pdns_zone_s {
     char profile[256];              /* X-KARIDNS-PROFILE, "" if none */
     uint8_t zkind;                  /* B7b: KDB_ZK_PRIMARY (0, rows), KDB_ZK_SECONDARY (SLAVE) or KDB_ZK_CATALOG (CONSUMER): no rows */
     char *master;                   /* B7b: domains.master of such a zone (private copy) */
+    bool summary;                   /* D1a milestone 4: only the directory entry of a primary zone (serial, SOA timers, settings, flags): no rows */
+    uint32_t sum_serial, sum_refresh, sum_retry, sum_expire;
+    bool sum_timers;
+    char *sum_apex;                 /* D1a step 6: the apex of the summary, one block: mname NUL rname NUL the NS names separated by LF NUL (pdns_zone_set_apex()) */
+    const char *sum_mname, *sum_rname, *sum_ns;
+    uint32_t sum_minimum, sum_soa_ttl, sum_ns_ttl;
+    const uint8_t *sum_glue;        /* the glue of the apex (tag 21 of ZONE_BEGIN), inside sum_apex; NULL / 0: none */
+    size_t sum_glue_len;
+    uint8_t *sum_naddr;             /* D1a step 7: the addresses of the NS targets outside the zone (tag 22 of ZONE_BEGIN), malloc; NULL / 0: none (pdns_zone_set_notify_addrs()) */
+    size_t sum_naddr_len;
     char *nsec3param;               /* NSEC3PARAM metadata (first row), NULL if none */
     presigned_mode_t presigned_mode;   /* PS_NSEC3 / PS_NSEC: the chain was rebuilt; PS_NONE: served as stored */
     size_t n_synth;                 /* records presigned_rebuild() added at the end of arena.records */
@@ -202,6 +212,13 @@ bool pdns_canonical_zone_name(const char *dbname, char out[DNS_NAME_TEXT_SIZE]);
  * master.  Returns -1 on out of memory. */
 int pdns_zone_set_secondary(pdns_zone_t *z, uint8_t kind, const char *master);
 
+/* D1a milestone 4 (design 3.3, 6.3): make a primary zone a summary before pdns_zone_finish(): the part of it the Backend keeps in its zone
+ * directory when the data is not in memory.  No rows are needed (pdns_zone_add_record() is not called); pdns_zone_finish() converts the
+ * metadata into the settings text and the flags, and pdns_zone_encode_kdb() writes ZONE_BEGIN (KDB_ZF_SUMMARY, rr_count 0, a zero digest,
+ * the serial and the SOA timers given here) and ZONE_END, no ZONE_DATA, and never calls the digest gate.  serial and timers are those of the
+ * zone's SOA as the loader read them from the zone list. */
+void pdns_zone_set_summary(pdns_zone_t *z, uint32_t serial, bool has_timers, uint32_t refresh, uint32_t retry, uint32_t expire);
+
 /* One row of `records` (the driver passes them in records.id order).  0 = accepted or skipped; -1 = the zone has
  * failed (z->error says why; later calls return -1 at once, so a driver callback can stop its scan). */
 int pdns_zone_add_record(pdns_zone_t *z, const db_record_row_t *row);
@@ -221,6 +238,23 @@ int pdns_zone_finish(pdns_zone_t *z);
 /* Third field of an SOA content: strict decimal digits only, <= 2^32 - 1.  Fields are separated by blanks; the
  * content may have leading / trailing blanks.  false if there are fewer than 3 fields or the serial is not valid. */
 bool pdns_soa_serial(const char *content, uint32_t *serial);
+/* The refresh, retry and expire (fields 4..6) of an SOA content, with the same rules.  false if a field is missing or not a number. */
+bool pdns_soa_timers(const char *content, uint32_t *refresh, uint32_t *retry, uint32_t *expire);
+/* D1a step 6: the two names (canonical absolute) and the minimum (field 7) of an SOA content.  false if one is missing or not valid. */
+bool pdns_soa_apex(const char *content, char mname[DNS_NAME_TEXT_SIZE], char rname[DNS_NAME_TEXT_SIZE], uint32_t *minimum);
+/* D1a step 6: the target of an NS record as the Backend gets it: a canonical absolute name.  false if it is not a name. */
+bool pdns_apex_name(const char *raw, char out[DNS_NAME_TEXT_SIZE]);
+/* D1a step 6: give a summary (pdns_zone_set_summary()) the apex of the zone: the SOA's names and minimum, the TTLs (RFC 2181 8: at most 2^31 - 1, larger values are
+ * rounded down), the NS targets, canonical absolute names separated by LF (1..KDB_APEX_NS_MAX of them), and the glue (glue_len octets, the records of tag 21 of
+ * ZONE_BEGIN; none when 0).  Everything is copied.  -1: out of memory. */
+int pdns_zone_set_apex(pdns_zone_t *z, const char *mname, const char *rname, uint32_t minimum, uint32_t soa_ttl, uint32_t ns_ttl, const char *ns_lf,
+                       const uint8_t *glue, size_t glue_len);
+/* D1a step 7: give the summary the addresses of its NS targets that are outside the zone (records of tag 22 of ZONE_BEGIN: ns index u8 | type u8 | address; sent only
+ * with an apex).  Copied; len 0 drops them.  -1: out of memory. */
+int pdns_zone_set_notify_addrs(pdns_zone_t *z, const uint8_t *naddrs, size_t len);
+/* D1a step 6 (in-zone glue): the address of an A (type 1) or AAAA (type 28) record as the octets of its RDATA (RFC 1035 3.4.1, RFC 3596 2.2): 4 or 16, 0 if the
+ * text is not an address of that kind. */
+size_t pdns_apex_addr(uint16_t type, const char *content, uint8_t out[16]);
 
 /* The line-safety rules above on s[0..len).  is_owner: the stricter owner rules.  Returns NULL if safe, else a
  * static reason text.  s may contain NUL (it is rejected). */
@@ -240,6 +274,8 @@ typedef struct {
      * (with the settings text and the profile name), so that editing the profile makes every zone that uses it new to a
      * loader that has the old version; the loader sends it itself as a PROFILE message. */
     const char *profile_text;
+    /* D1a, fetch stream: the FETCH_REQ the zone answers (ZONE_BEGIN tag 11); 0 = none (the batch stream) */
+    uint64_t request_id;
 } pdns_kdb_params_t;
 
 /* Called once per complete KDB1 message (12-byte header + body); the memory is valid during the call only.

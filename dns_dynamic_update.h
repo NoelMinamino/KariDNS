@@ -20,6 +20,8 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
  * 応答待ちの表を持つ制御スレッドだけが呼ぶ。他のスレッドは notify_request_send() で制御スレッドに頼む。 */
 void send_notify_to_all(zone_db_entry_t *entry);
 void notify_request_send(zone_db_entry_t *entry);
+/* D1a step 7: the NOTIFY messages of a zone whose data is out of memory (el: its directory element; view_name: the view of the directory).  Control thread only. */
+void notify_send_nonresident(const zdir_elem_t *el, const char *view_name);
 void notify_retransmit_due(time_t now);
 void notify_handle_response(const uint8_t *msg, size_t len, const struct sockaddr *from);
 

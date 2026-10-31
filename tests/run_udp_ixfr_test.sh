@@ -60,10 +60,13 @@ OLD_SERIAL=$((CURRENT_SERIAL - 10))
 echo "[*] Zone SOA Serial: $CURRENT_SERIAL, Old Serial: $OLD_SERIAL"
 
 FAILED=0
+# The zone has tsig-key "transfer-key" and an allow-transfer list with addresses: an IXFR over UDP is a zone transfer question too (RFC 1995 4.2; allow-transfer is checked
+# first, as for TCP), so a client of the list still has to sign it with the key.
+TKEY="-y transfer-key:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl"
 
 # Test 1: UDP IXFR with Current Serial (Up-to-Date) -> Expect NOERROR, TC=0, 1 SOA in Answer section over UDP
 echo -n "[Test 1] UDP IXFR with matching current serial (IXFR=$CURRENT_SERIAL) ... "
-OUT_MATCH=$($DAG example.com "IXFR=$CURRENT_SERIAL" @127.0.0.1 -p $PORT +udp +notcp 2>&1 || true)
+OUT_MATCH=$($DAG example.com "IXFR=$CURRENT_SERIAL" @127.0.0.1 -p $PORT +udp +notcp $TKEY 2>&1 || true)
 check_asan_log
 
 if echo "$OUT_MATCH" | grep -q "SOA.*$CURRENT_SERIAL" && echo "$OUT_MATCH" | grep -q "SERVER:.*(UDP)" && ! echo "$OUT_MATCH" | grep -q "Truncated"; then
@@ -83,7 +86,7 @@ fi
 
 # Test 2: UDP IXFR with Outdated Serial (+ignore) -> Expect TC=1 (Truncated) to prompt TCP retry, 1 SOA in Answer section
 echo -n "[Test 2] UDP IXFR with outdated serial (IXFR=$OLD_SERIAL, +udp +notcp +ignore) ... "
-OUT_OLD=$($DAG example.com "IXFR=$OLD_SERIAL" @127.0.0.1 -p $PORT +udp +notcp +ignore 2>&1 || true)
+OUT_OLD=$($DAG example.com "IXFR=$OLD_SERIAL" @127.0.0.1 -p $PORT +udp +notcp +ignore $TKEY 2>&1 || true)
 check_asan_log
 
 if echo "$OUT_OLD" | grep -q "Truncated" && echo "$OUT_OLD" | grep -q "SOA.*$CURRENT_SERIAL" && echo "$OUT_OLD" | grep -q "SERVER:.*(UDP)"; then
@@ -104,6 +107,18 @@ if echo "$OUT_FALLBACK" | grep -q "SOA.*$CURRENT_SERIAL"; then
 else
     echo "FAIL (TCP fallback did not retrieve zone SOA)"
     echo "$OUT_FALLBACK"
+    FAILED=$((FAILED + 1))
+fi
+
+# Test 4: UDP IXFR without the key -> REFUSED (allow-transfer applies to UDP IXFR), no SOA
+echo -n "[Test 4] UDP IXFR without the zone's TSIG key (IXFR=$CURRENT_SERIAL, +udp +notcp) ... "
+OUT_REFUSED=$($DAG example.com "IXFR=$CURRENT_SERIAL" @127.0.0.1 -p $PORT +udp +notcp +ignore +nohexdump 2>&1 || true)
+check_asan_log
+if echo "$OUT_REFUSED" | grep -q "Transfer failed" && ! echo "$OUT_REFUSED" | grep -q "SOA.*$CURRENT_SERIAL"; then
+    echo "OK (the transfer is refused, no SOA)"
+else
+    echo "FAIL (Expected a refused transfer)"
+    echo "$OUT_REFUSED"
     FAILED=$((FAILED + 1))
 fi
 

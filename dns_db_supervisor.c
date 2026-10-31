@@ -22,6 +22,7 @@
 
 int g_db_stream_fd = -1;
 int g_db_ctrl_fd = -1;
+int g_db_fetch_fd = -1;
 
 #define DB_SUP_UPTIME_RESET_MS (10 * 60 * 1000)
 #define DB_SUP_BACKOFF_MAX 60
@@ -44,7 +45,7 @@ static bool check_loader_path(const char *path, char *err, size_t errlen) {
 
 bool db_sup_init(db_sup_t *s, const server_config_t *cfg, char *err, size_t errlen) {
   memset(s, 0, sizeof(*s));
-  s->ctrl_fd = s->first_fd = -1;
+  s->ctrl_fd = s->first_fd = s->first_fetch_fd = -1;
   s->backoff_s = 1;
   if (!cfg->database.enabled) return true;
   const database_config_t *db = &cfg->database;
@@ -64,8 +65,23 @@ bool db_sup_init(db_sup_t *s, const server_config_t *cfg, char *err, size_t errl
     return false;
   }
   snprintf(s->path, sizeof(s->path), "%s", db_loader_path(cfg));
+  snprintf(s->state_file, sizeof(s->state_file), "%s", cfg->database.loader_state_file ? cfg->database.loader_state_file : "");
   if (!check_loader_path(s->path, err, errlen)) return false;
   s->enabled = true;
+  return true;
+}
+
+/* A fetch stream pair (D1a): f[0] for the loader, f[1] for the Backend (non-blocking: the Backend, in capability mode, never calls fcntl) */
+static bool fetch_pair(int f[2]) {
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, f) != 0) return false;
+  int fl = fcntl(f[1], F_GETFL, 0);
+  if (fl < 0 || fcntl(f[1], F_SETFL, fl | O_NONBLOCK) != 0) {
+    int e = errno;
+    close(f[0]);
+    close(f[1]);
+    errno = e;
+    return false;
+  }
   return true;
 }
 
@@ -98,6 +114,15 @@ bool db_sup_open_pairs(db_sup_t *s, char *err, size_t errlen) {
   s->ctrl_fd = c[0];
   g_db_stream_fd = a[1];
   g_db_ctrl_fd = c[1];
+  /* D1a: the fetch stream.  A loader without it works as before (the Backend has no zone that needs a fetch yet), so a failure here is
+   * not fatal: no pair, no `--fetch-fd`. */
+  int f[2];
+  if (fetch_pair(f)) {
+    s->first_fetch_fd = f[0];
+    g_db_fetch_fd = f[1];
+  } else {
+    syslog(LOG_WARNING, "[Manager] Cannot create the loader fetch stream: %m; the loader will run without it");
+  }
   return true;
 }
 
@@ -105,23 +130,26 @@ void db_sup_after_fork_supervisor(db_sup_t *s) {
   if (!s->enabled) return;
   if (g_db_stream_fd >= 0) close(g_db_stream_fd);
   if (g_db_ctrl_fd >= 0) close(g_db_ctrl_fd);
-  g_db_stream_fd = g_db_ctrl_fd = -1;
+  if (g_db_fetch_fd >= 0) close(g_db_fetch_fd);
+  g_db_stream_fd = g_db_ctrl_fd = g_db_fetch_fd = -1;
 }
 
 void db_sup_close_supervisor_ends(db_sup_t *s) {
   if (!s->enabled) return;
   if (s->first_fd >= 0) close(s->first_fd);
+  if (s->first_fetch_fd >= 0) close(s->first_fetch_fd);
   if (s->ctrl_fd >= 0) close(s->ctrl_fd);
-  s->first_fd = s->ctrl_fd = -1;
+  s->first_fd = s->first_fetch_fd = s->ctrl_fd = -1;
 }
 
-/* Hand fd to the Backend over pair C (SCM_RIGHTS).  The one-byte payload only gives the message a body. */
-static bool send_fd(int ctrl, int fd) {
+/* Hand fds to the Backend over pair C (SCM_RIGHTS), one message: fds[0] is the stream, fds[1] (when nfd is 2) the fetch stream.  The
+ * one-byte payload only gives the message a body. */
+static bool send_fds(int ctrl, const int *fds, int nfd) {
   char byte = 'F';
   struct iovec iov = { &byte, 1 };
   union {
     struct cmsghdr h;
-    char buf[CMSG_SPACE(sizeof(int))];
+    char buf[CMSG_SPACE(sizeof(int) * 2)];
   } u;
   memset(&u, 0, sizeof(u));
   struct msghdr m;
@@ -129,12 +157,12 @@ static bool send_fd(int ctrl, int fd) {
   m.msg_iov = &iov;
   m.msg_iovlen = 1;
   m.msg_control = u.buf;
-  m.msg_controllen = sizeof(u.buf);
+  m.msg_controllen = CMSG_SPACE(sizeof(int) * (size_t)nfd);
   struct cmsghdr *c = CMSG_FIRSTHDR(&m);
   c->cmsg_level = SOL_SOCKET;
   c->cmsg_type = SCM_RIGHTS;
-  c->cmsg_len = CMSG_LEN(sizeof(int));
-  memcpy(CMSG_DATA(c), &fd, sizeof(int));
+  c->cmsg_len = CMSG_LEN(sizeof(int) * (size_t)nfd);
+  memcpy(CMSG_DATA(c), fds, sizeof(int) * (size_t)nfd);
   ssize_t n;
   do {
     n = sendmsg(ctrl, &m, MSG_DONTWAIT);
@@ -143,7 +171,7 @@ static bool send_fd(int ctrl, int fd) {
 }
 
 /* The child between fork() and exec (design 1.2 step 4).  Never returns. */
-static void child_exec(const db_sup_t *s, int stream_fd) {
+static void child_exec(const db_sup_t *s, int stream_fd, int fetch_fd) {
   char msg[300];
   /* The parent blocked the signals across the fork: the dispositions are reset first, the mask is emptied last */
   /* An ignored disposition survives exec: a "pkill -HUP karidns" cannot kill a loader that has not installed its
@@ -163,16 +191,19 @@ static void child_exec(const db_sup_t *s, int stream_fd) {
   char tzbuf[128] = "";
   if (tz) snprintf(tzbuf, sizeof(tzbuf), "%s", tz);
 
-  /* stream on fd 3, stdin / stdout on /dev/null, stderr kept, everything else closed */
+  /* stream on fd 3, the fetch stream (D1a) on fd 4, stdin / stdout on /dev/null, stderr kept, everything else closed */
   int hi = fcntl(stream_fd, F_DUPFD, 10);
   if (hi < 0) _exit(127);
+  int hf = fetch_fd >= 0 ? fcntl(fetch_fd, F_DUPFD, 10) : -1;
+  if (fetch_fd >= 0 && hf < 0) _exit(127);
   int dn = open("/dev/null", O_RDWR);
   if (dn >= 0) {
     dup2(dn, 0);
     dup2(dn, 1);
   }
   if (dup2(hi, 3) < 0) _exit(127);
-  closefrom(4);
+  if (hf >= 0 && dup2(hf, 4) < 0) _exit(127);
+  closefrom(hf >= 0 ? 5 : 4);
 
   /* P5: the file that is checked is the file that runs: opened and checked here (as the supervisor's user, before the
    * drop), executed by its descriptor after the drop */
@@ -194,7 +225,17 @@ static void child_exec(const db_sup_t *s, int stream_fd) {
   if (chdir("/") != 0) _exit(127);
   clearenv();
   if (tz) setenv("TZ", tzbuf, 1);
-  char *argv[] = { (char *)"karidns-dbloader", (char *)"-s", (char *)"3", NULL };
+  char *argv[8] = { (char *)"karidns-dbloader", (char *)"-s", (char *)"3", NULL };
+  int ac = 3;
+  if (hf >= 0) {
+    argv[ac++] = (char *)"--fetch-fd";
+    argv[ac++] = (char *)"4";
+  }
+  if (s->state_file[0]) {                              /* D1a step 7: the loader keeps the hot list there (the Backend never names a path to it) */
+    argv[ac++] = (char *)"--state-file";
+    argv[ac++] = (char *)s->state_file;
+  }
+  argv[ac] = NULL;
   extern char **environ;
   exec_file_exec_fd(xfd, s->path, argv, environ);
   int n = snprintf(msg, sizeof(msg), "[Manager] cannot execute '%s': %s\n", s->path, strerror(errno));
@@ -217,7 +258,7 @@ bool db_sup_spawn(db_sup_t *s) {
   int64_t now = mono_ms();
   s->restart_pending = false;
   char err[300];
-  int loader_fd = -1, backend_fd = -1;
+  int loader_fd = -1, backend_fd = -1, loader_fetch_fd = -1, backend_fetch_fd = -1;
   if (!check_loader_path(s->path, err, sizeof(err))) {
     syslog(LOG_ERR, "[Manager] %s", err);
     schedule_restart(s, now);
@@ -226,6 +267,8 @@ bool db_sup_spawn(db_sup_t *s) {
   if (s->first_fd >= 0) {
     loader_fd = s->first_fd;
     s->first_fd = -1;
+    loader_fetch_fd = s->first_fetch_fd;      /* (the pair of db_sup_open_pairs(): the Backend already has its end) */
+    s->first_fetch_fd = -1;
   } else {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) {
@@ -243,6 +286,13 @@ bool db_sup_spawn(db_sup_t *s) {
     }
     loader_fd = sv[0];
     backend_fd = sv[1];
+    int fv[2];
+    if (fetch_pair(fv)) {
+      loader_fetch_fd = fv[0];
+      backend_fetch_fd = fv[1];
+    } else {
+      syslog(LOG_WARNING, "[Manager] Cannot create the loader fetch stream: %m; the loader will run without it");
+    }
   }
   gc_snapshot_wait_idle();   /* fork from a single thread (see dns_snapshot_rcu.c) */
   /* The child inherits the manager's flag-only handlers until child_exec() resets them: block the signals across the
@@ -257,7 +307,8 @@ bool db_sup_spawn(db_sup_t *s) {
   pid_t pid = fork();
   if (pid == 0) {
     if (backend_fd >= 0) close(backend_fd);
-    child_exec(s, loader_fd); /* resets the dispositions, then unblocks */
+    if (backend_fetch_fd >= 0) close(backend_fetch_fd);
+    child_exec(s, loader_fd, loader_fetch_fd); /* resets the dispositions, then unblocks */
   }
   int fork_errno = errno;
   sigprocmask(SIG_SETMASK, &fork_orig, NULL);
@@ -265,17 +316,23 @@ bool db_sup_spawn(db_sup_t *s) {
   if (pid < 0) {
     syslog(LOG_ERR, "[Manager] fork for the database loader failed: %m");
     close(loader_fd);
+    if (loader_fetch_fd >= 0) close(loader_fetch_fd);
     if (backend_fd >= 0) close(backend_fd);
+    if (backend_fetch_fd >= 0) close(backend_fetch_fd);
     schedule_restart(s, now);
     return false;
   }
   close(loader_fd);
+  if (loader_fetch_fd >= 0) close(loader_fetch_fd);
   if (backend_fd >= 0) {
-    /* The Backend turns the descriptor into its stream (and limits its rights).  If it cannot be sent, the Backend is
-     * not listening any more; it is going down, and the loader will find its end closed. */
-    if (!send_fd(s->ctrl_fd, backend_fd))
+    /* The Backend turns the descriptors into its streams (and limits their rights).  If they cannot be sent, the Backend is
+     * not listening any more; it is going down, and the loader will find its ends closed.  The fetch stream, when there is one,
+     * is the second descriptor of the same message. */
+    int fds[2] = { backend_fd, backend_fetch_fd };
+    if (!send_fds(s->ctrl_fd, fds, backend_fetch_fd >= 0 ? 2 : 1))
       syslog(LOG_ERR, "[Manager] Cannot pass the loader stream to the Backend: %m");
     close(backend_fd);
+    if (backend_fetch_fd >= 0) close(backend_fetch_fd);
   }
   s->pid = pid;
   s->started_ms = now;

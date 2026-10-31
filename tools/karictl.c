@@ -443,9 +443,11 @@ int main(int argc, char **argv) {
             /* T-11: time_t にミリ秒は無く、strftime() は %03d を知らないので秒までにする */
             char boot_str[64], config_str[64];
             struct tm tm_info;
-            strftime(boot_str, sizeof(boot_str), "%d-%b-%Y %H:%M:%S", localtime_r(&st.boot_time, &tm_info));
-            strftime(config_str, sizeof(config_str), "%d-%b-%Y %H:%M:%S",
-                     localtime_r(&st.last_configured_time, &tm_info));
+            /* (a time the local time cannot represent, from a damaged reply: localtime_r() fails and strftime() must not get a NULL) */
+            if (!localtime_r(&st.boot_time, &tm_info) || strftime(boot_str, sizeof(boot_str), "%d-%b-%Y %H:%M:%S", &tm_info) == 0)
+                snprintf(boot_str, sizeof(boot_str), "invalid (%lld)", (long long)st.boot_time);
+            if (!localtime_r(&st.last_configured_time, &tm_info) || strftime(config_str, sizeof(config_str), "%d-%b-%Y %H:%M:%S", &tm_info) == 0)
+                snprintf(config_str, sizeof(config_str), "invalid (%lld)", (long long)st.last_configured_time);
 
             /* D-12: バージョン、ホスト名、OS、CPU 数はサーバーが返した値 */
             printf("version: KariDNS %s (Authoritative)\n", st.version);
@@ -460,6 +462,11 @@ int main(int argc, char **argv) {
             printf("query logging is %s\n", st.query_logging ? "ON" : "OFF");
             printf("response logging is %s\n", st.response_logging ? "ON" : "OFF");
             printf("tcp clients: %d (High-water: %d)\n", st.tcp_clients, st.tcp_high_water);
+            /* D1a: what the zone versions hold (image, glue, IXFR differences); "retired" = replaced, not freed yet (a reader may hold it) */
+            printf("zone versions and IXFR deltas, database zones: %llu bytes resident, %llu bytes retired\n",
+                   (unsigned long long)st.db_bytes_resident, (unsigned long long)st.db_bytes_retired);
+            printf("zone versions and IXFR deltas, other zones: %llu bytes resident, %llu bytes retired\n",
+                   (unsigned long long)st.other_bytes_resident, (unsigned long long)st.other_bytes_retired);
             printf("server is up and running%s\n", st.frontend_alive ? "" : " (Frontend is down)");
             
             printf("\n--- Security & Rate Limit Stats ---\n");
@@ -537,14 +544,17 @@ int main(int argc, char **argv) {
                 char notify_time_str[64] = "never";
                 if (snap.last_notify_time > 0) {
                     time_t t = (time_t)snap.last_notify_time;
-                    struct tm *tm_n = localtime(&t);
-                    strftime(notify_time_str, sizeof(notify_time_str), "%Y-%m-%d %H:%M:%S", tm_n);
+                    struct tm tm_n;
+                    /* (a time stamp the local time cannot represent, from a damaged reply: localtime() would return NULL) */
+                    if (!localtime_r(&t, &tm_n) || strftime(notify_time_str, sizeof(notify_time_str), "%Y-%m-%d %H:%M:%S", &tm_n) == 0)
+                        snprintf(notify_time_str, sizeof(notify_time_str), "invalid (%lld)", (long long)snap.last_notify_time);
                 }
                 char transfer_time_str[64] = "never";
                 if (snap.last_transfer_time > 0) {
                     time_t t = (time_t)snap.last_transfer_time;
-                    struct tm *tm_x = localtime(&t);
-                    strftime(transfer_time_str, sizeof(transfer_time_str), "%Y-%m-%d %H:%M:%S", tm_x);
+                    struct tm tm_x;
+                    if (!localtime_r(&t, &tm_x) || strftime(transfer_time_str, sizeof(transfer_time_str), "%Y-%m-%d %H:%M:%S", &tm_x) == 0)
+                        snprintf(transfer_time_str, sizeof(transfer_time_str), "invalid (%lld)", (long long)snap.last_transfer_time);
                 }
 
                 if (snap.shared_views[0])   /* in-view: one entry for the zone, in its owner view, and the views it is shared to */

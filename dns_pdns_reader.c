@@ -193,9 +193,65 @@ bool pdns_soa_serial(const char *content, uint32_t *serial) {
     return false;
 }
 
+/* Fields 4, 5 and 6 of an SOA content (refresh, retry, expire), the same strict decimal rules as the serial. */
+bool pdns_soa_timers(const char *content, uint32_t *refresh, uint32_t *retry, uint32_t *expire) {
+    if (!content) return false;
+    const char *p = content;
+    uint32_t v[3] = { 0, 0, 0 };
+    for (int field = 0; field < 6; field++) {
+        while (*p == ' ' || *p == '\t') p++;
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (p == start) return false;
+        if (field < 3) continue;
+        uint64_t n = 0;
+        for (const char *d = start; d < p; d++) {
+            if (*d < '0' || *d > '9') return false;
+            n = n * 10 + (uint64_t)(*d - '0');
+            if (n > 0xFFFFFFFFull) return false;
+        }
+        v[field - 3] = (uint32_t)n;
+    }
+    if (refresh) *refresh = v[0];
+    if (retry) *retry = v[1];
+    if (expire) *expire = v[2];
+    return true;
+}
+
 /* ------------------------------------------------------------------------------------------------------------- */
 /* names                                                                                                          */
 /* ------------------------------------------------------------------------------------------------------------- */
+
+static bool name_to_absolute(const char *raw, size_t len, char *out, size_t cap);
+
+bool pdns_apex_name(const char *raw, char out[DNS_NAME_TEXT_SIZE]) {
+    return raw && name_to_absolute(raw, strlen(raw), out, DNS_NAME_TEXT_SIZE);
+}
+
+/* Fields 1, 2 and 7 of an SOA content (RFC 1035 3.3.13: MNAME, RNAME, ..., MINIMUM). */
+bool pdns_soa_apex(const char *content, char mname[DNS_NAME_TEXT_SIZE], char rname[DNS_NAME_TEXT_SIZE], uint32_t *minimum) {
+    if (!content) return false;
+    const char *p = content;
+    for (int field = 0; field < 7; field++) {
+        while (*p == ' ' || *p == '\t') p++;
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        size_t len = (size_t)(p - start);
+        if (len == 0) return false;
+        if (field < 2) {
+            if (!name_to_absolute(start, len, field == 0 ? mname : rname, DNS_NAME_TEXT_SIZE)) return false;
+        } else if (field == 6) {
+            uint64_t n = 0;
+            for (const char *d = start; d < p; d++) {
+                if (*d < '0' || *d > '9') return false;
+                n = n * 10 + (uint64_t)(*d - '0');
+                if (n > 0xFFFFFFFFull) return false;
+            }
+            if (minimum) *minimum = (uint32_t)n;
+        }
+    }
+    return true;
+}
 
 /* raw (as stored, usually without the trailing dot) -> canonical absolute name.  false: not a name. */
 static bool name_to_absolute(const char *raw, size_t len, char *out, size_t cap) {
@@ -265,6 +321,54 @@ int pdns_zone_set_secondary(pdns_zone_t *z, uint8_t kind, const char *master) {
     return 0;
 }
 
+size_t pdns_apex_addr(uint16_t type, const char *content, uint8_t out[16]) {
+    if (!content || (type != 1 && type != 28)) return 0;
+    return inet_pton(type == 1 ? AF_INET : AF_INET6, content, out) == 1 ? (type == 1 ? 4u : 16u) : 0;
+}
+
+int pdns_zone_set_notify_addrs(pdns_zone_t *z, const uint8_t *naddrs, size_t len) {
+    free(z->sum_naddr);
+    z->sum_naddr = NULL;
+    z->sum_naddr_len = 0;
+    if (len == 0) return 0;
+    z->sum_naddr = malloc(len);
+    if (!z->sum_naddr) return -1;
+    memcpy(z->sum_naddr, naddrs, len);
+    z->sum_naddr_len = len;
+    return 0;
+}
+
+int pdns_zone_set_apex(pdns_zone_t *z, const char *mname, const char *rname, uint32_t minimum, uint32_t soa_ttl, uint32_t ns_ttl, const char *ns_lf,
+                       const uint8_t *glue, size_t glue_len) {
+    size_t lm = strlen(mname), lr = strlen(rname), ln = strlen(ns_lf);
+    char *b = malloc(lm + lr + ln + 3 + (glue_len ? glue_len : 0));
+    if (!b) return -1;
+    memcpy(b, mname, lm + 1);
+    memcpy(b + lm + 1, rname, lr + 1);
+    memcpy(b + lm + lr + 2, ns_lf, ln + 1);
+    if (glue_len) memcpy(b + lm + lr + ln + 3, glue, glue_len);
+    free(z->sum_apex);
+    z->sum_apex = b;
+    z->sum_mname = b;
+    z->sum_rname = b + lm + 1;
+    z->sum_ns = b + lm + lr + 2;
+    z->sum_glue = glue_len ? (const uint8_t *)(b + lm + lr + ln + 3) : NULL;
+    z->sum_glue_len = glue_len;
+    z->sum_minimum = minimum > PDNS_MAX_TTL ? PDNS_MAX_TTL : minimum;       /* (the zone parser rounds a value with the top bit set down, RFC 8767 4) */
+    z->sum_soa_ttl = soa_ttl > PDNS_MAX_TTL ? PDNS_MAX_TTL : soa_ttl;
+    z->sum_ns_ttl = ns_ttl > PDNS_MAX_TTL ? PDNS_MAX_TTL : ns_ttl;
+    return 0;
+}
+
+void pdns_zone_set_summary(pdns_zone_t *z, uint32_t serial, bool has_timers, uint32_t refresh, uint32_t retry, uint32_t expire) {
+    z->summary = true;
+    z->sum_serial = serial;
+    z->sum_timers = has_timers;
+    z->sum_refresh = refresh;
+    z->sum_retry = retry;
+    z->sum_expire = expire;
+}
+
 /* The canonical absolute name pdns_zone_new() would give a zone called dbname; false when it would be a failed zone. */
 bool pdns_canonical_zone_name(const char *dbname, char out[DNS_NAME_TEXT_SIZE]) {
     if (!dbname) return false;
@@ -277,6 +381,8 @@ bool pdns_canonical_zone_name(const char *dbname, char out[DNS_NAME_TEXT_SIZE]) 
 void pdns_zone_free(pdns_zone_t *z) {
     if (!z) return;
     if (z->arena_ready) zone_arena_destroy(&z->arena);
+    free(z->sum_apex);
+    free(z->sum_naddr);
     free(z->text);
     free(z->line_off);
     free(z->line_id);
@@ -1056,7 +1162,7 @@ static bool notify_entry(const char *s, char *out, size_t cap) {
 }
 
 /* value of an X-KARIDNS-<option>; on success *out is the text to emit */
-typedef enum { OPT_INT, OPT_INT_SUFFIX, OPT_BACKOFF, OPT_AFA, OPT_BOOL } opt_kind_t;
+typedef enum { OPT_INT, OPT_INT_SUFFIX, OPT_BACKOFF, OPT_AFA, OPT_BOOL, OPT_CACHE } opt_kind_t;
 static const struct { const char *name; opt_kind_t kind; long long lo, hi; } k_options[] = {
     { "notify-retries", OPT_INT, 0, NOTIFY_RETRIES_MAX },
     { "notify-retry-interval", OPT_INT, 1, NOTIFY_RETRY_INTERVAL_MAX },
@@ -1069,6 +1175,7 @@ static const struct { const char *name; opt_kind_t kind; long long lo, hi; } k_o
     { "zone-tcp-mss", OPT_INT, KARIDNS_TCP_MSS_MIN, KARIDNS_TCP_MSS_MAX },
     { "zone-tcp-window", OPT_INT_SUFFIX, KARIDNS_TCP_BUF_MIN, KARIDNS_TCP_BUF_MAX },
     { "zone-tcp-sndbuf", OPT_INT_SUFFIX, KARIDNS_TCP_BUF_MIN, KARIDNS_TCP_BUF_MAX },
+    { "cache", OPT_CACHE, 0, 0 },                      /* D1a step 5: pin | no-cache | auto (the memory limit of database { }) */
 };
 #define N_OPTIONS (sizeof(k_options) / sizeof(k_options[0]))
 
@@ -1098,6 +1205,8 @@ static bool option_value_ok(size_t oi, const char *v) {
     }
     case OPT_BACKOFF:
         return strcasecmp(v, "fixed") == 0 || strcasecmp(v, "exponential") == 0;
+    case OPT_CACHE:
+        return strcasecmp(v, "pin") == 0 || strcasecmp(v, "no-cache") == 0 || strcasecmp(v, "auto") == 0;
     case OPT_AFA:
         if (strcasecmp(v, "in-domain") == 0 || strcasecmp(v, "in-zone") == 0) return true;
         /* fallthrough */
@@ -1567,6 +1676,10 @@ int pdns_zone_finish(pdns_zone_t *z) {
         z->serial = 0;
         return 0;
     }
+    if (z->summary) {                      /* D1a: the directory entry only; the rows (and what they could say against the zone) come with the data */
+        z->serial = z->sum_serial;
+        return 0;
+    }
     if (z->n_null_ttl)
         zwarn(z, true, z->first_null_ttl_id, "%llu record(s) have a NULL ttl; default-ttl %u used (first shown)",
               (unsigned long long)z->n_null_ttl, z->opts.default_ttl);
@@ -1860,7 +1973,9 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
     char dummy[8];
     if (!err || errlen == 0) { err = dummy; errlen = sizeof(dummy); }
     const bool sec = z->zkind != KDB_ZK_PRIMARY;         /* B7b: no rows, the settings text is the zone */
-    if (z->failed || !z->finished || (!z->arena_ready && !sec)) {
+    const bool sum = z->summary && !sec;                 /* D1a: the directory entry of a primary zone: no rows, a zero digest, no gate */
+    const bool norows = sec || sum;
+    if (z->failed || !z->finished || (!z->arena_ready && !norows)) {
         snprintf(err, errlen, "zone '%s': not converted", z->name);
         return -1;
     }
@@ -1876,21 +1991,21 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
         return -1;
     }
     const char *profile = p->profile ? p->profile : z->profile;
-    int rc = sec ? 0 : gen_bodies(z, digest_sink, &dd, &rr_count, err, errlen);
+    int rc = norows ? 0 : gen_bodies(z, digest_sink, &dd, &rr_count, err, errlen);
     if (rc == 0 && rr_count > z->opts.max_records) {
         snprintf(err, errlen, "zone '%s': %llu records exceed max-zone-records", z->name, (unsigned long long)rr_count);
         rc = -1;
     }
     /* B8: the tinydns flag is part of what the Backend serves (time-dependent TTLs, no response cache) also when no RR carries a time
      * stamp or a location; the attributes themselves are in the bodies */
-    if (rc == 0 && !sec && (z->flags & PDNS_F_TINYDNS)) {
+    if (rc == 0 && !norows && (z->flags & PDNS_F_TINYDNS)) {
         static const uint8_t ftag[] = "KDB1-TINYDNS";
         if (EVP_DigestUpdate(dd.md, ftag, sizeof(ftag)) != 1) rc = -1;
     }
     /* B7a: a metadata-only edit (the settings text, the profile that is named, the text of that profile) must change the
      * digest, or the diff would find the zone up to date.  Zones without settings and profile keep the digest of the data
      * alone.  Every field is length-prefixed, so two different splits cannot give the same input. */
-    if (rc == 0 && ((z->settings && *z->settings) || (profile && *profile))) {
+    if (rc == 0 && !sum && ((z->settings && *z->settings) || (profile && *profile))) {
         const char *parts[3] = { z->settings ? z->settings : "", profile ? profile : "", p->profile_text ? p->profile_text : "" };
         static const uint8_t tag[] = "KDB1-SETTINGS";
         if (EVP_DigestUpdate(dd.md, tag, sizeof(tag)) != 1) rc = -1;
@@ -1903,13 +2018,15 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
         }
         if (rc != 0) snprintf(err, errlen, "zone '%s': digest failed", z->name);
     }
-    if (rc == 0 && (EVP_DigestFinal_ex(dd.md, digest, &dlen) != 1 || dlen != KDB_DIGEST_LEN)) {
+    if (sum) {
+        memset(digest, 0, KDB_DIGEST_LEN);                  /* a zone that is not in memory has no digest (INVENTORY says the same) */
+    } else if (rc == 0 && (EVP_DigestFinal_ex(dd.md, digest, &dlen) != 1 || dlen != KDB_DIGEST_LEN)) {
         snprintf(err, errlen, "zone '%s': digest failed", z->name);
         rc = -1;
     }
     EVP_MD_CTX_free(dd.md);
     if (rc != 0) return -1;
-    if (p->gate && p->gate(p->gate_ud, z->serial, digest) != 0) return 1;        /* the loader has this version already */
+    if (!sum && p->gate && p->gate(p->gate_ud, z->serial, digest) != 0) return 1;        /* the loader has this version already */
 
     /* pass 2: the messages */
     kdb_enc_t enc;
@@ -1921,15 +2038,25 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
         kdb_enc_i64(&enc, 3, p->source_id) != 0 || kdb_enc_u8(&enc, 4, sec ? z->zkind : p->zone_kind) != 0 ||
         kdb_enc_u32(&enc, 5, sec ? 0 : z->serial) != 0 ||
         kdb_enc_u32(&enc, 6, sec ? 0 : ((z->flags & PDNS_F_PRESIGNED ? KDB_ZF_PRESIGNED : 0) | (z->has_ext ? KDB_ZF_EXTENDED : 0) |
-                                  (z->flags & PDNS_F_TINYDNS ? KDB_ZF_TINYDNS : 0))) != 0 ||
+                                  (z->flags & PDNS_F_TINYDNS ? KDB_ZF_TINYDNS : 0) | (sum ? KDB_ZF_SUMMARY : 0))) != 0 ||
         kdb_enc_u64(&enc, 7, rr_count) != 0 || kdb_enc_bytes(&enc, 8, digest, KDB_DIGEST_LEN) != 0 ||
         (z->settings && *z->settings && kdb_enc_str(&enc, 9, z->settings) != 0) ||
-        (profile && *profile && kdb_enc_str(&enc, 10, profile) != 0) || kdb_enc_end(&enc) != 0 ||
+        (profile && *profile && kdb_enc_str(&enc, 10, profile) != 0) ||
+        (p->request_id && kdb_enc_u64(&enc, 11, p->request_id) != 0) ||
+        (sum && z->sum_timers && (kdb_enc_u32(&enc, 12, z->sum_refresh) != 0 || kdb_enc_u32(&enc, 13, z->sum_retry) != 0 ||
+                                  kdb_enc_u32(&enc, 14, z->sum_expire) != 0)) ||
+        (sum && z->sum_timers && z->sum_apex &&                       /* D1a step 6: the apex, for the answer to an SOA question while the zone is out of memory */
+         (kdb_enc_name(&enc, 15, z->sum_mname) != 0 || kdb_enc_name(&enc, 16, z->sum_rname) != 0 || kdb_enc_u32(&enc, 17, z->sum_minimum) != 0 ||
+          kdb_enc_u32(&enc, 18, z->sum_soa_ttl) != 0 || kdb_enc_u32(&enc, 19, z->sum_ns_ttl) != 0 ||
+          kdb_enc_bytes(&enc, 20, (const uint8_t *)z->sum_ns, strlen(z->sum_ns)) != 0 ||
+          (z->sum_glue_len > 0 && kdb_enc_bytes(&enc, 21, z->sum_glue, z->sum_glue_len) != 0) ||
+          (z->sum_naddr_len > 0 && kdb_enc_bytes(&enc, 22, z->sum_naddr, z->sum_naddr_len) != 0))) ||
+        kdb_enc_end(&enc) != 0 ||
         emit_msg(&eu) != 0) {
         snprintf(err, errlen, "zone '%s': ZONE_BEGIN could not be encoded or sent", z->name);
         goto out;
     }
-    if (!sec) {
+    if (!norows) {
         uint64_t again = 0;
         if (gen_bodies(z, data_sink, &eu, &again, err, errlen) != 0) goto out;
         if (again != rr_count) {

@@ -4,7 +4,7 @@
 /*
  * dns_db_stream.h - KDB1: the byte stream between karidns-dbloader and the Backend (design: beta design 1.4).
  *
- * Pure functions, no I/O.  Shared by the loader (encoder, decoder of Backend messages) and the Backend
+ * Pure functions, no I/O (but the hot list's state file, kdb_hotl_file_*, which only the loader calls).  Shared by the loader (encoder, decoder of Backend messages) and the Backend
  * (decoder of loader messages + state machine).  The Backend treats every byte as hostile.
  *
  *   encoder  kdb_enc_*       growable buffer (malloc), TLV appenders.                     (encoder side only)
@@ -48,11 +48,25 @@
  *   ZONE_BEGIN (4)    1 view view R | 2 zone name R | 3 source_id i64 R | 4 zone_kind u8 R (0 primary,1 secondary,
  *                     2 catalog) | 5 serial u32 R | 6 flags u32 R (bit0 presigned, bit1 extended, bit2 tinydns; others 0) |
  *                     7 rr_count u64 R (primary: both SOAs and, with bit1, the Extended AXFR marker and definition RRs counted, >= 2; secondary and catalog: 0, no ZONE_DATA, B7b) | 8 digest bytes R (exactly 32) |
- *                     9 settings text<=65535 O | 10 profile str ne <=255 O
+ *                     9 settings text<=65535 O | 10 profile str ne <=255 O |
+ *                     D1a (fetch stream only): 11 request_id u64 O (the FETCH_REQ this zone answers; required on the fetch stream, forbidden
+ *                     on the batch stream).  flags bit3 = summary: the zone's serial, kind and settings without its data (primary: rr_count 0, no
+ *                     ZONE_DATA, digest all zero); on the fetch stream, and (milestone 4) in a batch when CONFIG said dir_only.  12 soa_refresh u32 | 13 soa_retry u32 | 14 soa_expire u32 (all
+ *                     three or none: the timers of the zone's SOA, which the zone directory keeps without the zone).
+ *                     D1a step 6, a summary only, tags 12..14 required, all of 15..20 or none: the apex of the zone, for the answer to an SOA question when the
+ *                     zone is not in memory.  15 soa_mname name | 16 soa_rname name | 17 soa_minimum u32 | 18 soa_ttl u32 | 19 ns_ttl u32 (the three
+ *                     TTLs <= 2147483647, RFC 2181 8) | 20 ns_names bytes<=2047: 1..8 canonical absolute names of the apex NS RRset, separated by one LF.
+ *                     21 glue bytes<=2048 O (with 15..20): the addresses of the NS targets that are inside the zone, which the answer carries in Additional
+ *                     (RFC 2181 9).  Records of  index u8 (the position of the name in tag 20) | type u8 (1 A, 28 AAAA) | ttl u32 (<= 2147483647) |
+ *                     address (4 or 16 octets, RFC 1035 3.4.1, RFC 3596 2.2); the indexes do not decrease, at most 8 records for one index.
+ *                     22 naddrs bytes<=1152 O (with 15..20): the addresses of the NS targets that are NOT inside the zone, which the loader found in the database
+ *                     by name (the A and AAAA records of that name in any zone of the same source), for the NOTIFY the Backend sends (RFC 1996 3.2) when
+ *                     the zone changes while its data is out of memory.  Records of  index u8 (the position of the name in tag 20) | type u8 (1 A, 28 AAAA) |
+ *                     address (4 or 16 octets); the indexes do not decrease, at most 8 records for one index.  The Backend keeps them with the apex block.
  *   ZONE_DATA (5)     raw DNS message (<= 65,535 bytes), no TLV
  *   ZONE_END (6)      1 rr_count u64 R
  *   ZONE_ABORT (7)    1 reason str<=255 R
- *   ZONE_FAILED (8)   1 view view R | 2 zone name R | 3 source_id i64 R | 4 reason str<=255 R
+ *   ZONE_FAILED (8)   1 view view R | 2 zone name R | 3 source_id i64 R | 4 reason str<=255 R | 5 request_id u64 O (D1a: fetch stream only, required there)
  *   ZONE_DELETE (9)   1 view view R | 2 zone name R | 3 source_id i64 R
  *   PROFILE (10)      1 name str ne <=255 R | 2 settings text<=65535 R
  *   BATCH_END (11)    1 batch_id u64 R | 2 n_zones u32 R | 3 n_failed u32 R | 4 n_deleted u32 R
@@ -66,6 +80,14 @@
  *                     that reload loaded) | 10 req_error str<=255 (why the last read of the requests or write of the status
  *                     row failed, absent = none) | 11 req_time u64 (unix seconds of the last status row written, 0 = never).
  *                     An entry is sent for a view that has auto reload on or whose source has the multi-server tables.
+ *   WARM_LIST (13)    D1a step 7 (design 8.4); only between batches (state READY), no state change.  The zones the loader's state file lists, in the
+ *                     order the Backend should read them, sent once after the startup load (an empty list when there is none), in parts:
+ *                     1 list_id u64 R | 2 part u32 R (0, 1, ... in order) | 3 last u8 R (0/1) | 4 ENTRY nested, repeatable (<= KDB_HOT_PART_MAX):
+ *                     1 view str ne <=255 R (the NAME of the view, not an index: the file outlives a reconfiguration) | 2 zone name R |
+ *                     6 file_state u8 O (KDB_HF_*: what the loader found in its state file at its start) | 7 file_zones u32 O (the zones the file held).
+ *                     Tag 5 is not used by this message.  The Backend treats the entries as untrusted: a name that is not a zone of its directory is ignored.
+ *   HOT_ACK (14)      D1a step 7; only between batches, no state change.  The loader's answer to the last part of a HOT_LIST:
+ *                     1 list_id u64 R | 2 status u8 R (KDB_HA_*) | 3 zones u32 R (the zones the state file holds now) | 4 error str<=255 O
  * Backend -> loader (type | 0x8000)
  *   CONFIG (0x8001)   1 generation u64 R | 2 driver str ne <=32 R | 3 server_id str<=64 O |
  *                     4 VIEW nested, repeatable (<= 1024):
@@ -73,16 +95,33 @@
  *                         4 conninfo_file path ne<=1023 O | 5 auto_reload u8 R (0/1) | 6 poll_interval u32 R (s) |
  *                         7 coalesce_ms u32 R | 8 max_zone_records u64 R | 9 max_zone_bytes u64 R |
  *                         10 shared_source u8 O (0/1; B6b: the source is the global one, so karidns_domain_views maps zones to this view)
- *                     5 default_ttl u32 O (<= 2147483647; B4a) | 6 bulk_threshold u8 O (<= 100) | 7 loader_threads u32 O (<= 16)
+ *                     5 default_ttl u32 O (<= 2147483647; B4a) | 6 bulk_threshold u8 O (<= 100) | 7 loader_threads u32 O (<= 16) |
+ *                     8 dir_only u8 O (0/1; D1a milestone 4: memory-limit is set, so a zone the Backend does not have in memory is sent as a
+ *                         summary (ZONE_BEGIN with the summary flag, settings and SOA timers, no ZONE_DATA) also in a batch)
  *   RELOAD_REQ (0x8002) 1 request_id u64 R | 2 scope u8 R (0 all, 1 one zone) | 3 view view O | 4 zone name O |
  *                     5 force u8 R (0/1); scope 1 needs tags 3 and 4, scope 0 forbids them
  *   INVENTORY (0x8003) 1 ENTRY nested, repeatable: 1 view view R | 2 zone name R | 3 source_id i64 R |
- *                         4 serial u32 R | 5 digest bytes R (exactly 32)
+ *                         4 serial u32 R | 5 digest bytes (exactly 32; required unless the zone is not resident) |
+ *                         6 resident u8 O (D1a: 0/1, absent = 1; 0 = the Backend has only the directory entry of the zone, no data and
+ *                         no digest)
  *   INVENTORY_END (0x8004) 1 last_change_seq u64 R | 2 n_zones u64 R
  *   ZONE_RESULT (0x8005) 1 view view R | 2 zone name R | 3 status u8 R (0 applied,1 unchanged,2 rejected,
  *                     3 shadowed,4 deleted) | 4 reason str<=255 O
  *   BATCH_RESULT (0x8006) 1 batch_id u64 R | 2 request_ids bytes O (n * u64, <= 2048 bytes) | 3 n_applied u32 R |
  *                     4 n_unchanged u32 R | 5 n_rejected u32 R | 6 n_deleted u32 R
+ *   FETCH_REQ (0x8007) D1a, fetch stream only: 1 request_id u64 R (> 0) | 2 view view R | 3 zone name R |
+ *                     4 priority u8 R (0 a query waits for it, 1 warm-up, 2 background) | 5 mode u8 R (0 the zone, 1 its summary) |
+ *                     6 range_lo name O | 7 range_hi name O (D1b: both or none; a loader that does not read ranges answers ZONE_FAILED)
+ *   HOT_LIST (0x8008) D1a step 7 (design 8.4), first stream only: the zones most asked for, hottest first, in parts as WARM_LIST (tags 1..4 the same;
+ *                     5 limit u32 O: the most entries the loader keeps in its state file, <= KDB_HOT_MAX, absent = KDB_HOT_MAX).  Several parts carry
+ *                     one list_id; a part that does not follow the one before (or a new list_id) starts the list again.  The loader merges the list
+ *                     with what it has (the zones of the old list that nobody asked for since stay after the new ones), writes the state file when
+ *                     the last part has come, and answers with HOT_ACK.  The entries are untrusted input of the loader: counts, names and views are checked.
+ *
+ * The fetch stream (D1a, design 6.1) is a second KDB1 stream, made by the supervisor with the first.  It carries only what a
+ * parked query waits for: FETCH_REQ from the Backend; from the loader, ZONE_BEGIN .. ZONE_DATA .. ZONE_END / ZONE_ABORT (PROFILE
+ * before ZONE_BEGIN) or ZONE_FAILED for each request, every one with the request id.  No HELLO, no batches, no results: the
+ * state machine starts in READY (kdb_sm_init_fetch()) and the Backend discards a zone it did not ask for.
  */
 
 #include <stdint.h>
@@ -100,6 +139,13 @@
 #define KDB_VIEWS_ANY 0xFFFFFFFFu    /* view_count: do not check view indexes */
 #define KDB_MAX_CONFIG_VIEWS 1024
 #define KDB_MAX_PROFILES 65535u      /* PROFILE messages per batch */
+#define KDB_HOT_PART_MAX 16384        /* D1a step 7: entries of one HOT_LIST / WARM_LIST message (a part) */
+#define KDB_HOT_MAX 100000            /* ... and of the whole list (database { hot-list-size } is at most this) */
+#define KDB_HOT_FILE_MAX (64u << 20)  /* a state file above this many bytes is not read */
+/* the state file at the loader's start: none configured, read, not there, ignored (corrupt), cannot be read */
+enum { KDB_HF_NONE = 0, KDB_HF_LOADED, KDB_HF_MISSING, KDB_HF_CORRUPT, KDB_HF_UNREADABLE, KDB_HF_N };
+/* HOT_ACK: written, same as the file (not written again), could not be written, no state file configured, the list was not valid */
+enum { KDB_HA_WRITTEN = 0, KDB_HA_UNCHANGED, KDB_HA_FAILED, KDB_HA_NOFILE, KDB_HA_IGNORED, KDB_HA_N };
 #define KDB_DEFAULT_MAX_ZONE_RECORDS 10000000ull
 #define KDB_DEFAULT_MAX_ZONE_BYTES (1ull << 30)
 
@@ -107,18 +153,32 @@ enum {
     /* loader -> Backend */
     KDB_T_HELLO = 1, KDB_T_INVENTORY_REQ = 2, KDB_T_BATCH_BEGIN = 3, KDB_T_ZONE_BEGIN = 4, KDB_T_ZONE_DATA = 5,
     KDB_T_ZONE_END = 6, KDB_T_ZONE_ABORT = 7, KDB_T_ZONE_FAILED = 8, KDB_T_ZONE_DELETE = 9, KDB_T_PROFILE = 10,
-    KDB_T_BATCH_END = 11, KDB_T_AUTO_STATUS = 12,
+    KDB_T_BATCH_END = 11, KDB_T_AUTO_STATUS = 12, KDB_T_WARM_LIST = 13, KDB_T_HOT_ACK = 14,
     /* Backend -> loader: high bit set */
     KDB_T_CONFIG = 0x8001, KDB_T_RELOAD_REQ = 0x8002, KDB_T_INVENTORY = 0x8003, KDB_T_INVENTORY_END = 0x8004,
-    KDB_T_ZONE_RESULT = 0x8005, KDB_T_BATCH_RESULT = 0x8006
+    KDB_T_ZONE_RESULT = 0x8005, KDB_T_BATCH_RESULT = 0x8006,
+    KDB_T_FETCH_REQ = 0x8007,           /* D1a: fetch stream */
+    KDB_T_HOT_LIST = 0x8008             /* D1a step 7: the zones most asked for (first stream) */
 };
+
+enum { KDB_FETCH_PRIO_QUERY = 0, KDB_FETCH_PRIO_WARM, KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_PRIO_N };
+enum { KDB_FETCH_FULL = 0, KDB_FETCH_SUMMARY };
 
 enum { KDB_BATCH_STARTUP = 0, KDB_BATCH_FULL, KDB_BATCH_DIFF, KDB_BATCH_ZONE, KDB_BATCH_AUTO };
 enum { KDB_ZK_PRIMARY = 0, KDB_ZK_SECONDARY, KDB_ZK_CATALOG };
 #define KDB_ZF_PRESIGNED 0x1u
 #define KDB_ZF_EXTENDED 0x2u    /* ZONE_DATA carries Extended AXFR records (dns_wire.h, xext_*): location / ECS tags, tinydns time stamps and locations */
 #define KDB_ZF_TINYDNS 0x4u     /* B8: the zone is a tinydns zone (ZONE_IMAGE_F_TINYDNS: time-dependent TTLs, never cached), also without any time stamp or location */
-enum { KDB_ST_APPLIED = 0, KDB_ST_UNCHANGED, KDB_ST_REJECTED, KDB_ST_SHADOWED, KDB_ST_DELETED };
+#define KDB_APEX_NS_MAX 8        /* D1a step 6: NS names of a summary's apex */
+#define KDB_APEX_NS_BYTES 2047   /* ... and the bytes of their list (8 names of 253 characters and the separators) */
+#define KDB_APEX_GLUE_PER_NS 8   /* addresses of one NS target in the glue list */
+#define KDB_APEX_GLUE_BYTES 2048 /* ... and the bytes of the list (8 names, 8 AAAA records of 22 octets each: 1408) */
+#define KDB_NOTIFY_ADDR_PER_NS 8 /* D1a step 7: addresses of one NS target in the NOTIFY address list (tag 22) */
+#define KDB_NOTIFY_ADDR_BYTES 1152 /* ... and the bytes of the list (8 targets, 8 AAAA records of 18 octets each) */
+#define KDB_ZF_SUMMARY 0x8u     /* D1a, fetch stream: the zone's summary (serial, kind, settings), no ZONE_DATA, rr_count 0, zero digest */
+enum { KDB_ST_APPLIED = 0, KDB_ST_UNCHANGED, KDB_ST_REJECTED, KDB_ST_SHADOWED, KDB_ST_DELETED,
+       KDB_ST_SEND_BODY,       /* D1a: SEND_BODY, to a summary (or to a zone body that was left out): the zone is in the Backend's memory in another version than the loader says, send it whole */
+       KDB_ST_NOT_RESIDENT };  /* D1a: NOT_RESIDENT, to a zone body: the Backend took the version into its directory and left the data out (memory-limit), so it has no data of the zone */
 
 typedef enum {
     KDB_OK = 0,
@@ -197,6 +257,19 @@ typedef struct { uint64_t batch_id; uint8_t kind; uint64_t change_seq; uint64_t 
 typedef struct {
     uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; uint8_t zone_kind; uint32_t serial;
     uint32_t flags; uint64_t rr_count; uint8_t digest[KDB_DIGEST_LEN]; kdb_str_t settings, profile;
+    uint64_t request_id;        /* D1a: 0 = tag absent */
+    bool has_soa_timers;        /* D1a: tags 12..14, the SOA refresh / retry / expire of the zone (a summary carries them for the directory) */
+    uint32_t soa_refresh, soa_retry, soa_expire;
+    bool has_apex;              /* D1a step 6: tags 15..20 */
+    char soa_mname[DNS_NAME_TEXT_SIZE], soa_rname[DNS_NAME_TEXT_SIZE];
+    uint32_t soa_minimum, soa_ttl, ns_ttl;
+    const char *ns_names;       /* the names separated by LF; points into the frame, valid until the next frame is read */
+    uint16_t ns_names_len;
+    uint8_t ns_count;
+    const uint8_t *glue;        /* tag 21 (validated by the decoder), NULL when there is none; points into the frame like ns_names */
+    uint16_t glue_len;
+    const uint8_t *naddrs;      /* tag 22 (validated by the decoder), NULL when there is none; points into the frame */
+    uint16_t naddrs_len;
 } kdb_zone_begin_t;
 typedef struct {
     const uint8_t *body; uint32_t len;   /* the DNS message */
@@ -204,7 +277,7 @@ typedef struct {
 } kdb_zone_data_t;
 typedef struct { uint64_t rr_count; } kdb_zone_end_t;
 typedef struct { kdb_str_t reason; } kdb_zone_abort_t;
-typedef struct { uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; kdb_str_t reason; } kdb_zone_failed_t;
+typedef struct { uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; kdb_str_t reason; uint64_t request_id; /* 0 = absent */ } kdb_zone_failed_t;
 typedef struct { uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; } kdb_zone_delete_t;
 typedef struct { kdb_str_t name, settings; } kdb_profile_t;
 typedef struct { uint64_t batch_id; uint32_t n_zones, n_failed, n_deleted; } kdb_batch_end_t;
@@ -215,6 +288,7 @@ typedef struct {
     uint32_t default_ttl;       /* 0 = tag absent */
     int bulk_threshold;         /* percent; -1 = tag absent */
     uint32_t loader_threads;    /* 0 = tag absent */
+    bool dir_only;              /* tag 8 (D1a milestone 4): memory-limit is set; the loader sends the summary only (no ZONE_DATA) for a zone the Backend does not have in memory */
     uint32_t n_views;
     const uint8_t *body; uint32_t body_len;       /* for kdb_config_views() */
 } kdb_config_t;
@@ -228,6 +302,18 @@ typedef struct {
     uint64_t batch_id; const uint8_t *request_ids; uint32_t n_request_ids;   /* big-endian u64 each */
     uint32_t n_applied, n_unchanged, n_rejected, n_deleted;
 } kdb_batch_result_t;
+typedef struct {
+    uint64_t list_id; uint32_t part; bool last; uint32_t n_entries;
+    uint32_t limit;             /* HOT_LIST tag 5, 0 = absent */
+    int file_state;             /* WARM_LIST tag 6 (KDB_HF_*), -1 = absent */
+    uint32_t file_zones;        /* WARM_LIST tag 7 */
+    const uint8_t *body; uint32_t body_len;       /* for kdb_hot_entries() */
+} kdb_hot_list_t;
+typedef struct { uint64_t list_id; uint8_t status; uint32_t zones; kdb_str_t error; } kdb_hot_ack_t;
+typedef struct {
+    uint64_t request_id; uint16_t view; char name[DNS_NAME_TEXT_SIZE]; uint8_t priority, mode;
+    bool has_range; char range_lo[DNS_NAME_TEXT_SIZE], range_hi[DNS_NAME_TEXT_SIZE];
+} kdb_fetch_req_t;
 
 typedef struct {
     uint16_t type;
@@ -238,12 +324,17 @@ typedef struct {
         kdb_zone_delete_t zone_delete; kdb_profile_t profile; kdb_batch_end_t batch_end; kdb_auto_status_t auto_status;
         kdb_config_t config; kdb_reload_req_t reload_req; kdb_inventory_t inventory;
         kdb_inventory_end_t inventory_end; kdb_zone_result_t zone_result; kdb_batch_result_t batch_result;
+        kdb_fetch_req_t fetch_req; kdb_hot_list_t hot_list; kdb_hot_ack_t hot_ack;
     } u;
 } kdb_msg_t;
 
 /* Decode one frame of either direction (the type says which).  view_count: number of configured views, or
  * KDB_VIEWS_ANY.  why (>= KDB_REASON_LEN bytes) receives the reason on error. */
 kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t view_count, kdb_msg_t *msg, char *why, size_t whylen);
+/* D1a step 6: is p a glue list as tag 21 of ZONE_BEGIN describes it, for an apex with ns_count NS names? */
+bool kdb_apex_glue_valid(const uint8_t *p, size_t len, unsigned ns_count);
+/* D1a step 7: is p a NOTIFY address list as tag 22 of ZONE_BEGIN describes it, for an apex with ns_count NS names? */
+bool kdb_notify_addrs_valid(const uint8_t *p, size_t len, unsigned ns_count);
 
 /* Repeated nested entries of CONFIG and INVENTORY.  The entries were validated by kdb_decode(); the iterator
  * checks again and simply ends on anything unexpected. */
@@ -255,6 +346,7 @@ typedef struct {
 } kdb_config_view_t;
 typedef struct {
     uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; uint32_t serial; uint8_t digest[KDB_DIGEST_LEN];
+    bool resident;              /* D1a: false = the Backend has no data of the zone, and `digest` is all zero */
 } kdb_inventory_entry_t;
 #define KDB_AS_AUTO 1u      /* AUTO_STATUS entry flags: the auto reload fields are real */
 #define KDB_AS_REQ 2u       /* the reload request fields are real (B11) */
@@ -268,6 +360,36 @@ void kdb_config_views(const kdb_msg_t *m, kdb_iter_t *it);
 bool kdb_config_views_next(kdb_iter_t *it, kdb_config_view_t *out);
 void kdb_inventory_entries(const kdb_msg_t *m, kdb_iter_t *it);
 bool kdb_inventory_entries_next(kdb_iter_t *it, kdb_inventory_entry_t *out);
+
+/* ---------------------------------------------------------------- hot list (D1a step 7, design 8.4) */
+/* The zones most asked for, hottest first: (view name, zone name) pairs in a malloc'd buffer, "view\0zone\0" each.  Used by the Backend (HOT_LIST out, WARM_LIST in),
+ * the loader (the state file, the merge) and the state file's reader.  Every pair is validated when it is added: the view is 1..255 printable ASCII bytes, the
+ * zone a canonical absolute name, the list at most KDB_HOT_MAX pairs. */
+typedef struct { char *buf; size_t len, cap; uint32_t n; } kdb_hotl_t;
+void kdb_hotl_init(kdb_hotl_t *l);
+void kdb_hotl_free(kdb_hotl_t *l);
+void kdb_hotl_clear(kdb_hotl_t *l);
+bool kdb_hotl_add(kdb_hotl_t *l, const char *view, const char *zone);     /* false: not valid, the list is full, or out of memory (the list is unchanged) */
+bool kdb_hotl_next(const kdb_hotl_t *l, size_t *pos, const char **view, const char **zone);   /* *pos starts at 0 */
+bool kdb_hotl_equal(const kdb_hotl_t *a, const kdb_hotl_t *b);
+/* out = the entries of fresh, then those of old that fresh does not have, at most limit (a pair twice in fresh counts once).  false: out of memory. */
+bool kdb_hotl_merge(const kdb_hotl_t *fresh, const kdb_hotl_t *old, uint32_t limit, kdb_hotl_t *out);
+/* Encode l as messages of type (KDB_T_HOT_LIST or KDB_T_WARM_LIST) into e, one part at a time: emit(ud) is called with each finished message in e (it sends it and
+ * resets e).  limit 0 = no tag 5; file_state < 0 = no tags 6 and 7.  0, or -1 (an emit failed, or the encoder is out of memory). */
+int kdb_hot_encode(const kdb_hotl_t *l, kdb_enc_t *e, uint16_t type, uint64_t list_id, uint32_t limit, int file_state, uint32_t file_zones,
+                   int (*emit)(void *ud), void *ud);
+void kdb_hot_entries(const kdb_msg_t *m, kdb_iter_t *it);
+bool kdb_hot_entries_next(kdb_iter_t *it, char view[256], char zone[DNS_NAME_TEXT_SIZE]);
+
+/* The state file (design 8.4, decision 10).  Text: a first line "KARIDNS-HOT-LIST 1", one line "view TAB zone" per entry, hottest first, and a last line
+ * "END <count> <checksum>" (FNV-1a of the entry lines, 8 hex digits); anything else (a truncated file, a bad line, a wrong count or checksum, bytes after END,
+ * an empty file) is refused.  The reader never trusts the file: it may be damaged or written by somebody else. */
+bool kdb_hotl_parse(const char *buf, size_t len, kdb_hotl_t *out, char *why, size_t whylen);   /* why: a reason without bytes of the file */
+char *kdb_hotl_serialize(const kdb_hotl_t *l, size_t *len);                                    /* malloc'd, NULL: out of memory */
+/* Read: KDB_HF_LOADED (out holds the list), KDB_HF_MISSING, KDB_HF_CORRUPT (ignored; why says what) or KDB_HF_UNREADABLE (why = strerror) */
+int kdb_hotl_file_read(const char *path, kdb_hotl_t *out, char *why, size_t whylen);
+/* Write l to path atomically: path.tmp (new, mode 0600, never follows a link), fsync, rename.  0, or -1 with err set. */
+int kdb_hotl_file_write(const char *path, const kdb_hotl_t *l, char *err, size_t errlen);
 
 /* ---------------------------------------------------------------- Backend state machine */
 typedef struct {
@@ -290,11 +412,17 @@ typedef struct {
     uint64_t zone_rr_sum;                      /* sum of ANCOUNT so far; at ZONE_END equal to the declared count */
     uint64_t zone_bytes;                       /* sum of ZONE_DATA bodies so far */
     uint32_t zone_data_msgs;
+    bool fetch;                                /* D1a: the fetch stream (kdb_sm_init_fetch()) */
+    uint64_t zone_req_id;                      /* fetch stream: the request id of the zone being received (ZONE_BEGIN tag 11) */
     kdb_rc_t fail;
     char reason[KDB_REASON_LEN];
 } kdb_sm_t;
 
 void kdb_sm_init(kdb_sm_t *sm, const kdb_limits_t *lim);   /* lim == NULL: defaults, KDB_VIEWS_ANY */
+/* The state machine of the fetch stream (D1a): starts in READY, accepts PROFILE / ZONE_BEGIN / ZONE_FAILED there and ZONE_DATA /
+ * ZONE_END / ZONE_ABORT in a zone; every ZONE_BEGIN and ZONE_FAILED carries a request id; summaries are allowed.  After ZONE_END,
+ * ZONE_ABORT and ZONE_FAILED the machine is READY again and the profile count starts again. */
+void kdb_sm_init_fetch(kdb_sm_t *sm, const kdb_limits_t *lim);
 /* Validate one frame from the loader against the current state, decode it, apply the semantic checks.  KDB_OK:
  * *msg is valid and the state advanced.  KDB_E_*: protocol error; the state is KDB_S_ERROR (sticky) and
  * sm->reason says why.  An error leaves any partial zone to be discarded by the caller. */

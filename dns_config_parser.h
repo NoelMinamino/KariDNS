@@ -313,6 +313,8 @@ typedef struct zone_inview {
   char *view;                   /* the view that holds the zone (in-view "v"); NULL when only in-view-settings was written */
   struct zone_config *target;   /* the owner's zone { }, set when the parse ends (not owned) */
   char *loc;                    /* "file:line" of the in-view statement (messages after the parse) */
+  bool db_target;               /* D1a phase 2 (design 9): the owner view has no zone { } of this name but takes zones from the database or has a catalog zone: the zone is found at
+                                 * run time in the owner's directory (target stays NULL).  The zone may or may not exist there at any moment; the stub only names it */
   uint8_t settings;             /* IVS_* written in this zone */
   bool acl_written;             /* an allow-query / allow-query-on / allow-transfer / allow-update / allow-notify was written (needs IVS_VIEW) */
 } zone_inview_t;
@@ -410,6 +412,9 @@ typedef struct zone_ext {
    * is what PowerDNS does. --- */
   uint8_t transfer_acl_match;
   uint8_t update_acl_match;
+  /* --- cache (D1a step 5): what the memory limit may do with a database zone: 0 auto (frequency decides), 1 pin (never taken out of memory),
+   * 2 no-cache (taken out of memory as soon as the queries it was loaded for are answered).  The loader writes it from the metadata X-KARIDNS-CACHE. --- */
+  uint8_t cache_mode;
   /* --- set by the code that installs the settings of a DB zone, never by text: the ACLs of this zone also have to pass
    * options { database { acl-ceiling } } (dns_tsig_acl.c) --- */
   bool db_acl_ceiling;
@@ -639,6 +644,16 @@ typedef struct {
   uint32_t db_reload_timeout;  /* seconds, 1..3600 */
   uint32_t ingest_threads;     /* 1..16 */
   uint32_t loader_threads;     /* 1..16 */
+  uint32_t park_max;           /* D1a: queries one worker parks for a zone that is not in memory, 1..65536 (0 = the default, 1024); restart-only */
+  uint32_t park_timeout_ms;    /* D1a: how long a parked query waits for the zone, 10..60000 ms (0 = the default, 1500) */
+  uint64_t memory_limit;       /* D1a step 5: bytes the database zones may hold in memory (resident + retired, not freed yet); 0 = no limit, every zone stays resident. 1M..1T */
+  uint32_t fetch_rate;         /* D1a: zones read from the database for queries per second, 1..100000 (0 = the default, 200); a token bucket with a burst of one second */
+  uint32_t fetch_concurrency;  /* D1a: fetches in flight to the loader while memory-limit is set, 2..256 (0 = loader-threads x 16, at least 16): fetch-rate, not this, should be what limits the reads; a request over it is shed */
+  uint32_t transfer_fetch_timeout_ms;   /* D1a step 7: how long an AXFR / IXFR of a zone that is not in memory waits for the zone, 100..600000 ms (0 = the default, 10000) */
+  char *loader_state_file;     /* D1a step 7 (design 8.4): the file the loader keeps the hot list in (restart-only); NULL = none */
+  uint32_t warm_before_serve;  /* D1a step 7: seconds the queries wait for the zones of the hot list to be read, 0..3600 (0 = do not wait, the default) */
+  uint32_t hot_list_size;      /* D1a step 7: the zones most asked for that the hot list keeps, 1..100000 (0 = the default, 10000) */
+  uint32_t hot_list_interval;  /* D1a step 7: seconds between two hot lists, 1..86400 (0 = the default, 60) */
   char *server_id;             /* postgresql only (B11) */
   char **alias_resolver;       /* stored only (B9a): IP address literals */
   int alias_resolver_count;
@@ -650,6 +665,24 @@ typedef struct {
 #define KARIDNS_DB_TTL_MAX 2147483647u
 #define KARIDNS_DB_RELOAD_TIMEOUT_MAX 3600
 #define KARIDNS_DB_THREADS_MAX 16
+#define KARIDNS_DB_PARK_MAX_MAX 65536
+#define KARIDNS_DB_MEMORY_LIMIT_MIN (1ull << 20)
+#define KARIDNS_DB_MEMORY_LIMIT_MAX (1ull << 40)
+#define KARIDNS_DB_FETCH_RATE_MAX 100000
+#define KARIDNS_DB_FETCH_RATE_DEFAULT 200
+#define KARIDNS_DB_FETCH_CONC_MIN 2
+#define KARIDNS_DB_FETCH_CONC_MAX 256
+#define KARIDNS_DB_FETCH_CONC_PER_THREAD 16  /* fetch-concurrency when it is not set: loader-threads times this (at least 16, the old fixed limit; at most the maximum) */
+#define KARIDNS_DB_XFR_FETCH_TIMEOUT_MIN 100
+#define KARIDNS_DB_XFR_FETCH_TIMEOUT_MAX 600000
+#define KARIDNS_DB_XFR_FETCH_TIMEOUT_DEFAULT 10000
+#define KARIDNS_DB_WARM_WAIT_MAX 3600
+#define KARIDNS_DB_HOT_LIST_MAX 100000
+#define KARIDNS_DB_HOT_LIST_DEFAULT 10000
+#define KARIDNS_DB_HOT_INTERVAL_MAX 86400
+#define KARIDNS_DB_HOT_INTERVAL_DEFAULT 60
+#define KARIDNS_DB_PARK_TIMEOUT_MIN 10
+#define KARIDNS_DB_PARK_TIMEOUT_MAX 60000
 #define KARIDNS_DB_MAX_VIEWS 1024   /* views that take DB zones: the CONFIG message of the loader link lists at most this many (KDB_MAX_CONFIG_VIEWS) */
 #define KARIDNS_DB_MAX_ZONE_RECORDS_DEFAULT 10000000ull   /* the database block and options { max-zone-records } (I2) */
 #define KARIDNS_DB_MAX_ZONE_BYTES_DEFAULT (1ull << 30)     /* the database block and options { max-zone-bytes } (I2) */

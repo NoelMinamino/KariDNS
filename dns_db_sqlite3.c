@@ -41,7 +41,7 @@ struct db_conn {
     char err[DB_ERRLEN];
     bool in_snapshot;
     bool has_changes;
-    sqlite3_stmt *st_zones, *st_zone_one, *st_rec_all, *st_rec_one, *st_rec_rng, *st_meta_all, *st_meta_one, *st_keys, *st_changes;
+    sqlite3_stmt *st_apex_all, *st_apex_one, *st_zones, *st_zone_one, *st_rec_all, *st_rec_one, *st_rec_rng, *st_meta_all, *st_meta_one, *st_keys, *st_changes;
     sqlite3_stmt *st_dv_all, *st_dv_one;
     bool has_domain_views;
     sqlite3_stmt *st_prof;
@@ -191,6 +191,8 @@ static void sq_close(db_conn_t *c) {
     if (!c) return;
     sqlite3_finalize(c->st_pv);
     free(c->path);
+    sqlite3_finalize(c->st_apex_all);
+    sqlite3_finalize(c->st_apex_one);
     sqlite3_finalize(c->st_zones);
     sqlite3_finalize(c->st_zone_one);
     sqlite3_finalize(c->st_rec_all);
@@ -467,7 +469,7 @@ static int sq_begin_snapshot(db_conn_t *c) {
 
 static int sq_end_snapshot(db_conn_t *c) {
     if (!c->in_snapshot) return 0;
-    sqlite3_stmt *all[] = { c->st_zones, c->st_zone_one, c->st_rec_all, c->st_rec_one, c->st_rec_rng, c->st_meta_all, c->st_meta_one,
+    sqlite3_stmt *all[] = { c->st_apex_all, c->st_apex_one, c->st_zones, c->st_zone_one, c->st_rec_all, c->st_rec_one, c->st_rec_rng, c->st_meta_all, c->st_meta_one,
                             c->st_keys, c->st_changes, c->st_dv_all, c->st_dv_one, c->st_prof };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
         if (all[i]) rearm(all[i]);
@@ -621,6 +623,60 @@ static int sq_scan_records(db_conn_t *c, const int64_t *domain_id, db_record_cb 
     rearm(st);
     if (domain_id) sqlite3_bind_int64(st, 1, *domain_id);
     return rec_loop(c, st, cb, ud);
+}
+
+/* D1a step 6: the enabled SOA and NS records at the apex (the record's name is the domain's name), one zone or all */
+static int sq_scan_apex(db_conn_t *c, const int64_t *domain_id, db_apex_cb cb, void *ud) {
+    sqlite3_stmt **slot = domain_id ? &c->st_apex_one : &c->st_apex_all;
+    /* the SOA and NS rows of the apex, and the address rows of the zone whose owner is an NS target inside the zone (g: the NS row n gives the target).  CROSS JOIN keeps
+     * the order n, d, g: left to itself the planner scans g and looks the NS rows of its zone up for every row (quadratic in the size of a big zone: 10 s for 10,000
+     * records); the NS rows are few, and g is looked up by domain_id for each of them. */
+#define AX_SOA_NS "SELECT r.domain_id, r.type, r.content, r.ttl, r.id, r.name FROM records r JOIN domains d ON d.id = r.domain_id AND r.name = d.name COLLATE NOCASE " \
+                  "WHERE r.type IN ('SOA', 'NS') AND r.disabled = 0 "
+#define AX_GLUE_1 "SELECT g.domain_id, g.type, g.content, g.ttl, g.id, g.name FROM records n CROSS JOIN domains d ON d.id = n.domain_id AND n.name = d.name COLLATE NOCASE " \
+                  "CROSS JOIN records g ON g.domain_id = n.domain_id AND g.type IN ('A', 'AAAA') AND g.disabled = 0 AND g.name = rtrim(n.content, '.') COLLATE NOCASE " \
+                  "WHERE n.type = 'NS' AND n.disabled = 0 "
+#define AX_IN_ZONE "AND (lower(rtrim(n.content, '.')) = lower(d.name) OR substr(lower(rtrim(n.content, '.')), -(length(d.name) + 1)) = '.' || lower(d.name)) "
+    /* D1a step 7: the address rows of the NS targets that are NOT inside the zone, from any zone of the source (the NOTIFY the Backend sends while the zone is out of memory
+     * needs them): the row is the zone's (n.domain_id) and the name is the target's.  g.name = lower(...) is an equality on records(name, type) (PowerDNS stores names in lower
+     * case; a name stored with upper case letters is not found), one lookup per NS row. */
+#define AX_XADDR "SELECT n.domain_id, g.type, g.content, g.ttl, g.id, g.name FROM records n CROSS JOIN domains d ON d.id = n.domain_id AND n.name = d.name COLLATE NOCASE " \
+                 "CROSS JOIN records g ON g.name = lower(rtrim(n.content, '.')) AND g.type IN ('A', 'AAAA') AND g.disabled = 0 " \
+                 "WHERE n.type = 'NS' AND n.disabled = 0 AND NOT (lower(rtrim(n.content, '.')) = lower(d.name) OR substr(lower(rtrim(n.content, '.')), -(length(d.name) + 1)) = '.' || lower(d.name)) "
+    int ret = prep(c, slot, domain_id ? AX_SOA_NS "AND r.domain_id = ?1 UNION ALL " AX_GLUE_1 "AND n.domain_id = ?1 " AX_IN_ZONE "UNION ALL " AX_XADDR "AND n.domain_id = ?1 " "ORDER BY 1, 5"
+                                      : AX_SOA_NS "UNION ALL " AX_GLUE_1 AX_IN_ZONE "UNION ALL " AX_XADDR "ORDER BY 1, 5");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = *slot;
+    rearm(st);
+    if (domain_id) sqlite3_bind_int64(st, 1, *domain_id);
+    for (;;) {
+        int rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE) break;
+        if (rc != SQLITE_ROW) {
+            ret = sql_fail(c, rc, "scan_apex");
+            break;
+        }
+        bool bad = false;
+        db_apex_row_t r;
+        r.domain_id = sqlite3_column_int64(st, 0);
+        const char *type = col_text(c, st, 1, "records", sqlite3_column_int64(st, 4), "type", &bad);
+        r.is_soa = type && strcasecmp(type, "SOA") == 0;
+        r.addr_type = type && strcasecmp(type, "A") == 0 ? 1 : type && strcasecmp(type, "AAAA") == 0 ? 28 : 0;
+        r.name = col_text(c, st, 5, "records", sqlite3_column_int64(st, 4), "name", &bad);
+        r.content = col_text(c, st, 2, "records", sqlite3_column_int64(st, 4), "content", &bad);
+        r.ttl_null = sqlite3_column_type(st, 3) == SQLITE_NULL;
+        r.ttl = r.ttl_null ? 0 : sqlite3_column_int64(st, 3);
+        if (bad) {
+            ret = -1;
+            break;
+        }
+        if (cb(ud, &r) != 0) {
+            ret = DB_STOPPED;
+            break;
+        }
+    }
+    rearm(st);
+    return ret;
 }
 
 static int sq_scan_records_range(db_conn_t *c, int64_t lo, int64_t hi, db_record_cb cb, void *ud) {
@@ -972,6 +1028,7 @@ const db_driver_t db_driver_sqlite3 = {
     sq_schema_findings, /* B12 */
     sq_find_zone,       /* B13 */
     NULL, NULL, NULL,   /* B13b scan_records_in, scan_metadata_in, scan_ext_in: PostgreSQL only (a statement costs no round trip here) */
+    sq_scan_apex,       /* D1a step 6 */
 };
 
 #endif /* KARIDNS_DB_SQLITE3 */

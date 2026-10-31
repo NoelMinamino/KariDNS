@@ -198,6 +198,7 @@ int db_zone_build_install(db_zone_build_t *b, zone_db_entry_t *entry, bool *noti
     set_why(why, whylen, "cannot build the zone image");
     return -1;
   }
+  atomic_store_explicit(&entry->updated, false, memory_order_release);                    /* what an UPDATE changed is replaced by the database's version */
   pthread_mutex_unlock(&entry->writer_lock);
   if (was_loaded && serial != old_serial) {
     notify_request_send(entry);
