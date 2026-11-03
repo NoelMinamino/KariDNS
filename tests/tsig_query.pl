@@ -13,6 +13,13 @@
 #   --key NAME:BASE64       (sign with hmac-sha256, RFC 8945 §4.3; verify the answer)
 #   --hex HEX               (send this packet as is, instead of building one)
 #   --count N               (UDP: send N queries back to back, one line each)
+#   A malformed request (tests/run_xfr_request_shape_test.sh): each option changes one thing of the request; the TSIG, if any, signs the result
+#   --opcode N / --req-rcode N                the OPCODE / RCODE of the request header (default 0)
+#   --hdr-qd N / --hdr-an N / --hdr-ns N      this value in QDCOUNT / ANCOUNT / NSCOUNT instead of the number of records that are there
+#   --second-question                         a second question, the same as the first
+#   --auth-type N                             the TYPE of the IXFR Authority record instead of SOA (6)
+#   --second-opt                              two OPT records (with --edns-version)
+#   --trailing N                              N octets after the last record (after the TSIG)
 # Output, one line per answer:
 #   rcode=<12-bit extended rcode> tc=<0|1> aa=<0|1> qd=<n> an=<n> ns=<n> ar=<n> opt=<version|none> tsig=<none|ok|bad|error-N>
 # A timeout prints "timeout".
@@ -28,9 +35,14 @@ use Getopt::Long;
 
 my ($server, $port, $tcp, $name, $type, $ixfr_serial, $edns_version, $key, $hex, $count) =
     ('127.0.0.1', 53, 0, '.', 'A', undef, undef, undef, undef, 1);
+my ($opcode, $req_rcode, $hdr_qd, $hdr_an, $hdr_ns, $second_question, $auth_type, $second_opt, $trailing) =
+    (0, 0, undef, undef, undef, 0, 6, 0, 0);
 GetOptions('server=s' => \$server, 'port=i' => \$port, 'tcp' => \$tcp, 'name=s' => \$name,
            'type=s' => \$type, 'ixfr-serial=i' => \$ixfr_serial, 'edns-version=i' => \$edns_version,
-           'key=s' => \$key, 'hex=s' => \$hex, 'count=i' => \$count) or die "bad options\n";
+           'key=s' => \$key, 'hex=s' => \$hex, 'count=i' => \$count,
+           'opcode=i' => \$opcode, 'req-rcode=i' => \$req_rcode, 'hdr-qd=i' => \$hdr_qd, 'hdr-an=i' => \$hdr_an,
+           'hdr-ns=i' => \$hdr_ns, 'second-question' => \$second_question, 'auth-type=i' => \$auth_type,
+           'second-opt' => \$second_opt, 'trailing=i' => \$trailing) or die "bad options\n";
 
 my %types = (A => 1, NS => 2, SOA => 6, TXT => 16, AAAA => 28, IXFR => 251, AXFR => 252, ANY => 255);
 my $qtype = $type =~ /^\d+$/ ? $type : ($types{uc $type} // die "unknown type $type\n");
@@ -54,11 +66,13 @@ sub build_query {
     return (pack('H*', $hex), '') if defined $hex;
     my $id = int(rand(65536));
     my $q = wire_name($name) . pack('nn', $qtype, 1);
+    my $qdcount = 1;
+    if ($second_question) { $q .= $q; $qdcount = 2; }
     my $ns = '';
     my $nscount = 0;
     if (defined $ixfr_serial) {    # RFC 1995 §3: the client's SOA in the authority section
         my $rd = wire_name("ns.$name") . wire_name("h.$name") . pack('NNNNN', $ixfr_serial, 0, 0, 0, 0);
-        $ns = wire_name($name) . pack('nnNn', 6, 1, 0, length $rd) . $rd;
+        $ns = wire_name($name) . pack('nnNn', $auth_type, 1, 0, length $rd) . $rd;
         $nscount = 1;
     }
     my $ar = '';
@@ -66,9 +80,11 @@ sub build_query {
     if (defined $edns_version) {   # RFC 6891 §6.1.3: VERSION is the second octet of the TTL
         $ar .= "\0" . pack('nnNn', 41, 1232, $edns_version << 16, 0);
         $arcount++;
+        if ($second_opt) { $ar .= "\0" . pack('nnNn', 41, 1232, $edns_version << 16, 0); $arcount++; }
     }
-    my $msg = pack('nnnnnn', $id, 0, 1, 0, $nscount, $arcount) . $q . $ns . $ar;
-    return ($msg, '') unless defined $key_name;
+    my $flags = ($opcode << 11) | $req_rcode;
+    my $msg = pack('nnnnnn', $id, $flags, $hdr_qd // $qdcount, $hdr_an // 0, $hdr_ns // $nscount, $arcount) . $q . $ns . $ar;
+    return ($msg . ("\xAA" x $trailing), '') unless defined $key_name;
     # RFC 8945 §4.3.2-§4.3.3: digest = message (before TSIG) + TSIG variables
     my $now = time();
     my $time48 = pack('nN', $now >> 32, $now & 0xFFFFFFFF);
@@ -77,7 +93,7 @@ sub build_query {
     my $rd = $alg . $time48 . pack('nn', 300, length $mac) . $mac . pack('nnn', $id, 0, 0);
     my $tsig = wire_name($key_name) . pack('nnNn', 250, 255, 0, length $rd) . $rd;
     substr($msg, 10, 2) = pack('n', $arcount + 1);
-    return ($msg . $tsig, $mac);
+    return ($msg . $tsig . ("\xAA" x $trailing), $mac);
 }
 
 sub skip_name {
