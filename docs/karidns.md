@@ -439,7 +439,7 @@ The messages of the server carry a `[Prefix]` (the part of the program they come
 | `security` | TSIG errors (`[TSIG]`), DNS cookie problems (`[Cookie]`). |
 | `network` | Socket options and buffer sizes (`[Network]`). |
 | `zoneload` | Loading zone files and building zone images (`[Zone]`, `[ZoneLoader]`, `[Image]`, `[tinydns]`). |
-| `database` | The database zones (`[DB]`). |
+| `database` | The database zones (`[DB]`), and the messages of `karidns-dbloader` (read from its standard error by the supervisor, see karidns-dbloader(8) MESSAGES). |
 | `rate-limit` | Response rate limiting (`[RRL]`). |
 | `dnstap` | The dnstap output (`[dnstap]`). |
 | `queries` | The query log, one line per query. |
@@ -448,7 +448,7 @@ The messages of the server carry a `[Prefix]` (the part of the program they come
 
 Severities are those of BIND: critical, error, warning, notice, info, and `debug <n>`. KariDNS has no debug level (BIND's `-d`), so nothing is logged at a debug level: the two messages that were `debug` in earlier versions (a NOTIFY that was answered, a zone file left alone by `reconfig` because its mtime is unchanged) are `info` now, which is what `default_syslog` passes. `severity dynamic` therefore passes everything from critical to info.
 
-The other categories are accepted (a configuration written for BIND works) but this authoritative server has nothing to write to them: `client`, `dispatch`, `dnssec`, `lame-servers`, `query-errors`, `update-security`, `nsid`, `rpz`, `rpz-passthru`, `cname`, `spill`, `serve-stale`, `edns-disabled`, `resolver`, `trust-anchor-telemetry`, `sslkeylog`, `unmatched`. `karidns-dbloader` (the database loader process) logs to syslog on its own.
+The other categories are accepted (a configuration written for BIND works) but this authoritative server has nothing to write to them: `client`, `dispatch`, `dnssec`, `lame-servers`, `query-errors`, `update-security`, `nsid`, `rpz`, `rpz-passthru`, `cname`, `spill`, `serve-stale`, `edns-disabled`, `resolver`, `trust-anchor-telemetry`, `sslkeylog`, `unmatched`. 
 
 **Query log and response log.** `options { querylog yes; }` switches the query log on and `querylog no;` off; the lines go to the channels of `category queries` (to the `default` category's when there are none, so `querylog yes;` alone logs the queries to syslog). With `querylog` not written, the query log is on when `category queries` lists a channel (BIND leaves it off until `rndc querylog`; KariDNS has always logged queries as soon as the category was configured). The response log is on when `category responses` lists a channel. A line is `client <address>#<port> (<name>): query: <name> <class> <type> <flags>` (`response: ... -> <rcode>` for responses). The rate limit of a channel is its own `max-qps` (when written and above 0), else `query-log-max-qps`; every channel of `category queries` is held to its own limit (the workers admit what the most generous channel allows and the query logger drops the lines over a channel's limit).
 

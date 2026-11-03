@@ -6177,8 +6177,17 @@ int main(int argc, char **argv) {
       g_broker_sock = -1;
     }
 
-    // beta design 1.2 step 4: the loader is started last, when the Backend and the routers exist
-    if (dbsup.enabled) db_sup_spawn(&dbsup);
+    // beta design 1.2 step 4: the loader is started last, when the Backend and the routers exist.  Its stderr is a pipe the loop below reads
+    // (batch 14): SIGIO tells that it has data, the handler does nothing (the signal is blocked in the loop and taken with sigtimedwait())
+    if (dbsup.enabled) {
+      struct sigaction ioa;
+      memset(&ioa, 0, sizeof(ioa));
+      ioa.sa_handler = supervisor_sigchld_handler;
+      sigemptyset(&ioa.sa_mask);
+      sigaction(SIGIO, &ioa, NULL);
+      dbsup.want_sigio = true;
+      db_sup_spawn(&dbsup);
+    }
     // The loop keeps SIGCHLD / SIGTERM / SIGINT / SIGHUP blocked and takes them synchronously with sigtimedwait(),
     // so a signal cannot slip in between the checks and the sleep, and no handler runs inside the loop (handlers
     // that run late, as under ThreadSanitizer, left the supervisor deaf to SIGTERM with the earlier ppoll() wait).
@@ -6198,6 +6207,7 @@ int main(int argc, char **argv) {
     sigaddset(&loop_block, SIGTERM);
     sigaddset(&loop_block, SIGINT);
     sigaddset(&loop_block, SIGHUP);
+    sigaddset(&loop_block, SIGIO);
     sigprocmask(SIG_BLOCK, &loop_block, &loop_orig);
 
     // 子プロセスの死活監視ループ (いずれかの子プロセスが終了した場合は全子プロセスを停止。
@@ -6235,8 +6245,9 @@ int main(int argc, char **argv) {
         break;
       }
       db_sup_tick(&dbsup);
+      bool log_more = db_sup_log_read(&dbsup);     // the loader's messages (the read is bounded: the signals above and below get their turn)
       struct timespec nap;
-      int nap_ms = db_sup_timeout_ms(&dbsup);
+      int nap_ms = log_more ? 0 : db_sup_wait_ms(&dbsup);
       nap.tv_sec = nap_ms / 1000;
       nap.tv_nsec = (long)(nap_ms % 1000) * 1000000L;
       siginfo_t si;
@@ -6298,6 +6309,7 @@ int main(int argc, char **argv) {
         continue;
       }
       if (w > 0 && dbsup.enabled && w == dbsup.pid) {
+        db_sup_log_finish(&dbsup);
         dbsup.pid = 0; // the loader's own status does not decide the exit code of the server
         continue;
       }
