@@ -1068,13 +1068,11 @@ void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct t
     klog_guard_leave(guard);
 }
 
-/* class and type of a logged query in the text BIND prints: IN / CH / ANY / CLASSn, and the type mnemonic */
+/* class and type of a logged query in the text BIND prints: IN / CH / HS / NONE / ANY / CLASSn, and the type mnemonic */
 static void query_log_class_type(uint16_t qclass, uint16_t qtype, char *class_str, size_t class_sz, char *type_buf, size_t type_sz,
                                  const char **type_str) {
-    if (qclass == 1) snprintf(class_str, class_sz, "IN");
-    else if (qclass == 255) snprintf(class_str, class_sz, "ANY");
-    else if (qclass == 3) snprintf(class_str, class_sz, "CH");
-    else snprintf(class_str, class_sz, "CLASS%d", qclass);
+    char cb[16];
+    snprintf(class_str, class_sz, "%s", dns_class_text(qclass, cb, sizeof(cb)));
     *type_str = format_type_name(qtype, type_buf, type_sz);
 }
 
@@ -3053,10 +3051,9 @@ process_tcp_client: ;
             if (!allowed || (!entry && !xfr_el)) {
               /* batch 14 (category xfer-out): the reason, first match: a quota or resource failure above, an EDNS version we do not speak (BADVERS), a TSIG
                * that cannot be parsed or does not verify, the transfer ACL, else the zone is not ours */
-              xfr_log_denied(ctx_tcp->client_ip, client_port, qname, qtype,
-                             xfr_deny ? xfr_deny : badvers ? XD_BADVERS : tsig.status == TSIG_REQ_FORMERR ? XD_TSIG_FORMERR
-                             : tsig.status == TSIG_REQ_ERROR ? XD_TSIG_NOTAUTH : (!zcfg && !entry && !xfr_el) ? XD_NOZONE : !allowed ? XD_ACL : XD_NOZONE,
-                             xfr_deny_limit);
+              const int deny = xfr_deny ? xfr_deny : badvers ? XD_BADVERS : tsig.status == TSIG_REQ_FORMERR ? XD_TSIG_FORMERR
+                             : tsig.status == TSIG_REQ_ERROR ? XD_TSIG_NOTAUTH : (!zcfg && !entry && !xfr_el) ? XD_NOZONE : !allowed ? XD_ACL : XD_NOZONE;
+              xfr_log_denied(ctx_tcp->client_ip, client_port, qname, qclass, qtype, deny, xfr_deny_limit);
               uint8_t res_buf[1024];
               uint8_t rcode = 5; /* REFUSED: 方針による拒否 (RFC 1035 §4.1.1、RFC 5936 §5)。AA=0 (R-06) */
               uint16_t qd_echo = 1;
@@ -3072,6 +3069,12 @@ process_tcp_client: ;
                 } else if (shape_bad) {
                   rcode = 1;       /* RFC 5936 §2.2.1 note e: a malformed request is a FORMERR */
                   qd_echo = (msg[4] | msg[5]) ? 1 : 0;   /* (the first question only, and none when the request counts none) */
+                } else if (deny == XD_NOZONE && xfr_view) {
+                  /* a zone this server is not authoritative for (also a QCLASS other than IN): EDE 20 Not Authoritative (RFC 8914 §4.21), as the UDP IXFR and a
+                   * query for such a name are answered (dns_query_engine.c); 18 Prohibited (§4.19) is for a client a policy refuses */
+                  add_ede(&edns, cfg ? cfg->send_extended_errors : false, 20, "This server is not authoritative for the queried zone");
+                } else if (deny == XD_NOZONE) {
+                  add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Query refused due to access control (no view matched)");
                 } else {
                   add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Query refused due to access control");
                 }

@@ -88,10 +88,10 @@ void xfr_ns_release(const struct sockaddr_storage *a);
 bool xfr_counter_acquire(_Atomic int *c, uint32_t limit);
 
 /* batch 14, category xfer-out (BIND lib/ns/xfrout.c).  Why an outbound transfer request is not served, for the log.  qtype 251 is an IXFR, anything else an
- * AXFR; `limit` is the transfers-out value for XD_QUOTA and the xfr_shape_t of dns_wire.h for XD_BAD_REQUEST (a request that is not shaped like an AXFR / IXFR request: FORMERR, RFC 5936 2.2.1 note e).  Called from the TCP worker (the record goes into its ring) and from the UDP IXFR path of the
+ * AXFR; qclass is the request's QCLASS, which the lines name (BIND: the class of the view); `limit` is the transfers-out value for XD_QUOTA and the xfr_shape_t of dns_wire.h for XD_BAD_REQUEST (a request that is not shaped like an AXFR / IXFR request: FORMERR, RFC 5936 2.2.1 note e).  Called from the TCP worker (the record goes into its ring) and from the UDP IXFR path of the
  * query engine; the transfer thread logs the rest itself (started, ended, aborted, fallbacks).  Nothing is formatted unless a channel passes the message. */
 enum { XD_ACL = 1, XD_NOZONE, XD_TSIG_FORMERR, XD_TSIG_NOTAUTH, XD_BADVERS, XD_QUOTA, XD_NO_THREAD, XD_NO_MEMORY, XD_UDP_AXFR, XD_BAD_REQUEST };
-void xfr_log_denied(const char *client_ip, int client_port, const char *zone, uint16_t qtype, int why, uint32_t limit);
+void xfr_log_denied(const char *client_ip, int client_port, const char *zone, uint16_t qclass, uint16_t qtype, int why, uint32_t limit);
 /* The UDP IXFR of the query engine (RFC 1995 4.2): the client is up to date (BIND: "IXFR poll up to date", debug 1) or behind (the answer is the SOA with TC=1:
  * the transfer itself follows over TCP and is logged by the transfer thread). */
 void xfr_log_udp_ixfr(const char *client_ip, int client_port, const char *zone, uint32_t client_serial, uint32_t serial, bool up_to_date, bool from_summary);

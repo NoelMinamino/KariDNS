@@ -2254,6 +2254,15 @@ static void test_wire_format_type_name_various_types(void) {
     CHECK_STR(format_type_name(28, buf, sizeof(buf)), "AAAA");
     CHECK_STR(format_type_name(6, buf, sizeof(buf)), "SOA");
     CHECK_STR(format_type_name(65001, buf, sizeof(buf)), "TYPE65001");
+    /* dns_class_text(): the mnemonics BIND prints in its logs, CLASSnnn (RFC 3597 5) for the rest */
+    CHECK_STR(dns_class_text(1, buf, sizeof(buf)), "IN");
+    CHECK_STR(dns_class_text(3, buf, sizeof(buf)), "CH");
+    CHECK_STR(dns_class_text(4, buf, sizeof(buf)), "HS");
+    CHECK_STR(dns_class_text(254, buf, sizeof(buf)), "NONE");
+    CHECK_STR(dns_class_text(255, buf, sizeof(buf)), "ANY");
+    CHECK_STR(dns_class_text(2, buf, sizeof(buf)), "CLASS2");
+    CHECK_STR(dns_class_text(0, buf, sizeof(buf)), "CLASS0");
+    CHECK_STR(dns_class_text(65535, buf, sizeof(buf)), "CLASS65535");
 }
 
 static void test_wire_get_type_code_mnemonics(void) {

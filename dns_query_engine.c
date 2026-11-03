@@ -117,7 +117,7 @@ static void qe_log_failure(const server_config_t *cfg, const uint8_t *req, size_
   if (opcode == 4 || opcode == 5) return;                  /* (notify.c, update.c: their own categories) */
   int level = cfg && cfg->logging.queries_enabled ? LOG_LVL_INFO : rcode == 2 ? 1 : 3;
   if (!logev_wanted(LOGC_QUERY_ERRORS, level)) return;
-  char qn[DNS_NAME_TEXT_SIZE], name[300] = "-", tn[32];
+  char qn[DNS_NAME_TEXT_SIZE], name[300] = "-", tn[32], cb[16];
   const char *tstr = "-";
   uint16_t qt = 0, qc = 0;
   size_t qend = 0;
@@ -126,7 +126,7 @@ static void qe_log_failure(const server_config_t *cfg, const uint8_t *req, size_
     if (qt == 251 || qt == 252) return;                    /* (xfer-out) */
     logev_name_text(qn, name, sizeof(name));
     tstr = format_type_name(qt, tn, sizeof(tn));
-    cls = qc == 1 ? "IN" : qc == 3 ? "CH" : qc == 255 ? "ANY" : "CLASS?";
+    cls = dns_class_text(qc, cb, sizeof(cb));
   }
   const char *reason = why ? why : t_qerr_ede[0] ? t_qerr_ede
                      : rcode == 1 ? "malformed query" : rcode == 2 ? "no answer could be made" : rcode == 5 ? "query refused"
@@ -178,6 +178,21 @@ static inline bool zone_query_permitted(const server_config_t *cfg, const zone_c
   if (!cfg || !cfg->acl_query_active) return true;
   return query_acl_permits_sa(cfg, zcfg, view_name, client_ip, t_qacl.client_valid ? &t_qacl.client : NULL, t_qacl.key,
                               t_qacl.local_valid ? &t_qacl.local : NULL);
+}
+
+/* UPDATE (RFC 2136 §3.3: the server's own policy): a client that allow-query does not let in may not update the zone either; the caller answers REFUSED
+ * with EDE 18 (RFC 8914 §4.19).  BIND checks allow-query for a primary zone before allow-update / update-policy (lib/ns/update.c checkqueryacl()) and
+ * logs `update 'z/IN' denied due to allow-query` in update-security, ERROR with an update ACL, INFO without.  allow-query-on is part of the check here,
+ * as for a query (a request must be allowed by both).  zone_class is IN: the engine serves IN only. */
+static bool qe_update_query_acl_denies(const server_config_t *cfg, const zone_config_t *zcfg, const char *view_name, const char *client_ip, const char *zone) {
+  if (zone_query_permitted(cfg, zcfg, view_name, client_ip)) return false;
+  if (logev_wanted(LOGC_UPDATE_SECURITY, LOG_LVL_ERROR)) {   /* (nothing passes ERROR: neither does INFO) */
+    char zn[512];
+    logev_name_text(zone, zn, sizeof(zn));
+    logev_post(LOGC_UPDATE_SECURITY, qe_update_acl_configured(cfg, zcfg, view_name) ? LOG_LVL_ERROR : LOG_LVL_INFO, client_ip, qe_client_port(),
+               "update '%s/IN' denied due to allow-query", zn);
+  }
+  return true;
 }
 
 program_plugin_t *g_program_plugins = NULL;
@@ -3390,9 +3405,12 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   edns_info_reset(&edns);
   edns.present = false;
   if (parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req, &edns) < 0) {
-    /* OPT 自体が使えない (所有者名が root でない、追加セクション以外、複数、RDATA 切れ): OPT なしの FORMERR */
+    /* OPT 自体が使えない (所有者名が root でない、追加セクション以外、複数、RDATA 切れ): OPT なしの FORMERR (RFC 6891 §6.1.1)。
+     * 質問は区切れれば写す (最初の1つ。区切れなければ dns_build_error_response() が QDCOUNT=0 にする): §7 の最小の応答はヘッダと質問で、
+     * BIND も質問を解析できたメッセージの FORMERR には質問を付ける。 */
     qe_why("the OPT record cannot be used (owner name, section, number or RDATA)");
-    return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, NULL, is_tcp, cfg);
+    return dns_build_error_response(req, req_len, res, max_res_len, 1, 0,
+                                    qdcount && !wire_question_name_compressed(req, req_len) ? 1 : 0, NULL, is_tcp, cfg);   /* (X-15: not a compressed name) */
   }
   edns.ede_count = 0; // 反射防止
   /* R-13: ecs-enable no のサーバーは ECS を実装していないものとして扱い、オプションを無視する
@@ -3530,6 +3548,9 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       } else if (!view || zclass != 1 || !domain_names_match_ci(not_ready_zone->name, current_qname)) {
         urc = 9;                                        // NOTAUTH
         qe_log_update_zone_error(client_ip, urc, current_qname);
+      } else if (qe_update_query_acl_denies(cfg, &zc, view->name, client_ip, not_ready_zone->name)) {
+        urc = 5;                                        // REFUSED: allow-query first, as for a zone in memory (a zone of the database is a primary)
+        add_ede(&edns, send_ede, 18, "Query refused due to access control");
       } else {
         bool uauth = zext(&zc)->upd_policy ? nr_tkey != NULL
                                            : (cfg && zone_update_acl_allows_in_view(cfg, &zc, view->name, client_ip, nr_tkey ? nr_tkey->name : NULL));
@@ -3578,13 +3599,14 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     if (opcode == 0 && qtype == 251 && !is_tcp && qdcount == 1 && domain_names_match_ci(not_ready_zone->name, current_qname)) {
       /* RFC 5936 §2.1.2, RFC 1995 §3: QCLASS is the class of the zone (IN): an IXFR of another class has no zone here, as for a zone in memory (below) */
       const size_t ix_qend = get_question_end_offset(req, req_len, 1);
-      if (ix_qend >= DNS_HEADER_SIZE + 5 && ((req[ix_qend - 2] << 8) | req[ix_qend - 1]) != 1) {
-        xfr_log_denied(client_ip, qe_client_port(), current_qname, 251, XD_NOZONE, 0);
+      const uint16_t ix_class = ix_qend >= DNS_HEADER_SIZE + 5 ? (uint16_t)((req[ix_qend - 2] << 8) | req[ix_qend - 1]) : 1;
+      if (ix_class != 1) {
+        xfr_log_denied(client_ip, qe_client_port(), current_qname, ix_class, 251, XD_NOZONE, 0);
         add_ede(&edns, send_ede, 20, "This server is not authoritative for the queried zone");
         return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
       }
       if (!udp_ixfr_allowed(cfg, &zc, view, client_ip, nr_tkey)) {
-        xfr_log_denied(client_ip, qe_client_port(), not_ready_zone->name, 251, XD_ACL, 0);
+        xfr_log_denied(client_ip, qe_client_port(), not_ready_zone->name, 1, 251, XD_ACL, 0);
         add_ede(&edns, send_ede, 18, "Query refused due to access control");
         return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
       }
@@ -3593,7 +3615,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       uint32_t cs = 0;
       const xfr_shape_t shape = xfr_request_shape(req, req_len, NULL, NULL, &cs);
       if (shape != XFR_SHAPE_OK) {
-        xfr_log_denied(client_ip, qe_client_port(), not_ready_zone->name, 251, XD_BAD_REQUEST, (uint32_t)shape);
+        xfr_log_denied(client_ip, qe_client_port(), not_ready_zone->name, 1, 251, XD_BAD_REQUEST, (uint32_t)shape);
         return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg);
       }
       const zdir_apex_t *iap = atomic_load_explicit(&not_ready_zone->apex, memory_order_acquire);
@@ -3764,6 +3786,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
        * ので、方針による拒否 (RFC 1035 §4.1.1 REFUSED) を返す。allow-update を満たしていても同じ。*/
       add_ede(&edns, send_ede, 18, "Updates are not accepted for a secondary zone");
       qe_log_update_secondary(client_ip, db_entry->domain);
+    } else if (qe_update_query_acl_denies(cfg, zone_cfg_any, view->name, client_ip, db_entry->domain)) {
+      add_ede(&edns, send_ede, 18, "Query refused due to access control");   /* (allow-query, before allow-update / update-policy) */
     } else if (auth) {
       qe_log_update_decision(client_ip, db_entry->domain, tkey ? tkey->name : NULL, true, cfg, zone_cfg_any, view->name);
       rcode = handle_dynamic_update(req, req_len, db_entry, client_ip, tkey ? tkey->name : "<none>");
@@ -3879,7 +3903,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
     // UDP経由(is_tcp == 0)でAXFR(252)を受信した場合はRFC 5936違反のためFORMERRを返す
     if (!is_tcp && qtype == 252) {
-      xfr_log_denied(client_ip, qe_client_port(), db_entry ? db_entry->domain : current_qname, 252, XD_UDP_AXFR, 0);
+      xfr_log_denied(client_ip, qe_client_port(), db_entry ? db_entry->domain : current_qname, qclass, 252, XD_UDP_AXFR, 0);
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg); // FORMERR
     }
 
@@ -3917,7 +3941,30 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   if (db_entry && view) {
     const zone_config_t *zcfg = zone_cfg_any;
-    if (zcfg && zcfg->type && strcasecmp(zcfg->type, "program") == 0) {
+    const bool fwd_zone = zcfg && zcfg->type && strcasecmp(zcfg->type, "forward") == 0;
+    const bool prog_zone = zcfg && zcfg->type && strcasecmp(zcfg->type, "program") == 0;
+    if ((qtype == 252 || qtype == 251) && (fwd_zone || prog_zone)) {
+      /* A transfer question for a program or forward zone: the TCP dispatch (dns_server_core.c) leaves these zones to this path, so the checks it makes
+       * on the request are made here, before anything is relayed.  A QCLASS other than IN has no zone (RFC 5936 §2.1.2, RFC 1995 §3; REFUSED, EDE 20, as
+       * the TCP dispatch and the UDP IXFR of a zone in memory answer it); a request that is not shaped like a transfer request is a FORMERR (RFC 5936
+       * §2.1, RFC 1995 §3, xfr_request_shape()).  A forward zone has no data to transfer: NOTIMP with EDE 21 (RFC 8914 §4.22), as for NOTIFY and UPDATE
+       * (docs/karidns.md) -- it used to be relayed to the forwarders over UDP.  A program zone's transfer goes to the plugin as before. */
+      if (qclass != 1) {
+        xfr_log_denied(client_ip, qe_client_port(), current_qname, qclass, qtype, XD_NOZONE, 0);
+        add_ede(&edns, send_ede, 20, "This server is not authoritative for the queried zone");
+        return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
+      }
+      const xfr_shape_t shape = xfr_request_shape(req, req_len, NULL, NULL, NULL);
+      if (shape != XFR_SHAPE_OK) {
+        xfr_log_denied(client_ip, qe_client_port(), db_entry->domain, 1, qtype, XD_BAD_REQUEST, (uint32_t)shape);
+        return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg);
+      }
+      if (fwd_zone) {
+        add_ede(&edns, send_ede, 21, "Zone transfers are not supported for this zone type");
+        return dns_build_error_response(req, req_len, res, max_res_len, 4, 0, 1, &edns, is_tcp, cfg);
+      }
+    }
+    if (prog_zone) {
       const rate_limit_config_t *rrl = zext(zcfg)->rrl.configured ? &zext(zcfg)->rrl : (cfg ? &cfg->rrl : NULL);
       if (!is_tcp && rrl && rrl->configured && rrl->early_drop) {
         struct sockaddr_storage ss;
@@ -3942,7 +3989,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       //  誘発できてしまい、RRLの存在意義そのものが破られる)。
       return plugin_result_len;
     }
-    if (zcfg && zcfg->type && strcasecmp(zcfg->type, "forward") == 0) {
+    if (fwd_zone) {
       int fwd_len = dispatch_forward_zone(zcfg, req, req_len, res, max_res_len);
       return add_opt_to_bare_passthrough(res, max_res_len, fwd_len, &edns, is_tcp, cfg);
     }
@@ -4041,14 +4088,14 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
      * classes were REFUSED above) has no zone: REFUSED, AA=0, EDE 20 as for a name this server is not authoritative for (R-06), before the ACL, as the TCP
      * dispatch refuses it.  BIND: "non-authoritative zone" (xfrout.c ns_xfr_start(), the zone is looked up in the views of that class). */
     if (qclass != 1) {
-      xfr_log_denied(client_ip, qe_client_port(), current_qname, 251, XD_NOZONE, 0);
+      xfr_log_denied(client_ip, qe_client_port(), current_qname, qclass, 251, XD_NOZONE, 0);
       add_ede(&edns, send_ede, 20, "This server is not authoritative for the queried zone");
       return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
     }
     /* allow-transfer applies to an IXFR over UDP as well (BIND xfrout.c ns_xfr_start() checks the transfer ACL first, whatever the transport): the one SOA of a
      * zone that is up to date, or the TC answer, are not for a client that may not transfer.  It used to be answered to anybody who may ask (allow-query). */
     if (!udp_ixfr_allowed(cfg, zone_cfg_any, view, client_ip, tsig && tsig->status == TSIG_REQ_VALID ? tsig->key : NULL)) {
-      xfr_log_denied(client_ip, qe_client_port(), db_entry->domain, 251, XD_ACL, 0);
+      xfr_log_denied(client_ip, qe_client_port(), db_entry->domain, 1, 251, XD_ACL, 0);
       add_ede(&edns, send_ede, 18, "Query refused due to access control");
       return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
     }
@@ -4057,7 +4104,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     uint32_t client_serial = 0;
     const xfr_shape_t shape = xfr_request_shape(req, req_len, NULL, NULL, &client_serial);
     if (shape != XFR_SHAPE_OK) {
-      xfr_log_denied(client_ip, qe_client_port(), db_entry->domain, 251, XD_BAD_REQUEST, (uint32_t)shape);
+      xfr_log_denied(client_ip, qe_client_port(), db_entry->domain, 1, 251, XD_BAD_REQUEST, (uint32_t)shape);
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg);
     }
 

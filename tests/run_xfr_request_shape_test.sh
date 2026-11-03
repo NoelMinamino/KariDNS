@@ -13,6 +13,11 @@
 #   - a transfer of a class other than IN (CH, ANY, NONE, HS; RFC 5936 §2.1.2: QCLASS is the class of the zone) has no zone: REFUSED, AA=0, before the ACL
 #     and the shape check, over TCP and for a UDP IXFR, for a zone in memory and one of the database that is not (nothing is fetched)
 #   - UDP IXFR (RFC 1995 §4.2) answers the same malformed requests with FORMERR
+#   - EDE (RFC 8914): 20 Not Authoritative for a zone or a class that is not here, 18 Prohibited for a client the ACL refuses, the same over TCP and UDP
+#   - a query with two OPT records (RFC 6891 §6.1.1): FORMERR without OPT, the question echoed, UDP and TCP
+#   - program and forward zones (answered by the query engine): the class and shape checks come before the plugin / the forwarders; a forward zone
+#     answers a transfer NOTIMP (EDE 21)
+#   - the log lines name the class of the request ('ax.test/CH')
 #   - the log of category xfer-out names the reason ("bad zone transfer request: malformed request, <why> (FORMERR)")
 #   - a zone of the database that is not in memory (D1a): the same FORMERR, and nothing is fetched for it (needs root; SKIP without it)
 # Uses tests/tsig_query.pl (core Perl only).
@@ -71,11 +76,17 @@ www IN A 192.0.2.2
 EOF
 sed 's/ax\.test/kz.test/g' "$T/ax.zone" > "$T/kz.zone"
 chmod 644 "$T"/*.zone
+PROG_USER_OPT=""
+[ "$(id -u)" = "0" ] && PROG_USER_OPT='program-user "nobody";'
+cp tests/plugins/dnstestscript.pl "$T/plugin.pl" && chmod 755 "$T/plugin.pl"
+CLOSED=$(kari_port 1 $((PORT + 1)))     # nothing listens there: the forwarder of fw.test
 cat > "$T/k.conf" <<EOF
-options { port $PORT; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT };
+options { port $PORT; bind-address { 127.0.0.1; }; pid-file "none"; allow-program-zones yes; $USER_OPT };
 key "k1" { algorithm hmac-sha256; secret "$SECRET"; };
 zone "ax.test" { type master; file "$T/ax.zone"; allow-transfer { 127.0.0.1; }; };
 zone "kz.test" { type master; file "$T/kz.zone"; allow-transfer { key "k1"; }; };
+zone "fw.test" { type forward; forwarders { 127.0.0.1 port $CLOSED; }; forward-timeout 500; };
+zone "pg.test" { type program; program "$T/plugin.pl"; $PROG_USER_OPT program-timeout 2000; };
 logging {
     channel xo { file "$T/logs/xfer.log"; severity debug 1; print-category yes; print-severity yes; };
     category xfer-out { xo; };
@@ -159,9 +170,41 @@ t "UDP: NSCOUNT 2 (one record)"                 "$FE1" --udp --name ax.test --ty
 t "UDP: the Authority record is an NS"          "$FE1" --udp --name ax.test --type IXFR --ixfr-serial 5 --auth-type 2
 t "UDP: no client SOA"                          "$FE1" --udp --name ax.test --type IXFR
 t "UDP: 16 octets after the request"            "$FE1" --udp --name ax.test --type IXFR --ixfr-serial 5 --trailing 16
-t "UDP: two OPT records (the query path's own FORMERR)" '^rcode=1 tc=0 aa=0 qd=[01] an=0 ns=0 ' --udp --name ax.test --type IXFR --ixfr-serial 5 --edns-version 0 --second-opt
+t "UDP: two OPT records (the query path's own FORMERR, the question echoed)" "$FE1" --udp --name ax.test --type IXFR --ixfr-serial 5 --edns-version 0 --second-opt
 t "UDP: malformed, the client may not transfer: REFUSED" '^rcode=5 ' --udp --name kz.test --type IXFR --ixfr-serial 5 --req-rcode 1
 t "UDP: good, the client may not transfer"      '^rcode=5 ' --udp --name kz.test --type IXFR --ixfr-serial 5
+
+echo "== EDE (RFC 8914): 20 Not Authoritative for a zone or a class that is not here, 18 Prohibited for a client the ACL refuses; TCP and UDP agree"
+EDE20='^rcode=5 tc=0 aa=0 qd=1 an=0 ns=0 ar=1 .* ede=20$'
+EDE18='^rcode=5 tc=0 aa=0 qd=1 an=0 ns=0 ar=1 .* ede=18$'
+t "TCP AXFR, no such zone: EDE 20"              "$EDE20" --name nx.test --type AXFR --edns-version 0 --show-ede
+t "TCP IXFR, no such zone: EDE 20"              "$EDE20" --name nx.test --type IXFR --ixfr-serial 1 --edns-version 0 --show-ede
+t "TCP AXFR of class CH: EDE 20"                "$EDE20" --name ax.test --type AXFR --class 3 --edns-version 0 --show-ede
+t "TCP IXFR of class ANY: EDE 20"               "$EDE20" --name ax.test --type IXFR --ixfr-serial 1 --class 255 --edns-version 0 --show-ede
+t "TCP AXFR, the client may not transfer: EDE 18" "$EDE18" --name kz.test --type AXFR --edns-version 0 --show-ede
+t "UDP IXFR of class CH: EDE 20"                "$EDE20" --udp --name ax.test --type IXFR --ixfr-serial 5 --class 3 --edns-version 0 --show-ede
+t "UDP IXFR, no such zone: EDE 20"              "$EDE20" --udp --name nx.test --type IXFR --ixfr-serial 5 --edns-version 0 --show-ede
+t "UDP IXFR, the client may not transfer: EDE 18" "$EDE18" --udp --name kz.test --type IXFR --ixfr-serial 5 --edns-version 0 --show-ede
+
+echo "== a query with two OPT records (RFC 6891 §6.1.1): FORMERR without OPT, the question echoed (§7: header and question)"
+t "UDP A query, two OPT records"                "$FE1" --udp --name www.ax.test --type A --edns-version 0 --second-opt
+t "TCP A query, two OPT records"                "$FE1" --name www.ax.test --type A --edns-version 0 --second-opt
+t "UDP SOA query, two OPT records, no such zone" "$FE1" --udp --name nx.test --type SOA --edns-version 0 --second-opt
+
+echo "== program and forward zones (answered by the query engine, not the transfer dispatch): the same checks of the request first"
+t "forward zone: AXFR is NOTIMP with EDE 21, not relayed" '^rcode=4 tc=0 aa=0 qd=1 an=0 ns=0 ar=1 .* ede=21$' --name fw.test --type AXFR --edns-version 0 --show-ede
+t "forward zone: IXFR is NOTIMP"                '^rcode=4 tc=0 aa=0 qd=1 an=0 ns=0 ' --name fw.test --type IXFR --ixfr-serial 1
+t "forward zone: UDP IXFR is NOTIMP"            '^rcode=4 tc=0 aa=0 qd=1 an=0 ns=0 ' --udp --name fw.test --type IXFR --ixfr-serial 1
+t "forward zone: a malformed AXFR is a FORMERR" "$FE1" --name fw.test --type AXFR --hdr-an 1
+t "forward zone: AXFR of class CH: REFUSED"     "$NA" --name fw.test --type AXFR --class 3
+t "forward zone: UDP IXFR of class ANY: REFUSED, EDE 20" "$EDE20" --udp --name fw.test --type IXFR --ixfr-serial 1 --class 255 --edns-version 0 --show-ede
+t "program zone: a malformed AXFR is a FORMERR (not given to the plugin)" "$FE1" --name pg.test --type AXFR --hdr-an 1
+t "program zone: AXFR with octets after it"     "$FE1" --name pg.test --type AXFR --trailing 16
+t "program zone: a malformed UDP IXFR is a FORMERR" "$FE1" --udp --name pg.test --type IXFR --ixfr-serial 1 --hdr-ns 2
+t "program zone: IXFR without the client's SOA" "$FE1" --name pg.test --type IXFR
+t "program zone: AXFR of class CH: REFUSED"     "$NA" --name pg.test --type AXFR --class 3
+t "program zone: UDP IXFR of class CH: REFUSED, EDE 20" "$EDE20" --udp --name pg.test --type IXFR --ixfr-serial 1 --class 3 --edns-version 0 --show-ede
+t "program zone: a good AXFR still goes to the plugin (not FORMERR / REFUSED)" '^rcode=[0234] ' --name pg.test --type AXFR
 
 echo "== the log of category xfer-out"
 lg() { i=0; while [ $i -lt 50 ]; do grep -q -- "$1" "$T/logs/xfer.log" 2>/dev/null && return 0; sleep 0.2; i=$((i + 1)); done; return 1; }
@@ -169,7 +212,14 @@ for why in "OPCODE is not QUERY" "RCODE is not NOERROR" "QDCOUNT is not 1" "ANCO
            "trailing octets after the last record" "request too long" "malformed or unexpected Additional record"; do
     lg "transfer of 'ax.test/IN': bad zone transfer request: malformed request, $why (FORMERR)" && pass "logged: $why" || fail "not logged: $why"
 done
-lg "transfer of 'ax.test/IN': bad zone transfer request: non-authoritative zone (REFUSED)" && pass "a transfer of another class is logged as a non-authoritative zone" || fail "a transfer of class CH was not logged as non-authoritative"
+for c in CH ANY NONE HS; do
+    lg "transfer of 'ax.test/$c': bad zone transfer request: non-authoritative zone (REFUSED)" && pass "a transfer of class $c is logged as a non-authoritative zone of class $c" || fail "the transfer of class $c was not logged as 'ax.test/$c'"
+done
+! grep -q "transfer of 'ax.test/IN': bad zone transfer request: non-authoritative" "$T/logs/xfer.log" && pass "no transfer of ax.test of another class is logged as IN" || fail "a transfer of another class was logged as 'ax.test/IN'"
+lg "transfer of 'nx.test/IN': bad zone transfer request: non-authoritative zone (REFUSED)" && pass "a zone that does not exist (class IN) is logged as IN" || fail "nx.test/IN not logged"
+lg "zone transfer 'kz.test/AXFR/IN' denied" && pass "the ACL refusal names the class (security)" || fail "no 'zone transfer 'kz.test/AXFR/IN' denied'"
+lg "transfer of 'fw.test/ANY': bad zone transfer request: non-authoritative zone (REFUSED)" && pass "forward zone: an IXFR of class ANY is logged with its class" || fail "fw.test/ANY not logged"
+lg "transfer of 'pg.test/IN': bad zone transfer request: malformed request, ANCOUNT is not 0 (FORMERR)" && pass "program zone: the malformed AXFR is logged" || fail "pg.test malformed AXFR not logged"
 ! grep -q "transfer of 'nx.test/IN': bad zone transfer request: malformed" "$T/logs/xfer.log" && pass "a malformed request for a zone that does not exist is logged as a refusal, not as malformed" || fail "nx.test was logged as malformed"
 if grep -qE "AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:" "$T/server.log"; then fail "sanitizer report in server.log"; tail -20 "$T/server.log"; else pass "no sanitizer report"; fi
 stop_srv
@@ -245,6 +295,8 @@ EOF
     t "DB: AXFR of class CH: REFUSED"                "$NA" --name a.test --type AXFR --class 3
     t "DB: IXFR of class ANY from an old serial: REFUSED" "$NA" --name a.test --type IXFR --ixfr-serial 1 --class 255
     t "DB: UDP IXFR of class CH from the current serial: REFUSED" "$NA" --udp --name a.test --type IXFR --ixfr-serial 5 --class 3
+    t "DB: AXFR of class CH: EDE 20, as for a zone in memory" "$EDE20" --name a.test --type AXFR --class 3 --edns-version 0 --show-ede
+    t "DB: UDP IXFR of class CH: EDE 20"             "$EDE20" --udp --name a.test --type IXFR --ixfr-serial 5 --class 3 --edns-version 0 --show-ede
     [ "$(issued)" = "$I0" ] && oom a.test && pass "nothing was fetched for them (issued=$I0), the zone is still out of memory" || fail "a malformed request made the server read the zone (issued $I0 -> $(issued))"
     t "DB: IXFR from the current serial: the one SOA, from the summary" '^rcode=0 tc=0 aa=1 qd=1 an=1 ns=0' --name a.test --type IXFR --ixfr-serial 5
     [ "$(issued)" = "$I0" ] && oom a.test && pass "the summary answered it, nothing was fetched" || fail "the good IXFR read the zone"

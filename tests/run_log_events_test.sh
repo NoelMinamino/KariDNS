@@ -81,6 +81,9 @@ zonefile "$W/pol.zone" pol.test 1
 zonefile "$W/x.zone" x.test 1
 zonefile "$W/deny.zone" deny.test 1
 zonefile "$W/key.zone" key.test 1
+zonefile "$W/aq.zone" aq.test 1
+zonefile "$W/aqn.zone" aqn.test 1
+zonefile "$W/aqok.zone" aqok.test 1
 
 chan() { # chan NAME FILE [SEVERITY]
     printf '    channel %s { file "%s"; severity %s; print-category yes; print-severity yes; };\n' "$1" "$2" "${3:-info}"
@@ -99,6 +102,9 @@ zone "u.test" { type primary; file "$W/u.zone"; allow-update { key upd; }; };
 zone "noacl.test" { type primary; file "$W/noacl.zone"; };
 zone "pol.test" { type primary; file "$W/pol.zone"; update-policy { grant upd zonesub A; }; };
 zone "sec.test" { type secondary; primaries { 127.0.0.1 port $P2; }; allow-update { key upd; }; };
+zone "aq.test" { type primary; file "$W/aq.zone"; allow-query { 192.0.2.1; }; allow-update { key upd; }; };
+zone "aqn.test" { type primary; file "$W/aqn.zone"; allow-query { 192.0.2.1; }; };
+zone "aqok.test" { type primary; file "$W/aqok.zone"; allow-query { 127.0.0.1; }; allow-update { key upd; }; };
 EOF
 "$KARIDNS" -f "$W/s1.conf" > "$W/s1.log" 2>&1 &
 PIDS="$PIDS $!"
@@ -126,6 +132,18 @@ has "U: the policy refusal names the record" "$LG/upd.log" "updating zone 'pol\.
 has "U: signer approved for the policy zone" "$LG/sec.log" 'signer "upd" approved'
 d pol.test A --update-add 'a3.pol.test 300 A 192.0.2.108' | grep -q "status: REFUSED" && pass "U: update-policy: an unsigned UPDATE is REFUSED" || fail "U: policy unsigned"
 has "U: policy zone, unsigned: update denied (error: a policy is an update ACL)" "$LG/sec.log" "update-security: error: client 127\.0\.0\.1#[0-9]*: update 'pol\.test/IN' denied"
+
+# allow-query applies to UPDATE, before allow-update / update-policy (BIND lib/ns/update.c checkqueryacl()): REFUSED, "denied due to allow-query"
+d aq.test A --update-add 'a1.aq.test 300 A 192.0.2.111' -y "$KEY" | grep -q "status: REFUSED" && pass "U: allow-query refuses a signed UPDATE that allow-update allows (UDP)" || fail "U: allow-query UDP"
+has "U: denied due to allow-query (error: the zone has an update ACL)" "$LG/sec.log" "update-security: error: client 127\.0\.0\.1#[0-9]*: update 'aq\.test/IN' denied due to allow-query"
+d aq.test A --update-add 'a2.aq.test 300 A 192.0.2.112' -y "$KEY" +tcp | grep -q "status: REFUSED" && pass "U: allow-query refuses the UPDATE over TCP as well" || fail "U: allow-query TCP"
+_i=0; while [ $_i -lt 30 ] && [ "$(count "update 'aq.test/IN' denied due to allow-query" "$LG/sec.log")" -lt 2 ]; do sleep 0.2; _i=$((_i + 1)); done
+[ "$(count "update 'aq.test/IN' denied due to allow-query" "$LG/sec.log")" -ge 2 ] && pass "U: the TCP refusal is logged too" || fail "U: TCP allow-query refusal not logged"
+d aqn.test A --update-add 'a1.aqn.test 300 A 192.0.2.113' | grep -q "status: REFUSED" && pass "U: allow-query refuses an UPDATE of a zone without an update ACL" || fail "U: allow-query, no update ACL"
+has "U: no update ACL: denied due to allow-query at info" "$LG/sec.log" "update-security: info: client 127\.0\.0\.1#[0-9]*: update 'aqn\.test/IN' denied due to allow-query"
+d aqok.test A --update-add 'a1.aqok.test 300 A 192.0.2.114' -y "$KEY" | grep -q "status: NOERROR" && pass "U: an UPDATE from a client allow-query lets in is applied" || fail "U: allow-query lets the client in"
+d a1.aqok.test A +short | grep -q '192\.0\.2\.114' && pass "U: the record is in aqok.test" || fail "U: no a1.aqok.test"
+hasnt "U: no allow-query refusal for aqok.test" "$LG/sec.log" "update 'aqok\.test/IN' denied"
 
 # the rate limit: a flood of refused UPDATEs
 N0=$(count "update 'u.test/IN' denied" "$LG/sec.log")
