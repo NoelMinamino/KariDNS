@@ -164,14 +164,6 @@ control-channel { socket "$T/ctl.sock"; secret "$S_CTL"; };
 EOF
 }
 
-wait_log() {   # wait_log LOG PATTERN SECONDS [COUNT]
-    i=0; want=${4:-1}
-    while [ $i -lt $(($3 * 10)) ]; do
-        [ "$(grep -c -- "$2" "$1" 2>/dev/null)" -ge "$want" ] && return 0
-        sleep 0.1; i=$((i + 1))
-    done
-    return 1
-}
 ans() { $DAG "$@" +short +nohexdump 2>/dev/null; }
 wait_ans() {   # wait_ans EXPECTED QNAME QTYPE [SECONDS]: S answers EXPECTED within SECONDS (default 15)
     i=0; max=$(( ${4:-15} * 10 ))
@@ -204,7 +196,7 @@ sleep 1
 write_sconf "$T/s.conf"
 "$KARIDNS" -c "$T/s.conf" -f > "$T/s.log" 2>&1 &
 SRV=$!
-if wait_log "$T/s.log" "\[DB\] initial load complete" 20; then pass "the startup batch is complete"; else fail "no 'initial load complete' line"; sed 's/^/         /' "$T/s.log" | tail -20; fi
+if kari_wait_log "$T/s.log" "\[DB\] initial load complete" 20; then pass "the startup batch is complete"; else fail "no 'initial load complete' line"; sed 's/^/         /' "$T/s.log" | tail -20; fi
 ./karicheck conf "$T/s.conf" > "$T/kc.out" 2>&1 && pass "karicheck conf accepts the configuration" || { fail "karicheck conf"; sed 's/^/         /' "$T/kc.out" | tail -5; }
 
 # ================================================================ initial transfers
@@ -323,7 +315,7 @@ sq "DELETE FROM domains WHERE name = 'del.test'"
 $KCTL reload > /dev/null 2>&1
 wait_rcode REFUSED del.test 15 && pass "del.test left with its row" || fail "del.test is still served"
 dbst del.test | grep -q "not in the database registry" && pass "dbstatus: del.test is not in the registry" || fail "dbstatus del.test"
-wait_log "$T/s.log" "zone 'del.test.' (view '[_a-z]*') deleted" 5 && pass "the deletion is logged" || fail "no deletion line in the log"
+kari_wait_log "$T/s.log" "zone 'del.test.' (view '[_a-z]*') deleted" 5 && pass "the deletion is logged" || fail "no deletion line in the log"
 
 # ================================================================ loader restart
 echo "== loader restart"
@@ -332,7 +324,7 @@ B0=$(grep -c "\[DB\] batch .* complete" "$T/s.log")
 LP=$(loader_pid)
 if [ -n "$LP" ]; then
     kill -9 "$LP"
-    wait_log "$T/s.log" "\[DB\] batch .* complete" 15 $((B0 + 1)) && pass "the restarted loader reconciled (a new batch)" || fail "no batch after the loader was killed"
+    kari_wait_log "$T/s.log" "\[DB\] batch .* complete" 15 $((B0 + 1)) && pass "the restarted loader reconciled (a new batch)" || fail "no batch after the loader was killed"
     sleep 3
     grep "\[DB\] batch .* complete" "$T/s.log" | tail -1 | grep -q "(0 installed" && pass "that batch sent nothing: 0 zones installed" || { fail "the batch after the restart"; grep "\[DB\] batch .* complete" "$T/s.log" | tail -2 | sed 's/^/         /'; }
     [ "$(transfers slv.test)" = "$t_slv" ] && [ "$(transfers recon.test)" = "$t_rec" ] && [ "$(transfers plain.test)" = "$t_plain" ] &&
@@ -350,7 +342,7 @@ SRV=""
 : > "$T/s2.log"
 "$KARIDNS" -c "$T/s.conf" -f > "$T/s2.log" 2>&1 &
 SRV=$!
-wait_log "$T/s2.log" "\[DB\] initial load complete" 20 && pass "the server restarted" || fail "restart"
+kari_wait_log "$T/s2.log" "\[DB\] initial load complete" 20 && pass "the server restarted" || fail "restart"
 wait_ans 192.0.2.10 www.slv.test A && pass "it is transferred again" || fail "slv.test after the restart"
 [ "$(ans new.slv.test A)" = "192.0.2.77" ] && pass "with the current data (the UPDATE of the primary included)" || fail "new.slv.test after the restart"
 

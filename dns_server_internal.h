@@ -1397,5 +1397,9 @@ extern _Atomic bool g_qlog_circuit_broken;
 extern resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
 extern _Atomic uint64_t g_resp_log_tail;
 extern _Atomic uint64_t g_resp_log_head;
+#ifdef KARIDNS_UNIT_TEST
+/* true: the logger threads and the control thread return (the unit tests stop them with it instead of pthread_cancel(), which TSan does not support) */
+extern _Atomic bool g_test_threads_stop;
+#endif
 
 #endif /* DNS_SERVER_INTERNAL_H */

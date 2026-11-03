@@ -462,6 +462,19 @@ const char *format_type_name(uint16_t type, char *buf, size_t buf_size) {
     return buf;
 }
 
+const char *dns_class_text(uint16_t qclass, char *buf, size_t buf_size) {
+    switch (qclass) {
+        case 1: return "IN";       /* RFC 1035 3.2.4 */
+        case 3: return "CH";
+        case 4: return "HS";
+        case 254: return "NONE";   /* RFC 2136 2.4 */
+        case 255: return "ANY";    /* RFC 1035 3.2.5 (QCLASS *) */
+        default:
+            snprintf(buf, buf_size, "CLASS%u", (unsigned)qclass);   /* RFC 3597 5 */
+            return buf;
+    }
+}
+
 const char *dns_rcode_name(unsigned rcode) {
   static const char *const names[] = {"NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED",
                                       "YXDOMAIN", "YXRRSET", "NXRRSET", "NOTAUTH", "NOTZONE"};

@@ -43,6 +43,8 @@ uint16_t get_type_code(const char *type_str);
 char *get_base_dir(const char *path);
 const char *format_type_name(uint16_t type, char *buf, size_t buf_size);
 const char *dns_type_to_string(uint16_t type_code);
+/* The mnemonic of a CLASS as BIND prints it in its logs (IN, CH, HS, NONE, ANY); CLASSnnn (RFC 3597 5) for the rest, written into buf (>= 12 bytes) */
+const char *dns_class_text(uint16_t qclass, char *buf, size_t buf_size);
 /* The mnemonic of an RCODE 0..10 (RFC 1035 4.1.1, RFC 2136 2.2, RFC 6895); "RCODE" for the rest */
 const char *dns_rcode_name(unsigned rcode);
 

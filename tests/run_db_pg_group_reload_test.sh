@@ -71,7 +71,8 @@ check_ans() { got=$(qa "$2"); [ "$got" = "$3" ] && pass "$1" || fail "$1 (got '$
 wait_log() {   # wait_log PATTERN SECONDS [COUNT]
     i=0; want=${3:-1}
     while [ $i -lt $(($2 * 10)) ]; do
-        [ "$(grep -Ec -- "$1" "$LOG" 2>/dev/null)" -ge "$want" ] && return 0
+        n=$(grep -Ec -- "$1" "$LOG" 2>/dev/null)     # (nothing for a missing file)
+        [ "${n:-0}" -ge "$want" ] && return 0
         sleep 0.1; i=$((i + 1))
     done
     return 1

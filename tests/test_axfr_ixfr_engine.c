@@ -908,6 +908,41 @@ static void test_send_axfr_response_ixfr_and_extended(void) {
     assert(g_tcp_out_len > 0);
     assert((g_tcp_out[2 + 3] & 0x0F) == 5);
 
+    // 5. A request that is not shaped like a transfer request (RFC 5936 2.1, RFC 1995 3) is a FORMERR and no transfer, for a zone that is there and for one
+    //    that is not (xfr_request_shape(); the TCP dispatch checks it too, this is the guard of a direct caller): a trailing octet, OPCODE NOTIFY, and a
+    //    QDCOUNT 0 request that has a question after the header (no question is echoed)
+    uint8_t req_bad[520];
+    memcpy(req_bad, req_std, s_off);
+    req_bad[s_off] = 0xAA;
+    for (int with_entry = 0; with_entry < 2; with_entry++) {
+        g_tcp_out_len = 0;
+        g_tcp_send_count = 0;
+        send_axfr_response(-1, "example.com.", req_bad, s_off + 1, NULL, with_entry ? &entry : NULL, NULL, 0, NULL, 0, NULL, false);
+        assert(g_tcp_send_count >= 1 && (g_tcp_out[2 + 3] & 0x0F) == 1 && g_tcp_out[2 + 5] == 1 && g_tcp_out[2 + 7] == 0);
+    }
+    memcpy(req_bad, req_std, s_off);
+    req_bad[2] = 0x20;                 // OPCODE 4 (NOTIFY)
+    g_tcp_out_len = 0;
+    send_axfr_response(-1, "example.com.", req_bad, s_off, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    assert((g_tcp_out[2 + 3] & 0x0F) == 1 && (g_tcp_out[2 + 2] & 0x78) == 0x20);
+    memcpy(req_bad, req_std, s_off);
+    req_bad[5] = 0;                    // QDCOUNT 0
+    g_tcp_out_len = 0;
+    send_axfr_response(-1, "example.com.", req_bad, s_off, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    assert((g_tcp_out[2 + 3] & 0x0F) == 1 && g_tcp_out[2 + 5] == 0 && g_tcp_out_len == 2 + 12);
+
+    // 6. RFC 5936 2.1.2: QCLASS is the class of the zone (IN): an AXFR of class CH or ANY has no zone, REFUSED with AA=0 and no transfer, the zone being there
+    const uint16_t bad_classes[] = { 3, 255 };
+    for (size_t k = 0; k < sizeof(bad_classes) / sizeof(bad_classes[0]); k++) {
+        memcpy(req_bad, req_std, s_off);
+        req_bad[s_off - 2] = (uint8_t)(bad_classes[k] >> 8);
+        req_bad[s_off - 1] = (uint8_t)(bad_classes[k] & 0xFF);
+        g_tcp_out_len = 0;
+        g_tcp_send_count = 0;
+        send_axfr_response(-1, "example.com.", req_bad, s_off, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+        assert(g_tcp_send_count >= 1 && g_tcp_out_len < 2 + 512 && (g_tcp_out[2 + 3] & 0x0F) == 5 && (g_tcp_out[2 + 2] & 0x04) == 0 && g_tcp_out[2 + 7] == 0);
+    }
+
     zone_arena_destroy(test_zone_slot(&entry, 0));
     pthread_mutex_destroy(&entry.writer_lock);
     pthread_mutex_destroy(&entry.ixfr_history.lock);
@@ -1304,6 +1339,7 @@ typedef struct {
     int nmsgs;
 } nr_reply_t;
 
+static bool g_nr_send_ede = true;
 /* run axfr_worker_thread for a request and read what the client gets */
 static void nr_run(nr_reply_t *out, const uint8_t *req, size_t req_len, uint16_t qtype, zone_db_entry_t *entry, zdir_elem_t *el,
                    zone_db_entry_t *(*aw)(zdir_elem_t *, const char *)) {
@@ -1312,6 +1348,7 @@ static void nr_run(nr_reply_t *out, const uint8_t *req, size_t req_len, uint16_t
     assert(rc == 0);
     axfr_worker_args_t *args = calloc(1, sizeof(axfr_worker_args_t));
     args->client_fd = sp[0];
+    args->send_ede = g_nr_send_ede;                     /* send-extended-errors (the dispatch copies it from the configuration) */
     strlcpy(args->client_ip, "127.0.0.1", sizeof(args->client_ip));
     args->client_port = 54321;
     strlcpy(args->qname, "nr.example.com.", sizeof(args->qname));
@@ -1450,6 +1487,13 @@ static void test_axfr_worker_zone_out_of_memory(void) {
     assert(atomic_load(&entry.active_axfr) == 0);
     g_nr_await_entry = NULL;
     zone_arena_destroy(test_zone_slot(&entry, 0));
+    /* send-extended-errors no: the same SERVFAIL without the EDE (and the summary's FORMERR still answered) */
+    g_nr_send_ede = false;
+    n = nr_request(req, sizeof(req), "nr.example.com.", 251, 4241, true, false);
+    nr_run(&rep, req, n, 251, NULL, el, nr_await_stub);
+    nr_parse(&rep, &serial, &expire, &ede);
+    assert(rep.nmsgs == 1 && (rep.msg[3] & 0x0F) == 2 && rep.msg[5] == 1 && rep.msg[11] == 1 && ede == -1);
+    g_nr_send_ede = true;
     pthread_mutex_destroy(&entry.writer_lock);
     pthread_mutex_destroy(&entry.ixfr_history.lock);
     free(apex);

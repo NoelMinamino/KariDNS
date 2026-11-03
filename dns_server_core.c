@@ -154,6 +154,19 @@ _Atomic int g_xfers_running = ATOMIC_VAR_INIT(0);
 _Atomic int g_tcp_clients = ATOMIC_VAR_INIT(0);
 _Atomic int g_tcp_high_water = ATOMIC_VAR_INIT(0);
 
+#ifdef KARIDNS_TEST_EVICT
+/* TEST ONLY (karidns-evict and the coverage build, never a production build): `karictl xfr-delay <ms>` makes the TCP zone transfer dispatch wait this
+ * long after it has read the zone's element, so that a test can take the zone out of memory or bring it in while a transfer request is being decided
+ * (run_db_park_test.sh).  0: no wait. */
+static _Atomic uint32_t g_test_xfr_delay_ms;
+static void xfr_test_delay(void) {
+  const uint32_t ms = atomic_load_explicit(&g_test_xfr_delay_ms, memory_order_relaxed);
+  if (ms == 0) return;
+  struct timespec ts = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000L };
+  nanosleep(&ts, NULL);
+}
+#endif
+
 #define response_log_enabled(cfg) ((cfg) && (cfg)->logging.responses_enabled)
 
 resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
@@ -1055,19 +1068,26 @@ void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct t
     klog_guard_leave(guard);
 }
 
-/* class and type of a logged query in the text BIND prints: IN / CH / ANY / CLASSn, and the type mnemonic */
+/* class and type of a logged query in the text BIND prints: IN / CH / HS / NONE / ANY / CLASSn, and the type mnemonic */
 static void query_log_class_type(uint16_t qclass, uint16_t qtype, char *class_str, size_t class_sz, char *type_buf, size_t type_sz,
                                  const char **type_str) {
-    if (qclass == 1) snprintf(class_str, class_sz, "IN");
-    else if (qclass == 255) snprintf(class_str, class_sz, "ANY");
-    else if (qclass == 3) snprintf(class_str, class_sz, "CH");
-    else snprintf(class_str, class_sz, "CLASS%d", qclass);
+    char cb[16];
+    snprintf(class_str, class_sz, "%s", dns_class_text(qclass, cb, sizeof(cb)));
     *type_str = format_type_name(qtype, type_buf, type_sz);
 }
 
+#ifdef KARIDNS_UNIT_TEST
+/* The unit tests stop the logger threads and the control thread with this flag and join them.  They used pthread_cancel(), which ThreadSanitizer does
+ * not support: the cancelled thread is never finished in its thread registry, and pthread_join() waits for ever. */
+_Atomic bool g_test_threads_stop;
+#define TEST_THREADS_STOPPING() atomic_load_explicit(&g_test_threads_stop, memory_order_acquire)
+#else
+#define TEST_THREADS_STOPPING() false
+#endif
+
 void *response_logger_thread_func(void *arg) {
     (void)arg;
-    while (1) {
+    while (!TEST_THREADS_STOPPING()) {
         uint64_t h = atomic_load_explicit(&g_resp_log_head, memory_order_relaxed);
         uint32_t idx = h & (RESP_LOG_RING_SIZE - 1);
 
@@ -1243,7 +1263,7 @@ void *query_logger_thread_func(void *arg) {
     uint64_t last_reported_dropped = 0;
     uint64_t last_reported_ev_dropped = 0;
 
-    while (1) {
+    while (!TEST_THREADS_STOPPING()) {
         rcu_slot_reader_enter(&g_query_logger_rcu_ctx);
         server_config_t *cfg = acquire_config_snapshot();
         bool enabled = cfg && cfg->logging.queries_enabled;
@@ -2853,26 +2873,41 @@ process_tcp_client: ;
               : NULL;
           zdir_elem_t *xfr_el = NULL;         /* D1a step 7: the database zone of the transfer when its data is not in memory (the thread waits for it) */
           zone_config_t xfr_nr_zc;            /* ... and its settings as the directory element keeps them (the ACL levels read them) */
-          if (xfr_view && (qtype == 252 || qtype == 251)) {
+          zone_db_entry_t *xfr_entry = NULL;  /* the zone of the transfer when its data is in memory */
+          if (xfr_view && (qtype == 252 || qtype == 251) && qclass != 1) {
+            /* RFC 5936 §2.1.2 (QCLASS: "the class of the zone requested"), RFC 1995 §3: every zone of KariDNS is of class IN, so a transfer of class CH,
+             * ANY or any other has no zone: it is answered as a zone this server is not authoritative for (REFUSED, AA=0, below), before the ACL and the
+             * shape of the request, and nothing is read.  BIND looks the zone up in the views of the request's class and answers "non-authoritative
+             * zone" (xfrout.c ns_xfr_start()) */
+            zcfg = NULL;
+          } else if (xfr_view && (qtype == 252 || qtype == 251)) {
+            /* The element of the zone is looked up once and its entry loaded once (one acquire): the memory cache (D1a) takes the data of a DB zone out of
+             * memory and brings it back at any moment, so the settings, the "not in memory" path and the zone that is transferred are all decided from this
+             * one reading.  (They were three readings: a zone evicted between them was answered "non-authoritative zone" (REFUSED), one that came into
+             * memory between them was refused as an ACL denial.)  The entry stays valid while it is used: the read section (rcu_reader_enter() above) and
+             * the snapshot this thread holds, which the transfer thread retains; an entry that was taken out of memory meanwhile is retired with that
+             * snapshot, and its version with it.  The exact name: a transfer is of the zone whose apex is the QNAME (RFC 5936 §2.1.1, RFC 1995 §3),
+             * never of a zone that encloses it. */
+            zdir_elem_t *xel = zdir_find_exact(xfr_view, qname);
+            xfr_entry = zdir_entry(xel);
+#ifdef KARIDNS_TEST_EVICT
+            xfr_test_delay();                /* TEST ONLY: the window between the reading and the decisions (run_db_park_test.sh) */
+#endif
             /* a DB zone has settings of its own (dbcfg), and a secondary may have settings received from its primary (B8t-2: rxcfg,
              * the zone's own statements first): the transfer checks below read them like a configured zone's */
-            zone_db_entry_t *xfr_entry = find_zone_exact_in_view(xfr_view, qname);
             if (xfr_entry && (!zcfg || xfr_entry->source == ZONE_SRC_DB || atomic_load_explicit(&xfr_entry->rxcfg, memory_order_acquire))) {
               const zone_config_t *ec = zone_entry_config(cfg, xfr_entry);
               if (ec) zcfg = ec;
-            } else if (!xfr_entry && !zcfg) {
+            } else if (!xfr_entry && !zcfg && xel) {
               /* a zone of the database that is in the directory without its data (memory-limit): the allow-transfer / TSIG checks below are made with the
                * settings the element kept, before anything is read for the transfer (the same order as allow-query for a parked query: a client that is
-               * refused costs no fetch) */
-              zdir_elem_t *nel = zdir_find_exact(xfr_view, qname);
-              if (nel && !zdir_entry(nel)) {
-                zone_ext_shared_t *nsh = atomic_load_explicit(&nel->sh, memory_order_acquire);
-                memset(&xfr_nr_zc, 0, sizeof(xfr_nr_zc));
-                xfr_nr_zc.domain = (char *)nel->name;
-                xfr_nr_zc.ext = nsh ? &nsh->ext : NULL;
-                zcfg = &xfr_nr_zc;
-                xfr_el = nel;
-              }
+               * refused costs no fetch).  If the data comes into memory meanwhile, the transfer thread finds it there (db_ingest_xfr_await()). */
+              zone_ext_shared_t *nsh = atomic_load_explicit(&xel->sh, memory_order_acquire);
+              memset(&xfr_nr_zc, 0, sizeof(xfr_nr_zc));
+              xfr_nr_zc.domain = (char *)xel->name;
+              xfr_nr_zc.ext = nsh ? &nsh->ext : NULL;
+              zcfg = &xfr_nr_zc;
+              xfr_el = xel;
             }
           }
           bool is_synthetic_zone = (zcfg && zcfg->type &&
@@ -2916,10 +2951,24 @@ process_tcp_client: ;
             static_assert(sizeof(tsig_mac) >= sizeof(tsig.mac), "tsig_mac must hold the request MAC");
             size_t tsig_mac_len = matched_key ? tsig.mac_len : 0;
             if (tsig_mac_len > 0) memcpy(tsig_mac, tsig.mac, tsig_mac_len);
-            zone_db_entry_t *entry = xfr_view ? find_zone_in_view(xfr_view, qname) : NULL;
-            if (entry) xfr_el = NULL;          /* (it came into memory meanwhile: the usual transfer) */
+            zone_db_entry_t *entry = xfr_entry;   /* (the one reading above; with xfr_el NULL whenever it is not) */
             int xfr_deny = 0;                  /* batch 14: why the request is not served after it was allowed (XD_*, dns_axfr_ixfr.h), for the log */
             uint32_t xfr_deny_limit = 0;
+            /* RFC 5936 §2.1 / RFC 1995 §3: a request that is not shaped like a transfer request (opcode, RCODE, the counts, the IXFR SOA, the Additional
+             * section, trailing octets: xfr_request_shape()) is a FORMERR and no transfer, whatever else is wrong with it.  The place is BIND's: after the TSIG
+             * (a request whose TSIG fails is NOTAUTH / FORMERR above; the FORMERR here is signed when the TSIG is good, RFC 8945 §5.3), the EDNS version and
+             * allow-transfer (BIND's ns_xfr_start() checks the ACL before the IXFR SOA), and before the transfer is started or a zone is read.  So it is seen
+             * only by a client that may transfer this zone: everybody else gets the REFUSED they got before, and the FORMERR tells nothing about a zone. */
+            bool shape_bad = false;
+            if (allowed && (entry || xfr_el)) {
+              const xfr_shape_t shape = xfr_request_shape(msg, msg_len, NULL, NULL, NULL);
+              if (shape != XFR_SHAPE_OK) {
+                shape_bad = true;
+                allowed = false;
+                xfr_deny = XD_BAD_REQUEST;
+                xfr_deny_limit = (uint32_t)shape;
+              }
+            }
             if (allowed && (entry || xfr_el)) {
               /* transfers-out and max-transfer-time-out / max-transfer-idle-out (BIND 9.20), read before the configuration is released */
               uint32_t out_limit = xfr_cfg_limit(cfg, XL_TRANSFERS_OUT);
@@ -2949,6 +2998,7 @@ process_tcp_client: ;
                   args->qtype = qtype;
                   args->has_edns = has_edns;
                   args->dnssec_ok = dnssec_ok;
+                  args->send_ede = cfg ? cfg->send_extended_errors : false;
                   args->req_len = msg_len > sizeof(args->req) ? sizeof(args->req) : msg_len;
                   memcpy(args->req, msg, args->req_len);
                   if (matched_key) {
@@ -3011,13 +3061,14 @@ process_tcp_client: ;
             if (!allowed || (!entry && !xfr_el)) {
               /* batch 14 (category xfer-out): the reason, first match: a quota or resource failure above, an EDNS version we do not speak (BADVERS), a TSIG
                * that cannot be parsed or does not verify, the transfer ACL, else the zone is not ours */
-              xfr_log_denied(ctx_tcp->client_ip, client_port, qname, qtype,
-                             xfr_deny ? xfr_deny : badvers ? XD_BADVERS : tsig.status == TSIG_REQ_FORMERR ? XD_TSIG_FORMERR
-                             : tsig.status == TSIG_REQ_ERROR ? XD_TSIG_NOTAUTH : (!zcfg && !entry && !xfr_el) ? XD_NOZONE : !allowed ? XD_ACL : XD_NOZONE,
-                             xfr_deny_limit);
+              const int deny = xfr_deny ? xfr_deny : badvers ? XD_BADVERS : tsig.status == TSIG_REQ_FORMERR ? XD_TSIG_FORMERR
+                             : tsig.status == TSIG_REQ_ERROR ? XD_TSIG_NOTAUTH : (!zcfg && !entry && !xfr_el) ? XD_NOZONE : !allowed ? XD_ACL : XD_NOZONE;
+              xfr_log_denied(ctx_tcp->client_ip, client_port, qname, qclass, qtype, deny, xfr_deny_limit);
               uint8_t res_buf[1024];
               uint8_t rcode = 5; /* REFUSED: 方針による拒否 (RFC 1035 §4.1.1、RFC 5936 §5)。AA=0 (R-06) */
+              uint16_t qd_echo = 1;
               int built;
+              const bool send_ede = cfg ? cfg->send_extended_errors : false;
               if (badvers) {
                 built = dns_build_badvers_response(msg, msg_len, res_buf, sizeof(res_buf), 1, &edns, true, cfg);
               } else {
@@ -3025,12 +3076,29 @@ process_tcp_client: ;
                   rcode = 1;       /* RFC 8945 §5.2: 解釈できない TSIG */
                 } else if (tsig.status == TSIG_REQ_ERROR) {
                   rcode = 9;       /* RFC 8945 §5.2.1-§5.2.4: TSIG のエラーは NOTAUTH */
-                  add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Invalid TSIG");
+                  add_ede(&edns, send_ede, 18, "Invalid TSIG");
+                } else if (shape_bad) {
+                  rcode = 1;       /* RFC 5936 §2.2.1 note e: a malformed request is a FORMERR */
+                } else if (deny == XD_QUOTA) {
+                  /* transfers-out: a refusal for the server's own reason, not a policy about the client, so not 18 Prohibited: 0 Other (RFC 8914 §4.1) */
+                  add_ede(&edns, send_ede, 0, "Too many zone transfers in progress");
+                } else if (deny == XD_NO_THREAD || deny == XD_NO_MEMORY) {
+                  /* an internal failure: 0 Other without a text, so the answer looks like any refusal and tells the client nothing about the server's
+                   * state; the reason is in the xfer-out log line above */
+                  add_ede(&edns, send_ede, 0, NULL);
+                } else if (deny == XD_NOZONE && xfr_view) {
+                  /* a zone this server is not authoritative for (also a QCLASS other than IN): EDE 20 Not Authoritative (RFC 8914 §4.21), as the UDP IXFR and a
+                   * query for such a name are answered (dns_query_engine.c); 18 Prohibited (§4.19) is for a client a policy refuses */
+                  add_ede(&edns, send_ede, 20, "This server is not authoritative for the queried zone");
+                } else if (deny == XD_NOZONE) {
+                  add_ede(&edns, send_ede, 18, "Query refused due to access control (no view matched)");
                 } else {
-                  add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Query refused due to access control");
+                  add_ede(&edns, send_ede, 18, "Query refused due to access control");
                 }
+                /* a FORMERR echoes the questions as BIND does (dns_error_qd_echo()) */
+                if (rcode == 1) qd_echo = dns_error_qd_echo(msg, msg_len);
                 /* 質問セクションまで (Rule 3)。TSIG なしの要求への応答は署名しない (RFC 8945 §5.3) */
-                built = dns_build_error_response(msg, msg_len, res_buf, sizeof(res_buf), rcode, 0, 1,
+                built = dns_build_error_response(msg, msg_len, res_buf, sizeof(res_buf), rcode, 0, qd_echo,
                                                  &edns, true, cfg);
               }
               int signed_len = tsig_finish_response(res_buf, (size_t)built, sizeof(res_buf), &tsig);
@@ -3846,7 +3914,7 @@ void *control_thread_func(void *arg) {
     usleep(1000);
 
   struct kevent ev_list[4];
-  while (1) {
+  while (!TEST_THREADS_STOPPING()) {   /* (the timer above wakes the loop every second) */
     int n = kevent(kq, NULL, 0, ev_list, 4, NULL);
     if (n < 0) {
       if (errno == EINTR)
@@ -4343,6 +4411,14 @@ void *control_thread_func(void *arg) {
               if (db_ingest_pick_view(view_arg, ev_view, sizeof(ev_view), ev_why, sizeof(ev_why)) && ev_view[0] && dbreg_test_evict(ev_view, arg))
                 (void)ctl_send_all(cfd, "OK\n", 3);
               else (void)ctl_send_all(cfd, "ERROR no such zone in memory\n", 29);
+            } else if (strcmp(cmd, "xfr-delay") == 0 && arg) {
+              /* TEST ONLY (as evict): the wait of the TCP zone transfer dispatch after it has read the zone (xfr_test_delay()), in ms, at most 10 s */
+              char *end = NULL;
+              unsigned long ms = strtoul(arg, &end, 10);
+              if (end && end != arg && *end == '\0' && ms <= 10000) {
+                atomic_store_explicit(&g_test_xfr_delay_ms, (uint32_t)ms, memory_order_relaxed);
+                (void)ctl_send_all(cfd, "OK\n", 3);
+              } else (void)ctl_send_all(cfd, "ERROR bad delay\n", 16);
 #endif
             } else if (strcmp(cmd, "dbstatus") == 0) {
               /* beta design 5.2: the loader, the batches and the DB zones of the registry */
@@ -4568,6 +4644,7 @@ void *control_thread_func(void *arg) {
       }
     }
   }
+  atomic_store_explicit(&g_control_kq, -1, memory_order_release);   /* (the workers trigger events on it: not on a closed, reused descriptor) */
   close(kq);
   pthread_exit(NULL);
 }

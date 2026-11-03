@@ -70,14 +70,6 @@ logging {
 zone "file.test" { type primary; file "$T/file.zone"; };
 EOF
 }
-wait_log() {   # wait_log LOG PATTERN SECONDS [COUNT]
-    i=0; want=${4:-1}
-    while [ $i -lt $(($3 * 10)) ]; do
-        [ "$(grep -c -- "$2" "$1" 2>/dev/null)" -ge "$want" ] && return 0
-        sleep 0.1; i=$((i + 1))
-    done
-    return 1
-}
 file_answers() { [ "$($DAG file.test SOA +short +nohexdump 2>/dev/null | head -1)" = "ns.file.test. host.file.test. 1 2 3 4 5" ]; }
 stop_srv() {
     kill -TERM "$SRV"
@@ -92,7 +84,7 @@ echo "== A: a message of the real loader"
 conf "$T/a.conf" "$T/karidns-dbloader"
 ./karidns -c "$T/a.conf" -f > "$T/a.log" 2>&1 &
 SRV=$!
-if wait_log "$DBLOG" "the SOA serial is 0" 15; then pass "the loader's warning is in the database log file"; else fail "no loader message in $DBLOG"; sed 's/^/         /' "$DBLOG" "$T/a.log" 2>/dev/null | tail -20; fi
+if kari_wait_log "$DBLOG" "the SOA serial is 0" 15; then pass "the loader's warning is in the database log file"; else fail "no loader message in $DBLOG"; sed 's/^/         /' "$DBLOG" "$T/a.log" 2>/dev/null | tail -20; fi
 grep -q "database: warning: \[DB\] zone 'zero.test.'" "$DBLOG" && pass "the line is 'database: warning: [DB] zone ...' (category, severity from the <N> priority, [DB] prefix)" || { fail "format of the loader line"; grep "SOA serial" "$DBLOG"; }
 N=$(grep -c "the SOA serial is 0" "$DBLOG")
 [ "$N" -eq 1 ] && pass "logged once" || fail "logged $N times"
@@ -123,7 +115,7 @@ conf "$T/b.conf" "$T/garbage.sh"
 T0=$(date +%s)
 ./karidns -c "$T/b.conf" -f > "$T/b.log" 2>&1 &
 SRV=$!
-wait_log "$DBLOG" "before the flood" 15 && pass "the first line arrived" || fail "no first line"
+kari_wait_log "$DBLOG" "before the flood" 15 && pass "the first line arrived" || fail "no first line"
 sleep 4
 file_answers && pass "the server answers while the loader floods" || fail "the file zone does not answer"
 T1=$(date +%s)
@@ -140,7 +132,7 @@ grep -q 'bytes: a\\x00b\\x1b\[31mred\\x0d tab\\x80' "$DBLOG" && pass "NUL, ESC, 
 grep -q "warning: \[DB\] CRLF line\$" "$DBLOG" && pass "CRLF ends a line without a stray CR" || fail "CRLF line"
 grep -q "unterminated" "$DBLOG" && fail "the unterminated line came before the end of the stream" || pass "a line without newline waits for the end of the stream"
 stop_srv
-wait_log "$DBLOG" "warning: \[DB\] unterminated\$" 5 && pass "the line without newline is logged when the loader is gone" || { fail "the unterminated line was lost"; tail -3 "$DBLOG"; }
+kari_wait_log "$DBLOG" "warning: \[DB\] unterminated\$" 5 && pass "the line without newline is logged when the loader is gone" || { fail "the unterminated line was lost"; tail -3 "$DBLOG"; }
 
 # ================================================================ C: restarts, no descriptor left
 echo "== C: restarts"
@@ -155,7 +147,7 @@ chown 0:0 "$T/short.sh"; chmod 755 "$T/short.sh"
 conf "$T/c.conf" "$T/short.sh"
 ./karidns -c "$T/c.conf" -f > "$T/c.log" 2>&1 &
 SRV=$!
-wait_log "$DBLOG" "short-lived loader" 30 4 && pass "the messages of four starts arrived (restart backoff 1, 2, 4 s)" || { fail "fewer than four starts logged"; grep -c "short-lived" "$DBLOG"; }
+kari_wait_log "$DBLOG" "short-lived loader" 30 4 && pass "the messages of four starts arrived (restart backoff 1, 2, 4 s)" || { fail "fewer than four starts logged"; grep -c "short-lived" "$DBLOG"; }
 MGR_FDS=$(procstat -f "$SRV" 2>/dev/null | awk '$3 ~ /^[0-9]+$/' | wc -l | tr -d ' ')
 [ "$MGR_FDS" -le 12 ] && pass "the manager holds $MGR_FDS descriptors after four restarts" || { fail "the manager holds $MGR_FDS descriptors"; procstat -f "$SRV" | head -30; }
 PIPES=$(procstat -f "$SRV" 2>/dev/null | awk '$4 == "p"' | wc -l | tr -d ' ')

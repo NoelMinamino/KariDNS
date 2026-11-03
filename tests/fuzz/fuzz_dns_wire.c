@@ -69,6 +69,24 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     memset(&edns, 0, sizeof(edns));
     parse_edns_opt(data, size, qdcount, ancount, nscount, arcount, &edns);
 
+    // 3b. xfr_request_shape(): what it accepts is a request the transfer code may read (RFC 5936 §2.1, RFC 1995 §3)
+    {
+        uint16_t xqt = 0;
+        size_t xqe = 0;
+        uint32_t xserial = 0;
+        if (xfr_request_shape(data, size, &xqt, &xqe, &xserial) == XFR_SHAPE_OK) {
+            if (xqt != 252 && xqt != 251) abort();
+            if (xqe < 12 + 1 + 4 || xqe > size) abort();
+            if (qdcount != 1 || ancount != 0 || (data[2] & 0xF8) != 0 || (data[3] & 0x0F) != 0) abort();
+            if (nscount != (xqt == 251 ? 1u : 0u) || arcount > 2) abort();
+            // the SOA of an IXFR is where the shape check read it
+            uint32_t again = 0;
+            if (xqt == 251 && (!ixfr_request_client_serial(data, size, xqe, &again) || again != xserial)) abort();
+            // a request cut anywhere is not a request (trailing or missing octets), and never read out of bounds
+            if (xfr_request_shape(data, size - 1, NULL, NULL, NULL) == XFR_SHAPE_OK) abort();
+        }
+    }
+
     // 4. Test serialize_dns_record
     if (size >= 16) {
         dns_record_t srec;

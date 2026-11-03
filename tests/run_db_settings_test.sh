@@ -175,14 +175,6 @@ EOF
 }
 for n in fany fdef fall; do mkzone "$n.test" 5; cp "$T/z/$n.test.zone" "$T/$n.zone"; done
 
-wait_log() {   # wait_log LOG PATTERN SECONDS [COUNT]
-    i=0; want=${4:-1}
-    while [ $i -lt $(($3 * 10)) ]; do
-        [ "$(grep -c -- "$2" "$1" 2>/dev/null)" -ge "$want" ] && return 0
-        sleep 0.1; i=$((i + 1))
-    done
-    return 1
-}
 dbst() { $KCTL dbstatus "$@" 2>&1; }
 
 # xfr ZONE SRC [KEY:SECRET]: success (0) when the transfer returns the zone's data
@@ -214,8 +206,8 @@ echo "== startup"
 conf "$T/k.conf" full
 "$KARIDNS" -c "$T/k.conf" -f > "$T/srv.log" 2>&1 &
 SRV=$!
-if wait_log "$T/srv.log" "\[DB\] initial load complete" 20; then pass "the startup batch is complete"; else fail "no 'initial load complete' line"; sed 's/^/         /' "$T/srv.log" | tail -20; fi
-wait_log "$T/srv.log" "Backend result for batch 1:" 15 && pass "batch 1 has its result" || fail "no result for batch 1"
+if kari_wait_log "$T/srv.log" "\[DB\] initial load complete" 20; then pass "the startup batch is complete"; else fail "no 'initial load complete' line"; sed 's/^/         /' "$T/srv.log" | tail -20; fi
+kari_wait_log "$T/srv.log" "Backend result for batch 1:" 15 && pass "batch 1 has its result" || fail "no result for batch 1"
 ./karicheck conf "$T/k.conf" > "$T/kc.out" 2>&1; RC=$?
 [ $RC -eq 0 ] && pass "karicheck conf accepts transfer-acl-match / update-acl-match and the ceiling" || { fail "karicheck conf: rc $RC"; sed 's/^/         /' "$T/kc.out" | tail -5; }
 grep -q "no acl-ceiling" "$T/kc.out" && fail "karicheck warns about a missing ceiling although one is set" || pass "karicheck: no 'no acl-ceiling' warning with a ceiling"
@@ -341,7 +333,7 @@ xfr_ok "addr.test before: from 127.0.0.2" addr.test 127.0.0.2
 conf "$T/k.conf" nokey
 OUT=$($KCTL reconfig 2>&1)
 printf '%s\n' "$OUT" | grep -q "^OK" && pass "reconfig without the key xfr: $OUT" || fail "reconfig: '$OUT'"
-wait_log "$T/srv.log" "naming a TSIG key that is not defined" 10 && pass "log: the settings were checked against the new configuration" || fail "no reload log line"
+kari_wait_log "$T/srv.log" "naming a TSIG key that is not defined" 10 && pass "log: the settings were checked against the new configuration" || fail "no reload log line"
 xfr_no "meta.test names the key xfr, which is gone: the ACL refuses even the listed address" meta.test 127.0.0.1
 OUT=$(dbst meta.test)
 printf '%s\n' "$OUT" | grep -q "settings error: the TSIG key 'xfr' is not defined in karidns.conf" && pass "dbstatus meta.test: settings error names the key" || { fail "dbstatus meta.test after the key went"; printf '%s\n' "$OUT" | sed 's/^/         /'; }
@@ -360,12 +352,12 @@ echo "== SIGHUP re-checks the settings too"
 HN=$(grep -c "with ACLs, [1-9][0-9]* naming a TSIG key" "$T/srv.log")
 conf "$T/k.conf" nokey
 kill -HUP "$SRV"
-wait_log "$T/srv.log" "with ACLs, [1-9][0-9]* naming a TSIG key" 10 $((HN + 1)) && pass "SIGHUP: the settings were checked against the new configuration" || fail "SIGHUP: no re-check line"
+kari_wait_log "$T/srv.log" "with ACLs, [1-9][0-9]* naming a TSIG key" 10 $((HN + 1)) && pass "SIGHUP: the settings were checked against the new configuration" || fail "SIGHUP: no re-check line"
 xfr_no "SIGHUP: meta.test refuses while the key xfr is gone" meta.test 127.0.0.1
 conf "$T/k.conf" full
 HZ=$(grep -c "with ACLs, 0 naming a TSIG key" "$T/srv.log")
 kill -HUP "$SRV"
-wait_log "$T/srv.log" "with ACLs, 0 naming a TSIG key" 10 $((HZ + 1)) && pass "SIGHUP with the key back: nothing names an undefined key" || fail "SIGHUP: no clean re-check line"
+kari_wait_log "$T/srv.log" "with ACLs, 0 naming a TSIG key" 10 $((HZ + 1)) && pass "SIGHUP with the key back: nothing names an undefined key" || fail "SIGHUP: no clean re-check line"
 xfr_ok "SIGHUP: meta.test works again" meta.test 127.0.0.1
 conf "$T/k.conf" narrow
 $KCTL reconfig > /dev/null 2>&1

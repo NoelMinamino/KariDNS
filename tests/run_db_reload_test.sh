@@ -131,14 +131,6 @@ zone "db5.test" { type primary; file "$T/db5_file.zone"; };
 zone "catalog.test" { type primary; file "$T/catalog.zone"; catalog-zone yes; };
 EOF
 }
-wait_log() {   # wait_log LOG PATTERN SECONDS [COUNT]
-    i=0; want=${4:-1}
-    while [ $i -lt $(($3 * 10)) ]; do
-        [ "$(grep -c -- "$2" "$1" 2>/dev/null)" -ge "$want" ] && return 0
-        sleep 0.1; i=$((i + 1))
-    done
-    return 1
-}
 loader_pid() { pgrep -P "$SRV" -f 'karidns-dbloader -s 3' | head -1; }
 ans() { $DAG "$@" +short +nohexdump 2>/dev/null; }
 check_ans() {   # check_ans DESCRIPTION EXPECTED QNAME QTYPE
@@ -149,7 +141,7 @@ dbst() { $KCTL dbstatus "$@" 2>&1; }
 BN=0                              # batches the loader process has sent so far
 next_batch() { BN=$((BN + 1)); }
 wait_batch() {   # wait_batch DESCRIPTION: the loader sent batch $BN and got the Backend's result
-    wait_log "$T/srv.log" "Backend result for batch $BN:" 15 && pass "$1: batch $BN done" || { fail "$1: no result for batch $BN"; tail -5 "$T/srv.log" | sed 's/^/         /'; }
+    kari_wait_log "$T/srv.log" "Backend result for batch $BN:" 15 && pass "$1: batch $BN done" || { fail "$1: no result for batch $BN"; tail -5 "$T/srv.log" | sed 's/^/         /'; }
 }
 batch_line() { grep "\[DB\] batch $BN (" "$T/srv.log" | tail -1 | sed 's/.* batch /batch /'; }
 expect_batch() {   # expect_batch DESCRIPTION READ SENT FAILED DELETED UNCHANGED
@@ -166,7 +158,7 @@ echo "== startup"
 conf "$T/k.conf"
 "$KARIDNS" -c "$T/k.conf" -f > "$T/srv.log" 2>&1 &
 SRV=$!
-if wait_log "$T/srv.log" "\[DB\] initial load complete" 20; then pass "the startup batch is complete"; else fail "no 'initial load complete' line"; sed 's/^/         /' "$T/srv.log" | tail -20; fi
+if kari_wait_log "$T/srv.log" "\[DB\] initial load complete" 20; then pass "the startup batch is complete"; else fail "no 'initial load complete' line"; sed 's/^/         /' "$T/srv.log" | tail -20; fi
 next_batch
 wait_batch "startup"
 expect_batch "startup" $NZ $NZ 0 0 0
@@ -304,7 +296,7 @@ SERIAL=1
 add_catalog_members db3.test db6.test
 OUT=$($KCTL reload catalog.test 2>&1)
 printf '%s\n' "$OUT" | grep -q "^OK reloaded$" && pass "the catalog zone was reloaded with two members" || fail "reload catalog.test: '$OUT'"
-wait_log "$T/srv.log" "zone db3.test. from the DB is hidden by a catalog member of the same name" 10 && pass "log: db3.test is hidden by the catalog member" || { fail "no 'hidden by a catalog member' line"; grep -i "catalog" "$T/srv.log" | tail -5 | sed 's/^/         /'; }
+kari_wait_log "$T/srv.log" "zone db3.test. from the DB is hidden by a catalog member of the same name" 10 && pass "log: db3.test is hidden by the catalog member" || { fail "no 'hidden by a catalog member' line"; grep -i "catalog" "$T/srv.log" | tail -5 | sed 's/^/         /'; }
 dbst db3.test | grep -q "status shadowed (hidden by a catalog member)" && pass "dbstatus db3.test: hidden by a catalog member" || { fail "dbstatus db3.test"; dbst db3.test | sed 's/^/         /'; }
 dbst | grep -q "hidden by catalog members" && pass "dbstatus summary counts it" || { fail "dbstatus summary"; dbst | sed 's/^/         /' | head -4; }
 [ "$(ans www.db3.test A)" != "192.0.2.30" ] && pass "www.db3.test no longer answers from the database" || fail "the database zone still answers behind the catalog member"
@@ -317,23 +309,23 @@ printf '%s\n' "$OUT" | grep -q "^OK zone db6.test. (view [_a-z]*): loaded, seria
 # the member of db3 goes away: the database zone comes back
 add_catalog_members db6.test
 OUT=$($KCTL reload catalog.test 2>&1)
-wait_log "$T/srv.log" "zone db3.test. (view '[_a-z]*') is served from the DB again: the catalog member is gone" 10 && pass "log: db3.test is served from the DB again" || fail "no 'served from the DB again' line"
+kari_wait_log "$T/srv.log" "zone db3.test. (view '[_a-z]*') is served from the DB again: the catalog member is gone" 10 && pass "log: db3.test is served from the DB again" || fail "no 'served from the DB again' line"
 check_ans "www.db3.test A answers from the database again" "192.0.2.30" www.db3.test A
 dbst db3.test | grep -q "serial 30, status applied" && pass "dbstatus db3.test: applied again" || fail "dbstatus db3.test after the member left"
 add_catalog_members
 OUT=$($KCTL reload catalog.test 2>&1)
-wait_log "$T/srv.log" "zone db6.test. (view '[_a-z]*') is served from the DB again: the catalog member is gone" 10 && pass "log: db6.test is served from the DB again" || fail "no 'served from the DB again' line for db6"
+kari_wait_log "$T/srv.log" "zone db6.test. (view '[_a-z]*') is served from the DB again: the catalog member is gone" 10 && pass "log: db6.test is served from the DB again" || fail "no 'served from the DB again' line for db6"
 check_ans "www.db6.test A answers from the database again" "192.0.2.60" www.db6.test A
 # a full reconfiguration lets the member win too (4.5): reconfig with the member present
 add_catalog_members db3.test
 $KCTL reload catalog.test > /dev/null 2>&1
-wait_log "$T/srv.log" "zone db3.test. from the DB is hidden by a catalog member of the same name" 10 2 && pass "hidden again" || fail "db3.test not hidden the second time"
+kari_wait_log "$T/srv.log" "zone db3.test. from the DB is hidden by a catalog member of the same name" 10 2 && pass "hidden again" || fail "db3.test not hidden the second time"
 OUT=$($KCTL reconfig 2>&1)
 printf '%s\n' "$OUT" | grep -q "^OK" && pass "reconfig with the member present: $OUT" || fail "reconfig: '$OUT'"
 dbst db3.test | grep -q "status shadowed (hidden by a catalog member)" && pass "still hidden after reconfig" || fail "dbstatus db3.test after reconfig"
 add_catalog_members
 $KCTL reload catalog.test > /dev/null 2>&1
-wait_log "$T/srv.log" "zone db3.test. (view '[_a-z]*') is served from the DB again: the catalog member is gone" 10 2 && pass "back again" || fail "db3.test did not come back"
+kari_wait_log "$T/srv.log" "zone db3.test. (view '[_a-z]*') is served from the DB again: the catalog member is gone" 10 2 && pass "back again" || fail "db3.test did not come back"
 
 # ================================================================ loader restart
 echo "== loader restart: nothing is sent again; a change made while the loader was down is"
@@ -345,14 +337,14 @@ while [ $i -lt 100 ]; do P2=$(loader_pid); [ -n "$P2" ] && [ "$P2" != "$LP" ] &&
 [ -n "$P2" ] && pass "the loader was restarted (pid $P2)" || fail "no restarted loader"
 BN=1
 NDB=$(sq "SELECT count(*) FROM domains")
-wait_log "$T/srv.log" "Backend result for batch 1:" 15 2 && pass "the restarted loader's startup batch is done" || fail "no result for the restarted loader's batch"
+kari_wait_log "$T/srv.log" "Backend result for batch 1:" 15 2 && pass "the restarted loader's startup batch is done" || fail "no result for the restarted loader's batch"
 expect_batch "restart (db1 changed while the loader was down)" $NDB 1 0 0 $((NDB - 1))
 check_ans "www.db1.test A has the address written while the loader was down" "192.0.2.12" www.db1.test A
 kill -9 "$P2"
 i=0; P3=""
 while [ $i -lt 100 ]; do P3=$(loader_pid); [ -n "$P3" ] && [ "$P3" != "$P2" ] && break; P3=""; sleep 0.1; i=$((i + 1)); done
 BN=1
-wait_log "$T/srv.log" "Backend result for batch 1:" 15 3 && pass "second restart: batch done" || fail "second restart: no result"
+kari_wait_log "$T/srv.log" "Backend result for batch 1:" 15 3 && pass "second restart: batch done" || fail "second restart: no result"
 l=$(grep "\[DB\] batch 1 (startup) sent" "$T/srv.log" | tail -1)
 case "$l" in *"$NDB zone(s) read, 0 sent, 0 failed in the loader, 0 deleted, $NDB unchanged"*) pass "second restart: $NDB zones read, none sent" ;; *) fail "second restart: '$l'" ;; esac
 

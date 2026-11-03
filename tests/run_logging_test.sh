@@ -96,8 +96,9 @@ ctlblock() { printf 'control-channel { socket "%s/%s.sock"; algorithm hmac-sha25
 zone() { # zone FILE ORIGIN SERIAL
     printf '$TTL 300\n$ORIGIN %s.\n@ IN SOA ns1 hostmaster %s 2 1 3600 60\n@ IN NS ns1\nns1 IN A 192.0.2.1\nwww IN A 192.0.2.10\n' "$2" "$3" > "$1"
 }
-size_of() { if [ -f "$1" ]; then wc -c < "$1" | tr -d ' '; else echo 0; fi; }
-lines_of() { if [ -f "$1" ]; then wc -l < "$1" | tr -d ' '; else echo 0; fi; }
+# (a file the server is rolling can go between the -f and the read: wc prints nothing then, and an empty number is "[: : bad number")
+size_of() { _sz=$(wc -c 2>/dev/null < "$1" | tr -d ' '); echo "${_sz:-0}"; }
+lines_of() { _ln=$(wc -l 2>/dev/null < "$1" | tr -d ' '); echo "${_ln:-0}"; }
 query() { # query PORT NAME [dag args]
     _p=$1; _n=$2; shift 2
     "$DAG" @127.0.0.1 -p "$_p" "$_n" A +short +nohexdump +time=1 +tries=1 "$@" >/dev/null 2>&1

@@ -469,6 +469,7 @@ register_test "core" "sh" "tests/run_manager_signal_race_test.sh" "Manager ends 
 register_test "core" "sh" "tests/run_tinydns_reload_test.sh" "karictl reload of a tinydns zone inside the sandbox, SOA serial from the file mtime (X-13)"
 register_test "core" "sh" "tests/run_cname_child_zone_test.sh" "CNAME/DNAME into a child zone on the same server answered from the child (X-27)"
 register_test "core" "sh" "tests/run_xfr_badvers_test.sh" "AXFR/IXFR with an unsupported EDNS version get BADVERS, signed when the TSIG is valid (X-28)"
+register_test "core" "sh" "tests/run_xfr_request_shape_test.sh" "A malformed AXFR/IXFR request (OPCODE, RCODE, QDCOUNT, ANCOUNT, NSCOUNT, the IXFR SOA, Additional section, trailing octets) is a FORMERR with no transfer, over TCP and UDP IXFR, after the TSIG and the ACL (a client that may not transfer still gets REFUSED; signed FORMERR), reason in the xfer-out log; a database zone out of memory is not read for it (root for the database part; RFC 5936 2.1, RFC 1995 3)"
 register_test "core" "sh" "tests/run_compressed_qname_test.sh" "Compression pointer in the question name -> FORMERR (X-15)"
 register_test "core" "sh" "tests/run_rrl_slip_tsig_test.sh" "RRL slip answers to TSIG-signed queries are signed (X-20)"
 register_test "core" "sh" "tests/run_view_same_zone_test.sh" "Same zone name in two views: data, glue and program plugin per view (R-26, O-12)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time

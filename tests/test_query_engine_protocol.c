@@ -1185,12 +1185,21 @@ static void test_response_header_and_error_builder(void) {
     check_hdr(&r, &q, 1, false, true);
     CHECK(&r, gr_count(&r, 3, 41) == 1 && !gr_has_option(&r, 10));
 
-    /* OPT itself unusable (owner is not the root): FORMERR without OPT, QDCOUNT 0 */
+    /* OPT itself unusable (owner is not the root): FORMERR without OPT (RFC 6891 §6.1.1), the question echoed (§7: header and question, as BIND
+     * answers a message whose question it could parse); "www.example." IN A is 17 octets */
     put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 1); put_question(&q, "www.example.", 1, 1);
     put_name(&q, "x."); put16(&q, 41); put16(&q, 4096); put32(&q, 0); put16(&q, 0);
     ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
     check_hdr(&r, &q, 1, false, true);
-    CHECK(&r, r.counts[2] == 0 && r.len == DNS_HEADER_SIZE);
+    CHECK(&r, r.counts[2] == 0 && r.len == DNS_HEADER_SIZE + 17);
+    /* two OPT records (RFC 6891 §6.1.1: FORMERR), on UDP and TCP: the same */
+    for (int tcp = 0; tcp < 2; tcp++) {
+        put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 2); put_question(&q, "www.example.", 1, 1);
+        put_opt(&q, 0, 0, 0, NULL, 0); put_opt(&q, 0, 0, 0, NULL, 0);
+        ask(&q, "www.example.", 1, "192.0.2.100", tcp != 0, &r);
+        check_hdr(&r, &q, 1, false, true);
+        CHECK(&r, r.counts[2] == 0 && r.len == DNS_HEADER_SIZE + 17);
+    }
 
     /* Unknown opcode with an answer record in the request: NOTIMP, EDE 21, only question + OPT returned */
     put_hdr(&q, 0x4592, (uint16_t)((2 << 11) | HDR_FLAGS_ALL), 1, 1, 0, 1); put_question(&q, "www.example.", 1, 1);

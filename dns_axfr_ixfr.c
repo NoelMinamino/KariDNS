@@ -399,17 +399,21 @@ static const char *xfr_rcode_name(unsigned rcode) { return dns_rcode_name(rcode)
  * The transfer thread has no ring and logs at once (logev_post() routes it); a TCP worker or the UDP path of the engine puts a record into its ring.
  * Levels follow BIND: started / ended / fallback to AXFR info, refusals and bad requests info or error, an up-to-date poll debug 1, provide-ixfr no debug 4. */
 
-static void xfr_log(int level, const char *client_ip, int client_port, const char *domain, const char *fmt, ...) __attribute__((format(printf, 5, 6)));
-static void xfr_log(int level, const char *client_ip, int client_port, const char *domain, const char *fmt, ...) {
+/* qclass: the class of the request (every zone here is IN, but a request of another class is refused and logged with its own class, as BIND names the
+ * class of the view it looked in) */
+static void xfr_log_c(int level, const char *client_ip, int client_port, const char *domain, uint16_t qclass, const char *fmt, ...) __attribute__((format(printf, 6, 7)));
+static void xfr_log_c(int level, const char *client_ip, int client_port, const char *domain, uint16_t qclass, const char *fmt, ...) {
   if (!logev_wanted(LOGC_XFER_OUT, level)) return;
-  char zn[300], txt[200];
+  char zn[300], txt[200], cb[16];
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(txt, sizeof(txt), fmt, ap);
   va_end(ap);
   logev_name_text(domain, zn, sizeof(zn));
-  logev_post(LOGC_XFER_OUT, level, client_ip, client_port, "transfer of '%s/IN': %s", zn, txt);
+  logev_post(LOGC_XFER_OUT, level, client_ip, client_port, "transfer of '%s/%s': %s", zn, dns_class_text(qclass, cb, sizeof(cb)), txt);
 }
+/* a transfer that runs is always of a zone of class IN */
+#define xfr_log(level, client_ip, client_port, domain, ...) xfr_log_c(level, client_ip, client_port, domain, 1, __VA_ARGS__)
 
 /* the client of a connection as text; the port (0: not an IP address) */
 static int xfr_client_text(const struct sockaddr_storage *a, char *ip, size_t n) {
@@ -428,27 +432,32 @@ static int xfr_client_text(const struct sockaddr_storage *a, char *ip, size_t n)
   return 0;
 }
 
-void xfr_log_denied(const char *client_ip, int client_port, const char *zone, uint16_t qtype, int why, uint32_t limit) {
+void xfr_log_denied(const char *client_ip, int client_port, const char *zone, uint16_t qclass, uint16_t qtype, int why, uint32_t limit) {
   const char *mn = qtype == 251 ? "IXFR" : "AXFR";
+  const char *ip = client_ip;
+  const int port = client_port;
+  /* every line names the class of the request (qclass), not IN: a refused request of class CH is logged as 'z/CH' */
   switch (why) {
     case XD_ACL:                       /* lib/ns/client.c ns_client_checkacl(): "zone transfer 'z/AXFR/IN' denied", ERROR, category security */
       if (logev_wanted(LOGC_XFER_OUT, LOG_LVL_ERROR)) {
-        char zn[300];
+        char zn[300], cb[16];
         logev_name_text(zone, zn, sizeof(zn));
-        logev_post(LOGC_SECURITY, LOG_LVL_ERROR, client_ip, client_port, "zone transfer '%s/%s/IN' denied", zn, mn);
+        logev_post(LOGC_SECURITY, LOG_LVL_ERROR, ip, port, "zone transfer '%s/%s/%s' denied", zn, mn, dns_class_text(qclass, cb, sizeof(cb)));
       }
       break;
-    case XD_NOZONE: xfr_log(LOG_LVL_INFO, client_ip, client_port, zone, "bad zone transfer request: non-authoritative zone (REFUSED)"); break;
-    case XD_TSIG_FORMERR: xfr_log(LOG_LVL_INFO, client_ip, client_port, zone, "bad zone transfer request: the TSIG record cannot be parsed (FORMERR)"); break;
-    case XD_TSIG_NOTAUTH: xfr_log(LOG_LVL_INFO, client_ip, client_port, zone, "bad zone transfer request: TSIG verification failed (NOTAUTH)"); break;
-    case XD_BADVERS: xfr_log(LOG_LVL_INFO, client_ip, client_port, zone, "bad zone transfer request: unsupported EDNS version (BADVERS)"); break;
+    case XD_NOZONE: xfr_log_c(LOG_LVL_INFO, ip, port, zone, qclass, "bad zone transfer request: non-authoritative zone (REFUSED)"); break;
+    case XD_TSIG_FORMERR: xfr_log_c(LOG_LVL_INFO, ip, port, zone, qclass, "bad zone transfer request: the TSIG record cannot be parsed (FORMERR)"); break;
+    case XD_TSIG_NOTAUTH: xfr_log_c(LOG_LVL_INFO, ip, port, zone, qclass, "bad zone transfer request: TSIG verification failed (NOTAUTH)"); break;
+    case XD_BADVERS: xfr_log_c(LOG_LVL_INFO, ip, port, zone, qclass, "bad zone transfer request: unsupported EDNS version (BADVERS)"); break;
     case XD_QUOTA:                     /* xfrout.c: "%s request denied: %s", WARNING */
-      xfr_log(LOG_LVL_WARNING, client_ip, client_port, zone, "%s request denied: quota reached (transfers-out %u)", mn, (unsigned)limit);
+      xfr_log_c(LOG_LVL_WARNING, ip, port, zone, qclass, "%s request denied: quota reached (transfers-out %u)", mn, (unsigned)limit);
       break;
-    case XD_NO_THREAD: xfr_log(LOG_LVL_ERROR, client_ip, client_port, zone, "%s request denied: cannot start a thread for the transfer", mn); break;
-    case XD_NO_MEMORY: xfr_log(LOG_LVL_ERROR, client_ip, client_port, zone, "%s request denied: out of memory", mn); break;
-    case XD_IXFR_NO_SOA: xfr_log(LOG_LVL_INFO, client_ip, client_port, zone, "bad zone transfer request: IXFR request missing SOA (FORMERR)"); break;
-    case XD_UDP_AXFR: xfr_log(LOG_LVL_INFO, client_ip, client_port, zone, "bad zone transfer request: attempted AXFR over UDP (FORMERR)"); break;
+    case XD_NO_THREAD: xfr_log_c(LOG_LVL_ERROR, ip, port, zone, qclass, "%s request denied: cannot start a thread for the transfer", mn); break;
+    case XD_NO_MEMORY: xfr_log_c(LOG_LVL_ERROR, ip, port, zone, qclass, "%s request denied: out of memory", mn); break;
+    case XD_UDP_AXFR: xfr_log_c(LOG_LVL_INFO, ip, port, zone, qclass, "bad zone transfer request: attempted AXFR over UDP (FORMERR)"); break;
+    case XD_BAD_REQUEST:               /* RFC 5936 2.1, RFC 1995 3: the request is not shaped like a transfer request (xfr_request_shape()); `limit` is the reason */
+      xfr_log_c(LOG_LVL_INFO, ip, port, zone, qclass, "bad zone transfer request: malformed request, %s (FORMERR)", xfr_shape_text((xfr_shape_t)limit));
+      break;
     default: break;
   }
 }
@@ -1927,10 +1936,11 @@ static int axfr_emit_zone_record(axfr_emit_ctx_t *ec, const dns_record_t *rec_it
 }
 
 /* 転送要求への1通だけのエラー応答 (RFC 5936 §2.2: 質問セクションを写し、それで転送を終える)。
- * 質問セクションまでで切り (Rule 3)、要求に OPT があれば OPT と EDE を付け (RFC 6891 §6.1.1)、
- * 検証できた TSIG があれば同じ鍵で署名する (RFC 8945 §5.3)。aa は応答の AA ビット。 */
+ * 質問セクションまで (写す数は BIND と同じ: dns_error_qd_echo()) で切り (Rule 3)、要求に OPT があれば OPT と、send_ede (send-extended-errors) なら
+ * EDE を付け (RFC 6891 §6.1.1、RFC 8914)、検証できた TSIG があれば同じ鍵で署名する (RFC 8945 §5.3)。aa は応答の AA ビット。
+ * ede_code 0xFFFF は EDE なし、ede_text NULL は EXTRA-TEXT なし。 */
 static void axfr_send_error(int client_fd, const uint8_t *req, uint16_t req_len, uint8_t rcode, bool aa,
-                            uint16_t ede_code, const char *ede_text,
+                            bool send_ede, uint16_t ede_code, const char *ede_text,
                             tsig_key_t *tsig_key, const uint8_t *req_mac, size_t req_mac_len,
                             const struct sockaddr_storage *client_addr, socklen_t client_len,
                             const struct sockaddr_storage *server_addr, bool has_server_addr) {
@@ -1941,8 +1951,8 @@ static void axfr_send_error(int client_fd, const uint8_t *req, uint16_t req_len,
                                 (uint16_t)((req[8] << 8) | req[9]), (uint16_t)((req[10] << 8) | req[11]),
                                 &req_edns_r) == 0 && req_edns_r.present;
   req_edns_r.ede_count = 0;
-  if (edns_ok && ede_code != 0xFFFF) add_ede(&req_edns_r, true, ede_code, ede_text);
-  int built = dns_build_error_response(req, req_len, res_buf, sizeof(res_buf), rcode, 0, 1,
+  if (edns_ok && ede_code != 0xFFFF) add_ede(&req_edns_r, send_ede, ede_code, ede_text);
+  int built = dns_build_error_response(req, req_len, res_buf, sizeof(res_buf), rcode, 0, dns_error_qd_echo(req, req_len),
                                        edns_ok ? &req_edns_r : NULL, true, NULL);
   if (built <= 0) return;
   if (aa) res_buf[2] |= 0x04;
@@ -2173,10 +2183,28 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
                         const struct sockaddr_storage *server_addr, bool has_server_addr) {
   char cip[INET6_ADDRSTRLEN];
   const int cport = xfr_client_text(client_addr, cip, sizeof(cip));
-  if (!entry) {
-    xfr_log_denied(cip, cport, qname, 252, XD_NOZONE, 0);
-    /* 権威を持たないゾーンへの転送要求: REFUSED、AA=0 (R-06) */
-    axfr_send_error(client_fd, req, req_len, 5, false, 0xFFFF, NULL, tsig_key, req_mac, req_mac_len,
+  /* send-extended-errors for the error answers below (the caller is in a read section, axfr_worker_thread(); with no configuration the default, yes) */
+  const server_config_t *ecfg = acquire_config_snapshot();
+  const bool send_ede = ecfg ? ecfg->send_extended_errors : true;
+  /* RFC 5936 §2.1, RFC 1995 §3: a request that is not shaped like a transfer request is answered with FORMERR and no transfer.  The TCP dispatch has
+   * checked it already; this keeps a direct caller from reading a question or a serial the request does not have. */
+  uint16_t qtype = 0;
+  size_t q_offset = 0;
+  uint32_t client_serial = 0;
+  const xfr_shape_t shape = xfr_request_shape(req, req_len, &qtype, &q_offset, &client_serial);
+  if (shape != XFR_SHAPE_OK) {
+    xfr_log_denied(cip, cport, entry ? entry->domain : qname, 1, 252, XD_BAD_REQUEST, (uint32_t)shape);
+    axfr_send_error(client_fd, req, req_len, 1, false, send_ede, 0xFFFF, NULL, tsig_key, req_mac, req_mac_len,
+                    client_addr, client_len, server_addr, has_server_addr);
+    return;
+  }
+  /* RFC 5936 §2.1.2, RFC 1995 §3: QCLASS is the class of the zone, and every zone here is IN; a transfer of another class has no zone (the TCP dispatch has
+   * answered it already: this is for a direct caller) */
+  const uint16_t req_class = (uint16_t)((req[q_offset - 2] << 8) | req[q_offset - 1]);
+  if (!entry || req_class != 1) {
+    xfr_log_denied(cip, cport, qname, req_class, qtype, XD_NOZONE, 0);
+    /* 権威を持たないゾーンへの転送要求: REFUSED、AA=0 (R-06)、EDE 20 Not Authoritative (RFC 8914 §4.21)、UDP と TCP の受付と同じ */
+    axfr_send_error(client_fd, req, req_len, 5, false, send_ede, 20, "This server is not authoritative for the queried zone", tsig_key, req_mac, req_mac_len,
                     client_addr, client_len, server_addr, has_server_addr);
     return;
   }
@@ -2189,39 +2217,24 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
     /* X-19: まだデータの無いゾーン (未転送のセカンダリなど)。何も送らないとクライアントは
      * タイムアウトまで待つので、SERVFAIL と EDE 14 Not Ready (RFC 8914 §4.15) で終える。 */
     xfr_log(LOG_LVL_WARNING, cip, cport, entry->domain, "request denied: the zone has no data yet (SERVFAIL, Not Ready)");
-    axfr_send_error(client_fd, req, req_len, 2, false, 14, "Zone not loaded", tsig_key, req_mac, req_mac_len,
+    axfr_send_error(client_fd, req, req_len, 2, false, send_ede, 14, "Zone not loaded", tsig_key, req_mac, req_mac_len,
                     client_addr, client_len, server_addr, has_server_addr);
     return;
   }
 
   uint8_t *res = calloc(1, 65535);
   if (!res) {
+    /* no buffer for the transfer: refused as the TCP dispatch refuses it for want of memory (REFUSED, EDE 0 without a text, the reason only in the log),
+     * not dropped */
+    xfr_log_denied(cip, cport, entry->domain, req_class, qtype, XD_NO_MEMORY, 0);
+    axfr_send_error(client_fd, req, req_len, 5, false, send_ede, 0, NULL, tsig_key, req_mac, req_mac_len, client_addr, client_len, server_addr,
+                    has_server_addr);
     return;
   }
-  size_t q_offset = DNS_HEADER_SIZE;
-  if (skip_wire_name(req, req_len, q_offset, &q_offset) != 0) {
-      free(res);
-      return;
-  }
-  if (q_offset + 4 > req_len) {
-    q_offset = req_len;
-  } else {
-    q_offset += 4;
-  }
-  uint16_t qtype = (q_offset >= 4) ? ((req[q_offset - 4] << 8) | req[q_offset - 3]) : 0;
   bool is_ixfr = (qtype == 251);
   const bool ixfr_asked = is_ixfr;        /* (is_ixfr says "answer incrementally" below, and goes false for an AXFR-style answer) */
-  uint32_t client_serial = 0;
-  /* RFC 1995 §3: IXFR 要求の Authority にはクライアントの版の SOA がある。無ければ FORMERR
-   * (BIND も "IXFR request missing SOA" で FORMERR)。 */
-  bool has_client_soa = is_ixfr && ixfr_request_client_serial(req, req_len, q_offset, &client_serial);
-  if (is_ixfr && !has_client_soa) {
-    xfr_log_denied(cip, cport, entry->domain, 251, XD_IXFR_NO_SOA, 0);
-    free(res);
-    axfr_send_error(client_fd, req, req_len, 1, false, 0xFFFF, NULL, tsig_key, req_mac, req_mac_len,
-                    client_addr, client_len, server_addr, has_server_addr);
-    return;
-  }
+  /* (RFC 1995 §3: an IXFR request has the SOA of the client's version in its Authority section; client_serial is its serial, checked by
+   * xfr_request_shape() above, which answers FORMERR for a request without one, as BIND does with "IXFR request missing SOA") */
   uint16_t req_qd = (req[4] << 8) | req[5];
   uint16_t req_an = (req[6] << 8) | req[7];
   uint16_t req_ns = (req[8] << 8) | req[9];
@@ -2272,7 +2285,7 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
            "(location, time stamp, tag) and the requester speaks version 2 of the extended format, which cannot carry them "
            "(upgrade the secondary)", entry->domain);
     free(res);
-    axfr_send_error(client_fd, req, req_len, 5, false, 0, "Extended transfer (version 2) of a zone with several or restricted SOA records is not supported; use version 3",
+    axfr_send_error(client_fd, req, req_len, 5, false, send_ede, 0, "Extended transfer (version 2) of a zone with several or restricted SOA records is not supported; use version 3",
                     tsig_key, req_mac, req_mac_len, client_addr, client_len, server_addr, has_server_addr);
     return;
   }
@@ -2298,7 +2311,7 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
     if (frame_rr == ZONE_IMAGE_NONE) {
       xfr_log(LOG_LVL_INFO, cip, cport, entry->domain, "request denied: the zone is not served to this client (REFUSED)");
       free(res);
-      axfr_send_error(client_fd, req, req_len, 5, false, 18, "Transfer refused: the zone is not served to this client", tsig_key,
+      axfr_send_error(client_fd, req, req_len, 5, false, send_ede, 18, "Transfer refused: the zone is not served to this client", tsig_key,
                       req_mac, req_mac_len, client_addr, client_len, server_addr, has_server_addr);
       return;
     }
@@ -2564,15 +2577,15 @@ static bool axfr_send_up_to_date_from_apex(const axfr_worker_args_t *a, tsig_key
   if (a->qtype != 251 || !a->elem) return false;
   const zdir_apex_t *ap = atomic_load_explicit(&a->elem->apex, memory_order_acquire);
   if (!ap || ap->serial != zdir_serial(a->elem)) return false;
-  size_t q_offset;
-  if (skip_wire_name(a->req, a->req_len, DNS_HEADER_SIZE, &q_offset) != 0 || q_offset + 4 > a->req_len) return false;
-  q_offset += 4;
+  size_t q_offset = 0;
   uint32_t client_serial = 0;
   char cip[INET6_ADDRSTRLEN];
   const int cport = xfr_client_text(&a->client_addr, cip, sizeof(cip));
-  if (!ixfr_request_client_serial(a->req, a->req_len, q_offset, &client_serial)) {
-    xfr_log_denied(cip, cport, a->elem->name, 251, XD_IXFR_NO_SOA, 0);
-    axfr_send_error(a->client_fd, a->req, a->req_len, 1, false, 0xFFFF, NULL, tsig_key, a->tsig_mac, a->tsig_mac_len, &a->client_addr, a->client_len,
+  /* RFC 5936 §2.1, RFC 1995 §3: a request that is not shaped like an IXFR request (no client SOA among them) is a FORMERR, as for a zone in memory */
+  const xfr_shape_t shape = xfr_request_shape(a->req, a->req_len, NULL, &q_offset, &client_serial);
+  if (shape != XFR_SHAPE_OK) {
+    xfr_log_denied(cip, cport, a->elem->name, 1, 251, XD_BAD_REQUEST, (uint32_t)shape);
+    axfr_send_error(a->client_fd, a->req, a->req_len, 1, false, a->send_ede, 0xFFFF, NULL, tsig_key, a->tsig_mac, a->tsig_mac_len, &a->client_addr, a->client_len,
                     &a->server_addr, a->has_server_addr);
     return true;
   }
@@ -2643,7 +2656,7 @@ void *axfr_worker_thread(void *arg) {
     } else if (args->await && (entry = args->await(args->elem, args->view_name)) == NULL) {
       xfr_log(LOG_LVL_WARNING, args->client_ip, args->client_port, args->elem->name,
               "%s request failed: the zone data could not be read in time (SERVFAIL, Not Ready)", args->qtype == 251 ? "IXFR" : "AXFR");
-      axfr_send_error(args->client_fd, args->req, args->req_len, 2, false, 14, "Not Ready", pkey, args->tsig_mac, args->tsig_mac_len, &args->client_addr,
+      axfr_send_error(args->client_fd, args->req, args->req_len, 2, false, args->send_ede, 14, "Not Ready", pkey, args->tsig_mac, args->tsig_mac_len, &args->client_addr,
                       args->client_len, &args->server_addr, args->has_server_addr);
       answered = true;
       log_rcode = 2;
