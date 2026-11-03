@@ -88,6 +88,25 @@ int process_dns_query_cap_routed(const uint8_t *req, size_t req_len, uint8_t *re
                                  bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                                  zone_db_snapshot_t *snap, const query_route_t *route);
 
+/* D1a: the answer for a query whose zone is in the directory and not in memory when the caller cannot wait for it: SERVFAIL + Extended DNS Error 14
+ * "Not Ready" (RFC 8914 4.15), through the same view, ACL (allow-query of the zone, the view and options, allow-query-on, key), TSIG
+ * (RFC 8945 5.3, 5.3.2: a validly signed request gets the answer signed with its key, BADKEY / BADSIG an unsigned NOTAUTH, BADTIME / BADTRUNC a
+ * signed one: the engine's one TSIG path decides) and rate limit handling as an answer from a zone.  elem: the directory element of the zone.
+ * The arguments are those of process_dns_query_cap_routed().
+ * probe: ask whether the query may wait for the zone.  DNS_NR_PERMITTED is returned (nothing written) when it may; any other value is a final
+ * answer built into res (REFUSED for an ACL denial, FORMERR / NOTAUTH for a request or TSIG that is wrong, 0 for a message not to be answered)
+ * and the query must neither park nor ask for the zone. */
+struct zdir_elem;
+#define DNS_NR_PERMITTED (-2)
+int process_dns_not_ready_routed(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len, size_t res_cap, const char *qname,
+                                 uint16_t qtype, const char *client_ip, compress_ctx_t *comp_ctx, bool is_tcp,
+                                 const rate_limit_config_t **out_rrl_cfg, zone_db_snapshot_t *snap, const query_route_t *route,
+                                 const struct zdir_elem *elem, bool probe);
+
+/* D1a step 8: the hook the engine calls (view name, zone name) for a zone that a CNAME chain or the glue of a name server leads into and that is in the directory
+ * without its data: it asks for the zone in the background.  Set by the server (dns_server_core.c); NULL = none. */
+extern void (*g_query_bg_fetch)(const char *view_name, const char *zone);
+
 /* The view of a client by its address alone: a view whose match-clients has a `key` element is evaluated as for an unsigned request. */
 view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip);
 /* The view of a request (BIND bin/named/server.c get_matching_view_sync()): the views are tried in order, and a view whose match-clients has a

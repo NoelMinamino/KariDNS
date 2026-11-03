@@ -160,6 +160,10 @@ printf '%s\n' "$OUT" | grep -q "^zones: $NZ in the registry ($NZ served, 0 shado
 printf '%s\n' "$OUT" | grep -q "^last batch: id 1, kind startup, finished .*: $NZ applied, 0 rejected, 0 shadowed, 0 deleted" && pass "dbstatus: last batch" || fail "dbstatus: last batch line"
 printf '%s\n' "$OUT" | grep -q "^since start: $NZ applied, 0 rejected, 0 shadowed, 0 deleted, 0 failed in the loader" && pass "dbstatus: totals" || fail "dbstatus: totals line"
 printf '%s\n' "$OUT" | grep -q "^last protocol error: none" && pass "dbstatus: no protocol error" || fail "dbstatus: protocol error line"
+# D1a: the zone memory (design 8.1: the bytes the DB zones hold, nothing retired once the loads are done) and the cost of the zone directory
+printf '%s\n' "$OUT" | grep -q "^zone versions and IXFR deltas: database zones [1-9][0-9]* bytes resident + [0-9][0-9]* retired; other zones [0-9][0-9]* resident + [0-9][0-9]* retired$" && pass "dbstatus: bytes of the zone versions and IXFR deltas of the DB zones" || { fail "dbstatus: zone versions line"; printf '%s\n' "$OUT" | grep "IXFR deltas" | sed 's/^/         /'; }
+printf '%s\n' "$OUT" | grep -q "^zone directory: $NZ elements, [1-9][0-9]* bytes in the registry + [1-9][0-9]* bytes in the indexes of the views ([1-9][0-9]* bytes per zone)$" && pass "dbstatus: zone directory of $NZ elements" || { fail "dbstatus: zone directory line"; printf '%s\n' "$OUT" | grep "zone directory" | sed 's/^/         /'; }
+$KCTL status 2>&1 | grep -q "^zone versions and IXFR deltas, database zones: [1-9][0-9]* bytes resident, [0-9][0-9]* bytes retired$" && pass "status: bytes of the zone versions and IXFR deltas of the DB zones" || fail "status: zone versions line"
 OUT=$(dbst db1.test)
 printf '%s\n' "$OUT" | grep -q "^zone db1.test. view [_a-z]*: source id [0-9]*, serial 10, status applied$" && pass "dbstatus db1.test: serial 10, applied" || { fail "dbstatus db1.test"; printf '%s\n' "$OUT" | sed 's/^/         /'; }
 dbst nothere.test | grep -q "not in the database registry" && pass "dbstatus of an unknown zone" || fail "dbstatus of an unknown zone"

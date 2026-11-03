@@ -525,7 +525,7 @@ static void test_database_block(void) {
         "loader-group \"karidns-db\"; loader-path \"/usr/local/libexec/karidns-dbloader\"; "
         "acl-ceiling { 192.0.2.0/24; }; auto-reload yes; poll-interval 5; coalesce 250; default-ttl 600; "
         "bulk-threshold 40; max-zone-records 5000; max-zone-bytes 64M; db-reload-timeout 45; ingest-threads 4; "
-        "loader-threads 8; server-id \"ns1\"; alias-resolver { 192.0.2.53; 2001:db8::53; }; }; };";
+        "loader-threads 8; park-max 2048; park-timeout 800; memory-limit 3g; fetch-rate 500; fetch-concurrency 40; transfer-fetch-timeout 2500; server-id \"ns1\"; alias-resolver { 192.0.2.53; 2001:db8::53; }; }; };";
     if (parse_ok(full, &cfg)) {
         const database_config_t *d = &cfg.database;
         CHECK(d->enabled);
@@ -538,6 +538,11 @@ static void test_database_block(void) {
         CHECK(d->auto_reload && d->poll_interval == 5 && d->coalesce_ms == 250 && d->default_ttl == 600);
         CHECK(d->bulk_threshold == 40 && d->max_zone_records == 5000 && d->max_zone_bytes == 64ull << 20);
         CHECK(d->db_reload_timeout == 45 && d->ingest_threads == 4 && d->loader_threads == 8);
+        CHECK(d->park_max == 2048 && d->park_timeout_ms == 800);                      /* D1a milestone 2 */
+        CHECK(d->memory_limit == 3ull << 30);                                         /* D1a step 5 */
+        CHECK(d->fetch_rate == 500);                                                  /* D1a: fetch-rate */
+        CHECK(d->fetch_concurrency == 40);                                            /* D1a: fetch-concurrency */
+        CHECK(d->transfer_fetch_timeout_ms == 2500);                                  /* D1a step 7: transfer-fetch-timeout */
         CHECK_STR(d->server_id, "ns1");
         CHECK(d->alias_resolver_count == 2);
         free_server_config_fields(&cfg);
@@ -548,6 +553,10 @@ static void test_database_block(void) {
         CHECK(!d->auto_reload && d->poll_interval == 2 && d->coalesce_ms == 1000 && d->default_ttl == 3600);
         CHECK(d->bulk_threshold == 25 && d->max_zone_records == 10000000ull && d->max_zone_bytes == 1ull << 30);
         CHECK(d->db_reload_timeout == 30 && d->ingest_threads == 1 && d->loader_threads == 1);
+        CHECK(d->park_max == 0 && d->park_timeout_ms == 0);                          /* (0: the worker's defaults, 1024 and 1500 ms) */
+        CHECK(d->memory_limit == 0);                                                  /* (0: no limit, every database zone stays in memory) */
+        CHECK(d->fetch_rate == 0);                                                    /* (0: the default, 200 zones per second) */
+        CHECK(d->transfer_fetch_timeout_ms == 0);                                     /* (0: the default, 10 seconds) */
         CHECK_STR(db_loader_path(&cfg), KARIDNS_DB_DEFAULT_LOADER_PATH);
         free_server_config_fields(&cfg);
     }
@@ -560,6 +569,23 @@ static void test_database_block(void) {
     expect_reject("bulk-threshold 101", DBP "bulk-threshold 101; }; };");
     expect_reject("ingest-threads 17", DBP "ingest-threads 17; }; };");
     expect_reject("loader-threads 0", DBP "loader-threads 0; }; };");
+    expect_reject("park-max 0", DBP "park-max 0; }; };");
+    expect_reject("park-max 65537", DBP "park-max 65537; }; };");
+    expect_reject("park-timeout 9", DBP "park-timeout 9; }; };");
+    expect_reject("park-timeout 60001", DBP "park-timeout 60001; }; };");
+    expect_reject("memory-limit 0", DBP "memory-limit 0; }; };");
+    expect_reject("memory-limit 512k", DBP "memory-limit 512k; }; };");
+    expect_reject("memory-limit 2t", DBP "memory-limit 2t; }; };");
+    expect_reject("memory-limit abc", DBP "memory-limit abc; }; };");
+    expect_reject("transfer-fetch-timeout 99", DBP "transfer-fetch-timeout 99; }; };");
+    expect_reject("transfer-fetch-timeout 600001", DBP "transfer-fetch-timeout 600001; }; };");
+    expect_reject("transfer-fetch-timeout abc", DBP "transfer-fetch-timeout abc; }; };");
+    expect_reject("fetch-rate 0", DBP "fetch-rate 0; }; };");
+    expect_reject("fetch-rate 100001", DBP "fetch-rate 100001; }; };");
+    expect_reject("fetch-rate abc", DBP "fetch-rate abc; }; };");
+    expect_reject("fetch-concurrency 1", DBP "fetch-concurrency 1; }; };");
+    expect_reject("fetch-concurrency 257", DBP "fetch-concurrency 257; }; };");
+    expect_reject("fetch-concurrency abc", DBP "fetch-concurrency abc; }; };");
     expect_reject("max-zone-records 1", DBP "max-zone-records 1; }; };");
     expect_reject("max-zone-bytes 100", DBP "max-zone-bytes 100; }; };");
     expect_reject("max-zone-bytes junk", DBP "max-zone-bytes 1X; }; };");
@@ -4207,6 +4233,39 @@ static void test_in_view(void) {
     expect_an_error("a skipped zone type is not a target",
                     "view \"a\" { match-clients { 127.0.0.2; }; zone \"x.test\" { type hint; file \"h\"; }; };\n" IV_B("in-view \"a\";"),
                     "does not exist in view 'a'");
+
+    /* D1a phase 2 (design 9): a name that is no zone { } of the owner is accepted when the owner can hold zones from the database or a catalog zone's members: it is found in
+     * the owner's directory at run time (zone_inview_t.db_target, target stays NULL) */
+    #define IV_DB "options { database { driver sqlite3; database-file \"/x.db\"; }; };\n"
+    if (ok_with("in-view of a zone of the database", IV_DB "view \"a\" { match-clients { 127.0.0.2; }; };\n" IV_B("in-view \"a\";"), "", &cfg)) {
+        const view_config_t *b = config_find_view(&cfg, "b");
+        const zone_inview_t *iv = (b && b->in_view_zones) ? zext(b->in_view_zones)->iv : NULL;
+        CHECK_MSG(iv && iv->db_target && iv->target == NULL && cfg.any_in_view && strcmp(iv->view, "a") == 0, "the stub of a zone of the database");
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("in-view of a zone of the database of a view's own file", IV_DB "view \"a\" { match-clients { 127.0.0.2; }; database-file \"/y.db\"; };\n" IV_B("in-view \"a\";"), "", &cfg)) {
+        const view_config_t *b = config_find_view(&cfg, "b");
+        CHECK_MSG(b && b->in_view_zones && zext(b->in_view_zones)->iv->db_target, "the stub of a zone of the view's own database");
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("in-view of a member of a catalog zone", "view \"a\" { match-clients { 127.0.0.2; }; zone \"cat.test\" { type primary; file \"c.db\"; catalog-zone yes; }; };\n" IV_B("in-view \"a\";"), "", &cfg)) {
+        const view_config_t *b = config_find_view(&cfg, "b");
+        CHECK_MSG(b && b->in_view_zones && zext(b->in_view_zones)->iv->db_target, "the stub of a catalog member");
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("a zone { } of the owner is still the target", IV_DB IV_OWN IV_B("in-view \"a\";"), "", &cfg)) {
+        const view_config_t *b = config_find_view(&cfg, "b");
+        const zone_inview_t *iv = (b && b->in_view_zones) ? zext(b->in_view_zones)->iv : NULL;
+        CHECK_MSG(iv && !iv->db_target && iv->target != NULL, "a zone { } block wins over the database");
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("the owner takes no database", IV_DB "view \"a\" { match-clients { 127.0.0.2; }; database none; };\n" IV_B("in-view \"a\";"),
+                    "does not exist in view 'a'");
+    expect_an_error("the owner has neither a database nor a catalog zone", "view \"a\" { match-clients { 127.0.0.2; }; };\n" IV_B("in-view \"a\";"),
+                    "does not exist in view 'a'");
+    expect_an_error("a database does not make a view defined later a target", IV_DB IV_B("in-view \"c\";") "\nview \"c\" { match-clients { 127.0.0.4; }; };",
+                    "does not exist in view 'c'");
+    #undef IV_DB
 
     /* in-view-settings: values and places */
     static const struct { const char *text; int mode; } ivs[] = { { "owner", IVS_OWNER }, { "view", IVS_VIEW }, { "VIEW", IVS_VIEW }, { "Owner", IVS_OWNER } };

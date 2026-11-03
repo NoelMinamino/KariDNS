@@ -784,9 +784,11 @@ static void scan_zones(void) {
     if (cfg && snap && snap->views) {
         for (size_t v = 0; v < snap->view_count; v++) {
             view_snapshot_t *view = &snap->views[v];
-            for (size_t zi = 0; zi < view->zone_count; zi++) {
-                zone_db_entry_t *e = view->entries ? view->entries[zi] : NULL;
-                if (!e || !view_owns_entry(view, e) || e->kind == ZONE_KIND_FORWARD || e->kind == ZONE_KIND_PROGRAM) continue;   /* a shared zone is scanned in its owner view */
+            zdir_iter_t zit;
+            zdir_iter_init(&zit, view);
+            for (zdir_elem_t *zel; (zel = zdir_iter_next(&zit));) {
+                zone_db_entry_t *e = zdir_entry(zel);
+                if (!e || !view_owns_elem(zel) || e->kind == ZONE_KIND_FORWARD || e->kind == ZONE_KIND_PROGRAM) continue;   /* a shared zone is scanned in its owner view */
                 zone_version_t *ver = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
                 const zone_image_t *img = ver ? ver->image : NULL;
                 if (!img || !(img->flags & ZONE_IMAGE_F_ALIAS)) continue;

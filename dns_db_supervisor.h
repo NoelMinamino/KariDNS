@@ -30,8 +30,10 @@ typedef struct {
   pid_t pid;                /* 0: not running */
   int ctrl_fd;              /* the supervisor's end of pair C */
   int first_fd;             /* the loader's end of the first pair A, until the first spawn uses it */
+  int first_fetch_fd;       /* the same for the fetch stream (D1a), -1 = the loader has none */
   run_identity_t id;        /* loader-user / loader-group, resolved once */
   char path[PATH_MAX];      /* loader-path */
+  char state_file[PATH_MAX]; /* loader-state-file (D1a step 7): the loader keeps the hot list there; "" = none */
   int64_t started_ms;       /* CLOCK_MONOTONIC */
   int64_t restart_at_ms;
   unsigned backoff_s;       /* the wait after the next exit */
@@ -43,6 +45,9 @@ typedef struct {
  * (-1 without a database block). */
 extern int g_db_stream_fd;
 extern int g_db_ctrl_fd;
+/* D1a: the Backend's end of the second stream, the fetch stream (design 6.1; -1 when it could not be made).  The loader gets its end as
+ * file descriptor 4 (`--fetch-fd 4`); a restart makes a new pair, and the Backend end goes over pair C together with the first stream's. */
+extern int g_db_fetch_fd;
 
 /* Resolve loader-user / loader-group (root: loader-user or loader-group is required; non-root: they must be the
  * running user) and check loader-path (a regular executable file, owned by root or by the running user, not

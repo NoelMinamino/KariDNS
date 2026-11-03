@@ -62,8 +62,10 @@ size_t resolve_ip_port_to_sockaddr(const char *ip, int port, struct sockaddr_sto
     (void)ip; (void)port; (void)out; return 0;
 }
 
-// Helper to build a test snapshot similarly to rebuild_zone_db_snapshot
+// Helper to build a test snapshot: the entries of the given zones (a NULL name is a zone that could not be allocated: no entry), listed
+// in the zone directory of the one view the way the production code lists them
 static zone_db_snapshot_t *build_test_snapshot(const char **domains, size_t count, bool simulate_malloc_fail) {
+    (void)simulate_malloc_fail;
     zone_db_snapshot_t *snap = calloc(1, sizeof(zone_db_snapshot_t));
     if (!snap) return NULL;
     snap->view_count = 1;
@@ -72,100 +74,27 @@ static zone_db_snapshot_t *build_test_snapshot(const char **domains, size_t coun
         free(snap);
         return NULL;
     }
-    
+
     view_snapshot_t *vs = &snap->views[0];
     vs->name = strdup("default");
-    vs->zone_count = count;
-    vs->entries = calloc(count > 0 ? count : 1, sizeof(zone_db_entry_t *));
-    
+    zone_db_entry_t **entries = calloc(count > 0 ? count : 1, sizeof(zone_db_entry_t *));
     for (size_t i = 0; i < count; i++) {
-        if (domains[i] != NULL) {
-            vs->entries[i] = create_new_zone_entry(domains[i], "default");
-        } else {
-            // Intentionally insert NULL entry to simulate tooth-missing (歯抜け)
-            vs->entries[i] = NULL;
-        }
+        // a NULL domain is a hole in the list (a failed allocation in regular zone loading)
+        entries[i] = domains[i] != NULL ? create_new_zone_entry(domains[i], "default") : NULL;
     }
-    
-    size_t p = 256;
-    while (p < vs->zone_count * 2) p <<= 1;
-    vs->hash_size = p;
-    vs->suffix_hash_size = p;
-    
-    if (simulate_malloc_fail) {
-        vs->hash_table = NULL;
-        vs->chain_next = NULL;
-        vs->suffix_hash_table = NULL;
-        vs->suffix_chain_next = NULL;
-        for (size_t i = 0; i < count; i++) {
-            if (vs->entries[i]) {
-                free_zone_db_entry(vs->entries[i]);
-            }
-        }
-        free(vs->entries);
-        free(vs->name);
-        free(snap->views);
-        free(snap);
-        return NULL; 
-    }
-    
-    if (vs->hash_size > 0) {
-        vs->hash_table = malloc(vs->hash_size * sizeof(int));
-        for (size_t i = 0; i < vs->hash_size; i++) vs->hash_table[i] = -1;
-    }
-    if (vs->zone_count > 0) {
-        vs->chain_next = malloc(vs->zone_count * sizeof(int));
-        for (size_t i = 0; i < vs->zone_count; i++) vs->chain_next[i] = -1;
-    }
-
-    if (vs->suffix_hash_size > 0) {
-        vs->suffix_hash_table = malloc(vs->suffix_hash_size * sizeof(int));
-        for (size_t i = 0; i < vs->suffix_hash_size; i++) vs->suffix_hash_table[i] = -1;
-    }
-    if (vs->zone_count > 0) {
-        vs->suffix_chain_next = malloc(vs->zone_count * sizeof(int));
-        for (size_t i = 0; i < vs->zone_count; i++) vs->suffix_chain_next[i] = -1;
-    }
-    
-    if (vs->hash_table && vs->chain_next) {
-        for (size_t i = 0; i < vs->zone_count; i++) {
-            if (!vs->entries[i]) continue;
-            uint32_t hash = calc_fnv1a_str(vs->entries[i]->domain);
-            size_t idx = hash & (vs->hash_size - 1);
-            vs->chain_next[i] = vs->hash_table[idx];
-            vs->hash_table[idx] = (int)i;
-        }
-    }
-
-    if (vs->suffix_hash_table && vs->suffix_chain_next) {
-        for (size_t i = 0; i < vs->zone_count; i++) {
-            if (!vs->entries[i]) continue;
-            size_t z_len = strlen(vs->entries[i]->domain);
-            while (z_len > 0 && vs->entries[i]->domain[z_len - 1] == '.') z_len--;
-            uint32_t hash = calc_fnv1a_strn(vs->entries[i]->domain, z_len);
-            size_t idx = hash & (vs->suffix_hash_size - 1);
-            vs->suffix_chain_next[i] = vs->suffix_hash_table[idx];
-            vs->suffix_hash_table[idx] = (int)i;
-        }
-    }
-    
+    assert(view_set_entries(vs, entries, count));   // (the elements borrow the entries; free_test_snapshot() frees them)
+    free(entries);
     return snap;
 }
 
 static void free_test_snapshot(zone_db_snapshot_t *snap) {
     if (!snap) return;
     for (size_t v = 0; v < snap->view_count; v++) {
-        for (size_t i = 0; i < snap->views[v].zone_count; i++) {
-            if (snap->views[v].entries[i]) {
-                free_zone_db_entry(snap->views[v].entries[i]);
-            }
-        }
-        free(snap->views[v].entries);
+        zdir_iter_t it;
+        zdir_iter_init(&it, &snap->views[v]);
+        for (zdir_elem_t *el; (el = zdir_iter_next(&it));) free_zone_db_entry(zdir_entry(el));
+        view_clear_dir(&snap->views[v]);
         free(snap->views[v].name);
-        if (snap->views[v].hash_table) free(snap->views[v].hash_table);
-        if (snap->views[v].chain_next) free(snap->views[v].chain_next);
-        if (snap->views[v].suffix_hash_table) free(snap->views[v].suffix_hash_table);
-        if (snap->views[v].suffix_chain_next) free(snap->views[v].suffix_chain_next);
     }
     free(snap->views);
     free(snap);
@@ -278,10 +207,8 @@ int main(void) {
 
     // 5.9 O-08: an escaped dot is part of a label, not a label boundary. "a\.example.com." is the
     //     label "a.example" under "com." (no such zone here -> root), and "x.a\.test.com." is not
-    //     below "test.com.". Checked on the suffix-hash path and on the linear fallback path.
-    for (int pass = 0; pass < 2; pass++) {
-        size_t saved_size = vs->suffix_hash_size;
-        if (pass == 1) vs->suffix_hash_size = 0;   // force the linear scan
+    //     below "test.com.".
+    for (int pass = 0; pass < 1; pass++) {
         zone_db_entry_t *e1 = find_zone_in_view(vs, "a\\.example.com.");
         assert(e1 != NULL && strcmp(e1->domain, ".") == 0);
         zone_db_entry_t *e2 = find_zone_in_view(vs, "x.a\\.test.com.");
@@ -290,7 +217,6 @@ int main(void) {
         assert(e3 != NULL && strcmp(e3->domain, "example.com.") == 0);
         zone_db_entry_t *e4 = find_zone_in_view(vs, "sp\\032ace.www.sub.example.com.");
         assert(e4 != NULL && strcmp(e4->domain, "sub.example.com.") == 0);
-        vs->suffix_hash_size = saved_size;
     }
 
     free_test_snapshot(snap);
@@ -334,10 +260,6 @@ int main(void) {
     assert(find_zone_in_view(&snap_teeth->views[0], "notfound.org.") == NULL);
     free_test_snapshot(snap_teeth);
 
-    // 9. Malloc failure validation (OOM simulation)
-    zone_db_snapshot_t *snap_fail = build_test_snapshot(domains, count, true);
-    assert(snap_fail == NULL);
-    
     printf("PASS: All Hash Table & Suffix Lookup Tests Completed Successfully!\n");
     return 0;
 }

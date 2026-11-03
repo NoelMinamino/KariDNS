@@ -91,6 +91,12 @@ typedef struct {
     char os_release[64];
     char machine[64];
     int ncpus;
+    /* D1a (design 8.1): the bytes the zone versions hold (image, glue, IXFR differences): of database zones and of the others, what is
+     * served now and what was replaced but is not freed yet.  Read only (nothing limits them yet) */
+    uint64_t db_bytes_resident;
+    uint64_t db_bytes_retired;
+    uint64_t other_bytes_resident;
+    uint64_t other_bytes_retired;
 } karidns_status_t;
 
 // ============================================================================

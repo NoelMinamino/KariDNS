@@ -204,8 +204,7 @@ static void sw_add_zone(const char *origin, const char *text) {
 static void sw_finish_view(void) {
     g_sw.acl[0] = (char *)"any";
     g_sw.view.name = "default";
-    g_sw.view.entries = g_sw.entries;
-    g_sw.view.zone_count = (size_t)g_sw.zone_count;
+    view_set_entries(&g_sw.view, g_sw.entries, g_sw.zone_count);
     g_sw.view.match_clients = g_sw.acl;
     g_sw.view.match_clients_count = 1;
     g_sw.snap.views = &g_sw.view;

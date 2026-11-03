@@ -1234,6 +1234,229 @@ static void test_handle_axfr_event_and_worker_thread(void) {
     printf("  -> handle_axfr_event & axfr_worker_thread passed.\n");
 }
 
+// ----------------------------------------------------------------------------
+// 6b. D1a step 7: a transfer of a zone that is in the directory and not in memory (axfr_worker_thread with an element)
+// ----------------------------------------------------------------------------
+static _Atomic int g_nr_await_calls;
+static zone_db_entry_t *g_nr_await_entry;
+static zone_db_entry_t *nr_await_stub(zdir_elem_t *el, const char *view) {
+    (void)el;
+    atomic_fetch_add(&g_nr_await_calls, 1);
+    if (strcmp(view, "default") != 0 || !g_nr_await_entry) return NULL;
+    atomic_fetch_add(&g_nr_await_entry->active_axfr, 1);      /* (as db_ingest_xfr_await() counts the transfer) */
+    return g_nr_await_entry;
+}
+
+static zdir_apex_t *nr_apex(uint32_t serial) {
+    static const uint8_t names[] = "\3ns1\7example\3com\0\5admin\7example\3com\0\3ns1\7example\3com\0";
+    const size_t ml = 17, rl = 19, nl = 17;
+    zdir_apex_t *a = calloc(1, sizeof(*a) + ml + rl + nl);
+    a->serial = serial; a->soa_ttl = 3600; a->refresh = 7200; a->retry = 3600; a->expire = 1209600; a->minimum = 300; a->ns_ttl = 3600;
+    a->mname_len = (uint16_t)ml; a->rname_len = (uint16_t)rl; a->ns_len = (uint16_t)nl; a->n_ns = 1;
+    memcpy(a->data, names, ml + rl + nl);
+    return a;
+}
+
+static zdir_elem_t *nr_elem(const char *name, uint32_t serial, zdir_apex_t *apex) {
+    zdir_elem_t *z = calloc(1, sizeof(*z) + strlen(name) + 1);
+    strcpy(z->name, name);
+    z->klen = (uint8_t)(strlen(name) - 1);
+    atomic_store(&z->serial, serial);
+    atomic_store(&z->apex, apex);
+    return z;
+}
+
+/* a transfer request: AXFR or IXFR (with the client's SOA in Authority when soa_serial >= 0), with an OPT record (and the EXPIRE option) when asked */
+static size_t nr_request(uint8_t *b, size_t cap, const char *zone, uint16_t qtype, int64_t soa_serial, bool edns, bool expire_opt) {
+    memset(b, 0, cap);
+    b[0] = 0x55; b[1] = 0x66;
+    b[5] = 1;
+    size_t o = 12;
+    o += (size_t)write_uncompressed_name(b, o, cap, zone);
+    b[o++] = (uint8_t)(qtype >> 8); b[o++] = (uint8_t)qtype; b[o++] = 0; b[o++] = 1;
+    if (soa_serial >= 0) {
+        b[9] = 1;
+        b[o++] = 0xC0; b[o++] = 12;                                    /* the owner: the question name */
+        b[o++] = 0; b[o++] = 6; b[o++] = 0; b[o++] = 1; b[o++] = 0; b[o++] = 0; b[o++] = 0; b[o++] = 0;
+        size_t rd = o;
+        o += 2;
+        o += (size_t)write_uncompressed_name(b, o, cap, "ns1.example.com.");
+        o += (size_t)write_uncompressed_name(b, o, cap, "admin.example.com.");
+        uint32_t s = (uint32_t)soa_serial;
+        b[o++] = (uint8_t)(s >> 24); b[o++] = (uint8_t)(s >> 16); b[o++] = (uint8_t)(s >> 8); b[o++] = (uint8_t)s;
+        memset(b + o, 0, 16);
+        o += 16;
+        b[rd] = (uint8_t)((o - rd - 2) >> 8);
+        b[rd + 1] = (uint8_t)(o - rd - 2);
+    }
+    if (edns) {
+        b[11] = 1;
+        b[o++] = 0; b[o++] = 0; b[o++] = 41; b[o++] = 0x10; b[o++] = 0; b[o++] = 0; b[o++] = 0; b[o++] = 0; b[o++] = 0;
+        b[o++] = 0; b[o++] = expire_opt ? 4 : 0;
+        if (expire_opt) { b[o++] = 0; b[o++] = 9; b[o++] = 0; b[o++] = 0; }
+    }
+    return o;
+}
+
+typedef struct {
+    uint8_t msg[8192];
+    size_t len;            /* of the first message; 0: none */
+    int nmsgs;
+} nr_reply_t;
+
+/* run axfr_worker_thread for a request and read what the client gets */
+static void nr_run(nr_reply_t *out, const uint8_t *req, size_t req_len, uint16_t qtype, zone_db_entry_t *entry, zdir_elem_t *el,
+                   zone_db_entry_t *(*aw)(zdir_elem_t *, const char *)) {
+    int sp[2];
+    int rc = socketpair(AF_UNIX, SOCK_STREAM, 0, sp);
+    assert(rc == 0);
+    axfr_worker_args_t *args = calloc(1, sizeof(axfr_worker_args_t));
+    args->client_fd = sp[0];
+    strlcpy(args->client_ip, "127.0.0.1", sizeof(args->client_ip));
+    args->client_port = 54321;
+    strlcpy(args->qname, "nr.example.com.", sizeof(args->qname));
+    args->qclass = 1;
+    args->qtype = qtype;
+    memcpy(args->req, req, req_len);
+    args->req_len = (uint16_t)req_len;
+    args->entry = entry;
+    args->elem = el;
+    args->await = aw;
+    strlcpy(args->view_name, "default", sizeof(args->view_name));
+    pthread_t th;
+    rc = pthread_create(&th, NULL, axfr_worker_thread, args);
+    assert(rc == 0);
+    struct timeval rcv_to = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(sp[1], SOL_SOCKET, SO_RCVTIMEO, &rcv_to, sizeof(rcv_to));
+    memset(out, 0, sizeof(*out));
+    for (;;) {
+        uint8_t pfx[2];
+        size_t got = 0;
+        while (got < 2) {
+            ssize_t r = recv(sp[1], pfx + got, 2 - got, 0);
+            if (r <= 0) break;
+            got += (size_t)r;
+        }
+        if (got < 2) break;
+        size_t mlen = ((size_t)pfx[0] << 8) | pfx[1], have = 0;
+        uint8_t tmp[65536];
+        while (have < mlen) {
+            ssize_t r = recv(sp[1], tmp + have, mlen - have, 0);
+            if (r <= 0) break;
+            have += (size_t)r;
+        }
+        if (have < mlen) break;
+        if (out->nmsgs++ == 0 && mlen <= sizeof(out->msg)) {
+            memcpy(out->msg, tmp, mlen);
+            out->len = mlen;
+        }
+    }
+    close(sp[1]);
+    pthread_join(th, NULL);
+}
+
+/* the SOA serial of the first answer, and the options of the OPT record: expire (-1: none), the extended error code (-1: none) */
+static void nr_parse(const nr_reply_t *r, uint32_t *serial_out, int64_t *expire_out, int *ede_out) {
+    *serial_out = 0; *expire_out = -1; *ede_out = -1;
+    const uint8_t *m = r->msg;
+    size_t p = 12, n;
+    uint16_t an = (uint16_t)((m[6] << 8) | m[7]), ns = (uint16_t)((m[8] << 8) | m[9]), ar = (uint16_t)((m[10] << 8) | m[11]);
+    for (int i = 0; i < (m[4] << 8 | m[5]); i++) { assert(skip_wire_name(m, r->len, p, &n) == 0); p = n + 4; }
+    for (int i = 0; i < an + ns + ar; i++) {
+        assert(skip_wire_name(m, r->len, p, &n) == 0);
+        uint16_t type = (uint16_t)((m[n] << 8) | m[n + 1]);
+        size_t rdlen = (size_t)((m[n + 8] << 8) | m[n + 9]), rd = n + 10;
+        if (type == 6 && i == 0) {
+            size_t q1, q2;
+            assert(skip_wire_name(m, r->len, rd, &q1) == 0 && skip_wire_name(m, r->len, q1, &q2) == 0);
+            *serial_out = ((uint32_t)m[q2] << 24) | ((uint32_t)m[q2 + 1] << 16) | ((uint32_t)m[q2 + 2] << 8) | m[q2 + 3];
+        } else if (type == 41) {
+            for (size_t o = rd; o + 4 <= rd + rdlen;) {
+                uint16_t code = (uint16_t)((m[o] << 8) | m[o + 1]), ol = (uint16_t)((m[o + 2] << 8) | m[o + 3]);
+                if (code == 9 && ol == 4) *expire_out = ((int64_t)m[o + 4] << 24) | (m[o + 5] << 16) | (m[o + 6] << 8) | m[o + 7];
+                if (code == 15 && ol >= 2) *ede_out = (m[o + 4] << 8) | m[o + 5];
+                o += 4 + ol;
+            }
+        }
+        p = rd + rdlen;
+    }
+}
+
+static void test_axfr_worker_zone_out_of_memory(void) {
+    printf("[TEST] AXFR/IXFR: a zone that is not in memory (summary answer, wait for the zone, SERVFAIL)...\n");
+    zdir_apex_t *apex = nr_apex(4242);
+    zdir_elem_t *el = nr_elem("nr.example.com.", 4242, apex);
+    uint8_t req[1024];
+    nr_reply_t rep;
+    uint32_t serial;
+    int64_t expire;
+    int ede;
+    dbreg_cache_stats_t cs;
+    dbreg_cache_stats(&cs);
+    const uint64_t sum0 = cs.xfr[DBREG_XFR_SUMMARY];
+
+    /* an IXFR from a client that has the serial (or a newer one): the one SOA of the apex, the zone is not waited for (RFC 1995 2) */
+    size_t n = nr_request(req, sizeof(req), "nr.example.com.", 251, 4242, false, false);
+    nr_run(&rep, req, n, 251, NULL, el, nr_await_stub);
+    nr_parse(&rep, &serial, &expire, &ede);
+    assert(rep.nmsgs == 1 && rep.len > 12 && rep.msg[0] == 0x55 && rep.msg[1] == 0x66);
+    assert((rep.msg[2] & 0x84) == 0x84 && (rep.msg[3] & 0x0F) == 0 && rep.msg[7] == 1 && rep.msg[5] == 1 && rep.msg[11] == 0);   /* QR AA, NOERROR, one answer, no OPT */
+    assert(serial == 4242 && atomic_load(&g_nr_await_calls) == 0);
+    n = nr_request(req, sizeof(req), "nr.example.com.", 251, 4243, true, true);     /* newer than the zone's, with an OPT and the EXPIRE option (RFC 7314 3) */
+    nr_run(&rep, req, n, 251, NULL, el, nr_await_stub);
+    nr_parse(&rep, &serial, &expire, &ede);
+    assert(rep.nmsgs == 1 && serial == 4242 && rep.msg[11] == 1 && expire == 1209600 && atomic_load(&g_nr_await_calls) == 0);
+    dbreg_cache_stats(&cs);
+    assert(cs.xfr[DBREG_XFR_SUMMARY] == sum0 + 2);
+
+    /* a request without the client's SOA: FORMERR (RFC 1995 3), nothing waited for */
+    n = nr_request(req, sizeof(req), "nr.example.com.", 251, -1, false, false);
+    nr_run(&rep, req, n, 251, NULL, el, nr_await_stub);
+    assert(rep.nmsgs == 1 && (rep.msg[3] & 0x0F) == 1 && rep.msg[7] == 0 && atomic_load(&g_nr_await_calls) == 0);
+
+    /* a client that is behind needs the zone: the wait ends without it (SERVFAIL, EDE 14 Not Ready; the question is copied, RFC 5936 2.2) */
+    n = nr_request(req, sizeof(req), "nr.example.com.", 251, 4241, true, false);
+    nr_run(&rep, req, n, 251, NULL, el, nr_await_stub);
+    nr_parse(&rep, &serial, &expire, &ede);
+    assert(rep.nmsgs == 1 && (rep.msg[3] & 0x0F) == 2 && rep.msg[5] == 1 && rep.msg[7] == 0 && ede == 14 && atomic_load(&g_nr_await_calls) == 1);
+    /* the apex describes another version than the directory has (a summary came meanwhile): the zone is waited for as well */
+    atomic_store(&el->serial, 4300);
+    n = nr_request(req, sizeof(req), "nr.example.com.", 251, 4300, false, false);
+    nr_run(&rep, req, n, 251, NULL, el, nr_await_stub);
+    assert(rep.nmsgs == 1 && (rep.msg[3] & 0x0F) == 2 && atomic_load(&g_nr_await_calls) == 2);
+    atomic_store(&el->serial, 4242);
+    /* an AXFR waits for the zone too */
+    n = nr_request(req, sizeof(req), "nr.example.com.", 252, -1, false, false);
+    nr_run(&rep, req, n, 252, NULL, el, nr_await_stub);
+    assert(rep.nmsgs == 1 && (rep.msg[3] & 0x0F) == 2 && atomic_load(&g_nr_await_calls) == 3);
+    /* a caller that gave no way to wait: the old answer for a zone that is not there (REFUSED) */
+    nr_run(&rep, req, n, 252, NULL, el, NULL);
+    assert(rep.nmsgs == 1 && (rep.msg[3] & 0x0F) == 5 && atomic_load(&g_nr_await_calls) == 3);
+
+    /* the zone is there when the wait ends: the transfer is the usual one from the entry, and the thread gives its count back */
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "nr.example.com.", sizeof(entry.domain));
+    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+    init_axfr_zone(test_zone_slot(&entry, 0), "nr.example.com.", "4242");
+    atomic_store_explicit(&entry.rcu.active, &test_zone_slot(&entry, 0)->ver, memory_order_release);
+    atomic_store_explicit(&entry.serial, 4242, memory_order_release);
+    g_nr_await_entry = &entry;
+    nr_run(&rep, req, n, 252, NULL, el, nr_await_stub);
+    nr_parse(&rep, &serial, &expire, &ede);
+    assert(rep.nmsgs >= 1 && (rep.msg[3] & 0x0F) == 0 && rep.msg[7] >= 2 && serial == 4242 && atomic_load(&g_nr_await_calls) == 4);
+    assert(atomic_load(&entry.active_axfr) == 0);
+    g_nr_await_entry = NULL;
+    zone_arena_destroy(test_zone_slot(&entry, 0));
+    pthread_mutex_destroy(&entry.writer_lock);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    free(apex);
+    free(el);
+    printf("  -> a zone that is not in memory passed.\n");
+}
+
 static void test_axfr_bg_thread_and_free_ixfr_txn(void) {
     printf("[TEST] AXFR/IXFR: axfr_bg_thread_func & free_ixfr_txn...\n");
 
@@ -7104,6 +7327,16 @@ static void test_b8t2_settings(void) {
     assert(db_settings_parse("file \"/etc/passwd\";", 19, err, sizeof(err)) == NULL);
     assert(db_settings_parse("include \"/etc/passwd\";", 22, err, sizeof(err)) == NULL);
     assert(db_settings_parse("masters { 192.0.2.1; }; allow-transfer { any; };", 48, err, sizeof(err)) != NULL);   /* parsed, then ignored */
+    {   /* D1a step 5: the `cache` setting (pin / no-cache / auto; the later statement wins; anything else is an error) */
+        static const struct { const char *text; int mode; } k[] = { { "cache pin;", 1 }, { "cache no-cache;", 2 }, { "cache pin; cache auto;", 0 }, { "cache AUTO;", 0 } };
+        for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
+            zone_ext_shared_t *c = db_settings_parse(k[i].text, strlen(k[i].text), err, sizeof(err));
+            assert(c && c->ext.cache_mode == k[i].mode);
+            zone_ext_shared_unref(c);
+        }
+        assert(db_settings_parse("cache forever;", 14, err, sizeof(err)) == NULL);
+        assert(db_settings_parse("cache pin", 9, err, sizeof(err)) == NULL);
+    }
 
     zone_ext_shared_unref(rx);
     free_server_config_fields(&pcfg);
@@ -7828,6 +8061,7 @@ int main(void) {
     test_handle_axfr_event_drops_unencodable();
     test_handle_axfr_event_intermediate_unsigned_flow();
     test_handle_axfr_event_and_worker_thread();
+    test_axfr_worker_zone_out_of_memory();
     test_axfr_bg_thread_and_free_ixfr_txn();
     test_ixfr_delta_empty_records();
     test_ixfr_history_ring_buffer_wrap();

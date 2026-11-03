@@ -234,15 +234,7 @@ static void test_snapshot_rcu_lifecycle_and_suffix_lookup(void) {
     memset(&view, 0, sizeof(view));
     view.name = "default";
     zone_db_entry_t *entries[1] = { entry };
-    view.entries = entries;
-    view.zone_count = 1;
-    view.hash_size = 16;
-    int hash_tbl[16];
-    int chain_next[1] = { -1 };
-    for (int i = 0; i < 16; i++) hash_tbl[i] = -1;
-    hash_tbl[calc_fnv1a_str("example.com.") & 15] = 0;
-    view.hash_table = hash_tbl;
-    view.chain_next = chain_next;
+    view_set_entries(&view, entries, 1);
 
     zone_db_entry_t *found = find_zone_in_view(&view, "sub.host.example.com.");
     assert(found == entry);

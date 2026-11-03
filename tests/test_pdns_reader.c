@@ -780,6 +780,28 @@ static void test_zone_level(void) {
         CHECK(pdns_soa_serial("a b 4294967295", &s) && s == 4294967295u);
         CHECK(!pdns_soa_serial(NULL, &s) && !pdns_soa_serial("", &s));
     }
+    {   /* D1a: refresh, retry and expire, with the rules of the serial (strict decimal, 32 bits, blanks around) */
+        uint32_t r = 0, t = 0, e = 0;
+        CHECK(pdns_soa_timers("ns1.z.test hostmaster.z.test 2024 3600 600 86400 300", &r, &t, &e) && r == 3600 && t == 600 && e == 86400);
+        CHECK(pdns_soa_timers("  a\tb  1  7200\t3600  1209600  ", &r, &t, &e) && r == 7200 && t == 3600 && e == 1209600);
+        CHECK(pdns_soa_timers("a b 1 4294967295 0 4294967295", &r, &t, &e) && r == 4294967295u && t == 0 && e == 4294967295u);
+        CHECK(pdns_soa_timers("a b 1 2 3 4", NULL, NULL, NULL));                                       /* (only the check) */
+        CHECK(!pdns_soa_timers(NULL, &r, &t, &e) && !pdns_soa_timers("", &r, &t, &e));
+        CHECK(!pdns_soa_timers("a b 1 2 3", &r, &t, &e));                                              /* the expire is missing */
+        CHECK(!pdns_soa_timers("a b 1 2 x 4", &r, &t, &e) && !pdns_soa_timers("a b 1 -2 3 4", &r, &t, &e));
+        CHECK(!pdns_soa_timers("a b 1 4294967296 3 4", &r, &t, &e));                                   /* above 32 bits */
+    }
+    {   /* D1a step 6: the names and the minimum of an SOA content (RFC 1035 3.3.13), canonical absolute */
+        char mn[DNS_NAME_TEXT_SIZE], rn[DNS_NAME_TEXT_SIZE], nm[DNS_NAME_TEXT_SIZE];
+        uint32_t mi = 0;
+        CHECK(pdns_soa_apex("ns1.z.test hostmaster.z.test 2024 3600 600 86400 300", mn, rn, &mi) && strcmp(mn, "ns1.z.test.") == 0 && strcmp(rn, "hostmaster.z.test.") == 0 && mi == 300);
+        CHECK(pdns_soa_apex("  NS1.Z.TEST.\thost\\.master.z.test.  1 2 3 4  4294967295 ", mn, rn, &mi) && strcmp(mn, "NS1.Z.TEST.") == 0 && strcmp(rn, "host\\.master.z.test.") == 0 && mi == 4294967295u);   /* (the case is the zone data's, RFC 4343) */
+        CHECK(pdns_soa_apex("a b 1 2 3 4 5", mn, rn, NULL));
+        CHECK(!pdns_soa_apex(NULL, mn, rn, &mi) && !pdns_soa_apex("", mn, rn, &mi) && !pdns_soa_apex("a b 1 2 3 4", mn, rn, &mi));       /* the minimum is missing */
+        CHECK(!pdns_soa_apex("a b 1 2 3 4 x", mn, rn, &mi) && !pdns_soa_apex("a b 1 2 3 4 4294967296", mn, rn, &mi) && !pdns_soa_apex("a..b c 1 2 3 4 5", mn, rn, &mi));
+        CHECK(pdns_apex_name("ns1.z.test", nm) && strcmp(nm, "ns1.z.test.") == 0 && pdns_apex_name("NS2.Z.test.", nm) && strcmp(nm, "NS2.Z.test.") == 0);
+        CHECK(!pdns_apex_name(NULL, nm) && !pdns_apex_name("", nm) && !pdns_apex_name(".", nm) && !pdns_apex_name("a..b", nm));
+    }
     {   /* the zone's only SOA has a serial the DB column could not hold in a 32-bit field */
         z = pdns_zone_new("z.test", NULL);
         db_record_row_t bad = R(50, "z.test", "SOA", "ns1.z.test hostmaster.z.test 4294967296 1 2 3 4", 3600, 0);
@@ -964,6 +986,14 @@ static void test_metadata(void) {
                         "notify-retries 3; notify-retry-backoff exponential; notify-tcp-timeout 25; ixfr-history 8; additional-from-auth in-domain; "
                         "disable-auto-tc-flag yes; zone-udp-bufsize 1232; zone-tcp-window 64k;", 0);
     }
+    {   /* D1a step 5: what the memory limit may do with the zone */
+        db_meta_row_t m1[] = { M("X-KARIDNS-CACHE", "pin") };
+        expect_settings("cache pin", m1, 1, "cache pin;", 0);
+        db_meta_row_t m2[] = { M("X-KARIDNS-CACHE", "No-Cache") };
+        expect_settings("cache no-cache", m2, 1, "cache No-Cache;", 0);
+        db_meta_row_t m3[] = { M("X-KARIDNS-CACHE", "forever") };
+        expect_settings("cache invalid", m3, 1, "", 1);
+    }
     {   /* invalid option values and unknown options are dropped with a warning, never passed on */
         db_meta_row_t m[] = { M("X-KARIDNS-IXFR-HISTORY", "999"), M("X-KARIDNS-IXFR-HISTORY", "4"), M("X-KARIDNS-NOTIFY-RETRIES", "3; allow-update { any; }"),
                               M("X-KARIDNS-FILE", "/etc/passwd"), M("X-KARIDNS-ZONE-UDP-BUFSIZE", "511"), M("X-KARIDNS-ZONE-TCP-MSS", "65496"),
@@ -1112,7 +1142,7 @@ static void test_kdb(void) {
 
         /* determinism: the same rows give the same bytes */
         rt_buf_t b1 = {0}, b2 = {0};
-        pdns_kdb_params_t kp = { 1, 9, KDB_ZK_PRIMARY, "prof", NULL, NULL, NULL };
+        pdns_kdb_params_t kp = { 1, 9, KDB_ZK_PRIMARY, "prof", NULL, NULL, NULL, 0 };
         char err[200];
         CHECK(pdns_zone_encode_kdb(z, &kp, rt_emit, &b1, err, sizeof(err)) == 0);
         pdns_zone_t *z2 = build(rows, n, NULL, 0, NULL);
@@ -1132,7 +1162,7 @@ static void test_kdb(void) {
         /* B6a: the gate sees the serial and the digest ZONE_BEGIN carries, and can keep the zone back (returns 1, emits nothing) */
         {
             gate_seen_t gs = { 0, 0, { 0 }, 0 };
-            pdns_kdb_params_t gp = { 1, 9, KDB_ZK_PRIMARY, "prof", test_gate, &gs, NULL };
+            pdns_kdb_params_t gp = { 1, 9, KDB_ZK_PRIMARY, "prof", test_gate, &gs, NULL, 0 };
             rt_buf_t b4 = {0};
             gs.answer = 1;
             CHECK(pdns_zone_encode_kdb(z, &gp, rt_emit, &b4, err, sizeof(err)) == 1);
@@ -1141,11 +1171,11 @@ static void test_kdb(void) {
             CHECK(memcmp(gs.digest, info.digest, KDB_DIGEST_LEN) != 0);
             uint8_t with_prof[KDB_DIGEST_LEN];
             memcpy(with_prof, gs.digest, KDB_DIGEST_LEN);
-            pdns_kdb_params_t gn = { 1, 9, KDB_ZK_PRIMARY, "", test_gate, &gs, NULL };
+            pdns_kdb_params_t gn = { 1, 9, KDB_ZK_PRIMARY, "", test_gate, &gs, NULL, 0 };
             CHECK(pdns_zone_encode_kdb(z, &gn, rt_emit, &b4, err, sizeof(err)) == 1);
             CHECK(memcmp(gs.digest, info.digest, KDB_DIGEST_LEN) == 0);
             /* ... and so is the text of the profile: editing a profile makes every zone that names it new */
-            pdns_kdb_params_t gt = { 1, 9, KDB_ZK_PRIMARY, "prof", test_gate, &gs, "allow-transfer { 192.0.2.1; };" };
+            pdns_kdb_params_t gt = { 1, 9, KDB_ZK_PRIMARY, "prof", test_gate, &gs, "allow-transfer { 192.0.2.1; };", 0 };
             CHECK(pdns_zone_encode_kdb(z, &gt, rt_emit, &b4, err, sizeof(err)) == 1);
             CHECK(memcmp(gs.digest, with_prof, KDB_DIGEST_LEN) != 0 && memcmp(gs.digest, info.digest, KDB_DIGEST_LEN) != 0);
             uint8_t with_text[KDB_DIGEST_LEN];
@@ -1168,7 +1198,7 @@ static void test_kdb(void) {
         pdns_zone_t *za = build(NULL, 0, NULL, 0, NULL), *zb = build(NULL, 0, m1, 1, NULL), *zc = build(NULL, 0, m2, 1, NULL),
                     *zd = build(NULL, 0, m1, 1, NULL);
         gate_seen_t ga = { 0, 0, { 0 }, 1 }, gb = ga, gc = ga, gd = ga;
-        pdns_kdb_params_t pa = { 0, 1, KDB_ZK_PRIMARY, NULL, test_gate, &ga, NULL }, pb = pa, pc = pa, pd = pa;
+        pdns_kdb_params_t pa = { 0, 1, KDB_ZK_PRIMARY, NULL, test_gate, &ga, NULL, 0 }, pb = pa, pc = pa, pd = pa;
         pb.gate_ud = &gb; pc.gate_ud = &gc; pd.gate_ud = &gd;
         char err[200];
         rt_buf_t nb = {0};
@@ -1228,7 +1258,7 @@ static void test_kdb(void) {
         z = build(NULL, 0, m2, 2, NULL);                              /* B5: NSEC3PARAM without any RRSIG(NSEC3) cannot be rebuilt */
         CHECK(z->failed);
         CHECK_HAS(z->error, "no RRSIG(NSEC3) rows");
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL }, rt_emit, &b, err, sizeof(err)) != 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 }, rt_emit, &b, err, sizeof(err)) != 0);
         pdns_zone_free(z);
         db_meta_row_t m3[] = { M("PRESIGNED", "1") };               /* presigned without NSEC3PARAM: encoded, flag set */
         z = build(NULL, 0, m3, 1, NULL);
@@ -1240,13 +1270,13 @@ static void test_kdb(void) {
         /* a failed zone is not encoded */
         db_record_row_t bad[1] = { R(2, "x.z.test", "A", "nope", 300, 0) };
         z = build(bad, 1, NULL, 0, NULL);
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL }, rt_emit, &b, err, sizeof(err)) != 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 }, rt_emit, &b, err, sizeof(err)) != 0);
         pdns_zone_free(z);
         /* size limit */
         pdns_opts_t o = { 0, 0, 0, 100 };
         z = build(NULL, 0, NULL, 0, &o);
         CHECK(!z->failed);
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL }, rt_emit, &b, err, sizeof(err)) != 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 }, rt_emit, &b, err, sizeof(err)) != 0);
         CHECK_HAS(err, "limit");
         pdns_zone_free(z);
         free(b.buf);
@@ -1257,7 +1287,7 @@ static void test_kdb(void) {
         pdns_zone_t *z = build(NULL, 0, m, 2, NULL);
         rt_buf_t b = {0};
         char err[200];
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){5, 42, KDB_ZK_SECONDARY, NULL, NULL, NULL, NULL }, rt_emit, &b, err, sizeof(err)) == 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){5, 42, KDB_ZK_SECONDARY, NULL, NULL, NULL, NULL, 0 }, rt_emit, &b, err, sizeof(err)) == 0);
         static uint8_t fb[KDB_MAX_BODY];
         kdb_framer_t f;
         kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
@@ -1288,7 +1318,7 @@ static pdns_zone_t *build_sec(uint8_t kind, const char *master, const db_meta_ro
 
 static void sec_digest(const pdns_zone_t *z, uint8_t out[KDB_DIGEST_LEN], uint32_t *serial) {
     gate_seen_t g = { 0, 0, { 0 }, 1 };
-    pdns_kdb_params_t p = { 0, 7, KDB_ZK_PRIMARY, NULL, test_gate, &g, NULL };
+    pdns_kdb_params_t p = { 0, 7, KDB_ZK_PRIMARY, NULL, test_gate, &g, NULL, 0 };
     char err[200];
     rt_buf_t nb = {0};
     CHECK(pdns_zone_encode_kdb(z, &p, rt_emit, &nb, err, sizeof(err)) == 1 && g.calls == 1);
@@ -1356,7 +1386,7 @@ static void test_secondary(void) {
         }
         /* KDB1: ZONE_BEGIN (catalog kind, serial 0, flags 0, rr_count 0, the settings, the profile) and ZONE_END, nothing between */
         rt_buf_t b = {0};
-        pdns_kdb_params_t kp = { 3, 77, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL };       /* the zone's own kind wins */
+        pdns_kdb_params_t kp = { 3, 77, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 };       /* the zone's own kind wins */
         CHECK(pdns_zone_encode_kdb(z, &kp, rt_emit, &b, err, sizeof(err)) == 0 && b.n_msgs == 2);
         static uint8_t fb[KDB_MAX_BODY];
         kdb_framer_t f;
@@ -1459,7 +1489,7 @@ static void test_kdb_name_case(void) {
     CHECK(fa.count == N);
     rt_buf_t b = {0};
     char err[200];
-    if (!z->failed) CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL }, rt_emit, &b, err, sizeof(err)) == 0);
+    if (!z->failed) CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 }, rt_emit, &b, err, sizeof(err)) == 0);
     for (size_t i = 0; i < N && !z->failed && i < fa.count; i++) {
         const dns_record_t *dbrec = NULL;
         for (size_t k = 0; k < z->arena.count; k++)
@@ -2011,6 +2041,137 @@ static void test_limits(void) {
     }
 }
 
+/* ------------------------------------------------------------------ D1a milestone 4: the summary of a primary zone */
+static void test_summary(void) {
+    printf("summary of a primary zone (D1a milestone 4): settings, serial, SOA timers, flags; no rows, no digest, no gate\n");
+    db_meta_row_t m[] = { M("ALLOW-AXFR-FROM", "192.0.2.1"), M("PRESIGNED", "1"), M("X-KARIDNS-CACHE", "pin") };
+    pdns_zone_t *z = pdns_zone_new("s.test", NULL);
+    CHECK(z != NULL);
+    pdns_zone_set_summary(z, 4711, true, 7200, 3600, 1209600);
+    for (size_t i = 0; i < 3; i++) pdns_zone_add_meta(z, &m[i]);
+    CHECK(pdns_zone_finish(z) == 0);                         /* no SOA row: a summary needs none */
+    CHECK_MSG(!z->failed, "%s", z->error);
+    CHECK(z->serial == 4711);
+    CHECK_HAS(z->settings, "allow-transfer { 192.0.2.1; };");
+    CHECK_HAS(z->settings, "cache pin;");
+    gate_seen_t g = { 0, 0, { 0 }, 0 };
+    pdns_kdb_params_t p = { 2, 99, KDB_ZK_PRIMARY, NULL, test_gate, &g, NULL, 0 };
+    rt_buf_t b = {0};
+    char err[200];
+    CHECK(pdns_zone_encode_kdb(z, &p, rt_emit, &b, err, sizeof(err)) == 0 && g.calls == 0);     /* the digest gate is not asked */
+    CHECK(b.n_msgs == 2);                                    /* ZONE_BEGIN and ZONE_END */
+    static uint8_t fb[KDB_MAX_BODY];
+    kdb_framer_t f;
+    kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
+    CHECK(kdb_framer_feed(&f, b.buf, b.len) == KDB_OK);
+    kdb_frame_t fr;
+    kdb_msg_t msg;
+    char why[200];
+    CHECK(kdb_framer_next(&f, &fr) == KDB_OK && fr.type == KDB_T_ZONE_BEGIN);
+    CHECK(kdb_decode(&fr, KDB_VIEWS_ANY, &msg, why, sizeof(why)) == KDB_OK);
+    const kdb_zone_begin_t *zb = &msg.u.zone_begin;
+    CHECK(zb->view == 2 && zb->source_id == 99 && zb->zone_kind == KDB_ZK_PRIMARY && zb->serial == 4711 && zb->rr_count == 0);
+    CHECK((zb->flags & KDB_ZF_SUMMARY) && (zb->flags & KDB_ZF_PRESIGNED));
+    CHECK(zb->has_soa_timers && zb->soa_refresh == 7200 && zb->soa_retry == 3600 && zb->soa_expire == 1209600);
+    uint8_t zero[KDB_DIGEST_LEN] = { 0 };
+    CHECK(memcmp(zb->digest, zero, KDB_DIGEST_LEN) == 0);
+    CHECK(zb->settings.p && zb->settings.len == strlen(z->settings) && memcmp(zb->settings.p, z->settings, zb->settings.len) == 0);
+    CHECK(kdb_framer_next(&f, &fr) == KDB_OK && fr.type == KDB_T_ZONE_END);
+    free(b.buf);
+    pdns_zone_free(z);
+    {   /* without timers: tags 12..14 are absent */
+        pdns_zone_t *z2 = pdns_zone_new("t.test", NULL);
+        pdns_zone_set_summary(z2, 5, false, 0, 0, 0);
+        CHECK(pdns_zone_finish(z2) == 0);
+        rt_buf_t b2 = {0};
+        CHECK(pdns_zone_encode_kdb(z2, &p, rt_emit, &b2, err, sizeof(err)) == 0);
+        kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
+        CHECK(kdb_framer_feed(&f, b2.buf, b2.len) == KDB_OK && kdb_framer_next(&f, &fr) == KDB_OK);
+        CHECK(kdb_decode(&fr, KDB_VIEWS_ANY, &msg, why, sizeof(why)) == KDB_OK && !msg.u.zone_begin.has_soa_timers);
+        free(b2.buf);
+        pdns_zone_free(z2);
+    }
+}
+
+/* D1a step 6: the apex in the summary's ZONE_BEGIN (tags 15..20): names, minimum, TTLs rounded to 2^31 - 1, the NS names as sent; only with the timers */
+static void test_summary_apex(void) {
+    printf("summary of a primary zone (D1a step 6): the apex, tags 15 to 20\n");
+    pdns_zone_t *z = pdns_zone_new("s.test", NULL);
+    pdns_zone_set_summary(z, 4711, true, 7200, 3600, 1209600);
+    CHECK(pdns_zone_set_apex(z, "ns1.hosting.example.", "host.hosting.example.", 4000000000u, 900, 4294967295u, "ns1.hosting.example.\nns2.hosting.example.", NULL, 0) == 0);
+    CHECK(pdns_zone_set_apex(z, "ns1.hosting.example.", "host.hosting.example.", 4000000000u, 900, 4294967295u, "ns1.hosting.example.\nns2.hosting.example.", NULL, 0) == 0);   /* (again: the first copy is freed) */
+    CHECK(pdns_zone_finish(z) == 0);
+    pdns_kdb_params_t p = { 2, 99, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 };
+    rt_buf_t b = {0};
+    char err[200], why[200];
+    CHECK(pdns_zone_encode_kdb(z, &p, rt_emit, &b, err, sizeof(err)) == 0);
+    static uint8_t fb[KDB_MAX_BODY];
+    kdb_framer_t f;
+    kdb_frame_t fr;
+    kdb_msg_t msg;
+    kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
+    CHECK(kdb_framer_feed(&f, b.buf, b.len) == KDB_OK && kdb_framer_next(&f, &fr) == KDB_OK);
+    CHECK(kdb_decode(&fr, KDB_VIEWS_ANY, &msg, why, sizeof(why)) == KDB_OK);
+    const kdb_zone_begin_t *zb = &msg.u.zone_begin;
+    CHECK(zb->has_apex && strcmp(zb->soa_mname, "ns1.hosting.example.") == 0 && strcmp(zb->soa_rname, "host.hosting.example.") == 0);
+    CHECK(zb->soa_minimum == 2147483647u && zb->soa_ttl == 900 && zb->ns_ttl == 2147483647u && zb->ns_count == 2);
+    CHECK(zb->ns_names_len == strlen("ns1.hosting.example.\nns2.hosting.example.") && memcmp(zb->ns_names, "ns1.hosting.example.\nns2.hosting.example.", zb->ns_names_len) == 0);
+    CHECK(zb->glue == NULL && zb->glue_len == 0);                      /* (no glue was given) */
+    free(b.buf);
+    pdns_zone_free(z);
+    {   /* the glue (tag 21): copied with the apex, on the wire as given, replaced by the next call */
+        static const uint8_t gl[] = { 0, 1, 0, 0, 0x0e, 0x10, 192, 0, 2, 53 };
+        pdns_zone_t *zg = pdns_zone_new("g.test", NULL);
+        pdns_zone_set_summary(zg, 4711, true, 7200, 3600, 1209600);
+        CHECK(pdns_zone_set_apex(zg, "ns1.g.test.", "host.g.test.", 300, 900, 3600, "ns1.g.test.", gl, sizeof(gl)) == 0);
+        CHECK(pdns_zone_set_apex(zg, "ns1.g.test.", "host.g.test.", 300, 900, 3600, "ns1.g.test.", gl, sizeof(gl)) == 0);
+        CHECK(pdns_zone_finish(zg) == 0);
+        rt_buf_t bg = {0};
+        CHECK(pdns_zone_encode_kdb(zg, &p, rt_emit, &bg, err, sizeof(err)) == 0);
+        kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
+        CHECK(kdb_framer_feed(&f, bg.buf, bg.len) == KDB_OK && kdb_framer_next(&f, &fr) == KDB_OK);
+        CHECK(kdb_decode(&fr, KDB_VIEWS_ANY, &msg, why, sizeof(why)) == KDB_OK);
+        CHECK(msg.u.zone_begin.has_apex && msg.u.zone_begin.glue_len == sizeof(gl) && memcmp(msg.u.zone_begin.glue, gl, sizeof(gl)) == 0);
+        free(bg.buf);
+        pdns_zone_free(zg);
+        /* the addresses: the octets of the RDATA of an A / AAAA record, 0 for anything else */
+        uint8_t ad[16];
+        CHECK(pdns_apex_addr(1, "192.0.2.53", ad) == 4 && ad[0] == 192 && ad[3] == 53);
+        CHECK(pdns_apex_addr(28, "2001:db8::53", ad) == 16 && ad[0] == 0x20 && ad[15] == 0x53);
+        CHECK(pdns_apex_addr(1, "2001:db8::53", ad) == 0 && pdns_apex_addr(28, "192.0.2.53", ad) == 0 && pdns_apex_addr(1, "192.0.2.256", ad) == 0);
+        CHECK(pdns_apex_addr(1, "", ad) == 0 && pdns_apex_addr(1, NULL, ad) == 0 && pdns_apex_addr(2, "192.0.2.53", ad) == 0);
+    }
+    {   /* the NOTIFY addresses (tag 22, D1a step 7): copied, on the wire as given, replaced (len 0 drops them) by the next call */
+        static const uint8_t na[] = { 1, 1, 192, 0, 2, 77 };
+        pdns_zone_t *zn = pdns_zone_new("n.test", NULL);
+        pdns_zone_set_summary(zn, 4712, true, 7200, 3600, 1209600);
+        CHECK(pdns_zone_set_apex(zn, "ns1.n.test.", "host.n.test.", 300, 900, 3600, "ns1.n.test.\nns1.prov.test.", NULL, 0) == 0);
+        CHECK(pdns_zone_set_notify_addrs(zn, na, sizeof(na)) == 0 && zn->sum_naddr_len == sizeof(na));
+        CHECK(pdns_zone_finish(zn) == 0);
+        rt_buf_t bn = {0};
+        CHECK(pdns_zone_encode_kdb(zn, &p, rt_emit, &bn, err, sizeof(err)) == 0);
+        kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
+        CHECK(kdb_framer_feed(&f, bn.buf, bn.len) == KDB_OK && kdb_framer_next(&f, &fr) == KDB_OK);
+        CHECK(kdb_decode(&fr, KDB_VIEWS_ANY, &msg, why, sizeof(why)) == KDB_OK);
+        CHECK(msg.u.zone_begin.has_apex && msg.u.zone_begin.naddrs_len == sizeof(na) && memcmp(msg.u.zone_begin.naddrs, na, sizeof(na)) == 0);
+        CHECK(pdns_zone_set_notify_addrs(zn, NULL, 0) == 0 && zn->sum_naddr == NULL && zn->sum_naddr_len == 0);
+        free(bn.buf);
+        pdns_zone_free(zn);
+    }
+    {   /* without the timers there is no apex on the wire (the Backend takes tags 15..20 with the timers only) */
+        pdns_zone_t *z2 = pdns_zone_new("t.test", NULL);
+        pdns_zone_set_summary(z2, 5, false, 0, 0, 0);
+        CHECK(pdns_zone_set_apex(z2, "a.example.", "b.example.", 1, 2, 3, "c.example.", NULL, 0) == 0 && pdns_zone_finish(z2) == 0);
+        rt_buf_t b2 = {0};
+        CHECK(pdns_zone_encode_kdb(z2, &p, rt_emit, &b2, err, sizeof(err)) == 0);
+        kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
+        CHECK(kdb_framer_feed(&f, b2.buf, b2.len) == KDB_OK && kdb_framer_next(&f, &fr) == KDB_OK);
+        CHECK(kdb_decode(&fr, KDB_VIEWS_ANY, &msg, why, sizeof(why)) == KDB_OK && !msg.u.zone_begin.has_apex);
+        free(b2.buf);
+        pdns_zone_free(z2);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--gen-corpus") == 0) return gen_corpus(argv[2]);
     if (argc == 2) g_zones_dir = argv[1];
@@ -2029,6 +2190,8 @@ int main(int argc, char **argv) {
     test_limits();
     test_kdb();
     test_secondary();
+    test_summary();
+    test_summary_apex();
     test_kdb_name_case();
     test_zone2sql();
     test_zone_files();

@@ -36,6 +36,12 @@ zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname);
 zone_db_entry_t *find_zone_for_query(view_snapshot_t *view, const char *qname, uint16_t qtype);
 void free_zone_db_entry(zone_db_entry_t *entry);
 void *gc_snapshot_thread(void *arg);
+/* Start the cleanup thread of every retired snapshot that has none (a start that failed is tried again by every publication, every ended
+ * cleanup thread and the control thread's tick); gc_has_unstarted() says whether there is one.  zdir_gc_queued(): the retired snapshots
+ * that are not drained yet (unit tests). */
+void gc_start_pending(void);
+bool gc_has_unstarted(void);
+size_t zdir_gc_queued(void);
 void gc_snapshot_detach_only(void); /* the Backend, right after fork: its cleanup threads are detached from now on */
 void gc_snapshot_wait_idle(void); /* the process manager calls it before every fork(): no helper thread may be running */
 zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name);

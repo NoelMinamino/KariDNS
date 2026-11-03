@@ -147,6 +147,58 @@ static void cat_write_version(size_t k) {
     snprintf(b, sizeof(b), FI_CAT2[k], g_serial++); cwrite("cat2.zone", b);
 }
 
+/* A digest of everything a failed change must leave as it was: the zones of the index (name, entry, owner and unique id of a catalog member,
+ * groups, the members a catalog zone lists), the CoO intentions, the number of queued changes and (with_registry) the hidden state of the
+ * registry's zones d1..d6.  The elements are added up, so the order of the slots does not matter (a table that grew has another order).
+ * (Call it with the fault injection paused.) */
+extern pending_coo_t *g_pending_coo;
+extern int g_pending_coo_count;
+
+static uint64_t fi_fnv(const char *s) {
+    uint64_t h = 1469598103934665603ull;
+    for (; *s; s++) h = (h ^ (uint8_t)*s) * 1099511628211ull;
+    return h;
+}
+
+static uint64_t fi_digest(bool with_registry) {
+    uint64_t sum = 0, ordered = 7;
+    char t[2048];
+    zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
+    for (size_t v = 0; snap && v < snap->view_count; v++) {
+        zdir_iter_t it;
+        zdir_iter_init(&it, &snap->views[v]);
+        for (zdir_elem_t *e; (e = zdir_iter_next(&it));) {
+            zone_db_entry_t *en = zdir_entry(e);
+            size_t o = (size_t)snprintf(t, sizeof(t), "%s|%s|%p|%s|%s|%d", snap->views[v].name, e->name, (void *)en,
+                                        en ? zone_entry_catalog_owner(en) : "", en ? zone_entry_catalog_uid(en) : "", en ? en->group_count : 0);
+            for (int g = 0; en && g < en->group_count && o < sizeof(t); g++) o += (size_t)snprintf(t + o, sizeof(t) - o, "|g:%s", en->groups[g]);
+            for (int m = 0; en && m < en->catalog_member_count && o < sizeof(t); m++)
+                o += (size_t)snprintf(t + o, sizeof(t) - o, "|m:%s/%s", en->catalog_members[m].domain, en->catalog_members[m].unique_id);
+            sum += fi_fnv(t);
+        }
+    }
+    release_zone_snapshot(snap);
+    for (int p = 0; p < g_pending_coo_count; p++) {
+        snprintf(t, sizeof(t), "%s|%s|%s", g_pending_coo[p].domain, g_pending_coo[p].old_catalog, g_pending_coo[p].new_catalog);
+        ordered = ordered * 31 + fi_fnv(t);
+    }
+    sum += ordered * 17 + (uint64_t)dbreg_pending_count();
+    for (int i = 0; with_registry && i < 6; i++) {
+        char nm[32];
+        dbreg_info_t inf;
+        snprintf(nm, sizeof(nm), "d%d.test.", i + 1);
+        int n = dbreg_find_info("default", nm, &inf, 1);
+        snprintf(t, sizeof(t), "%s|%d|%d|%d|%d|%d", nm, n, n ? inf.shadowed : 0, n ? inf.shadow_by : 0, n ? inf.has_entry : 0, n ? (int)inf.source_id : 0);
+        sum += fi_fnv(t);
+    }
+    return sum;
+}
+
+/* with this set, every membership change of cat_run() that did not publish a snapshot (it failed, or had nothing to change) must have left
+ * the zones, their owners and groups, the member lists and the CoO intentions as they were */
+static bool g_cat_check;
+static unsigned g_cat_unchanged;      /* how many such changes were compared */
+
 /* reload both catalogs in every view; with 'process' also apply membership */
 static void cat_run(server_config_t *cfg, bool reload, bool process) {
     zone_db_snapshot_t *snap = acquire_zone_snapshot();
@@ -165,7 +217,26 @@ static void cat_run(server_config_t *cfg, bool reload, bool process) {
             zone_config_t *zc = find_zone_config_in_view(cfg, vnames[v], cats[c]);
             if (!ents[v][c] || !zc) continue;
             if (reload) (void)reload_master_zone(ents[v][c], zc);
-            if (process) catalog_process_membership(ents[v][c], zc, vnames[v]);
+            if (process) {
+                zone_db_snapshot_t *before_snap = NULL;
+                uint64_t before = 0;
+                if (g_cat_check) {
+                    fi_pause();
+                    before_snap = acquire_retained_zone_snapshot();      /* (kept: its address cannot be reused by the next snapshot) */
+                    before = fi_digest(false);
+                    fi_resume();
+                }
+                catalog_process_membership(ents[v][c], zc, vnames[v]);
+                if (g_cat_check) {
+                    fi_pause();
+                    if (acquire_zone_snapshot() == before_snap) {
+                        assert(fi_digest(false) == before);
+                        g_cat_unchanged++;
+                    }
+                    release_zone_snapshot(before_snap);
+                    fi_resume();
+                }
+            }
         }
     }
 }
@@ -202,7 +273,9 @@ static void test_fi_catalog_membership(void) {
                 cat_write_version(to);
                 cat_run(cfg, true, false);
                 fi_resume();
+                g_cat_check = true;
                 cat_run(cfg, false, true);
+                g_cat_check = false;
                 fi_pause();
                 /* whatever failed, the published snapshot must stay usable */
                 zone_db_snapshot_t *snap = acquire_zone_snapshot();
@@ -218,12 +291,293 @@ static void test_fi_catalog_membership(void) {
             });
         }
     }
-    printf("  -> catalog membership transitions under OOM: %u runs\n", runs);
+    printf("  -> catalog membership transitions under OOM: %u runs, %u changes without a new snapshot compared with the state before\n", runs, g_cat_unchanged);
+    assert(g_cat_unchanged > 0);
+}
+
+/* ---------------------------------------------------------------------------
+ * The zone directory under allocation failure (D1a): the DB zone registry commits zones (elements, queues, the replaced entry's
+ * node), the delta changes the directory in place (plans, a bigger table, a new tick list, the clone of the snapshot), zones are
+ * deleted, and the full rebuild hides a DB zone behind a zone { } block.  Whatever fails, the directory must stay usable:
+ * a lookup finds the zones that were applied, the walk and the counter agree, and nothing is freed twice.
+ * ------------------------------------------------------------------------- */
+static void fi_dir_check(void) {
+    zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
+    if (!snap) return;
+    for (size_t v = 0; v < snap->view_count; v++) {
+        size_t n = 0;
+        zdir_iter_t it;
+        zdir_iter_init(&it, &snap->views[v]);
+        for (zdir_elem_t *e; (e = zdir_iter_next(&it));) {
+            n++;
+            zone_db_entry_t *en = zdir_entry(e);
+            assert(en && zdir_find_exact(&snap->views[v], e->name) == e);
+            assert(find_zone_in_view(&snap->views[v], e->name) == en);
+        }
+        assert(n == zdir_count(&snap->views[v]));
+    }
+    release_zone_snapshot(snap);
+}
+
+/* the delta of the DB zones; when it fails (out of memory) the planning has changed nothing: the zones of the index, the hidden state of the
+ * registry's zones, the CoO intentions and the queued changes are as they were (the changes are kept for the next try) */
+static unsigned g_delta_failed;       /* how many failed deltas were compared */
+
+static int fi_delta_checked(void) {
+    fi_pause();
+    uint64_t before = fi_digest(true);
+    fi_resume();
+    int rc = snapshot_apply_db_delta();
+    if (rc < 0) {
+        fi_pause();
+        assert(fi_digest(true) == before);
+        g_delta_failed++;
+        fi_resume();
+    }
+    return rc;
+}
+
+static void test_fi_directory_delta(void) {
+    zone_config_t zc;
+    memset(&zc, 0, sizeof(zc));
+    zc.domain = (char *)"static.test.";
+    zc.type = (char *)"master";
+    view_config_t vcfg;
+    memset(&vcfg, 0, sizeof(vcfg));
+    vcfg.name = (char *)"default";
+    vcfg.zones = &zc;
+    server_config_t config;
+    memset(&config, 0, sizeof(config));
+    config.views = &vcfg;
+    atomic_store_explicit(&g_config_db.active, &config, memory_order_release);
+    zone_config_t zc2 = zc;
+    zc2.domain = (char *)"d1.test.";                    /* a zone { } with the name of a DB zone: it hides it in the second configuration */
+    server_config_t config2 = config;
+    view_config_t vcfg2 = vcfg;
+    vcfg2.zones = &zc2;
+    config2.views = &vcfg2;
+
+    unsigned runs = 0;
+    uint8_t dg[32] = { 1 };
+    FI_SWEEP({
+        fi_pause();
+        dbreg_reset();
+        zone_db_snapshot_t *s0 = rebuild_zone_db_snapshot(&config, NULL, NULL, NULL, NULL, 0);
+        assert(s0);
+        zone_db_entry_t *ents[6] = { 0 };
+        const char *names[6] = { "d1.test.", "d2.test.", "d3.test.", "d4.test.", "d5.test.", "d6.test." };
+        for (int i = 0; i < 6; i++) {
+            ents[i] = create_new_zone_entry(names[i], "default");
+            assert(ents[i]);
+            ents[i]->source = ZONE_SRC_DB;
+            if (i == 5) {                                    /* a secondary: it ticks, so the tick list is rebuilt */
+                ents[i]->is_secondary = true;
+                ents[i]->kind = ZONE_KIND_SECONDARY;
+            }
+        }
+        fi_resume();
+        for (int i = 0; i < 6; i++) {
+            if (dbreg_commit("default", names[i], ents[i], true, 100 + i, 1, dg, NULL) != 0) {
+                fi_pause();
+                free_zone_db_entry(ents[i]);                 /* (the caller keeps a new entry the registry could not take) */
+                ents[i] = NULL;
+                fi_resume();
+            }
+        }
+        (void)fi_delta_checked();
+        (void)fi_delta_checked();                            /* a failed delta is tried again */
+        fi_pause();
+        fi_dir_check();
+        fi_resume();
+        /* a new entry for a zone that is in the index (the old one is given back), then deletions */
+        zone_db_entry_t *again = NULL;
+        fi_pause();
+        again = create_new_zone_entry("d2.test.", "default");
+        assert(again);
+        again->source = ZONE_SRC_DB;
+        fi_resume();
+        if (dbreg_commit("default", "d2.test.", again, true, 101, 2, dg, NULL) != 0) {
+            fi_pause();
+            free_zone_db_entry(again);
+            fi_resume();
+        }
+        (void)dbreg_delete("default", "d3.test.", 102);
+        (void)dbreg_delete("default", "d4.test.", 103);
+        (void)fi_delta_checked();
+        (void)fi_delta_checked();
+        fi_pause();
+        fi_dir_check();
+        /* (the zones of the index, not the registry's hidden flags: the full rebuild of a configuration, unlike the delta, sets those while it
+         * collects the DB zones and sets them again at the retry; that is how it was before the directory) */
+        uint64_t before_rebuild = fi_digest(false);
+        fi_resume();
+        /* the full rebuild with a zone { } that hides d1.test.: when it fails it has hidden nothing */
+        zone_db_snapshot_t *s1 = rebuild_zone_db_snapshot(&config2, NULL, NULL, NULL, NULL, 0);
+        fi_pause();
+        if (!s1) assert(fi_digest(false) == before_rebuild);
+        fi_dir_check();
+        gc_snapshot_wait_idle();
+        zone_retire_process(true);
+        fi_resume();
+        runs++;
+    });
+    fi_reset();
+    dbreg_reset();
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
+    printf("  -> zone directory (commit, delta, delete, hide) under OOM: %u runs, %u failed deltas compared with the state before\n", runs, g_delta_failed);
+    assert(g_delta_failed > 0);
+}
+
+/* ---------------------------------------------------------------------------
+ * A queued DB zone whose name an element of the index has when the delta is planned: the zone { } of karidns.conf wins (D-PRIO) and
+ * the registry's zone is hidden by it.  (The race this stands for: the commit looked at the configuration before a reload, the rebuild
+ * of the reload ran, then the commit queued the zone.)  Here the index has the zone { d1.test. } while the configuration the commit
+ * looks at does not.  Under out-of-memory the plan that hides it changes nothing until it is carried out.
+ * ------------------------------------------------------------------------- */
+static zone_db_entry_t *gc_mk(const char *name);
+
+static void test_fi_delta_hide(void) {
+    zone_config_t zc1, zc2;
+    memset(&zc1, 0, sizeof(zc1));
+    zc1.domain = (char *)"static.test.";
+    zc1.type = (char *)"master";
+    zc2 = zc1;
+    zc2.domain = (char *)"d1.test.";
+    view_config_t vc1, vc2;
+    memset(&vc1, 0, sizeof(vc1));
+    vc1.name = (char *)"default";
+    vc2 = vc1;
+    vc1.zones = &zc1;
+    vc2.zones = &zc2;
+    server_config_t cfg1, cfg2;
+    memset(&cfg1, 0, sizeof(cfg1));
+    cfg1.views = &vc1;
+    cfg2 = cfg1;
+    cfg2.views = &vc2;
+
+    unsigned runs = 0, hidden = 0;
+    uint8_t dg[32] = { 1 };
+    FI_SWEEP({
+        fi_pause();
+        dbreg_reset();
+        atomic_store_explicit(&g_config_db.active, &cfg2, memory_order_release);
+        zone_db_snapshot_t *s = rebuild_zone_db_snapshot(&cfg2, NULL, NULL, NULL, NULL, 0);
+        assert(s);                                           /* (the index has d1.test. as the zone { } of the configuration) */
+        atomic_store_explicit(&g_config_db.active, &cfg1, memory_order_release);   /* the commit does not see it */
+        zone_db_entry_t *e = gc_mk("d1.test.");
+        fi_resume();
+        bool committed = dbreg_commit("default", "d1.test.", e, true, 300, 1, dg, NULL) == 0;
+        if (!committed) {
+            fi_pause();
+            free_zone_db_entry(e);
+            fi_resume();
+        }
+        (void)fi_delta_checked();
+        (void)fi_delta_checked();
+        fi_pause();
+        fi_dir_check();
+        dbreg_info_t inf;
+        if (committed && dbreg_pending_count() == 0) {
+            assert(dbreg_find_info("default", "d1.test.", &inf, 1) == 1);
+            assert(inf.shadowed && inf.shadow_by == DBREG_SH_CONFIG);
+            zone_db_snapshot_t *cur = acquire_retained_zone_snapshot();
+            assert(cur && find_zone_in_view(&cur->views[0], "d1.test.") != e);   /* the zone { } is served, not the DB zone */
+            release_zone_snapshot(cur);
+            hidden++;
+        }
+        gc_snapshot_wait_idle();
+        zone_retire_process(true);
+        fi_resume();
+        runs++;
+    });
+    fi_reset();
+    dbreg_reset();
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
+    printf("  -> DB zone hidden by a zone { } found at the delta, under OOM: %u runs, hidden in %u\n", runs, hidden);
+    assert(hidden > 0);
+}
+
+/* ---------------------------------------------------------------------------
+ * The cleanup thread of a retired snapshot cannot be started (pthread_create fails once).  The snapshot stays queued with its garbage
+ * (the garbage of every later snapshot waits behind it, the release is in order), and the next try frees all of it: the next publish
+ * (case 1) or the control thread's tick (case 2, gc_start_pending()) starts the threads.
+ * ------------------------------------------------------------------------- */
+static zone_db_entry_t *gc_mk(const char *name) {
+    zone_db_entry_t *e = create_new_zone_entry(name, "default");
+    assert(e);
+    e->source = ZONE_SRC_DB;
+    return e;
+}
+
+static void gc_commit(const char *name, int64_t id, int64_t ver) {
+    uint8_t dg[32] = { 1 };
+    zone_db_entry_t *e = gc_mk(name);
+    assert(dbreg_commit("default", name, e, true, id, ver, dg, NULL) == 0);
+}
+
+static void test_fi_gc_thread_start(void) {
+    zone_config_t zc;
+    memset(&zc, 0, sizeof(zc));
+    zc.domain = (char *)"static.test.";
+    zc.type = (char *)"master";
+    view_config_t vcfg;
+    memset(&vcfg, 0, sizeof(vcfg));
+    vcfg.name = (char *)"default";
+    vcfg.zones = &zc;
+    server_config_t config;
+    memset(&config, 0, sizeof(config));
+    config.views = &vcfg;
+    atomic_store_explicit(&g_config_db.active, &config, memory_order_release);
+
+    for (int how = 0; how < 2; how++) {
+        fi_reset();
+        dbreg_reset();
+        assert(rebuild_zone_db_snapshot(&config, NULL, NULL, NULL, NULL, 0));
+        gc_snapshot_wait_idle();
+        assert(zdir_gc_queued() == 0 && !gc_has_unstarted());
+        gc_commit("g1.test.", 200, 1);
+        gc_commit("g2.test.", 201, 1);
+        assert(snapshot_apply_db_delta() > 0);                 /* the first snapshot retires, its thread starts */
+        gc_snapshot_wait_idle();
+        assert(zdir_gc_queued() == 0);
+
+        /* a replacement (the old entry is garbage) and a deletion, with the cleanup thread of the retired snapshot failing */
+        gc_commit("g2.test.", 201, 2);
+        assert(dbreg_delete("default", "g1.test.", 200) == 1);
+        fi_reset();
+        fi_arm_nth(FI_PTHREAD_CREATE, 1);
+        assert(snapshot_apply_db_delta() > 0);
+        assert(fi_fired_kind(FI_PTHREAD_CREATE));
+        assert(gc_has_unstarted() && zdir_gc_queued() == 1);   /* kept, with its garbage */
+        gc_snapshot_wait_idle();
+        assert(zdir_gc_queued() == 1);                         /* (nothing frees it) */
+        fi_reset();
+
+        if (how == 0) {
+            /* the next publish: its snapshot queues behind the first, and both threads are started */
+            gc_commit("g3.test.", 202, 1);
+            assert(snapshot_apply_db_delta() > 0);
+        } else {
+            gc_start_pending();                                /* the control thread's tick */
+        }
+        gc_snapshot_wait_idle();
+        assert(!gc_has_unstarted());
+        assert(zdir_gc_queued() == 0);                         /* every queued snapshot was drained and freed with its garbage */
+        fi_dir_check();
+        zone_retire_process(true);
+    }
+    fi_reset();
+    dbreg_reset();
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
+    printf("  -> cleanup thread that cannot be started: kept, then freed by the next publish and by the tick\n");
 }
 
 int main(void) {
     printf("[*] Running test_fi_snapshot...\n");
     test_fi_snapshot_rebuild();
+    test_fi_directory_delta();
+    test_fi_delta_hide();
+    test_fi_gc_thread_start();
     test_fi_catalog_membership();
     tmpdir_remove(g_cdir);
     printf("[+] test_fi_snapshot passed successfully.\n");

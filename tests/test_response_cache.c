@@ -375,8 +375,7 @@ static void test_wire_cache_consistency(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
 
@@ -1007,8 +1006,7 @@ static void test_wire_cache_max_records_limit(void) {
         view_snapshot_t view;
         memset(&view, 0, sizeof(view));
         view.name = "default";
-        view.entries = entries;
-        view.zone_count = 1;
+        view_set_entries(&view, entries, 1);
         view.match_clients = any_acl;
         view.match_clients_count = 1;
 
@@ -1084,8 +1082,7 @@ static void test_rcache_cross_zone_cname_not_cached(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 2;
+    view_set_entries(&view, entries, 2);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
     zone_db_snapshot_t snap;
@@ -1153,8 +1150,7 @@ static void test_rcache_cut_additional_not_cached(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
     zone_db_snapshot_t snap;
@@ -1220,8 +1216,7 @@ static void world_finish(glue_world_t *w, int n) {
     w->any_acl[0] = (char *)"any";
     memset(&w->view, 0, sizeof(w->view));
     w->view.name = "default";
-    w->view.entries = w->entries;
-    w->view.zone_count = (size_t)n;
+    view_set_entries(&w->view, w->entries, (size_t)n);
     w->view.match_clients = w->any_acl;
     w->view.match_clients_count = 1;
     memset(&w->snap, 0, sizeof(w->snap));
@@ -1550,8 +1545,7 @@ static void test_wire_cache_observatory_counters(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
+    view_set_entries(&view, entries, 1);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
 
@@ -1776,8 +1770,7 @@ static void test_acl_before_response_cache(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "__default__";
-    view.entries = entries;
-    view.zone_count = 2;
+    view_set_entries(&view, entries, 2);
     view.match_clients = any_acl;
     view.match_clients_count = 1;
     zone_db_snapshot_t snap;

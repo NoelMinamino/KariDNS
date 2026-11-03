@@ -36,6 +36,19 @@ static _Thread_local bool t_resolve_sibling_glue;
 static _Thread_local bool t_resolve_alias_expanded;
 static _Thread_local bool t_resolve_alias_failed;
 
+/* D1a step 8 (design 5): a CNAME / DNAME chain or the glue of an NS / MX / SRV target leads into a zone of the view that is in the directory and whose data
+ * is not in memory.  The answer is what it is without it -- the chain stops there (RFC 1034 4.3.2: the resolver follows it itself) and the sibling's glue is left
+ * out (RFC 9471 3.2: glue is a SHOULD, and "not at hand" is a good reason) -- and is not stored in the response cache; the zone is asked for in the background so
+ * that the next query finds it: the hook hands (view, zone) to the ingest thread (dns_park.c, park_bg_fetch(): the slots of the requests of threads that are not
+ * workers, priority background, one request for a zone in a few seconds, and nothing while a fetch of it is on its way), no I/O and no waiting here.  NULL: no hook
+ * (the engine on its own, a tool). */
+void (*g_query_bg_fetch)(const char *view_name, const char *zone) = NULL;
+static void bg_fetch_nonresident(const view_snapshot_t *view, const zdir_elem_t *pel) {
+  if (!pel || !view || !view->name || !g_query_bg_fetch || zdir_entry(pel)) return;
+  if (atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) != ZDIR_ST_ABSENT) return;     /* (LOADING: on its way; ERROR: nothing to read) */
+  g_query_bg_fetch(zdir_holder_view(view, pel), pel->name);
+}
+
 /* allow-query / allow-query-on (BIND 9.20 ARM): what the ACL check needs besides the client address.  The transport sets the address
  * the query came to (query_set_local_addr()) right before it calls process_dns_query*(); the call reads it and clears it, so a caller
  * that does not set it (unit tests, fuzzers) gives "unknown".  t_qacl.key is the TSIG key the request was verified with. */
@@ -385,7 +398,13 @@ STATIC_TEST bool append_glue_records(const zone_image_t *img, const char *target
 
   // 3. Fallback: Search sibling authoritative zones in view dynamically if policy == ADDITIONAL_AUTH_YES
   if (policy == ADDITIONAL_AUTH_YES && sib_ctx && sib_ctx->view) {
-    zone_db_entry_t *sib_entry = find_zone_in_view(sib_ctx->view, target);
+    zdir_elem_t *sib_pel = NULL;
+    zone_db_entry_t *sib_entry = find_zone_for_query_ex(sib_ctx->view, target, 0, &sib_pel);
+    if (!sib_entry && sib_pel) {
+      /* a sibling zone that is in the directory and not in memory (D1a): no glue from it now, the answer is not stored, the zone is asked for in the background */
+      t_resolve_sibling_glue = true;
+      bg_fetch_nonresident(sib_ctx->view, sib_pel);
+    }
     if (sib_entry) {
       zone_version_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
       const zone_image_t *sib = sib_arena ? sib_arena->image : NULL;
@@ -1274,10 +1293,18 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
        * 「QNAME に最も近い祖先のゾーン」を選ぶので、対象が今のゾーンの下でも、同じビューに子ゾーンが
        * あればそちらで答える (以前は親ゾーンに留まり、子への委任を返していた)。DS は R-32 の規則で
        * find_zone_for_query() が親ゾーンを選ぶ。forward/program ゾーンのデータは持たないので CNAME で止める。 */
-      zone_db_entry_t *new_db_entry = find_zone_for_query(view, current_qname, qtypes[0]);
+      zdir_elem_t *new_pel = NULL;
+      zone_db_entry_t *new_db_entry = view ? find_zone_for_query_ex(view, current_qname, qtypes[0], &new_pel) : find_zone_for_query(view, current_qname, qtypes[0]);
       if (!view && domain_name_is_at_or_below(current_qname, db_entry->domain) &&
           !(qtypes[0] == 43 && domain_names_match_ci(current_qname, db_entry->domain)))
         new_db_entry = db_entry; // ビューの無い呼び出し (応答キャッシュの構築など) はこのゾーンだけで続ける
+      if (!new_db_entry && new_pel) {
+        /* the zone the chain leads into is in the directory and not in memory (D1a): the chain stops here, the answer is not stored (the zone may be
+         * resident the next time), and the zone is asked for in the background */
+        t_resolve_crossed_zone = true;
+        bg_fetch_nonresident(view, new_pel);
+        return;
+      }
       if (!new_db_entry || new_db_entry->kind == ZONE_KIND_FORWARD || new_db_entry->kind == ZONE_KIND_PROGRAM)
         return;
       if (new_db_entry != db_entry) {
@@ -2096,6 +2123,8 @@ STATIC_TEST ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss
 }
 
 _Thread_local query_rrl_info_t t_query_rrl_info;
+/* D1a: process_dns_not_ready_routed() is asked whether the query may be parked (see there) */
+static _Thread_local bool t_nr_probe;
 /* X-20: 直前の要求の TSIG の状態 (鍵は設定スナップショット内)。RRL の slip 応答の署名に使う */
 static _Thread_local tsig_request_t t_query_tsig;
 
@@ -2880,6 +2909,234 @@ static bool notify_from_member_primaries(server_config_t *cfg, view_snapshot_t *
   return !need || (tkey && tsig_key_names_equal(tkey->name, need));
 }
 
+/* minimal-responses of the client's view (lib/ns/query.c: client->view->minimalresponses), else options'; no-auth-recursive is no-auth for a query with RD set and
+ * no for the others (ns_query_start()), so the mode returned is the one an answer is built with */
+static int query_minimal_mode(const server_config_t *cfg, const view_snapshot_t *view, const uint8_t *req) {
+  int mode = MINIMAL_NO;
+  if (cfg) {
+    const view_config_t *mr_view = (cfg->any_view_minimal && view) ? config_find_view(cfg, view->name) : NULL;
+    mode = config_minimal_responses(cfg, mr_view);
+    if (mode == MINIMAL_NO_AUTH_RECURSIVE) mode = (req[2] & 0x01) ? MINIMAL_NO_AUTH : MINIMAL_NO;
+  }
+  return mode;
+}
+
+/* The wire name at p (uncompressed, from the apex block) as text, for the directory lookup of an NS target. */
+static bool apex_name_text(const uint8_t *p, size_t len, char *out, size_t cap) {
+  size_t next;
+  return extract_wire_name_to_buffer(p, len, 0, &next, out, cap) >= 0;
+}
+
+/* Two uncompressed wire names (RFC 1035 3.1) are the same name: labels compared without regard to case (RFC 4343 2.1). */
+static bool wire_names_equal_ci(const uint8_t *a, const uint8_t *b) {
+  for (;;) {
+    uint8_t l = *a;
+    if (l != *b) return false;
+    if (l == 0) return true;
+    for (uint8_t i = 1; i <= l; i++) {
+      uint8_t x = a[i], y = b[i];
+      if (x >= 'A' && x <= 'Z') x = (uint8_t)(x + 32);
+      if (y >= 'A' && y <= 'Z') y = (uint8_t)(y + 32);
+      if (x != y) return false;
+    }
+    a += (size_t)l + 1;
+    b += (size_t)l + 1;
+  }
+}
+
+/* The size an answer may have on UDP when the query has EDNS: the size the client announced (512 at least) and no more than the server's limit (udp-bufsize,
+ * zone-udp-bufsize, view max-udp-size, the `server` statement of the client: RFC 6891 6.2.3, 6.2.5), the capacity of res when it is known.  Clamps edns->udp_payload_size
+ * too.  The limit the caller passed stays when the query has no EDNS, comes by TCP, or the caller's own buffer is smaller than a plain UDP answer (res[] must not be
+ * written past its end).  One function for the answer of a zone in memory and for the answer from a summary: the two give the same bytes. */
+static size_t edns_udp_limit(edns_info_t *edns, bool is_tcp, const server_config_t *cfg, const view_snapshot_t *view, const char *client_ip, size_t max_res_len,
+                             size_t res_cap) {
+  if (!edns->present) return max_res_len;
+  if (edns->udp_payload_size < 512) edns->udp_payload_size = 512;
+  if (is_tcp) return max_res_len;
+  uint16_t server_udp_size = edns->server_udp_size ? edns->server_udp_size : KARIDNS_UDP_BUFSIZE_DEFAULT;
+  /* the server statement of the client can set the limit (batch 5; BIND ns client.c: max-udp-size of the peer replaces the view's
+   * for this client, 512..4096).  Only looked for when some statement writes it; no allocation (inet_pton on the text address). */
+  if (cfg && cfg->any_server_max_udp) {
+    const server_stmt_t *psrv = config_server_find_ip(cfg, view ? view->name : NULL, client_ip);
+    if (psrv && (psrv->set & SV_MAX_UDP_SIZE)) server_udp_size = (uint16_t)psrv->max_udp_size;
+  }
+  if (edns->udp_payload_size > server_udp_size) edns->udp_payload_size = server_udp_size;
+  /* UDP 応答の上限はクライアントが OPT で通知したサイズ (512 以上に丸め、サーバーの
+   * udp-bufsize 以下。RFC 6891 §6.2.3、§6.2.5)。呼び出し側の max_res_len が大きくても小さくても
+   * 置き換える (以前は 512 ちょうどのとき呼び出し側の値のままで、非同期経路では 4096 まで
+   * 返しえた)。呼び出し側が 512 未満の小さなバッファを渡したときは広げない (res[] の範囲外へ
+   * 書き込むため)。res_cap が分かっていればそれを超えない。 */
+  if (max_res_len >= UDP_DEFAULT_MAX_RES_LEN) {
+    max_res_len = edns->udp_payload_size;
+    if (res_cap != 0 && max_res_len > res_cap) max_res_len = res_cap;
+  }
+  return max_res_len;
+}
+
+/* May this client transfer the zone (allow-transfer, the TSIG key, the zone's tsig-key, transfer-acl-match, acl-ceiling of a database zone)?  The question of an IXFR
+ * over UDP, which the zone transfer thread never sees.  False when there is no view, configuration or zone settings to say yes. */
+static bool udp_ixfr_allowed(const server_config_t *cfg, const zone_config_t *zcfg, const view_snapshot_t *view, const char *client_ip, const tsig_key_t *key) {
+  return cfg && zcfg && view && client_ip && zone_transfer_acl_allows_in_view(cfg, zcfg, view->name, client_ip, key ? key->name : NULL);
+}
+
+/* D1a step 6 (design 12-12): the answer to an SOA question at the apex of a zone that is not in memory, from the apex its summary brought.  It is what the
+ * zone in memory gives, byte for byte: the SOA RR in Answer (RFC 1035 3.3.13, the names compressed as the zone image's serializer does, RFC 1035 4.1.4)
+ * and, unless minimal-responses leaves it out, the NS RRset in Authority (RFC 1034 4.3.2 step 3a); the TTLs are the RRs' own (RFC 2181 5.2: the
+ * NS RRset has the lowest of them).  A zone in memory also adds the addresses of the NS targets it serves to Additional (glue, RFC 2181 9 allows it,
+ * and BIND does), and those are not in the summary: an NS target that a zone of this view contains (this zone, or a sibling) makes the summary
+ * insufficient, and so does everything else the body of a query does that the summary cannot (a cookie, ECS, DO = 1: RRSIGs, MQTYPE ...): the query
+ * then waits for the zone as before.  Returns the length of the response, or -1: not answered from the summary (nothing was written that matters). */
+static int build_apex_soa_answer(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len, const zdir_elem_t *elem, const zdir_apex_t *ap,
+                                 edns_info_t *edns, bool is_tcp, int minimal_mode, additional_from_auth_t policy, view_snapshot_t *view, compress_ctx_t *comp_ctx,
+                                 const tsig_request_t *tsig, server_config_t *cfg, const uint32_t *ixfr_serial) {
+  if (ap->serial != zdir_serial(elem) || ap->n_ns == 0) return -1;
+  if (edns->present && (edns->version != 0 || edns->dnssec_ok || edns->compact_answers_ok || edns->has_mqtype_query || edns->has_ecs || edns->has_malformed_ecs ||
+                        edns->has_karidns_ext || edns->has_cookie || edns->has_malformed_cookie || edns->ede_count != 0 || (edns->has_expire_query && !ixfr_serial) ||
+                        edns->has_expire_value))
+    return -1;
+  size_t q_end;
+  if (skip_wire_name(req, req_len, DNS_HEADER_SIZE, &q_end) != 0 || q_end + 4 > req_len) return -1;
+  if (((req[q_end + 2] << 8) | req[q_end + 3]) != 1) return -1;                  // (class IN)
+  size_t q_offset = q_end + 4;
+  const uint8_t *ns = ap->data + ap->mname_len + ap->rname_len;
+  const bool with_ns = minimal_mode == MINIMAL_NO && !ixfr_serial;           /* (an IXFR answer is the one SOA) */
+  /* the glue the zone in memory adds (append_glue_records()): the addresses of the NS targets, from the zone itself and, when the target is in another zone of
+   * the view, from that zone.  The summary has the addresses of the targets inside this zone; a target that another zone of the view holds (a sibling, or this
+   * zone's own name below a zone cut that is a zone of the view) makes the summary insufficient.  additional-from-auth: no = none at all, in-domain = only
+   * the targets at or below the apex. */
+  const bool with_glue = with_ns && policy != ADDITIONAL_AUTH_NO;
+  if (with_glue) {
+    char nm[DNS_NAME_TEXT_SIZE];
+    for (size_t off = 0, k = 0; k < ap->n_ns; k++) {
+      size_t nl = 0;
+      while (off + nl < ap->ns_len && ns[off + nl] != 0) nl += (size_t)ns[off + nl] + 1;
+      nl++;
+      if (off + nl > ap->ns_len || !apex_name_text(ns + off, nl, nm, sizeof(nm))) return -1;
+      off += nl;
+      const bool in_zone = domain_name_is_at_or_below(nm, elem->name);
+      if (policy == ADDITIONAL_AUTH_IN_DOMAIN && !in_zone) continue;
+      zdir_elem_t *pe = NULL;
+      zone_db_entry_t *ze = find_zone_for_query_ex(view, nm, 1, &pe);
+      if (ze != NULL || (pe != NULL && pe != elem) || (in_zone && pe != elem)) return -1;
+    }
+  }
+  size_t limit = max_res_len;                               /* what the body may use: the room for the OPT (RFC 6891 7) and for the TSIG (RFC 8945 5.3) is kept back */
+  if (tsig) {
+    size_t reserve = tsig_response_reserve(tsig);
+    if (reserve > 0 && limit > reserve + DNS_HEADER_SIZE) limit -= reserve;
+  }
+  size_t body_max = limit;
+  if (edns->present) {
+    size_t opt_reserve = edns_opt_reserve_len(edns, is_tcp, cfg);
+    if (limit > opt_reserve + DNS_HEADER_SIZE) body_max = limit - opt_reserve;
+  }
+  if (q_offset > body_max || body_max > UINT16_MAX) return -1;
+  memcpy(res, req, q_offset);
+  compress_ctx_init_packet(comp_ctx);
+  register_wire_name_for_compression(res, DNS_HEADER_SIZE, comp_ctx);
+  dns_init_response_header(res, req, 0, true);
+  if (ixfr_serial) {
+    /* UDP IXFR (RFC 1995 4, as the zone in memory answers it below): the one SOA of the current version; TC when the client is behind, so that it asks again over
+     * TCP; the RFC 7314 EXPIRE value of a primary is the SOA's */
+    if (!(*ixfr_serial == ap->serial || serial_is_newer(*ixfr_serial, ap->serial))) res[2] |= 0x02;
+    if (edns->present && edns->has_expire_query) {
+      edns->send_expire = true;
+      edns->send_expire_value = ap->expire;
+    }
+  }
+  uint16_t offset = (uint16_t)q_offset, ancount = 0, nscount = 0, arcount = 0;
+  /* SOA */
+
+  if (apex_write_soa_rr(res, &offset, body_max, elem->name, ap, comp_ctx) != 0) return -1;
+  uint32_t v;
+  uint16_t rdl_at;
+  ancount = 1;
+  /* NS */
+  if (with_ns) {
+    const uint8_t *t = ns;
+    for (unsigned k = 0; k < ap->n_ns; k++) {
+      size_t nl = 0;
+      while (t[nl] != 0) nl += (size_t)t[nl] + 1;
+      nl++;
+      if (write_dns_name_str(res, &offset, elem->name, comp_ctx, body_max) != 0 || (size_t)offset + 10 > body_max) return -1;
+      res[offset++] = 0; res[offset++] = 2; res[offset++] = 0; res[offset++] = 1;
+      v = ap->ns_ttl;
+      res[offset++] = (uint8_t)(v >> 24); res[offset++] = (uint8_t)(v >> 16); res[offset++] = (uint8_t)(v >> 8); res[offset++] = (uint8_t)v;
+      rdl_at = offset;
+      offset += 2;
+      if (compress_name(res, &offset, t, comp_ctx, body_max) != 0) return -1;
+      res[rdl_at] = (uint8_t)((offset - rdl_at - 2) >> 8);
+      res[rdl_at + 1] = (uint8_t)(offset - rdl_at - 2);
+      nscount++;
+      t += nl;
+    }
+  }
+  /* the addresses of the NS targets inside the zone, in the order of the NS RRs and, for one target, of the zone (RFC 2181 9: the addresses of a name are all
+   * there or none; the first target whose addresses do not fit ends the glue, without TC) */
+  if (with_glue && ap->glue_len > 0) {
+    const uint8_t *g = ns + ap->ns_len, *gend = g + ap->glue_len, *t = ns;
+    for (unsigned k = 0; k < ap->n_ns && g < gend; k++) {
+      size_t nl = 0;
+      while (t[nl] != 0) nl += (size_t)t[nl] + 1;
+      nl++;
+      bool dup = false;                                      /* (the same target twice: one set of addresses) */
+      for (const uint8_t *u = ns; u < t && !dup; ) {
+        size_t ul = 0;
+        while (u[ul] != 0) ul += (size_t)u[ul] + 1;
+        ul++;
+        dup = ul == nl && wire_names_equal_ci(u, t);
+        u += ul;
+      }
+      const uint16_t so = offset, sa = arcount;
+      bool fits = true;
+      while (g < gend && g[0] == k) {
+        const size_t al = g[1] == 1 ? 4 : 16;
+        if (!dup) {
+          if (compress_name(res, &offset, t, comp_ctx, body_max) != 0 || (size_t)offset + 10 + al > body_max) {
+            fits = false;
+            break;
+          }
+          res[offset++] = 0; res[offset++] = g[1]; res[offset++] = 0; res[offset++] = 1;
+          memcpy(res + offset, g + 2, 4);
+          offset += 4;
+          res[offset++] = 0; res[offset++] = (uint8_t)al;
+          memcpy(res + offset, g + 6, al);
+          offset += (uint16_t)al;
+          arcount++;
+        }
+        g += 6 + al;
+      }
+      if (!fits) {
+        offset = so;
+        arcount = sa;
+        break;
+      }
+      t += nl;
+    }
+  }
+  if (edns->present) assemble_edns_opt(res, limit, &offset, &arcount, edns, 0, is_tcp, cfg);
+  res[4] = 0; res[5] = 1;
+  res[6] = (uint8_t)(ancount >> 8); res[7] = (uint8_t)ancount;
+  res[8] = (uint8_t)(nscount >> 8); res[9] = (uint8_t)nscount;
+  res[10] = (uint8_t)(arcount >> 8); res[11] = (uint8_t)arcount;
+  return offset;
+}
+
+/* SERVFAIL with Extended DNS Error 14 "Not Ready" (RFC 8914 4.15), keeping the question: the answer for a query whose zone is in the directory
+ * and cannot be had in time (D1a design 4.4).  The request's own EDE options are not echoed.  Signing is the caller's (the TSIG handling around
+ * process_query_body()). */
+static int build_not_ready_response(const uint8_t *req, size_t req_len, uint8_t *res, size_t cap, bool is_tcp, server_config_t *cfg) {
+  if (req_len < DNS_HEADER_SIZE) return 0;
+  edns_info_t edns;
+  edns_info_reset(&edns);
+  edns.present = false;
+  uint16_t qd = (uint16_t)((req[4] << 8) | req[5]), an = (uint16_t)((req[6] << 8) | req[7]);
+  uint16_t ns = (uint16_t)((req[8] << 8) | req[9]), ar = (uint16_t)((req[10] << 8) | req[11]);
+  if (parse_edns_opt(req, req_len, qd, an, ns, ar, &edns) == 0) edns.ede_count = 0;      /* (reflection: the request's own EDE is not echoed) */
+  add_ede(&edns, cfg ? cfg->send_extended_errors : false, 14, "Not Ready");
+  return dns_build_error_response(req, req_len, res, cap, 2 /* SERVFAIL */, 0, 1, &edns, is_tcp, cfg);
+}
+
 int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                             size_t max_res_len, const char *qname, uint16_t qtype,
                             const char *client_ip, compress_ctx_t *comp_ctx,
@@ -2896,14 +3153,15 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
                               bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                               zone_db_snapshot_t *snap, server_config_t *cfg,
                               zone_db_entry_t **out_matched_entry, tsig_request_t *tsig,
-                              const query_route_t *route);
+                              const query_route_t *route, const zdir_elem_t *not_ready_zone);
 
 static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len, uint8_t *res,
                                              size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
                                              const char *client_ip, compress_ctx_t *comp_ctx,
                                              bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                                              zone_db_snapshot_t *snap, server_config_t *cfg,
-                                             zone_db_entry_t **out_matched_entry, const query_route_t *route);
+                                             zone_db_entry_t **out_matched_entry, const query_route_t *route,
+                                             const zdir_elem_t *not_ready_zone);
 
 int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
                                size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
@@ -2912,7 +3170,7 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
                                zone_db_snapshot_t *snap, server_config_t *cfg,
                                zone_db_entry_t **out_matched_entry) {
   return process_dns_query_impl_cap_routed(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
-                                           is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL);
+                                           is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL, NULL);
 }
 
 /* res_cap: res の実際の容量 (バイト)。0 なら不明で、従来どおり max_res_len (UDP では EDNS の
@@ -2925,7 +3183,8 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
                                              const char *client_ip, compress_ctx_t *comp_ctx,
                                              bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                                              zone_db_snapshot_t *snap, server_config_t *cfg,
-                                             zone_db_entry_t **out_matched_entry, const query_route_t *route) {
+                                             zone_db_entry_t **out_matched_entry, const query_route_t *route,
+                                             const zdir_elem_t *not_ready_zone) {
   t_query_rrl_info.zone = NULL; /* D-05: 早い段階で返す応答 (エラー) のために先に消す */
   t_query_rrl_info.wildcard = false;
   if (req_len < DNS_HEADER_SIZE) {
@@ -2942,7 +3201,10 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
   if (snap && !route) {
     bool done = false;
     own_route.view = select_view_req(snap, cfg, client_ip, req, req_len, &tsig, &done);
-    own_route.entry = own_route.view ? find_zone_for_query(own_route.view, qname, ((req[2] >> 3) & 0x0F) == 0 ? qtype : 0) : NULL;
+    zdir_elem_t *own_pel = NULL;
+    own_route.entry = own_route.view ? find_zone_for_query_ex(own_route.view, qname, ((req[2] >> 3) & 0x0F) == 0 ? qtype : 0, &own_pel) : NULL;
+    /* D1a: a zone that is in the directory and not in memory (TLS, DoH and the other callers that do not park): "not ready", not REFUSED */
+    if (!own_route.entry && own_pel && !not_ready_zone) not_ready_zone = own_pel;
     own_route.tsig = done ? &tsig : NULL;
     route = &own_route;
   }
@@ -2954,7 +3216,7 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
   t_query_tsig.status = TSIG_REQ_NONE; /* X-20: slip 応答の署名用。署名のない要求では使わない */
   if (tsig.status == TSIG_REQ_NONE) {
     int plain = process_query_body(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
-                                   is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL, route);
+                                   is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL, route, not_ready_zone);
     t_qacl.local_valid = t_qacl.client_valid = false;   /* the address of the next query is set by its transport */
     t_qacl.key = NULL;
     return plain;
@@ -2973,7 +3235,7 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
   }
   tsig.res_limit = max_res_len;
   int ret = process_query_body(body_req, body_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
-                               is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, &tsig, route);
+                               is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, &tsig, route, not_ready_zone);
   t_qacl.local_valid = t_qacl.client_valid = false;
   t_qacl.key = NULL;
   if (ret < DNS_HEADER_SIZE) return ret;
@@ -2989,7 +3251,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
                               bool is_tcp, const rate_limit_config_t **out_rrl_cfg,
                               zone_db_snapshot_t *snap, server_config_t *cfg,
                               zone_db_entry_t **out_matched_entry, tsig_request_t *tsig,
-                              const query_route_t *route) {
+                              const query_route_t *route, const zdir_elem_t *not_ready_zone) {
   char current_qname[DNS_NAME_TEXT_SIZE];
   strlcpy(current_qname, qname, sizeof(current_qname));
   char current_qname_lc[DNS_NAME_TEXT_SIZE];
@@ -3024,7 +3286,6 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       *out_rrl_cfg = &zext(matched_zcfg)->rrl;
     }
   }
-  
   uint16_t qdcount = (req[4] << 8) | req[5],
            ancount_req = (req[6] << 8) | req[7],
            nscount_req = (req[8] << 8) | req[9],
@@ -3131,6 +3392,106 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   if (qdcount == 1 && wire_question_name_compressed(req, req_len)) {
     add_ede(&edns, send_ede, 0, NULL);
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, &edns, is_tcp, cfg); // FORMERR
+  }
+
+  if (not_ready_zone && qdcount == 1) {
+    /* D1a: the zone is in the directory and its data is not in memory, and the caller cannot wait for it (or has waited in vain).  After the
+     * checks of the message above (a malformed request is still a FORMERR), before any work on the zone.  The answer is an error answer of that
+     * zone for rate limiting (the global limits), and goes through the TSIG handling of the caller like every other answer: signed with the
+     * key of a verified request, RFC 8945 5.3 (the request given here has the TSIG record taken off, 5.2). */
+    t_query_rrl_info.zone = not_ready_zone->name;
+    /* the zone's own settings come from the interned block the element kept when its data left memory (zdir_elem_t.sh); only the ACL levels read them */
+    zone_config_t zc;
+    memset(&zc, 0, sizeof(zc));
+    zc.domain = (char *)not_ready_zone->name;
+    zone_ext_shared_t *nrsh = atomic_load_explicit(&not_ready_zone->sh, memory_order_acquire);
+    zc.ext = nrsh ? &nrsh->ext : NULL;
+    tsig_key_t *nr_tkey = (tsig && tsig->status == TSIG_REQ_VALID) ? tsig->key : NULL;
+    if (opcode == 4) {
+      /* NOTIFY: a primary zone accepts none (the same REFUSED as a zone in memory gives, RFC 1996 4.7; AA=0, RD=0).  Nothing is read for it and
+       * nothing is counted: only a query (below) waits for a zone.  A zone that is a secondary is never taken out of memory. */
+      add_ede(&edns, send_ede, 18, "Query refused due to access control");
+      int len = dns_build_error_response(req, req_len, res, max_res_len, 5, 0, qdcount, &edns, is_tcp, cfg);
+      if (len >= DNS_HEADER_SIZE) res[2] &= ~0x01;
+      return len;
+    }
+    if (opcode == 5) {
+      /* UPDATE (RFC 2136): the zone is checked as for a zone in memory (3.1.1, 3.1.2: SOA question, the apex of this zone), then allow-update from the
+       * settings kept in the element.  An UPDATE that may be made is answered SERVFAIL + EDE 14 now: it is applied to the zone in memory, which a
+       * later step reads for it (design 7); nothing waits and nothing is read for it here. */
+      size_t zone_end = get_question_end_offset(req, req_len, 1);
+      uint16_t zclass = (zone_end >= DNS_HEADER_SIZE + 5) ? (uint16_t)((req[zone_end - 2] << 8) | req[zone_end - 1]) : 0;
+      int urc;
+      if (qtype != 6) {
+        urc = 1;                                        // FORMERR
+      } else if (!view || zclass != 1 || !domain_names_match_ci(not_ready_zone->name, current_qname)) {
+        urc = 9;                                        // NOTAUTH
+      } else {
+        bool uauth = zext(&zc)->upd_policy ? nr_tkey != NULL
+                                           : (cfg && zone_update_acl_allows_in_view(cfg, &zc, view->name, client_ip, nr_tkey ? nr_tkey->name : NULL));
+        if (uauth) {
+          /* D1a milestone 4 (design 7, 12-8): an UPDATE that may be made waits for the zone like a query (parked, the zone is read), and is applied
+           * to it when it is there; the zone then stays in memory (pinned) until the next load from the database.  Where nothing can wait (TLS, DoH,
+           * a table that is full, the time is up) the client is told to try again. */
+          if (t_nr_probe) return DNS_NR_PERMITTED;
+          urc = 2;                                      // SERVFAIL, Not Ready
+          add_ede(&edns, send_ede, 14, "Not Ready");
+        } else {
+          urc = 5;                                      // REFUSED
+          add_ede(&edns, send_ede, 18, "Query refused due to access control");
+        }
+      }
+      int len = dns_build_error_response(req, req_len, res, max_res_len, (uint8_t)urc, 0, qdcount, &edns, is_tcp, cfg);
+      if (len >= DNS_HEADER_SIZE) res[2] &= ~0x01;
+      return len;
+    }
+    /* allow-query first, exactly as for a zone in memory (below: once the zone is known, before anything else is done for the query): a client
+     * that may not ask is refused, does not wait for the zone, does not make the server read it, and does not learn that the zone is in the
+     * database. */
+    if (opcode == 0 && view && cfg && cfg->acl_query_active && !zone_query_permitted(cfg, &zc, view->name, client_ip)) {
+      add_ede(&edns, send_ede, 18, "Query refused due to access control");
+      return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
+    }
+    if (opcode == 0 && qtype == 6 && qdcount == 1 && view && domain_names_match_ci(not_ready_zone->name, current_qname)) {
+      const zdir_apex_t *ap = atomic_load_explicit(&not_ready_zone->apex, memory_order_acquire);
+      if (ap) {
+        /* the size the zone in memory would answer with (the EDNS size of the client on UDP), and the TSIG signing needs the same limit */
+        const size_t alimit = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
+        const size_t tsig_limit = tsig ? tsig->res_limit : 0;
+        if (tsig) tsig->res_limit = alimit;
+        const additional_from_auth_t apolicy = zext(&zc)->additional_from_auth_specified ? zext(&zc)->additional_from_auth
+                                                                                         : (cfg ? cfg->additional_from_auth : ADDITIONAL_AUTH_YES);
+        int alen = build_apex_soa_answer(req, req_len, res, alimit, not_ready_zone, ap, &edns, is_tcp, query_minimal_mode(cfg, view, req), apolicy, view,
+                                         comp_ctx, tsig, cfg, NULL);
+        if (alen >= DNS_HEADER_SIZE) return alen;
+        if (tsig) tsig->res_limit = tsig_limit;
+      }
+    }
+    /* A UDP IXFR (RFC 1995 4.2) is a zone transfer question: allow-transfer decides, as for a zone in memory and as BIND's ns_xfr_start() does before it looks at
+     * the transport -- a client that may not transfer is REFUSED here, without the zone being read.  One that may gets the answer from the summary (the one SOA,
+     * TC when it is behind) when the apex describes the version the directory has, else it waits for the zone like any other query. */
+    if (opcode == 0 && qtype == 251 && !is_tcp && qdcount == 1 && domain_names_match_ci(not_ready_zone->name, current_qname)) {
+      if (!udp_ixfr_allowed(cfg, &zc, view, client_ip, nr_tkey)) {
+        add_ede(&edns, send_ede, 18, "Query refused due to access control");
+        return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
+      }
+      const zdir_apex_t *iap = atomic_load_explicit(&not_ready_zone->apex, memory_order_acquire);
+      size_t iq;
+      uint32_t cs = 0;
+      if (iap && skip_wire_name(req, req_len, DNS_HEADER_SIZE, &iq) == 0 && iq + 4 <= req_len) {
+        if (!ixfr_request_client_serial(req, req_len, iq + 4, &cs))         /* RFC 1995 3, as the zone in memory */
+          return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
+        const size_t alimit = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
+        const size_t tsig_limit = tsig ? tsig->res_limit : 0;
+        if (tsig) tsig->res_limit = alimit;
+        int ilen = build_apex_soa_answer(req, req_len, res, alimit, not_ready_zone, iap, &edns, is_tcp, MINIMAL_YES, ADDITIONAL_AUTH_YES, view, comp_ctx, tsig, cfg, &cs);
+        if (ilen >= DNS_HEADER_SIZE) return ilen;
+        if (tsig) tsig->res_limit = tsig_limit;
+      }
+    }
+    if (t_nr_probe && opcode == 0) return DNS_NR_PERMITTED;
+
+    return build_not_ready_response(req, req_len, res, max_res_len, is_tcp, cfg);
   }
 
   // RFC 9619: QDCOUNT=0 QUERY – no question section, return minimal response.
@@ -3298,30 +3659,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   compress_ctx_init_packet(comp_ctx);
 
-  if (edns.present) {
-    if (edns.udp_payload_size < 512)
-      edns.udp_payload_size = 512;
-    if (!is_tcp) {
-      uint16_t server_udp_size = edns.server_udp_size ? edns.server_udp_size : KARIDNS_UDP_BUFSIZE_DEFAULT;
-      /* the server statement of the client can set the limit (batch 5; BIND ns client.c: max-udp-size of the peer replaces the view's
-       * for this client, 512..4096).  Only looked for when some statement writes it; no allocation (inet_pton on the text address). */
-      if (cfg && cfg->any_server_max_udp) {
-        const server_stmt_t *psrv = config_server_find_ip(cfg, view ? view->name : NULL, client_ip);
-        if (psrv && (psrv->set & SV_MAX_UDP_SIZE)) server_udp_size = (uint16_t)psrv->max_udp_size;
-      }
-      if (edns.udp_payload_size > server_udp_size)
-        edns.udp_payload_size = server_udp_size;
-      /* UDP 応答の上限はクライアントが OPT で通知したサイズ (512 以上に丸め、サーバーの
-       * udp-bufsize 以下。RFC 6891 §6.2.3、§6.2.5)。呼び出し側の max_res_len が大きくても小さくても
-       * 置き換える (以前は 512 ちょうどのとき呼び出し側の値のままで、非同期経路では 4096 まで
-       * 返しえた)。呼び出し側が 512 未満の小さなバッファを渡したときは広げない (res[] の範囲外へ
-       * 書き込むため)。res_cap が分かっていればそれを超えない。 */
-      if (max_res_len >= UDP_DEFAULT_MAX_RES_LEN) {
-        max_res_len = edns.udp_payload_size;
-        if (res_cap != 0 && max_res_len > res_cap) max_res_len = res_cap;
-      }
-    }
-  }
+  max_res_len = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
   /* RFC 8945 §5.3: 署名する応答は、上限から TSIG RR の分を空けて組み立てる (切り詰めは TC=1 で表す) */
   if (tsig) {
     tsig->res_limit = max_res_len;
@@ -3570,7 +3908,14 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   // If client's SOA serial matches server's current serial (up-to-date), send single SOA response (NOERROR).
   // If update is needed (or diff required), set TC=1 and send current SOA to prompt client to retry over TCP.
   if (!is_tcp && qtype == 251) {
+    /* allow-transfer applies to an IXFR over UDP as well (BIND xfrout.c ns_xfr_start() checks the transfer ACL first, whatever the transport): the one SOA of a
+     * zone that is up to date, or the TC answer, are not for a client that may not transfer.  It used to be answered to anybody who may ask (allow-query). */
+    if (!udp_ixfr_allowed(cfg, zone_cfg_any, view, client_ip, tsig && tsig->status == TSIG_REQ_VALID ? tsig->key : NULL)) {
+      add_ede(&edns, send_ede, 18, "Query refused due to access control");
+      return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
+    }
     uint32_t client_serial = 0;
+
     /* RFC 1995 §3: クライアントの版の SOA が Authority に無ければ FORMERR (TCP と同じ) */
     if (!ixfr_request_client_serial(req, req_len, q_offset, &client_serial))
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
@@ -3662,12 +4007,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
    * 解決中に版が上がっても、古い版の鍵で入れた応答は二度と引かれない。 */
   /* minimal-responses of the client's view (lib/ns/query.c: client->view->minimalresponses), else options'; no-auth-recursive is no-auth for a
    * query with RD set and no for the others (ns_query_start()), so mr_mode is what the body is built with */
-  int mr_mode = MINIMAL_NO;
-  if (cfg_for_ede) {
-    const view_config_t *mr_view = (cfg_for_ede->any_view_minimal && view) ? config_find_view(cfg_for_ede, view->name) : NULL;
-    mr_mode = config_minimal_responses(cfg_for_ede, mr_view);
-    if (mr_mode == MINIMAL_NO_AUTH_RECURSIVE) mr_mode = (req[2] & 0x01) ? MINIMAL_NO_AUTH : MINIMAL_NO;
-  }
+  int mr_mode = query_minimal_mode(cfg_for_ede, view, req);
   /* A zone shared with in-view, reached through a view that does not own it, and with NS / MX / SRV targets (current_zone->glue): the sibling
    * zones whose addresses go into the Additional section are looked up in the CLIENT's view (append_glue_records() 3., as BIND's query_getzonedb()
    * uses client->view), while the version, and so the cache entries and the sibling tracking of zone_glue_track_build(), belong to the owner view.
@@ -3829,13 +4169,34 @@ int process_dns_query_cap_routed(const uint8_t *req, size_t req_len, uint8_t *re
   zone_db_entry_t *matched_entry = NULL;
   int ret = process_dns_query_impl_cap_routed(req, req_len, res, max_res_len, res_cap, qname, qtype,
                                               client_ip, comp_ctx, is_tcp, out_rrl_cfg, snap, cfg, &matched_entry,
-                                              route);
+                                              route, NULL);
   release_config_snapshot(cfg);
   if (ret >= DNS_HEADER_SIZE && matched_entry) {
     uint8_t rcode = res[3] & 0x0F;
     uint16_t ancount = ((uint16_t)res[6] << 8) | (uint16_t)res[7];
     record_observatory_response(matched_entry, rcode, ancount);
   }
+  return ret;
+}
+
+/* D1a: the answer of the worker for a query whose zone is in the directory and not in memory, when it cannot wait for it: the same view, ACL,
+ * TSIG (RFC 8945 5.3) and rate limit handling as an answer from a zone, with SERVFAIL + EDE 14 as the content (route as for
+ * process_dns_query_cap_routed(); elem: the directory element of the zone).
+ * probe: the worker asks whether the query may be parked.  A query that the zone's allow-query (the full chain of the normal path: the zone's
+ * own statement, the view's, options', allow-query-on, a TSIG key) refuses gets REFUSED + EDE 18 exactly as for a zone in memory, and so does
+ * every other answer that is final (a malformed request, a TSIG error: FORMERR, NOTAUTH); the return value is that answer's length, and the
+ * query neither parks nor asks for the zone.  DNS_NR_PERMITTED is returned (nothing written) for a query that may wait for the zone. */
+int process_dns_not_ready_routed(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len, size_t res_cap, const char *qname,
+                                 uint16_t qtype, const char *client_ip, compress_ctx_t *comp_ctx, bool is_tcp,
+                                 const rate_limit_config_t **out_rrl_cfg, zone_db_snapshot_t *snap, const query_route_t *route,
+                                 const zdir_elem_t *elem, bool probe) {
+  server_config_t *cfg = acquire_config_snapshot();
+  zone_db_entry_t *matched_entry = NULL;
+  t_nr_probe = probe;
+  int ret = process_dns_query_impl_cap_routed(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx, is_tcp, out_rrl_cfg,
+                                              snap, cfg, &matched_entry, route, elem);
+  t_nr_probe = false;
+  release_config_snapshot(cfg);
   return ret;
 }
 

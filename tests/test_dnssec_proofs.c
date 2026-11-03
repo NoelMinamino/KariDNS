@@ -277,8 +277,7 @@ static void gr_setup(const char *origin, const char *zone_text) {
     g_gr.entries[0] = &g_gr.entry;
     g_gr.acl[0] = (char *)"any";
     g_gr.view.name = "default";
-    g_gr.view.entries = g_gr.entries;
-    g_gr.view.zone_count = 1;
+    view_set_entries(&g_gr.view, g_gr.entries, 1);
     g_gr.view.match_clients = g_gr.acl;
     g_gr.view.match_clients_count = 1;
     g_gr.snap.views = &g_gr.view;
@@ -1575,6 +1574,7 @@ static struct {
     zone_arena_t arena[5];
     zone_db_entry_t entry[5];
     zone_db_entry_t *entries[5];
+    size_t nzones;
     char *acl[1];
     view_snapshot_t view;
     zone_db_snapshot_t snap;
@@ -1586,7 +1586,6 @@ static void mz_reset(void) {
     memset(&g_mz, 0, sizeof(g_mz));
     g_mz.acl[0] = (char *)"any";
     g_mz.view.name = "default";
-    g_mz.view.entries = g_mz.entries;
     g_mz.view.match_clients = g_mz.acl;
     g_mz.view.match_clients_count = 1;
     g_mz.snap.views = &g_mz.view;
@@ -1594,7 +1593,7 @@ static void mz_reset(void) {
 }
 
 static void mz_add(const char *origin, const char *text) {
-    size_t i = g_mz.view.zone_count++;
+    size_t i = g_mz.nzones++;
     zone_arena_init(&g_mz.arena[i]);
     parse_error_t err = {0};
     parse_context_t ctx = { .base_dir = ".", .default_origin = origin, .is_standalone_mode = true, .err_out = &err };
@@ -1605,10 +1604,11 @@ static void mz_add(const char *origin, const char *text) {
     g_mz.entry[i].kind = ZONE_KIND_PRIMARY;
     atomic_store_explicit(&g_mz.entry[i].rcu.active, &g_mz.arena[i].ver, memory_order_release);
     g_mz.entries[i] = &g_mz.entry[i];
+    view_set_entries(&g_mz.view, g_mz.entries, g_mz.nzones);
 }
 
 static void mz_free(void) {
-    for (size_t i = 0; i < g_mz.view.zone_count; i++) zone_arena_destroy(&g_mz.arena[i]);
+    for (size_t i = 0; i < g_mz.nzones; i++) zone_arena_destroy(&g_mz.arena[i]);
 }
 
 static void mz_query(const char *qname, uint16_t qtype, bool dnssec_ok, gr_resp_t *out) {
@@ -1716,8 +1716,7 @@ static void test_ds_from_parent_zone(void) {
     zone_db_entry_t *ents[2] = { &tld, &root };
     view_snapshot_t v;
     memset(&v, 0, sizeof(v));
-    v.entries = ents;
-    v.zone_count = 2;
+    view_set_entries(&v, ents, 2);
     assert(find_zone_for_query(&v, "test.", 43) == &root);
     assert(find_zone_for_query(&v, "test.", 2) == &tld);
     assert(find_zone_for_query(&v, ".", 43) == &root);

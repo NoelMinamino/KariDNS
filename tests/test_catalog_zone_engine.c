@@ -301,10 +301,9 @@ static void test_find_catalog_parent_and_valid_properties(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 2;
+    view_set_entries(&view, entries, 2);
 
-    // 1. Without hash table (linear scan fallback)
+    // 1. The lookup by name in the directory
     zone_db_entry_t *found = find_catalog_parent_in_snapshot(&view, "CATALOG.EXAMPLE.");
     assert(found == &cat_parent);
     found = find_catalog_parent_in_snapshot(&view, "nonexistent.catalog.");
@@ -312,15 +311,7 @@ static void test_find_catalog_parent_and_valid_properties(void) {
     assert(find_catalog_parent_in_snapshot(NULL, "catalog.example.") == NULL);
     assert(find_catalog_parent_in_snapshot(&view, NULL) == NULL);
 
-    // 2. With hash table
-    int hash_tbl[4] = {-1, -1, -1, -1};
-    int chain_nxt[2] = {-1, -1};
-    uint32_t h = calc_fnv1a_str("catalog.example.") & 3;
-    hash_tbl[h] = 0;
-    view.hash_table = hash_tbl;
-    view.hash_size = 4;
-    view.chain_next = chain_nxt;
-
+    // 2. Again, with the same directory
     found = find_catalog_parent_in_snapshot(&view, "catalog.example.");
     assert(found == &cat_parent);
 

@@ -653,6 +653,7 @@ static void free_database_config(database_config_t *db) {
   free(db->loader_user);
   free(db->loader_group);
   free(db->loader_path);
+  free(db->loader_state_file);
   free_str_list(db->acl_ceiling, db->acl_ceiling_count);
   free(db->acl_ceiling_parsed);
   free_str_list(db->acl_ceiling_keys, db->acl_ceiling_keys_count);
@@ -974,8 +975,19 @@ static int acl_set_resolve(token_ctx_t *ctx, server_config_t *cfg, acl_set_t *s,
 
 /* After the parse: every zone { in-view "v"; } finds the zone it shares.  BIND (lib/isccfg/check.c, bin/named/server.c configure_zone()): the zone must be a
  * zone of a view that is defined earlier; a view cannot name itself.  Phase 1 of KariDNS shares the primary and secondary zone { } blocks of the
- * configuration (not catalog zones, program zones, catalog members or database zones).  The ACLs an in-view zone may write are the KariDNS
+ * configuration; phase 2 (D1a, design 9) also the zones of the database and the members of a catalog zone of the owner view, which are found in its directory
+ * at run time (zone_inview_t.db_target).  A catalog zone, a program zone and a forward zone themselves cannot be shared.  The ACLs an in-view zone may write are the KariDNS
  * in-view-settings view; with owner they are the same error BIND gives for any other option. */
+/* Can the view hold a zone that is not a zone { } block of the configuration: a zone of the database (the view takes the shared source or has its own, and has not
+ * said `database none`), or a member of a catalog zone */
+static bool view_may_have_dynamic_zones(const server_config_t *cfg, const view_config_t *v) {
+  if (v->catz_count > 0) return true;
+  for (const zone_config_t *z = v->zones; z; z = z->next)
+    if (z->is_catalog) return true;
+  if (v->database_none) return false;
+  return cfg->database.enabled;                 /* (a view's own database-file / database-schema needs the database block as well) */
+}
+
 static int in_view_resolve(token_ctx_t *ctx, server_config_t *cfg) {
   for (view_config_t *v = cfg->views; v; v = v->next) {
     for (zone_config_t *s = v->in_view_zones; s; s = s->next) {
@@ -990,6 +1002,17 @@ static int in_view_resolve(token_ctx_t *ctx, server_config_t *cfg) {
         }
       }
       if (!t) {
+        /* D1a phase 2 (design 9): the owner view is defined earlier and takes zones from the database, or has a catalog zone, so the zone may be one of those: it is
+         * looked up in the owner's directory when a query asks (a zone of the database comes and goes, so it cannot be checked here) */
+        const view_config_t *ov = NULL;
+        for (const view_config_t *tv = cfg->views; tv && tv != v; tv = tv->next)
+          if (strcasecmp(tv->name, iv->view) == 0) { ov = tv; break; }
+        if (ov && view_may_have_dynamic_zones(cfg, ov)) {
+          iv->target = NULL;
+          iv->db_target = true;
+          cfg->any_in_view = true;
+          continue;
+        }
         aml_report(ctx, iv->loc, what, "'in-view' zone '%.255s' does not exist in view '%.64s', or view '%.64s' is not yet defined",
                    s->domain, iv->view, iv->view);
         return -1;
@@ -4806,7 +4829,7 @@ static const char *const k_db_zone_statements[] = {
   "allow-transfer", "allow-update", "also-notify", "tsig-key", "notify-retries", "notify-retry-interval",
   "notify-retry-backoff", "notify-tcp-timeout", "ixfr-history", "additional-from-auth", "disable-auto-tc-flag", "zone-udp-bufsize",
   "zone-tcp-mss", "zone-tcp-window", "zone-tcp-sndbuf", "transfer-acl-match", "update-acl-match", "masters", "primaries",
-  "ecs-trusted-resolvers", "alias-resolver", NULL
+  "ecs-trusted-resolvers", "alias-resolver", "cache", NULL
 };
 
 /* The statement `key` is about to be read in restricted mode: refuse it unless it is on the list, and forget what an
@@ -5468,6 +5491,32 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       }
       free_token(&tok);
       x->primary_settings_off = !v;
+    } else if (strcmp(key, "cache") == 0) {
+      /* D1a step 5: pin | no-cache | auto (docs/karidns.md, database { memory-limit }); a zone of karidns.conf is always in memory, so it has no effect there */
+      tok = get_next_token(ctx);
+      int cm = -1;
+      if (tok.type == TOKEN_STRING && tok.value) {
+        if (strcasecmp(tok.value, "auto") == 0) cm = 0;
+        else if (strcasecmp(tok.value, "pin") == 0) cm = 1;
+        else if (strcasecmp(tok.value, "no-cache") == 0) cm = 2;
+      }
+      if (cm < 0) {
+        report_bad_value(ctx, zone->domain, key, tok.type == TOKEN_STRING ? tok.value : "", "auto, pin or no-cache");
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) {
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+      x->cache_mode = (uint8_t)cm;
     } else if (strcmp(key, "transfer-acl-match") == 0 || strcmp(key, "update-acl-match") == 0) {
       /* D14: which kinds of entry of allow-transfer / allow-update have to match (docs/karidns.md) */
       tok = get_next_token(ctx);
@@ -6091,6 +6140,49 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     db->loader_threads = (uint32_t)u;
     return 0;
   }
+  if (strcmp(key, "park-max") == 0) {
+    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_PARK_MAX_MAX, &u) != 0) return -1;
+    db->park_max = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "park-timeout") == 0) {
+    if (db_take_uint(ctx, key, false, KARIDNS_DB_PARK_TIMEOUT_MIN, KARIDNS_DB_PARK_TIMEOUT_MAX, &u) != 0) return -1;
+    db->park_timeout_ms = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "transfer-fetch-timeout") == 0) {     /* how long a zone transfer waits for a zone that is out of memory to be read (ms) */
+    if (db_take_uint(ctx, key, false, KARIDNS_DB_XFR_FETCH_TIMEOUT_MIN, KARIDNS_DB_XFR_FETCH_TIMEOUT_MAX, &u) != 0) return -1;
+    db->transfer_fetch_timeout_ms = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "fetch-rate") == 0) {       /* zones read for queries per second (token bucket, burst = one second): scattered queries for zones out of memory */
+    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_FETCH_RATE_MAX, &u) != 0) return -1;
+    db->fetch_rate = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "fetch-concurrency") == 0) {   /* fetches in flight to the loader while memory-limit is set (the loader reads that many zones at once, loader-threads of them in parallel) */
+    if (db_take_uint(ctx, key, false, KARIDNS_DB_FETCH_CONC_MIN, KARIDNS_DB_FETCH_CONC_MAX, &u) != 0) return -1;
+    db->fetch_concurrency = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "loader-state-file") == 0) return db_take_string(ctx, "database", key, KARIDNS_DB_PATH_MAX, &db->loader_state_file);     /* the hot list (design 8.4): restart-only, the loader writes it */
+  if (strcmp(key, "warm-before-serve") == 0) {        /* seconds to hold back the queries until the zones of the hot list are read (0 = do not wait) */
+    if (db_take_uint(ctx, key, false, 0, KARIDNS_DB_WARM_WAIT_MAX, &u) != 0) return -1;
+    db->warm_before_serve = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "hot-list-size") == 0) {            /* the zones most asked for that the hot list keeps */
+    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_HOT_LIST_MAX, &u) != 0) return -1;
+    db->hot_list_size = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "hot-list-interval") == 0) {        /* seconds between two hot lists */
+    if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_HOT_INTERVAL_MAX, &u) != 0) return -1;
+    db->hot_list_interval = (uint32_t)u;
+    return 0;
+  }
+  if (strcmp(key, "memory-limit") == 0)       /* K, M, G suffixes (up to 1024G); unset = no limit (every database zone stays in memory) */
+    return db_take_uint(ctx, key, true, KARIDNS_DB_MEMORY_LIMIT_MIN, KARIDNS_DB_MEMORY_LIMIT_MAX, &db->memory_limit);
   if (strcmp(key, "acl-ceiling") == 0) {
     /* addresses and "key" entries like allow-transfer (see zone_transfer_acl_allows(), dns_tsig_acl.c) */
     free_str_list(db->acl_ceiling, db->acl_ceiling_count);
@@ -6680,6 +6772,7 @@ static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
     /* the control-channel and dnstap sockets are NOT prefixed: a UNIX socket path holds 103 bytes (sun_path), a deep directory would overflow
      * it, and the server chdir()s to the directory at start-up (and daemonize() no longer leaves it), so the relative name resolves there */
     ok = ok && dir_prefix_path(&config->database.database_file, eff) && dir_prefix_path(&config->database.conninfo_file, eff);
+    ok = ok && dir_prefix_path(&config->database.loader_state_file, eff);
     if (!ok) goto oom;
   }
   /* what is still relative (no directory, or a relative directory without a startup directory) and is opened after daemonize() */
@@ -6688,6 +6781,7 @@ static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
   if (path_absolutize(ctx, &config->database.database_file, "database database-file", KARIDNS_DB_PATH_MAX) != 0 ||
       path_absolutize(ctx, &config->database.conninfo_file, "database conninfo-file", KARIDNS_DB_PATH_MAX) != 0 ||
       path_absolutize(ctx, &config->database.loader_path, "database loader-path", KARIDNS_DB_PATH_MAX) != 0) goto out;
+  if (path_absolutize(ctx, &config->database.loader_state_file, "database loader-state-file", KARIDNS_DB_PATH_MAX) != 0) goto out;
   for (view_config_t *v = config->views; v; v = v->next)
     if (path_absolutize(ctx, &v->database_file, "view database-file", KARIDNS_DB_PATH_MAX) != 0) goto out;
   rc = 0;

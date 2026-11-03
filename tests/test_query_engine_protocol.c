@@ -237,8 +237,7 @@ static void gr_setup(const char *origin, const char *zone_text) {
     g_gr.entries[0] = &g_gr.entry;
     g_gr.acl[0] = (char *)"any";
     g_gr.view.name = "default";
-    g_gr.view.entries = g_gr.entries;
-    g_gr.view.zone_count = 1;
+    view_set_entries(&g_gr.view, g_gr.entries, 1);
     g_gr.view.match_clients = g_gr.acl;
     g_gr.view.match_clients_count = 1;
     g_gr.snap.views = &g_gr.view;
@@ -326,6 +325,8 @@ static void put_soa_rr(req_t *q, const char *owner, uint32_t serial) {
     q->b[rl] = (uint8_t)((q->n - rs) >> 8); q->b[rl + 1] = (uint8_t)(q->n - rs);
 }
 
+static server_config_t *notify_cfg(const char *zone_stmt);
+
 static const char *ZONE_TXT =
     "$ORIGIN example.\n$TTL 60\n@ SOA ns h 5 2 3 4 5\n@ NS ns\nns A 192.0.2.1\nwww A 192.0.2.10\n";
 
@@ -384,16 +385,27 @@ static void test_protocol_anomalies(void) {
     ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
     CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 1) == 1);
 
-    /* RFC 1995 2: IXFR over UDP. Client already current -> the single SOA; older client -> SOA + TC so it retries via TCP */
-    put_hdr(&q, 0x4592, 0x0000, 1, 0, 1, 0); put_question(&q, "example.", 251, 1); put_soa_rr(&q, "example.", 5);
-    ask(&q, "example.", 251, "192.0.2.100", false, &r);
-    CHECK(&r, r.rcode == 0 && r.aa && r.counts[0] == 1 && gr_count(&r, 1, 6) == 1 && (r.msg[2] & 0x02) == 0);
-    put_hdr(&q, 0x4592, 0x0000, 1, 0, 1, 0); put_question(&q, "example.", 251, 1); put_soa_rr(&q, "example.", 1);
-    ask(&q, "example.", 251, "192.0.2.100", false, &r);
-    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 6) == 1 && (r.msg[2] & 0x02) != 0);
-    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0); put_question(&q, "example.", 251, 1);      /* IXFR without a client SOA */
-    ask(&q, "example.", 251, "192.0.2.100", false, &r);
-    CHECK(&r, r.rcode == 0 || r.rcode == 1);
+    /* RFC 1995 2: IXFR over UDP. Client already current -> the single SOA; older client -> SOA + TC so it retries via TCP.
+     * allow-transfer is checked first (BIND ns_xfr_start()): a client that may not transfer is REFUSED + EDE 18 */
+    {
+        server_config_t *icfg = notify_cfg("zone \"example.\" { type master; file \"x\"; allow-transfer { 192.0.2.100; }; };");
+        g_gr.cfg = *icfg;
+        g_gr.cfg.send_extended_errors = true;
+        g_gr.view.name = "__default__";
+        put_hdr(&q, 0x4592, 0x0000, 1, 0, 1, 0); put_question(&q, "example.", 251, 1); put_soa_rr(&q, "example.", 5);
+        ask(&q, "example.", 251, "192.0.2.100", false, &r);
+        CHECK(&r, r.rcode == 0 && r.aa && r.counts[0] == 1 && gr_count(&r, 1, 6) == 1 && (r.msg[2] & 0x02) == 0);
+        put_hdr(&q, 0x4592, 0x0000, 1, 0, 1, 0); put_question(&q, "example.", 251, 1); put_soa_rr(&q, "example.", 1);
+        ask(&q, "example.", 251, "192.0.2.100", false, &r);
+        CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 6) == 1 && (r.msg[2] & 0x02) != 0);
+        put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0); put_question(&q, "example.", 251, 1);      /* IXFR without a client SOA */
+        ask(&q, "example.", 251, "192.0.2.100", false, &r);
+        CHECK(&r, r.rcode == 0 || r.rcode == 1);
+        ask(&q, "example.", 251, "203.0.113.9", false, &r);                            /* not allowed to transfer */
+        CHECK(&r, r.rcode == 5 && r.counts[0] == 0 && gr_count(&r, 1, 6) == 0);
+        g_gr.cfg = (server_config_t){0};
+        free_server_config_fields(icfg); free(icfg);
+    }
 
     /* RFC 7873: a COOKIE that cannot be bound to a (parsable) client address is not answered with a server cookie */
     uint8_t opt_ck[12] = { 0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8 };
@@ -602,7 +614,7 @@ static void test_notify_catalog_member(void) {
     strncpy(g_gr.cat_entry.domain, "catalog.example.", sizeof(g_gr.cat_entry.domain) - 1);
     g_gr.cat_entry.is_secondary = true;
     g_gr.entries[1] = &g_gr.cat_entry;
-    g_gr.view.zone_count = 2;
+    view_set_entries(&g_gr.view, g_gr.entries, 2);
     g_gr.entry.is_catalog_member = true;
     g_gr.entry.is_secondary = true;
     g_gr.entry.source = ZONE_SRC_CATALOG;
@@ -626,7 +638,7 @@ static void test_notify_catalog_member(void) {
     g_gr.view.name = "__default__";
     strncpy(g_gr.cat_entry.domain, "catalog.example.", sizeof(g_gr.cat_entry.domain) - 1);
     g_gr.entries[1] = &g_gr.cat_entry;
-    g_gr.view.zone_count = 2;
+    view_set_entries(&g_gr.view, g_gr.entries, 2);
     g_gr.entry.is_catalog_member = true;
     g_gr.entry.is_secondary = true;
     g_gr.entry.source = ZONE_SRC_CATALOG;
@@ -656,7 +668,7 @@ static void test_notify_catalog_member(void) {
     g_gr.view.name = "__default__";
     strncpy(g_gr.cat_entry.domain, "catalog.example.", sizeof(g_gr.cat_entry.domain) - 1);
     g_gr.entries[1] = &g_gr.cat_entry;
-    g_gr.view.zone_count = 2;
+    view_set_entries(&g_gr.view, g_gr.entries, 2);
     g_gr.entry.is_catalog_member = true;
     g_gr.entry.is_secondary = true;
     g_gr.entry.source = ZONE_SRC_CATALOG;
@@ -803,7 +815,7 @@ static void test_notify_server_stmt_key(void) {
     strncpy(g_gr.cat_entry.domain, "catalog.example.", sizeof(g_gr.cat_entry.domain) - 1);
     g_gr.cat_entry.is_secondary = true;
     g_gr.entries[1] = &g_gr.cat_entry;
-    g_gr.view.zone_count = 2;
+    view_set_entries(&g_gr.view, g_gr.entries, 2);
     g_gr.entry.is_catalog_member = true;
     g_gr.entry.is_secondary = true;
     g_gr.entry.source = ZONE_SRC_CATALOG;
@@ -984,8 +996,7 @@ static void test_sibling_zone_additional_glue_and_limits(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 2;
+    view_set_entries(&view, entries, 2);
     view.match_clients = acl_any;
     view.match_clients_count = 1;
 
@@ -1348,9 +1359,81 @@ static void test_udp_limit_follows_edns_size(void) {
     printf("  -> UDP limit passed.\n");
 }
 
+/* D1a phase 2 (design 9): zone "x" { in-view "v1"; } where x is a zone of the database of v1.  The directory of the sharing view has no element for it: the view lists the
+ * name (its ivdb) and the lookup goes on in the directory of v1 of the same snapshot.  The lookup is the longest-suffix one over both, the case does not matter, a name that
+ * is not in v1 (the zone left the database) falls through to the zone above, and the view that holds the zone is v1's. */
+static void test_in_view_db_names(void) {
+    printf("[TEST] Zone directory: names shared by in-view from the directory of another view (D1a phase 2)...\n");
+    gr_setup("example.", ZONE_TXT);
+    view_snapshot_t views[3];
+    memset(views, 0, sizeof(views));
+    views[0].name = "v2";
+    views[0].match_clients = g_gr.acl;
+    views[0].match_clients_count = 1;
+    views[1] = g_gr.view;                                     /* v1: holds example. */
+    views[1].name = "v1";
+    views[2].name = "v3";
+    views[2].match_clients = g_gr.acl;
+    views[2].match_clients_count = 1;
+    assert(view_ivdb_alloc(&views[0], 3));
+    assert(view_ivdb_add(&views[0], "example.", &views[1]));
+    assert(view_ivdb_add(&views[0], "ghost.example.", &views[1]));            /* (not a zone of v1 now) */
+    assert(view_ivdb_add(&views[0], "EXAMPLE.", &views[1]));                   /* (written twice: the first stays) */
+    assert(views[0].ivdb_n == 2);
+    zdir_elem_t *e1 = zdir_find_suffix(&views[1], "www.example.");
+    assert(e1 && zdir_entry(e1) == &g_gr.entry);
+    assert(zdir_find_suffix(&views[0], "www.example.") == e1 && zdir_find_exact(&views[0], "Example.") == e1);
+    assert(find_zone_in_view(&views[0], "a.b.example.") == &g_gr.entry && find_zone_for_query(&views[0], "www.example.", 1) == &g_gr.entry);
+    assert(find_zone_in_view(&views[0], "x.ghost.example.") == &g_gr.entry);          /* ghost.example. is no zone of v1: the zone above answers */
+    assert(zdir_find_exact(&views[0], "ghost.example.") == NULL);
+    assert(find_zone_in_view(&views[0], "www.other.test.") == NULL && find_zone_in_view(&views[2], "www.example.") == NULL);
+    assert(strcmp(zdir_holder_view(&views[0], e1), "v1") == 0 && strcmp(zdir_holder_view(&views[1], e1), "v1") == 0 && strcmp(zdir_holder_view(&views[2], e1), "v3") == 0);
+    /* a name of the view's own directory wins and is the view's own */
+    zone_db_entry_t *other[1] = { &g_gr.cat_entry };
+    memset(&g_gr.cat_entry, 0, sizeof(g_gr.cat_entry));
+    strncpy(g_gr.cat_entry.domain, "sub.example.", sizeof(g_gr.cat_entry.domain) - 1);
+    atomic_store_explicit(&g_gr.cat_entry.rcu.active, &g_gr.arena.ver, memory_order_release);
+    assert(view_set_entries(&views[0], other, 1));
+    zdir_elem_t *own = zdir_find_suffix(&views[0], "www.sub.example.");
+    assert(own && zdir_entry(own) == &g_gr.cat_entry && strcmp(zdir_holder_view(&views[0], own), "v2") == 0);
+    assert(find_zone_in_view(&views[0], "www.example.") == &g_gr.entry);
+    /* many names: the table grows to its size */
+    view_snapshot_t big;
+    memset(&big, 0, sizeof(big));
+    assert(view_ivdb_alloc(&big, 301));
+    char nm[64];
+    for (int i = 0; i < 300; i++) {
+        snprintf(nm, sizeof(nm), "n%03d.example.", i);
+        assert(view_ivdb_add(&big, nm, &views[1]));
+    }
+    assert(view_ivdb_add(&big, "example.", &views[1]));
+    assert(big.ivdb_n == 301);
+    assert(find_zone_in_view(&big, "www.n123.example.") == &g_gr.entry);          /* (n123.example. is not in v1: the zone above answers) */
+    assert(zdir_find_exact(&big, "n123.example.") == NULL && zdir_find_exact(&big, "example.") == e1);
+    view_ivdb_free(&big);
+    /* a query through the sharing view is answered from v1's zone; one through a view that does not name it is REFUSED */
+    g_gr.snap.views = views;
+    g_gr.snap.view_count = 3;
+    req_t q;
+    gr_resp_t r;
+    put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 0); put_question(&q, "www.example.", 1, 1);
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);                         /* (the first view whose match-clients matches is v2) */
+    CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, 1) == 1);
+    views[0].name = "v2";
+    view_ivdb_free(&views[0]);                                                      /* v2 shares nothing now: its own directory has sub.example. only */
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+    CHECK(&r, r.rcode == 5);
+    view_clear_dir(&views[0]);
+    g_gr.snap.views = &g_gr.view;
+    g_gr.snap.view_count = 1;
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> shared names passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Query Engine Protocol Tests ===\n");
     test_protocol_anomalies();
+    test_in_view_db_names();
     test_expired_secondary_zone();
     test_notify_authorization();
     test_notify_catalog_member();

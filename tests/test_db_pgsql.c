@@ -153,6 +153,25 @@ static db_conn_t *open_drv(const char *schema) {
 
 /* ---- callbacks that collect ---- */
 typedef struct { int n; int64_t id[4000]; char name[8][64]; char type[8][16]; char master[8][32]; char soa[8][80]; bool soa_null[8]; bool master_null[8]; int stop_after; } zacc_t;
+/* D1a step 6: scan_apex rows */
+typedef struct { size_t n, nsoa, naddr, stop_after; int64_t first_dom; bool first_is_soa; char first_content[40]; uint16_t addr_at[8]; char addr_name[8][24]; } apx_t;
+static int cb_apex(void *ud, const db_apex_row_t *r) {
+    apx_t *a = ud;
+    if (r->addr_type && a->naddr < 8) {
+        a->addr_at[a->naddr] = r->addr_type;
+        snprintf(a->addr_name[a->naddr], sizeof(a->addr_name[0]), "%s", r->name ? r->name : "");
+    }
+    a->naddr += r->addr_type ? 1 : 0;
+    if (a->n == 0) {
+        a->first_dom = r->domain_id;
+        a->first_is_soa = r->is_soa;
+        snprintf(a->first_content, sizeof(a->first_content), "%s", r->content ? r->content : "");
+    }
+    a->n++;
+    a->nsoa += r->is_soa ? 1 : 0;
+    return a->stop_after && a->n >= a->stop_after;
+}
+
 static int cb_zone(void *ud, const db_zone_row_t *z) {
     zacc_t *a = ud;
     if (a->n < 8) {
@@ -494,6 +513,20 @@ static void test_rows(void) {
     z->stop_after = 2;
     CHECK(D->list_zones(c, cb_zone, z) == DB_STOPPED && z->n == 2);    /* stopped scan, then another query works */
 
+    /* D1a step 6 scan_apex: the enabled SOA and NS rows at the apex, in domain id order (a.test has two enabled SOA rows, the one with the smaller id first) */
+    {
+        apx_t ap;
+        memset(&ap, 0, sizeof(ap));
+        CHECK(D->scan_apex != NULL && D->scan_apex(c, NULL, cb_apex, &ap) == 0 && ap.n >= 1);
+        CHECK(ap.first_dom == 1 && ap.first_is_soa && !strncmp(ap.first_content, "ns.a.test ", 10));
+        memset(&ap, 0, sizeof(ap));
+        int64_t one = 3;
+        CHECK(D->scan_apex(c, &one, cb_apex, &ap) == 0 && ap.nsoa == 0);        /* (the only SOA of zone 3 is disabled) */
+        memset(&ap, 0, sizeof(ap));
+        ap.stop_after = 1;
+        CHECK(D->scan_apex(c, NULL, cb_apex, &ap) == DB_STOPPED && ap.n == 1);
+    }
+
     /* B13 find_zone: the same row as the list, by name: exact spelling by index, other capitals / trailing dot by the lower() fallback */
     memset(z, 0, sizeof(*z));
     CHECK(D->find_zone(c, "b.test", cb_zone, z) == 0 && z->n == 1 && z->id[0] == 2 && !strcmp(z->type[0], "SLAVE") && z->soa_null[0]);
@@ -633,7 +666,10 @@ static void test_zone_soa(void) {
       "(8, 'E8.test', 'SOA', 'soa-e8-ci', 60, false), (8, 'e8.test', 'SOA', 'soa-e8-exact', 60, false),"          /* two spellings: the exact one wins */
       "(9, 'e9.test', 'SOA', 'soa-e9-off', 60, true), (9, 'E9.TEST', 'SOA', 'soa-e9-ci', 60, false),"             /* exact disabled: the other spelling */
       "(10, 'e10.test', 'SOA', 'soa-e10', 60, false),"                                                            /* the domain is in capitals */
-      "(11, 'e11.test', 'SOA', NULL, 60, false)");                                                                /* an enabled SOA without content */
+      "(11, 'e11.test', 'SOA', NULL, 60, false),"                                                                 /* an enabled SOA without content */
+      "(1, 'ns.e1.test', 'AAAA', '2001:db8::1', 600, false), (1, 'NS.E1.test', 'A', '192.0.2.1', 300, false),"  /* D1a step 6: the addresses of the NS target inside the zone (names in capitals too) */
+      "(1, 'ns.e1.test', 'A', '192.0.2.9', 300, true), (1, 'www.e1.test', 'A', '192.0.2.80', 300, false),"       /* (disabled; not an NS target) */
+      "(2, 'ns.e1.test', 'A', '192.0.2.77', 300, false)");                                                     /* (another zone's row) */
     db_conn_t *c = open_drv("karidns_test_s2");
     if (!c) return;
     db_schema_info_t si;
@@ -661,6 +697,19 @@ static void test_zone_soa(void) {
             CHECK_MSG(w ? (!z->soa_null[0] && !strcmp(z->soa[0], w)) : z->soa_null[0], "find_zone %s: SOA '%s' (null %d)", fz[k].ask, z->soa[0], z->soa_null[0]);
         }
     }
+    /* D1a step 6 (in-zone glue) scan_apex: the A and AAAA rows of the zone whose owner is the target of its apex NS row (e1.test: ns.e1.test), enabled, in id order */
+    {
+        apx_t ap;
+        memset(&ap, 0, sizeof(ap));
+        int64_t one = 1;
+        CHECK(D->scan_apex(c, &one, cb_apex, &ap) == 0 && ap.nsoa == 2 && ap.naddr == 2);
+        CHECK(ap.addr_at[0] == 28 && !strcmp(ap.addr_name[0], "ns.e1.test") && ap.addr_at[1] == 1 && !strcmp(ap.addr_name[1], "NS.E1.test"));
+        memset(&ap, 0, sizeof(ap));
+        CHECK(D->scan_apex(c, NULL, cb_apex, &ap) == 0 && ap.naddr == 2);
+        memset(&ap, 0, sizeof(ap));
+        one = 2;
+        CHECK(D->scan_apex(c, &one, cb_apex, &ap) == 0 && ap.naddr == 0);                 /* (zone 2 has no NS row of its own) */
+    }
     CHECK(D->end_snapshot(c) == 0);
 
     /* more zones than one FETCH, with and without statistics (the planner may choose either plan): every zone gets its own SOA,
@@ -668,8 +717,15 @@ static void test_zone_soa(void) {
     Q("INSERT INTO domains (id, name, type) SELECT g, 'b' || g || '.test', 'NATIVE' FROM generate_series(1000, 3499) g");
     Q("INSERT INTO records (domain_id, name, type, content, ttl, disabled) SELECT g, 'b' || g || '.test', 'SOA', 'soa-b' || g, 60, false FROM generate_series(1100, 3499) g");
     Q("INSERT INTO records (domain_id, name, type, content, ttl, disabled) SELECT g, h || '.b' || g || '.test', 'A', '192.0.2.1', 60, false FROM generate_series(1000, 3499) g, generate_series(1, 4) h");
+    /* D1a step 7: the addresses of an NS target outside the zone, from any zone: b1000.test has the NS row ns.out.test, whose A and AAAA rows are in b1001.test
+     * (lower case, found); b1002.test has an NS row whose address row is stored with capitals (not found: names are matched in lower case, as PowerDNS stores them),
+     * a disabled address and a TXT row do not count */
+    Q("INSERT INTO records (domain_id, name, type, content, ttl, disabled) VALUES (1000, 'b1000.test', 'NS', 'ns.out.test.', 60, false), "
+      "(1001, 'ns.out.test', 'A', '192.0.2.61', 300, false), (1001, 'ns.out.test', 'AAAA', '2001:db8::61', 300, false), (1001, 'ns.out.test', 'A', '192.0.2.69', 300, true), "
+      "(1001, 'ns.out.test', 'TXT', 'text', 300, false), (1002, 'b1002.test', 'NS', 'ns.cap.test', 60, false), (1001, 'NS.CAP.test', 'A', '192.0.2.62', 300, false)");
     for (int pass = 0; pass < 2; pass++) {
         if (pass == 1) Q("ANALYZE domains; ANALYZE records");
+
         CHECK(D->begin_snapshot(c) == 0);
         memset(z, 0, sizeof(*z));
         CHECK(D->list_zones(c, cb_szone, z) == 0);
@@ -690,7 +746,17 @@ static void test_zone_soa(void) {
         CHECK(D->find_zone(c, "b2000.test", cb_szone, z) == 0 && z->n == 1 && z->id[0] == 2000 && !strcmp(z->soa[0], "soa-b2000"));
         memset(z, 0, sizeof(*z));
         CHECK(D->find_zone(c, "b1050.test", cb_szone, z) == 0 && z->n == 1 && z->id[0] == 1050 && z->soa_null[0]);
+        {
+            apx_t ap;
+            memset(&ap, 0, sizeof(ap));
+            int64_t k1000 = 1000, k1002 = 1002;
+            CHECK_MSG(D->scan_apex(c, &k1000, cb_apex, &ap) == 0 && ap.n == 3 && ap.naddr == 2, "pass %d: cross rows of b1000.test: %zu rows, %zu addresses", pass, ap.n, ap.naddr);
+            CHECK(ap.addr_at[0] == 1 && ap.addr_at[1] == 28 && !strcmp(ap.addr_name[0], "ns.out.test") && !strcmp(ap.addr_name[1], "ns.out.test"));
+            memset(&ap, 0, sizeof(ap));
+            CHECK_MSG(D->scan_apex(c, &k1002, cb_apex, &ap) == 0 && ap.n == 1 && ap.naddr == 0, "pass %d: cross rows of b1002.test: %zu rows", pass, ap.n);
+        }
         CHECK(D->end_snapshot(c) == 0);
+
     }
     D->close(c);
     free(z);

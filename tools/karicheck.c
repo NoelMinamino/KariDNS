@@ -694,6 +694,11 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
             kc_check_loader_driver(&t, db, lp, db->driver);
     }
 
+    /* D1a step 7 (design 8.4): the hot list is made from the frequencies the cache manager keeps, which it does only with memory-limit */
+    if (db->loader_state_file && db->memory_limit == 0)
+        kc_warning(&t, "database: loader-state-file has no effect without memory-limit (every zone stays in memory, so there is no hot list to warm from)\n");
+    if (db->warm_before_serve && db->memory_limit == 0)
+        kc_warning(&t, "database: warm-before-serve only waits for the directory to be loaded without memory-limit (every zone is read at the start)\n");
     /* B7a: without acl-ceiling the ACLs a database zone carries (allow-transfer, allow-update from the metadata or a profile)
      * refuse every client; the zones still answer queries */
     if (db->acl_ceiling_count == 0 && db->acl_ceiling_keys_count == 0)
@@ -1577,6 +1582,10 @@ KARIDNS_TOOL_FN int kc_db_run_source(const server_config_t *cfg, const kc_dbsrc_
         argv[a++] = num[2];
     }
     if (db->auto_reload) argv[a++] = "--auto-reload";
+    if (db->loader_state_file) {                        // D1a step 7: the loader checks that it can use the file (the directory it writes in, the file it reads)
+        argv[a++] = "--state-file";
+        argv[a++] = db->loader_state_file;
+    }
     if (db->server_id) {
         argv[a++] = "--server-id";
         argv[a++] = db->server_id;

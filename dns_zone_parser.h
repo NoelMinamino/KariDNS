@@ -93,6 +93,7 @@ typedef struct zone_glue_s {
   int count;
   uint64_t *ids;         /* per target: id of the zone it resolved to in the view (0 = none / the zone itself) */
   const char **targets;  /* per target: name of an NS / MX / SRV target (first MAX_PRELINK_TARGETS distinct, in file order) */
+  size_t bytes;          /* the size of the block (zone_version_t.bytes counts it) */
 } zone_glue_t;
 
 /* RFC 5155 §3.1.7: one NSEC3 RR of a chain, keyed by the hashed owner name (the owner's first label, base32hex;
@@ -136,6 +137,8 @@ typedef struct {
   zone_glue_t *glue;          /* NULL = no sibling addresses are used */                \
   bool rcache_ok;             /* the zone's answers may go into the shared response cache */ \
   bool heap;                  /* allocated by zone_version_new(): the zone entry frees it */ \
+  bool counted;               /* zone_publish() put `bytes` in the zone memory totals (zone_bytes_get()) */ \
+  size_t bytes;               /* D1a (8.1): what the version holds: the version, its image and the glue block; set when the image is frozen (zone_version_new()) and by zone_glue_track_build() */ \
   /* the published version / any change of a sibling zone: a new value (response cache key). 0 = unpublished/test */ \
   _Atomic uint64_t generation;
 typedef struct zone_version_s {
@@ -154,6 +157,7 @@ typedef struct zone_arena_s {
   int data_pool_count;
   int data_pool_cap;
   size_t first_pool_cap;  /* 0 = 64 KiB。小さいゾーンは読み込み前にファイルの大きさから決める */
+  size_t pool_bytes;      /* the bytes of all the data pools (the size of an IXFR difference's arena: zone memory accounting) */
   size_t current_pool_cap;
   size_t current_pool_idx;
   /* 読み込んだファイルの本文 (レコードの文字列はこの中を指す)。file_buf_cap 個まで (最大 32) */

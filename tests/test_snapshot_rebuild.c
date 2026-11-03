@@ -35,6 +35,18 @@
 #include "test_zone_slots.h"
 
 // Mock globals
+/* the ticking zones of a view (the control thread's tick list): how many, and the entry of the first */
+static size_t t_ticks(const view_snapshot_t *v) {
+    size_t n = 0;
+    (void)zdir_tick_list(v, &n);
+    return n;
+}
+static zone_db_entry_t *t_tick0(const view_snapshot_t *v) {
+    size_t n = 0;
+    zdir_elem_t *const *l = zdir_tick_list(v, &n);
+    return n ? zdir_entry(l[0]) : NULL;
+}
+
 _Atomic int g_control_kq = -1;
 int g_notify_ipc[2] = {-1, -1};
 int g_broker_sock = -1;
@@ -159,7 +171,7 @@ static void test_rebuild_two_views(void) {
         if (!strcmp(snap->views[v].name, "internal")) vi = &snap->views[v];
         if (!strcmp(snap->views[v].name, "external")) ve = &snap->views[v];
     }
-    assert(vi && ve && vi->zone_count == 2 && ve->zone_count == 1);
+    assert(vi && ve && zdir_count(vi) == 2 && zdir_count(ve) == 1);
     assert(find_zone_in_view(vi, "www.b.example.") != NULL);
     assert(find_zone_in_view(vi, "deep.host.a.example.") != NULL);
     assert(find_zone_in_view(ve, "www.b.example.") == NULL);          /* b.example only lives in the internal view */
@@ -758,7 +770,6 @@ static void test_snapshot_rebuild_case_29(void) {
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.zone_count = 0;
     zone_db_snapshot_t snap;
     memset(&snap, 0, sizeof(snap));
     snap.views = &view;
@@ -847,8 +858,8 @@ static void test_snapshot_rebuild_type_change(void) {
     assert(keep2 == keep1); /* "primary" and "master" are the same kind */
     /* the control thread's tick list of the view: the secondary only (the primaries have no timers to look at) */
     view_snapshot_t *v1 = snapshot_find_view(s1, "__default__"), *v2 = snapshot_find_view(s2, "__default__");
-    assert(v1 && v1->tick_count == 0);
-    assert(v2 && v2->tick_count == 1 && v2->tick_entries[0] == tc2);
+    assert(v1 && t_ticks(v1) == 0);
+    assert(v2 && t_ticks(v2) == 1 && t_tick0(v2) == tc2);
 
     server_config_t *c3 = load_conf(
         "options { directory \"%s\"; };\n"
@@ -1161,14 +1172,14 @@ static void test_snapshot_in_view(void) {
     zone_db_entry_t *sb = snapshot_get_zone_in_view(s1, "b", "sec.example."), *ob = snapshot_get_zone_in_view(s1, "b", "own.example.");
     assert(za && sa && za == zb && za == zc && sa == sb && ob && ob != za);
     assert(strcmp(za->view_name, "a") == 0 && strcmp(sb->view_name, "a") == 0 && strcmp(ob->view_name, "b") == 0);   /* the owner's name stays */
-    assert(va->zone_count == 2 && va->static_count == 2 && va->shared_count == 0);
-    assert(vb->zone_count == 3 && vb->static_count == 1 && vb->shared_count == 2);
-    assert(vc->zone_count == 1 && vc->static_count == 0 && vc->shared_count == 1);
+    assert(zdir_count(va) == 2 && zdir_count_static(va) == 2 && zdir_count_shared(va) == 0);
+    assert(zdir_count(vb) == 3 && zdir_count_static(vb) == 1 && zdir_count_shared(vb) == 2);
+    assert(zdir_count(vc) == 1 && zdir_count_static(vc) == 0 && zdir_count_shared(vc) == 1);
     assert(view_owns_entry(va, za) && !view_owns_entry(vb, zb) && view_owns_entry(vb, ob) && !view_owns_entry(vc, zc));
     assert(atomic_load(&za->snapshot_refs) >= 3);                       /* a, b and c each count it */
     /* the 1-second tick: the secondary is in the owner view's list only, never in the referencing view's */
-    assert(va->tick_count == 1 && va->tick_entries[0] == sa);
-    assert(vb->tick_count == 0 && vc->tick_count == 0);
+    assert(t_ticks(va) == 1 && t_tick0(va) == sa);
+    assert(t_ticks(vb) == 0 && t_ticks(vc) == 0);
     /* the query path: the client's address selects the view, the view finds the shared entry, whose data are the owner's */
     assert(find_zone_in_view(select_view(s1, "127.0.0.2"), "www.iv.example.") == za);
     assert(find_zone_in_view(select_view(s1, "192.0.2.200"), "www.iv.example.") == za);
@@ -1192,8 +1203,8 @@ static void test_snapshot_in_view(void) {
     server_config_t *c2 = load_conf(conf1, g_dir, g_dir, g_dir);
     zone_db_snapshot_t *s2 = build(c2, false);
     assert(snapshot_get_zone_in_view(s2, "a", "iv.example.") == za && snapshot_get_zone_in_view(s2, "c", "iv.example.") == za);
-    assert(snapshot_find_view(s2, "b")->shared_count == 2 && snapshot_find_view(s2, "b")->zone_count == 3);
-    assert(snapshot_find_view(s2, "a")->tick_count == 1 && snapshot_find_view(s2, "b")->tick_count == 0);
+    assert(zdir_count_shared(snapshot_find_view(s2, "b")) == 2 && zdir_count(snapshot_find_view(s2, "b")) == 3);
+    assert(t_ticks(snapshot_find_view(s2, "a")) == 1 && t_ticks(snapshot_find_view(s2, "b")) == 0);
     /* the in-view of view c is dropped: c no longer has the zone; view b keeps it */
     server_config_t *c3 = load_conf(
         "options { directory \"%s\"; };\n"
@@ -1204,9 +1215,9 @@ static void test_snapshot_in_view(void) {
         "  zone \"sec.example\" { in-view \"a\"; }; zone \"own.example\" { type master; file \"%s/ivown.zone\"; }; };\n"
         "view \"c\" { match-clients { any; }; zone \"own.example\" { type master; file \"%s/ivown.zone\"; }; };\n", g_dir, g_dir, g_dir, g_dir);
     zone_db_snapshot_t *s3 = build(c3, false);
-    assert(snapshot_get_zone_in_view(s3, "c", "iv.example.") == NULL && snapshot_find_view(s3, "c")->shared_count == 0);
-    assert(snapshot_get_zone_in_view(s3, "b", "iv.example.") == za && snapshot_find_view(s3, "b")->shared_count == 2);
-    assert(snapshot_find_view(s3, "a")->tick_count == 1 && snapshot_find_view(s3, "b")->tick_count == 0);
+    assert(snapshot_get_zone_in_view(s3, "c", "iv.example.") == NULL && zdir_count_shared(snapshot_find_view(s3, "c")) == 0);
+    assert(snapshot_get_zone_in_view(s3, "b", "iv.example.") == za && zdir_count_shared(snapshot_find_view(s3, "b")) == 2);
+    assert(t_ticks(snapshot_find_view(s3, "a")) == 1 && t_ticks(snapshot_find_view(s3, "b")) == 0);
     /* retargeted: c shares iv.example from view b's... b only shares it, so the zone moves: a real zone { } in b replaces the in-view there */
     server_config_t *c4 = load_conf(
         "options { directory \"%s\"; };\n"
@@ -1219,10 +1230,10 @@ static void test_snapshot_in_view(void) {
     zone_db_snapshot_t *s4 = build(c4, false);
     zone_db_entry_t *zb4 = snapshot_get_zone_in_view(s4, "b", "iv.example."), *zc4 = snapshot_get_zone_in_view(s4, "c", "iv.example.");
     assert(zb4 && zb4 != za && strcmp(zb4->view_name, "b") == 0);       /* it was a shared entry of a: the zone { } of b is a new entry */
-    assert(zc4 == zb4 && snapshot_find_view(s4, "b")->shared_count == 1 && snapshot_find_view(s4, "c")->shared_count == 1);
+    assert(zc4 == zb4 && zdir_count_shared(snapshot_find_view(s4, "b")) == 1 && zdir_count_shared(snapshot_find_view(s4, "c")) == 1);
     assert(view_owns_entry(snapshot_find_view(s4, "b"), zb4) && !view_owns_entry(snapshot_find_view(s4, "c"), zc4));
     assert(snapshot_get_zone_in_view(s4, "a", "iv.example.") == za);
-    assert(snapshot_find_view(s4, "a")->tick_count == 1 && snapshot_find_view(s4, "b")->tick_count == 0);
+    assert(t_ticks(snapshot_find_view(s4, "a")) == 1 && t_ticks(snapshot_find_view(s4, "b")) == 0);
     /* a reload of the same retargeted configuration also keeps the sharing; a different target of the same name is noticed */
     server_config_t *c5 = load_conf(
         "options { directory \"%s\"; };\n"
@@ -1253,9 +1264,9 @@ static void test_snapshot_in_view(void) {
     zone_db_snapshot_t *s7 = rebuild_zone_db_snapshot(NULL, "a", cat6, NULL, none, 0);
     assert(s7 != NULL);
     assert(snapshot_get_zone_in_view(s7, "b", "sec.example.") == sec6 && snapshot_get_zone_in_view(s7, "c", "sec.example.") == sec6);
-    assert(snapshot_find_view(s7, "b")->shared_count == 2 && snapshot_find_view(s7, "c")->shared_count == 1);
-    assert(snapshot_find_view(s7, "a")->tick_count == 1 && snapshot_find_view(s7, "b")->tick_count == 0 && snapshot_find_view(s7, "c")->tick_count == 0);
-    assert(snapshot_find_view(s7, "a")->shared_count == 0);
+    assert(zdir_count_shared(snapshot_find_view(s7, "b")) == 2 && zdir_count_shared(snapshot_find_view(s7, "c")) == 1);
+    assert(t_ticks(snapshot_find_view(s7, "a")) == 1 && t_ticks(snapshot_find_view(s7, "b")) == 0 && t_ticks(snapshot_find_view(s7, "c")) == 0);
+    assert(zdir_count_shared(snapshot_find_view(s7, "a")) == 0);
     release_zone_snapshot(s1);
     release_zone_snapshot(s2);
     release_zone_snapshot(s3);

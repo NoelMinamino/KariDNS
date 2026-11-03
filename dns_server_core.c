@@ -61,6 +61,8 @@
 #include "dns_snapshot_rcu.h"
 #include "dns_db_supervisor.h"
 #include "dns_db_ingest.h"
+#include "dns_db_stream.h"
+#include "dns_park.h"
 #include "dns_alias.h"
 
 // karidns
@@ -1484,6 +1486,7 @@ tcp_stream_ctx_t *tcp_ctx_alloc(void) {
                                               memory_order_acquire)) {
       tcp_stream_ctx_t *c = &g_tcp_pool[top - 1];
       memset(c, 0, offsetof(tcp_stream_ctx_t, buf));
+      c->gen++;                         /* (kept across the memset: it sits behind buf) */
       return c;
     }
   }
@@ -1518,11 +1521,19 @@ static void tcp_client_forget(int client_fd, tcp_stream_ctx_t *ctx_tcp,
   tcp_ctx_free(ctx_tcp);
 }
 
+/* D1a: the park table of this worker thread (NULL: none).  tcp_client_close() takes the entry of a connection that is closed while it is
+ * parked, so that no entry names a context that went back to the pool. */
+static _Thread_local park_table_t *t_park_tbl;
+
 /* TCP クライアントの接続を閉じる共通処理 (D-04: 以前は約10か所に複製され、後続イベントを
  * 無効にしない箇所があった)。 */
 static void tcp_client_close(int kq, int client_fd, tcp_stream_ctx_t *ctx_tcp,
                              struct kevent *ev_list, int from, int n_events) {
   struct kevent ev_del[2];
+  if (ctx_tcp->parked) {
+    if (t_park_tbl) (void)park_cancel_tcp(t_park_tbl, (uint32_t)(ctx_tcp - g_tcp_pool), ctx_tcp->gen);
+    ctx_tcp->parked = false;
+  }
   /* READ を先に: 期限切れで消えた ONESHOT タイマーの削除が失敗しても READ は外れる */
   EV_SET(&ev_del[0], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
   EV_SET(&ev_del[1], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
@@ -1972,9 +1983,380 @@ static bool blackhole_drops(worker_ctx_t *ctx, const void *sa) {
   return drop;
 }
 
+/* D1a step 8: the engine asks for a zone in the background (a CNAME or the glue of an NS host leads into a zone that is not in memory) */
+static void __attribute__((constructor)) bg_fetch_hook_init(void) { g_query_bg_fetch = park_bg_fetch; }
+
+/* ---- D1a milestone 2: parked queries (dns_park.h) ----
+ * A query whose zone is in the directory without its data is parked, not answered: the worker asks the db ingest thread to fetch the zone,
+ * and answers when the zone is there (a wake-up), or with SERVFAIL + EDE 14 when the time is up or the fetch failed.  Today every zone is in
+ * memory, so none of this runs; udp_one() and the TCP loop are the only code the query takes, with and without it. */
+
+/* (udp_pass_t is in dns_server_internal.h: what one pass over a batch of UDP requests needs besides the request) */
+
+static int64_t park_now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Park the UDP request for the zone of `pel`.  true: parked (the caller answers nothing now). false: not parked (no park table, the time is
+ * up, the table is full, the request too big): the caller answers "not ready". */
+static bool udp_park(udp_pass_t *w, const view_snapshot_t *view, const zdir_elem_t *pel, const udp_ipc_t *ipc, const uint8_t *req, size_t len) {
+  if (!w->park || !view->name) return false;
+  int64_t now = park_now_ms();
+  int64_t left = w->woken ? w->woken_deadline_ms - now : (int64_t)w->park_timeout_ms;
+  if (left <= 0) return false;
+  /* the first query for the zone asks for it.  One that was woken and finds the zone out of memory again (taken out by the cache manager before the request could use
+   * it) asks again: nothing is on its way (the state would be LOADING), and nobody else would wake it before its time is up. */
+  /* a zone that the view shares by in-view from the database of another view (D1a phase 2) is asked for, and woken, in the name of the view that holds it */
+  const char *hv = zdir_holder_view(view, pel);
+  bool ask = (!w->woken || atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) == ZDIR_ST_ABSENT) && !park_has_wait(w->park, hv, pel->name);
+  int32_t pi = park_udp(w->park, now, (uint32_t)left, hv, pel->name, w->active_fd, ipc, req, len);
+  if (pi < 0) return false;
+  if (ask && !park_fetch_request(w->worker_idx, hv, pel->name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL)) {
+    park_release(w->park, &w->park->e[pi]);            /* the request could not be handed over (ring full): nobody would ever wake it */
+    return false;
+  }
+  if (!w->woken) dbreg_cache_note_miss();            /* a query that had to wait for its zone (the cache manager counts misses) */
+  return true;
+}
+
+/* One request of the UDP loop of the worker, from the question to the answer in the batch of datagrams to send (or the park table: a zone that
+ * is in the directory without its data parks the query).  The first pass and the second one, after a wake-up or a time-out, are the same
+ * code: w->woken says which.  The function enters and leaves the read section itself, on every path. */
+STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ssize_t payload_received) {
+  worker_ctx_t *ctx = w->ctx;
+  udp_batch_ctx_t *batch = w->batch;
+  const int active_fd = w->active_fd;
+  const bool qlog_enabled = w->qlog_enabled, rlog_enabled = w->rlog_enabled, blackhole_on = w->blackhole_on;
+  const uint32_t eff_max_qps = w->eff_max_qps;
+            ipc_sockaddr_t *client_addr = &ipc_msg->client_addr;
+
+            /* options { blackhole } (BIND 9.20 lib/ns/client.c: "dropped request: blackholed peer"; the list's first match for the
+             * source address is not negated): dropped before anything else looks at the packet, the response cache and the logs included,
+             * and a NOTIFY answer from such an address is not passed on either.  No allocation: the subject lives on the stack. */
+            if (__builtin_expect(blackhole_on, 0) && blackhole_drops(ctx, client_addr)) return;
+
+            // クエリパケットの検証: QRビットが0(クエリ)であることを期待
+            uint8_t flags = req_buf[2];
+            if (!__builtin_expect((flags & 0x80) == 0, 1)) {
+              /* RFC 1996 §3.6, §4.8: 送った NOTIFY の応答は制御スレッドが照合して再送を止める */
+              if (((flags >> 3) & 0x0F) == 4)
+                send(g_notify_resp_ipc[1], ipc_msg, sizeof(udp_ipc_t) + (size_t)ipc_msg->payload_len, MSG_DONTWAIT);
+              return;
+            }
+
+            char client_ip[INET6_ADDRSTRLEN] = "";
+            rcu_reader_enter(ctx);
+            zone_db_snapshot_t *snap = acquire_zone_snapshot();
+            if (__builtin_expect(client_addr->ss_family == AF_INET, 1)) {
+              fast_ipv4_to_str(client_addr->sin.sin_addr.s_addr, client_ip);
+            } else if (client_addr->ss_family == AF_INET6) {
+              inet_ntop(AF_INET6,
+                        &client_addr->sin6.sin6_addr,
+                        client_ip, INET6_ADDRSTRLEN);
+            }
+
+            // --- 高速ワンパス走査 ---
+            char qname[DNS_NAME_TEXT_SIZE] = "";
+            uint16_t qtype = 0;
+            uint16_t qclass = 1;
+            size_t question_end = DNS_HEADER_SIZE;
+            bool has_edns = false;
+            bool dnssec_ok = false;
+
+            if (payload_received > DNS_HEADER_SIZE) {
+              parse_query_question_fast(req_buf, (size_t)payload_received, qname, sizeof(qname),
+                                        &qtype, &qclass, &question_end);
+              size_t offset = question_end;
+              size_t recv_len = (size_t)payload_received;
+
+              // EDNSの走査 (Questionの直後から無駄なくスキャン)
+              uint16_t arcount = (req_buf[10] << 8) | req_buf[11];
+              if (arcount > 0 && offset < recv_len) {
+                // 通常のクエリでは qd=1, an=0, ns=0 のため、offset は既に Additional Section の先頭
+                if (offset + 10 <= recv_len) {
+                  // OPTレコードの判定 (名前がルート 0x00 かつ TYPE 41)
+                  size_t opt_offset = offset;
+                  if (req_buf[opt_offset] == 0) {
+                    opt_offset++;
+                    if (opt_offset + 10 <= recv_len) {
+                      uint16_t rt = (req_buf[opt_offset] << 8) | req_buf[opt_offset + 1];
+                      if (rt == 41) {
+                        has_edns = true;
+                        uint32_t ttl = ((uint32_t)req_buf[opt_offset + 4] << 24) |
+                                       ((uint32_t)req_buf[opt_offset + 5] << 16) |
+                                       ((uint32_t)req_buf[opt_offset + 6] << 8) |
+                                       req_buf[opt_offset + 7];
+                        if (ttl & 0x00008000) dnssec_ok = true;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            int client_port = 0;
+            if (client_addr->ss_family == AF_INET)
+              client_port = ntohs(client_addr->sin.sin_port);
+            else if (client_addr->ss_family == AF_INET6)
+              client_port =
+                  ntohs(client_addr->sin6.sin6_port);
+
+            if (!w->woken) {                    /* (a request that comes back after it was parked was logged the first time) */
+              if (qlog_enabled && !__builtin_expect(atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed), 0)) {
+                  write_query_log(ctx, client_addr, ipc_msg->addr_len,
+                                  qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_UDP, eff_max_qps);
+              }
+              write_dnstap_event(ctx, 1 /*AUTH_QUERY*/, req_buf, payload_received, client_addr, ipc_msg->addr_len,
+                                 ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
+            }
+
+            /* E2: the view and the zone are looked up here once; process_dns_query_cap_routed() takes them instead of looking
+             * them up again. */
+            query_route_t route;
+            tsig_request_t route_tsig;   /* written only when a view with `match-clients { key ...; }` has checked the TSIG (select_view_req()) */
+            bool route_tsig_done;
+            route.view = select_view_req(snap, acquire_config_snapshot(), client_ip, req_buf, (size_t)payload_received, &route_tsig, &route_tsig_done);
+            route.tsig = route_tsig_done ? &route_tsig : NULL;
+            zdir_elem_t *pel = NULL;
+            route.entry = route.view ? find_zone_for_query_ex(route.view, qname, ((req_buf[2] >> 3) & 0x0F) == 0 ? qtype : 0, &pel) : NULL;
+            uint8_t *res_buf = batch->tx_buffers[w->n_tx] + sizeof(udp_ipc_t);
+            const rate_limit_config_t *rrl_cfg = NULL;
+            int res_len = 0;
+            bool not_ready = false, answered = false;
+            if (__builtin_expect(!route.entry && pel != NULL, 0)) {
+              /* D1a: the zone is in the directory and its data is not in memory.  First the question whether this client may ask at all (the
+               * allow-query chain of the normal path, TSIG): if not, or if the request is wrong, the answer is final (REFUSED, FORMERR,
+               * NOTAUTH ...) and nothing parks and nothing is fetched.  A request whose time was up (w->not_ready) is answered "not ready" only
+               * if the zone is still not there: one that arrived is answered. */
+              query_set_client_addr(client_addr);
+              query_set_local_addr(ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL);   /* allow-query-on */
+              res_len = process_dns_not_ready_routed(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
+                                                     UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname, qtype, client_ip, &(*w->cc), false,
+                                                     &rrl_cfg, snap, &route, pel, true);
+              if (res_len != DNS_NR_PERMITTED) {
+                answered = true;
+              } else {
+                if (!w->woken && ((req_buf[2] >> 3) & 0x0F) == 0) atomic_fetch_add_explicit(&pel->freq, 1, memory_order_relaxed);        /* the zone is asked for (an UPDATE does not count), once per query (a query that comes back after a wake-up or a time-out is not counted again) */
+                if (!w->not_ready && udp_park(w, route.view, pel, ipc_msg, req_buf, (size_t)payload_received)) {
+                  rcu_reader_exit(ctx);
+                  return;                                 /* parked: it is answered when the zone is there, or its time is up */
+                }
+                not_ready = true;
+              }
+            }
+            if (route.entry && (route.entry->kind == ZONE_KIND_PROGRAM || route.entry->kind == ZONE_KIND_FORWARD)) {
+              uint8_t *heap_req = malloc((size_t)payload_received);
+              if (!heap_req) {
+                if (rlog_enabled) {
+                  submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
+                }
+                rcu_reader_exit(ctx);
+                return;
+              }
+              memcpy(heap_req, req_buf, (size_t)payload_received);
+
+              async_io_task_t task = {0};
+              task.is_tcp = false;
+              task.active_fd = active_fd;
+              task.ipc_hdr = *ipc_msg;
+              task.req_buf = heap_req;
+              task.req_buf_cap = (size_t)payload_received;
+              task.req_len = (size_t)payload_received;
+              strncpy(task.client_ip, client_ip, sizeof(task.client_ip) - 1);
+              task.client_port = client_port;
+              memcpy(&task.client_addr, client_addr, ipc_msg->addr_len <= sizeof(task.client_addr) ? ipc_msg->addr_len : sizeof(task.client_addr));
+              task.client_len = ipc_msg->addr_len;
+              task.has_server_addr = ipc_msg->has_source_addr;
+              if (ipc_msg->has_source_addr) {
+                memcpy(&task.server_addr, &ipc_msg->source_addr, sizeof(ipc_msg->source_addr));
+              }
+              strncpy(task.qname, qname, sizeof(task.qname) - 1);
+              task.qtype = qtype;
+              task.qclass = qclass;
+              task.has_edns = has_edns;
+              task.dnssec_ok = dnssec_ok;
+              task.question_end = question_end;
+              task.snap = acquire_zone_snapshot();
+              retain_zone_snapshot(task.snap);
+              if (!enqueue_async_io_task(&task)) {
+                release_zone_snapshot(task.snap);
+                free(task.req_buf);
+                if (rlog_enabled) {
+                  submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
+                }
+              }
+              rcu_reader_exit(ctx);
+              return;
+            }
+
+            query_set_client_addr(client_addr);
+            query_set_local_addr(ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL);   /* allow-query-on */
+            if (answered) {
+              /* the answer was built by the check above (REFUSED, FORMERR, NOTAUTH ...) */
+            } else if (__builtin_expect(not_ready, 0)) {
+              /* D1a: the same view, TSIG and rate limit handling as an answer from the zone, with "not ready" as the content */
+              res_len = process_dns_not_ready_routed(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
+                                                     UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
+                                                     qtype, client_ip, &(*w->cc), false, &rrl_cfg, snap, &route, pel, false);
+            } else {
+              res_len = process_dns_query_cap_routed(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
+                                                     UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
+                                                     qtype, client_ip, &(*w->cc), false, &rrl_cfg, snap, &route);
+            }
+            if (res_len > 0) {
+              bool drop_packet = false;
+              bool tc_packet = false;
+
+              if (__builtin_expect(rrl_cfg != NULL && rrl_cfg->configured, 0)) {
+                bool slip_triggered = false;
+                /* D-05: BIND と同じキー (クライアントのプレフィックス + 応答の種類 + 名前) */
+                rrl_key_t rrl_key;
+                char rrl_name[DNS_NAME_TEXT_SIZE];
+                rrl_make_key(&rrl_key, res_buf, (size_t)res_len, qname, qtype, qclass, t_query_rrl_info.zone,
+                             t_query_rrl_info.wildcard, rrl_name, sizeof(rrl_name));
+                if (!rrl_check_key(&ipc_msg->client_addr, &rrl_key, rrl_cfg, &slip_triggered)) {
+                  if (slip_triggered) {
+                    tc_packet = true;
+                  } else {
+                    drop_packet = true;
+                  }
+                  zone_db_entry_t *rrl_z = route.entry; /* the zone the query was answered from (E2) */
+                  if (rrl_z) {
+                    if (tc_packet) {
+                      atomic_fetch_add_explicit(&rrl_z->observatory.rrl_slipped, 1, memory_order_relaxed);
+                    } else {
+                      atomic_fetch_add_explicit(&rrl_z->observatory.rrl_dropped, 1, memory_order_relaxed);
+                    }
+                  }
+                }
+              }
+
+              if (__builtin_expect(drop_packet, 0)) {
+                if (rlog_enabled) {
+                  submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, 
+                                      qclass, qtype, res_buf[3] & 0x0F, has_edns, dnssec_ok);
+                }
+                rcu_reader_exit(ctx);
+                return;
+              }
+
+              if (rlog_enabled) {
+                submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
+                                    res_buf[3] & 0x0F, has_edns, dnssec_ok);
+              }
+
+              udp_ipc_t *res_msg = (udp_ipc_t *)batch->tx_buffers[w->n_tx];
+              res_msg->sock_fd_idx = ipc_msg->sock_fd_idx;
+              res_msg->addr_len = ipc_msg->addr_len;
+              res_msg->has_source_addr = ipc_msg->has_source_addr;
+              if (ipc_msg->has_source_addr) {
+                res_msg->source_addr = ipc_msg->source_addr;
+              }
+              size_t copy_len = (ipc_msg->addr_len <= sizeof(res_msg->client_addr)) ? ipc_msg->addr_len : sizeof(res_msg->client_addr);
+              memcpy(&res_msg->client_addr, &ipc_msg->client_addr, copy_len);
+
+              if (__builtin_expect(tc_packet, 0)) {
+                /* TC=1、質問と OPT だけ。署名付きの要求なら署名し直す (X-20) */
+                int qlen = (int)dns_rrl_slip_response(res_buf, (size_t)res_len,
+                                                      UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t));
+                res_msg->payload_len = qlen;
+                batch->tx_iov[w->n_tx].iov_len = sizeof(udp_ipc_t) + qlen;
+              } else {
+                res_msg->payload_len = res_len;
+                batch->tx_iov[w->n_tx].iov_len = sizeof(udp_ipc_t) + res_len;
+              }
+
+              write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, res_buf, res_msg->payload_len, client_addr, ipc_msg->addr_len,
+                                 ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
+
+              batch->tx_iov[w->n_tx].iov_base = batch->tx_buffers[w->n_tx];
+              batch->tx_msgs[w->n_tx].msg_hdr.msg_name = NULL;
+              batch->tx_msgs[w->n_tx].msg_hdr.msg_namelen = 0;
+              batch->tx_msgs[w->n_tx].msg_hdr.msg_control = NULL;
+              batch->tx_msgs[w->n_tx].msg_hdr.msg_controllen = 0;
+              w->n_tx++;
+              if (w->n_tx == UDP_BATCH_SIZE) {
+                sendmmsg_skip_failed(active_fd, batch->tx_msgs, w->n_tx, "Backend->Frontend IPC", true);
+                w->n_tx = 0;
+              }
+              rcu_reader_exit(ctx);
+            } else {
+              if (rlog_enabled) {
+                submit_response_log(LOG_ACT_DROP_MALFORMED, client_ip, client_port, "<malformed>", 
+                                    0, 0, 0, false, false);
+              }
+              rcu_reader_exit(ctx);
+            }
+}
+
+/* What the ingest thread said (a zone is there, or the fetch failed), the deadlines, and then every parked query that is done: a UDP request is
+ * put through udp_one() again exactly as if it had just come in (w->woken: its old deadline, no new fetch; w->not_ready: answer "not ready"),
+ * a TCP connection is given a short timer whose event runs its request again from the top of the connection loop.  Only the worker calls it. */
+STATIC_TEST void park_service(udp_pass_t *w, int kq) {
+  park_table_t *t = w->park;
+  park_wake_ring_t *ring = park_wake_ring(w->worker_idx);
+  if (t->nwait == 0 && t->nready == 0 && !(ring && park_wake_pending(ring))) return;     /* nothing is parked and nobody said anything: no clock, no exchange */
+  park_key_t k;
+  while (ring && park_wake_pop(ring, &k)) {
+    if (k.failed) (void)park_fail(t, k.view, k.zone);
+    else (void)park_wake(t, k.view, k.zone);
+  }
+  if (ring && park_wake_take_overflow(ring)) (void)park_wake_all(t);          /* a wake was lost: every query looks again */
+  (void)park_expire(t, park_now_ms());
+  if (t->nready == 0) return;
+  uint32_t cur = 0;
+  park_entry_t *e;
+  while ((e = park_next_done(t, &cur))) {
+    bool timed_out = e->state == PARK_TIMEOUT;
+    if (e->kind == PARK_UDP) {
+      udp_ipc_t *ipc = (udp_ipc_t *)w->batch->rx_buffers[0];
+      *ipc = e->u.udp.ipc;
+      uint8_t *req = w->batch->rx_buffers[0] + sizeof(udp_ipc_t);
+      uint16_t len = e->udp_len;
+      memcpy(req, e->u.udp.payload, len);
+      w->active_fd = e->u.udp.fd;
+      w->woken = true;
+      w->woken_deadline_ms = e->deadline_ms;
+      w->not_ready = timed_out;
+      park_release(t, e);                                 /* (before the request runs: it may park again, and takes a free entry) */
+      w->n_tx = 0;
+      udp_one(w, ipc, req, len);
+      if (w->n_tx > 0) {
+        sendmmsg_skip_failed(w->active_fd, w->batch->tx_msgs, w->n_tx, "Backend->Frontend IPC", true);
+        w->n_tx = 0;
+      }
+      w->woken = false;
+      w->not_ready = false;
+    } else {
+      uint32_t idx = e->u.tcp.ctx_idx, gen = e->u.tcp.ctx_gen;
+      int fd = e->u.tcp.fd;
+      park_release(t, e);
+      tcp_stream_ctx_t *c = (g_tcp_pool && idx < MAX_TCP_CLIENTS) ? &g_tcp_pool[idx] : NULL;
+      if (c && c->gen == gen && c->parked) {                /* (the connection is still the one that parked) */
+        c->parked = false;
+        c->not_ready_now = timed_out;
+        c->resume_pending = true;
+        struct kevent ev;
+        EV_SET(&ev, fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0, 1, c);
+        if (kevent(kq, &ev, 1, NULL, 0, NULL) != 0) {        /* it cannot be started again: closing is better than a connection nobody looks at */
+          close(fd);                                         /* (the kqueue forgets the descriptor) */
+          dec_tcp_clients();
+          tcp_ctx_free(c);
+        }
+      }
+    }
+  }
+}
+
 void *worker_thread_func(void *arg) {
   worker_ctx_t *ctx = (worker_ctx_t *)arg;
   uint8_t *tcp_res_buf = NULL;
+  park_table_t park;                                    /* D1a milestone 2: queries parked for a zone that is not in memory (dns_park.h) */
+  memset(&park, 0, sizeof(park));
+  bool park_on = false;
+  uint32_t park_timeout_ms = PARK_DEFAULT_TIMEOUT_MS;
 #ifndef CPU_SETSIZE
 #define CPU_SETSIZE 256
 #endif
@@ -1999,6 +2381,20 @@ void *worker_thread_func(void *arg) {
   rcu_reader_enter(ctx);
   server_config_t *active_cfg = acquire_config_snapshot();
   int bind_count = active_cfg ? active_cfg->listen_count : 0;
+  if (active_cfg && active_cfg->database.enabled) {     /* only a database zone can be out of memory; park-max and park-timeout are read once */
+    if (active_cfg->database.park_timeout_ms) park_timeout_ms = active_cfg->database.park_timeout_ms;
+    park_on = park_init(&park, active_cfg->database.park_max ? active_cfg->database.park_max : PARK_DEFAULT_MAX);
+    if (park_on) {
+      struct kevent ev_park;
+      EV_SET(&ev_park, PARK_WAKE_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+      park_on = kevent(kq, &ev_park, 1, NULL, 0, NULL) == 0;
+      if (park_on) {
+        park_register_worker(ctx->thread_id, kq);
+        t_park_tbl = &park;
+      }
+    }
+    if (!park_on) syslog(LOG_ERR, "[Backend] worker %d: no park table; a query for a zone that is not in memory is answered \"not ready\" at once", ctx->thread_id);
+  }
 
   for (int i = 0; i < bind_count; i++) {
     const listen_addr_t *la = &active_cfg->listen[i];
@@ -2067,6 +2463,8 @@ worker_startup_success:;
   // イベントループ(=信頼できないネットワーク入力の処理)を開始しない。
   while (!atomic_load_explicit(&g_privilege_drop_complete, memory_order_acquire))
     sched_yield();
+  while (db_ingest_hold_queries())                       // database { warm-before-serve }: the sockets stay unread (the kernel queues what comes) until the hot list is read or the time is up
+    usleep(1000);
   if (getppid() != parent_pid)
     backend_shutdown(0); /* O-15: スレッドが動いているので exit() は使わない */
   compress_ctx_t thread_compress_ctx = {0};
@@ -2085,8 +2483,25 @@ worker_startup_success:;
     batch->tx_msgs[k].msg_hdr.msg_iovlen = 1;
   }
 
+  udp_pass_t pass;
+  memset(&pass, 0, sizeof(pass));
+  pass.ctx = ctx;
+  pass.batch = batch;
+  pass.cc = &thread_compress_ctx;
+  pass.park = park_on ? &park : NULL;
+  pass.worker_idx = ctx->thread_id;
+  pass.park_timeout_ms = park_timeout_ms;
+
   while (1) {
-    int n_events = kevent(kq, NULL, 0, ev_list, MAX_EVENTS, NULL);
+    /* with queries parked the wait ends at the first deadline (and at a wake-up: EVFILT_USER, PARK_WAKE_IDENT) */
+    struct timespec park_ts, *park_tp = NULL;
+    if (park_on && park.nwait > 0) {
+      int64_t left = park_next_deadline_ms(&park, park_now_ms());
+      park_ts.tv_sec = left / 1000;
+      park_ts.tv_nsec = (left % 1000) * 1000000;
+      park_tp = &park_ts;
+    }
+    int n_events = kevent(kq, NULL, 0, ev_list, MAX_EVENTS, park_tp);
     if (n_events < 0) {
       if (errno == EINTR)
         continue;
@@ -2099,6 +2514,10 @@ worker_startup_success:;
     uint32_t eff_max_qps = qlog_enabled ? get_effective_query_log_max_qps(active) : 0;
     bool rlog_enabled = response_log_enabled(active);
     bool blackhole_on = (active && active->blackhole);   /* options { blackhole }: read from the snapshot per packet, below */
+    pass.qlog_enabled = qlog_enabled;
+    pass.rlog_enabled = rlog_enabled;
+    pass.blackhole_on = blackhole_on;
+    pass.eff_max_qps = eff_max_qps;
     /* D-06 / RFC 7766 §6.2.3: 最初のメッセージまでの待ち時間と、メッセージ間の待ち時間 */
     uint32_t tcp_initial_ms = (active && active->tcp_initial_timeout > 0) ? active->tcp_initial_timeout : 10000;
     uint32_t tcp_idle_ms = (active && active->tcp_idle_timeout > 0) ? active->tcp_idle_timeout : 10000;
@@ -2112,9 +2531,22 @@ worker_startup_success:;
         int client_fd = ev_list[i].ident;
         tcp_stream_ctx_t *ctx_tcp = (tcp_stream_ctx_t *)ev_list[i].udata;
         if (!ctx_tcp) continue;
-        if (ctx_tcp->quota_yield) {
+        if (ctx_tcp->parked) continue;      /* D1a: waiting for a zone; the park table's deadline closes the matter */
+        if (ctx_tcp->quota_yield || ctx_tcp->resume_pending) {
           ctx_tcp->quota_yield = false;
+          ctx_tcp->resume_pending = false;   /* (a parked request that was woken: it is read from buf at the top of the loop) */
           goto process_tcp_client;
+        }
+        {
+          /* D1a: a 1 ms resume timer of a parked request that a READ event already ran is not the idle timeout: the connection is looked at
+           * again when its real deadline comes (a timer that fired early is the same case) */
+          int64_t tnow = park_now_ms();
+          if (tnow + 2 < ctx_tcp->idle_deadline_ms) {
+            struct kevent ev_t;
+            EV_SET(&ev_t, client_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0, tcp_ms_until(ctx_tcp->idle_deadline_ms, tnow), ctx_tcp);
+            kevent(kq, &ev_t, 1, NULL, 0, NULL);
+            continue;
+          }
         }
         // RFC 7766 §6.2.3: 次のメッセージの期限が過ぎた。接続を閉じる
         tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
@@ -2135,7 +2567,9 @@ worker_startup_success:;
             break;
           }
 
-          int n_tx = 0;
+          pass.active_fd = active_fd;
+          pass.n_tx = 0;
+          pass.woken = false;
           for (int p = 0; p < n_recv; p++) {
             ssize_t received = (ssize_t)batch->rx_msgs[p].msg_len;
             if (received < (ssize_t)sizeof(udp_ipc_t))
@@ -2145,238 +2579,12 @@ worker_startup_success:;
             if (ipc_msg->payload_len > received - (ssize_t)sizeof(udp_ipc_t) ||
                 ipc_msg->payload_len < DNS_HEADER_SIZE)
               continue;
-            uint8_t *req_buf = batch->rx_buffers[p] + sizeof(udp_ipc_t);
-            ssize_t payload_received = ipc_msg->payload_len;
-            ipc_sockaddr_t *client_addr = &ipc_msg->client_addr;
-
-            /* options { blackhole } (BIND 9.20 lib/ns/client.c: "dropped request: blackholed peer"; the list's first match for the
-             * source address is not negated): dropped before anything else looks at the packet, the response cache and the logs included,
-             * and a NOTIFY answer from such an address is not passed on either.  No allocation: the subject lives on the stack. */
-            if (__builtin_expect(blackhole_on, 0) && blackhole_drops(ctx, client_addr)) continue;
-
-            // クエリパケットの検証: QRビットが0(クエリ)であることを期待
-            uint8_t flags = req_buf[2];
-            if (!__builtin_expect((flags & 0x80) == 0, 1)) {
-              /* RFC 1996 §3.6, §4.8: 送った NOTIFY の応答は制御スレッドが照合して再送を止める */
-              if (((flags >> 3) & 0x0F) == 4)
-                send(g_notify_resp_ipc[1], ipc_msg, sizeof(udp_ipc_t) + (size_t)ipc_msg->payload_len, MSG_DONTWAIT);
-              continue;
-            }
-
-            char client_ip[INET6_ADDRSTRLEN] = "";
-            rcu_reader_enter(ctx);
-            zone_db_snapshot_t *snap = acquire_zone_snapshot();
-            if (__builtin_expect(client_addr->ss_family == AF_INET, 1)) {
-              fast_ipv4_to_str(client_addr->sin.sin_addr.s_addr, client_ip);
-            } else if (client_addr->ss_family == AF_INET6) {
-              inet_ntop(AF_INET6,
-                        &client_addr->sin6.sin6_addr,
-                        client_ip, INET6_ADDRSTRLEN);
-            }
-
-            // --- 高速ワンパス走査 ---
-            char qname[DNS_NAME_TEXT_SIZE] = "";
-            uint16_t qtype = 0;
-            uint16_t qclass = 1;
-            size_t question_end = DNS_HEADER_SIZE;
-            bool has_edns = false;
-            bool dnssec_ok = false;
-
-            if (payload_received > DNS_HEADER_SIZE) {
-              parse_query_question_fast(req_buf, (size_t)payload_received, qname, sizeof(qname),
-                                        &qtype, &qclass, &question_end);
-              size_t offset = question_end;
-              size_t recv_len = (size_t)payload_received;
-
-              // EDNSの走査 (Questionの直後から無駄なくスキャン)
-              uint16_t arcount = (req_buf[10] << 8) | req_buf[11];
-              if (arcount > 0 && offset < recv_len) {
-                // 通常のクエリでは qd=1, an=0, ns=0 のため、offset は既に Additional Section の先頭
-                if (offset + 10 <= recv_len) {
-                  // OPTレコードの判定 (名前がルート 0x00 かつ TYPE 41)
-                  size_t opt_offset = offset;
-                  if (req_buf[opt_offset] == 0) {
-                    opt_offset++;
-                    if (opt_offset + 10 <= recv_len) {
-                      uint16_t rt = (req_buf[opt_offset] << 8) | req_buf[opt_offset + 1];
-                      if (rt == 41) {
-                        has_edns = true;
-                        uint32_t ttl = ((uint32_t)req_buf[opt_offset + 4] << 24) |
-                                       ((uint32_t)req_buf[opt_offset + 5] << 16) |
-                                       ((uint32_t)req_buf[opt_offset + 6] << 8) |
-                                       req_buf[opt_offset + 7];
-                        if (ttl & 0x00008000) dnssec_ok = true;
-                      }
-                    }
-                  }
-                }
-              }
-            }
-
-            int client_port = 0;
-            if (client_addr->ss_family == AF_INET)
-              client_port = ntohs(client_addr->sin.sin_port);
-            else if (client_addr->ss_family == AF_INET6)
-              client_port =
-                  ntohs(client_addr->sin6.sin6_port);
-
-            if (qlog_enabled && !__builtin_expect(atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed), 0)) {
-                write_query_log(ctx, client_addr, ipc_msg->addr_len,
-                                qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_UDP, eff_max_qps);
-            }
-            write_dnstap_event(ctx, 1 /*AUTH_QUERY*/, req_buf, payload_received, client_addr, ipc_msg->addr_len,
-                               ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
-
-            /* E2: the view and the zone are looked up here once; process_dns_query_cap_routed() takes them instead of looking
-             * them up again. */
-            query_route_t route;
-            tsig_request_t route_tsig;   /* written only when a view with `match-clients { key ...; }` has checked the TSIG (select_view_req()) */
-            bool route_tsig_done;
-            route.view = select_view_req(snap, acquire_config_snapshot(), client_ip, req_buf, (size_t)payload_received, &route_tsig, &route_tsig_done);
-            route.tsig = route_tsig_done ? &route_tsig : NULL;
-            route.entry = route.view ? find_zone_for_query(route.view, qname, ((req_buf[2] >> 3) & 0x0F) == 0 ? qtype : 0) : NULL;
-            if (route.entry && (route.entry->kind == ZONE_KIND_PROGRAM || route.entry->kind == ZONE_KIND_FORWARD)) {
-              uint8_t *heap_req = malloc((size_t)payload_received);
-              if (!heap_req) {
-                if (rlog_enabled) {
-                  submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
-                }
-                rcu_reader_exit(ctx);
-                continue;
-              }
-              memcpy(heap_req, req_buf, (size_t)payload_received);
-
-              async_io_task_t task = {0};
-              task.is_tcp = false;
-              task.active_fd = active_fd;
-              task.ipc_hdr = *ipc_msg;
-              task.req_buf = heap_req;
-              task.req_buf_cap = (size_t)payload_received;
-              task.req_len = (size_t)payload_received;
-              strncpy(task.client_ip, client_ip, sizeof(task.client_ip) - 1);
-              task.client_port = client_port;
-              memcpy(&task.client_addr, client_addr, ipc_msg->addr_len <= sizeof(task.client_addr) ? ipc_msg->addr_len : sizeof(task.client_addr));
-              task.client_len = ipc_msg->addr_len;
-              task.has_server_addr = ipc_msg->has_source_addr;
-              if (ipc_msg->has_source_addr) {
-                memcpy(&task.server_addr, &ipc_msg->source_addr, sizeof(ipc_msg->source_addr));
-              }
-              strncpy(task.qname, qname, sizeof(task.qname) - 1);
-              task.qtype = qtype;
-              task.qclass = qclass;
-              task.has_edns = has_edns;
-              task.dnssec_ok = dnssec_ok;
-              task.question_end = question_end;
-              task.snap = acquire_zone_snapshot();
-              retain_zone_snapshot(task.snap);
-              if (!enqueue_async_io_task(&task)) {
-                release_zone_snapshot(task.snap);
-                free(task.req_buf);
-                if (rlog_enabled) {
-                  submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
-                }
-              }
-              rcu_reader_exit(ctx);
-              continue;
-            }
-
-            uint8_t *res_buf = batch->tx_buffers[n_tx] + sizeof(udp_ipc_t);
-            const rate_limit_config_t *rrl_cfg = NULL;
-            query_set_client_addr(client_addr);
-            query_set_local_addr(ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL);   /* allow-query-on */
-            int res_len =
-                process_dns_query_cap_routed(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
-                                             UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
-                                             qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap, &route);
-            if (res_len > 0) {
-              bool drop_packet = false;
-              bool tc_packet = false;
-
-              if (__builtin_expect(rrl_cfg != NULL && rrl_cfg->configured, 0)) {
-                bool slip_triggered = false;
-                /* D-05: BIND と同じキー (クライアントのプレフィックス + 応答の種類 + 名前) */
-                rrl_key_t rrl_key;
-                char rrl_name[DNS_NAME_TEXT_SIZE];
-                rrl_make_key(&rrl_key, res_buf, (size_t)res_len, qname, qtype, qclass, t_query_rrl_info.zone,
-                             t_query_rrl_info.wildcard, rrl_name, sizeof(rrl_name));
-                if (!rrl_check_key(&ipc_msg->client_addr, &rrl_key, rrl_cfg, &slip_triggered)) {
-                  if (slip_triggered) {
-                    tc_packet = true;
-                  } else {
-                    drop_packet = true;
-                  }
-                  zone_db_entry_t *rrl_z = route.entry; /* the zone the query was answered from (E2) */
-                  if (rrl_z) {
-                    if (tc_packet) {
-                      atomic_fetch_add_explicit(&rrl_z->observatory.rrl_slipped, 1, memory_order_relaxed);
-                    } else {
-                      atomic_fetch_add_explicit(&rrl_z->observatory.rrl_dropped, 1, memory_order_relaxed);
-                    }
-                  }
-                }
-              }
-
-              if (__builtin_expect(drop_packet, 0)) {
-                if (rlog_enabled) {
-                  submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, 
-                                      qclass, qtype, res_buf[3] & 0x0F, has_edns, dnssec_ok);
-                }
-                rcu_reader_exit(ctx);
-                continue;
-              }
-
-              if (rlog_enabled) {
-                submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
-                                    res_buf[3] & 0x0F, has_edns, dnssec_ok);
-              }
-
-              udp_ipc_t *res_msg = (udp_ipc_t *)batch->tx_buffers[n_tx];
-              res_msg->sock_fd_idx = ipc_msg->sock_fd_idx;
-              res_msg->addr_len = ipc_msg->addr_len;
-              res_msg->has_source_addr = ipc_msg->has_source_addr;
-              if (ipc_msg->has_source_addr) {
-                res_msg->source_addr = ipc_msg->source_addr;
-              }
-              size_t copy_len = (ipc_msg->addr_len <= sizeof(res_msg->client_addr)) ? ipc_msg->addr_len : sizeof(res_msg->client_addr);
-              memcpy(&res_msg->client_addr, &ipc_msg->client_addr, copy_len);
-
-              if (__builtin_expect(tc_packet, 0)) {
-                /* TC=1、質問と OPT だけ。署名付きの要求なら署名し直す (X-20) */
-                int qlen = (int)dns_rrl_slip_response(res_buf, (size_t)res_len,
-                                                      UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t));
-                res_msg->payload_len = qlen;
-                batch->tx_iov[n_tx].iov_len = sizeof(udp_ipc_t) + qlen;
-              } else {
-                res_msg->payload_len = res_len;
-                batch->tx_iov[n_tx].iov_len = sizeof(udp_ipc_t) + res_len;
-              }
-
-              write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, res_buf, res_msg->payload_len, client_addr, ipc_msg->addr_len,
-                                 ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
-
-              batch->tx_iov[n_tx].iov_base = batch->tx_buffers[n_tx];
-              batch->tx_msgs[n_tx].msg_hdr.msg_name = NULL;
-              batch->tx_msgs[n_tx].msg_hdr.msg_namelen = 0;
-              batch->tx_msgs[n_tx].msg_hdr.msg_control = NULL;
-              batch->tx_msgs[n_tx].msg_hdr.msg_controllen = 0;
-              n_tx++;
-              if (n_tx == UDP_BATCH_SIZE) {
-                sendmmsg_skip_failed(active_fd, batch->tx_msgs, n_tx, "Backend->Frontend IPC", true);
-                n_tx = 0;
-              }
-              rcu_reader_exit(ctx);
-            } else {
-              if (rlog_enabled) {
-                submit_response_log(LOG_ACT_DROP_MALFORMED, client_ip, client_port, "<malformed>", 
-                                    0, 0, 0, false, false);
-              }
-              rcu_reader_exit(ctx);
-            }
+            udp_one(&pass, ipc_msg, batch->rx_buffers[p] + sizeof(udp_ipc_t), ipc_msg->payload_len);
           }
           atomic_fetch_add_explicit(&ctx->query_count, n_recv, memory_order_relaxed);
-          if (n_tx > 0) {
-            sendmmsg_skip_failed(active_fd, batch->tx_msgs, n_tx, "Backend->Frontend IPC", true);
-            n_tx = 0;
+          if (pass.n_tx > 0) {
+            sendmmsg_skip_failed(active_fd, batch->tx_msgs, pass.n_tx, "Backend->Frontend IPC", true);
+            pass.n_tx = 0;
           }
         }
       } else if (ev_list[i].udata == (void *)2) {
@@ -2464,6 +2672,7 @@ process_tcp_client: ;
         int client_fd = ev_list[i].ident;
         tcp_stream_ctx_t *ctx_tcp = (tcp_stream_ctx_t *)ev_list[i].udata;
         if (!ctx_tcp) continue;
+        if (ctx_tcp->parked) continue;       /* D1a: parked for a zone; the connection is looked at again when the zone is there (park_service()) */
         if (ev_list[i].flags & (EV_EOF | EV_ERROR)) {
           tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
           continue;
@@ -2480,11 +2689,21 @@ process_tcp_client: ;
 
         int processed_queries = 0;
         bool client_closed = false;
+        bool parked_out = false;        /* D1a: the request is parked: nothing more is read from this connection now */
 
         while (processed_queries < 16) {
           uint8_t *msg = NULL;
           uint16_t msg_len = 0;
-          int ret = read_dns_tcp_message(client_fd, ctx_tcp, &msg, &msg_len);
+          int ret;
+          const bool resumed = ctx_tcp->resume_len != 0;
+          if (resumed) {                      /* D1a: the request that was parked is still in buf; it is answered (or parked again) now */
+            msg = &ctx_tcp->buf[2];
+            msg_len = ctx_tcp->resume_len;
+            ctx_tcp->resume_len = 0;
+            ret = 1;
+          } else {
+            ret = read_dns_tcp_message(client_fd, ctx_tcp, &msg, &msg_len);
+          }
           if (ret < 0) {
             tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
             client_closed = true;
@@ -2548,14 +2767,16 @@ process_tcp_client: ;
           bool has_edns = edns.present;
           bool dnssec_ok = edns.dnssec_ok;
           rcu_reader_enter(ctx);
-          atomic_fetch_add_explicit(&ctx->query_count, 1, memory_order_relaxed);
-          if (qlog_enabled && !atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed)) {
-              write_query_log(ctx, &ctx_tcp->client_addr, ctx_tcp->client_len,
-                              qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_TCP, eff_max_qps);
+          if (!resumed) {                     /* (a request that comes back after it was parked was counted and logged the first time) */
+            atomic_fetch_add_explicit(&ctx->query_count, 1, memory_order_relaxed);
+            if (qlog_enabled && !atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed)) {
+                write_query_log(ctx, &ctx_tcp->client_addr, ctx_tcp->client_len,
+                                qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_TCP, eff_max_qps);
+            }
+            write_dnstap_event(ctx, 1 /*AUTH_QUERY*/, msg, msg_len, &ctx_tcp->client_addr, ctx_tcp->client_len,
+                               ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL,
+                               ctx_tcp->has_server_addr, IPPROTO_TCP);
           }
-          write_dnstap_event(ctx, 1 /*AUTH_QUERY*/, msg, msg_len, &ctx_tcp->client_addr, ctx_tcp->client_len,
-                             ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL,
-                             ctx_tcp->has_server_addr, IPPROTO_TCP);
 
           zone_db_snapshot_t *snap = acquire_zone_snapshot();
           server_config_t *cfg = acquire_config_snapshot();
@@ -2567,6 +2788,8 @@ process_tcp_client: ;
           const zone_config_t *zcfg = xfr_view
               ? find_zone_config_in_view(cfg, xfr_view->name, qname)
               : NULL;
+          zdir_elem_t *xfr_el = NULL;         /* D1a step 7: the database zone of the transfer when its data is not in memory (the thread waits for it) */
+          zone_config_t xfr_nr_zc;            /* ... and its settings as the directory element keeps them (the ACL levels read them) */
           if (xfr_view && (qtype == 252 || qtype == 251)) {
             /* a DB zone has settings of its own (dbcfg), and a secondary may have settings received from its primary (B8t-2: rxcfg,
              * the zone's own statements first): the transfer checks below read them like a configured zone's */
@@ -2574,6 +2797,19 @@ process_tcp_client: ;
             if (xfr_entry && (!zcfg || xfr_entry->source == ZONE_SRC_DB || atomic_load_explicit(&xfr_entry->rxcfg, memory_order_acquire))) {
               const zone_config_t *ec = zone_entry_config(cfg, xfr_entry);
               if (ec) zcfg = ec;
+            } else if (!xfr_entry && !zcfg) {
+              /* a zone of the database that is in the directory without its data (memory-limit): the allow-transfer / TSIG checks below are made with the
+               * settings the element kept, before anything is read for the transfer (the same order as allow-query for a parked query: a client that is
+               * refused costs no fetch) */
+              zdir_elem_t *nel = zdir_find_exact(xfr_view, qname);
+              if (nel && !zdir_entry(nel)) {
+                zone_ext_shared_t *nsh = atomic_load_explicit(&nel->sh, memory_order_acquire);
+                memset(&xfr_nr_zc, 0, sizeof(xfr_nr_zc));
+                xfr_nr_zc.domain = (char *)nel->name;
+                xfr_nr_zc.ext = nsh ? &nsh->ext : NULL;
+                zcfg = &xfr_nr_zc;
+                xfr_el = nel;
+              }
             }
           }
           bool is_synthetic_zone = (zcfg && zcfg->type &&
@@ -2618,17 +2854,18 @@ process_tcp_client: ;
             size_t tsig_mac_len = matched_key ? tsig.mac_len : 0;
             if (tsig_mac_len > 0) memcpy(tsig_mac, tsig.mac, tsig_mac_len);
             zone_db_entry_t *entry = xfr_view ? find_zone_in_view(xfr_view, qname) : NULL;
-            if (allowed && entry) {
+            if (entry) xfr_el = NULL;          /* (it came into memory meanwhile: the usual transfer) */
+            if (allowed && (entry || xfr_el)) {
               /* transfers-out and max-transfer-time-out / max-transfer-idle-out (BIND 9.20), read before the configuration is released */
               uint32_t out_limit = xfr_cfg_limit(cfg, XL_TRANSFERS_OUT);
               xfr_eff_t out_eff;
               /* the settings of the view that owns the zone, not of the view the client came through (a zone shared with in-view is one object) */
-              xfr_opts_effective(cfg, zcfg, entry->view_name, &out_eff);
+              xfr_opts_effective(cfg, zcfg, entry ? entry->view_name : zdir_holder_view(xfr_view, xfr_el), &out_eff);
               release_config_snapshot(cfg);
               if (!xfr_counter_acquire(&g_xfr_out_active, out_limit)) {
                 allowed = false; /* "Zone transfer requests in excess of the limit are refused" (ARM transfers-out) */
               } else {
-                atomic_fetch_add(&entry->active_axfr, 1);
+                if (entry) atomic_fetch_add(&entry->active_axfr, 1);
                 axfr_worker_args_t *args = malloc(sizeof(axfr_worker_args_t));
                 if (args) {
                   args->client_fd = client_fd;
@@ -2664,6 +2901,9 @@ process_tcp_client: ;
                   args->tsig_mac_len = tsig_mac_len;
                   if (tsig_mac_len > 0) memcpy(args->tsig_mac, tsig_mac, tsig_mac_len);
                   args->entry = entry;
+                  args->elem = entry ? NULL : xfr_el;
+                  args->await = entry ? NULL : db_ingest_xfr_await;
+                  if (xfr_el) snprintf(args->view_name, sizeof(args->view_name), "%s", zdir_holder_view(xfr_view, xfr_el));
                   args->idle_out_secs = out_eff.xfer_idle_out;
                   args->time_out_secs = out_eff.xfer_time_out;
                   args->snap = snap;
@@ -2681,7 +2921,7 @@ process_tcp_client: ;
                   if (pthread_create(&t, NULL, axfr_worker_thread, args) != 0) {
                     release_zone_snapshot(args->snap);
                     free(args);
-                    atomic_fetch_sub(&entry->active_axfr, 1);
+                    if (entry) atomic_fetch_sub(&entry->active_axfr, 1);
                     xfr_counter_release(&g_xfr_out_active);
                     allowed = false;
                   } else {
@@ -2693,13 +2933,13 @@ process_tcp_client: ;
                     break;
                   }
                 } else {
-                  atomic_fetch_sub(&entry->active_axfr, 1);
+                  if (entry) atomic_fetch_sub(&entry->active_axfr, 1);
                   xfr_counter_release(&g_xfr_out_active);
                   allowed = false;
                 }
               }
             }
-            if (!allowed || !entry) {
+            if (!allowed || (!entry && !xfr_el)) {
               uint8_t res_buf[1024];
               uint8_t rcode = 5; /* REFUSED: 方針による拒否 (RFC 1035 §4.1.1、RFC 5936 §5)。AA=0 (R-06) */
               int built;
@@ -2749,7 +2989,48 @@ process_tcp_client: ;
             bool route_tsig_done;
             route.view = select_view_req(snap, acquire_config_snapshot(), ctx_tcp->client_ip, msg, msg_len, &route_tsig, &route_tsig_done);
             route.tsig = route_tsig_done ? &route_tsig : NULL;
-            route.entry = route.view ? find_zone_for_query(route.view, qname, ((msg[2] >> 3) & 0x0F) == 0 ? qtype : 0) : NULL;
+            zdir_elem_t *pel = NULL;
+            route.entry = route.view ? find_zone_for_query_ex(route.view, qname, ((msg[2] >> 3) & 0x0F) == 0 ? qtype : 0, &pel) : NULL;
+            bool not_ready = false, answered = false;
+            int res_len = 0;
+            if (__builtin_expect(!route.entry && pel != NULL, 0)) {
+              /* D1a: the zone is in the directory and its data is not in memory.  The client is checked first (allow-query as for a zone in
+               * memory, TSIG, a wrong request): a final answer (REFUSED ...) is sent and nothing parks.  Otherwise the connection is parked:
+               * one request per connection, kept in buf, read events ignored until park_service() starts it again */
+              query_set_client_addr(&ctx_tcp->client_addr);
+              query_set_local_addr(ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL);   /* allow-query-on */
+              res_len = process_dns_not_ready_routed(msg, msg_len, tcp_res_buf, 65535, 0, qname, qtype, ctx_tcp->client_ip,
+                                                     &thread_compress_ctx, true, NULL, snap, &route, pel, true);
+              if (res_len != DNS_NR_PERMITTED) answered = true;
+            }
+            if (__builtin_expect(!route.entry && pel != NULL && !answered, 0)) {
+              if (ctx_tcp->park_deadline_ms == 0 && ((msg[2] >> 3) & 0x0F) == 0) atomic_fetch_add_explicit(&pel->freq, 1, memory_order_relaxed);   /* once per query (an UPDATE does not count) */
+              int64_t pnow = park_now_ms();
+              int64_t left = ctx_tcp->park_deadline_ms ? ctx_tcp->park_deadline_ms - pnow : (int64_t)park_timeout_ms;
+              if (park_on && !ctx_tcp->not_ready_now && left > 0) {
+                const char *hv = zdir_holder_view(route.view, pel);          /* (the view that holds the zone: a zone shared by in-view from the database of another view is the owner's) */
+                bool ask = (ctx_tcp->park_deadline_ms == 0 || atomic_load_explicit((const _Atomic uint8_t *)&pel->state, memory_order_acquire) == ZDIR_ST_ABSENT) &&
+                           !park_has_wait(&park, hv, pel->name);       /* (as in udp_park(): a request that comes back and finds the zone out of memory again asks again) */
+                uint32_t cidx = (uint32_t)(ctx_tcp - g_tcp_pool);
+                int32_t pi = park_tcp(&park, pnow, (uint32_t)left, hv, pel->name, client_fd, cidx, ctx_tcp->gen);
+                if (pi >= 0 && ask && !park_fetch_request(ctx->thread_id, hv, pel->name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL)) {
+                  park_release(&park, &park.e[pi]);          /* the request could not be handed over (ring full): nobody would wake it */
+                  pi = -1;
+                }
+                if (pi >= 0) {
+                  if (ctx_tcp->park_deadline_ms == 0) dbreg_cache_note_miss();
+                  ctx_tcp->park_deadline_ms = pnow + left;
+                  ctx_tcp->resume_len = msg_len;
+                  ctx_tcp->parked = true;
+                  rcu_reader_exit(ctx);
+                  parked_out = true;
+                  break;
+                }
+              }
+              not_ready = true;
+            }
+            ctx_tcp->park_deadline_ms = 0;
+            ctx_tcp->not_ready_now = false;
             if (route.entry && (route.entry->kind == ZONE_KIND_PROGRAM || route.entry->kind == ZONE_KIND_FORWARD)) {
               /* forward / program ゾーン: 非同期 I/O スレッドへ渡すために要求を複製する
                * (D-04 で文書化した例外。平文 TCP のホットパスではない) */
@@ -2803,9 +3084,17 @@ process_tcp_client: ;
             /* D-04: 応答はワーカーごとのバッファ (起動時に確保) に組み立てる */
             query_set_client_addr(&ctx_tcp->client_addr);
             query_set_local_addr(ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL);   /* allow-query-on */
-            int res_len = process_dns_query_cap_routed(msg, msg_len, tcp_res_buf, 65535, 0,
-                                                       qname, qtype, ctx_tcp->client_ip,
-                                                       &thread_compress_ctx, true, NULL, snap, &route);
+            if (answered) {
+              /* the answer was built by the check above (REFUSED, FORMERR, NOTAUTH ...) */
+            } else if (__builtin_expect(not_ready, 0)) {
+              res_len = process_dns_not_ready_routed(msg, msg_len, tcp_res_buf, 65535, 0,
+                                                     qname, qtype, ctx_tcp->client_ip,
+                                                     &thread_compress_ctx, true, NULL, snap, &route, pel, false);
+            } else {
+              res_len = process_dns_query_cap_routed(msg, msg_len, tcp_res_buf, 65535, 0,
+                                                     qname, qtype, ctx_tcp->client_ip,
+                                                     &thread_compress_ctx, true, NULL, snap, &route);
+            }
             if (res_len > 0) {
               submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname, qclass, qtype,
                                   tcp_res_buf[3] & 0x0F, has_edns, dnssec_ok);
@@ -2839,7 +3128,7 @@ process_tcp_client: ;
           }
         }
 
-        if (!client_closed) {
+        if (!client_closed && !parked_out) {
           /* RFC 7766 §6.2.3: 期限はメッセージを受け取り終えたときにだけ延ばす (上で更新)。
            * メッセージの一部が届いても延ばさないので、少しずつ送り続けても居座れない。 */
           struct timespec ts_now;
@@ -2849,6 +3138,7 @@ process_tcp_client: ;
           struct kevent evs[2];
           uint32_t to_ms = (processed_queries >= 16) ? 1 : tcp_ms_until(ctx_tcp->idle_deadline_ms, now_ms);
           ctx_tcp->quota_yield = (processed_queries >= 16);
+          ctx_tcp->resume_pending = false;       /* D1a: the timer below replaces the 1 ms resume timer (a pipelined READ may have run the parked request first); its expiry is the idle timeout */
           EV_SET(&evs[0], client_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0,
                  to_ms, ctx_tcp);
           int nev = 1;
@@ -2860,6 +3150,11 @@ process_tcp_client: ;
         }
       }
     }
+    if (park_on) park_service(&pass, kq);        /* D1a: wake-ups, deadlines, the parked requests that are done */
+  }
+  if (park_on) {
+    park_unregister_worker(ctx->thread_id);
+    park_free(&park);
   }
   close(kq);
   free(tcp_res_buf);
@@ -2981,7 +3276,7 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
   if (o->dnstap.enabled != n->dnstap.enabled || str_differs(o->dnstap.socket_path, n->dnstap.socket_path))
     append_list_item(buf, sz, "dnstap socket");
   /* beta design 7.1: the loader is started once by the supervisor, so adding or removing the database block and
-   * these four options take effect only after a restart (everything else in the block reloads) */
+   * these options (driver, loader-user, loader-group, loader-path, loader-state-file) take effect only after a restart (everything else in the block reloads) */
   if (o->database.enabled != n->database.enabled) {
     append_list_item(buf, sz, "database block");
   } else if (o->database.enabled) {
@@ -2989,6 +3284,7 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
     if (str_differs(o->database.loader_user, n->database.loader_user)) append_list_item(buf, sz, "database loader-user");
     if (str_differs(o->database.loader_group, n->database.loader_group)) append_list_item(buf, sz, "database loader-group");
     if (str_differs(db_loader_path(o), db_loader_path(n))) append_list_item(buf, sz, "database loader-path");
+    if (str_differs(o->database.loader_state_file, n->database.loader_state_file)) append_list_item(buf, sz, "database loader-state-file");
   }
 }
 
@@ -3186,6 +3482,39 @@ const char *find_configured_domain(const char *arg, char *out_buf, size_t out_si
   return out_buf;
 }
 
+/* The whole reply to a control client.  The client's descriptor is non-blocking: a plain send() takes what fits the socket buffer (net.local.stream.sendspace,
+ * 64 KiB by default) and the rest of a long reply (karictl observatory: 664 bytes a zone) was lost, which desynchronised the stream the client reads.
+ * Wait for the client to read (poll), but not for ever: a client that does not read for CTL_SEND_WAIT_MS is dropped by the caller (false), and so is
+ * one that reads a byte at a time: the whole reply has CTL_REPLY_MS (a reply made of several calls shares one deadline, ctl_send_until()). */
+#define CTL_SEND_WAIT_MS 3000
+#define CTL_REPLY_MS 10000
+static bool ctl_send_until(int fd, const void *buf, size_t len, int64_t deadline_ms) {
+  const uint8_t *p = buf;
+  size_t sent = 0;
+  while (sent < len) {
+    ssize_t n = send(fd, p + sent, len - sent, 0);
+    if (n > 0) {
+      sent += (size_t)n;
+      if (sent < len && park_now_ms() >= deadline_ms) return false;
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      int64_t left = deadline_ms - park_now_ms();
+      if (left <= 0) return false;
+      struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+      int pr = poll(&pfd, 1, left < CTL_SEND_WAIT_MS ? (int)left : CTL_SEND_WAIT_MS);
+      if (pr > 0 || (pr < 0 && errno == EINTR)) continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+static bool ctl_send_all(int fd, const void *buf, size_t len) {
+  return ctl_send_until(fd, buf, len, park_now_ms() + CTL_REPLY_MS);
+}
+
 /* B6a: an answer of the database loader for a parked `reload <zone>` client (control thread) */
 static void control_db_results(void) {
   db_reload_result_t r;
@@ -3195,11 +3524,33 @@ static void control_db_results(void) {
     if (!c) continue; /* the client left or timed out: nothing to do */
     char reply[sizeof(r.text) + 16];
     int n = snprintf(reply, sizeof(reply), "%s %s\n", r.ok ? "OK" : "ERROR", r.text);
-    if (n > 0) (void)send(c->fd, reply, (size_t)n, 0);
+    if (n > 0) (void)ctl_send_all(c->fd, reply, (size_t)n);
     syslog(LOG_NOTICE, "[Control] reload of a database zone answered: %s", r.text);
     c->state = CTRL_STATE_CMD_WAIT; /* it is no longer waiting: free_ctrl_client() must not cancel the finished request */
     g_ctrl_parked--;
     free_ctrl_client(c->fd);
+  }
+}
+
+/* D1a step 7 (design 7): the zones the ingest thread queued for a NOTIFY (dbreg_notify_pop()): a zone whose serial changed while its data is out of memory (the
+ * apex of the new summary is here), or whose data came into memory with another serial.  The zone is looked up in the current snapshot; one that is in memory is
+ * sent from its entry, as a reload does, one that is not from its apex (notify_send_nonresident()).  At most 256 a tick; the NOTIFY rate decides the pace after
+ * that.  The control thread, which owns the table of NOTIFYs awaiting an answer. */
+static void control_zone_notify_queue(void) {
+  char view[KARIDNS_VIEW_NAME_MAX], zone[256];
+  dbreg_notify_sweep();
+  for (int n = 0; n < 256 && dbreg_notify_pop(view, sizeof(view), zone, sizeof(zone)); n++) {
+    rcu_aux_read_lock();
+    zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
+    if (snap) {
+      view_snapshot_t *v = snapshot_find_view(snap, view);
+      zdir_elem_t *el = v ? zdir_find_exact(v, zone) : NULL;
+      zone_db_entry_t *e = el ? zdir_entry(el) : NULL;
+      if (e) send_notify_to_all(e);
+      else if (el) notify_send_nonresident(el, v->name);
+      release_zone_snapshot(snap);
+    }
+    rcu_aux_read_unlock();
   }
 }
 
@@ -3211,7 +3562,7 @@ static void control_park_timeouts(time_t now) {
     if (c->state == CTRL_STATE_PARKED && now >= c->park_deadline) {
       static const char msg[] = "ERROR timeout: the database loader did not answer within db-reload-timeout; "
                                 "the reload may still be applied (see 'karictl dbstatus')\n";
-      (void)send(c->fd, msg, sizeof(msg) - 1, 0);
+      (void)ctl_send_all(c->fd, msg, sizeof(msg) - 1);
       syslog(LOG_WARNING, "[Control] reload of a database zone timed out (request %llu)", (unsigned long long)c->req_id);
       free_ctrl_client(c->fd); /* cancels the request */
     }
@@ -3226,6 +3577,19 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
   int cfd = c->fd;
   server_config_t *cfg = acquire_config_snapshot();
   bool enabled = cfg && cfg->database.enabled;
+  /* D1a phase 2: the view named is one that shares the zone with `zone "x" { in-view "owner"; }` and has no zone of that name itself: the zone is the owner's */
+  char owner[KARIDNS_VIEW_NAME_MAX];
+  if (cfg && view_arg && cfg->any_in_view) {
+    for (const view_config_t *v = cfg->views; v; v = v->next) {
+      if (!v->name || strcasecmp(v->name, view_arg) != 0) continue;
+      const zone_config_t *stub = view_find_in_view(v, zone);
+      if (stub && stub->ext->iv->db_target && stub->ext->iv->view && !view_find_zone_config(v, zone)) {
+        snprintf(owner, sizeof(owner), "%s", stub->ext->iv->view);
+        view_arg = owner;
+      }
+      break;
+    }
+  }
   uint32_t tmo = cfg && cfg->database.db_reload_timeout ? cfg->database.db_reload_timeout : 30;
   release_config_snapshot(cfg);
   if (!enabled || !db_ingest_enabled()) return false;
@@ -3243,7 +3607,7 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
   if (n >= 2 && !all_views) {
     char m[160];
     int l = snprintf(m, sizeof(m), "ERROR zone exists in multiple views; specify view (e.g. '%s <zone> <view>')\n", cmd);
-    send(cfd, m, (size_t)l, 0);
+    (void)ctl_send_all(cfd, m, (size_t)l);
     return true;
   }
   if (n == 0 && !is_reload) return false;
@@ -3256,20 +3620,20 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
     if (!db_ingest_pick_view(view_arg, view, sizeof(view), why, sizeof(why))) {
       char m[300];
       int l = snprintf(m, sizeof(m), "ERROR zone not found (%s)\n", why);
-      send(cfd, m, (size_t)l, 0);
+      (void)ctl_send_all(cfd, m, (size_t)l);
       return true;
     }
   }
   if (is_reload) {
     if (g_ctrl_parked >= CTRL_PARK_MAX) {
       static const char msg[] = "ERROR too many reloads are waiting for the database loader; try again later\n";
-      send(cfd, msg, sizeof(msg) - 1, 0);
+      (void)ctl_send_all(cfd, msg, sizeof(msg) - 1);
       return true;
     }
     uint64_t id = db_ingest_reload(false, view, zone, force);
     if (id == 0) {
       static const char msg[] = "ERROR cannot queue the reload request for the database loader\n";
-      send(cfd, msg, sizeof(msg) - 1, 0);
+      (void)ctl_send_all(cfd, msg, sizeof(msg) - 1);
       return true;
     }
     syslog(LOG_NOTICE, "[Control] Received reload command for database zone: %s (%s%s)%s", zone,
@@ -3298,7 +3662,7 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
                      zi->refresh, zi->view, (long long)zi->source_id, res, zi->has_entry ? "" : " (no version loaded)",
                      zi->error[0] ? " last-error: " : "", zi->error, rx_on ? " settings=primary" : "");
     if (l >= (int)sizeof(m)) l = (int)sizeof(m) - 1, m[l - 1] = '\n';
-    send(cfd, m, (size_t)l, 0);
+    (void)ctl_send_all(cfd, m, (size_t)l);
     return true;
   }
   if (strcmp(cmd, "notify") == 0) {
@@ -3307,10 +3671,10 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
     if (e) {
       syslog(LOG_NOTICE, "[Control] Received notify command for zone: %s (database zone, view %s)", zone, zi->view);
       zone_notify_request(e);
-      send(cfd, "OK\n", 3, 0);
+      (void)ctl_send_all(cfd, "OK\n", 3);
     } else {
       static const char msg[] = "ERROR zone is not served from the database (hidden by another zone of the same name)\n";
-      send(cfd, msg, sizeof(msg) - 1, 0);
+      (void)ctl_send_all(cfd, msg, sizeof(msg) - 1);
     }
     if (snap) release_zone_snapshot(snap);
     return true;
@@ -3323,10 +3687,10 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
     syslog(LOG_NOTICE, "[Control] Received retransfer command for zone: %s (database zone, view %s)", zone, zi->view);
     atomic_store_explicit(&re->serial, 0, memory_order_release);
     atomic_store_explicit(&re->refresh_now, true, memory_order_release);
-    send(cfd, "OK\n", 3, 0);
+    (void)ctl_send_all(cfd, "OK\n", 3);
   } else {
     static const char msg[] = "ERROR zone is a primary zone from the database; read it again with 'karictl reload <zone>'\n";
-    send(cfd, msg, sizeof(msg) - 1, 0);
+    (void)ctl_send_all(cfd, msg, sizeof(msg) - 1);
   }
   if (rsnap) release_zone_snapshot(rsnap);
   return true;
@@ -3493,7 +3857,7 @@ void *control_thread_func(void *arg) {
           
           char msg[128];
           int mlen = snprintf(msg, sizeof(msg), "CHALLENGE %s\n", c->challenge);
-          send(cfd, msg, mlen, 0);
+          (void)ctl_send_all(cfd, msg, mlen);
           c->state = CTRL_STATE_AUTH_WAIT;
         }
       } else if (ev_list[i].udata == (void*)1) {
@@ -3562,10 +3926,10 @@ void *control_thread_func(void *arg) {
             }
             release_config_snapshot(cfg);
             if (auth_ok) {
-              send(cfd, "OK\n", 3, 0);
+              (void)ctl_send_all(cfd, "OK\n", 3);
               c->state = CTRL_STATE_CMD_WAIT;
             } else {
-              send(cfd, "AUTH_FAILED\n", 12, 0);
+              (void)ctl_send_all(cfd, "AUTH_FAILED\n", 12);
               free_ctrl_client(cfd);
               continue;
             }
@@ -3616,10 +3980,10 @@ void *control_thread_func(void *arg) {
                     /* answered or parked (D17-2) */
                   } else {
                     syslog(LOG_ERR, "[Control] Command 'reload' failed: zone '%s' not found", canon_arg);
-                    send(cfd, "ERROR zone not found\n", 21, 0);
+                    (void)ctl_send_all(cfd, "ERROR zone not found\n", 21);
                   }
                 } else if (nmatches > 1) {
-                  send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'reload <zone> <view>')\n", 82, 0);
+                  (void)ctl_send_all(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'reload <zone> <view>')\n", 82);
                 } else if (lr.entry && lr.zcfg) {
                   syslog(LOG_NOTICE, "[Control] Received targeted reload command for zone: %s", canon_arg);
                   if (lr.zcfg->type && (strcmp(lr.zcfg->type, "master") == 0 || strcmp(lr.zcfg->type, "primary") == 0)) {
@@ -3631,31 +3995,31 @@ void *control_thread_func(void *arg) {
                                 void catalog_process_membership(zone_db_entry_t *catalog_entry, const zone_config_t *catalog_cfg, const char *view_name);
                                 catalog_process_membership(lr.entry, lr.zcfg, lr.view_name);
                             }
-                            send(cfd, "OK reloaded\n", 12, 0);
+                            (void)ctl_send_all(cfd, "OK reloaded\n", 12);
                             break;
                         case RELOAD_ERR_FILE_READ:
-                            send(cfd, "ERROR file read error\n", 22, 0);
+                            (void)ctl_send_all(cfd, "ERROR file read error\n", 22);
                             break;
                         case RELOAD_ERR_PARSE:
-                            send(cfd, "ERROR parse error\n", 18, 0);
+                            (void)ctl_send_all(cfd, "ERROR parse error\n", 18);
                             break;
                         case RELOAD_ERR_MISSING_SOA:
-                            send(cfd, "ERROR missing SOA\n", 18, 0);
+                            (void)ctl_send_all(cfd, "ERROR missing SOA\n", 18);
                             break;
                         case RELOAD_ERR_BUSY:
-                            send(cfd, "ERROR busy (AXFR in progress)\n", 30, 0);
+                            (void)ctl_send_all(cfd, "ERROR busy (AXFR in progress)\n", 30);
                             break;
                     }
                   } else if (lr.zcfg->type && (strcasecmp(lr.zcfg->type, "slave") == 0 || strcasecmp(lr.zcfg->type, "secondary") == 0)) {
                     syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone %s on reload", lr.zcfg->domain);
                     atomic_store_explicit(&lr.entry->serial, 0, memory_order_release);
                     atomic_store_explicit(&lr.entry->refresh_now, true, memory_order_release);
-                    send(cfd, "OK reloaded (slave)\n", 20, 0);
+                    (void)ctl_send_all(cfd, "OK reloaded (slave)\n", 20);
                   } else {
-                    send(cfd, "ERROR unknown zone type\n", 24, 0);
+                    (void)ctl_send_all(cfd, "ERROR unknown zone type\n", 24);
                   }
                 } else {
-                  send(cfd, "ERROR zone not found\n", 21, 0);
+                  (void)ctl_send_all(cfd, "ERROR zone not found\n", 21);
                 }
                 release_config_snapshot(active);
                 release_zone_snapshot(snap);
@@ -3674,14 +4038,14 @@ void *control_thread_func(void *arg) {
                                      (unsigned long long)rid);
                   }
                 }
-                send(cfd, reply, (size_t)rlen, 0);
+                (void)ctl_send_all(cfd, reply, (size_t)rlen);
               }
             } else if (strcmp(cmd, "reconfig") == 0) {
               syslog(LOG_NOTICE, "[Control] Received reconfig command");
               config_reload_result_t rr = run_config_reload(true);
               char reply[CTRL_RELOAD_REPLY_SIZE];
               int rlen = format_reload_reply(&rr, "OK", reply, sizeof(reply));
-              send(cfd, reply, (size_t)rlen, 0);
+              (void)ctl_send_all(cfd, reply, (size_t)rlen);
             } else if (strcmp(cmd, "stop") == 0) {
               syslog(LOG_NOTICE, "[Control] Received stop command");
               udp_ipc_t msg;
@@ -3690,7 +4054,7 @@ void *control_thread_func(void *arg) {
               uint8_t pkt[sizeof(msg)];
               memcpy(pkt, &msg, sizeof(msg));
               send(g_notify_ipc[1], pkt, sizeof(pkt), 0);
-              send(cfd, "OK stopping\n", 12, 0);
+              (void)ctl_send_all(cfd, "OK stopping\n", 12);
               backend_shutdown(0); /* O-15: exit() は他スレッドと並行して atexit を走らせる */
             } else if (strcmp(cmd, "status") == 0) {
               karidns_status_t st;
@@ -3701,7 +4065,7 @@ void *control_thread_func(void *arg) {
               zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
               if (snap) {
                 for (size_t v = 0; v < snap->view_count; v++) {
-                  st.num_zones += snap->views[v].zone_count - snap->views[v].shared_count;   /* a zone shared with another view (in-view) is one zone */
+                  st.num_zones += zdir_count_owned(&snap->views[v]);   /* a zone shared with another view (in-view) is one zone */
                 }
                 release_zone_snapshot(snap);
               }
@@ -3734,18 +4098,21 @@ void *control_thread_func(void *arg) {
               snprintf(st.os_release, sizeof(st.os_release), "%s", g_host_status_info.un.release);
               snprintf(st.machine, sizeof(st.machine), "%s", g_host_status_info.un.machine);
               st.ncpus = g_host_status_info.ncpus;
-              
-              struct iovec iov[2];
-              iov[0].iov_base = "OK ";
-              iov[0].iov_len = 3;
-              iov[1].iov_base = &st;
-              iov[1].iov_len = sizeof(st);
-              
-              struct msghdr msg;
-              memset(&msg, 0, sizeof(msg));
-              msg.msg_iov = iov;
-              msg.msg_iovlen = 2;
-              sendmsg(cfd, &msg, 0);
+              {
+                zone_bytes_t zb_db, zb_other;
+                zone_bytes_get(ZBYTES_DB, &zb_db);
+                zone_bytes_get(ZBYTES_OTHER, &zb_other);
+                st.db_bytes_resident = zb_db.resident;
+                st.db_bytes_retired = zb_db.retired;
+                st.other_bytes_resident = zb_other.resident;
+                st.other_bytes_retired = zb_other.retired;
+              }
+
+              /* "OK " and the structure in one buffer, written whole (the descriptor is non-blocking; no SCM_RIGHTS goes with it) */
+              uint8_t st_reply[3 + sizeof(st)];
+              memcpy(st_reply, "OK ", 3);
+              memcpy(st_reply + 3, &st, sizeof(st));
+              (void)ctl_send_all(cfd, st_reply, sizeof(st_reply));
             } else if (strcmp(cmd, "zonestatus") == 0 && arg) {
               char canon_buf[256];
               const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
@@ -3756,10 +4123,10 @@ void *control_thread_func(void *arg) {
               if (nmatches == 0) {
                 if (!db_zone_command(c, cmd, canon_arg, view_arg, false)) {
                   syslog(LOG_ERR, "[Control] Command 'zonestatus' failed: zone '%s' not found", canon_arg);
-                  send(cfd, "ERROR zone not found\n", 21, 0);
+                  (void)ctl_send_all(cfd, "ERROR zone not found\n", 21);
                 }
               } else if (nmatches > 1) {
-                send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'zonestatus <zone> <view>')\n", 86, 0);
+                (void)ctl_send_all(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'zonestatus <zone> <view>')\n", 86);
               } else if (lr.entry) {
                 char smsg[384];
                 char rx_note[160];
@@ -3771,9 +4138,9 @@ void *control_thread_func(void *arg) {
                                     (uint32_t)lr.entry->refresh, (uint32_t)lr.entry->retry, (uint32_t)lr.entry->expire,
                                     rx_on ? " settings=primary" : "", rx_note[0] ? " note: " : "", rx_note);
                 if (slen >= (int)sizeof(smsg)) slen = (int)sizeof(smsg) - 1, smsg[slen - 1] = '\n';
-                send(cfd, smsg, slen, 0);
+                (void)ctl_send_all(cfd, smsg, slen);
               } else {
-                send(cfd, "ERROR zone not found\n", 21, 0);
+                (void)ctl_send_all(cfd, "ERROR zone not found\n", 21);
               }
               release_config_snapshot(active_cfg);
               release_zone_snapshot(snap);
@@ -3783,40 +4150,63 @@ void *control_thread_func(void *arg) {
               char canon_buf[256];
               const char *canon_arg = (arg && strlen(arg) > 0) ? find_configured_domain(arg, canon_buf, sizeof(canon_buf)) : NULL;
 
+              /* The zones are collected first: the directories change under a snapshot (zone_db_snapshot_t), so the count sent in the
+               * first line and the zones sent after it must come from one pass.  The entries stay valid while the snapshot is held. */
               uint32_t match_count = 0;
+              zone_db_entry_t **obs = NULL;
+              bool obs_oom = false;
               if (snap) {
-                for (size_t v = 0; v < snap->view_count; v++) {
+                size_t cap = 0, n = 0;
+                for (size_t v = 0; v < snap->view_count && !obs_oom; v++) {
                   if (view_arg && strcasecmp(snap->views[v].name, view_arg) != 0) continue;
-                  for (size_t z = 0; z < snap->views[v].zone_count; z++) {
-                    zone_db_entry_t *e = snap->views[v].entries[z];
-                    if (!e || !view_owns_entry(&snap->views[v], e)) continue;   /* a shared zone is listed once, in its owner view */
+                  zdir_elem_t **els = NULL;
+                  size_t en = 0, ecap = 0;
+                  zdir_iter_t it;
+                  zdir_iter_init(&it, &snap->views[v]);
+                  for (zdir_elem_t *el; (el = zdir_iter_next(&it));) {
+                    zone_db_entry_t *e = zdir_entry(el);
+                    if (!e || !view_owns_elem(el)) continue;   /* a shared zone is listed once, in its owner view */
                     if (canon_arg && !domain_names_match_ci(e->domain, canon_arg)) continue;
-                    match_count++;
+                    if (en == ecap) {
+                      zdir_elem_t **ne = realloc(els, (ecap ? ecap * 2 : 64) * sizeof(*ne));
+                      if (!ne) { obs_oom = true; break; }
+                      els = ne;
+                      ecap = ecap ? ecap * 2 : 64;
+                    }
+                    els[en++] = el;
                   }
+                  /* the zones of zone { } blocks and the catalog members first, in the order of the configuration, then the database zones */
+                  if (en > 1) qsort(els, en, sizeof(*els), zdir_listing_cmp);
+                  if (!obs_oom && n + en > cap) {
+                    zone_db_entry_t **no = realloc(obs, (n + en) * sizeof(*no));
+                    if (!no) obs_oom = true;
+                    else { obs = no; cap = n + en; }
+                  }
+                  for (size_t k = 0; !obs_oom && k < en; k++) obs[n++] = zdir_entry(els[k]);
+                  free(els);
                 }
+                match_count = (uint32_t)n;
               }
 
-              char resp_hdr[64];
-              int hlen = snprintf(resp_hdr, sizeof(resp_hdr), "OK %u\n", match_count);
-              send(cfd, resp_hdr, hlen, 0);
+              if (obs_oom) {
+                (void)ctl_send_all(cfd, "ERROR out of memory\n", 20);
+              } else {
+                char resp_hdr[64];
+                int hlen = snprintf(resp_hdr, sizeof(resp_hdr), "OK %u\n", match_count);
+                const int64_t obs_deadline = park_now_ms() + CTL_REPLY_MS;   // (one deadline for the header and every item)
+                bool obs_ok = ctl_send_until(cfd, resp_hdr, (size_t)hlen, obs_deadline);
 
-              if (snap && match_count > 0) {
-                for (size_t v = 0; v < snap->view_count; v++) {
-                  if (view_arg && strcasecmp(snap->views[v].name, view_arg) != 0) continue;
-                  for (size_t z = 0; z < snap->views[v].zone_count; z++) {
-                    zone_db_entry_t *e = snap->views[v].entries[z];
-                    if (!e || !view_owns_entry(&snap->views[v], e)) continue;   /* a shared zone is listed once, in its owner view */
-                    if (canon_arg && !domain_names_match_ci(e->domain, canon_arg)) continue;
-                    zone_observatory_snapshot_t snap_item;
-                    memset(&snap_item, 0, sizeof(snap_item));
-                    // active arena を読むので読み取り区間に入れる (send は区間の外)
-                    rcu_aux_read_lock();
-                    fill_observatory_snapshot(e, active_cfg, &snap_item);
-                    rcu_aux_read_unlock();
-                    send(cfd, &snap_item, sizeof(snap_item), 0);
-                  }
+                for (uint32_t k = 0; obs_ok && k < match_count; k++) {
+                  zone_observatory_snapshot_t snap_item;
+                  memset(&snap_item, 0, sizeof(snap_item));
+                  // active arena を読むので読み取り区間に入れる (send は区間の外)
+                  rcu_aux_read_lock();
+                  fill_observatory_snapshot(obs[k], active_cfg, &snap_item);
+                  rcu_aux_read_unlock();
+                  obs_ok = ctl_send_until(cfd, &snap_item, sizeof(snap_item), obs_deadline);   // (a client that does not read: the reply is cut here and the connection closed below)
                 }
               }
+              free(obs);
               if (active_cfg) release_config_snapshot(active_cfg);
               if (snap) release_zone_snapshot(snap);
             } else if (strcmp(cmd, "notify") == 0 && arg) {
@@ -3829,16 +4219,16 @@ void *control_thread_func(void *arg) {
               if (nmatches == 0) {
                 if (!db_zone_command(c, cmd, canon_arg, view_arg, false)) {
                   syslog(LOG_ERR, "[Control] Command 'notify' failed: zone '%s' not found", canon_arg);
-                  send(cfd, "ERROR zone not found\n", 21, 0);
+                  (void)ctl_send_all(cfd, "ERROR zone not found\n", 21);
                 }
               } else if (nmatches > 1) {
-                send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'notify <zone> <view>')\n", 82, 0);
+                (void)ctl_send_all(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'notify <zone> <view>')\n", 82);
               } else if (lr.entry) {
                 syslog(LOG_NOTICE, "[Control] Received notify command for zone: %s", canon_arg);
                 zone_notify_request(lr.entry);
-                send(cfd, "OK\n", 3, 0);
+                (void)ctl_send_all(cfd, "OK\n", 3);
               } else {
-                send(cfd, "ERROR zone not found\n", 21, 0);
+                (void)ctl_send_all(cfd, "ERROR zone not found\n", 21);
               }
               release_config_snapshot(active_cfg);
               release_zone_snapshot(snap);
@@ -3852,34 +4242,42 @@ void *control_thread_func(void *arg) {
               if (nmatches == 0) {
                 if (!db_zone_command(c, cmd, canon_arg, view_arg, false)) {
                   syslog(LOG_ERR, "[Control] Command 'retransfer' failed: zone '%s' not found", canon_arg);
-                  send(cfd, "ERROR zone not found\n", 21, 0);
+                  (void)ctl_send_all(cfd, "ERROR zone not found\n", 21);
                 }
               } else if (nmatches > 1) {
-                send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'retransfer <zone> <view>')\n", 86, 0);
+                (void)ctl_send_all(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'retransfer <zone> <view>')\n", 86);
               } else if (lr.entry && !lr.entry->is_secondary) {
                 /* O-06: 転送元を持つのはセカンダリ (カタログのメンバーを含む) だけ。プライマリの
                  * シリアルを 0 にすると UDP IXFR や karictl zonestatus の値が壊れる。 */
                 syslog(LOG_ERR, "[Control] Command 'retransfer' failed: zone '%s' is not a secondary", canon_arg);
-                send(cfd, "ERROR zone is not a secondary\n", 30, 0);
+                (void)ctl_send_all(cfd, "ERROR zone is not a secondary\n", 30);
               } else if (lr.entry) {
                 syslog(LOG_NOTICE, "[Control] Received retransfer command for zone: %s", canon_arg);
                 atomic_store_explicit(&lr.entry->serial, 0, memory_order_release);
                 atomic_store_explicit(&lr.entry->refresh_now, true, memory_order_release);
-                send(cfd, "OK\n", 3, 0);
+                (void)ctl_send_all(cfd, "OK\n", 3);
               } else {
-                send(cfd, "ERROR zone not found\n", 21, 0);
+                (void)ctl_send_all(cfd, "ERROR zone not found\n", 21);
               }
               release_config_snapshot(active_cfg);
               release_zone_snapshot(snap);
+#ifdef KARIDNS_TEST_EVICT
+            } else if (strcmp(cmd, "evict") == 0 && arg) {
+              /* TEST ONLY (karidns-evict, never a production build): take the data of a DB zone out of memory, as eviction will (D1a) */
+              char ev_view[KARIDNS_VIEW_NAME_MAX], ev_why[200];
+              if (db_ingest_pick_view(view_arg, ev_view, sizeof(ev_view), ev_why, sizeof(ev_why)) && ev_view[0] && dbreg_test_evict(ev_view, arg))
+                (void)ctl_send_all(cfd, "OK\n", 3);
+              else (void)ctl_send_all(cfd, "ERROR no such zone in memory\n", 29);
+#endif
             } else if (strcmp(cmd, "dbstatus") == 0) {
               /* beta design 5.2: the loader, the batches and the DB zones of the registry */
-              char dbbuf[4096];
+              char dbbuf[8192];
               size_t dblen = db_ingest_status(arg, view_arg, dbbuf, sizeof(dbbuf));
-              if (dblen == 0) send(cfd, "ERROR no database block is configured\n", 38, 0);
-              else send(cfd, dbbuf, dblen, 0);
+              if (dblen == 0) (void)ctl_send_all(cfd, "ERROR no database block is configured\n", 38);
+              else (void)ctl_send_all(cfd, dbbuf, dblen);
             } else {
               syslog(LOG_ERR, "[Control] Received unknown command: %s", cmd);
-              send(cfd, "ERROR unknown command\n", 22, 0);
+              (void)ctl_send_all(cfd, "ERROR unknown command\n", 22);
             }
             if (c->state != CTRL_STATE_PARKED) free_ctrl_client(cfd); /* a parked client waits for the loader's answer */
             continue;
@@ -3889,7 +4287,7 @@ void *control_thread_func(void *arg) {
           c->buf_len = rem;
         } else if (c->buf_len >= sizeof(c->buf) - 1) {
           /* X-47: 1 行がバッファ (1023 バイト + NUL) に収まらない。理由を返してから切断する */
-          send(cfd, "ERROR buffer overflow\n", 22, 0);
+          (void)ctl_send_all(cfd, "ERROR buffer overflow\n", 22);
           syslog(LOG_ERR, "[Control] Command buffer overflow, dropping client");
           free_ctrl_client(cfd);
         }
@@ -3945,8 +4343,10 @@ void *control_thread_func(void *arg) {
 
         control_db_results(); /* an answer whose wake-up was missed */
         control_park_timeouts(now);
+        control_zone_notify_queue(); /* D1a step 7: NOTIFY of zones whose data is out of memory */
         notify_retransmit_due(now); /* RFC 1996 §3.6: 応答の無い NOTIFY の再送 */
 
+        if (gc_has_unstarted()) gc_start_pending();       /* a snapshot cleanup thread that could not be started is tried again */
         server_config_t *active = acquire_config_snapshot();
         zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
         if (snap) {
@@ -3960,15 +4360,27 @@ void *control_thread_func(void *arg) {
             bool walk_all = atomic_exchange_explicit(&g_zone_notify_pending, 0, memory_order_acq_rel) != 0;
             rcu_aux_read_lock();
             for (size_t v = 0; v < snap->view_count; v++) {
-                zone_db_entry_t **list = walk_all ? snap->views[v].entries : snap->views[v].tick_entries;
-                size_t count = walk_all ? snap->views[v].zone_count : snap->views[v].tick_count;
+                /* The zones to look at: the view's tick list (the secondaries and catalog members, in the order of the configuration and then
+                 * the database zones: the order in which refreshes start matters, transfers-per-ns lets only some of them run), and, for a
+                 * walk of every zone, then every other slot of its directory.  The walk of the slots holds the table it started with:
+                 * an element that is in the directory for the whole walk is seen. */
+                zdir_iter_t dit;
+                zdir_iter_init(&dit, &snap->views[v]);
+                for (int phase = 0; phase < (walk_all ? 2 : 1); phase++) {
+                zdir_elem_t *const *list = NULL;
+                size_t count;
+                bool slots = phase == 1;
+                if (slots) count = zdir_iter_slots(&dit);
+                else list = zdir_tick_list(&snap->views[v], &count);
                 /* transfers-in and serial-query-rate leave a refresh that is over the limit for a later tick; the walk starts one entry
                  * further each tick so that the zones at the end of the list are not always the ones that wait (BIND queues them in order) */
                 size_t rot = count ? g_tick_rotor % count : 0;
                 for (size_t kk = 0; kk < count; kk++) {
                     size_t i = (kk + rot) % count;
-                    zone_db_entry_t *entry = list[i];
-                    if (!entry || !view_owns_entry(&snap->views[v], entry)) continue;   /* a zone shared with another view (in-view) is looked at in its owner view, once */
+                    zdir_elem_t *el = slots ? zdir_iter_at(&dit, i) : list[i];
+                    zone_db_entry_t *entry = zdir_entry(el);
+                    if (!entry || !view_owns_elem(el)) continue;   /* a zone shared with another view (in-view) is looked at in its owner view, once */
+                    if (slots && zone_entry_ticks(entry)) continue;   /* (the tick list had it) */
 
                     /* B8t-2: settings received from the primary follow a changed karidns.conf (a secondary's own statements win) */
                     if (atomic_load_explicit(&entry->rx_present, memory_order_relaxed)) zone_rx_settings_refresh(entry, active);
@@ -4070,6 +4482,7 @@ void *control_thread_func(void *arg) {
                             }
                         }
                     }
+                }
                 }
             }
             g_tick_rotor++;
@@ -6107,7 +6520,7 @@ int main(int argc, char **argv) {
 
   // beta design 1.3 / 1.5: the db ingest thread.  It limits the rights of the two descriptors the supervisor made
   // (stream, control) and uses only them (read / write / recvmsg / kevent) once the sandbox is on.
-  if (cfg->database.enabled && !db_ingest_start(g_db_stream_fd, g_db_ctrl_fd)) {
+  if (cfg->database.enabled && !db_ingest_start(g_db_stream_fd, g_db_ctrl_fd, g_db_fetch_fd)) {
     syslog(LOG_ERR, "[Backend] Cannot start the database ingest thread; aborting startup");
     fprintf(stderr, "[ERROR] [Backend] Cannot start the database ingest thread; aborting startup\n");
     backend_exit(EXIT_FAILURE);

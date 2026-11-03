@@ -65,11 +65,11 @@ static int64_t now_ms(void) {
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* a loader script: writes "hello" to fd 3 and exits with the status 3 */
+/* a loader script: writes "hello" to fd 3, its arguments to the fetch stream on fd 4 (D1a), and exits with the status 3 */
 static void write_loader(const char *path, mode_t mode) {
     FILE *f = fopen(path, "w");
     if (f) {
-        fputs("#!/bin/sh\nprintf 'hello:%s' \"${KARIDNS_TEST_LEAK:-clean}\" >&3 2>/dev/null\nexit 3\n", f);
+        fputs("#!/bin/sh\nprintf 'hello:%s' \"${KARIDNS_TEST_LEAK:-clean}\" >&3 2>/dev/null\nprintf 'args:%s' \"$*\" >&4 2>/dev/null\nexit 3\n", f);
         fclose(f);
     }
     chmod(path, mode);
@@ -157,10 +157,13 @@ static void test_init(void) {
 }
 
 /* the fd that arrives over pair C: one byte "F" with an SCM_RIGHTS descriptor; -1 when nothing is there */
-static int recv_fd(int ctrl) {
+static int recv_fds(int ctrl, int *fetch_out);
+
+/* the same with the second descriptor of the message (D1a: the fetch stream), -1 when there is none */
+static int recv_fds(int ctrl, int *fetch_out) {
     char byte;
     struct iovec iov = { &byte, 1 };
-    union { struct cmsghdr h; char buf[CMSG_SPACE(sizeof(int))]; } u;
+    union { struct cmsghdr h; char buf[CMSG_SPACE(sizeof(int) * 2)]; } u;
     struct msghdr m;
     memset(&m, 0, sizeof(m));
     m.msg_iov = &iov;
@@ -172,9 +175,12 @@ static int recv_fd(int ctrl) {
     if (n != 1 || byte != 'F') return -1;
     struct cmsghdr *c = CMSG_FIRSTHDR(&m);
     if (!c || c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) return -1;
-    int fd;
-    memcpy(&fd, CMSG_DATA(c), sizeof(int));
-    return fd;
+    int fds[2] = { -1, -1 };
+    size_t cnt = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+    memcpy(fds, CMSG_DATA(c), (cnt > 2 ? 2 : cnt) * sizeof(int));
+    if (fetch_out) *fetch_out = cnt >= 2 ? fds[1] : -1;
+    else if (cnt >= 2) close(fds[1]);
+    return fds[0];
 }
 
 /* read what the loader wrote to its fd 3 (until it closes the stream) */
@@ -201,12 +207,15 @@ static void test_spawn_and_restart(void) {
     CHECK(db_sup_init(&s, &cfg, err, sizeof(err)));
     CHECK_MSG(db_sup_open_pairs(&s, err, sizeof(err)), "%s", err);
     CHECK(s.ctrl_fd >= 0 && s.first_fd >= 0 && g_db_stream_fd >= 0 && g_db_ctrl_fd >= 0);
+    CHECK(s.first_fetch_fd >= 0 && g_db_fetch_fd >= 0);                      /* D1a: the second pair, for the fetch stream */
 
     setenv("KARIDNS_TEST_LEAK", "leaked", 1);                                /* the loader runs with a cleared environment */
     CHECK(db_sup_spawn(&s));
-    CHECK(s.pid > 0 && s.starts == 1 && s.first_fd == -1 && !s.restart_pending);
+    CHECK(s.pid > 0 && s.starts == 1 && s.first_fd == -1 && s.first_fetch_fd == -1 && !s.restart_pending);
     read_all(g_db_stream_fd, got, sizeof(got));
     CHECK_MSG(strcmp(got, "hello:clean") == 0, "the first loader writes to fd 3 (pair A) and sees no environment: \"%s\"", got);
+    read_all(g_db_fetch_fd, got, sizeof(got));
+    CHECK_MSG(strcmp(got, "args:-s 3 --fetch-fd 4") == 0, "the first loader has the fetch stream on fd 4 and is told so: \"%s\"", got);
     pid_t first = s.pid;
     CHECK(WIFEXITED(reap(first)));
     int st = 3 << 8;                                                         /* "exited with status 3" */
@@ -223,12 +232,18 @@ static void test_spawn_and_restart(void) {
     CHECK(db_sup_timeout_ms(&s) == 0);
     db_sup_tick(&s);
     CHECK(s.pid > 0 && s.starts == 2 && !s.restart_pending);
-    int fd = recv_fd(g_db_ctrl_fd);                   /* the restart's Backend end came over pair C */
-    CHECK_MSG(fd >= 0, "SCM_RIGHTS descriptor");
+    int ffd = -1;
+    int fd = recv_fds(g_db_ctrl_fd, &ffd);            /* the restart's Backend ends came over pair C: one message, the stream and the fetch stream */
+    CHECK_MSG(fd >= 0 && ffd >= 0, "SCM_RIGHTS descriptors");
     if (fd >= 0) {
         read_all(fd, got, sizeof(got));
         CHECK_MSG(strcmp(got, "hello:clean") == 0, "the restarted loader writes to the passed stream: \"%s\"", got);
         close(fd);
+    }
+    if (ffd >= 0) {
+        read_all(ffd, got, sizeof(got));
+        CHECK_MSG(strcmp(got, "args:-s 3 --fetch-fd 4") == 0, "... and to the passed fetch stream: \"%s\"", got);
+        close(ffd);
     }
     db_sup_signal(&s, 0);                                                    /* signal 0: the loader exists */
     CHECK(WIFEXITED(reap(s.pid)));
@@ -275,7 +290,7 @@ static void test_spawn_and_restart(void) {
     unsetenv("KARIDNS_TEST_LEAK");
 
     db_sup_after_fork_supervisor(&s);                                        /* the supervisor drops the Backend's ends ... */
-    CHECK(g_db_stream_fd == -1 && g_db_ctrl_fd == -1);
+    CHECK(g_db_stream_fd == -1 && g_db_ctrl_fd == -1 && g_db_fetch_fd == -1);
     db_sup_close_supervisor_ends(&s);                                        /* ... and a child its own */
     CHECK(s.first_fd == -1 && s.ctrl_fd == -1);
     unlink(path);

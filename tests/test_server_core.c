@@ -1206,26 +1206,12 @@ static void test_control_socket_thread_and_commands(void) {
     atomic_init(&z_slave.refresh, 1800);
 
     zone_db_entry_t *entries[2] = {&z_master, &z_slave};
-    int hash_tbl[4] = {-1, -1, -1, -1};
-    int chain_nxt[2] = {-1, -1};
-
-    uint32_t h0 = calc_fnv1a_str("example.com.") & 3;
-    hash_tbl[h0] = 0;
-    uint32_t h1 = calc_fnv1a_str("slave.example.") & 3;
-    if (hash_tbl[h1] == -1) {
-        hash_tbl[h1] = 1;
-    } else {
-        chain_nxt[0] = 1;
-    }
 
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 2;
-    view.hash_table = hash_tbl;
-    view.hash_size = 4;
-    view.chain_next = chain_nxt;
+    view_set_entries(&view, entries, 2);
+
 
     zone_db_snapshot_t snap;
     memset(&snap, 0, sizeof(snap));
@@ -1681,17 +1667,14 @@ static void test_async_io_pool_and_tasks(void) {
     atomic_store_explicit(&entry.rcu.active, &arena.ver, memory_order_release);
 
     zone_db_entry_t *entries[1] = {&entry};
-    int hash_tbl[2] = {0, -1};
-    int chain_nxt[1] = {-1};
+
+
 
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
-    view.entries = entries;
-    view.zone_count = 1;
-    view.hash_table = hash_tbl;
-    view.hash_size = 2;
-    view.chain_next = chain_nxt;
+    view_set_entries(&view, entries, 1);
+
 
     zone_db_snapshot_t snap;
     memset(&snap, 0, sizeof(snap));
