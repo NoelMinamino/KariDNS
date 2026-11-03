@@ -3409,10 +3409,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
    * name can point to no earlier name (only into the header), so that section is not good either. */
   if (!dns_question_section_ok(req, req_len)) {
     qe_why(wire_question_name_compressed(req, req_len) ? "the question name is compressed (RFC 1035 4.1.4)" : "malformed question section");
-    int len = dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), NULL, is_tcp, cfg);
-    const uint8_t op = (req[2] >> 3) & 0x0F;
-    if (len >= DNS_HEADER_SIZE && (op == 4 || op == 5)) res[2] &= ~0x01; // NOTIFY/UPDATE: RD=0 (RFC 1996 §3.7、RFC 2136 §3.8)
-    return len;
+    return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), NULL, is_tcp, cfg);
   }
 
   edns_info_t edns;
@@ -3473,10 +3470,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       rc = 9;       // NOTAUTH
       add_ede(&edns, send_ede, 18, "Invalid TSIG");
     }
-    int len = dns_build_error_response(req, req_len, res, max_res_len, rc, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg);
-    uint8_t op = (req[2] >> 3) & 0x0F;
-    if (len >= DNS_HEADER_SIZE && (op == 4 || op == 5)) res[2] &= ~0x01; // NOTIFY/UPDATE: RD=0 (RFC 1996 §3.7、RFC 2136 §3.8)
-    return len;
+    return dns_build_error_response(req, req_len, res, max_res_len, rc, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg);
   }
   
   if (!cfg_for_ede || !cfg_for_ede->rfc10029_mqtype_enable) {
@@ -3541,9 +3535,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       /* NOTIFY: a primary zone accepts none (the same REFUSED as a zone in memory gives, RFC 1996 4.7; AA=0, RD=0).  Nothing is read for it and
        * nothing is counted: only a query (below) waits for a zone.  A zone that is a secondary is never taken out of memory. */
       add_ede(&edns, send_ede, 18, "Query refused due to access control");
-      int len = dns_build_error_response(req, req_len, res, max_res_len, 5, 0, qdcount, &edns, is_tcp, cfg);
-      if (len >= DNS_HEADER_SIZE) res[2] &= ~0x01;
-      return len;
+      return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, qdcount, &edns, is_tcp, cfg);
     }
     if (opcode == 5) {
       /* UPDATE (RFC 2136): the zone is checked as for a zone in memory (3.1.1, 3.1.2: SOA question, the apex of this zone), then allow-update from the
@@ -3577,10 +3569,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
           qe_log_update_decision(client_ip, not_ready_zone->name, nr_tkey ? nr_tkey->name : NULL, false, cfg, &zc, view->name);
         }
       }
-      int len = dns_build_error_response(req, req_len, res, max_res_len, (uint8_t)urc, 0, urc == 1 ? dns_error_qd_echo(req, req_len) : qdcount, &edns,
-                                         is_tcp, cfg);
-      if (len >= DNS_HEADER_SIZE) res[2] &= ~0x01;
-      return len;
+      return dns_build_error_response(req, req_len, res, max_res_len, (uint8_t)urc, 0, urc == 1 ? dns_error_qd_echo(req, req_len) : qdcount, &edns,
+                                      is_tcp, cfg);
     }
     /* allow-query first, exactly as for a zone in memory (below: once the zone is known, before anything else is done for the query): a client
      * that may not ask is refused, does not wait for the zone, does not make the server read it, and does not learn that the zone is in the
@@ -3693,18 +3683,14 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       if (zc && zc->type && (strcasecmp(zc->type, "program") == 0 ||
                               strcasecmp(zc->type, "forward") == 0)) {
         /* R-12: 要求の本体は返さず質問セクションで切り、OPT と EDE 21 (RFC 8914 §4.22) を付ける。
-         * RD=0 (RFC 1996 §3.7、RFC 2136 §3.8)。 */
+         * RD=0、CD=0 (dns_init_response_header(): QUERY 以外の応答)。 */
         add_ede(&edns, send_ede, 21, "NOTIFY and UPDATE are not supported for this zone type");
-        int len = dns_build_error_response(req, req_len, res, max_res_len, 4, 0, qdcount, &edns, is_tcp, cfg);
-        res[2] &= ~0x01;
-        return len;
+        return dns_build_error_response(req, req_len, res, max_res_len, 4, 0, qdcount, &edns, is_tcp, cfg);
       }
     }
     if (edns.has_mqtype_query) {
       // RFC 10029 §3.3: QUERY 以外への MQTYPE-Query は FORMERR。RFC 6891 §7: OPT を付ける。
-      int len = dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg);
-      res[2] &= ~0x01;
-      return len;
+      return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg);
     }
     /* R-30: TSIG は process_dns_query_impl_cap() で検証済み (RFC 8945 §5.2)。ここに来るのは TSIG なしか
      * 検証できた要求だけで、応答の署名もそこで行う。受け付けるのは masters からの NOTIFY で、
@@ -3739,10 +3725,9 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     }
     int offset = dns_build_error_response(req, req_len, res, max_res_len, notify_rcode, 0, qdcount,
                                       &edns, is_tcp, cfg);
-    /* RFC 1996 §4.7: 受け付けた NOTIFY への応答は flags QR AA、RD=0 (§3.7)。
+    /* RFC 1996 §4.7: 受け付けた NOTIFY への応答は flags QR AA (RD=0、CD=0 は dns_init_response_header())。
      * 拒否した NOTIFY はゾーンの権威として答えていないので AA=0 (R-06)。 */
-    res[2] &= ~0x01;
-    if (auth) res[2] |= 0x04;
+    if (auth && offset >= DNS_HEADER_SIZE) res[2] |= 0x04;
     return offset;
   }
 
@@ -3752,18 +3737,14 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       if (zc && zc->type && (strcasecmp(zc->type, "program") == 0 ||
                               strcasecmp(zc->type, "forward") == 0)) {
         /* R-12: 要求の本体は返さず質問セクションで切り、OPT と EDE 21 (RFC 8914 §4.22) を付ける。
-         * RD=0 (RFC 1996 §3.7、RFC 2136 §3.8)。 */
+         * RD=0、CD=0 (dns_init_response_header(): QUERY 以外の応答)。 */
         add_ede(&edns, send_ede, 21, "NOTIFY and UPDATE are not supported for this zone type");
-        int len = dns_build_error_response(req, req_len, res, max_res_len, 4, 0, qdcount, &edns, is_tcp, cfg);
-        res[2] &= ~0x01;
-        return len;
+        return dns_build_error_response(req, req_len, res, max_res_len, 4, 0, qdcount, &edns, is_tcp, cfg);
       }
     }
     if (edns.has_mqtype_query) {
       // RFC 10029 §3.3: QUERY 以外への MQTYPE-Query は FORMERR。RFC 6891 §7: OPT を付ける。
-      int len = dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg);
-      res[2] &= ~0x01;
-      return len;
+      return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg);
     }
     /* RFC 2136 §3.1.1, §3.1.2: ZTYPE が SOA でなければ FORMERR。ZNAME と ZCLASS がこのサーバー
      * (クライアントのビュー) のゾーンでなければ NOTAUTH。どちらも権限の確認 (§3.3) より前に行う。
@@ -3817,11 +3798,9 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     }
 
     /* RFC 2136 §3.8: ID と OPCODE を写し、ゾーンセクション以外のセクションは返さない (カウント 0)。
-     * QR=1、RD=0 (§2.2 / §3.8)。AA は UPDATE 応答では意味を持たないので 0。 */
-    int offset = dns_build_error_response(req, req_len, res, max_res_len, (uint8_t)(rcode & 0x0F), 0,
-                                          (rcode & 0x0F) == 1 ? dns_error_qd_echo(req, req_len) : qdcount, &edns, is_tcp, cfg);
-    res[2] &= ~0x01;
-    return offset;
+     * QR=1、RD=0、CD=0 (dns_init_response_header(): QUERY 以外の応答)。AA は UPDATE 応答では意味を持たないので 0。 */
+    return dns_build_error_response(req, req_len, res, max_res_len, (uint8_t)(rcode & 0x0F), 0,
+                                    (rcode & 0x0F) == 1 ? dns_error_qd_echo(req, req_len) : qdcount, &edns, is_tcp, cfg);
   }
 
   if (db_entry) {
