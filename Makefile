@@ -387,9 +387,7 @@ db_fetch_test: test_db_fetch
 test_db_fetch-tsan: $(TEST_DB_FETCH_SRCS)
 	$(CC) $(TSAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DB_FETCH_SRCS) -o $@ $(TSAN_LDFLAGS) -lcrypto -lpthread -lm
 
-# the stream reader and the PowerDNS reader also run under ThreadSanitizer (tests/run_rcu_tsan_test.sh part 1c).  test_db_registry-tsan is built but not run there: its
-# in_snapshot() helper reads e->domain of an entry the snapshot GC thread may have freed by then (a race of the test, not of the server), and the GC threads are
-# never joined (use TSAN_OPTIONS=report_thread_leaks=0); the unit test itself runs under ASan with the other unit tests (UT_ASAN_BINS)
+# the zone directory registry, the stream reader and the PowerDNS reader also run under ThreadSanitizer (tests/run_rcu_tsan_test.sh part 1c)
 test_db_registry-tsan: $(TEST_DB_REGISTRY_SRCS)
 	$(CC) $(TSAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DB_REGISTRY_SRCS) -o $@ $(TSAN_LDFLAGS) -lcrypto -lpthread -lm
 

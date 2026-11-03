@@ -197,9 +197,36 @@ static void rebuild(server_config_t *cfg) {
     rebuild_zone_db_from_config(cfg, false);
 }
 
+/* the names of the entries the tests made: in_snapshot() must not read e->domain, because an entry that has left the
+ * snapshot may already be freed by a cleanup thread.  Newest first, so a reused address finds its current name. */
+static struct { const zone_db_entry_t *e; char name[256]; } *g_names;
+static size_t g_nnames, g_cap_names;
+
+static void remember_name(const zone_db_entry_t *e, const char *zone) {
+    if (g_nnames == g_cap_names) {
+        size_t cap = g_cap_names ? g_cap_names * 2 : 256;
+        void *p = realloc(g_names, cap * sizeof(*g_names));
+        if (!p) { perror("realloc"); exit(1); }
+        g_names = p;
+        g_cap_names = cap;
+    }
+    g_names[g_nnames].e = e;
+    snprintf(g_names[g_nnames].name, sizeof(g_names[0].name), "%s", zone);
+    g_nnames++;
+}
+
+static const char *entry_name(const zone_db_entry_t *e) {
+    for (size_t i = g_nnames; i-- > 0;)
+        if (g_names[i].e == e) return g_names[i].name;
+    printf("  in_snapshot(): an entry the test did not record (remember_name())\n");
+    CHECK(false);
+    return "";
+}
+
 static zone_db_entry_t *new_entry(const char *view, const char *zone) {
     zone_db_entry_t *e = create_new_zone_entry(zone, view);
     CHECK(e != NULL);
+    remember_name(e, zone);
     zone_config_t *dc = db_zone_config_new(zone, NULL);
     CHECK(dc != NULL);
     e->source = ZONE_SRC_DB;
@@ -248,7 +275,7 @@ static zone_db_entry_t *add_zone(const char *view, const char *zone, uint32_t se
 static bool in_snapshot(const char *view, zone_db_entry_t *e) {
     zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
     view_snapshot_t *v = snapshot_find_view(s, view);
-    bool r = v && find_zone_exact_in_view(v, e->domain) == e;
+    bool r = v && find_zone_exact_in_view(v, entry_name(e)) == e;
     release_zone_snapshot(s);
     return r;
 }
@@ -718,6 +745,7 @@ static void test_catalog_member_wins(void) {
         member = find_zone_exact_in_view(v, "m1.test.");
         release_zone_snapshot(s);
     }
+    if (member) remember_name(member, "m1.test.");    /* its address may be one a freed entry of an earlier test had */
     CHECK(cat != NULL);
     CHECK(member && member->is_catalog_member && member->source == ZONE_SRC_CATALOG);
 
@@ -1014,6 +1042,7 @@ static int tick_list(const char *view, const zone_db_entry_t *e, bool *in_list) 
 static zone_db_entry_t *new_secondary_entry(const char *view, const char *zone, zone_ext_shared_t *sh, int kind) {
     zone_db_entry_t *e = create_new_zone_entry(zone, view);
     CHECK(e != NULL);
+    remember_name(e, zone);
     zone_config_t *dc = db_zone_config_new_kind(zone, sh, kind);
     CHECK(dc != NULL);
     e->source = ZONE_SRC_DB;
@@ -2150,6 +2179,8 @@ int main(void) {
     test_dir_bytes_per_zone();
     test_zone_bytes();
     test_concurrent();
+    gc_snapshot_wait_idle();      /* join the cleanup threads: none is left running (or leaked, for ThreadSanitizer) at exit */
+    free(g_names);
     /* Remove the scratch directory in-process: the detached snapshot GC threads of test_concurrent may still be starting
      * or exiting here, and fork() from a multi-threaded process (as system("rm -rf") did) deadlocks under ASan on FreeBSD:
      * the ASan fork handler holds the allocator lock while waiting for the rtld lock, which a starting thread holds while
