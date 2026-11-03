@@ -636,7 +636,7 @@ static void test_skip_wire_name(void) {
 static size_t qe_msg(uint8_t *m, uint8_t opcode, uint16_t qd, const uint8_t *body, size_t blen) {
     memset(m, 0, DNS_HEADER_SIZE);
     m[0] = 0x12; m[1] = 0x34; m[2] = (uint8_t)(opcode << 3); m[4] = (uint8_t)(qd >> 8); m[5] = (uint8_t)qd;
-    memcpy(m + DNS_HEADER_SIZE, body, blen);
+    if (blen) memcpy(m + DNS_HEADER_SIZE, body, blen);
     return DNS_HEADER_SIZE + blen;
 }
 
@@ -3089,7 +3089,8 @@ static void xs_soa(xs_msg_t *m, size_t rdlen_override) {
 static void xs_opt(xs_msg_t *m, const uint8_t *opts, size_t olen) {      /* root owner */
     m->b[m->n++] = 0;
     xs_rrfix(m, 41, 1232, olen);
-    memcpy(m->b + m->n, opts, olen); m->n += olen;
+    if (olen) memcpy(m->b + m->n, opts, olen);   /* (memcpy with NULL is undefined even for 0 bytes: UBSan on glibc) */
+    m->n += olen;
 }
 static void xs_tsig(xs_msg_t *m) {      /* owner key.test., TYPE 250, CLASS ANY, TTL 0, a short RDATA (the shape check does not read it) */
     static const uint8_t nm[] = { 3, 'k', 'e', 'y', 4, 't', 'e', 's', 't', 0 };
