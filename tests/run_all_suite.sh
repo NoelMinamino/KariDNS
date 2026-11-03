@@ -882,6 +882,11 @@ EOF
             _exit_code=$?
         fi
         [ ${_exit_code} -ne 0 ] && _status="FAIL"
+        # A test that SKIPs a part (no PostgreSQL driver in the loader, no PostgreSQL server, ...) and exits 0 is a PASS; the first of its
+        # SKIP lines is kept as the note of the PASS, so that a run which silently lost its PostgreSQL tests shows it.
+        if [ "${_status}" = "PASS" ] && [ -f "${_log}" ]; then
+            _skip_reason=$(grep -m1 -E 'SKIP(:|\])' "${_log}" | sed 's/^[ =]*//' | cut -c1-150 | tr '|' '/')
+        fi
     fi
 
     T_END=$(date +%s 2>/dev/null || perl -e 'print time')
@@ -899,6 +904,7 @@ print_result() {
     IFS='|' read -r _status _cmd _cat T_ELAPSED _exit_code _desc _skip_reason < "${RES_DIR}/${_pi}.res"
     if [ "${_status}" = "PASS" ]; then
         printf "  [ ${C_GREEN}PASS${C_RESET} ] %-42s (${T_ELAPSED}s) ${C_WHITE}%s${C_RESET}\n" "${_cmd}" "${_desc}"
+        [ -n "${_skip_reason}" ] && printf "           ${C_YELLOW}^ part skipped: %s${C_RESET}\n" "${_skip_reason}"
     elif [ "${_status}" = "SKIP" ]; then
         printf "  [ ${C_YELLOW}SKIP${C_RESET} ] %-42s (${_skip_reason})\n" "${_cmd}"
     else
@@ -1133,6 +1139,16 @@ if [ "${SKIPPED_COUNT}" -gt 0 ]; then
     while IFS='|' read -r _s _c _cat _t _code _d _skip_r; do
         if [ "${_s}" = "SKIP" ]; then
             printf "  - ${C_YELLOW}%-45s${C_RESET} [Category: %s, Reason: %s]\n" "${_c}" "${_cat}" "${_skip_r:-unknown}"
+        fi
+    done < "${SUMMARY_FILE}"
+fi
+
+if grep -q '^PASS|[^|]*|[^|]*|[^|]*|[^|]*|.*|.' "${SUMMARY_FILE}"; then
+    echo ""
+    echo "${C_YELLOW}Passed with a skipped part (the first SKIP line of the log):${C_RESET}"
+    while IFS='|' read -r _s _c _cat _t _code _d _skip_r; do
+        if [ "${_s}" = "PASS" ] && [ -n "${_skip_r}" ]; then
+            printf "  - ${C_YELLOW}%-45s${C_RESET} %s\n" "${_c}" "${_skip_r}"
         fi
     done < "${SUMMARY_FILE}"
 fi
