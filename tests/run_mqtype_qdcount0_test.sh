@@ -4,6 +4,7 @@
 # 2. QDCOUNT>=1 with MQTYPE-Response option in Query (Opcode=0)
 # 3. NOTIFY (Opcode=4) with MQTYPE-Query option
 # 4. UPDATE (Opcode=5) with MQTYPE-Query option
+# 5-7. QDCOUNT=0 QUERY without OPT, with OPT, with a COOKIE option only (RFC 9619, RFC 7873 5.4)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -91,6 +92,32 @@ cat dag_out4.txt
 grep "status: FORMERR" dag_out4.txt || { echo "FAIL: Test 4 status is not FORMERR"; cat karidns.log; exit 1; }
 grep "id: 17767" dag_out4.txt || { echo "FAIL: Test 4 transaction ID mismatch (expected 0x4567 = 17767)"; exit 1; }
 echo "[+] Test 4 passed: ID 0x4567 preserved on FORMERR."
+
+echo "========================================================"
+echo "Test 5-7: QDCOUNT=0 QUERY (RFC 9619, RFC 7873 5.4; BIND 9.20)"
+echo "========================================================"
+# 5. no OPT -> FORMERR, the header only; 6. OPT without COOKIE -> FORMERR with OPT;
+# 7. COOKIE only -> NOERROR with the client cookie and a server cookie. UDP and TCP.
+HEX_PKT5="567801000000000000000000"
+HEX_PKT6="5678010000000000000000010000291000000000000000"
+HEX_PKT7="567801000000000000000001000029100000000000000c000a00080102030405060708"
+for T in "+udp" "+tcp"; do   # --hex is sent as an ANY query: dag goes to TCP unless +udp is given
+    "$BIN_DIR/dag" "--hex=$HEX_PKT5" $T @127.0.0.1 -p ${PORT} > dag_out5.txt 2>&1 || true
+    cat dag_out5.txt
+    grep -q "status: FORMERR" dag_out5.txt && grep -q "QUERY: 0, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 0" dag_out5.txt \
+        || { echo "FAIL: Test 5 ($T) QDCOUNT=0 without OPT is not a header-only FORMERR"; exit 1; }
+    "$BIN_DIR/dag" "--hex=$HEX_PKT6" $T @127.0.0.1 -p ${PORT} > dag_out6.txt 2>&1 || true
+    cat dag_out6.txt
+    grep -q "status: FORMERR" dag_out6.txt && grep -q "QUERY: 0, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 1" dag_out6.txt \
+        && grep -q "OPT PSEUDOSECTION" dag_out6.txt \
+        || { echo "FAIL: Test 6 ($T) QDCOUNT=0 with OPT is not a FORMERR with OPT"; exit 1; }
+    # +nocookie: the client cookie is the one in the payload, not dag's own (dag would drop the UDP answer as a mismatch)
+    "$BIN_DIR/dag" "--hex=$HEX_PKT7" $T +nocookie @127.0.0.1 -p ${PORT} > dag_out7.txt 2>&1 || true
+    cat dag_out7.txt
+    grep -q "status: NOERROR" dag_out7.txt && grep -q "COOKIE: 0102030405060708[0-9a-f]\{32\}" dag_out7.txt \
+        || { echo "FAIL: Test 7 ($T) cookie-only query is not NOERROR with a server cookie"; exit 1; }
+done
+echo "[+] Tests 5-7 passed: QDCOUNT=0 FORMERR without COOKIE, NOERROR for a cookie-only query."
 
 echo "[+] All RFC 10029 FORMERR & ID preservation tests passed successfully!"
 exit 0
