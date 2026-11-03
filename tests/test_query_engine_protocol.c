@@ -570,6 +570,14 @@ static void test_notify_authorization(void) {
     atomic_store(&g_gr.entry.refresh_now, false);
     ask(&q, "example.", 6, STRANGER, false, &r);
     CHECK(&r, r.rcode == 5 && !atomic_load(&g_gr.entry.refresh_now));
+    /* from the master, but not a NOTIFY of the SOA (RFC 1996 4.5, 4.7) or not of class IN: FORMERR / NOTIMP with the question, no AA, no refresh (named
+     * 9.20 answers the same; KariDNS used to take them as a NOTIFY of the zone) */
+    put_hdr(&q, 0x4592, 0x2400, 1, 0, 0, 1); put_question(&q, "example.", 1, 1); put_opt(&q, 0, 0, 0, NULL, 0);
+    ask(&q, "example.", 1, MASTER, false, &r);
+    CHECK(&r, r.rcode == 1 && !r.aa && r.msg[5] == 1 && gr_count(&r, 3, 41) == 1 && !atomic_load(&g_gr.entry.refresh_now));
+    put_hdr(&q, 0x4592, 0x2400, 1, 0, 0, 0); put_question(&q, "example.", 6, 3);
+    ask(&q, "example.", 6, MASTER, false, &r);
+    CHECK(&r, r.rcode == 4 && !r.aa && r.msg[5] == 1 && !atomic_load(&g_gr.entry.refresh_now));
     /* RFC 8945 5.4: a TSIG that fails verification is fatal even when the source address is an authorized master */
     tsig_key_t *bad = calloc(1, sizeof(*bad));
     bad->name = strdup("nokey."); bad->algorithm = strdup("hmac-sha256");

@@ -10,6 +10,8 @@
 #   - NOTIMP (an opcode other than QUERY, NOTIFY and UPDATE) echoes no question (dns_message_reply()), with the OPT (KariDNS adds EDE 21)
 #   - BADVERS echoes the questions a FORMERR would (none for such an opcode), over UDP and in the TCP transfer dispatch
 #   - an UPDATE whose zone class is ANY or NONE is a FORMERR without a zone section (RFC 2136 §2.3; it was NOTAUTH), a NOTIFY of class ANY / NONE too
+#   - an UPDATE or NOTIFY of another class (CH, HS) is a NOTIMP with the question (named: no view of that class; an UPDATE was NOTAUTH, a NOTIFY REFUSED or
+#     accepted), and a NOTIFY whose question is not an SOA (RFC 1996 4.5) a FORMERR with the question and the OPT (KariDNS adds EDE 0; it was REFUSED or accepted)
 #   - an AXFR over UDP (RFC 5936 §4.2) is a FORMERR only after the checks of a transfer (BIND ns_xfr_start()): a forward zone, a name that is not a zone
 #     and a name inside a zone are no zone (KariDNS: REFUSED + EDE 20; BIND: NOTAUTH), a client allow-transfer refuses gets REFUSED + EDE 18; a UDP IXFR of
 #     a name inside a zone is no zone either (it was answered with the zone's SOA); an AXFR over UDP of a built-in CHAOS zone is a FORMERR
@@ -120,7 +122,16 @@ for tr in "" --tcp; do
     done
 done
 t "UPDATE of class ANY for a zone that is not here"  "$FE0" --name nx.test --type SOA --opcode 5 --class 255
-t "UPDATE of class CH: NOTAUTH as before"            '^rcode=9 tc=0 aa=0 qd=1 ' --name ax.test --type SOA --opcode 5 --class 3
+echo "== UPDATE and NOTIFY of another class: NOTIMP (named: no view of that class); a NOTIFY that is not of the SOA: FORMERR (RFC 1996 4.5)"
+for tr in "" --tcp; do
+    w=${tr:-udp}; w=${w#--}
+    t "$w: UPDATE of class CH"                       '^rcode=4 tc=0 aa=0 qd=1 an=0 ns=0 ar=1 opt=0 tsig=none ede=-' $tr --name ax.test --type SOA --opcode 5 --class 3 --edns-version 0
+    t "$w: NOTIFY of class CH"                       '^rcode=4 tc=0 aa=0 qd=1 an=0 ns=0 ar=1 opt=0 tsig=none ede=-' $tr --name ax.test --type SOA --opcode 4 --class 3 --edns-version 0
+    t "$w: NOTIFY of class HS"                       '^rcode=4 tc=0 aa=0 qd=1 an=0 ns=0 ar=1 opt=0 tsig=none ede=-' $tr --name ax.test --type SOA --opcode 4 --class 4 --edns-version 0
+    t "$w: NOTIFY of an A record"                    '^rcode=1 tc=0 aa=0 qd=1 an=0 ns=0 ar=1 opt=0 tsig=none ede=0' $tr --name ax.test --type A --opcode 4 --edns-version 0
+done
+t "UPDATE of class CH for a zone that is not here"   '^rcode=4 tc=0 aa=0 qd=1 ' --name nx.test --type SOA --opcode 5 --class 3
+t "NOTIFY of an NS record for a zone that is not here" '^rcode=1 tc=0 aa=0 qd=1 ' --name nx.test --type NS --opcode 4
 
 echo "== AXFR over UDP: the zone and allow-transfer first, then FORMERR"
 t "a zone the client may transfer: FORMERR"          '^rcode=1 tc=0 aa=0 qd=1 an=0 ns=0 ar=1 opt=0 tsig=none ede=-' --name ax.test --type AXFR --edns-version 0

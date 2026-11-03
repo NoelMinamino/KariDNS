@@ -3518,6 +3518,19 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg); // FORMERR
   }
 
+  /* NOTIFY and UPDATE, before the zone, the ACLs and the keys are looked at (also for a zone out of memory below), as BIND 9.20: a class other than IN
+   * (ANY and NONE were a FORMERR above) has no view here -- NOTIMP, as named answers; a NOTIFY whose question is not an SOA is a FORMERR (RFC 1996 §4.5,
+   * §4.7: QTYPE=SOA; named answers FORMERR), the question echoed with the OPT.  (An UPDATE whose zone section is not an SOA is the FORMERR of the UPDATE code below.) */
+  if (opcode == 4 || opcode == 5) {
+    const size_t nu_end = get_question_end_offset(req, req_len, 1);
+    const uint16_t nu_class = nu_end >= DNS_HEADER_SIZE + 5 ? (uint16_t)((req[nu_end - 2] << 8) | req[nu_end - 1]) : 1;
+    if (nu_class != 1) return dns_build_error_response(req, req_len, res, max_res_len, 4, 0, 1, &edns, is_tcp, cfg); // NOTIMP
+    if (opcode == 4 && qtype != 6) {
+      add_ede(&edns, send_ede, 0, NULL);
+      return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg); // FORMERR
+    }
+  }
+
   if (not_ready_zone && qdcount == 1) {
     /* D1a: the zone is in the directory and its data is not in memory, and the caller cannot wait for it (or has waited in vain).  After the
      * checks of the message above (a malformed request is still a FORMERR), before any work on the zone.  The answer is an error answer of that
@@ -3541,13 +3554,11 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       /* UPDATE (RFC 2136): the zone is checked as for a zone in memory (3.1.1, 3.1.2: SOA question, the apex of this zone), then allow-update from the
        * settings kept in the element.  An UPDATE that may be made is answered SERVFAIL + EDE 14 now: it is applied to the zone in memory, which a
        * later step reads for it (design 7); nothing waits and nothing is read for it here. */
-      size_t zone_end = get_question_end_offset(req, req_len, 1);
-      uint16_t zclass = (zone_end >= DNS_HEADER_SIZE + 5) ? (uint16_t)((req[zone_end - 2] << 8) | req[zone_end - 1]) : 0;
-      int urc;
+      int urc;                                          /* (a ZCLASS other than IN was a NOTIMP above) */
       if (qtype != 6) {
         urc = 1;                                        // FORMERR
         qe_log_update_zone_error(client_ip, urc, current_qname);
-      } else if (!view || zclass != 1 || !domain_names_match_ci(not_ready_zone->name, current_qname)) {
+      } else if (!view || !domain_names_match_ci(not_ready_zone->name, current_qname)) {
         urc = 9;                                        // NOTAUTH
         qe_log_update_zone_error(client_ip, urc, current_qname);
       } else if (qe_update_query_acl_denies(cfg, &zc, view->name, client_ip, not_ready_zone->name)) {
@@ -3746,17 +3757,15 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       // RFC 10029 §3.3: QUERY 以外への MQTYPE-Query は FORMERR。RFC 6891 §7: OPT を付ける。
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg);
     }
-    /* RFC 2136 §3.1.1, §3.1.2: ZTYPE が SOA でなければ FORMERR。ZNAME と ZCLASS がこのサーバー
+    /* RFC 2136 §3.1.1, §3.1.2: ZTYPE が SOA でなければ FORMERR。ZNAME がこのサーバー
      * (クライアントのビュー) のゾーンでなければ NOTAUTH。どちらも権限の確認 (§3.3) より前に行う。
      * ZOCOUNT (QDCOUNT) != 1 は上で FORMERR にしている。上位のゾーンに一致しただけのときも NOTAUTH。
-     * ZCLASS NONE / ANY (§2.3: ZCLASS はゾーンのクラス) は質問セクションの不正として冒頭で FORMERR (BIND getquestions())。*/
+     * ZCLASS NONE / ANY (§2.3: ZCLASS はゾーンのクラス) は質問セクションの不正として冒頭で FORMERR (BIND getquestions())、
+     * IN 以外の ZCLASS (CH、HS など) は上で NOTIMP (named と同じ: そのクラスのビューが無い)。*/
     int zone_rcode = 0;
-    size_t zone_end = get_question_end_offset(req, req_len, 1);
-    uint16_t zclass = (zone_end >= DNS_HEADER_SIZE + 5)
-                          ? (uint16_t)((req[zone_end - 2] << 8) | req[zone_end - 1]) : 0;
     if (qtype != 6) {
       zone_rcode = 1; // FORMERR
-    } else if (!db_entry || !view || zclass != 1 || !domain_names_match_ci(db_entry->domain, current_qname)) {
+    } else if (!db_entry || !view || !domain_names_match_ci(db_entry->domain, current_qname)) {
       zone_rcode = 9; // NOTAUTH
     }
     /* R-30: TSIG は process_dns_query_impl_cap() で検証済み (RFC 8945 §5.2)。ここに来るのは TSIG なしか

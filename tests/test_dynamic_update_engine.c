@@ -1808,10 +1808,13 @@ static void test_update_dispatch_zone_section(void) {
     upd_begin_zone(&m, "other.test.", 6, 1);
     len = upd_query(&m, "other.test.", 6, "192.0.2.99", &snap, &cfg, res, sizeof(res));
     assert(len >= 12 && (res[3] & 0x0F) == 9);
-    /* ZCLASS CH -> NOTAUTH; ZTYPE A -> FORMERR, before the permission check */
+    /* ZCLASS CH (HS) -> NOTIMP, as named 9.20 (no view of that class); ZTYPE A -> FORMERR; both before the permission check */
     upd_begin_zone(&m, UZ, 6, 3);
     len = upd_query(&m, UZ, 6, "192.0.2.99", &snap, &cfg, res, sizeof(res));
-    assert(len >= 12 && (res[3] & 0x0F) == 9);
+    assert(len >= 12 && (res[3] & 0x0F) == 4 && res[5] == 1);
+    upd_begin_zone(&m, UZ, 1, 4);                                   /* (the class is looked at before the type) */
+    len = upd_query(&m, UZ, 1, "192.0.2.99", &snap, &cfg, res, sizeof(res));
+    assert(len >= 12 && (res[3] & 0x0F) == 4);
     upd_begin_zone(&m, UZ, 1, 1);
     len = upd_query(&m, UZ, 1, "192.0.2.99", &snap, &cfg, res, sizeof(res));
     assert(len >= 12 && (res[3] & 0x0F) == 1);
