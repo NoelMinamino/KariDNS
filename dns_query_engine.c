@@ -82,6 +82,18 @@ void query_set_client_addr(const void *sa) {
   t_qacl.client_valid = qacl_copy_addr(&t_qacl.client, sa);
 }
 
+/* batch 14, category query-errors (BIND lib/ns/query.c log_queryerror()): why an error answer was made.  The reason is the text the site gives
+ * (qe_why()), else the text of the Extended DNS Error it attached (add_ede() of this file is qe_add_ede(): RFC 8914 texts such as "Zone expired"), else
+ * a general one; process_dns_query_impl_cap_routed() reads and clears it when the answer is final. */
+static _Thread_local const char *t_qerr_why;
+static _Thread_local char t_qerr_ede[96];
+static inline void qe_why(const char *why) { t_qerr_why = why; }
+static void qe_add_ede(edns_info_t *edns, bool enabled, uint16_t code, const char *text) {
+  if (text && *text) strlcpy(t_qerr_ede, text, sizeof(t_qerr_ede));
+  add_ede(edns, enabled, code, text);
+}
+#define add_ede(...) qe_add_ede(__VA_ARGS__)
+
 /* batch 14: event messages of the query path (dns_log.h logev_*).  The client is the address text the engine was given and the port the transport set
  * (query_set_client_addr(); 0 when it did not).  logev_wanted() is one atomic load; a caller checks it before it builds a name or a text. */
 static inline int qe_client_port(void) {
@@ -91,6 +103,36 @@ static inline int qe_client_port(void) {
   return 0;
 }
 int query_client_port(void) { return qe_client_port(); }
+
+/* The final answer of a query is an error: log it in query-errors (BIND query.c log_queryerror(): "query failed (SERVFAIL) for name/class/type" at debug 1; the
+ * other results at debug 3; INFO when the query log is on, as BIND's NS_SERVER_LOGQUERIES).  Only QUERYs (UPDATE, NOTIFY and the transfers have their own
+ * categories).  Nothing is built unless some channel passes the level. */
+static void qe_log_failure(const server_config_t *cfg, const uint8_t *req, size_t req_len, const uint8_t *res, int len, const char *client_ip) {
+  const char *why = t_qerr_why;
+  t_qerr_why = NULL;
+  if (len < DNS_HEADER_SIZE || req_len < DNS_HEADER_SIZE) return;
+  unsigned rcode = res[3] & 0x0F;
+  if (rcode != 1 && rcode != 2 && rcode != 4 && rcode != 5 && rcode != 9) return;
+  uint8_t opcode = (req[2] >> 3) & 0x0F;
+  if (opcode == 4 || opcode == 5) return;                  /* (notify.c, update.c: their own categories) */
+  int level = cfg && cfg->logging.queries_enabled ? LOG_LVL_INFO : rcode == 2 ? 1 : 3;
+  if (!logev_wanted(LOGC_QUERY_ERRORS, level)) return;
+  char qn[DNS_NAME_TEXT_SIZE], name[300] = "-", tn[32];
+  const char *tstr = "-";
+  uint16_t qt = 0, qc = 0;
+  size_t qend = 0;
+  const char *cls = "-";
+  if (((req[4] << 8) | req[5]) == 1 && parse_query_question_fast(req, req_len, qn, sizeof(qn), &qt, &qc, &qend)) {
+    if (qt == 251 || qt == 252) return;                    /* (xfer-out) */
+    logev_name_text(qn, name, sizeof(name));
+    tstr = format_type_name(qt, tn, sizeof(tn));
+    cls = qc == 1 ? "IN" : qc == 3 ? "CH" : qc == 255 ? "ANY" : "CLASS?";
+  }
+  const char *reason = why ? why : t_qerr_ede[0] ? t_qerr_ede
+                     : rcode == 1 ? "malformed query" : rcode == 2 ? "no answer could be made" : rcode == 5 ? "query refused"
+                     : rcode == 4 ? "not implemented" : "not authorized";
+  logev_post(LOGC_QUERY_ERRORS, level, client_ip, qe_client_port(), "query failed (%s) for %s/%s/%s: %s", dns_rcode_name(rcode), name, cls, tstr, reason);
+}
 
 /* UPDATE (RFC 2136) that never reaches the zone: the zone section is wrong (BIND lib/ns/update.c, category update, INFO: "update failed: ... (RCODE)") */
 static void qe_log_update_zone_error(const char *client_ip, int zone_rcode, const char *zname) {
@@ -3236,6 +3278,8 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
                                              const zdir_elem_t *not_ready_zone) {
   t_query_rrl_info.zone = NULL; /* D-05: 早い段階で返す応答 (エラー) のために先に消す */
   t_query_rrl_info.wildcard = false;
+  t_qerr_why = NULL;
+  t_qerr_ede[0] = '\0';
   if (req_len < DNS_HEADER_SIZE) {
     t_qacl.local_valid = t_qacl.client_valid = false;
     return 0; // 不正な短いパケットは無応答で破棄
@@ -3266,6 +3310,7 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
   if (tsig.status == TSIG_REQ_NONE) {
     int plain = process_query_body(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
                                    is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL, route, not_ready_zone);
+    qe_log_failure(cfg, req, req_len, res, plain, client_ip);
     t_qacl.local_valid = t_qacl.client_valid = false;   /* the address of the next query is set by its transport */
     t_qacl.key = NULL;
     return plain;
@@ -3285,6 +3330,7 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
   tsig.res_limit = max_res_len;
   int ret = process_query_body(body_req, body_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
                                is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, &tsig, route, not_ready_zone);
+  qe_log_failure(cfg, req, req_len, res, ret, client_ip);
   t_qacl.local_valid = t_qacl.client_valid = false;
   t_qacl.key = NULL;
   if (ret < DNS_HEADER_SIZE) return ret;
@@ -3345,6 +3391,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   edns.present = false;
   if (parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req, &edns) < 0) {
     /* OPT 自体が使えない (所有者名が root でない、追加セクション以外、複数、RDATA 切れ): OPT なしの FORMERR */
+    qe_why("the OPT record cannot be used (owner name, section, number or RDATA)");
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, NULL, is_tcp, cfg);
   }
   edns.ede_count = 0; // 反射防止
@@ -3389,7 +3436,9 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
    * NOTAUTH で、TSIG は process_dns_query_impl_cap() が付ける (§5.3.2)。どちらも要求の中身は処理しない。 */
   if (tsig && (tsig->status == TSIG_REQ_FORMERR || tsig->status == TSIG_REQ_ERROR)) {
     uint8_t rc = 1; // FORMERR
+    qe_why("the TSIG record cannot be parsed");
     if (tsig->status == TSIG_REQ_ERROR) {
+      qe_why(NULL);
       rc = 9;       // NOTAUTH
       add_ede(&edns, send_ede, 18, "Invalid TSIG");
     }
@@ -3407,6 +3456,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   if (edns.saw_invalid_mqtype_response_in_query || edns.mqtype_query_duplicated) {
+    qe_why("invalid MQTYPE-Query option (RFC 10029 3.3)");
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, &edns, is_tcp, cfg); // FORMERR
   }
 
@@ -3419,6 +3469,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   /* 長さが不正な COOKIE (RFC 7873 §5.2.2)、不正な ECS (RFC 7871 §6、§7.2.1) は FORMERR。
    * RFC 6891 §7: オプションの不正による FORMERR には OPT を付ける (R-13)。 */
   if (edns.has_malformed_cookie || edns.has_malformed_ecs) {
+    qe_why(edns.has_malformed_cookie ? "malformed COOKIE option (RFC 7873 5.2.2)" : "malformed EDNS Client Subnet option (RFC 7871 6)");
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
   }
 
@@ -3432,6 +3483,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   // OPCODE=4(NOTIFY)/5(UPDATE) still require QDCOUNT==1.
   bool qdcount_invalid = (opcode == 0) ? (qdcount > 1) : (qdcount != 1);
   if (qdcount_invalid) {
+    qe_why("the question count is not valid for this opcode (RFC 9619)");
     add_ede(&edns, send_ede, 0, NULL);
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg); // FORMERR
   }
@@ -3439,6 +3491,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   /* X-15, RFC 1035 §4.1.4: 最初の名前の圧縮ポインタは前に現れた名前を指せない (指せるのはヘッダだけ)。
    * 質問を写し返せないので QDCOUNT=0 の FORMERR (以前はポインタの先によって無応答、または別の名前の答え)。 */
   if (qdcount == 1 && wire_question_name_compressed(req, req_len)) {
+    qe_why("the question name is compressed (RFC 1035 4.1.4)");
     add_ede(&edns, send_ede, 0, NULL);
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, &edns, is_tcp, cfg); // FORMERR
   }
@@ -3557,6 +3610,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   if (opcode == 0 && qdcount == 0) {
     if (edns.has_mqtype_query) {
       // RFC 10029 §3.3: MQTYPE-Query option in a query with QDCOUNT=0 MUST be FORMERR.
+      qe_why("MQTYPE-Query option in a query without a question (RFC 10029 3.3)");
       // RFC 6891 §7: オプションに起因する FORMERR には OPT を付ける。
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, &edns, is_tcp, cfg);
     }
@@ -3784,6 +3838,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   if (q_offset + 4 > req_len) {
     // QTYPE/QCLASS が欠けている: 質問を区切れないので QDCOUNT=0 の FORMERR
+    qe_why("the question is cut short (no QTYPE and QCLASS)");
     add_ede(&edns, send_ede, 0, NULL);
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, &edns, is_tcp, cfg);
   }
@@ -3827,6 +3882,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       // CH class
     } else {
       add_ede(&edns, send_ede, 0, NULL);
+      qe_why("the query class is not supported");
       return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg); // REFUSED
     }
   q_offset += 4;
@@ -4120,6 +4176,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (edns.has_mqtype_query) {
     if (edns.mqtype_count == 0 || is_non_data_rrtype(qtype)) {
+      qe_why("invalid MQTYPE-Query option: no type, or a type that is not data (RFC 10029 3.3)");
       // RFC 10029 §3.3 / RFC 6891 §7: FORMERR (OPT 付き、AA=0)
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg);
     }
@@ -4127,12 +4184,14 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     for (int i = 0; i < edns.mqtype_count && num_qtypes <= limit; i++) {
        uint16_t mq = edns.mqtypes[i];
        if (is_non_data_rrtype(mq)) {
+          qe_why("invalid MQTYPE-Query option: a type that is not data (RFC 10029 3.3)");
           // RFC 10029 §3.3 / RFC 6891 §7: FORMERR (OPT 付き、AA=0)
           return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg);
        }
        bool dup = false;
        for (int j = 0; j < num_qtypes; j++) { if (qtypes[j] == mq) { dup = true; break; } }
        if (dup) {
+          qe_why("invalid MQTYPE-Query option: a type twice (RFC 10029 3.3)");
           // RFC 10029 §3.3 / RFC 6891 §7: FORMERR (OPT 付き、AA=0)
           return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg);
        }

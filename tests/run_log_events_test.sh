@@ -228,6 +228,129 @@ has "X: ... and the AXFR-style IXFR" "$LG/xfer_dbg4b.log" "AXFR-style IXFR start
 kari_kill_tree $S3; PIDS=""
 wait_free $P1
 
+# ------------------------------------------------------------------------------------------------ Q: query-errors
+echo "== Q: query-errors"
+rawq() { # rawq KIND [TCP]: one query of a kind a normal client does not send, to 127.0.0.1:$P1; prints the RCODE
+    perl -e '
+        use IO::Socket::INET;
+        my ($port, $kind, $tcp) = @ARGV;
+        my $name = "\x01a\x04test\x00";
+        my $q = $name . pack("nn", 1, 1);
+        my $pkt;
+        if ($kind eq "qd2") { $pkt = pack("n6", 0x1234, 0x0100, 2, 0, 0, 0) . $q . $q; }
+        elsif ($kind eq "iquery") { $pkt = pack("n6", 0x1234, 0x0800, 1, 0, 0, 0) . $q; }
+        elsif ($kind eq "cookie") { my $opt = "\x00" . pack("nnN", 41, 4096, 0) . pack("n", 7) . pack("nn", 10, 3) . "abc"; $pkt = pack("n6", 0x1234, 0x0100, 1, 0, 0, 1) . $q . $opt; }
+        elsif ($kind eq "cut") { $pkt = pack("n6", 0x1234, 0x0100, 1, 0, 0, 0) . $name . "\x00"; }
+        else { die "kind"; }
+        my $s = IO::Socket::INET->new(PeerAddr => "127.0.0.1", PeerPort => $port, Proto => $tcp ? "tcp" : "udp", Timeout => 3) or die "connect: $!";
+        $s->send($tcp ? pack("n", length $pkt) . $pkt : $pkt);
+        my $buf;
+        $s->recv($buf, 4096);
+        $buf = substr($buf, 2) if $tcp;
+        print unpack("n", substr($buf, 2, 2)) & 15, "\n";
+    ' "$P1" "$1" "${2:-}" 2>/dev/null
+}
+zonefile "$W/acl.zone" acl.test 1
+printf '$TTL 300\n@ IN SOA ns1 hostmaster\nthis line is broken\n' > "$W/bad.zone"
+cat > "$W/s4.conf" <<EOF
+options { port $P1; listen-on { 127.0.0.1; }; pid-file "none"; $USER_OPT };
+logging {
+$(chan qe1 "$LG/qe1.log" "debug 1")
+$(chan qe3 "$LG/qe3.log" "debug 3")
+$(chan qeinfo "$LG/qeinfo.log" "info")
+    category query-errors { qe1; qe3; qeinfo; };
+};
+zone "bad.test" { type primary; file "$W/bad.zone"; };
+zone "acl.test" { type primary; file "$W/acl.zone"; allow-query { 192.0.2.1; }; };
+zone "x.test" { type primary; file "$W/x.zone"; };
+EOF
+"$KARIDNS" -f "$W/s4.conf" > "$W/s4.log" 2>&1 &
+PIDS="$PIDS $!"
+S4=$!
+_i=0; while [ $_i -lt 20 ]; do d x.test SOA +tcp +short | grep -q hostmaster && break; sleep 0.5; _i=$((_i + 1)); done
+d x.test A +tcp +short >/dev/null
+
+d bad.test A | grep -q "status: SERVFAIL" && pass "Q: a zone that did not load answers SERVFAIL" || fail "Q: SERVFAIL"
+has "Q: SERVFAIL at debug 1 with the reason" "$LG/qe1.log" "query-errors: debug 1: client 127\.0\.0\.1#[0-9]*: query failed (SERVFAIL) for bad\.test/IN/A: Zone not ready (empty)"
+d nosuch.example A | grep -q "status: REFUSED" && pass "Q: a name no zone serves is REFUSED" || fail "Q: REFUSED"
+has "Q: REFUSED (not authoritative) at debug 3" "$LG/qe3.log" "query-errors: debug 3: client 127\.0\.0\.1#[0-9]*: query failed (REFUSED) for nosuch\.example/IN/A: This server is not authoritative for the queried zone"
+hasnt "Q: ... not on the debug 1 channel" "$LG/qe1.log" "REFUSED"
+d host.acl.test A | grep -q "status: REFUSED" && pass "Q: allow-query refuses a client" || fail "Q: acl"
+has "Q: allow-query: the reason" "$LG/qe3.log" "query failed (REFUSED) for host\.acl\.test/IN/A: Query refused due to access control"
+hasnt "Q: nothing at info (the query log is off)" "$LG/qeinfo.log" "query failed"
+[ "$(rawq qd2)" = 1 ] && pass "Q: QDCOUNT 2 is FORMERR" || fail "Q: qd2 rcode '$(rawq qd2)'"
+has "Q: FORMERR: the reason" "$LG/qe3.log" "query failed (FORMERR) for -/-/-: the question count is not valid for this opcode (RFC 9619)"
+[ "$(rawq cookie)" = 1 ] && pass "Q: a COOKIE option of 3 octets is FORMERR" || fail "Q: cookie rcode '$(rawq cookie)'"
+has "Q: ... with the reason" "$LG/qe3.log" "query failed (FORMERR) for a\.test/IN/A: malformed COOKIE option (RFC 7873 5.2.2)"
+[ "$(rawq iquery)" = 4 ] && pass "Q: opcode IQUERY is NOTIMP" || fail "Q: iquery rcode"
+has "Q: NOTIMP" "$LG/qe3.log" "(NOTIMP) for a\.test/IN/A: This opcode is not supported by this server"
+[ "$(rawq cut)" = 1 ] && pass "Q: a question without QTYPE / QCLASS is FORMERR" || fail "Q: cut rcode"
+has "Q: ... cut short" "$LG/qe3.log" "the question is cut short (no QTYPE and QCLASS)"
+d bad.test A +tcp | grep -q "status: SERVFAIL" && pass "Q: SERVFAIL over TCP" || fail "Q: SERVFAIL tcp"
+[ "$(rawq qd2 tcp)" = 1 ] && pass "Q: FORMERR over TCP" || fail "Q: qd2 tcp"
+N=$(count "query failed (SERVFAIL) for bad.test/IN/A" "$LG/qe1.log")
+[ "$N" -ge 2 ] && pass "Q: the TCP SERVFAIL is logged too (both transports go through the same hook)" || fail "Q: TCP SERVFAIL lines: $N"
+# an UPDATE / NOTIFY / transfer refusal is not a query error (their own categories)
+d x.test A --update-add 'z.x.test 300 A 192.0.2.1' | grep -q "status: REFUSED" && pass "Q: an UPDATE refused" || fail "Q: update"
+hasnt "Q: ... is not a query error" "$LG/qe3.log" "x\.test/IN/SOA"
+
+# the rate limit: 20 per second
+N0=$(count "query failed (REFUSED) for flood" "$LG/qe3.log")
+T0=$(date +%s)
+i=0
+while [ $i -lt 100 ]; do d "flood$i.nosuch.example" A >/dev/null; i=$((i + 1)); done
+T1=$(date +%s)
+sleep 2
+N1=$(count "query failed (REFUSED) for flood" "$LG/qe3.log")
+NEW=$((N1 - N0))
+MAX=$(( (T1 - T0 + 2) * 20 ))
+if [ "$NEW" -ge 1 ] && [ "$NEW" -le "$MAX" ]; then pass "Q: 100 refused queries in $((T1 - T0)) s wrote $NEW lines (at most $MAX: 20 per second)"; else fail "Q: rate limit: $NEW lines in $((T1 - T0)) s (max $MAX)"; fi
+has "Q: the suppressed ones are reported" "$LG/qe3.log" "query-errors: debug 3: [0-9]* message(s) suppressed by the rate limit of 20 per second"
+kari_kill_tree $S4; PIDS=""
+wait_free $P1
+
+# the query log is on: the same reasons at info (BIND: NS_SERVER_LOGQUERIES); and with no channel for the category nothing is written
+cat > "$W/s5.conf" <<EOF
+options { port $P1; listen-on { 127.0.0.1; }; pid-file "none"; querylog yes; $USER_OPT };
+logging {
+$(chan qeinfo "$LG/qeinfo5.log" "info")
+$(chan q "$LG/q5.log" "info")
+    category query-errors { qeinfo; };
+    category queries { q; };
+};
+zone "bad.test" { type primary; file "$W/bad.zone"; };
+zone "x.test" { type primary; file "$W/x.zone"; };
+EOF
+"$KARIDNS" -f "$W/s5.conf" > "$W/s5.log" 2>&1 &
+PIDS="$PIDS $!"
+S5=$!
+_i=0; while [ $_i -lt 20 ]; do d x.test SOA +tcp +short | grep -q hostmaster && break; sleep 0.5; _i=$((_i + 1)); done
+d nosuch.example A >/dev/null
+d bad.test A >/dev/null
+has "Q: with the query log on, a SERVFAIL is at info" "$LG/qeinfo5.log" "query-errors: info: client 127\.0\.0\.1#[0-9]*: query failed (SERVFAIL) for bad\.test/IN/A"
+has "Q: ... and a REFUSED" "$LG/qeinfo5.log" "query-errors: info: client 127\.0\.0\.1#[0-9]*: query failed (REFUSED) for nosuch\.example/IN/A"
+has "Q: the query log itself still works" "$LG/q5.log" "queries: info: client 127\.0\.0\.1#[0-9]*.*query: bad\.test\. IN A"
+kari_kill_tree $S5; PIDS=""
+wait_free $P1
+cat > "$W/s6.conf" <<EOF
+options { port $P1; listen-on { 127.0.0.1; }; pid-file "none"; $USER_OPT };
+zone "bad.test" { type primary; file "$W/bad.zone"; };
+zone "x.test" { type primary; file "$W/x.zone"; };
+EOF
+"$KARIDNS" -f "$W/s6.conf" > "$W/s6.log" 2>&1 &
+PIDS="$PIDS $!"
+S6=$!
+_i=0; while [ $_i -lt 20 ]; do d x.test SOA +tcp +short | grep -q hostmaster && break; sleep 0.5; _i=$((_i + 1)); done
+d nosuch.example A >/dev/null
+d bad.test A >/dev/null
+rawq qd2 >/dev/null
+sleep 1
+hasnt "Q: no channel for the category: no query-errors line anywhere (the default is info: the debug levels write nothing)" "$W/s6.log" "query failed"
+kari_kill_tree $S6; PIDS=""
+
+# a sanitizer build (KARIDNS=./karidns-asan or karidns-tsan) reports on stderr, which is in the logs of the servers
+if grep -lE "AddressSanitizer|ThreadSanitizer|UndefinedBehaviorSanitizer|runtime error:" "$W"/s[0-9].log >/dev/null 2>&1; then fail "a sanitizer report in a server log"; grep -hE -A8 "Sanitizer|runtime error:" "$W"/s[0-9].log | head -30; else pass "no sanitizer report in the logs of the servers"; fi
+
 echo
 echo "$PASSES passed, $FAILS failed"
 [ "$FAILS" -eq 0 ]
