@@ -5077,6 +5077,102 @@ bool wire_question_name_compressed(const uint8_t *buf, size_t len) {
     return false;
 }
 
+/* ---- the shape of an AXFR / IXFR request (dns_wire.h) ---- */
+
+const char *xfr_shape_text(xfr_shape_t s) {
+    switch (s) {
+        case XFR_SHAPE_OK: return "well formed";
+        case XFR_SHAPE_SHORT: return "shorter than a DNS header";
+        case XFR_SHAPE_TOO_LONG: return "request too long";
+        case XFR_SHAPE_RESPONSE: return "QR is set";
+        case XFR_SHAPE_OPCODE: return "OPCODE is not QUERY";
+        case XFR_SHAPE_RCODE: return "RCODE is not NOERROR";
+        case XFR_SHAPE_QDCOUNT: return "QDCOUNT is not 1";
+        case XFR_SHAPE_QUESTION: return "malformed question";
+        case XFR_SHAPE_QTYPE: return "the question is not AXFR or IXFR";
+        case XFR_SHAPE_ANCOUNT: return "ANCOUNT is not 0";
+        case XFR_SHAPE_NSCOUNT: return "unexpected NSCOUNT";
+        case XFR_SHAPE_IXFR_SOA: return "the IXFR Authority record is not a SOA";
+        case XFR_SHAPE_ADDITIONAL: return "malformed or unexpected Additional record";
+        case XFR_SHAPE_TRAILING: return "trailing octets after the last record";
+    }
+    return "malformed request";
+}
+
+/* one RR at *p (RFC 1035 §3.2.1): the name, TYPE, CLASS, TTL, RDLENGTH and the RDATA, all inside the message; *p moves past it */
+static bool xfr_shape_rr(const uint8_t *req, size_t req_len, size_t *p, size_t *start, uint16_t *type, size_t *rdata, size_t *rdlen) {
+    size_t n;
+    *start = *p;
+    if (skip_wire_name(req, req_len, *p, &n) != 0 || n + 10 > req_len) return false;
+    *type = (uint16_t)((req[n] << 8) | req[n + 1]);
+    *rdlen = (size_t)((req[n + 8] << 8) | req[n + 9]);
+    *rdata = n + 10;
+    if (*rdata + *rdlen > req_len) return false;
+    *p = *rdata + *rdlen;
+    return true;
+}
+
+xfr_shape_t xfr_request_shape(const uint8_t *req, size_t req_len, uint16_t *qtype, size_t *q_end, uint32_t *ixfr_serial) {
+    if (!req || req_len < DNS_HEADER_SIZE) return XFR_SHAPE_SHORT;
+    if (req_len > XFR_REQUEST_MAX_LEN) return XFR_SHAPE_TOO_LONG;
+    /* RFC 5936 §2.1.1: OPCODE 0 and RCODE 0 (a NOTIFY or UPDATE with the question of a transfer is not one) */
+    if (req[2] & 0x80) return XFR_SHAPE_RESPONSE;
+    if (((req[2] >> 3) & 0x0F) != 0) return XFR_SHAPE_OPCODE;
+    if ((req[3] & 0x0F) != 0) return XFR_SHAPE_RCODE;
+    const uint16_t qd = (uint16_t)((req[4] << 8) | req[5]);
+    const uint16_t an = (uint16_t)((req[6] << 8) | req[7]);
+    const uint16_t ns = (uint16_t)((req[8] << 8) | req[9]);
+    const uint16_t ar = (uint16_t)((req[10] << 8) | req[11]);
+    if (qd != 1) return XFR_SHAPE_QDCOUNT;                 /* §2.1.2: exactly one question */
+    size_t p;
+    if (wire_question_name_compressed(req, req_len) || skip_wire_name(req, req_len, DNS_HEADER_SIZE, &p) != 0 || p + 4 > req_len)
+        return XFR_SHAPE_QUESTION;
+    const uint16_t qt = (uint16_t)((req[p] << 8) | req[p + 1]);
+    p += 4;
+    const size_t qend = p;
+    if (qt != 252 && qt != 251) return XFR_SHAPE_QTYPE;
+    if (an != 0) return XFR_SHAPE_ANCOUNT;                 /* §2.1.3 */
+    uint32_t serial = 0;
+    if (qt == 252) {
+        if (ns != 0) return XFR_SHAPE_NSCOUNT;             /* §2.1.4 */
+    } else {
+        /* RFC 1995 §3: the Authority section holds the SOA of the client's version of the zone (one RR) */
+        size_t start, rdata, rdlen;
+        uint16_t type;
+        if (ns != 1) return XFR_SHAPE_NSCOUNT;
+        size_t q = p;
+        if (!xfr_shape_rr(req, req_len, &q, &start, &type, &rdata, &rdlen) || type != 6 ||
+            !ixfr_request_client_serial(req, req_len, p, &serial))
+            return XFR_SHAPE_IXFR_SOA;
+        p = q;
+    }
+    /* RFC 5936 §2.1.5: an OPT RR and a TSIG or SIG(0) RR may be present (RFC 6891 §6.1.1: at most one OPT; RFC 8945 §5.1: the TSIG is the last RR) */
+    unsigned n_opt = 0;
+    for (uint16_t i = 0; i < ar; i++) {
+        size_t start, rdata, rdlen;
+        uint16_t type;
+        if (!xfr_shape_rr(req, req_len, &p, &start, &type, &rdata, &rdlen)) return XFR_SHAPE_ADDITIONAL;
+        if (type == 41) {
+            if (++n_opt > 1 || rdata != start + 11 || req[start] != 0) return XFR_SHAPE_ADDITIONAL;   /* the owner is the root (RFC 6891 §6.1.2) */
+            size_t o = rdata;                              /* the options (code, length, data) fill the RDATA exactly */
+            while (o < rdata + rdlen) {
+                if (o + 4 > rdata + rdlen) return XFR_SHAPE_ADDITIONAL;
+                o += 4 + (size_t)((req[o + 2] << 8) | req[o + 3]);
+                if (o > rdata + rdlen) return XFR_SHAPE_ADDITIONAL;
+            }
+        } else if ((type == 250 || type == 24) && i == (uint16_t)(ar - 1)) {
+            /* the TSIG / SIG(0) of the request: it is verified by the TSIG code, the shape is all that is checked here */
+        } else {
+            return XFR_SHAPE_ADDITIONAL;
+        }
+    }
+    if (p != req_len) return XFR_SHAPE_TRAILING;
+    if (qtype) *qtype = qt;
+    if (q_end) *q_end = qend;
+    if (ixfr_serial) *ixfr_serial = serial;
+    return XFR_SHAPE_OK;
+}
+
 // ============================================================================
 // 高速クエリQuestion部パースヘルパー (UDP/TCP共通)
 // ============================================================================

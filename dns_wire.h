@@ -766,6 +766,34 @@ bool wrap_tinydns_record(const dns_record_t *rec, dns_record_t *out_wrap, uint8_
 // ポインタは前に現れた名前を指せない (RFC 1035 §4.1.4) ので、そのような要求は FORMERR にする。
 bool wire_question_name_compressed(const uint8_t *buf, size_t len);
 
+/* The shape of an AXFR / IXFR request (RFC 5936 §2.1, RFC 1995 §3).  xfr_request_shape() answers XFR_SHAPE_OK for a request a transfer may be started for, else
+ * the first thing wrong with it (a reason for the log, xfr_shape_text(); the request is answered with FORMERR, RFC 5936 §2.2.1 note e).  A request is a transfer
+ * request when: QR=0, OPCODE 0 (QUERY) and RCODE 0 (§2.1.1); exactly one question, complete and not compressed, of type AXFR (252) or IXFR (251); ANCOUNT 0;
+ * NSCOUNT 0 (AXFR) or 1 (IXFR: the SOA of the client's version, RFC 1995 §3, with a serial); the Additional section holds at most one OPT RR (RFC 6891 §6.1.1:
+ * the owner is the root and the options fill the RDATA exactly) and at most one TSIG (RFC 8945 §5.1) or SIG(0) (RFC 2931) RR, which is the last RR
+ * (§2.1.5 allows ARCOUNT 0, 1 or 2); and the counted records end the message (no trailing octets).  The question type, the end of the question and the
+ * IXFR serial are returned when the pointers are not NULL (and the shape is good).  A request longer than XFR_REQUEST_MAX_LEN is not a transfer request: the
+ * TCP dispatch keeps the request for the transfer thread in a buffer of that size. */
+#define XFR_REQUEST_MAX_LEN 4096
+typedef enum {
+    XFR_SHAPE_OK = 0,
+    XFR_SHAPE_SHORT,        /* shorter than a header */
+    XFR_SHAPE_TOO_LONG,     /* longer than XFR_REQUEST_MAX_LEN */
+    XFR_SHAPE_RESPONSE,     /* QR=1 */
+    XFR_SHAPE_OPCODE,       /* OPCODE is not QUERY */
+    XFR_SHAPE_RCODE,        /* RCODE is not 0 */
+    XFR_SHAPE_QDCOUNT,      /* QDCOUNT is not 1 */
+    XFR_SHAPE_QUESTION,     /* the question is cut short, compressed or malformed */
+    XFR_SHAPE_QTYPE,        /* the question is not AXFR or IXFR */
+    XFR_SHAPE_ANCOUNT,      /* ANCOUNT is not 0 */
+    XFR_SHAPE_NSCOUNT,      /* NSCOUNT is not 0 (AXFR) or 1 (IXFR) */
+    XFR_SHAPE_IXFR_SOA,     /* the Authority record of an IXFR is not a SOA with a serial */
+    XFR_SHAPE_ADDITIONAL,   /* a record of the Additional section is malformed or not allowed there (OPT, TSIG, SIG(0) only) */
+    XFR_SHAPE_TRAILING      /* octets after the last counted record */
+} xfr_shape_t;
+xfr_shape_t xfr_request_shape(const uint8_t *req, size_t req_len, uint16_t *qtype, size_t *q_end, uint32_t *ixfr_serial);
+const char *xfr_shape_text(xfr_shape_t s);
+
 // ============================================================================
 // 高速クエリQuestion部パースヘルパー (UDP/TCP共通)
 // 圧縮ポインタを含む名前は不正として false を返す (X-15)

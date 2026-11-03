@@ -908,6 +908,29 @@ static void test_send_axfr_response_ixfr_and_extended(void) {
     assert(g_tcp_out_len > 0);
     assert((g_tcp_out[2 + 3] & 0x0F) == 5);
 
+    // 5. A request that is not shaped like a transfer request (RFC 5936 2.1, RFC 1995 3) is a FORMERR and no transfer, for a zone that is there and for one
+    //    that is not (xfr_request_shape(); the TCP dispatch checks it too, this is the guard of a direct caller): a trailing octet, OPCODE NOTIFY, and a
+    //    QDCOUNT 0 request that has a question after the header (no question is echoed)
+    uint8_t req_bad[520];
+    memcpy(req_bad, req_std, s_off);
+    req_bad[s_off] = 0xAA;
+    for (int with_entry = 0; with_entry < 2; with_entry++) {
+        g_tcp_out_len = 0;
+        g_tcp_send_count = 0;
+        send_axfr_response(-1, "example.com.", req_bad, s_off + 1, NULL, with_entry ? &entry : NULL, NULL, 0, NULL, 0, NULL, false);
+        assert(g_tcp_send_count >= 1 && (g_tcp_out[2 + 3] & 0x0F) == 1 && g_tcp_out[2 + 5] == 1 && g_tcp_out[2 + 7] == 0);
+    }
+    memcpy(req_bad, req_std, s_off);
+    req_bad[2] = 0x20;                 // OPCODE 4 (NOTIFY)
+    g_tcp_out_len = 0;
+    send_axfr_response(-1, "example.com.", req_bad, s_off, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    assert((g_tcp_out[2 + 3] & 0x0F) == 1 && (g_tcp_out[2 + 2] & 0x78) == 0x20);
+    memcpy(req_bad, req_std, s_off);
+    req_bad[5] = 0;                    // QDCOUNT 0
+    g_tcp_out_len = 0;
+    send_axfr_response(-1, "example.com.", req_bad, s_off, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    assert((g_tcp_out[2 + 3] & 0x0F) == 1 && g_tcp_out[2 + 5] == 0 && g_tcp_out_len == 2 + 12);
+
     zone_arena_destroy(test_zone_slot(&entry, 0));
     pthread_mutex_destroy(&entry.writer_lock);
     pthread_mutex_destroy(&entry.ixfr_history.lock);

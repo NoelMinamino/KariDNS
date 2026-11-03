@@ -2920,6 +2920,21 @@ process_tcp_client: ;
             if (entry) xfr_el = NULL;          /* (it came into memory meanwhile: the usual transfer) */
             int xfr_deny = 0;                  /* batch 14: why the request is not served after it was allowed (XD_*, dns_axfr_ixfr.h), for the log */
             uint32_t xfr_deny_limit = 0;
+            /* RFC 5936 §2.1 / RFC 1995 §3: a request that is not shaped like a transfer request (opcode, RCODE, the counts, the IXFR SOA, the Additional
+             * section, trailing octets: xfr_request_shape()) is a FORMERR and no transfer, whatever else is wrong with it.  The place is BIND's: after the TSIG
+             * (a request whose TSIG fails is NOTAUTH / FORMERR above; the FORMERR here is signed when the TSIG is good, RFC 8945 §5.3), the EDNS version and
+             * allow-transfer (BIND's ns_xfr_start() checks the ACL before the IXFR SOA), and before the transfer is started or a zone is read.  So it is seen
+             * only by a client that may transfer this zone: everybody else gets the REFUSED they got before, and the FORMERR tells nothing about a zone. */
+            bool shape_bad = false;
+            if (allowed && (entry || xfr_el)) {
+              const xfr_shape_t shape = xfr_request_shape(msg, msg_len, NULL, NULL, NULL);
+              if (shape != XFR_SHAPE_OK) {
+                shape_bad = true;
+                allowed = false;
+                xfr_deny = XD_BAD_REQUEST;
+                xfr_deny_limit = (uint32_t)shape;
+              }
+            }
             if (allowed && (entry || xfr_el)) {
               /* transfers-out and max-transfer-time-out / max-transfer-idle-out (BIND 9.20), read before the configuration is released */
               uint32_t out_limit = xfr_cfg_limit(cfg, XL_TRANSFERS_OUT);
@@ -3017,6 +3032,7 @@ process_tcp_client: ;
                              xfr_deny_limit);
               uint8_t res_buf[1024];
               uint8_t rcode = 5; /* REFUSED: 方針による拒否 (RFC 1035 §4.1.1、RFC 5936 §5)。AA=0 (R-06) */
+              uint16_t qd_echo = 1;
               int built;
               if (badvers) {
                 built = dns_build_badvers_response(msg, msg_len, res_buf, sizeof(res_buf), 1, &edns, true, cfg);
@@ -3026,11 +3042,14 @@ process_tcp_client: ;
                 } else if (tsig.status == TSIG_REQ_ERROR) {
                   rcode = 9;       /* RFC 8945 §5.2.1-§5.2.4: TSIG のエラーは NOTAUTH */
                   add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Invalid TSIG");
+                } else if (shape_bad) {
+                  rcode = 1;       /* RFC 5936 §2.2.1 note e: a malformed request is a FORMERR */
+                  qd_echo = (msg[4] | msg[5]) ? 1 : 0;   /* (the first question only, and none when the request counts none) */
                 } else {
                   add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Query refused due to access control");
                 }
                 /* 質問セクションまで (Rule 3)。TSIG なしの要求への応答は署名しない (RFC 8945 §5.3) */
-                built = dns_build_error_response(msg, msg_len, res_buf, sizeof(res_buf), rcode, 0, 1,
+                built = dns_build_error_response(msg, msg_len, res_buf, sizeof(res_buf), rcode, 0, qd_echo,
                                                  &edns, true, cfg);
               }
               int signed_len = tsig_finish_response(res_buf, (size_t)built, sizeof(res_buf), &tsig);

@@ -2988,8 +2988,195 @@ static void test_char_string_nul(void) {
     zone_arena_destroy(&a);
 }
 
+/* ------------------------------------------------------------------ xfr_request_shape() (RFC 5936 §2.1, RFC 1995 §3) */
+/* A request is built octet by octet from the RFC layouts (RFC 1035 §4.1: header, question, RRs; RFC 6891 §6.1.2: OPT; RFC 8945 §4.2: TSIG). */
+typedef struct { uint8_t b[8192]; size_t n; } xs_msg_t;
+static void xs_u16(xs_msg_t *m, unsigned v) { m->b[m->n++] = (uint8_t)(v >> 8); m->b[m->n++] = (uint8_t)v; }
+static void xs_hdr(xs_msg_t *m, unsigned flags, unsigned qd, unsigned an, unsigned ns, unsigned ar) {
+    m->n = 0;
+    xs_u16(m, 0x1234); xs_u16(m, flags); xs_u16(m, qd); xs_u16(m, an); xs_u16(m, ns); xs_u16(m, ar);
+}
+static void xs_name(xs_msg_t *m) {      /* example.test. */
+    static const uint8_t nm[] = { 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 4, 't', 'e', 's', 't', 0 };
+    memcpy(m->b + m->n, nm, sizeof(nm)); m->n += sizeof(nm);
+}
+static void xs_question(xs_msg_t *m, unsigned type) { xs_name(m); xs_u16(m, type); xs_u16(m, 1); }
+/* an RR header after the owner name: TYPE CLASS TTL RDLENGTH */
+static void xs_rrfix(xs_msg_t *m, unsigned type, unsigned cls, unsigned rdlen) {
+    xs_u16(m, type); xs_u16(m, cls); xs_u16(m, 0); xs_u16(m, 0); xs_u16(m, rdlen);
+}
+/* the client's SOA of an IXFR: owner example.test., MNAME = pointer to the question name (offset 12), RNAME = "h" + pointer, serial 0x01020304 */
+static void xs_soa(xs_msg_t *m, size_t rdlen_override) {
+    xs_name(m);
+    const size_t rdlen = 2 + 4 + 20;        /* ptr, 1+'h'+ptr, SERIAL REFRESH RETRY EXPIRE MINIMUM */
+    xs_rrfix(m, 6, 1, rdlen_override ? rdlen_override : rdlen);
+    m->b[m->n++] = 0xC0; m->b[m->n++] = 12;
+    m->b[m->n++] = 1; m->b[m->n++] = 'h'; m->b[m->n++] = 0xC0; m->b[m->n++] = 12;
+    xs_u16(m, 0x0102); xs_u16(m, 0x0304);
+    for (int i = 0; i < 16; i++) m->b[m->n++] = 0;
+}
+static void xs_opt(xs_msg_t *m, const uint8_t *opts, size_t olen) {      /* root owner */
+    m->b[m->n++] = 0;
+    xs_rrfix(m, 41, 1232, olen);
+    memcpy(m->b + m->n, opts, olen); m->n += olen;
+}
+static void xs_tsig(xs_msg_t *m) {      /* owner key.test., TYPE 250, CLASS ANY, TTL 0, a short RDATA (the shape check does not read it) */
+    static const uint8_t nm[] = { 3, 'k', 'e', 'y', 4, 't', 'e', 's', 't', 0 };
+    memcpy(m->b + m->n, nm, sizeof(nm)); m->n += sizeof(nm);
+    xs_rrfix(m, 250, 255, 4);
+    for (int i = 0; i < 4; i++) m->b[m->n++] = 0;
+}
+static void xs_set_ar(xs_msg_t *m, unsigned ar) { m->b[10] = (uint8_t)(ar >> 8); m->b[11] = (uint8_t)ar; }
+
+#define XS_EXPECT(m, want) do { CHECK(xfr_request_shape((m).b, (m).n, NULL, NULL, NULL) == (want)); } while (0)
+
+static void test_xfr_request_shape(void) {
+    printf("[TEST] xfr_request_shape(): the shape of an AXFR / IXFR request...\n");
+    static const uint8_t cookie[] = { 0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8 };      /* RFC 7873 COOKIE, 8 octets */
+    xs_msg_t m;
+    memset(&m, 0, sizeof(m));
+    uint16_t qt = 0;
+    size_t qe = 0;
+    uint32_t serial = 0;
+
+    /* good requests */
+    xs_hdr(&m, 0x0000, 1, 0, 0, 0); xs_question(&m, 252);
+    CHECK(xfr_request_shape(m.b, m.n, &qt, &qe, &serial) == XFR_SHAPE_OK && qt == 252 && qe == m.n && serial == 0);
+    xs_hdr(&m, 0x0100, 1, 0, 0, 1); xs_question(&m, 252); xs_opt(&m, NULL, 0);                      /* RD and an empty OPT */
+    XS_EXPECT(m, XFR_SHAPE_OK);
+    xs_hdr(&m, 0x0000, 1, 0, 0, 1); xs_question(&m, 252); xs_opt(&m, cookie, sizeof(cookie));
+    XS_EXPECT(m, XFR_SHAPE_OK);
+    xs_hdr(&m, 0x0000, 1, 0, 0, 1); xs_question(&m, 252); xs_tsig(&m);
+    XS_EXPECT(m, XFR_SHAPE_OK);
+    xs_hdr(&m, 0x0000, 1, 0, 0, 2); xs_question(&m, 252); xs_opt(&m, cookie, sizeof(cookie)); xs_tsig(&m);
+    XS_EXPECT(m, XFR_SHAPE_OK);
+    xs_hdr(&m, 0x0000, 1, 0, 0, 2); xs_question(&m, 252); xs_opt(&m, NULL, 0);                      /* SIG(0): TYPE 24, last */
+    m.b[m.n++] = 0; xs_rrfix(&m, 24, 255, 0);
+    XS_EXPECT(m, XFR_SHAPE_OK);
+    xs_hdr(&m, 0x0000, 1, 0, 1, 0); xs_question(&m, 251); xs_soa(&m, 0);
+    qe = 0;
+    CHECK(xfr_request_shape(m.b, m.n, &qt, &qe, &serial) == XFR_SHAPE_OK && qt == 251 && qe == 12 + 14 + 4 && serial == 0x01020304u);
+    xs_hdr(&m, 0x0000, 1, 0, 1, 2); xs_question(&m, 251); xs_soa(&m, 0); xs_opt(&m, cookie, sizeof(cookie)); xs_tsig(&m);
+    XS_EXPECT(m, XFR_SHAPE_OK);
+    /* the Z / AD / CD / RD bits and the TC / AA bits are not part of the shape */
+    xs_hdr(&m, 0x0770, 1, 0, 0, 0); xs_question(&m, 252);
+    XS_EXPECT(m, XFR_SHAPE_OK);
+
+    /* the header */
+    CHECK(xfr_request_shape(NULL, 12, NULL, NULL, NULL) == XFR_SHAPE_SHORT);
+    xs_hdr(&m, 0x0000, 1, 0, 0, 0); xs_question(&m, 252);
+    CHECK(xfr_request_shape(m.b, 11, NULL, NULL, NULL) == XFR_SHAPE_SHORT);
+    xs_hdr(&m, 0x8000, 1, 0, 0, 0); xs_question(&m, 252); XS_EXPECT(m, XFR_SHAPE_RESPONSE);
+    xs_hdr(&m, 0x2000, 1, 0, 0, 0); xs_question(&m, 252); XS_EXPECT(m, XFR_SHAPE_OPCODE);          /* NOTIFY */
+    xs_hdr(&m, 0x2800, 1, 0, 0, 0); xs_question(&m, 252); XS_EXPECT(m, XFR_SHAPE_OPCODE);          /* UPDATE */
+    xs_hdr(&m, 0x0800, 1, 0, 0, 0); xs_question(&m, 252); XS_EXPECT(m, XFR_SHAPE_OPCODE);          /* IQUERY */
+    xs_hdr(&m, 0x0001, 1, 0, 0, 0); xs_question(&m, 252); XS_EXPECT(m, XFR_SHAPE_RCODE);
+    xs_hdr(&m, 0x000F, 1, 0, 0, 0); xs_question(&m, 252); XS_EXPECT(m, XFR_SHAPE_RCODE);
+    xs_hdr(&m, 0x0000, 1, 0, 0, 0); xs_question(&m, 252); m.n = 4096;
+    XS_EXPECT(m, XFR_SHAPE_TRAILING);                                                               /* the largest accepted length */
+    m.n = 4097;
+    XS_EXPECT(m, XFR_SHAPE_TOO_LONG);
+    m.n = 6000;
+    XS_EXPECT(m, XFR_SHAPE_TOO_LONG);
+
+    /* the question */
+    xs_hdr(&m, 0x0000, 0, 0, 0, 0); xs_question(&m, 252); XS_EXPECT(m, XFR_SHAPE_QDCOUNT);         /* QDCOUNT 0, a question after the header */
+    xs_hdr(&m, 0x0000, 0, 0, 0, 0); XS_EXPECT(m, XFR_SHAPE_QDCOUNT);                               /* RFC 9619 header only */
+    xs_hdr(&m, 0x0000, 2, 0, 0, 0); xs_question(&m, 252); xs_question(&m, 252); XS_EXPECT(m, XFR_SHAPE_QDCOUNT);
+    xs_hdr(&m, 0x0000, 1, 0, 0, 0); xs_question(&m, 252); m.n -= 1; XS_EXPECT(m, XFR_SHAPE_QUESTION);      /* QCLASS cut */
+    xs_hdr(&m, 0x0000, 1, 0, 0, 0); xs_question(&m, 252); m.n -= 4; XS_EXPECT(m, XFR_SHAPE_QUESTION);      /* no QTYPE / QCLASS */
+    xs_hdr(&m, 0x0000, 1, 0, 0, 0); xs_question(&m, 252); m.n = 12 + 5; XS_EXPECT(m, XFR_SHAPE_QUESTION);  /* name cut in a label */
+    xs_hdr(&m, 0x0000, 1, 0, 0, 0); m.b[m.n++] = 0xC0; m.b[m.n++] = 12; xs_u16(&m, 252); xs_u16(&m, 1);   /* a pointer to itself */
+    XS_EXPECT(m, XFR_SHAPE_QUESTION);
+    xs_hdr(&m, 0x0000, 1, 0, 0, 0); m.b[m.n++] = 3; memcpy(m.b + m.n, "foo", 3); m.n += 3; m.b[m.n++] = 0xC0; m.b[m.n++] = 12;
+    xs_u16(&m, 252); xs_u16(&m, 1); XS_EXPECT(m, XFR_SHAPE_QUESTION);                              /* a compressed question name (RFC 1035 §4.1.4) */
+    xs_hdr(&m, 0x0000, 1, 0, 0, 0); m.b[m.n++] = 0x80; m.b[m.n++] = 0; xs_u16(&m, 252); xs_u16(&m, 1);
+    XS_EXPECT(m, XFR_SHAPE_QUESTION);                                                               /* a reserved label type */
+    xs_hdr(&m, 0x0000, 1, 0, 0, 0); xs_question(&m, 1); XS_EXPECT(m, XFR_SHAPE_QTYPE);
+    xs_hdr(&m, 0x0000, 1, 0, 0, 0); xs_question(&m, 255); XS_EXPECT(m, XFR_SHAPE_QTYPE);
+
+    /* the counts of the sections */
+    xs_hdr(&m, 0x0000, 1, 1, 0, 0); xs_question(&m, 252); xs_name(&m); xs_rrfix(&m, 1, 1, 4); xs_u16(&m, 0xC000); xs_u16(&m, 0x0201);
+    XS_EXPECT(m, XFR_SHAPE_ANCOUNT);                                                                /* an Answer record */
+    xs_hdr(&m, 0x0000, 1, 1, 0, 0); xs_question(&m, 252); XS_EXPECT(m, XFR_SHAPE_ANCOUNT);         /* the count alone */
+    xs_hdr(&m, 0x0000, 1, 0, 1, 0); xs_question(&m, 252); xs_soa(&m, 0); XS_EXPECT(m, XFR_SHAPE_NSCOUNT);   /* AXFR with a SOA */
+    xs_hdr(&m, 0x0000, 1, 0, 5, 0); xs_question(&m, 252); XS_EXPECT(m, XFR_SHAPE_NSCOUNT);
+    xs_hdr(&m, 0x0000, 1, 0, 0, 0); xs_question(&m, 251); XS_EXPECT(m, XFR_SHAPE_NSCOUNT);         /* IXFR without its SOA */
+    xs_hdr(&m, 0x0000, 1, 0, 2, 0); xs_question(&m, 251); xs_soa(&m, 0); xs_soa(&m, 0); XS_EXPECT(m, XFR_SHAPE_NSCOUNT);
+    xs_hdr(&m, 0x0000, 1, 0, 5, 0); xs_question(&m, 251); xs_soa(&m, 0); XS_EXPECT(m, XFR_SHAPE_NSCOUNT);  /* NSCOUNT 5, one record */
+    xs_hdr(&m, 0x0000, 1, 1, 1, 0); xs_question(&m, 251); xs_soa(&m, 0); XS_EXPECT(m, XFR_SHAPE_ANCOUNT);
+
+    /* the IXFR Authority record (RFC 1995 §3) */
+    xs_hdr(&m, 0x0000, 1, 0, 1, 0); xs_question(&m, 251); xs_name(&m); xs_rrfix(&m, 2, 1, 2); m.b[m.n++] = 0xC0; m.b[m.n++] = 12;
+    XS_EXPECT(m, XFR_SHAPE_IXFR_SOA);                                                               /* an NS record */
+    xs_hdr(&m, 0x0000, 1, 0, 1, 0); xs_question(&m, 251); xs_soa(&m, 0); m.n -= 10;
+    XS_EXPECT(m, XFR_SHAPE_IXFR_SOA);                                                               /* the RDATA is cut short */
+    xs_hdr(&m, 0x0000, 1, 0, 1, 0); xs_question(&m, 251); xs_soa(&m, 0); m.n -= 21;
+    XS_EXPECT(m, XFR_SHAPE_IXFR_SOA);                                                               /* ... before the serial */
+    xs_hdr(&m, 0x0000, 1, 0, 1, 0); xs_question(&m, 251); xs_soa(&m, 2000);
+    XS_EXPECT(m, XFR_SHAPE_IXFR_SOA);                                                               /* RDLENGTH beyond the message */
+    xs_hdr(&m, 0x0000, 1, 0, 1, 0); xs_question(&m, 251); xs_soa(&m, 5);
+    XS_EXPECT(m, XFR_SHAPE_IXFR_SOA);                                                               /* RDLENGTH too small for the serial */
+    xs_hdr(&m, 0x0000, 1, 0, 1, 0); xs_question(&m, 251); m.b[m.n++] = 0xC0; m.b[m.n++] = 0xFF;    /* a pointer past the end of the message */
+    xs_rrfix(&m, 6, 1, 0);
+    XS_EXPECT(m, XFR_SHAPE_IXFR_SOA);
+
+    /* the Additional section: OPT (RFC 6891 §6.1.1, §6.1.2), TSIG last (RFC 8945 §5.1) */
+    xs_hdr(&m, 0x0000, 1, 0, 0, 1); xs_question(&m, 252); XS_EXPECT(m, XFR_SHAPE_ADDITIONAL);       /* counted, not there */
+    xs_hdr(&m, 0x0000, 1, 0, 0, 2); xs_question(&m, 252); xs_opt(&m, NULL, 0); XS_EXPECT(m, XFR_SHAPE_ADDITIONAL);
+    xs_hdr(&m, 0x0000, 1, 0, 0, 2); xs_question(&m, 252); xs_opt(&m, NULL, 0); xs_opt(&m, NULL, 0);
+    XS_EXPECT(m, XFR_SHAPE_ADDITIONAL);                                                             /* two OPT RRs */
+    xs_hdr(&m, 0x0000, 1, 0, 0, 1); xs_question(&m, 252); m.b[m.n++] = 1; m.b[m.n++] = 'x'; m.b[m.n++] = 0; xs_rrfix(&m, 41, 1232, 0);
+    XS_EXPECT(m, XFR_SHAPE_ADDITIONAL);                                                             /* the OPT owner is not the root */
+    xs_hdr(&m, 0x0000, 1, 0, 0, 1); xs_question(&m, 252); m.b[m.n++] = 0xC0; m.b[m.n++] = 12; xs_rrfix(&m, 41, 1232, 0);
+    XS_EXPECT(m, XFR_SHAPE_ADDITIONAL);                                                             /* ... a pointer is not the root either */
+    {
+        static const uint8_t over[] = { 0, 10, 0, 20, 1, 2, 3, 4 };                                 /* option length 20, 4 octets there */
+        static const uint8_t half[] = { 0, 10, 0, 0, 0, 10, 0 };                                    /* a whole option and 3 octets of the next header */
+        static const uint8_t exact[] = { 0, 3, 0, 0, 0, 4, 0, 1, 'a' };                             /* option 3 (empty), option 4 (1 octet) */
+        xs_hdr(&m, 0x0000, 1, 0, 0, 1); xs_question(&m, 252); xs_opt(&m, over, sizeof(over)); XS_EXPECT(m, XFR_SHAPE_ADDITIONAL);
+        xs_hdr(&m, 0x0000, 1, 0, 0, 1); xs_question(&m, 252); xs_opt(&m, half, sizeof(half)); XS_EXPECT(m, XFR_SHAPE_ADDITIONAL);
+        xs_hdr(&m, 0x0000, 1, 0, 0, 1); xs_question(&m, 252); xs_opt(&m, exact, sizeof(exact)); XS_EXPECT(m, XFR_SHAPE_OK);
+    }
+    xs_hdr(&m, 0x0000, 1, 0, 0, 2); xs_question(&m, 252); xs_tsig(&m); xs_opt(&m, NULL, 0);
+    XS_EXPECT(m, XFR_SHAPE_ADDITIONAL);                                                             /* the TSIG is not the last RR */
+    xs_hdr(&m, 0x0000, 1, 0, 0, 2); xs_question(&m, 252); xs_tsig(&m); xs_tsig(&m);
+    XS_EXPECT(m, XFR_SHAPE_ADDITIONAL);                                                             /* two TSIG RRs */
+    xs_hdr(&m, 0x0000, 1, 0, 0, 1); xs_question(&m, 252); xs_name(&m); xs_rrfix(&m, 1, 1, 4); xs_u16(&m, 0xC000); xs_u16(&m, 0x0201);
+    XS_EXPECT(m, XFR_SHAPE_ADDITIONAL);                                                             /* an A record is not allowed there */
+    xs_hdr(&m, 0x0000, 1, 0, 0, 3); xs_question(&m, 252); xs_opt(&m, NULL, 0); xs_tsig(&m); xs_tsig(&m);
+    XS_EXPECT(m, XFR_SHAPE_ADDITIONAL);                                                             /* ARCOUNT 3 */
+    xs_hdr(&m, 0x0000, 1, 0, 0, 1); xs_question(&m, 252); xs_tsig(&m); m.n -= 2;
+    XS_EXPECT(m, XFR_SHAPE_ADDITIONAL);                                                             /* the RDATA is cut short */
+    xs_hdr(&m, 0x0000, 1, 0, 0, 1); xs_question(&m, 252); { size_t at = m.n; m.b[m.n++] = 0xC0; m.b[m.n++] = (uint8_t)at; }   /* a name pointing at itself */
+    xs_rrfix(&m, 250, 255, 0);
+    XS_EXPECT(m, XFR_SHAPE_ADDITIONAL);
+    xs_hdr(&m, 0x0000, 1, 0, 0, 65535); xs_question(&m, 252); XS_EXPECT(m, XFR_SHAPE_ADDITIONAL);  /* an absurd count ends at the first missing RR */
+
+    /* octets after the last counted record */
+    xs_hdr(&m, 0x0000, 1, 0, 0, 0); xs_question(&m, 252); m.b[m.n++] = 0;
+    XS_EXPECT(m, XFR_SHAPE_TRAILING);                                                               /* one octet */
+    xs_hdr(&m, 0x0000, 1, 0, 0, 0); xs_question(&m, 252); memset(m.b + m.n, 0xAA, 16); m.n += 16;
+    XS_EXPECT(m, XFR_SHAPE_TRAILING);
+    xs_hdr(&m, 0x0000, 1, 0, 0, 0); xs_question(&m, 252); xs_opt(&m, NULL, 0);                      /* a record that ARCOUNT does not count */
+    XS_EXPECT(m, XFR_SHAPE_TRAILING);
+    xs_hdr(&m, 0x0000, 1, 0, 0, 1); xs_question(&m, 252); xs_opt(&m, NULL, 0); xs_tsig(&m); xs_set_ar(&m, 1);
+    XS_EXPECT(m, XFR_SHAPE_TRAILING);
+    xs_hdr(&m, 0x0000, 1, 0, 1, 0); xs_question(&m, 251); xs_soa(&m, 0); m.b[m.n++] = 0;
+    XS_EXPECT(m, XFR_SHAPE_TRAILING);                                                               /* an IXFR with a trailing octet */
+
+    /* the reason texts */
+    for (int s = XFR_SHAPE_OK; s <= XFR_SHAPE_TRAILING; s++) {
+        const char *t = xfr_shape_text((xfr_shape_t)s);
+        CHECK(t != NULL && t[0] != '\0');
+        for (int u = s + 1; u <= XFR_SHAPE_TRAILING; u++) CHECK(strcmp(t, xfr_shape_text((xfr_shape_t)u)) != 0);
+    }
+    CHECK_STR(xfr_shape_text((xfr_shape_t)99), "malformed request");
+}
+
 int main(void) {
     printf("=== Starting Wire / Utility Helper Tests ===\n");
+    test_xfr_request_shape();
     test_wire_compression_and_rdata_boundaries();
     test_deep_pointer_chains_and_cycles();
     test_type_to_string();

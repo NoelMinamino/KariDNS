@@ -447,8 +447,10 @@ void xfr_log_denied(const char *client_ip, int client_port, const char *zone, ui
       break;
     case XD_NO_THREAD: xfr_log(LOG_LVL_ERROR, client_ip, client_port, zone, "%s request denied: cannot start a thread for the transfer", mn); break;
     case XD_NO_MEMORY: xfr_log(LOG_LVL_ERROR, client_ip, client_port, zone, "%s request denied: out of memory", mn); break;
-    case XD_IXFR_NO_SOA: xfr_log(LOG_LVL_INFO, client_ip, client_port, zone, "bad zone transfer request: IXFR request missing SOA (FORMERR)"); break;
     case XD_UDP_AXFR: xfr_log(LOG_LVL_INFO, client_ip, client_port, zone, "bad zone transfer request: attempted AXFR over UDP (FORMERR)"); break;
+    case XD_BAD_REQUEST:               /* RFC 5936 2.1, RFC 1995 3: the request is not shaped like a transfer request (xfr_request_shape()); `limit` is the reason */
+      xfr_log(LOG_LVL_INFO, client_ip, client_port, zone, "bad zone transfer request: malformed request, %s (FORMERR)", xfr_shape_text((xfr_shape_t)limit));
+      break;
     default: break;
   }
 }
@@ -1927,7 +1929,7 @@ static int axfr_emit_zone_record(axfr_emit_ctx_t *ec, const dns_record_t *rec_it
 }
 
 /* 転送要求への1通だけのエラー応答 (RFC 5936 §2.2: 質問セクションを写し、それで転送を終える)。
- * 質問セクションまでで切り (Rule 3)、要求に OPT があれば OPT と EDE を付け (RFC 6891 §6.1.1)、
+ * 質問セクションまで (要求の QDCOUNT が 0 なら質問なし。最初の1つだけ) で切り (Rule 3)、要求に OPT があれば OPT と EDE を付け (RFC 6891 §6.1.1)、
  * 検証できた TSIG があれば同じ鍵で署名する (RFC 8945 §5.3)。aa は応答の AA ビット。 */
 static void axfr_send_error(int client_fd, const uint8_t *req, uint16_t req_len, uint8_t rcode, bool aa,
                             uint16_t ede_code, const char *ede_text,
@@ -1942,7 +1944,7 @@ static void axfr_send_error(int client_fd, const uint8_t *req, uint16_t req_len,
                                 &req_edns_r) == 0 && req_edns_r.present;
   req_edns_r.ede_count = 0;
   if (edns_ok && ede_code != 0xFFFF) add_ede(&req_edns_r, true, ede_code, ede_text);
-  int built = dns_build_error_response(req, req_len, res_buf, sizeof(res_buf), rcode, 0, 1,
+  int built = dns_build_error_response(req, req_len, res_buf, sizeof(res_buf), rcode, 0, req_len >= DNS_HEADER_SIZE && (req[4] | req[5]) ? 1 : 0,
                                        edns_ok ? &req_edns_r : NULL, true, NULL);
   if (built <= 0) return;
   if (aa) res_buf[2] |= 0x04;
@@ -2173,8 +2175,20 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
                         const struct sockaddr_storage *server_addr, bool has_server_addr) {
   char cip[INET6_ADDRSTRLEN];
   const int cport = xfr_client_text(client_addr, cip, sizeof(cip));
+  /* RFC 5936 §2.1, RFC 1995 §3: a request that is not shaped like a transfer request is answered with FORMERR and no transfer.  The TCP dispatch has
+   * checked it already; this keeps a direct caller from reading a question or a serial the request does not have. */
+  uint16_t qtype = 0;
+  size_t q_offset = 0;
+  uint32_t client_serial = 0;
+  const xfr_shape_t shape = xfr_request_shape(req, req_len, &qtype, &q_offset, &client_serial);
+  if (shape != XFR_SHAPE_OK) {
+    xfr_log_denied(cip, cport, entry ? entry->domain : qname, 252, XD_BAD_REQUEST, (uint32_t)shape);
+    axfr_send_error(client_fd, req, req_len, 1, false, 0xFFFF, NULL, tsig_key, req_mac, req_mac_len,
+                    client_addr, client_len, server_addr, has_server_addr);
+    return;
+  }
   if (!entry) {
-    xfr_log_denied(cip, cport, qname, 252, XD_NOZONE, 0);
+    xfr_log_denied(cip, cport, qname, qtype, XD_NOZONE, 0);
     /* 権威を持たないゾーンへの転送要求: REFUSED、AA=0 (R-06) */
     axfr_send_error(client_fd, req, req_len, 5, false, 0xFFFF, NULL, tsig_key, req_mac, req_mac_len,
                     client_addr, client_len, server_addr, has_server_addr);
@@ -2198,30 +2212,10 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
   if (!res) {
     return;
   }
-  size_t q_offset = DNS_HEADER_SIZE;
-  if (skip_wire_name(req, req_len, q_offset, &q_offset) != 0) {
-      free(res);
-      return;
-  }
-  if (q_offset + 4 > req_len) {
-    q_offset = req_len;
-  } else {
-    q_offset += 4;
-  }
-  uint16_t qtype = (q_offset >= 4) ? ((req[q_offset - 4] << 8) | req[q_offset - 3]) : 0;
   bool is_ixfr = (qtype == 251);
   const bool ixfr_asked = is_ixfr;        /* (is_ixfr says "answer incrementally" below, and goes false for an AXFR-style answer) */
-  uint32_t client_serial = 0;
-  /* RFC 1995 §3: IXFR 要求の Authority にはクライアントの版の SOA がある。無ければ FORMERR
-   * (BIND も "IXFR request missing SOA" で FORMERR)。 */
-  bool has_client_soa = is_ixfr && ixfr_request_client_serial(req, req_len, q_offset, &client_serial);
-  if (is_ixfr && !has_client_soa) {
-    xfr_log_denied(cip, cport, entry->domain, 251, XD_IXFR_NO_SOA, 0);
-    free(res);
-    axfr_send_error(client_fd, req, req_len, 1, false, 0xFFFF, NULL, tsig_key, req_mac, req_mac_len,
-                    client_addr, client_len, server_addr, has_server_addr);
-    return;
-  }
+  /* (RFC 1995 §3: an IXFR request has the SOA of the client's version in its Authority section; client_serial is its serial, checked by
+   * xfr_request_shape() above, which answers FORMERR for a request without one, as BIND does with "IXFR request missing SOA") */
   uint16_t req_qd = (req[4] << 8) | req[5];
   uint16_t req_an = (req[6] << 8) | req[7];
   uint16_t req_ns = (req[8] << 8) | req[9];
@@ -2564,14 +2558,14 @@ static bool axfr_send_up_to_date_from_apex(const axfr_worker_args_t *a, tsig_key
   if (a->qtype != 251 || !a->elem) return false;
   const zdir_apex_t *ap = atomic_load_explicit(&a->elem->apex, memory_order_acquire);
   if (!ap || ap->serial != zdir_serial(a->elem)) return false;
-  size_t q_offset;
-  if (skip_wire_name(a->req, a->req_len, DNS_HEADER_SIZE, &q_offset) != 0 || q_offset + 4 > a->req_len) return false;
-  q_offset += 4;
+  size_t q_offset = 0;
   uint32_t client_serial = 0;
   char cip[INET6_ADDRSTRLEN];
   const int cport = xfr_client_text(&a->client_addr, cip, sizeof(cip));
-  if (!ixfr_request_client_serial(a->req, a->req_len, q_offset, &client_serial)) {
-    xfr_log_denied(cip, cport, a->elem->name, 251, XD_IXFR_NO_SOA, 0);
+  /* RFC 5936 §2.1, RFC 1995 §3: a request that is not shaped like an IXFR request (no client SOA among them) is a FORMERR, as for a zone in memory */
+  const xfr_shape_t shape = xfr_request_shape(a->req, a->req_len, NULL, &q_offset, &client_serial);
+  if (shape != XFR_SHAPE_OK) {
+    xfr_log_denied(cip, cport, a->elem->name, 251, XD_BAD_REQUEST, (uint32_t)shape);
     axfr_send_error(a->client_fd, a->req, a->req_len, 1, false, 0xFFFF, NULL, tsig_key, a->tsig_mac, a->tsig_mac_len, &a->client_addr, a->client_len,
                     &a->server_addr, a->has_server_addr);
     return true;

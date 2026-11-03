@@ -3581,14 +3581,16 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         add_ede(&edns, send_ede, 18, "Query refused due to access control");
         return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
       }
-      const zdir_apex_t *iap = atomic_load_explicit(&not_ready_zone->apex, memory_order_acquire);
-      size_t iq;
+      /* RFC 1995 §3, RFC 5936 §2.1: then the shape of the request, as on TCP (after the ACL, as BIND): a request that is not shaped like an IXFR request, with
+       * no client SOA among the things that make it so, is a FORMERR; cs is the client's serial */
       uint32_t cs = 0;
-      if (iap && skip_wire_name(req, req_len, DNS_HEADER_SIZE, &iq) == 0 && iq + 4 <= req_len) {
-        if (!ixfr_request_client_serial(req, req_len, iq + 4, &cs)) {       /* RFC 1995 3, as the zone in memory */
-          xfr_log_denied(client_ip, qe_client_port(), not_ready_zone->name, 251, XD_IXFR_NO_SOA, 0);
-          return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
-        }
+      const xfr_shape_t shape = xfr_request_shape(req, req_len, NULL, NULL, &cs);
+      if (shape != XFR_SHAPE_OK) {
+        xfr_log_denied(client_ip, qe_client_port(), not_ready_zone->name, 251, XD_BAD_REQUEST, (uint32_t)shape);
+        return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg);
+      }
+      const zdir_apex_t *iap = atomic_load_explicit(&not_ready_zone->apex, memory_order_acquire);
+      if (iap) {
         const size_t alimit = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
         const size_t tsig_limit = tsig ? tsig->res_limit : 0;
         if (tsig) tsig->res_limit = alimit;
@@ -4035,12 +4037,13 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       add_ede(&edns, send_ede, 18, "Query refused due to access control");
       return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
     }
+    /* RFC 1995 §3, RFC 5936 §2.1: then the shape of the request, as on TCP (after the ACL, as BIND): a request that is not shaped like an IXFR request, with no
+     * client SOA among the things that make it so, is a FORMERR */
     uint32_t client_serial = 0;
-
-    /* RFC 1995 §3: クライアントの版の SOA が Authority に無ければ FORMERR (TCP と同じ) */
-    if (!ixfr_request_client_serial(req, req_len, q_offset, &client_serial)) {
-      xfr_log_denied(client_ip, qe_client_port(), db_entry->domain, 251, XD_IXFR_NO_SOA, 0);
-      return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
+    const xfr_shape_t shape = xfr_request_shape(req, req_len, NULL, NULL, &client_serial);
+    if (shape != XFR_SHAPE_OK) {
+      xfr_log_denied(client_ip, qe_client_port(), db_entry->domain, 251, XD_BAD_REQUEST, (uint32_t)shape);
+      return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg);
     }
 
     const zone_image_t *zimg = current_zone->image;
