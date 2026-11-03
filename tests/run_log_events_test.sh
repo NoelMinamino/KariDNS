@@ -153,6 +153,7 @@ $(chan xf "$LG/xfer.log")
 $(chan xfd "$LG/xfer_dbg.log" "debug 1")
 $(chan xf4 "$LG/xfer_dbg4.log" "debug 4")
     category xfer-out { xf; xfd; xf4; };
+    category security { xf; };
 };
 zone "x.test" { type primary; file "$W/x.zone"; allow-update { key upd; }; allow-transfer { 127.0.0.1; }; };
 zone "deny.test" { type primary; file "$W/deny.zone"; allow-transfer { none; }; };
@@ -184,7 +185,7 @@ d x.test IXFR=2 +notcp | grep -q "SOA" && pass "X: IXFR over UDP, up to date" ||
 d x.test AXFR -y "$KEY" >/dev/null
 d key.test AXFR -y "$KEY" | grep -q "Transfer failed" && pass "X: a zone whose key is the ACL" || true
 d deny.test AXFR | grep -qi "refused\|Transfer failed" && pass "X: AXFR denied by allow-transfer" || fail "X: deny"
-has "X: denied: zone transfer ... denied (error)" "$LG/xfer.log" "xfer-out: error: client 127\.0\.0\.1#[0-9]*: zone transfer 'deny\.test/AXFR/IN' denied"
+has "X: denied: zone transfer ... denied (security, error)" "$LG/xfer.log" "security: error: client 127\.0\.0\.1#[0-9]*: zone transfer 'deny\.test/AXFR/IN' denied"
 d deny.test IXFR=1 +notcp | grep -qi "refused\|failed" && pass "X: IXFR over UDP denied by allow-transfer" || fail "X: deny UDP"
 has "X: ... IXFR over UDP" "$LG/xfer.log" "zone transfer 'deny\.test/IXFR/IN' denied"
 d nosuch.test AXFR | grep -qi "refused\|Transfer failed" && pass "X: AXFR of a zone that is not served" || fail "X: nosuch"

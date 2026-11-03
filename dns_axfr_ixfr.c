@@ -431,11 +431,11 @@ static int xfr_client_text(const struct sockaddr_storage *a, char *ip, size_t n)
 void xfr_log_denied(const char *client_ip, int client_port, const char *zone, uint16_t qtype, int why, uint32_t limit) {
   const char *mn = qtype == 251 ? "IXFR" : "AXFR";
   switch (why) {
-    case XD_ACL:                       /* lib/ns/client.c ns_client_checkacl(): "zone transfer 'z/AXFR/IN' denied", ERROR */
+    case XD_ACL:                       /* lib/ns/client.c ns_client_checkacl(): "zone transfer 'z/AXFR/IN' denied", ERROR, category security */
       if (logev_wanted(LOGC_XFER_OUT, LOG_LVL_ERROR)) {
         char zn[300];
         logev_name_text(zone, zn, sizeof(zn));
-        logev_post(LOGC_XFER_OUT, LOG_LVL_ERROR, client_ip, client_port, "zone transfer '%s/%s/IN' denied", zn, mn);
+        logev_post(LOGC_SECURITY, LOG_LVL_ERROR, client_ip, client_port, "zone transfer '%s/%s/IN' denied", zn, mn);
       }
       break;
     case XD_NOZONE: xfr_log(LOG_LVL_INFO, client_ip, client_port, zone, "bad zone transfer request: non-authoritative zone (REFUSED)"); break;

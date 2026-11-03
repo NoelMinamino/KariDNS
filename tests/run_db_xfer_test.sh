@@ -105,6 +105,7 @@ control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
 logging {
     channel xo { file "$T/logs/xfer.log"; severity debug 1; print-category yes; print-severity yes; };
     category xfer-out { xo; };
+    category security { xo; };
 };
 EOF
 }
@@ -147,7 +148,7 @@ D nosuch.test AXFR +nohexdump +noall +answer | grep -v '^;' > "$T/nosuch.out"
 [ "$(issued)" = "$I0" ] && [ "$(xstat waited)" = "$W0" ] && oom b.test && pass "a refused AXFR costs no fetch (issued $I0, waited $W0) and b.test stays out of memory" || fail "fetches: issued $(issued) (was $I0), waited $(xstat waited) (was $W0)"
 D b.test IXFR=1 +nohexdump +noall +answer | grep -v '^;' > "$T/b.out"
 [ ! -s "$T/b.out" ] && [ "$(issued)" = "$I0" ] && oom b.test && pass "... and so does a refused IXFR" || fail "a refused IXFR: issued $(issued), $(head -2 "$T/b.out")"
-lg "xfer-out: error: client 127.0.0.1#[0-9]*: zone transfer 'b.test/AXFR/IN' denied" && lg "zone transfer 'b.test/IXFR/IN' denied" && pass "log: the refused AXFR and IXFR of b.test (xfer-out, error)" || fail "log: no 'denied' line for b.test"
+lg "security: error: client 127.0.0.1#[0-9]*: zone transfer 'b.test/AXFR/IN' denied" && lg "zone transfer 'b.test/IXFR/IN' denied" && pass "log: the refused AXFR and IXFR of b.test (security, error)" || fail "log: no 'denied' line for b.test"
 lg "transfer of 'nosuch.test/IN': bad zone transfer request: non-authoritative zone (REFUSED)" && pass "log: the AXFR of a zone that does not exist" || fail "log: no non-authoritative line"
 
 # AXFR of a.test: waits for the zone, complete
