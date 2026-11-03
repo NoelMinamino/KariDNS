@@ -61,6 +61,19 @@ kari_port() {
     fi
 }
 
+# kari_wait_log LOG PATTERN SECONDS [COUNT] : wait until LOG has COUNT (default 1) lines matching PATTERN (grep basic regex), at
+# most SECONDS.  A LOG that does not exist yet has no line: grep -c prints nothing for it, so the count is taken as 0 (an empty
+# operand of [ -ge ] is "[: : bad number").
+kari_wait_log() {
+    _kwl_i=0
+    while [ "$_kwl_i" -lt $(($3 * 10)) ]; do
+        _kwl_n=$(grep -c -- "$2" "$1" 2>/dev/null)
+        [ "${_kwl_n:-0}" -ge "${4:-1}" ] && return 0
+        sleep 0.1; _kwl_i=$((_kwl_i + 1))
+    done
+    return 1
+}
+
 # kari_test_conf SRC DST PORT SOCKET : copy the server configuration SRC (tests/karidns-test.conf) to DST with the port of
 # its options { } replaced by PORT and a `socket "SOCKET";` added to its control-channel { }.  A control-channel without a
 # socket binds /var/run/karidns/control.sock, and the server unlinks and re-binds that path: tests that run side by side

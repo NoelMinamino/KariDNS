@@ -113,14 +113,6 @@ ${2:-}
 EOF
 }
 
-wait_log() {   # wait_log LOG PATTERN SECONDS [COUNT]
-    i=0; want=${4:-1}
-    while [ $i -lt $(($3 * 10)) ]; do
-        [ "$(grep -c -- "$2" "$1" 2>/dev/null)" -ge "$want" ] && return 0
-        sleep 0.1; i=$((i + 1))
-    done
-    return 1
-}
 loader_pid() { pgrep -P "$SRV" -f 'karidns-dbloader -s 3' | head -1; }
 ans() { $DAG "$@" +short +nohexdump 2>/dev/null; }
 check_ans() {   # check_ans DESCRIPTION EXPECTED QNAME QTYPE
@@ -135,7 +127,7 @@ echo "== startup"
 conf "$T/k.conf"
 "$KARIDNS" -c "$T/k.conf" -f > "$T/srv.log" 2>&1 &
 SRV=$!
-if wait_log "$T/srv.log" "\[DB\] initial load complete" 20; then pass "the startup batch is complete"; else fail "no 'initial load complete' line"; sed 's/^/         /' "$T/srv.log" | tail -20; fi
+if kari_wait_log "$T/srv.log" "\[DB\] initial load complete" 20; then pass "the startup batch is complete"; else fail "no 'initial load complete' line"; sed 's/^/         /' "$T/srv.log" | tail -20; fi
 grep -q "initial load complete: $NZ zone(s) served from the database" "$T/srv.log" && pass "the log counts $NZ zones" || fail "the log does not count $NZ zones"
 grep -q "\[DB\] batch 1 complete: $NZ zone(s) received ($NZ installed, 0 hidden by karidns.conf, 0 rejected)" "$T/srv.log" && pass "batch 1: $NZ installed, none rejected" || fail "the batch line is wrong"
 grep -q "zone 'db1.test.' (view '[_a-z]*'): installed, serial 10" "$T/srv.log" && pass "log: db1.test installed with serial 10" || fail "no install line for db1.test"
@@ -174,7 +166,7 @@ P1=$LP
 kill -9 "$P1"
 [ "$(ans www.db1.test A)" = "192.0.2.10" ] && pass "DB zones keep answering while the loader is down" || fail "no answer without the loader"
 dbst | grep -q "^loader: not connected since" && pass "dbstatus: loader down" || fail "dbstatus does not show the loader down"
-if wait_log "$T/srv.log" "\[DB\] batch 1 complete" 20 2; then pass "the restarted loader delivered a batch"; else fail "no batch from the restarted loader"; fi
+if kari_wait_log "$T/srv.log" "\[DB\] batch 1 complete" 20 2; then pass "the restarted loader delivered a batch"; else fail "no batch from the restarted loader"; fi
 grep -q "loader asked for the inventory: sent $NZ zone(s)" "$T/srv.log" && pass "the Backend's inventory listed the $NZ zones" || { fail "inventory line"; grep "inventory" "$T/srv.log" | sed 's/^/         /'; }
 P2=$(loader_pid)
 [ -n "$P2" ] && [ "$P2" != "$P1" ] && pass "new loader pid $P2" || fail "no new loader process"
@@ -189,7 +181,7 @@ echo "== a configured zone hides a DB zone"
 conf "$T/k.conf" "zone \"shadow.test\" { type primary; file \"$T/shadow_file.zone\"; };"
 OUT=$($KCTL reconfig 2>&1)
 printf '%s\n' "$OUT" | grep -q "^OK" && pass "reconfig: $OUT" || fail "reconfig: $OUT"
-wait_log "$T/srv.log" "zone shadow.test. from the DB is shadowed by the zone in karidns.conf" 5 && pass "log: the DB zone is shadowed" || fail "no shadow warning"
+kari_wait_log "$T/srv.log" "zone shadow.test. from the DB is shadowed by the zone in karidns.conf" 5 && pass "log: the DB zone is shadowed" || fail "no shadow warning"
 check_ans "www.shadow.test A is the file zone's" "192.0.2.99" www.shadow.test A
 dbst shadow.test | grep -q "serial 30, status shadowed" && pass "dbstatus shadow.test: shadowed" || { fail "dbstatus shadow.test"; dbst shadow.test | sed 's/^/         /'; }
 dbst | grep -q "^zones: $NZ in the registry ($((NZ - 1)) served, 1 shadowed by karidns.conf)" && pass "dbstatus: 1 shadowed" || fail "dbstatus shadowed count"
@@ -197,7 +189,7 @@ check_ans "the other DB zones are not affected" "192.0.2.10" www.db1.test A
 conf "$T/k.conf"
 OUT=$($KCTL reconfig 2>&1)
 printf '%s\n' "$OUT" | grep -q "^OK" && pass "reconfig (zone removed): $OUT" || fail "reconfig: $OUT"
-wait_log "$T/srv.log" "zone shadow.test. (view '[_a-z]*') is served from the DB again" 5 && pass "log: the DB zone is back" || fail "no 'served from the DB again' line"
+kari_wait_log "$T/srv.log" "zone shadow.test. (view '[_a-z]*') is served from the DB again" 5 && pass "log: the DB zone is back" || fail "no 'served from the DB again' line"
 check_ans "www.shadow.test A is the DB version again" "192.0.2.77" www.shadow.test A
 dbst shadow.test | grep -q "serial 30, status applied" && pass "dbstatus shadow.test: applied again" || fail "dbstatus shadow.test after the zone is gone"
 
@@ -206,8 +198,8 @@ echo "== a zone the loader cannot read keeps its last good version"
 sqlite3 "$T/db/z.db" "INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) VALUES ((SELECT id FROM domains WHERE name = 'db2.test'), 'bad.db2.test', 'A', 'not.an.ip', 300, 0, 0)"
 P2=$(loader_pid)
 kill -9 "$P2"
-if wait_log "$T/srv.log" "the loader could not read zone 'db2.test.'" 20; then pass "log: the loader reports db2.test"; else fail "no loader error for db2.test"; fi
-wait_log "$T/srv.log" "\[DB\] batch 1 complete" 20 3 || true
+if kari_wait_log "$T/srv.log" "the loader could not read zone 'db2.test.'" 20; then pass "log: the loader reports db2.test"; else fail "no loader error for db2.test"; fi
+kari_wait_log "$T/srv.log" "\[DB\] batch 1 complete" 20 3 || true
 check_ans "www.db2.test A still answers (the last good version)" "192.0.2.20" www.db2.test A
 OUT=$(dbst db2.test)
 printf '%s\n' "$OUT" | grep -q "status rejected (serving the last good version, serial 20), last error: " && pass "dbstatus db2.test: rejected, serving serial 20, with the reason" || { fail "dbstatus db2.test"; printf '%s\n' "$OUT" | sed 's/^/         /'; }
@@ -229,11 +221,11 @@ i=0; while [ $i -lt 100 ]; do [ "$(ans www.zero.test A)" = "192.0.2.40" ] && bre
 check_ans "www.zero.test A is served" "192.0.2.40" www.zero.test A
 ans zero.test SOA | grep -q "^ns1.zero.test. host.zero.test. 0 3600 600 86400 300$" && pass "zero.test is served with SOA serial 0" || fail "zero.test SOA: $(ans zero.test SOA)"
 dbst zero.test | grep -q "serial 0, status applied" && pass "dbstatus zero.test: serial 0, applied" || { fail "dbstatus zero.test"; dbst zero.test | sed 's/^/         /'; }
-wait_log "$T/srv.log" "zone 'zero.test.' (domains.id [0-9]*): the SOA serial is 0" 5 && pass "log: the loader warns about serial 0" || { fail "no serial 0 warning"; tail -5 "$T/srv.log" | sed 's/^/         /'; }
+kari_wait_log "$T/srv.log" "zone 'zero.test.' (domains.id [0-9]*): the SOA serial is 0" 5 && pass "log: the loader warns about serial 0" || { fail "no serial 0 warning"; tail -5 "$T/srv.log" | sed 's/^/         /'; }
 $KCTL reload > "$T/reload1.out" 2>&1
 P4=$(loader_pid)
 kill -9 "$P4"                                   # a new loader compares every zone with the Backend's inventory: same digest, nothing sent
-wait_log "$T/srv.log" "\[DB\] batch [0-9]* complete" 20 5 || true
+kari_wait_log "$T/srv.log" "\[DB\] batch [0-9]* complete" 20 5 || true
 sleep 1
 [ "$(grep -c "zone 'zero.test.' (domains.id [0-9]*): the SOA serial is 0" "$T/srv.log")" -eq 1 ] && pass "the warning appears once: not on a reload of the unchanged zone, nor after a loader restart" || { fail "the serial 0 warning was logged $(grep -c "the SOA serial is 0" "$T/srv.log") times"; }
 check_ans "www.zero.test A is still served" "192.0.2.40" www.zero.test A
@@ -255,7 +247,7 @@ conf "$T/k4.conf" "zone \"shadow.test\" { type primary; file \"$T/shadow_file.zo
 sed 's/loader-path "\([^"]*\)";/loader-path "\1"; ingest-threads 4;/' "$T/k4.conf" > "$T/k4t.conf"
 "$KARIDNS" -c "$T/k4t.conf" -f > "$T/srv4.log" 2>&1 &
 SRV=$!
-if wait_log "$T/srv4.log" "\[DB\] initial load complete" 20; then pass "the startup batch is complete with 4 builder threads"; else fail "no startup batch with ingest-threads 4"; sed 's/^/         /' "$T/srv4.log" | tail -10; fi
+if kari_wait_log "$T/srv4.log" "\[DB\] initial load complete" 20; then pass "the startup batch is complete with 4 builder threads"; else fail "no startup batch with ingest-threads 4"; sed 's/^/         /' "$T/srv4.log" | tail -10; fi
 grep -q "4 builder thread(s) for the zones of the database" "$T/srv4.log" && pass "log: 4 builder threads" || fail "no builder thread line"
 grep -q "batch 1 complete: $NZ zone(s) received ($((NZ - 1)) installed, 1 hidden by karidns.conf, 0 rejected)" "$T/srv4.log" && pass "batch 1: $((NZ - 1)) installed by the builders, 1 hidden by the configured zone" || { fail "the batch line is wrong with builders"; grep "batch 1 complete" "$T/srv4.log" | sed 's/^/         /'; }
 grep -q "zone 'shadow.test.' (view '[_a-z]*'): loaded, but hidden by the zone in karidns.conf" "$T/srv4.log" && pass "log: the DB zone that arrives behind a configured zone is hidden" || fail "no 'hidden' line for shadow.test"

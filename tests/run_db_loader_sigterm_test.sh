@@ -47,14 +47,6 @@ pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
 PORT=$(kari_port 0 $((20000 + $$ % 20000)))
 now_ms() { perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1000'; }
-wait_log() {   # wait_log LOG PATTERN SECONDS [COUNT]
-    i=0; want=${4:-1}
-    while [ $i -lt $(($3 * 10)) ]; do
-        [ "$(grep -c -- "$2" "$1" 2>/dev/null)" -ge "$want" ] && return 0
-        sleep 0.1; i=$((i + 1))
-    done
-    return 1
-}
 
 mkdir "$T/db"
 t0=$(now_ms)
@@ -75,7 +67,7 @@ EOC
     : > "$T/srv$LT.log"
     "$KARIDNS" -c "$T/k.conf" -f > "$T/srv$LT.log" 2>&1 < /dev/null &
     SRV=$!
-    if wait_log "$T/srv$LT.log" "initial load complete" 300; then pass "the first load is complete"; else fail "no 'initial load complete'"; stop_srv; continue; fi
+    if kari_wait_log "$T/srv$LT.log" "initial load complete" 300; then pass "the first load is complete"; else fail "no 'initial load complete'"; stop_srv; continue; fi
     old=$(pgrep -P "$SRV" -x karidns-dbloader | head -1)
     kill -KILL "$old" 2>/dev/null
     # the supervisor starts a new loader after 1 s; it asks for the inventory and then reads every zone to compare it
@@ -86,7 +78,7 @@ EOC
         new=""; sleep 0.1; n=$((n + 1))
     done
     if [ -z "$new" ]; then fail "no new loader after kill -9"; stop_srv; continue; fi
-    if ! wait_log "$T/srv$LT.log" "inventory received" 20 2; then fail "the new loader did not ask for the inventory"; stop_srv; continue; fi
+    if ! kari_wait_log "$T/srv$LT.log" "inventory received" 20 2; then fail "the new loader did not ask for the inventory"; stop_srv; continue; fi
     sleep 0.5
     if [ "$(grep -c '(startup) sent' "$T/srv$LT.log")" -ge 2 ]; then
         fail "the reconciliation was already finished before the signal: too small a database for this machine (raise ZONES)"

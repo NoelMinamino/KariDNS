@@ -1076,9 +1076,18 @@ static void query_log_class_type(uint16_t qclass, uint16_t qtype, char *class_st
     *type_str = format_type_name(qtype, type_buf, type_sz);
 }
 
+#ifdef KARIDNS_UNIT_TEST
+/* The unit tests stop the logger threads and the control thread with this flag and join them.  They used pthread_cancel(), which ThreadSanitizer does
+ * not support: the cancelled thread is never finished in its thread registry, and pthread_join() waits for ever. */
+_Atomic bool g_test_threads_stop;
+#define TEST_THREADS_STOPPING() atomic_load_explicit(&g_test_threads_stop, memory_order_acquire)
+#else
+#define TEST_THREADS_STOPPING() false
+#endif
+
 void *response_logger_thread_func(void *arg) {
     (void)arg;
-    while (1) {
+    while (!TEST_THREADS_STOPPING()) {
         uint64_t h = atomic_load_explicit(&g_resp_log_head, memory_order_relaxed);
         uint32_t idx = h & (RESP_LOG_RING_SIZE - 1);
 
@@ -1254,7 +1263,7 @@ void *query_logger_thread_func(void *arg) {
     uint64_t last_reported_dropped = 0;
     uint64_t last_reported_ev_dropped = 0;
 
-    while (1) {
+    while (!TEST_THREADS_STOPPING()) {
         rcu_slot_reader_enter(&g_query_logger_rcu_ctx);
         server_config_t *cfg = acquire_config_snapshot();
         bool enabled = cfg && cfg->logging.queries_enabled;
@@ -3895,7 +3904,7 @@ void *control_thread_func(void *arg) {
     usleep(1000);
 
   struct kevent ev_list[4];
-  while (1) {
+  while (!TEST_THREADS_STOPPING()) {   /* (the timer above wakes the loop every second) */
     int n = kevent(kq, NULL, 0, ev_list, 4, NULL);
     if (n < 0) {
       if (errno == EINTR)
@@ -4625,6 +4634,7 @@ void *control_thread_func(void *arg) {
       }
     }
   }
+  atomic_store_explicit(&g_control_kq, -1, memory_order_release);   /* (the workers trigger events on it: not on a closed, reused descriptor) */
   close(kq);
   pthread_exit(NULL);
 }

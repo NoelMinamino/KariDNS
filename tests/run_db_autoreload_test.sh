@@ -129,15 +129,7 @@ start_server() {   # start_server CONF
     : > "$LOG"
     "$KARIDNS" -c "$1" -f > "$LOG" 2>&1 &
     SRV=$!
-    if wait_log "$LOG" "\[DB\] initial load complete" 30; then pass "the startup batch is complete"; else fail "no 'initial load complete' line"; sed 's/^/         /' "$LOG" | tail -20; fi
-}
-wait_log() {   # wait_log LOG PATTERN SECONDS [COUNT]
-    i=0; want=${4:-1}
-    while [ $i -lt $(($3 * 10)) ]; do
-        [ "$(grep -c -- "$2" "$1" 2>/dev/null)" -ge "$want" ] && return 0
-        sleep 0.1; i=$((i + 1))
-    done
-    return 1
+    if kari_wait_log "$LOG" "\[DB\] initial load complete" 30; then pass "the startup batch is complete"; else fail "no 'initial load complete' line"; sed 's/^/         /' "$LOG" | tail -20; fi
 }
 msnow() { echo $(( $(date +%s%N) / 1000000 )); }
 SRCB=""
@@ -206,8 +198,8 @@ conf "$T/s1.conf" "$DB" "auto-reload yes; poll-interval 1; coalesce 500;"
 OUT=$($KCTL reconfig 2>&1)
 printf '%s\n' "$OUT" | grep -q "^OK" && pass "reconfig with auto-reload yes: $OUT" || fail "reconfig: '$OUT'"
 if wait_ans www.z1.test 192.0.2.11 8000; then pass "switched on: the edit made while it was off is picked up ($WAIT_MS ms)"; else fail "switched on: the edit of the off period was not picked up"; fi
-wait_log "$LOG" "auto reload is on; checking for changes" 5 && pass "log: auto reload is on; checking for changes" || fail "no 'auto reload is on' line"
-wait_log "$LOG" "\[DB\] batch [0-9]* (auto) sent: 1 zone(s) read, 1 sent, 0 failed in the loader, 0 deleted, 2 unchanged (view " 5 && pass "that batch is an auto batch: 1 read, 1 sent, 2 unchanged" || { fail "auto batch line"; grep "batch" "$LOG" | tail -3 | sed 's/^/         /'; }
+kari_wait_log "$LOG" "auto reload is on; checking for changes" 5 && pass "log: auto reload is on; checking for changes" || fail "no 'auto reload is on' line"
+kari_wait_log "$LOG" "\[DB\] batch [0-9]* (auto) sent: 1 zone(s) read, 1 sent, 0 failed in the loader, 0 deleted, 2 unchanged (view " 5 && pass "that batch is an auto batch: 1 read, 1 sent, 2 unchanged" || { fail "auto batch line"; grep "batch" "$LOG" | tail -3 | sed 's/^/         /'; }
 wait_dbst "^auto reload: on (poll-interval 1 s, coalesce 500 ms), [1-9][0-9]* auto batch(es) since start$" 5 && pass "dbstatus: auto reload: on, with the settings and the auto batch count" || { fail "dbstatus (auto-reload yes)"; dbst | sed 's/^/         /' | head -8; }
 wait_dbst "^  view [^:]*: last poll 20[0-9-]* [0-9:]* UTC, applied change seq [1-9][0-9]*, pending changes 0, last error: none$" 5 && pass "dbstatus: per view last poll, applied change seq, pending changes, last error" || { fail "dbstatus per-view line"; dbst | sed 's/^/         /' | head -8; }
 dbst | grep -q "^last batch: id [0-9]*, kind auto, finished" && pass "dbstatus: the last batch is of kind auto" || { fail "dbstatus last batch kind"; dbst | sed 's/^/         /' | head -8; }
@@ -260,7 +252,7 @@ sq "UPDATE records SET content = '192.0.2.31' WHERE name = 'www.z3.test'"
 latency "poll-interval 3, coalesce 0" www.z3.test 192.0.2.31 4500
 conf "$T/s1.conf" "$DB" "auto-reload no;"
 $KCTL reconfig > /dev/null 2>&1
-wait_log "$LOG" "auto reload is off" 5 && pass "log: auto reload is off" || fail "no 'auto reload is off' line"
+kari_wait_log "$LOG" "auto reload is off" 5 && pass "log: auto reload is off" || fail "no 'auto reload is off' line"
 wait_dbst "^auto reload: off$" 5 && pass "dbstatus: auto reload: off" || fail "dbstatus after switching off"
 B0=$(n_auto)
 sq "UPDATE records SET content = '192.0.2.32' WHERE name = 'www.z3.test'"
@@ -318,7 +310,7 @@ addz "$DB" p1.test 10 192.0.2.10
 addz "$DB" p2.test 20 192.0.2.20
 conf "$T/s3.conf" "$DB" "auto-reload yes; poll-interval 1; coalesce 200;"
 start_server "$T/s3.conf"
-wait_log "$LOG" "auto-reload is on but the database has no karidns_changes table" 5 && pass "warned at the start: no karidns_changes" || fail "no warning about the missing change log"
+kari_wait_log "$LOG" "auto-reload is on but the database has no karidns_changes table" 5 && pass "warned at the start: no karidns_changes" || fail "no warning about the missing change log"
 sq "UPDATE records SET content = replace(content, ' 10 3600', ' 11 3600') WHERE type = 'SOA' AND name = 'p1.test'; UPDATE records SET content = '192.0.2.11' WHERE name = 'www.p1.test'"
 latency "a serial bump without a change log" www.p1.test 192.0.2.11 "$BOUND_MS"
 sleep 0.3
@@ -349,7 +341,7 @@ sq "UPDATE records SET content = '192.0.2.200' WHERE type = 'A' AND name LIKE 'w
 n=1; ok=0
 while [ $n -le 7 ]; do wait_ans "www.g$n.test" 192.0.2.200 8000 && ok=$((ok + 1)); n=$((n + 1)); done
 [ "$ok" = "7" ] && pass "a burst larger than the log: all 7 zones are right" || fail "a burst larger than the log: $ok of 7 zones are right"
-wait_log "$LOG" "rows of the change log after seq [0-9]* were pruned; comparing every zone" 5 && pass "log: the gap in the change log is noticed, every zone is compared" || fail "no 'were pruned' line"
+kari_wait_log "$LOG" "rows of the change log after seq [0-9]* were pruned; comparing every zone" 5 && pass "log: the gap in the change log is noticed, every zone is compared" || fail "no 'were pruned' line"
 
 echo "== S4: the database file is replaced by another file"
 newdb "$T/db/new1.db" ext5

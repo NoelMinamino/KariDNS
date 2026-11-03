@@ -114,7 +114,8 @@ LOG="$T/srv.log"
 wait_log() {   # wait_log LOG PATTERN SECONDS [COUNT]
     i=0; want=${4:-1}
     while [ $i -lt $(($3 * 10)) ]; do
-        [ "$(grep -Ec -- "$2" "$1" 2>/dev/null)" -ge "$want" ] && return 0
+        n=$(grep -Ec -- "$2" "$1" 2>/dev/null)     # (nothing for a missing file)
+        [ "${n:-0}" -ge "$want" ] && return 0
         sleep 0.1; i=$((i + 1))
     done
     return 1

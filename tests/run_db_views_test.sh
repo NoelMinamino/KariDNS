@@ -115,14 +115,6 @@ view "c" { match-clients { 127.0.0.4; }; database-file "$C"; };
 view "n" { match-clients { 127.0.0.5; }; database none; };
 EOF
 }
-wait_log() {   # wait_log LOG PATTERN SECONDS [COUNT]
-    i=0; want=${4:-1}
-    while [ $i -lt $(($3 * 10)) ]; do
-        [ "$(grep -c -- "$2" "$1" 2>/dev/null)" -ge "$want" ] && return 0
-        sleep 0.1; i=$((i + 1))
-    done
-    return 1
-}
 q() {   # q VIEW-ADDRESS NAME: the A answer of www
     ./dag @127.0.0.1 -p $PORT -b "$1" "$2" A +short +nohexdump 2>/dev/null
 }
@@ -142,7 +134,7 @@ reload_all() {   # reload_all DESCRIPTION: karictl reload, wait for the batch re
     NRES=$((NRES + 1))
     OUT=$($KCTL reload 2>&1)
     printf '%s\n' "$OUT" | grep -q "^OK reloaded; DB reload requested" || fail "$1: '$OUT'"
-    wait_log "$T/srv.log" "Backend result for batch" 15 $NRES && pass "$1: the batch is done" || fail "$1: no batch result"
+    kari_wait_log "$T/srv.log" "Backend result for batch" 15 $NRES && pass "$1: the batch is done" || fail "$1: no batch result"
 }
 
 # ================================================================ start
@@ -150,9 +142,9 @@ echo "== startup: threads $THREADS"
 conf "$T/k.conf" "$G"
 "$KARIDNS" -c "$T/k.conf" -f > "$T/srv.log" 2>&1 &
 SRV=$!
-if wait_log "$T/srv.log" "\[DB\] initial load complete" 20; then pass "the startup batch is complete"; else fail "no 'initial load complete' line"; sed 's/^/         /' "$T/srv.log" | tail -20; fi
+if kari_wait_log "$T/srv.log" "\[DB\] initial load complete" 20; then pass "the startup batch is complete"; else fail "no 'initial load complete' line"; sed 's/^/         /' "$T/srv.log" | tail -20; fi
 NRES=1
-wait_log "$T/srv.log" "Backend result for batch 1:" 10 || fail "no result for the startup batch"
+kari_wait_log "$T/srv.log" "Backend result for batch 1:" 10 || fail "no result for the startup batch"
 
 echo "== which view gets which zone"
 expect_views all.test "a b"
@@ -245,8 +237,8 @@ chown nobody "$G2"*; chmod 600 "$G2"*
 conf "$T/k2.conf" "$G2"
 "$KARIDNS" -c "$T/k2.conf" -f > "$T/srv2.log" 2>&1 &
 SRV=$!
-if wait_log "$T/srv2.log" "\[DB\] initial load complete" 20; then pass "the second server's startup batch is complete"; else fail "no 'initial load complete' line (second server)"; fi
-wait_log "$T/srv2.log" "Backend result for batch 1:" 10 || fail "no result for the startup batch (second server)"
+if kari_wait_log "$T/srv2.log" "\[DB\] initial load complete" 20; then pass "the second server's startup batch is complete"; else fail "no 'initial load complete' line (second server)"; fi
+kari_wait_log "$T/srv2.log" "Backend result for batch 1:" 10 || fail "no result for the startup batch (second server)"
 expect_views one.test "a b"
 expect_views two.test "a b"
 [ "$(q 127.0.0.2 www.one.test)" = "192.0.2.1" ] && [ "$(q 127.0.0.3 www.two.test)" = "192.0.2.2" ] && pass "without the mapping table every view answers every zone" || fail "D6 answers"

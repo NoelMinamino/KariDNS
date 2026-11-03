@@ -96,14 +96,6 @@ options {
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
 EOF
 
-wait_log() {   # wait_log LOG PATTERN SECONDS [COUNT]
-    i=0; want=${4:-1}
-    while [ $i -lt $(($3 * 10)) ]; do
-        [ "$(grep -c -- "$2" "$1" 2>/dev/null)" -ge "$want" ] && return 0
-        sleep 0.1; i=$((i + 1))
-    done
-    return 1
-}
 loader_pid() { pgrep -P "$SRV" -f 'karidns-dbloader -s 3' | head -1; }
 q() {   # q ZONE-OWNER [dag options]: the A record, short
     n=$1; shift
@@ -119,7 +111,7 @@ resident_again() {   # the zone is in memory again: evict says OK (and takes it 
 echo "== start"
 "$KARIDNS" -c "$T/k.conf" -f > "$T/srv.log" 2>&1 &
 SRV=$!
-wait_log "$T/srv.log" "\[DB\] initial load complete" 60 && pass "the startup batch is complete" || { fail "no 'initial load complete' line"; sed 's/^/         /' "$T/srv.log" | tail -20; }
+kari_wait_log "$T/srv.log" "\[DB\] initial load complete" 60 && pass "the startup batch is complete" || { fail "no 'initial load complete' line"; sed 's/^/         /' "$T/srv.log" | tail -20; }
 [ "$(q www.a.test)" = "192.0.2.80" ] && [ "$(q www.b.test)" = "192.0.2.80" ] && pass "both zones answer from memory" || fail "the zones do not answer"
 
 echo "== UDP and TCP query for an evicted zone"
@@ -252,7 +244,7 @@ echo "== the loader is killed: a new pair of streams, fetches work again"
 evicted a.test. "a.test is out of memory"
 LP=$(loader_pid)
 kill -9 "$LP"
-wait_log "$T/srv.log" "\[DB\] batch 1 complete" 30 2 && pass "the supervisor started another loader (new startup batch)" || fail "no new startup batch"
+kari_wait_log "$T/srv.log" "\[DB\] batch 1 complete" 30 2 && pass "the supervisor started another loader (new startup batch)" || fail "no new startup batch"
 sleep 1
 # the startup batch of the new loader compares digests: a zone without data in memory is sent again or fetched; either way it answers
 [ "$(q www.a.test)" = "192.0.2.80" ] && pass "a query for the zone that was out of memory is answered by the new loader" || fail "a.test does not answer after the loader restart"

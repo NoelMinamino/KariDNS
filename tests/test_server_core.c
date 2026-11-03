@@ -949,6 +949,13 @@ static bool test_file_has(const char *path, const char *needle) {
     return strstr(buf, needle) != NULL;
 }
 
+/* stop a logger thread or the control thread started by a test (g_test_threads_stop; not pthread_cancel(), which TSan does not support) */
+static void test_stop_thread(pthread_t th) {
+    atomic_store_explicit(&g_test_threads_stop, true, memory_order_release);
+    pthread_join(th, NULL);
+    atomic_store_explicit(&g_test_threads_stop, false, memory_order_release);
+}
+
 // ----------------------------------------------------------------------------
 // 12. Response Logger Background Thread Test
 // ----------------------------------------------------------------------------
@@ -998,8 +1005,7 @@ static void test_response_logger_thread_func(void) {
         usleep(2000);
     }
 
-    pthread_cancel(th);
-    pthread_join(th, NULL);
+    test_stop_thread(th);
 
     atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
     test_retire_runtime(test_rt);
@@ -1079,8 +1085,7 @@ static void test_query_logger_thread_func(void) {
 
     assert(atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed) == false);
 
-    pthread_cancel(th);
-    pthread_join(th, NULL);
+    test_stop_thread(th);
 
     atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
     atomic_store_explicit(&g_worker_ctxs, NULL, memory_order_release);
@@ -1303,8 +1308,7 @@ static void test_event_ring_and_logger(void) {
     /* the ring is nearly full (90%): the event is dropped and counted, the thread goes on */
     atomic_store_explicit(&worker.qlog_ring.tail, 0, memory_order_relaxed);
     atomic_store_explicit(&worker.qlog_ring.head, 0, memory_order_relaxed);
-    pthread_cancel(th);
-    pthread_join(th, NULL);
+    test_stop_thread(th);
     atomic_store_explicit(&g_worker_ctxs, NULL, memory_order_release);
     atomic_store_explicit(&g_worker_count, 0, memory_order_relaxed);
     logev_rate_reset();
@@ -1343,8 +1347,7 @@ static void test_event_ring_and_logger(void) {
     }
     assert(test_file_has(sec_path, "update-security: error: 5 message(s) suppressed by the rate limit of 10 per second\n"));
     logev_set_thread_sink(NULL, NULL);
-    pthread_cancel(th);
-    pthread_join(th, NULL);
+    test_stop_thread(th);
 
     atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
     atomic_store_explicit(&g_worker_ctxs, NULL, memory_order_release);
@@ -1643,8 +1646,7 @@ static void test_control_socket_thread_and_commands(void) {
     }
     close(cfd2);
 
-    pthread_cancel(th);
-    pthread_join(th, NULL);
+    test_stop_thread(th);
     atomic_store(&g_privilege_drop_complete, saved_drop);
 
     close(lfd);
@@ -6555,6 +6557,7 @@ int main(void) {
     test_server_core_feature_case_207();
     test_server_core_feature_case_209();
     test_server_core_feature_case_210();
+    gc_snapshot_wait_idle();   /* (the cleanup threads of the retired snapshots are joined, as the manager does before it forks: no thread leak under TSan) */
     printf("=== All KariDNS Server Core Unit Tests PASSED! ===\n");
     return 0;
 }
