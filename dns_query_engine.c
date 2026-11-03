@@ -3639,7 +3639,9 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     return build_not_ready_response(req, req_len, res, max_res_len, is_tcp, cfg);
   }
 
-  // RFC 9619: QDCOUNT=0 QUERY – no question section, return minimal response.
+  // RFC 9619: QDCOUNT=0 QUERY – no question section.  Only a cookie-only query (RFC 7873 §5.4) is answered NOERROR with the cookies;
+  // any other is a FORMERR without a question, as BIND 9.20 (ns__client_request(): no question and no COOKIE option), with OPT when
+  // the request had one (RFC 6891 §7) and EDE 0 like the FORMERR for QDCOUNT > 1 above.
   if (opcode == 0 && qdcount == 0) {
     if (edns.has_mqtype_query) {
       // RFC 10029 §3.3: MQTYPE-Query option in a query with QDCOUNT=0 MUST be FORMERR.
@@ -3647,24 +3649,25 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       // RFC 6891 §7: オプションに起因する FORMERR には OPT を付ける。
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg);
     }
+    if (!edns.has_cookie) {
+      qe_why("a query without a question and without a COOKIE option (RFC 9619, RFC 7873 5.4)");
+      add_ede(&edns, send_ede, 0, NULL);
+      return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, &edns, is_tcp, cfg); // FORMERR
+    }
     dns_init_response_header(res, req, 0, false); // NOERROR
     res[4] = 0; res[5] = 0; // QDCOUNT=0
     res[6] = 0; res[7] = 0; // ANCOUNT=0
     res[8] = 0; res[9] = 0; // NSCOUNT=0
     uint16_t offset0 = DNS_HEADER_SIZE;
     uint16_t arcount0 = 0;
-    if (edns.present) {
-      if (edns.has_cookie) {
-        // Refresh server cookie for cookie-only probes (RFC 7873 §5.4)
-        if (!generate_server_cookie(cfg, client_ip, edns.client_cookie, edns.server_cookie, (uint32_t)time(NULL))) {
-            edns.server_cookie_len = 0;
-            edns.has_cookie = false;
-        } else {
-            edns.server_cookie_len = 16;
-        }
-      }
-      assemble_edns_opt(res, max_res_len, &offset0, &arcount0, &edns, 0, is_tcp, cfg);
+    // Refresh server cookie for cookie-only probes (RFC 7873 §5.4)
+    if (!generate_server_cookie(cfg, client_ip, edns.client_cookie, edns.server_cookie, (uint32_t)time(NULL))) {
+      edns.server_cookie_len = 0;
+      edns.has_cookie = false;
+    } else {
+      edns.server_cookie_len = 16;
     }
+    assemble_edns_opt(res, max_res_len, &offset0, &arcount0, &edns, 0, is_tcp, cfg);
     res[10] = arcount0 >> 8;
     res[11] = arcount0 & 0xFF;
     return offset0;

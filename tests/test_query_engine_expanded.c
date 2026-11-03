@@ -8345,21 +8345,22 @@ static void test_query_engine_feature_case_219(void) {
 }
 
 static void test_query_engine_feature_case_220(void) {
-    printf("[TEST] Query Engine: RFC 9619 QDCOUNT == 0 (NOERROR) and QDCOUNT > 1 (FORMERR)...\n");
+    printf("[TEST] Query Engine: RFC 9619 QDCOUNT == 0 without COOKIE (FORMERR) and QDCOUNT > 1 (FORMERR)...\n");
     zone_db_snapshot_t snap = {0};
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
     const rate_limit_config_t *rrl_cfg = NULL;
 
-    // 1. RFC 9619: Opcode QUERY (0), QDCOUNT=0 -> NOERROR (0)
+    // 1. Opcode QUERY (0), QDCOUNT=0, no COOKIE -> FORMERR (1), the header only (BIND 9.20)
     uint8_t req[12];
     memset(req, 0, sizeof(req));
     req[0] = 0x11; req[1] = 0x22;
 
     uint8_t res[512];
     int len = process_dns_query(req, sizeof(req), res, sizeof(res), "example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
-    assert(len >= 12);
-    assert((res[3] & 0x0F) == 0); // RFC 9619 NOERROR
+    assert(len == 12);
+    assert((res[3] & 0x0F) == 1); // FORMERR
+    assert(res[5] == 0 && res[11] == 0);
 
     // 2. Opcode QUERY (0), QDCOUNT=2 -> FORMERR (1)
     uint8_t req2[64];
