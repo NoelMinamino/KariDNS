@@ -970,6 +970,103 @@ int main(void) {
             while (wake_next(&k, 100)) {}                                              /* (the reads woke nobody: the keys are for the tests that follow) */
         }
 
+        /* A second WARM_LIST (the loader restarted): the size of a zone of the list is estimated from the zones read since THIS list, not from every zone read since
+         * the Backend started (the counter behind the "loaded=" of dbstatus is cumulative).  Two zones are read for the first list; the first zone of the second list
+         * closes the gate at the high water mark as the first list's would, and the others are dropped.  Divided by every zone ever read (4), the estimate would be a
+         * quarter of a zone and the next zone would be asked for. */
+        {
+            static server_config_t cfgS, cfgU;
+            static const char *const sconf = "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; memory-limit 1024g; }; };\n"
+                                             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n";
+            CHECK(parse_named_conf(sconf, &cfgS) == 0 && parse_named_conf(sconf, &cfgU) == 0);
+            atomic_store_explicit(&g_config_db.active, &cfgS, memory_order_release);
+            for (int i = 0; i < 100 && dbreg_cache_limit() == 0; i++) usleep(50000);
+            CHECK(dbreg_cache_limit() != 0);
+            dbreg_cache_test_pause(true);                                              /* (the manager would take zones out under the tight limit below) */
+            kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+            kdb_enc_u64(&e, 1, 8); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
+            kdb_enc_end(&e);
+            ch_send(a[0], &e);
+            static const char *const wsz[5] = { "ws1.test.", "ws2.test.", "ws3.test.", "ws4.test.", "ws5.test." };
+            for (int i = 0; i < 5; i++) send_dir_zone(a[0], &e, 0, wsz[i], 3, 71001 + i, NULL);
+            kdb_enc_begin(&e, KDB_T_BATCH_END);
+            kdb_enc_u64(&e, 1, 8); kdb_enc_u32(&e, 2, 5); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+            kdb_enc_end(&e);
+            ch_send(a[0], &e);
+            while (ch_next(&mainc, &m, 10000) && m.type != KDB_T_BATCH_RESULT) {}
+            for (int i = 0; i < 100 && !elem_of("default", "ws5.test."); i++) usleep(50000);
+            CHECK(elem_of("default", "ws1.test.") && elem_of("default", "ws5.test."));
+
+            /* the first list: ws1, ws2 */
+            dbreg_cache_stats_t s0, s1;
+            dbreg_cache_stats(&s0);
+            hot_sink_t hs = { a[0], &e };
+            kdb_hotl_t hl;
+            kdb_hotl_init(&hl);
+            CHECK(kdb_hotl_add(&hl, "default", wsz[0]) && kdb_hotl_add(&hl, "default", wsz[1]));
+            CHECK(kdb_hot_encode(&hl, &e, KDB_T_WARM_LIST, 2, 0, KDB_HF_LOADED, 5, hot_sink_emit, &hs) == 0);
+            kdb_hotl_free(&hl);
+            for (int i = 0; i < 2; i++) {
+                CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, wsz[i]) == 0 && m.u.fetch_req.priority == KDB_FETCH_PRIO_WARM);
+                send_zone(f[0], &e, 0, wsz[i], 3, m.u.fetch_req.request_id, 71001 + i);
+                for (int j = 0; j < 100 && !dbreg_lookup_entry("default", wsz[i]); j++) usleep(50000);
+                CHECK(dbreg_lookup_entry("default", wsz[i]) != NULL);
+            }
+            dbreg_cache_stats(&s1);
+            uint64_t dz = (s1.resident + s1.retired - s0.resident - s0.retired) / 2;   /* what a zone of this shape adds */
+            CHECK(dz >= 300);                                                       /* (the margins below are about 100 bytes: the mark is a multiple of 95) */
+            char sbuf[8192];
+            for (int i = 0; i < 100; i++) {                                            /* (the dbstatus line counts when the fetch is completed; it follows the install) */
+                (void)db_ingest_status(NULL, NULL, sbuf, sizeof(sbuf));
+                const char *wl = strstr(sbuf, "\nwarm: ");
+                const char *ld = wl ? strstr(wl, " loaded=") : NULL;
+                if (ld && strtoul(ld + 8, NULL, 10) >= 3) break;
+                usleep(50000);
+            }
+            const char *wl0 = strstr(sbuf, "\nwarm: ");
+            const char *ld0 = wl0 ? strstr(wl0, " loaded=") : NULL;
+            unsigned long loaded0 = ld0 ? strtoul(ld0 + 8, NULL, 10) : 0;
+            CHECK(loaded0 >= 3);
+            const char *dr0 = wl0 ? strstr(wl0, "(memory limit ") : NULL;
+            unsigned long dropped0 = dr0 ? strtoul(dr0 + 14, NULL, 10) : 0;
+
+            /* the second list: ws3, ws4, ws5.  Its first zone is asked for (nothing is known about the size of a zone of this list); the limit is set so that this zone
+             * brings the memory over the high water mark by half a zone */
+            kdb_hotl_init(&hl);
+            CHECK(kdb_hotl_add(&hl, "default", wsz[2]) && kdb_hotl_add(&hl, "default", wsz[3]) && kdb_hotl_add(&hl, "default", wsz[4]));
+            CHECK(kdb_hot_encode(&hl, &e, KDB_T_WARM_LIST, 3, 0, KDB_HF_LOADED, 5, hot_sink_emit, &hs) == 0);
+            kdb_hotl_free(&hl);
+            CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, wsz[2]) == 0 && m.u.fetch_req.priority == KDB_FETCH_PRIO_WARM);
+            uint64_t rid3 = m.u.fetch_req.request_id;
+            uint64_t high = s1.resident + s1.retired + dz + dz / 2;                    /* (the memory after ws3, and half a zone more) */
+            cfgU.database.memory_limit = (high / 95 + 1) * 100;                        /* (the high water mark is lim / 100 * 95: from high to high + 94) */
+            atomic_store_explicit(&g_config_db.active, &cfgU, memory_order_release);
+            for (int i = 0; i < 100 && dbreg_cache_limit() != cfgU.database.memory_limit; i++) usleep(50000);
+            CHECK(dbreg_cache_limit() == cfgU.database.memory_limit);
+            CHECK(!dbreg_cache_over_high(0));                                          /* (ws3 is not in yet) */
+            send_zone(f[0], &e, 0, wsz[2], 3, rid3, 71003);
+            for (int i = 0; i < 100 && !dbreg_lookup_entry("default", wsz[2]); i++) usleep(50000);
+            CHECK(dbreg_lookup_entry("default", wsz[2]) != NULL);
+            CHECK(!dbreg_cache_over_high(0) && dbreg_cache_over_high(dz));              /* (over the mark with one zone more, not with a quarter of one) */
+            CHECK(!dbreg_cache_over_high(dz / 4));
+            char sbuf2[8192];
+            unsigned long dropped1 = dropped0;
+            for (int i = 0; i < 100; i++) {
+                (void)db_ingest_status(NULL, NULL, sbuf2, sizeof(sbuf2));
+                const char *wl = strstr(sbuf2, "\nwarm: ");
+                const char *dr = wl ? strstr(wl, "(memory limit ") : NULL;
+                dropped1 = dr ? strtoul(dr + 14, NULL, 10) : 0;
+                if (dropped1 >= dropped0 + 2) break;
+                usleep(50000);
+            }
+            CHECK(dropped1 == dropped0 + 2);                                            /* ws4 and ws5 were dropped at the mark */
+            CHECK(!ch_next(&fetchc, &m, 500));                                          /* ... not asked for */
+            atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+            for (int i = 0; i < 100 && dbreg_cache_limit() != 0; i++) usleep(50000);
+            dbreg_cache_test_pause(false);
+            while (wake_next(&k, 100)) {}
+        }
+
         /* without memory-limit the Backend does not take a summary in a batch (the loader sends one only after CONFIG dir_only; a loader that does it
          * anyway is told the zone was rejected, and nothing is installed) */
         kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);

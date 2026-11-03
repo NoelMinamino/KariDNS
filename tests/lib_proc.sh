@@ -120,16 +120,24 @@ kari_make() {
     fi
 }
 
+# kari_default_db_drivers : the DB_DRIVERS a test build of karidns-dbloader gets when there is no loader to copy them from: "sqlite3 postgresql" when
+# libpq is installed (pkg-config or pg_config, like the Makefile's DBPG_HAVE; CI builds both), else "sqlite3".  KARIDNS_DB_DRIVERS overrides it.
+# A plain `make karidns-dbloader` builds sqlite3 only, which made every PostgreSQL test SKIP on a host that has libpq and a server.
+kari_default_db_drivers() {
+    if [ -n "${KARIDNS_DB_DRIVERS:-}" ]; then echo "$KARIDNS_DB_DRIVERS"; return 0; fi
+    if { pkg-config --exists libpq || pg_config --version; } >/dev/null 2>&1; then echo "sqlite3 postgresql"; else echo "sqlite3"; fi
+}
+
 # kari_make_dbloader : (re)build karictl and karidns-dbloader and KEEP the drivers of the loader that is there.  A plain make of karidns-dbloader
 # builds the default DB_DRIVERS (sqlite3 only) when a source is newer than the binary, which silently turned the PostgreSQL tests of the same run
-# into SKIPs.  Without a loader yet the default applies.
+# into SKIPs.  Without a loader yet kari_default_db_drivers applies.
 kari_make_dbloader() {
     _kd=""
     [ -x ./karidns-dbloader ] && _kd=$(./karidns-dbloader --drivers 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')
     if [ -n "$_kd" ]; then
         kari_make karictl karidns-dbloader "DB_DRIVERS=$_kd"
     else
-        kari_make karictl karidns-dbloader
+        kari_make karictl karidns-dbloader "DB_DRIVERS=$(kari_default_db_drivers)"
     fi
 }
 
@@ -140,6 +148,6 @@ kari_make_dbloader_tsan() {
     if [ -n "$_kd" ]; then
         kari_make karidns-dbloader-tsan "DB_DRIVERS=$_kd"
     else
-        kari_make karidns-dbloader-tsan
+        kari_make karidns-dbloader-tsan "DB_DRIVERS=$(kari_default_db_drivers)"
     fi
 }

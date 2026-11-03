@@ -22,6 +22,9 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
 
+PGOPTIONS="-c client_min_messages=warning"      # no NOTICE lines ("drop cascades to ...") from the DROP SCHEMA ... CASCADE of the checks (as tests/db/pg_lib.sh)
+export PGOPTIONS
+
 PASS=0; FAILS=0; SKIPS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
