@@ -4151,6 +4151,8 @@ int dns_build_error_response(const uint8_t *req, size_t req_len, uint8_t *res, s
                              uint8_t rcode, uint8_t ext_rcode, uint16_t qd_keep,
                              edns_info_t *edns, bool is_tcp, struct server_config_s *cfg) {
     if (req_len < DNS_HEADER_SIZE || max_res_len < DNS_HEADER_SIZE) return 0;
+    /* a FORMERR for a request whose question section is bad has no OPT (and so no EDE), as BIND's: its parse stops before the OPT (dns_question_section_ok()) */
+    if (rcode == 1 && ext_rcode == 0 && !dns_question_section_ok(req, req_len)) edns = NULL;
     dns_init_response_header(res, req, rcode, false);
     size_t q_end = DNS_HEADER_SIZE;
     for (uint16_t i = 0; i < qd_keep; i++) {
@@ -5077,13 +5079,14 @@ bool wire_question_name_compressed(const uint8_t *buf, size_t len) {
     return false;
 }
 
-uint16_t dns_error_qd_echo(const uint8_t *req, size_t req_len) {
-    if (!req || req_len < DNS_HEADER_SIZE) return 0;
+/* BIND 9.20 getquestions() (lib/dns/message.c) over the question section of req: true when it is good; *n_read is the number of questions read before
+ * the first bad one (all of them when it is good).  The header is there (req_len >= 12). */
+static bool question_section_walk(const uint8_t *req, size_t req_len, uint16_t *n_read) {
     const uint8_t opcode = (req[2] >> 3) & 0x0F;
     const uint16_t qd = (uint16_t)((req[4] << 8) | req[5]);
-    /* dns_message_reply(): a question section only for QUERY and NOTIFY; UPDATE keeps its zone section (it clears from the prerequisites) */
-    if ((opcode != 0 && opcode != 4 && opcode != 5) || qd == 0 || wire_question_name_compressed(req, req_len)) return 0;
-    const bool upd = opcode == 5;                       /* (UPDATE: the zone names read before the bad one) */
+    *n_read = 0;
+    if (qd == 0) return true;
+    if (wire_question_name_compressed(req, req_len)) return false;   /* KariDNS: X-15, RFC 1035 §4.1.4 */
     char first[DNS_NAME_TEXT_SIZE], name[DNS_NAME_TEXT_SIZE];
     uint64_t seen[65536 / 64];                          /* the types asked for the one name (QDCOUNT > 1) */
     uint16_t first_class = 0;
@@ -5091,10 +5094,10 @@ uint16_t dns_error_qd_echo(const uint8_t *req, size_t req_len) {
     for (uint16_t i = 0; i < qd; i++) {
         size_t next;
         char *nb = i == 0 ? first : name;
-        if (expand_wire_name_to_buffer(req, req_len, p, &next, nb, DNS_NAME_TEXT_SIZE) < 0 || next + 4 > req_len) return upd ? i : 0;
+        if (expand_wire_name_to_buffer(req, req_len, p, &next, nb, DNS_NAME_TEXT_SIZE) < 0 || next + 4 > req_len) return false;
         const uint16_t type = (uint16_t)((req[next] << 8) | req[next + 1]);
         const uint16_t cls = (uint16_t)((req[next + 2] << 8) | req[next + 3]);
-        bool ok = !(opcode != 0 && (cls == 254 || cls == 255));   /* getquestions(): NOTIFY and UPDATE ask for no class NONE or ANY */
+        bool ok = !((opcode == 4 || opcode == 5) && (cls == 254 || cls == 255));   /* getquestions(): NOTIFY and UPDATE ask for no class NONE or ANY */
         if (i == 0) {
             first_class = cls;
             if (qd > 1) memset(seen, 0, sizeof(seen));
@@ -5102,11 +5105,27 @@ uint16_t dns_error_qd_echo(const uint8_t *req, size_t req_len) {
             /* getquestions(): one name, one class, and no type twice */
             ok = ok && strcasecmp(first, name) == 0 && cls == first_class && !(seen[type / 64] & (1ULL << (type % 64)));
         }
-        if (!ok) return upd ? i : 0;
+        if (!ok) return false;
         if (qd > 1) seen[type / 64] |= 1ULL << (type % 64);
         p = next + 4;
+        *n_read = (uint16_t)(i + 1);
     }
-    return qd;
+    return true;
+}
+
+bool dns_question_section_ok(const uint8_t *req, size_t req_len) {
+    uint16_t n;
+    return req && req_len >= DNS_HEADER_SIZE && question_section_walk(req, req_len, &n);
+}
+
+uint16_t dns_error_qd_echo(const uint8_t *req, size_t req_len) {
+    if (!req || req_len < DNS_HEADER_SIZE) return 0;
+    const uint8_t opcode = (req[2] >> 3) & 0x0F;
+    /* dns_message_reply(): a question section only for QUERY and NOTIFY; UPDATE keeps its zone section (it clears from the prerequisites) */
+    if (opcode != 0 && opcode != 4 && opcode != 5) return 0;
+    uint16_t n;
+    const bool ok = question_section_walk(req, req_len, &n);
+    return ok || opcode == 5 ? n : 0;                   /* (UPDATE: the zone names read before the bad one) */
 }
 
 /* ---- the shape of an AXFR / IXFR request (dns_wire.h) ---- */

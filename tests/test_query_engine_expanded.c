@@ -2641,14 +2641,15 @@ static void test_query_engine_protocol_qclass_and_edns_branches(void) {
     compress_ctx_init(&comp_ctx);
     const rate_limit_config_t *rrl_cfg = NULL;
 
-    // 1. UDP AXFR (QTYPE=252 on UDP -> FORMERR)
+    // 1. UDP AXFR (QTYPE=252 on UDP): allow-transfer comes first (BIND ns_xfr_start()); without a configuration nobody may transfer -> REFUSED
+    //    (the FORMERR for a client that may: tests/test_query_engine_protocol.c, tests/run_formerr_bind_compat_test.sh)
     uint8_t qbuf[512];
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0x1111, "qproto.example.", 252 /*AXFR*/, false);
     uint8_t rbuf[4096];
     int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "qproto.example.", 252, "127.0.0.1", &comp_ctx, false /*is_tcp=false*/, &rrl_cfg, &snap);
     assert(rlen >= 12);
-    assert((rbuf[3] & 0x0F) == 1); // FORMERR
+    assert((rbuf[3] & 0x0F) == 5); // REFUSED
 
     // 2. Foreign QCLASS (e.g. QCLASS=4 HS -> REFUSED)
     compress_ctx_init(&comp_ctx);
@@ -4752,10 +4753,11 @@ static void test_query_engine_formerr_truncated_question(void) {
     assert(rlen >= 12);
     assert((rpkt[3] & 0x0F) == 1); // FORMERR
 
-    // 2. Corrupt wire name without terminator -> dropped (-1)
+    // 2. Corrupt wire name without terminator -> FORMERR without a question and without OPT, as BIND (the question section does not parse; it used to
+    //    be dropped)
     uint8_t bad_q2[16] = { 0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 3, 'a', 'b', 'c' };
     int rlen2 = process_dns_query(bad_q2, sizeof(bad_q2), rpkt, sizeof(rpkt), "abc.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &empty_snap);
-    assert(rlen2 == -1 || rlen2 == 0);
+    assert(rlen2 == 12 && (rpkt[3] & 0x0F) == 1 && rpkt[5] == 0 && rpkt[11] == 0);
     printf("  -> truncated question FORMERR passed.\n");
 }
 

@@ -357,10 +357,11 @@ static void test_protocol_anomalies(void) {
     put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 0); q.b[q.n++] = 3; q.b[q.n++] = 'w';
     ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
     CHECK(&r, r.rcode == 1);
-    /* RFC 5936: AXFR has no UDP transport */
+    /* RFC 5936 §4.2: AXFR has no UDP transport; the FORMERR comes after allow-transfer (BIND ns_xfr_start()), which allows nobody here: REFUSED
+     * (the FORMERR for a client that may transfer: the IXFR block below) */
     put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0); put_question(&q, "example.", 252, 1);
     ask(&q, "example.", 252, "192.0.2.100", false, &r);
-    CHECK(&r, r.rcode == 1);
+    CHECK(&r, r.rcode == 5 && r.counts[0] == 0);
 
     /* RFC 1035 opcodes other than QUERY/NOTIFY/UPDATE: IQUERY(1), STATUS(2), unassigned(3,6..15) -> NOTIMP */
     for (int op = 1; op <= 15; op++) {
@@ -403,6 +404,14 @@ static void test_protocol_anomalies(void) {
         CHECK(&r, r.rcode == 0 || r.rcode == 1);
         ask(&q, "example.", 251, "203.0.113.9", false, &r);                            /* not allowed to transfer */
         CHECK(&r, r.rcode == 5 && r.counts[0] == 0 && gr_count(&r, 1, 6) == 0);
+        put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0); put_question(&q, "example.", 252, 1);      /* AXFR over UDP from a client that may transfer: FORMERR */
+        ask(&q, "example.", 252, "192.0.2.100", false, &r);
+        CHECK(&r, r.rcode == 1 && r.counts[0] == 0 && !r.aa);
+        ask(&q, "example.", 252, "203.0.113.9", false, &r);                            /* ... one that may not: REFUSED */
+        CHECK(&r, r.rcode == 5);
+        put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0); put_question(&q, "www.example.", 252, 1);  /* a name inside the zone is no zone: REFUSED */
+        ask(&q, "www.example.", 252, "192.0.2.100", false, &r);
+        CHECK(&r, r.rcode == 5);
         g_gr.cfg = (server_config_t){0};
         free_server_config_fields(icfg); free(icfg);
     }
@@ -1209,12 +1218,18 @@ static void test_response_header_and_error_builder(void) {
     check_hdr(&r, &q, 4, false, true);
     CHECK(&r, r.counts[0] == 0 && r.counts[2] == 1 && gr_ede(&r) == 21);
 
-    /* QDCOUNT > 1 -> FORMERR, OPT kept */
-    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 2, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_question(&q, "ns.example.", 1, 1);
+    /* QDCOUNT > 1 -> FORMERR: two types of one name (a good question section) keep the OPT; two names (a section that does not parse, BIND
+     * answers before the OPT) have none */
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 2, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_question(&q, "www.example.", 28, 1);
     put_opt(&q, 0, 0, 0, NULL, 0);
     ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
     check_hdr(&r, &q, 1, false, true);
     CHECK(&r, gr_count(&r, 3, 41) == 1);
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 2, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_question(&q, "ns.example.", 1, 1);
+    put_opt(&q, 0, 0, 0, NULL, 0);
+    ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 1, false, true);
+    CHECK(&r, gr_count(&r, 3, 41) == 0 && r.counts[2] == 0);
 
     /* RFC 9619 §4: a QUERY with QDCOUNT=0 is not malformed -> NOERROR without a question. A cookie-only query
      * (RFC 7873 §5.4) gets its client cookie back with a server cookie (8 + 16 octets). */
@@ -1247,11 +1262,12 @@ static void test_response_header_and_error_builder(void) {
     CHECK(&r, gr_count(&r, 3, 41) == 1);
     g_gr.cfg.rfc10029_mqtype_enable = false;
 
-    /* RFC 5936: AXFR over UDP -> FORMERR, OPT kept */
+    /* RFC 5936 §4.2: AXFR over UDP from a client allow-transfer refuses (none here) -> REFUSED, AA=0, OPT kept, EDE 18 (the FORMERR comes after the ACL,
+     * as in BIND's ns_xfr_start(): test_protocol_anomalies()) */
     put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 1); put_question(&q, "example.", 252, 1); put_opt(&q, 0, 0, 0, NULL, 0);
     ask(&q, "example.", 252, "192.0.2.100", false, &r);
-    check_hdr(&r, &q, 1, false, true);
-    CHECK(&r, gr_count(&r, 3, 41) == 1);
+    check_hdr(&r, &q, 5, false, true);
+    CHECK(&r, gr_count(&r, 3, 41) == 1 && gr_ede(&r) == 18);
 
     /* Foreign class -> REFUSED, AA=0 */
     put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 1, 0, 0, 0); put_question(&q, "www.example.", 1, 4);

@@ -12,7 +12,7 @@
 #   --edns-version V        (OPT with this version; default: no OPT)
 #   --key NAME:BASE64       (sign with hmac-sha256, RFC 8945 §4.3; verify the answer)
 #   --hex HEX               (send this packet as is, instead of building one)
-#   --count N               (UDP: send N queries back to back, one line each)
+#   --count N               (send N queries back to back, one line each: UDP from one socket, TCP over one connection)
 #   A malformed request (tests/run_xfr_request_shape_test.sh): each option changes one thing of the request; the TSIG, if any, signs the result
 #   --opcode N / --req-rcode N                the OPCODE / RCODE of the request header (default 0)
 #   --hdr-qd N / --hdr-an N / --hdr-ns N      this value in QDCOUNT / ANCOUNT / NSCOUNT instead of the number of records that are there
@@ -183,23 +183,27 @@ sub report {
 }
 
 if ($tcp) {
-    my ($msg, $mac) = build_query();
     my $s = IO::Socket::INET->new(PeerAddr => $server, PeerPort => $port, Proto => 'tcp', Timeout => 3)
         or do { print "timeout\n"; exit 0 };
-    print $s pack('n', length $msg) . $msg;
     my $sel = IO::Select->new($s);
     my $buf = '';
-    while ($sel->can_read(3)) {
-        my $r = sysread($s, $buf, 65537, length $buf);
-        last unless $r;
-        if (length $buf >= 2) {
+    for (1 .. $count) {
+        my ($msg, $mac) = build_query();
+        print $s pack('n', length $msg) . $msg;
+        my $wait = $count > 1 ? 2 : 3;
+        while (length $buf < 2 || length $buf < 2 + unpack('n', $buf)) {
+            last unless $sel->can_read($wait);
+            my $r = sysread($s, $buf, 65537, length $buf);
+            last unless $r;
+        }
+        if (length $buf < 2 || length $buf < 2 + unpack('n', $buf)) {
+            print "timeout\n";
+        } else {
             my $l = unpack('n', $buf);
-            last if length $buf >= 2 + $l;
+            print report(substr($buf, 2, $l), $mac), "\n";
+            $buf = substr($buf, 2 + $l);
         }
     }
-    if (length $buf < 2) { print "timeout\n"; exit 0; }
-    my $l = unpack('n', $buf);
-    print report(substr($buf, 2, $l), $mac), "\n";
 } else {
     my $s = IO::Socket::INET->new(PeerAddr => $server, PeerPort => $port, Proto => 'udp') or die "socket: $!\n";
     my $sel = IO::Select->new($s);

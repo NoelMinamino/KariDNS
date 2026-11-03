@@ -3401,6 +3401,20 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
            nscount_req = (req[8] << 8) | req[9],
            arcount_req = (req[10] << 8) | req[11];
 
+  /* A question section that does not parse (dns_question_section_ok(): a name or class other than the first, a type twice, a question cut short, a NOTIFY or
+   * UPDATE of class NONE or ANY -- RFC 2136 §2.3 and RFC 1996 §4 ask for the class of the zone; BIND refuses those while it parses, before the zone lookup of
+   * RFC 2136 §3.1.1 that would answer NOTAUTH) is a FORMERR before anything else is looked at, as BIND's dns_message_parse() fails there and
+   * ns_client_error() answers before the OPT, the EDNS version or the opcode are read: no OPT and no EDE, whatever the opcode (no NOTIMP) or the
+   * version (no BADVERS); an UPDATE echoes the zone names before the bad one (dns_error_qd_echo()).  X-15, RFC 1035 §4.1.4: a pointer in the first
+   * name can point to no earlier name (only into the header), so that section is not good either. */
+  if (!dns_question_section_ok(req, req_len)) {
+    qe_why(wire_question_name_compressed(req, req_len) ? "the question name is compressed (RFC 1035 4.1.4)" : "malformed question section");
+    int len = dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), NULL, is_tcp, cfg);
+    const uint8_t op = (req[2] >> 3) & 0x0F;
+    if (len >= DNS_HEADER_SIZE && (op == 4 || op == 5)) res[2] &= ~0x01; // NOTIFY/UPDATE: RD=0 (RFC 1996 §3.7、RFC 2136 §3.8)
+    return len;
+  }
+
   edns_info_t edns;
   edns_info_reset(&edns);
   edns.present = false;
@@ -3480,7 +3494,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   if (edns_version_unsupported(&edns)) {
     // RFC 6891 §6.1.3: BADVERS。オプションの意味はバージョンごとに決まるので、オプションの不正より先に返す。
     // AXFR/IXFR の受付 (dns_server_core.c) も同じ順序 (TSIG の検証の後、他の検査の前) で同じ関数を使う (X-28)。
-    return dns_build_badvers_response(req, req_len, res, max_res_len, qdcount, &edns, is_tcp, cfg);
+    // 質問は BIND と同じく dns_error_qd_echo() の数 (QUERY / NOTIFY / UPDATE の正しい質問セクションだけ。不正なものは上で FORMERR)。
+    return dns_build_badvers_response(req, req_len, res, max_res_len, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg);
   }
 
   /* 長さが不正な COOKIE (RFC 7873 §5.2.2)、不正な ECS (RFC 7871 §6、§7.2.1) は FORMERR。
@@ -3492,25 +3507,19 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
   uint8_t opcode = (req[2] >> 3) & 0x0F;
   if (opcode != 0 && opcode != 4 && opcode != 5) {
+    /* NOTIMP without a question: BIND's dns_message_reply() echoes the question section only for QUERY and NOTIFY (the zone section for UPDATE); the OPT
+     * stays (the request was parsed) */
     add_ede(&edns, send_ede, 21, "This opcode is not supported by this server");
-    return dns_build_error_response(req, req_len, res, max_res_len, 4, 0, qdcount, &edns, is_tcp, cfg); // NOTIMP
+    return dns_build_error_response(req, req_len, res, max_res_len, 4, 0, 0, &edns, is_tcp, cfg); // NOTIMP
   }
 
   // RFC 9619: OPCODE=0(QUERY) allows QDCOUNT 0 or 1; only QDCOUNT>1 is FORMERR.
   // OPCODE=4(NOTIFY)/5(UPDATE) still require QDCOUNT==1.
-  // The FORMERR echoes the questions as BIND does (dns_error_qd_echo()): all of them when they are one name and class with different types
-  // (getquestions() accepts that section; ns_query_start() refuses QDCOUNT > 1), none when a second name or class or a repeated type is there.
+  // The FORMERR echoes the questions as BIND does (dns_error_qd_echo()): all of them, as they are one name and class with different types
+  // (getquestions() accepts that section; ns_query_start() refuses QDCOUNT > 1; a section that is not good was answered above), with the OPT.
   bool qdcount_invalid = (opcode == 0) ? (qdcount > 1) : (qdcount != 1);
   if (qdcount_invalid) {
     qe_why("the question count is not valid for this opcode (RFC 9619)");
-    add_ede(&edns, send_ede, 0, NULL);
-    return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg); // FORMERR
-  }
-
-  /* X-15, RFC 1035 §4.1.4: 最初の名前の圧縮ポインタは前に現れた名前を指せない (指せるのはヘッダだけ)。
-   * 質問を写し返せないので QDCOUNT=0 の FORMERR (以前はポインタの先によって無応答、または別の名前の答え)。 */
-  if (qdcount == 1 && wire_question_name_compressed(req, req_len)) {
-    qe_why("the question name is compressed (RFC 1035 4.1.4)");
     add_ede(&edns, send_ede, 0, NULL);
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg); // FORMERR
   }
@@ -3597,20 +3606,25 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     }
     /* A UDP IXFR (RFC 1995 4.2) is a zone transfer question: allow-transfer decides, as for a zone in memory and as BIND's ns_xfr_start() does before it looks at
      * the transport -- a client that may not transfer is REFUSED here, without the zone being read.  One that may gets the answer from the summary (the one SOA,
-     * TC when it is behind) when the apex describes the version the directory has, else it waits for the zone like any other query. */
-    if (opcode == 0 && qtype == 251 && !is_tcp && qdcount == 1 && domain_names_match_ci(not_ready_zone->name, current_qname)) {
+     * TC when it is behind) when the apex describes the version the directory has, else it waits for the zone like any other query.  An AXFR over UDP has the
+     * same checks and then its FORMERR (RFC 5936 §4.2), as for a zone in memory (below): it never makes the server read the zone. */
+    if (opcode == 0 && (qtype == 251 || qtype == 252) && !is_tcp && qdcount == 1 && domain_names_match_ci(not_ready_zone->name, current_qname)) {
       /* RFC 5936 §2.1.2, RFC 1995 §3: QCLASS is the class of the zone (IN): an IXFR of another class has no zone here, as for a zone in memory (below) */
       const size_t ix_qend = get_question_end_offset(req, req_len, 1);
       const uint16_t ix_class = ix_qend >= DNS_HEADER_SIZE + 5 ? (uint16_t)((req[ix_qend - 2] << 8) | req[ix_qend - 1]) : 1;
       if (ix_class != 1) {
-        xfr_log_denied(client_ip, qe_client_port(), current_qname, ix_class, 251, XD_NOZONE, 0);
+        xfr_log_denied(client_ip, qe_client_port(), current_qname, ix_class, qtype, XD_NOZONE, 0);
         add_ede(&edns, send_ede, 20, "This server is not authoritative for the queried zone");
         return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
       }
       if (!udp_ixfr_allowed(cfg, &zc, view, client_ip, nr_tkey)) {
-        xfr_log_denied(client_ip, qe_client_port(), not_ready_zone->name, 1, 251, XD_ACL, 0);
+        xfr_log_denied(client_ip, qe_client_port(), not_ready_zone->name, 1, qtype, XD_ACL, 0);
         add_ede(&edns, send_ede, 18, "Query refused due to access control");
         return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
+      }
+      if (qtype == 252) {
+        xfr_log_denied(client_ip, qe_client_port(), not_ready_zone->name, 1, 252, XD_UDP_AXFR, 0);
+        return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg); // FORMERR
       }
       /* RFC 1995 §3, RFC 5936 §2.1: then the shape of the request, as on TCP (after the ACL, as BIND): a request that is not shaped like an IXFR request, with
        * no client SOA among the things that make it so, is a FORMERR; cs is the client's serial */
@@ -3750,7 +3764,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     }
     /* RFC 2136 §3.1.1, §3.1.2: ZTYPE が SOA でなければ FORMERR。ZNAME と ZCLASS がこのサーバー
      * (クライアントのビュー) のゾーンでなければ NOTAUTH。どちらも権限の確認 (§3.3) より前に行う。
-     * ZOCOUNT (QDCOUNT) != 1 は上で FORMERR にしている。上位のゾーンに一致しただけのときも NOTAUTH。*/
+     * ZOCOUNT (QDCOUNT) != 1 は上で FORMERR にしている。上位のゾーンに一致しただけのときも NOTAUTH。
+     * ZCLASS NONE / ANY (§2.3: ZCLASS はゾーンのクラス) は質問セクションの不正として冒頭で FORMERR (BIND getquestions())。*/
     int zone_rcode = 0;
     size_t zone_end = get_question_end_offset(req, req_len, 1);
     uint16_t zclass = (zone_end >= DNS_HEADER_SIZE + 5)
@@ -3868,14 +3883,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   size_t q_offset = DNS_HEADER_SIZE;
-  if (skip_wire_name(req, req_len, q_offset, &q_offset) != 0) {
-    return -1;
-  }
-  if (q_offset + 4 > req_len) {
-    // QTYPE/QCLASS が欠けている: 質問を区切れないので QDCOUNT=0 の FORMERR
-    qe_why("the question is cut short (no QTYPE and QCLASS)");
-    add_ede(&edns, send_ede, 0, NULL);
-    return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg);
+  if (skip_wire_name(req, req_len, q_offset, &q_offset) != 0 || q_offset + 4 > req_len) {
+    return -1;   /* (not reached: a question that is cut short was answered FORMERR by the question section check above) */
   }
   /* allow-query / allow-query-on (BIND 9.20 ARM): the zone's statement, else the view's, else options'.  A client that may not ask
    * gets REFUSED (RFC 1035 §4.1.1) with EDE 18 Prohibited (RFC 8914 §4.19), as for a transfer or an update that is not allowed.  This is
@@ -3903,11 +3912,9 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
     uint16_t qclass = (req[q_offset + 2] << 8) | req[q_offset + 3];
 
-    // UDP経由(is_tcp == 0)でAXFR(252)を受信した場合はRFC 5936違反のためFORMERRを返す
-    if (!is_tcp && qtype == 252) {
-      xfr_log_denied(client_ip, qe_client_port(), db_entry ? db_entry->domain : current_qname, qclass, 252, XD_UDP_AXFR, 0);
-      return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg); // FORMERR
-    }
+    /* An AXFR over UDP (RFC 5936 §4.2: TCP only) is a FORMERR after the checks of a transfer, as BIND's ns_xfr_start() makes them whatever the transport: a
+     * name that is not a zone here (a forward zone too) is refused as one, then a client that may not transfer is refused (the UDP IXFR below; a program
+     * zone in the transfer checks of the zone types). */
 
     if (__builtin_expect(qclass == 1, 1)) {
       // IN class (fast path)
@@ -3937,6 +3944,11 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         add_ede(&edns, send_ede, 18, "Query refused due to access control");
         return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
       }
+      if (!is_tcp && qtype == 252) {
+        /* an AXFR over UDP of a built-in zone: FORMERR (RFC 5936 §4.2), as BIND answers it for the zones of its _bind view */
+        xfr_log_denied(client_ip, qe_client_port(), current_qname, qclass, 252, XD_UDP_AXFR, 0);
+        return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg); // FORMERR
+      }
       if (is_badcookie) return build_badcookie_response(res, max_res_len, (uint16_t)q_offset, &edns, ext_rcode_out, is_tcp, cfg);
       return chaos_build_response(cfg, res, body_max_len, max_res_len, q_offset, zi, at_apex, qtype, &edns, is_tcp, ext_rcode_out, cfg);
     }
@@ -3956,6 +3968,10 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         xfr_log_denied(client_ip, qe_client_port(), current_qname, qclass, qtype, XD_NOZONE, 0);
         add_ede(&edns, send_ede, 20, "This server is not authoritative for the queried zone");
         return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
+      }
+      if (!is_tcp && qtype == 252) {
+        xfr_log_denied(client_ip, qe_client_port(), db_entry->domain, 1, 252, XD_UDP_AXFR, 0);
+        return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg); // FORMERR
       }
       const xfr_shape_t shape = xfr_request_shape(req, req_len, NULL, NULL, NULL);
       if (shape != XFR_SHAPE_OK) {
@@ -4082,21 +4098,30 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   // UDP IXFR (RFC 1995 §4.2):
   // If client's SOA serial matches server's current serial (up-to-date), send single SOA response (NOERROR).
   // If update is needed (or diff required), set TC=1 and send current SOA to prompt client to retry over TCP.
-  if (!is_tcp && qtype == 251) {
+  if (!is_tcp && (qtype == 251 || qtype == 252)) {
     /* RFC 5936 §2.1.2 (QCLASS: "the class of the zone requested"), RFC 1995 §3: every zone here is of class IN, so an IXFR of class CH or ANY (the other
      * classes were REFUSED above) has no zone: REFUSED, AA=0, EDE 20 as for a name this server is not authoritative for (R-06), before the ACL, as the TCP
      * dispatch refuses it.  BIND: "non-authoritative zone" (xfrout.c ns_xfr_start(), the zone is looked up in the views of that class). */
-    if (qclass != 1) {
-      xfr_log_denied(client_ip, qe_client_port(), current_qname, qclass, 251, XD_NOZONE, 0);
+    /* A transfer is of the zone whose apex is the QNAME (RFC 5936 §2.1.1, RFC 1995 §3): a name inside a zone is no zone either, as the TCP dispatch and the
+     * zone that is not in memory (above) answer it; BIND looks the zone up by the exact name (ns_xfr_start(): "non-authoritative zone").  A UDP IXFR for such a
+     * name used to be answered with the zone's SOA. */
+    if (qclass != 1 || !domain_names_match_ci(db_entry->domain, current_qname)) {
+      xfr_log_denied(client_ip, qe_client_port(), current_qname, qclass, qtype, XD_NOZONE, 0);
       add_ede(&edns, send_ede, 20, "This server is not authoritative for the queried zone");
       return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
     }
     /* allow-transfer applies to an IXFR over UDP as well (BIND xfrout.c ns_xfr_start() checks the transfer ACL first, whatever the transport): the one SOA of a
      * zone that is up to date, or the TC answer, are not for a client that may not transfer.  It used to be answered to anybody who may ask (allow-query). */
     if (!udp_ixfr_allowed(cfg, zone_cfg_any, view, client_ip, tsig && tsig->status == TSIG_REQ_VALID ? tsig->key : NULL)) {
-      xfr_log_denied(client_ip, qe_client_port(), db_entry->domain, 1, 251, XD_ACL, 0);
+      xfr_log_denied(client_ip, qe_client_port(), db_entry->domain, 1, qtype, XD_ACL, 0);
       add_ede(&edns, send_ede, 18, "Query refused due to access control");
       return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
+    }
+    /* RFC 5936 §4.2: AXFR is not carried over UDP.  FORMERR after the zone and the ACL (BIND ns_xfr_start(): "attempted AXFR over UDP"); it used to come before
+     * them, so a name that is not a zone here (a forward zone, which BIND calls non-authoritative) and a client that may not transfer got it too */
+    if (qtype == 252) {
+      xfr_log_denied(client_ip, qe_client_port(), db_entry->domain, 1, 252, XD_UDP_AXFR, 0);
+      return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg); // FORMERR
     }
     /* RFC 1995 §3, RFC 5936 §2.1: then the shape of the request, as on TCP (after the ACL, as BIND): a request that is not shaped like an IXFR request, with no
      * client SOA among the things that make it so, is a FORMERR */

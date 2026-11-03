@@ -688,10 +688,46 @@ static void test_error_qd_echo(void) {
     CHECK(dns_error_qd_echo(m, qe_msg(m, 5, 1, b, q1)) == 0);
     Q(wl, 6, 254);
     CHECK(dns_error_qd_echo(m, qe_msg(m, 5, 1, b, q1)) == 0);
+
+    /* dns_question_section_ok(): the same rules for any opcode (no OPT on the FORMERR when false); NONE / ANY only for NOTIFY and UPDATE */
+    CHECK(dns_question_section_ok(m, qe_msg(m, 0, 1, b, q1)));                      /* QUERY, class NONE */
+    CHECK(dns_question_section_ok(m, qe_msg(m, 1, 1, b, q1)));                      /* IQUERY, class NONE: good, nothing echoed */
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 1, 1, b, q1)) == 0);
+    CHECK(!dns_question_section_ok(m, qe_msg(m, 4, 1, b, q1)));                     /* NOTIFY, class NONE */
+    CHECK(!dns_question_section_ok(m, qe_msg(m, 5, 1, b, q1)));                     /* UPDATE, class NONE */
+    Q(wl, 1, 1);
+    CHECK(dns_question_section_ok(m, qe_msg(m, 0, 0, b, q1)));                      /* QDCOUNT 0: a good, empty section */
+    CHECK(!dns_question_section_ok(m, qe_msg(m, 3, 2, b, q1)));                     /* an unassigned opcode, QDCOUNT 2 with one there */
+    CHECK(!dns_question_section_ok(m, qe_msg(m, 0, 1, b, q1 - 1)));                 /* cut short */
+    b[q1] = 0xC0; b[q1 + 1] = 12; Q(q1 + 2, 1, 3);                                  /* the same name, another class */
+    CHECK(!dns_question_section_ok(m, qe_msg(m, 2, 2, b, q1 + 6)));                 /* (STATUS) */
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 5, 2, b, q1 + 6)) == 1);                   /* UPDATE: the zone name before the bad one */
+    CHECK(!dns_question_section_ok(NULL, 0) && !dns_question_section_ok(m, 11));
     /* a first name with a compression pointer (X-15): never */
     b[0] = 0xC0; b[1] = 4; Q(2, 1, 1);
     CHECK(dns_error_qd_echo(m, qe_msg(m, 0, 1, b, 6)) == 0);
+    CHECK(!dns_question_section_ok(m, qe_msg(m, 0, 1, b, 6)));
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 5, 1, b, 6)) == 0);
 #undef Q
+}
+
+static void test_error_response_no_opt(void) {
+    printf("[TEST] dns_build_error_response: no OPT on a FORMERR for a bad question section (BIND: the parse stops before the OPT)...\n");
+    uint8_t m[128], b[64], res[128];
+    const size_t wl = sizeof(WWW_EXAMPLE_COM);
+    memcpy(b, WWW_EXAMPLE_COM, wl);
+    b[wl] = 0; b[wl + 1] = 1; b[wl + 2] = 0; b[wl + 3] = 1;
+    edns_info_t edns;
+    edns_info_reset(&edns);
+    edns.present = true;
+    size_t n = qe_msg(m, 0, 2, b, wl + 4);                                          /* QDCOUNT 2, one question */
+    int len = dns_build_error_response(m, n, res, sizeof(res), 1, 0, 0, &edns, false, NULL);
+    CHECK(len == DNS_HEADER_SIZE && res[11] == 0 && (res[3] & 0x0F) == 1);
+    len = dns_build_error_response(m, n, res, sizeof(res), 4, 0, 0, &edns, false, NULL);     /* (another rcode keeps the OPT) */
+    CHECK(len == DNS_HEADER_SIZE + 11 && res[11] == 1);
+    n = qe_msg(m, 0, 1, b, wl + 4);                                                 /* a good section: the FORMERR has its OPT */
+    len = dns_build_error_response(m, n, res, sizeof(res), 1, 0, 1, &edns, false, NULL);
+    CHECK(len == (int)(n + 11) && res[5] == 1 && res[11] == 1);
 }
 
 static void test_name_compression(void) {
@@ -3259,6 +3295,7 @@ int main(void) {
     test_packet_has_tsig();
     test_skip_wire_name();
     test_error_qd_echo();
+    test_error_response_no_opt();
     test_name_compression();
     test_cookie_and_edns_wire_parsing();
     test_pb_encode_varint_and_fields();
