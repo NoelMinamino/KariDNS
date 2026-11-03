@@ -603,7 +603,15 @@ typedef struct {
     int upcount;
     bool changed;       // ゾーンのデータが変わった
     bool soa_replaced;  // SOA が新しいシリアルの SOA で置き換わった (§3.4.2.2, §3.6)
+    /* batch 14 (for the log): why a REFUSED (5) was returned.  UPD_WHY_POLICY: update-policy did not grant the change of deny_name / deny_type
+     * (deny_name is the owner name in the zone's canonical text, cut at 255 octets); UPD_WHY_TOO_MANY: more than 1000 RRs in the prerequisite and update sections. */
+    uint8_t why;
+    uint16_t deny_type;
+    char deny_name[256];
 } update_result_t;
+#define UPD_WHY_NONE 0
+#define UPD_WHY_POLICY 1
+#define UPD_WHY_TOO_MANY 2
 
 int process_update_sections(const uint8_t *req, size_t req_len,
                              const char *zone_name,

@@ -9,6 +9,7 @@
 #include "dns_tsig_acl.h"
 #include "dns_priv_sandbox.h"
 #include "dns_dynamic_update.h"
+#include "dns_axfr_ixfr.h"
 #include "dns_siphash.h"
 #include "dns_zone_image.h"
 #include "dns_alias.h"
@@ -79,6 +80,96 @@ void query_set_local_addr(const void *sa) {
 
 void query_set_client_addr(const void *sa) {
   t_qacl.client_valid = qacl_copy_addr(&t_qacl.client, sa);
+}
+
+/* batch 14, category query-errors (BIND lib/ns/query.c log_queryerror()): why an error answer was made.  The reason is the text the site gives
+ * (qe_why()), else the text of the Extended DNS Error it attached (add_ede() of this file is qe_add_ede(): RFC 8914 texts such as "Zone expired"), else
+ * a general one; process_dns_query_impl_cap_routed() reads and clears it when the answer is final. */
+static _Thread_local const char *t_qerr_why;
+static _Thread_local char t_qerr_ede[96];
+static inline void qe_why(const char *why) { t_qerr_why = why; }
+static void qe_add_ede(edns_info_t *edns, bool enabled, uint16_t code, const char *text) {
+  if (text && *text) strlcpy(t_qerr_ede, text, sizeof(t_qerr_ede));
+  add_ede(edns, enabled, code, text);
+}
+#define add_ede(...) qe_add_ede(__VA_ARGS__)
+
+/* batch 14: event messages of the query path (dns_log.h logev_*).  The client is the address text the engine was given and the port the transport set
+ * (query_set_client_addr(); 0 when it did not).  logev_wanted() is one atomic load; a caller checks it before it builds a name or a text. */
+static inline int qe_client_port(void) {
+  if (!t_qacl.client_valid) return 0;
+  if (t_qacl.client.ss_family == AF_INET) return ntohs(((const struct sockaddr_in *)&t_qacl.client)->sin_port);
+  if (t_qacl.client.ss_family == AF_INET6) return ntohs(((const struct sockaddr_in6 *)&t_qacl.client)->sin6_port);
+  return 0;
+}
+int query_client_port(void) { return qe_client_port(); }
+
+/* The final answer of a query is an error: log it in query-errors (BIND query.c log_queryerror(): "query failed (SERVFAIL) for name/class/type" at debug 1; the
+ * other results at debug 3; INFO when the query log is on, as BIND's NS_SERVER_LOGQUERIES).  Only QUERYs (UPDATE, NOTIFY and the transfers have their own
+ * categories).  Nothing is built unless some channel passes the level. */
+static void qe_log_failure(const server_config_t *cfg, const uint8_t *req, size_t req_len, const uint8_t *res, int len, const char *client_ip) {
+  const char *why = t_qerr_why;
+  t_qerr_why = NULL;
+  if (len < DNS_HEADER_SIZE || req_len < DNS_HEADER_SIZE) return;
+  unsigned rcode = res[3] & 0x0F;
+  if (rcode != 1 && rcode != 2 && rcode != 4 && rcode != 5 && rcode != 9) return;
+  uint8_t opcode = (req[2] >> 3) & 0x0F;
+  if (opcode == 4 || opcode == 5) return;                  /* (notify.c, update.c: their own categories) */
+  int level = cfg && cfg->logging.queries_enabled ? LOG_LVL_INFO : rcode == 2 ? 1 : 3;
+  if (!logev_wanted(LOGC_QUERY_ERRORS, level)) return;
+  char qn[DNS_NAME_TEXT_SIZE], name[300] = "-", tn[32];
+  const char *tstr = "-";
+  uint16_t qt = 0, qc = 0;
+  size_t qend = 0;
+  const char *cls = "-";
+  if (((req[4] << 8) | req[5]) == 1 && parse_query_question_fast(req, req_len, qn, sizeof(qn), &qt, &qc, &qend)) {
+    if (qt == 251 || qt == 252) return;                    /* (xfer-out) */
+    logev_name_text(qn, name, sizeof(name));
+    tstr = format_type_name(qt, tn, sizeof(tn));
+    cls = qc == 1 ? "IN" : qc == 3 ? "CH" : qc == 255 ? "ANY" : "CLASS?";
+  }
+  const char *reason = why ? why : t_qerr_ede[0] ? t_qerr_ede
+                     : rcode == 1 ? "malformed query" : rcode == 2 ? "no answer could be made" : rcode == 5 ? "query refused"
+                     : rcode == 4 ? "not implemented" : "not authorized";
+  logev_post(LOGC_QUERY_ERRORS, level, client_ip, qe_client_port(), "query failed (%s) for %s/%s/%s: %s", dns_rcode_name(rcode), name, cls, tstr, reason);
+}
+
+/* UPDATE (RFC 2136) that never reaches the zone: the zone section is wrong (BIND lib/ns/update.c, category update, INFO: "update failed: ... (RCODE)") */
+static void qe_log_update_zone_error(const char *client_ip, int zone_rcode, const char *zname) {
+  if (!logev_wanted(LOGC_UPDATE, LOG_LVL_INFO)) return;
+  char zn[512];
+  logev_name_text(zname, zn, sizeof(zn));
+  if (zone_rcode == 1) logev_post(LOGC_UPDATE, LOG_LVL_INFO, client_ip, qe_client_port(), "update failed: zone section is not of type SOA (FORMERR)");
+  else logev_post(LOGC_UPDATE, LOG_LVL_INFO, client_ip, qe_client_port(), "update failed: %s: not authoritative for update zone (NOTAUTH)", zn);
+}
+
+/* Is there an update ACL (allow-update, an `update-acl`, an update-policy) for the zone at all?  BIND logs a refusal at ERROR when there is one and at
+ * INFO when updates were never enabled (checkupdateacl()) */
+static bool qe_update_acl_configured(const server_config_t *cfg, const zone_config_t *zcfg, const char *view_name) {
+  const zone_ext_t *x = zext(zcfg);
+  return x->upd_policy || x->allow_update_count > 0 || (cfg && config_acl_for(cfg, zcfg, view_name, AML_ACL_UPDATE) != NULL);
+}
+
+/* category update-security (BIND lib/ns/update.c checkupdateacl()): a signed request is logged first (`signer "k" approved|denied`, INFO), then
+ * the decision on the zone: `update 'z/IN' denied` (ERROR with an update ACL, INFO without).  zone_class is IN: the engine serves IN only. */
+static void qe_log_update_decision(const char *client_ip, const char *zone, const char *signer, bool approved, const server_config_t *cfg, const zone_config_t *zcfg,
+                                   const char *view_name) {
+  if (!logev_wanted(LOGC_UPDATE_SECURITY, LOG_LVL_ERROR)) return;     /* (nothing passes ERROR: neither does INFO) */
+  char zn[512], kn[512];
+  logev_name_text(zone, zn, sizeof(zn));
+  if (signer) {
+    logev_name_text(signer, kn, sizeof(kn));
+    logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, client_ip, qe_client_port(), "signer \"%s\" %s", kn, approved ? "approved" : "denied");
+  }
+  if (!approved) logev_post(LOGC_UPDATE_SECURITY, qe_update_acl_configured(cfg, zcfg, view_name) ? LOG_LVL_ERROR : LOG_LVL_INFO, client_ip, qe_client_port(), "update '%s/IN' denied", zn);
+}
+
+/* a secondary zone: BIND would forward the UPDATE (allow-update-forwarding); KariDNS does not, so it is refused (RFC 2136 §6 leaves it to the server) */
+static void qe_log_update_secondary(const char *client_ip, const char *zone) {
+  if (!logev_wanted(LOGC_UPDATE_SECURITY, LOG_LVL_INFO)) return;
+  char zn[512];
+  logev_name_text(zone, zn, sizeof(zn));
+  logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, client_ip, qe_client_port(), "update forwarding '%s/IN' denied: this server does not forward updates to the primary", zn);
 }
 
 /* Does allow-query / allow-query-on of the zone `entry` (of this view) let the client in?  For the zone the query was routed to the
@@ -3187,6 +3278,8 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
                                              const zdir_elem_t *not_ready_zone) {
   t_query_rrl_info.zone = NULL; /* D-05: 早い段階で返す応答 (エラー) のために先に消す */
   t_query_rrl_info.wildcard = false;
+  t_qerr_why = NULL;
+  t_qerr_ede[0] = '\0';
   if (req_len < DNS_HEADER_SIZE) {
     t_qacl.local_valid = t_qacl.client_valid = false;
     return 0; // 不正な短いパケットは無応答で破棄
@@ -3217,6 +3310,7 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
   if (tsig.status == TSIG_REQ_NONE) {
     int plain = process_query_body(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
                                    is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL, route, not_ready_zone);
+    qe_log_failure(cfg, req, req_len, res, plain, client_ip);
     t_qacl.local_valid = t_qacl.client_valid = false;   /* the address of the next query is set by its transport */
     t_qacl.key = NULL;
     return plain;
@@ -3236,6 +3330,7 @@ static int process_dns_query_impl_cap_routed(const uint8_t *req, size_t req_len,
   tsig.res_limit = max_res_len;
   int ret = process_query_body(body_req, body_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
                                is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, &tsig, route, not_ready_zone);
+  qe_log_failure(cfg, req, req_len, res, ret, client_ip);
   t_qacl.local_valid = t_qacl.client_valid = false;
   t_qacl.key = NULL;
   if (ret < DNS_HEADER_SIZE) return ret;
@@ -3296,6 +3391,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   edns.present = false;
   if (parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req, &edns) < 0) {
     /* OPT 自体が使えない (所有者名が root でない、追加セクション以外、複数、RDATA 切れ): OPT なしの FORMERR */
+    qe_why("the OPT record cannot be used (owner name, section, number or RDATA)");
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, NULL, is_tcp, cfg);
   }
   edns.ede_count = 0; // 反射防止
@@ -3340,7 +3436,9 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
    * NOTAUTH で、TSIG は process_dns_query_impl_cap() が付ける (§5.3.2)。どちらも要求の中身は処理しない。 */
   if (tsig && (tsig->status == TSIG_REQ_FORMERR || tsig->status == TSIG_REQ_ERROR)) {
     uint8_t rc = 1; // FORMERR
+    qe_why("the TSIG record cannot be parsed");
     if (tsig->status == TSIG_REQ_ERROR) {
+      qe_why(NULL);
       rc = 9;       // NOTAUTH
       add_ede(&edns, send_ede, 18, "Invalid TSIG");
     }
@@ -3358,6 +3456,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   if (edns.saw_invalid_mqtype_response_in_query || edns.mqtype_query_duplicated) {
+    qe_why("invalid MQTYPE-Query option (RFC 10029 3.3)");
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, &edns, is_tcp, cfg); // FORMERR
   }
 
@@ -3370,6 +3469,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   /* 長さが不正な COOKIE (RFC 7873 §5.2.2)、不正な ECS (RFC 7871 §6、§7.2.1) は FORMERR。
    * RFC 6891 §7: オプションの不正による FORMERR には OPT を付ける (R-13)。 */
   if (edns.has_malformed_cookie || edns.has_malformed_ecs) {
+    qe_why(edns.has_malformed_cookie ? "malformed COOKIE option (RFC 7873 5.2.2)" : "malformed EDNS Client Subnet option (RFC 7871 6)");
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
   }
 
@@ -3383,6 +3483,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   // OPCODE=4(NOTIFY)/5(UPDATE) still require QDCOUNT==1.
   bool qdcount_invalid = (opcode == 0) ? (qdcount > 1) : (qdcount != 1);
   if (qdcount_invalid) {
+    qe_why("the question count is not valid for this opcode (RFC 9619)");
     add_ede(&edns, send_ede, 0, NULL);
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg); // FORMERR
   }
@@ -3390,6 +3491,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   /* X-15, RFC 1035 §4.1.4: 最初の名前の圧縮ポインタは前に現れた名前を指せない (指せるのはヘッダだけ)。
    * 質問を写し返せないので QDCOUNT=0 の FORMERR (以前はポインタの先によって無応答、または別の名前の答え)。 */
   if (qdcount == 1 && wire_question_name_compressed(req, req_len)) {
+    qe_why("the question name is compressed (RFC 1035 4.1.4)");
     add_ede(&edns, send_ede, 0, NULL);
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, &edns, is_tcp, cfg); // FORMERR
   }
@@ -3424,8 +3526,10 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       int urc;
       if (qtype != 6) {
         urc = 1;                                        // FORMERR
+        qe_log_update_zone_error(client_ip, urc, current_qname);
       } else if (!view || zclass != 1 || !domain_names_match_ci(not_ready_zone->name, current_qname)) {
         urc = 9;                                        // NOTAUTH
+        qe_log_update_zone_error(client_ip, urc, current_qname);
       } else {
         bool uauth = zext(&zc)->upd_policy ? nr_tkey != NULL
                                            : (cfg && zone_update_acl_allows_in_view(cfg, &zc, view->name, client_ip, nr_tkey ? nr_tkey->name : NULL));
@@ -3439,6 +3543,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         } else {
           urc = 5;                                      // REFUSED
           add_ede(&edns, send_ede, 18, "Query refused due to access control");
+          qe_log_update_decision(client_ip, not_ready_zone->name, nr_tkey ? nr_tkey->name : NULL, false, cfg, &zc, view->name);
         }
       }
       int len = dns_build_error_response(req, req_len, res, max_res_len, (uint8_t)urc, 0, qdcount, &edns, is_tcp, cfg);
@@ -3472,6 +3577,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
      * TC when it is behind) when the apex describes the version the directory has, else it waits for the zone like any other query. */
     if (opcode == 0 && qtype == 251 && !is_tcp && qdcount == 1 && domain_names_match_ci(not_ready_zone->name, current_qname)) {
       if (!udp_ixfr_allowed(cfg, &zc, view, client_ip, nr_tkey)) {
+        xfr_log_denied(client_ip, qe_client_port(), not_ready_zone->name, 251, XD_ACL, 0);
         add_ede(&edns, send_ede, 18, "Query refused due to access control");
         return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
       }
@@ -3479,13 +3585,19 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       size_t iq;
       uint32_t cs = 0;
       if (iap && skip_wire_name(req, req_len, DNS_HEADER_SIZE, &iq) == 0 && iq + 4 <= req_len) {
-        if (!ixfr_request_client_serial(req, req_len, iq + 4, &cs))         /* RFC 1995 3, as the zone in memory */
+        if (!ixfr_request_client_serial(req, req_len, iq + 4, &cs)) {       /* RFC 1995 3, as the zone in memory */
+          xfr_log_denied(client_ip, qe_client_port(), not_ready_zone->name, 251, XD_IXFR_NO_SOA, 0);
           return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
+        }
         const size_t alimit = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
         const size_t tsig_limit = tsig ? tsig->res_limit : 0;
         if (tsig) tsig->res_limit = alimit;
         int ilen = build_apex_soa_answer(req, req_len, res, alimit, not_ready_zone, iap, &edns, is_tcp, MINIMAL_YES, ADDITIONAL_AUTH_YES, view, comp_ctx, tsig, cfg, &cs);
-        if (ilen >= DNS_HEADER_SIZE) return ilen;
+        if (ilen >= DNS_HEADER_SIZE) {
+          if (logev_wanted(LOGC_XFER_OUT, 1))
+            xfr_log_udp_ixfr(client_ip, qe_client_port(), not_ready_zone->name, cs, iap->serial, cs == iap->serial || serial_is_newer(cs, iap->serial), true);
+          return ilen;
+        }
         if (tsig) tsig->res_limit = tsig_limit;
       }
     }
@@ -3498,6 +3610,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   if (opcode == 0 && qdcount == 0) {
     if (edns.has_mqtype_query) {
       // RFC 10029 §3.3: MQTYPE-Query option in a query with QDCOUNT=0 MUST be FORMERR.
+      qe_why("MQTYPE-Query option in a query without a question (RFC 10029 3.3)");
       // RFC 6891 §7: オプションに起因する FORMERR には OPT を付ける。
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, &edns, is_tcp, cfg);
     }
@@ -3636,14 +3749,18 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     int rcode = 5; // REFUSED
     if (zone_rcode != 0) {
       rcode = zone_rcode;
+      qe_log_update_zone_error(client_ip, zone_rcode, current_qname);
     } else if (!zone_is_master) {
       /* RFC 2136 §3.1.2 はセカンダリに UPDATE をプライマリへ転送させる (§6)。KariDNS は転送しない
        * ので、方針による拒否 (RFC 1035 §4.1.1 REFUSED) を返す。allow-update を満たしていても同じ。*/
       add_ede(&edns, send_ede, 18, "Updates are not accepted for a secondary zone");
+      qe_log_update_secondary(client_ip, db_entry->domain);
     } else if (auth) {
+      qe_log_update_decision(client_ip, db_entry->domain, tkey ? tkey->name : NULL, true, cfg, zone_cfg_any, view->name);
       rcode = handle_dynamic_update(req, req_len, db_entry, client_ip, tkey ? tkey->name : "<none>");
     } else {
       add_ede(&edns, send_ede, 18, "Query refused due to access control");
+      qe_log_update_decision(client_ip, db_entry->domain, tkey ? tkey->name : NULL, false, cfg, zone_cfg_any, view->name);
     }
 
     /* RFC 2136 §3.8: ID と OPCODE を写し、ゾーンセクション以外のセクションは返さない (カウント 0)。
@@ -3721,6 +3838,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   if (q_offset + 4 > req_len) {
     // QTYPE/QCLASS が欠けている: 質問を区切れないので QDCOUNT=0 の FORMERR
+    qe_why("the question is cut short (no QTYPE and QCLASS)");
     add_ede(&edns, send_ede, 0, NULL);
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, &edns, is_tcp, cfg);
   }
@@ -3752,6 +3870,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
     // UDP経由(is_tcp == 0)でAXFR(252)を受信した場合はRFC 5936違反のためFORMERRを返す
     if (!is_tcp && qtype == 252) {
+      xfr_log_denied(client_ip, qe_client_port(), db_entry ? db_entry->domain : current_qname, 252, XD_UDP_AXFR, 0);
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg); // FORMERR
     }
 
@@ -3763,6 +3882,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       // CH class
     } else {
       add_ede(&edns, send_ede, 0, NULL);
+      qe_why("the query class is not supported");
       return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg); // REFUSED
     }
   q_offset += 4;
@@ -3911,14 +4031,17 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     /* allow-transfer applies to an IXFR over UDP as well (BIND xfrout.c ns_xfr_start() checks the transfer ACL first, whatever the transport): the one SOA of a
      * zone that is up to date, or the TC answer, are not for a client that may not transfer.  It used to be answered to anybody who may ask (allow-query). */
     if (!udp_ixfr_allowed(cfg, zone_cfg_any, view, client_ip, tsig && tsig->status == TSIG_REQ_VALID ? tsig->key : NULL)) {
+      xfr_log_denied(client_ip, qe_client_port(), db_entry->domain, 251, XD_ACL, 0);
       add_ede(&edns, send_ede, 18, "Query refused due to access control");
       return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
     }
     uint32_t client_serial = 0;
 
     /* RFC 1995 §3: クライアントの版の SOA が Authority に無ければ FORMERR (TCP と同じ) */
-    if (!ixfr_request_client_serial(req, req_len, q_offset, &client_serial))
+    if (!ixfr_request_client_serial(req, req_len, q_offset, &client_serial)) {
+      xfr_log_denied(client_ip, qe_client_port(), db_entry->domain, 251, XD_IXFR_NO_SOA, 0);
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
+    }
 
     const zone_image_t *zimg = current_zone->image;
     /* B8t-1: the SOA this client sees (the zone has one, checked above); the serial is the zone's, the same in all of them */
@@ -3951,6 +4074,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     if (!is_up_to_date) {
       res[2] |= 0x02; // Set TC (Truncated) bit to prompt TCP retry
     }
+    if (logev_wanted(LOGC_XFER_OUT, is_up_to_date ? 1 : LOG_LVL_INFO))
+      xfr_log_udp_ixfr(client_ip, qe_client_port(), db_entry->domain, client_serial, current_serial, is_up_to_date, false);
 
     if (soa_rr != ZONE_IMAGE_NONE) {
       if (image_serialize_rr(zimg, soa_rr, res, body_max_len, &offset, comp_ctx, NULL, soa_ttl) >= 0) {
@@ -4051,6 +4176,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (edns.has_mqtype_query) {
     if (edns.mqtype_count == 0 || is_non_data_rrtype(qtype)) {
+      qe_why("invalid MQTYPE-Query option: no type, or a type that is not data (RFC 10029 3.3)");
       // RFC 10029 §3.3 / RFC 6891 §7: FORMERR (OPT 付き、AA=0)
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg);
     }
@@ -4058,12 +4184,14 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     for (int i = 0; i < edns.mqtype_count && num_qtypes <= limit; i++) {
        uint16_t mq = edns.mqtypes[i];
        if (is_non_data_rrtype(mq)) {
+          qe_why("invalid MQTYPE-Query option: a type that is not data (RFC 10029 3.3)");
           // RFC 10029 §3.3 / RFC 6891 §7: FORMERR (OPT 付き、AA=0)
           return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg);
        }
        bool dup = false;
        for (int j = 0; j < num_qtypes; j++) { if (qtypes[j] == mq) { dup = true; break; } }
        if (dup) {
+          qe_why("invalid MQTYPE-Query option: a type twice (RFC 10029 3.3)");
           // RFC 10029 §3.3 / RFC 6891 §7: FORMERR (OPT 付き、AA=0)
           return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg);
        }

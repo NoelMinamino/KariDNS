@@ -70,8 +70,13 @@
 enum { EXIT_OK = 0, EXIT_ZONES_FAILED = 1, EXIT_USAGE = 2, EXIT_ERROR = 3, EXIT_RETRY = 4 };
 
 /* Messages.  Dump mode: stderr with the program prefix (the lines the dump tests expect).  Stream mode: syslog
- * (openlog() has LOG_PERROR, so a foreground server still shows them on stderr). */
+ * (openlog() has LOG_PERROR, so a foreground server still shows them on stderr), each text starting with "[DB] " like the other components
+ * of the server; with --log-stderr (how karidns starts the loader, batch 14) the lines go to stderr instead, "<N>[DB] text" with N the
+ * syslog priority, and the supervisor forwards them to the `database` log category (dns_db_supervisor.c, db_logrd_*).  Stream mode never
+ * writes both: a message is logged once.  syslog is the fallback when stderr cannot be written (the supervisor is gone). */
 static bool g_stream_mode;
+static bool g_log_stderr;                /* --log-stderr */
+#define LG_LINE_MAX 500                  /* a line of the pipe is written with one write() of at most this many bytes: PIPE_BUF (512) keeps lines of the threads apart */
 static _Atomic sig_atomic_t g_stop;      /* SIGTERM / SIGINT in stream mode (atomic: the fetch thread reads it too; a handler may store to a lock-free atomic) */
 static _Atomic bool g_fetch_stop;          /* D1a: the main thread ends the fetch thread */
 static _Atomic bool g_fetch_died;          /* D1a: the fetch thread ended by itself (the Backend closed or broke the fetch stream, or an error): the main thread exits so that the supervisor starts a loader with a new pair of streams */
@@ -112,9 +117,31 @@ static void lg(int prio, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
-    if (g_chk_out) chk_line(prio <= LOG_ERR ? 'E' : prio == LOG_WARNING ? 'W' : 'I', msg);
-    else if (g_stream_mode) syslog(prio, "%s", msg);
-    else fprintf(stderr, "karidns-dbloader: %s\n", msg);
+    if (g_chk_out) {
+        chk_line(prio <= LOG_ERR ? 'E' : prio == LOG_WARNING ? 'W' : 'I', msg);
+    } else if (g_stream_mode) {
+        /* the text can carry names read from the database: no control character may start a line of its own */
+        for (char *p = msg; *p; p++)
+            if ((unsigned char)*p < 0x20 || *p == 0x7f) *p = '?';
+        if (g_log_stderr) {
+            char line[LG_LINE_MAX + 1];
+            int n = snprintf(line, sizeof(line) - 1, "<%d>[DB] %s", prio & LOG_PRIMASK, msg);
+            if (n < 0) n = 0;
+            if ((size_t)n > sizeof(line) - 2) {                      /* cut, and say so */
+                n = (int)sizeof(line) - 2;
+                memcpy(line + n - 3, "...", 3);
+            }
+            line[n++] = '\n';
+            ssize_t w;
+            do {
+                w = write(STDERR_FILENO, line, (size_t)n);
+            } while (w < 0 && errno == EINTR);
+            if (w == n) return;
+        }
+        syslog(prio, "[DB] %s", msg);
+    } else {
+        fprintf(stderr, "karidns-dbloader: %s\n", msg);
+    }
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -4998,7 +5025,7 @@ static int stream_main(int fd) {
         }
     }
     g_stream_mode = true;
-    openlog("karidns-dbloader", LOG_PID | LOG_NDELAY | LOG_PERROR, LOG_DAEMON);
+    openlog("karidns-dbloader", LOG_PID | LOG_NDELAY | (g_log_stderr ? 0 : LOG_PERROR), LOG_DAEMON);   /* (with --log-stderr syslog is only the fallback: no copy on stderr) */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_term;
@@ -5083,6 +5110,8 @@ static void usage(FILE *fp) {
         "  --location-tag NAME with --check: a tag of options { location-tags }; repeatable\n"
         "  --max-zone-records N, --max-zone-bytes N   with --check: the limits of the database block\n"
         "  --state-file PATH   with -s: the file the hot list is kept in (D1a: database { loader-state-file }); with --check: check that the loader can use it\n"
+        "  --log-stderr        with -s: write the messages to stderr as \"<N>[DB] text\" lines (N = syslog priority; karidns reads them and logs them in the\n"
+        "                      `database` category) instead of syslog\n"
         "  --zone-checks LIST  with --check: the check-* severities, name=fail|warn|ignore,... (names, dup-records, integrity, mx, mx-cname, sibling,\n"
         "                      spf, srv-cname, svcb, wildcard)\n"
         "  --version           print the version\n"
@@ -5128,6 +5157,7 @@ int main(int argc, char **argv) {
         { "zone-checks", required_argument, NULL, 1008 },
         { "fetch-fd", required_argument, NULL, 1009 },
         { "state-file", required_argument, NULL, 1010 },
+        { "log-stderr", no_argument, NULL, 1011 },
         { "help", no_argument, NULL, 'h' },                { NULL, 0, NULL, 0 }
     };
     const char *dump = NULL, *driver = NULL, *dbfile = NULL, *conninfo = NULL, *schema = NULL, *zone = NULL, *map_view = NULL;
@@ -5182,6 +5212,7 @@ int main(int argc, char **argv) {
         case 1008: chk_zone_checks = optarg; break;
         case 1009: fetch_fd_arg = optarg; break;
         case 1010: state_file_arg = optarg; break;
+        case 1011: g_log_stderr = true; break;
         case 1006:
             if (!parse_uint(optarg, 2, 4294967295ul, &max_records)) {
                 fprintf(stderr, "karidns-dbloader: --max-zone-records must be 2..4294967295\n");
@@ -5229,6 +5260,10 @@ int main(int argc, char **argv) {
     }
     if (fetch_fd_arg) {
         fprintf(stderr, "karidns-dbloader: --fetch-fd is for -s\n");
+        return EXIT_USAGE;
+    }
+    if (g_log_stderr) {
+        fprintf(stderr, "karidns-dbloader: --log-stderr is for -s\n");
         return EXIT_USAGE;
     }
     if (state_file_arg && !check) {

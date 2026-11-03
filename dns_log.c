@@ -432,6 +432,9 @@ void klog_guard_leave(bool prev) {
   t_inside = prev;
 }
 
+static uint32_t rt_level_mask(const log_runtime_t *rt, int cat);
+static void klog_emit_level(int cat, int level, const char *msg);
+
 bool log_runtime_install(log_runtime_t *nrt) {
   int old = atomic_load(&g_rt_cur);
   int ns = old < 0 ? 0 : 1 - old;
@@ -444,6 +447,8 @@ bool log_runtime_install(log_runtime_t *nrt) {
   nrt->slot = ns;
   atomic_store(&g_rt_slot[ns], nrt);
   atomic_store(&g_rt_cur, ns);
+  for (int c = 0; c < LOGC_COUNT; c++) logev_set_mask(c, rt_level_mask(nrt, c));   /* (the event messages of dns_log.h look at it before they build anything) */
+  klog_set_level_hook(klog_emit_level);
   klog_set_hook(klog_route);
   if (old >= 0) {
     log_runtime_t *o = atomic_load(&g_rt_slot[old]);
@@ -475,14 +480,33 @@ void klog_record(log_runtime_t *rt, int cat, int level, const struct timespec *t
   }
 }
 
+/* The levels a category passes (the bits of g_logev_mask: dns_log.h), for the channels that write somewhere */
+static uint32_t rt_level_mask(const log_runtime_t *rt, int cat) {
+  uint32_t mask = 0;
+  for (int i = 0; i < rt->nroute[cat]; i++) {
+    const log_channel_t *ch = rt->route[cat][i];
+    if (ch->dest == LOGDEST_NULL) continue;
+    for (int l = LOGEV_LEVEL_MIN; l <= LOGEV_LEVEL_MAX; l++)
+      if (klog_level_passes(ch->level, l)) mask |= LOGEV_BIT(l);
+  }
+  return mask;
+}
+
+static void klog_emit_level(int cat, int level, const char *msg);
+
+/* The text of a record is cut at the end of the first control character that is not a tab: replace them.  A message can carry text that came
+ * from the network (a key or zone name); in a file it must not be able to start a line of its own */
+static void klog_sanitize(char *msg) {
+  for (char *p = msg; *p; p++)
+    if (((unsigned char)*p < 0x20 && *p != '\t') || *p == 0x7f) *p = '?';
+}
+
 /* The hook of kdns_syslog() / kdns_logc().  A message logged while a message is being written (a rotation that fails, say) goes to syslog()
  * directly, so that a log call cannot wait for the channel lock its own thread holds. */
 static void klog_route(int cat, int prio, const char *fmt, va_list ap, int saved_errno) {
   char msg[KLOG_MSG_MAX];
   klog_vformat(msg, sizeof(msg), fmt, ap, saved_errno);
-  /* A message can carry text that came from the network (a key or zone name); in a file it must not be able to start a line of its own */
-  for (char *p = msg; *p; p++)
-    if (((unsigned char)*p < 0x20 && *p != '\t') || *p == 0x7f) *p = '?';
+  klog_sanitize(msg);
   log_runtime_t *rt = t_inside ? NULL : log_runtime_acquire();
   if (!rt) {
     syslog(prio, "%s", msg);
@@ -496,6 +520,27 @@ static void klog_route(int cat, int prio, const char *fmt, va_list ap, int saved
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
   klog_record(rt, cat < 0 || cat >= LOGC_COUNT ? klog_category_for_message(fmt) : cat, klog_level_from_priority(prio), &ts, msg);
+  klog_guard_leave(guard);
+  log_runtime_release(rt);
+  pthread_setcancelstate(cancel_state, NULL);
+}
+
+/* One finished line of an event (dns_log.h logev_*) to the channels of its category, at the level the caller gives (up to debug 10, which a
+ * syslog priority cannot say).  The same guards as klog_route(): no routing while this thread writes a record, no cancellation while the runtime
+ * is held.  A thread that is inside a write has no way to report this one: it is dropped (events are never worth a deadlock). */
+static void klog_emit_level(int cat, int level, const char *msg) {
+  char text[KLOG_MSG_MAX];
+  snprintf(text, sizeof(text), "%s", msg);
+  klog_sanitize(text);
+  if (cat < 0 || cat >= LOGC_COUNT) cat = LOGC_GENERAL;
+  log_runtime_t *rt = t_inside ? NULL : log_runtime_acquire();
+  if (!rt) return;
+  int cancel_state;
+  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+  bool guard = klog_guard_enter();
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  klog_record(rt, cat, level, &ts, text);
   klog_guard_leave(guard);
   log_runtime_release(rt);
   pthread_setcancelstate(cancel_state, NULL);

@@ -190,7 +190,7 @@ done
 for n in a b; do
     wait_dbst $n "last applied generation 1, ok yes, status written 20[0-9][0-9]-" 10 && pass "server $n: dbstatus shows generation 1, ok yes and a time" || { fail "server $n: dbstatus after the request"; kct $n dbstatus | sed 's/^/         /' | head -12; }
 done
-wait_log "$T/a.log" "karidns-dbloader.* batch [0-9]* \(diff\) sent" 5 && pass "ns1: the request was a diff batch (all zones)" || fail "ns1: no diff batch for an all-zones request"
+wait_log "$T/a.log" "\[DB\] batch [0-9]* \(diff\) sent" 5 && pass "ns1: the request was a diff batch (all zones)" || fail "ns1: no diff batch for an all-zones request"
 
 echo "== S1: a request for one zone reloads that zone only"
 setaddr z1.test 192.0.2.12
@@ -200,7 +200,7 @@ both "request for z2.test (generation 2)" www.z2.test 192.0.2.22
 check_ans "ns1: z1.test was not reloaded" 192.0.2.11 "$PORT_A" www.z1.test
 check_ans "ns2: z1.test was not reloaded" 192.0.2.11 "$PORT_B" www.z1.test
 wait_row ns1 "^2|true|$" 10 && wait_row ns2 "^2|true|$" 10 && pass "both rows are at generation 2" || fail "rows after the zone request: '$(row ns1)' '$(row ns2)'"
-wait_log "$T/a.log" "karidns-dbloader.* batch [0-9]* \(zone\) sent" 5 && pass "ns1: a zone batch" || fail "ns1: no zone batch"
+wait_log "$T/a.log" "\[DB\] batch [0-9]* \(zone\) sent" 5 && pass "ns1: a zone batch" || fail "ns1: no zone batch"
 
 echo "== S1: requests that arrive together are one reload"
 request "INSERT INTO karidns_reload_requests (zone) VALUES ('z1.test'), ('z2.test'), ('Z1.TEST.')"

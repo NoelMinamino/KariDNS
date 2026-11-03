@@ -61,6 +61,7 @@ PORT=$(kari_port 0 $((20000 + $$ % 20000)))
 SECRET="dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"
 
 mkdir "$T/db"
+mkdir "$T/logs"; chmod 777 "$T/logs"          # batch 14: the log of category xfer-out (debug 1 shows the polls)
 sqlite3 "$T/db/z.db" < tests/db/pdns_schema.sqlite3.sql > /dev/null
 # a: transferred; b: its allow-transfer does not list the client; c: IXFR; d: a change in the database; bad: more records than max-zone-records;
 # z0000 ...: the load part
@@ -101,8 +102,15 @@ options {
                acl-ceiling { 127.0.0.1; }; max-zone-records 200; transfer-fetch-timeout 3000; memory-limit $1; };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
+logging {
+    channel xo { file "$T/logs/xfer.log"; severity debug 1; print-category yes; print-severity yes; };
+    category xfer-out { xo; };
+    category security { xo; };
+};
 EOF
 }
+# the line of the xfer-out log (batch 14): lg PATTERN
+lg() { i=0; while [ $i -lt 75 ]; do grep -q -- "$1" "$T/logs/xfer.log" 2>/dev/null && return 0; sleep 0.2; i=$((i + 1)); done; return 1; }
 start_srv() {
     : > "$T/srv.log"                     # (the background job truncates it later: the line of the previous server must not be seen as this one's)
     "$KARIDNS" -c "$T/k.conf" -f > "$T/srv.log" 2>&1 &
@@ -140,6 +148,8 @@ D nosuch.test AXFR +nohexdump +noall +answer | grep -v '^;' > "$T/nosuch.out"
 [ "$(issued)" = "$I0" ] && [ "$(xstat waited)" = "$W0" ] && oom b.test && pass "a refused AXFR costs no fetch (issued $I0, waited $W0) and b.test stays out of memory" || fail "fetches: issued $(issued) (was $I0), waited $(xstat waited) (was $W0)"
 D b.test IXFR=1 +nohexdump +noall +answer | grep -v '^;' > "$T/b.out"
 [ ! -s "$T/b.out" ] && [ "$(issued)" = "$I0" ] && oom b.test && pass "... and so does a refused IXFR" || fail "a refused IXFR: issued $(issued), $(head -2 "$T/b.out")"
+lg "security: error: client 127.0.0.1#[0-9]*: zone transfer 'b.test/AXFR/IN' denied" && lg "zone transfer 'b.test/IXFR/IN' denied" && pass "log: the refused AXFR and IXFR of b.test (security, error)" || fail "log: no 'denied' line for b.test"
+lg "transfer of 'nosuch.test/IN': bad zone transfer request: non-authoritative zone (REFUSED)" && pass "log: the AXFR of a zone that does not exist" || fail "log: no non-authoritative line"
 
 # AXFR of a.test: waits for the zone, complete
 axfr a.test > "$T/a.nr"
@@ -160,6 +170,7 @@ sleep 3
 oom a.test && fail "a.test, loaded by a query and transferred, was taken out of memory" || pass "a zone that a query loaded is not marked by a transfer: it stays in memory"
 [ "$(xstat waited)" = "$W1" ] && pass "(the transfer from memory waited for nothing)" || fail "waited changed from $W1 to $(xstat waited)"
 
+lg "transfer of 'a.test/IN': AXFR started (serial 5)" && lg "transfer of 'a.test/IN': AXFR ended: [0-9]* messages, [0-9]* records, [0-9]* bytes" && pass "log: the AXFR of a.test (the zone was read for it): started and ended with the statistics" || fail "log: no AXFR started / ended for a.test"
 echo "== IXFR of a zone that is out of memory"
 I1=$(issued)
 SU0=$(xstat summary_answers)
@@ -169,6 +180,7 @@ NC=$(wc -l < "$T/c5.out" | tr -d ' ')
 ixfr c.test 9 > "$T/c9.out"
 [ "$(wc -l < "$T/c9.out" | tr -d ' ')" = "1" ] && pass "... also from a newer serial (RFC 1982)" || fail "IXFR=9: $(head -2 "$T/c9.out")"
 [ "$(issued)" = "$I1" ] && oom c.test && [ "$(xstat summary_answers)" = "$((SU0 + 2))" ] && pass "the zone was not read for them (issued $I1, summary_answers $((SU0 + 2)))" || fail "issued $(issued) (was $I1), summary_answers $(xstat summary_answers) (was $SU0), out of memory: $(oom c.test && echo yes || echo no)"
+lg "transfer of 'c.test/IN': IXFR poll up to date (serial 5), answered from the zone summary" && pass "log: the IXFR from the serial the directory has is a poll answered from the summary (debug 1)" || fail "log: no summary poll line for c.test"
 ixfr c.test 3 > "$T/c3.nr"
 NC3=$(wc -l < "$T/c3.nr" | tr -d ' ')
 [ "$NC3" -eq "$EXPECT" ] && pass "the IXFR from an old serial gets the whole zone (RFC 1995 4: no history): $NC3 records" || fail "IXFR=3: $NC3 records"
@@ -193,6 +205,8 @@ UP=$(uix z0007.test 7); TC=$(uix z0007.test 3); NW=$(uix z0007.test 9)
 [ "$TC" = "rcode=0 tc=1 aa=1 an=1 ns=0 ar=1 ede=-" ] && pass "behind: the one SOA and TC (retry over TCP)" || fail "UDP IXFR=3: $TC"
 [ "$NW" = "$UP" ] && pass "a client that is ahead (serial 9, RFC 1982) is up to date" || fail "UDP IXFR=9: $NW"
 [ "$(issued)" = "$I5" ] && oom z0007.test && pass "... all from the summary: nothing was read" || fail "issued $(issued) (was $I5)"
+lg "transfer of 'z0007.test/IN': IXFR poll up to date (serial 7), answered from the zone summary" && pass "log: the UDP IXFR that is up to date, from the summary" || fail "log: no UDP summary poll line"
+lg "zone transfer 'b.test/IXFR/IN' denied" && pass "log: the UDP IXFR b.test may not make" || fail "log: no UDP denied line"
 q www.z0007.test > /dev/null
 [ "$(uix z0007.test 7)" = "$UP" ] && [ "$(uix z0007.test 3)" = "$TC" ] && pass "the zone in memory answers the same" || fail "in memory: $(uix z0007.test 7) / $(uix z0007.test 3)"
 q www.b.test > /dev/null
@@ -219,6 +233,7 @@ E=$(( $(date +%s) - S ))
 grep -qi "SERVFAIL\|Transfer failed\|failed" "$T/bad.out" && pass "the AXFR of a zone the loader cannot read fails ($(grep -i -m1 'fail' "$T/bad.out"))" || fail "bad.test AXFR: $(head -5 "$T/bad.out")"
 [ "$E" -ge 2 ] && [ "$E" -le 8 ] && pass "... after transfer-fetch-timeout (3 s): $E s" || fail "the failure came after $E s"
 [ "$(xstat failed)" = "$((F0 + 1))" ] && pass "counted as failed" || fail "failed=$(xstat failed) (was $F0)"
+lg "transfer of 'bad.test/IN': AXFR request failed: the zone data could not be read in time (SERVFAIL, Not Ready)" && pass "log: the failed AXFR of bad.test (warning)" || fail "log: no 'could not be read in time' line"
 [ "$(q www.a.test)" = "192.0.2.80" ] && pass "the server goes on answering" || fail "no answer from the server after the failed transfer"
 grep -q "AddressSanitizer\|runtime error:\|ThreadSanitizer" "$T/srv.log" 2>/dev/null && fail "sanitizer report in the server log" || pass "no sanitizer report in the server log"
 stop_srv

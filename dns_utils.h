@@ -43,6 +43,8 @@ uint16_t get_type_code(const char *type_str);
 char *get_base_dir(const char *path);
 const char *format_type_name(uint16_t type, char *buf, size_t buf_size);
 const char *dns_type_to_string(uint16_t type_code);
+/* The mnemonic of an RCODE 0..10 (RFC 1035 4.1.1, RFC 2136 2.2, RFC 6895); "RCODE" for the rest */
+const char *dns_rcode_name(unsigned rcode);
 
 /* Returns true for QTYPE-only / pseudo-RR "meta-types" (OPT, TKEY, TSIG,
  * IXFR, AXFR, MAILB, MAILA, ANY, and NXNAME per RFC 9824) that MUST NOT be

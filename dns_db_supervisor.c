@@ -33,6 +33,150 @@ static int64_t mono_ms(void) {
   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+/* ---- the messages of the loader: its stderr pipe, read line by line (see the header) ---- */
+
+void db_logrd_init(db_logrd_t *rd) {
+  memset(rd, 0, sizeof(*rd));
+}
+
+/* the report of the lines the rate limit dropped */
+static void logrd_report(db_logrd_t *rd, db_logrd_sink_t sink, void *ud) {
+  char msg[96];
+  snprintf(msg, sizeof(msg), "[DB] %lu line(s) of the loader's output were not logged (more than %d per second)", rd->suppressed, DB_LOG_RATE_LINES);
+  sink(LOG_WARNING, msg, ud);
+  rd->suppressed = 0;
+}
+
+/* One complete line: "<N>text" (N = 0..7, the syslog priority; without it LOG_NOTICE), subject to the rate limit */
+static void logrd_line(db_logrd_t *rd, int64_t now_ms, db_logrd_sink_t sink, void *ud) {
+  if (rd->over) {
+    memcpy(rd->buf + rd->len, "...", 3);
+    rd->len += 3;
+  }
+  rd->buf[rd->len] = '\0';
+  int prio = LOG_NOTICE;
+  const char *text = rd->buf;
+  if (rd->len >= 3 && text[0] == '<' && text[1] >= '0' && text[1] <= '7' && text[2] == '>') {
+    prio = text[1] - '0';
+    text += 3;
+  }
+  while (*text == ' ') text++;
+  if (*text) {
+    if (now_ms - rd->window_ms >= 1000 || now_ms < rd->window_ms) {     /* a new second (or the clock went back): report what the last one dropped */
+      if (rd->suppressed) logrd_report(rd, sink, ud);
+      rd->window_ms = now_ms;
+      rd->window_lines = 0;
+    }
+    if (rd->window_lines < DB_LOG_RATE_LINES) {
+      rd->window_lines++;
+      sink(prio, text, ud);
+    } else {
+      rd->suppressed++;
+    }
+  }
+  rd->len = 0;
+  rd->over = false;
+  rd->pending_cr = false;
+}
+
+/* text of the line: printable ASCII as it is, a tab as a space, everything else \xNN (the loader reads names out of a database; nothing it
+ * writes may start a line of the log or hide in it) */
+static void logrd_put(db_logrd_t *rd, unsigned char c) {
+  char esc[4];
+  const char *p = esc;
+  size_t n = 1;
+  if (c >= 0x20 && c < 0x7f) esc[0] = (char)c;
+  else if (c == '\t') esc[0] = ' ';
+  else {
+    static const char hex[] = "0123456789abcdef";
+    esc[0] = '\\';
+    esc[1] = 'x';
+    esc[2] = hex[c >> 4];
+    esc[3] = hex[c & 15];
+    n = 4;
+  }
+  if (rd->over) return;
+  if (rd->len + n > DB_LOG_TEXT_MAX - 3) {      /* room for the "..." that marks a cut line */
+    rd->over = true;
+    return;
+  }
+  memcpy(rd->buf + rd->len, p, n);
+  rd->len += n;
+}
+
+void db_logrd_feed(db_logrd_t *rd, const char *data, size_t n, int64_t now_ms, db_logrd_sink_t sink, void *ud) {
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)data[i];
+    if (rd->pending_cr) {
+      rd->pending_cr = false;
+      if (c != '\n') logrd_put(rd, '\r');       /* (a CR that does not end a CRLF is text) */
+    }
+    if (c == '\n') logrd_line(rd, now_ms, sink, ud);
+    else if (c == '\r') rd->pending_cr = true;
+    else logrd_put(rd, c);
+  }
+}
+
+void db_logrd_flush(db_logrd_t *rd, int64_t now_ms, db_logrd_sink_t sink, void *ud) {
+  if (rd->pending_cr) logrd_put(rd, '\r');
+  if (rd->len > 0 || rd->over) logrd_line(rd, now_ms, sink, ud);
+  rd->pending_cr = false;
+  if (rd->suppressed) logrd_report(rd, sink, ud);        /* nothing follows: say it now */
+}
+
+void db_logrd_tick(db_logrd_t *rd, int64_t now_ms, db_logrd_sink_t sink, void *ud) {
+  if (rd->suppressed && (now_ms - rd->window_ms >= 1000 || now_ms < rd->window_ms)) logrd_report(rd, sink, ud);
+}
+
+void db_log_sink(int prio, const char *text, void *ud) {
+  (void)ud;
+  kdns_logc(LOGC_DATABASE, prio, text[0] == '[' ? "%s" : "[DB] %s", text);
+}
+
+static void log_close(db_sup_t *s) {
+  if (s->log_fd >= 0) close(s->log_fd);
+  s->log_fd = -1;
+}
+
+bool db_sup_log_read(db_sup_t *s) {
+  if (s->log_fd < 0) return false;
+  db_logrd_tick(&s->log_rd, mono_ms(), db_log_sink, NULL);        /* (a flood that stopped is reported when its second is over, not with the next line) */
+  char buf[4096];
+  size_t total = 0;
+  while (total < DB_LOG_READ_BUDGET) {
+    ssize_t r = read(s->log_fd, buf, sizeof(buf));
+    if (r > 0) {
+      total += (size_t)r;
+      db_logrd_feed(&s->log_rd, buf, (size_t)r, mono_ms(), db_log_sink, NULL);
+    } else if (r < 0 && errno == EINTR) {
+      continue;
+    } else if (r < 0 && errno == EAGAIN) {
+      return false;
+    } else {                                    /* the end of the stream (the loader, and everything it started, closed its stderr), or an error */
+      db_logrd_flush(&s->log_rd, mono_ms(), db_log_sink, NULL);
+      log_close(s);
+      return false;
+    }
+  }
+  return true;
+}
+
+/* The loader ended: what it left in the pipe is logged first, then the pipe goes (a restart makes a new one) */
+void db_sup_log_finish(db_sup_t *s) {
+  for (int i = 0; i < 4 && s->log_fd >= 0 && db_sup_log_read(s); i++) {
+  }
+  if (s->log_fd >= 0) {
+    db_logrd_flush(&s->log_rd, mono_ms(), db_log_sink, NULL);
+    log_close(s);
+  }
+}
+
+int db_sup_wait_ms(const db_sup_t *s) {
+  int t = db_sup_timeout_ms(s);
+  if (s->log_fd >= 0 && (t < 0 || t > 1000)) t = 1000;
+  return t;
+}
+
 /* The loader runs with the rights of loader-user, and karidns starts it as root: a binary others can replace would
  * be a way to root.  Checked at the start and again before every (re)start, and once more by the child on the open
  * file it then executes (P5: exec_file_open_checked() / exec_file_exec_fd(), shared with karicheck, dns_utils.c). */
@@ -45,7 +189,8 @@ static bool check_loader_path(const char *path, char *err, size_t errlen) {
 
 bool db_sup_init(db_sup_t *s, const server_config_t *cfg, char *err, size_t errlen) {
   memset(s, 0, sizeof(*s));
-  s->ctrl_fd = s->first_fd = s->first_fetch_fd = -1;
+  s->ctrl_fd = s->first_fd = s->first_fetch_fd = s->log_fd = -1;
+  db_logrd_init(&s->log_rd);
   s->backoff_s = 1;
   if (!cfg->database.enabled) return true;
   const database_config_t *db = &cfg->database;
@@ -171,7 +316,7 @@ static bool send_fds(int ctrl, const int *fds, int nfd) {
 }
 
 /* The child between fork() and exec (design 1.2 step 4).  Never returns. */
-static void child_exec(const db_sup_t *s, int stream_fd, int fetch_fd) {
+static void child_exec(const db_sup_t *s, int stream_fd, int fetch_fd, int log_wfd) {
   char msg[300];
   /* The parent blocked the signals across the fork: the dispositions are reset first, the mask is emptied last */
   /* An ignored disposition survives exec: a "pkill -HUP karidns" cannot kill a loader that has not installed its
@@ -191,9 +336,14 @@ static void child_exec(const db_sup_t *s, int stream_fd, int fetch_fd) {
   char tzbuf[128] = "";
   if (tz) snprintf(tzbuf, sizeof(tzbuf), "%s", tz);
 
-  /* stream on fd 3, the fetch stream (D1a) on fd 4, stdin / stdout on /dev/null, stderr kept, everything else closed */
+  /* stream on fd 3, the fetch stream (D1a) on fd 4, stdin / stdout on /dev/null, stderr the pipe to the supervisor (batch 14; no pipe: the
+   * manager's own stderr, kept), everything else closed.  Each descriptor that is moved is first copied above 10, so that none of the
+   * targets 0 .. 4 can be the source of a later copy. */
   int hi = fcntl(stream_fd, F_DUPFD, 10);
   if (hi < 0) _exit(127);
+  int hw = log_wfd >= 0 ? fcntl(log_wfd, F_DUPFD, 10) : -1;
+  if (log_wfd >= 0 && hw < 0) _exit(127);
+  const char *pri = hw >= 0 ? "<3>" : "";      /* LOG_ERR for the pipe reader (what is written below before the exec) */
   int hf = fetch_fd >= 0 ? fcntl(fetch_fd, F_DUPFD, 10) : -1;
   if (fetch_fd >= 0 && hf < 0) _exit(127);
   int dn = open("/dev/null", O_RDWR);
@@ -201,6 +351,7 @@ static void child_exec(const db_sup_t *s, int stream_fd, int fetch_fd) {
     dup2(dn, 0);
     dup2(dn, 1);
   }
+  if (hw >= 0 && dup2(hw, 2) < 0) _exit(127);
   if (dup2(hi, 3) < 0) _exit(127);
   if (hf >= 0 && dup2(hf, 4) < 0) _exit(127);
   closefrom(hf >= 0 ? 5 : 4);
@@ -210,12 +361,12 @@ static void child_exec(const db_sup_t *s, int stream_fd, int fetch_fd) {
   char err[256];
   int xfd = exec_file_open_checked(s->path, geteuid(), "database loader", "the user running karidns", err, sizeof(err));
   if (xfd < 0) {
-    int n = snprintf(msg, sizeof(msg), "[Manager] %s\n", err);
+    int n = snprintf(msg, sizeof(msg), "%s[Manager] %s\n", pri, err);
     if (n > 0) (void)!write(2, msg, (size_t)n);
     _exit(127);
   }
   if (!apply_run_identity_id(&s->id, err, sizeof(err))) {
-    int n = snprintf(msg, sizeof(msg), "[Manager] database loader: %s\n", err);
+    int n = snprintf(msg, sizeof(msg), "%s[Manager] database loader: %s\n", pri, err);
     if (n > 0) (void)!write(2, msg, (size_t)n);
     _exit(127);
   }
@@ -225,7 +376,7 @@ static void child_exec(const db_sup_t *s, int stream_fd, int fetch_fd) {
   if (chdir("/") != 0) _exit(127);
   clearenv();
   if (tz) setenv("TZ", tzbuf, 1);
-  char *argv[8] = { (char *)"karidns-dbloader", (char *)"-s", (char *)"3", NULL };
+  char *argv[9] = { (char *)"karidns-dbloader", (char *)"-s", (char *)"3", NULL };
   int ac = 3;
   if (hf >= 0) {
     argv[ac++] = (char *)"--fetch-fd";
@@ -235,10 +386,11 @@ static void child_exec(const db_sup_t *s, int stream_fd, int fetch_fd) {
     argv[ac++] = (char *)"--state-file";
     argv[ac++] = (char *)s->state_file;
   }
+  if (hw >= 0) argv[ac++] = (char *)"--log-stderr";    /* its messages go down the pipe, not to syslog (the supervisor logs them) */
   argv[ac] = NULL;
   extern char **environ;
   exec_file_exec_fd(xfd, s->path, argv, environ);
-  int n = snprintf(msg, sizeof(msg), "[Manager] cannot execute '%s': %s\n", s->path, strerror(errno));
+  int n = snprintf(msg, sizeof(msg), "%s[Manager] cannot execute '%s': %s\n", pri, s->path, strerror(errno));
   if (n > 0) (void)!write(2, msg, (size_t)n);
   _exit(127);
 }
@@ -294,6 +446,24 @@ bool db_sup_spawn(db_sup_t *s) {
       syslog(LOG_WARNING, "[Manager] Cannot create the loader fetch stream: %m; the loader will run without it");
     }
   }
+  /* batch 14: the loader's stderr, a pipe the supervisor reads (a new one for every start; the read end is close-on-exec and not shared with
+   * the Backend or the routers, which were forked before the first start).  Without one the loader logs to syslog, as it did. */
+  int log_rfd = -1, log_wfd = -1;
+  {
+    int lp[2];
+    if (pipe2(lp, O_CLOEXEC) == 0) {
+      int fl = fcntl(lp[0], F_GETFL, 0);
+      if (fl >= 0 && fcntl(lp[0], F_SETFL, fl | O_NONBLOCK | (s->want_sigio ? O_ASYNC : 0)) == 0 &&
+          (!s->want_sigio || fcntl(lp[0], F_SETOWN, getpid()) == 0)) {
+        log_rfd = lp[0];
+        log_wfd = lp[1];
+      } else {
+        close(lp[0]);
+        close(lp[1]);
+      }
+    }
+    if (log_rfd < 0) syslog(LOG_WARNING, "[Manager] Cannot create the pipe for the loader's messages: %m; the loader will log to syslog itself");
+  }
   gc_snapshot_wait_idle();   /* fork from a single thread (see dns_snapshot_rcu.c) */
   /* The child inherits the manager's flag-only handlers until child_exec() resets them: block the signals across the
    * fork so one that arrives meanwhile stays pending and is delivered with the default action after the reset */
@@ -308,7 +478,8 @@ bool db_sup_spawn(db_sup_t *s) {
   if (pid == 0) {
     if (backend_fd >= 0) close(backend_fd);
     if (backend_fetch_fd >= 0) close(backend_fetch_fd);
-    child_exec(s, loader_fd, loader_fetch_fd); /* resets the dispositions, then unblocks */
+    if (log_rfd >= 0) close(log_rfd);
+    child_exec(s, loader_fd, loader_fetch_fd, log_wfd); /* resets the dispositions, then unblocks */
   }
   int fork_errno = errno;
   sigprocmask(SIG_SETMASK, &fork_orig, NULL);
@@ -316,6 +487,10 @@ bool db_sup_spawn(db_sup_t *s) {
   if (pid < 0) {
     syslog(LOG_ERR, "[Manager] fork for the database loader failed: %m");
     close(loader_fd);
+    if (log_rfd >= 0) {
+      close(log_rfd);
+      close(log_wfd);
+    }
     if (loader_fetch_fd >= 0) close(loader_fetch_fd);
     if (backend_fd >= 0) close(backend_fd);
     if (backend_fetch_fd >= 0) close(backend_fetch_fd);
@@ -324,6 +499,12 @@ bool db_sup_spawn(db_sup_t *s) {
   }
   close(loader_fd);
   if (loader_fetch_fd >= 0) close(loader_fetch_fd);
+  if (log_rfd >= 0) {
+    close(log_wfd);                  /* (the end of the pipe is seen when the loader, and everything it starts, has closed its stderr) */
+    log_close(s);                    /* a pipe of an earlier start that was not drained: its loader is gone */
+    db_logrd_init(&s->log_rd);
+    s->log_fd = log_rfd;
+  }
   if (backend_fd >= 0) {
     /* The Backend turns the descriptors into its streams (and limits their rights).  If they cannot be sent, the Backend is
      * not listening any more; it is going down, and the loader will find its ends closed.  The fetch stream, when there is one,
@@ -345,6 +526,7 @@ bool db_sup_spawn(db_sup_t *s) {
 bool db_sup_child_exited(db_sup_t *s, pid_t pid, int status) {
   if (!s->enabled || s->pid == 0 || pid != s->pid) return false;
   int64_t now = mono_ms();
+  db_sup_log_finish(s);                  /* the rest of its messages first */
   if (WIFEXITED(status))
     syslog(WEXITSTATUS(status) == 0 ? LOG_NOTICE : LOG_ERR, "[Manager] Database loader (pid %d) exited (status=%d)",
            (int)pid, WEXITSTATUS(status));

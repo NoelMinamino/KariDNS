@@ -2,6 +2,7 @@
 #include "dns_dynamic_update.h"
 #include "dns_server_internal.h"
 #include "dns_wire.h"
+#include "dns_query_engine.h"
 #include "dns_utils.h"
 #include "dns_zone_image.h"
 #include "dns_axfr_ixfr.h"
@@ -94,6 +95,35 @@ static uint32_t soa_serial_in_arena(const zone_arena_t *arena, const char *zone_
   return 0;
 }
 
+/* batch 14, category update (BIND lib/ns/update.c update_log(): "updating zone 'z/IN': update failed: <reason> (<RCODE>)", INFO): why an UPDATE
+ * the zone is authoritative for was not applied.  Only the reasons the client causes; the server-side failures (SERVFAIL) log themselves. */
+static void update_log_failure(const zone_db_entry_t *entry, const char *client_ip, int rcode, const update_result_t *res) {
+  if (!logev_wanted(LOGC_UPDATE, LOG_LVL_INFO)) return;
+  char zn[512], tn[32], what[320];
+  logev_name_text(entry->domain, zn, sizeof(zn));
+  const char *why;
+  what[0] = '\0';
+  switch (rcode) {
+    case 1: why = "malformed update message"; break;
+    case 3: case 6: case 7: case 8: why = "prerequisite not satisfied"; break;
+    case 10: why = "name outside the zone"; break;
+    case 5:
+      if (res->why == UPD_WHY_POLICY) {
+        char dn[300];
+        logev_name_text(res->deny_name, dn, sizeof(dn));
+        snprintf(what, sizeof(what), ": %s %s", dn, format_type_name(res->deny_type, tn, sizeof(tn)));
+        why = "rejected by secure update";
+      } else if (res->why == UPD_WHY_TOO_MANY) {
+        why = "too many records in the update message";
+      } else {
+        why = "refused";
+      }
+      break;
+    default: return;
+  }
+  logev_post(LOGC_UPDATE, LOG_LVL_INFO, client_ip, query_client_port(), "updating zone '%s/IN': update failed: %s (%s)%s", zn, why, dns_rcode_name((unsigned)rcode), what);
+}
+
 int handle_dynamic_update(const uint8_t *req, size_t req_len,
                           zone_db_entry_t *entry,
                           const char *client_ip,
@@ -142,6 +172,7 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
      * 無視された RR や既存と同じ RR だけ) はシリアルを上げず、公開も NOTIFY もしない (§3.6)。*/
     zone_arena_destroy(z_standby);
     pthread_mutex_unlock(&entry->writer_lock);
+    if (rcode != 0) update_log_failure(entry, client_ip, rcode, &result);
     if (rcode == 0) {
       syslog(LOG_INFO, "[Update] client=%s key=%s zone='%s' prcount=%d upcount=%d: no change",
              client_ip, matched_key_name, entry->domain, result.prcount, result.upcount);

@@ -4538,6 +4538,14 @@ bool update_policy_allows(const update_policy_t *pol, const char *signer, const 
     return false;
 }
 
+/* update-policy refused the change of `name`/`type`: remember which, for the log (update_result_t) */
+static void update_deny(update_result_t *out, const char *name, uint16_t type) {
+    if (!out) return;
+    out->why = UPD_WHY_POLICY;
+    out->deny_type = type;
+    snprintf(out->deny_name, sizeof(out->deny_name), "%s", name ? name : "");
+}
+
 int process_update_sections_policy(const uint8_t *req, size_t req_len,
                              const char *zone_name,
                              zone_arena_t *standby,
@@ -4560,6 +4568,7 @@ int process_update_sections_policy(const uint8_t *req, size_t req_len,
 
     // Prevent DoS: Hard limit on number of updates per message
     if ((size_t)prcount + (size_t)upcount > 1000) {
+        if (out) out->why = UPD_WHY_TOO_MANY;
         return 5; // REFUSED
     }
 
@@ -4659,9 +4668,10 @@ int process_update_sections_policy(const uint8_t *req, size_t req_len,
                 /* every RRset of the name goes: each type that is there must be allowed (ssu_checkall()) */
                 for (int k = update_bucket_head(standby, name); k != -1; k = standby->records[k].next_record) {
                     if (!update_rec_is_at(&standby->records[k], name)) continue;
-                    if (!update_policy_allows(pol, signer, name, standby->records[k].type_code)) return 5; // REFUSED
+                    if (!update_policy_allows(pol, signer, name, standby->records[k].type_code)) { update_deny(out, name, standby->records[k].type_code); return 5; } // REFUSED
                 }
             } else if (!update_policy_allows(pol, signer, name, type)) {
+                update_deny(out, name, type);
                 return 5; // REFUSED
             }
         }

@@ -64,7 +64,10 @@ make karidns-dbloader DB_DRIVERS="sqlite3 postgresql"
 : Print the compiled-in drivers, one per line, and exit.
 
 `-s FD`
-: Stream mode: `FD` is the socket to the Backend. Started by `karidns`. The loader logs to syslog and ends when the Backend closes the stream or on `SIGTERM` / `SIGINT` (also in the middle of a long load: it stops at the next zone, within milliseconds); `SIGHUP` is ignored.
+: Stream mode: `FD` is the socket to the Backend. Started by `karidns`. The loader ends when the Backend closes the stream or on `SIGTERM` / `SIGINT` (also in the middle of a long load: it stops at the next zone, within milliseconds); `SIGHUP` is ignored.
+
+`--log-stderr`
+: With `-s`: write the messages to standard error instead of syslog, one line each, `<N>[DB] text` with `N` the syslog priority (0 .. 7) and a newline at the end, at most 500 bytes (a longer text is cut and ends in `...`; control characters become `?`). `karidns` starts the loader this way, with a pipe as its standard error, reads the lines and logs them in the `database` category (see MESSAGES). Without this option `-s` logs to syslog (identity `karidns-dbloader`, `[DB]` in front of the text). If standard error cannot be written (the pipe is closed), the message goes to syslog. It is an error without `-s`.
 
 `--driver DRIVER`
 : `sqlite3` or `postgresql` (a driver that was compiled in).
@@ -120,6 +123,36 @@ D1a step 7. With `--state-file` the loader keeps, for the Backend, the list of t
 - **`WARM_LIST`** (loader to Backend): once, after the startup load, the zones of the file in order (an empty list when the file is missing or damaged), with what the loader found in the file at its start (`loaded`, `missing`, `corrupt`, `unreadable`) for `karictl dbstatus`.
 
 The file is text: `KARIDNS-HOT-LIST 1`, one line `view<TAB>zone` for each zone, hottest first, and `END <count> <checksum>` (FNV-1a over the entry lines, eight hex digits). **Permissions.** The loader runs as `loader-user` and writes in the directory of the file: give it a directory of its own, owned by `loader-user`, mode 0700 (`install -d -o karidns-db -m 0700 /var/db/karidns/state`). The file is created with mode 0600. The Backend, in capability mode, never opens it. The loader opens the file with `O_NOFOLLOW`, so **a state file that is a symbolic link is UNREADABLE** (`karictl dbstatus` shows `state-file: ... at_start=unreadable, ignored`), even when the link points to a good file: give `loader-state-file` the real path (a link in a directory *above* the file is fine; only the last component counts). A state file that exists and cannot be read (permissions, a link, not a regular file) is **not replaced**: the loader says so in its log and in the acknowledgement of every hot list (`failed`), and keeps going without a state file until it is fixed or removed. The count and checksum of the `END` line must have exactly the form written (decimal digits, one space, eight lower case hex digits); the limit of a list is the one its first part says. The file is not trusted when it is read: it may be damaged, or written by somebody who could write in the directory; whatever its contents, the Backend reads only zones it has in its directory, at most 100000 of them, at the rate of `fetch-rate`.
+
+## MESSAGES
+
+Run on its own (`--dump`, `--check`), the loader writes its messages to standard error, `karidns-dbloader: text`, as it always did (the dump tests and scripts read those lines).
+
+Started by `karidns` (`-s`), the loader's standard error is a pipe that the supervisor (the manager process, which also restarts the loader) creates for every start: `karidns-dbloader -s 3 [--fetch-fd 4] [--state-file PATH] --log-stderr`. The loader writes `<N>[DB] text` lines; the supervisor reads the pipe without blocking and logs each line in the `database` category of BIND's `logging { }` statement, with the severity of `N` (`<3>` error, `<4>` warning, `<5>` notice, `<6>` info), so a configuration such as
+
+```
+logging {
+    channel dbfile { file "/var/log/karidns/database.log" versions 5 size 10m; severity info; print-time yes; print-severity yes; print-category yes; };
+    category database { dbfile; };
+};
+```
+
+collects the messages of the loader together with the `[DB]` messages of the Backend (stream, batches, installs). Example lines:
+
+```
+28-Oct-2026 12:34:56.789 database: warning: [DB] zone 'zero.example.test.' (domains.id 2): the SOA serial is 0; PowerDNS may compute the served serial (SOA-EDIT, auto-serial), but KariDNS uses the stored value as it is, so secondaries and NOTIFY see serial 0
+28-Oct-2026 12:34:56.790 database: info: [DB] state file /var/db/karidns/hot.list: 12 zone(s) of the hot list
+28-Oct-2026 12:35:10.001 database: warning: [DB] 480 line(s) of the loader's output were not logged (more than 50 per second)
+```
+
+A message is logged once: when the loader is supervised it does not also write to syslog (syslog is only the fallback when the pipe cannot be written), and with no `category database` the lines go to the channels of `default` / `default_syslog` like any other category. The bytes of the pipe are untrusted input of the manager, which runs with root's rights until it drops them:
+
+- a line is cut at 512 bytes of text and ends in `...`; the rest of a longer line is read and thrown away, never kept;
+- everything but printable ASCII is written as `\xNN` (a NUL, ESC, a CR that does not end a CRLF, bytes of 0x80 and above), a tab as a space, so that nothing a database name contains can start a line of the log or hide in it;
+- a line without `<N>` is logged at `notice`; empty lines are dropped; the end of the stream or the loader's end logs a last line that has no newline;
+- at most 50 lines per second are logged; the others are counted and reported by one `warning` line when their second is over (also when the loader writes nothing more);
+- one read takes at most 64 KiB, and the manager looks at its signals between reads, so a loader that floods the pipe cannot keep the manager from `SIGTERM`; a full pipe makes the loader wait;
+- the pipe is made for every start (close-on-exec, read end non-blocking), drained when the loader ends and then closed: restarts do not leave descriptors behind.
 
 ## EXIT STATUS
 
