@@ -879,11 +879,9 @@ static bool notify_add_glue(const zone_image_t *img, const char *name, notify_de
 /* A zone in memory whose NS host is in another zone of the view that is out of memory (a provider's zone): the address is not in any image.  When the host is also
  * one of the NS hosts of that zone and lies inside it, its address is in the glue of that zone's apex (D1a step 6), which is kept for a zone that notifies or
  * transfers; the apex of the version the directory has is used.  A host that is not an NS host of its own zone has no address here (the loader's addresses come with the
- * summary of the zone that has the NS record, not with the body).  true if an address was added. */
-static bool notify_add_sibling_apex(view_snapshot_t *view, const char *name, notify_dest_t *targets, int *count, int max, const tsig_key_t *tkey, uint16_t port) {
-  zdir_elem_t *pel = NULL;
-  (void)find_zone_for_query_ex(view, name, 0, &pel);
-  if (!pel || zdir_entry(pel)) return false;
+ * summary of the zone that has the NS record, not with the body).  pel: the zone that holds the host, as the caller's one lookup found it out of memory.
+ * true if an address was added. */
+static bool notify_add_sibling_apex(const zdir_elem_t *pel, const char *name, notify_dest_t *targets, int *count, int max, const tsig_key_t *tkey, uint16_t port) {
   const zdir_apex_t *ap = atomic_load_explicit(&pel->apex, memory_order_acquire);
   if (!ap || ap->glue_len == 0 || ap->serial != zdir_serial(pel)) return false;
   const uint8_t *ns = ap->data + ap->mname_len + ap->rname_len, *glue = ns + ap->ns_len;
@@ -1048,9 +1046,10 @@ static void notify_send_zone(zone_db_entry_t *entry, const zdir_elem_t *el, cons
       if (mname && !eff.notify_to_soa && domain_names_match_ci(ns_target, mname)) continue;
       // A. in-zone glue, B. otherwise the address in a sibling zone of the same view
       if (notify_add_glue(img, ns_target, targets, &ntargets, 64, key, ns_port)) continue;
-      zone_db_entry_t *sib_entry = find_zone_in_view(view, ns_target);
+      zdir_elem_t *sib_el = NULL;                          /* (one lookup decides: the data of the zone may come into memory or leave it at any moment) */
+      zone_db_entry_t *sib_entry = view ? find_zone_for_query_ex(view, ns_target, 0, &sib_el) : NULL;
       if (!sib_entry) {                                    /* (a zone of the view that is out of memory: the glue of its apex, D1a step 7) */
-        if (entry && view) (void)notify_add_sibling_apex(view, ns_target, targets, &ntargets, 64, key, ns_port);
+        if (entry && sib_el) (void)notify_add_sibling_apex(sib_el, ns_target, targets, &ntargets, 64, key, ns_port);
         continue;
       }
       if (sib_entry == entry) continue;

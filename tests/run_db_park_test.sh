@@ -67,7 +67,7 @@ export ASAN_OPTIONS="detect_leaks=0:abort_on_error=0"      # (the evict command 
 mkdir "$T/db" "$T/z"
 chown nobody "$T/db"; chmod 777 "$T/db"
 sqlite3 "$T/db/z.db" < tests/db/pdns_schema.sqlite3.sql > /dev/null
-for n in a b c d; do
+for n in a b c d x; do
     cat > "$T/z/$n.test.zone" <<EOF
 \$ORIGIN $n.test.
 \$TTL 300
@@ -79,6 +79,7 @@ EOF
     ./tests/db/zone2sql --dialect sqlite3 "$T/z/$n.test.zone" 2>/dev/null | sqlite3 "$T/db/z.db"
 done
 sqlite3 "$T/db/z.db" "INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'ALLOW-DNSUPDATE-FROM', '127.0.0.1' FROM domains WHERE name IN ('b.test', 'c.test');"
+sqlite3 "$T/db/z.db" "INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'ALLOW-AXFR-FROM', '127.0.0.1' FROM domains WHERE name = 'x.test';"
 chmod 666 "$T/db/z.db"*
 install -o root -g wheel -m 755 "$LOADER" "$T/karidns-dbloader" 2>/dev/null || { cp "$LOADER" "$T/karidns-dbloader"; chown 0:0 "$T/karidns-dbloader"; chmod 755 "$T/karidns-dbloader"; }
 cat > "$T/karictl.conf" <<EOF
@@ -128,6 +129,32 @@ resident_again a.test. "... and the zone is in memory again (it came through the
 evicted a.test. "a.test is out of memory again"
 [ "$(q www.a.test +tcp)" = "192.0.2.80" ] && pass "the TCP query is answered with the data of the database" || fail "TCP: '$(q www.a.test +tcp)'"
 resident_again a.test. "... and the zone is in memory again"
+
+echo "== a TCP transfer whose zone leaves or enters memory while the request is decided (one reading of the zone)"
+# `karictl xfr-delay MS` (TEST ONLY, the same build as evict) makes the dispatch wait after it has read the zone's element.  The zone is evicted, or
+# brought in by a query, in that window: the transfer must be decided from the one reading (it used to read the zone three times: an eviction in between
+# gave REFUSED "non-authoritative zone", a load in between an ACL denial)
+xfr_soas() { grep -c 'SOA' "$1" 2>/dev/null; }
+[ "$(q www.x.test)" = "192.0.2.80" ] && evict x.test. | grep -q '^OK' && q www.x.test > /dev/null && pass "x.test is in memory" || fail "x.test is not in memory"
+$KCTL xfr-delay 1500 | grep -q '^OK' && pass "karictl xfr-delay (the test hook)" || fail "xfr-delay: $($KCTL xfr-delay 1500 2>&1)"
+./dag @127.0.0.1 -p "$PORT" x.test AXFR +nohexdump +noall +answer +comments +time=10 +tries=1 > "$T/xa.out" 2>&1 &
+XP=$!
+sleep 0.5
+evict x.test. | grep -q '^OK' && pass "x.test was evicted while its AXFR request was being decided" || fail "the eviction in the window failed"
+wait "$XP"
+[ "$(xfr_soas "$T/xa.out")" = "2" ] && ! grep -q REFUSED "$T/xa.out" && pass "the AXFR is complete (the zone as it was read), not REFUSED" || fail "AXFR during the eviction: $(head -5 "$T/xa.out")"
+./dag @127.0.0.1 -p "$PORT" x.test AXFR +nohexdump +noall +answer +comments +time=10 +tries=1 > "$T/xb.out" 2>&1 &
+XP=$!
+sleep 0.5
+# (three queries at once: one that lands on the worker that is waiting in the dispatch is answered only after the window)
+QP=""
+for i in 1 2 3; do q www.x.test > "$T/xq$i.out" & QP="$QP $!"; done
+for p in $QP; do wait "$p"; done
+grep -qx 192.0.2.80 "$T/xq1.out" && evict x.test. | grep -q '^OK' && q www.x.test > /dev/null && pass "x.test came into memory while its AXFR request was being decided" || fail "the load in the window failed"
+wait "$XP"
+[ "$(xfr_soas "$T/xb.out")" = "2" ] && ! grep -q REFUSED "$T/xb.out" && pass "the AXFR is complete, not refused as an ACL denial" || fail "AXFR during the load: $(head -5 "$T/xb.out")"
+$KCTL xfr-delay 0 > /dev/null
+$KCTL xfr-delay 99999 | grep -q '^ERROR' && pass "xfr-delay refuses a delay above 10 s" || fail "xfr-delay 99999 was accepted"
 
 echo "== allow-query is evaluated before the query parks"
 if [ -z "$ALIAS" ]; then

@@ -42,6 +42,9 @@ sub skip_name {
     }
 }
 
+# the seconds to the deadline (a stall of the server in the middle of a transfer is waited for until then, not given up after one second)
+sub left { my $d = $_[0] - time(); return $d > 0 ? $d : 0; }
+
 # one transfer; returns (status, rrs).  status: ok / bad / servfail / refused / other
 sub transfer {
     my ($zone, $qt, $serial) = @_;
@@ -56,7 +59,7 @@ sub transfer {
     while (time() < $deadline) {
         my $hdr = '';
         while (length $hdr < 2) {
-            $sel->can_read(1) or last;
+            $sel->can_read(left($deadline)) or last;
             my $n = sysread($s, my $c, 2 - length $hdr);
             last unless $n;
             $hdr .= $c;
@@ -65,7 +68,7 @@ sub transfer {
         my $len = unpack('n', $hdr);
         my $msg = '';
         while (length $msg < $len) {
-            $sel->can_read(1) or last;
+            $sel->can_read(left($deadline)) or last;
             my $n = sysread($s, my $c, $len - length $msg);
             last unless $n;
             $msg .= $c;

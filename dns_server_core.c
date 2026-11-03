@@ -154,6 +154,19 @@ _Atomic int g_xfers_running = ATOMIC_VAR_INIT(0);
 _Atomic int g_tcp_clients = ATOMIC_VAR_INIT(0);
 _Atomic int g_tcp_high_water = ATOMIC_VAR_INIT(0);
 
+#ifdef KARIDNS_TEST_EVICT
+/* TEST ONLY (karidns-evict and the coverage build, never a production build): `karictl xfr-delay <ms>` makes the TCP zone transfer dispatch wait this
+ * long after it has read the zone's element, so that a test can take the zone out of memory or bring it in while a transfer request is being decided
+ * (run_db_park_test.sh).  0: no wait. */
+static _Atomic uint32_t g_test_xfr_delay_ms;
+static void xfr_test_delay(void) {
+  const uint32_t ms = atomic_load_explicit(&g_test_xfr_delay_ms, memory_order_relaxed);
+  if (ms == 0) return;
+  struct timespec ts = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000L };
+  nanosleep(&ts, NULL);
+}
+#endif
+
 #define response_log_enabled(cfg) ((cfg) && (cfg)->logging.responses_enabled)
 
 resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
@@ -2853,26 +2866,35 @@ process_tcp_client: ;
               : NULL;
           zdir_elem_t *xfr_el = NULL;         /* D1a step 7: the database zone of the transfer when its data is not in memory (the thread waits for it) */
           zone_config_t xfr_nr_zc;            /* ... and its settings as the directory element keeps them (the ACL levels read them) */
+          zone_db_entry_t *xfr_entry = NULL;  /* the zone of the transfer when its data is in memory */
           if (xfr_view && (qtype == 252 || qtype == 251)) {
+            /* The element of the zone is looked up once and its entry loaded once (one acquire): the memory cache (D1a) takes the data of a DB zone out of
+             * memory and brings it back at any moment, so the settings, the "not in memory" path and the zone that is transferred are all decided from this
+             * one reading.  (They were three readings: a zone evicted between them was answered "non-authoritative zone" (REFUSED), one that came into
+             * memory between them was refused as an ACL denial.)  The entry stays valid while it is used: the read section (rcu_reader_enter() above) and
+             * the snapshot this thread holds, which the transfer thread retains; an entry that was taken out of memory meanwhile is retired with that
+             * snapshot, and its version with it.  The exact name: a transfer is of the zone whose apex is the QNAME (RFC 5936 §2.1.1, RFC 1995 §3),
+             * never of a zone that encloses it. */
+            zdir_elem_t *xel = zdir_find_exact(xfr_view, qname);
+            xfr_entry = zdir_entry(xel);
+#ifdef KARIDNS_TEST_EVICT
+            xfr_test_delay();                /* TEST ONLY: the window between the reading and the decisions (run_db_park_test.sh) */
+#endif
             /* a DB zone has settings of its own (dbcfg), and a secondary may have settings received from its primary (B8t-2: rxcfg,
              * the zone's own statements first): the transfer checks below read them like a configured zone's */
-            zone_db_entry_t *xfr_entry = find_zone_exact_in_view(xfr_view, qname);
             if (xfr_entry && (!zcfg || xfr_entry->source == ZONE_SRC_DB || atomic_load_explicit(&xfr_entry->rxcfg, memory_order_acquire))) {
               const zone_config_t *ec = zone_entry_config(cfg, xfr_entry);
               if (ec) zcfg = ec;
-            } else if (!xfr_entry && !zcfg) {
+            } else if (!xfr_entry && !zcfg && xel) {
               /* a zone of the database that is in the directory without its data (memory-limit): the allow-transfer / TSIG checks below are made with the
                * settings the element kept, before anything is read for the transfer (the same order as allow-query for a parked query: a client that is
-               * refused costs no fetch) */
-              zdir_elem_t *nel = zdir_find_exact(xfr_view, qname);
-              if (nel && !zdir_entry(nel)) {
-                zone_ext_shared_t *nsh = atomic_load_explicit(&nel->sh, memory_order_acquire);
-                memset(&xfr_nr_zc, 0, sizeof(xfr_nr_zc));
-                xfr_nr_zc.domain = (char *)nel->name;
-                xfr_nr_zc.ext = nsh ? &nsh->ext : NULL;
-                zcfg = &xfr_nr_zc;
-                xfr_el = nel;
-              }
+               * refused costs no fetch).  If the data comes into memory meanwhile, the transfer thread finds it there (db_ingest_xfr_await()). */
+              zone_ext_shared_t *nsh = atomic_load_explicit(&xel->sh, memory_order_acquire);
+              memset(&xfr_nr_zc, 0, sizeof(xfr_nr_zc));
+              xfr_nr_zc.domain = (char *)xel->name;
+              xfr_nr_zc.ext = nsh ? &nsh->ext : NULL;
+              zcfg = &xfr_nr_zc;
+              xfr_el = xel;
             }
           }
           bool is_synthetic_zone = (zcfg && zcfg->type &&
@@ -2916,8 +2938,7 @@ process_tcp_client: ;
             static_assert(sizeof(tsig_mac) >= sizeof(tsig.mac), "tsig_mac must hold the request MAC");
             size_t tsig_mac_len = matched_key ? tsig.mac_len : 0;
             if (tsig_mac_len > 0) memcpy(tsig_mac, tsig.mac, tsig_mac_len);
-            zone_db_entry_t *entry = xfr_view ? find_zone_in_view(xfr_view, qname) : NULL;
-            if (entry) xfr_el = NULL;          /* (it came into memory meanwhile: the usual transfer) */
+            zone_db_entry_t *entry = xfr_entry;   /* (the one reading above; with xfr_el NULL whenever it is not) */
             int xfr_deny = 0;                  /* batch 14: why the request is not served after it was allowed (XD_*, dns_axfr_ixfr.h), for the log */
             uint32_t xfr_deny_limit = 0;
             /* RFC 5936 §2.1 / RFC 1995 §3: a request that is not shaped like a transfer request (opcode, RCODE, the counts, the IXFR SOA, the Additional
@@ -4362,6 +4383,14 @@ void *control_thread_func(void *arg) {
               if (db_ingest_pick_view(view_arg, ev_view, sizeof(ev_view), ev_why, sizeof(ev_why)) && ev_view[0] && dbreg_test_evict(ev_view, arg))
                 (void)ctl_send_all(cfd, "OK\n", 3);
               else (void)ctl_send_all(cfd, "ERROR no such zone in memory\n", 29);
+            } else if (strcmp(cmd, "xfr-delay") == 0 && arg) {
+              /* TEST ONLY (as evict): the wait of the TCP zone transfer dispatch after it has read the zone (xfr_test_delay()), in ms, at most 10 s */
+              char *end = NULL;
+              unsigned long ms = strtoul(arg, &end, 10);
+              if (end && end != arg && *end == '\0' && ms <= 10000) {
+                atomic_store_explicit(&g_test_xfr_delay_ms, (uint32_t)ms, memory_order_relaxed);
+                (void)ctl_send_all(cfd, "OK\n", 3);
+              } else (void)ctl_send_all(cfd, "ERROR bad delay\n", 16);
 #endif
             } else if (strcmp(cmd, "dbstatus") == 0) {
               /* beta design 5.2: the loader, the batches and the DB zones of the registry */
