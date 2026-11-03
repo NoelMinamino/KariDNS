@@ -2998,6 +2998,7 @@ process_tcp_client: ;
                   args->qtype = qtype;
                   args->has_edns = has_edns;
                   args->dnssec_ok = dnssec_ok;
+                  args->send_ede = cfg ? cfg->send_extended_errors : false;
                   args->req_len = msg_len > sizeof(args->req) ? sizeof(args->req) : msg_len;
                   memcpy(args->req, msg, args->req_len);
                   if (matched_key) {
@@ -3067,6 +3068,7 @@ process_tcp_client: ;
               uint8_t rcode = 5; /* REFUSED: 方針による拒否 (RFC 1035 §4.1.1、RFC 5936 §5)。AA=0 (R-06) */
               uint16_t qd_echo = 1;
               int built;
+              const bool send_ede = cfg ? cfg->send_extended_errors : false;
               if (badvers) {
                 built = dns_build_badvers_response(msg, msg_len, res_buf, sizeof(res_buf), 1, &edns, true, cfg);
               } else {
@@ -3074,19 +3076,27 @@ process_tcp_client: ;
                   rcode = 1;       /* RFC 8945 §5.2: 解釈できない TSIG */
                 } else if (tsig.status == TSIG_REQ_ERROR) {
                   rcode = 9;       /* RFC 8945 §5.2.1-§5.2.4: TSIG のエラーは NOTAUTH */
-                  add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Invalid TSIG");
+                  add_ede(&edns, send_ede, 18, "Invalid TSIG");
                 } else if (shape_bad) {
                   rcode = 1;       /* RFC 5936 §2.2.1 note e: a malformed request is a FORMERR */
-                  qd_echo = (msg[4] | msg[5]) ? 1 : 0;   /* (the first question only, and none when the request counts none) */
+                } else if (deny == XD_QUOTA) {
+                  /* transfers-out: a refusal for the server's own reason, not a policy about the client, so not 18 Prohibited: 0 Other (RFC 8914 §4.1) */
+                  add_ede(&edns, send_ede, 0, "Too many zone transfers in progress");
+                } else if (deny == XD_NO_THREAD || deny == XD_NO_MEMORY) {
+                  /* an internal failure: 0 Other without a text, so the answer looks like any refusal and tells the client nothing about the server's
+                   * state; the reason is in the xfer-out log line above */
+                  add_ede(&edns, send_ede, 0, NULL);
                 } else if (deny == XD_NOZONE && xfr_view) {
                   /* a zone this server is not authoritative for (also a QCLASS other than IN): EDE 20 Not Authoritative (RFC 8914 §4.21), as the UDP IXFR and a
                    * query for such a name are answered (dns_query_engine.c); 18 Prohibited (§4.19) is for a client a policy refuses */
-                  add_ede(&edns, cfg ? cfg->send_extended_errors : false, 20, "This server is not authoritative for the queried zone");
+                  add_ede(&edns, send_ede, 20, "This server is not authoritative for the queried zone");
                 } else if (deny == XD_NOZONE) {
-                  add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Query refused due to access control (no view matched)");
+                  add_ede(&edns, send_ede, 18, "Query refused due to access control (no view matched)");
                 } else {
-                  add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Query refused due to access control");
+                  add_ede(&edns, send_ede, 18, "Query refused due to access control");
                 }
+                /* a FORMERR echoes the questions as BIND does (dns_error_qd_echo()) */
+                if (rcode == 1) qd_echo = dns_error_qd_echo(msg, msg_len);
                 /* 質問セクションまで (Rule 3)。TSIG なしの要求への応答は署名しない (RFC 8945 §5.3) */
                 built = dns_build_error_response(msg, msg_len, res_buf, sizeof(res_buf), rcode, 0, qd_echo,
                                                  &edns, true, cfg);

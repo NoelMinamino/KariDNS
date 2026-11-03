@@ -153,6 +153,12 @@ static void test_fi_axfr_send_and_recv(void) {
         send_axfr_response(1, "fixfr.example.", req, qoff, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
     });
 
+    /* every allocation of the transfer fails in turn: the first one (the message buffer) is answered REFUSED + EDE 0 without a text (as the TCP dispatch
+     * answers its own want of memory), the others end the transfer; nothing leaks or crashes */
+    FI_SWEEP({
+        send_axfr_response(1, "fixfr.example.", req, qoff, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    });
+
     pthread_mutex_destroy(&entry.writer_lock);
     pthread_mutex_destroy(&entry.ixfr_history.lock);
     zone_arena_destroy(&arena);

@@ -124,6 +124,7 @@ typedef struct {
   uint16_t qtype;
   bool has_edns;
   bool dnssec_ok;
+  bool send_ede;            /* send-extended-errors when the request was taken: the thread's error answers before it reads the configuration */
   uint8_t req[BUFFER_SIZE];
   uint16_t req_len;
   bool has_tsig;

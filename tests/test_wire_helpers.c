@@ -632,6 +632,68 @@ static void test_skip_wire_name(void) {
     CHECK(skip_wire_name(runoff, sizeof(runoff), 0, &next) == -1);
 }
 
+/* a request header (ID 0x1234, the opcode, QDCOUNT qd) and then `body` */
+static size_t qe_msg(uint8_t *m, uint8_t opcode, uint16_t qd, const uint8_t *body, size_t blen) {
+    memset(m, 0, DNS_HEADER_SIZE);
+    m[0] = 0x12; m[1] = 0x34; m[2] = (uint8_t)(opcode << 3); m[4] = (uint8_t)(qd >> 8); m[5] = (uint8_t)qd;
+    memcpy(m + DNS_HEADER_SIZE, body, blen);
+    return DNS_HEADER_SIZE + blen;
+}
+
+static void test_error_qd_echo(void) {
+    printf("[TEST] dns_error_qd_echo: the questions a FORMERR echoes, as BIND 9.20 (getquestions(), dns_message_reply())...\n");
+    uint8_t m[128], b[96];
+    size_t n;
+    /* www.example.com A IN, then the same name (a pointer to it) with another type / class, or another name */
+    const size_t wl = sizeof(WWW_EXAMPLE_COM);
+#define Q(off, t, c) do { b[(off)] = 0; b[(off) + 1] = (t); b[(off) + 2] = 0; b[(off) + 3] = (c); } while (0)
+    memcpy(b, WWW_EXAMPLE_COM, wl); Q(wl, 1, 1);
+    const size_t q1 = wl + 4;
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 0, 1, b, q1)) == 1);                       /* one good question */
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 0, 0, b, q1)) == 0);                       /* QDCOUNT 0 */
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 0, 2, b, q1)) == 0);                       /* QDCOUNT 2, one question there */
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 0, 1, b, q1 - 1)) == 0);                   /* the class cut short */
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 1, 1, b, q1)) == 0);                       /* IQUERY: no question section */
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 2, 1, b, q1)) == 0);                       /* STATUS */
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 4, 1, b, q1)) == 1);                       /* NOTIFY */
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 5, 1, b, q1)) == 1);                       /* UPDATE */
+    CHECK(dns_error_qd_echo(NULL, 0) == 0 && dns_error_qd_echo(m, 11) == 0);
+    /* the same name (a pointer to 12), type AAAA: both */
+    b[q1] = 0xC0; b[q1 + 1] = 12; Q(q1 + 2, 28, 1);
+    n = qe_msg(m, 0, 2, b, q1 + 6);
+    CHECK(dns_error_qd_echo(m, n) == 2);
+    /* the same name spelt out in upper case: one name (compared without case) */
+    uint8_t up[sizeof(WWW_EXAMPLE_COM)];
+    memcpy(up, WWW_EXAMPLE_COM, wl);
+    for (size_t i = 0; i < wl; i++) if (up[i] >= 'a' && up[i] <= 'z') up[i] = (uint8_t)(up[i] - 32);
+    memcpy(b + q1, up, wl); Q(q1 + wl, 28, 1);
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 0, 2, b, q1 + wl + 4)) == 2);
+    /* the same type twice, another class, another name: none (QUERY), the first (UPDATE) */
+    b[q1] = 0xC0; b[q1 + 1] = 12; Q(q1 + 2, 1, 1);
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 0, 2, b, q1 + 6)) == 0);
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 5, 2, b, q1 + 6)) == 1);
+    Q(q1 + 2, 28, 3);
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 0, 2, b, q1 + 6)) == 0);
+    b[q1] = 3; memcpy(b + q1 + 1, "ftp", 3); b[q1 + 4] = 0xC0; b[q1 + 5] = 16; Q(q1 + 6, 1, 1);   /* ftp.example.com */
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 0, 2, b, q1 + 10)) == 0);
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 4, 2, b, q1 + 10)) == 0);
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 5, 2, b, q1 + 10)) == 1);
+    /* a second question cut short: none, the first for UPDATE */
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 0, 2, b, q1 + 8)) == 0);
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 5, 2, b, q1 + 8)) == 1);
+    /* class ANY / NONE: good in a QUERY, not in a NOTIFY or UPDATE */
+    Q(wl, 6, 255);
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 0, 1, b, q1)) == 1);
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 4, 1, b, q1)) == 0);
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 5, 1, b, q1)) == 0);
+    Q(wl, 6, 254);
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 5, 1, b, q1)) == 0);
+    /* a first name with a compression pointer (X-15): never */
+    b[0] = 0xC0; b[1] = 4; Q(2, 1, 1);
+    CHECK(dns_error_qd_echo(m, qe_msg(m, 0, 1, b, 6)) == 0);
+#undef Q
+}
+
 static void test_name_compression(void) {
     printf("[TEST] compress_ctx_init / compress_name / register_wire_name_for_compression (RFC 1035 §4.1.4)...\n");
     static compress_ctx_t ctx;           /* 32 KiB table: keep off the stack */
@@ -3195,6 +3257,7 @@ int main(void) {
     test_parse_query_question_fast();
     test_packet_has_tsig();
     test_skip_wire_name();
+    test_error_qd_echo();
     test_name_compression();
     test_cookie_and_edns_wire_parsing();
     test_pb_encode_varint_and_fields();

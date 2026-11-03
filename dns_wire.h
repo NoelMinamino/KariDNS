@@ -766,6 +766,16 @@ bool wrap_tinydns_record(const dns_record_t *rec, dns_record_t *out_wrap, uint8_
 // ポインタは前に現れた名前を指せない (RFC 1035 §4.1.4) ので、そのような要求は FORMERR にする。
 bool wire_question_name_compressed(const uint8_t *buf, size_t len);
 
+/* The number of questions an error answer (FORMERR, and the transfer errors of dns_axfr_ixfr.c) echoes for req: its qd_keep for dns_build_error_response().
+ * As BIND 9.20 answers it (lib/ns/client.c ns_client_error() -> lib/dns/message.c dns_message_reply(msg, true), and with no question when that fails):
+ * dns_message_parse() reads the whole question section first (getquestions()) and sets question_ok only when it is good, so a fault found later (a second
+ * or unusable OPT, a malformed EDNS option or TSIG, a missing RR, QDCOUNT > 1 in ns_query_start(), the meta-type and transfer checks) leaves every question
+ * echoed.  getquestions() refuses a second question of another name (compared without case) or class, the same type twice, and for NOTIFY and UPDATE the
+ * class NONE or ANY; several types of one name are a good section.  dns_message_reply() echoes the questions of a QUERY or NOTIFY whose section is good and
+ * none otherwise, the zone names an UPDATE has read up to the bad one (it clears from the prerequisite section), and nothing for any other opcode.
+ * KariDNS: a first name with a compression pointer is not echoed (X-15, RFC 1035 §4.1.4). */
+uint16_t dns_error_qd_echo(const uint8_t *req, size_t req_len);
+
 /* The shape of an AXFR / IXFR request (RFC 5936 §2.1, RFC 1995 §3).  xfr_request_shape() answers XFR_SHAPE_OK for a request a transfer may be started for, else
  * the first thing wrong with it (a reason for the log, xfr_shape_text(); the request is answered with FORMERR, RFC 5936 §2.2.1 note e).  A request is a transfer
  * request when: QR=0, OPCODE 0 (QUERY) and RCODE 0 (§2.1.1); exactly one question, complete and not compressed, of type AXFR (252) or IXFR (251); ANCOUNT 0;

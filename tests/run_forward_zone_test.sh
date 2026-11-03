@@ -338,6 +338,12 @@ run_check "UPDATE to forward zone is rejected with NOTIMP" \
     "$DAG @127.0.0.1 -p $PORT ttl-test.example SOA +opcode=UPDATE +timeout=1" \
     "NOTIMP"
 
+# Scenario 11: a zone transfer of a forward zone is REFUSED (this server is not authoritative for it; not relayed to the forwarders)
+# (dag, as dig, prints only "; Transfer failed."; the server's xfer-out line names the answer)
+run_check "AXFR of a forward zone is REFUSED" \
+    "$DAG @127.0.0.1 -p $PORT ttl-test.example AXFR +nohexdump +timeout=2 +tries=1; sleep 0.5; cat $TMP_DIR/karidns.log" \
+    "transfer of 'ttl-test.example/IN': bad zone transfer request: non-authoritative zone \\(REFUSED\\)"
+
 if [ "$FAILED" -gt 0 ] && [ -f "$TMP_DIR/karidns.log" ]; then
     echo "=== Server Log ==="
     cat "$TMP_DIR/karidns.log"

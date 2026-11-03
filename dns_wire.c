@@ -5077,6 +5077,38 @@ bool wire_question_name_compressed(const uint8_t *buf, size_t len) {
     return false;
 }
 
+uint16_t dns_error_qd_echo(const uint8_t *req, size_t req_len) {
+    if (!req || req_len < DNS_HEADER_SIZE) return 0;
+    const uint8_t opcode = (req[2] >> 3) & 0x0F;
+    const uint16_t qd = (uint16_t)((req[4] << 8) | req[5]);
+    /* dns_message_reply(): a question section only for QUERY and NOTIFY; UPDATE keeps its zone section (it clears from the prerequisites) */
+    if ((opcode != 0 && opcode != 4 && opcode != 5) || qd == 0 || wire_question_name_compressed(req, req_len)) return 0;
+    const bool upd = opcode == 5;                       /* (UPDATE: the zone names read before the bad one) */
+    char first[DNS_NAME_TEXT_SIZE], name[DNS_NAME_TEXT_SIZE];
+    uint64_t seen[65536 / 64];                          /* the types asked for the one name (QDCOUNT > 1) */
+    uint16_t first_class = 0;
+    size_t p = DNS_HEADER_SIZE;
+    for (uint16_t i = 0; i < qd; i++) {
+        size_t next;
+        char *nb = i == 0 ? first : name;
+        if (expand_wire_name_to_buffer(req, req_len, p, &next, nb, DNS_NAME_TEXT_SIZE) < 0 || next + 4 > req_len) return upd ? i : 0;
+        const uint16_t type = (uint16_t)((req[next] << 8) | req[next + 1]);
+        const uint16_t cls = (uint16_t)((req[next + 2] << 8) | req[next + 3]);
+        bool ok = !(opcode != 0 && (cls == 254 || cls == 255));   /* getquestions(): NOTIFY and UPDATE ask for no class NONE or ANY */
+        if (i == 0) {
+            first_class = cls;
+            if (qd > 1) memset(seen, 0, sizeof(seen));
+        } else {
+            /* getquestions(): one name, one class, and no type twice */
+            ok = ok && strcasecmp(first, name) == 0 && cls == first_class && !(seen[type / 64] & (1ULL << (type % 64)));
+        }
+        if (!ok) return upd ? i : 0;
+        if (qd > 1) seen[type / 64] |= 1ULL << (type % 64);
+        p = next + 4;
+    }
+    return qd;
+}
+
 /* ---- the shape of an AXFR / IXFR request (dns_wire.h) ---- */
 
 const char *xfr_shape_text(xfr_shape_t s) {

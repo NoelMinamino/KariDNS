@@ -1339,6 +1339,7 @@ typedef struct {
     int nmsgs;
 } nr_reply_t;
 
+static bool g_nr_send_ede = true;
 /* run axfr_worker_thread for a request and read what the client gets */
 static void nr_run(nr_reply_t *out, const uint8_t *req, size_t req_len, uint16_t qtype, zone_db_entry_t *entry, zdir_elem_t *el,
                    zone_db_entry_t *(*aw)(zdir_elem_t *, const char *)) {
@@ -1347,6 +1348,7 @@ static void nr_run(nr_reply_t *out, const uint8_t *req, size_t req_len, uint16_t
     assert(rc == 0);
     axfr_worker_args_t *args = calloc(1, sizeof(axfr_worker_args_t));
     args->client_fd = sp[0];
+    args->send_ede = g_nr_send_ede;                     /* send-extended-errors (the dispatch copies it from the configuration) */
     strlcpy(args->client_ip, "127.0.0.1", sizeof(args->client_ip));
     args->client_port = 54321;
     strlcpy(args->qname, "nr.example.com.", sizeof(args->qname));
@@ -1485,6 +1487,13 @@ static void test_axfr_worker_zone_out_of_memory(void) {
     assert(atomic_load(&entry.active_axfr) == 0);
     g_nr_await_entry = NULL;
     zone_arena_destroy(test_zone_slot(&entry, 0));
+    /* send-extended-errors no: the same SERVFAIL without the EDE (and the summary's FORMERR still answered) */
+    g_nr_send_ede = false;
+    n = nr_request(req, sizeof(req), "nr.example.com.", 251, 4241, true, false);
+    nr_run(&rep, req, n, 251, NULL, el, nr_await_stub);
+    nr_parse(&rep, &serial, &expire, &ede);
+    assert(rep.nmsgs == 1 && (rep.msg[3] & 0x0F) == 2 && rep.msg[5] == 1 && rep.msg[11] == 1 && ede == -1);
+    g_nr_send_ede = true;
     pthread_mutex_destroy(&entry.writer_lock);
     pthread_mutex_destroy(&entry.ixfr_history.lock);
     free(apex);
