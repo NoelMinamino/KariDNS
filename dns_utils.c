@@ -1004,17 +1004,21 @@ void logev_flush_suppressed(int64_t now) {
   }
 }
 
-void logev_post(int cat, int level, const char *client_ip, int client_port, const char *fmt, ...) {
+void logev_vpost(int cat, int level, const char *client_ip, int client_port, const char *fmt, va_list ap) {
   if (!logev_wanted(cat, level)) return;
   uint32_t rep;
   int rep_level = level;
   if (!logev_admit_at(cat, level, (int64_t)time(NULL), &rep, &rep_level)) return;
   if (rep && logev_wanted(cat, rep_level)) logev_report(cat, rep_level, rep);
   char msg[LOGEV_MSG_MAX];
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  logev_dispatch(cat, level, client_ip, client_port, msg);
+}
+
+void logev_post(int cat, int level, const char *client_ip, int client_port, const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
-  vsnprintf(msg, sizeof(msg), fmt, ap);
+  logev_vpost(cat, level, client_ip, client_port, fmt, ap);
   va_end(ap);
-  logev_dispatch(cat, level, client_ip, client_port, msg);
 }
 #endif

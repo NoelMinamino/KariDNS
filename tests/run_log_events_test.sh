@@ -140,7 +140,93 @@ MAX=$(( (T1 - T0 + 2) * 10 ))
 if [ "$NEW" -ge 1 ] && [ "$NEW" -le "$MAX" ]; then pass "U: 60 refused UPDATEs in $((T1 - T0)) s wrote $NEW 'denied' lines (at most $MAX: 10 per second)"; else fail "U: rate limit: $NEW lines for 60 refusals in $((T1 - T0)) s (max $MAX)"; fi
 has "U: the suppressed lines are reported" "$LG/sec.log" "update-security: [a-z]*: [0-9]* message(s) suppressed by the rate limit of 10 per second"
 
+# ------------------------------------------------------------------------------------------------ X: xfer-out
+echo "== X: xfer-out"
 kari_kill_tree $S1; PIDS=""
+wait_free $P1
+perl -e 'print "\$TTL 300\n\$ORIGIN big.test.\n\@ IN SOA ns1 hostmaster 1 3600 600 86400 60\n\@ IN NS ns1\nns1 IN A 192.0.2.1\n"; for my $i (1..30000) { printf "h%d IN TXT \"%s\"\n", $i, "x" x 200 }' > "$W/big.zone"
+cat > "$W/s2.conf" <<EOF
+options { port $P1; listen-on { 127.0.0.1; }; pid-file "none"; transfers-out 1; max-transfer-idle-out 1; $USER_OPT };
+key "upd" { algorithm hmac-sha256; secret "$SECRET"; };
+logging {
+$(chan xf "$LG/xfer.log")
+$(chan xfd "$LG/xfer_dbg.log" "debug 1")
+$(chan xf4 "$LG/xfer_dbg4.log" "debug 4")
+    category xfer-out { xf; xfd; xf4; };
+};
+zone "x.test" { type primary; file "$W/x.zone"; allow-update { key upd; }; allow-transfer { 127.0.0.1; }; };
+zone "deny.test" { type primary; file "$W/deny.zone"; allow-transfer { none; }; };
+zone "key.test" { type primary; file "$W/key.zone"; allow-transfer { key upd; }; };
+zone "big.test" { type primary; file "$W/big.zone"; allow-transfer { 127.0.0.1; }; };
+EOF
+KARIDNS_XFER_MINUTE_SECS=1 "$KARIDNS" -f "$W/s2.conf" > "$W/s2.log" 2>&1 &
+PIDS="$PIDS $!"
+S2=$!
+_i=0; while [ $_i -lt 20 ]; do d x.test SOA +tcp +short | grep -q hostmaster && break; sleep 0.5; _i=$((_i + 1)); done
+sleep 1
+
+d x.test AXFR | grep -q "SOA" && pass "X: AXFR over TCP works" || fail "X: AXFR"
+has "X: AXFR started" "$LG/xfer.log" "xfer-out: info: client 127\.0\.0\.1#[0-9]*: transfer of 'x\.test/IN': AXFR started (serial 1)"
+has "X: AXFR ended with the statistics" "$LG/xfer.log" "transfer of 'x\.test/IN': AXFR ended: 1 messages, [0-9]* records, [0-9]* bytes, 0\.[0-9][0-9][0-9] secs ([0-9]* bytes/sec) (serial 1)"
+d x.test A --update-add 'n1.x.test 300 A 192.0.2.50' -y "$KEY" | grep -q "status: NOERROR" && pass "X: the zone moves to serial 2" || fail "X: update"
+d x.test IXFR=1 +tcp | grep -q "SOA" && pass "X: IXFR from serial 1 over TCP" || fail "X: IXFR"
+has "X: IXFR started with both serials" "$LG/xfer.log" "transfer of 'x\.test/IN': IXFR started (serial 1 -> 2)"
+has "X: IXFR ended" "$LG/xfer.log" "transfer of 'x\.test/IN': IXFR ended: [0-9]* messages, [0-9]* records, [0-9]* bytes"
+d x.test IXFR=0 +tcp | grep -q "SOA" && pass "X: IXFR from a serial the history does not have" || fail "X: IXFR old"
+has "X: IXFR falling back to AXFR" "$LG/xfer.log" "transfer of 'x\.test/IN': IXFR version not in journal, falling back to AXFR"
+has "X: AXFR-style IXFR started" "$LG/xfer.log" "transfer of 'x\.test/IN': AXFR-style IXFR started (serial 2)"
+d x.test IXFR=2 +tcp | grep -q "SOA" && pass "X: IXFR from the current serial (a poll)" || fail "X: IXFR poll"
+has "X: the poll is a debug 1 line" "$LG/xfer_dbg.log" "xfer-out: debug 1: client 127\.0\.0\.1#[0-9]*: transfer of 'x\.test/IN': IXFR poll up to date (serial 2)"
+hasnt "X: ... and not at info" "$LG/xfer.log" "poll up to date"
+d x.test IXFR=1 +notcp | grep -q "SOA" && pass "X: IXFR over UDP" || fail "X: IXFR UDP"
+has "X: IXFR over UDP from a serial that is behind: SOA and TC" "$LG/xfer.log" "transfer of 'x\.test/IN': IXFR over UDP: serial 1 is behind 2, answered with the SOA and TC=1"
+d x.test IXFR=2 +notcp | grep -q "SOA" && pass "X: IXFR over UDP, up to date" || fail "X: IXFR UDP poll"
+d x.test AXFR -y "$KEY" >/dev/null
+d key.test AXFR -y "$KEY" | grep -q "Transfer failed" && pass "X: a zone whose key is the ACL" || true
+d deny.test AXFR | grep -qi "refused\|Transfer failed" && pass "X: AXFR denied by allow-transfer" || fail "X: deny"
+has "X: denied: zone transfer ... denied (error)" "$LG/xfer.log" "xfer-out: error: client 127\.0\.0\.1#[0-9]*: zone transfer 'deny\.test/AXFR/IN' denied"
+d deny.test IXFR=1 +notcp | grep -qi "refused\|failed" && pass "X: IXFR over UDP denied by allow-transfer" || fail "X: deny UDP"
+has "X: ... IXFR over UDP" "$LG/xfer.log" "zone transfer 'deny\.test/IXFR/IN' denied"
+d nosuch.test AXFR | grep -qi "refused\|Transfer failed" && pass "X: AXFR of a zone that is not served" || fail "X: nosuch"
+has "X: non-authoritative zone" "$LG/xfer.log" "transfer of 'nosuch\.test/IN': bad zone transfer request: non-authoritative zone (REFUSED)"
+d key.test AXFR -y "hmac-sha256:upd:Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFy" | grep -qi "fail\|NOTAUTH\|bad" && pass "X: AXFR signed with a wrong secret" || fail "X: bad tsig"
+has "X: TSIG that does not verify" "$LG/xfer.log" "transfer of 'key\.test/IN': bad zone transfer request: TSIG verification failed (NOTAUTH)"
+d x.test AXFR +notcp | grep -qi "FORMERR\|Transfer failed\|truncated" ; pass "X: AXFR over UDP was sent"
+has "X: AXFR over UDP is a bad request" "$LG/xfer.log" "transfer of 'x\.test/IN': bad zone transfer request: attempted AXFR over UDP (FORMERR)"
+
+# transfers-out 1 and a client that does not read: the second transfer is refused (quota), the first one is aborted by max-transfer-idle-out
+perl "$DIR/lib_slow_axfr_client.pl" "$P1" big.test 6 > "$W/slow.out" 2>&1 &
+SLOWPID=$!
+sleep 1
+d big.test AXFR +time=3 | head -5 | grep -qi "refused\|Transfer failed" && pass "X: a second transfer over transfers-out is refused" || fail "X: quota"
+has "X: quota reached (warning)" "$LG/xfer.log" "xfer-out: warning: client 127\.0\.0\.1#[0-9]*: transfer of 'big\.test/IN': AXFR request denied: quota reached (transfers-out 1)"
+wait_grep "transfer of 'big.test/IN': AXFR aborted: the message could not be sent to the client" "$LG/xfer.log" 12 && pass "X: the transfer to the client that does not read is aborted (max-transfer-idle-out 1)" || fail "X: no abort line"
+has "X: the abort line has the statistics" "$LG/xfer.log" "AXFR aborted: .* ([0-9]* messages, [0-9]* records, [0-9]* bytes were sent)"
+wait $SLOWPID 2>/dev/null
+hasnt "X: no debug 4 line without provide-ixfr no" "$LG/xfer_dbg4.log" "provide-ixfr"
+kari_kill_tree $S2; PIDS=""
+wait_free $P1
+
+# the same, with provide-ixfr no (debug 4) and no channel for xfer-out at all: nothing is written
+cat > "$W/s3.conf" <<EOF
+options { port $P1; listen-on { 127.0.0.1; }; pid-file "none"; provide-ixfr no; $USER_OPT };
+logging {
+$(chan xf4 "$LG/xfer_dbg4b.log" "debug 4")
+$(chan other "$LG/other.log")
+    category xfer-out { xf4; };
+    category general { other; };
+};
+zone "x.test" { type primary; file "$W/x.zone"; allow-transfer { 127.0.0.1; }; };
+EOF
+"$KARIDNS" -f "$W/s3.conf" > "$W/s3.log" 2>&1 &
+PIDS="$PIDS $!"
+S3=$!
+_i=0; while [ $_i -lt 20 ]; do d x.test SOA +tcp +short | grep -q hostmaster && break; sleep 0.5; _i=$((_i + 1)); done
+d x.test IXFR=0 +tcp | grep -q "SOA" && pass "X: IXFR with provide-ixfr no is answered with the whole zone" || { fail "X: provide-ixfr no"; d x.test IXFR=0 +tcp | head -8; }
+has "X: provide-ixfr no: debug 4 line" "$LG/xfer_dbg4b.log" "xfer-out: debug 4: client 127\.0\.0\.1#[0-9]*: transfer of 'x\.test/IN': IXFR delta response disabled due to 'provide-ixfr no;' being set"
+has "X: ... and the AXFR-style IXFR" "$LG/xfer_dbg4b.log" "AXFR-style IXFR started (serial 1)"
+kari_kill_tree $S3; PIDS=""
+wait_free $P1
 
 echo
 echo "$PASSES passed, $FAILS failed"

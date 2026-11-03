@@ -393,10 +393,72 @@ out:
   free(add_rr);
 }
 
-static const char *xfr_rcode_name(unsigned rcode) {
-  static const char *const names[] = {"NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED",
-                                      "YXDOMAIN", "YXRRSET", "NXRRSET", "NOTAUTH", "NOTZONE"};
-  return rcode < sizeof(names) / sizeof(names[0]) ? names[rcode] : "RCODE";
+static const char *xfr_rcode_name(unsigned rcode) { return dns_rcode_name(rcode); }
+
+/* ---- batch 14: category xfer-out (BIND lib/ns/xfrout.c, xfrout_log(): "transfer of 'zone/IN': text", prefixed by the client) ----
+ * The transfer thread has no ring and logs at once (logev_post() routes it); a TCP worker or the UDP path of the engine puts a record into its ring.
+ * Levels follow BIND: started / ended / fallback to AXFR info, refusals and bad requests info or error, an up-to-date poll debug 1, provide-ixfr no debug 4. */
+
+static void xfr_log(int level, const char *client_ip, int client_port, const char *domain, const char *fmt, ...) __attribute__((format(printf, 5, 6)));
+static void xfr_log(int level, const char *client_ip, int client_port, const char *domain, const char *fmt, ...) {
+  if (!logev_wanted(LOGC_XFER_OUT, level)) return;
+  char zn[300], txt[200];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(txt, sizeof(txt), fmt, ap);
+  va_end(ap);
+  logev_name_text(domain, zn, sizeof(zn));
+  logev_post(LOGC_XFER_OUT, level, client_ip, client_port, "transfer of '%s/IN': %s", zn, txt);
+}
+
+/* the client of a connection as text; the port (0: not an IP address) */
+static int xfr_client_text(const struct sockaddr_storage *a, char *ip, size_t n) {
+  ip[0] = '\0';
+  if (!a) return 0;
+  if (a->ss_family == AF_INET) {
+    const struct sockaddr_in *s4 = (const struct sockaddr_in *)a;
+    inet_ntop(AF_INET, &s4->sin_addr, ip, (socklen_t)n);
+    return ntohs(s4->sin_port);
+  }
+  if (a->ss_family == AF_INET6) {
+    const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)a;
+    inet_ntop(AF_INET6, &s6->sin6_addr, ip, (socklen_t)n);
+    return ntohs(s6->sin6_port);
+  }
+  return 0;
+}
+
+void xfr_log_denied(const char *client_ip, int client_port, const char *zone, uint16_t qtype, int why, uint32_t limit) {
+  const char *mn = qtype == 251 ? "IXFR" : "AXFR";
+  switch (why) {
+    case XD_ACL:                       /* lib/ns/client.c ns_client_checkacl(): "zone transfer 'z/AXFR/IN' denied", ERROR */
+      if (logev_wanted(LOGC_XFER_OUT, LOG_LVL_ERROR)) {
+        char zn[300];
+        logev_name_text(zone, zn, sizeof(zn));
+        logev_post(LOGC_XFER_OUT, LOG_LVL_ERROR, client_ip, client_port, "zone transfer '%s/%s/IN' denied", zn, mn);
+      }
+      break;
+    case XD_NOZONE: xfr_log(LOG_LVL_INFO, client_ip, client_port, zone, "bad zone transfer request: non-authoritative zone (REFUSED)"); break;
+    case XD_TSIG_FORMERR: xfr_log(LOG_LVL_INFO, client_ip, client_port, zone, "bad zone transfer request: the TSIG record cannot be parsed (FORMERR)"); break;
+    case XD_TSIG_NOTAUTH: xfr_log(LOG_LVL_INFO, client_ip, client_port, zone, "bad zone transfer request: TSIG verification failed (NOTAUTH)"); break;
+    case XD_BADVERS: xfr_log(LOG_LVL_INFO, client_ip, client_port, zone, "bad zone transfer request: unsupported EDNS version (BADVERS)"); break;
+    case XD_QUOTA:                     /* xfrout.c: "%s request denied: %s", WARNING */
+      xfr_log(LOG_LVL_WARNING, client_ip, client_port, zone, "%s request denied: quota reached (transfers-out %u)", mn, (unsigned)limit);
+      break;
+    case XD_NO_THREAD: xfr_log(LOG_LVL_ERROR, client_ip, client_port, zone, "%s request denied: cannot start a thread for the transfer", mn); break;
+    case XD_NO_MEMORY: xfr_log(LOG_LVL_ERROR, client_ip, client_port, zone, "%s request denied: out of memory", mn); break;
+    case XD_IXFR_NO_SOA: xfr_log(LOG_LVL_INFO, client_ip, client_port, zone, "bad zone transfer request: IXFR request missing SOA (FORMERR)"); break;
+    case XD_UDP_AXFR: xfr_log(LOG_LVL_INFO, client_ip, client_port, zone, "bad zone transfer request: attempted AXFR over UDP (FORMERR)"); break;
+    default: break;
+  }
+}
+
+void xfr_log_udp_ixfr(const char *client_ip, int client_port, const char *zone, uint32_t client_serial, uint32_t serial, bool up_to_date, bool from_summary) {
+  const char *where = from_summary ? ", answered from the zone summary (the data is not in memory)" : "";
+  if (up_to_date)
+    xfr_log(1, client_ip, client_port, zone, "IXFR poll up to date (serial %u)%s", (unsigned)serial, where);
+  else
+    xfr_log(LOG_LVL_INFO, client_ip, client_port, zone, "IXFR over UDP: serial %u is behind %u, answered with the SOA and TC=1 (the client retries over TCP)", (unsigned)client_serial, (unsigned)serial);
 }
 
 int xfr_check_response_header(const uint8_t *msg, size_t msg_len, axfr_session_t *session, const char *domain) {
@@ -1737,7 +1799,17 @@ typedef struct {
   xext_t xe;            /* Extended AXFR: the one encoder of the extension records (dns_wire.h), state markers included */
   bool wrap_apex_soa;   /* B8t-2 (v3, several or restricted SOA RRs): every apex SOA RR of the body is a 65406 wrapper */
   bool one_answer;      /* batch 5: the server statement of the requester says `transfer-format one-answer`: one RR in every message (BIND xfrout.c, RFC 5936 §2.2 allows it) */
+  uint32_t nmsgs, nrecs; /* batch 14: what has been sent (the statistics of the "ended" line: messages, RRs, octets of the messages) */
+  uint64_t nbytes;
+  const char *why;       /* batch 14: why a send function returned -1 ("aborted: ..." of the log) */
 } axfr_emit_ctx_t;
+
+/* one message went out */
+static void axfr_count_sent(axfr_emit_ctx_t *ec, uint16_t answers, size_t len) {
+  ec->nmsgs++;
+  ec->nrecs += answers;
+  ec->nbytes += len;
+}
 
 /* One RR to send: a builder record (IXFR history, KariDNS markers) or RR `rr` of a zone image (S5 B-2: the zone itself) */
 static int axfr_write_item(axfr_emit_ctx_t *ec, const dns_record_t *rec, const zone_image_t *img, uint32_t rr) {
@@ -1767,6 +1839,7 @@ static int axfr_emit_item(axfr_emit_ctx_t *ec, const dns_record_t *rec, const zo
       size_t sign_len = prev_offset;
       if (tsig_sign_packet(ec->res, &sign_len, 65535, ec->tsig_key, 0, ec->tsig_mac,
                            &ec->tsig_mac_len, NULL, 0, ec->is_subsequent) != 0) {
+        ec->why = "TSIG signing of a message failed";
         return -1;
       }
       ec->is_subsequent = true;
@@ -1776,7 +1849,11 @@ static int axfr_emit_item(axfr_emit_ctx_t *ec, const dns_record_t *rec, const zo
                        (const struct sockaddr *)ec->client_addr, ec->client_len,
                        ec->has_server_addr ? (const struct sockaddr *)ec->server_addr : NULL,
                        ec->has_server_addr, IPPROTO_TCP);
-    if (send_tcp_dns_message(ec->client_fd, ec->res, prev_offset) < 0) return -1; /* RFC 7766 §8 */
+    if (send_tcp_dns_message(ec->client_fd, ec->res, prev_offset) < 0) {   /* RFC 7766 §8 */
+      ec->why = "the message could not be sent to the client (closed, or a time limit of the transfer)";
+      return -1;
+    }
+    axfr_count_sent(ec, ec->answers, prev_offset);
 
     /* 次のパケットの準備（QDCOUNT=1 と質問セクションを必ず引き継ぐ） */
     ec->offset = ec->q_offset;
@@ -1795,6 +1872,7 @@ static int axfr_emit_item(axfr_emit_ctx_t *ec, const dns_record_t *rec, const zo
       kdns_logc(LOGC_XFER_OUT, LOG_ERR, "[AXFR] Record too large to fit in any TCP message (name=%s type=%u), aborting transfer",
              img ? zone_image_name_text(img, zone_image_rr_name(img, rr)) : (rec->name ? rec->name : "(null)"),
              img ? zone_image_rr_type(img, rr) : rec->type_code);
+      ec->why = "a record is too large for any message";
       return -1;
     }
   }
@@ -2039,21 +2117,64 @@ static int axfr_ec_finish(axfr_emit_ctx_t *ec) {
   }
   if (ec->tsig_key) {
     size_t sign_len = ec->offset;
-    if (tsig_sign_packet(ec->res, &sign_len, 65535, ec->tsig_key, 0, ec->tsig_mac, &ec->tsig_mac_len, NULL, 0, ec->is_subsequent) != 0) return -1;
+    if (tsig_sign_packet(ec->res, &sign_len, 65535, ec->tsig_key, 0, ec->tsig_mac, &ec->tsig_mac_len, NULL, 0, ec->is_subsequent) != 0) {
+      ec->why = "TSIG signing of a message failed";
+      return -1;
+    }
     ec->offset = (uint16_t)sign_len;
   }
   write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, ec->res, ec->offset, (const struct sockaddr *)ec->client_addr, ec->client_len,
                      ec->has_server_addr ? (const struct sockaddr *)ec->server_addr : NULL, ec->has_server_addr, IPPROTO_TCP);
-  return send_tcp_dns_message(ec->client_fd, ec->res, ec->offset) < 0 ? -1 : 0; /* RFC 7766 §8 */
+  if (send_tcp_dns_message(ec->client_fd, ec->res, ec->offset) < 0) {            /* RFC 7766 §8 */
+    ec->why = "the message could not be sent to the client (closed, or a time limit of the transfer)";
+    return -1;
+  }
+  axfr_count_sent(ec, ec->answers, ec->offset);
+  return 0;
 }
 
 
-void send_axfr_response(int client_fd, const char *qname __attribute__((unused)), uint8_t *req,
+/* batch 14: "AXFR started: TSIG k (serial 5)" / "IXFR started: TSIG k (serial 3 -> 5)" (xfrout.c) */
+static void xfr_log_started(const char *client_ip, int client_port, const char *domain, const char *mn, const tsig_key_t *key, bool incr, uint32_t from,
+                            uint32_t to) {
+  if (!logev_wanted(LOGC_XFER_OUT, LOG_LVL_INFO)) return;
+  char kn[160] = "", k2[128];
+  if (key && key->name) {
+    logev_name_text(key->name, k2, sizeof(k2));
+    snprintf(kn, sizeof(kn), ": TSIG %s", k2);
+  }
+  if (incr) xfr_log(LOG_LVL_INFO, client_ip, client_port, domain, "%s started%s (serial %u -> %u)", mn, kn, (unsigned)from, (unsigned)to);
+  else xfr_log(LOG_LVL_INFO, client_ip, client_port, domain, "%s started%s (serial %u)", mn, kn, (unsigned)to);
+}
+
+/* "AXFR ended: 12 messages, 4000 records, 500000 bytes, 0.123 secs (4065040 bytes/sec) (serial 5)" -- the same words as BIND (xfrout.c) */
+static void xfr_log_ended(const char *client_ip, int client_port, const char *domain, const char *mn, const axfr_emit_ctx_t *ec, const struct timespec *t0,
+                          uint32_t serial) {
+  if (!logev_wanted(LOGC_XFER_OUT, LOG_LVL_INFO)) return;
+  struct timespec t1;
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  int64_t ms = (int64_t)(t1.tv_sec - t0->tv_sec) * 1000 + (t1.tv_nsec - t0->tv_nsec) / 1000000;
+  if (ms < 0) ms = 0;
+  uint64_t bps = ms > 0 ? ec->nbytes * 1000 / (uint64_t)ms : ec->nbytes;
+  xfr_log(LOG_LVL_INFO, client_ip, client_port, domain, "%s ended: %u messages, %u records, %llu bytes, %u.%03u secs (%llu bytes/sec) (serial %u)", mn,
+          (unsigned)ec->nmsgs, (unsigned)ec->nrecs, (unsigned long long)ec->nbytes, (unsigned)(ms / 1000), (unsigned)(ms % 1000), (unsigned long long)bps,
+          (unsigned)serial);
+}
+
+static void xfr_log_aborted(const char *client_ip, int client_port, const char *domain, const char *mn, const axfr_emit_ctx_t *ec) {
+  xfr_log(LOG_LVL_ERROR, client_ip, client_port, domain, "%s aborted: %s (%u messages, %u records, %llu bytes were sent)", mn,
+          ec->why ? ec->why : "the transfer could not be completed", (unsigned)ec->nmsgs, (unsigned)ec->nrecs, (unsigned long long)ec->nbytes);
+}
+
+void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
                         uint16_t req_len, tsig_key_t *tsig_key, zone_db_entry_t *entry,
                         uint8_t *req_mac, size_t req_mac_len,
                         const struct sockaddr_storage *client_addr, socklen_t client_len,
                         const struct sockaddr_storage *server_addr, bool has_server_addr) {
+  char cip[INET6_ADDRSTRLEN];
+  const int cport = xfr_client_text(client_addr, cip, sizeof(cip));
   if (!entry) {
+    xfr_log_denied(cip, cport, qname, 252, XD_NOZONE, 0);
     /* 権威を持たないゾーンへの転送要求: REFUSED、AA=0 (R-06) */
     axfr_send_error(client_fd, req, req_len, 5, false, 0xFFFF, NULL, tsig_key, req_mac, req_mac_len,
                     client_addr, client_len, server_addr, has_server_addr);
@@ -2067,6 +2188,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   if (!current_zone || current_zone->n_rrs == 0) {
     /* X-19: まだデータの無いゾーン (未転送のセカンダリなど)。何も送らないとクライアントは
      * タイムアウトまで待つので、SERVFAIL と EDE 14 Not Ready (RFC 8914 §4.15) で終える。 */
+    xfr_log(LOG_LVL_WARNING, cip, cport, entry->domain, "request denied: the zone has no data yet (SERVFAIL, Not Ready)");
     axfr_send_error(client_fd, req, req_len, 2, false, 14, "Zone not loaded", tsig_key, req_mac, req_mac_len,
                     client_addr, client_len, server_addr, has_server_addr);
     return;
@@ -2088,11 +2210,13 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   }
   uint16_t qtype = (q_offset >= 4) ? ((req[q_offset - 4] << 8) | req[q_offset - 3]) : 0;
   bool is_ixfr = (qtype == 251);
+  const bool ixfr_asked = is_ixfr;        /* (is_ixfr says "answer incrementally" below, and goes false for an AXFR-style answer) */
   uint32_t client_serial = 0;
   /* RFC 1995 §3: IXFR 要求の Authority にはクライアントの版の SOA がある。無ければ FORMERR
    * (BIND も "IXFR request missing SOA" で FORMERR)。 */
   bool has_client_soa = is_ixfr && ixfr_request_client_serial(req, req_len, q_offset, &client_serial);
   if (is_ixfr && !has_client_soa) {
+    xfr_log_denied(cip, cport, entry->domain, 251, XD_IXFR_NO_SOA, 0);
     free(res);
     axfr_send_error(client_fd, req, req_len, 1, false, 0xFFFF, NULL, tsig_key, req_mac, req_mac_len,
                     client_addr, client_len, server_addr, has_server_addr);
@@ -2172,6 +2296,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     if (vcfg) release_config_snapshot(vcfg);
     frame_rr = zone_image_visible_soa(current_zone, &xview, NULL);
     if (frame_rr == ZONE_IMAGE_NONE) {
+      xfr_log(LOG_LVL_INFO, cip, cport, entry->domain, "request denied: the zone is not served to this client (REFUSED)");
       free(res);
       axfr_send_error(client_fd, req, req_len, 5, false, 18, "Transfer refused: the zone is not served to this client", tsig_key,
                       req_mac, req_mac_len, client_addr, client_len, server_addr, has_server_addr);
@@ -2214,16 +2339,22 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   /* provide-ixfr no (BIND 9.20 ARM: "only responds with a full zone transfer (AXFR)"; xfrout.c "IXFR delta response disabled due to
    * 'provide-ixfr no;' being set", mnemonic "AXFR-style IXFR"): a client that is behind gets the whole zone, as with ixfr-history 0 (RFC 1995 §4
    * allows an AXFR-style answer to an IXFR request) */
-  if (!provide_ixfr && !client_up_to_date) is_ixfr = false;
+  if (!provide_ixfr && !client_up_to_date) {
+    is_ixfr = false;
+    if (ixfr_asked)       /* xfrout.c: DEBUG(4) "IXFR delta response disabled due to 'provide-ixfr no;' being set" */
+      xfr_log(4, cip, cport, entry->domain, "IXFR delta response disabled due to 'provide-ixfr no;' being set, sending an AXFR-style IXFR");
+  }
   /* X-24: 拡張を求める KariDNS セカンダリの IXFR は、拡張でしか運べないデータがあるときだけ
    * Extended AXFR にする。それ以外は通常の IXFR (差分が無ければ下で AXFR) で答える。 */
   if (is_extended_axfr && is_ixfr && !client_up_to_date && zone_needs_extended_axfr(current_zone, entry, ext_ver)) {
     is_ixfr = false;
+    xfr_log(LOG_LVL_INFO, cip, cport, entry->domain, "IXFR falling back to AXFR: the zone has data that only an Extended AXFR can carry");
   }
   /* B8t-1: the history of differences is not per client; a standard IXFR of a zone with per-client RRs gets the whole zone as the
    * requester sees it (RFC 1995 §4: the server may answer an IXFR with an AXFR). The up to date answer is the one SOA. */
   if (!is_extended_axfr && is_ixfr && !client_up_to_date && (current_zone->flags & ZONE_IMAGE_F_VIEW)) {
     is_ixfr = false;
+    xfr_log(LOG_LVL_INFO, cip, cport, entry->domain, "IXFR falling back to AXFR: the zone has records that depend on the client");
   }
 
   if (client_up_to_date) {
@@ -2286,7 +2417,21 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       txn_count = 0;
       send_ixfr = false;
     }
+    if (!send_ixfr)       /* xfrout.c: INFO "IXFR version not in journal, falling back to AXFR" */
+      xfr_log(LOG_LVL_INFO, cip, cport, entry->domain, soa_in_history ? "IXFR falling back to AXFR: the differences include several or restricted SOA records"
+                                                                       : "IXFR version not in journal, falling back to AXFR");
   }
+
+  /* what is sent, and the words for the log: an IXFR that is answered with the whole zone is an "AXFR-style IXFR" (xfrout.c) */
+  const bool incremental = ixfr_asked && send_ixfr && txn_count > 0;
+  const char *const mn = incremental ? "IXFR" : is_extended_axfr ? "Extended AXFR" : ixfr_asked ? "AXFR-style IXFR" : "AXFR";
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  if (ixfr_asked && client_up_to_date)
+    xfr_log(1, cip, cport, entry->domain, "IXFR poll up to date (serial %u)%s%s", (unsigned)current_serial, tsig_key && tsig_key->name ? ": TSIG " : "",
+            tsig_key && tsig_key->name ? tsig_key->name : "");
+  else
+    xfr_log_started(cip, cport, entry->domain, mn, tsig_key, incremental, client_serial, current_serial);
 
   axfr_emit_ctx_t ec;
   axfr_ec_start(&ec, res, req, q_offset, client_fd, is_extended_axfr, tsig_key, req_mac, req_mac_len, &resp_edns, client_addr, client_len,
@@ -2296,7 +2441,10 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   ec.wrap_apex_soa = v3 && soa_multi && !send_ixfr;
   ec.one_answer = one_answer;
 
-  if (!send_ixfr && is_extended_axfr && zone_image_zattr_load(current_zone, &zattr) != 0) goto axfr_error;
+  if (!send_ixfr && is_extended_axfr && zone_image_zattr_load(current_zone, &zattr) != 0) {
+    ec.why = "the extended data of the zone could not be read";
+    goto axfr_error;
+  }
   if (send_ixfr) {
     if (axfr_emit_item(&ec, NULL, current_zone, frame_rr) < 0) goto axfr_error;
     if (v3 && txn_count > 0 && axfr_emit_settings(&ec, entry, zattr.bind_ecs_trusted_resolver_count > 0) < 0) goto axfr_error;
@@ -2382,6 +2530,8 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   }
   if (axfr_ec_finish(&ec) < 0) goto axfr_error;
 
+  if (!(ixfr_asked && client_up_to_date))        /* (an up-to-date poll is the one line above) */
+    xfr_log_ended(cip, cport, entry->domain, mn, &ec, &t0, current_serial);
   for (int t = 0; t < txn_count; t++) {
     if (atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_acq_rel) == 1) {
        free_ixfr_txn(txn_list[t]);
@@ -2393,6 +2543,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   return;
 
 axfr_error:
+  xfr_log_aborted(cip, cport, entry->domain, mn, &ec);
   xext_free(&ec.xe);
   zone_arena_destroy(&zattr);
   for (int t = 0; t < txn_count; t++) {
@@ -2417,7 +2568,10 @@ static bool axfr_send_up_to_date_from_apex(const axfr_worker_args_t *a, tsig_key
   if (skip_wire_name(a->req, a->req_len, DNS_HEADER_SIZE, &q_offset) != 0 || q_offset + 4 > a->req_len) return false;
   q_offset += 4;
   uint32_t client_serial = 0;
+  char cip[INET6_ADDRSTRLEN];
+  const int cport = xfr_client_text(&a->client_addr, cip, sizeof(cip));
   if (!ixfr_request_client_serial(a->req, a->req_len, q_offset, &client_serial)) {
+    xfr_log_denied(cip, cport, a->elem->name, 251, XD_IXFR_NO_SOA, 0);
     axfr_send_error(a->client_fd, a->req, a->req_len, 1, false, 0xFFFF, NULL, tsig_key, a->tsig_mac, a->tsig_mac_len, &a->client_addr, a->client_len,
                     &a->server_addr, a->has_server_addr);
     return true;
@@ -2452,7 +2606,10 @@ static bool axfr_send_up_to_date_from_apex(const axfr_worker_args_t *a, tsig_key
   if (done) {
     ec.offset = off;
     ec.answers = 1;
-    (void)axfr_ec_finish(&ec);       /* (a failed send: the client is gone, the connection is closed below) */
+    if (axfr_ec_finish(&ec) == 0)    /* (a failed send: the client is gone, the connection is closed below) */
+      xfr_log_udp_ixfr(cip, cport, a->elem->name, client_serial, ap->serial, true, true);
+    else
+      xfr_log_aborted(cip, cport, a->elem->name, "IXFR", &ec);
     dbreg_xfr_note(DBREG_XFR_SUMMARY);
   }
   free(res);
@@ -2484,6 +2641,8 @@ void *axfr_worker_thread(void *arg) {
     if (axfr_send_up_to_date_from_apex(args, pkey)) {
       answered = true;
     } else if (args->await && (entry = args->await(args->elem, args->view_name)) == NULL) {
+      xfr_log(LOG_LVL_WARNING, args->client_ip, args->client_port, args->elem->name,
+              "%s request failed: the zone data could not be read in time (SERVFAIL, Not Ready)", args->qtype == 251 ? "IXFR" : "AXFR");
       axfr_send_error(args->client_fd, args->req, args->req_len, 2, false, 14, "Not Ready", pkey, args->tsig_mac, args->tsig_mac_len, &args->client_addr,
                       args->client_len, &args->server_addr, args->has_server_addr);
       answered = true;

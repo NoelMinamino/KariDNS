@@ -2918,6 +2918,8 @@ process_tcp_client: ;
             if (tsig_mac_len > 0) memcpy(tsig_mac, tsig.mac, tsig_mac_len);
             zone_db_entry_t *entry = xfr_view ? find_zone_in_view(xfr_view, qname) : NULL;
             if (entry) xfr_el = NULL;          /* (it came into memory meanwhile: the usual transfer) */
+            int xfr_deny = 0;                  /* batch 14: why the request is not served after it was allowed (XD_*, dns_axfr_ixfr.h), for the log */
+            uint32_t xfr_deny_limit = 0;
             if (allowed && (entry || xfr_el)) {
               /* transfers-out and max-transfer-time-out / max-transfer-idle-out (BIND 9.20), read before the configuration is released */
               uint32_t out_limit = xfr_cfg_limit(cfg, XL_TRANSFERS_OUT);
@@ -2927,6 +2929,8 @@ process_tcp_client: ;
               release_config_snapshot(cfg);
               if (!xfr_counter_acquire(&g_xfr_out_active, out_limit)) {
                 allowed = false; /* "Zone transfer requests in excess of the limit are refused" (ARM transfers-out) */
+                xfr_deny = XD_QUOTA;
+                xfr_deny_limit = out_limit;
               } else {
                 if (entry) atomic_fetch_add(&entry->active_axfr, 1);
                 axfr_worker_args_t *args = malloc(sizeof(axfr_worker_args_t));
@@ -2987,6 +2991,7 @@ process_tcp_client: ;
                     if (entry) atomic_fetch_sub(&entry->active_axfr, 1);
                     xfr_counter_release(&g_xfr_out_active);
                     allowed = false;
+                    xfr_deny = XD_NO_THREAD;
                   } else {
                     pthread_detach(t);
                     /* fd は AXFR スレッドのもの。kevent は上で外してある */
@@ -2999,10 +3004,17 @@ process_tcp_client: ;
                   if (entry) atomic_fetch_sub(&entry->active_axfr, 1);
                   xfr_counter_release(&g_xfr_out_active);
                   allowed = false;
+                  xfr_deny = XD_NO_MEMORY;
                 }
               }
             }
             if (!allowed || (!entry && !xfr_el)) {
+              /* batch 14 (category xfer-out): the reason, first match: a quota or resource failure above, an EDNS version we do not speak (BADVERS), a TSIG
+               * that cannot be parsed or does not verify, the transfer ACL, else the zone is not ours */
+              xfr_log_denied(ctx_tcp->client_ip, client_port, qname, qtype,
+                             xfr_deny ? xfr_deny : badvers ? XD_BADVERS : tsig.status == TSIG_REQ_FORMERR ? XD_TSIG_FORMERR
+                             : tsig.status == TSIG_REQ_ERROR ? XD_TSIG_NOTAUTH : (!zcfg && !entry && !xfr_el) ? XD_NOZONE : !allowed ? XD_ACL : XD_NOZONE,
+                             xfr_deny_limit);
               uint8_t res_buf[1024];
               uint8_t rcode = 5; /* REFUSED: 方針による拒否 (RFC 1035 §4.1.1、RFC 5936 §5)。AA=0 (R-06) */
               int built;

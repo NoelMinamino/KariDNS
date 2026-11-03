@@ -9,6 +9,7 @@
 #include "dns_tsig_acl.h"
 #include "dns_priv_sandbox.h"
 #include "dns_dynamic_update.h"
+#include "dns_axfr_ixfr.h"
 #include "dns_siphash.h"
 #include "dns_zone_image.h"
 #include "dns_alias.h"
@@ -3523,6 +3524,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
      * TC when it is behind) when the apex describes the version the directory has, else it waits for the zone like any other query. */
     if (opcode == 0 && qtype == 251 && !is_tcp && qdcount == 1 && domain_names_match_ci(not_ready_zone->name, current_qname)) {
       if (!udp_ixfr_allowed(cfg, &zc, view, client_ip, nr_tkey)) {
+        xfr_log_denied(client_ip, qe_client_port(), not_ready_zone->name, 251, XD_ACL, 0);
         add_ede(&edns, send_ede, 18, "Query refused due to access control");
         return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
       }
@@ -3531,6 +3533,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       uint32_t cs = 0;
       if (iap && skip_wire_name(req, req_len, DNS_HEADER_SIZE, &iq) == 0 && iq + 4 <= req_len) {
         if (!ixfr_request_client_serial(req, req_len, iq + 4, &cs)) {       /* RFC 1995 3, as the zone in memory */
+          xfr_log_denied(client_ip, qe_client_port(), not_ready_zone->name, 251, XD_IXFR_NO_SOA, 0);
           return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
         }
         const size_t alimit = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
@@ -3538,6 +3541,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         if (tsig) tsig->res_limit = alimit;
         int ilen = build_apex_soa_answer(req, req_len, res, alimit, not_ready_zone, iap, &edns, is_tcp, MINIMAL_YES, ADDITIONAL_AUTH_YES, view, comp_ctx, tsig, cfg, &cs);
         if (ilen >= DNS_HEADER_SIZE) {
+          if (logev_wanted(LOGC_XFER_OUT, 1))
+            xfr_log_udp_ixfr(client_ip, qe_client_port(), not_ready_zone->name, cs, iap->serial, cs == iap->serial || serial_is_newer(cs, iap->serial), true);
           return ilen;
         }
         if (tsig) tsig->res_limit = tsig_limit;
@@ -3810,6 +3815,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
     // UDP経由(is_tcp == 0)でAXFR(252)を受信した場合はRFC 5936違反のためFORMERRを返す
     if (!is_tcp && qtype == 252) {
+      xfr_log_denied(client_ip, qe_client_port(), db_entry ? db_entry->domain : current_qname, 252, XD_UDP_AXFR, 0);
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg); // FORMERR
     }
 
@@ -3969,6 +3975,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     /* allow-transfer applies to an IXFR over UDP as well (BIND xfrout.c ns_xfr_start() checks the transfer ACL first, whatever the transport): the one SOA of a
      * zone that is up to date, or the TC answer, are not for a client that may not transfer.  It used to be answered to anybody who may ask (allow-query). */
     if (!udp_ixfr_allowed(cfg, zone_cfg_any, view, client_ip, tsig && tsig->status == TSIG_REQ_VALID ? tsig->key : NULL)) {
+      xfr_log_denied(client_ip, qe_client_port(), db_entry->domain, 251, XD_ACL, 0);
       add_ede(&edns, send_ede, 18, "Query refused due to access control");
       return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
     }
@@ -3976,6 +3983,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
     /* RFC 1995 §3: クライアントの版の SOA が Authority に無ければ FORMERR (TCP と同じ) */
     if (!ixfr_request_client_serial(req, req_len, q_offset, &client_serial)) {
+      xfr_log_denied(client_ip, qe_client_port(), db_entry->domain, 251, XD_IXFR_NO_SOA, 0);
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
     }
 
@@ -4010,6 +4018,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     if (!is_up_to_date) {
       res[2] |= 0x02; // Set TC (Truncated) bit to prompt TCP retry
     }
+    if (logev_wanted(LOGC_XFER_OUT, is_up_to_date ? 1 : LOG_LVL_INFO))
+      xfr_log_udp_ixfr(client_ip, qe_client_port(), db_entry->domain, client_serial, current_serial, is_up_to_date, false);
 
     if (soa_rr != ZONE_IMAGE_NONE) {
       if (image_serialize_rr(zimg, soa_rr, res, body_max_len, &offset, comp_ctx, NULL, soa_ttl) >= 0) {

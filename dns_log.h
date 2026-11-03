@@ -66,6 +66,7 @@ size_t logev_format_line(char *out, size_t n, const char *client_ip, int client_
 typedef void (*klog_level_hook_t)(int cat, int level, const char *msg);
 void klog_set_level_hook(klog_level_hook_t hook);
 void logev_post(int cat, int level, const char *client_ip, int client_port, const char *fmt, ...) __attribute__((format(printf, 5, 6)));
+void logev_vpost(int cat, int level, const char *client_ip, int client_port, const char *fmt, va_list ap) __attribute__((format(printf, 5, 0)));
 /* A name for a log line.  `name` is the presentation text the engine keeps (already escaped: \. \\ \DDD); bytes outside 0x21..0x7e and the characters
  * " and ; are written \DDD, the trailing dot is dropped (BIND logs example.test, not example.test.; the root stays "."), the result is cut to n-1. */
 void logev_name_text(const char *name, char *out, size_t n);
