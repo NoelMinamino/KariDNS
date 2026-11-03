@@ -168,7 +168,7 @@ check_ans() {   # check_ans DESCRIPTION EXPECTED QNAME
     [ "$got" = "$2" ] && pass "$1" || fail "$1 (got '$got', want '$2')"
 }
 dbst() { $KCTL dbstatus "$@" 2>&1; }
-n_auto() { grep -c "karidns-dbloader.* batch [0-9]* (auto) sent" "$LOG" 2>/dev/null; }
+n_auto() { grep -c "\[DB\] batch [0-9]* (auto) sent" "$LOG" 2>/dev/null; }
 wait_dbst() {   # wait_dbst PATTERN SECONDS
     i=0
     while [ $i -lt $(($2 * 10)) ]; do
@@ -207,7 +207,7 @@ OUT=$($KCTL reconfig 2>&1)
 printf '%s\n' "$OUT" | grep -q "^OK" && pass "reconfig with auto-reload yes: $OUT" || fail "reconfig: '$OUT'"
 if wait_ans www.z1.test 192.0.2.11 8000; then pass "switched on: the edit made while it was off is picked up ($WAIT_MS ms)"; else fail "switched on: the edit of the off period was not picked up"; fi
 wait_log "$LOG" "auto reload is on; checking for changes" 5 && pass "log: auto reload is on; checking for changes" || fail "no 'auto reload is on' line"
-wait_log "$LOG" "karidns-dbloader.* batch [0-9]* (auto) sent: 1 zone(s) read, 1 sent, 0 failed in the loader, 0 deleted, 2 unchanged (view " 5 && pass "that batch is an auto batch: 1 read, 1 sent, 2 unchanged" || { fail "auto batch line"; grep "batch" "$LOG" | tail -3 | sed 's/^/         /'; }
+wait_log "$LOG" "\[DB\] batch [0-9]* (auto) sent: 1 zone(s) read, 1 sent, 0 failed in the loader, 0 deleted, 2 unchanged (view " 5 && pass "that batch is an auto batch: 1 read, 1 sent, 2 unchanged" || { fail "auto batch line"; grep "batch" "$LOG" | tail -3 | sed 's/^/         /'; }
 wait_dbst "^auto reload: on (poll-interval 1 s, coalesce 500 ms), [1-9][0-9]* auto batch(es) since start$" 5 && pass "dbstatus: auto reload: on, with the settings and the auto batch count" || { fail "dbstatus (auto-reload yes)"; dbst | sed 's/^/         /' | head -8; }
 wait_dbst "^  view [^:]*: last poll 20[0-9-]* [0-9:]* UTC, applied change seq [1-9][0-9]*, pending changes 0, last error: none$" 5 && pass "dbstatus: per view last poll, applied change seq, pending changes, last error" || { fail "dbstatus per-view line"; dbst | sed 's/^/         /' | head -8; }
 dbst | grep -q "^last batch: id [0-9]*, kind auto, finished" && pass "dbstatus: the last batch is of kind auto" || { fail "dbstatus last batch kind"; dbst | sed 's/^/         /' | head -8; }
@@ -225,7 +225,7 @@ latency "a new zone" www.z4.test 192.0.2.40 "$BOUND_MS"
 sleep 0.3
 sq "DELETE FROM records WHERE domain_id = (SELECT id FROM domains WHERE name = 'z4.test'); DELETE FROM domains WHERE name = 'z4.test'"
 if wait_status www.z4.test REFUSED 15000; then [ "$WAIT_MS" -le "$BOUND_MS" ] && pass "a deleted zone is gone after $WAIT_MS ms (bound $BOUND_MS ms)" || fail "a deleted zone is gone after $WAIT_MS ms, bound $BOUND_MS ms"; else fail "the deleted zone still answers"; fi
-grep "karidns-dbloader.* (auto) sent" "$LOG" | grep -q "0 sent, 0 failed in the loader, 1 deleted" && pass "the delete went as ZONE_DELETE in an auto batch" || fail "no auto batch with 1 deleted"
+grep "\[DB\] .* (auto) sent" "$LOG" | grep -q "0 sent, 0 failed in the loader, 1 deleted" && pass "the delete went as ZONE_DELETE in an auto batch" || fail "no auto batch with 1 deleted"
 check_ans "the other zones are untouched" "192.0.2.20" www.z2.test
 sleep 1.5
 
@@ -298,7 +298,7 @@ while [ $k -le 3 ]; do
 done
 echo "  T-AUTORELOAD (defaults): mean $((SUM / 3)) ms, max $MAX ms"
 SRCB=127.0.0.3; check_ans "view b has the last value too" "192.0.2.13" www.all.test
-grep "karidns-dbloader.* (auto) sent" "$LOG" | grep -q "(view 'a')" && grep "karidns-dbloader.* (auto) sent" "$LOG" | grep -q "(view 'b')" && pass "each view makes its own auto batches" || fail "auto batches of views a and b"
+grep "\[DB\] .* (auto) sent" "$LOG" | grep -q "(view 'a')" && grep "\[DB\] .* (auto) sent" "$LOG" | grep -q "(view 'b')" && pass "each view makes its own auto batches" || fail "auto batches of views a and b"
 echo "== S2: a change of karidns_domain_views moves the zone"
 sq "UPDATE karidns_domain_views SET view_name = 'b' WHERE domain_id = (SELECT id FROM domains WHERE name = 'mv.test')"
 SRCB=127.0.0.3

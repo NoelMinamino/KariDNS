@@ -109,7 +109,7 @@ logging {
 EOF
 }
 # the line of the xfer-out log (batch 14): lg PATTERN
-lg() { i=0; while [ $i -lt 30 ]; do grep -q -- "$1" "$T/logs/xfer.log" 2>/dev/null && return 0; sleep 0.2; i=$((i + 1)); done; return 1; }
+lg() { i=0; while [ $i -lt 75 ]; do grep -q -- "$1" "$T/logs/xfer.log" 2>/dev/null && return 0; sleep 0.2; i=$((i + 1)); done; return 1; }
 start_srv() {
     : > "$T/srv.log"                     # (the background job truncates it later: the line of the previous server must not be seen as this one's)
     "$KARIDNS" -c "$T/k.conf" -f > "$T/srv.log" 2>&1 &

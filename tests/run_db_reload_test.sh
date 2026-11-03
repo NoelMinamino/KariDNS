@@ -151,7 +151,7 @@ next_batch() { BN=$((BN + 1)); }
 wait_batch() {   # wait_batch DESCRIPTION: the loader sent batch $BN and got the Backend's result
     wait_log "$T/srv.log" "Backend result for batch $BN:" 15 && pass "$1: batch $BN done" || { fail "$1: no result for batch $BN"; tail -5 "$T/srv.log" | sed 's/^/         /'; }
 }
-batch_line() { grep "karidns-dbloader.* batch $BN (" "$T/srv.log" | tail -1 | sed 's/.* batch /batch /'; }
+batch_line() { grep "\[DB\] batch $BN (" "$T/srv.log" | tail -1 | sed 's/.* batch /batch /'; }
 expect_batch() {   # expect_batch DESCRIPTION READ SENT FAILED DELETED UNCHANGED
     l=$(batch_line)
     case "$l" in
@@ -184,7 +184,7 @@ printf '%s\n' "$OUT" | grep -q "^OK reloaded; DB reload requested (request [0-9]
 next_batch
 wait_batch "serial change"
 expect_batch "serial change" 1 1 0 0 $((NZ - 1))
-grep -q "karidns-dbloader.* batch $BN (diff) sent" "$T/srv.log" && pass "the batch is a diff batch" || fail "batch kind"
+grep -q "\[DB\] batch $BN (diff) sent" "$T/srv.log" && pass "the batch is a diff batch" || fail "batch kind"
 grep -q "batch $BN (diff) sent.*(answers a request)" "$T/srv.log" && pass "the batch answers the request of karictl" || fail "no request marker on the batch"
 check_ans "www.db1.test A has the new address" "192.0.2.11" www.db1.test A
 dbst db1.test | grep -q "serial 11, status applied" && pass "dbstatus db1.test: serial 11" || fail "dbstatus db1.test serial 11"
@@ -353,7 +353,7 @@ i=0; P3=""
 while [ $i -lt 100 ]; do P3=$(loader_pid); [ -n "$P3" ] && [ "$P3" != "$P2" ] && break; P3=""; sleep 0.1; i=$((i + 1)); done
 BN=1
 wait_log "$T/srv.log" "Backend result for batch 1:" 15 3 && pass "second restart: batch done" || fail "second restart: no result"
-l=$(grep "karidns-dbloader.* batch 1 (startup) sent" "$T/srv.log" | tail -1)
+l=$(grep "\[DB\] batch 1 (startup) sent" "$T/srv.log" | tail -1)
 case "$l" in *"$NDB zone(s) read, 0 sent, 0 failed in the loader, 0 deleted, $NDB unchanged"*) pass "second restart: $NDB zones read, none sent" ;; *) fail "second restart: '$l'" ;; esac
 
 # ================================================================ the control thread never waits for the loader

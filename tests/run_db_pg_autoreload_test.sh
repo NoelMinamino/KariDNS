@@ -150,7 +150,7 @@ wait_status() {
 }
 check_ans() { got=$(qa "$3"); [ "$got" = "$2" ] && pass "$1" || fail "$1 (got '$got', want '$2')"; }
 dbst() { $KCTL dbstatus "$@" 2>&1; }
-n_auto() { grep -c "karidns-dbloader.* batch [0-9]* (auto) sent" "$LOG" 2>/dev/null; }
+n_auto() { grep -c "\[DB\] batch [0-9]* (auto) sent" "$LOG" 2>/dev/null; }
 wait_dbst() { i=0; while [ $i -lt $(($2 * 10)) ]; do dbst | grep -q -- "$1" && return 0; sleep 0.1; i=$((i + 1)); done; return 1; }
 latency() {   # latency DESCRIPTION NAME EXPECTED BOUND_MS
     if wait_ans "$2" "$3" 15000; then
@@ -197,7 +197,7 @@ latency "a new zone" www.z4.test 192.0.2.40 "$BOUND_MS"
 sleep 0.5
 pq "DELETE FROM domains WHERE name = 'z4.test'" > /dev/null
 if wait_status www.z4.test REFUSED 15000; then [ "$WAIT_MS" -le "$BOUND_MS" ] && pass "a deleted zone is gone after $WAIT_MS ms (bound $BOUND_MS ms)" || fail "a deleted zone is gone after $WAIT_MS ms, bound $BOUND_MS ms"; else fail "the deleted zone still answers"; fi
-grep "karidns-dbloader.* (auto) sent" "$LOG" | grep -q "1 deleted" && pass "the delete went as ZONE_DELETE in an auto batch" || fail "no auto batch with 1 deleted"
+grep "\[DB\] .* (auto) sent" "$LOG" | grep -q "1 deleted" && pass "the delete went as ZONE_DELETE in an auto batch" || fail "no auto batch with 1 deleted"
 check_ans "the other zones are untouched" "192.0.2.20" www.z2.test
 sleep 1
 
