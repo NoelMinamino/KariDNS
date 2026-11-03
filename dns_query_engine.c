@@ -81,6 +81,54 @@ void query_set_client_addr(const void *sa) {
   t_qacl.client_valid = qacl_copy_addr(&t_qacl.client, sa);
 }
 
+/* batch 14: event messages of the query path (dns_log.h logev_*).  The client is the address text the engine was given and the port the transport set
+ * (query_set_client_addr(); 0 when it did not).  logev_wanted() is one atomic load; a caller checks it before it builds a name or a text. */
+static inline int qe_client_port(void) {
+  if (!t_qacl.client_valid) return 0;
+  if (t_qacl.client.ss_family == AF_INET) return ntohs(((const struct sockaddr_in *)&t_qacl.client)->sin_port);
+  if (t_qacl.client.ss_family == AF_INET6) return ntohs(((const struct sockaddr_in6 *)&t_qacl.client)->sin6_port);
+  return 0;
+}
+int query_client_port(void) { return qe_client_port(); }
+
+/* UPDATE (RFC 2136) that never reaches the zone: the zone section is wrong (BIND lib/ns/update.c, category update, INFO: "update failed: ... (RCODE)") */
+static void qe_log_update_zone_error(const char *client_ip, int zone_rcode, const char *zname) {
+  if (!logev_wanted(LOGC_UPDATE, LOG_LVL_INFO)) return;
+  char zn[512];
+  logev_name_text(zname, zn, sizeof(zn));
+  if (zone_rcode == 1) logev_post(LOGC_UPDATE, LOG_LVL_INFO, client_ip, qe_client_port(), "update failed: zone section is not of type SOA (FORMERR)");
+  else logev_post(LOGC_UPDATE, LOG_LVL_INFO, client_ip, qe_client_port(), "update failed: %s: not authoritative for update zone (NOTAUTH)", zn);
+}
+
+/* Is there an update ACL (allow-update, an `update-acl`, an update-policy) for the zone at all?  BIND logs a refusal at ERROR when there is one and at
+ * INFO when updates were never enabled (checkupdateacl()) */
+static bool qe_update_acl_configured(const server_config_t *cfg, const zone_config_t *zcfg, const char *view_name) {
+  const zone_ext_t *x = zext(zcfg);
+  return x->upd_policy || x->allow_update_count > 0 || (cfg && config_acl_for(cfg, zcfg, view_name, AML_ACL_UPDATE) != NULL);
+}
+
+/* category update-security (BIND lib/ns/update.c checkupdateacl()): a signed request is logged first (`signer "k" approved|denied`, INFO), then
+ * the decision on the zone: `update 'z/IN' denied` (ERROR with an update ACL, INFO without).  zone_class is IN: the engine serves IN only. */
+static void qe_log_update_decision(const char *client_ip, const char *zone, const char *signer, bool approved, const server_config_t *cfg, const zone_config_t *zcfg,
+                                   const char *view_name) {
+  if (!logev_wanted(LOGC_UPDATE_SECURITY, LOG_LVL_ERROR)) return;     /* (nothing passes ERROR: neither does INFO) */
+  char zn[512], kn[512];
+  logev_name_text(zone, zn, sizeof(zn));
+  if (signer) {
+    logev_name_text(signer, kn, sizeof(kn));
+    logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, client_ip, qe_client_port(), "signer \"%s\" %s", kn, approved ? "approved" : "denied");
+  }
+  if (!approved) logev_post(LOGC_UPDATE_SECURITY, qe_update_acl_configured(cfg, zcfg, view_name) ? LOG_LVL_ERROR : LOG_LVL_INFO, client_ip, qe_client_port(), "update '%s/IN' denied", zn);
+}
+
+/* a secondary zone: BIND would forward the UPDATE (allow-update-forwarding); KariDNS does not, so it is refused (RFC 2136 §6 leaves it to the server) */
+static void qe_log_update_secondary(const char *client_ip, const char *zone) {
+  if (!logev_wanted(LOGC_UPDATE_SECURITY, LOG_LVL_INFO)) return;
+  char zn[512];
+  logev_name_text(zone, zn, sizeof(zn));
+  logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, client_ip, qe_client_port(), "update forwarding '%s/IN' denied: this server does not forward updates to the primary", zn);
+}
+
 /* Does allow-query / allow-query-on of the zone `entry` (of this view) let the client in?  For the zone the query was routed to the
  * caller has the configuration; a zone that a CNAME or glue lookup reaches is looked up here.  No allocation. */
 static inline bool zone_query_permitted(const server_config_t *cfg, const zone_config_t *zcfg, const char *view_name, const char *client_ip) {
@@ -3424,8 +3472,10 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       int urc;
       if (qtype != 6) {
         urc = 1;                                        // FORMERR
+        qe_log_update_zone_error(client_ip, urc, current_qname);
       } else if (!view || zclass != 1 || !domain_names_match_ci(not_ready_zone->name, current_qname)) {
         urc = 9;                                        // NOTAUTH
+        qe_log_update_zone_error(client_ip, urc, current_qname);
       } else {
         bool uauth = zext(&zc)->upd_policy ? nr_tkey != NULL
                                            : (cfg && zone_update_acl_allows_in_view(cfg, &zc, view->name, client_ip, nr_tkey ? nr_tkey->name : NULL));
@@ -3439,6 +3489,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         } else {
           urc = 5;                                      // REFUSED
           add_ede(&edns, send_ede, 18, "Query refused due to access control");
+          qe_log_update_decision(client_ip, not_ready_zone->name, nr_tkey ? nr_tkey->name : NULL, false, cfg, &zc, view->name);
         }
       }
       int len = dns_build_error_response(req, req_len, res, max_res_len, (uint8_t)urc, 0, qdcount, &edns, is_tcp, cfg);
@@ -3479,13 +3530,16 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       size_t iq;
       uint32_t cs = 0;
       if (iap && skip_wire_name(req, req_len, DNS_HEADER_SIZE, &iq) == 0 && iq + 4 <= req_len) {
-        if (!ixfr_request_client_serial(req, req_len, iq + 4, &cs))         /* RFC 1995 3, as the zone in memory */
+        if (!ixfr_request_client_serial(req, req_len, iq + 4, &cs)) {       /* RFC 1995 3, as the zone in memory */
           return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
+        }
         const size_t alimit = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
         const size_t tsig_limit = tsig ? tsig->res_limit : 0;
         if (tsig) tsig->res_limit = alimit;
         int ilen = build_apex_soa_answer(req, req_len, res, alimit, not_ready_zone, iap, &edns, is_tcp, MINIMAL_YES, ADDITIONAL_AUTH_YES, view, comp_ctx, tsig, cfg, &cs);
-        if (ilen >= DNS_HEADER_SIZE) return ilen;
+        if (ilen >= DNS_HEADER_SIZE) {
+          return ilen;
+        }
         if (tsig) tsig->res_limit = tsig_limit;
       }
     }
@@ -3636,14 +3690,18 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     int rcode = 5; // REFUSED
     if (zone_rcode != 0) {
       rcode = zone_rcode;
+      qe_log_update_zone_error(client_ip, zone_rcode, current_qname);
     } else if (!zone_is_master) {
       /* RFC 2136 §3.1.2 はセカンダリに UPDATE をプライマリへ転送させる (§6)。KariDNS は転送しない
        * ので、方針による拒否 (RFC 1035 §4.1.1 REFUSED) を返す。allow-update を満たしていても同じ。*/
       add_ede(&edns, send_ede, 18, "Updates are not accepted for a secondary zone");
+      qe_log_update_secondary(client_ip, db_entry->domain);
     } else if (auth) {
+      qe_log_update_decision(client_ip, db_entry->domain, tkey ? tkey->name : NULL, true, cfg, zone_cfg_any, view->name);
       rcode = handle_dynamic_update(req, req_len, db_entry, client_ip, tkey ? tkey->name : "<none>");
     } else {
       add_ede(&edns, send_ede, 18, "Query refused due to access control");
+      qe_log_update_decision(client_ip, db_entry->domain, tkey ? tkey->name : NULL, false, cfg, zone_cfg_any, view->name);
     }
 
     /* RFC 2136 §3.8: ID と OPCODE を写し、ゾーンセクション以外のセクションは返さない (カウント 0)。
@@ -3917,8 +3975,9 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     uint32_t client_serial = 0;
 
     /* RFC 1995 §3: クライアントの版の SOA が Authority に無ければ FORMERR (TCP と同じ) */
-    if (!ixfr_request_client_serial(req, req_len, q_offset, &client_serial))
+    if (!ixfr_request_client_serial(req, req_len, q_offset, &client_serial)) {
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
+    }
 
     const zone_image_t *zimg = current_zone->image;
     /* B8t-1: the SOA this client sees (the zone has one, checked above); the serial is the zone's, the same in all of them */

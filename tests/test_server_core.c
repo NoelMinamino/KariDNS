@@ -1099,6 +1099,264 @@ static void test_query_logger_thread_func(void) {
     printf("  -> query_logger_thread_func passed.\n");
 }
 
+
+/* ---- batch 14: the event messages (dns_log.h logev_*): the mask, the rate limit, the ring record, the logger thread ---- */
+void qlog_event_sink(void *vctx, int cat, int level, const char *client_ip, int client_port, const char *msg);
+
+static char g_ev_line[8][KLOG_MSG_MAX];
+static int g_ev_n, g_ev_cat[8], g_ev_level[8], g_ev_last_level;
+static char g_ev_last[KLOG_MSG_MAX];
+static void test_level_hook(int cat, int level, const char *msg) {
+    snprintf(g_ev_last, sizeof(g_ev_last), "%s", msg);
+    g_ev_last_level = level;
+    if (g_ev_n < 8) {
+        snprintf(g_ev_line[g_ev_n], sizeof(g_ev_line[0]), "%s", msg);
+        g_ev_cat[g_ev_n] = cat;
+        g_ev_level[g_ev_n] = level;
+    }
+    g_ev_n++;
+}
+
+static void test_logev_helpers(void) {
+    printf("[TEST] Server Core: logev_name_text / logev_format_line / mask / rate limit...\n");
+    char b[64];
+    logev_name_text("example.test.", b, sizeof(b));
+    assert(strcmp(b, "example.test") == 0);                                 /* BIND logs the name without the final dot */
+    logev_name_text(".", b, sizeof(b));
+    assert(strcmp(b, ".") == 0);
+    logev_name_text("a\\.b.example.test\\.", b, sizeof(b));                  /* an escaped dot at the end is part of the label */
+    assert(strcmp(b, "a\\.b.example.test\\.") == 0);
+    logev_name_text("a b\"c;d\x01\x7f\xff.test.", b, sizeof(b));
+    assert(strcmp(b, "a\\032b\\034c\\059d\\001\\127\\255.test") == 0);
+    logev_name_text("abcdefghij.test.", b, 8);                              /* cut, terminated */
+    assert(strcmp(b, "abcdefg") == 0);
+    logev_name_text("a b.test.", b, 5);                                     /* an escape that does not fit is not started */
+    assert(strcmp(b, "a") == 0);
+    logev_name_text(NULL, b, sizeof(b));
+    assert(b[0] == '\0');
+    logev_name_text("x", b, 0);
+
+    char l[64];
+    assert(logev_format_line(l, sizeof(l), "192.0.2.7", 5300, "denied") == strlen("client 192.0.2.7#5300: denied") && strcmp(l, "client 192.0.2.7#5300: denied") == 0);
+    logev_format_line(l, sizeof(l), "2001:db8::1", 0, "denied");
+    assert(strcmp(l, "client 2001:db8::1: denied") == 0);
+    logev_format_line(l, sizeof(l), NULL, 0, "denied");
+    assert(strcmp(l, "denied") == 0);
+    logev_format_line(l, 8, "192.0.2.7", 1, "denied");
+    assert(strcmp(l, "client ") == 0);
+    assert(logev_format_line(l, 0, "a", 1, "b") == 0);
+
+    /* the mask: a level is wanted when some channel passes it */
+    logev_set_mask(LOGC_UPDATE_SECURITY, LOGEV_BIT(LOG_LVL_ERROR) | LOGEV_BIT(LOG_LVL_INFO));
+    assert(logev_wanted(LOGC_UPDATE_SECURITY, LOG_LVL_INFO) && logev_wanted(LOGC_UPDATE_SECURITY, LOG_LVL_ERROR));
+    assert(!logev_wanted(LOGC_UPDATE_SECURITY, LOG_LVL_WARNING) && !logev_wanted(LOGC_UPDATE_SECURITY, 1));
+    assert(!logev_wanted(-1, LOG_LVL_INFO) && !logev_wanted(LOGC_COUNT, LOG_LVL_INFO) && !logev_wanted(LOGC_UPDATE_SECURITY, 11) && !logev_wanted(LOGC_UPDATE_SECURITY, -6));
+    logev_set_mask(-1, 0xffffffffu);                                         /* (ignored) */
+    logev_set_mask(LOGC_UPDATE_SECURITY, 0);
+    assert(!logev_wanted(LOGC_UPDATE_SECURITY, LOG_LVL_INFO));
+
+    /* the rate limit: update-security 10 per second; the second after, the count of the dropped is handed back once */
+    logev_rate_reset();
+    assert(logev_rate_limit(LOGC_UPDATE_SECURITY) == 10 && logev_rate_limit(LOGC_XFER_OUT) == 50 && logev_rate_limit(LOGC_QUERY_ERRORS) == 20 &&
+           logev_rate_limit(LOGC_UPDATE) == 20 && logev_rate_limit(LOGC_GENERAL) == 20);
+    uint32_t rep = 99;
+    int rl = LOG_LVL_INFO;
+    int passed = 0;
+    for (int i = 0; i < 25; i++)
+        if (logev_admit_at(LOGC_UPDATE_SECURITY, i % 2 ? LOG_LVL_ERROR : LOG_LVL_INFO, 5000, &rep, &rl)) passed++;
+    assert(passed == 10 && rep == 0);
+    assert(logev_admit_at(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, 5001, &rep, &rl) && rep == 15 && rl == LOG_LVL_INFO);      /* (the last one dropped was an INFO) */
+    assert(logev_admit_at(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, 5001, &rep, &rl) && rep == 0);
+    assert(!logev_admit_at(-1, LOG_LVL_INFO, 1, &rep, &rl) && !logev_admit_at(LOGC_COUNT, LOG_LVL_INFO, 1, &rep, &rl));
+    assert(logev_admit_at(LOGC_XFER_OUT, LOG_LVL_INFO, 7000, &rep, &rl));   /* every category counts for itself */
+
+    /* the direct path (a thread without a ring): the line goes to the level hook, once the mask and the rate limit allow it */
+    logev_rate_reset();
+    klog_set_level_hook(test_level_hook);
+    g_ev_n = 0;
+    logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, "192.0.2.7", 40000, "signer \"%s\" approved", "k");
+    assert(g_ev_n == 0);                                                    /* the mask is 0: nothing is built */
+    logev_set_mask(LOGC_UPDATE_SECURITY, LOGEV_BIT(LOG_LVL_INFO) | LOGEV_BIT(LOG_LVL_ERROR));
+    logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, "192.0.2.7", 40000, "signer \"%s\" approved", "k");
+    assert(g_ev_n == 1 && g_ev_cat[0] == LOGC_UPDATE_SECURITY && g_ev_level[0] == LOG_LVL_INFO);
+    assert(strcmp(g_ev_line[0], "client 192.0.2.7#40000: signer \"k\" approved") == 0);
+    for (int i = 0; i < 30; i++) logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_ERROR, "192.0.2.7", 1, "x");
+    assert(g_ev_n == 10);                                                   /* 10 per second in all */
+    logev_flush_suppressed((int64_t)time(NULL));                            /* its second is not over */
+    assert(g_ev_n == 10);
+    logev_flush_suppressed((int64_t)time(NULL) + 5);
+    assert(g_ev_n == 11 && g_ev_last_level == LOG_LVL_ERROR && strcmp(g_ev_last, "21 message(s) suppressed by the rate limit of 10 per second") == 0);
+    logev_flush_suppressed((int64_t)time(NULL) + 6);
+    assert(g_ev_n == 11);                                                   /* said once */
+    /* a text longer than the record is cut; no hook, no routing */
+    logev_rate_reset();
+    g_ev_n = 0;
+    char big[600];
+    memset(big, 'x', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+    logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, NULL, 0, "%s", big);
+    assert(g_ev_n == 1 && strlen(g_ev_line[0]) == LOGEV_MSG_MAX - 1);
+    klog_set_level_hook(NULL);
+    logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, NULL, 0, "nowhere");     /* (no hook: dropped) */
+    assert(g_ev_n == 1);
+    logev_set_mask(LOGC_UPDATE_SECURITY, 0);
+    logev_rate_reset();
+    printf("  -> logev helpers passed.\n");
+}
+
+/* a logging runtime for the event categories: one file channel per category, with the severity given */
+static log_runtime_t *test_install_event_runtime(const char *path_sec, const char *path_qe, int qe_level) {
+    log_channel_t c1, c2;
+    memset(&c1, 0, sizeof(c1));
+    memset(&c2, 0, sizeof(c2));
+    c1.name = (char *)"sec";
+    c1.file_path = (char *)path_sec;
+    c1.dest = LOGDEST_FILE;
+    c1.level = LOG_LVL_INFO;
+    c1.versions = LOG_VERSIONS_UNSET;
+    c1.fd = -1;
+    c1.time_fmt = LOGTIME_NONE;
+    c1.print_category = c1.print_severity = true;
+    c1.next = &c2;
+    c2 = c1;
+    c2.name = (char *)"qe";
+    c2.file_path = (char *)path_qe;
+    c2.level = qe_level;
+    c2.next = NULL;
+    logging_config_t lc;
+    memset(&lc, 0, sizeof(lc));
+    lc.channels = &c1;
+    lc.cat[LOGC_UPDATE_SECURITY].n = 1;
+    lc.cat[LOGC_UPDATE_SECURITY].name[0] = (char *)"sec";
+    lc.cat[LOGC_QUERY_ERRORS].n = 1;
+    lc.cat[LOGC_QUERY_ERRORS].name[0] = (char *)"qe";
+    logrt_status_t st;
+    log_runtime_t *rt = log_runtime_build(&lc, false, &st);
+    assert(rt && st == LOGRT_OK);
+    assert(log_runtime_install(rt));
+    return rt;
+}
+
+static void test_event_ring_and_logger(void) {
+    printf("[TEST] Server Core: event messages through the worker ring and the query logger thread...\n");
+    char sec_path[256], qe_path[256];
+    snprintf(sec_path, sizeof(sec_path), "/tmp/karidns_test_ev_sec_%ld.log", (long)time(NULL));
+    snprintf(qe_path, sizeof(qe_path), "/tmp/karidns_test_ev_qe_%ld.log", (long)time(NULL));
+    unlink(sec_path);
+    unlink(qe_path);
+    log_runtime_t *rt = test_install_event_runtime(sec_path, qe_path, 3 /* debug 3 */);
+    /* what log_runtime_install() computed: update-security passes the levels up to info, query-errors (debug 3) also debug 1..3 */
+    assert(logev_wanted(LOGC_UPDATE_SECURITY, LOG_LVL_INFO) && logev_wanted(LOGC_UPDATE_SECURITY, LOG_LVL_CRITICAL));
+    assert(!logev_wanted(LOGC_UPDATE_SECURITY, 1));
+    assert(logev_wanted(LOGC_QUERY_ERRORS, 1) && logev_wanted(LOGC_QUERY_ERRORS, 3) && !logev_wanted(LOGC_QUERY_ERRORS, 4));
+    assert(!logev_wanted(LOGC_XFER_OUT, LOG_LVL_INFO) || logev_wanted(LOGC_XFER_OUT, LOG_LVL_INFO));   /* (default_syslog: whatever it is, it is decided) */
+    logev_rate_reset();
+
+    server_config_t mock_cfg;
+    memset(&mock_cfg, 0, sizeof(mock_cfg));
+    mock_cfg.logging.queries_enabled = false;                                /* the query log is off: the events are still written */
+
+    worker_ctx_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.qlog_ring.size = 64;
+    worker.qlog_ring.mask = 63;
+    worker.qlog_ring.events = calloc(64, sizeof(qlog_event_t));
+    atomic_init(&worker.qlog_ring.head, 0);
+    atomic_init(&worker.qlog_ring.tail, 0);
+    atomic_init(&worker.qlog_ring.dropped_count, 0);
+    atomic_init(&worker.qlog_ring.ev_dropped, 0);
+
+    atomic_store_explicit(&g_config_db.active, &mock_cfg, memory_order_release);
+    atomic_store_explicit(&g_worker_ctxs, &worker, memory_order_release);
+    atomic_store_explicit(&g_worker_count, 1, memory_order_relaxed);
+
+    /* a record of the other kind that the producer left in the ring while the query log was on: dropped by the consumer */
+    qlog_event_t *q0 = &worker.qlog_ring.events[0];
+    memset(q0, 0, sizeof(*q0));
+    q0->kind = QLOG_KIND_QUERY;
+    q0->qtype = 1;
+    q0->qclass = 1;
+    strcpy(q0->qname, "left.over.example.");
+    atomic_store_explicit(&worker.qlog_ring.head, 1, memory_order_release);
+
+    pthread_t th;
+    assert(pthread_create(&th, NULL, query_logger_thread_func, NULL) == 0);
+
+    logev_set_thread_sink(qlog_event_sink, &worker);                         /* this thread plays the worker */
+    logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, "192.0.2.7", 40000, "signer \"k\" approved");
+    logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_ERROR, "2001:db8::7", 40001, "update 'e.test/IN' denied");
+    logev_post(LOGC_QUERY_ERRORS, 1, "192.0.2.8", 53, "query failed (SERVFAIL) for e.test/IN/A");
+    logev_post(LOGC_QUERY_ERRORS, 4, "192.0.2.8", 53, "not written: debug 4");
+    logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, NULL, 0, "line\nwith\rcontrol\tand\x01 bytes");
+    for (int wait_i = 0; wait_i < 200; wait_i++) {
+        if (atomic_load_explicit(&worker.qlog_ring.tail, memory_order_relaxed) == atomic_load_explicit(&worker.qlog_ring.head, memory_order_relaxed) &&
+            test_file_has(sec_path, "control") && test_file_has(qe_path, "SERVFAIL")) break;
+        usleep(5000);
+    }
+    assert(test_file_has(sec_path, "update-security: info: client 192.0.2.7#40000: signer \"k\" approved\n"));
+    assert(test_file_has(sec_path, "update-security: error: client 2001:db8::7#40001: update 'e.test/IN' denied\n"));
+    assert(test_file_has(sec_path, "update-security: info: line?with?control\tand? bytes\n"));          /* a line cannot start inside a message */
+    assert(test_file_has(qe_path, "query-errors: debug 1: client 192.0.2.8#53: query failed (SERVFAIL) for e.test/IN/A\n"));
+    assert(!test_file_has(qe_path, "debug 4"));
+    assert(!test_file_has(sec_path, "left.over") && !test_file_has(qe_path, "left.over"));
+
+    /* the ring is nearly full (90%): the event is dropped and counted, the thread goes on */
+    atomic_store_explicit(&worker.qlog_ring.tail, 0, memory_order_relaxed);
+    atomic_store_explicit(&worker.qlog_ring.head, 0, memory_order_relaxed);
+    pthread_cancel(th);
+    pthread_join(th, NULL);
+    atomic_store_explicit(&g_worker_ctxs, NULL, memory_order_release);
+    atomic_store_explicit(&g_worker_count, 0, memory_order_relaxed);
+    logev_rate_reset();
+    atomic_store_explicit(&worker.qlog_ring.tail, 0, memory_order_relaxed);
+    atomic_store_explicit(&worker.qlog_ring.head, 58, memory_order_relaxed);          /* 58 of 64 slots (the limit is 64 / 10 * 9 = 54) */
+    logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, "192.0.2.7", 1, "dropped");
+    assert(atomic_load_explicit(&worker.qlog_ring.head, memory_order_relaxed) == 58);
+    assert(atomic_load_explicit(&worker.qlog_ring.ev_dropped, memory_order_relaxed) == 1);
+    atomic_store_explicit(&worker.qlog_ring.head, 53, memory_order_relaxed);
+    logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, "192.0.2.7", 1, "kept");
+    assert(atomic_load_explicit(&worker.qlog_ring.head, memory_order_relaxed) == 54);
+    assert(atomic_load_explicit(&worker.qlog_ring.ev_dropped, memory_order_relaxed) == 1);
+    /* a worker without a ring (it could not allocate one): nothing is written, nothing breaks */
+    qlog_event_t *saved = worker.qlog_ring.events;
+    worker.qlog_ring.events = NULL;
+    logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, "192.0.2.7", 1, "no ring");
+    worker.qlog_ring.events = saved;
+    /* an out-of-range port and a missing client are stored as "unknown" */
+    atomic_store_explicit(&worker.qlog_ring.head, 0, memory_order_relaxed);
+    logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_INFO, NULL, 99999, "no client");
+    assert(worker.qlog_ring.events[0].kind == QLOG_KIND_EVENT && worker.qlog_ring.events[0].client_port == 0 && worker.qlog_ring.events[0].client_text[0] == '\0');
+    logev_set_thread_sink(NULL, NULL);
+
+    /* the report of suppressed messages when no further message comes: the logger thread's tick (logev_flush_suppressed()) writes it */
+    atomic_store_explicit(&worker.qlog_ring.head, 0, memory_order_relaxed);
+    atomic_store_explicit(&worker.qlog_ring.tail, 0, memory_order_relaxed);
+    logev_rate_reset();
+    atomic_store_explicit(&g_worker_ctxs, &worker, memory_order_release);
+    atomic_store_explicit(&g_worker_count, 1, memory_order_relaxed);
+    assert(pthread_create(&th, NULL, query_logger_thread_func, NULL) == 0);
+    logev_set_thread_sink(qlog_event_sink, &worker);
+    for (int i = 0; i < 15; i++) logev_post(LOGC_UPDATE_SECURITY, LOG_LVL_ERROR, "192.0.2.9", 1, "flood %d", i);
+    for (int wait_i = 0; wait_i < 300; wait_i++) {
+        if (test_file_has(sec_path, "5 message(s) suppressed by the rate limit of 10 per second")) break;
+        usleep(10000);
+    }
+    assert(test_file_has(sec_path, "update-security: error: 5 message(s) suppressed by the rate limit of 10 per second\n"));
+    logev_set_thread_sink(NULL, NULL);
+    pthread_cancel(th);
+    pthread_join(th, NULL);
+
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
+    atomic_store_explicit(&g_worker_ctxs, NULL, memory_order_release);
+    atomic_store_explicit(&g_worker_count, 0, memory_order_relaxed);
+    test_retire_runtime(rt);                                                 /* the empty runtime: the masks are recomputed */
+    assert(!logev_wanted(LOGC_QUERY_ERRORS, 1));
+    free(worker.qlog_ring.events);
+    unlink(sec_path);
+    unlink(qe_path);
+    printf("  -> event ring and logger thread passed.\n");
+}
+
 // ----------------------------------------------------------------------------
 // 14. Control Socket HMAC Auth & Commands Test
 // ----------------------------------------------------------------------------
@@ -6008,6 +6266,8 @@ int main(void) {
         test_klog_install_with_a_slow_user();
         test_response_logger_thread_func();
         test_query_logger_thread_func();
+        test_logev_helpers();
+        test_event_ring_and_logger();
         printf("=== Logging tests PASSED ===\n");
         return 0;
     }
@@ -6032,6 +6292,8 @@ int main(void) {
 
     test_response_logger_thread_func();
     test_query_logger_thread_func();
+    test_logev_helpers();
+    test_event_ring_and_logger();
     test_control_socket_thread_and_commands();
     test_open_router_udp_sockets_and_buffers();
     test_sendmmsg_skip_failed();

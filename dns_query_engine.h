@@ -28,6 +28,9 @@ extern _Thread_local query_rrl_info_t t_query_rrl_info;
 void query_set_local_addr(const void *sa);
 /* The client's address in binary (the same client as client_ip), so that allow-query does not parse the text again; optional. */
 void query_set_client_addr(const void *sa);
+/* The port of the client of the request in progress (from query_set_client_addr()), 0 when it was not set: for the event messages of the log
+ * (dns_log.h), which say "client <ip>#<port>". */
+int query_client_port(void);
 
 /* RRL の slip 応答: 直前の process_dns_query*() が作った応答 res[0..res_len) を TC=1 にして質問
  * と OPT だけに切り詰め、要求に TSIG があれば同じ鍵で署名し直す (X-20、RFC 8945 §5.3。BIND 9.20 の slip 応答も

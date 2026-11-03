@@ -462,6 +462,12 @@ const char *format_type_name(uint16_t type, char *buf, size_t buf_size) {
     return buf;
 }
 
+const char *dns_rcode_name(unsigned rcode) {
+  static const char *const names[] = {"NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED",
+                                      "YXDOMAIN", "YXRRSET", "NXRRSET", "NOTAUTH", "NOTZONE"};
+  return rcode < sizeof(names) / sizeof(names[0]) ? names[rcode] : "RCODE";
+}
+
 const char *dns_type_to_string(uint16_t type_code) {
     const char *n = lookup_type_name(type_code);
     if (n) return n;
@@ -864,5 +870,151 @@ void kdns_logc(int cat, int prio, const char *fmt, ...) {
   va_start(ap, fmt);
   klog_dispatch(cat, prio, fmt, ap, saved);
   va_end(ap);
+}
+
+/* ---- event messages (dns_log.h): the mask, the rate limit, the thread's sink ---- */
+
+_Atomic uint32_t g_logev_mask[LOGC_COUNT];
+static _Atomic(klog_level_hook_t) g_klog_level_hook;
+static _Thread_local struct { logev_sink_t fn; void *ctx; } t_logev_sink;
+
+void logev_set_mask(int cat, uint32_t mask) {
+  if (cat >= 0 && cat < LOGC_COUNT) atomic_store_explicit(&g_logev_mask[cat], mask, memory_order_relaxed);
+}
+
+void klog_set_level_hook(klog_level_hook_t hook) {
+  atomic_store_explicit(&g_klog_level_hook, hook, memory_order_release);
+}
+
+void logev_set_thread_sink(logev_sink_t fn, void *ctx) {
+  t_logev_sink.fn = fn;
+  t_logev_sink.ctx = ctx;
+}
+
+void logev_name_text(const char *name, char *out, size_t n) {
+  if (!out || n == 0) return;
+  size_t o = 0;
+  size_t len = name ? strlen(name) : 0;
+  if (len > 1 && name[len - 1] == '.' && name[len - 2] != '\\') len--;        /* (a final "\." is an escaped dot of the last label) */
+  for (size_t i = 0; i < len; i++) {
+    unsigned char c = (unsigned char)name[i];
+    if (c >= 0x21 && c <= 0x7e && c != '"' && c != ';') {
+      if (o + 1 >= n) break;
+      out[o++] = (char)c;
+    } else {
+      if (o + 4 >= n) break;
+      out[o++] = '\\';
+      out[o++] = (char)('0' + c / 100);
+      out[o++] = (char)('0' + c / 10 % 10);
+      out[o++] = (char)('0' + c % 10);
+    }
+  }
+  out[o] = '\0';
+}
+
+size_t logev_format_line(char *out, size_t n, const char *client_ip, int client_port, const char *msg) {
+  if (!out || n == 0) return 0;
+  int r;
+  if (client_ip && *client_ip && client_port > 0) r = snprintf(out, n, "client %s#%d: %s", client_ip, client_port, msg);
+  else if (client_ip && *client_ip) r = snprintf(out, n, "client %s: %s", client_ip, msg);
+  else r = snprintf(out, n, "%s", msg);
+  if (r < 0) {
+    out[0] = '\0';
+    return 0;
+  }
+  return (size_t)r < n ? (size_t)r : n - 1;
+}
+
+/* Messages per second and category.  Every message of these categories is something a client can cause (an UPDATE or transfer that is refused,
+ * a query that fails) or a per-transfer line, so none may be able to fill a disk: the limit is not BIND's (BIND logs every one) but it is high
+ * enough for an operator to see what is going on, and the count of the others is reported. */
+static const uint32_t k_logev_limit_default = 20;
+uint32_t logev_rate_limit(int cat) {
+  switch (cat) {
+    case LOGC_UPDATE_SECURITY: return 10;
+    case LOGC_UPDATE: return 20;
+    case LOGC_QUERY_ERRORS: return 20;
+    case LOGC_XFER_OUT: return 50;
+    default: return k_logev_limit_default;
+  }
+}
+
+static struct {
+  _Atomic int64_t sec;            /* the second being counted */
+  _Atomic uint32_t count;         /* messages passed in it */
+  _Atomic uint32_t suppressed;    /* messages dropped since the last report */
+  _Atomic int level;              /* the level of the last one dropped (the report is made at it) */
+} g_logev_rl[LOGC_COUNT];
+
+void logev_rate_reset(void) {
+  for (int i = 0; i < LOGC_COUNT; i++) {
+    atomic_store(&g_logev_rl[i].sec, 0);
+    atomic_store(&g_logev_rl[i].count, 0);
+    atomic_store(&g_logev_rl[i].suppressed, 0);
+    atomic_store(&g_logev_rl[i].level, LOG_LVL_INFO);
+  }
+}
+
+bool logev_admit_at(int cat, int level, int64_t now, uint32_t *report, int *report_level) {
+  *report = 0;
+  if (cat < 0 || cat >= LOGC_COUNT) return false;
+  int64_t s = atomic_load_explicit(&g_logev_rl[cat].sec, memory_order_relaxed);
+  if (s != now && atomic_compare_exchange_strong(&g_logev_rl[cat].sec, &s, now)) {   /* the first message of a new second */
+    atomic_store_explicit(&g_logev_rl[cat].count, 0, memory_order_relaxed);
+    *report = atomic_exchange_explicit(&g_logev_rl[cat].suppressed, 0, memory_order_relaxed);
+    *report_level = atomic_load_explicit(&g_logev_rl[cat].level, memory_order_relaxed);
+  }
+  if (atomic_load_explicit(&g_logev_rl[cat].count, memory_order_relaxed) >= logev_rate_limit(cat) ||
+      atomic_fetch_add_explicit(&g_logev_rl[cat].count, 1, memory_order_relaxed) >= logev_rate_limit(cat)) {
+    atomic_fetch_add_explicit(&g_logev_rl[cat].suppressed, 1, memory_order_relaxed);
+    atomic_store_explicit(&g_logev_rl[cat].level, level, memory_order_relaxed);
+    return false;
+  }
+  return true;
+}
+
+/* hand a finished record to the thread's sink, or format and route it here */
+static void logev_dispatch(int cat, int level, const char *client_ip, int client_port, const char *msg) {
+  if (t_logev_sink.fn) {
+    t_logev_sink.fn(t_logev_sink.ctx, cat, level, client_ip, client_port, msg);
+    return;
+  }
+  klog_level_hook_t hook = atomic_load_explicit(&g_klog_level_hook, memory_order_acquire);
+  if (!hook) return;
+  char line[KLOG_MSG_MAX];
+  logev_format_line(line, sizeof(line), client_ip, client_port, msg);
+  hook(cat, level, line);
+}
+
+static void logev_report(int cat, int level, uint32_t n) {
+  char msg[LOGEV_MSG_MAX];
+  snprintf(msg, sizeof(msg), "%u message(s) suppressed by the rate limit of %u per second", (unsigned)n, (unsigned)logev_rate_limit(cat));
+  logev_dispatch(cat, level, NULL, 0, msg);
+}
+
+void logev_flush_suppressed(int64_t now) {
+  static const int cats[] = { LOGC_UPDATE_SECURITY, LOGC_UPDATE, LOGC_QUERY_ERRORS, LOGC_XFER_OUT };
+  for (size_t i = 0; i < sizeof(cats) / sizeof(cats[0]); i++) {
+    int c = cats[i];
+    if (atomic_load_explicit(&g_logev_rl[c].suppressed, memory_order_relaxed) == 0) continue;
+    if (atomic_load_explicit(&g_logev_rl[c].sec, memory_order_relaxed) == now) continue;     /* its second is not over */
+    uint32_t n = atomic_exchange_explicit(&g_logev_rl[c].suppressed, 0, memory_order_relaxed);
+    if (n && logev_wanted(c, atomic_load_explicit(&g_logev_rl[c].level, memory_order_relaxed)))
+      logev_report(c, atomic_load_explicit(&g_logev_rl[c].level, memory_order_relaxed), n);
+  }
+}
+
+void logev_post(int cat, int level, const char *client_ip, int client_port, const char *fmt, ...) {
+  if (!logev_wanted(cat, level)) return;
+  uint32_t rep;
+  int rep_level = level;
+  if (!logev_admit_at(cat, level, (int64_t)time(NULL), &rep, &rep_level)) return;
+  if (rep && logev_wanted(cat, rep_level)) logev_report(cat, rep_level, rep);
+  char msg[LOGEV_MSG_MAX];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+  logev_dispatch(cat, level, client_ip, client_port, msg);
 }
 #endif

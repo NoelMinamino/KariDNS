@@ -248,9 +248,17 @@ typedef struct {
 } axfr_session_t;
 
 // クエリログ用 固定長イベント構造体 (バイナリ保持)
+// batch 14: the ring also carries the event messages of the worker (dns_log.h logev_*: update-security, update, xfer-out, query-errors).  A record of
+// kind QLOG_KIND_EVENT has the finished text in qname, the client address as text in client_text and its port in client_port, the category and the
+// level (LOG_LVL_*, or a debug level); everything else is unused.  Fixed size, nothing allocated, and the strings are cut.
+#define QLOG_KIND_QUERY 0
+#define QLOG_KIND_EVENT 1
 typedef struct {
     struct timespec ts;
-    struct sockaddr_storage client_addr;
+    union {
+        struct sockaddr_storage client_addr;
+        char client_text[INET6_ADDRSTRLEN + 2];     // QLOG_KIND_EVENT
+    };
     socklen_t addr_len;
     uint16_t qtype;
     uint16_t qclass;
@@ -259,7 +267,11 @@ typedef struct {
     uint8_t  protocol; // IPPROTO_UDP or IPPROTO_TCP
     bool     has_edns;
     bool     dnssec_ok;
-    char     qname[256];
+    uint8_t  kind;        // QLOG_KIND_*
+    uint8_t  cat;         // QLOG_KIND_EVENT: log_cat_t
+    int8_t   level;       // QLOG_KIND_EVENT: LOG_LVL_* or a debug level
+    uint16_t client_port; // QLOG_KIND_EVENT
+    char     qname[256];  // QLOG_KIND_EVENT: the text of the message
 } qlog_event_t;
 
 // Per-Worker SPSC (Single-Producer Single-Consumer) リングバッファ
@@ -270,6 +282,7 @@ typedef struct {
     alignas(64) _Atomic uint32_t head;
     alignas(64) _Atomic uint32_t tail;
     alignas(64) _Atomic uint64_t dropped_count;
+    _Atomic uint64_t ev_dropped;        // batch 14: event messages that found the ring too full
 } qlog_ring_t;
 
 /* S5 B-3: the published version of a zone is a heap zone_version_t (image + glue + flags); a writer builds a new one and

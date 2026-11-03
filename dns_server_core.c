@@ -1123,6 +1123,37 @@ void *response_logger_thread_func(void *arg) {
     return NULL;
 }
 
+/* batch 14: the sink of the event messages (dns_log.h logev_post()) of a worker thread.  The record goes into the worker's own query log ring (this
+ * thread is its one producer, as for a query); the query logger thread formats it and routes it to the channels.  Fixed size, nothing allocated; the
+ * texts are cut.  The events have their own limit on the ring (90%: they come after the 80% at which the query log stops itself), and what does not
+ * fit is counted in ev_dropped.  Called only when a channel passes the message (logev_wanted()) and the rate limit has admitted it. */
+STATIC_TEST void qlog_event_sink(void *vctx, int cat, int level, const char *client_ip, int client_port, const char *msg) {
+    worker_ctx_t *ctx = vctx;
+    qlog_ring_t *ring = &ctx->qlog_ring;
+    if (!ring->events) return;
+    uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
+    uint32_t t = atomic_load_explicit(&ring->tail, memory_order_acquire);
+    if (h - t >= ring->size / 10 * 9) {
+        atomic_fetch_add_explicit(&ring->ev_dropped, 1, memory_order_relaxed);
+        return;
+    }
+    qlog_event_t *ev = &ring->events[h & ring->mask];
+#ifdef CLOCK_REALTIME_FAST
+    clock_gettime(CLOCK_REALTIME_FAST, &ev->ts);
+#else
+    clock_gettime(CLOCK_REALTIME, &ev->ts);
+#endif
+    ev->kind = QLOG_KIND_EVENT;
+    ev->cat = (uint8_t)cat;
+    ev->level = (int8_t)level;
+    ev->client_port = (uint16_t)(client_port > 0 && client_port < 65536 ? client_port : 0);
+    ev->addr_len = 0;
+    if (client_ip) strlcpy(ev->client_text, client_ip, sizeof(ev->client_text));
+    else ev->client_text[0] = '\0';
+    strlcpy(ev->qname, msg, sizeof(ev->qname));
+    atomic_store_explicit(&ring->head, h + 1, memory_order_release);
+}
+
 void write_query_log(worker_ctx_t *ctx,
                                    const void *client_addr,
                                    socklen_t addr_len,
@@ -1192,6 +1223,7 @@ void write_query_log(worker_ctx_t *ctx,
     ev->protocol = protocol;
     ev->has_edns = has_edns;
     ev->dnssec_ok = dnssec_ok;
+    ev->kind = QLOG_KIND_QUERY;
 
     if (qname) {
         strlcpy(ev->qname, qname, sizeof(ev->qname));
@@ -1209,6 +1241,7 @@ void *query_logger_thread_func(void *arg) {
     uint32_t chan_count[LOG_ROUTE_MAX] = { 0 };
     time_t last_drop_report_time = time(NULL);
     uint64_t last_reported_dropped = 0;
+    uint64_t last_reported_ev_dropped = 0;
 
     while (1) {
         rcu_slot_reader_enter(&g_query_logger_rcu_ctx);
@@ -1220,9 +1253,12 @@ void *query_logger_thread_func(void *arg) {
 
         int cancel_state;   /* as in the response logger: no cancellation while the runtime is held */
         pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
-        log_runtime_t *rt = enabled ? log_runtime_acquire() : NULL;
+        /* batch 14: the runtime is held also when the query log is off -- the rings carry the event messages as well (update-security, update,
+         * xfer-out, query-errors), which go to their own channels */
+        log_runtime_t *rt = log_runtime_acquire();
         int nch = 0;
-        log_channel_t *const *route = rt ? log_runtime_route(rt, LOGC_QUERIES, &nch) : NULL;
+        log_channel_t *const *route = rt && enabled ? log_runtime_route(rt, LOGC_QUERIES, &nch) : NULL;
+        if (rt) logev_flush_suppressed((int64_t)time(NULL));
         /* each channel is held to its own limit (the rings admit what the most generous channel allows: get_effective_query_log_max_qps()) */
         uint32_t chan_limit[LOG_ROUTE_MAX];
         for (int i = 0; i < nch; i++) chan_limit[i] = qlog_channel_limit(opt_qps, route[i]->max_qps_specified, route[i]->max_qps);
@@ -1243,6 +1279,25 @@ void *query_logger_thread_func(void *arg) {
                 while (t != h) {
                     qlog_event_t *ev = &ring->events[t & ring->mask];
                     any_work = true;
+
+                    if (ev->kind == QLOG_KIND_EVENT) {
+                        /* an event message of the worker: the finished text, the client as text; to the channels of its category */
+                        if (ev->cat < LOGC_COUNT) {
+                            char line[KLOG_MSG_MAX];
+                            ev->client_text[sizeof(ev->client_text) - 1] = '\0';
+                            ev->qname[sizeof(ev->qname) - 1] = '\0';
+                            logev_format_line(line, sizeof(line), ev->client_text, ev->client_port, ev->qname);
+                            for (char *p = line; *p; p++)
+                                if (((unsigned char)*p < 0x20 && *p != '\t') || *p == 0x7f) *p = '?';
+                            klog_record(rt, ev->cat, ev->level, &ev->ts, line);
+                        }
+                        t++;
+                        continue;
+                    }
+                    if (!enabled) {        /* the query log is off: the worker does not write queries, a record left from before is dropped */
+                        t++;
+                        continue;
+                    }
 
                     char class_str[16];
                     char type_buf[32];
@@ -1312,6 +1367,13 @@ void *query_logger_thread_func(void *arg) {
                     uint64_t diff = total_dropped - last_reported_dropped;
                     last_reported_dropped = total_dropped;
                     syslog(LOG_WARNING, "[QueryLog] Dropped %" PRIu64 " queries due to ring buffer overflow (high load)", diff);
+                }
+                uint64_t ev_total = 0;
+                for (int w = 0; w < num_workers; w++) ev_total += atomic_load_explicit(&workers[w].qlog_ring.ev_dropped, memory_order_relaxed);
+                if (ev_total > last_reported_ev_dropped) {
+                    uint64_t diff = ev_total - last_reported_ev_dropped;
+                    last_reported_ev_dropped = ev_total;
+                    syslog(LOG_WARNING, "[QueryLog] Dropped %" PRIu64 " event log messages (update-security, update, xfer-out, query-errors) due to ring buffer overflow (high load)", diff);
                 }
             }
         } else if (num_workers > 0 && workers) {
@@ -2352,6 +2414,7 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
 
 void *worker_thread_func(void *arg) {
   worker_ctx_t *ctx = (worker_ctx_t *)arg;
+  logev_set_thread_sink(qlog_event_sink, ctx);    // batch 14: the event messages of this thread go into its ring
   uint8_t *tcp_res_buf = NULL;
   park_table_t park;                                    /* D1a milestone 2: queries parked for a zone that is not in memory (dns_park.h) */
   memset(&park, 0, sizeof(park));
@@ -6400,6 +6463,7 @@ int main(int argc, char **argv) {
     atomic_init(&ctxs[i].qlog_ring.head, 0);
     atomic_init(&ctxs[i].qlog_ring.tail, 0);
     atomic_init(&ctxs[i].qlog_ring.dropped_count, 0);
+    atomic_init(&ctxs[i].qlog_ring.ev_dropped, 0);
 
     uint32_t dnstap_buf_size = (cfg->dnstap.queue_size >= 64) ? cfg->dnstap.queue_size : 4096;
     if ((dnstap_buf_size & (dnstap_buf_size - 1)) != 0) {

@@ -18,6 +18,8 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <stdatomic.h>
 #include <syslog.h>
 #include "dns_logcat.h"
 
@@ -30,6 +32,50 @@ void klog_set_hook(klog_hook_t hook);
 size_t klog_vformat(char *buf, size_t n, const char *fmt, va_list ap, int saved_errno);
 void kdns_syslog(int prio, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void kdns_logc(int cat, int prio, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+
+/* ---- event messages (batch 14: update-security, update, xfer-out, query-errors) ----
+ *
+ * Messages that arise in a worker thread of the Backend, or that an attacker can make happen at will (a refused UPDATE or transfer, a malformed
+ * query), must not cost a write() on the query path nor flood the log.  logev_post() is the one entry point for them:
+ *   - logev_wanted(cat, level): one atomic load.  The mask of a category is computed when the logging runtime is installed (dns_log.c): it has
+ *     a bit for every level that some non-null channel of the category passes.  Without a configured sink for the level nothing else is done,
+ *     so a caller checks it before it builds anything for the message.
+ *   - a rate limit per category and second (logev_admit_at()); the messages over it are counted and reported once, "N messages suppressed".
+ *   - a worker thread (logev_set_thread_sink()) writes a fixed-size record into its ring (the query log ring of dns_server_core.c); the query
+ *     logger thread formats it and routes it to the channels.  Any other thread formats the line itself and routes it at once.
+ * The text is formatted into LOGEV_MSG_MAX bytes (cut); a name that came from the network must be escaped by the caller (escape_qname_for_log()).
+ * The client is the address text and the port (0: unknown); the line is "client <ip>#<port>: <text>". */
+#define LOGEV_MSG_MAX 256
+#define LOGEV_LEVEL_MIN LOG_LVL_CRITICAL      /* -5 */
+#define LOGEV_LEVEL_MAX 10                    /* debug 10 */
+
+extern _Atomic uint32_t g_logev_mask[LOGC_COUNT];
+static inline bool logev_wanted(int cat, int level) {
+  if (cat < 0 || cat >= LOGC_COUNT || level < LOGEV_LEVEL_MIN || level > LOGEV_LEVEL_MAX) return false;
+  return (atomic_load_explicit(&g_logev_mask[cat], memory_order_relaxed) >> (level - LOGEV_LEVEL_MIN)) & 1u;
+}
+void logev_set_mask(int cat, uint32_t mask);
+/* the bit of level in a mask */
+#define LOGEV_BIT(level) (1u << ((level) - LOGEV_LEVEL_MIN))
+
+typedef void (*logev_sink_t)(void *ctx, int cat, int level, const char *client_ip, int client_port, const char *msg);
+void logev_set_thread_sink(logev_sink_t fn, void *ctx);
+/* The line of a record for the channels: "client <ip>#<port>: <msg>" (no client: msg).  Returns the length. */
+size_t logev_format_line(char *out, size_t n, const char *client_ip, int client_port, const char *msg);
+/* Routes a finished line to the channels of the category at once (dns_log.c: klog_emit_level()); null = no routing (tools, unit tests). */
+typedef void (*klog_level_hook_t)(int cat, int level, const char *msg);
+void klog_set_level_hook(klog_level_hook_t hook);
+void logev_post(int cat, int level, const char *client_ip, int client_port, const char *fmt, ...) __attribute__((format(printf, 5, 6)));
+/* A name for a log line.  `name` is the presentation text the engine keeps (already escaped: \. \\ \DDD); bytes outside 0x21..0x7e and the characters
+ * " and ; are written \DDD, the trailing dot is dropped (BIND logs example.test, not example.test.; the root stays "."), the result is cut to n-1. */
+void logev_name_text(const char *name, char *out, size_t n);
+/* The rate limit (messages per second, per category) and its clock-driven part; `now` is time(NULL).  logev_admit_at() true = pass; *report is the
+ * number of messages the second before dropped (to be said once); logev_flush_suppressed() is called by the query logger thread about every
+ * 10 ms so that a report is not left waiting for the next message. */
+bool logev_admit_at(int cat, int level, int64_t now, uint32_t *report, int *report_level);
+void logev_flush_suppressed(int64_t now);
+uint32_t logev_rate_limit(int cat);
+void logev_rate_reset(void);               /* tests */
 
 #define syslog(...) kdns_syslog(__VA_ARGS__)
 
