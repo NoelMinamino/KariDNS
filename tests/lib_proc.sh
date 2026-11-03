@@ -119,3 +119,14 @@ kari_make_dbloader() {
         kari_make karictl karidns-dbloader
     fi
 }
+
+# kari_make_dbloader_tsan : karidns-dbloader-tsan with the drivers of ./karidns-dbloader (the default drivers when there is none)
+kari_make_dbloader_tsan() {
+    _kd=""
+    [ -x ./karidns-dbloader ] && _kd=$(./karidns-dbloader --drivers 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')
+    if [ -n "$_kd" ]; then
+        kari_make karidns-dbloader-tsan "DB_DRIVERS=$_kd"
+    else
+        kari_make karidns-dbloader-tsan
+    fi
+}
