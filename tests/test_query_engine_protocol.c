@@ -347,12 +347,12 @@ static void test_protocol_anomalies(void) {
     put_hdr(&q, 0x4592, 0x0100, 2, 0, 0, 0); put_question(&q, "www.example.", 1, 1); put_question(&q, "ns.example.", 1, 1);
     ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
     CHECK(&r, r.rcode == 1 && r.counts[0] == 0);
-    put_hdr(&q, 0x4592, 0x2800, 0, 0, 0, 0);                                      /* UPDATE, QDCOUNT 0 */
+    put_hdr(&q, 0x4592, 0x2910, 0, 0, 0, 0);                                      /* UPDATE, QDCOUNT 0, RD CD */
     ask(&q, "example.", 6, "192.0.2.100", false, &r);
-    CHECK(&r, r.rcode == 1);
-    put_hdr(&q, 0x4592, 0x2000, 0, 0, 0, 0);                                      /* NOTIFY, QDCOUNT 0 */
+    CHECK(&r, r.rcode == 1 && r.len >= DNS_HEADER_SIZE && r.msg[2] == 0xA8 && (r.msg[3] & 0xF0) == 0);   /* RD=0, CD=0 */
+    put_hdr(&q, 0x4592, 0x2110, 0, 0, 0, 0);                                      /* NOTIFY, QDCOUNT 0, RD CD */
     ask(&q, "example.", 6, "192.0.2.100", false, &r);
-    CHECK(&r, r.rcode == 1);
+    CHECK(&r, r.rcode == 1 && r.len >= DNS_HEADER_SIZE && r.msg[2] == 0xA0 && (r.msg[3] & 0xF0) == 0);
     /* a question that is cut off in the middle of a label */
     put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 0); q.b[q.n++] = 3; q.b[q.n++] = 'w';
     ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
@@ -363,12 +363,13 @@ static void test_protocol_anomalies(void) {
     ask(&q, "example.", 252, "192.0.2.100", false, &r);
     CHECK(&r, r.rcode == 5 && r.counts[0] == 0);
 
-    /* RFC 1035 opcodes other than QUERY/NOTIFY/UPDATE: IQUERY(1), STATUS(2), unassigned(3,6..15) -> NOTIMP */
+    /* RFC 1035 opcodes other than QUERY/NOTIFY/UPDATE: IQUERY(1), STATUS(2), unassigned(3,6..15) -> NOTIMP,
+     * RD and CD not echoed (BIND 9.20) */
     for (int op = 1; op <= 15; op++) {
         if (op == 4 || op == 5) continue;
-        put_hdr(&q, 0x4592, (uint16_t)(op << 11), 1, 0, 0, 0); put_question(&q, "www.example.", 1, 1);
+        put_hdr(&q, 0x4592, (uint16_t)((op << 11) | 0x0110), 1, 0, 0, 0); put_question(&q, "www.example.", 1, 1);
         ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
-        CHECK(&r, r.rcode == 4 && r.counts[0] == 0);
+        CHECK(&r, r.rcode == 4 && r.counts[0] == 0 && r.msg[2] == (uint8_t)(0x80 | (op << 3)) && (r.msg[3] & 0xF0) == 0);
     }
 
     /* Foreign classes are not served: CH / HS -> REFUSED, except the built-in CHAOS zones (version.bind, hostname.bind, id.server: batch 7, BIND's _bind
@@ -1126,7 +1127,8 @@ static bool gr_has_option(const gr_resp_t *r, uint16_t want) {
     return false;
 }
 
-/* QR=1, same ID/OPCODE, AA as expected, TC/RA/Z/AD=0, CD echoed, RD as expected, RCODE, no trailing bytes. */
+/* QR=1, same ID/OPCODE, AA as expected, TC/RA/Z/AD=0, CD echoed, RD as expected, RCODE, no trailing bytes.  An answer to an opcode other than
+ * QUERY has RD=0 and CD=0 (BIND 9.20 dns_message_reply()). */
 static void check_hdr(const gr_resp_t *r, const req_t *q, uint8_t rcode, bool aa, bool rd) {
     const uint8_t *m = r->msg;
     CHECK(r, m[0] == q->b[0] && m[1] == q->b[1]);
@@ -1135,7 +1137,9 @@ static void check_hdr(const gr_resp_t *r, const req_t *q, uint8_t rcode, bool aa
     CHECK(r, (m[2] & 0x02) == 0);
     CHECK(r, ((m[2] & 0x01) != 0) == rd);
     CHECK(r, (m[3] & 0xE0) == 0);
-    CHECK(r, (m[3] & 0x10) == (q->b[3] & 0x10));
+    const bool query = (q->b[2] & 0x78) == 0;
+    CHECK(r, query || !rd);
+    CHECK(r, (m[3] & 0x10) == (query ? (q->b[3] & 0x10) : 0));
     CHECK(r, (m[3] & 0x0F) == rcode);
     CHECK(r, gr_end(r) == r->len);
 }
@@ -1215,7 +1219,7 @@ static void test_response_header_and_error_builder(void) {
     put_name(&q, "www.example."); put16(&q, 1); put16(&q, 1); put32(&q, 60); put16(&q, 4); put32(&q, 0xC0000201);
     put_opt(&q, 0, 0, 0, NULL, 0);
     ask(&q, "www.example.", 1, "192.0.2.100", false, &r);
-    check_hdr(&r, &q, 4, false, true);
+    check_hdr(&r, &q, 4, false, false);
     CHECK(&r, r.counts[0] == 0 && r.counts[2] == 1 && gr_ede(&r) == 21);
 
     /* QDCOUNT > 1 -> FORMERR: two types of one name (a good question section) keep the OPT; two names (a section that does not parse, BIND

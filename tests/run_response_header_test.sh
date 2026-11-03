@@ -1,7 +1,7 @@
 #!/bin/sh
 # Response header bits and error responses (AUDIT_FINDINGS R-05, R-06, R-12, R-13, R-18, R-27 addendum).
 # - RFC 1035 §4.1.1 / RFC 4035 §3.1.6: RA, Z, AD and TC of the query are never copied into the response;
-#   CD and RD are echoed. AA only on answers from an authoritative zone and on an accepted NOTIFY (RFC 1996 §4.7).
+#   CD and RD are echoed in an answer to a QUERY, never in one to another opcode (BIND 9.20 dns_message_reply()). AA only on answers from an authoritative zone and on an accepted NOTIFY (RFC 1996 §4.7).
 # - REFUSED (not authoritative), SERVFAIL (zone not loaded, zone expired) and refused NOTIFY have AA=0.
 # - RFC 6891 §7: a malformed option (ECS, RFC 7871 §6) is answered FORMERR with an OPT record.
 # - NOTIFY/UPDATE to a forward zone: NOTIMP with the question section only (no request bytes left behind).
@@ -133,11 +133,11 @@ expect_flags "qr rd" "zone not ready"
 grep -q "EDE: 14" "$W/out.txt" || fail "zone not ready: expected EDE 14"
 echo "[OK] R-27 zone not ready without AA"
 
-# 5. NOTIFY: accepted (from the configured master) -> QR AA; refused -> AA=0.
-q $SPORT example.test SOA +opcode=notify +norecurse
+# 5. NOTIFY: accepted (from the configured master) -> QR AA; refused -> AA=0. RD and CD of the NOTIFY are not echoed.
+q $SPORT example.test SOA +opcode=notify +cdflag
 expect_status NOERROR "NOTIFY from the master"
 expect_flags "qr aa" "accepted NOTIFY"
-q $PPORT example.test SOA +opcode=notify +norecurse
+q $PPORT example.test SOA +opcode=notify +cdflag
 expect_status REFUSED "NOTIFY to a primary"
 expect_flags "qr" "refused NOTIFY"
 echo "[OK] NOTIFY AA only when accepted"
@@ -152,10 +152,10 @@ expect_status NOTIMP "NOTIFY to a forward zone"
 no_extra "NOTIFY to a forward zone"
 echo "[OK] R-12 NOTIMP for forward zones"
 
-# 7. Unknown opcode: NOTIMP, EDE 21, AD not echoed.
-q $PPORT example.test SOA +opcode=2 +adflag
+# 7. Unknown opcode: NOTIMP, EDE 21, neither RD nor CD nor AD echoed.
+q $PPORT example.test SOA +opcode=2 +adflag +cdflag
 expect_status NOTIMP "opcode 2"
-expect_flags "qr rd" "opcode 2"
+expect_flags "qr" "opcode 2"
 grep -q "EDE: 21" "$W/out.txt" || fail "opcode 2: expected EDE 21"
 echo "[OK] unknown opcode"
 

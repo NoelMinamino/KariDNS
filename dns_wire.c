@@ -4140,11 +4140,14 @@ void dns_init_response_header(uint8_t *res, const uint8_t *req, uint8_t rcode, b
     res[0] = req[0];
     res[1] = req[1];
     /* RFC 1035 §4.1.1: QR=1、OPCODE と RD は問い合わせから。AA は権威データを返すときだけ。
-     * TC は応答側で決める (問い合わせの TC は引き継がない)。*/
-    res[2] = (uint8_t)(0x80 | (req[2] & 0x78) | (req[2] & 0x01) | (aa ? 0x04 : 0));
+     * TC は応答側で決める (問い合わせの TC は引き継がない)。
+     * QUERY 以外 (NOTIFY、UPDATE、NOTIMP の opcode) の応答は RD も CD も写さない: BIND 9.20 の dns_message_reply() は
+     * QUERY のときだけ RD と CD を残す (RFC 1996 §4.7、RFC 2136 §3.8 の応答は ID と OPCODE を写すだけ)。*/
+    const bool query = ((req[2] >> 3) & 0x0F) == 0;
+    res[2] = (uint8_t)(0x80 | (req[2] & 0x78) | (query ? (req[2] & 0x01) : 0) | (aa ? 0x04 : 0));
     /* RA=0 (再帰しない)、Z=0 (RFC 1035 §4.1.1)、AD=0 (RFC 4035 §3.1.6: 検証しないので立てない)。
      * CD は §3.1.6 では権威応答でクリアが SHOULD だが、BIND と同じくエコーする (AUDIT_FINDINGS §8 の決定)。*/
-    res[3] = (uint8_t)((req[3] & 0x10) | (rcode & 0x0F));
+    res[3] = (uint8_t)((query ? (req[3] & 0x10) : 0) | (rcode & 0x0F));
 }
 
 int dns_build_error_response(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len,
