@@ -584,7 +584,8 @@ void dns_init_response_header(uint8_t *res, const uint8_t *req, uint8_t rcode, b
 // エラー応答の共通ビルダー。ヘッダは dns_init_response_header() (AA=0)、本文は要求の質問セクションを
 // qd_keep 個だけ写し、それ以外 (回答・権威・追加、UPDATE の各セクション) は返さない。質問を区切れない、
 // または入らないときは QDCOUNT=0。edns が OPT 付きの要求なら OPT (EDE を含む) を付ける (RFC 6891 §6.1.1、
-// §7)。MQTYPE と EXPIRE は応答データに関するオプションなので付けない。edns=NULL なら OPT なし。
+// §7)。MQTYPE と EXPIRE は応答データに関するオプションなので付けない。edns=NULL なら OPT なし。質問セクションが
+// 不正な要求への FORMERR も OPT なし (BIND と同じ。dns_question_section_ok())。
 // 戻り値は応答の長さ (要求がヘッダより短い、または max_res_len < 12 なら 0)。
 int dns_build_error_response(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len,
                              uint8_t rcode, uint8_t ext_rcode, uint16_t qd_keep,
@@ -775,6 +776,11 @@ bool wire_question_name_compressed(const uint8_t *buf, size_t len);
  * none otherwise, the zone names an UPDATE has read up to the bad one (it clears from the prerequisite section), and nothing for any other opcode.
  * KariDNS: a first name with a compression pointer is not echoed (X-15, RFC 1035 §4.1.4). */
 uint16_t dns_error_qd_echo(const uint8_t *req, size_t req_len);
+/* Whether the question section of req is good by the rules of getquestions() above (any opcode; the NONE / ANY class rule is for NOTIFY and UPDATE; QDCOUNT 0
+ * is a good, empty section; a first name with a compression pointer is not).  BIND answers a message whose section is bad with FORMERR from ns_client_error()
+ * before it has looked at the OPT record (dns_message_parse() stops there): no OPT, so no EDE, whatever the opcode, the EDNS version or the TSIG.  false for
+ * a message shorter than a header. */
+bool dns_question_section_ok(const uint8_t *req, size_t req_len);
 
 /* The shape of an AXFR / IXFR request (RFC 5936 §2.1, RFC 1995 §3).  xfr_request_shape() answers XFR_SHAPE_OK for a request a transfer may be started for, else
  * the first thing wrong with it (a reason for the log, xfr_shape_text(); the request is answered with FORMERR, RFC 5936 §2.2.1 note e).  A request is a transfer

@@ -209,7 +209,7 @@ d $P1 id.server NS -c CH +noall +answer | grep -Eq "^id\.server\.[[:space:]]+0[[
 d $P1 x.version.bind TXT -c CH | grep -q "status: NXDOMAIN" && pass "a name below version.bind is NXDOMAIN" || fail "x.version.bind"
 out=$(d $P1 version.bind A -c CH); echo "$out" | grep -q "status: NOERROR" && echo "$out" | grep -q "ANSWER: 0, AUTHORITY: 1" && pass "version.bind A is NODATA with the SOA" || fail "version.bind A: $out"
 d $P1 authors.bind TXT -c CH | grep -q "status: REFUSED" && pass "authors.bind is not served (REFUSED)" || fail "authors.bind"
-d $P1 version.bind TXT +short | grep -q . && fail "version.bind in class IN answered" || pass "version.bind in class IN is not served"
+d $P1 version.bind TXT +short | grep -q "^[^;]" && fail "version.bind in class IN answered" || pass "version.bind in class IN is not served"
 
 # dynamic update: max-zone-ttl lowers the TTL, serial-update-method unixtime, max-records refuses
 YKEY="hmac-sha256:upd:$KEYSECRET"
@@ -260,7 +260,7 @@ for n in version.bind hostname.bind id.server; do
 done
 d $P4 big.test SOA | grep -q "status: SERVFAIL\|status: REFUSED" && pass "a zone with more than max-records records is not served" || fail "big.test is served: $(d $P4 big.test SOA)"
 grep -q "more than max-records 5" "$W/s4.log" && pass "the load failure is logged" || fail "no log line for big.test"
-d $P4 ex.test SOA +short | grep -q . && pass "the other zone is served" || fail "ex.test not served"
+d $P4 ex.test SOA +short | grep -q "^[^;]" && pass "the other zone is served" || fail "ex.test not served"
 
 kari_kill_tree $PIDS; PIDS=""
 

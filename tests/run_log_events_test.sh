@@ -257,6 +257,7 @@ rawq() { # rawq KIND [TCP]: one query of a kind a normal client does not send, t
         my $q = $name . pack("nn", 1, 1);
         my $pkt;
         if ($kind eq "qd2") { $pkt = pack("n6", 0x1234, 0x0100, 2, 0, 0, 0) . $q . $q; }
+        elsif ($kind eq "qd2t") { $pkt = pack("n6", 0x1234, 0x0100, 2, 0, 0, 0) . $q . $name . pack("nn", 28, 1); }
         elsif ($kind eq "iquery") { $pkt = pack("n6", 0x1234, 0x0800, 1, 0, 0, 0) . $q; }
         elsif ($kind eq "cookie") { my $opt = "\x00" . pack("nnN", 41, 4096, 0) . pack("n", 7) . pack("nn", 10, 3) . "abc"; $pkt = pack("n6", 0x1234, 0x0100, 1, 0, 0, 1) . $q . $opt; }
         elsif ($kind eq "cut") { $pkt = pack("n6", 0x1234, 0x0100, 1, 0, 0, 0) . $name . "\x00"; }
@@ -297,14 +298,18 @@ hasnt "Q: ... not on the debug 1 channel" "$LG/qe1.log" "REFUSED"
 d host.acl.test A | grep -q "status: REFUSED" && pass "Q: allow-query refuses a client" || fail "Q: acl"
 has "Q: allow-query: the reason" "$LG/qe3.log" "query failed (REFUSED) for host\.acl\.test/IN/A: Query refused due to access control"
 hasnt "Q: nothing at info (the query log is off)" "$LG/qeinfo.log" "query failed"
-[ "$(rawq qd2)" = 1 ] && pass "Q: QDCOUNT 2 is FORMERR" || fail "Q: qd2 rcode '$(rawq qd2)'"
+[ "$(rawq qd2t)" = 1 ] && pass "Q: QDCOUNT 2 (A and AAAA of one name) is FORMERR" || fail "Q: qd2t rcode '$(rawq qd2t)'"
 has "Q: FORMERR: the reason" "$LG/qe3.log" "query failed (FORMERR) for -/-/-: the question count is not valid for this opcode (RFC 9619)"
+[ "$(rawq qd2)" = 1 ] && pass "Q: the same question twice is FORMERR" || fail "Q: qd2 rcode '$(rawq qd2)'"
+has "Q: ... a question section that does not parse" "$LG/qe3.log" "query failed (FORMERR) for -/-/-: malformed question section"
 [ "$(rawq cookie)" = 1 ] && pass "Q: a COOKIE option of 3 octets is FORMERR" || fail "Q: cookie rcode '$(rawq cookie)'"
 has "Q: ... with the reason" "$LG/qe3.log" "query failed (FORMERR) for a\.test/IN/A: malformed COOKIE option (RFC 7873 5.2.2)"
 [ "$(rawq iquery)" = 4 ] && pass "Q: opcode IQUERY is NOTIMP" || fail "Q: iquery rcode"
 has "Q: NOTIMP" "$LG/qe3.log" "(NOTIMP) for a\.test/IN/A: This opcode is not supported by this server"
 [ "$(rawq cut)" = 1 ] && pass "Q: a question without QTYPE / QCLASS is FORMERR" || fail "Q: cut rcode"
-has "Q: ... cut short" "$LG/qe3.log" "the question is cut short (no QTYPE and QCLASS)"
+_i=0; while [ $_i -lt 30 ] && [ "$(count "(FORMERR) for .*: malformed question section" "$LG/qe3.log")" -lt 2 ]; do sleep 0.2; _i=$((_i + 1)); done
+N=$(count "(FORMERR) for .*: malformed question section" "$LG/qe3.log")
+[ "$N" -ge 2 ] && pass "Q: ... cut short: a question section that does not parse" || fail "Q: cut short: $N lines"
 d bad.test A +tcp | grep -q "status: SERVFAIL" && pass "Q: SERVFAIL over TCP" || fail "Q: SERVFAIL tcp"
 [ "$(rawq qd2 tcp)" = 1 ] && pass "Q: FORMERR over TCP" || fail "Q: qd2 tcp"
 N=$(count "query failed (SERVFAIL) for bad.test/IN/A" "$LG/qe1.log")

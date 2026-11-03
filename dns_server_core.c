@@ -165,6 +165,9 @@ static void xfr_test_delay(void) {
   struct timespec ts = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000L };
   nanosleep(&ts, NULL);
 }
+/* TEST ONLY (as xfr-delay): `karictl xfr-fail thread|memory|off` makes the TCP zone transfer dispatch behave as if pthread_create() (XD_NO_THREAD) or the
+ * allocation of the transfer's arguments (XD_NO_MEMORY) had failed, so that the refusal of those branches can be tested (run_xfr_dispatch_fault_test.sh). */
+static _Atomic int g_test_xfr_fail;
 #endif
 
 #define response_log_enabled(cfg) ((cfg) && (cfg)->logging.responses_enabled)
@@ -2323,6 +2326,8 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
                 rcu_reader_exit(ctx);
                 return;
               }
+              /* A FORMERR repeated to one client, port and ID is answered every time (UDP and TCP), as named 9.20 does: its ns_client_error()
+               * formerrcache is set up again with every request (ns__client_setup()), so it never drops one.  No loop guard here on purpose. */
 
               if (rlog_enabled) {
                 submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
@@ -2936,12 +2941,15 @@ process_tcp_client: ;
             if (xfr_tsig_done) tsig = xfr_tsig;
             else tsig_check_request(cfg, xfr_view ? xfr_view->name : NULL, msg, msg_len, ctx_tcp->client_ip, &tsig);
             tsig_key_t *matched_key = (tsig.status == TSIG_REQ_VALID) ? tsig.key : NULL;
+            /* A question section that does not parse (dns_question_section_ok()) is a FORMERR without OPT before everything else, for every client: BIND's
+             * dns_message_parse() fails there, before the TSIG, the EDNS version, the zone and the ACL are looked at (the query engine does the same) */
+            const bool q_bad = !dns_question_section_ok(msg, msg_len);
             /* X-28, RFC 6891 §6.1.3: 実装していない EDNS VERSION は、クエリ経路と同じく TSIG の検証の後、
              * allow-transfer より前に BADVERS (TSIG が正しければ署名する) */
-            bool badvers = tsig.status != TSIG_REQ_ERROR && tsig.status != TSIG_REQ_FORMERR &&
+            bool badvers = !q_bad && tsig.status != TSIG_REQ_ERROR && tsig.status != TSIG_REQ_FORMERR &&
                            edns_version_unsupported(&edns);
             bool allowed = false;
-            if (zcfg && !badvers && tsig.status != TSIG_REQ_ERROR && tsig.status != TSIG_REQ_FORMERR) {
+            if (zcfg && !q_bad && !badvers && tsig.status != TSIG_REQ_ERROR && tsig.status != TSIG_REQ_FORMERR) {
               /* allow-transfer のアドレスと鍵 (鍵名は DNS 名として比較 D-03)、zone の tsig-key、transfer-acl-match、
                * DB ゾーンの acl-ceiling は zone_transfer_acl_allows() が見る (dns_tsig_acl.c) */
               allowed = zone_transfer_acl_allows_in_view(cfg, zcfg, xfr_view ? xfr_view->name : NULL, ctx_tcp->client_ip,
@@ -2960,7 +2968,7 @@ process_tcp_client: ;
              * allow-transfer (BIND's ns_xfr_start() checks the ACL before the IXFR SOA), and before the transfer is started or a zone is read.  So it is seen
              * only by a client that may transfer this zone: everybody else gets the REFUSED they got before, and the FORMERR tells nothing about a zone. */
             bool shape_bad = false;
-            if (allowed && (entry || xfr_el)) {
+            if (q_bad || (allowed && (entry || xfr_el))) {   /* (a bad question section is never XFR_SHAPE_OK) */
               const xfr_shape_t shape = xfr_request_shape(msg, msg_len, NULL, NULL, NULL);
               if (shape != XFR_SHAPE_OK) {
                 shape_bad = true;
@@ -2983,6 +2991,12 @@ process_tcp_client: ;
               } else {
                 if (entry) atomic_fetch_add(&entry->active_axfr, 1);
                 axfr_worker_args_t *args = malloc(sizeof(axfr_worker_args_t));
+#ifdef KARIDNS_TEST_EVICT
+                if (args && atomic_load_explicit(&g_test_xfr_fail, memory_order_relaxed) == XD_NO_MEMORY) {   /* TEST ONLY: as if malloc() had failed */
+                  free(args);
+                  args = NULL;
+                }
+#endif
                 if (args) {
                   args->client_fd = client_fd;
                   strncpy(args->client_ip, ctx_tcp->client_ip, INET6_ADDRSTRLEN - 1);
@@ -3035,7 +3049,13 @@ process_tcp_client: ;
                   kevent(kq, ev_del_axfr, 2, NULL, 0, NULL);
 
                   pthread_t t;
-                  if (pthread_create(&t, NULL, axfr_worker_thread, args) != 0) {
+                  int t_err;
+#ifdef KARIDNS_TEST_EVICT
+                  if (atomic_load_explicit(&g_test_xfr_fail, memory_order_relaxed) == XD_NO_THREAD) t_err = EAGAIN;   /* TEST ONLY */
+                  else
+#endif
+                  t_err = pthread_create(&t, NULL, axfr_worker_thread, args);
+                  if (t_err != 0) {
                     release_zone_snapshot(args->snap);
                     free(args);
                     if (entry) atomic_fetch_sub(&entry->active_axfr, 1);
@@ -3070,9 +3090,12 @@ process_tcp_client: ;
               int built;
               const bool send_ede = cfg ? cfg->send_extended_errors : false;
               if (badvers) {
-                built = dns_build_badvers_response(msg, msg_len, res_buf, sizeof(res_buf), 1, &edns, true, cfg);
+                /* the questions as BIND echoes them (dns_error_qd_echo(): none for an opcode other than QUERY, NOTIFY and UPDATE) */
+                built = dns_build_badvers_response(msg, msg_len, res_buf, sizeof(res_buf), dns_error_qd_echo(msg, msg_len), &edns, true, cfg);
               } else {
-                if (tsig.status == TSIG_REQ_FORMERR) {
+                if (q_bad) {
+                  rcode = 1;       /* no OPT: dns_build_error_response() leaves it out of a FORMERR for a bad question section */
+                } else if (tsig.status == TSIG_REQ_FORMERR) {
                   rcode = 1;       /* RFC 8945 §5.2: 解釈できない TSIG */
                 } else if (tsig.status == TSIG_REQ_ERROR) {
                   rcode = 9;       /* RFC 8945 §5.2.1-§5.2.4: TSIG のエラーは NOTAUTH */
@@ -4419,6 +4442,13 @@ void *control_thread_func(void *arg) {
                 atomic_store_explicit(&g_test_xfr_delay_ms, (uint32_t)ms, memory_order_relaxed);
                 (void)ctl_send_all(cfd, "OK\n", 3);
               } else (void)ctl_send_all(cfd, "ERROR bad delay\n", 16);
+            } else if (strcmp(cmd, "xfr-fail") == 0 && arg) {
+              /* TEST ONLY (as evict): the failure the TCP zone transfer dispatch acts out (g_test_xfr_fail) */
+              const int f = strcmp(arg, "thread") == 0 ? XD_NO_THREAD : strcmp(arg, "memory") == 0 ? XD_NO_MEMORY : strcmp(arg, "off") == 0 ? 0 : -1;
+              if (f >= 0) {
+                atomic_store_explicit(&g_test_xfr_fail, f, memory_order_relaxed);
+                (void)ctl_send_all(cfd, "OK\n", 3);
+              } else (void)ctl_send_all(cfd, "ERROR expected thread, memory or off\n", 37);
 #endif
             } else if (strcmp(cmd, "dbstatus") == 0) {
               /* beta design 5.2: the loader, the batches and the DB zones of the registry */

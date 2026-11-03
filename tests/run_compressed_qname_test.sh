@@ -12,7 +12,7 @@
 #  2. TCP: the same                               -> FORMERR, QDCOUNT=0
 #  3. UDP: the name is only a pointer             -> FORMERR, QDCOUNT=0
 #  4. UDP: "www" + pointer into the header (offset 2; used to be answered for "www.") -> FORMERR
-#  5. UDP: the same query with an OPT             -> FORMERR with OPT
+#  5. UDP: the same query with an OPT             -> FORMERR without OPT (the question section does not parse: BIND answers before the OPT)
 #  6. An ordinary query is still answered
 # ==============================================================================
 set -u
@@ -82,7 +82,7 @@ check "TCP: www + pointer -> FORMERR, QDCOUNT=0" "rcode=1 tc=0 aa=0 qd=0 an=0 ns
 check "UDP: pointer only -> FORMERR, QDCOUNT=0" "rcode=1 tc=0 aa=0 qd=0 an=0 ns=0 ar=0" --hex "$HDR$PTR_ONLY"
 # pointer to offset 2 (the flags, 0x0000 = an empty label): the old code answered for "www." (NXDOMAIN/REFUSED)
 check "UDP: www + pointer into the header -> FORMERR" "rcode=1 tc=0 aa=0 qd=0 an=0 ns=0 ar=0" --hex "${HDR}03777777c00200010001"
-check "UDP: www + pointer with OPT -> FORMERR with OPT" "rcode=1 tc=0 aa=0 qd=0 an=0 ns=0 ar=1 opt=0" --hex "$HDR_OPT$WWW_PTR$OPT"
+check "UDP: www + pointer with OPT -> FORMERR without OPT (a question section that does not parse, as BIND)" "rcode=1 tc=0 aa=0 qd=0 an=0 ns=0 ar=0 opt=none" --hex "$HDR_OPT$WWW_PTR$OPT"
 check "Ordinary query still answered" "rcode=0 tc=0 aa=1 qd=1 an=1" --name www.cq.test --type A
 
 kill -0 "$SERVER_PID" 2>/dev/null && pass "server still running" || fail "server exited"

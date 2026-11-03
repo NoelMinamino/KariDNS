@@ -7,7 +7,8 @@
 # in the state of an evicted one: in the directory, no data in memory.  `evict` answers OK only for a zone that is in memory, so a second
 # `evict` after a query shows that the query brought the zone back through the fetch stream.  Checked:
 #   - a UDP query and a TCP query for an evicted zone are answered with the data of the database (parked, fetched, woken)
-#   - NOTIFY and UPDATE (UDP and TCP) for an evicted zone are answered at once (REFUSED) and do not fetch the zone
+#   - NOTIFY and UPDATE (UDP and TCP) for an evicted zone are answered at once (REFUSED; FORMERR without OPT for the class ANY / NONE) and do not fetch
+#     the zone; an AXFR over UDP is REFUSED (allow-transfer) or a FORMERR, and does not fetch the zone either
 #   - an UPDATE (UDP and TCP) for an evicted zone parks, the zone is read, the UPDATE is applied and the zone stays in memory (pinned, dbstatus)
 #   - a karictl reconfig that adds a zone does not drop the zone that is out of memory (it still parks, fetches and answers)
 #   - TCP: three queries in one write (the first one for the evicted zone) are answered in order; a client that closes while its request
@@ -170,8 +171,23 @@ for tr in udp tcp; do
     echo "$got" | grep -q 'rcode=5$' && pass "$tr: NOTIFY is REFUSED at once ($got)" || fail "$tr: NOTIFY: $got"
     got=$(perl tests/db/dns_tcp_probe.pl 127.0.0.1 "$PORT" "$tr-op" 5 a.test 2>&1)
     echo "$got" | grep -q 'rcode=5$' && pass "$tr: UPDATE without allow-update is REFUSED at once ($got)" || fail "$tr: UPDATE: $got"
+    # a zone section of class ANY / NONE (BIND: the message does not parse): FORMERR without the zone section and without OPT
+    tcpopt=""; [ "$tr" = tcp ] && tcpopt=--tcp
+    for c in 255 254; do
+        got=$(perl tests/tsig_query.pl --port "$PORT" $tcpopt --name a.test --type SOA --opcode 5 --class $c --edns-version 0 2>&1)
+        echo "$got" | grep -q '^rcode=1 .* qd=0 .* opt=none' && pass "$tr: UPDATE of class $c is a FORMERR at once ($got)" || fail "$tr: UPDATE class $c: $got"
+    done
+    got=$(perl tests/tsig_query.pl --port "$PORT" $tcpopt --name a.test --type SOA --opcode 4 --class 255 --edns-version 0 2>&1)
+    echo "$got" | grep -q '^rcode=1 .* qd=0 .* opt=none' && pass "$tr: NOTIFY of class ANY is a FORMERR at once ($got)" || fail "$tr: NOTIFY class ANY: $got"
 done
+# an AXFR over UDP: allow-transfer first (a.test allows none: REFUSED), then the FORMERR (x.test), and the zone is read for neither
+got=$(perl tests/tsig_query.pl --port "$PORT" --name a.test --type AXFR --edns-version 0 --show-ede 2>&1)
+echo "$got" | grep -q '^rcode=5 .* ede=18' && pass "udp AXFR of an evicted zone the client may not transfer: REFUSED, EDE 18 ($got)" || fail "udp AXFR a.test: $got"
 evict a.test. | grep -q '^ERROR' && pass "... and the zone was not fetched for them" || fail "NOTIFY/UPDATE fetched the zone"
+evict x.test. > /dev/null
+got=$(perl tests/tsig_query.pl --port "$PORT" --name x.test --type AXFR --edns-version 0 2>&1)
+echo "$got" | grep -q '^rcode=1 .* qd=1 .* opt=0' && pass "udp AXFR of an evicted zone the client may transfer: FORMERR ($got)" || fail "udp AXFR x.test: $got"
+evict x.test. | grep -q '^ERROR' && pass "... and x.test was not fetched for it" || fail "a UDP AXFR fetched x.test"
 [ "$(q www.a.test)" = "192.0.2.80" ] && pass "a query still brings the zone back" || fail "a.test does not answer after the NOTIFY/UPDATE probes"
 
 echo "== UPDATE for an evicted zone: the zone is read, the UPDATE is applied, the zone is kept in memory"
