@@ -931,6 +931,18 @@ static void test_send_axfr_response_ixfr_and_extended(void) {
     send_axfr_response(-1, "example.com.", req_bad, s_off, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
     assert((g_tcp_out[2 + 3] & 0x0F) == 1 && g_tcp_out[2 + 5] == 0 && g_tcp_out_len == 2 + 12);
 
+    // 6. RFC 5936 2.1.2: QCLASS is the class of the zone (IN): an AXFR of class CH or ANY has no zone, REFUSED with AA=0 and no transfer, the zone being there
+    const uint16_t bad_classes[] = { 3, 255 };
+    for (size_t k = 0; k < sizeof(bad_classes) / sizeof(bad_classes[0]); k++) {
+        memcpy(req_bad, req_std, s_off);
+        req_bad[s_off - 2] = (uint8_t)(bad_classes[k] >> 8);
+        req_bad[s_off - 1] = (uint8_t)(bad_classes[k] & 0xFF);
+        g_tcp_out_len = 0;
+        g_tcp_send_count = 0;
+        send_axfr_response(-1, "example.com.", req_bad, s_off, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+        assert(g_tcp_send_count >= 1 && g_tcp_out_len < 2 + 512 && (g_tcp_out[2 + 3] & 0x0F) == 5 && (g_tcp_out[2 + 2] & 0x04) == 0 && g_tcp_out[2 + 7] == 0);
+    }
+
     zone_arena_destroy(test_zone_slot(&entry, 0));
     pthread_mutex_destroy(&entry.writer_lock);
     pthread_mutex_destroy(&entry.ixfr_history.lock);

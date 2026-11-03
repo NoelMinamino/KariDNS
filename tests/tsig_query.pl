@@ -20,6 +20,7 @@
 #   --auth-type N                             the TYPE of the IXFR Authority record instead of SOA (6)
 #   --second-opt                              two OPT records (with --edns-version)
 #   --trailing N                              N octets after the last record (after the TSIG)
+#   --class N                                 the QCLASS of the question (default 1, IN); the IXFR SOA keeps class IN
 # Output, one line per answer:
 #   rcode=<12-bit extended rcode> tc=<0|1> aa=<0|1> qd=<n> an=<n> ns=<n> ar=<n> opt=<version|none> tsig=<none|ok|bad|error-N>
 # A timeout prints "timeout".
@@ -35,14 +36,14 @@ use Getopt::Long;
 
 my ($server, $port, $tcp, $name, $type, $ixfr_serial, $edns_version, $key, $hex, $count) =
     ('127.0.0.1', 53, 0, '.', 'A', undef, undef, undef, undef, 1);
-my ($opcode, $req_rcode, $hdr_qd, $hdr_an, $hdr_ns, $second_question, $auth_type, $second_opt, $trailing) =
-    (0, 0, undef, undef, undef, 0, 6, 0, 0);
+my ($opcode, $req_rcode, $hdr_qd, $hdr_an, $hdr_ns, $second_question, $auth_type, $second_opt, $trailing, $qclass) =
+    (0, 0, undef, undef, undef, 0, 6, 0, 0, 1);
 GetOptions('server=s' => \$server, 'port=i' => \$port, 'tcp' => \$tcp, 'name=s' => \$name,
            'type=s' => \$type, 'ixfr-serial=i' => \$ixfr_serial, 'edns-version=i' => \$edns_version,
            'key=s' => \$key, 'hex=s' => \$hex, 'count=i' => \$count,
            'opcode=i' => \$opcode, 'req-rcode=i' => \$req_rcode, 'hdr-qd=i' => \$hdr_qd, 'hdr-an=i' => \$hdr_an,
            'hdr-ns=i' => \$hdr_ns, 'second-question' => \$second_question, 'auth-type=i' => \$auth_type,
-           'second-opt' => \$second_opt, 'trailing=i' => \$trailing) or die "bad options\n";
+           'second-opt' => \$second_opt, 'trailing=i' => \$trailing, 'class=i' => \$qclass) or die "bad options\n";
 
 my %types = (A => 1, NS => 2, SOA => 6, TXT => 16, AAAA => 28, IXFR => 251, AXFR => 252, ANY => 255);
 my $qtype = $type =~ /^\d+$/ ? $type : ($types{uc $type} // die "unknown type $type\n");
@@ -65,7 +66,7 @@ my $alg = wire_name('hmac-sha256');
 sub build_query {
     return (pack('H*', $hex), '') if defined $hex;
     my $id = int(rand(65536));
-    my $q = wire_name($name) . pack('nn', $qtype, 1);
+    my $q = wire_name($name) . pack('nn', $qtype, $qclass);
     my $qdcount = 1;
     if ($second_question) { $q .= $q; $qdcount = 2; }
     my $ns = '';

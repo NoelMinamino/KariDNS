@@ -3576,6 +3576,13 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
      * the transport -- a client that may not transfer is REFUSED here, without the zone being read.  One that may gets the answer from the summary (the one SOA,
      * TC when it is behind) when the apex describes the version the directory has, else it waits for the zone like any other query. */
     if (opcode == 0 && qtype == 251 && !is_tcp && qdcount == 1 && domain_names_match_ci(not_ready_zone->name, current_qname)) {
+      /* RFC 5936 §2.1.2, RFC 1995 §3: QCLASS is the class of the zone (IN): an IXFR of another class has no zone here, as for a zone in memory (below) */
+      const size_t ix_qend = get_question_end_offset(req, req_len, 1);
+      if (ix_qend >= DNS_HEADER_SIZE + 5 && ((req[ix_qend - 2] << 8) | req[ix_qend - 1]) != 1) {
+        xfr_log_denied(client_ip, qe_client_port(), current_qname, 251, XD_NOZONE, 0);
+        add_ede(&edns, send_ede, 20, "This server is not authoritative for the queried zone");
+        return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
+      }
       if (!udp_ixfr_allowed(cfg, &zc, view, client_ip, nr_tkey)) {
         xfr_log_denied(client_ip, qe_client_port(), not_ready_zone->name, 251, XD_ACL, 0);
         add_ede(&edns, send_ede, 18, "Query refused due to access control");
@@ -4030,6 +4037,14 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   // If client's SOA serial matches server's current serial (up-to-date), send single SOA response (NOERROR).
   // If update is needed (or diff required), set TC=1 and send current SOA to prompt client to retry over TCP.
   if (!is_tcp && qtype == 251) {
+    /* RFC 5936 §2.1.2 (QCLASS: "the class of the zone requested"), RFC 1995 §3: every zone here is of class IN, so an IXFR of class CH or ANY (the other
+     * classes were REFUSED above) has no zone: REFUSED, AA=0, EDE 20 as for a name this server is not authoritative for (R-06), before the ACL, as the TCP
+     * dispatch refuses it.  BIND: "non-authoritative zone" (xfrout.c ns_xfr_start(), the zone is looked up in the views of that class). */
+    if (qclass != 1) {
+      xfr_log_denied(client_ip, qe_client_port(), current_qname, 251, XD_NOZONE, 0);
+      add_ede(&edns, send_ede, 20, "This server is not authoritative for the queried zone");
+      return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
+    }
     /* allow-transfer applies to an IXFR over UDP as well (BIND xfrout.c ns_xfr_start() checks the transfer ACL first, whatever the transport): the one SOA of a
      * zone that is up to date, or the TC answer, are not for a client that may not transfer.  It used to be answered to anybody who may ask (allow-query). */
     if (!udp_ixfr_allowed(cfg, zone_cfg_any, view, client_ip, tsig && tsig->status == TSIG_REQ_VALID ? tsig->key : NULL)) {

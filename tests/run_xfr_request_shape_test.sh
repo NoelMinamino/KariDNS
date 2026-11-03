@@ -10,6 +10,8 @@
 #
 #   - TCP, a zone in memory: the good requests are transferred (plain, with OPT, signed); every malformed one is a FORMERR with no record for a client that may
 #     transfer the zone (one that may not, or a zone that does not exist, is REFUSED as before); a malformed request with a good TSIG gets a signed FORMERR, one with a bad TSIG NOTAUTH
+#   - a transfer of a class other than IN (CH, ANY, NONE, HS; RFC 5936 §2.1.2: QCLASS is the class of the zone) has no zone: REFUSED, AA=0, before the ACL
+#     and the shape check, over TCP and for a UDP IXFR, for a zone in memory and one of the database that is not (nothing is fetched)
 #   - UDP IXFR (RFC 1995 §4.2) answers the same malformed requests with FORMERR
 #   - the log of category xfer-out names the reason ("bad zone transfer request: malformed request, <why> (FORMERR)")
 #   - a zone of the database that is not in memory (D1a): the same FORMERR, and nothing is fetched for it (needs root; SKIP without it)
@@ -131,6 +133,22 @@ t "malformed request with OPT, the TSIG is good"            '^rcode=1 tc=0 aa=0 
 t "malformed request, the TSIG key is wrong: NOTAUTH"       '^rcode=9 ' --name kz.test --type AXFR --opcode 4 --key "k1:$BADSECRET"
 t "octets after a good TSIG: FORMERR"                       '^rcode=1 ' --name kz.test --type AXFR --trailing 16 --key "k1:$SECRET"
 
+echo "== QCLASS other than IN (RFC 5936 §2.1.2: the class of the zone): no such zone, REFUSED without a transfer"
+NA='^rcode=5 tc=0 aa=0 qd=1 an=0 ns=0 '
+t "AXFR of class CH"                            "$NA" --name ax.test --type AXFR --class 3
+t "AXFR of class ANY"                           "$NA" --name ax.test --type AXFR --class 255
+t "AXFR of class NONE"                          "$NA" --name ax.test --type AXFR --class 254
+t "AXFR of class HS"                            "$NA" --name ax.test --type AXFR --class 4
+t "AXFR of class CH with OPT"                   "$NA" --name ax.test --type AXFR --class 3 --edns-version 0
+t "IXFR of class CH"                            "$NA" --name ax.test --type IXFR --ixfr-serial 1 --class 3
+t "IXFR of class ANY from the current serial"   "$NA" --name ax.test --type IXFR --ixfr-serial 5 --class 255
+t "malformed AXFR of class CH: REFUSED, not FORMERR" "$NA" --name ax.test --type AXFR --class 3 --opcode 4
+t "signed AXFR of class CH: REFUSED, signed"    '^rcode=5 tc=0 aa=0 qd=1 an=0 ns=0 .* tsig=ok' --name kz.test --type AXFR --class 3 --key "k1:$SECRET"
+t "UDP IXFR of class CH"                        "$NA" --udp --name ax.test --type IXFR --ixfr-serial 5 --class 3
+t "UDP IXFR of class ANY, old serial (no TC)"   "$NA" --udp --name ax.test --type IXFR --ixfr-serial 1 --class 255
+t "UDP IXFR of class HS"                        "$NA" --udp --name ax.test --type IXFR --ixfr-serial 5 --class 4
+t "the same AXFR of class IN is transferred"    "$XFER" --name ax.test --type AXFR
+
 echo "== UDP IXFR (RFC 1995 §4.2)"
 t "IXFR from the current serial"                '^rcode=0 tc=0 aa=1 qd=1 an=1 ns=0' --udp --name ax.test --type IXFR --ixfr-serial 5
 t "IXFR from an old serial: TC"                 '^rcode=0 tc=1 ' --udp --name ax.test --type IXFR --ixfr-serial 1
@@ -151,6 +169,7 @@ for why in "OPCODE is not QUERY" "RCODE is not NOERROR" "QDCOUNT is not 1" "ANCO
            "trailing octets after the last record" "request too long" "malformed or unexpected Additional record"; do
     lg "transfer of 'ax.test/IN': bad zone transfer request: malformed request, $why (FORMERR)" && pass "logged: $why" || fail "not logged: $why"
 done
+lg "transfer of 'ax.test/IN': bad zone transfer request: non-authoritative zone (REFUSED)" && pass "a transfer of another class is logged as a non-authoritative zone" || fail "a transfer of class CH was not logged as non-authoritative"
 ! grep -q "transfer of 'nx.test/IN': bad zone transfer request: malformed" "$T/logs/xfer.log" && pass "a malformed request for a zone that does not exist is logged as a refusal, not as malformed" || fail "nx.test was logged as malformed"
 if grep -qE "AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:" "$T/server.log"; then fail "sanitizer report in server.log"; tail -20 "$T/server.log"; else pass "no sanitizer report"; fi
 stop_srv
@@ -223,6 +242,9 @@ EOF
     t "DB: IXFR without the client's SOA"            "$FE1" --name a.test --type IXFR
     t "DB: UDP IXFR from the current serial, RCODE 1" "$FE1" --udp --name a.test --type IXFR --ixfr-serial 5 --req-rcode 1
     t "DB: UDP IXFR from the current serial, trailing" "$FE1" --udp --name a.test --type IXFR --ixfr-serial 5 --trailing 16
+    t "DB: AXFR of class CH: REFUSED"                "$NA" --name a.test --type AXFR --class 3
+    t "DB: IXFR of class ANY from an old serial: REFUSED" "$NA" --name a.test --type IXFR --ixfr-serial 1 --class 255
+    t "DB: UDP IXFR of class CH from the current serial: REFUSED" "$NA" --udp --name a.test --type IXFR --ixfr-serial 5 --class 3
     [ "$(issued)" = "$I0" ] && oom a.test && pass "nothing was fetched for them (issued=$I0), the zone is still out of memory" || fail "a malformed request made the server read the zone (issued $I0 -> $(issued))"
     t "DB: IXFR from the current serial: the one SOA, from the summary" '^rcode=0 tc=0 aa=1 qd=1 an=1 ns=0' --name a.test --type IXFR --ixfr-serial 5
     [ "$(issued)" = "$I0" ] && oom a.test && pass "the summary answered it, nothing was fetched" || fail "the good IXFR read the zone"

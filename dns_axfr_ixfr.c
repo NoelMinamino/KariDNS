@@ -2187,7 +2187,9 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
                     client_addr, client_len, server_addr, has_server_addr);
     return;
   }
-  if (!entry) {
+  /* RFC 5936 §2.1.2, RFC 1995 §3: QCLASS is the class of the zone, and every zone here is IN; a transfer of another class has no zone (the TCP dispatch has
+   * answered it already: this is for a direct caller) */
+  if (!entry || ((req[q_offset - 2] << 8) | req[q_offset - 1]) != 1) {
     xfr_log_denied(cip, cport, qname, qtype, XD_NOZONE, 0);
     /* 権威を持たないゾーンへの転送要求: REFUSED、AA=0 (R-06) */
     axfr_send_error(client_fd, req, req_len, 5, false, 0xFFFF, NULL, tsig_key, req_mac, req_mac_len,

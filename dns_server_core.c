@@ -2867,7 +2867,13 @@ process_tcp_client: ;
           zdir_elem_t *xfr_el = NULL;         /* D1a step 7: the database zone of the transfer when its data is not in memory (the thread waits for it) */
           zone_config_t xfr_nr_zc;            /* ... and its settings as the directory element keeps them (the ACL levels read them) */
           zone_db_entry_t *xfr_entry = NULL;  /* the zone of the transfer when its data is in memory */
-          if (xfr_view && (qtype == 252 || qtype == 251)) {
+          if (xfr_view && (qtype == 252 || qtype == 251) && qclass != 1) {
+            /* RFC 5936 §2.1.2 (QCLASS: "the class of the zone requested"), RFC 1995 §3: every zone of KariDNS is of class IN, so a transfer of class CH,
+             * ANY or any other has no zone: it is answered as a zone this server is not authoritative for (REFUSED, AA=0, below), before the ACL and the
+             * shape of the request, and nothing is read.  BIND looks the zone up in the views of the request's class and answers "non-authoritative
+             * zone" (xfrout.c ns_xfr_start()) */
+            zcfg = NULL;
+          } else if (xfr_view && (qtype == 252 || qtype == 251)) {
             /* The element of the zone is looked up once and its entry loaded once (one acquire): the memory cache (D1a) takes the data of a DB zone out of
              * memory and brings it back at any moment, so the settings, the "not in memory" path and the zone that is transferred are all decided from this
              * one reading.  (They were three readings: a zone evicted between them was answered "non-authoritative zone" (REFUSED), one that came into
