@@ -94,6 +94,7 @@ start_srv() {
     sleep 1
 }
 issued() { $KCTL dbstatus 2>/dev/null | grep '^fetch:' | sed -n 's/.* issued=\([0-9]*\).*/\1/p' | tail -1; }
+marked() { $KCTL dbstatus 2>/dev/null | grep '^transfers of zones out of memory:' | sed -n 's/.* marked=\([0-9]*\).*/\1/p' | tail -1; }   # zones that a background fetch or a transfer brought, marked to go first
 oom() { $KCTL dbstatus "$1" 2>/dev/null | grep -q "out of memory"; }       # oom ZONE: its data is out of memory
 D() { ./dag @127.0.0.1 -p "$PORT" "$@" 2>/dev/null; }
 ans() { D "$1" "$2" +noall +answer +nohexdump | awk '{ print $4 }' | tr '\n' ' '; }       # ans NAME TYPE: the types of the Answer section
@@ -107,11 +108,13 @@ echo "== a CNAME into a zone that is not in memory"
 conf 5000
 start_srv
 oom target.test && oom prov2.test && pass "target.test and prov2.test start out of memory" || fail "a zone is in memory at the start"
+MK0=$(marked)
+[ "$MK0" = "0" ] && pass "nothing is marked yet (marked=0)" || fail "marked='$MK0' at the start"
 A1=$(ans www.a.test A)
 [ "$A1" = "CNAME " ] && pass "www.a.test: the answer is the CNAME alone (the chain stops at the zone that is not in memory)" || fail "www.a.test: '$A1'"
 wait_res target.test 10 && pass "target.test was fetched in the background" || fail "target.test is still out of memory"
-MK=$($KCTL dbstatus 2>/dev/null | sed -n 's/^transfers of zones out of memory:.* marked=\([0-9]*\).*/\1/p' | tail -1)
-[ "${MK:-0}" -ge 1 ] && pass "the zone that only the background fetch brought is marked to be taken out first (marked=$MK)" || fail "no mark after the background fetch: marked='$MK'"
+MK=$(marked)
+[ "$MK" = "$((MK0 + 1))" ] && pass "the zone that only the background fetch brought is marked to be taken out first (marked $MK0 -> $MK: exactly one)" || fail "marked after the background fetch of target.test: '$MK' (was '$MK0')"
 A2=$(ans www.a.test A)
 [ "$A2" = "CNAME A " ] && pass "the next query gets the whole chain (the partial answer was not stored in the response cache)" || fail "www.a.test: '$A2'"
 [ "$(ans ext.a.test A)" = "CNAME " ] && pass "a CNAME out of every zone of the view is as before (and asks for nothing)" || fail "ext.a.test: $(ans ext.a.test A)"
@@ -122,15 +125,19 @@ N1=$(addl ns.test NS)
 wait_res prov2.test 10 && pass "prov2.test was fetched in the background" || fail "prov2.test is still out of memory"
 N2=$(addl ns.test NS)
 [ "$N2" = "A " ] && pass "the next query has the glue (the answer without it was not stored)" || fail "ns.test: Additional '$N2'"
+MK2=$(marked)
+[ "$MK2" = "$((MK + 1))" ] && pass "prov2.test is marked too (marked $MK -> $MK2: one for each zone a background fetch brought)" || fail "marked after prov2.test: '$MK2' (was '$MK')"
 
 echo "== one request for a zone, however often the query comes"
 oom dt.test && oom dup.test && pass "dup.test and dt.test start out of memory" || fail "dup.test or dt.test did not start out of memory"
-D x.dup.test A +short +nohexdump > /dev/null     # (dup.test is read for the query; dt.test is the target)
 I0=$(issued)
+D x.dup.test A +short +nohexdump > /dev/null     # (dup.test is read for the query: one fetch; dt.test is the target: one fetch in the background)
 k=0; while [ $k -lt 60 ]; do D x.dup.test A +short +nohexdump +time=1 +tries=1 > /dev/null; k=$((k + 1)); done
 wait_res dt.test 10 && pass "dt.test was fetched" || fail "dt.test is out of memory"
 I1=$(issued)
-[ "$((I1 - I0))" -le 2 ] && pass "60 queries asked for dt.test at most twice ($((I1 - I0)) fetches)" || fail "$((I1 - I0)) fetches for 60 queries"
+[ "$((I1 - I0))" = "2" ] && pass "61 queries made exactly two fetches: dup.test for the first (it waited) and dt.test once, in the background" || fail "$((I1 - I0)) fetches for 61 queries (want 2)"
+MK3=$(marked)
+[ "$MK3" = "$((MK2 + 1))" ] && pass "dt.test is marked once (marked $MK2 -> $MK3)" || fail "marked after dt.test: '$MK3' (was '$MK2')"
 stop_srv
 
 echo "== a pattern of queries that chain into $NB zones, fetch-rate 20"

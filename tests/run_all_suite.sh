@@ -525,6 +525,7 @@ register_test "core" "sh" "tests/run_db_notify_test.sh" "NOTIFY for database zon
 register_test "core" "sh" "tests/run_db_bgfetch_test.sh" "A CNAME or the glue of a name server that leads into a database zone that is not in memory (D1a step 8, design 5), real karidns and loader: the answer is the CNAME alone / without the glue and is not stored in the response cache, the zone is fetched in the background (one request for a zone in a few seconds), the next query gets the whole chain and the glue, a pattern of chaining queries stays within fetch-rate (root; SKIP without sqlite3 / perl)"
 register_test "core" "sh" "tests/run_db_warm_test.sh" "The hot list, the warm-up and warm-before-serve (D1a step 7, design 8.4 / 3.3), real karidns and loader, SQLite3: with memory-limit and loader-state-file the Backend sends the zones most asked for to the loader, which writes them (atomically, header and END line with a checksum) in the order of the frequencies; after a restart the zones are in memory before the first query (no miss), with a small memory-limit the warm-up stops at the high water mark and the hottest zones are the ones in memory without any eviction; a corrupt, truncated, empty or wrongly counted state file is ignored (log, dbstatus) and replaced by the next list; kill -9 of the loader warms again what the Backend lost (karidns-evict); warm-before-serve holds the queries until the list is read (fetch-rate 1) or the time is up while karictl dbstatus keeps working; the new dbstatus lines; karicheck db / conf check the state file (root; SKIP without sqlite3 / perl; the loader-restart part SKIPs without karidns-evict)"
 register_test "core" "sh" "tests/run_db_fetchconc_test.sh" "The fetches in flight (database { fetch-concurrency }, default loader-threads x 16) and the loader's pool of fetch workers (D1a), real karidns and loader, SQLite3: dbstatus shows the limit, fetch-concurrency 2 sheds a burst of queries for zones out of memory, the default with loader-threads 4 sheds nothing and every answer is right (root; SKIP without sqlite3 / perl)"
+register_test "core" "sh" "tests/run_db_hotparts_test.sh" "A hot list of several parts, end to end (D1a step 7, design 8.4), real karidns and loader, SQLite3: 8000 zones with 140-byte names (more than the 1 MiB of one message) are asked for once each; the loader puts the parts of the HOT_LIST together (the state file holds all 8000, nothing dropped) and after a restart the Backend receives and reads all 8000 zones of the WARM_LIST (SKIP without root, sqlite3 or perl)"
 register_test "core" "sh" "tests/run_db_inview_test.sh" "zone x { in-view v1 } of a zone of the database of v1 (D1a step 9, design 9, in-view phase 2), real karidns and loader, three views: a query, an AXFR and a NOTIFY through the sharing view for a zone in memory and one out of memory (one fetch, in the owner's name), the sibling glue from the view of the query, the ACL by in-view-settings, only the names written are shared (a zone added to or removed from the database changes nothing in the sharing view), karictl reconfig keeps the sharing (root, loopback aliases 127.0.0.2 and 127.0.0.3; SKIP without sqlite3 / perl)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
 register_test "core" "sh" "tests/run_db_hostile_loader_test.sh" "A fake loader sends bad zone data (wrong counts, owner outside the zone, garbage RRs, oversize frames, ...): the zone is rejected or the stream closed, the Backend survives and keeps serving (beta B4b; root only, SKIP otherwise)"
 register_test "core" "sh" "tests/run_db_tags_test.sh" "GATE B8: per-client answers file = SQLite3 = file-free secondary for a zone with \$LOCATION / \$ECS-SUBNET tags and a tinydns zone (locations, activation time stamps, countdown TTLs); ECS from trusted resolvers bounded by acl-ceiling; Extended AXFR of file and database zone byte-identical; a tag edit reaches the answers with karictl reload (root; loopback aliases 127.0.0.2-5)" "group:alias"   # loopback aliases (ifconfig lo0 alias): one at a time
@@ -882,6 +883,11 @@ EOF
             _exit_code=$?
         fi
         [ ${_exit_code} -ne 0 ] && _status="FAIL"
+        # A test that SKIPs a part (no PostgreSQL driver in the loader, no PostgreSQL server, ...) and exits 0 is a PASS; the first of its
+        # SKIP lines is kept as the note of the PASS, so that a run which silently lost its PostgreSQL tests shows it.
+        if [ "${_status}" = "PASS" ] && [ -f "${_log}" ]; then
+            _skip_reason=$(grep -m1 -E 'SKIP(:|\])' "${_log}" | sed 's/^[ =]*//' | cut -c1-150 | tr '|' '/')
+        fi
     fi
 
     T_END=$(date +%s 2>/dev/null || perl -e 'print time')
@@ -899,6 +905,7 @@ print_result() {
     IFS='|' read -r _status _cmd _cat T_ELAPSED _exit_code _desc _skip_reason < "${RES_DIR}/${_pi}.res"
     if [ "${_status}" = "PASS" ]; then
         printf "  [ ${C_GREEN}PASS${C_RESET} ] %-42s (${T_ELAPSED}s) ${C_WHITE}%s${C_RESET}\n" "${_cmd}" "${_desc}"
+        [ -n "${_skip_reason}" ] && printf "           ${C_YELLOW}^ part skipped: %s${C_RESET}\n" "${_skip_reason}"
     elif [ "${_status}" = "SKIP" ]; then
         printf "  [ ${C_YELLOW}SKIP${C_RESET} ] %-42s (${_skip_reason})\n" "${_cmd}"
     else
@@ -1133,6 +1140,16 @@ if [ "${SKIPPED_COUNT}" -gt 0 ]; then
     while IFS='|' read -r _s _c _cat _t _code _d _skip_r; do
         if [ "${_s}" = "SKIP" ]; then
             printf "  - ${C_YELLOW}%-45s${C_RESET} [Category: %s, Reason: %s]\n" "${_c}" "${_cat}" "${_skip_r:-unknown}"
+        fi
+    done < "${SUMMARY_FILE}"
+fi
+
+if grep -q '^PASS|[^|]*|[^|]*|[^|]*|[^|]*|.*|.' "${SUMMARY_FILE}"; then
+    echo ""
+    echo "${C_YELLOW}Passed with a skipped part (the first SKIP line of the log):${C_RESET}"
+    while IFS='|' read -r _s _c _cat _t _code _d _skip_r; do
+        if [ "${_s}" = "PASS" ] && [ -n "${_skip_r}" ]; then
+            printf "  - ${C_YELLOW}%-45s${C_RESET} %s\n" "${_c}" "${_skip_r}"
         fi
     done < "${SUMMARY_FILE}"
 fi

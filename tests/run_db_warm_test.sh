@@ -182,6 +182,17 @@ LIM=$(field cache limit); RSD=$(field cache resident)
 [ "$RSD" -le $((LIM + LIM / 10)) ] && pass "the zones in memory ($RSD bytes) are within memory-limit ($LIM)" || fail "resident $RSD above the limit $LIM"
 EV=$(field cache evictions)
 [ "${EV:-1}" = "0" ] && pass "no zone was taken out of memory to warm others" || fail "$EV evictions during the warm-up"
+# D1a step 7 review: a zone the warm-up read starts with the frequency of its rank in the list (not 0), so that it is not the first the cache manager takes out
+# when queries bring other zones in.  The zones after the first K are asked for twice each now (their frequency is 2, below every rank): the zones that leave
+# memory are the lowest ranks and these new ones, not the top of the list (with frequency 0 for all of them a top zone goes too).
+n=$((K + 1))
+while [ $n -le $NZ ]; do q "www.$(zn $n).test" > /dev/null; q "www.$(zn $n).test" > /dev/null; n=$((n + 1)); done
+waitfor 10 sh -c "[ \"\$(./karictl -c $T/karictl.conf dbstatus 2>/dev/null | grep '^cache:' | head -1 | sed -n 's/.* evictions=\([0-9]*\).*/\1/p')\" -ge 1 ]" && pass "the zones that queries brought in pushed memory over the limit: the manager took zones out ($(field cache evictions) evictions)" || fail "no eviction after queries for the other zones"
+sleep 2
+R=$(resident_zones)
+echo "  zones in memory after queries for the others: $R"
+H=$((K / 2)); LEFT=""; n=1; while [ $n -le "$H" ]; do echo "$R" | grep -qw "$n" || LEFT="$LEFT$n "; n=$((n + 1)); done
+[ -z "$LEFT" ] && pass "the upper half of the list (z0001 .. $(zn $H)), frequency $((NZ + 1 - H)) and more) is still in memory: the zones taken out are the lowest ranks and the new ones" || fail "high ranking warmed zone(s) left memory: $LEFT"
 stop_srv
 
 echo "== a state file that is corrupt, truncated or empty is ignored"
@@ -271,10 +282,19 @@ waitfor 30 sh -c "./karictl -c $T/karictl.conf dbstatus >/dev/null 2>&1" && pass
 T0=$(now_s)
 ( a=$(./dag @127.0.0.1 -p "$PORT" "www.$(zn 1).test" A +short +nohexdump +time=70 +tries=1 2>/dev/null | head -1); echo "$(now_s) $a" > "$T/ans1" ) &
 QP=$!
+# the same over TCP (the connection is accepted, the query on it waits like the UDP one), and a second TCP query on a connection of its own for another zone
+( a=$(./dag @127.0.0.1 -p "$PORT" "www.$(zn 2).test" A +tcp +short +nohexdump +time=70 +tries=1 2>/dev/null | head -1); echo "$(now_s) $a" > "$T/ans1t" ) &
+QPT=$!
+( a=$(./dag @127.0.0.1 -p "$PORT" "www.$(zn 3).test" A +tcp +short +nohexdump +time=70 +tries=1 2>/dev/null | head -1); echo "$(now_s) $a" > "$T/ans1t2" ) &
+QPT2=$!
 sleep 2
 dbs | grep -q '^warm-before-serve: holding the queries' && pass "after 2 s dbstatus says the queries are held" || fail "dbstatus: $(dbs | grep '^warm-before-serve')"
-[ ! -s "$T/ans1" ] && pass "and the query has no answer yet" || fail "the query was answered while the warm-up runs: $(cat "$T/ans1")"
-wait "$QP"
+[ ! -s "$T/ans1" ] && [ ! -s "$T/ans1t" ] && [ ! -s "$T/ans1t2" ] && pass "and the queries (UDP and TCP) have no answer yet" || fail "a query was answered while the warm-up runs: $(cat "$T/ans1" "$T/ans1t" "$T/ans1t2" 2>/dev/null)"
+wait "$QP" "$QPT" "$QPT2"
+T1T=$(awk '{print $1}' "$T/ans1t"); A1T=$(awk '{print $2}' "$T/ans1t"); A1T2=$(awk '{print $2}' "$T/ans1t2")
+ELT=$(perl -e "printf '%d', $T1T - $T0")
+echo "  the TCP answers: '$A1T' after $ELT s, '$A1T2'"
+[ "$A1T" = "192.0.2.80" ] && [ "$A1T2" = "192.0.2.80" ] && [ "$ELT" -ge 5 ] && [ "$ELT" -le 55 ] && pass "the TCP queries waited for the warm-up too and were answered ($ELT s)" || fail "TCP answers '$A1T' / '$A1T2' after $ELT s"
 T1=$(awk '{print $1}' "$T/ans1"); A1=$(awk '{print $2}' "$T/ans1")
 EL=$(perl -e "printf '%d', $T1 - $T0")
 echo "  the answer came after $EL s: $A1"

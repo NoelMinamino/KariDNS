@@ -8,6 +8,11 @@
 #   - the ACL follows `in-view-settings`: with `view` the stub's allow-query refuses a client of the sharing view that the owner view answers
 #   - only the names the configuration wrote are shared: a zone that comes into the database of v1 is not served in the sharing view, one that leaves it is gone from
 #     both, and comes back in both when it returns, with no change of the configuration; a name that is no zone of v1 is REFUSED
+#   - karictl reload with the sharing view's name for a zone that is not in memory and for one that is not in the database
+#   - an UPDATE through the sharing view (also for a zone that is not in memory) is in both views; the ACL follows in-view-settings: the owner zone's list
+#     (ALLOW-DNSUPDATE-FROM within acl-ceiling), the stub's allow-update (which replaces it), the owner zone's list when the stub says nothing; a view that
+#     does not name the zone, and a zone nobody may update, are refused
+#   - a reconfiguration that adds a stub hides the zone of the same name in the view's own database (D-PRIO), and removing it brings that zone back
 # Needs root (the loader runs as nobody, loopback aliases 127.0.0.2 and 127.0.0.3).  SKIP without karidns, dag, karictl, karidns-dbloader (SQLite3), sqlite3 or perl.
 . "$(dirname "$0")/lib_proc.sh"
 set -u
@@ -72,8 +77,29 @@ INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT
   FROM domains d, (SELECT 0 AS i UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4) n WHERE d.name = 'a.test';
 INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'ALLOW-AXFR-FROM', '127.0.0.1' FROM domains;
 INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'ALLOW-AXFR-FROM', '127.0.0.2' FROM domains;
+-- UPDATE (this test's last sections): u: the database lets 127.0.0.1 and 127.0.0.2 update; s: only 127.0.0.1; r: both; w: nobody; d: its stub is added by a reconfiguration (v3 has a d.test of its own)
+INSERT INTO domains (name, type) VALUES ('u.test', 'NATIVE'), ('s.test', 'NATIVE'), ('r.test', 'NATIVE'), ('w.test', 'NATIVE'), ('d.test', 'NATIVE'), ('f.test', 'NATIVE');
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
+  SELECT id, name, 'SOA', 'ns1.' || name || ' host.' || name || ' 5 3600 600 86400 300', 900, 0, 0 FROM domains WHERE name IN ('u.test', 's.test', 'r.test', 'w.test', 'd.test', 'f.test');
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.' || name, 3600, 0, 0 FROM domains WHERE name IN ('u.test', 's.test', 'r.test', 'w.test', 'd.test', 'f.test');
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns1.' || name, 'A', '192.0.2.53', 600, 0, 0 FROM domains WHERE name IN ('u.test', 's.test', 'r.test', 'w.test', 'd.test', 'f.test');
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'www.' || name, 'A', '192.0.2.90', 300, 0, 0 FROM domains WHERE name IN ('u.test', 's.test', 'r.test', 'w.test', 'd.test', 'f.test');
+INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'ALLOW-DNSUPDATE-FROM', '127.0.0.1' FROM domains WHERE name IN ('u.test', 's.test', 'r.test', 'f.test');
+INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'ALLOW-DNSUPDATE-FROM', '127.0.0.2' FROM domains WHERE name IN ('u.test', 'r.test', 'f.test');
 SQL
 chown -R nobody "$T/db"; chmod 600 "$T/db/z.db"*
+# v3 takes zones from a database of its own: d.test (the name of a zone of v1 that a later reconfiguration shares with v3) and m.test
+mkdir "$T/db3"
+sqlite3 "$T/db3/z.db" < tests/db/pdns_schema.sqlite3.sql > /dev/null
+sqlite3 "$T/db3/z.db" <<SQL
+INSERT INTO domains (name, type) VALUES ('d.test', 'NATIVE'), ('m.test', 'NATIVE');
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
+  SELECT id, name, 'SOA', 'ns1.' || name || ' host.' || name || ' 9 3600 600 86400 300', 900, 0, 0 FROM domains;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.' || name, 3600, 0, 0 FROM domains;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns1.' || name, 'A', '192.0.2.53', 600, 0, 0 FROM domains;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'www.' || name, 'A', '192.0.2.77', 300, 0, 0 FROM domains;
+SQL
+chown -R nobody "$T/db3"; chmod 600 "$T/db3/z.db"*
 install -o root -g wheel -m 755 "$LOADER" "$T/karidns-dbloader" 2>/dev/null || { cp "$LOADER" "$T/karidns-dbloader"; chown 0:0 "$T/karidns-dbloader"; chmod 755 "$T/karidns-dbloader"; }
 cat > "$T/karictl.conf" <<EOF
 socket "$T/ctl.sock";
@@ -99,11 +125,18 @@ view "v2" {
     zone "g.test" { in-view "v1"; };
     zone "c.test" { in-view "v1"; allow-query { 192.0.2.99; }; };
     zone "ghost.test" { in-view "v1"; };
+    zone "u.test" { in-view "v1"; in-view-settings owner; };
+    zone "s.test" { in-view "v1"; allow-update { 127.0.0.2; }; };
+    zone "r.test" { in-view "v1"; allow-update { 192.0.2.99; }; };
+    zone "f.test" { in-view "v1"; };
+    zone "w.test" { in-view "v1"; };
+${EXTRA_V2:-}
 };
 view "v3" {
     match-clients { 127.0.0.3; };
-    database none;
+    database-file "$T/db3/z.db";
     zone "g.test" { in-view "v1"; };
+${EXTRA_V3:-}
 };
 EOF
 }
@@ -131,6 +164,9 @@ wait_oom() {   # wait_oom ZONE SECONDS: the zone's data leaves memory (the cache
 wait_ans() {   # wait_ans SRC NAME EXPECTED SECONDS
     i=0; while [ $i -lt $(($4 * 10)) ]; do [ "$(ans "$1" "$2" A)" = "$3" ] && return 0; sleep 0.1; i=$((i + 1)); done
     return 1
+}
+upd() {   # upd ZONE SRC NAME: the rcode of an UPDATE that adds NAME.ZONE (A 192.0.2.99), sent from the address SRC
+    D "$2" "$1" SOA +nohexdump +time=5 +tries=1 --update-add "$3.$1 300 IN A 192.0.2.99" | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -1
 }
 notify_rcode() {   # notify_rcode SRC ZONE: the rcode of a NOTIFY (opcode 4) for ZONE sent from the address SRC
     perl tests/db/udp_notify_probe.pl "$1" 127.0.0.1 "$PORT" "$2"
@@ -213,6 +249,58 @@ INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'www.a.test', 'A', '192.0.2.82', 300, 0, 0 FROM domains WHERE name = 'a.test';
 SQL
 wait_ans 127.0.0.2 www.a.test 192.0.2.82 15 && pass "a.test is back in the database: v2 serves it again, with no change of the configuration" || fail "v2: a.test after it returned: '$(ans 127.0.0.2 www.a.test)'"
+
+echo "== karictl reload through the sharing view: a zone that is not in memory, and one that is not in the database"
+oom w.test && pass "w.test is out of memory" || fail "w.test is in memory"
+RL=$($KCTL reload w.test v2 force 2>&1 | head -1)
+RL1=$($KCTL reload w.test v1 force 2>&1 | head -1)
+echo "$RL" | grep -q "^OK zone w.test. (view v1): unchanged, serial 5 (not in memory)" && [ "$RL" = "$RL1" ] && pass "reload w.test v2 force: the answer of the owner view v1, as for v1 itself, for a zone that is not in memory ($RL)" || fail "reload w.test v2 force: '$RL'; v1: '$RL1'"
+oom w.test && pass "... and the reload did not read the zone" || fail "w.test was read by the reload"
+[ "$(ans 127.0.0.2 www.w.test)" = "192.0.2.90" ] && pass "v2 answers www.w.test (a query reads it)" || fail "v2: www.w.test '$(ans 127.0.0.2 www.w.test)'"
+RL=$($KCTL reload ghost.test v2 2>&1 | head -1)
+echo "$RL" | grep -q "^ERROR.*not in the database" && pass "reload ghost.test v2 (no such zone in v1): $RL" || fail "reload ghost.test v2: $RL"
+
+echo "== UPDATE through the sharing view (one zone: the change is in both views)"
+oom u.test && oom s.test && oom r.test && oom f.test && pass "u.test, s.test, r.test and f.test are out of memory (an UPDATE waits for the zone)" || fail "a zone of the UPDATE tests is in memory"
+upd_is() {   # upd_is DESCRIPTION WANT ZONE SRC NAME: an UPDATE that adds NAME.ZONE from the address SRC
+    d=$1; w=$2; shift 2
+    got=$(upd "$@")
+    [ "$got" = "$w" ] && pass "$d" || fail "$d (got '$got', want $w)"
+}
+I0=$(issued)
+upd_is "u.test through v2 (in-view-settings owner, 127.0.0.2 is in ALLOW-DNSUPDATE-FROM and in the ceiling): NOERROR" NOERROR u.test 127.0.0.2 via2
+[ "$(issued)" = "$((I0 + 1))" ] && pass "... the zone was read once, in the owner's name" || fail "fetches: $(issued) (was $I0)"
+[ "$(ans 127.0.0.1 via2.u.test)" = "192.0.2.99" ] && [ "$(ans 127.0.0.2 via2.u.test)" = "192.0.2.99" ] && pass "... and the new name is in v1 and in v2 (one zone)" || fail "via2.u.test: v1 '$(ans 127.0.0.1 via2.u.test)', v2 '$(ans 127.0.0.2 via2.u.test)'"
+upd_is "u.test through v1: NOERROR" NOERROR u.test 127.0.0.1 via1
+[ "$(ans 127.0.0.2 via1.u.test)" = "192.0.2.99" ] && pass "... and the name added through v1 is in v2" || fail "via1.u.test through v2: '$(ans 127.0.0.2 via1.u.test)'"
+S1=$(ans 127.0.0.1 u.test SOA | awk '{ print $3 }'); S2=$(ans 127.0.0.2 u.test SOA | awk '{ print $3 }')
+[ -n "$S1" ] && [ "$S1" = "$S2" ] && [ "$S1" -gt 5 ] && pass "one SOA serial in both views, bumped by the updates ($S1)" || fail "serial: v1 '$S1', v2 '$S2'"
+V3=$(upd u.test 127.0.0.3 via3)
+case $V3 in REFUSED|NOTAUTH) pass "u.test through v3 (the view does not name the zone): $V3" ;; *) fail "u.test through v3: '$V3'" ;; esac
+[ -z "$(ans 127.0.0.1 via3.u.test)" ] && pass "... and nothing was added" || fail "via3.u.test was added"
+upd_is "s.test through v2 (in-view-settings view: the stub's allow-update, which the database does not list): NOERROR" NOERROR s.test 127.0.0.2 via2
+upd_is "s.test through v1 (the database lists 127.0.0.1): NOERROR" NOERROR s.test 127.0.0.1 via1
+[ "$(ans 127.0.0.1 via2.s.test)" = "192.0.2.99" ] && pass "s.test: the update made through v2 is in v1" || fail "via2.s.test through v1: '$(ans 127.0.0.1 via2.s.test)'"
+upd_is "r.test through v2 (in-view-settings view, the stub lists 192.0.2.99 only; the database lists 127.0.0.2): REFUSED" REFUSED r.test 127.0.0.2 via2
+upd_is "f.test through v2 (in-view-settings view, the stub has no allow-update: the owner zone's list, which has 127.0.0.2): NOERROR" NOERROR f.test 127.0.0.2 via2
+upd_is "r.test through v1 (the database lists 127.0.0.1): NOERROR" NOERROR r.test 127.0.0.1 via1
+[ -z "$(ans 127.0.0.2 via2.r.test)" ] && [ "$(ans 127.0.0.2 via1.r.test)" = "192.0.2.99" ] && pass "r.test: the refused name is absent, the accepted one is in v2" || fail "r.test: via2 '$(ans 127.0.0.2 via2.r.test)', via1 '$(ans 127.0.0.2 via1.r.test)'"
+upd_is "w.test through v1 (the database lists nobody): REFUSED" REFUSED w.test 127.0.0.1 via1
+upd_is "w.test through v2: REFUSED" REFUSED w.test 127.0.0.2 via2
+upd_is "ghost.test through v2 (no such zone in v1): NOTAUTH" NOTAUTH ghost.test 127.0.0.2 via2
+
+echo "== a reconfiguration that adds an in-view stub hides the zone of the same name in the view's own database (D-PRIO)"
+[ "$(ans 127.0.0.3 www.d.test)" = "192.0.2.77" ] && pass "v3 serves its own d.test" || fail "v3: www.d.test '$(ans 127.0.0.3 www.d.test)'"
+EXTRA_V3='    zone "d.test" { in-view "v1"; };'
+conf
+$KCTL reconfig > /dev/null 2>&1
+wait_ans 127.0.0.3 www.d.test 192.0.2.90 15 && pass "after the reconfiguration v3 answers d.test from the zone of v1 (the stub hides v3's own)" || fail "v3: www.d.test '$(ans 127.0.0.3 www.d.test)' after the stub was added"
+$KCTL dbstatus d.test 2>&1 | grep "view v3" | grep -q "shadowed" && pass "karictl dbstatus d.test: the zone of v3's database is shadowed" || fail "dbstatus d.test: $($KCTL dbstatus d.test 2>&1 | grep 'view v3')"
+[ "$(ans 127.0.0.3 www.m.test)" = "192.0.2.77" ] && pass "m.test (no stub) is still served from v3's database" || fail "v3: www.m.test '$(ans 127.0.0.3 www.m.test)'"
+EXTRA_V3=""
+conf
+$KCTL reconfig > /dev/null 2>&1
+wait_ans 127.0.0.3 www.d.test 192.0.2.77 15 && pass "the stub removed again: v3's own d.test is served" || fail "v3: www.d.test '$(ans 127.0.0.3 www.d.test)' after the stub was removed"
 
 echo "== a reload of the configuration keeps the sharing"
 $KCTL reconfig > /dev/null 2>&1

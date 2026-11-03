@@ -106,3 +106,27 @@ kari_make() {
         make "$@"
     fi
 }
+
+# kari_make_dbloader : (re)build karictl and karidns-dbloader and KEEP the drivers of the loader that is there.  A plain make of karidns-dbloader
+# builds the default DB_DRIVERS (sqlite3 only) when a source is newer than the binary, which silently turned the PostgreSQL tests of the same run
+# into SKIPs.  Without a loader yet the default applies.
+kari_make_dbloader() {
+    _kd=""
+    [ -x ./karidns-dbloader ] && _kd=$(./karidns-dbloader --drivers 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')
+    if [ -n "$_kd" ]; then
+        kari_make karictl karidns-dbloader "DB_DRIVERS=$_kd"
+    else
+        kari_make karictl karidns-dbloader
+    fi
+}
+
+# kari_make_dbloader_tsan : karidns-dbloader-tsan with the drivers of ./karidns-dbloader (the default drivers when there is none)
+kari_make_dbloader_tsan() {
+    _kd=""
+    [ -x ./karidns-dbloader ] && _kd=$(./karidns-dbloader --drivers 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')
+    if [ -n "$_kd" ]; then
+        kari_make karidns-dbloader-tsan "DB_DRIVERS=$_kd"
+    else
+        kari_make karidns-dbloader-tsan
+    fi
+}

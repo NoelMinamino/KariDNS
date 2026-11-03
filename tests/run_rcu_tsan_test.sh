@@ -1,7 +1,7 @@
 #!/bin/sh
 # R-25 regression: epoch-RCU publish ordering under ThreadSanitizer.
 #
-# Part 1: test_epoch_rcu-tsan (publish order, grace period, reuse stress); part 1b: test_zone_dir-tsan (the zone directory, D1a); part 1c: test_park-tsan, test_db_fetch-tsan, test_park_worker-tsan (parked queries, D1a milestone 2).
+# Part 1: test_epoch_rcu-tsan (publish order, grace period, reuse stress); part 1b: test_zone_dir-tsan (the zone directory, D1a); part 1c: test_park-tsan, test_db_fetch-tsan, test_park_worker-tsan, test_db_stream-tsan, test_pdns_reader-tsan, test_db_registry-tsan (parked queries, D1a milestone 2).
 # Part 2: karidns-tsan as a primary. Concurrently:
 #   - UDP and TCP (tcp-connection-reuse) queries from several clients,
 #   - SIGHUP reloads with a touched zone file (config swap + reload_master_zone
@@ -33,8 +33,8 @@ UPDATES=${UPDATES:-15}
 echo "=== R-25 RCU TSan test ==="
 
 # Build as the invoking user (kari_make: running make as root leaves root-owned objects).
-if ! kari_make karidns karidns-tsan dag test_epoch_rcu-tsan test_zone_dir-tsan test_park-tsan test_db_fetch-tsan test_park_worker-tsan >/dev/null 2>&1; then
-    echo "FAIL: could not build karidns / karidns-tsan / dag / test_epoch_rcu-tsan / test_zone_dir-tsan / test_park-tsan / test_db_fetch-tsan / test_park_worker-tsan"
+if ! kari_make karidns karidns-tsan dag test_epoch_rcu-tsan test_zone_dir-tsan test_park-tsan test_db_fetch-tsan test_park_worker-tsan test_db_stream-tsan test_pdns_reader-tsan test_db_registry-tsan >/dev/null 2>&1; then
+    echo "FAIL: could not build karidns / karidns-tsan / dag / test_epoch_rcu-tsan / test_zone_dir-tsan / test_park-tsan / test_db_fetch-tsan / test_park_worker-tsan / test_db_stream-tsan / test_pdns_reader-tsan / test_db_registry-tsan"
     exit 1
 fi
 
@@ -115,7 +115,7 @@ grep "inconsistencies" "$WORK/zdir.log"
 
 # part 1c (D1a milestone 2): the park table, the wake and fetch rings, workers and the ingest thread; the Backend side of the fetch stream
 # with the real ingest thread; a worker parking and answering a UDP query
-for t in test_park test_db_fetch test_park_worker; do
+for t in test_park test_db_fetch test_park_worker test_db_stream test_pdns_reader test_db_registry; do
     echo "--- part 1c: ${t}-tsan"
     if ! TSAN_OPTIONS="halt_on_error=0" ./${t}-tsan >"$WORK/${t}.log" 2>&1; then
         echo "FAIL: ${t}-tsan exited with an error"
@@ -370,7 +370,7 @@ echo "secondary: transfers logged: $xfrs, catalog passes: $members, reloads: $re
 check_tsan "$WORK/secondary.log" "secondary"
 
 echo "--- part 4: karidns-tsan with a memory limit (D1a step 5): the cache manager, the fetch stream and the workers (tests/run_db_cache_test.sh; root, SQLite3)"
-if [ "$(id -u)" = "0" ] && kari_make karictl karidns-dbloader >/dev/null 2>&1; then
+if [ "$(id -u)" = "0" ] && kari_make_dbloader >/dev/null 2>&1; then
     out=$(env KARIDNS=./karidns-tsan CACHE_TEST_DELAY_MS=10 CACHE_TEST_QUERIES=800 sh tests/run_db_cache_test.sh 2>&1)
     cr=$?
     echo "$out" | tail -5
@@ -383,7 +383,7 @@ else
 fi
 
 echo "--- part 5: karidns-tsan with zone transfers of zones that are out of memory (D1a step 7): AXFR / IXFR clients and queries while the cache manager takes zones out (tests/run_db_xfer_test.sh; root, SQLite3)"
-if [ "$(id -u)" = "0" ] && kari_make karictl karidns-dbloader >/dev/null 2>&1; then
+if [ "$(id -u)" = "0" ] && kari_make_dbloader >/dev/null 2>&1; then
     out=$(env KARIDNS=./karidns-tsan XFER_TEST_SECONDS=10 XFER_TEST_DELAY_MS=10 XFER_TEST_QUERIES=600 sh tests/run_db_xfer_test.sh 2>&1)
     cr=$?
     echo "$out" | tail -5
@@ -393,6 +393,19 @@ if [ "$(id -u)" = "0" ] && kari_make karictl karidns-dbloader >/dev/null 2>&1; t
     fi
 else
     echo "SKIP: needs root and karictl / karidns-dbloader"
+fi
+
+echo "--- part 6: karidns-tsan and karidns-dbloader-tsan: the loader's pool of fetch workers under bursts, eviction and reloads (D1a; tests/run_db_fetchconc_test.sh; root, SQLite3)"
+if [ "$(id -u)" = "0" ] && kari_make_dbloader >/dev/null 2>&1 && kari_make_dbloader_tsan >/dev/null 2>&1; then
+    out=$(env KARIDNS=./karidns-tsan LOADER=./karidns-dbloader-tsan FETCHCONC_STRESS_ROUNDS=2 sh tests/run_db_fetchconc_test.sh 2>&1)
+    cr=$?
+    echo "$out" | tail -5
+    if [ $cr -ne 0 ] || echo "$out" | grep -q "ThreadSanitizer"; then
+        echo "FAIL: run_db_fetchconc_test.sh with karidns-tsan and karidns-dbloader-tsan"
+        rc=1
+    fi
+else
+    echo "SKIP: needs root and karictl / karidns-dbloader / karidns-dbloader-tsan"
 fi
 
 if [ $rc -eq 0 ]; then

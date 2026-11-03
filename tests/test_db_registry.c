@@ -49,6 +49,8 @@ static pthread_mutex_t g_gc_log_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_gc_log[4096][64];
 static int g_gc_logn;
 
+static int g_hot_log;
+
 void syslog(int priority, const char *format, ...) {
     (void)priority;
     /* (the code logs through kdns_syslog(), which formats the message and passes it here as "%s") */
@@ -57,6 +59,7 @@ void syslog(int priority, const char *format, ...) {
         va_start(ap, format);
         const char *msg = va_arg(ap, const char *);
         va_end(ap);
+        if (strncmp(msg, "[DB] hot list: ", 15) == 0) g_hot_log++;       /* (dbreg_hot_emit(): zones left out for their long names, said once) */
         const char *key = "[GC] Freeing deleted zone '";
         if (strncmp(msg, key, strlen(key)) == 0) {
             pthread_mutex_lock(&g_gc_log_lock);
@@ -194,9 +197,36 @@ static void rebuild(server_config_t *cfg) {
     rebuild_zone_db_from_config(cfg, false);
 }
 
+/* the names of the entries the tests made: in_snapshot() must not read e->domain, because an entry that has left the
+ * snapshot may already be freed by a cleanup thread.  Newest first, so a reused address finds its current name. */
+static struct { const zone_db_entry_t *e; char name[256]; } *g_names;
+static size_t g_nnames, g_cap_names;
+
+static void remember_name(const zone_db_entry_t *e, const char *zone) {
+    if (g_nnames == g_cap_names) {
+        size_t cap = g_cap_names ? g_cap_names * 2 : 256;
+        void *p = realloc(g_names, cap * sizeof(*g_names));
+        if (!p) { perror("realloc"); exit(1); }
+        g_names = p;
+        g_cap_names = cap;
+    }
+    g_names[g_nnames].e = e;
+    snprintf(g_names[g_nnames].name, sizeof(g_names[0].name), "%s", zone);
+    g_nnames++;
+}
+
+static const char *entry_name(const zone_db_entry_t *e) {
+    for (size_t i = g_nnames; i-- > 0;)
+        if (g_names[i].e == e) return g_names[i].name;
+    printf("  in_snapshot(): an entry the test did not record (remember_name())\n");
+    CHECK(false);
+    return "";
+}
+
 static zone_db_entry_t *new_entry(const char *view, const char *zone) {
     zone_db_entry_t *e = create_new_zone_entry(zone, view);
     CHECK(e != NULL);
+    remember_name(e, zone);
     zone_config_t *dc = db_zone_config_new(zone, NULL);
     CHECK(dc != NULL);
     e->source = ZONE_SRC_DB;
@@ -245,7 +275,7 @@ static zone_db_entry_t *add_zone(const char *view, const char *zone, uint32_t se
 static bool in_snapshot(const char *view, zone_db_entry_t *e) {
     zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
     view_snapshot_t *v = snapshot_find_view(s, view);
-    bool r = v && find_zone_exact_in_view(v, e->domain) == e;
+    bool r = v && find_zone_exact_in_view(v, entry_name(e)) == e;
     release_zone_snapshot(s);
     return r;
 }
@@ -715,6 +745,7 @@ static void test_catalog_member_wins(void) {
         member = find_zone_exact_in_view(v, "m1.test.");
         release_zone_snapshot(s);
     }
+    if (member) remember_name(member, "m1.test.");    /* its address may be one a freed entry of an earlier test had */
     CHECK(cat != NULL);
     CHECK(member && member->is_catalog_member && member->source == ZONE_SRC_CATALOG);
 
@@ -1011,6 +1042,7 @@ static int tick_list(const char *view, const zone_db_entry_t *e, bool *in_list) 
 static zone_db_entry_t *new_secondary_entry(const char *view, const char *zone, zone_ext_shared_t *sh, int kind) {
     zone_db_entry_t *e = create_new_zone_entry(zone, view);
     CHECK(e != NULL);
+    remember_name(e, zone);
     zone_config_t *dc = db_zone_config_new_kind(zone, sh, kind);
     CHECK(dc != NULL);
     e->source = ZONE_SRC_DB;
@@ -1674,6 +1706,58 @@ static void test_hot_scan_order(void) {
     dbreg_reset();
 }
 
+/* D1a step 7 review: a zone whose view and zone names together are longer than 158 bytes (a pool slot of HOT_NAME_SLOT = 160 holds both and the two NULs) is not on
+ * the hot list, and the log says so once.  The boundary: "default" + a zone name of 151 bytes is 158 and stays, 152 does not. */
+struct hot_lens { int n, len[8]; };
+static void hot_collect_len(void *ud, const char *view, const char *zone) {
+    struct hot_lens *g = ud;
+    (void)view;
+    if (g->n < 8) g->len[g->n++] = (int)strlen(zone);
+}
+static void long_name(char *buf, size_t total) {      /* a canonical name of TOTAL bytes (the final dot counts): labels of 40 bytes */
+    size_t pos = 0;
+    while (pos < total) {
+        size_t l = total - pos - 1 > 40 ? 40 : total - pos - 1;
+        memset(buf + pos, 'x', l);
+        buf[pos + l] = '.';
+        pos += l + 1;
+    }
+    buf[total] = '\0';
+}
+static void test_hot_scan_long_names(void) {
+    printf("[TEST] zone directory: the hot list leaves out a zone whose view and zone names together do not fit a slot (158 bytes), and says so once...\n");
+    write_zone_file("hl.zone", "hl.test.", "192.0.2.1");
+    char conf[1024];
+    snprintf(conf, sizeof(conf), "%s/hl.zone", g_dir);
+    server_config_t *cfg = load_conf("view \"default\" { match-clients { any; };\n  zone \"hl.test\" { type master; file \"%s\"; }; };\n", conf);
+    rebuild(cfg);
+    char n151[256], n152[256], n240[256];
+    long_name(n151, 151);
+    long_name(n152, 152);
+    long_name(n240, 240);
+    const char *names[] = { "short.test.", n151, n152, n240 };
+    for (int i = 0; i < 4; i++) {
+        zone_db_entry_t *ez = add_zone("default", names[i], 5, 1, 700 + i);
+        CHECK(ez != NULL);
+        if (ez) atomic_store(&ez->observatory.queries_total, (uint64_t)(10 + i));
+    }
+    int logged0 = g_hot_log;
+    struct hot_lens got;
+    memset(&got, 0, sizeof(got));
+    dbreg_hot_t *h = dbreg_hot_begin(8);
+    CHECK(h && dbreg_hot_step(h) && dbreg_hot_emit(h, hot_collect_len, &got) == 2 && got.n == 2);
+    CHECK(got.n == 2 && got.len[0] == 151 && got.len[1] == 11);            /* (the hottest first: n151 was asked for 11 times, short.test. 10) */
+    CHECK(g_hot_log == logged0 + 1);                                       /* said once for the two zones left out */
+    memset(&got, 0, sizeof(got));
+    h = dbreg_hot_begin(8);
+    CHECK(h && dbreg_hot_step(h) && dbreg_hot_emit(h, hot_collect_len, &got) == 2 && got.n == 2);
+    CHECK(g_hot_log == logged0 + 1);                                       /* ... and not again at the next pass */
+    memset(&got, 0, sizeof(got));
+    h = dbreg_hot_begin(1);                                                /* one slot: the hot zones with a long name are left out before the heap sees them, the hottest of the rest stays */
+    CHECK(h && dbreg_hot_step(h) && dbreg_hot_emit(h, hot_collect_len, &got) == 1 && got.n == 1 && got.len[0] == 151);
+    dbreg_reset();
+}
+
 /* D1a review 6C: a walk over the registry in steps (dbreg_walk()) does not skip a zone that is there all along, when a zone leaves its chain or the tables are
  * rehashed between two steps (the position is an ordinal in a chain; the cursor remembers the generations of the registry and goes back). */
 typedef struct { size_t n, taken, stop_after; char name[512][24]; uint32_t hash[512]; } walk_t;
@@ -2085,6 +2169,7 @@ int main(void) {
     test_dir_elements();
     test_dir_fetch_state();
     test_hot_scan_order();
+    test_hot_scan_long_names();
     test_cold_no_garbage();
     test_walk_robust();
     test_dir_delta_in_place();
@@ -2094,6 +2179,8 @@ int main(void) {
     test_dir_bytes_per_zone();
     test_zone_bytes();
     test_concurrent();
+    gc_snapshot_wait_idle();      /* join the cleanup threads: none is left running (or leaked, for ThreadSanitizer) at exit */
+    free(g_names);
     /* Remove the scratch directory in-process: the detached snapshot GC threads of test_concurrent may still be starting
      * or exiting here, and fork() from a multi-threaded process (as system("rm -rf") did) deadlocks under ASan on FreeBSD:
      * the ASan fork handler holds the allocator lock while waiting for the rtld lock, which a starting thread holds while

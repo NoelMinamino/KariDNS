@@ -1462,6 +1462,176 @@ static bool check_lines_ok(const char *s) {
     return ok;
 }
 
+/* D1a step 7 review: hot_part() takes the Backend's HOT_LIST, which is not trusted.  The parts have to come in order (0, 1, 2, ...), of one list, up to part 1024;
+ * a part that does not follow loses the list and not the stream; an entry of a view that is not in the CONFIG is dropped and counted; the list's limit is part
+ * 0's and no later part changes it. */
+static void hp_send(struct lio *io, uint64_t id, uint32_t part, bool last, uint32_t limit, int n, const char *const *views, const char *const *zones) {
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_enc_begin(&e, KDB_T_HOT_LIST);
+    kdb_enc_u64(&e, 1, id);
+    kdb_enc_u32(&e, 2, part);
+    kdb_enc_u8(&e, 3, last ? 1 : 0);
+    if (limit) kdb_enc_u32(&e, 5, limit);
+    for (int i = 0; i < n; i++) {
+        kdb_enc_nest_begin(&e, 4);
+        kdb_enc_str(&e, 1, views[i]);
+        kdb_enc_name(&e, 2, zones[i]);
+        kdb_enc_nest_end(&e);
+    }
+    kdb_enc_end(&e);
+    kdb_frame_t fr = { KDB_T_HOT_LIST, e.buf + KDB_HEADER_LEN, (uint32_t)(e.len - KDB_HEADER_LEN) };
+    io_dispatch(io, &fr);
+    kdb_enc_free(&e);
+}
+/* one entry of the default view (or of the view V) in a part */
+static void hp_one(struct lio *io, uint64_t id, uint32_t part, bool last, uint32_t limit, const char *view, const char *zone) {
+    hp_send(io, id, part, last, limit, 1, &view, &zone);
+}
+static bool hp_fresh_is(struct lio *io, int n, const char *const *views, const char *const *zones) {   /* the complete list is exactly these entries, in this order */
+    if (!io->hot_ready || io->hot_fresh.n != (size_t)n) return false;
+    size_t pos = 0;
+    const char *v, *z;
+    for (int i = 0; i < n; i++) {
+        if (!kdb_hotl_next(&io->hot_fresh, &pos, &v, &z) || strcmp(v, views[i]) != 0 || strcmp(z, zones[i]) != 0) return false;
+    }
+    return !kdb_hotl_next(&io->hot_fresh, &pos, &v, &z);
+}
+static void hp_reset_ready(struct lio *io) {
+    io->hot_ready = false;
+    kdb_hotl_clear(&io->hot_fresh);
+}
+static void test_hot_part(void) {
+    printf("hot_part(): part order, the 1024 part limit, unknown views, the limit of part 0 (D1a step 7)\n");
+    struct lio *io = calloc(1, sizeof(*io));
+    io->cfg.views = calloc(2, sizeof(lview_t));
+    io->cfg.nviews = 2;
+    io->cfg.views[0].index = 0;
+    io->cfg.views[0].name = strdup("default");
+    io->cfg.views[1].index = 1;
+    io->cfg.views[1].name = strdup("v2");
+    kdb_hotl_init(&io->hot_asm);
+    kdb_hotl_init(&io->hot_fresh);
+    kdb_hotl_init(&io->hot_cur);
+
+    /* in order: the list is the parts one after the other */
+    {
+        const char *v[] = { "default", "v2", "default" }, *z[] = { "a.test.", "b.test.", "c.test." };
+        hp_one(io, 10, 0, false, 0, v[0], z[0]);
+        CHECK(io->hot_open && !io->hot_ready && io->hot_next == 1);
+        hp_one(io, 10, 1, false, 0, v[1], z[1]);
+        hp_one(io, 10, 2, true, 0, v[2], z[2]);
+        CHECK(hp_fresh_is(io, 3, v, z) && !io->hot_open && io->hot_fresh_id == 10 && !io->failed);
+        CHECK(io->hot_asm.n == 0);                                          /* (what was collected moved to the complete list) */
+    }
+    hp_reset_ready(io);
+
+    /* a part that skips one, repeats one, comes first, or belongs to another list: the list is lost, the stream is not */
+    {
+        hp_one(io, 11, 0, false, 0, "default", "a.test.");
+        hp_one(io, 11, 2, true, 0, "default", "c.test.");                   /* part 1 is missing */
+        CHECK(!io->hot_open && !io->hot_ready && io->hot_asm.n == 0 && !io->failed);
+        hp_one(io, 11, 3, true, 0, "default", "d.test.");                   /* ... and what follows does not start it again */
+        CHECK(!io->hot_open && !io->hot_ready && io->hot_asm.n == 0);
+
+        hp_one(io, 12, 0, false, 0, "default", "a.test.");
+        hp_one(io, 12, 1, false, 0, "default", "b.test.");
+        hp_one(io, 12, 1, true, 0, "default", "b.test.");                   /* part 1 twice */
+        CHECK(!io->hot_open && !io->hot_ready && io->hot_asm.n == 0);
+
+        hp_one(io, 13, 1, true, 0, "default", "b.test.");                   /* no part 0 */
+        CHECK(!io->hot_open && !io->hot_ready && io->hot_asm.n == 0);
+
+        hp_one(io, 14, 0, false, 0, "default", "a.test.");
+        hp_one(io, 15, 1, true, 0, "default", "b.test.");                   /* part 1 of another list */
+        CHECK(!io->hot_open && !io->hot_ready && io->hot_asm.n == 0 && !io->failed);
+
+        const char *v[] = { "default" }, *z[] = { "ok.test." };
+        hp_one(io, 16, 0, true, 0, v[0], z[0]);                              /* a new list starts clean after all that */
+        CHECK(hp_fresh_is(io, 1, v, z));
+    }
+    hp_reset_ready(io);
+
+    /* a part 0 in the middle of a list starts a new one: only the new entries are kept */
+    {
+        hp_one(io, 20, 0, false, 0, "default", "old1.test.");
+        hp_one(io, 20, 1, false, 0, "default", "old2.test.");
+        hp_one(io, 21, 0, false, 0, "default", "new.test.");
+        CHECK(io->hot_open && io->hot_asm.n == 1 && io->hot_next == 1);
+        hp_one(io, 21, 1, true, 0, "default", "new2.test.");
+        CHECK(io->hot_ready && io->hot_fresh.n == 2);
+    }
+    hp_reset_ready(io);
+
+    /* part 1024 is the last that is taken (a list of 1025 parts); part 1025 is not, whatever the list_id and the order */
+    {
+        bool ok = true;
+        for (uint32_t p = 0; p <= 1024; p++) {
+            hp_one(io, 30, p, p == 1024, 0, "default", "p.test.");
+            if (p < 1024 && (!io->hot_open || io->hot_next != p + 1)) ok = false;
+        }
+        CHECK(ok);
+        CHECK(io->hot_ready && io->hot_fresh.n == 1025 && !io->hot_open);
+        hp_reset_ready(io);
+        for (uint32_t p = 0; p <= 1025; p++) hp_one(io, 31, p, p == 1025, 0, "default", "p.test.");
+        CHECK(!io->hot_ready && !io->hot_open && io->hot_asm.n == 0 && !io->failed);       /* part 1025: the list is dropped */
+        hp_one(io, 32, 0, true, 0, "default", "after.test.");               /* the next list is taken */
+        CHECK(io->hot_ready && io->hot_fresh.n == 1);
+    }
+    hp_reset_ready(io);
+
+    /* views the CONFIG does not have: the entry is dropped and counted, the others are kept, also next to each other (the check remembers the last view) */
+    {
+        const char *v[] = { "default", "default", "nosuch", "default", "v2", "nosuch", "defaul", "default2", "V2", "v2" };
+        const char *z[] = { "1.test.", "2.test.", "3.test.", "4.test.", "5.test.", "6.test.", "7.test.", "8.test.", "9.test.", "10.test." };
+        hp_send(io, 40, 0, true, 0, 10, v, z);
+        const char *kv[] = { "default", "default", "default", "v2", "v2" }, *kz[] = { "1.test.", "2.test.", "4.test.", "5.test.", "10.test." };
+        CHECK(hp_fresh_is(io, 5, kv, kz));
+        CHECK_MSG(io->hot_dropped == 5, "dropped %u", (unsigned)io->hot_dropped);
+        hp_reset_ready(io);
+        const char *a[] = { "nosuch", "other" }, *b[] = { "x.test.", "y.test." };
+        hp_send(io, 41, 0, true, 0, 2, a, b);                                /* a list of nothing but unknown views is an empty complete list */
+        CHECK(io->hot_ready && io->hot_fresh.n == 0 && io->hot_dropped == 2);
+        hp_reset_ready(io);
+        io->hot_dropped = 0;
+        hp_one(io, 42, 0, false, 0, "nosuch", "x.test.");                    /* the count restarts with part 0 and goes on over the parts */
+        hp_one(io, 42, 1, true, 0, "nosuch2", "y.test.");
+        CHECK(io->hot_ready && io->hot_dropped == 2 && io->hot_fresh.n == 0);
+        hp_reset_ready(io);
+        size_t nv = io->cfg.nviews;
+        io->cfg.nviews = 0;                                                  /* no CONFIG yet: nothing is known */
+        hp_one(io, 43, 0, true, 0, "default", "x.test.");
+        CHECK(io->hot_ready && io->hot_fresh.n == 0 && io->hot_dropped == 1);
+        io->cfg.nviews = nv;
+        hp_reset_ready(io);
+    }
+
+    /* the limit is part 0's: a later part that says another one changes nothing, and one that says it when part 0 did not changes nothing either */
+    {
+        hp_one(io, 50, 0, false, 500, "default", "a.test.");
+        hp_one(io, 50, 1, false, 7, "default", "b.test.");
+        hp_one(io, 50, 2, true, 9999, "default", "c.test.");
+        CHECK(io->hot_ready && io->hot_fresh_limit == 500 && io->hot_limit == 500);
+        hp_reset_ready(io);
+        hp_one(io, 51, 0, false, 0, "default", "a.test.");
+        hp_one(io, 51, 1, true, 9, "default", "b.test.");
+        CHECK(io->hot_ready && io->hot_fresh_limit == 0);
+        hp_reset_ready(io);
+        hp_one(io, 52, 0, true, 123, "default", "a.test.");                 /* a list of one part with a limit */
+        CHECK(io->hot_ready && io->hot_fresh_limit == 123);
+        hp_one(io, 53, 0, true, 0, "default", "a.test.");                   /* the next list has none: the old limit is not kept */
+        CHECK(io->hot_ready && io->hot_fresh_limit == 0);
+    }
+
+    kdb_hotl_free(&io->hot_asm);
+    kdb_hotl_free(&io->hot_fresh);
+    kdb_hotl_free(&io->hot_cur);
+    free(io->cfg.views[0].name);
+    free(io->cfg.views[1].name);
+    free(io->cfg.views);
+    free(io);
+}
+
 static void test_check_mode(void) {
     printf("check mode (B12)\n");
     char path[500];
@@ -2340,6 +2510,7 @@ int main(int argc, char **argv) {
     test_requests_batch();
     test_server_id();
     test_status_entry();
+    test_hot_part();
     test_check_mode();
     test_scan_failures();
     test_profiles_and_views();

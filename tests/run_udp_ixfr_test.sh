@@ -110,11 +110,12 @@ else
     FAILED=$((FAILED + 1))
 fi
 
-# Test 4: UDP IXFR without the key -> REFUSED (allow-transfer applies to UDP IXFR), no SOA
+# Test 4: UDP IXFR without the key -> REFUSED (allow-transfer applies to UDP IXFR), no records.  The rcode of the answer is what is checked (tests/db/udp_ixfr_probe.pl:
+# an IXFR question with the client's SOA over UDP, RFC 1995 4.2); the text dag prints for a transfer that failed says nothing about the rcode.
 echo -n "[Test 4] UDP IXFR without the zone's TSIG key (IXFR=$CURRENT_SERIAL, +udp +notcp) ... "
-OUT_REFUSED=$($DAG example.com "IXFR=$CURRENT_SERIAL" @127.0.0.1 -p $PORT +udp +notcp +ignore +nohexdump 2>&1 || true)
+OUT_REFUSED=$(perl "$DIR/db/udp_ixfr_probe.pl" 127.0.0.1 "$PORT" example.com "$CURRENT_SERIAL" 2>&1 || true)
 check_asan_log
-if echo "$OUT_REFUSED" | grep -q "Transfer failed" && ! echo "$OUT_REFUSED" | grep -q "SOA.*$CURRENT_SERIAL"; then
+if echo "$OUT_REFUSED" | grep -q "^rcode=5 .* an=0 ns=0 "; then
     echo "OK (the transfer is refused, no SOA)"
 else
     echo "FAIL (Expected a refused transfer)"

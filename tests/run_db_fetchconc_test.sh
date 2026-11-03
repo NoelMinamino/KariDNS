@@ -51,6 +51,10 @@ INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'ns1.' || name, 'A', '192.0.2.53', 600, 0, 0 FROM domains;
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
   SELECT id, 'www.' || name, 'A', printf('192.0.2.%d', (CAST(substr(name, 2, 4) AS INTEGER) % 200) + 1), 300, 0, 0 FROM domains;
+-- ... and 100 more addresses in each zone, so that the zones together are well over 1 MB (the stress at the end runs with memory-limit 1M)
+WITH RECURSIVE m(j) AS (SELECT 0 UNION ALL SELECT j + 1 FROM m WHERE j < 99)
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
+  SELECT d.id, 'h' || m.j || '.' || d.name, 'A', '10.0.' || (m.j % 250 + 1) || '.1', 300, 0, 0 FROM domains d, m;
 SQL
 chown -R nobody "$T/db"; chmod 600 "$T/db/z.db"*
 install -o root -g wheel -m 755 "$LOADER" "$T/karidns-dbloader" 2>/dev/null || { cp "$LOADER" "$T/karidns-dbloader"; chown 0:0 "$T/karidns-dbloader"; chmod 755 "$T/karidns-dbloader"; }
@@ -60,12 +64,12 @@ key "karictl" { algorithm hmac-sha256; secret "$SECRET"; };
 EOF
 chmod 600 "$T/karictl.conf"
 KCTL="./karictl -c $T/karictl.conf"
-conf() {   # conf "EXTRA database statements"
+conf() {   # conf "EXTRA database statements" [MEMORY-LIMIT]
     cat > "$T/k.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT; notify no;
     database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; fetch-rate 5000; park-timeout 4000;
-               acl-ceiling { 127.0.0.1; }; memory-limit 64m; $1 };
+               acl-ceiling { 127.0.0.1; }; memory-limit ${2:-64m}; $1 };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
 EOF
@@ -80,6 +84,7 @@ start_srv() {
     sleep 1
 }
 conc() { $KCTL dbstatus 2>/dev/null | grep '^fetch:' | sed -n 's/.* concurrency=\([0-9]*\).*/\1/p' | tail -1; }
+q_one() { ./dag @127.0.0.1 -p "$PORT" "$1" A +short +nohexdump +time=10 +tries=1 2>/dev/null | head -1; }
 shed() { $KCTL dbstatus 2>/dev/null | sed -n 's/.* shed=\([0-9]*\) .*/\1/p' | tail -1; }
 burst() {   # burst OUTFILE: one query for www.<zone> of every zone, 60 at a time; "name answer" per line
     perl -e 'for $i (0..'"$((NZ - 1))"') { printf "www.c%04d.test\n", $i }' > "$T/names"
@@ -114,6 +119,38 @@ burst "$T/out"
 S1=$(shed)
 [ "${S1:-0}" = "0" ] && pass "nothing was shed" || fail "shed=$S1"
 if cmp -s "$T/out" "$T/expected"; then pass "all $NZ answers are the right ones (the zones of the loader's workers did not mix)"; else fail "wrong or missing answers: $(diff "$T/expected" "$T/out" | head -5 | tr '\n' ' ')"; fi
+grep -q "fetch worker\|protocol error" "$T/srv.log" && fail "the log mentions a worker or a protocol error: $(grep 'fetch worker\|protocol error' "$T/srv.log" | head -2)" || pass "no worker or protocol error in the log"
+grep -q "AddressSanitizer\|runtime error:\|ThreadSanitizer" "$T/srv.log" 2>/dev/null && fail "sanitizer report in the server log" || pass "no sanitizer report in the server log"
+stop_srv
+
+# A stress of the loader's pool of fetch workers: the zones do not fit memory-limit, so the cache manager takes zones out while the bursts ask for them again (each
+# one a new fetch for a worker), and reloads of the main loop run next to the workers.  Short (FETCHCONC_STRESS_ROUNDS, default 3); tests/run_rcu_tsan_test.sh runs
+# the test with the TSan builds of the server and of the loader.
+echo "== stress: bursts over the pool of fetch workers while zones are taken out of memory and the loader reloads"
+conf "loader-threads 4;" 1m
+start_srv
+RND=${FETCHCONC_STRESS_ROUNDS:-3}
+r=0; WRONG=0; RIGHT=0; TOTAL=0
+while [ $r -lt "$RND" ]; do
+    ( $KCTL reload > /dev/null 2>&1; $KCTL reload > /dev/null 2>&1 ) &
+    RLP=$!
+    perl -e 'for $i (0..'"$((NZ - 1))"') { printf "www.c%04d.test\n", ($i * 7 + '"$r"') % '"$NZ"' }' > "$T/names"
+    xargs -P 12 -n 1 sh -c 'echo "$0 $(./dag @127.0.0.1 -p '"$PORT"' "$0" A +short +nohexdump +time=15 +tries=1 2>/dev/null | head -1)"' < "$T/names" | sort > "$T/outs"
+    wait "$RLP"
+    # under this load a query may be shed or time out (SERVFAIL, no address): that is allowed; an address of another zone is not
+    join "$T/expected" "$T/outs" > "$T/joined"
+    WRONG=$((WRONG + $(awk 'NF == 3 && $3 != $2 { n++ } END { print n + 0 }' "$T/joined")))
+    RIGHT=$((RIGHT + $(awk 'NF == 3 && $3 == $2 { n++ } END { print n + 0 }' "$T/joined")))
+    TOTAL=$((TOTAL + NZ))
+    r=$((r + 1))
+done
+echo "  $RIGHT of $TOTAL queries got their address, $WRONG got another one"
+[ "$WRONG" -eq 0 ] && pass "no query got the address of another zone (zones in flight on four workers, taken out and read again)" || fail "$WRONG answers with the data of another zone"
+[ "$RIGHT" -ge $((TOTAL / 4)) ] && pass "a good part of the queries was answered ($RIGHT of $TOTAL) although the zones do not fit memory-limit" || fail "only $RIGHT of $TOTAL queries were answered"
+EVS=$($KCTL dbstatus 2>/dev/null | grep '^cache:' | head -1 | sed -n 's/.* evictions=\([0-9]*\).*/\1/p')
+[ "${EVS:-0}" -gt 0 ] && pass "the cache manager took zones out during the bursts ($EVS evictions): the workers had zones to read again" || fail "no evictions: the stress did not churn the cache"
+i=0; while [ $i -lt 100 ] && [ "$(q_one www.c0001.test)" != "192.0.2.2" ]; do sleep 0.1; i=$((i + 1)); done
+[ "$(q_one www.c0001.test)" = "192.0.2.2" ] && pass "the server goes on answering" || fail "no answer after the stress"
 grep -q "fetch worker\|protocol error" "$T/srv.log" && fail "the log mentions a worker or a protocol error: $(grep 'fetch worker\|protocol error' "$T/srv.log" | head -2)" || pass "no worker or protocol error in the log"
 grep -q "AddressSanitizer\|runtime error:\|ThreadSanitizer" "$T/srv.log" 2>/dev/null && fail "sanitizer report in the server log" || pass "no sanitizer report in the server log"
 stop_srv

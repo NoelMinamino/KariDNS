@@ -387,6 +387,16 @@ db_fetch_test: test_db_fetch
 test_db_fetch-tsan: $(TEST_DB_FETCH_SRCS)
 	$(CC) $(TSAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DB_FETCH_SRCS) -o $@ $(TSAN_LDFLAGS) -lcrypto -lpthread -lm
 
+# the zone directory registry, the stream reader and the PowerDNS reader also run under ThreadSanitizer (tests/run_rcu_tsan_test.sh part 1c)
+test_db_registry-tsan: $(TEST_DB_REGISTRY_SRCS)
+	$(CC) $(TSAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DB_REGISTRY_SRCS) -o $@ $(TSAN_LDFLAGS) -lcrypto -lpthread -lm
+
+test_db_stream-tsan: $(TEST_DBSTREAM_SRCS)
+	$(CC) $(TSAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DBSTREAM_SRCS) -o $@ $(TSAN_LDFLAGS) -lcrypto -lpthread -lm
+
+test_pdns_reader-tsan: $(TEST_PDNS_READER_SRCS)
+	$(CC) $(TSAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_PDNS_READER_SRCS) -o $@ $(TSAN_LDFLAGS) -lcrypto -lpthread -lm
+
 # a worker parks a UDP query for a zone that is not in memory and answers it later (udp_one(), park_service() of dns_server_core.c)
 TEST_PARK_WORKER_SRCS = $(TEST_SERVER_CORE_SRCS:tests/test_server_core.c=tests/test_park_worker.c)
 
@@ -1263,7 +1273,7 @@ clean: clean-fuzz coverage-clean
 	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck bench_serialize bench_rrl $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
 	@# karicheck's objects outside $(OBJS): an uninstrumented copy left here would be linked into the coverage build
 	rm -f dns_zone_lint.o dns_db_checkproto.o
-	rm -f karidns-asan karidns-tsan karidns-evict *.ev.o test_epoch_rcu-tsan test_zone_dir-tsan test_zone_dir test_park-tsan test_db_fetch-tsan test_park_worker-tsan test_park test_db_fetch test_park_worker *.asan.o *.tsan.o test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_stream test_pdns_reader test_presigned test_db_supervisor test_db_sqlite3 test_db_registry test_db_pgsql karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan tests/db/zone2sql tests/db/zone2kdb
+	rm -f karidns-asan karidns-tsan karidns-evict *.ev.o test_epoch_rcu-tsan test_zone_dir-tsan test_zone_dir test_park-tsan test_db_fetch-tsan test_park_worker-tsan test_db_registry-tsan test_db_stream-tsan test_pdns_reader-tsan test_park test_db_fetch test_park_worker *.asan.o *.tsan.o test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_stream test_pdns_reader test_presigned test_db_supervisor test_db_sqlite3 test_db_registry test_db_pgsql karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan tests/db/zone2sql tests/db/zone2kdb
 	rm -f $(UT_ASAN_BINS)
 	rm -f *.uta.o *.utn.o tests/*.uta.o tests/*.utn.o tools/*.uta.o tools/*.utn.o
 	rm -f tests/fi/kari_fi_preload.so
