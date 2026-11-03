@@ -208,7 +208,7 @@ for ip in $IPS; do
     ok=0
     for i in 1 2 3 4 5 6 7 8 9 10; do
         if "$DAG_BIN" @"$ip" -p "$PORT" . SOA +norec +short +time=1 >/dev/null 2>&1; then ok=1; break; fi
-        if "$DAG_BIN" @"$ip" -p "$PORT" unrelated.alt SOA +norec +short +time=1 2>/dev/null | grep -q .; then ok=1; break; fi
+        if "$DAG_BIN" @"$ip" -p "$PORT" unrelated.alt SOA +norec +short +time=1 2>/dev/null | grep -q "^[^;]"; then ok=1; break; fi
         sleep 0.3
     done
     if [ "$ok" != 1 ]; then

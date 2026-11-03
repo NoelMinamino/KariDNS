@@ -303,7 +303,7 @@ if wait_answer $PP txt.test; then
         [ "$N" = "60" ] && ok "I5: a secondary took the zone by AXFR and serves all 60 strings" || bad "I5: the secondary serves $N strings" "$(cat "$T/sec.out" | tail -5)"
     else bad "I5: the secondary did not take the zone (a TXT with more than 48 strings used to refuse the transfer)" "$(tail -8 "$T/sec.out")"; fi
     sleep 1
-    if ./dag @127.0.0.1 -p $LP txt.test SOA +short +nohexdump 2>/dev/null | grep -q .; then bad "I2: a secondary with max-zone-records 10 took a zone of 36 records"
+    if ./dag @127.0.0.1 -p $LP txt.test SOA +short +nohexdump 2>/dev/null | grep -q "^[^;]"; then bad "I2: a secondary with max-zone-records 10 took a zone of 36 records"
     else ok "I2: a secondary with max-zone-records 10 did not take a zone of 36 records"; fi
 else
     bad "the primary did not start" "$(tail -8 "$T/pri.out")"

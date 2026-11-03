@@ -75,7 +75,7 @@ wait_more() { # FILE LINES [SECONDS] : the file has more than LINES lines
 wait_up() { # PORT [SECONDS] : the server answers
     _i=0
     while [ $_i -lt "${2:-15}" ]; do
-        "$DAG" @127.0.0.1 -p "$1" pri.test SOA +short +nohexdump +time=1 +tries=1 2>/dev/null | grep -q . && return 0
+        "$DAG" @127.0.0.1 -p "$1" pri.test SOA +short +nohexdump +time=1 +tries=1 2>/dev/null | grep -q "^[^;]" && return 0
         sleep 1; _i=$((_i + 1))
     done
     return 1
