@@ -117,7 +117,7 @@ for key in 'port 953' 'secrt "dGVzdA=="'; do
     case "$out" in "ERROR configuration not applied: "*) pass "reload reply";; *) fail "reload reply: $out";; esac
     [ "$(answer www.a.example)" = "192.0.2.10" ] && pass "old configuration still answers" || fail "no answer after refused reload"
     kname=${key%% *}
-    grep -q "control-channel: unknown option '$kname' (supported: socket, secret, algorithm)" "$TMP_DIR/karidns.log" && pass "log names the key '$kname'" || fail "log does not name '$kname'"
+    grep -q "control-channel: unknown option '$kname' (supported: socket, secret, algorithm, allow-group, keys)" "$TMP_DIR/karidns.log" && pass "log names the key '$kname'" || fail "log does not name '$kname'"
     # a new server with that configuration does not start
     sed "s/^options { port $PORT;/options { port $((PORT + 2));/" "$TMP_DIR/karidns.conf" | sed "s|socket \"$CTRL_SOCK\"|socket \"$TMP_DIR/bad.sock\"|" > "$TMP_DIR/bad.conf"
     "$KARIDNS" -f "$TMP_DIR/bad.conf" > "$TMP_DIR/bad.log" 2>&1 &

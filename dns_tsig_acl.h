@@ -128,6 +128,10 @@ bool zone_update_acl_allows_in_view(const server_config_t *cfg, const zone_confi
 bool db_ceiling_allows_address(const server_config_t *cfg, const char *client_ip);
 /* 鍵名 (DNS 名) が同じか。大文字小文字と末尾のドットは区別しない (RFC 4343 §2、D-03) */
 bool tsig_key_names_equal(const char *a, const char *b);
+/* Is the TSIG key key used anywhere in cfg as a TSIG key: allow-query / -transfer / -update / -notify and match-clients (zone, view, options, acl
+ * blocks), a zone tsig-key, primaries / also-notify / remote-servers entries, server { keys }, update-policy, database acl-ceiling?  Writes a
+ * description of the first use to where ("zone 'example.test' allow-transfer"). */
+bool config_tsig_key_used(const server_config_t *cfg, const char *key, char *where, size_t wsz);
 
 /* 要求の TSIG を調べた結果 (RFC 8945 §5.2)。サーバーは全ての応答をこの結果で仕上げる。 */
 typedef enum {

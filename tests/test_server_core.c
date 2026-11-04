@@ -1660,6 +1660,304 @@ static void test_control_socket_thread_and_commands(void) {
 }
 
 // ----------------------------------------------------------------------------
+// 14b. Restricted control keys (control-channel { keys { } }): authentication over several keys and the permission of each command
+// ----------------------------------------------------------------------------
+bool ctrl_auth_match(const server_config_t *cfg, const char *challenge, const char *client_hmac, char *name_out, size_t name_sz,
+                     uint32_t *perm_out);
+void ctrl_log_text(const char *line, char *out, size_t out_sz);
+
+static void test_hmac_hex(const EVP_MD *md, const char *secret, const char *challenge, char *hex, size_t hex_sz) {
+    unsigned char mac[EVP_MAX_MD_SIZE];
+    unsigned int mac_len = 0;
+    HMAC(md, secret, strlen(secret), (const unsigned char *)challenge, 64, mac, &mac_len);
+    assert(hex_sz > 2 * mac_len);
+    for (unsigned int k = 0; k < mac_len; k++) snprintf(&hex[k * 2], 3, "%02x", mac[k]);
+}
+
+/* connects, answers the challenge with HMAC(md, secret) and returns the descriptor after "OK", or -1 (AUTH_FAILED) */
+static int test_ctrl_login(const struct sockaddr_un *sun, const EVP_MD *md, const char *secret) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    test_set_io_timeout(fd, 5);
+    assert(connect(fd, (const struct sockaddr *)sun, sizeof(*sun)) == 0);
+    char rbuf[256];
+    ssize_t n = recv(fd, rbuf, sizeof(rbuf) - 1, 0);
+    assert(n > 10 && strncmp(rbuf, "CHALLENGE ", 10) == 0);
+    char challenge[65], hex[2 * EVP_MAX_MD_SIZE + 1], line[2 * EVP_MAX_MD_SIZE + 16];
+    memcpy(challenge, rbuf + 10, 64);
+    challenge[64] = '\0';
+    test_hmac_hex(md, secret, challenge, hex, sizeof(hex));
+    int ll = snprintf(line, sizeof(line), "AUTH %s\n", hex);
+    send(fd, line, (size_t)ll, 0);
+    n = recv(fd, rbuf, sizeof(rbuf) - 1, 0);
+    if (n >= 3 && strncmp(rbuf, "OK\n", 3) == 0) return fd;
+    close(fd);
+    return -1;
+}
+
+/* one command on an open connection; the reply is the first chunk the server sends */
+static void test_ctrl_send(int fd, const char *cmd, char *out, size_t out_sz) {
+    send(fd, cmd, strlen(cmd), 0);
+    ssize_t n = recv(fd, out, out_sz - 1, 0);
+    out[n > 0 ? n : 0] = '\0';
+}
+
+/* a fresh connection for one command (the connection is closed by the server after an accepted command) */
+static void test_ctrl_once(const struct sockaddr_un *sun, const EVP_MD *md, const char *secret, const char *cmd, char *out, size_t out_sz) {
+    int fd = test_ctrl_login(sun, md, secret);
+    assert(fd >= 0);
+    test_ctrl_send(fd, cmd, out, out_sz);
+    close(fd);
+}
+
+static void test_control_restricted_keys(void) {
+    printf("[TEST] Server Core: control-channel keys (authentication over several keys, permission of each command)...\n");
+
+    /* the algorithm of every key is its own, and the key found by the HMAC decides the permission */
+    server_config_t mock_cfg;
+    memset(&mock_cfg, 0, sizeof(mock_cfg));
+    mock_cfg.control.enabled = true;
+    const char *main_secret = "main_secret_value", *admin_secret = "admin_secret_value", *web_secret = "web_secret_value", *ro_secret = "ro_secret_value";
+    memcpy(mock_cfg.control.secret_decoded, main_secret, strlen(main_secret));
+    mock_cfg.control.secret_decoded_len = strlen(main_secret);
+    control_key_t keys[3];
+    memset(keys, 0, sizeof(keys));
+    keys[0].name = "admin";
+    keys[0].algorithm = "hmac-sha256";
+    keys[0].perm = CTLP_FULL;
+    memcpy(keys[0].secret_decoded, admin_secret, strlen(admin_secret));
+    keys[0].secret_decoded_len = strlen(admin_secret);
+    keys[1].name = "web";
+    keys[1].algorithm = "hmac-sha512";
+    keys[1].perm = CTLP_READ | CTLP_RELOAD_ZONE;
+    memcpy(keys[1].secret_decoded, web_secret, strlen(web_secret));
+    keys[1].secret_decoded_len = strlen(web_secret);
+    keys[2].name = "ro";
+    keys[2].algorithm = "hmac-sha256";
+    keys[2].perm = CTLP_READ;
+    memcpy(keys[2].secret_decoded, ro_secret, strlen(ro_secret));
+    keys[2].secret_decoded_len = strlen(ro_secret);
+    mock_cfg.control.keys = keys;
+    mock_cfg.control.nkeys = 3;
+
+    /* ctrl_auth_match(): the key whose HMAC arrives, with its own algorithm; nothing else matches */
+    {
+        const char *chal = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        char hex[2 * EVP_MAX_MD_SIZE + 1], nm[128] = "";
+        uint32_t perm = 0;
+        test_hmac_hex(EVP_sha256(), main_secret, chal, hex, sizeof(hex));
+        assert(ctrl_auth_match(&mock_cfg, chal, hex, nm, sizeof(nm), &perm) && strcmp(nm, "(main)") == 0 && perm == CTLP_FULL);
+        test_hmac_hex(EVP_sha256(), admin_secret, chal, hex, sizeof(hex));
+        assert(ctrl_auth_match(&mock_cfg, chal, hex, nm, sizeof(nm), &perm) && strcmp(nm, "admin") == 0 && perm == CTLP_FULL);
+        test_hmac_hex(EVP_sha512(), web_secret, chal, hex, sizeof(hex));
+        assert(ctrl_auth_match(&mock_cfg, chal, hex, nm, sizeof(nm), &perm) && strcmp(nm, "web") == 0 && perm == (CTLP_READ | CTLP_RELOAD_ZONE));
+        test_hmac_hex(EVP_sha256(), ro_secret, chal, hex, sizeof(hex));
+        assert(ctrl_auth_match(&mock_cfg, chal, hex, nm, sizeof(nm), &perm) && strcmp(nm, "ro") == 0 && perm == CTLP_READ);
+        /* web's secret with sha256 (its key says sha512), a made-up value, an empty AUTH, a prefix of a good one */
+        test_hmac_hex(EVP_sha256(), web_secret, chal, hex, sizeof(hex));
+        assert(!ctrl_auth_match(&mock_cfg, chal, hex, nm, sizeof(nm), &perm));
+        assert(!ctrl_auth_match(&mock_cfg, chal, "00112233", nm, sizeof(nm), &perm));
+        assert(!ctrl_auth_match(&mock_cfg, chal, "", nm, sizeof(nm), &perm));
+        test_hmac_hex(EVP_sha256(), ro_secret, chal, hex, sizeof(hex));
+        hex[63] = '\0';
+        assert(!ctrl_auth_match(&mock_cfg, chal, hex, nm, sizeof(nm), &perm));
+        /* only keys, no unnamed secret: the keys still work (the old test needed a secret) */
+        mock_cfg.control.secret_decoded_len = 0;
+        test_hmac_hex(EVP_sha256(), main_secret, chal, hex, sizeof(hex));
+        assert(!ctrl_auth_match(&mock_cfg, chal, hex, nm, sizeof(nm), &perm));
+        test_hmac_hex(EVP_sha256(), admin_secret, chal, hex, sizeof(hex));
+        assert(ctrl_auth_match(&mock_cfg, chal, hex, nm, sizeof(nm), &perm) && strcmp(nm, "admin") == 0);
+        /* a key with an unknown algorithm (never accepted by the parser) fails closed */
+        keys[0].algorithm = "hmac-unknown";
+        assert(!ctrl_auth_match(&mock_cfg, chal, hex, nm, sizeof(nm), &perm));
+        keys[0].algorithm = "hmac-sha256";
+        mock_cfg.control.secret_decoded_len = strlen(main_secret);
+        /* the control channel is not enabled: nobody */
+        mock_cfg.control.enabled = false;
+        test_hmac_hex(EVP_sha256(), admin_secret, chal, hex, sizeof(hex));
+        assert(!ctrl_auth_match(&mock_cfg, chal, hex, nm, sizeof(nm), &perm));
+        mock_cfg.control.enabled = true;
+        /* no secret and no key: nobody, not even an empty HMAC */
+        server_config_t none;
+        memset(&none, 0, sizeof(none));
+        none.control.enabled = true;
+        assert(!ctrl_auth_match(&none, chal, hex, nm, sizeof(nm), &perm));
+        assert(!ctrl_auth_match(NULL, chal, hex, nm, sizeof(nm), &perm));
+    }
+    {   /* what reaches the log: printable ASCII, at most 120 bytes */
+        char lt[128];
+        ctrl_log_text("reload exa\x01mple\x7f.test\xff", lt, sizeof(lt));
+        assert(strcmp(lt, "reload exa?mple?.test?") == 0);
+        char longline[400];
+        memset(longline, 'a', sizeof(longline) - 1);
+        longline[sizeof(longline) - 1] = '\0';
+        ctrl_log_text(longline, lt, sizeof(lt));
+        assert(strlen(lt) == 120);
+        ctrl_log_text(longline, lt, 8);
+        assert(strlen(lt) == 7);
+    }
+
+    char sock_path[256];
+    snprintf(sock_path, sizeof(sock_path), "/tmp/karidns_test_ctrlkeys_%ld.sock", (long)getpid());
+    unlink(sock_path);
+    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(lfd >= 0);
+    struct sockaddr_un sun;
+    memset(&sun, 0, sizeof(sun));
+    sun.sun_family = AF_UNIX;
+    strncpy(sun.sun_path, sock_path, sizeof(sun.sun_path) - 1);
+    assert(bind(lfd, (struct sockaddr *)&sun, sizeof(sun)) == 0);
+    assert(listen(lfd, 8) == 0);
+    g_control_sock = lfd;
+
+    zone_db_entry_t z_master;
+    memset(&z_master, 0, sizeof(z_master));
+    strlcpy(z_master.domain, "example.com.", sizeof(z_master.domain));
+    strlcpy(z_master.view_name, "default", sizeof(z_master.view_name));
+    atomic_init(&z_master.serial, 2026091901);
+    atomic_init(&z_master.refresh, 3600);
+    zone_db_entry_t z_slave;
+    memset(&z_slave, 0, sizeof(z_slave));
+    strlcpy(z_slave.domain, "slave.example.", sizeof(z_slave.domain));
+    strlcpy(z_slave.view_name, "default", sizeof(z_slave.view_name));
+    z_slave.is_secondary = true;
+    atomic_init(&z_slave.serial, 100);
+    atomic_init(&z_slave.refresh, 1800);
+    zone_db_entry_t *entries[2] = {&z_master, &z_slave};
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view_set_entries(&view, entries, 2);
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+    atomic_init(&snap.reader_count, 1);
+    zone_config_t zc_master, zc_slave;
+    memset(&zc_master, 0, sizeof(zc_master));
+    memset(&zc_slave, 0, sizeof(zc_slave));
+    zc_master.domain = "example.com.";
+    zc_master.type = "master";
+    zc_slave.domain = "slave.example.";
+    zc_slave.type = "slave";
+    zc_master.next = &zc_slave;
+    view_config_t vc;
+    memset(&vc, 0, sizeof(vc));
+    vc.name = "default";
+    vc.zones = &zc_master;
+    mock_cfg.views = &vc;
+    atomic_store_explicit(&g_config_db.active, &mock_cfg, memory_order_release);
+    atomic_store_explicit(&g_zone_db_active, &snap, memory_order_release);
+
+    bool saved_drop = atomic_load(&g_privilege_drop_complete);
+    atomic_store(&g_privilege_drop_complete, true);
+    pthread_t th;
+    assert(pthread_create(&th, NULL, control_thread_func, NULL) == 0);
+    usleep(10000);
+
+    char out[2048];
+    const char *refused_web = "ERROR command not allowed for key \"web\"\n";
+
+    /* full keys: the unnamed secret and "admin" run everything; an unknown command and rollback (not built yet) are answered as before */
+    test_ctrl_once(&sun, EVP_sha256(), main_secret, "notify example.com.\n", out, sizeof(out));
+    assert(strcmp(out, "OK\n") == 0);
+    test_ctrl_once(&sun, EVP_sha256(), admin_secret, "retransfer slave.example.\n", out, sizeof(out));
+    assert(strcmp(out, "OK\n") == 0);
+    test_ctrl_once(&sun, EVP_sha256(), admin_secret, "reload slave.example.\n", out, sizeof(out));
+    assert(strcmp(out, "OK reloaded (slave)\n") == 0);
+    test_ctrl_once(&sun, EVP_sha256(), admin_secret, "rollback example.com.\n", out, sizeof(out));
+    assert(strcmp(out, "ERROR unknown command\n") == 0);
+    test_ctrl_once(&sun, EVP_sha256(), admin_secret, "bogus\n", out, sizeof(out));
+    assert(strcmp(out, "ERROR unknown command\n") == 0);
+
+    /* "web": read-only commands and reload <zone> only */
+    test_ctrl_once(&sun, EVP_sha512(), web_secret, "status\n", out, sizeof(out));
+    assert(strncmp(out, "OK ", 3) == 0);
+    test_ctrl_once(&sun, EVP_sha512(), web_secret, "zonestatus example.com.\n", out, sizeof(out));
+    assert(strncmp(out, "OK serial=", 10) == 0);
+    test_ctrl_once(&sun, EVP_sha512(), web_secret, "observatory\n", out, sizeof(out));
+    assert(strncmp(out, "OK 2\n", 5) == 0);
+    test_ctrl_once(&sun, EVP_sha512(), web_secret, "dbstatus\n", out, sizeof(out));
+    assert(strncmp(out, "ERROR no database block", 23) == 0);          /* allowed: it reached the command */
+    test_ctrl_once(&sun, EVP_sha512(), web_secret, "reload slave.example.\n", out, sizeof(out));
+    assert(strcmp(out, "OK reloaded (slave)\n") == 0);
+    atomic_store_explicit(&z_master.notify_now, false, memory_order_relaxed);
+    atomic_store_explicit(&z_slave.refresh_now, false, memory_order_relaxed);
+    static const char *const web_refused[] = { "reload\n", "reconfig\n", "stop\n", "notify example.com.\n", "retransfer slave.example.\n",
+                                               "rollback example.com.\n", "bogus\n", "evict x.test\n", "xfr-delay 5\n" };
+    for (size_t i = 0; i < sizeof(web_refused) / sizeof(web_refused[0]); i++) {
+        test_ctrl_once(&sun, EVP_sha512(), web_secret, web_refused[i], out, sizeof(out));
+        assert(strcmp(out, refused_web) == 0);
+    }
+    assert(!atomic_load_explicit(&z_master.notify_now, memory_order_relaxed) && !atomic_load_explicit(&z_slave.refresh_now, memory_order_relaxed));   /* nothing ran */
+
+    /* "ro": read-only, and reload <zone> is refused */
+    test_ctrl_once(&sun, EVP_sha256(), ro_secret, "zonestatus example.com.\n", out, sizeof(out));
+    assert(strncmp(out, "OK serial=", 10) == 0);
+    test_ctrl_once(&sun, EVP_sha256(), ro_secret, "reload slave.example.\n", out, sizeof(out));
+    assert(strcmp(out, "ERROR command not allowed for key \"ro\"\n") == 0);
+
+    /* the wrong algorithm for a key and an unknown secret are refused at login */
+    assert(test_ctrl_login(&sun, EVP_sha256(), web_secret) == -1);
+    assert(test_ctrl_login(&sun, EVP_sha512(), "nobody_has_this") == -1);
+
+    /* a refusal keeps the connection open: the same client can still run what it is allowed to (the connection ends after that) */
+    {
+        int fd = test_ctrl_login(&sun, EVP_sha512(), web_secret);
+        assert(fd >= 0);
+        test_ctrl_send(fd, "stop\n", out, sizeof(out));
+        assert(strcmp(out, refused_web) == 0);
+        test_ctrl_send(fd, "reconfig\n", out, sizeof(out));
+        assert(strcmp(out, refused_web) == 0);
+        test_ctrl_send(fd, "zonestatus example.com.\n", out, sizeof(out));
+        assert(strncmp(out, "OK serial=", 10) == 0);
+        assert(recv(fd, out, sizeof(out), 0) == 0);          /* an accepted command ends the connection, as before */
+        close(fd);
+    }
+
+    /* the permission is copied when the client logs in: a reconfig (here: the key now has full power) does not change an open connection */
+    {
+        int fd = test_ctrl_login(&sun, EVP_sha512(), web_secret);
+        assert(fd >= 0);
+        keys[1].perm = CTLP_FULL;
+        test_ctrl_send(fd, "reload\n", out, sizeof(out));
+        assert(strcmp(out, refused_web) == 0);
+        close(fd);
+        test_ctrl_once(&sun, EVP_sha512(), web_secret, "retransfer slave.example.\n", out, sizeof(out));   /* a new login sees the new mask */
+        assert(strcmp(out, "OK\n") == 0);
+        keys[1].perm = CTLP_READ | CTLP_RELOAD_ZONE;
+    }
+
+    test_stop_thread(th);
+    atomic_store(&g_privilege_drop_complete, saved_drop);
+    close(lfd);
+    unlink(sock_path);
+    g_control_sock = -1;
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
+    atomic_store_explicit(&g_zone_db_active, NULL, memory_order_release);
+    printf("  -> control-channel keys passed.\n");
+}
+
+bool ctrl_peer_admitted(uid_t peer_uid, const gid_t *groups, int ngroups, uid_t my_uid, bool have_gid, gid_t allow_gid);
+
+/* control-channel allow-group: who may connect (the HMAC challenge follows for everybody) */
+static void test_control_peer_admission(void) {
+    printf("[TEST] Server Core: control socket admission (uid, root, allow-group)...\n");
+    const gid_t g1[] = { 100, 200, 300 };
+    assert(ctrl_peer_admitted(1001, g1, 3, 1001, false, 0));          /* the server's own user */
+    assert(ctrl_peer_admitted(0, g1, 0, 1001, false, 0));             /* root */
+    assert(!ctrl_peer_admitted(2002, g1, 3, 1001, false, 0));         /* another user, no allow-group */
+    assert(!ctrl_peer_admitted(2002, g1, 3, 1001, true, 400));        /* allow-group the peer is not in */
+    assert(ctrl_peer_admitted(2002, g1, 3, 1001, true, 100));         /* the first group */
+    assert(ctrl_peer_admitted(2002, g1, 3, 1001, true, 300));         /* a supplementary group: the last one counts too */
+    assert(!ctrl_peer_admitted(2002, g1, 0, 1001, true, 100));        /* no groups at all */
+    assert(!ctrl_peer_admitted(2002, NULL, 3, 1001, true, 100));
+    assert(ctrl_peer_admitted(2002, g1, 3, 1001, true, 100) && !ctrl_peer_admitted(2002, g1, 3, 1001, false, 100));   /* a gid is not enough when none is configured */
+    assert(!ctrl_peer_admitted(2002, g1, 3, 0, true, 999));
+    printf("  -> admission passed.\n");
+}
+
+// ----------------------------------------------------------------------------
 // 15. open_router_udp_sockets & setup_udp_socket_buffers Test
 // ----------------------------------------------------------------------------
 // ----------------------------------------------------------------------------
@@ -6297,6 +6595,8 @@ int main(void) {
     test_logev_helpers();
     test_event_ring_and_logger();
     test_control_socket_thread_and_commands();
+    test_control_restricted_keys();
+    test_control_peer_admission();
     test_open_router_udp_sockets_and_buffers();
     test_sendmmsg_skip_failed();
     test_tcp_listen_and_zone_socket_opts();

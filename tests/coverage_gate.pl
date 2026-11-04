@@ -4,7 +4,8 @@
 # ==============================================================================
 # Reads JSON summary from `llvm-cov export -format=text -summary-only`
 # and evaluates Line, Region, and Branch coverage against Tier A/B/C targets.
-# Function coverage must be 100% in every measured file.
+# Function coverage must be 100% in every measured file (a MUST): it is shown per tier and for the total, and one function that never ran
+# fails the gate.
 #
 # Usage:
 #   llvm-cov export ... -format=text -summary-only | perl tests/coverage_gate.pl [options]
@@ -124,13 +125,10 @@ if (!$data || !$data->{data} || !$data->{data}[0]) {
 my $export = $data->{data}[0];
 my $files = $export->{files} || [];
 
-my %tier_stats = (
-    'A' => { lines_cov => 0, lines_cnt => 0, regions_cov => 0, regions_cnt => 0, branches_cov => 0, branches_cnt => 0 },
-    'B' => { lines_cov => 0, lines_cnt => 0, regions_cov => 0, regions_cnt => 0, branches_cov => 0, branches_cnt => 0 },
-    'C' => { lines_cov => 0, lines_cnt => 0, regions_cov => 0, regions_cnt => 0, branches_cov => 0, branches_cnt => 0 },
-    'D' => { lines_cov => 0, lines_cnt => 0, regions_cov => 0, regions_cnt => 0, branches_cov => 0, branches_cnt => 0 },
-    'Overall' => { lines_cov => 0, lines_cnt => 0, regions_cov => 0, regions_cnt => 0, branches_cov => 0, branches_cnt => 0 },
-);
+my %tier_stats = map {
+    $_ => { lines_cov => 0, lines_cnt => 0, regions_cov => 0, regions_cnt => 0, branches_cov => 0, branches_cnt => 0,
+            functions_cov => 0, functions_cnt => 0 }
+} qw(A B C D Overall);
 
 my @file_records = ();
 my $pg_driver_skipped = 0;
@@ -198,14 +196,18 @@ for my $f (@$files) {
         $tier_stats{$tier}{regions_cnt} += $r_cnt;
         $tier_stats{$tier}{branches_cov} += $b_cov;
         $tier_stats{$tier}{branches_cnt} += $b_cnt;
+        $tier_stats{$tier}{functions_cov} += $f_cov;
+        $tier_stats{$tier}{functions_cnt} += $f_cnt;
     }
-    
+
     $tier_stats{'Overall'}{lines_cov} += $l_cov;
     $tier_stats{'Overall'}{lines_cnt} += $l_cnt;
     $tier_stats{'Overall'}{regions_cov} += $r_cov;
     $tier_stats{'Overall'}{regions_cnt} += $r_cnt;
     $tier_stats{'Overall'}{branches_cov} += $b_cov;
     $tier_stats{'Overall'}{branches_cnt} += $b_cnt;
+    $tier_stats{'Overall'}{functions_cov} += $f_cov;
+    $tier_stats{'Overall'}{functions_cnt} += $f_cnt;
 }
 
 # "file:line name" of every function no instance of which ran, from an lcov export of the same binaries.  A static inline function of a
@@ -241,12 +243,12 @@ sub basename {
 
 # Print report
 print "\n";
-print "=" x 90 . "\n";
+print "=" x 109 . "\n";
 printf "                KariDNS Multi-Tier Coverage Quality Gate (Phase %d)\n", $phase;
-print "=" x 90 . "\n";
-printf "%-10s | %-16s | %-16s | %-16s | %-8s\n",
-    "Tier", "Line Cov (%)", "Region Cov (%)", "Branch Cov (%)", "Status";
-print "-" x 90 . "\n";
+print "=" x 109 . "\n";
+printf "%-10s | %-16s | %-16s | %-16s | %-16s | %-8s\n",
+    "Tier", "Line Cov (%)", "Region Cov (%)", "Branch Cov (%)", "Func Cov (%)", "Status";
+print "-" x 109 . "\n";
 
 my $all_passed = 1;
 
@@ -254,32 +256,38 @@ for my $t (qw(A B C D Overall)) {
     my $st = $tier_stats{$t};
     my $th = $thresholds{$t};
     if ($t eq 'D' && !$st->{lines_cnt}) {      # no data for any file of the tier (no loader built): not gated
-        printf "%-10s | %-16s | %-16s | %-16s | %-8s\n", "Tier D", "-", "-", "-", "SKIPPED (no database test data)";
+        printf "%-10s | %-16s | %-16s | %-16s | %-16s | %-8s\n", "Tier D", "-", "-", "-", "-", "SKIPPED (no database test data)";
         next;
     }
     
     my $l_pct = $st->{lines_cnt} ? (100.0 * $st->{lines_cov} / $st->{lines_cnt}) : 100.0;
     my $r_pct = $st->{regions_cnt} ? (100.0 * $st->{regions_cov} / $st->{regions_cnt}) : 100.0;
     my $b_pct = $st->{branches_cnt} ? (100.0 * $st->{branches_cov} / $st->{branches_cnt}) : 100.0;
-    
+    my $f_pct = $st->{functions_cnt} ? (100.0 * $st->{functions_cov} / $st->{functions_cnt}) : 100.0;
+
     my $l_pass = ($l_pct >= $th->{line});
     my $r_pass = ($r_pct >= $th->{region});
     my $b_pass = ($b_pct >= $th->{branch});
-    
-    my $tier_pass = ($l_pass && $r_pass && $b_pass);
+    # Functions: 100% is a MUST for every tier and the total.  Compared as counts, not as a percentage: 99.999% prints as 100.00%.
+    my $f_pass = ($st->{functions_cov} >= $st->{functions_cnt});
+
+    my $tier_pass = ($l_pass && $r_pass && $b_pass && $f_pass);
     $all_passed = 0 unless $tier_pass;
-    
+
     my $status_str = $tier_pass ? "PASS" : "FAIL";
-    
-    printf "%-10s | %6.2f%% (%4.1f%%) | %6.2f%% (%4.1f%%) | %6.2f%% (%4.1f%%) | %-8s\n",
+    # a missed function never shows as 100.00% (rounding), so the column and the status agree
+    my $f_str = $f_pass ? sprintf("%6.2f%%", $f_pct) : sprintf("%6.2f%%", $f_pct > 99.99 ? 99.99 : $f_pct);
+
+    printf "%-10s | %6.2f%% (%4.1f%%) | %6.2f%% (%4.1f%%) | %6.2f%% (%4.1f%%) | %s (100%%) | %-8s\n",
         ($t eq 'Overall' ? "TOTAL" : "Tier $t"),
         $l_pct, $th->{line},
         $r_pct, $th->{region},
         $b_pct, $th->{branch},
+        $f_str,
         $status_str;
 }
 
-print "=" x 90 . "\n\n";
+print "=" x 109 . "\n\n";
 if ($pg_driver_skipped) {
     print "[i] dns_db_pgsql.c was left out of Tier D and the totals: the PostgreSQL tests did not run (under 10% of its lines executed)\n\n";
 }
@@ -299,7 +307,7 @@ if (!$all_passed) {
         exit 1;
     }
 } else {
-    print "[+] Coverage Gate Status: PASSED (All tiers met target thresholds)\n";
+    print "[+] Coverage Gate Status: PASSED (All tiers met target thresholds, every function executed)\n";
 }
 
 exit($all_passed ? 0 : ($strict ? 1 : 0));

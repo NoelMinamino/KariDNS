@@ -586,8 +586,48 @@ A signed response that would not fit the client's UDP size with its TSIG is trun
 | `socket "<path>";` (alias `socket-path`) | `/var/run/karidns/control.sock` | UNIX socket for `karictl`. |
 | `secret "<base64>";` | none | Shared secret; must match `karictl.conf`. Authentication is an HMAC challenge-response. |
 | `algorithm "<name>";` | `hmac-sha256` | HMAC of the challenge-response: one of the TSIG algorithm names above. `karictl.conf` must name the same algorithm. |
+| `allow-group "<group>";` | none | A group name or a numeric gid. Members of that group (any of the groups of the peer's credentials) may connect to the socket as well as the user karidns runs as and root; the socket is given to the group with mode `0660`. Every client still has to answer the HMAC challenge with a key. Resolved when the configuration is read; an unknown group is an error. See **Restricted control keys**. |
+| `keys { "<key>" [ read-only yes\|no ] [ allow-commands { <command>; ... } ]; ... };` | none | Restricted control keys: top-level `key` statements that the control channel accepts, each with what it may run. See **Restricted control keys** below. |
 
-Any other key is a configuration error that names the key (`control-channel: unknown option 'port' (supported: socket, secret, algorithm)`): the server refuses to start, a `karictl reload` / `reconfig` is refused and keeps the running configuration, and `karicheck conf` reports it as an error. The channel is a UNIX socket only; there is no `port` or `bind-address`. A misspelt `secret` or `socket` used to be skipped, which left the channel without the secret or on the default socket without a word. Servers that run side by side need a `socket` each: without it every one binds `/var/run/karidns/control.sock`, and the last one to start takes the path over.
+Any other key is a configuration error that names the key (`control-channel: unknown option 'port' (supported: socket, secret, algorithm, allow-group, keys)`): the server refuses to start, a `karictl reload` / `reconfig` is refused and keeps the running configuration, and `karicheck conf` reports it as an error. The channel is a UNIX socket only; there is no `port` or `bind-address`. A misspelt `secret` or `socket` used to be skipped, which left the channel without the secret or on the default socket without a word. Servers that run side by side need a `socket` each: without it every one binds `/var/run/karidns/control.sock`, and the last one to start takes the path over.
+
+**Restricted control keys (`keys { }`).** `karictl` can be given a key that may run only some commands, for example for a web tier that has to show the status of the zones and reload one zone but must never stop the server. The keys are ordinary top-level `key` statements (the statement that also holds TSIG keys, with `algorithm` and `secret`); `keys { }` lists the ones the control channel accepts and what each may do:
+
+```
+key "admin" { algorithm hmac-sha256; secret "<base64>"; };
+key "web"   { algorithm hmac-sha256; secret "<base64>"; };
+
+control-channel {
+    socket "/var/run/karidns/control.sock";
+    secret "<base64>";                      // optional: the unnamed key, full power, as before
+    keys {
+        "admin";                            // full power
+        "web" read-only yes allow-commands { reload-zone; rollback; };
+    };
+};
+```
+
+- A key without `read-only` (or with `read-only no`) has full power. `read-only yes` has BIND's meaning (`controls { ... read-only yes; }`): only `status`, `zonestatus`, `observatory` and `dbstatus`. `allow-commands { ... }` is a KariDNS extension that adds commands to a read-only key; without `read-only yes` it is an error, because a key that is not read-only can run everything already. The clauses may be written in either order.
+- The names that `allow-commands` takes (nothing else is accepted, the test-only commands included):
+
+  | Name | Allows |
+  |---|---|
+  | `reload` | the full reload: `karictl reload` without a zone |
+  | `reload-zone` | `karictl reload <zone> [<view>] [force]` only (a zone, never all) |
+  | `reconfig` | `karictl reconfig` |
+  | `stop` | `karictl stop` |
+  | `notify` | `karictl notify <zone>` |
+  | `retransfer` | `karictl retransfer <zone>` |
+  | `rollback` | `karictl rollback <zone>`: accepted in the configuration now; until the command exists the server answers it with the unknown-command error |
+
+- The unnamed `secret` (and `algorithm`) of the block keep working as they always did: a full-power key that is logged as `(main)`. A configuration with only `keys { }` and no `secret` is valid.
+- **Nothing changes for `karictl` or the protocol.** The client's `karictl.conf` holds the `secret` and the `algorithm` of the key it uses (the name of the key is not sent). The server computes the HMAC of the challenge for the unnamed secret and for every listed key, each with its own algorithm, compares all of them in constant time and takes the key that matches. Two keys (the unnamed secret included) must therefore not have the same secret: that is a configuration error.
+- A command the key may not run is answered with `ERROR command not allowed for key "web"` (`karictl` exits 3); the connection stays open, so the client can send another command. The key and its permission are fixed when the client logs in: a `reconfig` that changes `keys { }` applies to the connections made afterwards, never to one that is open.
+- Every command is logged at NOTICE level with the key name, whether it was run or refused: `[Control] key "web": reload example.test` and `[Control] key "web": refused: stop`.
+- Errors (the server does not start, a `karictl reconfig` / `reload` is refused and keeps the running configuration, and `karicheck conf` reports them with file and line): a name that no top-level `key` statement defines (a `key` inside a `view` does not count), a key listed twice, a key whose algorithm the control channel cannot use, two keys with one secret, `allow-commands` without `read-only yes`, a name in `allow-commands` that is not in the table above, and a clause written twice.
+- **Letting a web tier in: `allow-group`.** The socket is normally open only to the user karidns runs as and to root, so a web tier would have to run as the karidns user, which can read `karidns.conf` and the full-power secret. With `allow-group "<group>";` (a group name or a numeric gid) the members of that group may connect too, and the socket file is given to that group with mode `0660` when it is created (without `allow-group` it stays `0600`, owned by karidns' user). The recommended setup for a web tier is `allow-group` plus a read-only key: the web user is in the group, holds only the `karictl.conf` of its read-only key, and **cannot read `karidns.conf`** (keep it `0640 root:karidns` or similar, and the web user outside that group). Being admitted is only the first step: the HMAC challenge follows, so a member of the group without a key gets nothing. The directory of the socket is the operator's job: the group needs search (`x`) permission on it, and nobody else should be able to replace the socket (karidns checks the directory when it starts). Details: the group is looked up when the configuration is read (start-up, `karicheck conf`); a `reload` runs in capability mode, where `/etc/group` cannot be read, so it accepts a numeric gid or the name that was resolved at start-up, and refuses another name with the reason (the running configuration is kept; restart the server). The socket is created once: a changed `allow-group` is reported as needing a restart, as a changed `socket` is. The check uses the credentials of the connection (`LOCAL_PEERCRED`: the user id and all groups of the peer, supplementary groups included); the server is FreeBSD-only, so there is no Linux variant (`dag` is the only component that builds there). If the process cannot give the socket to the group (it is not root and not in the group) the server does not start.
+- Use a key of its own for the control channel. `karicheck conf` warns when a listed key is also used for TSIG anywhere (`allow-transfer`, `allow-update`, `allow-notify`, `allow-query` and `match-clients` lists, a zone's `tsig-key`, `primaries` and `also-notify` entries, `server { keys }`, `update-policy`, an `acl { }` block, `acl-ceiling`): whoever holds a key for zone transfers, for example a secondary, could then also control the server.
+- `controls { inet ... keys { ... } read-only ...; }` of BIND stays as it was: read, checked and ignored.
 
 **Keys in a view.** A `key` statement inside `view { }` has the same options and is visible only to that view: its zones' `allow-transfer`, `allow-update`, `allow-query`, `tsig-key`, `primaries` / `also-notify` `key` and the view's `server` statements may name it, and a request that reaches the view is verified with the keys of that view and the global keys (BIND `bin/named/tsigconf.c`: the ring of a view is the global keys plus its own). The same name may be used in two different views with different secrets. A name that is already a global key, or twice in one view, is a configuration error, exactly as in BIND (`lib/isccfg/check.c`; the view's keys do not *shadow* a global key). A name used in a view that is neither global nor in that view is rejected for that view (`key 'k' is not defined in any key {} block`). The view is chosen first, by the client's address (`match-clients`), and then the request's TSIG is verified against that view's keys; a `key` entry in `match-clients` is still not supported. Limits: a named `acl { }` block, a `remote-servers` / `primaries` list and the settings of a database zone are global and can name only global keys.
 
@@ -1202,7 +1242,7 @@ MTU (this is the reason for the DNS Flag Day 2020 default); lower values push mo
 
 ## CONTROL CHANNEL & MANAGEMENT
 
-Runtime administration of `karidns` is managed over a local UNIX domain socket (default `/var/run/karidns/control.sock`, see `control-channel`) authenticated via an HMAC challenge-response (`control-channel { algorithm }`, default HMAC-SHA256) using the [`karictl(8)`](karictl.md) utility.
+Runtime administration of `karidns` is managed over a local UNIX domain socket (default `/var/run/karidns/control.sock`, see `control-channel`) authenticated via an HMAC challenge-response (`control-channel { algorithm }`, default HMAC-SHA256) using the [`karictl(8)`](karictl.md) utility. A key can be restricted to some commands (`control-channel { keys { } }`, see above); every command is logged with the name of the key.
 
 ---
 
