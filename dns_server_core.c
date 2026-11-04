@@ -3806,10 +3806,33 @@ static void control_park_timeouts(time_t now) {
   }
 }
 
+/* `rollback <zone> [view] [local]` for the zone entry e (zcfg: its zone { } block, NULL for a zone of the database): the refusals that depend on the kind of
+ * zone, then zone_rollback(); one line of reply on cfd. */
+STATIC_TEST void ctrl_rollback_zone(int cfd, zone_db_entry_t *e, const zone_config_t *zcfg, bool local) {
+  char reply[256];
+  int rl;
+  if (zcfg && zcfg->is_catalog) {
+    rl = snprintf(reply, sizeof(reply), "ERROR a catalog zone cannot be rolled back (its members would have to be redone)\n");
+  } else if (zcfg && zcfg->type && strcasecmp(zcfg->type, "program") == 0) {
+    rl = snprintf(reply, sizeof(reply), "ERROR a program zone cannot be rolled back (the plugin owns its data)\n");
+  } else if (zcfg && zcfg->type && strcasecmp(zcfg->type, "master") != 0 && strcasecmp(zcfg->type, "primary") != 0) {
+    rl = snprintf(reply, sizeof(reply), "ERROR %s\n", zone_rollback_text(ZRB_NOT_PRIMARY));
+  } else {
+    uint32_t ns = 0, from = 0;
+    zone_rollback_result_t rr = zone_rollback(e, local, &ns, &from);
+    if (rr == ZRB_OK)
+      rl = snprintf(reply, sizeof(reply), "OK rolled back%s: serial %u (was %u)%s\n", local ? " (local)" : "", ns, from,
+                    local ? "; the secondaries do not follow" : "");
+    else
+      rl = snprintf(reply, sizeof(reply), "ERROR %s\n", zone_rollback_text(rr));
+  }
+  if (rl > 0) (void)ctl_send_all(cfd, reply, (size_t)rl);
+}
+
 /* D17-2 / B6a: a command about a zone that is not in karidns.conf, which may be a zone of the database.  Returns true
  * when it was answered (or the client was parked), false when there is no such DB zone ("zone not found").  The registry
  * is looked at without any wait for the loader; `reload` hands the request to the ingest thread and parks the client. */
-static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone, const char *view_arg, bool force) {
+static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone, const char *view_arg, bool force /* reload: force; rollback: local */) {
   int cfd = c->fd;
   server_config_t *cfg = acquire_config_snapshot();
   bool enabled = cfg && cfg->database.enabled;
@@ -3881,6 +3904,18 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
     return true;
   }
   const dbreg_info_t *zi = &info[0];
+  if (strcmp(cmd, "rollback") == 0) {
+    zone_db_snapshot_t *rbsnap = acquire_retained_zone_snapshot();
+    zone_db_entry_t *rbe = rbsnap ? dbreg_snapshot_entry(rbsnap, zi->view, zone) : NULL;
+    if (rbe) {
+      ctrl_rollback_zone(cfd, rbe, NULL, force);
+    } else {
+      static const char msg[] = "ERROR the zone is not in memory (out of memory, or hidden by another zone of the same name); nothing to roll back\n";
+      (void)ctl_send_all(cfd, msg, sizeof(msg) - 1);
+    }
+    if (rbsnap) release_zone_snapshot(rbsnap);
+    return true;
+  }
   if (strcmp(cmd, "zonestatus") == 0) {
     char m[600];
     const char *res = zi->shadowed ? (zi->shadow_by == DBREG_SH_CATALOG ? "shadowed (hidden by a catalog member)"
@@ -3888,15 +3923,20 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
                                    : (zi->last_result == DBREG_REJECTED ? "rejected" : "applied");
     /* B8t-2: a database secondary with settings received from its primary */
     bool rx_on = false;
+    char rbtxt[160];
+    rbtxt[0] = '\0';
     {
       zone_db_snapshot_t *zsnap = acquire_retained_zone_snapshot();
       zone_db_entry_t *ze = zsnap ? dbreg_snapshot_entry(zsnap, zi->view, zone) : NULL;
-      if (ze) rx_on = zone_rx_settings_status(ze, NULL, 0);
+      if (ze) {
+        rx_on = zone_rx_settings_status(ze, NULL, 0);
+        zone_rollback_status(ze, rbtxt, sizeof(rbtxt));
+      }
       if (zsnap) release_zone_snapshot(zsnap);
     }
-    int l = snprintf(m, sizeof(m), "OK serial=%u refresh=%u source=database view=%s id=%lld result=%s%s%s%s%s\n", zi->serial,
+    int l = snprintf(m, sizeof(m), "OK serial=%u refresh=%u source=database view=%s id=%lld result=%s%s%s%s%s%s\n", zi->serial,
                      zi->refresh, zi->view, (long long)zi->source_id, res, zi->has_entry ? "" : " (no version loaded)",
-                     zi->error[0] ? " last-error: " : "", zi->error, rx_on ? " settings=primary" : "");
+                     zi->error[0] ? " last-error: " : "", zi->error, rx_on ? " settings=primary" : "", rbtxt);
     if (l >= (int)sizeof(m)) l = (int)sizeof(m) - 1, m[l - 1] = '\n';
     (void)ctl_send_all(cfd, m, (size_t)l);
     return true;
@@ -4165,13 +4205,16 @@ void *control_thread_func(void *arg) {
               }
             }
             
-            bool want_force = false; /* `reload <zone> [<view>] [force]` (B6a): force is the last word */
-            if (strcmp(cmd, "reload") == 0 && view_arg) {
+            /* `reload <zone> [<view>] [force]` (B6a), `rollback <zone> [<view>] [local]`: the option word is the last word (a view named "force" or
+             * "local" is written twice: `reload z force force`) */
+            bool want_force = false;
+            const char *opt_word = strcmp(cmd, "reload") == 0 ? "force" : strcmp(cmd, "rollback") == 0 ? "local" : NULL;
+            if (opt_word && view_arg) {
               char *fw = strrchr(view_arg, ' ');
-              if (strcmp(view_arg, "force") == 0) {
+              if (strcmp(view_arg, opt_word) == 0) {
                 want_force = true;
                 view_arg = NULL;
-              } else if (fw && strcmp(fw + 1, "force") == 0) {
+              } else if (fw && strcmp(fw + 1, opt_word) == 0) {
                 want_force = true;
                 while (fw > view_arg && fw[-1] == ' ') fw--;
                 *fw = '\0';
@@ -4208,12 +4251,20 @@ void *control_thread_func(void *arg) {
                     (void)ctl_send_all(cfd, "ERROR zone not found\n", 21);
                   }
                 } else if (nmatches > 1) {
-                  (void)ctl_send_all(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'reload <zone> <view>')\n", 82);
+                  static const char multi[] = "ERROR zone exists in multiple views; specify view (e.g. 'reload <zone> <view>')\n";
+                  (void)ctl_send_all(cfd, multi, sizeof(multi) - 1);
                 } else if (lr.entry && lr.zcfg) {
                   syslog(LOG_NOTICE, "[Control] Received targeted reload command for zone: %s", canon_arg);
                   if (lr.zcfg->type && (strcmp(lr.zcfg->type, "master") == 0 || strcmp(lr.zcfg->type, "primary") == 0)) {
-                    reload_result_t rr = reload_master_zone(lr.entry, lr.zcfg);
-                    switch (rr) {
+                    reload_result_t rr = RELOAD_OK;
+                    const bool rb_keep = !want_force && lr.entry && lr.zcfg->file && zone_rollback_keeps_file(lr.entry, lr.zcfg->file);
+                    if (rb_keep) {
+                        /* karictl rollback: reading the unchanged file again would bring back the data that was rolled back */
+                        syslog(LOG_NOTICE, "[Control] zone %s was rolled back and its file has not changed: keeping the rolled-back version", lr.zcfg->domain);
+                        static const char kept[] = "OK kept the rolled-back version: the file has not changed since (reload <zone> force reads it again)\n";
+                        (void)ctl_send_all(cfd, kept, sizeof(kept) - 1);
+                    } else rr = reload_master_zone(lr.entry, lr.zcfg);
+                    if (!rb_keep) switch (rr) {
                         case RELOAD_OK:
                             syslog(LOG_NOTICE, "[Control] Targeted reload successful for %s", lr.zcfg->domain);
                             if (lr.zcfg->is_catalog) {
@@ -4331,6 +4382,8 @@ void *control_thread_func(void *arg) {
                 st.db_bytes_retired = zb_db.retired;
                 st.other_bytes_resident = zb_other.resident;
                 st.other_bytes_retired = zb_other.retired;
+                st.db_bytes_previous = zb_db.previous;
+                st.other_bytes_previous = zb_other.previous;
               }
 
               /* "OK " and the structure in one buffer, written whole (the descriptor is non-blocking; no SCM_RIGHTS goes with it) */
@@ -4351,7 +4404,8 @@ void *control_thread_func(void *arg) {
                   (void)ctl_send_all(cfd, "ERROR zone not found\n", 21);
                 }
               } else if (nmatches > 1) {
-                (void)ctl_send_all(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'zonestatus <zone> <view>')\n", 86);
+                static const char multi[] = "ERROR zone exists in multiple views; specify view (e.g. 'zonestatus <zone> <view>')\n";
+                (void)ctl_send_all(cfd, multi, sizeof(multi) - 1);
               } else if (lr.entry) {
                 char smsg[384];
                 char rx_note[160];
@@ -4359,9 +4413,11 @@ void *control_thread_func(void *arg) {
                 bool rx_on = zone_rx_settings_status(lr.entry, rx_note, sizeof(rx_note));
                 /* refresh, retry and expire are the values the zone uses: a secondary holds the SOA's to min/max-refresh-time and
                  * min/max-retry-time (batch 4) */
-                int slen = snprintf(smsg, sizeof(smsg), "OK serial=%u refresh=%u retry=%u expire=%u%s%s%s\n", (uint32_t)lr.entry->serial,
+                char rbtxt[160];
+                zone_rollback_status(lr.entry, rbtxt, sizeof(rbtxt));      /* " rolled back (serial N, from M)" and " previous version kept (...)" */
+                int slen = snprintf(smsg, sizeof(smsg), "OK serial=%u refresh=%u retry=%u expire=%u%s%s%s%s\n", (uint32_t)lr.entry->serial,
                                     (uint32_t)lr.entry->refresh, (uint32_t)lr.entry->retry, (uint32_t)lr.entry->expire,
-                                    rx_on ? " settings=primary" : "", rx_note[0] ? " note: " : "", rx_note);
+                                    rx_on ? " settings=primary" : "", rbtxt, rx_note[0] ? " note: " : "", rx_note);
                 if (slen >= (int)sizeof(smsg)) slen = (int)sizeof(smsg) - 1, smsg[slen - 1] = '\n';
                 (void)ctl_send_all(cfd, smsg, slen);
               } else {
@@ -4447,7 +4503,8 @@ void *control_thread_func(void *arg) {
                   (void)ctl_send_all(cfd, "ERROR zone not found\n", 21);
                 }
               } else if (nmatches > 1) {
-                (void)ctl_send_all(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'notify <zone> <view>')\n", 82);
+                static const char multi[] = "ERROR zone exists in multiple views; specify view (e.g. 'notify <zone> <view>')\n";
+                (void)ctl_send_all(cfd, multi, sizeof(multi) - 1);
               } else if (lr.entry) {
                 syslog(LOG_NOTICE, "[Control] Received notify command for zone: %s", canon_arg);
                 zone_notify_request(lr.entry);
@@ -4470,7 +4527,8 @@ void *control_thread_func(void *arg) {
                   (void)ctl_send_all(cfd, "ERROR zone not found\n", 21);
                 }
               } else if (nmatches > 1) {
-                (void)ctl_send_all(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'retransfer <zone> <view>')\n", 86);
+                static const char multi[] = "ERROR zone exists in multiple views; specify view (e.g. 'retransfer <zone> <view>')\n";
+                (void)ctl_send_all(cfd, multi, sizeof(multi) - 1);
               } else if (lr.entry && !lr.entry->is_secondary) {
                 /* O-06: 転送元を持つのはセカンダリ (カタログのメンバーを含む) だけ。プライマリの
                  * シリアルを 0 にすると UDP IXFR や karictl zonestatus の値が壊れる。 */
@@ -4486,6 +4544,31 @@ void *control_thread_func(void *arg) {
               }
               release_config_snapshot(active_cfg);
               release_zone_snapshot(snap);
+            } else if (strcmp(cmd, "rollback") == 0 && arg) {
+              /* karictl rollback <zone> [view] [local]: publish the version that was served before the last reload / database install again */
+              char canon_buf[256];
+              const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
+              zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
+              server_config_t *active_cfg = acquire_config_snapshot();
+              zone_lookup_result_t lr = {0};
+              int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
+              if (nmatches == 0) {
+                if (!db_zone_command(c, cmd, canon_arg, view_arg, want_force)) {
+                  syslog(LOG_ERR, "[Control] Command 'rollback' failed: zone '%s' not found", canon_arg);
+                  (void)ctl_send_all(cfd, "ERROR zone not found\n", 21);
+                }
+              } else if (nmatches > 1) {
+                static const char multi[] = "ERROR zone exists in multiple views; specify view (e.g. 'rollback <zone> <view>')\n";
+                (void)ctl_send_all(cfd, multi, sizeof(multi) - 1);
+              } else if (lr.entry && lr.zcfg) {
+                ctrl_rollback_zone(cfd, lr.entry, lr.zcfg, want_force);
+              } else {
+                (void)ctl_send_all(cfd, "ERROR zone not found\n", 21);
+              }
+              release_config_snapshot(active_cfg);
+              release_zone_snapshot(snap);
+            } else if (strcmp(cmd, "rollback") == 0) {
+              (void)ctl_send_all(cfd, "ERROR rollback needs a zone name\n", 33);
 #ifdef KARIDNS_TEST_EVICT
             } else if (strcmp(cmd, "evict") == 0 && arg) {
               /* TEST ONLY (karidns-evict, never a production build): take the data of a DB zone out of memory, as eviction will (D1a) */
@@ -4553,6 +4636,7 @@ void *control_thread_func(void *arg) {
          * 公開で不要になった古い版を猶予期間の後で解放する */
         zone_glue_refresh_dependents(false);
         zone_retire_process(false);
+        zone_prev_expire(now);          /* karictl rollback: the previous versions whose rollback-window is over */
         config_standby_reap(false);
         if (g_reload_pending) {
           /* O-10: 読み手が残っていて延期したリロードを捨てずにやり直す */

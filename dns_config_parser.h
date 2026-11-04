@@ -283,6 +283,8 @@ enum {
 #define ZV_MAX_TYPES_PER_NAME (1u << 2)
 #define ZV_MAX_ZONE_TTL       (1u << 3)
 #define ZV_SERIAL_METHOD      (1u << 4)
+#define ZV_ROLLBACK_WINDOW    (1u << 5)
+#define ROLLBACK_WINDOW_DEFAULT 3600u    /* seconds: how long the version before the last reload / database install is kept for `karictl rollback` */
 #define ZV_CHK(c)             (1u << (8 + (c)))      /* the check-* option ZC_c is written at this level */
 typedef struct zone_vopts {
   uint32_t set;                    /* ZV_* of what is written at this level */
@@ -291,14 +293,16 @@ typedef struct zone_vopts {
   uint32_t max_types_per_name;     /* RR types at one name; 0 = no limit */
   uint32_t max_zone_ttl;           /* seconds; 0 = no limit (`unlimited`) */
   uint8_t serial_method;           /* SUM_* */
+  uint32_t rollback_window;        /* seconds; 0 = no previous version is kept (rollback-window) */
   uint8_t chk[ZC_N];               /* CHK_FAIL / CHK_WARN / CHK_IGNORE */
-  uint8_t zone_check_names;        /* zone { check-names <mode>; }: applies to the zone's own type */
+  uint8_t zone_check_names;       /* zone { check-names <mode>; }: applies to the zone's own type */
 } zone_vopts_t;
 #define ZV_ZONE_CHECK_NAMES   (1u << 30)
 /* The value that applies to a zone */
 typedef struct {
   uint32_t max_records, max_per_type, max_types_per_name, max_zone_ttl;
   uint8_t serial_method;
+  uint32_t rollback_window;        /* seconds; 0 = off (ROLLBACK_WINDOW_DEFAULT when not written) */
   uint8_t chk[ZC_N];               /* ZC_NAMES_PRIMARY .. : the effective severity, CHK_DEFAULT when not written; check_names: for the zone's type */
   uint8_t check_names;             /* the zone's check-names severity (primary or secondary one, or the zone's own) */
 } zone_veff_t;

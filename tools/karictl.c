@@ -172,6 +172,14 @@ static void karictl_usage(FILE *fp, const char *argv0) {
         "  stop                        stop the server\n"
         "  notify <zone> [view]        send NOTIFY for the zone now (zone files and database zones)\n"
         "  retransfer <zone> [view]    transfer a secondary zone again (a database zone is a primary: use reload)\n"
+        "  rollback <zone> [view] [local]\n"
+        "                              publish the version that was served before the last reload of the zone file (or the\n"
+        "                              last install from the database) again, with SOA serial = the current serial + 1, so\n"
+        "                              that the secondaries follow (IXFR, NOTIFY).  A primary zone only; the previous\n"
+        "                              version is kept for rollback-window (default 1h); a signed zone is refused (roll\n"
+        "                              back in the database and sign again), except with local: the old version, with its\n"
+        "                              old serial, on this server only (the secondaries do not follow).  Once per reload:\n"
+        "                              a second rollback is refused.  zonestatus shows 'rolled back (serial N, from M)'\n"
         "  zonestatus <zone> [view]    serial of the zone; a database zone also shows its source id and last result\n"
         "  observatory [zone] [view]   per-zone statistics\n"
         "  dbstatus [zone [view]]      the database loader, the last batch, the zones of the database\n"
@@ -180,6 +188,7 @@ static void karictl_usage(FILE *fp, const char *argv0) {
         "  karictl reload example.test\n"
         "  karictl reload example.test force\n"
         "  karictl zonestatus example.test\n"
+        "  karictl rollback example.test\n"
         "A zone name that exists in several views needs the view name after it: reload <zone> <view> [force]\n");
 }
 
@@ -228,7 +237,7 @@ int main(int argc, char **argv) {
     }
     /* notify / retransfer / zonestatus need a zone name; without one the server could only answer "unknown command" */
     if (optind + 1 >= argc && (strcmp(argv[optind], "notify") == 0 || strcmp(argv[optind], "retransfer") == 0 ||
-                               strcmp(argv[optind], "zonestatus") == 0)) {
+                               strcmp(argv[optind], "zonestatus") == 0 || strcmp(argv[optind], "rollback") == 0)) {
         fprintf(stderr, "karictl: %s needs a zone name\n", argv[optind]);
         karictl_usage(stderr, argv[0]);
         return 2;
@@ -468,6 +477,9 @@ int main(int argc, char **argv) {
                    (unsigned long long)st.db_bytes_resident, (unsigned long long)st.db_bytes_retired);
             printf("zone versions and IXFR deltas, other zones: %llu bytes resident, %llu bytes retired\n",
                    (unsigned long long)st.other_bytes_resident, (unsigned long long)st.other_bytes_retired);
+            /* the versions zones keep for 'karictl rollback' (rollback-window): not served, freed when the window is over or the memory-limit needs the room */
+            printf("zone versions kept for rollback: database zones %llu bytes, other zones %llu bytes\n",
+                   (unsigned long long)st.db_bytes_previous, (unsigned long long)st.other_bytes_previous);
             printf("server is up and running%s\n", st.frontend_alive ? "" : " (Frontend is down)");
             
             printf("\n--- Security & Rate Limit Stats ---\n");

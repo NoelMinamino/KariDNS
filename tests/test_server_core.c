@@ -1552,6 +1552,35 @@ static void test_control_socket_thread_and_commands(void) {
     assert(len > 0);
     assert(strncmp(out, "OK 2\n", 5) == 0);
 
+    /* karictl rollback <zone> [view] [local]: the refusals (a zone with nothing kept, a secondary, a catalog zone, a program zone), the words of the
+     * usage errors, and what zonestatus says about a rolled-back zone */
+    len = run_ctrl_cmd(&sun, secret_key, "rollback example.com.\n", out, sizeof(out));
+    assert(len > 0 && strncmp(out, "ERROR no previous version", 25) == 0);
+    len = run_ctrl_cmd(&sun, secret_key, "rollback example.com. local\n", out, sizeof(out));
+    assert(len > 0 && strncmp(out, "ERROR no previous version", 25) == 0);
+    len = run_ctrl_cmd(&sun, secret_key, "rollback example.com. default local\n", out, sizeof(out));
+    assert(len > 0 && strncmp(out, "ERROR no previous version", 25) == 0);
+    len = run_ctrl_cmd(&sun, secret_key, "rollback slave.example.\n", out, sizeof(out));
+    assert(len > 0 && strncmp(out, "ERROR rollback is for primary zones", 35) == 0);
+    len = run_ctrl_cmd(&sun, secret_key, "rollback unknown.example.\n", out, sizeof(out));
+    assert(len > 0 && strcmp(out, "ERROR zone not found\n") == 0);
+    len = run_ctrl_cmd(&sun, secret_key, "rollback\n", out, sizeof(out));
+    assert(len > 0 && strcmp(out, "ERROR rollback needs a zone name\n") == 0);
+    zc_master.is_catalog = true;
+    len = run_ctrl_cmd(&sun, secret_key, "rollback example.com.\n", out, sizeof(out));
+    assert(len > 0 && strncmp(out, "ERROR a catalog zone cannot be rolled back", 42) == 0);
+    zc_master.is_catalog = false;
+    zc_master.type = "program";
+    len = run_ctrl_cmd(&sun, secret_key, "rollback example.com.\n", out, sizeof(out));
+    assert(len > 0 && strncmp(out, "ERROR a program zone cannot be rolled back", 42) == 0);
+    zc_master.type = "master";
+    atomic_store(&z_master.rolled_back, true);
+    atomic_store(&z_master.rb_serial, 2026091902);
+    atomic_store(&z_master.rb_from, 2026091901);
+    len = run_ctrl_cmd(&sun, secret_key, "zonestatus example.com.\n", out, sizeof(out));
+    assert(len > 0 && strstr(out, " rolled back (serial 2026091902, from 2026091901)") != NULL);
+    atomic_store(&z_master.rolled_back, false);
+
     /* control-channel { algorithm } selects the HMAC of the challenge-response */
     mock_cfg.control.algorithm = "hmac-sha512";
     len = run_ctrl_cmd_md(&sun, EVP_sha512(), secret_key, "zonestatus example.com.\n", out, sizeof(out));
@@ -1858,7 +1887,7 @@ static void test_control_restricted_keys(void) {
     char out[2048];
     const char *refused_web = "ERROR command not allowed for key \"web\"\n";
 
-    /* full keys: the unnamed secret and "admin" run everything; an unknown command and rollback (not built yet) are answered as before */
+    /* full keys: the unnamed secret and "admin" run everything; an unknown command is answered as before, rollback reaches its command */
     test_ctrl_once(&sun, EVP_sha256(), main_secret, "notify example.com.\n", out, sizeof(out));
     assert(strcmp(out, "OK\n") == 0);
     test_ctrl_once(&sun, EVP_sha256(), admin_secret, "retransfer slave.example.\n", out, sizeof(out));
@@ -1866,7 +1895,7 @@ static void test_control_restricted_keys(void) {
     test_ctrl_once(&sun, EVP_sha256(), admin_secret, "reload slave.example.\n", out, sizeof(out));
     assert(strcmp(out, "OK reloaded (slave)\n") == 0);
     test_ctrl_once(&sun, EVP_sha256(), admin_secret, "rollback example.com.\n", out, sizeof(out));
-    assert(strcmp(out, "ERROR unknown command\n") == 0);
+    assert(strncmp(out, "ERROR no previous version", 25) == 0);
     test_ctrl_once(&sun, EVP_sha256(), admin_secret, "bogus\n", out, sizeof(out));
     assert(strcmp(out, "ERROR unknown command\n") == 0);
 

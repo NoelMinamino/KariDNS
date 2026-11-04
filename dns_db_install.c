@@ -189,7 +189,8 @@ int db_zone_build_install(db_zone_build_t *b, zone_db_entry_t *entry, bool *noti
   entry->refresh = refresh;
   entry->retry = retry;
   entry->expire = expire;
-  if (zone_install_builder(entry, a, "database load") != 0) {
+  /* karictl rollback: the version a primary's install replaces is kept for the zone's rollback-window */
+  if (zone_install_builder(entry, a, "database load", !entry->is_secondary && !entry->is_catalog_member) != 0) {
     entry->serial = old_serial;
     entry->refresh = old_refresh;
     entry->retry = old_retry;

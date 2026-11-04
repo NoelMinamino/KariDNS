@@ -795,6 +795,7 @@ zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name
 }
 
 static void zone_bytes_retired_add(int cls, int64_t delta);
+static void zone_prev_release_on_free(zone_db_entry_t *entry);
 /* D1a step 5: bytes of zones that were evicted and whose entries are not freed yet (they are in the retired total until then) */
 static _Atomic int64_t g_evict_inflight;
 
@@ -807,6 +808,7 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
     free(entry->groups);
   }
   wait_for_active_axfr(entry, 0);
+  zone_prev_release_on_free(entry);                 /* the version kept for karictl rollback goes with the entry */
   pthread_mutex_destroy(&entry->writer_lock);
   pthread_mutex_destroy(&entry->ixfr_history.lock);
   ixfr_history_clear(&entry->ixfr_history);
@@ -1110,6 +1112,7 @@ typedef struct zone_retire_s {
   void *obj;              /* ver が NULL のときに free_fn で解放する物 (ゾーン単位の設定など) */
   void (*free_fn)(void *);
   uint64_t epoch;
+  bool from_prev;         /* ver was a zone's prev dropped under memory pressure: g_prev_inflight counts its bytes until it is freed */
 } zone_retire_t;
 
 static _Atomic(zone_retire_t *) g_zone_retire_head;
@@ -1125,7 +1128,8 @@ uint64_t zone_entry_next_id(void) {
  * totals are per kind of zone (database zones, the others) and cover what the zones serve now (resident: the active versions and the
  * IXFR histories) and what was replaced but is not freed yet (retired: the versions on the retire stack, which a reader or a transfer
  * can still hold).  Nothing limits them yet; karictl status / dbstatus show them. ---- */
-static _Atomic int64_t g_zbytes_resident[ZBYTES_CLASSES], g_zbytes_retired[ZBYTES_CLASSES];
+static _Atomic int64_t g_zbytes_resident[ZBYTES_CLASSES], g_zbytes_retired[ZBYTES_CLASSES], g_zbytes_previous[ZBYTES_CLASSES];
+static _Atomic uint64_t g_prev_inflight;     /* ZBYTES_DB: bytes of previous versions that the cache manager dropped and the retire stack has not freed yet */
 
 int zone_bytes_class(const zone_db_entry_t *e) {
   return e->source == ZONE_SRC_DB ? ZBYTES_DB : ZBYTES_OTHER;
@@ -1150,11 +1154,17 @@ static void zone_bytes_retired_add(int cls, int64_t delta) {
   zone_bytes_note_underflow(atomic_fetch_add_explicit(&g_zbytes_retired[cls], delta, memory_order_relaxed) + delta);
 }
 
+static void zone_bytes_previous_add(int cls, int64_t delta) {
+  zone_bytes_note_underflow(atomic_fetch_add_explicit(&g_zbytes_previous[cls], delta, memory_order_relaxed) + delta);
+}
+
 void zone_bytes_get(int cls, zone_bytes_t *out) {
   int64_t r = atomic_load_explicit(&g_zbytes_resident[cls], memory_order_relaxed);
   int64_t t = atomic_load_explicit(&g_zbytes_retired[cls], memory_order_relaxed);
+  int64_t p = atomic_load_explicit(&g_zbytes_previous[cls], memory_order_relaxed);
   out->resident = r > 0 ? (uint64_t)r : 0;
   out->retired = t > 0 ? (uint64_t)t : 0;
+  out->previous = p > 0 ? (uint64_t)p : 0;
 }
 
 static void zone_retire_push(zone_retire_t *r) {
@@ -1195,6 +1205,7 @@ void zone_retire_process(bool wait) {
     }
     if (r->ver) {
       zone_bytes_retired_add(zone_bytes_class(e), -(int64_t)r->ver->bytes);     /* freed now: no longer retired */
+      if (r->from_prev) atomic_fetch_sub_explicit(&g_prev_inflight, (uint64_t)r->ver->bytes, memory_order_relaxed);
       zone_version_free(r->ver);
     } else {
       r->free_fn(r->obj);
@@ -1222,18 +1233,202 @@ bool zone_retire_object(zone_db_entry_t *entry, void *obj, void (*free_fn)(void 
   return true;
 }
 
+/* A version that no reader can reach any more (it left rcu.active at `epoch`, or it was a zone's prev): the retire stack frees it after the grace period, once no
+ * AXFR reads it.  Its bytes are counted as retired until then.  Ownership passes to the stack; when the stack cannot take it (no memory) it is freed here after
+ * the grace period, or, if a transfer may still read it, leaked with a log line.  from_prev: g_prev_inflight counts it until it is freed. */
+static void zone_version_retire(zone_db_entry_t *entry, zone_version_t *old, uint64_t epoch, bool from_prev) {
+  int zb = zone_bytes_class(entry);
+  zone_retire_t *r = calloc(1, sizeof(*r));
+  if (r) {
+    atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_relaxed);
+    r->entry = entry;
+    r->ver = old;
+    r->epoch = epoch;
+    r->from_prev = from_prev;
+    zone_bytes_retired_add(zb, (int64_t)old->bytes);   /* until zone_retire_process() frees it */
+    if (from_prev) atomic_fetch_add_explicit(&g_prev_inflight, (uint64_t)old->bytes, memory_order_relaxed);
+    zone_retire_push(r);
+  } else if (!atomic_load_explicit(&entry->active_axfr, memory_order_acquire) &&
+             !atomic_load_explicit(&entry->is_transferring, memory_order_acquire) &&
+             rcu_writer_wait_until_safe_in_reader(epoch, 60000)) {
+    zone_version_free(old); /* 積めないときは、ここで猶予期間を待って解放する */
+  } else {
+    zone_bytes_retired_add(zb, (int64_t)old->bytes);   /* leaked: it stays counted */
+    syslog(LOG_ERR, "[Zone] zone '%s': out of memory retiring the previous version; it is leaked", entry->domain);
+  }
+}
+
+/* ---- karictl rollback: entry->prev (see dns_server_internal.h) ----
+ * The entries that hold a prev are on a list per class of zone, ordered by the time the prev is dropped (the insertion looks at most PREV_SCAN_BACK entries back
+ * from the tail, so an entry with a much shorter window than the rest may sit a little late).  The list is for the control thread's tick (window over) and
+ * the cache manager (memory limit: the oldest first); it holds no reference of an entry: the entry takes itself off when it is freed (free_zone_db_entry()),
+ * and a walker takes a reference only while the entry is alive.  Lock order: entry->writer_lock, then g_prev_lock (innermost). */
+#define PREV_SCAN_BACK 64
+#define PREV_BATCH 128
+#define PREV_EXPIRE_MAX 16384         /* previous versions one tick drops at most (the rest go on the next tick) */
+static pthread_mutex_t g_prev_lock = PTHREAD_MUTEX_INITIALIZER;
+static zone_db_entry_t *g_prev_head[ZBYTES_CLASSES], *g_prev_tail[ZBYTES_CLASSES];
+
+static void prev_list_add_locked(zone_db_entry_t *e) {
+  int cls = zone_bytes_class(e);
+  time_t dl = atomic_load_explicit(&e->prev_deadline, memory_order_relaxed);
+  zone_db_entry_t *at = g_prev_tail[cls];
+  for (int n = 0; at && n < PREV_SCAN_BACK && atomic_load_explicit(&at->prev_deadline, memory_order_relaxed) > dl; n++) at = at->prev_prev;
+  e->prev_prev = at;
+  e->prev_next = at ? at->prev_next : g_prev_head[cls];
+  if (e->prev_next) e->prev_next->prev_prev = e;
+  else g_prev_tail[cls] = e;
+  if (at) at->prev_next = e;
+  else g_prev_head[cls] = e;
+  e->prev_linked = true;
+}
+
+static void prev_list_del_locked(zone_db_entry_t *e) {
+  int cls = zone_bytes_class(e);
+  if (e->prev_prev) e->prev_prev->prev_next = e->prev_next;
+  else g_prev_head[cls] = e->prev_next;
+  if (e->prev_next) e->prev_next->prev_prev = e->prev_prev;
+  else g_prev_tail[cls] = e->prev_prev;
+  e->prev_next = e->prev_prev = NULL;
+  e->prev_linked = false;
+}
+
+/* the serial of the SOA at the apex of a version's image (0: none) */
+static uint32_t version_serial(const zone_version_t *v) {
+  zone_image_soa_t nums;
+  uint32_t rr = v && v->image ? zone_image_apex_soa(v->image) : ZONE_IMAGE_NONE;
+  if (rr == ZONE_IMAGE_NONE || zone_image_soa(v->image, rr, NULL, 0, NULL, 0, &nums) != 0) return 0;
+  return nums.serial;
+}
+
+/* The prev of the entry is not wanted any more (the writer_lock is held): it goes to the retire stack.  Returns the bytes it held (0: there was none). */
+static uint64_t zone_prev_drop_locked(zone_db_entry_t *e, bool from_pressure) {
+  zone_version_t *p = e->prev;
+  if (!p) return 0;
+  e->prev = NULL;
+  pthread_mutex_lock(&g_prev_lock);
+  if (e->prev_linked) prev_list_del_locked(e);
+  pthread_mutex_unlock(&g_prev_lock);
+  atomic_store_explicit(&e->prev_bytes, 0, memory_order_relaxed);
+  atomic_store_explicit(&e->prev_serial, 0, memory_order_relaxed);
+  zone_bytes_previous_add(zone_bytes_class(e), -(int64_t)p->bytes);
+  uint64_t bytes = p->bytes;
+  zone_version_retire(e, p, e->prev_epoch, from_pressure);
+  return bytes;
+}
+
+/* old (just replaced; it left rcu.active at `epoch`) becomes the prev of the entry for `secs` seconds; the prev of an earlier publication goes (writer_lock held) */
+static void zone_prev_set_locked(zone_db_entry_t *e, zone_version_t *old, uint64_t epoch, uint32_t secs) {
+  (void)zone_prev_drop_locked(e, false);
+  e->prev = old;
+  e->prev_epoch = epoch;
+  atomic_store_explicit(&e->prev_serial, version_serial(old), memory_order_relaxed);
+  atomic_store_explicit(&e->prev_bytes, old->bytes, memory_order_relaxed);
+  zone_bytes_previous_add(zone_bytes_class(e), (int64_t)old->bytes);
+  pthread_mutex_lock(&g_prev_lock);
+  atomic_store_explicit(&e->prev_deadline, time(NULL) + (time_t)secs, memory_order_relaxed);
+  prev_list_add_locked(e);
+  pthread_mutex_unlock(&g_prev_lock);
+}
+
+/* free_zone_db_entry(): nobody else can reach the entry */
+static void zone_prev_release_on_free(zone_db_entry_t *entry) {
+  if (entry->prev_linked) {
+    pthread_mutex_lock(&g_prev_lock);
+    prev_list_del_locked(entry);
+    pthread_mutex_unlock(&g_prev_lock);
+  }
+  if (entry->prev) {
+    zone_bytes_previous_add(zone_bytes_class(entry), -(int64_t)entry->prev->bytes);
+    zone_version_free(entry->prev);
+    entry->prev = NULL;
+  }
+}
+
+/* a reference of the entry for a walker of the list, unless the entry is being freed (its count is 0: it waits for g_prev_lock to take itself off) */
+static bool entry_ref_if_live(zone_db_entry_t *e) {
+  int r = atomic_load_explicit(&e->snapshot_refs, memory_order_relaxed);
+  while (r > 0)
+    if (atomic_compare_exchange_weak_explicit(&e->snapshot_refs, &r, r + 1, memory_order_acq_rel, memory_order_relaxed)) return true;
+  return false;
+}
+
+/* Drop the previous versions of class cls.  expire (now): those whose time is over, at most PREV_EXPIRE_MAX; pressure: the oldest first until `want` bytes are
+ * dropped.  An entry whose writer_lock is busy is left for the next time.  Returns the bytes dropped. */
+static uint64_t prev_sweep(int cls, bool pressure, time_t now, uint64_t want) {
+  zone_db_entry_t *batch[PREV_BATCH];
+  uint64_t freed = 0;
+  size_t skip = 0, dropped = 0;       /* skip: entries at the head that were looked at and stay (busy, being freed) */
+  for (;;) {
+    size_t n = 0;
+    uint64_t planned = 0;
+    pthread_mutex_lock(&g_prev_lock);
+    zone_db_entry_t *e = g_prev_head[cls];
+    for (size_t k = 0; k < skip && e; k++) e = e->prev_next;
+    for (; e && n < PREV_BATCH; e = e->prev_next) {
+      if (pressure ? freed + planned >= want : atomic_load_explicit(&e->prev_deadline, memory_order_relaxed) > now) break;
+      if (!entry_ref_if_live(e)) {
+        skip++;                        /* (it leaves the list by itself) */
+        continue;
+      }
+      batch[n++] = e;
+      planned += atomic_load_explicit(&e->prev_bytes, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&g_prev_lock);
+    if (n == 0) break;
+    for (size_t i = 0; i < n; i++) {
+      e = batch[i];
+      if (pthread_mutex_trylock(&e->writer_lock) != 0) {
+        skip++;
+      } else {
+        if (e->prev && (pressure || atomic_load_explicit(&e->prev_deadline, memory_order_relaxed) <= now)) {
+          freed += zone_prev_drop_locked(e, pressure);
+          dropped++;
+        }
+        pthread_mutex_unlock(&e->writer_lock);
+      }
+      zone_entry_unref(e);              /* (the last reference frees the entry, which takes itself off the list: g_prev_lock is not held here) */
+    }
+    if (pressure ? freed >= want : dropped >= PREV_EXPIRE_MAX) break;
+  }
+  return freed;
+}
+
+void zone_prev_expire(time_t now) {
+  for (int cls = 0; cls < ZBYTES_CLASSES; cls++) (void)prev_sweep(cls, false, now, 0);
+}
+
+uint64_t zone_prev_free_oldest(int cls, uint64_t want) {
+  return want ? prev_sweep(cls, true, 0, want) : 0;
+}
+
+uint64_t zone_prev_inflight(void) { return atomic_load_explicit(&g_prev_inflight, memory_order_relaxed); }
+
+/* Is it the same content (same size, same bytes)?  The image is one block without pointers, and the same input makes the same bytes.  A false answer for equal
+ * content only costs a prev that equals the active version. */
+static bool version_same_image(const zone_version_t *a, const zone_version_t *b) {
+  return a && b && a->image && b->image && a->image->total_size == b->image->total_size &&
+         memcmp(a->image, b->image, a->image->total_size) == 0;
+}
+
 /* next を公開する。entry->writer_lock を持って呼ぶ (S2)。退いた版は解放待ちに積む (S5 B-3: 版は heap のものだけ。
  * 空の版とテストが自分で持つ版は積まない)。他のゾーンのグルーに使われているゾーン、または初めて公開するゾーン
- * なら、制御スレッドに依存するゾーンの応答の版の更新を頼む。 */
-void zone_publish(zone_db_entry_t *entry, zone_version_t *next) {
+ * なら、制御スレッドに依存するゾーンの応答の版の更新を頼む。
+ * keep_prev_secs >= 0 (a zone-file reload or a database install): the replaced version becomes the zone's prev for that long, unless the zone is
+ * published with the very content it had (then the prev stays what it was: a second `reload` of an unchanged zone must not push the good version out);
+ * 0 keeps none and drops the prev of an earlier publication.  < 0 (a dynamic UPDATE, a rollback): prev is not touched. */
+void zone_publish_ex(zone_db_entry_t *entry, zone_version_t *next, int64_t keep_prev_secs) {
   zone_version_t *old = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   /* B9a: a version with ALIAS RRs appears, changes or goes: the resolver thread looks for the targets again.  Read before the publish: the old version is retired by it. */
   bool alias_touch = (next && next->image && (next->image->flags & ZONE_IMAGE_F_ALIAS)) || (old && old->image && (old->image->flags & ZONE_IMAGE_F_ALIAS));
   bool first = atomic_load_explicit(&entry->publish_order, memory_order_relaxed) == 0;
+  /* decided before the publish (the old version is still the active one, so nobody frees it meanwhile) */
+  const bool keep = keep_prev_secs > 0 && old != next && old->heap && old->image && old->image->n_rrs > 0 && !version_same_image(old, next);
   uint64_t epoch = rcu_writer_publish(&entry->rcu.active, next);
   atomic_store_explicit(&entry->publish_order,
                         atomic_fetch_add_explicit(&g_publish_counter, 1, memory_order_seq_cst) + 1,
                         memory_order_seq_cst);
+  atomic_store_explicit(&entry->rolled_back, false, memory_order_release);   /* what is served is not the result of a rollback any more */
   int zb = zone_bytes_class(entry);
   if (next && next->heap && !next->counted) {            /* D1a (8.1): the new version is resident ... */
     next->counted = true;
@@ -1243,28 +1438,19 @@ void zone_publish(zone_db_entry_t *entry, zone_version_t *next) {
     old->counted = false;
     zone_bytes_resident_add(zb, -(int64_t)old->bytes);
   }
+  if (keep_prev_secs == 0) (void)zone_prev_drop_locked(entry, false);
   if (old != next && old->heap) {
-    zone_retire_t *r = calloc(1, sizeof(*r));
-    if (r) {
-      atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_relaxed);
-      r->entry = entry;
-      r->ver = old;
-      r->epoch = epoch;
-      zone_bytes_retired_add(zb, (int64_t)old->bytes);   /* until zone_retire_process() frees it */
-      zone_retire_push(r);
-    } else if (!atomic_load_explicit(&entry->active_axfr, memory_order_acquire) &&
-               !atomic_load_explicit(&entry->is_transferring, memory_order_acquire) &&
-               rcu_writer_wait_until_safe_in_reader(epoch, 60000)) {
-      zone_version_free(old); /* 積めないときは、ここで猶予期間を待って解放する */
-    } else {
-      zone_bytes_retired_add(zb, (int64_t)old->bytes);   /* leaked: it stays counted */
-      syslog(LOG_ERR, "[Zone] zone '%s': out of memory retiring the previous version; it is leaked", entry->domain);
-    }
+    if (keep) zone_prev_set_locked(entry, old, epoch, keep_prev_secs > UINT32_MAX ? UINT32_MAX : (uint32_t)keep_prev_secs);
+    else zone_version_retire(entry, old, epoch, false);
   }
   if (first || atomic_load_explicit(&entry->glue_provider, memory_order_relaxed))
     atomic_store_explicit(&g_glue_dirty, true, memory_order_release);
   if (alias_touch)
     alias_notify();
+}
+
+void zone_publish(zone_db_entry_t *entry, zone_version_t *next) {
+  zone_publish_ex(entry, next, -1);
 }
 
 typedef struct {
@@ -1642,11 +1828,15 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
                                       : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
   zone_glue_track_build(z_next, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
   build_zone_response_cache(z_next, active_cfg_prelink, entry);
+  /* karictl rollback: the version this reload replaces is kept for rollback-window (not for a catalog zone or a secondary's cache file) */
+  zone_veff_t veff;
+  zone_vopts_effective(active_cfg_prelink, zcfg, entry->view_name, &veff);
+  const int64_t keep_prev = (zcfg->is_catalog || entry->is_secondary) ? -1 : (int64_t)veff.rollback_window;
   release_config_snapshot(active_cfg_prelink);
   rcu_aux_read_unlock();
 
   compute_ixfr_diff(entry, z_active, z_next);
-  zone_publish(entry, z_next);
+  zone_publish_ex(entry, z_next, keep_prev);
   struct stat st_loaded;
   if (stat_via_dir_cache(file, &st_loaded) == 0) {
     entry->last_loaded_mtime = st_loaded.st_mtime;
@@ -1660,6 +1850,148 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   // RFC 1996 §4.5: プライマリのゾーンが変わったらセカンダリへ通知する
   if (was_loaded && !entry->is_secondary && entry->serial != old_serial) notify_request_send(entry);
   return RELOAD_OK;
+}
+
+/* ---- karictl rollback <zone> [<view>] [local] ---- */
+
+/* the effective rollback-window of the zone, from the configuration in force (the settings block of a database zone is read inside a read section) */
+uint32_t zone_rollback_window(zone_db_entry_t *entry) {
+  zone_veff_t v;
+  rcu_aux_read_lock();
+  server_config_t *cfg = acquire_config_snapshot();
+  zone_vopts_effective(cfg, cfg ? zone_entry_config(cfg, entry) : NULL, entry->view_name, &v);
+  release_config_snapshot(cfg);
+  rcu_aux_read_unlock();
+  return v.rollback_window;
+}
+
+/* Does the image hold DNSSEC data (RRSIG or DNSKEY)?  The server cannot sign: a new serial would leave the SOA with a signature that does not match. */
+static bool image_has_dnssec(const zone_image_t *img) {
+  if (!img) return false;
+  for (uint32_t seq = 0; seq < img->n_rrs; seq++) {
+    uint16_t t = zone_image_rr_type(img, zone_image_seq_rr(img, seq));
+    if (t == 46 || t == 48) return true;   /* RRSIG (RFC 4034 §3), DNSKEY (§2) */
+  }
+  return false;
+}
+
+/* zonestatus: " rolled back (serial N, from M)" while the served version is the result of a rollback, and " previous version kept (serial S, B bytes, T s left)"
+ * while the zone holds a prev; "" when neither.  Reads atomics only (no lock). */
+void zone_rollback_status(const zone_db_entry_t *entry, char *out, size_t cap) {
+  size_t n = 0;
+  out[0] = '\0';
+  if (atomic_load_explicit(&entry->rolled_back, memory_order_acquire))
+    n += (size_t)snprintf(out, cap, " rolled back (serial %u, from %u)", atomic_load_explicit(&entry->rb_serial, memory_order_relaxed),
+                          atomic_load_explicit(&entry->rb_from, memory_order_relaxed));
+  uint64_t pb = atomic_load_explicit(&entry->prev_bytes, memory_order_relaxed);
+  if (pb && n < cap) {
+    time_t left = atomic_load_explicit(&entry->prev_deadline, memory_order_relaxed) - time(NULL);
+    (void)snprintf(out + n, cap - n, " previous version kept (serial %u, %llu bytes, %lld s left)", atomic_load_explicit(&entry->prev_serial, memory_order_relaxed),
+                   (unsigned long long)pb, (long long)(left > 0 ? left : 0));
+  }
+}
+
+const char *zone_rollback_text(zone_rollback_result_t r) {
+  switch (r) {
+    case ZRB_OK: return "";
+    case ZRB_NO_PREV: return "no previous version: the zone was not reloaded within rollback-window, or it was rolled back already";
+    case ZRB_OFF: return "rollback-window is 0 for this zone: no previous version is kept";
+    case ZRB_NOT_PRIMARY: return "rollback is for primary zones; a secondary gets its data from the primary";
+    case ZRB_SIGNED: return "zone is signed; roll back in the DB and re-sign";
+    case ZRB_BUSY: return "busy (AXFR in progress)";
+    case ZRB_EVICTED: return "the zone was taken out of memory; nothing to roll back";
+    default: return "cannot publish the previous version (see syslog)";
+  }
+}
+
+zone_rollback_result_t zone_rollback(zone_db_entry_t *entry, bool local, uint32_t *new_serial, uint32_t *from_serial) {
+  if (entry->is_secondary || entry->is_catalog_member) return ZRB_NOT_PRIMARY;
+  pthread_mutex_lock(&entry->writer_lock);
+  if (entry->evicted) {
+    pthread_mutex_unlock(&entry->writer_lock);
+    return ZRB_EVICTED;
+  }
+  zone_version_t *p = entry->prev;
+  if (!p) {
+    pthread_mutex_unlock(&entry->writer_lock);
+    return zone_rollback_window(entry) == 0 ? ZRB_OFF : ZRB_NO_PREV;
+  }
+  if (!local && image_has_dnssec(p->image)) {
+    pthread_mutex_unlock(&entry->writer_lock);
+    return ZRB_SIGNED;
+  }
+  if (!wait_for_active_axfr(entry, 5000)) {
+    pthread_mutex_unlock(&entry->writer_lock);
+    syslog(LOG_WARNING, "[Zone] Rollback of zone '%s' postponed: active AXFR in progress (timeout 5s).", entry->domain);
+    return ZRB_BUSY;
+  }
+  /* the old content is built again from its image (as an UPDATE builds on the active one), and published like any other version */
+  zone_arena_t builder;
+  zone_arena_init(&builder);
+  if (thaw_zone_arena(p, &builder) != 0) {
+    zone_arena_destroy(&builder);
+    pthread_mutex_unlock(&entry->writer_lock);
+    syslog(LOG_ERR, "[Zone] Rollback of zone '%s' aborted: cannot rebuild the previous version from its image", entry->domain);
+    return ZRB_FAILED;
+  }
+  const uint32_t from = entry->serial;
+  uint32_t ns = from;
+  if (local) {
+    ns = version_serial(p);
+  } else {
+    ns = update_next_serial(from, SUM_INCREMENT, 0);       /* RFC 1982 §3.1: the next serial; 0 is skipped as for an UPDATE */
+    if (!set_soa_serial_in_arena(&builder, entry->domain, ns)) {
+      zone_arena_destroy(&builder);
+      pthread_mutex_unlock(&entry->writer_lock);
+      syslog(LOG_ERR, "[Zone] Rollback of zone '%s' aborted: cannot set the serial of the previous version", entry->domain);
+      return ZRB_FAILED;
+    }
+  }
+  /* the zone-wide values come with the version (as reload_master_zone() takes them from the SOA) */
+  const uint32_t old_refresh = entry->refresh, old_retry = entry->retry, old_expire = entry->expire;
+  const dns_record_t *ref = zone_arena_reference_soa(&builder, entry->domain);
+  if (!ref || ref->rdata_count < 6) {
+    zone_arena_destroy(&builder);
+    pthread_mutex_unlock(&entry->writer_lock);
+    syslog(LOG_ERR, "[Zone] Rollback of zone '%s' aborted: the previous version has no SOA", entry->domain);
+    return ZRB_FAILED;
+  }
+  entry->serial = ns;
+  entry->refresh = parse_ttl_value(ref->rdata[3]);
+  entry->retry = parse_ttl_value(ref->rdata[4]);
+  entry->expire = parse_ttl_value(ref->rdata[5]);
+  /* zone_install_builder() records the difference between the version in service and this one (the secondaries' IXFR) and publishes it; prev is not touched by it */
+  int rc = zone_install_builder(entry, &builder, "rollback", false);
+  zone_arena_destroy(&builder);
+  if (rc != 0) {
+    entry->serial = from;
+    entry->refresh = old_refresh;
+    entry->retry = old_retry;
+    entry->expire = old_expire;
+    pthread_mutex_unlock(&entry->writer_lock);
+    return ZRB_FAILED;
+  }
+  if (local) ixfr_history_reset(entry);     /* the serial went back: the differences that lead to the old one do not lead here */
+  (void)zone_prev_drop_locked(entry, false);   /* consumed: a second rollback is refused (no redo) */
+  atomic_store_explicit(&entry->rb_serial, ns, memory_order_relaxed);
+  atomic_store_explicit(&entry->rb_from, from, memory_order_relaxed);
+  atomic_store_explicit(&entry->rolled_back, true, memory_order_release);
+  if (entry->source == ZONE_SRC_DB) atomic_store_explicit(&entry->updated, true, memory_order_release);   /* like an UPDATE: only the memory has it; the cache manager does not take the zone out until the database's data change */
+  pthread_mutex_unlock(&entry->writer_lock);
+  if (!local) notify_request_send(entry);
+  if (new_serial) *new_serial = ns;
+  if (from_serial) *from_serial = from;
+  syslog(LOG_NOTICE, "[Zone] Zone '%s' rolled back%s: serial %u (was %u)", entry->domain, local ? " (local, secondaries do not follow)" : "", ns, from);
+  return ZRB_OK;
+}
+
+/* A reload of a rolled-back file zone whose file is the one that was read (mtime and size of that load) keeps the rolled-back version: reading the file
+ * again would bring the data back that was rolled back.  `reload <zone> force` or a changed file reads it. */
+bool zone_rollback_keeps_file(const zone_db_entry_t *entry, const char *file) {
+  struct stat st;
+  if (!atomic_load_explicit(&entry->rolled_back, memory_order_acquire) || !file) return false;
+  return stat_via_dir_cache(file, &st) == 0 && entry->last_loaded_mtime != 0 && st.st_mtime == entry->last_loaded_mtime &&
+         st.st_size == entry->last_loaded_size;
 }
 
 STATIC_TEST void abort_rebuild_snapshot(zone_db_snapshot_t *new_snap, const char *reason) {
@@ -2751,7 +3083,7 @@ static int64_t cache_mono_ms(void) {
 static void cache_peak_note(void) {
     zone_bytes_t zb;
     zone_bytes_get(ZBYTES_DB, &zb);
-    uint64_t u = zb.resident + zb.retired;
+    uint64_t u = zb.resident + zb.retired + zb.previous;
     uint64_t p = atomic_load_explicit(&g_cache_peak, memory_order_relaxed);
     while (u > p && !atomic_compare_exchange_weak_explicit(&g_cache_peak, &p, u, memory_order_relaxed, memory_order_relaxed)) {}
 }
@@ -2784,7 +3116,7 @@ bool dbreg_cache_over_high(uint64_t extra) {
     if (!lim) return false;
     zone_bytes_t zb;
     zone_bytes_get(ZBYTES_DB, &zb);
-    return zb.resident + zb.retired + extra > lim / 100 * CACHE_HIGH_PCT;
+    return zb.resident + zb.retired + zb.previous + extra > lim / 100 * CACHE_HIGH_PCT;
 }
 
 /* The zones in memory are above the hard limit: no zone is fetched for a query meanwhile.  The retired bytes are not counted: they belong to versions that were
@@ -2806,6 +3138,7 @@ void dbreg_cache_stats(dbreg_cache_stats_t *o) {
     o->limit = atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
     o->resident = zb.resident;
     o->retired = zb.retired;
+    o->previous = zb.previous;
     o->inflight = dbreg_evict_inflight();
     o->evictions = atomic_load_explicit(&g_evictions, memory_order_relaxed);
     o->rounds = atomic_load_explicit(&g_cache_rounds, memory_order_relaxed);
@@ -2882,15 +3215,20 @@ uint32_t dbreg_cache_round(void) {
 #endif
     zone_bytes_t zb;
     zone_bytes_get(ZBYTES_DB, &zb);
-    uint64_t used = zb.resident + zb.retired;
+    uint64_t used = zb.resident + zb.retired + zb.previous;
     cache_peak_note();
-    uint64_t inflight = dbreg_evict_inflight();
+    uint64_t inflight = dbreg_evict_inflight() + zone_prev_inflight();     /* (previous versions dropped earlier that the retire stack has not freed are in the retired total) */
     bool pressure = used > limit / 100 * CACHE_HIGH_PCT;
     uint64_t need = 0;
     if (pressure) {
         uint64_t low = limit / 100 * CACHE_LOW_PCT;
         need = used > low ? used - low : 0;
         need = need > inflight ? need - inflight : 0;
+        /* the versions kept for karictl rollback hold memory nobody reads: they go first, the oldest first, before any zone is taken out */
+        if (need && zb.previous) {
+            uint64_t pf = zone_prev_free_oldest(ZBYTES_DB, need);
+            need = need > pf ? need - pf : 0;
+        }
     }
     bool next_pending = atomic_load_explicit(&g_evict_next_hint, memory_order_relaxed) != 0;
     if (need == 0 && !next_pending) return 0;
@@ -4969,6 +5307,9 @@ int rebuild_zone_db_from_config_ext(server_config_t *config, bool skip_unchanged
                         /* reconfig only: a full reload reads every zone file again (it also drops dynamic updates, RFC 2136
                          * changes are not written back) */
                         syslog(LOG_INFO, "[Config] zone '%s' file unchanged (mtime match), skipping reload", z->domain);
+                    } else if (zone_rollback_keeps_file(entry, z->file)) {
+                        /* karictl rollback: the file is the one whose data was rolled back; reading it again would bring that data back (reload <zone> force does) */
+                        syslog(LOG_INFO, "[Config] zone '%s' was rolled back and its file is unchanged since, keeping the rolled-back version", z->domain);
                     } else if (reload_master_zone(entry, z) != RELOAD_OK) {
                         nfailed++;
                         if (failed && failed_sz > 0) {
