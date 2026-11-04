@@ -287,10 +287,8 @@ int main() {
 
     // Test 4: Local buffer overflow prevention (Input boundary checks)
     {
-        char huge_hex[1100];
         char huge_b64[1100];
-        for(int i=0; i<1099; i++) { huge_hex[i] = 'A'; huge_b64[i] = 'A'; }
-        huge_hex[1099] = '\0';
+        for(int i=0; i<1099; i++) { huge_b64[i] = 'A'; }
         huge_b64[1099] = '\0';
         
         static char exact_hex_512[1025];

@@ -84,7 +84,7 @@ static void test_priv_sandbox_directory_caching(void) {
         fd = open(tmp_file, O_CREAT | O_RDWR, 0600);
     }
     assert(fd >= 0);
-    write(fd, "test", 4);
+    (void)!write(fd, "test", 4);
     close(fd);
 
     // 1. Stat via dir cache

@@ -2528,7 +2528,9 @@ static int dag_check_rdata(const uint8_t *pkt, size_t len, uint16_t type, uint16
     size_t p = r, next = 0;
     int e;
 #define DAG_NAME_AT(pos_) do { e = dag_check_name(pkt, len, (pos_), rend, &next); \
-        if (e == DAG_NAME_END) return -1; if (e != DAG_NAME_OK) return e; p = next; } while (0)
+        if (e == DAG_NAME_END) return -1; \
+        if (e != DAG_NAME_OK) return e; \
+        p = next; } while (0)
     switch (type) {
         case 1:
             if (klass == 3) { DAG_NAME_AT(p); return (p + 2 == rend) ? DAG_NAME_OK : -1; } /* CH A: name + address */

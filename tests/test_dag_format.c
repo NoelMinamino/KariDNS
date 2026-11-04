@@ -252,6 +252,7 @@ static const char *type_mnemonic(const char *line) {
 static void __attribute__((noinline)) dirty_stack(size_t v) {
     volatile size_t s[4096];
     for (size_t i = 0; i < 4096; i++) s[i] = v;
+    (void)s[0]; /* a read, so the writes above are not dead stores to the compiler */
 }
 
 static void test_rrsig_cache_signature(void) {

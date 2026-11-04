@@ -3600,8 +3600,8 @@ static void test_control_socket_partial_writes(void) {
     printf("[TEST] Server Core: Control socket partial command writes...\n");
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
-        write(sv[1], "STA", 3);
-        write(sv[1], "TUS\n", 4);
+        (void)!write(sv[1], "STA", 3);
+        (void)!write(sv[1], "TUS\n", 4);
         char buf[16];
         ssize_t r = read(sv[0], buf, 7);
         assert(r == 7);

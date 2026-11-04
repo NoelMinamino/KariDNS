@@ -230,8 +230,14 @@ void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server,
                 static char sig_rdata[65536];
                 format_rdata_for_display(pkt, pkt_len, type, next + 10, rdlen, sig_rdata, sizeof(sig_rdata), dopt);
                 char raw[sizeof(sig_line)];
-                snprintf(raw, sizeof(raw), "%s %u %s %s %s", name, ttl, format_class_name(klass, cname_buf, sizeof(cname_buf)),
-                         dag_type_name(type, tname_buf, sizeof(tname_buf)), sig_rdata);
+                int head = snprintf(raw, sizeof(raw), "%s %u %s %s ", name, ttl, format_class_name(klass, cname_buf, sizeof(cname_buf)),
+                                    dag_type_name(type, tname_buf, sizeof(tname_buf)));
+                if (head > 0 && (size_t)head < sizeof(raw)) { /* the RDATA is cut to what is left of raw, as snprintf would */
+                    size_t room = sizeof(raw) - (size_t)head - 1, rl = strlen(sig_rdata);
+                    if (rl > room) rl = room;
+                    memcpy(raw + head, sig_rdata, rl);
+                    raw[(size_t)head + rl] = '\0';
+                }
                 yaml_single_quote_escape(raw, sig_line, sizeof(sig_line));
             }
         }

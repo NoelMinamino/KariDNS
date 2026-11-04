@@ -2986,7 +2986,7 @@ static void test_handle_axfr_event_eagain_and_partial_recv(void) {
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
         fcntl(sv[0], F_SETFL, O_NONBLOCK);
         uint8_t buf[16] = { 0, 10, 'x' };
-        write(sv[1], buf, 3); // partial 3 bytes
+        if (write(sv[1], buf, 3) != 3) abort(); // partial 3 bytes
         close(sv[0]);
         close(sv[1]);
     }
