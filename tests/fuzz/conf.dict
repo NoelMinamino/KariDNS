@@ -332,3 +332,7 @@
 "rollback"
 "retransfer"
 "reconfig"
+"rollback-window"
+"90m"
+"1h"
+"1d"

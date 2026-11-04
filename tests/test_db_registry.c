@@ -2135,7 +2135,8 @@ static void test_zone_bytes(void) {
     CHECK(txn && txn->acct == 1 + ZBYTES_DB && txn->bytes >= sizeof(*txn) && txn->old_serial == 1 && txn->new_serial == 2);
     zone_bytes_get(ZBYTES_DB, &db);
     CHECK(txn && db.resident == db0.resident + v2->bytes + txn->bytes);
-    CHECK(db.retired == db0.retired + b1 || db.retired == db0.retired);                 /* (b1 is still counted unless the stack was run) */
+    CHECK(db.retired == db0.retired);                                                   /* (v1 is the zone's prev now, not on the retire stack) */
+    CHECK(db.previous == db0.previous + b1 && z->prev == v1);
     zone_retire_process(true);
     zone_bytes_get(ZBYTES_DB, &db);
     CHECK(db.retired == db0.retired && db.resident == db0.resident + v2->bytes + txn->bytes);
@@ -2144,13 +2145,129 @@ static void test_zone_bytes(void) {
     gc_snapshot_wait_idle();
     zone_retire_process(true);
     zone_bytes_get(ZBYTES_DB, &db);
-    CHECK(db.resident == db0.resident && db.retired == db0.retired);
+    CHECK(db.resident == db0.resident && db.retired == db0.retired && db.previous == db0.previous);   /* (the entry's prev went with it) */
     dbreg_reset();
     rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
     gc_snapshot_wait_idle();
     zone_retire_process(true);
     zone_bytes_get(ZBYTES_OTHER, &ot);
     CHECK(ot.resident <= ot0.resident + 1 && ot.retired == ot0.retired);                 /* the file zone left with its snapshot */
+}
+
+/* ---- karictl rollback for DB zones: prev from a database install, the memory limit drops it first, a rollback pins the zone ---- */
+static void test_prev_db(void) {
+    printf("[TEST] rollback of DB zones: prev from an install, the cache manager drops it before it evicts a zone, a rollback pins the zone...\n");
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    zone_bytes_t d0, d1;
+    zone_bytes_get(ZBYTES_DB, &d0);
+    CHECK(d0.previous == 0);
+    const char *names[3] = { "pv0.test.", "pv1.test.", "pv2.test." };
+    zone_db_entry_t *z[3];
+    for (int i = 0; i < 3; i++) {
+        z[i] = add_zone("default", names[i], 1, 100, 9300 + i);
+        CHECK(z[i] != NULL && snapshot_apply_db_delta() == 1);
+        CHECK(z[i] && z[i]->prev == NULL);                                       /* the first install keeps nothing */
+    }
+    for (int i = 0; i < 3; i++) {
+        CHECK(add_zone("default", names[i], 2, 101, 9300 + i) == z[i]);
+        CHECK(z[i]->prev != NULL && atomic_load(&z[i]->prev_serial) == 1 && z[i]->prev->bytes == atomic_load(&z[i]->prev_bytes));
+    }
+    zone_bytes_get(ZBYTES_DB, &d1);
+    CHECK(d1.previous == z[0]->prev->bytes + z[1]->prev->bytes + z[2]->prev->bytes);
+    CHECK(d1.retired == d0.retired);
+
+    /* a rollback of a DB zone: serial + 1, pinned like an UPDATE, prev consumed; the next install from the database replaces it */
+    uint32_t ns = 0, from = 0;
+    CHECK(zone_rollback(z[0], false, &ns, &from) == ZRB_OK && from == 2 && ns == 3);
+    CHECK(z[0]->prev == NULL && atomic_load(&z[0]->rolled_back) && atomic_load(&z[0]->updated));
+    CHECK(zone_rollback(z[0], false, &ns, &from) == ZRB_NO_PREV);
+    CHECK(add_zone("default", names[0], 4, 102, 9300) == z[0]);
+    CHECK(!atomic_load(&z[0]->rolled_back) && !atomic_load(&z[0]->updated) && z[0]->prev != NULL && z[0]->serial == 4);
+    zone_retire_process(true);
+
+    /* memory-limit: three previous versions; the limit is reached by a little: the oldest one goes, no zone is evicted */
+    zone_bytes_get(ZBYTES_DB, &d1);
+    uint64_t used = d1.resident + d1.retired + d1.previous;
+    uint64_t pb = z[1]->prev->bytes;                                              /* (z[1] has the oldest one) */
+    CHECK(d1.previous > 0 && pb * 100 > used * 6);
+    uint64_t limit = (used - pb + 100) / 9 * 10;                               /* need = used - 0.9 * limit = pb - 100 */
+    dbreg_cache_set_limit(limit);
+    dbreg_cache_stats_t cs0, cs1;
+    dbreg_cache_stats(&cs0);
+    CHECK(cs0.previous == d1.previous);
+    CHECK(dbreg_cache_over_high(0));                                              /* previous versions count */
+    CHECK(dbreg_cache_round() == 0);
+    dbreg_cache_stats(&cs1);
+    CHECK(cs1.evictions == cs0.evictions);
+    CHECK(z[1]->prev == NULL && z[2]->prev != NULL && z[0]->prev != NULL);        /* the earliest deadline went, only that */
+    CHECK(zone_prev_inflight() == pb);
+    zone_retire_process(true);
+    CHECK(zone_prev_inflight() == 0);
+    zone_bytes_get(ZBYTES_DB, &d1);
+    CHECK(d1.previous == z[0]->prev->bytes + z[2]->prev->bytes);
+
+    /* the limit is far below what the zones need: every previous version goes first, then zones are taken out */
+    usleep(200 * 1000);                                                           /* (a zone is not taken out within 100 ms of its load) */
+    dbreg_cache_set_limit(d1.resident / 2);
+    (void)dbreg_cache_round();
+    zone_bytes_get(ZBYTES_DB, &d1);
+    CHECK(d1.previous == 0);
+    dbreg_cache_stats(&cs1);
+    CHECK(cs1.evictions > cs0.evictions);
+    dbreg_cache_set_limit(0);
+    zone_retire_process(true);
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    zone_bytes_get(ZBYTES_DB, &d1);
+    CHECK(d1.previous == 0 && d1.retired == 0 && zone_bytes_underflows() == 0);
+}
+
+/* prev against the retire stack, the tick and the cache manager at the same time (run under ThreadSanitizer too) */
+static _Atomic bool g_pc_stop;
+static void *pc_sweeper(void *arg) {
+    (void)arg;
+    while (!atomic_load(&g_pc_stop)) {
+        zone_prev_expire(time(NULL) + 7200);
+        (void)zone_prev_free_oldest(ZBYTES_DB, 1 << 20);
+        usleep(100);
+    }
+    return NULL;
+}
+
+static void test_prev_concurrent(void) {
+    printf("[TEST] rollback: prev, the retire stack, the tick and the cache manager at the same time...\n");
+    zone_retire_process(true);
+    pthread_t th;
+    atomic_store(&g_pc_stop, false);
+    CHECK(pthread_create(&th, NULL, pc_sweeper, NULL) == 0);
+    const char *names[4] = { "pc0.test.", "pc1.test.", "pc2.test.", "pc3.test." };
+    zone_db_entry_t *z[4];
+    for (int i = 0; i < 4; i++) {
+        z[i] = add_zone("default", names[i], 1, 3, 9400 + i);
+        CHECK(z[i] != NULL && snapshot_apply_db_delta() == 1);
+    }
+    for (int n = 2; n < 200; n++) {
+        int i = n % 4;
+        CHECK(add_zone("default", names[i], (uint32_t)n, 3 + n % 7, 9400 + i) == z[i]);
+        uint32_t ns, from;
+        if (n % 9 == 0) (void)zone_rollback(z[i], n % 2 == 0, &ns, &from);       /* (refused when the sweeper took prev meanwhile) */
+        if (n % 16 == 0) zone_retire_process(false);
+        if (n % 50 == 0) usleep(2000);
+    }
+    atomic_store(&g_pc_stop, true);
+    pthread_join(th, NULL);
+    for (int i = 0; i < 4; i++) CHECK(dbreg_delete("default", names[i], 9400 + i) == 1);
+    CHECK(snapshot_apply_db_delta() >= 1);
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    zone_bytes_t d;
+    zone_bytes_get(ZBYTES_DB, &d);
+    CHECK(d.previous == 0 && d.retired == 0 && zone_bytes_underflows() == 0);
 }
 
 int main(void) {
@@ -2178,6 +2295,8 @@ int main(void) {
     test_dir_replaced_entry_ticks();
     test_dir_bytes_per_zone();
     test_zone_bytes();
+    test_prev_db();
+    test_prev_concurrent();
     test_concurrent();
     gc_snapshot_wait_idle();      /* join the cleanup threads: none is left running (or leaked, for ThreadSanitizer) at exit */
     free(g_names);

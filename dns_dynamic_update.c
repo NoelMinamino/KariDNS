@@ -56,6 +56,19 @@ uint32_t bump_soa_serial_in_arena(zone_arena_t *arena, const char *zone_name) {
   return bump_soa_serial_method(arena, zone_name, SUM_INCREMENT, 0);
 }
 
+/* Writes serial as the serial of the SOA record i of the arena (arena_strdup, then the cached form is made again).  false: out of memory. */
+static bool soa_write_serial(zone_arena_t *arena, size_t i, uint32_t serial) {
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%u", serial);
+  /* [C-2] arena_strdup 失敗時は NULL が代入されることを防ぐ */
+  char *new_rdata = arena_strdup(arena, buf);
+  if (!new_rdata) return false;
+  arena->records[i].rdata[2] = new_rdata;
+  arena->records[i].is_cached = false;
+  dns_record_preparse_cache(arena, &arena->records[i]);
+  return true;
+}
+
 uint32_t bump_soa_serial_method(zone_arena_t *arena, const char *zone_name, int method, time_t now) {
   if (!arena || !zone_name) return 0;
   uint32_t new_serial = 0;
@@ -67,21 +80,28 @@ uint32_t bump_soa_serial_method(zone_arena_t *arena, const char *zone_name, int 
         if (new_serial == 0) {
           new_serial = update_next_serial((uint32_t)strtoul(arena->records[i].rdata[2], NULL, 10), method, now);
         }
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%u", new_serial);
-        /* [C-2] arena_strdup 失敗時は NULL が代入されることを防ぐ */
-        char *new_rdata = arena_strdup(arena, buf);
-        if (!new_rdata) {
+        if (!soa_write_serial(arena, i, new_serial)) {
           syslog(LOG_ERR, "[Update] arena_strdup failed bumping SOA serial; aborting update");
           return 0;
         }
-        arena->records[i].rdata[2] = new_rdata;
-        arena->records[i].is_cached = false;
-        dns_record_preparse_cache(arena, &arena->records[i]);
       }
     }
   }
   return new_serial;
+}
+
+/* karictl rollback: every apex SOA RR of the zone gets `serial` (the SOA RRs of one zone have one serial).  false: no SOA, or out of memory. */
+bool set_soa_serial_in_arena(zone_arena_t *arena, const char *zone_name, uint32_t serial) {
+  if (!arena || !zone_name) return false;
+  bool found = false;
+  for (size_t i = 0; i < arena->count; i++) {
+    if (arena->records[i].type_code == 6 && domain_names_match_ci(arena->records[i].name, zone_name) && arena->records[i].rdata_count >= 3 &&
+        arena->records[i].rdata[2]) {
+      if (!soa_write_serial(arena, i, serial)) return false;
+      found = true;
+    }
+  }
+  return found;
 }
 
 static uint32_t soa_serial_in_arena(const zone_arena_t *arena, const char *zone_name) {

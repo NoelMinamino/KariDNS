@@ -3975,6 +3975,38 @@ static void test_bind_option_values_zone(void) {
         }
     }
     expect_an_error("serial method", "zone \"z.test\" { type master; file \"z\"; serial-update-method epoch; };", "serial-update-method: invalid value 'epoch'|increment, unixtime or date");
+    /* rollback-window (KariDNS): the default is 1h, 0 = keep none, seconds or a time with units; zone > view > options */
+    if (ok_with("rollback default", "options { }; zone \"z.test\" { type master; file \"z\"; };", "", &cfg)) {
+        zone_vopts_effective(&cfg, first_zone(&cfg), "__default__", &v);
+        CHECK(v.rollback_window == 3600 && ROLLBACK_WINDOW_DEFAULT == 3600);
+        free_server_config_fields(&cfg);
+    }
+    if (ok_with("rollback levels",
+                "options { rollback-window 2h; };\n"
+                "view v1 { match-clients { any; }; rollback-window 90;\n"
+                "  zone \"a.test\" { type master; file \"a\"; rollback-window 0; };\n"
+                "  zone \"b.test\" { type master; file \"b\"; };\n"
+                "  zone \"c.test\" { type master; file \"c\"; rollback-window 1d; }; };\n"
+                "view v2 { match-clients { any; };\n"
+                "  zone \"d.test\" { type master; file \"d\"; }; };", "", &cfg)) {
+        zone_config_t *za = view_find_zone_config(cfg.views, "a.test"), *zb = view_find_zone_config(cfg.views, "b.test"),
+                      *zc = view_find_zone_config(cfg.views, "c.test"), *zd = view_find_zone_config(cfg.views->next, "d.test");
+        CHECK(za && zb && zc && zd);
+        zone_vopts_effective(&cfg, za, "v1", &v);
+        CHECK(v.rollback_window == 0 && (zext(za)->zv.set & ZV_ROLLBACK_WINDOW));
+        zone_vopts_effective(&cfg, zb, "v1", &v);
+        CHECK(v.rollback_window == 90);
+        zone_vopts_effective(&cfg, zc, "v1", &v);
+        CHECK(v.rollback_window == 86400);
+        zone_vopts_effective(&cfg, zd, "v2", &v);
+        CHECK(v.rollback_window == 7200 && cfg.zv.rollback_window == 7200);
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("rollback junk", "options { rollback-window soon; };", "rollback-window: invalid value 'soon'");
+    expect_an_error("rollback negative", "options { rollback-window -5; };", "rollback-window: invalid value '-5'");
+    expect_an_error("rollback unit", "zone \"z.test\" { type master; file \"z\"; rollback-window 5x; };", "zone 'z.test.'|rollback-window: invalid value '5x'");
+    expect_an_error("rollback iso", "view v { match-clients { any; }; rollback-window P1D; };", "view 'v'|rollback-window: invalid value 'P1D'");
+    expect_an_error("rollback too big", "options { rollback-window 4294967296; };", "rollback-window: invalid value");
     /* masterfile-format: text is read, raw is refused clearly (no silent text read of a raw file) */
     if (ok_with("masterfile text", "options { masterfile-format text; }; zone \"z.test\" { type master; file \"z\"; masterfile-format TEXT; };", "", &cfg))
         free_server_config_fields(&cfg);

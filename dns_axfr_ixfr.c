@@ -310,6 +310,13 @@ void ixfr_history_set_depth(zone_db_entry_t *entry, int depth) {
   pthread_mutex_unlock(&h->lock);
 }
 
+void ixfr_history_reset(zone_db_entry_t *entry) {
+  ixfr_history_t *h = &entry->ixfr_history;
+  pthread_mutex_lock(&h->lock);
+  if (h->entries) (void)ixfr_ring_resize(h, 0);      /* (the ring is made again at the next stored diff) */
+  pthread_mutex_unlock(&h->lock);
+}
+
 void ixfr_history_clear(ixfr_history_t *h) {
   for (int i = 0; i < h->cap && h->entries; i++)
     if (h->entries[i]) free_ixfr_txn(h->entries[i]);
@@ -1009,7 +1016,7 @@ int zone_limits_gate(zone_db_entry_t *entry, zone_arena_t *builder, const char *
   return 0;
 }
 
-int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const char *what) {
+int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const char *what, bool keep_prev) {
   zone_version_t *cur_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
 
   zone_arena_shrink_records(builder);
@@ -1042,11 +1049,17 @@ int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const ch
                                       : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
   zone_glue_track_build(standby, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
   build_zone_response_cache(standby, active_cfg_prelink, entry);
+  int64_t keep_secs = -1;           /* karictl rollback: a database install keeps the version it replaces for the zone's rollback-window */
+  if (keep_prev) {
+    zone_veff_t veff;
+    zone_vopts_effective(active_cfg_prelink, zcfg, entry->view_name, &veff);
+    keep_secs = veff.rollback_window;
+  }
   release_config_snapshot(active_cfg_prelink);
   rcu_aux_read_unlock();
 
   compute_ixfr_diff(entry, cur_active, standby);
-  zone_publish(entry, standby);
+  zone_publish_ex(entry, standby, keep_secs);
   return 0;
 }
 
@@ -1328,7 +1341,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
          * data is refused the previous settings are put back */
         zone_ext_shared_t *rx_prev = NULL;
         if (rx_apply) rx_prev = zone_rx_settings_apply_locked(entry, zone_rx_settings_parse(entry->domain, rx_text, rx_len));
-        if (zone_install_builder(entry, &tmp_arena, "XFR") != 0) {
+        if (zone_install_builder(entry, &tmp_arena, "XFR", false) != 0) {
           if (rx_apply) zone_ext_shared_unref(zone_rx_settings_apply_locked(entry, rx_prev));
           entry->serial = old_serial;
           entry->refresh = old_refresh;

@@ -194,7 +194,7 @@ ctl admin reload ctl.test;    expect "admin reload <zone>" 0 '^OK reloaded'
 ctl admin notify ctl.test;    expect "admin notify" 0 ''
 ctl admin reconfig;           expect "admin reconfig" 0 '^OK'
 ctl admin bogus_command;      expect "admin unknown command is the old reply" 3 '^ERROR unknown command$'
-ctl admin rollback ctl.test;  expect "admin rollback (not built yet) is the old unknown-command reply" 3 '^ERROR unknown command$'
+ctl admin rollback ctl.test;  expect "admin rollback reaches its command (nothing was reloaded with a change: no previous version)" 3 '^ERROR no previous version'
 ctl main status;              expect "unnamed secret: status" 0 '^server is up and running$'
 ctl main reload;              expect "unnamed secret: reload" 0 '^OK reloaded'
 grep -q '\[Control\] key "admin": reload$' "${LOG}" && pass "admin is named in the log" || fail "admin not in the log"

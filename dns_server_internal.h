@@ -428,7 +428,7 @@ typedef enum {
   ZONE_SRC_DB,         /* データベースから取り込んだゾーン */
 } zone_source_t;
 
-typedef struct {
+typedef struct zone_db_entry_s {
   char domain[256];
   char view_name[KARIDNS_VIEW_NAME_MAX];
   zone_kind_t kind;
@@ -489,6 +489,20 @@ typedef struct {
   uint64_t id;
   /* 最後に公開したときの全体の公開カウンタ */
   _Atomic uint64_t publish_order;
+  /* karictl rollback: the version that was served before the last zone-file reload or database install (not a dynamic UPDATE, not a
+   * transfer).  prev, prev_epoch and rolled_back's writers belong to entry->writer_lock; readers of the zone never see prev (it is not
+   * reachable from rcu.active), so the query path is unchanged.  prev_next / prev_prev / prev_linked belong to g_prev_lock (the list of
+   * the entries that hold a prev, oldest deadline first: the control thread's tick and the cache manager walk it).  prev_serial,
+   * prev_bytes, prev_deadline and the rolled_back group are atomics for zonestatus and dbstatus, which read them without the lock. */
+  zone_version_t *prev;
+  uint64_t prev_epoch;            /* the RCU epoch at which prev left rcu.active (its retirement waits for it) */
+  struct zone_db_entry_s *prev_next, *prev_prev;
+  bool prev_linked;
+  _Atomic uint32_t prev_serial;
+  _Atomic uint64_t prev_bytes;    /* 0 = no prev */
+  _Atomic(time_t) prev_deadline;  /* when the control thread's tick drops prev */
+  _Atomic bool rolled_back;       /* the served version is the result of a rollback; cleared by the next publication */
+  _Atomic uint32_t rb_serial, rb_from;
 } zone_db_entry_t;
 /* 制御チャネルで送る統計 (dns_wire.h、karictl も読む) も同じ長さで view 名を持つ */
 _Static_assert(sizeof(((zone_observatory_snapshot_t *)0)->view_name) == KARIDNS_VIEW_NAME_MAX,
@@ -914,10 +928,15 @@ void zone_glue_track_build(zone_version_t *ver, const char *zone_domain, view_sn
 size_t zone_drop_unencodable_logged(zone_arena_t *a, const char *zone, const char *from);
 /* S2: 公開、解放待ちの処理、兄弟ゾーンの変更に伴うグルーの作り直し (dns_snapshot_rcu.c) */
 void zone_publish(zone_db_entry_t *entry, zone_version_t *next);
+/* keep_prev_secs < 0: as zone_publish() (a dynamic UPDATE: prev is left as it is).  >= 0: a zone-file reload or a database install: the version
+ * that is replaced becomes entry->prev for that many seconds (0: none is kept, and the prev of an earlier publication goes), see "karictl rollback"
+ * below.  The writer_lock is held. */
+void zone_publish_ex(zone_db_entry_t *entry, zone_version_t *next, int64_t keep_prev_secs);
 void zone_retire_process(bool wait);
 bool zone_retire_object(zone_db_entry_t *entry, void *obj, void (*free_fn)(void *), uint64_t epoch);
 /* builder を新しい版として公開する (dns_axfr_ixfr.c)。entry->writer_lock を持って呼ぶ。約束は定義の前の注釈に */
-int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const char *what);
+/* keep_prev: the version it replaces becomes entry->prev for the zone's rollback-window (a database install); false: zone_publish() */
+int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const char *what, bool keep_prev);
 /* the size limits of the zone (max-records, ...) checked on a built zone before it is installed; 0 = ok (see dns_axfr_ixfr.c) */
 int zone_limits_gate(zone_db_entry_t *entry, zone_arena_t *builder, const char *what);
 /* 公開直前に呼ぶ: 応答キャッシュに入れてよいか (rcache_ok) を決める。ゾーンの設定は zone_entry_config(cfg, entry)
@@ -939,11 +958,43 @@ enum { ZBYTES_DB = 0, ZBYTES_OTHER = 1, ZBYTES_CLASSES = 2 };
 typedef struct {
   uint64_t resident;   /* what the zones serve now, IXFR differences included */
   uint64_t retired;    /* replaced versions that are not freed yet */
+  uint64_t previous;   /* the versions that zones keep for `karictl rollback` (entry->prev): nobody reads them, a rollback or the rollback-window ends them */
 } zone_bytes_t;
 void zone_bytes_get(int cls, zone_bytes_t *out);
 int zone_bytes_class(const zone_db_entry_t *e);
 /* for the IXFR history (dns_axfr_ixfr.c): a difference was stored in / left the history of a zone of class cls */
 void zone_bytes_resident_add(int cls, int64_t delta);
+
+/* ---- karictl rollback (dns_snapshot_rcu.c) ---- */
+typedef enum {
+  ZRB_OK = 0,
+  ZRB_NO_PREV,       /* no previous version (the zone was not reloaded since it was loaded, or the window ran out, or it was rolled back already) */
+  ZRB_OFF,           /* rollback-window is 0 for the zone: no previous version is kept */
+  ZRB_NOT_PRIMARY,   /* a secondary or a catalog member: its primary sends the data again */
+  ZRB_SIGNED,        /* the zone holds RRSIG / DNSKEY: a new serial would break the signature of the SOA */
+  ZRB_BUSY,          /* a zone transfer is running */
+  ZRB_EVICTED,       /* the zone was taken out of memory meanwhile */
+  ZRB_FAILED         /* out of memory, or the old version does not fit the limits now (syslog says) */
+} zone_rollback_result_t;
+/* Publish entry->prev again.  local false: with SOA serial = the current serial + 1 (RFC 1982), the IXFR difference and NOTIFY as for a reload, so
+ * the secondaries follow; local true: unchanged, with its old serial, on this server only (no NOTIFY, the IXFR history is dropped).  Consumes prev.
+ * *new_serial / *from_serial get the serial now served and the one it replaced.  Takes entry->writer_lock itself. */
+zone_rollback_result_t zone_rollback(zone_db_entry_t *entry, bool local, uint32_t *new_serial, uint32_t *from_serial);
+const char *zone_rollback_text(zone_rollback_result_t r);   /* the text after "ERROR " */
+/* " rolled back (serial N, from M)" and " previous version kept (...)" for zonestatus; "" for neither */
+void zone_rollback_status(const zone_db_entry_t *entry, char *out, size_t cap);
+/* the effective rollback-window of the zone, in seconds (reads the configuration) */
+uint32_t zone_rollback_window(zone_db_entry_t *entry);
+/* the control thread's tick: drop the previous versions whose window is over */
+void zone_prev_expire(time_t now);
+/* the cache manager: drop previous versions of class cls (ZBYTES_*), the oldest first, until about `want` bytes are on their way to being freed; returns
+ * the bytes dropped.  zone_prev_inflight(): the bytes dropped that the retire stack has not freed yet (class ZBYTES_DB) */
+uint64_t zone_prev_free_oldest(int cls, uint64_t want);
+uint64_t zone_prev_inflight(void);
+/* a rolled-back zone whose file is still the one that was read (same mtime and size): a reload keeps the rolled-back version unless it is forced */
+bool zone_rollback_keeps_file(const zone_db_entry_t *entry, const char *file);
+/* drops all the diffs of the IXFR history of the zone (a local rollback: the serial goes back, the chain would not lead to it) */
+void ixfr_history_reset(zone_db_entry_t *entry);
 
 /* ---- DB zone registry and view delta (beta design 4.2, 4.4; implemented in dns_snapshot_rcu.c) ----
  * The registry is the source of truth for which DB zones exist: per view (by name) the zone directory's elements of the
@@ -1068,6 +1119,7 @@ int dbreg_find_info(const char *view, const char *name, dbreg_info_t *out, int m
  * than the high mark of the limit; the ingest thread's cache thread calls it every 100 ms. */
 typedef struct {
   uint64_t limit, resident, retired, inflight;   /* bytes: the limit (0 = none), the version bytes in memory, replaced / evicted but not freed, evicted but not freed */
+  uint64_t previous;                             /* versions kept for karictl rollback (not served); the manager drops them before it evicts a zone */
   uint64_t evictions, rounds, cold, marked, misses;
   uint64_t xfr_marked;                           /* zones a transfer brought into memory that were marked evict-next (dbreg_xfr_loaded()) */
   uint64_t xfr[4];                               /* transfers of zones that were out of memory, by DBREG_XFR_* */

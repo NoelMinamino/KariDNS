@@ -27,6 +27,7 @@
 #include "dns_priv_sandbox.h"
 #include "dns_query_engine.h"
 #include "dns_axfr_ixfr.h"
+#include "dns_dynamic_update.h"
 #include "dns_cidr.h"
 #include "dns_tsig_acl.h"
 #include "dns_utils.h"
@@ -1412,6 +1413,301 @@ static void test_snapshot_view_match_key(void) {
     release_zone_snapshot(s2);
 }
 
+/* ---- karictl rollback: the previous version (entry->prev), its memory class, its window, and zone_rollback() ---- */
+static void rb_zone(const char *file, const char *zone, uint32_t serial, const char *extra) {
+    char text[1024];
+    snprintf(text, sizeof(text), "$ORIGIN %s.\n$TTL 300\n@ IN SOA ns.%s. h.%s. %u 7200 3600 1209600 300\n@ IN NS ns.%s.\nns IN A 192.0.2.1\n%s",
+             zone, zone, zone, serial, zone, extra ? extra : "");
+    wfile(file, text);
+}
+
+/* the serial of the SOA at the apex of the version the zone serves */
+static uint32_t rb_served_serial(zone_db_entry_t *e) {
+    zone_version_t *v = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
+    zone_image_soa_t nums;
+    uint32_t rr = zone_image_apex_soa(v->image);
+    assert(rr != ZONE_IMAGE_NONE && zone_image_soa(v->image, rr, NULL, 0, NULL, 0, &nums) == 0);
+    return nums.serial;
+}
+
+static bool rb_served_has(zone_db_entry_t *e, const char *name) {
+    zone_version_t *v = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
+    return zone_image_find_name(v->image, name) != ZONE_IMAGE_NONE;
+}
+
+/* a new version of the zone with this serial, built from the served one (what an UPDATE does) */
+static zone_version_t *rb_make_next(zone_db_entry_t *e, uint32_t serial) {
+    zone_arena_t b;
+    zone_arena_init(&b);
+    assert(thaw_zone_arena(atomic_load_explicit(&e->rcu.active, memory_order_acquire), &b) == 0);
+    assert(set_soa_serial_in_arena(&b, e->domain, serial));
+    zone_arena_shrink_records(&b);
+    assert(build_zone_index(&b, true) == 0);
+    b.image = zone_image_freeze(&b, e->domain);
+    assert(b.image);
+    zone_arena_free_builder(&b);
+    zone_version_t *v = zone_version_new(&b);
+    zone_arena_destroy(&b);
+    assert(v);
+    return v;
+}
+
+/* an UPDATE-like publication (zone_publish(): prev is left alone) */
+static void rb_update_like(zone_db_entry_t *e, uint32_t serial) {
+    zone_version_t *v = rb_make_next(e, serial);
+    pthread_mutex_lock(&e->writer_lock);
+    e->serial = serial;
+    zone_publish(e, v);
+    pthread_mutex_unlock(&e->writer_lock);
+}
+
+/* the cleanup threads free the entries of the earlier tests meanwhile: wait until the totals stop moving */
+static void rb_settle(void) {
+    zone_bytes_t a, b;
+    for (int i = 0; i < 100; i++) {
+        zone_retire_process(true);
+        zone_bytes_get(ZBYTES_OTHER, &a);
+        usleep(50000);
+        zone_retire_process(true);
+        zone_bytes_get(ZBYTES_OTHER, &b);
+        if (a.previous == b.previous && a.retired == b.retired && a.resident == b.resident) return;
+    }
+}
+
+static void test_zone_rollback(void) {
+    printf("[TEST] Rollback: prev is filled by a reload (not by an UPDATE), the previous bytes, the window, the serial, the refusals...\n");
+    rb_zone("rb1.zone", "rb1.example", 1, NULL);
+    rb_zone("rb2.zone", "rb2.example", 1, NULL);
+    rb_zone("rb3.zone", "rb3.example", 1, NULL);
+    rb_zone("rb4.zone", "rb4.example", 1, NULL);
+    rb_zone("rb5.zone", "rb5.example", 1, "@ IN DNSKEY 257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==\n");
+    rb_zone("rb6.zone", "rb6.example", 4294967294u, NULL);
+    /* the zones of the earlier tests are freed by the cleanup threads: let them finish before the totals are read */
+    {
+        zone_db_snapshot_t *empty = build(load_conf("options { };\n"), false);
+        release_zone_snapshot(empty);
+        rb_settle();
+    }
+    server_config_t *cfg = load_conf(
+        "options { rollback-window 300; };\n"
+        "zone \"rb1.example\" { type master; file \"%s/rb1.zone\"; };\n"
+        "zone \"rb2.example\" { type master; file \"%s/rb2.zone\"; rollback-window 0; };\n"
+        "zone \"rb3.example\" { type master; file \"%s/rb3.zone\"; rollback-window 100; };\n"
+        "zone \"rb4.example\" { type master; file \"%s/rb4.zone\"; rollback-window 200; };\n"
+        "zone \"rb5.example\" { type master; file \"%s/rb5.zone\"; };\n"
+        "zone \"rb6.example\" { type master; file \"%s/rb6.zone\"; };\n",
+        g_dir, g_dir, g_dir, g_dir, g_dir, g_dir);
+    zone_db_snapshot_t *snap = build(cfg, false);
+    zone_db_entry_t *e1 = snapshot_get_zone(snap, "rb1.example.");
+    zone_db_entry_t *e2 = snapshot_get_zone(snap, "rb2.example.");
+    zone_db_entry_t *e3 = snapshot_get_zone(snap, "rb3.example.");
+    zone_db_entry_t *e4 = snapshot_get_zone(snap, "rb4.example.");
+    zone_db_entry_t *e5 = snapshot_get_zone(snap, "rb5.example.");
+    zone_db_entry_t *e6 = snapshot_get_zone(snap, "rb6.example.");
+    assert(e1 && e2 && e3 && e4 && e5 && e6);
+    zone_config_t *c1 = find_zone_config_in_view(cfg, NULL, "rb1.example.");
+    zone_config_t *c2 = find_zone_config_in_view(cfg, NULL, "rb2.example.");
+    zone_config_t *c3 = find_zone_config_in_view(cfg, NULL, "rb3.example.");
+    zone_config_t *c4 = find_zone_config_in_view(cfg, NULL, "rb4.example.");
+    zone_config_t *c5 = find_zone_config_in_view(cfg, NULL, "rb5.example.");
+    zone_config_t *c6 = find_zone_config_in_view(cfg, NULL, "rb6.example.");
+
+    /* the window: the zone's own value, else options', 0 = off */
+    assert(zone_rollback_window(e1) == 300 && zone_rollback_window(e2) == 0 && zone_rollback_window(e3) == 100 && zone_rollback_window(e4) == 200);
+
+    /* the first load keeps nothing; a zone with nothing to go back to is refused */
+    assert(e1->prev == NULL && atomic_load(&e1->prev_bytes) == 0);
+    uint32_t ns = 0, from = 0;
+    assert(zone_rollback(e1, false, &ns, &from) == ZRB_NO_PREV);
+    assert(zone_rollback(e2, false, &ns, &from) == ZRB_OFF);
+    char st[200];
+    zone_rollback_status(e1, st, sizeof(st));
+    assert(st[0] == '\0');
+
+    /* a reload: the version it replaces becomes prev, counted as "previous" (not resident, not retired) */
+    zone_version_t *v1 = atomic_load_explicit(&e1->rcu.active, memory_order_acquire);
+    rb_zone("rb1.zone", "rb1.example", 2, "bad IN A 192.0.2.66\n");
+    zone_retire_process(true);
+    zone_bytes_t b1;
+    zone_bytes_get(ZBYTES_OTHER, &b1);
+    assert(reload_master_zone(e1, c1) == RELOAD_OK);
+    assert(e1->prev == v1 && atomic_load(&e1->prev_bytes) == v1->bytes && atomic_load(&e1->prev_serial) == 1 && !v1->counted);
+    assert(rb_served_has(e1, "bad.rb1.example.") && rb_served_serial(e1) == 2);
+    zone_bytes_t b2;
+    zone_bytes_get(ZBYTES_OTHER, &b2);
+    assert(b2.previous == b1.previous + v1->bytes);                          /* the class "previous" ... */
+    assert(b2.retired == b1.retired && b2.resident >= b1.resident);          /* ... not the retire stack's */
+    assert(atomic_load(&e1->prev_deadline) >= time(NULL) + 299);
+    zone_rollback_status(e1, st, sizeof(st));
+    assert(strstr(st, "previous version kept (serial 1,") != NULL && strstr(st, "rolled back") == NULL);
+    assert(zone_prev_inflight() == 0);
+
+    /* a reload that brings the same content does not push the good version out of prev */
+    assert(reload_master_zone(e1, c1) == RELOAD_OK);
+    assert(e1->prev == v1);
+
+    /* an UPDATE-like publication leaves prev as it is */
+    rb_update_like(e1, 3);
+    assert(e1->prev == v1 && rb_served_serial(e1) == 3);
+
+    /* a window of 0 keeps nothing */
+    rb_zone("rb2.zone", "rb2.example", 2, "bad IN A 192.0.2.66\n");
+    assert(reload_master_zone(e2, c2) == RELOAD_OK);
+    assert(e2->prev == NULL && atomic_load(&e2->prev_bytes) == 0);
+    assert(zone_rollback(e2, false, &ns, &from) == ZRB_OFF);
+
+    /* the rollback: the old content with serial = served serial + 1 (RFC 1982), the difference for the secondaries, NOTIFY */
+    atomic_store(&e1->notify_now, false);
+    assert(zone_rollback(e1, false, &ns, &from) == ZRB_OK);
+    assert(from == 3 && ns == 4 && e1->serial == 4 && rb_served_serial(e1) == 4);
+    assert(!rb_served_has(e1, "bad.rb1.example.") && rb_served_has(e1, "ns.rb1.example."));
+    assert(e1->prev == NULL && atomic_load(&e1->prev_bytes) == 0);           /* consumed */
+    assert(atomic_load(&e1->notify_now));                                    /* secondaries are told */
+    assert(e1->ixfr_history.count > 0);
+    {
+        ixfr_history_t *h = &e1->ixfr_history;
+        ixfr_txn_t *t = h->entries[(h->head + h->cap - 1) % h->cap];
+        assert(t->old_serial == 3 && t->new_serial == 4 && t->deleted_count > 0);       /* 3 -> 4 deletes the bad record */
+    }
+    assert(atomic_load(&e1->rolled_back) && atomic_load(&e1->rb_serial) == 4 && atomic_load(&e1->rb_from) == 3);
+    zone_rollback_status(e1, st, sizeof(st));
+    assert(strcmp(st, " rolled back (serial 4, from 3)") == 0);
+    zone_bytes_t b3;
+    zone_bytes_get(ZBYTES_OTHER, &b3);
+    assert(b3.previous == b1.previous);                                      /* prev went to the retire stack ... */
+    zone_retire_process(true);
+    zone_bytes_get(ZBYTES_OTHER, &b3);
+    assert(b3.retired == b1.retired && b3.previous == b1.previous);          /* ... and was freed */
+    assert(zone_rollback(e1, false, &ns, &from) == ZRB_NO_PREV);             /* no redo */
+
+    /* the file that was read when the data was rolled back is kept by a reload, until it changes */
+    char zf[300];
+    snprintf(zf, sizeof(zf), "%s/rb1.zone", g_dir);
+    assert(zone_rollback_keeps_file(e1, zf));
+    assert(!zone_rollback_keeps_file(e1, "/nonexistent/rb1.zone"));
+    assert(!zone_rollback_keeps_file(e2, zf));                               /* (a zone that was not rolled back) */
+    rb_zone("rb1.zone", "rb1.example", 9, "bad IN A 192.0.2.66\nmore IN A 192.0.2.67\n");
+    assert(!zone_rollback_keeps_file(e1, zf));
+    /* the next publication ends the rolled-back state */
+    assert(reload_master_zone(e1, c1) == RELOAD_OK);
+    assert(!atomic_load(&e1->rolled_back) && e1->prev != NULL);
+    zone_rollback_status(e1, st, sizeof(st));
+    assert(strstr(st, "rolled back") == NULL);
+
+    /* a publication that keeps nothing (keep 0) drops the prev of an earlier one */
+    zone_version_t *nx = rb_make_next(e1, 10);
+    pthread_mutex_lock(&e1->writer_lock);
+    e1->serial = 10;
+    zone_publish_ex(e1, nx, 0);
+    pthread_mutex_unlock(&e1->writer_lock);
+    assert(e1->prev == NULL && atomic_load(&e1->prev_bytes) == 0);
+    zone_retire_process(true);
+    zone_bytes_get(ZBYTES_OTHER, &b3);
+    assert(b3.previous == b1.previous && b3.retired == b1.retired);
+
+    /* the window is over: the control thread's tick drops prev, oldest deadline first */
+    rb_zone("rb3.zone", "rb3.example", 2, "bad IN A 192.0.2.66\n");
+    rb_zone("rb4.zone", "rb4.example", 2, "bad IN A 192.0.2.66\n");
+    rb_zone("rb1.zone", "rb1.example", 11, "other IN A 192.0.2.68\n");
+    assert(reload_master_zone(e1, c1) == RELOAD_OK);                          /* window 300 */
+    assert(reload_master_zone(e3, c3) == RELOAD_OK);                          /* window 100 */
+    assert(reload_master_zone(e4, c4) == RELOAD_OK);                          /* window 200 */
+    assert(e1->prev && e3->prev && e4->prev);
+    zone_bytes_get(ZBYTES_OTHER, &b3);
+    assert(b3.previous == b1.previous + e1->prev->bytes + e3->prev->bytes + e4->prev->bytes);
+    time_t now = time(NULL);
+    zone_prev_expire(now + 50);
+    assert(e1->prev && e3->prev && e4->prev);
+    zone_prev_expire(now + 150);                                              /* rb3 (100) only */
+    assert(e1->prev && !e3->prev && e4->prev);
+    zone_prev_expire(now + 250);                                              /* rb4 (200) */
+    assert(e1->prev && !e3->prev && !e4->prev);
+    zone_retire_process(true);
+
+    /* the memory limit: the oldest first, as many as it takes */
+    rb_zone("rb3.zone", "rb3.example", 3, "bad IN A 192.0.2.66\nnew IN A 192.0.2.70\n");
+    rb_zone("rb4.zone", "rb4.example", 3, "bad IN A 192.0.2.66\nnew IN A 192.0.2.70\n");
+    assert(reload_master_zone(e3, c3) == RELOAD_OK);                          /* rb3 has a prev again (deadline now + 100) */
+    assert(reload_master_zone(e4, c4) == RELOAD_OK);                          /* rb4 (now + 200) */
+    assert(e3->prev && e4->prev && e1->prev);
+    uint64_t one = e3->prev->bytes;
+    assert(zone_prev_free_oldest(ZBYTES_OTHER, 0) == 0);
+    assert(zone_prev_free_oldest(ZBYTES_OTHER, 1) == one);                    /* rb3 (the earliest deadline) only */
+    assert(!e3->prev && e4->prev && e1->prev);
+    assert(zone_prev_inflight() == one);                                      /* (a pressure drop is counted until the retire stack frees it) */
+    zone_retire_process(true);
+    assert(zone_prev_inflight() == 0);
+    uint64_t rest = e1->prev->bytes + e4->prev->bytes;
+    assert(zone_prev_free_oldest(ZBYTES_OTHER, UINT64_MAX / 2) == rest);      /* everything that is left, rb4 before rb1 */
+    assert(!e1->prev && !e4->prev);
+    assert(zone_prev_free_oldest(ZBYTES_OTHER, 100) == 0);                    /* nothing left */
+    zone_retire_process(true);
+    zone_bytes_get(ZBYTES_OTHER, &b3);
+    assert(b3.previous == b1.previous && b3.retired == b1.retired);
+
+    /* a signed zone: the serial cannot change (the SOA's signature would not match): refused; local publishes it as it was */
+    rb_zone("rb5.zone", "rb5.example", 2, "@ IN DNSKEY 257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ==\nbad IN A 192.0.2.66\n");
+    assert(reload_master_zone(e5, c5) == RELOAD_OK && e5->prev);
+    assert(zone_rollback(e5, false, &ns, &from) == ZRB_SIGNED);
+    assert(e5->prev != NULL && rb_served_serial(e5) == 2);                    /* nothing changed */
+    atomic_store(&e5->notify_now, false);
+    assert(zone_rollback(e5, true, &ns, &from) == ZRB_OK);
+    assert(from == 2 && ns == 1 && e5->serial == 1 && rb_served_serial(e5) == 1 && !rb_served_has(e5, "bad.rb5.example."));
+    assert(!atomic_load(&e5->notify_now));                                    /* local: the secondaries are not told ... */
+    assert(e5->ixfr_history.count == 0);                                      /* ... and the history that led to the old serial is gone */
+    assert(atomic_load(&e5->rolled_back) && atomic_load(&e5->rb_serial) == 1 && atomic_load(&e5->rb_from) == 2);
+    zone_retire_process(true);
+
+    /* the serial after 4294967295 is 1 (0 is skipped, as for an UPDATE) and is greater than it (RFC 1982) */
+    rb_zone("rb6.zone", "rb6.example", 4294967295u, "bad IN A 192.0.2.66\n");
+    assert(reload_master_zone(e6, c6) == RELOAD_OK && e6->prev);
+    assert(zone_rollback(e6, false, &ns, &from) == ZRB_OK && from == 4294967295u && ns == 1 && rb_served_serial(e6) == 1);
+    zone_retire_process(true);
+
+    /* secondaries and catalog members are refused; so is an entry that was taken out of memory; an image that cannot be rebuilt fails */
+    zone_db_entry_t *sec = create_new_zone_entry("sec.example.", "default");
+    zone_db_entry_t *cat = create_new_zone_entry("cat.example.", "default");
+    zone_db_entry_t *ev = create_new_zone_entry("ev.example.", "default");
+    assert(sec && cat && ev);
+    sec->is_secondary = true;
+    cat->is_catalog_member = true;
+    assert(zone_rollback(sec, false, &ns, &from) == ZRB_NOT_PRIMARY && zone_rollback(cat, false, &ns, &from) == ZRB_NOT_PRIMARY);
+    ev->evicted = true;
+    assert(zone_rollback(ev, false, &ns, &from) == ZRB_EVICTED);
+    ev->evicted = false;
+    ev->prev = calloc(1, sizeof(*ev->prev));                                  /* (a version without an image) */
+    assert(ev->prev);
+    ev->prev->heap = true;
+    assert(zone_rollback(ev, false, &ns, &from) == ZRB_FAILED);
+    free(ev->prev);
+    ev->prev = NULL;
+    free_zone_db_entry(sec);
+    free_zone_db_entry(cat);
+    free_zone_db_entry(ev);
+
+    /* the words of every reply */
+    for (int r = ZRB_OK; r <= ZRB_FAILED; r++) assert(zone_rollback_text((zone_rollback_result_t)r) != NULL);
+    assert(strstr(zone_rollback_text(ZRB_SIGNED), "signed") && strstr(zone_rollback_text(ZRB_OFF), "rollback-window") &&
+           strstr(zone_rollback_text(ZRB_NO_PREV), "no previous version") && strstr(zone_rollback_text(ZRB_BUSY), "busy") &&
+           strstr(zone_rollback_text(ZRB_EVICTED), "memory") && strstr(zone_rollback_text(ZRB_NOT_PRIMARY), "primary") &&
+           strstr(zone_rollback_text(ZRB_FAILED), "syslog"));
+    assert(zone_rollback_text(ZRB_OK)[0] == '\0');
+
+    /* a zone that leaves takes its prev with it (LeakSanitizer and the byte totals check it) */
+    rb_zone("rb1.zone", "rb1.example", 12, "again IN A 192.0.2.69\n");
+    assert(reload_master_zone(e1, c1) == RELOAD_OK && e1->prev);
+    release_zone_snapshot(snap);
+    server_config_t *cfg2 = load_conf("options { };\n");
+    zone_db_snapshot_t *snap2 = build(cfg2, false);
+    release_zone_snapshot(snap2);
+    rb_settle();
+    zone_bytes_t b9;
+    zone_bytes_get(ZBYTES_OTHER, &b9);
+    assert(b9.previous == 0 && b9.retired == 0);
+    assert(zone_bytes_underflows() == 0);
+    printf("  -> rollback: prev lifecycle, window, memory limit order, serial, refusals passed.\n");
+}
+
 int main(void) {
     /* Line-buffered progress + a hang watchdog (exit 124 with the phase) so a
      * stalled run fails fast in CI instead of blocking the job. */
@@ -1459,6 +1755,7 @@ int main(void) {
     test_snapshot_rebuild_case_35();
     test_retire_object_and_entry_config();
     test_snapshot_in_view();
+    test_zone_rollback();
     /* Remove the scratch directory in-process: detached snapshot GC threads may
      * still be running here, and fork()/exec from a multi-threaded process (as
      * system("rm -rf") did) can deadlock the child under ASan. */

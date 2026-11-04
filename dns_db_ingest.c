@@ -3642,8 +3642,15 @@ static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   if (!zdir_entry(z)) st_append(c, z->digest && atomic_load_explicit(&z->state, memory_order_relaxed) != ZDIR_ST_ERROR
                                        ? " (the data is out of memory: it is read when a query needs it)" : " (no version loaded)");
   if (z->error) st_append(c, ", last error: %s", z->error);
-  if (zdir_entry(z) && atomic_load_explicit(&zdir_entry(z)->updated, memory_order_relaxed)) st_append(c, " (changed by a dynamic UPDATE: pinned in memory until the next load from the database)");
+  if (zdir_entry(z) && atomic_load_explicit(&zdir_entry(z)->rolled_back, memory_order_acquire))
+    st_append(c, " (rolled back: serial %u, from %u; pinned in memory until the next load from the database)", atomic_load_explicit(&zdir_entry(z)->rb_serial, memory_order_relaxed),
+              atomic_load_explicit(&zdir_entry(z)->rb_from, memory_order_relaxed));
+  else if (zdir_entry(z) && atomic_load_explicit(&zdir_entry(z)->updated, memory_order_relaxed)) st_append(c, " (changed by a dynamic UPDATE: pinned in memory until the next load from the database)");
   st_append(c, "\n");
+  /* a line of its own: the zone line above keeps its form (it ends with the status) */
+  if (zdir_entry(z) && atomic_load_explicit(&zdir_entry(z)->prev_bytes, memory_order_relaxed))
+    st_append(c, "  previous version kept for rollback: serial %u, %llu bytes\n", atomic_load_explicit(&zdir_entry(z)->prev_serial, memory_order_relaxed),
+              (unsigned long long)atomic_load_explicit(&zdir_entry(z)->prev_bytes, memory_order_relaxed));
   if (zdir_entry(z)) settings_status(c, zdir_entry(z));
   return true;
 }
@@ -3710,6 +3717,8 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     st_append(&c, "zone versions and IXFR deltas: database zones %llu bytes resident + %llu retired; other zones %llu resident + %llu retired\n",
               (unsigned long long)zdb.resident, (unsigned long long)zdb.retired, (unsigned long long)zot.resident,
               (unsigned long long)zot.retired);
+    st_append(&c, "zone versions kept for karictl rollback (rollback-window): database zones %llu bytes; other zones %llu bytes\n", (unsigned long long)zdb.previous,
+              (unsigned long long)zot.previous);
     st_append(&c, "fetch: rate=%u/s refused_by_rate=%llu issued=%llu concurrency=%u\n", (unsigned)atomic_load_explicit(&g_fetch_rate, memory_order_relaxed),
               (unsigned long long)atomic_load_explicit(&g_fetch_limited, memory_order_relaxed), (unsigned long long)atomic_load_explicit(&g_fetch_issued, memory_order_relaxed),
               (unsigned)atomic_load_explicit(&g_fetch_conc, memory_order_relaxed));
@@ -3724,9 +3733,9 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
               (unsigned long long)cs.xfr[DBREG_XFR_WAITED], (unsigned long long)cs.xfr[DBREG_XFR_LOADED], (unsigned long long)cs.xfr[DBREG_XFR_FAILED],
               (unsigned long long)cs.xfr[DBREG_XFR_SUMMARY], (unsigned long long)cs.xfr_marked, (unsigned)atomic_load_explicit(&g_xfr_timeout_ms, memory_order_relaxed));
     if (cs.limit)
-      st_append(&c, "cache: limit=%llu resident=%llu retired=%llu inflight=%llu evictions=%llu rounds=%llu cold=%llu marked=%llu misses=%llu "
+      st_append(&c, "cache: limit=%llu resident=%llu retired=%llu previous=%llu inflight=%llu evictions=%llu rounds=%llu cold=%llu marked=%llu misses=%llu "
                     "shed=%llu pinned=%llu peak=%llu victim_freq=%u\n",
-                (unsigned long long)cs.limit, (unsigned long long)cs.resident, (unsigned long long)cs.retired, (unsigned long long)cs.inflight,
+                (unsigned long long)cs.limit, (unsigned long long)cs.resident, (unsigned long long)cs.retired, (unsigned long long)cs.previous, (unsigned long long)cs.inflight,
                 (unsigned long long)cs.evictions, (unsigned long long)cs.rounds, (unsigned long long)cs.cold, (unsigned long long)cs.marked,
                 (unsigned long long)cs.misses, (unsigned long long)atomic_load_explicit(&g_fetch_shed, memory_order_relaxed),
                 (unsigned long long)cs.pinned_bytes, (unsigned long long)cs.peak, (unsigned)cs.victim_freq);

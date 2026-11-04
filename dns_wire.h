@@ -97,6 +97,8 @@ typedef struct {
     uint64_t db_bytes_retired;
     uint64_t other_bytes_resident;
     uint64_t other_bytes_retired;
+    uint64_t db_bytes_previous;       /* the versions kept for `karictl rollback` (rollback-window), not served */
+    uint64_t other_bytes_previous;
 } karidns_status_t;
 
 // ============================================================================

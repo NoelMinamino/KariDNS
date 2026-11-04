@@ -67,6 +67,7 @@ options {
     // max-udp-size 1232;           // udp-bufsize の別名。udp-receive-buffer / udp-send-buffer / tcp-receive-buffer / tcp-send-buffer も使える
     // max-records 1000000;  max-records-per-type 100;  max-types-per-name 100;  max-zone-ttl 1d;   // 超えるゾーンは読み込まない
     // serial-update-method unixtime;    // Dynamic Update の SOA シリアル: increment | unixtime | date
+    // rollback-window 1h;               // karictl rollback のために、リロードやDBインストールで置き換わった直前の版を残す時間 (0 = 残さない)。options / view / zone に書ける
     // check-mx-cname warn;  check-srv-cname ignore;  check-integrity yes;  check-names primary fail;   // karicheck の指摘の重さ (fail | warn | ignore)
     // dnstap の BIND 形式 (dnstap-output は unix だけ):
     // dnstap { auth; };  dnstap-output unix "/var/run/dnstap.sock";  dnstap-identity hostname;
