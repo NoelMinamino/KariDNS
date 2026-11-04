@@ -290,7 +290,7 @@ conf_case ixfr_hist_zbad conf 1 "invalid ixfr-history value '-1'" 'zone "h.examp
 conf_case bad_b64       conf 1 "secret is not valid base64" 'key "k" { algorithm "hmac-sha256"; secret "NOT_BASE64="; };'
 conf_case bad_b64_ctl   conf 1 "control-channel: secret is not valid base64" 'control-channel { algorithm "hmac-sha256"; secret "NOT_BASE64="; };'
 conf_case ctl_in_options conf 1 "control-channel is written inside options" 'options { port 5300; control-channel { algorithm "hmac-sha256"; secret "dGVzdC1zZWNyZXQ="; }; };'
-conf_case ctl_unknown_key conf 1 "control-channel: unknown option 'port' (supported: socket, secret, algorithm)" 'control-channel { port 953; bind-address 127.0.0.1; algorithm "hmac-sha256"; secret "dGVzdC1zZWNyZXQ="; };'
+conf_case ctl_unknown_key conf 1 "control-channel: unknown option 'port' (supported: socket, secret, algorithm, allow-group, keys)" 'control-channel { port 953; bind-address 127.0.0.1; algorithm "hmac-sha256"; secret "dGVzdC1zZWNyZXQ="; };'
 conf_case ctl_misspelt  conf 1 "control-channel: unknown option 'secrt'" 'control-channel { socket "/tmp/x.sock"; secrt "dGVzdC1zZWNyZXQ="; };'
 conf_case ctl_top_level conf 0 "is valid" 'options { port 5300; };
 control-channel { algorithm "hmac-sha256"; secret "dGVzdC1zZWNyZXQ="; };'

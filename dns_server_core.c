@@ -3343,6 +3343,8 @@ typedef struct ctrl_client {
   time_t connect_time;
   time_t last_active;
   char challenge[65];
+  char key_name[128];     /* CMD_WAIT: the key that authenticated ("(main)" = the unnamed secret) */
+  uint32_t perm;          /* CMD_WAIT: a copy of that key's CTLP_* mask; a reconfig does not change an open connection */
   char buf[1024];
   size_t buf_len;
   uint64_t req_id;       /* PARKED: the reload request this client waits for */
@@ -3379,6 +3381,73 @@ static ctrl_client_t *get_ctrl_client(int fd) {
     p = p->next;
   }
   return NULL;
+}
+
+/* The key a client authenticated with: the HMAC of the challenge is computed for the unnamed `secret` and for every key of
+ * control-channel { keys { } }, each with its own algorithm, and every one is compared in constant time: the loop does not stop at the
+ * first match, so the time does not tell which key (or how many) matched.  config_parse refuses two keys with one secret, so at most one
+ * can match.  Returns true when one matched; name_out gets its name ("(main)" for the unnamed secret) and perm_out its CTLP_* mask. */
+STATIC_TEST bool ctrl_auth_match(const server_config_t *cfg, const char *challenge, const char *client_hmac,
+                                 char *name_out, size_t name_sz, uint32_t *perm_out) {
+  if (!cfg || !cfg->control.enabled || !challenge || !client_hmac) return false;
+  size_t clen = strlen(client_hmac);
+  bool found = false;
+  for (int i = cfg->control.secret_decoded_len > 0 ? -1 : 0; i < cfg->control.nkeys; i++) {
+    const uint8_t *sec;
+    size_t slen;
+    const char *alg, *nm;
+    uint32_t pm;
+    if (i < 0) {
+      sec = cfg->control.secret_decoded;
+      slen = cfg->control.secret_decoded_len;
+      alg = cfg->control.algorithm;
+      nm = "(main)";
+      pm = CTLP_FULL;
+    } else {
+      sec = cfg->control.keys[i].secret_decoded;
+      slen = cfg->control.keys[i].secret_decoded_len;
+      alg = cfg->control.keys[i].algorithm;
+      nm = cfg->control.keys[i].name;
+      pm = cfg->control.keys[i].perm;
+    }
+    /* control-channel { algorithm } / the key's algorithm (hmac-sha256 when not written); the names were checked when the configuration was read */
+    const EVP_MD *md = alg ? tsig_algorithm_evp_md(alg) : EVP_sha256();
+    unsigned char mac[EVP_MAX_MD_SIZE];
+    unsigned int mac_len = 0;
+    char expected[2 * EVP_MAX_MD_SIZE + 1];
+    expected[0] = '\0';
+    if (md && slen > 0 && HMAC(md, sec, slen, (const unsigned char *)challenge, 64, mac, &mac_len) != NULL) {
+      for (unsigned int k = 0; k < mac_len; k++) snprintf(&expected[k * 2], 3, "%02x", mac[k]);
+    }
+    /* [H-5] timing: const_time_memcmp is always called, over the shorter length; the length is checked after.  elen == 0 is a failed HMAC:
+     * an empty AUTH never matches it (fail-closed) */
+    size_t elen = strlen(expected);
+    bool eq = const_time_memcmp(client_hmac, expected, clen < elen ? clen : elen) == 0;
+    if (eq && clen == elen && elen > 0 && !found) {
+      found = true;
+      snprintf(name_out, name_sz, "%s", nm);
+      *perm_out = pm;
+    }
+  }
+  return found;
+}
+
+/* Who may connect to the control socket (before the HMAC challenge, which every client still has to pass): the server's own user, root, or a
+ * member of the allow-group (any of the groups of the peer's credentials, xucred cr_groups[0..cr_ngroups-1]: FreeBSD LOCAL_PEERCRED).  The
+ * server is FreeBSD-only (kqueue, Capsicum, LOCAL_PEERCRED), so there is no Linux/SO_PEERCRED variant to keep in step. */
+STATIC_TEST bool ctrl_peer_admitted(uid_t peer_uid, const gid_t *groups, int ngroups, uid_t my_uid, bool have_gid, gid_t allow_gid) {
+  if (peer_uid == my_uid || peer_uid == 0) return true;
+  if (!have_gid || !groups) return false;
+  for (int i = 0; i < ngroups; i++)
+    if (groups[i] == allow_gid) return true;
+  return false;
+}
+
+/* A command line for the log: printable ASCII only, cut at 120 bytes (the client is authenticated but may still send anything). */
+STATIC_TEST void ctrl_log_text(const char *line, char *out, size_t out_sz) {
+  size_t o = 0;
+  for (size_t i = 0; line[i] && o + 1 < out_sz && o < 120; i++, o++) out[o] = (line[i] >= 0x20 && line[i] < 0x7f) ? line[i] : '?';
+  out[o] = '\0';
 }
 
 STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged);
@@ -3437,8 +3506,9 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
   if (o->tcp_window != n->tcp_window) append_list_item(buf, sz, "tcp-window");
   if (cfg_tcp_rcvbuf(o) != cfg_tcp_rcvbuf(n) || cfg_tcp_sndbuf(o) != cfg_tcp_sndbuf(n)) append_list_item(buf, sz, "tcp-receive-buffer / tcp-send-buffer");
   if (o->response_cache_size != n->response_cache_size) append_list_item(buf, sz, "response-cache-size");
-  if (o->control.enabled != n->control.enabled || str_differs(o->control.socket_path, n->control.socket_path))
-    append_list_item(buf, sz, "control-channel socket");
+  if (o->control.enabled != n->control.enabled || str_differs(o->control.socket_path, n->control.socket_path) ||
+      o->control.has_allow_gid != n->control.has_allow_gid || (n->control.has_allow_gid && o->control.allow_gid != n->control.allow_gid))
+    append_list_item(buf, sz, "control-channel socket / allow-group");
   if (o->dnstap.enabled != n->dnstap.enabled || str_differs(o->dnstap.socket_path, n->dnstap.socket_path))
     append_list_item(buf, sz, "dnstap socket");
   /* beta design 7.1: the loader is started once by the supervisor, so adding or removing the database block and
@@ -3981,11 +4051,12 @@ void *control_thread_func(void *arg) {
           struct xucred cr;
           socklen_t cr_len = sizeof(cr);
           if (getsockopt(cfd, 0, LOCAL_PEERCRED, &cr, &cr_len) == 0 && cr.cr_version == XUCRED_VERSION) {
-            bool allowed = false;
-            uid_t my_uid = geteuid();
-            if (cr.cr_uid == my_uid || cr.cr_uid == 0) {
-              allowed = true;
-            }
+            server_config_t *pcfg = acquire_config_snapshot();
+            bool have_gid = pcfg && pcfg->control.has_allow_gid;
+            gid_t allow_gid = have_gid ? (gid_t)pcfg->control.allow_gid : 0;
+            release_config_snapshot(pcfg);
+            int ng = cr.cr_ngroups < 0 ? 0 : (cr.cr_ngroups > XU_NGROUPS ? XU_NGROUPS : cr.cr_ngroups);
+            bool allowed = ctrl_peer_admitted(cr.cr_uid, cr.cr_groups, ng, geteuid(), have_gid, allow_gid);
             if (!allowed) {
               close(cfd);
               continue;
@@ -4060,36 +4131,8 @@ void *control_thread_func(void *arg) {
           if (c->state == CTRL_STATE_AUTH_WAIT) {
             server_config_t *cfg = acquire_config_snapshot();
             bool auth_ok = false;
-            if (cfg && strncmp(c->buf, "AUTH ", 5) == 0 && cfg->control.enabled && cfg->control.secret_decoded_len > 0) {
-              char *client_hmac = c->buf + 5;
-              unsigned char md[EVP_MAX_MD_SIZE];
-              unsigned int md_len = 0;
-              /* control-channel { algorithm } で指定した HMAC を使う (省略時 hmac-sha256)。
-               * 名前は設定読込時に tsig_algorithm_is_supported() で検証済み。 */
-              const EVP_MD *ctrl_md = cfg->control.algorithm ? tsig_algorithm_evp_md(cfg->control.algorithm)
-                                                             : EVP_sha256();
-              char expected[2 * EVP_MAX_MD_SIZE + 1];
-              expected[0] = '\0';
-              if (ctrl_md &&
-                  HMAC(ctrl_md, cfg->control.secret_decoded, cfg->control.secret_decoded_len,
-                       (unsigned char*)c->challenge, 64, md, &md_len) != NULL) {
-                for (unsigned int k = 0; k < md_len; k++) snprintf(&expected[k*2], 3, "%02x", md[k]);
-              }
-              /* [H-5] タイミング攻撃対策: 長さ比較も定数時間で行う。
-               * client_hmac が expected と長さが異なる場合も const_time_memcmp を
-               * 必ず呼んでキャッシュタイミングを均一化し、その後 len_ok で弾く。*/
-              size_t clen = strlen(client_hmac);
-              size_t elen = strlen(expected);
-              bool len_ok = (clen == elen);
-              /* 長さが異なる場合は expected の長さで比較 (ダミー比較) */
-              size_t cmp_len = len_ok ? elen : elen;
-              bool hmac_ok = (const_time_memcmp(client_hmac, expected,
-                                                clen >= cmp_len ? cmp_len : clen) == 0);
-              /* elen == 0 は HMAC 計算失敗。空の AUTH と一致させない (fail-closed) */
-              if (len_ok && hmac_ok && elen > 0) {
-                auth_ok = true;
-              }
-            }
+            if (cfg && strncmp(c->buf, "AUTH ", 5) == 0)
+              auth_ok = ctrl_auth_match(cfg, c->challenge, c->buf + 5, c->key_name, sizeof(c->key_name), &c->perm);
             release_config_snapshot(cfg);
             if (auth_ok) {
               (void)ctl_send_all(cfd, "OK\n", 3);
@@ -4100,6 +4143,8 @@ void *control_thread_func(void *arg) {
               continue;
             }
           } else if (c->state == CTRL_STATE_CMD_WAIT) {
+            char logline[128];
+            ctrl_log_text(c->buf, logline, sizeof(logline));   /* before the line is split below */
             char *cmd = c->buf;
             char *arg = strchr(cmd, ' ');
             if (arg) {
@@ -4133,7 +4178,21 @@ void *control_thread_func(void *arg) {
               }
             }
 
-            if (strcmp(cmd, "reload") == 0) {
+            /* The permission of the key that authenticated this connection (a copy made at login).  Every command goes through this one check;
+             * a refused command is answered and logged, and the connection stays open. */
+            const bool allowed = (c->perm & control_command_perm(cmd, arg != NULL)) != 0;
+            if (allowed) {
+              syslog(LOG_NOTICE, "[Control] key \"%s\": %s", c->key_name, logline);
+            } else {
+              char deny[192];
+              int dl = snprintf(deny, sizeof(deny), "ERROR command not allowed for key \"%.100s\"\n", c->key_name);
+              syslog(LOG_NOTICE, "[Control] key \"%s\": refused: %s", c->key_name, logline);
+              (void)ctl_send_all(cfd, deny, (size_t)dl);
+            }
+
+            if (!allowed) {
+              /* answered above */
+            } else if (strcmp(cmd, "reload") == 0) {
               if (arg && strlen(arg) > 0) {
                 char canon_buf[256];
                 const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
@@ -4460,8 +4519,11 @@ void *control_thread_func(void *arg) {
               syslog(LOG_ERR, "[Control] Received unknown command: %s", cmd);
               (void)ctl_send_all(cfd, "ERROR unknown command\n", 22);
             }
-            if (c->state != CTRL_STATE_PARKED) free_ctrl_client(cfd); /* a parked client waits for the loader's answer */
-            continue;
+            if (allowed) {
+              if (c->state != CTRL_STATE_PARKED) free_ctrl_client(cfd); /* a parked client waits for the loader's answer */
+              continue;
+            }
+            /* refused: the line is consumed below and the client may send another command */
           }
           size_t rem = c->buf_len - (nl + 1 - c->buf);
           memmove(c->buf, nl + 1, rem);
@@ -6196,13 +6258,30 @@ int main(int argc, char **argv) {
       if (bind(g_control_sock, (struct sockaddr *)&un, sizeof(un)) == 0) {
         fcntl(g_control_sock, F_SETFL, fcntl(g_control_sock, F_GETFL, 0) | O_NONBLOCK);
         listen(g_control_sock, 128);
-        if (g_run_identity.has_user) {
+        const bool want_grp = g_config_db.config_a.control.has_allow_gid;
+        if (g_run_identity.has_user || want_grp) {
           /* [SEC] ソケットFDに対する fchown() は FreeBSD で EINVAL となるため、
            * 事前に O_DIRECTORY で開いた安全なディレクトリFD (dir_fd) と
            * AT_SYMLINK_NOFOLLOW を用いて fchownat() を実行し、
            * TOCTOU/シンボリックリンク攻撃を防ぎつつ所有者を変更する。 */
-          if (dir_fd >= 0) {
-            fchownat(dir_fd, leaf_name, g_run_identity.uid, g_run_identity.gid, AT_SYMLINK_NOFOLLOW);
+          /* allow-group: the socket belongs to that group and the group may write to it (mode 0660); without allow-group the
+           * mode stays 0600 (umask 0177).  The directory is the operator's job: the group needs search (x) permission on it. */
+          uid_t own_uid = g_run_identity.has_user ? g_run_identity.uid : (uid_t)-1;
+          gid_t own_gid = want_grp ? (gid_t)g_config_db.config_a.control.allow_gid : g_run_identity.gid;
+          bool ok_owner = dir_fd >= 0 && fchownat(dir_fd, leaf_name, own_uid, own_gid, AT_SYMLINK_NOFOLLOW) == 0;
+          if (want_grp && !(ok_owner && fchmodat(dir_fd, leaf_name, 0660, AT_SYMLINK_NOFOLLOW) == 0)) {
+            int e = errno;
+            syslog(LOG_ERR, "[Startup] control-channel allow-group: cannot give the socket '%s' to group %s: %s", sock_path,
+                   g_config_db.config_a.control.allow_group, dir_fd < 0 ? "directory not open" : strerror(e));
+            fprintf(stderr, "[ERROR] control-channel allow-group: cannot give the socket '%s' to group %s: %s\n", sock_path,
+                    g_config_db.config_a.control.allow_group, dir_fd < 0 ? "directory not open" : strerror(e));
+            umask(old_mask);
+            close(g_control_sock);
+            g_control_sock = -1;
+            if (dir_fd >= 0) close(dir_fd);
+            cleanup_pid_file();
+            free_server_config_fields(&g_config_db.config_a);
+            return 1;
           }
         }
         if (dir_fd >= 0) {

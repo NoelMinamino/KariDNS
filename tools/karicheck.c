@@ -802,6 +802,18 @@ KARIDNS_TOOL_FN bool kc_aml_negation(const aml_t *l, int depth) {
     return false;
 }
 
+/* 0.6.0: a key of control-channel { keys { } } that is also a TSIG key anywhere: a secondary, an updater or a primary that holds the secret
+ * for zone transfers could then control the server.  Give the control channel a key of its own. */
+static void kc_control_key_notes(const server_config_t *cfg) {
+    char where[300];
+    for (int i = 0; i < cfg->control.nkeys; i++) {
+        const control_key_t *k = &cfg->control.keys[i];
+        if (config_tsig_key_used(cfg, k->name, where, sizeof(where)))
+            fprintf(stderr, "[WARNING] %s: control-channel: key '%s' is also used for TSIG (%s): whoever holds it for DNS can also control the "
+                            "server. Use a key of its own for the control channel\n", k->loc, k->name, where);
+    }
+}
+
 /* Batch 4: the transfer / NOTIFY options of BIND 9.20 and the places where KariDNS differs.  The lines go to stderr like the warnings. */
 static void kc_xfr_notes(const server_config_t *cfg) {
     if (cfg->startup_notify_rate_set)
@@ -883,6 +895,7 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
     }
 
     kc_xfr_notes(cfg);
+    kc_control_key_notes(cfg);
 
     if (cfg->directory) {
         /* karidns opens options { directory } at start-up and refuses to start without it */

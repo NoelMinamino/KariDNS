@@ -29,6 +29,8 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <syslog.h>
+#include <grp.h>
+#include <stdatomic.h>
 
 #include "../dns_config_parser.h"
 #include "test_zext.h"
@@ -1084,6 +1086,204 @@ static void test_tsig_key_blocks(void) {
     expect_reject("secret ';' missing", "key \"k\" { secret \"QUJD\" };");
     snprintf(txt, sizeof(txt), "key \"k\" { algorithm hmac-sha256; secret \"%s\"; }", SECRET_OK);
     expect_reject("final ';' missing", txt);
+}
+
+/* control-channel { allow-group }: a number, a name that exists, the unknown ones, and the capability-mode rule for a reload */
+extern _Atomic bool g_capsicum_enabled;
+static void test_control_allow_group(void) {
+    printf("[TEST] control-channel allow-group...\n");
+    server_config_t cfg;
+    char txt[512];
+    if (parse_ok("control-channel { allow-group 4242; };", &cfg)) {
+        CHECK(cfg.control.has_allow_gid && cfg.control.allow_gid == 4242);
+        CHECK_STR(cfg.control.allow_group, "4242");
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("control-channel { allow-group \"0\"; };", &cfg)) { CHECK(cfg.control.has_allow_gid && cfg.control.allow_gid == 0); free_server_config_fields(&cfg); }
+    if (parse_ok("control-channel { };", &cfg)) { CHECK(!cfg.control.has_allow_gid && cfg.control.allow_group == NULL); free_server_config_fields(&cfg); }
+    struct group *g = getgrgid(0);          /* the group of gid 0 exists on every host, whatever its name (wheel, root) */
+    if (g) {
+        snprintf(txt, sizeof(txt), "control-channel { allow-group \"%s\"; allow-group \"%s\"; };", g->gr_name, g->gr_name);
+        if (parse_ok(txt, &cfg)) {   /* written twice: the last one replaces the first */
+            CHECK(cfg.control.has_allow_gid && cfg.control.allow_gid == 0);
+            CHECK_STR(cfg.control.allow_group, g->gr_name);
+            free_server_config_fields(&cfg);
+        }
+        /* a reload runs in capability mode: the name that start-up resolved still works, a new one is refused with the reason */
+        char known[256];
+        snprintf(known, sizeof(known), "%s", g->gr_name);
+        g_capsicum_enabled = true;
+        snprintf(txt, sizeof(txt), "control-channel { allow-group \"%s\"; };", known);
+        if (parse_ok(txt, &cfg)) { CHECK(cfg.control.allow_gid == 0); free_server_config_fields(&cfg); }
+        expect_an_error("a name not resolved at start-up cannot be looked up in capability mode", "control-channel { allow-group \"never_looked_up_grp\"; };",
+                        "allow-group|never_looked_up_grp|cannot be looked up now");
+        if (parse_ok("control-channel { allow-group 77; };", &cfg)) { CHECK(cfg.control.allow_gid == 77); free_server_config_fields(&cfg); }   /* a number needs no lookup */
+        g_capsicum_enabled = false;
+    }
+    expect_an_error("unknown group", "control-channel { allow-group \"no_such_group_here\"; };", "line 1|control-channel: allow-group: group 'no_such_group_here' not found");
+    expect_an_error("bad number", "control-channel { allow-group \"12x\"; };", "allow-group: '12x' is not a valid group id");
+    expect_an_error("too large a number", "control-channel { allow-group 4294967295; };", "is not a valid group id");
+    expect_an_error("empty", "control-channel { allow-group \"\"; };", "allow-group: the group is empty");
+    expect_an_error("value missing", "control-channel { allow-group; };", "");
+    expect_an_error("the unknown-option message names allow-group", "control-channel { frobnicate yes; };", "algorithm, allow-group, keys");
+}
+
+/* control-channel { keys { } }: restricted control keys (KariDNS 0.6.0) */
+#define SECRET_B "c2VjcmV0MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3OA=="   /* "secret123456789012345678901234567 8" (34 octets) */
+#define SECRET_C "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo="                /* "ABCDEFGHIJKLMNOPQRSTUVWXYZ" */
+#define CK_KEYS "key \"admin\" { algorithm hmac-sha256; secret \"" SECRET_OK "\"; };\n" \
+                "key \"web\" { algorithm hmac-sha512; secret \"" SECRET_B "\"; };\n" \
+                "key \"ro\" { algorithm hmac-sha1; secret \"" SECRET_C "\"; };\n"
+
+static void test_control_keys(void) {
+    printf("[TEST] control-channel keys { }...\n");
+    server_config_t cfg;
+    char txt[2048];
+
+    /* the forms: full power, read-only, read-only with allow-commands (both orders), read-only no; the key statements may come after */
+    snprintf(txt, sizeof(txt),
+             "control-channel { socket \"/s\"; secret \"QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=\"; keys { \"admin\"; \"web\" read-only yes "
+             "allow-commands { reload-zone; rollback; }; ro read-only yes; }; };\n" CK_KEYS);
+    if (parse_ok(txt, &cfg)) {
+        CHECK(cfg.control.nkeys == 3);
+        CHECK_STR(cfg.control.keys[0].name, "admin");
+        CHECK(cfg.control.keys[0].perm == CTLP_FULL);
+        CHECK_STR(cfg.control.keys[0].algorithm, "hmac-sha256");
+        CHECK(cfg.control.keys[0].secret_decoded_len == 32 && memcmp(cfg.control.keys[0].secret_decoded, cfg.keys->secret_decoded, 32) == 0);
+        CHECK_STR(cfg.control.keys[1].name, "web");
+        CHECK(cfg.control.keys[1].perm == (CTLP_READ | CTLP_RELOAD_ZONE | CTLP_ROLLBACK));
+        CHECK_STR(cfg.control.keys[1].algorithm, "hmac-sha512");
+        CHECK(cfg.control.keys[1].secret_decoded_len == 34);
+        CHECK(memcmp(cfg.control.keys[1].secret_decoded, "secret123456789012345678901234567", 33) == 0);
+        CHECK_STR(cfg.control.keys[2].name, "ro");
+        CHECK(cfg.control.keys[2].perm == CTLP_READ);
+        CHECK(strstr(cfg.control.keys[1].loc, "line ") == cfg.control.keys[1].loc);
+        CHECK(cfg.control.secret_decoded_len == 32);       /* the unnamed secret is still there, and is not one of the keys */
+        free_server_config_fields(&cfg);
+    }
+    snprintf(txt, sizeof(txt),
+             CK_KEYS "control-channel { keys { Web allow-commands { notify; retransfer; reload; reconfig; stop; } read-only yes; "
+             "\"ADMIN.\" read-only no; }; };");
+    if (parse_ok(txt, &cfg)) {      /* key names are DNS names: case and the final dot do not matter; the order of the two clauses is free */
+        CHECK(cfg.control.nkeys == 2);
+        CHECK(cfg.control.keys[0].perm == (CTLP_READ | CTLP_NOTIFY | CTLP_RETRANSFER | CTLP_RELOAD | CTLP_RECONFIG | CTLP_STOP));
+        CHECK(cfg.control.keys[1].perm == CTLP_FULL);
+        CHECK_STR(cfg.control.keys[0].algorithm, "hmac-sha512");
+        free_server_config_fields(&cfg);
+    }
+    snprintf(txt, sizeof(txt), CK_KEYS "control-channel { keys { }; };");
+    if (parse_ok(txt, &cfg)) { CHECK(cfg.control.enabled && cfg.control.nkeys == 0 && cfg.control.keys == NULL); free_server_config_fields(&cfg); }
+    snprintf(txt, sizeof(txt), CK_KEYS "control-channel { keys { \"admin\"; }; keys { \"web\" read-only yes; }; };");
+    if (parse_ok(txt, &cfg)) { CHECK(cfg.control.nkeys == 2); free_server_config_fields(&cfg); }   /* two keys statements add up */
+    /* a key used for the control channel is a key like any other: the statement is still the TSIG key */
+    snprintf(txt, sizeof(txt), CK_KEYS "control-channel { keys { \"admin\"; }; }; zone \"example.com\" { type master; file \"z\"; allow-transfer { key admin; }; };");
+    if (parse_ok(txt, &cfg)) { CHECK(cfg.control.nkeys == 1); free_server_config_fields(&cfg); }
+
+    /* the errors, each with the place and the reason */
+    expect_an_error("unknown key", CK_KEYS "control-channel { keys { \"nokey\"; }; };", "line |control-channel keys|unknown key 'nokey'");
+    expect_an_error("key defined only in a view", "view \"v\" { match-clients { any; }; key \"vk\" { algorithm hmac-sha256; secret \"" SECRET_OK "\"; }; };\n"
+                    "control-channel { keys { \"vk\"; }; };", "unknown key 'vk'|top-level key");
+    expect_an_error("key listed twice", CK_KEYS "control-channel { keys { \"web\"; \"admin\"; \"WEB\" read-only yes; }; };",
+                    "key 'WEB' is listed twice|first at line");
+    expect_an_error("two keys with one secret", "key \"a\" { algorithm hmac-sha256; secret \"" SECRET_OK "\"; };\n"
+                    "key \"b\" { algorithm hmac-sha512; secret \"" SECRET_OK "\"; };\ncontrol-channel { keys { \"a\"; \"b\"; }; };",
+                    "key 'b' has the same secret as key 'a'");
+    expect_an_error("a key with the secret of the unnamed one", CK_KEYS "control-channel { secret \"" SECRET_OK "\"; keys { \"admin\"; }; };",
+                    "key 'admin' has the same secret as the control-channel secret");
+    expect_an_error("allow-commands without read-only", CK_KEYS "control-channel { keys { \"web\" allow-commands { reload-zone; }; }; };",
+                    "key 'web'|allow-commands needs 'read-only yes'|line ");
+    expect_an_error("allow-commands with read-only no", CK_KEYS "control-channel { keys { \"web\" read-only no allow-commands { stop; }; }; };",
+                    "allow-commands needs 'read-only yes'");
+    expect_an_error("unknown command", CK_KEYS "control-channel { keys { \"web\" read-only yes allow-commands { restart; }; }; };",
+                    "allow-commands: 'restart' is not a command that can be allowed");
+    expect_an_error("test-only command", CK_KEYS "control-channel { keys { \"web\" read-only yes allow-commands { evict; }; }; };",
+                    "'evict' is not a command that can be allowed");
+    expect_an_error("read-only command in allow-commands", CK_KEYS "control-channel { keys { \"web\" read-only yes allow-commands { status; }; }; };",
+                    "'status' is not a command that can be allowed|always allowed for a read-only key");
+    expect_an_error("read-only twice", CK_KEYS "control-channel { keys { \"web\" read-only yes read-only no; }; };", "'read-only' is given twice");
+    expect_an_error("allow-commands twice", CK_KEYS "control-channel { keys { \"web\" read-only yes allow-commands { stop; } allow-commands { stop; }; }; };",
+                    "'allow-commands' is given twice");
+    expect_an_error("read-only value", CK_KEYS "control-channel { keys { \"web\" read-only maybe; }; };", "read-only: invalid value 'maybe'");
+    expect_an_error("unknown clause", CK_KEYS "control-channel { keys { \"web\" write yes; }; };", "expected 'read-only', 'allow-commands' or ';' but found 'write'");
+    expect_an_error("'{' missing", CK_KEYS "control-channel { keys \"web\"; };", "expected '{'");
+    expect_an_error("'{' after allow-commands missing", CK_KEYS "control-channel { keys { \"web\" read-only yes allow-commands reload; }; };",
+                    "expected '{' after allow-commands");
+    expect_an_error("name expected", CK_KEYS "control-channel { keys { { }; }; };", "expected a key name or '}'");
+    expect_an_error("command name expected", CK_KEYS "control-channel { keys { \"web\" read-only yes allow-commands { { }; }; }; };",
+                    "expected a command name or '}'");
+    expect_an_error("';' after a command missing", CK_KEYS "control-channel { keys { \"web\" read-only yes allow-commands { stop reload; }; }; };",
+                    "expected ';' after the command name");
+    expect_an_error("';' after keys missing", CK_KEYS "control-channel { keys { \"web\"; } };", "expected ';'");
+    expect_an_error("the unknown-option message lists keys", "control-channel { frobnicate yes; };", "supported: socket, secret, algorithm, allow-group, keys");
+
+    /* the permission of each command; reload with a zone and without are different commands */
+    CHECK(control_command_perm("reload", false) == CTLP_RELOAD);
+    CHECK(control_command_perm("reload", true) == CTLP_RELOAD_ZONE);
+    CHECK(control_command_perm("reconfig", false) == CTLP_RECONFIG);
+    CHECK(control_command_perm("stop", false) == CTLP_STOP);
+    CHECK(control_command_perm("notify", true) == CTLP_NOTIFY);
+    CHECK(control_command_perm("retransfer", true) == CTLP_RETRANSFER);
+    CHECK(control_command_perm("rollback", true) == CTLP_ROLLBACK);
+    CHECK(control_command_perm("status", false) == CTLP_READ && control_command_perm("zonestatus", true) == CTLP_READ);
+    CHECK(control_command_perm("observatory", false) == CTLP_READ && control_command_perm("dbstatus", false) == CTLP_READ);
+    CHECK(control_command_perm("evict", true) == CTLP_OTHER && control_command_perm("xfr-fail", true) == CTLP_OTHER);
+    CHECK(control_command_perm("", false) == CTLP_OTHER && control_command_perm("bogus", true) == CTLP_OTHER && control_command_perm(NULL, false) == CTLP_OTHER);
+    CHECK(control_command_perm("RELOAD", false) == CTLP_OTHER);          /* the server compares the command case-sensitively: so does the permission */
+    /* a full key reaches every class, a read-only key only the read-only commands and what allow-commands added */
+    const char *cmds[] = { "reload", "reconfig", "stop", "notify", "retransfer", "rollback", "status", "zonestatus", "evict", "bogus" };
+    for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
+        CHECK((CTLP_FULL & control_command_perm(cmds[i], true)) != 0);
+        CHECK((CTLP_FULL & control_command_perm(cmds[i], false)) != 0);
+        bool ro_ok = control_command_perm(cmds[i], true) == CTLP_READ;
+        CHECK(((CTLP_READ & control_command_perm(cmds[i], true)) != 0) == ro_ok);
+    }
+    CHECK(control_perm_from_name("reload") == CTLP_RELOAD && control_perm_from_name("reload-zone") == CTLP_RELOAD_ZONE);
+    CHECK(control_perm_from_name("reconfig") == CTLP_RECONFIG && control_perm_from_name("stop") == CTLP_STOP);
+    CHECK(control_perm_from_name("notify") == CTLP_NOTIFY && control_perm_from_name("retransfer") == CTLP_RETRANSFER);
+    CHECK(control_perm_from_name("rollback") == CTLP_ROLLBACK);
+    CHECK(control_perm_from_name("status") == 0 && control_perm_from_name("evict") == 0 && control_perm_from_name("") == 0 && control_perm_from_name(NULL) == 0);
+}
+
+/* config_tsig_key_used(): every place that names a key as a TSIG key is found, a key that is only a control-channel key is not */
+static void test_tsig_key_used(void) {
+    printf("[TEST] config_tsig_key_used...\n");
+    static const struct { const char *label, *conf, *where; } t[] = {
+        { "zone allow-transfer", "zone \"a.test\" { type master; file \"z\"; allow-transfer { key admin; }; };", "zone 'a.test.' allow-transfer" },
+        { "zone allow-update", "zone \"a.test\" { type master; file \"z\"; allow-update { key admin; }; };", "zone 'a.test.' allow-update" },
+        { "zone allow-notify", "zone \"a.test\" { type secondary; file \"z\"; primaries { 192.0.2.1; }; allow-notify { key admin; }; };", "allow-notify" },
+        { "zone allow-query", "zone \"a.test\" { type master; file \"z\"; allow-query { key admin; }; };", "allow-query" },
+        { "zone tsig-key", "zone \"a.test\" { type secondary; file \"z\"; primaries { 192.0.2.1; }; tsig-key admin; };", "tsig-key" },
+        { "primaries key", "zone \"a.test\" { type secondary; file \"z\"; primaries { 192.0.2.1 key admin; }; };", "primaries" },
+        { "zone also-notify key", "zone \"a.test\" { type master; file \"z\"; also-notify { 192.0.2.7 key admin; }; };", "also-notify" },
+        { "options also-notify key", "options { also-notify { 192.0.2.7 key admin; }; };", "options also-notify" },
+        { "named list entry", "primaries l { 192.0.2.8 key admin; };", "list 'l'" },
+        { "server keys", "server 192.0.2.9 { keys admin; };", "server statement at" },
+        { "update-policy", "zone \"a.test\" { type master; file \"z\"; update-policy { grant admin zonesub ANY; }; };", "update-policy" },
+        { "options allow-query", "options { allow-query { key admin; }; };", "options allow-query" },
+        { "acl block", "acl trusted { key admin; };", "acl 'trusted'" },
+        { "view allow-transfer", "view \"v\" { match-clients { any; }; allow-transfer { key admin; }; };", "view 'v' allow-transfer" },
+        { "view match-clients", "view \"v\" { match-clients { key admin; }; };", "view 'v' match-clients" },
+    };
+    for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+        char txt[1536], where[300];
+        server_config_t cfg;
+        snprintf(txt, sizeof(txt), CK_KEYS "%s\ncontrol-channel { keys { \"admin\"; }; };", t[i].conf);
+        if (!parse_ok(txt, &cfg)) { printf("         (%s)\n", t[i].label); continue; }
+        bool used = config_tsig_key_used(&cfg, "admin", where, sizeof(where));
+        CHECK_MSG(used, "%s: not found", t[i].label);
+        CHECK_MSG(used && strstr(where, t[i].where) != NULL, "%s: where is '%s'", t[i].label, where);
+        CHECK_MSG(!config_tsig_key_used(&cfg, "ro", where, sizeof(where)), "%s: 'ro' is not used", t[i].label);
+        CHECK(config_tsig_key_used(&cfg, "ADMIN.", where, sizeof(where)) == used);       /* a DNS name: case and the final dot do not matter */
+        free_server_config_fields(&cfg);
+    }
+    server_config_t cfg;
+    char where[64] = "x";
+    if (parse_ok(CK_KEYS "control-channel { keys { \"admin\"; }; };", &cfg)) {      /* listed in control-channel only: not a TSIG use */
+        CHECK(!config_tsig_key_used(&cfg, "admin", where, sizeof(where)) && where[0] == '\0');
+        CHECK(!config_tsig_key_used(NULL, "admin", where, sizeof(where)) && !config_tsig_key_used(&cfg, NULL, where, sizeof(where)));
+        CHECK(!config_tsig_key_used(&cfg, "admin", where, 0));
+        free_server_config_fields(&cfg);
+    }
 }
 
 static void test_control_channel(void) {
@@ -4493,6 +4693,9 @@ int main(void) {
     test_acl_lists();
     test_tsig_key_blocks();
     test_control_channel();
+    test_control_keys();
+    test_control_allow_group();
+    test_tsig_key_used();
     test_logging_channels();
     test_structure_and_validation();
     test_config_cidr_matching();

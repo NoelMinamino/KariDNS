@@ -550,6 +550,36 @@ typedef struct {
   char **key_loc;      /* "file:line" of each key name */
 } controls_inet_t;
 
+/* The commands of the control channel as permission bits (a key's permission is a mask of these).  `reload` is the full reload and
+ * `reload-zone` is `reload <zone> [view] [force]`; CTLP_READ covers status, zonestatus, observatory and dbstatus (BIND's read-only set);
+ * CTLP_OTHER is every other word (test-only commands, unknown commands): only a key with full power reaches them. */
+#define CTLP_RELOAD      (1u << 0)
+#define CTLP_RELOAD_ZONE (1u << 1)
+#define CTLP_RECONFIG    (1u << 2)
+#define CTLP_STOP        (1u << 3)
+#define CTLP_NOTIFY      (1u << 4)
+#define CTLP_RETRANSFER  (1u << 5)
+#define CTLP_ROLLBACK    (1u << 6)
+#define CTLP_READ        (1u << 7)
+#define CTLP_OTHER       (1u << 8)
+#define CTLP_FULL        ((1u << 9) - 1u)
+/* the bit a command needs: reload with an argument is CTLP_RELOAD_ZONE, without CTLP_RELOAD */
+uint32_t control_command_perm(const char *cmd, bool has_arg);
+/* the bit of an allow-commands name (reload, reload-zone, reconfig, stop, notify, retransfer, rollback); 0 = not a name */
+uint32_t control_perm_from_name(const char *name);
+
+/* One key of control-channel { keys { } }.  The names are read first and the key { } statements may come later in the file, so the
+ * algorithm and the secret are copied from the top-level key when the parse ends (control_keys_resolve()).  The unnamed `secret` of
+ * the block is not in this list; it has full power and is logged as key "(main)". */
+typedef struct {
+  char *name;
+  char loc[240];                 /* "file:line" of the entry */
+  uint32_t perm;                 /* CTLP_* mask: CTLP_FULL, or CTLP_READ plus the allow-commands of a read-only key */
+  char *algorithm;               /* copy of the key's algorithm (resolved) */
+  uint8_t secret_decoded[256];   /* copy of the key's secret (resolved); cleansed when the configuration is freed */
+  size_t secret_decoded_len;
+} control_key_t;
+
 typedef struct {
   bool enabled;
   char *socket_path;
@@ -557,6 +587,11 @@ typedef struct {
   char *secret;
   uint8_t secret_decoded[256];
   size_t secret_decoded_len;
+  control_key_t *keys;           /* keys { }: the named keys, in the order written */
+  int nkeys;
+  char *allow_group;             /* allow-group: as written (a group name or a number), NULL = only the server's user and root may connect */
+  bool has_allow_gid;            /* allow_gid is valid (resolved when the configuration is read) */
+  uint32_t allow_gid;            /* the gid of allow-group: its members may connect to the socket (the HMAC challenge still follows) */
 } control_channel_config_t;
 
 typedef struct {

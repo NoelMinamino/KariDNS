@@ -506,6 +506,7 @@ register_test "core" "sh" "tests/run_matrix_queries_test.sh" "Table-driven Query
 register_test "core" "sh" "tests/run_server_lifecycle_test.sh" "Server lifecycle: port conflict, bad syntax, signals, and crash recovery (root only, SKIP otherwise)"
 register_test "core" "sh" "tests/run_tcp_adversary_test.sh" "TCP state machine adversary: slowloris, framing errors, trickle, flood"
 register_test "core" "sh" "tests/run_control_adversary_test.sh" "Control channel adversary: bad AUTH, oversized line, idle client, karictl exit statuses"
+register_test "core" "sh" "tests/run_ctl_restricted_key_test.sh" "Restricted control keys (control-channel { keys { } }): karicheck errors with file:line and the TSIG-key warning, a read-only key with allow-commands { reload-zone; } (zonestatus and reload <zone> work, reload / reconfig / stop / notify / retransfer are refused, logged with the key name), full-power key and unnamed secret, refusals keep the connection open, wrong algorithm, reconfig with a bad or changed keys list"
 register_test "core" "sh" "tests/run_karicheck_rules_test.sh" "karicheck diagnostic rules: SSHFP, RFC 8624, tcp-idle-timeout, program zones"
 register_test "core" "sh" "tests/run_karicheck_deep_rules_test.sh" "karicheck static lint rules: delegation, glue, CNAME & ZONEMD"
 register_test "core" "sh" "tests/run_zone_parser_error_paths_test.sh" "Zone parser error paths, escape sequences & malformed directives"

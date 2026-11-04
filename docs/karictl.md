@@ -138,6 +138,8 @@ The `secret` defined in `karictl.conf` must match the secret configured in the `
 
 The file is not parsed as a full configuration file: `karictl` takes the quoted value that follows the **first** occurrence of the word `secret`, and the quoted value that follows the first occurrence of the word `socket`, anywhere in the file (comments included). The value after the first `algorithm` (quoted or not) selects the HMAC: `hmac-md5`, `hmac-sha1`, `hmac-sha224`, `hmac-sha256` (default), `hmac-sha384` or `hmac-sha512`; it must match the server's `control-channel { algorithm }`, and an unsupported name exits with status 2. The key name is not used. The secret may decode to at most 256 bytes. `karictl` prints a warning when the file is readable by group or other users; it should have mode `0600`.
 
+**Restricted keys.** The server can hold several keys, each allowed to run only some commands (`control-channel { keys { } }` in [`karidns.conf`](karidns.md), "Restricted control keys"). `karictl` needs nothing for that: give each user a `karictl.conf` with the `secret` and the `algorithm` of the key it should use. The server finds the key by the response to its challenge. A command the key may not run is answered with `ERROR command not allowed for key "<name>"` and `karictl` exits with status 3; the server logs it with the key name. To let a user other than the server's in, the server's `control-channel { allow-group }` must name a group that user belongs to (the socket is then group-writable); the user needs the `karictl.conf` of its key and no access to `karidns.conf`.
+
 ---
 
 ## EXIT STATUS
@@ -152,7 +154,7 @@ The file is not parsed as a full configuration file: `karictl` takes the quoted 
 : Usage error (no command, an unknown option, `notify` / `retransfer` / `zonestatus` without a zone name; the usage text goes to standard error and nothing is sent to the server), or the secret could not be read or decoded from the configuration file, the challenge was invalid, or authentication failed. A command the server does not know is not a usage error for `karictl`: the server answers `ERROR unknown command` and the exit status is 3. `-h` and `--help` print the usage text to standard output and exit with 0.
 
 `3`
-: The server returned an error (`ERROR ...`, including a failed `reload` or `reconfig`, a database zone that was rejected or could not be read, and a reload that timed out) or an invalid `status` or `observatory` response (also `dbstatus` without a database block).
+: The server returned an error (`ERROR ...`, including a failed `reload` or `reconfig`, a command that the key is not allowed to run, a database zone that was rejected or could not be read, and a reload that timed out) or an invalid `status` or `observatory` response (also `dbstatus` without a database block).
 
 ---
 

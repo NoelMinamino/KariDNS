@@ -143,6 +143,19 @@ control-channel {
     secret "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy";
 };
 
+// 制限付きのキー (control-channel の keys { })。Web 画面などに、状態の確認とゾーン 1 つの reload だけを許す鍵を渡せます。
+// 鍵は TSIG と同じトップレベルの key 文で定義し、keys { } で列挙します (上の secret は従来どおり全権の鍵です)。
+//   read-only yes          : status / zonestatus / observatory / dbstatus だけ
+//   allow-commands { ... } : read-only の鍵に足すコマンド (reload, reload-zone, reconfig, stop, notify, retransfer, rollback)
+// 許されないコマンドは ERROR command not allowed for key "<name>" になり、全コマンドが鍵の名前つきで syslog に残ります。
+// 制御用の鍵は TSIG と別にしてください (karicheck conf は、TSIG にも使っている鍵を警告します)。
+// key "web" { algorithm hmac-sha256; secret "<openssl rand -base64 32 の出力>"; };
+// control-channel {
+//     keys { "web" read-only yes allow-commands { reload-zone; }; };
+//     allow-group "www";   // この group のユーザーも socket に接続できます (socket は group 書き込み可の 0660 になります)。
+//                          // Web 用ユーザーは karidns.conf を読めないようにしてください (0640 root:karidns など)。ディレクトリの x 権限は運用側の責任です
+// };
+
 // 外部設定ファイルのインクルード (include ディレクティブ)
 // トップレベルだけでなく、ブロック内やリストの途中など任意の場所で使用できます。
 // 相対パスは options の directory があればそこから、無ければ当設定ファイルの配置ディレクトリを起点に解決されます。

@@ -198,6 +198,95 @@ bool tsig_key_names_equal(const char *a, const char *b) {
     return domain_names_match_ci(a, b);
 }
 
+/* config_tsig_key_used(): the places that name a TSIG key.  Each helper returns true at the first one and writes its description. */
+static bool kuse_aml(const aml_t *l, const char *key, char *where, size_t wsz, const char *what, const char *scope) {
+    if (!l || !aml_key_listed(l, key)) return false;
+    snprintf(where, wsz, "%s%s%s", scope, scope[0] ? " " : "", what);
+    return true;
+}
+
+static bool kuse_acl_set(const acl_set_t *s, const char *key, char *where, size_t wsz, const char *scope) {
+    return kuse_aml(s->query, key, where, wsz, "allow-query", scope) || kuse_aml(s->query_on, key, where, wsz, "allow-query-on", scope) ||
+           kuse_aml(s->transfer, key, where, wsz, "allow-transfer", scope) || kuse_aml(s->update, key, where, wsz, "allow-update", scope) ||
+           kuse_aml(s->notify, key, where, wsz, "allow-notify", scope) || kuse_aml(s->match, key, where, wsz, "match-clients", scope);
+}
+
+static bool kuse_targets(const notify_target_t *t, int n, const char *key, char *where, size_t wsz, const char *what, const char *scope) {
+    for (int i = 0; i < n; i++)
+        if (t[i].key && tsig_key_names_equal(t[i].key, key)) {
+            snprintf(where, wsz, "%s%s%s", scope, scope[0] ? " " : "", what);
+            return true;
+        }
+    return false;
+}
+
+static bool kuse_servers(const server_stmt_t *s, const char *key, char *where, size_t wsz, const char *scope) {
+    for (; s; s = s->next)
+        if ((s->set & SV_KEYS) && s->key && tsig_key_names_equal(s->key, key)) {
+            snprintf(where, wsz, "%s%sserver statement at %s (keys)", scope, scope[0] ? " " : "", s->loc);
+            return true;
+        }
+    return false;
+}
+
+bool config_tsig_key_used(const server_config_t *cfg, const char *key, char *where, size_t wsz) {
+    if (!cfg || !key || !where || wsz == 0) return false;
+    where[0] = '\0';
+    char scope[200];
+    const view_config_t *v;
+    const zone_config_t *z;
+    CONFIG_FOR_EACH_ZONE(cfg, v, z) {
+        const zone_ext_t *x = zext(z);
+        snprintf(scope, sizeof(scope), "zone '%.80s'", z->domain ? z->domain : "");
+        if (x->tsig_key && tsig_key_names_equal(x->tsig_key, key)) {
+            snprintf(where, wsz, "%s tsig-key", scope);
+            return true;
+        }
+        for (int i = 0; i < x->tsig_keys_count; i++)
+            if (x->tsig_keys[i] && tsig_key_names_equal(x->tsig_keys[i], key)) {
+                snprintf(where, wsz, "%s allow-transfer", scope);
+                return true;
+            }
+        if (kuse_acl_set(&x->acl, key, where, wsz, scope) || kuse_targets(x->masters, x->masters_count, key, where, wsz, "primaries", scope) ||
+            kuse_targets(x->also_notify, x->also_notify_count, key, where, wsz, "also-notify", scope))
+            return true;
+        if (x->upd_policy)
+            for (int i = 0; i < x->upd_policy->count; i++) {
+                const update_rule_t *r = &x->upd_policy->rules[i];
+                if (!r->ident_wild && tsig_key_names_equal(r->identity, key)) {
+                    snprintf(where, wsz, "%s update-policy", scope);
+                    return true;
+                }
+            }
+    }
+    for (v = cfg->views; v; v = v->next) {
+        snprintf(scope, sizeof(scope), "view '%.80s'", v->name ? v->name : "");
+        if (kuse_acl_set(&v->acl, key, where, wsz, scope) || kuse_targets(v->also_notify, v->also_notify_count, key, where, wsz, "also-notify", scope) ||
+            kuse_servers(v->servers, key, where, wsz, scope))
+            return true;
+    }
+    if (kuse_acl_set(&cfg->acl, key, where, wsz, "options") || kuse_targets(cfg->also_notify, cfg->also_notify_count, key, where, wsz, "also-notify", "options") ||
+        kuse_servers(cfg->servers, key, where, wsz, ""))
+        return true;
+    for (const acl_def_t *a = cfg->acls; a; a = a->next) {
+        snprintf(scope, sizeof(scope), "acl '%.80s'", a->name ? a->name : "");
+        if (a->aml && aml_key_listed(a->aml, key)) {
+            snprintf(where, wsz, "%s", scope);
+            return true;
+        }
+    }
+    for (const remote_list_t *r = cfg->remote_lists; r; r = r->next) {
+        snprintf(scope, sizeof(scope), "list '%.80s'", r->name ? r->name : "");
+        if (kuse_targets(r->items, r->count, key, where, wsz, "entries", scope)) return true;
+    }
+    for (int i = 0; i < cfg->database.acl_ceiling_keys_count; i++)
+        if (cfg->database.acl_ceiling_keys[i] && tsig_key_names_equal(cfg->database.acl_ceiling_keys[i], key)) {
+            snprintf(where, wsz, "database acl-ceiling");
+            return true;
+        }
+    return false;
+}
+
 static const char *tsig_error_name(uint16_t error) {
     switch (error) {
     case 16: return "BADSIG";

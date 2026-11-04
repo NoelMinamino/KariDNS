@@ -1211,6 +1211,14 @@ void free_server_config_fields(server_config_t *cfg) {
   if (cfg->control.socket_path) { free(cfg->control.socket_path); cfg->control.socket_path = NULL; }
   if (cfg->control.algorithm) { free(cfg->control.algorithm); cfg->control.algorithm = NULL; }
   if (cfg->control.secret) { free(cfg->control.secret); cfg->control.secret = NULL; }
+  free(cfg->control.allow_group);
+  for (int i = 0; i < cfg->control.nkeys; i++) {
+    free(cfg->control.keys[i].name);
+    free(cfg->control.keys[i].algorithm);
+    OPENSSL_cleanse(cfg->control.keys[i].secret_decoded, sizeof(cfg->control.keys[i].secret_decoded));
+  }
+  free(cfg->control.keys);
+  OPENSSL_cleanse(cfg->control.secret_decoded, sizeof(cfg->control.secret_decoded));
   memset(&cfg->control, 0, sizeof(control_channel_config_t));
   if (cfg->dnstap.socket_path) { free(cfg->dnstap.socket_path); cfg->dnstap.socket_path = NULL; }
   if (cfg->dnstap.identity) { free(cfg->dnstap.identity); cfg->dnstap.identity = NULL; }
@@ -7581,6 +7589,244 @@ static int controls_resolve(token_ctx_t *ctx, server_config_t *cfg) {
   return 0;
 }
 
+/* control-channel { allow-group }: a numeric gid, or a group name looked up with getgrnam_r().  The server reads its configuration again in
+ * capability mode (reload), where /etc/group cannot be opened (and a lookup would trap); so a name that was resolved while the process could
+ * still look it up (start-up, karicheck) is remembered, and a reload may use that name again.  Any other name is refused at a reload with a
+ * message that says a restart is needed; the running configuration is kept.  The cache is written only outside capability mode, which is
+ * single-threaded start-up code. */
+static char g_group_cache_name[256];
+static uint32_t g_group_cache_gid;
+static bool g_group_cache_ok = false;
+
+static bool control_resolve_group(const char *name, uint32_t *gid, char *err, size_t errlen) {
+  if (!name || !name[0]) {
+    snprintf(err, errlen, "the group is empty");
+    return false;
+  }
+  char *end = NULL;
+  if (name[0] >= '0' && name[0] <= '9') {
+    unsigned long v = strtoul(name, &end, 10);
+    if (*end != '\0' || v >= 0xFFFFFFFFul) {
+      snprintf(err, errlen, "'%.64s' is not a valid group id", name);
+      return false;
+    }
+    *gid = (uint32_t)v;
+    return true;
+  }
+  if (g_group_cache_ok && strcmp(g_group_cache_name, name) == 0) {
+    *gid = g_group_cache_gid;
+    return true;
+  }
+  if (atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
+    snprintf(err, errlen, "group '%.64s' was not known when the server started and cannot be looked up now (restart the server, or write the numeric gid)", name);
+    return false;
+  }
+  char stackbuf[16384];
+  struct group gr, *res = NULL;
+  int rc = getgrnam_r(name, &gr, stackbuf, sizeof(stackbuf), &res);
+  if (rc != 0 || !res) {
+    snprintf(err, errlen, "group '%.64s' not found", name);
+    return false;
+  }
+  *gid = (uint32_t)gr.gr_gid;
+  if (strlen(name) < sizeof(g_group_cache_name)) {
+    snprintf(g_group_cache_name, sizeof(g_group_cache_name), "%s", name);
+    g_group_cache_gid = *gid;
+    g_group_cache_ok = true;
+  }
+  return true;
+}
+
+/* ---- control-channel { keys { } }: restricted control keys (KariDNS 0.6.0; BIND's `controls { inet ... keys { } read-only }` has the same idea) ----
+ *   keys { "<key>" [ read-only <boolean> ] [ allow-commands { <command>; ... } ]; ... };
+ * Each name refers to a top-level `key` statement (the secret and the algorithm are taken from it).  A key without read-only has full power.
+ * read-only yes: status, zonestatus, observatory and dbstatus only (BIND's meaning); allow-commands (KariDNS) adds commands to it.
+ * `reload` is the full reload, `reload-zone` is `reload <zone> [view] [force]`.  The test-only commands (evict, xfr-delay, xfr-fail) have no name. */
+uint32_t control_perm_from_name(const char *name) {
+  static const struct { const char *name; uint32_t bit; } t[] = {
+    { "reload", CTLP_RELOAD }, { "reload-zone", CTLP_RELOAD_ZONE }, { "reconfig", CTLP_RECONFIG }, { "stop", CTLP_STOP },
+    { "notify", CTLP_NOTIFY }, { "retransfer", CTLP_RETRANSFER }, { "rollback", CTLP_ROLLBACK },
+  };
+  if (!name) return 0;
+  for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++)
+    if (strcmp(name, t[i].name) == 0) return t[i].bit;
+  return 0;
+}
+
+uint32_t control_command_perm(const char *cmd, bool has_arg) {
+  if (!cmd) return CTLP_OTHER;
+  if (strcmp(cmd, "reload") == 0) return has_arg ? CTLP_RELOAD_ZONE : CTLP_RELOAD;
+  if (strcmp(cmd, "status") == 0 || strcmp(cmd, "zonestatus") == 0 || strcmp(cmd, "observatory") == 0 || strcmp(cmd, "dbstatus") == 0)
+    return CTLP_READ;
+  uint32_t p = control_perm_from_name(cmd);
+  return p ? p : CTLP_OTHER;
+}
+
+/* Reads `{ "name" ...; ... };` after the word `keys`.  The names are checked against the key statements when the parse ends. */
+static int parse_control_keys(token_ctx_t *ctx, server_config_t *config) {
+  const char *what = "control-channel keys";
+  char db[96];
+  conf_token_t t = get_next_token(ctx);
+  if (t.type != TOKEN_LBRACE) {
+    conf_error(ctx, what, "expected '{' but found %s", tok_desc(&t, db, sizeof(db)));
+    free_token(&t);
+    return -1;
+  }
+  free_token(&t);
+  for (;;) {
+    t = get_next_token(ctx);
+    if (t.type == TOKEN_RBRACE) {
+      free_token(&t);
+      break;
+    }
+    if (t.type != TOKEN_STRING || !t.value || !t.value[0]) {
+      conf_error(ctx, what, "expected a key name or '}' but found %s", tok_desc(&t, db, sizeof(db)));
+      free_token(&t);
+      return -1;
+    }
+    char kloc[240];
+    ctx_location(ctx, kloc, sizeof(kloc));
+    char *name = t.value;
+    t.value = NULL;
+    free_token(&t);
+    bool ro = false, ro_set = false, ac_set = false;
+    uint32_t allow = 0;
+    for (;;) {
+      t = get_next_token(ctx);
+      if (t.type == TOKEN_SEMICOLON) {
+        free_token(&t);
+        break;
+      }
+      bool is_ro = t.type == TOKEN_STRING && t.value && !t.is_quoted && strcmp(t.value, "read-only") == 0;
+      bool is_ac = t.type == TOKEN_STRING && t.value && !t.is_quoted && strcmp(t.value, "allow-commands") == 0;
+      if ((is_ro && ro_set) || (is_ac && ac_set)) {
+        conf_error(ctx, what, "key '%.64s': '%s' is given twice", name, is_ro ? "read-only" : "allow-commands");
+        free_token(&t);
+        free(name);
+        return -1;
+      }
+      if (!is_ro && !is_ac) {
+        conf_error(ctx, what, "key '%.64s': expected 'read-only', 'allow-commands' or ';' but found %s", name, tok_desc(&t, db, sizeof(db)));
+        free_token(&t);
+        free(name);
+        return -1;
+      }
+      free_token(&t);
+      if (is_ro) {
+        ro_set = true;
+        char *v = log_word(ctx, what, "yes or no");
+        if (!v) { free(name); return -1; }
+        bool ok = parse_config_bool(v, &ro);
+        if (!ok) conf_error(ctx, what, "key '%.64s': read-only: invalid value '%.64s' (expected yes or no)", name, v);
+        free(v);
+        if (!ok) { free(name); return -1; }
+        continue;
+      }
+      ac_set = true;
+      t = get_next_token(ctx);
+      if (t.type != TOKEN_LBRACE) {
+        conf_error(ctx, what, "key '%.64s': expected '{' after allow-commands but found %s", name, tok_desc(&t, db, sizeof(db)));
+        free_token(&t);
+        free(name);
+        return -1;
+      }
+      free_token(&t);
+      for (;;) {
+        t = get_next_token(ctx);
+        if (t.type == TOKEN_RBRACE) {
+          free_token(&t);
+          break;
+        }
+        if (t.type != TOKEN_STRING || !t.value) {
+          conf_error(ctx, what, "key '%.64s': expected a command name or '}' but found %s", name, tok_desc(&t, db, sizeof(db)));
+          free_token(&t);
+          free(name);
+          return -1;
+        }
+        uint32_t bit = control_perm_from_name(t.value);
+        if (!bit) {
+          conf_error(ctx, what, "key '%.64s': allow-commands: '%.64s' is not a command that can be allowed (reload, reload-zone, reconfig, "
+                     "stop, notify, retransfer, rollback; status, zonestatus, observatory and dbstatus are always allowed for a read-only key)",
+                     name, t.value);
+          free_token(&t);
+          free(name);
+          return -1;
+        }
+        allow |= bit;
+        free_token(&t);
+        if (log_semi(ctx, what, "the command name") != 0) { free(name); return -1; }
+      }
+    }
+    if (ac_set && !(ro_set && ro)) {
+      aml_report(ctx, kloc, what, "key '%.64s': allow-commands needs 'read-only yes' (a key that is not read-only can already run every command)", name);
+      free(name);
+      return -1;
+    }
+    control_key_t *nk = realloc(config->control.keys, (size_t)(config->control.nkeys + 1) * sizeof(*nk));
+    if (!nk) {
+      if (ctx) ctx->error_occurred = true;
+      free(name);
+      return -1;
+    }
+    config->control.keys = nk;
+    control_key_t *k = &nk[config->control.nkeys++];
+    memset(k, 0, sizeof(*k));
+    k->name = name;
+    snprintf(k->loc, sizeof(k->loc), "%s", kloc);
+    k->perm = ro ? (CTLP_READ | allow) : CTLP_FULL;
+  }
+  return log_semi(ctx, what, "'}'");
+}
+
+/* When the file has been read: each listed key must be a top-level key and listed once, the control channel must be able to use its
+ * algorithm, and no two keys (the unnamed `secret` included) may share a secret: the server finds the key by the HMAC the client sends,
+ * so two keys with one secret could not be told apart.  Copies the algorithm and the secret into the list. */
+static int control_keys_resolve(token_ctx_t *ctx, server_config_t *cfg) {
+  control_channel_config_t *cc = &cfg->control;
+  for (int i = 0; i < cc->nkeys; i++) {
+    control_key_t *k = &cc->keys[i];
+    const tsig_key_t *def = NULL;
+    for (const tsig_key_t *t = cfg->keys; t && !def; t = t->next)
+      if (t->name && domain_names_match_ci(t->name, k->name)) def = t;
+    if (!def) {
+      aml_report(ctx, k->loc, "control-channel keys", "unknown key '%.64s' (it must be defined by a top-level key statement)", k->name);
+      return -1;
+    }
+    for (int j = 0; j < i; j++)
+      if (domain_names_match_ci(cc->keys[j].name, k->name)) {
+        aml_report(ctx, k->loc, "control-channel keys", "key '%.64s' is listed twice (first at %s)", k->name, cc->keys[j].loc);
+        return -1;
+      }
+    if (!def->algorithm || !tsig_algorithm_evp_md(def->algorithm)) {
+      aml_report(ctx, k->loc, "control-channel keys", "key '%.64s': algorithm '%.64s' is not supported by the control channel", k->name,
+                 def->algorithm ? def->algorithm : "(none)");
+      return -1;
+    }
+    if (def->secret_decoded_len == 0) {
+      aml_report(ctx, k->loc, "control-channel keys", "key '%.64s' has an empty secret", k->name);
+      return -1;
+    }
+    if (cc->secret_decoded_len == def->secret_decoded_len && memcmp(cc->secret_decoded, def->secret_decoded, def->secret_decoded_len) == 0) {
+      aml_report(ctx, k->loc, "control-channel keys", "key '%.64s' has the same secret as the control-channel secret", k->name);
+      return -1;
+    }
+    for (int j = 0; j < i; j++)
+      if (cc->keys[j].secret_decoded_len == def->secret_decoded_len &&
+          memcmp(cc->keys[j].secret_decoded, def->secret_decoded, def->secret_decoded_len) == 0) {
+        aml_report(ctx, k->loc, "control-channel keys", "key '%.64s' has the same secret as key '%.64s'", k->name, cc->keys[j].name);
+        return -1;
+      }
+    k->algorithm = strdup(def->algorithm);
+    if (!k->algorithm) {
+      if (ctx) ctx->error_occurred = true;
+      return -1;
+    }
+    memcpy(k->secret_decoded, def->secret_decoded, def->secret_decoded_len);
+    k->secret_decoded_len = def->secret_decoded_len;
+  }
+  return 0;
+}
+
 static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) {
   int nr_rc = 0;
   memset(config, 0, sizeof(server_config_t));
@@ -8640,9 +8886,18 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         char *key_prop = tok.value;
         tok.value = NULL;
         free_token(&tok);
+        if (strcmp(key_prop, "keys") == 0) {
+          free(key_prop);
+          if (parse_control_keys(ctx, config) != 0) {
+            if (ctx) ctx->error_occurred = true;
+            return -1;
+          }
+          continue;
+        }
         if (strcmp(key_prop, "algorithm") == 0 ||
             strcmp(key_prop, "secret") == 0 ||
             strcmp(key_prop, "socket") == 0 ||
+            strcmp(key_prop, "allow-group") == 0 ||
             strcmp(key_prop, "socket-path") == 0) {
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
@@ -8664,6 +8919,19 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           if (strcmp(key_prop, "socket") == 0 || strcmp(key_prop, "socket-path") == 0) {
             if (config->control.socket_path) free(config->control.socket_path);
             config->control.socket_path = val;
+          } else if (strcmp(key_prop, "allow-group") == 0) {
+            char gerr[200];
+            uint32_t gid = 0;
+            if (!control_resolve_group(val, &gid, gerr, sizeof(gerr))) {
+              conf_error(ctx, "control-channel", "allow-group: %s", gerr);
+              free(key_prop);
+              free(val);
+              return -1;
+            }
+            free(config->control.allow_group);
+            config->control.allow_group = val;
+            config->control.allow_gid = gid;
+            config->control.has_allow_gid = true;
           } else if (strcmp(key_prop, "algorithm") == 0) {
             if (!tsig_algorithm_is_supported(val)) {
               syslog(LOG_ERR, "[Config] Unsupported TSIG algorithm in controls: %s", val);
@@ -8718,8 +8986,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           /* An unknown key used to be skipped, so a misspelt "secret" or "socket" left the control channel without a secret
            * or on the default socket without a word.  It is a configuration error now (startup and reload alike; karicheck
            * conf shows it as an error because it runs this parser). */
-          syslog(LOG_ERR, "[Config] control-channel: unknown option '%.64s' (supported: socket, secret, algorithm)", key_prop);
-          fprintf(stderr, "[ERROR] control-channel: unknown option '%.64s' (supported: socket, secret, algorithm)\n", key_prop);
+          syslog(LOG_ERR, "[Config] control-channel: unknown option '%.64s' (supported: socket, secret, algorithm, allow-group, keys)", key_prop);
+          fprintf(stderr, "[ERROR] control-channel: unknown option '%.64s' (supported: socket, secret, algorithm, allow-group, keys)\n", key_prop);
           if (ctx) ctx->error_occurred = true;
           free(key_prop);
           return -1;
@@ -8759,6 +9027,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   if (chaos_finish(ctx, config) != 0) return -1;
   logging_finish(config);
   if (controls_resolve(ctx, config) != 0) return -1;
+  if (control_keys_resolve(ctx, config) != 0) return -1;
   if (saw_view_block && saw_top_level_zone) {
     syslog(LOG_ERR, "Cannot mix top-level zone and view blocks");
     // トップレベル直付けの zone_config_t リストを完全解放してリークを防ぐ
