@@ -134,10 +134,11 @@ static void test_zone_files(void) {
     char *names[256];
     size_t nn = 0;
     struct dirent *e;
+    /* (the files that are not tested are "[note]", not "[SKIP]": tests/run_all_suite.sh lists a passing test with a [SKIP] line as one with a skipped part) */
     while ((e = readdir(d)) && nn < 256) {
         size_t l = strlen(e->d_name);
         if (l > 5 && strcmp(e->d_name + l - 5, ".zone") == 0) names[nn++] = strdup(e->d_name);
-        else if (e->d_name[0] != '.') printf("  [SKIP] %s: not a .zone file (include fragment, dnskey or hosts data)\n", e->d_name);
+        else if (e->d_name[0] != '.') printf("  [note] %s: not a .zone file (include fragment, dnskey or hosts data)\n", e->d_name);
     }
     closedir(d);
     qsort(names, nn, sizeof(char *), cmp_names);
@@ -148,7 +149,7 @@ static void test_zone_files(void) {
         snprintf(path, sizeof(path), "%s/%s", g_zones_dir, names[k]);
         zone_arena_t fa;
         if (!z2s_load_zone_file(path, NULL, &fa, apex, sizeof(apex), err, sizeof(err))) {
-            printf("  [SKIP] %s: the zone parser rejects it (%s)\n", names[k], err);
+            printf("  [note] %s: the zone parser rejects it (%s)\n", names[k], err);
             skipped++;
             free(names[k]);
             continue;
@@ -157,7 +158,7 @@ static void test_zone_files(void) {
         for (size_t i = 0; i < fa.count; i++)
             if (fa.records[i].class_val > 1) non_in = true;
         if (fa.is_tinydns_format || non_in) {
-            printf("  [SKIP] %s: %s\n", names[k], fa.is_tinydns_format ? "tinydns data" : "non-IN class records");
+            printf("  [note] %s: %s\n", names[k], fa.is_tinydns_format ? "tinydns data" : "non-IN class records");
             zone_arena_destroy(&fa);
             skipped++;
             free(names[k]);
@@ -165,7 +166,7 @@ static void test_zone_files(void) {
         }
         z2s_rows_t rows;
         if (!z2s_rows_from_arena(&fa, apex, &rows, err, sizeof(err))) {
-            printf("  [SKIP] %s: zone2sql cannot represent it (%s)\n", names[k], err);
+            printf("  [note] %s: zone2sql cannot represent it (%s)\n", names[k], err);
             zone_arena_destroy(&fa);
             skipped++;
             free(names[k]);

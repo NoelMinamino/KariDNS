@@ -8,6 +8,7 @@
 #   - after a restart the zones are in memory before the first query (and the first query is not a miss); with a small memory-limit the warm-up stops at the high
 #     water mark and the zones that are in memory are the hottest ones, in the order of the list
 #   - a corrupt, a truncated and an empty state file are ignored (a log line, `karictl dbstatus`), the server serves, and the next hot list replaces the file
+#   - a state file that exists and cannot be read (a symbolic link) is reported (log, `karictl dbstatus`) and NOT replaced by the next hot list
 #   - a restart of the loader (kill -9) warms again what the Backend lost (needs the test hook of karidns-evict; that part is SKIPped without it)
 #   - warm-before-serve: the queries wait until the hot list is read (fetch-rate 1: about 10 s), or until the time is up; karictl dbstatus works meanwhile
 #   - karictl dbstatus: the new lines, and the old ones are still there; karicheck db checks the state file's directory and contents
@@ -214,6 +215,19 @@ for bad in garbage truncated empty badcount; do
     waitfor 15 sh -c "head -1 '$ST' | grep -q '^KARIDNS-HOT-LIST 1\$' && tail -1 '$ST' | grep -q '^END [0-9]'" && pass "$bad: the next hot list replaces the file" || fail "$bad: the file was not replaced: $(head -c 80 "$ST")"
     stop_srv
 done
+
+echo "== a state file that exists and cannot be read (a symbolic link: O_NOFOLLOW) is not replaced"
+rm -f "$ST"; ln -s "$T/good.state" "$ST"
+conf 256m "fetch-rate 5000;"
+start_srv
+grep -q "state file $ST cannot be read: .*NOT replaced" "$T/srv.log" && pass "the loader says the file cannot be read and is NOT replaced" || fail "no 'cannot be read ... NOT replaced' line in the log"
+dbs | grep -q '^state-file: .* at_start=unreadable, ignored' && pass "dbstatus: unreadable, ignored" || fail "state-file line: $(dbs | grep '^state-file')"
+[ "$(q www.$(zn 3).test)" = "192.0.2.80" ] && pass "the server answers" || fail "no answer"
+n=5; while [ $n -gt 0 ]; do q "www.$(zn 3).test" > /dev/null; n=$((n - 1)); done
+waitfor 15 sh -c "[ \"\$(./karictl -c $T/karictl.conf dbstatus 2>/dev/null | grep '^state-file:' | sed -n 's/.* failed=\([0-9]*\).*/\1/p')\" -ge 1 ]" && pass "the loader acknowledged a hot list with 'failed' (it was not written)" || fail "state-file line: $(dbs | grep '^state-file')"
+[ -L "$ST" ] && [ ! -e "$ST.tmp" ] && ! ls "$T/st" | grep -q tmp && cmp -s "$T/good.state" "$ST" && pass "the link is still there, nothing was renamed over it, no temporary file is left" || fail "the state file was replaced or a temporary file is left: $(ls -l "$T/st")"
+stop_srv
+rm -f "$ST"
 cp "$T/good.state" "$ST"; fix_state
 
 if [ -n "$HOOKBIN" ]; then

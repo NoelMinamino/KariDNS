@@ -37,7 +37,9 @@ build() {
     done
 }
 
-[ -x ./karidns-dbloader ] || build karidns-dbloader
+# a missing loader gets the drivers CI builds (sqlite3 and, with libpq, postgresql: the PostgreSQL tests SKIP without the latter)
+. "$ROOT/tests/lib_proc.sh"
+[ -x ./karidns-dbloader ] || { kari_make karidns-dbloader "DB_DRIVERS=$(kari_default_db_drivers)" > "/tmp/run_db_dump_build.$$.log" 2>&1 || { echo "[FAIL] make karidns-dbloader failed:"; tail -20 "/tmp/run_db_dump_build.$$.log"; rm -f "/tmp/run_db_dump_build.$$.log"; exit 1; }; rm -f "/tmp/run_db_dump_build.$$.log"; }
 [ -x tests/db/zone2sql ] || build zone2sql
 [ -x tests/db/zone2kdb ] || build zone2kdb
 
