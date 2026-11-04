@@ -522,7 +522,7 @@ static int zone_pdns_type_rewrite(dns_record_t *rec, bool is_alias, const char *
         hex[2 * i + 1] = digits[rd[i] & 15];
       }
       hex[2 * n] = '\0';
-      snprintf(lenstr, 8, "%zu", n);
+      snprintf(lenstr, 8, "%u", (unsigned)(n & 0xFFFF)); /* n <= 65535 (RDLENGTH) */
       rec->rdata[0] = arena_strdup(arena, "\\#");
       rec->rdata[1] = lenstr;
       rec->rdata[2] = hex;

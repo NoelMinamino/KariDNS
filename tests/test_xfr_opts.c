@@ -388,7 +388,7 @@ static void test_source_registry(void) {
     }
     CHECK(found == 6);
     /* before the server has recorded its start-up set nothing is allowed; after, exactly what was there, for the use it had */
-    uint8_t a1[4], a2[16], a3[4];
+    uint8_t a1[16] = {0}, a2[16], a3[4]; /* a1 is passed to config_xfr_source_allowed(), which takes 16 bytes */
     inet_pton(AF_INET, "192.0.2.1", a1);
     inet_pton(AF_INET6, "2001:db8::1", a2);
     inet_pton(AF_INET, "192.0.2.5", a3);

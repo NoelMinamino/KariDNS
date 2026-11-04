@@ -2159,7 +2159,7 @@ static int parse_listen_statement(token_ctx_t *ctx, server_config_t *cfg, bool v
   s->v6 = v6;
   s->port = port;
   s->list = l;
-  snprintf(s->loc, sizeof(s->loc), "%s", loc);
+  snprintf(s->loc, sizeof(s->loc), "%.*s", (int)sizeof(s->loc) - 1, loc);
   return 0;
 }
 
@@ -3163,7 +3163,7 @@ static int parse_transport_param(token_ctx_t *ctx, const char *zone_domain, cons
 static int alias_note(token_ctx_t *ctx, server_config_t *cfg, int slot, const char *key, long v) {
   char loc[64], cur[300];
   ctx_location(ctx, cur, sizeof(cur));
-  snprintf(loc, sizeof(loc), "%s", cur);
+  snprintf(loc, sizeof(loc), "%.*s", (int)sizeof(loc) - 1, cur);
   if (cfg->alias_note[slot].name[0] && strcmp(cfg->alias_note[slot].name, key) != 0 && cfg->alias_note[slot].v != v) {
     conf_error(ctx, "options", "%s %ld and %s %ld (%s) are the same setting with two values; write one of them, or the same value in both", key, v,
                cfg->alias_note[slot].name, cfg->alias_note[slot].v, cfg->alias_note[slot].loc);
@@ -4316,7 +4316,7 @@ static int parse_server_block(token_ctx_t *ctx, server_stmt_t **list, const char
   }
   server_stmt_t *s = calloc(1, sizeof(*s));
   if (!s) { free_token(&tok); if (ctx) ctx->error_occurred = true; return -1; }
-  snprintf(s->loc, sizeof(s->loc), "%s", loc);
+  snprintf(s->loc, sizeof(s->loc), "%.*s", (int)sizeof(s->loc) - 1, loc);
   const char *why = NULL;
   snprintf(what, sizeof(what), "%sserver '%.64s'", scope, tok.value);
   if (!server_prefix_parse(tok.value, s, &why)) {
@@ -7255,7 +7255,7 @@ static int parse_log_category(token_ctx_t *ctx, log_pend_t **pend, int *npend, i
     p->cat = cat;
     p->name = t.value;
     t.value = NULL;
-    snprintf(p->loc, sizeof(p->loc), "%s", loc);
+    snprintf(p->loc, sizeof(p->loc), "%.*s", (int)sizeof(p->loc) - 1, loc);
     if (log_semi(ctx, what, "the channel name") != 0) return -1;
   }
   return log_semi(ctx, what, "'}'");
@@ -7443,7 +7443,7 @@ static int parse_controls_inet(token_ctx_t *ctx, server_config_t *config) {
   config->controls = nc;
   controls_inet_t *c = &nc[config->controls_count++];
   memset(c, 0, sizeof(*c));
-  snprintf(c->loc, sizeof(c->loc), "%s", loc);
+  snprintf(c->loc, sizeof(c->loc), "%.*s", (int)sizeof(c->loc) - 1, loc);
   snprintf(c->addr, sizeof(c->addr), "%s", norm);
   c->port = port;
   c->allow = allow;

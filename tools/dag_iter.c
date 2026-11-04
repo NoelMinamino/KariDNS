@@ -176,7 +176,7 @@ static void it_collect_glue(it_resp_t *out, const it_rr_t *ad, int nad, const ch
             if (!trace_name_equal(ad[i].owner, out->ns[j])) continue;
             it_glue_t *g = &out->glue[out->nglue++];
             snprintf(g->owner, sizeof(g->owner), "%s", ad[i].owner);
-            snprintf(g->addr, sizeof(g->addr), "%s", ad[i].rdata);
+            snprintf(g->addr, sizeof(g->addr), "%.*s", (int)sizeof(g->addr) - 1, ad[i].rdata);
             g->in_domain = trace_name_is_subdomain(ad[i].owner, out->cut);
             break;
         }
@@ -252,7 +252,7 @@ it_resp_kind_t dag_iter_classify(const uint8_t *pkt, size_t len, const char *qna
             if (ans[i].type != qtype && qtype != 255 /* ANY */) continue;
             matched++;
             if ((ans[i].type == 1 || ans[i].type == 28) && out->naddr < IT_MAX_ADDRS) {
-                snprintf(out->addrs[out->naddr++], sizeof(out->addrs[0]), "%s", ans[i].rdata);
+                snprintf(out->addrs[out->naddr++], sizeof(out->addrs[0]), "%.*s", (int)sizeof(out->addrs[0]) - 1, ans[i].rdata);
             }
         }
         if (matched > 0) {
@@ -337,7 +337,7 @@ it_resp_kind_t dag_iter_classify(const uint8_t *pkt, size_t len, const char *qna
             }
         }
         it_collect_glue(out, add, nad, zone);
-        IT_RET(IT_RESP_REFERRAL, "referral to %s", out->cut);
+        IT_RET(IT_RESP_REFERRAL, "referral to %.*s", (int)(sizeof(out->why) - sizeof("referral to ")), out->cut); /* (cut to what why[] holds) */
     }
 
     if (has_soa || out->aa) IT_RET(IT_RESP_NODATA, "NODATA");

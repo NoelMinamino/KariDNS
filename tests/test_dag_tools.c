@@ -25,6 +25,14 @@ char g_last_server_ip[INET6_ADDRSTRLEN + 1] = {0};
 static int g_reasm_msg_count = 0;
 static size_t g_last_reasm_len = 0;
 
+/* Write a whole fixture file; a short write would only show up later as a confusing parse failure. */
+static void write_all(int fd, const char *s) {
+    size_t n = strlen(s);
+    ssize_t w = write(fd, s, n);
+    assert(w == (ssize_t)n);
+    (void)w;
+}
+
 bool has_break(break_kind_t kind, long *param_out, bool *has_param_out) {
     (void)kind;
     if (param_out) *param_out = 0;
@@ -156,7 +164,7 @@ static void test_dag_sig0_client_keys(void) {
         "Private-key-format: v1.3\n"
         "Algorithm: 15 (ED25519)\n"
         "PrivateKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n";
-    write(fd, ed_content, strlen(ed_content));
+    write_all(fd, ed_content);
     close(fd);
 
     sig0_key_t key_ed;
@@ -182,7 +190,7 @@ static void test_dag_sig0_client_keys(void) {
         "Private-key-format: v1.3\n"
         "Algorithm: 13 (ECDSAP256SHA256)\n"
         "PrivateKey: c29tZXJhbmRvbTMyeWJ0ZXNwMjg2a2V5c2VjcmV0ISE=\n";
-    write(fd, ec_content, strlen(ec_content));
+    write_all(fd, ec_content);
     close(fd);
 
     sig0_key_t key_ec;
@@ -214,7 +222,7 @@ static void test_dag_sig0_client_keys(void) {
         "Exponent1: o3gQjF4y3mS31M4q0y5Q5w==\n"
         "Exponent2: o3gQjF4y3mS31M4q0y5Q5w==\n"
         "Coefficient: o3gQjF4y3mS31M4q0y5Q5w==\n";
-    write(fd, rsa_content, strlen(rsa_content));
+    write_all(fd, rsa_content);
     close(fd);
 
     sig0_key_t key_rsa;
@@ -330,7 +338,7 @@ static void test_dag_tsig_client_parser(void) {
     }
     assert(fd >= 0);
     const char kf_content[] = "key \"transfer-key\" {\n\talgorithm hmac-sha256;\n\tsecret \"c2VjcmV0MTIz\";\n};\n";
-    write(fd, kf_content, strlen(kf_content));
+    write_all(fd, kf_content);
     close(fd);
 
     memset(&qo, 0, sizeof(qo));
@@ -1306,7 +1314,7 @@ static void test_dag_tsig_client_keyfile_with_comments(void) {
         "  algorithm hmac-sha256;\n"
         "  secret \"c2VjcmV0MTIz\";\n"
         "};\n";
-    write(fd, content_str, strlen(content_str));
+    write_all(fd, content_str);
     close(fd);
 
     query_opts_t qo;
@@ -1328,7 +1336,7 @@ static void test_dag_tsig_client_keyfile_trailing_newline(void) {
     }
     assert(fd >= 0);
     const char *content_str = "key \"key2\" { algorithm hmac-sha512; secret \"c2VjcmV0MTIz\"; };   \n";
-    write(fd, content_str, strlen(content_str));
+    write_all(fd, content_str);
     close(fd);
 
     query_opts_t qo;
@@ -3781,7 +3789,7 @@ static void test_dag_tsig_client_p384_and_curve_matching(void) {
             "Modulus: o3gQjF4y3mS31M4q0y5Q5mS31M4q0y5Q5mS31M4q0y4=\n"
             "PublicExponent: AQAB\n"
             "PrivateExponent: o3gQjF4y3mS31M4q0y5Q5mS31M4q0y5Q5mS31M4q0y4=\n";
-        write(fd, unsupp_content, strlen(unsupp_content));
+        write_all(fd, unsupp_content);
         close(fd);
         sig0_key_t key_unsupp;
         memset(&key_unsupp, 0, sizeof(key_unsupp));

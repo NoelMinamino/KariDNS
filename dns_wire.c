@@ -484,7 +484,8 @@ static char *dnssec_rdata_time(zone_arena_t *arena, uint32_t t) {
     unsigned m = mp < 10 ? mp + 3 : mp - 9;
     if (m <= 2) y++;
     char *s = arena_alloc(arena, 15);
-    if (s) snprintf(s, 15, "%04u%02u%02u%02u%02u%02u", (unsigned)y, m, d,
+    /* the %100 and %10000 hold for every uint32_t time (year <= 2106); they let the compiler see the 14-digit bound */
+    if (s) snprintf(s, 15, "%04u%02u%02u%02u%02u%02u", (unsigned)(y % 10000), m % 100, d % 100,
                     secs / 3600, (secs / 60) % 60, secs % 60);
     return s;
 }
