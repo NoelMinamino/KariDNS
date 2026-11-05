@@ -172,7 +172,7 @@ if [ -n "$DRIVERS" ]; then
     SQL_FILES=""
     for d in $DRIVERS; do
         case "$d" in
-            sqlite3)    SQL_FILES="${SQL_FILES} db/karidns_ext.sqlite3.sql db/karidns_ext_v1_to_v2.sqlite3.sql" ;;
+            sqlite3)    SQL_FILES="${SQL_FILES} db/karidns_ext.sqlite3.sql db/karidns_ext_v1_to_v2.sqlite3.sql db/karidns_audit.sqlite3.sql db/karidns_auth.sqlite3.sql" ;;
             postgresql) SQL_FILES="${SQL_FILES} db/karidns_ext.pgsql.sql db/karidns_ext_v1_to_v2.pgsql.sql db/karidns_loader_role.pgsql.sql db/karidns_writer_role.pgsql.sql" ;;
         esac
     done

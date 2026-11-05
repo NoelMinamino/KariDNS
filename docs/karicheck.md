@@ -160,7 +160,7 @@ Every database gets a line `[RESULT] Database ...: N zone(s) read, E error(s), W
 | **Schema** | |
 | a PowerDNS table or column the loader reads is missing (`domains`, `records`, `domainmetadata`, `cryptokeys`; all missing columns are named) | error |
 | none of the `karidns_*` tables exists (a plain PowerDNS database), or one is missing or incomplete (what it costs is said: no change log, no view mapping, no profiles, no tags) | warning |
-| `karidns_schema_version` is newer than 2 / has no row | error / warning |
+| `karidns_schema_version` is newer than 3 / has no row | error / warning |
 | `auto-reload yes` and `karidns_changes` is missing, or change log triggers are missing (named) | error |
 | PostgreSQL: `karidns_changes` has no `xid` column (schema version 1: no change log) | warning |
 | PostgreSQL: the role cannot `SELECT` a table the loader reads, or `cryptokeys.domain_id` | error |

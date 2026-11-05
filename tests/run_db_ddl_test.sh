@@ -91,9 +91,9 @@ else
     sq < "$SCHEMA" > /dev/null
     sq < "$EXT" || fail "the ext file does not apply"
     sq < "$EXT" || fail "the ext file does not apply a second time"
-    [ "$(sq 'SELECT count(*) FROM karidns_schema_version')" = "1" ] && [ "$(sq 'SELECT version FROM karidns_schema_version')" = "2" ] &&
-        pass "schema version 2, one row after two applications" || fail "karidns_schema_version"
-    for t in karidns_schema_version karidns_changes karidns_domain_views karidns_profiles karidns_record_tags karidns_record_tinydns karidns_zone_tagdefs; do
+    [ "$(sq 'SELECT count(*) FROM karidns_schema_version')" = "1" ] && [ "$(sq 'SELECT version FROM karidns_schema_version')" = "3" ] &&
+        pass "schema version 3, one row after two applications" || fail "karidns_schema_version"
+    for t in karidns_schema_version karidns_changes karidns_domain_views karidns_profiles karidns_record_tags karidns_record_tinydns karidns_zone_tagdefs karidns_audit_log karidns_audit_actor; do
         [ "$(sq "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '$t'")" = "1" ] && pass "table $t" || fail "table $t is missing"
     done
     # 9 tables with INSERT / UPDATE / DELETE triggers (B7a: karidns_profiles) + the prune trigger
@@ -101,6 +101,19 @@ else
     [ "$(sq "SELECT count(*) FROM pragma_table_info('karidns_zone_tagdefs') WHERE name = 'id' AND pk = 1")" = "1" ] && pass "karidns_zone_tagdefs.id is the primary key" || fail "karidns_zone_tagdefs.id"
     [ "$(sq "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'")" = "28" ] && pass "28 triggers (9 tables x 3 + prune)" ||
         fail "trigger count $(sq "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'"), wanted 28"
+    # item B (schema version 3): a version 2 database (the audit tables gone, the version row 2) becomes version 3 when the file is applied again;
+    # applied again to a version 3 database it changes nothing; a version 1 database (version row 1) keeps its version
+    sq "DROP TABLE karidns_audit_log; DROP TABLE karidns_audit_actor; UPDATE karidns_schema_version SET version = 2"
+    sq < "$EXT" && [ "$(sq 'SELECT version FROM karidns_schema_version')" = "3" ] && [ "$(sq 'SELECT count(*) FROM karidns_schema_version')" = "1" ] &&
+        [ "$(sq "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('karidns_audit_log', 'karidns_audit_actor')")" = "2" ] &&
+        pass "a version 2 database becomes version 3 when the file is applied again (the audit tables are added)" || fail "version 2 to 3"
+    sq "UPDATE karidns_schema_version SET version = 1"
+    sq < "$EXT" && [ "$(sq 'SELECT version FROM karidns_schema_version')" = "1" ] && pass "a version 1 database keeps version 1 (it needs the v1 to v2 file first)" || fail "version 1 is kept"
+    sq "UPDATE karidns_schema_version SET version = 3"
+    [ "$(sq "SELECT count(*) FROM pragma_table_info('karidns_audit_actor')")" = "5" ] && pass "karidns_audit_actor has id and the four actor columns" || fail "karidns_audit_actor columns"
+    sq "INSERT INTO karidns_audit_actor (id, db_role) VALUES (1, 'x')" && ! sq "INSERT INTO karidns_audit_actor (id, db_role) VALUES (2, 'y')" 2> /dev/null &&
+        pass "karidns_audit_actor holds one row at most (id is always 1)" || fail "karidns_audit_actor single row"
+    sq "DELETE FROM karidns_audit_actor"
     sq "PRAGMA foreign_keys = ON" > /dev/null
 
     # sq with foreign keys on for the statements below (the pragma is per connection)
@@ -231,13 +244,35 @@ else
         pf tests/db/pdns_schema.pgsql.sql > "$T/pg_schema.out" 2>&1 || { fail "the PowerDNS-style schema does not load"; cat "$T/pg_schema.out"; }
         pf db/karidns_ext.pgsql.sql > "$T/pg_ext.out" 2>&1 && pass "the ext file applies" || { fail "the ext file does not apply"; cat "$T/pg_ext.out"; }
         pf db/karidns_ext.pgsql.sql > "$T/pg_ext2.out" 2>&1 && pass "the ext file applies a second time" || { fail "second application"; cat "$T/pg_ext2.out"; }
-        [ "$(pq 'SELECT count(*) FROM karidns_schema_version')" = "1" ] && [ "$(pq 'SELECT version FROM karidns_schema_version')" = "2" ] &&
-            pass "schema version 2, one row after two applications" || fail "karidns_schema_version"
+        [ "$(pq 'SELECT count(*) FROM karidns_schema_version')" = "1" ] && [ "$(pq 'SELECT version FROM karidns_schema_version')" = "3" ] &&
+            pass "schema version 3, one row after two applications" || fail "karidns_schema_version"
+        [ "$(pq 'SELECT count(*) FROM karidns_auth.schema_version')" = "1" ] && [ "$(pq 'SELECT version FROM karidns_auth.schema_version')" = "3" ] &&
+            pass "karidns_auth.schema_version is 3, one row" || fail "karidns_auth.schema_version"
+        for t in principals credentials memberships principal_closure rr_policies grants audit_log; do
+            [ "$(pq "SELECT count(*) FROM pg_tables WHERE tablename = '$t' AND schemaname = 'karidns_auth'")" = "1" ] && pass "table karidns_auth.$t" || fail "table karidns_auth.$t is missing"
+        done
         for t in karidns_schema_version karidns_changes karidns_domain_views karidns_profiles karidns_record_tags karidns_record_tinydns karidns_zone_tagdefs karidns_reload_requests karidns_server_status; do
             [ "$(pq "SELECT count(*) FROM pg_tables WHERE tablename = '$t' AND schemaname = current_schema()")" = "1" ] && pass "table $t" || fail "table $t is missing"
         done
-        [ "$(pq "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND c.relname LIKE '%'")" = "31" ] &&
-            pass "31 triggers (9 tables x 3 + prune + the 3 of karidns_reload_requests: lock, notify, prune)" || fail "trigger count $(pq "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal")"
+        [ "$(pq "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND c.relname LIKE '%'")" = "43" ] &&
+            pass "43 triggers (9 tables x 3 + prune + the 3 of karidns_reload_requests + item B: the grants trigger on domains, 6 on principals / credentials / memberships, the audit of the 5 karidns_auth tables)" ||
+            fail "trigger count $(pq "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal")"
+        # item B: no audit trigger and no RLS on the PowerDNS tables (the role scripts of the WebAdmin switch them on)
+        [ "$(pq "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND t.tgname LIKE 'karidns_audit%' AND c.relnamespace = current_schema()::regnamespace")" = "0" ] &&
+            [ "$(pq "SELECT count(*) FROM pg_class WHERE relrowsecurity AND relnamespace IN (current_schema()::regnamespace, 'karidns_auth'::regnamespace)")" = "0" ] &&
+            pass "the file attaches no audit trigger to the PowerDNS tables and enables no row level security" || fail "audit triggers or RLS enabled by the ext file"
+        [ "$(pq "SELECT count(*) FROM pg_proc WHERE pronamespace = 'karidns_auth'::regnamespace AND prokind = 'f' AND proconfig IS NULL")" = "0" ] && pass "every karidns_auth function pins its search_path" || fail "unpinned karidns_auth functions"
+        [ "$(pq "SELECT count(*) FROM pg_proc p JOIN pg_trigger t ON t.tgfoid = p.oid WHERE p.pronamespace = 'karidns_auth'::regnamespace AND NOT p.prosecdef AND p.proname <> 'audit_zone_fn'")" = "0" ] &&
+            pass "the trigger functions of karidns_auth are SECURITY DEFINER" || fail "a karidns_auth trigger function is not SECURITY DEFINER"
+        # item B: a version 2 database (karidns_auth gone, the version row 2) becomes version 3 when the file is applied again; a version 1 database keeps its version
+        pq "DROP SCHEMA karidns_auth CASCADE; UPDATE karidns_schema_version SET version = 2" > /dev/null
+        [ "$(pq "SELECT count(*) FROM pg_trigger WHERE tgname = 'karidns_trg_domains_grants'")" = "0" ] && pass "(the version 2 look: no karidns_auth, no grants trigger on domains)" || fail "version 2 look"
+        pf db/karidns_ext.pgsql.sql > "$T/pg_ext3.out" 2>&1 && [ "$(pq 'SELECT version FROM karidns_schema_version')" = "3" ] && [ "$(pq 'SELECT count(*) FROM karidns_schema_version')" = "1" ] &&
+            [ "$(pq 'SELECT version FROM karidns_auth.schema_version')" = "3" ] && [ "$(pq "SELECT count(*) FROM pg_trigger WHERE tgname = 'karidns_trg_domains_grants'")" = "1" ] &&
+            pass "a version 2 database becomes version 3 when the file is applied again (karidns_auth and the grants trigger are added)" || { fail "version 2 to 3"; cat "$T/pg_ext3.out"; }
+        pq "UPDATE karidns_schema_version SET version = 1" > /dev/null
+        pf db/karidns_ext.pgsql.sql > /dev/null 2>&1 && [ "$(pq 'SELECT version FROM karidns_schema_version')" = "1" ] && pass "a version 1 database keeps version 1 (it needs the v1 to v2 file first)" || fail "version 1 is kept"
+        pq "UPDATE karidns_schema_version SET version = 3" > /dev/null
 
         # B10 (schema version 2): the log rows carry the xid8 of the writing transaction, tagdefs have an id
         [ "$(pq "SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'karidns_changes'::regclass AND attname = 'xid'")" = "xid8" ] &&

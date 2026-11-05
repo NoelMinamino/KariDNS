@@ -387,11 +387,14 @@ static void test_schema(void) {
     CHECK(D->check_schema(c, &si) == 0);
 
     /* a newer schema version */
-    Q("UPDATE karidns_schema_version SET version = 3");
+    Q("UPDATE karidns_schema_version SET version = 4");
     CHECK(D->check_schema(c, &si) == -1);
-    CHECK_HAS(D->errmsg(c), "versions 1 and 2");
+    CHECK_HAS(D->errmsg(c), "versions 1 to 3");
+    Q("UPDATE karidns_schema_version SET version = 3");                       /* item B: version 3 is read, the loader uses nothing of it */
+    CHECK(D->check_schema(c, &si) == 0);
     Q("UPDATE karidns_schema_version SET version = 2");
     CHECK(D->check_schema(c, &si) == 0);
+    Q("UPDATE karidns_schema_version SET version = 3");
 
     /* a table of the optional set missing: no change log, no mapping */
     Q("ALTER TABLE karidns_domain_views RENAME TO karidns_domain_views_x");
@@ -426,7 +429,7 @@ static void test_schema_findings(void) {
     memset(&f, 0, sizeof(f));
     CHECK(D->schema_findings(c, &o, fnd_sink, &f) == 0);
     CHECK(strstr(f.text, "E:") == NULL);                                         /* everything is there, triggers too */
-    CHECK_HAS(f.text, "I:karidns_* schema version 2");
+    CHECK_HAS(f.text, "I:karidns_* schema version 3");
 
     /* several faults at once: all named */
     Q("ALTER TABLE records RENAME COLUMN ordername TO ordername_x; ALTER TABLE records RENAME COLUMN prio TO prio_x");
@@ -1788,6 +1791,64 @@ static void test_writes(void) {
     Q("DROP SCHEMA wr_plain CASCADE");
 }
 
+/* item B: karidns-zone --audit summary (w_set_audit).  db/karidns_ext.pgsql.sql (schema version 3) holds the audit log; karidns_auth.enable_audit()
+ * attaches the triggers (the role scripts of milestone M2 do that in production). */
+static void test_audit(void) {
+    printf("audit log (w_set_audit)\n");
+    Q("TRUNCATE domains, records, domainmetadata, karidns_changes, karidns_domain_views, karidns_record_tags, karidns_record_tinydns, karidns_zone_tagdefs, "
+      "karidns_reload_requests RESTART IDENTITY CASCADE");
+    CHECK(pg_count("SELECT karidns_auth.enable_audit('public')") == 8);
+    Q("DELETE FROM karidns_auth.audit_log");
+    db_source_t src = { "postgresql", NULL, g_ci, NULL, 300 };
+    char err[DB_ERRLEN], v[64];
+    db_conn_t *ro = open_drv(NULL), *c = NULL;
+    CHECK(D->open_write(&c, &src, err, sizeof(err)) == 0);
+    if (!ro || !c) return;
+    db_schema_info_t si;
+    CHECK(D->check_schema(c, &si) == 0 && si.has_ext);
+    int64_t did = 0, rid = 0;
+    db_record_row_t row = { 0, 300, 10, false, false, false, "a.au.test", "MX", "mx.au.test", NULL };
+    CHECK(D->w_set_audit(ro, true, NULL) == -1);
+    CHECK_HAS(D->errmsg(ro), "writable connection");
+    /* rows (the default): one audit row per changed row */
+    CHECK(D->w_begin(c, "au.test") == 0 && D->w_create_zone(c, "au.test", NULL, &did) == 0);
+    CHECK(D->w_insert_record(c, did, &row, true, &rid) == 0 && D->w_insert_record(c, did, &row, true, &rid) == 0 && D->w_commit(c) == 0);
+    CHECK(pg_count("SELECT count(*) FROM karidns_auth.audit_log WHERE table_name = 'records' AND op = 'I' AND zone_name = 'au.test'") == 2);
+    CHECK(pg_count("SELECT count(*) FROM karidns_auth.audit_log WHERE table_name = 'domains' AND op = 'I' AND zone_name = 'au.test'") == 1);
+    CHECK(pg_count("SELECT count(*) FROM karidns_auth.audit_log WHERE after ->> 'summary' IS NOT NULL") == 0);
+    /* summary: one row for the transaction, table, operation and zone, with the statements and the rows */
+    Q("DELETE FROM karidns_auth.audit_log");
+    CHECK(D->w_set_audit(c, true, "ignored on PostgreSQL") == 0);
+    CHECK(D->w_begin(c, "au.test") == 0);
+    CHECK(D->w_set_audit(c, false, NULL) == -1);                                  /* not inside a transaction */
+    CHECK_HAS(D->errmsg(c), "outside a transaction");
+    for (int i = 0; i < 3; i++) CHECK(D->w_insert_record(c, did, &row, true, &rid) == 0);
+    CHECK(D->w_insert_tags(c, rid, "lan", NULL) == 0 && D->w_commit(c) == 0);
+    CHECK(pg_count("SELECT count(*) FROM karidns_auth.audit_log WHERE table_name = 'records'") == 1);
+    qv(g_admin, "SELECT zone_name || ' ' || op || ' ' || (after ->> 'statements') || ' ' || (after ->> 'rows') || ' ' || (before IS NULL)::text FROM karidns_auth.audit_log WHERE table_name = 'records'", v, sizeof(v));
+    CHECK_MSG(!strcmp(v, "au.test I 3 3 true"), "summary row: %s", v);
+    qv(g_admin, "SELECT zone_name || ' ' || (after ->> 'rows') FROM karidns_auth.audit_log WHERE table_name = 'karidns_record_tags'", v, sizeof(v));
+    CHECK_MSG(!strcmp(v, "au.test 1"), "tags summary row: %s", v);
+    CHECK(pg_count("SELECT count(*) FROM karidns_auth.audit_log") == 2);
+    /* the next transaction has its own summary rows (SET LOCAL ended with the first), and a delete of all records is one row */
+    CHECK(D->w_begin(c, "au.test") == 0 && D->w_delete_records(c, did, NULL, 0) == 0 && D->w_commit(c) == 0);
+    qv(g_admin, "SELECT zone_name || ' ' || (before ->> 'rows') || ' ' || (after IS NULL)::text FROM karidns_auth.audit_log WHERE table_name = 'records' AND op = 'D'", v, sizeof(v));
+    CHECK_MSG(!strcmp(v, "au.test 5 true"), "delete summary row: %s", v);
+    CHECK(pg_count("SELECT count(*) FROM karidns_auth.audit_log WHERE table_name = 'records' AND op = 'I'") == 1);
+    /* back to rows */
+    Q("DELETE FROM karidns_auth.audit_log");
+    CHECK(D->w_set_audit(c, false, NULL) == 0);
+    CHECK(D->w_begin(c, "au.test") == 0 && D->w_insert_record(c, did, &row, true, &rid) == 0 && D->w_insert_record(c, did, &row, true, &rid) == 0 && D->w_commit(c) == 0);
+    CHECK(pg_count("SELECT count(*) FROM karidns_auth.audit_log WHERE table_name = 'records' AND after ->> 'summary' IS NULL") == 2);
+    D->close(c);
+    D->close(ro);
+    Q("SELECT karidns_auth.disable_audit('public')");
+    Q("TRUNCATE domains, records, domainmetadata, karidns_changes, karidns_domain_views, karidns_record_tags, karidns_record_tinydns, karidns_zone_tagdefs, "
+      "karidns_reload_requests RESTART IDENTITY CASCADE");
+    Q("DELETE FROM karidns_auth.audit_log");
+}
+
+
 int main(int argc, char **argv) {
     snprintf(g_root, sizeof(g_root), "%s", argc > 1 ? argv[1] : "tests/db");
     const char *pg = getenv("KARIDNS_TEST_PG");
@@ -1863,6 +1924,7 @@ int main(int argc, char **argv) {
     test_status();
     test_v1_and_migration();
     test_writes();
+    test_audit();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

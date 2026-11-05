@@ -281,6 +281,14 @@ typedef struct db_driver {
     int (*w_request_reload)(db_conn_t *c, const char *zone, bool force);
     /* Does the zone have a row in cryptokeys?  (Existence only: the importer never reads key material.) */
     int (*w_zone_has_keys)(db_conn_t *c, int64_t domain_id, bool *has);
+    /* The audit log (schema version 3, db/karidns_ext.*.sql; karidns-zone --audit).  Call it on an open_write() connection outside a
+     * transaction; it applies to every later w_begin() ... w_commit().  PostgreSQL: summary makes each write transaction begin with
+     * SET LOCAL karidns.audit = 'summary' (the audit triggers then log one row per transaction, table and operation instead of one per row; actor is
+     * ignored).  SQLite3: when actor is not NULL and the database has the table karidns_audit_actor, each write transaction puts the row
+     * (id 1, db_role = actor, no principal) there first and w_commit() deletes it, so that the audit triggers
+     * (db/karidns_audit.sqlite3.sql) name the writer; actor is not copied and must stay valid until close(); summary is ignored.
+     * -1 on a connection that is read only or inside a transaction. */
+    int (*w_set_audit)(db_conn_t *c, bool summary, const char *actor);
 } db_driver_t;
 
 #define DB_IN_MAX 128u        /* the most zones of one scan_*_in call */

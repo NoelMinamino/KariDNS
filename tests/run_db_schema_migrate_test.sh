@@ -8,7 +8,7 @@
 # SQLite3 (sqlite3 CLI and a loader with the driver; SKIP otherwise): a version 1 database with tag definitions of two zones
 # inserted interleaved; the dump of it; after the migration (applied twice) the table has ids in the old order, the version
 # row is 2 (one row), the three triggers of the table are back and log, integrity_check is ok, and the dump has the same bytes;
-# applying the version 2 file to the migrated database changes nothing; a version 3 database is refused by the loader.
+# applying the version 3 file to the migrated database moves it to version 3 and the loader reads it; a version 4 database is refused by the loader.
 # PostgreSQL (psql, a reachable server, a loader with the driver; SKIP otherwise, with the reason): the same on a version 1
 # database (no xid: the loader serves it without a change log, the dump is the same as SQLite3's), the migration (applied
 # twice) gives xid 0 to the old log rows and the transaction's xid to new ones, ids in the old order, and the same dump bytes.
@@ -33,9 +33,9 @@ pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
 skip() { SKIPS=$((SKIPS + 1)); echo "  [SKIP] $1"; }
 
-# the version 1 files: version 2 without its additions
-perl -ne 'next if /schema version 2: the order of the definitions/; next if /^CREATE INDEX IF NOT EXISTS karidns_changes_xid_idx/; s/ SET search_path FROM CURRENT//; s/SELECT 2 WHERE/SELECT 1 WHERE/; s/^(  changed_at BIGINT NOT NULL),$/$1/; next if /^  xid        xid8/; print' db/karidns_ext.pgsql.sql > "$T/v1.pgsql.sql"
-perl -ne 'next if /schema version 2: the order of the definitions/; s/SELECT 2 WHERE/SELECT 1 WHERE/; print' db/karidns_ext.sqlite3.sql > "$T/v1.sqlite3.sql"
+# the version 1 files: version 2 without its additions (and without what version 3 adds: everything from the marker line on)
+perl -ne 'last if /^-- == karidns_auth .schema version 3. ==/; next if /schema version 2: the order of the definitions/; next if /^CREATE INDEX IF NOT EXISTS karidns_changes_xid_idx/; s/ SET search_path FROM CURRENT//; s/SELECT 2 WHERE/SELECT 1 WHERE/; s/^(  changed_at BIGINT NOT NULL),$/$1/; next if /^  xid        xid8/; print' db/karidns_ext.pgsql.sql > "$T/v1.pgsql.sql"
+perl -ne 'last if /^-- == audit tables .schema version 3. ==/; next if /schema version 2: the order of the definitions/; s/SELECT 2 WHERE/SELECT 1 WHERE/; print' db/karidns_ext.sqlite3.sql > "$T/v1.sqlite3.sql"
 grep -q "xid8 NOT NULL" "$T/v1.pgsql.sql" && fail "the version 1 PostgreSQL file still has the xid column"
 [ "$(grep -c "^  id        INTEGER PRIMARY KEY AUTOINCREMENT" "$T/v1.sqlite3.sql")" = "0" ] || fail "the version 1 SQLite file still has tagdefs.id"
 
@@ -94,10 +94,12 @@ else
     sqlite3 "$DB" "INSERT INTO karidns_zone_tagdefs (domain_id, kind, tag, cidr) VALUES (1, 'location', 'interleaved', '203.0.113.0/24')" > /dev/null
     "$LOADER" --dump "$T/s3.kdb" --driver sqlite3 --database-file "$DB" 2> /dev/null
     cmp -s "$T/s1.kdb" "$T/s3.kdb" && pass "the dump of the migrated database equals the dump of the version 1 database (byte for byte)" || fail "the dump changed with the migration"
-    sqlite3 "$DB" < db/karidns_ext.sqlite3.sql > /dev/null 2>&1 && [ "$(sqlite3 "$DB" "SELECT version FROM karidns_schema_version")" = "2" ] && pass "the version 2 file applies to a migrated database (idempotent)" || fail "version 2 file on a migrated database"
-    sqlite3 "$DB" "UPDATE karidns_schema_version SET version = 3" > /dev/null
+    sqlite3 "$DB" < db/karidns_ext.sqlite3.sql > /dev/null 2>&1 && [ "$(sqlite3 "$DB" "SELECT version FROM karidns_schema_version")" = "3" ] && pass "the version 3 file applies to a migrated database: version 3 (idempotent)" || fail "version 3 file on a migrated database"
+    "$LOADER" --dump "$T/s3b.kdb" --driver sqlite3 --database-file "$DB" 2> "$T/s3b.err"; r=$?
+    [ "$r" -eq 0 ] && pass "the loader reads the version 3 database (exit 0)" || { fail "version 3 database: exit $r"; head -2 "$T/s3b.err"; }
+    sqlite3 "$DB" "UPDATE karidns_schema_version SET version = 4" > /dev/null
     "$LOADER" --dump "$T/s4.kdb" --driver sqlite3 --database-file "$DB" 2> "$T/s4.err"; r=$?
-    [ "$r" -eq 3 ] && grep -q "versions 1 and 2" "$T/s4.err" && pass "version 3 is refused (exit 3, 'versions 1 and 2')" || { fail "version 3: exit $r"; head -2 "$T/s4.err"; }
+    [ "$r" -eq 3 ] && grep -q "versions 1 to 3" "$T/s4.err" && pass "version 4 is refused (exit 3, 'versions 1 to 3')" || { fail "version 4: exit $r"; head -2 "$T/s4.err"; }
 fi
 
 # ================================================================ PostgreSQL
@@ -135,10 +137,12 @@ else
         as_pg "$PGLOADER" --dump "$T/p2.kdb" --driver postgresql --conninfo-file "$T/ci" 2> "$T/p2.err"; r=$?
         [ "$r" -eq 0 ] && pass "the loader reads the migrated database" || { fail "dump after the migration: exit $r"; head -3 "$T/p2.err"; }
         cmp -s "$T/p1.kdb" "$T/p2.kdb" && pass "the dump of the migrated database equals the dump of the version 1 database (byte for byte)" || fail "the dump changed with the migration"
-        pf db/karidns_ext.pgsql.sql > /dev/null 2>&1 && [ "$(pq "SELECT version FROM karidns_schema_version")" = "2" ] && pass "the version 2 file applies to a migrated database (idempotent)" || fail "version 2 file on a migrated database"
-        pq "UPDATE karidns_schema_version SET version = 3" > /dev/null
+        pf db/karidns_ext.pgsql.sql > /dev/null 2>&1 && [ "$(pq "SELECT version FROM karidns_schema_version")" = "3" ] && pass "the version 3 file applies to a migrated database: version 3 (idempotent)" || fail "version 3 file on a migrated database"
+        as_pg "$PGLOADER" --dump "$T/p3b.kdb" --driver postgresql --conninfo-file "$T/ci" 2> "$T/p3b.err"; r=$?
+        [ "$r" -eq 0 ] && pass "the loader reads the version 3 database (exit 0)" || { fail "version 3 database: exit $r"; head -2 "$T/p3b.err"; }
+        pq "UPDATE karidns_schema_version SET version = 4" > /dev/null
         as_pg "$PGLOADER" --dump "$T/p4.kdb" --driver postgresql --conninfo-file "$T/ci" 2> "$T/p4.err"; r=$?
-        [ "$r" -eq 3 ] && grep -q "versions 1 and 2" "$T/p4.err" && pass "version 3 is refused (exit 3, 'versions 1 and 2')" || { fail "version 3: exit $r"; head -2 "$T/p4.err"; }
+        [ "$r" -eq 3 ] && grep -q "versions 1 to 3" "$T/p4.err" && pass "version 4 is refused (exit 3, 'versions 1 to 3')" || { fail "version 4: exit $r"; head -2 "$T/p4.err"; }
     fi
 fi
 

@@ -98,6 +98,7 @@ struct db_conn {
     bool writable;                  /* M2: opened with open_write() (the session is not default_transaction_read_only) */
     bool in_wtxn;                   /* M2: w_begin() is open (in_snapshot is set too, so the reads of the zone work inside it) */
     uint32_t w_prepared;            /* M2: bit i = the statement W_STMT[i] is prepared on this session */
+    bool audit_summary;             /* open_write(): every write transaction starts with SET LOCAL karidns.audit = 'summary' (w_set_audit) */
 };
 static bool pg_has_soa_cover_index(db_conn_t *c);
 
@@ -465,13 +466,14 @@ static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
     bool has_version = HAVE(T_VERSION);
 #undef HAVE
     if (has_version) {
-        /* version 1 and 2 are read; a newer one was written for a later loader */
+        /* versions 1 to 3 are read (version 3 adds the schema karidns_auth and the audit log, which the loader never uses); a newer one was
+         * written for a later loader */
         ret = exec_rows(c, "SELECT max(version) FROM karidns_schema_version", 0, NULL, &r, "karidns_schema_version");
         if (ret != 0) return ret;
         long long v = PQgetisnull(r, 0, 0) ? 0 : strtoll(PQgetvalue(r, 0, 0), NULL, 10);
         PQclear(r);
-        if (v > 2) {
-            set_err(c, "schema: karidns_schema_version is %lld; this loader reads versions 1 and 2", v);
+        if (v > 3) {
+            set_err(c, "schema: karidns_schema_version is %lld; this loader reads versions 1 to 3", v);
             return -1;
         }
     }
@@ -598,7 +600,7 @@ static int pg_schema_findings(db_conn_t *c, const db_check_opts_t *o, db_finding
         long long v = none ? 0 : strtoll(PQgetvalue(r, 0, 0), NULL, 10);
         PQclear(r);
         if (none) fnd(cb, ud, 'W', "karidns_schema_version has no row");
-        else if (v > 2) fnd(cb, ud, 'E', "karidns_schema_version is %lld; this loader reads versions 1 and 2", v);
+        else if (v > 3) fnd(cb, ud, 'E', "karidns_schema_version is %lld; this loader reads versions 1 to 3", v);
         else fnd(cb, ud, 'I', "karidns_* schema version %lld", v);
     }
     /* B11: the multi-server tables (db/karidns_ext.pgsql.sql, release plan 4.8) */
@@ -1528,11 +1530,25 @@ static int pg_w_begin(db_conn_t *c, const char *zone) {
      * which waits lock_timeout (open_write) and ends with the transaction */
     const char *pv[1] = { zone };
     rc = wq(c, W_LOCK, pv, NULL, PGRES_TUPLES_OK, "w_begin (zone lock)");
+    /* karidns-zone --audit summary: the audit triggers (db/karidns_ext.pgsql.sql, karidns_auth.enable_audit) log one row per statement and
+     * table for this transaction; SET LOCAL ends with it */
+    if (rc == 0 && c->audit_summary) rc = exec_cmd(c, "SET LOCAL karidns.audit = 'summary'", "w_begin (audit)");
     if (rc != 0) {
         PQclear(PQexec(c->pg, "ROLLBACK"));            /* a failed w_begin leaves no transaction open */
         return rc;
     }
     c->in_wtxn = c->in_snapshot = true;
+    return 0;
+}
+
+/* karidns-zone --audit (dns_db_driver.h): a flag the next w_begin() acts on */
+static int pg_w_set_audit(db_conn_t *c, bool summary, const char *actor) {
+    (void)actor;                                    /* the database role is the PostgreSQL session's own */
+    if (!c->writable || c->in_wtxn) {
+        set_err(c, "w_set_audit: needs a writable connection outside a transaction");
+        return -1;
+    }
+    c->audit_summary = summary;
     return 0;
 }
 
@@ -1726,6 +1742,7 @@ const db_driver_t db_driver_postgresql = {
     pg_open_write, pg_w_begin, pg_w_commit, pg_w_rollback, pg_w_create_zone, pg_w_delete_records, pg_w_insert_record, pg_w_insert_tags,
     pg_w_insert_tinydns, pg_w_delete_tagdefs, pg_w_insert_tagdef, pg_w_delete_meta, pg_w_insert_meta, pg_w_set_view, pg_w_request_reload,
     pg_w_zone_has_keys,
+    pg_w_set_audit,       /* schema version 3 */
 };
 
 #endif /* KARIDNS_DB_POSTGRESQL */
