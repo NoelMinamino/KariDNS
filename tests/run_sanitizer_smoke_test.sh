@@ -155,6 +155,28 @@ done
 
 echo ""
 echo "=========================================="
+echo "Step 2b: karidns-zone-asan (import / export of a SQLite3 database)"
+echo "=========================================="
+# the whole CLI test of karidns-zone on the ASan/UBSan build; a sanitizer error ends the tool with status 99, which no case expects
+if command -v sqlite3 >/dev/null 2>&1; then
+    [ -x karidns-zone-asan ] || make karidns-zone-asan DB_DRIVERS="sqlite3 postgresql" >/dev/null 2>&1 || make karidns-zone-asan DB_DRIVERS="sqlite3" >/dev/null 2>&1
+    if [ -x karidns-zone-asan ]; then
+        ZONE=./karidns-zone-asan sh tests/run_karidns_zone_test.sh > karidns_zone_asan.log 2>&1
+        if [ $? -eq 0 ]; then
+            log_ok "karidns-zone-asan (tests/run_karidns_zone_test.sh)"
+        else
+            log_fail "karidns-zone-asan (see karidns_zone_asan.log)"
+            tail -5 karidns_zone_asan.log
+        fi
+    else
+        echo "  -> SKIP: karidns-zone-asan could not be built (no SQLite3 library?)"
+    fi
+else
+    echo "  -> SKIP: the sqlite3 command line tool is not installed"
+fi
+
+echo ""
+echo "=========================================="
 echo "Step 3: karidns-asan / karidns-tsan quick start-query-stop"
 echo "=========================================="
 for variant in asan tsan; do
@@ -249,7 +271,7 @@ pids=""
 # new inputs go to a scratch directory (the first one given to libFuzzer); the corpus in git is only read
 FUZZ_NEW_DIR=$(mktemp -d "${TMPDIR:-/tmp}/kari_san_fuzz.XXXXXX")
 for target in fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_zone_image fuzz_conf_parser fuzz_tsig_sign fuzz_tsig_verify \
-              fuzz_query_engine fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_db_logline fuzz_nsec3_rebuild fuzz_alias_response \
+              fuzz_query_engine fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_db_logline fuzz_nsec3_rebuild fuzz_alias_response \
               fuzz_dag_response fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file; do
     bin="tests/fuzz/$target"
     corpus="tests/fuzz/corpus_$target"

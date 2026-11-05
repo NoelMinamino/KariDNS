@@ -33,6 +33,7 @@
 #include "../dns_config_parser.h"
 #include "../dns_utils.h"
 #include "db/zone2sql.h"
+#include "db/zrows_feed.h"
 #include "db/xfr_mocks.h"
 #include "db/pdns_roundtrip.h"
 #include "db/pdns_confcheck.h"
@@ -148,7 +149,7 @@ static void test_zone_files(void) {
         char path[1024], apex[DNS_NAME_TEXT_SIZE], err[500];
         snprintf(path, sizeof(path), "%s/%s", g_zones_dir, names[k]);
         zone_arena_t fa;
-        if (!z2s_load_zone_file(path, NULL, &fa, apex, sizeof(apex), err, sizeof(err))) {
+        if (!zrows_load_zone_file(path, NULL, &fa, apex, sizeof(apex), err, sizeof(err))) {
             printf("  [note] %s: the zone parser rejects it (%s)\n", names[k], err);
             skipped++;
             free(names[k]);
@@ -164,8 +165,8 @@ static void test_zone_files(void) {
             free(names[k]);
             continue;
         }
-        z2s_rows_t rows;
-        if (!z2s_rows_from_arena(&fa, apex, &rows, err, sizeof(err))) {
+        zrows_t rows;
+        if (!zrows_from_arena(&fa, apex, &rows, err, sizeof(err))) {
             printf("  [note] %s: zone2sql cannot represent it (%s)\n", names[k], err);
             zone_arena_destroy(&fa);
             skipped++;
@@ -184,7 +185,7 @@ static void test_zone_files(void) {
             if (pdns_zone_add_record(z, &rows.rows[i]) != 0) rc = -1;
         for (size_t i = 0; rc == 0 && i < nmeta; i++)
             if (pdns_zone_add_meta(z, &meta[i]) != 0) rc = -1;
-        if (rc == 0 && z2s_feed_ext(&rows, z) != 0) rc = -1;           // B8: tags, tinydns attributes, tag definitions
+        if (rc == 0 && zrows_feed_ext(&rows, z) != 0) rc = -1;           // B8: tags, tinydns attributes, tag definitions
         if (rc == 0) rc = pdns_zone_finish(z);
         CHECK_MSG(rc == 0, "%s: reader: %s", names[k], z ? z->error : "(null)");
         if (rc == 0) {
@@ -225,7 +226,7 @@ static void test_zone_files(void) {
             }
         }
         pdns_zone_free(z);
-        z2s_rows_free(&rows);
+        zrows_free(&rows);
         zone_arena_destroy(&fa);
         free(names[k]);
     }
@@ -1545,12 +1546,12 @@ static void test_zone2sql(void) {
     snprintf(path, sizeof(path), "%s/example.com.zone", g_zones_dir);
     zone_arena_t a;
     char apex[DNS_NAME_TEXT_SIZE], err[400];
-    if (!z2s_load_zone_file(path, NULL, &a, apex, sizeof(apex), err, sizeof(err))) {
+    if (!zrows_load_zone_file(path, NULL, &a, apex, sizeof(apex), err, sizeof(err))) {
         printf("  [SKIP] %s\n", err);
         return;
     }
-    z2s_rows_t rows;
-    CHECK(z2s_rows_from_arena(&a, apex, &rows, err, sizeof(err)));
+    zrows_t rows;
+    CHECK(zrows_from_arena(&a, apex, &rows, err, sizeof(err)));
     CHECK_STR(rows.zone, "example.com");
     bool saw_mx = false, saw_srv = false, saw_txt = false;
     for (size_t i = 0; i < rows.n; i++) {
@@ -1593,7 +1594,7 @@ static void test_zone2sql(void) {
         CHECK(ins == rows.n);
         free(buf);
     }
-    z2s_rows_free(&rows);
+    zrows_free(&rows);
     zone_arena_destroy(&a);
 }
 

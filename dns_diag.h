@@ -66,8 +66,10 @@ bool dns_diag_json_enabled(void);
 /* Suspend (true) or resume (false) JSON mode: while it is suspended the messages are printed as in text mode.  Returns the previous state.
  * karicheck uses it where the configuration parser runs with its stderr redirected to learn the reason of an error. */
 bool dns_diag_suspend_json(bool suspend);
-/* Switch to JSON mode (once, at the start of the run).  command: "conf", "zones", "zone", "db" or NULL (usage error before a command). */
+/* Switch to JSON mode (once, at the start of the run).  command: "conf", "zones", "zone", "db" (karicheck), "import", "export" (karidns-zone) or NULL (usage error before a command). */
 void dns_diag_json_start(const char *command, const char *version);
+/* The first key of the document is the name of the tool (default "karicheck"): karidns-zone calls this after dns_diag_json_start().  The schema is the same. */
+void dns_diag_json_tool(const char *tool);
 /* What the following messages are about; NULL clears.  JSON mode only. */
 void dns_diag_set_file(const char *file);                   /* the file a message is about when it names none */
 void dns_diag_set_zone(const char *zone, const char *view);

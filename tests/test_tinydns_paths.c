@@ -64,7 +64,7 @@ static const struct { const char *line; size_t n; uint16_t must_have; } VALID[] 
     { "'txt.example.com:hello world:300", 1, 16 },
     { "Calias.example.com:www.example.com:300", 1, 5 },
     { "Zexample.com:ns1.example.com:hostmaster.example.com:1:2:3:4:5:300", 1, 6 },
-    { ":raw.example.com:99:\\001\\002\\003:300", 1, 99 },
+    { ":raw.example.com:99:\\002\\002\\003:300", 1, 99 },               /* SPF: one <character-string> of 2 octets */
     { "3www.example.com:20010db8000000000000000000000001:300", 1, 28 },
     { "6www.example.com:20010db8000000000000000000000001:300", 1, 28 },
     { "Sexample.com:5.srv.example.com:5060:10:20:300", 1, 0 },
@@ -216,13 +216,34 @@ static void test_generic_and_unknown(void) {
         assert(e.error_message && strstr(e.error_message, "Prohibited or invalid RR type"));
         zone_arena_destroy(&a);
     }
-    /* ordinary types are still accepted */
-    static const int allowed[] = { 1, 16, 28, 33, 99, 257, 65280 };
+    /* ordinary types are still accepted, with RDATA valid for the type */
+    static const struct { int type; const char *rd; } allowed[] = {
+        { 1, "\\300\\000\\002\\001" },                                  /* A 192.0.2.1 */
+        { 16, "\\003abc" },                                             /* TXT "abc" */
+        { 28, "\\040\\001\\015\\270\\000\\000\\000\\000\\000\\000\\000\\000\\000\\000\\000\\001" },  /* AAAA 2001:db8::1 */
+        { 33, "\\000\\001\\000\\002\\023\\304\\000" },                  /* SRV 1 2 5060 . */
+        { 99, "\\001x" },                                               /* SPF "x" */
+        { 257, "\\000\\005issueca.example" },                           /* CAA 0 issue "ca.example" */
+        { 65280, "\\001" },                                             /* unknown type: any octets */
+    };
     for (size_t i = 0; i < N(allowed); i++) {
-        char line[128];
-        snprintf(line, sizeof(line), ":raw.example.com:%d:\\001:300", allowed[i]);
+        char line[160];
+        snprintf(line, sizeof(line), ":raw.example.com:%d:%s:300", allowed[i].type, allowed[i].rd);
         zone_arena_t a; parse_error_t e; size_t cnt;
-        assert(run_line(line, CTX_FULL, &e, &a, &cnt) >= 0 && cnt == 1);
+        if (run_line(line, CTX_FULL, &e, &a, &cnt) < 0 || cnt != 1) { fprintf(stderr, "generic type %d refused: %s\n", allowed[i].type, e.error_message ? e.error_message : "?"); assert(0); }
+        zone_arena_destroy(&a);
+    }
+    /* D15-2 as in master files: RDATA that is not valid for a known type is refused (A of 1 octet, a TXT string running past the end,
+     * NXT whose name runs past the end: the case the fuzz_zone_text run found, served as it was before) */
+    static const char *const malformed[] = {
+        ":raw.example.com:1:\\001:300", ":raw.example.com:16:\\005ab:300", ":raw.example.com:30:.:300", ":raw.example.com:28::300",
+    };
+    for (size_t i = 0; i < N(malformed); i++) {
+        zone_arena_t a; parse_error_t e; size_t cnt;
+        if (run_line(malformed[i], CTX_FULL, &e, &a, &cnt) >= 0) { fprintf(stderr, "malformed generic RDATA accepted: %s\n", malformed[i]); assert(0); }
+        assert(e.error_message != NULL);
+        zone_arena_destroy(&a);
+        assert(run_line(malformed[i], CTX_NO_ERR_OUT, &e, &a, &cnt) < 0);
         zone_arena_destroy(&a);
     }
     printf("  -> generic/unknown rejections passed.\n");

@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-# json_check.pl - read the JSON document of `karicheck --json` strictly, check its shape, and answer questions about it for the shell tests.
+# json_check.pl - read the JSON document of `karicheck --json` or `karidns-zone --json` (first key "karidns-zone") strictly, check its shape, and answer questions about it for the shell tests.
 #
 #   json_check.pl FILE valid         exit 0 when FILE is one valid JSON document (UTF-8, nothing after it) of the karicheck schema
 #                                    (docs/karicheck.md, JSON OUTPUT); otherwise the reason on stderr and exit 1
@@ -46,12 +46,14 @@ sub known_codes {
 }
 
 sub check_schema {
-    my @top = qw(karicheck version command result counts truncated messages zones);
+    my $tool = exists $doc->{"karidns-zone"} ? "karidns-zone" : "karicheck";    # the first key names the tool
+    my @top = ($tool, qw(version command result counts truncated messages zones));
     for my $k (@top) { fail("missing key $k") unless exists $doc->{$k}; }
     fail("unexpected keys: " . join(',', grep { my $x = $_; !grep { $_ eq $x } @top } sort keys %$doc)) if keys %$doc != @top;
-    fail("karicheck is not 1") unless is_int($doc->{karicheck}) && $doc->{karicheck} == 1;
+    fail("$tool is not 1") unless is_int($doc->{$tool}) && $doc->{$tool} == 1;
     fail("version is not a string") unless is_str($doc->{version}) && length $doc->{version};
-    fail("command is not conf/zones/zone/db/null") unless !defined $doc->{command} || $doc->{command} =~ /^(conf|zones|zone|db)$/;
+    my $cmds = $tool eq "karidns-zone" ? "import|export" : "conf|zones|zone|db";
+    fail("command is not $cmds or null") unless !defined $doc->{command} || $doc->{command} =~ /^($cmds)$/;
     fail("result is not ok/fail/usage") unless is_str($doc->{result}) && $doc->{result} =~ /^(ok|fail|usage)$/;
     fail("truncated is not a boolean") unless ref $doc->{truncated} eq 'JSON::PP::Boolean';
     my $c = $doc->{counts};

@@ -120,6 +120,14 @@ jobs:
               if ldd /usr/local/libexec/karidns-dbloader | grep -E 'lib(crypto|ssl)[.]so' | grep -q '/usr/local/'; then
                 echo "::error::$name: karidns-dbloader links the ports OpenSSL"; exit 1
               fi
+              test -x /usr/local/bin/karidns-zone
+              gotz=$(/usr/local/bin/karidns-zone --version | sed -n 's/.*(drivers: \(.*\))$/\1/p' | tr -d ',')
+              if [ "$gotz" != "$want" ]; then
+                echo "::error::$name: karidns-zone has the drivers '$gotz', expected '$want'"; exit 1
+              fi
+              if ldd /usr/local/bin/karidns-zone | grep -E 'lib(crypto|ssl)[.]so' | grep -q '/usr/local/'; then
+                echo "::error::$name: karidns-zone links the ports OpenSSL"; exit 1
+              fi
               pkg delete -y "$name"
             done
             echo "::endgroup::"

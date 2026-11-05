@@ -804,6 +804,17 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                     }
                     return false;
                 }
+                /* D15-2, as for "\# <len> <hex>" in a master file: the RDATA of a type the server knows must be valid for that type
+                 * (dns_generic_rdata_check(); an unknown type is any octets).  Before this, a malformed known-type RDATA was served as it was. */
+                const char *gwhy = dns_generic_rdata_check((uint16_t)type_num, raw_bytes ? raw_bytes : (const uint8_t *)"", raw_len);
+                if (gwhy) {
+                    if (ctx && ctx->err_out) {
+                        ctx->err_out->error_message = gwhy;
+                        ctx->err_out->error_offset = (size_t)(line_start - buf);
+                        ctx->err_out->token_length = flen[2];
+                    }
+                    return false;
+                }
 
                 char type_buf[16];
                 snprintf(type_buf, sizeof(type_buf), "TYPE%lu", type_num);

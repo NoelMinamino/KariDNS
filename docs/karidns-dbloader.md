@@ -180,7 +180,7 @@ The loader reads the tables of the **PowerDNS 5.1 generic SQLite3 / PostgreSQL b
 | `db/karidns_ext.sqlite3.sql` | SQLite3: schema version 2. `karidns_changes` (the change log: which domain changed, written by triggers on `domains`, `records`, `domainmetadata`, `cryptokeys` and the tables below), a trigger that keeps the newest 1,000,000 log rows, `karidns_domain_views`, `karidns_profiles`, `karidns_record_tags`, `karidns_record_tinydns`, `karidns_zone_tagdefs`, `karidns_schema_version`. Apply it once, as the owner of the database, after the PowerDNS schema. It can be applied again. |
 | `db/karidns_ext.pgsql.sql` | PostgreSQL: the same tables with statement-level triggers (one log row per distinct domain per statement), `NOTIFY karidns_changes` for auto reload, and the multi-server tables `karidns_reload_requests` and `karidns_server_status`. PostgreSQL 13 or newer. Apply it in the schema that holds the PowerDNS tables. |
 | `db/karidns_ext_v1_to_v2.sqlite3.sql`, `db/karidns_ext_v1_to_v2.pgsql.sql` | Convert a database from schema version 1 (the extension files of the early betas) to version 2. The loader reads both versions and serves a version 1 database without a change log. |
-| `db/karidns_loader_role.pgsql.sql` | PostgreSQL: the privileges of the loader's role (`psql -v role=... -v schema=...`). `SELECT` on the PowerDNS tables and the `karidns_*` tables, only the column privilege `SELECT (domain_id, active, published)` on `cryptokeys` (never the private keys), `default_transaction_read_only = on`, and `INSERT, UPDATE` on `karidns_server_status` when the table exists. It does not create the role (the authentication is yours) and can be run again. |
+$1| `db/karidns_writer_role.pgsql.sql` | PostgreSQL: the privileges of the role that [`karidns-zone`](karidns-zone.md) imports with (`psql -v role=... -v schema=...`). `SELECT, INSERT, UPDATE, DELETE` on `domains`, `records` and `domainmetadata`, the `karidns_*` zone tables, what the change-log triggers need, and only the column privilege `SELECT (domain_id)` on `cryptokeys` (never `content`, the private keys). Not for the loader: give the loader `karidns_loader_role.pgsql.sql`. |
 
 A bulk import writes one change-log row per changed row (SQLite3) or per statement (PostgreSQL); a big import makes the next reload compare every zone once. The files carry their own documentation in their first lines.
 
@@ -210,7 +210,7 @@ The extension files create `karidns_zone_tagdefs_domain_idx` on `karidns_zone_ta
 | `karidns-postgresql` | PostgreSQL driver | `databases/postgresqlNN-client` (libpq; NN is the version the build host linked) |
 | `karidns-db` | both drivers | both |
 
-The database packages install `/usr/local/libexec/karidns-dbloader` (root:wheel, mode 0555), this manual, and the SQL files of their drivers in `/usr/local/share/karidns/db/`. In a package without the loader `karicheck db` reports `DB support is not installed`. See [Distribution Guide](distribution.md).
+The database packages install `/usr/local/libexec/karidns-dbloader` (root:wheel, mode 0555), [`karidns-zone`](karidns-zone.md) (`/usr/local/bin/karidns-zone`, with the same drivers, and its manual), this manual, and the SQL files of their drivers in `/usr/local/share/karidns/db/`. In a package without the loader `karicheck db` reports `DB support is not installed`. See [Distribution Guide](distribution.md).
 
 ## MEASUREMENTS
 
@@ -402,8 +402,9 @@ R	0	0	1
 
 ## FILES
 
-`/usr/local/libexec/karidns-dbloader`
-: The loader (database packages).
+$1
+`/usr/local/bin/karidns-zone`
+: The importer and exporter of zones (database packages; [`karidns-zone(1)`](karidns-zone.md)).
 
 `/usr/local/share/karidns/db/`
 : The SQL files above (database packages; `db/` in a source tree).
@@ -421,7 +422,7 @@ the file of `loader-state-file` (default: none)
 
 - [`karidns(8)`](karidns.md) — the `database` block, database zones, settings, auto reload, several servers
 - [`karictl(8)`](karictl.md) — `reload`, `dbstatus`
-- [`karicheck(1)`](karicheck.md) — `karicheck db`
+$1- [`karidns-zone(1)`](karidns-zone.md) — import and export of zones (writes the tables this loader reads)
 - [Distribution Guide](distribution.md) — the four FreeBSD packages
 
 ---

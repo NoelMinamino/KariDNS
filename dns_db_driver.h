@@ -23,7 +23,8 @@
  *     (db_errmsg() says why, one line, no row data beyond table and id); DB_ERR_RETRY = a transient condition (SQLite
  *     SQLITE_BUSY after the busy timeout, PostgreSQL connection loss): the loader backs off and retries the batch;
  *     DB_ERR_UNAVAILABLE = the source does not offer the feature (changes_since without karidns_changes).
- *   - A connection is used by one thread at a time.  The connection is read only (the loader never writes).
+ *   - A connection is used by one thread at a time.  The connection is read only (the loader never writes); the write functions at the
+ *     end of db_driver_t belong to open_write() connections (the ZoneImporter), which the loader never opens.
  *
  * Call order: open, check_schema, begin_snapshot, (list_zones | scan_* | zones_with_keys | changes_since)*,
  * end_snapshot, close.  Everything read between begin_snapshot() and end_snapshot() is one consistent state (a WAL read
@@ -228,6 +229,58 @@ typedef struct db_driver {
     /* D1a step 6: the apex SOA and NS rows (db_apex_row_t) of one zone (domain_id) or of all, ORDER BY domain_id, id; as scan_records in a snapshot.
      * NULL = the driver cannot tell: no apex goes with the summaries. */
     int (*scan_apex)(db_conn_t *c, const int64_t *domain_id, db_apex_cb cb, void *ud);
+
+    /* ----------------------------------------------------------------------------------------------------------------------------
+     * 0.6.0 ZoneImporter (M2): write access.  The loader never uses any of this: its connections come from open(), which is read only
+     * (PRAGMA query_only / default_transaction_read_only), and a write function on such a connection fails.  A write-capable
+     * connection is a separate, explicit mode: open_write().  NULL = the driver cannot write.
+     *
+     * Call order: open_write, check_schema, (w_begin, <reads and writes>, w_commit | w_rollback)*, close.  Between w_begin() and the
+     * end of the transaction the read functions of the zone (find_zone, scan_records, scan_metadata, scan_ext, scan_domain_views,
+     * scan_apex) work like inside a snapshot and see the connection's own writes.  Everything is one transaction: a failed call leaves
+     * the transaction open (PostgreSQL: aborted) and the caller calls w_rollback().  Every value is bound as a parameter of a
+     * prepared / parameterised statement; no value is ever part of the SQL text.  The rows of karidns_changes are written by the
+     * triggers of db/karidns_ext.*.sql (a running server picks the change up); nothing here writes that table.  Return values as above
+     * (0, -1, DB_ERR_RETRY, DB_ERR_UNAVAILABLE for a table the database does not have).
+     * ---------------------------------------------------------------------------------------------------------------------------- */
+    /* A write-capable connection (same db_source_t as open()).  PostgreSQL: the session is not default_transaction_read_only and
+     * lock_timeout is busy_timeout_ms (0 = 10 s); SQLite3: no query_only, busy_timeout_ms as for open(). */
+    int (*open_write)(db_conn_t **c, const db_source_t *src, char *err, size_t errlen);
+    /* BEGIN a read-write transaction that holds the zone `zone` (the name as stored in domains.name: lowercase, no final dot) against a
+     * concurrent importer: PostgreSQL takes a transaction-level advisory lock on the name (so two importers of a zone that does not
+     * exist yet do not both create it) and waits at most lock_timeout, then DB_ERR_RETRY; SQLite3 BEGIN IMMEDIATE (the whole database
+     * is the lock) and waits busy_timeout_ms, then DB_ERR_RETRY.  A failed w_begin() leaves no transaction open. */
+    int (*w_begin)(db_conn_t *c, const char *zone);
+    int (*w_commit)(db_conn_t *c);
+    int (*w_rollback)(db_conn_t *c);                 /* also ends an aborted transaction; harmless outside one */
+    /* A new `domains` row.  type NULL = NATIVE (what pdnsutil load-zone creates; the type of an existing zone is never changed).
+     * *id = domains.id. */
+    int (*w_create_zone)(db_conn_t *c, const char *name, const char *type, int64_t *id);
+    /* Delete records of the zone, with their karidns_record_tags / karidns_record_tinydns rows (ext rows first: their delete triggers
+     * find the zone through the record).  ids NULL: every record of the zone (n ignored); else the n records.id values, which must
+     * belong to the zone. */
+    int (*w_delete_records)(db_conn_t *c, int64_t domain_id, const int64_t *ids, size_t n);
+    /* One row of records (row->id is ignored, ttl / prio / ordername / type may be NULL as in a PowerDNS table; disabled is written as
+     * row->disabled); *id = records.id, for the extension rows below. */
+    int (*w_insert_record)(db_conn_t *c, int64_t domain_id, const db_record_row_t *row, bool auth, int64_t *id);
+    /* karidns_record_tags / karidns_record_tinydns of a record (loc / ecs NULL = none; tinydns loc NULL = none).  DB_ERR_UNAVAILABLE
+     * when the database has no extension tables (check_schema() has_ext false). */
+    int (*w_insert_tags)(db_conn_t *c, int64_t record_id, const char *loc, const char *ecs);
+    int (*w_insert_tinydns)(db_conn_t *c, int64_t record_id, int64_t ttd, const char *loc, bool countdown);
+    /* karidns_zone_tagdefs of the zone: delete the rows of `kind` ('location' 'ecs' 'tinydns'; NULL = every kind) named `tag` (ASCII
+     * case-insensitive; NULL = every tag), insert one row at the end (definitions are read in insertion order). */
+    int (*w_delete_tagdefs)(db_conn_t *c, int64_t domain_id, const char *kind, const char *tag);
+    int (*w_insert_tagdef)(db_conn_t *c, int64_t domain_id, const char *kind, const char *tag, const char *cidr);
+    /* domainmetadata of the zone: delete every row of this kind (ASCII case-insensitive) / insert one.  No other kind is touched. */
+    int (*w_delete_meta)(db_conn_t *c, int64_t domain_id, const char *kind);
+    int (*w_insert_meta)(db_conn_t *c, int64_t domain_id, const char *kind, const char *content);
+    /* karidns_domain_views: the zone is in this view (a row that exists stays).  DB_ERR_UNAVAILABLE without the table. */
+    int (*w_set_view)(db_conn_t *c, int64_t domain_id, const char *view_name);
+    /* A row of karidns_reload_requests (PostgreSQL; zone NULL = every zone), written in the transaction, so the request and the data
+     * become visible together.  DB_ERR_UNAVAILABLE without the table (and always on SQLite3). */
+    int (*w_request_reload)(db_conn_t *c, const char *zone, bool force);
+    /* Does the zone have a row in cryptokeys?  (Existence only: the importer never reads key material.) */
+    int (*w_zone_has_keys)(db_conn_t *c, int64_t domain_id, bool *has);
 } db_driver_t;
 
 #define DB_IN_MAX 128u        /* the most zones of one scan_*_in call */

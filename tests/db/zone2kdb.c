@@ -28,7 +28,7 @@
 #include <stdbool.h>
 #include <syslog.h>
 
-#include "zone2sql.h"
+#include "zrows_feed.h"
 #include "../../dns_pdns_reader.h"
 #include "../../dns_db_stream.h"
 
@@ -107,7 +107,7 @@ static int cmd_ref(const char *out_path, const char *list_path, uint32_t default
     for (int i = 0; i < nfiles; i++) {
         char apex[DNS_NAME_TEXT_SIZE], err[500];
         zone_arena_t fa;
-        if (!z2s_load_zone_file(files[i], NULL, &fa, apex, sizeof(apex), err, sizeof(err))) {
+        if (!zrows_load_zone_file(files[i], NULL, &fa, apex, sizeof(apex), err, sizeof(err))) {
             printf("SKIP %s: the zone parser rejects it (%s)\n", files[i], err);
             continue;
         }
@@ -119,8 +119,8 @@ static int cmd_ref(const char *out_path, const char *list_path, uint32_t default
             zone_arena_destroy(&fa);
             continue;
         }
-        z2s_rows_t rows;
-        if (!z2s_rows_from_arena(&fa, apex, &rows, err, sizeof(err))) {
+        zrows_t rows;
+        if (!zrows_from_arena(&fa, apex, &rows, err, sizeof(err))) {
             printf("SKIP %s: zone2sql cannot represent it (%s)\n", files[i], err);
             zone_arena_destroy(&fa);
             continue;
@@ -130,7 +130,7 @@ static int cmd_ref(const char *out_path, const char *list_path, uint32_t default
             if (strcasecmp(seen[k], rows.zone) == 0) dup = true;
         if (dup) {
             printf("SKIP %s: zone %s was already taken from another file\n", files[i], rows.zone);
-            z2s_rows_free(&rows);
+            zrows_free(&rows);
             zone_arena_destroy(&fa);
             continue;
         }
@@ -145,7 +145,7 @@ static int cmd_ref(const char *out_path, const char *list_path, uint32_t default
             if (pdns_zone_add_record(z, &rows.rows[k]) != 0) rc = -1;
         for (size_t k = 0; rc == 0 && k < nmeta; k++)
             if (pdns_zone_add_meta(z, &meta[k]) != 0) rc = -1;
-        if (rc == 0 && z2s_feed_ext(&rows, z) != 0) rc = -1;        // B8: tags, tinydns attributes, tag definitions
+        if (rc == 0 && zrows_feed_ext(&rows, z) != 0) rc = -1;        // B8: tags, tinydns attributes, tag definitions
         if (rc == 0) rc = pdns_zone_finish(z);
         buf_t zb = {0};
         char why[400] = "";
@@ -170,7 +170,7 @@ static int cmd_ref(const char *out_path, const char *list_path, uint32_t default
             printf("  [ OK ] %s: zone %s\n", files[i], rows.zone);
         }
         pdns_zone_free(z);
-        z2s_rows_free(&rows);
+        zrows_free(&rows);
         zone_arena_destroy(&fa);
     }
     fclose(list);

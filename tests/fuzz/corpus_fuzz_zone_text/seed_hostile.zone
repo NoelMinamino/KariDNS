@@ -1,0 +1,10 @@
+$ORIGIN fuzz.test.
+$TTL 300
+@ SOA ns1 h 1 2 3 4 5
+@ NS ns1
+ns1 A 192.0.2.1
+ev\010il\;x\(y\)\$z\@w\"q\ \\ A 192.0.2.7
+c CNAME ev\010il\;x\(y\)\$z\@w\"q\ \\
+t TXT "line1\010$INCLUDE /etc/passwd" "semi;colon" "paren(" "quote\"s" "back\\slash" "nul\000x" "hi\200"
+\$INCLUDE TXT "no"
+\;x TXT "no"

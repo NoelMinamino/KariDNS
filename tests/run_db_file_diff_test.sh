@@ -21,6 +21,11 @@
 # owners in lower case; the synthetic zone mixed.test with WWW and Mail.Sub is identical byte for byte).  A zone that one of the servers does not load (a zone the server's loader rejects, tags that need B8) is
 # skipped and listed with the reason; the test fails if fewer than 8 zones could be compared.
 #
+# DB_IMPORTER=karidns-zone (0.6.0, tests/run_karidns_zone_test.sh is the unit-level sibling): the database is filled by `karidns-zone import` (the product's
+# importer: the zone file goes through the checks, the rows and the read-back of the loader's reader) instead of the SQL zone2sql prints; the zone2sql
+# run still decides which files are candidates.  A file that the importer refuses (the reader refuses it: the loader would too) is listed as skipped.
+# Default DB_IMPORTER=zone2sql.
+#
 # Needs root (the loader must be root-owned and runs as nobody).  SKIP otherwise, and when a binary, the sqlite3 CLI or
 # a C compiler is missing.
 set -u
@@ -30,6 +35,8 @@ cd "$ROOT" || exit 1
 
 if [ "$(id -u)" != "0" ]; then echo "SKIP: needs root (the loader runs as another user)"; exit 0; fi
 KARIDNS=${KARIDNS:-./karidns}
+IMPORTER=${DB_IMPORTER:-zone2sql}
+case $IMPORTER in zone2sql) ;; karidns-zone) [ -x ./karidns-zone ] || { echo "SKIP: ./karidns-zone is not built"; exit 0; } ;; *) echo "DB_IMPORTER must be zone2sql or karidns-zone" >&2; exit 2 ;; esac
 for b in "$KARIDNS" ./karidns-dbloader ./tests/db/zone2sql; do
     [ -x "$b" ] || { echo "SKIP: $b is not built"; exit 0; }
 done
@@ -195,7 +202,12 @@ while [ $k -le $R ]; do
     } > "$D/b.conf"
     printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n};\n' "$PC" > "$D/c.conf"
     while IFS="$TAB" read -r apex f sqlf; do
-        sqlite3 "$D/z.db" < "$sqlf" > /dev/null 2>&1
+        if [ "$IMPORTER" = karidns-zone ]; then      # the zone is written by the product's importer, not by the SQL zone2sql prints
+            case $f in /*) zf0=$f ;; *) zf0="$ROOT/$f" ;; esac
+            ./karidns-zone import --no-config --sqlite3 "$D/z.db" "$apex" "$zf0" > "$D/imp.out" 2>&1 || echo "$f: karidns-zone import failed ($(grep -m1 ERROR "$D/imp.out" | cut -c1-90))" >> "$T/skipped.txt"
+        else
+            sqlite3 "$D/z.db" < "$sqlf" > /dev/null 2>&1
+        fi
         sqlite3 "$D/z.db" "INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'ALLOW-AXFR-FROM', '127.0.0.1' FROM domains WHERE name = '$apex'"
         case $f in /*) zf=$f ;; *) zf="$ROOT/$f" ;; esac
         printf 'zone "%s" { type primary; file "%s"; allow-transfer { 127.0.0.1; }; };\n' "$apex" "$zf" >> "$D/a.conf"
@@ -298,6 +310,6 @@ echo "$COMPARED zones compared, $TOTAL_Q queries: $TOTAL_OK byte-identical, $TOT
 echo "secondary C: $TOTAL_C queries, $OK_C byte-identical to the database server's answers"
 [ -n "$FOLDED_ZONES" ] && echo "zones that differ only in the case of owner names (zone file has upper-case letters):$FOLDED_ZONES"
 if [ "$COMPARED" -ge 8 ]; then pass "at least 8 zones could be compared ($COMPARED)"; else fail "only $COMPARED zones could be compared (8 needed)"; fi
-if [ "$FAILS" -eq 0 ]; then echo "=== run_db_file_diff_test: all $PASS checks passed (file vs DB = 0 differences) ==="; exit 0; fi
+if [ "$FAILS" -eq 0 ]; then echo "=== run_db_file_diff_test: all $PASS checks passed (file vs DB = 0 differences; zones written by $IMPORTER) ==="; exit 0; fi
 echo "=== run_db_file_diff_test: $FAILS check(s) FAILED ($PASS passed) ==="
 exit 1

@@ -54,6 +54,12 @@
  * explicit transaction writes, and the role needs INSERT and UPDATE on that one table (db/karidns_loader_role.pgsql.sql).
  * Generations are made visible in order by the advisory lock of the INSERT trigger, so a position kept as a generation number
  * never skips a request (unlike karidns_changes.seq, which needs the xmin cursor above).
+ *
+ * Writing (M2, the 0.6.0 ZoneImporter; the loader never does this): open_write() is the same open with a session that may write
+ * (default_transaction_read_only = off, application_name karidns-zone, lock_timeout = busy_timeout_ms).  w_begin() is BEGIN READ WRITE
+ * followed by a transaction-level advisory lock on the zone name, so two importers of one zone (also of one that does not exist yet) run
+ * one after the other and the second gives up with DB_ERR_RETRY after lock_timeout; the reads of the zone (find_zone, scan_*) work inside
+ * the transaction and see its own writes.  Every write statement is prepared once per session and takes its values as parameters.
  */
 
 #ifdef KARIDNS_DB_POSTGRESQL
@@ -89,6 +95,9 @@ struct db_conn {
     bool chan_reload;               /* B11: LISTEN karidns_reload (watch_requests) instead of karidns_changes */
     bool listen_failed;             /* LISTEN was refused (a standby): wait_fd() stays -1, the caller polls by timer */
     int soa_cover_idx;              /* records (domain_id) INCLUDE (name, content) WHERE type = 'SOA' ...: 0 unknown, 1 yes, -1 no */
+    bool writable;                  /* M2: opened with open_write() (the session is not default_transaction_read_only) */
+    bool in_wtxn;                   /* M2: w_begin() is open (in_snapshot is set too, so the reads of the zone work inside it) */
+    uint32_t w_prepared;            /* M2: bit i = the statement W_STMT[i] is prepared on this session */
 };
 static bool pg_has_soa_cover_index(db_conn_t *c);
 
@@ -255,7 +264,9 @@ static void wipe(void *p, size_t n) {
     while (n--) *v++ = 0;
 }
 
-static int pg_open(db_conn_t **out, const db_source_t *src, char *err, size_t errlen) {
+/* write: the ZoneImporter's connection (open_write()): the session may write, and waits lock_timeout = busy_timeout_ms (0: 10 s) for the zone
+ * lock.  The loader's open() is write == false: read only, exactly the session settings it always had. */
+static int pg_open_mode(db_conn_t **out, const db_source_t *src, char *err, size_t errlen, bool write) {
     *out = NULL;
     if (!src || !src->conninfo_file || !*src->conninfo_file) {
         snprintf(err, errlen, "postgresql: no conninfo-file given");
@@ -282,7 +293,7 @@ static int pg_open(db_conn_t **out, const db_source_t *src, char *err, size_t er
     /* our defaults first: a keyword in the user's string (the dbname value is expanded as a connection string and its
      * keywords win) replaces them */
     const char *kw[] = { "application_name", "connect_timeout", "keepalives_idle", "keepalives_interval", "keepalives_count", "dbname", NULL };
-    const char *vl[] = { "karidns-dbloader", "10", "60", "10", "3", conninfo, NULL };
+    const char *vl[] = { write ? "karidns-zone" : "karidns-dbloader", "10", "60", "10", "3", conninfo, NULL };
     c->pg = PQconnectdbParams(kw, vl, 1);
     wipe(conninfo, sizeof(conninfo));
     if (!c->pg) {
@@ -303,13 +314,17 @@ static int pg_open(db_conn_t **out, const db_source_t *src, char *err, size_t er
     bool ok = pr && PQresultStatus(pr) == PGRES_COMMAND_OK;
     PQclear(pr);
     if (ok) {
-        pr = PQexec(c->pg, "SET default_transaction_read_only = on; SET application_name = 'karidns-dbloader'; "
-                           "SET statement_timeout = '900s'; SET lock_timeout = '10s'; "
-                           "SET idle_in_transaction_session_timeout = '1h'; SET cursor_tuple_fraction = 1; "
-                           "SET standard_conforming_strings = on");
+        char setup[400];
+        snprintf(setup, sizeof(setup),
+                 "SET default_transaction_read_only = %s; SET application_name = '%s'; SET statement_timeout = '900s'; SET lock_timeout = '%ums'; "
+                 "SET idle_in_transaction_session_timeout = '1h'; SET cursor_tuple_fraction = 1; SET standard_conforming_strings = on",
+                 write ? "off" : "on", write ? "karidns-zone" : "karidns-dbloader",
+                 write && src->busy_timeout_ms ? src->busy_timeout_ms : 10000u);
+        pr = PQexec(c->pg, setup);
         ok = pr && PQresultStatus(pr) == PGRES_COMMAND_OK;
         PQclear(pr);
     }
+    c->writable = write;
     int ret = ok ? 0 : pq_fail(c, NULL, "session setup");
     if (ret == 0 && src->schema && *src->schema) {
         char *q = PQescapeIdentifier(c->pg, src->schema, strlen(src->schema));
@@ -337,6 +352,14 @@ static int pg_open(db_conn_t **out, const db_source_t *src, char *err, size_t er
     c->last_ping = time(NULL);
     *out = c;
     return 0;
+}
+
+static int pg_open(db_conn_t **out, const db_source_t *src, char *err, size_t errlen) {
+    return pg_open_mode(out, src, err, errlen, false);
+}
+
+static int pg_open_write(db_conn_t **out, const db_source_t *src, char *err, size_t errlen) {
+    return pg_open_mode(out, src, err, errlen, true);
 }
 
 static void pg_close(db_conn_t *c) {
@@ -1418,6 +1441,276 @@ static int pg_report_status(db_conn_t *c, const db_status_t *st) {
     return exec_cmd(c, "COMMIT", "report status");
 }
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* M2: write access for the ZoneImporter (dns_db_driver.h).  Only open_write() connections get here.                 */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* The statements of the write functions.  Every one is prepared once per session (PQprepare) and run with PQexecPrepared: the values are
+ * parameters, never part of the SQL text.  A prepared statement outlives a rolled back transaction. */
+enum {
+    W_LOCK, W_CREATE, W_DEL_ALL_TAGS, W_DEL_ALL_TD, W_DEL_ALL_REC, W_DEL_IDS_TAGS, W_DEL_IDS_TD, W_DEL_IDS_REC, W_INS_REC, W_INS_TAGS,
+    W_INS_TD, W_DEL_TAGDEFS, W_INS_TAGDEF, W_DEL_META, W_INS_META, W_SET_VIEW, W_REQ, W_HAS_KEYS, W_N
+};
+static const struct { const char *sql; int np; } W_STMT[W_N] = {
+    [W_LOCK] = { "SELECT pg_advisory_xact_lock(hashtextextended('karidns-zone:' || $1::text, 0))", 1 },
+    [W_CREATE] = { "INSERT INTO domains (name, type) VALUES ($1, $2) RETURNING id", 2 },
+    [W_DEL_ALL_TAGS] = { "DELETE FROM karidns_record_tags WHERE record_id IN (SELECT id FROM records WHERE domain_id = $1::bigint)", 1 },
+    [W_DEL_ALL_TD] = { "DELETE FROM karidns_record_tinydns WHERE record_id IN (SELECT id FROM records WHERE domain_id = $1::bigint)", 1 },
+    [W_DEL_ALL_REC] = { "DELETE FROM records WHERE domain_id = $1::bigint", 1 },
+    [W_DEL_IDS_TAGS] = { "DELETE FROM karidns_record_tags WHERE record_id = ANY ($1::bigint[]) AND record_id IN (SELECT id FROM records WHERE domain_id = $2::bigint)", 2 },
+    [W_DEL_IDS_TD] = { "DELETE FROM karidns_record_tinydns WHERE record_id = ANY ($1::bigint[]) AND record_id IN (SELECT id FROM records WHERE domain_id = $2::bigint)", 2 },
+    [W_DEL_IDS_REC] = { "DELETE FROM records WHERE id = ANY ($1::bigint[]) AND domain_id = $2::bigint", 2 },
+    [W_INS_REC] = { "INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled, auth, ordername) "
+                    "VALUES ($1::bigint, $2, $3, $4, $5::bigint, $6::bigint, $7::boolean, $8::boolean, $9) RETURNING id", 9 },
+    [W_INS_TAGS] = { "INSERT INTO karidns_record_tags (record_id, location_tag, ecs_tag) VALUES ($1::bigint, $2, $3)", 3 },
+    [W_INS_TD] = { "INSERT INTO karidns_record_tinydns (record_id, ttd, loc, countdown) VALUES ($1::bigint, $2::bigint, $3, $4::boolean)", 4 },
+    [W_DEL_TAGDEFS] = { "DELETE FROM karidns_zone_tagdefs WHERE domain_id = $1::bigint AND ($2::text IS NULL OR kind = $2::text) "
+                        "AND ($3::text IS NULL OR lower(tag) = lower($3::text))", 3 },
+    [W_INS_TAGDEF] = { "INSERT INTO karidns_zone_tagdefs (domain_id, kind, tag, cidr) VALUES ($1::bigint, $2, $3, $4)", 4 },
+    [W_DEL_META] = { "DELETE FROM domainmetadata WHERE domain_id = $1::bigint AND upper(kind) = upper($2::text)", 2 },
+    [W_INS_META] = { "INSERT INTO domainmetadata (domain_id, kind, content) VALUES ($1::bigint, $2, $3)", 3 },
+    [W_SET_VIEW] = { "INSERT INTO karidns_domain_views (domain_id, view_name) VALUES ($1::bigint, $2) ON CONFLICT DO NOTHING", 2 },
+    [W_REQ] = { "INSERT INTO karidns_reload_requests (zone, force) VALUES ($1, $2::boolean)", 2 },
+    [W_HAS_KEYS] = { "SELECT EXISTS (SELECT 1 FROM cryptokeys WHERE domain_id = $1::bigint)", 1 },
+};
+
+/* run statement `idx` with the parameters pv (text, NULL = SQL NULL); the result (when out is set) is for the caller to clear */
+static int wq(db_conn_t *c, int idx, const char *const *pv, PGresult **out, ExecStatusType want, const char *what) {
+    char name[16];
+    snprintf(name, sizeof(name), "kzw%d", idx);
+    if (!(c->w_prepared & (1u << idx))) {
+        PGresult *p = PQprepare(c->pg, name, W_STMT[idx].sql, W_STMT[idx].np, NULL);
+        if (!p || PQresultStatus(p) != PGRES_COMMAND_OK) {
+            int ret = pq_fail(c, p, what);
+            PQclear(p);
+            return ret;
+        }
+        PQclear(p);
+        c->w_prepared |= 1u << idx;
+    }
+    PGresult *r = PQexecPrepared(c->pg, name, W_STMT[idx].np, pv, NULL, NULL, 0);
+    if (!r || PQresultStatus(r) != want) {
+        int ret = pq_fail(c, r, what);
+        PQclear(r);
+        return ret;
+    }
+    if (out) *out = r;
+    else PQclear(r);
+    return 0;
+}
+
+static int wcheck(db_conn_t *c, const char *fn) {
+    if (!c->writable) {
+        set_err(c, "%s: the connection is read only (open_write() makes a writable one)", fn);
+        return -1;
+    }
+    if (!c->in_wtxn) {
+        set_err(c, "%s: no write transaction is open (w_begin)", fn);
+        return -1;
+    }
+    return 0;
+}
+
+static void i64_text(char *buf, size_t cap, int64_t v) { snprintf(buf, cap, "%lld", (long long)v); }
+
+static int pg_w_begin(db_conn_t *c, const char *zone) {
+    if (!c->writable) {
+        set_err(c, "w_begin: the connection is read only (open_write() makes a writable one)");
+        return -1;
+    }
+    if (c->in_snapshot || c->in_wtxn) {
+        set_err(c, "w_begin: a transaction is already open");
+        return -1;
+    }
+    int rc = exec_cmd(c, "BEGIN READ WRITE", "w_begin");
+    if (rc != 0) return rc;
+    /* the lock against a concurrent importer of the same zone (also one that creates it): a transaction-level advisory lock on the name,
+     * which waits lock_timeout (open_write) and ends with the transaction */
+    const char *pv[1] = { zone };
+    rc = wq(c, W_LOCK, pv, NULL, PGRES_TUPLES_OK, "w_begin (zone lock)");
+    if (rc != 0) {
+        PQclear(PQexec(c->pg, "ROLLBACK"));            /* a failed w_begin leaves no transaction open */
+        return rc;
+    }
+    c->in_wtxn = c->in_snapshot = true;
+    return 0;
+}
+
+static int pg_w_commit(db_conn_t *c) {
+    int ret = wcheck(c, "w_commit");
+    if (ret != 0) return ret;
+    c->in_wtxn = c->in_snapshot = false;
+    return exec_cmd(c, "COMMIT", "w_commit");
+}
+
+static int pg_w_rollback(db_conn_t *c) {
+    if (!c->in_wtxn) return 0;
+    c->in_wtxn = c->in_snapshot = false;
+    return exec_cmd(c, "ROLLBACK", "w_rollback");
+}
+
+static int pg_w_create_zone(db_conn_t *c, const char *name, const char *type, int64_t *id) {
+    int ret = wcheck(c, "w_create_zone");
+    if (ret != 0) return ret;
+    const char *pv[2] = { name, type ? type : "NATIVE" };
+    PGresult *r = NULL;
+    if ((ret = wq(c, W_CREATE, pv, &r, PGRES_TUPLES_OK, "w_create_zone")) != 0) return ret;
+    *id = cell_i64(r, 0, 0);
+    PQclear(r);
+    return 0;
+}
+
+#define W_DEL_CHUNK 1000
+
+static int pg_w_delete_records(db_conn_t *c, int64_t domain_id, const int64_t *ids, size_t n) {
+    int ret = wcheck(c, "w_delete_records");
+    if (ret != 0) return ret;
+    char did[32];
+    i64_text(did, sizeof(did), domain_id);
+    if (!ids) {
+        const char *pv[1] = { did };
+        /* the extension rows first: their delete triggers find the zone through the record */
+        if (c->has_ext && (ret = wq(c, W_DEL_ALL_TAGS, pv, NULL, PGRES_COMMAND_OK, "w_delete_records")) != 0) return ret;
+        if (c->has_ext && (ret = wq(c, W_DEL_ALL_TD, pv, NULL, PGRES_COMMAND_OK, "w_delete_records")) != 0) return ret;
+        return wq(c, W_DEL_ALL_REC, pv, NULL, PGRES_COMMAND_OK, "w_delete_records");
+    }
+    char *arr = malloc(W_DEL_CHUNK * 21 + 4);
+    if (!arr) {
+        set_err(c, "out of memory");
+        return -1;
+    }
+    for (size_t i = 0; i < n && ret == 0; i += W_DEL_CHUNK) {
+        size_t k = n - i < W_DEL_CHUNK ? n - i : W_DEL_CHUNK, o = 0;
+        arr[o++] = '{';
+        for (size_t j = 0; j < k; j++) o += (size_t)snprintf(arr + o, 24, "%s%lld", j ? "," : "", (long long)ids[i + j]);
+        arr[o++] = '}';
+        arr[o] = '\0';
+        const char *pv[2] = { arr, did };
+        if (c->has_ext && (ret = wq(c, W_DEL_IDS_TAGS, pv, NULL, PGRES_COMMAND_OK, "w_delete_records")) == 0)
+            ret = wq(c, W_DEL_IDS_TD, pv, NULL, PGRES_COMMAND_OK, "w_delete_records");
+        if (ret == 0) ret = wq(c, W_DEL_IDS_REC, pv, NULL, PGRES_COMMAND_OK, "w_delete_records");
+    }
+    free(arr);
+    return ret;
+}
+
+static int pg_w_insert_record(db_conn_t *c, int64_t domain_id, const db_record_row_t *row, bool auth, int64_t *id) {
+    int ret = wcheck(c, "w_insert_record");
+    if (ret != 0) return ret;
+    char did[32], ttl[32], prio[32];
+    i64_text(did, sizeof(did), domain_id);
+    i64_text(ttl, sizeof(ttl), row->ttl);
+    i64_text(prio, sizeof(prio), row->prio);
+    const char *pv[9] = { did, row->name, row->type, row->content, row->ttl_null ? NULL : ttl, row->prio_null ? NULL : prio,
+                          row->disabled ? "t" : "f", auth ? "t" : "f", row->ordername };
+    PGresult *r = NULL;
+    if ((ret = wq(c, W_INS_REC, pv, &r, PGRES_TUPLES_OK, "w_insert_record")) != 0) return ret;
+    *id = cell_i64(r, 0, 0);
+    PQclear(r);
+    return 0;
+}
+
+static int ext_missing(db_conn_t *c) {
+    set_err(c, "the karidns_record_tags / karidns_record_tinydns / karidns_zone_tagdefs tables do not exist in this database");
+    return DB_ERR_UNAVAILABLE;
+}
+
+static int pg_w_insert_tags(db_conn_t *c, int64_t record_id, const char *loc, const char *ecs) {
+    int ret = wcheck(c, "w_insert_tags");
+    if (ret != 0) return ret;
+    if (!c->has_ext) return ext_missing(c);
+    char rid[32];
+    i64_text(rid, sizeof(rid), record_id);
+    const char *pv[3] = { rid, loc, ecs };
+    return wq(c, W_INS_TAGS, pv, NULL, PGRES_COMMAND_OK, "w_insert_tags");
+}
+
+static int pg_w_insert_tinydns(db_conn_t *c, int64_t record_id, int64_t ttd, const char *loc, bool countdown) {
+    int ret = wcheck(c, "w_insert_tinydns");
+    if (ret != 0) return ret;
+    if (!c->has_ext) return ext_missing(c);
+    char rid[32], td[32];
+    i64_text(rid, sizeof(rid), record_id);
+    i64_text(td, sizeof(td), ttd);
+    const char *pv[4] = { rid, td, loc, countdown ? "t" : "f" };
+    return wq(c, W_INS_TD, pv, NULL, PGRES_COMMAND_OK, "w_insert_tinydns");
+}
+
+static int pg_w_delete_tagdefs(db_conn_t *c, int64_t domain_id, const char *kind, const char *tag) {
+    int ret = wcheck(c, "w_delete_tagdefs");
+    if (ret != 0) return ret;
+    if (!c->has_ext) return ext_missing(c);
+    char did[32];
+    i64_text(did, sizeof(did), domain_id);
+    const char *pv[3] = { did, kind, tag };
+    return wq(c, W_DEL_TAGDEFS, pv, NULL, PGRES_COMMAND_OK, "w_delete_tagdefs");
+}
+
+static int pg_w_insert_tagdef(db_conn_t *c, int64_t domain_id, const char *kind, const char *tag, const char *cidr) {
+    int ret = wcheck(c, "w_insert_tagdef");
+    if (ret != 0) return ret;
+    if (!c->has_ext) return ext_missing(c);
+    char did[32];
+    i64_text(did, sizeof(did), domain_id);
+    const char *pv[4] = { did, kind, tag, cidr };
+    return wq(c, W_INS_TAGDEF, pv, NULL, PGRES_COMMAND_OK, "w_insert_tagdef");
+}
+
+static int pg_w_delete_meta(db_conn_t *c, int64_t domain_id, const char *kind) {
+    int ret = wcheck(c, "w_delete_meta");
+    if (ret != 0) return ret;
+    char did[32];
+    i64_text(did, sizeof(did), domain_id);
+    const char *pv[2] = { did, kind };
+    return wq(c, W_DEL_META, pv, NULL, PGRES_COMMAND_OK, "w_delete_meta");
+}
+
+static int pg_w_insert_meta(db_conn_t *c, int64_t domain_id, const char *kind, const char *content) {
+    int ret = wcheck(c, "w_insert_meta");
+    if (ret != 0) return ret;
+    char did[32];
+    i64_text(did, sizeof(did), domain_id);
+    const char *pv[3] = { did, kind, content };
+    return wq(c, W_INS_META, pv, NULL, PGRES_COMMAND_OK, "w_insert_meta");
+}
+
+static int pg_w_set_view(db_conn_t *c, int64_t domain_id, const char *view_name) {
+    int ret = wcheck(c, "w_set_view");
+    if (ret != 0) return ret;
+    if (!c->has_domain_views) {
+        set_err(c, "karidns_domain_views does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    char did[32];
+    i64_text(did, sizeof(did), domain_id);
+    const char *pv[2] = { did, view_name };
+    return wq(c, W_SET_VIEW, pv, NULL, PGRES_COMMAND_OK, "w_set_view");
+}
+
+static int pg_w_request_reload(db_conn_t *c, const char *zone, bool force) {
+    int ret = wcheck(c, "w_request_reload");
+    if (ret != 0) return ret;
+    if (!c->has_reload_requests) {
+        set_err(c, "karidns_reload_requests does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    const char *pv[2] = { zone, force ? "t" : "f" };
+    return wq(c, W_REQ, pv, NULL, PGRES_COMMAND_OK, "w_request_reload");
+}
+
+static int pg_w_zone_has_keys(db_conn_t *c, int64_t domain_id, bool *has) {
+    int ret = wcheck(c, "w_zone_has_keys");
+    if (ret != 0) return ret;
+    char did[32];
+    i64_text(did, sizeof(did), domain_id);
+    const char *pv[1] = { did };
+    PGresult *r = NULL;
+    if ((ret = wq(c, W_HAS_KEYS, pv, &r, PGRES_TUPLES_OK, "w_zone_has_keys")) != 0) return ret;
+    *has = cell_true(r, 0, 0);
+    PQclear(r);
+    return 0;
+}
+
 const db_driver_t db_driver_postgresql = {
     "postgresql",    pg_open,         pg_close,           pg_errmsg,           pg_check_schema,
     pg_begin_snapshot, pg_end_snapshot, pg_list_zones,    pg_scan_records,     pg_scan_metadata,
@@ -1429,6 +1722,10 @@ const db_driver_t db_driver_postgresql = {
     pg_find_zone,       /* B13 */
     pg_scan_records_in, pg_scan_metadata_in, pg_scan_ext_in,      /* B13b */
     pg_scan_apex,       /* D1a step 6 */
+    /* M2, the ZoneImporter: write access (open_write connections only) */
+    pg_open_write, pg_w_begin, pg_w_commit, pg_w_rollback, pg_w_create_zone, pg_w_delete_records, pg_w_insert_record, pg_w_insert_tags,
+    pg_w_insert_tinydns, pg_w_delete_tagdefs, pg_w_insert_tagdef, pg_w_delete_meta, pg_w_insert_meta, pg_w_set_view, pg_w_request_reload,
+    pg_w_zone_has_keys,
 };
 
 #endif /* KARIDNS_DB_POSTGRESQL */

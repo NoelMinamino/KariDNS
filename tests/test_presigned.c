@@ -29,7 +29,7 @@
 #include "../dns_pdns_reader.h"
 #include "../dns_presigned.h"
 #include "../dns_utils.h"
-#include "db/zone2sql.h"
+#include "../dns_zone_rows.h"
 #include "db/xfr_mocks.h"
 #include "db/pdns_roundtrip.h"
 
@@ -95,7 +95,7 @@ static bool sign_zone(const char *z, const char *opts) {
 
 /* ------------------------------------------------------------------ rows */
 typedef struct {
-    z2s_rows_t z;                   /* rows from zone2sql (presigned layout) */
+    zrows_t z;                      /* rows from zone2sql (presigned layout) */
     db_meta_row_t meta[2];
     size_t nmeta;
     zone_arena_t file;              /* the signed zone file */
@@ -106,14 +106,14 @@ static bool fx_load(fx_t *f, const char *z, bool plain) {
     char path[700], err[400];
     snprintf(path, sizeof(path), "%s/%s.signed", g_dir, z);
     memset(f, 0, sizeof(*f));
-    if (!z2s_load_zone_file(path, NULL, &f->file, f->apex, sizeof(f->apex), err, sizeof(err))) {
+    if (!zrows_load_zone_file(path, NULL, &f->file, f->apex, sizeof(f->apex), err, sizeof(err))) {
         printf("  [FAIL] load %s: %s\n", path, err);
         g_failed++;
         return false;
     }
-    z2s_plain_signed = plain;
-    bool ok = z2s_rows_from_arena(&f->file, f->apex, &f->z, err, sizeof(err));
-    z2s_plain_signed = false;
+    zrows_plain_signed = plain;
+    bool ok = zrows_from_arena(&f->file, f->apex, &f->z, err, sizeof(err));
+    zrows_plain_signed = false;
     if (!ok) {
         printf("  [FAIL] rows of %s: %s\n", z, err);
         g_failed++;
@@ -125,7 +125,7 @@ static bool fx_load(fx_t *f, const char *z, bool plain) {
 }
 
 static void fx_free(fx_t *f) {
-    z2s_rows_free(&f->z);
+    zrows_free(&f->z);
     zone_arena_destroy(&f->file);
 }
 

@@ -126,7 +126,15 @@ A zone file syntax and configuration validation utility. It performs pre-flight 
 ./karicheck zone example.com /path/to/example.com.zone
 ```
 
-### 4. `dag` (DNS Anomaly Generator)
+### 3b. `karidns-zone` (database packages)
+The importer and exporter for zones in a PowerDNS 5.1 database (SQLite3 or PostgreSQL): `import` writes a zone file or a tinydns data file into the database in one transaction (with the checks of `karicheck`, the `check-*` options and size limits of the configuration, and a read-back through the loader's reader before the commit), `export` writes a zone, or every zone (`--all --dir`, a backup), as a zone file in canonical order. It runs as an ordinary user. See the **[karidns-zone(1) Manual](docs/karidns-zone.md)**.
+
+```sh
+./karidns-zone import -c /usr/local/etc/karidns/karidns.conf example.com /path/to/example.com.zone
+./karidns-zone export -c /usr/local/etc/karidns/karidns.conf example.com > example.com.zone
+./karidns-zone export --all --dir /var/backups/zones -c /usr/local/etc/karidns/karidns.conf
+```
+$1
 A test client, protocol debugger, and packet fuzzer for DNS servers. For full option specifications and fuzzing modes, see the **[dag(1) Manual](docs/dag.md)**.
 
 `dag` can construct custom queries (including EDNS options, Cookie, EDNS Client Subnet, IXFR, Dynamic Updates, etc.), output formatted responses (`+short`, `+yaml`, `+multiline`), resolve iteratively without any local resolver (`+trace2`), replay captured traffic against servers (`--replay`), generate web links (`+ldnsz`) for online wire-format analysis, and intentionally generate malformed or boundary-testing packets using the `--break` option. Its defaults follow `dig` (EDNS0 with a 1232-byte UDP payload size and a client cookie); unlike `dig`, it also prints hex dumps of the query and response by default (`+nohexdump` turns them off).
@@ -304,6 +312,10 @@ For complete packaging details and checksum verification, see the **[Distributio
 To compile all utilities on FreeBSD (`karidns`, `dag`, `karictl`, `karicheck`):
 ```sh
 make all
+```
+The database tools (`karidns-dbloader`, the loader the server starts, and `karidns-zone`, the zone importer and exporter) link a database library and are built on request, with the drivers you want (`sqlite3`, `postgresql`):
+```sh
+make karidns-dbloader karidns-zone DB_DRIVERS="sqlite3 postgresql"
 ```
 
 To compile only the `dag` client (on Linux, macOS, Windows MSYS2, or FreeBSD):

@@ -16,6 +16,11 @@
  * A NULL `disabled` is a disabled row (PowerDNS reads rows with "disabled=0", which a NULL does not satisfy).
  * Every text column is checked for an embedded NUL (sqlite3_column_bytes() != strlen()): such a row is an error that
  * names the table and the row id.
+ *
+ * Writing (M2, the 0.6.0 ZoneImporter): open_write() is the same open without PRAGMA query_only; the loader never calls it.  w_begin() is
+ * BEGIN IMMEDIATE (SQLite has one write lock for the whole database, which is the lock against a concurrent importer), everything
+ * after it is parameterised (sqlite3_bind_*), and the triggers of db/karidns_ext.sqlite3.sql write the change log.  Foreign keys are
+ * not relied on (PRAGMA foreign_keys is off by default): the extension rows of a record are deleted with it.
  */
 
 #ifdef KARIDNS_DB_SQLITE3
@@ -48,7 +53,13 @@ struct db_conn {
     bool has_profiles;
     sqlite3_stmt *st_xt[2], *st_xd[2], *st_xg[2];      /* B8: karidns_record_tags, karidns_record_tinydns, karidns_zone_tagdefs; [0] all, [1] one domain */
     bool has_ext;
+    bool writable;              /* M2: opened with open_write() (no PRAGMA query_only) */
+    bool in_wtxn;               /* M2: w_begin() is open (in_snapshot is set too, so the reads of the zone work inside it) */
+    sqlite3_stmt *st_w[8];      /* M2: the statements of the write functions that run once per row (W_* below) */
 };
+
+/* M2: the statements kept for the per-row write functions */
+enum { W_INS_REC, W_INS_TAGS, W_INS_TD, W_DEL_TAGS_ID, W_DEL_TD_ID, W_DEL_REC_ID, W_INS_TAGDEF, W_INS_META };
 
 /* ------------------------------------------------------------------------------------------------------------- */
 /* errors                                                                                                         */
@@ -117,7 +128,8 @@ static const char *col_text(db_conn_t *c, sqlite3_stmt *st, int i, const char *t
 /* open / close                                                                                                   */
 /* ------------------------------------------------------------------------------------------------------------- */
 
-static int sq_open(db_conn_t **out, const db_source_t *src, char *err, size_t errlen) {
+/* write: the ZoneImporter's connection (open_write()).  The loader's open() is write == false: PRAGMA query_only=1, as before. */
+static int sq_open_mode(db_conn_t **out, const db_source_t *src, char *err, size_t errlen, bool write) {
     *out = NULL;
     const char *path = src ? src->database_file : NULL;
     if (!path || !*path) {
@@ -152,7 +164,8 @@ static int sq_open(db_conn_t **out, const db_source_t *src, char *err, size_t er
 #ifdef SQLITE_DBCONFIG_DEFENSIVE
     sqlite3_db_config(c->db, SQLITE_DBCONFIG_DEFENSIVE, 1, (int *)NULL);
 #endif
-    int ret = exec(c, "PRAGMA query_only=1");
+    c->writable = write;
+    int ret = write ? 0 : exec(c, "PRAGMA query_only=1");
     if (ret == 0) {
         sqlite3_stmt *st = NULL;
         rc = sqlite3_prepare_v2(c->db, "PRAGMA journal_mode", -1, &st, NULL);
@@ -187,8 +200,18 @@ static int sq_open(db_conn_t **out, const db_source_t *src, char *err, size_t er
     return 0;
 }
 
+static int sq_open(db_conn_t **out, const db_source_t *src, char *err, size_t errlen) {
+    return sq_open_mode(out, src, err, errlen, false);
+}
+
+static int sq_open_write(db_conn_t **out, const db_source_t *src, char *err, size_t errlen) {
+    return sq_open_mode(out, src, err, errlen, true);
+}
+
 static void sq_close(db_conn_t *c) {
     if (!c) return;
+    if (c->in_wtxn) sqlite3_exec(c->db, "ROLLBACK", NULL, NULL, NULL);       /* an importer that gives up: nothing is committed */
+    for (size_t i = 0; i < sizeof(c->st_w) / sizeof(c->st_w[0]); i++) sqlite3_finalize(c->st_w[i]);
     sqlite3_finalize(c->st_pv);
     free(c->path);
     sqlite3_finalize(c->st_apex_all);
@@ -467,8 +490,8 @@ static int sq_begin_snapshot(db_conn_t *c) {
     return 0;
 }
 
-static int sq_end_snapshot(db_conn_t *c) {
-    if (!c->in_snapshot) return 0;
+/* every read statement back to the start, so that no cursor keeps the transaction (or the WAL read mark) busy */
+static void rearm_all(db_conn_t *c) {
     sqlite3_stmt *all[] = { c->st_apex_all, c->st_apex_one, c->st_zones, c->st_zone_one, c->st_rec_all, c->st_rec_one, c->st_rec_rng, c->st_meta_all, c->st_meta_one,
                             c->st_keys, c->st_changes, c->st_dv_all, c->st_dv_one, c->st_prof };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
@@ -478,6 +501,11 @@ static int sq_end_snapshot(db_conn_t *c) {
         if (c->st_xd[i]) rearm(c->st_xd[i]);
         if (c->st_xg[i]) rearm(c->st_xg[i]);
     }
+}
+
+static int sq_end_snapshot(db_conn_t *c) {
+    if (!c->in_snapshot) return 0;
+    rearm_all(c);
     c->in_snapshot = false;
     return exec(c, "COMMIT");
 }
@@ -1018,6 +1046,262 @@ static int sq_poll_version(db_conn_t *c, uint64_t *version, bool *replaced) {
     return ret;
 }
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* M2: write access for the ZoneImporter (dns_db_driver.h).  Only open_write() connections get here.                 */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+static int wcheck(db_conn_t *c, const char *fn) {
+    if (!c->writable) {
+        set_err(c, "%s: the connection is read only (open_write() makes a writable one)", fn);
+        return -1;
+    }
+    if (!c->in_wtxn) {
+        set_err(c, "%s: no write transaction is open (w_begin)", fn);
+        return -1;
+    }
+    return 0;
+}
+
+static void bind_txt(sqlite3_stmt *st, int i, const char *s) {
+    if (s) sqlite3_bind_text(st, i, s, -1, SQLITE_STATIC);
+    else sqlite3_bind_null(st, i);
+}
+
+/* run a statement whose parameters are bound, once, and put it back to the start */
+static int wstep(db_conn_t *c, sqlite3_stmt *st, const char *what) {
+    int rc = sqlite3_step(st);
+    int ret = rc == SQLITE_DONE ? 0 : sql_fail(c, rc, what);
+    rearm(st);
+    return ret;
+}
+
+/* a statement that runs once: prepare, run (parameters bound by the caller before wstep1), finalize */
+static int wstep1(db_conn_t *c, sqlite3_stmt *st, const char *what) {
+    int rc = sqlite3_step(st);
+    int ret = rc == SQLITE_DONE ? 0 : sql_fail(c, rc, what);
+    sqlite3_finalize(st);
+    return ret;
+}
+
+static int sq_w_begin(db_conn_t *c, const char *zone) {
+    (void)zone;                         /* the lock is the whole database: BEGIN IMMEDIATE takes SQLite's one write lock */
+    if (!c->writable) {
+        set_err(c, "w_begin: the connection is read only (open_write() makes a writable one)");
+        return -1;
+    }
+    if (c->in_snapshot || c->in_wtxn) {
+        set_err(c, "w_begin: a transaction is already open");
+        return -1;
+    }
+    int rc = exec(c, "BEGIN IMMEDIATE");
+    if (rc != 0) return rc;
+    c->in_wtxn = c->in_snapshot = true;
+    return 0;
+}
+
+static int sq_w_commit(db_conn_t *c) {
+    int ret = wcheck(c, "w_commit");
+    if (ret != 0) return ret;
+    rearm_all(c);
+    c->in_wtxn = c->in_snapshot = false;
+    ret = exec(c, "COMMIT");
+    if (ret != 0) sqlite3_exec(c->db, "ROLLBACK", NULL, NULL, NULL);       /* a failed COMMIT can leave the transaction open */
+    return ret;
+}
+
+static int sq_w_rollback(db_conn_t *c) {
+    if (!c->in_wtxn) return 0;
+    rearm_all(c);
+    for (size_t i = 0; i < sizeof(c->st_w) / sizeof(c->st_w[0]); i++)
+        if (c->st_w[i]) rearm(c->st_w[i]);
+    c->in_wtxn = c->in_snapshot = false;
+    return exec(c, "ROLLBACK");
+}
+
+static int sq_w_create_zone(db_conn_t *c, const char *name, const char *type, int64_t *id) {
+    int ret = wcheck(c, "w_create_zone");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = NULL;
+    ret = prep(c, &st, "INSERT INTO domains (name, type) VALUES (?1, ?2)");
+    if (ret != 0) return ret;
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, type ? type : "NATIVE", -1, SQLITE_STATIC);
+    ret = wstep1(c, st, "w_create_zone");
+    if (ret == 0) *id = (int64_t)sqlite3_last_insert_rowid(c->db);
+    return ret;
+}
+
+static int sq_w_delete_records(db_conn_t *c, int64_t domain_id, const int64_t *ids, size_t n) {
+    int ret = wcheck(c, "w_delete_records");
+    if (ret != 0) return ret;
+    if (!ids) {
+        /* the extension rows first: their delete triggers find the zone through the record */
+        static const char *const sql[] = {
+            "DELETE FROM karidns_record_tags WHERE record_id IN (SELECT id FROM records WHERE domain_id = ?1)",
+            "DELETE FROM karidns_record_tinydns WHERE record_id IN (SELECT id FROM records WHERE domain_id = ?1)",
+            "DELETE FROM records WHERE domain_id = ?1",
+        };
+        for (size_t i = c->has_ext ? 0 : 2; i < 3 && ret == 0; i++) {
+            sqlite3_stmt *st = NULL;
+            if ((ret = prep(c, &st, sql[i])) != 0) return ret;
+            sqlite3_bind_int64(st, 1, domain_id);
+            ret = wstep1(c, st, "w_delete_records");
+        }
+        return ret;
+    }
+    /* the ids belong to the zone: every statement says so, so an id of another zone deletes nothing */
+    if (c->has_ext) {
+        ret = prep(c, &c->st_w[W_DEL_TAGS_ID], "DELETE FROM karidns_record_tags WHERE record_id = ?1 AND EXISTS (SELECT 1 FROM records WHERE id = ?1 AND domain_id = ?2)");
+        if (ret == 0)
+            ret = prep(c, &c->st_w[W_DEL_TD_ID], "DELETE FROM karidns_record_tinydns WHERE record_id = ?1 AND EXISTS (SELECT 1 FROM records WHERE id = ?1 AND domain_id = ?2)");
+    }
+    if (ret == 0) ret = prep(c, &c->st_w[W_DEL_REC_ID], "DELETE FROM records WHERE id = ?1 AND domain_id = ?2");
+    for (size_t i = 0; i < n && ret == 0; i++) {
+        for (int k = c->has_ext ? W_DEL_TAGS_ID : W_DEL_REC_ID; k <= W_DEL_REC_ID && ret == 0; k++) {
+            sqlite3_stmt *st = c->st_w[k];
+            sqlite3_bind_int64(st, 1, ids[i]);
+            sqlite3_bind_int64(st, 2, domain_id);
+            ret = wstep(c, st, "w_delete_records");
+        }
+    }
+    return ret;
+}
+
+static int sq_w_insert_record(db_conn_t *c, int64_t domain_id, const db_record_row_t *row, bool auth, int64_t *id) {
+    int ret = wcheck(c, "w_insert_record");
+    if (ret != 0) return ret;
+    ret = prep(c, &c->st_w[W_INS_REC],
+               "INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled, auth, ordername) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = c->st_w[W_INS_REC];
+    sqlite3_bind_int64(st, 1, domain_id);
+    bind_txt(st, 2, row->name);
+    bind_txt(st, 3, row->type);
+    bind_txt(st, 4, row->content);
+    if (row->ttl_null) sqlite3_bind_null(st, 5);
+    else sqlite3_bind_int64(st, 5, row->ttl);
+    if (row->prio_null) sqlite3_bind_null(st, 6);
+    else sqlite3_bind_int64(st, 6, row->prio);
+    sqlite3_bind_int(st, 7, row->disabled ? 1 : 0);
+    sqlite3_bind_int(st, 8, auth ? 1 : 0);
+    bind_txt(st, 9, row->ordername);
+    ret = wstep(c, st, "w_insert_record");
+    if (ret == 0) *id = (int64_t)sqlite3_last_insert_rowid(c->db);
+    return ret;
+}
+
+static int ext_missing(db_conn_t *c) {
+    set_err(c, "the karidns_record_tags / karidns_record_tinydns / karidns_zone_tagdefs tables do not exist in this database");
+    return DB_ERR_UNAVAILABLE;
+}
+
+static int sq_w_insert_tags(db_conn_t *c, int64_t record_id, const char *loc, const char *ecs) {
+    int ret = wcheck(c, "w_insert_tags");
+    if (ret != 0) return ret;
+    if (!c->has_ext) return ext_missing(c);
+    if ((ret = prep(c, &c->st_w[W_INS_TAGS], "INSERT INTO karidns_record_tags (record_id, location_tag, ecs_tag) VALUES (?1, ?2, ?3)")) != 0) return ret;
+    sqlite3_stmt *st = c->st_w[W_INS_TAGS];
+    sqlite3_bind_int64(st, 1, record_id);
+    bind_txt(st, 2, loc);
+    bind_txt(st, 3, ecs);
+    return wstep(c, st, "w_insert_tags");
+}
+
+static int sq_w_insert_tinydns(db_conn_t *c, int64_t record_id, int64_t ttd, const char *loc, bool countdown) {
+    int ret = wcheck(c, "w_insert_tinydns");
+    if (ret != 0) return ret;
+    if (!c->has_ext) return ext_missing(c);
+    if ((ret = prep(c, &c->st_w[W_INS_TD], "INSERT INTO karidns_record_tinydns (record_id, ttd, loc, countdown) VALUES (?1, ?2, ?3, ?4)")) != 0) return ret;
+    sqlite3_stmt *st = c->st_w[W_INS_TD];
+    sqlite3_bind_int64(st, 1, record_id);
+    sqlite3_bind_int64(st, 2, ttd);
+    bind_txt(st, 3, loc);
+    sqlite3_bind_int(st, 4, countdown ? 1 : 0);
+    return wstep(c, st, "w_insert_tinydns");
+}
+
+static int sq_w_delete_tagdefs(db_conn_t *c, int64_t domain_id, const char *kind, const char *tag) {
+    int ret = wcheck(c, "w_delete_tagdefs");
+    if (ret != 0) return ret;
+    if (!c->has_ext) return ext_missing(c);
+    sqlite3_stmt *st = NULL;
+    if ((ret = prep(c, &st, "DELETE FROM karidns_zone_tagdefs WHERE domain_id = ?1 AND (?2 IS NULL OR kind = ?2) AND (?3 IS NULL OR lower(tag) = lower(?3))")) != 0)
+        return ret;
+    sqlite3_bind_int64(st, 1, domain_id);
+    bind_txt(st, 2, kind);
+    bind_txt(st, 3, tag);
+    return wstep1(c, st, "w_delete_tagdefs");
+}
+
+static int sq_w_insert_tagdef(db_conn_t *c, int64_t domain_id, const char *kind, const char *tag, const char *cidr) {
+    int ret = wcheck(c, "w_insert_tagdef");
+    if (ret != 0) return ret;
+    if (!c->has_ext) return ext_missing(c);
+    if ((ret = prep(c, &c->st_w[W_INS_TAGDEF], "INSERT INTO karidns_zone_tagdefs (domain_id, kind, tag, cidr) VALUES (?1, ?2, ?3, ?4)")) != 0) return ret;
+    sqlite3_stmt *st = c->st_w[W_INS_TAGDEF];
+    sqlite3_bind_int64(st, 1, domain_id);
+    bind_txt(st, 2, kind);
+    bind_txt(st, 3, tag);
+    bind_txt(st, 4, cidr);
+    return wstep(c, st, "w_insert_tagdef");
+}
+
+static int sq_w_delete_meta(db_conn_t *c, int64_t domain_id, const char *kind) {
+    int ret = wcheck(c, "w_delete_meta");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = NULL;
+    if ((ret = prep(c, &st, "DELETE FROM domainmetadata WHERE domain_id = ?1 AND upper(kind) = upper(?2)")) != 0) return ret;
+    sqlite3_bind_int64(st, 1, domain_id);
+    bind_txt(st, 2, kind);
+    return wstep1(c, st, "w_delete_meta");
+}
+
+static int sq_w_insert_meta(db_conn_t *c, int64_t domain_id, const char *kind, const char *content) {
+    int ret = wcheck(c, "w_insert_meta");
+    if (ret != 0) return ret;
+    if ((ret = prep(c, &c->st_w[W_INS_META], "INSERT INTO domainmetadata (domain_id, kind, content) VALUES (?1, ?2, ?3)")) != 0) return ret;
+    sqlite3_stmt *st = c->st_w[W_INS_META];
+    sqlite3_bind_int64(st, 1, domain_id);
+    bind_txt(st, 2, kind);
+    bind_txt(st, 3, content);
+    return wstep(c, st, "w_insert_meta");
+}
+
+static int sq_w_set_view(db_conn_t *c, int64_t domain_id, const char *view_name) {
+    int ret = wcheck(c, "w_set_view");
+    if (ret != 0) return ret;
+    if (!c->has_domain_views) {
+        set_err(c, "karidns_domain_views does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    sqlite3_stmt *st = NULL;
+    if ((ret = prep(c, &st, "INSERT INTO karidns_domain_views (domain_id, view_name) VALUES (?1, ?2) ON CONFLICT (domain_id, view_name) DO NOTHING")) != 0)
+        return ret;
+    sqlite3_bind_int64(st, 1, domain_id);
+    bind_txt(st, 2, view_name);
+    return wstep1(c, st, "w_set_view");
+}
+
+static int sq_w_request_reload(db_conn_t *c, const char *zone, bool force) {
+    (void)zone;
+    (void)force;
+    set_err(c, "karidns_reload_requests exists on PostgreSQL only (multi-server operation); the change log triggers tell a running server");
+    return DB_ERR_UNAVAILABLE;
+}
+
+static int sq_w_zone_has_keys(db_conn_t *c, int64_t domain_id, bool *has) {
+    int ret = wcheck(c, "w_zone_has_keys");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = NULL;
+    if ((ret = prep(c, &st, "SELECT 1 FROM cryptokeys WHERE domain_id = ?1 LIMIT 1")) != 0) return ret;
+    sqlite3_bind_int64(st, 1, domain_id);
+    int rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW || rc == SQLITE_DONE) *has = rc == SQLITE_ROW;
+    else ret = sql_fail(c, rc, "w_zone_has_keys");
+    sqlite3_finalize(st);
+    return ret;
+}
+
 const db_driver_t db_driver_sqlite3 = {
     "sqlite3",       sq_open,         sq_close,           sq_errmsg,           sq_check_schema,
     sq_begin_snapshot, sq_end_snapshot, sq_list_zones,    sq_scan_records,     sq_scan_metadata,
@@ -1029,6 +1313,10 @@ const db_driver_t db_driver_sqlite3 = {
     sq_find_zone,       /* B13 */
     NULL, NULL, NULL,   /* B13b scan_records_in, scan_metadata_in, scan_ext_in: PostgreSQL only (a statement costs no round trip here) */
     sq_scan_apex,       /* D1a step 6 */
+    /* M2, the ZoneImporter: write access (open_write connections only) */
+    sq_open_write, sq_w_begin, sq_w_commit, sq_w_rollback, sq_w_create_zone, sq_w_delete_records, sq_w_insert_record, sq_w_insert_tags,
+    sq_w_insert_tinydns, sq_w_delete_tagdefs, sq_w_insert_tagdef, sq_w_delete_meta, sq_w_insert_meta, sq_w_set_view, sq_w_request_reload,
+    sq_w_zone_has_keys,
 };
 
 #endif /* KARIDNS_DB_SQLITE3 */

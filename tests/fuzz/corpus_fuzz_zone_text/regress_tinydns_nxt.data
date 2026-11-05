@@ -1,0 +1,12 @@
+Zfuzz.test:ns1.fuzz.test:hostmaster.fuzz.test:2026110501:3600:600:86400:300:300
+&fuzz192.0.2.30:300::l2
+@fuzz.test::mail.fuzz.test:10:300
++maiul.z.zftest:192.0.2.60:300
+'txt.fuzz.test:v=spf1 -all\072 \134 end:300
+'long.fuzz.test:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa[aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:300
+'empty.fuzz.test::300
+Cc.fuzz.test:www.fuzz.test:475
+^ptr.fuzz.test:host.example.:300
+3ip6.fuzz.test:20010db8000000000000000000000001:300
+:gen.fuzz.test:30^.*$!sip\072x!:.:300
+_ssh.fuzz.test:1:1:123456789abcdef0:300

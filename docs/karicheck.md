@@ -246,7 +246,7 @@ $ karicheck db /usr/local/etc/karidns/karidns.conf
 |---|---|
 | `karicheck` | The schema version, an integer. It is raised only when a field changes its meaning or goes away; a new field does not raise it. Read the fields you know and ignore the others. |
 | `version` | The version of `karicheck`. |
-| `command` | `conf`, `zones`, `zone` or `db`; `null` when the command line named none that exists. |
+| `command` | `conf`, `zones`, `zone` or `db` (`import` or `export` for `karidns-zone`); `null` when the command line named none that exists. |
 | `result` | `ok` (exit status 0), `fail` (1: problems found) or `usage` (2: usage error). |
 | `counts.error`, `counts.warning` | The messages of those severities, also the ones that did not fit into `messages`. |
 | `counts.checked`, `counts.skipped` | Zones checked and zones skipped (a type that has no zone file); for `db`, `checked` is the number of zones read. 0 for `conf`. |
@@ -258,6 +258,8 @@ $ karicheck db /usr/local/etc/karidns/karidns.conf
 | `messages[].file`, `.line` | Where the problem is: the file (`<stdin>` for standard input), and the line (a positive integer) or `null` when it is not known. For `db` both are `null`. |
 | `messages[].zone`, `.view` | The zone (absolute name, as `karicheck` shows it) and the view the message is about, or `null`. The view of a configuration without `view { }` is `__default__`; `null` when there is no view (a standalone zone file, a message about the configuration as a whole). |
 | `zones[]` | One entry per zone checked, in order: `zone`, `view` and `file` (`null` when unknown), `format` (`bind`, `tinydns` or `database`), `result` (`ok` or `fail`) and the numbers of `errors` and `warnings` found while it was checked. |
+
+`karidns-zone --json` ([`karidns-zone(1)`](karidns-zone.md)) writes the same document: the first key is `"karidns-zone": 1` instead of `"karicheck": 1`, `command` is `import` or `export`, `zones[]` has one entry per zone imported or exported (`file` is the input or output file), and the codes are the `db.import.*`, `db.export.*` and `db.zone.*` ones below (with `usage.*`, `io.*`, `conf.*` and `zone.*`).
 
 All strings are valid JSON strings: `"` and `\` are escaped, every control character (below U+0020, and U+007F) is written as `\u00XX`, and a byte that is not part of valid UTF-8 (a zone file, a file name or the database can hold anything) is replaced by U+FFFD. A text longer than 4096 bytes is cut and ends with `...`.
 
@@ -281,8 +283,9 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | Code | Severity | Meaning |
 |---|---|---|
 | `usage.command.missing` | error | no command was given |
-| `usage.command.unknown` | error | the command is not conf, zones, zone or db |
+| `usage.command.unknown` | error | the command is not one the tool has (karicheck: conf, zones, zone, db; karidns-zone: import, export) |
 | `usage.args` | error | a command got too few or too many arguments |
+| `usage.option` | error | an option is unknown, lacks its value, has a value that is not valid, or cannot be used with another option |
 | `io.open` | error | a file could not be opened |
 | `io.not-regular` | error | a path that must be a regular file is not one |
 | `io.read` | error | a file could not be read |
@@ -544,6 +547,37 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `db.settings.zone` | error | the settings of a zone do not parse |
 | `db.settings.combined` | error | the settings of a profile and of its zone together do not parse |
 | `db.settings.key-undefined` | error | the settings name a TSIG key that is not defined |
+| `db.import.open` | error | the database could not be opened for writing |
+| `db.import.schema` | error | the database lacks a table or a column the import needs |
+| `db.import.option` | error | an import option is not valid: a zone type, a view name or a record type of the types filter |
+| `db.import.zone-name` | error | the zone name is not valid, or the zone is not in the tinydns data file |
+| `db.import.rows` | error | the zone cannot be written as rows of the PowerDNS schema |
+| `db.import.serial` | error | the SOA serial of the file does not grow past the serial in the database (RFC 1982) |
+| `db.import.checks` | error | the zone checks found errors; nothing was written |
+| `db.import.strict` | error | the zone checks printed warnings and strict mode is on |
+| `db.import.busy` | error | another import holds the zone or the database; nothing was written |
+| `db.import.write` | error | a database write failed; the transaction was rolled back and nothing was written |
+| `db.import.keys` | warning | the zone has cryptokeys but the imported data is not presigned, so the loader refuses the zone |
+| `db.import.file-zone` | warning | the zone is also a file zone of the configuration, and the file zone is served |
+| `db.import.no-reload` | warning | a reload request was asked for but the database has no karidns_reload_requests table |
+| `db.import.dry-run` | info | a dry run: everything but the commit was done, and nothing was written |
+| `db.import.verify` | error | the zone read back from the transaction is not one the loader would load; the transaction was rolled back |
+| `db.import.not-primary` | warning | the zone in the database is not a primary zone, so the records written were not checked |
+| `db.import.done` | info | a zone was imported, with the number of RRsets added, replaced and deleted |
+| `db.import.summary` | info | the end of an import of several zones: how many were imported and how many failed |
+| `db.import.change` | note | an RRset the import adds, replaces or deletes (listed for --dry-run and --verbose) |
+| `db.export.open` | error | the database could not be opened |
+| `db.export.not-found` | error | the zone is not in the database, or not in the view asked for |
+| `db.export.zone-type` | error | the zone is not a primary zone: its records are not what the server serves |
+| `db.export.read` | error | the rows of the zone could not be read |
+| `db.export.zone` | error | the rows of the zone do not make a zone the server would load |
+| `db.export.write` | error | the zone could not be written as text |
+| `db.export.warning` | warning | the reader of the database zone printed a warning about the rows it exports |
+| `db.export.done` | info | a zone was exported to a file, or every zone to a directory |
+| `db.zone.no-source` | error | no database was named: no --sqlite3 or --conninfo-file, and no configuration with options { database { } } |
+| `db.zone.driver` | error | the database driver is not one this build of karidns-zone has |
+| `db.zone.output` | error | an output file or directory could not be used, created, written or renamed |
+| `db.zone.output-exists` | error | an output file exists and --force was not given |
 
 <!-- END CODES -->
 

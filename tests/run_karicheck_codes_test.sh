@@ -292,6 +292,44 @@ cp "$T/exc.txt" "$T/skip.txt"
 [ $IS_ROOT = 0 ] || cat "$T/nonroot.txt" >> "$T/skip.txt"
 [ $IS_ROOT = 1 ] || cat "$T/root.txt" >> "$T/skip.txt"
 [ $SWEEP = 1 ] || cat "$T/sweep.txt" >> "$T/skip.txt"
+# printed by the ZoneImporter / ZoneExporter (dns_zone_import.c, dns_zone_export.c) and by tools/karidns_zone.c, never by karicheck: tests/test_zone_import.c
+# checks that it printed each db.import.* and db.export.* of the library (all but db.import.rows, the rows of a parsed zone that cannot be written as
+# PowerDNS rows, and the three the tool prints), tests/run_karidns_zone_test.sh the codes of the tool
+cat > "$T/zonetool.txt" <<'EOF'
+db.export.not-found
+db.export.open
+db.export.read
+db.export.warning
+db.export.write
+db.export.zone
+db.export.zone-type
+db.import.busy
+db.import.checks
+db.import.done
+db.import.dry-run
+db.import.file-zone
+db.import.keys
+db.import.no-reload
+db.import.open
+db.import.option
+db.import.rows
+db.import.schema
+db.import.serial
+db.import.strict
+db.import.write
+db.import.zone-name
+db.import.verify
+db.import.not-primary
+db.import.summary
+db.import.change
+db.export.done
+db.zone.driver
+db.zone.no-source
+db.zone.output
+db.zone.output-exists
+usage.option
+EOF
+cat "$T/zonetool.txt" >> "$T/skip.txt"
 sort -u "$T/skip.txt" -o "$T/skip.txt"
 comm -23 "$T/all.txt" "$T/seen.txt" > "$T/missing.txt"
 comm -23 "$T/missing.txt" "$T/skip.txt" > "$T/need.txt"

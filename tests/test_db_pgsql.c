@@ -1651,6 +1651,143 @@ static void cleanup(void) {
     if (g_dir[0]) rm_tree(g_dir);
 }
 
+/* M2 (the 0.6.0 ZoneImporter): the write functions of an open_write() connection.  The loader's connections (open) are read only and refuse them. */
+static long pg_count(const char *sql) {
+    char b[64];
+    qv(g_admin, sql, b, sizeof(b));
+    return b[0] ? strtol(b, NULL, 10) : -1;
+}
+
+static int wr_count_cb(void *ud, int64_t did, const db_record_row_t *r) {
+    (void)did;
+    (void)r;
+    (*(int *)ud)++;
+    return 0;
+}
+
+static void test_writes(void) {
+    printf("write functions (open_write, w_*)\n");
+    Q("TRUNCATE domains, records, domainmetadata, karidns_changes, karidns_domain_views, karidns_record_tags, karidns_record_tinydns, karidns_zone_tagdefs, "
+      "karidns_reload_requests RESTART IDENTITY CASCADE");
+    db_source_t src = { "postgresql", NULL, g_ci, NULL, 300 };
+    char err[DB_ERRLEN];
+    db_conn_t *ro = open_drv(NULL), *c = NULL, *c2 = NULL;
+    CHECK(D->open_write(&c, &src, err, sizeof(err)) == 0 && D->open_write(&c2, &src, err, sizeof(err)) == 0);
+    if (!ro || !c || !c2) return;
+    db_schema_info_t si;
+    CHECK(D->check_schema(ro, &si) == 0 && D->check_schema(c, &si) == 0 && D->check_schema(c2, &si) == 0 && si.has_ext && si.has_domain_views && si.has_reload_requests);
+    CHECK(pg_count("SELECT count(*) FROM pg_stat_activity WHERE application_name = 'karidns-zone' AND datname = current_database()") == 2);
+    int64_t id = 0, did = 0, rid = 0, rid2 = 0;
+    bool has = true;
+    db_record_row_t row = { 0, 300, 10, false, false, false, "a.w.test", "MX", "mx.w.test", NULL };
+    db_record_row_t ent = { 0, 0, 0, true, true, false, "e.w.test", NULL, NULL, "ord1" };
+    /* a read only connection refuses everything; a writable one outside a transaction too */
+    CHECK(D->w_begin(ro, "w.test") == -1);
+    CHECK_HAS(D->errmsg(ro), "read only");
+    CHECK(D->w_commit(ro) == -1 && D->w_rollback(ro) == 0 && D->w_create_zone(ro, "w.test", NULL, &id) == -1);
+    CHECK(D->w_create_zone(c, "w.test", NULL, &id) == -1);
+    CHECK_HAS(D->errmsg(c), "no write transaction");
+    CHECK(D->w_delete_records(c, 1, NULL, 0) == -1 && D->w_insert_record(c, 1, &row, true, &id) == -1 && D->w_insert_tags(c, 1, "a", NULL) == -1);
+    CHECK(D->w_insert_tinydns(c, 1, 1, NULL, false) == -1 && D->w_delete_tagdefs(c, 1, NULL, NULL) == -1 && D->w_insert_tagdef(c, 1, "ecs", "t", "10.0.0.0/8") == -1);
+    CHECK(D->w_delete_meta(c, 1, "K") == -1 && D->w_insert_meta(c, 1, "K", "v") == -1 && D->w_set_view(c, 1, "v") == -1 && D->w_zone_has_keys(c, 1, &has) == -1);
+    CHECK(D->w_request_reload(c, NULL, false) == -1 && D->w_commit(c) == -1 && D->w_rollback(c) == 0);
+    /* a transaction: zone, records (an empty non-terminal too), tags, tinydns attributes, definitions, metadata, view, reload request */
+    CHECK(D->w_begin(c, "w.test") == 0 && D->w_begin(c, "w.test") == -1);
+    CHECK_HAS(D->errmsg(c), "already open");
+    CHECK(D->w_create_zone(c, "w.test", "MASTER", &did) == 0 && did > 0);
+    CHECK(D->w_insert_record(c, did, &row, false, &rid) == 0 && D->w_insert_record(c, did, &ent, true, &rid2) == 0 && rid > 0 && rid2 != rid);
+    CHECK(D->w_insert_tags(c, rid, "lan", "east") == 0 && D->w_insert_tags(c, rid2, NULL, "west") == 0 && D->w_insert_tinydns(c, rid, 1000, "l2", true) == 0);
+    CHECK(D->w_insert_tagdef(c, did, "location", "lan", "10.0.0.0/8") == 0 && D->w_insert_tagdef(c, did, "ecs", "east", "198.51.100.0/24") == 0);
+    CHECK(D->w_insert_meta(c, did, "PRESIGNED", "1") == 0 && D->w_insert_meta(c, did, "Other", "x") == 0);
+    CHECK(D->w_set_view(c, did, "v1") == 0 && D->w_set_view(c, did, "v1") == 0 && D->w_zone_has_keys(c, did, &has) == 0 && !has);
+    CHECK(D->w_request_reload(c, "w.test", true) == 0 && D->w_request_reload(c, NULL, false) == 0);
+    int n = 0;
+    CHECK(D->scan_records(c, &did, wr_count_cb, &n) == 0 && n == 2);              /* the zone's own reads inside the transaction see the writes */
+    CHECK(pg_count("SELECT count(*) FROM records") == 0);                           /* ... another session does not */
+    /* a second writer of the same zone waits lock_timeout and gives up cleanly; another zone is not held */
+    CHECK(D->w_begin(c2, "w.test") == DB_ERR_RETRY);
+    CHECK_HAS(D->errmsg(c2), "retry later");
+    CHECK(D->w_begin(c2, "other.test") == 0 && D->w_rollback(c2) == 0);
+    CHECK(D->w_commit(c) == 0);
+    CHECK(pg_count("SELECT count(*) FROM records") == 2 && pg_count("SELECT prio FROM records WHERE type = 'MX'") == 10);
+    CHECK(pg_count("SELECT count(*) FROM records WHERE type IS NULL AND ordername = 'ord1' AND ttl IS NULL AND prio IS NULL AND auth") == 1);
+    CHECK(pg_count("SELECT count(*) FROM records WHERE type = 'MX' AND NOT auth AND NOT disabled") == 1);
+    CHECK(pg_count("SELECT count(*) FROM karidns_record_tags") == 2 && pg_count("SELECT count(*) FROM karidns_record_tinydns WHERE countdown AND loc = 'l2'") == 1);
+    CHECK(pg_count("SELECT count(*) FROM karidns_domain_views") == 1 && pg_count("SELECT count(*) FROM karidns_changes") > 0);
+    CHECK(pg_count("SELECT count(*) FROM karidns_reload_requests WHERE zone = 'w.test' AND force") == 1 && pg_count("SELECT count(*) FROM karidns_reload_requests WHERE zone IS NULL") == 1);
+    /* deletes: by id (the extension rows first; an id of another zone deletes nothing), a whole zone, definitions by kind and tag, metadata by kind */
+    int64_t yid = 0, y = 0;
+    CHECK(D->w_begin(c, "y.test") == 0 && D->w_create_zone(c, "y.test", NULL, &y) == 0 && D->w_insert_record(c, y, &row, true, &yid) == 0 && D->w_commit(c) == 0);
+    int64_t both[2] = { rid, yid };
+    CHECK(D->w_begin(c, "w.test") == 0 && D->w_delete_records(c, did, both, 2) == 0 && D->w_commit(c) == 0);
+    CHECK(pg_count("SELECT count(*) FROM records") == 2);                          /* the empty non-terminal of w.test and the record of y.test */
+    CHECK(pg_count("SELECT count(*) FROM karidns_record_tags") == 1 && pg_count("SELECT count(*) FROM karidns_record_tinydns") == 0);
+    CHECK(D->w_begin(c, "w.test") == 0 && D->w_delete_records(c, did, NULL, 0) == 0 && D->w_commit(c) == 0);
+    CHECK(pg_count("SELECT count(*) FROM records") == 1 && pg_count("SELECT count(*) FROM karidns_record_tags") == 0);
+    CHECK(D->w_begin(c, "w.test") == 0 && D->w_delete_tagdefs(c, did, "location", "LAN") == 0 && D->w_commit(c) == 0);
+    CHECK(pg_count("SELECT count(*) FROM karidns_zone_tagdefs") == 1);
+    CHECK(D->w_begin(c, "w.test") == 0 && D->w_delete_tagdefs(c, did, NULL, NULL) == 0 && D->w_delete_meta(c, did, "presigned") == 0 && D->w_commit(c) == 0);
+    CHECK(pg_count("SELECT count(*) FROM karidns_zone_tagdefs") == 0 && pg_count("SELECT count(*) FROM domainmetadata") == 1);
+    /* more ids than one statement takes */
+    CHECK(D->w_begin(c, "y.test") == 0);
+    int64_t *ids = malloc(2300 * sizeof(*ids));
+    db_record_row_t big = { 0, 60, 0, false, true, false, "b.y.test", "A", "192.0.2.1", NULL };
+    for (int i = 0; ids && i < 2300; i++) CHECK(D->w_insert_record(c, y, &big, true, &ids[i]) == 0);
+    CHECK(ids && D->w_delete_records(c, y, ids, 2300) == 0 && D->w_commit(c) == 0);
+    free(ids);
+    CHECK(pg_count("SELECT count(*) FROM records") == 1);
+    /* statements that fail abort the transaction; w_rollback ends it and the connection is usable again */
+    CHECK(D->w_begin(c, "w.test") == 0 && D->w_insert_meta(c, did, "K", "v") == 0);
+    CHECK(D->w_create_zone(c, "w.test", NULL, &id) == -1);                              /* the name exists */
+    CHECK(D->errmsg(c)[0] != '\0');
+    CHECK(D->w_insert_tags(c, 1, "a", NULL) == -1);                                     /* the transaction is aborted */
+    CHECK(D->w_rollback(c) == 0 && D->w_rollback(c) == 0);
+    CHECK(pg_count("SELECT count(*) FROM domainmetadata") == 1 && pg_count("SELECT count(*) FROM domains") == 2);
+    CHECK(D->w_begin(c, "w.test") == 0 && D->w_commit(c) == 0);
+    D->close(c2);
+    D->close(ro);
+    /* a lost connection: DB_ERR_RETRY */
+    CHECK(D->w_begin(c, "w.test") == 0);
+    {
+        char sql[200];
+        snprintf(sql, sizeof(sql), "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'karidns-zone' AND datname = current_database()");
+        Q(sql);
+    }
+    CHECK(D->w_create_zone(c, "lost.test", NULL, &id) == DB_ERR_RETRY);
+    CHECK(D->w_rollback(c) == DB_ERR_RETRY);
+    D->close(c);
+    CHECK(D->open_write(&c, &src, err, sizeof(err)) == 0 && D->w_begin(c, "x.test") == 0 && D->w_rollback(c) == 0);
+    D->close(c);
+    Q("TRUNCATE domains, records, domainmetadata, karidns_changes, karidns_domain_views, karidns_record_tags, karidns_record_tinydns, karidns_zone_tagdefs, "
+      "karidns_reload_requests RESTART IDENTITY CASCADE");
+    /* the write functions of a database without the extension tables: the PowerDNS schema alone in a schema of its own */
+    Q("DROP SCHEMA IF EXISTS wr_plain CASCADE; CREATE SCHEMA wr_plain");
+    {
+        char path[500];
+        snprintf(path, sizeof(path), "%s/pdns_schema.pgsql.sql", g_root);
+        char *schema = slurp(path);
+        CHECK(schema != NULL);
+        if (schema) {
+            PGresult *r = PQexec(g_admin, "SET search_path TO wr_plain");
+            PQclear(r);
+            CHECK(qx(g_admin, schema));
+            r = PQexec(g_admin, "RESET search_path");
+            PQclear(r);
+            free(schema);
+        }
+    }
+    src.schema = "wr_plain";
+    c = NULL;
+    CHECK(D->open_write(&c, &src, err, sizeof(err)) == 0 && D->check_schema(c, &si) == 0 && !si.has_ext && !si.has_domain_views && !si.has_reload_requests);
+    CHECK(D->w_begin(c, "x.test") == 0 && D->w_create_zone(c, "x.test", NULL, &did) == 0 && D->w_insert_record(c, did, &row, true, &rid) == 0);
+    CHECK(D->w_insert_tags(c, rid, "a", NULL) == DB_ERR_UNAVAILABLE && D->w_insert_tinydns(c, rid, 1, NULL, false) == DB_ERR_UNAVAILABLE);
+    CHECK(D->w_delete_tagdefs(c, did, NULL, NULL) == DB_ERR_UNAVAILABLE && D->w_insert_tagdef(c, did, "ecs", "t", "10.0.0.0/8") == DB_ERR_UNAVAILABLE);
+    CHECK(D->w_set_view(c, did, "v") == DB_ERR_UNAVAILABLE && D->w_request_reload(c, "x.test", false) == DB_ERR_UNAVAILABLE);
+    CHECK(D->w_delete_records(c, did, &rid, 1) == 0 && D->w_delete_records(c, did, NULL, 0) == 0 && D->w_commit(c) == 0);
+    D->close(c);
+    Q("DROP SCHEMA wr_plain CASCADE");
+}
+
 int main(int argc, char **argv) {
     snprintf(g_root, sizeof(g_root), "%s", argc > 1 ? argv[1] : "tests/db");
     const char *pg = getenv("KARIDNS_TEST_PG");
@@ -1725,6 +1862,7 @@ int main(int argc, char **argv) {
     test_requests();
     test_status();
     test_v1_and_migration();
+    test_writes();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

@@ -17,8 +17,9 @@
 
 /* ---- usage ---- */
 X (USAGE_COMMAND_MISSING, "usage.command.missing", 'E', "no command was given")
-X (USAGE_COMMAND_UNKNOWN, "usage.command.unknown", 'E', "the command is not conf, zones, zone or db")
+X (USAGE_COMMAND_UNKNOWN, "usage.command.unknown", 'E', "the command is not one the tool has (karicheck: conf, zones, zone, db; karidns-zone: import, export)")
 X (USAGE_ARGS, "usage.args", 'E', "a command got too few or too many arguments")
+X (USAGE_OPTION, "usage.option", 'E', "an option is unknown, lacks its value, has a value that is not valid, or cannot be used with another option")
 
 /* ---- io and internal ---- */
 X (IO_OPEN, "io.open", 'E', "a file could not be opened")
@@ -294,3 +295,38 @@ X (DB_SETTINGS_PROFILE, "db.settings.profile", 'E', "the settings text of a prof
 X (DB_SETTINGS_ZONE, "db.settings.zone", 'E', "the settings of a zone do not parse")
 X (DB_SETTINGS_COMBINED, "db.settings.combined", 'E', "the settings of a profile and of its zone together do not parse")
 X (DB_SETTINGS_KEY_UNDEFINED, "db.settings.key-undefined", 'E', "the settings name a TSIG key that is not defined")
+
+/* ---- db: the ZoneImporter (dns_zone_import.c) and the ZoneExporter (dns_zone_export.c) ---- */
+X (DB_IMPORT_OPEN, "db.import.open", 'E', "the database could not be opened for writing")
+X (DB_IMPORT_SCHEMA, "db.import.schema", 'E', "the database lacks a table or a column the import needs")
+X (DB_IMPORT_OPTION, "db.import.option", 'E', "an import option is not valid: a zone type, a view name or a record type of the types filter")
+X (DB_IMPORT_ZONE_NAME, "db.import.zone-name", 'E', "the zone name is not valid, or the zone is not in the tinydns data file")
+X (DB_IMPORT_ROWS, "db.import.rows", 'E', "the zone cannot be written as rows of the PowerDNS schema")
+X (DB_IMPORT_SERIAL, "db.import.serial", 'E', "the SOA serial of the file does not grow past the serial in the database (RFC 1982)")
+X (DB_IMPORT_CHECKS, "db.import.checks", 'E', "the zone checks found errors; nothing was written")
+X (DB_IMPORT_STRICT, "db.import.strict", 'E', "the zone checks printed warnings and strict mode is on")
+X (DB_IMPORT_BUSY, "db.import.busy", 'E', "another import holds the zone or the database; nothing was written")
+X (DB_IMPORT_WRITE, "db.import.write", 'E', "a database write failed; the transaction was rolled back and nothing was written")
+X (DB_IMPORT_KEYS, "db.import.keys", 'W', "the zone has cryptokeys but the imported data is not presigned, so the loader refuses the zone")
+X (DB_IMPORT_FILE_ZONE, "db.import.file-zone", 'W', "the zone is also a file zone of the configuration, and the file zone is served")
+X (DB_IMPORT_NO_RELOAD, "db.import.no-reload", 'W', "a reload request was asked for but the database has no karidns_reload_requests table")
+X (DB_IMPORT_DRY_RUN, "db.import.dry-run", 'I', "a dry run: everything but the commit was done, and nothing was written")
+X (DB_IMPORT_VERIFY, "db.import.verify", 'E', "the zone read back from the transaction is not one the loader would load; the transaction was rolled back")
+X (DB_IMPORT_NOT_PRIMARY, "db.import.not-primary", 'W', "the zone in the database is not a primary zone, so the records written were not checked")
+X (DB_IMPORT_DONE, "db.import.done", 'I', "a zone was imported, with the number of RRsets added, replaced and deleted")
+X (DB_IMPORT_SUMMARY, "db.import.summary", 'I', "the end of an import of several zones: how many were imported and how many failed")
+X (DB_IMPORT_CHANGE, "db.import.change", 'N', "an RRset the import adds, replaces or deletes (listed for --dry-run and --verbose)")
+X (DB_EXPORT_OPEN, "db.export.open", 'E', "the database could not be opened")
+X (DB_EXPORT_NOT_FOUND, "db.export.not-found", 'E', "the zone is not in the database, or not in the view asked for")
+X (DB_EXPORT_ZONE_TYPE, "db.export.zone-type", 'E', "the zone is not a primary zone: its records are not what the server serves")
+X (DB_EXPORT_READ, "db.export.read", 'E', "the rows of the zone could not be read")
+X (DB_EXPORT_ZONE, "db.export.zone", 'E', "the rows of the zone do not make a zone the server would load")
+X (DB_EXPORT_WRITE, "db.export.write", 'E', "the zone could not be written as text")
+X (DB_EXPORT_WARNING, "db.export.warning", 'W', "the reader of the database zone printed a warning about the rows it exports")
+X (DB_EXPORT_DONE, "db.export.done", 'I', "a zone was exported to a file, or every zone to a directory")
+
+/* ---- db: the command line tool karidns-zone (tools/karidns_zone.c) ---- */
+X (DB_ZONE_NO_SOURCE, "db.zone.no-source", 'E', "no database was named: no --sqlite3 or --conninfo-file, and no configuration with options { database { } }")
+X (DB_ZONE_DRIVER, "db.zone.driver", 'E', "the database driver is not one this build of karidns-zone has")
+X (DB_ZONE_OUTPUT, "db.zone.output", 'E', "an output file or directory could not be used, created, written or renamed")
+X (DB_ZONE_OUTPUT_EXISTS, "db.zone.output-exists", 'E', "an output file exists and --force was not given")

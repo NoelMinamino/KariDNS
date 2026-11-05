@@ -1016,7 +1016,7 @@ A zone file with `$LOCATION` / `$ECS-SUBNET` tags or a tinydns data file is not 
 
 **What does not carry over.** (1) The SOA serial that a tinydns `.` line takes from the data file's modification time: the database stores the number the importer saw; whoever edits the zone bumps it (a `Z` line carries an explicit serial). (2) The data file as text: comments, line grouping, one line that writes into two zones (`=` makes an A and a PTR: two independent rows in two zones), a data file with many zones (the importer writes one zone per SOA). (3) Several SOA rows for the apex, and tags or tinydns attributes (time stamp, location) on a SOA row (milestone B8t-1): `karidns-dbloader` reads them like any other row (the SOA rows must have one serial; the SOA without attributes, else the first row, is the reference SOA and gives the zone serial; a presigned zone cannot have them) and the rules of "Several SOA records" below apply to a zone file. Milestone B8t-2: the stream between the loader and the Backend is the Extended AXFR version 3 format, which carries them (the frame is the reference SOA, `SOA_SET` announces the number of SOA rows and each SOA row is a body RR in a wrapper record, with its tinydns attributes and tags). The Backend checks what the loader sent: every SOA at the apex, one serial (the one `ZONE_BEGIN` declares), no two SOA rows for the same clients, the opening SOA is the reference SOA, the number announced; a zone that fails a check is rejected and the last good version keeps serving. At most 4096 SOA rows. (4) `karidns_*` rows of a record that is disabled or does not exist are ignored with a warning.
 
-**Importer.** `tests/db/zone2sql` (the seed of the later ZoneImporter) writes all of this: `zone2sql --dialect sqlite3|pgsql zone` for a zone file with tags, `zone2sql --format tinydns data` for a tinydns data file; apply `db/karidns_ext.*.sql` first.
+$1[`karidns-zone(1)`](karidns-zone.md) writes all of this: `karidns-zone import <zone> <file>` for a zone file with tags, `karidns-zone import --all data` for a tinydns data file (apply `db/karidns_ext.*.sql` first), and `karidns-zone export` writes a zone, or every zone, back as a zone file. (`tests/db/zone2sql`, which prints the same rows as SQL, is the test tool.)
 
 ### Address match lists (ACLs)
 
@@ -1410,7 +1410,9 @@ The default `file-format` is the master file format of RFC 1035 §5 as BIND read
   Type and class mnemonics are case-insensitive (`in a`, `IN Mx`). Unknown types and classes use the RFC 3597
   forms `TYPEnn`, `CLASSnn` and `\# <length> <hex>`. The generic form of a type the server knows must carry RDATA
   that is valid for that type (RFC 3597 §5): `PTR \# 0`, `NS \# 3 010203` or a compressed name in the hex are
-  zone file errors, reported by `karicheck zone` at the record's line. Zero-length RDATA is legal for a type
+  zone file errors, reported by `karicheck zone` at the record's line. The same rule applies to the generic `:` lines of a
+  tinydns data file (`:name:type:rdata`): `:x.example:1:\001` (an A of one octet) is an error at that line. tinydns itself
+  stores any octets there; KariDNS used to serve such RDATA as it was. Zero-length RDATA is legal for a type
   without a defined format (`TYPE65534 \# 0`) and is transferred (AXFR/IXFR) and served like any other record.
 - **`\# <length> <hex>`** (RFC 3597 §5): the hex digits may be split over any number of tokens, for every type, as far as the
   limit of a record line allows (512 fields; a line with more is a zone file error, use `( )` and fewer, longer tokens).
@@ -1587,14 +1589,15 @@ For complete configuration syntax, query evaluation flows, and Extended AXFR det
 `/var/run/karidns/karidns.pid`
 : Default process ID file when daemonized.
 
-`/usr/local/libexec/karidns-dbloader`
-: The database loader (the packages `karidns-sqlite3`, `karidns-postgresql` and `karidns-db`; the default `loader-path`).
+$1
+`/usr/local/bin/karidns-zone`
+: The zone importer and exporter (the same packages; [`karidns-zone(1)`](karidns-zone.md)).
 
 `/usr/local/share/karidns/db/`
-: The SQL files for the databases (`karidns_ext.*.sql`, `karidns_ext_v1_to_v2.*.sql`, `karidns_loader_role.pgsql.sql`); `db/` in a source tree. See [`karidns-dbloader(8)`](karidns-dbloader.md).
+: The SQL files for the databases (`karidns_ext.*.sql`, `karidns_ext_v1_to_v2.*.sql`, `karidns_loader_role.pgsql.sql`, `karidns_writer_role.pgsql.sql`); `db/` in a source tree. See [`karidns-dbloader(8)`](karidns-dbloader.md).
 
 `/usr/local/share/doc/karidns/`
-: These manuals (`karidns.md`, `karictl.md`, `karicheck.md`, `dag.md`, `dag_replay.md` and, with the loader, `karidns-dbloader.md`).
+: These manuals (`karidns.md`, `karictl.md`, `karicheck.md`, `dag.md`, `dag_replay.md` and, with the loader, `karidns-dbloader.md` and `karidns-zone.md`).
 
 ---
 
@@ -1602,7 +1605,7 @@ For complete configuration syntax, query evaluation flows, and Extended AXFR det
 
 - [`karictl(8)`](karictl.md) — KariDNS server management and control utility
 - [`karicheck(1)`](karicheck.md) — Configuration and zone file validation utility
-- [`karidns-dbloader(8)`](karidns-dbloader.md) — The database loader: drivers, SQL files, privileges, packages, measurements
+$1- [`karidns-zone(1)`](karidns-zone.md) — Import and export of zones in a PowerDNS database (modes, serial rules, views, the writer role, backups)
 - [`dag(1)`](dag.md) — DNS anomaly generator and test client
 - [`KariDNS 'type program' Zone Guide`](KariDNS_how_to_use_type_program_zone.md) — Complete guide to external dynamic program zone plugins (IPC specs, Perl/Python/C/Rust/Go implementations)
 - [`KariDNS Client Geolocation & Subnet Steering Guide`](KariDNS_How_to_use_ECS_and_location.md) — Comprehensive guide for BIND $LOCATION, $ECS-SUBNET, tinydns location, and Extended AXFR
