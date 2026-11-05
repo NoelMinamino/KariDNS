@@ -60,6 +60,7 @@
 #include "dns_db_driver.h"
 #include "dns_db_stream.h"
 #include "dns_db_checkproto.h"
+#include "dns_diag.h"
 #include "dns_pdns_reader.h"
 #include "dns_zone_lint.h"
 
@@ -88,8 +89,9 @@ static unsigned g_chk_errors, g_chk_warnings;
 static char g_chk_zone[DNS_NAME_TEXT_SIZE + 16];
 static int64_t g_chk_id;
 
-/* one finding: level E W I O D, text of any bytes (cut at CHK_TEXT_MAX, escaped) */
-static void chk_line(char level, const char *text) {
+/* one finding: level E W I O D, text of any bytes (cut at CHK_TEXT_MAX, escaped); code: the code of the zone check that found it (a fifth
+ * field, dns_diag_codes.h), DC_NONE for a finding of the loader itself */
+static void chk_line_coded(char level, dns_diag_code_t code, const char *text) {
     char zone[4 * DNS_NAME_TEXT_SIZE + 4], body[4 * CHK_TEXT_MAX + 8];
     size_t tl = strlen(text);
     bool cut = false;
@@ -97,7 +99,13 @@ static void chk_line(char level, const char *text) {
     else if (level == 'W') g_chk_warnings++;
     chk_escape(g_chk_zone, strlen(g_chk_zone), zone, sizeof(zone), NULL);
     chk_escape(text, tl > CHK_TEXT_MAX ? CHK_TEXT_MAX : tl, body, sizeof(body), &cut);
-    fprintf(g_chk_out, "%c\t%s\t%lld\t%s%s\n", level, zone, (long long)g_chk_id, body, tl > CHK_TEXT_MAX || cut ? "..." : "");
+    fprintf(g_chk_out, "%c\t%s\t%lld\t%s%s", level, zone, (long long)g_chk_id, body, tl > CHK_TEXT_MAX || cut ? "..." : "");
+    if (code != DC_NONE) fprintf(g_chk_out, "\t%s", dns_diag_code_name(code));
+    fputc('\n', g_chk_out);
+}
+
+static void chk_line(char level, const char *text) {
+    chk_line_coded(level, DC_NONE, text);
 }
 
 static void chk_linef(char level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -1321,9 +1329,9 @@ static const char *chk_strip_zone(const char *msg) {
     return msg;
 }
 
-static void chk_sink(void *ud, char level, const char *text) {
+static void chk_sink(void *ud, char level, dns_diag_code_t code, const char *text) {
     (void)ud;
-    chk_line(level, text);
+    chk_line_coded(level, code, text);
 }
 
 /* the first line of a zone: Z <zone> <id> <kind> <view>... (the views karidns_domain_views names, "*" = no row) */

@@ -8,9 +8,11 @@
  * the PowerDNS reader built from the rows of a database, so a zone file and a database zone are judged by one implementation.
  * Ordinary process code (malloc allowed, CLAUDE.md Rules 1-2 do not apply).
  *
- * Every finding goes through kc_error() / kc_warning() / kc_info() / kc_ok() / kc_detail() with a kc_tally_t.  Without a sink they
- * print "[ERROR] ..." / "[WARNING] ..." on stderr and "[INFO] ..." / "[OK] ..." on stdout, as karicheck always did, and count in the
- * tally.  With a sink the text (the printf result without its final line feed) goes to the sink instead, and nothing is printed.
+ * Every finding goes through kc_error() / kc_warning() / kc_info() / kc_ok() / kc_detail() with a kc_tally_t; kc_error, _warning, _info and
+ * _finding take the code of the message (dns_diag_codes.h).  Without a sink they print "[ERROR] ..." / "[WARNING] ..." on stderr and
+ * "[INFO] ..." / "[OK] ..." on stdout, as karicheck always did (through dns_diag(): karicheck --json keeps them instead), and count in
+ * the tally.  With a sink the code and the text (the printf result without its final line feed) go to the sink instead, and nothing is
+ * printed.
  */
 
 #include <stdbool.h>
@@ -18,9 +20,10 @@
 #include "dns_zone_parser.h"
 #include "dns_wire.h"
 #include "dns_config_parser.h"   /* CHK_*, ZC_* */
+#include "dns_diag.h"            /* the codes, and where the messages go */
 
 /* level: 'E' error, 'W' warning, 'I' info, 'O' ok, 'D' detail (a continuation line of the previous finding) */
-typedef void (*kc_sink_fn)(void *ud, char level, const char *text);
+typedef void (*kc_sink_fn)(void *ud, char level, dns_diag_code_t code, const char *text);   /* code: DC_NONE for 'O' and 'D' */
 
 typedef struct {
     int errors;
@@ -30,9 +33,9 @@ typedef struct {
 } kc_tally_t;
 
 /* t == NULL: print without counting (error / warning) */
-void kc_error(kc_tally_t *t, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
-void kc_warning(kc_tally_t *t, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
-void kc_info(kc_tally_t *t, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+void kc_error(kc_tally_t *t, dns_diag_code_t code, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+void kc_warning(kc_tally_t *t, dns_diag_code_t code, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+void kc_info(kc_tally_t *t, dns_diag_code_t code, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 void kc_ok(kc_tally_t *t, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void kc_detail(kc_tally_t *t, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 /* The check-* policy as text, "mx-cname=warn,integrity=fail,names=ignore" (names = check-names of a primary zone), to hand to karidns-dbloader
@@ -41,7 +44,7 @@ void kc_detail(kc_tally_t *t, const char *fmt, ...) __attribute__((format(printf
 int zone_lint_policy_parse(const char *spec, uint8_t chk[ZC_N], uint8_t *names, char *err, size_t errlen);
 size_t zone_lint_policy_format(const uint8_t chk[ZC_N], uint8_t names, char *out, size_t cap);
 /* A finding whose severity a check-* option sets: sev = CHK_FAIL / CHK_WARN / CHK_IGNORE, or CHK_DEFAULT = dflt ('E', 'W', or 'N' for nothing) */
-void kc_finding(kc_tally_t *t, uint8_t sev, char dflt, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+void kc_finding(kc_tally_t *t, uint8_t sev, char dflt, dns_diag_code_t code, const char *fmt, ...) __attribute__((format(printf, 5, 6)));
 
 /* RFC 2181 5.2 (what: "zone file" or "database", for the message): RRs of one RRset with different TTLs, on the raw data of the source (call before the TTLs are harmonized:
  * before build_zone_index(arena, true); a zone the reader built (build_zone_index(false)) has its TTLs as written) */

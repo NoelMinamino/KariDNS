@@ -347,7 +347,8 @@ static void test_karictl(void) {
  * (the runs above only execute them: here a zone is fed to the checks and the findings are compared) */
 typedef struct { char text[16384]; } lint_out_t;
 
-static void lint_sink(void *ud, char level, const char *text) {
+static void lint_sink(void *ud, char level, dns_diag_code_t code, const char *text) {
+    (void)code;
     lint_out_t *o = ud;
     size_t l = strlen(o->text);
     snprintf(o->text + l, sizeof(o->text) - l, "%c %s\n", level, text);
@@ -527,6 +528,9 @@ int main(void) {
     wd_start("test_coverage_sweep_tools", 300);
     printf("=== Tools Coverage Sweep Tests ===\n");
     signal(SIGPIPE, SIG_IGN);
+#ifdef KARIDNS_DIAG_CODELOG        /* make test_coverage_sweep_tools-codelog */
+    if (getenv("KARICHECK_CODE_LOG")) dns_diag_code_log(getenv("KARICHECK_CODE_LOG"));     /* tests/run_karicheck_codes_test.sh: the codes the lint checks hand to the sink below */
+#endif
     snprintf(g_tmp, sizeof(g_tmp), "/tmp/ktools_XXXXXX");
     if (!mkdtemp(g_tmp)) { perror("mkdtemp"); return 1; }
     WD_PHASE("test_karicheck"); test_karicheck();

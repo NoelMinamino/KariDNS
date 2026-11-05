@@ -24,9 +24,10 @@ void syslog(int priority, const char *format, ...) {
 #undef main
 
 /* the findings go nowhere (libFuzzer's own messages use stderr, which must stay open) */
-static void null_sink(void *ud, char level, const char *text) {
+static void null_sink(void *ud, char level, dns_diag_code_t code, const char *text) {
     (void)ud;
     (void)level;
+    (void)code;
     (void)text;
 }
 
