@@ -56,10 +56,17 @@ make clean
 make VERSION="${VERSION}" MARCH_FLAGS= all
 if [ -n "$DRIVERS" ]; then
     make VERSION="${VERSION}" MARCH_FLAGS= DB_DRIVERS="${DRIVERS}" karidns-dbloader
+    # karidns-zone (the importer and exporter, docs/karidns-zone.md) is linked with the same drivers
+    make VERSION="${VERSION}" MARCH_FLAGS= DB_DRIVERS="${DRIVERS}" karidns-zone
     # the loader must report exactly the drivers of the package (the server refuses a driver the loader does not have)
     GOT=$(./karidns-dbloader --drivers | tr '\n' ' ' | sed 's/ $//')
     if [ "$GOT" != "$DRIVERS" ]; then
         echo "ERROR: karidns-dbloader has the drivers '${GOT}', expected '${DRIVERS}'" >&2
+        exit 1
+    fi
+    GOT=$(./karidns-zone --version | sed -n 's/.*(drivers: \(.*\))$/\1/p' | tr -d ',')
+    if [ "$GOT" != "$DRIVERS" ]; then
+        echo "ERROR: karidns-zone has the drivers '${GOT}', expected '${DRIVERS}'" >&2
         exit 1
     fi
 fi
@@ -69,7 +76,7 @@ fi
 # dependency, so a package linked against it fails to install on hosts without
 # it ("Missing shlib libcrypto.so.12"). Set ALLOW_PORTS_OPENSSL=1 to override.
 if [ "${ALLOW_PORTS_OPENSSL:-0}" != "1" ]; then
-    for b in karidns karictl karicheck dag $( [ -n "$DRIVERS" ] && echo karidns-dbloader ); do
+    for b in karidns karictl karicheck dag $( [ -n "$DRIVERS" ] && echo karidns-dbloader karidns-zone ); do
         if ldd "$b" 2>/dev/null | grep -E 'lib(crypto|ssl)\.so' | grep -q '/usr/local/'; then
             echo "ERROR: $b links the ports OpenSSL:" >&2
             ldd "$b" | grep -E 'lib(crypto|ssl)\.so' >&2
@@ -155,13 +162,18 @@ if [ -n "$DRIVERS" ]; then
     mkdir -p "${STAGE_DIR}/usr/local/share/karidns/db"
     install -m 0555 karidns-dbloader "${STAGE_DIR}/usr/local/libexec/karidns-dbloader"
     install -m 0644 docs/karidns-dbloader.md "${STAGE_DIR}/usr/local/share/doc/karidns/karidns-dbloader.md"
+    # karidns-zone runs as an ordinary user, so it goes to bin (not to libexec like the loader)
+    install -m 0755 karidns-zone "${STAGE_DIR}/usr/local/bin/karidns-zone"
+    install -m 0644 docs/karidns-zone.md "${STAGE_DIR}/usr/local/share/doc/karidns/karidns-zone.md"
     DB_FILES="    /usr/local/libexec/karidns-dbloader: { uname: \"root\", gname: \"wheel\", perm: \"0555\" },
+    /usr/local/bin/karidns-zone: { uname: \"root\", gname: \"wheel\", perm: \"0555\" },
+    /usr/local/share/doc/karidns/karidns-zone.md: { uname: \"root\", gname: \"wheel\", perm: \"0644\" },
     /usr/local/share/doc/karidns/karidns-dbloader.md: { uname: \"root\", gname: \"wheel\", perm: \"0644\" },"
     SQL_FILES=""
     for d in $DRIVERS; do
         case "$d" in
             sqlite3)    SQL_FILES="${SQL_FILES} db/karidns_ext.sqlite3.sql db/karidns_ext_v1_to_v2.sqlite3.sql" ;;
-            postgresql) SQL_FILES="${SQL_FILES} db/karidns_ext.pgsql.sql db/karidns_ext_v1_to_v2.pgsql.sql db/karidns_loader_role.pgsql.sql" ;;
+            postgresql) SQL_FILES="${SQL_FILES} db/karidns_ext.pgsql.sql db/karidns_ext_v1_to_v2.pgsql.sql db/karidns_loader_role.pgsql.sql db/karidns_writer_role.pgsql.sql" ;;
         esac
     done
     for f in $SQL_FILES; do
@@ -169,7 +181,7 @@ if [ -n "$DRIVERS" ]; then
         DB_FILES="${DB_FILES}
     /usr/local/share/karidns/db/$(basename "$f"): { uname: \"root\", gname: \"wheel\", perm: \"0644\" },"
     done
-    DB_DESC="This package includes karidns-dbloader with the driver(s): ${DRIVERS}."
+    DB_DESC="This package includes karidns-dbloader and karidns-zone with the driver(s): ${DRIVERS}."
 fi
 
 echo "==> Generating +MANIFEST..."

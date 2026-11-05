@@ -60,9 +60,9 @@ Use `pkg add -f` to replace an already installed version in place.
 - **Manuals:**
   - `/usr/local/share/doc/karidns/` (`karidns.md`, `karictl.md`, `karicheck.md`, `dag.md`, `dag_replay.md`)
 - **Database packages only** (§2.5):
-  - `/usr/local/libexec/karidns-dbloader` (the database loader, root:wheel, 0555)
+$1  - `/usr/local/bin/karidns-zone` (the zone importer and exporter, with the same drivers, root:wheel, 0555)
   - `/usr/local/share/karidns/db/*.sql` (extension tables, change-log triggers, role script of the packaged drivers)
-  - `/usr/local/share/doc/karidns/karidns-dbloader.md`
+$1  - `/usr/local/share/doc/karidns/karidns-zone.md`
 
 ### 2.3 Starting the Service
 1. Copy the configuration and sample zone, then edit them (`user`, `group`, secrets, zones):

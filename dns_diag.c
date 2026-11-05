@@ -167,6 +167,7 @@ typedef struct {
 
 static struct {
     bool json, suspended;
+    char tool[24];              /* the first key of the document: "karicheck", or the tool that called dns_diag_json_tool() */
     char command[16], version[32];
     diag_msg_t *msgs;
     size_t nmsgs, cmsgs, dropped;
@@ -207,6 +208,7 @@ void dns_diag_code_log(const char *path) {
 void dns_diag_json_start(const char *command, const char *version) {
     dns_diag_json_reset();
     g.json = true;
+    snprintf(g.tool, sizeof(g.tool), "karicheck");
     snprintf(g.command, sizeof(g.command), "%s", command ? command : "");
     snprintf(g.version, sizeof(g.version), "%s", version ? version : "");
 }
@@ -228,6 +230,10 @@ void dns_diag_json_reset(void) {
     }
     free(g.zones);
     memset(&g, 0, sizeof(g));
+}
+
+void dns_diag_json_tool(const char *tool) {
+    snprintf(g.tool, sizeof(g.tool), "%s", tool ? tool : "karicheck");
 }
 
 void dns_diag_set_file(const char *file) {
@@ -466,7 +472,9 @@ static void json_int_or_null(FILE *fp, long v) {
 
 int dns_diag_json_finish(FILE *fp, int status) {
     const char *result = status == 0 ? "ok" : status == 2 ? "usage" : "fail";
-    fputs("{\n  \"karicheck\": 1,\n  \"version\": ", fp);
+    fputs("{\n  ", fp);
+    json_str(fp, g.tool[0] ? g.tool : "karicheck");
+    fputs(": 1,\n  \"version\": ", fp);
     json_str(fp, g.version);
     fputs(",\n  \"command\": ", fp);
     json_str(fp, g.command[0] ? g.command : NULL);

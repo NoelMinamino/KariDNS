@@ -1,0 +1,15 @@
+$ORIGIN fuzz.test.
+$TTL 300
+@ SOA ns1 hostmaster ( 2026102401 3600 600 86400 300 )
+@ NS ns1
+ns1 A 192.0.2.53
+$LOCATION-TAG lan 127.0.0.2/32 127.0.0.3/32
+$ECS-SUBNET-TAG east 198.51.100.0/24 2001:db8:1::/48
+www A 192.0.2.1
+$LOCATION lan
+www A 192.0.2.10
+$ECS-SUBNET east
+www TXT "lan and east"
+$LOCATION none
+$ECS-SUBNET none
+mail A 192.0.2.11

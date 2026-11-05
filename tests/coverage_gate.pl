@@ -59,9 +59,11 @@ my %tier_c_files = map { $_ => 1 } (
     "tools/dag_iter.c", "tools/dag_roothints.c", "tools/dag_tsig_client.c",
     "tools/dag_edns_client.c", "tools/dag_transport.c", "tools/dag_replay.c",
     "tools/dag_pcap_l4.c", "tools/dag_tcp_reassembly.c", "tools/dag_http.c",
-    "tools/karicheck.c", "tools/karictl.c",
+    "tools/karicheck.c", "tools/karictl.c", "tools/karidns_zone.c",
     "dns_zone_lint.c",   # the zone checks of karicheck (moved out of tools/karicheck.c in B12; karidns-dbloader --check runs them too)
-    "dns_diag.c"         # the diagnostic sink: the text path of the parser and the checks, the JSON document of karicheck --json
+    "dns_diag.c",        # the diagnostic sink: the text path of the parser and the checks, the JSON document of karicheck --json
+    # 0.6.0 ZoneImporter / ZoneExporter: zone file <-> PowerDNS rows <-> zone file text; the database drivers they use are in Tier D
+    "dns_zone_rows.c", "dns_zone_text.c", "dns_zone_import.c", "dns_zone_export.c", "dns_zone_msg.c"
 );
 
 # Tier D (B10, design 8.6; B11c, D-B11-4): the database layer: the PostgreSQL driver, and since B11 the SQLite3 driver and the loader
@@ -101,7 +103,7 @@ if ($json_file && -f $json_file) {
 if ($json_text eq "") {
     # Generate on the fly using llvm-cov
     my @objs = ();
-    for my $obj (qw(dag karictl karicheck karicheck-codelog test_coverage_sweep_tools-codelog test_dns_diag test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_zone_image test_dag_format test_dag_iter test_dag_reassembly test_query_engine_protocol test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_pgsql test_db_sqlite3 test_db_stream test_db_registry test_pdns_reader test_presigned test_db_supervisor karidns-dbloader)) {
+    for my $obj (qw(dag karictl karicheck karicheck-codelog test_coverage_sweep_tools-codelog test_dns_diag test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_zone_image test_dag_format test_dag_iter test_dag_reassembly test_query_engine_protocol test_hash_table test_epoch_rcu test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_pgsql test_db_sqlite3 test_db_stream test_db_registry test_pdns_reader test_presigned test_zone_text test_zone_import test_db_supervisor karidns-dbloader karidns-zone)) {
         push @objs, "-object=./$obj" if -x "./$obj";
     }
     if (-d "coverage_fuzz") {

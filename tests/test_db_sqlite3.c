@@ -2473,6 +2473,124 @@ static void test_scan_apex_cross(void) {
     unlink(path);
 }
 
+/* M2 (the 0.6.0 ZoneImporter): the write functions of an open_write() connection.  The loader's connections (open) are read only and refuse them. */
+static char g_ext_path[600];                /* db/karidns_ext.sqlite3.sql */
+
+static long sq_count(sqlite3 *db, const char *sql) {
+    sqlite3_stmt *st = NULL;
+    long n = -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) n = (long)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return n;
+}
+
+static int wr_count_cb(void *ud, int64_t did, const db_record_row_t *r) {
+    (void)did;
+    (void)r;
+    (*(int *)ud)++;
+    return 0;
+}
+
+static void test_writes(void) {
+    printf("write functions (open_write, w_*)\n");
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("write.db", path, sizeof(path));
+    char *ext = slurp(g_ext_path);
+    CHECK(ext != NULL);
+    if (ext) raw_exec(db, ext);
+    free(ext);
+    const db_driver_t *D = &db_driver_sqlite3;
+    db_conn_t *ro = open_driver(path, 0, err, sizeof(err), NULL), *c = NULL, *c2 = NULL;
+    db_source_t src = { "sqlite3", path, NULL, NULL, 200 };
+    CHECK(ro != NULL && D->open_write(&c, &src, err, sizeof(err)) == 0 && D->open_write(&c2, &src, err, sizeof(err)) == 0);
+    if (!ro || !c || !c2) {
+        sqlite3_close(db);
+        return;
+    }
+    db_schema_info_t si;
+    CHECK(D->check_schema(ro, &si) == 0 && D->check_schema(c, &si) == 0 && D->check_schema(c2, &si) == 0 && si.has_ext && si.has_domain_views);
+    /* a read only connection refuses everything; a writable one outside a transaction too */
+    int64_t id = 0, did = 0, rid = 0, rid2 = 0;
+    bool has = false;
+    db_record_row_t row = { 0, 300, 10, false, false, false, "a.w.test", "MX", "mx.w.test", NULL };
+    db_record_row_t ent = { 0, 0, 0, true, true, false, "e.w.test", NULL, NULL, "ord1" };
+    CHECK(D->w_begin(ro, "w.test") == -1);
+    CHECK_HAS(D->errmsg(ro), "read only");
+    CHECK(D->w_commit(ro) == -1 && D->w_rollback(ro) == 0 && D->w_create_zone(ro, "w.test", NULL, &id) == -1);
+    CHECK(D->w_create_zone(c, "w.test", NULL, &id) == -1);
+    CHECK_HAS(D->errmsg(c), "no write transaction");
+    CHECK(D->w_delete_records(c, 1, NULL, 0) == -1 && D->w_insert_record(c, 1, &row, true, &id) == -1 && D->w_insert_tags(c, 1, "a", NULL) == -1);
+    CHECK(D->w_insert_tinydns(c, 1, 1, NULL, false) == -1 && D->w_delete_tagdefs(c, 1, NULL, NULL) == -1 && D->w_insert_tagdef(c, 1, "ecs", "t", "10.0.0.0/8") == -1);
+    CHECK(D->w_delete_meta(c, 1, "K") == -1 && D->w_insert_meta(c, 1, "K", "v") == -1 && D->w_set_view(c, 1, "v") == -1 && D->w_zone_has_keys(c, 1, &has) == -1);
+    CHECK(D->w_commit(c) == -1 && D->w_rollback(c) == 0);
+    CHECK(D->w_request_reload(c, NULL, false) == DB_ERR_UNAVAILABLE);          /* SQLite3 has no reload requests */
+    /* a transaction: zone, records (an empty non-terminal too), tags, tinydns attributes, definitions, metadata, view */
+    CHECK(D->w_begin(c, "w.test") == 0 && D->w_begin(c, "w.test") == -1);
+    CHECK_HAS(D->errmsg(c), "already open");
+    CHECK(D->w_create_zone(c, "w.test", "MASTER", &did) == 0 && did > 0);
+    CHECK(D->w_insert_record(c, did, &row, false, &rid) == 0 && D->w_insert_record(c, did, &ent, true, &rid2) == 0 && rid > 0 && rid2 != rid);
+    CHECK(D->w_insert_tags(c, rid, "lan", "east") == 0 && D->w_insert_tags(c, rid2, NULL, "west") == 0 && D->w_insert_tinydns(c, rid, 1000, "l2", true) == 0);
+    CHECK(D->w_insert_tagdef(c, did, "location", "lan", "10.0.0.0/8") == 0 && D->w_insert_tagdef(c, did, "ecs", "east", "198.51.100.0/24") == 0);
+    CHECK(D->w_insert_meta(c, did, "PRESIGNED", "1") == 0 && D->w_insert_meta(c, did, "Other", "x") == 0);
+    CHECK(D->w_set_view(c, did, "v1") == 0 && D->w_set_view(c, did, "v1") == 0 && D->w_zone_has_keys(c, did, &has) == 0 && !has);
+    CHECK(D->w_request_reload(c, "w.test", true) == DB_ERR_UNAVAILABLE);
+    int n = 0;
+    CHECK(D->scan_records(c, &did, wr_count_cb, &n) == 0 && n == 2);              /* the zone's own reads inside the transaction see the writes */
+    CHECK(sq_count(db, "SELECT count(*) FROM records") == 0);                      /* ... another connection does not */
+    /* a second writer gives up cleanly after the busy timeout, and the holder is not harmed */
+    CHECK(D->w_begin(c2, "other.test") == DB_ERR_RETRY);
+    CHECK_HAS(D->errmsg(c2), "retry later");
+    CHECK(D->w_commit(c) == 0);
+    CHECK(sq_count(db, "SELECT count(*) FROM records") == 2 && sq_count(db, "SELECT prio FROM records WHERE type = 'MX'") == 10);
+    CHECK(sq_count(db, "SELECT count(*) FROM records WHERE type IS NULL AND ordername = 'ord1' AND ttl IS NULL AND prio IS NULL AND auth = 1") == 1);
+    CHECK(sq_count(db, "SELECT count(*) FROM records WHERE type = 'MX' AND auth = 0 AND disabled = 0") == 1);
+    CHECK(sq_count(db, "SELECT count(*) FROM karidns_record_tags") == 2 && sq_count(db, "SELECT count(*) FROM karidns_record_tinydns WHERE countdown = 1 AND loc = 'l2'") == 1);
+    CHECK(sq_count(db, "SELECT count(*) FROM karidns_domain_views") == 1 && sq_count(db, "SELECT count(*) FROM karidns_changes") > 0);
+    /* deletes: by id (the extension rows first; an id of another zone deletes nothing), a whole zone, definitions by kind and tag, metadata by kind */
+    CHECK(D->w_begin(c, "y.test") == 0 && D->w_create_zone(c, "y.test", NULL, &id) == 0);
+    int64_t yid = 0;
+    CHECK(D->w_insert_record(c, id, &row, true, &yid) == 0 && D->w_commit(c) == 0);
+    int64_t both[2] = { rid, yid };
+    CHECK(D->w_begin(c, "w.test") == 0 && D->w_delete_records(c, did, both, 2) == 0 && D->w_commit(c) == 0);
+    CHECK(sq_count(db, "SELECT count(*) FROM records") == 2);
+    CHECK(sq_count(db, "SELECT count(*) FROM karidns_record_tags") == 1 && sq_count(db, "SELECT count(*) FROM karidns_record_tinydns") == 0);
+    CHECK(D->w_begin(c, "w.test") == 0 && D->w_delete_records(c, did, NULL, 0) == 0 && D->w_commit(c) == 0);
+    CHECK(sq_count(db, "SELECT count(*) FROM records") == 1 && sq_count(db, "SELECT count(*) FROM karidns_record_tags") == 0);
+    CHECK(D->w_begin(c, "w.test") == 0 && D->w_delete_tagdefs(c, did, "location", "LAN") == 0 && D->w_commit(c) == 0);
+    CHECK(sq_count(db, "SELECT count(*) FROM karidns_zone_tagdefs") == 1);
+    CHECK(D->w_begin(c, "w.test") == 0 && D->w_delete_tagdefs(c, did, NULL, NULL) == 0 && D->w_delete_meta(c, did, "presigned") == 0 && D->w_commit(c) == 0);
+    CHECK(sq_count(db, "SELECT count(*) FROM karidns_zone_tagdefs") == 0 && sq_count(db, "SELECT count(*) FROM domainmetadata") == 1);
+    /* statements that fail leave the transaction to be rolled back; it undoes everything, and the connection is usable again */
+    CHECK(D->w_begin(c, "w.test") == 0 && D->w_insert_meta(c, did, "K", "v") == 0);
+    CHECK(D->w_create_zone(c, "w.test", NULL, &id) == -1);                              /* the name exists */
+    CHECK(D->errmsg(c)[0] != '\0');
+    CHECK(D->w_insert_tags(c, 1, "a", NULL) == 0 && D->w_insert_tags(c, 1, "a", NULL) == -1);       /* the record id is the key */
+    CHECK(D->w_rollback(c) == 0 && D->w_rollback(c) == 0);
+    CHECK(sq_count(db, "SELECT count(*) FROM domainmetadata") == 1 && sq_count(db, "SELECT count(*) FROM domains") == 2);
+    CHECK(D->w_begin(c, "w.test") == 0 && D->w_commit(c) == 0);
+    /* a connection that is closed in a transaction writes nothing */
+    CHECK(D->w_begin(c, "gone.test") == 0 && D->w_create_zone(c, "gone.test", NULL, &id) == 0);
+    D->close(c);
+    CHECK(sq_count(db, "SELECT count(*) FROM domains WHERE name = 'gone.test'") == 0);
+    CHECK(D->w_begin(c2, "other.test") == 0 && D->w_commit(c2) == 0);
+    D->close(c2);
+    D->close(ro);
+    /* a database without the extension tables */
+    sqlite3_close(db);
+    db = make_db("write_noext.db", path, sizeof(path));
+    src.database_file = path;
+    c = NULL;
+    CHECK(D->open_write(&c, &src, err, sizeof(err)) == 0 && D->check_schema(c, &si) == 0 && !si.has_ext && !si.has_domain_views);
+    CHECK(D->w_begin(c, "x.test") == 0 && D->w_create_zone(c, "x.test", NULL, &did) == 0 && D->w_insert_record(c, did, &row, true, &rid) == 0);
+    CHECK(D->w_insert_tags(c, rid, "a", NULL) == DB_ERR_UNAVAILABLE && D->w_insert_tinydns(c, rid, 1, NULL, false) == DB_ERR_UNAVAILABLE);
+    CHECK(D->w_delete_tagdefs(c, did, NULL, NULL) == DB_ERR_UNAVAILABLE && D->w_insert_tagdef(c, did, "ecs", "t", "10.0.0.0/8") == DB_ERR_UNAVAILABLE);
+    CHECK(D->w_set_view(c, did, "v") == DB_ERR_UNAVAILABLE && D->w_request_reload(c, "x.test", false) == DB_ERR_UNAVAILABLE);
+    CHECK(D->w_delete_records(c, did, &rid, 1) == 0 && D->w_delete_records(c, did, NULL, 0) == 0 && D->w_commit(c) == 0);
+    CHECK(sq_count(db, "SELECT count(*) FROM records") == 0);
+    D->close(c);
+    sqlite3_close(db);
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/db";
     snprintf(g_schema, sizeof(g_schema), "%s/pdns_schema.sqlite3.sql", dir);
@@ -2515,6 +2633,8 @@ int main(int argc, char **argv) {
     test_scan_failures();
     test_profiles_and_views();
     test_driver_faults();
+    snprintf(g_ext_path, sizeof(g_ext_path), "%s/../../db/karidns_ext.sqlite3.sql", dir);
+    test_writes();
     test_cli();
     free(g_schema_sql);
     rm_tree(g_dir);

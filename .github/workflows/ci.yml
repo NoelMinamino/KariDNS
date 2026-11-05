@@ -64,7 +64,7 @@ jobs:
 
             echo "::group::📦 [Build] Parallel Build KariDNS, Sanitizers, Tests & Fuzzers"
             NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
-            make -j"$NCPU" DB_DRIVERS="sqlite3 postgresql" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader zone2sql zone2kdb asan tsan tools-asan fuzz_all asan_test tinydns_test hash_test include_test response_cache_test vulnerability_test bench_serialize
+            make -j"$NCPU" DB_DRIVERS="sqlite3 postgresql" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader karidns-zone karidns-zone-asan zone2sql zone2kdb asan tsan tools-asan fuzz_all asan_test tinydns_test hash_test include_test response_cache_test vulnerability_test bench_serialize
             echo "::endgroup::"
 
             echo "::group::🧪 [Unit Tests] All C unit tests (incl. RFC published-vector tests)"
