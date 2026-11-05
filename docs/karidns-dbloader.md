@@ -178,32 +178,13 @@ The loader reads the tables of the **PowerDNS 5.1 generic SQLite3 / PostgreSQL b
 | File | Content |
 |---|---|
 | `db/karidns_ext.sqlite3.sql` | SQLite3: schema version 3 (version 2 plus the tables `karidns_audit_log` and `karidns_audit_actor`, which the loader does not use; the audit triggers are in `db/karidns_audit.sqlite3.sql`, applied when the WebAdmin or the signer is used, and the users, groups and grants of the WebAdmin in the file `db/karidns_auth.sqlite3.sql`, which the API ATTACHes: the loader never opens it). `karidns_changes` (the change log: which domain changed, written by triggers on `domains`, `records`, `domainmetadata`, `cryptokeys` and the tables below), a trigger that keeps the newest 1,000,000 log rows, `karidns_domain_views`, `karidns_profiles`, `karidns_record_tags`, `karidns_record_tinydns`, `karidns_zone_tagdefs`, `karidns_schema_version`. Apply it once, as the owner of the database, after the PowerDNS schema. It can be applied again. |
-| `db/karidns_ext.pgsql.sql` | PostgreSQL: schema version 3. The same tables with statement-level triggers (one log row per distinct domain per statement), `NOTIFY karidns_changes` for auto reload, and the multi-server tables `karidns_reload_requests` and `karidns_server_status`. PostgreSQL 13 or newer. Apply it in the schema that holds the PowerDNS tables. |
+| `db/karidns_ext.pgsql.sql` | PostgreSQL: schema version 3 (version 2 plus the schema `karidns_auth`: users, groups, grants, the audit log, the RLS functions and policies; see THE AUTH SCHEMA, ROLES AND THE AUDIT LOG below). The same tables with statement-level triggers (one log row per distinct domain per statement), `NOTIFY karidns_changes` for auto reload, and the multi-server tables `karidns_reload_requests` and `karidns_server_status`. PostgreSQL 13 or newer. Apply it in the schema that holds the PowerDNS tables. |
 | `db/karidns_ext_v1_to_v2.sqlite3.sql`, `db/karidns_ext_v1_to_v2.pgsql.sql` | Convert a database from schema version 1 (the extension files of the early betas) to version 2. The loader reads both versions and serves a version 1 database without a change log. |
 | `db/karidns_writer_role.pgsql.sql` | PostgreSQL: the privileges of the role that [`karidns-zone`](karidns-zone.md) imports with (`psql -v role=... -v schema=...`). `SELECT, INSERT, UPDATE, DELETE` on `domains`, `records` and `domainmetadata`, the `karidns_*` zone tables, what the change-log triggers need, and only the column privilege `SELECT (domain_id)` on `cryptokeys` (never `content`, the private keys). Not for the loader: give the loader `karidns_loader_role.pgsql.sql`. |
 
 A bulk import writes one change-log row per changed row (SQLite3) or per statement (PostgreSQL); a big import makes the next reload compare every zone once. The files carry their own documentation in their first lines.
 
-### Roles and row level security (PostgreSQL, 0.6.0)
-
-Two more role scripts serve the WebAdmin API and the signer daemon (`psql -v ON_ERROR_STOP=1 -v role=... -v schema=... -f ...`, run as the owner of the PowerDNS tables, who needs `CREATEROLE`; each script can be run again, once per data schema):
-
-| File | Content |
-|---|---|
-| `db/karidns_api_role.pgsql.sql` | The role the API connects as (created `NOLOGIN` if it does not exist: `GRANT` it to the login role, which must not be a member of `karidns_rls_trusted`). `SELECT, INSERT, UPDATE, DELETE` on `domains`, `records`, `domainmetadata` and the `karidns_*` zone tables, only the column privilege `SELECT (id, domain_id, flags, active, published)` on `cryptokeys` (never `content`), the users, groups, grants and credentials of the schema `karidns_auth` (the only role that reads `credentials`), `SELECT` on the audit log, and `EXECUTE` on `karidns_auth.bump_serial()`. Every earlier privilege of the role on the schema's tables is revoked first. `SELECT` and `INSERT` (no `DELETE`) on `karidns_reload_requests`, limited by row level security to the zones it has a grant on; nothing on `karidns_changes`. Nothing else: no `TRUNCATE`, no write to the audit log. It switches row level security and the audit log on (below). The script stops, before it changes anything, if the role is a superuser or has `BYPASSRLS`, is a member of `karidns_rls_trusted` or of the owner of the tables (directly or through other roles). |
-| `db/karidns_signer_role.pgsql.sql` | The role of the signer: reads every table including `cryptokeys.content`; writes only the DNSSEC-managed record types (`RRSIG`, `NSEC`, `NSEC3`, `NSEC3PARAM`, `DNSKEY`, `CDS`, `CDNSKEY`), updates SOA rows, writes the metadata kinds `PRESIGNED`, `NSEC3PARAM` and `X-KARIDNS-SIGNER`, and inserts reload requests. Nothing on `karidns_auth` and `karidns_changes`: the signer is a trusted daemon held to its types by row level security, not bound by grants. Its write policies exist twice, permissive and `RESTRICTIVE`, so setting `karidns.principal` to a global master does not let it write an `A` record. A trigger on `records` (for the roles in `karidns_auth.signer_roles`, which the script fills) lets it change an SOA row in its serial only: type, name, domain and the rest of the content stay, no record becomes an SOA, and it neither inserts nor deletes an SOA. The same refusals as for the API role apply at install time. |
-
-**What row level security checks.** `db/karidns_ext.pgsql.sql` creates the functions and policies but leaves row level security (RLS) off; the two scripts above switch it on for the tables of the schema and of `karidns_auth`, so a site without them is unchanged. The API sets `SET LOCAL karidns.principal = '<id>'` in every transaction; the policies read it. A missing, empty or non-numeric setting, a principal that does not exist and a disabled principal are all "no principal": no rows, no writes. A row is covered when **one** effective grant of the principal (its own or a group's, through nested groups) allows it: the name is in the grant's scope (a subdomain master: the suffix, at a label boundary, so `evilsub.example.com` is not under `sub.example.com`), the type is allowed and not DNSSEC-managed, the TTL (NULL counts as 0) is in the policy's range, a wildcard label needs `allow_wildcard`, `NS` below the apex needs `allow_delegation`, `DNAME` needs `allow_dname`, and the apex needs `apex_editable` and a role other than subdomain master. The SOA changes only through `karidns_auth.bump_serial(schema, domain_id)` (adds 1, RFC 1982), or for a global master whose policy allows it. The type names `TYPE2`, `TYPE6`, `TYPE39` and `TYPE46` ... `TYPE60` are read as the names they stand for (NS, SOA, DNAME, the DNSSEC-managed types), so an alias gets the rules of the name (an `rr_policy` may not list those aliases; any other `TYPEnn` is a type of its own). Reads need the name inside the zone too: a row without a name, a row whose name is outside its zone and a row without a zone are invisible to the API, a global master included (the owner repairs them); an empty non-terminal (type NULL) is visible by its name. A trailing dot of `domains.name` is ignored. A record outside its zone, a row without a name and (outside the apex) an empty non-terminal follow the same scope rule on writes; two grants never combine for one row. A trigger on `karidns_auth.grants` keeps the sessions of the API role (and of every role that is a member of it) from escalating: a new grant must be on a zone the granter is domain master of, with an `rr_policy` that is a subset of the granter's own; `granted_by` and `granted_at` are the trigger's (an update keeps them unless the grant changes materially). The database cannot check what the API must: that one grant allows a whole change set, `max_rr`, and the zone checks of `karicheck`.
-
-**`karidns_rls_trusted`.** The policies bind every role that is not a member of `karidns_rls_trusted`, a `NOLOGIN` role the scripts create. A role that must see and write everything joins it: `karidns_loader_role.pgsql.sql` and `karidns_writer_role.pgsql.sql` do it for their role (in either order against the API script), and for the PowerDNS `gpgsql` backend's role and any other role (backup, monitoring) you run
-
-```
-GRANT karidns_rls_trusted TO <the PowerDNS gpgsql role>;
-```
-
-A role that uses the tables without it is refused (no rows, or `permission denied for function karidns_auth.rr_visible`) once RLS is on. The table owner is not subject to RLS and is the "operator" for the grant trigger: do not make the owner a member of the API role. The maintenance triggers of the data tables (the change log `karidns_changes`, its prune, the reload requests and their prune) run as the owner with a pinned `search_path` (`pg_catalog`, the schema, `pg_temp`), so the API and signer roles need no right on the change log and cannot read, forge or delete it, nor delete reload requests; an API session sees and inserts the reload requests of the zones it has a grant on (all zones: a global master).
-
-**Trust boundary.** `karidns.principal` is a custom setting that any session can set. The API is trusted to set it to the logged-in user; RLS catches the API's own mistakes (a missing `WHERE`, a wrong zone id), not a compromised API process or a stolen database password of the API role. That is why the API role gets nothing of `cryptokeys.content`, nothing of what the signer or the owner may do, and no way to change or delete audit rows (the audit triggers are `SECURITY DEFINER`; pruning is the owner's `DELETE`). The tables `principals`, `memberships` and `rr_policies` are readable by every API session (a login looks the user up by name before it has a principal id), `credentials` only by its owner and a global master.
+The users, groups, grants, database roles, row level security and the audit log of the WebAdmin and the signer (the schema `karidns_auth`, `db/karidns_api_role.pgsql.sql`, `db/karidns_signer_role.pgsql.sql`, `db/karidns_audit.sqlite3.sql`, `db/karidns_auth.sqlite3.sql`) are described in THE AUTH SCHEMA, ROLES AND THE AUDIT LOG, below.
 
 ### Indexes
 
@@ -219,6 +200,163 @@ The extension files create `karidns_zone_tagdefs_domain_idx` on `karidns_zone_ta
 **Migration note: `records.name` of address rows must be in lower case.** When a zone is out of memory (`memory-limit`), the Backend sends its NOTIFY from the zone's summary, and the summary carries the addresses of the NS targets that are *outside* the zone (tag 22 of `ZONE_BEGIN`, `KDB_NOTIFY_ADDR_PER_NS` per name). The loader reads them with `g.name = lower(<NS target>)` (SQLite3 and PostgreSQL alike), an exact comparison that the index on `records (name)` serves; it does not fold the case of `records.name`. An A / AAAA row of such a target whose `name` has an upper case letter is not found, and that name server gets no NOTIFY while the zone is out of memory (the addresses *inside* the zone are matched case-insensitively and are not affected). PowerDNS stores names in lower case, so a database written by PowerDNS or by `zone2sql` is fine; before pointing the loader at data from another source or edited by hand, check `SELECT id, name FROM records WHERE type IN ('A', 'AAAA') AND name <> lower(name);` and fix the rows (`UPDATE records SET name = lower(name) WHERE name <> lower(name);`).
 
 **Zone names that differ only in case are not supported.** PowerDNS stores `domains.name` in lower case, and so should the data: two rows of one source such as `Example.test` and `example.test` are two rows for PostgreSQL's case-sensitive unique index (the PowerDNS PostgreSQL schema has a `CHECK` constraint `c_lowercase_name` that refuses upper case, and SQLite3's schema declares the column `COLLATE NOCASE`; such rows only exist when a constraint was dropped or the data was written around it). The loader keeps the one-zone lookup (`--zone`, used by reload requests and auto reload) fast: it matches the indexed name exactly first and falls back to `lower()` only when that finds nothing. With such duplicates a full read and a one-zone read may therefore pick different rows. `karicheck db` (`karidns-dbloader --check`) warns about every pair of `domains` rows of one source whose names are equal ignoring case, with both `domains.id` values (both drivers); fix the data, do not rely on either row.
+
+## THE AUTH SCHEMA, ROLES AND THE AUDIT LOG (0.6.0)
+
+Schema version 3 adds what the WebAdmin API and the signer daemon need: users, groups and grants, database roles held to their grants by row level security (RLS, PostgreSQL only), and an audit log. The server and `karidns-dbloader` use none of it. A database that only has the loader's and the importer's roles behaves as it did before: RLS is off and nothing is logged.
+
+### What version 3 adds
+
+PostgreSQL (`db/karidns_ext.pgsql.sql`)
+: The schema `karidns_auth` with the tables `principals`, `credentials`, `memberships`, `principal_closure`, `rr_policies`, `grants`, `audit_log` and `schema_version`; the functions and triggers that keep them consistent; the RLS policies for the tables of the data schema (they do nothing while RLS is off); and the audit triggers of `karidns_auth` itself. There is one `karidns_auth` for the whole database, shared by every data schema (a view that has a schema of its own applies the same file there and adds its own triggers and policies).
+
+SQLite3
+: `db/karidns_ext.sqlite3.sql` adds the tables `karidns_audit_log` and `karidns_audit_actor` to the zone file. The users, groups and grants live in a file of their own, `db/karidns_auth.sqlite3.sql`, so that the loader, which only opens the zone file, can never read a password hash. SQLite3 has no roles and no RLS: the API does the checks that PostgreSQL does in the policies.
+
+Both: the version row says 3 (`karidns_auth.schema_version` and `karidns_schema_version`). The loader and `karicheck db` read versions 1, 2 and 3. There is no v2-to-v3 file: apply the version 3 file again and the database becomes version 3 (it only adds objects). Version 1 needs the `v1_to_v2` file first.
+
+### Files and the order to apply them
+
+1. The PowerDNS schema (from PowerDNS, not part of KariDNS).
+2. PostgreSQL: `db/karidns_ext.pgsql.sql`, as the owner of the PowerDNS tables, who needs `CREATE` on the database (for `CREATE SCHEMA karidns_auth`). Once per data schema; it can be applied again. SQLite3: `sqlite3 zones.sqlite3 < db/karidns_ext.sqlite3.sql`, and `sqlite3 auth.sqlite3 < db/karidns_auth.sqlite3.sql` as the user of the API.
+3. The roles of the tools, as an administrator, once per data schema: `db/karidns_loader_role.pgsql.sql` (the server's loader), `db/karidns_writer_role.pgsql.sql` (`karidns-zone`), `db/karidns_api_role.pgsql.sql` (the WebAdmin API), `db/karidns_signer_role.pgsql.sql` (the signer). They can be run in any order and again.
+4. `GRANT karidns_rls_trusted TO <the PowerDNS gpgsql role>;` and the same for every other role that must see everything (backup, monitoring). The loader and writer scripts do it for their role.
+5. SQLite3 only, when the API or the signer is used: `sqlite3 zones.sqlite3 < db/karidns_audit.sqlite3.sql` (the audit triggers).
+
+```
+psql -v ON_ERROR_STOP=1 -f db/karidns_ext.pgsql.sql karidns
+psql -v ON_ERROR_STOP=1 -v role=karidns_api    -v schema=public -f db/karidns_api_role.pgsql.sql karidns
+psql -v ON_ERROR_STOP=1 -v role=karidns_signer -v schema=public -f db/karidns_signer_role.pgsql.sql karidns
+```
+
+The ext file only creates things. RLS and the audit triggers on the PowerDNS tables are switched on by the API and signer role scripts (`karidns_auth.enable_rls()`, `enable_audit()`); switching RLS on in the ext file would hide every row from the loader, from `karidns-zone` and from PowerDNS itself. `karidns_auth.disable_rls('public')` and `disable_audit('public')` switch them off again.
+
+### Users, groups and tenants
+
+A **principal** is a user or a group (`principals.kind`). Names are unique ignoring case. A **user** may have `credentials` (a password hash as a PHC string, `$argon2id$` or `$scrypt$`: the database checks the prefix only; an opaque TOTP secret, which the API should store encrypted with a key of its own; an OIDC issuer and subject; failed-login and lock fields). Only the API role reads the credentials, and only a user's own row and, for a global master, all of them.
+
+A **membership** puts a user or a group into a group. Groups nest, at most 8 deep; a cycle is refused, and so is a user as a group. `principal_closure` lists every principal with all the groups it is in, directly or not (plus itself at depth 0); triggers keep it, so a policy joins it instead of recursing. A group that is in no group is a **tenant**; a principal's tenants are the top groups of its closure. The database only stores this; the API uses it ("grant only inside my tenant", lists). A disabled principal, or a grant held through a disabled group, counts for nothing.
+
+### Record policies (`rr_policies`)
+
+A grant carries a record policy: `allowed_types` (a list; never a DNSSEC-managed type: `RRSIG`, `NSEC`, `NSEC3`, `NSEC3PARAM`, `DNSKEY`, `CDS`, `CDNSKEY`; `DS` is an ordinary type), `allow_wildcard`, `allow_delegation` (`NS` below the apex), `allow_dname`, `apex_editable`, `ttl_min` and `ttl_max`, and `max_rr`. All the flags default to false. The database enforces everything but `max_rr`, which the API checks.
+
+### Grants
+
+A grant gives a principal a role on zones. The zone is named by **(data schema, zone name)**, not by `domains.id`: there is one `karidns_auth` and several data schemas, and in SQLite3 the grants are in another file. Names are stored lower case without the final dot.
+
+`global_master`
+: Every zone of the database. Its record policy still limits the records it may write.
+
+`domain_master`
+: One zone: all its records that the record policy allows.
+
+`subdomain_master`
+: One zone, and only the names at or below a suffix inside it (at a label boundary: `evilsub.example.com` is not under `sub.example.com`). It may not change the apex.
+
+The principal's effective grants are its own and those of every group it is in. A trigger on `domains` removes the grants of a zone that is deleted and renames them when the zone is renamed, so a grant never moves to a new zone of the same name that someone else creates later. On SQLite3 the API does this cleanup itself (the grants are in another file).
+
+**No escalation.** A trigger on `karidns_auth.grants` binds the sessions of the API role (and of every role that is a member of it; the owner and other roles are the operator and are not bound). A global master may grant anything. A domain master may grant `domain_master` or `subdomain_master` on its own zone, with a record policy that is a **subset** of the one it holds (fewer types, no flag it lacks, a TTL range inside its own, `max_rr` not higher; no limit counts as the highest). A subdomain master may not grant. A grant may be deleted by a global master, or by a domain master of the zone for a grant it could have made. `granted_by` and `granted_at` are set by the trigger. A record policy that a global master changes later is trusted.
+
+### Roles (PostgreSQL)
+
+The role scripts take `-v role=` and `-v schema=`, so a site can name its roles. Each script revokes every earlier privilege of its role on the tables of the schema first.
+
+| File | The role |
+|---|---|
+| `db/karidns_api_role.pgsql.sql` | The role the API connects as (created `NOLOGIN` if it does not exist: `GRANT` it to the login role, which must not be a member of `karidns_rls_trusted`). `SELECT, INSERT, UPDATE, DELETE` on `domains`, `records`, `domainmetadata` and the `karidns_*` zone tables, only the column privilege `SELECT (id, domain_id, flags, active, published)` on `cryptokeys` (never `content`), the users, groups, grants and credentials of `karidns_auth` (the only role that reads `credentials`), `SELECT` on the audit log, `EXECUTE` on `karidns_auth.bump_serial()`. `SELECT` and `INSERT` (no `DELETE`) on `karidns_reload_requests`; nothing on `karidns_changes`. No `TRUNCATE`, no write to the audit log. It switches RLS and the audit log on. The script stops, before it changes anything, if the role is a superuser or has `BYPASSRLS`, is a member of `karidns_rls_trusted`, or is, or is a member of, the owner of the tables (directly or through other roles). |
+| `db/karidns_signer_role.pgsql.sql` | The signer: reads every table including `cryptokeys.content`; writes only the DNSSEC-managed record types, updates SOA rows, writes the metadata kinds `PRESIGNED`, `NSEC3PARAM` and `X-KARIDNS-SIGNER`, and inserts reload requests. Nothing on `karidns_auth` and `karidns_changes`. It is a trusted daemon held to its types by RLS, not bound by grants. Its write policies exist twice, permissive and `RESTRICTIVE`, so setting `karidns.principal` to a global master does not let it write an `A` record. A trigger lets it change an SOA row in its serial only (type, name, domain and the rest of the content stay; it neither inserts nor deletes an SOA). The same refusals as for the API role apply at install time. |
+| `db/karidns_loader_role.pgsql.sql`, `db/karidns_writer_role.pgsql.sql` | As before, plus membership in `karidns_rls_trusted`. Nothing on `karidns_auth`. The loader and `karidns-zone` read and write everything with RLS on, in either script order. |
+| the owner | Owns everything and is not subject to RLS (no `FORCE`). The only role that may `UPDATE` or `DELETE` audit rows. |
+
+Nobody gets `BYPASSRLS` or superuser.
+
+### What row level security checks
+
+The API sets `SET LOCAL karidns.principal = '<id>'` in every transaction; the policies read it. A missing, empty or non-numeric setting, a principal that does not exist and a disabled principal are all "no principal": no rows, no writes.
+
+A row is **writable** when one effective grant of the principal covers it: the name is in the grant's scope, the type is allowed and not DNSSEC-managed, the TTL (NULL counts as 0) is in the policy's range, a wildcard label needs `allow_wildcard`, `NS` below the apex needs `allow_delegation`, `DNAME` needs `allow_dname`, and the apex needs `apex_editable` and a role other than subdomain master. Two grants never combine for one row. The SOA changes only through `karidns_auth.bump_serial(schema, domain_id)` (adds 1, RFC 1982; any grant on the zone may call it), or for a global master whose policy allows it. The type names `TYPE2`, `TYPE6`, `TYPE39` and `TYPE46` ... `TYPE60` are read as the names they stand for, so an alias gets the rules of the name. A record outside its zone, a row without a name and (outside the apex) an empty non-terminal follow the same scope rule.
+
+A row is **visible** when a grant of the principal reaches it: a domain master sees the records of its zone, a subdomain master those of its suffix, a global master every zone; the SOA and the apex `NS` are visible to every grant on the zone. A row without a name, a row whose name is outside its zone and a row without a zone are invisible to the API, a global master included (the owner repairs them). A trailing dot of `domains.name` is ignored.
+
+The other tables follow the zone: `domains`, `domainmetadata`, the tag tables, the key table (without `content`) and the views are visible to a grant on the zone; a global master writes `domains`, `domainmetadata` (not the kinds the signer owns) and `karidns_domain_views`; a domain master writes `karidns_zone_tagdefs`; the tag rows of a record follow the record. `principals`, `memberships` and `rr_policies` are readable by every API session (a login looks the user up by name before it has a principal id) and changed by a global master. The audit log is visible to a global master (all of it) and to a domain master (the rows of its zones).
+
+**What the API must check itself.** The database cannot see: that one grant allows a whole change set (it checks each row alone), `max_rr`, a CNAME beside other data and the other zone checks (`karicheck --json`), and that a change set stays in one zone.
+
+### karidns_rls_trusted
+
+The policies bind every role that is not a member of `karidns_rls_trusted`, a `NOLOGIN` role the scripts create. A role that must see and write everything joins it: the loader and writer scripts do it for their role, and for the PowerDNS `gpgsql` backend's role and any other role you run
+
+```
+GRANT karidns_rls_trusted TO <the PowerDNS gpgsql role>;
+```
+
+A role that uses the tables without it is refused (no rows, or `permission denied for function`) once RLS is on. The table owner is not subject to RLS and is the "operator" for the grant trigger: do not make the owner a member of the API role. The maintenance triggers of the data tables (the change log `karidns_changes` and its prune, the reload requests and their prune) run as the owner with a pinned `search_path`, so the API and signer roles need no right on the change log and cannot read, forge or delete it.
+
+### The trust boundary
+
+`karidns.principal` is a custom setting that any session can set. The API is trusted to set it to the logged-in user. RLS catches the API's own mistakes (a missing `WHERE`, a wrong zone id); it does not stop a compromised API process or a stolen database password of the API role. That is why the API role gets nothing of `cryptokeys.content`, nothing of what the signer or the owner may do, and no way to change or delete audit rows. Treat the API's database password like the key to every zone it has a grant on.
+
+### The audit log
+
+With the audit triggers on, every change of the tables of the data schema and of `karidns_auth` is logged. PostgreSQL: `karidns_auth.audit_log`; SQLite3: `karidns_audit_log` in the zone file and `karidns_auth_audit` in the auth file. The columns:
+
+| Column | Meaning |
+|---|---|
+| `id`, `at` | A running number, the time. |
+| `xid` | The transaction (PostgreSQL), to group the rows of one commit. |
+| `db_role` | The database role (the role after `SET ROLE`, else the login role). `karidns-zone` on SQLite3: `karidns-zone:<OS user>`. |
+| `principal_id`, `principal_name` | `karidns.principal` of the session and its name (copied, so it survives the deletion of the principal). NULL without one. |
+| `change_set` | `karidns.change_set` of the session: the API's change set. |
+| `data_schema`, `table_name`, `op`, `zone_name`, `row_id` | Where: the table, `I`, `U` or `D`, the zone, the row's id. |
+| `before`, `after` | The row as JSON. |
+
+**Redaction.** `cryptokeys.content`, `credentials.password_hash` and `credentials.totp_secret` are written as `"<redacted>"`: the API reads the audit log, and keys and secrets must not reach it.
+
+**Summary mode.** A big import writes two rows per record (the old row and the new one). A role other than the API and the signer may `SET LOCAL karidns.audit = 'summary'` (`karidns-zone import --audit summary` does): the audit then writes one row per transaction, table, operation and zone that counts the statements and the rows (`{"summary": true, "statements": 100000, "rows": 100000}`), filled in when the transaction commits. The API role, the signer role and any role that is a member of them (also after `SET ROLE`) cannot turn the detail off; the restricted roles are the rows of `karidns_auth.audit_restricted_roles`, which only the owner writes. The tables of `karidns_auth` are always logged row by row. SQLite3 has no summary mode.
+
+**Append only.** Only the owner has `INSERT`, `UPDATE` or `DELETE` on the log; the triggers are `SECURITY DEFINER` and insert as the owner. Nobody gets `TRUNCATE`, and a `TRUNCATE` of an audited table is not logged (use `DELETE`).
+
+**Pruning.** Nothing is pruned automatically. The owner deletes by date:
+
+```
+DELETE FROM karidns_auth.audit_log WHERE at < now() - interval '1 year';
+```
+
+Run it in batches on a big log (`WHERE id IN (SELECT id ... LIMIT 100000)`) and `VACUUM` afterwards. At scale, partition the table by month (declare `audit_log` partitioned by `at` and drop old partitions); that needs a migration of the table and is planned for 0.7.
+
+### SQLite3
+
+- The audit triggers are in `db/karidns_audit.sqlite3.sql`; a site that does not use the API or the signer does not apply them and logs nothing. Persistent triggers can only read their own database, so the actor lives in the zone file: `karidns_audit_actor` has one row (principal, change set, database role). SQLite3 has one writer at a time (`BEGIN IMMEDIATE`): the API writes the actor row first in its transaction and deletes it last. A writer that does not is logged with a NULL principal. `karidns-zone` writes its own row (`karidns-zone:<OS user>`) and deletes it before the commit.
+- The auth file holds the principals, credentials, memberships, record policies and grants. Its own changes are logged by triggers into `karidns_auth_audit` in the auth file. **The auth file belongs to the user of the API and has mode 0600**; the loader's user must not be able to read it (it holds the password hashes). Run `PRAGMA foreign_keys=ON` on the connection.
+- The checks that need no API are in the file: the `CHECK` constraints, users only in `credentials`, no cycle, depth 8, and the closure table. What PostgreSQL does in policies and in the escalation trigger, the API must do on SQLite3, and it must delete or rename the grants of a zone it deletes or renames.
+
+### What RLS and the audit cost
+
+Measured on 2026-11-06 with `tests/perf/auth_rls_bench.sh` on the FreeBSD 15.1 build host (4 vCPU, shared with other jails), PostgreSQL 18.6 with `shared_buffers` 128 MB, `fsync` off, a private cluster. Each figure is the median of 3 runs, each run a new connection. The big zone has 100,000 records; the user is in a group that is domain master of it. Times are the client's, with the rows sent to `/dev/null`.
+
+| What | Without RLS (the owner) | `karidns_api`, RLS on | Notes |
+|---|---|---|---|
+| `SELECT *` of the 100,000 records of the zone, domain master | 33.6 ms | 193.9 ms | 5.8 times; 150 ms on a connection that is already warm |
+| the same with 100,001 zones and 10,002 grants in the database | 35.6 ms | 207.1 ms | the grant lookups are by index: the time stays flat |
+| the same, global master | 33.6 ms | 745 ms (815 ms) | every row also checks its name against its own zone |
+| `SELECT count(*)` of the zones, a user with one zone out of 100,001 | - | 9.0 ms | 1,330 ms before the grants were read once per statement |
+| one record by name | - | 2.7 ms | |
+| change set: `INSERT` of 1,000 records (one statement, one transaction) | 82 ms (15 ms with the audit off) | 172 ms (155 ms with 100,001 zones) | |
+| change set: `UPDATE` of 1,000 records | 85 ms (24 ms with the audit off) | 257 ms (234 ms) | the policy is checked for the old and the new row |
+| change set: `DELETE` of 1,000 records | 80 ms (13 ms with the audit off) | 166 ms (156 ms) | |
+
+The owner's change sets above have the audit triggers on (the API scripts switch them on); the figures in brackets are the same measurement with the other 100,000 zones and 10,000 grants. The cost of RLS on a read is the checks that make a row visible: the name must be inside the zone (and, for a subdomain master, inside its suffix). Writes are checked row by row with the full rules. The grants are read once per statement, not once per row; the lookups use the indexes `grants (data_schema, zone_name)` and `grants (principal_id)` and the key of `principal_closure` (an index-only scan of 0.02 ms, the whole lookup 0.04 ms). The measurement used 100,000 zones and 10,000 grants because the host is shared; the lookups are by index, so more zones should not change them.
+
+`karidns-zone import` (replace mode, `--serial keep`) of the same 100,000 records as the writer role, a zone that already has them (so 100,000 rows are deleted and inserted again), RLS on:
+
+| Audit | Time | Audit rows |
+|---|---|---|
+| off (`karidns_auth.disable_audit('public')`) | 17.2 s | 0 |
+| on, `--audit rows` | 36.1 s (2.1 times) | 200,000 |
+| on, `--audit summary` | 35.7 s | 2 |
+
+The audit costs about 0.1 ms per changed row (the row trigger builds the JSON of the old and the new row and looks up the zone) or, in summary mode, about 0.2 ms per statement (the importer inserts one row per statement). Summary mode saves the space of the log, not the time. Both figures include the statement triggers with transition tables and the maintenance triggers that run as the owner (the change log; the SOA trigger of the signer has a `WHEN` clause on the type, so its function runs for SOA rows only).
 
 ## PACKAGES
 

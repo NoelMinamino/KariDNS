@@ -254,8 +254,8 @@ else
         for t in karidns_schema_version karidns_changes karidns_domain_views karidns_profiles karidns_record_tags karidns_record_tinydns karidns_zone_tagdefs karidns_reload_requests karidns_server_status; do
             [ "$(pq "SELECT count(*) FROM pg_tables WHERE tablename = '$t' AND schemaname = current_schema()")" = "1" ] && pass "table $t" || fail "table $t is missing"
         done
-        [ "$(pq "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND c.relname LIKE '%'")" = "47" ] &&
-            pass "47 triggers (9 tables x 3 + prune + the 3 of karidns_reload_requests + item B: the grants trigger on domains, 6 on principals / credentials / memberships, the audit of the 5 karidns_auth tables, the escalation trigger on grants, the 3 on the SOA rows of records for the signer)" ||
+        [ "$(pq "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND c.relname LIKE '%'")" = "48" ] &&
+            pass "48 triggers (9 tables x 3 + prune + the 3 of karidns_reload_requests + item B: the grants trigger on domains, 6 on principals / credentials / memberships, the audit of the 5 karidns_auth tables, the deferred summary trigger on audit_log, the escalation trigger on grants, the 3 on the SOA rows of records for the signer)" ||
             fail "trigger count $(pq "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal")"
         # item B: no audit trigger and no RLS on the PowerDNS tables (the role scripts of the WebAdmin switch them on)
         [ "$(pq "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid WHERE NOT t.tgisinternal AND t.tgname LIKE 'karidns_audit%' AND c.relnamespace = current_schema()::regnamespace")" = "0" ] &&
@@ -389,6 +389,12 @@ else
               n=$(psql -X -q -At "$PGC5" -c "SELECT count(*) FROM karidns_changes" 2>&1);
               mx=$(psql -X -q -At "$PGC5" -c "SELECT max(seq) - min(seq) + 1 FROM karidns_changes" 2>&1);
               [ "$n" = "5" ] && [ "$mx" = "5" ] && pass "prune: the newest 5 of 20 rows are kept" || fail "prune: $n rows, span $mx";
+              { echo "BEGIN;"; i=0; while [ $i -lt 40 ]; do i=$((i + 1)); echo "INSERT INTO domains (name, type) VALUES ('t$i.test', 'NATIVE');"; done; echo "COMMIT;"; } > "$T/prune_tx.sql";
+              psql -X -q -At -v ON_ERROR_STOP=1 "$PGC5" -f "$T/prune_tx.sql" >/dev/null 2>&1;
+              n=$(psql -X -q -At "$PGC5" -c "SELECT count(*) FROM karidns_changes" 2>&1);
+              mx=$(psql -X -q -At "$PGC5" -c "SELECT max(seq) - min(seq) + 1 FROM karidns_changes" 2>&1);
+              last=$(psql -X -q -At "$PGC5" -c "SELECT max(domain_id) = (SELECT max(id) FROM domains) FROM karidns_changes" 2>&1);
+              [ "$n" = "5" ] && [ "$mx" = "5" ] && [ "$last" = "t" ] && pass "prune: 40 statements in one transaction keep the newest 5 rows (the transaction remembers how far it has pruned)" || fail "prune in one transaction: $n rows, span $mx, newest kept $last";
               psql -X -q -d "$PGMAINT" -c "DROP DATABASE IF EXISTS $PGDB5" >/dev/null 2>&1; } ||
             skip "cannot create a second database for the prune test"
 

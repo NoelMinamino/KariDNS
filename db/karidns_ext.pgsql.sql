@@ -93,10 +93,19 @@ CREATE TABLE IF NOT EXISTS karidns_zone_tagdefs (
 -- table.  Added after version 2; applying this file again creates it (the schema version stays 2).
 CREATE INDEX IF NOT EXISTS karidns_zone_tagdefs_domain_idx ON karidns_zone_tagdefs (domain_id);
 
--- prune: keep the newest 1000000 rows (statement level: one DELETE per INSERT statement)
+-- prune: keep the newest 1000000 rows (statement level: one DELETE per INSERT statement).  A transaction with many statements (a row by row import
+-- into a log that is full) deletes the oldest rows again and again, and the rows its earlier statements deleted are still there for the index scan
+-- until it commits; the transaction-local setting karidns.prune_cut remembers how far it has pruned, so each statement starts after that.
 CREATE OR REPLACE FUNCTION karidns_changes_prune_fn() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE
+  cut  bigint := (SELECT max(seq) FROM new_rows) - 1000000;
+  prev bigint := coalesce((SELECT s::bigint FROM (SELECT current_setting('karidns.prune_cut', true) AS s) x WHERE s ~ '^[0-9]{1,18}$'), 0);
 BEGIN
-  DELETE FROM karidns_changes WHERE seq <= (SELECT max(seq) FROM new_rows) - 1000000;
+  IF prev > cut THEN prev := 0; END IF;
+  IF cut > prev THEN
+    DELETE FROM karidns_changes WHERE seq > prev AND seq <= cut;
+    PERFORM set_config('karidns.prune_cut', cut::text, true);
+  END IF;
   RETURN NULL;
 END $$;
 DROP TRIGGER IF EXISTS karidns_changes_prune ON karidns_changes;
@@ -752,22 +761,38 @@ DECLARE
   pid  bigint;
   pname text;
   j    jsonb;
+  gk   text;
+  cur  text;
 BEGIN
   IF NOT karidns_auth.audit_summary() THEN RETURN NULL; END IF;
+  -- The transition table is read alone (count, distinct zones, one domain id), then the name of the one zone is looked up by id: a join of the
+  -- transition table with domains / records can be planned as a hash join of the whole of them, which is what a statement per row cannot afford.
   IF tbl = 'domains' THEN
     q := format('SELECT count(*), count(DISTINCT lower(t.name)), min(lower(t.name)), NULL::bigint FROM %s t', src);
   ELSIF tbl IN ('karidns_record_tags', 'karidns_record_tinydns') THEN
     -- the records of a zone or a record that is being deleted are gone when their tags go: no zone (the record's own row has it)
-    q := format('SELECT count(*), count(DISTINCT d.id), min(lower(d.name)), NULL::bigint FROM %s t LEFT JOIN %I.records r ON r.id = t.record_id '
-                'LEFT JOIN %I.domains d ON d.id = r.domain_id', src, sch, sch);
+    q := format('SELECT count(*), count(DISTINCT y.did), NULL::text, min(y.did) FROM (SELECT (SELECT r.domain_id FROM %I.records r WHERE r.id = t.record_id) AS did FROM %s t) y', sch, src);
   ELSE
-    q := format('SELECT count(*), count(DISTINCT t.domain_id), min(lower(d.name)), min(t.domain_id) FROM %s t LEFT JOIN %I.domains d ON d.id = t.domain_id', src, sch);
+    q := format('SELECT count(*), count(DISTINCT t.domain_id), NULL::text, min(t.domain_id) FROM %s t', src);
   END IF;
   EXECUTE q INTO n, nz, zone, did;
+  IF tbl <> 'domains' AND nz = 1 AND did IS NOT NULL THEN
+    EXECUTE format('SELECT lower(name) FROM %I.domains WHERE id = $1', sch) INTO zone USING did;
+    IF tbl IN ('karidns_record_tags', 'karidns_record_tinydns') THEN did := NULL; END IF;
+  END IF;
   IF n = 0 THEN RETURN NULL; END IF;                       -- a statement that changed no row is not logged
   IF nz <> 1 THEN zone := NULL; END IF;                    -- several zones (or a zone already gone): the row names none
   IF zone IS NULL AND nz = 1 AND did IS NOT NULL THEN      -- the zone is being deleted: karidns_audit_zone remembered its name
     zone := current_setting('karidns.zc_' || substr(md5(sch), 1, 8) || '_' || did, true);
+  END IF;
+  -- The summary row of a transaction, table, operation and zone is inserted by its first statement.  The next statements only count, in a
+  -- transaction-local setting (updating the one row again and again is quadratic: its dead versions pile up in the unique index until the commit);
+  -- audit_summary_fin() writes the totals into the row when the transaction commits.
+  gk := 'karidns.as_' || md5(sch || '|' || tbl || '|' || left(TG_OP, 1) || '|' || coalesce(NULLIF(zone, ''), ''));
+  cur := current_setting(gk, true);
+  IF cur IS NOT NULL AND cur <> '' THEN
+    PERFORM set_config(gk, (split_part(cur, ',', 1)::bigint + 1) || ',' || (split_part(cur, ',', 2)::bigint + n), true);
+    RETURN NULL;
   END IF;
   j := jsonb_build_object('summary', true, 'statements', 1, 'rows', n);
   pid := NULLIF(current_setting('karidns.principal', true), '')::bigint;
@@ -780,8 +805,33 @@ BEGIN
                                                                                       'rows', (a.before ->> 'rows')::bigint + n) END,
                   after  = CASE WHEN a.after IS NOT NULL THEN jsonb_build_object('summary', true, 'statements', (a.after ->> 'statements')::bigint + 1,
                                                                                     'rows', (a.after ->> 'rows')::bigint + n) END;
+  PERFORM set_config(gk, '1,' || n, true);
   RETURN NULL;
 END $$;
+
+-- AFTER INSERT on audit_log, DEFERRED to the commit, for the summary rows: the totals of the statements audit_stmt() only counted
+CREATE OR REPLACE FUNCTION karidns_auth.audit_summary_fin() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+DECLARE
+  cur text := current_setting('karidns.as_' || md5(NEW.data_schema || '|' || NEW.table_name || '|' || NEW.op || '|' || coalesce(NEW.zone_name, '')), true);
+  s   bigint;
+  r   bigint;
+BEGIN
+  IF cur IS NULL OR cur = '' THEN RETURN NULL; END IF;
+  s := split_part(cur, ',', 1)::bigint;
+  r := split_part(cur, ',', 2)::bigint;
+  IF s > 1 THEN
+    UPDATE karidns_auth.audit_log a
+       SET before = CASE WHEN a.before IS NOT NULL THEN jsonb_build_object('summary', true, 'statements', greatest(s, (a.before ->> 'statements')::bigint),
+                                                                               'rows', greatest(r, (a.before ->> 'rows')::bigint)) END,
+           after  = CASE WHEN a.after IS NOT NULL THEN jsonb_build_object('summary', true, 'statements', greatest(s, (a.after ->> 'statements')::bigint),
+                                                                              'rows', greatest(r, (a.after ->> 'rows')::bigint)) END
+     WHERE a.id = NEW.id;
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS karidns_audit_summary_fin ON karidns_auth.audit_log;
+CREATE CONSTRAINT TRIGGER karidns_audit_summary_fin AFTER INSERT ON karidns_auth.audit_log DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+  WHEN ((NEW.after ->> 'summary') = 'true' OR (NEW.before ->> 'summary') = 'true') EXECUTE FUNCTION karidns_auth.audit_summary_fin();
 
 -- BEFORE DELETE on domains: remember the name for the rows of the zone that the cascade deletes next (the domains row is gone by then).
 -- The name is kept in a transaction-local setting karidns.zc_<hash of the schema>_<domain id> (one per deleted zone; it goes away with the
@@ -992,6 +1042,21 @@ CREATE OR REPLACE FUNCTION karidns_auth.rr_visible(sch text, zone text, nm text,
                      OR lower(nm) = g.name_suffix OR right(lower(nm), length(g.name_suffix) + 1) = '.' || g.name_suffix
                      OR (lower(nm) = lower(zone) AND karidns_auth.canon_type(typ) IN ('SOA', 'NS')))))
   )
+$$;
+
+-- The fast path of the SELECT policies of domains and records (4.8 of the design; docs/karidns-dbloader.md, "Measurements").  rr_visible() and zone_grant()
+-- look the grants up again for every row.  The policies of a data schema read two functions that create_policies(schema) generates for that schema
+-- (their names: fast_fn(schema, 'eff_grants') and fast_fn(schema, 'name_in_zone')):
+--   eff_grants()                  the effective grants of the acting principal, ONCE per statement (PostgreSQL does not run a function scan again for the
+--                                 next row), already joined to the zones' domains.id (NULL for a global master), with the lengths and dotted forms the
+--                                 policy compares with, so a row costs a few string operations and no index lookup.  Columns: grole, domain_id,
+--                                 zone_name, zone_len (length + 1), zone_dot ('.' || zone_name), name_suffix, suffix_len, suffix_dot (NULL for a grant
+--                                 without a suffix).
+--   name_in_zone(domain_id, name) is the name inside the zone of the domain (a global master sees every row whose name is in its zone).
+-- The rules are those of rr_visible.  A grant's zone is matched as domains.name or domains.name with a final dot, which relies on what the PowerDNS
+-- schema enforces: domains.name is lower case.
+CREATE OR REPLACE FUNCTION karidns_auth.fast_fn(sch text, base text) RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE SET search_path = pg_catalog, pg_temp AS $$
+  SELECT pg_catalog.format('karidns_auth.%I', base || '_' || pg_catalog.substr(pg_catalog.md5(sch), 1, 8))
 $$;
 
 -- an audit_log row is visible to a global master, and to a domain master of the row's zone (the rows about grants name the data schema in the JSON)
@@ -1211,6 +1276,8 @@ DECLARE
   zn   text := $q$lower(regexp_replace(%s, '[.]$', ''))$q$;
   w    text;
   nm   text;
+  fe   text;       -- the generated fast path functions of a data schema
+  fz   text;
 BEGIN
   IF sch = 'karidns_auth' THEN
     -- audit_log: append only for the roles (the owner and the SECURITY DEFINER triggers write it); read by scope
@@ -1244,10 +1311,33 @@ BEGIN
 
   -- ---- a data schema
   zr := format('(SELECT %s FROM %I.domains d WHERE d.id = %%1$s.domain_id)', format(zn, 'd.name'), sch);
+  -- the fast path functions of this schema (see fast_fn): the effective grants once per statement, and the name-in-zone test of a global master's rows
+  fe := karidns_auth.fast_fn(sch, 'eff_grants');
+  fz := karidns_auth.fast_fn(sch, 'name_in_zone');
+  IF to_regclass(format('%I.domains', sch)) IS NOT NULL THEN
+    EXECUTE format($f$CREATE OR REPLACE FUNCTION %1$s() RETURNS TABLE (grole text, domain_id bigint, zone_name text, zone_len integer, zone_dot text,
+                                                                     name_suffix text, suffix_len integer, suffix_dot text)
+      LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $b$
+      SELECT g.role::text, d.id::bigint, g.zone_name::text, length(g.zone_name) + 1, '.' || g.zone_name, g.name_suffix::text, length(g.name_suffix) + 1, '.' || g.name_suffix
+        FROM karidns_auth.principal_closure c
+        JOIN karidns_auth.principals gp ON gp.id = c.group_id AND NOT gp.disabled
+        JOIN karidns_auth.grants g ON g.principal_id = c.group_id
+        LEFT JOIN %2$I.domains d ON g.role <> 'global_master' AND d.name IN (g.zone_name, g.zone_name || '.')
+       WHERE c.member_id = karidns_auth.current_principal() AND (g.role = 'global_master' OR g.data_schema = %3$L)
+      $b$ $f$, fe, sch, sch);
+    EXECUTE format($f$CREATE OR REPLACE FUNCTION %1$s(did bigint, nm text) RETURNS boolean
+      LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $b$
+      SELECT EXISTS (SELECT 1 FROM (SELECT lower(CASE WHEN right(d.name, 1) = '.' THEN left(d.name, -1) ELSE d.name END) AS z FROM %2$I.domains d WHERE d.id = did) x
+                      WHERE x.z <> '' AND (lower(nm) = x.z OR right(lower(nm), length(x.z) + 1) = '.' || x.z))
+      $b$ $f$, fz, sch);
+    EXECUTE format('REVOKE EXECUTE ON FUNCTION %s(), %s(bigint, text) FROM PUBLIC', fe, fz);
+  END IF;
   -- domains
   IF to_regclass(format('%I.domains', sch)) IS NOT NULL THEN
     rel := format('%I.domains', sch)::regclass;
-    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', format('karidns_auth.zone_grant(%s, %s) IS NOT NULL', lit, format(zn, 'domains.name')), NULL);
+    -- a zone the principal has a grant on (a hashed lookup of the ids eff_grants() returns once), or any zone for a global master
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT',
+      format('domains.id IN (SELECT g.domain_id FROM %1$s() g) OR (SELECT coalesce(bool_or(g.grole = ''global_master''), false) FROM %1$s() g)', fe), NULL);
     PERFORM karidns_auth.set_policy(rel, 'karidns_rls_insert', 'INSERT', NULL, 'karidns_auth.is_global()');
     PERFORM karidns_auth.set_policy(rel, 'karidns_rls_update', 'UPDATE', 'karidns_auth.is_global()', 'karidns_auth.is_global()');
     PERFORM karidns_auth.set_policy(rel, 'karidns_rls_delete', 'DELETE', 'karidns_auth.is_global()', NULL);
@@ -1257,7 +1347,16 @@ BEGIN
   IF to_regclass(format('%I.records', sch)) IS NOT NULL THEN
     rel := format('%I.records', sch)::regclass;
     w := format('karidns_auth.rr_ok(%s, %s, records.name, records.type, records.ttl)', lit, format(zr, 'records'));
-    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', format('karidns_auth.rr_visible(%s, %s, records.name, records.type)', lit, format(zr, 'records')), NULL);
+    -- reading: the rules of rr_visible(), without a function call and a lookup per row (the fast path: see eff_grants()).  A grant on the row's domain
+    -- (domain master: the name is in the zone; subdomain master: it is in the suffix, or it is the apex SOA / NS), or, for a global master, a name inside
+    -- the zone of the row's domain.
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', format(
+      '(EXISTS (SELECT 1 FROM %1$s() g WHERE g.domain_id = records.domain_id '
+      'AND (right(lower(records.name), g.zone_len) = g.zone_dot OR lower(records.name) = g.zone_name) '
+      'AND (g.grole = ''domain_master'' OR right(lower(records.name), g.suffix_len) = g.suffix_dot OR lower(records.name) = g.name_suffix '
+      'OR (lower(records.name) = g.zone_name AND karidns_auth.canon_type(records.type) IN (''SOA'', ''NS''))))) '
+      'OR ((SELECT coalesce(bool_or(g.grole = ''global_master''), false) FROM %1$s() g) AND %2$s(records.domain_id, records.name))',
+      fe, fz), NULL);
     PERFORM karidns_auth.set_policy(rel, 'karidns_rls_insert', 'INSERT', NULL, w);
     PERFORM karidns_auth.set_policy(rel, 'karidns_rls_update', 'UPDATE', w, w);
     PERFORM karidns_auth.set_policy(rel, 'karidns_rls_delete', 'DELETE', w, NULL);
@@ -1433,7 +1532,7 @@ END $$;
 -- rr_types_ok stay with PUBLIC: CHECK constraints call them as the role that inserts the row.
 REVOKE EXECUTE ON FUNCTION karidns_auth.credentials_user_only_fn(), karidns_auth.principals_kind_fn(), karidns_auth.principals_self_fn(),
   karidns_auth.principals_delete_fn(), karidns_auth.memberships_check_fn(), karidns_auth.memberships_closure_fn(), karidns_auth.domains_grants_fn(),
-  karidns_auth.audit_row(), karidns_auth.audit_stmt(), karidns_auth.audit_zone_fn(), karidns_auth.audit_summary(),
+  karidns_auth.audit_row(), karidns_auth.audit_stmt(), karidns_auth.audit_summary_fin(), karidns_auth.audit_zone_fn(), karidns_auth.audit_summary(),
   karidns_auth.enable_audit(text), karidns_auth.disable_audit(text) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION karidns_auth.current_principal(), karidns_auth.my_groups(), karidns_auth.zone_grant(text, text), karidns_auth.is_global(),
   karidns_auth.rr_ok(text, text, text, text, integer), karidns_auth.rr_visible(text, text, text, text), karidns_auth.audit_visible(text, text, text, jsonb, jsonb),
@@ -1443,7 +1542,8 @@ REVOKE EXECUTE ON FUNCTION karidns_auth.current_principal(), karidns_auth.my_gro
   karidns_auth.create_signer_policies(text, text), karidns_auth.enable_rls(text), karidns_auth.disable_rls(text) FROM PUBLIC;
 -- (canon_type, is_dnssec_type and setting_principal stay with PUBLIC: the policies and the trigger conditions of the signer call them as the signer.)
 -- The role scripts grant EXECUTE on current_principal, my_groups, zone_grant, is_global, rr_ok, rr_visible and audit_visible (and bump_serial to the API
--- role) to their role and to karidns_rls_trusted: the policies call them as the role that runs the statement.
+-- role) to their role and to karidns_rls_trusted: the policies call them as the role that runs the statement.  The generated functions of the fast path
+-- (fast_fn(schema, 'eff_grants'), fast_fn(schema, 'name_in_zone')) are granted the same way, per schema.
 
 
 -- the versions, last: a fresh install whose karidns_auth part fails stays version 2 (a version 1 database is not touched: it needs

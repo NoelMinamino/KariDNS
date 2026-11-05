@@ -83,6 +83,10 @@ SELECT format('GRANT USAGE ON SEQUENCE %I.%I TO %I', n.nspname, s.relname, :'rol
 GRANT EXECUTE ON FUNCTION karidns_auth.current_principal(), karidns_auth.my_groups(), karidns_auth.zone_grant(text, text), karidns_auth.is_global(),
   karidns_auth.rr_ok(text, text, text, text, integer), karidns_auth.rr_visible(text, text, text, text),
   karidns_auth.audit_visible(text, text, text, jsonb, jsonb) TO :"role", karidns_rls_trusted;
+-- the functions of the fast path that create_policies() generates for this schema (the SELECT policies of domains and records call them)
+SELECT format('GRANT EXECUTE ON FUNCTION %s(), %s(bigint, text) TO %I, karidns_rls_trusted', karidns_auth.fast_fn(:'schema', 'eff_grants'),
+              karidns_auth.fast_fn(:'schema', 'name_in_zone'), :'role')
+\gexec
 
 INSERT INTO karidns_auth.audit_restricted_roles (role_name) VALUES (:'role') ON CONFLICT DO NOTHING;
 INSERT INTO karidns_auth.signer_roles (role_name) VALUES (:'role') ON CONFLICT DO NOTHING;
