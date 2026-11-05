@@ -11,6 +11,7 @@
 #include "../dns_utils.h"
 #include "../dns_wire.h"
 #include "../dns_zone_lint.h"
+#include "../dns_diag.h"
 #include "../dns_db_checkproto.h"
 #include "../dns_cidr.h"
 #include "../dns_tsig_acl.h"
@@ -42,7 +43,7 @@ KARIDNS_TOOL_FN char *read_file_or_die(const char *path, bool *out_failed) {
     FILE *f = fopen(path, "r");
     if (!f) {
         if (out_failed) *out_failed = true;
-        fprintf(stderr, "[ERROR] Could not open file: %s (%s)\n", path, strerror(errno));
+        dns_diag(DIAG_ERROR, DC_IO_OPEN, path, 0, "Could not open file: %s (%s)\n", path, strerror(errno));
         return NULL;
     }
     /* A directory (or FIFO/device) opens fine on some systems, but its ftell()
@@ -52,7 +53,7 @@ KARIDNS_TOOL_FN char *read_file_or_die(const char *path, bool *out_failed) {
     if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode)) {
         fclose(f);
         if (out_failed) *out_failed = true;
-        fprintf(stderr, "[ERROR] Not a regular file: %s\n", path);
+        dns_diag(DIAG_ERROR, DC_IO_NOT_REGULAR, path, 0, "Not a regular file: %s\n", path);
         return NULL;
     }
     fseek(f, 0, SEEK_END);
@@ -61,20 +62,70 @@ KARIDNS_TOOL_FN char *read_file_or_die(const char *path, bool *out_failed) {
     if (len < 0) {
         fclose(f);
         if (out_failed) *out_failed = true;
-        fprintf(stderr, "[ERROR] Could not read file: %s\n", path);
+        dns_diag(DIAG_ERROR, DC_IO_READ, path, 0, "Could not read file: %s\n", path);
         return NULL;
     }
     char *buf = malloc(len + 1);
     if (!buf) {
         fclose(f);
         if (out_failed) *out_failed = true;
-        fprintf(stderr, "[ERROR] Out of memory reading file: %s\n", path);
+        dns_diag(DIAG_ERROR, DC_INTERNAL_OOM, path, 0, "Out of memory reading file: %s\n", path);
         return NULL;
     }
     size_t read_bytes = fread(buf, 1, len, f);
     buf[read_bytes] = '\0';
     fclose(f);
     if (out_failed) *out_failed = false;
+    return buf;
+}
+
+/* `karicheck zone <domain> -`: the zone text comes from standard input, at most 64 MiB (a bigger zone is refused, not cut).  The name the
+ * messages and the JSON document give the "file". */
+#define KC_STDIN_NAME "<stdin>"
+#define KC_STDIN_MAX ((size_t)64 << 20)
+
+KARIDNS_TOOL_FN char *kc_read_stdin(bool *out_failed) {
+    size_t len = 0, cap = 65536;
+    char *buf = malloc(cap + 1);
+    *out_failed = true;
+    if (!buf) {
+        dns_diag(DIAG_ERROR, DC_INTERNAL_OOM, KC_STDIN_NAME, 0, "Out of memory reading standard input\n");
+        return NULL;
+    }
+    for (;;) {
+        if (len == cap) {
+            if (cap >= KC_STDIN_MAX) {                  /* full, and there may be more: one more byte decides */
+                char probe;
+                ssize_t more;
+                while ((more = read(0, &probe, 1)) < 0 && errno == EINTR) {}
+                if (more == 0) break;
+                free(buf);
+                dns_diag(DIAG_ERROR, DC_IO_STDIN_TOO_LARGE, KC_STDIN_NAME, 0,
+                         "The zone text on standard input is larger than %zu bytes\n", (size_t)KC_STDIN_MAX);
+                return NULL;
+            }
+            cap *= 2;
+            char *nb = realloc(buf, cap + 1);
+            if (!nb) {
+                free(buf);
+                dns_diag(DIAG_ERROR, DC_INTERNAL_OOM, KC_STDIN_NAME, 0, "Out of memory reading standard input\n");
+                return NULL;
+            }
+            buf = nb;
+        }
+        ssize_t got = read(0, buf + len, cap - len);
+        if (got < 0 && errno == EINTR) continue;
+        if (got < 0) {
+            int e = errno;
+            free(buf);
+            dns_diag(DIAG_ERROR, DC_IO_STDIN_READ, KC_STDIN_NAME, 0, "Could not read standard input: %s\n", strerror(e));
+            return NULL;
+        }
+        if (got == 0) break;
+        len += (size_t)got;
+    }
+    buf[len] = '\0';
+    *out_failed = false;
     return buf;
 }
 
@@ -132,8 +183,14 @@ KARIDNS_TOOL_FN void print_error_context(const char *root_file_path, const char 
     const char *line_end = line_start;
     while (*line_end && *line_end != '\n' && *line_end != '\r') line_end++;
 
-    fprintf(stderr, "[ERROR] Syntax error in %s at line %d\n", file_path, line);
-    fprintf(stderr, "Reason: %s\n\n", err->error_message);
+    const char *reason = err->error_message;
+    dns_diag_code_t code = DC_ZONE_SYNTAX;
+    if (strcmp(file_path, KC_STDIN_NAME) == 0 && reason && strncmp(reason, "$INCLUDE is not available", 25) == 0) {
+        code = DC_ZONE_INCLUDE_STDIN;                    /* a zone read from standard input has no directory to include from */
+        reason = "$INCLUDE is refused in a zone read from standard input";
+    }
+    dns_diag(DIAG_ERROR, code, file_path, line, "Syntax error in %s at line %d\n", file_path, line);
+    dns_diag_detail("Reason: %s\n\n", reason);
 
     // Limit line length to 80 chars
     size_t len = line_end - line_start;
@@ -156,6 +213,7 @@ KARIDNS_TOOL_FN void print_error_context(const char *root_file_path, const char 
         caret_pos = offset - (print_start - buf);
     }
 
+    if (dns_diag_json_enabled()) return;      /* the document has the file, the line and the reason */
     fprintf(stderr, "%4d | ", line);
     if (clipped_start) fprintf(stderr, "... ");
     for (size_t i = 0; i < len; i++) {
@@ -214,7 +272,7 @@ typedef struct { const char *zone; kc_tally_t *tally; } kc_out_of_zone_ud_t;
 
 static void karicheck_report_out_of_zone(const dns_record_t *rec, void *ud) {
     const kc_out_of_zone_ud_t *u = ud;
-    kc_warning(u->tally, "Zone '%s': out-of-zone record '%s' %s ignored (not at or below the zone apex; "
+    kc_warning(u->tally, DC_ZONE_OUT_OF_ZONE, "Zone '%s': out-of-zone record '%s' %s ignored (not at or below the zone apex; "
                          "the server does not load it)\n",
                u->zone, rec->name ? rec->name : "", rec->type ? rec->type : "");
 }
@@ -224,7 +282,7 @@ static bool kc_view_has_zone(const void *ud, const char *name) {
     return view_find_zone_config((const view_config_t *)ud, name) != NULL || view_find_in_view((const view_config_t *)ud, name) != NULL;
 }
 
-KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bool is_standalone, bool is_catalog, const char *file_format, const zone_config_t *zcfg, const server_config_t *cfg, const view_config_t *view) {
+KARIDNS_TOOL_FN int check_zone_run(const char *domain_raw, const char *file_arg, bool is_standalone, bool is_catalog, const char *file_format, const zone_config_t *zcfg, const server_config_t *cfg, const view_config_t *view) {
     // Normalize domain to FQDN: append trailing dot if missing.
     // Without this, "example.com" wouldn't match records expanded to "example.com."
     char domain_buf[256];
@@ -235,14 +293,17 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     /* D-24: karidns は相対パス ("../" を含むものも) を起動時のディレクトリから、絶対パスはそのまま
      * 開くので、standalone モードでも絶対パスや "../" を警告しない */
 
+    /* `-` as the zone file of the standalone mode: the zone text comes from standard input (D-4) */
+    bool from_stdin = is_standalone && strcmp(file_arg, "-") == 0;
+    const char *file_path = from_stdin ? KC_STDIN_NAME : file_arg;
     bool failed = false;
-    char *buf = read_file_or_die(file_path, &failed);
+    char *buf = from_stdin ? kc_read_stdin(&failed) : read_file_or_die(file_path, &failed);
     if (failed || !buf) return 1;
 
     char *mutable_buf = strdup(buf);
     if (!mutable_buf) {
         free(buf);
-        kc_error(&tally, "Out of memory\n");
+        kc_error(&tally, DC_INTERNAL_OOM, "Out of memory\n");
         return 1;
     }
 
@@ -254,7 +315,7 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         free(root_path_copy);
         free(mutable_buf);
         free(buf);
-        kc_error(&tally, "Out of memory\n");
+        kc_error(&tally, DC_INTERNAL_OOM, "Out of memory\n");
         return 1;
     }
 
@@ -270,7 +331,7 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
 
     char *base_dir = get_base_dir(file_path);
     if (!base_dir) {
-        kc_error(&tally, "Out of memory allocating base_dir\n");
+        kc_error(&tally, DC_INTERNAL_OOM, "Out of memory allocating base_dir\n");
         free(root_path);
         return 1;
     }
@@ -299,11 +360,12 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     dev_t root_dev = 0;
     ino_t root_ino = 0;
     struct stat root_st;
-    if (stat(file_path, &root_st) == 0) {
+    memset(&root_st, 0, sizeof(root_st));
+    if (from_stdin || stat(file_path, &root_st) == 0) {
         root_dev = root_st.st_dev;
         root_ino = root_st.st_ino;
     } else {
-        fprintf(stderr, "Failed to stat root zone file: %s\n", file_path);
+        dns_diag(DIAG_ERROR | DIAG_UNTAGGED, DC_IO_STAT, file_path, 0, "Failed to stat root zone file: %s\n", file_path);
         free((void*)base_dir);
         free(root_path);
         return 1;
@@ -321,7 +383,7 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         .visited_inos = visited_inos,
         .visited_count = 1,
         .visited_cap = 16,
-        .load_file_cb = karicheck_load_file_cb,
+        .load_file_cb = from_stdin ? NULL : karicheck_load_file_cb,       /* stdin: no $INCLUDE (the parser says so) */
         .shared_ttl_io = &root_ttl,
         .shared_ecs_tag_io = &root_ecs_tag,
         .shared_loc_tag_io = &root_loc_tag
@@ -357,13 +419,13 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     kc_out_of_zone_ud_t ooz = {domain, &tally};
     zone_arena_drop_out_of_zone(&arena, domain, karicheck_report_out_of_zone, &ooz);
     if (ctx.out_of_zone_count > 0) {
-        kc_warning(&tally, "Zone '%s': %zu tinydns record(s) belong to no zone configured in the same "
+        kc_warning(&tally, DC_ZONE_TINYDNS_OUT_OF_ZONE, "Zone '%s': %zu tinydns record(s) belong to no zone configured in the same "
                         "view and are ignored (first: '%s')\n",
                 domain, ctx.out_of_zone_count, ctx.first_out_of_zone ? ctx.first_out_of_zone : "");
     }
 
     if (arena.count == 0) {
-        kc_error(&tally, "No records found in zone '%s' (%s)\n", domain, file_path);
+        kc_error(&tally, DC_ZONE_EMPTY, "No records found in zone '%s' (%s)\n", domain, file_path);
         free((void*)ctx.base_dir);
         zone_arena_destroy(&arena);
         free(root_path);
@@ -372,19 +434,19 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
 
     zone_lint_ttl(&arena, "zone file", &tally);
     if (ctx.no_ttl_count > 0 && !(file_format && strcasecmp(file_format, "tinydns") == 0)) {
-        kc_warning(&tally, "Zone '%s': %s:%zu: no TTL specified for '%s' (no $TTL, no earlier TTL, no SOA to take one from); %zu record(s) are "
+        kc_warning(&tally, DC_ZONE_TTL_MISSING, "Zone '%s': %s:%zu: no TTL specified for '%s' (no $TTL, no earlier TTL, no SOA to take one from); %zu record(s) are "
                         "served with 3600; BIND rejects such a zone (\"no TTL specified\"). Add a $TTL line\n",
                 domain, ctx.first_no_ttl_file ? ctx.first_no_ttl_file : file_path, ctx.first_no_ttl_line,
                 ctx.first_no_ttl_owner ? ctx.first_no_ttl_owner : "", ctx.no_ttl_count);
     }
     if (ctx.long_txt_count > 0 && !(file_format && strcasecmp(file_format, "tinydns") == 0)) {
-        kc_warning(&tally, "Zone '%s': %s:%zu: a character-string of more than 255 octets in '%s' (%zu record(s) in all); BIND rejects this. It is served as 255-octet strings\n",
+        kc_warning(&tally, DC_ZONE_STRING_LONG, "Zone '%s': %s:%zu: a character-string of more than 255 octets in '%s' (%zu record(s) in all); BIND rejects this. It is served as 255-octet strings\n",
                 domain, ctx.first_long_txt_file ? ctx.first_long_txt_file : file_path, ctx.first_long_txt_line,
                 ctx.first_long_txt_owner ? ctx.first_long_txt_owner : "", ctx.long_txt_count);
     }
 
     if (build_zone_index(&arena, true) != 0) {
-        kc_error(&tally, "Memory allocation failed during index build for '%s'\n", domain);
+        kc_error(&tally, DC_INTERNAL_OOM, "Memory allocation failed during index build for '%s'\n", domain);
         free((void*)ctx.base_dir);
         zone_arena_destroy(&arena);
         free(root_path);
@@ -413,7 +475,7 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         zone_limits_effective(cfg, zcfg, view ? view->name : NULL, &lim);
         char lim_err[320];
         if (zone_arena_check_limits(&arena, &lim, lim_err, sizeof(lim_err)) < 0) {
-            kc_error(&tally, "Zone '%s': %s (the server does not load this zone)\n", domain, lim_err);
+            kc_error(&tally, DC_ZONE_LIMITS, "Zone '%s': %s (the server does not load this zone)\n", domain, lim_err);
             free((void*)ctx.base_dir);
             zone_arena_destroy(&arena);
             free(root_path);
@@ -423,7 +485,7 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     {   /* B9a (design 3.6b): PowerDNS ALIAS / LUA records.  The same rules the server applies when it publishes the zone. */
         char pdns_why[400];
         if (validate_zone_pdns_types(&arena, &err, pdns_why, sizeof(pdns_why)) < 0) {
-            kc_error(&tally, "Zone '%s': %s (the server does not load this zone)\n", domain, pdns_why);
+            kc_error(&tally, DC_ZONE_PDNS_TYPES, "Zone '%s': %s (the server does not load this zone)\n", domain, pdns_why);
             free((void*)ctx.base_dir);
             zone_arena_destroy(&arena);
             free(root_path);
@@ -431,7 +493,7 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         }
     }
 
-    fprintf(stdout, "[OK] Zone '%s' parsed successfully (%zu records)\n", domain, arena.count);
+    dns_diag_plain(stdout, "[OK] Zone '%s' parsed successfully (%zu records)\n", domain, arena.count);
     zone_lint_pdns_types(&arena, domain, &tally);
     {
         /* the library of zone checks (dns_zone_lint.c) is shared with karidns-dbloader --check, which runs it on database zones */
@@ -449,16 +511,33 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         zone_lint_records(&arena, &lin, &tally);
     }
 
-    printf("[RESULT] Zone '%s': %d error(s), %d warning(s)\n", domain, tally.errors, tally.warnings);
+    dns_diag_plain(stdout, "[RESULT] Zone '%s': %d error(s), %d warning(s)\n", domain, tally.errors, tally.warnings);
     free((void*)ctx.base_dir);
     zone_arena_destroy(&arena); // frees mutable_buf via arena.file_bufs[0]; do not free() it again here
     free(root_path);
     if (tally.errors > 0) {
-        fprintf(stderr, "[FAIL] Zone '%s' contains invalid records.\n", domain);
+        dns_diag_plain(stderr, "[FAIL] Zone '%s' contains invalid records.\n", domain);
         return 1;
     }
-    printf("[OK] Zone '%s' is valid.\n", domain);
+    dns_diag_plain(stdout, "[OK] Zone '%s' is valid.\n", domain);
     return 0;
+}
+
+/* One zone: check_zone_run() with the context JSON mode needs (what the messages are about) and the zones[] entry that sums them up.
+ * The file `-` of the standalone mode is standard input. */
+KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bool is_standalone, bool is_catalog, const char *file_format, const zone_config_t *zcfg, const server_config_t *cfg, const view_config_t *view) {
+    char domain[256];
+    normalize_domain_fqdn(domain_raw, domain, sizeof(domain));
+    const char *shown = is_standalone && strcmp(file_path, "-") == 0 ? KC_STDIN_NAME : file_path;
+    const char *vname = view ? view->name : NULL;
+    dns_diag_set_zone(domain, vname);
+    dns_diag_set_file(shown);
+    dns_diag_mark_t mark = dns_diag_mark();
+    int rc = check_zone_run(domain_raw, file_path, is_standalone, is_catalog, file_format, zcfg, cfg, view);
+    dns_diag_zone_result(domain, vname, shown, file_format && strcasecmp(file_format, "tinydns") == 0 ? "tinydns" : "bind", mark);
+    dns_diag_set_zone(NULL, NULL);
+    dns_diag_set_file(NULL);
+    return rc;
 }
 
 KARIDNS_TOOL_FN bool kc_db_identity(const database_config_t *db, uid_t *uid, gid_t *gid, bool *drop, char *who, size_t whocap);
@@ -561,7 +640,7 @@ KARIDNS_TOOL_FN bool kc_check_loader_file(kc_tally_t *t, const char *lp) {
     char err[600];
     int fd = exec_file_open_checked(lp, geteuid(), "database loader", "this user", err, sizeof(err));
     if (fd < 0) {
-        kc_error(t, "%s; karidns refuses to run it\n", err);
+        kc_error(t, DC_CONF_DATABASE_LOADER_FILE, "%s; karidns refuses to run it\n", err);
         return false;
     }
     close(fd);
@@ -572,11 +651,11 @@ KARIDNS_TOOL_FN bool kc_check_loader_file(kc_tally_t *t, const char *lp) {
 KARIDNS_TOOL_FN void kc_check_loader_driver(kc_tally_t *t, const database_config_t *db, const char *lp, const char *driver) {
     char drivers[256];
     if (!kc_loader_drivers(db, lp, drivers, sizeof(drivers)))
-        kc_error(t, "database loader '%s' did not answer --drivers; is it karidns-dbloader?\n", lp);
+        kc_error(t, DC_CONF_DATABASE_LOADER_ANSWER, "database loader '%s' did not answer --drivers; is it karidns-dbloader?\n", lp);
     else if (!kc_line_listed(drivers, driver)) {
         for (char *c = drivers; *c; c++)
             if (*c == '\n') *c = (c[1] ? ',' : '\0');
-        kc_error(t, "driver %s is not available in this installation (the loader '%s' has: %s)\n", driver, lp,
+        kc_error(t, DC_CONF_DATABASE_DRIVER, "driver %s is not available in this installation (the loader '%s' has: %s)\n", driver, lp,
                  drivers[0] ? drivers : "no driver");
     }
 }
@@ -620,15 +699,15 @@ KARIDNS_TOOL_FN bool kc_conninfo_unix_socket(const char *s) {
 KARIDNS_TOOL_FN void kc_check_sqlite_file(kc_tally_t *t, const char *what, const char *path) {
     struct stat st;
     if (stat(path, &st) != 0) {
-        kc_error(t, "%s: database file '%s': %s\n", what, path, strerror(errno));
+        kc_error(t, DC_CONF_DATABASE_FILE, "%s: database file '%s': %s\n", what, path, strerror(errno));
         return;
     }
     if (!S_ISREG(st.st_mode)) {
-        kc_error(t, "%s: database file '%s' is not a regular file\n", what, path);
+        kc_error(t, DC_CONF_DATABASE_FILE_TYPE, "%s: database file '%s' is not a regular file\n", what, path);
         return;
     }
     if (st.st_mode & S_IROTH)
-        kc_warning(t, "%s: database file '%s' is readable by everyone (mode %04o); the zone data should be private\n",
+        kc_warning(t, DC_CONF_DATABASE_FILE_READABLE, "%s: database file '%s' is readable by everyone (mode %04o); the zone data should be private\n",
                    what, path, (unsigned)(st.st_mode & 07777));
     char dir[PATH_MAX];
     snprintf(dir, sizeof(dir), "%s", path);
@@ -637,10 +716,10 @@ KARIDNS_TOOL_FN void kc_check_sqlite_file(kc_tally_t *t, const char *what, const
     else snprintf(dir, sizeof(dir), ".");
     struct stat ds;
     if (stat(dir, &ds) == 0 && (ds.st_mode & S_IWOTH) && !(ds.st_mode & S_ISVTX))
-        kc_warning(t, "%s: the directory '%s' of the database file is writable by everyone\n", what, dir);
+        kc_warning(t, DC_CONF_DATABASE_DIR_WRITABLE, "%s: the directory '%s' of the database file is writable by everyone\n", what, dir);
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        kc_warning(t, "%s: cannot read '%s' to check its journal mode: %s (run karicheck as the loader user to check it)\n",
+        kc_warning(t, DC_CONF_DATABASE_FILE_UNREADABLE, "%s: cannot read '%s' to check its journal mode: %s (run karicheck as the loader user to check it)\n",
                    what, path, strerror(errno));
         return;
     }
@@ -649,13 +728,13 @@ KARIDNS_TOOL_FN void kc_check_sqlite_file(kc_tally_t *t, const char *what, const
     close(fd);
     if (n < 20 || memcmp(h, "SQLite format 3\0", 16) != 0) {
         if (n == 0)
-            kc_error(t, "%s: database file '%s' is empty; create the PowerDNS schema first\n", what, path);
+            kc_error(t, DC_CONF_DATABASE_FILE_EMPTY, "%s: database file '%s' is empty; create the PowerDNS schema first\n", what, path);
         else
-            kc_error(t, "%s: '%s' is not an SQLite3 database\n", what, path);
+            kc_error(t, DC_CONF_DATABASE_FILE_FORMAT, "%s: '%s' is not an SQLite3 database\n", what, path);
         return;
     }
     if (h[18] != 2 || h[19] != 2)
-        kc_error(t, "%s: database file '%s' is not in WAL mode (run: sqlite3 '%s' 'PRAGMA journal_mode=WAL;')\n", what,
+        kc_error(t, DC_CONF_DATABASE_WAL, "%s: database file '%s' is not in WAL mode (run: sqlite3 '%s' 'PRAGMA journal_mode=WAL;')\n", what,
                  path, path);
 }
 
@@ -674,14 +753,14 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
     bool id_root = identity_names_root(db->loader_user, db->loader_group, id_err, sizeof(id_err));
     if (db->loader_user) {
         struct passwd *pw = getpwnam(db->loader_user);
-        if (!pw) kc_error(&t, "database loader-user '%s' does not exist\n", db->loader_user);
+        if (!pw) kc_error(&t, DC_CONF_DATABASE_LOADER_USER, "database loader-user '%s' does not exist\n", db->loader_user);
         else if (!id_root) { loader_uid = pw->pw_uid; have_uid = true; }
     } else {
-        kc_warning(&t, "database: no loader-user; karidns refuses to start as root without one\n");
+        kc_warning(&t, DC_CONF_DATABASE_LOADER_USER_MISSING, "database: no loader-user; karidns refuses to start as root without one\n");
     }
     if (db->loader_group && !getgrnam(db->loader_group))
-        kc_error(&t, "database loader-group '%s' does not exist\n", db->loader_group);
-    if (id_root) kc_error(&t, "database loader-user / loader-group: %s; karidns refuses to start\n", id_err);
+        kc_error(&t, DC_CONF_DATABASE_LOADER_GROUP, "database loader-group '%s' does not exist\n", db->loader_group);
+    if (id_root) kc_error(&t, DC_CONF_DATABASE_IDENTITY_ROOT, "database loader-user / loader-group: %s; karidns refuses to start\n", id_err);
 
     /* loader-path: owned by root (or by the user running karidns), not group / world writable, executable; and it has the driver.
      * Run by root, --drivers is run as loader-user (kc_loader_spawn()); without a loader-user root cannot run it at all. */
@@ -689,24 +768,24 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
     bool loader_ok = kc_check_loader_file(&t, lp);
     if (loader_ok && db->driver) {
         if (geteuid() == 0 && !have_uid)
-            kc_warning(&t, "database loader '%s': --drivers was not run: karicheck is run by root and the loader is only run as loader-user\n", lp);
+            kc_warning(&t, DC_CONF_DATABASE_DRIVERS_NOT_RUN, "database loader '%s': --drivers was not run: karicheck is run by root and the loader is only run as loader-user\n", lp);
         else
             kc_check_loader_driver(&t, db, lp, db->driver);
     }
 
     /* D1a step 7 (design 8.4): the hot list is made from the frequencies the cache manager keeps, which it does only with memory-limit */
     if (db->loader_state_file && db->memory_limit == 0)
-        kc_warning(&t, "database: loader-state-file has no effect without memory-limit (every zone stays in memory, so there is no hot list to warm from)\n");
+        kc_warning(&t, DC_CONF_DATABASE_STATE_FILE, "database: loader-state-file has no effect without memory-limit (every zone stays in memory, so there is no hot list to warm from)\n");
     if (db->warm_before_serve && db->memory_limit == 0)
-        kc_warning(&t, "database: warm-before-serve only waits for the directory to be loaded without memory-limit (every zone is read at the start)\n");
+        kc_warning(&t, DC_CONF_DATABASE_WARM, "database: warm-before-serve only waits for the directory to be loaded without memory-limit (every zone is read at the start)\n");
     /* B7a: without acl-ceiling the ACLs a database zone carries (allow-transfer, allow-update from the metadata or a profile)
      * refuse every client; the zones still answer queries */
     if (db->acl_ceiling_count == 0 && db->acl_ceiling_keys_count == 0)
-        kc_warning(&t, "database: no acl-ceiling; the ACLs of database zones (zone transfers, dynamic updates) refuse every "
+        kc_warning(&t, DC_CONF_DATABASE_ACL_CEILING, "database: no acl-ceiling; the ACLs of database zones (zone transfers, dynamic updates) refuse every "
                        "client until one is set (acl-ceiling { 192.0.2.0/24; key \"name\"; };)\n");
     /* B7b: acl-ceiling-match all needs both kinds of entry to say anything; with one kind that kind decides, as with any */
     else if (db->acl_ceiling_match == ACL_MATCH_ALL && (db->acl_ceiling_count == 0 || db->acl_ceiling_keys_count == 0))
-        kc_warning(&t, "database: acl-ceiling-match all has no effect: acl-ceiling lists only %s, and that kind alone decides\n",
+        kc_warning(&t, DC_CONF_DATABASE_ACL_CEILING_MATCH, "database: acl-ceiling-match all has no effect: acl-ceiling lists only %s, and that kind alone decides\n",
                    db->acl_ceiling_count == 0 ? "keys" : "addresses");
 
     /* sources */
@@ -719,18 +798,18 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
                 kc_check_sqlite_file(&t, what, v->database_file);
             }
         if (db->server_id)
-            kc_warning(&t, "database: server-id is for driver postgresql (ignored with sqlite3)\n");
+            kc_warning(&t, DC_CONF_DATABASE_SERVER_ID_SQLITE, "database: server-id is for driver postgresql (ignored with sqlite3)\n");
     } else if (db->conninfo_file) {
         struct stat cs;
         if (stat(db->conninfo_file, &cs) != 0) {
-            kc_error(&t, "database conninfo-file '%s': %s\n", db->conninfo_file, strerror(errno));
+            kc_error(&t, DC_CONF_DATABASE_CONNINFO_FILE, "database conninfo-file '%s': %s\n", db->conninfo_file, strerror(errno));
         } else {
             mode_t m = cs.st_mode & 0777;
             if (m != 0600 && m != 0400)
-                kc_error(&t, "database conninfo-file '%s' has mode %04o; it must be 0600 or 0400\n", db->conninfo_file,
+                kc_error(&t, DC_CONF_DATABASE_CONNINFO_MODE, "database conninfo-file '%s' has mode %04o; it must be 0600 or 0400\n", db->conninfo_file,
                          (unsigned)m);
             if (have_uid && cs.st_uid != loader_uid)
-                kc_error(&t, "database conninfo-file '%s' is owned by uid %u; it must belong to the loader user '%s'\n",
+                kc_error(&t, DC_CONF_DATABASE_CONNINFO_OWNER, "database conninfo-file '%s' is owned by uid %u; it must belong to the loader user '%s'\n",
                          db->conninfo_file, (unsigned)cs.st_uid, db->loader_user);
             FILE *cf = fopen(db->conninfo_file, "r");
             if (cf) {
@@ -751,7 +830,7 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
                 fclose(cf);
                 bool verify = strstr(all, "sslmode=verify-full") || strstr(all, "sslmode='verify-full'") || strstr(all, "sslmode=\"verify-full\"");
                 if (!kc_conninfo_unix_socket(all) && !verify)
-                    kc_warning(&t, "database conninfo-file '%s' has neither a UNIX socket host nor sslmode=verify-full\n",
+                    kc_warning(&t, DC_CONF_DATABASE_CONNINFO_TLS, "database conninfo-file '%s' has neither a UNIX socket host nor sslmode=verify-full\n",
                                db->conninfo_file);
             }
         }
@@ -767,7 +846,7 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
                 if (!isalnum(ch) && ch != '.' && ch != '-' && ch != '_' && ch != ':') odd = true;
             }
             if (odd)       /* the length (1..64 bytes) is checked by the parser */
-                kc_warning(&t, "database: server-id '%s' has characters other than ASCII letters, digits and . - _ : ; use only those, "
+                kc_warning(&t, DC_CONF_DATABASE_SERVER_ID_CHARS, "database: server-id '%s' has characters other than ASCII letters, digits and . - _ : ; use only those, "
                                "so that it reads the same in every tool and tables of other character sets take it\n", db->server_id);
         } else {
             char h[256];
@@ -775,7 +854,7 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
                 h[sizeof(h) - 1] = '\0';
                 size_t n = strlen(h);
                 if (n == 0 || n > 64)
-                    kc_warning(&t, "database: server-id is not set and the host name has %zu bytes (karidns_server_status takes 1 to 64): "
+                    kc_warning(&t, DC_CONF_DATABASE_SERVER_ID_HOST, "database: server-id is not set and the host name has %zu bytes (karidns_server_status takes 1 to 64): "
                                    "a server with reload requests (karidns_reload_requests) cannot report its status; set server-id\n", n);
             }
         }
@@ -784,7 +863,7 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
          * the SOA serials and the zone transfers (which carry the ALIAS RR itself) stay the same.  (A resolver that a zone's profile
          * text names is not visible here.  LUA records are never run, so they are the same everywhere.) */
         if (db->server_id && (db->alias_resolver_count > 0 || cfg->alias_resolvers_count > 0))
-            kc_warning(&t, "database: server-id is set and alias-resolver expands ALIAS records: the A and AAAA answers at an ALIAS name depend on "
+            kc_warning(&t, DC_CONF_DATABASE_ALIAS_RESOLVER, "database: server-id is set and alias-resolver expands ALIAS records: the A and AAAA answers at an ALIAS name depend on "
                            "the resolver and the moment of the lookup, so two servers that share this database can answer differently "
                            "(SOA serials and zone transfers are the same); see karidns(8) \"Several servers on one PostgreSQL database\"\n");
     }
@@ -802,6 +881,29 @@ KARIDNS_TOOL_FN bool kc_aml_negation(const aml_t *l, int depth) {
     return false;
 }
 
+/* Append printf text to the malloc'd line *buf (a list of addresses is one message, so karicheck --json carries it as one).  *len is the
+ * length so far (0 with *buf NULL at the start); (size_t)-1 after an allocation failure, when *buf is NULL and nothing more is added. */
+static void kc_catf(char **buf, size_t *len, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void kc_catf(char **buf, size_t *len, const char *fmt, ...) {
+    if (*len == (size_t)-1) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    char *nb = n < 0 ? NULL : realloc(*buf, *len + (size_t)n + 1);
+    if (!nb) {
+        free(*buf);
+        *buf = NULL;
+        *len = (size_t)-1;
+        return;
+    }
+    va_start(ap, fmt);
+    vsnprintf(nb + *len, (size_t)n + 1, fmt, ap);
+    va_end(ap);
+    *buf = nb;
+    *len += (size_t)n;
+}
+
 /* 0.6.0: a key of control-channel { keys { } } that is also a TSIG key anywhere: a secondary, an updater or a primary that holds the secret
  * for zone transfers could then control the server.  Give the control channel a key of its own. */
 static void kc_control_key_notes(const server_config_t *cfg) {
@@ -809,7 +911,7 @@ static void kc_control_key_notes(const server_config_t *cfg) {
     for (int i = 0; i < cfg->control.nkeys; i++) {
         const control_key_t *k = &cfg->control.keys[i];
         if (config_tsig_key_used(cfg, k->name, where, sizeof(where)))
-            fprintf(stderr, "[WARNING] %s: control-channel: key '%s' is also used for TSIG (%s): whoever holds it for DNS can also control the "
+            dns_diag_at(DIAG_WARNING, DC_CONF_CONTROL_KEY_TSIG, k->loc, "%s: control-channel: key '%s' is also used for TSIG (%s): whoever holds it for DNS can also control the "
                             "server. Use a key of its own for the control channel\n", k->loc, k->name, where);
     }
 }
@@ -817,31 +919,35 @@ static void kc_control_key_notes(const server_config_t *cfg) {
 /* Batch 4: the transfer / NOTIFY options of BIND 9.20 and the places where KariDNS differs.  The lines go to stderr like the warnings. */
 static void kc_xfr_notes(const server_config_t *cfg) {
     if (cfg->startup_notify_rate_set)
-        fprintf(stderr, "[NOTE] options: startup-notify-rate %u is accepted but has no effect: KariDNS sends no NOTIFY when it starts (only after a "
+        dns_diag(DIAG_NOTE, DC_CONF_STARTUP_NOTIFY_RATE, NULL, 0, "options: startup-notify-rate %u is accepted but has no effect: KariDNS sends no NOTIFY when it starts (only after a "
                         "zone has changed or a secondary has transferred it)\n", (unsigned)cfg->startup_notify_rate);
     if (cfg->transfers_in_set && cfg->transfers_in == 0)
-        fprintf(stderr, "[WARNING] options: transfers-in 0: no zone is transferred in\n");
+        dns_diag(DIAG_WARNING, DC_CONF_TRANSFERS_IN_ZERO, NULL, 0, "options: transfers-in 0: no zone is transferred in\n");
     if (cfg->transfers_out_set && cfg->transfers_out == 0)
-        fprintf(stderr, "[WARNING] options: transfers-out 0: every zone transfer request is refused\n");
+        dns_diag(DIAG_WARNING, DC_CONF_TRANSFERS_OUT_ZERO, NULL, 0, "options: transfers-out 0: every zone transfer request is refused\n");
     if (cfg->transfers_per_ns_set && cfg->transfers_per_ns == 0)
-        fprintf(stderr, "[WARNING] options: transfers-per-ns 0: no zone is transferred in\n");
+        dns_diag(DIAG_WARNING, DC_CONF_TRANSFERS_PER_NS_ZERO, NULL, 0, "options: transfers-per-ns 0: no zone is transferred in\n");
     if (cfg->xfr_source_count > 0) {
-        printf("[INFO] Source addresses (bound at start-up; a new one needs a restart):");
+        char *line = NULL;
+        size_t ll = 0;
+        kc_catf(&line, &ll, "Source addresses (bound at start-up; a new one needs a restart):");
         for (int i = 0; i < cfg->xfr_source_count; i++) {
             const xfr_source_t *s = &cfg->xfr_sources[i];
-            printf(" %s (%s%s%s)", s->text, s->notify ? "NOTIFY" : "", s->notify && s->xfer ? "+" : "", s->xfer ? "transfer" : "");
+            kc_catf(&line, &ll, " %s (%s%s%s)", s->text, s->notify ? "NOTIFY" : "", s->notify && s->xfer ? "+" : "", s->xfer ? "transfer" : "");
         }
-        printf("\n");
+        if (line) dns_diag(DIAG_INFO, DC_CONF_XFR_SOURCE_LIST, NULL, 0, "%s\n", line);
+        free(line);
     }
     /* batch 5: a view that has server statements of its own does not use the top-level ones (BIND takes the first list that exists) */
     if (cfg->servers)
         for (const view_config_t *sv = cfg->views; sv; sv = sv->next)
             if (sv->servers)
-                fprintf(stderr, "[NOTE] View '%s': it has server statements of its own, so the top-level server statements do not apply in this view "
+                dns_diag(DIAG_NOTE, DC_CONF_VIEW_SERVERS_OVERRIDE, NULL, 0, "View '%s': it has server statements of its own, so the top-level server statements do not apply in this view "
                                 "(BIND uses the view's list, not both)\n", sv->name);
     const view_config_t *zv;
     const zone_config_t *z;
     CONFIG_FOR_EACH_ZONE(cfg, zv, z) {
+        dns_diag_set_zone(z->domain, zv->name);              // JSON mode: the zone and view the messages below are about
         const zone_ext_t *zx = zext(z);
         bool sec = z->type && (strcasecmp(z->type, "slave") == 0 || strcasecmp(z->type, "secondary") == 0);
         bool pri = z->type && strcasecmp(z->type, "master") == 0;
@@ -851,25 +957,26 @@ static void kc_xfr_notes(const server_config_t *cfg) {
             const uint32_t sec_only = XO_MIN_REFRESH | XO_MAX_REFRESH | XO_MIN_RETRY | XO_MAX_RETRY | XO_XFER_TIME_IN | XO_XFER_IDLE_IN |
                                       XO_B_MULTI_MASTER | XO_B_TRY_TCP_REFRESH | XO_B_REQUEST_IXFR | XO_B_REQUEST_EXPIRE;
             if ((zx->xo->set & sec_only) || zx->xo->src[XSRC_XFER4].state || zx->xo->src[XSRC_XFER6].state)
-                fprintf(stderr, "[NOTE] Zone '%s': the refresh and inbound-transfer options (min/max-refresh-time, min/max-retry-time, max-transfer-*-in, "
+                dns_diag(DIAG_NOTE, DC_CONF_ZONE_SECONDARY_OPTIONS_ON_PRIMARY, NULL, 0, "Zone '%s': the refresh and inbound-transfer options (min/max-refresh-time, min/max-retry-time, max-transfer-*-in, "
                                 "multi-master, request-ixfr, request-expire, try-tcp-refresh, transfer-source) have no effect in a primary zone\n",
                         z->domain);
         }
         if (sec) {
             if (e.multi_master && zx->masters_count < 2)
-                fprintf(stderr, "[NOTE] Zone '%s': multi-master has no effect with fewer than two primaries (BIND looks at it only then)\n", z->domain);
+                dns_diag(DIAG_NOTE, DC_CONF_ZONE_MULTI_MASTER, NULL, 0, "Zone '%s': multi-master has no effect with fewer than two primaries (BIND looks at it only then)\n", z->domain);
             if (e.min_refresh > e.max_refresh)
-                fprintf(stderr, "[WARNING] Zone '%s': min-refresh-time %u is larger than max-refresh-time %u: the refresh interval is always %u\n",
+                dns_diag(DIAG_WARNING, DC_CONF_ZONE_REFRESH_RANGE, NULL, 0, "Zone '%s': min-refresh-time %u is larger than max-refresh-time %u: the refresh interval is always %u\n",
                         z->domain, (unsigned)e.min_refresh, (unsigned)e.max_refresh, (unsigned)e.max_refresh);
             if (e.min_retry > e.max_retry)
-                fprintf(stderr, "[WARNING] Zone '%s': min-retry-time %u is larger than max-retry-time %u: the retry interval is always %u\n",
+                dns_diag(DIAG_WARNING, DC_CONF_ZONE_RETRY_RANGE, NULL, 0, "Zone '%s': min-retry-time %u is larger than max-retry-time %u: the retry interval is always %u\n",
                         z->domain, (unsigned)e.min_retry, (unsigned)e.max_retry, (unsigned)e.max_retry);
         }
     }
 }
 
 KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) {
-    printf("[INFO] Loading config %s...\n", config_path);
+    dns_diag_set_file(config_path);
+    dns_diag(DIAG_INFO, DC_CONF_LOADING, config_path, 0, "Loading config %s...\n", config_path);
     bool failed = false;
     char *buf = read_file_or_die(config_path, &failed);
     if (failed || !buf) return 1;
@@ -878,40 +985,45 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
     aml_init_interfaces();
 
     if (parse_named_conf_ext(buf, config_path, cfg) != 0) {
-        fprintf(stderr, "[ERROR] Syntax error in config file: %s\n", config_path);
+        dns_diag(DIAG_ERROR, DC_CONF_PARSE_FAILED, config_path, 0, "Syntax error in config file: %s\n", config_path);
         free(buf);
         return 1;
     }
 
     /* what listen-on / listen-on-v6 / bind-address come to on this host (the interfaces of this machine, as karidns takes them at start-up) */
     if (cfg->listen_count > 0) {
-        printf("[INFO] Listening (UDP and TCP) on:");
-        for (int li = 0; li < cfg->listen_count; li++)
+        char *line = NULL;
+        size_t ll = 0;
+        kc_catf(&line, &ll, "Listening (UDP and TCP) on:");
+        for (int li = 0; li < cfg->listen_count; li++) {
             if (cfg->listen[li].family == AF_INET6)
-                printf(" [%s]:%u", cfg->listen[li].text, (unsigned)cfg->listen[li].port);
+                kc_catf(&line, &ll, " [%s]:%u", cfg->listen[li].text, (unsigned)cfg->listen[li].port);
             else
-                printf(" %s:%u", cfg->listen[li].text, (unsigned)cfg->listen[li].port);
-        printf("\n");
+                kc_catf(&line, &ll, " %s:%u", cfg->listen[li].text, (unsigned)cfg->listen[li].port);
+        }
+        if (line) dns_diag(DIAG_INFO, DC_CONF_LISTEN, NULL, 0, "%s\n", line);
+        free(line);
     }
 
     kc_xfr_notes(cfg);
+    dns_diag_set_zone(NULL, NULL);
     kc_control_key_notes(cfg);
 
     if (cfg->directory) {
         /* karidns opens options { directory } at start-up and refuses to start without it */
         struct stat dst;
         if (stat(cfg->directory, &dst) != 0) {
-            fprintf(stderr, "[ERROR] options: directory '%s' cannot be accessed: %s\n", cfg->directory, strerror(errno));
+            dns_diag(DIAG_ERROR, DC_CONF_DIRECTORY_ACCESS, NULL, 0, "options: directory '%s' cannot be accessed: %s\n", cfg->directory, strerror(errno));
             free(buf);
             return 1;
         }
         if (!S_ISDIR(dst.st_mode)) {
-            fprintf(stderr, "[ERROR] options: directory '%s' is not a directory\n", cfg->directory);
+            dns_diag(DIAG_ERROR, DC_CONF_DIRECTORY_NOT_DIR, NULL, 0, "options: directory '%s' is not a directory\n", cfg->directory);
             free(buf);
             return 1;
         }
         if (cfg->directory[0] != '/')
-            fprintf(stderr, "[WARNING] options: directory '%s' is a relative path (relative to the directory karidns is started in); "
+            dns_diag(DIAG_WARNING, DC_CONF_DIRECTORY_RELATIVE, NULL, 0, "options: directory '%s' is a relative path (relative to the directory karidns is started in); "
                             "BIND recommends an absolute path\n", cfg->directory);
     }
 
@@ -919,6 +1031,7 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
     const view_config_t *zv;
     zone_config_t *z;
     CONFIG_FOR_EACH_ZONE(cfg, zv, z) {
+        dns_diag_set_zone(z->domain, zv->name);              // JSON mode: the zone and view the messages below are about
         const zone_ext_t *zx = zext(z);
         /* D14 (B7a): transfer-acl-match / update-acl-match only choose between the entries of an ACL */
         const aml_t *tl = config_acl_for(cfg, z, zv->name, AML_ACL_TRANSFER);   /* the zone's own list, else the view's, else options' */
@@ -927,16 +1040,16 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
         bool t_key = (tl ? tl->has_key : zx->tsig_keys_count > 0) || zx->tsig_key != NULL;   /* the zone's tsig-key may transfer too */
         if (zx->transfer_acl_match != ACL_MATCH_DEFAULT) {
             if (!t_addr && !t_key)
-                fprintf(stderr, "[WARNING] Zone '%s': transfer-acl-match has no effect without allow-transfer\n", z->domain);
+                dns_diag(DIAG_WARNING, DC_CONF_ACL_TRANSFER_MATCH, NULL, 0, "Zone '%s': transfer-acl-match has no effect without allow-transfer\n", z->domain);
             else if (!t_addr || !t_key)
-                fprintf(stderr, "[WARNING] Zone '%s': transfer-acl-match has no effect: allow-transfer lists only %s "
+                dns_diag(DIAG_WARNING, DC_CONF_ACL_TRANSFER_MATCH, NULL, 0, "Zone '%s': transfer-acl-match has no effect: allow-transfer lists only %s "
                                 "(the option chooses between addresses and keys)\n",
                         z->domain, t_addr ? "addresses" : "keys");
         } else if (zx->acl.transfer && tl && tl->has_addr && tl->has_key) {
             /* with no transfer-acl-match the list is evaluated in BIND's way now: the first element that matches decides, so a client
              * from a listed address OR signed with a listed key is let in; it used to take the address AND the key.  (A zone's
              * tsig-key with a list of addresses only is unchanged: the request still has to be signed.) */
-            fprintf(stderr, "[WARNING] Zone '%s': allow-transfer lists addresses and keys: it now lets in a client from a listed address "
+            dns_diag(DIAG_WARNING, DC_CONF_ACL_TRANSFER_ORDER, NULL, 0, "Zone '%s': allow-transfer lists addresses and keys: it now lets in a client from a listed address "
                             "or signed with a listed key (BIND's first-match order; it used to need both). Write "
                             "'transfer-acl-match all;' in the zone to keep the old meaning, or 'any' to make this one explicit\n",
                     z->domain);
@@ -945,12 +1058,12 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
         bool u_key = ul && ul->has_key;
         if (zx->update_acl_match != ACL_MATCH_DEFAULT) {
             if (!ul)
-                fprintf(stderr, "[WARNING] Zone '%s': update-acl-match has no effect without allow-update\n", z->domain);
+                dns_diag(DIAG_WARNING, DC_CONF_ACL_UPDATE_MATCH, NULL, 0, "Zone '%s': update-acl-match has no effect without allow-update\n", z->domain);
             else if (!u_addr || !u_key)
-                fprintf(stderr, "[WARNING] Zone '%s': update-acl-match has no effect: allow-update lists only %s "
+                dns_diag(DIAG_WARNING, DC_CONF_ACL_UPDATE_MATCH, NULL, 0, "Zone '%s': update-acl-match has no effect: allow-update lists only %s "
                                 "(the option chooses between addresses and keys)\n", z->domain, u_addr ? "addresses" : "keys");
         } else if (zx->acl.update && u_key && kc_aml_negation(ul, 0)) {
-            fprintf(stderr, "[WARNING] Zone '%s': allow-update has keys and negated entries: it is evaluated in BIND's first-match order now, so a "
+            dns_diag(DIAG_WARNING, DC_CONF_ACL_UPDATE_ORDER, NULL, 0, "Zone '%s': allow-update has keys and negated entries: it is evaluated in BIND's first-match order now, so a "
                             "negated entry before a key refuses that key's requests (it used to let in a request signed with a listed key "
                             "whatever the addresses said). Write 'update-acl-match any;' in the zone to keep the old meaning\n", z->domain);
         }
@@ -962,8 +1075,8 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
                     zx = zext(z);
                 }
                 if (zx->program_path[0] != '/') {
-                    fprintf(stderr,
-                        "[ERROR] Zone '%s': 'program' must be an absolute path (got '%s'). "
+                    dns_diag(DIAG_ERROR, DC_CONF_ZONE_PROGRAM_PATH, NULL, 0,
+                        "Zone '%s': 'program' must be an absolute path (got '%s'). "
                         "A relative name would be resolved via $PATH at runtime, which is "
                         "not deterministic for a network-facing daemon.\n",
                         z->domain, zx->program_path);
@@ -971,30 +1084,30 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
                     return 1;
                 }
                 if (access(zx->program_path, X_OK) != 0) {
-                    fprintf(stderr, "[WARNING] Zone '%s' program '%s' is not executable (access X_OK failed: %s)\n",
+                    dns_diag(DIAG_WARNING, DC_CONF_ZONE_PROGRAM_EXEC, NULL, 0, "Zone '%s' program '%s' is not executable (access X_OK failed: %s)\n",
                             z->domain, zx->program_path, strerror(errno));
                 }
                 if (zx->program_user) {
                     /* P4: a program-user that is root by another name is refused by karidns (validate_program_zone_users()) */
                     char id_err[256];
                     if (identity_names_root(zx->program_user, NULL, id_err, sizeof(id_err))) {
-                        fprintf(stderr, "[ERROR] Zone '%s': program-user: %s; karidns refuses to start\n", z->domain, id_err);
+                        dns_diag(DIAG_ERROR, DC_CONF_ZONE_PROGRAM_USER_ROOT, NULL, 0, "Zone '%s': program-user: %s; karidns refuses to start\n", z->domain, id_err);
                         free(buf);
                         return 1;
                     }
                 }
                 if (zx->program_user && cfg->user &&
                     strcasecmp(zx->program_user, cfg->user) != 0) {
-                    fprintf(stderr,
-                        "[WARNING] Zone '%s': program-user '%s' differs from options.user '%s'. "
+                    dns_diag(DIAG_WARNING, DC_CONF_ZONE_PROGRAM_USER_DIFFERS, NULL, 0,
+                        "Zone '%s': program-user '%s' differs from options.user '%s'. "
                         "This only works if karidns itself starts as root (no prior privilege drop); "
                         "if karidns is started as a non-root user, it refuses to start "
                         "(setuid to a different non-root user is not permitted by the OS).\n",
                         z->domain, zx->program_user, cfg->user);
                 }
                 if (zx->program_args_count > 62) {
-                    fprintf(stderr,
-                        "[ERROR] Zone '%s': program-args has %d entries, but only 62 are "
+                    dns_diag(DIAG_ERROR, DC_CONF_ZONE_PROGRAM_ARGS, NULL, 0,
+                        "Zone '%s': program-args has %d entries, but only 62 are "
                         "supported (argv[] is fixed-size in spawn_one_program_plugin()). "
                         "Reduce the argument count.\n",
                         z->domain, zx->program_args_count);
@@ -1002,16 +1115,16 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
                     return 1;
                 }
             } else {
-                fprintf(stderr, "[ERROR] Zone '%s' has type 'program' but no 'program' path specified\n", z->domain);
+                dns_diag(DIAG_ERROR, DC_CONF_ZONE_PROGRAM_MISSING, NULL, 0, "Zone '%s' has type 'program' but no 'program' path specified\n", z->domain);
                 free(buf);
                 return 1;
             }
         } else if (z->type && strcasecmp(z->type, "forward") == 0) {
-            fprintf(stderr, "[INFO] Zone '%s': type 'forward' keeps its KariDNS meaning (this authoritative server relays the queries of the "
+            dns_diag(DIAG_INFO|DIAG_STDERR, DC_CONF_ZONE_FORWARD, NULL, 0, "Zone '%s': type 'forward' keeps its KariDNS meaning (this authoritative server relays the queries of the "
                             "zone to its forwarders). In BIND it is a resolver-side zone type, so a BIND configuration that relies on it is "
                             "not equivalent\n", z->domain);
             if (zx->forwarders_count == 0) {
-                fprintf(stderr, "[ERROR] Zone '%s' has type 'forward' but no 'forwarders' specified\n",
+                dns_diag(DIAG_ERROR, DC_CONF_ZONE_FORWARD_MISSING, NULL, 0, "Zone '%s' has type 'forward' but no 'forwarders' specified\n",
                         z->domain);
                 free(buf);
                 return 1;
@@ -1023,8 +1136,8 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
                     for (int bi = 0; bi < cfg->listen_count; bi++) {
                         if (strcmp(zx->forwarders[fi].ip, cfg->listen[bi].text) == 0 &&
                             (zx->forwarders[fi].port == cfg->listen[bi].port || zx->forwarders[fi].port == 0)) {
-                            fprintf(stderr,
-                                "[WARNING] Zone '%s': forwarder '%s:%d' appears to point back "
+                            dns_diag(DIAG_WARNING, DC_CONF_ZONE_FORWARD_LOOP, NULL, 0,
+                                "Zone '%s': forwarder '%s:%d' appears to point back "
                                 "at this server itself (self-loop risk).\n",
                                 z->domain, zx->forwarders[fi].ip, zx->forwarders[fi].port);
                         }
@@ -1034,8 +1147,9 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
         }
     }
 
+    dns_diag_set_zone(NULL, NULL);
     if (program_zone_count > 0 && !cfg->allow_program_zones) {
-        fprintf(stderr, "[ERROR] Config contains %d type 'program' zone(s), but 'allow-program-zones' is not enabled in options{}\n",
+        dns_diag(DIAG_ERROR, DC_CONF_PROGRAM_ZONES_DISABLED, NULL, 0, "Config contains %d type 'program' zone(s), but 'allow-program-zones' is not enabled in options{}\n",
                 program_zone_count);
         free(buf);
         return 1;
@@ -1046,7 +1160,7 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
     for (int ti = 0; ti < cfg->ecs_tag_count; ti++) {
         for (int ci = 0; ci < cfg->ecs_tags[ti].cidr_count; ci++) {
             if (!validate_cidr_syntax(cfg->ecs_tags[ti].cidrs[ci].cidr)) {
-                fprintf(stderr, "[ERROR] Invalid CIDR '%s' in options.ecs-tags tag '%s'\n",
+                dns_diag(DIAG_ERROR, DC_CONF_TAG_CIDR, NULL, 0, "Invalid CIDR '%s' in options.ecs-tags tag '%s'\n",
                         cfg->ecs_tags[ti].cidrs[ci].cidr, cfg->ecs_tags[ti].tag);
                 ecs_error = true;
             }
@@ -1055,7 +1169,7 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
     for (int ti = 0; ti < cfg->location_tag_count; ti++) {
         for (int ci = 0; ci < cfg->location_tags[ti].cidr_count; ci++) {
             if (!validate_cidr_syntax(cfg->location_tags[ti].cidrs[ci].cidr)) {
-                fprintf(stderr, "[ERROR] Invalid CIDR '%s' in options.location-tags tag '%s'\n",
+                dns_diag(DIAG_ERROR, DC_CONF_TAG_CIDR, NULL, 0, "Invalid CIDR '%s' in options.location-tags tag '%s'\n",
                         cfg->location_tags[ti].cidrs[ci].cidr, cfg->location_tags[ti].tag);
                 ecs_error = true;
             }
@@ -1065,12 +1179,13 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
     const view_config_t *zcv;
     zone_config_t *zc;
     CONFIG_FOR_EACH_ZONE(cfg, zcv, zc) {
+        dns_diag_set_zone(zc->domain, zcv->name);
         const zone_ext_t *zx = zext(zc);
         if (zx->ecs_tag_count > 0) has_ecs_tags = true;
         for (int ti = 0; ti < zx->ecs_tag_count; ti++) {
             for (int ci = 0; ci < zx->ecs_tags[ti].cidr_count; ci++) {
                 if (!validate_cidr_syntax(zx->ecs_tags[ti].cidrs[ci].cidr)) {
-                    fprintf(stderr, "[ERROR] Zone '%s': Invalid CIDR '%s' in ecs-tags tag '%s'\n",
+                    dns_diag(DIAG_ERROR, DC_CONF_TAG_CIDR, NULL, 0, "Zone '%s': Invalid CIDR '%s' in ecs-tags tag '%s'\n",
                             zc->domain, zx->ecs_tags[ti].cidrs[ci].cidr, zx->ecs_tags[ti].tag);
                     ecs_error = true;
                 }
@@ -1079,7 +1194,7 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
         for (int ti = 0; ti < zx->location_tag_count; ti++) {
             for (int ci = 0; ci < zx->location_tags[ti].cidr_count; ci++) {
                 if (!validate_cidr_syntax(zx->location_tags[ti].cidrs[ci].cidr)) {
-                    fprintf(stderr, "[ERROR] Zone '%s': Invalid CIDR '%s' in location-tags tag '%s'\n",
+                    dns_diag(DIAG_ERROR, DC_CONF_TAG_CIDR, NULL, 0, "Zone '%s': Invalid CIDR '%s' in location-tags tag '%s'\n",
                             zc->domain, zx->location_tags[ti].cidrs[ci].cidr, zx->location_tags[ti].tag);
                     ecs_error = true;
                 }
@@ -1087,8 +1202,9 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
         }
     }
     }
+    dns_diag_set_zone(NULL, NULL);
     if (has_ecs_tags && !cfg->ecs_enable) {
-        fprintf(stderr, "[WARNING] ecs-tags defined, but ecs-enable is not set to 'yes' in options{}\n");
+        dns_diag(DIAG_WARNING, DC_CONF_ECS_DISABLED, NULL, 0, "ecs-tags defined, but ecs-enable is not set to 'yes' in options{}\n");
     }
     if (ecs_error) {
         free(buf);
@@ -1099,7 +1215,7 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
     {
         char id_err[256];
         if (identity_names_root(cfg->user, cfg->group, id_err, sizeof(id_err))) {
-            fprintf(stderr, "[ERROR] options user / group: %s; karidns refuses to start\n", id_err);
+            dns_diag(DIAG_ERROR, DC_CONF_IDENTITY_ROOT, NULL, 0, "options user / group: %s; karidns refuses to start\n", id_err);
             free(buf);
             return 1;
         }
@@ -1110,7 +1226,7 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
         return 1;
     }
 
-    printf("[OK] Config file %s is valid.\n", config_path);
+    dns_diag_plain(stdout, "[OK] Config file %s is valid.\n", config_path);
     free(buf);
     return 0;
 }
@@ -1165,6 +1281,8 @@ typedef struct {
     char raw[3][160];               /* lines that are not protocol lines */
     unsigned nraw, nraw_all;
     bool overlong;
+    bool zopen;                     /* JSON mode: a zones[] entry is open for the zone of the last Z line */
+    dns_diag_mark_t zmark;
 } kc_dbrun_t;
 
 /* "the view 'x'", or "the default view" for the view karidns makes when the configuration has no view {} */
@@ -1178,27 +1296,35 @@ KARIDNS_TOOL_FN const char *kc_vdesc(const char *name) {
 }
 
 /* the message of a finding, with the database and, for a zone, the zone */
-KARIDNS_TOOL_FN void kc_db_say(kc_dbrun_t *r, char level, const char *zone, long long id, const char *text) {
+KARIDNS_TOOL_FN void kc_db_say(kc_dbrun_t *r, char level, dns_diag_code_t code, const char *zone, long long id, const char *text) {
     char head[DNS_NAME_TEXT_SIZE + 128];
     if (zone && zone[0]) snprintf(head, sizeof(head), "%s: zone '%s' (domains.id %lld): ", r->label, kc_pr(zone), id);
     else snprintf(head, sizeof(head), "%s: ", r->label);
+    dns_diag_set_zone(zone && zone[0] ? zone : NULL, r->only ? r->only->name : NULL);     /* JSON mode: what the message is about */
     switch (level) {
-    case 'E': kc_error(&r->t, "%s%s\n", head, kc_pr(text)); break;
-    case 'W': kc_warning(&r->t, "%s%s\n", head, kc_pr(text)); break;
-    case 'I': kc_info(&r->t, "%s%s\n", head, kc_pr(text)); break;
+    case 'E': kc_error(&r->t, code, "%s%s\n", head, kc_pr(text)); break;
+    case 'W': kc_warning(&r->t, code, "%s%s\n", head, kc_pr(text)); break;
+    case 'I': kc_info(&r->t, code, "%s%s\n", head, kc_pr(text)); break;
     case 'O': kc_ok(&r->t, "%s%s\n", head, kc_pr(text)); break;
     default: kc_detail(&r->t, "%s\n", kc_pr(text)); break;
     }
 }
 
-KARIDNS_TOOL_FN void kc_db_sayf(kc_dbrun_t *r, char level, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
-KARIDNS_TOOL_FN void kc_db_sayf(kc_dbrun_t *r, char level, const char *fmt, ...) {
+KARIDNS_TOOL_FN void kc_db_sayf(kc_dbrun_t *r, char level, dns_diag_code_t code, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+KARIDNS_TOOL_FN void kc_db_sayf(kc_dbrun_t *r, char level, dns_diag_code_t code, const char *fmt, ...) {
     char msg[1200];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
-    kc_db_say(r, level, r->zone, r->zid, msg);
+    kc_db_say(r, level, code, r->zone, r->zid, msg);
+}
+
+/* JSON mode: the zones[] entry of the zone whose findings were read since its Z line */
+KARIDNS_TOOL_FN void kc_db_zone_flush(kc_dbrun_t *r) {
+    if (!r->zopen) return;
+    r->zopen = false;
+    dns_diag_zone_result(r->zone, r->only ? r->only->name : NULL, NULL, "database", r->zmark);
 }
 
 KARIDNS_TOOL_FN const view_config_t *kc_find_view(const server_config_t *cfg, const char *name) {
@@ -1221,12 +1347,13 @@ KARIDNS_TOOL_FN void kc_db_zone(kc_dbrun_t *r, char **f, int n) {
     char name[DNS_NAME_TEXT_SIZE + 4], *maps[CHK_MAX_FIELDS];
     char mapbuf[CHK_MAX_FIELDS][270];
     int nmaps = 0;
+    kc_db_zone_flush(r);
     r->zones++;
     if (chk_unescape(f[1], strlen(f[1]), name, sizeof(name)) == (size_t)-1) {
         r->zone[0] = '\0';
         r->zid = 0;
         r->vis = !r->only;
-        kc_db_say(r, 'E', "", 0, "the loader sent a zone line that does not decode");
+        kc_db_say(r, 'E', DC_DB_PROTOCOL_ZONE, "", 0, "the loader sent a zone line that does not decode");
         return;
     }
     snprintf(r->zone, sizeof(r->zone), "%s", name);
@@ -1254,6 +1381,10 @@ KARIDNS_TOOL_FN void kc_db_zone(kc_dbrun_t *r, char **f, int n) {
         if (nserved < sizeof(served) / sizeof(served[0])) served[nserved++] = m;
     }
     r->vis = !r->only || in_only;
+    if (r->vis) {                                   // JSON mode: the findings up to the next Z line belong to this zone
+        r->zopen = true;
+        r->zmark = dns_diag_mark();
+    }
     bool valid = strcmp(f[3], "invalid") != 0;
     if (!r->vis || !valid) return;
     /* karidns_domain_views: rows that name a view this server does not have, or one that does not read this database through the shared
@@ -1265,13 +1396,13 @@ KARIDNS_TOOL_FN void kc_db_zone(kc_dbrun_t *r, char **f, int n) {
             for (size_t k = 0; k < r->src->nmem; k++)
                 if (r->src->mem[k].shared && r->src->mem[k].v == v) shared_member = true;
             if (!v)
-                kc_db_sayf(r, 'W', "karidns_domain_views names the view '%s', which is not defined in the configuration; the row is ignored", kc_pr(maps[i]));
+                kc_db_sayf(r, 'W', DC_DB_VIEW_UNDEFINED, "karidns_domain_views names the view '%s', which is not defined in the configuration; the row is ignored", kc_pr(maps[i]));
             else if (!shared_member)
-                kc_db_sayf(r, 'W', "karidns_domain_views names the view '%s', which does not read this database through the shared source "
+                kc_db_sayf(r, 'W', DC_DB_VIEW_NOT_SHARED, "karidns_domain_views names the view '%s', which does not read this database through the shared source "
                                    "(database none, or a database-file / database-schema of its own); the row is ignored", kc_pr(maps[i]));
         }
         if (!served_shared)
-            kc_db_sayf(r, 'W', "karidns_domain_views maps the zone only to views that do not read it, so no view serves the zone");
+            kc_db_sayf(r, 'W', DC_DB_VIEW_UNSERVED, "karidns_domain_views maps the zone only to views that do not read it, so no view serves the zone");
     }
     /* D-PRIO / D-PROG: a zone of karidns.conf with the same name hides the database zone in that view (design 4.5) */
     for (size_t i = 0; i < nserved; i++) {
@@ -1281,10 +1412,10 @@ KARIDNS_TOOL_FN void kc_db_zone(kc_dbrun_t *r, char **f, int n) {
         if (!zc) continue;
         const char *vn = served[i]->v->name ? served[i]->v->name : "";
         if (zc->type && (strcasecmp(zc->type, "program") == 0 || strcasecmp(zc->type, "forward") == 0))
-            kc_db_sayf(r, 'W', "D-PROG: %s has a zone of type %s with this name in the configuration; it hides the database zone", kc_vdesc(vn),
+            kc_db_sayf(r, 'W', DC_DB_ZONE_SHADOWED_PROGRAM, "D-PROG: %s has a zone of type %s with this name in the configuration; it hides the database zone", kc_vdesc(vn),
                        zc->type);
         else
-            kc_db_sayf(r, 'W', "D-PRIO: %s has a zone with this name in the configuration%s%s%s; it hides the database zone", kc_vdesc(vn),
+            kc_db_sayf(r, 'W', DC_DB_ZONE_SHADOWED, "D-PRIO: %s has a zone with this name in the configuration%s%s%s; it hides the database zone", kc_vdesc(vn),
                        zc->file ? " (file '" : "", zc->file ? kc_pr(zc->file) : "", zc->file ? "')" : "");
     }
 }
@@ -1317,13 +1448,13 @@ KARIDNS_TOOL_FN void kc_db_acl_list(kc_dbrun_t *r, const char *what, char *const
         cidr_entry_t ce;
         if (cidr_entry_parse(&ce, e)) {
             if (!kc_ceiling_covers(db, &ce))
-                kc_db_sayf(r, 'W', "%s entry '%s' is outside acl-ceiling; a client there is refused", what, kc_pr(e));
+                kc_db_sayf(r, 'W', DC_DB_SETTINGS_CEILING_ENTRY, "%s entry '%s' is outside acl-ceiling; a client there is refused", what, kc_pr(e));
         } else if (keys_too) {
             bool listed = false;
             for (int k = 0; k < db->acl_ceiling_keys_count; k++)
                 if (db->acl_ceiling_keys[k] && strcasecmp(db->acl_ceiling_keys[k], e) == 0) listed = true;
             if (!listed)
-                kc_db_sayf(r, 'W', "%s key '%s' is not listed in acl-ceiling; a client that uses it is refused unless its address is inside the ceiling", what, kc_pr(e));
+                kc_db_sayf(r, 'W', DC_DB_SETTINGS_CEILING_KEY, "%s key '%s' is not listed in acl-ceiling; a client that uses it is refused unless its address is inside the ceiling", what, kc_pr(e));
         }
     }
 }
@@ -1332,7 +1463,7 @@ KARIDNS_TOOL_FN void kc_db_ceiling(kc_dbrun_t *r, const zone_ext_t *x) {
     const database_config_t *db = &r->cfg->database;
     if (db->acl_ceiling_count == 0 && db->acl_ceiling_keys_count == 0) {
         if (x->allow_transfer_count > 0 || x->tsig_keys_count > 0 || x->allow_update_count > 0 || x->ecs_trusted_resolvers_count > 0)
-            kc_db_sayf(r, 'W', "the settings have allow-transfer / allow-update / ecs-trusted-resolvers entries, but acl-ceiling is not configured; "
+            kc_db_sayf(r, 'W', DC_DB_SETTINGS_CEILING_MISSING, "the settings have allow-transfer / allow-update / ecs-trusted-resolvers entries, but acl-ceiling is not configured; "
                                "the ACLs of a database zone refuse every client without it");
         return;
     }
@@ -1342,7 +1473,7 @@ KARIDNS_TOOL_FN void kc_db_ceiling(kc_dbrun_t *r, const zone_ext_t *x) {
         for (int k = 0; k < db->acl_ceiling_keys_count; k++)
             if (x->tsig_keys[i] && db->acl_ceiling_keys[k] && strcasecmp(db->acl_ceiling_keys[k], x->tsig_keys[i]) == 0) listed = true;
         if (!listed)
-            kc_db_sayf(r, 'W', "allow-transfer key '%s' is not listed in acl-ceiling; a client that uses it is refused unless its address is inside the ceiling",
+            kc_db_sayf(r, 'W', DC_DB_SETTINGS_CEILING_KEY, "allow-transfer key '%s' is not listed in acl-ceiling; a client that uses it is refused unless its address is inside the ceiling",
                        kc_pr(x->tsig_keys[i] ? x->tsig_keys[i] : ""));
     }
     kc_db_acl_list(r, "allow-update", x->allow_update, x->allow_update_count, true);
@@ -1355,6 +1486,7 @@ KARIDNS_TOOL_FN void kc_db_ceiling(kc_dbrun_t *r, const zone_ext_t *x) {
 static bool kc_settings_capture = true;
 
 KARIDNS_TOOL_FN zone_ext_shared_t *kc_parse_settings(const char *text, size_t len, char *err, size_t errlen) {
+    bool was_suspended = dns_diag_suspend_json(true);       /* the parser prints to the redirected stderr, also in JSON mode */
     static int devnull = -2;
     if (devnull == -2) devnull = open("/dev/null", O_WRONLY);
     fflush(stderr);
@@ -1387,6 +1519,7 @@ KARIDNS_TOOL_FN zone_ext_shared_t *kc_parse_settings(const char *text, size_t le
         if (saved >= 0) close(saved);
         if (tf) fclose(tf);
     }
+    dns_diag_suspend_json(was_suspended);
     return sh;
 }
 
@@ -1397,12 +1530,12 @@ KARIDNS_TOOL_FN void kc_db_settings(kc_dbrun_t *r, char **f) {
     size_t zl = strlen(f[3]), pl = strlen(f[5]);
     char *zt = malloc(zl + 1), *pt = malloc(pl + 1), *both = malloc(zl + pl + 2);
     if (!zt || !pt || !both) {
-        kc_db_say(r, 'E', r->zone, r->zid, "out of memory");
+        kc_db_say(r, 'E', DC_INTERNAL_OOM, r->zone, r->zid, "out of memory");
         goto out;
     }
     size_t zn = chk_unescape(f[3], zl, zt, zl + 1), pn = chk_unescape(f[5], pl, pt, pl + 1);
     if (zn == (size_t)-1 || pn == (size_t)-1) {
-        kc_db_say(r, 'E', r->zone, r->zid, "the loader sent a settings line that does not decode");
+        kc_db_say(r, 'E', DC_DB_PROTOCOL_SETTINGS, r->zone, r->zid, "the loader sent a settings line that does not decode");
         goto out;
     }
     char pname[300];
@@ -1412,7 +1545,7 @@ KARIDNS_TOOL_FN void kc_db_settings(kc_dbrun_t *r, char **f) {
     if (pn > 0) {
         sh = kc_parse_settings(pt, pn, err, sizeof(err));
         if (!sh) {
-            kc_db_sayf(r, 'E', "the settings text of the profile '%s' does not parse in restricted mode: %s", kc_pr(pname), kc_pr(err));
+            kc_db_sayf(r, 'E', DC_DB_SETTINGS_PROFILE, "the settings text of the profile '%s' does not parse in restricted mode: %s", kc_pr(pname), kc_pr(err));
             goto out;
         }
         zone_ext_shared_unref(sh);
@@ -1420,7 +1553,7 @@ KARIDNS_TOOL_FN void kc_db_settings(kc_dbrun_t *r, char **f) {
     if (zn > 0) {
         sh = kc_parse_settings(zt, zn, err, sizeof(err));
         if (!sh) {
-            kc_db_sayf(r, 'E', "the settings from domainmetadata do not parse in restricted mode: %s", kc_pr(err));
+            kc_db_sayf(r, 'E', DC_DB_SETTINGS_ZONE, "the settings from domainmetadata do not parse in restricted mode: %s", kc_pr(err));
             goto out;
         }
         zone_ext_shared_unref(sh);
@@ -1437,12 +1570,12 @@ KARIDNS_TOOL_FN void kc_db_settings(kc_dbrun_t *r, char **f) {
     }
     sh = kc_parse_settings(both, bn, err, sizeof(err));
     if (!sh) {
-        kc_db_sayf(r, 'E', "the settings of the profile '%s' and of the zone together do not parse in restricted mode: %s", kc_pr(pname), kc_pr(err));
+        kc_db_sayf(r, 'E', DC_DB_SETTINGS_COMBINED, "the settings of the profile '%s' and of the zone together do not parse in restricted mode: %s", kc_pr(pname), kc_pr(err));
         goto out;
     }
     const char *missing = db_settings_missing_key(&sh->ext, r->cfg);
     if (missing)
-        kc_db_sayf(r, 'E', "the settings name the TSIG key '%s', which is not defined in the configuration (key \"%s\" { ... };); the server refuses the zone",
+        kc_db_sayf(r, 'E', DC_DB_SETTINGS_KEY_UNDEFINED, "the settings name the TSIG key '%s', which is not defined in the configuration (key \"%s\" { ... };); the server refuses the zone",
                    kc_pr(missing), kc_pr(missing));
     kc_db_ceiling(r, &sh->ext);
     zone_ext_shared_unref(sh);
@@ -1461,7 +1594,7 @@ KARIDNS_TOOL_FN void kc_db_line(kc_dbrun_t *r, char *line) {
     shown[sk] = '\0';
     int n = chk_split(line, f, CHK_MAX_FIELDS);
     char tag = n > 0 && f[0][0] && !f[0][1] ? f[0][0] : 0;
-    bool proto = (tag && strchr("EWIOD", tag) && n == 4) || (tag == 'Z' && n >= 5) || (tag == 'S' && n == 6) || (tag == 'R' && n == 4);
+    bool proto = (tag && strchr("EWIOD", tag) && (n == 4 || n == 5)) || (tag == 'Z' && n >= 5) || (tag == 'S' && n == 6) || (tag == 'R' && n == 4);
     if (!proto) {
         r->nraw_all++;
         if (r->nraw < 3) {
@@ -1489,7 +1622,9 @@ KARIDNS_TOOL_FN void kc_db_line(kc_dbrun_t *r, char *line) {
     }
     long long id = strtoll(f[2], NULL, 10);
     if (zone[0] && r->only && !(r->vis && strcmp(zone, r->zone) == 0)) return;          /* a zone of another view */
-    kc_db_say(r, tag, zone, id, text);
+    /* the optional fifth field is the code the loader got from the zone checks; a finding without one is a db.finding */
+    dns_diag_code_t code = n == 5 ? dns_diag_code_find(f[4]) : DC_NONE;
+    kc_db_say(r, tag, code == DC_NONE ? DC_DB_FINDING : code, zone, id, text);
 }
 
 /* The user the loader of karidns runs as (design 1.2): when root runs karicheck, loader-user / loader-group; else the caller. */
@@ -1506,18 +1641,18 @@ KARIDNS_TOOL_FN bool kc_db_identity(const database_config_t *db, uid_t *uid, gid
         return true;
     }
     if (!db->loader_user) {
-        fprintf(stderr, "[ERROR] karicheck is run by root, but options { database { loader-user } } is not set: karidns does not run the loader as root, "
+        dns_diag(DIAG_ERROR, DC_DB_IDENTITY_NO_LOADER_USER, NULL, 0, "karicheck is run by root, but options { database { loader-user } } is not set: karidns does not run the loader as root, "
                         "so there are no rights to check with; run karicheck as the user of the loader, or set loader-user\n");
         return false;
     }
     char id_err[256];
     if (identity_names_root(db->loader_user, db->loader_group, id_err, sizeof(id_err))) {   /* P4: never drop "to" root */
-        fprintf(stderr, "[ERROR] database loader-user / loader-group: %s; karidns refuses to start, and karicheck does not run the loader as root\n", id_err);
+        dns_diag(DIAG_ERROR, DC_DB_IDENTITY_ROOT, NULL, 0, "database loader-user / loader-group: %s; karidns refuses to start, and karicheck does not run the loader as root\n", id_err);
         return false;
     }
     struct passwd *pw = getpwnam(db->loader_user);
     if (!pw) {
-        fprintf(stderr, "[ERROR] database loader-user '%s' does not exist\n", kc_pr(db->loader_user));
+        dns_diag(DIAG_ERROR, DC_DB_IDENTITY_USER, NULL, 0, "database loader-user '%s' does not exist\n", kc_pr(db->loader_user));
         return false;
     }
     *uid = pw->pw_uid;
@@ -1525,7 +1660,7 @@ KARIDNS_TOOL_FN bool kc_db_identity(const database_config_t *db, uid_t *uid, gid
     if (db->loader_group) {
         struct group *gr = getgrnam(db->loader_group);
         if (!gr) {
-            fprintf(stderr, "[ERROR] database loader-group '%s' does not exist\n", kc_pr(db->loader_group));
+            dns_diag(DIAG_ERROR, DC_DB_IDENTITY_GROUP, NULL, 0, "database loader-group '%s' does not exist\n", kc_pr(db->loader_group));
             return false;
         }
         *gid = gr->gr_gid;
@@ -1554,9 +1689,9 @@ KARIDNS_TOOL_FN int kc_db_run_source(const server_config_t *cfg, const kc_dbsrc_
         snprintf(names + l, sizeof(names) - l, "%s%s", i ? ", " : "", kc_pr(src->mem[i].v->name ? src->mem[i].v->name : ""));
     }
     if (src->nmem == 1 && src->mem[0].v->name && strcmp(src->mem[0].v->name, "__default__") == 0)
-        printf("[INFO] Checking %s (the default view) with %s\n", label, who);
+        dns_diag(DIAG_INFO, DC_DB_CHECKING, NULL, 0, "Checking %s (the default view) with %s\n", label, who);
     else
-        printf("[INFO] Checking %s (view%s %s) with %s\n", label, src->nmem > 1 ? "s" : "", names, who);
+        dns_diag(DIAG_INFO, DC_DB_CHECKING, NULL, 0, "Checking %s (view%s %s) with %s\n", label, src->nmem > 1 ? "s" : "", names, who);
     fflush(stdout);
 
     /* the arguments: the source, and what the configuration says about the load */
@@ -1625,12 +1760,12 @@ KARIDNS_TOOL_FN int kc_db_run_source(const server_config_t *cfg, const kc_dbsrc_
 
     int fds[2];
     if (pipe(fds) != 0) {
-        fprintf(stderr, "[ERROR] %s: pipe: %s\n", label, strerror(errno));
+        dns_diag(DIAG_ERROR, DC_IO_PIPE, NULL, 0, "%s: pipe: %s\n", label, strerror(errno));
         return 1;
     }
     pid_t pid = kc_loader_spawn(lp, argv, drop, uid, gid, fds[1], true);  /* the child: the loader's rights, nothing else */
     if (pid < 0) {
-        fprintf(stderr, "[ERROR] %s: fork: %s\n", label, strerror(errno));
+        dns_diag(DIAG_ERROR, DC_IO_FORK, NULL, 0, "%s: fork: %s\n", label, strerror(errno));
         close(fds[0]);
         close(fds[1]);
         return 1;
@@ -1648,7 +1783,7 @@ KARIDNS_TOOL_FN int kc_db_run_source(const server_config_t *cfg, const kc_dbsrc_
     size_t len = 0;
     bool skipping = false;
     if (!buf) {
-        fprintf(stderr, "[ERROR] %s: out of memory\n", label);
+        dns_diag(DIAG_ERROR, DC_INTERNAL_OOM, NULL, 0, "%s: out of memory\n", label);
         close(fds[0]);
         kill(pid, SIGKILL);
         while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
@@ -1686,10 +1821,12 @@ KARIDNS_TOOL_FN int kc_db_run_source(const server_config_t *cfg, const kc_dbsrc_
         kc_db_line(&r, buf);
     }
     free(buf);
+    kc_db_zone_flush(&r);
+    dns_diag_set_zone(NULL, NULL);
     int st = 0;
     while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
     int rc = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
-    if (r.overlong) kc_error(&r.t, "%s: the loader wrote a line longer than %d bytes; it was skipped\n", label, CHK_LINE_MAX);
+    if (r.overlong) kc_error(&r.t, DC_DB_LOADER_LINE_TOO_LONG, "%s: the loader wrote a line longer than %d bytes; it was skipped\n", label, CHK_LINE_MAX);
     if (rc >= 2 || !r.have_r) {
         /* it did not finish its job (usage, cannot run, database error, killed): whatever it said that was not a finding is the reason */
         if (r.t.errors == 0 || r.nraw > 0) {
@@ -1698,17 +1835,17 @@ KARIDNS_TOOL_FN int kc_db_run_source(const server_config_t *cfg, const kc_dbsrc_
                 size_t l = strlen(why);
                 snprintf(why + l, sizeof(why) - l, "%s%s", i ? " / " : "", r.raw[i]);
             }
-            kc_error(&r.t, "%s: the loader %s%s%s\n", label,
+            kc_error(&r.t, DC_DB_LOADER_FAILED, "%s: the loader %s%s%s\n", label,
                      WIFSIGNALED(st) ? "was killed by a signal" : (rc == 127 ? "could not be executed" : rc == 4 ? "found the database busy or unreachable (try again)" :
                                                                           rc < 2 ? "ended without its final line" : "could not check the database"),
                      why[0] ? ": " : "", why);
         }
     } else if (r.nraw_all > 0) {
-        kc_warning(&r.t, "%s: the loader printed %u line(s) that are not part of its protocol (first: %s)\n", label, r.nraw_all, r.nraw ? r.raw[0] : "?");
+        kc_warning(&r.t, DC_DB_LOADER_PROTOCOL, "%s: the loader printed %u line(s) that are not part of its protocol (first: %s)\n", label, r.nraw_all, r.nraw ? r.raw[0] : "?");
     }
-    printf("[RESULT] %s: %u zone(s) read, %d error(s), %d warning(s)\n", label, r.zones, r.t.errors, r.t.warnings);
-    if (r.t.errors > 0) fprintf(stderr, "[FAIL] %s has errors.\n", label);
-    else printf("[OK] %s is valid.\n", label);
+    dns_diag_plain(stdout, "[RESULT] %s: %u zone(s) read, %d error(s), %d warning(s)\n", label, r.zones, r.t.errors, r.t.warnings);
+    if (r.t.errors > 0) dns_diag_plain(stderr, "[FAIL] %s has errors.\n", label);
+    else dns_diag_plain(stdout, "[OK] %s is valid.\n", label);
     *zones_out += r.zones;
     *errors_out += r.t.errors;
     *warnings_out += r.t.warnings;
@@ -1720,25 +1857,26 @@ KARIDNS_TOOL_FN int kc_db_main(const char *config_path, const char *view_arg) {
     setvbuf(stdout, NULL, _IOLBF, 0);                   // the lines of stdout and stderr come out in the order they were written even in a pipe
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
-    printf("[INFO] Loading config %s...\n", config_path);
+    dns_diag_set_file(config_path);
+    dns_diag(DIAG_INFO, DC_CONF_LOADING, config_path, 0, "Loading config %s...\n", config_path);
     bool failed = false;
     char *buf = read_file_or_die(config_path, &failed);
     if (failed || !buf) return 1;
     if (parse_named_conf_ext(buf, config_path, &cfg) != 0) {
-        fprintf(stderr, "[ERROR] Syntax error in config file: %s\n", config_path);
+        dns_diag(DIAG_ERROR, DC_CONF_PARSE_FAILED, config_path, 0, "Syntax error in config file: %s\n", config_path);
         free(buf);
         return 1;
     }
     free(buf);
     const database_config_t *db = &cfg.database;
     if (!db->enabled) {
-        fprintf(stderr, "[ERROR] The configuration has no options { database { } } block; there is no database to check\n");
+        dns_diag(DIAG_ERROR, DC_DB_DISABLED, NULL, 0, "The configuration has no options { database { } } block; there is no database to check\n");
         return 1;
     }
     const char *lp = db_loader_path(&cfg);
     struct stat lst;
     if (stat(lp, &lst) != 0 && errno == ENOENT) {
-        fprintf(stderr, "[ERROR] DB support is not installed: the database loader '%s' does not exist (this installation has no karidns-dbloader; "
+        dns_diag(DIAG_ERROR, DC_DB_LOADER_MISSING, NULL, 0, "DB support is not installed: the database loader '%s' does not exist (this installation has no karidns-dbloader; "
                         "install the karidns-sqlite3, karidns-postgresql or karidns-db package, or set loader-path)\n", kc_pr(lp));
         return 1;
     }
@@ -1746,11 +1884,11 @@ KARIDNS_TOOL_FN int kc_db_main(const char *config_path, const char *view_arg) {
     if (view_arg) {
         only = kc_find_view(&cfg, view_arg);
         if (!only) {
-            fprintf(stderr, "[ERROR] The view '%s' is not defined in %s\n", kc_pr(view_arg), config_path);
+            dns_diag(DIAG_ERROR, DC_DB_VIEW_NOT_FOUND, NULL, 0, "The view '%s' is not defined in %s\n", kc_pr(view_arg), config_path);
             return 1;
         }
         if (only->database_none) {
-            fprintf(stderr, "[ERROR] The view '%s' takes no zones from the database (database none)\n", kc_pr(view_arg));
+            dns_diag(DIAG_ERROR, DC_DB_VIEW_NONE, NULL, 0, "The view '%s' takes no zones from the database (database none)\n", kc_pr(view_arg));
             return 1;
         }
     }
@@ -1758,7 +1896,7 @@ KARIDNS_TOOL_FN int kc_db_main(const char *config_path, const char *view_arg) {
      * says what it cannot read, with the rights it runs with.  What this command needs: a loader that can be executed and has the driver. */
     {
         kc_tally_t ct = {0};
-        if (!db->driver) kc_error(&ct, "options { database { } } has no driver\n");
+        if (!db->driver) kc_error(&ct, DC_CONF_DATABASE_NO_DRIVER, "options { database { } } has no driver\n");
         else if (!kc_check_loader_file(&ct, lp) || ct.errors > 0) {}                     /* ownership, mode and X_OK as karidns wants them: before the loader is run */
         else kc_check_loader_driver(&ct, db, lp, db->driver);                           /* run as the loader user (root drops to it, kc_loader_spawn()) */
         if (ct.errors > 0) return 1;
@@ -1781,7 +1919,7 @@ KARIDNS_TOOL_FN int kc_db_main(const char *config_path, const char *view_arg) {
                 csrc = csrc ? csrc * 2 : 8;
                 kc_dbsrc_t *ns = realloc(srcs, csrc * sizeof(*ns));
                 if (!ns) {
-                    fprintf(stderr, "[ERROR] Out of memory\n");
+                    dns_diag(DIAG_ERROR, DC_INTERNAL_OOM, NULL, 0, "Out of memory\n");
                     free(srcs);
                     return 1;
                 }
@@ -1795,7 +1933,7 @@ KARIDNS_TOOL_FN int kc_db_main(const char *config_path, const char *view_arg) {
             s->cmem = s->cmem ? s->cmem * 2 : 4;
             kc_member_t *nm = realloc(s->mem, s->cmem * sizeof(*nm));
             if (!nm) {
-                fprintf(stderr, "[ERROR] Out of memory\n");
+                dns_diag(DIAG_ERROR, DC_INTERNAL_OOM, NULL, 0, "Out of memory\n");
                 return 1;
             }
             s->mem = nm;
@@ -1816,10 +1954,11 @@ KARIDNS_TOOL_FN int kc_db_main(const char *config_path, const char *view_arg) {
         if (kc_db_run_source(&cfg, &srcs[i], only, sqlite, &total_zones, &total_err, &total_warn) != 0) bad++;
     }
     if (ran == 0) {
-        fprintf(stderr, "[ERROR] No view reads a database: nothing to check\n");
+        dns_diag(DIAG_ERROR, DC_DB_NOTHING, NULL, 0, "No view reads a database: nothing to check\n");
         bad++;
     }
-    printf("[INFO] Checked %zu database%s (%u zone%s). Errors: %d, warnings: %d\n", ran, ran == 1 ? "" : "s", total_zones, total_zones == 1 ? "" : "s", total_err,
+    dns_diag_counts(total_zones, 0);
+    dns_diag(DIAG_INFO, DC_DB_SUMMARY, NULL, 0, "Checked %zu database%s (%u zone%s). Errors: %d, warnings: %d\n", ran, ran == 1 ? "" : "s", total_zones, total_zones == 1 ? "" : "s", total_err,
            total_warn);
     for (size_t i = 0; i < nsrc; i++) free(srcs[i].mem);
     free(srcs);
@@ -1834,6 +1973,11 @@ KARIDNS_TOOL_FN void print_usage(FILE *fp, const char *prog) {
     fprintf(fp, "  %s zone <domain> [config_path]\n", prog);
     fprintf(fp, "  %s zone <domain> <zone_file_path>\n", prog);
     fprintf(fp, "  %s db [view] [config_path]\n", prog);
+    fprintf(fp, "  %s zone <domain> -\n", prog);
+    fprintf(fp, "  %s --json <command> ...\n", prog);
+    fprintf(fp, "\n");
+    fprintf(fp, "zone <domain> - reads the zone text (BIND format, up to 64 MiB) from standard input.  --json, before the command, writes one JSON\n");
+    fprintf(fp, "document on standard output instead of the text lines (docs/karicheck.md, JSON OUTPUT); the exit status is the same.\n");
     fprintf(fp, "\n");
     fprintf(fp, "db reads the PowerDNS tables of options { database { } } (read only, through karidns-dbloader --check) and checks the schema,\n");
     fprintf(fp, "every zone (as zone does), the settings texts, the views and the zones that karidns.conf defines with the same name.  Run by\n");
@@ -1852,19 +1996,32 @@ int karicheck_main(int argc, char **argv);
 int main(int argc, char **argv) { return karicheck_main(argc, argv); }
 #define main karicheck_main
 #endif
-int main(int argc, char **argv) {
-    if (argc < 2) {
-        print_usage(stderr, argv[0]);
-        return 2;
+/* A usage error: the usage text on stderr, or with --json one message of the document (nothing is printed on stderr).  Exit status 2. */
+KARIDNS_TOOL_FN int kc_usage(const char *prog, dns_diag_code_t code, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+KARIDNS_TOOL_FN int kc_usage(const char *prog, dns_diag_code_t code, const char *fmt, ...) {
+    if (dns_diag_json_enabled()) {
+        va_list ap;
+        va_start(ap, fmt);
+        dns_vdiag(DIAG_ERROR, code, NULL, 0, fmt, ap);
+        va_end(ap);
+    } else {
+        print_usage(stderr, prog);
     }
+    return 2;
+}
 
-    /* -h / --help: the text goes to stdout and the exit status is 0 (as karictl and karidns-dbloader do); a usage error goes to stderr with 2 (1 is "problems found") */
-    if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+/* The run, with argv as the user wrote it after a leading --json has been taken off */
+KARIDNS_TOOL_FN int kc_run(int argc, char **argv) {
+    if (argc < 2) return kc_usage(argv[0], DC_USAGE_COMMAND_MISSING, "no command given");
+
+    /* -h / --help: the text goes to stdout and the exit status is 0 (as karictl and karidns-dbloader do); a usage error goes to stderr with 2 (1 is "problems found").
+     * With --json stdout carries only the document, so -h and -v are commands that do not exist then. */
+    if (!dns_diag_json_enabled() && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         print_usage(stdout, argv[0]);
         return 0;
     }
 
-    if (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0) {
+    if (!dns_diag_json_enabled() && (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0)) {
         printf("karicheck %s\n", KARIDNS_VERSION);
         return 0;
     }
@@ -1898,21 +2055,20 @@ int main(int argc, char **argv) {
                     }
                     checked++;
                 } else {
-                    printf("[INFO] Skipping zone '%s' (type %s): no zone file to check\n", z->domain, z->type);
+                    dns_diag(DIAG_INFO, DC_ZONE_SKIPPED, NULL, 0, "Skipping zone '%s' (type %s): no zone file to check\n", z->domain, z->type);
                     skipped++;
                 }
             }
         }
-        printf("[INFO] Checked %d zones (%d skipped). Errors: %d\n", checked, skipped, error_count);
+        dns_diag_counts((unsigned)checked, (unsigned)skipped);
+        dns_diag(DIAG_INFO, DC_ZONE_SUMMARY, NULL, 0, "Checked %d zones (%d skipped). Errors: %d\n", checked, skipped, error_count);
         return (error_count > 0) ? 1 : 0;
     } else if (strcmp(cmd, "zone") == 0) {
-        if (argc < 3) {
-            print_usage(stderr, argv[0]);
-            return 2;
-        }
+        if (argc < 3) return kc_usage(argv[0], DC_USAGE_ARGS, "zone needs a domain name (zone <domain> [config_path | zone_file | -])");
         const char *domain = argv[2];
         if (argc >= 4 && strstr(argv[3], ".conf") == NULL) {
             // Standalone mode: karicheck zone <domain> <zone_file_path>
+            dns_diag_counts(1, 0);
             return check_zone(domain, argv[3], true, false, NULL, NULL, NULL, NULL);
         } else {
             // From config: karicheck zone <domain> [config_path]
@@ -1928,20 +2084,23 @@ int main(int argc, char **argv) {
             /* 同じゾーン名が複数の view にあれば、それぞれの view の定義を検査する (R-26) */
             int found = 0;
             int failed = 0;
+            int program = 0;
             for (view_config_t *v = cfg.views; v; v = v->next) {
                 for (zone_config_t *z = v->zones; z; z = z->next) {
                     if (strcasecmp(z->domain, norm_domain) != 0) continue;
                     found++;
                     if (z->type && strcasecmp(z->type, "program") == 0) {
-                        printf("[INFO] Zone '%s' is type 'program'; skipping file validation.\n", z->domain);
+                        program++;
+                        dns_diag(DIAG_INFO, DC_ZONE_PROGRAM_SKIPPED, NULL, 0, "Zone '%s' is type 'program'; skipping file validation.\n", z->domain);
                     } else if (check_zone(z->domain, z->file, false, z->is_catalog, zext(z)->file_format, z, &cfg, v) != 0) {
                         failed++;
                     }
                     break;
                 }
             }
+            dns_diag_counts((unsigned)(found - program), (unsigned)program);
             if (found == 0) {
-                fprintf(stderr, "[ERROR] Zone '%s' not found in config %s\n", domain, cfg_path);
+                dns_diag(DIAG_ERROR, DC_ZONE_NOT_FOUND, cfg_path, 0, "Zone '%s' not found in config %s\n", domain, cfg_path);
                 return 1;
             }
             return failed > 0 ? 1 : 0;
@@ -1949,10 +2108,7 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "db") == 0) {
         /* db [view] [config_path]: one argument is the configuration when it looks like a path, else a view */
         const char *view = NULL, *cfg_path = default_config;
-        if (argc > 4) {
-            print_usage(stderr, argv[0]);
-            return 2;
-        }
+        if (argc > 4) return kc_usage(argv[0], DC_USAGE_ARGS, "db takes at most a view and a configuration file");
         if (argc == 4) {
             view = argv[2];
             cfg_path = argv[3];
@@ -1962,8 +2118,30 @@ int main(int argc, char **argv) {
         }
         return kc_db_main(cfg_path, view);
     } else {
-        print_usage(stderr, argv[0]);
-        return 2;
+        return kc_usage(argv[0], DC_USAGE_COMMAND_UNKNOWN, "unknown command '%.64s'", cmd);
     }
     return 0;
+}
+
+int main(int argc, char **argv) {
+#ifdef KARIDNS_DIAG_CODELOG
+    /* test build only (make karicheck-codelog): KARICHECK_CODE_LOG=file appends the code of every message to it (tests/run_karicheck_codes_test.sh) */
+    const char *code_log = getenv("KARICHECK_CODE_LOG");
+    if (code_log && *code_log) dns_diag_code_log(code_log);
+#endif
+    if (argc >= 2 && strcmp(argv[1], "--json") == 0) {
+        /* --json comes before the command; stdout carries only the document, written when the run is over */
+        argv[1] = argv[0];
+        argv++;
+        argc--;
+        const char *cmd = argc >= 2 ? argv[1] : NULL;
+        bool known = cmd && (strcmp(cmd, "conf") == 0 || strcmp(cmd, "zones") == 0 || strcmp(cmd, "zone") == 0 || strcmp(cmd, "db") == 0);
+        dns_diag_json_start(known ? cmd : NULL, KARIDNS_VERSION);
+    }
+    int rc = kc_run(argc, argv);
+    if (dns_diag_json_enabled() && dns_diag_json_finish(stdout, rc) != 0) {
+        fprintf(stderr, "karicheck: cannot write the JSON document: %s\n", strerror(errno));
+        if (rc == 0) rc = 1;
+    }
+    return rc;
 }

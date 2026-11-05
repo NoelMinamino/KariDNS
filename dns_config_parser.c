@@ -20,6 +20,7 @@
 #include <grp.h>
 #include "dns_wire.h"
 #include "dns_tsig_acl.h"
+#include "dns_diag.h"
 
 static int hex_nibble_value(char c) {
   if (c >= '0' && c <= '9') return c - '0';
@@ -756,9 +757,24 @@ static bool acl_entry_is_address(const char *t) {
 
 typedef enum { ACL_USE_TRANSFER, ACL_USE_UPDATE, ACL_USE_ADDRESS } acl_use_t;
 
+static void ctx_location(const token_ctx_t *ctx, char *buf, size_t n);
+
+/* A diagnostic of the statement being read: the text printed is the one given, karicheck --json also gets the place (file and line) of the
+ * token read last.  ctx may be NULL. */
+static void cfg_diag(const token_ctx_t *ctx, int sev, dns_diag_code_t code, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+static void cfg_diag(const token_ctx_t *ctx, int sev, dns_diag_code_t code, const char *fmt, ...) {
+  char loc[300];
+  loc[0] = '\0';
+  if (ctx && dns_diag_json_enabled()) ctx_location(ctx, loc, sizeof(loc));
+  va_list ap;
+  va_start(ap, fmt);
+  dns_vdiag_at(sev, code, loc[0] ? loc : NULL, fmt, ap);
+  va_end(ap);
+}
+
 static int acl_reject(token_ctx_t *ctx, const char *where, const char *entry, const char *why) {
   syslog(LOG_ERR, "[Config] %s: entry '%s' %s", where, entry, why);
-  fprintf(stderr, "[ERROR] %s: entry '%s' %s\n", where, entry, why);
+  cfg_diag(ctx, DIAG_ERROR, DC_CONF_ACL_ENTRY, "%s: entry '%s' %s\n", where, entry, why);
   if (ctx) ctx->error_occurred = true;
   return -1;
 }
@@ -875,10 +891,10 @@ static void aml_report(token_ctx_t *ctx, const char *loc, const char *what, cons
   va_end(ap);
   if (loc) {
     syslog(LOG_ERR, "[Config] %s: %s: %s", loc, what, msg);
-    fprintf(stderr, "[ERROR] %s: %s: %s\n", loc, what, msg);
+    dns_diag_at(DIAG_ERROR, DC_CONF_ACL_LIST, loc, "%s: %s: %s\n", loc, what, msg);
   } else {   /* a problem of the configuration as a whole (an acl that contains itself, an option that does not go with a list) */
     syslog(LOG_ERR, "[Config] %s: %s", what, msg);
-    fprintf(stderr, "[ERROR] %s: %s\n", what, msg);
+    cfg_diag(ctx, DIAG_ERROR, DC_CONF_ACL_LIST, "%s: %s\n", what, msg);
   }
   if (ctx) ctx->error_occurred = true;
 }
@@ -1377,10 +1393,10 @@ static void report_bad_value(token_ctx_t *ctx, const char *zone, const char *nam
                              const char *expected) {
   if (zone) {
     syslog(LOG_ERR, "[Config] zone '%s': invalid %s value '%s' (expected %s)", zone, name, val ? val : "", expected);
-    fprintf(stderr, "[ERROR] zone '%s': invalid %s value '%s' (expected %s)\n", zone, name, val ? val : "", expected);
+    cfg_diag(ctx, DIAG_ERROR, DC_CONF_VALUE_INVALID, "zone '%s': invalid %s value '%s' (expected %s)\n", zone, name, val ? val : "", expected);
   } else {
     syslog(LOG_ERR, "[Config] invalid %s value '%s' (expected %s)", name, val ? val : "", expected);
-    fprintf(stderr, "[ERROR] invalid %s value '%s' (expected %s)\n", name, val ? val : "", expected);
+    cfg_diag(ctx, DIAG_ERROR, DC_CONF_VALUE_INVALID, "invalid %s value '%s' (expected %s)\n", name, val ? val : "", expected);
   }
   if (ctx) ctx->error_occurred = true;
 }
@@ -1674,7 +1690,7 @@ static void conf_error(token_ctx_t *ctx, const char *what, const char *fmt, ...)
   va_end(ap);
   ctx_location(ctx, loc, sizeof(loc));
   syslog(LOG_ERR, "[Config] %s: %s: %s", loc, what, msg);
-  fprintf(stderr, "[ERROR] %s: %s: %s\n", loc, what, msg);
+  dns_diag_at(DIAG_ERROR, DC_CONF_SYNTAX, loc, "%s: %s: %s\n", loc, what, msg);
   ctx->error_occurred = true;
 }
 
@@ -1855,7 +1871,7 @@ static void conf_warn_loc(const char *loc, const char *what, const char *fmt, ..
   vsnprintf(msg, sizeof(msg), fmt, ap);
   va_end(ap);
   syslog(LOG_WARNING, "[Config] %s: %s: %s", loc, what, msg);
-  fprintf(stderr, "[WARNING] %s: %s: %s\n", loc, what, msg);
+  dns_diag_at(DIAG_WARNING, DC_CONF_WARNING, loc, "%s: %s: %s\n", loc, what, msg);
 }
 
 /* Does the list surely match every client, whatever its address and TSIG key?  Deliberately conservative: a non-negated `any`, a non-negated
@@ -2813,7 +2829,7 @@ static int parse_alias_resolvers(token_ctx_t *ctx, const char *where, ip_port_t 
   if (bad) {
     syslog(LOG_ERR, "[Config] %s: alias-resolver: '%.64s' is not an IP address (or the list has more than %d entries)", where, bad,
            KARIDNS_ALIAS_RESOLVERS_MAX);
-    fprintf(stderr, "[ERROR] %s: alias-resolver: '%.64s' is not an IP address (or the list has more than %d entries)\n", where, bad,
+    cfg_diag(ctx, DIAG_ERROR, DC_CONF_ALIAS_RESOLVER, "%s: alias-resolver: '%.64s' is not an IP address (or the list has more than %d entries)\n", where, bad,
             KARIDNS_ALIAS_RESOLVERS_MAX);
     if (ctx) ctx->error_occurred = true;
     return -1;
@@ -3142,11 +3158,11 @@ static int parse_transport_param(token_ctx_t *ctx, const char *zone_domain, cons
     if (zone_domain) {
       syslog(LOG_ERR, "[Config] %szone '%s': invalid %s value '%s' (expected %lld..%lld%s)",
              loc, zone_domain, name, s, lo, hi, suffix_hint);
-      fprintf(stderr, "[ERROR] %szone '%s': invalid %s value '%s' (expected %lld..%lld%s)\n",
+      cfg_diag(ctx, DIAG_ERROR, DC_CONF_VALUE_RANGE, "%szone '%s': invalid %s value '%s' (expected %lld..%lld%s)\n",
               loc, zone_domain, name, s, lo, hi, suffix_hint);
     } else {
       syslog(LOG_ERR, "[Config] %sInvalid %s value '%s' (expected %lld..%lld%s)", loc, name, s, lo, hi, suffix_hint);
-      fprintf(stderr, "[ERROR] %sInvalid %s value '%s' (expected %lld..%lld%s)\n", loc, name, s, lo, hi, suffix_hint);
+      cfg_diag(ctx, DIAG_ERROR, DC_CONF_VALUE_RANGE, "%sInvalid %s value '%s' (expected %lld..%lld%s)\n", loc, name, s, lo, hi, suffix_hint);
     }
     free_token(&tok);
     if (ctx) ctx->error_occurred = true;
@@ -3250,11 +3266,11 @@ static int parse_notify_retry_option(token_ctx_t *ctx, const char *zone_domain, 
     if (zone_domain) {
       syslog(LOG_ERR, "[Config] zone '%s': invalid notify-retry-backoff value '%s' (expected fixed or exponential)",
              zone_domain, v);
-      fprintf(stderr, "[ERROR] zone '%s': invalid notify-retry-backoff value '%s' (expected fixed or exponential)\n",
+      cfg_diag(ctx, DIAG_ERROR, DC_CONF_VALUE_INVALID, "zone '%s': invalid notify-retry-backoff value '%s' (expected fixed or exponential)\n",
               zone_domain, v);
     } else {
       syslog(LOG_ERR, "[Config] Invalid notify-retry-backoff value '%s' (expected fixed or exponential)", v);
-      fprintf(stderr, "[ERROR] Invalid notify-retry-backoff value '%s' (expected fixed or exponential)\n", v);
+      cfg_diag(ctx, DIAG_ERROR, DC_CONF_VALUE_INVALID, "Invalid notify-retry-backoff value '%s' (expected fixed or exponential)\n", v);
     }
     free_token(&tok);
     if (ctx) ctx->error_occurred = true;
@@ -4540,7 +4556,7 @@ static int servers_check_keys(token_ctx_t *ctx, server_config_t *cfg) {
       server_prefix_text(s, pt, sizeof(pt));
       bool dflt = strcmp(v->name, "__default__") == 0;
       syslog(LOG_ERR, "[Config] %s: server '%s': unknown key '%.64s'%s%s%s", s->loc, pt, s->key, dflt ? "" : " (in view '", dflt ? "" : v->name, dflt ? "" : "')");
-      fprintf(stderr, "[ERROR] %s: server '%s': unknown key '%.64s'%s%s%s\n", s->loc, pt, s->key, dflt ? "" : " (in view '", dflt ? "" : v->name, dflt ? "" : "')");
+      dns_diag_at(DIAG_ERROR, DC_CONF_SERVER_KEY_UNKNOWN, s->loc, "%s: server '%s': unknown key '%.64s'%s%s%s\n", s->loc, pt, s->key, dflt ? "" : " (in view '", dflt ? "" : v->name, dflt ? "" : "')");
       ctx->scope_keys = NULL;
       ctx->error_occurred = true;
       return -1;
@@ -4552,7 +4568,7 @@ static int servers_check_keys(token_ctx_t *ctx, server_config_t *cfg) {
     for (const tsig_key_t *k = v->keys; k; k = k->next)
       if (key_name_is_defined(cfg->keys, k->name)) {
         syslog(LOG_ERR, "[Config] view '%s': key '%s' already exists as a top-level key; the name of a key in a view must be new", v->name, k->name);
-        fprintf(stderr, "[ERROR] view '%s': key '%s' already exists as a top-level key; the name of a key in a view must be new\n", v->name, k->name);
+        cfg_diag(ctx, DIAG_ERROR, DC_CONF_KEY_VIEW_CLASH, "view '%s': key '%s' already exists as a top-level key; the name of a key in a view must be new\n", v->name, k->name);
         ctx->error_occurred = true;
         return -1;
       }
@@ -4621,14 +4637,14 @@ static int unknown_statement(token_ctx_t *ctx, const char *kind, const char *nam
   if (name_in_list(in_view ? k_bind_view_options : k_bind_zone_options, key)) {
     syslog(LOG_WARNING, "[Config] %s '%s': option '%s' is a BIND option that KariDNS does not implement; it is ignored", kind,
            name, key);
-    fprintf(stderr, "[WARNING] %s '%s': option '%s' is a BIND option that KariDNS does not implement; it is ignored\n", kind,
+    cfg_diag(ctx, DIAG_WARNING, DC_CONF_OPTION_BIND_UNIMPLEMENTED, "%s '%s': option '%s' is a BIND option that KariDNS does not implement; it is ignored\n", kind,
             name, key);
     skip_unknown_block(ctx);
     return 0;
   }
   syslog(LOG_ERR, "[Config] %s '%s': unknown option '%.64s' (neither a KariDNS option nor a BIND option for this statement; check the spelling)", kind, name,
          key);
-  fprintf(stderr, "[ERROR] %s '%s': unknown option '%.64s' (neither a KariDNS option nor a BIND option for this statement; check the spelling)\n", kind,
+  cfg_diag(ctx, DIAG_ERROR, DC_CONF_OPTION_UNKNOWN, "%s '%s': unknown option '%.64s' (neither a KariDNS option nor a BIND option for this statement; check the spelling)\n", kind,
           name, key);
   if (ctx) ctx->error_occurred = true;
   return -1;
@@ -4709,7 +4725,7 @@ static int unknown_block_statement(token_ctx_t *ctx, const char *what, const cha
     char loc[300];
     ctx_location(ctx, loc, sizeof(loc));
     syslog(LOG_WARNING, "[Config] %s: %s: '%.64s' is a BIND option that KariDNS does not implement; it is ignored", loc, what, key);
-    fprintf(stderr, "[WARNING] %s: %s: '%.64s' is a BIND option that KariDNS does not implement; it is ignored\n", loc, what, key);
+    dns_diag_at(DIAG_WARNING, DC_CONF_OPTION_BIND_UNIMPLEMENTED, loc, "%s: %s: '%.64s' is a BIND option that KariDNS does not implement; it is ignored\n", loc, what, key);
     skip_unknown_block(ctx);
     return 0;
   }
@@ -4777,7 +4793,7 @@ static tsig_key_t *parse_key_block(token_ctx_t *ctx) {
       if (strcmp(key_prop, "algorithm") == 0) {
         if (!tsig_algorithm_is_supported(val)) {
           syslog(LOG_ERR, "[Config] Unsupported TSIG algorithm: %s", val);
-          fprintf(stderr, "[ERROR] Unsupported TSIG algorithm: %s\n", val);
+          cfg_diag(ctx, DIAG_ERROR, DC_CONF_TSIG_ALGORITHM, "Unsupported TSIG algorithm: %s\n", val);
           goto fail;
         }
         if (strstr(val, "md5") || strstr(val, "sha1")) {
@@ -4790,13 +4806,13 @@ static tsig_key_t *parse_key_block(token_ctx_t *ctx) {
         size_t decoded_upper_bound = ((slen + 3) / 4) * 3;
         if (slen == 0 || decoded_upper_bound > sizeof(tsig->secret_decoded)) {
           syslog(LOG_ERR, "[Config] secret too long for algorithm (decodes to %zu bytes, max %zu)", decoded_upper_bound, sizeof(tsig->secret_decoded));
-          fprintf(stderr, "[ERROR] secret too long for algorithm\n");
+          cfg_diag(ctx, DIAG_ERROR, DC_CONF_TSIG_SECRET_LENGTH, "secret too long for algorithm\n");
           goto fail;
         }
         int len = EVP_DecodeBlock(tsig->secret_decoded, (const unsigned char *)val, slen);
         if (len < 0) {
           syslog(LOG_ERR, "[Config] key '%s': secret is not valid base64", tsig->name);
-          fprintf(stderr, "[ERROR] key '%s': secret is not valid base64\n", tsig->name);
+          cfg_diag(ctx, DIAG_ERROR, DC_CONF_TSIG_SECRET_BASE64, "key '%s': secret is not valid base64\n", tsig->name);
           goto fail;
         }
         int padding = 0;
@@ -4808,7 +4824,7 @@ static tsig_key_t *parse_key_block(token_ctx_t *ctx) {
         if (strcmp(val, KARIDNS_SAMPLE_SECRET_PLACEHOLDER) == 0) {
           syslog(LOG_WARNING, "[Config] key '%s': secret is still the sample placeholder; "
                  "replace it with the output of 'openssl rand -base64 32'", tsig->name);
-          fprintf(stderr, "[WARNING] key '%s': secret is still the sample placeholder; "
+          cfg_diag(ctx, DIAG_WARNING, DC_CONF_TSIG_SECRET_PLACEHOLDER, "key '%s': secret is still the sample placeholder; "
                   "replace it with the output of 'openssl rand -base64 32'\n", tsig->name);
         }
         tsig->secret = val;
@@ -5012,7 +5028,7 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
   }
   if (nl == (size_t)-1 || nl > 255) {
     syslog(LOG_ERR, "[Config] invalid zone name '%s' (bad escape, empty label, or name too long)", zone->domain);
-    fprintf(stderr, "[ERROR] invalid zone name '%s' (bad escape, empty label, or name too long)\n", zone->domain);
+    cfg_diag(ctx, DIAG_ERROR, DC_CONF_ZONE_NAME, "invalid zone name '%s' (bad escape, empty label, or name too long)\n", zone->domain);
     free_zone_config(zone);
     if (ctx) ctx->error_occurred = true;
     return -1;
@@ -5241,7 +5257,7 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
           ctx_location(ctx, loc, sizeof(loc));
           syslog(LOG_WARNING, "[Config] %s: zone '%s': type '%s' is a BIND zone type for resolvers that KariDNS (authoritative only) does not "
                  "implement; the zone is not loaded", loc, zone->domain, val);
-          fprintf(stderr, "[WARNING] %s: zone '%s': type '%s' is a BIND zone type for resolvers that KariDNS (authoritative only) does not "
+          dns_diag_at(DIAG_WARNING, DC_CONF_ZONE_TYPE_RESOLVER, loc, "%s: zone '%s': type '%s' is a BIND zone type for resolvers that KariDNS (authoritative only) does not "
                   "implement; the zone is not loaded\n", loc, zone->domain, val);
           free(key);
           free(val);
@@ -5256,7 +5272,7 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
           zone->type = strdup(canon);
         } else {
           syslog(LOG_ERR, "[Config] Unknown zone type '%s' for zone '%s' (expected master/primary, slave/secondary, forward, or program)", val, zone->domain);
-          fprintf(stderr, "[ERROR] Unknown zone type '%s' for zone '%s'\n", val, zone->domain);
+          cfg_diag(ctx, DIAG_ERROR, DC_CONF_ZONE_TYPE_UNKNOWN, "Unknown zone type '%s' for zone '%s'\n", val, zone->domain);
           free(key);
           free(val);
           free_zone_config(zone);
@@ -5276,7 +5292,7 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       else if (strcmp(key, "file-format") == 0) {
         if (strcasecmp(val, "bind") != 0 && strcasecmp(val, "tinydns") != 0) {
           syslog(LOG_ERR, "[Config] zone '%s': file-format must be 'bind' or 'tinydns' (got '%s')", zone->domain, val);
-          fprintf(stderr, "[ERROR] zone '%s': file-format must be 'bind' or 'tinydns' (got '%s')\n", zone->domain, val);
+          cfg_diag(ctx, DIAG_ERROR, DC_CONF_ZONE_FILE_FORMAT, "zone '%s': file-format must be 'bind' or 'tinydns' (got '%s')\n", zone->domain, val);
           free(key);
           free(val);
           free_zone_config(zone);
@@ -5620,8 +5636,8 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
            "[Config] Zone '%s' is type 'slave'/'secondary' but has 'allow-update' configured; "
            "Dynamic Update requests to secondary zones are refused at runtime (REFUSED; updates are not forwarded to the primary)",
            zone->domain);
-    fprintf(stderr,
-           "[WARNING] Zone '%s' is type 'slave'/'secondary' but has 'allow-update' configured; "
+    dns_diag(DIAG_WARNING, DC_CONF_ZONE_UPDATE_ON_SECONDARY, NULL, 0,
+           "Zone '%s' is type 'slave'/'secondary' but has 'allow-update' configured; "
            "Dynamic Update requests to secondary zones are refused at runtime (REFUSED; updates are not forwarded to the primary)\n",
            zone->domain);
   }
@@ -6031,7 +6047,7 @@ static void db_cfg_error(token_ctx_t *ctx, const char *fmt, ...) {
   vsnprintf(msg, sizeof(msg), fmt, ap);
   va_end(ap);
   syslog(LOG_ERR, "[Config] %s", msg);
-  fprintf(stderr, "[ERROR] %s\n", msg);
+  cfg_diag(ctx, DIAG_ERROR, DC_CONF_DATABASE, "%s\n", msg);
   if (ctx) ctx->error_occurred = true;
 }
 
@@ -6419,7 +6435,7 @@ static void notify_cfg_error(token_ctx_t *ctx, const char *where, const char *wh
   vsnprintf(msg, sizeof(msg), fmt, ap);
   va_end(ap);
   syslog(LOG_ERR, "[Config] %s%s%s: %s", where ? where : "", where ? ": " : "", what, msg);
-  fprintf(stderr, "[ERROR] %s%s%s: %s\n", where ? where : "", where ? ": " : "", what, msg);
+  dns_diag_at(DIAG_ERROR, DC_CONF_NOTIFY, where, "%s%s%s: %s\n", where ? where : "", where ? ": " : "", what, msg);
   if (ctx) ctx->error_occurred = true;
 }
 
@@ -6600,7 +6616,7 @@ static int xs_add(token_ctx_t *ctx, server_config_t *cfg, int family, const uint
   if (cfg->xfr_source_count >= KARIDNS_XFR_SOURCES_MAX) {
     syslog(LOG_ERR, "[Config] %s: %s: more than %d distinct source addresses", loc && loc[0] ? loc : "configuration", what,
            KARIDNS_XFR_SOURCES_MAX);
-    fprintf(stderr, "[ERROR] %s: %s: more than %d distinct source addresses\n", loc && loc[0] ? loc : "configuration", what,
+    dns_diag_at(DIAG_ERROR, DC_CONF_XFR_SOURCE_LIMIT, loc, "%s: %s: more than %d distinct source addresses\n", loc && loc[0] ? loc : "configuration", what,
             KARIDNS_XFR_SOURCES_MAX);
     if (ctx) ctx->error_occurred = true;
     return -1;
@@ -6761,7 +6777,7 @@ static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
       syslog(LOG_WARNING, "[Config] options: directory %s%s%s differs from the directory the server was started with (%s%s%s); "
              "the running server keeps using the old one until it is restarted",
              written ? "'" : "", written ? written : "(not set)", written ? "'" : "", eff ? "'" : "", eff ? eff : "not set", eff ? "'" : "");
-      fprintf(stderr, "[WARNING] options: directory %s%s%s differs from the directory the server was started with (%s%s%s); "
+      dns_diag(DIAG_WARNING, DC_CONF_DIRECTORY_CHANGED, NULL, 0, "options: directory %s%s%s differs from the directory the server was started with (%s%s%s); "
               "the running server keeps using the old one until it is restarted\n",
               written ? "'" : "", written ? written : "(not set)", written ? "'" : "", eff ? "'" : "", eff ? eff : "not set", eff ? "'" : "");
       config->directory_changed = true;
@@ -8128,13 +8144,13 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
           if (!hex_ok) {
             syslog(LOG_ERR, "[Config] Invalid cookie-secret (must be exactly 32 hex digits = 128-bit SipHash-2-4 key, RFC 9018)");
-            fprintf(stderr, "[ERROR] Invalid cookie-secret (must be exactly 32 hex digits = 128-bit SipHash-2-4 key, RFC 9018)\n");
+            cfg_diag(ctx, DIAG_ERROR, DC_CONF_COOKIE_SECRET, "Invalid cookie-secret (must be exactly 32 hex digits = 128-bit SipHash-2-4 key, RFC 9018)\n");
             OPENSSL_cleanse(tok.value, strlen(tok.value));
             free(key); free_token(&tok); return -1;
           }
           if (config->cookie_secret_count >= 4) {
             syslog(LOG_ERR, "[Config] Too many cookie-secret entries (max 4)");
-            fprintf(stderr, "[ERROR] Too many cookie-secret entries (max 4)\n");
+            cfg_diag(ctx, DIAG_ERROR, DC_CONF_COOKIE_SECRET_COUNT, "Too many cookie-secret entries (max 4)\n");
             OPENSSL_cleanse(secret, sizeof(secret));
             OPENSSL_cleanse(tok.value, strlen(tok.value));
             free(key); free_token(&tok); return -1;
@@ -8153,7 +8169,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             /* RFC 9018 §6: SipHash-2-4 is the mandatory algorithm; the BIND aes/sha1/sha256
              * variants are not interoperable and are deliberately not implemented. */
             syslog(LOG_ERR, "[Config] cookie-algorithm '%s' is not supported (only siphash24, RFC 9018)", tok.value);
-            fprintf(stderr, "[ERROR] cookie-algorithm '%s' is not supported (only siphash24, RFC 9018)\n", tok.value);
+            cfg_diag(ctx, DIAG_ERROR, DC_CONF_COOKIE_ALGORITHM, "cookie-algorithm '%s' is not supported (only siphash24, RFC 9018)\n", tok.value);
             free(key); free_token(&tok); return -1;
           }
           free_token(&tok);
@@ -8218,7 +8234,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             config->query_log_max_qps = (uint32_t)v;
           } else {
             syslog(LOG_ERR, "[Config] Invalid query-log-max-qps value '%s'", tok.value);
-            fprintf(stderr, "[ERROR] Invalid query-log-max-qps value '%s'\n", tok.value);
+            cfg_diag(ctx, DIAG_ERROR, DC_CONF_QUERY_LOG_MAX_QPS, "Invalid query-log-max-qps value '%s'\n", tok.value);
             free(key);
             free_token(&tok);
             return -1;
@@ -8243,7 +8259,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             config->query_log_buffer_size = (uint32_t)v;
           } else {
             syslog(LOG_ERR, "[Config] Invalid query-log-buffer-size value '%s' (must be a power of 2 between 1024 and 1048576)", tok.value);
-            fprintf(stderr, "[ERROR] Invalid query-log-buffer-size value '%s' (must be a power of 2 between 1024 and 1048576)\n", tok.value);
+            cfg_diag(ctx, DIAG_ERROR, DC_CONF_QUERY_LOG_BUFFER_SIZE, "Invalid query-log-buffer-size value '%s' (must be a power of 2 between 1024 and 1048576)\n", tok.value);
             free(key);
             free_token(&tok);
             return -1;
@@ -8292,7 +8308,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           unsigned long v = strtoul(tok.value, &endptr, 10);
           if (*endptr != '\0' || tok.value[0] == '-' || isspace((unsigned char)tok.value[0])) {
             syslog(LOG_ERR, "[Config] Invalid minimal-any-ttl value '%s' (must be a non-negative integer)", tok.value);
-            fprintf(stderr, "[ERROR] Invalid minimal-any-ttl value '%s' (must be a non-negative integer)\n", tok.value);
+            cfg_diag(ctx, DIAG_ERROR, DC_CONF_MINIMAL_ANY_TTL, "Invalid minimal-any-ttl value '%s' (must be a non-negative integer)\n", tok.value);
             free(key); free_token(&tok); return -1;
           }
           config->minimal_any_ttl = (uint32_t)v;
@@ -8314,7 +8330,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           unsigned long v = strtoul(tok.value, &endptr, 10);
           if (*endptr != '\0' || tok.value[0] == '-' || isspace((unsigned char)tok.value[0])) {
             syslog(LOG_ERR, "[Config] Invalid wire-cache-max-records value '%s' (must be a non-negative integer)", tok.value);
-            fprintf(stderr, "[ERROR] Invalid wire-cache-max-records value '%s' (must be a non-negative integer)\n", tok.value);
+            cfg_diag(ctx, DIAG_ERROR, DC_CONF_WIRE_CACHE_MAX_RECORDS, "Invalid wire-cache-max-records value '%s' (must be a non-negative integer)\n", tok.value);
             free(key); free_token(&tok); return -1;
           }
           config->wire_cache_max_records = (uint32_t)v;
@@ -8511,7 +8527,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
            * top-level statement (like in the sample configuration); say so instead of ignoring it. */
           syslog(LOG_ERR, "[Config] control-channel is written inside options { }: it is a top-level statement, "
                           "write it outside options { }");
-          fprintf(stderr, "[ERROR] control-channel is written inside options { }: it is a top-level statement, "
+          cfg_diag(ctx, DIAG_ERROR, DC_CONF_CONTROL_CHANNEL_PLACEMENT, "control-channel is written inside options { }: it is a top-level statement, "
                           "write it outside options { }\n");
           if (ctx) ctx->error_occurred = true;
           free(key);
@@ -8537,7 +8553,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       if (strlen(tok.value) >= KARIDNS_VIEW_NAME_MAX) {
         syslog(LOG_ERR, "[Config] View name '%.40s...' is longer than %d characters; rejecting configuration",
                tok.value, KARIDNS_VIEW_NAME_MAX - 1);
-        fprintf(stderr, "[ERROR] View name '%.40s...' is longer than %d characters\n", tok.value,
+        cfg_diag(ctx, DIAG_ERROR, DC_CONF_VIEW_NAME_LENGTH, "View name '%.40s...' is longer than %d characters\n", tok.value,
                 KARIDNS_VIEW_NAME_MAX - 1);
         free_token(&tok);
         if (ctx) ctx->error_occurred = true;
@@ -8631,7 +8647,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           if (ins != 0) {
             if (ins > 0) {
               syslog(LOG_ERR, "[Config] Duplicate zone '%s' defined in view '%s'; rejecting configuration", z->domain, view->name);
-              fprintf(stderr, "[ERROR] Duplicate zone '%s' defined in view '%s'\n", z->domain, view->name);
+              cfg_diag(ctx, DIAG_ERROR, DC_CONF_ZONE_DUPLICATE, "Duplicate zone '%s' defined in view '%s'\n", z->domain, view->name);
             } else {
               syslog(LOG_ERR, "[Config] Out of memory indexing zone '%s'", z->domain);
             }
@@ -8683,7 +8699,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             if (domain_names_match_ci((*tail)->name, vk->name)) dup = true;
           if (dup) {
             syslog(LOG_ERR, "[Config] view '%s': duplicate TSIG key '%s' defined; rejecting configuration", view->name, vk->name);
-            fprintf(stderr, "[ERROR] view '%s': duplicate TSIG key '%s' defined\n", view->name, vk->name);
+            cfg_diag(ctx, DIAG_ERROR, DC_CONF_VIEW_KEY_DUPLICATE, "view '%s': duplicate TSIG key '%s' defined\n", view->name, vk->name);
             tsig_keys_free(vk);
             free_partial_view(view);
             if (ctx) ctx->error_occurred = true;
@@ -8752,7 +8768,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       for (view_config_t *existing = config->views; existing; existing = existing->next) {
         if (strcasecmp(existing->name, view->name) == 0) {
           syslog(LOG_ERR, "[Config] Duplicate view '%s' defined; rejecting configuration", view->name);
-          fprintf(stderr, "[ERROR] Duplicate view '%s' defined\n", view->name);
+          cfg_diag(ctx, DIAG_ERROR, DC_CONF_VIEW_DUPLICATE, "Duplicate view '%s' defined\n", view->name);
           free_partial_view(view);
           return -1;
         }
@@ -8778,7 +8794,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       if (ins != 0) {
         if (ins > 0) {
           syslog(LOG_ERR, "[Config] Duplicate zone '%s' defined (top-level); rejecting configuration", zone->domain);
-          fprintf(stderr, "[ERROR] Duplicate zone '%s' defined\n", zone->domain);
+          cfg_diag(ctx, DIAG_ERROR, DC_CONF_ZONE_DUPLICATE, "Duplicate zone '%s' defined\n", zone->domain);
         } else {
           syslog(LOG_ERR, "[Config] Out of memory indexing zone '%s'", zone->domain);
         }
@@ -8846,7 +8862,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       config->acls = acl;
       if (dup_name || acl_name_is_builtin(acl->name)) {
         syslog(LOG_ERR, "[Config] acl '%s' is %s", acl->name, dup_name ? "defined twice" : "a built-in name");
-        fprintf(stderr, "[ERROR] acl '%s' is %s\n", acl->name, dup_name ? "defined twice" : "a built-in name");
+        cfg_diag(ctx, DIAG_ERROR, DC_CONF_ACL_DUPLICATE, "acl '%s' is %s\n", acl->name, dup_name ? "defined twice" : "a built-in name");
         if (ctx) ctx->error_occurred = true;
         return -1;
       }
@@ -8865,7 +8881,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       for (tsig_key_t *existing = config->keys; existing; existing = existing->next) {
         if (domain_names_match_ci(existing->name, tsig->name)) {
           syslog(LOG_ERR, "[Config] Duplicate TSIG key '%s' defined; rejecting configuration", tsig->name);
-          fprintf(stderr, "[ERROR] Duplicate TSIG key '%s' defined\n", tsig->name);
+          cfg_diag(ctx, DIAG_ERROR, DC_CONF_KEY_DUPLICATE, "Duplicate TSIG key '%s' defined\n", tsig->name);
           tsig_keys_free(tsig);
           return -1;
         }
@@ -8946,7 +8962,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           } else if (strcmp(key_prop, "algorithm") == 0) {
             if (!tsig_algorithm_is_supported(val)) {
               syslog(LOG_ERR, "[Config] Unsupported TSIG algorithm in controls: %s", val);
-              fprintf(stderr, "[ERROR] Unsupported TSIG algorithm in controls: %s\n", val);
+              cfg_diag(ctx, DIAG_ERROR, DC_CONF_TSIG_ALGORITHM, "Unsupported TSIG algorithm in controls: %s\n", val);
               free(key_prop);
               free(val);
               return -1;
@@ -8963,7 +8979,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             size_t decoded_upper_bound = ((slen + 3) / 4) * 3;
             if (slen == 0 || decoded_upper_bound > sizeof(config->control.secret_decoded)) {
               syslog(LOG_ERR, "[Config] secret too long for algorithm (decodes to %zu bytes, max %zu)", decoded_upper_bound, sizeof(config->control.secret_decoded));
-              fprintf(stderr, "[ERROR] secret too long for algorithm\n");
+              cfg_diag(ctx, DIAG_ERROR, DC_CONF_TSIG_SECRET_LENGTH, "secret too long for algorithm\n");
               free(key_prop);
               free(config->control.secret);
               config->control.secret = NULL;
@@ -8974,7 +8990,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                                       slen);
             if (len < 0) {
               syslog(LOG_ERR, "[Config] control-channel: secret is not valid base64");
-              fprintf(stderr, "[ERROR] control-channel: secret is not valid base64\n");
+              cfg_diag(ctx, DIAG_ERROR, DC_CONF_TSIG_SECRET_BASE64, "control-channel: secret is not valid base64\n");
               free(key_prop);
               free(config->control.secret);
               config->control.secret = NULL;
@@ -8989,7 +9005,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             if (strcmp(config->control.secret, KARIDNS_SAMPLE_SECRET_PLACEHOLDER) == 0) {
               syslog(LOG_WARNING, "[Config] control-channel: secret is still the sample placeholder; "
                      "replace it with the output of 'openssl rand -base64 32'");
-              fprintf(stderr, "[WARNING] control-channel: secret is still the sample placeholder; "
+              cfg_diag(ctx, DIAG_WARNING, DC_CONF_TSIG_SECRET_PLACEHOLDER, "control-channel: secret is still the sample placeholder; "
                       "replace it with the output of 'openssl rand -base64 32'\n");
             }
           }
@@ -8998,7 +9014,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
            * or on the default socket without a word.  It is a configuration error now (startup and reload alike; karicheck
            * conf shows it as an error because it runs this parser). */
           syslog(LOG_ERR, "[Config] control-channel: unknown option '%.64s' (supported: socket, secret, algorithm, allow-group, keys)", key_prop);
-          fprintf(stderr, "[ERROR] control-channel: unknown option '%.64s' (supported: socket, secret, algorithm, allow-group, keys)\n", key_prop);
+          cfg_diag(ctx, DIAG_ERROR, DC_CONF_CONTROL_CHANNEL_OPTION, "control-channel: unknown option '%.64s' (supported: socket, secret, algorithm, allow-group, keys)\n", key_prop);
           if (ctx) ctx->error_occurred = true;
           free(key_prop);
           return -1;
@@ -9176,7 +9192,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       if (zx->tsig_key && !key_is_defined(ctx, config, zx->tsig_key)) {
         syslog(LOG_ERR, "[Config] Zone '%s': tsig-key '%s' is not defined in any key {} block",
                z->domain, zx->tsig_key);
-        fprintf(stderr, "[ERROR] Zone '%s': tsig-key '%s' is not defined in any key {} block\n",
+        cfg_diag(ctx, DIAG_ERROR, DC_CONF_ZONE_TSIG_KEY_UNDEFINED, "Zone '%s': tsig-key '%s' is not defined in any key {} block\n",
                 z->domain, zx->tsig_key);
         return -1;
       }
@@ -9185,7 +9201,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         if (!key_is_defined(ctx, config, zx->tsig_keys[i])) {
           syslog(LOG_ERR, "[Config] Zone '%s': allow-transfer key '%s' is not defined in any key {} block",
                  z->domain, zx->tsig_keys[i]);
-          fprintf(stderr, "[ERROR] Zone '%s': allow-transfer key '%s' is not defined in any key {} block\n",
+          cfg_diag(ctx, DIAG_ERROR, DC_CONF_ZONE_TRANSFER_KEY_UNDEFINED, "Zone '%s': allow-transfer key '%s' is not defined in any key {} block\n",
                   z->domain, zx->tsig_keys[i]);
           return -1;
         }

@@ -23,7 +23,11 @@ karicheck zone <domain> [config_path]
 
 karicheck zone <domain> <zone_file_path>
 
+karicheck zone <domain> -
+
 karicheck db [view] [config_path]
+
+karicheck --json conf|zones|zone|db ...
 
 karicheck -v | --version
 
@@ -55,6 +59,12 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
 
 `zone <domain> <zone_file_path>`
 : Standalone mode: parse and validate `<zone_file_path>` as a BIND-format zone for `<domain>` without a configuration file. The third argument is treated as a configuration file if it contains `.conf`, and as a zone file otherwise. A relative path is resolved against the current directory; the server resolves relative zone paths (also with `../`) against the directory it was started from.
+
+`zone <domain> -`
+: The zone text is read from standard input (BIND format, at most 64 MiB; a bigger input is refused with `io.stdin.too-large`, it is not cut). The messages and the JSON document call the file `<stdin>`. `$INCLUDE` is refused (`zone.include-stdin`): there is no directory to include from. This is for a caller that holds the zone in memory (a web interface that validates an edited zone before it writes it to the database) and wants no temporary file.
+
+`--json` *command* ...
+: Write the result as one JSON document on standard output (see [JSON OUTPUT](#json-output)) instead of the text lines. `--json` comes before the command. Standard output then carries nothing but the document, and standard error nothing at all (except when the document cannot be written). The exit status is the same as without `--json`. `-h` and `-v` are not commands with `--json`: they are usage errors.
 
 `db [view] [config_path]`
 : Read the PowerDNS tables of `options { database { } }` (read only, through `karidns-dbloader --check`) and check the schema, every zone (with the checks of `zone`), the settings texts, the views, and the zones of the configuration that hide a database zone. With `view`, only the zones that view gets are reported. A single argument is a view unless it contains a `/` or ends in `.conf`. See [Database checks](#database-checks-karicheck-db).
@@ -143,7 +153,7 @@ Each zone check prints `[RESULT] Zone '<zone>': <n> error(s), <n> warning(s)` fo
 
 The first `[INFO]` line of each database names the rights used. When the database file or the `conninfo-file` cannot be used with them, the message names the file and the missing permission (`is not readable by the user ...: it needs read permission`, `has no search (x) permission on the directory ...`, SQLite3: `is not writable by the user ...` because even a reader of a WAL database writes the `-shm` file, and its directory or the `-wal` / `-shm` files must be writable), and no zone is read.
 
-Every database gets a line `[RESULT] Database ...: N zone(s) read, E error(s), W warning(s)` followed by `[OK]` or `[FAIL]`, then one summary line. A zone the loader would refuse is reported with its first failing row, as the loader does (one bad row fails the zone): `zone 'example.test.' (domains.id 3): records.id 41: ...`. Everything that came from the database is escaped before it is printed. The exit status is 1 when any error was found or the check could not be run, else 0 (warnings do not change it). `--json` comes with a later release.
+Every database gets a line `[RESULT] Database ...: N zone(s) read, E error(s), W warning(s)` followed by `[OK]` or `[FAIL]`, then one summary line. A zone the loader would refuse is reported with its first failing row, as the loader does (one bad row fails the zone): `zone 'example.test.' (domains.id 3): records.id 41: ...`. Everything that came from the database is escaped before it is printed. The exit status is 1 when any error was found or the check could not be run, else 0 (warnings do not change it). With `--json` each finding is a message of the document (code, place and zone), and the zones are the entries of `zones` (`"format": "database"`; `file` is null).
 
 | Check | Level |
 |---|---|
@@ -211,6 +221,334 @@ $ karicheck db /usr/local/etc/karidns/karidns.conf
 
 ---
 
+## JSON OUTPUT
+
+`karicheck --json <command> ...` runs the same checks as the text mode and writes one JSON document (RFC 8259, UTF-8) on standard output when the run is over. A caller that always parses standard output gets an answer for every run, a usage error included. Nothing else is written to standard output, and nothing to standard error unless the document itself cannot be written (then the status is 1 and a line says so).
+
+```json
+{
+  "karicheck": 1,
+  "version": "0.6.0",
+  "command": "zone",
+  "result": "fail",
+  "counts": { "error": 1, "warning": 2, "checked": 1, "skipped": 0, "dropped": 0 },
+  "truncated": false,
+  "messages": [
+    { "severity": "error", "code": "zone.syntax", "text": "Syntax error in db/example.test.zone at line 12\nReason: invalid TTL", "file": "db/example.test.zone", "line": 12, "zone": "example.test.", "view": null }
+  ],
+  "zones": [
+    { "zone": "example.test.", "view": null, "file": "db/example.test.zone", "format": "bind", "result": "fail", "errors": 1, "warnings": 2 }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `karicheck` | The schema version, an integer. It is raised only when a field changes its meaning or goes away; a new field does not raise it. Read the fields you know and ignore the others. |
+| `version` | The version of `karicheck`. |
+| `command` | `conf`, `zones`, `zone` or `db`; `null` when the command line named none that exists. |
+| `result` | `ok` (exit status 0), `fail` (1: problems found) or `usage` (2: usage error). |
+| `counts.error`, `counts.warning` | The messages of those severities, also the ones that did not fit into `messages`. |
+| `counts.checked`, `counts.skipped` | Zones checked and zones skipped (a type that has no zone file); for `db`, `checked` is the number of zones read. 0 for `conf`. |
+| `counts.dropped`, `truncated` | At most 10000 messages and 100000 `zones` entries are kept; the rest is only counted. `dropped` is the number of messages left out, `truncated` is true when anything was left out. |
+| `messages[]` | Every finding in the order `karicheck` found it. |
+| `messages[].severity` | `error`, `warning`, `note` or `info`. |
+| `messages[].code` | The code of the problem (below); a string, in every message. |
+| `messages[].text` | The text the text mode prints, without the `[ERROR]` tag and the final line feed. A continuation (`Reason: ...` of a syntax error, the expected and computed digest of a ZONEMD mismatch) follows after a line feed. May hold any characters (it quotes names from the files). |
+| `messages[].file`, `.line` | Where the problem is: the file (`<stdin>` for standard input), and the line (a positive integer) or `null` when it is not known. For `db` both are `null`. |
+| `messages[].zone`, `.view` | The zone (absolute name, as `karicheck` shows it) and the view the message is about, or `null`. The view of a configuration without `view { }` is `__default__`; `null` when there is no view (a standalone zone file, a message about the configuration as a whole). |
+| `zones[]` | One entry per zone checked, in order: `zone`, `view` and `file` (`null` when unknown), `format` (`bind`, `tinydns` or `database`), `result` (`ok` or `fail`) and the numbers of `errors` and `warnings` found while it was checked. |
+
+All strings are valid JSON strings: `"` and `\` are escaped, every control character (below U+0020, and U+007F) is written as `\u00XX`, and a byte that is not part of valid UTF-8 (a zone file, a file name or the database can hold anything) is replaced by U+FFFD. A text longer than 4096 bytes is cut and ends with `...`.
+
+**Stability.** A code is never renamed and never used for another problem once released. A code that is no longer printed stays in the list, marked retired. A code names the problem, not the text: the same code may come with several texts (they carry the details), and the text of a message may change without its code. New codes may appear in any release; treat a code you do not know by its `severity`. The codes of `karidns-dbloader` findings that carry none of their own are `db.finding`.
+
+Examples:
+
+```sh
+karicheck --json zone example.test /etc/karidns/zones/example.test.zone
+karicheck --json zone example.test - < edited.zone
+karicheck --json conf /usr/local/etc/karidns/karidns.conf
+karicheck --json db /usr/local/etc/karidns/karidns.conf
+```
+
+### Message codes
+
+Severity is the usual one of the code; a check whose severity the configuration sets (`check-*` options) prints the severity in force.
+
+<!-- BEGIN CODES (generated by tests/check_diag_codes.pl --print-docs; do not edit) -->
+
+| Code | Severity | Meaning |
+|---|---|---|
+| `usage.command.missing` | error | no command was given |
+| `usage.command.unknown` | error | the command is not conf, zones, zone or db |
+| `usage.args` | error | a command got too few or too many arguments |
+| `io.open` | error | a file could not be opened |
+| `io.not-regular` | error | a path that must be a regular file is not one |
+| `io.read` | error | a file could not be read |
+| `io.stat` | error | a file could not be examined with stat |
+| `io.stdin.read` | error | reading standard input failed |
+| `io.stdin.too-large` | error | the zone text on standard input is larger than 64 MiB |
+| `io.pipe` | error | a pipe for the database loader could not be created |
+| `io.fork` | error | the database loader could not be started |
+| `internal.oom` | error | out of memory |
+| `conf.syntax` | error | a syntax error in a configuration statement |
+| `conf.value.invalid` | error | the value of an option is not one the option accepts |
+| `conf.value.range` | error | a numeric option is outside its range |
+| `conf.warning` | warning | an option is accepted but has no effect, or is written in a way KariDNS reads differently from BIND |
+| `conf.acl.entry` | error | an entry of an ACL is not valid |
+| `conf.acl.list` | error | an address match list cannot be resolved |
+| `conf.acl.duplicate` | error | an acl is defined twice or has a built-in name |
+| `conf.alias-resolver` | error | an alias-resolver entry is not an IP address, or the list is too long |
+| `conf.server.key-unknown` | error | a server statement names a TSIG key that is not defined |
+| `conf.key.view-clash` | error | a key in a view has the name of a top-level key |
+| `conf.key.duplicate` | error | a TSIG key is defined twice |
+| `conf.view.key-duplicate` | error | a TSIG key is defined twice in a view |
+| `conf.option.bind-unimplemented` | warning | a BIND option that KariDNS does not implement is ignored |
+| `conf.option.unknown` | error | an option that is neither a KariDNS option nor a BIND option for the statement |
+| `conf.tsig.algorithm` | error | a TSIG algorithm that KariDNS does not support |
+| `conf.tsig.secret-length` | error | a TSIG secret is too long for its algorithm |
+| `conf.tsig.secret-base64` | error | a TSIG secret is not valid base64 |
+| `conf.tsig.secret-placeholder` | warning | a secret is still the placeholder of the sample configuration |
+| `conf.zone.name` | error | a zone name is not valid (bad escape, empty label, or too long) |
+| `conf.zone.duplicate` | error | a zone is defined twice |
+| `conf.zone.type-resolver` | warning | a BIND zone type for resolvers is not loaded |
+| `conf.zone.type-unknown` | error | an unknown zone type |
+| `conf.zone.file-format` | error | file-format is neither bind nor tinydns |
+| `conf.zone.update-on-secondary` | warning | allow-update on a secondary zone is refused at run time |
+| `conf.zone.tsig-key-undefined` | error | the tsig-key of a zone is not defined |
+| `conf.zone.transfer-key-undefined` | error | an allow-transfer key of a zone is not defined |
+| `conf.database` | error | an error in options { database { } } or in the database options of a view |
+| `conf.notify` | error | an error in also-notify or in a remote-servers list |
+| `conf.xfr-source.limit` | error | more distinct transfer or NOTIFY source addresses than KariDNS can bind |
+| `conf.directory.changed` | warning | options { directory } differs from the directory the running server uses |
+| `conf.cookie.secret` | error | cookie-secret is not 32 hexadecimal digits |
+| `conf.cookie.secret-count` | error | more cookie-secret entries than the limit |
+| `conf.cookie.algorithm` | error | a cookie-algorithm other than siphash24 |
+| `conf.query-log.max-qps` | error | query-log-max-qps is not valid |
+| `conf.query-log.buffer-size` | error | query-log-buffer-size is not a power of 2 in range |
+| `conf.minimal-any-ttl` | error | minimal-any-ttl is not a non-negative integer |
+| `conf.wire-cache.max-records` | error | wire-cache-max-records is not a non-negative integer |
+| `conf.control-channel.placement` | error | control-channel is written inside options { } |
+| `conf.control-channel.option` | error | an unknown option in control-channel { } |
+| `conf.view.name-length` | error | a view name is too long |
+| `conf.view.duplicate` | error | a view is defined twice |
+| `conf.loading` | info | the configuration file that is being checked |
+| `conf.parse-failed` | error | the configuration file could not be parsed (the reason is in the messages before it) |
+| `conf.listen` | info | the addresses the server listens on |
+| `conf.xfr-source.list` | info | the transfer and NOTIFY source addresses |
+| `conf.startup-notify-rate` | note | startup-notify-rate is accepted but has no effect |
+| `conf.transfers-in-zero` | warning | transfers-in 0: no zone is transferred in |
+| `conf.transfers-out-zero` | warning | transfers-out 0: every zone transfer request is refused |
+| `conf.transfers-per-ns-zero` | warning | transfers-per-ns 0: no zone is transferred in |
+| `conf.view.servers-override` | note | a view with its own server statements does not use the top-level ones |
+| `conf.zone.secondary-options-on-primary` | note | refresh and inbound-transfer options have no effect in a primary zone |
+| `conf.zone.multi-master` | note | multi-master has no effect with fewer than two primaries |
+| `conf.zone.refresh-range` | warning | min-refresh-time is larger than max-refresh-time |
+| `conf.zone.retry-range` | warning | min-retry-time is larger than max-retry-time |
+| `conf.control-key.tsig` | warning | a control-channel key is also used for TSIG |
+| `conf.directory.access` | error | options { directory } cannot be accessed |
+| `conf.directory.not-dir` | error | options { directory } is not a directory |
+| `conf.directory.relative` | warning | options { directory } is a relative path |
+| `conf.acl.transfer-match` | warning | transfer-acl-match has no effect |
+| `conf.acl.transfer-order` | warning | allow-transfer with addresses and keys is evaluated in BIND's first-match order |
+| `conf.acl.update-match` | warning | update-acl-match has no effect |
+| `conf.acl.update-order` | warning | allow-update with keys and negated entries is evaluated in BIND's first-match order |
+| `conf.zone.program-path` | error | the program of a program zone is not an absolute path |
+| `conf.zone.program-exec` | warning | the program of a program zone is not executable |
+| `conf.zone.program-user-root` | error | program-user is root by another name |
+| `conf.zone.program-user-differs` | warning | program-user differs from options user |
+| `conf.zone.program-args` | error | program-args has more entries than supported |
+| `conf.zone.program-missing` | error | a program zone has no program path |
+| `conf.zone.forward` | info | type forward keeps its KariDNS meaning, which differs from BIND |
+| `conf.zone.forward-missing` | error | a forward zone has no forwarders |
+| `conf.zone.forward-loop` | warning | a forwarder points at this server itself |
+| `conf.program-zones.disabled` | error | program zones are configured but allow-program-zones is not enabled |
+| `conf.tag.cidr` | error | a CIDR in ecs-tags or location-tags is not valid |
+| `conf.ecs.disabled` | warning | ecs-tags are defined but ecs-enable is not set |
+| `conf.identity.root` | error | options user or group is root by another name |
+| `conf.database.no-driver` | error | options { database { } } has no driver |
+| `conf.database.loader-user` | error | the loader-user does not exist |
+| `conf.database.loader-user-missing` | warning | no loader-user is set |
+| `conf.database.loader-group` | error | the loader-group does not exist |
+| `conf.database.identity-root` | error | loader-user or loader-group is root by another name |
+| `conf.database.loader-file` | error | the loader file fails the ownership, mode or execute checks |
+| `conf.database.loader-answer` | error | the loader did not answer --drivers |
+| `conf.database.driver` | error | the loader was not built with the configured driver |
+| `conf.database.drivers-not-run` | warning | --drivers was not run because karicheck is run by root |
+| `conf.database.state-file` | warning | loader-state-file has no effect without memory-limit |
+| `conf.database.warm` | warning | warm-before-serve has no effect without memory-limit |
+| `conf.database.acl-ceiling` | warning | no acl-ceiling: the ACLs of database zones refuse every client |
+| `conf.database.acl-ceiling-match` | warning | acl-ceiling-match all has no effect with one kind of entry |
+| `conf.database.file` | error | the SQLite3 database file does not exist |
+| `conf.database.file-type` | error | the SQLite3 database file is not a regular file |
+| `conf.database.file-readable` | warning | the SQLite3 database file is readable by everyone |
+| `conf.database.dir-writable` | warning | the directory of the SQLite3 database file is writable by everyone |
+| `conf.database.file-unreadable` | warning | the SQLite3 database file cannot be read to check its journal mode |
+| `conf.database.file-empty` | error | the SQLite3 database file is empty |
+| `conf.database.file-format` | error | the file is not an SQLite3 database |
+| `conf.database.wal` | error | the SQLite3 database is not in WAL mode |
+| `conf.database.conninfo-file` | error | the conninfo-file cannot be examined |
+| `conf.database.conninfo-mode` | error | the conninfo-file mode is not 0600 or 0400 |
+| `conf.database.conninfo-owner` | error | the conninfo-file does not belong to the loader user |
+| `conf.database.conninfo-tls` | warning | the connection has neither a UNIX socket host nor sslmode=verify-full |
+| `conf.database.server-id-sqlite` | warning | server-id is ignored with sqlite3 |
+| `conf.database.server-id-chars` | warning | server-id has characters other than letters, digits and . - _ : |
+| `conf.database.server-id-host` | warning | server-id is not set and the host name does not fit |
+| `conf.database.alias-resolver` | warning | an alias-resolver with server-id: servers sharing a database can answer ALIAS names differently |
+| `zone.not-found` | error | the zone is not in the configuration |
+| `zone.skipped` | info | a zone without a zone file is not checked |
+| `zone.summary` | info | the number of zones checked and skipped, and the errors |
+| `zone.syntax` | error | a syntax error in the zone file or a record that the zone parser or a zone validation refuses |
+| `zone.include-stdin` | error | $INCLUDE is refused in a zone read from standard input |
+| `zone.empty` | error | the zone has no records |
+| `zone.out-of-zone` | warning | a record outside the zone is ignored |
+| `zone.tinydns.out-of-zone` | warning | tinydns records that belong to no zone of the view are ignored |
+| `zone.ttl.missing` | warning | records have no TTL and no $TTL |
+| `zone.string.long` | warning | a character-string of more than 255 octets |
+| `zone.limits` | error | the zone breaks a size limit of the configuration |
+| `zone.pdns-types` | error | ALIAS or LUA records that the server does not accept |
+| `zone.program-skipped` | info | a program zone has no zone file to validate |
+| `zone.dnssec.algorithm-deprecated` | warning | a DNSSEC algorithm that RFC 8624 forbids or does not recommend |
+| `zone.dnssec.algorithm-unknown` | warning | an unknown DNSSEC algorithm number |
+| `zone.dnssec.key-base64` | warning | a DNSSEC key or signature is not valid base64 |
+| `zone.dnssec.mldsa-length` | warning | an ML-DSA key or signature has the wrong length |
+| `zone.ds.digest-null` | warning | DS digest type 0 outside of the CDS delete signal |
+| `zone.ds.digest-deprecated` | warning | a DS digest type that is deprecated |
+| `zone.ds.digest-unknown` | warning | an unknown DS digest type |
+| `zone.zonemd.scheme-invalid` | warning | the ZONEMD scheme is not a number from 0 to 255 |
+| `zone.zonemd.hash-invalid` | warning | the ZONEMD hash algorithm is not a number from 0 to 255 |
+| `zone.zonemd.canonical` | error | a record cannot be put in canonical form, so the ZONEMD digest is not computed |
+| `zone.zonemd.serial-mismatch` | error | the ZONEMD serial differs from the SOA serial |
+| `zone.zonemd.unsupported` | info | a ZONEMD with an unsupported scheme or hash algorithm is not verified |
+| `zone.zonemd.duplicate` | error | more than one ZONEMD with the same scheme and hash algorithm |
+| `zone.zonemd.digest-length` | error | the ZONEMD digest has the wrong length |
+| `zone.zonemd.compute-failed` | error | the ZONEMD digest could not be computed |
+| `zone.zonemd.mismatch` | error | the ZONEMD digest does not match the zone |
+| `zone.zonemd.not-apex` | warning | a ZONEMD record is not at the zone apex |
+| `zone.zonemd.fields` | warning | a ZONEMD record has fewer than four fields |
+| `zone.glue.missing` | error | an in-bailiwick NS target has no A or AAAA record |
+| `zone.target.no-address` | warning | an in-bailiwick MX, SRV or similar target has no A or AAAA record |
+| `zone.cname.coexists` | error | a CNAME shares its name with other record types |
+| `zone.cname.coexists-other` | warning | a CNAME co-exists with other records (RFC 1912) |
+| `zone.record.occluded` | warning | a record is hidden by a delegation above it |
+| `zone.cname.target` | error | an NS or MX record points to a CNAME |
+| `zone.srv.cname` | warning | an SRV record points to a CNAME |
+| `zone.cname.loop` | error | a CNAME points to itself |
+| `zone.cname.chain` | warning | a CNAME points to another CNAME |
+| `zone.wildcard.non-terminal` | warning | an owner name contains a wildcard that is not the leftmost label |
+| `zone.dup-records` | warning | an RRset has duplicate records |
+| `zone.mx.address` | warning | an MX target is an IP address |
+| `zone.names.owner` | error | an owner name is not a valid host name (check-names) |
+| `zone.names.target` | error | a name in record data is not a valid host name (check-names) |
+| `zone.nsec3param.not-apex` | warning | an NSEC3PARAM is not at the zone apex |
+| `zone.nsec3param.hash-algorithm` | warning | an NSEC3PARAM with a hash algorithm other than 1 |
+| `zone.nsec3param.flags` | error | an NSEC3PARAM with Flags other than 0 |
+| `zone.nsec3param.iterations-high` | error | NSEC3PARAM iterations that are excessively high |
+| `zone.nsec3param.iterations` | warning | NSEC3PARAM iterations other than 0 (RFC 9276) |
+| `zone.nsec3param.salt` | warning | an NSEC3PARAM that uses a salt (RFC 9276) |
+| `zone.nsec3param.unusable` | warning | no NSEC3PARAM of the zone is usable |
+| `zone.nsec3.chain-missing` | warning | no NSEC3 records with the parameters of the NSEC3PARAM |
+| `zone.nsec3.hash-algorithm` | warning | an NSEC3 chain with a hash algorithm other than 1 |
+| `zone.nsec3.flags-reserved` | warning | NSEC3 records with reserved Flags bits set |
+| `zone.nsec3.opt-out` | warning | NSEC3 opt-out is set |
+| `zone.nsec3.iterations-high` | error | NSEC3 iterations that are excessively high |
+| `zone.nsec3.iterations` | warning | NSEC3 iterations other than 0 (RFC 9276) |
+| `zone.nsec3.salt` | warning | an NSEC3 chain that uses a salt (RFC 9276) |
+| `zone.nsec3.chain-orphan` | warning | an NSEC3 chain that matches no usable NSEC3PARAM |
+| `zone.ttl.inconsistent` | warning | the records of an RRset have different TTLs (RFC 2181 section 5.2) |
+| `zone.ttl.inconsistent-visibility` | warning | restricted and unrestricted records of an RRset have different TTLs |
+| `zone.alias.present` | info | the zone has ALIAS records |
+| `zone.lua.present` | warning | the zone has LUA records, which are never executed |
+| `zone.location.prefix` | error | a tinydns location prefix longer than /32 |
+| `zone.location.duplicate` | warning | a tinydns location code is defined twice |
+| `zone.location.tag-undefined` | error | a record names a location tag that is not defined |
+| `zone.ecs.tag-undefined` | error | a record names an ECS subnet tag that is not defined |
+| `zone.tinydns.ipv6-hex` | error | a tinydns line needs a 32-character hexadecimal IPv6 address |
+| `zone.tinydns.ip6int` | info | a tinydns type 6 line generates a PTR in the deprecated ip6.int |
+| `zone.a.fields` | error | an A record without exactly one field |
+| `zone.a.address` | error | an A record with an invalid IPv4 address |
+| `zone.aaaa.fields` | error | an AAAA record without exactly one field |
+| `zone.aaaa.address` | error | an AAAA record with an invalid IPv6 address |
+| `zone.csync.type-unknown` | warning | a CSYNC record names an unknown type |
+| `zone.svcb.target-dot` | warning | an SVCB or HTTPS TargetName does not end with a dot |
+| `zone.hip.fields` | warning | a HIP record has fewer than three fields |
+| `zone.hip.key-base64` | error | the public key of a HIP record is not valid base64 |
+| `zone.wks.protocol` | warning | the protocol of a WKS record is neither a number nor TCP or UDP |
+| `zone.wks.port` | warning | a port of a WKS record is neither a number nor a known service |
+| `zone.gpos.fields` | warning | a GPOS record has fewer than three fields |
+| `zone.x25.fields` | warning | an X25 record has no field |
+| `zone.isdn.fields` | warning | an ISDN record does not have one or two fields |
+| `zone.eui48` | warning | an EUI48 record is not six octets |
+| `zone.eui64` | warning | an EUI64 record is not eight octets |
+| `zone.srv.fields` | error | an SRV record without four fields |
+| `zone.srv.priority-range` | error | the priority of an SRV record is out of range |
+| `zone.srv.weight-range` | error | the weight of an SRV record is out of range |
+| `zone.srv.port-range` | error | the port of an SRV record is out of range |
+| `zone.naptr.fields` | error | a NAPTR record without six fields |
+| `zone.naptr.order-range` | error | the order of a NAPTR record is out of range |
+| `zone.naptr.preference-range` | error | the preference of a NAPTR record is out of range |
+| `zone.naptr.flags` | error | the flags of a NAPTR record are not alphanumeric |
+| `zone.naptr.regexp-replacement` | error | a NAPTR record sets both a regexp and a replacement |
+| `zone.caa.fields` | error | a CAA record without three fields |
+| `zone.caa.flags-range` | error | the flags of a CAA record are out of range |
+| `zone.caa.flags-undefined` | warning | a CAA record sets undefined flag bits |
+| `zone.caa.tag-syntax` | error | a CAA tag does not match the RFC 8659 syntax |
+| `zone.caa.tag-critical` | error | an unknown CAA tag with the critical flag set |
+| `zone.caa.tag-unknown` | warning | an unrecognized CAA tag |
+| `zone.sshfp.fields` | error | an SSHFP record without three fields |
+| `zone.sshfp.algorithm-range` | error | the algorithm of an SSHFP record is out of range |
+| `zone.sshfp.algorithm-unassigned` | warning | an SSHFP algorithm that is not assigned |
+| `zone.sshfp.fptype-range` | error | the fingerprint type of an SSHFP record is out of range |
+| `zone.sshfp.fptype-unassigned` | warning | an SSHFP fingerprint type that is not assigned |
+| `zone.sshfp.fingerprint-hex` | error | the fingerprint of an SSHFP record is not hexadecimal |
+| `zone.soa.mname-cname` | warning | the SOA MNAME points to a CNAME |
+| `zone.meta-type` | error | a meta-type appears as a standalone RRset |
+| `zone.dsync.type-unknown` | warning | a DSYNC record names an unknown RR type |
+| `zone.record.wire` | error | a record cannot be serialized to wire format |
+| `zone.soa.missing` | error | the zone has no SOA record at the apex |
+| `zone.soa.multiple` | error | more than one SOA record that every client sees |
+| `zone.soa.invalid` | error | the SOA records of the zone are not valid |
+| `zone.soa.location-undefined` | warning | the SOA record is restricted to a location the zone does not define |
+| `zone.soa.expired` | warning | the SOA record has expired |
+| `zone.ns.missing` | error | the zone has no NS record at the apex |
+| `zone.catalog.version` | error | a catalog zone lacks its version TXT record |
+| `zone.catalog.name-too-long` | error | a name in a catalog zone is too long to check |
+| `zone.catalog.orphan-group` | warning | a group TXT record of a catalog zone has no member PTR record |
+| `db.finding` | error | a finding of karidns-dbloader --check that carries no code of its own (the severity is the message's) |
+| `db.checking` | info | the database that is being checked |
+| `db.summary` | info | the number of databases and zones checked |
+| `db.disabled` | error | the configuration has no database block |
+| `db.loader-missing` | error | the database loader is not installed |
+| `db.view-not-found` | error | the view named on the command line is not defined |
+| `db.view-none` | error | the view takes no zones from the database |
+| `db.nothing` | error | no view reads a database |
+| `db.identity.no-loader-user` | error | run by root without a loader-user, so there are no rights to check with |
+| `db.identity.root` | error | loader-user or loader-group is root by another name |
+| `db.identity.user` | error | the loader-user does not exist |
+| `db.identity.group` | error | the loader-group does not exist |
+| `db.loader.line-too-long` | error | the loader wrote a line that is too long |
+| `db.loader.failed` | error | the loader did not finish its check |
+| `db.loader.protocol` | warning | the loader printed lines that are not part of its protocol |
+| `db.protocol.zone` | error | a zone line of the loader does not decode |
+| `db.protocol.settings` | error | a settings line of the loader does not decode |
+| `db.view.undefined` | warning | karidns_domain_views names a view that is not defined |
+| `db.view.not-shared` | warning | karidns_domain_views names a view that does not read the shared source |
+| `db.view.unserved` | warning | karidns_domain_views maps the zone only to views that do not read it |
+| `db.zone.shadowed` | warning | a zone of the configuration hides the database zone |
+| `db.zone.shadowed-program` | warning | a program or forward zone of the configuration hides the database zone |
+| `db.settings.ceiling-entry` | warning | an ACL entry of the settings is outside acl-ceiling |
+| `db.settings.ceiling-key` | warning | a key of the settings is not listed in acl-ceiling |
+| `db.settings.ceiling-missing` | warning | the settings have ACL entries but acl-ceiling is not configured |
+| `db.settings.profile` | error | the settings text of a profile does not parse |
+| `db.settings.zone` | error | the settings of a zone do not parse |
+| `db.settings.combined` | error | the settings of a profile and of its zone together do not parse |
+| `db.settings.key-undefined` | error | the settings name a TSIG key that is not defined |
+
+<!-- END CODES -->
+
+---
+
 ## EXIT STATUS
 
 `0`
@@ -220,7 +558,7 @@ $ karicheck db /usr/local/etc/karidns/karidns.conf
 : Problems found: unreadable file, syntax error, validation error, or ZONEMD digest mismatch detected. `db`: an error in the database or its data, a database that cannot be read with the rights of the loader, or a loader that is not installed (`DB support is not installed`).
 
 `2`
-: Usage error (a missing or unknown command, missing or too many arguments; the usage text goes to standard error). Nothing was checked. Before this release a usage error exited with 1.
+: Usage error (a missing or unknown command, missing or too many arguments; the usage text goes to standard error). Nothing was checked. Before this release a usage error exited with 1. With `--json` the document holds the usage error (`usage.*`) and nothing is written to standard error.
 
 ---
 

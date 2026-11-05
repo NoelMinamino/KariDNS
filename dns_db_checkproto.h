@@ -9,8 +9,11 @@
  * untrusted input: every field is bounded, the escapes are strict, and nothing a line says is trusted to be printable.
  *
  * A line is TAB separated fields, ended by LF.  Field 0 is a one-letter tag:
- *   E W I O D  <zone> <id> <text>    a finding: error, warning, information, ok, detail (continuation of the finding before)
+ *   E W I O D  <zone> <id> <text> [<code>]
+ *                                    a finding: error, warning, information, ok, detail (continuation of the finding before)
  *                                    zone: the canonical zone name ("" = about the source, not a zone), id: domains.id (0 = none)
+ *                                    code: the code of the zone check that found it (dns_diag_codes.h, for karicheck --json); a line
+ *                                    without one is a db.finding.  Plain ASCII, never escaped; an unknown code counts as none.
  *   Z  <zone> <id> <kind> <view>...  a zone of the source (before its findings): kind primary | secondary | catalog | other;
  *                                    the views of karidns_domain_views that name it ("*" = it has no row: every view of the source)
  *   S  <zone> <id> <text> <profile> <profile-text>
