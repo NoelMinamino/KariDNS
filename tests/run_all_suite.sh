@@ -26,6 +26,9 @@
 #   -v, --verbose           Print verbose real-time test output (implies -j 1).
 #   -l, --list              List all registered test cases with categories.
 #   -h, --help              Show this help message.
+#
+# Environment: KARI_SUITE_STATUS=<file>  write "total=N passed=N failed=N skipped=N" there when every test has run
+# (make coverage-run fails when the file is missing, i.e. the suite stopped early).
 # ==============================================================================
 
 set -u
@@ -1132,6 +1135,13 @@ while IFS='|' read -r _s _c _cat _t _code _d _skip_r; do
         SKIP) SKIPPED_COUNT=$((SKIPPED_COUNT + 1)) ;;
     esac
 done < "${SUMMARY_FILE}"
+
+# KARI_SUITE_STATUS=<file>: the counts are written there once every test has run, so a caller that ignores the exit status (make
+# coverage-run) can tell a suite that finished, with or without failing tests, from one that stopped before running them (the file is missing).
+if [ -n "${KARI_SUITE_STATUS:-}" ]; then
+    printf 'total=%d passed=%d failed=%d skipped=%d\n' "${TOTAL_COUNT}" "${PASSED_COUNT}" "${FAILED_COUNT}" "${SKIPPED_COUNT}" > "${KARI_SUITE_STATUS}" ||
+        echo "WARN: could not write ${KARI_SUITE_STATUS}" >&2
+fi
 
 ROOT_FILES_LIST="${SUITE_TMP}/root_files.txt"
 : > "${ROOT_FILES_LIST}"

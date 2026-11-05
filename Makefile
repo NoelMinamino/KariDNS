@@ -1312,7 +1312,7 @@ COV_DB_DRIVERS != if [ -n "$(DBPG_HAVE)" ]; then echo "sqlite3 postgresql"; else
 COV_BIN_OBJS += $(COV_FUZZ_OBJS)
 
 coverage-clean:
-	rm -rf $(COV_DIR) $(COV_HTML_DIR) $(COV_DATA) $(COV_FUZZ_DIR) default.profraw *.profraw
+	rm -rf $(COV_DIR) $(COV_HTML_DIR) $(COV_DATA) $(COV_FUZZ_DIR) default.profraw *.profraw coverage_suite.status
 
 coverage-build:
 	@echo "=== Building KariDNS & Test Suite with Profile Coverage ==="
@@ -1332,7 +1332,13 @@ coverage-run:
 	@echo "=== Executing Test Suite with Instrumentation ==="
 	@mkdir -p $(COV_DIR)
 	@chmod 1777 $(COV_DIR)
-	@LLVM_PROFILE_FILE="$$(pwd)/$(COV_DIR)/$(COV_PROFILE_PAT_$(COV_CONTINUOUS))" sh tests/run_all_suite.sh -j $(COV_JOBS) --exclude "$(COV_SUITE_EXCLUDE)" || true
+	@rm -f coverage_suite.status
+	@KARI_SUITE_STATUS="$$(pwd)/coverage_suite.status" LLVM_PROFILE_FILE="$$(pwd)/$(COV_DIR)/$(COV_PROFILE_PAT_$(COV_CONTINUOUS))" sh tests/run_all_suite.sh -j $(COV_JOBS) --exclude "$(COV_SUITE_EXCLUDE)" || true
+	@# A failing test does not stop the coverage run (the gate judges the numbers), but a suite that stopped before running its tests
+	@# (no status file: e.g. a shell error while registering them) would only show up as very low coverage: fail here with the reason.
+	@test -s coverage_suite.status || { echo "Error: tests/run_all_suite.sh stopped before it ran the tests (no coverage_suite.status); see its output above."; exit 1; }
+	@grep -q '^total=[1-9]' coverage_suite.status || { echo "Error: tests/run_all_suite.sh ran no test: $$(cat coverage_suite.status)"; exit 1; }
+	@echo "Test suite: $$(cat coverage_suite.status)"
 	@$(MAKE) coverage-fuzz-run || true
 	@echo "Profile files in $(COV_DIR): $$(ls $(COV_DIR) | wc -l | tr -d ' ') (continuous mode: one file per instrumented binary)"
 
