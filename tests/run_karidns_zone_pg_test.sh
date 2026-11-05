@@ -70,6 +70,9 @@ printf '%s dbname=%s\n' "$RC" "$PGDB" > "$T/ci_role"
 [ -n "$PG_AS" ] && chown "$PG_AS" "$T/ci_role"
 chmod 600 "$T/ci_role"
 CI=$T/ci_role
+W=$T/w            # what the tool writes: $T belongs to root when the tool runs as PG_AS
+mkdir "$W" && chmod 755 "$W"
+[ -n "$PG_AS" ] && chown "$PG_AS" "$W"
 OUT=$T/out.txt; ERR=$T/err.txt
 # zt ARGS...: the tool as the role; the status in $st
 zt() { as_pg "$Z" "$@" --no-config --conninfo-file "$CI" > "$OUT" 2> "$ERR" < /dev/null; st=$?; }
@@ -149,16 +152,16 @@ echo "== tinydns, export, backup"
 expect "import --all" 0 import --all "$T/in/tdz.test.data"
 outhas "...the summary" "1 zone(s) imported, 0 failed"
 same "...a tinydns zone" "$(pq "SELECT count(*) FROM domainmetadata WHERE kind = 'X-KARIDNS-FORMAT'")" 1
-expect "export of one zone" 0 export example.test "$T/o.zone"
-head -1 "$T/o.zone" | grep -q 'ORIGIN example.test' && ok "...BIND format" || bad "...format" "$(head -2 "$T/o.zone")"
-expect "export --all --dir" 0 export --all --dir "$T/bk"
+expect "export of one zone" 0 export example.test "$W/o.zone"
+head -1 "$W/o.zone" | grep -q 'ORIGIN example.test' && ok "...BIND format" || bad "...format" "$(head -2 "$W/o.zone")"
+expect "export --all --dir" 0 export --all --dir "$W/bk"
 for f in example.test.zone mzone.test.zone viewed.test.zone tdz.test.tinydns; do
-    [ -f "$T/bk/$f" ] && ok "...$f" || bad "...no $f" "$(ls "$T/bk")"
+    [ -f "$W/bk/$f" ] && ok "...$f" || bad "...no $f" "$(ls "$W/bk")"
 done
-expect "again: existing files are refused" 1 export --all --dir "$T/bk"
+expect "again: existing files are refused" 1 export --all --dir "$W/bk"
 expect "--json import" 0 --json import --serial keep example.test "$T/r.zone"
 ZT_JSON=$OUT
-zt --json export example.test "$T/oj.zone"
+zt --json export example.test "$W/oj.zone"
 grep -q '"karidns-zone": 1' "$OUT" && ok "...the JSON document of export" || bad "...no document" "$(head -c 300 "$OUT")"
 
 echo "== the role and the keys"

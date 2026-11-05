@@ -952,6 +952,61 @@ static void test_signed(const char *z, const char *opts) {
     zone_arena_destroy(&fa);
 }
 
+/* the presigned layout of an NSEC3 Opt-Out zone written by hand (no signer tool needed: the signatures are never checked here): an empty
+ * non-terminal below a name two labels deep, an insecure delegation (no DS: no ordername with Opt-Out), a name below it (occluded: auth 0),
+ * a secure delegation (DS: hashed), the NSEC3 / NSEC3PARAM rows dropped and turned into metadata */
+static const db_record_row_t *find_row(const zrows_t *r, const char *name, const char *type, size_t *idx) {
+    for (size_t i = 0; i < r->n; i++) {
+        const char *t = r->rows[i].type;
+        if (strcmp(r->rows[i].name, name) == 0 && ((!type && !t) || (type && t && strcmp(t, type) == 0))) {
+            if (idx) *idx = i;
+            return &r->rows[i];
+        }
+    }
+    return NULL;
+}
+
+static void test_presigned_rows(void) {
+    printf("presigned rows of a hand-written NSEC3 Opt-Out zone (dns_zone_rows.c)\n");
+    char err[600];
+    zone_arena_t a;
+    const char *text =
+        "$ORIGIN example.test.\n$TTL 300\n@ SOA ns1 h 1 2 3 4 5\n@ NS ns1\n@ NSEC3PARAM 1 0 0 -\nns1 A 192.0.2.1\n"
+        "a.b A 192.0.2.2\nsub NS ns.sub\nns.sub A 192.0.2.3\nsec NS ns1\n"
+        "sec DS 12345 8 2 0000000000000000000000000000000000000000000000000000000000000000\n"
+        "0123456789abcdefghijklmnopqrstuv NSEC3 1 1 0 - 0123456789abcdefghijklmnopqrstuu A RRSIG\n"
+        "0123456789abcdefghijklmnopqrstuv RRSIG NSEC3 8 3 300 20300101000000 20200101000000 12345 example.test. AAAA\n";
+    CHECK_MSG(parse_bind(text, &a, err, sizeof(err)), "%s", err);
+    zrows_t rows;
+    if (!zrows_from_arena(&a, "example.test.", &rows, err, sizeof(err))) {
+        CHECK_MSG(false, "%s", err);
+        zone_arena_destroy(&a);
+        return;
+    }
+    CHECK(rows.presigned);
+    CHECK_MSG(rows.nsec3param && strcmp(rows.nsec3param, "1 1 0 -") == 0, "NSEC3PARAM metadata '%s' (flags of the NSEC3 RR)",
+              rows.nsec3param ? rows.nsec3param : "(null)");
+    CHECK(!find_row(&rows, "example.test", "NSEC3PARAM", NULL));
+    CHECK(!find_row(&rows, "0123456789abcdefghijklmnopqrstuv.example.test", "NSEC3", NULL));
+    CHECK(find_row(&rows, "0123456789abcdefghijklmnopqrstuv.example.test", "RRSIG", NULL));
+    size_t i = 0;
+    const db_record_row_t *r = find_row(&rows, "b.example.test", NULL, &i);
+    CHECK_MSG(r && r->ordername && strlen(r->ordername) == 32 && rows.auth[i] == 1, "the empty non-terminal b.example.test");
+    r = find_row(&rows, "a.b.example.test", "A", &i);
+    CHECK(r && r->ordername && rows.auth[i] == 1);
+    r = find_row(&rows, "sub.example.test", "NS", &i);
+    CHECK_MSG(r && !r->ordername && rows.auth[i] == 0, "the insecure delegation: no ordername (Opt-Out), auth 0");
+    r = find_row(&rows, "ns.sub.example.test", "A", &i);
+    CHECK_MSG(r && !r->ordername && rows.auth[i] == 0, "below the delegation: occluded, auth 0");
+    r = find_row(&rows, "sec.example.test", "NS", &i);
+    CHECK_MSG(r && r->ordername && rows.auth[i] == 0, "the secure delegation: hashed, auth 0");
+    r = find_row(&rows, "sec.example.test", "DS", &i);
+    CHECK(r && r->ordername && rows.auth[i] == 1);
+    CHECK(!find_row(&rows, "sub.example.test", NULL, NULL));       /* a delegation point is an owner, not an ENT */
+    zrows_free(&rows);
+    zone_arena_destroy(&a);
+}
+
 static void test_presigned_zones(void) {
     printf("presigned zones (signer tools)\n");
     if (!tool("dnssec-signzone") || !tool("dnssec-keygen")) {
@@ -1194,6 +1249,7 @@ int main(int argc, char **argv) {
     }
     test_loaders();
     test_db_zones();
+    test_presigned_rows();
     test_presigned_zones();
     if (getenv("KARI_KEEP")) {
         printf("kept %s\n", g_dir);
