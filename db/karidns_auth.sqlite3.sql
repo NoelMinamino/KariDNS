@@ -82,13 +82,13 @@ CREATE TABLE IF NOT EXISTS rr_policies (
 );
 
 -- the record types of a policy (PostgreSQL: rr_policies.allowed_types); upper case; none of the types the signer owns (also written TYPE46,
--- TYPE0047, ...: RRSIG 46, NSEC 47, DNSKEY 48, NSEC3 50, NSEC3PARAM 51, CDS 59, CDNSKEY 60) and none of the meta types that are not data
+-- TYPE0047, ...: and NS 2, SOA 6, DNAME 39 written that way: RRSIG 46, NSEC 47, DNSKEY 48, NSEC3 50, NSEC3PARAM 51, CDS 59, CDNSKEY 60) and none of the meta types that are not data
 CREATE TABLE IF NOT EXISTS rr_policy_types (
   policy_id INTEGER NOT NULL REFERENCES rr_policies (id) ON DELETE CASCADE,
   type      TEXT NOT NULL CHECK (type GLOB '[A-Z]*' AND type NOT GLOB '*[^A-Z0-9]*'
                                  AND type NOT IN ('RRSIG', 'NSEC', 'NSEC3', 'NSEC3PARAM', 'DNSKEY', 'CDS', 'CDNSKEY',
                                                   'ANY', 'AXFR', 'IXFR', 'OPT', 'TSIG', 'TKEY', 'MAILA', 'MAILB')
-                                 AND NOT (type GLOB 'TYPE[0-9]*' AND type NOT GLOB 'TYPE*[^0-9]*' AND CAST(substr(type, 5) AS INTEGER) IN (46, 47, 48, 50, 51, 59, 60))),
+                                 AND NOT (type GLOB 'TYPE[0-9]*' AND type NOT GLOB 'TYPE*[^0-9]*' AND CAST(substr(type, 5) AS INTEGER) IN (2, 6, 39, 46, 47, 48, 50, 51, 59, 60))),
   PRIMARY KEY (policy_id, type)
 );
 

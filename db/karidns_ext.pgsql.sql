@@ -356,7 +356,8 @@ CREATE TRIGGER karidns_reload_requests_prune AFTER INSERT ON karidns_reload_requ
 --
 -- This file only CREATES things.  It does not enable row level security and it does not attach the audit triggers to the PowerDNS tables:
 -- either would hide rows from, or slow down, roles that have nothing to do with the WebAdmin (the loader, karidns-zone, PowerDNS itself).
--- The role scripts of the WebAdmin and the signer (milestone M2) switch them on; a site without them has no audit rows and no RLS.
+-- The role scripts of the WebAdmin and the signer (db/karidns_api_role.pgsql.sql, db/karidns_signer_role.pgsql.sql) switch them on; a site without
+-- them has no audit rows and no RLS.  The functions and the policies of the RLS (milestone M2) are created below, inactive until then.
 -- The audit is attached to a schema's tables with
 --     SELECT karidns_auth.enable_audit('public');       -- idempotent; karidns_auth.disable_audit('public') takes it off again
 -- The audit triggers of the karidns_auth tables themselves are attached below (nothing writes them without the WebAdmin).
@@ -845,6 +846,588 @@ END $$;
 DO $$ BEGIN PERFORM karidns_auth.enable_audit('karidns_auth'); END $$;
 
 
+-- ---------------------------------------------------------------------------------------------------------------------------------
+-- Row level security (0.6.0 item B, milestone M2).  This file creates the functions and the policies; RLS stays OFF on every table until the role
+-- script of the WebAdmin API (db/karidns_api_role.pgsql.sql) or of the signer (db/karidns_signer_role.pgsql.sql) calls karidns_auth.enable_rls(schema),
+-- so a site without them changes nothing.  How the rules work (docs/karidns-dbloader.md, "Roles and row level security"):
+--   * The policies without a TO clause apply to every role that is not a member of karidns_rls_trusted (a NOLOGIN role the role scripts create).
+--     A role that must not be bound by them (the loader, karidns-zone, the PowerDNS gpgsql role) is a member of karidns_rls_trusted, whose own
+--     policy is USING (true) WITH CHECK (true).  The table owner is not subject to RLS (no FORCE).
+--   * The acting user is the setting karidns.principal (SET LOCAL karidns.principal = '42' in every transaction of the API).  It is a custom
+--     setting any session can set: the API is trusted to set it to the logged-in user, RLS catches the API's own mistakes (a missing WHERE, a wrong
+--     zone id), not a compromised API process.  A missing, empty or non-numeric setting, a principal that does not exist and a disabled
+--     principal are all "no principal": no rows, no writes.
+--   * The effective grants of a principal are the grants of the principal and of every group it is in, directly or through groups (principal_closure);
+--     a grant given to a disabled group does not count (a disabled group in the middle of a chain does not cut the chain).
+--   * rr_ok() asks for ONE effective grant that covers a record: two grants that each allow half of a record do not combine.
+--   * The signer's own policies are PERMISSIVE like the API's, so they would be OR-ed with them (a signer that sets karidns.principal to a global
+--     master would pass the API policies): the signer therefore also gets RESTRICTIVE policies, which every write must pass as well.
+-- The functions are SECURITY DEFINER (they read karidns_auth, which the caller may only see through its policies), STABLE, with a pinned search_path,
+-- owned by the owner that applies this file; EXECUTE is revoked from PUBLIC and granted by the role scripts.
+--
+-- Type names.  The special record types are compared through karidns_auth.canon_type(): upper case, trimmed, and the generic forms TYPE2, TYPE06,
+-- TYPE0039 ... of NS (2), SOA (6), DNAME (39) and the DNSSEC-managed types (46 RRSIG, 47 NSEC, 48 DNSKEY, 50 NSEC3, 51 NSEC3PARAM, 59 CDS, 60 CDNSKEY)
+-- are read as the named type, so an alias gets exactly the rules of the name.  Any other TYPEnn is its own type (a policy may list it, as TYPE65280;
+-- an rr_policy may not list the aliases of the special types: rr_types_ok).
+
+-- the roles whose sessions are the WebAdmin API / the signer (a member of one of them, directly or through any chain, counts): the trigger on grants
+-- binds the first, the trigger on records (SOA rows) the second
+CREATE TABLE IF NOT EXISTS karidns_auth.api_roles (role_name name PRIMARY KEY);
+INSERT INTO karidns_auth.api_roles (role_name) VALUES ('karidns_api') ON CONFLICT DO NOTHING;
+REVOKE ALL ON karidns_auth.api_roles FROM PUBLIC;
+CREATE TABLE IF NOT EXISTS karidns_auth.signer_roles (role_name name PRIMARY KEY);
+INSERT INTO karidns_auth.signer_roles (role_name) VALUES ('karidns_signer') ON CONFLICT DO NOTHING;
+REVOKE ALL ON karidns_auth.signer_roles FROM PUBLIC;
+
+-- the type, upper case and trimmed, with the generic form of NS, SOA, DNAME and the DNSSEC-managed types read as the name; NULL stays NULL
+CREATE OR REPLACE FUNCTION karidns_auth.canon_type(t text) RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE SET search_path = pg_catalog, pg_temp AS $$
+  SELECT CASE WHEN u ~ '^TYPE0*[0-9]{1,5}$' THEN
+           CASE substring(u from '^TYPE0*([0-9]{1,5})$')::integer
+             WHEN 2 THEN 'NS' WHEN 6 THEN 'SOA' WHEN 39 THEN 'DNAME' WHEN 46 THEN 'RRSIG' WHEN 47 THEN 'NSEC' WHEN 48 THEN 'DNSKEY'
+             WHEN 50 THEN 'NSEC3' WHEN 51 THEN 'NSEC3PARAM' WHEN 59 THEN 'CDS' WHEN 60 THEN 'CDNSKEY' ELSE u END
+         ELSE u END
+    FROM (SELECT upper(btrim(t)) AS u) x
+$$;
+
+-- a DNSSEC-managed type (the signer's), also as TYPE46, TYPE0047, ...; false for NULL.  (Self-contained: the signer calls it from its policies and has no USAGE on karidns_auth,
+-- and a SQL function that names another function of the schema looks it up at run time.  Keep it in step with canon_type.)
+CREATE OR REPLACE FUNCTION karidns_auth.is_dnssec_type(t text) RETURNS boolean LANGUAGE sql IMMUTABLE PARALLEL SAFE SET search_path = pg_catalog, pg_temp AS $$
+  SELECT coalesce(upper(btrim(t)) IN ('RRSIG', 'NSEC', 'NSEC3', 'NSEC3PARAM', 'DNSKEY', 'CDS', 'CDNSKEY') OR upper(btrim(t)) ~ '^TYPE0*(46|47|48|50|51|59|60)$', false)
+$$;
+
+-- the types of an rr_policy: upper case; none of the types the signer owns and none of the meta types that are not data, and none of the generic forms
+-- (TYPE2, TYPE06 ...) of NS, SOA or DNAME or of a DNSSEC-managed type (write the name; the generic form of an ordinary type is a type of its own)
+CREATE OR REPLACE FUNCTION karidns_auth.rr_types_ok(t text[]) RETURNS boolean LANGUAGE sql IMMUTABLE PARALLEL SAFE SET search_path = pg_catalog, pg_temp AS $$
+  SELECT t IS NOT NULL AND NOT EXISTS (SELECT 1 FROM unnest(t) AS x
+                                        WHERE x IS NULL OR x !~ '^[A-Z][A-Z0-9]*$'
+                                           OR x IN ('RRSIG', 'NSEC', 'NSEC3', 'NSEC3PARAM', 'DNSKEY', 'CDS', 'CDNSKEY',
+                                                    'ANY', 'AXFR', 'IXFR', 'OPT', 'TSIG', 'TKEY', 'MAILA', 'MAILB')
+                                           OR x ~ '^TYPE0*(2|6|39|46|47|48|50|51|59|60)$')
+$$;
+
+-- karidns.principal as a number: NULL for no setting, '' and anything that is not 1 to 18 digits (a non-numeric setting is "no principal", never an error)
+CREATE OR REPLACE FUNCTION karidns_auth.setting_principal() RETURNS bigint LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $$
+  SELECT CASE WHEN s ~ '^[0-9]{1,18}$' THEN s::bigint END FROM (SELECT current_setting('karidns.principal', true) AS s) x
+$$;
+
+-- the acting principal: NULL unless the setting names an existing principal that is not disabled
+CREATE OR REPLACE FUNCTION karidns_auth.current_principal() RETURNS bigint LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+  SELECT p.id FROM karidns_auth.principals p WHERE p.id = karidns_auth.setting_principal() AND NOT p.disabled
+$$;
+
+-- the principal and every group it is in (the ids a grant may be given to for the principal to hold it)
+CREATE OR REPLACE FUNCTION karidns_auth.my_groups() RETURNS bigint[] LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+  SELECT coalesce(array_agg(c.group_id), '{}'::bigint[]) FROM karidns_auth.principal_closure c WHERE c.member_id = karidns_auth.current_principal()
+$$;
+
+-- the strongest effective grant on a zone ('global_master' > 'domain_master' > 'subdomain_master'), NULL when there is none.  A global master has a grant
+-- on every zone.  The zone name is compared in lower case, without a trailing dot (as PowerDNS stores it; the policies strip a dot of domains.name).
+CREATE OR REPLACE FUNCTION karidns_auth.zone_grant(sch text, zone text) RETURNS text LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+  SELECT g.role
+    FROM karidns_auth.principal_closure c
+    JOIN karidns_auth.principals gp ON gp.id = c.group_id AND NOT gp.disabled
+    JOIN karidns_auth.grants g ON g.principal_id = c.group_id
+   WHERE c.member_id = karidns_auth.current_principal()
+     AND (g.role = 'global_master' OR (g.data_schema = sch AND g.zone_name = lower(zone)))
+   ORDER BY CASE g.role WHEN 'global_master' THEN 0 WHEN 'domain_master' THEN 1 ELSE 2 END
+   LIMIT 1
+$$;
+
+CREATE OR REPLACE FUNCTION karidns_auth.is_global() RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+  SELECT EXISTS (SELECT 1
+                   FROM karidns_auth.principal_closure c
+                   JOIN karidns_auth.principals gp ON gp.id = c.group_id AND NOT gp.disabled
+                   JOIN karidns_auth.grants g ON g.principal_id = c.group_id
+                  WHERE c.member_id = karidns_auth.current_principal() AND g.role = 'global_master')
+$$;
+
+-- May the principal WRITE this record?  True when ONE effective grant covers it (4.4 of the design):
+--   scope        the name is the zone or ends in '.<zone>' (for every grant); a subdomain master: the name is the suffix or ends in '.<suffix>' (label
+--                boundary: evilsub.example.com is not under sub.example.com); a global master: any zone, a domain master: its (schema, zone)
+--   rr_policy    the type (canon_type: TYPE2 is NS, TYPE6 is SOA, ...) is allowed and not DNSSEC-managed; the TTL (NULL counts as 0) is in range; a
+--                wildcard label (*) needs allow_wildcard; NS below the apex is a delegation (allow_delegation); DNAME needs allow_dname; the apex needs
+--                apex_editable and a role other than subdomain master; SOA only for a global master whose policy allows SOA and apex_editable
+--                (everybody else: bump_serial())
+--   an empty non-terminal (type NULL or '') is a bare name: it needs the scope, never the apex, and the wildcard rule; type and TTL do not matter
+-- A NULL or empty zone or name is never writable (the row is not inside any zone).  The name is compared as lower(records.name).
+CREATE OR REPLACE FUNCTION karidns_auth.rr_ok(sch text, zone text, nm text, typ text, p_ttl integer) RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+  SELECT CASE WHEN zone IS NULL OR zone = '' OR nm IS NULL OR nm = '' THEN false ELSE EXISTS (
+    SELECT 1
+      FROM (SELECT lower(nm) AS n, lower(zone) AS z, nullif(karidns_auth.canon_type(typ), '') AS t) x,
+           karidns_auth.principal_closure c
+      JOIN karidns_auth.principals gp ON gp.id = c.group_id AND NOT gp.disabled
+      JOIN karidns_auth.grants g ON g.principal_id = c.group_id
+      JOIN karidns_auth.rr_policies p ON p.id = g.rr_policy_id
+     WHERE c.member_id = karidns_auth.current_principal()
+       AND (x.n = x.z OR right(x.n, length(x.z) + 1) = '.' || x.z)
+       AND (g.role = 'global_master'
+            OR (g.data_schema = sch AND g.zone_name = x.z
+                AND (g.role = 'domain_master' OR x.n = g.name_suffix OR right(x.n, length(g.name_suffix) + 1) = '.' || g.name_suffix)))
+       AND (x.n !~ '(^|[.])[*]([.]|$)' OR p.allow_wildcard)
+       AND CASE WHEN x.t IS NULL THEN x.n <> x.z
+                ELSE x.t = ANY (p.allowed_types)
+                     AND NOT karidns_auth.is_dnssec_type(x.t)
+                     AND coalesce(p_ttl, 0) BETWEEN p.ttl_min AND p.ttl_max
+                     AND (x.t <> 'NS' OR x.n = x.z OR p.allow_delegation)
+                     AND (x.t <> 'DNAME' OR p.allow_dname)
+                     AND (x.n <> x.z OR (p.apex_editable AND g.role <> 'subdomain_master'))
+                     AND (x.t <> 'SOA' OR (x.n = x.z AND g.role = 'global_master' AND p.apex_editable))
+           END) END
+$$;
+
+-- May the principal READ this record?  The name must be inside the zone for every grant (a row without a name, a row without a zone and a row whose name
+-- is outside its zone are invisible to the API, a global master included: the owner repairs them).  Then: a global master sees every such row; a domain
+-- master the rows of its (schema, zone); a subdomain master the rows of its suffix; the SOA and the apex NS are visible to every grant on the zone.
+-- An empty non-terminal (type NULL) is visible by its name alone.
+CREATE OR REPLACE FUNCTION karidns_auth.rr_visible(sch text, zone text, nm text, typ text) RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+  SELECT coalesce(zone <> '' AND nm <> '' AND (lower(nm) = lower(zone) OR right(lower(nm), length(zone) + 1) = '.' || lower(zone)), false) AND EXISTS (
+    SELECT 1
+      FROM karidns_auth.principal_closure c
+      JOIN karidns_auth.principals gp ON gp.id = c.group_id AND NOT gp.disabled
+      JOIN karidns_auth.grants g ON g.principal_id = c.group_id
+     WHERE c.member_id = karidns_auth.current_principal()
+       AND (g.role = 'global_master'
+            OR (g.data_schema = sch AND g.zone_name = lower(zone)
+                AND (g.role = 'domain_master'
+                     OR lower(nm) = g.name_suffix OR right(lower(nm), length(g.name_suffix) + 1) = '.' || g.name_suffix
+                     OR (lower(nm) = lower(zone) AND karidns_auth.canon_type(typ) IN ('SOA', 'NS')))))
+  )
+$$;
+
+-- an audit_log row is visible to a global master, and to a domain master of the row's zone (the rows about grants name the data schema in the JSON)
+CREATE OR REPLACE FUNCTION karidns_auth.audit_visible(ds text, zone text, tbl text, b jsonb, a jsonb) RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+  SELECT karidns_auth.is_global()
+         OR (zone IS NOT NULL
+             AND karidns_auth.zone_grant(CASE WHEN ds = 'karidns_auth' AND tbl = 'grants' THEN coalesce(a, b) ->> 'data_schema' ELSE ds END, zone) = 'domain_master')
+$$;
+
+-- bump_serial(schema, domain id): add 1 to the serial of the SOA of the zone (RFC 1982: 4294967295 + 1 = 0).  Any effective grant on the zone may do it
+-- (the SOA is otherwise not writable by the API); the update is audited as an UPDATE of records by the principal.  Returns the new serial.
+CREATE OR REPLACE FUNCTION karidns_auth.bump_serial(sch text, did integer) RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+DECLARE
+  zone text;
+  rec  record;
+  m    text[];
+  ser  bigint;
+  nser bigint;
+  n    integer := 0;
+BEGIN
+  IF karidns_auth.current_principal() IS NULL THEN
+    RAISE EXCEPTION 'karidns_auth.bump_serial: no valid karidns.principal' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  IF sch IS NULL OR to_regclass(format('%I.domains', sch)) IS NULL OR to_regclass(format('%I.records', sch)) IS NULL
+     OR to_regclass(format('%I.karidns_schema_version', sch)) IS NULL THEN
+    RAISE EXCEPTION 'karidns_auth.bump_serial: % is not a KariDNS data schema', sch USING ERRCODE = 'invalid_schema_name';
+  END IF;
+  EXECUTE format('SELECT lower(regexp_replace(name, ''[.]$'', '''')) FROM %I.domains WHERE id = $1', sch) INTO zone USING did;
+  IF zone IS NULL OR karidns_auth.zone_grant(sch, zone) IS NULL THEN
+    RAISE EXCEPTION 'karidns_auth.bump_serial: no grant on zone % of schema %', did, sch USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  FOR rec IN EXECUTE format('SELECT id, content FROM %I.records WHERE domain_id = $1 AND lower(name) = $2 AND karidns_auth.canon_type(type) = ''SOA'' ORDER BY id FOR UPDATE', sch) USING did, zone LOOP
+    m := regexp_match(rec.content, '^(\s*\S+\s+\S+\s+)([0-9]{1,10})(\s.*)?$');
+    IF m IS NULL OR m[2]::bigint > 4294967295 THEN
+      RAISE EXCEPTION 'karidns_auth.bump_serial: the SOA of zone % has no serial that can be incremented', zone USING ERRCODE = 'data_exception';
+    END IF;
+    ser := m[2]::bigint;
+    nser := (ser + 1) % 4294967296;
+    EXECUTE format('UPDATE %I.records SET content = $1 WHERE id = $2', sch) USING m[1] || nser::text || coalesce(m[3], ''), rec.id;
+    n := n + 1;
+  END LOOP;
+  IF n = 0 THEN
+    RAISE EXCEPTION 'karidns_auth.bump_serial: zone % has no SOA record', zone USING ERRCODE = 'no_data_found';
+  END IF;
+  RETURN nser;
+END $$;
+
+-- ---- no escalation (4.7): a BEFORE trigger on grants for the sessions of the API roles (karidns_auth.api_roles); every other role is the operator
+-- Is the session one of the API roles, or a member of one (the login role AND the SET ROLE role are looked at, as audit_summary() does)?
+CREATE OR REPLACE FUNCTION karidns_auth.is_api_caller() RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+  SELECT EXISTS (WITH RECURSIVE m(roleid) AS (SELECT oid FROM pg_roles WHERE rolname IN (session_user::text, current_setting('role'))
+                                              UNION
+                                              SELECT am.roleid FROM pg_auth_members am JOIN m ON am.member = m.roleid)
+                 SELECT 1 FROM m JOIN pg_roles r ON r.oid = m.roleid JOIN karidns_auth.api_roles x ON x.role_name = r.rolname)
+$$;
+
+-- the same for the signer roles (the trigger on SOA rows)
+CREATE OR REPLACE FUNCTION karidns_auth.is_signer_caller() RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+  SELECT EXISTS (WITH RECURSIVE m(roleid) AS (SELECT oid FROM pg_roles WHERE rolname IN (session_user::text, current_setting('role'))
+                                              UNION
+                                              SELECT am.roleid FROM pg_auth_members am JOIN m ON am.member = m.roleid)
+                 SELECT 1 FROM m JOIN pg_roles r ON r.oid = m.roleid JOIN karidns_auth.signer_roles x ON x.role_name = r.rolname)
+$$;
+
+-- is policy `sub` no wider than policy `sup`?  (types a subset, each flag not more, ttl_min not lower, ttl_max not higher, max_rr not higher; NULL = no limit)
+CREATE OR REPLACE FUNCTION karidns_auth.policy_subset(sub bigint, sup bigint) RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+  SELECT coalesce((SELECT a.allowed_types <@ b.allowed_types
+                          AND (NOT a.allow_wildcard OR b.allow_wildcard)
+                          AND (NOT a.allow_delegation OR b.allow_delegation)
+                          AND (NOT a.allow_dname OR b.allow_dname)
+                          AND (NOT a.apex_editable OR b.apex_editable)
+                          AND a.ttl_min >= b.ttl_min AND a.ttl_max <= b.ttl_max
+                          AND (b.max_rr IS NULL OR (a.max_rr IS NOT NULL AND a.max_rr <= b.max_rr))
+                     FROM karidns_auth.rr_policies a, karidns_auth.rr_policies b WHERE a.id = sub AND b.id = sup), false)
+$$;
+
+-- may the principal (not a global master) make, change or remove a grant of this shape?  It must be a domain master of the same (schema, zone) with a
+-- policy at least as wide, and the grant must be a domain_master or subdomain_master one.  A subdomain master therefore never grants.
+CREATE OR REPLACE FUNCTION karidns_auth.may_grant(r text, ds text, zone text, pol bigint) RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+  SELECT r IN ('domain_master', 'subdomain_master') AND ds IS NOT NULL AND zone IS NOT NULL
+         AND EXISTS (SELECT 1
+                       FROM karidns_auth.principal_closure c
+                       JOIN karidns_auth.principals gp ON gp.id = c.group_id AND NOT gp.disabled
+                       JOIN karidns_auth.grants g ON g.principal_id = c.group_id
+                      WHERE c.member_id = karidns_auth.current_principal() AND g.role = 'domain_master' AND g.data_schema = ds AND g.zone_name = zone
+                        AND karidns_auth.policy_subset(pol, g.rr_policy_id))
+$$;
+
+-- granted_by and granted_at are the trigger's: an INSERT sets them (what the caller sent is replaced); an UPDATE keeps the old values unless the
+-- grant changes materially (principal, role or rr_policy; and, for a statement of the session itself, the data schema, zone or suffix: a rename that
+-- follows a renamed zone, made by the trigger on domains one level down, is not a new grant)
+CREATE OR REPLACE FUNCTION karidns_auth.grants_escalation_fn() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+DECLARE
+  me bigint;
+BEGIN
+  IF NOT karidns_auth.is_api_caller() THEN
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;                  -- the operator: anything
+  END IF;
+  me := karidns_auth.current_principal();
+  IF me IS NULL THEN
+    RAISE EXCEPTION 'karidns_auth.grants: no valid karidns.principal' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  IF NOT karidns_auth.is_global() THEN                                         -- a global master may do anything
+    IF TG_OP IN ('UPDATE', 'DELETE') AND NOT karidns_auth.may_grant(OLD.role, OLD.data_schema, OLD.zone_name, OLD.rr_policy_id) THEN
+      RAISE EXCEPTION 'karidns_auth.grants: grant % is not one that principal % may change or remove (escalation)', OLD.id, me USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    IF TG_OP IN ('INSERT', 'UPDATE') AND NOT karidns_auth.may_grant(NEW.role, NEW.data_schema, NEW.zone_name, NEW.rr_policy_id) THEN
+      RAISE EXCEPTION 'karidns_auth.grants: principal % may not make this grant (it needs a domain master grant of the same zone with a wider rr_policy: escalation)', me USING ERRCODE = 'insufficient_privilege';
+    END IF;
+  END IF;
+  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+  IF TG_OP = 'INSERT'
+     OR (NEW.principal_id, NEW.role, NEW.rr_policy_id) IS DISTINCT FROM (OLD.principal_id, OLD.role, OLD.rr_policy_id)
+     OR (pg_trigger_depth() = 1 AND (NEW.data_schema, NEW.zone_name, NEW.name_suffix) IS DISTINCT FROM (OLD.data_schema, OLD.zone_name, OLD.name_suffix)) THEN
+    NEW.granted_by := me;
+    NEW.granted_at := now();
+  ELSE
+    NEW.granted_by := OLD.granted_by;
+    NEW.granted_at := OLD.granted_at;
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS karidns_grants_escalation ON karidns_auth.grants;
+CREATE TRIGGER karidns_grants_escalation BEFORE INSERT OR UPDATE OR DELETE ON karidns_auth.grants
+  FOR EACH ROW EXECUTE FUNCTION karidns_auth.grants_escalation_fn();
+
+-- ---- the signer and the SOA: for the sessions of the signer roles (karidns_auth.signer_roles), a BEFORE trigger on the records of this schema lets an
+-- SOA row change in its serial only: it keeps its type, name and domain_id, the rest of its content is the same, a record cannot become an SOA (nor
+-- an SOA another type), and the signer cannot insert or delete an SOA.  (The policies of the signer allow UPDATE of SOA rows; a policy cannot look at
+-- columns.)  The trigger fires only for rows that are, or become, an SOA.
+CREATE OR REPLACE FUNCTION karidns_auth.signer_soa_fn() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, karidns_auth, pg_temp AS $$
+DECLARE
+  mo  text[];
+  mn  text[];
+  pat constant text := '^(\s*\S+\s+\S+\s+)([0-9]{1,10})(\s.*)?$';
+BEGIN
+  IF NOT karidns_auth.is_signer_caller() THEN
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+  END IF;
+  IF TG_OP = 'INSERT' THEN
+    RAISE EXCEPTION 'karidns_auth.signer: the signer cannot insert an SOA record' USING ERRCODE = 'insufficient_privilege';
+  ELSIF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'karidns_auth.signer: the signer cannot delete an SOA record' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  IF karidns_auth.canon_type(OLD.type) IS DISTINCT FROM 'SOA' THEN
+    RAISE EXCEPTION 'karidns_auth.signer: a record cannot become an SOA record' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  IF karidns_auth.canon_type(NEW.type) IS DISTINCT FROM 'SOA' THEN
+    RAISE EXCEPTION 'karidns_auth.signer: an SOA record cannot become another type' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  IF NEW.type IS DISTINCT FROM OLD.type OR NEW.name IS DISTINCT FROM OLD.name OR NEW.domain_id IS DISTINCT FROM OLD.domain_id THEN
+    RAISE EXCEPTION 'karidns_auth.signer: an SOA record keeps its type, name and domain_id' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  mo := regexp_match(OLD.content, pat);
+  mn := regexp_match(NEW.content, pat);
+  IF mo IS NULL OR mn IS NULL OR mo[1] <> mn[1] OR coalesce(mo[3], '') <> coalesce(mn[3], '') THEN
+    RAISE EXCEPTION 'karidns_auth.signer: the signer may change only the serial of an SOA record' USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS karidns_signer_soa_ins ON records;
+DROP TRIGGER IF EXISTS karidns_signer_soa_upd ON records;
+DROP TRIGGER IF EXISTS karidns_signer_soa_del ON records;
+CREATE TRIGGER karidns_signer_soa_ins BEFORE INSERT ON records FOR EACH ROW WHEN (karidns_auth.canon_type(NEW.type) = 'SOA')
+  EXECUTE FUNCTION karidns_auth.signer_soa_fn();
+CREATE TRIGGER karidns_signer_soa_upd BEFORE UPDATE ON records FOR EACH ROW WHEN (karidns_auth.canon_type(OLD.type) = 'SOA' OR karidns_auth.canon_type(NEW.type) = 'SOA')
+  EXECUTE FUNCTION karidns_auth.signer_soa_fn();
+CREATE TRIGGER karidns_signer_soa_del BEFORE DELETE ON records FOR EACH ROW WHEN (karidns_auth.canon_type(OLD.type) = 'SOA')
+  EXECUTE FUNCTION karidns_auth.signer_soa_fn();
+
+-- ---- the role scripts of the API and the signer call this first: the role must be one that RLS binds.  It is refused when it is a superuser or has
+-- BYPASSRLS, when it is (directly or through other roles) a member of karidns_rls_trusted, or when it is, or is a member of, the owner of the tables
+CREATE OR REPLACE FUNCTION karidns_auth.assert_service_role(sch text, rol text) RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+  r   pg_roles%ROWTYPE;
+  own oid;
+BEGIN
+  SELECT * INTO r FROM pg_roles WHERE rolname = rol;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'karidns_auth.assert_service_role: role % does not exist', rol;
+  END IF;
+  IF r.rolsuper OR r.rolbypassrls THEN
+    RAISE EXCEPTION 'karidns_auth.assert_service_role: role % is a superuser or has BYPASSRLS: row level security would not bind it', rol USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  SELECT c.relowner INTO own FROM pg_class c WHERE c.oid = to_regclass(format('%I.records', sch));
+  IF own IS NULL THEN
+    RAISE EXCEPTION 'karidns_auth.assert_service_role: schema % has no records table', sch;
+  END IF;
+  IF EXISTS (WITH RECURSIVE m(roleid) AS (SELECT r.oid UNION SELECT am.roleid FROM pg_auth_members am JOIN m ON am.member = m.roleid)
+             SELECT 1 FROM m JOIN pg_roles t ON t.oid = m.roleid WHERE t.rolname = 'karidns_rls_trusted') THEN
+    RAISE EXCEPTION 'karidns_auth.assert_service_role: role % is a member of karidns_rls_trusted (directly or through another role): row level security would not bind it', rol USING ERRCODE = 'insufficient_privilege';
+  END IF;
+  IF EXISTS (WITH RECURSIVE m(roleid) AS (SELECT r.oid UNION SELECT am.roleid FROM pg_auth_members am JOIN m ON am.member = m.roleid)
+             SELECT 1 FROM m WHERE m.roleid = own) THEN
+    RAISE EXCEPTION 'karidns_auth.assert_service_role: role % is, or is a member of, the owner of the tables of schema %: the owner is not bound by row level security', rol, sch USING ERRCODE = 'insufficient_privilege';
+  END IF;
+END $$;
+
+-- ---- policies.  set_policy replaces one policy; create_policies(schema) creates the policies of a data schema (the schema is a literal in them, so no
+-- search_path matters when they run) or, for 'karidns_auth', those of the auth tables.  Both are idempotent.
+DROP FUNCTION IF EXISTS karidns_auth.set_policy(regclass, text, text, text, text, text);
+CREATE OR REPLACE FUNCTION karidns_auth.set_policy(tbl regclass, pname text, cmd text, using_e text, check_e text, to_role text DEFAULT NULL, restrictive boolean DEFAULT false) RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+  EXECUTE format('DROP POLICY IF EXISTS %I ON %s', pname, tbl);
+  EXECUTE format('CREATE POLICY %I ON %s AS %s FOR %s%s%s%s', pname, tbl, CASE WHEN restrictive THEN 'RESTRICTIVE' ELSE 'PERMISSIVE' END, cmd,
+                 CASE WHEN to_role IS NOT NULL THEN format(' TO %I', to_role) ELSE '' END,
+                 CASE WHEN using_e IS NOT NULL THEN ' USING (' || using_e || ')' ELSE '' END,
+                 CASE WHEN check_e IS NOT NULL THEN ' WITH CHECK (' || check_e || ')' ELSE '' END);
+END $$;
+
+CREATE OR REPLACE FUNCTION karidns_auth.create_policies(sch text) RETURNS integer LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+  cnt  integer := 0;
+  lit  text := quote_literal(sch);
+  rel  regclass;
+  zr   text;       -- the zone name of a row with a domain_id column (a trailing dot of domains.name is stripped); %1$s is the table
+  zn   text := $q$lower(regexp_replace(%s, '[.]$', ''))$q$;
+  w    text;
+  nm   text;
+BEGIN
+  IF sch = 'karidns_auth' THEN
+    -- audit_log: append only for the roles (the owner and the SECURITY DEFINER triggers write it); read by scope
+    PERFORM karidns_auth.set_policy('karidns_auth.audit_log', 'karidns_rls_select', 'SELECT',
+      'karidns_auth.audit_visible(audit_log.data_schema, audit_log.zone_name, audit_log.table_name, audit_log.before, audit_log.after)', NULL);
+    -- grants: own and inherited grants, the grants on zones the principal is domain master of, all for a global master; changes by global master or
+    -- the domain master of the zone (the trigger karidns_grants_escalation checks the subset rule)
+    w := 'karidns_auth.is_global() OR (grants.zone_name IS NOT NULL AND karidns_auth.zone_grant(grants.data_schema, grants.zone_name) = ''domain_master'')';
+    PERFORM karidns_auth.set_policy('karidns_auth.grants', 'karidns_rls_select', 'SELECT',
+      'grants.principal_id = ANY (karidns_auth.my_groups()) OR karidns_auth.is_global() OR (grants.zone_name IS NOT NULL AND karidns_auth.zone_grant(grants.data_schema, grants.zone_name) IN (''global_master'', ''domain_master''))', NULL);
+    PERFORM karidns_auth.set_policy('karidns_auth.grants', 'karidns_rls_insert', 'INSERT', NULL, w);
+    PERFORM karidns_auth.set_policy('karidns_auth.grants', 'karidns_rls_update', 'UPDATE', w, w);
+    PERFORM karidns_auth.set_policy('karidns_auth.grants', 'karidns_rls_delete', 'DELETE', w, NULL);
+    -- principals, memberships, rr_policies: every row is readable (a login looks the user up by name before it has a principal id; the names are
+    -- needed to grant); only a global master changes them
+    FOREACH nm IN ARRAY ARRAY['principals', 'memberships', 'rr_policies'] LOOP
+      rel := format('karidns_auth.%I', nm)::regclass;
+      PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', 'true', NULL);
+      PERFORM karidns_auth.set_policy(rel, 'karidns_rls_insert', 'INSERT', NULL, 'karidns_auth.is_global()');
+      PERFORM karidns_auth.set_policy(rel, 'karidns_rls_update', 'UPDATE', 'karidns_auth.is_global()', 'karidns_auth.is_global()');
+      PERFORM karidns_auth.set_policy(rel, 'karidns_rls_delete', 'DELETE', 'karidns_auth.is_global()', NULL);
+    END LOOP;
+    -- credentials: the principal's own row (the API sets the principal of a login before it reads the credentials), a global master all of them
+    w := 'credentials.principal_id = karidns_auth.current_principal() OR karidns_auth.is_global()';
+    PERFORM karidns_auth.set_policy('karidns_auth.credentials', 'karidns_rls_select', 'SELECT', w, NULL);
+    PERFORM karidns_auth.set_policy('karidns_auth.credentials', 'karidns_rls_insert', 'INSERT', NULL, 'karidns_auth.is_global()');
+    PERFORM karidns_auth.set_policy('karidns_auth.credentials', 'karidns_rls_update', 'UPDATE', w, w);
+    PERFORM karidns_auth.set_policy('karidns_auth.credentials', 'karidns_rls_delete', 'DELETE', 'karidns_auth.is_global()', NULL);
+    RETURN 6;
+  END IF;
+
+  -- ---- a data schema
+  zr := format('(SELECT %s FROM %I.domains d WHERE d.id = %%1$s.domain_id)', format(zn, 'd.name'), sch);
+  -- domains
+  IF to_regclass(format('%I.domains', sch)) IS NOT NULL THEN
+    rel := format('%I.domains', sch)::regclass;
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', format('karidns_auth.zone_grant(%s, %s) IS NOT NULL', lit, format(zn, 'domains.name')), NULL);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_insert', 'INSERT', NULL, 'karidns_auth.is_global()');
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_update', 'UPDATE', 'karidns_auth.is_global()', 'karidns_auth.is_global()');
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_delete', 'DELETE', 'karidns_auth.is_global()', NULL);
+    cnt := cnt + 1;
+  END IF;
+  -- records
+  IF to_regclass(format('%I.records', sch)) IS NOT NULL THEN
+    rel := format('%I.records', sch)::regclass;
+    w := format('karidns_auth.rr_ok(%s, %s, records.name, records.type, records.ttl)', lit, format(zr, 'records'));
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', format('karidns_auth.rr_visible(%s, %s, records.name, records.type)', lit, format(zr, 'records')), NULL);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_insert', 'INSERT', NULL, w);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_update', 'UPDATE', w, w);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_delete', 'DELETE', w, NULL);
+    cnt := cnt + 1;
+  END IF;
+  -- domainmetadata: a grant on the zone reads; a global master writes every kind but the ones the signer owns
+  IF to_regclass(format('%I.domainmetadata', sch)) IS NOT NULL THEN
+    rel := format('%I.domainmetadata', sch)::regclass;
+    w := 'karidns_auth.is_global() AND upper(btrim(domainmetadata.kind)) NOT IN (''PRESIGNED'', ''NSEC3PARAM'', ''X-KARIDNS-SIGNER'')';
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', format('karidns_auth.zone_grant(%s, %s) IS NOT NULL', lit, format(zr, 'domainmetadata')), NULL);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_insert', 'INSERT', NULL, w);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_update', 'UPDATE', w, w);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_delete', 'DELETE', w, NULL);
+    cnt := cnt + 1;
+  END IF;
+  -- the tag tables of a record: readable when the record is (the records policy filters the subquery), writable when the record is
+  FOREACH nm IN ARRAY ARRAY['karidns_record_tags', 'karidns_record_tinydns'] LOOP
+    IF to_regclass(format('%I.%I', sch, nm)) IS NULL THEN CONTINUE; END IF;
+    rel := format('%I.%I', sch, nm)::regclass;
+    w := format('EXISTS (SELECT 1 FROM %1$I.records r JOIN %1$I.domains d ON d.id = r.domain_id WHERE r.id = %2$I.record_id AND karidns_auth.rr_ok(%3$s, %4$s, r.name, r.type, r.ttl))', sch, nm, lit, format(zn, 'd.name'));
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', format('EXISTS (SELECT 1 FROM %I.records r WHERE r.id = %I.record_id)', sch, nm), NULL);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_insert', 'INSERT', NULL, w);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_update', 'UPDATE', w, w);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_delete', 'DELETE', w, NULL);
+    cnt := cnt + 1;
+  END LOOP;
+  -- karidns_zone_tagdefs: a domain master (or global) writes
+  IF to_regclass(format('%I.karidns_zone_tagdefs', sch)) IS NOT NULL THEN
+    rel := format('%I.karidns_zone_tagdefs', sch)::regclass;
+    w := format('karidns_auth.zone_grant(%s, %s) IN (''global_master'', ''domain_master'')', lit, format(zr, 'karidns_zone_tagdefs'));
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', format('karidns_auth.zone_grant(%s, %s) IS NOT NULL', lit, format(zr, 'karidns_zone_tagdefs')), NULL);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_insert', 'INSERT', NULL, w);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_update', 'UPDATE', w, w);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_delete', 'DELETE', w, NULL);
+    cnt := cnt + 1;
+  END IF;
+  -- karidns_domain_views: a global master writes
+  IF to_regclass(format('%I.karidns_domain_views', sch)) IS NOT NULL THEN
+    rel := format('%I.karidns_domain_views', sch)::regclass;
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', format('karidns_auth.zone_grant(%s, %s) IS NOT NULL', lit, format(zr, 'karidns_domain_views')), NULL);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_insert', 'INSERT', NULL, 'karidns_auth.is_global()');
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_update', 'UPDATE', 'karidns_auth.is_global()', 'karidns_auth.is_global()');
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_delete', 'DELETE', 'karidns_auth.is_global()', NULL);
+    cnt := cnt + 1;
+  END IF;
+  -- karidns_reload_requests: a request for one zone needs a grant on the zone, for all zones (zone NULL) a global master; the same rule says which
+  -- requests a principal sees.  No UPDATE, no DELETE: the prune trigger of the table is SECURITY DEFINER.
+  IF to_regclass(format('%I.karidns_reload_requests', sch)) IS NOT NULL THEN
+    rel := format('%I.karidns_reload_requests', sch)::regclass;
+    w := format('CASE WHEN karidns_reload_requests.zone IS NULL THEN karidns_auth.is_global() ELSE karidns_auth.zone_grant(%s, %s) IS NOT NULL END', lit, format(zn, 'karidns_reload_requests.zone'));
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', w, NULL);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_insert', 'INSERT', NULL, w);
+    cnt := cnt + 1;
+  END IF;
+  -- cryptokeys: the rows of the zones the principal has a grant on; the role has the column privilege SELECT (id, domain_id, flags, active, published) only
+  IF to_regclass(format('%I.cryptokeys', sch)) IS NOT NULL THEN
+    rel := format('%I.cryptokeys', sch)::regclass;
+    PERFORM karidns_auth.set_policy(rel, 'karidns_rls_select', 'SELECT', format('karidns_auth.zone_grant(%s, %s) IS NOT NULL', lit, format(zr, 'cryptokeys')), NULL);
+    cnt := cnt + 1;
+  END IF;
+  RETURN cnt;
+END $$;
+
+-- The policies of the signer role (db/karidns_signer_role.pgsql.sql): it reads everything and writes only what it owns: records of DNSSEC-managed types
+-- (and UPDATE of SOA rows, whose serial is all the trigger signer_soa_fn lets it change), the domainmetadata kinds PRESIGNED, NSEC3PARAM and
+-- X-KARIDNS-SIGNER, reload requests.  It is not bound by grants.  Every write policy exists twice, PERMISSIVE (what it may do) and RESTRICTIVE (what
+-- every write must also pass, so the permissive policies of the API, which are OR-ed with these, cannot widen them: karidns.principal changes nothing).
+CREATE OR REPLACE FUNCTION karidns_auth.create_signer_policies(sch text, rol text) RETURNS integer LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+  cnt integer := 0;
+  nm  text;
+  rel regclass;
+  sfx text := CASE WHEN length(rol) <= 40 THEN rol ELSE left(md5(rol), 16) END;
+  pr  text;
+  pm  text;
+BEGIN
+  FOREACH nm IN ARRAY ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns', 'karidns_zone_tagdefs',
+                            'karidns_domain_views', 'karidns_reload_requests'] LOOP
+    IF to_regclass(format('%I.%I', sch, nm)) IS NULL THEN CONTINUE; END IF;
+    rel := format('%I.%I', sch, nm)::regclass;
+    PERFORM karidns_auth.set_policy(rel, 'karidns_signer_select_' || sfx, 'SELECT', 'true', NULL, rol);
+    cnt := cnt + 1;
+  END LOOP;
+  IF to_regclass(format('%I.records', sch)) IS NOT NULL THEN
+    rel := format('%I.records', sch)::regclass;
+    pr := 'karidns_auth.is_dnssec_type(records.type)';
+    pm := 'karidns_auth.is_dnssec_type(records.type) OR karidns_auth.canon_type(records.type) = ''SOA''';
+    PERFORM karidns_auth.set_policy(rel, 'karidns_signer_insert_' || sfx, 'INSERT', NULL, pr, rol);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_signer_update_' || sfx, 'UPDATE', pm, pm, rol);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_signer_delete_' || sfx, 'DELETE', pr, NULL, rol);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_signer_r_insert_' || sfx, 'INSERT', NULL, pr, rol, true);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_signer_r_update_' || sfx, 'UPDATE', pm, pm, rol, true);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_signer_r_delete_' || sfx, 'DELETE', pr, NULL, rol, true);
+  END IF;
+  IF to_regclass(format('%I.domainmetadata', sch)) IS NOT NULL THEN
+    rel := format('%I.domainmetadata', sch)::regclass;
+    pr := 'upper(btrim(domainmetadata.kind)) IN (''PRESIGNED'', ''NSEC3PARAM'', ''X-KARIDNS-SIGNER'')';
+    PERFORM karidns_auth.set_policy(rel, 'karidns_signer_insert_' || sfx, 'INSERT', NULL, pr, rol);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_signer_update_' || sfx, 'UPDATE', pr, pr, rol);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_signer_delete_' || sfx, 'DELETE', pr, NULL, rol);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_signer_r_insert_' || sfx, 'INSERT', NULL, pr, rol, true);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_signer_r_update_' || sfx, 'UPDATE', pr, pr, rol, true);
+    PERFORM karidns_auth.set_policy(rel, 'karidns_signer_r_delete_' || sfx, 'DELETE', pr, NULL, rol, true);
+  END IF;
+  IF to_regclass(format('%I.karidns_reload_requests', sch)) IS NOT NULL THEN       -- INSERT only (the prune trigger is SECURITY DEFINER)
+    rel := format('%I.karidns_reload_requests', sch)::regclass;
+    PERFORM karidns_auth.set_policy(rel, 'karidns_signer_insert_' || sfx, 'INSERT', NULL, 'true', rol);
+  END IF;
+  RETURN cnt;
+END $$;
+
+-- Switch RLS on / off for the tables of a schema (or of karidns_auth).  enable_rls also gives the role karidns_rls_trusted its policy
+-- (USING (true) WITH CHECK (true)); the role must exist (the role scripts create it).  The owner of the tables runs them.  Returns the number of tables.
+CREATE OR REPLACE FUNCTION karidns_auth.enable_rls(sch text) RETURNS integer LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+  t   text;
+  cnt integer := 0;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'karidns_rls_trusted') THEN
+    RAISE EXCEPTION 'karidns_auth.enable_rls: the role karidns_rls_trusted does not exist (the role scripts create it)';
+  END IF;
+  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'audit_log']
+                           ELSE ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns',
+                                      'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_reload_requests'] END) LOOP
+    IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
+    EXECUTE format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY', sch, t);
+    EXECUTE format('DROP POLICY IF EXISTS karidns_rls_trusted ON %I.%I', sch, t);
+    EXECUTE format('CREATE POLICY karidns_rls_trusted ON %I.%I AS PERMISSIVE FOR ALL TO karidns_rls_trusted USING (true) WITH CHECK (true)', sch, t);
+    cnt := cnt + 1;
+  END LOOP;
+  RETURN cnt;
+END $$;
+
+CREATE OR REPLACE FUNCTION karidns_auth.disable_rls(sch text) RETURNS integer LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+  t   text;
+  cnt integer := 0;
+BEGIN
+  FOREACH t IN ARRAY (CASE WHEN sch = 'karidns_auth' THEN ARRAY['principals', 'credentials', 'memberships', 'rr_policies', 'grants', 'audit_log']
+                           ELSE ARRAY['domains', 'records', 'domainmetadata', 'cryptokeys', 'karidns_record_tags', 'karidns_record_tinydns',
+                                      'karidns_zone_tagdefs', 'karidns_domain_views', 'karidns_reload_requests'] END) LOOP
+    IF to_regclass(format('%I.%I', sch, t)) IS NULL THEN CONTINUE; END IF;
+    EXECUTE format('ALTER TABLE %I.%I DISABLE ROW LEVEL SECURITY', sch, t);
+    cnt := cnt + 1;
+  END LOOP;
+  RETURN cnt;
+END $$;
+
+-- the policies of the auth tables and of the schema this file is applied in (inactive while RLS is off)
+DO $$ BEGIN PERFORM karidns_auth.create_policies('karidns_auth'); PERFORM karidns_auth.create_policies(current_schema()); END $$;
+
+-- The maintenance triggers of the data tables (the change log, its prune, the reload requests: all of the version 2 part of this file) run as the owner,
+-- not as the role that writes: the roles of the API and the signer need no right on karidns_changes (and cannot read or forge the log the loader's
+-- auto reload depends on) and cannot delete reload requests.  Their search_path is pinned to pg_catalog, this schema, pg_temp (the temporary schema
+-- last: a temporary table cannot shadow a table of the log); a SECURITY DEFINER function must not use the writer's path.
+DO $$
+DECLARE
+  f regprocedure;
+BEGIN
+  FOR f IN SELECT p.oid::regprocedure FROM pg_proc p
+            WHERE p.pronamespace = current_schema()::regnamespace AND p.prokind = 'f'
+              AND (p.proname LIKE 'karidns\_trg\_%\_fn' OR p.proname IN ('karidns_log_domains', 'karidns_changes_prune_fn', 'karidns_reload_requests_lock_fn',
+                                                                         'karidns_reload_requests_notify_fn', 'karidns_reload_requests_prune_fn'))
+  LOOP
+    EXECUTE format('ALTER FUNCTION %s SECURITY DEFINER SET search_path = pg_catalog, %I, pg_temp', f, current_schema());
+    EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', f);
+  END LOOP;
+END $$;
+
+
 -- The trigger functions and the audit switches are not for anybody to call or to attach to a table of their own: EXECUTE is for the owner only
 -- (a trigger function needs no EXECUTE right of the role whose statement fires the trigger; CREATE TRIGGER does).  is_canonical_name and
 -- rr_types_ok stay with PUBLIC: CHECK constraints call them as the role that inserts the row.
@@ -852,6 +1435,16 @@ REVOKE EXECUTE ON FUNCTION karidns_auth.credentials_user_only_fn(), karidns_auth
   karidns_auth.principals_delete_fn(), karidns_auth.memberships_check_fn(), karidns_auth.memberships_closure_fn(), karidns_auth.domains_grants_fn(),
   karidns_auth.audit_row(), karidns_auth.audit_stmt(), karidns_auth.audit_zone_fn(), karidns_auth.audit_summary(),
   karidns_auth.enable_audit(text), karidns_auth.disable_audit(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION karidns_auth.current_principal(), karidns_auth.my_groups(), karidns_auth.zone_grant(text, text), karidns_auth.is_global(),
+  karidns_auth.rr_ok(text, text, text, text, integer), karidns_auth.rr_visible(text, text, text, text), karidns_auth.audit_visible(text, text, text, jsonb, jsonb),
+  karidns_auth.bump_serial(text, integer), karidns_auth.is_api_caller(), karidns_auth.is_signer_caller(), karidns_auth.policy_subset(bigint, bigint),
+  karidns_auth.may_grant(text, text, text, bigint), karidns_auth.grants_escalation_fn(), karidns_auth.signer_soa_fn(), karidns_auth.assert_service_role(text, text),
+  karidns_auth.set_policy(regclass, text, text, text, text, text, boolean), karidns_auth.create_policies(text),
+  karidns_auth.create_signer_policies(text, text), karidns_auth.enable_rls(text), karidns_auth.disable_rls(text) FROM PUBLIC;
+-- (canon_type, is_dnssec_type and setting_principal stay with PUBLIC: the policies and the trigger conditions of the signer call them as the signer.)
+-- The role scripts grant EXECUTE on current_principal, my_groups, zone_grant, is_global, rr_ok, rr_visible and audit_visible (and bump_serial to the API
+-- role) to their role and to karidns_rls_trusted: the policies call them as the role that runs the statement.
+
 
 -- the versions, last: a fresh install whose karidns_auth part fails stays version 2 (a version 1 database is not touched: it needs
 -- db/karidns_ext_v1_to_v2.pgsql.sql first)

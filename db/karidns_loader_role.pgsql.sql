@@ -53,3 +53,11 @@ SELECT format('GRANT INSERT, UPDATE ON %I.%I TO %I', :'schema', c.relname, :'rol
 \gexec
 
 ALTER ROLE :"role" SET default_transaction_read_only = on;
+
+-- Row level security (0.6.0 item B): once db/karidns_api_role.pgsql.sql or db/karidns_signer_role.pgsql.sql has switched RLS on for the tables of the
+-- schema, a role without a policy sees no row.  The loader is not bound by grants, so it joins karidns_rls_trusted, a NOLOGIN role whose policy on each of
+-- those tables is USING (true) WITH CHECK (true); the role is created here if it is missing, so this script and the API / signer scripts work in either
+-- order.  It gets nothing on karidns_auth (users, grants, credentials, the audit log).  Without RLS the membership changes nothing.
+SELECT 'CREATE ROLE karidns_rls_trusted NOLOGIN' WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'karidns_rls_trusted')
+\gexec
+GRANT karidns_rls_trusted TO :"role";
