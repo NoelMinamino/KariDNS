@@ -1,0 +1,5 @@
+#!/bin/sh
+# karidns-signer: starts the signer (docs/karidns-signer.md) with the Node.js of the package.  Installed as /usr/local/sbin/karidns-signer.
+# The path of the Node.js binary and of the program are fixed: nothing is looked up in PATH.
+ulimit -c 0                                     # no core dump: the process memory holds private keys while a zone is signed
+exec /usr/local/bin/node /usr/local/libexec/karidns-signer/bin/karidns-signer.js "$@"

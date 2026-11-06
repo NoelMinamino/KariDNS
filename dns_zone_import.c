@@ -463,11 +463,11 @@ static int zi_cmp_rrv(const void *x, const void *y) {
 typedef struct { char what; const char *owner, *type; } zi_item_t;
 
 /* The RRsets of the rows a (deleted) against those of b (inserted): in a only '-', in b only '+', in both with other rows '~'. */
-static bool zi_diff(rrv_t *a, size_t na, rrv_t *b, size_t nb, zi_item_t **out, size_t *nout, zi_result_t *res) {
+static bool zi_diff(rrv_t *a, size_t na, rrv_t *b, size_t nb, bool want_items, zi_item_t **out, size_t *nout, zi_result_t *res) {
     qsort(a, na, sizeof(*a), zi_cmp_rrv);
     qsort(b, nb, sizeof(*b), zi_cmp_rrv);
-    zi_item_t *items = malloc((na + nb + 1) * sizeof(*items));
-    if (!items) return false;
+    zi_item_t *items = want_items ? malloc((na + nb + 1) * sizeof(*items)) : NULL;      /* without a report only the counts are needed */
+    if (want_items && !items) return false;
     size_t n = 0, i = 0, j = 0;
     while (i < na || j < nb) {
         int c = i >= na ? 1 : j >= nb ? -1 : zi_cmp_key(&a[i], &b[j]);
@@ -477,16 +477,19 @@ static bool zi_diff(rrv_t *a, size_t na, rrv_t *b, size_t nb, zi_item_t **out, s
         if (c >= 0)
             while (je < nb && zi_cmp_key(&b[je], &b[j]) == 0) je++;
         if (c < 0) {
-            items[n++] = (zi_item_t){ '-', a[i].owner, a[i].type };
+            if (items) items[n] = (zi_item_t){ '-', a[i].owner, a[i].type };
+            n++;
             res->rrsets_deleted++;
         } else if (c > 0) {
-            items[n++] = (zi_item_t){ '+', b[j].owner, b[j].type };
+            if (items) items[n] = (zi_item_t){ '+', b[j].owner, b[j].type };
+            n++;
             res->rrsets_added++;
         } else {
             bool same = ie - i == je - j;
             for (size_t k = 0; same && k < ie - i; k++) same = zi_cmp_rrv(&a[i + k], &b[j + k]) == 0;
             if (!same) {
-                items[n++] = (zi_item_t){ '~', b[j].owner, b[j].type };
+                if (items) items[n] = (zi_item_t){ '~', b[j].owner, b[j].type };
+                n++;
                 res->rrsets_replaced++;
             }
         }
@@ -494,7 +497,7 @@ static bool zi_diff(rrv_t *a, size_t na, rrv_t *b, size_t nb, zi_item_t **out, s
         j = je;
     }
     *out = items;
-    *nout = n;
+    *nout = items ? n : 0;
     return true;
 }
 
@@ -790,7 +793,7 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
     }
     res->records_deleted = ndel;
     res->records_inserted = nins;
-    if (!zi_diff(va, nva, vb, nins, &items, &nitems, res)) goto oom;
+    if (!zi_diff(va, nva, vb, nins, true, &items, &nitems, res)) goto oom;
 
     if (zf.found && whole && z->o.mode == ZI_REPLACE && !rows->presigned && !szone) {
         bool keys = false;
@@ -1209,7 +1212,10 @@ static int zi_sfail(zi_t *z, const char *what, int rc, const char *shown, const 
 #define ZI_SFAIL(what, rc) do { status = zi_sfail(z, (what), (rc), shown, rows->zone); goto out; } while (0)
 
 /* Everything of a signer import in the transaction.  ZI_OK, ZI_FAIL, ZI_BUSY, ZI_CHANGED; the caller rolls back unless this committed.  farena: the parsed file. */
-static int zi_apply_signer(zi_t *z, zrows_t *rows, const zone_arena_t *farena, const char *shown, zi_result_t *res) {
+/* farena: the zone arena of the file; it is destroyed here as soon as it has been compared (the caller's destroy of the emptied arena is harmless).  The memory
+ * of a big signed zone is the point: the file's arena, the rows made from it, the database's rows and the zone read from them are not held while the written
+ * rows are read back (zi_verify), which needs as much again. */
+static int zi_apply_signer(zi_t *z, zrows_t *rows, zone_arena_t *farena, const char *shown, zi_result_t *res) {
     const db_driver_t *d = z->drv;
     db_conn_t *c = z->conn;
     int status = ZI_FAIL;
@@ -1240,8 +1246,10 @@ static int zi_apply_signer(zi_t *z, zrows_t *rows, const zone_arena_t *farena, c
     size_t nords = 0;
     db_ins_t *ins = NULL;
     char why[400];
+    char zone[DNS_NAME_TEXT_SIZE];
     int rc;
 
+    snprintf(zone, sizeof(zone), "%s", rows->zone);
     if (!rows->presigned) {
         ZI_ERR(z, DC_DB_IMPORT_SIGNER, shown, "Zone '%s': the file is not a signed zone (it needs RRSIG records and a complete NSEC or NSEC3 chain); nothing was written", rows->zone);
         return ZI_FAIL;
@@ -1406,6 +1414,14 @@ static int zi_apply_signer(zi_t *z, zrows_t *rows, const zone_arena_t *farena, c
         }
     }
 
+    /* compared: the file's arena, the zone read from the database and the sets made of them are not needed any more */
+    zi_crrs_free(&dbr);
+    zi_crrs_free(&fir);
+    pdns_zone_free(pz);
+    pz = NULL;
+    zone_arena_destroy(farena);
+    zone_arena_init(farena);
+
     /* the RRsets of the DNSSEC records, for the report and the counts */
     vb = malloc((nfdn ? nfdn : 1) * sizeof(*vb));
     ins = malloc((nfdn ? nfdn : 1) * sizeof(*ins));
@@ -1415,7 +1431,7 @@ static int zi_apply_signer(zi_t *z, zrows_t *rows, const zone_arena_t *farena, c
         vb[k] = (rrv_t){ r->name, r->type, r->content ? r->content : "", r->ttl_null ? -1 : r->ttl, r->prio_null ? 0 : r->prio };
         ins[k] = (db_ins_t){ r, !rows->auth || rows->auth[fdn[k]] != 0 };
     }
-    if (!zi_diff(va, nva, vb, nfdn, &items, &nitems, res)) goto oom;
+    if (!zi_diff(va, nva, vb, nfdn, z->o.report != NULL, &items, &nitems, res)) goto oom;
     res->records_deleted = ndel;
     res->records_inserted = nfdn;
     res->has_expire = true;
@@ -1472,7 +1488,22 @@ static int zi_apply_signer(zi_t *z, zrows_t *rows, const zone_arena_t *farena, c
                     "db/karidns_ext.pgsql.sql); a running server notices the change through the change log");
         }
     }
-    if (!zi_verify(z, rows->zone, zf.id, shown, false, 0, res)) goto out;
+    if (!z->o.report) {
+        /* no report names the RRsets (items point into these): the rest of the memory goes before the zone is read back */
+        free(ins); ins = NULL;
+        free(ords); ords = NULL;
+        free(vb); vb = NULL;
+        free(va); va = NULL;
+        free(del_ids); del_ids = NULL;
+        free(fm); fm = NULL;
+        free(fe); fe = NULL;
+        free(fdn); fdn = NULL;
+        free(au.v); au.v = NULL;
+        zi_recs_free(&db);
+        soa_d = NULL;
+        zrows_free(rows);
+    }
+    if (!zi_verify(z, zone, zf.id, shown, false, 0, res)) goto out;
     if (d->w_write_id(c, mark, &res->write_id) != 0) {
         zi_dbfail(z, "reading the id of the write");
         goto out;
@@ -1495,7 +1526,7 @@ static int zi_apply_signer(zi_t *z, zrows_t *rows, const zone_arena_t *farena, c
         if (gmtime_r(&et, &tmv)) strftime(ex, sizeof(ex), "%Y-%m-%dT%H:%M:%SZ", &tmv);
         zmsg_emit(&z->msg, DIAG_INFO, z->o.dry_run ? DC_DB_IMPORT_DRY_RUN : DC_DB_IMPORT_DONE, shown,
                   "Zone '%s' signed: SOA serial %u -> %u, %zu DNSSEC record(s) written, %zu removed, %zu record(s) updated (ordername, auth); the earliest RRSIG expires %s%s",
-                  rows->zone, (unsigned)res->old_serial, (unsigned)res->new_serial, res->records_inserted, res->records_deleted, res->rows_updated, ex,
+                  zone, (unsigned)res->old_serial, (unsigned)res->new_serial, res->records_inserted, res->records_deleted, res->rows_updated, ex,
                   z->o.dry_run ? "; dry run, nothing was written" : "");
     }
     goto out;
@@ -1569,6 +1600,13 @@ int zi_import_zone(zi_t *z, const zi_input_t *in, const char *zone, zi_result_t 
         ZI_ERR(z, info.include_refused ? DC_ZONE_INCLUDE_STDIN : DC_ZONE_SYNTAX, t.shown, "%s",
                info.include_refused ? "$INCLUDE is refused in a zone read from standard input" : err);
     } else {
+        /* The arena has its own copy of the text, and the checks of a BIND zone do not read the raw text (zone_lint_in_t.raw_text is for tinydns): a signed zone is
+         * big, so the second copy goes now when the signer imports it. */
+        if (z->o.signer) {
+            free(t.text);
+            t.text = NULL;
+            t.len = 0;
+        }
         status = zi_import_arena(z, &arena, apex, &t, false, &info, res);
         zone_arena_destroy(&arena);
     }

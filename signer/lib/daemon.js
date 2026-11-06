@@ -12,6 +12,7 @@ import { zoneSettings } from './config.js';
 export const REQUEST_POLL = 5;            // seconds between two looks at the key requests
 export const CATCHUP_EVERY = 3600;        // seconds between two full catch-up scans (a safety net: the change log is the normal way)
 export const LOCKED_DELAY = 30;           // seconds before a zone that another instance holds is tried again
+export const REQUEST_BATCH = 50;          // key requests read at a time
 
 export class Daemon {
   constructor({ db, ctx, sign, log, clock, sleep, rand = Math.random, tickMs = 1000, changePollMs }) {
@@ -37,6 +38,7 @@ export class Daemon {
     this.lastRequests = 0;
     this.requests = [];                    // the pending key requests of the last poll
     this.requestsDue = false;
+    this.requestsFull = false;
     this.lastCatchUp = 0;
     this.kick = null;
     this.loops = [];
@@ -148,7 +150,8 @@ export class Daemon {
     const ready = (id) => !this.inflight.has(id) && (this.notBefore.get(id) ?? 0) <= now;
     if (now - this.lastRequests >= REQUEST_POLL || this.requestsDue) {
       this.requestsDue = false;
-      this.requests = await this.db.pendingRequests(50);
+      this.requests = await this.db.pendingRequests(REQUEST_BATCH);
+      this.requestsFull = this.requests.length >= REQUEST_BATCH;
       this.lastRequests = now;
     }
     for (const r of this.requests) {
@@ -158,6 +161,8 @@ export class Daemon {
       this.requests = this.requests.filter((x) => x !== r);
       free--;
     }
+    // every request of a full batch is started: the next batch is read at the next pass, not after the poll interval (a bulk of requests would be taken REQUEST_BATCH per REQUEST_POLL)
+    if (this.requests.length === 0 && this.requestsFull) this.requestsDue = true;
     if (free <= 0) return;
     const due = await this.db.dueZones(now, this.workers * 4 + this.inflight.size);
     for (const z of due) {
@@ -171,6 +176,8 @@ export class Daemon {
   start1(job) {
     const p = this.runJob(job).finally(() => {
       this.inflight.delete(job.domainId);
+      // a poll that happened while the job ran listed its request again (it is pending until the job has answered it): not a second job for it
+      this.requests = this.requests.filter((r) => r.domainId !== job.domainId);
       this.wakeLoop();
     });
     this.inflight.set(job.domainId, p);

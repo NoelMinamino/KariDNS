@@ -31,7 +31,7 @@ export class Debounce {
   constructor(debounce, max = debounce * 6) {
     this.debounce = debounce;
     this.max = max;
-    this.zones = new Map();               // domain id -> { first, last, rows: [{ seq, xid }] }
+    this.zones = new Map();               // domain id -> { first, last, rows: [{ seq, seqEnd, xid }] }
   }
 
   add(domainId, row, now) {
@@ -41,8 +41,19 @@ export class Debounce {
       this.zones.set(domainId, z);
     }
     z.last = now;
-    if (z.rows.length < 256) z.rows.push(row);
-    else z.overflow = true;                 // too many rows to remember: the zone is looked at, own writes or not
+    // The rows are kept as few entries: PostgreSQL writes a handful of log rows per transaction (one entry per xid); SQLite3 writes a row per changed row, and a
+    // write of a big zone makes ten thousands of them, in one run of consecutive seq (a single writer): one entry { seq, seqEnd } per run.
+    if (row.xid != null) {
+      if (z.rows.some((r) => r.xid === row.xid)) return;
+    } else {
+      const prev = z.rows[z.rows.length - 1];
+      if (prev && prev.xid == null && row.seq === prev.seqEnd + 1) {
+        prev.seqEnd = row.seq;
+        return;
+      }
+    }
+    if (z.rows.length < 256) z.rows.push({ seq: row.seq, seqEnd: row.seq, xid: row.xid });
+    else z.overflow = true;                 // too many separate runs to remember: the zone is looked at, own writes or not
   }
 
   // the domains whose burst ended and that have a row that is not ours; `busy(id)` true keeps the entry (the zone is being signed now: the write id of
@@ -83,6 +94,14 @@ export class OwnWrites {
 
   isOwn(row) {
     if (row.xid != null && this.xids.has(String(row.xid))) return true;
-    return row.seq != null && this.ranges.some(([a, b]) => row.seq >= a && row.seq <= b);
+    if (row.seq == null) return false;
+    // a run of consecutive rows (debounce) is ours when our writes together cover all of it (the import and the INSERT of the keys right after it are two writes, one run)
+    const end = row.seqEnd ?? row.seq;
+    for (let pos = row.seq; pos <= end;) {
+      const r = this.ranges.find(([a, b]) => pos >= a && pos <= b);
+      if (!r) return false;
+      pos = r[1] + 1;
+    }
+    return true;
   }
 }

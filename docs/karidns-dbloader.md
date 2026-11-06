@@ -205,7 +205,7 @@ The extension files create `karidns_zone_tagdefs_domain_idx` on `karidns_zone_ta
 
 Schema version 3 adds what the WebAdmin API and the signer daemon need: users, groups and grants, database roles held to their grants by row level security (RLS, PostgreSQL only), an audit log, and the signer's two tables. The server and `karidns-dbloader` use none of it (but for the metadata `X-KARIDNS-SIGNER`, below). A database that only has the loader's and the importer's roles behaves as it did before: RLS is off and nothing is logged.
 
-**The signer's tables (0.6.0 item C).** `karidns_key_requests` and `karidns_signer_state` are in `db/karidns_ext.pgsql.sql` and `db/karidns_ext.sqlite3.sql` (per data schema, like the other `karidns_*` tables; apply the file again to a version 3 database that lacks them; the schema version stays 3). They go away with their zone (`ON DELETE CASCADE`), are covered by the audit (`enable_audit`; the SQLite3 audit file has their triggers) and write **no** row to `karidns_changes`: the signer writes its state after every run, and a signer that followed its own state would never stop.
+**The signer's tables (0.6.0 item C).** The daemon that uses them is [`karidns-signer(8)`](karidns-signer.md). `karidns_key_requests` and `karidns_signer_state` are in `db/karidns_ext.pgsql.sql` and `db/karidns_ext.sqlite3.sql` (per data schema, like the other `karidns_*` tables; apply the file again to a version 3 database that lacks them; the schema version stays 3). They go away with their zone (`ON DELETE CASCADE`), are covered by the audit (`enable_audit`; the SQLite3 audit file has their triggers) and write **no** row to `karidns_changes`: the signer writes its state after every run, and a signer that followed its own state would never stop.
 
 | Table | Columns |
 |---|---|
@@ -386,7 +386,7 @@ The audit costs about 0.1 ms per changed row (the row trigger builds the JSON of
 | `karidns-postgresql` | PostgreSQL driver | `databases/postgresqlNN-client` (libpq; NN is the version the build host linked) |
 | `karidns-db` | both drivers | both |
 
-The database packages install `/usr/local/libexec/karidns-dbloader` (root:wheel, mode 0555), [`karidns-zone`](karidns-zone.md) (`/usr/local/bin/karidns-zone`, with the same drivers, and its manual), this manual, and the SQL files of their drivers in `/usr/local/share/karidns/db/`. In a package without the loader `karicheck db` reports `DB support is not installed`. See [Distribution Guide](distribution.md).
+The database packages install `/usr/local/libexec/karidns-dbloader` (root:wheel, mode 0555), [`karidns-zone`](karidns-zone.md) (`/usr/local/bin/karidns-zone`, with the same drivers, and its manual), this manual, and the SQL files of their drivers in `/usr/local/share/karidns/db/`. The signer daemon [`karidns-signer`](karidns-signer.md) is a package of its own (`karidns-signer`, [Distribution Guide](distribution.md), 2.6). In a package without the loader `karicheck db` reports `DB support is not installed`. See [Distribution Guide](distribution.md).
 
 ## MEASUREMENTS
 
@@ -578,10 +578,11 @@ R	0	0	1
 
 ## FILES
 
-$1
 `/usr/local/bin/karidns-zone`
 : The importer and exporter of zones (database packages; [`karidns-zone(1)`](karidns-zone.md)).
 
+`/usr/local/libexec/karidns-signer/`, `/usr/local/sbin/karidns-signer`
+: The signer daemon and its wrapper (the package `karidns-signer`; [`karidns-signer(8)`](karidns-signer.md)).
 `/usr/local/share/karidns/db/`
 : The SQL files above (database packages; `db/` in a source tree).
 
@@ -598,7 +599,8 @@ the file of `loader-state-file` (default: none)
 
 - [`karidns(8)`](karidns.md) — the `database` block, database zones, settings, auto reload, several servers
 - [`karictl(8)`](karictl.md) — `reload`, `dbstatus`
-$1- [`karidns-zone(1)`](karidns-zone.md) — import and export of zones (writes the tables this loader reads)
+- [`karidns-zone(1)`](karidns-zone.md) — import and export of zones (writes the tables this loader reads)
+- [`karidns-signer(8)`](karidns-signer.md) — keeps the zones signed; uses the signer tables, role and reload requests described here
 - [Distribution Guide](distribution.md) — the four FreeBSD packages
 
 ---

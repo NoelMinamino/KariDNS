@@ -34,6 +34,9 @@ export class PipelineError extends Error {
 
 const fail = (m) => new PipelineError('failed', m);
 
+// the SQLSTATE 40001 and 40P01 messages of PostgreSQL
+export const TRANSIENT_DB_ERROR = /could not serialize access|deadlock detected/;
+
 // seconds between the attempts to INSERT the keys of a zone that is signed already (about ten minutes in all)
 export const KEY_RETRY_DELAYS = [1, 2, 4, 8, 16, 32, 60, 60, 60, 60, 60, 60, 60, 60, 60];
 
@@ -246,6 +249,9 @@ async function runZone(ctx, job, zone, settings, dir, t0) {
   r = await ctx.run(ctx.tools.zone, importArgv(cfgDb, zone, out), { cwd: dir, timeoutMs });
   if (r.code === 3) throw new PipelineError('changed', 'the zone changed while it was signed');
   if (r.code === 4) throw new PipelineError('busy', 'the database is busy');
+  // PostgreSQL gives up one of two transactions that touch the same rows (REPEATABLE READ: the pruning of karidns_reload_requests by two importers at once;
+  // a deadlock): nothing was written, and the next try works.  Not an error of the zone.
+  if (r.code !== 0 && TRANSIENT_DB_ERROR.test(`${r.stdout}\n${r.stderr}`)) throw new PipelineError('busy', 'the database rolled the write back (concurrent update)');
   if (r.code !== 0) throw fail(toolMessage('karidns-zone import', r));
   const sg = jsonOf(r.stdout)?.signer;
   if (!sg || sg.committed !== true || !Number.isInteger(sg.serial)) throw fail('karidns-zone import --signer gave no usable result');

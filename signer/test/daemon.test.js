@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseConfig } from '../lib/config.js';
-import { Daemon, REQUEST_POLL, CATCHUP_EVERY, LOCKED_DELAY } from '../lib/daemon.js';
+import { Daemon, REQUEST_POLL, REQUEST_BATCH, CATCHUP_EVERY, LOCKED_DELAY } from '../lib/daemon.js';
 import { backoff, busyDelay } from '../lib/scheduler.js';
 
 const CONF = 'database = sqlite3\nsqlite-file = /db\nkarictl-config = /k\nworkers = 2\nvalidity = 14d\nrefresh = 3d\njitter = 1d\ndebounce = 5';
@@ -123,6 +123,45 @@ test('tick: a zone that waits (notBefore) or runs is not started; the request li
   m.db.due = [];
   await m.d.tick();
   assert.ok(!m.signed.some((j) => j.domainId === 9));
+});
+
+test('tick: a request that a poll listed while its job ran is not started a second time when the job is done', async () => {
+  const m = make();
+  m.db.reqs = [{ id: 7, domainId: 5, zone: 'r.test', kind: 'enable', algorithm: 13 }];
+  let release;
+  m.outcomes.set(5, () => new Promise((r) => { release = () => r({ status: 'signed', serial: 2, minExpire: null, durationMs: 1, request: { state: 'done', message: 'ok' } }); }));
+  await m.d.tick();
+  assert.equal(m.signed.length, 1);
+  m.clock.now += REQUEST_POLL;
+  await m.d.tick();                       // the poll lists the request again: it is still pending in the database while the job runs
+  assert.equal(m.signed.length, 1);
+  assert.equal(m.d.requests.length, 1);
+  release();
+  await idle(m.d);
+  assert.equal(m.d.requests.length, 0);
+  await m.d.tick();
+  assert.equal(m.signed.length, 1, 'the zone was signed once for the one request');
+});
+
+test('tick: a full batch of key requests is followed by the next batch at once, a short one waits for the poll interval', async () => {
+  const m = make();
+  m.ctx.config.settings.workers = 100;
+  const batch = (from, n) => Array.from({ length: n }, (_, i) => ({ id: from + i, domainId: from + i, zone: `r${from + i}.test`, kind: 'enable', algorithm: 13 }));
+  m.db.reqs = batch(1, REQUEST_BATCH);
+  await m.d.tick();
+  assert.equal(m.signed.length, REQUEST_BATCH);
+  await idle(m.d);
+  const polls = () => find(m.calls, 'pendingRequests').length;
+  assert.equal(polls(), 1);
+  m.db.reqs = batch(1000, 3);
+  await m.d.tick();                       // no time has passed: the list was full and is empty, so the database is asked again
+  assert.equal(polls(), 2);
+  assert.equal(m.signed.length, REQUEST_BATCH + 3);
+  await idle(m.d);
+  m.db.reqs = batch(2000, 3);
+  await m.d.tick();                       // the last batch was short: the poll interval applies
+  assert.equal(polls(), 2);
+  assert.equal(m.signed.length, REQUEST_BATCH + 3);
 });
 
 test('the catch-up scan runs again every hour', async () => {

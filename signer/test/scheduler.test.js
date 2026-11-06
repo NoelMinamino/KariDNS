@@ -83,12 +83,44 @@ test('debounce: a zone that is being signed keeps its entry until it is done', (
   assert.deepEqual(d.flush(100, own, () => false), [1]);
 });
 
-test('debounce: too many rows to remember means the zone is looked at, own writes or not', () => {
+test('debounce: too many separate runs to remember means the zone is looked at, own writes or not', () => {
   const w = new OwnWrites();
-  w.add({ xid: '1' });
+  w.add({ xid: null, seq_first: 0, seq_last: 1000 });
   const d = new Debounce(5);
-  for (let i = 0; i < 300; i++) d.add(1, { seq: i, xid: '1' }, 0);
+  for (let i = 0; i < 300; i++) d.add(1, { seq: i * 2, xid: null }, 0);      // 300 runs of one row each
   assert.deepEqual(d.flush(100, (r) => w.isOwn(r)), [1]);
+});
+
+test('debounce: the rows of one write of a big zone are one run, and our own (SQLite3: a row per changed row)', () => {
+  const w = new OwnWrites();
+  const d = new Debounce(5);
+  for (let i = 1000; i < 101000; i++) d.add(4, { seq: i, xid: null }, 0);    // 100,000 log rows of one import --signer
+  assert.equal(d.zones.get(4).rows.length, 1);
+  assert.deepEqual(d.flush(100, (r) => w.isOwn(r)), [4], 'not ours yet: the write id is not known');
+  for (let i = 1000; i < 101000; i++) d.add(4, { seq: i, xid: null }, 200);
+  w.add({ xid: null, seq_first: 1000, seq_last: 100999 });
+  assert.deepEqual(d.flush(300, (r) => w.isOwn(r)), [], 'one write, all of it ours: no new run');
+  // two writes of ours one after the other (the import, then the INSERT of the keys) are one run in the log, covered by both
+  w.add({ xid: null, seq_first: 101000, seq_last: 101003 });
+  for (let i = 1000; i < 101004; i++) d.add(4, { seq: i, xid: null }, 350);
+  assert.deepEqual(d.flush(360, (r) => w.isOwn(r)), []);
+  // a foreign row right after ours joins the run, and the run is no longer within our range
+  for (let i = 1000; i < 101005; i++) d.add(4, { seq: i, xid: null }, 400);
+  assert.deepEqual(d.flush(500, (r) => w.isOwn(r)), [4]);
+  // a foreign row before ours, and one in the middle of a gap: separate runs
+  d.add(4, { seq: 999, xid: null }, 600);
+  for (let i = 1000; i < 1010; i++) d.add(4, { seq: i, xid: null }, 600);
+  assert.equal(d.zones.get(4).rows.length, 1, 'consecutive with the row before: still one run');
+  assert.deepEqual(d.flush(700, (r) => w.isOwn(r)), [4]);
+});
+
+test('debounce: PostgreSQL rows of one transaction are one entry', () => {
+  const w = new OwnWrites();
+  w.add({ xid: '77', seq_first: null, seq_last: null });
+  const d = new Debounce(5);
+  for (let i = 0; i < 1000; i++) d.add(1, { seq: i, xid: '77' }, 0);
+  assert.equal(d.zones.get(1).rows.length, 1);
+  assert.deepEqual(d.flush(100, (r) => w.isOwn(r)), []);
 });
 
 test('own writes: PostgreSQL by xid8, SQLite3 by a range of seq', () => {

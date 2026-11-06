@@ -64,7 +64,7 @@ A new zone takes the file's serial. A merge or a `--types` import that does not 
 
 ### Signer mode (`--signer`)
 
-`karidns-zone import --signer <zone> <file>` writes a zone that `karidns-signer` signed (0.6.0 item C). The file is the zone as `dnssec-signzone` wrote it from an **export** of the zone; the tool takes from it the DNSSEC records and nothing else, so it works with the rights of the signer role alone (below) and cannot change the data of the zone. In ONE transaction:
+`karidns-zone import --signer <zone> <file>` writes a zone that [`karidns-signer`](karidns-signer.md) signed (0.6.0 item C). The file is the zone as `dnssec-signzone` wrote it from an **export** of the zone; the tool takes from it the DNSSEC records and nothing else, so it works with the rights of the signer role alone (below) and cannot change the data of the zone. In ONE transaction:
 
 1. The `RRSIG`, `NSEC`, `NSEC3`, `NSEC3PARAM` and `DNSKEY` records of the database are replaced by the file's, in the layout PowerDNS stores a presigned zone in (no `NSEC`, `NSEC3` or `NSEC3PARAM` rows, the chain is rebuilt by the reader; `ordername` is the NSEC3 hash, or the reversed relative name of an NSEC zone). `CDS` and `CDNSKEY` are not touched.
 2. The SOA of the file must be the database's SOA but for the serial, which must be **greater** (RFC 1982); it is written with `UPDATE`.
@@ -330,6 +330,7 @@ then `karictl reconfig`. A signed zone is exported with its signatures and the N
 ## SEE ALSO
 
 - [`karidns-dbloader(8)`](karidns-dbloader.md) — the loader that reads the zones the importer writes; the SQL files, the packages
+- [`karidns-signer(8)`](karidns-signer.md) — the daemon that runs `export --signer` and `import --signer` and keeps the zones signed
 - [`karicheck(1)`](karicheck.md) — the zone checks (`karicheck zone`), `karicheck db`, the JSON document and the message codes
 - [`karictl(8)`](karictl.md) — `reload`, `dbstatus`, `rollback`
 - [`karidns(8)`](karidns.md) — the `database` block, views, database zones, `check-*` options and limits

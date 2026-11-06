@@ -345,10 +345,16 @@ DROP TRIGGER IF EXISTS karidns_reload_requests_notify ON karidns_reload_requests
 CREATE TRIGGER karidns_reload_requests_notify AFTER INSERT ON karidns_reload_requests
   REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION karidns_reload_requests_notify_fn();
 
--- prune: keep the newest 1000 requests
+-- prune: keep the newest 1000 requests.  Two transactions that insert at the same time (the signer with several workers, importers) both prune the same old
+-- rows; the lock above is taken after the second one has its snapshot, so under REPEATABLE READ it fails with "could not serialize access due to
+-- concurrent delete" and the whole write is rolled back.  The rows are gone then (the first transaction deleted them): the prune is best effort.
 CREATE OR REPLACE FUNCTION karidns_reload_requests_prune_fn() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
-  DELETE FROM karidns_reload_requests WHERE generation <= (SELECT max(generation) FROM new_rows) - 1000;
+  BEGIN
+    DELETE FROM karidns_reload_requests WHERE generation <= (SELECT max(generation) FROM new_rows) - 1000;
+  EXCEPTION WHEN serialization_failure THEN
+    NULL;
+  END;
   RETURN NULL;
 END $$;
 DROP TRIGGER IF EXISTS karidns_reload_requests_prune ON karidns_reload_requests;

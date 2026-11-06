@@ -134,7 +134,16 @@ The importer and exporter for zones in a PowerDNS 5.1 database (SQLite3 or Postg
 ./karidns-zone export -c /usr/local/etc/karidns/karidns.conf example.com > example.com.zone
 ./karidns-zone export --all --dir /var/backups/zones -c /usr/local/etc/karidns/karidns.conf
 ```
-$1
+
+### 3c. `karidns-signer` (database packages)
+A Node.js daemon that keeps the zones of a PowerDNS 5.1 database signed (static DNSSEC): it generates keys on request and signs with BIND's `dnssec-keygen` / `dnssec-signzone`, reads and writes the zones through `karidns-zone`, signs again before the signatures run out and when a zone changes, and asks the server to reload; the server serves a changed signed zone only after it is signed. PostgreSQL (the signer role with row level security) and SQLite3. See the **[karidns-signer(8) Manual](docs/karidns-signer.md)**.
+
+```sh
+karidns-signer --check -c /usr/local/etc/karidns/karidns-signer.conf
+service karidns_signer start
+```
+
+### 4. `dag` (DNS Anomaly Generator)
 A test client, protocol debugger, and packet fuzzer for DNS servers. For full option specifications and fuzzing modes, see the **[dag(1) Manual](docs/dag.md)**.
 
 `dag` can construct custom queries (including EDNS options, Cookie, EDNS Client Subnet, IXFR, Dynamic Updates, etc.), output formatted responses (`+short`, `+yaml`, `+multiline`), resolve iteratively without any local resolver (`+trace2`), replay captured traffic against servers (`--replay`), generate web links (`+ldnsz`) for online wire-format analysis, and intentionally generate malformed or boundary-testing packets using the `--break` option. Its defaults follow `dig` (EDNS0 with a 1232-byte UDP payload size and a client cookie); unlike `dig`, it also prints hex dumps of the query and response by default (`+nohexdump` turns them off).
@@ -317,6 +326,8 @@ The database tools (`karidns-dbloader`, the loader the server starts, and `karid
 ```sh
 make karidns-dbloader karidns-zone DB_DRIVERS="sqlite3 postgresql"
 ```
+
+`karidns-signer` (the signer daemon, [manual](docs/karidns-signer.md)) is Node.js and is not built: `cd signer && npm ci --ignore-scripts`, then `node signer/bin/karidns-signer.js --check -c <config>`; it needs Node 22.13 or newer and BIND 9.20's `dnssec-keygen` and `dnssec-signzone`.
 
 To compile only the `dag` client (on Linux, macOS, Windows MSYS2, or FreeBSD):
 ```sh

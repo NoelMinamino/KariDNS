@@ -1,0 +1,37 @@
+name: "karidns-signer"
+version: "__VERSION__"
+origin: "dns/karidns-signer"
+comment: "Signer daemon for KariDNS database zones (static DNSSEC)"
+arch: "__ARCH__"
+www: "https://github.com/NoelMinamino/KariDNS"
+maintainer: "noel@karidns.org"
+prefix: "/usr/local"
+licenselogic: "single"
+licenses: [
+    "MIT"
+]
+desc: <<EOD
+karidns-signer keeps the zones of a KariDNS database (PostgreSQL or SQLite3) signed: it runs BIND's dnssec-keygen and
+dnssec-signzone and karidns-zone (from karidns-sqlite3, karidns-postgresql or karidns-db, which must be installed first).
+EOD
+categories: [
+    "dns",
+    "net",
+    "sysutils"
+]
+scripts: {
+    pre-install: <<EOD
+if [ ! -x /usr/local/bin/karidns-zone ]; then
+    echo "karidns-signer needs karidns-zone: install karidns-sqlite3, karidns-postgresql or karidns-db first" >&2
+    exit 1
+fi
+pw groupshow karidns-signer >/dev/null 2>&1 || pw groupadd karidns-signer
+pw usershow karidns-signer >/dev/null 2>&1 || pw useradd karidns-signer -g karidns-signer -h - -d /var/db/karidns-signer -s /usr/sbin/nologin -c "KariDNS signer"
+EOD
+}
+deps: {
+__DEPS__
+}
+files: {
+__FILES__
+}

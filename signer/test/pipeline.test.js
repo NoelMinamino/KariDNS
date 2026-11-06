@@ -422,6 +422,21 @@ test('exit status 3 is "changed", 4 is "busy": not errors, and the zone is not w
   }
 });
 
+test('a write that PostgreSQL rolled back for a concurrent update is "busy", not an error', async () => {
+  for (const text of ['ERROR:  could not serialize access due to concurrent delete (changed concurrently)', 'ERROR:  deadlock detected']) {
+    const s = setup(SQLITE_CONF, { keys: [row(KSK, 257)], exit: { ...EXIT0, import: 1 }, importErr: `{"messages":[{"severity":"error","code":"db.import.write","text":"adding a reload request: ${text}"}]}` });
+    try {
+      assert.deepEqual(await signZone(s.ctx, JOB), { status: 'busy' });
+      assert.deepEqual(s.state.inserted, []);
+      empty(s.work);
+    } finally { s.done(); }
+  }
+  const s = setup(SQLITE_CONF, { keys: [row(KSK, 257)], exit: { ...EXIT0, import: 1 }, importErr: '{"messages":[{"severity":"error","code":"db.import.write","text":"permission denied for table records"}]}' });
+  try {
+    assert.equal((await signZone(s.ctx, JOB)).status, 'failed');
+  } finally { s.done(); }
+});
+
 test('exit status 3 of the first signing: the generated keys are discarded, nothing stored', async () => {
   const s = setup(SQLITE_CONF, { meta: { signer: false, presigned: false, nsec3param: null }, exportText: EXPORT_UNSIGNED, exit: { ...EXIT0, import: 3 } });
   try {

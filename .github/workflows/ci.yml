@@ -26,7 +26,7 @@ jobs:
     if: github.event_name != 'schedule' && github.event.action != 'labeled'
     runs-on: ubuntu-latest
     # a hung test must fail the job instead of blocking it for hours
-    timeout-minutes: 40
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:
@@ -46,6 +46,15 @@ jobs:
             echo "::group::📦 [Setup] Install test dependencies (perl5, sqlite3 for karidns-dbloader and its tests)"
             pkg install -y perl5 || true
             pkg install -y sqlite3
+            echo "::endgroup::"
+
+            echo "::group::📦 [Setup] Node.js, BIND tools and the npm dependency of karidns-signer (0.6.0 item C)"
+            # karidns-signer is Node.js orchestration around BIND's dnssec-keygen / dnssec-signzone / dnssec-verify (bind-tools); signer/ has one
+            # npm dependency (pg, exact version in package-lock.json), installed without install scripts.  The signer tests SKIP without these.
+            pkg install -y node24 npm-node24 bind-tools
+            (cd signer && npm ci --ignore-scripts)
+            node --version
+            dnssec-signzone -V
             echo "::endgroup::"
 
             echo "::group::📦 [Setup] PostgreSQL server and libpq (PostgreSQL driver of karidns-dbloader, B10)"
@@ -157,6 +166,16 @@ jobs:
             sh ./tests/run_zone_type_secondary_test.sh
             echo "::endgroup::"
 
+            echo "::group::🔏 [Signer] karidns-signer: unit tests, SQLite3 and PostgreSQL (root: with a server)"
+            # A SKIP of a whole script must fail here (tests/run_all_suite.sh shows it as a note of a PASS): node24, bind-tools and signer/node_modules are installed above
+            for t in run_signer_unit_test run_signer_test run_signer_pg_test; do
+              out="/tmp/$t.out"
+              sh "./tests/$t.sh" < /dev/null > "$out" 2>&1 || { cat "$out"; echo "::error title=karidns-signer::$t failed"; exit 1; }
+              cat "$out"
+              if grep -Eq '^[[:space:]]*SKIP' "$out"; then echo "::error title=karidns-signer::$t skipped a part (see SKIP above)"; exit 1; fi
+            done
+            echo "::endgroup::"
+
             echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"
             ./tests/run_sanitizer_smoke_test.sh
             echo "::endgroup::"
@@ -211,6 +230,71 @@ jobs:
       - name: Portable unit tests under ASan + UBSan
         run: |
           make unit-tests-portable-asan
+
+  # ---------------------------------------------------------------------------
+  # karidns-signer (signer/, 0.6.0 item C): Node.js orchestration around BIND's
+  # dnssec tools.  This job checks the Node side on its own: the pinned dependency
+  # (npm audit) and the unit tests with coverage (functions 100%, lines 90%, the
+  # gate of tests/run_signer_unit_test.sh).  The integration tests need the
+  # FreeBSD build (karidns-zone, karicheck) and run in the FreeBSD jobs.  It runs
+  # when signer/ or this workflow changes (and always on a schedule or by hand).
+  # ---------------------------------------------------------------------------
+  signer-node:
+    name: signer (Node)
+    if: github.event_name != 'schedule' && github.event.action != 'labeled'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Does the change touch the signer?
+        id: paths
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          run=true
+          base=""
+          [ "$EVENT" = "pull_request" ] && base="$PR_BASE"
+          [ "$EVENT" = "push" ] && base="$PUSH_BEFORE"
+          if [ -n "$base" ] && ! printf '%s' "$base" | grep -Eq '^0+$' && git cat-file -e "$base^{commit}" 2>/dev/null; then
+            if ! git diff --name-only "$base" HEAD | grep -Eq '^(signer/|tests/run_signer_unit_test\.sh$|\.github/workflows/ci\.yml$)'; then
+              run=false
+              echo "signer/ and its unit test are unchanged: the job has nothing to do"
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js 24
+        if: steps.paths.outputs.run == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: signer/package-lock.json
+
+      - name: Install the dependency (pinned, no install scripts)
+        if: steps.paths.outputs.run == 'true'
+        working-directory: signer
+        run: npm ci --ignore-scripts
+
+      - name: npm audit (high and critical fail the job)
+        if: steps.paths.outputs.run == 'true'
+        working-directory: signer
+        run: npm audit --audit-level=high
+
+      - name: Unit tests with the coverage gate (functions 100%, lines 90%)
+        if: steps.paths.outputs.run == 'true'
+        run: |
+          node --version
+          sh tests/run_signer_unit_test.sh < /dev/null | tee /tmp/signer_unit.out
+          # a SKIP (no Node 22.13, say) is a failure here: the gate did not run
+          if grep -Eq '^[[:space:]]*SKIP' /tmp/signer_unit.out; then echo "::error title=signer (Node)::the unit tests were skipped"; exit 1; fi
+          grep -q 'all unit tests passed' /tmp/signer_unit.out
 
   build-dag-unix:
     name: Build & Smoke Test dag on ${{ matrix.name }}
@@ -309,7 +393,7 @@ jobs:
   coverage-freebsd:
     name: Coverage gate (FreeBSD 15.1)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -327,6 +411,9 @@ jobs:
             # provides llvm-covNN / llvm-profdataNN, which the Makefile picks up.
             V=$(cc --version | sed -n 's/.*clang version \([0-9][0-9]*\).*/\1/p' | head -n 1)
             pkg install -y perl5 sqlite3 "llvm${V}-lite"
+            # the suite runs the karidns-signer tests (tests/run_signer_*.sh): Node.js, BIND tools and signer/node_modules, or they SKIP (shown as a note in the suite output)
+            pkg install -y node24 npm-node24 bind-tools
+            (cd signer && npm ci --ignore-scripts)
             echo "::endgroup::"
 
             echo "::group::📦 [Setup] PostgreSQL for the PostgreSQL driver tier (test_db_pgsql)"
